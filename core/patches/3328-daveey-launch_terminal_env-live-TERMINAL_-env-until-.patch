@@ -1,0 +1,134 @@
+From de11a701694cecd047ce143fe0a928c3bc6f052a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:17:50 +0000
+Subject: [PATCH] [daveey] launch_terminal_env: live TERMINAL_* env until
+ multiplexing, never freeze the launch snapshot early
+
+launch_terminal_env() called capture_launch_env(), which freezes the
+process-wide launch snapshot on first call. A single-profile process
+(multiplexing inactive) that binds or validates its own profile before
+any activation (_bind_whole_profile via bind_profile_scope, the kanban
+`requires` check's _profile_policy from PR #2029) froze it early, missing
+values the launch process still bridges at startup: the case
+_launch_env() documents avoiding.
+
+Filter _launch_env() to TERMINAL_* instead (frozen once multiplexing is
+active, the live env before), as profile_config_scope already does.
+
+Tests: launch_terminal_env reads the live env single-profile and the
+frozen snapshot multiplexed; bind_profile_scope(launch) and an own-profile
+validate_assignment (bare and inside the worker's bound scope) leave
+_snapshot None with multiplexing inactive. RED on origin/main (3 fail),
+GREEN after.
+
+PR #2029 review nit 1 (t_01a1d429a7873ad1); card t_01a1d42d00bdbb33.
+---
+ tests/hermes_cli/test_kanban_capabilities.py  | 23 ++++++++++++++
+ .../tui_gateway/test_profile_config_scope.py  | 30 ++++++++++++++++---
+ tui_gateway/launch_profile_policy.py          | 14 +++++----
+ 3 files changed, 58 insertions(+), 9 deletions(-)
+
+diff --git a/tests/hermes_cli/test_kanban_capabilities.py b/tests/hermes_cli/test_kanban_capabilities.py
+index 63e0ee98cc..dbd4f72cbb 100644
+--- a/tests/hermes_cli/test_kanban_capabilities.py
++++ b/tests/hermes_cli/test_kanban_capabilities.py
+@@ -231,6 +231,29 @@ def test_own_profile_policy_counts_launch_only_terminal_backend(profiles, monkey
+         assert validate_assignment("default", requires=["terminal", "git"]) == ["terminal", "git"]
+         # Another profile reads its own files only: the default backend (local) still grants host_repo.
+         assert validate_assignment("coder", requires=["host_repo"]) == ["host_repo"]
++        # Single-profile: read from the live launch env, the snapshot stays unfrozen (t_01a1d42d00bdbb33).
++        assert (launch_profile_policy._snapshot is None) is not multiplex
++    finally:
++        secret_scope.reset_multiplex_context(token)
++
++
++def test_own_profile_check_does_not_freeze_the_launch_env(profiles, monkeypatch):
++    """A single-profile process (multiplexing inactive) that checks its OWN profile, bare or inside
++    its own bound worker scope (``_bind_whole_profile``), reads the live launch env and leaves the
++    process-wide launch snapshot unfrozen: freezing it before activation would miss values the
++    launch process still bridges at startup (t_01a1d42d00bdbb33). [daveey]"""
++    from agent import secret_scope
++    from agent.runtime_scope import bind_profile_scope
++    from tui_gateway import launch_profile_policy
++
++    monkeypatch.setattr(launch_profile_policy, "_snapshot", None)
++    home = profiles("default", LOCAL)
++    token = secret_scope.set_multiplex_context(False)
++    try:
++        assert validate_assignment("default", requires=["host_repo"]) == ["host_repo"]
++        with bind_profile_scope(home, hydrate_secrets=False):
++            assert validate_assignment("default", requires=["terminal", "git"]) == ["terminal", "git"]
++        assert launch_profile_policy._snapshot is None
+     finally:
+         secret_scope.reset_multiplex_context(token)
+ 
+diff --git a/tests/tui_gateway/test_profile_config_scope.py b/tests/tui_gateway/test_profile_config_scope.py
+index 60e637b964..df26f3e119 100644
+--- a/tests/tui_gateway/test_profile_config_scope.py
++++ b/tests/tui_gateway/test_profile_config_scope.py
+@@ -92,10 +92,32 @@ def test_the_launch_home_inside_a_bound_scope_binds_the_launch_scope(homes, boun
+         assert current_scope() == outer
+         assert get_hermes_home() == (launch if bound == "launch" else work)
+     assert (get_hermes_home_override(), current_secret_scope(), get_terminal_scope()) == (None, None, None)
+-    # Only for bound=="work": bind_profile_scope(launch) on a single-profile host already freezes
+-    # ``_snapshot`` itself (``_bind_whole_profile`` -> ``launch_terminal_env()``), before this body runs.
+-    if bound == "work" and not multiplex:
+-        assert policy._snapshot is frozen_before is None  # a single-profile host's launch env is not frozen early
++    # Neither bind_profile_scope(launch) (``_bind_whole_profile`` -> ``launch_terminal_env()``) nor the
++    # nested launch scope freezes a single-profile host's launch env early.
++    if not multiplex:
++        assert policy._snapshot is frozen_before is None
++
++
++def test_launch_terminal_env_reads_the_live_env_until_multiplexing(homes, monkeypatch):
++    """Single-profile: the live ``TERMINAL_*`` env, nothing frozen (a later startup bridge still
++    counts). Multiplexing: the snapshot frozen at activation, never re-read. [daveey]"""
++    _, _, multiplex = homes
++
++    def overlay() -> dict:
++        env = policy.launch_terminal_env()
++        assert all(k.startswith("TERMINAL_") for k in env)
++        return {k: env.get(k) for k in ("TERMINAL_ENV", "TERMINAL_SSH_HOST")}
++
++    assert overlay()["TERMINAL_ENV"] == "local"
++    monkeypatch.setenv("TERMINAL_ENV", "ssh")
++    monkeypatch.setenv("TERMINAL_SSH_HOST", "bridged-late")
++    if multiplex:
++        assert overlay()["TERMINAL_ENV"] == "local"
++        assert overlay()["TERMINAL_SSH_HOST"] != "bridged-late"
++        assert policy._snapshot is not None
++    else:
++        assert overlay() == {"TERMINAL_ENV": "ssh", "TERMINAL_SSH_HOST": "bridged-late"}
++        assert policy._snapshot is None
+ 
+ 
+ def test_the_launch_home_inside_a_bound_launch_turn_keeps_the_turn(homes):
+diff --git a/tui_gateway/launch_profile_policy.py b/tui_gateway/launch_profile_policy.py
+index 5e96ff2223..b6ec4f25dc 100644
+--- a/tui_gateway/launch_profile_policy.py
++++ b/tui_gateway/launch_profile_policy.py
+@@ -123,12 +123,16 @@ def _launch_env() -> dict[str, str]:
+ 
+ 
+ def launch_terminal_env() -> dict[str, str]:
+-    """The frozen launch ``TERMINAL_*`` overlay for a launch-profile turn's terminal scope.
+-
+-    Production always captured at activation; a first capture here only happens when the
+-    multiplexer flag was set by another owner (the messaging gateway) or a harness.
++    """The launch ``TERMINAL_*`` overlay for a launch-profile turn's terminal scope: frozen once
++    multiplexing is active, the live process env before (``_launch_env``).
++
++    [daveey] A single-profile process that binds or validates its own profile before any
++    activation (``_bind_whole_profile``, the kanban ``requires`` check) must not freeze the
++    process-wide snapshot here: it would miss what the launch process still bridges at startup.
++    Once multiplexing is active, production captured at activation; a first capture here only
++    happens when the flag was set by another owner (the messaging gateway) or a harness.
+     """
+-    return {k: v for k, v in capture_launch_env().items() if k.startswith("TERMINAL_")}
++    return {k: v for k, v in _launch_env().items() if k.startswith("TERMINAL_")}
+ 
+ 
+ def launch_secret_scope(launch_home: str | Path) -> dict[str, str]:
+-- 
+2.51.0
+

@@ -1,0 +1,231 @@
+From 7755ecfca23573b4ba8850ee92a99d668833b616 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 03:59:28 +0000
+Subject: [PATCH] [daveey] fix(kanban-sync): retire a lease_lost release whose
+ run the Board already ended
+
+A crash release that loses the lease race to a reclaim (worker-1 11-13: a hermes-sync core-update
+reclaim ended the run ~3 s before the dead worker's release was pushed) is refused lease_lost and can
+never apply. resolve_rejections only proved supersession for upsert/import and mootness for chat
+links, so the rejected release stayed forever and `sync diff` reported the gateway dirty every sample.
+
+Classify a rejected release as moot only on fresh authoritative evidence: the card row is live and
+neither leases nor runs that run_uid; the run row is live, belongs to that card and has ended_at;
+and locally there is no open copy of the run and no pending op or tombstone for the card or run.
+Retirement keeps the existing compare-and-delete revalidation; anything else stays unresolved.
+---
+ hermes_cli/kanban_sync_rejections.py          |  45 +++++++-
+ .../hermes_cli/test_kanban_sync_rejections.py | 104 ++++++++++++++++++
+ 2 files changed, 146 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_rejections.py b/hermes_cli/kanban_sync_rejections.py
+index 5a6d38f0fb..ac2eb6ea7e 100644
+--- a/hermes_cli/kanban_sync_rejections.py
++++ b/hermes_cli/kanban_sync_rejections.py
+@@ -20,6 +20,14 @@ def _local(conn, table, uid):
+     return row
+ 
+ 
++def _release_run(op):
++    """The run uid a rejected lease ``release`` op tried to end, or None for any other op."""
++    if op["table_name"] != "tasks" or op["op"] != "release":
++        return None
++    run = json.loads(op["fields"]).get("run_uid")
++    return run if isinstance(run, str) and run else None
++
++
+ def _inputs(conn, rejected):
+     """Include translated references and pending/tombstone guards in the compare-and-delete snapshot."""
+     from hermes_cli import kanban_sync_client as client
+@@ -31,6 +39,11 @@ def _inputs(conn, rejected):
+     identities = {(table, uid)}
+     if task:
+         identities.add(("tasks", task))
++    run = _release_run(rejected)
++    run_row = None
++    if run:
++        identities.add(("task_runs", run))
++        run_row = conn.execute("SELECT * FROM task_runs WHERE uid=?", (run,)).fetchone()
+     pending, tombs = [], []
+     for tab, key in sorted(identities):
+         pending.extend(tuple(r) for r in conn.execute(
+@@ -42,7 +55,7 @@ def _inputs(conn, rejected):
+         "SELECT * FROM kanban_sync_outbox WHERE table_name='tasks' AND row_uid=?", (task,))] if task else []
+     return {"row": dict(row) if row else None, "fields": fields, "task": task,
+             "parent": dict(parent) if parent else None, "parent_ops": parent_ops,
+-            "pending": pending, "tombstones": tombs}
++            "pending": pending, "tombstones": tombs, "run": dict(run_row) if run_row else None}
+ 
+ 
+ def _evidence(hub, board, table, uid):
+@@ -53,10 +66,32 @@ def _evidence(hub, board, table, uid):
+     return e
+ 
+ 
+-def _classify(op, before, evidence, parent_evidence):
++def _moot_release(op, before, evidence, run_evidence):
++    """A ``lease_lost`` release is moot once the Board itself ended that run and no longer leases the card to it.
++
++    The Board refuses a release from a run that does not hold the lease, so the op can never apply; the run's
++    authoritative end (reclaim, owner restart, another release) already won. Proof needs fresh rows for both the
++    card and the run, the run belonging to that card, and no local copy of the run that is still open."""
++    run = _release_run(op)
++    if not run or run_evidence is None or not str(op.get("last_error") or "").startswith("lease_lost"):
++        return False
++    task_row, run_row, local_run = evidence.get("row"), run_evidence.get("row"), before.get("run")
++    return bool(
++        evidence.get("state") == "live" and task_row and task_row.get("uid") == op["row_uid"]
++        and run not in (task_row.get("lease_run_uid"), task_row.get("current_run_uid"))
++        and run_evidence.get("state") == "live" and run_row and run_row.get("uid") == run
++        and run_row.get("task_id") == op["row_uid"] and run_row.get("ended_at") is not None
++        and (local_run is None or local_run.get("ended_at") is not None))
++
++
++def _classify(op, before, evidence, parent_evidence, run_evidence=None):
+     from hermes_cli import kanban_sync_client as client
+     if before["pending"] or before["tombstones"]:
+         return "unresolved", "pending local work or local tombstone"
++    if op["op"] == "release":
++        if _moot_release(op, before, evidence, run_evidence):
++            return "moot", "authoritative run already ended and does not hold the card's lease; nothing to release"
++        return "unresolved", "no proof the released run already ended off this card's lease"
+     fields = client._wire_fields(op["table_name"], json.loads(op["fields"]))
+     remote, local = evidence.get("row"), before["row"]
+     if op["op"] in ("upsert", "import") and evidence.get("state") == "live" and remote and local:
+@@ -104,13 +139,17 @@ def resolve_rejections(conn: sqlite3.Connection, hub, board: str) -> list[dict]:
+             evidence = _evidence(hub, board, op["table_name"], op["row_uid"])
+             parent = _evidence(hub, board, "tasks", before["task"]) if (
+                 op["table_name"] == "task_chat_links" and before["task"]) else None
++            run_uid = _release_run(op)
++            run = _evidence(hub, board, "task_runs", run_uid) if run_uid else None
+         except (HubError, SyncUnavailable, OSError, AttributeError, ValueError) as exc:
+             report["proof"] = f"authoritative evidence unavailable: {exc}"
+             continue
+         report["evidence"] = evidence
+         if parent:
+             report["parent_evidence"] = parent
+-        classification, proof = _classify(op, before, evidence, parent)
++        if run:
++            report["run_evidence"] = run
++        classification, proof = _classify(op, before, evidence, parent, run)
+         report.update(classification=classification, proof=proof)
+         if classification == "unresolved":
+             continue
+diff --git a/tests/hermes_cli/test_kanban_sync_rejections.py b/tests/hermes_cli/test_kanban_sync_rejections.py
+index 44b2962cca..0b1921014b 100644
+--- a/tests/hermes_cli/test_kanban_sync_rejections.py
++++ b/tests/hermes_cli/test_kanban_sync_rejections.py
+@@ -183,6 +183,110 @@ def test_cli_diff_does_not_report_clean_from_failed_refresh(live, svc, kanban_ho
+     assert bool(report.get("unavailable")) is offline
+ 
+ 
++TASK, RUN = "t_released", "run-reclaimed"
++
++
++def lost_release(live, svc, *, error="lease_lost: this run no longer holds the lease"):
++    """worker-1 11-13 shape: the host's core-update reclaim ended the run on the Board ~3 s before the dead
++    worker's own crash release was pushed, so that release was refused ``lease_lost`` and kept forever."""
++    fields = {"failure_limit": 2, "force_trip": False, "infrastructure": False, "block_kind": "transient",
++              "diagnostic": {"exit_kind": "signaled", "exit_code": 15}, "run_uid": RUN, "outcome": "crashed",
++              "error": "pid 3264955 killed by signal 15"}
++    with kbc.write_txn(live):
++        live.execute("INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at,state,last_error,"
++                     "attempts) VALUES ('release-op','tasks',?,'release',?,'',1,'rejected',?,1)",
++                     (TASK, json.dumps(fields), error))
++    rows = svc.board(BOARD)["rows"]
++    rows.setdefault("tasks", {})[TASK] = {"uid": TASK, "id": TASK, "status": "done", "version": 66, "created_on": OTHER,
++                                          "current_run_uid": None, "lease_run_uid": None, "lease_holder": None}
++    rows.setdefault("task_runs", {})[RUN] = {"uid": RUN, "task_id": TASK, "status": "reclaimed", "outcome": "reclaimed",
++                                             "ended_at": 1794527437, "version": 4, "origin_gateway": ME}
++    return rows
++
++
++def test_lease_lost_release_of_ended_run_retired_by_normal_sync(live, svc, kanban_home):
++    lost_release(live, svc)
++    shadow = client.open_shadow(BOARD, ME)
++    try:
++        assert client.diff(live, shadow, ME)["rejected_ops"] == 1
++    finally:
++        shadow.close()
++    result = client.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++    report = result.rejection_resolutions[0]
++    assert (report["classification"], report["action"]) == ("moot", "retired")
++    assert report["run_evidence"]["row"]["ended_at"] == 1794527437
++    assert client.status(live)["rejected"] == 0
++    shadow = client.open_shadow(BOARD, ME)
++    try:
++        assert client.diff(live, shadow, ME)["clean"]
++    finally:
++        shadow.close()
++
++
++RELEASE_BOARD_VETOES = {
++    "run_open": lambda rows: rows["task_runs"][RUN].update(ended_at=None),
++    "lease_held": lambda rows: rows["tasks"][TASK].update(lease_run_uid=RUN),
++    "current_run": lambda rows: rows["tasks"][TASK].update(current_run_uid=RUN),
++    "other_task": lambda rows: rows["task_runs"][RUN].update(task_id="t_other"),
++    "run_missing": lambda rows: rows["task_runs"].pop(RUN),
++    "run_deleted": lambda rows: rows["task_runs"][RUN].update(deleted_at=1),
++    "task_missing": lambda rows: rows["tasks"].pop(TASK),
++}
++
++
++@pytest.mark.parametrize("veto", [*RELEASE_BOARD_VETOES, "not_lease_lost", "local_run_open", "pending_run",
++                                  "evidence_down"])
++def test_release_retirement_needs_ended_run_off_the_lease(live, svc, monkeypatch, veto):
++    rows = lost_release(live, svc, error="not_found: no such card" if veto == "not_lease_lost" else
++                        "lease_lost: this run no longer holds the lease")
++    RELEASE_BOARD_VETOES.get(veto, lambda rows: None)(rows)
++    hub = svc.hub(ME)
++    tid = None
++    if veto in ("local_run_open", "pending_run"):
++        tid = kb.create_task(live, title="local copy", assignee="worker")
++    with kbc.write_txn(live):
++        if veto in ("local_run_open", "pending_run"):
++            live.execute("UPDATE kanban_sync_state SET applying=1")
++            live.execute("INSERT INTO task_runs (id,uid,task_id,status,started_at) VALUES (77,?,?,'running',1)", (RUN, tid))
++            live.execute("UPDATE kanban_sync_state SET applying=0")
++        if veto == "pending_run":
++            live.execute("UPDATE task_runs SET ended_at=2 WHERE uid=?", (RUN,))
++            live.execute("INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at) "
++                         "VALUES ('run-pending','task_runs',?,'upsert','{}','',2)", (RUN,))
++    if veto == "evidence_down":
++        original = hub.row_evidence
++
++        def read(board, table, uid):
++            if table == "task_runs":
++                raise OSError("board unreachable")
++            return original(board, table, uid)
++        monkeypatch.setattr(hub, "row_evidence", read)
++    from hermes_cli.kanban_sync_rejections import resolve_rejections
++    report = next(r for r in resolve_rejections(live, hub, BOARD) if r["op_id"] == "release-op")
++    assert (report["classification"], report["action"]) == ("unresolved", "retained")
++    assert live.execute("SELECT state FROM kanban_sync_outbox WHERE op_id='release-op'").fetchone()[0] == "rejected"
++
++
++def test_release_local_change_during_read_vetoes(live, svc, monkeypatch):
++    lost_release(live, svc)
++    hub = svc.hub(ME)
++    original = hub.row_evidence
++
++    def read_then_open_run(board, table, uid):
++        evidence = original(board, table, uid)
++        if table == "task_runs":
++            with kbc.write_txn(live):
++                live.execute("INSERT INTO kanban_sync_tombstones (table_name,row_uid,deleted_at) VALUES ('task_runs',?,1)",
++                             (RUN,))
++        return evidence
++
++    monkeypatch.setattr(hub, "row_evidence", read_then_open_run)
++    from hermes_cli.kanban_sync_rejections import resolve_rejections
++    report = resolve_rejections(live, hub, BOARD)[0]
++    assert report["classification"] == "unresolved"
++    assert client.status(live)["rejected"] == 1
++
++
+ def test_concurrent_edit_vetoes_retirement(live, svc, monkeypatch):
+     reject_status(live, svc)
+     hub = svc.hub(ME)
+-- 
+2.51.0
+

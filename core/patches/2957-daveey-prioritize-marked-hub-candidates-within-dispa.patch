@@ -1,0 +1,204 @@
+From edf5ea67215b55efec7c1b06331be0f9a88d7cb1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:16:30 +0000
+Subject: [PATCH] [daveey] prioritize marked hub candidates within dispatch
+ lanes
+
+---
+ docs/kanban-hub-admission-v2.md               | 13 +--
+ hermes_cli/kanban_admission_pools.py          |  9 ++
+ hermes_cli/kanban_db_dispatch.py              |  4 +-
+ hermes_cli/kanban_db_dispatch_queries.py      |  7 +-
+ tests/hermes_cli/test_kanban_hub_admission.py | 89 +++++++++++++++++++
+ 5 files changed, 112 insertions(+), 10 deletions(-)
+
+diff --git a/docs/kanban-hub-admission-v2.md b/docs/kanban-hub-admission-v2.md
+index f4f86de2e9..61bb42efc8 100644
+--- a/docs/kanban-hub-admission-v2.md
++++ b/docs/kanban-hub-admission-v2.md
+@@ -12,11 +12,14 @@ Local run pool/class/origin receipts now survive task class and chat-release edi
+ The whole-host census uses a consistent read snapshot per board and enforces the
+ capacity-origin cap in final admission. Opt-in pre-lease/final CPU gates select the
+ separate priority pool. The dispatcher budget can reach the extra pool at regular
+-saturation, preserving the shared critical/elevated memory guard. Ready and review
+-claim tests admit urgent work at 70% CPU with seven regular slots full. These are
+-isolated budget/claim-path tests, not complete dispatcher or live proof.
+-
+-Still pending: composed dispatcher selection and queue notes, Board and
++saturation, preserving the shared critical/elevated memory guard. Opted-in hubs
++order marked candidates first within each lane, retaining effective priority
++within each group. Composed ready/review dispatcher tests now reach real final
++claims at 70% CPU with seven regular runs, including an opposite normal lane,
++critical/elevated memory and a hard per-board `max_spawn` ceiling. Workers retain
++plain priority. These isolated tests do not establish Board or live acceptance.
++
++Still pending: queue notes, Board and
+ courier receiver compatibility, full malformed-config/receipt tests, sync replay
+ coverage, guard mutations, scoring, reporting and live activation. Do not enable
+ this incomplete implementation. `priority_slots` is currently opt-in (absent = 0)
+diff --git a/hermes_cli/kanban_admission_pools.py b/hermes_cli/kanban_admission_pools.py
+index 5617e4db1d..63473fb5a1 100644
+--- a/hermes_cli/kanban_admission_pools.py
++++ b/hermes_cli/kanban_admission_pools.py
+@@ -64,6 +64,15 @@ def root_settings():
+     return slots, ceiling
+ 
+ 
++def lane_rows(conn, status):
++    """Offer marked candidates before normal rows only on an opted-in hub."""
++    from hermes_cli import machine_cpu_metrics as cpu
++    from hermes_cli.kanban_db_dispatch_queries import lane_rows as query
++
++    marked_first = cpu.root_limit()[0] == cpu.ON and root_settings()[0] > 0
++    return query(conn, status, marked_first=marked_first)
++
++
+ def dispatch_remaining(regular_cap):
+     """Upper bound for candidate attempts; final locked claims enforce each pool."""
+     from hermes_cli import machine_cpu_metrics as cpu, machine_metrics
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 83f575d850..697e8ad2a1 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -41,7 +41,8 @@ from hermes_cli import kanban_owner_death as _owner_death, kanban_parent_unclaim
+ from hermes_cli.kanban_db_dispatch_crash_accounting import _account_crashes  # [daveey]
+ from hermes_cli.kanban_failure_accounting import _record_task_failure
+ from hermes_cli.kanban_db_dispatch_dead_worker import _DeadWorker
+-from hermes_cli.kanban_db_dispatch_queries import lane_rows, skip_reap
++from hermes_cli.kanban_db_dispatch_queries import skip_reap
++from hermes_cli.kanban_admission_pools import host_remaining, lane_rows
+ from hermes_cli.kanban_db_dispatch_clock import record_clock_hold as _record_clock_hold
+ from hermes_cli.kanban_db_dispatch_rerun import reopened_after
+ 
+@@ -2150,7 +2151,6 @@ def _tick_spawn_budget(
+         spawn_budget = max_spawn - running_count
+ 
+     if max_in_progress is not None:
+-        from hermes_cli.kanban_admission_pools import host_remaining
+         remaining = host_remaining(max_in_progress, running_count, board)
+         if remaining <= 0:
+             result.at_capacity = f"max_in_progress={max_in_progress - remaining}/{max_in_progress}"
+diff --git a/hermes_cli/kanban_db_dispatch_queries.py b/hermes_cli/kanban_db_dispatch_queries.py
+index 97b802b9a5..ec5218b6bf 100644
+--- a/hermes_cli/kanban_db_dispatch_queries.py
++++ b/hermes_cli/kanban_db_dispatch_queries.py
+@@ -30,12 +30,13 @@ DISPATCH_ORDER = (
+ )
+ 
+ 
+-def lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
+-    """Unclaimed rows of one lane in dispatch order (:data:`DISPATCH_ORDER`)."""
++def lane_rows(conn: sqlite3.Connection, status: str, *, marked_first: bool = False) -> list[sqlite3.Row]:
++    """Unclaimed rows of one lane in dispatch order; optional pool ordering keeps priority ties per class."""
++    prefix = "admission_class IN ('capacity', 'urgent') DESC, " if marked_first else ""
+     rows = conn.execute(
+         "SELECT id, assignee FROM tasks "
+         f"WHERE status = '{status}' AND claim_lock IS NULL "
+-        f"ORDER BY {DISPATCH_ORDER}"
++        f"ORDER BY {prefix}{DISPATCH_ORDER}"
+     ).fetchall()
+     from hermes_cli.kanban_dispatch_priority import order_with_remote_waiters
+     return order_with_remote_waiters(conn, rows)
+diff --git a/tests/hermes_cli/test_kanban_hub_admission.py b/tests/hermes_cli/test_kanban_hub_admission.py
+index 2c3f00ff3c..0133965ebf 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission.py
++++ b/tests/hermes_cli/test_kanban_hub_admission.py
+@@ -264,6 +264,95 @@ def test_dispatch_budget_reaches_extra_pool_at_regular_cap(board, monkeypatch, p
+         assert result.memory_pressure == pressure
+ 
+ 
++@pytest.mark.parametrize("review", [False, True])
++def test_dispatch_marked_candidate_precedes_normal_in_same_lane(
++    board, monkeypatch, all_assignees_spawnable, review,
++):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    conn, home = board
++    configure(home, cap=7)
++    with (home / "config.yaml").open("a") as config:
++        config.write("    priority_slots: 3\n")
++    advisory(home)
++    monkeypatch.setattr(cm, "sample", fake_sample(10))
++    monkeypatch.setattr(dispatch, "review_dispatch_enabled", lambda: True)
++    monkeypatch.setattr(dispatch, "_memory_pressure_level", lambda: "normal")
++    normal = task(conn, review=review, title="higher numeric priority")
++    kb.edit_task(conn, normal, priority=1000)
++    marked = task(conn, review=review, title="restore capacity")
++    kb.edit_task(conn, marked, admission_class="capacity", admission_frees="frees: worker slots")
++    spawned = []
++
++    def spawn(candidate, workspace, board=None):
++        spawned.append(candidate.id)
++
++    result = dispatch.dispatch_once(conn, spawn_fn=spawn, max_spawn=1, max_in_progress=7)
++    assert spawned == [marked], result
++    assert kb.get_task(conn, normal).status == ("review" if review else "ready")
++    receipt = conn.execute("SELECT admission_pool FROM task_runs WHERE task_id=?", (marked,)).fetchone()
++    assert receipt[0] == "priority"
++
++
++@pytest.mark.parametrize("enabled", [False, True])
++def test_dispatch_pool_order_keeps_worker_priority(board, monkeypatch, all_assignees_spawnable, enabled):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    conn, home = board
++    configure(home, limit=None, cap=7)
++    if enabled:
++        with (home / "config.yaml").open("a") as config:
++            config.write("  admission:\n    priority_slots: 3\n")
++    monkeypatch.setattr(dispatch, "_memory_pressure_level", lambda: "normal")
++    high = task(conn, title="high normal")
++    kb.edit_task(conn, high, priority=1000)
++    marked = task(conn, title="marked low")
++    kb.edit_task(conn, marked, admission_class="urgent")
++    spawned = []
++
++    def spawn(candidate, workspace, board=None):
++        spawned.append(candidate.id)
++
++    dispatch.dispatch_once(conn, spawn_fn=spawn, max_spawn=1, max_in_progress=7)
++    assert spawned == [high]
++
++
++@pytest.mark.parametrize("review", [False, True])
++@pytest.mark.parametrize("pressure,expected", [("normal", 2), ("elevated", 1), ("critical", 0)])
++def test_dispatch_full_regular_pool_claims_marked_with_shared_memory_budget(
++    board, monkeypatch, all_assignees_spawnable, review, pressure, expected,
++):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    conn, home = board
++    configure(home, limit=None)
++    for index in range(7):
++        tid = task(conn, title=f"active {index}")
++        assert kb.claim_task(conn, tid)
++    configure(home, cap=7)
++    with (home / "config.yaml").open("a") as config:
++        config.write("    priority_slots: 3\n")
++    normal = task(conn, review=not review, title="normal opposite lane")
++    marked = [task(conn, review=review, title=f"incident {index}") for index in range(3)]
++    for tid in marked:
++        kb.edit_task(conn, tid, admission_class="urgent")
++    advisory(home, pct=70)
++    monkeypatch.setattr(cm, "sample", fake_sample(70))
++    monkeypatch.setattr(dispatch, "review_dispatch_enabled", lambda: True)
++    monkeypatch.setattr(dispatch, "_memory_pressure_level", lambda: pressure)
++    spawned = []
++
++    def spawn(candidate, workspace, board=None):
++        spawned.append(candidate.id)
++
++    dispatch.dispatch_once(conn, spawn_fn=spawn, max_spawn=9, max_in_progress=7, reconcile_orphans=False)
++    assert len(spawned) == expected
++    assert set(spawned) <= set(marked)
++    assert normal not in spawned
++    for tid in spawned:
++        assert conn.execute("SELECT admission_pool FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0] == "priority"
++    detail = {"pools": {"regular": 0, "priority": 0}}
++    assert mm.active_card_runs(detail=detail) == 7 + expected
++    assert detail["pools"] == {"regular": 7, "priority": expected}
++
++
+ def test_pool_census_uses_one_board_snapshot(board, monkeypatch):
+     from hermes_cli import kanban_admission_pools as pools
+     conn, home = board
+-- 
+2.51.0
+

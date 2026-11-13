@@ -1,0 +1,225 @@
+From fecd636ee8e3cee254797dfd8317ea73f5630b63 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:23:45 +0000
+Subject: [PATCH] [daveey] kanban sync links pass: serialize passes across loop
+ restarts; reset _LINKS_RUNNER; run-ref prefilter test
+
+Follow-up to the non-blocking review points on PR #1882 (t_01a1d353ab225eda):
+
+1. test_prefilter_compares_run_refs_by_uid exercises the REF_COLUMNS uid-subquery branch of
+   _differing_settled: equal run uids under different local run ids are no candidate; the same local
+   id naming another uid is one (it fails when that branch compares raw ids).
+2. LinksPass.stop() joins for only JOIN_S, so a slow pass can outlive its loop. A process-wide
+   _PASS_LOCK serializes reconcile_links: a restarted loop's runner refuses requests while a stopped
+   runner's pass still runs and never runs a pass beside it (they share _LINKS_DONE).
+3. run_forever's finally resets _LINKS_RUNNER, so no stopped runner stays published.
+4. The links thread copies the loop's contextvars itself (Thread(target=copy_context().run)) instead of
+   importing spawn_context_thread from agent.memory_provider.
+---
+ hermes_cli/kanban_sync_client.py              |  3 +-
+ hermes_cli/kanban_sync_links_pass.py          | 22 ++++++--
+ .../test_kanban_sync_divergence_prefilter.py  | 36 +++++++++++++
+ .../test_kanban_sync_links_thread.py          | 53 +++++++++++++++++++
+ 4 files changed, 108 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index a1d6b603ac..6d263cd604 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1199,7 +1199,7 @@ def _links_pass_clock() -> float:
+     return time.monotonic()
+ 
+ 
+-# The running loop's links pass (tests wait on it to observe a pass deterministically).
++# The running loop's links pass (tests wait on it to observe a pass deterministically); None once the loop exits.
+ _LINKS_RUNNER: Any = None  # a kanban_sync_links_pass.LinksPass while the loop runs
+ 
+ 
+@@ -1542,6 +1542,7 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+             sync_timing.wait(wait_for_work, wake, [p for _s, p in boards], remaining, keep_running)
+     finally:
+         links.stop()
++        _LINKS_RUNNER = None  # no stale runner for the next loop's tests to wait on
+         sender.close()
+         sampler.close()
+     runstate.record_down(runstate.STOPPED)
+diff --git a/hermes_cli/kanban_sync_links_pass.py b/hermes_cli/kanban_sync_links_pass.py
+index 6c501d5e17..4338bb0d3b 100644
+--- a/hermes_cli/kanban_sync_links_pass.py
++++ b/hermes_cli/kanban_sync_links_pass.py
+@@ -6,9 +6,14 @@ queued on ``_links_lock`` behind Desktop readers) and the replica went 13 min st
+ cards did not promote (t_01a1d2cc49634a78). The loop asks for a pass on its cadence; a request while one is running
+ is refused and asked again on a later iteration, so passes never pile up. The thread owns its own connection scope
+ and never calls the loop's ``keep_running`` (callers count its calls); the loop stops it.
++
++``stop`` waits only ``JOIN_S`` for a running pass, so a slow pass can outlive its loop. Passes are serialized per
++process (``_PASS_LOCK``): a restarted loop's runner refuses requests while a stopped runner's pass still runs, and
++never runs ``reconcile_links`` alongside it (both would share ``kanban_sync_client._LINKS_DONE``).
+ """
+ from __future__ import annotations
+ 
++import contextvars
+ import logging
+ import threading
+ from pathlib import Path
+@@ -16,6 +21,9 @@ from typing import Optional
+ 
+ _log = logging.getLogger("hermes_cli.kanban_sync_client")
+ 
++# Held for the length of one ``reconcile_links`` call by whichever runner (live, or stopped but still running) owns it.
++_PASS_LOCK = threading.Lock()
++
+ 
+ class LinksPass:
+     JOIN_S = 5.0
+@@ -30,15 +38,17 @@ class LinksPass:
+         self._thread: Optional[threading.Thread] = None
+ 
+     def request(self, boards: list[tuple[str, Path]]) -> bool:
+-        """Start a pass over ``boards`` unless one is running. True when it started."""
+-        if not self._idle.is_set():
++        """Start a pass over ``boards`` unless one is running: this runner's, or an earlier loop's that outlived its
++        ``stop``. True when it started."""
++        if not self._idle.is_set() or _PASS_LOCK.locked():
+             return False
+         self._boards = list(boards)
+         self._idle.clear()
+         self._want.set()
+         if self._thread is None or not self._thread.is_alive():
+-            from agent.memory_provider import spawn_context_thread
+-            self._thread = spawn_context_thread(self._run, name="kanban-sync-links")
++            # The loop's contextvars (profile scope) cross into the thread; no agent.memory_provider dependency.
++            self._thread = threading.Thread(target=contextvars.copy_context().run, args=(self._run,),
++                                            name="kanban-sync-links", daemon=True)
+             self._thread.start()
+         return True
+ 
+@@ -63,7 +73,9 @@ class LinksPass:
+                     if self._stopped:
+                         break
+                     try:
+-                        client.reconcile_links(self._boards, self._gateway, skip_unchanged=True)
++                        with _PASS_LOCK:  # a request that raced past ``request``'s check waits here, never overlaps
++                            if not self._stopped:
++                                client.reconcile_links(self._boards, self._gateway, skip_unchanged=True)
+                     except Exception as exc:  # health: allow BLE001 -- a failed pass must not end the thread
+                         _log.warning("kanban sync: chat links pass failed (%s: %s)", type(exc).__name__, exc)
+                     finally:
+diff --git a/tests/hermes_cli/test_kanban_sync_divergence_prefilter.py b/tests/hermes_cli/test_kanban_sync_divergence_prefilter.py
+index 24ffd86fea..962e919ac3 100644
+--- a/tests/hermes_cli/test_kanban_sync_divergence_prefilter.py
++++ b/tests/hermes_cli/test_kanban_sync_divergence_prefilter.py
+@@ -24,6 +24,11 @@ def kanban_home(tmp_path, monkeypatch):
+     return support.kanban_home(tmp_path, monkeypatch)
+ 
+ 
++@pytest.fixture
++def lease_client():
++    yield from support.lease_client()
++
++
+ @pytest.fixture
+ def live(kanban_home):
+     support.write_sync_config(kanban_home, True)
+@@ -120,6 +125,37 @@ def test_prefilter_skips_unsettled_and_matches_run_refs(live, kanban_home):
+         replica.close()
+ 
+ 
++def test_prefilter_compares_run_refs_by_uid(live, kanban_home, lease_client):
++    """``current_run_id`` is a per-file local id: the pre-filter compares the run uids it names (review of PR #1882).
++    Equal uids under different local ids are no difference; the same local id naming another uid is one."""
++    svc = FakeService()
++    ids = _settle(live, kanban_home, svc, 3)
++    for tid in ids[:2]:
++        assert kb.claim_task(live, tid) is not None
++    for _ in range(3):
++        ksc.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++    replica = ksc.open_shadow(BOARD, ME)
++    try:
++        runs = {tid: (live.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0],
++                      replica.execute("SELECT r.uid FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
++                                      "WHERE t.id = ?", (tid,)).fetchone())
++                for tid in ids[:2]}
++        assert all(run_id is not None and uid is not None for run_id, uid in runs.values()), runs
++        assert div._differing_settled(live, replica, ME) == set()
++        # ids[0]: the same run uid under another local id (raw ids now differ; the uids do not).
++        run_id = runs[ids[0]][0]
++        _uncaptured(live, "UPDATE task_runs SET id = id + 1000 WHERE id = ?", (run_id,))
++        _uncaptured(live, "UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id + 1000, ids[0]))
++        assert live.execute("SELECT current_run_id FROM tasks WHERE id = ?", (ids[0],)).fetchone()[0] != \
++            replica.execute("SELECT current_run_id FROM tasks WHERE id = ?", (ids[0],)).fetchone()[0]
++        assert div._differing_settled(live, replica, ME) == set()
++        # ids[1]: the same local id now names another run uid (only the uid differs).
++        _uncaptured(live, "UPDATE task_runs SET uid = 'other-run-uid' WHERE id = ?", (runs[ids[1]][0],))
++        assert div._differing_settled(live, replica, ME) == {ids[1]}
++    finally:
++        replica.close()
++
++
+ def test_prefilter_unavailable_for_in_memory_files(live):
+     import sqlite3
+     mem = sqlite3.connect(":memory:")
+diff --git a/tests/hermes_cli/test_kanban_sync_links_thread.py b/tests/hermes_cli/test_kanban_sync_links_thread.py
+index 6636525da1..afdd191e3d 100644
+--- a/tests/hermes_cli/test_kanban_sync_links_thread.py
++++ b/tests/hermes_cli/test_kanban_sync_links_thread.py
+@@ -76,3 +76,56 @@ def test_a_failed_links_pass_does_not_stop_later_passes(monkeypatch):
+     _run_loop(monkeypatch, reconcile=flaky, sync_all_once=lambda *a, **k: [], wait=wait,
+               keep_running=lambda: iterations["n"] < 3)
+     assert len(calls) == 3, calls
++    assert ksc._LINKS_RUNNER is None, "the stopped loop's runner is still published"
++
++
++def test_a_restarted_loop_never_runs_a_pass_beside_the_stopped_loops(monkeypatch):
++    """``stop`` waits only ``JOIN_S``: a slow pass outlives its loop. A same-process restart must not start a second
++    ``reconcile_links`` beside it (both share ``_LINKS_DONE``; review of PR #1882)."""
++    from hermes_cli.kanban_sync_links_pass import LinksPass
++    monkeypatch.setattr(LinksPass, "JOIN_S", 0.05)
++    release, entered = threading.Event(), threading.Event()
++    lock = threading.Lock()
++    state = {"active": 0, "max": 0}
++    calls: list[threading.Thread] = []
++
++    def reconcile(boards, gateway, **kwargs):
++        with lock:
++            calls.append(threading.current_thread())
++            state["active"] += 1
++            state["max"] = max(state["max"], state["active"])
++        entered.set()
++        try:
++            release.wait(10)
++        finally:
++            with lock:
++                state["active"] -= 1
++
++    first = {"n": 0}
++
++    def first_wait(*args):
++        first["n"] += 1
++        assert entered.wait(10), "the first loop's pass never started"
++
++    _run_loop(monkeypatch, reconcile=reconcile, sync_all_once=lambda *a, **k: [], wait=first_wait,
++              keep_running=lambda: first["n"] < 2)
++    assert len(calls) == 1 and calls[0].is_alive() and state["active"] == 1, "the first pass must outlive its loop"
++    slow = calls[0]
++
++    second = {"n": 0, "calls_while_blocked": None}
++
++    def second_wait(*args):
++        second["n"] += 1
++        if second["n"] == 3:  # three requests refused while the stopped loop's pass ran
++            second["calls_while_blocked"] = len(calls)
++            release.set()
++            slow.join(10)
++        elif second["n"] > 3:
++            assert ksc._LINKS_RUNNER.wait_idle(10)
++
++    _run_loop(monkeypatch, reconcile=reconcile, sync_all_once=lambda *a, **k: [], wait=second_wait,
++              keep_running=lambda: len(calls) < 2 and second["n"] < 10)
++    release.set()
++    assert second["calls_while_blocked"] == 1, f"the restarted loop ran a pass beside the stopped one: {calls}"
++    assert state["max"] == 1, f"{state['max']} concurrent reconcile_links passes"
++    assert len(calls) == 2 and calls[1] is not slow, "the restarted loop never ran its own pass"
+-- 
+2.51.0
+

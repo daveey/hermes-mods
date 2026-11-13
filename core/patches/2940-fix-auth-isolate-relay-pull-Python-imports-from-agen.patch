@@ -1,0 +1,115 @@
+From fc989aee48fceb018b755f97d09f55790a0b7ea9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 19:56:11 +0000
+Subject: [PATCH] fix(auth): isolate relay pull Python imports from agent
+ runtime [daveey]
+
+---
+ agent/credential_relay_repull.py           | 14 ++++-
+ tests/agent/test_relay_pull_environment.py | 61 ++++++++++++++++++++++
+ 2 files changed, 73 insertions(+), 2 deletions(-)
+ create mode 100644 tests/agent/test_relay_pull_environment.py
+
+diff --git a/agent/credential_relay_repull.py b/agent/credential_relay_repull.py
+index 78687d6428..730186632b 100644
+--- a/agent/credential_relay_repull.py
++++ b/agent/credential_relay_repull.py
+@@ -108,7 +108,11 @@ def _wait_budget() -> float:
+ 
+ 
+ def _run_pull(cmd: list[str]) -> None:
+-    """Run the pull once; a peer process already pulling (lock held) is left to finish on its own."""
++    """Run the pull once; leave a peer holding the lock to finish on its own.
++
++    The command must bootstrap its own Python dependencies, not borrow the agent's
++    PYTHONPATH/PYTHONHOME. All other relay settings remain inherited.
++    """
+     from hermes_constants import get_hermes_home
+     lock_path = Path(get_hermes_home()) / "state" / "oauth-relay-repull.lock"
+     log = _ra().logger
+@@ -124,8 +128,14 @@ def _run_pull(cmd: list[str]) -> None:
+                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                 except BlockingIOError:
+                     return
++            # The relay owns its interpreter (workers use /usr/bin/python3 for boto3).
++            # PM's backend PYTHONPATH mixes its cryptography with distro OpenSSL and
++            # fails at GEN_EMAIL. Preserve relay/AWS/home settings, not Python imports.
++            env = os.environ.copy()
++            env.pop("PYTHONPATH", None)
++            env.pop("PYTHONHOME", None)
+             proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+-                                  timeout=_PULL_TIMEOUT_S, stdin=subprocess.DEVNULL, check=False)
++                                  timeout=_PULL_TIMEOUT_S, stdin=subprocess.DEVNULL, check=False, env=env)
+             if proc.returncode != 0:
+                 log.warning("OAuth relay re-pull %s exited %s: %s", cmd[0], proc.returncode,
+                             (proc.stderr or proc.stdout or "").strip()[-300:])
+diff --git a/tests/agent/test_relay_pull_environment.py b/tests/agent/test_relay_pull_environment.py
+new file mode 100644
+index 0000000000..b0635b029f
+--- /dev/null
++++ b/tests/agent/test_relay_pull_environment.py
+@@ -0,0 +1,61 @@
++"""Exercise the external relay child, not a mocked subprocess return."""
++
++import json
++import logging
++import os
++import subprocess
++import sys
++from types import SimpleNamespace
++
++import pytest
++
++from agent import credential_relay_repull as relay
++
++
++@pytest.mark.parametrize("polluted", [False, True])
++def test_pull_child_owns_python_imports(tmp_path, monkeypatch, polluted):
++    """A timer-like clean parent and a PM-bootstrapped parent both pull successfully."""
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
++    monkeypatch.setattr(relay, "_ra", lambda: SimpleNamespace(logger=logging.getLogger(__name__)))
++    poison = tmp_path / "backend-site-packages"
++    poison.mkdir()
++    # Deterministic version skew: the child needs stdlib ssl, not backend packages.
++    (poison / "ssl.py").write_text("raise AttributeError(\"module 'lib' has no attribute 'GEN_EMAIL'\")\n")
++    output = tmp_path / "receipt.json"
++    script = tmp_path / "pull.py"
++    script.write_text(
++        "import ssl, json, os, sys\n"
++        "from pathlib import Path\n"
++        "Path(sys.argv[1]).write_text(json.dumps({k: os.environ.get(k) for k in "
++        "('HERMES_HOME', 'AWS_DEFAULT_REGION', 'WORKER_OAUTH_STAMP', 'PYTHONPATH', 'PYTHONHOME')}))\n"
++    )
++    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-west-2")
++    monkeypatch.setenv("WORKER_OAUTH_STAMP", str(tmp_path / "stamp"))
++    monkeypatch.delenv("PYTHONHOME", raising=False)
++    monkeypatch.delenv("PYTHONPATH", raising=False)
++    cmd = [sys.executable, str(script), str(output)]
++    if polluted:
++        monkeypatch.setenv("PYTHONPATH", str(poison))
++        broken = subprocess.run(cmd, capture_output=True, text=True, check=False)
++        assert broken.returncode != 0
++        assert "GEN_EMAIL" in broken.stderr
++    before = dict(os.environ)
++    relay._run_pull(cmd)
++    assert output.exists(), "relay child failed before writing its success receipt"
++    result = json.loads(output.read_text())
++    assert result == {"HERMES_HOME": before["HERMES_HOME"], "AWS_DEFAULT_REGION": "us-west-2",
++                      "WORKER_OAUTH_STAMP": before["WORKER_OAUTH_STAMP"],
++                      "PYTHONPATH": None, "PYTHONHOME": None}
++    assert dict(os.environ) == before
++
++
++def test_pull_child_ignores_backend_pythonhome(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
++    monkeypatch.setenv("PYTHONHOME", str(tmp_path / "nonexistent-runtime"))
++    monkeypatch.setattr(relay, "_ra", lambda: SimpleNamespace(logger=logging.getLogger(__name__)))
++    script = tmp_path / "pull.py"
++    receipt = tmp_path / "ok"
++    script.write_text("import pathlib, sys; pathlib.Path(sys.argv[1]).write_text('ok')\n")
++    relay._run_pull([sys.executable, str(script), str(receipt)])
++    assert receipt.read_text() == "ok"
++    assert os.environ["PYTHONHOME"] == str(tmp_path / "nonexistent-runtime")
+-- 
+2.51.0
+

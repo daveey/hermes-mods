@@ -1,0 +1,480 @@
+From a1eab4f33b0bc82e858a9d650e44e36c3c0c6454 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 20:13:46 +0000
+Subject: [PATCH] [daveey] require proven bindings and intact stdin before
+ nested heredoc masking
+
+---
+ .../cron/test_lifecycle_guard_heredoc_walk.py | 209 +++++++++++++++++-
+ tools/shell_heredoc.py                        | 166 ++++++++++++--
+ 2 files changed, 356 insertions(+), 19 deletions(-)
+
+diff --git a/tests/cron/test_lifecycle_guard_heredoc_walk.py b/tests/cron/test_lifecycle_guard_heredoc_walk.py
+index 1638071e08..57eea976c4 100644
+--- a/tests/cron/test_lifecycle_guard_heredoc_walk.py
++++ b/tests/cron/test_lifecycle_guard_heredoc_walk.py
+@@ -241,7 +241,12 @@ def test_trusted_owner_masks_the_data_body(command):
+     from tools.shell_heredoc import strip_inert_heredoc_bodies
+ 
+     masked = strip_inert_heredoc_bodies(command, nested=True)
+-    assert "\nx\n" not in masked and masked.count("\n") == command.count("\n"), masked
++    if "${XOPTS:-}" in command:
++        # This old positive case was unsound: unknown options can inject a remote
++        # program. Retain the case with its fail-closed expectation (real shell below).
++        assert masked == command
++    else:
++        assert "\nx\n" not in masked and masked.count("\n") == command.count("\n"), masked
+ 
+ 
+ @pytest.mark.parametrize("command", [
+@@ -367,6 +372,208 @@ def test_subshell_and_substitution_parens_still_execute(tmp_path, template):
+     assert unsafe is True and "scan cap" in refusal
+ 
+ 
++# --- binding provenance: textual assignments are not necessarily shell state --------------------
++
++@pytest.mark.parametrize("decoy", [
++    "if false; then CMD='bash -s'; fi",
++    "# CMD='bash -s'",
++    "CMD='bash -s' true",
++    "echo CMD='bash -s'",
++])
++def test_untrusted_variable_assignment_does_not_hide_executed_body(tmp_path, decoy):
++    import os
++    import subprocess
++    from tools.shell_heredoc import strip_inert_heredoc_bodies
++
++    marker = tmp_path / "marker"
++    hermes = tmp_path / "hermes"
++    hermes.write_text('#!/bin/sh\nprintf called > "$MARKER"\n')
++    hermes.chmod(0o755)
++    command = (
++        "transform() { sed s/python3/bash/ | bash; }\nCMD=transform\n" + decoy + "\n"
++        "$CMD <<'R'\npython3 - <<'PY'\n"
++        "bash -c 'hermes gateway \"restart\"'\nPY\nR\n"
++    )
++    result = subprocess.run(["bash"], input=command, text=True, encoding="utf-8", capture_output=True, check=False,
++                            env={**os.environ, "PATH": f"{tmp_path}:/usr/bin:/bin",
++                                 "MARKER": str(marker)}, timeout=10)
++    assert result.returncode == 0, result.stderr
++    assert marker.read_text() == "called"
++    assert guard(command, cwd=str(tmp_path)) is True
++    assert strip_inert_heredoc_bodies(command, nested=True) == command
++
++
++@pytest.mark.parametrize("mutation", [
++    "set -- ev al\n\"$1$2\" 'CMD=transform'",
++    "set -- pri ntf -v CMD transform\n\"$1$2\" \"$3\" \"$4\" \"$5\"",
++])
++def test_synthesized_mutator_cannot_change_a_trusted_shell_binding(tmp_path, mutation):
++    import os
++    import subprocess
++    from tools.shell_heredoc import strip_inert_heredoc_bodies
++
++    marker = tmp_path / "marker"
++    hermes = tmp_path / "hermes"
++    hermes.write_text('#!/bin/sh\nprintf called > "$MARKER"\n')
++    hermes.chmod(0o755)
++    transform = tmp_path / "transform"
++    transform.write_text('#!/bin/sh\nsed s/python3/bash/ | bash\n')
++    transform.chmod(0o755)
++    command = ("CMD=bash\n" + mutation + "\n$CMD <<'R'\npython3 - <<'PY'\n"
++               "bash -c 'hermes gateway \"restart\"'\nPY\nR\n")
++    result = subprocess.run(["bash"], input=command, text=True, encoding="utf-8", capture_output=True, check=False,
++                            env={**os.environ, "PATH": f"{tmp_path}:/usr/bin:/bin",
++                                 "MARKER": str(marker)}, timeout=10)
++    assert result.returncode == 0, result.stderr
++    assert marker.read_text() == "called"
++    assert guard(command, cwd=str(tmp_path)) is True
++    assert strip_inert_heredoc_bodies(command, nested=True) == command
++
++
++def test_ssh_binding_with_unknown_expansions_can_change_remote_program(tmp_path):
++    import os
++    import subprocess
++    from tools.shell_heredoc import strip_inert_heredoc_bodies
++
++    marker = tmp_path / "marker"
++    hermes = tmp_path / "hermes"
++    hermes.write_text('#!/bin/sh\nprintf called > "$MARKER"\n')
++    hermes.chmod(0o755)
++    ssh = tmp_path / "ssh"
++    # SSH's documented joining of remote arguments, without any network access.
++    ssh.write_text('#!/bin/sh\nshift 3\nexec sh -c "$*"\n')
++    ssh.chmod(0o755)
++    command = ('SSH="timeout 60 ssh -o A=b ${XOPTS:-} u@$IP"\n'
++               '$SSH "T=$T bash -s" <<\'R\'\npython3 - <<\'PY\'\n'
++               'bash -c \'hermes gateway "restart"\'\nPY\nR\n')
++    result = subprocess.run(["bash"], input=command, text=True, encoding="utf-8", capture_output=True, check=False,
++                            env={**os.environ, "PATH": f"{tmp_path}:/usr/bin:/bin",
++                                 "MARKER": str(marker), "IP": "h", "T": "x",
++                                 "XOPTS": "otherhost sed s/python3/bash/ | bash #"}, timeout=10)
++    assert result.returncode == 0, result.stderr
++    assert marker.read_text() == "called"
++    assert guard(command, cwd=str(tmp_path)) is True
++    assert strip_inert_heredoc_bodies(command, nested=True) == command
++
++
++@pytest.mark.parametrize("prefix", [
++    "if false; then\nCMD='bash -s'\nfi\n",
++    "# CMD='bash -s'\n",
++    "CMD='bash -s' true\n",
++    "echo CMD='bash -s'\n",
++    "f() {\nCMD='bash -s'\n}\n",
++    "true && (\nCMD='bash -s'\n)\n",
++    "echo '\nCMD=bash\n'\n",
++    "false &&\nCMD=bash\n",
++    "CMD=bash\nCMD=bash\n",
++    "CMD=bash\nprintf -v CMD transform\n",
++    "CMD=bash\ne'val' 'CMD=transform'; :\n",
++    "CMD=bash\nread CMD\n",
++    "CMD=bash\nunknown_command\n",
++    "CMD=bash\nset -- ev al\n\"$1$2\" 'CMD=transform'\n",
++    "CMD=bash\nset -- printf -v CMD transform\n\"$@\"\n",
++    "CMD='$OTHER'\n",
++    "CMD=bash\nPATH=/untrusted\n",
++    "CMD= bash\n",
++    "CMD= 'bash -s'\n",
++])
++def test_variable_binding_requires_unique_standalone_top_level_assignment(prefix):
++    from tools.shell_heredoc import _variable_value
++
++    assert _variable_value(prefix, "CMD", len(prefix)) is None
++
++
++@pytest.mark.parametrize("prefix", ["CMD='bash -s'\n", 'CMD="bash -s"\n'])
++def test_variable_binding_accepts_unique_standalone_assignment(prefix):
++    from tools.shell_heredoc import _variable_value
++
++    assert _variable_value(prefix, "CMD", len(prefix)) == "bash -s"
++
++
++# --- stdin scripts may be consumed by earlier commands before the shell parses them -------------
++
++@pytest.mark.parametrize("unit", [
++    "", "# comment", "MESSAGE='hello world'", 'echo "$MESSAGE"',
++    'echo before; q "$1"', ": ready", "set -u",
++])
++def test_nonreading_units_use_a_generic_positive_grammar(unit):
++    from tools.shell_heredoc import _nonreading_shell_unit
++
++    assert _nonreading_shell_unit(unit, {"q"}) is True
++
++
++@pytest.mark.parametrize("unit", [
++    "arbitrary_cli comment", "PATH=/untrusted", "set -- eval", "printf -v PATH /untrusted",
++    "printf '%n' PATH", 'echo "${X:=changed}"', 'echo "$((X=1))"',
++    "echo safe </dev/stdin", r"e\cho safe",
++    'echo "$(cat /arbitrary/file)"', "cat /dev/stdin", "q | bash",
++    "HB=$(command -v hermes || ls ~/.local/bin/hermes 2>/dev/null || echo ~/.hermes/hermes-agent/venv/bin/hermes)",
++    'env -u X timeout 60 "$HB" kanban comment x "$(cat /tmp/wc_$T.txt)" 2>&1 | tail -3 | cut -c1-200',
++])
++def test_cli_and_file_substitutions_are_not_proven_nonreading(unit):
++    from tools.shell_heredoc import _nonreading_shell_unit
++
++    # An executable discovered on PATH may read stdin; a file can be a symlink to it.
++    assert _nonreading_shell_unit(unit, set()) is False
++
++
++@pytest.mark.parametrize("prefix", [
++    "sed 's/^python3 - /bash -s /' | bash",
++    "while IFS= read -r line; do eval \"$line\"; done",
++    "hash -p /bin/bash python3",
++])
++def test_nested_stdin_hijack_walk_only_body_stays_visible(tmp_path, prefix):
++    import os
++    import subprocess
++    from tools.shell_heredoc import strip_inert_heredoc_bodies
++
++    marker = tmp_path / "marker"
++    hermes = tmp_path / "hermes"
++    hermes.write_text('#!/bin/sh\nprintf called > "$MARKER"\n')
++    hermes.chmod(0o755)
++    command = ("bash -s <<'R'\n" + prefix + "\npython3 - <<'PY'\n"
++               "bash -c 'hermes gateway \"restart\"'\nPY\nR\n")
++    result = subprocess.run(["bash"], input=command, text=True, encoding="utf-8", capture_output=True, check=False,
++                            env={**os.environ, "PATH": f"{tmp_path}:/usr/bin:/bin",
++                                 "MARKER": str(marker)}, timeout=10)
++    assert marker.read_text() == "called", result.stderr
++    assert guard(command, cwd=str(tmp_path)) is True
++    assert strip_inert_heredoc_bodies(command, nested=True) == command
++
++
++@pytest.mark.parametrize("opener", [
++    "ssh ${XOPTS:-} h 'bash -s' <<'R'",
++    "bash -s <<R",
++])
++def test_nested_masking_requires_literal_owner_and_quoted_outer_body(opener):
++    from tools.shell_heredoc import strip_inert_heredoc_bodies
++
++    command = opener + "\npython3 - <<'PY'\nx\nPY\nR\n"
++    assert strip_inert_heredoc_bodies(command, nested=True) == command
++
++
++@pytest.mark.parametrize("prefix", [
++    "unknown_command; ",
++    "unknown_command <<'A'\ndata\nA\n",
++])
++def test_nested_masking_stops_after_untrusted_same_line_or_heredoc_owner(prefix):
++    from tools.shell_heredoc import strip_inert_heredoc_bodies
++
++    command = "bash -s <<'R'\n" + prefix + "python3 - <<'PY'\nx\nPY\nR\n"
++    assert strip_inert_heredoc_bodies(command, nested=True) == command
++
++
++def test_nested_function_second_body_is_not_assumed_nonreading():
++    from tools.shell_heredoc import strip_inert_heredoc_bodies
++
++    command = ("bash -s <<'R'\nf() { python3 - <<'ONE'\nfirst\nONE\n"
++               "python3 - <<'TWO'\nsecond\nTWO\n}\nR\n")
++    masked = strip_inert_heredoc_bodies(command, nested=True)
++    assert "\nfirst\n" not in masked
++    assert "\nsecond\n" in masked
++    assert masked.count("\n") == command.count("\n")
++
++
+ # --- the refused scripts, verbatim ---------------------------------------------------------------
+ 
+ @pytest.mark.parametrize("script, db_rel", [
+diff --git a/tools/shell_heredoc.py b/tools/shell_heredoc.py
+index dc964c7313..d2a0a1ef38 100644
+--- a/tools/shell_heredoc.py
++++ b/tools/shell_heredoc.py
+@@ -70,7 +70,7 @@ _CONSUMER_SHADOW_RE = re.compile(
+     r"(?:^|[\s;&|(){{}}])(?:(?:function\s+)?{names}\s*\(\s*\)|function\s+{names}\s+\{{"
+     r"|alias\s+{names}=)".format(
+         names=r"(?:python[\d.]*|osascript|cat|timeout|nice|ionice|nohup|setsid|stdbuf|env|command"
+-              r"|exec|eatmydata|sudo|doas|ssh|bash|sh|dash|zsh|ksh)"),
++              r"|exec|eatmydata|sudo|doas|ssh|bash|sh|dash|zsh|ksh|echo|printf|set|tail|cut|ls)"),
+     re.IGNORECASE)
+ 
+ 
+@@ -170,18 +170,49 @@ def _ssh_runs_stdin_shell(words: list[str]) -> bool:
+         return False
+ 
+ 
+-def _variable_value(command: str, name: str, before: int) -> str | None:
+-    """Value of the last plain ``NAME=value`` assignment in ``command[:before]``, or None."""
+-    pattern = re.compile(r"(?:^|[\s;&|])" + re.escape(name)
+-                         + r"""=("(?:[^"\\]|\\.)*"|'[^']*'|[^\s;&|'"]*)(?=[\s;&|]|$)""")
+-    matches = list(pattern.finditer(command, 0, before))
+-    if not matches or "$(" in matches[-1].group(1) or "`" in matches[-1].group(1):
++def _literal_assignment(unit: str) -> tuple[str, str] | None:
++    """Recognize one literal scalar assignment, never shell state or expansions.
++
++    Even quoted expansion markers are rejected: callers split the value as a command,
++    not as a second shell program. No attempt is made to evaluate shell syntax.
++    """
++    match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", unit)
++    if (not match or match[2][:1].isspace()
++            or any(char in match[2] for char in "$`\\\n;|&<>(){}~*?[]")):
++        return None
++    name = match[1]
++    if name in {"PATH", "IFS", "ENV", "CDPATH", "GLOBIGNORE", "SHELLOPTS", "PS4"} or name.startswith("BASH"):
+         return None
+     try:
+-        words = shlex.split(matches[-1].group(1))
++        words = shlex.split(match[2])
+     except ValueError:
+         return None
+-    return words[0] if len(words) == 1 else None
++    return (name, words[0]) if len(words) == 1 else None
++
++
++def _variable_value(command: str, name: str, before: int) -> str | None:
++    """Resolve one literal binding in a wholly declarative prefix.
++
++    A mutator blacklist is insufficient: positional parameters, quoted names and
++    arbitrary functions can synthesize eval/printf/read. Unknown commands invalidate
++    provenance, even before the assignment. Ambiguous scopes and writes fail closed.
++    """
++    found: list[str] = []
++    cursor = 0
++    while cursor < before:
++        end, specs, unknown, _post, _owner = _scan_heredoc_command_unit(command, cursor)
++        if end > before or specs or unknown:
++            return None
++        unit = command[cursor:end].strip()
++        cursor = end + 1
++        if not unit or unit.startswith("#"):
++            continue
++        assignment = _literal_assignment(unit)
++        if assignment is None:
++            return None
++        if assignment[0] == name:
++            found.append(assignment[1])
++    return found[0] if len(found) == 1 else None
+ 
+ 
+ def _owner_feeds_shell(command: str, command_start: int, owner_start: int, specs: list) -> bool:
+@@ -214,6 +245,10 @@ def _owner_feeds_shell(command: str, command_start: int, owner_start: int, specs
+         if not value:
+             return False
+         words[first:first + 1] = value.split()
++    # Unknown expansions can inject SSH options, a host, or remote shell syntax.
++    # Resolving the first word is not proof of the remaining argument values.
++    if any("$" in word or "`" in word for word in words):
++        return False
+     return _is_stdin_shell(words) or _ssh_runs_stdin_shell(words)
+ 
+ 
+@@ -399,6 +434,91 @@ def _owner_runs_inert_consumer(
+ _OUTPUT_EXECUTOR_RE = re.compile(r"\||\$\(|`|<\(|>\(|\beval\b|\bsource\b|(?:^|[\s;&(])\.\s")
+ 
+ 
++def _nonreading_shell_unit(unit: str, functions: set[str]) -> bool:
++    """Positive grammar for units that cannot consume or reinterpret the stdin script.
++
++    External programs and file-backed substitutions are not trusted by name: even an
++    ordinary pathname can resolve to a script reader or a symlink to /dev/stdin.
++    Only literal assignments, nonmutating builtins and already-verified functions
++    qualify. Substitutions, arithmetic/indirect expansions, redirects and pipelines
++    remain visible. printf is excluded because %n and -v can mutate shell state.
++    """
++    unit = unit.strip()
++    if not unit or unit.startswith("#"):
++        return True
++    if _literal_assignment(unit) is not None:
++        return True
++    if any(mark in unit for mark in ("`", "<", ">", "\\", "\n")):
++        return False
++    # Simple scalar/positional expansions are arguments, never a command name.
++    simple_arguments = re.sub(r"\$(?:[A-Za-z_]\w*|[0-9]+)", "ARG", unit)
++    if "$" in simple_arguments:
++        return False
++    for segment in unit.split(";"):
++        try:
++            tokens = shlex.split(segment, comments=True)
++        except ValueError:
++            return False
++        if not tokens:
++            continue
++        if any(char in _mask_simple_quotes(segment) for char in "|&(){}"):
++            return False
++        if tokens[0] in {"echo", ":"} | functions:
++            continue
++        if tokens == ["set", "-u"]:
++            continue
++        return False
++    return True
++
++
++class _StdinScriptState:
++    """Track whether earlier units leave a nested shell's source stream untouched."""
++
++    def __init__(self) -> None:
++        self.intact = True
++        self.functions: set[str] = set()
++        self.pending_function: str | None = None
++
++    def observe_unit(self, unit: str) -> None:
++        unit = unit.strip()
++        if self.pending_function and unit == "}":
++            self.functions.add(self.pending_function)
++            self.pending_function = None
++        else:
++            safe = _nonreading_shell_unit(unit, self.functions)
++            self.intact = self.intact and safe and self.pending_function is None
++
++    def before_heredoc(self, command: str, start: int, owner: int) -> bool:
++        if self.pending_function:
++            self.intact = False
++        if owner > start:
++            safe = _nonreading_shell_unit(command[start:owner].rstrip(";&| "), self.functions)
++            self.intact = self.intact and safe
++        return self.intact
++
++    def begin_function(self, command: str, start: int, end: int) -> bool:
++        header = _FUNCTION_HEADER_RE.match(command, start, end)
++        if header is None:
++            return False
++        name = re.search(r"(?:function\s+)?([A-Za-z_][\w.:-]*)", header.group())
++        if name is None:
++            return False
++        self.pending_function = name.group(1)
++        return True
++
++
++def _heredoc_bodies(command: str, start: int, specs: list) -> list[tuple[int, int, int]] | None:
++    """Locate all bodies in opener order, failing closed on any missing terminator."""
++    bodies = []
++    for delimiter, strip_tabs, _quoted in specs:
++        closed = _find_heredoc_close(command, start, delimiter, strip_tabs)
++        if closed is None:
++            return None
++        bodies.append((start, *closed))
++        start = closed[1]
++    return bodies
++
++
+ def strip_inert_heredoc_bodies(command: str, *, nested: bool = False, _depth: int = 0) -> str:
+     """Mask heredoc bodies that are provably inert data (see module docstring).
+ 
+@@ -409,12 +529,15 @@ def strip_inert_heredoc_bodies(command: str, *, nested: bool = False, _depth: in
+     # Runs on every terminal call: skip the state machine when no '<<' exists; stop past the last.
+     if "<<" not in command:
+         return command
+-    if _CONSUMER_SHADOW_RE.search(command):
++    if (_CONSUMER_SHADOW_RE.search(command)
++            or re.search(r"(?:^|[\s;&|])hash\s", command)):
+         return command
+     last_opener_index = command.rfind("<<")
+     replacements: list[tuple[int, int, str, str]] = []
+     function_masks = 0
+     command_start = 0
++    stdin = _StdinScriptState()
++
+     while command_start <= last_opener_index:
+         (
+             command_end,
+@@ -426,25 +549,30 @@ def strip_inert_heredoc_bodies(command: str, *, nested: bool = False, _depth: in
+         if unknown_operator:
+             return command
+         if not specs:
++            if _depth:
++                stdin.observe_unit(command[command_start:command_end])
+             if command_end >= len(command):
+                 break
+             command_start = command_end + 1
+             continue
+         if command_end >= len(command):
+             return command  # opener with no body line: unterminated — leave visible
+-        body_cursor = command_end + 1
+-        bodies: list[tuple[int, int, int]] = []
+-        for delimiter, strip_tabs, _quoted in specs:
+-            closed = _find_heredoc_close(command, body_cursor, delimiter, strip_tabs)
+-            if closed is None:
+-                return command  # unterminated
+-            bodies.append((body_cursor, *closed))
+-            body_cursor = closed[1]
++        bodies = _heredoc_bodies(command, command_end + 1, specs)
++        if bodies is None:
++            return command  # unterminated
++        body_cursor = bodies[-1][2]
+         quoted = [spec_quoted for _delimiter, _strip_tabs, spec_quoted in specs]
+         consumer = None
+         if all(quoted) and not post_heredoc_list_operator:
+             consumer = _owner_runs_inert_consumer(command, command_start, command_end, owner_start)
++        if _depth and not stdin.before_heredoc(command, command_start, owner_start):
++            # Once a previous command could steal stdin, no later source lines can
++            # be interpreted as the shell's untouched program.
++            return _apply_replacements(command, replacements)
+         if consumer:
++            if _depth and consumer == "function":
++                if not stdin.begin_function(command, command_start, command_end):
++                    return command
+             function_masks += consumer == "function"
+             replacements += [(start, end, "\n" * command.count("\n", start, end), consumer)
+                              for start, _terminator, end in bodies]
+@@ -458,6 +586,8 @@ def strip_inert_heredoc_bodies(command: str, *, nested: bool = False, _depth: in
+                 masked = strip_inert_heredoc_bodies(inner, nested=True, _depth=_depth + 1)
+                 if masked != inner:
+                     replacements.append((start, terminator, masked, "nested"))
++        if _depth and not consumer:
++            stdin.intact = False
+         command_start = body_cursor
+     result = _apply_replacements(command, replacements)
+     if function_masks and not nested and _OUTPUT_EXECUTOR_RE.search(_mask_simple_quotes(result)):
+-- 
+2.51.0
+

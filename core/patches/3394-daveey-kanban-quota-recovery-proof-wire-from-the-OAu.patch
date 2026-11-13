@@ -1,0 +1,480 @@
+From 05a174a3602fd718ce0f889cc38f32bbafd8180c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:42:16 +0000
+Subject: [PATCH] [daveey] kanban quota recovery: proof wire from the OAuth
+ client, failed-proof cooldown, Windows drain guard, reaped resolver timeout
+
+Follow-up to the non-blocking nits in review 5887288967 on PR #1745.
+
+1. The Anthropic completion proof hard-coded user-agent claude-code/2.1.280
+   and the OAuth beta list. It now sends agent.anthropic_adapter's
+   oauth_wire_headers() (common betas + _OAUTH_ONLY_BETAS, detected Claude
+   Code user-agent, x-app) and the shared Claude Code system prefix, so the
+   proof wire cannot drift from the real client and give false "still
+   walled" negatives. Both OAuth paths in the adapter use the same new
+   claude_code_identity_headers(). recover() resolves the cached Claude
+   Code version before its proof deadline starts.
+   Test: the probe's anthropic-beta/user-agent/x-app equal
+   build_anthropic_client()'s headers for an OAuth token.
+
+2. Negative-result backoff: each (provider, model, account) proof is
+   reserved for 10 min in <kanban_home>/quota_proof_gate.db (BEGIN
+   IMMEDIATE, shared by every process of the home) and released only by a
+   completed proof. During a real wall each Kanban start no longer spends
+   one real 1-token completion per benched account; concurrent starts share
+   one probe too. An unusable gate store fails open (probes as before);
+   entries without a pool row id are not gated.
+   RED: two contradictions within the window -> one probe.
+
+3. drain_owner imported fcntl inside its try, so on Windows it logged
+   "quota contradiction drain failed" (WARNING + traceback) every tick while
+   reports were pending. fcntl is now imported at module load; without it
+   the drain is an explicit no-op with one debug line and reports stay
+   pending. RED: two ticks logged two WARNINGs.
+
+4. _getaddrinfo's finally ran process.wait(timeout=1) bare, so
+   subprocess.TimeoutExpired could replace the result and escape
+   completion_succeeds' except tuple. It now kills again and does one more
+   bounded reap (Popen's cleanup list reaps any survivor), and
+   completion_succeeds also catches SubprocessError, keeping its
+   returns-False contract. Tests for both.
+
+Kanban: t_01a1d3b0fa53cbc7
+---
+ agent/anthropic_adapter.py                    | 19 +++-
+ hermes_cli/kanban_quota_detector.py           | 18 +++-
+ hermes_cli/kanban_quota_recovery.py           | 97 +++++++++++++++++--
+ .../hermes_cli/test_kanban_quota_detector.py  | 20 ++++
+ .../test_kanban_quota_dns_deadline.py         | 42 ++++++++
+ .../hermes_cli/test_kanban_quota_recovery.py  | 75 +++++++++++++-
+ 6 files changed, 257 insertions(+), 14 deletions(-)
+
+diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
+index 0477632ebe..ed629f75c9 100644
+--- a/agent/anthropic_adapter.py
++++ b/agent/anthropic_adapter.py
+@@ -315,6 +315,18 @@ def _get_claude_code_version() -> str:
+     return _claude_code_version_cache
+ 
+ 
++def claude_code_identity_headers() -> dict[str, str]:
++    """User-agent + x-app every native OAuth request carries (Anthropic routes OAuth by user-agent)."""
++    return {"user-agent": f"claude-code/{_get_claude_code_version()} (external, cli)", "x-app": "cli"}
++
++
++def oauth_wire_headers(base_url: str | None = None) -> dict[str, str]:
++    """Beta + identity headers :func:`build_anthropic_client` sends for an OAuth token, for raw
++    callers (the Kanban quota proof) whose wire must not drift from the real client's."""
++    return {**_beta_header(_common_betas_for_base_url(base_url) + _OAUTH_ONLY_BETAS),
++            **claude_code_identity_headers()}
++
++
+ _CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
+ _MCP_TOOL_PREFIX = "mcp__"
+ 
+@@ -423,9 +435,7 @@ def _build_anthropic_client_with_bearer_hook(
+         # key_cmd-sourced Claude Code OAuth on the native host: a bare bearer without the Claude Code
+         # identity is answered with 429 rate_limit_error "Error" (#114967) — same headers as the
+         # static "oauth" style in build_anthropic_client.
+-        headers = _beta_header(betas + _OAUTH_ONLY_BETAS)
+-        headers["user-agent"] = f"claude-code/{_get_claude_code_version()} (external, cli)"
+-        headers["x-app"] = "cli"
++        headers = {**_beta_header(betas + _OAUTH_ONLY_BETAS), **claude_code_identity_headers()}
+     else:
+         headers = _beta_header(betas)
+     return _new_sdk_client(sdk, kwargs, headers, route=base_url)
+@@ -510,8 +520,7 @@ def build_anthropic_client(api_key, base_url: str | None = None, timeout: float
+     if style == "kimi":
+         headers = {**_attribution_headers(), **headers}
+     elif style == "oauth":
+-        headers["user-agent"] = f"claude-code/{_get_claude_code_version()} (external, cli)"
+-        headers["x-app"] = "cli"
++        headers.update(claude_code_identity_headers())
+     if _is_opencode_endpoint(base_url):
+         # OpenCode identifies clients by request headers (like OpenRouter). The OpenAI-wire paths
+         # get these from profile.default_headers, but this route never sees the profile.
+diff --git a/hermes_cli/kanban_quota_detector.py b/hermes_cli/kanban_quota_detector.py
+index 1838f3627e..5eccb632d7 100644
+--- a/hermes_cli/kanban_quota_detector.py
++++ b/hermes_cli/kanban_quota_detector.py
+@@ -23,7 +23,13 @@ import sqlite3
+ import time
+ from contextlib import closing
+ 
++try:
++    import fcntl as _fcntl
++except ImportError:  # Windows: drain_owner skips (see there)
++    _fcntl = None
++
+ log = logging.getLogger(__name__)
++_NO_FLOCK_LOGGED = False
+ WINDOW_SECONDS = 1800
+ THRESHOLD = 3
+ _ID = re.compile(r'[A-Za-z0-9_.:-]{1,64}')
+@@ -175,10 +181,18 @@ def drain_owner(conn, *, detector=None, writer=None):
+         det = detector or Detector(default_path())
+         if not det.pending():
+             return 0
+-        import fcntl  # one drainer at a time: create_task's idempotency check is not atomic
++        if _fcntl is None:
++            # No flock (Windows): one owner-side drainer cannot be guaranteed, and create_task's
++            # idempotency check is not atomic. Keep the reports pending rather than warn every tick.
++            global _NO_FLOCK_LOGGED
++            if not _NO_FLOCK_LOGGED:
++                _NO_FLOCK_LOGGED = True
++                log.debug('quota contradiction drain skipped: no fcntl.flock on this platform')
++            return 0
++        # one drainer at a time: create_task's idempotency check is not atomic
+         with open(str(det.path) + '.drain.lock', 'ab') as lock:
+             try:
+-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++                _fcntl.flock(lock, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+             except OSError:
+                 return 0
+             return det.deliver(lambda r: (writer or create_or_comment)(conn, r))
+diff --git a/hermes_cli/kanban_quota_recovery.py b/hermes_cli/kanban_quota_recovery.py
+index c5515bad1e..3bedd95a77 100644
+--- a/hermes_cli/kanban_quota_recovery.py
++++ b/hermes_cli/kanban_quota_recovery.py
+@@ -2,12 +2,18 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import contextlib
+ import json
++import subprocess
+ import time
+ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+ from contextvars import copy_context
+ 
+ MAX_RESPONSE_BYTES = 1 << 20
++# A refused/failed proof benches that (provider, model, account) proof for this long across
++# every process of the home: during a real wall each Kanban start would otherwise spend one
++# real completion per benched account.
++FAILED_PROOF_COOLDOWN_SECONDS = 600
+ 
+ # libc DNS has no cancellation API. Keep it outside the interpreter/executor so
+ # cancelling a probe can kill AND reap the resolver, including during loop shutdown.
+@@ -58,7 +64,18 @@ async def _getaddrinfo(host, port, *, family=0, type=0, proto=0, flags=0):
+                     process.kill()
+                 except ProcessLookupError:
+                     pass
+-            process.wait(timeout=1)
++            try:
++                process.wait(timeout=1)
++            except subprocess.TimeoutExpired:
++                # Not reaped within 1 s (killed child stuck in the kernel, or never killed): kill
++                # again and give it one more bounded reap; Popen's own cleanup list reaps a
++                # survivor later. Never let TimeoutExpired replace the closed result.
++                try:
++                    process.kill()
++                except ProcessLookupError:
++                    pass
++                with contextlib.suppress(subprocess.TimeoutExpired):
++                    process.wait(timeout=1)
+ 
+ 
+ async def _run_attempt(provider, url, headers, body, deadline):
+@@ -146,12 +163,13 @@ def completion_succeeds(provider, model, observed, deadline):
+         return False
+     headers = {'Authorization': f'Bearer {observed.runtime_api_key}'}
+     if provider == 'anthropic':
++        # The real OAuth client's wire (betas, detected Claude Code user-agent, x-app): a
++        # drifted proof wire would be refused and read as a false "still walled".
++        from agent.anthropic_adapter import _CLAUDE_CODE_SYSTEM_PREFIX, oauth_wire_headers
+         url = 'https://api.anthropic.com/v1/messages'
+-        headers.update({'anthropic-version': '2023-06-01',
+-                        'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20',
+-                        'user-agent': 'claude-code/2.1.280 (external, cli)', 'x-app': 'cli'})
++        headers.update({'anthropic-version': '2023-06-01', **oauth_wire_headers()})
+         body = {'model': model, 'max_tokens': 1,
+-                'system': [{'type': 'text', 'text': "You are Claude Code, Anthropic's official CLI for Claude."}],
++                'system': [{'type': 'text', 'text': _CLAUDE_CODE_SYSTEM_PREFIX}],
+                 'messages': [{'role': 'user', 'content': 'Reply OK.'}]}
+     elif provider == 'openai-codex':
+         from agent.codex_headers import CODEX_AUX_BASE_URL, codex_cloudflare_headers
+@@ -166,10 +184,66 @@ def completion_succeeds(provider, model, observed, deadline):
+         return False
+     try:
+         return asyncio.run(_run_attempt(provider, url, headers, body, deadline))
+-    except (httpx.HTTPError, OSError, ValueError, TimeoutError):
++    except (httpx.HTTPError, OSError, ValueError, TimeoutError, subprocess.SubprocessError):
+         return False
+ 
+ 
++def _proof_gate_path():
++    from hermes_cli.kanban_db import kanban_home
++    return str(kanban_home() / 'quota_proof_gate.db')
++
++
++def _proof_key(provider, model, entry):
++    aid = getattr(entry, 'id', None)
++    return json.dumps([provider, model, aid]) if isinstance(aid, str) and aid else None
++
++
++def _gate_connect(path):
++    import sqlite3
++    # quota_proof_gate.db: a local per-home proof throttle, never a board.
++    conn = sqlite3.connect(path, timeout=0.25)  # noqa: kanban-lockguard (not a board)
++    conn.execute('CREATE TABLE IF NOT EXISTS proofs (key TEXT PRIMARY KEY, at REAL)')
++    conn.commit()
++    return conn
++
++
++def _reserve_proofs(provider, model, entries, now, *, path=None):
++    """Entries whose proof may run now, each reserved for the cooldown window (cross-process).
++
++    An account with a failed or in-flight proof within FAILED_PROOF_COOLDOWN_SECONDS is skipped,
++    so concurrent and back-to-back starts share one probe. A verified proof deletes its row.
++    Entries without a pool row id are not gated. An unusable store fails open (probe as before).
++    """
++    from contextlib import closing
++    keyed = [(e, _proof_key(provider, model, e)) for e in entries]
++    try:
++        with closing(_gate_connect(path or _proof_gate_path())) as conn, conn:
++            conn.execute('BEGIN IMMEDIATE')
++            conn.execute('DELETE FROM proofs WHERE at < ?', (now - FAILED_PROOF_COOLDOWN_SECONDS,))
++            allowed = []
++            for entry, key in keyed:
++                if key is not None:
++                    if conn.execute('SELECT 1 FROM proofs WHERE key=?', (key,)).fetchone():
++                        continue
++                    conn.execute('INSERT OR REPLACE INTO proofs VALUES (?, ?)', (key, now))
++                allowed.append(entry)
++            return allowed
++    except Exception:  # health: allow BLE001 -- a broken throttle must not disable recovery
++        import logging
++        logging.getLogger(__name__).debug('quota proof gate unavailable; probing ungated', exc_info=True)
++        return list(entries)
++
++
++def _release_proof(provider, model, entry, *, path=None):
++    """A verified proof clears its reservation so the next bench of this account probes at once."""
++    from contextlib import closing
++    key = _proof_key(provider, model, entry)
++    if key is None:
++        return
++    with contextlib.suppress(Exception), closing(_gate_connect(path or _proof_gate_path())) as conn, conn:
++        conn.execute('DELETE FROM proofs WHERE key=?', (key,))
++
++
+ def _eligible(entry, provider, model, now, disabled):
+     from agent.credential_pool import STATUS_DEAD, STATUS_EXHAUSTED
+     from agent.credential_pool_disabled import matches
+@@ -189,17 +263,27 @@ def recover(provider, model, *, seconds=None):
+ 
+     Futures hold detached observations, never the pool. Timed-out futures can finish but cannot
+     clear anything. Usage endpoints are intentionally not prerequisites: unknown usage is common.
++    Each (provider, model, account) proof is reserved for FAILED_PROOF_COOLDOWN_SECONDS across
++    processes (released only by a completed proof), so a real wall costs one completion per
++    account per window, not one per Kanban start.
+     """
+     from copy import deepcopy
+     from agent.credential_pool import load_pool
+     from agent.credential_pool_disabled import disabled_keys
+     from hermes_cli.kanban_quota_probe import PROBE_DEADLINE_SECONDS
++    if provider == 'anthropic':
++        # Resolve the cached Claude Code version (a `claude --version` subprocess) before the
++        # proof deadline starts, not inside every proof thread.
++        from agent.anthropic_adapter import _get_claude_code_version
++        _get_claude_code_version()
+     deadline = time.monotonic() + (PROBE_DEADLINE_SECONDS if seconds is None else seconds)
+     if provider not in ('anthropic', 'openai-codex') or not model:
+         return False
+     pool = load_pool(provider, allowed_auth_types={'oauth'})
+     disabled = disabled_keys(provider)
+     entries = [deepcopy(e) for e in pool.entries() if _eligible(e, provider, model, time.time(), disabled)]
++    if entries:
++        entries = _reserve_proofs(provider, model, entries, time.time())
+     if not entries or time.monotonic() >= deadline:
+         return False
+     executor = ThreadPoolExecutor(max_workers=len(entries), thread_name_prefix='quota-proof')
+@@ -214,6 +298,7 @@ def recover(provider, model, *, seconds=None):
+                     break
+                 if not future.exception() and future.result() and time.monotonic() < deadline:
+                     observed = futures[future]
++                    _release_proof(provider, model, observed)
+                     if pool.clear_verified_model_cooldown(observed, model):
+                         cleared = True
+                         verified.append({'id': getattr(observed, 'id', ''),
+diff --git a/tests/hermes_cli/test_kanban_quota_detector.py b/tests/hermes_cli/test_kanban_quota_detector.py
+index 1f3e81368f..7514ee0c7e 100644
+--- a/tests/hermes_cli/test_kanban_quota_detector.py
++++ b/tests/hermes_cli/test_kanban_quota_detector.py
+@@ -121,6 +121,26 @@ def test_managed_worker_cannot_drain(tmp_path, monkeypatch):
+     assert len(Detector(path).pending()) == 1
+ 
+ 
++def test_drain_without_flock_skips_quietly_and_keeps_reports(tmp_path, monkeypatch, caplog):
++    """Windows has no fcntl: the drain is an explicit no-op with one debug line, not a warning per tick."""
++    import logging
++    import sys
++    from hermes_cli import kanban_quota_detector as detector
++    _kb, conn = _board(tmp_path, monkeypatch)
++    path = tmp_path / 'd.db'
++    _three(path)
++    monkeypatch.setitem(sys.modules, 'fcntl', None)  # `import fcntl` raises ImportError, as on Windows
++    monkeypatch.setattr(detector, '_fcntl', None, raising=False)
++    monkeypatch.setattr(detector, '_NO_FLOCK_LOGGED', False, raising=False)
++    with caplog.at_level(logging.DEBUG, logger=detector.__name__):
++        assert detector.drain_owner(conn, detector=detector.Detector(path)) == 0
++        assert detector.drain_owner(conn, detector=detector.Detector(path)) == 0
++    records = [r for r in caplog.records if r.name == detector.__name__]
++    assert [r.levelno for r in records] == [logging.DEBUG]
++    assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 0
++    assert len(detector.Detector(path).pending()) == 1
++
++
+ def test_drain_failsoft_and_concurrent_owners_single_card(tmp_path, monkeypatch):
+     from hermes_cli.kanban_quota_detector import Detector, drain_owner
+     _kb, conn = _board(tmp_path, monkeypatch)
+diff --git a/tests/hermes_cli/test_kanban_quota_dns_deadline.py b/tests/hermes_cli/test_kanban_quota_dns_deadline.py
+index 97943dc1bd..fb0767081b 100644
+--- a/tests/hermes_cli/test_kanban_quota_dns_deadline.py
++++ b/tests/hermes_cli/test_kanban_quota_dns_deadline.py
+@@ -104,3 +104,45 @@ def test_resolver_explicit_reap_guard_and_mutant(monkeypatch, drop_wait):
+     monkeypatch.setattr(subprocess, 'Popen', spawn)
+     assert asyncio.run(module._getaddrinfo('unused.invalid', 443)) == []
+     assert process.wait.called is (not drop_wait)
++
++
++@pytest.mark.parametrize('child_ok', [False, True])
++def test_unreaped_resolver_timeout_never_escapes(monkeypatch, child_ok):
++    """A resolver that outlives the 1 s reap is killed and reaped again; TimeoutExpired never escapes."""
++    import asyncio
++    import io
++    import types
++    from unittest.mock import Mock
++
++    waits = Mock(side_effect=[subprocess.TimeoutExpired('resolver', 1), 0])
++    process = types.SimpleNamespace(stdin=io.BytesIO(), poll=lambda: 0, returncode=0 if child_ok else 1,
++                                    wait=waits, kill=Mock())
++
++    def spawn(*args, **kw):
++        kw['stdout'].write(b'[]')
++        return process
++
++    monkeypatch.setattr(subprocess, 'Popen', spawn)
++    if child_ok:
++        assert asyncio.run(recovery._getaddrinfo('unused.invalid', 443)) == []
++    else:
++        with pytest.raises(OSError, match='DNS resolution failed'):
++            asyncio.run(recovery._getaddrinfo('unused.invalid', 443))
++    assert waits.call_count == 2
++    process.kill.assert_called_once_with()
++
++
++def test_completion_returns_false_when_resolver_cannot_be_reaped(monkeypatch):
++    import httpx
++    import io
++    import types
++    from unittest.mock import Mock
++
++    process = types.SimpleNamespace(
++        stdin=io.BytesIO(), poll=lambda: 0, returncode=1, kill=Mock(),
++        wait=Mock(side_effect=subprocess.TimeoutExpired('resolver', 1)))
++    monkeypatch.setattr(subprocess, 'Popen', lambda *a, **kw: process)
++    monkeypatch.setattr(recovery, '_client', lambda timeout: httpx.AsyncClient(timeout=timeout, trust_env=False))
++    entry = types.SimpleNamespace(runtime_api_key='synthetic')
++    assert recovery.completion_succeeds('anthropic', 'm', entry, time.monotonic() + 5) is False
++    assert process.wait.call_count >= 2
+diff --git a/tests/hermes_cli/test_kanban_quota_recovery.py b/tests/hermes_cli/test_kanban_quota_recovery.py
+index bdba4e082e..926bf36edf 100644
+--- a/tests/hermes_cli/test_kanban_quota_recovery.py
++++ b/tests/hermes_cli/test_kanban_quota_recovery.py
+@@ -41,18 +41,91 @@ def test_completion_uses_claude_code_wire(monkeypatch):
+         import json
+         seen.append((request, json.loads(request.content)))
+         return httpx.Response(200, json=MESSAGE)
++    monkeypatch.setattr('agent.anthropic_adapter._claude_code_version_cache', '9.8.7')
+     monkeypatch.setattr(recovery, '_client', lambda timeout: httpx.AsyncClient(transport=httpx.MockTransport(handle)))
+     assert recovery.completion_succeeds('anthropic', 'model', _entry(), recovery.time.monotonic() + 5)
+     request, body = seen[0]
+     assert request.url == 'https://api.anthropic.com/v1/messages'
+     assert request.headers['x-app'] == 'cli'
+     assert 'oauth-2025-04-20' in request.headers['anthropic-beta']
+-    assert request.headers['user-agent'].startswith('claude-code/2.1.280')
++    assert request.headers['user-agent'] == 'claude-code/9.8.7 (external, cli)'
+     assert body['max_tokens'] == 1 and body['model'] == 'model'
+     assert body['system'][0]['text'] == "You are Claude Code, Anthropic's official CLI for Claude."
+     assert len(seen) == 1
+ 
+ 
++def test_proof_wire_headers_equal_the_oauth_client(monkeypatch):
++    """The proof sends exactly the identity/beta headers the real OAuth client sends."""
++    from agent import anthropic_adapter
++    from hermes_cli import kanban_quota_recovery as recovery
++    monkeypatch.setattr(anthropic_adapter, '_claude_code_version_cache', '9.8.7')
++    for name in ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL'):
++        monkeypatch.delenv(name, raising=False)
++    client = anthropic_adapter.build_anthropic_client('sk-ant-oat01-' + 'x' * 40)
++    real = {k.lower(): v for k, v in client._custom_headers.items() if isinstance(v, str)}
++    seen = []
++    monkeypatch.setattr(recovery, '_client', lambda timeout: httpx.AsyncClient(transport=httpx.MockTransport(
++        lambda request: seen.append(request) or httpx.Response(200, json=MESSAGE))))
++    assert recovery.completion_succeeds('anthropic', 'model', _entry(), recovery.time.monotonic() + 5)
++    for header in ('anthropic-beta', 'user-agent', 'x-app'):
++        assert seen[0].headers[header] == real[header], header
++
++
++def _gated_entries(*ids):
++    entries = [_entry(id=i) for i in ids]
++    return entries, SimpleNamespace(entries=lambda: entries, clear_verified_model_cooldown=Mock(return_value=True))
++
++
++def test_failed_proof_cools_down_per_account_across_starts(monkeypatch, tmp_path):
++    """Two quota walls within the cooldown -> one real completion per (provider, model, account)."""
++    from hermes_cli import kanban_quota_recovery as recovery
++    monkeypatch.setattr(recovery, '_proof_gate_path', lambda: str(tmp_path / 'gate.db'))
++    entries, pool = _gated_entries('acct1')
++    monkeypatch.setattr('agent.credential_pool.load_pool', lambda *a, **k: pool)
++    complete = Mock(return_value=False)
++    monkeypatch.setattr(recovery, 'completion_succeeds', complete)
++    clock = [1_000_000.0]
++    monkeypatch.setattr(recovery.time, 'time', lambda: clock[0])
++    assert not recovery.recover('anthropic', 'model')
++    assert not recovery.recover('anthropic', 'model')
++    assert complete.call_count == 1
++    # Another model of the same account is its own proof.
++    assert not recovery.recover('anthropic', 'other')
++    assert complete.call_count == 1  # 'other' is not benched on the fixture entry, so ineligible
++    entries[0].model_cooldowns['other'] = 9999999999
++    assert not recovery.recover('anthropic', 'other')
++    assert complete.call_count == 2
++    clock[0] += recovery.FAILED_PROOF_COOLDOWN_SECONDS + 1
++    assert not recovery.recover('anthropic', 'model')
++    assert complete.call_count == 3
++
++
++def test_verified_proof_releases_its_cooldown(monkeypatch, tmp_path):
++    from hermes_cli import kanban_quota_recovery as recovery
++    monkeypatch.setattr(recovery, '_proof_gate_path', lambda: str(tmp_path / 'gate.db'))
++    monkeypatch.setattr('hermes_cli.kanban_quota_detector.record_contradiction', lambda *a, **k: None)
++    _, pool = _gated_entries('acct1', 'acct2')
++    monkeypatch.setattr('agent.credential_pool.load_pool', lambda *a, **k: pool)
++    complete = Mock(side_effect=lambda p, m, e, d: e.id == 'acct1')
++    monkeypatch.setattr(recovery, 'completion_succeeds', complete)
++    assert recovery.recover('anthropic', 'model')
++    assert recovery.recover('anthropic', 'model')
++    # acct1 proved twice (released on success); acct2's failed proof stays benched.
++    assert sorted(c.args[2].id for c in complete.call_args_list) == ['acct1', 'acct1', 'acct2']
++
++
++def test_broken_proof_gate_fails_open(monkeypatch, tmp_path):
++    from hermes_cli import kanban_quota_recovery as recovery
++    monkeypatch.setattr(recovery, '_proof_gate_path', lambda: str(tmp_path / 'missing-dir' / 'gate.db'))
++    _, pool = _gated_entries('acct1')
++    monkeypatch.setattr('agent.credential_pool.load_pool', lambda *a, **k: pool)
++    complete = Mock(return_value=False)
++    monkeypatch.setattr(recovery, 'completion_succeeds', complete)
++    assert not recovery.recover('anthropic', 'model')
++    assert not recovery.recover('anthropic', 'model')
++    assert complete.call_count == 2
++
++
+ @pytest.mark.parametrize('data,ok', [
+     ('data: {"type":"response.created"}\n\n', False),
+     ('data: {"type":"response.failed"}\n\n', False),
+-- 
+2.51.0
+

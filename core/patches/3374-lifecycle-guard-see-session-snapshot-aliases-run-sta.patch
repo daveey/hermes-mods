@@ -1,0 +1,972 @@
+From c3bbf092e9c46a811de7c8fc1d506a9237c4dd66 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:43:14 +0000
+Subject: [PATCH] lifecycle guard: see session-snapshot aliases; run
+ startup-file proofs on CI (review 5888336995 nits 1-2)
+
+Nit 2 (fail-open main did not have): the terminal backend sources a login
+snapshot holding `alias -p` and `shopt -s expand_aliases` before every
+command, so `alias t='time '` turns `t ( bash /x/huge.sh )` into a subshell
+running an unscannable script, which the guard read as a mention.
+- The snapshot bootstrap now prints the alias names it captured
+  (`_alias_names_printf`), BaseEnvironment reports them through
+  `lifecycle_guard_session_aliases()`, and gateway_lifecycle_block passes them
+  to `scan_gateway_lifecycle(session_aliases=...)`.
+- Any session alias (or unknown names: no snapshot yet, bootstrap silent)
+  makes `aliases_possible` true for the whole walk; an alias that may rename a
+  heredoc consumer, wrapper or shell (`alias python3=bash`) disables heredoc
+  masking entirely.
+- Shape corpus: new generator dimension "aliases defined outside the walked
+  text" (6 snapshots x 3 forms x 5 payloads), run in real bash the way the
+  backend does (source snapshot, eval command). A mutant guard that ignores the
+  snapshot produces 21 corpus violations; this tree reports violations=0 on
+  the full corpus (17410 cases).
+
+Nit 1: the startup-file execution proofs no longer degrade to a warning the
+parallel runner drops. `startup_shell_prefix()` finds a shell that sources
+`$HOME` startup files (plain bash, else bubblewrap masking /etc/profile*,
+which the CI test job installs); with one the proof must pass, without one
+it is a real pytest skip whose reason is also appended to
+$GITHUB_STEP_SUMMARY (run_tests.sh now forwards it).
+---
+ cron/lifecycle_guard.py                       |  62 +++++--
+ scripts/run_tests.sh                          |   5 +-
+ .../main_verdicts.json                        |  25 ++-
+ tests/cron/heredoc_shape_corpus.py            | 154 ++++++++++++++++--
+ .../cron/test_lifecycle_guard_heredoc_walk.py |  89 +++++-----
+ .../test_lifecycle_guard_session_aliases.py   | 105 ++++++++++++
+ tools/environments/base.py                    |  21 ++-
+ tools/environments/base_session_env.py        |  30 +++-
+ tools/shell_heredoc.py                        |  15 +-
+ tools/terminal_tool_guards.py                 |  18 ++
+ 10 files changed, 446 insertions(+), 78 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_session_aliases.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 4b4307bdb0..35fe507307 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -391,8 +391,9 @@ def _contains_launchctl_gateway_lifecycle(normalized_text: str) -> bool:
+     )
+ 
+ 
+-def contains_gateway_lifecycle_command(text: str) -> bool:
+-    """Return True if *text* contains a gateway lifecycle command pattern.
++def contains_gateway_lifecycle_command(text: str, *, mask_heredocs: bool = True) -> bool:
++    """Return True if *text* contains a gateway lifecycle command pattern. ``mask_heredocs=False``
++    scans inert-looking heredoc bodies too (a session alias may shadow their consumer).
+ 
+     Passes, in order: raw-text regex (the only pass that fires on inputs shlex cannot tokenize, e.g.
+     Python source); profile-flag form; the same regex on each shell-tokenized segment with quotes/
+@@ -420,7 +421,8 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
+     # restart" inside such a body is documentation, not a command this shell will execute.
+     from tools.shell_heredoc import strip_inert_heredoc_bodies
+ 
+-    text = strip_inert_heredoc_bodies(text)
++    if mask_heredocs:
++        text = strip_inert_heredoc_bodies(text)
+     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
+     if _GATEWAY_LIFECYCLE_PATTERN.search(normalized):
+         return True
+@@ -481,6 +483,7 @@ class _LifecycleScanBudget:
+         "aliases_possible",
+         "bytes_remaining",
+         "lines_remaining",
++        "mask_heredocs",
+         "overrun",
+         "paths_remaining",
+         "refusal",
+@@ -488,7 +491,8 @@ class _LifecycleScanBudget:
+         "separator_lines",
+     )
+ 
+-    def __init__(self, *, separator_lines: int = 0) -> None:
++    def __init__(self, session_aliases: Optional[frozenset[str]] = frozenset(), *,
++                 separator_lines: int = 0) -> None:
+         # Read the module constants at construction so tests/operators can lower them at runtime.
+         self.bytes_remaining = _MAX_LIFECYCLE_SCAN_BYTES
+         self.lines_remaining = _MAX_LIFECYCLE_SCAN_LINES
+@@ -502,8 +506,12 @@ class _LifecycleScanBudget:
+         # join). Charged like any line, never reported as the text's own; spent on the first charge.
+         self.separator_lines = separator_lines
+         # Sticky for the whole walk: any walked text (the command, an eval payload, a sourced
+-        # script) that may define an alias makes `NAME ( … )` possibly a keyword-led subshell.
+-        self.aliases_possible = False
++        # script) that may define an alias makes `NAME ( … )` possibly a keyword-led subshell. So do
++        # aliases the command's shell already holds (*session_aliases*, see `scan_gateway_lifecycle`).
++        self.aliases_possible = session_aliases is None or bool(session_aliases)
++        # False when a session alias may shadow a heredoc consumer, wrapper or shell name
++        # (`alias python3=bash`): then no heredoc body is provably inert, so none is masked.
++        self.mask_heredocs = not _session_aliases_shadow_consumers(session_aliases)
+ 
+     def note_aliases(self, text: str) -> None:
+         """Record (sticky) that walked *text* may define or enable an alias."""
+@@ -783,6 +791,18 @@ def _may_define_alias(text: str) -> bool:
+     return "alias" in re.sub(r"[\"'\\\\]", "", text).lower() or "$'" in text
+ 
+ 
++def _session_aliases_shadow_consumers(session_aliases: Optional[frozenset[str]]) -> bool:
++    """Whether aliases the command's shell already holds may rename a heredoc consumer, wrapper
++    or shell (``alias python3=bash`` runs a "Python" body as shell). ``None`` means the names
++    are unknown, so any name may be shadowed."""
++    from tools.shell_heredoc import shadows_heredoc_consumer
++
++    if session_aliases is None:
++        return True
++    return any(not isinstance(name, str) or shadows_heredoc_consumer(name)
++               for name in session_aliases)
++
++
+ def _iter_positioned_command_segments(command: str) -> Iterator[tuple[list[str], bool]]:
+     """``_iter_command_segments`` plus whether each segment is the argument list of a call
+     (``True``): the segment right after a ``(`` that follows an ordinary word."""
+@@ -910,19 +930,20 @@ def _mask_data_sink_arguments(text: str) -> str:
+     return "\n".join(lines_out) if changed else text
+ 
+ 
+-def _lifecycle_command_scan_with_data_exemption(text: str) -> bool:
++def _lifecycle_command_scan_with_data_exemption(text: str, *, mask_heredocs: bool = True) -> bool:
+     """Lifecycle scan exempting matches inside data arguments: cheap regex first (no-match pays
+     nothing), then re-scan with data-sink arguments masked; only a surviving match blocks."""
+-    if not contains_gateway_lifecycle_command(text):
++    if not contains_gateway_lifecycle_command(text, mask_heredocs=mask_heredocs):
+         return False
+     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
+-    return contains_gateway_lifecycle_command(_mask_data_sink_arguments(normalized))
++    return contains_gateway_lifecycle_command(
++        _mask_data_sink_arguments(normalized), mask_heredocs=mask_heredocs)
+ 
+ 
+-def _direct_lifecycle_scan(command: str) -> bool:
++def _direct_lifecycle_scan(command: str, *, mask_heredocs: bool = True) -> bool:
+     """Pure-string direct scans: lifecycle regex (data-exempted) + submit."""
+     return (
+-        _lifecycle_command_scan_with_data_exemption(command)
++        _lifecycle_command_scan_with_data_exemption(command, mask_heredocs=mask_heredocs)
+         or contains_launchctl_submit_command(command)
+     )
+ 
+@@ -1294,7 +1315,7 @@ def _contains_unsafe_gateway_action(
+     # Charge BEFORE _direct_lifecycle_scan: every scan in it tokenizes with shlex.
+     if not budget.charge_text(command):
+         return _budget_exhausted(budget, "text", depth, source=source) if executed else False
+-    if _direct_lifecycle_scan(command):
++    if _direct_lifecycle_scan(command, mask_heredocs=budget.mask_heredocs):
+         return True
+     budget.note_aliases(command)
+     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
+@@ -1311,7 +1332,8 @@ def _contains_unsafe_gateway_action(
+     # oversized data file mentioned there otherwise fails closed as a "script".
+     from tools.shell_heredoc import strip_inert_heredoc_bodies
+ 
+-    walk_command = strip_inert_heredoc_bodies(command, nested=True)
++    walk_command = (strip_inert_heredoc_bodies(command, nested=True) if budget.mask_heredocs
++                    else command)
+ 
+     for payload in _iter_shell_command_payloads(walk_command):
+         # An `sh -c` payload is text of the same file (or command) it appears in.
+@@ -1378,6 +1400,7 @@ def scan_gateway_lifecycle(
+     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+     source: Optional[str] = None,
+     separator_lines: int = 0,
++    session_aliases: Optional[frozenset[str]] = frozenset(),
+ ) -> tuple[bool, Optional[str]]:
+     """``(unsafe, refusal)``: *refusal* names a non-lifecycle reason the walk failed closed (budget,
+     size, device, live SQLite, cloud) so callers can tell the model; ``None`` when the verdict is a
+@@ -1385,6 +1408,13 @@ def scan_gateway_lifecycle(
+     refusal (default "the command"); *separator_lines* counts newlines the caller added to join it,
+     left out of a refusal's reported line count (the budget still charges them).
+ 
++    *session_aliases* are the alias names the shell running *command* already holds before its
++    first line, outside the walked text: the terminal backend sources a login snapshot holding
++    ``alias -p`` and ``shopt -s expand_aliases`` (``tools/environments/base_session_env.py``).
++    ``None`` means it may hold aliases with unknown names. Any session alias makes ``NAME ( … )``
++    possibly a keyword-led subshell (``alias t='time '``), and one that may rename a heredoc
++    consumer, wrapper or shell (``alias python3=bash``) leaves every heredoc body visible.
++
+     Total by construction: never raises. Direct scans are pure string ops; the referenced-script
+     walk (filesystem, remote backends, shlex on decoded bytes) is best-effort defense-in-depth — an
+     unexpected failure is logged and treated as "walk found nothing".
+@@ -1394,7 +1424,7 @@ def scan_gateway_lifecycle(
+     every terminal command until the gateway restarts (#77780, #78256), which is strictly worse than either
+     verdict.
+     """
+-    budget = _LifecycleScanBudget(separator_lines=separator_lines)
++    budget = _LifecycleScanBudget(session_aliases, separator_lines=separator_lines)
+     try:
+         unsafe = _contains_unsafe_gateway_action(
+             command, cwd=cwd, depth=0, visited=set(), budget=budget,
+@@ -1408,10 +1438,10 @@ def scan_gateway_lifecycle(
+             exc_info=True,
+         )
+         try:
+-            return _direct_lifecycle_scan(command), None
++            return _direct_lifecycle_scan(command, mask_heredocs=budget.mask_heredocs), None
+         except Exception:
+             # If even the data-argument masker fails, fall to raw regex + submit scan: stay total.
+-            return (contains_gateway_lifecycle_command(command)
++            return (contains_gateway_lifecycle_command(command, mask_heredocs=budget.mask_heredocs)
+                     or contains_launchctl_submit_command(command)), None
+ 
+ 
+diff --git a/scripts/run_tests.sh b/scripts/run_tests.sh
+index de53de1152..fb9ede6a40 100755
+--- a/scripts/run_tests.sh
++++ b/scripts/run_tests.sh
+@@ -201,6 +201,9 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
+ #     tests/e2e/core/terminal instead of a skip (set by the e2e CI job).
+ #   * CI / GITHUB_ACTIONS tell suites they run on a disposable runner (e.g.
+ #     tests/e2e/core/upgrade runs the real updater unsandboxed only there).
++#     GITHUB_STEP_SUMMARY lets a test name a skipped proof in the job summary
++#     (tests/cron/heredoc_shape_corpus.note_ci_skip): the runner keeps skip
++#     counts but drops skip reasons and warnings.
+ #   * HERMES_E2E_WINDOWS_INSTALL opts tests/e2e/core/windows_update into running
+ #     the real install.ps1 (it writes HKCU PATH); HERMES_E2E_MACHINE_ROOT,
+ #     HERMES_E2E_PROFILES_ROOT and HERMES_E2E_ARTIFACTS place its fake machines,
+@@ -235,7 +238,7 @@ for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
+   HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE HERMES_TEST_FORKSERVER \
+   HERMES_TEST_SLOW_CASE_S HERMES_TEST_FLAKY_REPORT HERMES_TEST_REQUIRE_EXTRAS \
+   HERMES_TEST_HOST_SLOTS HERMES_TEST_SLOT_DIR HERMES_TEST_SLOT_HELD HERMES_TEST_USER_STEPS_API \
+-  SSL_CERT_FILE SSL_CERT_DIR HERMES_GATEWAY_LOCK_DIR HERMES_E2E_REQUIRE_TUI CI GITHUB_ACTIONS \
++  SSL_CERT_FILE SSL_CERT_DIR HERMES_GATEWAY_LOCK_DIR HERMES_E2E_REQUIRE_TUI CI GITHUB_ACTIONS GITHUB_STEP_SUMMARY \
+   HERMES_E2E_WINDOWS_INSTALL HERMES_E2E_MACHINE_ROOT HERMES_E2E_PROFILES_ROOT HERMES_E2E_ARTIFACTS \
+   HERMES_E2E_STRICT_ACCEPTANCE HERMES_E2E_UPGRADE_BASE HERMES_E2E_N1_REF \
+   HERMES_E2E_INSTALL_REF HERMES_E2E_GIT_OBJECTS HERMES_E2E_KEEP_ROOT \
+diff --git a/tests/cron/fixtures/lifecycle_guard_heredoc/main_verdicts.json b/tests/cron/fixtures/lifecycle_guard_heredoc/main_verdicts.json
+index aa141c7f7c..cbfd57a997 100644
+--- a/tests/cron/fixtures/lifecycle_guard_heredoc/main_verdicts.json
++++ b/tests/cron/fixtures/lifecycle_guard_heredoc/main_verdicts.json
+@@ -1,7 +1,26 @@
+ {
+- "cases": 17320,
+- "corpus_digest": "2b1ee923f05c3902560ec8dae4211f99f7689cb4dd5c9b0348c64c0294dbd1b0",
+- "main_allows": [],
++ "cases": 17410,
++ "corpus_digest": "4d46887a400878c76be79a4a39b232edda25eef34b501acd2d6070fe2644b236",
++ "main_allows": [
++  "068f6b9fccb98384",
++  "099666096503950b",
++  "1063caa4d3aa4022",
++  "44ae2c7fd84f309e",
++  "4c3995bbbbabae1e",
++  "60354970c31e1649",
++  "6c3a8ff7c8e34c09",
++  "71a3fc0272b4b1d8",
++  "84d0254ec159ae1f",
++  "8d2972b7beaeb77e",
++  "970a83dacb6fd831",
++  "9f6aa6102575c155",
++  "ad4bbe0033fb340c",
++  "b5c6fa2207de29c9",
++  "badf6317e898705f",
++  "bd7354ede9c73648",
++  "de1e4f64a3081e38",
++  "e367d5b9efcddc00"
++ ],
+  "main_sha": "da52aff8f4c0177a1786c3db09431fafaf8d267f",
+  "seed": 20261113
+ }
+diff --git a/tests/cron/heredoc_shape_corpus.py b/tests/cron/heredoc_shape_corpus.py
+index 63ad1dd23a..e122bc97c2 100644
+--- a/tests/cron/heredoc_shape_corpus.py
++++ b/tests/cron/heredoc_shape_corpus.py
+@@ -11,10 +11,21 @@ only when the outer shell reads its stdin verbatim. Two payloads try to make it
+ - ``history``: ``timeout !!:1-3 python3 -`` becomes ``timeout 5 bash -s python3 -`` once
+   history expansion is on.
+ 
++A second family (``s_position == "session"``) runs top-level commands in a shell that already
++holds aliases defined outside the walked text, the way the terminal backend sources its login
++snapshot (``alias -p`` + ``shopt -s expand_aliases``) before ``eval``-ing the command:
++keyword-prefix aliases (``alias t='time '``) turn ``t ( bash ./big.sh )`` into a subshell that
++runs an unscannable script, and ``alias python3=bash`` runs a "Python" heredoc body as shell. The
++guard is told the session's alias names (``scan_gateway_lifecycle(session_aliases=…)``).
++
+ Real bash runs every case with a fake ``hermes`` that writes a marker. The property the test
+ asserts: when bash ran the payload and origin/main refuses the command, the tree under test
+ refuses it too. origin/main's verdicts are checked in (``main_verdicts.json``) with its sha.
+ 
++Startup-file payloads need bash to source the test's ``$HOME`` files; ``startup_shell_prefix``
++finds an argv prefix that makes it do so on this host (none, or bubblewrap masking the system
++startup files), else those rows run unproven and the tests that need them skip.
++
+ CLI, run from the repo root with the tree under test first on PYTHONPATH:
+     python3 tests/cron/heredoc_shape_corpus.py main-verdicts OUT.json   # regenerate the fixture
+     python3 tests/cron/heredoc_shape_corpus.py report [MAIN_VERDICTS]   # count violations
+@@ -22,11 +33,16 @@ CLI, run from the repo root with the tree under test first on PYTHONPATH:
+ 
+ from __future__ import annotations
+ 
++import functools
+ import hashlib
++import inspect
+ import itertools
+ import json
+ import os
+ import random
++import re
++import shlex
++import shutil
+ import subprocess
+ import sys
+ import tempfile
+@@ -66,6 +82,25 @@ REVIEW_ROWS = (
+     ("bash -s -H -o history", "plain", "history"),
+     ("bash -o history -o histexpand -s", "ssh", "history"),
+ )
++# Aliases the command's shell holds before its first line (the backend's login snapshot).
++SESSIONS = {
++    "none": "",
++    "time": "alias t='time '",  # review 5888336995 nit 2, verbatim
++    "blank": "alias t=' '",
++    "bang": "alias t='! '",
++    "python": "alias python3=bash",
++    "benign": "alias ll='ls -l'",
++}
++SESSION_PAYLOADS = {
++    "alias-subshell": "t ( bash ./big.sh )\n",
++    "alias-source": "t ( . ./big.sh )\n",
++    "consumer": _INNER,
++    "consumer-function": "q() { " + _INNER + "}\nq\n",
++    "consumer-wrapped": "timeout 5 env A=1 " + _INNER,
++}
++SESSION_FORMS = ("plain", "function", "subshell")
++# Over the 1 MiB scan cap, so a walk that executes it fails closed; bash runs it to the end.
++BIG_SCRIPT = "# padding\n" * 130000 + 'hermes gateway "restart"\n'
+ # Startup file: record that it ran, keep the fake bin on PATH, then rewrite the rest of stdin.
+ REWRITE_STARTUP = (
+     'printf "ran HOME=%s\\n" "$HOME" >> "$FAKE_BIN/startup-ran"\n'
+@@ -86,10 +121,21 @@ class Case:
+     command: str
+     shell: str
+     words: tuple[str, ...]
+-    s_position: str  # "before" / "after" (relative to the option words), "bundled", "none"
++    s_position: str  # "before" / "after" (option words), "bundled", "none", "review", "session"
+     wrapper: str
+     nesting: str
+     payload: str
++    session: str = ""  # a SESSIONS key (session cases only): aliases the shell already holds
++
++
++def session_alias_names(session: str) -> frozenset[str]:
++    """Alias names a SESSIONS snapshot defines (what the backend reports to the guard)."""
++    return frozenset(re.findall(r"alias ([^=\s]+)=", SESSIONS[session]))
++
++
++def build_session_command(form: str, payload: str) -> str:
++    body = SESSION_PAYLOADS[payload]
++    return {"plain": body, "function": f"g() {{\n{body}}}\ng\n", "subshell": f"(\n{body})\n"}[form]
+ 
+ 
+ def build_command(shell: str, words: tuple[str, ...], wrapper: str, nesting: str, payload: str) -> str:
+@@ -142,6 +188,11 @@ def generate_full_corpus() -> list[Case]:
+             position = "bundled" if form == "bundle" else "mixed"
+         add(rng.choice(SHELLS), words, position, rng.choice(WRAPPERS), rng.choice(NESTINGS),
+             rng.choice(tuple(PAYLOADS)))
++    for session, form, payload in itertools.product(SESSIONS, SESSION_FORMS, SESSION_PAYLOADS):
++        command = build_session_command(form, payload)
++        # Old keys stay command-only; a session case's key also names its session.
++        key = hashlib.sha1(f"session {session}\n{command}".encode()).hexdigest()[:16]
++        cases.setdefault(key, Case(key, command, "bash", (), "session", "", form, payload, session))
+     return list(cases.values())
+ 
+ 
+@@ -156,11 +207,11 @@ def _cover_keys(case: Case) -> set[tuple]:
+ def generate_cases(size: int = SAMPLE_SIZE) -> list[Case]:
+     """A seeded sample of :func:`generate_full_corpus` that still covers every option word,
+     wrapper, shell and payload with ``-s`` before, after, bundled and absent in every nesting
+-    form, plus every review row; the rest is filled at random up to *size*."""
++    form, plus every review row and every session case; the rest is filled at random up to *size*."""
+     full = generate_full_corpus()
+     order = list(full)
+     random.Random(SEED).shuffle(order)
+-    chosen = {case.key: case for case in full if case.s_position == "review"}
++    chosen = {case.key: case for case in full if case.s_position in ("review", "session")}
+     covered: set[tuple] = set()
+     for case in order:
+         keys = _cover_keys(case)
+@@ -175,13 +226,17 @@ def generate_cases(size: int = SAMPLE_SIZE) -> list[Case]:
+ 
+ 
+ def prepare(root: Path) -> dict[str, str]:
+-    """Fake ``hermes``/``ssh`` bin, a ``$HOME`` and ``./rc`` that rewrite stdin; return the env."""
++    """Fake ``hermes``/``ssh`` bin, a ``$HOME`` and ``./rc`` that rewrite stdin, ``./big.sh`` and
++    the session snapshots; return the env."""
+     home = root / "home"
+     home.mkdir(parents=True, exist_ok=True)
+     for name in (".bash_profile", ".bashrc"):
+         (home / name).write_text(REWRITE_STARTUP)
+     (home / ".profile").write_text(REWRITE_STARTUP_POSIX)
+     (root / "rc").write_text(REWRITE_STARTUP)
++    (root / "big.sh").write_text(BIG_SCRIPT)
++    for session, aliases in SESSIONS.items():
++        (root / f"session-{session}.sh").write_text(f"{aliases}\nshopt -s expand_aliases\n")
+     (root / "evil").mkdir(exist_ok=True)
+     evil_python = root / "evil" / "python3"
+     evil_python.write_text('#!/bin/sh\nexec /bin/bash "$@"\n')
+@@ -196,29 +251,104 @@ def prepare(root: Path) -> dict[str, str]:
+             "BASH_ENV": "", "ENV": str(home / ".profile"), "LANG": "C.UTF-8"}
+ 
+ 
+-def bash_runs_payload(root: Path, env: dict[str, str], case: Case) -> bool:
+-    """Run *case* in real bash (cwd *root*); True when the fake hermes wrote its marker."""
++def bash_input(case: Case) -> str:
++    """What the outer bash reads: the command itself, or, for a session case, the backend's own
++    shape (``tools/environments/base_session_env._wrap_command_script``): source the snapshot,
++    then ``eval`` the command."""
++    if not case.session:
++        return case.command
++    return (f"source ./session-{case.session}.sh >/dev/null 2>&1 || true\n"
++            f"eval {shlex.quote(case.command)}\n")
++
++
++def bash_runs_payload(root: Path, env: dict[str, str], case: Case,
++                      prefix: tuple[str, ...] = ()) -> bool:
++    """Run *case* in real bash (cwd *root*, under argv *prefix*); True when the fake hermes wrote
++    its marker."""
+     marker = root / "markers" / case.key
+     marker.parent.mkdir(exist_ok=True)
+     try:
+-        subprocess.run(["/bin/bash"], input=case.command, text=True, capture_output=True,
+-                       timeout=20, check=False, cwd=root, env={**env, "MARKER": str(marker)})
++        subprocess.run([*prefix, "/bin/bash"], input=bash_input(case), text=True,
++                       capture_output=True, timeout=20, check=False, cwd=root,
++                       env={**env, "MARKER": str(marker)})
+     except subprocess.TimeoutExpired:
+         pass
+     return marker.exists() and marker.read_text() == "called"
+ 
+ 
+ def guard_refuses(root: Path, case: Case) -> bool:
+-    from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
+-
+-    return contains_gateway_lifecycle_command_or_referenced_script(case.command, cwd=str(root)) is True
++    """The tree's verdict. A session case passes its alias names when the tree's guard takes them
++    (origin/main's does not: it never sees the snapshot, which is main's real behavior)."""
++    from cron import lifecycle_guard
++
++    scan = lifecycle_guard.scan_gateway_lifecycle
++    if case.session and "session_aliases" in inspect.signature(scan).parameters:
++        return scan(case.command, cwd=str(root),
++                    session_aliases=session_alias_names(case.session))[0] is True
++    return lifecycle_guard.contains_gateway_lifecycle_command_or_referenced_script(
++        case.command, cwd=str(root)) is True
++
++
++def _startup_prefixes():
++    """Candidate argv prefixes for ``startup_shell_prefix``: none, then bubblewrap with the system
++    startup files masked (a runner image's ``/etc/profile*`` may keep a login bash from sourcing
++    ``$HOME`` files; bwrap needs unprivileged user namespaces, which the CI job enables)."""
++    yield "plain", ()
++    bwrap = shutil.which("bwrap")
++    if bwrap:
++        args = [bwrap, "--unshare-user", "--dev-bind", "/", "/"]
++        for path in ("/etc/profile", "/etc/bash.bashrc", "/etc/bashrc"):
++            if os.path.isfile(path):
++                args += ["--ro-bind", "/dev/null", path]
++        if os.path.isdir("/etc/profile.d"):
++            args += ["--tmpfs", "/etc/profile.d"]
++        yield "bwrap with /etc/profile* masked", tuple(args)
++
++
++@functools.cache
++def startup_shell_prefix() -> tuple[tuple[str, ...] | None, str]:
++    """``(argv prefix, how)`` under which ``HOME=<dir> bash -l -s`` sources ``<dir>/.bash_profile``
++    on this host, or ``(None, diagnostics)`` when no candidate does (startup-file execution
++    proofs are then unavailable here)."""
++    notes = []
++    with tempfile.TemporaryDirectory(prefix="heredoc-startup-probe-") as tmp:
++        home, ran = Path(tmp) / "home", Path(tmp) / "ran"
++        home.mkdir()
++        (home / ".bash_profile").write_text('printf ok > "$PROBE"\n')
++        env = {"PATH": "/usr/bin:/bin", "HOME": str(home), "PROBE": str(ran), "LANG": "C.UTF-8"}
++        probe = ('shopt -q login_shell && echo login; echo "HOME=$HOME"; '
++                 'ls /etc/profile.d 2>/dev/null | tr "\\n" " "\n')
++        for how, prefix in _startup_prefixes():
++            ran.unlink(missing_ok=True)
++            try:
++                result = subprocess.run([*prefix, "/bin/bash", "-l", "-s"], input=probe, text=True,
++                                        capture_output=True, timeout=20, check=False, env=env)
++            except (OSError, subprocess.TimeoutExpired) as exc:
++                notes.append(f"{how}: {exc}")
++                continue
++            if ran.exists():
++                return prefix, how
++            notes.append(f"{how}: rc={result.returncode} out={result.stdout.strip()[-300:]!r} "
++                         f"err={result.stderr.strip()[-300:]!r}")
++    return None, "; ".join(notes)
++
++
++def note_ci_skip(test_id: str, reason: str) -> None:
++    """Append a skipped execution proof to ``$GITHUB_STEP_SUMMARY`` (run_tests.sh forwards it):
++    the per-file runner keeps skip counts but drops reasons and warnings."""
++    path = os.environ.get("GITHUB_STEP_SUMMARY")
++    if path:
++        with open(path, "a", encoding="utf-8") as summary:
++            summary.write(f"- heredoc execution proof skipped (untested on CI): `{test_id}`: "
++                          f"{reason}\n")
+ 
+ 
+ def evaluate(root: Path, cases: list[Case]) -> list[tuple[Case, bool, bool]]:
+     """``(case, bash ran the payload, guard refuses)`` for every case."""
+     env = prepare(root)
++    prefix = startup_shell_prefix()[0] or ()
+     with ThreadPoolExecutor(max_workers=max(2, min(8, os.cpu_count() or 2))) as pool:
+-        ran = list(pool.map(lambda case: bash_runs_payload(root, env, case), cases))
++        ran = list(pool.map(lambda case: bash_runs_payload(root, env, case, prefix), cases))
+     return [(case, executed, guard_refuses(root, case)) for case, executed in zip(cases, ran)]
+ 
+ 
+diff --git a/tests/cron/test_lifecycle_guard_heredoc_walk.py b/tests/cron/test_lifecycle_guard_heredoc_walk.py
+index dfe210010f..c77452acbc 100644
+--- a/tests/cron/test_lifecycle_guard_heredoc_walk.py
++++ b/tests/cron/test_lifecycle_guard_heredoc_walk.py
+@@ -591,8 +591,9 @@ def test_refused_scripts_verbatim_are_not_refused(tmp_path, monkeypatch, script,
+ 
+ 
+ # Independent review: prove execution with a fake hermes, never a real gateway.
+-def _run_bash_marker(tmp_path, command):
+-    """Run `command` in real Bash with a fake `hermes`; return (marker written, stderr)."""
++def _run_bash_marker(tmp_path, command, prefix=()):
++    """Run `command` in real Bash (under argv *prefix*) with a fake `hermes`; return
++    (marker written, stderr)."""
+     import os
+     import subprocess
+ 
+@@ -602,13 +603,28 @@ def _run_bash_marker(tmp_path, command):
+     hermes.write_text('#!/bin/sh\nprintf called > "$MARKER"\n')
+     hermes.chmod(0o755)
+     result = subprocess.run(
+-        ["/bin/bash"], input=command, text=True, capture_output=True, timeout=10, check=False,
+-        env={**os.environ, "PATH": f"{tmp_path}:/usr/bin:/bin", "FAKE_BIN": str(tmp_path),
+-             "MARKER": str(marker), "BASH_ENV": "", "ENV": ""}, cwd=tmp_path,
++        [*prefix, "/bin/bash"], input=command, text=True, capture_output=True, timeout=10,
++        check=False, env={**os.environ, "PATH": f"{tmp_path}:/usr/bin:/bin", "FAKE_BIN": str(tmp_path),
++                          "MARKER": str(marker), "BASH_ENV": "", "ENV": ""}, cwd=tmp_path,
+     )
+     return marker.exists() and marker.read_text() == "called", result.stderr
+ 
+ 
++def _startup_shell_prefix_or_skip(request):
++    """Argv prefix under which a login bash sources the test's `$HOME` startup files on this host
++    (none, or bubblewrap masking the system /etc/profile*). Without one the execution proof is
++    impossible here: a real skip (the runner counts it) that also names the test in
++    $GITHUB_STEP_SUMMARY, since the runner drops skip reasons and warnings."""
++    from tests.cron import heredoc_shape_corpus as corpus
++
++    prefix, how = corpus.startup_shell_prefix()
++    if prefix is None:
++        reason = f"no shell on this host sources $HOME startup files ({how})"
++        corpus.note_ci_skip(request.node.nodeid, reason)
++        pytest.skip(reason)
++    return prefix
++
++
+ def _assert_bash_marker(tmp_path, command):
+     called, stderr = _run_bash_marker(tmp_path, command)
+     assert called, stderr
+@@ -713,11 +729,11 @@ _WALK_ONLY_BODY = "python3 - <<'PY'\nbash -c 'hermes gateway \"restart\"'\nPY\n"
+     "home-login", "home-long-login", "home-interactive", "env-home-login", "separate-line-home",
+     "prompt-command", "combined-flags", "nested", "remote",
+ ])
+-def test_startup_files_and_prompt_hooks_cannot_authorize_nested_masking(tmp_path, shape):
++def test_startup_files_and_prompt_hooks_cannot_authorize_nested_masking(tmp_path, shape, request):
+     """Review 5882059941 #1: login/interactive shells source `$HOME` startup files and run
+-    PROMPT_COMMAND before each line; either can rewrite the stdin script (main refuses)."""
+-    import warnings
+-
++    PROMPT_COMMAND before each line; either can rewrite the stdin script (main refuses).
++    Review 5888336995 nit 1: the execution proof runs wherever some shell on the host sources
++    `$HOME` startup files (CI: bubblewrap masking the runner's /etc/profile*), else it skips."""
+     from tools.shell_heredoc import strip_inert_heredoc_bodies
+ 
+     home = tmp_path / "home"
+@@ -742,20 +758,14 @@ def test_startup_files_and_prompt_hooks_cannot_authorize_nested_masking(tmp_path
+     command = opener + " <<'R'\n" + _WALK_ONLY_BODY + "R\n"
+     if shape == "nested":
+         command = "bash -s <<'OUTER'\n" + command + "OUTER\n"
+-    startup_ran = tmp_path / "startup-ran"
+-    called, stderr = _run_bash_marker(tmp_path, command)
+-    if not called:
+-        # The proof needs bash to source the test's `$HOME` startup file. Some hosts' system
+-        # login files (/etc/profile*) keep that from happening (a CI runner image did for every
+-        # login shape); only then is the proof unavailable and the guard verdicts below are
+-        # all that is checked. A startup file that ran yet failed to rewrite stdin still fails.
+-        ran = startup_ran.read_text() if startup_ran.exists() else ""
+-        assert shape != "prompt-command" and not ran, f"startup file: {ran!r}\n{stderr}"
+-        # A warning (not a print, which pytest captures) so a CI log shows the proof was skipped.
+-        warnings.warn(f"{shape}: execution proof unavailable on this host (startup file not "
+-                      f"sourced); guard verdicts only: {stderr[-300:]!r}", stacklevel=1)
++    # The guard verdicts hold on every host; only the execution proof below may skip.
+     assert strip_inert_heredoc_bodies(command, nested=True) == command
+     assert guard(command, cwd=str(tmp_path)) is True
++    prefix = () if shape == "prompt-command" else _startup_shell_prefix_or_skip(request)
++    startup_ran = tmp_path / "startup-ran"
++    called, stderr = _run_bash_marker(tmp_path, command, prefix)
++    ran = startup_ran.read_text() if startup_ran.exists() else ""
++    assert called, f"startup file: {ran!r}\n{stderr}"
+ 
+ 
+ @pytest.mark.parametrize("opener", [
+@@ -849,12 +859,14 @@ def test_keyword_led_subshells_still_execute_scripts(tmp_path, shape):
+     assert unsafe is True and refusal is not None and "scan cap" in refusal
+ 
+ 
+-def test_generated_shape_corpus_never_allows_what_bash_runs_and_main_refuses(tmp_path):
++def test_generated_shape_corpus_never_allows_what_bash_runs_and_main_refuses(tmp_path, request):
+     """Card comment 10718 item 2: a seeded sample of the product of shell option words (``-s``
+     before, after, bundled or absent) x stdin wrappers x nesting forms x payloads. Real bash runs
+     every case; whenever it ran the walk-only payload and origin/main refuses the command (the
+     checked-in verdicts), this tree must refuse it too. The six rows of review 5887281618 are in
+-    the sample. Regenerate the main verdicts with the CLI in ``heredoc_shape_corpus``."""
++    the sample, and so is every session-alias case (review 5888336995 nit 2: aliases the
++    backend's login snapshot defines outside the walked text). Regenerate the main verdicts with
++    the CLI in ``heredoc_shape_corpus``."""
+     import time
+     import warnings
+ 
+@@ -877,6 +889,9 @@ def test_generated_shape_corpus_never_allows_what_bash_runs_and_main_refuses(tmp
+                 option, position)
+     review = [case for case in cases if case.s_position == "review"]
+     assert len(review) == len(corpus.REVIEW_ROWS)
++    session = [case for case in cases if case.s_position == "session"]
++    assert len(session) == (len(corpus.SESSIONS) * len(corpus.SESSION_FORMS)
++                            * len(corpus.SESSION_PAYLOADS))
+ 
+     started = time.monotonic()
+     results = corpus.evaluate(tmp_path, cases)
+@@ -885,23 +900,23 @@ def test_generated_shape_corpus_never_allows_what_bash_runs_and_main_refuses(tmp
+     assert not bad, "\n".join(case.command for case in bad[:10])
+     ran = {case.key for case, executed, _refused in results if executed}
+     allowed = sum(not refused for _case, _executed, refused in results)
+-    # Not vacuous: the history review rows run their payload on any bash. Startup-file rows need
+-    # bash to source the test's `$HOME` files, which some hosts' system login files prevent.
++    # Not vacuous: the history review rows run their payload on any bash, and so does the nit-2
++    # repro (`alias t='time '` then `t ( bash ./big.sh )`) in every form.
+     assert all(case.key in ran for case in review if case.payload == "history")
++    assert all(case.key in ran for case in session
++               if case.session == "time" and case.payload == "alias-subshell")
++    # Startup-file rows need a shell that sources the test's `$HOME` files (see
++    # corpus.startup_shell_prefix): every one of them must run when there is one.
++    prefix, how = corpus.startup_shell_prefix()
+     missed = [case.command.split("\n", 1)[0] for case in review if case.key not in ran]
+-    probe = ""
+-    if missed:  # why this host's login shell skipped the test's `$HOME` startup files
+-        import subprocess
+-
+-        probe = subprocess.run(
+-            ["/bin/bash", "-l", "-s"], text=True, capture_output=True, timeout=20, check=False,
+-            input='shopt login_shell; echo "HOME=$HOME BASH_ENV=$BASH_ENV"; ls -a "$HOME"; '
+-                  'cat "$FAKE_BIN/startup-ran" 2>&1 | head -3; ls /etc/profile.d 2>&1\n',
+-            env={**corpus.prepare(tmp_path), "MARKER": str(tmp_path / "probe")}, cwd=tmp_path,
+-        ).stdout[-600:]
+     warnings.warn(f"shape corpus: {len(cases)} cases in {elapsed:.1f}s, bash ran the payload in "
+-                  f"{len(ran)}, guard allows {allowed}, 0 violations; review rows without an "
+-                  f"execution proof on this host: {missed} {probe!r}", stacklevel=1)
++                  f"{len(ran)}, guard allows {allowed}, 0 violations; startup shell: {how}",
++                  stacklevel=1)
++    if prefix is None:
++        reason = f"review rows without an execution proof on this host: {missed} ({how})"
++        corpus.note_ci_skip(request.node.nodeid, reason)
++        pytest.skip(reason)
++    assert not missed, f"startup shell {how!r} ran but these rows did not: {missed}"
+ 
+ 
+ _LIVE_SSH_BODY = (
+diff --git a/tests/cron/test_lifecycle_guard_session_aliases.py b/tests/cron/test_lifecycle_guard_session_aliases.py
+new file mode 100644
+index 0000000000..e3ca323b69
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_session_aliases.py
+@@ -0,0 +1,105 @@
++"""Review 5888336995 nit 2: aliases the terminal backend's login snapshot defines live outside the
++walked text (``alias -p`` + ``shopt -s expand_aliases`` in ``_snapshot_bootstrap_script``), yet
++every command runs with them. The guard must hear about them from the backend."""
++
++import json
++import subprocess
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from tools.environments.base_session_env import _alias_names_printf, _split_alias_marker
++from tools.terminal_tool_guards import _session_aliases_for_guard, gateway_lifecycle_block
++
++_FN_BODY = "q() { python3 - <<'PY'\nbash -c 'hermes gateway \"restart\"'\nPY\n}\nq\n"
++
++
++def _big(tmp_path):
++    big = tmp_path / "huge.sh"
++    big.write_text("# padding\n" * 130000 + 'hermes gateway "restart"\n')
++    return big
++
++
++def test_reviewer_repro_snapshot_time_alias_fails_closed(tmp_path):
++    """`alias t='time '` from the snapshot makes `t ( bash huge.sh )` a subshell running it."""
++    command = f"t ( bash {_big(tmp_path)} )"
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)  # no session
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path),
++                                             session_aliases=frozenset({"t"}))
++    assert unsafe is True and refusal is not None and "scan cap" in refusal
++
++
++def test_unknown_session_aliases_fail_closed(tmp_path):
++    command = f"t ( bash {_big(tmp_path)} )"
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path), session_aliases=None)
++    assert unsafe is True and refusal is not None and "scan cap" in refusal
++
++
++@pytest.mark.parametrize("names,blocked", [
++    (frozenset(), False), (frozenset({"ll", "gs"}), False),
++    (frozenset({"python3"}), True), (frozenset({"timeout"}), True), (frozenset({"bash"}), True),
++    (None, True),
++])
++def test_session_alias_shadowing_a_consumer_keeps_heredoc_bodies_visible(tmp_path, names, blocked):
++    """`alias python3=bash` in the snapshot runs a "Python" heredoc body as shell."""
++    assert scan_gateway_lifecycle(_FN_BODY, cwd=str(tmp_path), session_aliases=names)[0] is blocked
++
++
++def test_bootstrap_alias_names_round_trip_through_real_bash():
++    marker = "__HERMES_ALIASES_t__"
++    script = ("shopt -s expand_aliases\nalias t='time '\nalias ll='ls -l'\n"
++              "alias -- -x='echo'\nalias multi='echo a\necho b'\n" + _alias_names_printf(marker))
++    out = subprocess.run(["/bin/bash", "--norc", "--noprofile", "-s"], input=script, text=True,
++                         capture_output=True, timeout=10, check=True).stdout
++    names = _split_alias_marker(out, marker)
++    assert names is not None and {"t", "ll", "-x", "multi"} <= names
++    assert _split_alias_marker("no marker here", marker) is None
++    empty = subprocess.run(["/bin/bash", "--norc", "--noprofile", "-s"],
++                           input=_alias_names_printf(marker), text=True, capture_output=True,
++                           timeout=10, check=True).stdout
++    assert _split_alias_marker(empty, marker) == frozenset()
++
++
++def test_guard_reads_backend_hook_on_the_class_only():
++    class Backend:
++        def __init__(self, names):
++            self.names = names
++
++        def lifecycle_guard_session_aliases(self):
++            return self.names
++
++    class Broken:
++        def lifecycle_guard_session_aliases(self):
++            raise AttributeError("_snapshot_ready")
++
++    assert _session_aliases_for_guard(Backend(frozenset({"t"}))) == frozenset({"t"})
++    assert _session_aliases_for_guard(Backend(None)) is None
++    assert _session_aliases_for_guard(Backend({"t"})) is None  # wrong type: unknown
++    assert _session_aliases_for_guard(Broken()) is None
++    assert _session_aliases_for_guard(SimpleNamespace(cwd="/")) == frozenset()
++
++
++def test_local_backend_reports_snapshot_aliases_and_terminal_guard_refuses(tmp_path, monkeypatch):
++    """End to end: a login-file alias reaches the snapshot, the backend reports it, and the
++    terminal guard refuses the reviewer's repro (it allowed it before the fix)."""
++    from tools.environments.local import LocalEnvironment
++
++    init_file = tmp_path / "custom-init.sh"
++    init_file.write_text("alias t='time '\n")
++    with patch("tools.environments.local._read_terminal_shell_init_config",
++               return_value=([str(init_file)], False)):
++        env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
++        try:
++            names = env.lifecycle_guard_session_aliases()
++            assert names is not None and "t" in names
++            assert "__HERMES_ALIASES_" not in env.execute("echo hi").get("output", "")
++            monkeypatch.setattr("tools.process_registry._is_supervised_gateway_process",
++                                lambda: True)
++            result = gateway_lifecycle_block(
++                command=f"t ( bash {_big(tmp_path)} )", env=env, env_type="local",
++                cwd=str(tmp_path), workdir=str(tmp_path), session_key="snapshot-alias-test")
++        finally:
++            env.cleanup()
++    assert result is not None and "scan cap" in json.loads(result)["error"]
+diff --git a/tools/environments/base.py b/tools/environments/base.py
+index 5a5d096044..3b950200d3 100644
+--- a/tools/environments/base.py
++++ b/tools/environments/base.py
+@@ -25,8 +25,8 @@ from tools.environments.base_output import (
+     ProcessHandle, _finalize_wait_result, _new_output_collector, _start_drain_thread,
+ )
+ from tools.environments.base_session_env import (
+-    _SHELL_ENV_NAME_RE, _SNAP_TMP_SUFFIX, _cwd_marker, _pipe_marker, _snapshot_bootstrap_script, _split_cwd_marker,
+-    _wrap_command_script,
++    _SHELL_ENV_NAME_RE, _SNAP_TMP_SUFFIX, _alias_marker, _cwd_marker, _pipe_marker, _snapshot_bootstrap_script,
++    _split_alias_marker, _split_cwd_marker, _wrap_command_script,
+ )
+ from tools.environments.base_processes import LongLivedProcessMixin
+ from tools.environments.base_wait import _WaitTrace
+@@ -341,6 +341,9 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
+         self._cwd_marker = _cwd_marker(self._session_id)
+         self._pipe_marker = _pipe_marker(self._session_id)
+         self._snapshot_ready = False
++        # Alias names the login snapshot holds (it turns expand_aliases on for every command);
++        # None until a bootstrap reported them. See lifecycle_guard_session_aliases().
++        self._snapshot_aliases: frozenset[str] | None = None
+         self._snapshot_passthrough_names: set[str] = set()
+         # True when login bash is unusable (e.g. broken Git-for-Windows startup)
+         # so execute() must fall back to non-login ``bash -c``, not ``bash -l``.
+@@ -420,6 +423,15 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
+             logger.debug("Could not refresh profile-scoped snapshot exclusions", exc_info=True)
+         return tuple(sorted(self._snapshot_passthrough_names))
+ 
++    def lifecycle_guard_session_aliases(self) -> frozenset[str] | None:
++        """Alias names a command's shell holds before its first line, for the lifecycle guard
++        (``cron.lifecycle_guard.scan_gateway_lifecycle(session_aliases=…)``): each command sources
++        the login snapshot, which carries ``alias -p`` and turns ``expand_aliases`` on. ``None``
++        when unknown: no snapshot yet (commands run ``bash -l``, whose login files may define and
++        enable aliases) or a bootstrap that did not report names. Sticky from the login snapshot,
++        which is the most aliases any later command can see."""
++        return self._snapshot_aliases if self._snapshot_ready else None
++
+     def _snapshot_script_kwargs(self, cwd: str) -> dict:
+         """Quoting inputs shared by the bootstrap and per-command wrapper scripts.
+         ``_quote_cwd_for_cd`` / ``_quote_shell_path`` (not bare shlex.quote) let the Windows
+@@ -436,12 +448,15 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
+         under ``bash -l``. On failure, fall back to ``bash -l`` per command — unless a non-login
+         probe shows login bash itself is dead, in which case prefer ``bash -c``."""
+         bootstrap = _snapshot_bootstrap_script(
+-            excluded_names=self._snapshot_excluded_passthrough_names(), **self._snapshot_script_kwargs(self.cwd))
++            excluded_names=self._snapshot_excluded_passthrough_names(),
++            alias_marker=_alias_marker(self._session_id), **self._snapshot_script_kwargs(self.cwd))
+         try:
+             proc = self._run_bash(bootstrap, login=True, timeout=self._snapshot_timeout)
+             result = self._wait_for_process(proc, timeout=self._snapshot_timeout)
+             if int(result.get("returncode") or 0) != 0:
+                 raise RuntimeError(f"snapshot bootstrap failed with exit code {result.get('returncode')}")
++            self._snapshot_aliases = _split_alias_marker(
++                result.get("output", ""), _alias_marker(self._session_id))
+             self._snapshot_ready = True
+             self._update_cwd(result)
+             logger.info("Session snapshot created (session=%s, cwd=%s)", self._session_id, self.cwd)
+diff --git a/tools/environments/base_session_env.py b/tools/environments/base_session_env.py
+index 7d5c02a8b2..0f73df1f13 100644
+--- a/tools/environments/base_session_env.py
++++ b/tools/environments/base_session_env.py
+@@ -45,6 +45,28 @@ def _pipe_marker(session_id: str) -> str:
+     return f"__HERMES_PIPE_{session_id}__"
+ 
+ 
++def _alias_marker(session_id: str) -> str:
++    return f"__HERMES_ALIASES_{session_id}__"
++
++
++def _alias_names_printf(marker: str) -> str:
++    """Bootstrap lines that print the snapshot's alias names between two *marker*s. Pure bash (no
++    sed): a multi-line alias value may add a spurious name, which only makes the guard stricter."""
++    return (
++        "__hermes_an=\n"
++        "while IFS= read -r __hermes_al; do case $__hermes_al in 'alias '*=*) "
++        "__hermes_al=${__hermes_al#alias }; __hermes_al=${__hermes_al#-- }; "
++        "__hermes_an=\"$__hermes_an ${__hermes_al%%=*}\";; esac; done < <(alias -p)\n"
++        f"printf '\\n{marker}%s{marker}\\n' \"$__hermes_an\"\n")
++
++
++def _split_alias_marker(output: str, marker: str) -> "frozenset[str] | None":
++    """Alias names the bootstrap printed (see ``_alias_names_printf``); ``None`` when it printed
++    none (the snapshot may hold aliases whose names are unknown)."""
++    match = re.search(re.escape(marker) + r"(.*?)" + re.escape(marker), output or "")
++    return None if match is None else frozenset(match.group(1).split())
++
++
+ def _pipe_marker_printf(marker: str) -> str:
+     """Emit the pipeline's per-segment exit statuses (``PIPESTATUS``) on their own line.
+ 
+@@ -120,6 +142,7 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
+ 
+ def _snapshot_bootstrap_script(
+     *, quoted_cwd: str, quoted_snap: str, snap_tmp_template: str, excluded_names: Iterable[str], cwd_marker: str,
++    alias_marker: str = "",
+ ) -> str:
+     """Login-shell bootstrap that captures env/functions/aliases into the snapshot. Atomic publish:
+     assemble in a ``mktemp`` file, then ``mv`` over the final path so a concurrent ``source`` never
+@@ -128,7 +151,9 @@ def _snapshot_bootstrap_script(
+     ``declare -F`` (a line-based ``declare -f | grep -v`` strips the header and leaves an orphaned
+     body that breaks every sourced command); the non-empty guard matters because bare ``declare -f``
+     dumps ALL functions. The trailing ``cd`` restores the configured cwd after profile scripts (e.g.
+-    ``cd ~``) so ``pwd -P`` reports terminal.cwd, not the profile's directory."""
++    ``cd ~``) so ``pwd -P`` reports terminal.cwd, not the profile's directory. With *alias_marker*
++    it also prints the alias names it captured (``_alias_names_printf``): the lifecycle guard must
++    know them, because the snapshot turns ``expand_aliases`` on for every command."""
+     return (
+         "umask 077\n"
+         f"__hermes_snap_tmp=$(mktemp {snap_tmp_template}) || exit 1\n"
+@@ -136,7 +161,8 @@ def _snapshot_bootstrap_script(
+         "__hermes_fns=$(declare -F | awk '{print $3}' | grep -vE '^_[^_]') || true\n"
+         f"[ -n \"$__hermes_fns\" ] && declare -f $__hermes_fns >> {_SNAP_TMP} 2>/dev/null || true\n"
+         f"alias -p >> {_SNAP_TMP}\n"
+-        f"echo 'shopt -s expand_aliases' >> {_SNAP_TMP}\n"
++        + (_alias_names_printf(alias_marker) if alias_marker else "")
++        + f"echo 'shopt -s expand_aliases' >> {_SNAP_TMP}\n"
+         f"echo 'set +e' >> {_SNAP_TMP}\n"
+         f"echo 'set +u' >> {_SNAP_TMP}\n"
+         # Publish only if assembly succeeded; otherwise drop the partial temp.
+diff --git a/tools/shell_heredoc.py b/tools/shell_heredoc.py
+index 569716462b..f23fee287c 100644
+--- a/tools/shell_heredoc.py
++++ b/tools/shell_heredoc.py
+@@ -80,12 +80,19 @@ _FUNCTION_HEADER_RE = re.compile(
+ _MAX_NESTED_HEREDOC_DEPTH = 4
+ # A command that (re)defines a consumer, wrapper or outer-shell name as a function or alias
+ # anywhere (``python3() { bash; }``) may run a shell where the peeled word says "python": mask nothing.
++_SHADOWABLE_NAMES = (r"(?:python[\d.]*|osascript|cat|timeout|nice|ionice|nohup|setsid|stdbuf|env|command"
++                     r"|exec|eatmydata|sudo|doas|ssh|bash|sh|dash|zsh|ksh|echo|printf|set|tail|cut|ls)")
+ _CONSUMER_SHADOW_RE = re.compile(
+-    r"(?:^|[\s;&|(){{}}])(?:(?:function\s+)?{names}\s*\(\s*\)|function\s+{names}\s+\{{"
+-    r"|alias\s+{names}=)".format(
+-        names=r"(?:python[\d.]*|osascript|cat|timeout|nice|ionice|nohup|setsid|stdbuf|env|command"
+-              r"|exec|eatmydata|sudo|doas|ssh|bash|sh|dash|zsh|ksh|echo|printf|set|tail|cut|ls)"),
++    rf"(?:^|[\s;&|(){{}}])(?:(?:function\s+)?{_SHADOWABLE_NAMES}\s*\(\s*\)"
++    rf"|function\s+{_SHADOWABLE_NAMES}\s+\{{|alias\s+{_SHADOWABLE_NAMES}=)",
+     re.IGNORECASE)
++_SHADOWABLE_NAME_RE = re.compile(_SHADOWABLE_NAMES, re.IGNORECASE)
++
++
++def shadows_heredoc_consumer(name: str) -> bool:
++    """Whether an alias or function called *name* may rename a heredoc consumer, stdin wrapper or
++    shell the masking trusts (the names ``_CONSUMER_SHADOW_RE`` guards in the command text)."""
++    return _SHADOWABLE_NAME_RE.fullmatch(name) is not None
+ 
+ 
+ def _peel_stdin_wrappers(words: list[str], index: int) -> int | None:
+diff --git a/tools/terminal_tool_guards.py b/tools/terminal_tool_guards.py
+index 8ef054fb36..aaab6004b7 100644
+--- a/tools/terminal_tool_guards.py
++++ b/tools/terminal_tool_guards.py
+@@ -561,6 +561,23 @@ def _read_script_for_guard(env: Any, guard_cwd: str, script_path: str, max_bytes
+     return None
+ 
+ 
++def _session_aliases_for_guard(env: Any) -> Optional[frozenset[str]]:
++    """Alias names the backend's command shell holds before the command runs (its login
++    snapshot turns ``expand_aliases`` on); ``None`` = unknown. Looked up on the class so a test
++    double's auto-attributes (``MagicMock``) never stand in for a backend's answer; a backend
++    without the hook has no snapshot."""
++    hook = getattr(type(env), "lifecycle_guard_session_aliases", None)
++    if hook is None:
++        return frozenset()
++    try:
++        names = hook(env)
++    except (AttributeError, TypeError, ValueError, OSError):  # a half-built backend: unknown
++        return None
++    if names is None or isinstance(names, frozenset):
++        return names
++    return None
++
++
+ def gateway_lifecycle_block(
+     *,
+     command: str,
+@@ -625,6 +642,7 @@ def gateway_lifecycle_block(
+         command,
+         cwd=guard_cwd,
+         read_remote_script=lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES),
++        session_aliases=_session_aliases_for_guard(env),
+     )
+     if unsafe and refusal:
+         # Not a lifecycle command: a script the command EXECUTES could not be scanned (budget,
+-- 
+2.51.0
+

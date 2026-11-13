@@ -1,0 +1,155 @@
+From bc4eee92f101c59304aa49882387d06d118cb32d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:03:30 +0000
+Subject: [PATCH] [daveey] fix(guard): tie the hermes-sync refusal hint to an
+ executed hermes-sync and the root sync log
+
+Follow-up to PR #2099 review 5889765136 (card t_01a1d48e57dd8d16), both nits:
+
+1) The hint named <display_hermes_home()>/logs/hermes-sync.log, which follows the gateway's
+   profile. hermes-sync logs under its own home (HERMES_HOME of its cron/systemd pass, the root
+   ~/.hermes), so a profile gateway pointed at a missing
+   ~/.hermes/profiles/<name>/logs/hermes-sync.log. The hint now resolves the root home with
+   get_default_hermes_root(home=get_hermes_home()).
+2) The hint matched `hermes-sync` anywhere in the command text, so a refusal of another script
+   that merely mentions it (`grep x hermes-sync; ./deploy.sh`) got the deploy-route advice. The
+   hint now fires only when a segment executes hermes-sync: as its command word (env
+   assignments and sudo/nohup/systemd-run/... peeled with the guard's own helpers), as the
+   script a shell or Python interpreter runs, or inside an `sh -c` payload (depth-bounded, and
+   only for commands within the guard's scan budget).
+
+The guard refuses exactly the same commands; only the hint text changes.
+
+Tests (tests/tools/test_lifecycle_guard_hermes_sync_hint.py): RED with the PR #2099 source,
+3 failed / 10 passed (two mention cases and the profile-gateway log path); GREEN 13 passed.
+9 files importing the guard: 537 passed.
+---
+ .../test_lifecycle_guard_hermes_sync_hint.py  | 49 +++++++++++++++++++
+ tools/terminal_tool_guards.py                 | 44 +++++++++++++++--
+ 2 files changed, 89 insertions(+), 4 deletions(-)
+
+diff --git a/tests/tools/test_lifecycle_guard_hermes_sync_hint.py b/tests/tools/test_lifecycle_guard_hermes_sync_hint.py
+index 9934cc381a..5225146036 100644
+--- a/tests/tools/test_lifecycle_guard_hermes_sync_hint.py
++++ b/tests/tools/test_lifecycle_guard_hermes_sync_hint.py
+@@ -56,3 +56,52 @@ def test_other_refusals_keep_the_generic_text(tmp_path, monkeypatch):
+ 
+     assert _ROUTE not in error
+     assert "hermes gateway restart" in error
++
++
++_RESTART = "#!/bin/sh\nhermes gateway restart\n"
++
++
++@pytest.mark.parametrize("template", [
++    "sudo -u ubuntu {script} mods-pull",
++    "HERMES_HOME=/x nohup {script} mods-pull",
++    "systemd-run --user --unit sync {script} mods-pull",
++    "bash {script} mods-pull",
++    "bash -c '{script} mods-pull'",
++    "cd /tmp && {script} mods-pull",
++])
++def test_hint_follows_hermes_sync_through_wrappers(tmp_path, monkeypatch, template):
++    script = _script(tmp_path, "hermes-sync", _RESTART)
++
++    error = _refuse(tmp_path, monkeypatch, template.format(script=script))
++
++    assert _ROUTE in error
++
++
++@pytest.mark.parametrize("template", [
++    "grep x hermes-sync; {deploy}",
++    "{deploy} --log ~/.hermes/logs/hermes-sync.log",
++    "echo 'hermes-sync mods-pull' && {deploy}",
++])
++def test_a_mere_mention_of_hermes_sync_gets_no_hint(tmp_path, monkeypatch, template):
++    # The refused script is deploy.sh; hermes-sync only appears as an argument or in data.
++    deploy = _script(tmp_path, "deploy.sh", _RESTART)
++
++    error = _refuse(tmp_path, monkeypatch, template.format(deploy=deploy))
++
++    assert "hermes gateway restart" in error
++    assert _ROUTE not in error
++
++
++def test_hint_names_the_root_sync_log_from_a_profile_gateway(tmp_path, monkeypatch):
++    # hermes-sync logs under its own home (root ~/.hermes), not the gateway profile's home.
++    home = tmp_path / "home"
++    profile = home / ".hermes" / "profiles" / "coder"
++    profile.mkdir(parents=True)
++    monkeypatch.setenv("HOME", str(home))
++    monkeypatch.setenv("HERMES_HOME", str(profile))
++    script = _script(tmp_path, "hermes-sync", _RESTART)
++
++    error = _refuse(tmp_path, monkeypatch, f"{script} mods-pull")
++
++    assert "~/.hermes/logs/hermes-sync.log" in error
++    assert "profiles" not in error
+diff --git a/tools/terminal_tool_guards.py b/tools/terminal_tool_guards.py
+index 01c0521851..54f2222ba7 100644
+--- a/tools/terminal_tool_guards.py
++++ b/tools/terminal_tool_guards.py
+@@ -581,20 +581,56 @@ def _session_aliases_for_guard(env: Any) -> Optional[frozenset[str]]:
+ # hermes-sync can idle-restart the gateway it runs under, so the guard refuses it inside the
+ # gateway (by lifecycle content, or because the script is over the scan budget). The generic
+ # "separate shell" advice made agents wrap it in systemd-run/nohup; name the sanctioned route.
+-_HERMES_SYNC_WORD = re.compile(r"(?:^|[\s/;&|(`'\"])hermes-sync(?=$|[\s;&|)`'\"])")
++_HERMES_SYNC = "hermes-sync"
++_HERMES_SYNC_PAYLOAD_DEPTH = 4
++
++
++def _runs_hermes_sync(command: str, depth: int = 0) -> bool:
++    """Whether *command* EXECUTES hermes-sync: as a segment's command word (env assignments and
++    wrappers such as sudo/nohup/systemd-run peeled), as the script a shell or Python interpreter
++    runs, or inside an ``sh -c`` payload. A mere mention (``grep x hermes-sync``) does not count."""
++    from cron.lifecycle_guard import (
++        _SHELL_EXECUTABLES,
++        _executable_name,
++        _executed_command_index,
++        _is_interpreter_image,
++        _iter_command_segments,
++        _iter_shell_command_payloads,
++        lifecycle_scan_root_within_budget,
++    )
++
++    if _HERMES_SYNC not in command or not lifecycle_scan_root_within_budget(command):
++        return False
++    for segment in _iter_command_segments(command):
++        index = _executed_command_index(segment)
++        if index is None:
++            continue
++        name = _executable_name(segment[index])
++        if name == _HERMES_SYNC:
++            return True
++        if name in _SHELL_EXECUTABLES or _is_interpreter_image(name):
++            script = next((t for t in segment[index + 1:] if not t.startswith("-")), None)
++            if script is not None and _executable_name(script) == _HERMES_SYNC:
++                return True
++    if depth >= _HERMES_SYNC_PAYLOAD_DEPTH:
++        return False
++    return any(_runs_hermes_sync(p, depth + 1) for p in _iter_shell_command_payloads(command))
+ 
+ 
+ def _refusal_hint(command: str) -> str:
+-    if not _HERMES_SYNC_WORD.search(command):
++    if not _runs_hermes_sync(command):
+         return ""
+-    from hermes_constants import display_hermes_home
++    from hermes_constants import display_hermes_home, get_default_hermes_root, get_hermes_home
+ 
++    # hermes-sync logs under its own home (the root ~/.hermes), not a profile gateway's home.
++    root = get_default_hermes_root(home=get_hermes_home())
++    sync_log = f"{display_hermes_home(root)}/logs/hermes-sync.log"
+     return (
+         " hermes-sync runs only from its scheduled cron/systemd pass, never from a gateway chat. "
+         "To deploy a pushed hermes-mods commit from here, run "
+         "`git -C ~/code/hermes-mods fetch -q origin && git -C ~/code/hermes-mods merge --ff-only origin/main`, "
+         "then wait for the next scheduled "
+-        f"sync pass and read its `mods-reload:` line in {display_hermes_home()}/logs/hermes-sync.log. "
++        f"sync pass and read its `mods-reload:` line in {sync_log}. "
+         "Do not wrap hermes-sync in systemd-run, nohup, setsid or a background shell to get past "
+         "this refusal."
+     )
+-- 
+2.51.0
+

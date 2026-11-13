@@ -1,0 +1,226 @@
+From d7f74363b809db24a8f0f2673b99650507068e0e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:32:34 +0000
+Subject: [PATCH] fix(update-pause): take back a carried pause's stamp when the
+ pause does not stand
+
+`carried_turn_paused` is stamped write-ahead by a synthesized turn's step-boundary hook (mark_turn_paused) and
+nothing cleared it when that carried pause did not stand: a failed job stop let the notification turn run to
+completion, or a user Stop won after the hook paid the pause. The continuation then still appended
+CARRIED_TURN_NOTE ("Finish what it still needs too") for a notification turn that finished or was stopped.
+
+The hook now takes back a stamp it added itself (the marker had none before) when it refuses the pause after the
+write-ahead mark (job stop failed or raised, user Stop pending), and records the fresh stamp in
+`_carried_pause_stamped` when it pauses; `pause_stands` removes the stamp when that turn does not end paused
+(a later Stop won). An earlier carried pause that stood keeps its stamp. New turn_marker.clear_carried_turn_paused.
+
+PR #1888 review nit (review 5887196749), t_01a1d3a622ae983f.
+---
+ .../test_update_pause_superseded.py           | 77 +++++++++++++++++++
+ tui_gateway/prompt_turn.py                    |  1 +
+ tui_gateway/turn_marker.py                    | 13 ++++
+ tui_gateway/update_pause.py                   | 35 +++++++--
+ 4 files changed, 118 insertions(+), 8 deletions(-)
+
+diff --git a/tests/tui_gateway/test_update_pause_superseded.py b/tests/tui_gateway/test_update_pause_superseded.py
+index 528d7b8d18..886b56ea63 100644
+--- a/tests/tui_gateway/test_update_pause_superseded.py
++++ b/tests/tui_gateway/test_update_pause_superseded.py
+@@ -450,3 +450,80 @@ def test_a_turn_retrying_its_own_pause_after_a_failed_job_stop_is_not_carried(en
+     marker = read_turn_marker(env.home, "session-key")
+     assert marker is not None and marker["reason"] == up.PAUSE_REASON and marker["pauses"] == 1
+     assert not marker.get("carried_turn_paused"), "the turn's own retried pause was stamped as carried"
++
++
++# --- PR #1888 review nit (t_01a1d3a622ae983f): ``carried_turn_paused`` is stamped write-ahead, so a carried pause
++# that does not stand must take the stamp back, or the continuation tells the model to finish a notification turn
++# that ran to completion or that the user stopped.
++
++def _continuation_note(env):
++    marker = read_turn_marker(env.home, "session-key")
++    assert marker is not None and marker["reason"] == up.PAUSE_REASON and marker["prompt"] == "the long task"
++    return marker, up.pause_note(marker["prompt"], marker.get("killed_jobs"),
++                                 carried=bool(marker.get("carried_turn_paused")))
++
++
++def test_a_carried_pause_whose_job_stop_failed_does_not_name_the_completed_notification_turn(env, monkeypatch):
++    fail = {"on": False}  # only the carried turn's job stop fails; the paused turn's own pause stands
++    monkeypatch.setattr(up, "stop_owned_jobs_for_update_pause", lambda jobs, save: not fail["on"])
++
++    def _turn(agent, seen):
++        fail["on"] = True
++        seen["reason"] = agent.step_boundary_pause()  # stamps write-ahead, then the job stop fails
++        return {"final_response": "noted", "messages": []}  # so the notification turn runs to completion
++
++    _session, seen = _carried_turn_with_window(env, _turn)
++
++    assert seen["reason"] is None
++    marker, note = _continuation_note(env)
++    assert not marker.get("carried_turn_paused"), "a carried pause that never stood stayed stamped"
++    assert up.CARRIED_TURN_NOTE not in note
++
++
++def test_a_user_stop_of_a_carried_turn_after_its_hook_paid_does_not_name_the_stopped_turn(env):
++    seen = {}
++    session = _paused_session(env.home)
++    server._sessions["ui-sid"] = session
++
++    def _turn(agent, seen):
++        seen["reason"] = agent.step_boundary_pause()
++        seen["stamped"] = bool((read_turn_marker(env.home, "session-key") or {}).get("carried_turn_paused"))
++        reply = server._methods["session.interrupt"]("rid-stop", {"session_id": "ui-sid", "origin": "stop_button"})
++        seen["stop"] = reply.get("result", {}).get("status")
++        return {"final_response": "", "messages": [], "interrupted": True, "completed": False}  # the Stop won
++
++    session["agent"].run_conversation = lambda message, **kw: _run_with_window(env, session, _turn, seen)
++    session["agent"].interrupt = lambda *a, **k: None
++    session["running"] = True
++    try:
++        assert server._notif_run_submit("__notif__1", "ui-sid", session, "[Background process proc_1 finished]")
++    finally:
++        server._sessions.pop("ui-sid", None)
++
++    assert seen["reason"] == up.PAUSE_REASON and seen["stamped"] and seen["stop"] == "interrupted"
++    marker, note = _continuation_note(env)
++    assert not marker.get("carried_turn_paused"), "the stopped notification turn is still named by the continuation"
++    assert up.CARRIED_TURN_NOTE not in note
++    assert up.in_place_resume_action(session, "session-key", skew=lambda: None) == "resume"
++
++
++def test_a_later_carried_pause_that_does_not_stand_keeps_an_earlier_carried_pause_named(env, monkeypatch):
++    session, seen = _carried_turn_with_window(env, _hook_pauses)  # a first notification turn's pause stood
++    assert seen["reason"] == up.PAUSE_REASON
++    assert read_turn_marker(env.home, "session-key").get("carried_turn_paused") is True
++
++    monkeypatch.setattr(up, "stop_owned_jobs_for_update_pause", lambda jobs, save: False)
++    second = {}
++
++    def _turn(agent, seen):
++        seen["reason"] = agent.step_boundary_pause()
++        return {"final_response": "noted", "messages": []}
++
++    session["agent"].run_conversation = lambda message, **kw: _run_with_window(env, session, _turn, second)
++    session["running"] = True
++    assert server._notif_run_submit("__notif__2", "ui-sid", session, "[Background process proc_2 finished]")
++
++    assert second["reason"] is None
++    marker, note = _continuation_note(env)
++    assert marker.get("carried_turn_paused") is True, "a failed later pause erased the earlier interrupted turn"
++    assert note.endswith(up.CARRIED_TURN_NOTE)
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 1413d32054..e184948faf 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -273,6 +273,7 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
+     until_tool = bool(session.pop("_marker_until_tool", False))
+     # [daveey] A core-update pause kept the previous turn's marker; this turn owns (and retires) its own.
+     session.pop("_update_pause_marker_key", None)
++    session.pop("_carried_pause_stamped", None)  # a carried turn that raised before pause_stands left it
+     if not synthesized:  # the continuation (or a typed message) started: automatic turns may run again
+         session.pop("_update_pause_due_until", None)
+     if synthesized and not marker_attempt and _carry_paused_marker(session, marker_home, marker_key):
+diff --git a/tui_gateway/turn_marker.py b/tui_gateway/turn_marker.py
+index 725e443509..cdfcc93050 100644
+--- a/tui_gateway/turn_marker.py
++++ b/tui_gateway/turn_marker.py
+@@ -304,6 +304,19 @@ def mark_turn_paused(home: Path | str, session_key: str, reason: str,
+     return False
+ 
+ 
++def clear_carried_turn_paused(home: Path | str, session_key: str) -> bool:
++    """[daveey] Take back a write-ahead ``carried_turn_paused`` stamp whose carried pause did not stand (the job
++    stop failed, or a user Stop won), so the continuation does not name a notification turn that ran to completion
++    or was stopped. Everything else untouched. True when a stamp was removed."""
++    def mutate(entries):
++        entry = entries.get(session_key)
++        if not isinstance(entry, dict) or not entry.pop("carried_turn_paused", None):
++            return None
++        return entries
++
++    return bool(session_key) and _update(home, session_key, mutate, "unstamp carried pause")
++
++
+ def mark_turn_parked(home: Path | str, session_key: str) -> bool:
+     """[daveey] Restamp ``parked_at`` on a core-update pause its live writer keeps idle between drain
+     windows (``update_pause.drain_retry_pending``). Reason, prompt and counters untouched."""
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index b6e886f936..929a9f4b3c 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -277,7 +277,7 @@ def boundary_pause_hook(session: dict, marker_key: str, *, carried: bool = False
+                 declined.append(why)
+                 logger.info("core-update pause: session %s keeps running (%s)", marker_key, why)
+             return None
+-        from tui_gateway.turn_marker import mark_turn_paused, read_turn_marker
++        from tui_gateway.turn_marker import clear_carried_turn_paused, mark_turn_paused, read_turn_marker
+         home = _home(session)
+         marker = read_turn_marker(home, marker_key)
+         if marker is None:
+@@ -290,6 +290,13 @@ def boundary_pause_hook(session: dict, marker_key: str, *, carried: bool = False
+         # Counted already: a synthesized turn over the paused marker pays it, and a turn retrying its own pause
+         # after a failed attempt left the write-ahead mark. Only the former is ``carried`` (the caller's call).
+         increment = marker.get("reason") != PAUSE_REASON
++        # Only a stamp this turn adds is its to take back: an earlier carried pause that stood keeps its own.
++        stamps = carried and not marker.get("carried_turn_paused")
++
++        def take_back() -> None:
++            if stamps:  # the carried pause did not stand: the notification turn goes on, so do not name it
++                clear_carried_turn_paused(home, marker_key)
++
+         if not mark_turn_paused(home, marker_key, PAUSE_REASON, killed_jobs=killed, increment=increment,
+                                 carried=carried):
+             return None
+@@ -298,18 +305,25 @@ def boundary_pause_hook(session: dict, marker_key: str, *, carried: bool = False
+                                     carried=carried)
+         try:
+             if not stop_owned_jobs_for_update_pause(killed, save):
++                take_back()
+                 return None
+         except Exception:
+             logger.warning("core-update pause: background cleanup failed; refusing pause for %s", marker_key, exc_info=True)
++            take_back()
+             return None
+         drainer_lock = _drainer_lock(session)  # request disappears when the window ends
+         with session["history_lock"]:
+-            if user_stop_pending(session):  # under the lock user_stop_wins takes: one of the two sees the other
+-                logger.info("core-update pause: session %s was stopped by the user; not pausing it", marker_key)
+-                return None
+-            session["_update_pause_marker_key"] = marker_key
+-            session["_update_pause_drainer_lock"] = drainer_lock
+-            session.pop("_update_pause_parked_stamp", None)  # a new pause starts unparked
++            stopped = user_stop_pending(session)  # under the lock user_stop_wins takes: one sees the other
++            if not stopped:
++                session["_update_pause_marker_key"] = marker_key
++                session["_update_pause_drainer_lock"] = drainer_lock
++                session.pop("_update_pause_parked_stamp", None)  # a new pause starts unparked
++                if stamps:  # pause_stands takes it back if the turn does not end paused (a later Stop won)
++                    session["_carried_pause_stamped"] = marker_key
++        if stopped:
++            logger.info("core-update pause: session %s was stopped by the user; not pausing it", marker_key)
++            take_back()
++            return None
+         logger.info("core-update pause: session %s paused at a step boundary for a Hermes update", marker_key)
+         return PAUSE_REASON
+ 
+@@ -372,12 +386,17 @@ def effective_pause_key(session: dict, marker_key: str) -> str:
+ def pause_stands(session: dict, marker_key: str, result: Any) -> bool:
+     """The turn's end: it ended paused for the update AND the session still keeps this turn's marker (a Stop
+     that won dropped it). A turn whose hook paused it but which did not end paused (the Stop won in the agent
+-    loop) drops the session's keep here, before its marker is retired."""
++    loop) drops the session's keep here, before its marker is retired, and a carried turn takes back the
++    write-ahead ``carried_turn_paused`` stamp its hook added, so the continuation does not name a stopped turn."""
+     with session["history_lock"]:
+         mine = bool(marker_key) and session.get("_update_pause_marker_key") == marker_key
+         stands = mine and isinstance(result, dict) and bool(result.get("paused_for_update"))
+         if mine and not stands and not session.get("_exit_keeps_turn_marker"):
+             _drop_pause(session)
++        stamped = session.pop("_carried_pause_stamped", None) == marker_key
++    if stamped and not stands:  # a carried turn's hook paid the pause but the turn did not end paused
++        from tui_gateway.turn_marker import clear_carried_turn_paused
++        clear_carried_turn_paused(_home(session), marker_key)
+     return stands
+ 
+ 
+-- 
+2.51.0
+

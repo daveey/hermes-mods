@@ -1,0 +1,285 @@
+From 10580b699674a237512a6d8ff1aaa469f91bdf05 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 03:39:28 +0000
+Subject: [PATCH] [daveey] worker inventory: tests never register in the real
+ account; GC'd scratch boards retire
+
+Incident t_01a1d2f44306133f: worker-2 deferred every claim for ~18 min with
+worker_resources_unknown. A pytest tmp board had been registered in the real
+~/.hermes/worker-resources/boards and then deleted; paths() raised
+FileNotFoundError on it, and refusal() fail-closes on any exception.
+
+How it got there: test_unverified_fingerprint_capture_never_authorizes_a_signal
+called monkeypatch.undo(), which also dropped conftest's
+worker_compute_capacity.policy_root isolation (and the real-home I/O guard), so
+the next claim registered under the real account root.
+
+- The fingerprint test restores only its own patch (monkeypatch.context()).
+- register() refuses under PYTEST_CURRENT_TEST when policy_root is the real
+  account root, so any of the other monkeypatch.undo() tests fail loudly
+  instead of poisoning the host inventory (path compare only, no I/O).
+- paths(): a missing registered board whose directory is gone from an
+  ephemeral root (/tmp, /var/tmp, gettempdir(), <account>/cache/scratch)
+  is a GC'd workspace: its record is retired instead of holding claims
+  forever (worker-1's scratch bench records). Real boards, non-ephemeral
+  paths and a missing file in a surviving directory still fail closed. An
+  ephemeral root that contains the account root is ignored.
+- refusal() logs the failing check once per 10 min per distinct error
+  ("worker_resources_unknown: FileNotFoundError: ... <path>").
+---
+ hermes_cli/worker_account_boards.py           | 51 +++++++++++++-
+ hermes_cli/worker_resource_admission.py       | 19 ++++-
+ .../test_kanban_worker_pid_fingerprint.py     | 16 +++--
+ .../hermes_cli/test_worker_account_boards.py  | 69 +++++++++++++++++++
+ .../test_worker_resource_admission.py         | 16 +++++
+ 5 files changed, 161 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/worker_account_boards.py b/hermes_cli/worker_account_boards.py
+index 76a70de49b..d3033b8919 100644
+--- a/hermes_cli/worker_account_boards.py
++++ b/hermes_cli/worker_account_boards.py
+@@ -2,7 +2,10 @@
+ 
+ Registration happens under account admission.lock before the final gate. Records
+ survive process exits: a parked dispatcher is not evidence its running rows or
+-jobs vanished. Missing registered DBs are unknown, never silently free capacity.
++jobs vanished. Missing registered DBs are unknown, never silently free capacity,
++except a board whose whole directory was removed from an ephemeral root (system
++temp, the account scratch dir): that workspace was garbage-collected, so its
++record retires instead of holding every claim on the host forever.
+ """
+ from __future__ import annotations
+ 
+@@ -17,7 +20,45 @@ import tempfile
+ from hermes_cli import worker_compute_capacity as capacity
+ 
+ 
++def _refuse_test_registration() -> None:
++    """A pytest process never writes the real account inventory.
++
++    conftest isolates ``policy_root``; a test's ``monkeypatch.undo()`` also drops
++    that patch, and a later claim then registered its tmp board in the real
++    account. Once pytest deleted the board, every worker claim on the host was
++    deferred ``worker_resources_unknown``. Compare paths without I/O: the
++    test-only real-home guard refuses any stat under the real root.
++    """
++    if not os.environ.get('PYTEST_CURRENT_TEST'):
++        return
++    from hermes_constants import _account_home
++    real = os.path.normpath(str(_account_home() / '.hermes'))
++    if os.path.normpath(str(capacity.policy_root())) == real:
++        raise RuntimeError('pytest must not register boards in the real account worker '
++                           f'inventory ({real}); is worker_compute_capacity.policy_root isolated?')
++
++
++def _ephemeral_roots() -> list[Path]:
++    account = capacity.policy_root().resolve()
++    # no-tmp: ok — matches boards OTHER processes made in system temp (pytest tmp_path), not our own scratch
++    roots = {Path('/tmp'), Path('/var/tmp'), Path(tempfile.gettempdir()), account / 'cache' / 'scratch'}
++    # An odd TMPDIR (a home or /) must never make the account's own boards ephemeral.
++    return [root for root in (r.resolve() for r in roots) if not account.is_relative_to(root)]
++
++
++def _collected(path: Path) -> bool:
++    """The board's directory is gone from a temp/scratch root: GC'd, not unknown.
++
++    A real board (installation root, any non-ephemeral path) or a missing file in
++    a surviving directory stays unknown and keeps refusing claims.
++    """
++    if path.parent.exists():
++        return False
++    return any(path.is_relative_to(root) for root in _ephemeral_roots())
++
++
+ def register(conn) -> None:
++    _refuse_test_registration()
+     from hermes_cli.kanban_db_connect import _main_db_file
+     raw = _main_db_file(conn)
+     if not raw:
+@@ -132,6 +173,12 @@ def paths() -> list[Path]:
+                 raise ValueError('invalid registered board path')
+             if record.stem != hashlib.sha256(raw.encode()).hexdigest():
+                 raise ValueError('invalid registered board identity')
+-            Path(raw).stat()  # disappearance is unknown, including default boards
++            try:
++                Path(raw).stat()  # disappearance is unknown, including default boards
++            except FileNotFoundError:
++                if not _collected(Path(raw)):
++                    raise
++                record.unlink(missing_ok=True)
++                continue
+             found.append(Path(raw))
+     return found
+diff --git a/hermes_cli/worker_resource_admission.py b/hermes_cli/worker_resource_admission.py
+index 562c5e17a1..3726c91137 100644
+--- a/hermes_cli/worker_resource_admission.py
++++ b/hermes_cli/worker_resource_admission.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ 
+ 
+ import json
++import logging
+ import os
+ from pathlib import Path
+ import tempfile
+@@ -13,6 +14,21 @@ from hermes_cli import worker_compute_capacity as capacity
+ # Short hysteresis writers should not cause prelease/final-gate churn. Keep the
+ # wait bounded; final admission also checks its whole-lock budget after sampling.
+ PRESSURE_LOCK_TIMEOUT = 0.25
++# One log line per distinct failure per window: refusal() runs per card per tick.
++UNKNOWN_LOG_INTERVAL = 600.0
++_unknown_logged: dict[str, float] = {}
++
++
++def _log_unknown(exc: BaseException) -> None:
++    """Name the failing check (e.g. the missing registered board) in gateway.log."""
++    detail = f'{type(exc).__name__}: {exc}'
++    now = time.monotonic()
++    if detail in _unknown_logged and now - _unknown_logged[detail] < UNKNOWN_LOG_INTERVAL:
++        return
++    _unknown_logged[detail] = now
++    logging.getLogger(__name__).warning(
++        'worker_resources_unknown: %s (board inventory: %s)', detail,
++        capacity.policy_root() / 'worker-resources' / 'boards')
+ 
+ 
+ def _lock_pressure(lock):
+@@ -125,5 +141,6 @@ def refusal(echo=None, *, enabled=None, claimant=None) -> str | None:
+         if occupied_count > cap if claimant is not None else occupied_count >= cap:
+             return 'worker_capacity_full'
+         return None
+-    except Exception:  # health: allow BLE001 -- any unreadable policy/controller must refuse claims
++    except Exception as exc:  # health: allow BLE001 -- any unreadable policy/controller must refuse claims
++        _log_unknown(exc)
+         return 'worker_resources_unknown'
+diff --git a/tests/hermes_cli/test_kanban_worker_pid_fingerprint.py b/tests/hermes_cli/test_kanban_worker_pid_fingerprint.py
+index 51800bd0c3..ffa8d5bd9e 100644
+--- a/tests/hermes_cli/test_kanban_worker_pid_fingerprint.py
++++ b/tests/hermes_cli/test_kanban_worker_pid_fingerprint.py
+@@ -119,13 +119,15 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
+ 
+     conn = board
+     killed = []
+-    monkeypatch.setattr(status, "_get_process_start_time", lambda pid: None)
+-    tid = kb.create_task(conn, title="job", assignee="worker", max_runtime_seconds=1)
+-    kb.claim_task(conn, tid)
+-    kbd._set_worker_pid(conn, tid, os.getpid())
+-    row = conn.execute("SELECT worker_started_at FROM tasks WHERE id = ?", (tid,)).fetchone()
+-    assert row["worker_started_at"] == kbd.UNVERIFIED_WORKER_FINGERPRINT
+-    monkeypatch.undo()
++    # Restore ONLY this patch: a bare monkeypatch.undo() also dropped conftest's policy_root isolation, and the
++    # next claim registered this tmp board in the real account worker inventory (incident t_01a1d2f44306133f).
++    with monkeypatch.context() as m:
++        m.setattr(status, "_get_process_start_time", lambda pid: None)
++        tid = kb.create_task(conn, title="job", assignee="worker", max_runtime_seconds=1)
++        kb.claim_task(conn, tid)
++        kbd._set_worker_pid(conn, tid, os.getpid())
++        row = conn.execute("SELECT worker_started_at FROM tasks WHERE id = ?", (tid,)).fetchone()
++        assert row["worker_started_at"] == kbd.UNVERIFIED_WORKER_FINGERPRINT
+     old = int(time.time()) - 3600
+     with kb.write_txn(conn):
+         conn.execute("UPDATE tasks SET started_at = ?, claim_expires = ? WHERE id = ?", (old, old, tid))
+diff --git a/tests/hermes_cli/test_worker_account_boards.py b/tests/hermes_cli/test_worker_account_boards.py
+index fc1ecaa5d5..7243488061 100644
+--- a/tests/hermes_cli/test_worker_account_boards.py
++++ b/tests/hermes_cli/test_worker_account_boards.py
+@@ -70,3 +70,72 @@ def test_unregistered_account_boards_count(monkeypatch, tmp_path):
+     named.parent.mkdir(parents=True)
+     named.touch()
+     assert set(inventory.paths()) == {default, named}
++
++
++def _registered(conn_path):
++    conn = sqlite3.connect(conn_path)
++    try:
++        inventory.register(conn)
++    finally:
++        conn.close()
++
++
++def test_garbage_collected_scratch_board_retires_its_record(monkeypatch, tmp_path):
++    """A scratch HERMES_HOME's board whose workspace was pruned no longer holds every claim."""
++    import shutil
++    monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path)
++    workspace = tmp_path / 'cache' / 'scratch' / 't_bench-x' / 'home'
++    workspace.mkdir(parents=True)
++    _registered(workspace / 'kanban.db')
++    records = list((tmp_path / 'worker-resources' / 'boards').glob('*.json'))
++    assert len(records) == 1 and inventory.paths() == [(workspace / 'kanban.db').resolve()]
++    shutil.rmtree(tmp_path / 'cache' / 'scratch' / 't_bench-x')
++    assert inventory.paths() == []
++    assert not records[0].exists()
++
++
++def test_missing_board_stays_unknown_unless_its_scratch_dir_is_gone(monkeypatch, tmp_path):
++    """Fail closed for real boards: a non-ephemeral root, or a surviving scratch dir."""
++    import shutil
++    account = tmp_path / 'account'
++    account.mkdir()
++    monkeypatch.setattr(capacity, 'policy_root', lambda: account)
++    real = tmp_path / 'other-install' / 'kanban.db'
++    real.parent.mkdir()
++    _registered(real)
++    shutil.rmtree(real.parent)
++    with pytest.raises(FileNotFoundError):
++        inventory.paths()
++    shutil.rmtree(account / 'worker-resources')
++    scratch = account / 'cache' / 'scratch' / 'run' / 'kanban.db'
++    scratch.parent.mkdir(parents=True)
++    _registered(scratch)
++    scratch.unlink()  # the directory survives: a replaced or moving board, not a pruned workspace
++    with pytest.raises(FileNotFoundError):
++        inventory.paths()
++
++
++def test_ephemeral_roots_never_cover_the_account(monkeypatch, tmp_path):
++    import tempfile
++    account = tmp_path / 'home' / '.hermes'
++    monkeypatch.setattr(capacity, 'policy_root', lambda: account)
++    monkeypatch.setattr(tempfile, 'gettempdir', lambda: str(tmp_path / 'home'))
++    roots = inventory._ephemeral_roots()
++    assert (account / 'cache' / 'scratch').resolve() in roots
++    assert not any(account.resolve().is_relative_to(root) for root in roots)
++
++
++def test_pytest_never_registers_in_the_real_account_inventory(monkeypatch, tmp_path):
++    """monkeypatch.undo() drops conftest's policy_root isolation; register must still refuse."""
++    import hermes_constants
++    monkeypatch.setattr(hermes_constants, '_account_home', lambda: tmp_path)
++    monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path / '.hermes')
++    conn = sqlite3.connect(tmp_path / 'board.db')
++    try:
++        with pytest.raises(RuntimeError, match='real account worker inventory'):
++            inventory.register(conn)
++        monkeypatch.delenv('PYTEST_CURRENT_TEST')
++        inventory.register(conn)
++    finally:
++        conn.close()
++    assert inventory.paths() == [(tmp_path / 'board.db').resolve()]
+diff --git a/tests/hermes_cli/test_worker_resource_admission.py b/tests/hermes_cli/test_worker_resource_admission.py
+index d4708bc99b..a4cbc0e07e 100644
+--- a/tests/hermes_cli/test_worker_resource_admission.py
++++ b/tests/hermes_cli/test_worker_resource_admission.py
+@@ -223,3 +223,19 @@ def test_policy_enabled_after_lock_selection_refuses(worker_rig, monkeypatch):
+     with admission.claim_transaction(rig.conn) as accepted:
+         assert not accepted
+ 
++
++
++def test_unknown_names_the_failing_check_once(monkeypatch, tmp_path, caplog):
++    import logging
++    from hermes_cli import worker_resource_admission as resources
++    monkeypatch.setattr(resources, '_unknown_logged', {})
++    monkeypatch.setattr(resources, '_pressure', lambda directory: False)
++    missing = tmp_path / 'gone' / 'kanban.db'
++    def boom(*_args, **_kwargs):
++        raise FileNotFoundError(2, 'No such file or directory', str(missing))
++    monkeypatch.setattr(resources, 'occupied_count_for_host', boom)
++    with caplog.at_level(logging.WARNING, logger=resources.__name__):
++        assert resources.refusal(enabled=True) == 'worker_resources_unknown'
++        assert resources.refusal(enabled=True) == 'worker_resources_unknown'
++    lines = [r.getMessage() for r in caplog.records if 'worker_resources_unknown' in r.getMessage()]
++    assert len(lines) == 1 and str(missing) in lines[0]
+-- 
+2.51.0
+

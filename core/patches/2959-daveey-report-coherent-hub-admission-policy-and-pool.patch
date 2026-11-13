@@ -1,0 +1,231 @@
+From 39d659344173e24ea189c77cd75d0348985e2cf8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:16:51 +0000
+Subject: [PATCH] [daveey] report coherent hub admission policy and pool census
+
+---
+ hermes_cli/machine_admission_metrics.py       |  49 +++++++++
+ hermes_cli/machine_drain_metrics.py           |   3 +-
+ hermes_cli/machine_metrics.py                 |  10 +-
+ .../test_machine_admission_metrics.py         | 104 ++++++++++++++++++
+ 4 files changed, 163 insertions(+), 3 deletions(-)
+ create mode 100644 hermes_cli/machine_admission_metrics.py
+ create mode 100644 tests/hermes_cli/test_machine_admission_metrics.py
+
+diff --git a/hermes_cli/machine_admission_metrics.py b/hermes_cli/machine_admission_metrics.py
+new file mode 100644
+index 0000000000..4c27c58ce6
+--- /dev/null
++++ b/hermes_cli/machine_admission_metrics.py
+@@ -0,0 +1,49 @@
++"""Versioned hub pool telemetry; operator policy is never inferred by the receiver."""
++from pathlib import Path
++
++FIELDS = ("admission_version", "admission_regular_slots", "admission_priority_slots",
++          "admission_regular_cpu_limit", "admission_priority_cpu_limit", "active_regular_runs", "active_priority_runs")
++
++
++def policy():
++    """Read one root configuration snapshot, returning no support for invalid/disabled policy."""
++    from hermes_constants import get_default_hermes_root
++    from hermes_cli.config_backend import read_config_doc_readonly
++    from hermes_cli import machine_cpu_metrics as cpu
++    from hermes_cli.kanban_db_dispatch import resolve_max_in_progress
++
++    try:
++        doc = read_config_doc_readonly(Path(get_default_hermes_root()) / "config.yaml")
++        state, limit = cpu.root_limit(read_doc=lambda _path: doc)
++        if state != cpu.ON:
++            return {}
++        kanban = doc["kanban"]
++        admission = kanban["admission"]
++        slots = admission.get("priority_slots", 0)
++        ceiling = admission.get("priority_cpu_busy_below_pct", 85)
++        raw = kanban.get("max_in_progress")
++        if type(slots) is not int or not 0 < slots <= 256 or not cpu.valid_limit(ceiling):
++            return {}
++        if raw is not None and (type(raw) is not int or raw < 1):
++            return {}
++        cap = resolve_max_in_progress(raw)
++        if type(cap) is not int or not 0 <= cap <= 256:
++            return {}
++        return {"admission_version": 1, "admission_regular_slots": cap, "admission_priority_slots": slots,
++                "admission_regular_cpu_limit": limit, "admission_priority_cpu_limit": ceiling}
++    except (OSError, ValueError, TypeError, KeyError):
++        return {}
++
++
++def collect(count):
++    """Use a single census for the scalar and both pools, or omit the entire tuple."""
++    settings = policy()
++    if not settings:
++        return {"active_card_runs": count()}
++    detail = {"pools": {"regular": 0, "priority": 0}}
++    active = count(detail=detail)
++    out = {"active_card_runs": active}
++    pools = detail["pools"]
++    if type(active) is int and active >= 0 and all(type(v) is int and v >= 0 for v in pools.values()) and sum(pools.values()) == active:
++        out.update(settings, active_regular_runs=pools["regular"], active_priority_runs=pools["priority"])
++    return out
+diff --git a/hermes_cli/machine_drain_metrics.py b/hermes_cli/machine_drain_metrics.py
+index 2310304793..24a7b4da5a 100644
+--- a/hermes_cli/machine_drain_metrics.py
++++ b/hermes_cli/machine_drain_metrics.py
+@@ -2,6 +2,7 @@
+ from __future__ import annotations
+ 
+ import math
++from hermes_cli.machine_admission_metrics import FIELDS as ADMISSION_FIELDS
+ 
+ 
+ def collect():
+@@ -33,7 +34,7 @@ def collect():
+ 
+ # Fields newer Boards accept and older Boards reject (400, atomically). CPU busy fields are never resent: the
+ # compatibility retry strips them, so an old CPU sample is never re-stamped as fresh.
+-ADDITIVE_FIELDS = ("drain_active", "drain_until_ms", "cpu_busy_pct", "cpu_busy_window_ms", "cpu_busy_sample_end_ms")
++ADDITIVE_FIELDS = ("drain_active", "drain_until_ms", "cpu_busy_pct", "cpu_busy_window_ms", "cpu_busy_sample_end_ms") + ADMISSION_FIELDS
+ 
+ 
+ def send_compatible(send, sample, on_counters_rejected=None):
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index 3868c5b165..b78f0d010f 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -142,8 +142,8 @@ def active_card_runs(exclude=None, detail: Optional[dict] = None) -> Optional[in
+ def collect(disk_path: Optional[Path] = None) -> dict[str, Any]:
+     """``{cpu_load1, cpus, mem_used_pct, disk_free_gb, disk_total_gb}`` plus the throughput counters
+     (``machine_throughput_metrics``); a value that cannot be read is left out."""
+-    out: dict[str, Any] = {"active_card_runs": active_card_runs()}
+-    from hermes_cli import machine_drain_metrics, machine_throughput_metrics
++    from hermes_cli import machine_admission_metrics, machine_drain_metrics, machine_throughput_metrics
++    out: dict[str, Any] = machine_admission_metrics.collect(active_card_runs)
+     out.update(machine_drain_metrics.collect())
+     out.update(machine_throughput_metrics.cached_counters())
+     try:
+@@ -228,6 +228,12 @@ class Reporter:
+         timing.note_cpu_sample(measured)
+         if measured and all(k in measured for k in cpu.FIELDS):
+             sample.update({k: measured[k] for k in cpu.FIELDS})
++        if "admission_version" in sample:
++            from hermes_cli import machine_admission_metrics as admission
++            current = admission.policy()
++            if not current or any(sample.get(key) != value for key, value in current.items()):
++                for key in admission.FIELDS:
++                    sample.pop(key, None)
+         return sample
+ 
+     def _spaced(self, now: float) -> bool:
+diff --git a/tests/hermes_cli/test_machine_admission_metrics.py b/tests/hermes_cli/test_machine_admission_metrics.py
+new file mode 100644
+index 0000000000..cfcddcdf31
+--- /dev/null
++++ b/tests/hermes_cli/test_machine_admission_metrics.py
+@@ -0,0 +1,104 @@
++"""Opted-in hub policy and its pool census travel as one fail-closed tuple."""
++import pytest
++
++from hermes_cli import machine_metrics as mm
++from hermes_cli import config_backend
++
++
++POLICY = {"kanban": {"max_in_progress": 7, "admission": {
++    "cpu_busy_below_pct": 50, "priority_slots": 3, "priority_cpu_busy_below_pct": 85,
++}}}
++EXPECTED = {"admission_version": 1, "admission_regular_slots": 7, "admission_priority_slots": 3,
++            "admission_regular_cpu_limit": 50, "admission_priority_cpu_limit": 85,
++            "active_regular_runs": 7, "active_priority_runs": 1}
++
++
++def test_collect_uses_one_config_and_one_census(monkeypatch, tmp_path):
++    reads, counts = [], []
++
++    def read(path):
++        reads.append(path)
++        return POLICY
++
++    def census(*, detail=None):
++        counts.append(detail)
++        if detail is not None:
++            detail["pools"].update(regular=7, priority=1)
++        return 8
++
++    monkeypatch.setattr(config_backend, "read_config_doc_readonly", read)
++    monkeypatch.setattr(mm, "active_card_runs", census)
++    out = mm.collect(tmp_path)
++    assert {key: out.get(key) for key in EXPECTED} == EXPECTED
++    assert out["active_card_runs"] == 8
++    assert len(reads) == len(counts) == 1
++
++
++def test_old_board_strips_admission_tuple_and_cpu_on_single_retry(monkeypatch):
++    from hermes_cli.kanban_sync_client import HubError
++    from hermes_cli import machine_admission_metrics as admission
++
++    monkeypatch.setattr(admission, "policy", lambda: {k: v for k, v in EXPECTED.items() if k.startswith("admission_")})
++    calls = []
++
++    def send(sample):
++        calls.append(sample)
++        if any(key in sample for key in EXPECTED):
++            raise HubError(400, "unknown metric")
++
++    reporter = mm.Reporter(send, collect_fn=lambda: {"cpus": 4, "active_card_runs": 8, **EXPECTED},
++                           cpu_limit_fn=lambda: ("off", None))
++    assert reporter.report_due()
++    assert calls[1] == {"cpus": 4, "active_card_runs": 8}
++    assert len(calls) == 2
++
++
++@pytest.mark.parametrize("changed", ["off", "changed", "same"])
++def test_reporter_rechecks_policy_after_cpu_sample(monkeypatch, changed):
++    from hermes_cli import machine_admission_metrics as admission
++
++    settings = {k: v for k, v in EXPECTED.items() if k.startswith("admission_")}
++    current = {} if changed == "off" else {**settings, "admission_priority_slots": 4} if changed == "changed" else settings
++    monkeypatch.setattr(admission, "policy", lambda: current)
++    monkeypatch.setattr(mm, "record_hub_cpu_sample", lambda sample: None)
++    sent = []
++    reporter = mm.Reporter(sent.append, collect_fn=lambda: {"active_card_runs": 8, **EXPECTED},
++                           cpu_limit_fn=lambda: ("on", 50),
++                           cpu_sample_fn=lambda: {"cpu_busy_pct": 10, "cpu_busy_window_ms": 1000,
++                                                  "cpu_busy_sample_end_ms": 100000})
++    assert reporter.report_due()
++    assert ("admission_version" in sent[0]) == (changed == "same")
++    assert sent[0]["active_card_runs"] == 8
++
++
++@pytest.mark.parametrize("doc", [None, [], {}, {"kanban": []}, {"kanban": {"admission": []}},
++    *({"kanban": {"max_in_progress": cap, "admission": POLICY["kanban"]["admission"]}} for cap in [True, -1, 257]),
++    *({"kanban": {"max_in_progress": 7, "admission": {**POLICY["kanban"]["admission"], key: value}}}
++      for key, value in [("cpu_busy_below_pct", None), ("priority_slots", 0), ("priority_slots", True),
++                         ("priority_slots", 257), ("priority_cpu_busy_below_pct", 101)])])
++def test_invalid_or_disabled_policy_does_not_advertise_support(monkeypatch, tmp_path, doc):
++    monkeypatch.setattr(config_backend, "read_config_doc_readonly", lambda path: doc)
++    calls = []
++
++    def count():
++        calls.append(1)
++        return 8
++
++    monkeypatch.setattr(mm, "active_card_runs", count)
++    out = mm.collect(tmp_path)
++    assert not set(EXPECTED).intersection(out)
++    assert out["active_card_runs"] == 8 and len(calls) == 1
++
++
++@pytest.mark.parametrize("active,regular,priority", [(None, 7, 1), (9, 7, 1), (8, -1, 9), (8, True, 7)])
++def test_bad_census_omits_entire_tuple(monkeypatch, tmp_path, active, regular, priority):
++    monkeypatch.setattr(config_backend, "read_config_doc_readonly", lambda path: POLICY)
++
++    def count(*, detail):
++        detail["pools"].update(regular=regular, priority=priority)
++        return active
++
++    monkeypatch.setattr(mm, "active_card_runs", count)
++    out = mm.collect(tmp_path)
++    assert not set(EXPECTED).intersection(out)
++    assert out["active_card_runs"] == active
+-- 
+2.51.0
+

@@ -1,0 +1,558 @@
+From 7d578d0ccc2290387cb5babfbbd0cd34d1c383c4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:30:45 +0000
+Subject: [PATCH] [daveey] kanban: a worker's re-park of a hub card relays a
+ board-reading wake_check to the hub
+
+park_fields stamped probe_host = the parking gateway, so a worker node re-parking a copy of a hub card with a
+probe that reads ~/.hermes/kanban.db read its OWN board and exited 1 forever (t_01a1cd7f37cfb8a7 on worker-2).
+kanban_wake_check_hub_relay.relay_host names the hub as probe_host for such a park (block/timed park, schedule,
+continue); the worker registers no probe and skips the dry run, the hub restores it from the synced park event.
+Unchanged: own cards, non-hub homes, probes already routed via ssh/hub-admin, probes reading a worker-local
+workspace or wake-checks script.
+---
+ hermes_cli/kanban.py                          |   4 +-
+ hermes_cli/kanban_cli_park.py                 |   9 +-
+ hermes_cli/kanban_continuation.py             |   7 +-
+ hermes_cli/kanban_db_schedule.py              |   7 +-
+ hermes_cli/kanban_timed_park.py               |   2 +
+ hermes_cli/kanban_wake_check_hub_relay.py     |  46 ++++
+ .../test_kanban_wake_check_hub_relay.py       | 215 ++++++++++++++++++
+ .../tools/test_kanban_park_hub_relay_entry.py |  86 +++++++
+ tools/kanban_tools.py                         |   6 +-
+ tools/kanban_tools_park_args.py               |   8 +-
+ 10 files changed, 375 insertions(+), 15 deletions(-)
+ create mode 100644 hermes_cli/kanban_wake_check_hub_relay.py
+ create mode 100644 tests/hermes_cli/test_kanban_wake_check_hub_relay.py
+ create mode 100644 tests/tools/test_kanban_park_hub_relay_entry.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 999d21dc9f..e0739bc64b 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1425,7 +1425,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
+             return f"Blocked {tid}{suffix}"
+ 
+         try:
+-            wake = _cli_wake_check(args)
++            wake = _cli_wake_check(args, conn=conn, ids=ids)
+             awaiting, wake = _cli_awaiting(args, wake)
+         except ValueError as exc:
+             return _err(f"kanban block: {exc}", 2)
+@@ -1460,7 +1460,7 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
+         if rc:
+             return rc
+         try:
+-            wake = _cli_wake_check(args)
++            wake = _cli_wake_check(args, conn=conn, ids=ids)
+             awaiting, wake = _cli_awaiting(args, wake)
+         except ValueError as exc:
+             return _err(f"kanban schedule: {exc}", 2)
+diff --git a/hermes_cli/kanban_cli_park.py b/hermes_cli/kanban_cli_park.py
+index e5803114b2..033f2a6b3e 100644
+--- a/hermes_cli/kanban_cli_park.py
++++ b/hermes_cli/kanban_cli_park.py
+@@ -43,16 +43,19 @@ _REASON_FLAG_HINT = 'Pass a reason with --reason "..."'
+ _REASON_WORDS_HINT = "The reason goes after the task id; --ids takes only task ids"
+ 
+ 
+-def _cli_wake_check(args: argparse.Namespace):
+-    """``(wake_check, check_every, clock_only)`` from ``--wake-check/--check-every/--clock-only``."""
++def _cli_wake_check(args: argparse.Namespace, *, conn=None, ids=()):
++    """``(wake_check, check_every, clock_only)`` from ``--wake-check/--check-every/--clock-only``. The dry run is
++    skipped only when the hub runs the probe for every card in ``ids`` (``kanban_wake_check_hub_relay``). [daveey]"""
+     from hermes_cli import kanban_wake_check as kwc
++    from hermes_cli.kanban_wake_check_hub_relay import relay_host
+ 
+     cmd = kwc.normalize_cmd(getattr(args, "wake_check", None))
+     every = kwc.normalize_every(getattr(args, "check_every", None)) if cmd else None
+     secret = secret_error(cmd) if cmd else None
+     if secret:  # before the dry run executes it; the tool path refuses the same probe the same way
+         raise ValueError(secret)
+-    err = kwc.dry_run_error(cmd, blocker_id=getattr(args, "blocker_id", None) or None)
++    relayed = bool(ids) and all(relay_host(conn, tid, cmd) for tid in ids)
++    err = None if relayed else kwc.dry_run_error(cmd, blocker_id=getattr(args, "blocker_id", None) or None)
+     if err:
+         raise ValueError(err)
+     return cmd, every, bool(getattr(args, "clock_only", False))
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index 3e7ea133b9..2f6d779963 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -211,12 +211,15 @@ def continue_task(
+             payload["blocker_id"] = meta["blocker_id"]
+             payload.update({key: meta[key] for key in FIELDS if key in meta})
+         from hermes_cli import kanban_wake_check as kwc  # condition wake [daveey]
++        from hermes_cli.kanban_wake_check_hub_relay import relay_host
++        host = relay_host(conn, task_id, wake_check)  # a hub card's board probe runs on the hub
+         if wake_at is not None:
+             payload["wake_at"] = wake_at
+-            payload.update(kwc.park_fields(wake_check, check_every, clock_only, conn=conn))
++            payload.update(kwc.park_fields(wake_check, check_every, clock_only, conn=conn, probe_host=host))
+             payload["awaiting"] = record
+         kb._append_event(conn, task_id, CONTINUED_OUTCOME, payload, run_id=run_id)
+-        kwc.set_check(conn, task_id, wake_check if wake_at is not None else None, check_every, now=now)
++        kwc.set_check(conn, task_id, wake_check if wake_at is not None else None, check_every, now=now,
++                      register_here=kwc.probe_here(conn, host))
+         if in_txn is not None:
+             in_txn(conn, run_id)
+     return {"ok": True, "status": new_status, "run_id": run_id,
+diff --git a/hermes_cli/kanban_db_schedule.py b/hermes_cli/kanban_db_schedule.py
+index 74918f57fb..c026f00c98 100644
+--- a/hermes_cli/kanban_db_schedule.py
++++ b/hermes_cli/kanban_db_schedule.py
+@@ -93,10 +93,13 @@ def schedule_task(
+             conn, task_id, outcome="scheduled", status="scheduled", summary=reason,
+             metadata=meta or None, synthesize=bool(reason or meta),
+         )
++        from hermes_cli.kanban_wake_check_hub_relay import relay_host
++        host = relay_host(conn, task_id, wake_check)  # [daveey] a hub card's board probe runs on the hub
+         _kb._append_event(conn, task_id, "scheduled", {
+-            **payload, **kwc.park_fields(wake_check, check_every, clock_only, conn=conn), "awaiting": record, **meta,
++            **payload, **kwc.park_fields(wake_check, check_every, clock_only, conn=conn, probe_host=host),
++            "awaiting": record, **meta,
+         }, run_id=run_id)
+-        kwc.set_check(conn, task_id, wake_check, check_every)
++        kwc.set_check(conn, task_id, wake_check, check_every, register_here=kwc.probe_here(conn, host))
+         return noted.keep(True)
+ 
+ 
+diff --git a/hermes_cli/kanban_timed_park.py b/hermes_cli/kanban_timed_park.py
+index a294df0b2e..a5ea4e546f 100644
+--- a/hermes_cli/kanban_timed_park.py
++++ b/hermes_cli/kanban_timed_park.py
+@@ -176,6 +176,8 @@ def park(
+     wake_check = wake_check or kaw.card_probe(record)
+     wake_check, check_every = kwc.validate_park(
+         wake_at=wake_at, wake_check=wake_check, check_every=check_every, clock_only=clock_only)
++    from hermes_cli.kanban_wake_check_hub_relay import relay_host
++    probe_host = probe_host or relay_host(conn, task_id, wake_check)  # [daveey] a hub card's board probe
+     sql = ("UPDATE tasks SET status = 'scheduled', human_request = NULL, claim_lock = NULL, claim_expires = NULL, "
+            "consecutive_failures = CASE WHEN status = 'triage' THEN 0 ELSE consecutive_failures END, "
+            "last_failure_error = CASE WHEN status = 'triage' THEN NULL ELSE last_failure_error END, "
+diff --git a/hermes_cli/kanban_wake_check_hub_relay.py b/hermes_cli/kanban_wake_check_hub_relay.py
+new file mode 100644
+index 0000000000..f8cef2f046
+--- /dev/null
++++ b/hermes_cli/kanban_wake_check_hub_relay.py
+@@ -0,0 +1,46 @@
++"""[daveey] A copy of a hub card parked elsewhere with a probe reading the board relays that probe to the hub.
++
++A park stamps ``probe_host`` = the parking gateway (``kanban_wake_check.park_fields``), so the gateway that parks
++runs the probe. A gateway that re-parks a card copied from the hub (``tasks.created_on`` = hub, a Board worker node
++running hub work) with a probe that reads a kanban board database (``~/.hermes/kanban.db``, a board under
++``~/.hermes/kanban/boards``, ``$HERMES_KANBAN_DB``) would read its OWN board, where the hub's producer rows never
++appear: the probe exits 1 ("not yet") forever and nothing says so (t_01a1cd7f37cfb8a7 watched worker-2's board
++for hub-created FIX cards).
++
++:func:`relay_host` names the hub as ``probe_host`` for such a park, so the parking gateway registers no probe (and
++skips the park-time dry run, which would read the wrong board) and the hub's ``restore_missing_checks`` registers
++it from the synced park event: the relay a capability route already uses (``kanban_capability_routing.RELAY_HOME``).
++
++Unchanged: the gateway's own cards; a probe that already runs remotely (``ssh``, ``hub-admin``); a probe that also
++reads a fact local to the parking gateway (a workspace or ``wake-checks`` script): the hub cannot run that. Also
++unchanged: a copy of a NON-hub card (a Mac's). The hub's board is the board of record for pooled work, so a Mac
++card the hub ran with a hub ``kanban.db`` probe meant the hub's board (t_b2390590 waited on hub cards); relaying it
++to the Mac would turn a working probe into a silent one.
++"""
++from __future__ import annotations
++
++import re
++import sqlite3
++from typing import Optional
++
++HOME_BOARD_RE = re.compile(r"kanban\.db\b|\.hermes/kanban/(?:boards|sync-shadow)\b|\bHERMES_KANBAN_DB\b")
++REMOTE_RE = re.compile(r"(?<![\w.-])(?:ssh|hub-admin)(?![\w.-])")
++LOCAL_FACT_RE = re.compile(r"/kanban/(?:boards/[^/\s'\"]+/)?(?:workspaces|wake-checks)/|\bHERMES_KANBAN_WORKSPACE\b")
++
++
++def reads_home_board(cmd: Optional[str]) -> bool:
++    """Whether ``cmd`` reads a kanban board database on the host that runs it, and nothing local to the parker."""
++    text = cmd or ""
++    return bool(HOME_BOARD_RE.search(text)) and not REMOTE_RE.search(text) and not LOCAL_FACT_RE.search(text)
++
++
++def relay_host(conn: Optional[sqlite3.Connection], task_id: Optional[str], cmd: Optional[str]) -> Optional[str]:
++    """The hub gateway that must run ``cmd`` for a park of ``task_id`` here, else None (this gateway runs it)."""
++    if conn is None or not task_id or not reads_home_board(cmd):
++        return None
++    from hermes_cli import kanban_placement as kp
++    from hermes_cli.kanban_capability_routing import card_home
++    from hermes_cli.kanban_hub_admission_placement import is_hub
++
++    home = card_home(conn, task_id)
++    return home if home and is_hub(home, kp.config()) else None
+diff --git a/tests/hermes_cli/test_kanban_wake_check_hub_relay.py b/tests/hermes_cli/test_kanban_wake_check_hub_relay.py
+new file mode 100644
+index 0000000000..515c0bb8cb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wake_check_hub_relay.py
+@@ -0,0 +1,215 @@
++"""A copy of a hub card re-parked on a worker node with a probe that reads the board relays that probe to the hub.
++[daveey]
++
++t_01a1cd7f37cfb8a7 (a hub card) was re-parked on worker-2 with ``sqlite3.connect(Path.home()/".hermes/kanban.db")``
++watching for hub-created selfheal FIX cards. ``park_fields`` stamped ``probe_host=worker-2``, so worker-2 ran the
++probe against its OWN board, where hub-created cards never appear: rc 1 ("not yet") forever, with
++``wake_check_alive host: worker-2`` events saying all was well. The park now names the hub as ``probe_host``: the
++worker registers no probe and skips the dry run (it would read the wrong board), and the hub registers the probe
++from the synced park event and runs it against the hub's board. A probe that reads something local to the worker
++(its workspace script), a probe already routed remotely, the worker's own card and a non-hub card stay unchanged.
++"""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_continuation as kcont
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_timed_park as ktp
++from hermes_cli import kanban_wake_check as kwc
++from hermes_cli import kanban_wake_check_hub_relay as relay
++from tests.hermes_cli import test_kanban_wake_check_home as home_tests
++from tests.hermes_cli.test_kanban_worker_node import HUB, WORKER
++
++gws = home_tests.gws
++BUILD = home_tests.BUILD
++RESTORED = home_tests.RESTORED
++UNTIL = "SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting for the hub's FIX card"
++
++# The board probe: exits 0 once a card titled "selfheal FIX" exists on the board of the host that runs it.
++BOARD_PROBE = ("/usr/bin/env python3 -S -c 'import sqlite3,pathlib,sys; "
++               "c=sqlite3.connect(\"file:\"+str(pathlib.Path(__import__(\"os\").environ[\"HERMES_HOME\"])/"
++               "\"kanban.db\")+\"?mode=ro\",uri=True); "
++               "sys.exit(0 if c.execute(\"select 1 from tasks where title=?\",(\"selfheal FIX\",)).fetchone() else 1)'")
++# The probe from t_01a1cd7f37cfb8a7, verbatim.
++EVIDENCE_PROBE = ("/usr/bin/python3 -S -c 'import sqlite3,pathlib,sys; c=sqlite3.connect(\"file:\"+str(pathlib.Path."
++                  "home()/\".hermes/kanban.db\")+\"?mode=ro\",uri=True); rows=c.execute(\"select id from tasks where "
++                  "idempotency_key like ? and created_at >= strftime(?,?)\",(\"selfheal%:fix\",\"%s\",\"2026-11-12 "
++                  "00:34:00\")).fetchall(); print(rows); sys.exit(0 if rows else 1)'")
++
++
++@pytest.mark.parametrize("cmd", [
++    EVIDENCE_PROBE,
++    BOARD_PROBE,
++    "test \"$(sqlite3 ~/.hermes/kanban.db \"select count(*) from tasks where id='t_7e2ee45c' and status='done'\")\" = 1",
++    "sqlite3 -readonly /home/ubuntu/.hermes/kanban/boards/bb/kanban.db 'select 1' | grep -q 1",
++    "python3 -c 'import os,sqlite3; sqlite3.connect(os.environ[\"HERMES_KANBAN_DB\"])'",
++])
++def test_a_probe_that_reads_a_board_on_the_host_that_runs_it(cmd):
++    assert relay.reads_home_board(cmd)
++
++
++@pytest.mark.parametrize("cmd", [
++    # a worker-local fact: its own workspace / wake-checks script (default and named boards)
++    "bash /home/ubuntu/.hermes/kanban/workspaces/t_01a1c8609d476871/train-ci-probe.sh",
++    "/home/ubuntu/.hermes/kanban/boards/hermes/workspaces/t_01a1d01a9830c8cb/wake_probe.sh",
++    "/home/ubuntu/.hermes/kanban/wake-checks/t_01a1cf843e21f1b3-pr1131-head-moved.sh",
++    "python3 \"$HERMES_KANBAN_WORKSPACE/probe.py\" ~/.hermes/kanban.db",
++    "python3 /home/ubuntu/.hermes/kanban/workspaces/t_x/probe.py ~/.hermes/kanban.db",
++    # already routed to where the data lives
++    "ssh -o BatchMode=yes hermes-hub \"sqlite3 -readonly /home/ubuntu/.hermes/kanban.db 'select 1'\"",
++    "Q='select 1'; if [ \"$(hostname)\" = hermes-hub ]; then sqlite3 -readonly ~/.hermes/kanban.db \"$Q\"; "
++    "else ssh hermes-hub sqlite kanban \"$Q\"; fi | grep -q 1",
++    "hub-admin 'sqlite3 -readonly ~/.hermes/kanban.db \"select 1\"' | grep -q 1",
++    "/usr/bin/ssh hub-admin test -f /home/ubuntu/.hermes/kanban.db",
++    # no board read at all
++    "hermes kanban wait-check task t_01a1cd7f37cfb8a7 --gateway hub --until done,blocked",
++    "git -C ~/.hermes/hermes-agent merge-base --is-ancestor abc123 HEAD",
++    "test -f /home/ubuntu/.hermes/kanban/evidence/x/summary.json",
++    "token-broker exec --scope user/mac-mini-ssh -- bash /tmp/kanban.dbx",
++    "",
++    None,
++])
++def test_a_probe_with_no_unrouted_board_read_stays_local(cmd):
++    assert not relay.reads_home_board(cmd)
++
++
++def test_only_a_hub_home_takes_the_relay(gws, monkeypatch):
++    """A Mac card the hub ran with a hub ``kanban.db`` probe meant the hub's board (t_b2390590 waited on hub cards);
++    relaying it to the Mac would make it silent. Only a hub home takes it."""
++    from hermes_cli import kanban_capability_routing as kcr
++
++    _hub, worker = gws
++    monkeypatch.setattr(kcr, "card_home", lambda conn, tid: "macbook")
++    assert relay.relay_host(worker.conn, "t_x", EVIDENCE_PROBE) is None
++    monkeypatch.setattr(kcr, "card_home", lambda conn, tid: "hermes-hub")
++    assert relay.relay_host(worker.conn, "t_x", EVIDENCE_PROBE) == "hermes-hub"
++    # No board or no card (a caller without them): no relay, even when every card here is a hub card.
++    assert relay.relay_host(None, "t_x", EVIDENCE_PROBE) is None
++    assert relay.relay_host(worker.conn, None, EVIDENCE_PROBE) is None
++    monkeypatch.setattr(kcr, "card_home", lambda conn, tid: None)   # the parker's own card
++    assert relay.relay_host(worker.conn, "t_x", EVIDENCE_PROBE) is None
++
++
++# --- the park paths ----------------------------------------------------------------------------------------------
++
++def _running_copy(hub, worker, title="hub card run on the worker"):
++    hub.enter()
++    tid = kb.create_task(hub.conn, title=title, assignee="default", runs_on=["linux"])
++    hub.round()
++    worker.round()
++    worker.tick()
++    assert home_tests._status(worker.conn, tid) == "running"
++    return tid, kb.get_task(worker.conn, tid).current_run_id
++
++
++def _park_block(conn, tid, run_id, cmd):
++    with kb.write_txn(conn):
++        assert ktp.park(conn, tid, reason=UNTIL, requested_kind="time", source_status="running",
++                        expected_run_id=run_id, wake_check=cmd, check_every=300, awaiting=BUILD)
++
++
++def _park_schedule(conn, tid, run_id, cmd):
++    assert kb.schedule_task(conn, tid, reason=UNTIL, expected_run_id=run_id, wake_check=cmd, check_every=300,
++                            awaiting=BUILD)
++
++
++def _park_continue(conn, tid, run_id, cmd):
++    res = kcont.continue_task(conn, tid, checkpoint="waiting for the hub's FIX card", resume_after_seconds=86400,
++                              expected_run_id=run_id, wake_check=cmd, check_every=300, awaiting=BUILD)
++    assert res["ok"], res
++
++
++PARKS = {"block": _park_block, "schedule": _park_schedule, "continue": _park_continue}
++
++
++def _last_park(conn, tid):
++    kinds = kcont.SCHEDULED_ENTRY_EVENTS
++    return [e for e in kb.list_events(conn, tid) if e.kind in kinds][-1].payload
++
++
++@pytest.mark.parametrize("op", sorted(PARKS))
++def test_a_worker_reparking_a_hub_card_on_a_board_probe_relays_it_to_the_hub(gws, op):
++    hub, worker = gws
++    tid, run_id = _running_copy(hub, worker)
++    worker.enter()
++    PARKS[op](worker.conn, tid, run_id, BOARD_PROBE)
++    assert home_tests._status(worker.conn, tid) == "scheduled"
++    assert _last_park(worker.conn, tid)["probe_host"] == HUB
++    assert kwc.get_state(worker.conn, tid) is None, "the worker registered a probe that reads its own board"
++
++    # A FIX card the probe waits for exists only on the hub's board; the worker's board never gets it.
++    hub.enter()
++    kb.create_task(hub.conn, title="selfheal FIX", assignee="default")
++    worker.round()   # push the park
++    hub.round()      # the hub receives it
++    assert home_tests._status(hub.conn, tid) == "scheduled"
++    assert _last_park(hub.conn, tid)["probe_host"] == HUB
++    assert kwc.restore_missing_checks(hub.conn)["restored"] == [tid]
++    assert kwc.get_state(hub.conn, tid)["cmd"] == BOARD_PROBE
++    assert home_tests._events(hub.conn, tid, RESTORED)
++    kwc.run_due_wake_checks(hub.conn, wait=True)
++    assert home_tests._status(hub.conn, tid) == "ready", "the hub's probe did not see the hub's FIX card"
++
++
++@pytest.mark.parametrize("op", sorted(PARKS))
++def test_a_worker_local_probe_on_a_hub_card_stays_on_the_worker(gws, tmp_path, op):
++    hub, worker = gws
++    tid, run_id = _running_copy(hub, worker)
++    script = tmp_path / ".hermes" / "kanban" / "workspaces" / tid / "probe.sh"
++    cmd = f"bash {script} ~/.hermes/kanban.db"
++    worker.enter()
++    PARKS[op](worker.conn, tid, run_id, cmd)
++    assert _last_park(worker.conn, tid)["probe_host"] == WORKER
++    assert kwc.get_state(worker.conn, tid)["cmd"] == cmd
++
++
++@pytest.mark.parametrize("op", sorted(PARKS))
++def test_the_workers_own_card_keeps_its_board_probe(gws, op):
++    _hub, worker = gws
++    worker.enter()
++    tid = kb.create_task(worker.conn, title="the worker's own card", assignee="default")
++    worker.tick()
++    assert home_tests._status(worker.conn, tid) == "running"
++    PARKS[op](worker.conn, tid, kb.get_task(worker.conn, tid).current_run_id, BOARD_PROBE)
++    assert _last_park(worker.conn, tid)["probe_host"] == WORKER
++    assert kwc.get_state(worker.conn, tid)["cmd"] == BOARD_PROBE
++
++
++# --- the park-time dry run --------------------------------------------------------------------------------------
++
++ALREADY_TRUE_ON_THE_WORKER = "echo ~/.hermes/kanban.db; exit 0"
++
++
++def test_a_relayed_probe_skips_the_dry_run_on_the_worker(gws, monkeypatch):
++    """The dry run would read the worker's board: an answer about the wrong board refuses nothing."""
++    from tools import kanban_tools_park_args as tpa
++
++    hub, worker = gws
++    monkeypatch.delenv("HERMES_KANBAN_WAKE_DRYRUN", raising=False)
++    tid, _ = _running_copy(hub, worker)
++    own = kb.create_task(worker.conn, title="own", assignee="default")
++    args = {"wake_check": ALREADY_TRUE_ON_THE_WORKER}
++    assert tpa._wake_check_args(args, conn=worker.conn, tid=tid)[0] == ALREADY_TRUE_ON_THE_WORKER
++    with pytest.raises(Exception, match=kwc.WAKE_CHECK_ALREADY_TRUE):
++        tpa._wake_check_args(args, conn=worker.conn, tid=own)
++    with pytest.raises(Exception, match=kwc.WAKE_CHECK_ALREADY_TRUE):
++        tpa._wake_check_args(args)
++
++
++def test_the_cli_skips_the_dry_run_only_when_every_card_relays(gws, monkeypatch):
++    import argparse
++
++    from hermes_cli import kanban_cli_park as kcp
++
++    hub, worker = gws
++    monkeypatch.delenv("HERMES_KANBAN_WAKE_DRYRUN", raising=False)
++    tid, _ = _running_copy(hub, worker)
++    own = kb.create_task(worker.conn, title="own", assignee="default")
++    args = argparse.Namespace(wake_check=ALREADY_TRUE_ON_THE_WORKER, check_every=None, clock_only=False)
++    assert kcp._cli_wake_check(args, conn=worker.conn, ids=[tid])[0] == ALREADY_TRUE_ON_THE_WORKER
++    for ids in ([tid, own], [own], []):
++        with pytest.raises(ValueError, match=kwc.WAKE_CHECK_ALREADY_TRUE):
++            kcp._cli_wake_check(args, conn=worker.conn, ids=ids)
++    with pytest.raises(ValueError, match=kwc.WAKE_CHECK_ALREADY_TRUE):
++        kcp._cli_wake_check(args)
+diff --git a/tests/tools/test_kanban_park_hub_relay_entry.py b/tests/tools/test_kanban_park_hub_relay_entry.py
+new file mode 100644
+index 0000000000..80130fbc88
+--- /dev/null
++++ b/tests/tools/test_kanban_park_hub_relay_entry.py
+@@ -0,0 +1,86 @@
++"""The public park entry points (tools and CLI) relay a hub card's board probe from a worker node. [daveey]
++
++The park helpers skip the dry run for a probe the hub will run (``kanban_wake_check_hub_relay``) only when the entry
++point hands them the board and the card: these drive the real tool and slash-command entry points on a worker's copy
++of a hub card, with a probe whose dry run on the worker would refuse the park as "already true".
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_wake_check as kwc
++from tests.hermes_cli import test_kanban_wake_check_home as home_tests
++from tests.hermes_cli import test_kanban_wake_check_hub_relay as relay_tests
++from tests.hermes_cli.test_kanban_worker_node import HUB
++from tools import kanban_tools  # registers the real entry points
++from tools.registry import registry
++
++gws = home_tests.gws
++PROBE = relay_tests.ALREADY_TRUE_ON_THE_WORKER
++UNTIL = relay_tests.UNTIL
++
++
++@pytest.fixture
++def worker_board(gws, monkeypatch):
++    hub, worker = gws
++    monkeypatch.delenv("HERMES_KANBAN_WAKE_DRYRUN", raising=False)
++    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_TASK", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_RUN_ID",
++                "HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_SESSION_ID"):
++        monkeypatch.delenv(key, raising=False)
++    copy, _ = relay_tests._running_copy(hub, worker)
++    worker.enter()
++    own = kb.create_task(worker.conn, title="the worker's own card", assignee="default")
++    assert kb.claim_task(worker.conn, own)
++    return worker, copy, own
++
++
++def _as_worker(monkeypatch, worker, tid):
++    """Park as the card's own worker (the live-claim guard refuses anyone else)."""
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb.get_task(worker.conn, tid).current_run_id))
++
++
++def _tool(tool, tid):
++    args = {"task_id": tid, "wake_check": PROBE, "check_every": 300, "awaiting": home_tests.BUILD}
++    if tool == "kanban_continue":
++        args.update(checkpoint="waiting for the hub's FIX card", resume_after_seconds=86400)
++    else:
++        args["reason"] = UNTIL
++        if tool == "kanban_block":
++            args["kind"] = "time"
++    return json.loads(registry.dispatch(tool, args))
++
++
++@pytest.mark.parametrize("tool", ["kanban_block", "kanban_continue", "kanban_schedule"])
++def test_the_tools_relay_a_hub_cards_board_probe_without_a_dry_run(worker_board, monkeypatch, tool):
++    worker, copy, own = worker_board
++    _as_worker(monkeypatch, worker, copy)
++    res = _tool(tool, copy)
++    assert res.get("ok"), res
++    assert relay_tests._last_park(worker.conn, copy)["probe_host"] == HUB
++    assert kwc.get_state(worker.conn, copy) is None
++    _as_worker(monkeypatch, worker, own)
++    refused = _tool(tool, own)   # the worker's own card: dry run as before
++    assert kwc.WAKE_CHECK_ALREADY_TRUE in json.dumps(refused), refused
++
++
++@pytest.mark.parametrize("verb", ["schedule", "block"])
++def test_the_cli_relays_a_hub_cards_board_probe_without_a_dry_run(worker_board, monkeypatch, verb):
++    worker, copy, own = worker_board
++    tail = ("SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting for the FIX card --wake-check "
++            f"'{PROBE}' --check-every 300 "
++            "--awaiting 'external:release build 559' --awaiting-why 'the build job writes the flag'")
++    kind = " --kind time" if verb == "block" else ""
++    _as_worker(monkeypatch, worker, copy)
++    out = kc.run_slash(f"{verb} {copy} {tail}{kind}")
++    assert kb.get_task(worker.conn, copy).status == "scheduled", out
++    assert relay_tests._last_park(worker.conn, copy)["probe_host"] == HUB
++    assert kwc.get_state(worker.conn, copy) is None
++    _as_worker(monkeypatch, worker, own)
++    out = kc.run_slash(f"{verb} {own} {tail}{kind}")
++    assert kwc.WAKE_CHECK_ALREADY_TRUE in out, out
++    assert kb.get_task(worker.conn, own).status == "running"
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index af0bfc8d4c..7b76b2ca9c 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1101,7 +1101,7 @@ def _handle_block(args: dict, **kw) -> str:
+                f"the completion judge will evaluate it.")
+         blocker_id = _blocker_id_arg(args)
+         clear_blocker = _clear_blocker_arg(args, blocker_id)
+-        wake = _wake_check_args(args)
++        wake = _wake_check_args(args, conn=conn, tid=tid)
+         awaiting, wake = _awaiting_arg(args, wake)
+         from hermes_cli.kanban_block_policy import ERROR_CODE, block_policy_error
+         _policy = block_policy_error(kind, human_request=args.get("human_request"), wake_check=wake[0],
+@@ -1171,7 +1171,7 @@ def _handle_schedule(args: dict, **kw) -> str:
+                "goal_mode tasks cannot be scheduled: for a wait on time or a cron use "
+                "kanban_block with kind='time' (SCHEDULED_UNTIL=<ISO8601> in the reason sets "
+                "the wake), or kanban_complete so the completion judge can evaluate it.")
+-        wake = _wake_check_args(args)
++        wake = _wake_check_args(args, conn=conn, tid=tid)
+         awaiting, wake = _awaiting_arg(args, wake)
+         blocker_id = _blocker_id_arg(args)
+         clear_blocker = _clear_blocker_arg(args, blocker_id)
+@@ -1220,7 +1220,7 @@ def _handle_continue(args: dict, **kw) -> str:
+         metadata = {**(metadata or {}), CLEAR_FLAG: True}
+     from hermes_cli.kanban_continuation import continue_task
+     with _board(args.get("board")) as (kb, conn):
+-        wake = _wake_check_args(args)
++        wake = _wake_check_args(args, conn=conn, tid=tid)
+         awaiting, wake = _awaiting_arg(args, wake)
+         _park_guard(conn, tid, "continue", wake, resume_after=int(raw_after or 0))
+         res = continue_task(conn, tid, checkpoint=checkpoint, resume_after_seconds=int(raw_after or 0),
+diff --git a/tools/kanban_tools_park_args.py b/tools/kanban_tools_park_args.py
+index 13db0c7df2..efdb8c5825 100644
+--- a/tools/kanban_tools_park_args.py
++++ b/tools/kanban_tools_park_args.py
+@@ -54,9 +54,11 @@ def _park_guard(conn, tid: str, op: str, wake: tuple, **plan: Any) -> None:
+     _check(err is None, f"kanban_{op} {err}", "invalid_args")
+ 
+ 
+-def _wake_check_args(args: dict) -> tuple[Optional[str], Optional[int], bool]:
+-    """``(wake_check, check_every, clock_only)`` from a park call, validated. [daveey]"""
++def _wake_check_args(args: dict, *, conn=None, tid: Optional[str] = None) -> tuple[Optional[str], Optional[int], bool]:
++    """``(wake_check, check_every, clock_only)`` from a park call, validated. With ``conn``/``tid``, a probe the hub
++    runs for this card (``kanban_wake_check_hub_relay``) skips the dry run here: it would read this board. [daveey]"""
+     from hermes_cli import kanban_wake_check as kwc
++    from hermes_cli.kanban_wake_check_hub_relay import relay_host
+ 
+     raw_every = args.get("check_every")
+     _check(raw_every is None or (isinstance(raw_every, (int, float)) and not isinstance(raw_every, bool)),
+@@ -72,7 +74,7 @@ def _wake_check_args(args: dict) -> tuple[Optional[str], Optional[int], bool]:
+     secret = _wake_check_secret_error(cmd) if cmd else None
+     _check(secret is None, secret or "", WAKE_CHECK_SECRET)  # before the dry run executes it
+     try:
+-        err = kwc.dry_run_error(cmd, blocker_id=args.get("blocker_id"))
++        err = None if relay_host(conn, tid, cmd) else kwc.dry_run_error(cmd, blocker_id=args.get("blocker_id"))
+         if err:
+             raise ValueError(err)
+     except ValueError as exc:
+-- 
+2.51.0
+

@@ -1,0 +1,144 @@
+From a60bb2634f5beadaea86bc5c9457794905128f61 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 17:02:51 +0000
+Subject: [PATCH] perf(kanban): index event-kind history lookups [daveey]
+
+---
+ hermes_cli/kanban_db.py                       |  2 +-
+ hermes_cli/kanban_db_connect.py               |  2 +
+ tests/hermes_cli/test_kanban_db_init.py       |  2 +-
+ .../test_kanban_event_read_budget.py          | 72 +++++++++++++++++++
+ 4 files changed, 76 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_event_read_budget.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 9efb71f89d..defa7b8f3d 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -998,11 +998,11 @@ CREATE TABLE IF NOT EXISTS task_wake_checks (
+     fails     INTEGER NOT NULL DEFAULT 0, first_failure_at INTEGER,
+     generation TEXT, purpose TEXT NOT NULL DEFAULT 'wake'  -- 'wake' (park) | 'ask_resolved' (kanban_ask_resolved)
+ );
+-
+ CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
+ CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
+ CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
+ CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
++CREATE INDEX IF NOT EXISTS idx_events_kind_task_id   ON task_events(kind, task_id, id);
+ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
+ CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
+ CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 7e49982776..7fc78c92b0 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1181,6 +1181,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
+ 
+     # Same ordering rule as the ``tasks`` indexes above: index after column.
+     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_run ON task_events(run_id, id)")
++    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_kind_task_id ON task_events(kind, task_id, id)")
+ 
+     if _table_exists(conn, "kanban_notify_subs"):
+         notify_cols = _column_names(conn, "kanban_notify_subs")
+@@ -1299,6 +1300,7 @@ _REBUILD_SPECS = {
+         (
+             "CREATE INDEX idx_events_task ON task_events(task_id, created_at)",
+             "CREATE INDEX idx_events_run ON task_events(run_id, id)",
++            "CREATE INDEX idx_events_kind_task_id ON task_events(kind, task_id, id)",
+         ),
+     ),
+     "task_comments": (
+diff --git a/tests/hermes_cli/test_kanban_db_init.py b/tests/hermes_cli/test_kanban_db_init.py
+index c89b7da6ed..a8971c4067 100644
+--- a/tests/hermes_cli/test_kanban_db_init.py
++++ b/tests/hermes_cli/test_kanban_db_init.py
+@@ -97,7 +97,7 @@ def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkey
+ 
+         # Indexes restored, including idx_events_run (added by the additive pass).
+         indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+-        for name in ("idx_events_task", "idx_events_run", "idx_comments_task",
++        for name in ("idx_events_task", "idx_events_run", "idx_events_kind_task_id", "idx_comments_task",
+                      "idx_runs_task", "idx_runs_status", "idx_notify_task"):
+             assert name in indexes
+ 
+diff --git a/tests/hermes_cli/test_kanban_event_read_budget.py b/tests/hermes_cli/test_kanban_event_read_budget.py
+new file mode 100644
+index 0000000000..b54ce7f8ba
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_event_read_budget.py
+@@ -0,0 +1,72 @@
++"""Event-kind lookups must scale with that kind, not the full heartbeat history."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++
++INDEX = "idx_events_kind_task_id"
++CREATORS = ("SELECT task_id FROM task_events WHERE kind='created' "
++            "AND json_extract(payload,'$.creator_task_id')=?")
++LATEST_MOVE = "SELECT MAX(id) FROM task_events WHERE task_id=? AND kind='moved'"
++
++
++@pytest.fixture
++def history():
++    conn = sqlite3.connect(":memory:")
++    conn.executescript(kb.SCHEMA_SQL)
++    conn.executemany(
++        "INSERT INTO task_events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
++        ((f"t_{i % 5000}", "created" if i < 5000 else "moved" if i < 5576 else "heartbeat",
++          f'{{"creator_task_id":"t_{i % 100}"}}', i) for i in range(320000)),
++    )
++    conn.commit()
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def _query_with_budget(conn, sql, args, budget):
++    steps = 0
++
++    def progress():
++        nonlocal steps
++        steps += 100
++        return int(steps > budget)
++
++    conn.set_progress_handler(progress, 100)
++    try:
++        return conn.execute(sql, args).fetchall()
++    finally:
++        conn.set_progress_handler(None, 0)
++
++
++def test_creator_search_does_not_scan_heartbeat_history(history):
++    # Exact production query from kanban-honest-done.related_task_ids.
++    rows = _query_with_budget(history, CREATORS, ("t_0",), 80000)
++    assert {row[0] for row in rows} == {f"t_{i}" for i in range(0, 5000, 100)}
++    assert any(INDEX in row[3] for row in history.execute("EXPLAIN QUERY PLAN " + CREATORS, ("t_0",)))
++
++
++def test_latest_move_uses_kind_and_id_order(history):
++    # A long history of later non-move events must not obscure the latest move.
++    assert _query_with_budget(history, LATEST_MOVE, ("t_0",), 100) == [(5001,)]
++    assert _query_with_budget(history, LATEST_MOVE, ("t_4999",), 100) == [(None,)]
++    assert any(INDEX in row[3] for row in history.execute("EXPLAIN QUERY PLAN " + LATEST_MOVE, ("t_0",)))
++
++
++def test_existing_integer_schema_gets_index_on_reopen(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    path = tmp_path / "kanban.db"
++    with sqlite3.connect(path) as conn:
++        conn.executescript(kb.SCHEMA_SQL)
++        conn.execute(f"DROP INDEX IF EXISTS {INDEX}")
++        conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('t_0','created','{}',1)")
++    for _ in range(2):
++        kb._INITIALIZED_PATHS.discard(str(path.resolve()))
++        with kbc.connect(path) as conn:
++            assert [row[2] for row in conn.execute(f"PRAGMA index_info({INDEX})")] == ["kind", "task_id", "id"]
++            assert conn.execute("SELECT count(*) FROM task_events").fetchone()[0] == 1
+-- 
+2.51.0
+

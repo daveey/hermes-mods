@@ -1,0 +1,588 @@
+From fe24ed797f533b4b9c49219151841f09d20a5b57 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 19:46:27 +0000
+Subject: [PATCH] [daveey] Preserve scoped cooldown recovery across stale pool
+ writers
+
+Checkpoint for t_01a1d139db545db9. Captured generic 429 has genuine weekly headers; request-bucket evidence overrides conflicting generic reset fields. Model recovery records generation-aware clear receipts and honors external resets. Remaining: bounded completion probes, startup admission, contradiction detector, Codex identity proof, compatibility pins, independent review and shipping.
+---
+ agent/agent_runtime_helpers.py                |   6 +-
+ agent/credential_pool.py                      |  17 +-
+ agent/credential_pool_model_cooldowns.py      |  13 +-
+ agent/credential_pool_model_state.py          |  71 +++++++++
+ agent/credential_pool_recovery.py             |  77 +++++++++
+ agent/request_bucket_context.py               |  32 ++++
+ hermes_cli/auth_pool_merge.py                 |   7 +-
+ tests/agent/test_model_cooldown_recovery.py   | 150 ++++++++++++++++++
+ .../test_quota_cooldown_contradictions.py     |  75 +++++++++
+ 9 files changed, 432 insertions(+), 16 deletions(-)
+ create mode 100644 agent/credential_pool_model_state.py
+ create mode 100644 agent/credential_pool_recovery.py
+ create mode 100644 agent/request_bucket_context.py
+ create mode 100644 tests/agent/test_model_cooldown_recovery.py
+ create mode 100644 tests/agent/test_quota_cooldown_contradictions.py
+
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 0ffc044d59..608617497b 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -3588,6 +3588,7 @@ def _set_reset_from_vendor_headers(context: dict[str, Any], headers: Any) -> Non
+ 
+ def extract_api_error_context(error: Exception) -> dict[str, Any]:
+     """Extract structured rate-limit details from provider errors."""
++    from agent.request_bucket_context import request_bucket_context
+     context: dict[str, Any] = {}
+     body = getattr(error, "body", None)
+     payload = (body.get("error") if isinstance(body.get("error"), dict) else body) if isinstance(body, dict) else None
+@@ -3596,8 +3597,7 @@ def extract_api_error_context(error: Exception) -> dict[str, Any]:
+         if isinstance(reason, str) and reason.strip():
+             context["reason"] = reason.strip()
+         message = payload.get("message") or payload.get("error_description")
+-        if not message and isinstance(payload.get("error"), str):
+-            # xAI uses a top-level string ``error`` beside a structured ``code``.
++        if not message and isinstance(payload.get("error"), str):  # xAI top-level string beside structured code
+             message = payload.get("error")
+         if isinstance(message, str) and message.strip():
+             context["message"] = message.strip()
+@@ -3622,7 +3622,7 @@ def extract_api_error_context(error: Exception) -> dict[str, Any]:
+         delay = reset_delay_from_message(context.get("message") or "")
+         if delay is not None:
+             context["reset_at"] = time.time() + delay
+-    return context
++    return request_bucket_context(error, context, now=time.time())
+ 
+ 
+ def _requeue_pending_steer(agent, steer_text: str) -> None:
+diff --git a/agent/credential_pool.py b/agent/credential_pool.py
+index 1f3ee57bd4..eefd5ce2b5 100644
+--- a/agent/credential_pool.py
++++ b/agent/credential_pool.py
+@@ -231,6 +231,8 @@ class PooledCredential:
+     # usable for its sibling models.  Keep that observation separate from the
+     # credential-wide status used for auth and billing failures.
+     model_cooldowns: Optional[dict[str, float]] = None
++    model_cooldown_recorded_at: Optional[dict[str, float]] = None
++    model_cooldown_cleared_at: Optional[dict[str, float]] = None
+     extra: dict[str, Any] = None  # type: ignore[assignment]
+ 
+     def __post_init__(self):
+@@ -1091,18 +1093,13 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+                 return
+             rows = auth_mod._entry_ids(written)
+             self._persisted_token_pairs = auth_mod._token_pairs_by_id(written)
++            from agent.credential_pool_model_state import adopt_persisted_row
+             for entry in self._entries:
+                 row = rows.get(entry.id)
+                 pair = self._persisted_token_pairs.get(entry.id, (None, None))
+-                # Reference-only rows are intentionally secret-free on disk; never dehydrate
+-                # their live in-memory credential while adopting a concurrent generation.
+-                if row is None or not any(pair):
+-                    continue
+-                # Adopt only rows the store overrode with a peer's newer pair; re-hydrating an
+-                # unchanged row would replace the live object (and pull peer cooldown state
+-                # merged into the written row) on every ordinary flush.
+-                if pair != (entry.access_token, entry.refresh_token):
+-                    self._replace_entry(entry, PooledCredential.from_dict(self.provider, row))
++                updated = adopt_persisted_row(entry, row, pair)
++                if updated is not entry:
++                    self._replace_entry(entry, updated)
+ 
+     def _adopt(self, entry: PooledCredential, *, persist: bool = True, **updates: Any) -> PooledCredential:
+         """``replace(entry, **updates)``, swap it into the pool, optionally persist."""
+@@ -2021,6 +2018,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+         reset`` run from another process while this pool is live is honoured the
+         same way (#89415): the in-memory cooldown would otherwise outlive it.
+         """
++        from agent.credential_pool_model_state import resync_model_state
++        entry = resync_model_state(self, entry)
+         if entry.last_status not in {STATUS_EXHAUSTED, STATUS_DEAD}:
+             return entry
+         if entry.auth_type == AUTH_TYPE_OAUTH and not entry.refresh_token:
+diff --git a/agent/credential_pool_model_cooldowns.py b/agent/credential_pool_model_cooldowns.py
+index a8da9ffb01..6585d28ee6 100644
+--- a/agent/credential_pool_model_cooldowns.py
++++ b/agent/credential_pool_model_cooldowns.py
+@@ -60,6 +60,15 @@ def merge_model_cooldowns(*maps: Any) -> dict[str, float]:
+ 
+ 
+ class CredentialPoolModelCooldownMixin:
++    def clear_verified_model_cooldown(self, observed: PooledCredential, model: str) -> bool:
++        """CAS-clear the observed model bench (or Codex 429) after verified recovery.
++
++        The caller owns verification; this method does no network I/O. A changed token,
++        failure generation, disabled account, or auth/billing failure refuses the clear.
++        """
++        from agent.credential_pool_recovery import clear_verified_model_cooldown
++        return clear_verified_model_cooldown(self, observed, model)
++
+     def token_is_blocked(self, token: str, *, model: Optional[str] = None) -> bool:
+         """Whether a pool cooldown blocks *token* for *model*.
+ 
+@@ -118,7 +127,9 @@ class CredentialPoolModelCooldownMixin:
+             if scoped.id != entry.id and not (failed_key and scoped.runtime_api_key == failed_key):
+                 continue
+             cooldowns = merge_model_cooldowns(scoped.model_cooldowns, {model: until})
+-            self._adopt(scoped, persist=False, model_cooldowns=cooldowns)
++            recorded = {**(scoped.model_cooldown_recorded_at or {}), model: time.time()}
++            self._adopt(scoped, persist=False, model_cooldowns=cooldowns,
++                        model_cooldown_recorded_at=recorded)
+         self._persist()
+ 
+     def limit_state(self, models: Iterable[str]) -> Optional[dict[str, Any]]:
+diff --git a/agent/credential_pool_model_state.py b/agent/credential_pool_model_state.py
+new file mode 100644
+index 0000000000..23242f8ade
+--- /dev/null
++++ b/agent/credential_pool_model_state.py
+@@ -0,0 +1,71 @@
++"""Mergeable model failure generations and sticky scoped recovery receipts."""
++from __future__ import annotations
++
++import logging
++from typing import Any
++
++MODEL_STATE_FIELDS = ("model_cooldowns", "model_cooldown_recorded_at", "model_cooldown_cleared_at")
++
++
++def merge_model_state(*rows: dict[str, Any]) -> dict[str, Any]:
++    from agent.credential_pool import _parse_absolute_timestamp
++
++    recorded: dict[str, float] = {}
++    cleared: dict[str, float] = {}
++    global_clear = max((_parse_absolute_timestamp(row.get("status_cleared_at")) or 0.0
++                        for row in rows), default=0.0)
++    for row in rows:
++        for field, target in (("model_cooldown_recorded_at", recorded),
++                              ("model_cooldown_cleared_at", cleared)):
++            for model, stamp in (row.get(field) or {}).items():
++                if isinstance(stamp, (int, float)):
++                    target[model] = max(target.get(model, 0.0), float(stamp))
++    observations: dict[str, tuple[float, float]] = {}
++    for row in rows:
++        for model, until in (row.get("model_cooldowns") or {}).items():
++            if not isinstance(until, (int, float)):
++                continue
++            stamp = (row.get("model_cooldown_recorded_at") or {}).get(model, 0.0)
++            receipt = max(global_clear, cleared.get(model, 0.0))
++            if receipt and stamp <= receipt:
++                continue
++            observations[model] = max(observations.get(model, (0.0, 0.0)), (stamp, float(until)))
++    result: dict[str, Any] = dict(zip(MODEL_STATE_FIELDS, (
++        {model: observation[1] for model, observation in observations.items()}, recorded, cleared)))
++    result = {field: value for field, value in result.items()
++              if value or any(row.get(field) is not None for row in rows)}
++    if global_clear:
++        result["status_cleared_at"] = global_clear
++    return result
++
++
++def resync_model_state(pool, entry):
++    """Read resets even when the credential has no account-wide failure status."""
++    from hermes_cli.auth import read_credential_pool
++    try:
++        row = next((r for r in read_credential_pool(pool.provider) if r.get("id") == entry.id), None)
++        if row is None:
++            return entry
++        state = merge_model_state(entry.to_dict(), row)
++        if all((getattr(entry, field) or {}) == state.get(field, {}) for field in MODEL_STATE_FIELDS):
++            return entry
++        return pool._adopt(entry, persist=False, **state)
++    except Exception:
++        logging.getLogger(__name__).debug("Could not resync model cooldown state", exc_info=True)
++        return entry
++
++
++def adopt_persisted_row(entry, row, pair):
++    """Adopt merged resets/status as well as tokens without dehydrating reference rows."""
++    from dataclasses import replace
++    from agent.credential_pool import PooledCredential
++    from hermes_cli.auth_pool_merge import _POOL_STATUS_FIELDS
++
++    if row is None:
++        return entry
++    updates = {field: row.get(field) for field in (*MODEL_STATE_FIELDS, *_POOL_STATUS_FIELDS)}
++    changed = any(getattr(entry, field) != value for field, value in updates.items())
++    if any(pair):
++        return PooledCredential.from_dict(entry.provider, row) if changed or pair != (
++            entry.access_token, entry.refresh_token) else entry
++    return replace(entry, **updates) if changed else entry
+diff --git a/agent/credential_pool_recovery.py b/agent/credential_pool_recovery.py
+new file mode 100644
+index 0000000000..c3b2eeb434
+--- /dev/null
++++ b/agent/credential_pool_recovery.py
+@@ -0,0 +1,77 @@
++"""Persistence-only compare-and-swap for externally verified quota recovery."""
++from __future__ import annotations
++
++import time
++import logging
++
++
++def clear_verified_model_cooldown(pool, observed, model: str) -> bool:
++    """Clear only the exact failure/token generation that a caller verified.
++
++    No probes or refreshes here. Read and mutate the owning store under its lock, never
++    flush a pre-probe pool snapshot over a peer's refresh or another model's failure.
++    """
++    from agent import credential_pool as cp
++    from agent.credential_pool_disabled import disabled_keys, matches
++    from hermes_cli import auth
++
++    if not model or observed.provider != pool.provider:
++        return False
++    with pool._lock:
++        target = None
++        if pool.provider in cp.SINGLE_USE_REFRESH_POOL_PROVIDERS and not cp._profile_owns_pool_provider(pool.provider):
++            target = cp._borrowed_single_use_pool_root()
++            if target is None:
++                return False
++        try:
++            with auth._auth_store_lock(target_path=target):
++                store = auth._load_auth_store(target) if target is not None else auth._load_auth_store()
++                rows = store.get("credential_pool", {}).get(pool.provider, [])
++                row = next((r for r in rows if isinstance(r, dict) and r.get("id") == observed.id), None)
++                if row is None:
++                    return False
++                current = cp.PooledCredential.from_dict(pool.provider, row)
++                if (not observed.runtime_api_key or current.runtime_api_key != observed.runtime_api_key
++                        or (current.access_token, current.refresh_token, current.base_url, current.auth_type)
++                        != (observed.access_token, observed.refresh_token, observed.base_url, observed.auth_type)
++                        or matches(current, disabled_keys(pool.provider))):
++                    return False
++                status_fields = ("last_status", "last_status_at", "last_error_code", "last_error_reason",
++                                 "last_error_message", "last_error_reset_at", "status_cleared_at")
++                if any(getattr(current, f) != getattr(observed, f) for f in status_fields):
++                    return False
++                if any(current.extra.get(f) != observed.extra.get(f)
++                       for f in ("cooldown_until", "failure_reason", "bench_status_at", "bench_token_fp")):
++                    return False
++                billing = (cp.FAILURE_REASON_BILLING, cp.FAILURE_REASON_BILLING_UNVERIFIED)
++                if (current.last_status == cp.STATUS_DEAD or current.last_error_code in (401, 402, 403)
++                        or current.last_error_reason in billing or current.extra.get("failure_reason") in billing):
++                    return False
++                cooldown = (observed.model_cooldowns or {}).get(model)
++                if current.last_status == cp.STATUS_EXHAUSTED:
++                    # Only Codex's explicitly observed account-wide 429 is recoverable here.
++                    if pool.provider != "openai-codex" or current.last_error_code != 429:
++                        return False
++                    updates = {**cp._MARK_OK, "last_status_at": current.last_status_at}
++                elif cooldown is not None:
++                    for field in ("model_cooldowns", "model_cooldown_recorded_at", "model_cooldown_cleared_at"):
++                        if (getattr(current, field) or {}).get(model) != (getattr(observed, field) or {}).get(model):
++                            return False
++                    cooldowns = dict(current.model_cooldowns or {})
++                    cooldowns.pop(model, None)
++                    cleared = {**(current.model_cooldown_cleared_at or {}), model: time.time()}
++                    updates = {"model_cooldowns": cooldowns, "model_cooldown_cleared_at": cleared}
++                else:
++                    return False
++                row.update(updates)
++                auth._save_auth_store(store, target_path=target)
++                adopted = cp.PooledCredential.from_dict(pool.provider, row)
++                live = pool._find(lambda e: e.id == observed.id)
++                if live is not None:
++                    pool._replace_entry(live, adopted)
++                pool._persisted_token_pairs[observed.id] = (adopted.access_token, adopted.refresh_token)
++                return True
++        except Exception:
++            # Failure to lock/read/write is not evidence of recovery.
++            logging.getLogger(__name__).debug("Could not persist verified quota recovery", exc_info=True)
++            return False
+diff --git a/agent/request_bucket_context.py b/agent/request_bucket_context.py
+new file mode 100644
+index 0000000000..ea393d1b7b
+--- /dev/null
++++ b/agent/request_bucket_context.py
+@@ -0,0 +1,32 @@
++"""Keep a request-bucket reset separate from subscription usage windows."""
++from __future__ import annotations
++
++from agent.credential_pool_timestamps import _parse_absolute_timestamp
++from agent.retry_utils import parse_retry_after_seconds
++
++
++def request_bucket_context(error, context, *, now):
++    """Override generic/body resets only with positive request-bucket evidence.
++
++    Anthropic uses the same generic rate-limit message for a real weekly rejection;
++    never classify that message alone as a transient throttle. Unified rejected
++    windows stay authoritative even if request-bucket headers are also present.
++    """
++    if getattr(error, 'status_code', None) != 429:
++        return context
++    headers = getattr(getattr(error, 'response', None), 'headers', None) or {}
++    headers = {str(k).lower(): v for k, v in headers.items()}
++    if any(str(value).lower() == 'rejected' for key, value in headers.items()
++           if key.startswith('anthropic-ratelimit-unified') and key.endswith('status')):
++        return context
++    exhausted = any(str(headers.get(key, '')).strip() == '0' for key in (
++        'anthropic-ratelimit-requests-remaining', 'x-ratelimit-remaining-requests'))
++    if not exhausted:
++        return context
++    seconds = parse_retry_after_seconds(headers)
++    if seconds is None:
++        reset = _parse_absolute_timestamp(headers.get('anthropic-ratelimit-requests-reset'))
++        seconds = reset - now if reset is not None else None
++    if seconds is None or seconds < 0:
++        return context
++    return {**context, 'reset_at': now + seconds}
+diff --git a/hermes_cli/auth_pool_merge.py b/hermes_cli/auth_pool_merge.py
+index 1dbf02fa7d..69807d99b7 100644
+--- a/hermes_cli/auth_pool_merge.py
++++ b/hermes_cli/auth_pool_merge.py
+@@ -34,10 +34,11 @@ def _merge_disk_cooldown_state(
+ 
+         # Model cooldowns are independent observations: keep the latest reset per model so a
+         # writer that just cooled one model cannot erase another process's cooldown for another.
+-        from agent.credential_pool_model_cooldowns import merge_model_cooldowns
+-        merged_cooldowns = merge_model_cooldowns(disk_entry.get("model_cooldowns"), entry.get("model_cooldowns"))
+-        merged = {**entry, "model_cooldowns": merged_cooldowns} if merged_cooldowns else entry
++        from agent.credential_pool_model_state import merge_model_state
++        merged = {**entry, **merge_model_state(disk_entry, entry)}
+         disk_status_fields = {f: disk_entry.get(f) for f in _POOL_STATUS_FIELDS}
++        # Model reset receipts remain monotonic even when a newer account failure wins.
++        disk_status_fields["status_cleared_at"] = merged.get("status_cleared_at")
+ 
+         mem_ts = _parse_absolute_timestamp(entry.get("last_status_at")) or 0.0
+         cleared_ts = _parse_absolute_timestamp(disk_entry.get("status_cleared_at")) or 0.0
+diff --git a/tests/agent/test_model_cooldown_recovery.py b/tests/agent/test_model_cooldown_recovery.py
+new file mode 100644
+index 0000000000..1cddae37e3
+--- /dev/null
++++ b/tests/agent/test_model_cooldown_recovery.py
+@@ -0,0 +1,150 @@
++"""Verified recoveries are scoped, generation-checked store transactions."""
++import time
++
++import pytest
++
++from tests.agent import test_anthropic_model_cooldowns as helpers
++
++pool = helpers.pool
++A, B, KEY = helpers.MODEL_A, helpers.MODEL_B, helpers.KEY
++
++
++def bench(pool, model=A):
++    pool.mark_exhausted_and_rotate(status_code=429, api_key_hint=KEY,
++        model=model, failure_reason="rate_limit", error_context={"reset_at": time.time() + 3600})
++    return pool.entries()[0]
++
++
++def test_verified_recovery_clears_only_observed_model(pool):
++    from agent.credential_pool import load_pool
++    from hermes_cli.auth import read_credential_pool
++
++    bench(pool, B)
++    observed = bench(pool)
++    stale = load_pool("anthropic")
++    assert pool.clear_verified_model_cooldown(observed, A)
++    row = read_credential_pool("anthropic")[0]
++    assert A not in row["model_cooldowns"]
++    assert B in row["model_cooldowns"]
++    stale._persist()
++    assert A not in read_credential_pool("anthropic")[0]["model_cooldowns"]
++    assert A not in stale.entries()[0].model_cooldowns
++    assert pool.select(model=A) is not None
++    assert pool.select(model=B) is None
++
++
++def test_new_failure_after_clear_still_benches(pool):
++    from agent.credential_pool import load_pool
++    from hermes_cli.auth import read_credential_pool
++
++    observed = bench(pool)
++    stale = load_pool("anthropic")
++    assert pool.clear_verified_model_cooldown(observed, A)
++    bench(stale)
++    pool._persist()
++    assert A in read_credential_pool("anthropic")[0]["model_cooldowns"]
++    assert pool.select(model=A) is None
++
++
++@pytest.mark.parametrize("change", ["token", "refresh", "until", "stamp", "cooldown_until",
++                                     "dead", "billing", "disabled"])
++def test_verified_recovery_refuses_changed_or_unsafe_row(pool, change):
++    from hermes_cli import auth
++    from agent.credential_pool_disabled import set_credential_disabled
++
++    observed = bench(pool)
++    if change == "disabled":
++        set_credential_disabled("anthropic", observed, True)
++    else:
++        with auth._auth_store_lock():
++            store = auth._load_auth_store()
++            row = store["credential_pool"]["anthropic"][0]
++            updates = {
++                "token": {"access_token": "peer-token"},
++                "refresh": {"refresh_token": "peer-refresh"},
++                "until": {"model_cooldowns": {A: row["model_cooldowns"][A] + 1}},
++                "stamp": {"model_cooldown_recorded_at": {A: row["model_cooldown_recorded_at"][A] + 1}},
++                "cooldown_until": {"cooldown_until": time.time() + 7200},
++                "dead": {"last_status": "dead"},
++                "billing": {"last_status": "exhausted", "last_error_code": 402, "last_error_reason": "billing"},
++            }
++            row.update(updates[change])
++            auth._save_auth_store(store)
++    before = auth.read_credential_pool("anthropic")
++    assert not pool.clear_verified_model_cooldown(observed, A)
++    assert auth.read_credential_pool("anthropic") == before
++
++
++def test_codex_recovery_preserves_other_model_benches(pool):
++    from agent.credential_pool import CredentialPool, PooledCredential
++    from hermes_cli import auth
++
++    row = pool.entries()[0].to_dict()
++    row.update(last_status="exhausted", last_status_at=time.time() - 60,
++               last_error_code=429, last_error_reset_at=time.time() + 3600,
++               model_cooldowns={B: time.time() + 7200})
++    auth.write_credential_pool("openai-codex", [row])
++    codex = CredentialPool("openai-codex", [PooledCredential.from_dict("openai-codex", row)])
++    observed = codex.entries()[0]
++    assert codex.clear_verified_model_cooldown(observed, A)
++    recovered = auth.read_credential_pool("openai-codex")[0]
++    assert recovered["last_status"] == "ok"
++    assert B in recovered["model_cooldowns"]
++    # A stale row cannot resurrect the account-wide 429 either.
++    auth.write_credential_pool("openai-codex", [row])
++    assert auth.read_credential_pool("openai-codex")[0]["last_status"] == "ok"
++    assert B in auth.read_credential_pool("openai-codex")[0]["model_cooldowns"]
++
++
++@pytest.mark.parametrize("unsafe", ["dead", "billing", "billing_unverified", "payment", "disabled"])
++def test_verified_recovery_never_clears_unsafe_observed_generation(pool, unsafe):
++    from agent.credential_pool import CredentialPool, PooledCredential
++    from agent.credential_pool_disabled import set_credential_disabled
++    from hermes_cli import auth
++
++    row = pool.entries()[0].to_dict()
++    row.update(last_status="exhausted", last_status_at=time.time(), last_error_code=429,
++               last_error_reset_at=time.time() + 3600, model_cooldowns={A: time.time() + 3600})
++    if unsafe == "dead":
++        row["last_status"] = "dead"
++    elif unsafe == "payment":
++        row["last_error_code"] = 402
++    elif unsafe != "disabled":
++        row["failure_reason"] = unsafe
++    auth.write_credential_pool("openai-codex", [row])
++    codex = CredentialPool("openai-codex", [PooledCredential.from_dict("openai-codex", row)])
++    observed = codex.entries()[0]
++    if unsafe == "disabled":
++        set_credential_disabled("openai-codex", observed, True)
++    before = auth.read_credential_pool("openai-codex")
++    assert not codex.clear_verified_model_cooldown(observed, A)
++    assert auth.read_credential_pool("openai-codex") == before
++
++
++def test_legacy_model_bench_loses_to_external_reset(pool):
++    from hermes_cli import auth
++    from agent.credential_pool import load_pool
++
++    row = pool.entries()[0].to_dict()
++    row["model_cooldowns"] = {A: time.time() + 3600}
++    auth.write_credential_pool("anthropic", [row])
++    stale = load_pool("anthropic")
++    reset = {**row, "model_cooldowns": {}, "status_cleared_at": time.time()}
++    auth.write_credential_pool("anthropic", [reset], status_cleared_ids=[row["id"]])
++    stale._persist()
++    stale._persist()
++    assert not auth.read_credential_pool("anthropic")[0]["model_cooldowns"]
++    bench(stale)
++    assert stale.entries()[0].model_cooldowns[A] > time.time()
++
++
++def test_new_account_failure_does_not_erase_model_reset_receipt():
++    from hermes_cli.auth_pool_merge import _merge_disk_cooldown_state
++
++    memory = {"id": "seat", "status_cleared_at": 200.0, "model_cooldowns": {}}
++    disk = {"id": "seat", "status_cleared_at": 100.0, "last_status": "dead", "last_status_at": 300.0}
++    merged = _merge_disk_cooldown_state(memory, disk, "anthropic")
++    assert merged["status_cleared_at"] == 200.0
++    stale = {"id": "seat", "model_cooldowns": {A: time.time() + 3600},
++             "model_cooldown_recorded_at": {A: 150.0}}
++    assert not _merge_disk_cooldown_state(stale, merged, "anthropic")["model_cooldowns"]
+diff --git a/tests/agent/test_quota_cooldown_contradictions.py b/tests/agent/test_quota_cooldown_contradictions.py
+new file mode 100644
+index 0000000000..a7b1cef319
+--- /dev/null
++++ b/tests/agent/test_quota_cooldown_contradictions.py
+@@ -0,0 +1,75 @@
++"""Captured weekly rejection and contradictory model cooldown regressions."""
++from types import SimpleNamespace
++
++from tests.agent import test_anthropic_model_cooldowns as helpers
++
++pool = helpers.pool
++MODEL = helpers.MODEL_A
++KEY = helpers.KEY
++CAPTURED_AT = 1794511819.8353467
++# Allowlisted headers of a live 1-token request, 2026-11-12 19:30:19Z.
++# The generic body is NOT evidence of a short throttle: these headers prove a weekly wall.
++WEEKLY_HEADERS = {
++    'anthropic-ratelimit-unified-representative-claim': 'seven_day',
++    'anthropic-ratelimit-unified-reset': '1794672000',
++    'anthropic-ratelimit-unified-7d-reset': '1794672000',
++    'anthropic-ratelimit-unified-7d-status': 'rejected',
++    'anthropic-ratelimit-unified-7d-utilization': '1.0',
++    'anthropic-ratelimit-unified-status': 'rejected',
++    'retry-after': '160180',
++}
++MESSAGE = "This request would exceed your account's rate limit. Please try again later."
++
++
++def _error(headers, **body_fields):
++    error = RuntimeError(MESSAGE)
++    error.body = {'error': {'type': 'rate_limit_error', 'message': MESSAGE, **body_fields}}
++    error.response = SimpleNamespace(headers=headers)
++    error.status_code = 429
++    return error
++
++
++def _bench(pool, context):
++    pool.mark_exhausted_and_rotate(status_code=429, error_context=context,
++                                   api_key_hint=KEY, failure_reason='rate_limit', model=MODEL)
++    return pool.entries()[0].model_cooldowns[MODEL]
++
++
++def test_captured_generic_message_with_weekly_headers_keeps_weekly_bench(pool, monkeypatch):
++    from agent.agent_runtime_helpers import extract_api_error_context
++    monkeypatch.setattr('time.time', lambda: CAPTURED_AT)
++    until = _bench(pool, extract_api_error_context(_error(WEEKLY_HEADERS)))
++    assert until == CAPTURED_AT + 160180
++
++
++def test_request_bucket_retry_after_not_usage_reset(pool, monkeypatch):
++    """Synthetic conflicting fields, not a claim that the captured response had these headers."""
++    from agent.agent_runtime_helpers import extract_api_error_context
++    monkeypatch.setattr('time.time', lambda: CAPTURED_AT)
++    headers = {'retry-after': '2', 'anthropic-ratelimit-requests-remaining': '0',
++               'anthropic-ratelimit-requests-reset': '2026-11-12T19:30:21Z'}
++    until = _bench(pool, extract_api_error_context(_error(headers, reset_at=1794672000)))
++    assert 0 < until - CAPTURED_AT <= 2
++
++
++def test_external_model_reset_is_seen_by_existing_pool(pool):
++    from hermes_cli.auth import read_credential_pool, write_credential_pool
++    import time
++    _bench(pool, {'reset_at': time.time() + 172800, 'message': MESSAGE})
++    rows = read_credential_pool('anthropic')
++    rows[0]['model_cooldowns'] = {}
++    rows[0]['status_cleared_at'] = time.time()
++    write_credential_pool('anthropic', rows, status_cleared_ids=[rows[0]['id']])
++    assert pool.select(model=MODEL) is not None
++
++
++def test_stale_flush_does_not_resurrect_externally_cleared_model_bench(pool):
++    from hermes_cli.auth import read_credential_pool, write_credential_pool
++    import time
++    _bench(pool, {'reset_at': time.time() + 172800, 'message': MESSAGE})
++    rows = read_credential_pool('anthropic')
++    rows[0]['model_cooldowns'] = {}
++    rows[0]['status_cleared_at'] = time.time()
++    write_credential_pool('anthropic', rows, status_cleared_ids=[rows[0]['id']])
++    pool._persist()
++    assert not read_credential_pool('anthropic')[0].get('model_cooldowns')
+-- 
+2.51.0
+

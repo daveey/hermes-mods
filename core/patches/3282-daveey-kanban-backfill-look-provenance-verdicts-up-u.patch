@@ -1,0 +1,411 @@
+From dba0056c0a3c0fd97b9026ebc9850ea4e4196b6c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:28:03 +0000
+Subject: [PATCH] [daveey] kanban backfill: look provenance verdicts up under
+ write_txn; prefetch skips foreign refs
+
+creator_chats.backfill warmed the 300 s source cache before write_txn, but a pass that
+outlived the TTL reopened every home's state.db per row with the board write lock held.
+LinkVerdicts.read now computes is_machine_session for every unreleased chat link and
+hub-sub origin (board file and replica) before the transaction, via one prefetch plus
+one machine_sessions call per (gateway, profile) (machine_verdicts). resolve_chats /
+inherit_chats / _ReplicaReader.resolve take it as `verdicts=` and only look up. A link
+that arrives mid-pass is classified without a read when it is another gateway's chat;
+a local one fails closed (owns nothing), so its card stays unresolved and the next
+pass retries it.
+
+prefetch_sources skips gw/profile/sid refs of other gateways: scoped_sources never
+looks them up locally.
+
+Tests (test_kanban_chat_links_bulk_provenance.py): a clock that expires every cache
+entry before reuse; at main backfill made 252 provenance reads inside write_txn, now 0.
+Batch verdicts equal per-row is_machine_session over the mixed-ref corpus; backfill
+output equals the per-row oracle with and without the expiring clock; prefetch of
+foreign refs opens no state.db and leaves scoped_sources verdicts unchanged.
+
+Follow-up to #1843 review nits 2 and 3 (t_01a1d2f6289c3fe7).
+---
+ hermes_cli/kanban_creator_chats.py            | 110 +++++++++-------
+ hermes_cli/kanban_session_provenance.py       |  35 +++++-
+ .../test_kanban_chat_links_bulk_provenance.py | 119 ++++++++++++++++++
+ .../test_kanban_backfill_replica_budget.py    |   2 +-
+ 4 files changed, 220 insertions(+), 46 deletions(-)
+
+diff --git a/hermes_cli/kanban_creator_chats.py b/hermes_cli/kanban_creator_chats.py
+index a302c64425..a4a4028408 100644
+--- a/hermes_cli/kanban_creator_chats.py
++++ b/hermes_cli/kanban_creator_chats.py
+@@ -78,13 +78,15 @@ def _chat_links(conn: sqlite3.Connection, task_id: str) -> list[dict]:
+     return out
+ 
+ 
+-def resolve_chats(conn: sqlite3.Connection, creator_task_id: str) -> list[dict]:
++def resolve_chats(conn: sqlite3.Connection, creator_task_id: str, *, verdicts: LinkVerdicts | None = None
++                  ) -> list[dict]:
+     """Nearest unreleased human links; creator edges precede dependency parents, cycles stop.
+ 
+     A machine session (``is_machine_session``: a worker/cron/one-shot/subagent transcript, whatever its id
+     shape) owns nothing: its link is skipped and the walk goes on to the next level. Another gateway's
+     ``local-<sha256>`` chat is one only without this board's proof on the card or an ancestor
+-    (``proven_foreign_chats``). [daveey]"""
++    (``proven_foreign_chats``). With ``verdicts`` (read before the caller's write lock) the machine test is a
++    lookup and never reads state.db. [daveey]"""
+     from hermes_cli.kanban_db_notify import is_machine_session
+     from hermes_cli.kanban_origin import gateway_names
+     from hermes_cli.kanban_placement import is_placeholder_session
+@@ -94,8 +96,12 @@ def resolve_chats(conn: sqlite3.Connection, creator_task_id: str) -> list[dict]:
+     proofs: dict[str, frozenset[str]] = {}
+ 
+     def _owner(task_id: str, row: dict) -> bool:
+-        if not is_machine_session(row["chat_gateway"], row["chat_session"], local_gateway=me,
+-                                  profile=row["chat_profile"]):
++        if verdicts is not None:
++            machine = verdicts.is_machine(row["chat_gateway"], row["chat_profile"], row["chat_session"])
++        else:
++            machine = is_machine_session(row["chat_gateway"], row["chat_session"], local_gateway=me,
++                                         profile=row["chat_profile"])
++        if not machine:
+             return True
+         if task_id not in proofs:
+             proofs[task_id] = proven_foreign_chats(conn, (task_id,), local_gateway=me)
+@@ -211,10 +217,10 @@ class _ReplicaReader:
+             return None
+         return self.replica
+ 
+-    def resolve(self, creator_task_id: str) -> list[dict]:
++    def resolve(self, creator_task_id: str, *, verdicts: LinkVerdicts | None = None) -> list[dict]:
+         try:
+             replica = self.open()
+-            return resolve_chats(replica, creator_task_id) if replica is not None else []
++            return resolve_chats(replica, creator_task_id, verdicts=verdicts) if replica is not None else []
+         except (OSError, sqlite3.Error):
+             return []
+ 
+@@ -241,15 +247,15 @@ def _owner_delivery(conn: sqlite3.Connection, task_id: str, owner: dict) -> None
+ 
+ 
+ def inherit_chats(conn: sqlite3.Connection, task_id: str, creator_task_id: str,
+-                  *, replica_reader: _ReplicaReader | None = None) -> None:
++                  *, replica_reader: _ReplicaReader | None = None, verdicts: LinkVerdicts | None = None) -> None:
+     """Copy a creator's real chat links inside the card creation transaction."""
+     from hermes_cli.kanban_chat_links import link_uid
+     from hermes_cli.kanban_db import _append_event
+     if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
+         return
+-    owners, source = resolve_chats(conn, creator_task_id), None
++    owners, source = resolve_chats(conn, creator_task_id, verdicts=verdicts), None
+     if not owners:
+-        owners = (replica_reader.resolve(creator_task_id) if replica_reader is not None
++        owners = (replica_reader.resolve(creator_task_id, verdicts=verdicts) if replica_reader is not None
+                   else _replica_chats(conn, creator_task_id))
+         source = "replica" if owners else None
+     if not owners:
+@@ -270,41 +276,61 @@ def inherit_chats(conn: sqlite3.Connection, task_id: str, creator_task_id: str,
+         (_owner_delivery if source else _copy_delivery)(conn, task_id, owner)
+ 
+ 
+-def _warm_link_provenance(conn: sqlite3.Connection, replica_reader: _ReplicaReader) -> None:
+-    """Read each local home's state.db once for the local chat links ``resolve_chats`` may test, BEFORE the caller
+-    takes the board write lock: a cold per-row ``is_machine_session`` there reopened every home's state.db with
+-    ``BEGIN IMMEDIATE`` held, stalling the dispatcher's pull for minutes (hub, t_01a1d2cc49634a78). Only the
+-    300 s source cache is warmed; verdicts are still computed per row, so an expired entry costs a read, never a
+-    different answer. [daveey]"""
+-    from hermes_cli.kanban_db_notify import prefetch_sources
+-    from hermes_cli.kanban_origin import gateway_names, parse_origin, OriginError
+-    me = gateway_names()[0]
+-    if not me:
+-        return
+-    sessions: list = []
+-    for db in (conn, replica_reader.open()):
+-        try:
+-            if db is None or not db.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
+-                continue
+-            sessions += [r[0] for r in db.execute(
+-                "SELECT chat_session FROM task_chat_links WHERE chat_gateway=? AND released=0", (me,))]
+-            for (chat_id,) in db.execute("SELECT DISTINCT chat_id FROM kanban_notify_subs WHERE platform='hub'"):
+-                try:
+-                    origin = parse_origin(chat_id)
+-                except OriginError:
++class LinkVerdicts:
++    """``is_machine_session`` verdicts for every chat link ``resolve_chats`` may test in one backfill pass, read
++    BEFORE the board write lock. A cold per-row lookup under ``BEGIN IMMEDIATE`` reopened every home's state.db,
++    stalling the dispatcher's pull for minutes (hub, t_01a1d2cc49634a78); warming the 300 s source cache was not
++    enough, since a pass that outlives it reads again (t_01a1d2f6289c3fe7). A lookup never reads state.db: a link
++    that arrives mid-pass is classified only when that needs no read (another gateway's chat). A local one fails
++    closed (owns nothing), so its card stays unresolved and the next pass retries it with a fresh map. [daveey]"""
++
++    def __init__(self, verdicts: dict[tuple, bool], local_gateway):
++        self.verdicts, self.local_gateway = verdicts, local_gateway
++
++    def is_machine(self, gateway, profile, session) -> bool:
++        from hermes_cli.kanban_db_notify import is_machine_session
++        from hermes_cli.kanban_session_provenance import reads_local_store
++        hit = self.verdicts.get((gateway, profile, str(session or "")))
++        if hit is not None:
++            return hit
++        if reads_local_store(gateway, session, local_gateway=self.local_gateway):
++            return True
++        return is_machine_session(gateway, session, local_gateway=self.local_gateway, profile=profile)
++
++    @classmethod
++    def read(cls, conn: sqlite3.Connection, replica_reader: _ReplicaReader) -> LinkVerdicts:
++        """Verdicts for the unreleased links and hub-sub origins of this board file and its replica. [daveey]"""
++        from hermes_cli.kanban_origin import gateway_names, parse_origin, OriginError
++        from hermes_cli.kanban_placement import is_placeholder_session
++        from hermes_cli.kanban_session_provenance import machine_verdicts
++        me = gateway_names()[0]
++        keys: dict[tuple, None] = {}
++        # Without a gateway name nothing here is synced: links of named gateways need no read, and the replica
++        # stays unopened until a creator is missing locally (``_ReplicaReader``).
++        for db in (conn, replica_reader.open() if me else None):
++            try:
++                if db is None or not db.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
+                     continue
+-                if origin.gateway == me:
+-                    sessions.append(origin.session)
+-        except sqlite3.Error:  # a cold cache only costs reads inside the transaction, never a wrong verdict
+-            continue
+-    prefetch_sources(sessions)
++                for gw, prof, sid in db.execute("SELECT DISTINCT chat_gateway, chat_profile, chat_session "
++                                                "FROM task_chat_links WHERE released=0"):
++                    keys[(gw, prof, str(sid or ""))] = None
++                for (chat_id,) in db.execute("SELECT DISTINCT chat_id FROM kanban_notify_subs WHERE platform='hub'"):
++                    try:
++                        origin = parse_origin(chat_id)
++                    except OriginError:
++                        continue
++                    keys[(origin.gateway, origin.profile, str(origin.session or ""))] = None
++            except sqlite3.Error:  # a missing verdict fails closed or needs no read, never a read under the lock
++                continue
++        return cls(machine_verdicts([k for k in keys if not is_placeholder_session(k[2])], local_gateway=me), me)
+ 
+ 
+ def backfill(conn: sqlite3.Connection) -> dict:
+     """Repair legacy worker creations once; unresolved rows remain discoverable and retryable.
+ 
+-    Provenance is read before ``write_txn``, in batches: per-row state.db reads under the board write lock held
+-    it for minutes on the hub (t_01a1d2cc49634a78). [daveey]"""
++    Provenance is read before ``write_txn``, in batches, and the transaction only looks verdicts up
++    (:class:`LinkVerdicts`): per-row state.db reads under the board write lock held it for minutes on the hub
++    (t_01a1d2cc49634a78), and a pass longer than the source cache's 300 s TTL read again. [daveey]"""
+     from hermes_cli.kanban_db import write_txn
+     from hermes_cli.kanban_db_notify import headless_sessions
+     from hermes_cli.kanban_placement import is_placeholder_session
+@@ -316,9 +342,9 @@ def backfill(conn: sqlite3.Connection) -> dict:
+     attempted, unresolved = [], []
+     headless = headless_sessions(row["session_id"] for row in rows if row["session_id"])
+     with _ReplicaReader(conn) as replica_reader:
+-        if any(not row["session_id"] or str(row["session_id"]) in headless or is_placeholder_session(row["session_id"])
+-               for row in rows):
+-            _warm_link_provenance(conn, replica_reader)
++        verdicts = (LinkVerdicts.read(conn, replica_reader) if any(
++            not row["session_id"] or str(row["session_id"]) in headless or is_placeholder_session(row["session_id"])
++            for row in rows) else LinkVerdicts({}, None))
+         with write_txn(conn):
+             for row in rows:
+                 if row["session_id"] and not (str(row["session_id"]) in headless
+@@ -327,7 +353,7 @@ def backfill(conn: sqlite3.Connection) -> dict:
+                 creator = json.loads(row["payload"] or "{}").get("creator_task_id")
+                 if not creator:
+                     continue
+-                inherit_chats(conn, row["id"], creator, replica_reader=replica_reader)
++                inherit_chats(conn, row["id"], creator, replica_reader=replica_reader, verdicts=verdicts)
+                 attempted.append(row["id"])
+                 if not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='creator_chats_resolved'",
+                                     (row["id"],)).fetchone():
+diff --git a/hermes_cli/kanban_session_provenance.py b/hermes_cli/kanban_session_provenance.py
+index 34c267e7b5..5d512b8fac 100644
+--- a/hermes_cli/kanban_session_provenance.py
++++ b/hermes_cli/kanban_session_provenance.py
+@@ -114,16 +114,45 @@ def scoped_sources(gateway: Any, sessions: Iterable[Any], *, local_gateway=None,
+     return out
+ 
+ 
+-def prefetch_sources(refs: Iterable[Any]) -> None:
++def prefetch_sources(refs: Iterable[Any], *, local_gateway=None) -> None:
+     """Read every local home's state.db ONCE for the bare session ids of ``refs`` (``sid`` or ``gw/profile/sid``),
+     filling the source cache so the classifications that follow in the same pass are cache hits, whatever profile
+-    they scope to. Verdicts are unchanged: an entry that expires before use only costs a read. [daveey]"""
+-    sids = [p[-1] for r in dict.fromkeys(str(r or "") for r in refs) if len(p := r.split("/")) in (1, 3) and p[-1]]
++    they scope to. Verdicts are unchanged: an entry that expires before use only costs a read. A qualified ref of
++    another gateway is skipped: :func:`scoped_sources` never looks it up locally. [daveey]"""
++    from hermes_cli.kanban_origin import gateway_names
++    me = local_gateway if local_gateway is not None else gateway_names()[0]
++    sids = [p[-1] for r in dict.fromkeys(str(r or "") for r in refs)
++            if (len(p := r.split("/")) == 1 or (len(p) == 3 and me and p[0] == me)) and p[-1]]
+     if sids:
+         for home in _local_homes(None):
+             _local_session_sources(sids, home=home)
+ 
+ 
++def reads_local_store(gateway: Any, session: Any, *, local_gateway: Any) -> bool:
++    """Whether :func:`scoped_sources` may open a state.db for ``session`` scoped to ``gateway`` (the same rule it
++    applies): only another gateway's ref is answered unknown without a read. [daveey]"""
++    parts = str(session or "").split("/")
++    gw = parts[0] if len(parts) == 3 else gateway
++    return len(parts) in (1, 3) and (gw is None or bool(local_gateway and gw == local_gateway))
++
++
++def machine_verdicts(keys: Iterable[tuple[Any, Any, Any]], *, local_gateway) -> dict[tuple, bool]:
++    """``is_machine_session(gateway, session, profile=profile)`` for every ``(gateway, profile, session)`` key, with
++    each home read once (one :func:`prefetch_sources`) and one :func:`machine_sessions` call per (gateway, profile).
++    Keys are ``(gateway, profile, str(session or ""))``. A caller computes this BEFORE taking a lock, so the
++    per-row path under the lock looks verdicts up instead of reading state.db (t_01a1d2f6289c3fe7). [daveey]"""
++    groups: dict[tuple, list[str]] = {}
++    for gw, prof, session in keys:
++        groups.setdefault((gw, prof), []).append(str(session or ""))
++    prefetch_sources([s for (gw, _p), refs in groups.items() for s in refs
++                      if reads_local_store(gw, s, local_gateway=local_gateway)], local_gateway=local_gateway)
++    out: dict[tuple, bool] = {}
++    for (gw, prof), refs in groups.items():
++        machine = machine_sessions(gw, refs, local_gateway=local_gateway, profile=prof)
++        out.update({(gw, prof, s): s in machine for s in refs})
++    return out
++
++
+ def headless_sessions(chat_ids: Iterable[Any], *, gateway=None, profile=None, local_gateway=None) -> set[str]:
+     """The ``str(chat_id or "")`` refs :func:`is_headless_session` calls headless, from ONE ``scoped_sources`` read.
+ 
+diff --git a/tests/hermes_cli/test_kanban_chat_links_bulk_provenance.py b/tests/hermes_cli/test_kanban_chat_links_bulk_provenance.py
+index a6521d2905..34ff3ac603 100644
+--- a/tests/hermes_cli/test_kanban_chat_links_bulk_provenance.py
++++ b/tests/hermes_cli/test_kanban_chat_links_bulk_provenance.py
+@@ -457,3 +457,122 @@ def test_backfill_result_and_rows_match_the_per_row_implementation(home, tmp_pat
+     old = run(copy, _frozen_backfill)
+     assert new == old
+     assert "creator_chats_resolved" in new and "creator_chats_unresolved" in new
++
++
++class _SlowClock:
++    """Every ``monotonic`` call advances past the 300 s source-cache TTL: each entry expires before its next use."""
++    t = 1000.0
++
++    @classmethod
++    def monotonic(cls):
++        cls.t += provenance._MISSING_TTL_S + 1
++        return cls.t
++
++
++def test_backfill_reads_no_provenance_inside_its_transaction_when_the_pass_outlives_the_cache(home, opens,
++                                                                                               monkeypatch):
++    """t_01a1d2f6289c3fe7: warming the source cache before ``write_txn`` bounded reads only while the pass stayed
++    inside the 300 s TTL. With every entry expired by its next use, ``backfill`` must still look verdicts up
++    under the lock: no ``scoped_sources`` / ``_local_session_sources`` call and no state.db open."""
++    seen, board = opens
++    calls: list[tuple[str, bool]] = []
++
++    def spy(name):
++        real = getattr(provenance, name)
++
++        def wrapped(*a, **kw):
++            conn = board.get("conn")
++            calls.append((name, bool(conn is not None and conn.in_transaction)))
++            return real(*a, **kw)
++        monkeypatch.setattr(provenance, name, wrapped)
++
++    for name in ("scoped_sources", "_local_session_sources"):
++        spy(name)
++    with kbc.connect_closing() as conn:
++        _backfill_board(conn, 40)
++        with kbc.write_txn(conn):  # hub-sub origins resolve_chats also tests (legacy courier rows)
++            conn.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, delivery_metadata, created_at) "
++                         "VALUES ('t_lost', 'hub', ?, ?, 1)",
++                         (f"{GW}/default/{DESKTOP}", json.dumps({"reason": "origin"})))
++        notify._source_cache.clear()
++        monkeypatch.setattr(provenance, "time", _SlowClock)
++        board["conn"] = conn
++        seen.clear()
++        calls.clear()
++        out = creator_chats.backfill(conn)
++        board.clear()
++    assert len(out["attempted"]) > 10
++    assert any(not in_txn for _n, in_txn in calls)  # verdicts were read, before the transaction
++    inside = [n for n, in_txn in calls if in_txn] + [p for p, in_txn in seen if in_txn]
++    assert not inside, f"{len(inside)} provenance reads inside write_txn: {sorted(set(inside))}"
++
++
++@pytest.mark.parametrize("slow", [False, True])
++def test_backfill_with_expiring_cache_matches_the_per_row_implementation(home, tmp_path, monkeypatch, slow):
++    with kbc.connect_closing() as conn:
++        _backfill_board(conn, 40)
++    board = home / "kanban.db"
++    copy = tmp_path / "copy.db"
++    shutil.copy(board, copy)
++    if slow:
++        monkeypatch.setattr(provenance, "time", _SlowClock)
++
++    def run(path, fn):
++        notify._source_cache.clear()
++        conn = kbc.connect(path)
++        try:
++            result = fn(conn)
++            rows = conn.execute("SELECT * FROM task_chat_links ORDER BY 1").fetchall()
++            events = conn.execute("SELECT task_id, kind, payload FROM task_events ORDER BY id").fetchall()
++            return _dump([result, [tuple(r) for r in rows], [tuple(r) for r in events]])
++        finally:
++            conn.close()
++
++    assert run(board, creator_chats.backfill) == run(copy, _frozen_backfill)
++
++
++def test_link_verdicts_never_read_for_a_link_missing_from_the_map(home, opens):
++    """A link that arrives mid-pass: another gateway's chat is classified (no read needed); a local one fails
++    closed (owns nothing, retried next pass) rather than reading state.db under the lock."""
++    seen, _board = opens
++    verdicts = creator_chats.LinkVerdicts({}, GW)
++    seen.clear()
++    assert verdicts.is_machine(GW, None, DESKTOP) is True
++    assert verdicts.is_machine(None, "default", DESKTOP) is True
++    assert verdicts.is_machine("away", "default", DESKTOP) is True  # a foreign hash: suppressed without proof
++    assert verdicts.is_machine("away", "default", "20261101_000000_human") is False
++    assert not seen
++
++
++def test_link_verdicts_match_per_row_is_machine_session(home):
++    keys = [(gw, prof, s) for s in MIXED for gw in (GW, "away", None) for prof in (None, "default", "research", "")]
++    batch = provenance.machine_verdicts(keys, local_gateway=GW)
++    notify._source_cache.clear()
++    per_row = {(gw, prof, s): notify.is_machine_session(gw, s, local_gateway=GW, profile=prof)
++               for gw, prof, s in keys}
++    assert batch == per_row
++    assert any(batch.values()) and not all(batch.values())
++
++
++def test_prefetch_skips_other_gateways_refs(home, opens):
++    """t_01a1d2f6289c3fe7 nit 3: ``scoped_sources`` never reads another gateway's ``gw/profile/sid`` locally, so the
++    prefetch does not either."""
++    seen, _board = opens
++    seen.clear()
++    provenance.prefetch_sources([f"away/default/{DESKTOP}", f"away/research/{RCHAT}", "a/b"])
++    assert not seen
++    provenance.prefetch_sources([f"{GW}/default/{DESKTOP}"])
++    assert len(seen) == 3
++
++
++@pytest.mark.parametrize("gateway", [None, GW, "away"])
++@pytest.mark.parametrize("profile", [None, "default", "research"])
++def test_prefetch_leaves_scoped_verdicts_unchanged(home, gateway, profile):
++    """The mixed-ref corpus (bare, local-qualified and foreign-qualified refs) gets the same ``scoped_sources``
++    verdicts from a cold cache and after the filtered prefetch."""
++    notify._source_cache.clear()
++    cold = provenance.scoped_sources(gateway, MIXED, local_gateway=GW, profile=profile)
++    notify._source_cache.clear()
++    provenance.prefetch_sources(MIXED)
++    assert provenance.scoped_sources(gateway, MIXED, local_gateway=GW, profile=profile) == cold
++    assert any(v is not None for v in cold.values()) or gateway == "away"
+diff --git a/tests/tools/test_kanban_backfill_replica_budget.py b/tests/tools/test_kanban_backfill_replica_budget.py
+index be7b5bb164..d0adaccd54 100644
+--- a/tests/tools/test_kanban_backfill_replica_budget.py
++++ b/tests/tools/test_kanban_backfill_replica_budget.py
+@@ -114,7 +114,7 @@ def test_replica_closes_on_resolution_error(tmp_path, monkeypatch):
+     remote = _replica(home)
+     with kbc.connect_closing() as conn:
+         reader = creator._ReplicaReader(conn)
+-        def broken(*args):
++        def broken(*args, **kwargs):
+             raise sqlite3.OperationalError('injected read failure')
+         monkeypatch.setattr(creator, 'resolve_chats', broken)
+         with reader:
+-- 
+2.51.0
+

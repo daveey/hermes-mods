@@ -1,0 +1,230 @@
+From 4e66fb8cc2f4fd0dcbedf9bdee5d28d31054ae50 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:56:43 +0000
+Subject: [PATCH] [daveey] venv_sync: a served borrowing launch hands its
+ verdict across the store-Python relaunch
+
+Follow-up to PR #2009's review (5888294947).
+
+A borrowing HERMES_HOME served by the owner's committed generation records no
+facts of its own, and _prepare_borrowed_launch set no _handoff. A launch from
+any interpreter other than the store Python therefore paid the currency probe
+and the 'borrowed' owner probe (each bounded at 5 s) twice: once in the
+launching process and again in the store Python it re-execs into, which then
+also ran check_runtime's own runtime probe.
+
+- _prepare_borrowed_launch: when the borrower's dependencies serve it (its own
+  current generation, or the owner's), hand ("current", root) to the relaunch
+  as prepare_launch's main path does; on the store interpreter, record the
+  root in _current_roots so check_runtime reuses the verdict. A launch that
+  just synced its own hands nothing on, as after the main path's sync.
+- pm.environments._require_own_dependencies: document (and accept) that
+  processes skipping prepare_launch -- the _METADATA_FLAGS path and
+  ui-tui/scripts/gateway_bootstrap.py -- lease the owner's last committed
+  generation without its stamp check.
+
+Measured on a fake owner home (worker-7, 5 runs each, median), launching
+`HERMES_HOME=$(mktemp -d) ... config path`:
+  owner's launcher (store Python): 0.96 s -> 0.90 s; probes currency,borrowed,runtime -> currency,borrowed
+  other interpreter (relaunch):    1.19 s -> 0.89 s; probes currency,borrowed x2,runtime -> currency,borrowed
+---
+ hermes_cli/venv_sync.py                       | 20 +++++-
+ pm/environments.py                            | 10 +++
+ tests/hermes_cli/test_borrowed_home_launch.py | 63 +++++++++++++++++++
+ tests/pm/test_borrowed_owner_environment.py   | 43 +++++++++++++
+ 4 files changed, 134 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/venv_sync.py b/hermes_cli/venv_sync.py
+index 5e768e9b56..45719a031a 100644
+--- a/hermes_cli/venv_sync.py
++++ b/hermes_cli/venv_sync.py
+@@ -749,6 +749,14 @@ def _prepare_borrowed_launch(root: Path, owner: Path, *, current: bool) -> Path
+     run, written or published from here, so a borrowing launch cannot rebind the shared
+     launchers, rebuild products another root is serving, or race the owner's tail under a lock
+     that lives in a different home.
++
++    A launch whose dependencies serve it -- its own current generation, or the owner's that
++    serves it -- hands that verdict to the store interpreter it relaunches into (``_handoff``,
++    as ``prepare_launch`` does), so the exec'd child repeats neither the currency probe nor the
++    owner check; on that interpreter it records the root as current, so ``check_runtime`` skips
++    its own probe as well. A borrower's child reads ``current`` as "served" (its own or the
++    owner's) and takes this path again. A launch that just synced its own hands nothing on: its
++    child checks for itself, as a relaunch after the main path's sync does.
+     """
+     import os
+     import sys
+@@ -756,7 +764,9 @@ def _prepare_borrowed_launch(root: Path, owner: Path, *, current: bool) -> Path
+     from hermes_cli._launchers import resolve_store_python
+     from hermes_cli.update_lock import UpdateLock
+ 
+-    if not current and not _owner_environment_serves(root):
++    global _handoff
++    served = current or _owner_environment_serves(root)
++    if not served:
+         lock = UpdateLock(install_root=root, checkout_first=False)  # R6, as in prepare_launch
+         if not lock.acquire():
+             raise RuntimeError("an update is still running; wait for it to exit, then relaunch Hermes")
+@@ -774,7 +784,13 @@ def _prepare_borrowed_launch(root: Path, owner: Path, *, current: bool) -> Path
+     # The pre-sync flag used to force a re-exec even when this process already is the store
+     # interpreter. A script that mints a new HERMES_HOME on each start would then sync and
+     # re-exec forever. Activation runs in this process when prepare_launch returns None.
+-    return None if same else python
++    if not same:
++        if served:
++            _handoff = ("current", root)
++        return python
++    if served:
++        _current_roots.add(root)
++    return None
+ 
+ 
+ def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
+diff --git a/pm/environments.py b/pm/environments.py
+index dc0fae72c6..efeaf0e299 100644
+--- a/pm/environments.py
++++ b/pm/environments.py
+@@ -525,6 +525,16 @@ def _require_own_dependencies(project_root: Path) -> Path | None:
+     removes it under a running borrower. Nothing else of the owner's state is written and its lock
+     is not taken: the selection is re-read after leasing, as an unlocked reader does. A lease
+     directory this user cannot write leaves the refusal in place.
++
++    The lease does not check the owner's stamp (``pm.install.borrowed_venv_is_current``): that
++    is ``hermes_cli.venv_sync.prepare_launch``'s question, and a borrowing launch that asks it
++    syncs its own environment when the owner's does not serve it. Processes that skip
++    prepare_launch -- the ``_METADATA_FLAGS`` path (``--version``, ``--help``) and
++    ``ui-tui/scripts/gateway_bootstrap.py`` -- therefore boot the owner's last committed
++    generation even when the checkout has moved past it, where they used to refuse. That is
++    accepted: it is the generation the owner's own processes on those paths run too (they skip
++    the same check), and the bootstrap is only a client: a gateway it starts is a ``hermes``
++    entry point, whose boot (``hermes_bootstrap``) runs prepare_launch and judges currency.
+     """
+     import sys
+ 
+diff --git a/tests/hermes_cli/test_borrowed_home_launch.py b/tests/hermes_cli/test_borrowed_home_launch.py
+index 144b4dd270..ff125457ce 100644
+--- a/tests/hermes_cli/test_borrowed_home_launch.py
++++ b/tests/hermes_cli/test_borrowed_home_launch.py
+@@ -264,6 +264,69 @@ def test_a_borrowing_launch_runs_the_owners_generation_when_it_serves(tmp_path,
+     assert completion_tail == []
+ 
+ 
++@pytest.mark.parametrize("own", [False, True])
++def test_a_served_borrowing_launch_hands_its_verdict_across_the_relaunch(tmp_path, monkeypatch, own):
++    """The relaunched store interpreter (same pid) trusts the verdict once: it repeats neither the
++    currency probe nor the owner check, and its runtime check reuses it. *own*: the borrower's own
++    generation is current; otherwise the owner's serves it."""
++    import pm
++    from hermes_cli import _launchers
++
++    root = _checkout(tmp_path, monkeypatch).resolve()
++    _state(tmp_path / ".hermes", root)
++    _home(monkeypatch, tmp_path / "tmp" / "borrowed")
++    python = tmp_path / ".hermes" / "tools" / "python" / "bin" / "python3"
++    probes: list[str] = []
++    monkeypatch.setattr(venv_sync, "_launch_currency", lambda r, command: probes.append("currency") or own)
++    monkeypatch.setattr(venv_sync, "_owner_environment_serves", lambda r: probes.append("borrowed") or True)
++    monkeypatch.setattr(pm, "sync_venv", lambda *a, **kw: pytest.fail("a served borrower synced"))
++    monkeypatch.setattr(_launchers, "resolve_store_python", lambda _, **__: python)
++    monkeypatch.setattr(venv_sync, "_current_roots", set())
++    monkeypatch.delenv(venv_sync.LAUNCH_HANDOFF_ENV, raising=False)
++
++    assert venv_sync.prepare_launch(root, ["config", "path"]) == python
++    assert probes == (["currency"] if own else ["currency", "borrowed"])
++    handoff = venv_sync.launch_handoff_env()
++    assert handoff == {venv_sync.LAUNCH_HANDOFF_ENV: f"current:{os.getpid()}:{root}"}
++    assert root not in venv_sync._current_roots, "the launching interpreter is not the one that runs"
++
++    for name, value in handoff.items():
++        monkeypatch.setenv(name, value)
++    monkeypatch.setattr(sys, "executable", str(python))
++    probes.clear()
++    assert venv_sync.prepare_launch(root, ["config", "path"]) is None
++    assert probes == [], "the relaunched interpreter repeated its parent's checks"
++    assert venv_sync.LAUNCH_HANDOFF_ENV not in os.environ, "the handoff must not reach subprocesses"
++    assert venv_sync.launch_handoff_env() == {}
++    assert root in venv_sync._current_roots, "check_runtime would probe again"
++
++    # A later re-exec (the handoff was consumed) checks for itself again.
++    assert venv_sync.prepare_launch(root, ["config", "path"]) is None
++    assert probes == (["currency"] if own else ["currency", "borrowed"])
++
++
++def test_a_borrowing_launch_that_synced_its_own_hands_nothing_on(tmp_path, monkeypatch, completion_tail):
++    """As after the main path's sync, the relaunched child checks the fresh generation itself."""
++    import pm
++    from hermes_cli import _launchers
++
++    root = _checkout(tmp_path, monkeypatch).resolve()
++    _state(tmp_path / ".hermes", root)
++    _home(monkeypatch, tmp_path / "tmp" / "borrowed")
++    syncs = []
++    python = tmp_path / ".hermes" / "tools" / "python" / "bin" / "python3"
++    monkeypatch.setattr(pm, "venv_is_current", lambda **kw: bool(syncs))
++    monkeypatch.setattr(venv_sync, "_owner_environment_serves", lambda r: False)
++    monkeypatch.setattr(pm, "sync_venv", lambda extras=None, **kw: syncs.append(extras))
++    monkeypatch.setattr(_launchers, "resolve_store_python", lambda _, **__: python)
++    monkeypatch.setattr(venv_sync, "_current_roots", set())
++
++    assert venv_sync.prepare_launch(root, ["config", "path"]) == python
++    assert len(syncs) == 1
++    assert venv_sync.launch_handoff_env() == {}
++    assert root not in venv_sync._current_roots
++
++
+ def test_the_owner_check_needs_an_owner_generation_before_probing(tmp_path, monkeypatch):
+     """No generation named in the owner's facts: no probe, the borrower syncs its own."""
+     from hermes_cli import launch_probe
+diff --git a/tests/pm/test_borrowed_owner_environment.py b/tests/pm/test_borrowed_owner_environment.py
+index ff5a775633..868de1bc9f 100644
+--- a/tests/pm/test_borrowed_owner_environment.py
++++ b/tests/pm/test_borrowed_owner_environment.py
+@@ -158,3 +158,46 @@ def test_a_store_python_borrower_activates_the_owners_generation(tmp_path, monke
+         assert not (home / "installs").exists(), "the borrower built state of its own"
+     else:
+         assert result.stdout.startswith("refused: no dependency environment is committed"), result.stdout
++
++
++@posix
++def test_a_served_borrowers_relaunch_runs_the_owners_generation_without_rechecking(tmp_path, monkeypatch):
++    """The store interpreter a served borrowing launch relaunches into (same pid, the parent's
++    verdict handed over in the environment) asks no probe at all -- neither currency nor the owner
++    check -- records the root as current for check_runtime, and boots the owner's generation."""
++    root = _checkout(tmp_path, monkeypatch)
++    (root / ".git").mkdir()
++    (root / "install-stamp.json").write_text(json.dumps({"updateMechanism": "self", "commit": "abc"}),
++                                              encoding="utf-8")
++    venv = _owner_generation(tmp_path / "owner", root)
++    home = _borrow(tmp_path, monkeypatch)
++    base_prefix = Path(sys.base_prefix).resolve()
++    repo = Path(__file__).resolve().parents[2]
++    code = (
++        "import importlib.util, os, sys; from pathlib import Path; sys.path.insert(0, sys.argv[1])\n"
++        "import hermes_constants; hermes_constants._get_platform_default_hermes_home = lambda: Path(sys.argv[3])\n"
++        "root = Path(sys.argv[2]).resolve()\n"
++        "from hermes_cli import _launchers, launch_probe, venv_sync\n"
++        "probes = []\n"
++        "launch_probe.probe = lambda root, operation='currency', **kw: probes.append(operation)\n"
++        "venv_sync._launch_currency = lambda root, command: probes.append('currency')\n"
++        "_launchers.resolve_store_python = lambda *a, **kw: Path(sys.executable)\n"
++        "os.environ[venv_sync.LAUNCH_HANDOFF_ENV] = f'current:{os.getpid()}:{root}'\n"
++        "print('relaunch:', venv_sync.prepare_launch(root, ['config', 'path']))\n"
++        "print('probes:', probes)\n"
++        "print('current:', root in venv_sync._current_roots)\n"
++        "from pm.environments import activate_dependencies\n"
++        "activate_dependencies(root)\n"
++        "print('owner importable:', importlib.util.find_spec('owner_only') is not None)\n"
++    )
++    env = {**os.environ, "HERMES_HOME": str(home), "HERMES_RUNTIME_DIR": str(base_prefix.parent)}
++    for name in ("PYTHONPATH", "HERMES_DISABLE_LAZY_INSTALLS", "HERMES_LAUNCH_CURRENT_HANDOFF"):
++        env.pop(name, None)
++    result = subprocess.run([getattr(sys, "_base_executable", sys.executable), "-I", "-c", code, str(repo),
++                             str(root), str(tmp_path / "default")],
++                            env=env, capture_output=True, text=True, timeout=60, check=False)
++    assert result.returncode == 0, result.stderr
++    assert result.stdout.splitlines() == ["relaunch: None", "probes: []", "current: True",
++                                          "owner importable: True"], result.stdout + result.stderr
++    assert not (home / "installs").exists(), "the borrower built state of its own"
++    assert venv.is_dir()
+-- 
+2.51.0
+

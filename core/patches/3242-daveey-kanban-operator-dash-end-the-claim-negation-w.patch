@@ -1,0 +1,158 @@
+From 147e0606cbe5cf32f9e99e20862000c06b077879 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:52:26 +0000
+Subject: [PATCH] [daveey] kanban operator: ':'/dash/'(' end the claim negation
+ window; defer only the unsynced caller's call
+
+Follow-up to the PR #1917 review nits (t_01a1d3d7fe5e45bd).
+
+1. Delivery claim classifier: the verb-scoped negation window now also stops at
+   ':', em/en dash and '(' (as it did at commas and conjunctions), so
+   "No longer pending: posted to t_X" is a claim and needs the exact operator
+   receipt. Controls ("not posted", "queued", "failed and was not sent") stay
+   non-claims.
+
+2. Home executor: a call whose caller created event has not reached the replica
+   no longer stops the scan (`hi = eid - 1; break`). Only that call is deferred:
+   the watermark stays below it, so it is retried next tick and still refused
+   consent_unproven after CREATION_SYNC_GRACE_S, while later calls on the board
+   are applied now (rescans skip them via the execute log). An unreachable Board
+   still stops the scan, since every later call would retry too.
+---
+ hermes_cli/kanban_consent.py                  |  5 +++--
+ hermes_cli/kanban_operator_call.py            | 15 +++++++++----
+ hermes_cli/kanban_operator_delivery.py        |  8 ++++---
+ .../test_kanban_consent_provenance.py         | 21 +++++++++++++++++++
+ .../test_kanban_operator_delivery.py          |  9 ++++++++
+ 5 files changed, 49 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/kanban_consent.py b/hermes_cli/kanban_consent.py
+index 47798291d2..4607ecfd00 100644
+--- a/hermes_cli/kanban_consent.py
++++ b/hermes_cli/kanban_consent.py
+@@ -227,8 +227,9 @@ CREATION_SYNC_GRACE_S = 600
+ def home_refusal(rep, payload, target):
+     """``(refusal, retry)`` for the home executor, from the caller's created event in the replica.
+ 
+-    A missing created event (sync lag) is retried like an unreachable Board, then
+-    refused after ``CREATION_SYNC_GRACE_S``: the stops cannot be checked, so the
++    A missing created event (sync lag) defers only this call (the executor keeps
++    going with the rest and retries it next tick), then it is refused after
++    ``CREATION_SYNC_GRACE_S``: the stops cannot be checked, so the
+     call is never applied on an empty read. Known limit: the submitting session's
+     host-local stops are checked only at submission (``enforce``), never here.
+     """
+diff --git a/hermes_cli/kanban_operator_call.py b/hermes_cli/kanban_operator_call.py
+index 5d91962599..dfe8e85b3f 100644
+--- a/hermes_cli/kanban_operator_call.py
++++ b/hermes_cli/kanban_operator_call.py
+@@ -723,6 +723,7 @@ def apply_incoming(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+         hi = rep.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0] if len(rows) < SCAN_BATCH \
+             else rows[-1][0]
+         handled = 0
++        hold = hi  # below the first call deferred for creation sync lag
+         for eid, euid, etask, raw in rows:
+             try:
+                 payload = json.loads(raw or "{}")
+@@ -745,17 +746,23 @@ def apply_incoming(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+             handled += 1
+             event = {"id": eid, "uid": euid, "task_id": etask}
+             refusal, retry = _caller_refusal(rep, board, event, payload)
+-            if refusal is None and not retry:
+-                from hermes_cli.kanban_consent import home_refusal
+-                refusal, retry = home_refusal(rep, payload, target)  # unsynced created event: retry, then refuse
+-            if retry:
++            if retry:  # unreachable Board: every later call would retry too
+                 hi = eid - 1
+                 break
++            if refusal is None:
++                from hermes_cli.kanban_consent import home_refusal
++                refusal, defer = home_refusal(rep, payload, target)  # unsynced created event: retry, then refuse
++                if defer:
++                    # Only this caller lags: keep the watermark below it (retried next tick) and go on with the
++                    # rest; calls handled meanwhile are logged, so the rescan skips them.
++                    hold = min(hold, eid - 1)
++                    continue
+             if labels:
+                 done.append((uid, kol.handle(conn, own, event, payload, refusal)))
+                 continue
+             outcome, _detail = _execute_one(conn, payload, own, refusal)
+             done.append((uid, outcome))
++        hi = min(int(hi), hold)
+         stored = conn.execute("SELECT last_id, last_uid FROM operator_call_scan WHERE board = ?",
+                               (board,)).fetchone()
+         new, anchor = _anchor(rep, max(int(hi), last))
+diff --git a/hermes_cli/kanban_operator_delivery.py b/hermes_cli/kanban_operator_delivery.py
+index 4d60ad6569..f1a1b58e32 100644
+--- a/hermes_cli/kanban_operator_delivery.py
++++ b/hermes_cli/kanban_operator_delivery.py
+@@ -17,9 +17,11 @@ _NOT_CLAIM = frozenset({"not", "never", "no", "nothing", "none", "neither", "nor
+                         "failed", "refused", "rejected", "unable", "will", "would", "could", "should", "may",
+                         "might", "if", "once", "until", "awaiting", "waiting", "yet"})
+ _GOVERN_WINDOW = 3  # words before the verb: "has not yet been posted", "will later be sent"
+-# A comma or conjunction ends the governing span: "filed no card, so I posted ..." is a claim.
+-_BOUNDARY = frozenset({",", "so", "and", "but", "then", "after", "before", "because", "which", "while", "that"})
+-_WORD = re.compile(r"[\w’']+|,")
++# A comma, ':', a dash, '(' or a conjunction ends the governing span: "filed no card, so I posted ..." and
++# "No longer pending: posted to ..." are claims.
++_BOUNDARY = frozenset({",", ":", "—", "–", "(", "so", "and", "but", "then", "after", "before", "because", "which",
++                       "while", "that"})
++_WORD = re.compile(r"[\w’']+|[,:—–(]")
+ _TASK_ID = re.compile(r"\bt_[0-9a-f]{8}(?:[0-9a-f]{8})?\b")
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_consent_provenance.py b/tests/hermes_cli/test_kanban_consent_provenance.py
+index 3bc78321b4..ec4a2d742b 100644
+--- a/tests/hermes_cli/test_kanban_consent_provenance.py
++++ b/tests/hermes_cli/test_kanban_consent_provenance.py
+@@ -272,6 +272,27 @@ def test_home_executor_refuses_when_creation_provenance_never_syncs(fleet, monke
+     assert not f.h.execute("SELECT 1 FROM task_comments WHERE task_id=?", (f.target,)).fetchone()
+ 
+ 
++def test_unsynced_caller_defers_only_its_own_call(fleet, monkeypatch, tmp_path):
++    """One caller's sync lag must not hold back a later call on the board; its own call still fails closed."""
++    from hermes_cli import kanban_consent as consent
++    f = fleet
++    caller, rid = _stopped_home_call(f, monkeypatch, tmp_path, "lagging")
++    _hide_created(f, monkeypatch, caller)
++    later = helpers._submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "second"})
++    helpers._round(f)
++    bodies = [r[0] for r in f.h.execute("SELECT body FROM task_comments WHERE task_id=?", (f.target,))]
++    assert bodies == ["second"], "the synced caller's call waited behind the unsynced one"
++    assert requests.get_request(f.w, later["request_id"])["result"][0]["outcome"] == "applied"
++    assert requests.get_request(f.w, rid)["status"] != "done", "the unsynced call was not deferred"
++    # The deferred call is retried on a later tick (same watermark) and refused once the grace has passed.
++    monkeypatch.setattr(consent, "CREATION_SYNC_GRACE_S", -1)
++    helpers._round(f)
++    request = requests.get_request(f.w, rid)
++    assert request["result"][0]["outcome"] == "refused", request
++    assert "consent_unproven" in request["result"][0]["detail"]
++    assert [r[0] for r in f.h.execute("SELECT body FROM task_comments WHERE task_id=?", (f.target,))] == ["second"]
++
++
+ def test_submitting_session_stop_is_enforced_and_inherited(fleet, monkeypatch, tmp_path):
+     """A worker run's own timed-out approval binds its submissions and the cards it creates."""
+     from gateway.session_context import scoped_current_session_id
+diff --git a/tests/hermes_cli/test_kanban_operator_delivery.py b/tests/hermes_cli/test_kanban_operator_delivery.py
+index e6271cf609..40bf66b637 100644
+--- a/tests/hermes_cli/test_kanban_operator_delivery.py
++++ b/tests/hermes_cli/test_kanban_operator_delivery.py
+@@ -269,6 +269,15 @@ def test_negation_outside_the_claim_verb_still_needs_a_receipt(fleet, summary):
+     ("No probes were found, so nothing was commented on t_0123456789abcdef.", False),
+     ("Ship filed no card, so I posted both IDs on t_0123456789abcdef.", True),
+     ("Posted to t_0123456789abcdef; no errors.", True),
++    # ':' / dashes / '(' end the governing span like a comma does.
++    ("No longer pending: posted to t_0123456789abcdef.", True),
++    ("No longer pending — posted to t_0123456789abcdef.", True),
++    ("No longer pending – posted to t_0123456789abcdef.", True),
++    ("Was pending (posted to t_0123456789abcdef since).", True),
++    ("Comment to t_0123456789abcdef: not posted.", False),
++    ("Comment to t_0123456789abcdef: queued.", False),
++    ("Comment to t_0123456789abcdef — failed and was not sent.", False),
++    ("Comment to t_0123456789abcdef (not posted).", False),
+ ])
+ def test_claimed_targets_scopes_negation_to_the_verb(text, claimed):
+     from hermes_cli.kanban_operator_delivery import claimed_targets
+-- 
+2.51.0
+

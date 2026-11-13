@@ -1,0 +1,256 @@
+From c20e84e937fc873ef1dab4b3cbecca98cb6a4c6c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 19:58:37 +0000
+Subject: [PATCH] [daveey] fix(sessions): refresh outcomes when remote cards
+ change
+
+---
+ .../tui_gateway/test_remote_card_outcomes.py  | 149 ++++++++++++++++++
+ tui_gateway/notice_fanout.py                  |  52 ++++++
+ 2 files changed, 201 insertions(+)
+ create mode 100644 tests/tui_gateway/test_remote_card_outcomes.py
+
+diff --git a/tests/tui_gateway/test_remote_card_outcomes.py b/tests/tui_gateway/test_remote_card_outcomes.py
+new file mode 100644
+index 0000000000..4dcabc9126
+--- /dev/null
++++ b/tests/tui_gateway/test_remote_card_outcomes.py
+@@ -0,0 +1,149 @@
++"""Remote-only card changes refresh authoritative stored chat outcomes."""
++import pytest
++
++import hermes_state_outcome as so
++from hermes_cli import kanban_session_activity as ksa
++from tests.tui_gateway import test_session_outcome_notices as helpers
++from tui_gateway import notice_fanout as nf
++
++db = helpers.db
++CHAT = helpers.CHAT
++
++
++@pytest.fixture
++def remote(monkeypatch):
++    rows = []
++    def read(ids, statuses, stale_ok):
++        assert stale_ok is True
++        assert statuses == ksa.LISTED_STATUSES
++        return list(rows)
++    monkeypatch.setattr(ksa, "_remote_cards", read)
++    return rows
++
++
++def card(chat=CHAT, status="running"):
++    return {"key": "worker/default/t_remote", "id": "t_remote", "board": "default",
++            "gateway": "worker", "session": chat, "status": status, "title": "remote work"}
++
++
++def run(db):
++    return nf.card_change_pass(session_db=helpers._opener(db), slugs=[])
++
++
++def test_remote_appears_changes_and_finishes(db, remote):
++    assert so.refresh_outcome(CHAT, "manual", db=db)["kind"] == "done"
++    assert run(db) == []
++    remote.append(card())
++    assert len(run(db)) == 1
++    assert so.get_outcome(CHAT, db=db)["kind"] == "waiting"
++    assert run(db) == []
++    remote[0]["status"] = "scheduled"
++    assert len(run(db)) == 1
++    assert so.get_outcome(CHAT, db=db)["on"][0]["state"] == "scheduled"
++    remote.clear()
++    assert len(run(db)) == 1
++    assert so.get_outcome(CHAT, db=db)["kind"] == "done"
++
++
++def test_first_pass_seeds_only(db, remote, monkeypatch, caplog):
++    remote.append(card())
++    monkeypatch.setattr(so, "refresh_outcomes_quietly", lambda *a, **k: pytest.fail("unexpected refresh"))
++    assert run(db) == []
++    assert run(db) == []
++    assert "remote card-change outcome pass failed" not in caplog.text
++
++
++def test_failed_read_preserves_snapshot(db, remote, monkeypatch):
++    remote.append(card())
++    run(db)
++    with monkeypatch.context() as patch:
++        def fail(*a, **k):
++            raise OSError("replica unavailable")
++        patch.setattr(ksa, "_remote_cards", fail)
++        patch.setattr(so, "refresh_outcomes_quietly", lambda *a, **k: pytest.fail("failed read refreshed"))
++        assert run(db) == []
++    remote.clear()
++    assert len(run(db)) == 1
++
++
++@pytest.mark.parametrize("how", ["archived", "moved"])
++def test_skipped_chat_not_refreshed(db, remote, monkeypatch, how):
++    run(db)
++    if how == "archived":
++        db.set_session_archived(CHAT, True)
++    else:
++        db.end_session(CHAT, "moved_to_gateway:elsewhere")
++    monkeypatch.setattr(so, "refresh_outcomes_quietly", lambda *a, **k: pytest.fail("unexpected refresh"))
++    remote.append(card())
++    assert [r["skipped"] for r in run(db)] == [how]
++
++
++def test_missing_chat_and_unlisted_cards(db, remote):
++    run(db)
++    remote.extend([card("absent"), card(status="done"), card(status="unknown"),
++                   {**card(status="done"), "unfinished": True}])
++    assert run(db) == []
++
++
++def test_unknown_unfinished_and_compression_tip(db, remote, monkeypatch):
++    run(db)
++    remote.append({**card(status="unknown"), "unfinished": True})
++    seen = []
++    monkeypatch.setattr(so, "refresh_outcomes_quietly", lambda ids, trigger, **kw: (seen.append((ids, trigger, kw)) or 1))
++    monkeypatch.setattr(db, "get_compression_tip", lambda sid: "compressed-tip")
++    assert len(run(db)) == 1
++    assert seen == [(["compressed-tip"], "card_change", {"db": db})]
++
++
++@pytest.mark.parametrize("failure", ["read", "write", "missing"])
++def test_failed_chat_retries_unchanged_projection(db, remote, monkeypatch, failure):
++    so.refresh_outcome(CHAT, "manual", db=db)
++    run(db)
++    remote.append(card())
++    with monkeypatch.context() as patch:
++        if failure == "read":
++            def fail(*a):
++                raise OSError("temporary session read")
++            patch.setattr(nf, "chat_skip_reason", fail)
++        elif failure == "write":
++            patch.setattr(so, "refresh_outcomes_quietly", lambda *a, **k: 0)
++        else:
++            patch.setattr(db, "get_session", lambda *a: None)
++        assert run(db) == []
++    assert so.get_outcome(CHAT, db=db)["kind"] == "done"
++    assert len(run(db)) == 1
++    assert so.get_outcome(CHAT, db=db)["kind"] == "waiting"
++    assert run(db) == []
++    remote.clear()
++    with monkeypatch.context() as patch:
++        patch.setattr(so, "refresh_outcomes_quietly", lambda *a, **k: 0)
++        assert run(db) == []
++    assert len(run(db)) == 1
++    assert so.get_outcome(CHAT, db=db)["kind"] == "done"
++    assert run(db) == []
++
++
++def test_failed_first_chat_does_not_starve_later_chat(db, remote, monkeypatch):
++    run(db)
++    remote.extend([card("000-failing"), card()])
++    original = nf.chat_skip_reason
++    def skip(db, chat):
++        if chat == "000-failing":
++            raise OSError("temporary session read")
++        return original(db, chat)
++    from contextlib import contextmanager
++    @contextmanager
++    def opener(chat):
++        yield db, chat
++    monkeypatch.setattr(nf, "chat_skip_reason", skip)
++    rows = nf.card_change_pass(session_db=opener, slugs=[])
++    assert [r["chat_id"] for r in rows] == [CHAT]
++    assert so.get_outcome(CHAT, db=db)["kind"] == "waiting"
++
++
++def test_origin_alias_and_duplicate_rows_refresh_once(db, remote):
++    run(db)
++    row = {**card("absent"), "origin_session": CHAT}
++    remote.extend([row, dict(row)])
++    assert len(run(db)) == 1
++    assert so.get_outcome(CHAT, db=db)["kind"] == "waiting"
+diff --git a/tui_gateway/notice_fanout.py b/tui_gateway/notice_fanout.py
+index 3c70a372e7..f4c68d3844 100644
+--- a/tui_gateway/notice_fanout.py
++++ b/tui_gateway/notice_fanout.py
+@@ -14,6 +14,10 @@ Session-outcome contract, "Fan-out" and "Stale notices":
+   chat's stored outcome (trigger ``card_change``). The first pass of a process only seeds its cursor; the other
+   refresh points (turn end, notice write, reap) cover what changed while no backend ran. Every step is
+   idempotent, so two backends running the pass at once write the same result.
++- Remote links have no local events. Each pass also snapshots the shared remote-card projection by chat and
++  (owner-qualified key, status). The first successful read seeds it; additions, removals and status changes
++  refresh the affected chats once each. A failed read preserves the previous snapshot. This refresh does not
++  synthesize notices or change their stale metadata; normal remote notice delivery owns those rows.
+ """
+ 
+ from __future__ import annotations
+@@ -40,10 +44,13 @@ MAX_EVENTS_PER_PASS = 2000
+ _BLOCKED_LINE = re.compile(r"Kanban (t_[0-9A-Za-z_]+) blocked")
+ _TASK_ID = re.compile(r"Kanban (t_[0-9A-Za-z_]+)")
+ _cursors: dict[str, int] = {}
++_remote_snapshot: Optional[dict[str, frozenset[tuple[str, str]]]] = None
+ 
+ 
+ def _reset_for_tests() -> None:
++    global _remote_snapshot
+     _cursors.clear()
++    _remote_snapshot = None
+ 
+ 
+ def chat_skip_reason(db: Any, chat_id: str) -> Optional[str]:
+@@ -188,6 +195,47 @@ def _fan_out_change(conn: sqlite3.Connection, _kb: Any, session_db: Callable, sl
+     return out
+ 
+ 
++def _remote_change_pass(session_db: Callable) -> list[dict]:
++    """Observe the same remote projection as outcomes; failed reads never mean cards finished."""
++    from hermes_cli import kanban_session_activity as activity
++    from hermes_state_outcome import refresh_outcomes_quietly
++    global _remote_snapshot
++    current: dict[str, set[tuple[str, str]]] = {}
++    for card in activity._remote_cards(None, activity.LISTED_STATUSES, stale_ok=True):
++        status = card.get("status")
++        if status not in activity.LISTED_STATUSES and not (status == "unknown" and card.get("unfinished")):
++            continue
++        for chat in {card.get("session"), card.get("origin_session")} - {None, ""}:
++            current.setdefault(chat, set()).add((card["key"], status))
++    snapshot = {chat: frozenset(cards) for chat, cards in current.items()}
++    previous = _remote_snapshot
++    if previous is None:
++        _remote_snapshot = snapshot
++        return []
++    out = []
++    for chat in sorted(previous.keys() | snapshot.keys()):
++        if previous.get(chat) == snapshot.get(chat):
++            continue
++        try:
++            with session_db(chat) as (db, tip):
++                if db is None:
++                    continue
++                skipped = chat_skip_reason(db, chat)
++                if skipped is None and not refresh_outcomes_quietly([tip], "card_change", db=db):
++                    continue
++        except Exception:  # health: allow BLE001 -- retain failed chat invalidations and continue other chats
++            logger.warning("remote card-change outcome failed for chat %s", chat, exc_info=True)
++            continue
++        # Acknowledge only a successful refresh or an intentionally skipped chat.
++        if chat in snapshot:
++            previous[chat] = snapshot[chat]
++        else:
++            previous.pop(chat, None)
++        out.append({"board": None, "task_id": None, "chat_id": chat, "session_id": tip,
++                    "status": None, "skipped": skipped, "source": "remote"})
++    return out
++
++
+ def card_change_pass(*, session_db: Optional[Callable] = None, slugs: Optional[Iterable[str]] = None) -> list[dict]:
+     """Refresh every chat linked to a card whose status moved since the last pass (see module doc). Never
+     raises; returns ``[{board, task_id, chat_id, session_id, status, skipped}]``."""
+@@ -204,4 +252,8 @@ def card_change_pass(*, session_db: Optional[Callable] = None, slugs: Optional[I
+                     done += _fan_out_change(conn, _kb, session_db, slug, tid)
+         except Exception:
+             logger.warning("card-change outcome pass failed on board %s", slug, exc_info=True)
++    try:
++        done += _remote_change_pass(session_db)
++    except Exception:  # health: allow BLE001 -- isolate the replica source and report failed reads
++        logger.warning("remote card-change outcome pass failed", exc_info=True)
+     return done
+-- 
+2.51.0
+

@@ -1,0 +1,291 @@
+From e7319e41d1bcc32b94bebbacce5d2b9ea65ed55e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:17:41 +0000
+Subject: [PATCH] [daveey] kanban: hub-cpu-alert uses the pre-lease advisory's
+ 10 s limit; PR #1856 review nits
+
+The pre-lease advisory (hub_cpu_advisory) defers every claim on a sample older than
+10 s, but kanban_hub_cpu_alert still called a sample fresh up to the locked gate's
+15 s: a sampler stuck 10-15 s behind started nothing on the hub and never filed the
+hub-cpu-advisory-stale card. Both now read kanban_admission.PRELEASE_MAX_AGE_MS
+(RED first: a 12 s-old sample must trip the alert).
+
+Review nits from #1856 (reviews 5885991227, 5886827276):
+- hub_cpu_advisory docstring: stale is >10 s, not >15 s.
+- _final_hub_gate docstring: back-to-back local claims in one sampler period share one
+  pre-claim sample (only the max_in_progress census protects CPU between them); the
+  independent re-sample was dropped deliberately (it overran the 2.25 s hold in the
+  GIL-busy gateway -> hub_cpu_unknown after the lease).
+- the waiting-turn comment no longer mentions a ~1 s sample.
+- dispatch skip words: a claim_deferred detail from this host's admission gate
+  (hub_cpu_*, hub_admission_overrun, hub_capacity_full) says "this host's admission
+  gate deferred its claim" instead of "the Board".
+- tests: limit_unknown stage covered; the contention test is renamed, its cm.sample
+  stub fails instead of advancing the clock and its bound allows one census
+  (HUB_BOARDS * 8); the sampler-read claim test's docstring matches what it runs.
+---
+ hermes_cli/kanban_admission.py                | 23 +++++++++-----
+ hermes_cli/kanban_dispatch_skip.py            |  9 ++++++
+ hermes_cli/kanban_hub_cpu_alert.py            |  6 ++--
+ .../test_hub_cpu_gate_contention.py           | 31 ++++++++++---------
+ tests/hermes_cli/test_kanban_dispatch_skip.py | 12 ++++++-
+ tests/hermes_cli/test_kanban_hub_admission.py |  4 +--
+ tests/hermes_cli/test_kanban_hub_cpu_alert.py | 15 +++++++--
+ 7 files changed, 71 insertions(+), 29 deletions(-)
+
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index 4042364922..d3a11809e1 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -24,6 +24,9 @@ ADVISORY_MAX_AGE_MS = 15_000  # the locked gate's freshness limit for the sample
+ # The pre-lease advisory wants this much more freshness, so the sample it accepts survives the Board lease round-trip
+ # and the txn wait inside ADVISORY_MAX_AGE_MS (the sampler rewrites it every 5 s: a healthy one is <= ~7 s old).
+ PRELEASE_HEADROOM_MS = 5_000
++# The pre-lease advisory's freshness limit (10 s): an older sample defers every claim here. Shared with the
++# stale-advisory alert (``kanban_hub_cpu_alert``), which must call a sample stale at the age the advisory defers.
++PRELEASE_MAX_AGE_MS = ADVISORY_MAX_AGE_MS - PRELEASE_HEADROOM_MS
+ OVERRUN = "hub_admission_overrun"
+ _consumed = threading.local()
+ _decision = threading.local()  # the last cap count this thread's final gate read (refusal log / claimed event)
+@@ -43,11 +46,11 @@ def _defer(task_id, reason):
+ def hub_cpu_advisory(task_id=None, *, conn=None):
+     """Lock-free pre-check before a Board lease (review ruling 5). Returns a refusal reason or None.
+ 
+-    Off unless the root limit is set. Uses the advisory sampler's latest complete sample: missing, stale (>15 s),
++    Off unless the root limit is set. Uses the advisory sampler's latest complete sample: missing, stale (>10 s),
+     future or malformed reads as unknown and defers; a fresh value at or above the limit defers. Advisory only.
+-    Freshness here is ``ADVISORY_MAX_AGE_MS - PRELEASE_HEADROOM_MS`` (10 s): the locked gate re-reads the same
+-    file with the looser ``ADVISORY_MAX_AGE_MS``, so a sample accepted before the lease is not stale by the time the
+-    gate reads it."""
++    Freshness here is ``PRELEASE_MAX_AGE_MS`` (``ADVISORY_MAX_AGE_MS - PRELEASE_HEADROOM_MS``, 10 s): the locked
++    gate re-reads the same file with the looser ``ADVISORY_MAX_AGE_MS``, so a sample accepted before the lease is not
++    stale by the time the gate reads it."""
+     from hermes_cli import machine_cpu_metrics as cpu
+ 
+     from hermes_cli.worker_resource_admission import refusal
+@@ -72,7 +75,7 @@ def hub_cpu_advisory(task_id=None, *, conn=None):
+             except (OSError, ValueError, TypeError):
+                 _defer(task_id, reason)
+                 return reason
+-        last = sampler_sample(ADVISORY_MAX_AGE_MS - PRELEASE_HEADROOM_MS)
++        last = sampler_sample(PRELEASE_MAX_AGE_MS)
+         if last is not None:
+             if cpu.below(last["cpu_busy_pct"], limit):
+                 return None
+@@ -190,7 +193,13 @@ def _final_hub_gate(gate, started=None, claimant=None, *, conn=None, task_id=Non
+     recounted. ``started`` (monotonic, taken when admission.lock was acquired) enforces the designed hold: a gate that
+     overran ``CLAIM_MAX_HOLD_S`` minus the commit reserve (a slow board scan in a GIL-starved process, a stall) refuses
+     as ``hub_admission_overrun`` instead of committing, so a waiting turn's BUSY_WAIT_S budget is never outlasted by an
+-    admitted claim (final review N1). The overrun is not a CPU reading and is never reported as one."""
++    admitted claim (final review N1). The overrun is not a CPU reading and is never reported as one.
++
++    Back-to-back local claims inside one sampler period (~5 s) read the same pre-claim sample, which cannot show the
++    CPU the first claim's worker is about to use: between them only the ``max_in_progress`` census (it counts the
++    committed run) protects the host. The gate's own independent re-sample was dropped deliberately: in the GIL-busy
++    hub gateway census + ~1 s sample + recount overran the 2.25 s hold on every claim, after the lease was granted,
++    and every claim deferred as ``hub_cpu_unknown`` (2026-11-13, t_01a1d2e5c4899f40)."""
+     from hermes_cli import machine_cpu_metrics as cpu
+ 
+     echo = getattr(gate, "echo", None)
+@@ -427,7 +436,7 @@ def claim_transaction(conn, *, task_id=None, gate=None):
+                 return
+             if waiting:
+                 # [daveey] A chat/notification/review turn is waiting out this lock: claims retry next tick, turns
+-                # cannot, so the claim yields before its ~1 s sample (review F1).
++                # cannot, so the claim yields before the locked gate's census (review F1).
+                 logging.getLogger(__name__).info("A turn is waiting for update admission; deferring Kanban claim")
+                 yield False
+                 return
+diff --git a/hermes_cli/kanban_dispatch_skip.py b/hermes_cli/kanban_dispatch_skip.py
+index 07f5a36fb2..086c78a40d 100644
+--- a/hermes_cli/kanban_dispatch_skip.py
++++ b/hermes_cli/kanban_dispatch_skip.py
+@@ -294,11 +294,20 @@ _WORDS = {
+ }
+ 
+ 
++def _local_gate(detail: Any) -> bool:
++    """A ``claim_deferred`` detail set by this host's own admission gate (``kanban_admission``: the hub CPU checks,
++    the hold overrun, the whole-host cap), not by the Board service."""
++    return isinstance(detail, str) and (detail.startswith("hub_cpu_")
++                                        or detail in ("hub_admission_overrun", "hub_capacity_full"))
++
++
+ def words(skip: dict[str, Any], *, now: Optional[float] = None) -> str:
+     """The skip as one clause, e.g. ``held: pinned model claude-opus-5-5 (anthropic) quota-walled until 01:59Z``."""
+     reason = str(skip.get("reason") or "unknown")
+     detail = skip.get("detail") or "no detail"
+     text = _WORDS.get(reason, "skipped: {reason} ({detail})").format(reason=reason, detail=detail)
++    if reason == "claim_deferred" and _local_gate(detail):
++        text = f"skipped: this host's admission gate deferred its claim ({detail})"
+     if skip.get("until"):
+         text += f" until {_stamp(skip['until'], now)}"
+         if _wall_passed(skip, now):
+diff --git a/hermes_cli/kanban_hub_cpu_alert.py b/hermes_cli/kanban_hub_cpu_alert.py
+index e7ce6d35d7..6f4c79ac9e 100644
+--- a/hermes_cli/kanban_hub_cpu_alert.py
++++ b/hermes_cli/kanban_hub_cpu_alert.py
+@@ -1,7 +1,9 @@
+ """One Kanban card when the hub CPU advisory goes stale while the root CPU limit is on. [daveey]
+ 
+ With ``kanban.admission.cpu_busy_below_pct`` set, every claim on this host first reads the advisory sample
+-(``kanban_admission.hub_cpu_advisory``); a sample older than 15 s defers the claim as ``hub_cpu_unknown``. On
++(``kanban_admission.hub_cpu_advisory``); a sample older than 10 s (``PRELEASE_MAX_AGE_MS``) defers the claim as
++``hub_cpu_unknown``, so this alert calls a sample stale at that same age (the locked gate's looser 15 s would let a
++sampler stuck 10-15 s behind defer every claim with no card). On
+ 2026-11-12 every sample was dropped for four minutes and the hub claimed nothing with all slots free, and the only
+ signal was the dispatcher's "stuck" log line. Now the dispatcher calls :func:`check` once per tick: once the
+ advisory has been unusable for :data:`STALE_FOR_S` of this process's own observation (a gateway that just started
+@@ -61,7 +63,7 @@ def _check(mono, wall, state: _Incident, file_fn) -> Optional[str]:
+         state.stale_since, state.filed = None, False
+         return None
+     age = _sample_age_s(wall())
+-    if age is not None and age * 1000 <= ka.ADVISORY_MAX_AGE_MS:
++    if age is not None and age * 1000 <= ka.PRELEASE_MAX_AGE_MS:
+         state.stale_since, state.filed = None, False  # fresh: the incident (if any) is over
+         return None
+     now = mono()
+diff --git a/tests/hermes_cli/test_hub_cpu_gate_contention.py b/tests/hermes_cli/test_hub_cpu_gate_contention.py
+index 2a39f9cc53..6c0ca3b651 100644
+--- a/tests/hermes_cli/test_hub_cpu_gate_contention.py
++++ b/tests/hermes_cli/test_hub_cpu_gate_contention.py
+@@ -2,8 +2,9 @@
+ 
+ Inside the gateway every ``sqlite3`` call releases the GIL and has to win it back from busy Python threads (the Kanban
+ sync loop, the event loop); under that contention each handoff costs about one switch interval (5 ms). The final gate
+-runs the whole-host census twice under ``admission.lock`` (cap check before the ~1 s sample, recount after it), inside
+-a 2.25 s hold. A census that iterates ``PRAGMA table_info`` and row-by-row cursors makes ~80 handoffs per board, so on
++ran the whole-host census twice under ``admission.lock`` (cap check before a ~1 s sample, recount after it), inside
++a 2.25 s hold; it now runs one census and re-reads the sampler's sample. A census that iterates ``PRAGMA table_info``
++and row-by-row cursors makes ~80 handoffs per board, so on
+ the hub (10 boards) it took ~4 s (7 s measured with one busy thread) and every hub claim was refused before sampling
+ as ``hub_cpu_unknown`` from 2026-11-13 02:03Z. The model below charges one switch interval per sqlite call/row step
+ on a virtual clock, so the test is deterministic and fast.
+@@ -119,27 +120,20 @@ def _hub_boards(conn, home, *, cap=20, synced=False):
+                     other.execute("UPDATE tasks SET status='running', lease_holder='worker-9' WHERE id=?", (foreign,))
+ 
+ 
+-def _sample_taking(clock, window_s=1.0, pct=10.0):
+-    def sample(*a, **k):
+-        clock.offset += window_s
+-        return {"cpu_busy_pct": pct, "cpu_busy_window_ms": round(window_s * 1000),
+-                "cpu_busy_sample_end_ms": int(time.time() * 1000)}
+-    return sample
+-
+-
+ @pytest.mark.parametrize("synced", [True, False])
+ @pytest.mark.parametrize("review", [False, True])
+-def test_contended_census_leaves_the_sample_room_inside_the_hold(board, monkeypatch, review, synced):
+-    """RED before the fix: ~80 handoffs per board x 10 boards ~ 4 s refused every claim before sampling."""
++def test_contended_census_fits_inside_the_hold(board, monkeypatch, review, synced):
++    """RED before the census fix: ~80 handoffs per board x 10 boards ~ 4 s overran the hold on every claim. The gate
++    now runs one census and re-reads the sampler's sample (never samples), so the claim commits inside 2.25 s."""
+     conn, home = board
+     _hub_boards(conn, home, synced=synced)
+     t = task(conn, review)
+     clock = _contended(monkeypatch, sys.getswitchinterval())
+-    monkeypatch.setattr(cm, "sample", _sample_taking(clock))
++    monkeypatch.setattr(cm, "sample", lambda *a, **k: pytest.fail("the locked gate reads the sampler, never samples"))
+     claimed = claim(conn, t, review)
+     assert claimed is not None, (sync.pop_claim_deferral(t), clock.handoffs)
+-    # One census over 10 boards (the sampler's sample is re-read, not measured): a handful of sqlite calls per board.
+-    assert clock.handoffs <= 2 * HUB_BOARDS * 8, clock.handoffs
++    # One census over 10 boards: a handful of sqlite calls per board (a second census would double it).
++    assert clock.handoffs <= HUB_BOARDS * 8, clock.handoffs
+     payload = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='claimed' "
+                                       "ORDER BY id DESC", (t,)).fetchone()[0])
+     assert payload["hub_admission"]["pools"] == {"regular": HUB_BOARDS, "priority": 0}
+@@ -192,7 +186,14 @@ def _expires_during_census(mp):
+     mp.setattr(ka, "_expired", lambda gate: next(calls, True))
+ 
+ 
++def _limit_unreadable_at_the_lock(mp):
++    # The pre-lease advisory would refuse first with the same code; skip it so only the locked gate reads the limit.
++    mp.setattr(kb, "hub_cpu_advisory", lambda task_id=None, *, conn=None: None)
++    mp.setattr(cm, "root_limit", lambda *a, **k: (cm.UNKNOWN, None))
++
++
+ @pytest.mark.parametrize("reason,stage,setup", [
++    (ka.HUB_CPU_LIMIT_UNKNOWN, "limit_unknown", _limit_unreadable_at_the_lock),
+     # The pre-lease advisory passes a max age; only the locked gate's re-read (no argument) finds the sample gone.
+     (ka.HUB_CPU_SAMPLE_STALE, "sample_stale_or_missing", lambda mp: mp.setattr(
+         ka, "sampler_sample", lambda max_age_ms=None, _real=ka.sampler_sample:
+diff --git a/tests/hermes_cli/test_kanban_dispatch_skip.py b/tests/hermes_cli/test_kanban_dispatch_skip.py
+index ee7eaca61a..79b4c30981 100644
+--- a/tests/hermes_cli/test_kanban_dispatch_skip.py
++++ b/tests/hermes_cli/test_kanban_dispatch_skip.py
+@@ -309,11 +309,21 @@ def test_flapping_detail_over_40_ticks_keeps_two_rows_and_latest_tracks_the_curr
+             skips.record_tick(conn, _deferred(tid, detail))
+             assert skips.latest(conn, tid)["detail"] == detail, i
+             place = qp.position(conn, kb.get_task(conn, tid))
+-            assert f"the Board deferred its claim ({detail})" in qp.describe(place), i
++            who = "the Board" if detail == "capacity" else "this host's admission gate"
++            assert f"{who} deferred its claim ({detail})" in qp.describe(place), i
+             clock[0] += 10
+         assert [(p["reason"], p["detail"]) for p in _skips(conn, tid)] == [("claim_deferred", d) for d in FLAP]
+ 
+ 
++@pytest.mark.parametrize("detail,who", [
++    ("capacity", "the Board"), ("hub_cpu_unknown", "this host's admission gate"),
++    ("hub_cpu_sample_stale", "this host's admission gate"), ("hub_admission_overrun", "this host's admission gate"),
++    ("hub_capacity_full", "this host's admission gate"),
++])
++def test_claim_deferred_words_name_who_deferred_it(detail, who):
++    assert skips.words({"reason": "claim_deferred", "detail": detail}) == f"skipped: {who} deferred its claim ({detail})"
++
++
+ def test_latest_tracks_the_current_skip_after_the_episode_cap(board, monkeypatch):
+     clock = _clock(monkeypatch)
+     with kbc.connect() as conn:
+diff --git a/tests/hermes_cli/test_kanban_hub_admission.py b/tests/hermes_cli/test_kanban_hub_admission.py
+index 8ad89f54fb..a2d65bf98f 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission.py
++++ b/tests/hermes_cli/test_kanban_hub_admission.py
+@@ -997,8 +997,8 @@ def _lock_state(home):
+ 
+ def test_real_claim_reads_the_sampler_file_under_the_lock_and_holds_it_briefly(board, monkeypatch):
+     """Contract (replaces the 2026-11 independent ~1 s sample): the locked gate reads the sampler's own file while
+-    admission.lock is held, takes no /proc/stat sample, records that very triple on ``claimed``, and its hold is short
+-    enough that a chat/notification turn reserving the lock with BUSY_WAIT_S (3.0 s) is admitted well inside it."""
++    admission.lock is held, takes no /proc/stat sample, records that very triple on ``claimed``, and the whole claim
++    finishes in under ``BUSY_WAIT_S - WINDOW_S`` (1.75 s), so it no longer holds the lock for a ~1 s sample."""
+     from hermes_cli import backend_retirement
+ 
+     conn, home = board
+diff --git a/tests/hermes_cli/test_kanban_hub_cpu_alert.py b/tests/hermes_cli/test_kanban_hub_cpu_alert.py
+index b5968e6a1f..196379f9bf 100644
+--- a/tests/hermes_cli/test_kanban_hub_cpu_alert.py
++++ b/tests/hermes_cli/test_kanban_hub_cpu_alert.py
+@@ -84,16 +84,27 @@ def test_a_fresh_sample_ends_the_incident_and_resets_the_clock(home):
+     assert _cards() == []
+ 
+ 
+-def test_fresh_within_fifteen_seconds_never_files(home):
++def test_fresh_within_the_prelease_limit_never_files(home):
+     w = World(home)
+     for _ in range(20):
+         w.mono += 10
+         w.wall += 10
+-        w.sample(age_s=14)
++        w.sample(age_s=9)
+         assert w.tick() is None
+     assert _cards() == []
+ 
+ 
++def test_a_sample_stuck_twelve_seconds_old_trips_the_alert(home):
++    """The pre-lease advisory defers every claim on a sample older than 10 s, so a sampler stuck 10-15 s behind
++    starts nothing here: the alert must use the advisory's limit, not the locked gate's looser 15 s."""
++    w = World(home)
++    w.sample(age_s=12)
++    assert w.tick() is None
++    w.wall -= alert.STALE_FOR_S  # keep the sample 12 s old while the dispatcher observes for 60 s
++    tid = w.tick(alert.STALE_FOR_S)
++    assert tid is not None and "12 s old" in _cards()[0][3]
++
++
+ @pytest.mark.parametrize("gate", [(cpu.OFF, None), (cpu.UNKNOWN, None)])
+ def test_gate_not_on_never_files(home, monkeypatch, gate):
+     monkeypatch.setattr(cpu, "root_limit", lambda *a, **k: gate)
+-- 
+2.51.0
+

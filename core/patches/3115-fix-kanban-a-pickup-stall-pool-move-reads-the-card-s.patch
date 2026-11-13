@@ -1,0 +1,172 @@
+From 1e10ec3a90214e512c2a406773acbdf008476730 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 03:42:59 +0000
+Subject: [PATCH] fix(kanban): a pickup-stall pool move reads the card's skills
+ like the Board [daveey]
+
+The Board's requiredLabels reads task.skills through the same stringList as
+requires (unreadable -> task_metadata_invalid) and adds skill:<s> labels for a
+pool worker. scope_refusal read only requires, so a card with malformed or
+unattested skills still looked pool-eligible and an alarm pool move stalled.
+
+Refuse a pool:worker move when skills is present but not a JSON list of
+strings, and require skill:<s> from the pool worker. machine:<X> moves are
+unchanged. Follow-up to #1844's review nit (t_01a1d2f66de283de).
+---
+ hermes_cli/kanban_pickup_stall_repin.py       | 61 +++++++++++++------
+ .../test_kanban_pickup_stall_repin.py         | 37 +++++++++++
+ 2 files changed, 81 insertions(+), 17 deletions(-)
+
+diff --git a/hermes_cli/kanban_pickup_stall_repin.py b/hermes_cli/kanban_pickup_stall_repin.py
+index aeebf167a1..8290da10da 100644
+--- a/hermes_cli/kanban_pickup_stall_repin.py
++++ b/hermes_cli/kanban_pickup_stall_repin.py
+@@ -19,7 +19,8 @@ move would write:
+   (active, unheld, copies cards, carries the target's ``capability:<requires>`` and ``profile:<assignee>``, not
+   draining, seen recently, a free card slot); or exactly the pool queue ``[POOL_LABEL]``
+   (:data:`hermes_cli.kanban_placement.POOL_LABEL`) while some pool machine other than M is eligible now by the same
+-  rules (t_01a1d0214f3e63e8: ``machine:<pool worker>`` needs a ``host_reason`` (:mod:`hermes_cli.kanban_move_pool`)
++  rules plus the target's ``skill:<skills>`` (the Board's ``requiredLabels``) (t_01a1d0214f3e63e8:
++  ``machine:<pool worker>`` needs a ``host_reason`` (:mod:`hermes_cli.kanban_move_pool`)
+   that no alarm path passes, so with every eligible machine a pool worker the alarm could re-place nothing).
+ 
+ The move itself is the ordinary queued move (``kanban_move.move_queued``) with its own guards. Nothing here reads
+@@ -99,24 +100,44 @@ def _requires(target: Any) -> list:
+     return [r for r in requires if isinstance(r, str)] if isinstance(requires, list) else []
+ 
+ 
+-def malformed_requires(target: Any) -> Optional[str]:
+-    """Why the Board cannot read ``target``'s stored ``requires``, else None.
++def _stored(target: Any, col: str) -> Any:
++    """``target``'s stored ``col`` (NULL when the row has no such column, e.g. an older replica)."""
++    return target[col] if col in _cols(target) else None
++
+ 
+-    Mirrors the Board's ``stringList`` (worker_placement.ts): NULL is ``[]``; anything else must parse as a JSON list
+-    of strings, or the Board answers ``task_metadata_invalid`` and never pool-places the card. :func:`_requires` maps
+-    such a row to ``[]`` for the need, so this check is what keeps a pool move from looking eligible."""
++def _string_list(raw: Any) -> Optional[list]:
++    """The Board's ``stringList`` (worker_placement.ts): NULL is ``[]``; anything else must parse as a JSON list of
++    strings, else None (the Board then answers ``task_metadata_invalid`` and never pool-places the card)."""
+     import json
+-    raw = target["requires"]
+     if raw is None:
+-        return None
++        return []
+     try:
+         value = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+     except (TypeError, ValueError):
+-        value = None
+-    if isinstance(value, list) and all(isinstance(r, str) for r in value):
+         return None
+-    return (f"its stored requires {str(raw)[:80]!r} is not a JSON list of strings, so the Board's pool selection "
+-            "answers task_metadata_invalid; fix the card's requires or move it to one machine:<X>")
++    return value if isinstance(value, list) and all(isinstance(r, str) for r in value) else None
++
++
++def _malformed(target: Any, col: str) -> Optional[str]:
++    raw = _stored(target, col)
++    if _string_list(raw) is not None:
++        return None
++    return (f"its stored {col} {str(raw)[:80]!r} is not a JSON list of strings, so the Board's pool selection "
++            f"answers task_metadata_invalid; fix the card's {col} or move it to one machine:<X>")
++
++
++def malformed_requires(target: Any) -> Optional[str]:
++    """Why the Board cannot read ``target``'s stored ``requires`` (:func:`_string_list`), else None.
++
++    :func:`_requires` maps such a row to ``[]`` for the need, so this check is what keeps a pool move from looking
++    eligible."""
++    return _malformed(target, "requires")
++
++
++def malformed_skills(target: Any) -> Optional[str]:
++    """Why the Board cannot read ``target``'s stored ``skills``, else None: the Board's ``requiredLabels`` reads
++    ``skills`` through the same ``stringList`` (t_01a1d2f66de283de)."""
++    return _malformed(target, "skills")
+ 
+ 
+ def _need(target: Any) -> set:
+@@ -124,6 +145,12 @@ def _need(target: Any) -> set:
+     return {requirement_label(r) for r in _requires(target)} | {f"profile:{target['assignee']}"}
+ 
+ 
++def _pool_need(target: Any) -> set:
++    """:func:`_need` plus the ``skill:<s>`` labels the Board's ``requiredLabels`` adds for a pool worker, built
++    verbatim as the Board builds them. A machine:<X> move keeps :func:`_need`."""
++    return _need(target) | {f"skill:{s}" for s in (_string_list(_stored(target, "skills")) or [])}
++
++
+ def eligible_now(name: str, own: str, machines: Optional[Mapping[str, Mapping[str, Any]]], need: set,
+                  now_ms: int) -> Optional[str]:
+     """None when ``name`` may take a card off ``own`` now (``kanban_pickup_stall`` placement rules), else why not."""
+@@ -159,13 +186,13 @@ def scope_refusal(conn: sqlite3.Connection, alarm: Any, target: Any, runs_on: An
+     except ValueError as exc:
+         return str(exc)
+     if labels == [pool_label()]:
+-        # A worker may attest ssh access, but the Board's pool selection cannot place it, nor a requires it cannot
+-        # read (not a JSON list of strings): the card would sit in task_requirement_unsupported or
+-        # task_metadata_invalid instead of leaving the stalled machine.
++        # A worker may attest ssh access, but the Board's pool selection cannot place it, nor a requires or skills it
++        # cannot read (not a JSON list of strings): the card would sit in task_requirement_unsupported or
++        # task_metadata_invalid instead of leaving the stalled machine. A pool worker must also carry skill:<s>.
+         from hermes_cli.kanban_placement_coordination import board_refusal
+-        if why := malformed_requires(target) or board_refusal(_requires(target)):
++        if why := malformed_requires(target) or malformed_skills(target) or board_refusal(_requires(target)):
+             return f"{target['id']} cannot go to {pool_label()}: {why}"
+-        return pool_refusal(own, machines, _need(target), now_ms)
++        return pool_refusal(own, machines, _pool_need(target), now_ms)
+     if len(labels) != 1 or not labels[0].startswith("machine:"):
+         return f"runs_on must be exactly [\"{pool_label()}\"] or exactly one machine:<X> label"
+     name = labels[0].split(":", 1)[1]
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall_repin.py b/tests/hermes_cli/test_kanban_pickup_stall_repin.py
+index 88a38445b6..e3c327e4fb 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall_repin.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall_repin.py
+@@ -266,6 +266,43 @@ def test_a_requires_the_board_reads_still_takes_the_pool_queue(board, stored):
+     assert board.why(runs_on=[POOL], machines=machines) is None
+ 
+ 
++@pytest.mark.parametrize("stored", ['{"a":1}', '"kanban-worker"', '["kanban-worker", 3]', "null", "not json"])
++def test_skills_the_board_cannot_read_refuse_the_pool_queue_only(board, stored):
++    """t_01a1d2f66de283de: the Board's ``requiredLabels`` reads ``skills`` through the same ``stringList`` as
++    ``requires`` and answers ``task_metadata_invalid`` for a row it cannot read, so a pool move would stall. A move to
++    one machine is unchanged."""
++    board.set(board.target, skills=stored)
++    why = board.why(runs_on=[POOL], machines=_pooled())
++    assert why is not None and "task_metadata_invalid" in why and "stored skills" in why, why
++    assert board.why(machines=_pooled()) is None  # machine:<X> still moves
++
++
++def test_the_pool_queue_needs_the_cards_skill_labels(board):
++    """t_01a1d2f66de283de: the Board's ``requiredLabels`` adds ``skill:<s>``; a pool worker without it never takes the
++    card, so the pool move is refused until one attests it. A move to one machine does not need the skill label."""
++    board.set(board.target, skills=json.dumps(["kanban-worker", "github"]))
++    why = board.why(runs_on=[POOL], machines=_pooled())
++    assert why is not None and "skill:kanban-worker" in why and "skill:github" in why, why
++    partial = _pooled(worker_2={"labels": [*_worker(X)["labels"], POOL, "skill:kanban-worker"]})
++    assert board.why(runs_on=[POOL], machines=partial) is not None
++    full = _pooled(worker_2={"labels": [*_worker(X)["labels"], POOL, "skill:kanban-worker", "skill:github"]})
++    assert board.why(runs_on=[POOL], machines=full) is None
++    assert board.why(machines=_pooled()) is None  # machine:<X> unchanged
++
++
++@pytest.mark.parametrize("stored", [None, "[]"])
++def test_no_skills_still_takes_the_pool_queue(board, stored):
++    board.set(board.target, skills=stored)
++    assert board.why(runs_on=[POOL], machines=_pooled()) is None
++
++
++def test_a_row_without_a_skills_column_reads_as_no_skills():
++    """An older replica row has no ``skills`` column: NULL, as the Board reads a missing value."""
++    row = {"requires": None, "assignee": "default"}
++    assert rp.malformed_skills(row) is None
++    assert rp._pool_need(row) == rp._need(row) == {"profile:default"}
++
++
+ @pytest.mark.parametrize("name, label", [("hub:write", "capability:hub-write"), ("hub:read", "capability:hub-read"),
+                                          ("ssh:mbp", "capability:ssh-mbp"), ("ssh:mini", "capability:ssh-mini"),
+                                          ("terminal", "capability:terminal")])
+-- 
+2.51.0
+

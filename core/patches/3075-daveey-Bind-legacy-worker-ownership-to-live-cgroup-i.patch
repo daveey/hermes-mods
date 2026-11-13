@@ -1,0 +1,691 @@
+From af3aeb1b29cdf8d2d6c4b25c17508ce2800bb51d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:23:19 +0000
+Subject: [PATCH] [daveey] Bind legacy worker ownership to live cgroup identity
+
+---
+ docs/worker-compute-capacity.md               |  21 ++
+ hermes_cli/worker_account_boards.py           |   5 +
+ hermes_cli/worker_compute_capacity.py         |  19 +-
+ hermes_cli/worker_legacy_scopes.py            | 200 ++++++++++++
+ hermes_cli/worker_resource_admission.py       |   8 +-
+ .../hermes_cli/test_worker_account_boards.py  |  20 +-
+ tests/hermes_cli/test_worker_legacy_scopes.py | 297 ++++++++++++++++++
+ 7 files changed, 563 insertions(+), 7 deletions(-)
+ create mode 100644 hermes_cli/worker_legacy_scopes.py
+ create mode 100644 tests/hermes_cli/test_worker_legacy_scopes.py
+
+diff --git a/docs/worker-compute-capacity.md b/docs/worker-compute-capacity.md
+index 8a237a0567..dafe77bffa 100644
+--- a/docs/worker-compute-capacity.md
++++ b/docs/worker-compute-capacity.md
+@@ -59,6 +59,27 @@ at the cap when its populated slice already reserves that slot. A new owner must
+ fit. Load pressure still refuses both kinds of claim. Existing slug-based owner
+ maps and legacy flat scopes require explicit rollout migration before enabling.
+ 
++After independently confirming the exact execution DB/task provenance and setting
++and reading back each surviving flat scope's CPU quota (at most two cores) and
++CPUWeight (at most 10), register it with:
++
++```
++python -m hermes_cli.worker_legacy_scopes register --scope old.scope --database /absolute/kanban.db --task t_id
++```
++
++Registration takes admission fences, verifies the task exists (including parked
++or terminal owners with surviving jobs), and binds the scope to its boot ID and
++cgroup device/inode. It does not infer provenance from a name, move processes,
++change their quotas, or signal them. Census resolves this binding inside the
++identity-fenced population sample; replacement during the sample refuses it.
++Unmapped or recreated scopes remain separate unknown reservations. Corrupt records
++for existing scopes fail closed. Multiple verified jobs of one owner reserve one
++slot, as for managed slices, but legacy flat scopes have **individual** two-core
++limits, not a shared per-card two-core limit. The aggregate pool and user backstop
++must cover all of them before enabling; report this transitional limitation until
++legacy jobs drain. Jobs outside the pool need separate explicit containment and
++readback and are not made accounted-for by this command.
++
+ ## Pressure contention
+ 
+ Hysteresis writers wait up to 250 ms for the pressure lock, then refuse as unknown.
+diff --git a/hermes_cli/worker_account_boards.py b/hermes_cli/worker_account_boards.py
+index b3302c1312..136d6ba52a 100644
+--- a/hermes_cli/worker_account_boards.py
++++ b/hermes_cli/worker_account_boards.py
+@@ -42,6 +42,11 @@ def register(conn) -> None:
+         os.fsync(handle.fileno())
+     try:
+         os.replace(temporary, destination)
++        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
++        try:
++            os.fsync(fd)
++        finally:
++            os.close(fd)
+     finally:
+         temporary.unlink(missing_ok=True)
+ 
+diff --git a/hermes_cli/worker_compute_capacity.py b/hermes_cli/worker_compute_capacity.py
+index 43b7976186..4b62cc1247 100644
+--- a/hermes_cli/worker_compute_capacity.py
++++ b/hermes_cli/worker_compute_capacity.py
+@@ -91,22 +91,35 @@ def owner_slice(board: str, task: str) -> str:
+     return f"hermes-kanban-{digest}.slice"
+ 
+ 
+-def occupied_owners(root: Path, owners: dict[str, Owner], active: set[Owner]) -> set[Owner]:
++def occupied_owners(root: Path, owners: dict[str, Owner], active: set[Owner], *,
++                    legacy_resolver=None) -> set[Owner]:
+     """Union active cards with populated child units, including unknown legacy jobs.
+ 
+     Read errors propagate: an incomplete inventory cannot prove free capacity.
+     cgroup.events populated includes descendants, unlike cgroup.procs.
+     """
++    import stat
+     occupied = set(active)
+     for child in root.iterdir():
+-        if not child.is_dir():
++        before = child.lstat()
++        if not stat.S_ISDIR(before.st_mode):
+             continue
++        owner = owners.get(child.name)
++        # Resolve against this sample's identity, never an earlier name census.
++        if owner is None and legacy_resolver is not None:
++            owner = legacy_resolver(root, child.name)
+         events = dict(line.split() for line in (child / 'cgroup.events').read_text(encoding='utf-8').splitlines())
++        try:
++            after = child.lstat()
++        except FileNotFoundError as exc:
++            raise ValueError(f'worker scope changed during census: {child.name}') from exc
++        if (before.st_dev, before.st_ino, before.st_mode) != (after.st_dev, after.st_ino, after.st_mode):
++            raise ValueError(f'worker scope changed during census: {child.name}')
+         populated = events.get('populated')
+         if populated not in {'0', '1'}:
+             raise ValueError(f'invalid populated observation for {child.name}')
+         if populated == '1':
+-            occupied.add(owners.get(child.name, ('unknown-cgroup', child.name)))
++            occupied.add(owner if owner is not None else ('unknown-cgroup', child.name))
+     return occupied
+ 
+ 
+diff --git a/hermes_cli/worker_legacy_scopes.py b/hermes_cli/worker_legacy_scopes.py
+new file mode 100644
+index 0000000000..7ba41b385d
+--- /dev/null
++++ b/hermes_cli/worker_legacy_scopes.py
+@@ -0,0 +1,200 @@
++"""Explicit ownership records for legacy flat worker scopes.
++
++Legacy jobs run in a flat child of the worker pool that carries no owner hash.
++Such a populated child stays an *unknown* reservation unless an operator binds
++it to (execution DB, task).  A record is bound to the live cgroup directory
++(st_dev, st_ino) and the boot ID, so a recreated or post-reboot scope of the
++same name never inherits the old owner; a stale record is simply ignored (the
++scope is then unknown again).  A record that is unreadable or malformed for a
++scope that currently exists raises, so admission fails closed.
++
++Registration never moves, signals or otherwise touches the job.
++"""
++from __future__ import annotations
++
++import contextlib
++import hashlib
++import json
++import os
++import re
++import sqlite3
++import tempfile
++from pathlib import Path
++
++from hermes_cli import worker_compute_capacity as capacity
++
++BOOT_ID_PATH = Path('/proc/sys/kernel/random/boot_id')
++MAX_CORES = 2
++MAX_WEIGHT = 10
++_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@:-]{0,200}\Z')
++_MANAGED = re.compile(r'hermes-kanban-[0-9a-f]{64}\.slice\Z')
++
++
++def boot_id() -> str:
++    value = BOOT_ID_PATH.read_text(encoding='utf-8').strip()
++    if not value:
++        raise ValueError('empty boot id')
++    return value
++
++
++def valid_scope_name(name) -> bool:
++    return (isinstance(name, str) and bool(_NAME.fullmatch(name)) and name not in {'.', '..'}
++            and not _MANAGED.fullmatch(name))
++
++
++def _directory() -> Path:
++    return capacity.policy_root() / 'worker-resources' / 'legacy-owners'
++
++
++def _record_path(name: str) -> Path:
++    return _directory() / (hashlib.sha256(name.encode()).hexdigest() + '.json')
++
++
++def _identity(path: Path) -> tuple[int, int]:
++    st = path.lstat()  # never follow a symlink out of the pool
++    import stat
++    if not stat.S_ISDIR(st.st_mode):
++        raise ValueError('legacy scope is not a directory')
++    return st.st_dev, st.st_ino
++
++
++def _parse(raw, name: str) -> dict:
++    keys = {'version', 'scope', 'owner', 'boot_id', 'dev', 'ino'}
++    if (not isinstance(raw, dict) or set(raw) != keys
++            or type(raw['version']) is not int or raw['version'] != 1 or raw['scope'] != name
++            or not isinstance(raw['owner'], list) or len(raw['owner']) != 2
++            or not all(isinstance(v, str) and v for v in raw['owner'])
++            or not Path(raw['owner'][0]).is_absolute()
++            or not isinstance(raw['boot_id'], str) or not raw['boot_id']
++            or any(type(raw[k]) is not int or raw[k] < 0 for k in ('dev', 'ino'))):
++        raise ValueError('invalid legacy worker owner record')
++    return raw
++
++
++def lookup(pool: Path, name: str):
++    """Owner for a live flat scope, None if unregistered/stale. Corrupt raises."""
++    if not valid_scope_name(name):
++        return None
++    try:
++        text = _record_path(name).read_text(encoding='utf-8')
++    except FileNotFoundError:
++        return None
++    record = _parse(json.loads(text), name)
++    try:
++        dev, ino = _identity(Path(pool) / name)
++    except FileNotFoundError:
++        return None  # disappeared: stale record must not block anything
++    if record['boot_id'] != boot_id() or (record['dev'], record['ino']) != (dev, ino):
++        return None  # recreated or rebooted: do not alias the old owner
++    return tuple(record['owner'])
++
++
++def owners_for_pool(pool: Path) -> dict[str, tuple[str, str]]:
++    """Map child name -> registered owner for populated-eligible flat children."""
++    owners = {}
++    try:
++        children = list(Path(pool).iterdir())
++    except FileNotFoundError:
++        return owners
++    for child in children:
++        if child.is_symlink() or not child.is_dir():
++            continue
++        owner = lookup(pool, child.name)
++        if owner is not None:
++            owners[child.name] = owner
++    return owners
++
++
++def _populated(path: Path) -> bool:
++    events = dict(line.split() for line in (path / 'cgroup.events').read_text(encoding='utf-8').splitlines())
++    if events.get('populated') not in {'0', '1'}:
++        raise ValueError('invalid populated observation')
++    return events['populated'] == '1'
++
++
++def register(scope: str, database, task: str, *, pool: Path | None = None, timeout: float = 0) -> dict:
++    """Bind a live populated legacy scope to (database, task) under the account fence."""
++    from hermes_cli.admission_fence import SUPPORTED, admission_lock
++    from hermes_constants import get_default_hermes_root
++
++    if not SUPPORTED:
++        raise ValueError('legacy scope registration requires admission fencing')
++    if not valid_scope_name(scope):
++        raise ValueError('invalid legacy scope name')
++    owner = capacity.owner_for_db(database, task)
++    if not Path(owner[0]).is_file():
++        raise ValueError('execution database does not exist')
++    pool = Path(capacity.pool_path() if pool is None else pool)
++    account = capacity.policy_root().resolve()
++    roots = list(dict.fromkeys([account, Path(get_default_hermes_root()).resolve()]))
++    with contextlib.ExitStack() as stack:
++        for root in roots:
++            stack.enter_context(admission_lock(root, timeout=timeout))
++        try:
++            with contextlib.closing(sqlite3.connect(Path(owner[0]).as_uri() + '?mode=ro', uri=True)) as conn:
++                if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tasks'").fetchone() is None:
++                    raise ValueError('execution database has no tasks table')
++                found = conn.execute('SELECT 1 FROM tasks WHERE id = ? COLLATE BINARY LIMIT 1', (task,)).fetchone()
++        except sqlite3.Error as exc:
++            raise ValueError('invalid execution database') from exc
++        if found is None:
++            raise ValueError('task does not exist in execution database')
++        path = pool / scope
++        if path.parent.resolve() != pool.resolve():
++            raise ValueError('legacy scope escapes the worker pool')
++        dev, ino = _identity(path)
++        if not _populated(path):
++            raise ValueError('legacy scope is not populated')
++        capacity._verify_quota(path, MAX_CORES)
++        if not 1 <= int((path / 'cpu.weight').read_text(encoding='utf-8')) <= MAX_WEIGHT:
++            raise ValueError('legacy scope CPU weight is missing or too high')
++        record = {'version': 1, 'scope': scope, 'owner': list(owner), 'boot_id': boot_id(),
++                  'dev': dev, 'ino': ino}
++        existing = None
++        with contextlib.suppress(FileNotFoundError):
++            existing = _parse(json.loads(_record_path(scope).read_text(encoding='utf-8')), scope)
++        if existing is not None and existing != record and lookup(pool, scope) is not None:
++            raise ValueError('legacy scope is already registered to another owner')
++        if _identity(path) != (dev, ino):
++            raise ValueError('legacy scope changed during registration')
++        directory = _directory()
++        directory.mkdir(parents=True, exist_ok=True)
++        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=directory, delete=False) as handle:
++            temporary = Path(handle.name)
++            json.dump(record, handle)
++            handle.flush()
++            os.fsync(handle.fileno())
++        try:
++            if _identity(path) != (dev, ino):
++                raise ValueError('legacy scope changed during registration')
++            os.replace(temporary, _record_path(scope))
++            fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
++            try:
++                os.fsync(fd)
++            finally:
++                os.close(fd)
++        finally:
++            temporary.unlink(missing_ok=True)
++        return record
++
++
++def main(argv=None) -> int:
++    import argparse
++    parser = argparse.ArgumentParser(prog='worker_legacy_scopes')
++    sub = parser.add_subparsers(dest='command', required=True)
++    reg = sub.add_parser('register', help='bind a live legacy flat scope to a task')
++    reg.add_argument('--scope', required=True)
++    reg.add_argument('--database', required=True)
++    reg.add_argument('--task', required=True)
++    args = parser.parse_args(argv)
++    try:
++        record = register(args.scope, args.database, args.task)
++    except Exception as exc:  # health: allow BLE001 -- CLI reports any refusal
++        print(f'refused: {exc}')
++        return 1
++    print(json.dumps(record))
++    return 0
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+diff --git a/hermes_cli/worker_resource_admission.py b/hermes_cli/worker_resource_admission.py
+index 781b780d15..a1a7c829fa 100644
+--- a/hermes_cli/worker_resource_admission.py
++++ b/hermes_cli/worker_resource_admission.py
+@@ -60,7 +60,7 @@ def _pressure(directory: Path) -> bool:
+         return held
+ 
+ 
+-def pool_occupancy(pool: Path, owners, active):
++def pool_occupancy(pool: Path, owners, active, *, legacy_resolver=None):
+     """A not-yet-started slice is empty, but a missing hierarchy is unknown.
+ 
+     Inspect the manager first after ENOENT, then retry the slice inventory;
+@@ -76,7 +76,7 @@ def pool_occupancy(pool: Path, owners, active):
+             pool.stat()
+         except FileNotFoundError:
+             return set(active)
+-    return capacity.occupied_owners(pool, owners, active)
++    return capacity.occupied_owners(pool, owners, active, legacy_resolver=legacy_resolver)
+ 
+ 
+ def occupied_count_for_host(echo=None, *, claimant=None) -> int | None:
+@@ -99,7 +99,9 @@ def occupied_count_for_host(echo=None, *, claimant=None) -> int | None:
+                     or capacity.owner_slice(*owner) != path.stem):
+                 raise ValueError('invalid worker owner map')
+             owners[path.stem] = tuple(owner)
+-    occupied = pool_occupancy(capacity.pool_path(), owners, active_owners)
++    from hermes_cli import worker_legacy_scopes
++    occupied = pool_occupancy(capacity.pool_path(), owners, active_owners,
++                              legacy_resolver=worker_legacy_scopes.lookup)
+     # A prospective resume in a populated slice does not take a second slot.
+     if claimant is not None:
+         occupied.add(claimant)
+diff --git a/tests/hermes_cli/test_worker_account_boards.py b/tests/hermes_cli/test_worker_account_boards.py
+index 5fd5f2b1f0..fc1ecaa5d5 100644
+--- a/tests/hermes_cli/test_worker_account_boards.py
++++ b/tests/hermes_cli/test_worker_account_boards.py
+@@ -25,7 +25,7 @@ def test_registered_foreign_board_counts_after_installation_changes(monkeypatch,
+         monkeypatch.setattr('hermes_cli.kanban_db_boards.named_board_db_files', list)
+         owners = set()
+         assert machine_metrics.active_card_runs(extra_paths=inventory.paths(), owner_output=owners) == 1
+-        assert owners == {('default', 't_foreign')}
++        assert owners == {(str(foreign.resolve()), 't_foreign')}
+         assert machine_metrics.active_card_runs(extra_paths=[foreign, foreign]) == 1
+     finally:
+         conn.close()
+@@ -44,6 +44,24 @@ def test_corrupt_inventory_fails_closed(monkeypatch, tmp_path, raw):
+         inventory.paths()
+ 
+ 
++def test_register_directory_fsync_failure_propagates(monkeypatch, tmp_path):
++    import os
++    import stat
++    monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path)
++    real_fsync = os.fsync
++    def fsync(fd):
++        if stat.S_ISDIR(os.fstat(fd).st_mode):
++            raise OSError('directory fsync failed')
++        real_fsync(fd)
++    monkeypatch.setattr(os, 'fsync', fsync)
++    conn = sqlite3.connect(tmp_path / 'board.db')
++    try:
++        with pytest.raises(OSError, match='directory fsync failed'):
++            inventory.register(conn)
++    finally:
++        conn.close()
++
++
+ def test_unregistered_account_boards_count(monkeypatch, tmp_path):
+     monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path)
+     default = tmp_path / 'kanban.db'
+diff --git a/tests/hermes_cli/test_worker_legacy_scopes.py b/tests/hermes_cli/test_worker_legacy_scopes.py
+new file mode 100644
+index 0000000000..bfcf3d9c58
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_legacy_scopes.py
+@@ -0,0 +1,297 @@
++"""Legacy flat worker scope ownership: bound, fail-closed, never aliasing."""
++import json
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import worker_compute_capacity as capacity
++from hermes_cli import worker_legacy_scopes as legacy
++from hermes_cli import worker_resource_admission as admission
++
++
++@pytest.fixture
++def env(monkeypatch, tmp_path):
++    home = tmp_path / 'home'
++    home.mkdir()
++    pool = tmp_path / 'pool'
++    pool.mkdir()
++    boot = tmp_path / 'boot_id'
++    boot.write_text('boot-a\n')
++    db = tmp_path / 'kanban.db'
++    with sqlite3.connect(db) as conn:
++        conn.execute('CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT)')
++        conn.executemany('INSERT INTO tasks VALUES (?, ?)', [('t1', 'parked'), ('t2', 'done')])
++    monkeypatch.setattr(capacity, 'policy_root', lambda: home)
++    monkeypatch.setattr(capacity, 'pool_path', lambda: pool)
++    monkeypatch.setattr(legacy, 'BOOT_ID_PATH', boot)
++    monkeypatch.setattr('hermes_constants.get_default_hermes_root', lambda: home)
++    return home, pool, boot, db
++
++
++def scope(pool, name='old-job.scope', populated=1, cpu='200000 100000', weight='10'):
++    path = pool / name
++    path.mkdir(exist_ok=True)
++    (path / 'cgroup.events').write_text(f'populated {populated}\n')
++    (path / 'cpu.max').write_text(cpu + '\n')
++    (path / 'cpu.weight').write_text(weight + '\n')
++    return path
++
++
++def record_file(home):
++    [path] = (home / 'worker-resources' / 'legacy-owners').iterdir()
++    return path
++
++
++def test_register_binds_owner_and_lookup(env):
++    _, pool, _, db = env
++    scope(pool)
++    record = legacy.register('old-job.scope', db, 't1', pool=pool)
++    assert record['owner'] == [str(db.resolve()), 't1']
++    assert legacy.lookup(pool, 'old-job.scope') == (str(db.resolve()), 't1')
++    assert legacy.owners_for_pool(pool) == {'old-job.scope': (str(db.resolve()), 't1')}
++
++
++@pytest.mark.parametrize('kwargs', [
++    {'populated': 0}, {'cpu': 'max 100000'}, {'cpu': '300000 100000'}, {'weight': '11'}, {'weight': '0'},
++])
++def test_register_refuses_unsafe_scope(env, kwargs):
++    _, pool, _, db = env
++    scope(pool, **kwargs)
++    with pytest.raises(ValueError):
++        legacy.register('old-job.scope', db, 't1', pool=pool)
++
++
++@pytest.mark.parametrize('name', ['../x', 'a/b', '.', '..', '.hidden', '', 'x' * 300,
++                                  'hermes-kanban-' + 'a' * 64 + '.slice'])
++def test_register_refuses_bad_names(env, name):
++    _, pool, _, db = env
++    with pytest.raises(ValueError):
++        legacy.register(name, db, 't1', pool=pool)
++
++
++def test_register_refuses_symlink_escape_and_bad_owner(env, tmp_path):
++    _, pool, _, db = env
++    outside = scope(tmp_path, 'outside')
++    (pool / 'link.scope').symlink_to(outside)
++    with pytest.raises(ValueError):
++        legacy.register('link.scope', db, 't1', pool=pool)
++    scope(pool)
++    with pytest.raises(ValueError):
++        legacy.register('old-job.scope', 'relative.db', 't1', pool=pool)
++    with pytest.raises(ValueError):
++        legacy.register('old-job.scope', tmp_path / 'missing.db', 't1', pool=pool)
++
++
++def test_register_is_fenced_and_does_not_touch_scope(env, monkeypatch):
++    home, pool, _, db = env
++    path = scope(pool)
++    before = {p.name: p.read_text() for p in path.iterdir()}
++    from hermes_cli.admission_fence import admission_lock
++    import hermes_cli.admission_fence as fence
++    with admission_lock(home):
++        monkeypatch.setattr(fence, 'admission_lock', lambda root, timeout=0: admission_lock(root, timeout=0.01))
++        with pytest.raises(fence.AdmissionBusy):
++            legacy.register('old-job.scope', db, 't1', pool=pool)
++    legacy.register('old-job.scope', db, 't1', pool=pool)
++    assert {p.name: p.read_text() for p in path.iterdir()} == before
++
++
++def test_reregister_other_owner_refused_while_live(env):
++    _, pool, _, db = env
++    scope(pool)
++    legacy.register('old-job.scope', db, 't1', pool=pool)
++    legacy.register('old-job.scope', db, 't1', pool=pool)
++    with pytest.raises(ValueError):
++        legacy.register('old-job.scope', db, 't2', pool=pool)
++
++
++def test_stale_records_are_ignored(env):
++    home, pool, boot, db = env
++    scope(pool)
++    legacy.register('old-job.scope', db, 't1', pool=pool)
++    # recreated scope (different inode)
++    path = record_file(home)
++    data = json.loads(path.read_text())
++    data['ino'] += 1
++    path.write_text(json.dumps(data))
++    assert legacy.lookup(pool, 'old-job.scope') is None
++    data['ino'] -= 1
++    path.write_text(json.dumps(data))
++    assert legacy.lookup(pool, 'old-job.scope') is not None
++    # reboot
++    boot.write_text('boot-b\n')
++    assert legacy.lookup(pool, 'old-job.scope') is None
++    # disappeared, and re-registration replaces the stale record
++    boot.write_text('boot-a\n')
++    (pool / 'old-job.scope' / 'cgroup.events').unlink()
++    (pool / 'old-job.scope' / 'cpu.max').unlink()
++    (pool / 'old-job.scope' / 'cpu.weight').unlink()
++    (pool / 'old-job.scope').rmdir()
++    assert legacy.lookup(pool, 'old-job.scope') is None
++    scope(pool)
++    data['ino'] += 1
++    path.write_text(json.dumps(data))
++    assert legacy.register('old-job.scope', db, 't2', pool=pool)['owner'][1] == 't2'
++
++
++@pytest.mark.parametrize('mutate', [
++    lambda d: d.update(scope='other'), lambda d: d.update(owner=['rel', 't']), lambda d: d.update(ino='1'),
++    lambda d: d.update(version=True), lambda d: d.update(version=1.0),
++    lambda d: d.pop('boot_id'), lambda d: d.update(extra=1), lambda d: d.update(version=2),
++])
++def test_corrupt_record_fails_closed(env, mutate):
++    home, pool, _, db = env
++    scope(pool)
++    legacy.register('old-job.scope', db, 't1', pool=pool)
++    path = record_file(home)
++    data = json.loads(path.read_text())
++    mutate(data)
++    path.write_text(json.dumps(data))
++    with pytest.raises(ValueError):
++        legacy.lookup(pool, 'old-job.scope')
++    assert admission.refusal() in {None, 'worker_resources_unknown'}  # never raises
++    path.write_text('{broken')
++    with pytest.raises(ValueError):
++        legacy.owners_for_pool(pool)
++
++
++def test_census_wiring_and_unknown_stays_reserved(env, monkeypatch):
++    from hermes_cli import machine_metrics
++    home, pool, boot, db = env
++    monkeypatch.setattr('hermes_cli.worker_account_boards.paths', list)
++    def fake_active(exclude=None, owner_output=None, extra_paths=None):
++        owner_output.add((str(db.resolve()), 't1'))
++        return 1
++    monkeypatch.setattr(machine_metrics, 'active_card_runs', fake_active)
++    scope(pool)
++    # unknown: active t1 plus an unmapped populated scope => 2
++    assert admission.occupied_count_for_host() == 2
++    # registered to the active task: counted once
++    legacy.register('old-job.scope', db, 't1', pool=pool)
++    assert admission.occupied_count_for_host() == 1
++    # reboot makes the map stale: unknown again, reserved
++    boot.write_text('boot-b\n')
++    assert admission.occupied_count_for_host() == 2
++    # corrupt record on a live scope fails the census (refusal fails closed)
++    boot.write_text('boot-a\n')
++    record_file(home).write_text('{broken')
++    with pytest.raises(ValueError):
++        admission.occupied_count_for_host()
++    monkeypatch.setattr(capacity, 'worker_enabled', lambda: True)
++    monkeypatch.setattr(capacity, 'effective_cores', lambda: 16)
++    monkeypatch.setattr('os.getloadavg', lambda: (1, 1, 1))
++    assert admission.refusal() == 'worker_resources_unknown'
++
++
++@pytest.mark.parametrize('boundary', ['before_lookup', 'lookup', 'events'])
++def test_census_refuses_replaced_scope(env, monkeypatch, boundary):
++    _, pool, _, db = env
++    path = scope(pool)
++    legacy.register(path.name, db, 't1', pool=pool)
++    original_read = Path.read_text
++    original_lookup = legacy.lookup
++    def replace_scope():
++        path.rename(pool / 'removed')
++        scope(pool)
++    def lookup(root, name):
++        if boundary == 'before_lookup':
++            replace_scope()
++        owner = original_lookup(root, name)
++        if boundary == 'lookup':
++            replace_scope()
++        return owner
++    def read(target, *args, **kwargs):
++        result = original_read(target, *args, **kwargs)
++        if boundary == 'events' and target == path / 'cgroup.events':
++            replace_scope()
++        return result
++    monkeypatch.setattr(Path, 'read_text', read)
++    with pytest.raises(ValueError, match='changed'):
++        admission.pool_occupancy(pool, {}, set(), legacy_resolver=lookup)
++
++
++def test_census_refuses_disappeared_scope(env, monkeypatch):
++    _, pool, _, _ = env
++    path = scope(pool)
++    original = Path.read_text
++    def read(target, *args, **kwargs):
++        result = original(target, *args, **kwargs)
++        if target == path / 'cgroup.events':
++            path.rename(pool.parent / 'removed')
++        return result
++    monkeypatch.setattr(Path, 'read_text', read)
++    with pytest.raises(ValueError, match='changed'):
++        capacity.occupied_owners(pool, {}, set())
++
++
++def test_registration_requires_exact_existing_task(env):
++    _, pool, _, db = env
++    scope(pool)
++    with pytest.raises(ValueError, match='task'):
++        legacy.register('old-job.scope', db, 't', pool=pool)
++
++
++@pytest.mark.parametrize('kind', ['empty', 'corrupt', 'no_tasks', 'bad_tasks'])
++def test_registration_requires_valid_database(env, kind):
++    _, pool, _, db = env
++    scope(pool)
++    db.unlink()
++    if kind == 'corrupt':
++        db.write_text('not sqlite')
++    elif kind == 'empty':
++        db.touch()
++    else:
++        with sqlite3.connect(db) as conn:
++            conn.execute('CREATE TABLE other (id TEXT)' if kind == 'no_tasks'
++                         else 'CREATE TABLE tasks (wrong TEXT)')
++    before = db.read_bytes()
++    with pytest.raises(ValueError, match='database'):
++        legacy.register('old-job.scope', db, 't1', pool=pool)
++    assert db.read_bytes() == before
++
++
++def test_register_refuses_scope_replaced_during_validation(env, monkeypatch):
++    home, pool, _, db = env
++    path = scope(pool)
++    original = capacity._verify_quota
++    def verify(target, maximum):
++        original(target, maximum)
++        path.rename(pool / 'removed')
++        scope(pool)
++    monkeypatch.setattr(capacity, '_verify_quota', verify)
++    with pytest.raises(ValueError, match='changed'):
++        legacy.register(path.name, db, 't1', pool=pool)
++    assert not (home / 'worker-resources' / 'legacy-owners').exists()
++
++
++def test_registration_directory_fsync_failure_is_not_success(env, monkeypatch):
++    import os
++    import stat
++    _, pool, _, db = env
++    scope(pool)
++    original = os.fsync
++    def fsync(fd):
++        if stat.S_ISDIR(os.fstat(fd).st_mode):
++            raise OSError('directory fsync failed')
++        original(fd)
++    monkeypatch.setattr(os, 'fsync', fsync)
++    with pytest.raises(OSError, match='directory fsync failed'):
++        legacy.register('old-job.scope', db, 't1', pool=pool)
++
++
++def test_multiple_scopes_for_one_owner_count_once(env):
++    _, pool, _, db = env
++    for name in ['old-job.scope', 'second.scope']:
++        scope(pool, name)
++        legacy.register(name, db, 't1', pool=pool)
++    owner = (str(db.resolve()), 't1')
++    assert capacity.occupied_owners(pool, {}, {owner}, legacy_resolver=legacy.lookup) == {owner}
++
++
++def test_cli_register(env, capsys):
++    _, pool, _, db = env
++    scope(pool)
++    assert legacy.main(['register', '--scope', 'old-job.scope', '--database', str(db), '--task', 't1']) == 0
++    assert json.loads(capsys.readouterr().out)['scope'] == 'old-job.scope'
++    assert legacy.main(['register', '--scope', '../x', '--database', str(db), '--task', 't1']) == 1
+-- 
+2.51.0
+

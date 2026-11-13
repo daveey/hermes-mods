@@ -1,0 +1,542 @@
+From eee92f3087f6be51005fd172a65a7b43ee7781ea Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 04:47:43 +0000
+Subject: [PATCH] [daveey] perf(kanban-sync): divergence repair compares
+ settled cards in SQLite; chat-link pass off the round thread
+
+Hub 2026-11-13 after #1843 (t_01a1d2cc49634a78): replica pulled_at 04:14:01 -> 04:26:48 (13 min stale), the
+remote-parent mirror held finished worker cards as running, so hub children did not promote.
+
+- py-spy record 04:17Z (gw 1817115, sync thread 1819025, 1626 samples incl. idle): 100% in
+  repair_divergence; 84% at the `SELECT * FROM tasks` fetchall over every live card (5,496 rows), 15% at the
+  replica chunk reads. Each fetched row re-acquires the contended gateway GIL: a SELECT * fetch of 1000 rows
+  takes 0.01 s alone and 4-10 s with 1-3 CPU-bound threads in the process (repro on worker-4, Python 3.14).
+  Fix: `_differing_settled` joins live and replica in one read-only SQLite connection (replica ATTACHed
+  read-only) and returns only the ids whose synced columns differ (run refs compared by uid). Equal raw values
+  give equal `_row_fields`, so it is a superset; each candidate is re-compared exactly as before. Unattachable
+  files fall back to the full scan. 60 settled cards + 1 edit: 121 `_row_fields` conversions at base, 2 at head.
+- The chat-link pass ran inline in the loop: 04:14-04:24Z one pass (its strict ledger read queued on
+  `_links_lock`) held the round ~10 min. It now runs on its own `kanban-sync-links` thread with its own
+  connection scope; the loop requests a pass on its cadence and a request while one runs is refused (no pile-up).
+  Test: with a pass blocked, all 6 rounds run before it returns (base: 1 of 6).
+---
+ hermes_cli/kanban_sync_client.py              |  11 +-
+ hermes_cli/kanban_sync_divergence.py          |  78 ++++++++++-
+ hermes_cli/kanban_sync_links_pass.py          |  72 ++++++++++
+ .../test_dispatcher_tick_read_budget.py       |  17 ++-
+ .../test_kanban_sync_divergence_prefilter.py  | 129 ++++++++++++++++++
+ .../test_kanban_sync_links_thread.py          |  78 +++++++++++
+ .../test_kanban_sync_steady_links.py          |   1 +
+ 7 files changed, 375 insertions(+), 11 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_links_pass.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_divergence_prefilter.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_links_thread.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 0d5a7fe9cc..e5b69f2367 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1183,6 +1183,10 @@ def _links_clock() -> float:
+     return time.monotonic()
+ 
+ 
++# The running loop's links pass (tests wait on it to observe a pass deterministically).
++_LINKS_RUNNER: Any = None  # a kanban_sync_links_pass.LinksPass while the loop runs
++
++
+ def _ledger_slices(cards: Iterable[Mapping[str, Any]], gateway: str) -> dict[str, frozenset]:
+     """Per board, every field of this gateway's origin-ledger rows that a links pass reads (``ledger_boards``,
+     ``kanban_chat_links._ledger_links``). Compared by value: a re-projection with the same rows is no change."""
+@@ -1467,6 +1471,9 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+     work = SyncWork(period)
+     watchers: dict[str, threading.Thread] = {}
+     next_links = 0.0
++    global _LINKS_RUNNER
++    from hermes_cli.kanban_sync_links_pass import LinksPass
++    links = _LINKS_RUNNER = LinksPass(ident.gateway)
+     from hermes_cli.machine_metrics import Reporter
+     metrics = Reporter(hub.report_metrics)
+     # Hub CPU advisory: measured on its own thread, so a slow sync round can neither void nor delay it. [daveey]
+@@ -1502,8 +1509,7 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+                 if r.push and (r.push.sent or r.push.rejected):
+                     _log.info("kanban sync: %s %s pulled=%d pushed=%d rejected=%d", r.board, r.mode, r.pulled,
+                               r.push.sent, r.push.rejected)
+-            if time.monotonic() >= next_links:
+-                reconcile_links(boards, ident.gateway, skip_unchanged=True)
++            if time.monotonic() >= next_links and links.request(boards):  # busy: ask again next iteration
+                 next_links = time.monotonic() + LINKS_EVERY_S
+             sync_timing.report(sender.loop_report)
+             remaining = max(0.0, work.deadline - time.monotonic())
+@@ -1512,6 +1518,7 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+                 remaining = min(remaining, max(0.0, deferred_due - _repair_clock()))
+             sync_timing.wait(wait_for_work, wake, [p for _s, p in boards], remaining, keep_running)
+     finally:
++        links.stop()
+         sender.close()
+         sampler.close()
+     runstate.record_down(runstate.STOPPED)
+diff --git a/hermes_cli/kanban_sync_divergence.py b/hermes_cli/kanban_sync_divergence.py
+index 7c8a4195dd..41b0202c5a 100644
+--- a/hermes_cli/kanban_sync_divergence.py
++++ b/hermes_cli/kanban_sync_divergence.py
+@@ -5,6 +5,7 @@ import json
+ import logging
+ import sqlite3
+ import time
++from pathlib import Path
+ from hermes_cli import kanban_db_sync as sync
+ 
+ _log = logging.getLogger(__name__)
+@@ -25,12 +26,23 @@ def repair_divergence(live: sqlite3.Connection, shadow: sqlite3.Connection, gate
+     from hermes_cli.kanban_db_connect import write_txn
+     from hermes_cli.kanban_sync_omissions import repair_holds
+     held = repair_holds(live, "tasks")
+-    seen = {r[0]: r[1] for r in shadow.execute(
+-        "SELECT id, sync_version FROM tasks WHERE (created_on = ? OR created_on IS NULL) AND sync_version IS NOT NULL",
+-        (gateway,))}
+     repaired: dict[str, list[str]] = {}
+-    rows = [r for r in live.execute("SELECT * FROM tasks WHERE sync_version IS NOT NULL").fetchall()
+-            if r["id"] not in held and seen.get(r["id"]) == r["sync_version"]]
++    candidates = _differing_settled(live, shadow, gateway)
++    if candidates is None:  # cannot pre-filter in SQLite (in-memory/unknown files, an error): scan every card
++        seen = {r[0]: r[1] for r in shadow.execute(
++            "SELECT id, sync_version FROM tasks WHERE (created_on = ? OR created_on IS NULL) "
++            "AND sync_version IS NOT NULL", (gateway,))}
++        rows = [r for r in live.execute("SELECT * FROM tasks WHERE sync_version IS NOT NULL").fetchall()
++                if r["id"] not in held and seen.get(r["id"]) == r["sync_version"]]
++    else:
++        # Only the cards whose raw columns differ come back to Python; the replica row read below re-checks the
++        # settled condition (version, creator), since either file may have moved since the pre-filter read.
++        ids = sorted(candidates - held)
++        rows = []
++        for index in range(0, len(ids), _CHUNK):
++            part = ids[index:index + _CHUNK]
++            rows += live.execute(f"SELECT * FROM tasks WHERE sync_version IS NOT NULL AND id IN "
++                                 f"({','.join('?' * len(part))}) ORDER BY rowid", part).fetchall()
+     # One replica read per chunk and one omissions read per pass, not one of each per settled card: the scan
+     # visits every synced card each round (13% of hub gateway CPU at 4,948 cards, 2026-11-12). [daveey]
+     omissions: dict[str, set[str]] = {}
+@@ -47,6 +59,9 @@ def repair_divergence(live: sqlite3.Connection, shadow: sqlite3.Connection, gate
+         theirs = replica.get(tid)
+         if theirs is None:  # left the replica since ``seen`` was read: nothing to compare this pass
+             continue
++        if candidates is not None and (theirs["sync_version"] != row["sync_version"]
++                                       or theirs["created_on"] not in (gateway, None)):
++            continue  # not settled (or not this gateway's card) as of this read
+         mine, remote = _row_fields(live, "tasks", row), _row_fields(shadow, "tasks", theirs)
+         omitted = omissions.get(tid, ())
+         fields = {k: v for k, v in mine.items() if k in remote and remote[k] != v and k not in omitted}
+@@ -77,6 +92,59 @@ def repair_divergence(live: sqlite3.Connection, shadow: sqlite3.Connection, gate
+     return repaired
+ 
+ 
++def _db_file(conn: sqlite3.Connection) -> str | None:
++    """The main database file of ``conn``; None for an in-memory or temporary database."""
++    for _seq, name, file in conn.execute("PRAGMA database_list").fetchall():
++        if name == "main":
++            return file or None
++    return None
++
++
++def _task_columns(conn: sqlite3.Connection, schema: str = "main") -> set[str]:
++    return {r[1] for r in conn.execute(f"PRAGMA {schema}.table_info(tasks)").fetchall()}
++
++
++def _differing_settled(live: sqlite3.Connection, shadow: sqlite3.Connection, gateway: str) -> set[str] | None:
++    """Ids of this gateway's settled cards (same ``sync_version`` in both copies) whose synced columns differ.
++
++    One SQLite join over both files, in a private read-only connection: the comparison runs in C and only the
++    differing ids cross into Python. Scanning every settled card in Python made each round fetch every task row
++    twice (``SELECT *``, ~5.5k rows on the hub); under the gateway's GIL contention each fetched row waits for the
++    GIL, so the scan held the sync loop 40+ s per pass and the replica went 11+ min stale (hub py-spy 04:17Z
++    2026-11-13, t_01a1d2cc49634a78: 100% of the sync thread in ``repair_divergence``). Equal raw values always
++    give equal ``_row_fields`` values, so this is a superset of the cards the Python comparison flags; the caller
++    re-compares each candidate exactly. None when the pre-filter cannot run: the caller scans every card. [daveey]"""
++    from hermes_cli import kanban_lockguard
++    live_file, replica_file = _db_file(live), _db_file(shadow)
++    if not live_file or not replica_file:
++        return None
++    try:
++        conn = kanban_lockguard.connect(Path(live_file).resolve().as_uri() + "?mode=ro", uri=True)
++    except (sqlite3.Error, OSError, ValueError):
++        return None
++    try:
++        conn.execute("ATTACH DATABASE ? AS rep", (Path(replica_file).resolve().as_uri() + "?mode=ro",))
++        skip = sync.LOCAL_COLUMNS["tasks"] | sync.KEY_COLUMNS["tasks"] | sync.SERVER_COLUMNS.get("tasks", frozenset())
++        columns = sorted((sync.SYNCED_COLUMNS["tasks"] - skip) & _task_columns(conn) & _task_columns(conn, "rep"))
++        terms = []
++        for column in columns:
++            if ("tasks", column) in sync.REF_COLUMNS:  # local run ids differ per file: compare the run uids
++                terms.append(f"(SELECT uid FROM main.task_runs WHERE id = l.{column}) IS NOT "
++                             f"(SELECT uid FROM rep.task_runs WHERE id = r.{column})")
++            else:
++                terms.append(f"l.{column} IS NOT r.{column}")
++        if not terms:
++            return set()
++        return {row[0] for row in conn.execute(
++            "SELECT l.id FROM main.tasks l JOIN rep.tasks r ON r.id = l.id "
++            "WHERE l.sync_version IS NOT NULL AND r.sync_version = l.sync_version "
++            "AND (r.created_on = ? OR r.created_on IS NULL) AND (" + " OR ".join(terms) + ")", (gateway,))}
++    except sqlite3.Error as exc:
++        _log.debug("kanban sync: divergence pre-filter unavailable (%s); scanning every card", exc)
++        return None
++    finally:
++        conn.close()
++
+ _TERMINAL = frozenset({"done", "archived"})
+ 
+ 
+diff --git a/hermes_cli/kanban_sync_links_pass.py b/hermes_cli/kanban_sync_links_pass.py
+new file mode 100644
+index 0000000000..6c501d5e17
+--- /dev/null
++++ b/hermes_cli/kanban_sync_links_pass.py
+@@ -0,0 +1,72 @@
++"""The sync loop's chat-link pass, on its own thread so it can never hold up a sync round. [daveey]
++
++Inline in ``kanban_sync_client._run_forever``, a slow pass held the replica pull, the remote-parent mirror and the
++outbox push for its whole length: on the hub 2026-11-13 one pass took ~10 min (04:14-04:24Z, its strict ledger read
++queued on ``_links_lock`` behind Desktop readers) and the replica went 13 min stale, so hub cards waiting on worker
++cards did not promote (t_01a1d2cc49634a78). The loop asks for a pass on its cadence; a request while one is running
++is refused and asked again on a later iteration, so passes never pile up. The thread owns its own connection scope
++and never calls the loop's ``keep_running`` (callers count its calls); the loop stops it.
++"""
++from __future__ import annotations
++
++import logging
++import threading
++from pathlib import Path
++from typing import Optional
++
++_log = logging.getLogger("hermes_cli.kanban_sync_client")
++
++
++class LinksPass:
++    JOIN_S = 5.0
++
++    def __init__(self, gateway: str) -> None:
++        self._gateway = gateway
++        self._want = threading.Event()
++        self._idle = threading.Event()
++        self._idle.set()
++        self._stopped = False
++        self._boards: list[tuple[str, Path]] = []
++        self._thread: Optional[threading.Thread] = None
++
++    def request(self, boards: list[tuple[str, Path]]) -> bool:
++        """Start a pass over ``boards`` unless one is running. True when it started."""
++        if not self._idle.is_set():
++            return False
++        self._boards = list(boards)
++        self._idle.clear()
++        self._want.set()
++        if self._thread is None or not self._thread.is_alive():
++            from agent.memory_provider import spawn_context_thread
++            self._thread = spawn_context_thread(self._run, name="kanban-sync-links")
++            self._thread.start()
++        return True
++
++    def wait_idle(self, timeout: Optional[float] = None) -> bool:
++        return self._idle.wait(timeout)
++
++    def stop(self) -> None:
++        self._stopped = True
++        self._want.set()
++        if self._thread is not None:
++            self._thread.join(self.JOIN_S)
++
++    def _run(self) -> None:
++        from hermes_cli import kanban_sync_client as client  # module attribute: tests replace reconcile_links
++        from hermes_cli.kanban_sync_connections import connection_scope
++        with connection_scope():
++            try:
++                while not self._stopped:
++                    if not self._want.wait(timeout=1.0):
++                        continue
++                    self._want.clear()
++                    if self._stopped:
++                        break
++                    try:
++                        client.reconcile_links(self._boards, self._gateway, skip_unchanged=True)
++                    except Exception as exc:  # health: allow BLE001 -- a failed pass must not end the thread
++                        _log.warning("kanban sync: chat links pass failed (%s: %s)", type(exc).__name__, exc)
++                    finally:
++                        self._idle.set()
++            finally:
++                self._idle.set()
+diff --git a/tests/hermes_cli/test_dispatcher_tick_read_budget.py b/tests/hermes_cli/test_dispatcher_tick_read_budget.py
+index bbfc36cd31..9402254b40 100644
+--- a/tests/hermes_cli/test_dispatcher_tick_read_budget.py
++++ b/tests/hermes_cli/test_dispatcher_tick_read_budget.py
+@@ -167,8 +167,13 @@ def test_gateway_names_does_not_keep_the_answer_of_a_failed_hub_db_read(tmp_path
+ # --- divergence repair ----------------------------------------------------------------------------------------------
+ 
+ 
++class _Rows(list):
++    def fetchall(self):
++        return list(self)
++
++
+ class _VanishingReplica:
+-    """The replica connection, losing one task row right after the pass's first read."""
++    """The replica connection, losing one task row right after the pass's first read of its tasks."""
+ 
+     def __init__(self, conn, task_id):
+         self._conn, self._task_id, self._reads = conn, task_id, 0
+@@ -177,15 +182,19 @@ class _VanishingReplica:
+         return getattr(self._conn, name)
+ 
+     def execute(self, sql, *params):
+-        if self._reads == 0:
++        if self._reads == 0 and "FROM tasks" in sql:
+             self._reads = 1
+             rows = self._conn.execute(sql, *params).fetchall()
+             self._conn.execute("DELETE FROM tasks WHERE id = ?", (self._task_id,))
+-            return iter(rows)
++            return _Rows(rows)
+         return self._conn.execute(sql, *params)
+ 
+ 
+-def test_divergence_repair_skips_a_row_that_left_the_replica_mid_pass(tmp_path, monkeypatch):
++@pytest.mark.parametrize("prefilter", [True, False])
++def test_divergence_repair_skips_a_row_that_left_the_replica_mid_pass(tmp_path, monkeypatch, prefilter):
++    if not prefilter:  # the full Python scan, used when the SQLite pre-filter cannot run
++        from hermes_cli import kanban_sync_divergence
++        monkeypatch.setattr(kanban_sync_divergence, "_differing_settled", lambda *_a: None)
+     home = support.kanban_home(tmp_path, monkeypatch)
+     support.write_sync_config(home, True)
+     live = kbc.connect(home / "kanban.db")
+diff --git a/tests/hermes_cli/test_kanban_sync_divergence_prefilter.py b/tests/hermes_cli/test_kanban_sync_divergence_prefilter.py
+new file mode 100644
+index 0000000000..24ffd86fea
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_divergence_prefilter.py
+@@ -0,0 +1,129 @@
++"""The divergence repair compares settled cards in SQLite, not row by row in Python. [daveey]
++
++Hub py-spy 2026-11-13 04:17Z (t_01a1d2cc49634a78): after the chat-link fix landed, 100% of the sync-loop thread
++sat in ``repair_divergence`` fetching every task row of both files (``SELECT *``, ~5.5k cards). Each fetched row
++waits for the contended gateway GIL, so one pass held the loop 40+ s and the replica went 11+ min stale.
++"""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_divergence as div
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++ME, BOARD = "macbook", "default"
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def live(kanban_home):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(conn, BOARD, ME)
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def _settle(live, kanban_home, svc, cards):
++    sync.set_mode(live, "primary")
++    ids = [kb.create_task(live, title=f"card {i}", body=f"body {i}", assignee="worker") for i in range(cards)]
++    for _ in range(3):
++        ksc.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++    return ids
++
++
++def _uncaptured(live, sql, args):
++    with kbc.write_txn(live):
++        sync.drop_triggers(live)  # an uncaptured write: only the repair scan finds it
++        live.execute(sql, args)
++    sync.install_triggers(live)
++
++
++def _spy_repair(monkeypatch):
++    real, results = ksc.repair_divergence, []
++
++    def spied(live_conn, shadow, gateway):
++        got = real(live_conn, shadow, gateway)
++        results.append(got)
++        return got
++
++    monkeypatch.setattr(ksc, "repair_divergence", spied)
++    return results
++
++
++def test_settled_cards_never_reach_python(live, kanban_home, monkeypatch):
++    """Only differing cards are materialized: base fetched and converted every settled card (2 x 60 calls)."""
++    svc = FakeService()
++    ids = _settle(live, kanban_home, svc, 60)
++    converted = []
++    real_fields = ksc._row_fields
++
++    def counted(conn, table, row):
++        converted.append(row["id"])
++        return real_fields(conn, table, row)
++
++    monkeypatch.setattr(ksc, "_row_fields", counted)
++    results = _spy_repair(monkeypatch)
++    _uncaptured(live, "UPDATE tasks SET title = 'gap edit' WHERE id = ?", (ids[7],))
++    ksc.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++    ksc.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++    assert results and results[0] == {ids[7]: ["title"]}, results
++    assert set(converted) <= {ids[7]}, f"{len(converted)} rows converted for 1 differing card of 60"
++    assert svc.board(BOARD)["rows"]["tasks"][ids[7]]["title"] == "gap edit"
++
++
++@pytest.mark.parametrize("prefilter", [True, False])
++@pytest.mark.parametrize("sql, field", [
++    ("UPDATE tasks SET title = 'gap edit' WHERE id = ?", "title"),
++    ("UPDATE tasks SET body = 'gap body' WHERE id = ?", "body"),
++    ("UPDATE tasks SET priority = 9 WHERE id = ?", "priority"),
++    ("UPDATE tasks SET result = 'gap result' WHERE id = ?", "result"),
++])
++def test_prefilter_and_full_scan_queue_the_same_fields(live, kanban_home, monkeypatch, prefilter, sql, field):
++    svc = FakeService()
++    ids = _settle(live, kanban_home, svc, 5)
++    if not prefilter:
++        monkeypatch.setattr(div, "_differing_settled", lambda *_a: None)
++    results = _spy_repair(monkeypatch)
++    _uncaptured(live, sql, (ids[2],))
++    # A local-only column (never synced) must not make a card a candidate in either path.
++    _uncaptured(live, "UPDATE tasks SET workspace_path = '/elsewhere' WHERE id = ?", (ids[3],))
++    ksc.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++    ksc.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++    assert results and results[0] == {ids[2]: [field]}, results
++
++
++def test_prefilter_skips_unsettled_and_matches_run_refs(live, kanban_home):
++    """A card with a newer local version is not settled; equal run uids under different local ids are equal."""
++    svc = FakeService()
++    ids = _settle(live, kanban_home, svc, 3)
++    replica = ksc.open_shadow(BOARD, ME)
++    try:
++        assert div._differing_settled(live, replica, ME) == set()
++        live.execute("UPDATE tasks SET sync_version = sync_version + 100 WHERE id = ?", (ids[0],))
++        _uncaptured(live, "UPDATE tasks SET title = 'x' WHERE id = ?", (ids[0],))
++        assert div._differing_settled(live, replica, ME) == set()
++        _uncaptured(live, "UPDATE tasks SET title = 'y' WHERE id = ?", (ids[1],))
++        assert div._differing_settled(live, replica, ME) == {ids[1]}
++    finally:
++        replica.close()
++
++
++def test_prefilter_unavailable_for_in_memory_files(live):
++    import sqlite3
++    mem = sqlite3.connect(":memory:")
++    try:
++        assert div._differing_settled(live, mem, ME) is None
++    finally:
++        mem.close()
+diff --git a/tests/hermes_cli/test_kanban_sync_links_thread.py b/tests/hermes_cli/test_kanban_sync_links_thread.py
+new file mode 100644
+index 0000000000..6636525da1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_links_thread.py
+@@ -0,0 +1,78 @@
++"""A slow chat-link pass never holds up sync rounds (hub 2026-11-13, t_01a1d2cc49634a78). [daveey]
++
++Inline in the loop, one ~10 min links pass (04:14-04:24Z) held the replica pull, the remote-parent mirror and the
++outbox push, so the replica went 13 min stale and hub cards waiting on worker cards did not promote.
++"""
++from __future__ import annotations
++
++import threading
++from pathlib import Path
++from types import SimpleNamespace
++
++from hermes_cli import kanban_sync_client as ksc
++
++
++def _run_loop(monkeypatch, *, reconcile, sync_all_once, wait, keep_running):
++    from hermes_cli import machine_metrics
++    monkeypatch.setattr(ksc, "load_identity", lambda: SimpleNamespace(gateway="here", url="fake", key="k"))
++    monkeypatch.setattr(ksc, "Hub", lambda ident: SimpleNamespace(report_metrics=lambda *a: None))
++    monkeypatch.setattr(ksc.sync, "set_lease_client", lambda value: None)
++    monkeypatch.setattr(ksc, "board_paths", lambda: [("default", Path("/nonexistent/kanban.db"))])
++    monkeypatch.setattr(ksc, "_schema_ahead_boards", lambda boards: [])
++    monkeypatch.setattr(ksc, "FeedWatcher", lambda *a, **k: SimpleNamespace(run=lambda: None))
++    monkeypatch.setattr(ksc, "sync_all_once", sync_all_once)
++    monkeypatch.setattr(ksc, "LINKS_EVERY_S", 0.0)
++    monkeypatch.setattr(ksc, "reconcile_links", reconcile)
++    monkeypatch.setattr(ksc, "wait_for_work", wait)
++    monkeypatch.setattr(machine_metrics, "Reporter",
++                        lambda *a: SimpleNamespace(report_due=lambda: None, pending_wake_in=lambda: None))
++    ksc.run_forever(keep_running, interval=1)
++
++
++def test_rounds_keep_running_while_a_links_pass_is_slow(monkeypatch):
++    release, finished = threading.Event(), threading.Event()
++    calls: list[str] = []
++    rounds: list[int] = []
++    rounds_when_pass_returned: list[int] = []
++    iterations = {"n": 0}
++
++    def slow_reconcile(boards, gateway, **kwargs):
++        calls.append(gateway)
++        release.wait(5)  # base: the loop itself blocks here for the whole pass
++        rounds_when_pass_returned.append(len(rounds))
++        finished.set()
++
++    def sync_all_once(*a, **k):
++        rounds.append(1)
++        return []
++
++    def wait(*args):  # runs after the iteration asked for its links pass: no request follows the release
++        iterations["n"] += 1
++        if iterations["n"] == 6:
++            release.set()
++
++    _run_loop(monkeypatch, reconcile=slow_reconcile, sync_all_once=sync_all_once, wait=wait,
++              keep_running=lambda: iterations["n"] < 6)
++    assert finished.wait(10), "the links pass never finished"
++    assert len(rounds) == 6, rounds
++    assert rounds_when_pass_returned == [6], \
++        f"rounds waited for the links pass: {rounds_when_pass_returned[0]} of 6 ran before it returned"
++    assert calls == ["here"], f"passes piled up behind a running one: {calls}"
++
++
++def test_a_failed_links_pass_does_not_stop_later_passes(monkeypatch):
++    calls: list[int] = []
++    iterations = {"n": 0}
++
++    def flaky(boards, gateway, **kwargs):
++        calls.append(1)
++        if len(calls) == 1:
++            raise RuntimeError("boom")
++
++    def wait(*args):
++        iterations["n"] += 1
++        assert ksc._LINKS_RUNNER is not None and ksc._LINKS_RUNNER.wait_idle(10)
++
++    _run_loop(monkeypatch, reconcile=flaky, sync_all_once=lambda *a, **k: [], wait=wait,
++              keep_running=lambda: iterations["n"] < 3)
++    assert len(calls) == 3, calls
+diff --git a/tests/hermes_cli/test_kanban_sync_steady_links.py b/tests/hermes_cli/test_kanban_sync_steady_links.py
+index 5f336aca71..139712db37 100644
+--- a/tests/hermes_cli/test_kanban_sync_steady_links.py
++++ b/tests/hermes_cli/test_kanban_sync_steady_links.py
+@@ -427,6 +427,7 @@ def test_the_sync_loop_skips_unchanged_links_passes(live, ledger, svc, kanban_ho
+ 
+     def wait(*args):
+         iterations["n"] += 1
++        assert ksc._LINKS_RUNNER is not None and ksc._LINKS_RUNNER.wait_idle(30), "links pass did not finish"
+         per_iteration.append(spies["reconcile"])
+ 
+     monkeypatch.setattr(ksc, "wait_for_work", wait)
+-- 
+2.51.0
+

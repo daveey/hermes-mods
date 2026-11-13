@@ -1,0 +1,239 @@
+From 4fcd38b4c2168983d68c248b62360bf4a8b6cb09 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:55:53 +0000
+Subject: [PATCH] [daveey] tests: FakeService release refuses non-object extra,
+ counts numbers like JSON.stringify, refuses spawn_failed on ops
+
+PR #1999 review nits (pullrequestreview-5888197293), compared against
+hermes-hub worker/src/transitions.ts releaseTask / releaseDiagnostic:
+
+1. releaseTask refuses `op.extra ?? {}` that is not an object as `invalid`
+   ("failure extra must be an object") right before releaseDiagnostic. The
+   fake read `op.get("extra") or {}`, so [], "", 0 and False silently became
+   {}. New FakeService.release_inputs does the extra check then
+   release_diagnostic; both the ops route (release_op) and the leases route
+   use it, so a non-object extra is `invalid` and changes nothing.
+2. release_diagnostic measured json.dumps, which writes 1.0 as "1.0", 1e-7
+   as "1e-07" and NaN/Infinity as NaN/Infinity; JSON.stringify writes "1",
+   "1e-7" and null. _js_stringify/_js_number reproduce Number::toString from
+   the shortest round-trip digits, so the 8000-char boundary matches for
+   numbers too (lone surrogates stay out of scope, as documented).
+3. release_op accepted spawn_failed and only ended the run with a
+   spawn_failed event, while the leases route raises NotImplementedError
+   (the real releaseTask goes through endCustody + recordTaskFailure).
+   release_op now raises the same NotImplementedError before any write.
+
+Tests (tests/hermes_cli/test_kanban_sync_rejections.py): 72 non-object-extra
+cases x routes, 21 number-length cases, spawn_failed on both routes; 87 of
+them fail on the pre-change fake, all 230 in the file pass after.
+---
+ tests/hermes_cli/kanban_sync_fake_board.py    | 78 ++++++++++++++++---
+ .../hermes_cli/test_kanban_sync_rejections.py | 51 +++++++++++-
+ 2 files changed, 115 insertions(+), 14 deletions(-)
+
+diff --git a/tests/hermes_cli/kanban_sync_fake_board.py b/tests/hermes_cli/kanban_sync_fake_board.py
+index 28b13aaf88..790e327f24 100644
+--- a/tests/hermes_cli/kanban_sync_fake_board.py
++++ b/tests/hermes_cli/kanban_sync_fake_board.py
+@@ -9,7 +9,9 @@ from __future__ import annotations
+ 
+ import copy
+ import json
++import math
+ import time
++from decimal import Decimal
+ from typing import Any, Optional
+ 
+ from hermes_cli import kanban_sync_client as ksc
+@@ -17,6 +19,46 @@ from hermes_cli import kanban_sync_client as ksc
+ FENCED = {"status", "current_run_uid", "result", "started_at", "completed_at"}
+ 
+ 
++def _js_number(x: float) -> str:
++    """ECMAScript Number::toString of the wire number ``x`` as JSON.stringify writes it: ``null`` for NaN and
++    +-Infinity (an int past the double range parses to Infinity), else the shortest round-trip digits (the ones
++    Python's ``repr`` picks) laid out by the spec's fixed/exponent rule."""
++    try:
++        x = float(x)
++    except OverflowError:
++        return "null"
++    if x != x or x in (math.inf, -math.inf):
++        return "null"
++    if x == 0:
++        return "0"
++    _, digits, exp = Decimal(repr(abs(x))).normalize().as_tuple()
++    s, k = "".join(map(str, digits)), len(digits)
++    n = int(exp) + k  # x = 0.s * 10**n
++    sign = "-" if x < 0 else ""
++    if k <= n <= 21:
++        return sign + s + "0" * (n - k)
++    if 0 < n <= 21:
++        return sign + s[:n] + "." + s[n:]
++    if -6 < n <= 0:
++        return sign + "0." + "0" * -n + s
++    return f"{sign}{s[0]}{'.' + s[1:] if k > 1 else ''}e{'+' if n > 0 else '-'}{abs(n - 1)}"
++
++
++def _js_stringify(value: object) -> str:
++    """``JSON.stringify(JSON.parse(json.dumps(value)))`` for a wire JSON value: strings as ``json.dumps`` with no
++    ASCII escaping, numbers by :func:`_js_number`. Lone surrogates are out of scope (JS escapes them)."""
++    if value is None or isinstance(value, bool):
++        return json.dumps(value)
++    if isinstance(value, (int, float)):
++        return _js_number(value)
++    if isinstance(value, dict):
++        return "{" + ",".join(json.dumps(str(k), ensure_ascii=False) + ":" + _js_stringify(v)
++                              for k, v in value.items()) + "}"
++    if isinstance(value, (list, tuple)):
++        return "[" + ",".join(_js_stringify(v) for v in value) + "]"
++    return json.dumps(value, ensure_ascii=False)
++
++
+ class FakeService:
+     def __init__(self, *, lease_runs: bool = False, machines: Optional[dict] = None) -> None:
+         self.boards: dict[str, dict[str, Any]] = {}
+@@ -139,15 +181,26 @@ class FakeService:
+     def release_diagnostic(cls, value: object) -> Optional[dict]:
+         """As transitions.ts releaseDiagnostic: absent -> ``{}``; anything but an object -> None (the caller
+         refuses the release ``invalid``); past MAX_DIAGNOSTIC_CHARS of ``JSON.stringify`` (UTF-16 code units, no
+-        ASCII escaping) -> ``{diagnostic_truncated: true}``; else a copy."""
++        ASCII escaping, numbers as JS writes them: see :func:`_js_stringify`) -> ``{diagnostic_truncated: true}``;
++        else a copy."""
+         if value is None:
+             return {}
+         if not isinstance(value, dict):
+             return None
+-        text = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
++        text = _js_stringify(value)
+         return {"diagnostic_truncated": True} if len(text.encode("utf-16-le")) // 2 > cls.MAX_DIAGNOSTIC_CHARS \
+             else dict(value)
+ 
++    @classmethod
++    def release_inputs(cls, op: dict) -> Optional[dict]:
++        """releaseTask's post-fence validation, before any write, in its order: ``op.extra ?? {}`` that is not an
++        object is ``invalid`` ("failure extra must be an object"), then :meth:`release_diagnostic`. Returns the
++        diagnostic, or None when the caller refuses the release ``invalid``."""
++        extra = op.get("extra")
++        if extra is not None and not isinstance(extra, dict):
++            return None
++        return cls.release_diagnostic(op.get("diagnostic"))
++
+     @classmethod
+     def release_evidence(cls, outcome: str, op: dict, diagnostic: dict) -> tuple[dict, dict]:
+         """releaseTask's (run metadata, event evidence) for ``outcome``, shared by the ops and leases routes (the
+@@ -164,15 +217,20 @@ class FakeService:
+     def release_op(self, b: dict, op: dict, gw: str) -> dict:
+         """As transitions.ts releaseTask: only the lease holder's run is released; the Board ends that run, emits
+         its one outcome event (carrying :meth:`release_evidence`) and books a charged outcome exactly once.
+-        Not modelled: the protocol-violation streak (a ``protocol_violation`` crash is charged like any crash)."""
++        Not modelled: the protocol-violation streak (a ``protocol_violation`` crash is charged like any crash), and
++        ``spawn_failed`` (endCustody + recordTaskFailure(releaseClaim, endRun)), refused with NotImplementedError
++        as on the leases route."""
+         task, run = op["task"], op["run_uid"]
+         if op.get("outcome", "released") not in self.RELEASE_OUTCOMES:
+             return {"status": "rejected", "reason": "invalid"}
++        if op.get("outcome") == "spawn_failed":
++            raise NotImplementedError("FakeService.release_op: spawn_failed release (endCustody + "
++                                      "recordTaskFailure) is not modelled")
+         lease = b["leases"].get(task)
+         if not lease or lease["holder"] != gw or lease["run_uid"] != run:
+             return {"status": "rejected", "reason": "lease_lost"}
+-        # releaseDiagnostic runs after fence(), before any write, for every outcome.
+-        diagnostic = self.release_diagnostic(op.get("diagnostic"))
++        # releaseTask's extra check and releaseDiagnostic run after fence(), before any write, for every outcome.
++        diagnostic = self.release_inputs(op)
+         if diagnostic is None:
+             return {"status": "rejected", "reason": "invalid"}
+         outcome, op_id = op.get("outcome", "released"), op["client_op_id"]
+@@ -313,9 +371,9 @@ class FakeHub:
+                 # releaseTask's fence(): a release that does not name this gateway's live lease run is refused and
+                 # changes nothing (the card keeps its lease and mirror).
+                 return {"status": "rejected", "reason": "lease_lost", "lease": cur}
+-            # releaseDiagnostic runs after fence(), before any write: a non-object diagnostic is ``invalid`` for
+-            # every outcome and changes nothing.
+-            diagnostic = self.svc.release_diagnostic(body.get("diagnostic"))
++            # releaseTask's extra check and releaseDiagnostic run after fence(), before any write: a non-object
++            # extra or diagnostic is ``invalid`` for every outcome and changes nothing.
++            diagnostic = self.svc.release_inputs(body)
+             if diagnostic is None:
+                 return {"status": "rejected", "reason": "invalid", "lease": cur}
+             b["leases"].pop(task, None)
+@@ -339,8 +397,8 @@ class FakeHub:
+         a running card goes back to ``retry`` (retryStatusForRun) and the run-outcome event always carries it as
+         ``retry_status``.
+ 
+-        Modelled outcomes (anything outside ``FakeService.RELEASE_OUTCOMES``, or a non-object ``diagnostic``, is
+-        refused ``invalid`` before this); run metadata and event evidence come from
++        Modelled outcomes (anything outside ``FakeService.RELEASE_OUTCOMES``, a non-object ``extra`` or a
++        non-object ``diagnostic``, is refused ``invalid`` before this); run metadata and event evidence come from
+         :meth:`FakeService.release_evidence`, shared with :meth:`FakeService.release_op`:
+         - neutral (``FakeService.NEUTRAL`` = NEUTRAL_RELEASES): the run ends as its mapped outcome and emits its
+           mapped event; the holder's ``extra`` (plus ``owner_restart: true``) is merged into run metadata and payload.
+diff --git a/tests/hermes_cli/test_kanban_sync_rejections.py b/tests/hermes_cli/test_kanban_sync_rejections.py
+index 15cc82baeb..1be5ca1cce 100644
+--- a/tests/hermes_cli/test_kanban_sync_rejections.py
++++ b/tests/hermes_cli/test_kanban_sync_rejections.py
+@@ -512,13 +512,56 @@ def test_fake_release_rejects_non_object_diagnostic(live, kanban_home, route, le
+     assert svc.board(BOARD) == before
+ 
+ 
+-def test_fake_lease_release_spawn_failed_is_not_modelled(live, kanban_home):
+-    """releaseTask hands spawn_failed to endCustody + recordTaskFailure; the fake refuses it loudly."""
++@pytest.mark.parametrize("route,lease_runs", [("leases", True), ("leases", False), ("ops", True)])
++@pytest.mark.parametrize("outcome", ["released", "crashed", "timed_out", "owner_down"])
++@pytest.mark.parametrize("extra", [[], "", 0, False, "host", [["host", "mini"]]])
++def test_fake_release_rejects_non_object_extra(live, kanban_home, route, lease_runs, outcome, extra):
++    """As releaseTask: ``op.extra ?? {}`` that is not an object is ``invalid`` ("failure extra must be an object")
++    for every outcome, before releaseDiagnostic, and changes nothing."""
++    svc = FakeService(lease_runs=lease_runs)
++    hub, tid = _leased(live, svc)
++    before = copy.deepcopy(svc.board(BOARD))
++    res = _release(route, svc, hub, tid, outcome=outcome, extra=extra, diagnostic={"rc": 1})
++    assert (res["status"], res["reason"]) == ("rejected", "invalid")
++    assert svc.board(BOARD) == before
++
++
++@pytest.mark.parametrize("route", ["leases", "ops"])
++def test_fake_release_null_extra_is_empty(live, kanban_home, route):
++    """``extra: null`` is ``op.extra ?? {}`` = ``{}``: a neutral release applies with no holder metadata."""
+     svc = FakeService(lease_runs=True)
+     hub, tid = _leased(live, svc)
++    assert _release(route, svc, hub, tid, outcome="owner_down", extra=None)["status"] == "applied"
++    assert svc.board(BOARD)["rows"]["task_runs"][RUN]["metadata"] is None
++
++
++@pytest.mark.parametrize("number,literal", [
++    (1.0, "1"), (-0.0, "0"), (123.456, "123.456"), (1e16, "10000000000000000"), (1e20, "100000000000000000000"),
++    (1e21, "1e+21"), (1.5e300, "1.5e+300"), (1e-7, "1e-7"), (1.25e-7, "1.25e-7"), (0.00001, "0.00001"),
++    (0.000001, "0.000001"), (float("nan"), "null"), (float("inf"), "null"), (float("-inf"), "null"),
++    (10**21, "1e+21"), (2**60, "1152921504606847000"), (10**400, "null"), (True, "true"), (None, "null"),
++    ([1.0, float("nan"), "é"], '[1,null,"é"]'), ({"k": 2.50}, '{"k":2.5}'),
++], ids=lambda v: repr(v)[:24])
++def test_fake_release_diagnostic_counts_numbers_like_json_stringify(number, literal):
++    """releaseDiagnostic measures ``JSON.stringify(value).length``: a number in the diagnostic counts as JS writes
++    it (1.0 -> ``1``, 1e-7 -> ``1e-7``, NaN/Infinity -> ``null``), not as Python's ``json.dumps``."""
++    frame = '{"v":' + literal + ',"tail":""}'
++    fill = FakeService.MAX_DIAGNOSTIC_CHARS - len(frame)
++    kept = FakeService.release_diagnostic({"v": number, "tail": "x" * fill})
++    assert kept is not None and "diagnostic_truncated" not in kept
++    assert FakeService.release_diagnostic({"v": number, "tail": "x" * (fill + 1)}) == {"diagnostic_truncated": True}
++
++
++@pytest.mark.parametrize("route,lease_runs", [("leases", True), ("ops", True)])
++def test_fake_release_spawn_failed_is_not_modelled(live, kanban_home, route, lease_runs):
++    """releaseTask hands spawn_failed to endCustody + recordTaskFailure; the fake refuses it loudly on both
++    routes and changes nothing."""
++    svc = FakeService(lease_runs=lease_runs)
++    hub, tid = _leased(live, svc)
++    before = copy.deepcopy(svc.board(BOARD))
+     with pytest.raises(NotImplementedError):
+-        hub.leases(BOARD, {"action": "release", "task": tid, "run_uid": RUN, "client_op_id": "r",
+-                           "outcome": "spawn_failed"})
++        _release(route, svc, hub, tid, outcome="spawn_failed")
++    assert svc.board(BOARD) == before
+     assert svc.board(BOARD)["leases"][tid]["run_uid"] == RUN
+ 
+ 
+-- 
+2.51.0
+

@@ -1,0 +1,768 @@
+From 920f3f23ac45a7c7f4606ade167771df7f7643e8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:50:15 +0000
+Subject: [PATCH] [daveey] gateway: no per-request stat/realpath on the event
+ loop; scratch GC off the board lock
+
+laptop-1's gateway logged 288 event-loop stalls in an hour (1269 s), ~10/min while
+`hermes kanban gc` removed scratch workspaces. Outside the plugin discovery lock (PR #1923),
+the leaf frames were per-request filesystem calls on the loop, and Desktop session-ticket
+bootstraps queued behind them for 25-45 s.
+
+- Plugin consent gate: `_get_dashboard_plugins` stat'ed every plugin dir (~80) on every
+  /api/plugins/* HTTP and WS request. The sweep now runs at most once per
+  DASHBOARD_PLUGINS_STALE_CHECK_SECS (5 s), and `_plugin_api_request_refused` reads the cached
+  list only (`_fresh_dashboard_plugins`), sending a due sweep or rescan to a worker thread.
+  A secondary profile's list gets the same window.
+- `_config_profile_scope` compares homes with the memoized `hermes_home_key`, and
+  `get_secret_source_values` / hydration use a memoized home key (`env_loader._home_key`;
+  existing homes only, as hermes_home_key does). `_is_process_home` uses hermes_home_key too.
+- Control socket `_posix_peer_subject`: the home's "no symlinked component" realpath verdict
+  is reused for 30 s (passes only). The home is still lstat'ed per connection, so it turning
+  into a symlink or changing owner/mode is refused at once.
+- `gc_task_scratch` holds the board write lock only for the candidate SELECT. The inventory,
+  walks and rmtree run outside it; each removal re-checks the owner (unchanged path and
+  completion, terminal, no active children, no live sharer or job) in a short txn and detaches
+  the tree by rename there, then removes the detached copy unlocked.
+
+Tests (RED on base: 10 failures; GREEN 12/12):
+tests/hermes_cli/test_loop_fs_request_paths.py,
+tests/gateway/test_control_socket_peer_realpath_cache.py,
+tests/hermes_cli/test_kanban_scratch_gc_lock_scope.py.
+Every test file referencing the changed functions (98 files, 1739 tests) passes.
+
+Left on request paths (not changed here): serve_css / serve_spa static handlers
+(is_file/resolve/read_text per asset request), `load_config_readonly`'s per-call config stat
+in the consent gate, `load_env_file` / managed .env reads in `build_profile_secret_scope`
+per scoped request, `home_mode_unsafe`'s ACL/getpwall probe when the home is group-writable,
+and the secondary-profile `plugin_api_path` resolve in `in_process_router_refused`.
+
+Card: t_01a1d3ac14d0b207
+---
+ agent/secret_scope.py                         |   4 +-
+ gateway/control_socket.py                     |  19 ++-
+ hermes_cli/env_loader.py                      |  24 +++-
+ hermes_cli/kanban_worktree_gc.py              | 101 +++++++++-----
+ hermes_cli/web_server.py                      |  43 ++++--
+ hermes_cli/web_server_dashboard.py            |   9 +-
+ hermes_cli/web_server_plugin_profiles.py      |  26 +++-
+ hermes_cli/web_server_profiles.py             |   8 +-
+ ...test_control_socket_peer_realpath_cache.py |  68 ++++++++++
+ .../test_kanban_scratch_gc_lock_scope.py      |  95 +++++++++++++
+ .../hermes_cli/test_loop_fs_request_paths.py  | 127 ++++++++++++++++++
+ 11 files changed, 472 insertions(+), 52 deletions(-)
+ create mode 100644 tests/gateway/test_control_socket_peer_realpath_cache.py
+ create mode 100644 tests/hermes_cli/test_kanban_scratch_gc_lock_scope.py
+ create mode 100644 tests/hermes_cli/test_loop_fs_request_paths.py
+
+diff --git a/agent/secret_scope.py b/agent/secret_scope.py
+index 2f685a9248..e1fb67f065 100644
+--- a/agent/secret_scope.py
++++ b/agent/secret_scope.py
+@@ -474,9 +474,9 @@ def _is_process_home(hermes_home: Path) -> bool:
+     """Is *hermes_home* the profile this process serves as its own? Same launch-home identity as
+     ``serves_routed_profile()``: a host that mirrors a served profile into ``HERMES_HOME`` would
+     otherwise seed the launch profile's bridged allow-all grant into that profile's scope."""
+-    from hermes_constants import get_routing_process_hermes_home
++    from hermes_constants import get_routing_process_hermes_home, hermes_home_key
+     try:
+-        return Path(hermes_home).resolve() == get_routing_process_hermes_home().resolve()
++        return hermes_home_key(hermes_home) == hermes_home_key(get_routing_process_hermes_home())
+     except OSError:
+         return False
+ 
+diff --git a/gateway/control_socket.py b/gateway/control_socket.py
+index 5f554d5d16..d3c9201125 100644
+--- a/gateway/control_socket.py
++++ b/gateway/control_socket.py
+@@ -541,6 +541,23 @@ class GatewayControlServer:
+                 "instance_id": self.ticket_store.instance_id,
+                 "profile_id": params["profile_id"], "runtime_protocol": 1}
+ 
++    # How long a "no symlinked component in the home's path" verdict is reused. The check is a
++    # realpath (an lstat per component) and ran on the event loop for every control connection;
++    # under FS pressure each one stalled the loop for seconds (session-ticket bootstraps queued
++    # behind it). The home itself is still lstat'ed per connection: it turning into a symlink, or
++    # its owner/mode changing, is caught at once; only an ancestor swap waits for this window.
++    _HOME_REALPATH_TTL_SECS = 30.0
++
++    def _home_unsymlinked(self, home: Path) -> bool:
++        cached = getattr(self, "_home_realpath_verdict", None)
++        now = time.monotonic()
++        if cached is not None and cached[0] == home and now - cached[1] < self._HOME_REALPATH_TTL_SECS:
++            return True
++        verdict = home.absolute() == home.resolve()
++        # Only a pass is reused: a refusal is re-checked, so a repaired home is admitted at once.
++        self._home_realpath_verdict = (home, now) if verdict else None
++        return verdict
++
+     def _posix_peer_subject(self, writer) -> Optional[str]:
+         # The legacy diagnostic channel may operate without bootstrap-safe metadata.
+         if os.name == "nt":
+@@ -549,7 +566,7 @@ class GatewayControlServer:
+             from hermes_cli.gateway_runtime_discovery import home_mode_unsafe, socket_peer_uid
+             home = self._home
+             info = home.lstat()
+-            if (home.absolute() != home.resolve() or not stat.S_ISDIR(info.st_mode)
++            if (not stat.S_ISDIR(info.st_mode) or not self._home_unsymlinked(home)
+                     or info.st_uid != os.getuid() or home_mode_unsafe(info, home)):  # windows-footgun: ok — POSIX-only helper
+                 return None
+             uid = socket_peer_uid(writer.get_extra_info("socket"))
+diff --git a/hermes_cli/env_loader.py b/hermes_cli/env_loader.py
+index 4cff9e2c01..125b022e86 100644
+--- a/hermes_cli/env_loader.py
++++ b/hermes_cli/env_loader.py
+@@ -185,9 +185,29 @@ def adopt_env_provenance(provenance: dict[str, list[str]]) -> None:
+     _MANAGED_DOTENV_KEYS.update(provenance.get("managed", ()))
+ 
+ 
++def _home_key(hermes_home: str | os.PathLike) -> str:
++    """``str(Path(hermes_home).resolve())``, the key of the per-home source maps, memoized per input
++    for a home that exists (a missing one is resolved again: it may yet appear as a symlink). The
++    dashboard and control paths build a secret scope on the event loop for every request, and a
++    per-request realpath stalled that loop for seconds under FS pressure."""
++    raw = os.fspath(hermes_home)
++    cached = _HOME_KEYS.get(raw)
++    if cached is not None:
++        return cached
++    try:
++        key = str(Path(raw).resolve(strict=True))
++    except OSError:
++        return str(Path(raw).resolve())
++    _HOME_KEYS[raw] = key
++    return key
++
++
++_HOME_KEYS: dict[str, str] = {}
++
++
+ def get_secret_source_values(hermes_home: str | os.PathLike) -> dict[str, str]:
+     """Return the external-secret value snapshot for ``hermes_home``."""
+-    return dict(_SECRET_SOURCE_VALUES_BY_HOME.get(str(Path(hermes_home).resolve()), {}))
++    return dict(_SECRET_SOURCE_VALUES_BY_HOME.get(_home_key(hermes_home), {}))
+ 
+ 
+ def hydrate_profile_secret_sources(hermes_home: str | os.PathLike) -> dict[str, str]:
+@@ -207,7 +227,7 @@ def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
+ 
+     if worker_config_snapshot() is not None:
+         return {}
+-    home_key = str(home.resolve())
++    home_key = _home_key(home)
+     if home_key in _APPLIED_HOMES:
+         return get_secret_source_values(home)
+ 
+diff --git a/hermes_cli/kanban_worktree_gc.py b/hermes_cli/kanban_worktree_gc.py
+index 1cb06b284c..c22257a5c5 100644
+--- a/hermes_cli/kanban_worktree_gc.py
++++ b/hermes_cli/kanban_worktree_gc.py
+@@ -14,6 +14,7 @@ import os
+ import re
+ import sqlite3
+ import time
++import uuid
+ from pathlib import Path
+ 
+ from hermes_cli import kanban_db_workspace as ws
+@@ -40,7 +41,9 @@ def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: int | None = N
+ 
+     Only task records establish ownership; never infer it from directory names.
+     Read every board before the first removal, even if an earlier board reports
+-    a live sharer. Keep the selected owner locked against concurrent resumption.
++    a live sharer. The owner is re-checked (unchanged, terminal, no active
++    children) in a short write txn right before each removal, which detaches
++    the tree by rename there; walks and rmtree never hold the board lock.
+ 
+     A tree that is kept only because it holds standalone git clones is archived
+     and then removed once its card finished more than *older_than_days* ago
+@@ -53,36 +56,44 @@ def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: int | None = N
+     days = retention_days() if older_than_days is None else older_than_days
+     removed = 0
+     aged: list[tuple[str, Path, int | None]] = []
++    # Only the candidate SELECT holds the board's write lock. The inventory, the tree walks and
++    # every rmtree run outside it (they took 11 min for 29 trees on a loaded Mac, holding BEGIN
++    # IMMEDIATE on the board throughout); each removal re-checks its owner in a short write txn
++    # and detaches the tree by rename there, so a card resumed mid-GC never sees it half-deleted.
+     with kb.write_txn(conn):
+-        try:
+-            rows = conn.execute(
+-                "SELECT t.id, t.workspace_path, t.completed_at, t.created_at, "
+-                "(SELECT MAX(created_at) FROM task_events e WHERE e.task_id=t.id "
+-                " AND e.kind NOT LIKE 'workspace%') AS last_event "
+-                "FROM tasks t WHERE t.workspace_kind='scratch' "
+-                f"AND t.status IN {ws._TERMINAL_STATUSES_SQL}"
+-            ).fetchall()
+-            known_paths = _scratch_owner_paths(conn)
+-            for board in ws._sibling_board_db_files(conn):
+-                with _read_board(board) as other:
+-                    known_paths.update(_scratch_owner_paths(other))
+-        except (OSError, sqlite3.Error):
+-            log.warning("Scratch GC aborted: cannot read all boards; preserving workspaces", exc_info=True)
+-            return 0
+-        try:
+-            _report_unowned_scratch(kb.workspaces_root(), known_paths)
+-        except OSError:
+-            log.warning("Scratch preservation inventory unavailable; unknown paths remain preserved",
+-                        exc_info=True)
+-        for row in rows:
+-            path = Path(row["workspace_path"] or (kb.workspaces_root() / row["id"])).expanduser()
+-            if not path.is_dir() or path.is_symlink() or not ws._is_managed_scratch_path(path):
+-                continue
+-            if ws._has_active_children(conn, row["id"]):
+-                continue
+-            removable = ws._scratch_tree_removable(path)
+-            if not removable and not _finished_before(row, days):
+-                _report_scratch_retention(row, path, days)
++        rows = conn.execute(
++            "SELECT t.id, t.workspace_path, t.workspace_kind, t.completed_at, t.created_at, "
++            "(SELECT MAX(created_at) FROM task_events e WHERE e.task_id=t.id "
++            " AND e.kind NOT LIKE 'workspace%') AS last_event "
++            "FROM tasks t WHERE t.workspace_kind='scratch' "
++            f"AND t.status IN {ws._TERMINAL_STATUSES_SQL}"
++        ).fetchall()
++    try:
++        known_paths = _scratch_owner_paths(conn)
++        for board in ws._sibling_board_db_files(conn):
++            with _read_board(board) as other:
++                known_paths.update(_scratch_owner_paths(other))
++    except (OSError, sqlite3.Error):
++        log.warning("Scratch GC aborted: cannot read all boards; preserving workspaces", exc_info=True)
++        return 0
++    try:
++        _report_unowned_scratch(kb.workspaces_root(), known_paths)
++    except OSError:
++        log.warning("Scratch preservation inventory unavailable; unknown paths remain preserved",
++                    exc_info=True)
++    for row in rows:
++        path = Path(row["workspace_path"] or (kb.workspaces_root() / row["id"])).expanduser()
++        if not path.is_dir() or path.is_symlink() or not ws._is_managed_scratch_path(path):
++            continue
++        if ws._has_active_children(conn, row["id"]):
++            continue
++        removable = ws._scratch_tree_removable(path)
++        if not removable and not _finished_before(row, days):
++            _report_scratch_retention(row, path, days)
++            continue
++        trash = None
++        with kb.write_txn(conn):
++            if not _scratch_owner_unchanged(conn, row, path):
+                 continue
+             if ws._defer_shared_workspace_cleanup(conn, row["id"], path):
+                 continue
+@@ -92,10 +103,17 @@ def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: int | None = N
+                 aged.append((row["id"], path, row["completed_at"]))
+                 continue
+             ws.release_lsp_clients(str(path))
+-            shutil.rmtree(path, ignore_errors=True)
+-            if not path.exists():
+-                ws._log_scratch_removal(conn, row["id"], path, "scratch workspace (GC retry)")
+-                removed += 1
++            trash = path.with_name(f".{path.name}.gc-rm-{uuid.uuid4().hex}")
++            try:
++                os.rename(path, trash)
++            except OSError:
++                log.warning("Scratch GC could not detach %s; keeping it", path, exc_info=True)
++                continue
++            ws._log_scratch_removal(conn, row["id"], path, "scratch workspace (GC retry)")
++            removed += 1
++        shutil.rmtree(trash, ignore_errors=True)
++        if os.path.lexists(trash):
++            log.warning("Scratch GC left detached tree %s (from %s) after a partial removal", trash, path)
+     # Archiving runs git for minutes on big clones: never hold the board's write lock for it.
+     for task_id, path, completed_at in aged:
+         removed += _archive_and_remove_scratch(conn, task_id, path, completed_at)
+@@ -104,6 +122,21 @@ def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: int | None = N
+     return removed
+ 
+ 
++def _scratch_owner_unchanged(conn: sqlite3.Connection, row: sqlite3.Row, path: Path) -> bool:
++    """Inside the removal txn: the candidate's task still owns ``path`` exactly as selected, is
++    still terminal and has no active children (it may have been resumed or reassigned since)."""
++    from hermes_cli import kanban_db as kb
++    current = conn.execute("SELECT workspace_kind, workspace_path, completed_at FROM tasks WHERE id=?",
++                           (row["id"],)).fetchone()
++    if current is None or current["workspace_kind"] != "scratch":
++        return False
++    if (current["workspace_path"], current["completed_at"]) != (row["workspace_path"], row["completed_at"]):
++        return False
++    if Path(current["workspace_path"] or (kb.workspaces_root() / row["id"])).expanduser() != path:
++        return False
++    return ws._is_terminal_task(conn, row["id"]) and not ws._has_active_children(conn, row["id"])
++
++
+ def _scratch_owner_paths(conn: sqlite3.Connection) -> set[Path]:
+     """Read local records only; this inventory never supplies deletion candidates."""
+     from hermes_cli import kanban_db as kb
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index e55eea8c45..e92c27a925 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -952,21 +952,48 @@ _ACTION_LOG_FILES.setdefault("computer-use-grant", "action-computer-use-grant.lo
+ 
+ # Cache discovered plugins per-process (refresh on explicit re-scan).
+ _dashboard_plugins_cache: Optional[list] = None
++# The cache list last proven current (every plugin dir still present) and when. The dir sweep stats
++# every plugin (~80 on a Mac) and ran on the event loop for each /api/plugins/* request; under FS
++# pressure that stalled the loop for seconds per request. Identity, not just time: a list assigned
++# directly (tests, a rescan) is unproven until swept.
++DASHBOARD_PLUGINS_STALE_CHECK_SECS = 5.0
++_dashboard_plugins_checked: tuple = (None, 0.0)
++
++
++def _fresh_dashboard_plugins() -> Optional[list]:
++    """The active scope's cached plugin list when it was proven current within
++    :data:`DASHBOARD_PLUGINS_STALE_CHECK_SECS`, else None. No disk access: the request gate reads
++    this on the event loop and sends a miss to :func:`_get_dashboard_plugins` on a worker thread."""
++    from hermes_cli.web_server_plugin_profiles import fresh_profile_dashboard_plugins, secondary_profile_home
++    home = secondary_profile_home()
++    if home is not None:
++        return fresh_profile_dashboard_plugins(home)
++    checked, at = _dashboard_plugins_checked
++    cache = _dashboard_plugins_cache
++    if cache is not None and checked is cache and time.monotonic() - at < DASHBOARD_PLUGINS_STALE_CHECK_SECS:
++        return cache
++    return None
+ 
+ 
+ def _get_dashboard_plugins(force_rescan: bool = False) -> list:
+-    """The active scope's dashboard plugins: a secondary profile's are its own (PLG-3)."""
+-    global _dashboard_plugins_cache
++    """The active scope's dashboard plugins: a secondary profile's are its own (PLG-3).
++
++    A removed plugin dir triggers a rescan, checked at most once per
++    :data:`DASHBOARD_PLUGINS_STALE_CHECK_SECS`; ``force_rescan`` always rescans."""
++    global _dashboard_plugins_cache, _dashboard_plugins_checked
+     from hermes_cli.web_server_plugin_profiles import profile_dashboard_plugins, secondary_profile_home
+     home = secondary_profile_home()
+     if home is not None:
+         return profile_dashboard_plugins(home, force_rescan)
+-    stale = _dashboard_plugins_cache is None or force_rescan or any(
+-        not Path(p["_dir"]).is_dir() for p in _dashboard_plugins_cache
+-    )
+-    if stale:
+-        _dashboard_plugins_cache = _discover_dashboard_plugins()
+-    return _dashboard_plugins_cache
++    if not force_rescan:
++        fresh = _fresh_dashboard_plugins()
++        if fresh is not None:
++            return fresh
++    cache = _dashboard_plugins_cache
++    if cache is None or force_rescan or any(not Path(p["_dir"]).is_dir() for p in cache):
++        cache = _dashboard_plugins_cache = _discover_dashboard_plugins()
++    _dashboard_plugins_checked = (cache, time.monotonic())
++    return cache
+ 
+ 
+ # Router mounting. ORDER IS ROUTE-MATCHING ORDER: literal paths must land before
+diff --git a/hermes_cli/web_server_dashboard.py b/hermes_cli/web_server_dashboard.py
+index c00210b525..99b80739c2 100644
+--- a/hermes_cli/web_server_dashboard.py
++++ b/hermes_cli/web_server_dashboard.py
+@@ -912,9 +912,14 @@ async def _plugin_api_request_refused(name: str) -> bool:
+     keeps its router mounted until restart, so every request is checked again. An unknown name
+     counts as a user plugin (safe default: refused).
+     """
+-    from hermes_cli.web_server import _get_dashboard_plugins
++    from hermes_cli.web_server import _fresh_dashboard_plugins, _get_dashboard_plugins
+     from hermes_cli.web_server_plugin_profiles import rescanned_plugin, secondary_profile_home
+-    plugin = next((p for p in _get_dashboard_plugins() if p.get("name") == name), None)
++    # Runs on the event loop for every request: read the cached list, and leave its plugin-dir
++    # sweep (a stat per plugin, or a full rescan) to a worker thread once the cache is due.
++    plugins = _fresh_dashboard_plugins()
++    if plugins is None:
++        plugins = await asyncio.to_thread(_get_dashboard_plugins)
++    plugin = next((p for p in plugins if p.get("name") == name), None)
+     home = secondary_profile_home()
+     if plugin is None and home is not None:  # installed since the last scan (rate-limited per name)
+         plugin = await asyncio.to_thread(rescanned_plugin, home, name)  # a disk scan: off the event loop
+diff --git a/hermes_cli/web_server_plugin_profiles.py b/hermes_cli/web_server_plugin_profiles.py
+index d999abe829..4c2b22826c 100644
+--- a/hermes_cli/web_server_plugin_profiles.py
++++ b/hermes_cli/web_server_plugin_profiles.py
+@@ -39,6 +39,8 @@ _GATEWAY_CREDENTIAL_HEADERS = frozenset({
+ _GATEWAY_QUERY_KEYS = frozenset({"token", "ticket", "internal", "display_ticket", "attach", "profile"})
+ 
+ _profile_plugins: dict[str, list] = {}
++# Per home: the cached list last proven current (plugin dirs present) and when (monotonic).
++_profile_plugins_checked: dict[str, tuple] = {}
+ # Bumped by each explicit rescan of a profile: a scan begun before it publishes neither its list nor a miss.
+ _profile_rescans: dict[str, int] = {}
+ # Guards these module dicts only; disk scans run without it, so a scan never blocks another caller.
+@@ -87,10 +89,29 @@ def _published(key: str, rescans: int, plugins: list) -> list:
+     return plugins
+ 
+ 
++def fresh_profile_dashboard_plugins(home: Path) -> Optional[list]:
++    """``home``'s cached list when its plugin dirs were proven present within the launch list's
++    stale-check window (``web_server.DASHBOARD_PLUGINS_STALE_CHECK_SECS``), else None. No disk access."""
++    from hermes_cli.web_server import DASHBOARD_PLUGINS_STALE_CHECK_SECS
++    from hermes_constants import hermes_home_key
++    key = hermes_home_key(home)
++    with _profile_plugins_lock:
++        cached = _profile_plugins.get(key)
++        checked, at = _profile_plugins_checked.get(key, (None, 0.0))
++    if cached is not None and checked is cached and time.monotonic() - at < DASHBOARD_PLUGINS_STALE_CHECK_SECS:
++        return cached
++    return None
++
++
+ def profile_dashboard_plugins(home: Path, force_rescan: bool = False) -> list:
+     """Dashboard plugins of the profile at ``home`` (:func:`_scan_profile_plugins`), cached per home
+-    like the launch profile's list. An explicit rescan also forgets the profile's cached misses."""
++    like the launch profile's list (its plugin dirs re-checked at most once per stale-check window).
++    An explicit rescan also forgets the profile's cached misses."""
+     from hermes_constants import hermes_home_key
++    if not force_rescan:
++        fresh = fresh_profile_dashboard_plugins(home)
++        if fresh is not None:
++            return fresh
+     key = hermes_home_key(home)
+     with _profile_plugins_lock:
+         if force_rescan:
+@@ -100,6 +121,9 @@ def profile_dashboard_plugins(home: Path, force_rescan: bool = False) -> list:
+         cached, rescans = _profile_plugins.get(key), _profile_rescans.get(key, 0)
+     if cached is None or force_rescan or any(not Path(p["_dir"]).is_dir() for p in cached):
+         cached = _published(key, rescans, _scan_profile_plugins(home))
++    with _profile_plugins_lock:
++        if _profile_plugins.get(key) is cached:
++            _profile_plugins_checked[key] = (cached, time.monotonic())
+     return cached
+ 
+ 
+diff --git a/hermes_cli/web_server_profiles.py b/hermes_cli/web_server_profiles.py
+index e2153f9684..68c1402227 100644
+--- a/hermes_cli/web_server_profiles.py
++++ b/hermes_cli/web_server_profiles.py
+@@ -262,7 +262,7 @@ def _config_profile_scope(profile: Optional[str]):
+     """
+     from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
+     from hermes_cli.env_loader import hydrate_profile_secret_sources
+-    from hermes_constants import get_hermes_home, get_hermes_home_override
++    from hermes_constants import get_hermes_home, get_hermes_home_override, hermes_home_key
+     from tui_gateway.launch_profile_policy import activate_multi_profile_hosting, launch_secret_scope
+ 
+     process_home = get_process_hermes_home()
+@@ -270,7 +270,11 @@ def _config_profile_scope(profile: Optional[str]):
+         profile_dir = get_hermes_home() if get_hermes_home_override() else None
+     else:
+         profile_dir = _resolve_profile_dir(profile.strip())
+-    scoped = None if profile_dir is None or profile_dir.resolve() == process_home.resolve() else profile_dir
++    # ``hermes_home_key`` memoizes each home's realpath: this runs on the event loop for every
++    # scoped request (plugin routes, ``?profile=``), and a per-request realpath stalled it under
++    # FS pressure.
++    scoped = (None if profile_dir is None or hermes_home_key(profile_dir) == hermes_home_key(process_home)
++              else profile_dir)
+     if scoped is not None:
+         activate_multi_profile_hosting()
+         hydrate_profile_secret_sources(scoped)  # first call may block on the source's fetch
+diff --git a/tests/gateway/test_control_socket_peer_realpath_cache.py b/tests/gateway/test_control_socket_peer_realpath_cache.py
+new file mode 100644
+index 0000000000..ac1b59e140
+--- /dev/null
++++ b/tests/gateway/test_control_socket_peer_realpath_cache.py
+@@ -0,0 +1,68 @@
++"""The control socket's per-connection peer check must not realpath the home on the event loop
++for every connection (t_01a1d3ac14d0b207): under FS pressure each one stalled session-ticket
++bootstraps for seconds."""
++import os
++import socket
++import threading
++import time
++from pathlib import Path
++
++import pytest
++
++pytestmark = pytest.mark.platforms("linux")  # SO_PEERCRED
++
++
++class _Writer:
++    def __init__(self, sock):
++        self._sock = sock
++
++    def get_extra_info(self, _key):
++        return self._sock
++
++
++def _slow(real):
++    def wrapper(*args, **kwargs):
++        threading.Event().wait(0.2)  # health: allow HX013 -- a slow realpath IS the behaviour under test
++        return real(*args, **kwargs)
++    return wrapper
++
++
++def test_repeat_peer_check_reuses_the_home_realpath(tmp_path, monkeypatch):
++    """Test B: after a warm call, a repeat peer check costs no realpath."""
++    from gateway.control_socket import GatewayControlServer
++    home = tmp_path / "home"
++    home.mkdir(mode=0o700)
++    ours, _theirs = socket.socketpair(socket.AF_UNIX)
++    server = GatewayControlServer(home)
++    assert server._posix_peer_subject(_Writer(ours)) == f"uid:{os.getuid()}"
++    # Path.resolve only: the test harness's home-IO guard itself calls os.path.realpath per syscall.
++    monkeypatch.setattr(Path, "resolve", _slow(Path.resolve))
++    started = time.monotonic()
++    assert server._posix_peer_subject(_Writer(ours)) == f"uid:{os.getuid()}"
++    assert time.monotonic() - started < 0.05
++
++
++def test_home_swapped_for_a_symlink_is_refused_at_once(tmp_path):
++    """The home itself is still lstat'ed per connection: the cached verdict never admits a home
++    that became a symlink."""
++    from gateway.control_socket import GatewayControlServer
++    home = tmp_path / "home"
++    home.mkdir(mode=0o700)
++    ours, _theirs = socket.socketpair(socket.AF_UNIX)
++    server = GatewayControlServer(home)
++    assert server._posix_peer_subject(_Writer(ours)) == f"uid:{os.getuid()}"
++    home.rename(tmp_path / "moved")
++    home.symlink_to(tmp_path / "moved")
++    assert server._posix_peer_subject(_Writer(ours)) is None
++
++
++def test_symlinked_ancestor_refusal_is_not_cached(tmp_path, monkeypatch):
++    from gateway.control_socket import GatewayControlServer
++    home = tmp_path / "home"
++    home.mkdir(mode=0o700)
++    ours, _theirs = socket.socketpair(socket.AF_UNIX)
++    server = GatewayControlServer(home)
++    verdicts = iter([False, True])
++    monkeypatch.setattr(Path, "absolute", lambda self: self if next(verdicts) else self / "x")
++    assert server._posix_peer_subject(_Writer(ours)) is None
++    assert server._posix_peer_subject(_Writer(ours)) == f"uid:{os.getuid()}"
+diff --git a/tests/hermes_cli/test_kanban_scratch_gc_lock_scope.py b/tests/hermes_cli/test_kanban_scratch_gc_lock_scope.py
+new file mode 100644
+index 0000000000..941e894f39
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scratch_gc_lock_scope.py
+@@ -0,0 +1,95 @@
++"""Scratch GC must not hold the board's write lock across tree walks and rmtree
++(t_01a1d3ac14d0b207): a ``kanban gc`` on a loaded Mac held BEGIN IMMEDIATE for 11 minutes while
++it removed 29 workspaces. Each removal re-checks its owner in a short txn instead."""
++import shutil
++import sqlite3
++import threading
++import time
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_worktree_gc as gc
++from tests.hermes_cli import test_kanban_scratch_gc_archive as helpers
++
++board = helpers.board
++
++
++def _db_path():
++    with kbc.connect_closing() as conn:
++        return conn.execute("PRAGMA database_list").fetchone()["file"]
++
++
++def _run_gc():
++    with kbc.connect_closing() as conn:
++        return gc.gc_task_scratch(conn, older_than_days=7)
++
++
++def test_board_writable_while_scratch_gc_removes_trees(board, monkeypatch):
++    """Test C: another connection's BEGIN IMMEDIATE succeeds while a slow rmtree runs."""
++    paths = [helpers._task()[1] for _ in range(3)]
++    db, real_rmtree = _db_path(), shutil.rmtree
++    waits = []
++
++    def slow_rmtree(path, *args, **kwargs):
++        other = sqlite3.connect(db, timeout=0.5, isolation_level=None)
++        started = time.monotonic()
++        try:
++            other.execute("BEGIN IMMEDIATE")
++            other.execute("ROLLBACK")
++            waits.append(time.monotonic() - started)
++        except sqlite3.OperationalError as exc:
++            waits.append(exc)
++        finally:
++            other.close()
++        threading.Event().wait(1.0)  # health: allow HX013 -- a slow rmtree IS the behaviour under test
++        return real_rmtree(path, *args, **kwargs)
++
++    monkeypatch.setattr(shutil, "rmtree", slow_rmtree)
++    assert _run_gc() == 3
++    assert len(waits) == 3
++    assert all(isinstance(w, float) and w < 0.5 for w in waits), waits
++    assert not any(p.exists() for p in paths)
++    root = kb.workspaces_root()
++    assert not [p for p in root.iterdir() if ".gc-rm-" in p.name]
++
++
++def test_card_resumed_mid_gc_keeps_its_workspace(board, monkeypatch):
++    """Test C: the per-removal ownership re-check skips a card resumed after selection."""
++    tasks = [helpers._task() for _ in range(3)]
++    db, real_rmtree = _db_path(), shutil.rmtree
++    resumed: list[str] = []
++
++    def rmtree_then_resume_the_rest(path, *args, **kwargs):
++        if not resumed:
++            other = sqlite3.connect(db, timeout=0.5, isolation_level=None)
++            try:
++                for tid, tpath in tasks:
++                    if tpath.exists():
++                        other.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
++                        resumed.append(tid)
++            finally:
++                other.close()
++        return real_rmtree(path, *args, **kwargs)
++
++    monkeypatch.setattr(shutil, "rmtree", rmtree_then_resume_the_rest)
++    assert _run_gc() == 1
++    assert len(resumed) == 2
++    for tid, path in tasks:
++        assert path.exists() == (tid in resumed)
++
++
++def test_owner_repointed_mid_gc_keeps_the_tree(board, monkeypatch):
++    tid, path = helpers._task()
++    db = _db_path()
++
++    def repoint_then_walk(p):
++        other = sqlite3.connect(db, timeout=0.5, isolation_level=None)
++        try:
++            other.execute("UPDATE tasks SET workspace_path='/elsewhere' WHERE id=?", (tid,))
++        finally:
++            other.close()
++        return True
++
++    monkeypatch.setattr(gc.ws, "_scratch_tree_removable", repoint_then_walk)
++    assert _run_gc() == 0
++    assert path.exists()
+diff --git a/tests/hermes_cli/test_loop_fs_request_paths.py b/tests/hermes_cli/test_loop_fs_request_paths.py
+new file mode 100644
+index 0000000000..0241954507
+--- /dev/null
++++ b/tests/hermes_cli/test_loop_fs_request_paths.py
+@@ -0,0 +1,127 @@
++"""Per-request filesystem calls that ran on the gateway event loop (t_01a1d3ac14d0b207).
++
++Under FS/CPU pressure (a ``kanban gc`` rmtree sweep on a loaded Mac) each stat or realpath on the
++loop stalled every Desktop request queued behind it for seconds. Each test makes the call slow
++after a warm-up and pins that the repeat request path no longer pays for it.
++"""
++import asyncio
++import os
++import threading
++import time
++from pathlib import Path
++
++import pytest
++
++SLOW = 0.2
++
++
++def _slow(real, calls=None, under=None):
++    """``real`` made slow (and its calls' on-main-thread flags recorded); with ``under``, only for
++    paths below that dir (config loads stat the test home, which is not what is measured)."""
++    def wrapper(*args, **kwargs):
++        if under is not None and not str(args[0]).startswith(str(under)):
++            return real(*args, **kwargs)
++        if calls is not None:
++            calls.append(threading.current_thread() is threading.main_thread())
++        threading.Event().wait(SLOW)  # health: allow HX013 -- a slow filesystem call IS the behaviour under test
++        return real(*args, **kwargs)
++    return wrapper
++
++
++def _plugins_root(cache):
++    return Path(cache[0]["_dir"]).parent
++
++
++@pytest.fixture
++def plugin_cache(tmp_path, monkeypatch):
++    from hermes_cli import web_server
++    dirs = []
++    for i in range(5):
++        d = tmp_path / "plugins" / f"p{i}"
++        d.mkdir(parents=True)
++        dirs.append(d)
++    cache = [{"name": d.name, "_dir": str(d), "source": "bundled"} for d in dirs]
++    monkeypatch.setattr(web_server, "_dashboard_plugins_cache", cache)
++    monkeypatch.setattr(web_server, "_discover_dashboard_plugins",
++                        lambda: [p for p in cache if Path(p["_dir"]).is_dir()])
++    return cache
++
++
++def test_plugin_gate_does_not_stat_plugin_dirs_per_request(plugin_cache, monkeypatch):
++    """Test A: within the stale-check window the gate reads the cached list only."""
++    from hermes_cli import web_server
++    from hermes_cli.web_server_dashboard import _plugin_api_request_refused
++    assert web_server._get_dashboard_plugins() is plugin_cache  # warm: proves the dirs present
++    calls = []
++    monkeypatch.setattr(Path, "is_dir", _slow(Path.is_dir, calls, _plugins_root(plugin_cache)))
++
++    async def twenty():
++        return [await _plugin_api_request_refused("p0") for _ in range(20)]
++
++    started = time.monotonic()
++    assert asyncio.run(twenty()) == [False] * 20
++    assert time.monotonic() - started < 0.5
++    assert calls == []
++
++
++def test_due_plugin_dir_sweep_runs_off_the_event_loop_and_notices_removal(plugin_cache, monkeypatch):
++    from hermes_cli import web_server
++    from hermes_cli.web_server_dashboard import _plugin_api_request_refused
++    monkeypatch.setattr(web_server, "DASHBOARD_PLUGINS_STALE_CHECK_SECS", 0.0)
++    Path(plugin_cache[0]["_dir"]).rmdir()
++    calls = []
++    monkeypatch.setattr(Path, "is_dir", _slow(Path.is_dir, calls, _plugins_root(plugin_cache)))
++    # Gone from disk: rescanned, so it is now unknown (user plugin by default: refused).
++    assert asyncio.run(_plugin_api_request_refused("p0")) is True
++    assert calls and not any(calls), "the dir sweep must run on a worker thread, not the loop"
++
++
++def test_stale_check_window_bounds_the_sweep(plugin_cache, monkeypatch):
++    from hermes_cli import web_server
++    clock = [1000.0]
++    monkeypatch.setattr(web_server.time, "monotonic", lambda: clock[0])
++    web_server._get_dashboard_plugins()
++    Path(plugin_cache[1]["_dir"]).rmdir()
++    assert any(p["name"] == "p1" for p in web_server._get_dashboard_plugins())  # within the window
++    clock[0] += web_server.DASHBOARD_PLUGINS_STALE_CHECK_SECS
++    assert not any(p["name"] == "p1" for p in web_server._get_dashboard_plugins())
++    # A list assigned directly is unproven until swept, whatever the clock says.
++    fresh = [{"name": "x", "_dir": str(Path(plugin_cache[0]["_dir"]).parent / "gone"), "source": "user"}]
++    monkeypatch.setattr(web_server, "_dashboard_plugins_cache", fresh)
++    assert web_server._fresh_dashboard_plugins() is None
++
++
++def test_current_profile_scope_does_not_realpath_per_request(monkeypatch):
++    """Test B: ``_config_profile_scope`` for the dashboard's own profile reuses resolved homes."""
++    from hermes_cli.web_server_profiles import _config_profile_scope
++    with _config_profile_scope(None):
++        pass
++    # Path.resolve only: the test harness's home-IO guard itself calls os.path.realpath per syscall.
++    monkeypatch.setattr(Path, "resolve", _slow(Path.resolve))
++    started = time.monotonic()
++    with _config_profile_scope(None):
++        pass
++    assert time.monotonic() - started < 0.05
++
++
++def test_secret_source_values_reuse_the_resolved_home(tmp_path, monkeypatch):
++    from hermes_cli import env_loader
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setitem(env_loader._SECRET_SOURCE_VALUES_BY_HOME, str(home.resolve()), {"K": "v"})
++    assert env_loader.get_secret_source_values(home) == {"K": "v"}
++    monkeypatch.setattr(Path, "resolve", _slow(Path.resolve))
++    started = time.monotonic()
++    assert env_loader.get_secret_source_values(home) == {"K": "v"}
++    assert time.monotonic() - started < 0.05
++
++
++def test_missing_home_key_is_not_memoized(tmp_path):
++    from hermes_cli import env_loader
++    home = tmp_path / "later"
++    assert env_loader._home_key(home) == str(home.resolve())
++    assert str(home) not in env_loader._HOME_KEYS
++    real = tmp_path / "real"
++    real.mkdir()
++    home.symlink_to(real)
++    assert env_loader._home_key(home) == str(real.resolve())
+-- 
+2.51.0
+

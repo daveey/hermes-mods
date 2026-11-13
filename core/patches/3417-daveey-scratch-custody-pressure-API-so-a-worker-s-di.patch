@@ -1,0 +1,288 @@
+From b17776db3adf500ba45142c38cb946e76b4518cd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:07:31 +0000
+Subject: [PATCH] [daveey] scratch custody: pressure API so a worker's disk
+ reclaim can see evicted-owner trees
+
+hermes-worker-1 (incident t_01a1d43cc9752108, 2026-11-13): of 380 workspace dirs /
+135.8 GB, 265 dirs / 63 GB belong to hub cards already evicted from the local replica.
+They have a kanban_scratch_custody receipt but no tasks row, so the worker
+disk-pressure adapter (state worker_disk_reclaim, which selects tasks rows) never sees
+them, and gc_custody only removes them after the 7-day retention with no time bound.
+worker-8 shows the same shape (62 of 94 dirs, 69 receipts).
+
+Five whys: space fell -> pressure reclaim skipped 63 GB -> its candidates come from
+`tasks` only -> eviction moves ownership into a custody receipt -> core exposes custody
+only through gc_custody (retention age, in-process unbounded archive), so no other
+remover can apply the same guards.
+
+Design pick (documented for the state adapter, card t_01a1d485d6472560): a small public
+API the adapter composes, not a bounded gc_custody(deadline=...). gc_custody archives
+in-process (no fork, no SIGTERM window), deletes "removable" trees with no archive, and
+cannot join the adapter's oldest-first pass across replica rows, receipts and archive
+expiry. The adapter already owns the bounded, process-isolated archive and the
+complete-archive verification; core keeps ownership of the guards and the receipt:
+
+* pressure_candidates(conn, limit) / pressure_candidate(conn, task_id): receipts whose
+  tree is a directory and whose recorded runs all ended, oldest latest-run-end first.
+  Local reads only, no Board call; listing grants nothing.
+* terminal_owner(hub, board, receipt): gc_custody's rule (runs ended, then _terminal
+  fresh Board evidence: done/archived, completed_at, lease expired).
+* removal_guard(conn, receipt): remove_archived guard = _safe for exactly this receipt
+  (unchanged receipt, no local row, no active children, no overlapping receipt,
+  no sharer, idle sessions, no owned job).
+* release(conn, receipt): remove_archived finalize that deletes exactly this receipt
+  (task_id, path and evidence) and raises otherwise, so a changed receipt rolls the
+  detach back and restores the tree.
+
+gc_custody now uses the same _runs_ended / removal_guard / release (its finalize is
+stricter: it matches the whole receipt, which _safe already pinned in the same fence).
+
+Tests (tests/hermes_cli/test_kanban_scratch_custody.py, 7 new cases): listing order,
+bound, no Board call, unended-run / missing-tree exclusion, no custody table; an
+hour-old done evicted tree that gc_custody keeps is archived (verify_complete_archive)
+and removed with its receipt released through the API; terminal_owner refuses running,
+leased and deleted owners and reads no Board for an unended run; a pickup, a live
+session or a receipt change at the final fence keeps tree and receipt. The file passes
+127/127; the five other gc_custody/gc_task_scratch suites pass 81/81; scripts/check ok.
+---
+ hermes_cli/kanban_scratch_custody.py          |  86 ++++++++++++--
+ .../hermes_cli/test_kanban_scratch_custody.py | 107 ++++++++++++++++++
+ 2 files changed, 184 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/kanban_scratch_custody.py b/hermes_cli/kanban_scratch_custody.py
+index c164eaac3c..11109c0428 100644
+--- a/hermes_cli/kanban_scratch_custody.py
++++ b/hermes_cli/kanban_scratch_custody.py
+@@ -2,6 +2,11 @@
+ 
+ Custody establishes a path, not deletion authority. Fresh Board terminal evidence
+ supplies retention, while local pickup and the receipt are fenced at rename.
++
++Two removers share the same guards: the scheduled gc_custody (retention age, in-process
++archive) and a worker's disk-pressure adapter through pressure_candidates /
++terminal_owner / removal_guard / release (no retention age; the adapter bounds and
++isolates archive creation and always removes through remove_archived).
+ """
+ from __future__ import annotations
+ 
+@@ -202,6 +207,76 @@ class _DetachUncommitted(Exception):
+     """The tree was renamed aside but the receipt DELETE did not cleanly commit: stop the pass."""
+ 
+ 
++def _runs_ended(receipt):
++    runs = json.loads(receipt["evidence"])["runs"]
++    return bool(runs) and all(r["ended_at"] for r in runs)
++
++
++def _pressure_candidate(receipt):
++    """Local-only scheduling view of one receipt, or None when gc_custody would skip it before the Board."""
++    try:
++        if not _runs_ended(receipt):
++            return None
++        ended = max(r["ended_at"] for r in json.loads(receipt["evidence"])["runs"])
++        path = Path(receipt["workspace_path"])
++        if (type(ended) not in (int, float) or ended <= 0 or not path.is_absolute()
++                or path.is_symlink() or not path.is_dir()):
++            return None
++    except (OSError, ValueError, KeyError, TypeError):
++        return None
++    return {"task_id": receipt["task_id"], "workspace_path": receipt["workspace_path"],
++            "finished_at": ended, "receipt": dict(receipt)}
++
++
++def pressure_candidates(conn, limit=1000):
++    """Evicted-owner trees a disk-pressure reclaimer may try: local reads only, no Board call, no write.
++
++    One dict per receipt whose tree is a directory and whose recorded runs all ended:
++    ``{task_id, workspace_path, finished_at, receipt}``, oldest ``finished_at`` (latest recorded run end,
++    scheduling only) first, at most ``limit``. Listing grants nothing: a caller needs ``terminal_owner()``
++    evidence, a verified complete archive and ``kanban_scratch_archive.remove_archived(conn, path, archive,
++    removal_guard(conn, receipt), release(conn, receipt))``; gc_custody's retention age does not apply.
++    """
++    out = [c for c in map(_pressure_candidate, receipts(conn)) if c is not None]
++    out.sort(key=lambda c: (c["finished_at"], c["task_id"]))
++    return out[:limit]
++
++
++def pressure_candidate(conn, task_id):
++    """The current pressure_candidates() entry for task_id, or None (receipt gone, run live, tree missing)."""
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name=? AND type='table'", (_TABLE,)).fetchone():
++        return None
++    row = conn.execute(f"SELECT * FROM {_TABLE} WHERE task_id=?", (task_id,)).fetchone()
++    return _pressure_candidate(dict(row)) if row is not None else None
++
++
++def terminal_owner(hub, board, receipt):
++    """Fresh Board terminal evidence for an evicted owner, or None; gc_custody's own rule (runs ended, _terminal).
++
++    Network: never call inside a DB transaction. Transport errors propagate (the caller keeps the tree).
++    """
++    if not _runs_ended(receipt):
++        return None
++    return _terminal(hub, board, receipt["task_id"])
++
++
++def removal_guard(conn, receipt):
++    """remove_archived guard(tree): gc_custody's _safe for exactly this receipt (unchanged, no local row, idle)."""
++    path = Path(receipt["workspace_path"])
++    return lambda tree: _safe(conn, receipt, path, tree=tree)
++
++
++def release(conn, receipt):
++    """remove_archived finalize: consume exactly this receipt inside the detach fence, else raise (rolls back)."""
++    def finalize():
++        from hermes_cli.kanban_scratch_archive import ArchiveRefused
++        cur = conn.execute(f"DELETE FROM {_TABLE} WHERE task_id=? AND workspace_path=? AND evidence=?",
++                           (receipt["task_id"], receipt["workspace_path"], receipt["evidence"]))
++        if cur.rowcount != 1:
++            raise ArchiveRefused("custody receipt changed before release")
++    return finalize
++
++
+ def _restore_detached(conn, tid, path, trash, exc):
+     """After a failed commit, put the tree back unless something now occupies the path. Never deletes."""
+     try:
+@@ -241,13 +316,7 @@ def _remove(conn, receipt, owner, days, board):
+     if archive is not None:
+         ws.release_lsp_clients(str(path))
+ 
+-        def guard(tree):
+-            return _safe(conn, receipt, path, tree=tree)
+-
+-        def finalize():
+-            conn.execute(f"DELETE FROM {_TABLE} WHERE task_id=?", (tid,))
+-
+-        return sa.remove_archived(conn, path, archive, guard, finalize)
++        return sa.remove_archived(conn, path, archive, removal_guard(conn, receipt), release(conn, receipt))
+     # Remote resumption does not use this tree. Local pickup does, and shares this lock.
+     trash = path.with_name(f".{path.name}.gc-{os.getpid()}")
+     renamed = False
+@@ -303,8 +372,7 @@ def gc_custody(conn, days):
+                     log.info("Scratch custody skipped: task=%s path=%s reason=path_unavailable",
+                              receipt["task_id"], receipt["workspace_path"])
+                     continue
+-                runs = json.loads(receipt["evidence"])["runs"]
+-                if not runs or any(not r["ended_at"] for r in runs):
++                if not _runs_ended(receipt):
+                     log.warning("Scratch custody preserved: task=%s path=%s reason=run_unverified "
+                                 "eligible_at=None", receipt["task_id"], receipt["workspace_path"])
+                     continue
+diff --git a/tests/hermes_cli/test_kanban_scratch_custody.py b/tests/hermes_cli/test_kanban_scratch_custody.py
+index 68176f386f..47184dee7b 100644
+--- a/tests/hermes_cli/test_kanban_scratch_custody.py
++++ b/tests/hermes_cli/test_kanban_scratch_custody.py
+@@ -990,3 +990,110 @@ def test_custody_archive_unlocked_scans_and_final_fence(env, remote, monkeypatch
+             assert (Path(intent["detached"]) / "repo" / "tracked.txt").exists()
+         else:
+             assert (path / "repo" / "tracked.txt").exists()
++
++
++# -- pressure API: the worker disk-pressure adapter's view of evicted trees (no retention age) --
++
++def _hub():
++    return client.Hub(client.load_identity())
++
++
++def _pressure_reclaim(env, tid):
++    """The adapter's sequence: candidate -> Board evidence -> complete archive -> fenced detach + release."""
++    cand = custody.pressure_candidate(env.conn, tid)
++    receipt, path = cand["receipt"], Path(cand["workspace_path"])
++    owner = custody.terminal_owner(_hub(), "default", receipt)
++    assert owner is not None
++    dest = env.home / "archive" / "scratch" / "default" / tid
++    built = archive.archive_workspace(path, dest, task_id=tid, completed_at=owner["completed_at"])
++    return archive.remove_archived(env.conn, path, built, custody.removal_guard(env.conn, receipt),
++                                   custody.release(env.conn, receipt)), path, built
++
++
++def test_pressure_candidates_are_local_oldest_first_and_bounded(env):
++    newer, newer_path, _ = evicted(env, ended=OLD + 50)
++    older, older_path, _ = evicted(env, ended=OLD)
++    live, live_path, _ = evicted(env, ended=None)
++    gone, gone_path, _ = evicted(env)
++    gone_path.rename(gone_path.with_name("moved"))
++    cands = custody.pressure_candidates(env.conn)
++    assert env.calls == 0  # listing never reads the Board
++    assert [(c["task_id"], c["finished_at"]) for c in cands] == [(older, OLD), (newer, OLD + 50)]
++    assert cands[0]["workspace_path"] == str(older_path)
++    assert cands[0]["receipt"] == dict(_receipt(env, older))
++    assert [c["task_id"] for c in custody.pressure_candidates(env.conn, limit=1)] == [older]
++    assert custody.pressure_candidate(env.conn, newer)["workspace_path"] == str(newer_path)
++    assert custody.pressure_candidate(env.conn, live) is None and custody.pressure_candidate(env.conn, gone) is None
++    assert custody.pressure_candidate(env.conn, "t_missing") is None
++    assert live_path.exists()
++
++
++def test_pressure_candidates_without_custody_table(tmp_path):
++    conn = kbc.connect(tmp_path / "fresh.db")
++    try:
++        assert custody.pressure_candidates(conn) == [] and custody.pressure_candidate(conn, "t_x") is None
++    finally:
++        conn.close()
++
++
++def test_pressure_reclaim_inside_retention_archives_then_releases_receipt(env):
++    env.owner["completed_at"] = env.now - 3600  # an hour old: gc_custody's 7-day retention keeps it
++    tid, path, _ = evicted(env)
++    assert custody.gc_custody(env.conn, 7) == 0 and path.exists()
++    removed, path, built = _pressure_reclaim(env, tid)
++    assert removed == 1 and not path.exists() and _receipt(env, tid) is None
++    archive.verify_complete_archive(built)
++    assert (built / archive.PAYLOAD_DIR / "manifest.json").is_file()
++
++
++@pytest.mark.parametrize("control", ["running", "leased", "deleted"])
++def test_pressure_terminal_owner_refuses_unverified_owner(env, control):
++    tid, _path, _ = evicted(env)
++    if control == "running":
++        env.owner["status"] = "running"
++    elif control == "leased":
++        env.owner.update(lease_holder="worker-9", lease_expires=(env.now + 60) * 1000)
++    else:
++        env.evidence_state = "deleted"
++    assert custody.terminal_owner(_hub(), "default", dict(_receipt(env, tid))) is None
++
++
++def test_pressure_terminal_owner_requires_ended_runs_before_board(env):
++    tid, _path, _ = evicted(env, ended=None)
++    assert custody.terminal_owner(_hub(), "default", dict(_receipt(env, tid))) is None
++    assert env.calls == 0
++
++
++@pytest.mark.parametrize("race", ["receipt", "pickup", "session"])
++def test_pressure_guard_and_release_keep_tree_on_race(env, race):
++    tid, path, _ = evicted(env)
++    receipt = custody.pressure_candidate(env.conn, tid)["receipt"]
++    built = archive.archive_workspace(path, env.home / "archive" / "scratch" / "default" / tid,
++                                      task_id=tid, completed_at=OLD)
++    if race == "receipt":
++        # Changes only after the guard's last read: release() itself must refuse.
++        real_guard = custody.removal_guard(env.conn, receipt)
++        calls = []
++
++        def guard(tree):
++            ok = real_guard(tree)
++            calls.append(tree)
++            if len(calls) == 3:
++                env.conn.execute("UPDATE kanban_scratch_custody SET evidence=json_set(evidence, '$.x', 1) "
++                                 "WHERE task_id=?", (tid,))
++            return ok
++        with pytest.raises(archive.ArchiveRefused):
++            archive.remove_archived(env.conn, path, built, guard, custody.release(env.conn, receipt))
++    else:
++        if race == "pickup":
++            sync.apply_remote_changes(env.conn, [sync.RemoteChange(
++                1, "tasks", tid, "upsert", {"title": "picked up", "status": "ready", "created_on": "other",
++                                            "created_at": OLD, "workspace_kind": "scratch", "workspace_path": None},
++                1, "", "")], new_cursor=1, observers=False)
++        else:
++            env.state.execute("INSERT INTO sessions VALUES ('live',?,?,NULL,NULL)", ("kanban", str(path / "x")))
++            env.state.commit()
++        assert archive.remove_archived(env.conn, path, built, custody.removal_guard(env.conn, receipt),
++                                       custody.release(env.conn, receipt)) == 0
++    assert (path / "notes").read_text() == "keep me"
++    assert env.conn.execute("SELECT 1 FROM kanban_scratch_custody WHERE task_id=?", (tid,)).fetchone()
+-- 
+2.51.0
+

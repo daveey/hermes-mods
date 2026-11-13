@@ -1,0 +1,454 @@
+From 1273771b42eebe2da96c1c0e963f239893cd205c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:44:01 +0000
+Subject: [PATCH] [daveey] kanban priority: capture reads the inventory at one
+ fixed head (mid-window creations join it)
+
+Problem: `supervisor-requests --priority-operation origins|migrate` refused
+about half the time on the busy default board with "canonical inventory
+changed; capture a new manifest" even after #1947 (open<->terminal flips) and
+#1975 (page-head order). An instrumented MacBook capture (14 pages, 55-180 s)
+showed exactly one trip per refusal, always "missing from snapshot, open at
+target" (t_01a1d3f04e37f0cf on 95fe, t_01a1d4087cc6545b on 99ae). New
+ULID-style ids (t_01a1d4...) sort before the legacy ids (t_c21c170e...), so the
+page covering a card created mid-capture was read before the card existed, and
+the board creates about one card a minute.
+
+Fix: check_interval now produces the inventory at ONE fixed head (the final
+observed head) by construction. The Board pages at most 1000 rows per call and
+holds no read transaction across calls (each Durable Object request is its own
+transaction), so a single server-side snapshot of the tasks table is not
+available; its documented consistent-read contract for paged readers is "keep
+the head of your first page and resume the feed from it: rows that change while
+it pages are replayed there" (worker/src/board.ts snapshot()). The replay
+already covered status. It now also covers membership: a card whose FIRST
+in-window change is the Board's creation row (full row, `version` 1, which
+Tx.put writes only on INSERT; `id` equal to the uid; a status) joins the
+inventory. Open at the final head, it must carry an origin string and an
+integer priority <= PRIORITY_CAP (the apply-time arrival rule in
+kanban_priority_inventory.classify); terminal there it stays out of scope.
+
+Still refused: a card missing from the snapshot whose first in-window change is
+not a creation row (it existed before the first head, or a patch-shaped
+upsert); a new open card above the cap or without an origin; any id, origin or
+priority change on a snapshot row or a created row (also when it ends
+terminal); any delete. A priority change on a page read before the change
+leaves the snapshot stale and refuses; one on a page read after it is already
+the fixed-head value, so the capture is exact (tested both ways).
+
+Why not a server-side fixed-head snapshot: it would need a new Board endpoint
+(one-call projection of id/status/created_on/priority) in hermes-hub, a
+Cloudflare deploy and a client fallback for old Boards, and could not replace
+the feed check for verify. Reconstructing as-of-head from the change log is not
+possible either: sweep() compacts changes below the floor, so a long-unchanged
+row edited mid-window has no older version left. The feed replay is complete
+and dense from the first head, so first-head snapshot + replay IS a fixed-head
+read; this change finishes it instead of adding a second mechanism.
+
+Five whys (why did three PRs each meet a new race?):
+1. Capture refused: a card created mid-window was missing from its page.
+2. Why was that a refusal? check_interval treated the replay as a validator of
+   a snapshot assumed to be static, refusing whatever it could not explain,
+   instead of as the means of moving the snapshot to one head.
+3. Why validate instead of reconstruct? #1947 and #1975 each fixed the one
+   shape seen in a live refusal (status flips, page-head order) by widening
+   what the validator tolerates, so the window design was never stated as
+   "the result is the inventory at head H".
+4. Why did review not catch it? Each review checked the PR's claim against
+   hand-built fixtures with two pages and one change; none had creations,
+   completions and reopenings spread across every page with an exact
+   ground-truth comparison, so the remaining race classes were invisible.
+5. Why no such fixture? The tests asserted refusals and acceptances, not the
+   invariant "capture == board state at the final head". Fix: the new seeded
+   BusyBoard simulation asserts exactly that invariant on 20 seeds (all 20
+   refuse on main), plus verify read-back through churn on 20 seeds and a real
+   mid-window priority change refusing on 20 seeds.
+
+Proof:
+- tests/hermes_cli/test_kanban_priority_fixed_head.py: 90+ cases. RED on
+  origin/main: every busy-board capture/verify seed and every mid-window
+  creation case fails ("canonical inventory changed"). GREEN here.
+- All tests/hermes_cli/test_kanban_priority_*.py (20 files, 401 tests) pass,
+  including the #1947/#1975 window-churn, first-head and page-head suites.
+- 14 hand mutants of the new conditions (version type/value, id, status,
+  first-change, inventory membership, terminal skip, origin type/emptiness,
+  priority type/cap, append, sort, inventory insertion): all killed.
+- No live priority operation was run.
+---
+ hermes_cli/kanban_priority_feed.py            |  55 +++-
+ .../test_kanban_priority_fixed_head.py        | 266 ++++++++++++++++++
+ 2 files changed, 306 insertions(+), 15 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_priority_fixed_head.py
+
+diff --git a/hermes_cli/kanban_priority_feed.py b/hermes_cli/kanban_priority_feed.py
+index 6ff95173d9..3742efe6d0 100644
+--- a/hermes_cli/kanban_priority_feed.py
++++ b/hermes_cli/kanban_priority_feed.py
+@@ -6,24 +6,30 @@ _TERMINAL = ('done', 'archived')
+ 
+ 
+ def check_interval(hub, board: str, rows: list[dict], first: int, target: int) -> None:
+-    """Ignore unrelated traffic; bring the inventory to its state at ``target``.
++    """Bring the paged inventory to its state at ONE fixed head, ``target``.
+ 
+-    The snapshot is not transactional: each page reflects its own read time, so
+-    a row paged late can already carry a later state than an intermediate feed
+-    change. Replay from the FIRST head through the final observed head (never a
+-    moving head that could starve forever) and compare the FINAL replayed state
+-    with each snapshot row, not every intermediate change.
++    The Board pages at most 1000 rows per call and holds no read transaction
++    across calls, so each page reflects its own read time. Its consistent-read
++    contract is: keep the FIRST page head and replay the dense feed from there.
++    Replay runs from ``first`` through the final observed ``target`` (never a
++    moving head that could starve forever), so the result is the inventory at
++    ``target`` by construction:
++
++    - status is replayed onto the rows (a card finishing or reopening);
++    - a card CREATED in the window (its first in-window change is the Board's
++      full creation row, ``version`` 1) joins the inventory even when its id
++      sorts into a page read before it existed. Open at ``target`` it needs an
++      origin and an integer priority <= ``PRIORITY_CAP`` (the apply-time
++      arrival rule); terminal at ``target`` it is out of manifest scope.
+ 
+-    Status is replayed onto the rows, so an open<->terminal flip inside the
+-    window (a card finishing or reopening) yields the inventory at ``target``.
+     Identity, origin and priority are never replayed: any in-window value that
+     differs from the row refuses, as do deletes and a card missing from the
+-    snapshot that is open (or of unknown status) at ``target``. A card missing
+-    from the snapshot that is terminal at ``target`` (created and finished in
+-    the window) is out of manifest scope. No import or priority clipping
++    snapshot that is open (or of unknown status) at ``target`` without a
++    creation row (it existed before ``first``). No import or priority clipping
+     occurs. Local apply still requires atomic CAS.
+     """
+     inventory = {row['id']: row for row in rows}
++    created: dict[str, dict] = {}
+     final: dict[str, str | None] = {}
+     cursor = first
+     for _ in range(10000):
+@@ -41,7 +47,7 @@ def check_interval(hub, board: str, rows: list[dict], first: int, target: int) -
+                 raise ValueError('invalid canonical feed ordering')
+             previous = change['seq']
+             if previous <= target and change['table'] == 'tasks':
+-                _check_task(inventory, final, change)
++                _check_task(inventory, created, final, change)
+         if nxt != previous:
+             raise ValueError('invalid canonical feed cursor')
+         cursor = nxt
+@@ -56,9 +62,24 @@ def check_interval(hub, board: str, rows: list[dict], first: int, target: int) -
+                 raise ValueError(_CHANGED)
+         elif status is not None:
+             row['status'] = status
++    from hermes_cli.kanban_priority import PRIORITY_CAP
++    for row in created.values():
++        if row['status'] in _TERMINAL:
++            continue
++        origin, value = row.get('created_on'), row.get('priority')
++        if not isinstance(origin, str) or not origin or type(value) is not int or value > PRIORITY_CAP:
++            raise ValueError(f'{_CHANGED} (new open card exceeds cap or lacks origin)')
++        rows.append(row)
++    rows.sort(key=lambda row: row['id'])
++
++
++def _creation(uid: str, fields: dict) -> bool:
++    """The Board's full insert row: it writes version 1 only when it creates a row."""
++    return (type(fields.get('version')) is int and fields['version'] == 1
++            and fields.get('id') == uid and 'status' in fields)
+ 
+ 
+-def _check_task(inventory: dict, final: dict, change: dict) -> None:
++def _check_task(inventory: dict, created: dict, final: dict, change: dict) -> None:
+     uid = change.get('uid')
+     fields = change.get('fields')
+     if not isinstance(uid, str) or change.get('op') != 'upsert' or not isinstance(fields, dict):
+@@ -66,9 +87,13 @@ def _check_task(inventory: dict, final: dict, change: dict) -> None:
+     # Full-row and patch-shaped feed entries are both accepted; a patch without
+     # a status leaves the last replayed (or snapshot) status in place.
+     from hermes_cli.kanban_priority_manifest import STATUSES
++    if 'status' in fields and (not isinstance(fields['status'], str) or fields['status'] not in STATUSES):
++        raise ValueError(_CHANGED)
++    if uid not in inventory and uid not in final and _creation(uid, fields):
++        # Only the FIRST in-window change admits a missing card: a card first
++        # seen as an update existed before ``first`` and belonged in the snapshot.
++        inventory[uid] = created[uid] = dict(fields)
+     if 'status' in fields:
+-        if not isinstance(fields['status'], str) or fields['status'] not in STATUSES:
+-            raise ValueError(_CHANGED)
+         final[uid] = fields['status']
+     else:
+         final.setdefault(uid, None)
+diff --git a/tests/hermes_cli/test_kanban_priority_fixed_head.py b/tests/hermes_cli/test_kanban_priority_fixed_head.py
+new file mode 100644
+index 0000000000..0cf986d78f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_priority_fixed_head.py
+@@ -0,0 +1,266 @@
++"""Capture and verify read the inventory at ONE fixed head, closed by construction.
++
++The Board pages tasks by id (1000 per call) and holds no read transaction across
++calls, so a capture over 14 pages spans 55-180 s of a board that creates about
++one card a minute. New ULID-style ids (``t_01a1d4…``) sort before the legacy
++ids (``t_c21c…``), so the page covering a new card was usually read before the
++card existed: 2026-11-13 MacBook captures refused 5 of 6 (95fe) and 2 of 3
++(99ae) times with ``missing from snapshot, open at target`` (t_01a1d3f04e37f0cf,
++t_01a1d4087cc6545b). The feed replay from the first page head now admits a card
++whose first in-window change is the Board's creation row (``version`` 1), so
++the result is the inventory at the final head. Real priority, origin, identity
++and delete changes still refuse.
++"""
++import copy
++import random
++
++import pytest
++
++from hermes_cli import kanban_priority_prepare as prepare
++from hermes_cli.kanban_priority import PRIORITY_CAP
++from hermes_cli.kanban_priority_feed import check_interval
++from tests.hermes_cli.test_kanban_priority_window_churn import Window, _row, _task
++
++TERMINAL = ('done', 'archived')
++
++
++def _new(seq, uid, version=1, **over):
++    return _task(seq, uid, **{**_row(uid, priority=500), 'version': version, **over})
++
++
++def _rows(manifest):
++    return [(row['id'], row['old']) for row in manifest['rows']]
++
++
++# ---- unit shapes (Window: page heads 1 then 3, final head 5) ------------------------------------------------
++
++
++@pytest.mark.parametrize('seq', [2, 3, 4, 5])
++def test_card_created_mid_window_and_still_open_joins_inventory(seq):
++    hub = Window([_row('a'), _row('b')], [_new(seq, 'n')])
++    assert _rows(prepare.capture(hub, board_id='board', exceptions=[])) == [
++        ('a', 10000), ('b', 10000), ('n', 500)]
++
++
++def test_card_created_completed_and_reopened_mid_window_joins_inventory():
++    hub = Window([_row('a')], [_new(2, 'n'), _task(3, 'n', status='done'), _task(4, 'n', status='ready')])
++    assert _rows(prepare.capture(hub, board_id='board', exceptions=[])) == [('a', 10000), ('n', 500)]
++
++
++def test_card_created_at_the_cap_is_accepted():
++    hub = Window([_row('a')], [_new(2, 'n', priority=PRIORITY_CAP)])
++    assert ('n', PRIORITY_CAP) in _rows(prepare.capture(hub, board_id='board', exceptions=[]))
++
++
++@pytest.mark.parametrize('terminal', TERMINAL)
++def test_card_created_above_cap_and_finished_mid_window_is_out_of_scope(terminal):
++    hub = Window([_row('a')], [_new(2, 'n', priority=PRIORITY_CAP + 1), _task(4, 'n', status=terminal)])
++    assert _rows(prepare.capture(hub, board_id='board', exceptions=[])) == [('a', 10000)]
++
++
++@pytest.mark.parametrize('changes', [
++    pytest.param([_new(2, 'n', version=3)], id='pre-existing-full-row'),
++    pytest.param([_new(2, 'n', version=None)], id='pre-existing-no-version'),
++    pytest.param([_new(2, 'n', version=True)], id='bool-version'),
++    pytest.param([_new(2, 'n', version=1.0)], id='float-version'),
++    pytest.param([_task(2, 'n', status='ready', version=1)], id='patch-shaped'),
++    pytest.param([_task(2, 'n', title='renamed'), _new(4, 'n')], id='creation-after-update'),
++    pytest.param([_task(2, 'n', status='done'), _new(4, 'n')], id='creation-after-terminal-update'),
++    pytest.param([_new(2, 'n', id='other')], id='identity-mismatch'),
++    pytest.param([_new(2, 'n', priority=PRIORITY_CAP + 1)], id='above-cap'),
++    pytest.param([_new(2, 'n', priority=None)], id='no-priority'),
++    pytest.param([_new(2, 'n', priority=True)], id='bool-priority'),
++    pytest.param([_new(2, 'n', created_on='')], id='no-origin'),
++    pytest.param([_new(2, 'n', created_on=None)], id='null-origin'),
++    pytest.param([_new(2, 'n', created_on=5)], id='int-origin'),
++    pytest.param([_task(2, 'n', id='n', version=1, created_on='one', priority=5)], id='creation-without-status'),
++    pytest.param([_new(2, 'n'), _task(4, 'n', priority=7)], id='priority-changed-after-creation'),
++    pytest.param([_new(2, 'n'), _task(4, 'n', created_on='two')], id='origin-changed-after-creation'),
++    pytest.param([_new(2, 'n'), _task(4, 'n', op='delete')], id='deleted-after-creation'),
++    pytest.param([_new(2, 'n'), _task(3, 'n', status='done'), _task(4, 'n', priority=7)],
++                 id='priority-changed-then-terminal'),
++])
++def test_missing_card_that_is_not_an_admissible_creation_refuses(changes):
++    hub = Window([_row('a'), _row('b')], changes)
++    with pytest.raises(ValueError, match='changed'):
++        prepare.capture(hub, board_id='board', exceptions=[])
++
++
++def test_creation_after_final_head_is_ignored():
++    hub = Window([_row('a')], [])
++    hub.log.append(_new(6, 'n'))
++    assert _rows(prepare.capture(hub, board_id='board', exceptions=[])) == [('a', 10000)]
++
++
++def test_created_rows_join_the_inventory_in_id_order():
++    rows = [_row('b'), _row('d')]
++    check_interval(Window(rows, [_new(2, 'e'), _new(3, 'a'), _new(4, 'c')]), 'board', rows, 1, 5)
++    assert [row['id'] for row in rows] == ['a', 'b', 'c', 'd', 'e']
++
++
++def test_verify_accepts_a_card_created_during_its_own_read():
++    manifest = prepare.capture(Window([_row('a'), _row('b')], []), board_id='board', exceptions=[])
++    hub = Window([_row('a'), _row('b')], [_new(3, 'n')])
++    assert prepare.verify(hub, manifest, undo=True)['verified'] == 2
++
++
++def test_verify_refuses_a_card_created_above_the_cap_during_its_read():
++    manifest = prepare.capture(Window([_row('a'), _row('b')], []), board_id='board', exceptions=[])
++    hub = Window([_row('a'), _row('b')], [_new(3, 'n', priority=PRIORITY_CAP + 1)])
++    with pytest.raises(ValueError, match='changed'):
++        prepare.verify(hub, manifest, undo=True)
++
++
++# ---- simulated busy board: churn across every page ----------------------------------------------------------
++
++
++class BusyBoard:
++    """A Board-shaped fake: full-row feed entries with versions, id-paged snapshot, churn before every read.
++
++    Each ``snapshot_page`` call (the final ``limit=1`` read included) first applies a burst of
++    creations (new ids sort before AND among legacy ids), completions, reopenings, title edits,
++    create-then-finish cards and unrelated table traffic. ``truth`` is the open inventory at the
++    final observed head. ``inject`` puts one real priority change on a pre-existing open card
++    before page ``inject``.
++    """
++
++    def __init__(self, seed, *, inject=None, ahead=False, page=6, legacy=60):
++        self.rng = random.Random(seed)
++        self.ahead = ahead
++        self.seq = 0
++        self.log = []
++        self.tasks = {}
++        self.page = page
++        self.reads = 0
++        self.inject = inject
++        self.injected = None
++        self.first = 0
++        self.reopen = True
++        self.truth = None
++        for i in range(legacy):
++            uid = f't_{self.rng.randrange(0xc0000000, 0xffffffff):08x}'
++            status = self.rng.choice(['ready', 'running', 'todo', 'blocked', 'done', 'archived', 'done'])
++            self._put(uid, {'id': uid, 'status': status, 'created_on': self.rng.choice(['hub', 'mbp', 'mini']),
++                             'priority': self.rng.choice([0, 5, 10, 100, 900, 10000, 60320]), 'title': str(i)})
++        self.ulid = 0x01a1d3000000
++
++    def _put(self, uid, patch):
++        row = self.tasks.get(uid)
++        row = {'uid': uid, 'version': 0} if row is None else row
++        self.seq += 1
++        row.update(patch, version=row['version'] + 1, seq=self.seq, deleted_at=None)
++        self.tasks[uid] = row
++        self.log.append({'seq': self.seq, 'table': 'tasks', 'uid': uid, 'op': 'upsert', 'fields': copy.deepcopy(row)})
++
++    def _noise(self):
++        self.seq += 1
++        self.log.append({'seq': self.seq, 'table': self.rng.choice(['task_events', 'task_runs']), 'uid': 'x',
++                         'op': 'upsert', 'fields': {}})
++
++    def _open(self):
++        return [u for u, r in sorted(self.tasks.items()) if r['status'] not in TERMINAL]
++
++    def _churn(self):
++        for _ in range(self.rng.randrange(2, 8)):
++            kind = self.rng.choice(['create', 'create', 'finish', 'reopen', 'edit', 'flash', 'noise'])
++            if kind in ('create', 'flash'):
++                self.ulid += self.rng.randrange(1, 5000)
++                uid = f't_{self.ulid:012x}{self.rng.randrange(0x10000):04x}'
++                if self.rng.random() < 0.3:  # ids that interleave with the legacy pages too
++                    uid = f't_{self.rng.randrange(0xc0000000, 0xffffffff):08x}n'
++                self._put(uid, {'id': uid, 'status': self.rng.choice(['ready', 'triage', 'todo']),
++                                'created_on': self.rng.choice(['hub', 'worker-3', 'mbp']),
++                                'priority': self.rng.choice([0, 50, 500, PRIORITY_CAP]), 'title': 'new'})
++                if kind == 'flash':
++                    self._put(uid, {'status': 'running'})
++                    self._put(uid, {'status': 'done'})
++            elif kind == 'finish' and self._open():
++                self._put(self.rng.choice(self._open()), {'status': self.rng.choice(TERMINAL)})
++            elif kind == 'reopen':
++                closed = [u for u, r in sorted(self.tasks.items()) if r['status'] == 'done'
++                          and (self.reopen or r['priority'] <= PRIORITY_CAP)]
++                if closed:
++                    self._put(self.rng.choice(closed), {'status': 'ready'})
++            elif kind == 'edit':
++                self._put(self.rng.choice(sorted(self.tasks)), {'title': f'edited {self.seq}'})
++            else:
++                self._noise()
++
++    def snapshot_page(self, board, table, after='', limit=1000):
++        self._churn()
++        if self.inject is not None and self.reads >= self.inject and self.injected is None:
++            # behind: a card on a page already read (the snapshot holds its old value);
++            # ahead: a card unchanged since the first head, on a page not read yet.
++            victims = [u for u in self._open() if (u > after and self.tasks[u]['seq'] <= self.first
++                                                   if self.ahead else u <= after)]
++            if victims:
++                self.injected = self.rng.choice(victims)
++                self._put(self.injected, {'priority': self.tasks[self.injected]['priority'] + 1})
++        self.reads += 1
++        if self.reads == 1:
++            self.first = self.seq
++        live = [copy.deepcopy(r) for u, r in sorted(self.tasks.items()) if u > after]
++        if limit == 1:
++            self.truth = [(u, r['priority']) for u, r in sorted(self.tasks.items()) if r['status'] not in TERMINAL]
++            return {'table': 'tasks', 'head': self.seq, 'rows': live[:1], 'more': len(live) > 1,
++                    'next': live[0]['id'] if live else after}
++        batch = live[:self.page]
++        return {'table': 'tasks', 'head': self.seq, 'rows': batch, 'more': len(live) > len(batch),
++                'next': batch[-1]['id'] if batch else after}
++
++    def changes(self, board, since):
++        batch = [c for c in self.log if c['seq'] > since][:7]
++        return {'changes': copy.deepcopy(batch), 'next': batch[-1]['seq'] if batch else since,
++                'head': self.seq, 'more': bool(batch) and batch[-1]['seq'] < self.seq}
++
++
++SEEDS = range(20)
++
++
++def test_busy_board_creations_land_in_pages_already_read():
++    # Guard the simulation itself: it must produce the incident shape.
++    hits = 0
++    for seed in SEEDS:
++        board = BusyBoard(seed)
++        prepare.capture(board, board_id='board', exceptions=[])
++        first = [c for c in board.log if c['fields'].get('version') == 1 and c['fields'].get('title') == 'new']
++        hits += any(c['uid'] < max(board.tasks) for c in first)
++    assert hits == len(SEEDS)
++
++
++@pytest.mark.parametrize('seed', SEEDS)
++def test_busy_board_capture_is_the_inventory_at_the_final_head(seed):
++    board = BusyBoard(seed)
++    manifest = prepare.capture(board, board_id='board', exceptions=[])
++    assert _rows(manifest) == board.truth
++
++
++@pytest.mark.parametrize('seed', SEEDS)
++def test_busy_board_verify_reads_back_through_churn(seed):
++    board = BusyBoard(seed)
++    manifest = prepare.capture(board, board_id='board', exceptions=[])
++    # Later churn keeps going during verify's own paged read. Reopening an
++    # above-cap legacy card is a real apply-time refusal, so verify's window
++    # reopens only capped cards here.
++    board.rng, board.reopen = random.Random(seed + 1000), False
++    result = prepare.verify(board, manifest, undo=True)
++    still = {u for u, _ in board.truth}
++    assert result['verified'] == len([r for r in manifest['rows'] if r['id'] in still])
++
++
++@pytest.mark.parametrize('seed', SEEDS)
++def test_busy_board_real_priority_change_mid_window_still_refuses(seed):
++    board = BusyBoard(seed, inject=1 + seed % 8)
++    with pytest.raises(ValueError, match='changed'):
++        prepare.capture(board, board_id='board', exceptions=[])
++    assert board.injected is not None
++
++
++def test_busy_board_priority_change_before_its_page_is_read_is_the_fixed_head_value():
++    # A row paged AFTER its in-window change already holds the final-head
++    # value, so the capture is exact; only a change the snapshot missed would
++    # leave it stale, and that refuses (above).
++    for seed in SEEDS:
++        board = BusyBoard(seed, inject=1, ahead=True)
++        manifest = prepare.capture(board, board_id='board', exceptions=[])
++        assert board.injected is not None and _rows(manifest) == board.truth
+-- 
+2.51.0
+

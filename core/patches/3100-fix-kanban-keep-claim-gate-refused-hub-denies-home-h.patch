@@ -1,0 +1,205 @@
+From 3d50cc3739fc4c563ce39437e60834db6e69d50b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 01:47:09 +0000
+Subject: [PATCH] fix(kanban): keep claim-gate-refused hub denies home;
+ hub-admin hermes-hub needs hub-write [daveey]
+
+A hub-admission deny routed every card to the worker queue or worker-first, even when its text names a
+hermes-hub action the pickup claim gate (kanban_placement_coordination.claim_refusal) refuses on EVERY
+pool worker ("needs home coordination action"). hermes-hub's claim-stall incident template says
+`hermes-hub outcomes --id <id>`, so t_01a1d267a7e60bc2 was enrolled worker-first, reserved on
+worker-5, and skipped by every worker (31 capability_missing skips on worker-5 alone) while the
+pickup-stall detector fired.
+
+- pool_route: when coordination.required_labels refuses, keep the card home (no runs_on, no
+  worker-first policy, declared requires only) and record hub_admission.home = ACTION_REASON.
+  Create-time placement now matches the claim gate.
+- requirements(): a hermes-hub action inside an open `hub-admin '...'` quote runs ON the hub with
+  its identity, so it needs capability:hub-write (the hub-admin attestation), not a refusal. A
+  worker's own `hermes-hub outcomes --id` reads only its own sent requests (the hub's request read
+  back `state: null` on worker-1), so bare spellings still stay home.
+
+Tests: the shipped claim-stall template stays home on the hub (queue live or not) and is exactly what
+claim_refusal refuses; the hub-admin spelling queues with capability:hub-write and a hub-write
+worker's claim gate accepts it; wrapped/unwrapped requirements() cases.
+---
+ hermes_cli/kanban_hub_admission_placement.py  | 15 ++++-
+ hermes_cli/kanban_placement_coordination.py   | 11 +++-
+ .../test_kanban_coordination_placement.py     | 22 +++++++
+ .../test_kanban_worker_placement.py           |  8 +++
+ tests/test_kanban_hub_admission_placement.py  | 58 +++++++++++++++++++
+ 5 files changed, 111 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_hub_admission_placement.py b/hermes_cli/kanban_hub_admission_placement.py
+index ae97b6fc41..a83fc3cdd4 100644
+--- a/hermes_cli/kanban_hub_admission_placement.py
++++ b/hermes_cli/kanban_hub_admission_placement.py
+@@ -536,8 +536,19 @@ def pool_route(args, cfg, gateway, audit, requires, *, queue=True, machine_ok=No
+     from hermes_cli.kanban_worker_placement import POLICY, QUEUED_WHY, WAITING
+ 
+     label = kp._Cfg(cfg).queue_label(gateway) if queue else None
+-    extra = coordination.required_labels({**args, "requires": requires}, cfg) if label else None
+-    if label and extra is not None and (machine_ok or kp._machine_picks_up)(label):
++    extra = coordination.required_labels({**args, "requires": requires}, cfg)
++    if extra is None:
++        # The pickup claim gate (coordination.claim_refusal) refuses this text on EVERY pool worker, so neither
++        # the queue nor worker-first can run it: enrolling it only stranded it ready. t_01a1d267a7e60bc2, a
++        # claim-stall incident whose body says `hermes-hub outcomes --id`, sat 40 min skipped by six workers.
++        # It stays home; ``requires`` stays as declared (the hub:write the deny route adds is for workers).
++        out = {"where": "local", "why": f"hub admission denied, but the text {coordination.ACTION_REASON} "
++                                        "no pool worker is attested for, so it stays here",
++               "hub_admission": {**audit, "home": coordination.ACTION_REASON}}
++        if args.get("requires"):
++            out["requires"] = args["requires"]
++        return out
++    if label and (machine_ok or kp._machine_picks_up)(label):
+         out = {"where": "local", "runs_on": [label, *sorted(extra - {label})],
+                "why": QUEUED_WHY.format(label=label), "hub_admission": audit}
+     elif why := worker_first_refusal(args):
+diff --git a/hermes_cli/kanban_placement_coordination.py b/hermes_cli/kanban_placement_coordination.py
+index ec2f55922c..ba7b6fadc8 100644
+--- a/hermes_cli/kanban_placement_coordination.py
++++ b/hermes_cli/kanban_placement_coordination.py
+@@ -21,6 +21,12 @@ _HUB_ACTIONS = set(("status pull sync sessions inbox tasks where links request r
+                     "inspect-legacy reconcile-legacy inspect-alias retire-alias adopt-task "
+                     "create-task depend outcomes install-watch watch diff-shared").split())
+ _EXECUTION = re.compile(r"(?:\b(?:run|execute|invoke|call|use|via|with)\s+`?|`|[;$|&]\s*)$", re.IGNORECASE)
++# ``hub-admin '<command>'`` runs the command ON the hub with its write access: a hermes-hub action inside the
++# still-open quote acts with the hub's identity and replica, so it needs ``capability:hub-write`` (the hub-admin
++# attestation), not this worker's own hermes-hub install. A worker's ``hermes-hub outcomes --id`` reads only its
++# OWN sent requests (the hub's request read back as ``state: null`` on worker-1, 11-13), so bare spellings stay home.
++_HUB_ADMIN = re.compile(r"\bhub-admin\s+(['\"])(?:(?!\1).)*$", re.IGNORECASE)
++HUB_WRITE = "capability:hub-write"
+ 
+ 
+ def _actions(text, tool, known):
+@@ -92,7 +98,10 @@ def requirements(text):
+                  r"\bcreate board replicas\b|\battach primary/pickup subscriptions\b",
+                  text, re.IGNORECASE):
+         return labels, ACTION_REASON
+-    for _, _, action in _actions(text, _HUB, _HUB_ACTIONS):
++    for start, _, action in _actions(text, _HUB, _HUB_ACTIONS):
++        if _HUB_ADMIN.search(text[:start].rsplit("\n", 1)[-1]):
++            labels.add(HUB_WRITE)
++            continue
+         if action not in ("status", "pull"):
+             return labels, ACTION_REASON
+         labels.add("capability:coordination-read")
+diff --git a/tests/hermes_cli/test_kanban_coordination_placement.py b/tests/hermes_cli/test_kanban_coordination_placement.py
+index d65edf9bb6..d21ebf4293 100644
+--- a/tests/hermes_cli/test_kanban_coordination_placement.py
++++ b/tests/hermes_cli/test_kanban_coordination_placement.py
+@@ -496,3 +496,25 @@ def test_declared_hub_access_is_board_placeable(fleet, requires):
+         assert coord.claim_refusal(card, "worker") == coord.REASON
+         entry["labels"].append(label)
+     assert coord.attested(["held", "worker"], labels) is True
++
++
++@pytest.mark.parametrize("text", [
++    "Read it with `hub-admin 'hermes-hub outcomes --id t_x-v1'`",
++    'hub-admin "hermes-hub requests --json"',
++    "run hub-admin 'cd ~ && hermes-hub request tasks k comment'",
++])
++def test_hub_admin_wrapped_action_needs_hub_write(text):
++    """hub-admin runs the action on the hub with its own identity: the hub-admin attestation, not a refusal."""
++    from hermes_cli import kanban_placement_coordination as coord
++    assert coord.requirements(text) == ({"capability:hub-write"}, None)
++
++
++@pytest.mark.parametrize("text", [
++    "hub-admin 'uptime'; hermes-hub outcomes --id t_x",  # closed quote: the action runs on this worker
++    "hub-admin 'uptime'\n`hermes-hub outcomes --id t_x`",
++    "`hermes-hub outcomes --id t_x` (a worker reads only its own sent requests)",
++    "ssh hermes-hub 'hermes-hub outcomes --id t_x'",
++])
++def test_bare_or_unwrapped_action_still_stays_home(text):
++    from hermes_cli import kanban_placement_coordination as coord
++    assert coord.requirements(text)[1] == coord.ACTION_REASON
+diff --git a/tests/hermes_cli/test_kanban_worker_placement.py b/tests/hermes_cli/test_kanban_worker_placement.py
+index fde6d326fe..2442326468 100644
+--- a/tests/hermes_cli/test_kanban_worker_placement.py
++++ b/tests/hermes_cli/test_kanban_worker_placement.py
+@@ -176,6 +176,14 @@ def test_host_specific_state_and_identity_stay_local(title, hub_judge):
+     hub_judge.admit_next = False
+     denied = placement.decide({"title": title, "requires": ["terminal", "file", "git"]},
+                               cfg={"worker_pools": {"hub": ["worker-1"]}}, self_gw="hub")
++    from hermes_cli import kanban_placement_coordination as coord
++    if coord.requirements(title)[1]:
++        # Every pool worker's claim gate refuses a hermes-hub action it is not attested for (it would act with
++        # the worker's own key and replica): enrolling it would strand it ready, so a deny keeps it home.
++        assert "placement_policy" not in denied and "runs_on" not in denied
++        assert denied["requires"] == ["terminal", "file", "git"]
++        assert denied["hub_admission"]["home"] == coord.ACTION_REASON
++        return
+     assert denied["placement_policy"] == "worker-first-v1"
+     assert denied["requires"] == ["terminal", "file", "git", "hub:write"]
+ 
+diff --git a/tests/test_kanban_hub_admission_placement.py b/tests/test_kanban_hub_admission_placement.py
+index 3e16576252..d7e866fa45 100644
+--- a/tests/test_kanban_hub_admission_placement.py
++++ b/tests/test_kanban_hub_admission_placement.py
+@@ -241,3 +241,61 @@ def test_assignee_keep_remedy_tracks_structural_reason():
+     assert placement.structural_reason({"assignee": "mac-ops"}, cfg) == hap.ASSIGNEE_KEEP
+     text = hap.hub_stay_remedy(hap.ASSIGNEE_KEEP, None, assignee="mac-ops", pool_profiles={"default", "bb-tuner"})
+     assert "'mac-ops'" in text and "pool profiles: bb-tuner, default" in text and "assignee='default'" in text
++
++
++# hermes-hub's claim-stall incident template as it shipped on 11-13 (hermes_hub.py ``alert_claim_stalls``), and
++# the same step spelled through hub-admin. t_01a1d267a7e60bc2 (the first) was enrolled worker-first and every
++# pool worker's claim gate refused it ("needs home coordination action"), so it sat ready for 40 minutes.
++CLAIM_STALL_STEPS = (
++    "Requests (exact original ids; keep them, do not mint replacements):\n"
++    "- t_x-macbook-comment-v1  coll=tasks key=default/default/t_y action=comment claims=0 age=4304s\n\n"
++    "What to do:\n"
++    "1. Read each request's exact state with {read} (`hermes-hub requests` is a bounded recent window and can "
++    "omit old ids).\n"
++    "2. Try to read macbook (tailnet SSH, cross_task). If it cannot be reached, park this card with a wake_check.\n"
++)
++CLAIM_STALL_BARE = CLAIM_STALL_STEPS.format(read="`hermes-hub outcomes --id <id>`")
++CLAIM_STALL_HUB_ADMIN = CLAIM_STALL_STEPS.format(read="`hub-admin 'hermes-hub outcomes --id <id>'`").replace(
++    "(`hermes-hub requests` is", "(`hub-admin 'hermes-hub requests'` is")
++HUB_CFG = {**QUEUE_CFG, "worker_pools": {"hub": ["worker-1"]}}
++
++
++def _claim_stall(body):
++    return {"title": "Hub requests to macbook unclaimed: claim-stall incident (1 request)", "body": body,
++            "assignee": "default"}
++
++
++@pytest.mark.parametrize("queue_live", [True, False])
++def test_claim_stall_template_no_worker_can_claim_stays_home(gate, queue_live):
++    """A denied card whose text the pickup claim gate refuses on every worker is not enrolled anywhere."""
++    from hermes_cli import kanban_placement_coordination as coord
++    result = placement.decide(_claim_stall(CLAIM_STALL_BARE), self_gw="hub", cfg=HUB_CFG, live=lambda _: None,
++                              carries=True, machine_ok=lambda label: queue_live and label == "pool:worker")
++    assert result["where"] == "local"
++    assert "runs_on" not in result and "placement_policy" not in result
++    assert "requires" not in result  # the deny route's hub:write is a worker label; home keeps the declaration
++    assert result["hub_admission"]["admit"] is False
++    assert result["hub_admission"]["home"] == coord.ACTION_REASON
++    # Exactly what the claim gate says for the row the old route produced.
++    row = {"placement_policy": "worker-first-v1", "requires": '["hub:write"]', **_claim_stall(CLAIM_STALL_BARE)}
++    assert coord.claim_refusal(row, "worker-1") == coord.ACTION_REASON
++
++
++def test_claim_stall_template_via_hub_admin_queues_for_hub_write_workers(gate, monkeypatch):
++    """The hub-admin spelling runs on the hub with its write access: hub-write workers can claim it."""
++    import time
++    from hermes_cli import kanban_placement_coordination as coord
++    from hermes_cli import kanban_worker_node as wn
++    result = placement.decide(_claim_stall(CLAIM_STALL_HUB_ADMIN), self_gw="hub", cfg=HUB_CFG,
++                              live=lambda _: None, carries=True, machine_ok=lambda label: label == "pool:worker")
++    assert result["runs_on"][0] == "pool:worker"
++    assert "capability:hub-write" in result["runs_on"]
++    assert "capability:coordination-read" not in result["runs_on"]
++    assert "hub:write" in result["requires"]
++    entry = {"state": "active", "pickup": "explicit", "last_seen": time.time() * 1000,
++             "labels": ["capability:hub-write"]}
++    monkeypatch.setattr(wn, "registry", lambda: {"machines": {"worker-1": entry}})
++    row = {"placement_policy": "worker-first-v1", "requires": '["hub:write"]', **_claim_stall(CLAIM_STALL_HUB_ADMIN)}
++    assert coord.claim_refusal(row, "worker-1") is None
++    entry["labels"] = ["capability:coordination-read"]
++    assert coord.claim_refusal(row, "worker-1") == coord.REASON
+-- 
+2.51.0
+

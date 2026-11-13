@@ -1,0 +1,97 @@
+From fa4263a9939bcc424e51671c45a251f221c014ff Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:14:58 +0000
+Subject: [PATCH] fix(kanban): relay reads state.db past the board lock guard
+ (noqa), records its plugin import in the boundary baseline, and finds the
+ /loop tick row with the reply scan's filters [daveey]
+
+Review 5879581646: CI red on test_kanban_lockguard (raw sqlite3.connect of state.db, read-only, not a board)
+and test_boundary_lint (plugin_api_comment_actor's three kanban_relayed_human imports, the same intended
+crossing as its baselined kanban_http_comment_writer import). Nit: the tick-row lookup now skips compressed
+and synthetic-prefixed rows, so such a row landing between the fire and the tick's own row is not taken as
+the tick.
+---
+ hermes_cli/kanban_relayed_human.py            | 18 +++++++++++-------
+ scripts/boundary_lint_baseline.json           |  3 +++
+ tests/hermes_cli/test_kanban_relayed_human.py | 18 ++++++++++++++++++
+ 3 files changed, 32 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_relayed_human.py b/hermes_cli/kanban_relayed_human.py
+index 1eba9362c9..08ce894092 100644
+--- a/hermes_cli/kanban_relayed_human.py
++++ b/hermes_cli/kanban_relayed_human.py
+@@ -106,17 +106,21 @@ def _latest_user_message(session_id: str, db_path: Optional[str] = None) -> Opti
+            "AND COALESCE(_compressed_summary, 0) = 0 ORDER BY id DESC")
+     prefixes = _synthetic_prefixes()
+     try:
+-        with sqlite3.connect(uri, uri=True, timeout=5) as sdb:
+-            tick_row = None
++        with sqlite3.connect(uri, uri=True, timeout=5) as sdb:  # noqa: kanban-lockguard (state.db, read-only)
++            tick_id = None
+             if (loop_since := _slash_loop_tick_since(sdb, session_id)) is not None:
+-                tick_row = sdb.execute(  # the oldest untyped row at/after the fire: the tick's own prompt
+-                    "SELECT id FROM messages WHERE session_id = ? AND role = 'user' "
+-                    "AND COALESCE(display_kind, '') = '' AND timestamp >= ? ORDER BY id ASC LIMIT 1",
+-                    (session_id, loop_since - 1)).fetchone()
++                # the oldest untyped, uncompressed, non-synthetic row at/after the fire: the tick's own prompt
++                for row_id, row_content in sdb.execute(
++                        "SELECT id, content FROM messages WHERE session_id = ? AND role = 'user' "
++                        "AND COALESCE(display_kind, '') = '' AND COALESCE(_compressed_summary, 0) = 0 "
++                        "AND timestamp >= ? ORDER BY id ASC", (session_id, loop_since - 1)):
++                    if not str(row_content or "").lstrip().startswith(prefixes):
++                        tick_id = int(row_id)
++                        break
+             for message_id, at, content, _kind in sdb.execute(sql, (session_id, *_TYPED_KINDS)):
+                 if str(content or "").lstrip().startswith(prefixes):
+                     continue
+-                if tick_row is not None and int(message_id) == int(tick_row[0]):
++                if tick_id is not None and int(message_id) == tick_id:
+                     continue
+                 return int(message_id), float(at)
+     except sqlite3.Error:
+diff --git a/scripts/boundary_lint_baseline.json b/scripts/boundary_lint_baseline.json
+index 7605e0c96e..9cd8c95cc2 100644
+--- a/scripts/boundary_lint_baseline.json
++++ b/scripts/boundary_lint_baseline.json
+@@ -227,6 +227,9 @@
+     "plugins/kanban/dashboard/plugin_api.py hermes_cli.web_server_chat": 1,
+     "plugins/kanban/dashboard/plugin_api.py hermes_cli.web_server_sessions._open_session_db_for_profile": 1,
+     "plugins/kanban/dashboard/plugin_api_comment_actor.py hermes_cli.kanban_http_comment_writer.http_comment_writer": 1,
++    "plugins/kanban/dashboard/plugin_api_comment_actor.py hermes_cli.kanban_relayed_human.RelayRefused": 1,
++    "plugins/kanban/dashboard/plugin_api_comment_actor.py hermes_cli.kanban_relayed_human.admit": 1,
++    "plugins/kanban/dashboard/plugin_api_comment_actor.py hermes_cli.kanban_relayed_human.from_remote": 1,
+     "plugins/kanban/dashboard/plugin_api_human_request.py hermes_cli.kanban_ask_resolved.create_context": 1,
+     "plugins/kanban/dashboard/plugin_api_human_request.py hermes_cli.kanban_ask_resolved.create_filing_error": 1,
+     "plugins/kanban/dashboard/plugin_api_human_request.py hermes_cli.kanban_ask_resolved.filing_refusal": 1,
+diff --git a/tests/hermes_cli/test_kanban_relayed_human.py b/tests/hermes_cli/test_kanban_relayed_human.py
+index 2f27060382..7802c1a725 100644
+--- a/tests/hermes_cli/test_kanban_relayed_human.py
++++ b/tests/hermes_cli/test_kanban_relayed_human.py
+@@ -199,6 +199,24 @@ def test_a_reply_after_an_interrupted_loop_tick_is_the_reply(kanban_home, prompt
+         assert krh.verify(conn, tid, session_id="chat-1")["message_id"] == reply
+ 
+ 
++@pytest.mark.parametrize("early", [
++    {"content": "[System: the stream was cut; retry the tool call]"},
++    {"content": "summary of earlier turns", "compressed": 1},
++])
++def test_a_synthetic_row_before_the_tick_row_is_not_taken_as_the_tick(kanban_home, early):
++    """Review 5879581646 nit: the tick-row lookup filters like the reply scan. A synthetic or compressed untyped
++    row landing between the fire and the tick's own row must not be taken as the tick, or the real tick row
++    would pass as the person's reply."""
++    now = int(time.time())
++    with kbc.connect_closing() as conn:
++        tid = _asked(conn, now - 100)
++        reply = _state_db(kanban_home, "chat-1", now - 50)
++        _loop_state(kanban_home, "chat-1", awaiting=True, fired_at=now - 10)
++        _state_db(kanban_home, "chat-1", now - 10, **early)
++        _state_db(kanban_home, "chat-1", now - 9, content="Run the recap skill now")
++        assert krh.verify(conn, tid, session_id="chat-1")["message_id"] == reply
++
++
+ def test_an_untyped_row_of_a_wakeup_framed_loop_is_never_skipped_as_the_tick(kanban_home):
+     """The tick-row rule covers slash loops only: a wakeup-framed tick is caught by its frame, so the person's
+     reply right after the fire is never mistaken for the tick."""
+-- 
+2.51.0
+

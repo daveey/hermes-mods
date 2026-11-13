@@ -1,0 +1,955 @@
+From 6bd4b97b00f670abe854cca5f56705799e87ad62 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 03:42:22 +0000
+Subject: [PATCH] [daveey] kanban: hub final gate reads the sampler's fresh
+ sample instead of measuring again under the lock
+
+Hub 2026-11-12 23:21 -> 2026-11-13 03:14Z (16 "Hub admission refused Kanban claim" lines in agent.log): top-priority
+card t_01a19400313cfbda was claimed by the hub, then released 5 s later (unused_grant) with
+dispatch_skipped claim_deferred detail=hub_cpu_unknown, about every 5 min, while
+machine_metrics.read_hub_cpu_sample() was 0.5-4.5 s old at 23-32 % busy.
+
+Five whys
+Problem: the hub takes a Board lease for t_01a19400313cfbda and refuses it as hub_cpu_unknown under a fresh sample.
+Why 1: the refusal comes from _final_hub_gate (the locked gate after the lease), not the pre-lease advisory --
+  evidence: the advisory admitted (the claim/lease happened); the release carries unused_grant; the refusal log is
+  hermes_cli.kanban_admission. The docstring's "pre-check before a Board lease" exists and passed.
+Why 2: the locked gate never read the sampler's sample: it took its own ~1 s /proc/stat sample and counted the host
+  twice around it, inside a 2.25 s hold budget, and every exit it could not finish in time returned hub_cpu_unknown
+  (`_over_budget(started, cpu.WINDOW_S)` before sampling, `_over_budget(started)` after) -- evidence: base
+  kanban_admission.py _final_hub_gate.
+Why 3: in the hub gateway process the pre-sample work alone exceeds the 1.25 s left for it -- evidence: hub probes
+  with the live config (root_limit on/50 %, cap 7, 9 boards): quiet process admits in 1.13 s; with in-process CPU
+  contention _cap_full took 4.5-63 s and root_limit/max_in_progress/census/candidate_pool 1.3-2.9 s each, and
+  every call returned hub_cpu_unknown without ever sampling. The gateway is a single busy Python process (load ~6,
+  tui-notif-poller and delegation threads competing for the GIL).
+Why 4: the design treated "independent sample under the lock" as the safety property and charged it against the
+  same hold that serializes chat turns, so the only budget-safe answer on a busy process was to refuse -- and it was
+  labelled as an unknown CPU reading, so it looked like a sampler problem (the stale-advisory alert never fired
+  because the advisory was fine).
+Root (happened): the final gate re-measured CPU under the lock instead of reading the sample the sampler already
+  publishes, so its cost scaled with the gateway's GIL contention, and the pre-lease advisory could not predict the
+  locked outcome -> lease, refuse, release, repeat.
+Root (not caught): tests faked cm.sample with an instant return and a fast census; no test ran the gate with a slow
+  locked census, and an overrun shared the hub_cpu_unknown code, so logs could not tell "unknown CPU" from "slow gate".
+Recurrence: kanban_dispatch_skip.py records a 2026-11-12 hub flap (claim_deferred alternating capacity /
+  hub_cpu_at_or_above_limit); same family (locked gate disagreeing with the pre-lease view), different reason.
+
+Countermeasures
+- root: _final_hub_gate re-reads cache/hub-cpu-sample.json through one reader, sampler_sample(), shared with the
+  pre-lease advisory (same triple, same validation: numeric fields, 1-2 s window, 0-100 %, not future, <= 15 s
+  old). No /proc/stat sample and no sleep under admission.lock; one census, no recount (nothing waits between it
+  and the commit). The claimed event records the sampler's exact triple.
+- root: the pre-lease advisory now demands PRELEASE_HEADROOM_MS (5 s) more freshness (<= 10 s), so a sample it
+  accepts is still fresh when the locked gate reads it after the Board round-trip: a stale sampler defers BEFORE
+  the lease instead of churning a grant.
+- detection: a hold overrun is now hub_admission_overrun (added to kanban_queue_reason.CODES), never
+  hub_cpu_unknown.
+- proof: tests/hermes_cli/test_kanban_hub_admission_sampler_read.py, 10 tests, all fail on the base (RED) and pass
+  after; 17 admission/sampler/worker-admission files, 503 tests, pass. Existing tests that faked cm.sample now feed
+  the locked read via a `locked()` helper; the real-/proc/stat lock-hold contract test is replaced by one asserting
+  the locked read happens under the lock, takes no sample and records the sampler's triple.
+
+Card: t_01a1d2e5c4899f40
+---
+ docs/worker-first-v1.md                       |   2 +-
+ hermes_cli/kanban_admission.py                | 104 ++++++-----
+ hermes_cli/kanban_queue_reason.py             |   3 +-
+ hermes_cli/machine_cpu_metrics.py             |  12 +-
+ hermes_cli/machine_metrics.py                 |   2 +-
+ tests/hermes_cli/test_kanban_hub_admission.py | 167 ++++++++----------
+ .../test_kanban_hub_admission_grant_echo.py   |   3 +-
+ .../test_kanban_hub_admission_guards.py       |  21 ++-
+ .../test_kanban_hub_admission_sampler_read.py | 116 ++++++++++++
+ .../test_kanban_hub_admission_scopes.py       |   3 +-
+ .../test_kanban_hub_admission_turns.py        |   7 +-
+ 11 files changed, 281 insertions(+), 159 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_hub_admission_sampler_read.py
+
+diff --git a/docs/worker-first-v1.md b/docs/worker-first-v1.md
+index 680390a4d4..c65d999abc 100644
+--- a/docs/worker-first-v1.md
++++ b/docs/worker-first-v1.md
+@@ -7,7 +7,7 @@
+ Workers always win. The Board reserves the origin hub for a portable card only when **every** compatible member of the origin's *configured* pool (never the request subset) is known, fresh and refused solely for pressure (score >= .85) or full slots, AND the hub's reported measured CPU busy is fresh (conservative end within 15 s) and strictly below the operator's threshold, AND hub capacity/memory/drain allow it, AND no other hub overflow reservation is outstanding, AND the sample's conservative start is after the last hub overflow grant. Unknown, stale, held, draining or offline workers veto overflow and the card queues. Zero compatible workers queues with `no_eligible_worker` (overflow path only; with overflow off the same card queues with the per-candidate rollup `capability_mismatch` or `mixed`, and core treats that as the same state when every configured pool member carries a structural `supports()` reason): the automatic structural origin repin was removed (only the explicit owner repin clears the fence). The origin then posts one owner notice per card revision (`hermes_cli/kanban_repin_notice.py`): a comment naming the missing labels and the exact `hermes kanban move <id> --runs-on machine:<origin> --reason "no pool worker can run it"` command, plus a `worker_repin_notice` event its origin chat receives; the dispatcher stuck summary lists such cards as "waiting for a manual repin" instead of a stall. Nothing repins automatically. Prior runs, host-bound cards and running leases are never moved.
+ 
+ * Board: operator-owned `worker_overflow` setting, e.g. `{"hub": {"machine": "hub", "cpu_busy_below_pct": 50}}`; `{}`/absent disables it. The lease grant re-runs the decision with the current registry and records the consumed sample; a worker freeing up, a CPU rise, a used sample or a disabled setting refuses the grant.
+-* Core: `kanban.admission.cpu_busy_below_pct` in the **installation-root** config enables (a) a 10 s metrics report carrying `cpu_busy_pct`/`cpu_busy_window_ms`/`cpu_busy_sample_end_ms` (2 s hard total, never replayed), (b) a lock-free advisory pre-check before any Board lease, and (c) the final gate: with `admission.lock` held and before the claim commits, an independent full ~1 s `/proc/stat` sample must be strictly below the limit and the host running count below the root `kanban.max_in_progress`. Any unknown (unreadable config, bad value, failed sample, window outside 1-2 s, passed deadline) refuses. The gate applies to every new ready/review claim on that host (legacy, host-bound and policy cards); the worker load formula is not used for the origin's own cards.
++* Core: `kanban.admission.cpu_busy_below_pct` in the **installation-root** config enables (a) a 10 s metrics report carrying `cpu_busy_pct`/`cpu_busy_window_ms`/`cpu_busy_sample_end_ms` (2 s hard total, never replayed), (b) a lock-free advisory pre-check before any Board lease (sampler sample at most 10 s old), and (c) the final gate: with `admission.lock` held and before the claim commits, the same advisory sampler sample (at most 15 s old, re-read from `cache/hub-cpu-sample.json`, never a new sample under the lock) must be strictly below the limit and the host running count below the root `kanban.max_in_progress`, inside the 2.25 s hold. Any unknown (unreadable config, bad value, missing/stale/malformed sample, window outside 1-2 s, passed deadline) refuses; a hold overrun refuses as `hub_admission_overrun`. The 5 s gap between the two ages keeps a sample the advisory accepted fresh through the lease round-trip, so the hub does not take a lease it then cannot use. (Until 2026-11-13 the gate took an independent ~1 s sample under the lock and counted the host twice around it; in the GIL-busy hub gateway that overran the hold after every lease and was reported as `hub_cpu_unknown` while the advisory was fresh.) The gate applies to every new ready/review claim on that host (legacy, host-bound and policy cards); the worker load formula is not used for the origin's own cards.
+ * Rollout order: deploy Boards and clients first; set root `cpu_busy_below_pct`; verify reports; only then enable Board `worker_overflow`. Rollback: set Board `worker_overflow` to `{}` and read it back (outstanding hub reservations become unclaimable). Rollback keeps the root CPU guard and `kanban.max_in_progress` (7): removing the root key or raising the cap is a separate, explicit operator decision, never part of rollback. After rollback the Board still admits the origin hub's review continuation of a card it already ran on the hub (review ruling 11), on the hub's non-CPU admission only (active, unheld, pickup, capability, fresh metrics, no drain, memory < 85 %, a free slot under a known cap); the root CPU guard is then that claim's only CPU check, which is why rollback keeps it. Rollback never creates an overflow, a hub reservation or a new hub assignment, and there is no operator move of a review card to ready: a review card the hub can never admit moves only once its refusal reason is cleared or overflow is re-enabled.
+ * The advisory is fed only by the sync loop's advisory sampler thread (`hermes_cli/machine_cpu_sampler.py`, `cache/hub-cpu-sample.json`): a full ~1 s sample every 5 s on its own thread, written independently of the Board POST, so neither a Board outage nor a slow sync round (3-20 s on the hub) starves it. Each metrics report attaches the newest sample not yet reported (at most 10 s old). The loop starts the thread and stops it when the loop ends, so when the sync loop is not running (sync role given up, no identity) every hub claim on that host defers as `hub_cpu_unknown`: fail-closed by design. When the advisory stays stale for 60 s of dispatcher observation while the root limit is on, the dispatcher opens one Kanban card per incident (`hermes_cli/kanban_hub_cpu_alert.py`, key `hub-cpu-advisory-stale`). An earlier design measured inside the loop and validated the 1-2 s window across loop iterations; on the hub every sample was dropped (2026-11-12).
+ * Turns are not refused by a claim's sample: on **every** host (whether or not the root limit is set), chat, notification and review turns wait out a busy `admission.lock` for longer than its longest designed hold (`admission_fence.CLAIM_MAX_HOLD_S`), a waiting turn makes the next claims defer to their next tick (also on hosts without the CPU gate, e.g. worker-1: `BUSY_WAIT_S` rose from 0.5 s to 3.0 s for all turn sources), and `prompt.admit` waits outside the session resume lock and then retries its admission once (nothing durable precedes admission, so no duplicate turn).
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index 231dab2c63..f7724916ac 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -2,10 +2,17 @@
+ 
+ Hub CPU gate (worker-first overflow, docs/worker-first-v1.md): on a host whose installation-root config sets
+ ``kanban.admission.cpu_busy_below_pct`` every new ready/review claim (legacy, host-bound and policy cards alike) must
+-pass, while ``admission.lock`` is held and before the claim commits: an independent full ~1 s CPU busy sample strictly
+-below the limit, a whole-host running count below the root ``kanban.max_in_progress`` cap, and a lease deadline that
+-is still ahead after sampling. Any unknown refuses. No network happens under the lock. A lock-free advisory read of the
+-reporter's latest sample runs earlier, before any Board lease, so a busy hub causes no grant/release churn.
++pass, while ``admission.lock`` is held and before the claim commits: the advisory sampler's latest complete sample
++(``cache/hub-cpu-sample.json``, at most ``ADVISORY_MAX_AGE_MS`` old) strictly below the limit, a whole-host running
++count below the root ``kanban.max_in_progress`` cap, a lease deadline that is still ahead, and a hold inside its
++budget. Any unknown refuses. No network and no sleep happen under the lock. A lock-free advisory read of the same
++sample runs earlier, before any Board lease, and demands ``PRELEASE_HEADROOM_MS`` of extra freshness, so the sample it
++accepts is still fresh when the locked gate reads it and a busy or stale hub causes no grant/release churn.
++
++[daveey] The locked gate used to take its own ~1 s ``/proc/stat`` sample and count the host twice around it. In the
++hub gateway (a process holding the GIL ~100 % of a core) the census alone ran ~1.3 s, so census + sample + recount
++overran the 2.25 s hold on every claim, after the lease was granted, and was reported as ``hub_cpu_unknown`` while the
++advisory was fresh (2026-11-13, t_01a1d2e5c4899f40). An overrun is now ``hub_admission_overrun``.
+ """
+ import contextlib
+ import logging
+@@ -13,7 +20,11 @@ import threading
+ import time
+ from pathlib import Path
+ 
+-ADVISORY_MAX_AGE_MS = 15_000
++ADVISORY_MAX_AGE_MS = 15_000  # the locked gate's freshness limit for the sampler's sample
++# The pre-lease advisory wants this much more freshness, so the sample it accepts survives the Board lease round-trip
++# and the txn wait inside ADVISORY_MAX_AGE_MS (the sampler rewrites it every 5 s: a healthy one is <= ~7 s old).
++PRELEASE_HEADROOM_MS = 5_000
++OVERRUN = "hub_admission_overrun"
+ _consumed = threading.local()
+ _decision = threading.local()  # the last cap count this thread's final gate read (refusal log / claimed event)
+ 
+@@ -33,9 +44,11 @@ def hub_cpu_advisory(task_id=None, *, conn=None):
+     """Lock-free pre-check before a Board lease (review ruling 5). Returns a refusal reason or None.
+ 
+     Off unless the root limit is set. Uses the advisory sampler's latest complete sample: missing, stale (>15 s),
+-    future or malformed reads as unknown and defers; a fresh value at or above the limit defers. Advisory only."""
++    future or malformed reads as unknown and defers; a fresh value at or above the limit defers. Advisory only.
++    Freshness here is ``ADVISORY_MAX_AGE_MS - PRELEASE_HEADROOM_MS`` (10 s): the locked gate re-reads the same
++    file with the looser ``ADVISORY_MAX_AGE_MS``, so a sample accepted before the lease is not stale by the time the
++    gate reads it."""
+     from hermes_cli import machine_cpu_metrics as cpu
+-    from hermes_cli import machine_metrics
+ 
+     from hermes_cli.worker_resource_admission import refusal
+     from hermes_cli.worker_compute_capacity import worker_enabled, owner_for_connection
+@@ -59,19 +72,34 @@ def hub_cpu_advisory(task_id=None, *, conn=None):
+             except (OSError, ValueError, TypeError):
+                 _defer(task_id, reason)
+                 return reason
+-        last = machine_metrics.read_hub_cpu_sample() or {}
+-        end = last.get("cpu_busy_sample_end_ms")
+-        age = _now() * 1000 - end if type(end) in (int, float) else None
+-        if age is not None and 0 <= age <= ADVISORY_MAX_AGE_MS:
+-            pct = last.get("cpu_busy_pct")
+-            if cpu.below(pct, limit):
++        last = sampler_sample(ADVISORY_MAX_AGE_MS - PRELEASE_HEADROOM_MS)
++        if last is not None:
++            if cpu.below(last["cpu_busy_pct"], limit):
+                 return None
+-            if type(pct) in (int, float) and 0 <= pct <= 100:
+-                reason = "hub_cpu_at_or_above_limit"
++            reason = "hub_cpu_at_or_above_limit"
+     _defer(task_id, reason)
+     return reason
+ 
+ 
++def sampler_sample(max_age_ms=None):
++    """The advisory sampler's latest complete sample when usable, else None (unknown).
++
++    One reader for the pre-lease advisory and the locked gate: the triple ``machine_cpu_sampler`` writes, with every
++    field a number, a 1-2 s window, a busy percentage in [0, 100] and an end stamp 0..``max_age_ms`` ago (a future
++    stamp is unknown). ``max_age_ms`` None is the locked gate's ``ADVISORY_MAX_AGE_MS``."""
++    from hermes_cli import machine_cpu_metrics as cpu
++    from hermes_cli import machine_metrics
++
++    last = machine_metrics.read_hub_cpu_sample() or {}
++    pct, window, end = (last.get(k) for k in cpu.FIELDS)
++    if not (type(pct) in (int, float) and type(window) in (int, float) and type(end) in (int, float)):
++        return None
++    if not 0 <= pct <= 100 or not cpu.MIN_WINDOW_MS <= window <= cpu.MAX_WINDOW_MS:
++        return None
++    max_age_ms = ADVISORY_MAX_AGE_MS if max_age_ms is None else max_age_ms
++    return dict(zip(cpu.FIELDS, (pct, window, end))) if 0 <= _now() * 1000 - end <= max_age_ms else None
++
++
+ def _root_max_in_progress(*, root=None):
+     """Root ``kanban.max_in_progress`` resolved like the dispatcher (unset → memory-derived default).
+ 
+@@ -143,14 +171,15 @@ def _unknown(stage, started, **extra):
+ 
+ 
+ def _final_hub_gate(gate, started=None, claimant=None, *, conn=None, task_id=None):
+-    """Under admission.lock: ``(reason, evidence)``; reason None admits. Never touches the network.
+-
+-    Cheap checks (whole-host cap, lease deadline) run BEFORE the ~1 s sample so a claim that must be refused anyway
+-    never holds the lock for a sample (review F6); the deadline and the whole-host count are checked again after
+-    sampling, immediately before the commit. ``started`` (monotonic, taken when admission.lock was acquired) enforces
+-    the designed hold: a gate that cannot fit its sample inside ``CLAIM_MAX_HOLD_S`` minus the commit
+-    reserve refuses before sampling when not even a nominal 1 s sample fits, and one that overran it (slow board scan, stall) refuses instead of committing, so
+-    a waiting turn's BUSY_WAIT_S budget is never outlasted by an admitted claim (final review N1)."""
++    """Under admission.lock: ``(reason, evidence)``; reason None admits. Never touches the network or sleeps.
++
++    One whole-host census (it picks the pool and its CPU ceiling), then the advisory sampler's sample re-read through
++    :func:`sampler_sample` (at most ``ADVISORY_MAX_AGE_MS`` old, the same triple the pre-lease advisory accepted or a
++    newer one), then the lease deadline and the hold. Nothing between the census and the commit waits, so it is not
++    recounted. ``started`` (monotonic, taken when admission.lock was acquired) enforces the designed hold: a gate that
++    overran ``CLAIM_MAX_HOLD_S`` minus the commit reserve (a slow board scan in a GIL-starved process, a stall) refuses
++    as ``hub_admission_overrun`` instead of committing, so a waiting turn's BUSY_WAIT_S budget is never outlasted by an
++    admitted claim (final review N1). The overrun is not a CPU reading and is never reported as one."""
+     from hermes_cli import machine_cpu_metrics as cpu
+ 
+     echo = getattr(gate, "echo", None)
+@@ -171,29 +200,20 @@ def _final_hub_gate(gate, started=None, claimant=None, *, conn=None, task_id=Non
+         return None, None
+     if state != cpu.ON:
+         return _unknown("limit_unknown", started)
+-    if _cap_full(echo, conn=conn, task_id=task_id):
+-        return "hub_capacity_full", None
+-    selected_limit = getattr(_decision, "pool_limit", None) or limit
+     if _expired(gate):
+-        return _unknown("lease_expired_before_sample", started)
+-    if _over_budget(started, cpu.WINDOW_S):
+-        return _unknown("hold_before_sample", started)  # no room left for even a nominal sample inside the hold
+-    measured = cpu.sample()
+-    if not measured or not all(k in measured for k in cpu.FIELDS):
+-        return _unknown("sample_invalid", started)
+-    if not cpu.MIN_WINDOW_MS <= measured["cpu_busy_window_ms"] <= cpu.MAX_WINDOW_MS:
+-        return _unknown("sample_window", started, window_ms=measured["cpu_busy_window_ms"])
+-    if not cpu.below(measured["cpu_busy_pct"], selected_limit):
+-        return "hub_cpu_at_or_above_limit", None
+-    if _expired(gate):
+-        return _unknown("lease_expired_after_sample", started)  # the claim/lease deadline passed while sampling
+-    if _cap_full(echo, conn=conn, task_id=task_id):  # recount immediately before commit
++        return _unknown("lease_expired_before_census", started)  # the claim/lease deadline already passed
++    if _cap_full(echo, conn=conn, task_id=task_id):
+         return "hub_capacity_full", None
+     limit = getattr(_decision, "pool_limit", None) or limit
++    measured = sampler_sample()
++    if measured is None:
++        return _unknown("sample_stale_or_missing", started)
+     if not cpu.below(measured["cpu_busy_pct"], limit):
+         return "hub_cpu_at_or_above_limit", None
++    if _expired(gate):
++        return _unknown("lease_expired_after_census", started)  # the deadline passed while counting: never start
+     if _over_budget(started):
+-        return _unknown("hold_after_sample", started)  # the hold overran its budget: refuse, never outlast turns
++        return OVERRUN, None  # the hold overran its budget: refuse rather than outlast waiting turns
+     counts = getattr(_decision, "counts", None) or {}
+     admission = {k: counts[k] for k in ("active_before", "active_after", "excluded_run_uid")} \
+         if counts.get("excluded_run_uid") else None
+@@ -398,8 +418,8 @@ def claim_transaction(conn, *, task_id=None, gate=None):
+                 logging.getLogger(__name__).info("A turn is waiting for update admission; deferring Kanban claim")
+                 yield False
+                 return
+-            # Frozen contract: an independent full CPU sample is taken HERE, with admission.lock held, and the
+-            # claim commits before the lock is released, so a concurrent claimer sees this run in its recount.
++            # The CPU/cap gate runs HERE, with admission.lock held, and the claim commits before the lock is released,
++            # so a concurrent claimer sees this run in its census. It re-reads the sampler's sample; it never sleeps.
+             _bind_echo(conn, task_id, gate)
+             _decision.counts = None
+             _decision.pool = "regular"
+diff --git a/hermes_cli/kanban_queue_reason.py b/hermes_cli/kanban_queue_reason.py
+index 1f96bca990..f023f3db09 100644
+--- a/hermes_cli/kanban_queue_reason.py
++++ b/hermes_cli/kanban_queue_reason.py
+@@ -14,7 +14,8 @@ CODES = {"reserved", "draining", "admission_limits", "no_live_candidate", "capab
+          "observation_unavailable", "mixed", "board_error", "board_refused", "no_pool_worker",
+          # worker-first overflow (docs/worker-first-v1.md): Board reserve observations and the core final gate
+          "workers_unknown", "no_eligible_worker", "workers_saturated", "hub_cpu_at_or_above_limit",
+-         "hub_cpu_unknown", "hub_capacity_full", "hub_sample_already_used", "hub_overflow_reserved"}
++         "hub_cpu_unknown", "hub_capacity_full", "hub_sample_already_used", "hub_overflow_reserved",
++         "hub_admission_overrun"}
+ _REJECTIONS = {"invalid_policy", "not_creator", "not_claimable", "worker_pool_disabled",
+                "unauthorized_candidate", "explicit_pin", "revision_conflict", "not_found"}
+ _TOKEN = re.compile(r"^[A-Za-z0-9_.:/+-]{1,120}$")
+diff --git a/hermes_cli/machine_cpu_metrics.py b/hermes_cli/machine_cpu_metrics.py
+index 3140fe56e6..5e7b70c263 100644
+--- a/hermes_cli/machine_cpu_metrics.py
++++ b/hermes_cli/machine_cpu_metrics.py
+@@ -8,12 +8,12 @@ included in user/nice and are never added again; ``steal`` counts as busy (time
+ error, malformed line, counter decrease (reboot/reset), non-positive total, or an elapsed window outside
+ [1000, 2000] ms yields ``None`` (unknown), which every caller treats as "refuse", never as idle.
+ 
+-Two callers sample:
+-- the sync loop's advisory sampler thread (``machine_cpu_sampler``), one rolling snapshot per second and only while
+-  the installation-root config sets ``kanban.admission.cpu_busy_below_pct``; it feeds the lock-free advisory file
+-  and the metrics report (the Board uses the reported triple for hub overflow), and
+-- the final claim gate in ``kanban_admission.claim_transaction``, with an independent full sample taken while
+-  ``admission.lock`` is held.
++One caller samples: the sync loop's advisory sampler thread (``machine_cpu_sampler``), one rolling snapshot per
++second and only while the installation-root config sets ``kanban.admission.cpu_busy_below_pct``. It feeds the
++advisory file, which both the lock-free pre-lease advisory and the final claim gate under ``admission.lock`` read
++(``kanban_admission.sampler_sample``), and the metrics report (the Board uses the reported triple for hub overflow).
++The final gate no longer takes its own ~1 s sample under the lock: in the GIL-busy hub gateway that sample plus the
++census overran the hold on every claim (2026-11-13).
+ 
+ Normalized load average is NOT a substitute for this measurement anywhere in the gate.
+ """
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index ef6c899080..3d3032cc3a 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -248,7 +248,7 @@ def _hub_cpu_path(root: Optional[Path] = None) -> Path:
+ 
+ def record_hub_cpu_sample(sample: dict, root: Optional[Path] = None) -> None:
+     """Keep the reporter's latest complete CPU triple for the lock-free advisory pre-check
+-    (``kanban_admission.hub_cpu_advisory``). Advisory only: the final gate always measures again under the lock."""
++    (``kanban_admission.hub_cpu_advisory``) and the locked final gate (``kanban_admission.sampler_sample``)."""
+     import json
+     path = _hub_cpu_path(root)
+     path.parent.mkdir(parents=True, exist_ok=True)
+diff --git a/tests/hermes_cli/test_kanban_hub_admission.py b/tests/hermes_cli/test_kanban_hub_admission.py
+index 58e954700f..1c513b6282 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission.py
++++ b/tests/hermes_cli/test_kanban_hub_admission.py
+@@ -71,6 +71,16 @@ def fake_sample(pct, calls=None, check=None):
+     return sample
+ 
+ 
++def locked(monkeypatch, read):
++    """Feed the final gate's locked read of the sampler sample from ``read()`` (a ``fake_sample`` or a ``pytest.fail``
++    stand-in). The pre-lease advisory (stricter age) still reads the real file written with :func:`advisory`."""
++    real = ka.sampler_sample
++
++    def sampler_sample(max_age_ms=None):
++        return read() if max_age_ms is None else real(max_age_ms)
++    monkeypatch.setattr(ka, "sampler_sample", sampler_sample)
++
++
+ tool_worker_env = tool_helpers.worker_env
+ 
+ 
+@@ -144,7 +154,7 @@ def test_concurrent_cross_board_claims_obey_origin_and_pool_caps(board, monkeypa
+     with (home / "config.yaml").open("a") as config:
+         config.write("    priority_slots: 3\n")
+     advisory(home)
+-    monkeypatch.setattr(cm, "sample", fake_sample(10))
++    locked(monkeypatch, fake_sample(10))
+     candidates = []
+     for index in range(4):
+         folder = kb.boards_root() / f"pool-{index}"
+@@ -184,7 +194,7 @@ def test_queue_note_reports_pools_and_marked_lane_order(board, monkeypatch):
+     with (home / "config.yaml").open("a") as config:
+         config.write("    priority_slots: 3\n")
+     advisory(home)
+-    monkeypatch.setattr(cm, "sample", fake_sample(10))
++    locked(monkeypatch, fake_sample(10))
+     active = task(conn, title="marked running")
+     kb.edit_task(conn, active, admission_class="urgent")
+     assert kb.claim_task(conn, active)
+@@ -244,7 +254,7 @@ def test_unsupported_fence_resets_prior_priority_receipt(board, monkeypatch):
+     with (home / "config.yaml").open("a") as config:
+         config.write("    priority_slots: 3\n")
+     advisory(home)
+-    monkeypatch.setattr(cm, "sample", fake_sample(10))
++    locked(monkeypatch, fake_sample(10))
+     marked = task(conn)
+     kb.edit_task(conn, marked, admission_class="urgent")
+     assert kb.claim_task(conn, marked)
+@@ -281,7 +291,7 @@ def test_capacity_origin_cap_survives_task_class_edits(board, monkeypatch):
+     with (home / "config.yaml").open("a") as config:
+         config.write("    priority_slots: 3\n")
+     advisory(home)
+-    monkeypatch.setattr(cm, "sample", fake_sample(10))
++    locked(monkeypatch, fake_sample(10))
+     for index in range(2):
+         tid = task(conn, title=f"capacity {index}")
+         kb.edit_task(conn, tid, admission_class="capacity", admission_frees="frees: worker slots")
+@@ -362,7 +372,7 @@ def test_urgent_claim_uses_extra_pool_with_regular_pool_full(board, monkeypatch,
+     candidate = task(conn, review=review, title="Incident recovery")
+     kb.edit_task(conn, candidate, admission_class="urgent")
+     advisory(home, pct=70)
+-    monkeypatch.setattr(cm, "sample", fake_sample(70))
++    locked(monkeypatch, fake_sample(70))
+     assert claim(conn, candidate, review) is not None
+     receipt = conn.execute("SELECT admission_pool FROM task_runs WHERE task_id=?", (candidate,)).fetchone()
+     assert receipt[0] == "priority"
+@@ -412,7 +422,7 @@ def test_dispatch_marked_candidate_precedes_normal_in_same_lane(
+     with (home / "config.yaml").open("a") as config:
+         config.write("    priority_slots: 3\n")
+     advisory(home)
+-    monkeypatch.setattr(cm, "sample", fake_sample(10))
++    locked(monkeypatch, fake_sample(10))
+     monkeypatch.setattr(dispatch, "review_dispatch_enabled", lambda: True)
+     monkeypatch.setattr(dispatch, "_memory_pressure_level", lambda: "normal")
+     normal = task(conn, review=review, title="higher numeric priority")
+@@ -442,7 +452,7 @@ def test_replica_waiter_ranking_cannot_undo_marked_lane_order(board, monkeypatch
+         with (home / "config.yaml").open("a") as config:
+             config.write("    priority_slots: 3\n")
+         advisory(home)
+-        monkeypatch.setattr(cm, "sample", fake_sample(10))
++        locked(monkeypatch, fake_sample(10))
+     monkeypatch.setattr(dispatch, "_memory_pressure_level", lambda: "normal")
+     marked = task(conn, title="restore capacity")
+     kb.edit_task(conn, marked, admission_class="urgent")
+@@ -499,7 +509,7 @@ def test_dispatch_full_regular_pool_claims_marked_with_shared_memory_budget(
+     for tid in marked:
+         kb.edit_task(conn, tid, admission_class="urgent")
+     advisory(home, pct=70)
+-    monkeypatch.setattr(cm, "sample", fake_sample(70))
++    locked(monkeypatch, fake_sample(70))
+     monkeypatch.setattr(dispatch, "review_dispatch_enabled", lambda: True)
+     monkeypatch.setattr(dispatch, "_memory_pressure_level", lambda: pressure)
+     spawned = []
+@@ -528,7 +538,7 @@ def _saturate(conn, home, monkeypatch, regular_active):
+     with (home / "config.yaml").open("a") as config:
+         config.write("    priority_slots: 3\n")
+     advisory(home)
+-    monkeypatch.setattr(cm, "sample", fake_sample(10))
++    locked(monkeypatch, fake_sample(10))
+     monkeypatch.setattr(dispatch, "review_dispatch_enabled", lambda: True)
+     monkeypatch.setattr(dispatch, "_memory_pressure_level", lambda: "normal")
+     attempts, spawned = [], []
+@@ -816,7 +826,7 @@ def refused(conn, t, review, reason):
+ @pytest.mark.parametrize("review", [False, True])
+ def test_gate_absent_admits_without_sampling(board, monkeypatch, review):
+     conn, _home = board
+-    monkeypatch.setattr(cm, "sample", lambda *a, **k: pytest.fail("no root limit: must not sample"))
++    locked(monkeypatch, lambda *a, **k: pytest.fail("no root limit: must not sample"))
+     t = task(conn, review)
+     assert claim(conn, t, review) is not None
+ 
+@@ -826,7 +836,7 @@ def test_below_limit_admits_and_claimed_event_carries_consumed_sample(board, mon
+     conn, home = board
+     configure(home)
+     advisory(home)
+-    monkeypatch.setattr(cm, "sample", fake_sample(49.999))
++    locked(monkeypatch, fake_sample(49.999))
+     t = task(conn, review)
+     assert claim(conn, t, review) is not None
+     payload = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='claimed'",
+@@ -843,7 +853,7 @@ def test_at_or_above_limit_or_unknown_refuses_with_no_local_run(board, monkeypat
+     conn, home = board
+     configure(home)
+     advisory(home)
+-    monkeypatch.setattr(cm, "sample", fake_sample(pct))
++    locked(monkeypatch, fake_sample(pct))
+     t = task(conn, review)
+     assert claim(conn, t, review) is None
+     refused(conn, t, review, reason)
+@@ -853,7 +863,7 @@ def test_at_or_above_limit_or_unknown_refuses_with_no_local_run(board, monkeypat
+ def test_invalid_root_limit_refuses_without_sampling(board, monkeypatch, review):
+     conn, home = board
+     configure(home, limit='"fifty"')  # type: ignore[arg-type]
+-    monkeypatch.setattr(cm, "sample", lambda *a, **k: pytest.fail("invalid limit: refuse before sampling"))
++    locked(monkeypatch, lambda *a, **k: pytest.fail("invalid limit: refuse before sampling"))
+     t = task(conn, review)
+     assert claim(conn, t, review) is None
+     refused(conn, t, review, "hub_cpu_unknown")
+@@ -869,7 +879,7 @@ def test_profile_override_cannot_disable_root_gate(board, monkeypatch, tmp_path)
+     monkeypatch.setenv("HERMES_HOME", str(profile))
+     import hermes_constants
+     monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda *a, **k: home)
+-    monkeypatch.setattr(cm, "sample", fake_sample(80.0))
++    locked(monkeypatch, fake_sample(80.0))
+     t = task(conn)
+     assert kb.claim_task(conn, t) is None
+     refused(conn, t, False, "hub_cpu_at_or_above_limit")
+@@ -888,7 +898,7 @@ def test_sample_is_taken_while_admission_lock_is_held(board, monkeypatch, review
+                 seen.append("free")
+         except af.AdmissionBusy:
+             seen.append("held")
+-    monkeypatch.setattr(cm, "sample", fake_sample(10.0, check=check))
++    locked(monkeypatch, fake_sample(10.0, check=check))
+     t = task(conn, review)
+     assert claim(conn, t, review) is not None
+     assert seen == ["held"]
+@@ -907,19 +917,22 @@ def test_advisory_precheck_defers_before_any_lease_or_sample(board, monkeypatch,
+     elif advice != "missing":
+         advisory(home, pct=advice)
+     monkeypatch.setattr(sync, "claim_gate", lambda *a, **k: pytest.fail("advisory refusal must not ask for a lease"))
+-    monkeypatch.setattr(cm, "sample", lambda *a, **k: pytest.fail("advisory refusal must not sample"))
++    locked(monkeypatch, lambda *a, **k: pytest.fail("advisory refusal must not sample"))
+     t = task(conn, review)
+     assert claim(conn, t, review) is None
+     refused(conn, t, review, reason)
+ 
+ 
+-def test_advisory_age_boundary_15000_ms_is_fresh(board, monkeypatch):
++def test_advisory_age_boundary_10000_ms_is_fresh_and_the_locked_read_keeps_15000(board, monkeypatch):
++    """Pre-lease: 10 s (15 s minus the lease headroom). The locked gate reads the same file and accepts up to 15 s."""
+     conn, home = board
+     configure(home)
+-    advisory(home, age_ms=14_900)
+-    monkeypatch.setattr(cm, "sample", fake_sample(10.0))
++    advisory(home, age_ms=9_900)
+     t = task(conn)
+     assert kb.claim_task(conn, t) is not None
++    assert ka.ADVISORY_MAX_AGE_MS - ka.PRELEASE_HEADROOM_MS == 10_000
++    advisory(home, age_ms=14_000)  # too old to take a lease, still fresh for the locked read
++    assert ka.sampler_sample() is not None and ka.sampler_sample(10_000) is None
+ 
+ 
+ @pytest.mark.parametrize("review", [False, True])
+@@ -927,7 +940,7 @@ def test_whole_host_cap_is_rechecked_under_lock(board, monkeypatch, review):
+     conn, home = board
+     configure(home, cap=2)
+     advisory(home)
+-    monkeypatch.setattr(cm, "sample", fake_sample(10.0))
++    locked(monkeypatch, fake_sample(10.0))
+     monkeypatch.setattr(mm, "active_card_runs", lambda: 2)
+     t = task(conn, review)
+     assert claim(conn, t, review) is None
+@@ -944,7 +957,7 @@ def test_lease_expiring_during_sample_cannot_start(board, monkeypatch):
+     configure(home)
+     advisory(home)
+     real_time = time.time
+-    monkeypatch.setattr(cm, "sample", fake_sample(10.0, check=lambda: monkeypatch.setattr(
++    locked(monkeypatch, fake_sample(10.0, check=lambda: monkeypatch.setattr(
+         ka, "_now", lambda: real_time() + 10 ** 7)))
+     t = task(conn)
+     assert kb.claim_task(conn, t) is None
+@@ -962,7 +975,7 @@ def test_simultaneous_claimers_at_6_of_7_start_at_most_one(board, monkeypatch):
+         with closing(sqlite3.connect(f"file:{home / 'kanban.db'}?mode=ro", uri=True, timeout=5)) as db:
+             return 6 + db.execute("SELECT count(*) FROM tasks WHERE status='running'").fetchone()[0]
+     monkeypatch.setattr(mm, "active_card_runs", active)
+-    monkeypatch.setattr(cm, "sample", fake_sample(10.0, check=lambda: time.sleep(0.2)))  # health: allow HX013 -- stands in for the ~1 s sample held under the lock
++    locked(monkeypatch, fake_sample(10.0, check=lambda: time.sleep(0.2)))  # health: allow HX013 -- stands in for the ~1 s sample held under the lock
+     tasks = [task(conn, title=f"t{i}") for i in range(4)]
+ 
+     def go(t):
+@@ -982,72 +995,35 @@ def _lock_state(home):
+         return "held"
+ 
+ 
+-@pytest.mark.skipif(not cm.sys.platform.startswith("linux"), reason="real /proc/stat sample")
+-def test_real_sample_is_entirely_under_lock_bounded_and_measures_chat_turn_cost(board):
+-    """Frozen contract: an independent FULL real ~1 s /proc/stat sample is taken entirely while admission.lock is held
+-    (held at its first and last read), the hold stays <= ~2 s, and a chat/notification turn reserving the lock with
+-    BUSY_WAIT_S (3.0 s) during the sample is measured (its outcome must match the measured hold interval)."""
++def test_real_claim_reads_the_sampler_file_under_the_lock_and_holds_it_briefly(board, monkeypatch):
++    """Contract (replaces the 2026-11 independent ~1 s sample): the locked gate reads the sampler's own file while
++    admission.lock is held, takes no /proc/stat sample, records that very triple on ``claimed``, and its hold is short
++    enough that a chat/notification turn reserving the lock with BUSY_WAIT_S (3.0 s) is admitted well inside it."""
+     from hermes_cli import backend_retirement
+ 
+     conn, home = board
+-    configure(home, limit=100)  # the real measured value admits unless the host is 100% busy
+-    advisory(home)
++    configure(home)
++    advisory(home, pct=23.0, age_ms=500)
+     t = task(conn)
++    monkeypatch.setattr(cm, "sample", lambda *a, **k: pytest.fail("no /proc/stat sample under the lock"))
+     m = {}
+-    started = threading.Event()
+-
+-    def chat_turn():
+-        started.wait(5)
+-        time.sleep(0.2)  # health: allow HX013 -- positions the chat turn inside the claim's real ~1 s sample
+-        m["chat_try"] = time.monotonic()
+-        try:
+-            with af.admission_lock(home, timeout=backend_retirement.BUSY_WAIT_S):
+-                m["chat"] = "acquired"
+-        except af.AdmissionBusy:
+-            m["chat"] = "busy"
+-        m["chat_done"] = time.monotonic()
+-    real_sample = cm.sample
+-
+-    def sample(*a, **k):
+-        m["lock_at_sample_start"] = _lock_state(home)
+-        m["sample_start"] = time.monotonic()
+-        started.set()
+-        out = real_sample(*a, **k)
+-        m["sample_end"] = time.monotonic()
+-        m["lock_at_sample_end"] = _lock_state(home)
+-        m["sample"] = out
+-        return out
+-    cm_sample, cm.sample = cm.sample, sample
+-    try:
+-        th = threading.Thread(target=chat_turn)
+-        th.start()
+-        t0 = time.monotonic()
+-        got = kb.claim_task(conn, t)
+-        m["claim_end"] = time.monotonic()
+-        th.join(5)
+-    finally:
+-        cm.sample = cm_sample
+-    claim_s = m["claim_end"] - t0
+-    sample_s = m["sample_end"] - m["sample_start"]
+-    record = {"claim_s": round(claim_s, 4), "sample_s": round(sample_s, 4),
+-              "lock_at_sample_start": m["lock_at_sample_start"], "lock_at_sample_end": m["lock_at_sample_end"],
+-              "sample": m["sample"], "chat": m["chat"], "chat_wait_s": round(m["chat_done"] - m["chat_try"], 4),
+-              "chat_try_offset_s": round(m["chat_try"] - m["sample_start"], 4),
+-              "busy_wait_s": backend_retirement.BUSY_WAIT_S}
+-    print("HUB_ADMISSION_LOCK_MEASURE " + json.dumps(record))
++    real = ka.sampler_sample
++
++    def read(max_age_ms=None):
++        if max_age_ms is None:
++            m["lock_at_read"] = _lock_state(home)
++        return real(max_age_ms)
++    monkeypatch.setattr(ka, "sampler_sample", read)
++    t0 = time.monotonic()
++    got = kb.claim_task(conn, t)
++    claim_s = time.monotonic() - t0
++    print("HUB_ADMISSION_LOCK_MEASURE " + json.dumps({"claim_s": round(claim_s, 4)}))
+     assert got is not None
+-    # The whole independent sample ran with admission.lock held (first and last /proc/stat read inside the hold).
+-    assert m["lock_at_sample_start"] == "held" and m["lock_at_sample_end"] == "held"
+-    assert m["sample"] is not None and cm.MIN_WINDOW_MS <= m["sample"]["cpu_busy_window_ms"] <= cm.MAX_WINDOW_MS
+-    assert sample_s >= 1.0
+-    assert claim_s <= 2.5  # frozen bound: one ~1 s sample (window <= 2 s) plus the commit
+-    # The chat turn's outcome follows from the measured hold: lock held over [sample_start, claim_end].
+-    wait_end = m["chat_try"] + backend_retirement.BUSY_WAIT_S
+-    if m["sample_start"] <= m["chat_try"] and wait_end <= m["sample_end"]:
+-        assert m["chat"] == "busy" and m["chat_done"] - m["chat_try"] >= backend_retirement.BUSY_WAIT_S
+-    elif m["chat"] == "acquired":
+-        assert m["chat_done"] >= m["sample_end"]  # only once the claim's hold had ended
+-    assert m["chat_done"] - m["chat_try"] <= 2.5
++    assert m["lock_at_read"] == "held"
++    payload = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='claimed'",
++                                      (t,)).fetchone()[0])
++    assert {k: payload["hub_cpu"][k] for k in cm.FIELDS} == mm.read_hub_cpu_sample(home)
++    assert claim_s < backend_retirement.BUSY_WAIT_S - cm.WINDOW_S  # no ~1 s sample inside the hold any more
+ 
+ 
+ def test_queue_reason_codes_cover_the_eight_overflow_reasons():
+@@ -1062,7 +1038,7 @@ def test_full_cap_refuses_before_the_sample_so_the_lock_is_not_held_for_it(board
+     configure(home, cap=2)
+     advisory(home)
+     monkeypatch.setattr(mm, "active_card_runs", lambda: 2)
+-    monkeypatch.setattr(cm, "sample", lambda *a, **k: pytest.fail("at the cap: refuse before sampling"))
++    locked(monkeypatch, lambda *a, **k: pytest.fail("at the cap: refuse before sampling"))
+     t = task(conn, review)
+     assert claim(conn, t, review) is None
+     refused(conn, t, review, "hub_capacity_full")
+@@ -1075,7 +1051,7 @@ def test_deadline_already_passed_refuses_before_the_sample(board, monkeypatch):
+     real_time = time.time
+     monkeypatch.setattr(sync, "claim_gate", lambda conn, task_id, expires, lane="ready": sync.ClaimGate(expires))
+     monkeypatch.setattr(ka, "_now", lambda: real_time() + 10 ** 7)
+-    monkeypatch.setattr(cm, "sample", lambda *a, **k: pytest.fail("deadline passed: refuse before sampling"))
++    locked(monkeypatch, lambda *a, **k: pytest.fail("deadline passed: refuse before sampling"))
+     t = task(conn)
+     assert kb.claim_task(conn, t) is None
+     refused(conn, t, False, "hub_cpu_unknown")
+@@ -1088,43 +1064,42 @@ def _shrink_hold_budget(monkeypatch, budget_s):
+ 
+ @pytest.mark.parametrize("review", [False, True])
+ def test_hold_that_overruns_its_budget_refuses_instead_of_committing(board, monkeypatch, review):
+-    """Final review N1: a sample + recount that outlast the designed hold must not commit (turn budget would lose)."""
++    """Final review N1: a gate that outlasts the designed hold must not commit (turn budget would lose). It is named
++    ``hub_admission_overrun``: an overrun is not a CPU reading (hub 2026-11-13 reported it as hub_cpu_unknown)."""
+     conn, home = board
+     configure(home)
+     advisory(home)
+     _shrink_hold_budget(monkeypatch, 0.2)
+-    monkeypatch.setattr(cm, "sample", fake_sample(10.0, check=lambda: time.sleep(0.3)))  # health: allow HX013 -- a sample that overruns the shrunken hold
++    locked(monkeypatch, fake_sample(10.0, check=lambda: time.sleep(0.3)))  # health: allow HX013 -- a read that overruns the shrunken hold
+     t = task(conn, review)
+     assert claim(conn, t, review) is None
+-    refused(conn, t, review, "hub_cpu_unknown")
++    refused(conn, t, review, ka.OVERRUN)
+ 
+ 
+ @pytest.mark.parametrize("review", [False, True])
+-def test_slow_pre_sample_checks_leave_no_room_so_it_refuses_before_sampling(board, monkeypatch, review):
+-    """Final review N1: when the cheap checks already ate the room a nominal 1 s sample needs, never start sampling."""
++def test_slow_census_overrun_refuses_as_overrun(board, monkeypatch, review):
+     conn, home = board
+     configure(home)
+     advisory(home)
+-    _shrink_hold_budget(monkeypatch, cm.WINDOW_S + 0.2)
++    _shrink_hold_budget(monkeypatch, 0.2)
+ 
+     def slow_count():
+-        time.sleep(0.3)  # health: allow HX013 -- a slow board scan before the sample
++        time.sleep(0.3)  # health: allow HX013 -- a slow board scan under the lock
+         return 0
+     monkeypatch.setattr(mm, "active_card_runs", slow_count)
+-    monkeypatch.setattr(cm, "sample", lambda *a, **k: pytest.fail("no room for the sample: refuse before sampling"))
+     t = task(conn, review)
+     assert claim(conn, t, review) is None
+-    refused(conn, t, review, "hub_cpu_unknown")
++    refused(conn, t, review, ka.OVERRUN)
+ 
+ 
+ def test_claim_inside_the_hold_budget_still_admits(board, monkeypatch):
+-    """Control for the N1 bound: the default budget admits a normal sample (the bound is not a blanket refusal)."""
++    """Control for the N1 bound: the default budget admits a normal gate (the bound is not a blanket refusal)."""
+     conn, home = board
+     configure(home)
+     advisory(home)
+     assert ka._hold_budget_s() == pytest.approx(af.CLAIM_MAX_HOLD_S - ka.COMMIT_RESERVE_S)
+     assert ka._hold_budget_s() >= cm.WINDOW_S + 1.0
+-    monkeypatch.setattr(cm, "sample", fake_sample(10.0, check=lambda: time.sleep(0.1)))  # health: allow HX013 -- a short stand-in sample
++    locked(monkeypatch, fake_sample(10.0, check=lambda: time.sleep(0.1)))  # health: allow HX013 -- a short stand-in read
+     t = task(conn)
+     assert kb.claim_task(conn, t) is not None
+ 
+@@ -1344,7 +1319,7 @@ def _explain_board(conn, home, monkeypatch):
+     assert kb.claim_task(conn, task(conn, title="regular running"))
+     _enable(home)
+     advisory(home)
+-    monkeypatch.setattr(cm, "sample", fake_sample(10))
++    locked(monkeypatch, fake_sample(10))
+     fresh = ready(conn, "fresh", priority=900, created_at=now)
+     starved = ready(conn, "starved", priority=0, created_at=now - 11 * 3600)
+     marked = ready(conn, "marked", priority=0, created_at=now - 25 * 60, admission_class="capacity")
+diff --git a/tests/hermes_cli/test_kanban_hub_admission_grant_echo.py b/tests/hermes_cli/test_kanban_hub_admission_grant_echo.py
+index 392615c01e..0f6096a21e 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission_grant_echo.py
++++ b/tests/hermes_cli/test_kanban_hub_admission_grant_echo.py
+@@ -32,6 +32,7 @@ from hermes_cli import machine_cpu_metrics as cm
+ from hermes_cli import machine_metrics as mm
+ from tests.hermes_cli import kanban_sync_support as support
+ from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_hub_admission import locked
+ 
+ pytestmark = pytest.mark.platforms("posix")
+ 
+@@ -59,7 +60,7 @@ class Rig:
+                                   "cpu_busy_sample_end_ms": int(time.time() * 1000)}, root=self.home)
+         self.mp = monkeypatch
+         monkeypatch.setattr(ka, "ADVISORY_MAX_AGE_MS", 10**9)
+-        monkeypatch.setattr(cm, "sample", self._sample)
++        locked(monkeypatch, self._sample)
+ 
+     def _sample(self, *a, **k):
+         self.samples.append(time.monotonic())
+diff --git a/tests/hermes_cli/test_kanban_hub_admission_guards.py b/tests/hermes_cli/test_kanban_hub_admission_guards.py
+index d503d24b71..1d0ed97cbb 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission_guards.py
++++ b/tests/hermes_cli/test_kanban_hub_admission_guards.py
+@@ -14,7 +14,8 @@ from tests.hermes_cli import test_kanban_hub_admission as helpers
+ pytestmark = pytest.mark.platforms("posix")
+ 
+ board = helpers.board
+-configure, advisory, task, fake_sample = helpers.configure, helpers.advisory, helpers.task, helpers.fake_sample
++configure, advisory, task, fake_sample, locked = (helpers.configure, helpers.advisory, helpers.task, helpers.fake_sample,
++                                              helpers.locked)
+ 
+ 
+ def enable(home, extra=""):
+@@ -25,7 +26,7 @@ def enable(home, extra=""):
+ 
+ def no_lease_or_sample(monkeypatch):
+     monkeypatch.setattr(sync, "claim_gate", lambda *a, **k: pytest.fail("advisory refusal must not ask for a lease"))
+-    monkeypatch.setattr(cm, "sample", lambda *a, **k: pytest.fail("advisory refusal must not sample"))
++    locked(monkeypatch, lambda *a, **k: pytest.fail("advisory refusal must not sample"))
+ 
+ 
+ @pytest.mark.parametrize("key,value,reason", [
+@@ -113,7 +114,7 @@ def test_pool_census_error_at_final_gate_refuses_instead_of_scalar_admit(board,
+     conn, home = board
+     enable(home)
+     advisory(home)
+-    monkeypatch.setattr(cm, "sample", fake_sample(10))
++    locked(monkeypatch, fake_sample(10))
+ 
+     def broken(*a, **k):
+         raise ValueError("unknown admission pool receipt")
+@@ -133,7 +134,7 @@ def test_candidate_pool_unknown_census_selects_no_pool(board, monkeypatch):
+     assert (pool, ceiling) == (None, 85)
+ 
+ 
+-def test_pool_change_during_sample_rechecks_cpu_against_new_pool(board, monkeypatch):
++def test_pool_change_during_the_lease_checks_cpu_against_the_locked_census_pool(board, monkeypatch):
+     conn, home = board
+     configure(home, limit=None)
+     for index in range(6):
+@@ -153,11 +154,17 @@ def test_pool_change_during_sample_rechecks_cpu_against_new_pool(board, monkeypa
+     calls = []
+ 
+     def fill_priority_pool():
+-        # Another board's three priority runs become live while this claim samples: the recount moves the
+-        # candidate from the priority pool (85%) to the last regular slot (50%), where 70% must refuse.
++        # Another board's three priority runs become live while this claim waits for its lease: the locked census
++        # moves the candidate from the priority pool (85%) to the last regular slot (50%), where 70% must refuse.
+         with closing(kbc.connect(late)) as other, kb.write_txn(other):
+             other.execute("UPDATE tasks SET status='running'")
+-    monkeypatch.setattr(cm, "sample", fake_sample(70, calls=calls, check=fill_priority_pool))
++    real_gate = sync.claim_gate
++
++    def lease(*a, **k):
++        fill_priority_pool()
++        return real_gate(*a, **k)
++    monkeypatch.setattr(sync, "claim_gate", lease)
++    locked(monkeypatch, fake_sample(70, calls=calls))
+     candidate = task(conn, title="incident")
+     kb.edit_task(conn, candidate, admission_class="urgent")
+     assert kb.claim_task(conn, candidate) is None
+diff --git a/tests/hermes_cli/test_kanban_hub_admission_sampler_read.py b/tests/hermes_cli/test_kanban_hub_admission_sampler_read.py
+new file mode 100644
+index 0000000000..8ea64c43a1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_hub_admission_sampler_read.py
+@@ -0,0 +1,116 @@
++"""The final hub gate reads the advisory sampler's fresh sample; it never measures again under the lock.
++
++Hub 2026-11-13 (card t_01a1d2e5c4899f40): with the advisory fresh (0.5 s old, 23 % busy) every claim of a top-priority
++card took a Board lease and then refused under ``admission.lock`` as ``hub_cpu_unknown`` and released the grant
++(``unused_grant``), about every 5 min. The gateway process holds the GIL ~100 % of a core, so the locked whole-host
++census ran ~1.3 s; census + the independent ~1 s sample + the recount overran the 2.25 s hold budget, and the
++overrun was reported as an unknown CPU reading. The advisory could not predict it, so the lease churned.
++"""
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_admission as ka
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import machine_cpu_metrics as cm
++from hermes_cli import machine_metrics as mm
++from tests.hermes_cli import test_kanban_hub_admission as helpers
++
++pytestmark = pytest.mark.platforms("posix")
++PRELEASE_MAX_AGE_MS = ka.ADVISORY_MAX_AGE_MS - getattr(ka, "PRELEASE_HEADROOM_MS", 5_000)
++
++board = helpers.board
++configure, advisory, task, claim, refused = (helpers.configure, helpers.advisory, helpers.task, helpers.claim,
++                                             helpers.refused)
++
++
++def no_own_sample(monkeypatch):
++    monkeypatch.setattr(cm, "sample", lambda *a, **k: pytest.fail("the final gate must read the sampler's sample"))
++
++
++@pytest.mark.parametrize("review", [False, True])
++def test_final_gate_admits_on_the_sampler_sample_without_measuring_under_the_lock(board, monkeypatch, review):
++    conn, home = board
++    configure(home)
++    advisory(home, pct=23.0, age_ms=500)
++    no_own_sample(monkeypatch)
++    t = task(conn, review)
++    assert claim(conn, t, review) is not None
++    payload = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='claimed'",
++                                      (t,)).fetchone()[0])
++    written = mm.read_hub_cpu_sample(home)
++    assert payload["hub_cpu"] == {**written, "limit_pct": 50.0}  # the very triple the sampler wrote
++
++
++@pytest.mark.parametrize("review", [False, True])
++def test_slow_locked_census_on_a_gil_starved_hub_still_admits_inside_the_budget(board, monkeypatch, review):
++    """The hub's case: a ~1.3 s census under the lock. One census and no sleep fit the 2.25 s hold."""
++    conn, home = board
++    configure(home, cap=7)
++    advisory(home)
++    no_own_sample(monkeypatch)
++    calls = []
++
++    def slow_census(*a, **k):
++        calls.append(time.monotonic())
++        time.sleep(0.9)  # health: allow HX013 -- stands in for the GIL-starved hub census (~1.3 s measured)
++        return 0
++    monkeypatch.setattr(mm, "active_card_runs", slow_census)
++    t = task(conn, review)
++    assert claim(conn, t, review) is not None
++    assert len(calls) == 1  # one locked census: nothing between it and the commit needs a recount
++
++
++def test_advisory_keeps_lease_headroom_so_the_accepted_sample_is_still_fresh_under_the_lock(board, monkeypatch):
++    """Defer BEFORE the lease when the sample would be too old by the time the locked gate reads it."""
++    conn, home = board
++    configure(home)
++    advisory(home, age_ms=PRELEASE_MAX_AGE_MS + 100)
++    monkeypatch.setattr(sync, "claim_gate", lambda *a, **k: pytest.fail("a soon-stale sample must not take a lease"))
++    t = task(conn)
++    assert kb.claim_task(conn, t) is None
++    refused(conn, t, False, "hub_cpu_unknown")
++
++
++def test_sample_accepted_before_the_lease_is_still_fresh_after_a_slow_lease(board, monkeypatch):
++    conn, home = board
++    configure(home)
++    advisory(home, age_ms=PRELEASE_MAX_AGE_MS - 100)
++    no_own_sample(monkeypatch)
++    real_gate, real_now = sync.claim_gate, ka._now
++
++    def slow_lease(*a, **k):  # the Board round-trip ages the sample by most of the headroom
++        monkeypatch.setattr(ka, "_now", lambda: real_now() + (ka.ADVISORY_MAX_AGE_MS - PRELEASE_MAX_AGE_MS - 500) / 1000)
++        return real_gate(*a, **k)
++    monkeypatch.setattr(sync, "claim_gate", slow_lease)
++    t = task(conn)
++    assert kb.claim_task(conn, t) is not None
++
++
++@pytest.mark.parametrize("change,reason", [("stale", "hub_cpu_unknown"), ("missing", "hub_cpu_unknown"),
++                                           ("busy", "hub_cpu_at_or_above_limit"), ("window", "hub_cpu_unknown")])
++def test_sample_that_changes_after_the_advisory_is_rechecked_under_the_lock(board, monkeypatch, change, reason):
++    conn, home = board
++    configure(home)
++    advisory(home)
++    no_own_sample(monkeypatch)
++    real_gate = sync.claim_gate
++
++    def lease_then_change(*a, **k):
++        path = home / "cache" / mm.HUB_CPU_SAMPLE_FILE
++        if change == "stale":
++            advisory(home, age_ms=ka.ADVISORY_MAX_AGE_MS + 1)
++        elif change == "missing":
++            path.unlink()
++        elif change == "busy":
++            advisory(home, pct=50.0)
++        else:
++            path.write_text(json.dumps({"cpu_busy_pct": 10.0, "cpu_busy_window_ms": cm.MAX_WINDOW_MS + 1,
++                                        "cpu_busy_sample_end_ms": int(time.time() * 1000)}))
++        return real_gate(*a, **k)
++    monkeypatch.setattr(sync, "claim_gate", lease_then_change)
++    t = task(conn)
++    assert kb.claim_task(conn, t) is None
++    refused(conn, t, False, reason)
+diff --git a/tests/hermes_cli/test_kanban_hub_admission_scopes.py b/tests/hermes_cli/test_kanban_hub_admission_scopes.py
+index 0a06ad40a4..644a1fb2df 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission_scopes.py
++++ b/tests/hermes_cli/test_kanban_hub_admission_scopes.py
+@@ -20,6 +20,7 @@ from hermes_cli import kanban_worker_node as wn
+ from hermes_cli import machine_cpu_metrics as cm
+ from hermes_cli import machine_metrics as mm
+ from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.test_kanban_hub_admission import locked
+ 
+ pytestmark = pytest.mark.platforms("posix")
+ 
+@@ -84,7 +85,7 @@ class Install:
+             calls.append(pct)
+             return {"cpu_busy_pct": pct, "cpu_busy_window_ms": 1000,
+                     "cpu_busy_sample_end_ms": int(time.time() * 1000)}
+-        self.mp.setattr(cm, "sample", sample)
++        locked(self.mp, sample)
+         return calls
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_hub_admission_turns.py b/tests/hermes_cli/test_kanban_hub_admission_turns.py
+index 560f0a77cc..fb6ae8d824 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission_turns.py
++++ b/tests/hermes_cli/test_kanban_hub_admission_turns.py
+@@ -18,6 +18,7 @@ from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import machine_cpu_metrics as cm
+ from hermes_cli import machine_metrics as mm
+ from tests.waiting import wait_until
++from tests.hermes_cli.test_kanban_hub_admission import locked
+ 
+ pytestmark = pytest.mark.platforms("posix")
+ 
+@@ -66,7 +67,7 @@ def test_turn_reserving_during_a_hub_claim_sample_is_admitted_after_the_hold(boa
+     claim's held sample is admitted once the claim commits: no 5035, and the claim still sampled under the lock."""
+     conn, home = board
+     started, ended = threading.Event(), []
+-    monkeypatch.setattr(cm, "sample", slow_sample(started, ended=ended))
++    locked(monkeypatch, slow_sample(started, ended=ended))
+     t = ready(conn)
+     m = {}
+ 
+@@ -89,7 +90,7 @@ def test_turn_reserving_during_a_hub_claim_sample_is_admitted_after_the_hold(boa
+ 
+ def test_a_waiting_turn_makes_the_next_claim_defer_without_sampling(board, monkeypatch):
+     conn, home = board
+-    monkeypatch.setattr(cm, "sample", lambda *a, **k: pytest.fail("a waiting turn: defer before sampling"))
++    locked(monkeypatch, lambda *a, **k: pytest.fail("a waiting turn: defer before sampling"))
+     t = ready(conn)
+     with af.turn_waiting(home):
+         assert af.turns_waiting(home / "core-update")
+@@ -98,7 +99,7 @@ def test_a_waiting_turn_makes_the_next_claim_defer_without_sampling(board, monke
+         assert conn.execute("SELECT count(*) FROM task_runs").fetchone()[0] == 0
+         assert sync.pop_claim_deferral(t) is None  # an ordinary busy-lock defer, not a gate refusal
+     assert not af.turns_waiting(home / "core-update")
+-    monkeypatch.setattr(cm, "sample", slow_sample(threading.Event(), hold_s=0))
++    locked(monkeypatch, slow_sample(threading.Event(), hold_s=0))
+     assert kb.claim_task(conn, t) is not None
+ 
+ 
+-- 
+2.51.0
+

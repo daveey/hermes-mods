@@ -1,0 +1,136 @@
+From 2a5460cafe7de465690a763288e59bcce5b0b59a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:05:08 +0000
+Subject: [PATCH] fix(update-pause): only a turn without its own marker is
+ carried; a retried own pause is not
+
+Review 5886751258 (PR #1888): the hook judged carried from marker.reason, so a turn retrying its own
+pause after a failed job stop (write-ahead mark already core_update_pause) was stamped carried_turn_paused
+and its continuation named a notification turn that never ran. The caller now passes carried=not
+st.marker_key; the marker reason only decides whether the pause is counted again.
+---
+ .../test_update_pause_compression.py          |  4 +--
+ .../test_update_pause_superseded.py           | 31 +++++++++++++++++++
+ .../test_update_pause_user_stop.py            |  4 +--
+ tui_gateway/prompt_turn.py                    |  3 +-
+ tui_gateway/update_pause.py                   | 14 ++++++---
+ 5 files changed, 47 insertions(+), 9 deletions(-)
+
+diff --git a/tests/tui_gateway/test_update_pause_compression.py b/tests/tui_gateway/test_update_pause_compression.py
+index 4e2fbd9ded..3459f63e2d 100644
+--- a/tests/tui_gateway/test_update_pause_compression.py
++++ b/tests/tui_gateway/test_update_pause_compression.py
+@@ -382,8 +382,8 @@ def test_replayed_prelude_does_not_reuse_previous_turn_call_count(home, tmp_path
+ def _release_pause_at_boundary(home, streaming, monkeypatch):
+     original = up.boundary_pause_hook
+ 
+-    def factory(*args):
+-        hook = original(*args)
++    def factory(*args, **kwargs):
++        hook = original(*args, **kwargs)
+ 
+         def released(**kwargs):
+             if streaming.outcome == "cancelled":
+diff --git a/tests/tui_gateway/test_update_pause_superseded.py b/tests/tui_gateway/test_update_pause_superseded.py
+index d6bb07e1a2..528d7b8d18 100644
+--- a/tests/tui_gateway/test_update_pause_superseded.py
++++ b/tests/tui_gateway/test_update_pause_superseded.py
+@@ -419,3 +419,34 @@ def test_a_pause_the_paused_turn_paid_itself_does_not_name_a_notification_turn(e
+     _paused_session(env.home)
+     marker = read_turn_marker(env.home, "session-key")
+     assert marker is not None and not marker.get("carried_turn_paused")
++
++
++def test_a_turn_retrying_its_own_pause_after_a_failed_job_stop_is_not_carried(env, monkeypatch):
++    """The write-ahead mark of a failed attempt leaves ``core_update_pause`` on the turn's OWN marker; the retry
++    at the next step boundary must not read that as a carried pause and name a notification turn that never ran."""
++    attempts = iter([False, True])
++    monkeypatch.setattr(up, "stop_owned_jobs_for_update_pause", lambda jobs, save: next(attempts))
++    session = {"session_key": "session-key", "history": [], "history_lock": threading.RLock(),
++               "history_version": 0, "running": True, "attached_images": [], "image_counter": 0, "cols": 80,
++               "slash_worker": None, "show_reasoning": False, "tool_progress_mode": "all", "inflight_turn": None,
++               "profile_home": str(env.home)}
++    seen: dict = {}
++
++    def _run(message, **kwargs):
++        af.set_hold(env.home)
++        af.request_pause(env.home, expires_at=time.time() + 120)
++        seen["first"] = session["agent"].step_boundary_pause()
++        seen["retry"] = session["agent"].step_boundary_pause()
++        return {"final_response": "", "messages": [], "interrupted": True, "completed": False,
++                "paused_for_update": seen["retry"]}
++
++    session["agent"] = types.SimpleNamespace(session_id="session-key", run_conversation=_run,
++                                             clear_interrupt=lambda: None)
++    server._run_prompt_submit("rid", "ui-sid", session, "the long task")
++    af.clear_pause_request(env.home)
++    af.clear_hold(env.home)
++
++    assert seen["first"] is None and seen["retry"] == up.PAUSE_REASON
++    marker = read_turn_marker(env.home, "session-key")
++    assert marker is not None and marker["reason"] == up.PAUSE_REASON and marker["pauses"] == 1
++    assert not marker.get("carried_turn_paused"), "the turn's own retried pause was stamped as carried"
+diff --git a/tests/tui_gateway/test_update_pause_user_stop.py b/tests/tui_gateway/test_update_pause_user_stop.py
+index 3133302f12..1b2d6b95f0 100644
+--- a/tests/tui_gateway/test_update_pause_user_stop.py
++++ b/tests/tui_gateway/test_update_pause_user_stop.py
+@@ -78,8 +78,8 @@ def _stop_right_after_the_hook(monkeypatch):
+     """The Stop lands after the hook returned its pause verdict, before the agent loop acts on it."""
+     real, fired = up.boundary_pause_hook, []
+ 
+-    def _boundary_pause_hook(session, marker_key):
+-        hook = real(session, marker_key)
++    def _boundary_pause_hook(session, marker_key, **kwargs):
++        hook = real(session, marker_key, **kwargs)
+ 
+         def _hook():
+             verdict = hook()
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index f0818689da..1413d32054 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -1015,7 +1015,8 @@ def _invoke_agent(
+     from tui_gateway.update_pause import boundary_pause_hook, effective_pause_key, install_clarify_pause_provider, \
+         start_mid_tool_cancel
+     pause_key = effective_pause_key(session, st.marker_key)
+-    agent.step_boundary_pause = boundary_pause_hook(session, pause_key) if pause_key else None
++    agent.step_boundary_pause = boundary_pause_hook(session, pause_key, carried=not st.marker_key) \
++        if pause_key else None
+     # [daveey] t_01a1d31bf400d56c: a continuation may yield before its first model request (it redoes nothing).
+     agent.update_pause_first_request = bool(st.marker_key) and display_kind == "auto_continue"
+     _mid_tool_stop = None
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index b4d83af1c1..1ee05e20f0 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -254,8 +254,12 @@ def _drainer_lock(session: dict) -> Path:
+         return fallback
+ 
+ 
+-def boundary_pause_hook(session: dict, marker_key: str) -> Callable[[], str | None]:
+-    """The per-turn ``agent.step_boundary_pause``: one stat per step while no pause is requested."""
++def boundary_pause_hook(session: dict, marker_key: str, *, carried: bool = False) -> Callable[[], str | None]:
++    """The per-turn ``agent.step_boundary_pause``: one stat per step while no pause is requested.
++
++    ``carried``: the turn wrote no marker of its own and runs over the paused turn's (``effective_pause_key``).
++    The caller decides it from the turn, never from the marker: a turn retrying its own pause also finds
++    ``core_update_pause`` on its marker (the write-ahead mark of a failed attempt) and is not carried."""
+     declined: list[str] = []
+ 
+     def hook() -> str | None:
+@@ -279,8 +283,10 @@ def boundary_pause_hook(session: dict, marker_key: str) -> Callable[[], str | No
+         killed = list(jobs.values())
+         # Write-ahead journal: even a crash during kill or a later disk failure leaves an
+         # explicit uncertain-outcome record. Never claim an unverified kill succeeded.
+-        carried = marker.get("reason") == PAUSE_REASON  # a synthesized turn over the paused marker pays it
+-        if not mark_turn_paused(home, marker_key, PAUSE_REASON, killed_jobs=killed, increment=not carried,
++        # Counted already: a synthesized turn over the paused marker pays it, and a turn retrying its own pause
++        # after a failed attempt left the write-ahead mark. Only the former is ``carried`` (the caller's call).
++        increment = marker.get("reason") != PAUSE_REASON
++        if not mark_turn_paused(home, marker_key, PAUSE_REASON, killed_jobs=killed, increment=increment,
+                                 carried=carried):
+             return None
+         def save() -> bool:
+-- 
+2.51.0
+

@@ -1,0 +1,173 @@
+From 9cc62f6b6d00b6c74a27ee06f2073e2c747d3ff5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 00:23:38 +0000
+Subject: [PATCH] [daveey] fix(process): release never rewrites processes.json
+ without its lock
+
+Follow-up to PR #1773 review nits (t_01a1d22d10eb8a41):
+
+- _enter_checkpoint_lock now returns whether it took the processes.json
+  flock. release_foreground skips its local read-merge-write when it did
+  not (an unlocked rewrite can clobber a concurrent writer's entries); it
+  still pops the hold and settles the entry via drop_from_every_checkpoint,
+  which takes each file's own lock.
+- New test_release_never_rewrites_the_checkpoint_without_its_lock (red on
+  main) forces _checkpoint_file_lock to raise.
+- New test_recovery_racing_a_real_handoff_tracks_the_command_once[handoff|
+  recovery] races the real convert_foreground (log reader + reentrant
+  flock checkpoint write) against recovery in both orders: no deadlock,
+  tracked once, exit 0 (no lost/-1). Red on dee152823f^ (recovery adopts
+  the command), green on main and here; 15x repeat green.
+---
+ .../tools/test_update_survivable_processes.py | 100 ++++++++++++++++++
+ tools/process_registry_survivable.py          |  13 ++-
+ 2 files changed, 109 insertions(+), 4 deletions(-)
+
+diff --git a/tests/tools/test_update_survivable_processes.py b/tests/tools/test_update_survivable_processes.py
+index 99de8e53e9..8de9d48eef 100644
+--- a/tests/tools/test_update_survivable_processes.py
++++ b/tests/tools/test_update_survivable_processes.py
+@@ -386,6 +386,106 @@ def test_recovery_racing_a_handoff_tracks_the_command_once(tmp_path, monkeypatch
+         proc.wait()
+ 
+ 
++@pytest.mark.parametrize("first", ["handoff", "recovery"])
++def test_recovery_racing_a_real_handoff_tracks_the_command_once(tmp_path, monkeypatch, first):
++    """The real ``convert_foreground`` (log reader start + checkpoint write under the reentrant flock)
++    racing a recovery pass, in both orders: neither deadlocks, the command gets exactly one owner (the
++    handoff's), and its completion is the real exit, never a false lost/-1."""
++    import threading
++
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(pr, "_checkpoint_path", lambda: tmp_path / "processes.json")
++    registry = ProcessRegistry()
++    tracked = []
++    real_track = registry._track_started
++    racing, popped, decided = threading.Event(), threading.Event(), threading.Event()
++
++    def track(session, *a, **k):  # the real path, plus the race window: the hold is gone, not yet tracked
++        tracked.append(session)
++        if threading.current_thread() is handoff:
++            if first == "handoff":
++                recovery.start()  # fixed: it waits for the checkpoint file lock this handoff holds
++            popped.set()
++            if racing.wait(0.3):  # unfixed: recovery decides now, while the command is in neither table
++                decided.wait(0.3)
++        return real_track(session, *a, **k)
++
++    registry._track_started = track
++    handoff = threading.Thread(target=lambda: registry.convert_foreground(session), daemon=True, name="handoff")
++    recovered = []
++    recovery = threading.Thread(target=lambda: recovered.append(registry.recover_from_checkpoint()),
++                                daemon=True, name="recovery")
++    real_locked = registry._recover_from_checkpoint_locked
++
++    def locked(owner):  # recovery owns the file lock and is about to decide
++        racing.set()
++        if first == "recovery":
++            handoff.start()
++            popped.wait(0.3)  # fixed: the handoff waits for our lock before it drops the hold
++        try:
++            return real_locked(owner)
++        finally:
++            decided.set()
++
++    registry._recover_from_checkpoint_locked = locked
++    trigger, log = tmp_path / "finish", tmp_path / "fg.log"
++    with open(log, "w") as out:
++        proc = subprocess.Popen(["sh", "-c", f"while [ ! -e '{trigger}' ]; do sleep 0.05; done; echo fg-done"],
++                                stdout=out, stderr=subprocess.STDOUT)
++    try:
++        session = registry._new_session("fg", "t", "t", "k", str(tmp_path), persist_on_release=True)
++        session.process, session.pid = proc, proc.pid
++        session.host_start_time = registry._safe_host_start_time(proc.pid)
++        session.output_log = str(log)
++        registry.hold_foreground(session)
++        order = (recovery, handoff) if first == "recovery" else (handoff, recovery)
++        order[0].start()  # it starts the other one while it holds the checkpoint file lock
++        for thread in order:
++            thread.join(10)
++            assert not thread.is_alive(), f"deadlock: {thread.name} still waits ({first} first)"
++        assert recovered == [0]
++        assert tracked == [session], "the command was tracked by more than one owner"
++        assert registry._running[session.id] is session
++        assert session.id not in registry.held_foreground()
++        assert not registry.pending_watchers
++        assert [e["session_id"] for e in json.loads((tmp_path / "processes.json").read_text())] == [session.id]
++        trigger.touch()
++        wait_until(lambda: session.exited, timeout=10)
++        assert (session.exit_code, session.completion_reason) == (0, "exited")
++        assert tracked == [session]
++    finally:
++        trigger.touch()
++        proc.wait(10)
++
++
++def test_release_never_rewrites_the_checkpoint_without_its_lock(tmp_path, monkeypatch):
++    """A release that cannot take the processes.json lock still drops the hold and settles the entry
++    through the cross-profile drop (which takes each file's own lock), but never runs an unlocked
++    read-merge-write that could clobber a concurrent writer's entries."""
++    registry, session, proc, _home = _held_sleep(tmp_path, monkeypatch)
++    import tools.process_registry_profiles as profiles
++
++    def no_lock():
++        raise OSError("lock unavailable")
++
++    rewrites, dropped = [], []
++    monkeypatch.setattr(registry, "_checkpoint_file_lock", no_lock)
++    monkeypatch.setattr(registry, "_write_checkpoint_locked", lambda *a, **k: rewrites.append((a, k)))
++    monkeypatch.setattr(profiles, "drop_from_every_checkpoint", lambda ids: dropped.append(list(ids)))
++    before = (tmp_path / "processes.json").read_bytes()
++    try:
++        registry.release_foreground(session.id)
++        assert rewrites == [], "processes.json was rewritten without its lock"
++        assert (tmp_path / "processes.json").read_bytes() == before
++        assert session.id not in registry.held_foreground()
++        assert dropped == [[session.id]]
++    finally:
++        proc.kill()
++        proc.wait()
++
++
+ def test_adoption_boundary_refuses_a_held_foreground_command(tmp_path, monkeypatch, caplog):
+     """Detection: any path that tracks a still-held command as a background job is refused and logged."""
+     registry, session, proc, home = _held_sleep(tmp_path, monkeypatch)
+diff --git a/tools/process_registry_survivable.py b/tools/process_registry_survivable.py
+index 09c1027831..65cb01f598 100644
+--- a/tools/process_registry_survivable.py
++++ b/tools/process_registry_survivable.py
+@@ -279,10 +279,12 @@ class ProcessForegroundHoldMixin:
+         holds that lock across its read-decide-write, so it sees either the held entry (ours, skipped) or
+         no entry, never an on-disk entry that no table of ours owns any more (it adopted that). [daveey]"""
+         with ExitStack() as stack:
+-            self._enter_checkpoint_lock(stack)
++            locked = self._enter_checkpoint_lock(stack)
+             with self._lock:
+                 dropped = self._holds().pop(session_id, None)
+-            if dropped is not None:
++            # Without the lock a read-merge-write could clobber a concurrent writer's entries; the
++            # cross-profile drop below (under each file's own lock) removes the entry instead. [daveey]
++            if dropped is not None and locked:
+                 try:
+                     # drop_ids: the entry's child is still alive, so without it the merge keeps it as
+                     # another writer's live entry until drop_from_every_checkpoint, the same window.
+@@ -307,9 +309,12 @@ class ProcessForegroundHoldMixin:
+                 self._holds().pop(session.id, None)
+             self._track_started(session, self._log_reader_loop, f"proc-log-reader-{session.id}")
+ 
+-    def _enter_checkpoint_lock(self, stack: ExitStack) -> None:
+-        """The processes.json lock when it can be had; a release or handoff never fails for want of it."""
++    def _enter_checkpoint_lock(self, stack: ExitStack) -> bool:
++        """The processes.json lock when it can be had (True); a release or handoff never fails for want of
++        it, but a caller must not rewrite processes.json unlocked when this returns False."""
+         try:
+             stack.enter_context(self._checkpoint_file_lock())
+         except Exception:
+             logger.debug("Checkpoint file lock unavailable; settling the hold without it", exc_info=True)
++            return False
++        return True
+-- 
+2.51.0
+

@@ -1,0 +1,670 @@
+From 9508bc741512c2e725d7b25b9a1c7225ce0e9f39 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 17:57:06 +0000
+Subject: [PATCH] [daveey] async_delegation: wake the parent chat for a result
+ no live poller delivers
+
+A pending terminal async-delegation result now reaches its parent chat without
+anyone reopening it. tui_gateway/delegation_unloaded.py runs from the kanban
+unloaded-session sweeper loop in every Desktop/TUI backend: a UI-dispatched
+result past a 90 s grace, not under a live delivery claim, is claimed in the
+ledger (the one cross-process gate) and run as one turn in the parent via
+server._wake_session_turn (resumed here when no backend holds it). Started =
+ack; busy/refused/error = defer with backoff; per-chat wake budget.
+
+Covers the three gaps behind deleg_5facc89f's 8 h lag (2026-11-11): parent
+loaded nowhere; parent loaded headless (startup_replay copies need a live
+transport); parent held by backend B while backend A's SESSION_NOT_OWNED
+retries keep the row 'recently touched', so B's orphan sweep never re-offers
+it (reproduced in test_tail_repro_...).
+---
+ .../test_delegation_unloaded_wake.py          | 305 ++++++++++++++++++
+ tools/async_delegation.py                     |  32 ++
+ tui_gateway/delegation_unloaded.py            | 261 +++++++++++++++
+ tui_gateway/kanban_unloaded.py                |   7 +
+ 4 files changed, 605 insertions(+)
+ create mode 100644 tests/tui_gateway/test_delegation_unloaded_wake.py
+ create mode 100644 tui_gateway/delegation_unloaded.py
+
+diff --git a/tests/tui_gateway/test_delegation_unloaded_wake.py b/tests/tui_gateway/test_delegation_unloaded_wake.py
+new file mode 100644
+index 0000000000..edcb023749
+--- /dev/null
++++ b/tests/tui_gateway/test_delegation_unloaded_wake.py
+@@ -0,0 +1,305 @@
++"""A finished async delegation reaches its parent chat without anyone reopening it. [daveey]
++
++Hub incident (2026-11-11): async delegation ``deleg_5facc89f`` of desktop chat ``20261031_222913_405ade`` was
++recovered ``unknown`` at 10:06:18Z; its notice reached the chat at 18:20:02Z. The parent was loaded in no backend
++until 17:24, and no poller exists for an unloaded chat; restored (``startup_replay``) copies are also refused by a
++chat loaded only headless; and from 17:24 the chat was held by one backend while the queued copy sat in another,
++whose ``SESSION_NOT_OWNED`` retries kept the row "recently touched" so the holder's orphan sweep never re-offered
++it. On 2026-11-12 the hub ledger still had four such rows pending 13-26 h with zero delivery attempts.
++
++``tui_gateway.delegation_unloaded`` claims such a row (the ledger's atomic gate) and runs one turn in the parent.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import json
++import os
++import queue
++import sqlite3
++import threading
++import time
++
++import pytest
++
++from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++from hermes_state import SessionDB
++from tools import async_delegation as ad
++from tui_gateway import delegation_unloaded as du
++
++CHAT = "20261031_222913_405ade"
++DID = "deleg_5facc89f"
++
++
++@pytest.fixture(autouse=True)
++def _clean_state(monkeypatch):
++    ad._reset_for_tests()
++    du._reset_for_tests()
++    # Owner liveness: the row's owner pid (999999) is dead, as after the 10:06 backend restart.
++    monkeypatch.setattr(ad, "_owner_liveness", lambda: (lambda pid, started: int(pid or 0) == os.getpid()))
++    yield
++    ad._reset_for_tests()
++    du._reset_for_tests()
++
++
++@pytest.fixture
++def home(tmp_path):
++    token = set_hermes_home_override(str(tmp_path))
++    try:
++        db = SessionDB(tmp_path / "state.db")
++        db.create_session(CHAT, "desktop")
++        db.append_message(CHAT, "user", "review the fix in the background")
++        db.close()
++        yield tmp_path
++    finally:
++        reset_hermes_home_override(token)
++
++
++def _opener(home):
++    @contextlib.contextmanager
++    def opener(chat_id):
++        db = SessionDB(home / "state.db")
++        try:
++            yield (db, db.get_compression_tip(chat_id) or chat_id) if db.get_session(chat_id) else (None, None)
++        finally:
++            db.close()
++    return opener
++
++
++def _completion(did=DID, *, chat=CHAT, ui="4907c592", completed_ago=8 * 3600.0, status="unknown"):
++    """A terminal ledger row whose owner died, pending delivery: what recovery left for ``deleg_5facc89f``."""
++    now = time.time()
++    evt = {"type": "async_delegation", "delegation_id": did, "session_key": chat, "origin_ui_session_id": ui,
++           "parent_session_id": chat, "goal": "review the fix", "status": status, "summary": None,
++           "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
++           "dispatched_at": now - completed_ago - 1500, "completed_at": now - completed_ago}
++    with ad._DB_LOCK, ad._transaction() as conn:
++        conn.execute(
++            "INSERT INTO async_delegations (delegation_id, origin_session, origin_ui_session_id, parent_session_id, "
++            "state, dispatched_at, completed_at, updated_at, delivery_state, delivery_attempts, owner_pid, "
++            "owner_started_at, task_json, event_json, result_json) "
++            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 999999, 1, '{}', ?, '{}')",
++            (did, chat, ui, chat, status, evt["dispatched_at"], evt["completed_at"], evt["completed_at"],
++             json.dumps(evt)))
++    return evt
++
++
++def _row(home, did=DID) -> dict:
++    conn = sqlite3.connect(home / "state.db")
++    conn.row_factory = sqlite3.Row
++    try:
++        return dict(conn.execute("SELECT * FROM async_delegations WHERE delegation_id=?", (did,)).fetchone())
++    finally:
++        conn.close()
++
++
++def _set(home, did=DID, **cols) -> None:
++    conn = sqlite3.connect(home / "state.db")
++    try:
++        conn.execute(f"UPDATE async_delegations SET {', '.join(f'{k}=?' for k in cols)} WHERE delegation_id=?",
++                     (*cols.values(), did))
++        conn.commit()
++    finally:
++        conn.close()
++
++
++class _Waker:
++    def __init__(self, verdict="started"):
++        self.verdict, self.calls = verdict, []
++
++    def __call__(self, chat, text, metadata):
++        self.calls.append((chat, text, metadata))
++        return self.verdict
++
++
++def _sweep(home, wake, *, holders=list, busy=lambda ids: False, now=None):
++    return du.sweep_once(now=now, homes=lambda: [None], opener=_opener(home), holders=holders, busy=busy,
++                         wake=wake, spawn=lambda job: job())
++
++
++def test_unloaded_parent_gets_one_turn_and_the_row_is_delivered(home):
++    _completion()
++    wake = _Waker()
++
++    decisions = _sweep(home, wake)
++
++    assert [d["verdict"] for d in decisions] == ["started"]
++    assert len(wake.calls) == 1
++    chat, text, meta = wake.calls[0]
++    assert chat == CHAT and DID in text
++    assert meta["delegation_id"] == DID and meta["woken"] is True
++    row = _row(home)
++    assert row["delivery_state"] == "delivered" and row["delivery_claim"] is None
++    # Exactly once: nothing left for the next pass, and the poller's late copy cannot claim it.
++    assert _sweep(home, wake) == [] and len(wake.calls) == 1
++    assert ad.claim_event_delivery({"type": "async_delegation", "delegation_id": DID}, "tui-poller") is None
++
++
++def test_a_live_claim_wins_and_the_sweeper_never_doubles_it(home):
++    _completion()
++    assert ad.claim_completion_delivery(DID, "tui-poller:1:x")
++    wake = _Waker()
++
++    assert _sweep(home, wake) == []
++    assert wake.calls == []
++    assert _row(home)["delivery_claim"] == "tui-poller:1:x"
++
++
++def test_a_claim_taken_between_select_and_claim_is_left_alone(home, monkeypatch):
++    _completion()
++    real = ad.claim_completion_delivery
++
++    def racing(did, claim):
++        assert real(did, "tui-poller:2:y")  # the poller got there first
++        return real(did, claim)
++    monkeypatch.setattr(ad, "claim_completion_delivery", racing)
++    wake = _Waker()
++
++    assert [d["verdict"] for d in _sweep(home, wake)] == ["skipped:claimed"]
++    assert wake.calls == []
++
++
++@pytest.mark.parametrize("verdict", ["busy", "refused", "error"])
++def test_a_wake_that_did_not_start_defers_without_spending_an_attempt_and_backs_off(home, verdict):
++    _completion()
++    wake = _Waker(verdict)
++
++    assert [d["verdict"] for d in _sweep(home, wake)] == [verdict]
++    row = _row(home)
++    assert row["delivery_state"] == "pending" and row["delivery_claim"] is None
++    assert row["delivery_attempts"] == 0
++    assert [d["verdict"] for d in _sweep(home, wake)] == ["skipped:backoff"]
++    later = time.time() + du.RETRY_S + 1
++    wake.verdict = "started"
++    assert [d["verdict"] for d in _sweep(home, wake, now=later)] == ["started"]
++    assert _row(home)["delivery_state"] == "delivered"
++
++
++def test_a_chat_no_store_has_is_left_pending(home):
++    _completion(chat="20261101_000000_gone00")
++    wake = _Waker()
++
++    assert [d["verdict"] for d in _sweep(home, wake)] == ["skipped:no-store"]
++    assert wake.calls == [] and _row(home)["delivery_state"] == "pending"
++
++
++def test_a_chat_held_by_another_backend_is_left_to_it(home):
++    _completion()
++    wake = _Waker()
++    other = [{"session_id": CHAT, "pid": os.getpid() + 1}]
++
++    assert [d["verdict"] for d in _sweep(home, wake, holders=lambda: other)] == [
++        f"skipped:held:pid {os.getpid() + 1}"]
++    assert wake.calls == [] and _row(home)["delivery_claim"] is None
++    # This backend holds the chat (a stale sibling lease beside it does not hand it away).
++    mine = other + [{"session_id": CHAT, "pid": os.getpid()}]
++    assert [d["verdict"] for d in _sweep(home, wake, holders=lambda: mine)] == ["started"]
++
++
++def test_a_chat_mid_turn_here_waits_for_its_own_poller(home):
++    _completion()
++    wake = _Waker()
++
++    assert [d["verdict"] for d in _sweep(home, wake, busy=lambda ids: CHAT in ids)] == ["skipped:busy"]
++    assert wake.calls == []
++
++
++def test_fresh_results_and_gateway_results_are_not_the_sweepers(home):
++    _completion("deleg_fresh", completed_ago=5.0)
++    _completion("deleg_gateway", ui="")
++    wake = _Waker()
++
++    assert [(d["delegation_id"], d["verdict"]) for d in _sweep(home, wake)] == [
++        ("deleg_gateway", "skipped:not-a-ui-result")]
++    assert wake.calls == []
++
++
++def test_the_wake_budget_caps_turns_per_chat(home, monkeypatch):
++    monkeypatch.setattr(du, "WAKES_PER_HOUR", 1)
++    _completion("deleg_a")
++    _completion("deleg_b")
++    wake = _Waker()
++
++    assert [d["verdict"] for d in _sweep(home, wake)] == ["started", "skipped:budget"]
++    assert _row(home, "deleg_b")["delivery_state"] == "pending"
++
++
++def test_tail_repro_copy_in_another_backend_starves_the_holders_orphan_sweep(home):
++    """17:24-18:20: backend B holds the chat (David opened it there); backend A holds the queued copy and its turn
++    is refused SESSION_NOT_OWNED, retried with backoff (<= 300 s), each retry claiming then deferring the row. B had
++    offered the row itself at startup (its copy was refused before the chat was open there). B's orphan sweep then
++    reads the row as "touched within a claim lease" on every pass and never re-offers it: the result waits until
++    one backend lets go of the chat. The ledger-claimed wake in B delivers it on its next pass."""
++    _completion()
++    q_b: queue.Queue = queue.Queue()
++    assert ad.restore_undelivered_completions(q_b) == 1  # B's startup replay ...
++    ad.return_completion_offer(q_b.get_nowait())  # ... refused (no transport yet) and handed back
++    start = time.time()
++    for minute in range(0, 60, 1):  # an hour of B's sweeps, A retrying at its 300 s backoff ceiling
++        now = start + minute * 60
++        last_retry = now - (minute * 60) % 300
++        _set(home, updated_at=last_retry)  # A's claim + defer_completion_delivery touch
++        assert ad.sweep_orphaned_completions(q_b, now=now) == 0, f"re-offered at minute {minute}"
++    assert q_b.empty() and _row(home)["delivery_state"] == "pending"
++
++    wake = _Waker()
++    mine = [{"session_id": CHAT, "pid": os.getpid()}]
++    assert [d["verdict"] for d in _sweep(home, wake, holders=lambda: mine)] == ["started"]
++    assert _row(home)["delivery_state"] == "delivered"
++    # A's next retry finds the row settled: its claim fails, so it can never run the result a second time.
++    assert not ad.claim_completion_delivery(DID, "tui-poller:A:retry")
++
++
++def test_the_kanban_unloaded_loop_runs_the_delegation_pass(monkeypatch):
++    from tui_gateway import kanban_unloaded as ku
++    from tui_gateway import notice_fanout, notice_guarantee, reap_notices, server
++    stop = threading.Event()
++    ran = []
++    monkeypatch.setenv("HERMES_KANBAN_UNLOADED_FIRST_S", "0")
++    monkeypatch.setattr(ku, "sweep_remote_once", lambda *a, **k: [])
++    monkeypatch.setattr(ku, "sweep_once", lambda *a, **k: [])
++    monkeypatch.setattr(ku, "live_session_ids", lambda: set())
++    monkeypatch.setattr(notice_fanout, "card_change_pass", lambda *a, **k: None)
++    monkeypatch.setattr(notice_guarantee, "guarantee_pass", lambda *a, **k: stop.set())
++    monkeypatch.setattr(reap_notices, "retry_pending_killed_notices", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_get_db", lambda: None, raising=False)
++    monkeypatch.setattr(du, "sweep_once", lambda *a, **k: ran.append(1) or [])
++
++    ku._loop(stop)
++
++    assert ran == [1]
++
++
++def test_end_to_end_unloaded_parent_is_resumed_here_and_runs_the_result_turn(home, monkeypatch):
++    """The real waker (``server._wake_session_turn``): the parent is in no backend, so it is resumed here and one
++    turn runs with the formatted result, typed ``async_delegation_complete``; the row is then delivered."""
++    from tui_gateway import server
++    _completion()
++    live: dict = {}
++    submitted: list = []
++
++    def resume(rid, params):
++        assert params["session_id"] == CHAT and params["omit_messages"]
++        ready = threading.Event()
++        ready.set()
++        live.update(sid="sid-woken", session={"history_lock": threading.RLock(), "running": False,
++                                              "agent_ready": ready, "session_key": CHAT, "profile_home": None})
++        return {"result": {"session_id": "sid-woken"}}
++
++    monkeypatch.setitem(server._methods, "session.resume", resume)
++    monkeypatch.setattr(server, "_find_live_session_by_key",
++                        lambda key, profile_home=None: (live["sid"], live["session"]) if live and key == CHAT else None)
++    monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
++    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda sid, session: None)
++    monkeypatch.setattr(server, "_notif_submit",
++                        lambda rid, sid, session, text, what, **kw: submitted.append((sid, text, kw)) or True)
++
++    decisions = du.sweep_once(homes=lambda: [None], opener=_opener(home), holders=list,
++                              busy=lambda ids: False, spawn=lambda job: job())
++
++    assert [d["verdict"] for d in decisions] == ["started"]
++    assert len(submitted) == 1
++    sid, text, kw = submitted[0]
++    assert sid == "sid-woken" and DID in text
++    assert kw["display_kind"] == "async_delegation_complete" and kw["display_metadata"]["delegation_id"] == DID
++    assert _row(home)["delivery_state"] == "delivered"
+diff --git a/tools/async_delegation.py b/tools/async_delegation.py
+index b8a089a4cc..78e182665f 100644
+--- a/tools/async_delegation.py
++++ b/tools/async_delegation.py
+@@ -458,6 +458,38 @@ def restore_undelivered_completions(target_queue) -> int:
+         return _replay_pending(conn, rows, target_queue, now, startup=True)
+ 
+ 
++def unclaimed_pending_completions(*, min_age_s: float, now: Optional[float] = None) -> list[dict[str, Any]]:
++    """[daveey] This home's terminal completions still pending delivery, not under a live claim, and at least
++    ``min_age_s`` past completion: ``[{"delegation_id", "event"}]``, oldest first. Expired rows are dropped first
++    (as the replay does). For the unloaded-parent waker (``tui_gateway.delegation_unloaded``), which claims each
++    row with ``claim_completion_delivery`` before acting, so a stale read here can never deliver twice. Never
++    creates a ledger; a quiet one (no pending or live rows) is answered without a write."""
++    from agent.runtime_session_store import is_worker_process
++    if is_worker_process() or not _db_path().exists():
++        return []
++    from tools.async_delegation_idle import ledger_quiet
++    if ledger_quiet(_db_path()):
++        return []
++    recover_abandoned_delegations()  # an owner that died while no poller ran here: classify it first
++    now = time.time() if now is None else now
++    with _DB_LOCK, _transaction() as conn:
++        _expire_pending_completions(conn, now)
++        rows = conn.execute("""SELECT delegation_id, event_json FROM async_delegations
++               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending' AND event_json IS NOT NULL
++                 AND (delivery_claim IS NULL OR delivery_claimed_at < ?)
++                 AND COALESCE(NULLIF(completed_at, 0), dispatched_at) < ?
++               ORDER BY completed_at, delegation_id""", (now - _CLAIM_LEASE_S, now - min_age_s)).fetchall()
++    out = []
++    for delegation_id, payload in rows:
++        try:
++            evt = json.loads(payload)
++        except (TypeError, ValueError):
++            continue
++        if isinstance(evt, dict):
++            out.append({"delegation_id": delegation_id, "event": redact_completion_event(evt)})
++    return out
++
++
+ def _expire_pending_completions(conn, now: float) -> None:
+     """Resolve expired terminal rows even if their copies are queued or held; never steal a live claim."""
+     rows = conn.execute("""SELECT delegation_id, delivery_attempts,
+diff --git a/tui_gateway/delegation_unloaded.py b/tui_gateway/delegation_unloaded.py
+new file mode 100644
+index 0000000000..8609c5c586
+--- /dev/null
++++ b/tui_gateway/delegation_unloaded.py
+@@ -0,0 +1,261 @@
++"""Deliver async-delegation results to parent chats that no live poller delivers them to. [daveey]
++
++A finished async delegation sits in the ledger (``async_delegations``, ``delivery_state='pending'``) until a TUI
++poller claims its in-memory copy and starts the parent's turn. Three gaps left such a result waiting for hours
++(``deleg_5facc89f``: durable at 10:06Z, delivered 18:20Z on 2026-11-11):
++
++- the parent chat is loaded in NO backend: no poller exists to claim it until someone opens the chat;
++- the chat is loaded here only headless (a kanban wake resumed it): a copy restored at process start
++  (``startup_replay``) is refused by every session without a live transport
++  (``session_notifications._session_owns_notification_event``), so the loaded chat still does not get it;
++- the chat is held by backend B while backend A holds the copy: A's turn is refused ``SESSION_NOT_OWNED`` and
++  retried with backoff, each retry claiming and deferring the row, which keeps it "recently touched", so B's orphan
++  sweep (``async_delegation._copy_may_be_live``) never re-offers it; B has no copy, A cannot run the turn.
++
++This pass runs in every Desktop/TUI backend from the kanban unloaded-session sweeper's loop. For each terminal row
++past ``GRACE_S`` (a live poller delivers a fresh result within seconds), not under a live delivery claim, whose event
++was dispatched from a UI chat (``origin_ui_session_id``; messaging-gateway parents are the gateway's), and whose
++chat is in this host's stores, it:
++
++- skips the chat if another backend holds its active-session lease and this one does not (that backend's own pass
++  delivers it), or if the chat is live here mid-turn (its poller delivers at the turn's end);
++- otherwise claims the row (``claim_completion_delivery``: the one atomic cross-process gate, so the poller's copy,
++  another backend's pass and this one deliver at most once between them) and runs ONE turn with the result in the
++  chat (``server._wake_session_turn``: the chat live here as is, else resumed here detached, as the kanban wake does);
++- acknowledges the row only once the turn started. A busy/refused/failed wake defers the claim (no attempt spent)
++  and backs this row off (``RETRY_S`` doubling to ``RETRY_MAX_S``); a chat no store has releases it (spends an
++  attempt, so the ledger's budget ends it as ``dropped``).
++
++A started wake spends the chat's budget (``WAKES_PER_HOUR``; a woken turn may dispatch work whose result wakes it
++again). A chat past budget keeps its result pending: its next poller, or the next hour's pass, delivers it. The pass
++runs (and is disabled) with the kanban unloaded-session sweeper's loop.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import logging
++import os
++import sqlite3
++import threading
++import time
++import uuid
++from pathlib import Path
++from typing import Any, Callable, Iterator, Optional
++
++logger = logging.getLogger(__name__)
++
++LABEL = "deleg-sweep-wake"
++GRACE_S = 90.0
++WAKES_PER_HOUR = 6
++MAX_PARALLEL_WAKES = 2
++RETRY_S = 120.0
++RETRY_MAX_S = 1800.0
++
++_lock = threading.Lock()
++_wake_times: dict[str, list[float]] = {}  # chat -> started wakes (this process)
++_retry: dict[str, tuple[float, float]] = {}  # delegation id -> (not before, last delay)
++_wake_slots = threading.BoundedSemaphore(MAX_PARALLEL_WAKES)
++
++
++def _reset_for_tests() -> None:
++    global _wake_slots
++    with _lock:
++        _wake_times.clear()
++        _retry.clear()
++    _wake_slots = threading.BoundedSemaphore(MAX_PARALLEL_WAKES)
++
++
++def ledger_homes() -> list[Optional[Path]]:
++    """Launch home (None: no override) first, then each named profile home with a state.db."""
++    from tui_gateway import server
++    homes: list[Optional[Path]] = [None]
++    for profile in server._readopt_wake_profiles()[1:]:
++        with contextlib.suppress(Exception):
++            if (home := server._profile_home(profile)) is not None:
++                homes.append(home)
++    return homes
++
++
++@contextlib.contextmanager
++def _home_scope(home: Optional[Path]) -> Iterator[None]:
++    if home is None:
++        yield
++        return
++    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++    token = set_hermes_home_override(str(home))
++    try:
++        yield
++    finally:
++        reset_hermes_home_override(token)
++
++
++def wake_turn(chat: str, text: str, metadata: dict) -> str:
++    from tui_gateway import server
++    return server._wake_session_turn(chat, text, display_kind="async_delegation_complete",
++                                     display_metadata=metadata, label=LABEL)
++
++
++def busy_here(ids: set[str]) -> bool:
++    """Whether a session this process holds for one of ``ids`` is mid-turn (its own poller delivers after it)."""
++    from tui_gateway import server
++    with server._sessions_lock:
++        for sid, session in server._sessions.items():
++            if not isinstance(session, dict) or session.get("_finalized"):
++                continue
++            keys = {sid, str(session.get("session_key") or ""), str(getattr(session.get("agent"), "session_id", "") or "")}
++            if keys & ids and session.get("running"):
++                return True
++    return False
++
++
++def held_elsewhere(holders: Callable[[], list[dict]], ids: set[str]) -> Optional[str]:
++    """``pid N`` of another live backend holding one of ``ids`` when this process holds none, else None."""
++    me, other = os.getpid(), None
++    for entry in holders() or ():
++        if str(entry.get("session_id") or "") not in ids:
++            continue
++        try:
++            pid = int(entry.get("pid") or 0)
++        except (TypeError, ValueError):
++            continue
++        if pid == me:
++            return None
++        other = other or f"pid {pid}"
++    return other
++
++
++def _spawn_thread(job: Callable[[], Any]) -> str:
++    from agent.memory_provider import spawn_context_thread
++    spawn_context_thread(job, name=LABEL).start()  # keeps the pass's profile home binding
++    return "dispatched"
++
++
++def _has_budget(chat: str, now: float) -> bool:
++    with _lock:
++        _wake_times[chat] = [t for t in _wake_times.get(chat, ()) if t > now - 3600]
++        return len(_wake_times[chat]) < WAKES_PER_HOUR
++
++
++def _backing_off(delegation_id: str, now: float) -> bool:
++    with _lock:
++        return _retry.get(delegation_id, (0.0, 0.0))[0] > now
++
++
++def _back_off(delegation_id: str, now: float) -> None:
++    with _lock:
++        delay = min(_retry.get(delegation_id, (0.0, RETRY_S / 2))[1] * 2, RETRY_MAX_S)
++        _retry[delegation_id] = (now + delay, delay)
++
++
++def _wake_job(wake, delegation_id: str, claim: str, chat: str, text: str, metadata: dict, now: float) -> str:
++    """Run on a worker thread: the wake, then settle the claim by its verdict. Never raises."""
++    from tools import async_delegation as ad
++    try:
++        try:
++            verdict = str(wake(chat, text, metadata) or "error")
++        except Exception:
++            logger.warning("%s of %s for %s failed", LABEL, chat, delegation_id, exc_info=True)
++            verdict = "error"
++        if verdict == "started":
++            ad.complete_completion_delivery(delegation_id, claim)
++            with _lock:
++                _wake_times.setdefault(chat, []).append(now)
++                _retry.pop(delegation_id, None)
++            logger.info("%s: started a turn in chat %s for async delegation %s", LABEL, chat, delegation_id)
++        else:
++            (ad.release_completion_delivery if verdict == "missing" else ad.defer_completion_delivery)(
++                delegation_id, claim)
++            _back_off(delegation_id, time.time())
++            logger.info("%s: chat %s did not take async delegation %s (%s); it stays pending", LABEL, chat,
++                        delegation_id, verdict)
++        return verdict
++    except Exception:
++        logger.warning("%s job for %s failed", LABEL, delegation_id, exc_info=True)
++        with contextlib.suppress(Exception):
++            ad.defer_completion_delivery(delegation_id, claim)
++        return "error"
++    finally:
++        _wake_slots.release()
++
++
++def _chat_and_tip(chat: str, opener) -> tuple[Optional[str], Optional[str]]:
++    with opener(chat) as (db, tip):
++        return (chat, tip) if db is not None else (None, None)
++
++
++def sweep_once(*, now: Optional[float] = None, grace_s: float = GRACE_S,
++               homes: Callable[[], list] = ledger_homes, opener=None,
++               holders: Optional[Callable[[], list[dict]]] = None,
++               busy: Callable[[set], bool] = busy_here, wake: Callable[..., str] = wake_turn,
++               spawn: Callable[[Callable[[], Any]], Any] = _spawn_thread) -> list[dict]:
++    """One pass over every ledger this backend serves; one decision dict per candidate row (for logs and tests)."""
++    from tools import async_delegation as ad
++    from tools.process_registry_notifications import format_process_notification
++    from tui_gateway import kanban_unloaded as ku
++    from tui_gateway.session_notifications import _async_delegation_display_metadata
++    opener = opener or ku.find_session_db
++    holders = holders or ku.registry_holders
++    now = time.time() if now is None else now
++    out: list[dict] = []
++    for home in homes():
++        with _home_scope(home):
++            try:
++                rows = ad.unclaimed_pending_completions(min_age_s=grace_s, now=now)
++            except Exception:
++                logger.debug("%s: ledger of %s unreadable", LABEL, home or "launch home", exc_info=True)
++                continue
++            for row in rows:
++                did, evt = row["delegation_id"], row["event"]
++                decision = {"delegation_id": did, "home": str(home or ""), "verdict": None}
++                out.append(decision)
++                chat = str(evt.get("session_key") or evt.get("parent_session_id") or "")
++                if (evt.get("type") != "async_delegation" or ad.is_interim_delegation_event(evt)
++                        or not evt.get("origin_ui_session_id") or not chat):
++                    decision["verdict"] = "skipped:not-a-ui-result"
++                    continue
++                if _backing_off(did, now):
++                    decision["verdict"] = "skipped:backoff"
++                    continue
++                found, tip = _chat_and_tip(chat, opener)
++                if found is None:
++                    decision["verdict"] = "skipped:no-store"
++                    continue
++                ids = {chat, tip or chat}
++                if (holder := held_elsewhere(holders, ids)) is not None:
++                    decision["verdict"] = f"skipped:held:{holder}"
++                    continue
++                if busy(ids):
++                    decision["verdict"] = "skipped:busy"
++                    continue
++                if not _has_budget(tip or chat, now):
++                    decision["verdict"] = "skipped:budget"
++                    continue
++                text = format_process_notification(evt)
++                if not text:
++                    decision["verdict"] = "skipped:no-text"
++                    continue
++                if not _wake_slots.acquire(blocking=False):
++                    decision["verdict"] = "skipped:slots"
++                    continue
++                claim = f"{LABEL}:{os.getpid()}:{uuid.uuid4().hex}"
++                try:
++                    claimed = ad.claim_completion_delivery(did, claim)
++                except sqlite3.Error:
++                    logger.debug("%s: claim of %s failed; the next pass retries", LABEL, did, exc_info=True)
++                    claimed = False
++                if not claimed:
++                    _wake_slots.release()
++                    decision["verdict"] = "skipped:claimed"
++                    continue
++                meta = {**_async_delegation_display_metadata(evt), "woken": True}
++                job = lambda did=did, claim=claim, chat=tip or chat, text=text, meta=meta: _wake_job(
++                    wake, did, claim, chat, text, meta, now)
++                try:
++                    decision["verdict"] = str(spawn(job))
++                except Exception:
++                    _wake_slots.release()
++                    ad.defer_completion_delivery(did, claim)
++                    logger.warning("%s could not start a wake for %s", LABEL, did, exc_info=True)
++                    decision["verdict"] = "error"
++    return out
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 79e8588e00..81952c3ae8 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -622,6 +622,13 @@ def _loop(stop: threading.Event) -> None:
+             sweep_once(live_session_ids(), grace_s=grace)
+         except Exception:
+             logger.warning("kanban unloaded sweep failed", exc_info=True)
++        # [daveey] Async-delegation results no live poller delivers (parent unloaded, loaded headless, or held by
++        # another backend than the copy's): one turn in the parent, ledger-claimed (delegation_unloaded).
++        try:
++            from tui_gateway.delegation_unloaded import sweep_once as delegation_sweep_once
++            delegation_sweep_once()
++        except Exception:
++            logger.warning("async delegation unloaded sweep failed", exc_info=True)
+         # [daveey] Session outcome: refresh chats whose cards moved, then make sure no notice ends a chat unanswered.
+         from tui_gateway.notice_fanout import card_change_pass
+         from tui_gateway.notice_guarantee import guarantee_pass
+-- 
+2.51.0
+

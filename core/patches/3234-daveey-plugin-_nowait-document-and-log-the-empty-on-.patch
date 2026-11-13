@@ -1,0 +1,179 @@
+From 181c6738b9ceb6e199dd39382a2b5ffdf19d43c0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:44:31 +0000
+Subject: [PATCH] [daveey] plugin *_nowait: document and log the empty on-loop
+ fallback
+
+Follow-up to the non-blocking *_nowait probes (review nits on PR #1923).
+
+1. The on-loop busy-sweep fallback `set()` (no live answer in this process,
+   no plugin_toolset_keys.json) is not a harmless hint:
+   tools_config._get_platform_tools uses plugin toolset keys to INCLUDE
+   default-on plugin toolsets, so a session built in that window lacks them
+   (explicitly listed plugin toolsets still pass through by name). The
+   probe now logs that once per field, and the get_plugin_toolset_keys_nowait
+   and test docstrings say so instead of "callers only EXCLUDE".
+   Inclusion is unchanged: with nothing known there is no key set to treat
+   as "unknown" short of blocking the loop, which is what #1923 removed.
+2. The _nowait_plugin_set docstring now matches the code: an idle,
+   never-discovered manager with nothing remembered still runs
+   discover_plugins() inline on the loop and skips the persisted cache.
+
+Tests: the empty fallback logs once per field and not when the persisted
+set is served; the inline first sweep on the loop is pinned.
+
+Task: t_01a1d3d8e27b8ff9
+---
+ hermes_cli/plugins.py                         | 29 +++++++++--
+ .../test_plugins_nowait_reload_nonblocking.py | 49 +++++++++++++++++--
+ 2 files changed, 68 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index 7a0a9d001a..dfeedef128 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -913,6 +913,7 @@ def discover_plugins(force: bool = False) -> None:
+ 
+ _background_discovery_thread: Optional[threading.Thread] = None
+ _background_discovery_lock = threading.Lock()
++_nowait_empty_logged: set[str] = set()  # [daveey] fields whose empty on-loop *_nowait fallback was logged
+ 
+ 
+ def start_background_plugin_discovery() -> None:
+@@ -960,7 +961,12 @@ def _nowait_plugin_set(cache_field: str, live: Callable[[PluginManager], set[str
+ 
+     [daveey] A sweep another thread holds (a force reload unloads first, so ``_discovered`` is False
+     meanwhile) is never waited on: that parked the gateway loop 36 s (kanban_run -> build_policy).
+-    Blocking stays only for a process with no known set, off the event loop."""
++    While a sweep is busy the probe serves this process's last live set, else last launch's persisted
++    ``plugin_toolset_keys.json``, else ``set()`` on the event loop (logged once per field; off the loop
++    it blocks on ``discover_plugins()``). With the lock free and nothing discovered it still runs
++    ``discover_plugins()`` inline, ON the loop too, when this process has no remembered set (a first
++    sweep; the persisted cache is not consulted then); only a retry after a failed sweep with a
++    remembered set is skipped on the loop."""
+     snapshot = plugins_snapshot.active()
+     if snapshot is not None:
+         return set(snapshot.toolset_keys if cache_field == "toolset_keys" else snapshot.portable_mcp)
+@@ -992,7 +998,17 @@ def _nowait_plugin_set(cache_field: str, live: Callable[[PluginManager], set[str
+         if isinstance(values, list) and all(isinstance(v, str) for v in values):
+             return set(values)
+     if _on_event_loop():
+-        return set()  # nothing known yet; the next probe after the sweep reads the live set
++        # Nothing known yet; the next probe after the sweep reads the live set. Not a harmless hint:
++        # tools_config._get_platform_tools INCLUDES default-on plugin toolsets from these keys, so a
++        # session built now lacks them (explicitly listed ones still pass through by name). No better
++        # answer exists without blocking the loop, so say so once.
++        if cache_field not in _nowait_empty_logged:
++            _nowait_empty_logged.add(cache_field)
++            logger.warning(
++                "plugins: %s unknown while another thread sweeps and no %s exists; serving an empty set "
++                "on the event loop (a session built now lacks default-on plugin toolsets)",
++                cache_field, plugins_snapshot._cache_path(get_hermes_home()).name)
++        return set()
+     discover_plugins()
+     return live(manager)
+ 
+@@ -1006,9 +1022,12 @@ def _on_event_loop() -> bool:
+ 
+ 
+ def get_plugin_toolset_keys_nowait() -> set[str]:
+-    """Plugin toolset keys without blocking on in-flight discovery: live registry when done, last
+-    launch's persisted set while a background scan runs (callers only EXCLUDE these keys, so a stale
+-    set is harmless and self-heals), else block via discover_plugins()."""
++    """Plugin toolset keys without blocking on in-flight discovery (see :func:`_nowait_plugin_set`):
++    live registry when done, else the last live / last launch's persisted set while a sweep runs, else
++    ``set()`` on the event loop (off it, block via discover_plugins()). Callers use these keys to
++    EXCLUDE (validation) and to INCLUDE (``tools_config._get_platform_tools`` enables default-on plugin
++    toolsets from them), so a stale set self-heals on the next probe, but the empty fallback drops
++    default-on plugin toolsets from a session built in that window; it is logged once."""
+     return _nowait_plugin_set("toolset_keys", lambda _m: {ts_key for ts_key, _, _ in get_plugin_toolsets()})
+ 
+ 
+diff --git a/tests/hermes_cli/test_plugins_nowait_reload_nonblocking.py b/tests/hermes_cli/test_plugins_nowait_reload_nonblocking.py
+index 62baac8451..0922458df9 100644
+--- a/tests/hermes_cli/test_plugins_nowait_reload_nonblocking.py
++++ b/tests/hermes_cli/test_plugins_nowait_reload_nonblocking.py
+@@ -3,13 +3,16 @@
+ A force reload (hermes-sync's mods-reload) unloads first, so ``_discovered`` is False while the sweep
+ thread holds ``_discovery_lock``. The probe used to fall through to a blocking ``discover_plugins()``,
+ which parked the gateway event loop (``kanban_run -> build_policy -> get_plugin_toolset_keys_nowait``)
+-for 36 s. It now serves the last live set instead (callers treat these keys as a hint; a stale set
+-self-heals on the next probe after the sweep).
++for 36 s. It now serves the last live set, else last launch's persisted set; a stale set self-heals
++on the next probe after the sweep. With neither, the event loop gets ``set()``: callers use these keys
++to INCLUDE default-on plugin toolsets too (``tools_config._get_platform_tools``), so that window drops
++them from a session built in it, and the fallback is logged once.
+ """
+ from __future__ import annotations
+ 
+ import asyncio
+ import json
++import logging
+ import threading
+ import time
+ 
+@@ -80,15 +83,39 @@ def test_nowait_serves_persisted_set_when_never_answered_live(manager):
+     assert keys == {"a2a"} and mcp == {"srv"}
+ 
+ 
+-def test_nowait_never_blocks_event_loop_without_any_known_set(manager):
++def test_nowait_never_blocks_event_loop_without_any_known_set(manager, monkeypatch, caplog):
++    """The empty on-loop fallback is served without blocking and logged once per field."""
++    monkeypatch.setattr(plugins_mod, "_nowait_empty_logged", set())
+     t, release = _hold_lock(manager)
+     try:
+-        keys, elapsed = asyncio.run(_timed(plugins_mod.get_plugin_toolset_keys_nowait))
++        with caplog.at_level(logging.WARNING, logger=plugins_mod.logger.name):
++            keys, elapsed = asyncio.run(_timed(plugins_mod.get_plugin_toolset_keys_nowait))
++            again, _ = asyncio.run(_timed(plugins_mod.get_plugin_toolset_keys_nowait))
++            mcp, _ = asyncio.run(_timed(plugins_mod.get_portable_mcp_server_names_nowait))
+     finally:
+         release.set()
+         t.join(5)
+     assert elapsed < 0.5
+-    assert keys == set()
++    assert keys == set() and again == set() and mcp == set()
++    logged = [r.getMessage() for r in caplog.records if "serving an empty set" in r.getMessage()]
++    assert len(logged) == 2, logged  # once per field, not once per probe
++    assert "toolset_keys" in logged[0] and "plugin_toolset_keys.json" in logged[0]
++    assert "portable_mcp" in logged[1]
++
++
++def test_nowait_empty_fallback_not_logged_when_persisted_set_served(manager, monkeypatch, caplog):
++    monkeypatch.setattr(plugins_mod, "_nowait_empty_logged", set())
++    (plugins_mod.get_hermes_home() / "cache" / "plugin_toolset_keys.json").write_text(
++        json.dumps({"toolset_keys": ["a2a"], "portable_mcp": []}))
++    t, release = _hold_lock(manager)
++    try:
++        with caplog.at_level(logging.WARNING, logger=plugins_mod.logger.name):
++            keys, _ = asyncio.run(_timed(plugins_mod.get_plugin_toolset_keys_nowait))
++    finally:
++        release.set()
++        t.join(5)
++    assert keys == {"a2a"}
++    assert not [r for r in caplog.records if "serving an empty set" in r.getMessage()]
+ 
+ 
+ def test_nowait_blocks_off_loop_for_never_discovered_process(manager, monkeypatch):
+@@ -100,6 +127,18 @@ def test_nowait_blocks_off_loop_for_never_discovered_process(manager, monkeypatc
+     assert calls == [False]
+ 
+ 
++def test_nowait_idle_never_discovered_sweeps_inline_on_loop(manager, monkeypatch):
++    """Documented contract: with the lock free and nothing remembered, the first sweep runs inline even
++    on the event loop, and the persisted cache is not consulted."""
++    (plugins_mod.get_hermes_home() / "cache" / "plugin_toolset_keys.json").write_text(
++        json.dumps({"toolset_keys": ["stale"], "portable_mcp": []}))
++    calls = []
++    monkeypatch.setattr(plugins_mod, "discover_plugins", lambda force=False: calls.append(force))
++    monkeypatch.setattr(plugins_mod, "get_plugin_toolsets", lambda: [("x", "X", "")])
++    keys, _ = asyncio.run(_timed(plugins_mod.get_plugin_toolset_keys_nowait))
++    assert keys == {"x"} and calls == [False]
++
++
+ def test_nowait_on_loop_skips_retry_after_failed_sweep(manager, monkeypatch):
+     """A force reload that failed resets ``_discovered``; the loop serves the last live set instead of
+     re-running the sweep inline (off the loop the retry still runs, as before)."""
+-- 
+2.51.0
+

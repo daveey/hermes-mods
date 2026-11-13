@@ -1,0 +1,138 @@
+From b9238de75305909ea60accc64b5c35e788dd39e6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 22:25:10 +0000
+Subject: [PATCH] fix(cron): preserve one-shot jobs awaiting admission
+ settlement [daveey]
+
+---
+ cron/jobs.py                   |  6 ++++
+ cron/scheduler_authority.py    | 20 ++++++++++++
+ tests/cron/test_restart_cut.py | 57 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 83 insertions(+)
+
+diff --git a/cron/jobs.py b/cron/jobs.py
+index e1bbb44a5d..b8c16d62c3 100644
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -2692,6 +2692,9 @@ def claim_dispatch(job_id: str) -> bool:
+         completed = repeat.get("completed", 0)
+         label = job.get("name", job.get("id", "?"))
+         if completed >= times:
++            from cron.scheduler_authority import has_pending_admission
++            if has_pending_admission(job_id):
++                return False  # settlement owns the record; no dispatch and no retirement
+             if job.get("last_run_at") is not None:
+                 # A prior run completed normally (mark_job_run raced this tick). Retain the terminal
+                 # record, as mark_job_run's repeat-limit branch does, instead of deleting the
+@@ -3242,6 +3245,9 @@ def _oneshot_dispatch_limit_reached(job: dict[str, Any], scan: _DueScan) -> bool
+     completed = repeat.get("completed", 0)
+     if times is None or times <= 0 or completed < times:
+         return False
++    from cron.scheduler_authority import has_pending_admission
++    if has_pending_admission(job["id"]):
++        return True  # a dead firer can still have a canonical receipt awaiting reconciliation
+     name = job.get("name", job.get("id", "?"))
+     # A live run must never have its job record deleted underneath it (#62002): a run that outlives the
+     # run_claim TTL (stream stall, laptop asleep mid-run) satisfies the same completed >= times +
+diff --git a/cron/scheduler_authority.py b/cron/scheduler_authority.py
+index 98669e3ba7..204377178b 100644
+--- a/cron/scheduler_authority.py
++++ b/cron/scheduler_authority.py
+@@ -63,6 +63,26 @@ def journal_path(job_id, request_id):
+     return get_hermes_home() / 'cron' / 'admissions' / (key + '.json')
+ 
+ 
++def has_pending_admission(job_id):
++    """An admission journal owns settlement, even after its firer died. Do not retire its job.
++
++    Only a matching, identity-checked journal holds the job; unrelated journals do not. Read
++    errors propagate so a damaged journal cannot turn an uncertain fire into destructive cleanup.
++    """
++    root = journal_path(job_id, '').parent
++    for path in root.glob('*.json'):
++        try:
++            record = json.loads(path.read_text(encoding='utf-8-sig'))
++        except FileNotFoundError:
++            continue  # reconciliation just retired it
++        params = record['params']
++        if params['job_id'] == job_id:
++            if path != journal_path(job_id, params['request_id']):
++                raise ValueError('cron journal identity conflict')
++            return True
++    return False
++
++
+ def _pause_identity(paused):
+     """The exact pause this recovery uncertainty caused, so only that pause is ever lifted."""
+     return {'paused_at': paused.get('paused_at'), 'reason': paused.get('paused_reason')} if paused else True
+diff --git a/tests/cron/test_restart_cut.py b/tests/cron/test_restart_cut.py
+index 5e8d303419..48ef9a0da7 100644
+--- a/tests/cron/test_restart_cut.py
++++ b/tests/cron/test_restart_cut.py
+@@ -290,6 +290,63 @@ def test_restart_safe_worker_cut_is_rerun_by_journal_recovery(home, monkeypatch,
+     _assert_rerun_once(job["id"], fire, natural_next=natural_next)
+ 
+ 
++@pytest.mark.parametrize("deleted", [False, True])
++def test_oneshot_due_scan_before_journal_recovery(home, monkeypatch, owner_ops, deleted):
++    """A replacement ticker may scan before the canonical owner can reconcile its journal."""
++    from datetime import UTC, datetime, timedelta
++
++    now = datetime.now(UTC)
++    monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
++    job = jobs.create_job(prompt="probe", schedule="in 1m", repeat=1, deliver="local")
++    now += timedelta(minutes=1, seconds=1)
++    assert _due(job["id"])
++    claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
++    assert jobs.claim_dispatch(job["id"])
++    fire = executions.create_execution(job["id"], source="builtin")["id"]
++    executions.mark_execution_running(fire)
++    journal = scheduler_authority.journal_path(job["id"], fire)
++    journal.parent.mkdir(parents=True, exist_ok=True)
++    journal.write_text(json.dumps({"params": {"job_id": job["id"], "request_id": fire,
++                                              "extra_prompt": None}, "receipt": None}))
++    _dead_firer(monkeypatch)
++    owner_ops["recover"] = lambda params: {
++        "status": "terminal", "result": [False, "", "", "interrupted"], "job": claimed,
++        "job_flags": {"_restart_cut": True}}
++    if deleted:
++        assert jobs.remove_job(job["id"])
++    # Headless tick cannot dial an absent owner; housekeeping leaves the journal pending,
++    # but still performs its real due scan before the replacement gateway can reconcile.
++    with monkeypatch.context() as headless:
++        headless.setattr("gateway.session_cron.owner_for_home", lambda home: None)
++        headless.setattr(scheduler, "_maybe_run_worktree_maintenance", lambda: None)
++        headless.setattr(scheduler, "_sweep_mcp_orphans", lambda: None)
++        assert scheduler.tick(verbose=False, headless=True) == 0
++    assert not _due(job["id"])
++    if not deleted:
++        assert jobs.get_job(job["id"]) is not None
++        assert not jobs.claim_dispatch(job["id"])
++        assert jobs.get_job(job["id"]) is not None
++    scheduler_authority.reconcile_pending()
++    scheduler_authority.reconcile_pending()
++    if deleted:
++        assert jobs.get_job(job["id"]) is None
++        assert not _due(job["id"])
++        return
++    saved = jobs.get_job(job["id"])
++    assert saved["repeat"] == {"times": 1, "completed": 0}
++    assert int(saved.get("failure_streak") or 0) == 0
++    assert not journal.exists()
++    assert _due(job["id"])
++    rerun = jobs.claim_job_for_fire(job["id"], return_job=True)
++    assert jobs.claim_dispatch(job["id"])
++    assert jobs.mark_job_run(job["id"], True, expected_fire_owner=rerun["fire_claim"]["by"])
++    scheduler_authority.reconcile_pending()
++    saved = jobs.get_job(job["id"])
++    assert saved["repeat"] == {"times": 1, "completed": 1}
++    assert saved["state"] == "completed" and saved["last_status"] == "ok"
++    assert not _due(job["id"])
++
++
+ def test_manual_fire_refused_while_draining_is_deferred_not_failed(home, monkeypatch, owner_ops):
+     """Hub sample 2: ``hermes cron run`` while the owner drains: refused, never admitted."""
+     from hermes_state_runtime import RuntimeStoreError
+-- 
+2.51.0
+

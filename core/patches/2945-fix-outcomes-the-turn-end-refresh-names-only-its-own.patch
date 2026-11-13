@@ -1,0 +1,809 @@
+From 2a1c471bafa24cfb28b6da1cb1f31ab7b92415d3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:23:48 +0000
+Subject: [PATCH] fix(outcomes): the turn-end refresh names only its own turn's
+ evidence, never a snapshot [daveey]
+
+PR1131 review t_01a1d0ca50bdd065 (ce34362731): capture_turn_identity snapshotted every live-turn evidence
+the chat held at conclusion, so (1) the TUI refresh, which runs after settle_prompt_state admitted a newer
+turn, discounted that newer turn's marker, and (2) the gateway capture discounted a concurrent Desktop
+turn's marker while it waited on the gateway's lease.
+
+- hermes_state_outcome.turn_identity(marker=, lease_holder=, gateway_token=) builds the concluding turn's
+  identity from handles only that turn holds; capture_turn_identity is gone. Lease token = holder (unique
+  per turn: pid+relay turn uuid), gateway token = active_turn_token (uuid per turn).
+- agent._last_session_turn_lease_holder: set at lease admission, kept after release (the active attr is
+  cleared even when a busy store defers the release).
+- TUI: run_body reads its own marker back right after recording it (st.own_marker); the turn-end refresh
+  and the refused-turn retry timer pass concluding_turn_identity(agent, own_marker). Nothing passed =
+  nothing discounted.
+- Gateway: the event's _gateway_active_turn_token (cleared only after the handler returns) and the turn
+  agent's lease holder; never a marker.
+- tests/tui_gateway/test_update_pause.py: the home fixture keeps card sources local. The turn-end refresh
+  now derives past the turn's own marker and reads the chat's cards; with Thread inlined process-wide the
+  remote-links worker loop ran forever (CI slice 6, 600 s file timeout at a007a31d and ce34362731).
+
+Tests: test_outcome_late_turn_end_refresh.py covers both review repros (TUI after settle, gateway with a
+concurrent TUI marker), late gateway refresh x routing/lease, own-evidence discount on all three paths,
+refused-turn timer x routing/lease/marker.
+---
+ agent/turn_facade_lease.py                    |   3 +
+ gateway/run_turn.py                           |   2 +-
+ gateway/turn_outcome.py                       |  42 ++-
+ hermes_state_outcome.py                       |  42 ++-
+ .../test_outcome_late_turn_end_refresh.py     | 248 +++++++++++++-----
+ .../test_outcome_turn_end_declaration.py      |  21 +-
+ tests/tui_gateway/test_update_pause.py        |   8 +
+ tui_gateway/prompt_turn.py                    |  14 +-
+ tui_gateway/session_auto_continue.py          |  12 +-
+ tui_gateway/turn_outcome.py                   |  44 ++--
+ 10 files changed, 312 insertions(+), 124 deletions(-)
+
+diff --git a/agent/turn_facade_lease.py b/agent/turn_facade_lease.py
+index b8018e9bc1..b3d5f4ae90 100644
+--- a/agent/turn_facade_lease.py
++++ b/agent/turn_facade_lease.py
+@@ -564,6 +564,9 @@ def admit_durable_turn_lease(
+         agent, db, session_id, holder, expires_at=_committed_lease_expiry(db, session_id, holder, authority_floor),
+     )
+     agent._active_session_turn_lease_holder = holder
++    # [daveey] Kept after release (the active attr is cleared even when a busy store defers the release): the
++    # turn-end outcome refresh discounts only this turn's own lease (hermes_state_outcome.turn_identity).
++    agent._last_session_turn_lease_holder = holder
+     agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS
+     try:
+         # Read the row only now: the previous holder may have created or deleted it while this
+diff --git a/gateway/run_turn.py b/gateway/run_turn.py
+index d31882aad6..5aa7d80020 100644
+--- a/gateway/run_turn.py
++++ b/gateway/run_turn.py
+@@ -341,7 +341,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
+         except Exception as e:
+             return await self._hmwa_agent_error_reply(e, event, source, session_entry, session_key, prepared)
+         finally:  # [daveey] store the chat's outcome (off the reply path), then restore the session context
+-            refresh_gateway_turn_outcome(self, session_entry)
++            refresh_gateway_turn_outcome(self, session_entry, event, session_key)
+             self._clear_session_env(_session_env_tokens)
+ 
+     def _profile_scope_for_source(self, source: SessionSource):
+diff --git a/gateway/turn_outcome.py b/gateway/turn_outcome.py
+index 4b9dbae57d..b19c2a9fca 100644
+--- a/gateway/turn_outcome.py
++++ b/gateway/turn_outcome.py
+@@ -15,16 +15,32 @@ from typing import Optional
+ logger = logging.getLogger(__name__)
+ 
+ 
+-def _capture(sid: str, db) -> frozenset:
+-    """The concluding turn's own live-turn evidence (routing token, turn lease, marker), taken now, before the
+-    refresh is scheduled. The refresh runs later on an unawaited thread: a newer turn may have started by then,
+-    and only this turn's evidence may be discounted. Nothing captured = nothing discounted."""
++def _turn_agent(runner, session_key: Optional[str]):
++    """The agent that ran this turn (``turn.agent`` stays set until the session's next turn is claimed)."""
++    if not session_key:
++        return None
++    try:
++        return getattr(runner._session_state(session_key).turn, "agent", None)
++    except Exception:  # health: allow BLE001 -- no agent = its lease is not named, so it reads live (fail safe)
++        logger.debug("gateway turn agent lookup failed for %s", session_key, exc_info=True)
++        return None
++
++
++def concluding_turn_identity(runner, event=None, session_key: Optional[str] = None) -> frozenset:
++    """The concluding gateway turn's OWN evidence: its routing ``active_turn_token`` (the event owns it until
++    ``_clear_durable_active_turn``) and its agent's turn-lease holder. Never a snapshot of the chat's live
++    evidence: a concurrent Desktop turn's marker, or a turn that starts before the unawaited refresh runs, stays
++    a live turn. Nothing named = nothing discounted."""
+     try:
+-        from hermes_state_outcome import capture_turn_identity
++        from hermes_state_outcome import turn_identity
+ 
+-        return capture_turn_identity(sid, db=db)
+-    except Exception:  # health: allow BLE001 -- best-effort; an unreadable store discounts nothing
+-        logger.warning("gateway turn identity capture failed for %s", sid, exc_info=True)
++        agent = _turn_agent(runner, session_key)
++        holder = getattr(agent, "_last_session_turn_lease_holder", None)
++        token = getattr(event, "_gateway_active_turn_token", None)
++        return turn_identity(lease_holder=holder if isinstance(holder, str) else None,
++                             gateway_token=token if isinstance(token, str) else None)
++    except Exception:  # health: allow BLE001 -- best-effort; nothing named discounts nothing
++        logger.warning("gateway turn identity capture failed for %s", session_key, exc_info=True)
+         return frozenset()
+ 
+ 
+@@ -37,8 +53,10 @@ def _refresh(sid: str, db, concluding_turn: frozenset) -> None:
+         logger.warning("gateway turn-end outcome refresh failed for %s", sid, exc_info=True)
+ 
+ 
+-def refresh_gateway_turn_outcome(runner, session_entry) -> Optional[threading.Thread]:
+-    """Start the refresh off the reply path; the started thread (None when there is nothing to refresh)."""
++def refresh_gateway_turn_outcome(runner, session_entry, event=None,
++                                 session_key: Optional[str] = None) -> Optional[threading.Thread]:
++    """Start the refresh off the reply path; the started thread (None when there is nothing to refresh).
++    The concluding turn's identity is taken here, before the thread is scheduled."""
+     sid = str(getattr(session_entry, "session_id", "") or "")
+     store = getattr(runner, "_session_db", None)
+     db = getattr(store, "_db", store)
+@@ -47,8 +65,8 @@ def refresh_gateway_turn_outcome(runner, session_entry) -> Optional[threading.Th
+     try:
+         from agent.memory_provider import spawn_context_thread
+ 
+-        thread = spawn_context_thread(
+-            _refresh, name="gateway-turn-outcome", args=(sid, db, _capture(sid, db)))
++        concluding = concluding_turn_identity(runner, event, session_key)
++        thread = spawn_context_thread(_refresh, name="gateway-turn-outcome", args=(sid, db, concluding))
+         thread.start()
+         return thread
+     except Exception:  # health: allow BLE001 -- a thread that can't start skips one refresh; logged
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index be760ae781..aabd571ef6 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -246,8 +246,8 @@ def _live_turn(db: Any, sid: str, concluding: frozenset[str] = frozenset()) -> b
+ 
+     Managed workers and CLI turns need no TUI marker or gateway routing entry. Their shared
+     turn-facade lease is the cross-process evidence; an idle attached session is not a turn.
+-    ``concluding`` [daveey]: tokens of the turn that is concluding (``capture_turn_identity``); evidence
+-    carrying one of them is that turn's own, not a live turn."""
++    ``concluding`` [daveey]: tokens of the turn that is concluding (``turn_identity``); evidence carrying
++    one of them is that turn's own, not a live turn."""
+     return any(token not in concluding for token in _live_turn_tokens(db, sid))
+ 
+ 
+@@ -258,10 +258,10 @@ def _live_turn_tokens(db: Any, sid: str) -> Iterator[str]:
+     home = Path(db.db_path).parent
+     marker = read_turn_marker(home, sid)
+     if marker and marker_writer_state(marker) == "alive":
+-        yield f"marker:{marker.get('writer_pid')}:{marker.get('started_at')}"
++        yield marker_identity(marker)
+     owner = _guarded("durable turn", sid, lambda: _durable_turn_owner(db, sid), None)
+     if owner is not None:
+-        yield f"lease:{owner['holder']}:{owner.get('acquired_at')}"
++        yield f"lease:{owner['holder']}"
+     yield from _guarded("gateway turn", sid, lambda: list(_gateway_turn_tokens(db, sid)), [])
+ 
+ 
+@@ -299,7 +299,7 @@ def _gateway_turn_tokens(db: Any, sid: str) -> Iterator[str]:
+         scope = str(routing_scope or "")
+         gateway_home = Path(scope).parent if scope else Path(db.db_path).parent
+         if _gateway_running(gateway_home):
+-            yield f"gateway:{scope}:{entry.get('active_turn_token')}:{entry.get('active_turn_started_at')}"
++            yield f"gateway:{entry.get('active_turn_token')}"
+ 
+ 
+ def _gateway_turn_live(db: Any, sid: str) -> bool:
+@@ -849,20 +849,34 @@ def derive_outcome(sid: str, *, db: Any = None, ignore_live_turn: bool = False,
+         return _derive(handle, _tip(handle, sid), ignore_live_turn=ignore_live_turn, pending_reply=pending_reply)
+ 
+ 
+-def capture_turn_identity(sid: str, *, db: Any = None) -> frozenset[str]:
+-    """[daveey] The live-turn evidence ``sid`` holds right now, as opaque tokens (TUI marker pid+start, turn-lease
+-    holder+acquisition, gateway routing token+start). A turn's conclusion captures this BEFORE it schedules its
+-    ``turn_end`` refresh and hands it to ``refresh_outcome(concluding_turn=...)``: the refresh then discounts
+-    exactly that turn's not-yet-released evidence, while a turn that started afterwards (different token) is
+-    still a live turn. Callers treat a failed capture as nothing to discount."""
+-    with _db_scope(db) as handle:
+-        return frozenset(_live_turn_tokens(handle, _tip(handle, sid)))
++def marker_identity(marker: Optional[dict]) -> str:
++    """[daveey] Identity of one TUI turn marker (writer pid + its own ``started_at``); a newer turn's marker under
++    the same key has a different one."""
++    marker = marker or {}
++    return f"marker:{marker.get('writer_pid')}:{marker.get('started_at')}"
++
++
++def turn_identity(*, marker: Optional[dict] = None, lease_holder: Optional[str] = None,
++                  gateway_token: Optional[str] = None) -> frozenset[str]:
++    """[daveey] The concluding turn's OWN live-turn evidence, built only from handles that turn holds: the TUI
++    marker it recorded (read back right after it was written), its turn-lease holder (unique per turn) and its
++    gateway ``active_turn_token`` (a uuid per turn). Never a snapshot of what the chat holds at conclusion: that
++    would also take a newer or concurrent turn's evidence (PR1131 review t_01a1d0ca50bdd065). Passed to
++    ``refresh_outcome(concluding_turn=...)``; any evidence not named here is a live turn."""
++    tokens = set()
++    if marker:
++        tokens.add(marker_identity(marker))
++    if lease_holder:
++        tokens.add(f"lease:{lease_holder}")
++    if gateway_token:
++        tokens.add(f"gateway:{gateway_token}")
++    return frozenset(tokens)
+ 
+ 
+ def refresh_outcome(sid: str, trigger: str, *, db: Any = None,
+                     concluding_turn: Optional[Iterable[str]] = None) -> dict[str, Any]:
+     """Derive, write when it changed, and return the outcome now stored. ``concluding_turn``: the
+-    ``capture_turn_identity`` of the turn whose conclusion is refreshing (``turn_end``): only that turn's own
++    ``turn_identity`` of the turn whose conclusion is refreshing (``turn_end``): only that turn's own
+     evidence is not a live turn; any other live turn derives ``running``."""
+     if trigger not in TRIGGERS:
+         raise ValueError(f"unknown outcome trigger {trigger!r}")
+diff --git a/tests/hermes_state/test_outcome_late_turn_end_refresh.py b/tests/hermes_state/test_outcome_late_turn_end_refresh.py
+index 2644bd0691..e27a1d3bc9 100644
+--- a/tests/hermes_state/test_outcome_late_turn_end_refresh.py
++++ b/tests/hermes_state/test_outcome_late_turn_end_refresh.py
+@@ -1,9 +1,15 @@
+-"""A turn-end refresh that runs late must not paint over a newer turn. [daveey]
+-
+-PR1131 review (t_01a1ce099f1c7723): the gateway runs its turn-end refresh on an unawaited thread and the TUI's
+-refused-turn timer refreshes seconds later. Both used to skip every live turn, so a turn that started in between
+-was overwritten with a non-running outcome. The concluding turn now captures its own evidence when it concludes
+-(``capture_turn_identity``) and only that evidence is discounted.
++"""A turn-end refresh discounts only the concluding turn's OWN live-turn evidence. [daveey]
++
++PR1131 reviews:
++- t_01a1ce099f1c7723 (a007a31d): the gateway runs its turn-end refresh on an unawaited thread and the TUI's
++  refused-turn timer refreshes seconds later; both skipped every live turn, so a turn that started in between was
++  overwritten with a non-running outcome.
++- t_01a1d0ca50bdd065 (ce343627): capturing "every live evidence the chat holds" at conclusion still took a newer
++  TUI turn's marker (the TUI captured after ``settle_prompt_state`` admitted it) and a concurrent Desktop turn's
++  marker (the gateway captured it while that turn waited on the lease).
++
++The concluding turn now names its evidence from handles only it holds (``turn_identity``: the marker it recorded,
++read back at once; its lease holder; its gateway ``active_turn_token``). Anything else live is a live turn.
+ """
+ 
+ from __future__ import annotations
+@@ -18,19 +24,20 @@ from types import SimpleNamespace
+ import pytest
+ 
+ import hermes_state_outcome as so
++from gateway.turn_outcome import concluding_turn_identity as gateway_identity
+ from gateway.turn_outcome import refresh_gateway_turn_outcome
+ from tests.hermes_state import test_outcome_turn_end_declaration as helpers
+ 
+ from tests.waiting import wait_until
+-from tui_gateway.turn_marker import clear_turn_marker, record_turn_start
+-
++from tui_gateway.turn_marker import clear_turn_marker, read_turn_marker, record_turn_start
+ 
+ db = helpers.db
+ KINDS = ["routing", "lease", "marker"]
+ 
+ 
+ class Turns:
+-    """Begin/end one kind of live-turn evidence for chat ``chat`` (a gateway routing token, a turn lease, a TUI marker)."""
++    """Begin/end one kind of live-turn evidence for chat ``chat`` (a gateway routing token, a turn lease, a TUI
++    marker). ``begin`` returns the handle the turn that owns it holds (token, holder, marker read back)."""
+ 
+     def __init__(self, db, kind, monkeypatch):
+         self.db, self.kind = db, kind
+@@ -41,12 +48,14 @@ class Turns:
+             self.db.save_gateway_routing_entry("route", json.dumps({
+                 "session_id": "chat", "active_turn_token": f"tok-{n}",
+                 "active_turn_started_at": datetime.now(UTC).isoformat()}))
+-        elif self.kind == "lease":
++            return f"tok-{n}"
++        if self.kind == "lease":
+             assert self.db.try_acquire_session_turn_lease("chat", f"turn-{n}", ttl_seconds=300.0)
+-        else:
+-            t0 = time.time()  # a new marker carries a new start time
+-            wait_until(lambda: time.time() > t0 + 0.02, timeout=2.0)
+-            assert record_turn_start(self.db.db_path.parent, "chat", f"prompt {n}")
++            return f"turn-{n}"
++        t0 = time.time()  # a new marker carries a new start time
++        wait_until(lambda: time.time() > t0 + 0.02, timeout=2.0)
++        assert record_turn_start(self.db.db_path.parent, "chat", f"prompt {n}")
++        return read_turn_marker(self.db.db_path.parent, "chat")
+ 
+     def end(self, n):
+         if self.kind == "routing":
+@@ -56,6 +65,18 @@ class Turns:
+         else:
+             clear_turn_marker(self.db.db_path.parent, "chat")
+ 
++    def identity(self, handle):
++        key = {"routing": "gateway_token", "lease": "lease_holder", "marker": "marker"}[self.kind]
++        return so.turn_identity(**{key: handle})
++
++
++def _gateway(db, *, token=None, holder=None):
++    """A runner whose session state holds the turn's agent, and the turn's event (it owns the routing token)."""
++    agent = SimpleNamespace(_last_session_turn_lease_holder=holder)
++    state = SimpleNamespace(turn=SimpleNamespace(agent=agent))
++    runner = SimpleNamespace(_session_db=db, _session_state=lambda key: state)
++    return runner, SimpleNamespace(_gateway_active_turn_token=token)
++
+ 
+ def _gate_refresh(monkeypatch):
+     entered, release = threading.Event(), threading.Event()
+@@ -74,13 +95,53 @@ def _next_turn_starts(db):
+     db.append_message("chat", role="user", content="start the next task", timestamp=time.time() + 1)
+ 
+ 
++def _tui_scope(monkeypatch, db):
++    from tui_gateway import server
++
++    monkeypatch.setattr(server, "_session_profile_runtime_scope", lambda s: contextlib.nullcontext(), raising=False)
++    monkeypatch.setattr(server, "_session_db", lambda s: contextlib.nullcontext(db), raising=False)
++
++
++# ── identity ─────────────────────────────────────────────────────────────────
++
++
+ @pytest.mark.parametrize("kind", KINDS)
++def test_the_named_identity_is_exactly_what_the_store_reads_live(db, monkeypatch, kind):
++    """``turn_identity`` built from the owner's handle matches the token derivation reads, and a later turn of
++    the same kind has a different one."""
++    turns = Turns(db, kind, monkeypatch)
++    first = turns.identity(turns.begin(1))
++    try:
++        assert set(so._live_turn_tokens(db, "chat")) == set(first)
++        assert not so._live_turn(db, "chat", first)
++    finally:
++        turns.end(1)
++    second = turns.identity(turns.begin(2))
++    try:
++        assert second.isdisjoint(first)
++        assert so._live_turn(db, "chat", first)
++    finally:
++        turns.end(2)
++
++
++def test_turn_identity_names_nothing_without_handles():
++    assert so.turn_identity() == frozenset()
++    assert so.turn_identity(marker=None, lease_holder="", gateway_token=None) == frozenset()
++    assert so.turn_identity(lease_holder="h", gateway_token="t") == {"lease:h", "gateway:t"}
++
++
++# ── gateway entry path ───────────────────────────────────────────────────────
++
++
++@pytest.mark.parametrize("kind", ["routing", "lease"])
+ def test_a_late_gateway_refresh_keeps_the_newer_turn_running(db, monkeypatch, kind):
++    """Red on a007a31d (blanket ignore_live_turn): the late refresh stored unresolved/interrupted."""
+     turns = Turns(db, kind, monkeypatch)
+     helpers._declare_then_reply(db)
+-    turns.begin(1)  # the concluding turn's evidence, not yet released
++    own = turns.begin(1)  # the concluding gateway turn's evidence, not yet released
++    runner, event = _gateway(db, token=own if kind == "routing" else None, holder=own if kind == "lease" else None)
+     entered, release = _gate_refresh(monkeypatch)
+-    thread = refresh_gateway_turn_outcome(SimpleNamespace(_session_db=db), SimpleNamespace(session_id="chat"))
++    thread = refresh_gateway_turn_outcome(runner, SimpleNamespace(session_id="chat"), event, "key")
+     assert entered.wait(10)
+     try:
+         turns.end(1)
+@@ -99,13 +160,14 @@ def test_a_late_gateway_refresh_keeps_the_newer_turn_running(db, monkeypatch, ki
+         turns.end(2)
+ 
+ 
+-@pytest.mark.parametrize("kind", KINDS)
++@pytest.mark.parametrize("kind", ["routing", "lease"])
+ def test_a_gateway_refresh_still_discounts_its_own_unreleased_turn(db, monkeypatch, kind):
+     turns = Turns(db, kind, monkeypatch)
+     helpers._declare_then_reply(db)
+-    turns.begin(1)
++    own = turns.begin(1)
++    runner, event = _gateway(db, token=own if kind == "routing" else None, holder=own if kind == "lease" else None)
+     try:
+-        thread = refresh_gateway_turn_outcome(SimpleNamespace(_session_db=db), SimpleNamespace(session_id="chat"))
++        thread = refresh_gateway_turn_outcome(runner, SimpleNamespace(session_id="chat"), event, "key")
+         thread.join(10)
+         stored = so.get_outcome("chat", db=db)
+         assert (stored["kind"], stored["source"]) == ("waiting", "declared"), stored
+@@ -113,9 +175,42 @@ def test_a_gateway_refresh_still_discounts_its_own_unreleased_turn(db, monkeypat
+         turns.end(1)
+ 
+ 
++def test_the_gateway_never_names_a_concurrent_desktop_turns_marker(db, monkeypatch):
++    """Review t_01a1d0ca50bdd065 repro 2: a Desktop/TUI turn for the same chat records its marker and waits on the
++    lease the gateway turn holds. The gateway names only its own lease; the late refresh sees the TUI turn live."""
++    monkeypatch.setattr(so, "_gateway_running", lambda home: True)
++    helpers._declare_then_reply(db)
++    assert db.try_acquire_session_turn_lease("chat", "gateway-turn", ttl_seconds=300.0)
++    db.append_message("chat", role="user", content="tui prompt", timestamp=time.time() + 1)
++    record_turn_start(db.db_path.parent, "chat", "tui prompt")  # TUI turn admitted, waiting on the lease
++    runner, event = _gateway(db, holder="gateway-turn")
++    assert not any(t.startswith("marker:") for t in gateway_identity(runner, event, "key"))
++    entered, release = _gate_refresh(monkeypatch)
++    thread = refresh_gateway_turn_outcome(runner, SimpleNamespace(session_id="chat"), event, "key")
++    assert entered.wait(10)
++    try:
++        db.release_session_turn_lease("chat", "gateway-turn")  # gateway turn ends; TUI turn still live
++        release.set()
++        thread.join(10)
++        stored = so.get_outcome("chat", db=db)
++        assert stored["kind"] == "running", stored
++    finally:
++        release.set()
++        thread.join(10)
++        clear_turn_marker(db.db_path.parent, "chat")
++
++
++def test_the_gateway_names_its_agents_lease_and_its_events_token(db):
++    runner, event = _gateway(db, token="tok-x", holder="pid=1:turn=a")
++    assert gateway_identity(runner, event, "key") == {"gateway:tok-x", "lease:pid=1:turn=a"}
++    assert gateway_identity(SimpleNamespace(), None, None) == frozenset()  # nothing found: nothing discounted
++    broken = SimpleNamespace(_session_state=lambda key: (_ for _ in ()).throw(KeyError(key)))
++    assert gateway_identity(broken, SimpleNamespace(_gateway_active_turn_token="t"), "key") == {"gateway:t"}
++
++
+ @pytest.mark.parametrize("kind", KINDS)
+ def test_a_failed_capture_discounts_nothing(db, monkeypatch, kind):
+-    """No evidence captured = no bypass: a live turn is running, as before this PR."""
++    """No evidence named = no bypass: a live turn is running, as before this PR."""
+     turns = Turns(db, kind, monkeypatch)
+     helpers._declare_then_reply(db)
+     turns.begin(1)
+@@ -123,24 +218,76 @@ def test_a_failed_capture_discounts_nothing(db, monkeypatch, kind):
+         assert so.refresh_outcome("chat", "turn_end", db=db, concluding_turn=frozenset())["kind"] == "running"
+         assert so.refresh_outcome("chat", "turn_end", db=db)["kind"] == "running"
+         assert so.refresh_outcome("chat", "turn_end", db=db, concluding_turn=["marker:1:2"])["kind"] == "running"
++        thread = refresh_gateway_turn_outcome(SimpleNamespace(_session_db=db), SimpleNamespace(session_id="chat"))
++        thread.join(10)
++        assert so.get_outcome("chat", db=db)["kind"] == "running"
+     finally:
+         turns.end(1)
+ 
+ 
+-def test_capture_turn_identity_names_each_kind_of_evidence(db, monkeypatch):
+-    for kind, prefix in (("routing", "gateway:"), ("lease", "lease:"), ("marker", "marker:")):
+-        turns = Turns(db, kind, monkeypatch)
+-        assert so.capture_turn_identity("chat", db=db) == frozenset()
+-        turns.begin(1)
+-        first = so.capture_turn_identity("chat", db=db)
+-        assert len(first) == 1 and next(iter(first)).startswith(prefix)
+-        turns.end(1)
+-        turns.begin(2)
+-        assert so.capture_turn_identity("chat", db=db).isdisjoint(first)  # a later turn has its own identity
++# ── TUI turn-end entry path ──────────────────────────────────────────────────
++
++
++def test_the_tui_turn_end_refresh_after_settle_keeps_a_newer_turn_running(db, monkeypatch):
++    """Review t_01a1d0ca50bdd065 repro 1: prompt_turn.run_body settles (a new prompt can be admitted and record its
++    marker under the same key) before its finally-path refresh. The concluding turn names the marker it recorded,
++    not the newer one now on disk."""
++    from tui_gateway import turn_outcome as tui
++
++    _tui_scope(monkeypatch, db)
++    helpers._declare_then_reply(db)
++    turns = Turns(db, "marker", monkeypatch)
++    own = turns.begin(1)  # the concluding turn's marker, read back when it was recorded
++    turns.end(1)  # _retire_turn_marker
++    _next_turn_starts(db)
++    turns.begin(2)  # the newer turn admitted after settle
++    agent = SimpleNamespace(session_id="chat", _last_session_turn_lease_holder="turn-1")
++    try:
++        assert so.derive_outcome("chat", db=db)["kind"] == "running"
++        tui.refresh_turn_outcome({"session_key": "chat"}, agent, tui.concluding_turn_identity(agent, own))
++        stored = so.get_outcome("chat", db=db)
++        assert stored["kind"] == "running", stored
++        tui.refresh_turn_outcome({"session_key": "chat"})  # nothing named: still running
++        assert so.get_outcome("chat", db=db)["kind"] == "running"
++    finally:
+         turns.end(2)
+ 
+ 
+-# ── TUI / auto-continue entry path ──────────────────────────────────────────
++@pytest.mark.parametrize("kind", ["marker", "lease"])
++def test_the_tui_turn_end_discounts_its_own_unreleased_evidence(db, monkeypatch, kind):
++    from tui_gateway import turn_outcome as tui
++
++    _tui_scope(monkeypatch, db)
++    helpers._declare_then_reply(db)
++    turns = Turns(db, kind, monkeypatch)
++    own = turns.begin(1)
++    agent = SimpleNamespace(session_id="chat",
++                            _last_session_turn_lease_holder=own if kind == "lease" else None)
++    try:
++        tui.refresh_turn_outcome({"session_key": "chat"}, agent,
++                                 tui.concluding_turn_identity(agent, own if kind == "marker" else None))
++        stored = so.get_outcome("chat", db=db)
++        assert (stored["kind"], stored["source"]) == ("waiting", "declared"), stored
++    finally:
++        turns.end(1)
++
++
++def test_own_turn_marker_reads_back_what_the_turn_recorded(db):
++    from tui_gateway import turn_outcome as tui
++
++    home = db.db_path.parent
++    session = {"session_key": "chat", "profile_home": str(home)}
++    assert tui.own_turn_marker(session, "") is None
++    assert tui.own_turn_marker(session, "chat") is None
++    record_turn_start(home, "chat", "prompt")
++    try:
++        own = tui.own_turn_marker(session, "chat")
++        assert so.turn_identity(marker=own) == set(so._live_turn_tokens(db, "chat"))
++    finally:
++        clear_turn_marker(home, "chat")
++
++
++# ── TUI refused-turn auto-continue timer entry path ──────────────────────────
+ 
+ 
+ @pytest.fixture
+@@ -160,26 +307,25 @@ def timers(monkeypatch):
+     return fired
+ 
+ 
+-def _arm_refused_retry(db, monkeypatch, timers):
++def _arm_refused_retry(db, monkeypatch, timers, concluding):
+     from tui_gateway import server
+ 
+     monkeypatch.setattr(server, "_hermes_home", db.db_path.parent)
+-    monkeypatch.setattr(server, "_session_profile_runtime_scope", lambda s: contextlib.nullcontext(), raising=False)
+-    monkeypatch.setattr(server, "_session_db", lambda s: contextlib.nullcontext(db), raising=False)
++    _tui_scope(monkeypatch, db)
+     monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *a: None)
+     monkeypatch.setattr("tui_gateway.update_pause._detect_skew", lambda: None)
+     session = {"session_key": "chat", "agent": None, "_refused_turn_delay": 45.0}
+-    server._schedule_refused_turn_retry("chat", session, "retry-marker-key")
++    server._schedule_refused_turn_retry("chat", session, "retry-marker-key", concluding)
+     assert len(timers) == 1
+     return timers[0]
+ 
+ 
+-@pytest.mark.parametrize("kind", ["routing", "lease"])
++@pytest.mark.parametrize("kind", KINDS)
+ def test_the_refused_turn_timer_keeps_a_newer_turn_running(db, monkeypatch, timers, kind):
+     turns = Turns(db, kind, monkeypatch)
+     helpers._declare_then_reply(db)
+-    turns.begin(1)  # the refused turn, concluding
+-    fire = _arm_refused_retry(db, monkeypatch, timers)
++    own = turns.begin(1)  # the refused turn, concluding
++    fire = _arm_refused_retry(db, monkeypatch, timers, turns.identity(own))
+     turns.end(1)
+     _next_turn_starts(db)
+     turns.begin(2)  # the user's next turn starts during the retry wait
+@@ -192,35 +338,15 @@ def test_the_refused_turn_timer_keeps_a_newer_turn_running(db, monkeypatch, time
+         turns.end(2)
+ 
+ 
+-@pytest.mark.parametrize("kind", ["routing", "lease"])
++@pytest.mark.parametrize("kind", ["lease", "marker"])
+ def test_the_refused_turn_timer_discounts_the_refused_turns_own_evidence(db, monkeypatch, timers, kind):
+     turns = Turns(db, kind, monkeypatch)
+     helpers._declare_then_reply(db)
+-    turns.begin(1)
+-    fire = _arm_refused_retry(db, monkeypatch, timers)
++    own = turns.begin(1)
++    fire = _arm_refused_retry(db, monkeypatch, timers, turns.identity(own))
+     try:
+         fire()  # no newer turn: only the refused turn's own, still unreleased, evidence is present
+         stored = so.get_outcome("chat", db=db)
+         assert (stored["kind"], stored["source"]) == ("waiting", "declared"), stored
+     finally:
+         turns.end(1)
+-
+-
+-def test_the_tui_turn_end_captures_its_own_evidence_when_none_is_passed(db, monkeypatch):
+-    from tui_gateway import server
+-    from tui_gateway import turn_outcome as tui
+-
+-    turns = Turns(db, "lease", monkeypatch)
+-    helpers._declare_then_reply(db)
+-    monkeypatch.setattr(server, "_session_profile_runtime_scope", lambda s: contextlib.nullcontext(), raising=False)
+-    monkeypatch.setattr(server, "_session_db", lambda s: contextlib.nullcontext(db), raising=False)
+-    turns.begin(1)
+-    try:
+-        tui.refresh_turn_outcome({"session_key": "chat"})
+-        stored = so.get_outcome("chat", db=db)
+-        assert (stored["kind"], stored["source"]) == ("waiting", "declared"), stored
+-        assert tui.capture_concluding_turn({"session_key": "chat"}) == so.capture_turn_identity("chat", db=db)
+-    finally:
+-        turns.end(1)
+-    assert tui.capture_concluding_turn({"session_key": ""}) == frozenset()
+-
+diff --git a/tests/hermes_state/test_outcome_turn_end_declaration.py b/tests/hermes_state/test_outcome_turn_end_declaration.py
+index 0a9d1590b2..e6ba77e64c 100644
+--- a/tests/hermes_state/test_outcome_turn_end_declaration.py
++++ b/tests/hermes_state/test_outcome_turn_end_declaration.py
+@@ -12,7 +12,7 @@ import pytest
+ 
+ import hermes_state_outcome as so
+ from hermes_state import SessionDB
+-from tui_gateway.turn_marker import clear_turn_marker, record_turn_start
++from tui_gateway.turn_marker import clear_turn_marker, read_turn_marker, record_turn_start
+ 
+ WAIT = {"kind": "waiting", "on": [{"kind": "card", "id": "t_suite", "label": "Fleet scheduling regression suite"}]}
+ # A reply the heuristic (no judge) reads as a closing summary: without the declaration it derives done.
+@@ -60,7 +60,7 @@ def test_the_turns_own_turn_end_refresh_ignores_its_unreleased_turn(db):
+     home = db.db_path.parent
+     record_turn_start(home, "chat", "is the suite built?")  # the lease/token the concluding turn still holds
+     try:
+-        own = so.capture_turn_identity("chat", db=db)  # what the turn captures when it concludes
++        own = so.turn_identity(marker=read_turn_marker(home, "chat"))  # the marker the turn recorded
+         assert own
+         out = so.refresh_outcome("chat", "turn_end", db=db, concluding_turn=own)
+     finally:
+@@ -96,13 +96,16 @@ def test_a_newer_user_row_still_supersedes_a_carried_declaration(db):
+ 
+ def test_both_turn_end_callers_pass_the_concluding_turn_never_a_blanket_bypass(monkeypatch):
+     """Entry paths: the gateway (messaging/local Desktop runtime) and the TUI turn-end refresh."""
++    from types import SimpleNamespace
++
+     calls = []
+     monkeypatch.setattr(so, "refresh_outcome", lambda sid, trigger, **kw: calls.append((sid, trigger, kw)) or {})
+-    monkeypatch.setattr(so, "capture_turn_identity", lambda sid, db=None: frozenset({"lease:h:1"}))
+     from gateway import turn_outcome as gw
+ 
+-    gw._refresh("chat", object(), gw._capture("chat", object()))
+-    assert calls[-1][1] == "turn_end" and calls[-1][2].get("concluding_turn") == frozenset({"lease:h:1"})
++    agent = SimpleNamespace(_last_session_turn_lease_holder="h")
++    runner = SimpleNamespace(_session_state=lambda key: SimpleNamespace(turn=SimpleNamespace(agent=agent)))
++    gw._refresh("chat", object(), gw.concluding_turn_identity(runner, None, "key"))
++    assert calls[-1][1] == "turn_end" and calls[-1][2].get("concluding_turn") == frozenset({"lease:h"})
+     assert "ignore_live_turn" not in calls[-1][2]
+ 
+     import contextlib
+@@ -111,8 +114,8 @@ def test_both_turn_end_callers_pass_the_concluding_turn_never_a_blanket_bypass(m
+ 
+     monkeypatch.setattr(server, "_session_profile_runtime_scope", lambda s: contextlib.nullcontext(), raising=False)
+     monkeypatch.setattr(server, "_session_db", lambda s: contextlib.nullcontext(object()), raising=False)
+-    tui.refresh_turn_outcome({"session_key": "chat"})
+-    assert calls[-1][1] == "turn_end" and calls[-1][2].get("concluding_turn") == frozenset({"lease:h:1"})
++    tui.refresh_turn_outcome({"session_key": "chat"}, agent, tui.concluding_turn_identity(agent))
++    assert calls[-1][1] == "turn_end" and calls[-1][2].get("concluding_turn") == frozenset({"lease:h"})
+     assert "ignore_live_turn" not in calls[-1][2]
+-    tui.refresh_turn_outcome({"session_key": "chat"}, None, frozenset({"marker:1:2"}))  # a timer's earlier capture
+-    assert calls[-1][2].get("concluding_turn") == frozenset({"marker:1:2"})
++    tui.refresh_turn_outcome({"session_key": "chat"})  # nothing named: nothing discounted
++    assert calls[-1][2].get("concluding_turn") == frozenset()
+diff --git a/tests/tui_gateway/test_update_pause.py b/tests/tui_gateway/test_update_pause.py
+index 18a1799469..9b7f9ff52d 100644
+--- a/tests/tui_gateway/test_update_pause.py
++++ b/tests/tui_gateway/test_update_pause.py
+@@ -52,6 +52,14 @@ def _session(agent=None, **extra):
+ def home(monkeypatch, tmp_path):
+     monkeypatch.setattr(server, "_hermes_home", tmp_path)
+     monkeypatch.setattr(server, "_load_cfg", lambda: CFG)
++    # [daveey] A turn's end refresh derives the chat's outcome past its own marker and reads the chat's cards.
++    # With Thread inlined process-wide (turn_env, schedule_env) the remote-links worker loop
++    # (kanban_links_refresh._run) would run forever on the test thread (CI: 600 s file timeout): keep the card
++    # sources local and empty.
++    from hermes_cli import kanban_session_activity as ksa
++    monkeypatch.setattr(ksa, "_board_db_paths", list)
++    monkeypatch.setattr(ksa, "_remote_cards", lambda *a, **k: [])
++    ksa._reset_cache_for_tests()
+     return tmp_path
+ 
+ 
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 4df556f453..ad01a03de1 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -666,6 +666,9 @@ class _TurnRun:
+     error_detail: str = ""
+     prompt_text: str = ""
+     marker_key: str = ""
++    # [daveey] The marker this turn recorded, read back at once: its identity is the only marker evidence the
++    # turn-end outcome refresh may discount (tui_gateway/turn_outcome.concluding_turn_identity).
++    own_marker: Any = None
+     display_kind: Any = None
+     receipt_attempted: bool = False
+     # [daveey] An automation turn (kanban_notice, process_complete): its display metadata and the one replay plan
+@@ -1410,6 +1413,8 @@ def _run_admitted_prompt(
+             receipt_committed=terminal_callback is None)
+         st.marker_key = _record_turn_marker(session, text, auto_continue=auto_continue and terminal_callback is None,
+             notification_category=(display_metadata or {}).get("notification_category"))
++        from tui_gateway.turn_outcome import own_turn_marker
++        st.own_marker = own_turn_marker(session, st.marker_key)
+         st.display_kind = display_kind
+         st.display_metadata = display_metadata
+         from tui_gateway import automation_replay  # [daveey] a failed automation turn's copy and its one replay
+@@ -1450,7 +1455,9 @@ def _run_admitted_prompt(
+                 _emit("message.complete", sid, payload)
+                 if paused_for_update:
+                     update_pause.start_in_place_watcher(sid, session, st.marker_key)
+-            _schedule_refused_turn_retry(sid, session, st.marker_key)
++            from tui_gateway.turn_outcome import concluding_turn_identity
++            _schedule_refused_turn_retry(sid, session, st.marker_key,
++                                         concluding_turn_identity(st.agent, st.own_marker))
+             if status == "complete":
+                 # [daveey] This turn's context carried any failed delivery already in the transcript.
+                 automation_replay.cancel_carried(st.marker_key, str(session.get("session_key") or ""))
+@@ -1512,8 +1519,9 @@ def _run_admitted_prompt(
+                 _emit_settled_session_info(sid, session, st.agent)
+             finally:
+                 try:
+-                    from tui_gateway.turn_outcome import refresh_turn_outcome  # [daveey] every conclusion,
+-                    refresh_turn_outcome(session, st.agent)  # before the profile scope resets
++                    from tui_gateway.turn_outcome import (  # [daveey] every conclusion, before the profile
++                        concluding_turn_identity, refresh_turn_outcome)  # scope resets; only its own evidence
++                    refresh_turn_outcome(session, st.agent, concluding_turn_identity(st.agent, st.own_marker))
+                     _post_turn_housekeeping(sid, session, st)
+                 finally:
+                     _rearm_carried_pause_watcher(sid, session, st)
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 503a105dd5..812eec7984 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -116,18 +116,16 @@ def _hold_refused_turn(session: dict, marker_key: str, display_kind, error_surfa
+                    _auto_continue_retry_after=time.monotonic() + delay - 1.0)
+ 
+ 
+-def _schedule_refused_turn_retry(sid: str, session: dict, marker_key: str) -> None:
++def _schedule_refused_turn_retry(sid: str, session: dict, marker_key: str,
++                                 concluding: frozenset = frozenset()) -> None:
+     """Start the wait ``_hold_refused_turn`` armed. A skewed backend leaves the marker for its replacement's boot
+-    sweep; a replay that can no longer run (the marker aged out) settles the chat's outcome."""
++    sweep; a replay that can no longer run (the marker aged out) settles the chat's outcome. ``concluding``: the
++    refused turn's own evidence (``turn_outcome.concluding_turn_identity``); a turn the user starts during the wait
++    is a live turn the refresh must not paint over."""
+     delay = session.pop("_refused_turn_delay", None)
+     if delay is None:
+         return
+ 
+-    # [daveey] The refused turn's own evidence, taken when it concluded: a turn the user starts during the wait is
+-    # a live turn the refresh must not paint over.
+-    from tui_gateway.turn_outcome import capture_concluding_turn
+-    concluding = capture_concluding_turn(session, session.get("agent"))
+-
+     def fire() -> None:
+         from tui_gateway.update_pause import _detect_skew
+         if _detect_skew() is not None:
+diff --git a/tui_gateway/turn_outcome.py b/tui_gateway/turn_outcome.py
+index e1ea9a71fc..8f10f3a44b 100644
+--- a/tui_gateway/turn_outcome.py
++++ b/tui_gateway/turn_outcome.py
+@@ -17,32 +17,44 @@ def _turn_sid(session: dict, agent=None) -> str:
+     return str(getattr(agent, "session_id", "") or session.get("session_key") or "")
+ 
+ 
+-def capture_concluding_turn(session: dict, agent=None) -> frozenset:
+-    """The concluding turn's own live-turn evidence (marker, turn lease), taken now. A refresh that runs later
+-    (a timer) passes it back so a turn started in between stays a live turn. Failure discounts nothing."""
+-    sid = _turn_sid(session, agent)
+-    if not sid:
+-        return frozenset()
++def own_turn_marker(session: dict, marker_key: str) -> Optional[dict]:
++    """The marker this turn just recorded, read back right after ``record_turn_start`` (before any other turn of
++    the chat can overwrite the key). Its identity is what the turn-end refresh may discount, nothing later."""
++    if not marker_key:
++        return None
+     try:
+-        from hermes_state_outcome import capture_turn_identity
+         from tui_gateway import server  # split helpers only work rebound onto server globals (bind_module)
++        from tui_gateway.turn_marker import read_turn_marker
+ 
+-        with server._session_profile_runtime_scope(session), server._session_db(session) as db:
+-            return capture_turn_identity(sid, db=db) if db is not None else frozenset()
+-    except Exception:  # health: allow BLE001 -- best-effort; an unreadable store discounts nothing
+-        logger.warning("turn identity capture failed for %s", sid, exc_info=True)
++        return read_turn_marker(server._session_home(session), marker_key)
++    except Exception:  # health: allow BLE001 -- unreadable = not named, so the marker reads live (fail safe)
++        logger.debug("own turn marker read failed for %s", marker_key, exc_info=True)
++        return None
++
++
++def concluding_turn_identity(agent=None, marker: Optional[dict] = None) -> frozenset:
++    """The concluding TUI turn's OWN evidence: the marker it recorded (``own_turn_marker``) and its agent's
++    turn-lease holder. Never a snapshot of what the chat holds now: a turn admitted after ``settle_prompt_state``,
++    or a concurrent turn's marker or routing token, stays a live turn. Nothing named = nothing discounted."""
++    try:
++        from hermes_state_outcome import turn_identity
++
++        holder = getattr(agent, "_last_session_turn_lease_holder", None)
++        return turn_identity(marker=marker if isinstance(marker, dict) else None,
++                             lease_holder=holder if isinstance(holder, str) else None)
++    except Exception:  # health: allow BLE001 -- best-effort; nothing named discounts nothing
++        logger.warning("turn identity capture failed", exc_info=True)
+         return frozenset()
+ 
+ 
+ def refresh_turn_outcome(session: dict, agent=None, concluding_turn: Optional[frozenset] = None) -> None:
+     """Refresh the outcome of the row this turn wrote (the agent's compression tip, else the session key).
+-    ``concluding_turn``: evidence captured when the turn concluded (``capture_concluding_turn``); omitted = the
+-    turn is concluding right now and its evidence is captured here, in the same store scope."""
++    ``concluding_turn``: the turn's own evidence (``concluding_turn_identity``); omitted = nothing discounted."""
+     sid = _turn_sid(session, agent)
+     if not sid:
+         return
+     try:
+-        from hermes_state_outcome import capture_turn_identity, refresh_outcome
++        from hermes_state_outcome import refresh_outcome
+         from tui_gateway import server  # split helpers only work rebound onto server globals (bind_module)
+ 
+         # The turn has already released its secret scope (the home override alone
+@@ -50,8 +62,6 @@ def refresh_turn_outcome(session: dict, agent=None, concluding_turn: Optional[fr
+         # context threads: bind the owning session's full runtime scope again.
+         with server._session_profile_runtime_scope(session), server._session_db(session) as db:
+             if db is not None:
+-                if concluding_turn is None:
+-                    concluding_turn = capture_turn_identity(sid, db=db)
+-                refresh_outcome(sid, "turn_end", db=db, concluding_turn=concluding_turn)
++                refresh_outcome(sid, "turn_end", db=db, concluding_turn=concluding_turn or frozenset())
+     except Exception:  # health: allow BLE001 -- the turn already concluded; a failed refresh is logged
+         logger.warning("turn-end outcome refresh failed for %s", sid, exc_info=True)
+-- 
+2.51.0
+

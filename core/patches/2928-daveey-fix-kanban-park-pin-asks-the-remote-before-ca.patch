@@ -1,0 +1,152 @@
+From 82b88332ade1d22f96cd1b9cf44b48b2f7b3225e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:18:19 +0000
+Subject: [PATCH] [daveey] fix(kanban): park pin asks the remote before calling
+ pushed work unpushed
+
+A worker that pushes by URL (git push https://...git HEAD:wt/x) leaves
+refs/remotes/origin/* at the old tip, and a server-side update-branch
+then moves the branch past HEAD. The park's local check called that
+'unpushed commits' and pinned the pool card to machine:<worker>; on
+11-12 t_01a1d0a1eaa00371 sat ready on machine:worker-2 while worker-2
+was on a Board hold (hub-pin sweep slug resume-pinned-to-held-worker).
+
+tree_state now re-checks a local 'unpushed' verdict against the remote:
+HEAD is a remote branch tip, or a stale tracking ref HEAD builds on,
+refreshed from the remote, contains HEAD. Fails toward pinning.
+---
+ hermes_cli/kanban_move_pool.py             | 50 +++++++++++++++++++++-
+ tests/hermes_cli/test_kanban_pool_queue.py | 42 ++++++++++++++++++
+ 2 files changed, 91 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_move_pool.py b/hermes_cli/kanban_move_pool.py
+index 7422575f0c..dc82014994 100644
+--- a/hermes_cli/kanban_move_pool.py
++++ b/hermes_cli/kanban_move_pool.py
+@@ -12,6 +12,7 @@ from __future__ import annotations
+ 
+ import json
+ import re
++import subprocess
+ from pathlib import Path
+ from typing import Any, Iterable, Mapping, Optional
+ 
+@@ -95,6 +96,53 @@ def card_trees(task_id: Optional[str], path: Optional[str], text: Optional[str]
+     return out[:_MAX_TREES]
+ 
+ 
++_REMOTE_TIMEOUT = 20
++_MAX_ANCESTRY_CHECKS = 50
++_MAX_REFRESHES = 5
++
++
++def pushed_on_remote(tree: str) -> bool:
++    """Whether a tree the local refs call unpushed has HEAD on a remote branch after all. Fails toward False.
++
++    ``git push https://github.com/<o>/<r>.git HEAD:wt/x`` (a URL, not the remote's name: the HTTPS-credential push
++    workers use) leaves ``refs/remotes/origin/wt/x`` at the old tip, and a server-side ``update-branch`` moves the
++    branch past HEAD again. The local check then reports pushed work as unpushed, and the park pinned a card to
++    its worker (11-12: t_01a1d0a1eaa00371 sat ready on ``machine:worker-2`` while worker-2 was on a Board hold).
++    So ask the remote: HEAD is a remote branch tip, or a stale tracking ref HEAD builds on, once refreshed from
++    the remote, contains HEAD."""
++    from hermes_cli.worktree_ops import _git_out, _worktree_has_unpushed_commits
++    try:
++        head = _git_out(["rev-parse", "HEAD"], tree)
++        remotes = (_git_out(["remote"], tree) or "").split()
++        if not head or not remotes:
++            return False
++        stale: list[tuple[str, str, str]] = []
++        checks = 0
++        for remote in remotes:
++            listing = _git_out(["ls-remote", "--heads", remote], tree, timeout=_REMOTE_TIMEOUT)
++            if not listing:
++                continue
++            tracked = dict(line.split(" ", 1)[::-1] for line in (_git_out(
++                ["for-each-ref", "--format=%(objectname) %(refname)", f"refs/remotes/{remote}"], tree) or ""
++            ).splitlines() if " " in line)
++            for line in listing.splitlines():
++                sha, _, ref = line.partition("\t")
++                if sha == head:
++                    return True
++                tracking = f"refs/remotes/{remote}/{ref[len('refs/heads/'):]}"
++                local = tracked.get(tracking)
++                if not local or local == sha or checks >= _MAX_ANCESTRY_CHECKS:
++                    continue
++                checks += 1
++                if _git_out(["merge-base", "--is-ancestor", local, "HEAD"], tree) is not None:
++                    stale.append((remote, ref, tracking))
++        for remote, ref, tracking in stale[:_MAX_REFRESHES]:
++            _git_out(["fetch", "--no-tags", "-q", remote, f"+{ref}:{tracking}"], tree, timeout=_REMOTE_TIMEOUT)
++        return bool(stale) and not _worktree_has_unpushed_commits(tree)
++    except (OSError, subprocess.SubprocessError, ValueError):
++        return False
++
++
+ def tree_state(trees: Iterable[str]) -> Optional[str]:
+     """``dirty worktree <p>`` / ``unpushed commits in <p>`` for the first tree with state, else None."""
+     from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
+@@ -103,7 +151,7 @@ def tree_state(trees: Iterable[str]) -> Optional[str]:
+             continue
+         if _worktree_is_dirty(tree, tree):
+             return f"dirty worktree {tree}"
+-        if _worktree_has_unpushed_commits(tree):
++        if _worktree_has_unpushed_commits(tree) and not pushed_on_remote(tree):
+             return f"unpushed commits in {tree}"
+     return None
+ 
+diff --git a/tests/hermes_cli/test_kanban_pool_queue.py b/tests/hermes_cli/test_kanban_pool_queue.py
+index 43ea2c142b..db0d7785ad 100644
+--- a/tests/hermes_cli/test_kanban_pool_queue.py
++++ b/tests/hermes_cli/test_kanban_pool_queue.py
+@@ -307,6 +307,48 @@ def test_park_keeps_a_pushed_card_on_the_pool_and_pins_only_unpushed_state(w2, t
+     assert [k for k, _ in _placement_events(conn, tid)] == ["pool_pinned", "pool_unpinned"]
+ 
+ 
++def test_park_keeps_work_pushed_by_url_on_the_pool_even_after_the_remote_branch_moved(w2, tmp_path, monkeypatch):
++    """11-12: t_01a1d0a1eaa00371 pushed its fix with ``git push https://...git HEAD:wt/...`` (a URL, so origin/*
++    stayed at the old tip) and a server-side update-branch then moved the branch past it. The park called that
++    "unpushed commits", pinned the card to machine:worker-2, and it sat ready while worker-2 was on a Board hold."""
++    from tools import kanban_tools as kt
++    conn = w2.conn
++    tid = kb.create_task(conn, title="pool card pushed by url", assignee="default", runs_on=[POOL])
++    tree = _pushed_clone(tmp_path, tmp_path / "code" / "_wt" / "url-push")
++    remote = str(tmp_path / "url-push-remote.git")
++    _git(tree, "fetch", "-q", "origin")  # origin/wt/x tracks the pushed tip
++    _commit(tree, "b.txt")
++    _git(tree, "push", "-q", remote, "HEAD:refs/heads/wt/x")  # by URL: origin/wt/x stays behind HEAD
++    other = tmp_path / "other"
++    _git(tmp_path, "clone", "-q", "-b", "wt/x", remote, str(other))
++    _commit(other, "merge-from-base.txt")  # GitHub's update-branch: the remote branch moves past HEAD
++    _git(other, "push", "-q", "origin", "HEAD:refs/heads/wt/x")
++
++    _run(w2, monkeypatch, tid)
++    out = json.loads(kt._handle_block({"kind": "time", "clock_only": True, "reason": (
++        f"SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting on review; fix pushed from {tree}")}))
++    assert out.get("ok"), out
++    assert _runs_on(conn, tid) == [POOL] and _placement_events(conn, tid) == []
++
++    # A commit no remote branch holds still pins, even with a stale tracking ref around.
++    _run(w2, monkeypatch, tid)
++    _commit(tree, "c.txt")
++    out = json.loads(kt._handle_block({"kind": "time", "clock_only": True, "reason": (
++        f"SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting on review; c.txt only in {tree}")}))
++    assert out.get("ok"), out
++    assert _runs_on(conn, tid) == ["machine:worker-2"]
++    assert _placement_events(conn, tid)[-1][1]["unpushed_state"] == f"unpushed commits in {tree.resolve()}"
++
++
++def test_a_head_that_is_a_remote_branch_tip_counts_as_pushed(tmp_path):
++    from hermes_cli import kanban_move_pool as kmp
++    tree = _pushed_clone(tmp_path, tmp_path / "tip")
++    _commit(tree, "b.txt")
++    assert kmp.tree_state([str(tree)]) == f"unpushed commits in {tree}"
++    _git(tree, "push", "-q", str(tmp_path / "tip-remote.git"), "HEAD:refs/heads/wt/new")  # new branch, by URL
++    assert kmp.tree_state([str(tree)]) is None
++
++
+ def test_park_pins_a_dirty_tree_found_by_its_owner_marker(w2, tmp_path, monkeypatch):
+     from tools import kanban_tools as kt
+     conn = w2.conn
+-- 
+2.51.0
+

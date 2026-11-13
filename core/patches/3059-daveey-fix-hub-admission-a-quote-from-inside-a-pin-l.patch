@@ -1,0 +1,220 @@
+From 50f0b11c1d967d965f0e1a5d1e0b9fe333620238 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 01:03:54 +0000
+Subject: [PATCH] [daveey] fix(hub-admission): a quote from inside a pin line
+ is self-assertion; relayed denies carry its why
+
+Review follow-ups to PR #1678 (card t_01a1d11dd67571c4):
+
+- validated(): an admit whose every verbatim occurrence overlaps a producer's pin line (the marker's line,
+  run on to the end of a wrapped sentence) is denied, so the rationale tail alone ("it reads this
+  gateway's own logs, ... which a worker node does not have.") no longer admits (review
+  t_01a1d24d488edbd9). The same text found elsewhere in the card is still judged normally.
+- stored_owner_verdict(): a relayed owner verdict quoting a pin sentence is a final deny whose why
+  carries SELF_ASSERTION_WHY instead of "need or verbatim evidence" (review t_01a1d10df13c4a8d).
+- Tests: tail/fragment/wrapped quotes and stored_owner_verdict gateway/machine/tail variants
+  (admit=False, invalid=True, specific why); RED on base (6 fail), GREEN on head.
+- tests/tools/test_kanban_move_hub_guidance.py asserts the guidance's intent (ssh hermes-hub reads,
+  hub:write via hub-admin, a hub move discouraged and gated on admission), not exact wording.
+---
+ hermes_cli/kanban_hub_admission.py           | 44 ++++++++++++++++++-
+ hermes_cli/kanban_hub_admission_placement.py |  9 ++--
+ tests/test_kanban_hub_admission.py           | 45 ++++++++++++++++++++
+ tests/tools/test_kanban_move_hub_guidance.py | 27 +++++++++---
+ 4 files changed, 113 insertions(+), 12 deletions(-)
+
+diff --git a/hermes_cli/kanban_hub_admission.py b/hermes_cli/kanban_hub_admission.py
+index f3bd48e44b..146dcc2839 100644
+--- a/hermes_cli/kanban_hub_admission.py
++++ b/hermes_cli/kanban_hub_admission.py
+@@ -6,6 +6,7 @@ import contextvars
+ import hashlib
+ import json
+ import logging
++import re
+ import sqlite3
+ import threading
+ import time
+@@ -63,6 +64,39 @@ def self_assertion(quote):
+     return any(marker in text for marker in SELF_ASSERTIONS)
+ 
+ 
++_PIN = re.compile("|".join(r"\s+".join(map(re.escape, m.split())) for m in SELF_ASSERTIONS), re.IGNORECASE)
++_SENTENCE_END = re.compile(r"[.!?](?=\s|$)|\n[ \t]*\n")
++
++
++def _pin_spans(text):
++    """``[start, end)`` of every pin line in ``text``: the marker's whole line, run on to the sentence's end
++    when the producer wrapped it (never past a blank line)."""
++    spans = []
++    for match in _PIN.finditer(text):
++        start = text.rfind("\n", 0, match.start()) + 1
++        line_end = text.find("\n", match.end())
++        stop = _SENTENCE_END.search(text, match.end())
++        spans.append((start, max(len(text) if line_end < 0 else line_end, stop.end() if stop else len(text))))
++    return spans
++
++
++def quotes_pin_sentence(quote, fields, hub_reason):
++    """True when ``quote`` is a producer's pin sentence: it names the marker, or every verbatim occurrence of it
++    in the card overlaps a pin line (the rationale tail alone, review t_01a1d24d488edbd9). [daveey]"""
++    if self_assertion(quote):
++        return True
++    quote = str(quote or "")
++    found = False
++    for item in (fields.get("title") or "", fields.get("body") or "", hub_reason or ""):
++        spans, at = _pin_spans(item), item.find(quote) if quote else -1
++        while at >= 0:
++            found = True
++            if not any(at < end and at + len(quote) > start for start, end in spans):
++                return False
++            at = item.find(quote, at + 1)
++    return found
++
++
+ def validated(result, fields, hub_reason, sha):
+     """The Verdict for a well-formed, evidence-checked ``{admit, need, evidence, why}`` dict, else None."""
+     if not isinstance(result, dict) or set(result) != {"admit", "need", "evidence", "why"}:
+@@ -78,7 +112,7 @@ def validated(result, fields, hub_reason, sha):
+         inputs = (fields.get("title") or "", fields.get("body") or "", hub_reason or "")
+         if need is None or not quote.strip() or not any(quote in item for item in inputs):
+             return None
+-        if self_assertion(quote):
++        if quotes_pin_sentence(quote, fields, hub_reason):
+             return None  # a producer's self-assertion: invalid as admission evidence (deny), cached copies too
+     return Verdict(**result, skill_sha=sha)
+ 
+@@ -91,11 +125,17 @@ def _parse(text, fields, hub_reason, sha):
+     verdict = validated(result, fields, hub_reason, sha)
+     if verdict is not None:
+         return verdict
+-    if isinstance(result, dict) and result.get("admit") is True and self_assertion(result.get("evidence")):
++    if pin_quoting_admit(result, fields, hub_reason):
+         return Verdict(why=f"invalid admission verdict: {SELF_ASSERTION_WHY}", skill_sha=sha)
+     return Verdict(why="invalid admission verdict", skill_sha=sha)
+ 
+ 
++def pin_quoting_admit(result, fields, hub_reason):
++    """True when ``result`` admits on a producer's pin sentence (so a deny can carry SELF_ASSERTION_WHY)."""
++    return (isinstance(result, dict) and result.get("admit") is True and isinstance(result.get("evidence"), str)
++            and quotes_pin_sentence(result["evidence"], fields, hub_reason))
++
++
+ def _cache(key, verdict=None):
+     from hermes_cli.config import get_hermes_home
+     from hermes_cli import kanban_lockguard
+diff --git a/hermes_cli/kanban_hub_admission_placement.py b/hermes_cli/kanban_hub_admission_placement.py
+index 5d2ce9e88e..ae97b6fc41 100644
+--- a/hermes_cli/kanban_hub_admission_placement.py
++++ b/hermes_cli/kanban_hub_admission_placement.py
+@@ -237,9 +237,12 @@ def stored_owner_verdict(entry, title, body):
+         return None  # the judge was unavailable at relay time: retry, never a permanent answer
+     sha = audit["skill_sha"] if isinstance(audit.get("skill_sha"), str) else ""
+     result = {k: audit.get(k) for k in ("admit", "need", "evidence", "why")}
+-    if judge.validated(result, {"title": title, "body": body}, None, sha) is None:
+-        return {**asdict(judge.Verdict(why="relay-time admission verdict failed validation (need or verbatim "
+-                                           "evidence)", skill_sha=sha)),
++    fields = {"title": title, "body": body}
++    if judge.validated(result, fields, None, sha) is None:
++        detail = (judge.SELF_ASSERTION_WHY if judge.pin_quoting_admit(result, fields, None)
++                  else "need or verbatim evidence")
++        return {**asdict(judge.Verdict(why=f"relay-time admission verdict failed validation ({detail})",
++                                       skill_sha=sha)),
+                 "entry": audit.get("entry") or "capability_owner", "capability": audit.get("capability"),
+                 "invalid": True}
+     return audit
+diff --git a/tests/test_kanban_hub_admission.py b/tests/test_kanban_hub_admission.py
+index be35fb700e..d419ae3f62 100644
+--- a/tests/test_kanban_hub_admission.py
++++ b/tests/test_kanban_hub_admission.py
+@@ -269,3 +269,48 @@ def test_other_evidence_on_a_card_with_a_pin_sentence_still_admits(judge):
+     reply.update(admit=True, need="hub_chrome", evidence="using the hub's signed-in Chrome", why="Browser.")
+     body = f"{ESCAPE_PIN}\nRead the billing page using the hub's signed-in Chrome."
+     assert gate.admit({"title": "billing", "body": body}).admit is True
++
++
++ESCAPE_TAIL = "it reads this gateway's own logs, state files and coach store, which a worker node does not have."
++WRAPPED_PIN = ("Pinned to the machine that filed it: the bsky cron output and its counters live\n"
++               "only on this machine.\n## Do this\n1. Read the counters.")
++
++
++@pytest.mark.parametrize("body, quote", [
++    (ESCAPE_BODY, ESCAPE_TAIL),                       # rationale tail alone (review t_01a1d24d488edbd9)
++    (ESCAPE_BODY, "which a worker node does not have"),
++    (WRAPPED_PIN, "only on this machine."),            # the wrapped continuation of a pin sentence
++], ids=["tail", "tail-fragment", "wrapped"])
++def test_quote_from_inside_a_pin_line_is_not_admission_evidence(judge, body, quote):
++    gate, _, reply, _ = judge
++    reply.update(admit=True, need="hub_live_process", evidence=quote, why="Needs local state.")
++    verdict = gate.admit({"title": ESCAPE_TITLE, "body": body})
++    assert verdict.admit is False and gate.SELF_ASSERTION_WHY in verdict.why
++
++
++def test_quote_also_found_outside_the_pin_line_is_judged_on_that_text(judge):
++    gate, _, reply, _ = judge
++    reply.update(admit=True, need="hub_chrome", evidence="signed-in Chrome", why="Browser.")
++    body = ("Pinned to the gateway that filed it: it needs the signed-in Chrome.\n\n"
++            "## Do this\n1. Renew the dashboard session in the hub's signed-in Chrome.")
++    assert gate.admit({"title": "renew", "body": body}).admit is True
++
++
++@pytest.mark.parametrize("pin, quote", [
++    (ESCAPE_PIN, ESCAPE_PIN),
++    (ESCAPE_PIN, ESCAPE_TAIL),
++    ("Pinned to the machine that filed it: the cron output is on this machine.",
++     "Pinned to the machine that filed it: the cron output is on this machine."),
++], ids=["gateway", "gateway-tail", "machine"])
++def test_stored_owner_verdict_quoting_a_pin_sentence_is_a_final_deny_with_its_why(judge, pin, quote):
++    gate, _, _, _ = judge
++    from hermes_cli.kanban_hub_admission_placement import stored_owner_verdict
++    entry = {"hub_admission": {"admit": True, "need": "hub_live_process", "evidence": quote, "why": "x",
++                               "skill_sha": "abc"}}
++    verdict = stored_owner_verdict(entry, "Capability owner", f"Owner card.\n{pin}\n\nRead the logs.")
++    assert verdict is not None
++    assert verdict["admit"] is False and verdict["invalid"] is True
++    assert gate.SELF_ASSERTION_WHY in verdict["why"]
++    if quote == ESCAPE_TAIL:  # without a pin line around it the same text is ordinary evidence
++        moved = stored_owner_verdict(entry, "Capability owner", f"Owner card.\n{quote}")
++        assert moved is not None and moved["admit"] is True
+diff --git a/tests/tools/test_kanban_move_hub_guidance.py b/tests/tools/test_kanban_move_hub_guidance.py
+index 040d7ed46d..4bb6be4706 100644
+--- a/tests/tools/test_kanban_move_hub_guidance.py
++++ b/tests/tools/test_kanban_move_hub_guidance.py
+@@ -2,14 +2,27 @@
+ 
+ t_01a1ccba2bf93bf1 and t_01a1cad1b3da962a were moved to machine:hub for hub reads and routine hub writes that a
+ capability:hub-write worker does with `ssh hermes-hub` and `hub-admin`; the tool description only said to move
+-when the work needs "a specific host's files or logs".
++when the work needs "a specific host's files or logs". These tests pin the guidance's intent, not its wording.
+ """
++import re
++
+ from tools.kanban_tools_schemas import KANBAN_MOVE_SCHEMA
+ 
+ 
+-def test_move_description_routes_hub_work_through_hub_admin():
+-    description = KANBAN_MOVE_SCHEMA["description"]
+-    assert "Never move a card to the hub for hub files, logs, databases, cron" in description
+-    assert "`hub-admin '<command>'` (declare hub:write)" in description
+-    assert "`ssh hermes-hub`" in description
+-    assert "judged by hub admission" in description
++def _hub_guidance():
++    sentences = re.split(r"(?<=[.!?])\s+", " ".join(KANBAN_MOVE_SCHEMA["description"].split()))
++    return [s.lower() for s in sentences if "hub-admin" in s]
++
++
++def test_move_guidance_routes_hub_reads_and_writes_through_worker_access():
++    guidance = _hub_guidance()
++    assert guidance, "kanban_move must say how a worker reaches the hub without moving there"
++    text = " ".join(guidance)
++    assert "ssh hermes-hub" in text  # hub reads
++    assert "hub:write" in text  # the access a hub-admin worker declares for writes
++
++
++def test_move_guidance_discourages_a_hub_move_and_gates_it_on_admission():
++    text = " ".join(_hub_guidance())
++    assert re.search(r"\b(never|do not|don't)\b[^.;]*\bhub\b", text), "a hub move must be discouraged"
++    assert "machine:hub" not in text or "admission" in text, "a machine:hub move must name hub admission"
+-- 
+2.51.0
+

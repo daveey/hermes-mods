@@ -1,0 +1,142 @@
+From 769c6b401d445264566562a8312da25ab5227eeb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 02:11:32 +0000
+Subject: [PATCH] [daveey] input_origin: pin the room-plumbing rule to the
+ resume rule; read only its 3 columns per submit
+
+Follow-up to #1816 review nits (t_01a1d29d72344153, GitHub review 5884937401):
+
+1. human_input._row_is_room_plumbing copies the plumbing rule (model_config.room_plumbing, or a hidden
+   "Group:" row) from agent_factory._stored_session_runtime_overrides. That function is upstream code, so
+   it stays untouched (no merge-conflict surface) and a parity test now runs both over one 420-row matrix
+   (model_config dict/JSON text/invalid/list/null/blank x 7 titles x 5 hidden values; each row carries a
+   stored model, so the resume rule restores a non-empty override unless it calls the row plumbing).
+   Drift on either side fails it.
+2. _stored_room_plumbing no longer calls db.get_session() on every would-be human submit (flush_for_read
+   plus the system-prompt/tool-name JOINs on the request thread): it reads
+   SELECT model_config, hidden, title FROM sessions WHERE id = ? and feeds that row to the same predicate.
+   A missing row is a plain miss. Profile sessions still go through server._session_db (pooled
+   hermes_state_registry.acquire handle).
+
+Proof: RED on origin/main 3e6f010495 (narrow-read test: get_session/flush_for_read called; the parity
+test is green on main since the copies agree today, and it kills drift mutants). GREEN: 12 files that
+import human_input / input_origin, 197 passed. Mutants 8/8 killed (title strip, hidden ignored,
+agent_factory case-folded Group and dropped model_config flag, back to get_session, no None-db guard,
+no missing-row guard, SELECT *). scripts/check --base origin/main: 18 checks ok.
+---
+ tests/tui_gateway/test_human_input.py | 56 +++++++++++++++++++++++++++
+ tui_gateway/human_input.py            | 15 +++++--
+ 2 files changed, 68 insertions(+), 3 deletions(-)
+
+diff --git a/tests/tui_gateway/test_human_input.py b/tests/tui_gateway/test_human_input.py
+index 2b4300cae7..740cb41468 100644
+--- a/tests/tui_gateway/test_human_input.py
++++ b/tests/tui_gateway/test_human_input.py
+@@ -100,6 +100,62 @@ def test_row_is_room_plumbing(row, expected):
+     assert human_input._row_is_room_plumbing(row) is expected
+ 
+ 
++_PARITY_CONFIGS = [None, {}, {"room_plumbing": True}, {"room_plumbing": False}, {"room_plumbing": 1}, {"room_plumbing": ""},
++                   '{"room_plumbing": true}', '{"room_plumbing": 0}', "not json", "[1]", "null", "  "]
++_PARITY_TITLES = [None, "", "Group: standup", "  Group: a", "group: lower", "Groups", "renamed"]
++_PARITY_HIDDEN = [None, 0, 1, True, False]
++
++
++def test_row_is_room_plumbing_matches_the_resume_rule():
++    """One plumbing rule: ``_row_is_room_plumbing`` mirrors ``agent_factory._stored_session_runtime_overrides`` (which
++    drops a plumbing row's stored runtime on resume; upstream code, left untouched), so the two must not drift. A row
++    carrying a stored model restores a non-empty override unless the resume rule calls it plumbing (agent_factory
++    binds into the server namespace, so call it there)."""
++    rows = [{"id": "s", "model": "parity-model", "model_config": config, "title": title, "hidden": hidden}
++            for config in _PARITY_CONFIGS for title in _PARITY_TITLES for hidden in _PARITY_HIDDEN]
++    resume_plumbing = [server._stored_session_runtime_overrides(row) == {} for row in rows]
++    assert any(resume_plumbing) and not all(resume_plumbing), "the matrix must hold both kinds of row"
++    mismatched = [(row, resume) for row, resume in zip(rows, resume_plumbing)
++                  if human_input._row_is_room_plumbing(row) is not resume]
++    assert mismatched == []
++
++
++def test_input_origin_reads_only_the_plumbing_columns(tmp_path, monkeypatch, caplog):
++    """A would-be human submit reads ``model_config, hidden, title`` for the key: never ``get_session`` (its
++    flush_for_read plus prompt/tool JOINs on the request thread) or any other full-row read."""
++    import logging
++
++    from hermes_state import SessionDB
++
++    plumbing = _stored(tmp_path, "plumb", title="Group: x", hidden=True)
++    chat = _stored(tmp_path, "dm", title="Bot Chat", hidden=True, model_config={"room_plumbing": False})
++    reads, sql = [], []
++
++    def spy(name):
++        def call(self, *args, **kwargs):
++            reads.append(name)
++            raise AssertionError(f"{name} on a submit")
++        return call
++
++    real_read_one = SessionDB._read_one
++
++    def read_one(self, query, params=()):
++        sql.append(" ".join(query.split()))
++        return real_read_one(self, query, params)
++
++    for name in ("get_session", "flush_for_read", "get_session_list_row"):
++        monkeypatch.setattr(SessionDB, name, spy(name))
++    monkeypatch.setattr(SessionDB, "_read_one", read_one)
++    caplog.set_level(logging.DEBUG, logger=human_input.logger.name)
++    assert human_input.input_origin("r", {}, "hi", session=plumbing) == "agent"
++    assert human_input.input_origin("r", {}, "hi", session=chat) == "human"
++    assert human_input.input_origin("r", {}, "hi", session={"session_key": "missing", "profile_home": str(tmp_path)}) \
++        == "human", "no row: not plumbing"
++    assert reads == []
++    assert "row read failed" not in caplog.text, "a missing row is a plain miss, not an error"
++    assert sql == ["SELECT model_config, hidden, title FROM sessions WHERE id = ?"] * 3
++
++
+ @pytest.mark.parametrize("session", [{"pending_hidden": True}, {"pending_hidden": False}])
+ def test_hidden_alone_is_no_authorship_signal(session):
+     """Bot Mode's canonical Bot Chat is born hidden and David types into it, so hidden != agent (first submit
+diff --git a/tui_gateway/human_input.py b/tui_gateway/human_input.py
+index 584c239c2e..ebb74bbcf6 100644
+--- a/tui_gateway/human_input.py
++++ b/tui_gateway/human_input.py
+@@ -68,10 +68,13 @@ def record_human_input(session_id: str = "", home: Path | None = None) -> None:
+         logger.debug("could not record the last human input", exc_info=True)
+ 
+ 
++_PLUMBING_ROW_SQL = "SELECT model_config, hidden, title FROM sessions WHERE id = ?"
++
++
+ def _row_is_room_plumbing(row) -> bool:
+     """A stored Bot Mode room member row: ``model_config.room_plumbing``, or a legacy hidden ``Group:`` row (the
+     rule ``agent_factory._stored_session_runtime_overrides`` applies on resume; kept here to leave that upstream
+-    function untouched)."""
++    function untouched, with test_human_input's parity test running both over one row matrix so they can't drift)."""
+     if not isinstance(row, dict):
+         return False
+     config = row.get("model_config")
+@@ -86,14 +89,20 @@ def _row_is_room_plumbing(row) -> bool:
+ 
+ def _stored_room_plumbing(session: dict) -> bool:
+     """True when the session's persisted row is Bot Mode room plumbing (:func:`_row_is_room_plumbing`). A resumed
+-    session carries no in-memory ``room_plumbing`` flag, so only the row answers for it. Unreadable row: False."""
++    session carries no in-memory ``room_plumbing`` flag, so only the row answers for it. Unreadable row: False.
++
++    Runs on every would-be human submit, so it reads only the three columns the rule needs: not ``get_session``
++    (flush_for_read plus the prompt/tool JOINs, on the request thread)."""
+     if not session.get("session_key"):
+         return False
+     try:
+         from tui_gateway import server  # session_workdir's helpers are bound into the server namespace
+ 
+         with server._session_db(session) as db:
+-            return db is not None and _row_is_room_plumbing(db.get_session(session["session_key"]))
++            if db is None:
++                return False
++            row = db._read_one(_PLUMBING_ROW_SQL, (session["session_key"],))
++            return row is not None and _row_is_room_plumbing(dict(row))
+     except Exception:  # health: allow BLE001 -- a classification must never fail a prompt
+         logger.debug("input-origin row read failed", exc_info=True)
+         return False
+-- 
+2.51.0
+

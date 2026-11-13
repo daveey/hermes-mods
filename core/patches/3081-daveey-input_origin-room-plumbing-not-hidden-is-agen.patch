@@ -1,0 +1,395 @@
+From 3e6f01049555b3fb7e33a051a1d30374440fb27c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 01:38:40 +0000
+Subject: [PATCH] [daveey] input_origin: room plumbing (not hidden) is agent;
+ forward origin to compute-host turns
+
+Follow-up to #1797 review nits (t_01a1d271c47294ad):
+
+1. pending_hidden was transient (popped once session_workdir marks the row hidden), so only the
+   first submit into a hidden session classified 'agent'. Treating every persisted hidden row as
+   'agent' instead would be wrong: Bot Mode's canonical "Bot Chat" is born hidden and David types
+   into it (canonical-chat.ts), so his bot DMs would stop stamping last-human-input and read as agent
+   to pre_llm_call plugins. Hidden is no authorship signal. input_origin now keys on Bot Mode room
+   plumbing instead, consistently for every submit: the live session's room_plumbing flag, or (for a
+   resumed session with no flag) its stored row (model_config.room_plumbing, or a hidden "Group:" row:
+   the rule agent_factory._stored_session_runtime_overrides applies on resume, mirrored in
+   human_input to leave that upstream function untouched). The row is read only for a would-be human
+   submit with a session key; an unreadable store falls back to 'human'.
+2. The compute-host isolated dispatch now pops the stashed _submit_input_origin and forwards it:
+   _submit_prompt_to_compute_host(input_origin=) -> turn.start frame "input_origin" ->
+   ComputeHost._run_real_turn -> _run_prompt_submit(input_origin=). A failed dispatch hands the
+   stash back so the inline fallback's _run_after_agent_ready still reads it. An older child
+   ignores the extra frame key.
+3. note_submit's docstring lists every non-stamping case (agent transport, agent_created, room
+   plumbing, relayed/hosted params, hidden widget intents, cross-session sends, no request id).
+
+Proof: RED on origin/main (8 failed: stored plumbing rows 'human', pending_hidden 'agent', no
+input_origin kwarg/frame key, remote turn origin ''); GREEN 54 tests in the 2 files; 54 files
+touching these seams 1330 passed / 8 skipped; 18/18 mutants killed; scripts/check health ok.
+Replay: worker-1 profile DBs hold 0 hidden/room-plumbing rows (Desktop Bot Mode rows live on the Macs).
+---
+ .../test_compute_host_turn_protocol.py        |  19 +++
+ tests/tui_gateway/test_human_input.py         | 128 +++++++++++++++++-
+ tui_gateway/compute_host.py                   |   3 +-
+ tui_gateway/compute_host_bridge.py            |   8 +-
+ tui_gateway/human_input.py                    |  56 ++++++--
+ tui_gateway/methods_prompt.py                 |   7 +-
+ 6 files changed, 205 insertions(+), 16 deletions(-)
+
+diff --git a/tests/tui_gateway/test_compute_host_turn_protocol.py b/tests/tui_gateway/test_compute_host_turn_protocol.py
+index bb92e7a21b..2e2ccad158 100644
+--- a/tests/tui_gateway/test_compute_host_turn_protocol.py
++++ b/tests/tui_gateway/test_compute_host_turn_protocol.py
+@@ -267,3 +267,22 @@ def test_host_builds_the_session_agent_with_the_frame_login(monkeypatch):
+     assert captured["auth_user_id"] == "basic:alice"
+     assert session["auth_user_id"] == "basic:alice"
+     assert server._session_auth_user_id(session) == "basic:alice"
++
++
++@pytest.mark.parametrize("frame_origin,expected", [({"input_origin": "agent"}, "agent"), ({}, "")])
++def test_turn_start_runs_the_turn_with_the_forwarded_input_origin(turn_env, frame_origin, expected):
++    """[daveey] The parent's prompt.submit classified the submit; the remote turn's pre_llm_call reads it too."""
++    out = io.StringIO()
++    host = ComputeHost(stdout=out, heartbeat_secs=0)
++    agent = _agent(["ok"])
++    seen = []
++    run = agent.run_conversation
++    agent.run_conversation = lambda *a, **kw: seen.append(getattr(agent, "_input_origin", "<unset>")) or run(*a, **kw)
++    server._sessions["s-origin"] = _session(agent)
++    try:
++        host.handle_frame({"type": "turn.start", "sid": "s-origin", "request_id": "t", "prompt": "hi", **frame_origin})
++        _wait(out, lambda f: f["type"] == "turn.end")
++    finally:
++        server._sessions.pop("s-origin", None)
++        host.close()
++    assert seen == [expected]
+diff --git a/tests/tui_gateway/test_human_input.py b/tests/tui_gateway/test_human_input.py
+index 4aca4cd204..2b4300cae7 100644
+--- a/tests/tui_gateway/test_human_input.py
++++ b/tests/tui_gateway/test_human_input.py
+@@ -64,11 +64,83 @@ def test_input_origin_agent_for_an_agent_transport():
+     assert human_input.input_origin("r", {}, "hi", transport=_transport("renderer")) == "human"
+ 
+ 
+-@pytest.mark.parametrize("session", [{"agent_created": True}, {"pending_hidden": True}])
+-def test_input_origin_agent_for_agent_created_or_hidden_sessions(session):
++@pytest.mark.parametrize("session", [{"agent_created": True}, {"room_plumbing": True}])
++def test_input_origin_agent_for_agent_created_or_room_plumbing_sessions(session):
+     assert human_input.input_origin("r", {}, "hi", session=session) == "agent"
+ 
+ 
++def _stored(tmp_path, key, *, title, hidden, model_config=None):
++    """A session dict whose row lives in its own profile ``state.db`` (no ``room_plumbing``/``pending_hidden`` in
++    memory: a resumed session, or one whose transient ``pending_hidden`` was already applied and popped)."""
++    from hermes_state import SessionDB
++
++    db = SessionDB(tmp_path / "state.db")
++    try:
++        db.create_session(key, source="desktop", model_config=model_config)
++        db.set_session_title(key, title)
++        db.set_session_hidden(key, hidden)
++    finally:
++        db.close()
++    return {"session_key": key, "profile_home": str(tmp_path)}
++
++
++@pytest.mark.parametrize("title,model_config", [("Group: standup", None), ("renamed", {"room_plumbing": True})])
++def test_input_origin_agent_for_every_submit_into_a_stored_room_plumbing_row(tmp_path, title, model_config):
++    session = _stored(tmp_path, "plumb", title=title, hidden=True, model_config=model_config)
++    assert [human_input.input_origin("r", {}, "hi", session=session) for _ in range(2)] == ["agent", "agent"]
++
++
++@pytest.mark.parametrize("row,expected", [
++    (None, False), ({}, False),
++    ({"model_config": {"room_plumbing": True}}, True), ({"model_config": '{"room_plumbing": true}'}, True),
++    ({"model_config": "not json", "hidden": 1, "title": "Bot Chat"}, False), ({"model_config": "[1]"}, False),
++    ({"model_config": "  "}, False), ({"hidden": 1, "title": "  Group: a"}, True), ({"hidden": 0, "title": "Group: a"}, False),
++])
++def test_row_is_room_plumbing(row, expected):
++    assert human_input._row_is_room_plumbing(row) is expected
++
++
++@pytest.mark.parametrize("session", [{"pending_hidden": True}, {"pending_hidden": False}])
++def test_hidden_alone_is_no_authorship_signal(session):
++    """Bot Mode's canonical Bot Chat is born hidden and David types into it, so hidden != agent (first submit
++    included): only plumbing markers are."""
++    assert human_input.input_origin("r", {}, "hi", session=session) == "human"
++
++
++def test_input_origin_human_in_a_stored_hidden_bot_chat(tmp_path):
++    session = _stored(tmp_path, "dm", title="Bot Chat", hidden=True)
++    assert [human_input.input_origin("r", {}, "hi", session=session) for _ in range(2)] == ["human", "human"]
++    assert human_input.input_origin("r", {}, "hi", session=_stored(tmp_path, "g", title="Group: x", hidden=False)) \
++        == "human", "a visible row titled like a room is a user's chat"
++
++
++def test_input_origin_row_lookup_failure_falls_back_to_human(monkeypatch):
++    def boom(session):
++        raise RuntimeError("db gone")
++
++    monkeypatch.setattr(server, "_session_db", boom)
++    assert human_input.input_origin("r", {}, "hi", session={"session_key": "k"}) == "human"
++
++
++def test_input_origin_row_lookup_needs_a_key_and_an_open_db(monkeypatch, caplog):
++    import contextlib
++    import logging
++
++    opened = []
++
++    @contextlib.contextmanager
++    def no_db(session):
++        opened.append(session.get("session_key"))
++        yield None
++
++    monkeypatch.setattr(server, "_session_db", no_db)
++    with caplog.at_level(logging.DEBUG, logger=human_input.logger.name):
++        assert human_input.input_origin("r", {}, "hi", session={"cols": 80}) == "human"
++        assert human_input.input_origin("r", {}, "hi", session={"session_key": "k"}) == "human"
++    assert opened == ["k"], "a keyless (unpersisted) session has no row to read"
++    assert "row read failed" not in caplog.text, "an unavailable store is a plain miss, not an error"
++
++
+ @pytest.mark.parametrize("params", [
+     {"_turn_author": object()}, {"_hosted_task": {}}, {"_hosted_terminal_callback": print},
+     {"display_kind": "hidden"}])
+@@ -107,7 +179,7 @@ def test_note_submit_returns_the_origin_and_stamps_only_humans(monkeypatch, tmp_
+     stamps = []
+     monkeypatch.setattr(human_input, "record_human_input", lambda sid="", home=None: stamps.append(sid))
+     assert human_input.note_submit("r", {"session_id": "a"}, "hi", transport=_transport("agent")) == "agent"
+-    assert human_input.note_submit("r", {"session_id": "b"}, "hi", session={"pending_hidden": True}) == "agent"
++    assert human_input.note_submit("r", {"session_id": "b"}, "hi", session={"room_plumbing": True}) == "agent"
+     assert human_input.note_submit(None, {"session_id": "c"}, "hi") == ""
+     assert human_input.note_submit("r", {"session_id": "d"}, "hi", transport=_transport()) == "human"
+     assert stamps == ["d"]
+@@ -215,6 +287,56 @@ def test_prompt_submit_consumes_the_stashed_origin(turn_env):
+     assert seen == ["agent"] and "_submit_input_origin" not in session, "read once, never left for a later turn"
+ 
+ 
++# ── compute-host isolated dispatch forwards (and consumes) the origin ─────────────────────────────────────
++
++
++def _isolated_dispatch(monkeypatch, session, response):
++    calls = []
++    monkeypatch.setattr(server, "_reopen_before_isolated_submit", lambda sid, session: None)
++    monkeypatch.setattr(server, "_submit_prompt_to_compute_host",
++                        lambda rid, sid, session, text, **kw: calls.append(kw) or response)
++    session["_submit_input_origin"] = "agent"
++    return calls
++
++
++def test_isolated_dispatch_forwards_and_consumes_the_origin(monkeypatch):
++    session = _session(None)
++    calls = _isolated_dispatch(monkeypatch, session, server._ok("r1", {"status": "streaming"}))
++    resp = server._dispatch_admitted_prompt("r1", "sid", session, "hi", True, None, None, None, {}, None)
++    assert resp["result"]["status"] == "streaming"
++    assert calls[0].get("input_origin") == "agent"
++    assert "_submit_input_origin" not in session, "the remote turn consumed it: nothing lingers for the next turn"
++
++
++def test_isolated_dispatch_failure_keeps_the_origin_for_the_inline_fallback(monkeypatch):
++    session = _session(None)
++    _isolated_dispatch(monkeypatch, session, server._err("r1", 5019, "compute-host dispatch failed: x"))
++    monkeypatch.setattr(server, "_persist_session_row_for_submit", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_restart_completed_failed_agent_build", lambda *a, **k: True)
++    seen = []
++    monkeypatch.setattr(server, "_start_session_work", lambda fn, **kw: seen.append(session.get("_submit_input_origin")))
++    server._dispatch_admitted_prompt("r1", "sid", session, "hi", True, None, None, None, {}, None)
++    assert seen == ["agent"], "the inline turn (_run_after_agent_ready) still reads this submit's origin"
++
++
++def test_compute_host_turn_frame_carries_the_origin():
++    session = _session(None)
++    assert server._compute_host_turn_frame("r", "sid", session, "hi", input_origin="agent")["input_origin"] == "agent"
++    assert "input_origin" not in server._compute_host_turn_frame("r", "sid", session, "hi")
++
++
++def test_compute_host_dispatch_sends_the_origin_in_its_frame(monkeypatch):
++    frames = []
++
++    class _Supervisor:
++        def submit_turn(self, frame, *, on_complete=None):
++            frames.append(frame)
++
++    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
++    resp = server._submit_prompt_to_compute_host("r1", "sid", _session(None), "hi", input_origin="agent")
++    assert resp["result"]["status"] == "streaming" and frames[0]["input_origin"] == "agent"
++
++
+ # ── prompt.admit (in-process owner services) never inherits a client submit's origin ─────────────────────
+ 
+ owner = admission_tests.owner
+diff --git a/tui_gateway/compute_host.py b/tui_gateway/compute_host.py
+index e075c825aa..964cb6fe76 100644
+--- a/tui_gateway/compute_host.py
++++ b/tui_gateway/compute_host.py
+@@ -276,7 +276,8 @@ class ComputeHost:
+             server._run_prompt_submit(
+                 request_id, sid, session, text, display_kind=frame.get("display_kind") or None,
+                 display_metadata=(frame.get("display_metadata")
+-                                  if isinstance(frame.get("display_metadata"), dict) else None))
++                                  if isinstance(frame.get("display_metadata"), dict) else None),
++                input_origin=str(frame.get("input_origin") or ""))  # [daveey] the parent prompt.submit's origin
+             run_thread = session.get("_run_thread")
+             if run_thread is not None and hasattr(run_thread, "join"):
+                 while run_thread.is_alive():
+diff --git a/tui_gateway/compute_host_bridge.py b/tui_gateway/compute_host_bridge.py
+index d8c56de626..916a672222 100644
+--- a/tui_gateway/compute_host_bridge.py
++++ b/tui_gateway/compute_host_bridge.py
+@@ -50,7 +50,7 @@ def _get_compute_host_supervisor(cfg: dict | None = None):
+ def _compute_host_turn_frame(
+     rid: str, sid: str, session: dict, text: Any, image_paths: list[str] | None = None,
+     queued_prompt_generation: int | None = None, display_kind: str | None = None,
+-    display_metadata: dict | None = None) -> dict:
++    display_metadata: dict | None = None, input_origin: str = "") -> dict:
+     with session["history_lock"]:
+         history = list(session.get("history", []))
+         history_version = int(session.get("history_version", 0))
+@@ -60,6 +60,7 @@ def _compute_host_turn_frame(
+         "session_key": session.get("session_key") or sid, "text": text,
+         **({"display_kind": display_kind} if display_kind else {}), "history": history,
+         **({"display_metadata": display_metadata} if display_metadata else {}),
++        **({"input_origin": input_origin} if input_origin else {}),  # [daveey] the remote turn's pre_llm_call origin
+         "history_version": history_version, "cols": int(session.get("cols", 80) or 80),
+         "cwd": _session_cwd(session),
+         # Workspace provenance rides with the cwd: a sandbox backend registers an unpicked host cwd as nothing.
+@@ -324,11 +325,12 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
+ def _submit_prompt_to_compute_host(
+     rid: str, sid: str, session: dict, text: Any, image_paths: list[str] | None = None,
+     queued_prompt_generation: int | None = None, display_kind: str | None = None,
+-    display_metadata: dict | None = None) -> dict:
++    display_metadata: dict | None = None, input_origin: str = "") -> dict:
+     cfg = _load_dashboard_process_isolation_config()
+     frame = _compute_host_turn_frame(rid, sid, session, text, image_paths=image_paths,
+                                      queued_prompt_generation=queued_prompt_generation,
+-                                     display_kind=display_kind, display_metadata=display_metadata)
++                                     display_kind=display_kind, display_metadata=display_metadata,
++                                     input_origin=input_origin)
+     # Caller JSON-RPC ids may repeat across sockets and turns. Use an opaque
+     # dispatch lifetime token, installed before a fast child can send activity.
+     turn_id = frame["turn_id"] = frame["request_id"] = uuid.uuid4().hex
+diff --git a/tui_gateway/human_input.py b/tui_gateway/human_input.py
+index ce7a723a46..584c239c2e 100644
+--- a/tui_gateway/human_input.py
++++ b/tui_gateway/human_input.py
+@@ -11,7 +11,8 @@ notices and wakes, auto-continue resumes and queued drains call ``_run_prompt_su
+ handler skips the in-process ones that do: bot-relay / hosted-room submits (``_turn_author`` /
+ ``_hosted_*``), ``start_chat`` (no request id), hidden widget intents, and cross-session sends (the
+ session-mentions courier submits over the websocket, with its fixed header first). Agent scripts that dial
+-``/api/ws?client=agent`` (gateway_rpc.py) never stamp either, nor do submits into chats they created.
++``/api/ws?client=agent`` (gateway_rpc.py) never stamp either, nor do submits into chats they created or into
++Bot Mode room plumbing (human_input.input_origin).
+ """
+ 
+ from __future__ import annotations
+@@ -67,19 +68,54 @@ def record_human_input(session_id: str = "", home: Path | None = None) -> None:
+         logger.debug("could not record the last human input", exc_info=True)
+ 
+ 
++def _row_is_room_plumbing(row) -> bool:
++    """A stored Bot Mode room member row: ``model_config.room_plumbing``, or a legacy hidden ``Group:`` row (the
++    rule ``agent_factory._stored_session_runtime_overrides`` applies on resume; kept here to leave that upstream
++    function untouched)."""
++    if not isinstance(row, dict):
++        return False
++    config = row.get("model_config")
++    if isinstance(config, str):
++        try:
++            config = json.loads(config) if config.strip() else {}
++        except ValueError:
++            config = {}
++    return bool((isinstance(config, dict) and config.get("room_plumbing"))
++                or (row.get("hidden") and str(row.get("title") or "").strip().startswith("Group:")))
++
++
++def _stored_room_plumbing(session: dict) -> bool:
++    """True when the session's persisted row is Bot Mode room plumbing (:func:`_row_is_room_plumbing`). A resumed
++    session carries no in-memory ``room_plumbing`` flag, so only the row answers for it. Unreadable row: False."""
++    if not session.get("session_key"):
++        return False
++    try:
++        from tui_gateway import server  # session_workdir's helpers are bound into the server namespace
++
++        with server._session_db(session) as db:
++            return db is not None and _row_is_room_plumbing(db.get_session(session["session_key"]))
++    except Exception:  # health: allow BLE001 -- a classification must never fail a prompt
++        logger.debug("input-origin row read failed", exc_info=True)
++        return False
++
++
+ def input_origin(rid, params, text, *, transport=None, session: dict | None = None) -> str:
+     """Who wrote this client ``prompt.submit``: ``"agent"``, ``"human"`` or ``""`` (unknown). Never raises.
+ 
+     ``"agent"``: a websocket opened with ``/api/ws?client=agent`` (*transport*, default the bound one), a session
+-    such a connection created or a hidden (bot plumbing) one (*session*), a relayed/hosted turn, a hidden widget
+-    intent, or a cross-session send. ``"human"``: :func:`is_human_typed_submit`. ``pre_llm_call`` plugins read it
+-    as ``input_origin`` (agent/turn_context.py); injected turns never reach here and stay ``""``."""
++    such a connection created or Bot Mode room plumbing (*session*: live flag or stored row), a relayed/hosted
++    turn, a hidden widget intent, or a cross-session send. ``"human"``: :func:`is_human_typed_submit`.
++    ``pre_llm_call`` plugins read it as ``input_origin`` (agent/turn_context.py); injected turns never reach
++    here and stay ``""``.
++
++    Hidden alone (``pending_hidden`` or a stored hidden row) is no authorship signal: the canonical Bot Chat is
++    born hidden and David types into it, so every submit into it must stay ``"human"`` (and stamp)."""
+     try:
+         from tui_gateway.transport import current_transport, is_agent_transport
+ 
+         if is_agent_transport(current_transport() if transport is None else transport):
+             return "agent"
+-        if isinstance(session, dict) and (session.get("agent_created") or session.get("pending_hidden")):
++        if isinstance(session, dict) and (session.get("agent_created") or session.get("room_plumbing")):
+             return "agent"
+         if rid is None or not isinstance(params, dict):
+             return ""
+@@ -87,7 +123,9 @@ def input_origin(rid, params, text, *, transport=None, session: dict | None = No
+             return "agent"
+         if isinstance(text, str) and text.lstrip().startswith(CROSS_SESSION_HEADER):
+             return "agent"
+-        return "human" if is_human_typed_submit(rid, params, text) else ""
++        if not is_human_typed_submit(rid, params, text):
++            return ""
++        return "agent" if isinstance(session, dict) and _stored_room_plumbing(session) else "human"
+     except Exception:  # health: allow BLE001 -- a classification must never fail a prompt
+         logger.debug("input-origin check failed", exc_info=True)
+         return ""
+@@ -96,8 +134,10 @@ def input_origin(rid, params, text, *, transport=None, session: dict | None = No
+ def note_submit(rid, params: dict, text, *, transport=None, session: dict | None = None) -> str:
+     """Record ``prompt.submit`` when a human typed it; return its :func:`input_origin`. Never raises.
+ 
+-    Agent traffic never stamps: a submit over a websocket opened with ``/api/ws?client=agent`` (*transport*,
+-    default the bound one), or into a session such a connection created (*session* ``agent_created``)."""
++    Only ``"human"`` stamps. Never: a websocket opened with ``/api/ws?client=agent`` (*transport*, default the bound
++    one); a session such a connection created (``agent_created``) or Bot Mode room plumbing (``room_plumbing``, or
++    its stored row); relayed/hosted params (``_turn_author``, ``_hosted_*``); hidden widget intents
++    (``display_kind=hidden``); cross-session sends; in-process submits with no request id."""
+     origin = input_origin(rid, params, text, transport=transport, session=session)
+     if origin == "human":
+         record_human_input(str(params.get("session_id") or ""))
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index 67bca62cad..ff5fd905d8 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -1015,12 +1015,17 @@ def _dispatch_admitted_prompt(rid, sid, session, text, turn_isolation, turn_auth
+         # (#85303 review: the early return made _reopen_if_finalized unreachable on
+         # this path). Best-effort like the helper: a failed read never blocks the send.
+         _reopen_before_isolated_submit(sid, session)
++        # [daveey] The remote turn consumes this submit's origin (prompt.submit's stash); a failed dispatch hands it
++        # back for the inline fallback's _run_after_agent_ready.
++        input_origin = session.pop("_submit_input_origin", "")
+         isolated_response = _submit_prompt_to_compute_host(
+-            rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata)
++            rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata,
++            input_origin=input_origin)
+         if not isolated_response.get("error"):
+             # The truncation already happened inline above (memory + DB).
+             isolated_response["result"].update(survivor_fields)
+             return isolated_response
++        session["_submit_input_origin"] = input_origin
+         # An ordinal/id alone is not consent. A client that carries a leftover ordinal into an ORDINARY
+         # submit sends a request that is indistinguishable, field by field, from a real rewind — same
+         # method, same shape, an in-range target — and the cut it asks for is a destructive
+-- 
+2.51.0
+

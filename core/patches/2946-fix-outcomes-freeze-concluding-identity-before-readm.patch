@@ -1,0 +1,300 @@
+From 278b56d9faa7994c090df8759254c680d97370ec Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 20:17:17 +0000
+Subject: [PATCH] fix(outcomes): freeze concluding identity before readmission
+ [daveey]
+
+---
+ .../hermes_state/test_outcome_reused_agent.py | 129 ++++++++++++++++++
+ .../test_bot_live_owner_delivery.py           |   2 +-
+ tui_gateway/prompt_turn.py                    |  19 ++-
+ tui_gateway/session_auto_continue.py          |   7 +-
+ tui_gateway/turn_marker.py                    |  16 ++-
+ tui_gateway/turn_outcome.py                   |   5 +-
+ 6 files changed, 163 insertions(+), 15 deletions(-)
+ create mode 100644 tests/hermes_state/test_outcome_reused_agent.py
+
+diff --git a/tests/hermes_state/test_outcome_reused_agent.py b/tests/hermes_state/test_outcome_reused_agent.py
+new file mode 100644
+index 0000000000..99bbc26303
+--- /dev/null
++++ b/tests/hermes_state/test_outcome_reused_agent.py
+@@ -0,0 +1,129 @@
++"""A concluding TUI turn must not retire or discount its reused agent's next turn."""
++import contextlib
++import contextvars
++import logging
++import threading
++import time
++from types import SimpleNamespace
++
++import pytest
++
++import hermes_state_outcome as so
++from tests.hermes_state.test_outcome_late_turn_end_refresh import _next_turn_starts, _tui_scope
++from tests.hermes_state import test_outcome_turn_end_declaration as helpers
++from tui_gateway import prompt_turn, server, turn_admission, turn_outcome
++from tui_gateway.method_ctx import rebind
++from tui_gateway.turn_marker import clear_turn_marker, read_turn_marker, record_turn_start
++
++db = helpers.db
++
++
++@pytest.mark.parametrize("path", ["refused", "exception", "complete"])
++@pytest.mark.parametrize("lease_only", [False, True])
++def test_settlement_reuses_agent_without_retiring_or_discarding_successor(db, monkeypatch, path, lease_only):
++    _tui_scope(monkeypatch, db)
++    monkeypatch.setattr(so, "_gateway_running", lambda home: True)
++    helpers._declare_then_reply(db)
++    home = db.db_path.parent
++    agent = SimpleNamespace(session_id="chat", _last_session_turn_lease_holder="turn-A")
++    session = dict(agent=agent, session_key="chat", profile_home=str(home),
++                   history_lock=threading.RLock(), running=True)
++    assert db.try_acquire_session_turn_lease("chat", "turn-A", ttl_seconds=300)
++    successor = []
++    retired = []
++    refreshed = []
++    real_refresh = turn_outcome.refresh_turn_outcome
++
++    def refresh(*a, **kw):
++        refreshed.append(kw["concluding_turn"])
++        return real_refresh(*a, **kw)
++
++    monkeypatch.setattr(turn_outcome, "refresh_turn_outcome", refresh)
++    noop = lambda *a, **kw: None
++
++    def record(*a, **kw):
++        assert record_turn_start(home, "chat", "A")
++        return "chat"
++
++    def prepare(*a):
++        if path == "exception":
++            raise ValueError("turn A failed")
++        return None if path == "refused" else ("prompt", "message", 80, None)
++
++    real_settle = turn_admission.settle_prompt_state
++
++    def settle(s, st):
++        real_settle(s, st)
++        assert not s["running"]
++        db.release_session_turn_lease("chat", "turn-A")
++        _next_turn_starts(db)
++        assert db.try_acquire_session_turn_lease("chat", "turn-B", ttl_seconds=300)
++        agent._last_session_turn_lease_holder = "turn-B"
++        assert record_turn_start(home, "chat", "B")
++        successor.append(read_turn_marker(home, "chat"))
++        s["running"] = True
++        assert so.derive_outcome("chat", db=db)["kind"] == "running"
++
++    def retire(*a, **kw):
++        server._retire_turn_marker(*a, **kw)  # real locked marker retirement, not a stub
++        retired.append(read_turn_marker(home, "chat"))
++        if lease_only:
++            # B published its terminal frame, but still owns a lease while unwinding. The marker
++            # assertion above and the lease-only outcome assertion below catch each half independently.
++            clear_turn_marker(home, "chat")
++
++    class Work:
++        def start(self, **kw):
++            self.target()
++            return True
++        def abort(self):
++            pass
++        def cancel(self):
++            pass
++
++    def work(target, **kw):
++        result = Work()
++        result.target = target
++        return result
++
++    monkeypatch.setattr(turn_admission, "settle_prompt_state", settle)
++    monkeypatch.setattr(server, "_clear_inflight_turn", noop)
++    monkeypatch.setattr(server, "_release_hosted_room_turn_slot", noop)
++    namespace = {name: noop for name in (
++        "_emit", "bind_transport", "reset_transport", "_release_turn_scopes",
++        "_post_turn_housekeeping", "_run_post_turn_followups", "_clear_inflight_turn", "_rearm_carried_pause_watcher", "_emit_settled_session_info",
++        "_ensure_session_db_row", "_reopen_routed_session_row", "_recover_turn_exception",
++        "_invoke_agent", "_record_stop_notice", "_schedule_refused_turn_retry",
++        "_after_complete_turn", "_publish_session_control_snapshot", "_goal_followup_after_turn")}
++    namespace.update(threading=threading, time=time, logger=logging.getLogger(__name__),
++        _prepare_session_work=work, _sessions_lock=threading.RLock(), _sessions={},
++        _admit_prompt_turn=lambda *a, **kw: ([], agent),
++        _session_profile_runtime_scope=lambda s: contextlib.nullcontext(),
++        _current_runtime_session_record=contextvars.ContextVar("reuse_turn"),
++        _TurnRun=prompt_turn._TurnRun, _record_turn_marker=record, _prepare_turn_input=prepare,
++        _retire_turn_marker=retire, _routing_provenance_db=lambda s: contextlib.nullcontext(None),
++        start_synthesized_turn=server.start_synthesized_turn,
++        _absorb_turn_result=lambda *a: None,
++        _complete_turn_payload=lambda *a: ({}, "", "complete"))
++    submit = rebind(prompt_turn._run_admitted_prompt, namespace)
++    assert submit(None, "live", session, "A")
++    assert successor
++    assert len(refreshed) == 1
++    assert "lease:turn-A" in refreshed[0]
++    assert "lease:turn-B" not in refreshed[0]
++    stored = so.get_outcome("chat", db=db)
++    assert (retired, stored["kind"]) == (successor, "running"), (retired, successor, stored)
++    assert read_turn_marker(home, "chat") == (None if lease_only else successor[0])
++
++
++@pytest.mark.parametrize("ownership", ["own", "unknown", "other"])
++def test_late_retirement_only_deletes_its_named_marker(db, ownership):
++    home = db.db_path.parent
++    assert record_turn_start(home, "chat", "own prompt")
++    marker = read_turn_marker(home, "chat")
++    identity = so.turn_identity(marker=marker) if ownership == "own" else frozenset()
++    if ownership == "other":
++        identity = so.turn_identity(marker={**marker, "started_at": marker["started_at"] - 1})
++    session = dict(session_key="chat", profile_home=str(home))
++    server._retire_turn_marker(session, "chat", concluding_turn=identity)
++    assert read_turn_marker(home, "chat") == (None if ownership == "own" else marker)
+diff --git a/tests/tui_gateway/test_bot_live_owner_delivery.py b/tests/tui_gateway/test_bot_live_owner_delivery.py
+index 88da91b9bf..bce3253e7a 100644
+--- a/tests/tui_gateway/test_bot_live_owner_delivery.py
++++ b/tests/tui_gateway/test_bot_live_owner_delivery.py
+@@ -47,7 +47,7 @@ def test_refused_input_reports_a_failed_terminal_outcome():
+         "_clear_inflight_turn": noop,
+         # Hosted room member sessions drop their bot_room slot at turn end (#106847); a canonical chat is not one.
+         "_release_hosted_room_turn_slot": noop,
+-        "_retire_turn_marker": lambda *args: retired.append(args),
++        "_retire_turn_marker": lambda *args, **kwargs: retired.append(args),
+         "_emit_settled_session_info": noop,
+         "_routing_provenance_db": lambda _session: contextlib.nullcontext(None),
+         "_reopen_routed_session_row": noop,
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index ad01a03de1..366b762491 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -1421,6 +1421,7 @@ def _run_admitted_prompt(
+         automation_replay.install_failure_copy(st, text)
+         st.literal_text = bool((display_metadata or {}).get("producer_admission"))
+         goal_followup = None
++        concluding = None
+         try:
+             prepared = _prepare_turn_input(sid, session, st, text, images)
+             if prepared is None:
+@@ -1456,8 +1457,8 @@ def _run_admitted_prompt(
+                 if paused_for_update:
+                     update_pause.start_in_place_watcher(sid, session, st.marker_key)
+             from tui_gateway.turn_outcome import concluding_turn_identity
+-            _schedule_refused_turn_retry(sid, session, st.marker_key,
+-                                         concluding_turn_identity(st.agent, st.own_marker))
++            concluding = concluding_turn_identity(st.agent, st.own_marker)
++            _schedule_refused_turn_retry(sid, session, st.marker_key, concluding)
+             if status == "complete":
+                 # [daveey] This turn's context carried any failed delivery already in the transcript.
+                 automation_replay.cancel_carried(st.marker_key, str(session.get("session_key") or ""))
+@@ -1475,6 +1476,11 @@ def _run_admitted_prompt(
+             automation_replay.plan_for_turn(st, {"error": f"{type(e).__name__}: {e}"})
+             automation_replay.schedule_for_turn(session, st)
+         finally:
++            # Capture before admission reopens: the reused agent may then hold the next turn's lease.
++            from tui_gateway.turn_outcome import concluding_turn_identity
++            if concluding is None:
++                concluding = concluding_turn_identity(st.agent, st.own_marker)
++            outcome_sid = str(getattr(st.agent, "session_id", "") or session.get("session_key") or "")
+             automation_replay.remove_failure_copy(st)
+             _release_turn_scopes(sid, session, st)
+             try:  # a raising settle step must not skip the trim / HERMES_HOME reset
+@@ -1500,12 +1506,12 @@ def _run_admitted_prompt(
+                 logger.info(
+                     "tui turn finished: ui_session=%s session_key=%s agent_session_id=%s status=%s "
+                     "error_retained=%s duration=%.1fs%s",
+-                    sid, session.get("session_key") or "", getattr(st.agent, "session_id", "") or "",
++                    sid, session.get("session_key") or "", outcome_sid,
+                     status, st.error_retained, time.monotonic() - _turn_started_monotonic,
+                     st.error_detail)
+                 # Backstop for turns that never reached a terminal frame.
+                 if st.receipt_committed:
+-                    _retire_turn_marker(session, st.marker_key)
++                    _retire_turn_marker(session, st.marker_key, concluding_turn=concluding)
+                     with session["history_lock"]:
+                         if session.get("_active_turn_marker_key") == st.marker_key:
+                             session.pop("_active_turn_marker_key", None)
+@@ -1519,9 +1525,8 @@ def _run_admitted_prompt(
+                 _emit_settled_session_info(sid, session, st.agent)
+             finally:
+                 try:
+-                    from tui_gateway.turn_outcome import (  # [daveey] every conclusion, before the profile
+-                        concluding_turn_identity, refresh_turn_outcome)  # scope resets; only its own evidence
+-                    refresh_turn_outcome(session, st.agent, concluding_turn_identity(st.agent, st.own_marker))
++                    from tui_gateway.turn_outcome import refresh_turn_outcome
++                    refresh_turn_outcome(session, concluding_turn=concluding, session_id=outcome_sid)
+                     _post_turn_housekeeping(sid, session, st)
+                 finally:
+                     _rearm_carried_pause_watcher(sid, session, st)
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 812eec7984..ae3a6171eb 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -74,7 +74,7 @@ def _session_home(session: dict) -> Path:
+     return Path(session.get("profile_home") or _hermes_home)
+ 
+ 
+-def _retire_turn_marker(session: dict, *keys: str) -> None:
++def _retire_turn_marker(session: dict, *keys: str, concluding_turn: frozenset | None = None) -> None:
+     """Drop the crash marker right before the terminal frame (not at turn-thread end: post-turn work outlives the
+     client's answer, and quitting in that window would leave a marker that re-runs a finished turn). Extra ``keys``
+     cover a session_key that compression rotated mid-turn. A turn stopped by backend shutdown keeps its marker
+@@ -87,7 +87,10 @@ def _retire_turn_marker(session: dict, *keys: str) -> None:
+     home = _session_home(session)
+     for key in dict.fromkeys((*keys, str(session.get("session_key") or ""))):
+         if key:
+-            clear_turn_marker(home, key)
++            if concluding_turn is None:
++                clear_turn_marker(home, key)
++            else:
++                clear_turn_marker(home, key, concluding_turn=concluding_turn)
+ 
+ 
+ def _hold_refused_turn(session: dict, marker_key: str, display_kind, error_surface) -> None:
+diff --git a/tui_gateway/turn_marker.py b/tui_gateway/turn_marker.py
+index 6b01cfc773..21a93363ab 100644
+--- a/tui_gateway/turn_marker.py
++++ b/tui_gateway/turn_marker.py
+@@ -252,10 +252,20 @@ def merge_receipts(home: Path | str, session_key: str, jobs: list, merge, *, cre
+     return bool(session_key) and _update(home, session_key, mutate, "journal jobs")
+ 
+ 
+-def clear_turn_marker(home: Path | str, session_key: str) -> None:
+-    """Remove the marker once its turn concluded (any outcome the client saw)."""
++def clear_turn_marker(home: Path | str, session_key: str, *, concluding_turn: frozenset | None = None) -> None:
++    """Remove a concluded marker. A late backstop must name its owner; compare and delete under the same lock."""
++    def mutate(entries):
++        if session_key not in entries:
++            return None
++        if concluding_turn is not None:
++            from hermes_state_outcome import turn_identity
++            identity = turn_identity(marker=entries[session_key])
++            if not identity or not identity <= concluding_turn:
++                return None
++        return {k: v for k, v in entries.items() if k != session_key}
++
+     if session_key:
+-        _update(home, session_key, lambda e: {k: v for k, v in e.items() if k != session_key} if session_key in e else None, "clear")
++        _update(home, session_key, mutate, "clear")
+ 
+ 
+ def mark_turn_tool_started(home: Path | str, session_key: str) -> bool:
+diff --git a/tui_gateway/turn_outcome.py b/tui_gateway/turn_outcome.py
+index 8f10f3a44b..d0fc7fbe48 100644
+--- a/tui_gateway/turn_outcome.py
++++ b/tui_gateway/turn_outcome.py
+@@ -47,10 +47,11 @@ def concluding_turn_identity(agent=None, marker: Optional[dict] = None) -> froze
+         return frozenset()
+ 
+ 
+-def refresh_turn_outcome(session: dict, agent=None, concluding_turn: Optional[frozenset] = None) -> None:
++def refresh_turn_outcome(session: dict, agent=None, concluding_turn: Optional[frozenset] = None,
++                         *, session_id: Optional[str] = None) -> None:
+     """Refresh the outcome of the row this turn wrote (the agent's compression tip, else the session key).
+     ``concluding_turn``: the turn's own evidence (``concluding_turn_identity``); omitted = nothing discounted."""
+-    sid = _turn_sid(session, agent)
++    sid = _turn_sid(session, agent) if session_id is None else session_id
+     if not sid:
+         return
+     try:
+-- 
+2.51.0
+

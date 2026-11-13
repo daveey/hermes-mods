@@ -1,0 +1,804 @@
+From 7c0b09492aeec57b122bab5e612b18dc871f606b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:10:21 +0000
+Subject: [PATCH] [daveey] Desktop: drive fetchJson/fetchPublicJson themselves
+ in tests (json-fetch.ts seam)
+
+PR #1981 review nit: api-transport.test.ts proves sendWithRequestDeadline,
+but nothing failed if fetchJson or fetchPublicJson stopped calling it (an
+inline req.write + deadline.arm(req, reject) without the body size).
+
+Move both helpers out of main.ts into electron/json-fetch.ts
+(fetchJsonWith / fetchPublicJsonWith) with main.ts's remote-header and
+native-grant sources passed in as deps; main.ts keeps thin fetchJson /
+fetchPublicJson wrappers, so every caller is unchanged.
+
+json-fetch.test.ts drives both against a live loopback server:
+- a ~125 KB POST to a server busy 600 ms answers under a 200 ms timeout
+  (body-scaled budget), and a small body times out at exactly its budget;
+- a POST dropped after the server read it is not replayed (bodySent),
+  while a dropped GET is retried;
+- pool: 'probe' rides the 2-socket probe pool (a third probe queues),
+  replacing the main.ts source regex for it in remote-down-gate.test.ts.
+
+RED: fetchJson with inline write/arm and no body size fails the two budget
+tests; arm with the body but no bodySent fails the replay test; ignoring
+options.pool fails the probe-pool test.
+---
+ apps/desktop/electron/json-fetch.test.ts      | 211 +++++++++++++++
+ apps/desktop/electron/json-fetch.ts           | 255 ++++++++++++++++++
+ apps/desktop/electron/main.ts                 | 237 +---------------
+ .../desktop/electron/remote-down-gate.test.ts |   4 +-
+ 4 files changed, 479 insertions(+), 228 deletions(-)
+ create mode 100644 apps/desktop/electron/json-fetch.test.ts
+ create mode 100644 apps/desktop/electron/json-fetch.ts
+
+diff --git a/apps/desktop/electron/json-fetch.test.ts b/apps/desktop/electron/json-fetch.test.ts
+new file mode 100644
+index 0000000000..7f4cf64492
+--- /dev/null
++++ b/apps/desktop/electron/json-fetch.test.ts
+@@ -0,0 +1,211 @@
++import http from 'node:http'
++import type { AddressInfo } from 'node:net'
++
++import { afterAll, describe, expect, it } from 'vitest'
++
++import { destroyKeepaliveAgents, requestDeadlineBudgetMs } from './api-transport'
++import { fetchJsonWith, fetchPublicJsonWith, type JsonFetchDeps } from './json-fetch'
++
++/**
++ * fetchJson / fetchPublicJson themselves (json-fetch.ts, which main.ts wraps), driven against a live loopback server.
++ * api-transport.test.ts proves sendWithRequestDeadline; these prove both helpers actually send through it: a large
++ * body gets the body-scaled total budget, and once the body is on the wire a POST is not replayed.
++ */
++
++const deps: JsonFetchDeps = {
++  remoteHeaders: () => ({}),
++  nativeHeaders: async () => null
++}
++
++const TIMEOUT_MS = 200
++// ~125 KB of JSON: at 125 bytes/ms the total budget grows by ~1 s, well past BUSY_MS.
++const LARGE = { blob: 'x'.repeat(125_000) }
++const SMALL = { blob: 'x' }
++// The server stays busy this long after reading the body: longer than TIMEOUT_MS, shorter than the scaled budget.
++const BUSY_MS = 600
++
++/**
++ * /busy reads the body, then keeps the connection active for BUSY_MS (a byte every 20 ms, so the idle timer never
++ * fires) before answering with the byte count. /drop reads the body and destroys the socket without answering.
++ */
++function testServer() {
++  const hits = { busy: 0, drop: 0 }
++
++  const server = http.createServer((req, res) => {
++    let bytes = 0
++    req.on('data', chunk => (bytes += chunk.length))
++    req.on('end', () => {
++      if (req.url === '/drop') {
++        hits.drop += 1
++        req.socket.destroy()
++
++        return
++      }
++
++      hits.busy += 1
++      res.writeHead(200, { 'Content-Type': 'application/json' })
++      const tick = setInterval(() => res.write(' '), 20)
++      setTimeout(() => {
++        clearInterval(tick)
++        res.end(JSON.stringify({ bytes }))
++      }, BUSY_MS)
++    })
++  })
++
++  return {
++    hits,
++    async listen(): Promise<string> {
++      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
++
++      return `http://127.0.0.1:${(server.address() as AddressInfo).port}`
++    },
++    close: () =>
++      new Promise<void>(resolve => {
++        server.closeAllConnections()
++        server.close(() => resolve())
++      })
++  }
++}
++
++afterAll(() => destroyKeepaliveAgents())
++
++describe('fetchJson request pools', () => {
++  /** Counts requests that reached the server and holds each open until `release()`. */
++  function holdingServer() {
++    const held: http.ServerResponse[] = []
++
++    const server = http.createServer((_req, res) => {
++      held.push(res)
++    })
++
++    return {
++      held,
++      async listen(): Promise<string> {
++        await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
++
++        return `http://127.0.0.1:${(server.address() as AddressInfo).port}`
++      },
++      release() {
++        for (const res of held.splice(0)) {
++          res.writeHead(200, { 'Content-Type': 'application/json' })
++          res.end('{"ok":true}')
++        }
++      },
++      close: () =>
++        new Promise<void>(resolve => {
++          server.closeAllConnections()
++          server.close(() => resolve())
++        })
++    }
++  }
++
++  const reached = async (srv: { held: unknown[] }, count: number) => {
++    const until = Date.now() + 2_000
++
++    while (srv.held.length < count && Date.now() < until) {
++      await new Promise(resolve => setTimeout(resolve, 10))
++    }
++
++    // Give a queued request time to (wrongly) get a socket of its own.
++    await new Promise(resolve => setTimeout(resolve, 100))
++
++    return srv.held.length
++  }
++
++  it("pool: 'probe' rides the small probe pool, so a third concurrent probe queues", async () => {
++    const srv = holdingServer()
++    const base = await srv.listen()
++
++    try {
++      const calls = [1, 2, 3].map(() => fetchJsonWith(deps, `${base}/api/health`, 'token', { pool: 'probe' }))
++
++      expect(await reached(srv, 2)).toBe(2)
++      srv.release()
++      expect(await reached(srv, 1)).toBe(1)
++      srv.release()
++      await expect(Promise.all(calls)).resolves.toEqual([{ ok: true }, { ok: true }, { ok: true }])
++    } finally {
++      await srv.close()
++    }
++  })
++
++  it('the default JSON pool is not held to the probe limit', async () => {
++    const srv = holdingServer()
++    const base = await srv.listen()
++
++    try {
++      const calls = [1, 2, 3].map(() => fetchJsonWith(deps, `${base}/api/health`, 'token'))
++
++      expect(await reached(srv, 3)).toBe(3)
++      srv.release()
++      await expect(Promise.all(calls)).resolves.toEqual([{ ok: true }, { ok: true }, { ok: true }])
++    } finally {
++      await srv.close()
++    }
++  })
++})
++
++const helpers = {
++  fetchJson: (url: string, options: any) => fetchJsonWith(deps, url, 'session-token', options),
++  fetchPublicJson: (url: string, options: any) => fetchPublicJsonWith(deps, url, options)
++}
++
++describe.each(Object.entries(helpers))('%s total deadline and retry state', (_name, fetchHelper) => {
++  it('gives a large body the body-scaled budget: a POST outlasting the base deadline still answers', async () => {
++    const srv = testServer()
++    const base = await srv.listen()
++
++    try {
++      const answer = (await fetchHelper(`${base}/busy`, {
++        method: 'POST',
++        body: LARGE,
++        timeoutMs: TIMEOUT_MS
++      })) as { bytes: number }
++
++      expect(answer.bytes).toBe(Buffer.byteLength(JSON.stringify(LARGE)))
++    } finally {
++      await srv.close()
++    }
++  })
++
++  it('a small body gets only its own few ms on top: the same busy server times it out at that budget', async () => {
++    const srv = testServer()
++    const base = await srv.listen()
++    const budgetMs = requestDeadlineBudgetMs(TIMEOUT_MS, Buffer.byteLength(JSON.stringify(SMALL)))
++
++    try {
++      expect(budgetMs).toBeLessThan(BUSY_MS)
++      await expect(fetchHelper(`${base}/busy`, { method: 'POST', body: SMALL, timeoutMs: TIMEOUT_MS })).rejects.toThrow(
++        `Timed out connecting to Hermes backend after ${budgetMs}ms`
++      )
++    } finally {
++      await srv.close()
++    }
++  })
++
++  it('marks the body sent: a POST dropped after the server read it is not replayed', async () => {
++    const srv = testServer()
++    const base = await srv.listen()
++
++    try {
++      await expect(fetchHelper(`${base}/drop`, { method: 'POST', body: SMALL, timeoutMs: 2_000 })).rejects.toThrow(
++        /socket hang up|ECONNRESET/
++      )
++      expect(srv.hits.drop).toBe(1)
++    } finally {
++      await srv.close()
++    }
++  })
++
++  it('a dropped GET is still retried (idempotent), so the drop above is the bodySent gate, not a dead retry loop', async () => {
++    const srv = testServer()
++    const base = await srv.listen()
++
++    try {
++      await expect(fetchHelper(`${base}/drop`, { timeoutMs: 2_000 })).rejects.toThrow(/socket hang up|ECONNRESET/)
++      expect(srv.hits.drop).toBe(3)
++    } finally {
++      await srv.close()
++    }
++  })
++})
+diff --git a/apps/desktop/electron/json-fetch.ts b/apps/desktop/electron/json-fetch.ts
+new file mode 100644
+index 0000000000..3f321bb7a5
+--- /dev/null
++++ b/apps/desktop/electron/json-fetch.ts
+@@ -0,0 +1,255 @@
++/**
++ * [daveey] The Electron main process's JSON REST helpers (fetchJson / fetchPublicJson), lifted out of main.ts so
++ * vitest can drive them against a live local server without Electron. main.ts keeps thin `fetchJson` /
++ * `fetchPublicJson` wrappers that pass its remote-header and native-gateway-grant sources in as `deps`.
++ *
++ * Transport policy (pools, retry gating, the total request deadline and its body-size budget) lives in
++ * api-transport.ts; this module only builds and parses the requests.
++ */
++
++import http from 'node:http'
++import https from 'node:https'
++
++import {
++  htmlResponseError,
++  httpStatusError,
++  jsonAgentFor,
++  multipartBody,
++  sendWithRequestDeadline,
++  startRequestDeadline,
++  withRetry
++} from './api-transport'
++import { decodeResponseBody, displayTranscriptHeaders } from './display-transcript'
++import { DEFAULT_FETCH_TIMEOUT_MS, resolveTimeoutMs } from './hardening'
++
++/** What main.ts supplies: headers configured for remote gateways, and one-use native gateway grants. */
++export interface JsonFetchDeps {
++  remoteHeaders: (url: string) => Record<string, string>
++  nativeHeaders: (descriptor: any, url: string, method: string, body: unknown) => Promise<null | Record<string, string>>
++}
++
++export function fetchJsonWith(deps: JsonFetchDeps, url: string, token: null | string, options: any = {}) {
++  // Retry policy lives in api-transport.ts: idempotent verbs retry on any
++  // transient transport error; POST/PUT/DELETE only when the request provably
++  // never reached the server (see shouldRetryRequest) — never double-submit.
++  return withRetry(
++    async (requestState: any) => {
++      // [daveey] Total per-attempt deadline from here: covers grant minting, Agent queue wait, connect and response.
++      const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
++      const deadline = startRequestDeadline(timeoutMs)
++
++      // Mint inside each retry: a grant authorizes exactly one HTTP request.
++      const nativeHeaders = options.gatewayDescriptor
++        ? await deps.nativeHeaders(
++            options.gatewayDescriptor,
++            url,
++            options.method || 'GET',
++            options.upload ? undefined : options.body
++          )
++        : null
++
++      return new Promise((resolve, reject) => {
++        const { body, contentType } = options.upload
++          ? multipartBody(options.upload)
++          : {
++              body: options.body === undefined ? undefined : Buffer.from(JSON.stringify(options.body)),
++              contentType: 'application/json'
++            }
++
++        const parsed = new URL(url)
++        const client = parsed.protocol === 'https:' ? https : http
++        // The dispatch health probe rides its own small pool (pool: 'probe') so a saturated JSON pool can't fail it.
++        const agent = jsonAgentFor(parsed.protocol, options.pool === 'probe' ? 'probe' : 'json')
++
++        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
++          reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
++
++          return
++        }
++
++        // On the wire from here (api-transport sendWithRequestDeadline): the deadline is armed with the body's size,
++        // and requestState.bodySent is set, so a later transport error no longer proves the server didn't process it
++        // and non-idempotent verbs are not retried.
++        sendWithRequestDeadline(
++          deadline,
++          () =>
++            client.request(
++              parsed,
++              {
++                agent,
++                method: options.method || 'GET',
++                headers: {
++                  ...deps.remoteHeaders(url),
++                  // [daveey] Transcript pages: slim + gzip when the backend supports it (display-transcript.ts).
++                  ...displayTranscriptHeaders(options.method, url),
++                  ...(options.headers || {}),
++                  'Content-Type': contentType,
++                  ...(nativeHeaders || { 'X-Hermes-Session-Token': token }),
++                  // RFC 8252 native flow authenticates the gated gateway with a bearer
++                  // token instead of the loopback session-token header. When
++                  // ``options.bearer`` is set we send Authorization: Bearer <token>;
++                  // the gateway's OAuth gate verifies it via the provider stack with
++                  // no cookie involved.
++                  ...(options.bearer ? { Authorization: `Bearer ${options.bearer}` } : {}),
++                  ...(body ? { 'Content-Length': String(body.length) } : {})
++                }
++              },
++              res => {
++                const chunks: Buffer[] = []
++                res.on('error', reject)
++                res.on('data', chunk => chunks.push(chunk))
++                res.on('end', () => {
++                  let text: string
++
++                  try {
++                    text = decodeResponseBody(Buffer.concat(chunks), res.headers['content-encoding'])
++                  } catch (error) {
++                    reject(error)
++
++                    return
++                  }
++
++                  if ((res.statusCode || 500) >= 400) {
++                    reject(httpStatusError(res.statusCode, text, res.statusMessage))
++
++                    return
++                  }
++
++                  // http.request never follows redirects, so any 3xx -- with an HTML
++                  // login page, an empty body, whatever -- is the request bouncing
++                  // off a proxy or a scheme/slash mismatch, never JSON.
++                  if (res.statusCode >= 300) {
++                    reject(htmlResponseError(url, res.statusCode, res.headers.location))
++
++                    return
++                  }
++
++                  if (!text) {
++                    resolve(null)
++
++                    return
++                  }
++
++                  // A 2xx response whose body is HTML means the request fell through
++                  // to the SPA index.html (e.g. an unregistered /api path). JSON.parse
++                  // would throw an opaque `Unexpected token '<'` here, so surface a
++                  // clear diagnostic with the offending URL instead.
++                  const looksHtml = /^\s*<(?:!doctype|html)/i.test(text)
++                  const contentType = String(res.headers['content-type'] || '')
++
++                  if (looksHtml || contentType.includes('text/html')) {
++                    reject(htmlResponseError(url, res.statusCode))
++
++                    return
++                  }
++
++                  try {
++                    resolve(JSON.parse(text))
++                  } catch {
++                    reject(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
++                  }
++                })
++              }
++            ),
++          { body, onError: reject, requestState }
++        )
++      })
++    },
++    { method: options.method || 'GET' }
++  )
++}
++
++export function fetchPublicJsonWith(deps: JsonFetchDeps, url: string, options: any = {}) {
++  // Credential-free JSON GET/POST for public gateway endpoints
++  // (``/api/status``, ``/api/auth/providers``). Unlike ``fetchJson`` it sends
++  // NO ``X-Hermes-Session-Token`` header — used by the auth-mode probe before
++  // any credentials exist, and any time we must not leak a token to an
++  // endpoint that doesn't need one.
++  return withRetry(
++    (requestState: any) =>
++      new Promise((resolve, reject) => {
++        const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
++        const deadline = startRequestDeadline(timeoutMs)
++        const body = options.body === undefined ? undefined : Buffer.from(JSON.stringify(options.body))
++        let parsed
++
++        try {
++          parsed = new URL(url)
++        } catch (error) {
++          reject(new Error(`Invalid URL: ${error.message}`))
++
++          return
++        }
++
++        const client = parsed.protocol === 'https:' ? https : http
++        const agent = jsonAgentFor(parsed.protocol)
++
++        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
++          reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
++
++          return
++        }
++
++        // Past this point the request is on the wire — see fetchJson.
++        sendWithRequestDeadline(
++          deadline,
++          () =>
++            client.request(
++              parsed,
++              {
++                agent,
++                method: options.method || 'GET',
++                headers: {
++                  ...deps.remoteHeaders(url),
++                  ...(options.headers || {}),
++                  'Content-Type': 'application/json',
++                  ...(body ? { 'Content-Length': String(body.length) } : {})
++                }
++              },
++              res => {
++                const chunks: Buffer[] = []
++                res.on('data', chunk => chunks.push(chunk))
++                res.on('end', () => {
++                  const text = Buffer.concat(chunks).toString('utf8')
++
++                  if ((res.statusCode || 500) >= 400) {
++                    reject(httpStatusError(res.statusCode, text, res.statusMessage))
++
++                    return
++                  }
++
++                  if (res.statusCode >= 300) {
++                    reject(htmlResponseError(url, res.statusCode, res.headers.location))
++
++                    return
++                  }
++
++                  if (!text) {
++                    resolve(null)
++
++                    return
++                  }
++
++                  const looksHtml = /^\s*<(?:!doctype|html)/i.test(text)
++                  const contentType = String(res.headers['content-type'] || '')
++
++                  if (looksHtml || contentType.includes('text/html')) {
++                    reject(htmlResponseError(url, res.statusCode))
++
++                    return
++                  }
++
++                  try {
++                    resolve(JSON.parse(text))
++                  } catch {
++                    reject(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
++                  }
++                })
++              }
++            ),
++          { body, onError: reject, requestState }
++        )
++      }),
++    { method: options.method || 'GET' }
++  )
++}
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index d8704d30c2..92681baecd 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -46,18 +46,7 @@ import { type ActiveRuntimeState, classifyActiveRuntime } from './active-runtime
+ import { hideAgentTestInstance, isHiddenAgentTestInstance } from './agent-test-instance'
+ import { HERMES_API_EXPECTED_404 } from './api-expected-404'
+ import { formatApiRequestFailure } from './api-request-failure'
+-import {
+-  destroyKeepaliveAgents,
+-  htmlResponseError,
+-  httpStatusError,
+-  jsonAgentFor,
+-  multipartBody,
+-  readJsonErrorBody,
+-  readStatusCode,
+-  sendWithRequestDeadline,
+-  startRequestDeadline,
+-  withRetry
+-} from './api-transport'
++import { destroyKeepaliveAgents, readJsonErrorBody, readStatusCode } from './api-transport'
+ import { appIconCandidates, resolveAppIcon, shouldOverrideDockIcon } from './app-icon'
+ import { stageAppInstallerFile } from './app-installer-file'
+ import { createAppRelauncher, relaunchApp } from './app-relaunch'
+@@ -251,7 +240,6 @@ import {
+   type UninstallSummaryDetails
+ } from './desktop-uninstall'
+ import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
+-import { decodeResponseBody, displayTranscriptHeaders } from './display-transcript'
+ import { preReadyDockLaunchSteps } from './dock-launch-order'
+ import { embedHostOrigin } from './embed-host'
+ import { installEmbedReferer } from './embed-referer'
+@@ -338,6 +326,7 @@ import { buildHudWindowUrl } from './hud-url'
+ import { linuxOzoneBackend, resolveHudWindowing } from './hud-windowing'
+ import { INSTALL_STAMP, installShape } from './install-stamp'
+ import type { InstallStamp } from './install-stamp'
++import { fetchJsonWith, fetchPublicJsonWith, type JsonFetchDeps } from './json-fetch'
+ import { createKeepAwakeController } from './keep-awake-controller'
+ import { launchBuildIdentity } from './launch-build-identity'
+ import { applyLaunchProfileOverride, parseLaunchProfile } from './launch-profile'
+@@ -5215,223 +5204,19 @@ async function ensureRuntime(
+ }
+ 
+ function fetchJson(url, token, options: any = {}) {
+-  // Retry policy lives in api-transport.ts: idempotent verbs retry on any
+-  // transient transport error; POST/PUT/DELETE only when the request provably
+-  // never reached the server (see shouldRetryRequest) — never double-submit.
+-  return withRetry(
+-    async (requestState: any) => {
+-      // [daveey] Total per-attempt deadline from here: covers grant minting, Agent queue wait, connect and response.
+-      const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+-      const deadline = startRequestDeadline(timeoutMs)
+-      // Mint inside each retry: a grant authorizes exactly one HTTP request.
+-      const nativeHeaders = options.gatewayDescriptor
+-        ? await nativeGatewayHttpHeaders(options.gatewayDescriptor, url, HERMES_HOME, options.method || 'GET', options.upload ? undefined : options.body)
+-        : null
+-
+-      return new Promise((resolve, reject) => {
+-        const { body, contentType } = options.upload
+-          ? multipartBody(options.upload)
+-          : {
+-              body: options.body === undefined ? undefined : Buffer.from(JSON.stringify(options.body)),
+-              contentType: 'application/json'
+-            }
+-
+-        const parsed = new URL(url)
+-        const client = parsed.protocol === 'https:' ? https : http
+-        // The dispatch health probe rides its own small pool (pool: 'probe') so a saturated JSON pool can't fail it.
+-        const agent = jsonAgentFor(parsed.protocol, options.pool === 'probe' ? 'probe' : 'json')
+-
+-        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+-          reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
+-
+-          return
+-        }
+-
+-        // On the wire from here (api-transport sendWithRequestDeadline): the deadline is armed with the body's size,
+-        // and requestState.bodySent is set, so a later transport error no longer proves the server didn't process it
+-        // and non-idempotent verbs are not retried.
+-        sendWithRequestDeadline(
+-          deadline,
+-          () =>
+-            client.request(
+-              parsed,
+-              {
+-                agent,
+-                method: options.method || 'GET',
+-                headers: {
+-                  ...headersForRemoteRequest(url),
+-                  // [daveey] Transcript pages: slim + gzip when the backend supports it (display-transcript.ts).
+-                  ...displayTranscriptHeaders(options.method, url),
+-                  ...(options.headers || {}),
+-                  'Content-Type': contentType,
+-                  ...(nativeHeaders || { 'X-Hermes-Session-Token': token }),
+-                  // RFC 8252 native flow authenticates the gated gateway with a bearer
+-                  // token instead of the loopback session-token header. When
+-                  // ``options.bearer`` is set we send Authorization: Bearer <token>;
+-                  // the gateway's OAuth gate verifies it via the provider stack with
+-                  // no cookie involved.
+-                  ...(options.bearer ? { Authorization: `Bearer ${options.bearer}` } : {}),
+-                  ...(body ? { 'Content-Length': String(body.length) } : {})
+-                }
+-              },
+-              res => {
+-                const chunks = []
+-                res.on('error', reject)
+-                res.on('data', chunk => chunks.push(chunk))
+-                res.on('end', () => {
+-                  let text: string
+-
+-                  try {
+-                    text = decodeResponseBody(Buffer.concat(chunks), res.headers['content-encoding'])
+-                  } catch (error) {
+-                    reject(error)
+-
+-                    return
+-                  }
+-
+-                  if ((res.statusCode || 500) >= 400) {
+-                    reject(httpStatusError(res.statusCode, text, res.statusMessage))
+-
+-                    return
+-                  }
+-
+-                  // http.request never follows redirects, so any 3xx -- with an HTML
+-                  // login page, an empty body, whatever -- is the request bouncing
+-                  // off a proxy or a scheme/slash mismatch, never JSON.
+-                  if (res.statusCode >= 300) {
+-                    reject(htmlResponseError(url, res.statusCode, res.headers.location))
+-
+-                    return
+-                  }
+-
+-                  if (!text) {
+-                    resolve(null)
+-
+-                    return
+-                  }
+-
+-                  // A 2xx response whose body is HTML means the request fell through
+-                  // to the SPA index.html (e.g. an unregistered /api path). JSON.parse
+-                  // would throw an opaque `Unexpected token '<'` here, so surface a
+-                  // clear diagnostic with the offending URL instead.
+-                  const looksHtml = /^\s*<(?:!doctype|html)/i.test(text)
+-                  const contentType = String(res.headers['content-type'] || '')
+-
+-                  if (looksHtml || contentType.includes('text/html')) {
+-                    reject(htmlResponseError(url, res.statusCode))
+-
+-                    return
+-                  }
+-
+-                  try {
+-                    resolve(JSON.parse(text))
+-                  } catch {
+-                    reject(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
+-                  }
+-                })
+-              }
+-            ),
+-          { body, onError: reject, requestState }
+-        )
+-      })
+-    },
+-    { method: options.method || 'GET' }
+-  )
++  return fetchJsonWith(jsonFetchDeps(), url, token, options)
+ }
+ 
+ function fetchPublicJson(url, options: any = {}) {
+-  // Credential-free JSON GET/POST for public gateway endpoints
+-  // (``/api/status``, ``/api/auth/providers``). Unlike ``fetchJson`` it sends
+-  // NO ``X-Hermes-Session-Token`` header — used by the auth-mode probe before
+-  // any credentials exist, and any time we must not leak a token to an
+-  // endpoint that doesn't need one.
+-  return withRetry(
+-    (requestState: any) =>
+-      new Promise((resolve, reject) => {
+-        const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+-        const deadline = startRequestDeadline(timeoutMs)
+-        const body = options.body === undefined ? undefined : Buffer.from(JSON.stringify(options.body))
+-        let parsed
+-
+-        try {
+-          parsed = new URL(url)
+-        } catch (error) {
+-          reject(new Error(`Invalid URL: ${error.message}`))
+-
+-          return
+-        }
+-
+-        const client = parsed.protocol === 'https:' ? https : http
+-        const agent = jsonAgentFor(parsed.protocol)
+-
+-        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+-          reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
+-
+-          return
+-        }
++  return fetchPublicJsonWith(jsonFetchDeps(), url, options)
++}
+ 
+-        // Past this point the request is on the wire — see fetchJson.
+-        sendWithRequestDeadline(
+-          deadline,
+-          () =>
+-            client.request(
+-              parsed,
+-              {
+-                agent,
+-                method: options.method || 'GET',
+-                headers: {
+-                  ...headersForRemoteRequest(url),
+-                  ...(options.headers || {}),
+-                  'Content-Type': 'application/json',
+-                  ...(body ? { 'Content-Length': String(body.length) } : {})
+-                }
+-              },
+-              res => {
+-                const chunks = []
+-                res.on('data', chunk => chunks.push(chunk))
+-                res.on('end', () => {
+-                  const text = Buffer.concat(chunks).toString('utf8')
+-
+-                  if ((res.statusCode || 500) >= 400) {
+-                    reject(httpStatusError(res.statusCode, text, res.statusMessage))
+-
+-                    return
+-                  }
+-
+-                  if (res.statusCode >= 300) {
+-                    reject(htmlResponseError(url, res.statusCode, res.headers.location))
+-
+-                    return
+-                  }
+-
+-                  if (!text) {
+-                    resolve(null)
+-
+-                    return
+-                  }
+-
+-                  const looksHtml = /^\s*<(?:!doctype|html)/i.test(text)
+-                  const contentType = String(res.headers['content-type'] || '')
+-
+-                  if (looksHtml || contentType.includes('text/html')) {
+-                    reject(htmlResponseError(url, res.statusCode))
+-
+-                    return
+-                  }
+-
+-                  try {
+-                    resolve(JSON.parse(text))
+-                  } catch {
+-                    reject(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
+-                  }
+-                })
+-              }
+-            ),
+-          { body, onError: reject, requestState }
+-        )
+-      }),
+-    { method: options.method || 'GET' }
+-  )
++// A function, not a module const: fetchJson may run before a const declared down here is initialised.
++function jsonFetchDeps(): JsonFetchDeps {
++  return {
++    remoteHeaders: url => headersForRemoteRequest(url),
++    nativeHeaders: (descriptor, url, method, body) => nativeGatewayHttpHeaders(descriptor, url, HERMES_HOME, method, body)
++  }
+ }
+ 
+ function mimeTypeForPath(filePath) {
+diff --git a/apps/desktop/electron/remote-down-gate.test.ts b/apps/desktop/electron/remote-down-gate.test.ts
+index c6a9e692a9..bda2babfe1 100644
+--- a/apps/desktop/electron/remote-down-gate.test.ts
++++ b/apps/desktop/electron/remote-down-gate.test.ts
+@@ -436,8 +436,8 @@ describe('remote down gate: trial deadline', () => {
+ describe('main.ts wiring', () => {
+   const main = readFileSync(join(__dirname, 'main.ts'), 'utf8')
+ 
+-  it('fetchJson picks the probe pool when asked and fetchJsonForBackend forwards it', () => {
+-    expect(main).toMatch(/jsonAgentFor\(parsed\.protocol, options\.pool === 'probe' \? 'probe' : 'json'\)/)
++  // fetchJson's own pool choice is proven by behaviour in json-fetch.test.ts.
++  it('fetchJsonForBackend forwards the pool option', () => {
+     const body = main.slice(main.indexOf('async function fetchJsonForBackend('))
+     expect(body.slice(0, 4000)).toMatch(/pool: opts\.pool/)
+   })
+-- 
+2.51.0
+

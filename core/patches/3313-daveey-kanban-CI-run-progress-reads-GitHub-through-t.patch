@@ -1,0 +1,329 @@
+From 350ac8fedba518dc9fdb0a95795400336f28073e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:03:15 +0000
+Subject: [PATCH] [daveey] kanban: CI-run progress reads GitHub through the
+ broker prefix
+
+The CI-run progress check (#1956) ran `gh api` with no credential prefix. On the hub
+`gh` has no login and the gateway env has no GH_TOKEN, so every read exited 4 and failed
+open as `unknown`: the check never refused a park on an unstartable run and never woke
+a card parked on one (self-heal agent-c2b8fc1abf; verify card t_01a1d3aae49cdabe). The
+same call under the hub's `kanban.pr_acceptance.gh_command_prefix`
+(`token-broker exec --scope user/github ... --`) exits 0.
+
+- New `hermes_cli/kanban_gh_argv.dispatcher_gh_argv()`: `[*gh_command_prefix(None), gh]`,
+  raising `GhArgvUnavailable` with fixed text (config errors may carry credentials).
+  The dispatcher PR-state read (`_gh_argv`) and `_fetch_jobs` both use it.
+- `_fetch_jobs` classifies gh exit 4, HTTP 401, a missing gh and an unbuildable argv as
+  `NoCredential`; `Progress.no_credential` marks the fail-open.
+- The sweep logs one WARNING per hour per process for that case ("gh api exit 4 ...;
+  no credential: CI-run progress check disabled"), instead of a per-card line that
+  hid a check disabled everywhere.
+
+Proof:
+- RED (before the `_fetch_jobs` change): test_run_read_goes_through_the_configured_broker_prefix
+  got Progress(state='unknown', detail='gh api exit 4: To get started with GitHub CLI ...');
+  GREEN: not_starting with labels self-hosted,ci-fast.
+- 9/9 mutants killed (prefix dropped, gh-missing check, exit-4 / 401 classification,
+  rate limit removed / never re-warn, sweep warn dropped, config-text leak, flag unset).
+- tests/hermes_cli/test_kanban_ci_progress.py, test_kanban_park_invariants.py,
+  test_kanban_dependency_review_relink.py, test_kanban_active_pr_foreign_contract.py,
+  test_subprocess_text_encoding.py, test_subprocess_env_guard.py: green.
+
+Undo: git revert <this commit>.
+---
+ hermes_cli/kanban_ci_progress.py            | 52 +++++++++--
+ hermes_cli/kanban_db_dispatch_pr_state.py   | 11 +--
+ hermes_cli/kanban_gh_argv.py                | 29 +++++++
+ tests/hermes_cli/test_kanban_ci_progress.py | 96 ++++++++++++++++++++-
+ 4 files changed, 172 insertions(+), 16 deletions(-)
+ create mode 100644 hermes_cli/kanban_gh_argv.py
+
+diff --git a/hermes_cli/kanban_ci_progress.py b/hermes_cli/kanban_ci_progress.py
+index cadb44e147..fcefd7f13f 100644
+--- a/hermes_cli/kanban_ci_progress.py
++++ b/hermes_cli/kanban_ci_progress.py
+@@ -19,6 +19,11 @@ longer than ``QUEUED_LIMIT_SECONDS`` with no runner assigned.
+ A ref is checked when it is (or contains) ``<owner>/<repo>/actions/runs/<id>``, or is a bare run id whose wake
+ check names the repo (``gh run view <id> -R owner/repo``). Anything else (a PR, a release, an unknown repo) is
+ ``untracked``. A GitHub error is logged and fails open: the park is allowed and the next sweep tries again.
++
++GitHub is read through the home's ``kanban.pr_acceptance.gh_command_prefix`` (the credential broker), as the
++dispatcher's PR-state read does (:mod:`hermes_cli.kanban_gh_argv`): the hub's ``gh`` has no login, and a bare read
++failed open on every run, so the check never fired there (agent-c2b8fc1abf). A fail-open for want of a credential is
++logged as one WARNING per ``NO_CREDENTIAL_WARN_SECONDS`` per process, so a disabled check is visible, not silent.
+ """
+ from __future__ import annotations
+ 
+@@ -41,6 +46,7 @@ NOT_STARTING = "not_starting"
+ QUEUED_LIMIT_SECONDS = 15 * 60
+ RECHECK_SECONDS = 5 * 60
+ FETCH_TIMEOUT_SECONDS = 20
++NO_CREDENTIAL_WARN_SECONDS = 60 * 60
+ BLOCKER_PREFIX = "runners-offline"
+ AUTHOR = "kanban-dispatcher"
+ 
+@@ -53,6 +59,10 @@ _GENERIC_LABELS = frozenset({"self-hosted", "linux", "macos", "windows", "x64",
+ Fetch = Callable[[str, str], dict]
+ 
+ 
++class NoCredential(RuntimeError):
++    """gh has no usable login here (exit 4 / HTTP 401), or no gh argv could be built."""
++
++
+ @dataclass
+ class Progress:
+     state: str  # "untracked" | "unknown" | "ok" | "not_starting"
+@@ -61,6 +71,7 @@ class Progress:
+     labels: list[str] = field(default_factory=list)
+     queued_seconds: int = 0
+     detail: str = ""
++    no_credential: bool = False
+ 
+ 
+ def run_target(ref: str, hint: str = "") -> Optional[tuple[str, str]]:
+@@ -78,16 +89,23 @@ def run_target(ref: str, hint: str = "") -> Optional[tuple[str, str]]:
+ 
+ 
+ def _fetch_jobs(repo: str, run_id: str) -> dict:
+-    """The run's jobs from the GitHub API through ``gh``. Raises on any failure."""
+-    from hermes_platform.resolver.github import resolve_gh
+-    resolved = resolve_gh()
+-    if not resolved.found:
+-        raise RuntimeError("gh not found on PATH, ~/bin or ~/.local/bin")
+-    p = subprocess.run([*resolved.command, "api", f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"],
++    """The run's jobs from the GitHub API through the home's broker prefix + ``gh``. Raises on any failure:
++    :class:`NoCredential` when gh has no usable login or no argv can be built (config text never included)."""
++    from hermes_cli.kanban_gh_argv import GhArgvUnavailable, dispatcher_gh_argv
++    try:
++        gh = dispatcher_gh_argv()
++    except GhArgvUnavailable as exc:
++        raise NoCredential(f"gh unavailable: {exc}") from None
++    p = subprocess.run([*gh, "api", f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"],
+                        capture_output=True, text=True, timeout=FETCH_TIMEOUT_SECONDS, check=False,
+                        stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace")
+     if p.returncode != 0:
+-        raise RuntimeError(f"gh api exit {p.returncode}: {(p.stderr or p.stdout or '').strip()[-200:]}")
++        err = (p.stderr or p.stdout or "").strip()
++        detail = f"gh api exit {p.returncode}: {err[-200:]}"
++        # 4 = gh's "authentication required"; HTTP 401 = a token GitHub refuses.
++        if p.returncode == 4 or "HTTP 401" in err:
++            raise NoCredential(detail)
++        raise RuntimeError(detail)
+     return json.loads(p.stdout or "{}")
+ 
+ 
+@@ -109,6 +127,8 @@ def ci_run_progress(ref: str, *, hint: str = "", fetch: Optional[Fetch] = None,
+     repo, run_id = target
+     try:
+         data = (fetch or _fetch_jobs)(repo, run_id)
++    except NoCredential as exc:
++        return Progress("unknown", repo, run_id, detail=str(exc)[-300:], no_credential=True)
+     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+         return Progress("unknown", repo, run_id, detail=str(exc)[-300:])
+     now = time.time() if now is None else now
+@@ -163,6 +183,20 @@ def confirm(awaiting: Optional[dict], *, hint: str = "", fetch: Optional[Fetch]
+ _LOCK = threading.Lock()
+ _LAST_CHECK: dict[tuple[str, str], float] = {}
+ _SWEEPS: dict[str, Future] = {}
++_WARNED_AT: Optional[float] = None
++
++
++def _warn_no_credential(p: Progress) -> None:
++    """One WARNING per ``NO_CREDENTIAL_WARN_SECONDS`` per process: without a credential every read fails open."""
++    global _WARNED_AT
++    with _LOCK:
++        now = time.monotonic()
++        if _WARNED_AT is not None and now - _WARNED_AT < NO_CREDENTIAL_WARN_SECONDS:
++            return
++        _WARNED_AT = now
++    logger.warning("kanban ci run progress: %s; no credential: CI-run progress check disabled (cards parked on CI "
++                   "runs are neither refused nor woken). Set kanban.pr_acceptance.gh_command_prefix to the "
++                   "credential broker or log gh in.", p.detail)
+ 
+ 
+ def _ci_waits(conn: sqlite3.Connection) -> list[tuple[str, str, str]]:
+@@ -224,7 +258,9 @@ def sweep(conn: sqlite3.Connection, *, fetch: Optional[Fetch] = None) -> list[st
+                     continue
+                 _LAST_CHECK[key] = time.monotonic()
+             p = ci_run_progress(ref, hint=hint, fetch=fetch)
+-            if p.state == "unknown":
++            if p.no_credential:
++                _warn_no_credential(p)
++            elif p.state == "unknown":
+                 logger.warning("ci run progress for %s (%s) unreadable: %s", task_id, ref, p.detail)
+             if p.state == NOT_STARTING and apply(conn, task_id, ref, p):
+                 woken.append(task_id)
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+index 3517cbdfc9..0928302d23 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_state.py
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -44,14 +44,11 @@ def _gh_argv() -> Optional[list[str]]:
+     broker wrapper such as ``token-broker exec --scope user/github --``) and resolves ``gh``
+     from ~/bin / ~/.local/bin as the PR-acceptance gate does: a service process has a minimal
+     PATH and often no ambient ``gh`` login, and without either every lookup failed closed, so
+-    merged PRs held their cards for the full 6 h hold cap. [daveey]"""
++    merged PRs held their cards for the full 6 h hold cap. Built by the shared
++    :func:`hermes_cli.kanban_gh_argv.dispatcher_gh_argv`. [daveey]"""
+     try:
+-        from hermes_cli.kanban_pr_acceptance import _gh_command_prefix
+-        from hermes_platform.resolver.github import resolve_gh
+-        resolved = resolve_gh()
+-        if not resolved.found:
+-            return None
+-        return [*_gh_command_prefix(None), *resolved.command]
++        from hermes_cli.kanban_gh_argv import dispatcher_gh_argv
++        return dispatcher_gh_argv()
+     except Exception:  # config/setup errors may carry credentials: log no text
+         logger.debug("kanban: gh argv for PR state unavailable")
+         return None
+diff --git a/hermes_cli/kanban_gh_argv.py b/hermes_cli/kanban_gh_argv.py
+new file mode 100644
+index 0000000000..96164f304f
+--- /dev/null
++++ b/hermes_cli/kanban_gh_argv.py
+@@ -0,0 +1,29 @@
++"""The ``gh`` argv a dispatcher-side GitHub read runs. [daveey]
++
++A gateway or dispatcher service has a minimal PATH and often no ambient ``gh`` login (the hub: "You are not
++logged into any GitHub hosts", no GH_TOKEN). Its GitHub reads go through the home's
++``kanban.pr_acceptance.gh_command_prefix`` (a credential-broker wrapper such as
++``token-broker exec --scope user/github --``) and a ``gh`` resolved from ~/bin / ~/.local/bin, as the
++PR-acceptance gate does. A read that skips the prefix fails on the hub with gh's auth exit (4): the CI-run progress
++check did, so it answered ``unknown`` for every run and never refused a park or woke a card (agent-c2b8fc1abf).
++"""
++from __future__ import annotations
++
++
++class GhArgvUnavailable(RuntimeError):
++    """No ``gh`` argv can be built. The message is fixed text: config errors may carry credentials."""
++
++
++def dispatcher_gh_argv() -> list[str]:
++    """``[*gh_command_prefix, gh]`` for this home. Raises :class:`GhArgvUnavailable` with no config text."""
++    from hermes_cli import kanban_pr_acceptance as kpa
++    from hermes_platform.resolver import github as ghres
++
++    resolved = ghres.resolve_gh()
++    if not resolved.found:
++        raise GhArgvUnavailable("gh not found on PATH, ~/bin or ~/.local/bin")
++    try:
++        prefix = kpa._gh_command_prefix(None)
++    except (RuntimeError, OSError, ValueError, TypeError, ImportError):
++        raise GhArgvUnavailable("kanban.pr_acceptance.gh_command_prefix is unreadable or invalid") from None
++    return [*prefix, *resolved.command]
+diff --git a/tests/hermes_cli/test_kanban_ci_progress.py b/tests/hermes_cli/test_kanban_ci_progress.py
+index ccf359571a..7a5e67806e 100644
+--- a/tests/hermes_cli/test_kanban_ci_progress.py
++++ b/tests/hermes_cli/test_kanban_ci_progress.py
+@@ -50,6 +50,10 @@ def fake_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+         "#!/usr/bin/env python3\n"
+         "import os, sys\n"
+         f"open({str(calls)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
++        "if os.environ.get('FAKE_GH_NEEDS_TOKEN') and not os.environ.get('FAKE_BROKER_TOKEN'):\n"
++        "    sys.stderr.write('To get started with GitHub CLI, please run:  gh auth login\\n'); sys.exit(4)\n"
++        "if os.environ.get('FAKE_GH_401'):\n"
++        "    sys.stderr.write('HTTP 401: Bad credentials (https://api.github.com/)\\n'); sys.exit(1)\n"
+         "if os.environ.get('FAKE_GH_FAIL'):\n"
+         "    sys.stderr.write('HTTP 502: Bad Gateway (https://api.github.com/)\\n'); sys.exit(1)\n"
+         f"sys.stdout.write(open({str(jobs)!r}).read())\n")
+@@ -176,4 +180,94 @@ def test_ci_sweep_reads_github_at_most_every_5_min_per_card(kanban_home, fake_gh
+         for _ in range(3):
+             kwc.run_due_wake_checks(conn, wait=True)
+         assert fake_gh.calls() == parked + 1
+-        assert kb.get_task(conn, tid).status == "scheduled", [(e.kind, e.payload) for e in kb.list_events(conn, tid)][-3:]
+\ No newline at end of file
++        assert kb.get_task(conn, tid).status == "scheduled", [(e.kind, e.payload) for e in kb.list_events(conn, tid)][-3:]
++
++# --- credentials: the hub's gh has no login; its GitHub reads go through the broker prefix (agent-c2b8fc1abf) ---
++
++@pytest.fixture
++def no_login(fake_gh, monkeypatch):
++    """The hub's ``gh``: exit 4 (auth required) unless the broker put a token in its env."""
++    from hermes_cli import kanban_ci_progress as kcp
++    monkeypatch.setenv("FAKE_GH_NEEDS_TOKEN", "1")
++    monkeypatch.delenv("FAKE_BROKER_TOKEN", raising=False)
++    monkeypatch.setattr(kcp, "_WARNED_AT", None, raising=False)
++    return fake_gh
++
++
++def _configure_prefix(home: Path, prefix: list[str]) -> None:
++    # JSON is YAML; the test env has ruamel, not PyYAML.
++    (home / "config.yaml").write_text(json.dumps({"kanban": {"pr_acceptance": {"gh_command_prefix": prefix}}}))
++
++
++@pytest.fixture
++def broker(kanban_home: Path, tmp_path: Path) -> Path:
++    """``kanban.pr_acceptance.gh_command_prefix`` = a wrapper that hands gh a token, like ``token-broker exec``."""
++    wrapper = tmp_path / "broker" / "token-broker-exec"
++    wrapper.parent.mkdir()
++    wrapper.write_text("#!/bin/sh\n[ \"$1\" = -- ] && shift\nFAKE_BROKER_TOKEN=granted exec \"$@\"\n")
++    wrapper.chmod(0o755)
++    _configure_prefix(kanban_home, [str(wrapper), "--"])
++    return wrapper
++
++
++def test_run_read_goes_through_the_configured_broker_prefix(kanban_home, no_login, broker) -> None:
++    from hermes_cli.kanban_ci_progress import ci_run_progress
++    no_login.serve(age=20 * 60)
++    p = ci_run_progress(RUN_URL)
++    assert p.state == "not_starting", p
++    assert p.labels == LABELS
++
++
++def _sweep_warnings(caplog, conn) -> list[str]:
++    from hermes_cli import kanban_ci_progress as kcp
++    kcp._LAST_CHECK.clear()
++    caplog.clear()
++    with caplog.at_level("WARNING", logger=kcp.logger.name):
++        kcp.sweep(conn)
++    return [r.getMessage() for r in caplog.records if "progress check disabled" in r.getMessage()]
++
++
++def test_no_credential_warns_once_an_hour(kanban_home, no_login, monkeypatch, caplog) -> None:
++    from hermes_cli import kanban_ci_progress as kcp
++    no_login.serve(age=2 * 60)
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        assert _park_on_run().get("status") == "scheduled"  # fails open
++        monkeypatch.delenv("HERMES_KANBAN_TASK")
++        first = _sweep_warnings(caplog, conn)
++        assert len(first) == 1, caplog.text
++        assert "gh api exit 4" in first[0] and "no credential: CI-run progress check disabled" in first[0], first
++        assert _sweep_warnings(caplog, conn) == [], caplog.text
++        monkeypatch.setattr(kcp, "_WARNED_AT", time.monotonic() - kcp.NO_CREDENTIAL_WARN_SECONDS - 1)
++        assert len(_sweep_warnings(caplog, conn)) == 1, caplog.text
++
++
++def test_unreadable_broker_config_fails_open_without_its_text(kanban_home, no_login) -> None:
++    from hermes_cli.kanban_ci_progress import ci_run_progress
++    no_login.serve(age=20 * 60)
++    _configure_prefix(kanban_home, ["relative-broker", "--token=s3cr3t-value"])
++    p = ci_run_progress(RUN_URL)
++    assert p.state == "unknown" and p.no_credential, p
++    assert "s3cr3t" not in p.detail and "relative-broker" not in p.detail, p.detail
++
++
++def test_other_github_errors_are_not_credential_errors(kanban_home, fake_gh, monkeypatch) -> None:
++    from hermes_cli.kanban_ci_progress import ci_run_progress
++    fake_gh.serve(age=20 * 60)
++    monkeypatch.setenv("FAKE_GH_FAIL", "1")
++    p = ci_run_progress(RUN_URL)
++    assert p.state == "unknown" and not p.no_credential, p
++
++
++def test_refused_token_and_missing_gh_are_credential_errors(kanban_home, fake_gh, monkeypatch) -> None:
++    import types
++    from hermes_cli.kanban_ci_progress import ci_run_progress
++    from hermes_platform.resolver import github as ghres
++    fake_gh.serve(age=20 * 60)
++    monkeypatch.setenv("FAKE_GH_401", "1")
++    p = ci_run_progress(RUN_URL)
++    assert p.state == "unknown" and p.no_credential and "HTTP 401" in p.detail, p
++    monkeypatch.setattr(ghres, "resolve_gh", lambda path=None: types.SimpleNamespace(found=False, command=[]))
++    p = ci_run_progress(RUN_URL)
++    assert p.state == "unknown" and p.no_credential and "gh not found" in p.detail, p
+-- 
+2.51.0
+

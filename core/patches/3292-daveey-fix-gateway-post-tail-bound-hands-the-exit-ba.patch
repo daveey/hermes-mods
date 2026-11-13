@@ -1,0 +1,88 @@
+From 457b53db17fd257766776f93b557ccfe51377e3c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:43:54 +0000
+Subject: [PATCH] [daveey] fix(gateway): post-tail bound hands the exit back on
+ BaseException; one SystemExit code mapping
+
+The post-tail watcher handed the exit back to a main thread parked in
+enter_exit_funnel only on Exception: a BaseException (e.g. SystemExit) out
+of the funnel killed the watcher still holding exit_owner, so the main
+thread waited for the hard deadline. It now hands back on any
+BaseException and re-raises non-Exception ones.
+
+The except SystemExit branch in the shutdown tail now calls
+_unwind_exit_code instead of repeating its mapping.
+
+PR #1984 review nits (t_01a1d3f3b6fab6d8).
+---
+ gateway/exit_deadline.py                 | 9 +++++++--
+ gateway/run_bootstrap.py                 | 3 +--
+ tests/gateway/test_update_exit_target.py | 8 ++++++--
+ 3 files changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/gateway/exit_deadline.py b/gateway/exit_deadline.py
+index b34f04044c..93a0de4180 100644
+--- a/gateway/exit_deadline.py
++++ b/gateway/exit_deadline.py
+@@ -167,11 +167,16 @@ def bound_post_tail(exit_code: int, exit_fn: Callable[[int], None], *,
+                              target_reason=_state.get("target_reason"), phases=phases())
+         try:
+             exit_fn(exit_code)
+-        except Exception:  # health: allow BLE001 -- hand the exit back to the main thread's funnel
+-            logger.exception("Post-tail exit bound: the exit funnel failed")
++        # BaseException too (e.g. a SystemExit out of the funnel): dying here still holding exit_owner
++        # would park the main thread's funnel until the hard deadline.
++        except BaseException as exc:  # health: allow BLE001 -- hand the exit back to the main thread's funnel
++            with contextlib.suppress(Exception):
++                logger.exception("Post-tail exit bound: the exit funnel failed")
+             with _lock:
+                 _state.pop("exit_owner", None)
+             _handback.set()  # a main thread parked in enter_exit_funnel wakes and runs the funnel
++            if not isinstance(exc, Exception):
++                raise
+ 
+     try:
+         threading.Thread(target=_watch, daemon=True, name=POST_TAIL_THREAD_NAME).start()
+diff --git a/gateway/run_bootstrap.py b/gateway/run_bootstrap.py
+index ebc9ce660d..d650656a60 100644
+--- a/gateway/run_bootstrap.py
++++ b/gateway/run_bootstrap.py
+@@ -591,8 +591,7 @@ async def _start_gateway_shutdown_tail(
+     try:
+         verdict = _resolve_gateway_exit_verdict(runner, _signal_initiated_shutdown[0])
+     except SystemExit as exc:
+-        exit_deadline.bound_post_tail(
+-            0 if exc.code is None else exc.code if isinstance(exc.code, int) else 1, _exit_after_graceful_shutdown)
++        exit_deadline.bound_post_tail(_unwind_exit_code(exc), _exit_after_graceful_shutdown)
+         raise
+     exit_deadline.bound_post_tail(
+         _unwind_exit_code(unwinding) if unwinding is not None else 0 if verdict else 1,
+diff --git a/tests/gateway/test_update_exit_target.py b/tests/gateway/test_update_exit_target.py
+index 640ce0ecbe..9d1ebbc6ad 100644
+--- a/tests/gateway/test_update_exit_target.py
++++ b/tests/gateway/test_update_exit_target.py
+@@ -307,7 +307,11 @@ def test_post_tail_bound_writes_an_exit_diag_record_before_the_funnel(monkeypatc
+     assert "post_tail_bound" in records[0]["phases"] and records[0]["over_target_s"] >= 0
+ 
+ 
+-def test_exit_funnel_wakes_when_the_bound_hands_the_exit_back():
++@pytest.mark.parametrize("failure", [
++    RuntimeError("funnel failed"),
++    SystemExit(1),  # a BaseException: the bound must not die still holding exit_owner
++])
++def test_exit_funnel_wakes_when_the_bound_hands_the_exit_back(failure):
+     """The bound took the exit, the main thread parked in the funnel, then the bound's funnel failed:
+     the parked main thread wakes and runs the funnel instead of waiting for the hard deadline."""
+     owned, release = threading.Event(), threading.Event()
+@@ -315,7 +319,7 @@ def test_exit_funnel_wakes_when_the_bound_hands_the_exit_back():
+     def failing_funnel(_code):
+         owned.set()
+         release.wait(5)
+-        raise RuntimeError("funnel failed")
++        raise failure
+ 
+     exit_deadline.set_exit_target(time.monotonic() + 0.05, "test")
+     assert exit_deadline.bound_post_tail(0, failing_funnel, grace_s=0.05)
+-- 
+2.51.0
+

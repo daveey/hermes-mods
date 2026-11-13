@@ -1,0 +1,133 @@
+From f0f3e369882db0b9d9f4eda1a3d984eb088d0e4e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 23:14:11 +0000
+Subject: [PATCH] [daveey] Respect gateway ownership in update-pause sibling
+ notifications
+
+Proof: foreign pickup cases fail before fix; 32 ownership and deferral tests pass after; scripts/check passes 18 checks.
+---
+ hermes_cli/update_pause_siblings.py           | 10 ++-
+ .../test_update_pause_sibling_ownership.py    | 85 +++++++++++++++++++
+ 2 files changed, 93 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_update_pause_sibling_ownership.py
+
+diff --git a/hermes_cli/update_pause_siblings.py b/hermes_cli/update_pause_siblings.py
+index dc4d7e84c1..99ea694d14 100644
+--- a/hermes_cli/update_pause_siblings.py
++++ b/hermes_cli/update_pause_siblings.py
+@@ -99,13 +99,19 @@ def _open_alarms(db: sqlite3.Connection, unit: str) -> list[dict]:
+         host = created_on or (m.group(1) if (m := _HOST.search(body)) else None)
+         refusal = m.group(1).strip() if (m := _REFUSAL.search(body)) else ""
+         sibling = m.group(1) if (m := _SIBLING.search(body)) else None
+-        out.append({"id": task_id, "host": host, "created_at": created_at, "refusal": refusal, "sibling": sibling})
++        out.append({"id": task_id, "host": host, "created_on": created_on,
++                    "created_at": created_at, "refusal": refusal, "sibling": sibling})
+     return out
+ 
+ 
+ def _board_alarms(conn: sqlite3.Connection, unit: str) -> list[dict]:
+     """Open alarms for ``unit`` on this board: the live file's, then the replica's (the whole board)."""
+-    found = {a["id"]: dict(a, local=True) for a in _open_alarms(conn, unit)}
++    from hermes_cli import kanban_capability_routing as kcr
++    gateway = kcr._own_gateway(conn)
++    # A live row can be a foreign pickup copy. Legacy rows without created_on belong to
++    # this board even when their body names another host; that host is not write authority.
++    found = {a["id"]: dict(a, local=not a["created_on"] or a["created_on"] == gateway)
++             for a in _open_alarms(conn, unit)}
+     try:
+         with _replica(conn) as rep:
+             if rep is not None:
+diff --git a/tests/hermes_cli/test_update_pause_sibling_ownership.py b/tests/hermes_cli/test_update_pause_sibling_ownership.py
+new file mode 100644
+index 0000000000..1f9333d8fa
+--- /dev/null
++++ b/tests/hermes_cli/test_update_pause_sibling_ownership.py
+@@ -0,0 +1,85 @@
++"""Notification custody is the row's gateway, not its presence or body's host."""
++import sqlite3
++from contextlib import contextmanager
++
++import pytest
++
++from hermes_cli import kanban_capability_routing as kcr
++from hermes_cli import kanban_db as kb
++from hermes_cli import update_pause_siblings as sib
++
++
++@pytest.fixture
++def boards(monkeypatch):
++    connections = []
++
++    def make(owner_column=True):
++        conn = sqlite3.connect(":memory:")
++        connections.append(conn)
++        conn.execute("CREATE TABLE tasks (id TEXT, body TEXT, created_at INTEGER, created_by TEXT, title TEXT, status TEXT" +
++                     (", created_on TEXT)" if owner_column else ")"))
++        conn.execute("CREATE TABLE task_comments (task_id TEXT, author TEXT, body TEXT)")
++        return conn
++
++    @contextmanager
++    def no_replica(conn):
++        yield None
++
++    def comment(conn, task_id, author, body):
++        conn.execute("INSERT INTO task_comments VALUES (?, ?, ?)", (task_id, author, body))
++
++    monkeypatch.setattr(sib, "_replica", no_replica)
++    monkeypatch.setattr(kb, "add_comment", comment)
++    yield make
++    for conn in connections:
++        conn.close()
++
++
++def alarm(conn, task_id, host, owner=None, sibling=None):
++    body = f"On `{host}`\nLatest refusal: busy\n"
++    if sibling:
++        body += f"Sibling alarm: {sibling}\n"
++    conn.execute("INSERT INTO tasks (id, body, created_at, created_by, title, status) VALUES (?, ?, 1, ?, ?, 'ready')",
++                 (task_id, body, sib.AUTHOR, sib.TITLE + "gateway"))
++    if "created_on" in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:
++        conn.execute("UPDATE tasks SET created_on = ? WHERE id = ?", (owner, task_id))
++
++
++@pytest.mark.parametrize("gateway,owner", [("worker-1", "worker-5"), (None, "worker-5")])
++def test_foreign_pickup_skips_direct_write_and_home_mirrors_once(boards, monkeypatch, gateway, owner):
++    pickup, home = boards(), boards()
++    for conn in (pickup, home):
++        alarm(conn, "t_leader", "shared-hostname", owner)
++    alarm(pickup, "t_follower", "worker-1", "worker-1", "t_leader")
++    monkeypatch.setattr(kcr, "_own_gateway", lambda conn: gateway)
++    monkeypatch.setattr(sib.socket, "gethostname", lambda: "shared-hostname")
++    sibling = sib._board_alarms(pickup, "gateway")[1]
++    assert sibling["id"] == "t_leader"
++    assert not sib.notify(pickup, sibling, "t_follower", "worker-1", "now", "busy")
++    assert pickup.execute("SELECT * FROM task_comments").fetchall() == []
++
++    @contextmanager
++    def replica(conn):
++        yield pickup
++
++    monkeypatch.setattr(sib, "_replica", replica)
++    monkeypatch.setattr(kcr, "_own_gateway", lambda conn: owner)
++    assert sib.mirror_followers(home, "t_leader", "gateway", frozenset({owner})) == ["t_follower"]
++    assert sib.mirror_followers(home, "t_leader", "gateway", frozenset({owner})) == []
++    assert home.execute("SELECT COUNT(*) FROM task_comments").fetchone()[0] == 1
++
++
++@pytest.mark.parametrize("column,owner,gateway", [
++    (True, "worker-1", "worker-1"),
++    (True, None, "worker-1"),
++    (True, "", "worker-1"),
++    (False, None, None),
++])
++def test_owned_and_legacy_same_board_notifications(boards, monkeypatch, column, owner, gateway):
++    conn = boards(column)
++    alarm(conn, "t_leader", "another-host", owner)
++    monkeypatch.setattr(kcr, "_own_gateway", lambda conn: gateway)
++    sibling = sib._board_alarms(conn, "gateway")[0]
++    assert sib.notify(conn, sibling, "t_follower", "local-host", "now", "busy")
++    assert not sib.notify(conn, sibling, "t_follower", "local-host", "now", "busy")
++    assert conn.execute("SELECT COUNT(*) FROM task_comments").fetchone()[0] == 1
+-- 
+2.51.0
+

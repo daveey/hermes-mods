@@ -1,0 +1,144 @@
+From 761d318f668b02dfb3de0d326e4f21a421cc5b21 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:15:09 +0000
+Subject: [PATCH] [daveey] project one record for a parked remote card in
+ counts and task list
+
+A parked replica card (scheduled, blocked, review) has no executor clock, so
+every consumer projects state=unknown / missing_qualified_identity. Its
+last_known_state differed though: /api/session-kanban-tasks projects
+kanban_execution_observations.card() over the replica row and keeps the row's
+status ("waiting", or "needs_user" with an ask), while the sidebar counts and
+session-idle-check (annotate_kanban_activity -> count_snapshot) rebuilt the row
+from its count key alone, with no status, ask or session, so they showed null.
+
+Root cause: kanban_replica_execution.collect() put only RUNNING evidence
+(raw()) into the counts evidence sink.
+
+Fix: factor the generic kanban.card record out of card() into card_raw(), and
+have collect() store card_raw(card) for any remote row raw() does not cover.
+count_snapshot already projects a stored _raw with the same sidebar class, so
+both paths now project the identical record. No new query, polling or cadence;
+the counts fingerprint and memo are unchanged; observed_at stays None (never
+the pull or fetch clock); running replica evidence is unchanged. An adapter
+error in card_raw keeps the old key-only unknown.
+
+Five whys: the sidebar showed null while the API showed waiting -> the counts
+built a statusless row from the key -> no evidence was stored for that key ->
+collect() stored running evidence only -> the parked case was added to card()
+for session_tasks but never mirrored into the counts sink.
+
+Proof: tests/hermes_cli/test_kanban_replica_execution_memo.py
+test_parked_remote_card_projects_one_record_in_list_counts_and_checker
+(scheduled / review / blocked / blocked+ask) is RED on main (last_known_state
+None vs waiting/needs_user; owner.session and human_request missing in counts)
+and GREEN here. 135 files importing the touched modules (replica, golden,
+parity, annotation, chat-links suites): 2595 passed, 0 failed.
+
+Card: t_01a1d495b43909e8 (follow-up of t_01a1c7a649c59bec)
+---
+ hermes_cli/kanban_execution_observations.py   | 13 +++++++---
+ hermes_cli/kanban_replica_execution.py        | 14 ++++++++--
+ .../test_kanban_replica_execution_memo.py     | 26 +++++++++++++++++++
+ 3 files changed, 48 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_execution_observations.py b/hermes_cli/kanban_execution_observations.py
+index ec632d25a4..494190f970 100644
+--- a/hermes_cli/kanban_execution_observations.py
++++ b/hermes_cli/kanban_execution_observations.py
+@@ -136,12 +136,19 @@ def card(row, *, gateway=None, profile=None, now=None):
+         if row.get("stale"):
+             value.update(state="unknown", unknown_reason="source_unavailable")
+         return project(value, now=now, source_class="sidebar")
+-    remote = bool(row.get("remote"))
+-    if remote and isinstance(row.get("_replica_run"), dict):
++    if row.get("remote") and isinstance(row.get("_replica_run"), dict):
+         from hermes_cli.kanban_replica_execution import raw as replica_raw
+         value = replica_raw(row)
+         if value is not None:
+             return project(value, now=now, source_class="sidebar")
++    return project(card_raw(row, gateway=gateway, profile=profile), now=now, source_class="sidebar")
++
++
++def card_raw(row, *, gateway=None, profile=None):
++    """The unprojected ``kanban.card`` record ``card`` projects for a row with no execution source, receipt or
++    running replica evidence. The sidebar counts store it for a parked replica card (``kanban_replica_execution
++    .collect``), so they project exactly what ``session_tasks`` does for the same row."""
++    remote = bool(row.get("remote"))
+     gateway = row.get("gateway") if remote else gateway
+     profile = row.get("owner_profile", row.get("profile")) if remote else profile
+     identity = {"kind": "card", "work_id": row.get("id")}
+@@ -179,7 +186,7 @@ def card(row, *, gateway=None, profile=None, now=None):
+         raw["human_request"] = request
+     if row.get("stale"):
+         raw.update(state="unknown", last_known_state=state, unknown_reason="source_unavailable")
+-    return project(raw, now=now, source_class="sidebar")
++    return raw
+ 
+ 
+ def _merge(row, observations, *, keep_empty=False):
+diff --git a/hermes_cli/kanban_replica_execution.py b/hermes_cli/kanban_replica_execution.py
+index 2e45497702..89ae45faa5 100644
+--- a/hermes_cli/kanban_replica_execution.py
++++ b/hermes_cli/kanban_replica_execution.py
+@@ -93,8 +93,18 @@ def raw(row: dict) -> dict | None:
+ 
+ 
+ def collect(card: dict, evidence: dict) -> None:
+-    """Add a replica card's running evidence to the counts' per-session evidence sink, keyed like its count key, so
+-    the sidebar counts and ``session_tasks`` project the same record. Never mutates ``card`` (shared, read-only)."""
++    """Add a remote card's record to the counts' per-session evidence sink, keyed like its count key, so the
++    sidebar counts and ``session_tasks`` project the same record. Never mutates ``card`` (shared, read-only).
++
++    Running evidence is ``raw``. Any other remote row (parked, or running with no current-run beat) gets the
++    ``kanban.card`` record ``session_tasks`` builds from the same row (``card_raw``): still unknown with no clock,
++    but with the row's last-known state and ask, which the count key alone cannot carry. No query, no clock."""
+     value = raw(card)
++    if value is None and card.get("remote"):
++        from hermes_cli.kanban_execution_observations import ADAPTER_ERRORS, card_raw
++        try:
++            value = card_raw(card)
++        except ADAPTER_ERRORS:  # what add_cards turns into failed_card: keep the key-only unknown here
++            value = None
+     if value is not None:
+         evidence.setdefault(card["session"], {})[str(card.get("key"))] = value
+diff --git a/tests/hermes_cli/test_kanban_replica_execution_memo.py b/tests/hermes_cli/test_kanban_replica_execution_memo.py
+index 4ee6b06efe..214052f6e1 100644
+--- a/tests/hermes_cli/test_kanban_replica_execution_memo.py
++++ b/tests/hermes_cli/test_kanban_replica_execution_memo.py
+@@ -170,6 +170,32 @@ def test_last_good_preserves_run_evidence_when_replica_read_fails(shadow, monkey
+         assert after[field] == before[field]
+ 
+ 
++@pytest.mark.parametrize("status, request_json, last_known", [
++    ("scheduled", None, "waiting"), ("review", None, "waiting"), ("blocked", None, "waiting"),
++    ("blocked", '{"action": "reply A or B"}', "needs_user")])
++def test_parked_remote_card_projects_one_record_in_list_counts_and_checker(shadow, monkeypatch, status,
++                                                                         request_json, last_known):
++    """A parked replica card has no executor clock: every consumer is unknown, and all of them keep the SAME
++    last-known state. The counts used to rebuild the row from its count key alone (no status), so the sidebar and
++    session-idle-check (``annotate_kanban_activity``) showed ``last_known_state`` null while
++    ``/api/session-kanban-tasks`` showed the row's status (t_01a1d495b43909e8)."""
++    _path, conn, now = shadow
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET status = ?, human_request = ? WHERE id = 't_hub'", (status, request_json))
++        conn.execute("UPDATE task_runs SET status = 'released', ended_at = ? WHERE id = 7", (int(now - 60),))
++    sync.mark_pulled(conn, at=now)
++    monkeypatch.setattr(time, "time", lambda: now)
++    counted = _counted_observation()  # the sidebar counts row, which session-idle-check reads too
++    (listed,) = ksa.session_tasks(["s1"])
++    (obs,) = listed["execution_observations"]
++    assert obs == counted
++    assert obs["state"] == "unknown" and obs["unknown_reason"] == "missing_qualified_identity"
++    assert obs["last_known_state"] == last_known
++    assert obs["observed_at"] is None and obs["evidence_refs"] == []  # the pull clock never dates it
++    assert obs["identity"] == {"gateway": OWNER, "profile": "work", "board": "default", "kind": "card",
++                               "work_id": "t_hub"}
++
++
+ def test_warm_counts_reproject_expired_run_without_recompute(shadow, monkeypatch):
+     _path, _conn, now = shadow
+     beat = int(now - 170)
+-- 
+2.51.0
+

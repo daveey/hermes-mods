@@ -1,0 +1,386 @@
+From 9e59c5917a29647073fd44f40ccaaaf0a9bf2124 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:16:30 +0000
+Subject: [PATCH] [daveey] extend hub dispatch budget and capture capacity
+ origins
+
+---
+ docs/kanban-hub-admission-v2.md               | 15 +--
+ hermes_cli/kanban_admission.py                |  5 +-
+ hermes_cli/kanban_admission_origin.py         | 17 ++++
+ hermes_cli/kanban_admission_pools.py          | 57 +++++++++--
+ hermes_cli/kanban_db_connect.py               |  1 +
+ hermes_cli/kanban_db_dispatch.py              |  8 +-
+ hermes_cli/kanban_db_sync.py                  |  2 +-
+ hermes_cli/machine_metrics.py                 |  5 +-
+ tests/hermes_cli/test_kanban_hub_admission.py | 99 ++++++++++++++++++-
+ 9 files changed, 188 insertions(+), 21 deletions(-)
+ create mode 100644 hermes_cli/kanban_admission_origin.py
+
+diff --git a/docs/kanban-hub-admission-v2.md b/docs/kanban-hub-admission-v2.md
+index 6f9cbbae13..f4f86de2e9 100644
+--- a/docs/kanban-hub-admission-v2.md
++++ b/docs/kanban-hub-admission-v2.md
+@@ -8,12 +8,15 @@ validation on edit; CLI create/edit `--class` and `--frees`; create tool schema,
+ pre-placement validation, persistence/readback and remote option encoding.
+ Admission metadata edits may be combined with ordinary title/body/priority edits,
+ but not operator fields or completion-contract edits (separate transactions).
+-Local run pool/class receipts now survive task class edits. The whole-host census
+-can count those receipts, and opt-in pre-lease/final CPU gates select the separate
+-priority pool. Ready and review claim tests admit urgent work at 70% CPU with seven
+-regular slots full. These are claim-path tests, not dispatcher or live proof.
+-
+-Still pending: origin receipts/cap, dispatcher budget and queue notes, Board and
++Local run pool/class/origin receipts now survive task class and chat-release edits.
++The whole-host census uses a consistent read snapshot per board and enforces the
++capacity-origin cap in final admission. Opt-in pre-lease/final CPU gates select the
++separate priority pool. The dispatcher budget can reach the extra pool at regular
++saturation, preserving the shared critical/elevated memory guard. Ready and review
++claim tests admit urgent work at 70% CPU with seven regular slots full. These are
++isolated budget/claim-path tests, not complete dispatcher or live proof.
++
++Still pending: composed dispatcher selection and queue notes, Board and
+ courier receiver compatibility, full malformed-config/receipt tests, sync replay
+ coverage, guard mutations, scoring, reporting and live activation. Do not enable
+ this incomplete implementation. `priority_slots` is currently opt-in (absent = 0)
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index efabc0cb35..12cfcace34 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -236,10 +236,11 @@ def claim_and_open_run(conn, task_id, source_status, lock, expires, now, *, even
+         )
+         run_id = run_cur.lastrowid
+     conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, task_id))
++    from hermes_cli.kanban_admission_origin import origin_key
+     conn.execute(
+-        "UPDATE task_runs SET admission_pool=?, "
++        "UPDATE task_runs SET admission_pool=?, admission_origin=?, "
+         "admission_class=(SELECT admission_class FROM tasks WHERE id=?) WHERE id=?",
+-        (getattr(_decision, "pool", None) or "regular", task_id, run_id),
++        (getattr(_decision, "pool", None) or "regular", origin_key(conn, task_id), task_id, run_id),
+     )
+     hub_cpu = dict(consumed_hub_cpu() or {})
+     admission = hub_cpu.pop("hub_admission", None)
+diff --git a/hermes_cli/kanban_admission_origin.py b/hermes_cli/kanban_admission_origin.py
+new file mode 100644
+index 0000000000..4c7cf4d98b
+--- /dev/null
++++ b/hermes_cli/kanban_admission_origin.py
+@@ -0,0 +1,17 @@
++"""Stable claim-time origin attribution, independent of current shepherds."""
++import json
++
++
++def origin_key(conn, task_id):
++    """Use the original created chat, including released links, then creating gateway/creator."""
++    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
++        row = conn.execute(
++            "SELECT chat_gateway, chat_profile, chat_session FROM task_chat_links "
++            "WHERE task_id=? AND kind='created' ORDER BY created_at, uid LIMIT 1", (task_id,),
++        ).fetchone()
++        if row:
++            return json.dumps(["chat", row[0], row[1] or "default", row[2]], separators=(",", ":"))
++    cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
++    gateway = "created_on" if "created_on" in cols else "NULL"
++    row = conn.execute(f"SELECT {gateway}, created_by FROM tasks WHERE id=?", (task_id,)).fetchone()
++    return json.dumps(["creator", row[0] or "local", row[1] or "unknown"], separators=(",", ":"))
+diff --git a/hermes_cli/kanban_admission_pools.py b/hermes_cli/kanban_admission_pools.py
+index fbff6d55aa..5617e4db1d 100644
+--- a/hermes_cli/kanban_admission_pools.py
++++ b/hermes_cli/kanban_admission_pools.py
+@@ -10,7 +10,7 @@ def select_pool(admission_class, *, regular, priority, regular_cap, priority_cap
+     return None
+ 
+ 
+-def board_pools(conn, *, own=None, excluded=()):
++def board_pools(conn, *, own=None, excluded=(), origins=None):
+     """Count local running rows by claim-time receipt; legacy NULL is regular."""
+     cols = {row[1] for row in conn.execute("PRAGMA table_info(task_runs)")}
+     receipt = "r.admission_pool" if "admission_pool" in cols else "NULL"
+@@ -19,8 +19,10 @@ def board_pools(conn, *, own=None, excluded=()):
+         where += " AND (t.claim_lock IS NOT NULL OR t.lease_holder IS NULL OR t.lease_holder=?)"
+         params = (own,)
+     counts = {"regular": 0, "priority": 0}
+-    for run_id, pool in conn.execute(
+-        f"SELECT t.current_run_id, {receipt} FROM tasks t LEFT JOIN task_runs r "
++    klass = "r.admission_class" if "admission_class" in cols else "NULL"
++    origin = "r.admission_origin" if "admission_origin" in cols else "NULL"
++    for run_id, pool, admission_class, origin_key in conn.execute(
++        f"SELECT t.current_run_id, {receipt}, {klass}, {origin} FROM tasks t LEFT JOIN task_runs r "
+         f"ON r.id=t.current_run_id AND r.task_id=t.id WHERE {where}", params,
+     ):
+         if run_id in excluded:
+@@ -29,6 +31,10 @@ def board_pools(conn, *, own=None, excluded=()):
+         if pool not in counts:
+             raise ValueError("unknown admission pool receipt")
+         counts[pool] += 1
++        if origins is not None and admission_class == "capacity":
++            if not origin_key:
++                raise ValueError("capacity receipt has no origin")
++            origins[origin_key] = origins.get(origin_key, 0) + 1
+     return counts
+ 
+ 
+@@ -39,10 +45,16 @@ def root_settings():
+     from hermes_cli.config_backend import read_config_doc_readonly
+ 
+     try:
+-        doc = read_config_doc_readonly(Path(get_default_hermes_root()) / "config.yaml") or {}
++        doc = read_config_doc_readonly(Path(get_default_hermes_root()) / "config.yaml")
+     except FileNotFoundError:
+         return 0, 85
+-    policy = (doc.get("kanban") or {}).get("admission") or {}
++    policy = {} if doc is None else doc
++    for key in ("kanban", "admission"):
++        if not isinstance(policy, dict):
++            raise ValueError("admission configuration must be mappings")
++        policy = policy.get(key, {})
++    if not isinstance(policy, dict):
++        raise ValueError("admission configuration must be mappings")
+     slots = policy.get("priority_slots", 0)
+     ceiling = policy.get("priority_cpu_busy_below_pct", 85)
+     if type(slots) is not int or slots < 0:
+@@ -52,6 +64,35 @@ def root_settings():
+     return slots, ceiling
+ 
+ 
++def dispatch_remaining(regular_cap):
++    """Upper bound for candidate attempts; final locked claims enforce each pool."""
++    from hermes_cli import machine_cpu_metrics as cpu, machine_metrics
++
++    if cpu.root_limit()[0] != cpu.ON:
++        return None
++    slots, _ceiling = root_settings()
++    if not slots:
++        return None
++    detail = {"pools": {"regular": 0, "priority": 0}}
++    active = machine_metrics.active_card_runs(detail=detail)
++    if active is None:
++        return 0
++    counts = detail["pools"]
++    return max(0, regular_cap - counts["regular"]) + max(0, slots - counts["priority"])
++
++
++def host_remaining(regular_cap, running_count, board):
++    """Keep the legacy scalar budget when the extra hub pool is not enabled."""
++    from hermes_cli.kanban_db_dispatch import count_running_tasks_other_boards
++    try:
++        remaining = dispatch_remaining(regular_cap)
++    except (OSError, ValueError, TypeError):
++        return 0
++    if remaining is None:
++        return regular_cap - running_count - count_running_tasks_other_boards(board)
++    return remaining
++
++
+ def advisory_limit(conn, task_id, regular_limit):
+     """Advisory may admit a marked candidate to final arbitration, never grant a slot."""
+     slots, ceiling = root_settings()
+@@ -69,13 +110,17 @@ def candidate_pool(conn, task_id, regular_cap, *, echo=None):
+     if not slots:
+         return None, None, None
+     row = conn.execute("SELECT admission_class FROM tasks WHERE id=?", (task_id,)).fetchone()
+-    detail = {"pools": {"regular": 0, "priority": 0}}
++    detail = {"pools": {"regular": 0, "priority": 0}, "capacity_origins": {}}
+     active = machine_metrics.active_card_runs(exclude=echo, detail=detail)
+     if row is None or active is None:
+         return None, ceiling, detail
+     detail.update(active_before=active + detail.get("excluded", 0), active_after=active)
+     if echo is not None and detail.get("excluded"):
+         detail["excluded_run_uid"] = echo.run_uid
++    from hermes_cli.kanban_admission_origin import origin_key
++    origins = detail.pop("capacity_origins")
++    if row[0] == "capacity" and origins.get(origin_key(conn, task_id), 0) >= 2:
++        return None, ceiling, detail
+     counts = detail["pools"]
+     pool = select_pool(row[0], **counts, regular_cap=regular_cap, priority_cap=slots)
+     return pool, ceiling, detail
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index f89ecb7478..257d96fd3e 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1110,6 +1110,7 @@ _NOTIFY_SUB_COLUMNS = (
+ 
+ _TASK_RUN_COLUMNS = (
+     ("admission_pool", "admission_pool TEXT"),
++    ("admission_origin", "admission_origin TEXT"),
+     ("admission_class", "admission_class TEXT"),
+     # Spawn-time start fingerprint of the run's worker_pid (PID-reuse guard for the
+     # terminal-worker reaper; NULL = legacy row, never signalled).
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index c32094def4..83f575d850 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2150,11 +2150,11 @@ def _tick_spawn_budget(
+         spawn_budget = max_spawn - running_count
+ 
+     if max_in_progress is not None:
+-        total_running = running_count + count_running_tasks_other_boards(board)
+-        if total_running >= max_in_progress:
+-            result.at_capacity = f"max_in_progress={total_running}/{max_in_progress}"
++        from hermes_cli.kanban_admission_pools import host_remaining
++        remaining = host_remaining(max_in_progress, running_count, board)
++        if remaining <= 0:
++            result.at_capacity = f"max_in_progress={max_in_progress - remaining}/{max_in_progress}"
+             return False, None
+-        remaining = max_in_progress - total_running
+         if spawn_budget is None or spawn_budget > remaining:
+             spawn_budget = remaining
+     if spawn_quota is not None:  # this board's share of the host slots, ranked across boards (kanban_board_share)
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 9d91e13c83..e406a1f5f2 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -91,7 +91,7 @@ LOCAL_COLUMNS: dict[str, frozenset[str]] = {
+     # ``sync_version``: the Board version of the row this gateway last applied or had acknowledged (the fence that
+     # keeps an older copy of a run from the feed off a newer local row).
+     "task_runs": frozenset({"claim_lock", "claim_expires", "worker_pid", "worker_started_at", "last_heartbeat_at",
+-                            "sync_version", "admission_pool", "admission_class"}),
++                            "sync_version", "admission_pool", "admission_class", "admission_origin"}),
+     "task_attachments": frozenset({"stored_path"}),
+     "task_chat_links": frozenset(),
+ }
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index 95ca1d84e3..3868c5b165 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -104,6 +104,8 @@ def active_card_runs(exclude=None, detail: Optional[dict] = None) -> Optional[in
+             seen.add(identity)
+             db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
+             try:
++                # Count, own-grant matching and receipt grouping must see one WAL snapshot.
++                db.execute("BEGIN")
+                 cols = {row[1] for row in db.execute("PRAGMA table_info(tasks)")}
+                 own, matched = None, []
+                 if "lease_holder" in cols:
+@@ -124,7 +126,8 @@ def active_card_runs(exclude=None, detail: Optional[dict] = None) -> Optional[in
+                     total += db.execute("SELECT count(*) FROM tasks WHERE status='running'").fetchone()[0]
+                 if detail is not None and "pools" in detail:
+                     from hermes_cli.kanban_admission_pools import board_pools
+-                    counts = board_pools(db, own=own[0] if own else None, excluded=matched)
++                    counts = board_pools(db, own=own[0] if own else None, excluded=matched,
++                                         origins=detail.get("capacity_origins"))
+                     for pool, count in counts.items():
+                         detail["pools"][pool] += count
+             finally:
+diff --git a/tests/hermes_cli/test_kanban_hub_admission.py b/tests/hermes_cli/test_kanban_hub_admission.py
+index 189f70205d..2c3f00ff3c 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission.py
++++ b/tests/hermes_cli/test_kanban_hub_admission.py
+@@ -119,8 +119,65 @@ def test_claim_persists_immutable_regular_receipt(board):
+                               (task_id,)).fetchone()) == ("regular", "capacity")
+ 
+ 
++def test_claim_captures_created_origin_not_mutable_shepherd(board):
++    conn, home = board
++    configure(home, limit=None)
++    tid = task(conn)
++    conn.executescript(sync.SYNC_SCHEMA_SQL)
++    with kb.write_txn(conn):
++        for kind, session in [("created", "original"), ("shepherd", "operator")]:
++            conn.execute("INSERT INTO task_chat_links "
++                         "(uid,task_id,chat_gateway,chat_profile,chat_session,kind,released,created_at) "
++                         "VALUES (?,?, 'source', 'default', ?, ?, 0, 1)", (kind, tid, session, kind))
++    assert kb.claim_task(conn, tid)
++    origin = conn.execute("SELECT admission_origin FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0]
++    assert json.loads(origin) == ["chat", "source", "default", "original"]
++    with kb.write_txn(conn):
++        conn.execute("UPDATE task_chat_links SET released=1 WHERE task_id=?", (tid,))
++    assert conn.execute("SELECT admission_origin FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0] == origin
++
++
++def test_capacity_origin_cap_survives_task_class_edits(board, monkeypatch):
++    conn, home = board
++    configure(home, cap=7)
++    with (home / "config.yaml").open("a") as config:
++        config.write("    priority_slots: 3\n")
++    advisory(home)
++    monkeypatch.setattr(cm, "sample", fake_sample(10))
++    for index in range(2):
++        tid = task(conn, title=f"capacity {index}")
++        kb.edit_task(conn, tid, admission_class="capacity", admission_frees="frees: worker slots")
++        assert kb.claim_task(conn, tid)
++        kb.edit_task(conn, tid, admission_class="normal")
++    candidate = task(conn)
++    kb.edit_task(conn, candidate, admission_class="capacity", admission_frees="frees: runner slots")
++    assert kb.claim_task(conn, candidate) is None
++    # Incident recovery is not subject to the capacity-origin limit.
++    kb.edit_task(conn, candidate, admission_class="urgent")
++    assert kb.claim_task(conn, candidate)
++
++
++@pytest.mark.parametrize("text", ["[]\n", "kanban: [bad]\n", "kanban:\n  admission: [bad]\n"])
++def test_malformed_pool_config_refuses_cleanly(board, text):
++    from hermes_cli import kanban_admission_pools as pools
++    _conn, home = board
++    (home / "config.yaml").write_text(text)
++    with pytest.raises(ValueError, match="^admission configuration must be mappings$"):
++        pools.root_settings()
++
++
++def test_dispatch_invalid_priority_setting_defers_without_crashing(board):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    conn, home = board
++    configure(home, cap=7)
++    with (home / "config.yaml").open("a") as config:
++        config.write("    priority_slots: wrong\n")
++    assert dispatch._tick_spawn_budget(conn, dispatch.DispatchResult(), max_spawn=None,
++                                       max_in_progress=7, board=None) == (False, None)
++
++
+ def test_pool_receipt_is_local_only():
+-    fields = {"admission_pool", "admission_class"}
++    fields = {"admission_pool", "admission_class", "admission_origin"}
+     assert fields <= sync.LOCAL_COLUMNS["task_runs"]
+     assert not fields & sync.SYNCED_COLUMNS["task_runs"]
+ 
+@@ -187,6 +244,46 @@ def test_unknown_pool_receipt_invalidates_census(board, bad):
+     assert mm.active_card_runs(detail={"pools": {"regular": 0, "priority": 0}}) is None
+ 
+ 
++@pytest.mark.parametrize("pressure,expected", [("normal", (True, 3)), ("elevated", (True, 1)),
++                                               ("critical", (False, None))])
++def test_dispatch_budget_reaches_extra_pool_at_regular_cap(board, monkeypatch, pressure, expected):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    conn, home = board
++    configure(home, cap=7)
++    with (home / "config.yaml").open("a") as config:
++        config.write("    priority_slots: 3\n")
++    for index in range(7):
++        tid = task(conn, title=f"regular {index}")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
++    monkeypatch.setattr(dispatch, "_memory_pressure_level", lambda: pressure)
++    result = dispatch.DispatchResult()
++    assert dispatch._tick_spawn_budget(conn, result, max_spawn=None, max_in_progress=7,
++                                       board=None) == expected
++    if pressure in ("elevated", "critical"):
++        assert result.memory_pressure == pressure
++
++
++def test_pool_census_uses_one_board_snapshot(board, monkeypatch):
++    from hermes_cli import kanban_admission_pools as pools
++    conn, home = board
++    tid = task(conn)
++    original = pools.board_pools
++
++    def concurrent_claim(db, **kwargs):
++        with closing(kbc.connect(home / "kanban.db")) as writer:
++            with kb.write_txn(writer):
++                writer.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
++        return original(db, **kwargs)
++
++    monkeypatch.setattr(pools, "board_pools", concurrent_claim)
++    detail = {"pools": {"regular": 0, "priority": 0}}
++    total = mm.active_card_runs(detail=detail)
++    assert total == 0
++    assert detail["pools"] == {"regular": 0, "priority": 0}
++    assert kb.get_task(conn, tid).status == "running"
++
++
+ def test_capacity_class_and_frees_claim_survive_task_readback(board):
+     conn, _home = board
+     task_id = kb.create_task(
+-- 
+2.51.0
+

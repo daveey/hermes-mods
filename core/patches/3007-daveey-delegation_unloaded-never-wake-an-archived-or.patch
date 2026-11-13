@@ -1,0 +1,129 @@
+From af03354d0a666d7523672cc69f4af5818bc16fa5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:18:48 +0000
+Subject: [PATCH] [daveey] delegation_unloaded: never wake an archived or moved
+ parent chat
+
+Review 5879600272 on #1657: the unloaded-parent pass lacked the
+notice_fanout.chat_skip_reason gate the kanban sweep applies, and
+session.resume refuses neither case, so an archived chat was revived and
+a chat moved to another gateway ran a turn here. The pass now skips such
+a row (verdict skipped:archived / skipped:moved), leaves it pending and
+unclaimed (an unarchived chat's poller can still take it; else the
+ledger's expiry ends it), and backs it off.
+
+Also log a WARNING when the ack after a started turn finds the claim
+lease lapsed (complete_completion_delivery returned False).
+---
+ .../test_delegation_unloaded_wake.py          | 31 +++++++++++++++++++
+ tui_gateway/delegation_unloaded.py            | 27 +++++++++++++---
+ 2 files changed, 53 insertions(+), 5 deletions(-)
+
+diff --git a/tests/tui_gateway/test_delegation_unloaded_wake.py b/tests/tui_gateway/test_delegation_unloaded_wake.py
+index edcb023749..c51cb4b35c 100644
+--- a/tests/tui_gateway/test_delegation_unloaded_wake.py
++++ b/tests/tui_gateway/test_delegation_unloaded_wake.py
+@@ -183,6 +183,37 @@ def test_a_chat_no_store_has_is_left_pending(home):
+     assert wake.calls == [] and _row(home)["delivery_state"] == "pending"
+ 
+ 
++@pytest.mark.parametrize("mark, verdict", [
++    ({"archived": 1}, "skipped:archived"),
++    ({"end_reason": "moved_to_gateway:macbook"}, "skipped:moved"),
++])
++def test_an_archived_or_moved_parent_is_never_woken(home, mark, verdict):
++    """``session.resume`` refuses neither, so the pass itself must apply the kanban sweep's ``chat_skip_reason``
++    gate: an archived chat must not be revived, and a chat moved to another gateway is no longer this host's."""
++    _completion()
++    conn = sqlite3.connect(home / "state.db")
++    try:
++        conn.execute(f"UPDATE sessions SET {', '.join(f'{k}=?' for k in mark)} WHERE id=?", (*mark.values(), CHAT))
++        conn.commit()
++    finally:
++        conn.close()
++    wake = _Waker()
++
++    assert [d["verdict"] for d in _sweep(home, wake)] == [verdict]
++    row = _row(home)
++    assert wake.calls == [] and row["delivery_state"] == "pending" and row["delivery_claim"] is None
++    assert row["delivery_attempts"] == 0  # unclaimed: an unarchived/reopened chat's poller can still take it
++
++
++def test_a_lapsed_claim_at_ack_is_logged_as_a_warning(home, monkeypatch, caplog):
++    _completion()
++    monkeypatch.setattr(ad, "complete_completion_delivery", lambda did, claim: False)
++
++    with caplog.at_level("WARNING", logger=du.__name__):
++        assert [d["verdict"] for d in _sweep(home, _Waker())] == ["started"]
++    assert any("lease" in r.getMessage() and DID in r.getMessage() for r in caplog.records)
++
++
+ def test_a_chat_held_by_another_backend_is_left_to_it(home):
+     _completion()
+     wake = _Waker()
+diff --git a/tui_gateway/delegation_unloaded.py b/tui_gateway/delegation_unloaded.py
+index 8609c5c586..a610338ee3 100644
+--- a/tui_gateway/delegation_unloaded.py
++++ b/tui_gateway/delegation_unloaded.py
+@@ -17,7 +17,9 @@ past ``GRACE_S`` (a live poller delivers a fresh result within seconds), not und
+ was dispatched from a UI chat (``origin_ui_session_id``; messaging-gateway parents are the gateway's), and whose
+ chat is in this host's stores, it:
+ 
+-- skips the chat if another backend holds its active-session lease and this one does not (that backend's own pass
++- skips the chat if it is archived or moved to another gateway (``notice_fanout.chat_skip_reason``, as the kanban
++  sweep; the row stays pending and unclaimed), if another backend holds its active-session lease and this one does
++  not (that backend's own pass
+   delivers it), or if the chat is live here mid-turn (its poller delivers at the turn's end);
+ - otherwise claims the row (``claim_completion_delivery``: the one atomic cross-process gate, so the poller's copy,
+   another backend's pass and this one deliver at most once between them) and runs ONE turn with the result in the
+@@ -158,7 +160,10 @@ def _wake_job(wake, delegation_id: str, claim: str, chat: str, text: str, metada
+             logger.warning("%s of %s for %s failed", LABEL, chat, delegation_id, exc_info=True)
+             verdict = "error"
+         if verdict == "started":
+-            ad.complete_completion_delivery(delegation_id, claim)
++            if not ad.complete_completion_delivery(delegation_id, claim):
++                # The turn ran but the claim lease lapsed before the ack: another consumer may deliver it again.
++                logger.warning("%s: started a turn in chat %s for async delegation %s, but its claim lease lapsed "
++                               "before the ack; the row was not marked delivered", LABEL, chat, delegation_id)
+             with _lock:
+                 _wake_times.setdefault(chat, []).append(now)
+                 _retry.pop(delegation_id, None)
+@@ -179,9 +184,15 @@ def _wake_job(wake, delegation_id: str, claim: str, chat: str, text: str, metada
+         _wake_slots.release()
+ 
+ 
+-def _chat_and_tip(chat: str, opener) -> tuple[Optional[str], Optional[str]]:
++def _chat_and_tip(chat: str, opener) -> tuple[Optional[str], Optional[str], Optional[str]]:
++    """``(chat, tip, skip)``: ``skip`` is ``notice_fanout.chat_skip_reason`` (``archived`` / ``moved``), the gate
++    the kanban sweep applies. ``session.resume`` refuses neither, so without it an archived chat would be revived
++    and a chat moved to another gateway would run a turn here. (None, None, None) when no store has the chat."""
++    from tui_gateway.notice_fanout import chat_skip_reason
+     with opener(chat) as (db, tip):
+-        return (chat, tip) if db is not None else (None, None)
++        if db is None:
++            return None, None, None
++        return chat, tip, chat_skip_reason(db, chat)
+ 
+ 
+ def sweep_once(*, now: Optional[float] = None, grace_s: float = GRACE_S,
+@@ -217,10 +228,16 @@ def sweep_once(*, now: Optional[float] = None, grace_s: float = GRACE_S,
+                 if _backing_off(did, now):
+                     decision["verdict"] = "skipped:backoff"
+                     continue
+-                found, tip = _chat_and_tip(chat, opener)
++                found, tip, skip = _chat_and_tip(chat, opener)
+                 if found is None:
+                     decision["verdict"] = "skipped:no-store"
+                     continue
++                if skip is not None:
++                    # Left pending and unclaimed: an unarchived chat's poller can still take it, else the ledger's
++                    # expiry ends it. Back off so the pass does not re-read the chat every tick.
++                    _back_off(did, now)
++                    decision["verdict"] = f"skipped:{skip}"
++                    continue
+                 ids = {chat, tip or chat}
+                 if (holder := held_elsewhere(holders, ids)) is not None:
+                     decision["verdict"] = f"skipped:held:{holder}"
+-- 
+2.51.0
+

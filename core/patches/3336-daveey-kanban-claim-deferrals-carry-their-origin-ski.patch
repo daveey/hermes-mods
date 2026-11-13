@@ -1,0 +1,343 @@
+From 60c18a241e50ae89b2b616914cd21690d47ac8b0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:54:01 +0000
+Subject: [PATCH] [daveey] kanban: claim deferrals carry their origin; skip
+ words read it, not a name list
+
+PR #2003 (review 5888302963, nit) worded a claim_deferred skip as "this host's admission gate" from a
+name-prefix list (hub_cpu_*, hub_admission_overrun, hub_capacity_full). This host's other refusals
+(update_admission_hold, the disk admission refusals, worker_resources_unknown, the worker-resource
+refusal() codes, the placement/worker-capacity refusals in claim_gate) still read "the Board deferred
+its claim", and a Board lease reason spelt like a local one would read as local.
+
+kanban_db_sync.ClaimDeferral is a str carrying origin ("local" | "board"), stamped where the deferral is
+produced: kanban_admission._defer and claim_gate's execution_refusal / waiting_for_worker_capacity are
+local; the Board lease refusal and the unreachable service ("offline") are board. Every consumer that
+compares or prints the reason is unchanged. The dispatch skip records origin in its payload (and the
+notice fields), and words() picks the wording from it. A skip without an origin keeps the Board default.
+
+Tests: tests/hermes_cli/test_kanban_claim_deferral_origin.py (RED on base: update hold, disk refusal and
+worker_resources_unknown worded as Board; a Board "hub_capacity_full" refusal worded as local).
+---
+ hermes_cli/kanban_admission.py                |  2 +-
+ hermes_cli/kanban_db_sync.py                  | 39 ++++++--
+ hermes_cli/kanban_dispatch_skip.py            | 22 +++--
+ .../test_kanban_claim_deferral_origin.py      | 98 +++++++++++++++++++
+ tests/hermes_cli/test_kanban_dispatch_skip.py | 21 ++--
+ .../hermes_cli/test_kanban_source_resolver.py |  4 +-
+ 6 files changed, 159 insertions(+), 27 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_claim_deferral_origin.py
+
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index d3a11809e1..c3cbe7b3bb 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -40,7 +40,7 @@ def _defer(task_id, reason):
+     if task_id is None:
+         return
+     from hermes_cli import kanban_db_sync as sync
+-    sync._CLAIM_DEFERRALS[task_id] = reason
++    sync.defer_claim(task_id, reason, sync.ORIGIN_LOCAL)  # this host's gate, never the Board
+ 
+ 
+ def hub_cpu_advisory(task_id=None, *, conn=None):
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 20c0d5f6a4..f156c32752 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -801,13 +801,34 @@ class ClaimGate:
+             _log.info("kanban sync: release of unused lease for %s failed: %s", task_id, err)
+ 
+ 
+-# task_id -> why the Board did not grant its lease, set by :func:`claim_gate` and read once by the dispatcher
+-# (:func:`pop_claim_deferral`), so a tick can tell a deferred claim from a lost CAS and the "dispatcher stuck"
+-# warning can name it.
+-_CLAIM_DEFERRALS: dict[str, str] = {}
++ORIGIN_LOCAL = "local"  # this host refused: its admission gate (kanban_admission), placement or worker capacity
++ORIGIN_BOARD = "board"  # the Board service refused the lease, or could not be reached
+ 
+ 
+-def pop_claim_deferral(task_id: str) -> Optional[str]:
++class ClaimDeferral(str):
++    """A claim deferral reason that knows who set it (``origin``: :data:`ORIGIN_LOCAL` / :data:`ORIGIN_BOARD`).
++    A ``str``, so every consumer that compares, logs or serialises the reason is unchanged; the dispatch skip
++    words read ``origin`` instead of guessing from the reason's name (PR #2003 review). [daveey]"""
++
++    origin: str
++
++    def __new__(cls, reason: str, origin: str) -> ClaimDeferral:
++        self = super().__new__(cls, reason)
++        self.origin = origin
++        return self
++
++
++# task_id -> why the claim was not granted (a :class:`ClaimDeferral`), set by :func:`claim_gate` and this host's
++# admission gate and read once by the dispatcher (:func:`pop_claim_deferral`), so a tick can tell a deferred claim
++# from a lost CAS and the "dispatcher stuck" warning can name it.
++_CLAIM_DEFERRALS: dict[str, ClaimDeferral] = {}
++
++
++def defer_claim(task_id: str, reason: str, origin: str) -> None:
++    _CLAIM_DEFERRALS[task_id] = ClaimDeferral(reason, origin)
++
++
++def pop_claim_deferral(task_id: str) -> Optional[ClaimDeferral]:
+     return _CLAIM_DEFERRALS.pop(task_id, None)
+ 
+ 
+@@ -833,7 +854,7 @@ def claim_gate(conn: sqlite3.Connection, task_id: str, expires: int, lane: str =
+     from hermes_cli.kanban_sync_diagnostics import record_claim
+     row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+     if row is not None and (reason := execution_refusal(conn, row) or _source_skip(conn, row)):
+-        _CLAIM_DEFERRALS[task_id] = reason
++        defer_claim(task_id, reason, ORIGIN_LOCAL)
+         return ClaimGate(expires, deferred=True)
+     if board_mode(conn) != "primary":
+         return ClaimGate(expires)
+@@ -845,12 +866,12 @@ def claim_gate(conn: sqlite3.Connection, task_id: str, expires: int, lane: str =
+                                   ttl_s=max(expires - int(time.time()), 1), lane=lane)
+     except _CLIENT_ERRORS as exc:  # fail closed: an unreachable service defers the claim
+         _log.info("claim_deferred: offline task=%s (%s: %s)", task_id, type(exc).__name__, exc)
+-        _CLAIM_DEFERRALS[task_id] = "offline"
++        defer_claim(task_id, "offline", ORIGIN_BOARD)
+         record_claim(conn, task_id, "offline")
+         return ClaimGate(expires, deferred=True)
+     if not lease.granted:
+         _log.info("claim_deferred: %s task=%s holder=%s", lease.reason or "denied", task_id, lease.holder)
+-        _CLAIM_DEFERRALS[task_id] = lease.reason or "denied"
++        defer_claim(task_id, lease.reason or "denied", ORIGIN_BOARD)
+         record_claim(conn, task_id, lease.reason or "denied")
+         return ClaimGate(expires, deferred=True)
+     record_claim(conn, task_id, "granted")
+@@ -864,7 +885,7 @@ def claim_gate(conn: sqlite3.Connection, task_id: str, expires: int, lane: str =
+         if not local_admission(conn):
+             with gate:
+                 pass  # release the unused grant; no local task/run was started
+-            _CLAIM_DEFERRALS[task_id] = "waiting_for_worker_capacity"
++            defer_claim(task_id, "waiting_for_worker_capacity", ORIGIN_LOCAL)
+             return ClaimGate(expires, deferred=True)
+     return gate
+ 
+diff --git a/hermes_cli/kanban_dispatch_skip.py b/hermes_cli/kanban_dispatch_skip.py
+index 086c78a40d..6f7ef04014 100644
+--- a/hermes_cli/kanban_dispatch_skip.py
++++ b/hermes_cli/kanban_dispatch_skip.py
+@@ -9,7 +9,8 @@ guessed a quota wall and parked the card. The tick logs had rotated, so the real
+ * :func:`record_tick` (the dispatcher's post-result seam, ``kanban_capacity_evidence.observe_dispatch``) appends
+   ONE ``dispatch_skipped {reason, detail, until?}`` event per (card, reason, detail) per ready episode for every
+   row the tick passed over: ``skipped_ineligible``, ``capsule_refused``, ``no_progress_held``,
+-  ``per_profile_capped``, ``claim_deferred`` (Board/claim refusals), ``owner_down`` and ``pinned_quota_wall``.
++  ``per_profile_capped``, ``claim_deferred`` (Board lease refusals and this host's admission-gate refusals, told
++  apart by the deferral's ``origin``), ``owner_down`` and ``pinned_quota_wall``.
+   A (reason, detail) the episode already holds adds nothing; a new one appends. At most :data:`MAX_PER_EPISODE` per
+   episode, so two dispatchers that disagree cannot grow a card's history without bound.
+ * :func:`pinned_quota_hold` holds a fresh card (no run yet) on the ready lane whose explicit pin's provider pool
+@@ -205,7 +206,9 @@ def _tick_skips(result: Any) -> list[tuple[str, str, Any, Optional[float], dict[
+     """``(task_id, reason, detail, until, extra)`` for every row ``result`` says the tick passed over."""
+     out: list[tuple[str, str, Any, Optional[float], dict[str, Any]]] = []
+     for name in ("skipped_ineligible", "capsule_refused", "no_progress_held", "claim_deferred"):
+-        out += [(tid, name, code, None, {}) for tid, code in getattr(result, name, ())]
++        # A claim deferral carries who set it (local gate vs Board); the skip words read it back (:func:`words`).
++        out += [(tid, name, code, None, {"origin": code.origin} if getattr(code, "origin", None) else {})
++                for tid, code in getattr(result, name, ())]
+     out += [(tid, "per_profile_capped", who, None, {"running": n})
+             for tid, who, n in getattr(result, "skipped_per_profile_capped", ())]
+     out += [(tid, "owner_down", f"{who}:{code}", None, {}) for tid, who, code in getattr(result, "owner_down", ())]
+@@ -294,11 +297,11 @@ _WORDS = {
+ }
+ 
+ 
+-def _local_gate(detail: Any) -> bool:
+-    """A ``claim_deferred`` detail set by this host's own admission gate (``kanban_admission``: the hub CPU checks,
+-    the hold overrun, the whole-host cap), not by the Board service."""
+-    return isinstance(detail, str) and (detail.startswith("hub_cpu_")
+-                                        or detail in ("hub_admission_overrun", "hub_capacity_full"))
++def _local_gate(skip: dict[str, Any]) -> bool:
++    """The ``claim_deferred`` skip was set by this host (its admission gate, placement or worker-capacity check),
++    not by the Board service: the producer stamps ``origin`` (``kanban_db_sync.ClaimDeferral``); no name list."""
++    from hermes_cli.kanban_db_sync import ORIGIN_LOCAL
++    return skip.get("origin") == ORIGIN_LOCAL
+ 
+ 
+ def words(skip: dict[str, Any], *, now: Optional[float] = None) -> str:
+@@ -306,7 +309,7 @@ def words(skip: dict[str, Any], *, now: Optional[float] = None) -> str:
+     reason = str(skip.get("reason") or "unknown")
+     detail = skip.get("detail") or "no detail"
+     text = _WORDS.get(reason, "skipped: {reason} ({detail})").format(reason=reason, detail=detail)
+-    if reason == "claim_deferred" and _local_gate(detail):
++    if reason == "claim_deferred" and _local_gate(skip):
+         text = f"skipped: this host's admission gate deferred its claim ({detail})"
+     if skip.get("until"):
+         text += f" until {_stamp(skip['until'], now)}"
+@@ -390,7 +393,8 @@ def notice_fields(place: Optional[dict[str, Any]], ready_seconds: Optional[float
+     """Payload fields for a ready-wait notice: ``dispatch_skip`` or ``skip_unrecorded``; empty otherwise."""
+     skip = (place or {}).get("skip")
+     if skip:
+-        return {"dispatch_skip": {k: skip.get(k) for k in ("reason", "detail", "until") if skip.get(k) is not None}}
++        return {"dispatch_skip": {k: skip.get(k) for k in ("reason", "detail", "until", "origin")
++                                  if skip.get(k) is not None}}
+     return {"skip_unrecorded": True} if unrecorded(place, ready_seconds) else {}
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_claim_deferral_origin.py b/tests/hermes_cli/test_kanban_claim_deferral_origin.py
+new file mode 100644
+index 0000000000..b5c81c7761
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_claim_deferral_origin.py
+@@ -0,0 +1,98 @@
++"""A claim deferral carries who set it, and the skip words follow that origin, not the reason's name.
++
++PR #2003 review 5888302963 (nit): the skip words picked "this host's admission gate" from a name-prefix list
++(``hub_cpu_*``, ``hub_admission_overrun``, ``hub_capacity_full``), so this host's other refusals (the updater
++hold, the disk admission refusals, ``worker_resources_unknown``, the worker-resource refusal codes) still read
++"the Board deferred its claim", and a Board lease reason spelt like a local one would read as local.
++"""
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import admission_fence
++from hermes_cli import kanban_admission as admission
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_disk_admission as disk
++from hermes_cli import kanban_dispatch_skip as skips
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_runs_on_dispatch as support
++from tests.hermes_cli.test_kanban_quota_episode import board as board  # noqa: PLC0414 -- pytest fixture re-export
++
++gws = support.gws
++svc = support.svc
++
++LOCAL = "this host's admission gate deferred its claim"
++BOARD = "the Board deferred its claim"
++
++
++def _recorded_words(conn, tid):
++    """Pop the deferral the producer left, record it as the dispatcher tick does, and word the current skip."""
++    deferral = sync.pop_claim_deferral(tid)
++    assert deferral is not None
++    skips.record_tick(conn, SimpleNamespace(claim_deferred=[(tid, deferral)]))
++    return skips.words(skips.latest(conn, tid))
++
++
++def _update_hold(monkeypatch, tid):
++    monkeypatch.setattr(disk, "refusal_reason", lambda: None)
++    monkeypatch.setattr(admission_fence, "SUPPORTED", True)
++    monkeypatch.setattr(admission_fence, "is_held", lambda _path: True)
++    assert admission.admission_hold_set(tid)
++    return "update_admission_hold"
++
++
++def _disk_refusal(monkeypatch, tid):
++    monkeypatch.setattr(disk, "refusal_reason", lambda: "worker_disk_policy_unknown")
++    assert admission.disk_admission_refused(tid)
++    return "worker_disk_policy_unknown"
++
++
++def _worker_resources_unknown(_monkeypatch, tid):
++    admission._defer(tid, "worker_resources_unknown")
++    return "worker_resources_unknown"
++
++
++@pytest.mark.parametrize("produce", [_update_hold, _disk_refusal, _worker_resources_unknown])
++def test_a_local_gate_deferral_is_not_worded_as_a_board_deferral(board, monkeypatch, produce):
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="held here", assignee="a")
++        detail = produce(monkeypatch, tid)
++        text = _recorded_words(conn, tid)
++    assert text == f"skipped: {LOCAL} ({detail})"
++    assert "Board" not in text
++
++
++@pytest.mark.parametrize("reason", ["capacity", "hub_capacity_full"])
++def test_a_board_lease_refusal_is_worded_as_the_board_whatever_its_name(gws, monkeypatch, reason):
++    """The Board's own refusal stays "the Board", even under a name the local gate also uses."""
++    hub, _ = gws
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="refused by the Board", assignee="default")
++    hub.round()
++
++    def refuse(self, **kwargs):
++        return sync.Lease(granted=False, run_uid=kwargs["run_uid"], reason=reason)
++
++    monkeypatch.setattr(client.HubLeaseClient, "acquire", refuse)
++    result = hub.tick(max_in_progress=1)
++    assert result.claim_deferred == [(tid, reason)]
++    assert [getattr(d, "origin", None) for _t, d in result.claim_deferred] == [sync.ORIGIN_BOARD]
++    skips.record_tick(hub.conn, result)
++    assert skips.words(skips.latest(hub.conn, tid)) == f"skipped: {BOARD} ({reason})"
++
++
++def test_the_origin_rides_the_recorded_skip_and_the_notice_fields():
++    deferral = sync.ClaimDeferral("update_admission_hold", sync.ORIGIN_LOCAL)
++    assert deferral == "update_admission_hold" and isinstance(deferral, str)  # every str consumer is unchanged
++    [(_tid, reason, detail, _until, extra)] = skips._tick_skips(SimpleNamespace(claim_deferred=[("t_x", deferral)]))
++    assert (reason, detail, extra) == ("claim_deferred", "update_admission_hold", {"origin": "local"})
++    fields = skips.notice_fields({"skip": {"reason": "claim_deferred", "detail": "x", "origin": "local"}}, 0)
++    assert fields == {"dispatch_skip": {"reason": "claim_deferred", "detail": "x", "origin": "local"}}
++    assert skips.words(fields["dispatch_skip"]) == f"skipped: {LOCAL} (x)"
++
++
++def test_a_skip_without_an_origin_reads_as_the_board():
++    """No name list: an unmarked detail (a plain str producer, a skip recorded before origins) keeps the default."""
++    assert skips.words({"reason": "claim_deferred", "detail": "hub_cpu_unknown"}) == f"skipped: {BOARD} (hub_cpu_unknown)"
+diff --git a/tests/hermes_cli/test_kanban_dispatch_skip.py b/tests/hermes_cli/test_kanban_dispatch_skip.py
+index 79b4c30981..e3979e1ac1 100644
+--- a/tests/hermes_cli/test_kanban_dispatch_skip.py
++++ b/tests/hermes_cli/test_kanban_dispatch_skip.py
+@@ -296,7 +296,11 @@ FLAP = ("capacity", "hub_cpu_at_or_above_limit")
+ 
+ def _deferred(tid, detail):
+     from types import SimpleNamespace
+-    return SimpleNamespace(claim_deferred=[(tid, detail)])
++
++    from hermes_cli import kanban_db_sync as sync
++    # The hub CPU gate is this host's; ``capacity`` is the Board's lease refusal (the producers stamp the origin).
++    origin = sync.ORIGIN_BOARD if detail == "capacity" else sync.ORIGIN_LOCAL
++    return SimpleNamespace(claim_deferred=[(tid, sync.ClaimDeferral(detail, origin))])
+ 
+ 
+ def test_flapping_detail_over_40_ticks_keeps_two_rows_and_latest_tracks_the_current_one(board, monkeypatch):
+@@ -315,13 +319,16 @@ def test_flapping_detail_over_40_ticks_keeps_two_rows_and_latest_tracks_the_curr
+         assert [(p["reason"], p["detail"]) for p in _skips(conn, tid)] == [("claim_deferred", d) for d in FLAP]
+ 
+ 
+-@pytest.mark.parametrize("detail,who", [
+-    ("capacity", "the Board"), ("hub_cpu_unknown", "this host's admission gate"),
+-    ("hub_cpu_sample_stale", "this host's admission gate"), ("hub_admission_overrun", "this host's admission gate"),
+-    ("hub_capacity_full", "this host's admission gate"),
++@pytest.mark.parametrize("detail,origin,who", [
++    ("capacity", "board", "the Board"), ("hub_cpu_unknown", "local", "this host's admission gate"),
++    ("hub_cpu_sample_stale", "local", "this host's admission gate"),
++    ("hub_admission_overrun", "local", "this host's admission gate"),
++    ("hub_capacity_full", "local", "this host's admission gate"),
++    ("update_admission_hold", "local", "this host's admission gate"),
+ ])
+-def test_claim_deferred_words_name_who_deferred_it(detail, who):
+-    assert skips.words({"reason": "claim_deferred", "detail": detail}) == f"skipped: {who} deferred its claim ({detail})"
++def test_claim_deferred_words_name_who_deferred_it(detail, origin, who):
++    skip = {"reason": "claim_deferred", "detail": detail, "origin": origin}
++    assert skips.words(skip) == f"skipped: {who} deferred its claim ({detail})"
+ 
+ 
+ def test_latest_tracks_the_current_skip_after_the_episode_cap(board, monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_source_resolver.py b/tests/hermes_cli/test_kanban_source_resolver.py
+index ae40bf920e..1866709141 100644
+--- a/tests/hermes_cli/test_kanban_source_resolver.py
++++ b/tests/hermes_cli/test_kanban_source_resolver.py
+@@ -348,7 +348,9 @@ def test_materialize_timeout_uses_grant_revision_then_defers_next_claim(world, r
+         conn.execute("UPDATE tasks SET workspace_source=? WHERE id=?", (json.dumps(manifest(world, manifest_revision=7)), claimed.id))
+     runs = conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0]
+     assert sync.claim_gate(conn, claimed.id, 900).deferred
+-    assert sync.pop_claim_deferral(claimed.id) == "workspace_source_refused_here:materialize_timeout"
++    deferral = sync.pop_claim_deferral(claimed.id)
++    assert deferral == "workspace_source_refused_here:materialize_timeout"
++    assert deferral.origin == sync.ORIGIN_LOCAL  # this host's skip memo, not a Board refusal
+     assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == runs
+ 
+ 
+-- 
+2.51.0
+

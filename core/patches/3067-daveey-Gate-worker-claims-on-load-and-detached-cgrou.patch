@@ -1,0 +1,365 @@
+From e2be627817d263d5b5e20eb5dc32fac79d184f1b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:00:10 +0000
+Subject: [PATCH] [daveey] Gate worker claims on load and detached cgroup
+ occupancy
+
+---
+ hermes_cli/kanban_admission.py                |   7 +
+ hermes_cli/machine_metrics.py                 |  19 ++-
+ hermes_cli/worker_compute_capacity.py         |   6 +
+ hermes_cli/worker_resource_admission.py       |  97 +++++++++++++
+ .../test_worker_resource_admission.py         | 132 ++++++++++++++++++
+ 5 files changed, 257 insertions(+), 4 deletions(-)
+ create mode 100644 hermes_cli/worker_resource_admission.py
+ create mode 100644 tests/hermes_cli/test_worker_resource_admission.py
+
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index 242bd99c3b..65c11a93a9 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -37,6 +37,10 @@ def hub_cpu_advisory(task_id=None, *, conn=None):
+     from hermes_cli import machine_cpu_metrics as cpu
+     from hermes_cli import machine_metrics
+ 
++    from hermes_cli.worker_resource_admission import refusal
++    if reason := refusal():
++        _defer(task_id, reason)
++        return reason
+     state, limit = cpu.root_limit()
+     if state == cpu.OFF:
+         return None
+@@ -136,6 +140,9 @@ def _final_hub_gate(gate, started=None, *, conn=None, task_id=None):
+     from hermes_cli import machine_cpu_metrics as cpu
+ 
+     echo = getattr(gate, "echo", None)
++    from hermes_cli.worker_resource_admission import refusal
++    if reason := refusal(echo):
++        return reason, None
+     state, limit = cpu.root_limit()
+     if state == cpu.OFF:
+         return None, None
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index e372398e1e..d063e2c248 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -70,7 +70,7 @@ def _mem_used_pct() -> Optional[float]:
+     return None
+ 
+ 
+-def active_card_runs(exclude=None, detail: Optional[dict] = None) -> Optional[int]:
++def active_card_runs(exclude=None, detail: Optional[dict] = None, *, owner_output=None) -> Optional[int]:
+     """All profiles share the kanban root. Count its execution boards, not replicas.
+ 
+     Unreadable/schema-unknown boards invalidate the whole sample. Conservative
+@@ -88,6 +88,7 @@ def active_card_runs(exclude=None, detail: Optional[dict] = None) -> Optional[in
+         default = kb.kanban_home() / "kanban.db"
+         paths = [default, *(p for _, p in named_board_db_files())]
+         total = excluded = 0
++        owners = set()
+         seen = set()
+         for path in paths:
+             try:
+@@ -112,9 +113,11 @@ def active_card_runs(exclude=None, detail: Optional[dict] = None) -> Optional[in
+                     own = db.execute("SELECT gateway_id FROM kanban_sync_state LIMIT 1").fetchone()
+                     if own is None or not own[0]:
+                         return None
+-                    total += db.execute("SELECT count(*) FROM tasks WHERE status='running' AND "
++                    rows = db.execute("SELECT id FROM tasks WHERE status='running' AND "
+                                         "(claim_lock IS NOT NULL OR lease_holder IS NULL OR lease_holder=?)",
+-                                        (own[0],)).fetchone()[0]
++                                        (own[0],)).fetchall()
++                    ids = {row[0] for row in rows}
++                    total += len(rows)
+                     if exclude is not None and identity == tuple(exclude.db_identity) and own[0] == exclude.gateway_id:
+                         from hermes_cli.kanban_grant_echo import match_rows
+                         matched = match_rows(db, exclude)
+@@ -122,18 +125,26 @@ def active_card_runs(exclude=None, detail: Optional[dict] = None) -> Optional[in
+                             return None  # the proven row moved or duplicated under us: unknown, fail closed
+                         total -= len(matched)
+                         excluded += len(matched)
++                        if matched:
++                            ids.discard(exclude.task_id)
+                 else:
+-                    total += db.execute("SELECT count(*) FROM tasks WHERE status='running'").fetchone()[0]
++                    ids = {row[0] for row in db.execute("SELECT id FROM tasks WHERE status='running'")}
++                    total += len(ids)
+                 if detail is not None and "pools" in detail:
+                     from hermes_cli.kanban_admission_pools import board_pools
+                     counts = board_pools(db, own=own[0] if own else None, excluded=matched,
+                                          origins=detail.get("capacity_origins"))
+                     for pool, count in counts.items():
+                         detail["pools"][pool] += count
++                if owner_output is not None:
++                    from hermes_cli.kanban_db_sync import board_slug_for_path
++                    owners.update((board_slug_for_path(str(path)), task) for task in ids)
+             finally:
+                 db.close()
+         if detail is not None:
+             detail["excluded"] = excluded
++        if owner_output is not None:
++            owner_output.update(owners)
+         return total
+     except (OSError, sqlite3.Error, ValueError):
+         return None
+diff --git a/hermes_cli/worker_compute_capacity.py b/hermes_cli/worker_compute_capacity.py
+index 2f6f048d34..8521d422b5 100644
+--- a/hermes_cli/worker_compute_capacity.py
++++ b/hermes_cli/worker_compute_capacity.py
+@@ -98,6 +98,12 @@ def occupied_owners(root: Path, owners: dict[str, Owner], active: set[Owner]) ->
+     return occupied
+ 
+ 
++def pool_path() -> Path:
++    import os
++    uid = os.getuid()
++    return CGROUP_ROOT / 'user.slice' / f'user-{uid}.slice' / f'user@{uid}.service' / 'hermes.slice' / 'hermes-kanban.slice'
++
++
+ def worker_enabled() -> bool:
+     """Read installation policy, never a card's environment or profile override."""
+     from hermes_constants import get_default_hermes_root
+diff --git a/hermes_cli/worker_resource_admission.py b/hermes_cli/worker_resource_admission.py
+new file mode 100644
+index 0000000000..4553cd4ed0
+--- /dev/null
++++ b/hermes_cli/worker_resource_admission.py
+@@ -0,0 +1,97 @@
++"""Opt-in worker gate, independent of hub overflow and placement policy."""
++from __future__ import annotations
++
++
++import json
++import os
++from pathlib import Path
++import tempfile
++
++from hermes_cli import worker_compute_capacity as capacity
++
++
++def _pressure(directory: Path) -> bool:
++    """Serialize hysteresis updates, including pre-lease callers across boards.
++
++    The observation is taken inside the lock, never replayed from a reporter.
++    Corrupt state or a busy lock refuses rather than erasing a held brake.
++    """
++    import fcntl
++    directory.mkdir(parents=True, exist_ok=True)
++    with (directory / 'pressure.lock').open('a') as lock:
++        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        path = directory / 'pressure.json'
++        try:
++            state = json.loads(path.read_text(encoding='utf-8'))
++        except FileNotFoundError:
++            state = {'held': False}
++        if not isinstance(state, dict) or type(state.get('held')) is not bool:
++            raise ValueError('invalid worker pressure state')
++        load, cores = os.getloadavg()[0], capacity.effective_cores()
++        held = capacity.pressure_held(state['held'], load, cores)
++        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=directory, delete=False) as handle:
++            temporary = Path(handle.name)
++            json.dump({'held': held, 'load1': load, 'cores': cores}, handle)
++            handle.flush()
++            os.fsync(handle.fileno())
++        try:
++            os.replace(temporary, path)
++        finally:
++            temporary.unlink(missing_ok=True)
++        return held
++
++
++def pool_occupancy(pool: Path, owners, active):
++    """A not-yet-started slice is empty, but a missing hierarchy is unknown.
++
++    Inspect the manager first after ENOENT, then retry the slice inventory;
++    never turn a disappearing child or unreadable events file into free slots.
++    """
++    try:
++        pool.stat()
++    except FileNotFoundError:
++        events = dict(line.split() for line in (pool.parent.parent / 'cgroup.events').read_text(encoding='utf-8').splitlines())
++        if events.get('populated') not in {'0', '1'}:
++            raise ValueError('invalid user manager observation')
++        try:
++            pool.stat()
++        except FileNotFoundError:
++            return set(active)
++    return capacity.occupied_owners(pool, owners, active)
++
++
++def refusal(echo=None) -> str | None:
++    """Pre-lease and final-lock check. Unknown observations fail closed."""
++    from hermes_constants import get_default_hermes_root
++
++    try:
++        if not capacity.worker_enabled():
++            return None
++        directory = Path(get_default_hermes_root()) / 'worker-resources'
++        if _pressure(directory):
++            return 'worker_load_pressure'
++        from hermes_cli import machine_metrics
++        from hermes_cli.kanban_admission import _root_max_in_progress
++        active_owners = set()
++        active = machine_metrics.active_card_runs(exclude=echo, owner_output=active_owners)
++        ok, cap = _root_max_in_progress()
++        if active is None or not ok or cap is None:
++            return 'worker_resources_unknown'
++        owners = {}
++        owner_dir = directory / 'owners'
++        if owner_dir.exists():
++            for path in owner_dir.iterdir():
++                if path.suffix != '.json':
++                    continue
++                owner = json.loads(path.read_text(encoding='utf-8'))
++                if (not isinstance(owner, list) or len(owner) != 2
++                        or not all(isinstance(value, str) and value for value in owner)
++                        or capacity.owner_slice(*owner) != path.stem):
++                    raise ValueError('invalid worker owner map')
++                owners[path.stem] = tuple(owner)
++        occupied = pool_occupancy(capacity.pool_path(), owners, active_owners)
++        if len(occupied) >= cap:
++            return 'worker_capacity_full'
++        return None
++    except Exception:  # health: allow BLE001 -- any unreadable policy/controller must refuse claims
++        return 'worker_resources_unknown'
+diff --git a/tests/hermes_cli/test_worker_resource_admission.py b/tests/hermes_cli/test_worker_resource_admission.py
+new file mode 100644
+index 0000000000..c6945e26cc
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_resource_admission.py
+@@ -0,0 +1,132 @@
++"""Worker pressure applies even when hub CPU admission is disabled."""
++import json
++
++import pytest
++
++from tests.hermes_cli.test_kanban_hub_admission_grant_echo import Rig, claim
++from hermes_cli import kanban_admission as admission
++from hermes_cli import worker_compute_capacity as capacity
++
++
++@pytest.fixture
++def worker_rig(monkeypatch, tmp_path):
++    rig = Rig(tmp_path, monkeypatch, cap=2)
++    monkeypatch.setattr(capacity, 'worker_enabled', lambda: True)
++    monkeypatch.setattr(capacity, 'effective_cores', lambda: 16)
++    monkeypatch.setattr('os.getloadavg', lambda: (1, 1, 1))
++    pool = tmp_path / 'pool'
++    pool.mkdir()
++    monkeypatch.setattr(capacity, 'pool_path', lambda: pool)
++    try:
++        yield rig, pool
++    finally:
++        rig.close()
++
++
++@pytest.mark.parametrize('lane', ['ready', 'review'])
++def test_final_gate_counts_new_detached_jobs_and_releases_grant(worker_rig, lane):
++    rig, pool = worker_rig
++    rig.fill(1)
++    t = rig.card(lane)
++    def populated_after_lease(conn, task, gate):
++        group = pool / 'unknown.scope'
++        group.mkdir()
++        (group / 'cgroup.events').write_text('populated 1\n')
++    seen = rig.echo_between_gate_and_txn(populated_after_lease)
++    assert claim(rig.conn, t, lane) is None
++    assert seen['gate'].consumed is False
++    from hermes_cli import kanban_db_sync as sync
++    assert sync.pop_claim_deferral(t) == 'worker_capacity_full'
++
++
++@pytest.mark.parametrize('lane', ['ready', 'review'])
++def test_worker_own_grant_echo_does_not_take_extra_slot(worker_rig, lane):
++    rig, pool = worker_rig
++    started = rig.fill(1)
++    name = capacity.owner_slice('default', started[0])
++    (pool / name).mkdir()
++    (pool / name / 'cgroup.events').write_text('populated 1\n')
++    directory = rig.home / 'worker-resources' / 'owners'
++    directory.mkdir()
++    (directory / f'{name}.json').write_text(json.dumps(['default', started[0]]))
++    t = rig.card(lane)
++    rig.echo_between_gate_and_txn()
++    assert claim(rig.conn, t, lane) is not None
++
++
++def test_persistent_hysteresis_and_bad_state_refuse(worker_rig, monkeypatch):
++    from hermes_cli.worker_resource_admission import refusal
++    rig, _ = worker_rig
++    for load, expected in [(24, 'worker_load_pressure'), (20, 'worker_load_pressure'), (16, None)]:
++        monkeypatch.setattr('os.getloadavg', lambda: (load, 0, 0))
++        assert refusal() == expected
++    (rig.home / 'worker-resources' / 'pressure.json').write_text('{broken')
++    assert refusal() == 'worker_resources_unknown'
++
++
++@pytest.mark.parametrize('lane', ['ready', 'review'])
++def test_parked_job_blocks_before_lease_then_releases(monkeypatch, tmp_path, lane):
++    rig = Rig(tmp_path, monkeypatch, cap=1)
++    try:
++        monkeypatch.setattr(capacity, 'worker_enabled', lambda: True)
++        monkeypatch.setattr(capacity, 'effective_cores', lambda: 16)
++        monkeypatch.setattr('os.getloadavg', lambda: (1, 1, 1))
++        pool = tmp_path / 'cgroups'
++        pool.mkdir()
++        monkeypatch.setattr(capacity, 'pool_path', lambda: pool, raising=False)
++        owner = ('default', 't_parked')
++        unit = capacity.owner_slice(*owner)
++        (pool / unit).mkdir()
++        events = pool / unit / 'cgroup.events'
++        events.write_text('populated 1\n')
++        directory = rig.home / 'worker-resources' / 'owners'
++        directory.mkdir(parents=True)
++        (directory / f'{unit}.json').write_text(json.dumps(owner))
++        t = rig.card(lane)
++        assert claim(rig.conn, t, lane) is None
++        from hermes_cli import kanban_db_sync as sync
++        assert sync.pop_claim_deferral(t) == 'worker_capacity_full'
++        assert rig.row(t)['status'] == lane
++        events.write_text('populated 0\n')
++        assert claim(rig.conn, t, lane) is not None
++    finally:
++        rig.close()
++
++
++def test_absent_pool_is_empty_only_with_readable_manager(tmp_path):
++    from hermes_cli.worker_resource_admission import pool_occupancy
++    manager = tmp_path / 'manager'
++    manager.mkdir()
++    pool = manager / 'hermes.slice' / 'hermes-kanban.slice'
++    with pytest.raises(FileNotFoundError):
++        pool_occupancy(pool, {}, set())
++    (manager / 'cgroup.events').write_text('populated 1\n')
++    assert pool_occupancy(pool, {}, {('default', 't_live')}) == {('default', 't_live')}
++    pool.mkdir(parents=True)
++    (pool / 'broken.scope').mkdir()
++    with pytest.raises(FileNotFoundError):
++        pool_occupancy(pool, {}, set())
++
++
++def test_malformed_root_config_refuses_without_raising(monkeypatch, tmp_path):
++    import hermes_constants
++    from hermes_cli.worker_resource_admission import refusal
++    monkeypatch.setattr(hermes_constants, 'get_default_hermes_root', lambda: tmp_path)
++    for text in ['kanban: [broken', '- not-a-mapping', 'kanban: 7']:
++        (tmp_path / 'config.yaml').write_text(text)
++        assert refusal() == 'worker_resources_unknown'
++
++
++def test_worker_brake_is_not_bypassed_by_disabled_hub(monkeypatch, tmp_path):
++    from hermes_cli import machine_cpu_metrics as cpu
++    import hermes_constants
++    monkeypatch.setattr(hermes_constants, 'get_default_hermes_root', lambda: tmp_path)
++    monkeypatch.setattr(cpu, 'root_limit', lambda: (cpu.OFF, None))
++    monkeypatch.setattr(capacity, 'worker_enabled', lambda: True)
++    monkeypatch.setattr(capacity, 'effective_cores', lambda: 16)
++    monkeypatch.setattr('os.getloadavg', lambda: (24, 20, 18))
++    assert admission.hub_cpu_advisory('t_pressure') == 'worker_load_pressure'
++    # Final boundary independently refuses, with hub admission still OFF.
++    assert admission._final_hub_gate(None)[0] == 'worker_load_pressure'
++    state = tmp_path / 'worker-resources' / 'pressure.json'
++    assert json.loads(state.read_text())['held'] is True
+-- 
+2.51.0
+

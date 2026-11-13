@@ -1,0 +1,360 @@
+From 61494075165daf62651a2318919c8a1cf523174c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 04:42:18 +0000
+Subject: [PATCH] [daveey] fix(kanban): review_required refusals name the
+ operator rule; refuse before the goal judge
+
+Follow-up to PR #1123 (deferred non-blocking review points, card t_01a1d11f2b89d33f):
+
+1. edit_operator_fields refuses disabling review_required for every kanban
+   worker run (HERMES_KANBAN_TASK / HERMES_KANBAN_WORKER_TASK), dispatched
+   orchestrators included, but said "only an orchestrator". It now says "an
+   operator (outside a kanban worker run)". require_review gives a worker
+   approving a child pending in review without claiming it the same rule.
+   Permission is unchanged; the rule is documented in the module docstring
+   and the kanban CLI docs.
+2. _handle_complete checks review_required before _goal_gate, so a goal_mode
+   + review_required implementer gets the deterministic refusal without a
+   judge call.
+3. An operator (no worker identity) completing a review_required card outside
+   review (CLI complete, dashboard done) is pointed at
+   `hermes kanban edit <id> --review-required off` instead of the
+   implementer-only kanban_request_review text.
+
+Proof: tests/tools/test_kanban_review_required_wording.py (9) + updated
+plumbing assertion: 9 fail on base 7755ecfca2, all pass on head; the
+non-required goal-judge control passes on both. 33 affected test files
+(744 tests) green; scripts/check --base origin/main ok.
+---
+ hermes_cli/kanban_db_operator.py              |   7 +-
+ hermes_cli/kanban_review_required.py          |  33 +++-
+ .../test_kanban_review_required_plumbing.py   |   2 +-
+ .../test_kanban_review_required_wording.py    | 142 ++++++++++++++++++
+ tools/kanban_tools.py                         |  16 +-
+ website/docs/user-guide/features/kanban.md    |  11 ++
+ 6 files changed, 198 insertions(+), 13 deletions(-)
+ create mode 100644 tests/tools/test_kanban_review_required_wording.py
+
+diff --git a/hermes_cli/kanban_db_operator.py b/hermes_cli/kanban_db_operator.py
+index 4cd4e33966..7e3b215f64 100644
+--- a/hermes_cli/kanban_db_operator.py
++++ b/hermes_cli/kanban_db_operator.py
+@@ -5,7 +5,6 @@ which sqlite-live-guard refuses. [daveey]"""
+ 
+ from __future__ import annotations
+ 
+-import os
+ import sqlite3
+ import time
+ from typing import Any, Optional
+@@ -41,9 +40,9 @@ def edit_operator_fields(
+     if goal_mode is not None:
+         wanted["goal_mode"] = 1 if goal_mode else 0
+     if review_required is not None:
+-        worker = os.environ.get("HERMES_KANBAN_TASK") or os.environ.get("HERMES_KANBAN_WORKER_TASK")
+-        if not review_required and worker:
+-            raise KanbanEditRefused("review_required can only be disabled by an orchestrator, not a worker")
++        from hermes_cli.kanban_review_required import OPERATOR, worker_identity
++        if not review_required and worker_identity():  # any worker run, orchestrators included
++            raise KanbanEditRefused(f"review_required can only be disabled by {OPERATOR}")
+         wanted["review_required"] = int(bool(review_required))
+     if session_id is not None:
+         sid = str(session_id).strip()
+diff --git a/hermes_cli/kanban_review_required.py b/hermes_cli/kanban_review_required.py
+index 550e7111ca..c4eaf780fa 100644
+--- a/hermes_cli/kanban_review_required.py
++++ b/hermes_cli/kanban_review_required.py
+@@ -1,26 +1,55 @@
+-"""Completion admission for cards with an explicit review requirement."""
++"""Completion admission for cards with an explicit review requirement.
++
++Who may do what on a ``review_required`` card:
++
++* The implementer finishes with ``kanban_request_review``; a reviewer that
++  claims the review run then approves with ``kanban_complete``.
++* Only an operator (outside a kanban worker run: neither ``HERMES_KANBAN_TASK``
++  nor ``HERMES_KANBAN_WORKER_TASK`` is set) may approve a card pending in
++  ``review`` without claiming it, or turn the requirement off with
++  ``hermes kanban edit <id> --review-required off``. Every kanban worker run,
++  dispatched orchestrator workers included, is refused both.
++"""
+ from __future__ import annotations
+ 
+ import os
+ 
++OPERATOR = "an operator (outside a kanban worker run)"
++
+ 
+ class ReviewRequiredError(ValueError):
+     """The current lane cannot approve a review-required card."""
+ 
+ 
++def worker_identity() -> str:
++    """The kanban worker task this process runs for, or ``""`` for an operator."""
++    return os.environ.get("HERMES_KANBAN_TASK") or os.environ.get("HERMES_KANBAN_WORKER_TASK") or ""
++
++
+ def require_review(conn, task_id: str, expected_run_id: int | None, *, placement_settled: bool = False) -> None:
+     from hermes_cli import kanban_db as kb
+ 
+     task = kb.get_task(conn, task_id)
+     if task is None or not task.review_required or placement_settled:
+         return
+-    worker = os.environ.get("HERMES_KANBAN_TASK") or os.environ.get("HERMES_KANBAN_WORKER_TASK")
++    worker = worker_identity()
+     if task.status == "review" and expected_run_id is None and not worker:
+         return  # An operator may approve a pending review without claiming it.
+     if (task.status == "running" and task.current_run_id is not None
+             and (expected_run_id is None or expected_run_id == task.current_run_id)
+             and kb._retry_status_for_run(conn, task_id, task.current_run_id) == "review"):
+         return
++    if task.status == "review" and expected_run_id is None:
++        raise ReviewRequiredError(
++            f"{task_id} is pending review: a reviewer approves it by claiming the review run; only "
++            f"{OPERATOR} may approve it without claiming it."
++        )
++    if not worker:
++        raise ReviewRequiredError(
++            f"{task_id} requires review and is not in review: send it through kanban_request_review, "
++            f"or, as {OPERATOR}, turn the requirement off with "
++            f"`hermes kanban edit {task_id} --review-required off`."
++        )
+     raise ReviewRequiredError(
+         f"{task_id} requires review: use kanban_request_review, then a reviewer may complete it. "
+         "The implementer cannot complete this card, even with --force."
+diff --git a/tests/hermes_cli/test_kanban_review_required_plumbing.py b/tests/hermes_cli/test_kanban_review_required_plumbing.py
+index 8fca6f2011..76ff61c280 100644
+--- a/tests/hermes_cli/test_kanban_review_required_plumbing.py
++++ b/tests/hermes_cli/test_kanban_review_required_plumbing.py
+@@ -97,7 +97,7 @@ def test_cli_edit_worker_cannot_disable(home, monkeypatch, capsys, identity):
+     tid = make(True)
+     monkeypatch.setenv(identity, tid)
+     assert kc._cmd_edit(parse("edit", tid, "--review-required", "off")) != 0
+-    assert "orchestrator" in capsys.readouterr().err
++    assert "an operator (outside a kanban worker run)" in capsys.readouterr().err
+     assert flag(tid) is True
+ 
+ 
+diff --git a/tests/tools/test_kanban_review_required_wording.py b/tests/tools/test_kanban_review_required_wording.py
+new file mode 100644
+index 0000000000..43dece93a0
+--- /dev/null
++++ b/tests/tools/test_kanban_review_required_wording.py
+@@ -0,0 +1,142 @@
++"""review_required refusals name the real rule (operator = outside a kanban worker run),
++and kanban_complete refuses a review_required card before spending a goal-judge call."""
++import argparse
++import importlib.util
++import json
++import sys
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_operator as kbo
++from tools import kanban_tools as kt
++
++OPERATOR = "an operator (outside a kanban worker run)"
++IDENTITIES = ("HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK")
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_DB",
++                "HERMES_KANBAN_BOARD", "HERMES_SESSION_ID", "HERMES_KANBAN_WORKER_TASK"):
++        monkeypatch.delenv(key, raising=False)
++    kb._INITIALIZED_PATHS.clear()
++    with kbc.connect_closing() as conn:
++        yield conn
++
++
++def claimed(conn, monkeypatch, *, required=True, goal_mode=False):
++    tid = kb.create_task(conn, title="Wording fixture", body="Must achieve X.", assignee="default",
++                         review_required=required, goal_mode=goal_mode)
++    task = kb.claim_task(conn, tid)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
++    return tid, task.current_run_id
++
++
++def as_operator(monkeypatch):
++    for key in (*IDENTITIES, "HERMES_KANBAN_RUN_ID"):
++        monkeypatch.delenv(key, raising=False)
++
++
++# --- item 1: refusals say "operator (outside a kanban worker run)", not "orchestrator" ---
++
++
++@pytest.mark.parametrize("identity", IDENTITIES)
++def test_disable_refusal_names_operator_outside_worker_run(board, monkeypatch, identity):
++    tid = kb.create_task(board, title="flagged", assignee="default", review_required=True)
++    monkeypatch.setenv(identity, "t_orchestrator")  # a dispatched orchestrator worker is still a worker run
++    with pytest.raises(kbo.KanbanEditRefused) as refused:
++        kbo.edit_operator_fields(board, tid, review_required=False)
++    assert OPERATOR in str(refused.value)
++    assert "orchestrator" not in str(refused.value)
++    assert kb.get_task(board, tid).review_required is True
++
++
++@pytest.mark.parametrize("identity", IDENTITIES)
++def test_worker_approving_pending_review_without_claim_names_operator(board, monkeypatch, identity):
++    tid, run = claimed(board, monkeypatch)
++    assert kb.request_review(board, tid, summary="implemented", expected_run_id=run)
++    as_operator(monkeypatch)
++    monkeypatch.setenv(identity, "t_orchestrator")
++    with pytest.raises(ValueError) as refused:
++        kb.complete_task(board, tid, summary="approve child", force=True)
++    message = str(refused.value)
++    assert OPERATOR in message and "without claiming" in message
++    assert "kanban_request_review" not in message  # the card is already in review
++    assert kb.get_task(board, tid).status == "review"
++
++
++# --- comment item 3: an operator outside review is pointed at the escape hatch ---
++
++
++def test_operator_cli_complete_outside_review_names_edit_escape_hatch(board, monkeypatch, capsys):
++    from hermes_cli import kanban
++    tid, _run = claimed(board, monkeypatch)
++    as_operator(monkeypatch)
++    rc = kanban._cmd_complete(argparse.Namespace(
++        task_ids=[tid], result=None, summary="operator done", metadata=None, force=True))
++    out = capsys.readouterr()
++    assert rc != 0
++    assert f"hermes kanban edit {tid} --review-required off" in out.err + out.out
++    assert kb.get_task(board, tid).status == "running"
++
++
++def test_worker_refusal_does_not_offer_operator_escape_hatch(board, monkeypatch):
++    tid, run = claimed(board, monkeypatch)
++    with pytest.raises(ValueError) as refused:
++        kb.complete_task(board, tid, summary="skip", expected_run_id=run)
++    assert "kanban_request_review" in str(refused.value)
++    assert "--review-required off" not in str(refused.value)
++
++
++def _dashboard(tmp_path):
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++    plugin = Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
++    spec = importlib.util.spec_from_file_location("hermes_dashboard_plugin_kanban_wording_test", plugin)
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = mod
++    spec.loader.exec_module(mod)
++    app = FastAPI()
++    app.include_router(mod.router, prefix="/api/plugins/kanban")
++    return TestClient(app)
++
++
++def test_dashboard_done_outside_review_names_edit_escape_hatch(board, monkeypatch, tmp_path):
++    tid, _run = claimed(board, monkeypatch)
++    as_operator(monkeypatch)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    r = _dashboard(tmp_path).patch(f"/api/plugins/kanban/tasks/{tid}",
++                                   json={"status": "done", "summary": "operator done"})
++    assert r.status_code == 400, r.text
++    assert f"hermes kanban edit {tid} --review-required off" in r.json()["detail"]
++    assert kb.get_task(board, tid).status == "running"
++
++
++# --- item 2: review_required refuses before the goal judge runs ---
++
++
++@pytest.mark.parametrize("required", [True, False])
++def test_review_required_refuses_before_goal_judge(board, monkeypatch, required):
++    tid, _run = claimed(board, monkeypatch, required=required, goal_mode=True)
++    calls = []
++
++    def judge(goal, last_response, **kw):
++        calls.append(goal)
++        return "done", "looks done", False, None, False
++
++    monkeypatch.setattr(kt, "judge_goal", judge)
++    monkeypatch.setattr(kt, "_goal_judge_available", lambda: True)
++    out = json.loads(kt._handle_complete({"task_id": tid, "summary": "implemented"}))
++    if required:
++        assert out.get("rejection") == "review_required", out
++        assert calls == []  # the deterministic refusal spends no judge call
++        assert kb.get_task(board, tid).status == "running"
++    else:  # control: without the requirement the judge still gates completion
++        assert out.get("ok"), out
++        assert len(calls) == 1
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 7b76b2ca9c..f0ebdcf5db 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -873,7 +873,7 @@ def _handle_list(args: dict, **kw) -> str:
+ def _handle_complete(args: dict, **kw) -> str:
+     """Mark the current task done with a structured handoff. Every refusal
+     carries a ``rejection`` class from ``COMPLETE_REJECTION_CLASSES``."""
+-    from hermes_cli.kanban_review_required import ReviewRequiredError
++    from hermes_cli.kanban_review_required import ReviewRequiredError, require_review
+     try:
+         tid = _worker_guard("kanban_complete", args)
+     except _Reject as e:
+@@ -904,13 +904,17 @@ def _handle_complete(args: dict, **kw) -> str:
+         from hermes_cli import kanban_review_contract as _krc  # [daveey] a review ship would refuse: refuse it now
+         if refused := _krc.completion_refusal(getattr(task, "body", None), metadata, _worker_run_id(tid)):
+             raise _Reject(*refused)
++        run_id = _worker_run_id(tid)
++        if run_id is not None and _kc.parked_by_own_run(conn, tid, run_id):
++            # This worker parked its card with kanban_block, then edited its own edges (kanban_unlink):
++            # its run is over but nothing has claimed the card since, so it may still close its own card.
++            run_id = None
++        try:  # deterministic review_required refusal before the goal judge spends a call
++            require_review(conn, tid, run_id)
++        except ReviewRequiredError as review_err:
++            return tool_error(str(review_err), rejection="review_required")
+         goal_verification = _goal_gate("kanban_complete", task, tid, (summary or result or "").strip(), conn=conn)
+         try:
+-            run_id = _worker_run_id(tid)
+-            if run_id is not None and _kc.parked_by_own_run(conn, tid, run_id):
+-                # This worker parked its card with kanban_block, then edited its own edges (kanban_unlink):
+-                # its run is over but nothing has claimed the card since, so it may still close its own card.
+-                run_id = None
+             event_mark = _kc.event_mark(conn, tid)  # a refusal's own pr_acceptance event lands above it
+             ok = kb.complete_task(
+                 conn, tid, result=result, summary=summary, metadata=metadata,
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index abd3e652e0..93f611dd04 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1264,6 +1264,7 @@ hermes kanban create "<title>" [--body ...] [--assignee <profile>]
+                                 [--max-runtime 30m|2h|1d|<seconds>]
+                                 [--max-retries N]
+                                 [--goal] [--goal-max-turns N]
++                                [--review-required]
+                                 [--reasoning-effort low|medium|high|none]
+                                 [--skill <name>]...
+                                 [--json]
+@@ -1276,6 +1277,7 @@ hermes kanban assign <id> <profile>                    # or 'none' to unassign
+ hermes kanban reassign <id>... <profile>               # bulk re-assign tasks to a profile
+ hermes kanban edit <id> [--title ...] [--body ...]     # edit task title / body / priority in place
+         [--priority N]
++        [--review-required on|off]                     # 'off' is operator-only (see below)
+ hermes kanban promote <id>...                          # move todo/blocked/triage tasks to ready (recovery)
+ hermes kanban schedule <id> --at <ISO8601>             # set/clear a task's scheduled_at start time
+ hermes kanban diagnostics [--json]                     # board health snapshot (alias: diag)
+@@ -1320,6 +1322,15 @@ hermes kanban gc [--event-retention-days N] [--worktree-retention-days N] # work
+         [--log-retention-days N]                       #   (negative N is rejected; 0 disables that sweep)
+ ```
+ 
++A card created with `--review-required` (tool: `review_required=true`) cannot be
++completed by its implementer, even with `--force`: the implementer calls
++`kanban_request_review`, and a reviewer that claims the review run approves it.
++Only an operator (outside a kanban worker run: neither `HERMES_KANBAN_TASK` nor
++`HERMES_KANBAN_WORKER_TASK` is set) may approve a card pending in `review`
++without claiming it, or turn the requirement off with
++`hermes kanban edit <id> --review-required off`. Every kanban worker run,
++dispatched orchestrator workers included, is refused both.
++
+ Worktree GC also covers done, failed, and cancelled tasks. After
+ `kanban.worktree_retention_days` (default 7, overridden by the GC flag), clean
+ worktrees may be removed even with unpushed commits: their HEAD and history are
+-- 
+2.51.0
+

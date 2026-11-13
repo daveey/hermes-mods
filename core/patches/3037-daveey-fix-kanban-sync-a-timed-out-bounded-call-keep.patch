@@ -1,0 +1,106 @@
+From 41a924412c4af902789a4e1ac1f9fe2a191ec4ab Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 17:22:24 +0000
+Subject: [PATCH] [daveey] fix(kanban-sync): a timed-out bounded call keeps its
+ worker's schedstat
+
+_bounded_call joins its worker until the deadline, sees it alive, then reads
+/proc/self/task/<tid>/schedstat. The worker's socket times out at that same
+deadline, so on a throttled runner it can exit between is_alive() and the read:
+the read returns None and overwrote the schedstat the worker's finally had
+already stored, so the metrics sender logged worker_run_ns=None
+(test_a_sample_without_a_cpu_triple_is_bounded_to_2_s_and_probed flaked on CI
+run 43261825540).
+
+A missing task entry means run() already returned, so keep the worker's own
+value when the caller's read finds nothing.
+
+Tests: a deterministic regression test makes the caller's read wait until the
+worker thread is gone (red on base: probe["worker"] is None). The flaky test's
+wall bound gets 3 s slack instead of 1 s (still far below the 30 s path it
+guards), and _SlowBoard reads its Event via type(self) so a subclass can own one.
+---
+ hermes_cli/kanban_sync_client.py              |  6 +++-
+ .../hermes_cli/test_machine_metrics_sender.py | 35 +++++++++++++++++--
+ 2 files changed, 38 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 4ab283bf8a..9c1580da8c 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -224,7 +224,11 @@ def _bounded_call(ident: Identity, method: str, path: str, body: Optional[dict],
+     worker.join(max(0.0, deadline - time.monotonic()))
+     if worker.is_alive():
+         if probe is not None:
+-            probe["worker"] = schedstat(worker.native_id)
++            # The worker's socket times out at this same deadline, so it may exit between is_alive() and this read.
++            # Its task entry goes only after run() returned, whose finally already stored its own schedstat.
++            stat = schedstat(worker.native_id)
++            if stat is not None:
++                probe["worker"] = stat
+         with expiry:
+             box["expired"] = True
+             if "conn" in box:
+diff --git a/tests/hermes_cli/test_machine_metrics_sender.py b/tests/hermes_cli/test_machine_metrics_sender.py
+index b19ee8e32a..a418f79f93 100644
+--- a/tests/hermes_cli/test_machine_metrics_sender.py
++++ b/tests/hermes_cli/test_machine_metrics_sender.py
+@@ -399,7 +399,7 @@ class _SlowBoard(http.server.BaseHTTPRequestHandler):
+     def do_POST(self):
+         self.rfile.read(int(self.headers.get("content-length") or 0))
+         _SlowBoard.seen.append(self.path)
+-        _SlowBoard.release.wait(30)
++        type(self).release.wait(30)
+         try:
+             self.send_response(200)
+             self.send_header("content-length", "2")
+@@ -422,7 +422,7 @@ def test_a_sample_without_a_cpu_triple_is_bounded_to_2_s_and_probed(caplog):
+         t0 = time.monotonic()
+         with caplog.at_level("INFO", logger=ms.__name__):
+             assert sender.tick() is False
+-        assert time.monotonic() - t0 < client.CPU_REPORT_BUDGET_S + 1.0
++        assert time.monotonic() - t0 < client.CPU_REPORT_BUDGET_S + 3.0  # far below the 30 s kept-alive path
+         line = next(_fields(r.getMessage()) for r in caplog.records
+                     if r.getMessage().startswith("metrics_sender send "))
+         assert line["out"] == "timeout" and line["written"] == "True" and line["end_ms"] == "None"
+@@ -433,6 +433,37 @@ def test_a_sample_without_a_cpu_triple_is_bounded_to_2_s_and_probed(caplog):
+         server.shutdown()
+ 
+ 
++class _SilentBoard(_SlowBoard):
++    release = threading.Event()  # its own: _SlowBoard's is left set by the test above
++
++
++@pytest.mark.platforms("linux")  # /proc/self/task/<tid>/schedstat
++def test_a_worker_that_exits_at_the_deadline_keeps_its_own_schedstat(monkeypatch):
++    """The worker's socket times out at the caller's join deadline, so it can exit between the caller's is_alive()
++    and its /proc/self/task/<tid> read (seen on a throttled CI runner: worker_run_ns=None). That lost read must not
++    erase the schedstat the worker stored on its way out."""
++    real = client.schedstat
++
++    def worker_gone_first(tid=None):
++        if tid is not None:  # the caller's read of a timed-out worker: let the worker exit before it, deterministically
++            wait_until(lambda: not Path(f"/proc/self/task/{tid}").exists(), timeout=30, what="the worker exits")
++        return real(tid)
++    monkeypatch.setattr(client, "schedstat", worker_gone_first)
++    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _SilentBoard)
++    threading.Thread(target=server.serve_forever, daemon=True).start()
++    try:
++        ident = client.Identity(url=f"http://127.0.0.1:{server.server_address[1]}", key="k" * 16, gateway="gw")
++        probe: dict = {}
++        with pytest.raises(TimeoutError):
++            client._bounded_call(ident, "POST", ms.METRICS_PATH, {"cpus": 2}, 0.5, probe=probe)
++        assert probe["written"] is True
++        run_ns, wait_ns = probe["worker"]
++        assert run_ns > 0 and wait_ns >= 0
++    finally:
++        _SilentBoard.release.set()
++        server.shutdown()
++
++
+ def test_non_linux_starts_no_thread_and_the_loop_reports_as_before():
+     calls = []
+     reporter = SimpleNamespace(report_due=lambda: calls.append(1) or True)
+-- 
+2.51.0
+

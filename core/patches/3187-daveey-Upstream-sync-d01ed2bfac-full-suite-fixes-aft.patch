@@ -1,0 +1,202 @@
+From b39991718ab6015b10fb2b286d45943c4fd7f591 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 09:33:02 +0000
+Subject: [PATCH] [daveey] Upstream sync d01ed2bfac: full-suite fixes after the
+ merge
+
+- sidecar registry: _chat_adopted (upstream delegate-row adoption) is an owner-reserved
+  lineage marker written only by the gateway's session recovery
+- cron shutdown test rows carry the claim fence upstream's bind_turn reads
+- the upstream reset-row delegate-marker heal skips a damaged sessions b-tree on open
+  (the first write latches it, as the fork's corruption contract requires)
+- header-probe release: the lock-safe readers' pread fds hold no locks either
+- legacy local-completion route tests keep their note outcome under upstream resumes_parent
+- e2e dashboard auth sweep: /api/peer is peer-pass gated (404 peer_access_unavailable)
+- kanban: forward HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS to the worker client, its
+  owner and the failed-result observer, which books the quota episode with it
+---
+ hermes_cli/kanban_failed_result_service.py      |  6 ++++--
+ hermes_cli/kanban_worker_client.py              |  6 ++++--
+ hermes_cli/kanban_worker_env.py                 |  3 +++
+ hermes_state_dbfile.py                          |  4 ++++
+ hermes_state_schema.py                          |  4 +++-
+ hermes_state_sidecar_keys.py                    |  5 +++--
+ tests/cron/test_shutdown_interrupt.py           |  2 +-
+ tests/e2e/core/dashboard/test_dashboard_auth.py | 17 ++++++++++++++++-
+ tests/gateway/test_legacy_local_completion.py   |  5 +++++
+ .../hermes_state/test_sidecar_keys_registry.py  |  3 +++
+ 10 files changed, 46 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/kanban_failed_result_service.py b/hermes_cli/kanban_failed_result_service.py
+index 1b7dcbb19e..fde40f57c3 100644
+--- a/hermes_cli/kanban_failed_result_service.py
++++ b/hermes_cli/kanban_failed_result_service.py
+@@ -55,9 +55,11 @@ def arm_service(context, *, startup_seconds=5.0):
+                '--property=StartLimitIntervalSec=0',
+                f'--working-directory={project_root_str()}']
+     # A manager-created service does not inherit its submitter's environment.
+-    # Keep profile/path resolution, without forwarding secrets or worker pins.
++    # Keep profile/path resolution, without forwarding secrets or worker pins. The rate-limit
++    # cooldown is policy the reaper applies when it records a quota episode for this run: without it
++    # the observer books the default backoff although its dispatcher runs another one.
+     for key in ('PATH', 'PYTHONPATH', 'HERMES_HOME', 'HERMES_KANBAN_HOME', 'HERMES_KANBAN_BOARD',
+-                'HOME', 'LANG', 'TZ', 'TMPDIR'):
++                'HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS', 'HOME', 'LANG', 'TZ', 'TMPDIR'):
+         if key in env:
+             command.append(f'--setenv={key}={env[key]}')
+     command += ['--', *argv]
+diff --git a/hermes_cli/kanban_worker_client.py b/hermes_cli/kanban_worker_client.py
+index 9fc53ba1f4..362f681a2e 100644
+--- a/hermes_cli/kanban_worker_client.py
++++ b/hermes_cli/kanban_worker_client.py
+@@ -386,8 +386,10 @@ def _submit():
+         board_db = os.environ['HERMES_KANBAN_DB']
+         # Owner startup must never inherit this worker's task/tool/goal identity.
+         for key in list(os.environ):
+-            # The busy timeout is a host tuning knob, not task identity: the answer budget reads it.
+-            if key.startswith('HERMES_KANBAN_') and key not in ('HERMES_KANBAN_HOME', 'HERMES_KANBAN_BUSY_TIMEOUT_MS'):
++            # The busy timeout is a host tuning knob, not task identity: the answer budget reads it. So is
++            # the rate-limit cooldown, which this run's failed-result observer books its quota episode with.
++            if key.startswith('HERMES_KANBAN_') and key not in (
++                    'HERMES_KANBAN_HOME', 'HERMES_KANBAN_BUSY_TIMEOUT_MS', 'HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS'):
+                 os.environ.pop(key)
+         for key in ('HERMES_SESSION_SOURCE', 'HERMES_TENANT', 'TERMINAL_CWD'):
+             os.environ.pop(key, None)
+diff --git a/hermes_cli/kanban_worker_env.py b/hermes_cli/kanban_worker_env.py
+index cb44f50943..8ded31f398 100644
+--- a/hermes_cli/kanban_worker_env.py
++++ b/hermes_cli/kanban_worker_env.py
+@@ -39,6 +39,9 @@ _HOST_NAMES = frozenset({
+     "HERMES_PYTHON_SRC_ROOT", "HERMES_DATA_DIR_SUFFIX", "HERMES_HOME_MODE", "HERMES_MANAGED",
+     "HERMES_CONTAINER", "HERMES_SKIP_CHMOD", "HERMES_GATEWAY_LOCK_DIR", "HERMES_DISABLE_LAZY_INSTALLS",
+     "HERMES_KANBAN_HOME", "HERMES_KANBAN_BUSY_TIMEOUT_MS",
++    # The board's rate-limit cooldown: the worker's failed-result observer reaps a 429 run and books
++    # its quota episode with it, so it must match the dispatcher's (else it books the default).
++    "HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS",
+     # The administrator-managed scope directory (an IT bootstrap override, never in any profile's
+     # ``.env``): without it a cold-started gateway loses the managed overlay stored elsewhere.
+     "HERMES_MANAGED_DIR",
+diff --git a/hermes_state_dbfile.py b/hermes_state_dbfile.py
+index 944d0b0001..d44feef20a 100644
+--- a/hermes_state_dbfile.py
++++ b/hermes_state_dbfile.py
+@@ -145,6 +145,10 @@ def inodes_with_other_descriptors(identities: set[tuple[int, int]]) -> Optional[
+         probe_fds.update(_RETIRED_HEADER_PROBE_FDS)  # retired probes hold no locks either
+     finally:
+         _HEADER_PROBE_LOCK.release()
++    # The lock-safe readers' cached O_RDONLY pread fds (hermes_cli.sqlite_safe_read) hold no locks
++    # either: counting them would pin every probe of a file that path also read a header through.
++    from hermes_cli.sqlite_safe_read import lock_safe_fds
++    probe_fds.update(lock_safe_fds())
+     descriptors = own_descriptors()
+     if descriptors is None:
+         return None
+diff --git a/hermes_state_schema.py b/hermes_state_schema.py
+index 34fffdb25b..d77b74793c 100644
+--- a/hermes_state_schema.py
++++ b/hermes_state_schema.py
+@@ -888,7 +888,9 @@ class SessionSchemaMixin:
+             healed = cursor.execute(
+                 f"UPDATE sessions SET model_config = json_remove(model_config, '$._delegate_from') WHERE {polluted}"
+             ).rowcount
+-        except sqlite3.OperationalError as exc:
++        except sqlite3.DatabaseError as exc:
++            # OperationalError (locked/missing column) or a damaged sessions b-tree: the open-time scan
++            # must not turn page damage into an open failure; the first write confirms and latches it.
+             logger.debug("reset-row delegate-marker heal skipped: %s", exc)
+             return
+         self._index_healed_rows_for_trigram(cursor, ids)
+diff --git a/hermes_state_sidecar_keys.py b/hermes_state_sidecar_keys.py
+index 3f37e49690..c6f6a2f3a6 100644
+--- a/hermes_state_sidecar_keys.py
++++ b/hermes_state_sidecar_keys.py
+@@ -22,5 +22,6 @@ SIDECAR_KEYS = frozenset({
+     'codex_thread_id',                # agent/codex_runtime.py
+ })
+ 
+-# Lineage/identity markers only the owner writes (session creation, branch, delegate reservation).
+-OWNER_RESERVED_KEYS = frozenset({'_delegate_from', '_branched_from'})
++# Lineage/identity markers only the owner writes (session creation, branch, delegate reservation, and
++# the gateway's delegate-row adoption on an explicit repoint: ``gateway.session_lifecycle.CHAT_ADOPTED_MARKER``).
++OWNER_RESERVED_KEYS = frozenset({'_delegate_from', '_branched_from', '_chat_adopted'})
+diff --git a/tests/cron/test_shutdown_interrupt.py b/tests/cron/test_shutdown_interrupt.py
+index 6a09ab1d23..8c12887a96 100644
+--- a/tests/cron/test_shutdown_interrupt.py
++++ b/tests/cron/test_shutdown_interrupt.py
+@@ -780,7 +780,7 @@ class TestOwnerSideShutdownCancel:
+         cancel.set()  # the firer's forwarded cron.cancel landed before the run checked it
+         authority._cron_cancellations = {"adm": cancel}
+         row = {"admission_id": "adm", "request_id": "req", "principal_id": "cron-owner",
+-               "payload": {"text": ""}}
++               "owner_epoch": 1, "generation": 1, "payload": {"text": ""}}
+         policy = SimpleNamespace(request_json=json.dumps({
+             "cron_job": {"id": job_id, "prompt": "x"}, "extra_prompt": None, "request_id": "req"}))
+         try:
+diff --git a/tests/e2e/core/dashboard/test_dashboard_auth.py b/tests/e2e/core/dashboard/test_dashboard_auth.py
+index 250d8b46f3..5eb508c8d6 100644
+--- a/tests/e2e/core/dashboard/test_dashboard_auth.py
++++ b/tests/e2e/core/dashboard/test_dashboard_auth.py
+@@ -57,6 +57,21 @@ def _concrete(path: str) -> str:
+     return _PARAM.sub(lambda m: f"e2e-{m.group(1)}", path)
+ 
+ 
++# ``/api/peer/`` is gated by a peer pass, not the session token (hermes_cli/dashboard_auth/peer_pass.py):
++# with no provider taking passes (this sandbox) its contract is a 404 ``peer_access_unavailable`` for
++# every caller, which serves nothing either.
++_PEER_PREFIX = "/api/peer/"
++
++
++def _peer_route_refusal(path: str, r) -> bool:
++    if not path.startswith(_PEER_PREFIX) or r.status_code != 404:
++        return False
++    try:
++        return r.json().get("error") == "peer_access_unavailable"
++    except ValueError:
++        return False
++
++
+ @pytest.fixture(scope="module")
+ def dash(tmp_path_factory: pytest.TempPathFactory):
+     sb = H.make_sandbox(tmp_path_factory.mktemp("dash-auth"))
+@@ -106,7 +121,7 @@ def test_every_api_route_refuses_missing_and_wrong_token(dash: H.Dashboard, inve
+         for label, headers, query in _bad_credentials(dash, path):
+             r = dash.http.request(method, url, headers=headers, params=query,
+                                   json={} if method != "GET" else None)
+-            if r.status_code != 401:
++            if r.status_code != 401 and not _peer_route_refusal(path, r):
+                 leaks.append(f"{method} {path} ({label}) -> {r.status_code} {r.text[:120]!r}")
+     assert not leaks, f"{len(leaks)} gated route(s) served a caller without the session token:\n  " + "\n  ".join(leaks[:40])
+     assert dash.proc.poll() is None, "dashboard died during the unauthenticated sweep"
+diff --git a/tests/gateway/test_legacy_local_completion.py b/tests/gateway/test_legacy_local_completion.py
+index 9c54294ba6..b138349b71 100644
+--- a/tests/gateway/test_legacy_local_completion.py
++++ b/tests/gateway/test_legacy_local_completion.py
+@@ -60,6 +60,11 @@ async def _rig(tmp_path, monkeypatch, *, secondary=True):
+         rig.served_ref = create_local_session(rig.served, _actor(sec_home), dict(
+             request_id="served", source="cli", model="fixture", toolsets=[]))
+     monkeypatch.setattr(runner, "_handle_message", _refuse_turn)
++    # Upstream runs an unviewed final result as the parent's turn (``resumes_parent``,
++    # test_unviewed_completion_resumes_parent.py). These cases cover legacy ROUTE resolution, so keep the
++    # outcome a note: its row lands in the resolved session, where the assertions can see which one.
++    import tools.process_registry_notifications as notifications
++    monkeypatch.setattr(notifications, "completion_resumes_parent", lambda evt: False)
+     return rig
+ 
+ 
+diff --git a/tests/hermes_state/test_sidecar_keys_registry.py b/tests/hermes_state/test_sidecar_keys_registry.py
+index 26e475b959..63174b1db1 100644
+--- a/tests/hermes_state/test_sidecar_keys_registry.py
++++ b/tests/hermes_state/test_sidecar_keys_registry.py
+@@ -22,6 +22,9 @@ OWNER_ONLY_WRITERS = {
+     # The store implementations themselves (their own forwarding calls take a caller's dict).
+     "agent/runtime_session_store.py",
+     "hermes_state_sessions.py",
++    # Gateway delegate-row adoption (``_adopt_delegate_row``): the gateway runner owns its SessionDB and
++    # writes the owner-reserved ``_chat_adopted`` lineage marker; no managed worker runs session recovery.
++    "gateway/session_recovery.py",
+ }
+ 
+ 
+-- 
+2.51.0
+

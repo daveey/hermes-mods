@@ -1,0 +1,357 @@
+From 9f04cd2a20f8c89525a84e5031b8007321514b43 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 02:56:17 +0000
+Subject: [PATCH] [daveey] requeued publisher: an earlier PR needs a recorded
+ handoff to the requeued claim; probe schema once; skip the scan with no
+ requeue
+
+Follow-up to PR #1818 review nits (review 5885076095, card t_01a1d2b3476ab649).
+
+1. continues() assumed holding PR comments from before the requeued run's claim
+   were cleared by the respawn guard. A direct claim_task bypasses the guard, so
+   an earlier crashed publisher's PR rode along once the claimed run restated it
+   and was requeued. Now fail closed: such an earlier PR needs a handoff event
+   (the kinds the guard honours, re-validated: owner dependency park, reopen of
+   a done card, one-continuation hold release / operator resume, real reassign,
+   unblock, continued, scheduled, changes_requested, review_reopened) after the
+   comment, after every earlier real run ended, and no later than the claim.
+   Core-update requeues and unused grants between do not consume it. A PR from
+   before the card's first run is a handoff's input. Unreadable run starts/ends
+   hold.
+2. The task_runs.uid schema probe runs once per continues() call, not per comment.
+3. Cheap pre-check: no core-update requeue on the card (requeued_run_ids) returns
+   False before get_task or the commented-event scan.
+
+Proof:
+- RED on origin/main: 13 of the new tests fail; GREEN: 29 files importing
+  kanban_requeued_publisher / kanban_core_update_requeue / kanban_db_dispatch_pr_state,
+  634 passed.
+- Mutants: 18 of 18 new/changed conditions killed (sdlc-review mutants.py).
+- Replay (read-only) of active_pr_reason old vs new continues() over the 161 real
+  cards with a core-update reclaim on hermes-worker-1's board: 0 verdict changes.
+---
+ hermes_cli/kanban_requeued_publisher.py       | 102 ++++++++++--
+ ...test_kanban_core_update_requeue_handoff.py | 148 ++++++++++++++++++
+ 2 files changed, 239 insertions(+), 11 deletions(-)
+
+diff --git a/hermes_cli/kanban_requeued_publisher.py b/hermes_cli/kanban_requeued_publisher.py
+index ecb8925a38..9aa735fec4 100644
+--- a/hermes_cli/kanban_requeued_publisher.py
++++ b/hermes_cli/kanban_requeued_publisher.py
+@@ -12,23 +12,41 @@ The pause lets that run's lineage continue exactly once, and only when every fac
+   on a synced schema, the database-local integer only on an unsynced one);
+ * that run ended as a core-update requeue (no crash, timeout or other reclaim);
+ * its profile is the card's current assignee;
++* a holding PR comment from before that claim (and after the card's first run) was handed to
++  it: a recorded handoff (:data:`_HANDOFF_KINDS`) falls after that comment, after every earlier
++  real run ended, and no later than the claim. The claim itself records no proof that the
++  respawn guard let it through, and a direct ``claim_task`` bypasses the guard, so without this
++  an earlier crashed publisher's PR would ride along once the claimed run restated it;
+ * every run claimed after it is itself skipped (a core-update requeue or an attested unused
+   grant): the next real execution consumes the grant, so its crash or timeout holds again.
+ 
+-Unknown, missing or ambiguous provenance, a second writer, another profile or a later real run
+-keeps the hold (fail closed). Chats and known other-card runs are FYI to the guard already.
++Unknown, missing or ambiguous provenance, a second writer, another profile, an earlier PR with
++no recorded handoff to the claim, or a later real run keeps the hold (fail closed). Chats and
++known other-card runs are FYI to the guard already.
+ """
+ from __future__ import annotations
+ 
+ import sqlite3
+ from typing import Iterable, Optional
+ 
++# Events that hand an earlier PR to the next claim (the kinds ``_handed_off_after`` in
++# :mod:`kanban_db_dispatch_pr_state` honours); each is re-checked by :func:`_is_handoff`.
++_HANDOFF_KINDS = ("assigned", "changes_requested", "review_reopened", "unblocked", "continued", "scheduled",
++                  "dependency_wait", "reopened", "hold_released", "operator_resumed")
+ 
+-def _writer_run(conn: sqlite3.Connection, task_id: str, data: dict):
+-    """This card's run the ``commented`` payload names, or None when it can't be proven."""
++
++def _has_run_uid(conn: sqlite3.Connection) -> bool:
++    """True on a synced schema (``task_runs.uid``); probed once per :func:`continues` call."""
+     try:
+         conn.execute("SELECT uid FROM task_runs LIMIT 0")
+     except sqlite3.OperationalError:
++        return False
++    return True
++
++
++def _writer_run(conn: sqlite3.Connection, task_id: str, data: dict, synced: bool):
++    """This card's run the ``commented`` payload names, or None when it can't be proven."""
++    if not synced:
+         # Unsynced schema: the integer is this database's own run id.
+         writer = data.get("writer_run_id")
+         if "writer_run_uid" in data or type(writer) is not int:
+@@ -42,6 +60,57 @@ def _writer_run(conn: sqlite3.Connection, task_id: str, data: dict):
+     return run if run is not None and run["task_id"] == task_id else None
+ 
+ 
++def _is_handoff(event) -> bool:
++    """An owner park or operator act; never a link-only or dispatcher write."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_dispatch_rerun import is_handoff_event
++
++    kind = event["kind"]
++    data = kb._json_dict(event["payload"])
++    if kind == "dependency_wait":
++        return event["run_id"] is not None  # an owner's park closes its run; a bare link does not
++    if kind == "reopened":
++        return data.get("previous_status") == "done"
++    if kind in ("hold_released", "operator_resumed"):
++        via = "owner-wake-hold-release" if kind == "hold_released" else "operator-resume"
++        return data.get("via") == via and data.get("scope") == "one_continuation"
++    return is_handoff_event(kind, event["payload"])
++
++
++def _handed_to_claim(conn: sqlite3.Connection, task_id: str, run, started: int, newest_earlier: int) -> bool:
++    """The holding PR comment at ``newest_earlier`` (before ``run``'s claim) was handed to that claim.
++
++    A PR comment from before the card's first run is a handoff's input, not a publication.
++    Otherwise a handoff event must fall strictly after that comment, no earlier than the end of
++    every earlier real run (a real run consumes a handoff) and no later than the claim.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_core_update_requeue import _skipped
++
++    starts = [kb._to_epoch(r[0]) for r in conn.execute("SELECT started_at FROM task_runs WHERE task_id = ?",
++                                                        (task_id,))]
++    readable = [t for t in starts if t is not None]
++    if not readable or len(readable) != len(starts):
++        return False  # an unreadable start could hide the run that published that comment
++    if newest_earlier < min(readable):
++        return True
++    floor = newest_earlier + 1
++    for prior in conn.execute("SELECT * FROM task_runs WHERE task_id = ? AND id < ?", (task_id, run["id"])):
++        if _skipped(conn, prior):
++            continue
++        ended = kb._to_epoch(prior["ended_at"])
++        if ended is None:
++            return False  # an earlier real run with no readable end orders nothing after it
++        floor = max(floor, ended)
++    marks = ", ".join("?" * len(_HANDOFF_KINDS))
++    for event in conn.execute(f"SELECT kind, payload, run_id, created_at FROM task_events "
++                              f"WHERE task_id = ? AND kind IN ({marks})", (task_id, *_HANDOFF_KINDS)):
++        at = kb._to_epoch(event["created_at"])
++        if at is not None and floor <= at <= started and _is_handoff(event):
++            return True
++    return False
++
++
+ def continues(conn: sqlite3.Connection, task_id: str, holding: Iterable[tuple[int, int]],
+               latest_pr_comment_id: int) -> bool:
+     """True when the requeued publisher of the holding PR comments may continue once.
+@@ -50,7 +119,12 @@ def continues(conn: sqlite3.Connection, task_id: str, holding: Iterable[tuple[in
+     own restated notes; ``latest_pr_comment_id`` is the newest of them.
+     """
+     from hermes_cli import kanban_db as kb
+-    from hermes_cli.kanban_core_update_requeue import _skipped, is_core_update_requeue
++    from hermes_cli.kanban_core_update_requeue import _skipped, requeued_run_ids
++
++    requeued = requeued_run_ids(conn, task_id)
++    if not requeued:
++        return False  # the common held card: no core-update requeue, so no scan
++
+     from hermes_cli.kanban_db_dispatch_pr_state import _comment_events
+ 
+     events = _comment_events(conn, task_id)
+@@ -59,13 +133,14 @@ def continues(conn: sqlite3.Connection, task_id: str, holding: Iterable[tuple[in
+     by_row: dict[Optional[int], list[dict]] = {}
+     for data, _at, cid in events:
+         by_row.setdefault(cid, []).append(data)
++    synced = _has_run_uid(conn)
+ 
+     def writer(cid: int):
+         datas = by_row.get(cid, [])
+-        return _writer_run(conn, task_id, datas[0]) if len(datas) == 1 else None
++        return _writer_run(conn, task_id, datas[0], synced) if len(datas) == 1 else None
+ 
+     run = writer(latest_pr_comment_id)
+-    if run is None or not is_core_update_requeue(conn, run):
++    if run is None or run["id"] not in requeued:
+         return False
+     task = kb.get_task(conn, task_id)
+     if task is None or run["profile"] != task.assignee:
+@@ -73,10 +148,15 @@ def continues(conn: sqlite3.Connection, task_id: str, holding: Iterable[tuple[in
+     started = kb._to_epoch(run["started_at"])
+     if started is None:
+         return False
++    earlier: list[int] = []
+     for t, cid in holding:
+-        if t >= started:
+-            other = writer(cid)
+-            if other is None or other["id"] != run["id"]:
+-                return False  # a second (or unknown) publisher since the run was claimed
++        if t < started:
++            earlier.append(t)
++            continue
++        other = writer(cid)
++        if other is None or other["id"] != run["id"]:
++            return False  # a second (or unknown) publisher since the run was claimed
++    if earlier and not _handed_to_claim(conn, task_id, run, started, max(earlier)):
++        return False  # an earlier PR no handoff gave this claim (e.g. a direct claim_task)
+     later = conn.execute("SELECT * FROM task_runs WHERE task_id = ? AND id > ?", (task_id, run["id"]))
+     return all(_skipped(conn, r) for r in later)
+diff --git a/tests/hermes_cli/test_kanban_core_update_requeue_handoff.py b/tests/hermes_cli/test_kanban_core_update_requeue_handoff.py
+index cee0f0f5be..1f5a0276b3 100644
+--- a/tests/hermes_cli/test_kanban_core_update_requeue_handoff.py
++++ b/tests/hermes_cli/test_kanban_core_update_requeue_handoff.py
+@@ -359,6 +359,154 @@ def test_pr_named_by_an_earlier_handed_off_run_then_restated_by_the_publisher(bo
+     assert dispatch.check_respawn_guard(board, task) is None
+ 
+ 
++def _shift(board, run, start, end):
++    board.execute("UPDATE task_runs SET started_at = started_at - ?, ended_at = ended_at - ? WHERE id = ?",
++                  (start, end, run))
++
++
++def _claim(board, task):
++    claimed = kb.claim_task(board, task)
++    assert claimed is not None
++    return claimed.current_run_id
++
++
++_UNBLOCK = ("unblocked", {"by": "operator"}, False, 20)
++
++
++def _earlier_pr_then_direct_claim(board, *, handoff, consumed=None):
++    """Run A publishes then crashes; a direct ``claim_task`` (no guard) restates the PR and is requeued.
++
++    ``handoff``: None or (kind, payload, stamped with run A, seconds before the requeued claim)
++    recorded after the crash; ``consumed``: the reclaim reason of a run claimed after it.
++    """
++    from tests.hermes_cli.kanban_guard_helpers import worker_comment
++
++    task = kb.create_task(board, title="implementation", assignee="dev")
++    first = _claim(board, task)
++    worker_comment(board, task, "dev", "Opened " + PR)
++    board.execute("UPDATE task_comments SET created_at = created_at - 30 WHERE task_id = ?", (task,))
++    board.execute("UPDATE task_events SET created_at = created_at - 30 WHERE task_id = ? AND kind = 'commented'",
++                  (task,))
++    assert kb.reclaim_task(board, task, reason=CRASH, signal_fn=lambda *_: None)
++    _shift(board, first, 40, 25)
++    if handoff:
++        kind, payload, own, ago = handoff
++        with kb.write_txn(board):
++            kb._append_event(board, task, kind, payload, run_id=first if own else None)
++        board.execute("UPDATE task_events SET created_at = created_at - ? WHERE id = "
++                      "(SELECT MAX(id) FROM task_events WHERE task_id = ?)", (ago, task))
++    if consumed:  # a run the handoff released, then reclaimed with this reason
++        second = _claim(board, task)
++        assert kb.reclaim_task(board, task, reason=consumed, signal_fn=lambda *_: None)
++        _shift(board, second, 15, 10)
++    assert kb.claim_task(board, task) is not None  # direct claim: the respawn guard never ran
++    worker_comment(board, task, "dev", "Still on " + PR)
++    assert kb.reclaim_task(board, task, reason=CORE_UPDATE_REQUEUE_REASON, signal_fn=lambda *_: None)
++    return task
++
++
++@pytest.mark.parametrize("handoff,consumed,held", [
++    (None, None, "active_pr"),  # an earlier crashed publisher's PR never rides along
++    (_UNBLOCK, None, None),     # an unblock handed that PR to the requeued run's claim
++    (_UNBLOCK, CRASH, "active_pr"),  # a real run between consumed that unblock
++    (_UNBLOCK, CORE_UPDATE_REQUEUE_REASON, None),  # a requeued run between is a pause: still handed
++], ids=["no_handoff", "handed_off", "handoff_consumed", "handoff_paused"])
++def test_earlier_pr_needs_a_handoff_before_the_requeued_claim(board, handoff, consumed, held):
++    """Review nit on PR #1818: the claim is not proof the guard let it through."""
++    task = _earlier_pr_then_direct_claim(board, handoff=handoff, consumed=consumed)
++    assert dispatch.check_respawn_guard(board, task) == held
++
++
++@pytest.mark.parametrize("handoff,granted", [
++    (("unblocked", {"by": "operator"}, False, -5), False),  # after the claim: it handed nothing to it
++    (("dependency_wait", {"reason": "parent_not_done"}, False, 20), False),  # a bare link
++    (("dependency_wait", {"kind": "dependency"}, True, 20), True),  # the owner's own park
++    (("reopened", {"previous_status": "blocked"}, False, 20), False),
++    (("reopened", {"previous_status": "done"}, False, 20), True),
++    (("assigned", {"assignee": "dev", "from": "dev"}, False, 20), False),  # a no-op re-assign
++    (("assigned", {"assignee": "dev", "from": "ops"}, False, 20), True),
++    (("operator_resumed", {"via": "chat", "scope": "one_continuation"}, False, 20), False),
++    (("operator_resumed", {"via": "operator-resume", "scope": "one_continuation"}, False, 20), True),
++    (("hold_released", {"via": "owner-wake-hold-release", "scope": "all"}, False, 20), False),
++    (("hold_released", {"via": "owner-wake-hold-release", "scope": "one_continuation"}, False, 20), True),
++    (("promoted", {}, False, 20), False),  # not a handoff kind at all
++], ids=["after_claim", "link_only_dependency_wait", "owner_park", "reopen_not_done", "reopen_done",
++        "noop_assign", "reassign", "resume_wrong_via", "operator_resume", "release_wrong_scope",
++        "hold_release", "promoted"])
++def test_which_events_hand_an_earlier_pr_to_the_claim(board, handoff, granted):
++    from hermes_cli import kanban_requeued_publisher as publisher
++
++    task = _earlier_pr_then_direct_claim(board, handoff=handoff)
++    rows = board.execute("SELECT id, created_at FROM task_comments WHERE task_id = ? ORDER BY id", (task,))
++    holding = [(int(at), row) for row, at in rows]
++    assert publisher.continues(board, task, holding, holding[-1][1]) is granted
++
++
++def test_earlier_real_run_with_unreadable_end_holds(board):
++    from hermes_cli import kanban_requeued_publisher as publisher
++
++    task = _earlier_pr_then_direct_claim(board, handoff=_UNBLOCK)
++    rows = board.execute("SELECT id, created_at FROM task_comments WHERE task_id = ? ORDER BY id", (task,))
++    holding = [(int(at), row) for row, at in rows]
++    assert publisher.continues(board, task, holding, holding[-1][1])
++    board.execute("UPDATE task_runs SET ended_at = 'later' WHERE id = (SELECT MIN(id) FROM task_runs "
++                  "WHERE task_id = ?)", (task,))
++    assert not publisher.continues(board, task, holding, holding[-1][1])
++
++
++def test_earlier_pr_with_an_unreadable_first_start_holds(board):
++    """An unreadable start must not make an own run's PR look older than the card's first run."""
++    from hermes_cli import kanban_requeued_publisher as publisher
++
++    task = _earlier_pr_then_direct_claim(board, handoff=None)
++    rows = board.execute("SELECT id, created_at FROM task_comments WHERE task_id = ? ORDER BY id", (task,))
++    holding = [(int(at), row) for row, at in rows]
++    first_run_start = int(board.execute("SELECT MIN(started_at) FROM task_runs WHERE task_id = ?",
++                                        (task,)).fetchone()[0])
++    pre_first_run = [(first_run_start - 1, holding[0][1]), holding[1]]
++    assert publisher.continues(board, task, pre_first_run, holding[-1][1])  # a handoff's input, not a publication
++    assert not publisher.continues(board, task, holding, holding[-1][1])
++    board.execute("UPDATE task_runs SET started_at = 'later' WHERE id = (SELECT MIN(id) FROM task_runs "
++                  "WHERE task_id = ?)", (task,))
++    assert not publisher.continues(board, task, pre_first_run, holding[-1][1])
++
++
++def test_held_card_without_a_requeue_is_decided_before_any_scan(board, monkeypatch):
++    """Cheap pre-check: no core-update requeue on the card, no comment scan or task read."""
++    from hermes_cli import kanban_db_dispatch_pr_state as prs
++    from hermes_cli import kanban_requeued_publisher as publisher
++    from tests.hermes_cli.kanban_guard_helpers import worker_comment
++
++    task = kb.create_task(board, title="implementation", assignee="dev")
++    assert kb.claim_task(board, task) is not None
++    worker_comment(board, task, "dev", "Opened " + PR)
++    assert kb.reclaim_task(board, task, reason=CRASH, signal_fn=lambda *_: None)
++    row = board.execute("SELECT id FROM task_comments WHERE task_id = ?", (task,)).fetchone()[0]
++
++    def scanned(*_a, **_k):
++        raise AssertionError("scanned a card with no core-update requeue")
++
++    monkeypatch.setattr(prs, "_comment_events", scanned)
++    monkeypatch.setattr(kb, "get_task", scanned)
++    assert not publisher.continues(board, task, [(0, row)], row)
++
++
++def test_schema_is_probed_once_per_call(board):
++    from hermes_cli import kanban_requeued_publisher as publisher
++    from tests.hermes_cli.kanban_guard_helpers import worker_comment
++
++    task = _synced_publisher(board, lambda board, task: worker_comment(board, task, "dev", "Also " + PR + "8"))
++    rows = [r[0] for r in board.execute("SELECT id FROM task_comments WHERE task_id = ? ORDER BY id", (task,))]
++    now = int(board.execute("SELECT MAX(created_at) FROM task_comments").fetchone()[0])
++    probes: list[str] = []
++    board.set_trace_callback(lambda sql: probes.append(sql) if "SELECT uid FROM task_runs LIMIT 0" in sql else None)
++    try:
++        assert publisher.continues(board, task, [(now, r) for r in rows], rows[-1])
++    finally:
++        board.set_trace_callback(None)
++    assert len(probes) == 1
++
++
+ def test_another_own_run_writing_since_the_publisher_claim_holds(board):
+     """A second writer that is a known run of this card (not the requeued one): held."""
+     import json
+-- 
+2.51.0
+

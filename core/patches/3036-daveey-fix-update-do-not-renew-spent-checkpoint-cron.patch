@@ -1,0 +1,183 @@
+From 768cc0a23a9ae12ebfe333605ef45dbd770b0320 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 22:29:22 +0000
+Subject: [PATCH] [daveey] fix(update): do not renew spent checkpoint cron
+ grace in shutdown
+
+A live five-workload update took 197s against 180s. Its gateway spent the 15s restart grace, then stop restored a 30s cron floor despite effective drain=0. Honor that spent grace only for an unfenced checkpoint cron cut, retaining ordinary/Mac and API floors. Compose the real stop phase and drain loop in regression coverage; the old total-drain test mocked away the restoring consumer.
+---
+ gateway/restart.py                            | 32 +++++++
+ gateway/run_shutdown.py                       | 12 +--
+ .../test_instant_update_cron_drain_latency.py | 87 +++++++++++++++++++
+ 3 files changed, 121 insertions(+), 10 deletions(-)
+ create mode 100644 tests/gateway/test_instant_update_cron_drain_latency.py
+
+diff --git a/gateway/restart.py b/gateway/restart.py
+index c008f77b2f..eb660abbf2 100644
+--- a/gateway/restart.py
++++ b/gateway/restart.py
+@@ -258,6 +258,38 @@ def effective_stop_drain_timeout(runner: object) -> float:
+     return resolve_launchd_capped_drain(drain, getattr(runner, "_launchd_exit_timeout_s", None))
+ 
+ 
++def checkpoint_cron_grace_spent(runner: object) -> bool:
++    """Do not restore the cron floor after an instant checkpoint spent its grace.
++
++    The stop-entry snapshot already required a live intent and only cuttable work.
++    Re-read the intent to preserve withdrawal, ordinary updates and Mac policy;
++    this narrows an accepted stop, never authorizes a checkpoint or tree mutation.
++    """
++    import json
++
++    if getattr(runner, "_stop_kanban_leash_s", None) is None:
++        return False
++    path = getattr(runner, "_restart_update_intent", None)
++    try:
++        data = json.loads(path.read_text(encoding="utf-8-sig")) if path is not None else None
++        return (isinstance(data, dict) and data.get("kind") == "unfenced"
++                and data.get("checkpoint") is True and data.get("cron_cut") is True)
++    except (OSError, ValueError, TypeError):
++        return False
++
++
++def stop_cron_drain_budget(runner: object, timeout: float, cron_timeout: float, elapsed: float, *, api: int) -> float:
++    """The real stop-phase budget, including its already-spent checkpoint grace."""
++    from gateway.shutdown_watchdog import resolve_shutdown_watchdog_delay
++
++    if not api and checkpoint_cron_grace_spent(runner):
++        return timeout
++    # Under launchd the real leash is its exit timeout. ``timeout`` is already
++    # launchd-capped: use the same leash as the watchdog, including dump margin.
++    leash = effective_stop_watchdog_delay(runner, resolve_shutdown_watchdog_delay(timeout))
++    return resolve_cron_drain_budget(timeout, cron_timeout, watchdog_delay=leash, elapsed=elapsed)
++
++
+ def effective_stop_watchdog_delay(runner: object, watchdog_delay: float) -> float:
+     """Thread-watchdog leash for the stop in progress on ``runner``.
+ 
+diff --git a/gateway/run_shutdown.py b/gateway/run_shutdown.py
+index 2506cbe1bd..f890794b67 100644
+--- a/gateway/run_shutdown.py
++++ b/gateway/run_shutdown.py
+@@ -25,7 +25,7 @@ from agent.i18n import t
+ from gateway.config import Platform
+ from gateway.restart import (
+     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, GATEWAY_SERVICE_RESTART_EXIT_CODE,
+-    effective_stop_drain_timeout, effective_stop_watchdog_delay, resolve_cron_drain_budget
++    effective_stop_drain_timeout, effective_stop_watchdog_delay, stop_cron_drain_budget
+ )
+ from gateway.run_common import _UNSET
+ from gateway.run_runtime import interrupt_side_agents, managed_turn_count, stop_managed_turns
+@@ -1824,15 +1824,7 @@ class GatewayShutdownMixin(GatewayRestartWaitMixin, GatewaySessionEndMixin, Gate
+         _deferred_at_start = ctx.deferred_count()
+         # Cron floor clamped to the watchdog leash; getattr-guard for bare shutdown-path doubles.
+         _cron_drain_cfg = getattr(self, "_cron_drain_timeout", DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT)
+-        # Under launchd the real leash is launchd's own exit timeout, not our watchdog
+-        # (drain + grace): a signal-driven stop that lets cron work push past it is SIGKILLed
+-        # before cleanup runs.
+-        # ``timeout`` is already the effective (launchd-capped) drain, so this is the same
+-        # leash the thread watchdog is armed with — dump margin included.
+-        _cron_leash = effective_stop_watchdog_delay(self, resolve_shutdown_watchdog_delay(timeout))
+-        _cron_timeout = resolve_cron_drain_budget(
+-            timeout, _cron_drain_cfg, watchdog_delay=_cron_leash, elapsed=ctx.elapsed(),
+-        )
++        _cron_timeout = stop_cron_drain_budget(self, timeout, _cron_drain_cfg, ctx.elapsed(), api=_api_at_start)
+         if (_cron_at_start or _api_at_start) and _cron_timeout > timeout:
+             logger.info(
+                 "Shutdown drain: %d in-flight cron job(s), %d api_server run(s) — waiting up to "
+diff --git a/tests/gateway/test_instant_update_cron_drain_latency.py b/tests/gateway/test_instant_update_cron_drain_latency.py
+new file mode 100644
+index 0000000000..7cffbb2e0c
+--- /dev/null
++++ b/tests/gateway/test_instant_update_cron_drain_latency.py
+@@ -0,0 +1,87 @@
++"""Compose spent update grace with the real stop phase and real drain loop."""
++import json
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++
++import pytest
++
++from gateway.restart import checkpoint_cron_grace_spent, effective_stop_drain_timeout
++from gateway.run import GatewayRunner
++from tests.gateway import test_core_update_cron_cut as cut
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("mode", ["instant", "ordinary", "uncut", "human", "withdrawn", "unspent",
++                                  "mac_signal", "noncheckpoint", "fenced", "late_api", "late_withdrawal"])
++async def test_cron_floor_does_not_restore_spent_update_grace(tmp_path, monkeypatch, mode):
++    body = {"cron_cut": mode != "uncut", "checkpoint": mode != "noncheckpoint",
++            "kind": "fenced" if mode == "fenced" else "unfenced"}
++    runner = cut._runner(tmp_path, monkeypatch, body, cron=1, kanban=2, chat=int(mode == "human"))
++    runner._restart_requested = True
++    runner._restart_drain_timeout = 0
++    runner._cron_drain_timeout = 30
++    clock = cut._virtual_clock(monkeypatch)
++    if mode == "instant":
++        assert await runner._await_active_work_before_restart() is False
++        assert 15 <= clock[0] < 15.2
++    else:
++        runner._core_update_kanban_cap_spent = mode != "unspent"
++    intent = runner._restart_update_intent
++    if mode in ("ordinary", "mac_signal"):
++        runner._restart_update_intent = None
++    if mode == "withdrawn":
++        intent.unlink()
++    if mode == "mac_signal":
++        runner._stop_requested_by_signal = True
++        runner._launchd_exit_timeout_s = 60
++    runner._core_update_kanban_snapshot_stop_leash()
++    if mode == "late_withdrawal":
++        intent.unlink()
++    monkeypatch.setattr(GatewayRunner, "_mark_running_sessions_resume_pending", AsyncMock(return_value=[]))
++    runner._active_cron_job_count = lambda: 1
++    runner._active_api_run_count = lambda: int(mode == "late_api")
++    runner._drain_work_counts = lambda: (0, 1, int(mode == "late_api"), 0)
++    runner._snapshot_running_agents = dict
++    observed = {}
++
++    async def drain(timeout, cron_timeout):
++        observed.update(timeout=timeout, cron_timeout=cron_timeout)
++        return await GatewayRunner._drain_active_agents(runner, timeout, cron_timeout)
++
++    runner._drain_active_agents = drain
++    ctx = SimpleNamespace(deferred_count=lambda: 0, elapsed=lambda: 0)
++    await runner._stop_drain_active_work(effective_stop_drain_timeout(runner), ctx)
++    assert observed["cron_timeout"] == (0 if mode == "instant" else 30)
++    assert ctx.timed_out is True  # stop_impl must still enter interruption/settlement, never skip the work
++    if mode == "instant":
++        # Historical composition: retain all other measured poll/prepass/pause/
++        # checkpoint/install/restart costs of attempt5. Not live delivery proof.
++        composed = 197 - 30 + observed["cron_timeout"]
++        assert composed <= 180
++        assert clock[0] < 15.2
++    else:
++        assert 30 <= clock[0] < 30.2
++
++
++@pytest.mark.parametrize("text, expected", [
++    ('{"kind":"unfenced","checkpoint":true,"cron_cut":true}', True),
++    ('\ufeff{"kind":"unfenced","checkpoint":true,"cron_cut":true}', True),
++    ('{"kind":"unfenced","checkpoint":1,"cron_cut":true}', False),
++    ('{"kind":"unfenced","checkpoint":true,"cron_cut":1}', False),
++    ('{"kind":"fenced","checkpoint":true,"cron_cut":true}', False),
++    ('{"kind":"unfenced","cron_cut":true}', False),
++    ('[]', False), ('null', False), ('invalid', False),
++])
++def test_post_snapshot_intent_read_is_fail_closed(tmp_path, text, expected):
++    intent = tmp_path / "intent"
++    intent.write_text(text)
++    runner = SimpleNamespace(_stop_kanban_leash_s=40, _restart_update_intent=intent)
++    assert checkpoint_cron_grace_spent(runner) is expected
++    intent.unlink()
++    assert checkpoint_cron_grace_spent(runner) is False
++    runner._restart_update_intent = None
++    assert checkpoint_cron_grace_spent(runner) is False
++    intent.write_text(json.dumps({"kind": "unfenced", "checkpoint": True, "cron_cut": True}))
++    runner._restart_update_intent = intent
++    runner._stop_kanban_leash_s = None
++    assert checkpoint_cron_grace_spent(runner) is False
+-- 
+2.51.0
+

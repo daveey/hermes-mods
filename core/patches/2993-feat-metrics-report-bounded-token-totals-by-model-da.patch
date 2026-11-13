@@ -1,0 +1,373 @@
+From 264889a8ede89d0f14f45a0f8a2dcf03e1340300 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 19:43:31 +0000
+Subject: [PATCH] feat(metrics): report bounded token totals by model [daveey]
+
+Proof: new model suite 20 passed; all 25 importer suites passed across bounded runs (last scope suite rerun after launcher timeout). 13 targeted mutants killed. Initial regression suite: 14 failures before implementation. Legacy scalar/drain fallback and reporter backoff preserved.
+---
+ hermes_cli/machine_drain_metrics.py           |  12 +-
+ hermes_cli/machine_metrics.py                 |   2 +-
+ hermes_cli/machine_throughput_metrics.py      |  58 ++++++-
+ tests/hermes_cli/test_machine_metrics.py      |   5 +-
+ .../test_machine_tokens_by_model.py           | 161 ++++++++++++++++++
+ 5 files changed, 225 insertions(+), 13 deletions(-)
+ create mode 100644 tests/hermes_cli/test_machine_tokens_by_model.py
+
+diff --git a/hermes_cli/machine_drain_metrics.py b/hermes_cli/machine_drain_metrics.py
+index 24a7b4da5a..febfe22e9d 100644
+--- a/hermes_cli/machine_drain_metrics.py
++++ b/hermes_cli/machine_drain_metrics.py
+@@ -38,7 +38,7 @@ ADDITIVE_FIELDS = ("drain_active", "drain_until_ms", "cpu_busy_pct", "cpu_busy_w
+ 
+ 
+ def send_compatible(send, sample, on_counters_rejected=None):
+-    """Old Boards reject unknown metrics atomically; retry once with every additive field removed.
++    """Old Boards reject unknown metrics atomically; downgrade each optional generation once.
+ 
+     Only a 400 on a sample that carried an additive field is retried; any other error (timeouts included) is raised
+     and the sample is dropped. An unrelated validation error simply fails again on the retry and is raised.
+@@ -46,7 +46,9 @@ def send_compatible(send, sample, on_counters_rejected=None):
+     Throughput counters (``machine_throughput_metrics.FIELDS``) are newer still: a Board that predates them answers
+     400 "unknown field(s): ...". That answer first drops just the counters (calling ``on_counters_rejected`` so the
+     caller stops sending them for a while) and the CPU busy fields, keeping drain fields for a Board that accepts
+-    those."""
++    those. The newest ``tokens_by_model`` map is dropped first on a 400, preserving
++    scalar counters for Boards that support them. Older counter/drain fallbacks
++    remain available if that downgraded request is also rejected."""
+     from hermes_cli.kanban_sync_client import HubError
+     from hermes_cli.machine_throughput_metrics import FIELDS as COUNTERS
+ 
+@@ -55,6 +57,12 @@ def send_compatible(send, sample, on_counters_rejected=None):
+     except HubError as exc:
+         if exc.status != 400:
+             raise
++        if "tokens_by_model" in sample:
++            # A scalar-capable Board may predate the model map. Keep its counters
++            # enabled, and never restamp the already attempted CPU sample.
++            from hermes_cli.machine_cpu_metrics import FIELDS as CPU
++            return send_compatible(send, {k: v for k, v in sample.items()
++                                          if k != "tokens_by_model" and k not in CPU}, on_counters_rejected)
+         if any(k in sample for k in COUNTERS) and "unknown field" in str(exc):
+             if on_counters_rejected is not None:
+                 on_counters_rejected()
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index b78f0d010f..e372398e1e 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -302,7 +302,7 @@ class Reporter:
+             sample = self._sample(sample, measured)
+             if now < self.counters_off_until:  # this Board rejected them lately: the normal report only
+                 from hermes_cli.machine_throughput_metrics import FIELDS
+-                sample = {k: v for k, v in sample.items() if k not in FIELDS}
++                sample = {k: v for k, v in sample.items() if k not in FIELDS and k != "tokens_by_model"}
+ 
+             def counters_rejected() -> None:
+                 self.counters_off_until = now + UNSUPPORTED_RETRY_S
+diff --git a/hermes_cli/machine_throughput_metrics.py b/hermes_cli/machine_throughput_metrics.py
+index d8d27242eb..f7a70be929 100644
+--- a/hermes_cli/machine_throughput_metrics.py
++++ b/hermes_cli/machine_throughput_metrics.py
+@@ -8,14 +8,18 @@ Sources, per ``state.db`` (the installation root's and every ``profiles/*/state.
+   (compression, titles, approval, coach, goal judge ...), about 12% of the hub's tokens, which ``sessions`` never
+   counts. A database without the table (older schema) falls back to the ``sessions`` columns.
+ - ``sessions_started_total`` / ``sessions_ended_total``: ``count(*)`` and ``count(ended_at)`` of ``sessions``.
++- ``tokens_by_model``: the same token columns grouped by model, merged across profiles,
++  normalized to 64-character names and bounded to 32 keys (overflow becomes ``other``).
++  Legacy schemas contribute their token totals under ``unknown``.
+ 
+ Totals only grow while rows are kept; deleting sessions (prune) lowers them, which a consumer treats as a reset.
+ Read-only URI connections with a 1 s busy timeout. The result (success or failure) is cached for :data:`CACHE_TTL_S`
+-because ``collect()`` runs every 10 s. Any unreadable database omits all four fields: a partial sum would read as
++because ``collect()`` runs every 10 s. Any unreadable database omits all throughput fields: a partial sum would read as
+ a drop, and 0 would read as a reset.
+ """
+ from __future__ import annotations
+ 
++from copy import deepcopy
+ import sqlite3
+ import time
+ from pathlib import Path
+@@ -39,12 +43,47 @@ def state_db_paths(root: Optional[Path] = None) -> list[Path]:
+     return [p for p in (root / "state.db", *sorted((root / "profiles").glob("*/state.db"))) if p.exists()]
+ 
+ 
+-def _read(path: Path) -> tuple[int, int, int, int]:
++def _bounded_models(models: dict[str, list[int]]) -> dict[str, list[int]]:
++    """Normalize before ranking; reserve the last slot for the merged tail.
++
++    Saturate each host-wide token axis at the wire limit, assigning its budget in
++    rank order. Deriving the scalars from this same map preserves exact equality
++    even for corrupt negative counts or counters beyond the wire limit.
++    """
++    ranked = sorted(models.items(), key=lambda item: (-sum(item[1]), item[0]))
++    folded: dict[str, list[int]] = {}
++    for index, (model, values) in enumerate(ranked):
++        key = "other" if len(ranked) > 32 and index >= 31 else model
++        target = folded.setdefault(key, [0, 0])
++        for axis in range(2):
++            target[axis] += values[axis]
++    remaining = [10**15, 10**15]
++    for values in folded.values():
++        for axis in range(2):
++            values[axis] = min(remaining[axis], max(0, int(values[axis])))
++            remaining[axis] -= values[axis]
++    return folded
++
++
++def _read(path: Path, models: Optional[dict[str, list[int]]] = None) -> tuple[int, int, int, int]:
+     db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
+     try:
+         has_usage = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_model_usage'"
+                                ).fetchone()
+-        io, cache = db.execute(_USAGE_SQL.format(table="session_model_usage" if has_usage else "sessions")).fetchone()
++        if has_usage:
++            rows = db.execute(_USAGE_SQL.replace("SELECT ", "SELECT model, ", 1).format(
++                table="session_model_usage") + " GROUP BY model").fetchall()
++        else:
++            # Older schemas cannot supply a ledger breakdown; preserve their totals.
++            rows = [("unknown", *db.execute(_USAGE_SQL.format(table="sessions")).fetchone())]
++        io = cache = 0
++        for model, model_io, model_cache in rows:
++            io += int(model_io)
++            cache += int(model_cache)
++            if models is not None:
++                target = models.setdefault(str(model or "unknown")[:64], [0, 0])
++                target[0] += int(model_io)
++                target[1] += int(model_cache)
+         started, ended = db.execute(_SESSIONS_SQL).fetchone()
+     finally:
+         db.close()
+@@ -52,8 +91,9 @@ def _read(path: Path) -> tuple[int, int, int, int]:
+ 
+ 
+ def counters(root: Optional[Path] = None) -> dict:
+-    """The four totals for this host, or ``{}`` when any ``state.db`` cannot be read (or none exists)."""
++    """Host totals and model breakdown, or ``{}`` if any database is unreadable (or absent)."""
+     totals, seen = [0, 0, 0, 0], set()
++    models: dict[str, list[int]] = {}
+     try:
+         paths = state_db_paths(root)
+         for path in paths:
+@@ -62,23 +102,25 @@ def counters(root: Optional[Path] = None) -> dict:
+             if identity in seen:
+                 continue
+             seen.add(identity)
+-            for i, value in enumerate(_read(path)):
++            for i, value in enumerate(_read(path, models)):
+                 totals[i] += value
+     except (OSError, sqlite3.Error, TypeError, ValueError):
+         return {}
+     if not seen:
+         return {}
+-    return dict(zip(FIELDS, totals))
++    bounded = _bounded_models(models)
++    totals[:2] = [sum(v[axis] for v in bounded.values()) for axis in range(2)]
++    return {**dict(zip(FIELDS, totals)), "tokens_by_model": bounded}
+ 
+ 
+ def cached_counters(root: Optional[Path] = None, *, clock: Callable[[], float] = time.monotonic) -> dict:
+     global _cache
+     now, key = clock(), str(root)
+     if _cache is not None and _cache[0] == key and 0 <= now - _cache[1] < CACHE_TTL_S:
+-        return dict(_cache[2])
++        return deepcopy(_cache[2])
+     value = counters(root)
+     _cache = (key, now, value)
+-    return dict(value)
++    return deepcopy(value)
+ 
+ 
+ def reset_cache() -> None:
+diff --git a/tests/hermes_cli/test_machine_metrics.py b/tests/hermes_cli/test_machine_metrics.py
+index 923202b812..106ed7286d 100644
+--- a/tests/hermes_cli/test_machine_metrics.py
++++ b/tests/hermes_cli/test_machine_metrics.py
+@@ -33,7 +33,7 @@ def test_collect_reads_this_machine(tmp_path: Path):
+     assert 0 < out["disk_free_gb"] <= out["disk_total_gb"]
+     assert 0 <= out["mem_used_pct"] <= 100  # this platform's reader (linux or macos)
+     assert set(out) <= {"cpu_load1", "cpus", "mem_used_pct", "disk_free_gb", "disk_total_gb", "active_card_runs",
+-                        "drain_active", "drain_until_ms", *mt.FIELDS}
++                        "drain_active", "drain_until_ms", "tokens_by_model", *mt.FIELDS}
+     assert out["active_card_runs"] is None or out["active_card_runs"] >= 0
+     assert out.get("drain_active") in (None, 0, 1)  # omitted when the hold marker cannot be read
+     assert "drain_until_ms" not in out or out.get("drain_active") == 1
+@@ -212,7 +212,8 @@ def _root(tmp_path: Path) -> Path:
+ def test_throughput_counters_sum_root_and_profiles_from_real_state_dbs(tmp_path):
+     root = _root(tmp_path)
+     assert mt.counters(root) == {"tokens_io_total": 45, "tokens_cache_total": 310,  # reasoning is not counted
+-                                 "sessions_started_total": 3, "sessions_ended_total": 2}
++                                 "sessions_started_total": 3, "sessions_ended_total": 2,
++                                 "tokens_by_model": {"m": [45, 310]}}
+ 
+ 
+ def test_throughput_tokens_count_auxiliary_usage_rows(tmp_path):
+diff --git a/tests/hermes_cli/test_machine_tokens_by_model.py b/tests/hermes_cli/test_machine_tokens_by_model.py
+new file mode 100644
+index 0000000000..69a062b9e3
+--- /dev/null
++++ b/tests/hermes_cli/test_machine_tokens_by_model.py
+@@ -0,0 +1,161 @@
++"""Bounded model token telemetry and old-Board compatibility."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import machine_drain_metrics as md
++from hermes_cli import machine_throughput_metrics as mt
++from hermes_cli.kanban_sync_client import HubError
++
++
++def usage(root, rows, *, profile=None, legacy=False):
++    path = root / "state.db" if profile is None else root / "profiles" / profile / "state.db"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with sqlite3.connect(path) as db:
++        db.execute("CREATE TABLE sessions (ended_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)")
++        db.execute("INSERT INTO sessions VALUES (NULL, 3, 4, 5, 6)")
++        if not legacy:
++            db.execute("CREATE TABLE session_model_usage (model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)")
++            db.executemany("INSERT INTO session_model_usage VALUES (?, ?, ?, ?, ?)", rows)
++    return path
++
++
++def assert_sums(out):
++    assert sum(v[0] for v in out["tokens_by_model"].values()) == out["tokens_io_total"]
++    assert sum(v[1] for v in out["tokens_by_model"].values()) == out["tokens_cache_total"]
++
++
++def test_groups_all_profiles_and_unknowns(tmp_path):
++    path = usage(tmp_path, [("a", 1, 2, 3, 4), ("a", 10, 20, 30, 40), (None, 1, 1, 1, 1), ("", 2, 2, 2, 2)])
++    assert mt._read(path) == (39, 83, 1, 0)
++    usage(tmp_path, [("a", 100, 200, 300, 400), ("b", 7, 8, 9, 10)], profile="p")
++    out = mt.counters(tmp_path)
++    assert out["tokens_by_model"] == {"a": [333, 777], "b": [15, 19], "unknown": [6, 6]}
++    assert_sums(out)
++
++
++def test_truncation_merges_collisions_and_unknown_literal(tmp_path):
++    usage(tmp_path, [("x" * 64 + "a", 1, 2, 3, 4), ("x" * 64 + "b", 5, 6, 7, 8),
++                     (None, 1, 0, 0, 0), ("unknown", 2, 0, 0, 0)])
++    out = mt.counters(tmp_path)
++    assert out["tokens_by_model"] == {"x" * 64: [14, 22], "unknown": [3, 0]}
++    assert_sums(out)
++
++
++@pytest.mark.parametrize("count", [32, 33, 40])
++@pytest.mark.parametrize("other_io", [0, 1000])
++def test_top_models_fold_without_losing_literal_other(tmp_path, count, other_io):
++    usage(tmp_path, [(f"m{i:02}", i, 0, 0, 1) for i in range(count)] + [("other", other_io, 0, 0, 0)])
++    out = mt.counters(tmp_path)
++    models = out["tokens_by_model"]
++    assert len(models) <= 32
++    assert "m00" not in models and "other" in models
++    assert models[f"m{count - 1:02}"] == [count - 1, 1]
++    assert_sums(out)
++
++
++def test_exactly_32_models_are_not_folded(tmp_path):
++    usage(tmp_path, [(str(i), 1, 0, 0, 0) for i in range(32)])
++    assert set(mt.counters(tmp_path)["tokens_by_model"]) == {str(i) for i in range(32)}
++
++
++def test_clamped_integer_values_and_scalar_equality(tmp_path):
++    usage(tmp_path, [("a", 10**15, 1, -10, 0), ("b", 10**15, 0, 10**15, 1)])
++    out = mt.counters(tmp_path)
++    assert all(type(n) is int and 0 <= n <= 10**15 for v in out["tokens_by_model"].values() for n in v)
++    assert out["tokens_io_total"] == out["tokens_cache_total"] == 10**15
++    assert_sums(out)
++
++
++def test_legacy_tokens_have_unknown_model_and_duplicate_inode_not_counted(tmp_path):
++    path = usage(tmp_path, [], legacy=True)
++    alias = tmp_path / "profiles" / "alias" / "state.db"
++    alias.parent.mkdir(parents=True)
++    alias.symlink_to(path)
++    out = mt.counters(tmp_path)
++    assert out["tokens_by_model"] == {"unknown": [7, 11]}
++    assert_sums(out)
++
++
++def test_cache_nested_values_are_not_shared(tmp_path):
++    usage(tmp_path, [("a", 1, 0, 0, 0)])
++    mt.reset_cache()
++    try:
++        first = mt.cached_counters(tmp_path, clock=lambda: 1)
++        first["tokens_by_model"]["a"][0] = 999
++        second = mt.cached_counters(tmp_path, clock=lambda: 2)
++        assert second["tokens_by_model"] == {"a": [1, 0]}
++        second["tokens_by_model"]["a"][0] = 999
++        assert mt.cached_counters(tmp_path, clock=lambda: 3)["tokens_by_model"] == {"a": [1, 0]}
++    finally:
++        mt.reset_cache()
++
++
++@pytest.mark.parametrize("message", ["unknown field(s): tokens_by_model", "invalid metrics"])
++def test_400_retries_without_models_preserving_scalars(message):
++    sent, rejected = [], []
++    sample = {"tokens_by_model": {"a": [3, 4]}, "tokens_io_total": 3, "tokens_cache_total": 4, "drain_active": 0,
++              "cpu_busy_pct": 50, "cpu_busy_window_ms": 1000, "cpu_busy_sample_end_ms": 1}
++
++    def send(value):
++        sent.append(value)
++        if "tokens_by_model" in value:
++            raise HubError(400, message)
++        return "ok"
++
++    assert md.send_compatible(send, sample, lambda: rejected.append(True)) == "ok"
++    assert sent == [sample, {"tokens_io_total": 3, "tokens_cache_total": 4, "drain_active": 0}]
++    assert rejected == []
++
++
++def test_read_contract_and_empty_ledger(tmp_path):
++    path = usage(tmp_path, [])
++    assert mt._read(path) == (0, 0, 1, 0)
++    assert mt.counters(tmp_path)["tokens_by_model"] == {}
++
++
++def test_ranking_uses_both_axes_and_tail_preserves_totals(tmp_path):
++    usage(tmp_path, [(f"m{i:02}", i, 0, 0, 0) for i in range(33)] + [("cache", 0, 0, 100, 0)])
++    out = mt.counters(tmp_path)
++    models = out["tokens_by_model"]
++    assert len(models) == 32 and models["cache"] == [0, 100]
++    assert models["other"] == [3, 0]
++    assert set(models) == {"cache", "other", *(f"m{i:02}" for i in range(3, 33))}
++    assert out["tokens_io_total"] == sum(range(33))
++    assert_sums(out)
++
++
++@pytest.mark.parametrize("pre_drain", [False, True])
++def test_pre_counter_board_keeps_legacy_fallback_and_backoff(pre_drain):
++    from hermes_cli import machine_metrics as mm
++
++    sent, now = [], [1000.0]
++    sample = {"cpus": 4, "drain_active": 0, "tokens_io_total": 3, "tokens_by_model": {"a": [3, 0]}}
++
++    def send(value):
++        sent.append(value)
++        allowed = {"cpus"} if pre_drain else {"cpus", "drain_active"}
++        if set(value) - allowed:
++            raise HubError(400, "unknown field(s): " + ", ".join(sorted(set(value) - allowed)))
++
++    reporter = mm.Reporter(send, collect_fn=lambda: dict(sample), clock=lambda: now[0])
++    assert reporter.report_due()
++    assert reporter.counters_off_until == now[0] + mm.UNSUPPORTED_RETRY_S
++    assert sent[-1] == ({"cpus": 4} if pre_drain else {"cpus": 4, "drain_active": 0})
++    sent.clear()
++    now[0] += mm.REPORT_EVERY_S
++    assert reporter.report_due()
++    assert all("tokens_by_model" not in value and "tokens_io_total" not in value for value in sent)
++
++
++@pytest.mark.parametrize("status, calls", [(400, 2), (500, 1)])
++def test_retry_bounded_and_other_errors_not_retried(status, calls):
++    sent = []
++
++    def send(value):
++        sent.append(value)
++        raise HubError(status, "invalid metrics")
++
++    with pytest.raises(HubError):
++        md.send_compatible(send, {"tokens_by_model": {}})
++    assert len(sent) == calls
+-- 
+2.51.0
+

@@ -1,0 +1,120 @@
+From aa4d13d2b38006f532ced81f13eedc510753cce7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 22:16:44 +0000
+Subject: [PATCH] [daveey] Capture queued follow-up lease on worker abandonment
+
+Gate abandonment capture on this executor future rather than a predecessor receipt in the shared handler scope. Preserve completed worker evidence without rereading reused agents. Proof: four follow-up rows RED before fix; 21 custody tests and 1510 affected tests pass, one skip; three mutation checks killed.
+---
+ gateway/run_turn_wait.py                      | 10 ++++---
+ gateway/turn_outcome.py                       |  7 -----
+ .../hermes_state/test_outcome_run_custody.py  | 26 ++++++++++++++++---
+ 3 files changed, 28 insertions(+), 15 deletions(-)
+
+diff --git a/gateway/run_turn_wait.py b/gateway/run_turn_wait.py
+index 7adf01d644..f4d449c1fd 100644
+--- a/gateway/run_turn_wait.py
++++ b/gateway/run_turn_wait.py
+@@ -8,7 +8,7 @@ import threading
+ async def await_turn_worker(runner, worker, turn_ctx, interrupt_detected, interrupt_monitor):
+     """Poll the executor, preserving this run's evidence even on timeout/cancellation."""
+     from gateway.run import _abandon_timed_out_gateway_turn
+-    from gateway.turn_outcome import capture_pending_run_outcome
++    from gateway.turn_outcome import capture_run_outcome
+ 
+     agent_holder = turn_ctx.agent_holder
+     warning_fired = False
+@@ -36,6 +36,8 @@ async def await_turn_worker(runner, worker, turn_ctx, interrupt_detected, interr
+             await runner._run_agent_backup_interrupt_check(turn_ctx, interrupt_detected, interrupt_monitor)
+         return runner._run_agent_timeout_result(worker, turn_ctx)
+     finally:
+-        # The worker can still be inside run_conversation. Do not consult the
+-        # replacement session turn slot or overwrite an already finished receipt.
+-        capture_pending_run_outcome(agent_holder[0])
++        # A queued follow-up shares the handler scope, so an existing receipt may
++        # belong to its predecessor. Only this worker's completion proves that
++        # its frozen receipt is ready and the cached agent must not be reread.
++        if not worker.executor_task.done():
++            capture_run_outcome(agent_holder[0])
+diff --git a/gateway/turn_outcome.py b/gateway/turn_outcome.py
+index 62624b9a2a..e96e1c77a0 100644
+--- a/gateway/turn_outcome.py
++++ b/gateway/turn_outcome.py
+@@ -30,13 +30,6 @@ def capture_run_outcome(agent) -> None:
+         owned["session_id"] = str(getattr(agent, "session_id", "") or owned["session_id"] or "")
+ 
+ 
+-def capture_pending_run_outcome(agent) -> None:
+-    """Fill missing evidence on handler abandonment, retaining a finished worker's receipt."""
+-    owned = run_outcome.get()
+-    if owned is not None and "lease_holder" not in owned:
+-        capture_run_outcome(agent)
+-
+-
+ def concluding_turn_identity(runner, event=None, session_key: Optional[str] = None) -> frozenset:
+     """The concluding gateway turn's OWN evidence: its routing ``active_turn_token`` (the event owns it until
+     ``_clear_durable_active_turn``) and its agent's turn-lease holder. Never a snapshot of the chat's live
+diff --git a/tests/hermes_state/test_outcome_run_custody.py b/tests/hermes_state/test_outcome_run_custody.py
+index cdc8843234..36d561a0bd 100644
+--- a/tests/hermes_state/test_outcome_run_custody.py
++++ b/tests/hermes_state/test_outcome_run_custody.py
+@@ -128,7 +128,8 @@ async def test_displaced_handler_uses_worker_receipt_not_successor_slot(db, monk
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize("cancelled", [False, True])
+ @pytest.mark.parametrize("newer", [False, True])
+-async def test_abandoned_worker_captures_own_live_lease(db, monkeypatch, cancelled, newer):
++@pytest.mark.parametrize("followup", [False, True])
++async def test_abandoned_worker_captures_own_live_lease(db, monkeypatch, cancelled, newer, followup):
+     helpers._declare_then_reply(db)
+     if newer:
+         late._next_turn_starts(db)
+@@ -147,6 +148,9 @@ async def test_abandoned_worker_captures_own_live_lease(db, monkeypatch, cancell
+                              _session_state=lambda *a: pytest.fail("successor slot read"))
+     token = gw.run_outcome.set({"session_id": "chat"})
+     try:
++        if followup:
++            # A completed first conversation in the same handler left its receipt.
++            gw.capture_run_outcome(SimpleNamespace(session_id="chat", _last_session_turn_lease_holder="turn-A1"))
+         call = GatewayTurnMixin._run_agent_await_turn_worker(runner, worker, ctx, None, None)
+         if cancelled:
+             with pytest.raises(asyncio.CancelledError):
+@@ -165,12 +169,27 @@ async def test_abandoned_worker_captures_own_live_lease(db, monkeypatch, cancell
+         gw.run_outcome.reset(token)
+ 
+ 
++@pytest.mark.asyncio
+ @pytest.mark.parametrize("holder", [None, "turn-A"])
+-def test_pending_capture_preserves_finished_receipt(holder):
++@pytest.mark.parametrize("failed", [False, True])
++async def test_finished_worker_preserves_frozen_receipt(holder, failed):
+     owned = {"session_id": "chat", "lease_holder": holder}
+     token = gw.run_outcome.set(owned.copy())
++    completed = asyncio.get_running_loop().create_future()
++    if failed:
++        completed.set_exception(ValueError("worker failed"))
++    else:
++        completed.set_result({"done": True})
++    worker = SimpleNamespace(executor_task=completed)
++    ctx = SimpleNamespace(agent_holder=[SimpleNamespace(
++        session_id="new-chat", _last_session_turn_lease_holder="turn-B")])
+     try:
+-        gw.capture_pending_run_outcome(SimpleNamespace(session_id="new-chat", _last_session_turn_lease_holder="turn-B"))
++        call = GatewayTurnMixin._run_agent_await_turn_worker(None, worker, ctx, None, None)
++        if failed:
++            with pytest.raises(ValueError, match="worker failed"):
++                await call
++        else:
++            assert await call == {"done": True}
+         assert gw.run_outcome.get() == owned
+     finally:
+         gw.run_outcome.reset(token)
+@@ -192,7 +211,6 @@ def test_no_run_scope_never_names_successor():
+     token = gw.run_outcome.set(None)
+     try:
+         gw.capture_run_outcome(SimpleNamespace(_last_session_turn_lease_holder="foreign"))
+-        gw.capture_pending_run_outcome(SimpleNamespace(_last_session_turn_lease_holder="foreign"))
+         runner = SimpleNamespace(_session_state=lambda key: pytest.fail("mutable slot read"))
+         assert gw.concluding_turn_identity(runner, None, "key") == frozenset()
+     finally:
+-- 
+2.51.0
+

@@ -1,0 +1,175 @@
+From 4e08f0d58d2163f35c691665dd226bc20c7cdcc7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 04:04:47 +0000
+Subject: [PATCH] [daveey] fix(update-pause): a synthesized turn over a paused
+ marker pauses at its next step boundary
+
+A process-completion/kanban-notice turn that lands on a session paused for a core update carries the
+paused marker instead of writing its own (_carry_paused_marker). With no marker key it got no step-boundary
+hook, no mid-tool cancel and no clarify withdrawal, so it ran straight through the next drain window. The
+drainer never waits on it (running_desktop_turns skips core_update_pause markers), yet it holds an admission
+reservation no gateway publishes, so every instant apply was refused while it ran.
+
+Live: hermes-hub 2026-11-13, the core update (#1820, #1843) was due from 02:59:48Z and deferred
+'admission reservations busy: N unpublished reservation(s)' ~700 times. A process_complete turn on paused
+session 8d8534 admitted at 03:44:20 between two windows held reservation 80fb50dd for 12 min (one 193 s
+kanban_create, 10 model calls); synthesized turns on paused 4f5f4b (03:51:52, 03:55:01) and 8d8534 again
+(03:57:39) did the same. The apply only launched at 03:59:43 once none was running (t_01a1d3083b2dae09).
+
+Fix: the turn's pause key is its own marker key or else the paused key it carries; the existing hook then
+ends it at its next step boundary (mark_turn_paused does not count the carried pause again) and
+_rearm_carried_pause_watcher continues the paused turn after the window.
+
+Proof: tests/tui_gateway/test_update_pause_superseded.py, 4 new tests fail before (no hook: TypeError /
+nothing armed) and pass after; 9 update-pause files, 167 passed.
+---
+ .../test_update_pause_superseded.py           | 94 +++++++++++++++++++
+ tui_gateway/prompt_turn.py                    | 21 ++++-
+ 2 files changed, 112 insertions(+), 3 deletions(-)
+
+diff --git a/tests/tui_gateway/test_update_pause_superseded.py b/tests/tui_gateway/test_update_pause_superseded.py
+index a2b8ba8c5a..39e93b75dd 100644
+--- a/tests/tui_gateway/test_update_pause_superseded.py
++++ b/tests/tui_gateway/test_update_pause_superseded.py
+@@ -242,3 +242,97 @@ def test_goal_continuation_still_runs_once_the_pause_is_retired(env, monkeypatch
+ 
+     assert session["_test_prompts"] == [typed, "[goal] keep going"]
+     assert read_turn_marker(env.home, "session-key") is None
++
++
++# --- A synthesized turn running over the paused marker must itself pause when the next drain window asks.
++# Live, hermes-hub 2026-11-13 (t_01a1d3083b2dae09): a process_complete turn landed on paused session 8d8534 between
++# two drain windows (03:44:20). With no marker of its own it got no step-boundary hook, so it ran 12 minutes through
++# the next windows; hermes-sync's drainer skips core_update_pause markers, so it never waited on it either, and its
++# admission reservation (no gateway publishes Desktop turns) refused every instant apply for over an hour.
++
++def _carried_turn_with_window(env, during_turn):
++    """Pause a turn, then run a notification turn over the paused marker that opens a new drain window
++    mid-turn and returns whatever ``during_turn(agent)`` says the turn ended with."""
++    session = _paused_session(env.home)
++    seen = {}
++
++    def _run(message, **kwargs):
++        af.set_hold(env.home)
++        af.request_pause(env.home, expires_at=time.time() + 120)
++        try:
++            return during_turn(session["agent"], seen)
++        finally:
++            af.clear_pause_request(env.home)
++            af.clear_hold(env.home)
++
++    session["agent"].run_conversation = _run
++    session["running"] = True
++    assert server._notif_run_submit("__notif__1", "ui-sid", session, "[Background process proc_1 finished]")
++    return session, seen
++
++
++def test_synthesized_turn_over_a_paused_marker_pauses_at_its_next_step_boundary(env):
++    def _turn(agent, seen):
++        hook = agent.step_boundary_pause
++        seen["hook"] = hook
++        reason = hook() if callable(hook) else None
++        seen["reason"] = reason
++        return {"final_response": "", "messages": [], "interrupted": bool(reason), "completed": not reason,
++                "paused_for_update": reason}
++
++    session, seen = _carried_turn_with_window(env, _turn)
++
++    assert callable(seen["hook"]), "a synthesized turn over a paused marker has no step-boundary pause hook"
++    assert seen["reason"] == up.PAUSE_REASON
++    marker = read_turn_marker(env.home, "session-key")
++    # The paused request is kept as it was: same prompt, still core_update_pause, not counted as a second pause.
++    assert marker is not None and marker["reason"] == up.PAUSE_REASON
++    assert marker["prompt"] == "the long task"
++    assert marker["pauses"] == 1 and marker["attempts"] == 0
++    # The carried turn ended and re-armed the watcher; the paused turn continues once the window is over.
++    assert env.watchers[-1] == ("ui-sid", "session-key")
++    assert not session.get("running")
++    assert up.in_place_resume_action(session, "session-key", skew=lambda: None) == "resume"
++
++
++def test_synthesized_turn_over_a_paused_marker_keeps_running_without_a_pause_request(env):
++    session = _paused_session(env.home)
++    seen = {}
++
++    def _run(message, **kwargs):
++        seen["reason"] = session["agent"].step_boundary_pause()
++        return {"final_response": "noted", "messages": []}
++
++    session["agent"].run_conversation = _run
++    session["running"] = True
++    assert server._notif_run_submit("__notif__1", "ui-sid", session, "[Background process proc_1 finished]")
++    assert seen["reason"] is None
++
++
++def test_synthesized_turn_whose_carried_pause_was_retired_meanwhile_does_not_pause(env):
++    from tui_gateway.turn_marker import clear_turn_marker
++
++    def _turn(agent, seen):
++        clear_turn_marker(env.home, "session-key")  # e.g. the user's Stop retired the paused request
++        seen["reason"] = agent.step_boundary_pause()
++        return {"final_response": "noted", "messages": []}
++
++    _session, seen = _carried_turn_with_window(env, _turn)
++    assert seen["reason"] is None
++
++
++def test_synthesized_turn_over_a_paused_marker_arms_the_mid_tool_cancel_and_clarify_withdrawal(env, monkeypatch):
++    # A long tool call (the live turn sat 193 s in one kanban_create) must be cancellable too, or the turn
++    # reaches no step boundary before the drainer gives the window up.
++    armed, stopped, clarify = [], [], []
++    monkeypatch.setattr(up, "start_mid_tool_cancel",
++                        lambda session, key, agent: armed.append(key) or (lambda: stopped.append(key)))
++    monkeypatch.setattr(up, "install_clarify_pause_provider", lambda: clarify.append(True))
++    session = _paused_session(env.home)
++    for seen in (armed, stopped, clarify):  # the paused turn's own
++        seen.clear()
++
++    session["agent"].run_conversation = lambda message, **kw: {"final_response": "noted", "messages": []}
++    session["running"] = True
++    assert server._notif_run_submit("__notif__1", "ui-sid", session, "[Background process proc_1 finished]")
++    assert armed == ["session-key"] and stopped == ["session-key"] and clarify == [True]
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index c06bc82958..608beaa21c 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -233,6 +233,20 @@ def _carry_paused_marker(session: dict, home, marker_key: str) -> bool:
+     return True
+ 
+ 
++def _carried_pause_key(session: dict) -> str:
++    """[daveey] The paused turn's marker key a synthesized turn runs over (``_carry_paused_marker``), or "".
++
++    Such a turn writes no marker of its own, but it still holds an admission reservation, and hermes-sync's
++    drainer skips ``core_update_pause`` markers, so it never waits on it. Without a step-boundary hook it ran
++    straight through the next drain window, and an instant apply (which refuses a reservation no gateway
++    publishes) deferred until it ended: hermes-hub 2026-11-13, one notification turn ran 12 min and the core
++    update stayed deferred for over an hour (t_01a1d3083b2dae09). With the hook it ends at its next step
++    boundary like any turn; the pause it lands on is the one it carries (``mark_turn_paused`` does not count it
++    again), and ``_rearm_carried_pause_watcher`` continues the paused turn after the window."""
++    with session["history_lock"]:
++        return str(session.get("_paused_marker_carried") or "")
++
++
+ def _rearm_carried_pause_watcher(sid: str, session: dict, st) -> None:
+     """[daveey] A synthesized turn that ran over a core-update-paused marker re-arms the in-place watcher however
+     it ended (complete, raised, refused at prepare): otherwise, on a backend that already restarted, nothing
+@@ -1015,11 +1029,12 @@ def _invoke_agent(
+     _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
+     # [daveey] Core-update pause: consulted by the agent loop at each step boundary of this turn only.
+     from tui_gateway.update_pause import boundary_pause_hook, install_clarify_pause_provider, start_mid_tool_cancel
+-    agent.step_boundary_pause = boundary_pause_hook(session, st.marker_key) if st.marker_key else None
++    pause_key = st.marker_key or _carried_pause_key(session)
++    agent.step_boundary_pause = boundary_pause_hook(session, pause_key) if pause_key else None
+     _mid_tool_stop = None
+-    if st.marker_key:
++    if pause_key:
+         install_clarify_pause_provider()  # a blocked clarify is withdrawn so the pause can land
+-        _mid_tool_stop = start_mid_tool_cancel(session, st.marker_key, agent)  # so is a long tool call, after a grace
++        _mid_tool_stop = start_mid_tool_cancel(session, pause_key, agent)  # so is a long tool call, after a grace
+     try:
+         from agent.notification_presentation import notification_turn, event_presentation_muted
+         with notification_turn(agent, muted=event_presentation_muted("message.delta", sid), session_id=sid):
+-- 
+2.51.0
+

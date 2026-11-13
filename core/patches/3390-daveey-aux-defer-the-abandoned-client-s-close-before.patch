@@ -1,0 +1,206 @@
+From ae7d73404004f9f7d4a0193b0a7cf2407dbe8dd5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:27:54 +0000
+Subject: [PATCH] [daveey] aux: defer the abandoned client's close before the
+ shutdown; scope native-adapter streams; tripwire via config
+
+Review of 0b02d0f3e8 (t_01a1d461f1e10477):
+- release_client registered the deferred close only after
+  force_close_tcp_sockets woke the daemon, so a fast daemon could finish
+  first and the close fell back to the owner thread (FD-safe, but the e2e
+  test flaked 7/40 under load). Defer first, then shut down; 0/100 runs
+  failed under 8-12x concurrency.
+- _stream's native-adapter branch (Anthropic/Codex/Bedrock aggregate
+  through _complete, i.e. the protected daemon) closed the per-call client
+  in its owner-thread finally. It now wraps _complete in client_scope; the
+  e2e test is parametrized over it and fails without this (incident bytes
+  b'SQLit\x17\x03\x03\x00\x13...').
+- The debug tripwire is config.yaml logging.debug_ssl_close instead of the
+  HERMES_DEBUG_SSL_CLOSE env var (AGENTS.md: behaviour goes in config).
+
+Card: t_01a1d4495a984fc9
+---
+ agent/aux_provider_handoff.py                 |  4 ++-
+ agent/auxiliary_class_routing.py              | 36 +++++++++++--------
+ agent/ssl_close_tripwire.py                   | 11 +++---
+ hermes_logging.py                             |  4 +--
+ .../test_aux_abandoned_provider_tls_fd.py     | 17 ++++++---
+ 5 files changed, 43 insertions(+), 29 deletions(-)
+
+diff --git a/agent/aux_provider_handoff.py b/agent/aux_provider_handoff.py
+index 1dd316c144..39c5c65f44 100644
+--- a/agent/aux_provider_handoff.py
++++ b/agent/aux_provider_handoff.py
+@@ -85,7 +85,6 @@ def release_client(client: Any, close: Callable[[Any], None], abandoned: list[Pr
+         close(client)
+         return
+     from agent.agent_runtime_helpers import force_close_tcp_sockets
+-    shutdown_count = force_close_tcp_sockets(getattr(client, "_real_client", None) or client)
+     remaining = [len(abandoned)]
+     lock = threading.Lock()
+ 
+@@ -96,9 +95,12 @@ def release_client(client: Any, close: Callable[[Any], None], abandoned: list[Pr
+         if last:
+             close(client)
+ 
++    # Defer before the shutdown wakes the daemon: shutting down first let a woken daemon finish before the
++    # defer, so the close fell back to this thread (FD-safe then, but no longer the daemon's).
+     deferred = sum(attempt.defer(one_done) for attempt in abandoned)
+     for _ in range(len(abandoned) - deferred):
+         one_done()
++    shutdown_count = force_close_tcp_sockets(getattr(client, "_real_client", None) or client) if deferred else 0
+     if deferred:
+         logger.info("auxiliary client close handed to %d abandoned provider daemon(s) (tcp_shutdown=%d)",
+                     deferred, shutdown_count)
+diff --git a/agent/auxiliary_class_routing.py b/agent/auxiliary_class_routing.py
+index 762861aeb7..1df28fb61a 100644
+--- a/agent/auxiliary_class_routing.py
++++ b/agent/auxiliary_class_routing.py
+@@ -249,24 +249,30 @@ def _complete(task, runtime, client, kwargs):
+ 
+ def _stream(task, runtime, client, kwargs, options):
+     from agent import auxiliary_client as aux
+-    try:
+-        if aux._client_streams_internally(client):
+-            # Native adapters aggregate their SDK stream; expose one normalized
+-            # chunk, preserving tool calls, rather than iterating a response object.
++
++    def close(c):
++        aux._close_cached_client(c, close_async=True)
++    if aux._client_streams_internally(client):
++        # Native adapters aggregate their SDK stream; expose one normalized
++        # chunk, preserving tool calls, rather than iterating a response object.
++        # _complete runs the protected provider daemon, so client_scope keeps a hard cancel's close off this
++        # thread. Nothing is yielded inside the scope: its context var is set and reset in one resumption.
++        with client_scope(client, close):
+             response = _complete(task, runtime, client, kwargs)
+-            choice = response.choices[0]
+-            yield SimpleNamespace(choices=[SimpleNamespace(index=0, delta=choice.message,
+-                                                           finish_reason=choice.finish_reason)],
+-                                  model=runtime["model"], usage=getattr(response, "usage", None))
+-        else:
+-            kwargs["stream"] = True
+-            if options.get("stream_options"):
+-                kwargs["stream_options"] = options["stream_options"]
+-            yield from aux._relay_sync_stream(client, kwargs, provider=runtime["provider"],
+-                                              api_mode=runtime["api_mode"])
++        choice = response.choices[0]
++        yield SimpleNamespace(choices=[SimpleNamespace(index=0, delta=choice.message,
++                                                       finish_reason=choice.finish_reason)],
++                              model=runtime["model"], usage=getattr(response, "usage", None))
++        return
++    try:
++        kwargs["stream"] = True
++        if options.get("stream_options"):
++            kwargs["stream_options"] = options["stream_options"]
++        yield from aux._relay_sync_stream(client, kwargs, provider=runtime["provider"],
++                                          api_mode=runtime["api_mode"])
+         # Never replay a stream after yielding any output.
+     finally:
+-        aux._close_cached_client(client, close_async=True)
++        close(client)
+ 
+ 
+ def _stream_with_recovery(task, options, request):
+diff --git a/agent/ssl_close_tripwire.py b/agent/ssl_close_tripwire.py
+index 1f840e1603..43bc0699bf 100644
+--- a/agent/ssl_close_tripwire.py
++++ b/agent/ssl_close_tripwire.py
+@@ -3,20 +3,18 @@
+ ``close()`` from a thread other than the one inside ``recv`` releases the fd under the reader's live SSL
+ object; the kernel recycles the number and the reader's next ``SSL_read`` / alert write lands in whatever
+ file took it (hub SQLite headers, 2026-11-11 and 2026-11-13). The FD-safe stranger-thread wake is
+-``shutdown()`` (``agent_runtime_helpers._shutdown_socket``). Set ``HERMES_DEBUG_SSL_CLOSE=1`` to install;
+-off by default because every TLS read then pays a Python-level wrapper.
++``shutdown()`` (``agent_runtime_helpers._shutdown_socket``). Set config.yaml ``logging.debug_ssl_close: true``
++to install (read by ``hermes_logging.setup_logging``); off by default because every TLS read then pays a Python-level wrapper.
+ """
+ 
+ from __future__ import annotations
+ 
+ import logging
+-import os
+ import ssl
+ import threading
+ 
+ logger = logging.getLogger(__name__)
+ 
+-_ENV = "HERMES_DEBUG_SSL_CLOSE"
+ _READS = ("recv", "recv_into", "read")
+ _installed = False
+ _install_lock = threading.Lock()
+@@ -82,7 +80,8 @@ def uninstall() -> None:
+         _installed = False
+ 
+ 
+-def install_from_env() -> bool:
+-    if os.environ.get(_ENV, "").strip().lower() not in ("1", "true", "yes", "on"):
++def install_if_enabled(enabled: object) -> bool:
++    """Install when config ``logging.debug_ssl_close`` is true (bool, or a 1/true/yes/on string)."""
++    if enabled is not True and str(enabled).strip().lower() not in ("1", "true", "yes", "on"):
+         return False
+     return install()
+diff --git a/hermes_logging.py b/hermes_logging.py
+index cca353b1cd..6500828c53 100644
+--- a/hermes_logging.py
++++ b/hermes_logging.py
+@@ -473,8 +473,8 @@ def setup_logging(
+     if root.level == logging.NOTSET or root.level > level:
+         root.setLevel(level)
+     _quiet_noisy_loggers()
+-    from agent.ssl_close_tripwire import install_from_env  # lazy: debug-only, HERMES_DEBUG_SSL_CLOSE=1
+-    install_from_env()
++    from agent.ssl_close_tripwire import install_if_enabled  # lazy: debug-only, logging.debug_ssl_close
++    install_if_enabled(log_cfg.get("debug_ssl_close"))
+     _logging_initialized = True
+     return log_dir
+ 
+diff --git a/tests/agent/test_aux_abandoned_provider_tls_fd.py b/tests/agent/test_aux_abandoned_provider_tls_fd.py
+index ed0e8a5195..e64cc60bdb 100644
+--- a/tests/agent/test_aux_abandoned_provider_tls_fd.py
++++ b/tests/agent/test_aux_abandoned_provider_tls_fd.py
+@@ -114,8 +114,9 @@ def _fd_is_open(fd: int) -> bool:
+     return True
+ 
+ 
++@pytest.mark.parametrize("streamed", [False, True], ids=["complete", "native-adapter-stream"])
+ def test_cancelled_class_call_never_hands_the_daemons_tls_fd_to_sqlite(stalling_stream, tmp_path, monkeypatch,
+-                                                                       caplog):
++                                                                       caplog, streamed):
+     caplog.set_level("INFO", logger="agent.aux_provider_handoff")
+     http = httpx.Client(verify=stalling_stream.ssl_context, timeout=httpx.Timeout(20.0))
+     client = _PerCallClient(http)
+@@ -136,12 +137,18 @@ def test_cancelled_class_call_never_hands_the_daemons_tls_fd_to_sqlite(stalling_
+         {"provider": "anthropic", "model": "deep", "api_mode": "anthropic_messages"}, client, {}))
+     monkeypatch.setattr(routing, "_complete", lambda task, runtime, client, kwargs:
+                         aux._run_protected_sync_provider_call(provider, kwargs))
++    # stream=True on a native adapter (Anthropic/Codex/Bedrock) aggregates through the same _complete.
++    monkeypatch.setattr(aux, "_client_streams_internally", lambda _client: True)
+     outcome: dict = {}
+ 
+     def owner() -> None:  # the compression host: protected, with a hard-cancel source
+         try:
+             with aux.aux_interrupt_protection(cancel_check=cancel.is_set):
+-                routing.class_routed_sync(lambda *a, **k: None)(task="compression", messages=[])
++                call = routing.class_routed_sync(lambda *a, **k: None)
++                if streamed:
++                    list(call(task="compression", messages=[], stream=True) or ())
++                else:
++                    call(task="compression", messages=[])
+         except aux.AuxiliaryExplicitCancellation:
+             outcome["cancelled"] = True
+ 
+@@ -270,7 +277,7 @@ def test_tripwire_is_quiet_for_an_owner_close(stalling_stream, tripwire, caplog)
+     assert caplog.text == ""
+ 
+ 
+-def test_tripwire_installs_only_when_enabled(monkeypatch):
+-    monkeypatch.delenv("HERMES_DEBUG_SSL_CLOSE", raising=False)
+-    assert ssl_close_tripwire.install_from_env() is False
++def test_tripwire_installs_only_when_enabled():
++    assert ssl_close_tripwire.install_if_enabled(None) is False
++    assert ssl_close_tripwire.install_if_enabled(False) is False
+     assert not hasattr(ssl.SSLSocket.recv, "__wrapped__")
+-- 
+2.51.0
+

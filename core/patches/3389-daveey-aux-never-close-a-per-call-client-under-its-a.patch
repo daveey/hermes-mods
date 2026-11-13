@@ -1,0 +1,641 @@
+From 5a528cc90cc8117e54c13f3b437df2bd36307d97 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:54:38 +0000
+Subject: [PATCH] [daveey] aux: never close a per-call client under its
+ abandoned provider daemon's TLS read
+
+A hard cancel of a protected aux call (a user Stop, the core-update pause's
+compression yield) lets the owner unwind at once while the
+hermes-protected-aux-provider daemon keeps reading the client's TLS stream.
+Class routing builds one client per call and closed it in the owner's
+finally: httpx close()d the socket the daemon was blocked on. The SSL
+object keeps the raw fd in its BIO; the kernel gave the number to the next
+open() (a SQLite database), and the daemon's next SSL_read took "SQLit"
+from the header and wrote a 24-byte TLS 1.3 alert at offset 5: hub
+inbox/inbox.db 2026-11-13 09:01:27 (3 ms after "compression yielded to a
+Hermes update pause") and user-steps/actions.sqlite3 2026-11-11.
+
+- agent/aux_provider_handoff.py: each protected call has a ProviderAttempt;
+  on cancel the owner records it in the enclosing client_scope. The scope's
+  release then only shuts the client's sockets down (FD-safe from any
+  thread, wakes the daemon and stops billing the abandoned summary) and the
+  daemon closes the client when its callback returns. No abandoned daemon:
+  closed on the caller as before.
+- class_routed_sync wraps each attempt in client_scope.
+- agent/ssl_close_tripwire.py: HERMES_DEBUG_SSL_CLOSE=1 (installed from
+  setup_logging) logs the stack when an SSLSocket is closed while another
+  thread is inside recv on it.
+
+Test: a real loopback TLS 1.3 server streams to the protected daemon; the
+owner is cancelled, the socket's fd number is handed to a SQLite file when
+released, and data wakes the daemon. Before the fix the header reads
+b'SQLit\x17\x03\x03\x00\x13...' (the incident bytes); after it the header is
+intact and the daemon thread closes the client.
+
+Card: t_01a1d4495a984fc9
+---
+ agent/aux_provider_handoff.py                 | 104 +++++++
+ agent/auxiliary_class_routing.py              |  14 +-
+ agent/auxiliary_client.py                     |  20 +-
+ agent/ssl_close_tripwire.py                   |  88 ++++++
+ hermes_logging.py                             |   2 +
+ .../test_aux_abandoned_provider_tls_fd.py     | 276 ++++++++++++++++++
+ 6 files changed, 488 insertions(+), 16 deletions(-)
+ create mode 100644 agent/aux_provider_handoff.py
+ create mode 100644 agent/ssl_close_tripwire.py
+ create mode 100644 tests/agent/test_aux_abandoned_provider_tls_fd.py
+
+diff --git a/agent/aux_provider_handoff.py b/agent/aux_provider_handoff.py
+new file mode 100644
+index 0000000000..1dd316c144
+--- /dev/null
++++ b/agent/aux_provider_handoff.py
+@@ -0,0 +1,104 @@
++"""[daveey] FD-safe release of a per-call aux client that an abandoned provider daemon may still be reading.
++
++``auxiliary_client._run_protected_sync_provider_call`` runs the provider callback on a
++``hermes-protected-aux-provider`` daemon so the owner can unwind at once on a hard cancel (a user Stop,
++the core-update pause's compression yield). The daemon keeps reading the client's TLS stream after that.
++Class routing builds one client per call and closed it in the owner's ``finally``: ``httpx`` then
++``close()``d the socket the daemon was blocked on. The SSL object keeps the raw fd number in its BIO, the
++kernel hands that number to the next ``open()`` (a SQLite database), and the daemon's next ``SSL_read``
++takes ``SQLit`` from the file header, finds no valid record and writes a 24-byte TLS 1.3 alert at offset 5
++(hub ``inbox/inbox.db`` 2026-11-13 09:01:27, 3 ms after a compression yield; ``user-steps/actions.sqlite3``
++2026-11-11).
++
++The owner now only shuts the sockets down (``force_close_tcp_sockets``: FD-safe from any thread, wakes the
++daemon's read at once and stops billing an abandoned summary) and hands the real close to the daemon,
++which runs it right after its callback returns, on the thread that owns the socket.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import contextvars
++import logging
++import threading
++from typing import Any, Callable, Iterator
++
++logger = logging.getLogger(__name__)
++
++_ABANDONED: contextvars.ContextVar[list | None] = contextvars.ContextVar(
++    "hermes_aux_abandoned_provider_calls", default=None)
++
++
++class ProviderAttempt:
++    """One protected provider call's daemon. Callbacks deferred to it run on the daemon once its provider
++    callback returned (or at once from ``defer``'s caller when it already has)."""
++
++    def __init__(self) -> None:
++        self._lock = threading.Lock()
++        self._finished = False
++        self._on_finish: list[Callable[[], None]] = []
++
++    def finish(self) -> None:
++        """Daemon side, after the provider callback returned or raised: run the deferred releases here."""
++        with self._lock:
++            self._finished = True
++            pending, self._on_finish = self._on_finish, []
++        for release in pending:
++            try:
++                release()
++            except Exception:
++                logger.debug("deferred aux client release failed", exc_info=True)
++
++    def defer(self, release: Callable[[], None]) -> bool:
++        """Queue ``release`` for the daemon; False when the daemon already finished (the caller runs it)."""
++        with self._lock:
++            if self._finished:
++                return False
++            self._on_finish.append(release)
++            return True
++
++
++def note_abandoned(attempt: ProviderAttempt) -> None:
++    """Owner side, on hard cancel: the daemon still runs; record it in the enclosing ``client_scope``."""
++    abandoned = _ABANDONED.get()
++    if abandoned is not None:
++        abandoned.append(attempt)
++
++
++@contextlib.contextmanager
++def client_scope(client: Any, close: Callable[[Any], None]) -> Iterator[None]:
++    """Own ``client`` for one provider call and ``close`` it on exit, on a thread allowed to.
++
++    No abandoned daemon: closed here, as before. Otherwise the sockets are shut down from here and the
++    close runs on the last abandoned daemon when its callback returns."""
++    abandoned: list[ProviderAttempt] = []
++    token = _ABANDONED.set(abandoned)
++    try:
++        yield
++    finally:
++        _ABANDONED.reset(token)
++        release_client(client, close, abandoned)
++
++
++def release_client(client: Any, close: Callable[[Any], None], abandoned: list[ProviderAttempt]) -> None:
++    if not abandoned:
++        close(client)
++        return
++    from agent.agent_runtime_helpers import force_close_tcp_sockets
++    shutdown_count = force_close_tcp_sockets(getattr(client, "_real_client", None) or client)
++    remaining = [len(abandoned)]
++    lock = threading.Lock()
++
++    def one_done() -> None:
++        with lock:
++            remaining[0] -= 1
++            last = remaining[0] == 0
++        if last:
++            close(client)
++
++    deferred = sum(attempt.defer(one_done) for attempt in abandoned)
++    for _ in range(len(abandoned) - deferred):
++        one_done()
++    if deferred:
++        logger.info("auxiliary client close handed to %d abandoned provider daemon(s) (tcp_shutdown=%d)",
++                    deferred, shutdown_count)
+diff --git a/agent/auxiliary_class_routing.py b/agent/auxiliary_class_routing.py
+index fec938d056..762861aeb7 100644
+--- a/agent/auxiliary_class_routing.py
++++ b/agent/auxiliary_class_routing.py
+@@ -7,6 +7,7 @@ from functools import wraps
+ from types import SimpleNamespace
+ from uuid import uuid4
+ 
++from agent.aux_provider_handoff import client_scope
+ from agent.model_routing import ModelRoutingError, is_class_selector
+ from agent.model_routing_runtime import resolve_class_runtime
+ 
+@@ -306,12 +307,13 @@ def class_routed_sync(callback):
+         while True:
+             runtime, client, kwargs = _prepare(task, options, request, failed)
+             terminal = None
+-            try:
+-                return _complete(task, runtime, client, kwargs)
+-            except Exception as exc:  # health: allow BLE001 -- classified once, then recovered or re-raised below
+-                terminal = _recover(runtime, client, exc, attempted, failed)
+-            finally:
+-                aux._close_cached_client(client, close_async=True)
++            # A hard cancel can leave the provider daemon reading this client: the scope then shuts its
++            # sockets down and the daemon closes it, never this thread (TLS fd recycled into SQLite).
++            with client_scope(client, lambda c: aux._close_cached_client(c, close_async=True)):
++                try:
++                    return _complete(task, runtime, client, kwargs)
++                except Exception as exc:  # health: allow BLE001 -- classified once, then recovered or re-raised below
++                    terminal = _recover(runtime, client, exc, attempted, failed)
+             if terminal is not None:
+                 raise terminal
+     return wrapped
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 32d12234ba..83b04ce94a 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -36,6 +36,7 @@ from agent.error_classifier import (
+ from agent.errors import InvalidProviderResponseError
+ from agent.auxiliary_fallback_recovery import reapply_repairs
+ from agent.auxiliary_managed_local import _is_managed_local_endpoint
++from agent.aux_provider_handoff import ProviderAttempt, note_abandoned as note_abandoned_provider_call
+ from agent.auxiliary_reasoning_floor import remember_reasoning_floor, with_reasoning_floor
+ from agent.auxiliary_profile_gates import (
+     PROFILE_REASONING_KEYS, contains_profile_reasoning_fields, profile_forwards_max_tokens,
+@@ -452,10 +453,9 @@ def aux_stream_deadline(deadline: float | Callable[[], float | None] | None):
+ def _run_protected_sync_provider_call(callback: Callable[[dict[str, Any]], Any], kwargs: dict[str, Any]) -> Any:
+     """Run one protected provider callback in an attempt-isolated daemon thread.
+ 
+-    Aux clients are process-shared and cannot be closed to wake one request, so the callback (incl.
+-    stream aggregation) runs in a daemon while the owner polls cancellation; on cancel the owner
+-    unwinds at once; the daemon stops at its next streamed chunk, else under the provider timeout in ``kwargs``
+-    (it owns no transcript/commit state, never holds the session lock). Unprotected / no cancel source: direct.
++    The callback (incl. stream aggregation) runs in a daemon while the owner polls cancellation; on cancel the
++    owner unwinds at once and the daemon, which owns the client's socket, closes a per-call client itself
++    (``aux_provider_handoff``: an owner close recycled its TLS fd into a SQLite header). Unprotected: direct.
+     """
+     source_cancel_check = _capture_aux_cancel_check()
+     if not _aux_interrupt_protected() or not callable(source_cancel_check):
+@@ -476,8 +476,7 @@ def _run_protected_sync_provider_call(callback: Callable[[dict[str, Any]], Any],
+     # owner-thread-only deadline would leave the fix inert on exactly the path large-session compression
+     # takes (protected call + hard-cancel source installed).
+     provider_context = contextvars.copy_context()
+-    done = threading.Event()
+-    outcome: dict[str, Any] = {}
++    done, outcome, attempt = threading.Event(), {}, ProviderAttempt()
+ 
+     def _provider_worker() -> None:
+         try:
+@@ -493,6 +492,7 @@ def _run_protected_sync_provider_call(callback: Callable[[dict[str, Any]], Any],
+             outcome["exception"] = exc
+         finally:
+             done.set()
++            attempt.finish()  # deferred client closes run here, on the thread that owns the socket
+ 
+     threading.Thread(
+         target=provider_context.run, args=(_provider_worker,), name="hermes-protected-aux-provider",
+@@ -500,11 +500,11 @@ def _run_protected_sync_provider_call(callback: Callable[[dict[str, Any]], Any],
+     while True:
+         # Check cancel before AND after each wait so it wins when result publication and the
+         # host Event land in the same polling interval.
+-        if _captured_aux_cancel_requested(cancel_check):
+-            raise AuxiliaryExplicitCancellation()
+-        if not done.wait(0.02):
++        cancelled = _captured_aux_cancel_requested(cancel_check)
++        if not cancelled and not done.wait(0.02):
+             continue
+-        if _captured_aux_cancel_requested(cancel_check):
++        if cancelled or _captured_aux_cancel_requested(cancel_check):
++            note_abandoned_provider_call(attempt)
+             raise AuxiliaryExplicitCancellation()
+         exception = outcome.get("exception")
+         if exception is not None:
+diff --git a/agent/ssl_close_tripwire.py b/agent/ssl_close_tripwire.py
+new file mode 100644
+index 0000000000..1f840e1603
+--- /dev/null
++++ b/agent/ssl_close_tripwire.py
+@@ -0,0 +1,88 @@
++"""[daveey] Debug tripwire: log the stack when an ``ssl.SSLSocket`` is closed while another thread reads it.
++
++``close()`` from a thread other than the one inside ``recv`` releases the fd under the reader's live SSL
++object; the kernel recycles the number and the reader's next ``SSL_read`` / alert write lands in whatever
++file took it (hub SQLite headers, 2026-11-11 and 2026-11-13). The FD-safe stranger-thread wake is
++``shutdown()`` (``agent_runtime_helpers._shutdown_socket``). Set ``HERMES_DEBUG_SSL_CLOSE=1`` to install;
++off by default because every TLS read then pays a Python-level wrapper.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import ssl
++import threading
++
++logger = logging.getLogger(__name__)
++
++_ENV = "HERMES_DEBUG_SSL_CLOSE"
++_READS = ("recv", "recv_into", "read")
++_installed = False
++_install_lock = threading.Lock()
++
++
++def _wrap_read(original):
++    def read(self, *args, **kwargs):
++        readers = self.__dict__.setdefault("_hermes_readers", {})
++        tid = threading.get_ident()
++        readers[tid] = readers.get(tid, 0) + 1
++        try:
++            return original(self, *args, **kwargs)
++        finally:
++            if readers.get(tid, 0) <= 1:
++                readers.pop(tid, None)
++            else:
++                readers[tid] -= 1
++    read.__wrapped__ = original
++    return read
++
++
++def _wrap_close(original):
++    def _real_close(self, *args, **kwargs):
++        me = threading.get_ident()
++        others = [tid for tid in dict(self.__dict__.get("_hermes_readers") or {}) if tid != me]
++        if others:
++            logger.warning("SSL socket fd=%s closed by thread %s while thread(s) %s read it: the fd can be recycled "
++                           "under their SSL object (use shutdown() from a stranger thread)",
++                           _fileno(self), threading.current_thread().name, others, stack_info=True)
++        return original(self, *args, **kwargs)
++    _real_close.__wrapped__ = original
++    return _real_close
++
++
++def _fileno(sock) -> int:
++    try:
++        return sock.fileno()
++    except OSError:
++        return -1
++
++
++def install() -> bool:
++    """Patch ``ssl.SSLSocket`` once; True when this call installed it."""
++    global _installed
++    with _install_lock:
++        if _installed:
++            return False
++        for name in _READS:
++            setattr(ssl.SSLSocket, name, _wrap_read(getattr(ssl.SSLSocket, name)))
++        ssl.SSLSocket._real_close = _wrap_close(ssl.SSLSocket._real_close)
++        _installed = True
++        return True
++
++
++def uninstall() -> None:
++    """Restore the originals (tests)."""
++    global _installed
++    with _install_lock:
++        if not _installed:
++            return
++        for name in (*_READS, "_real_close"):
++            setattr(ssl.SSLSocket, name, getattr(ssl.SSLSocket, name).__wrapped__)
++        _installed = False
++
++
++def install_from_env() -> bool:
++    if os.environ.get(_ENV, "").strip().lower() not in ("1", "true", "yes", "on"):
++        return False
++    return install()
+diff --git a/hermes_logging.py b/hermes_logging.py
+index 4d033b5e64..cca353b1cd 100644
+--- a/hermes_logging.py
++++ b/hermes_logging.py
+@@ -473,6 +473,8 @@ def setup_logging(
+     if root.level == logging.NOTSET or root.level > level:
+         root.setLevel(level)
+     _quiet_noisy_loggers()
++    from agent.ssl_close_tripwire import install_from_env  # lazy: debug-only, HERMES_DEBUG_SSL_CLOSE=1
++    install_from_env()
+     _logging_initialized = True
+     return log_dir
+ 
+diff --git a/tests/agent/test_aux_abandoned_provider_tls_fd.py b/tests/agent/test_aux_abandoned_provider_tls_fd.py
+new file mode 100644
+index 0000000000..ed0e8a5195
+--- /dev/null
++++ b/tests/agent/test_aux_abandoned_provider_tls_fd.py
+@@ -0,0 +1,276 @@
++"""[daveey] A hard-cancelled protected aux call must not release the TLS fd its provider daemon still reads.
++
++Hub incident 2026-11-13 09:01:27 (and 2026-11-11 on actions.sqlite3): a compression yield cancelled a
++class-routed aux call; the owner's ``finally`` closed the per-call client while the
++``hermes-protected-aux-provider`` daemon was blocked reading its TLS stream. The fd number went to a
++SQLite file, and the daemon's next ``SSL_read`` read ``SQLit`` and wrote a TLS alert into the header.
++This reproduces it end to end on a real loopback TLS 1.3 server.
++"""
++from __future__ import annotations
++
++from datetime import UTC, datetime, timedelta
++from ipaddress import ip_address
++import os
++import socket
++import sqlite3
++import ssl
++import threading
++from types import SimpleNamespace
++
++from cryptography import x509
++from cryptography.hazmat.primitives import hashes, serialization
++from cryptography.hazmat.primitives.asymmetric import rsa
++from cryptography.x509.oid import NameOID
++import httpx
++import pytest
++from truststore._ssl_constants import _original_SSLContext
++
++from agent import aux_provider_handoff as handoff
++from agent import auxiliary_class_routing as routing
++from agent import auxiliary_client as aux
++from agent import ssl_close_tripwire
++from tests.waiting import wait_until
++
++SQLITE_MAGIC = b"SQLite format 3\x00"
++
++
++def _tls_material(tmp_path):
++    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
++    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test loopback")])
++    now = datetime.now(UTC)
++    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
++            .public_key(key.public_key()).serial_number(x509.random_serial_number())
++            .not_valid_before(now - timedelta(days=1)).not_valid_after(now + timedelta(days=1))
++            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
++            .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ip_address("127.0.0.1"))]), critical=False)
++            .sign(key, hashes.SHA256()))
++    cert_path, key_path = tmp_path / "loopback.pem", tmp_path / "loopback.key"
++    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
++    key_path.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
++                                           serialization.NoEncryption()))
++    return cert_path, key_path
++
++
++@pytest.fixture
++def stalling_stream(tmp_path):
++    """Loopback TLS 1.3 server: one chunked response, first chunk at once, the rest only on ``resume``."""
++    cert_path, key_path = _tls_material(tmp_path)
++    server_ctx = _original_SSLContext(ssl.PROTOCOL_TLS_SERVER)
++    server_ctx.minimum_version = ssl.TLSVersion.TLSv1_3
++    server_ctx.load_cert_chain(cert_path, key_path)
++    listener = socket.create_server(("127.0.0.1", 0))
++    resume, stop = threading.Event(), threading.Event()
++
++    def serve() -> None:
++        raw, _ = listener.accept()
++        try:
++            with server_ctx.wrap_socket(raw, server_side=True) as conn:
++                request = b""
++                while b"\r\n\r\n" not in request:
++                    request += conn.recv(4096)
++                conn.sendall(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
++                             b"transfer-encoding: chunked\r\n\r\n5\r\nfirst\r\n")
++                resume.wait(30)
++                for _ in range(20):  # keep the peer's poll waking until the test is done
++                    conn.sendall(b"6\r\nsecond\r\n")
++                    if stop.wait(0.05):
++                        break
++        except OSError:
++            pass  # the client shut its side down: expected after the fix
++
++    server = threading.Thread(target=serve, daemon=True)
++    server.start()
++    client_ctx = _original_SSLContext(ssl.PROTOCOL_TLS_CLIENT)
++    client_ctx.load_verify_locations(cert_path)
++    yield SimpleNamespace(url=f"https://127.0.0.1:{listener.getsockname()[1]}/v1/messages",
++                          ssl_context=client_ctx, resume=resume)
++    stop.set()
++    resume.set()
++    server.join(10)
++    listener.close()
++
++
++class _PerCallClient:
++    """Stands in for ``AnthropicAuxiliaryClient``: a per-call SDK client whose ``close`` closes its own pool."""
++
++    def __init__(self, http: httpx.Client) -> None:
++        self._client = http
++        self.closed_on: list[str] = []
++
++    def close(self) -> None:
++        self.closed_on.append(threading.current_thread().name)
++        self._client.close()
++
++
++def _provider_daemons() -> list[threading.Thread]:
++    return [t for t in threading.enumerate() if t.name == "hermes-protected-aux-provider"]
++
++
++def _fd_is_open(fd: int) -> bool:
++    try:
++        os.fstat(fd)
++    except OSError:
++        return False
++    return True
++
++
++def test_cancelled_class_call_never_hands_the_daemons_tls_fd_to_sqlite(stalling_stream, tmp_path, monkeypatch,
++                                                                       caplog):
++    caplog.set_level("INFO", logger="agent.aux_provider_handoff")
++    http = httpx.Client(verify=stalling_stream.ssl_context, timeout=httpx.Timeout(20.0))
++    client = _PerCallClient(http)
++    reading, cancel = threading.Event(), threading.Event()
++    seen: dict = {}
++
++    def provider(_kwargs):  # runs on the protected daemon, like a streamed Anthropic summary
++        with http.stream("POST", stalling_stream.url, content=b"{}") as response:
++            sock = response.extensions["network_stream"].get_extra_info("socket")
++            seen["fd"] = sock.fileno()
++            for chunk in response.iter_raw():
++                seen.setdefault("chunks", []).append(chunk)
++                reading.set()
++        return "summary"
++
++    monkeypatch.setattr(routing, "_class_request", lambda *args: ("class:deep", "owner", {}, None, "class:deep"))
++    monkeypatch.setattr(routing, "_prepare", lambda *args: (
++        {"provider": "anthropic", "model": "deep", "api_mode": "anthropic_messages"}, client, {}))
++    monkeypatch.setattr(routing, "_complete", lambda task, runtime, client, kwargs:
++                        aux._run_protected_sync_provider_call(provider, kwargs))
++    outcome: dict = {}
++
++    def owner() -> None:  # the compression host: protected, with a hard-cancel source
++        try:
++            with aux.aux_interrupt_protection(cancel_check=cancel.is_set):
++                routing.class_routed_sync(lambda *a, **k: None)(task="compression", messages=[])
++        except aux.AuxiliaryExplicitCancellation:
++            outcome["cancelled"] = True
++
++    before = set(_provider_daemons())
++    owner_thread = threading.Thread(target=owner, name="compression-owner")
++    owner_thread.start()
++    assert reading.wait(15), "the provider daemon never started streaming"
++    daemons = [t for t in _provider_daemons() if t not in before]
++    cancel.set()  # the update pause's compression yield
++    owner_thread.join(15)
++    assert outcome == {"cancelled": True}
++
++    # SQLite opens a database and the kernel hands it the lowest free fd; pin it to the socket's number
++    # when (and only when) the owner released it, so the reuse is deterministic.
++    database = tmp_path / "inbox.db"
++    sqlite3.connect(database).executescript("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
++    db_fd = os.open(database, os.O_RDWR)
++    target = seen["fd"]
++    reused = not _fd_is_open(target)
++    if reused:
++        os.dup2(db_fd, target)
++    try:
++        stalling_stream.resume.set()  # data arrives: the daemon's read wakes
++        for daemon in daemons:
++            daemon.join(15)
++        assert not any(d.is_alive() for d in daemons)
++        with open(database, "rb") as fh:
++            header = fh.read(32)
++    finally:
++        os.close(db_fd)
++        if reused:
++            os.close(target)
++    assert header[:16] == SQLITE_MAGIC, f"TLS bytes landed in the SQLite header: {header!r}"
++    # The owner only shut the socket down (waking the daemon at once); the daemon closed the client.
++    assert client.closed_on == ["hermes-protected-aux-provider"]
++    assert "tcp_shutdown=1" in caplog.text
++    assert http.is_closed
++
++
++def test_release_without_abandoned_daemon_closes_on_the_caller():
++    closed = []
++    with handoff.client_scope("client", closed.append):
++        pass
++    assert closed == ["client"]
++
++
++def test_release_runs_on_the_abandoned_daemon_once_it_finishes():
++    closed, threads = [], []
++    attempt = handoff.ProviderAttempt()
++
++    def close(client) -> None:
++        closed.append(client)
++        threads.append(threading.get_ident())
++
++    with handoff.client_scope(object(), close):
++        handoff.note_abandoned(attempt)
++    assert closed == []
++    daemon = threading.Thread(target=attempt.finish)
++    daemon.start()
++    daemon.join(5)
++    assert len(closed) == 1 and threads == [daemon.ident]
++
++
++def test_release_closes_at_once_when_the_daemon_already_finished():
++    closed = []
++    attempt = handoff.ProviderAttempt()
++    attempt.finish()
++    with handoff.client_scope("client", closed.append):
++        handoff.note_abandoned(attempt)
++    assert closed == ["client"]
++
++
++def test_note_abandoned_outside_a_scope_is_a_no_op():
++    handoff.note_abandoned(handoff.ProviderAttempt())
++
++
++@pytest.fixture
++def tripwire():
++    assert ssl_close_tripwire.install()
++    try:
++        yield
++    finally:
++        ssl_close_tripwire.uninstall()
++
++
++def _connected_tls_socket(stalling_stream):
++    host, port = "127.0.0.1", int(stalling_stream.url.split(":")[2].split("/")[0])
++    sock = stalling_stream.ssl_context.wrap_socket(socket.create_connection((host, port)), server_hostname=host)
++    sock.sendall(b"POST /v1/messages HTTP/1.1\r\nhost: x\r\ncontent-length: 0\r\n\r\n")
++    received = b""
++    while b"first" not in received:  # headers + first chunk: the server now stalls
++        received += sock.recv(4096)
++    return sock
++
++
++def test_tripwire_logs_a_stranger_thread_close_under_a_live_read(stalling_stream, tripwire, caplog):
++    caplog.set_level("WARNING", logger="agent.ssl_close_tripwire")
++    sock = _connected_tls_socket(stalling_stream)
++    reading = threading.Event()
++
++    def reader() -> None:
++        reading.set()
++        try:
++            sock.recv(4096)
++        except OSError:
++            pass
++
++    thread = threading.Thread(target=reader, name="tls-reader")
++    thread.start()
++    assert reading.wait(5)
++    wait_until(lambda: sock.__dict__.get("_hermes_readers"), what="the reader to enter recv")  # wrapper sees it
++    sock.shutdown(socket.SHUT_RDWR)  # wake the reader FD-safely: the test itself must never recycle a live fd
++    thread.join(5)
++    caplog.clear()
++    # Simulate the bad order on bookkeeping only: a reader still registered while a stranger closes.
++    sock.__dict__["_hermes_readers"] = {thread.ident: 1}
++    sock.close()
++    assert "closed by thread" in caplog.text and "tls-reader" not in caplog.text
++    assert str(thread.ident) in caplog.text
++
++
++def test_tripwire_is_quiet_for_an_owner_close(stalling_stream, tripwire, caplog):
++    caplog.set_level("WARNING", logger="agent.ssl_close_tripwire")
++    sock = _connected_tls_socket(stalling_stream)
++    sock.close()
++    assert caplog.text == ""
++
++
++def test_tripwire_installs_only_when_enabled(monkeypatch):
++    monkeypatch.delenv("HERMES_DEBUG_SSL_CLOSE", raising=False)
++    assert ssl_close_tripwire.install_from_env() is False
++    assert not hasattr(ssl.SSLSocket.recv, "__wrapped__")
+-- 
+2.51.0
+

@@ -1,0 +1,369 @@
+From 5aefacfb0b73b3cff4684482ba116618bd4826e9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:00:11 +0000
+Subject: [PATCH] [daveey] Bind worker policy to account root and test receipts
+ to acquisitions
+
+---
+ hermes_cli/kanban_admission.py                |  4 +-
+ hermes_cli/worker_compute_capacity.py         | 16 ++++--
+ hermes_cli/worker_resource_admission.py       |  6 +-
+ scripts/run_tests_host_slots.py               |  4 +-
+ scripts/worker_test_budget.py                 | 12 +++-
+ tests/conftest.py                             |  5 ++
+ .../test_worker_compute_configuration.py      |  3 +-
+ .../test_worker_resource_admission.py         |  8 +--
+ tests/scripts/test_worker_policy_root.py      | 56 +++++++++++++++++++
+ tests/scripts/test_worker_test_budget.py      | 43 ++++++++++++++
+ 10 files changed, 138 insertions(+), 19 deletions(-)
+ create mode 100644 tests/scripts/test_worker_policy_root.py
+
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index 65c11a93a9..a8a0f642c1 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -66,7 +66,7 @@ def hub_cpu_advisory(task_id=None, *, conn=None):
+     return reason
+ 
+ 
+-def _root_max_in_progress():
++def _root_max_in_progress(*, root=None):
+     """Root ``kanban.max_in_progress`` resolved like the dispatcher (unset → memory-derived default).
+ 
+     ``(ok, cap)``: ok False when the root config is unreadable or the value is invalid (refuses)."""
+@@ -75,7 +75,7 @@ def _root_max_in_progress():
+     from hermes_cli.kanban_db_dispatch import resolve_max_in_progress
+ 
+     try:
+-        doc = read_config_doc_readonly(Path(get_default_hermes_root()) / "config.yaml")
++        doc = read_config_doc_readonly(Path(root if root is not None else get_default_hermes_root()) / "config.yaml")
+     except FileNotFoundError:
+         doc = None
+     except Exception:  # health: allow BLE001 -- unreadable root config refuses the claim
+diff --git a/hermes_cli/worker_compute_capacity.py b/hermes_cli/worker_compute_capacity.py
+index 8521d422b5..94cf5aec30 100644
+--- a/hermes_cli/worker_compute_capacity.py
++++ b/hermes_cli/worker_compute_capacity.py
+@@ -104,13 +104,22 @@ def pool_path() -> Path:
+     return CGROUP_ROOT / 'user.slice' / f'user-{uid}.slice' / f'user@{uid}.service' / 'hermes.slice' / 'hermes-kanban.slice'
+ 
+ 
++def policy_root() -> Path:
++    """Host policy is account-owned, independent of HOME and HERMES_HOME.
++
++    Worker enrollment uses this fixed Linux account installation. Custom profile
++    roots remain valid for session data, but cannot disable host CPU policy.
++    """
++    from hermes_constants import _account_home
++    return _account_home() / '.hermes'
++
++
+ def worker_enabled() -> bool:
+     """Read installation policy, never a card's environment or profile override."""
+-    from hermes_constants import get_default_hermes_root
+     from hermes_cli.config_backend import read_config_doc_readonly
+ 
+     try:
+-        doc = read_config_doc_readonly(Path(get_default_hermes_root()) / 'config.yaml')
++        doc = read_config_doc_readonly(policy_root() / 'config.yaml')
+     except FileNotFoundError:
+         return False
+     raw = ((doc or {}).get('kanban') or {}).get('worker_resources', {})
+@@ -127,7 +136,6 @@ def configure_card(board: str, task: str) -> str:
+     """
+     import os
+     import subprocess
+-    from hermes_constants import get_default_hermes_root
+     from tools.process_registry import RestartSafeScopeUnavailable, systemd_user_bus_env
+ 
+     env = systemd_user_bus_env()
+@@ -147,7 +155,7 @@ def configure_card(board: str, task: str) -> str:
+         _verify_quota(path, quota)
+         if not 1 <= int((path / 'cpu.weight').read_text(encoding='utf-8')) <= 10:
+             raise ValueError(f'Worker CPU weight is missing or too high: {unit}')
+-    directory = Path(get_default_hermes_root()) / 'worker-resources' / 'owners'
++    directory = policy_root() / 'worker-resources' / 'owners'
+     directory.mkdir(parents=True, exist_ok=True)
+     # Immutable one-file-per-owner: concurrent retries write identical bytes.
+     import tempfile
+diff --git a/hermes_cli/worker_resource_admission.py b/hermes_cli/worker_resource_admission.py
+index 4553cd4ed0..fa32262479 100644
+--- a/hermes_cli/worker_resource_admission.py
++++ b/hermes_cli/worker_resource_admission.py
+@@ -62,19 +62,17 @@ def pool_occupancy(pool: Path, owners, active):
+ 
+ def refusal(echo=None) -> str | None:
+     """Pre-lease and final-lock check. Unknown observations fail closed."""
+-    from hermes_constants import get_default_hermes_root
+-
+     try:
+         if not capacity.worker_enabled():
+             return None
+-        directory = Path(get_default_hermes_root()) / 'worker-resources'
++        directory = capacity.policy_root() / 'worker-resources'
+         if _pressure(directory):
+             return 'worker_load_pressure'
+         from hermes_cli import machine_metrics
+         from hermes_cli.kanban_admission import _root_max_in_progress
+         active_owners = set()
+         active = machine_metrics.active_card_runs(exclude=echo, owner_output=active_owners)
+-        ok, cap = _root_max_in_progress()
++        ok, cap = _root_max_in_progress(root=capacity.policy_root())
+         if active is None or not ok or cap is None:
+             return 'worker_resources_unknown'
+         owners = {}
+diff --git a/scripts/run_tests_host_slots.py b/scripts/run_tests_host_slots.py
+index 3e43d15614..1688aab001 100644
+--- a/scripts/run_tests_host_slots.py
++++ b/scripts/run_tests_host_slots.py
+@@ -157,7 +157,9 @@ def _write_holder(fd: int) -> None:
+     except OSError:
+         cwd = ""
+     pid = os.getpid()
+-    record = json.dumps({"pid": pid, "start": _proc_start(pid), "since": time.time(), "cwd": cwd}).encode()
++    import secrets
++    record = json.dumps({"pid": pid, "start": _proc_start(pid), "since": time.time(),
++                         "cwd": cwd, "nonce": secrets.token_hex(16)}).encode()
+     with contextlib.suppress(OSError):
+         os.ftruncate(fd, 0)
+         os.pwrite(fd, record, 0)
+diff --git a/scripts/worker_test_budget.py b/scripts/worker_test_budget.py
+index 477450ce01..c27ea68cf8 100644
+--- a/scripts/worker_test_budget.py
++++ b/scripts/worker_test_budget.py
+@@ -49,6 +49,11 @@ def inherited_slot() -> bool:
+         held = os.stat(f'/proc/{pid}/fd/{fd}')
+         if (st.st_dev, st.st_ino) != (held.st_dev, held.st_ino):
+             return False
++        record = json.loads(expected.read_text(encoding='utf-8'))
++        if (not isinstance(record, dict) or not isinstance(rec.get('nonce'), str) or not rec['nonce'] or
++                record.get('nonce') != rec['nonce'] or record.get('pid') != pid or
++                record.get('start') != birth):
++            return False
+         identity = f'{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}'
+         for line in Path(f'/proc/{pid}/fdinfo/{fd}').read_text(encoding='utf-8').splitlines():
+             fields = line.split()
+@@ -63,7 +68,7 @@ def inherited_slot() -> bool:
+ 
+ def child_environment(env: MutableMapping[str, str], fd: int | None) -> None:
+     from hermes_cli.worker_compute_capacity import worker_enabled
+-    from scripts.run_tests_host_slots import HELD_ENV, host_slot_dir, host_slot_count
++    from scripts.run_tests_host_slots import HELD_ENV, host_slot_dir, host_slot_count, _read_holder
+     env[HELD_ENV] = '1'
+     if not worker_enabled():
+         return
+@@ -80,7 +85,10 @@ def child_environment(env: MutableMapping[str, str], fd: int | None) -> None:
+             continue
+         candidate = path.stat()
+         if (candidate.st_dev, candidate.st_ino) == (st.st_dev, st.st_ino):
++            record = _read_holder(fd)
++            if not record or not record.get('nonce'):
++                raise RuntimeError('worker test lock has no acquisition identity')
+             env[RECEIPT_ENV] = json.dumps({'pid': os.getpid(), 'birth': _stat(os.getpid())[1],
+-                                         'fd': fd, 'slot': slot})
++                                         'fd': fd, 'slot': slot, 'nonce': record['nonce']})
+             return
+     raise RuntimeError('worker test lock is outside canonical slot domain')
+diff --git a/tests/conftest.py b/tests/conftest.py
+index c8ea099aa9..0f85d5838c 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -343,6 +343,11 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
+ 
+     platform_default = hermes_constants._get_platform_default_hermes_home
+ 
++    # Per-test host policy is hermetic too. Do not change import-time / session
++    # admission: pytest itself must obey the real account's worker budget.
++    from hermes_cli import worker_compute_capacity
++    monkeypatch.setattr(worker_compute_capacity, "policy_root", lambda: tmp_path / "hermes_test")
++
+     def isolated_platform_default() -> Path:
+         root = platform_default()
+         # Explicit Path.home()/LOCALAPPDATA overrides in individual tests
+diff --git a/tests/hermes_cli/test_worker_compute_configuration.py b/tests/hermes_cli/test_worker_compute_configuration.py
+index ec6e8546e7..04117ec649 100644
+--- a/tests/hermes_cli/test_worker_compute_configuration.py
++++ b/tests/hermes_cli/test_worker_compute_configuration.py
+@@ -29,13 +29,12 @@ def test_invalid_cpuset_refuses(monkeypatch, tmp_path, raw):
+ 
+ @pytest.fixture
+ def configured(monkeypatch, tmp_path):
+-    import hermes_constants
+     import subprocess
+     from tools import process_registry
+     root = tmp_path / 'cgroups'
+     monkeypatch.setattr(capacity, 'CGROUP_ROOT', root)
+     monkeypatch.setattr(capacity, 'effective_cores', lambda: 16)
+-    monkeypatch.setattr(hermes_constants, 'get_default_hermes_root', lambda: tmp_path / 'home')
++    monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path / 'home')
+     monkeypatch.setattr(process_registry, 'systemd_user_bus_env', lambda: {'bus': 'fixture'})
+     base = root / 'user.slice' / f'user-{os.getuid()}.slice'
+     pool = base / f'user@{os.getuid()}.service/hermes.slice/hermes-kanban.slice'
+diff --git a/tests/hermes_cli/test_worker_resource_admission.py b/tests/hermes_cli/test_worker_resource_admission.py
+index c6945e26cc..e15bddab8d 100644
+--- a/tests/hermes_cli/test_worker_resource_admission.py
++++ b/tests/hermes_cli/test_worker_resource_admission.py
+@@ -11,6 +11,7 @@ from hermes_cli import worker_compute_capacity as capacity
+ @pytest.fixture
+ def worker_rig(monkeypatch, tmp_path):
+     rig = Rig(tmp_path, monkeypatch, cap=2)
++    monkeypatch.setattr(capacity, 'policy_root', lambda: rig.home)
+     monkeypatch.setattr(capacity, 'worker_enabled', lambda: True)
+     monkeypatch.setattr(capacity, 'effective_cores', lambda: 16)
+     monkeypatch.setattr('os.getloadavg', lambda: (1, 1, 1))
+@@ -67,6 +68,7 @@ def test_persistent_hysteresis_and_bad_state_refuse(worker_rig, monkeypatch):
+ @pytest.mark.parametrize('lane', ['ready', 'review'])
+ def test_parked_job_blocks_before_lease_then_releases(monkeypatch, tmp_path, lane):
+     rig = Rig(tmp_path, monkeypatch, cap=1)
++    monkeypatch.setattr(capacity, 'policy_root', lambda: rig.home)
+     try:
+         monkeypatch.setattr(capacity, 'worker_enabled', lambda: True)
+         monkeypatch.setattr(capacity, 'effective_cores', lambda: 16)
+@@ -109,9 +111,8 @@ def test_absent_pool_is_empty_only_with_readable_manager(tmp_path):
+ 
+ 
+ def test_malformed_root_config_refuses_without_raising(monkeypatch, tmp_path):
+-    import hermes_constants
+     from hermes_cli.worker_resource_admission import refusal
+-    monkeypatch.setattr(hermes_constants, 'get_default_hermes_root', lambda: tmp_path)
++    monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path)
+     for text in ['kanban: [broken', '- not-a-mapping', 'kanban: 7']:
+         (tmp_path / 'config.yaml').write_text(text)
+         assert refusal() == 'worker_resources_unknown'
+@@ -119,8 +120,7 @@ def test_malformed_root_config_refuses_without_raising(monkeypatch, tmp_path):
+ 
+ def test_worker_brake_is_not_bypassed_by_disabled_hub(monkeypatch, tmp_path):
+     from hermes_cli import machine_cpu_metrics as cpu
+-    import hermes_constants
+-    monkeypatch.setattr(hermes_constants, 'get_default_hermes_root', lambda: tmp_path)
++    monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path)
+     monkeypatch.setattr(cpu, 'root_limit', lambda: (cpu.OFF, None))
+     monkeypatch.setattr(capacity, 'worker_enabled', lambda: True)
+     monkeypatch.setattr(capacity, 'effective_cores', lambda: 16)
+diff --git a/tests/scripts/test_worker_policy_root.py b/tests/scripts/test_worker_policy_root.py
+new file mode 100644
+index 0000000000..8a65dcb6cc
+--- /dev/null
++++ b/tests/scripts/test_worker_policy_root.py
+@@ -0,0 +1,56 @@
++"""Real conftest sandbox entry must not switch off host CPU policy."""
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++from tools.environments.local import build_subprocess_env
++
++
++@pytest.mark.parametrize('enabled', [True, False])
++def test_conftest_sandbox_preserves_account_worker_policy(tmp_path, enabled):
++    account = tmp_path / 'account'
++    root = account / '.hermes'
++    root.mkdir(parents=True)
++    (root / 'config.yaml').write_text(
++        f'kanban:\n  worker_resources:\n    enabled: {str(enabled).lower()}\n')
++    code = r'''
++import os, pwd, sys
++from pathlib import Path
++from types import SimpleNamespace
++# Replace only OS-account discovery, not worker policy or the test-slot gate.
++real = pwd.getpwuid
++account, enabled = sys.argv[1], sys.argv[2] == 'True'
++pwd.getpwuid = lambda uid: SimpleNamespace(pw_dir=account)
++import hermes_constants
++from hermes_cli import worker_compute_capacity as capacity
++assert capacity.policy_root() == Path(account) / '.hermes'
++assert capacity.worker_enabled() is enabled
++capacity.effective_cores = lambda: 16
++from tests import conftest
++assert Path(os.environ['HERMES_HOME']) != capacity.policy_root()
++assert capacity.worker_enabled() is enabled
++from scripts import run_tests_host_slots as slots
++assert slots.xdist_worker_budget() == (1 if enabled else 64)
++# Forged inherited metadata must be rejected after conftest's sandbox redirect.
++os.environ[slots.HELD_ENV] = '1'
++os.environ['HERMES_TEST_SLOT_RECEIPT'] = '{}'
++import pytest
++config = SimpleNamespace(option=SimpleNamespace(tx=['popen'] * 16, numprocesses=16))
++try:
++    conftest._take_host_test_slot(config)
++except pytest.UsageError as error:
++    assert enabled and 'invalid inherited' in str(error), str(error)
++else:
++    assert not enabled
++print('policy survived conftest sandbox')
++'''
++    env = build_subprocess_env()
++    env.update(HOME=str(tmp_path / 'foreign-home'), HERMES_HOME=str(tmp_path / 'foreign-profile'),
++               HERMES_TEST_XDIST_MAX='64')
++    result = subprocess.run([sys.executable, '-c', code, str(account), str(enabled)],
++                            cwd=Path(__file__).resolve().parents[2], env=env,
++                            capture_output=True, text=True, encoding='utf-8', timeout=60, check=False)
++    assert result.returncode == 0, result.stdout + result.stderr
++    assert 'policy survived conftest sandbox' in result.stdout
+diff --git a/tests/scripts/test_worker_test_budget.py b/tests/scripts/test_worker_test_budget.py
+index 4793003679..e72a0dc491 100644
+--- a/tests/scripts/test_worker_test_budget.py
++++ b/tests/scripts/test_worker_test_budget.py
+@@ -36,10 +36,18 @@ def test_receipt_requires_live_exclusive_lock(monkeypatch, tmp_path):
+     monkeypatch.delenv(budget.RECEIPT_ENV, raising=False)
+     monkeypatch.delenv(slots.HELD_ENV, raising=False)
+     with slots.host_test_slot() as fd:
++        assert fd is not None
+         env = {}
+         budget.child_environment(env, fd)
+         monkeypatch.setenv(budget.RECEIPT_ENV, env[budget.RECEIPT_ENV])
+         assert not slots.host_slots_enabled()
++        # Same PID/fd/inode can be reacquired for another file attempt. A stray
++        # grandchild's old receipt must not borrow that later acquisition.
++        slots._write_holder(fd)
++        assert slots.host_slots_enabled(), 'receipt must bind acquisition nonce'
++        budget.child_environment(env, fd)
++        monkeypatch.setenv(budget.RECEIPT_ENV, env[budget.RECEIPT_ENV])
++        assert not slots.host_slots_enabled()
+         fcntl.flock(fd, fcntl.LOCK_UN)
+         assert slots.host_slots_enabled(), 'unlocked descriptor is not a receipt'
+         fcntl.flock(fd, fcntl.LOCK_SH)
+@@ -82,3 +90,38 @@ def test_worker_never_reclaims_held_inode(monkeypatch, tmp_path):
+         inode = (tmp_path / '0.lock').stat().st_ino
+         assert slots.reclaim_stale_slots(str(tmp_path), 1) == []
+         assert (tmp_path / '0.lock').stat().st_ino == inode
++
++
++def test_receipt_in_real_child_and_bad_identities(monkeypatch, tmp_path):
++    import subprocess
++    import sys
++    from pathlib import Path
++    from scripts import worker_test_budget as budget
++    from tools.environments.local import build_subprocess_env
++    monkeypatch.setattr(capacity, 'worker_enabled', lambda: True)
++    monkeypatch.setattr(slots, 'host_slot_dir', lambda: str(tmp_path))
++    monkeypatch.setattr(slots, 'host_slot_count', lambda: 1)
++    monkeypatch.delenv(slots.HELD_ENV, raising=False)
++    monkeypatch.delenv(budget.RECEIPT_ENV, raising=False)
++    code = '''
++import json, os, sys
++from scripts import run_tests_host_slots as slots, worker_test_budget as budget
++slots.host_slot_dir = lambda: sys.argv[1]
++slots.host_slot_count = lambda: 1
++assert budget.inherited_slot(), 'real ancestor lock must validate without inherited fd'
++original = os.environ[budget.RECEIPT_ENV]
++for field, value in [('pid', 1), ('birth', -1), ('fd', 999999), ('slot', 1), ('nonce', 'wrong')]:
++    rec = json.loads(original)
++    rec[field] = value
++    os.environ[budget.RECEIPT_ENV] = json.dumps(rec)
++    assert not budget.inherited_slot(), field
++print('child receipt verified')
++'''
++    with slots.host_test_slot() as fd:
++        env = build_subprocess_env()
++        budget.child_environment(env, fd)
++        result = subprocess.run([sys.executable, '-c', code, str(tmp_path)], env=env,
++                                cwd=Path(__file__).resolve().parents[2], capture_output=True,
++                                text=True, encoding='utf-8', timeout=30, check=False)
++    assert result.returncode == 0, result.stdout + result.stderr
++    assert 'child receipt verified' in result.stdout
+-- 
+2.51.0
+

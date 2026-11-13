@@ -1,0 +1,232 @@
+From a7e9d558ca5ea68d3b1ed6225a173723453d51e7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:23:00 +0000
+Subject: [PATCH] [daveey] plugin *_nowait probes never wait on a sweep another
+ thread holds
+
+A force reload (hermes-sync mods-reload) unloads first, so `_discovered` is
+False while the sweep thread holds `_discovery_lock`. `_nowait_plugin_set`
+then fell through to a blocking `discover_plugins()`, which parked the
+gateway event loop 36 s on laptop-1 (kanban_run -> build_kanban_policy ->
+_resolve_toolsets -> _get_platform_tools -> get_plugin_toolset_keys_nowait)
+and timed out Desktop's backend connects.
+
+The probe now tries the lock non-blocking. Free and discovered: live set,
+remembered per manager. Busy (another thread's sweep or a background scan):
+the last live set, else last launch's persisted set, else on the event loop
+an empty set (never block there). Blocking stays only for an idle,
+never-discovered manager, or off the loop when nothing is known. A retry
+after a failed sweep runs inline only off the loop.
+
+Every async caller (session_policy, toolset_validation, enabled_mcp_server_names,
+banner) goes through this one helper; hook_unused_nowait was already
+non-blocking.
+
+Task: t_01a1d38b9df85a72
+---
+ hermes_cli/plugins.py                         |  49 ++++++--
+ .../test_plugins_nowait_reload_nonblocking.py | 115 ++++++++++++++++++
+ 2 files changed, 155 insertions(+), 9 deletions(-)
+ create mode 100644 tests/hermes_cli/test_plugins_nowait_reload_nonblocking.py
+
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index 844cefcb7b..7a0a9d001a 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -280,6 +280,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
+         self.home_path = Path(self.scope_key)
+         self._discovery_lock = threading.RLock()
+         self._discovered: bool = False
++        self._nowait_last: dict[str, frozenset[str]] = {}  # [daveey] last live *_nowait answers (_nowait_plugin_set)
+         # [daveey] Inputs the last completed sweep read (``plugins_snapshot.fingerprint`` / ``precheck``,
+         # taken pre-sweep): ``refresh_if_inputs_changed`` compares against them at a session boundary.
+         self._swept_fingerprint: Optional[str] = None
+@@ -955,25 +956,55 @@ def _join_background_discovery(timeout: float = 30.0) -> bool:
+ 
+ def _nowait_plugin_set(cache_field: str, live: Callable[[PluginManager], set[str]]) -> set[str]:
+     """Shared body of the ``*_nowait`` probes: an active recorded snapshot (plugins_snapshot.serving),
+-    else live registry, else last launch's cache, else block."""
++    else live registry, else this process's last live answer or last launch's cache, else block.
++
++    [daveey] A sweep another thread holds (a force reload unloads first, so ``_discovered`` is False
++    meanwhile) is never waited on: that parked the gateway loop 36 s (kanban_run -> build_policy).
++    Blocking stays only for a process with no known set, off the event loop."""
+     snapshot = plugins_snapshot.active()
+     if snapshot is not None:
+         return set(snapshot.toolset_keys if cache_field == "toolset_keys" else snapshot.portable_mcp)
+     manager = get_plugin_manager()
+     t = _background_discovery_thread
+     in_flight = t is not None and t.is_alive()
+-    if manager._discovered and not in_flight:
+-        return live(manager)
+-    if in_flight:
+-        with suppress(Exception):
+-            blob = json.loads(plugins_snapshot._cache_path(get_hermes_home()).read_text(encoding="utf-8-sig"))
+-            values = blob.get(cache_field) if isinstance(blob, dict) else None
+-            if isinstance(values, list) and all(isinstance(v, str) for v in values):
+-                return set(values)
++    remembered = getattr(manager, "_nowait_last", None)
++    if not isinstance(remembered, dict):  # test doubles: remember nothing
++        remembered = {}
++    lock = getattr(manager, "_discovery_lock", None)
++    if not in_flight and (lock is None or lock.acquire(blocking=False)):
++        try:  # RLock: the sweep's own thread re-enters here and reads its partial registry, as before
++            if manager._discovered:
++                values = set(live(manager))
++                remembered[cache_field] = frozenset(values)
++                return values
++        finally:
++            if lock is not None:
++                lock.release()
++        if cache_field not in remembered or not _on_event_loop():
++            discover_plugins()  # idle and undiscovered: first sweep, or a retry after a failed one
++            return live(manager)
++    # A sweep is busy elsewhere (or a retry would run on the event loop): serve the last known set.
++    if cache_field in remembered:
++        return set(remembered[cache_field])
++    with suppress(Exception):
++        blob = json.loads(plugins_snapshot._cache_path(get_hermes_home()).read_text(encoding="utf-8-sig"))
++        values = blob.get(cache_field) if isinstance(blob, dict) else None
++        if isinstance(values, list) and all(isinstance(v, str) for v in values):
++            return set(values)
++    if _on_event_loop():
++        return set()  # nothing known yet; the next probe after the sweep reads the live set
+     discover_plugins()
+     return live(manager)
+ 
+ 
++def _on_event_loop() -> bool:
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return False
++    return True
++
++
+ def get_plugin_toolset_keys_nowait() -> set[str]:
+     """Plugin toolset keys without blocking on in-flight discovery: live registry when done, last
+     launch's persisted set while a background scan runs (callers only EXCLUDE these keys, so a stale
+diff --git a/tests/hermes_cli/test_plugins_nowait_reload_nonblocking.py b/tests/hermes_cli/test_plugins_nowait_reload_nonblocking.py
+new file mode 100644
+index 0000000000..62baac8451
+--- /dev/null
++++ b/tests/hermes_cli/test_plugins_nowait_reload_nonblocking.py
+@@ -0,0 +1,115 @@
++"""[daveey] The ``*_nowait`` plugin probes never wait on a sweep another thread holds.
++
++A force reload (hermes-sync's mods-reload) unloads first, so ``_discovered`` is False while the sweep
++thread holds ``_discovery_lock``. The probe used to fall through to a blocking ``discover_plugins()``,
++which parked the gateway event loop (``kanban_run -> build_policy -> get_plugin_toolset_keys_nowait``)
++for 36 s. It now serves the last live set instead (callers treat these keys as a hint; a stale set
++self-heals on the next probe after the sweep).
++"""
++from __future__ import annotations
++
++import asyncio
++import json
++import threading
++import time
++
++import pytest
++
++from hermes_cli import plugins as plugins_mod
++
++
++@pytest.fixture
++def manager(monkeypatch, tmp_path):
++    home = tmp_path / "home"
++    (home / "cache").mkdir(parents=True)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    mgr = plugins_mod.PluginManager()
++    monkeypatch.setattr(plugins_mod, "get_plugin_manager", lambda: mgr)
++    monkeypatch.setattr(plugins_mod, "_background_discovery_thread", None)
++    return mgr
++
++
++def _hold_lock(mgr):
++    """Hold ``mgr._discovery_lock`` on another thread (a force reload mid-sweep) until released."""
++    held, release = threading.Event(), threading.Event()
++
++    def _sweep():
++        with mgr._discovery_lock:
++            mgr._discovered = False  # unload() reset it; re-registration has not finished
++            held.set()
++            release.wait(10)
++
++    t = threading.Thread(target=_sweep, name="force-reload", daemon=True)
++    t.start()
++    assert held.wait(5)
++    return t, release
++
++
++async def _timed(fn):
++    start = time.monotonic()
++    value = fn()
++    return value, time.monotonic() - start
++
++
++def test_nowait_returns_last_live_set_while_reload_holds_lock(manager, monkeypatch):
++    manager._discovered = True
++    monkeypatch.setattr(plugins_mod, "get_plugin_toolsets", lambda: [("coach", "Coach", "")])
++    assert plugins_mod.get_plugin_toolset_keys_nowait() == {"coach"}  # live answer is remembered
++
++    t, release = _hold_lock(manager)
++    try:
++        keys, elapsed = asyncio.run(_timed(plugins_mod.get_plugin_toolset_keys_nowait))
++    finally:
++        release.set()
++        t.join(5)
++    assert elapsed < 0.5, f"nowait probe blocked {elapsed:.2f}s on _discovery_lock"
++    assert keys == {"coach"}
++
++
++def test_nowait_serves_persisted_set_when_never_answered_live(manager):
++    (plugins_mod.get_hermes_home() / "cache" / "plugin_toolset_keys.json").write_text(
++        json.dumps({"toolset_keys": ["a2a"], "portable_mcp": ["srv"]}))
++    t, release = _hold_lock(manager)
++    try:
++        keys, elapsed = asyncio.run(_timed(plugins_mod.get_plugin_toolset_keys_nowait))
++        mcp = plugins_mod.get_portable_mcp_server_names_nowait()
++    finally:
++        release.set()
++        t.join(5)
++    assert elapsed < 0.5
++    assert keys == {"a2a"} and mcp == {"srv"}
++
++
++def test_nowait_never_blocks_event_loop_without_any_known_set(manager):
++    t, release = _hold_lock(manager)
++    try:
++        keys, elapsed = asyncio.run(_timed(plugins_mod.get_plugin_toolset_keys_nowait))
++    finally:
++        release.set()
++        t.join(5)
++    assert elapsed < 0.5
++    assert keys == set()
++
++
++def test_nowait_blocks_off_loop_for_never_discovered_process(manager, monkeypatch):
++    """Off the event loop, a process with no known set still waits for the sweep (old contract)."""
++    calls = []
++    monkeypatch.setattr(plugins_mod, "discover_plugins", lambda force=False: calls.append(force))
++    monkeypatch.setattr(plugins_mod, "get_plugin_toolsets", lambda: [("x", "X", "")])
++    assert plugins_mod.get_plugin_toolset_keys_nowait() == {"x"}
++    assert calls == [False]
++
++
++def test_nowait_on_loop_skips_retry_after_failed_sweep(manager, monkeypatch):
++    """A force reload that failed resets ``_discovered``; the loop serves the last live set instead of
++    re-running the sweep inline (off the loop the retry still runs, as before)."""
++    manager._discovered = True
++    monkeypatch.setattr(plugins_mod, "get_plugin_toolsets", lambda: [("coach", "Coach", "")])
++    assert plugins_mod.get_plugin_toolset_keys_nowait() == {"coach"}
++    manager._discovered = False
++    calls = []
++    monkeypatch.setattr(plugins_mod, "discover_plugins", lambda force=False: calls.append(force))
++    keys, _ = asyncio.run(_timed(plugins_mod.get_plugin_toolset_keys_nowait))
++    assert keys == {"coach"} and calls == []
++    plugins_mod.get_plugin_toolset_keys_nowait()
++    assert calls == [False]
+-- 
+2.51.0
+

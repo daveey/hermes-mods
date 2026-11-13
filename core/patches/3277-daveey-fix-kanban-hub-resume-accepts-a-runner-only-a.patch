@@ -1,0 +1,225 @@
+From b8b3d536eaa08748adc4970725d665119b6f7b9c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:27:06 +0000
+Subject: [PATCH] [daveey] fix(kanban): hub resume accepts a runner-only
+ active_pr hold after any latest transition
+
+Problem: `hermes kanban resume` on the hub (core 3f3789037c5) refused t_01a1d120e7d7c686 with
+"resume requires an active_pr hold (guard: none)" while pool workers 1-6 logged
+`Held cards: t_01a1d120e7d7c686=active_pr`. Operators fell back to `schedule --clock-only` + `unblock`
+(again for t_01a1d09d3547337b, 2026-11-13 02:42Z).
+
+Why 1: resume trusted only the hub's own check_respawn_guard, which returned None; the hold existed
+  only in the runners' evaluation (their respawn_guarded events replicate to the hub: hub kanban.db
+  rows 1160747, 1161849, 1164966).
+Why 2: 7cc74b2d05 added observed(): a replicated respawn_guarded active_pr after the latest lifecycle
+  transition counts - but only when that transition is one of promoted/promoted_manual/unblocked/
+  reopened/reclaimed/created.
+Why 3: a card becomes ready again through many other paths whose latest transition is not in that
+  list: the same-profile reassign tried in this incident (`assigned` 21:50:29, runners re-held at
+  21:50:32 = row 1164966), a woken continuation (`continued` + continuation_woken), a woken park
+  (`scheduled` + condition_met), a released claim (`claimed` + released), changes_requested, a
+  triage sweep after `blocked`, and a resume the runners did not honour (`operator_resumed`).
+  After any of them resume refused although the runners held the card.
+Root (happened): the episode rule tried to name "ready transitions" instead of asking whether the
+  observation itself (a dispatcher writes respawn_guarded only for a card in its ready/review lane,
+  and re-writes it after every other event: guard_hold_reason) follows the latest transition.
+Root (not caught): tests built only promoted -> respawn_guarded; no test replayed real Board
+  histories or the reassign workaround shape.
+Recurrence: second fix on this path (7cc74b2d05 covered the promoted shape only).
+
+Fix: the episode starts at the latest transition of any kind; an active_pr observation after it
+proves a current hold. Observations before any later transition still don't count, the local
+guard's other reasons still win, the Board-replica read stays bound to the home boundary UID, and
+resume() still requires an unclaimed READY card on its home gateway (review cards refused there).
+
+Proof:
+- New tests fail on origin/main c559287b51 with "guard: none" (7 parametrized observed cases + the
+  real-gateway reassign test) and pass after; 120 tests across operator_resume*, observed_pr_hold
+  boundaries and review_release* pass.
+- test_home_resume_accepts_a_worker_hold_recorded_after_a_reassign: real hub + worker stores and
+  Board feed; hub same-profile reassign, worker re-holds, hub guard None, hub resume, worker claims.
+- Boundary test "parked" now parks AFTER the hold (old version asserted a hold seen after a park is
+  stale, which the replay contradicts); new test covers a hold seen after each kind.
+- Replay (Board replica default/hermes/bb/askeve + worker-1 kanban.db, mode=ro): every active_pr
+  respawn_guarded event classified by its latest transition. Newly accepted points: continued 6216
+  events/26 cards, changes_requested 2053/1, assigned 757/7 (incl. t_01a1d120e7d7c686), scheduled
+  133/11, claimed(+released) 92/21, operator_resumed 10/1, dependency_wait 2/1, blocked(+triage
+  sweep) 2/2. Samples read: each was a ready card still held, except dependency_wait (a runner copy
+  that had not yet seen the demotion; card was todo, so resume's READY check refuses it). Current
+  card states: 0 cards change verdict today.
+---
+ hermes_cli/kanban_observed_pr_hold.py         | 16 ++++++--
+ ...test_kanban_observed_pr_hold_boundaries.py | 17 +++++++-
+ .../test_kanban_operator_resume_observed.py   | 40 +++++++++++++++++++
+ ...test_kanban_operator_resume_worker_copy.py | 29 ++++++++++++++
+ 4 files changed, 96 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_observed_pr_hold.py b/hermes_cli/kanban_observed_pr_hold.py
+index e86ad1d880..7cc28dfb76 100644
+--- a/hermes_cli/kanban_observed_pr_hold.py
++++ b/hermes_cli/kanban_observed_pr_hold.py
+@@ -1,4 +1,13 @@
+-"""Current-episode dispatcher observations for operator-only resume."""
++"""Current-episode dispatcher observations for operator-only resume.
++
++The episode starts at the card's latest lifecycle transition, of any kind. A dispatcher
++records ``respawn_guarded`` only for a card it finds in its ready (or review) lane, and
++records it again after every other event (``guard_hold_reason``). So an ``active_pr``
++observation after that transition shows the card is held now, also when it became
++ready again through an event that is no transition itself (a woken continuation or
++park, a released claim, a triage sweep) or through a same-profile reassign. The caller
++still requires an unclaimed READY card before it writes, which refuses review cards.
++"""
+ from __future__ import annotations
+ 
+ 
+@@ -10,7 +19,6 @@ _BOUNDARIES = frozenset({
+     "crashed", "timed_out", "completed", "archived", "assigned", "review_requested",
+     "review_reopened", "changes_requested", "operator_resumed",
+ })
+-_READY = frozenset({"promoted", "promoted_manual", "unblocked", "reopened", "reclaimed", "created"})
+ 
+ 
+ def _episode(conn, task_id):
+@@ -22,7 +30,7 @@ def _episode(conn, task_id):
+         return None, False
+     ordered = sorted(timed, key=lambda pair: (pair[0], pair[1]["id"]))
+     boundary = next((e for _, e in reversed(ordered) if e["kind"] in _BOUNDARIES), None)
+-    if boundary is None or boundary["kind"] not in _READY:
++    if boundary is None:
+         return None, False
+     point = (kb._to_epoch(boundary["created_at"]), boundary["id"])
+     held = any((at, e["id"]) > point and e["kind"] == "respawn_guarded"
+@@ -31,7 +39,7 @@ def _episode(conn, task_id):
+ 
+ 
+ def observed(conn, task_id):
+-    """Local or fresh Board evidence, bound to the home ready episode's UID."""
++    """Local or fresh Board evidence, bound to the home episode's UID."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_dependency_history import _with_fresh_replica
+ 
+diff --git a/tests/hermes_cli/test_kanban_observed_pr_hold_boundaries.py b/tests/hermes_cli/test_kanban_observed_pr_hold_boundaries.py
+index fa68a4bf34..a4637e2538 100644
+--- a/tests/hermes_cli/test_kanban_observed_pr_hold_boundaries.py
++++ b/tests/hermes_cli/test_kanban_observed_pr_hold_boundaries.py
+@@ -57,9 +57,22 @@ def test_local_observation_requires_ready_boundary(stores, monkeypatch, case):
+         "diagnostic": "UPDATE task_events SET kind='commented' WHERE id=2",
+         "wrong_reason": "UPDATE task_events SET payload='{\"reason\":\"other\"}' WHERE id=2",
+         "before_boundary": "UPDATE task_events SET created_at='2025-01-01T00:00:00Z' WHERE id=2",
+-        # The latest lifecycle boundary is a park, not a ready transition.
+-        "parked": "INSERT INTO task_events VALUES (3,'task','blocked','2026-01-01T00:00:00Z','{}','park')",
++        # The card was parked after the hold was seen: the observation is from an older episode.
++        "parked": "INSERT INTO task_events VALUES (3,'task','blocked','2026-01-01T00:00:02Z','{}','park')",
+     }
+     home.execute(mutations[case])
+     monkeypatch.setattr(history, "_with_fresh_replica", lambda *args: False)
+     assert not observed.observed(home, "task")
++
++
++@pytest.mark.parametrize("kind", ["blocked", "scheduled", "continued", "assigned", "claimed", "operator_resumed"])
++def test_a_hold_seen_after_any_latest_transition_counts(stores, monkeypatch, kind):
++    # A dispatcher records respawn_guarded only on a card it finds ready, so a hold after a park, a
++    # continuation, a reassign or a released claim shows the card left it through a non-transition event
++    # (a wake, a triage sweep, a release). resume() itself still requires an unclaimed READY card.
++    home, _ = stores
++    home.execute(f"INSERT INTO task_events VALUES (2,'task','{kind}','2026-01-01T00:00:01Z','{{}}','t')")
++    home.execute("INSERT INTO task_events VALUES (3,'task','respawn_guarded',"
++                 "'2026-01-01T00:00:02Z','{\"reason\":\"active_pr\"}','hold')")
++    monkeypatch.setattr(history, "_with_fresh_replica", lambda *args: False)
++    assert observed.observed(home, "task")
+diff --git a/tests/hermes_cli/test_kanban_operator_resume_observed.py b/tests/hermes_cli/test_kanban_operator_resume_observed.py
+index 7a4f041207..82e58f3b83 100644
+--- a/tests/hermes_cli/test_kanban_operator_resume_observed.py
++++ b/tests/hermes_cli/test_kanban_operator_resume_observed.py
+@@ -26,6 +26,46 @@ def test_current_observed_hold_allows_home_resume(kanban_home, clock, monkeypatc
+         assert not resume.resumed_after(conn, task, helpers.T0)
+ 
+ 
++# 2026-11-12 t_01a1d120e7d7c686: pool workers held the card ``active_pr``; the hub's own guard said none. A
++# same-profile reassign wrote ``assigned`` and the workers re-held it 3 s later, yet hub ``resume`` still
++# refused, because only promoted/unblocked/... started an episode. Replayed Board history shows the same
++# for every way a card becomes ready again without such an event: a continuation that woke, a reviewer's
++# changes_requested, a released claim, a woken park, an earlier resume the runners never honoured.
++@pytest.mark.parametrize("boundary", [
++    "assigned", "continued", "changes_requested", "claimed", "scheduled", "operator_resumed", "blocked",
++])
++def test_observation_after_any_latest_transition_allows_home_resume(kanban_home, clock, monkeypatch, boundary):
++    with kbc.connect_closing() as conn:
++        task = helpers._held(conn)
++        clock[0] += 10
++        with kb.write_txn(conn):
++            kb._append_event(conn, task, "promoted")
++            kb._append_event(conn, task, "respawn_guarded", {"reason": "active_pr"})
++        clock[0] += 10
++        with kb.write_txn(conn):
++            kb._append_event(conn, task, boundary)
++            kb._append_event(conn, task, "respawn_guarded", {"reason": "active_pr"})
++        monkeypatch.setattr(dispatch, "check_respawn_guard", lambda *_: None)
++        receipt = resume.resume(conn, task, reason="runner-only hold", actor="operator")
++        assert receipt["scope"] == "one_continuation"
++        assert resume.resumed_after(conn, task, helpers.T0)
++
++
++@pytest.mark.parametrize("boundary", ["assigned", "continued", "changes_requested", "claimed"])
++def test_any_later_transition_invalidates_an_earlier_observation(kanban_home, clock, monkeypatch, boundary):
++    # The other half of the rule: a hold seen before the latest transition says nothing about now.
++    with kbc.connect_closing() as conn:
++        task = helpers._held(conn)
++        clock[0] += 10
++        with kb.write_txn(conn):
++            kb._append_event(conn, task, "promoted")
++            kb._append_event(conn, task, "respawn_guarded", {"reason": "active_pr"})
++            kb._append_event(conn, task, boundary)
++        monkeypatch.setattr(dispatch, "check_respawn_guard", lambda *_: None)
++        with pytest.raises(resume.ResumeRefused, match="guard: none"):
++            resume.resume(conn, task, reason="stale hold", actor="operator")
++
++
+ @pytest.mark.parametrize("mode", ["absent", "old", "other", "claimed"])
+ def test_observation_must_be_in_current_ready_episode(kanban_home, clock, monkeypatch, mode):
+     with kbc.connect_closing() as conn:
+diff --git a/tests/hermes_cli/test_kanban_operator_resume_worker_copy.py b/tests/hermes_cli/test_kanban_operator_resume_worker_copy.py
+index 17caf657a4..0400b64952 100644
+--- a/tests/hermes_cli/test_kanban_operator_resume_worker_copy.py
++++ b/tests/hermes_cli/test_kanban_operator_resume_worker_copy.py
+@@ -133,6 +133,35 @@ def test_home_resume_accepts_worker_only_observation(gws, clock, monkeypatch):
+     assert _status(worker.conn, tid) == "running"
+ 
+ 
++def test_home_resume_accepts_a_worker_hold_recorded_after_a_reassign(gws, clock, monkeypatch):
++    """t_01a1d120e7d7c686, 2026-11-12: a same-profile reassign on the hub, the workers re-held the card 3 s later,
++    and hub ``resume`` refused with "guard: none". The hub's DB holds only the replicated worker events."""
++    hub, worker = gws
++    tid = _held_on_worker(gws, clock)
++    hub.enter()
++    clock[0] += 30
++    assert kb.assign_task(hub.conn, tid, "default")
++    hub.round()
++    worker.round()
++    clock[0] += 3
++    worker.tick()  # the worker's own guard holds the copy again, after the reassign
++    assert _status(worker.conn, tid) == "ready"
++    worker.round()
++    hub.round()
++    hub.enter()
++    held_after = [e for e in kb.list_events(hub.conn, tid) if e.kind in ("assigned", "respawn_guarded")]
++    assert [e.kind for e in held_after][-2:] == ["assigned", "respawn_guarded"]  # replicated, not hub-written
++    clock[0] += 30
++    with monkeypatch.context() as patch:
++        patch.setattr(kbd, "check_respawn_guard", lambda *_: None)
++        resume.resume(hub.conn, tid, reason="runner-only hold after reassign", actor="operator")
++    hub.round()
++    worker.round()
++    clock[0] += 5
++    worker.tick()
++    assert _status(worker.conn, tid) == "running"
++
++
+ def test_without_a_resume_the_kept_copy_stays_held(gws, clock):
+     hub, worker = gws
+     tid = _held_on_worker(gws, clock)
+-- 
+2.51.0
+

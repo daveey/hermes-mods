@@ -1,0 +1,211 @@
+From c612925175232228b89f645f31a89307d0eb58f0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 01:47:43 +0000
+Subject: [PATCH] fix(kanban): chat-wait notices name pool workers that could
+ run the card [daveey]
+
+Defect kanban-e7a33105a4: a chat told David its cards "start as hub worker
+slots free up" while worker-1 could run them. kanban_queue_position.position()
+computes pool_could_run and local_words() (kanban_show) prints the re-place
+command, but kanban_parent_unclaimed._queue_words - used by both chat-wait
+notice_texts and ready_hint - had no branch for it, so the chat-facing notices
+read like a local-slot-only wait.
+
+Extract the sentence into kanban_queue_position.pool_words() and append it in
+_queue_words when pool_could_run is set (local lane), so the chat notice leads
+its advice with `hermes kanban move <id> --runs-on machine:<w>`. Text without
+pool_could_run is unchanged.
+
+Tests: tests/hermes_cli/test_kanban_wait_notice_pool_hint.py (4 RED on main,
+GREEN after); 26 consumer files, 607 tests green; scripts/check ok.
+---
+ hermes_cli/kanban_parent_unclaimed.py         |   3 +
+ hermes_cli/kanban_queue_position.py           |  21 ++-
+ .../test_kanban_wait_notice_pool_hint.py      | 123 ++++++++++++++++++
+ 3 files changed, 140 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_wait_notice_pool_hint.py
+
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index ff3ec5e119..37614f6544 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -68,6 +68,9 @@ def _queue_words(place: dict[str, Any]) -> str:
+         words += f", running count unknown (cap {place['limit']})"
+     if place.get("skip"):  # the recorded reason comes first: a bare queue place read as an ordering wait [daveey]
+         words = f"{skips.words(place['skip'])}; {words}"
++    if place.get("pool_could_run"):  # a pool worker could start it now; dropped here before (kanban-e7a33105a4)
++        from hermes_cli.kanban_queue_position import pool_words
++        words = f"{words}. {pool_words(place)}"
+     return words
+ 
+ 
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index 882167b2a7..e737da4527 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -351,19 +351,26 @@ def local_words(place: dict[str, Any]) -> str:
+         words += f", {place['running']}/{place['limit']} running"
+     elif place.get("limit") is not None and "running" in place:
+         words += f", running count unknown (cap {place['limit']})"
+-    pool = place.get("pool_could_run")
+-    if pool:
+-        from hermes_cli.kanban_placement_coordination import REASON
+-        return (words + f". Home-only by a stale creation verdict ({REASON}): pool worker(s) "
+-                f"{', '.join(pool)} now carry its access labels and have free slots. Re-place it "
+-                f"(`hermes kanban move {place.get('task_id') or '<id>'} --runs-on machine:{pool[0]} --reason \"pool attests its labels\"`) "
+-                "instead of waiting for a local slot; do not run its work outside the dispatcher")
++    if place.get("pool_could_run"):
++        return words + ". " + pool_words(place)
+     if not skip:
+         return words + ". " + _NOT_STUCK
+     words = f"last dispatcher skip of this ready episode: {skips.words(skip)} ({words})"
+     return words + ". " + (_NOT_STUCK if skips.is_ordering(skip) else skips.advice(skip))
+ 
+ 
++def pool_words(place: dict[str, Any]) -> str:
++    """The re-place sentence for a local-lane card that ``pool_could_run`` workers could start now. Shared by
++    :func:`local_words` and the chat-wait notices (``kanban_parent_unclaimed._queue_words``), which dropped it: a chat
++    told David to wait for hub slots while worker-1 could run the card (kanban-e7a33105a4). [daveey]"""
++    from hermes_cli.kanban_placement_coordination import REASON
++    pool = place.get("pool_could_run") or []
++    return (f"Home-only by a stale creation verdict ({REASON}): pool worker(s) {', '.join(pool)} now carry its "
++            "access labels and have free slots. Re-place it (`hermes kanban move "
++            f"{place.get('task_id') or '<id>'} --runs-on machine:{pool[0]} --reason \"pool attests its labels\"`) "
++            "instead of waiting for a local slot; do not run its work outside the dispatcher")
++
++
+ def read(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Optional[dict[str, Any]]:
+     """:func:`position` for card reads (``kanban_show``, ``hermes kanban show``): advisory, never fails the read."""
+     try:
+diff --git a/tests/hermes_cli/test_kanban_wait_notice_pool_hint.py b/tests/hermes_cli/test_kanban_wait_notice_pool_hint.py
+new file mode 100644
+index 0000000000..7197362d1f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wait_notice_pool_hint.py
+@@ -0,0 +1,123 @@
++"""Chat-wait notices name the pool workers that could run a home-waiting card. [daveey]
++
++Defect kanban-e7a33105a4 (hermes-hub, 2026-11-10 23:53Z): a chat told David its build cards "start as hub worker
++slots free up" while worker-1 could run them. The only queue facts it saw were the chat-wait notice ("16 card(s)
++ahead of it, 7/7 worker slots busy"): ``kanban_queue_position.position`` had computed ``pool_could_run`` and
++``local_words`` (kanban_show) printed the re-place command, but ``kanban_parent_unclaimed._queue_words``, which
++both chat notices and ``ready_hint`` use, dropped it.
++"""
++from __future__ import annotations
++
++import json
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_chat_wait as cw
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_notify as kn
++from hermes_cli import kanban_parent_unclaimed as pu
++from hermes_cli import kanban_queue_position as kqp
++
++_ENV = ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID",
++        "HERMES_KANBAN_CLAIM_LOCK", "HERMES_KANBAN_HOME", "HERMES_DELEGATED_CHILD_CONTEXT",
++        "HERMES_KANBAN_WORKER_TASK")
++_PLACE = {"lane": "local", "ahead": 16, "running": 7, "limit": 7, "approximate": True, "board": "default"}
++
++
++@pytest.fixture
++def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
++    h = tmp_path / ".hermes"
++    h.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(h))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    for key in _ENV:
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: 7)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    return h
++
++
++@pytest.fixture
++def pool(monkeypatch: pytest.MonkeyPatch):
++    """worker-2 carries the card's labels and has a free slot."""
++    monkeypatch.setattr(kqp, "_pool_could_run", lambda conn, task_id: ["worker-2"])
++
++
++def _waiting_card(conn, *, age_s: int = 40 * 60) -> str:
++    now = int(time.time())
++    tid = kb.create_task(conn, title="waiting", assignee="default")
++    kn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="origin-chat", delivery_metadata={"reason": "create"})
++    conn.execute("UPDATE tasks SET created_at=? WHERE id=?", (now - age_s, tid))
++    conn.execute("UPDATE task_events SET created_at=? WHERE task_id=?", (now - age_s, tid))
++    conn.commit()
++    return tid
++
++
++def _notice(conn, tid: str, kind: str) -> dict:
++    (payload,) = [json.loads(p) for (p,) in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind=?", (tid, kind))]
++    return payload
++
++
++def _assert_pool_hint(text: str, tid: str) -> None:
++    assert "worker-2" in text
++    assert f"hermes kanban move {tid} --runs-on machine:worker-2" in text
++
++
++def test_queue_words_carry_the_pool_hint_from_the_shared_helper():
++    place = {**_PLACE, "pool_could_run": ["worker-2", "worker-1"], "task_id": "t_x"}
++    words = pu._queue_words(place)
++    assert words.startswith("16 card(s) ahead of it, 7/7 worker slots busy. ")
++    assert words.endswith(kqp.pool_words(place))
++    assert kqp.pool_words(place) in kqp.local_words(place)  # one wording for kanban_show and the chat notices
++    _assert_pool_hint(words, "t_x")
++    assert "worker-2, worker-1" in words
++
++
++def test_queue_words_without_pool_are_unchanged():
++    assert pu._queue_words(dict(_PLACE)) == "16 card(s) ahead of it, 7/7 worker slots busy"
++    assert pu._queue_words({**_PLACE, "pool_could_run": []}) == "16 card(s) ahead of it, 7/7 worker slots busy"
++
++
++def test_direct_chat_wait_notice_names_the_pool_worker(home, pool):
++    with kbc.connect_closing() as conn:
++        tid = _waiting_card(conn)
++        assert cw.sweep(conn) == 1
++        payload = _notice(conn, tid, cw.NOTICE_KIND)
++    _assert_pool_hint(cw.notice_text(payload), tid)
++
++
++def test_parent_unclaimed_notice_names_the_pool_worker(home, pool):
++    with kbc.connect_closing() as conn:
++        parent = _waiting_card(conn)
++        child = kb.create_task(conn, title="child", assignee="default", parents=[parent])
++        kn.add_notify_sub(conn, task_id=child, platform="tui", chat_id="origin-chat",
++                          delivery_metadata={"reason": "create"})
++        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'dependency_wait', "
++                     "'{}', ?)", (child, int(time.time()) - 40 * 60))
++        conn.commit()
++        assert pu.sweep(conn) == 1
++        payload = _notice(conn, child, pu.NOTICE_KIND)
++    _assert_pool_hint(pu.notice_text(payload), parent)
++
++
++def test_ready_hint_names_the_pool_worker(home, pool):
++    with kbc.connect_closing() as conn:
++        tid = _waiting_card(conn)
++        hint = pu.ready_hint(conn, kb.get_task(conn, tid))
++    assert hint is not None
++    _assert_pool_hint(hint, tid)
++
++
++def test_notices_without_pool_name_no_worker(home):
++    with kbc.connect_closing() as conn:
++        tid = _waiting_card(conn)
++        assert cw.sweep(conn) == 1
++        text = cw.notice_text(_notice(conn, tid, cw.NOTICE_KIND))
++    assert "--runs-on machine:" not in text and "pool worker(s)" not in text
+-- 
+2.51.0
+

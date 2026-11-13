@@ -1,0 +1,707 @@
+From 0105819b21738dbe96beea7c87a3e9a316abda20 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:59:09 +0000
+Subject: [PATCH] [daveey] kanban active_pr: awaited-review head re-read before
+ release, one gh read, one parked-run definition, strict wait-check parse
+
+Follow-up to the 4 non-blocking nits of PR #1995 (review 5888333701, card t_01a1d417c6c8fd9c).
+
+1. pr_head TTL: a cached head may only REFUSE an awaited-review release. A match is
+   confirmed by a head read at most RELEASE_HEAD_MAX_AGE_SECONDS (5 s) old, so a
+   force-push after the approval can no longer match the approved sha from a read up to
+   OPEN_TTL_SECONDS (300 s) old. A failed re-read is unknown (hold). Mismatches still
+   come from the cache (no gh call per held tick).
+2. One gh read: _gh_pr_state now asks for state,comments,headRefOid and records the OPEN
+   head in kanban_db_dispatch_pr_state._heads; pr_head reads that entry and refreshes it
+   through the same read (which also refreshes pr_state's cache). The separate
+   `gh pr view --json state,headRefOid` in kanban_awaited_review is gone.
+3. kanban_pr_same_run_park.latest_parked_run is the single "parked run" definition
+   (latest executed run, the assignee's, outcome scheduled/continued, ended_at set);
+   reported_then_parked and kanban_awaited_review._park both use it, and the tie park
+   event must be the kind the run's outcome names. A run that wrote its park event and
+   then crashed/was reclaimed/timed out (or never ended) no longer releases the tie.
+4. _WAIT_CHECK now matches only the whole card-wait idiom with wait-check's own flags
+   (--gateway/--board/--until/--from). `... t_x && false`, `| grep`, and a second line
+   previously named t_x; now they name nothing (fail closed). Wrapped probes (bash -lc,
+   timeout, paths, env) and gateway/request awaiting refs are pinned as naming nothing;
+   a real park's recorded `awaiting` kind card (inferred from a live card named in the
+   probe) still names it, which a test pins.
+
+Proof:
+- RED on origin/main base (src reverted, tests kept): 17 of 38 new tests fail, covering
+  every point (force-push, shared read x2, outcome/ended_at ties x10 + helper, && / | / \n
+  probes x3). GREEN: 41/41 in test_kanban_active_pr_awaited_head.py.
+- Mutation: 13/13 mutants killed (cached release, no cached refusal, stale head kept on
+  refresh, max_age ignored, non-OPEN head recorded, failure not cached, pr_head without
+  store, outcome/ended_at/assignee/kind dropped from the parked run, regex tail opened,
+  flags dropped).
+- Replay over the hub's real rows (hub-read, read-only; kanban + kanban-hermes): 1 of 1982
+  park probes changes (t_01a183029f279d66 `wait-check task A && wait-check task B`; its
+  recorded awaiting still names A, so no release changes); 0 of 98 latest runs carrying a
+  park event change their parked-run verdict.
+- 264 kanban test files importing the changed modules: 4778 passed, 0 failed.
+---
+ hermes_cli/kanban_awaited_review.py           |  85 ++----
+ hermes_cli/kanban_db_dispatch_pr_state.py     |  57 +++-
+ hermes_cli/kanban_pr_same_run_park.py         |  40 ++-
+ .../test_kanban_active_pr_awaited_head.py     | 258 ++++++++++++++++++
+ .../test_kanban_active_pr_awaited_review.py   |   7 +-
+ .../hermes_cli/test_kanban_park_invariants.py |   2 +-
+ 6 files changed, 368 insertions(+), 81 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_active_pr_awaited_head.py
+
+diff --git a/hermes_cli/kanban_awaited_review.py b/hermes_cli/kanban_awaited_review.py
+index 634e17e460..30cf2cca79 100644
+--- a/hermes_cli/kanban_awaited_review.py
++++ b/hermes_cli/kanban_awaited_review.py
+@@ -9,76 +9,51 @@ t_01a1d30035fa4777: review t_01a1d3093ee49e78 approved PR #1862 at its head; hel
+ 
+ One continuation is permitted only when all of these hold:
+ 
+-* the card's latest run that executed (no later claim) is the assignee's orderly
+-  ``scheduled``/``continued`` park, and that park names the awaited card(s);
++* the card's :func:`kanban_pr_same_run_park.latest_parked_run` (its latest executed run,
++  ended as the assignee's orderly ``scheduled``/``continued`` park) names the awaited card(s);
+ * each awaited card is done with a claimed completion that ended at or after the park;
+ * none requested changes; together they approve every holding PR by name
+-  (``pr``/``reviewed_pr``) at a full ``reviewed_sha`` equal to that PR's current GitHub head.
++  (``pr``/``reviewed_pr``) at a full ``reviewed_sha`` equal to that PR's current GitHub head,
++  read by ``pr_state``'s own ``gh pr view`` and re-read before it releases (a cached head
++  only refuses).
+ 
+ A request-changes verdict, an approval of another head or PR, an unknown head (gh failure),
+ or a crash/reclaim after the park keeps the hold. It never authorizes a merge.
+ """
+ from __future__ import annotations
+ 
+-import json
+-import logging
+ import re
+ import sqlite3
+-import subprocess
+-import time
+ from typing import Iterable, Optional
+ 
+-logger = logging.getLogger(__name__)
+-
+-_WAIT_CHECK = re.compile(r"\s*hermes\s+kanban\s+wait-check\s+task\s+(t_[0-9A-Za-z_]+)(?:\s|$)")
++# The whole probe must be the card-wait idiom ``kanban_awaiting.card_probe`` writes, with only
++# wait-check's own flags. A wrapper (``bash -lc``, ``timeout``, a path, env) or a shell operator
++# (``&& false``, ``| grep``, a second line) changes what the probe means, so it names no
++# awaited card here (fail closed); the park's recorded ``awaiting`` still can. [daveey]
++_WAIT_CHECK = re.compile(r"\s*hermes\s+kanban\s+wait-check\s+task\s+(t_[0-9A-Za-z_]+)"
++                         r"(?:\s+--(?:gateway|board|until|from)(?:=|\s+)[A-Za-z0-9_.,:@-]+)*\s*\Z")
+ _TASK_ID = re.compile(r"t_[0-9A-Za-z_]+\Z")
+-_PARKED = {"scheduled": "scheduled", "continued": "continued"}  # run outcome -> park event kind
+-
+-# url -> (head or None, monotonic expiry)
+-_heads: dict[str, tuple[Optional[str], float]] = {}
+-
++# A head read older than this never releases a hold: re-read it (one ``gh`` call per release).
++RELEASE_HEAD_MAX_AGE_SECONDS = 5
+ 
+-def _gh_pr_head(url: str) -> Optional[str]:
+-    from hermes_cli.kanban_db_dispatch_pr_state import GH_TIMEOUT_SECONDS, _gh_argv
+ 
+-    gh = _gh_argv() or ["gh"]
+-    try:
+-        proc = subprocess.run([*gh, "pr", "view", url, "--json", "state,headRefOid"], stdin=subprocess.DEVNULL,
+-                              capture_output=True, text=True, encoding="utf-8", errors="replace",
+-                              timeout=GH_TIMEOUT_SECONDS, check=False)
+-    except (OSError, subprocess.SubprocessError):
+-        logger.debug("kanban: gh pr view %s (head) failed", url, exc_info=True)
+-        return None
+-    if proc.returncode != 0:
+-        return None
+-    try:
+-        data = json.loads(proc.stdout or "{}")
+-    except ValueError:
+-        return None
+-    if not isinstance(data, dict):
+-        return None
+-    oid = data.get("headRefOid")
+-    if data.get("state") != "OPEN" or not isinstance(oid, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", oid):
+-        return None
+-    return oid.lower()
++def pr_head(url: str, *, max_age: Optional[float] = None) -> Optional[str]:
++    """Full head sha of an OPEN PR from :func:`pr_state`'s own read and cache entry; None when unknown."""
++    from hermes_cli.kanban_db_dispatch_pr_state import pr_head as shared_pr_head
+ 
++    return shared_pr_head(url, max_age=max_age)
+ 
+-def pr_head(url: str) -> Optional[str]:
+-    """Full head sha of an OPEN PR, cached like :func:`pr_state`; None when unknown."""
+-    from hermes_cli.kanban_db_dispatch_pr_state import ERROR_TTL_SECONDS, OPEN_TTL_SECONDS
+-    from hermes_cli.kanban_db_dispatch_pr_policy import norm_pr
+ 
+-    key = norm_pr(url)
+-    now = time.monotonic()
+-    hit = _heads.get(key)
+-    if hit is not None and now < hit[1]:
+-        return hit[0]
+-    head = _gh_pr_head(url)
+-    _heads[key] = (head, now + (OPEN_TTL_SECONDS if head else ERROR_TTL_SECONDS))
+-    return head
++def _at_head(url: str, sha: str) -> bool:
++    """True when ``sha`` is the PR's head now. A cached head may refuse, never release: a
++    force-push after the approval could still match the approved sha in a head read up to
++    OPEN_TTL_SECONDS old, so a match is confirmed by a read at most seconds old."""
++    return pr_head(url) == sha and pr_head(url, max_age=RELEASE_HEAD_MAX_AGE_SECONDS) == sha
+ 
+ 
+ def clear_cache() -> None:
++    from hermes_cli.kanban_db_dispatch_pr_state import _heads
++
+     _heads.clear()
+ 
+ 
+@@ -101,16 +76,14 @@ def awaited_cards(payload: dict) -> list[str]:
+ def _park(conn: sqlite3.Connection, task_id: str):
+     """(run, park payload, parked_at) of the latest run's orderly timed park, or None."""
+     from hermes_cli import kanban_db as kb
+-    from hermes_cli.kanban_core_update_requeue import latest_run_skipping_requeues
++    from hermes_cli.kanban_pr_same_run_park import latest_parked_run
+ 
+-    run = latest_run_skipping_requeues(conn, task_id)
+-    task = kb.get_task(conn, task_id)
+-    if (run is None or task is None or run["profile"] != task.assignee
+-            or run["outcome"] not in _PARKED or run["ended_at"] is None):
++    run = latest_parked_run(conn, task_id)
++    if run is None:
+         return None
+     event = conn.execute(
+         "SELECT payload, created_at FROM task_events WHERE task_id = ? AND run_id = ? AND kind = ? "
+-        "ORDER BY id DESC LIMIT 1", (task_id, run["id"], _PARKED[run["outcome"]])).fetchone()
++        "ORDER BY id DESC LIMIT 1", (task_id, run["id"], run["outcome"])).fetchone()
+     parked_at = kb._to_epoch(event["created_at"]) if event is not None else None
+     if parked_at is None:
+         return None
+@@ -134,7 +107,7 @@ def _approved_at_head(conn, card: str, parked_at: int, run_id: int, urls: set[st
+             or not isinstance(sha, str)):
+         return set()
+     named = review._named_prs(data, urls) or set()  # must name the PR: no checkpoint binds scope
+-    return {u for u in named if pr_head(u) == sha.lower()}  # pr_head is a full 40-hex sha or None
++    return {u for u in named if _at_head(u, sha.lower())}  # pr_head is a full 40-hex sha or None
+ 
+ 
+ def resumes_awaited_review(conn: sqlite3.Connection, task_id: str, pr_urls: Iterable[str]) -> bool:
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+index 0928302d23..fca9147714 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_state.py
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -3,7 +3,8 @@
+ ``active_pr`` exists to stop a second worker opening a duplicate PR. Once every PR a
+ card's comments name is MERGED or CLOSED there is nothing left to duplicate, so the hold
+ must lift (2026-10-23: t_d507533c sat held 6 h after Metta-AI/coworld-qwop#1 merged).
+-States and queue markers come from ``gh pr view --json state,comments``. A completed
++States and queue markers come from ``gh pr view --json state,comments,headRefOid`` (the head
++serves :func:`pr_head` from the same read). A completed
+ rejection releases the worker to repair the existing PR, with a quoted card comment.
+ Anything unknown (gh missing, auth, network,
+ timeout, unparseable output) is ``None`` and the caller keeps holding (fail closed).
+@@ -18,6 +19,7 @@ from __future__ import annotations
+ 
+ import json
+ import logging
++import re
+ import sqlite3
+ import subprocess
+ import time
+@@ -35,6 +37,9 @@ GH_TIMEOUT_SECONDS = 20
+ # url -> (state or None, monotonic expiry or None for "forever")
+ _cache: dict[str, tuple[Optional[str], Optional[float]]] = {}
+ _rejections: dict[str, str] = {}
++# url -> (OPEN head sha or None, monotonic time of the gh read that saw it)
++_heads: dict[str, tuple[Optional[str], float]] = {}
++_SHA = re.compile(r"[0-9a-fA-F]{40}")
+ 
+ 
+ def _gh_argv() -> Optional[list[str]]:
+@@ -55,10 +60,14 @@ def _gh_argv() -> Optional[list[str]]:
+ 
+ 
+ def _gh_pr_state(url: str) -> Optional[str]:
+-    """GitHub state, ``REJECTED`` for a completed queue rejection, or None on failure."""
++    """GitHub state, ``REJECTED`` for a completed queue rejection, or None on failure.
++
++    The same read records the OPEN head for :func:`pr_head` (``_heads``), so the awaited-review
++    release costs no second ``gh pr view``. [daveey]"""
+     gh = _gh_argv() or ["gh"]
+     try:
+-        proc = subprocess.run([*gh, "pr", "view", url, "--json", "state,comments"], stdin=subprocess.DEVNULL,
++        proc = subprocess.run([*gh, "pr", "view", url, "--json", "state,comments,headRefOid"],
++                              stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, encoding="utf-8", errors="replace",
+                               timeout=GH_TIMEOUT_SECONDS, check=False)
+     except (OSError, subprocess.SubprocessError):
+@@ -74,6 +83,9 @@ def _gh_pr_state(url: str) -> Optional[str]:
+         return None
+     state = state.upper() if isinstance(state, str) and state else None
+     key = norm_pr(url)
++    oid = data.get("headRefOid")
++    _heads[key] = (oid.lower() if state == "OPEN" and isinstance(oid, str) and _SHA.fullmatch(oid) else None,
++                   time.monotonic())
+     _rejections.pop(key, None)
+     if state == "OPEN":
+         from hermes_cli.kanban_db_dispatch_pr_rejection import rejection_reason
+@@ -85,6 +97,15 @@ def _gh_pr_state(url: str) -> Optional[str]:
+     return state
+ 
+ 
++def _store(key: str, state: Optional[str], now: float) -> None:
++    if state == "REJECTED":
++        _cache.pop(key, None)  # requeue must invalidate rejection immediately
++    elif state in TERMINAL_STATES:
++        _cache[key] = (state, None)
++    else:
++        _cache[key] = (state, now + (OPEN_TTL_SECONDS if state else ERROR_TTL_SECONDS))
++
++
+ def pr_state(url: str) -> Optional[str]:
+     """Cached :func:`_gh_pr_state`."""
+     key = norm_pr(url)
+@@ -93,15 +114,29 @@ def pr_state(url: str) -> Optional[str]:
+     if hit is not None and (hit[1] is None or now < hit[1]):
+         return hit[0]
+     state = _gh_pr_state(url)
+-    if state == "REJECTED":
+-        _cache.pop(key, None)  # requeue must invalidate rejection immediately
+-    elif state in TERMINAL_STATES:
+-        _cache[key] = (state, None)
+-    else:
+-        _cache[key] = (state, now + (OPEN_TTL_SECONDS if state else ERROR_TTL_SECONDS))
++    _store(key, state, now)
+     return state
+ 
+ 
++def pr_head(url: str, *, max_age: Optional[float] = None) -> Optional[str]:
++    """Full lowercase head sha of an OPEN PR, from :func:`pr_state`'s read; None when unknown.
++
++    Serves the head recorded by the last ``gh pr view`` of this PR while it is younger than
++    ``max_age`` (default: :data:`OPEN_TTL_SECONDS` for a head, :data:`ERROR_TTL_SECONDS` for
++    unknown), else re-reads, refreshing ``pr_state``'s cache entry too. [daveey]"""
++    key = norm_pr(url)
++    now = time.monotonic()
++    hit = _heads.get(key)
++    if hit is not None:
++        limit = max_age if max_age is not None else (OPEN_TTL_SECONDS if hit[0] else ERROR_TTL_SECONDS)
++        if now - hit[1] < limit:
++            return hit[0]
++    _heads.pop(key, None)
++    _store(key, _gh_pr_state(url), now)
++    _heads.setdefault(key, (None, now))  # a failed read is unknown: cached like an error state
++    return _heads[key][0]
++
++
+ def all_prs_finished(urls: Iterable[str]) -> bool:
+     """True only when ``urls`` is non-empty and every PR is MERGED or CLOSED.
+ 
+@@ -578,8 +613,6 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+ 
+ 
+ def clear_cache() -> None:
+-    from hermes_cli import kanban_awaited_review
+-
+     _cache.clear()
+     _rejections.clear()
+-    kanban_awaited_review.clear_cache()
++    _heads.clear()
+diff --git a/hermes_cli/kanban_pr_same_run_park.py b/hermes_cli/kanban_pr_same_run_park.py
+index 764bcf5ffb..2bbf12a658 100644
+--- a/hermes_cli/kanban_pr_same_run_park.py
++++ b/hermes_cli/kanban_pr_same_run_park.py
+@@ -11,8 +11,11 @@ The tie counts as "reported, then parked" only when every fact is proven:
+ * every PR comment at that second has exactly one ``commented`` event, written by the
+   run that parked (portable ``writer_run_uid`` on a synced schema; the database-local
+   integer only on an unsynced one);
+-* that run is the card's latest run that executed (no later claim), of the assignee;
+-* its park event is in the same second, and each comment's event precedes it.
++* that run is the card's :func:`latest_parked_run` (the one "parked run" definition the
++  awaited-review release shares): its latest executed run, of the assignee, that ENDED as
++  that park, so a run that wrote its park event and then crashed or was reclaimed is not;
++* its park event (the kind its outcome names) is in the same second, and each comment's
++  event precedes it.
+ 
+ A comment written after the park in that second (a new PR named post-park), another run's
+ or a chat's comment, or unreadable provenance keeps today's hold.
+@@ -20,9 +23,28 @@ or a chat's comment, or unreadable provenance keeps today's hold.
+ from __future__ import annotations
+ 
+ import sqlite3
+-from typing import Iterable
++from typing import Iterable, Optional
+ 
+-PARK_KINDS = ("scheduled", "continued")
++PARK_KINDS = ("scheduled", "continued")  # run outcome == the kind of its park event
++
++
++def latest_parked_run(conn: sqlite3.Connection, task_id: str) -> Optional[sqlite3.Row]:
++    """The card's latest executed run when it ended as the assignee's orderly timed park, else None.
++
++    The one definition every same-run handoff shares (this module and
++    :mod:`kanban_awaited_review`): the latest run that executed (core-update requeues and
++    unused grants skipped), run by the card's assignee, with ``outcome`` ``scheduled`` or
++    ``continued`` and ``ended_at`` set. A park event alone is not a park: the run may have
++    crashed, been reclaimed or timed out in the same second, or still be running. [daveey]"""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_core_update_requeue import latest_run_skipping_requeues
++
++    run = latest_run_skipping_requeues(conn, task_id)
++    task = kb.get_task(conn, task_id)
++    if (run is None or task is None or run["profile"] != task.assignee
++            or run["outcome"] not in PARK_KINDS or run["ended_at"] is None):
++        return None
++    return run
+ 
+ 
+ def _comment_event_ids(conn: sqlite3.Connection, task_id: str) -> dict[int, list[tuple[int, dict]]] | None:
+@@ -49,19 +71,17 @@ def reported_then_parked(conn: sqlite3.Connection, task_id: str, since: int,
+                          tie_comment_ids: Iterable[int]) -> bool:
+     """True when the PR comments at ``since`` and a later-ordered timed park share a run."""
+     from hermes_cli import kanban_db as kb
+-    from hermes_cli.kanban_core_update_requeue import latest_run_skipping_requeues
+     from hermes_cli.kanban_pr_park_note import _writer_matches
+ 
+     ids = set(tie_comment_ids)
+     if not ids:
+         return False
+-    run = latest_run_skipping_requeues(conn, task_id)
+-    task = kb.get_task(conn, task_id)
+-    if run is None or task is None or run["profile"] != task.assignee:
++    run = latest_parked_run(conn, task_id)
++    if run is None:
+         return False
+     parks = [e for e in conn.execute(
+-        "SELECT id, created_at FROM task_events WHERE task_id = ? AND run_id = ? AND kind IN (?, ?)",
+-        (task_id, run["id"], *PARK_KINDS)) if kb._to_epoch(e["created_at"]) == since]
++        "SELECT id, created_at FROM task_events WHERE task_id = ? AND run_id = ? AND kind = ?",
++        (task_id, run["id"], run["outcome"])) if kb._to_epoch(e["created_at"]) == since]
+     if not parks:
+         return False
+     park_id = max(e["id"] for e in parks)
+diff --git a/tests/hermes_cli/test_kanban_active_pr_awaited_head.py b/tests/hermes_cli/test_kanban_active_pr_awaited_head.py
+new file mode 100644
+index 0000000000..e9aa87b26f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_active_pr_awaited_head.py
+@@ -0,0 +1,258 @@
++"""Review nits on the awaited-review release (PR #1995, review 5888333701). [daveey]
++
++1. A cached head never releases: a force-push after the approval must not match the
++   approved sha from a head read up to OPEN_TTL_SECONDS old.
++2. The head comes from ``pr_state``'s own ``gh pr view`` (one read, one cache entry).
++3. One "parked run" definition: a run that wrote a park event but ended crashed/reclaimed
++   (or never ended) is not parked, for the same-second tie as for the awaited review.
++4. Only a bare leading ``hermes kanban wait-check task <id>`` or ``awaiting`` kind ``card``
++   with a task-id ref names an awaited card; wrapped probes and gateway request refs hold.
++"""
++import json
++import subprocess
++
++import pytest
++
++from hermes_cli import kanban_awaited_review as kar
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch_pr_state as prs
++from tests.hermes_cli import test_kanban_active_pr_awaited_review as base
++from tests.hermes_cli import test_kanban_park_invariants as park_invariants
++
++kanban_home = park_invariants.kanban_home
++clock = base.clock
++pytestmark = pytest.mark.usefixtures("kanban_home")
++URL, HEAD, APPROVE = base.URL, base.HEAD, base.APPROVE
++PUSHED = "b" * 40
++_REAL_GH_PR_STATE = prs._gh_pr_state
++_REAL_PR_HEAD = kar.pr_head
++
++
++@pytest.fixture
++def gh(monkeypatch):
++    """Fake ``gh pr view``: ``gh.head`` is the PR's current head; ``gh.calls`` the argv seen."""
++    class Gh:
++        head = HEAD
++        calls: list = []
++
++    Gh.calls = []
++
++    def run(argv, **kwargs):
++        Gh.calls.append(list(argv))
++        out = {"state": "OPEN", "headRefOid": Gh.head, "comments": []}
++        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(out), stderr="")
++
++    monkeypatch.setattr(prs, "_gh_pr_state", _REAL_GH_PR_STATE)
++    monkeypatch.setattr(kar, "pr_head", _REAL_PR_HEAD)
++    monkeypatch.setattr(subprocess, "run", run)
++    prs.clear_cache()
++    kar.clear_cache()
++    yield Gh
++    prs.clear_cache()
++    kar.clear_cache()
++
++
++# --- 1. a cached head never releases ------------------------------------------------------
++
++def _age_head_reads(seconds=60):
++    """Move every cached head read ``seconds`` into the past (an earlier dispatcher tick).
++
++    Both cache shapes store a monotonic instant second (read time here, expiry in the old
++    per-module cache), so shifting it back means "that read happened earlier" either way."""
++    for cache in (getattr(prs, "_heads", None), getattr(kar, "_heads", None)):
++        for key, (head, at) in list((cache or {}).items()):
++            cache[key] = (head, at - seconds)  # type: ignore[index]
++
++
++def test_force_push_after_a_cached_head_read_keeps_the_hold(clock, monkeypatch, gh):
++    with kbc.connect() as conn:
++        tid, _ = base._awaiting_owner(conn, clock, monkeypatch, APPROVE)
++        assert kar.pr_head(URL) == HEAD  # an earlier tick read the approved head
++        _age_head_reads()
++        gh.head = PUSHED  # the owner force-pushed after the approval
++        assert prs.active_pr_reason(conn, tid, clock[0] + 10) == "active_pr"
++
++
++def test_approval_at_the_current_head_still_releases_through_real_gh(clock, monkeypatch, gh):
++    with kbc.connect() as conn:
++        tid, _ = base._awaiting_owner(conn, clock, monkeypatch, APPROVE)
++        assert kar.pr_head(URL) == HEAD
++        _age_head_reads()
++        assert prs.active_pr_reason(conn, tid, clock[0] + 10) is None
++
++
++def test_a_cold_release_costs_one_read(clock, monkeypatch, gh):
++    with kbc.connect() as conn:
++        tid, _ = base._awaiting_owner(conn, clock, monkeypatch, APPROVE)
++        assert prs.active_pr_reason(conn, tid, clock[0] + 10) is None
++        assert len(gh.calls) == 1
++
++
++def test_a_failed_release_reread_keeps_the_hold(clock, monkeypatch, gh):
++    """The cached approved head is dropped before the re-read: a gh failure then is unknown."""
++    with kbc.connect() as conn:
++        tid, _ = base._awaiting_owner(conn, clock, monkeypatch, APPROVE)
++        assert kar.pr_head(URL) == HEAD
++        _age_head_reads()
++        monkeypatch.setattr(subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "down"))
++        assert prs.active_pr_reason(conn, tid, clock[0] + 10) == "active_pr"
++
++
++def test_a_cached_head_that_mismatches_refuses_without_a_new_read(clock, monkeypatch, gh):
++    with kbc.connect() as conn:
++        tid, _ = base._awaiting_owner(conn, clock, monkeypatch, APPROVE)
++        gh.head = PUSHED
++        assert kar.pr_head(URL) == PUSHED
++        _age_head_reads()
++        reads = len(gh.calls)
++        assert prs.active_pr_reason(conn, tid, clock[0] + 10) == "active_pr"
++        assert len(gh.calls) == reads  # a refusal may come from the cache
++
++
++# --- 2. one gh read, one cache entry --------------------------------------------------------
++
++def test_pr_head_shares_pr_states_read(gh):
++    assert prs.pr_state(URL) == "OPEN"
++    assert kar.pr_head(URL) == HEAD
++    assert prs.pr_state(URL) == "OPEN"
++    assert len(gh.calls) == 1
++    assert gh.calls[0][-1] == "state,comments,headRefOid"
++
++
++def test_pr_state_reuses_pr_heads_read(gh):
++    assert kar.pr_head(URL) == HEAD
++    assert prs.pr_state(URL) == "OPEN"
++    assert len(gh.calls) == 1
++
++
++# --- 3. one "parked run" definition ---------------------------------------------------------
++
++@pytest.mark.parametrize("outcome", ["crashed", "reclaimed", "timed_out", None])
++@pytest.mark.parametrize("kind", ["scheduled", "continued"])
++def test_same_second_tie_of_a_run_that_did_not_end_parked_still_guards(clock, monkeypatch, kind, outcome):
++    """The run commented, wrote its park event, then crashed/was reclaimed in that second."""
++    with kbc.connect() as conn:
++        tid, run_id = base._owner(conn, monkeypatch)
++        base._comment(conn, tid, run_id, f"Opened {URL}; waiting on review", monkeypatch)
++        base._park(conn, tid, kind)
++        base._wake(conn, tid)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_runs SET outcome=?, ended_at=CASE WHEN ? THEN ended_at END WHERE id=?",
++                         (outcome or kind, outcome is not None, run_id))
++        assert prs.active_pr_reason(conn, tid, clock[0] + 700) == "active_pr"
++
++
++@pytest.mark.parametrize("kind", ["scheduled", "continued"])
++def test_same_second_tie_needs_the_park_event_its_outcome_names(clock, monkeypatch, kind):
++    """A ``continued`` run carrying only a ``scheduled`` event (or vice versa) is not that park."""
++    other = {"scheduled": "continued", "continued": "scheduled"}[kind]
++    with kbc.connect() as conn:
++        tid, run_id = base._owner(conn, monkeypatch)
++        base._comment(conn, tid, run_id, f"Opened {URL}", monkeypatch)
++        base._park(conn, tid, kind)
++        base._wake(conn, tid)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_runs SET outcome=? WHERE id=?", (other, run_id))
++        assert prs.active_pr_reason(conn, tid, clock[0] + 700) == "active_pr"
++
++
++def test_latest_parked_run_is_the_one_definition(clock, monkeypatch):
++    from hermes_cli.kanban_pr_same_run_park import latest_parked_run
++
++    with kbc.connect() as conn:
++        tid, run_id = base._owner(conn, monkeypatch)
++        assert latest_parked_run(conn, tid) is None  # running
++        base._park(conn, tid, "scheduled")
++        assert latest_parked_run(conn, tid)["id"] == run_id
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_runs SET outcome='crashed' WHERE id=?", (run_id,))
++        assert latest_parked_run(conn, tid) is None
++
++
++# --- 4. wrapped probes and gateway request refs hold (fail closed) ----------------------------
++
++WRAPPED = [
++    "bash -lc 'hermes kanban wait-check task {rev}'",
++    "timeout 30 hermes kanban wait-check task {rev}",
++    "~/.hermes/bin/hermes kanban wait-check task {rev}",
++    "/usr/bin/env hermes kanban wait-check task {rev}",
++    "HERMES_HOME=/x hermes kanban wait-check task {rev}",
++    "test -f /x || hermes kanban wait-check task {rev}",
++    "hermes kanban wait-check task {rev} && false",
++    "hermes kanban wait-check task {rev} | grep -q done",
++    "hermes kanban wait-check task {rev}\nfalse",
++]
++
++
++@pytest.mark.parametrize("probe", WRAPPED)
++def test_wrapped_wait_check_names_no_awaited_card(probe):
++    assert kar.awaited_cards({"wake_check": probe.format(rev="t_abc")}) == []
++    assert kar.awaited_cards({"_wake_episode_v1": {"park_cmd": probe.format(rev="t_abc")}}) == []
++
++
++@pytest.mark.parametrize("awaiting", [
++    {"kind": "card", "ref": "worker-3/request/01a1d4"},
++    {"kind": "card", "ref": "worker-3/request/t_abc"},
++    {"kind": "card", "ref": "worker-3/t_abc", "gateway": "worker-3"},
++    [{"kind": "card", "ref": "t_abc"}],
++], ids=["request", "request_task_suffix", "gateway_prefixed", "list"])
++def test_gateway_request_and_list_awaiting_name_no_awaited_card(awaiting):
++    assert kar.awaited_cards({"awaiting": awaiting}) == []
++
++
++@pytest.mark.parametrize("probe", WRAPPED[:4])
++def test_wrapped_probe_park_keeps_the_hold_after_an_approval(clock, monkeypatch, probe):
++    with kbc.connect() as conn:
++        tid, rev = base._awaiting_owner(conn, clock, monkeypatch, APPROVE)
++        _rewrite_park(conn, tid, lambda p: _without(p, "awaiting") | {"wake_check": probe.format(rev=rev)})
++        assert prs.active_pr_reason(conn, tid, clock[0] + 10) == "active_pr"
++
++
++def test_gateway_request_awaiting_park_keeps_the_hold_after_an_approval(clock, monkeypatch):
++    with kbc.connect() as conn:
++        tid, rev = base._awaiting_owner(conn, clock, monkeypatch, APPROVE, via="awaiting")
++        _rewrite_park(conn, tid, lambda p: _without(p, "wake_check")
++                      | {"awaiting": {"kind": "card", "ref": f"worker-3/request/{rev}"}})
++        assert prs.active_pr_reason(conn, tid, clock[0] + 10) == "active_pr"
++
++
++@pytest.mark.parametrize("change", ["wake_check", "awaiting"])
++def test_rewritten_park_fixture_releases_with_the_bare_card_wait(clock, monkeypatch, change):
++    """Control for the two tests above: the same rewrite naming the card plainly releases."""
++    with kbc.connect() as conn:
++        tid, rev = base._awaiting_owner(conn, clock, monkeypatch, APPROVE)
++        if change == "wake_check":
++            _rewrite_park(conn, tid, lambda p: _without(p, "awaiting")
++                          | {"wake_check": f"hermes kanban wait-check task {rev} --gateway worker-3 --from running"})
++        else:
++            _rewrite_park(conn, tid, lambda p: _without(p, "wake_check")
++                          | {"awaiting": {"kind": "card", "ref": rev}})
++        assert prs.active_pr_reason(conn, tid, clock[0] + 10) is None
++
++
++def test_a_wrapped_probe_parked_for_real_is_named_by_its_recorded_awaiting(clock, monkeypatch):
++    """The park records ``awaiting`` kind ``card`` for a live card its probe names, wrapped or
++    not, so that record (not the probe parser) is what names the review card."""
++    with kbc.connect() as conn:
++        rev = kb.create_task(conn, title="exact-head review", assignee="reviewer")
++        tid, _ = base._owner(conn, monkeypatch)
++        assert kb.schedule_task(conn, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting on review",
++                                wake_check=f"timeout 30 hermes kanban wait-check task {rev}", check_every=900)
++        payload = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='scheduled'",
++                                          (tid,)).fetchone()[0])
++        assert kar.awaited_cards(_without(payload, "awaiting")) == []
++        assert kar.awaited_cards(payload) == [rev]
++
++
++def _without(payload, key):
++    return {k: v for k, v in payload.items() if k != key}
++
++
++def _rewrite_park(conn, tid, change):
++    with kb.write_txn(conn):
++        row = conn.execute("SELECT id, payload FROM task_events WHERE task_id=? AND kind='scheduled'",
++                           (tid,)).fetchone()
++        payload = change(json.loads(row["payload"]))
++        payload.pop("_wake_episode_v1", None)
++        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row["id"]))
+diff --git a/tests/hermes_cli/test_kanban_active_pr_awaited_review.py b/tests/hermes_cli/test_kanban_active_pr_awaited_review.py
+index 9655b21334..aad05a6fcb 100644
+--- a/tests/hermes_cli/test_kanban_active_pr_awaited_review.py
++++ b/tests/hermes_cli/test_kanban_active_pr_awaited_review.py
+@@ -25,6 +25,7 @@ pytestmark = pytest.mark.usefixtures("kanban_home")
+ URL = "https://github.com/example/project/pull/12"
+ OTHER = "https://github.com/example/project/pull/13"
+ HEAD = "a" * 40
++_REAL_GH_PR_STATE = prs._gh_pr_state
+ 
+ 
+ @pytest.fixture
+@@ -32,7 +33,7 @@ def clock(monkeypatch):
+     now = [int(time.time())]
+     monkeypatch.setattr(time, "time", lambda: now[0])
+     monkeypatch.setattr(prs, "pr_state", lambda url: "OPEN")
+-    monkeypatch.setattr(kar, "pr_head", lambda url: HEAD)
++    monkeypatch.setattr(kar, "pr_head", lambda url, **_: HEAD)
+     return now
+ 
+ 
+@@ -268,7 +269,7 @@ def test_awaited_review_that_is_not_an_approval_at_head_still_guards(clock, monk
+ 
+ 
+ def test_awaited_review_with_unknown_head_still_guards(clock, monkeypatch):
+-    monkeypatch.setattr(kar, "pr_head", lambda url: None)
++    monkeypatch.setattr(kar, "pr_head", lambda url, **_: None)
+     with kbc.connect() as conn:
+         tid, _ = _awaiting_owner(conn, clock, monkeypatch, APPROVE)
+         assert prs.active_pr_reason(conn, tid, clock[0] + 10) == "active_pr"
+@@ -386,6 +387,7 @@ def test_pr_head_reads_only_an_open_full_head(monkeypatch, stdout, code, expecte
+         calls.append(argv)
+         return subprocess.CompletedProcess(argv, code, stdout=stdout, stderr="")
+ 
++    monkeypatch.setattr(prs, "_gh_pr_state", _REAL_GH_PR_STATE)
+     monkeypatch.setattr(subprocess, "run", run)
+     kar.clear_cache()
+     assert kar.pr_head(URL) == expected
+@@ -400,6 +402,7 @@ def test_pr_head_survives_a_gh_launch_failure(monkeypatch):
+     def run(argv, **kwargs):
+         raise FileNotFoundError("gh")
+ 
++    monkeypatch.setattr(prs, "_gh_pr_state", _REAL_GH_PR_STATE)
+     monkeypatch.setattr(subprocess, "run", run)
+     kar.clear_cache()
+     assert kar.pr_head(URL) is None
+diff --git a/tests/hermes_cli/test_kanban_park_invariants.py b/tests/hermes_cli/test_kanban_park_invariants.py
+index 3162a2230d..06f769a198 100644
+--- a/tests/hermes_cli/test_kanban_park_invariants.py
++++ b/tests/hermes_cli/test_kanban_park_invariants.py
+@@ -534,7 +534,7 @@ def test_pr_state_lookup_uses_broker_prefix_and_resolved_gh(kanban_home, monkeyp
+     monkeypatch.setattr(prs.subprocess, "run",
+                         lambda cmd, *a, **k: calls.append(cmd) or _Proc(0, json.dumps({"state": "MERGED"})))
+     assert prs.pr_state(PR_A) == "MERGED"
+-    assert calls == [[*prefix, "/home/x/bin/gh", "pr", "view", PR_A, "--json", "state,comments"]]
++    assert calls == [[*prefix, "/home/x/bin/gh", "pr", "view", PR_A, "--json", "state,comments,headRefOid"]]
+ 
+     # Broken broker config: fall back to bare gh (still fail-closed on error), never raise.
+     prs.clear_cache()
+-- 
+2.51.0
+

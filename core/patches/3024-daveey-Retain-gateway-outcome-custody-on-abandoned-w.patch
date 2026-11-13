@@ -1,0 +1,199 @@
+From 072af658a2a1e0324e7dc6f0290dd3a7d2c3ef53 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 21:53:27 +0000
+Subject: [PATCH] [daveey] Retain gateway outcome custody on abandoned worker
+ waits
+
+Capture the run-owned holder on timeout/cancel before handler refresh; preserve completed receipts against cached agent reuse. Normalize absent SIDs and exercise the production executor context hop.
+
+Proof: 126 affected files: 1504 passed, 1 skipped. Five revision mutants killed with 15-test green baseline, including omitted abandonment capture and receipt overwrite.
+---
+ gateway/run_turn.py                           | 50 ++++++++------
+ gateway/turn_outcome.py                       | 11 ++-
+ .../hermes_state/test_outcome_run_custody.py  | 69 ++++++++++++++++++-
+ 3 files changed, 105 insertions(+), 25 deletions(-)
+
+diff --git a/gateway/run_turn.py b/gateway/run_turn.py
+index 47016dd4fd..e706952356 100644
+--- a/gateway/run_turn.py
++++ b/gateway/run_turn.py
+@@ -1445,28 +1445,34 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
+         from gateway.run import _abandon_timed_out_gateway_turn
+         agent_holder = turn_ctx.agent_holder
+         _warning_fired = False
+-        while True:
+-            done, _ = await asyncio.wait({worker.executor_task}, timeout=5.0)
+-            if done:
+-                # Prefer the real result even if the watchdog fired in the same window (the run already
+-                # persisted its reply).
+-                return worker.executor_task.result()
+-            if worker.agent_timeout is not None:
+-                if worker.timeout_fired.is_set():
+-                    break
+-                _idle_secs = turn_ctx.awake_idle.measure(self._agent_activity_summary(agent_holder[0]).get("seconds_since_activity", 0.0))
+-                if not _warning_fired and worker.agent_warning is not None and _idle_secs >= worker.agent_warning:
+-                    _warning_fired = True
+-                    await self._run_agent_inactivity_warning(worker, turn_ctx.source, turn_ctx._status_thread_metadata)
+-                if _idle_secs >= worker.agent_timeout:
+-                    threading.Thread(
+-                        target=_abandon_timed_out_gateway_turn,
+-                        kwargs={"agent_holder": agent_holder, **self._reaper_kwargs(worker)},
+-                        name=f"gateway-turn-reaper-{worker.task_id[:12]}", daemon=True,
+-                    ).start()
+-                    break
+-            await self._run_agent_backup_interrupt_check(turn_ctx, _interrupt_detected, interrupt_monitor)
+-        return self._run_agent_timeout_result(worker, turn_ctx)
++        try:
++            while True:
++                done, _ = await asyncio.wait({worker.executor_task}, timeout=5.0)
++                if done:
++                    # Prefer the real result even if the watchdog fired in the same window (the run already
++                    # persisted its reply).
++                    return worker.executor_task.result()
++                if worker.agent_timeout is not None:
++                    if worker.timeout_fired.is_set():
++                        break
++                    _idle_secs = turn_ctx.awake_idle.measure(self._agent_activity_summary(agent_holder[0]).get("seconds_since_activity", 0.0))
++                    if not _warning_fired and worker.agent_warning is not None and _idle_secs >= worker.agent_warning:
++                        _warning_fired = True
++                        await self._run_agent_inactivity_warning(worker, turn_ctx.source, turn_ctx._status_thread_metadata)
++                    if _idle_secs >= worker.agent_timeout:
++                        threading.Thread(
++                            target=_abandon_timed_out_gateway_turn,
++                            kwargs={"agent_holder": agent_holder, **self._reaper_kwargs(worker)},
++                            name=f"gateway-turn-reaper-{worker.task_id[:12]}", daemon=True,
++                        ).start()
++                        break
++                await self._run_agent_backup_interrupt_check(turn_ctx, _interrupt_detected, interrupt_monitor)
++            return self._run_agent_timeout_result(worker, turn_ctx)
++        finally:
++            # Timeout/cancellation can leave the worker inside run_conversation. Its own
++            # holder is still valid; never consult the replacement session turn slot.
++            from gateway.turn_outcome import capture_pending_run_outcome
++            capture_pending_run_outcome(agent_holder[0])
+ 
+     def _run_agent_evict_on_fallback(self, turn_ctx: TurnContext) -> None:
+         """Evict the cached agent when a fallback model activated on a SUCCESSFUL run (so /model shows
+diff --git a/gateway/turn_outcome.py b/gateway/turn_outcome.py
+index 7a1a375196..62624b9a2a 100644
+--- a/gateway/turn_outcome.py
++++ b/gateway/turn_outcome.py
+@@ -27,7 +27,14 @@ def capture_run_outcome(agent) -> None:
+     owned = run_outcome.get()
+     if owned is not None:
+         owned["lease_holder"] = getattr(agent, "_last_session_turn_lease_holder", None)
+-        owned["session_id"] = str(getattr(agent, "session_id", "") or owned["session_id"])
++        owned["session_id"] = str(getattr(agent, "session_id", "") or owned["session_id"] or "")
++
++
++def capture_pending_run_outcome(agent) -> None:
++    """Fill missing evidence on handler abandonment, retaining a finished worker's receipt."""
++    owned = run_outcome.get()
++    if owned is not None and "lease_holder" not in owned:
++        capture_run_outcome(agent)
+ 
+ 
+ def concluding_turn_identity(runner, event=None, session_key: Optional[str] = None) -> frozenset:
+@@ -70,7 +77,7 @@ def refresh_gateway_turn_outcome(runner, session_entry, event=None,
+     """Start the refresh off the reply path; the started thread (None when there is nothing to refresh).
+     The concluding turn's identity is taken here, before the thread is scheduled."""
+     owned = run_outcome.get()
+-    sid = str(owned["session_id"] if owned is not None else getattr(session_entry, "session_id", "") or "")
++    sid = str((owned["session_id"] if owned is not None else getattr(session_entry, "session_id", "")) or "")
+     store = getattr(runner, "_session_db", None)
+     db = getattr(store, "_db", store)
+     if not sid or db is None:
+diff --git a/tests/hermes_state/test_outcome_run_custody.py b/tests/hermes_state/test_outcome_run_custody.py
+index 4720b45eff..cdc8843234 100644
+--- a/tests/hermes_state/test_outcome_run_custody.py
++++ b/tests/hermes_state/test_outcome_run_custody.py
+@@ -98,7 +98,10 @@ async def test_displaced_handler_uses_worker_receipt_not_successor_slot(db, monk
+     receipts = []
+     async def run_agent(**kw):
+         try:
+-            return await asyncio.to_thread(worker._run_conversation_with_approval, agent, [], None, None, None)
++            from gateway.run import GatewayRunner
++            executor_runner = SimpleNamespace(_get_executor=lambda: None)
++            return await GatewayRunner._run_in_executor_with_context(
++                executor_runner, worker._run_conversation_with_approval, agent, [], None, None, None)
+         finally:
+             receipts.append(dict(gw.run_outcome.get()))
+             # Both the cached object and shared entry now belong to another turn.
+@@ -122,10 +125,74 @@ async def test_displaced_handler_uses_worker_receipt_not_successor_slot(db, monk
+     assert so.get_outcome("chat", db=db)["kind"] == ("running" if newer else "waiting")
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize("cancelled", [False, True])
++@pytest.mark.parametrize("newer", [False, True])
++async def test_abandoned_worker_captures_own_live_lease(db, monkeypatch, cancelled, newer):
++    helpers._declare_then_reply(db)
++    if newer:
++        late._next_turn_starts(db)
++    assert db.try_acquire_session_turn_lease("chat", "turn-B" if newer else "turn-A", ttl_seconds=300)
++    agent = SimpleNamespace(session_id="chat", _last_session_turn_lease_holder="turn-A")
++    ctx = SimpleNamespace(agent_holder=[agent])
++    pending = asyncio.get_running_loop().create_future()
++    worker = SimpleNamespace(executor_task=pending, agent_timeout=1,
++                             timeout_fired=SimpleNamespace(is_set=lambda: True))
++    async def poll(*a, **kw):
++        if cancelled:
++            raise asyncio.CancelledError
++        return set(), {pending}
++    monkeypatch.setattr("gateway.run_turn.asyncio.wait", poll)
++    runner = SimpleNamespace(_session_db=db, _run_agent_timeout_result=lambda *a: {"failed": True},
++                             _session_state=lambda *a: pytest.fail("successor slot read"))
++    token = gw.run_outcome.set({"session_id": "chat"})
++    try:
++        call = GatewayTurnMixin._run_agent_await_turn_worker(runner, worker, ctx, None, None)
++        if cancelled:
++            with pytest.raises(asyncio.CancelledError):
++                await call
++        else:
++            assert await call == {"failed": True}
++        assert not pending.done()  # worker still owns its physical lease
++        event = SimpleNamespace(_gateway_active_turn_token="token-A")
++        assert gw.concluding_turn_identity(runner, event, "key") == {"lease:turn-A", "gateway:token-A"}
++        thread = gw.refresh_gateway_turn_outcome(runner, SimpleNamespace(session_id="new-chat"), event, "key")
++        thread.join(10)
++        assert not thread.is_alive()
++        assert so.get_outcome("chat", db=db)["kind"] == ("running" if newer else "waiting")
++    finally:
++        pending.cancel()
++        gw.run_outcome.reset(token)
++
++
++@pytest.mark.parametrize("holder", [None, "turn-A"])
++def test_pending_capture_preserves_finished_receipt(holder):
++    owned = {"session_id": "chat", "lease_holder": holder}
++    token = gw.run_outcome.set(owned.copy())
++    try:
++        gw.capture_pending_run_outcome(SimpleNamespace(session_id="new-chat", _last_session_turn_lease_holder="turn-B"))
++        assert gw.run_outcome.get() == owned
++    finally:
++        gw.run_outcome.reset(token)
++
++
++def test_null_sid_does_not_refresh(monkeypatch):
++    monkeypatch.setattr(gw, "_refresh", lambda *a: pytest.fail("null session refreshed"))
++    token = gw.run_outcome.set({"session_id": None})
++    try:
++        runner = SimpleNamespace(_session_db=object())
++        assert gw.refresh_gateway_turn_outcome(runner, None) is None
++        gw.capture_run_outcome(SimpleNamespace(session_id=None))
++        assert gw.run_outcome.get()["session_id"] == ""
++    finally:
++        gw.run_outcome.reset(token)
++
++
+ def test_no_run_scope_never_names_successor():
+     token = gw.run_outcome.set(None)
+     try:
+         gw.capture_run_outcome(SimpleNamespace(_last_session_turn_lease_holder="foreign"))
++        gw.capture_pending_run_outcome(SimpleNamespace(_last_session_turn_lease_holder="foreign"))
+         runner = SimpleNamespace(_session_state=lambda key: pytest.fail("mutable slot read"))
+         assert gw.concluding_turn_identity(runner, None, "key") == frozenset()
+     finally:
+-- 
+2.51.0
+

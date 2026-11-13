@@ -1,0 +1,167 @@
+From ffb398e0d40878145bd9535c727494636f2eb64e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 22:00:16 +0000
+Subject: [PATCH] fix(kanban): fence portable receipts on origin and
+ contradictory evidence [daveey]
+
+---
+ hermes_cli/kanban_db_connect.py               |  1 +
+ hermes_cli/kanban_db_sync.py                  |  4 ++-
+ hermes_cli/kanban_review_release.py           | 17 ++++++++++++-
+ hermes_cli/kanban_worker_node.py              |  2 +-
+ .../hermes_cli/test_kanban_review_release.py  | 25 +++++++++++++++++++
+ .../test_kanban_review_release_transport.py   | 12 ++++++++-
+ 6 files changed, 57 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 850e924e75..a4ba954ab7 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1174,6 +1174,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
+     # probes match the gateway, not a free-text author. Back-filled from ``hub:gw:<x>`` / ``<x>/t_...``.
+     from hermes_cli.kanban_comment_origin import ensure_origin_column
+     ensure_origin_column(conn)
++    _add_column_if_missing(conn, "task_events", "origin_gateway", "origin_gateway TEXT")
+ 
+     # task_events.run_id back-fills as NULL for historical events (they predate
+     # runs and can't be attributed).
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index a6126f3e0c..a6ed48a158 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -87,7 +87,7 @@ LOCAL_COLUMNS: dict[str, frozenset[str]] = {
+     "task_links": frozenset(),
+     # ``origin_gateway``: the sending gateway as this gateway saw it (relay sender); peers keep their own.
+     "task_comments": frozenset({"origin_gateway"}),
+-    "task_events": frozenset(),
++    "task_events": frozenset({"origin_gateway"}),
+     # ``sync_version``: the Board version of the row this gateway last applied or had acknowledged (the fence that
+     # keeps an older copy of a run from the feed off a newer local row).
+     "task_runs": frozenset({"claim_lock", "claim_expires", "worker_pid", "worker_started_at", "last_heartbeat_at",
+@@ -1346,6 +1346,8 @@ def _upsert_row(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: Ap
+         return False
+     from hermes_cli.kanban_sync_omissions import without_held
+     cols = _local_fields(conn, table, without_held(conn, table, ch.uid, ch.fields), task_id)
++    if table == "task_events" and "origin_gateway" in table_columns(conn, table):
++        cols["origin_gateway"] = ch.origin_gateway or None
+     if table == "task_links":
+         return conn.execute("INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                             (cols["parent_id"], cols["child_id"])).rowcount == 1
+diff --git a/hermes_cli/kanban_review_release.py b/hermes_cli/kanban_review_release.py
+index 8d734ffbee..5cf5ea3651 100644
+--- a/hermes_cli/kanban_review_release.py
++++ b/hermes_cli/kanban_review_release.py
+@@ -109,8 +109,16 @@ def released(conn, task_id, pr_urls):
+     parents = kb.parent_ids(conn, task_id)
+     if kb.unsatisfied_parents(conn, task_id) or owner_faulted_since(conn, task_id, parked):
+         return False
+-    for event in conn.execute("SELECT payload, created_at FROM task_events WHERE task_id=? "
++    for event in conn.execute("SELECT * FROM task_events WHERE task_id=? "
+                               "AND kind='promoted' ORDER BY id DESC LIMIT 1", (task_id,)):
++        origin = event["origin_gateway"] if "origin_gateway" in event.keys() else None
++        if origin or foreign_copy(conn, task_id):
++            home = conn.execute("SELECT created_on FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
++            if not origin or origin != home:
++                return False
++        if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND id>? "
++                        "AND kind='descendant_invalidated' LIMIT 1", (task_id, event["id"])).fetchone():
++            return False
+         stamp = kb._json_dict(event["payload"]).get("review_release")
+         if not isinstance(stamp, dict):
+             continue
+@@ -149,6 +157,13 @@ def released(conn, task_id, pr_urls):
+                                   (proof["parent"],)).fetchone()
+             if latest is not None and not review._checkpoint_matches_run(proof.get("result"), latest):
+                 break
++            if latest is not None:
++                current = kb._json_dict(latest["metadata"])
++                # Absent replica evidence is allowed; explicit changed review
++                # identity is not. Verdict changes can still authorize repair.
++                identity_keys = ("reviewed_sha", "head", "exact_head", "pr", "reviewed_pr")
++                if any(k in current and current[k] != data.get(k) for k in identity_keys):
++                    break
+             explicit = review._named_prs(data, urls)
+             if explicit is not None and set(named) != explicit:
+                 break
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index 46380d43f8..2ece366678 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -466,7 +466,7 @@ def _changes_for(replica: sqlite3.Connection, tid: str, card: sqlite3.Row) -> li
+                 continue
+             version = int(row["sync_version"] or 0) if "sync_version" in row.keys() else 0
+             # A comment's sender is machine-local (never a wire field): carry the replica's as the change's writer.
+-            sender = (row["origin_gateway"] or "") if table == "task_comments" and "origin_gateway" in row.keys() else ""
++            sender = (row["origin_gateway"] or "") if table in ("task_comments", "task_events") and "origin_gateway" in row.keys() else ""
+             out.append(sync.RemoteChange(0, table, row["uid"], "upsert", ksc._row_fields(replica, table, row),
+                                          version, "", sender))
+     # Its parent edges too: once the copy is here the feed applies its later links (own_partition), so a copy
+diff --git a/tests/hermes_cli/test_kanban_review_release.py b/tests/hermes_cli/test_kanban_review_release.py
+index a1f11e0b55..1cab32bf12 100644
+--- a/tests/hermes_cli/test_kanban_review_release.py
++++ b/tests/hermes_cli/test_kanban_review_release.py
+@@ -72,6 +72,31 @@ def test_new_promotion_does_not_rearm_old_receipt(board, monkeypatch):
+     assert not release.released(board, task, {PR})
+ 
+ 
++@pytest.mark.parametrize("field,value", [("reviewed_sha", "b" * 40), ("reviewed_pr", OLD)])
++def test_same_result_contradiction_revokes_receipt(board, field, value):
++    import json
++    from hermes_cli import kanban_review_release as release
++    task, reviews = helpers.parked(board)
++    helpers.finish_reviews(board, reviews)
++    assert release.released(board, task, {PR})
++    row = board.execute("SELECT id,metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (reviews[0],)).fetchone()
++    metadata = json.loads(row["metadata"])
++    metadata[field] = value
++    board.execute("UPDATE task_runs SET metadata=? WHERE id=?", (json.dumps(metadata), row["id"]))
++    board.commit()
++    assert not release.released(board, task, {PR})
++
++
++def test_lifecycle_retraction_revokes_receipt(board):
++    from hermes_cli import kanban_review_release as release
++    task, reviews = helpers.parked(board)
++    helpers.finish_reviews(board, reviews)
++    assert release.released(board, task, {PR})
++    kb._append_event(board, task, "descendant_invalidated", {})
++    board.commit()
++    assert not release.released(board, task, {PR})
++
++
+ def test_remote_review_change_during_precompute_drops_stamp(board, monkeypatch):
+     from hermes_cli import kanban_review_release as release
+     task, reviews = helpers.parked(board)
+diff --git a/tests/hermes_cli/test_kanban_review_release_transport.py b/tests/hermes_cli/test_kanban_review_release_transport.py
+index 4342c53780..0616583ea1 100644
+--- a/tests/hermes_cli/test_kanban_review_release_transport.py
++++ b/tests/hermes_cli/test_kanban_review_release_transport.py
+@@ -17,7 +17,7 @@ PR = "https://github.com/example/repo/pull/9003"
+ OLD = PR + "9"
+ 
+ 
+-@pytest.mark.parametrize("missing", ["parent", "github"])
++@pytest.mark.parametrize("missing", ["parent", "github", "foreign_origin"])
+ def test_home_review_receipt_crosses_feed_and_pickup(gws, clock, monkeypatch, missing):
+     hub, worker = gws
+     hub.enter()
+@@ -57,6 +57,16 @@ def test_home_review_receipt_crosses_feed_and_pickup(gws, clock, monkeypatch, mi
+         assert worker.conn.execute("SELECT 1 FROM task_runs WHERE task_id=?", (parent,)).fetchone() is None
+         from hermes_cli import kanban_dependency_review as review
+         monkeypatch.setattr(review, "_completed_review_run", lambda *a: None)
++    if missing == "foreign_origin":
++        from hermes_cli import kanban_db_sync as sync
++        from hermes_cli import kanban_sync_client as client
++        from hermes_cli import kanban_review_release as release
++        event = worker.conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='promoted' ORDER BY id DESC LIMIT 1", (task,)).fetchone()
++        forged = sync.RemoteChange(0, "task_events", event["uid"], "upsert",
++                                   client._row_fields(worker.conn, "task_events", event), 0, "", "foreign")
++        sync._upsert_row(worker.conn, forged, "worker", sync.ApplyResult(cursor=0))
++        assert not release.released(worker.conn, task, {PR, OLD})
++        return
+     assert dispatch.check_respawn_guard(worker.conn, task) is None
+     assert kb.claim_task(worker.conn, task)
+     assert dispatch.check_respawn_guard(worker.conn, task) == "active_pr"
+-- 
+2.51.0
+

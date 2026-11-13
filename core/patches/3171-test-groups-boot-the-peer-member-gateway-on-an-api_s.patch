@@ -1,0 +1,186 @@
+From 62fce90aea49b2a71615563b9ae5c80c3babc34d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 05:44:46 +0000
+Subject: [PATCH] test(groups): boot the peer member gateway on an api_server
+ port it owns
+
+test_peer_member_on_another_gateway_joins_replies_stops_recovers_and_is_revoked
+flaked on CI with "timed out after 30s waiting for groups.capabilities": the
+member gateway's room_link never enabled. The fixture picked the member's
+api_server port free (bind, close) long before the daemon booted; under the
+parallel runner another test's daemon can bind it first. The member then parks
+api_server (api_server_port_in_use), still reports ready, and room_link stays
+{'enabled': False, 'reason': 'api_server_required'} forever. Squatting the
+picked port reproduces the exact failure.
+
+The member's first boot now goes through api_daemon, which writes the config
+for each picked port and re-boots only on that race; later boots keep the port
+(the home's stored route names it) and assert the listener is theirs. The
+room_link wait uses RPC_DEADLINE (a hang bound that returns as soon as the
+link is enabled) instead of 30 s, so a CPU-throttled cold boot does not trip it.
+---
+ .../test_session_group_peer_daemons.py        | 76 +++++++++++++------
+ 1 file changed, 51 insertions(+), 25 deletions(-)
+
+diff --git a/tests/gateway/test_session_group_peer_daemons.py b/tests/gateway/test_session_group_peer_daemons.py
+index b924a1f4ca..169d14025f 100644
+--- a/tests/gateway/test_session_group_peer_daemons.py
++++ b/tests/gateway/test_session_group_peer_daemons.py
+@@ -1,6 +1,6 @@
+ """Two real canonical gateways: a Group Chat on one, with a member hosted by the other."""
+ import asyncio
+-from contextlib import ExitStack
++from contextlib import ExitStack, contextmanager
+ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ import json
+ from pathlib import Path
+@@ -15,7 +15,8 @@ import urllib.request
+ 
+ import pytest
+ 
+-from tests.gateway.fixtures.local_recovery_probe import child_env, daemon, rpc, websocket
++from tests.gateway.fixtures.local_recovery_probe import (
++    RPC_DEADLINE, api_daemon, api_listener_state, child_env, daemon, rpc, websocket)
+ 
+ 
+ # These tests kill only the child handles returned by their isolated daemon fixture.
+@@ -66,24 +67,30 @@ def _model(reply, *markers, handler=Model):
+     return server
+ 
+ 
+-def _gateway(tmp_path, name, model, root, *, api_port=None, link_port=None):
+-    home, user = tmp_path / name, tmp_path / f'{name}-user'
+-    home.mkdir(mode=0o700)
+-    user.mkdir()
++def _write_config(home, model, *, api_port=None, link_port=None):
+     base = f'http://127.0.0.1:{model.server_port}/v1'
+     gateway = {'multiplex_profiles': False}
+-    env = child_env() | dict(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home),
+-                             PYTHONPATH=str(root), OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=base,
+-                             PYTHONUNBUFFERED='1')
+     if api_port is not None:
+         gateway |= {'room_link_url': f'http://127.0.0.1:{link_port or api_port}',
+                     'platforms': {'api_server': {'enabled': True, 'port': api_port, 'host': '127.0.0.1'}}}
+-        env |= dict(API_SERVER_KEY='target-gateway-owned-secret', API_SERVER_ENABLED='true',
+-                    API_SERVER_PORT=str(api_port))
+     (home / 'config.yaml').write_text(json.dumps({
+         'model': {'provider': 'custom', 'default': 'room-model', 'base_url': base},
+         'gateway': gateway, 'platform_toolsets': {'gui': [], 'bot_room': [], 'api_server': []},
+         'auxiliary': {'title_generation': {'enabled': False}}, 'terminal': {'cwd': str(home)}}))
++
++
++def _gateway(tmp_path, name, model, root, *, api_server=False):
++    """An isolated gateway home; a member gateway's config is written at its first boot (``_member``)."""
++    home, user = tmp_path / name, tmp_path / f'{name}-user'
++    home.mkdir(mode=0o700)
++    user.mkdir()
++    env = child_env() | dict(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home),
++                             PYTHONPATH=str(root), OPENAI_API_KEY='loopback-only',
++                             OPENAI_BASE_URL=f'http://127.0.0.1:{model.server_port}/v1', PYTHONUNBUFFERED='1')
++    if api_server:
++        env |= dict(API_SERVER_KEY='target-gateway-owned-secret', API_SERVER_ENABLED='true')
++    else:
++        _write_config(home, model)
+     return home, env
+ 
+ 
+@@ -96,17 +103,21 @@ def gateways(tmp_path):
+         root = Path(__file__).resolve().parents[2]
+         home_model, target_model = _model('HOME_REPLY'), _model('PEER_REPLY', *markers, handler=handler)
+         models.extend((home_model, target_model))
+-        with socket.socket() as sock:
+-            sock.bind(('127.0.0.1', 0))
+-            api_port = sock.getsockname()[1]
+-        relay = _LossyRelay(api_port) if lossy else None
++        relay = _LossyRelay() if lossy else None
+         if relay:
+             relays.append(relay)
+         home, home_env = _gateway(tmp_path, 'home', home_model, root)
+-        target, target_env = _gateway(tmp_path, 'target', target_model, root,
+-                                      api_port=api_port, link_port=relay.port if relay else None)
+-        return SimpleNamespace(root=root, home=home, home_env=home_env, target=target, target_env=target_env,
+-                               home_model=home_model, target_model=target_model, api_port=api_port, relay=relay)
++        target, target_env = _gateway(tmp_path, 'target', target_model, root, api_server=True)
++        g = SimpleNamespace(root=root, home=home, home_env=home_env, target=target, target_env=target_env,
++                            home_model=home_model, target_model=target_model, api_port=None, relay=relay)
++
++        def write_target_config(port):
++            g.api_port, g.target_env['API_SERVER_PORT'] = port, str(port)
++            if relay:
++                relay.target_port = port
++            _write_config(target, target_model, api_port=port, link_port=relay.port if relay else None)
++        g.write_target_config = write_target_config
++        return g
+     yield create
+     for relay in relays:
+         relay.close()
+@@ -117,6 +128,21 @@ def gateways(tmp_path):
+         model.server_close()
+ 
+ 
++@contextmanager
++def _member(g):
++    """The member gateway with an api_server listener of its own. Its first boot picks the port
++    through ``api_daemon``: a port picked free here can be taken by a concurrent test's daemon first,
++    and then room_link never enables. Later boots keep that port: the home's stored route names it."""
++    if g.api_port is None:
++        with api_daemon(g.root, g.target, g.target_env, g.write_target_config) as (proc, desc, _):
++            yield proc, desc
++        return
++    with daemon(g.root, g.target, g.target_env, barrier=False) as (proc, desc):
++        api = api_listener_state(g.target, desc)
++        assert api['state'] == 'connected', f'member api_server on port {g.api_port}: {api}'
++        yield proc, desc
++
++
+ async def _create(home_ws, catalog, *, peer_id='target-gateway'):
+     pinned = {'kind': 'peer', 'peer_id': peer_id, 'installation_id': catalog['installation_id'],
+               'profile': 'default', 'capability_digest': catalog['catalog_digest']}
+@@ -182,7 +208,7 @@ async def _events(ws, kind, count=1, timeout=60):
+     return found
+ 
+ 
+-async def _room_link(ws, timeout=30):
++async def _room_link(ws, timeout=RPC_DEADLINE):
+     """The member gateway's room_link once its API server is up."""
+     return await _wait_rpc(ws, 'groups.capabilities',
+                           lambda result: result['room_link'] if result['room_link']['enabled'] else None,
+@@ -321,7 +347,7 @@ def test_peer_member_on_another_gateway_joins_replies_stops_recovers_and_is_revo
+ 
+     with ExitStack() as running:
+         member = running.enter_context(ExitStack())
+-        _, target_desc = member.enter_context(daemon(g.root, g.target, g.target_env, barrier=False))
++        _, target_desc = member.enter_context(_member(g))
+         with daemon(g.root, g.home, g.home_env, barrier=False) as (home_proc, home_desc):
+             asyncio.run(before_restart(home_desc, target_desc, home_proc))
+         g.target_model.gates['HOLD_RESTART'][1].set()
+@@ -331,15 +357,15 @@ def test_peer_member_on_another_gateway_joins_replies_stops_recovers_and_is_revo
+         # the room; once that gateway runs again, Disband revokes there and ends the room.
+         member.close()
+         asyncio.run(disband_while_member_is_down(home_desc))
+-        running.enter_context(daemon(g.root, g.target, g.target_env, barrier=False))
++        running.enter_context(_member(g))
+         asyncio.run(revoked_once_member_returns(home_desc))
+ 
+ 
+ class _LossyRelay:
+     """Lose an admitted request's reply, then definitively refuse its immediate replay."""
+ 
+-    def __init__(self, target_port):
+-        self.target_port, self.admissions = target_port, 0
++    def __init__(self):
++        self.target_port, self.admissions = None, 0
+         self.closed, self.replay_refused = threading.Event(), threading.Event()
+         self.listener = socket.create_server(('127.0.0.1', 0))
+         self.port = self.listener.getsockname()[1]
+@@ -415,6 +441,6 @@ def test_a_lost_admission_reply_never_runs_the_peer_turn_twice(gateways):
+                 (key,), = db.execute('SELECT idempotency_key FROM run_idempotency').fetchall()
+             assert key.startswith('room:dtask:') and key.endswith(':1'), key
+ 
+-    with daemon(g.root, g.target, g.target_env, barrier=False) as (_, target_desc):
++    with _member(g) as (_, target_desc):
+         with daemon(g.root, g.home, g.home_env, barrier=False) as (_, home_desc):
+             asyncio.run(drive(home_desc, target_desc))
+-- 
+2.51.0
+

@@ -1,0 +1,438 @@
+From 6517132afa73277ce5f5172913c5524ae5900a1c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 03:18:52 +0000
+Subject: [PATCH] [daveey] Satisfy code-health and Windows-footgun gates for
+ worker capacity
+
+---
+ hermes_cli/kanban_db_dispatch.py         |  6 ++----
+ hermes_cli/worker_account_boards.py      |  6 +++---
+ hermes_cli/worker_board_retirement.py    |  4 ++--
+ hermes_cli/worker_compute_capacity.py    | 16 ++++++++--------
+ hermes_cli/worker_legacy_scopes.py       | 10 +++++-----
+ hermes_cli/worker_load_observer.py       |  2 +-
+ hermes_cli/worker_load_snapshot.py       |  8 ++++----
+ hermes_cli/worker_resource_admission.py  |  6 +++---
+ scripts/run_tests_parallel.py            | 16 +++++++++++-----
+ scripts/worker_test_budget.py            | 23 ++++++++++++++++++++---
+ tests/conftest.py                        | 17 +----------------
+ tests/scripts/test_worker_test_budget.py | 10 ++++++++++
+ 12 files changed, 70 insertions(+), 54 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 37f48c3337..c747d2741f 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2706,10 +2706,8 @@ def _restart_safe_worker_argv(task: Task, command: list[str], board: Optional[st
+         require_restart_safe_scope=True,
+         outlives_parent=True,
+     ).argv)
+-    # OOM recovery raises the cap; bounded_scope adds the shared pool (kanban_aggregate_scope)
+-    return _aggregate_scope.bounded_scope(
+-        _worker_scope.apply_oom_recovery(argv, task.id, board), task_id=task.id,
+-        board=str(_kb.kanban_db_path(board=board).resolve()))
++    argv = _worker_scope.apply_oom_recovery(argv, task.id, board)  # OOM recovery raises the cap
++    return _aggregate_scope.bounded_scope(argv, task_id=task.id, board=str(_kb.kanban_db_path(board=board).resolve()))  # pool + per-card slice
+ 
+ 
+ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None, observation=None) -> Optional[int]:
+diff --git a/hermes_cli/worker_account_boards.py b/hermes_cli/worker_account_boards.py
+index 136d6ba52a..76a70de49b 100644
+--- a/hermes_cli/worker_account_boards.py
++++ b/hermes_cli/worker_account_boards.py
+@@ -32,7 +32,7 @@ def register(conn) -> None:
+     directory.mkdir(parents=True, exist_ok=True)
+     destination = directory / (hashlib.sha256(str(path).encode()).hexdigest() + '.json')
+     if destination.exists():
+-        if json.loads(destination.read_text(encoding='utf-8')) != str(path):
++        if json.loads(destination.read_text(encoding='utf-8-sig')) != str(path):
+             raise ValueError('invalid registered board')
+         return
+     with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=directory, delete=False) as handle:
+@@ -78,7 +78,7 @@ def removing(path: Path):
+             for root in roots:
+                 stack.enter_context(admission_lock(root, timeout=0))
+             registered = record.exists()
+-            if registered and json.loads(record.read_text(encoding='utf-8')) != str(path):
++            if registered and json.loads(record.read_text(encoding='utf-8-sig')) != str(path):
+                 raise ValueError('invalid registered board')
+             verify = registered or (capacity.worker_enabled() and path.exists())
+             if verify:
+@@ -127,7 +127,7 @@ def paths() -> list[Path]:
+         for record in directory.iterdir():
+             if record.suffix != '.json':
+                 continue
+-            raw = json.loads(record.read_text(encoding='utf-8'))
++            raw = json.loads(record.read_text(encoding='utf-8-sig'))
+             if not isinstance(raw, str) or not Path(raw).is_absolute():
+                 raise ValueError('invalid registered board path')
+             if record.stem != hashlib.sha256(raw.encode()).hexdigest():
+diff --git a/hermes_cli/worker_board_retirement.py b/hermes_cli/worker_board_retirement.py
+index 01afce43ff..d206d9ceb9 100644
+--- a/hermes_cli/worker_board_retirement.py
++++ b/hermes_cli/worker_board_retirement.py
+@@ -77,14 +77,14 @@ def recover(path: Path) -> None:
+     with admission_lock(root, timeout=0):
+         if path.exists():
+             raise ValueError('source exists; use normal board removal')
+-        raw = json.loads(intent.read_text(encoding='utf-8'))
++        raw = json.loads(intent.read_text(encoding='utf-8-sig'))
+         if (not isinstance(raw, dict) or raw.get('version') != 1
+                 or raw.get('path') != str(path) or raw.get('idle') is not True
+                 or type(raw.get('device')) is not int
+                 or type(raw.get('inode')) is not int or raw['inode'] <= 0):
+             raise ValueError('invalid board retirement proof')
+         if record.exists():
+-            if json.loads(record.read_text(encoding='utf-8')) != str(path):
++            if json.loads(record.read_text(encoding='utf-8-sig')) != str(path):
+                 raise ValueError('registered identity differs from retirement proof')
+             discard(record)
+         discard(intent)
+diff --git a/hermes_cli/worker_compute_capacity.py b/hermes_cli/worker_compute_capacity.py
+index 4b62cc1247..6b1adc4b26 100644
+--- a/hermes_cli/worker_compute_capacity.py
++++ b/hermes_cli/worker_compute_capacity.py
+@@ -21,7 +21,7 @@ def effective_cores() -> float:
+     """
+     import os
+     cpus = set()
+-    for span in (CGROUP_ROOT / 'cpuset.cpus.effective').read_text(encoding='utf-8').strip().split(','):
++    for span in (CGROUP_ROOT / 'cpuset.cpus.effective').read_text(encoding='utf-8-sig').strip().split(','):
+         bounds = span.split('-')
+         low, high = int(bounds[0]), int(bounds[-1])
+         if len(bounds) > 2 or low < 0 or high < low or high > 1048576:
+@@ -34,7 +34,7 @@ def effective_cores() -> float:
+     quota_file = CGROUP_ROOT / 'cpu.max'
+     # The real cgroup-v2 root has no cpu.max; a delegated mount may have one.
+     if quota_file.exists():
+-        raw, period = quota_file.read_text(encoding='utf-8').split()
++        raw, period = quota_file.read_text(encoding='utf-8-sig').split()
+         if int(period) <= 0:
+             raise ValueError('invalid host CPU period')
+         if raw != 'max':
+@@ -108,7 +108,7 @@ def occupied_owners(root: Path, owners: dict[str, Owner], active: set[Owner], *,
+         # Resolve against this sample's identity, never an earlier name census.
+         if owner is None and legacy_resolver is not None:
+             owner = legacy_resolver(root, child.name)
+-        events = dict(line.split() for line in (child / 'cgroup.events').read_text(encoding='utf-8').splitlines())
++        events = dict(line.split() for line in (child / 'cgroup.events').read_text(encoding='utf-8-sig').splitlines())
+         try:
+             after = child.lstat()
+         except FileNotFoundError as exc:
+@@ -125,7 +125,7 @@ def occupied_owners(root: Path, owners: dict[str, Owner], active: set[Owner], *,
+ 
+ def pool_path() -> Path:
+     import os
+-    uid = os.getuid()
++    uid = os.getuid()  # windows-footgun: ok (Linux cgroup-v2 only)
+     return CGROUP_ROOT / 'user.slice' / f'user-{uid}.slice' / f'user@{uid}.service' / 'hermes.slice' / 'hermes-kanban.slice'
+ 
+ 
+@@ -167,10 +167,10 @@ def configure_card(board: str, task: str) -> str:
+     if env is None:
+         raise RestartSafeScopeUnavailable('Worker compute budget requires the user bus')
+     cores = effective_cores()
+-    base = CGROUP_ROOT / 'user.slice' / f'user-{os.getuid()}.slice'
++    base = CGROUP_ROOT / 'user.slice' / f'user-{os.getuid()}.slice'  # windows-footgun: ok (Linux cgroup-v2 only)
+     _verify_quota(base, cores * .875)
+     name = owner_slice(board, task)
+-    manager = base / f'user@{os.getuid()}.service'
++    manager = base / f'user@{os.getuid()}.service'  # windows-footgun: ok (Linux cgroup-v2 only)
+     pool = manager / 'hermes.slice' / 'hermes-kanban.slice'
+     for unit, quota, path in [('hermes-kanban.slice', cores * .75, pool), (name, 2, pool / name)]:
+         for arguments in [('set-property', '--runtime', unit, f'CPUQuota={quota * 100:g}%', 'CPUWeight=10'),
+@@ -178,7 +178,7 @@ def configure_card(board: str, task: str) -> str:
+             subprocess.run(['systemctl', '--user', *arguments], env=env, check=True,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10)
+         _verify_quota(path, quota)
+-        if not 1 <= int((path / 'cpu.weight').read_text(encoding='utf-8')) <= 10:
++        if not 1 <= int((path / 'cpu.weight').read_text(encoding='utf-8-sig')) <= 10:
+             raise ValueError(f'Worker CPU weight is missing or too high: {unit}')
+     directory = policy_root() / 'worker-resources' / 'owners'
+     directory.mkdir(parents=True, exist_ok=True)
+@@ -197,6 +197,6 @@ def configure_card(board: str, task: str) -> str:
+ 
+ 
+ def _verify_quota(path: Path, maximum: float) -> None:
+-    raw, period = (path / 'cpu.max').read_text(encoding='utf-8').split()
++    raw, period = (path / 'cpu.max').read_text(encoding='utf-8-sig').split()
+     if raw == 'max' or int(period) <= 0 or int(raw) <= 0 or int(raw) / int(period) > maximum:
+         raise ValueError(f'Worker CPU quota is missing or too wide: {path.name}')
+diff --git a/hermes_cli/worker_legacy_scopes.py b/hermes_cli/worker_legacy_scopes.py
+index 7ba41b385d..3f80b691a1 100644
+--- a/hermes_cli/worker_legacy_scopes.py
++++ b/hermes_cli/worker_legacy_scopes.py
+@@ -31,7 +31,7 @@ _MANAGED = re.compile(r'hermes-kanban-[0-9a-f]{64}\.slice\Z')
+ 
+ 
+ def boot_id() -> str:
+-    value = BOOT_ID_PATH.read_text(encoding='utf-8').strip()
++    value = BOOT_ID_PATH.read_text(encoding='utf-8-sig').strip()
+     if not value:
+         raise ValueError('empty boot id')
+     return value
+@@ -76,7 +76,7 @@ def lookup(pool: Path, name: str):
+     if not valid_scope_name(name):
+         return None
+     try:
+-        text = _record_path(name).read_text(encoding='utf-8')
++        text = _record_path(name).read_text(encoding='utf-8-sig')
+     except FileNotFoundError:
+         return None
+     record = _parse(json.loads(text), name)
+@@ -106,7 +106,7 @@ def owners_for_pool(pool: Path) -> dict[str, tuple[str, str]]:
+ 
+ 
+ def _populated(path: Path) -> bool:
+-    events = dict(line.split() for line in (path / 'cgroup.events').read_text(encoding='utf-8').splitlines())
++    events = dict(line.split() for line in (path / 'cgroup.events').read_text(encoding='utf-8-sig').splitlines())
+     if events.get('populated') not in {'0', '1'}:
+         raise ValueError('invalid populated observation')
+     return events['populated'] == '1'
+@@ -146,13 +146,13 @@ def register(scope: str, database, task: str, *, pool: Path | None = None, timeo
+         if not _populated(path):
+             raise ValueError('legacy scope is not populated')
+         capacity._verify_quota(path, MAX_CORES)
+-        if not 1 <= int((path / 'cpu.weight').read_text(encoding='utf-8')) <= MAX_WEIGHT:
++        if not 1 <= int((path / 'cpu.weight').read_text(encoding='utf-8-sig')) <= MAX_WEIGHT:
+             raise ValueError('legacy scope CPU weight is missing or too high')
+         record = {'version': 1, 'scope': scope, 'owner': list(owner), 'boot_id': boot_id(),
+                   'dev': dev, 'ino': ino}
+         existing = None
+         with contextlib.suppress(FileNotFoundError):
+-            existing = _parse(json.loads(_record_path(scope).read_text(encoding='utf-8')), scope)
++            existing = _parse(json.loads(_record_path(scope).read_text(encoding='utf-8-sig')), scope)
+         if existing is not None and existing != record and lookup(pool, scope) is not None:
+             raise ValueError('legacy scope is already registered to another owner')
+         if _identity(path) != (dev, ino):
+diff --git a/hermes_cli/worker_load_observer.py b/hermes_cli/worker_load_observer.py
+index cb0655ae69..2009ca8ceb 100644
+--- a/hermes_cli/worker_load_observer.py
++++ b/hermes_cli/worker_load_observer.py
+@@ -44,7 +44,7 @@ def tick(directory: Path, *, now: float, load_per_core: float | None, evidence:
+     with (directory / 'observer.lock').open('a') as lock:
+         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+         try:
+-            state = json.loads((directory / 'observer.json').read_text(encoding='utf-8'))
++            state = json.loads((directory / 'observer.json').read_text(encoding='utf-8-sig'))
+         except FileNotFoundError:
+             state = dict(version=1, last=None, high_since=None, pending=None, published_id=None, armed=True)
+         if not isinstance(state, dict) or state.get('version') != 1:
+diff --git a/hermes_cli/worker_load_snapshot.py b/hermes_cli/worker_load_snapshot.py
+index a09082e556..f7d549ca6e 100644
+--- a/hermes_cli/worker_load_snapshot.py
++++ b/hermes_cli/worker_load_snapshot.py
+@@ -20,12 +20,12 @@ def _processes(proc: Path) -> dict:
+         if not path.name.isdecimal():
+             continue
+         try:
+-            raw = (path / 'stat').read_text(encoding='utf-8')
++            raw = (path / 'stat').read_text(encoding='utf-8-sig')
+             opening, closing = raw.index('('), raw.rindex(')')
+             fields = raw[closing + 2:].split()
+             # Fields after comm start at stat field 3; starttime is field 22.
+             ticks, birth = int(fields[11]) + int(fields[12]), int(fields[19])
+-            cgroup = (path / 'cgroup').read_text(encoding='utf-8')
++            cgroup = (path / 'cgroup').read_text(encoding='utf-8-sig')
+             unified = next(line[3:] for line in cgroup.splitlines() if line.startswith('0::'))
+             result[int(path.name)] = dict(birth=birth, ticks=ticks, comm=_text(raw[opening + 1:closing]),
+                                           group=unified, uid=path.stat().st_uid)
+@@ -46,7 +46,7 @@ def snapshot(*, proc: Path = Path('/proc'), interval: float = 0.2) -> dict:
+     if directory.exists():
+         for path in directory.glob('*.json'):
+             try:
+-                owner = json.loads(path.read_text(encoding='utf-8'))
++                owner = json.loads(path.read_text(encoding='utf-8-sig'))
+                 if (not isinstance(owner, list) or len(owner) != 2
+                         or not all(isinstance(value, str) and value for value in owner)
+                         or capacity.owner_slice(*owner) != path.stem):
+@@ -80,7 +80,7 @@ def snapshot(*, proc: Path = Path('/proc'), interval: float = 0.2) -> dict:
+         contained = 'hermes-kanban.slice' in parts
+         rows.append(dict(pid=pid, comm=current['comm'], cpu_percent=round(100 * delta / hz / elapsed, 2),
+                          card=owned or 'unknown', contained=contained,
+-                         uncontained_same_uid=current['uid'] == os.getuid() and not contained))
++                         uncontained_same_uid=current['uid'] == os.getuid() and not contained))  # windows-footgun: ok (Linux /proc only)
+     rows.sort(key=lambda row: (-row['cpu_percent'], row['pid']))
+     return dict(cpu_basis='interval; 100% = one core', sample_seconds=round(elapsed, 3),
+                 process_inventory='partial' if unknown else 'observed', unknown_processes=unknown,
+diff --git a/hermes_cli/worker_resource_admission.py b/hermes_cli/worker_resource_admission.py
+index a1a7c829fa..562c5e17a1 100644
+--- a/hermes_cli/worker_resource_admission.py
++++ b/hermes_cli/worker_resource_admission.py
+@@ -41,7 +41,7 @@ def _pressure(directory: Path) -> bool:
+         _lock_pressure(lock)
+         path = directory / 'pressure.json'
+         try:
+-            state = json.loads(path.read_text(encoding='utf-8'))
++            state = json.loads(path.read_text(encoding='utf-8-sig'))
+         except FileNotFoundError:
+             state = {'held': False}
+         if not isinstance(state, dict) or type(state.get('held')) is not bool:
+@@ -69,7 +69,7 @@ def pool_occupancy(pool: Path, owners, active, *, legacy_resolver=None):
+     try:
+         pool.stat()
+     except FileNotFoundError:
+-        events = dict(line.split() for line in (pool.parent.parent / 'cgroup.events').read_text(encoding='utf-8').splitlines())
++        events = dict(line.split() for line in (pool.parent.parent / 'cgroup.events').read_text(encoding='utf-8-sig').splitlines())
+         if events.get('populated') not in {'0', '1'}:
+             raise ValueError('invalid user manager observation')
+         try:
+@@ -93,7 +93,7 @@ def occupied_count_for_host(echo=None, *, claimant=None) -> int | None:
+         for path in owner_dir.iterdir():
+             if path.suffix != '.json':
+                 continue
+-            owner = json.loads(path.read_text(encoding='utf-8'))
++            owner = json.loads(path.read_text(encoding='utf-8-sig'))
+             if (not isinstance(owner, list) or len(owner) != 2
+                     or not all(isinstance(value, str) and value for value in owner)
+                     or capacity.owner_slice(*owner) != path.stem):
+diff --git a/scripts/run_tests_parallel.py b/scripts/run_tests_parallel.py
+index cd927723af..60af1b07d2 100644
+--- a/scripts/run_tests_parallel.py
++++ b/scripts/run_tests_parallel.py
+@@ -804,6 +804,15 @@ def _run_one_file_once(
+         return _run_one_file_attempt(file, pytest_args, repo_root, file_timeout, targets, slot_fd=slot_fd)
+ 
+ 
++def _worker_job_cap(text: str) -> int:
++    """argparse type for -j: a worker host caps file parallelism to its fixed test budget."""
++    jobs = int(text)
++    from hermes_cli.worker_compute_capacity import worker_enabled
++    if worker_enabled():
++        return 1 if inherited_slot() else min(jobs, host_slot_count())
++    return jobs
++
++
+ def _run_one_file_attempt(
+     file: Path,
+     pytest_args: list[str],
+@@ -1464,8 +1473,8 @@ def main() -> int:
+         description=__doc__,
+         formatter_class=argparse.RawDescriptionHelpFormatter,
+     )
+-    parser.add_argument("-j", "--jobs", type=int,
+-                        default=int(os.environ.get("HERMES_TEST_WORKERS") or (os.cpu_count() or 4)),
++    parser.add_argument("-j", "--jobs", type=_worker_job_cap,  # string default: the cap applies to it too
++                        default=os.environ.get("HERMES_TEST_WORKERS") or str(os.cpu_count() or 4),
+                         help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count)")
+     parser.add_argument(
+         "--paths",
+@@ -1857,9 +1866,6 @@ def main() -> int:
+         sys.path.insert(0, str(repo_root))
+     _sweep_killed_run_roots(_runner_scratch_root())
+ 
+-    from hermes_cli.worker_compute_capacity import worker_enabled
+-    if worker_enabled():
+-        args.jobs = 1 if inherited_slot() else min(args.jobs, host_slot_count())
+     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+         # Duration cache for the timeout scaler: known-slow files get
+         # proportional headroom instead of a false timeout-kill under
+diff --git a/scripts/worker_test_budget.py b/scripts/worker_test_budget.py
+index c27ea68cf8..6537388302 100644
+--- a/scripts/worker_test_budget.py
++++ b/scripts/worker_test_budget.py
+@@ -17,7 +17,7 @@ THREAD_VARS = ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
+ 
+ 
+ def _stat(pid: int) -> tuple[int, int]:
+-    parts = Path(f'/proc/{pid}/stat').read_text(encoding='utf-8').rsplit(')', 1)[1].split()
++    parts = Path(f'/proc/{pid}/stat').read_text(encoding='utf-8-sig').rsplit(')', 1)[1].split()
+     return int(parts[1]), int(parts[19])
+ 
+ 
+@@ -49,13 +49,13 @@ def inherited_slot() -> bool:
+         held = os.stat(f'/proc/{pid}/fd/{fd}')
+         if (st.st_dev, st.st_ino) != (held.st_dev, held.st_ino):
+             return False
+-        record = json.loads(expected.read_text(encoding='utf-8'))
++        record = json.loads(expected.read_text(encoding='utf-8-sig'))
+         if (not isinstance(record, dict) or not isinstance(rec.get('nonce'), str) or not rec['nonce'] or
+                 record.get('nonce') != rec['nonce'] or record.get('pid') != pid or
+                 record.get('start') != birth):
+             return False
+         identity = f'{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}'
+-        for line in Path(f'/proc/{pid}/fdinfo/{fd}').read_text(encoding='utf-8').splitlines():
++        for line in Path(f'/proc/{pid}/fdinfo/{fd}').read_text(encoding='utf-8-sig').splitlines():
+             fields = line.split()
+             if (len(fields) == 9 and fields[0] == 'lock:' and
+                     fields[2:6] == ['FLOCK', 'ADVISORY', 'WRITE', str(pid)] and
+@@ -66,6 +66,23 @@ def inherited_slot() -> bool:
+     return False
+ 
+ 
++def cap_xdist_workers(config, budget: int) -> None:
++    """[daveey] One slot holder runs at most ``budget`` xdist workers (``-n 8`` / ``-n auto`` included).
++
++    xdist turns ``-n`` into ``config.option.tx`` in its tryfirst ``pytest_cmdline_main`` and only reads
++    ``tx`` when ``DSession`` starts its nodes at session start, so trimming it in pytest_configure
++    (tests/conftest.py) caps the worker count."""
++    import sys
++    option = getattr(config, "option", None)
++    tx = getattr(option, "tx", None)
++    if not tx or len(tx) <= budget or any(spec != "popen" for spec in tx):
++        return
++    sys.stderr.write(f"(host test slots: capping xdist workers {len(tx)} -> {budget}; "
++                     f"HERMES_TEST_XDIST_MAX overrides)\n")
++    option.tx = list(tx[:budget])
++    option.numprocesses = budget
++
++
+ def child_environment(env: MutableMapping[str, str], fd: int | None) -> None:
+     from hermes_cli.worker_compute_capacity import worker_enabled
+     from scripts.run_tests_host_slots import HELD_ENV, host_slot_dir, host_slot_count, _read_holder
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 0f85d5838c..999042dc50 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -294,6 +294,7 @@ from tests._fixtures.offline_cli_catalogs import _offline_cli_catalog_transport
+ from tests._fixtures.platform_gating import _platforms_gate_reason, _reject_contradictory_platform_marks
+ from tests._fixtures.session_context_reset import _reset_session_context_vars
+ from tests._fixtures.state_monkeypatch import _state_aware_monkeypatch
++from scripts.worker_test_budget import cap_xdist_workers as _cap_xdist_workers
+ from tests._fixtures import required_extras as _required_extras
+ 
+ # HERMES_TEST_REQUIRE_EXTRAS (set by the CI lanes that install the extras): a listed optional
+@@ -1509,22 +1510,6 @@ def _take_host_test_slot(config) -> None:
+         sys.stderr.write(f"(host test slot unavailable: {exc})\n")
+ 
+ 
+-def _cap_xdist_workers(config, budget: int) -> None:
+-    """[daveey] One slot holder runs at most ``budget`` xdist workers (``-n 8`` / ``-n auto`` included).
+-
+-    xdist turns ``-n`` into ``config.option.tx`` in its tryfirst ``pytest_cmdline_main`` and only reads
+-    ``tx`` when ``DSession`` starts its nodes at session start, so trimming it here (pytest_configure)
+-    caps the worker count."""
+-    option = getattr(config, "option", None)
+-    tx = getattr(option, "tx", None)
+-    if not tx or len(tx) <= budget or any(spec != "popen" for spec in tx):
+-        return
+-    sys.stderr.write(f"(host test slots: capping xdist workers {len(tx)} -> {budget}; "
+-                     f"HERMES_TEST_XDIST_MAX overrides)\n")
+-    option.tx = list(tx[:budget])
+-    option.numprocesses = budget
+-
+-
+ def _release_host_test_slot(config) -> None:
+     fd = getattr(config, "_hermes_host_slot_fd", None)
+     if fd is not None:
+diff --git a/tests/scripts/test_worker_test_budget.py b/tests/scripts/test_worker_test_budget.py
+index e72a0dc491..ed76d64cfe 100644
+--- a/tests/scripts/test_worker_test_budget.py
++++ b/tests/scripts/test_worker_test_budget.py
+@@ -125,3 +125,13 @@ print('child receipt verified')
+                                 text=True, encoding='utf-8', timeout=30, check=False)
+     assert result.returncode == 0, result.stdout + result.stderr
+     assert 'child receipt verified' in result.stdout
++
++
++@pytest.mark.parametrize(('enabled', 'inherited', 'expected'),
++                         [(False, False, 16), (True, False, 4), (True, True, 1)])
++def test_runner_jobs_capped_to_worker_budget(monkeypatch, enabled, inherited, expected):
++    from scripts import run_tests_parallel as runner
++    monkeypatch.setattr(capacity, 'worker_enabled', lambda: enabled)
++    monkeypatch.setattr(runner, 'inherited_slot', lambda: inherited)
++    monkeypatch.setattr(runner, 'host_slot_count', lambda: 4)
++    assert runner._worker_job_cap('16') == expected
+-- 
+2.51.0
+

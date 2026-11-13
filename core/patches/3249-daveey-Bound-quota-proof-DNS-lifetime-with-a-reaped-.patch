@@ -1,0 +1,253 @@
+From 2ea8e094e912bbeff682400d59853b88e24d1a29 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 21:00:01 +0000
+Subject: [PATCH] [daveey] Bound quota proof DNS lifetime with a reaped
+ resolver
+
+---
+ hermes_cli/kanban_quota_recovery.py           | 61 ++++++++++++-
+ .../test_kanban_quota_completion_mutations.py | 40 ++++----
+ .../test_kanban_quota_dns_deadline.py         | 91 +++++++++++++++++++
+ 3 files changed, 167 insertions(+), 25 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_quota_dns_deadline.py
+
+diff --git a/hermes_cli/kanban_quota_recovery.py b/hermes_cli/kanban_quota_recovery.py
+index a108722b4c..2b01bd6860 100644
+--- a/hermes_cli/kanban_quota_recovery.py
++++ b/hermes_cli/kanban_quota_recovery.py
+@@ -9,6 +9,61 @@ from contextvars import copy_context
+ 
+ MAX_RESPONSE_BYTES = 1 << 20
+ 
++# libc DNS has no cancellation API. Keep it outside the interpreter/executor so
++# cancelling a probe can kill AND reap the resolver, including during loop shutdown.
++_DNS_SCRIPT = """
++import json, socket, sys
++args = json.load(sys.stdin)
++try:
++    result = socket.getaddrinfo(*args)
++except OSError:
++    sys.exit(1)
++json.dump(result, sys.stdout)
++"""
++
++
++async def _getaddrinfo(host, port, *, family=0, type=0, proto=0, flags=0):
++    import subprocess
++    import sys
++    import tempfile
++    from tools.environments.local import build_subprocess_env
++
++    if isinstance(host, bytes):
++        host = host.decode('ascii')
++    # A file avoids pipe backpressure and transport finalizers. Reaping below is
++    # synchronous after SIGKILL, so nested AnyIO cancellation cannot interrupt it.
++    with tempfile.TemporaryFile() as output:
++        process = subprocess.Popen(  # noqa: ASYNC220 -- synchronous spawn preserves kill/reap ownership on cancellation
++            [sys.executable, '-I', '-S', '-c', _DNS_SCRIPT],
++            stdin=subprocess.PIPE, stdout=output, stderr=subprocess.DEVNULL,
++            env=build_subprocess_env(base={}))
++        try:
++            process.stdin.write(json.dumps([host, port, family, type, proto, flags]).encode('utf-8'))
++            process.stdin.close()
++            while process.poll() is None:
++                await asyncio.sleep(0.01)
++            if process.returncode != 0:
++                raise OSError('DNS resolution failed')
++            output.seek(0)
++            rows = json.loads(output.read(MAX_RESPONSE_BYTES))
++            return [(af, kind, protocol, name, tuple(address))
++                    for af, kind, protocol, name, address in rows]
++        finally:
++            process.stdin.close()
++            if process.poll() is None:
++                try:
++                    process.kill()
++                except ProcessLookupError:
++                    pass
++            process.wait(timeout=1)
++
++
++async def _run_attempt(provider, url, headers, body, deadline):
++    # Loop-local replacement: no global socket patch and no uncancellable DNS
++    # work in asyncio's default executor (which asyncio.run must join on exit).
++    asyncio.get_running_loop().getaddrinfo = _getaddrinfo
++    return await _attempt(provider, url, headers, body, deadline)
++
+ 
+ def _client(timeout):
+     import httpx
+@@ -80,8 +135,8 @@ async def _attempt(provider, url, headers, body, deadline):
+ def completion_succeeds(provider, model, observed, deadline):
+     """One request, no SDK retry/refresh, and no response or credential diagnostics.
+ 
+-    The absolute deadline is enforced by asyncio cancellation (closes the connection), so a
+-    trickling or newline-less peer cannot keep a worker thread alive past it.
++    Cancellation closes HTTP sockets and kills/reaps the isolated DNS resolver;
++    asyncio.run retains normal executor shutdown with no DNS thread to join.
+     """
+     import httpx
+     if deadline - time.monotonic() <= 0:
+@@ -107,7 +162,7 @@ def completion_succeeds(provider, model, observed, deadline):
+     else:
+         return False
+     try:
+-        return asyncio.run(_attempt(provider, url, headers, body, deadline))
++        return asyncio.run(_run_attempt(provider, url, headers, body, deadline))
+     except (httpx.HTTPError, OSError, ValueError, TimeoutError):
+         return False
+ 
+diff --git a/tests/hermes_cli/test_kanban_quota_completion_mutations.py b/tests/hermes_cli/test_kanban_quota_completion_mutations.py
+index 630d671c74..11978e4557 100644
+--- a/tests/hermes_cli/test_kanban_quota_completion_mutations.py
++++ b/tests/hermes_cli/test_kanban_quota_completion_mutations.py
+@@ -317,31 +317,27 @@ def test_recover_all_stalled_clears_nothing_within_deadline(serve, monkeypatch):
+ # ---------------------------------------------------------------- DNS executor finalization
+ 
+ @pytest.fixture
+-def hang_dns(monkeypatch):
+-    """Bounded DNS stub: blocks until released (or 3s) then fails; never touches the network.
++def hang_dns(monkeypatch, tmp_path):
++    """Hang the actual resolver child, then verify cancellation reaped it."""
++    from pathlib import Path
+ 
+-    Teardown releases the stub and joins every thread it spawned (asyncio default-executor
+-    and recover() workers) BEFORE monkeypatch restores getaddrinfo, so nothing escapes.
+-    """
+-    release = threading.Event()
+     baseline = set(threading.enumerate())
++    marker = tmp_path / 'dns-pid'
++    monkeypatch.setattr(recovery, '_DNS_SCRIPT', (
++        "import os, time\n"
++        f"open({str(marker)!r}, 'w').write(str(os.getpid()))\n"
++        "time.sleep(3)\n"))
++    yield marker
++    # recover may return just before its worker finishes cancellation. Join those
++    # owned workers before restoring patches; never relax the caller bound.
++    for thread in set(threading.enumerate()) - baseline:
++        thread.join(1)
++        assert not thread.is_alive()
++    assert marker.exists(), 'resolver never started'
++    pid = int(marker.read_text())
++    assert not Path(f'/proc/{pid}').exists(), f'resolver {pid} not reaped'
++
+ 
+-    def stub(*a, **k):
+-        release.wait(3.0)
+-        raise socket.gaierror(socket.EAI_AGAIN, 'stubbed DNS failure')
+-    monkeypatch.setattr(socket, 'getaddrinfo', stub)
+-    yield release
+-    release.set()
+-    leaked = [t for t in threading.enumerate() if t not in baseline and t is not threading.current_thread()]
+-    for t in leaked:
+-        t.join(5)
+-    assert not [t for t in leaked if t.is_alive()], 'DNS worker thread leaked'
+-
+-
+-@pytest.mark.xfail(strict=True, reason=(
+-    'KNOWN PRODUCTION LEAK: asyncio.run() joins the default executor on exit, so a hung '
+-    'getaddrinfo keeps completion_succeeds() alive past its absolute deadline. Remove this '
+-    'xfail once production stops joining it (e.g. own loop + shutdown_default_executor skipped).'))
+ def test_hung_dns_does_not_extend_completion_past_deadline(hang_dns):
+     start = time.monotonic()
+     assert recovery.completion_succeeds('anthropic', 'm', _entry('k'), start + 0.5) is False
+diff --git a/tests/hermes_cli/test_kanban_quota_dns_deadline.py b/tests/hermes_cli/test_kanban_quota_dns_deadline.py
+new file mode 100644
+index 0000000000..9e77d2aa0c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_quota_dns_deadline.py
+@@ -0,0 +1,91 @@
++"""Process-exit proof and killing mutants for the isolated DNS resolver."""
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_quota_recovery as recovery
++from tools.environments.local import build_subprocess_env
++
++
++@pytest.mark.parametrize('mutant', ['none', 'executor_dns', 'no_kill'])
++def test_dns_deadline_in_fresh_interpreter_and_mutants(tmp_path, mutant):
++    source = Path(recovery.__file__).read_text(encoding='utf-8')
++    if mutant == 'executor_dns':
++        source = source.replace('asyncio.get_running_loop().getaddrinfo = _getaddrinfo', 'pass')
++    elif mutant == 'no_kill':
++        source = source.replace('process.kill()', 'process.wait(timeout=5)')
++    script = tmp_path / 'probe.py'
++    marker = tmp_path / 'resolver-pid'
++    dns_script = f"import os,time; open({str(marker)!r}, 'w').write(str(os.getpid())); time.sleep(3)"
++    script.write_text(
++        'import sys, socket, time, types\n'
++        f'sys.path.insert(0, {str(Path(recovery.__file__).resolve().parents[1])!r})\n'
++        'import httpx\n'
++        'from types import SimpleNamespace\n'
++        'module = types.ModuleType("isolated_recovery")\n'
++        f'exec(compile({source!r}, "recovery.py", "exec"), module.__dict__)\n'
++        'def stalled(*a, **kw):\n'
++        '    time.sleep(3)\n'
++        '    raise socket.gaierror("controlled DNS failure")\n'
++        'socket.getaddrinfo = stalled\n'
++        'module._client = lambda timeout: httpx.AsyncClient(timeout=timeout, trust_env=False)\n'
++        f'module._DNS_SCRIPT = {dns_script!r}\n'
++        'assert module.completion_succeeds("anthropic", "m", '
++        'SimpleNamespace(runtime_api_key="synthetic"), time.monotonic()+0.5) is False\n',
++        encoding='utf-8')
++    start = time.monotonic()
++    result = subprocess.run([sys.executable, str(script)], capture_output=True,
++                            text=True, encoding='utf-8', timeout=6, check=False,
++                            env=build_subprocess_env())
++    elapsed = time.monotonic() - start
++    assert result.returncode == 0, result.stderr
++    assert not result.stderr
++    if mutant == 'none':
++        assert elapsed < 2.5
++    else:
++        assert elapsed > 2.8  # both mutants violate the same process-exit bound
++    if marker.exists():
++        assert not Path('/proc/' + marker.read_text()).exists(), 'resolver not reaped'
++
++
++def test_resolver_roundtrips_addresses_without_network():
++    import asyncio
++    import socket
++
++    rows = asyncio.run(recovery._getaddrinfo(b'127.0.0.1', 443, type=socket.SOCK_STREAM))
++    assert rows
++    assert all(row[0] == socket.AF_INET and row[4] == ('127.0.0.1', 443) for row in rows)
++
++
++def test_resolver_failure_is_closed_and_reaped(monkeypatch):
++    import asyncio
++
++    monkeypatch.setattr(recovery, '_DNS_SCRIPT', 'import sys; sys.exit(1)')
++    with pytest.raises(OSError, match='DNS resolution failed'):
++        asyncio.run(recovery._getaddrinfo('unused.invalid', 443))
++
++
++@pytest.mark.parametrize('drop_wait', [False, True])
++def test_resolver_explicit_reap_guard_and_mutant(monkeypatch, drop_wait):
++    import asyncio
++    import io
++    import types
++    from unittest.mock import Mock
++
++    source = Path(recovery.__file__).read_text(encoding='utf-8')
++    if drop_wait:
++        source = source.replace('process.wait(timeout=1)', 'pass')
++    module = types.ModuleType('reap_proof')
++    exec(compile(source, recovery.__file__, 'exec'), module.__dict__)
++    process = types.SimpleNamespace(stdin=io.BytesIO(), poll=lambda: 0, returncode=0, wait=Mock())
++
++    def spawn(*args, **kw):
++        kw['stdout'].write(b'[]')
++        return process
++
++    monkeypatch.setattr(subprocess, 'Popen', spawn)
++    assert asyncio.run(module._getaddrinfo('unused.invalid', 443)) == []
++    assert process.wait.called is (not drop_wait)
+-- 
+2.51.0
+

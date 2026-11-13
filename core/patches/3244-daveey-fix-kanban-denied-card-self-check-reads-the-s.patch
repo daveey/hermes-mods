@@ -1,0 +1,165 @@
+From c559287b51a4073d1bff1b248bed5c4ebfec98dc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:56:38 +0000
+Subject: [PATCH] [daveey] fix(kanban): denied-card self-check reads the
+ screen's verdict, skips the history read for kept cards; document
+ portable_wake_probes
+
+Follow-ups to PR #1950 (review 5887663683, card t_01a1d3d6ec456452):
+
+1. `denied_target` read only `latest_verdict` (hub_admission events) while the claim screen gates the self-check
+   on `pickup.verdict` (that event, else the `created` payload's audit). It now reads `pickup.verdict`, so a card
+   whose only verdict sits in its created payload is re-placed too. In practice `record_created` mirrors the
+   creation audit as a hub_admission event: on the hub (read-only, 11-13) all 136 creation-time denies have the
+   event and 0 cards carry a created-payload verdict without one, so this is a consistency fallback.
+2. `kanban.placement.portable_wake_probes` is documented in user-guide/configuration.md. The docs-drift ratchet
+   missed it because it only scanned `self.raw.get(...)` in kanban_placement.py; it now also scans `cfg.get(...)`
+   in kanban_hub_admission_claim.py, which reads the placement section directly.
+3. Per tick the self-check ran `ready_since` (all events + runs) before `keep_reason` for every judged card still
+   on the hub. Keep reasons (regexes + one LIMIT 1 wake_check read) now run first. Measured for a dir-workspace
+   card: denied_target 0.305 -> 0.017 ms at 50 events, 10.6 -> 0.016 ms at 2000 events.
+
+Tests: test_kanban_claim_deny_selfcheck.py +3 (created-payload-only verdict repins; dir/host_repo kept cards
+never call ready_since), test_docs_drift.py open-section key. Red before the fix: those 3 + the drift ratchet.
+---
+ hermes_cli/kanban_worker_first_selfcheck.py   | 19 ++++++----
+ scripts/ci/check_docs_drift.py                |  7 +++-
+ tests/ci/test_docs_drift.py                   |  2 +
+ .../test_kanban_claim_deny_selfcheck.py       | 37 +++++++++++++++++++
+ website/docs/user-guide/configuration.md      |  2 +
+ 5 files changed, 58 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/kanban_worker_first_selfcheck.py b/hermes_cli/kanban_worker_first_selfcheck.py
+index f11ae4dc27..7741cde2d3 100644
+--- a/hermes_cli/kanban_worker_first_selfcheck.py
++++ b/hermes_cli/kanban_worker_first_selfcheck.py
+@@ -75,28 +75,33 @@ def denied_target(conn, row, gateway, cfg, *, board, now=None):
+     non-forced deny, ready for :data:`STALE_S`, that no keep reason holds for *now* (a recorded ``kept`` that still
+     holds, e.g. a dir workspace, ``host_repo`` or a hub-local wake_check, keeps it), and whose worker-queue labels a
+     live machine other than this one carries. The caller writes the same ``runs_on`` the claim-time deny route
+-    writes (``hermes kanban move --pool``'s labels) and a ``moved`` event with the reason."""
++    writes (``hermes kanban move --pool``'s labels) and a ``moved`` event with the reason.
++
++    The verdict is :func:`hermes_cli.kanban_hub_admission_pickup.verdict`, the one the claim screen gates on: the
++    latest ``hub_admission`` event, else the ``created`` payload's audit (``record_created`` mirrors that audit as an
++    event, so the fallback only covers a card whose event is missing). The keep reasons (regexes on the card plus
++    one indexed wake_check read) run before :func:`ready_since`, which scans the card's events and runs: this runs
++    every tick for each judged card still here, and a card kept for good never needs its history read."""
+     from hermes_cli import kanban_hub_admission_claim as claim
+     from hermes_cli import kanban_hub_admission_pickup as pickup
+     from hermes_cli import kanban_move as km
++    from hermes_cli import kanban_parent_unclaimed as unclaimed
+     from hermes_cli import kanban_worker_node as node
+-    from hermes_cli.kanban_hub_admission_placement import latest_verdict
+-    from hermes_cli.kanban_parent_unclaimed import ready_since
+ 
+     # created_on NULL is this gateway's own card the Board has not stamped yet (kanban_sync_client "mine").
+     if (row["placement_policy"] is not None or row["runs_on"] not in (None, "", "[]") or row["status"] != "ready"
+             or row["created_on"] not in (None, gateway) or row["claim_lock"] is not None
+             or row["lease_holder"] is not None):
+         return None
+-    verdict = latest_verdict(conn, row["id"])
++    verdict = pickup.verdict(conn, row["id"])
+     if not verdict or verdict.get("admit") is not False or verdict.get("forced"):
+         return None
+-    waited = (time.time() if now is None else now) - ready_since(conn, row["id"], row["created_at"])
+-    if waited < STALE_S:
+-        return None
+     fields = pickup._fields(row, board)
+     if claim.keep_reason(conn, row, fields, cfg):
+         return None
++    waited = (time.time() if now is None else now) - unclaimed.ready_since(conn, row["id"], row["created_at"])
++    if waited < STALE_S:
++        return None
+     labels = pickup._target(fields, gateway, cfg, dict(verdict))
+     if not labels:
+         return None
+diff --git a/scripts/ci/check_docs_drift.py b/scripts/ci/check_docs_drift.py
+index 31eef6bfad..3efe5c8b39 100644
+--- a/scripts/ci/check_docs_drift.py
++++ b/scripts/ci/check_docs_drift.py
+@@ -60,8 +60,11 @@ def config_leaves() -> list[str]:
+ 
+ # Sections whose default is an empty dict, so walking DEFAULT_CONFIG finds no leaves: their keys are the
+ # ones each reader module takes from its section config (``self.raw.get("key")``). [daveey]
+-OPEN_SECTIONS = {"kanban.placement": ("hermes_cli/kanban_placement.py",)}
+-_RAW_GET = re.compile(r"""\bself\.raw\.get\(\s*["']([A-Za-z_]\w*)["']""")
++# section -> modules that read its keys: ``self.raw.get("k")`` (kanban_placement._Cfg) or ``cfg.get("k")`` in a
++# module handed the section dict (the claim screen's ``portable_wake_probes`` shipped undocumented when only
++# kanban_placement.py was scanned).
++OPEN_SECTIONS = {"kanban.placement": ("hermes_cli/kanban_placement.py", "hermes_cli/kanban_hub_admission_claim.py")}
++_RAW_GET = re.compile(r"""\b(?:self\.raw|cfg)\.get\(\s*["']([A-Za-z_]\w*)["']""")
+ 
+ 
+ def open_section_keys() -> list[str]:
+diff --git a/tests/ci/test_docs_drift.py b/tests/ci/test_docs_drift.py
+index aeaaff79df..ce6a0b49ff 100644
+--- a/tests/ci/test_docs_drift.py
++++ b/tests/ci/test_docs_drift.py
+@@ -62,3 +62,5 @@ def test_open_section_keys_are_checked(drift, monkeypatch):
+     monkeypatch.setattr(drift, "slash_commands", list)
+     gaps = drift.find_gaps()["config"]
+     assert "kanban.placement.auto_overridable_skill_markers" in gaps and "kanban.placement.route" not in gaps
++    # A placement key read as cfg.get(...) outside kanban_placement.py (the claim screen) counts too.
++    assert "kanban.placement.portable_wake_probes" in keys, keys
+diff --git a/tests/hermes_cli/test_kanban_claim_deny_selfcheck.py b/tests/hermes_cli/test_kanban_claim_deny_selfcheck.py
+index 7fc84607b6..533ce0132a 100644
+--- a/tests/hermes_cli/test_kanban_claim_deny_selfcheck.py
++++ b/tests/hermes_cli/test_kanban_claim_deny_selfcheck.py
+@@ -205,6 +205,43 @@ def test_a_failed_self_check_still_screens_the_unjudged_cards(gws, hub_judge, po
+     assert "denied-card self-check failed" in caplog.text
+ 
+ 
++def test_self_check_repins_a_card_whose_only_verdict_is_in_its_created_payload(gws, hub_judge, portable,
++                                                                             monkeypatch):
++    """The screen gates on ``pickup.verdict`` (the ``created`` payload's audit when no ``hub_admission`` event
++    exists), so the self-check reads the same verdict: red when it read only the events. ``record_created`` mirrors
++    the audit as an event (all 136 creation-time denies on the hub, 11-13, have one), so this is the fallback for a
++    card whose event is missing, not the usual path."""
++    import json
++    hub, _worker, _svc = gws
++    tid = _card(hub, wake_check=PROBE)
++    verdict = {k: v for k, v in STALE_KEPT.items() if k != "kept"}
++    with kb.write_txn(hub.conn):
++        (raw,) = hub.conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created'",
++                                  (tid,)).fetchone()
++        hub.conn.execute("UPDATE task_events SET payload = ? WHERE task_id = ? AND kind = 'created'",
++                         (json.dumps({**json.loads(raw), "hub_admission": verdict}), tid))
++    assert _events(hub.conn, tid, "hub_admission") == []
++    _waited(monkeypatch, 3 * 3600)
++    assert hac.screen(hub.conn).repinned == 1 and hub_judge.calls == []
++    [moved] = _events(hub.conn, tid, "moved")
++    assert moved["runs_on"][0] == POOL and moved["self_check"] == "hub_admission_denied"
++
++
++@pytest.mark.parametrize("case", ["dir_workspace", "host_repo"])
++def test_a_structurally_kept_card_skips_the_ready_since_read(gws, hub_judge, portable, monkeypatch, tmp_path, case):
++    """Per tick the self-check runs for every judged card still here; a keep reason that holds is read before the
++    ``ready_since`` events + runs scan, so a card kept for good costs no history read (red: read first)."""
++    hub, _worker, _svc = gws
++    kw, overrides, probe, *_ = _STAY[case]
++    if case == "dir_workspace":
++        kw = {**kw, "workspace_path": str(tmp_path / "ws")}
++    tid = _card(hub, wake_check=probe, verdict={**STALE_KEPT, **overrides}, **kw)
++    reads = []
++    monkeypatch.setattr(unclaimed, "ready_since", lambda conn, t, created_at=None: reads.append(t) or 0)
++    assert hac.screen(hub.conn).repinned == 0 and reads == []
++    assert _events(hub.conn, tid, "moved") == []
++
++
+ def test_self_check_skips_a_card_that_changed_while_checked(gws, portable, monkeypatch):
+     hub, _worker, _svc = gws
+     tid = _card(hub, wake_check=PROBE, verdict=STALE_KEPT)
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index 16b8917e01..8ee9b7eb8c 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -3518,3 +3518,5 @@ kanban:
+ `kanban.placement` (default `{}`: every card is created locally) lets a gateway send cards that have no local-only need to another gateway. `kanban_create` creates such a card on the `route` target via `hermes-hub create-task` and binds it to the chat that asked for it. A card stays local when the caller passes `placement="local"`, when it uses options a remote create can't carry (parents, a project, a `dir`/`worktree` workspace, an initial status, a human request, a tenant; with a hermes-hub client older than 1.8.0, which lacks `create-task --option`, also a model pin, goal mode, triage or a non-local completion contract), when it needs a capability only this gateway holds, when its text matches a local marker (`kanban.placement.local_markers` replaces the built-in list, `kanban.placement.extra_local_markers` extends it; a bare MacBook or mini mention pins only from the title, not from a body verification step), or when the target isn't live. A text-marker local decision is reported on the `kanban_create` result as `placement` plus a one-line remedy. Other keys: `kanban.placement.creator_session`, `kanban.placement.local_skill_markers` (regexes on a card's skills that keep it local), `kanban.placement.auto_overridable_skill_markers`, `kanban.placement.assignees`, `kanban.placement.hub_live_seconds`, `wait_seconds`, `kanban.placement.hub_cli`.
+ 
+ `kanban.placement.auto_overridable_skill_markers` (default `["^myapp", "^bb-"]`) lists the skill regexes that only say what a card is about, such as a Baby Bear repo skill on a Python fix. A card created with an explicit `placement="auto"` skips these skills in the local-marker scan, so it can run elsewhere. Device skills (`apple-*`, `macos-*`, `computer-use`, `ios-*`, a local Chrome) still keep it local, and an omitted placement honours every skill. A list replaces the default. The remedy on a skill-marker result names `placement="auto"` only when that would move the card: one that also carries a device skill is told to drop that skill instead.
++
++`kanban.placement.portable_wake_probes` (default `["alpha-hub-escalation-check.py"]`) lists the basenames of hub wake probes that the fleet installs at the same `~/.hermes/bin/<name>` path on every worker. When the hub's claim screen denies a card hub admission, it keeps the card on the hub if its wake_check reads a hub-local path. A probe on this list doesn't count as hub-local, so the card moves to the worker queue. Any other hub path in the same command still keeps the card. A list replaces the default, and `[]` makes every `~/.hermes/bin` probe hub-local again. A denied card left on the hub with no `runs_on` (its keep reason no longer holds) is re-placed on the worker queue after 5 minutes ready, without a new judge call.
+-- 
+2.51.0
+

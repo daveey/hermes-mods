@@ -1,0 +1,843 @@
+From fe5697ab1b916152ccebc550f236b46dcec54576 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:34:55 +0000
+Subject: [PATCH] [daveey] process completion custody survives a gateway
+ restart between exit and watcher tick
+
+A gateway-watched notify_on_complete job's exit was recorded in its result receipt, removed from
+_running and from the checkpoint before the 5 s watcher tick. A gateway restart in that gap left
+nothing to re-adopt (a receipt reads as observed), so the completion was never admitted
+(proc_0fcf936312c4; exact kill interleaving unproven).
+
+The receipt write now carries a delivery_obligation block (same atomic write, before checkpoint
+removal) for gateway-routed notify_on_complete jobs not already consumed. It is settled only by
+the watcher's admission (or found-admitted / intended suppression) or by wait/read_log/kill
+consumption. recover_from_checkpoint(owner="gateway") re-arms a watcher for each owed receipt of
+its own profile whose writer is gone, bounded by 48 h / 8 starts; the producer identity
+(completion, proc id, started_at) makes a lost-ack replay resolve to the existing admission.
+Ordinary receipts stay retrieval-only. CLI, managed workers and the TUI backend never adopt.
+
+`python -m tools.process_registry_obligations show|reopen proc_<id>` inspects or re-owes one
+exact receipt; reopen refuses when a completion admission for that identity exists.
+
+Task: t_01a1d0f2824382ab
+---
+ gateway/run_process_watcher.py                |  12 +
+ .../test_process_completion_custody.py        | 254 ++++++++++++++
+ tests/tools/test_process_registry.py          |   2 +-
+ tools/process_registry.py                     |  18 +-
+ tools/process_registry_checkpoint.py          |  14 +-
+ tools/process_registry_obligations.py         | 322 ++++++++++++++++++
+ tools/process_registry_results.py             |   6 +-
+ 7 files changed, 615 insertions(+), 13 deletions(-)
+ create mode 100644 tests/gateway/test_process_completion_custody.py
+ create mode 100644 tools/process_registry_obligations.py
+
+diff --git a/gateway/run_process_watcher.py b/gateway/run_process_watcher.py
+index 745bf347e1..68b7c9697f 100644
+--- a/gateway/run_process_watcher.py
++++ b/gateway/run_process_watcher.py
+@@ -40,6 +40,9 @@ class GatewayProcessWatcherMixin:
+         last_output_len = 0
+         completion_attempts = 0
+         retry_interval = interval
++        # [daveey] Why the owed completion (process_registry_obligations) is settled when this loop ends;
++        # None keeps the receipt's obligation for the next gateway start (refused, or the session vanished).
++        settled_by = None
+         while True:
+             await asyncio.sleep(retry_interval)
+             session = process_registry.get(session_id)
+@@ -52,6 +55,7 @@ class GatewayProcessWatcherMixin:
+             if not surface:
+                 # Recheck live ownership next tick: handoff retains notification intent.
+                 if session.exited:
++                    settled_by = "not surfaced"
+                     break
+                 continue
+             if silent:
+@@ -69,12 +73,14 @@ class GatewayProcessWatcherMixin:
+                     completion_evt = self._build_process_completion_event(watcher, session, session_id)
+                     synth_text = format_process_notification(completion_evt)
+                     if not synth_text:
++                        settled_by = "no notice text"
+                         break
+                     # Captured before injection: afterwards the key is busy either way (the injected
+                     # turn itself installs the guard).
+                     turn_busy = await self._launching_turn_active(platform_name, watcher)
+                     delivered = await self._enqueue_process_completion_notification(synth_text, completion_evt)
+                     if delivered is not False:
++                        settled_by = "admitted" if delivered else "already admitted or suppressed"
+                         # The agent normally reports the result itself, so the chat gets no separate
+                         # receipt. While the launching turn is still running the injection only queues a
+                         # follow-up, and the chat would stay mute for as long as that turn lasts
+@@ -106,6 +112,7 @@ class GatewayProcessWatcherMixin:
+                                          exc_info=True)
+                             committed = False
+                         if committed:
++                            settled_by = "admitted (lost acknowledgement)"
+                             break  # The last refusal was a lost ACK: the turn is committed.
+                     logger.warning(
+                         "Process watcher: completion for %s was refused %d times; falling back to the "
+@@ -118,6 +125,7 @@ class GatewayProcessWatcherMixin:
+                         "Process watcher: completion for %s already consumed "
+                         "via wait/log — skipping raw notification (#65379)", session_id,
+                     )
++                    settled_by = "consumed via wait/log"
+                     break
+                 if notify_mode in {"concise", "all", "result"} or (
+                     notify_mode == "error" and session.exit_code not in {0, None}
+@@ -135,6 +143,10 @@ class GatewayProcessWatcherMixin:
+                 await self._send_watcher_message(
+                     platform_name, chat_id, thread_id, self._format_process_running_message(session), watcher,
+                 )
++        if settled_by is not None:
++            # In the owning profile's scope (bound by _run_process_watcher): its receipt holds the obligation.
++            from tools.process_registry_obligations import settle_quietly
++            await asyncio.to_thread(settle_quietly, session_id, settled_by)
+         logger.debug("Process watcher ended%s: %s", " (silent)" if silent else "", session_id)
+ 
+     # Former name of the poll loop (fork tests and callers).
+diff --git a/tests/gateway/test_process_completion_custody.py b/tests/gateway/test_process_completion_custody.py
+new file mode 100644
+index 0000000000..bc247865cf
+--- /dev/null
++++ b/tests/gateway/test_process_completion_custody.py
+@@ -0,0 +1,254 @@
++"""A gateway-watched completion survives a gateway restart that lands between its exit and the watcher tick.
++
++Regression for proc_0fcf936312c4 (local chat 20261027_134353_5ab65c, 11-12): the job's exit was
++recorded in its result receipt, but no completion admission was ever made and no turn ran.
++``_move_to_finished`` writes the receipt, drops the job from ``_running`` and from the checkpoint,
++and only then can the 5 s watcher see it. A restart in that gap left nothing to re-adopt, because a
++receipt counts as "observed" and only the in-memory watcher could deliver.
++
++The receipt now carries the owed delivery (``tools/process_registry_obligations.py``). These tests
++use the real local SessionAuthority, the real watcher and real admission rows. No chat is created
++beyond the fixture's own local session, and no model is called.
++"""
++import json
++
++import pytest
++
++from tests.gateway.test_session_end_delegations import _admissions, _local, _notes
++from tools import process_registry as pr_mod
++from tools.process_registry import ProcessRegistry, ProcessSession
++from tools.process_registry_obligations import OBLIGATION_KEY
++
++STARTED = 1794505311.363151
++
++
++@pytest.fixture()
++def rig(tmp_path, monkeypatch):
++    """Local authority + a registry standing in for each gateway process (patched as the module global)."""
++    holder = {}
++
++    def restart():
++        """A new gateway process: fresh registry, then startup recovery exactly as run_startup calls it."""
++        registry = ProcessRegistry()
++        monkeypatch.setattr(pr_mod, "process_registry", registry)
++        registry.recover_from_checkpoint(owner="gateway")
++        holder["registry"] = registry
++        return registry
++
++    async def setup():
++        runner, authority, ref, _actor = await _local(tmp_path, monkeypatch)
++        live = authority.sessions[ref.session_id]
++        target = runner.session_store.lookup_by_session_key(live.route).session_id
++        holder.update(runner=runner, authority=authority, ref=ref, live=live, target=target, home=tmp_path)
++        return holder
++    holder["setup"], holder["restart"] = setup, restart
++    yield holder
++    if "authority" in holder:
++        holder["authority"].db.close()
++
++
++def _job(h, sid="proc_0fcf936312c4", *, notify=True, key=None, output="RESULT_ok\n", exit_code=0):
++    """A gateway-watched background job of the local chat, running in the current registry."""
++    live = h["live"]
++    registry = h.get("registry") or h["restart"]()
++    session = ProcessSession(
++        id=sid, command="hermes update --yes", task_id="t", owner_task_id="t",
++        session_key=key or live.route, started_at=STARTED, notify_on_complete=notify,
++        watcher_platform=live.source.platform.value, watcher_chat_id=str(live.source.chat_id or ""),
++        watcher_user_id=str(live.source.user_id or ""), watcher_thread_id=str(live.source.thread_id or ""),
++        watcher_interval=5, parent_session_id=h["target"], persist_on_release=True)
++    with registry._lock:
++        registry._running[sid] = session
++    session.append_output(output)
++    return registry, session
++
++
++def _settle_exit(registry, session, exit_code=0):
++    """The reader's exit path: receipt + checkpoint settlement + in-memory publish, no watcher tick."""
++    assert registry._finish_exited(session, exit_code) is True
++
++
++def _receipt(h, sid="proc_0fcf936312c4") -> dict:
++    path = h["home"] / "logs" / "process-results" / f"{sid}.json"
++    return json.loads(path.read_text())
++
++
++async def _run_watchers(h, registry):
++    watchers, registry.pending_watchers = registry.pending_watchers, []
++    for watcher in watchers:
++        watcher["check_interval"] = 0
++        await h["runner"]._run_process_watcher(watcher)
++    return watchers
++
++
++def _completion_admissions(h, sid="proc_"):
++    return [r for r in _admissions(h["authority"], h["ref"]) if sid in json.dumps(r["payload"])]
++
++
++@pytest.mark.asyncio
++async def test_restart_between_exit_and_watcher_tick_admits_the_exact_completion_once(rig):
++    h = await rig["setup"]()
++    registry, session = _job(h, output="build ok\nRESULT_proc_0fcf936312c4 done\n")
++    _settle_exit(registry, session, 0)
++    receipt = _receipt(h)
++    assert receipt["exit_code"] == 0 and OBLIGATION_KEY in receipt, "the owed notice rides the receipt write"
++    assert "proc_0fcf936312c4" not in json.dumps(
++        json.loads((h["home"] / "processes.json").read_text())), "the checkpoint entry is gone"
++
++    # The gateway is replaced before the watcher's first tick (its 5 s sleep): never run it.
++    registry = h["restart"]()
++    watchers = await _run_watchers(h, registry)
++    assert [w["session_id"] for w in watchers] == ["proc_0fcf936312c4"], "restart lost custody of the completion"
++    rows = _completion_admissions(h)
++    assert len(rows) == 1, rows
++    text = rows[0]["payload"]["text"]
++    assert "RESULT_proc_0fcf936312c4" in text and "exit" in text.lower()
++    assert '"completion","proc_0fcf936312c4",1794505311.363151' in json.dumps(rows[0]["payload"]).replace("\\", "")
++    assert OBLIGATION_KEY not in _receipt(h), "admission acknowledges the obligation"
++
++    # Acknowledged: later starts never offer it again.
++    for _ in range(2):
++        registry = h["restart"]()
++        assert await _run_watchers(h, registry) == []
++    assert len(_completion_admissions(h)) == 1
++    await h["authority"]._drain(h["ref"])
++    notes = _notes(h["authority"], h["target"])
++    assert len(notes) == 1 and "RESULT_proc_0fcf936312c4" in str(notes[0]["content"])
++    # The exact-ID recovery tool sees the real admission row and refuses to owe it again.
++    from tools.process_registry_obligations import reopen
++    refused = reopen("proc_0fcf936312c4", platform="local", chat_id=str(h["live"].source.chat_id or "x"))
++    assert not refused["ok"] and "already admitted as" in refused["error"], refused
++
++
++@pytest.mark.asyncio
++async def test_lost_acknowledgement_replay_resolves_to_the_existing_admission(rig, monkeypatch):
++    """Admission committed, ack never written (gateway killed after admitting): the next start re-arms it,
++    and the producer identity finds the durable admission instead of starting a second turn."""
++    h = await rig["setup"]()
++    registry, session = _job(h)
++    _settle_exit(registry, session)
++    owed_receipt = (h["home"] / "logs" / "process-results" / "proc_0fcf936312c4.json").read_text()
++    registry = h["restart"]()
++    await _run_watchers(h, registry)
++    assert len(_completion_admissions(h)) == 1 and OBLIGATION_KEY not in _receipt(h)
++    # The ack never reached disk: the receipt still says "owed" at the next start.
++    (h["home"] / "logs" / "process-results" / "proc_0fcf936312c4.json").write_text(owed_receipt)
++    registry = h["restart"]()
++    assert len(await _run_watchers(h, registry)) == 1
++    assert len(_completion_admissions(h)) == 1, "a replay must not admit a second turn"
++    assert OBLIGATION_KEY not in _receipt(h)
++
++
++@pytest.mark.asyncio
++async def test_refusal_and_repeated_restarts_keep_custody_until_admitted(rig, monkeypatch):
++    h = await rig["setup"]()
++    registry, session = _job(h)
++    _settle_exit(registry, session)
++    # Repeated restarts with no watcher run in between: each start still finds it.
++    for _ in range(3):
++        registry = h["restart"]()
++    import gateway.run_notifications as rn
++    monkeypatch.setattr(rn, "_MAX_COMPLETION_INJECTION_ATTEMPTS", 1)
++
++    async def refuse(text, evt):
++        return False
++    sent = []
++
++    async def plain(*args, **kwargs):
++        sent.append(args)
++    runner = h["runner"]
++    runner._enqueue_process_completion_notification = refuse
++    runner._send_watcher_message = plain
++    assert len(await _run_watchers(h, registry)) == 1
++    assert _completion_admissions(h) == [] and OBLIGATION_KEY in _receipt(h), "a refusal keeps custody"
++    del runner._enqueue_process_completion_notification, runner._send_watcher_message
++    registry = h["restart"]()
++    assert len(await _run_watchers(h, registry)) == 1
++    assert len(_completion_admissions(h)) == 1 and OBLIGATION_KEY not in _receipt(h)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("consume", ["wait", "read_log"])
++async def test_wait_or_log_consumption_suppresses_the_notice_across_restart(rig, consume):
++    h = await rig["setup"]()
++    registry, session = _job(h)
++    _settle_exit(registry, session)
++    result = registry.wait(session.id, timeout=5) if consume == "wait" else registry.read_log(session.id)
++    assert "RESULT_ok" in json.dumps(result)
++    assert OBLIGATION_KEY not in _receipt(h)
++    registry = h["restart"]()
++    assert await _run_watchers(h, registry) == []
++    assert _completion_admissions(h) == []
++
++
++@pytest.mark.asyncio
++async def test_no_notify_and_other_profile_jobs_do_not_wake(rig):
++    h = await rig["setup"]()
++    registry, quiet = _job(h, "proc_aaaaaaaaaaaa", notify=False)
++    _settle_exit(registry, quiet)
++    registry, foreign = _job(h, "proc_bbbbbbbbbbbb", key="agent:other:local:dm:20261027_134353_5ab65c")
++    _settle_exit(registry, foreign)
++    assert OBLIGATION_KEY not in _receipt(h, "proc_aaaaaaaaaaaa")
++    # A multiplexed gateway starting under profile "main": agent:other:* belongs to profile "other".
++    registry = ProcessRegistry()
++    registry.profile_scoped_checkpoints = True
++    pr_mod.process_registry = registry
++    registry.recover_from_checkpoint(owner="gateway")
++    assert [w["session_id"] for w in registry.pending_watchers] == []
++    assert OBLIGATION_KEY in _receipt(h, "proc_bbbbbbbbbbbb"), "another profile's custody is left for it"
++    assert _receipt(h, "proc_bbbbbbbbbbbb")[OBLIGATION_KEY]["recoveries"] == 0
++    assert _completion_admissions(h) == []
++
++
++def test_only_a_messaging_gateway_rearms_owed_completions(tmp_path, monkeypatch):
++    """Managed workers (owner=None) and the Desktop backend (owner=tui) never take custody."""
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    registry = ProcessRegistry()
++    session = ProcessSession(id="proc_cccccccccccc", command="true", task_id="t", session_key="agent:main:local:dm:x",
++                             started_at=STARTED, notify_on_complete=True, watcher_platform="local",
++                             watcher_chat_id="x", watcher_interval=5)
++    with registry._lock:
++        registry._running[session.id] = session
++    registry._finish_exited(session, 0)
++    for owner in (None, "tui"):
++        other = ProcessRegistry()
++        other.recover_from_checkpoint(owner=owner)
++        assert other.pending_watchers == []
++    gateway = ProcessRegistry()
++    gateway.recover_from_checkpoint(owner="gateway")
++    assert [w["session_id"] for w in gateway.pending_watchers] == ["proc_cccccccccccc"]
++
++
++def test_reopen_marks_one_exact_receipt_and_refuses_an_admitted_one(tmp_path, monkeypatch, capsys):
++    """The supported recovery for a completion lost before this fix: exact id, no chat post, no SQL write."""
++    from tools import process_registry_obligations as ob
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    from hermes_state import SessionDB
++    SessionDB(tmp_path / "state.db").close()
++    directory = tmp_path / "logs" / "process-results"
++    directory.mkdir(parents=True)
++    legacy = {"id": "proc_dddddddddddd", "command": "hermes update", "cwd": None, "task_id": "t",
++              "owner_task_id": "t", "session_key": "agent:main:local:dm:20261027_134353_5ab65c",
++              "parent_session_id": "20261027_134353_5ab65c", "started_at": STARTED, "exit_code": 0,
++              "completion_reason": "exited", "termination_source": "", "notify_on_complete": True,
++              "output": "done"}
++    (directory / "proc_dddddddddddd.json").write_text(json.dumps(legacy))
++    assert ob.main(["reopen", "proc_dddd", "--platform", "local", "--chat-id", "x"]) == 1  # exact ids only
++    assert ob.main(["reopen", "proc_dddddddddddd", "--platform", "local",
++                    "--chat-id", "20261027_134353_5ab65c"]) == 0
++    owed = json.loads((directory / "proc_dddddddddddd.json").read_text())[OBLIGATION_KEY]
++    assert owed["watcher_chat_id"] == "20261027_134353_5ab65c" and owed["recoveries"] == 0
++    armed = ProcessRegistry()
++    armed.recover_from_checkpoint(owner="gateway")
++    assert [(w["session_id"], w["chat_id"], w["platform"]) for w in armed.pending_watchers] == [
++        ("proc_dddddddddddd", "20261027_134353_5ab65c", "local")]
++    recovered = armed.get("proc_dddddddddddd")
++    assert recovered is not None and recovered.exit_code == 0 and recovered.exited
++    assert ob.main(["reopen", "proc_dddddddddddd", "--platform", "local", "--chat-id", "x"]) == 1  # already owed
++    monkeypatch.setattr(ob, "_admitted", lambda record: "adm_1")
++    (directory / "proc_dddddddddddd.json").write_text(json.dumps(legacy))
++    assert ob.main(["reopen", "proc_dddddddddddd", "--platform", "local", "--chat-id", "x"]) == 1
++    assert "already admitted as adm_1" in capsys.readouterr().out
++    registry = ProcessRegistry()
++    registry.recover_from_checkpoint(owner="gateway")
++    assert registry.pending_watchers == []
+diff --git a/tests/tools/test_process_registry.py b/tests/tools/test_process_registry.py
+index 2a29105d7c..740355268c 100644
+--- a/tests/tools/test_process_registry.py
++++ b/tests/tools/test_process_registry.py
+@@ -1255,7 +1255,7 @@ class TestKillProcess:
+ 
+         saved = []
+ 
+-        def record_save(session):
++        def record_save(session, *_owed):
+             saved.append(
+                 (session.completion_reason, session.termination_source, session.exit_code)
+             )
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index b193022604..99ae7cd603 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -40,6 +40,7 @@ from tools.process_registry_output_log import ProcessOutputLogMixin, open_output
+ from tools.process_registry_survivable import ProcessForegroundHoldMixin, enabled as survivable_enabled
+ from tools.process_registry_ownership import ProcessOwnershipMixin
+ from tools.process_registry_termination import ProcessTerminationMixin
++from tools.process_registry_obligations import ProcessObligationMixin, owed_still
+ from tools.process_registry_results import load_completed_results, save_completed_result
+ from tools.process_registry_env_log import env_poller_loop, log_delta_command
+ from tools.process_registry_wsl import _is_wsl_launcher_command
+@@ -684,7 +685,7 @@ _WSL_CHAIN_NOTE = (
+ )
+ 
+ 
+-class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessReadoptMixin, ProcessOutputLogMixin, ProcessOwnershipMixin, ProcessEnvScopeMixin, ProcessForegroundHoldMixin):
++class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCheckpointMixin, ProcessReadoptMixin, ProcessOutputLogMixin, ProcessOwnershipMixin, ProcessEnvScopeMixin, ProcessForegroundHoldMixin):
+     """In-memory registry of running and finished background processes.
+     Thread-safe: accessed from executor threads (terminal_tool, process handlers),
+     the gateway asyncio loop (watchers, reset checks) and the cleanup thread."""
+@@ -1513,9 +1514,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+             if was_running:
+                 session._finish_claimed = True
+                 session.exited_at = time.time()
+-                # Keep the session tracked until its result is durable. A finite
+-                # parent must not observe completion and exit during this write.
+-                save_completed_result(session)
++                # Keep the session tracked until its result (and owed notice) is durable; a finite parent waits.
++                save_completed_result(session, self._completion_obligation(session))
+                 if session.notify_on_complete:
+                     from tools.process_registry_awaiting import claim_completion_event
+                     claim_completion_event(session)
+@@ -1986,7 +1986,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+             **self._status_head(session), "output": "\n".join(selected),
+             "total_lines": total_lines, "showing": f"{len(selected)} lines"}
+         if exited and observed_completion_output and not finalizing:
+-            self._completion_consumed.add(session_id)
++            self._consume_completion(session_id)
+         return result
+ 
+     def wait(self, session_id: str, timeout: int | None = None) -> dict:
+@@ -2020,7 +2020,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+             self._reconcile_local_exit(session)  # orphaned-pipe reader guard
+             result = None
+             if session.exited and not self._reader_finalizing(session):
+-                self._completion_consumed.add(session_id)
++                self._consume_completion(session_id)
+                 result = self._exit_snapshot(session, "exited")
+             elif _is_interrupted():
+                 result = {
+@@ -2096,7 +2096,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+             # Only suppress the autonomous turn after its output is present in
+             # the explicit kill result, matching wait/log consumption.
+             if consume_output and not finalizing:
+-                self._completion_consumed.add(session_id)
++                self._consume_completion(session_id)
+             return result
+         try:
+             early = self._signal_kill(session, session_id, consume_output)
+@@ -2153,7 +2153,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+             self._log_lifecycle_kill(session, source)
+             # A reader can persist a plain exit during the SIGKILL wait; rewrite the receipt.
+             if not self._move_to_finished(session):
+-                save_completed_result(session)
++                save_completed_result(session, owed_still(session.id))
+             self._write_checkpoint()
+             return {
+                 "status": "killed", "session_id": session.id, "completion_reason": session.completion_reason,
+@@ -2199,7 +2199,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+                 with session._lock:
+                     output = _completion_output(session)
+                 if consume_output:
+-                    self._completion_consumed.add(session_id)
++                    self._consume_completion(session_id)
+                 # No waitable handle, so this is not a collected exit. Close the
+                 # entry without queueing a completion, and do not signal a PID
+                 # whose start time does not match.
+diff --git a/tools/process_registry_checkpoint.py b/tools/process_registry_checkpoint.py
+index d38a149797..dbe15c2cfe 100644
+--- a/tools/process_registry_checkpoint.py
++++ b/tools/process_registry_checkpoint.py
+@@ -30,6 +30,10 @@ class ProcessCheckpointMixin:
+         """Subclass supplies the live PID decision. See ProcessRegistry."""
+         raise NotImplementedError
+ 
++    def _recover_owed_completions_locked(self, owner: Optional[str]) -> int:
++        """ProcessObligationMixin re-arms owed gateway completions; a bare checkpoint owes none."""
++        return 0
++
+     # ----- Checkpoint (crash recovery) -----
+ 
+     def _write_checkpoint(self, extra_entries: Optional[list[dict[str, Any]]] = None, *,
+@@ -260,6 +264,11 @@ class ProcessCheckpointMixin:
+         try:
+             with self._checkpoint_file_lock():
+                 recovered, foreign, settled, source = self._recover_from_checkpoint_locked(owner)
++                # Completions a stopped gateway still owed (exit settled before its watcher ticked). [daveey]
++                try:
++                    recovered += self._recover_owed_completions_locked(owner)
++                except Exception:
++                    logger.warning("Owed process completion recovery failed", exc_info=True)
+         except Exception as e:
+             logger.warning("Process checkpoint recovery failed: %s", e, exc_info=True)
+             return 0
+@@ -307,8 +316,9 @@ class ProcessCheckpointMixin:
+                 already_tracked = entry.get("session_id") in self._running
+             if already_tracked:
+                 continue
+-            # Its exit was already observed and delivered (a result receipt exists in some profile):
+-            # re-attaching would start a watcher on a finished job's (maybe reused) PID. [daveey]
++            # Its exit was already observed (a result receipt exists in some profile): re-attaching would start
++            # a watcher on a finished job's (maybe reused) PID. A notice it still owes rides that receipt
++            # (process_registry_obligations). [daveey]
+             if result_recorded(entry.get("session_id")):
+                 logger.info("Not re-attaching finished process %s of session %s: its exit is already recorded",
+                             entry.get("session_id"), entry.get("session_key") or "-")
+diff --git a/tools/process_registry_obligations.py b/tools/process_registry_obligations.py
+new file mode 100644
+index 0000000000..61df0afbc0
+--- /dev/null
++++ b/tools/process_registry_obligations.py
+@@ -0,0 +1,322 @@
++"""[daveey] Completion custody for gateway-watched background jobs across a gateway restart.
++
++A messaging-gateway job's completion has one consumer, the process watcher task the gateway runs for it
++(``gateway/run_process_watcher.py``; the post-turn queue drain discards process completions). The
++watcher polls every few seconds. ``_move_to_finished`` writes the job's result receipt, removes it from
++``_running`` and drops its checkpoint entry before that poll. A gateway restart in that gap left
++nothing to re-adopt: no running entry, and recovery reads a receipt as "observed and delivered"
++(``result_recorded``). The completion was lost even though the receipt held the exit and output.
++
++The receipt now also carries the owed delivery. In the same atomic write that records the result
++(before the checkpoint entry goes), a gateway-watched ``notify_on_complete`` job's receipt gets a
++``delivery_obligation`` block with its watcher route. The obligation is settled (the block removed)
++only when one of these happens:
++
++- the watcher's completion is admitted, or found already admitted (the durable completion admission
++  keyed by producer identity ``(completion, proc id, started_at)``);
++- the watcher ends on an intended suppression (the result was consumed, the notice is not surfaced,
++  or there is no text);
++- the agent consumes the output through ``wait`` / ``read_log`` / ``kill``.
++
++A gateway start (``recover_from_checkpoint(owner="gateway")`` only) re-arms a watcher for each owed
++receipt of its own profile whose writer is gone. That watcher delivers the real exit and output once,
++through the normal admission path, so a replay after a lost acknowledgement resolves to the existing
++admission instead of a second turn. Receipts without the block stay retrieval-only, never replayed.
++Recovery is bounded by ``OBLIGATION_MAX_AGE_SECONDS`` and ``OBLIGATION_MAX_RECOVERIES``.
++
++``python -m tools.process_registry_obligations reopen proc_<id> ...`` marks the obligation on one
++existing receipt by exact id. It refuses when a completion admission for that identity already exists.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import re
++import time
++from contextlib import suppress
++from pathlib import Path
++from typing import Any, Optional
++
++logger = logging.getLogger("tools.process_registry")
++
++OBLIGATION_KEY = "delivery_obligation"
++# Like the async-delegation replay cap: an owed notice older than this is dropped with a logged reason.
++OBLIGATION_MAX_AGE_SECONDS = 48 * 3600
++# Gateway starts that may re-arm one obligation (a notice refused at every start must not loop forever).
++OBLIGATION_MAX_RECOVERIES = 8
++_ROUTE_FIELDS = ("watcher_platform", "watcher_chat_id", "watcher_user_id", "watcher_user_name",
++                 "watcher_thread_id", "watcher_message_id", "watcher_interval", "parent_session_id",
++                 "completion_output_chars", "handoff_note")
++_ID_RE = re.compile(r"proc_[\w]+")
++
++
++def receipt_path(session_id: str) -> Optional[Path]:
++    """This profile's receipt path for an exact process id (None for anything that is not one)."""
++    if not isinstance(session_id, str) or not _ID_RE.fullmatch(session_id):
++        return None
++    from hermes_constants import get_hermes_home
++    return get_hermes_home() / "logs" / "process-results" / f"{session_id}.json"
++
++
++def _read(path: Path) -> Optional[dict]:
++    try:
++        record = json.loads(path.read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        return None
++    return record if isinstance(record, dict) and record.get("id") == path.stem else None
++
++
++def _rewrite(path: Path, record: dict) -> None:
++    """Atomic rewrite that keeps the receipt's mtime (retention and pruning order are by completion)."""
++    from utils import atomic_json_write
++    try:
++        stat = path.stat()
++    except OSError:
++        stat = None
++    atomic_json_write(path, record, mode=0o600)
++    if stat is not None:
++        with suppress(OSError):
++            os.utime(path, (stat.st_atime, stat.st_mtime))
++
++
++def _writer() -> dict:
++    from tools.process_registry import ProcessRegistry
++    pid = os.getpid()
++    return {"writer_pid": pid, "writer_start_time": ProcessRegistry._safe_host_start_time(pid)}
++
++
++def owes_gateway_delivery(session) -> bool:
++    """Whether a finished session's completion is owed to a messaging-gateway watcher."""
++    from tools.process_registry_readopt import OWNER_GATEWAY, checkpoint_entry_owner
++    return bool(session.notify_on_complete and int(session.watcher_interval or 0) > 0
++                and not getattr(session, "_completion_via_readopt_sink", False)
++                and checkpoint_entry_owner({"session_key": session.session_key,
++                                            "watcher_platform": session.watcher_platform}) == OWNER_GATEWAY)
++
++
++def obligation_for(session, *, owed_since: Optional[float] = None) -> dict:
++    return {**{f: getattr(session, f) for f in _ROUTE_FIELDS}, "owed_since": owed_since or time.time(),
++            "recoveries": 0, **_writer()}
++
++
++def settle(session_id: str, how: str) -> bool:
++    """Remove the owed-delivery block from this profile's receipt; True when one was removed."""
++    path = receipt_path(session_id)
++    if path is None or not path.exists():
++        return False
++    record = _read(path)
++    if not record or OBLIGATION_KEY not in record:
++        return False
++    record.pop(OBLIGATION_KEY, None)
++    try:
++        _rewrite(path, record)
++    except OSError:
++        logger.warning("Could not settle the owed completion of %s (%s)", session_id, how, exc_info=True)
++        return False
++    logger.info("Completion of %s settled (%s)", session_id, how)
++    return True
++
++
++def owed_still(session_id: str) -> Optional[dict]:
++    """The obligation the current receipt still carries (a receipt rewrite keeps, never re-creates, it)."""
++    path = receipt_path(session_id)
++    record = _read(path) if path is not None and path.exists() else None
++    owed = record.get(OBLIGATION_KEY) if record else None
++    return owed if isinstance(owed, dict) else None
++
++
++def settle_quietly(session_id: str, how: str) -> bool:
++    """``settle`` for the watcher: a failed acknowledgement keeps custody (the next start retries)."""
++    try:
++        return settle(session_id, how)
++    except Exception:  # health: allow BLE001 -- a failed ack keeps custody; the next start retries
++        logger.warning("Settling completion %s failed", session_id, exc_info=True)
++        return False
++
++
++class ProcessObligationMixin:
++    """Registry side: decide, settle and re-arm owed gateway completions."""
++
++    # Supplied by ProcessRegistry / ProcessCheckpointMixin / ProcessReadoptMixin.
++    _lock: Any
++    _running: dict
++    _finished: dict
++    _completion_consumed: set
++    pending_watchers: list
++    _owned_here: Any
++    _writer_alive: Any
++    _recovered_watcher: Any
++
++    def _completion_obligation(self, session) -> Optional[dict]:
++        """Called under ``self._lock`` by the receipt writer: the owed-delivery block, or None."""
++        if session.id in self._completion_consumed or not owes_gateway_delivery(session):
++            return None
++        return obligation_for(session)
++
++    def _consume_completion(self, session_id: str) -> None:
++        """The agent has the output (wait/log/kill): suppress the autonomous notice, here and across a restart.
++        Under ``self._lock`` so it cannot interleave with ``_move_to_finished``'s receipt write."""
++        with self._lock:
++            self._completion_consumed.add(session_id)
++            settle_quietly(session_id, "consumed via wait/log")
++
++    def _recover_owed_completions_locked(self, owner: Optional[str]) -> int:
++        """Under the checkpoint file lock: re-arm a watcher for each owed receipt of this profile."""
++        from tools.process_registry_readopt import OWNER_GATEWAY, owner_accepts
++        from tools.process_registry_profiles import scope_profile
++        if owner != OWNER_GATEWAY:
++            return 0  # only a messaging gateway runs process watchers
++        from hermes_constants import get_hermes_home
++        directory = get_hermes_home() / "logs" / "process-results"
++        try:
++            paths = sorted(directory.glob("proc_*.json"))
++        except OSError:
++            return 0
++        scope, now, armed = scope_profile(), time.time(), 0
++        for path in paths:
++            record = _read(path) or {}
++            owed = record.get(OBLIGATION_KEY)
++            if not isinstance(owed, dict):
++                continue
++            sid = record["id"]
++            entry = {"session_key": record.get("session_key"), "watcher_platform": owed.get("watcher_platform")}
++            if not owner_accepts(owner, entry) or not self._owned_here(record.get("session_key"), scope):
++                continue
++            with self._lock:
++                tracked = sid in self._running or sid in self._finished
++            if tracked:
++                continue
++            if owed.get("writer_pid") != os.getpid() and self._writer_alive(owed):
++                continue  # a live gateway still has this watcher
++            age, tries = now - float(owed.get("owed_since") or 0), int(owed.get("recoveries") or 0)
++            if age > OBLIGATION_MAX_AGE_SECONDS or tries >= OBLIGATION_MAX_RECOVERIES:
++                record.pop(OBLIGATION_KEY, None)
++                with suppress(OSError):
++                    _rewrite(path, record)
++                logger.warning("Dropped the owed completion of %s (session %s): %s", sid,
++                               record.get("session_key") or "-",
++                               f"{tries} gateway starts did not admit it" if tries >= OBLIGATION_MAX_RECOVERIES
++                               else f"owed for {int(age)}s")
++                continue
++            record[OBLIGATION_KEY] = {**owed, "recoveries": tries + 1, **_writer()}
++            try:
++                _rewrite(path, record)
++            except OSError:
++                logger.warning("Could not claim the owed completion of %s", sid, exc_info=True)
++                continue
++            session = self._owed_session(record, owed)
++            with self._lock:
++                self._finished[sid] = session
++            self.pending_watchers.append(self._recovered_watcher(session))
++            armed += 1
++            logger.info("Re-armed the watcher for %s (session %s): its completion was owed when the last "
++                        "gateway stopped (exit %s)", sid, session.session_key or "-", session.exit_code)
++        return armed
++
++    @staticmethod
++    def _owed_session(record: dict, owed: dict):
++        from tools.process_registry import ProcessSession
++        from tools.process_registry_results import _RESULT_FIELDS
++        fields: dict[str, Any] = {key: record[key] for key in _RESULT_FIELDS}
++        fields.update({f: owed[f] for f in _ROUTE_FIELDS if f in owed and owed[f] is not None})
++        fields["notify_on_complete"] = True
++        session = ProcessSession(**fields, exited=True, output_buffer=str(record.get("output") or ""))
++        session.exited_at = time.time()
++        session._finish_claimed = True
++        session._completion_event.set()
++        return session
++
++
++def _admitted(record: dict) -> Optional[str]:
++    """The admission id of a completion admission for this receipt's producer identity, if any."""
++    from hermes_constants import get_hermes_home
++    from hermes_state import SessionDB
++    identity = json.dumps(["completion", record["id"], record.get("started_at")], separators=(",", ":"))
++    # This profile's own state.db (the receipt's home), never a process-wide default path.
++    db = SessionDB(get_hermes_home() / "state.db", read_only=True)
++    try:
++        with db._read_ctx() as conn:
++            rows = conn.execute("SELECT admission_id, payload_json FROM session_admissions "
++                                "WHERE instr(payload_json, ?) > 0", (record["id"],)).fetchall()
++    finally:
++        db.close()
++    for admission_id, payload_json in rows:
++        with suppress(ValueError, TypeError):
++            payload = json.loads(payload_json)
++            descriptor = payload.get("local_automation_v1") or payload.get("native_text_v1", {}).get("automation", {})
++            if identity in (descriptor.get("identities") or [descriptor.get("identity")]):
++                return admission_id
++    return None
++
++
++def reopen(session_id: str, *, platform: str, chat_id: str, thread_id: str = "", user_id: str = "",
++           parent_session_id: str = "") -> dict:
++    """Mark one existing receipt (exact id, this profile) as owed to its gateway route. Refuses when the
++    receipt is missing, is not ``notify_on_complete``, is not gateway-routed, is already owed, or a completion
++    admission for its producer identity exists. Delivery happens at the next gateway start, once."""
++    path = receipt_path(session_id)
++    if path is None:
++        return {"ok": False, "error": "not an exact process id (proc_<hex>)"}
++    record = _read(path) if path.exists() else None
++    if record is None:
++        return {"ok": False, "error": f"no readable receipt at {path}"}
++    if not record.get("notify_on_complete"):
++        return {"ok": False, "error": "the job did not ask for a completion notice"}
++    if OBLIGATION_KEY in record:
++        return {"ok": False, "error": "already owed; the next gateway start delivers it"}
++    from tools.process_registry_readopt import OWNER_GATEWAY, checkpoint_entry_owner
++    if not platform or not chat_id or checkpoint_entry_owner(
++            {"session_key": record.get("session_key"), "watcher_platform": platform}) != OWNER_GATEWAY:
++        return {"ok": False, "error": "a gateway route (--platform, --chat-id) and a gateway session key are required"}
++    try:
++        admission = _admitted(record)
++    except Exception as exc:  # health: allow BLE001 -- an unverifiable admission state refuses the reopen
++        return {"ok": False, "error": f"cannot read this profile's state.db to rule out an admission: {exc}"}
++    if admission is not None:
++        return {"ok": False, "error": f"already admitted as {admission}; nothing to recover"}
++    record[OBLIGATION_KEY] = {
++        "watcher_platform": platform, "watcher_chat_id": chat_id, "watcher_user_id": user_id,
++        "watcher_user_name": "", "watcher_thread_id": thread_id, "watcher_message_id": "",
++        "watcher_interval": 5, "parent_session_id": parent_session_id or record.get("parent_session_id") or "",
++        "owed_since": time.time(), "recoveries": 0, "writer_pid": 0, "writer_start_time": None,
++        "reopened": True}
++    _rewrite(path, record)
++    logger.info("Reopened the owed completion of %s for %s:%s", session_id, platform, chat_id)
++    return {"ok": True, "receipt": str(path), "session_key": record.get("session_key"),
++            "exit_code": record.get("exit_code"), "started_at": record.get("started_at")}
++
++
++def main(argv: Optional[list[str]] = None) -> int:
++    import argparse
++    parser = argparse.ArgumentParser(prog="python -m tools.process_registry_obligations")
++    sub = parser.add_subparsers(dest="cmd", required=True)
++    show = sub.add_parser("show", help="print one receipt's custody state (read-only)")
++    show.add_argument("session_id")
++    op = sub.add_parser("reopen", help="owe one receipt's completion to its gateway route again")
++    op.add_argument("session_id")
++    op.add_argument("--platform", required=True)
++    op.add_argument("--chat-id", required=True)
++    op.add_argument("--thread-id", default="")
++    op.add_argument("--user-id", default="")
++    op.add_argument("--parent-session-id", default="")
++    args = parser.parse_args(argv)
++    if args.cmd == "show":
++        path = receipt_path(args.session_id)
++        record = _read(path) if path is not None and path.exists() else None
++        if record is None:
++            print(json.dumps({"ok": False, "error": "no readable receipt"}))
++            return 1
++        print(json.dumps({"ok": True, "receipt": str(path), "owed": record.get(OBLIGATION_KEY),
++                          "admission": _admitted(record), "exit_code": record.get("exit_code"),
++                          "session_key": record.get("session_key")}, default=str))
++        return 0
++    result = reopen(args.session_id, platform=args.platform, chat_id=args.chat_id, thread_id=args.thread_id,
++                    user_id=args.user_id, parent_session_id=args.parent_session_id)
++    print(json.dumps(result, default=str))
++    return 0 if result.get("ok") else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/process_registry_results.py b/tools/process_registry_results.py
+index 988b72bd5d..d5c1287dbf 100644
+--- a/tools/process_registry_results.py
++++ b/tools/process_registry_results.py
+@@ -46,13 +46,17 @@ def _result_paths():
+     return [path for _, path in retained[:MAX_RETAINED_RESULTS]]
+ 
+ 
+-def save_completed_result(session) -> None:
++def save_completed_result(session, obligation: dict | None = None) -> None:
++    """``obligation``: the completion is still owed to a gateway watcher (``process_registry_obligations``);
++    it rides this same atomic write, so it is durable before the checkpoint entry goes. [daveey]"""
+     from agent.redact import redact_sensitive_text, redact_terminal_output
+     from tools.process_registry import MAX_OUTPUT_CHARS
+ 
+     with session._lock:
+         record = {key: getattr(session, key) for key in _RESULT_FIELDS}
+         record["output"] = session.output_buffer[-MAX_OUTPUT_CHARS:]
++    if obligation:
++        record["delivery_obligation"] = obligation
+     # Live-output opt-out must not persist raw credentials in durable receipts.
+     record["output"] = redact_terminal_output(record["output"], record["command"], force=True)
+     record["command"] = redact_sensitive_text(record["command"], code_file=True, force=True)
+-- 
+2.51.0
+

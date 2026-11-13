@@ -1,0 +1,429 @@
+From c8863853b104431ffc83821901bcdfc687c7f84a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:40:48 +0000
+Subject: [PATCH] [daveey] kanban: missing-parent repair grant refuses a
+ re-held child and a stale repair run
+
+Review follow-ups for PR #1945 (reviews 5888194553 and 5887767012):
+
+- A hold placed after the parent_missing block no longer reads as that block.
+  missing_parent_repair_grant and the operator call's own-actor check
+  (_agent_block) used the newest `blocked` event only. The failure breaker
+  writes `gave_up`, not `blocked`, so a child that was released and then
+  re-held by the breaker still looked parent_missing (or own-agent) blocked,
+  and the repair card or the operator call could release a policy hold.
+  New kanban_requeue.current_block_payload returns {} when an `unblocked` or
+  `gave_up` event is newer than the newest `blocked`; both checks use it.
+- The kanban_unblock tool path now applies the owner-wake path's run check
+  inside the unblock txn: the repair card must be `running` with
+  current_run_id == _worker_run_id(env_tid), so a reclaimed earlier run
+  cannot act for the live one.
+- Operator call: the repair_task_id/via annotation is decided inside the
+  unblock_task precondition, so it credits the repair grant only when that
+  grant is what passed in the txn.
+- Tests: breaker-hold repro (tool path, 3 event orders; operator path, after a
+  release and after an own-agent block), human_request refusal on both paths,
+  stale-run refusal (not running / reclaimed / unbound), plus refusals for a
+  block naming this card on another child, a card the detector did not file,
+  and a later non-detector block naming the repair card.
+---
+ hermes_cli/kanban_operator_call.py            |  24 +--
+ hermes_cli/kanban_requeue.py                  |  33 +++-
+ ...est_kanban_operator_call_missing_parent.py |  63 ++++++
+ ...st_kanban_missing_parent_repair_unblock.py | 180 ++++++++++++++++++
+ tools/kanban_tools_self_heal.py               |  11 +-
+ 5 files changed, 289 insertions(+), 22 deletions(-)
+
+diff --git a/hermes_cli/kanban_operator_call.py b/hermes_cli/kanban_operator_call.py
+index 9271136693..dc73635853 100644
+--- a/hermes_cli/kanban_operator_call.py
++++ b/hermes_cli/kanban_operator_call.py
+@@ -622,18 +622,14 @@ def _agent_block(conn: sqlite3.Connection, target: str, caller_task: Optional[st
+     gate = _human_gate(row[1], row[2], target)
+     if gate:
+         return gate
+-    ev = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked' "
+-                      "ORDER BY id DESC LIMIT 1", (target,)).fetchone()
+-    try:
+-        payload = json.loads(ev[0] or "{}") if ev else {}
+-    except ValueError:
+-        payload = {}
++    from hermes_cli.kanban_requeue import current_block_payload, missing_parent_repair_grant
+     # Positive provenance: only the card's OWN worker run's block counts (kanban_block from that run records actor
+     # ``agent (task <target>)``, kanban_cli_actor.tool_actor). A block from a human shell (actor ``user``), the
+-    # Desktop or dashboard (no actor), a chat agent or the breaker (no blocked event) is a hold placed by hand or
++    # Desktop or dashboard (no actor), a chat agent or the breaker (no blocked event; an ``unblocked`` or
++    # ``gave_up`` newer than the last ``blocked`` hides it, ``current_block_payload``) is a hold placed by hand or
+     # by policy, and only its owner or a human releases it.
++    payload = current_block_payload(conn, target)
+     if str(payload.get("actor") or "").strip() != f"agent (task {target})":
+-        from hermes_cli.kanban_requeue import missing_parent_repair_grant
+         if caller_task and missing_parent_repair_grant(conn, caller_task, target) == caller_task:
+             return None
+         return (f"{target} was not blocked by its own agent run (a hand, Desktop or policy hold); only its owner "
+@@ -673,11 +669,15 @@ def _apply(conn: sqlite3.Connection, payload: dict, own: str) -> tuple[str, Opti
+             return "refused", refusal
+         reason = str(args.get("reason") or "").strip()
+         from hermes_cli.kanban_requeue import MISSING_PARENT_VIA, missing_parent_repair_grant
+-        if missing_parent_repair_grant(conn, caller.get("task_id"), target):
+-            extra = {**extra, "repair_task_id": caller.get("task_id"), "via": MISSING_PARENT_VIA}
++        extra = dict(extra)
++
++        def precondition(c):  # runs inside the unblock txn, before unblock_task reads event_extra
++            refusal = _agent_block(c, target, caller.get("task_id"))
++            if refusal is None and missing_parent_repair_grant(c, caller.get("task_id"), target):
++                extra.update(repair_task_id=caller.get("task_id"), via=MISSING_PARENT_VIA)
++            return refusal
+         ok = kb.unblock_task(conn, target, comment=(author, f"Unblocked through an operator call: {reason}"),
+-                             event_extra=extra,
+-                             precondition=lambda c: _agent_block(c, target, caller.get("task_id")))
++                             event_extra=extra, precondition=precondition)
+         return ("applied", None) if ok else ("refused", f"cannot unblock {target} (state changed)")
+     if action == "move":
+         if _marker(conn, target, km.MOVED_EVENT, uid) or _marker(conn, target, MOVE_MARK, uid):
+diff --git a/hermes_cli/kanban_requeue.py b/hermes_cli/kanban_requeue.py
+index 7f892c1baa..da06281331 100644
+--- a/hermes_cli/kanban_requeue.py
++++ b/hermes_cli/kanban_requeue.py
+@@ -93,7 +93,9 @@ def missing_parent_repair_grant(conn, worker_task_id: Optional[str], target_id:
+     recovery. That repair card (``created_by='missing-parent-detector'``) may unblock exactly the child that
+     created it (``creator_task_id``), and only while the child is blocked, has no human request, and its NEWEST
+     ``blocked`` event is ``source: parent_missing`` naming this very card as ``repair_task_id``. A later hand
+-    block, or a block naming another repair card, revokes it. Both entry paths use it: the ``kanban_unblock``
++    block, a block naming another repair card, or any ``unblocked``/``gave_up`` event after it (the child was
++    released, then re-held by a policy such as the failure breaker; ``current_block_payload``) revokes it.
++    Both entry paths use it: the ``kanban_unblock``
+     tool (same gateway) and the operator call's home check (another gateway). [daveey]
+     """
+     if not worker_task_id or not target_id or worker_task_id == target_id:
+@@ -105,17 +107,32 @@ def missing_parent_repair_grant(conn, worker_task_id: Optional[str], target_id:
+     row = conn.execute("SELECT status, human_request FROM tasks WHERE id = ?", (target_id,)).fetchone()
+     if row is None or row[0] != "blocked" or row[1]:
+         return None
+-    ev = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked' "
+-                      "ORDER BY id DESC LIMIT 1", (target_id,)).fetchone()
+-    try:
+-        payload = json.loads(ev[0] or "{}") if ev else {}
+-    except ValueError:
+-        return None
+-    if not isinstance(payload, dict) or payload.get("source") != "parent_missing":
++    payload = current_block_payload(conn, target_id)
++    if payload.get("source") != "parent_missing":
+         return None
+     return worker_task_id if payload.get("repair_task_id") == worker_task_id else None
+ 
+ 
++def current_block_payload(conn, task_id: str) -> dict:
++    """The payload of the ``blocked`` event that placed the card's current hold, else ``{}``.
++
++    That is the newest ``blocked`` event, unless an ``unblocked`` or ``gave_up`` event is newer: then the card was
++    released after it, and the hold it is in now came from somewhere that writes no ``blocked`` event (the failure
++    breaker writes ``gave_up``). ``{}`` names no source and no actor, so every grant keyed on them refuses. [daveey]
++    """
++    ev = conn.execute("SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'blocked' "
++                      "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++    if ev is None or conn.execute(
++            "SELECT 1 FROM task_events WHERE task_id = ? AND kind IN ('unblocked', 'gave_up') AND id > ? LIMIT 1",
++            (task_id, ev[0])).fetchone() is not None:
++        return {}
++    try:
++        payload = json.loads(ev[1] or "{}")
++    except ValueError:
++        return {}
++    return payload if isinstance(payload, dict) else {}
++
++
+ _OWNER_WAKE_TITLE = "Owner wake: supervise"
+ # One chat-closeout ``owner_wake.card_line`` of a local card: ``- <board>/<id> "<title>": ...`` or ``- <board>/<id>:``.
+ # A remote card's line names its gateway (`` on <gw>``) or a longer key, so it never matches.
+diff --git a/tests/hermes_cli/test_kanban_operator_call_missing_parent.py b/tests/hermes_cli/test_kanban_operator_call_missing_parent.py
+index 7df277c72e..99fdfd7c41 100644
+--- a/tests/hermes_cli/test_kanban_operator_call_missing_parent.py
++++ b/tests/hermes_cli/test_kanban_operator_call_missing_parent.py
+@@ -9,6 +9,8 @@ from __future__ import annotations
+ 
+ import json
+ 
++import pytest
++
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_supervisor_requests as ksr
+ from tests.hermes_cli import test_kanban_operator_call as base
+@@ -119,3 +121,64 @@ def test_parent_missing_block_naming_another_repair_card_is_refused(fleet):
+     _round(f)
+     assert _execute_row(f, child)["outcome"] == "refused"
+     assert kb.get_task(f.h, child).status == "blocked"
++
++
++def test_breaker_hold_after_a_release_is_refused_at_home(fleet):
++    """Review 5888194553: released after the parent_missing block, then re-held by the breaker (``gave_up``, no
++    ``blocked`` event). The newest ``blocked`` event still names the repair card, but the hold is a policy hold."""
++    f = fleet
++    child, repair, run_id = _home_repair(f)
++    assert kb.unblock_task(f.h, child)
++    with kb.write_txn(f.h):
++        kb._append_event(f.h, child, "gave_up", {"kind": "transient", "reason_code": "worker_failures_exhausted",
++                                                 "sticky": True})
++        f.h.execute("UPDATE tasks SET status = 'blocked', block_kind = 'transient' WHERE id = ?", (child,))
++    f.board()
++    _submit_as(f, repair, run_id, child)
++    _round(f)
++    row = _execute_row(f, child)
++    assert row["outcome"] == "refused" and "not blocked by its own agent run" in row["detail"], row
++    assert kb.get_task(f.h, child).status == "blocked"
++    assert len(_unblocked(f, child)) == 1  # only the release before the breaker trip
++
++
++def test_child_that_later_got_a_human_request_is_refused_at_home(fleet):
++    """Review 5887767012 nit 3: a human_request on the parent_missing child is David's to answer."""
++    f = fleet
++    child, repair, run_id = _home_repair(f)
++    with kb.write_txn(f.h):
++        f.h.execute("UPDATE tasks SET human_request = ? WHERE id = ?",
++                    (json.dumps({"action": "Pick A or B. Unblock = build it; archive = drop it."}), child))
++    # The caller's replica has not seen the ask yet, so the call reaches the home, which refuses it.
++    _submit_as(f, repair, run_id, child)
++    _round(f)
++    row = _execute_row(f, child)
++    assert row["outcome"] == "refused" and "waits on a human" in row["detail"], row
++    assert kb.get_task(f.h, child).status == "blocked"
++    assert not _unblocked(f, child)
++    # Once the replica has it, the caller refuses before sending.
++    f.board()
++    with pytest.raises(ksr.SupervisorRequestError, match="waits on a human"):
++        _submit_as(f, repair, run_id, child)
++
++
++def test_breaker_hold_after_releasing_an_own_agent_block_is_refused_at_home(fleet):
++    """The pre-existing own-actor check had the same blind spot: the card's own run blocked it, it was released,
++    then the breaker re-held it (``gave_up``, no ``blocked`` event). That hold is not the agent's own block."""
++    f = fleet
++    held = f.card(f.h, "own block, released, then breaker")
++    with kb.write_txn(f.h):
++        f.h.execute("UPDATE tasks SET status = 'blocked', block_kind = 'transient' WHERE id = ?", (held,))
++        kb._append_event(f.h, held, "blocked", {"reason": "waiting", "kind": "transient",
++                                                "actor": f"agent (task {held})"})
++    assert kb.unblock_task(f.h, held)
++    with kb.write_txn(f.h):
++        kb._append_event(f.h, held, "gave_up", {"kind": "transient", "reason_code": "worker_failures_exhausted",
++                                                "sticky": True})
++        f.h.execute("UPDATE tasks SET status = 'blocked', block_kind = 'transient' WHERE id = ?", (held,))
++    f.board()
++    _submit_as(f, f.caller, f.run_id, held)
++    _round(f)
++    row = _execute_row(f, held)
++    assert row["outcome"] == "refused" and "not blocked by its own agent run" in row["detail"], row
++    assert kb.get_task(f.h, held).status == "blocked"
+diff --git a/tests/tools/test_kanban_missing_parent_repair_unblock.py b/tests/tools/test_kanban_missing_parent_repair_unblock.py
+index 73d5ca0ca1..44daf0d55f 100644
+--- a/tests/tools/test_kanban_missing_parent_repair_unblock.py
++++ b/tests/tools/test_kanban_missing_parent_repair_unblock.py
+@@ -244,3 +244,183 @@ def test_child_on_another_gateway_is_forwarded_as_an_operator_call(board, monkey
+     assert args["ops"][0] == {"op": "operator", "action": "unblock", "task_id": foreign,
+                               "reason": args["ops"][0]["reason"]}
+     assert repair in args["ops"][0]["reason"]
++
++
++def _rehold(conn, kb, child, events):
++    """Release the parent_missing child, then re-hold it with no new ``blocked`` event (e.g. the failure breaker)."""
++    if "unblocked" in events:
++        assert kb.unblock_task(conn, child)
++    with kb.write_txn(conn):
++        if "gave_up" in events:
++            kb._append_event(conn, child, "gave_up", {"kind": "transient", "reason_code": "worker_failures_exhausted",
++                                                      "sticky": True})
++        conn.execute("UPDATE tasks SET status = 'blocked', block_kind = 'transient' WHERE id = ?", (child,))
++
++
++@pytest.mark.parametrize("events", [("unblocked", "gave_up"), ("unblocked",), ("gave_up",)],
++                         ids=["unblocked-then-breaker", "unblocked-only", "breaker-only"])
++def test_hold_placed_after_the_parent_missing_block_stays_refused(board, monkeypatch, events):
++    """Review 5888194553: an unblock or a breaker trip after the parent_missing block ends the repair card's grant.
++
++    The child was released and is now held by something that writes no ``blocked`` event (the failure breaker
++    writes ``gave_up``), so the newest ``blocked`` event still names the repair card. That hold is a policy hold.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_requeue as kr
++
++    conn = kbc.connect()
++    child, repair = _parent_missing_child(conn, kb)
++    _rehold(conn, kb, child, events)
++    assert kb.get_task(conn, child).status == "blocked"
++    assert kr.missing_parent_repair_grant(conn, repair, child) is None
++    before = len(_unblocked(conn, kb, child))
++    _as_worker(monkeypatch, conn, kb, repair)
++    conn.close()
++
++    assert _unblock(child).get("ok") is not True
++    conn = kbc.connect()
++    try:
++        assert kb.get_task(conn, child).status == "blocked"
++        assert len(_unblocked(conn, kb, child)) == before
++    finally:
++        conn.close()
++
++
++def test_child_that_later_got_a_human_request_stays_refused(board, monkeypatch):
++    """Review 5887767012 nit 3: a human_request on the child is David's to answer, never the repair card's."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    conn = kbc.connect()
++    child, repair = _parent_missing_child(conn, kb)
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET human_request = ? WHERE id = ?",
++                     (json.dumps({"action": "Pick A or B. Unblock = build it; archive = drop it."}), child))
++    _as_worker(monkeypatch, conn, kb, repair)
++    conn.close()
++
++    assert _unblock(child).get("ok") is not True
++    conn = kbc.connect()
++    try:
++        assert kb.get_task(conn, child).status == "blocked"
++        assert not _unblocked(conn, kb, child)
++    finally:
++        conn.close()
++
++
++def _reclaim_and_reclaim(conn, kb, tid):
++    """The dispatcher reclaims the run this worker holds and a fresh run claims the card."""
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status = 'ready', claim_lock = NULL, claim_expires = NULL, "
++                     "current_run_id = NULL WHERE id = ?", (tid,))
++    kb.claim_task(conn, tid)
++
++
++@pytest.mark.parametrize("case", ["reclaimed", "not-running", "unbound"])
++def test_repair_run_that_no_longer_owns_the_card_is_refused(board, monkeypatch, case):
++    """Review 5887767012 nit 1: the tool path needs the owner-wake run check; worker-context checks don't cover it.
++
++    ``_is_dispatcher_owned_worker`` only tells a dispatcher worker from a delegate child or an in-process cron. A
++    reclaimed earlier run of the repair card passes it, so the unblock txn checks the run itself.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++
++    conn = kbc.connect()
++    child, repair = _parent_missing_child(conn, kb)
++    _as_worker(monkeypatch, conn, kb, repair)
++    if case == "reclaimed":
++        old = kb._current_run_id(conn, repair)
++        _reclaim_and_reclaim(conn, kb, repair)
++        assert kb._current_run_id(conn, repair) != old
++        assert kb.get_task(conn, repair).status == "running"
++    elif case == "not-running":  # the run id still matches, but the card left running
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (repair,))
++    else:  # no HERMES_KANBAN_RUN_ID, against a running row whose run id is unset
++        monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (repair,))
++    conn.close()
++    assert kt._is_dispatcher_owned_worker() is True
++
++    out = _unblock(child)
++    assert out.get("ok") is not True, out
++    conn = kbc.connect()
++    try:
++        assert kb.get_task(conn, child).status == "blocked"
++        assert not _unblocked(conn, kb, child)
++    finally:
++        conn.close()
++
++
++def test_block_naming_this_repair_card_on_another_child_is_refused(board, monkeypatch):
++    """The grant reaches only the repair card's own creator child, even when another block names the card."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    conn = kbc.connect()
++    _child, repair = _parent_missing_child(conn, kb, "mine")
++    other, _ = _parent_missing_child(conn, kb, "someone else's")
++    with kb.write_txn(conn):
++        kb._append_event(conn, other, "blocked", {"reason": "re-detected", "kind": "transient",
++                                                  "source": "parent_missing", "repair_task_id": repair})
++    _as_worker(monkeypatch, conn, kb, repair)
++    conn.close()
++
++    assert _unblock(other).get("ok") is not True
++    conn = kbc.connect()
++    try:
++        assert kb.get_task(conn, other).status == "blocked"
++        assert not _unblocked(conn, kb, other)
++    finally:
++        conn.close()
++
++
++def test_card_the_detector_did_not_file_gets_no_grant(board, monkeypatch):
++    """A card the child created and its block names, but not filed by the missing-parent detector, is refused."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    conn = kbc.connect()
++    child, _repair = _parent_missing_child(conn, kb)
++    lookalike = kb.create_task(conn, title=f"Recover missing dependencies for {child}", assignee="default",
++                               creator_task_id=child)
++    with kb.write_txn(conn):
++        kb._append_event(conn, child, "blocked", {"reason": "re-detected", "kind": "transient",
++                                                  "source": "parent_missing", "repair_task_id": lookalike})
++    _as_worker(monkeypatch, conn, kb, lookalike)
++    conn.close()
++
++    assert _unblock(child).get("ok") is not True
++    conn = kbc.connect()
++    try:
++        assert kb.get_task(conn, child).status == "blocked"
++        assert not _unblocked(conn, kb, child)
++    finally:
++        conn.close()
++
++
++def test_later_block_naming_the_repair_card_but_not_from_the_detector_is_refused(board, monkeypatch):
++    """Only the detector's own ``source: parent_missing`` block grants; a later hold that merely names the card
++    (a hand block that copied the old payload's fields) is a hand hold."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    conn = kbc.connect()
++    child, repair = _parent_missing_child(conn, kb)
++    with kb.write_txn(conn):
++        kb._append_event(conn, child, "blocked", {"reason": "David holds it", "actor": "user", "kind": "transient",
++                                                  "repair_task_id": repair})
++    _as_worker(monkeypatch, conn, kb, repair)
++    conn.close()
++
++    assert _unblock(child).get("ok") is not True
++    conn = kbc.connect()
++    try:
++        assert kb.get_task(conn, child).status == "blocked"
++        assert not _unblocked(conn, kb, child)
++    finally:
++        conn.close()
+diff --git a/tools/kanban_tools_self_heal.py b/tools/kanban_tools_self_heal.py
+index 247ca327ad..1d8dbafd62 100644
+--- a/tools/kanban_tools_self_heal.py
++++ b/tools/kanban_tools_self_heal.py
+@@ -130,8 +130,15 @@ def handle_unblock(args: dict, **kw) -> str:
+             if via:
+                 def precondition(current):
+                     task = kb.get_task(current, tid)
+-                    if via == kr.MISSING_PARENT_VIA and kr.missing_parent_repair_grant(current, env_tid, tid) is None:
+-                        return "missing-parent repair grant was revoked (the child's newest block changed)"
++                    if via == kr.MISSING_PARENT_VIA:
++                        # The owner-wake path's run check: a reclaimed earlier run of the repair card (its process
++                        # still alive, HERMES_KANBAN_RUN_ID stale) must not act for the live run. [daveey]
++                        repair, run = kb.get_task(current, env_tid), kt._worker_run_id(env_tid)
++                        if not (repair is not None and repair.status == "running" and run is not None
++                                and repair.current_run_id == run):
++                            return "missing-parent repair card no longer owns its current run"
++                        if kr.missing_parent_repair_grant(current, env_tid, tid) is None:
++                            return "missing-parent repair grant was revoked (the child's newest block changed)"
+                     if via == "owner-wake-requeue" and (
+                             task is None or task.status not in (*OWNER_WAKE_REQUEUE_STATUSES, "ready")):
+                         return "owner-wake target must be triage or blocked"
+-- 
+2.51.0
+

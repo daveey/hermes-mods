@@ -1,0 +1,466 @@
+From 19cbe548a7c75c0e4081ebce0f9af37e4c135623 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 00:07:16 +0000
+Subject: [PATCH] [daveey] Give each _run_agent invocation its own outcome
+ receipt
+
+A queued follow-up's recursive _run_agent now opens a fresh receipt and
+makes it the handler's concluding one, so a predecessor worker writing
+late (an abandoned worker's capture) can only write its own receipt.
+Abandonment captures only a lease the worker holds now, not the cached
+agent's previous holder. concluding_turn_identity drops its unused
+runner/session_key params; prompt_turn uses turn_outcome._turn_sid.
+
+Follow-up to PR #1753 reviews.
+---
+ gateway/run_turn.py                           |   8 +-
+ gateway/run_turn_wait.py                      |   7 +-
+ gateway/turn_outcome.py                       |  64 ++++++++--
+ .../test_outcome_followup_receipts.py         | 119 ++++++++++++++++++
+ .../test_outcome_late_turn_end_refresh.py     |  17 ++-
+ .../hermes_state/test_outcome_run_custody.py  |  17 ++-
+ .../test_outcome_turn_end_declaration.py      |   3 +-
+ tui_gateway/prompt_turn.py                    |   8 +-
+ 8 files changed, 200 insertions(+), 43 deletions(-)
+ create mode 100644 tests/hermes_state/test_outcome_followup_receipts.py
+
+diff --git a/gateway/run_turn.py b/gateway/run_turn.py
+index 368b1473cd..9192df49c2 100644
+--- a/gateway/run_turn.py
++++ b/gateway/run_turn.py
+@@ -40,7 +40,7 @@ from gateway.session_transcript import TranscriptReadError
+ from gateway.run_turn_bubble_cleanup import register_bubble_cleanup, settle_turn_senders
+ from gateway.turn_context import TurnContext
+ from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
+-from gateway.turn_outcome import finish_gateway_turn_outcome, run_outcome
++from gateway.turn_outcome import finish_gateway_turn_outcome, run_outcome, run_receipt_scope
+ from hermes_constants import get_hermes_home_override
+ from pathlib import Path
+ from typing import Any, Callable, Dict, List, Optional, Tuple
+@@ -813,9 +813,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
+         self, message: str, context_prompt: str, history: list[dict[str, Any]],
+         source: SessionSource, session_id: str, **turn_kwargs,
+     ) -> dict[str, Any]:
+-        """Profile-scoping wrapper around ``_run_agent_inner`` (same keyword parameters; pass-through
+-        when multiplexing is off)."""
+-        with self._profile_scope_for_source(source):
++        """Profile-scoping wrapper around ``_run_agent_inner``; each invocation (a queued follow-up's
++        recursion included) owns its outcome receipt (``gateway.turn_outcome.run_receipt_scope``)."""
++        with run_receipt_scope(session_id), self._profile_scope_for_source(source):
+             return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
+ 
+     def _run_agent_display_settings(self, source: SessionSource) -> GatewayRunner._RunAgentDisplay:
+diff --git a/gateway/run_turn_wait.py b/gateway/run_turn_wait.py
+index f4d449c1fd..7c3508d56c 100644
+--- a/gateway/run_turn_wait.py
++++ b/gateway/run_turn_wait.py
+@@ -36,8 +36,7 @@ async def await_turn_worker(runner, worker, turn_ctx, interrupt_detected, interr
+             await runner._run_agent_backup_interrupt_check(turn_ctx, interrupt_detected, interrupt_monitor)
+         return runner._run_agent_timeout_result(worker, turn_ctx)
+     finally:
+-        # A queued follow-up shares the handler scope, so an existing receipt may
+-        # belong to its predecessor. Only this worker's completion proves that
+-        # its frozen receipt is ready and the cached agent must not be reread.
++        # This invocation's own receipt (``begin_run_receipt``): only this worker's completion proves
++        # its frozen receipt is ready; an abandoned worker names only a lease it holds now.
+         if not worker.executor_task.done():
+-            capture_run_outcome(agent_holder[0])
++            capture_run_outcome(agent_holder[0], abandoned=True)
+diff --git a/gateway/turn_outcome.py b/gateway/turn_outcome.py
+index e96e1c77a0..efb1ad640f 100644
+--- a/gateway/turn_outcome.py
++++ b/gateway/turn_outcome.py
+@@ -10,40 +10,78 @@ from __future__ import annotations
+ 
+ import logging
+ import threading
++from contextlib import contextmanager
+ from contextvars import ContextVar
+ from typing import Optional
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
++# The handler's custody record (``_handle_message_with_agent``): its default receipt, and under "concluding" the
++# receipt of the last ``_run_agent`` invocation it started (a queued follow-up's recursion starts later).
+ run_outcome: ContextVar[Optional[dict]] = ContextVar("gateway_run_outcome", default=None)
++# This ``_run_agent`` invocation's own receipt; its executor worker writes here through the copied context.
++run_receipt: ContextVar[Optional[dict]] = ContextVar("gateway_run_receipt", default=None)
+ 
+ 
+-def capture_run_outcome(agent) -> None:
++def begin_run_receipt(session_id):
++    """Open a receipt for one ``_run_agent`` invocation and make it the handler's concluding one.
++
++    A predecessor's worker keeps writing only its own receipt, so a late write after its follow-up started
++    cannot rename the concluding turn. Returns the token for ``run_receipt.reset``."""
++    receipt = {"session_id": str(session_id or "")}
++    custody = run_outcome.get()
++    if custody is not None:
++        custody["concluding"] = receipt
++    return run_receipt.set(receipt)
++
++
++@contextmanager
++def run_receipt_scope(session_id):
++    """``begin_run_receipt`` for the duration of one ``_run_agent`` invocation."""
++    token = begin_run_receipt(session_id)
++    try:
++        yield
++    finally:
++        run_receipt.reset(token)
++
++
++def concluding_receipt() -> Optional[dict]:
++    """The receipt of the handler's concluding run (its own default receipt when no run started)."""
++    custody = run_outcome.get()
++    if custody is None:
++        return None
++    return custody.get("concluding") or custody
++
++
++def capture_run_outcome(agent, *, abandoned: bool = False) -> None:
+     """Freeze worker-owned evidence before the cached agent can run again.
+ 
+-    The handler owns this dict; copied executor contexts share it, never the mutable session turn slot.
+-    """
+-    owned = run_outcome.get()
+-    if owned is not None:
+-        owned["lease_holder"] = getattr(agent, "_last_session_turn_lease_holder", None)
+-        owned["session_id"] = str(getattr(agent, "session_id", "") or owned["session_id"] or "")
++    Writes this run's receipt (the handler's own outside any ``_run_agent``), never the mutable session turn slot.
++    ``abandoned``: the worker is still running, so only a lease it holds now is this run's; the cached agent's
++    remembered holder may still be its previous turn's (abandonment before lease acquisition)."""
++    owned = run_receipt.get() or run_outcome.get()
++    if owned is None:
++        return
++    attr = "_active_session_turn_lease_holder" if abandoned else "_last_session_turn_lease_holder"
++    owned["lease_holder"] = getattr(agent, attr, None)
++    owned["session_id"] = str(getattr(agent, "session_id", "") or owned["session_id"] or "")
+ 
+ 
+-def concluding_turn_identity(runner, event=None, session_key: Optional[str] = None) -> frozenset:
++def concluding_turn_identity(event=None) -> frozenset:
+     """The concluding gateway turn's OWN evidence: its routing ``active_turn_token`` (the event owns it until
+-    ``_clear_durable_active_turn``) and its agent's turn-lease holder. Never a snapshot of the chat's live
++    ``_clear_durable_active_turn``) and its run's turn-lease holder. Never a snapshot of the chat's live
+     evidence: a concurrent Desktop turn's marker, or a turn that starts before the unawaited refresh runs, stays
+     a live turn. Nothing named = nothing discounted."""
+     try:
+         from hermes_state_outcome import turn_identity
+ 
+-        holder = (run_outcome.get() or {}).get("lease_holder")
++        holder = (concluding_receipt() or {}).get("lease_holder")
+         token = getattr(event, "_gateway_active_turn_token", None)
+         return turn_identity(lease_holder=holder if isinstance(holder, str) else None,
+                              gateway_token=token if isinstance(token, str) else None)
+     except Exception:  # health: allow BLE001 -- best-effort; nothing named discounts nothing
+-        logger.warning("gateway turn identity capture failed for %s", session_key, exc_info=True)
++        logger.warning("gateway turn identity capture failed", exc_info=True)
+         return frozenset()
+ 
+ 
+@@ -69,7 +107,7 @@ def refresh_gateway_turn_outcome(runner, session_entry, event=None,
+                                  session_key: Optional[str] = None) -> Optional[threading.Thread]:
+     """Start the refresh off the reply path; the started thread (None when there is nothing to refresh).
+     The concluding turn's identity is taken here, before the thread is scheduled."""
+-    owned = run_outcome.get()
++    owned = concluding_receipt()
+     sid = str((owned["session_id"] if owned is not None else getattr(session_entry, "session_id", "")) or "")
+     store = getattr(runner, "_session_db", None)
+     db = getattr(store, "_db", store)
+@@ -78,7 +116,7 @@ def refresh_gateway_turn_outcome(runner, session_entry, event=None,
+     try:
+         from agent.memory_provider import spawn_context_thread
+ 
+-        concluding = concluding_turn_identity(runner, event, session_key)
++        concluding = concluding_turn_identity(event)
+         thread = spawn_context_thread(_refresh, name="gateway-turn-outcome", args=(sid, db, concluding))
+         thread.start()
+         return thread
+diff --git a/tests/hermes_state/test_outcome_followup_receipts.py b/tests/hermes_state/test_outcome_followup_receipts.py
+new file mode 100644
+index 0000000000..29512d44c4
+--- /dev/null
++++ b/tests/hermes_state/test_outcome_followup_receipts.py
+@@ -0,0 +1,119 @@
++"""Per-``_run_agent`` outcome receipts through a real recursive queued follow-up.
++
++Drives the real ``GatewayRunner._run_agent`` → ``_run_agent_queued_followup`` → ``_run_agent`` recursion with a fake
++agent (no stubbed ``_run_agent``): each invocation owns its receipt, so a predecessor worker writing late can never
++rename the handler's concluding turn, and an abandoned worker never drains the follow-up.
++"""
++import asyncio
++import contextvars
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from gateway import turn_outcome as gw
++from gateway.platforms.base import MessageEvent
++from tests.gateway.test_queued_followup_processing_hooks import (
++    SESSION_KEY,
++    HookRecordingAdapter,
++    _install_fake_agent,
++    _make_runner,
++    _source,
++)
++
++EVENT = SimpleNamespace(_gateway_active_turn_token="token-A")
++
++
++@pytest.fixture
++def handler_scope():
++    """What ``_handle_message_with_agent`` opens around its ``_run_agent`` call."""
++    token = gw.run_outcome.set({"session_id": "chat"})
++    try:
++        yield
++    finally:
++        gw.run_outcome.reset(token)
++
++
++@pytest.mark.asyncio
++async def test_followup_owns_the_concluding_receipt_despite_a_late_predecessor_write(
++        monkeypatch, tmp_path, handler_scope):
++    contexts, calls = [], []
++
++    class LeasedTurns:
++        def __init__(self, **kwargs):
++            self.tools, self.session_id = [], kwargs.get("session_id")
++
++        def run_conversation(self, message, conversation_history=None, task_id=None, **_kwargs):
++            calls.append(message)
++            # The turn's lease; the worker context is the one its own late capture would write through.
++            self._last_session_turn_lease_holder = f"turn-{len(calls)}"
++            contexts.append(contextvars.copy_context())
++            return {"final_response": f"done-{len(calls)}", "messages": [], "api_calls": 1}
++
++    _install_fake_agent(monkeypatch, tmp_path, LeasedTurns)
++    adapter = HookRecordingAdapter()
++    runner = _make_runner(adapter)
++    adapter._pending_messages[SESSION_KEY] = MessageEvent(text="follow-up", source=_source(), message_id="queued")
++    result = await runner._run_agent(message="first", context_prompt="", history=[], source=_source(),
++                                     session_id="chat", session_key=SESSION_KEY)
++    assert calls == ["first", "follow-up"] and result["final_response"] == "done-2"
++    assert gw.concluding_turn_identity(event=EVENT) == {"lease:turn-2", "gateway:token-A"}
++    # The predecessor's worker captures again after its successor ran (an abandoned worker's late write).
++    stale = SimpleNamespace(session_id="old-chat", _last_session_turn_lease_holder="turn-1")
++    contexts[0].run(gw.capture_run_outcome, stale)
++    assert gw.concluding_turn_identity(event=EVENT) == {"lease:turn-2", "gateway:token-A"}
++    assert gw.concluding_receipt()["session_id"] == "chat"
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("leased", [False, True])
++async def test_abandoned_worker_never_drains_and_names_only_its_own_lease(
++        monkeypatch, tmp_path, handler_scope, leased):
++    started, release, calls = threading.Event(), threading.Event(), []
++
++    class WedgedFirstTurn:
++        def __init__(self, **kwargs):
++            self.tools, self.session_id = [], kwargs.get("session_id")
++            # A cached agent remembers its previous turn's (released) lease.
++            self._last_session_turn_lease_holder = "previous-turn"
++            self._active_session_turn_lease_holder = None
++
++        def get_activity_summary(self):
++            return {"seconds_since_activity": 3600.0}
++
++        def interrupt(self, *a, **kw):
++            pass
++
++        def run_conversation(self, message, conversation_history=None, task_id=None, **_kwargs):
++            calls.append(message)
++            if leased:
++                self._active_session_turn_lease_holder = self._last_session_turn_lease_holder = "turn-1"
++            started.set()
++            assert release.wait(10), "abandoned worker was never released"
++            return {"final_response": "late", "messages": [], "api_calls": 1}
++
++    _install_fake_agent(monkeypatch, tmp_path, WedgedFirstTurn)
++    monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "0.01")
++    monkeypatch.setenv("HERMES_AGENT_TIMEOUT_WARNING", "0")
++    real_wait = asyncio.wait
++
++    async def quick_wait(fs, timeout=None, **kw):
++        return await real_wait(fs, timeout=min(timeout or 0.05, 0.05), **kw)
++
++    monkeypatch.setattr("gateway.run_turn_wait.asyncio.wait", quick_wait)
++    adapter = HookRecordingAdapter()
++    runner = _make_runner(adapter)
++    queued = MessageEvent(text="follow-up", source=_source(), message_id="queued")
++    adapter._pending_messages[SESSION_KEY] = queued
++    try:
++        result = await asyncio.wait_for(runner._run_agent(
++            message="first", context_prompt="", history=[], source=_source(),
++            session_id="chat", session_key=SESSION_KEY), 30)
++        assert started.is_set() and result.get("failed")
++        # Drain gating: abandonment returns the synthetic failure and leaves the follow-up queued.
++        assert calls == ["first"]
++        assert adapter._pending_messages.get(SESSION_KEY) is queued
++        want = {"lease:turn-1", "gateway:token-A"} if leased else {"gateway:token-A"}
++        assert gw.concluding_turn_identity(event=EVENT) == want
++    finally:
++        release.set()
+diff --git a/tests/hermes_state/test_outcome_late_turn_end_refresh.py b/tests/hermes_state/test_outcome_late_turn_end_refresh.py
+index d91017ca6f..58ee34128c 100644
+--- a/tests/hermes_state/test_outcome_late_turn_end_refresh.py
++++ b/tests/hermes_state/test_outcome_late_turn_end_refresh.py
+@@ -81,13 +81,11 @@ def gateway_outcome_scope():
+ 
+ 
+ def _gateway(db, *, token=None, holder=None):
+-    """A runner whose session state holds the turn's agent, and the turn's event (it owns the routing token)."""
++    """A runner, its run's frozen receipt (the agent's lease), and the turn's event (it owns the routing token)."""
+     agent = SimpleNamespace(_last_session_turn_lease_holder=holder)
+     from gateway.turn_outcome import capture_run_outcome
+     capture_run_outcome(agent)
+-    state = SimpleNamespace(turn=SimpleNamespace(agent=agent))
+-    runner = SimpleNamespace(_session_db=db, _session_state=lambda key: state)
+-    return runner, SimpleNamespace(_gateway_active_turn_token=token)
++    return SimpleNamespace(_session_db=db), SimpleNamespace(_gateway_active_turn_token=token)
+ 
+ 
+ def _gate_refresh(monkeypatch):
+@@ -196,7 +194,7 @@ def test_the_gateway_never_names_a_concurrent_desktop_turns_marker(db, monkeypat
+     db.append_message("chat", role="user", content="tui prompt", timestamp=time.time() + 1)
+     record_turn_start(db.db_path.parent, "chat", "tui prompt")  # TUI turn admitted, waiting on the lease
+     runner, event = _gateway(db, holder="gateway-turn")
+-    assert not any(t.startswith("marker:") for t in gateway_identity(runner, event, "key"))
++    assert not any(t.startswith("marker:") for t in gateway_identity(event))
+     entered, release = _gate_refresh(monkeypatch)
+     thread = refresh_gateway_turn_outcome(runner, SimpleNamespace(session_id="chat"), event, "key")
+     assert entered.wait(10)
+@@ -213,13 +211,12 @@ def test_the_gateway_never_names_a_concurrent_desktop_turns_marker(db, monkeypat
+ 
+ 
+ def test_the_gateway_names_its_agents_lease_and_its_events_token(db):
+-    runner, event = _gateway(db, token="tok-x", holder="pid=1:turn=a")
+-    assert gateway_identity(runner, event, "key") == {"gateway:tok-x", "lease:pid=1:turn=a"}
++    _, event = _gateway(db, token="tok-x", holder="pid=1:turn=a")
++    assert gateway_identity(event) == {"gateway:tok-x", "lease:pid=1:turn=a"}
+     from gateway.turn_outcome import run_outcome
+     run_outcome.get().clear()  # no worker-owned receipt: nothing discounted
+-    assert gateway_identity(SimpleNamespace(), None, None) == frozenset()
+-    broken = SimpleNamespace(_session_state=lambda key: (_ for _ in ()).throw(KeyError(key)))
+-    assert gateway_identity(broken, SimpleNamespace(_gateway_active_turn_token="t"), "key") == {"gateway:t"}
++    assert gateway_identity(None) == frozenset()
++    assert gateway_identity(SimpleNamespace(_gateway_active_turn_token="t")) == {"gateway:t"}
+ 
+ 
+ @pytest.mark.parametrize("kind", KINDS)
+diff --git a/tests/hermes_state/test_outcome_run_custody.py b/tests/hermes_state/test_outcome_run_custody.py
+index 3d9ea38c58..60bd6950aa 100644
+--- a/tests/hermes_state/test_outcome_run_custody.py
++++ b/tests/hermes_state/test_outcome_run_custody.py
+@@ -112,7 +112,7 @@ async def test_displaced_handler_uses_worker_receipt_not_successor_slot(db, monk
+     real_refresh = gw.refresh_gateway_turn_outcome
+     def refresh(*a):
+         assert receipts, runner._hmwa_agent_error_reply.call_args
+-        assert gw.concluding_turn_identity(runner, event, "key") == {"lease:turn-A", "gateway:token-A"}
++        assert gw.concluding_turn_identity(event) == {"lease:turn-A", "gateway:token-A"}
+         threads.append(real_refresh(*a))
+     monkeypatch.setattr(gw, "refresh_gateway_turn_outcome", refresh)
+     previous = gw.run_outcome.get()
+@@ -134,7 +134,8 @@ async def test_abandoned_worker_captures_own_live_lease(db, monkeypatch, cancell
+     if newer:
+         late._next_turn_starts(db)
+     assert db.try_acquire_session_turn_lease("chat", "turn-B" if newer else "turn-A", ttl_seconds=300)
+-    agent = SimpleNamespace(session_id="chat", _last_session_turn_lease_holder="turn-A")
++    agent = SimpleNamespace(session_id="chat", _last_session_turn_lease_holder="turn-A",
++                            _active_session_turn_lease_holder="turn-A")
+     ctx = SimpleNamespace(agent_holder=[agent])
+     pending = asyncio.get_running_loop().create_future()
+     worker = SimpleNamespace(executor_task=pending, agent_timeout=1,
+@@ -147,10 +148,13 @@ async def test_abandoned_worker_captures_own_live_lease(db, monkeypatch, cancell
+     runner = SimpleNamespace(_session_db=db, _run_agent_timeout_result=lambda *a: {"failed": True},
+                              _session_state=lambda *a: pytest.fail("successor slot read"))
+     token = gw.run_outcome.set({"session_id": "chat"})
++    tokens = []
+     try:
+         if followup:
+-            # A completed first conversation in the same handler left its receipt.
++            # A completed first conversation in the same handler left its own receipt.
++            tokens.append(gw.begin_run_receipt("chat"))
+             gw.capture_run_outcome(SimpleNamespace(session_id="chat", _last_session_turn_lease_holder="turn-A1"))
++        tokens.append(gw.begin_run_receipt("chat"))  # this (abandoned) run's receipt
+         call = GatewayTurnMixin._run_agent_await_turn_worker(runner, worker, ctx, None, None)
+         if cancelled:
+             with pytest.raises(asyncio.CancelledError):
+@@ -159,13 +163,15 @@ async def test_abandoned_worker_captures_own_live_lease(db, monkeypatch, cancell
+             assert await call == {"failed": True}
+         assert not pending.done()  # worker still owns its physical lease
+         event = SimpleNamespace(_gateway_active_turn_token="token-A")
+-        assert gw.concluding_turn_identity(runner, event, "key") == {"lease:turn-A", "gateway:token-A"}
++        assert gw.concluding_turn_identity(event) == {"lease:turn-A", "gateway:token-A"}
+         thread = gw.refresh_gateway_turn_outcome(runner, SimpleNamespace(session_id="new-chat"), event, "key")
+         thread.join(10)
+         assert not thread.is_alive()
+         assert so.get_outcome("chat", db=db)["kind"] == ("running" if newer else "waiting")
+     finally:
+         pending.cancel()
++        for t in reversed(tokens):
++            gw.run_receipt.reset(t)
+         gw.run_outcome.reset(token)
+ 
+ 
+@@ -211,7 +217,6 @@ def test_no_run_scope_never_names_successor():
+     token = gw.run_outcome.set(None)
+     try:
+         gw.capture_run_outcome(SimpleNamespace(_last_session_turn_lease_holder="foreign"))
+-        runner = SimpleNamespace(_session_state=lambda key: pytest.fail("mutable slot read"))
+-        assert gw.concluding_turn_identity(runner, None, "key") == frozenset()
++        assert gw.concluding_turn_identity() == frozenset()
+     finally:
+         gw.run_outcome.reset(token)
+diff --git a/tests/hermes_state/test_outcome_turn_end_declaration.py b/tests/hermes_state/test_outcome_turn_end_declaration.py
+index 71fd27c6d3..718c683f89 100644
+--- a/tests/hermes_state/test_outcome_turn_end_declaration.py
++++ b/tests/hermes_state/test_outcome_turn_end_declaration.py
+@@ -103,11 +103,10 @@ def test_both_turn_end_callers_pass_the_concluding_turn_never_a_blanket_bypass(m
+     from gateway import turn_outcome as gw
+ 
+     agent = SimpleNamespace(_last_session_turn_lease_holder="h")
+-    runner = SimpleNamespace(_session_state=lambda key: SimpleNamespace(turn=SimpleNamespace(agent=agent)))
+     token = gw.run_outcome.set({"session_id": "chat"})
+     try:
+         gw.capture_run_outcome(agent)
+-        gw._refresh("chat", object(), gw.concluding_turn_identity(runner, None, "key"))
++        gw._refresh("chat", object(), gw.concluding_turn_identity())
+     finally:
+         gw.run_outcome.reset(token)
+     assert calls[-1][1] == "turn_end" and calls[-1][2].get("concluding_turn") == frozenset({"lease:h"})
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 0c749104f0..9939f92fec 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -1459,10 +1459,10 @@ def _run_admitted_prompt(
+                 _emit("message.complete", sid, payload)
+                 if paused_for_update:
+                     update_pause.start_in_place_watcher(sid, session, st.marker_key)
+-            from tui_gateway.turn_outcome import concluding_turn_identity
++            from tui_gateway.turn_outcome import _turn_sid, concluding_turn_identity
+             concluding = concluding_turn_identity(st.agent, st.own_marker)
+             _schedule_refused_turn_retry(sid, session, st.marker_key, concluding,
+-                outcome_sid=str(getattr(st.agent, "session_id", "") or session.get("session_key") or ""))
++                outcome_sid=_turn_sid(session, st.agent))
+             if status == "complete":
+                 # [daveey] This turn's context carried any failed delivery already in the transcript.
+                 automation_replay.cancel_carried(st.marker_key, str(session.get("session_key") or ""))
+@@ -1481,10 +1481,10 @@ def _run_admitted_prompt(
+             automation_replay.schedule_for_turn(session, st)
+         finally:
+             # Capture before admission reopens: the reused agent may then hold the next turn's lease.
+-            from tui_gateway.turn_outcome import concluding_turn_identity
++            from tui_gateway.turn_outcome import _turn_sid, concluding_turn_identity
+             if concluding is None:
+                 concluding = concluding_turn_identity(st.agent, st.own_marker)
+-            outcome_sid = str(getattr(st.agent, "session_id", "") or session.get("session_key") or "")
++            outcome_sid = _turn_sid(session, st.agent)
+             automation_replay.remove_failure_copy(st)
+             _release_turn_scopes(sid, session, st)
+             try:  # a raising settle step must not skip the trim / HERMES_HOME reset
+-- 
+2.51.0
+

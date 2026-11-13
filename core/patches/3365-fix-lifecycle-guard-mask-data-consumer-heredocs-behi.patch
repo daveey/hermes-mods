@@ -1,0 +1,624 @@
+From a6a0637377152cca63d4f83fee3d17fbea71d797 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:25:20 +0000
+Subject: [PATCH] fix(lifecycle-guard): mask data-consumer heredocs behind
+ wrappers, in functions, nested; call-syntax paths are mentions
+
+The terminal lifecycle guard refused read-only commands because a SQLite file named inside
+interpreter code was read as an executed script (larger than the scan cap -> fail closed).
+`strip_inert_heredoc_bodies` recognized a quoted data-consumer heredoc only as a bare top-level
+`python3 - <<'PY'`.
+
+tools/shell_heredoc.py
+- Classify a quoted heredoc by its peeled consumer, reusing lifecycle_guard's
+  `_peel_transparent_prefixes` (timeout N, nice, env VAR=..., command, ...). Only wrappers that
+  hand stdin to their operand qualify; su/runuser/sudo -s/env -S stay visible.
+- Accept positional args after the stdin marker (`python3 - "$1"`) and an opener that is the
+  first command of a `name() {` / `function name {` body.
+- A quoted outer body (`ssh h "bash -s" <<'R'`, also via `$SSH`) is literal text: data-consumer
+  heredocs nested in it are masked by the same rules (depth-bounded); the outer body's own lines
+  are still walked. Unquoted outer bodies are never recursed into.
+- Mask nothing when the command defines a function or alias named like a consumer or wrapper
+  (`python3() { bash; }`, `function python3 {`, `alias python3=bash`): main already refused the
+  `;`-separated shadow; the newline-separated forms were masked on main.
+
+cron/lifecycle_guard.py
+- A segment that follows `(` after an ordinary word is interpreter call syntax
+  (`expanduser("~/x")`, `connect('/d/x.db')`), not a subshell: its paths are mentions
+  (read and scanned, never a fail-closed verdict). `$(`, `<(`, `>(`, `x=(`, and `(` after
+  keywords (if/while/!/time/...) keep the executed treatment. This is script B's trigger.
+
+Tests: 9 -> 63 cases in tests/cron/test_lifecycle_guard_heredoc_walk.py, plus verbatim
+fixtures for both refused scripts (core_split_0923.sh sha256 4d87a461...).
+
+Kanban: t_01a1d0ea6db6c158
+---
+ cron/lifecycle_guard.py                       |  75 ++++++-
+ .../core_split_0923.sh                        |  26 +++
+ .../lifecycle_guard_heredoc/wcomment2.sh      |  31 +++
+ .../cron/test_lifecycle_guard_heredoc_walk.py | 190 ++++++++++++++++++
+ tools/shell_heredoc.py                        | 130 +++++++++---
+ 5 files changed, 413 insertions(+), 39 deletions(-)
+ create mode 100644 tests/cron/fixtures/lifecycle_guard_heredoc/core_split_0923.sh
+ create mode 100644 tests/cron/fixtures/lifecycle_guard_heredoc/wcomment2.sh
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 23656d601c..7d20072dd0 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -705,22 +705,62 @@ def _split_segments(tokens: list[str], *, keep_controls: bool = False) -> Iterat
+         yield segment
+ 
+ 
+-def _iter_command_segments(command: str) -> Iterator[list[str]]:
+-    """Yield shell-tokenized command segments per logical line; a line shlex rejects (unbalanced
+-    quotes) falls back to per-physical-line tokenization."""
++def _iter_command_token_lists(command: str) -> Iterator[list[str]]:
++    """Yield the shell tokens of each logical line; a line shlex rejects (unbalanced quotes) falls
++    back to per-physical-line tokenization."""
+     for line in _split_logical_lines(command.replace("\\\n", "")):
+         try:
+             tokens = _shlex_tokens(line)
+         except ValueError:
+             for physical_line in line.splitlines():
+                 try:
+-                    yield from _split_segments(_shlex_tokens(physical_line))
++                    yield _shlex_tokens(physical_line)
+                 except ValueError:
+                     continue
+             continue
++        yield tokens
++
++
++def _iter_command_segments(command: str) -> Iterator[list[str]]:
++    """Yield shell-tokenized command segments per logical line (see ``_iter_command_token_lists``)."""
++    for tokens in _iter_command_token_lists(command):
+         yield from _split_segments(tokens)
+ 
+ 
++# Words after which `(` still opens a command list (`if (cd x && ./y)`, `! (…)`, `time (…)`).
++_SUBSHELL_OPENING_WORDS = frozenset({
++    "if", "then", "else", "elif", "do", "while", "until", "!", "time", "coproc", "in", "{",
++})
++
++
++def _opens_call_arguments(previous: str) -> bool:
++    """Whether a bare ``(`` after the word *previous* is interpreter call syntax, not a subshell.
++
++    In the shell a subshell ``(`` only starts a command, so ``word (`` is a syntax error there;
++    it is how interpreter code tokenized as shell looks (``expanduser("~/x")``, ``Path('/d')``).
++    ``$(``, ``<(``, ``>(`` and ``x=(`` keep today's executed treatment."""
++    return previous not in _SUBSHELL_OPENING_WORDS and not previous.endswith(("$", "<", ">", "="))
++
++
++def _iter_positioned_command_segments(command: str) -> Iterator[tuple[list[str], bool]]:
++    """``_iter_command_segments`` plus whether each segment is the argument list of a call
++    (``True``): the segment right after a ``(`` that follows an ordinary word."""
++    for tokens in _iter_command_token_lists(command):
++        segment: list[str] = []
++        call_argument = False
++        for token in tokens:
++            if token and set(token) <= _CONTROL_CHARS:
++                next_is_call = token == "(" and bool(segment) and _opens_call_arguments(segment[-1])
++                if segment:
++                    yield segment, call_argument
++                    segment = []
++                call_argument = next_is_call
++                continue
++            segment.append(token)
++        if segment:
++            yield segment, call_argument
++
++
+ def _executable_name(token: str) -> str:
+     """Command name of an executable token. ``Path(token).name`` is "" for ``.``, ``..`` and ``/``;
+     the POSIX dot-source builtin is spelled ``.``, so fall back to the raw token or ``.
+@@ -989,11 +1029,17 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
+         yield from _resolved_or_nothing(executable, cwd)
+ 
+ 
+-def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None) -> Iterator[Path]:
++def _iter_referenced_shell_scripts(
++    command: str, *, cwd: Optional[str] = None, call_arguments: bool = False,
++) -> Iterator[Path]:
+     """Yield scripts executed directly or through a POSIX shell. Each segment is read at the
+     original token AND at the peeled wrapper target — additive on purpose: peeling must never REMOVE
+-    a reference (a local ``./timeout`` is a script, not the coreutils wrapper)."""
+-    for segment in _iter_command_segments(command):
++    a reference (a local ``./timeout`` is a script, not the coreutils wrapper). With
++    *call_arguments* the same discovery runs over call-argument segments instead
++    (``expanduser("~/x")``): paths there are interpreter string literals, i.e. mentions."""
++    for segment, is_call_argument in _iter_positioned_command_segments(command):
++        if is_call_argument != call_arguments:
++            continue
+         index = _command_token_index(segment)
+         if index is None:
+             continue
+@@ -1199,10 +1245,21 @@ def _contains_unsafe_gateway_action(
+     # Paths named only inside a masked body are still READ: an interpreter body that hands
+     # `/x/restart.sh` to os.system() executes it. Only the fail-closed verdicts (cloud placeholder,
+     # oversized/binary, budget) stay restricted to the executed view — a mere data mention must not
+-    # trip them. Executed candidates come first so a mention never starves a real script's budget.
++    # trip them. Executed candidates come first so a mention never starves a real script's budget. A
++    # path in interpreter call syntax (`expanduser("~/x")`, `connect('/d/x.db')`) is a string
++    # literal the shell never runs: a mention too, read and scanned but never a fail-closed verdict.
+     candidates = [(path, executed) for path in _iter_referenced_shell_scripts(walk_command, cwd=cwd)]
++    candidates += [
++        (path, False)
++        for path in _iter_referenced_shell_scripts(walk_command, cwd=cwd, call_arguments=True)
++    ]
+     if walk_command != command:
+-        candidates += [(path, False) for path in _iter_referenced_shell_scripts(command, cwd=cwd)]
++        candidates += [
++            (path, False)
++            for call_arguments in (False, True)
++            for path in _iter_referenced_shell_scripts(
++                command, cwd=cwd, call_arguments=call_arguments)
++        ]
+ 
+     for script_path, candidate_executed in candidates:
+         # Do not touch a FileProvider path even to discover whether the file is hydrated.
+diff --git a/tests/cron/fixtures/lifecycle_guard_heredoc/core_split_0923.sh b/tests/cron/fixtures/lifecycle_guard_heredoc/core_split_0923.sh
+new file mode 100644
+index 0000000000..8150449fab
+--- /dev/null
++++ b/tests/cron/fixtures/lifecycle_guard_heredoc/core_split_0923.sh
+@@ -0,0 +1,26 @@
++#!/usr/bin/env bash
++# Read-only: core vs graphql request counts per host from each host's github-quota audit.sqlite `requests` table
++# for the quota window ending at reset 1794501882 (15:44:42-16:44:42Z = 07:44:42-08:44:42 PST).
++set -u
++cd "$(dirname "$0")"
++END=1794501882; START=$((END-3600))
++REMOTE='import os, sqlite3, socket, sys
++p = os.path.expanduser("~/.hermes/logs/github-quota/audit.sqlite")
++s, e = int(sys.argv[1]), int(sys.argv[2])
++try:
++    c = sqlite3.connect("file:" + p + "?mode=ro", uri=True, timeout=10)
++    rows = c.execute("select coalesce(rate_limit_resource, \"(none)\"), count(*) from requests where started >= ? and started < ? group by 1 order by 1", (s, e)).fetchall()
++    print(socket.gethostname(), dict(rows))
++except Exception as x:
++    print(socket.gethostname(), "ERR", type(x).__name__, str(x)[:120])'
++run() { # $1 label, $2 ip, $3 extra opts
++  /opt/homebrew/bin/timeout 40 ssh -o BatchMode=yes -o ConnectTimeout=8 $3 ubuntu@$2 "timeout 25 nice python3 -c '$(printf "%s" "$REMOTE" | sed "s/'/'\\\\''/g")' $START $END" 2>&1 | grep -avE 'SSH route|ghp_|gho_|github_pat_|Bearer|TOKEN|SECRET|PASS|eyJ|sk-ant|oat01' | sed "s/^/$1 /" | cut -c1-220
++}
++run hub 192.0.2.10 ""
++run w1 192.0.2.11 ""
++run w2 192.0.2.12 ""
++run w3 192.0.2.13 ""
++run w4 192.0.2.14 ""
++run w5 192.0.2.15 "-o UserKnownHostsFile=kh_w5 -o StrictHostKeyChecking=accept-new"
++run w6 192.0.2.16 ""
++date '+checked %H:%M:%S %Z'
+diff --git a/tests/cron/fixtures/lifecycle_guard_heredoc/wcomment2.sh b/tests/cron/fixtures/lifecycle_guard_heredoc/wcomment2.sh
+new file mode 100644
+index 0000000000..e27972c91d
+--- /dev/null
++++ b/tests/cron/fixtures/lifecycle_guard_heredoc/wcomment2.sh
+@@ -0,0 +1,31 @@
++#!/usr/bin/env bash
++set -u
++cd "$(dirname "$0")"
++IP=$1; T=$2; F=$3
++SSH="/opt/homebrew/bin/timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=8 ${XOPTS:-} ubuntu@$IP"
++$SSH "cat > /tmp/wc_$T.txt" < "$F"
++$SSH "T=$T bash -s" <<'REMOTE' 2>&1 | grep -avE 'ghp_|gho_|github_pat_|sk-|xox|cfut_|Bearer|TOKEN|SECRET|PASS|access_token|refresh_token|eyJ|oat01|sk-ant'
++set -u
++HB=$(command -v hermes || ls ~/.local/bin/hermes 2>/dev/null || echo ~/.hermes/hermes-agent/venv/bin/hermes)
++q() { timeout 20 python3 - "$1" <<'PY'
++import sqlite3, sys, os, time
++c = sqlite3.connect("file:" + os.path.expanduser("~/.hermes/kanban.db") + "?mode=ro", uri=True, timeout=10)
++t = sys.argv[1]
++r = c.execute("select status from tasks where id=?", (t,)).fetchone()
++n = c.execute("select count(*), max(id) from task_comments where task_id=?", (t,)).fetchone()
++print("status", r, "comments", n, time.strftime("%H:%M:%SZ", time.gmtime()))
++PY
++}
++echo "before:"; q $T
++env -u HERMES_KANBAN_TASK HERMES_AGENT=1 HERMES_SESSION_ID=20261026_235722_bef6c6 timeout 60 "$HB" kanban comment $T "$(cat /tmp/wc_$T.txt)" 2>&1 | tail -3 | cut -c1-200
++echo "after:"; q $T
++timeout 20 python3 - "$T" <<'PY'
++import sqlite3, os, sys
++c = sqlite3.connect("file:" + os.path.expanduser("~/.hermes/kanban.db") + "?mode=ro", uri=True, timeout=10)
++cols = [r[1] for r in c.execute("pragma table_info(task_comments)")]
++r = c.execute("select * from task_comments where task_id=? order by id desc limit 1", (sys.argv[1],)).fetchone()
++d = dict(zip(cols, r))
++print({k: (str(v)[:100] if k == "body" else v) for k, v in d.items()})
++PY
++rm -f /tmp/wc_$T.txt
++REMOTE
+diff --git a/tests/cron/test_lifecycle_guard_heredoc_walk.py b/tests/cron/test_lifecycle_guard_heredoc_walk.py
+index ba83dc176b..49e33cd730 100644
+--- a/tests/cron/test_lifecycle_guard_heredoc_walk.py
++++ b/tests/cron/test_lifecycle_guard_heredoc_walk.py
+@@ -6,6 +6,8 @@ referenced scripts and ``sh -c`` payloads on the raw command, so a >1 MiB data p
+ inside the Python body failed closed as an oversized "script".
+ """
+ 
++from pathlib import Path
++
+ import pytest
+ 
+ from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script as guard
+@@ -116,3 +118,191 @@ def test_unscannable_own_cron_script_raises_named_refusal(tmp_path, shape):
+     message = str(excinfo.value)
+     assert "could not scan" in message and str(script) in message
+     assert "contains a gateway lifecycle command" not in message
++
++
++# --- wrapped, function-body and nested data consumers (t_01a1d0ea6db6c158) --------------------
++# Each shape below opened a >1 MiB SQLite file read-only and was refused as an "executed script":
++# the consumer was only recognized as a bare top-level `python3 - <<'PY'`.
++
++_FIXTURES = Path(__file__).parent / "fixtures" / "lifecycle_guard_heredoc"
++
++
++def _big_sqlite(path):
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_bytes(b"SQLite format 3\0" + b"\0" * (2 * 1024 * 1024 - 16))
++    return path
++
++
++def _bodies(db):
++    # one-line (the probe table) and a wrapped call whose path line starts a shell segment
++    return {
++        "one-line": f"import sqlite3\nsqlite3.connect('{db}')\n",
++        "multi-line": f"import sqlite3\nc = sqlite3.connect(\n    '{db}')\n",
++    }
++
++
++_CONSUMER_SHAPES = {
++    "wrapper": "timeout 20 python3 - <<'PY'\n{body}PY",
++    "wrapper-args": "nice -n 5 env A=1 timeout 20 python3 - \"$T\" x <<'PY'\n{body}PY",
++    "nested-in-ssh": "ssh -o BatchMode=yes h \"bash -s\" <<'R'\npython3 - <<'PY'\n{body}PY\nR",
++    "nested-$SSH": "SSH='ssh -o BatchMode=yes'\n$SSH h \"bash -s\" <<'R' 2>&1 | grep -v x\n"
++                   "python3 - <<'PY'\n{body}PY\nR",
++    "function-args": "q() {{ python3 - \"$1\" <<'PY'\n{body}PY\n}}\nq x",
++    "function-no-args": "q() {{ python3 - <<'PY'\n{body}PY\n}}\nq x",
++    "function-keyword": "function q {{ timeout 20 python3 - \"$1\" <<'PY'\n{body}PY\n}}\nq x",
++    "nested-function-wrapper": "ssh h \"bash -s\" <<'R'\nq() {{ timeout 20 python3 - \"$1\" <<'PY'\n"
++                               "{body}PY\n}}\nq x\nR",
++}
++
++
++@pytest.mark.parametrize("body_kind", ["one-line", "multi-line"])
++@pytest.mark.parametrize("shape", sorted(_CONSUMER_SHAPES))
++def test_data_consumer_heredoc_mention_is_not_refused(tmp_path, shape, body_kind):
++    from cron.lifecycle_guard import scan_gateway_lifecycle
++    from tools.shell_heredoc import strip_inert_heredoc_bodies
++
++    db = _big_sqlite(tmp_path / "big.db")
++    command = _CONSUMER_SHAPES[shape].format(body=_bodies(db)[body_kind])
++    masked = strip_inert_heredoc_bodies(command)
++    assert str(db) not in masked, masked  # the consumer body is masked, wherever it sits
++    assert masked.count("\n") == command.count("\n")
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
++
++
++@pytest.mark.parametrize("command", [
++    # su's operand is a USER and its shell reads stdin; env -S hands a string to a shell
++    "su python3 - <<'EOF'\nhermes gateway restart\nEOF",
++    "env -S 'bash -s' python3 <<'EOF'\nhermes gateway restart\nEOF",
++    "sudo -s python3 <<'EOF'\nhermes gateway restart\nEOF",
++    # an unquoted outer body expands `$(…)` locally before the remote shell sees it
++    "bash <<EOF\npython3 - <<'PY'\n$(hermes gateway restart)\nPY\nEOF",
++    # a function header must open the line; other braces/parens keep the opener visible
++    "x; q() { python3 - <<'PY'\nhermes gateway restart\nPY\n}",
++    # an outer `bash -s` body's own lines are still commands
++    "ssh h \"bash -s\" <<'R'\nhermes gateway restart\nR",
++    "ssh h \"bash -s\" <<'R'\npython3 - <<'PY'\nprint(1)\nPY\nhermes gateway restart\nR",
++    # a function or alias that shadows a consumer/wrapper name is never a data consumer
++    "python3() { bash; }\npython3 - <<'PY'\nhermes gateway restart\nPY",
++    "python3() { bash; }; q() { python3 - <<'PY'\nhermes gateway restart\nPY\n}; q",
++    "function python3 { bash; }\npython3 - <<'PY'\nhermes gateway restart\nPY",
++    "timeout() { bash; }\ntimeout 5 python3 - <<'PY'\nhermes gateway restart\nPY",
++    "shopt -s expand_aliases; alias python3=bash\npython3 - <<'PY'\nhermes gateway restart\nPY",
++    "python3() { bash; }\nssh h \"bash -s\" <<'R'\nhermes gateway restart\nR",
++])
++def test_shell_consumers_and_outer_bodies_stay_visible(tmp_path, command):
++    from cron.lifecycle_guard import scan_gateway_lifecycle
++
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (True, None)
++
++
++def test_deeply_nested_heredocs_stay_bounded(tmp_path):
++    """Nesting past the bound keeps the innermost body visible (fail closed), and never recurses
++    without limit."""
++    from cron.lifecycle_guard import scan_gateway_lifecycle
++
++    db = _big_sqlite(tmp_path / "big.db")
++    command = f"python3 - <<'PY'\nimport sqlite3\nc = sqlite3.connect(\n    '{db}')\nPY"
++    for level in range(6):
++        command = f"ssh h{level} \"bash -s\" <<'R{level}'\n{command}\nR{level}"
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe is True and str(db) in refusal
++
++
++@pytest.mark.parametrize("shape", ["wrapper", "nested-in-ssh", "function-args"])
++def test_masked_consumer_mentions_are_still_read(tmp_path, shape):
++    """A wrapped/nested/function consumer's mentions are still read: a lifecycle script handed to
++    os.system() from the masked body still blocks."""
++    from cron.lifecycle_guard import scan_gateway_lifecycle
++
++    script = tmp_path / "restart.sh"
++    script.write_text("#!/bin/sh\nhermes gateway restart\n", encoding="utf-8")
++    body = f"import os\nos.system('{script}')\n"
++    command = _CONSUMER_SHAPES[shape].format(body=body)
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (True, None)
++
++
++@pytest.mark.parametrize("template", [
++    "python3 - <<'PY'\nimport sqlite3\nsqlite3.connect('{db}')\nPY",
++    "ssh -o BatchMode=yes h \"bash -s\" <<'R'\nsqlite3 {db} 'select 1'\nR",
++    "X='import sqlite3; sqlite3.connect(\"{db}\")'\nssh h \"python3 -c '$X'\"",
++])
++def test_probe_table_plain_rows_stay_allowed(tmp_path, template):
++    from cron.lifecycle_guard import scan_gateway_lifecycle
++
++    db = _big_sqlite(tmp_path / "big.db")
++    assert scan_gateway_lifecycle(template.format(db=db), cwd=str(tmp_path)) == (False, None)
++
++
++@pytest.mark.parametrize("make", [
++    lambda d: (f"bash {d / 'big.sh'}", "scan cap"),
++    lambda d: ("X='hermes gateway restart'; eval \"$X\"", None),
++    lambda d: (f"cd {d} && source ./restart.sh", None),
++    lambda d: (f"timeout 20 python3 - <<'PY'\nimport os\nos.system('{d / 'restart.sh'}')\nPY", None),
++])
++def test_probe_table_controls_still_refused(tmp_path, make):
++    from cron.lifecycle_guard import scan_gateway_lifecycle
++
++    (tmp_path / "big.sh").write_text("echo hi\n" * 220000, encoding="utf-8")
++    (tmp_path / "restart.sh").write_text("#!/bin/sh\nhermes gateway restart\n", encoding="utf-8")
++    command, refusal_part = make(tmp_path)
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe is True
++    assert (refusal_part in refusal) if refusal_part else refusal is None
++
++
++# --- interpreter call syntax tokenized as shell is a mention, not a subshell -------------------
++
++@pytest.mark.parametrize("command", [
++    # script B's isolated trigger shapes: the Python is shell-tokenized, and
++    # `expanduser("~/x")` reads as a word followed by a subshell `("~/x")`
++    "REMOTE=$(cat <<'PY'\nimport os\np = os.path.expanduser(\"{db}\")\nPY\n)\n"
++    "ssh h \"python3 -c '$REMOTE'\"",
++    "ssh h python3 - <<'PY' | sed 's/^/hub /'\nimport os, sqlite3\n"
++    "c = sqlite3.connect(os.path.expanduser(\"{db}\"))\nPY",
++    "cat > /tmp/x.py <<EOF\nfrom pathlib import Path\nprint(Path('{db}').stat())\nEOF",
++])
++def test_path_in_interpreter_call_is_a_mention(tmp_path, command):
++    from cron.lifecycle_guard import scan_gateway_lifecycle
++
++    db = _big_sqlite(tmp_path / "big.db")
++    assert scan_gateway_lifecycle(command.format(db=db), cwd=str(tmp_path)) == (False, None)
++
++
++def test_call_argument_mentions_are_still_read(tmp_path):
++    from cron.lifecycle_guard import scan_gateway_lifecycle
++
++    script = tmp_path / "restart.sh"
++    script.write_text("#!/bin/sh\nhermes gateway restart\n", encoding="utf-8")
++    command = f"ssh h python3 - <<'PY' | sed 's/^/x /'\nimport os\nos.system('{script}')\nPY"
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (True, None)
++
++
++@pytest.mark.parametrize("template", [
++    "X=$({big})", "diff <({big}) /dev/null", "tee >({big})", "if ({big}); then :; fi",
++    "while ({big}); do :; done", "! ({big})", "time ({big})", "arr=({big})",
++])
++def test_subshell_and_substitution_parens_still_execute(tmp_path, template):
++    """`(` only stops meaning \"runs a command\" after an ordinary word: substitutions, keywords
++    and assignments keep the executed fail-closed verdict."""
++    from cron.lifecycle_guard import scan_gateway_lifecycle
++
++    big = tmp_path / "big.sh"
++    big.write_text("echo hi\n" * 220000, encoding="utf-8")
++    unsafe, refusal = scan_gateway_lifecycle(template.format(big=big), cwd=str(tmp_path))
++    assert unsafe is True and "scan cap" in refusal
++
++
++# --- the refused scripts, verbatim ---------------------------------------------------------------
++
++@pytest.mark.parametrize("script, db_rel", [
++    ("wcomment2.sh", ".hermes/kanban.db"),
++    ("core_split_0923.sh", ".hermes/logs/github-quota/audit.sqlite"),
++])
++def test_refused_scripts_verbatim_are_not_refused(tmp_path, monkeypatch, script, db_rel):
++    from cron.lifecycle_guard import scan_gateway_lifecycle
++
++    home = tmp_path / "home"
++    _big_sqlite(home / db_rel)
++    monkeypatch.setenv("HOME", str(home))  # the scripts' `~/` paths point into tmp_path
++    command = f"bash {_FIXTURES / script} 1.2.3.4 t_x f.txt"
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
+diff --git a/tools/shell_heredoc.py b/tools/shell_heredoc.py
+index e69e22c9b3..a64bdbb6e1 100644
+--- a/tools/shell_heredoc.py
++++ b/tools/shell_heredoc.py
+@@ -2,23 +2,70 @@
+ cron lifecycle_guard) that false-positive on heredoc *bodies*. Stripping every body is unsafe the
+ other way (a fake ``<<`` in quotes can swallow an operator; unquoted bodies expand; ``bash <<'EOF'``
+ executes), so a body is masked ONLY when every delimiter is quoted, every heredoc has an exact
+-terminator line, the owning simple command is an allowlisted non-shell interpreter, and no list
+-operator follows the heredoc. Otherwise the command is returned untouched: a false positive is
+-acceptable, hiding shell syntax from a guard is not.
++terminator line, the owning simple command (after transparent wrappers such as ``timeout 20`` are
++peeled; optionally the first command of a ``name() {`` body) is an allowlisted non-shell
++interpreter, and no list operator follows the heredoc. Otherwise the command is returned
++untouched: a false positive is acceptable, hiding shell syntax from a guard is not. A quoted body
++that stays visible (``ssh h 'bash -s' <<'R'``) is literal text, so data-consumer heredocs nested in
++it are judged by the same rules.
+ Masked bodies keep their newline count (re.MULTILINE)."""
+ 
+ from __future__ import annotations
+ 
+ import re
+ 
+-# Non-shell interpreters whose quoted heredoc bodies are data for THAT interpreter; optional
+-# VAR=... assignments, ``env`` and a path prefix allowed. Narrow on purpose: unmatched = visible.
+-_INERT_HEREDOC_CONSUMER_RE = re.compile(
+-    r"^\s*(?:[A-Z_][A-Z0-9_]*=\S+\s+)*(?:env\s+)?(?:[A-Za-z0-9_./-]+/)?"
+-    r"(?:python(?:3(?:\.\d+)*)?|osascript|cat)(?=\s|$)",
++# Non-shell interpreters whose quoted heredoc bodies are data for THAT interpreter, judged on the
++# command the owner actually runs: VAR=... assignments and transparent wrappers (``timeout 20``,
++# ``nice``, ``env VAR=1``, ``command``) are peeled, a path prefix is allowed, positional arguments
++# may follow. Narrow on purpose: unmatched = visible.
++_INERT_HEREDOC_CONSUMER_RE = re.compile(r"^(?:python(?:3(?:\.\d+)*)?|osascript|cat)$", re.IGNORECASE)
++# Wrappers that run their operand with the heredoc on its stdin. Excluded: ``su``/``runuser`` (the
++# operand is a USER and a shell reads stdin) and every other privilege/namespace wrapper.
++_INERT_HEREDOC_WRAPPERS = frozenset({
++    "timeout", "nice", "ionice", "nohup", "setsid", "stdbuf", "env", "command", "exec",
++    "eatmydata", "sudo", "doas",
++})
++# A wrapper option that hands a STRING to a shell (``env -S 'bash -s'``) or starts one (``sudo
++# -s``) makes the peeled word unreliable: keep the body visible.
++_SHELL_STARTING_WRAPPER_OPTIONS = frozenset({
++    "-S", "--split-string", "-c", "--command", "-s", "--shell", "-i", "--login",
++})
++_ASSIGNMENT_WORD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
++# ``name() {`` / ``function name {`` opening a function body on the heredoc's own line.
++_FUNCTION_HEADER_RE = re.compile(
++    r"\s*(?:function\s+[A-Za-z_][\w.:-]*\s*(?:\(\s*\))?|[A-Za-z_][\w.:-]*\s*\(\s*\))\s*\{\s+")
++# Nested heredocs inside a quoted outer body are classified recursively, this deep at most.
++_MAX_NESTED_HEREDOC_DEPTH = 4
++# A command that (re)defines a consumer or wrapper name as a function or alias anywhere
++# (``python3() { bash; }``) may run a shell where the peeled word says "python": mask nothing.
++_CONSUMER_SHADOW_RE = re.compile(
++    r"(?:^|[\s;&|(){{}}])(?:(?:function\s+)?{names}\s*\(\s*\)|function\s+{names}\s+\{{"
++    r"|alias\s+{names}=)".format(
++        names=r"(?:python[\d.]*|osascript|cat|timeout|nice|ionice|nohup|setsid|stdbuf|env|command"
++              r"|exec|eatmydata|sudo|doas)"),
+     re.IGNORECASE)
+ 
+ 
++def _runs_inert_consumer(owner_words: list[str]) -> bool:
++    """Whether the simple command *owner_words* (quotes masked, heredoc operators removed) runs
++    an allowlisted data consumer, after the same wrapper peeling as the lifecycle guard."""
++    from cron.lifecycle_guard import _TRANSPARENT_COMMAND_PREFIXES, _peel_transparent_prefixes
++
++    index = next((i for i, word in enumerate(owner_words) if not _ASSIGNMENT_WORD_RE.match(word)), None)
++    if index is None:
++        return False
++    peeled = _peel_transparent_prefixes(owner_words, index)
++    if peeled >= len(owner_words):
++        return False
++    for word in owner_words[index:peeled]:
++        name = word.rsplit("/", 1)[-1]
++        if word in _SHELL_STARTING_WRAPPER_OPTIONS or (
++            name in _TRANSPARENT_COMMAND_PREFIXES and name not in _INERT_HEREDOC_WRAPPERS
++        ):
++            return False
++    return bool(_INERT_HEREDOC_CONSUMER_RE.match(owner_words[peeled].rsplit("/", 1)[-1]))
++
++
+ def _span_end(command: str, cursor: int, closer: str) -> int:
+     """Index just past the backslash-aware span opened at ``cursor``."""
+     end = cursor + 1
+@@ -162,8 +209,8 @@ def _scan_heredoc_command_unit(command: str, start: int):
+ 
+ 
+ def _find_heredoc_close(
+-        command: str, body_start: int, delimiter: str, strip_tabs: bool) -> int | None:
+-    """Return the position after an exact shell heredoc terminator line."""
++        command: str, body_start: int, delimiter: str, strip_tabs: bool) -> tuple[int, int] | None:
++    """Return ``(terminator_line_start, position_after_it)`` for the exact terminator line."""
+     cursor = body_start
+     while True:
+         newline = command.find("\n", cursor)
+@@ -171,19 +218,36 @@ def _find_heredoc_close(
+         line = command[cursor:after].removesuffix("\n").removesuffix("\r")
+         candidate = line.lstrip("\t") if strip_tabs else line
+         if candidate == delimiter:
+-            return after
++            return cursor, after
+         if newline == -1:
+             return None
+         cursor = after
+ 
+ 
+-def strip_inert_heredoc_bodies(command: str) -> str:
+-    """Mask heredoc bodies that are provably inert data (see module docstring)."""
++def _owner_runs_inert_consumer(
++        command: str, command_start: int, command_end: int, owner_start: int) -> bool:
++    """Whether the heredoc opener line is a plain simple command (optionally the first command of
++    a ``name() {`` function body) whose peeled command is an allowlisted data consumer."""
++    header = _FUNCTION_HEADER_RE.match(command, command_start, command_end)
++    opener_start = header.end() if header else command_start
++    masked_opener = _mask_simple_quotes(command[opener_start:command_end])
++    if any(marker in masked_opener for marker in ("$(", "`", "<(", ">(", "(", ")", "{", "}")):
++        return False
++    owner = command[max(owner_start, opener_start):command_end]
++    return _runs_inert_consumer(_mask_simple_quotes(owner).split())
++
++
++def strip_inert_heredoc_bodies(command: str, *, _depth: int = 0) -> str:
++    """Mask heredoc bodies that are provably inert data (see module docstring). The body of a
++    quoted-delimiter heredoc that is NOT masked (``ssh h 'bash -s' <<'R'``) stays visible, but
++    data-consumer heredocs nested inside it are classified and masked the same way."""
+     # Runs on every terminal call: skip the state machine when no '<<' exists; stop past the last.
+     if "<<" not in command:
+         return command
++    if _CONSUMER_SHADOW_RE.search(command):
++        return command
+     last_opener_index = command.rfind("<<")
+-    ranges: list[tuple[int, int]] = []
++    replacements: list[tuple[int, int, str]] = []
+     command_start = 0
+     while command_start <= last_opener_index:
+         (
+@@ -203,29 +267,35 @@ def strip_inert_heredoc_bodies(command: str) -> str:
+         if command_end >= len(command):
+             return command  # opener with no body line: unterminated — leave visible
+         body_cursor = command_end + 1
+-        body_ranges: list[tuple[int, int]] = []
++        bodies: list[tuple[int, int, int]] = []
+         for delimiter, strip_tabs, _quoted in specs:
+-            close_end = _find_heredoc_close(command, body_cursor, delimiter, strip_tabs)
+-            if close_end is None:
++            closed = _find_heredoc_close(command, body_cursor, delimiter, strip_tabs)
++            if closed is None:
+                 return command  # unterminated
+-            body_ranges.append((body_cursor, close_end))
+-            body_cursor = close_end
++            bodies.append((body_cursor, *closed))
++            body_cursor = closed[1]
++        quoted = [spec_quoted for _delimiter, _strip_tabs, spec_quoted in specs]
+         if (
+-            all(quoted for _delimiter, _strip_tabs, quoted in specs)
++            all(quoted)
+             and not post_heredoc_list_operator
++            and _owner_runs_inert_consumer(command, command_start, command_end, owner_start)
+         ):
+-            masked_opener = _mask_simple_quotes(command[command_start:command_end])
+-            masked_owner = _mask_simple_quotes(command[owner_start:command_end])
+-            if not any(
+-                marker in masked_opener
+-                for marker in ("$(", "`", "<(", ">(", "(", ")", "{", "}")
+-            ) and _INERT_HEREDOC_CONSUMER_RE.search(masked_owner):
+-                ranges.extend(body_ranges)
++            replacements += [(start, end, "\n" * command.count("\n", start, end))
++                             for start, _terminator, end in bodies]
++        elif _depth < _MAX_NESTED_HEREDOC_DEPTH:
++            # An unquoted outer body expands locally first (`$(…)` runs here), so only a quoted
++            # one is literal text whose nested heredocs can be judged on their own.
++            for (start, terminator, _end), body_quoted in zip(bodies, quoted):
++                inner = command[start:terminator]
++                if body_quoted and "<<" in inner:
++                    masked = strip_inert_heredoc_bodies(inner, _depth=_depth + 1)
++                    if masked != inner:
++                        replacements.append((start, terminator, masked))
+         command_start = body_cursor
+-    # Single-pass rebuild (ranges are sorted and non-overlapping), bodies -> their newlines only.
++    # Single-pass rebuild (replacements are sorted and non-overlapping).
+     parts: list[str] = []
+     previous = 0
+-    for start, end in ranges:
+-        parts += [command[previous:start], "\n" * command.count("\n", start, end)]
++    for start, end, replacement in replacements:
++        parts += [command[previous:start], replacement]
+         previous = end
+     return "".join(parts) + command[previous:]
+-- 
+2.51.0
+

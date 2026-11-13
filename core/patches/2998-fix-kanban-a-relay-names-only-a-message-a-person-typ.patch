@@ -1,0 +1,349 @@
+From eb14ba72596529b269864c471bf506d14cae6629 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 17:03:55 +0000
+Subject: [PATCH] fix(kanban): a relay names only a message a person typed; the
+ card holder refuses replayed and pre-ask relays [daveey]
+
+Review 5878485674 on #1583 (kanban-d1b921f32e):
+
+1. verify() took the session's newest role='user' row, so a synthetic row (above all the card's own
+   needs_input kanban_notice, which always lands after the ask) could "verify" a relay with no reply from
+   David and bring back the ping-pong the no-progress budget stops. _latest_user_message now picks the
+   newest row a person typed: display_kind NULL/'' or 'steer', not a compaction summary, not a
+   "[System:" notice or a session-mentions cross-session delivery.
+2. A cross-gateway relay was stored after a shape check only: replays and pre-ask messages counted.
+   New kanban_relayed_human.admit(), called by add_comment inside its write transaction (atomic) and by
+   the dashboard endpoint first (HTTP 400): the card asked, the message is not older than its latest ask
+   (REMOTE_CLOCK_SKEW_SECONDS=120 for a remote origin), and no (session, message_id) is relayed twice.
+---
+ hermes_cli/kanban_db_comment_ids.py           |  3 +
+ hermes_cli/kanban_relayed_human.py            | 56 ++++++++++---
+ plugins/kanban/dashboard/plugin_api.py        |  5 +-
+ .../dashboard/plugin_api_comment_actor.py     | 15 ++++
+ tests/hermes_cli/test_kanban_relayed_human.py | 79 ++++++++++++++++++-
+ .../test_kanban_dashboard_comment_actor.py    | 40 +++++++++-
+ 6 files changed, 180 insertions(+), 18 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_comment_ids.py b/hermes_cli/kanban_db_comment_ids.py
+index a4d5b22d1d..e0ea5e79c0 100644
+--- a/hermes_cli/kanban_db_comment_ids.py
++++ b/hermes_cli/kanban_db_comment_ids.py
+@@ -125,6 +125,9 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str,
+     # compose comment writes under one outer commit.
+     with _kb.write_txn(conn, allow_nested=True):
+         _kb._require_task(conn, task_id)
++        if relayed_human:  # the card holder's own checks, atomic with the write (one relay per user turn)
++            from hermes_cli.kanban_relayed_human import admit
++            admit(conn, task_id, relayed_human)
+         cur = conn.execute(
+             "INSERT INTO task_comments (task_id, author, body, created_at, origin_gateway) "
+             "VALUES (?, ?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now, origin),
+diff --git a/hermes_cli/kanban_relayed_human.py b/hermes_cli/kanban_relayed_human.py
+index ba7d066738..f96b57fc09 100644
+--- a/hermes_cli/kanban_relayed_human.py
++++ b/hermes_cli/kanban_relayed_human.py
+@@ -15,7 +15,14 @@ The origin (the chat writing the comment) verifies it:
+   ``scheduled`` event): an answer cannot predate the question;
+ * one relay per user message per card: the same user turn cannot mark two comments.
+ 
+-A receiver of a cross-gateway relay stores the field as sent (``via='remote'``); its origin verified it.
++Only a row a person typed is a reply: a plain or ``steer`` user row, never a synthetic ``role='user'`` row (the
++card's own ``kanban_notice``, hidden scaffolding, process/delegation completions, internal notifications,
++compaction summaries, ``[System:`` notices or cross-session deliveries).
++
++The card's holder checks every relay before storing it (``admit``, inside ``add_comment``'s write transaction,
++so the one-relay rule is atomic), a cross-gateway one included: the card asked, the message is not older than
++the latest ask (``REMOTE_CLOCK_SKEW_SECONDS`` allowed for a remote clock), and no ``(session, message_id)`` is
++relayed to the card twice.
+ """
+ from __future__ import annotations
+ 
+@@ -28,6 +35,12 @@ RELAY_FIELD = "relayed_human"
+ SUSPECT_EVENT = "no_progress_relay_suspect"
+ # A chat unblock this close to the escalation (and no relayed comment) is most likely an unmarked relay.
+ SUSPECT_WINDOW_SECONDS = 15 * 60
++# A cross-gateway relay's ``at`` is the origin's clock; allow this much skew against the card's ask.
++REMOTE_CLOCK_SKEW_SECONDS = 120
++# Display kinds of a user row a person typed (NULL/'' = a plain prompt). Every other kind is synthetic.
++_TYPED_KINDS = ("steer",)
++# Untyped role='user' rows that are still not the user's words (gateway scaffolding, session-mentions courier).
++_SYNTHETIC_PREFIXES = ("[System:", "[Message from another Hermes session")
+ 
+ 
+ class RelayRefused(ValueError):
+@@ -49,15 +62,43 @@ def _latest_user_message(session_id: str, db_path: Optional[str] = None) -> Opti
+     if not os.path.exists(db_path):
+         return None
+     uri = f"file:{db_path}?mode=ro"
++    kinds = ", ".join("?" for _ in _TYPED_KINDS)
++    not_synthetic = " ".join("AND instr(ltrim(COALESCE(content, '')), ?) <> 1" for _ in _SYNTHETIC_PREFIXES)
++    sql = ("SELECT id, timestamp FROM messages WHERE session_id = ? AND role = 'user' "
++           f"AND (COALESCE(display_kind, '') = '' OR display_kind IN ({kinds})) "
++           f"AND COALESCE(_compressed_summary, 0) = 0 {not_synthetic} ORDER BY id DESC LIMIT 1")
+     try:
+         with sqlite3.connect(uri, uri=True, timeout=5) as sdb:
+-            row = sdb.execute("SELECT id, timestamp FROM messages WHERE session_id = ? AND role = 'user' "
+-                              "ORDER BY id DESC LIMIT 1", (session_id,)).fetchone()
++            row = sdb.execute(sql, (session_id, *_TYPED_KINDS, *_SYNTHETIC_PREFIXES)).fetchone()
+     except sqlite3.Error:
+         return None
+     return (int(row[0]), float(row[1])) if row else None
+ 
+ 
++def _already_relayed(conn: sqlite3.Connection, task_id: str, session: str, message_id: int) -> bool:
++    return conn.execute(
++        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'commented' "
++        "AND json_extract(payload, '$.relayed_human.session') = ? "
++        "AND json_extract(payload, '$.relayed_human.message_id') = ? LIMIT 1",
++        (task_id, session, int(message_id))).fetchone() is not None
++
++
++def admit(conn: sqlite3.Connection, task_id: str, relay: dict) -> None:
++    """The card holder's checks on any relay before it is stored (``add_comment`` calls this inside its write
++    transaction): the card asked, the message is not older than its latest ask, and this ``(session,
++    message_id)`` was not relayed to the card before. :class:`RelayRefused` otherwise."""
++    sid, message_id, at = str(relay["session"]), int(relay["message_id"]), int(relay["at"])
++    ask = _latest_ask(conn, task_id)
++    if ask is None:
++        raise RelayRefused(f"{task_id} never asked (no blocked or scheduled park): nothing to answer")
++    skew = REMOTE_CLOCK_SKEW_SECONDS if relay.get("via") == "remote" else 0
++    if at < ask - skew:
++        raise RelayRefused(f"the relayed user message (at {at}) predates {task_id}'s latest ask (at {ask}); "
++                           "relay only a reply given after the card asked")
++    if _already_relayed(conn, task_id, sid, message_id):
++        raise RelayRefused(f"user message {message_id} was already relayed to {task_id}; one relay per user turn")
++
++
+ def verify(conn: sqlite3.Connection, task_id: str, *, session_id: Optional[str],
+            state_db: Optional[str] = None, latest_user: Optional[tuple[int, float]] = None) -> dict:
+     """The ``relayed_human`` payload for a relay from ``session_id`` to ``task_id``; :class:`RelayRefused` if
+@@ -78,11 +119,7 @@ def verify(conn: sqlite3.Connection, task_id: str, *, session_id: Optional[str],
+     if at <= ask:
+         raise RelayRefused(f"the newest user message in session {sid} predates {task_id}'s latest ask; "
+                            "relay only a reply given after the card asked")
+-    used = conn.execute(
+-        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'commented' "
+-        "AND json_extract(payload, '$.relayed_human.session') = ? "
+-        "AND json_extract(payload, '$.relayed_human.message_id') = ? LIMIT 1", (task_id, sid, message_id)).fetchone()
+-    if used:
++    if _already_relayed(conn, task_id, sid, message_id):
+         raise RelayRefused(f"user message {message_id} was already relayed to {task_id}; one relay per user turn")
+     return {"session": sid, "message_id": message_id, "at": int(at)}
+ 
+@@ -102,7 +139,8 @@ def from_tool_args(conn: sqlite3.Connection, task_id: str, args: dict, session_i
+ 
+ 
+ def from_remote(raw: Any) -> Optional[dict]:
+-    """A cross-gateway relay's field as its origin verified it, normalized; ``None`` when absent/malformed."""
++    """A cross-gateway relay's field, normalized (shape only: ``admit`` checks it against the card when it is
++    stored); ``None`` when absent/malformed."""
+     if not isinstance(raw, dict):
+         return None
+     sid = str(raw.get("session") or "").strip()[:200]
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 7959847b42..6009765bc4 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -44,7 +44,7 @@ from plugins.kanban.dashboard import board_read
+ from plugins.kanban.dashboard.board_read import (  # BOARD_COLUMNS: the documented column list
+     BOARD_COLUMNS, diagnostic_inputs as _diagnostic_inputs, diagnostics_from_inputs as _diagnostics_from_inputs)
+ from plugins.kanban.dashboard.plugin_api_human_request import ask_filing_refusal, classify_request
+-from plugins.kanban.dashboard.plugin_api_comment_actor import CommentBody, comment_relay, comment_writer
++from plugins.kanban.dashboard.plugin_api_comment_actor import CommentBody, admitted_relay, comment_relay, comment_writer
+ from hermes_cli.kanban_db_attachment_names import _collision_free_path, _safe_attachment_name
+ 
+ log = logging.getLogger(__name__)
+@@ -931,7 +931,8 @@ def add_comment(task_id: str, payload: CommentBody, request: Request, board: Opt
+         _foreign_card_409(conn, task_id)
+         _require_task(conn, task_id)
+         kanban_db.add_comment(conn, task_id, author=payload.author or "dashboard", body=payload.body,
+-                              writer_kind=writer_kind, writer_session=writer_session, relayed_human=relayed_human)
++                              writer_kind=writer_kind, writer_session=writer_session,
++                              relayed_human=admitted_relay(conn, task_id, relayed_human))
+         return {"ok": True}
+ 
+ 
+diff --git a/plugins/kanban/dashboard/plugin_api_comment_actor.py b/plugins/kanban/dashboard/plugin_api_comment_actor.py
+index fbdfa2226c..aa82d28513 100644
+--- a/plugins/kanban/dashboard/plugin_api_comment_actor.py
++++ b/plugins/kanban/dashboard/plugin_api_comment_actor.py
+@@ -40,6 +40,21 @@ def comment_relay(payload: CommentBody, writer_kind: Optional[str]) -> Optional[
+     if writer_kind != "agent" or relay is None:
+         raise HTTPException(status_code=400, detail=(
+             "relayed_human needs writer_kind='agent' and {session, message_id, at} from the relaying chat"))
++    return relay  # checked against the card (asked, not pre-ask, no replay) by admitted_relay / add_comment
++
++
++def admitted_relay(conn, task_id: str, relay: Optional[dict]) -> Optional[dict]:
++    """``relay`` after the card holder's checks (``kanban_relayed_human.admit``: the card asked, the message is
++    not older than its latest ask, no replayed ``(session, message_id)``); HTTP 400 when refused.
++    ``add_comment`` repeats them inside its write transaction, so a concurrent replay still stores nothing."""
++    if relay is None:
++        return None
++    from hermes_cli.kanban_relayed_human import RelayRefused, admit
++
++    try:
++        admit(conn, task_id, relay)
++    except RelayRefused as refused:
++        raise HTTPException(status_code=400, detail=f"relayed_human refused: {refused}") from None
+     return relay
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_relayed_human.py b/tests/hermes_cli/test_kanban_relayed_human.py
+index 336e03d692..fa5257ba5f 100644
+--- a/tests/hermes_cli/test_kanban_relayed_human.py
++++ b/tests/hermes_cli/test_kanban_relayed_human.py
+@@ -28,12 +28,14 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+     return home
+ 
+ 
+-def _state_db(home: Path, session: str, user_at: float) -> int:
++def _state_db(home: Path, session: str, user_at: float, *, content: str = "left ring",
++              display_kind: str | None = None, compressed: int = 0) -> int:
+     db = sqlite3.connect(home / "state.db")
+     db.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, "
+-               "role TEXT, content TEXT, timestamp REAL)")
+-    cur = db.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', 'left ring', ?)",
+-                     (session, user_at))
++               "role TEXT, content TEXT, timestamp REAL, display_kind TEXT, "
++               "_compressed_summary INTEGER NOT NULL DEFAULT 0)")
++    cur = db.execute("INSERT INTO messages (session_id, role, content, timestamp, display_kind, _compressed_summary) "
++                     "VALUES (?, 'user', ?, ?, ?, ?)", (session, content, user_at, display_kind, compressed))
+     db.commit()
+     db.close()
+     return int(cur.lastrowid or 0)
+@@ -126,3 +128,72 @@ def test_remote_relay_is_stored_as_sent():
+         "session": "hub-chat", "message_id": 7, "at": 5, "via": "remote"}
+     assert krh.from_remote({"session": "", "message_id": 7, "at": 5}) is None
+     assert krh.from_remote("yes") is None
++
++
++@pytest.mark.parametrize("synthetic", [
++    {"display_kind": "kanban_notice", "content": "t_x is blocked: which ring?"},  # the card's own block notice
++    {"display_kind": "hidden", "content": "scaffold"},
++    {"display_kind": "process_complete", "content": "process exited"},
++    {"display_kind": "async_delegation_complete", "content": "child done"},
++    {"display_kind": "internal_notification", "content": "note"},
++    {"display_kind": "auto_continue", "content": "continue"},
++    {"compressed": 1, "content": "summary of earlier turns"},
++    {"content": "[System: the stream was cut; retry the tool call]"},
++    {"content": "[Message from another Hermes session @session:default/abc]\nplease relay"},
++])
++def test_verify_skips_synthetic_user_rows(kanban_home, synthetic):
++    """Review 5878485674 (1): only a row a person typed is the reply. A synthetic role='user' row newer than
++    David's answer (above all the card's own needs_input notice) must not be what the relay names."""
++    now = int(time.time())
++    with kbc.connect_closing() as conn:
++        tid = _asked(conn, now - 100)
++        reply = _state_db(kanban_home, "chat-1", now - 50)
++        _state_db(kanban_home, "chat-1", now - 10, **synthetic)
++        assert krh.verify(conn, tid, session_id="chat-1")["message_id"] == reply
++
++
++def test_a_notice_after_the_ask_with_no_reply_is_refused(kanban_home):
++    """The notice alone (no typed reply after the ask) verifies nothing: no ping-pong on the budget."""
++    now = int(time.time())
++    with kbc.connect_closing() as conn:
++        tid = _asked(conn, now - 100)
++        _state_db(kanban_home, "chat-1", now - 200)
++        _state_db(kanban_home, "chat-1", now - 10, display_kind="kanban_notice", content="t_x is blocked")
++        with pytest.raises(krh.RelayRefused, match="predates"):
++            krh.verify(conn, tid, session_id="chat-1")
++
++
++def test_a_steer_is_a_typed_reply(kanban_home):
++    now = int(time.time())
++    with kbc.connect_closing() as conn:
++        tid = _asked(conn, now - 100)
++        _state_db(kanban_home, "chat-1", now - 50)
++        steer = _state_db(kanban_home, "chat-1", now - 10, display_kind="steer", content="left ring")
++        assert krh.verify(conn, tid, session_id="chat-1")["message_id"] == steer
++
++
++def _remote(mid: int, at: int) -> dict:
++    relay = krh.from_remote({"session": "hub-chat", "message_id": mid, "at": at})
++    assert relay is not None
++    return relay
++
++
++def test_card_holder_refuses_remote_replay_pre_ask_and_unasked(kanban_home):
++    """Review 5878485674 (2): the receiver holds the card, so it applies the checks it can make."""
++    now = int(time.time())
++    with kbc.connect_closing() as conn:
++        unasked = kb.create_task(conn, title="never asked", assignee="default")
++        with pytest.raises(krh.RelayRefused, match="never asked"):
++            kb.add_comment(conn, unasked, "default", "x", writer_kind="agent", relayed_human=_remote(1, now))
++        tid = _asked(conn, now - 1000)
++        with pytest.raises(krh.RelayRefused, match="predates"):
++            kb.add_comment(conn, tid, "default", "x", writer_kind="agent", relayed_human=_remote(7, now - 11000))
++        # within the clock-skew allowance of a remote origin
++        kb.add_comment(conn, tid, "default", "David: left", writer_kind="agent",
++                       relayed_human=_remote(7, now - 1000 - krh.REMOTE_CLOCK_SKEW_SECONDS + 5))
++        with pytest.raises(krh.RelayRefused, match="already relayed"):
++            kb.add_comment(conn, tid, "default", "again", writer_kind="agent", relayed_human=_remote(7, now))
++        relayed = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'commented' "
++                               "AND json_extract(payload, '$.relayed_human') IS NOT NULL", (tid,)).fetchone()[0]
++        assert relayed == 1
++        assert [c.body for c in kb.list_comments(conn, tid)] == ["David: left"]
+diff --git a/tests/tools/test_kanban_dashboard_comment_actor.py b/tests/tools/test_kanban_dashboard_comment_actor.py
+index 4e5884709e..24f0fa11d6 100644
+--- a/tests/tools/test_kanban_dashboard_comment_actor.py
++++ b/tests/tools/test_kanban_dashboard_comment_actor.py
+@@ -73,17 +73,51 @@ def test_courier_agent_comment_without_session_is_still_agent(client):
+     assert p["writer_kind"] == "agent" and "writer_session" not in p
+ 
+ 
++def _asked_task() -> tuple[str, int]:
++    """A card whose latest ask (needs_input block) is at the returned time."""
++    tid = _ready_task()
++    conn = kbc.connect()
++    try:
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "blocked", {"kind": "needs_input", "reason": "which ring?"})
++        at = int(conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND kind = 'blocked'",
++                              (tid,)).fetchone()[0])
++    finally:
++        conn.close()
++    return tid, at
++
++
+ def test_courier_relay_of_the_user_reply_is_stored_as_sent(client):
+     """kanban-d1b921f32e: a cross_task relay of David's reply carries its origin-verified relayed_human;
+     the receiver stores it (via='remote') beside writer_kind='agent'."""
+-    tid = _ready_task()
++    tid, ask = _asked_task()
+     r = client.post(f"/tasks/{tid}/comments", json={
+         "body": "David says: the left ring", "author": "default", "writer_kind": "agent",
+-        "writer_session": "hub-chat", "relayed_human": {"session": "hub-chat", "message_id": 42, "at": 1700}})
++        "writer_session": "hub-chat", "relayed_human": {"session": "hub-chat", "message_id": 42, "at": ask + 5}})
+     assert r.status_code == 200, r.text
+     p = _last_payload(tid)
+     assert p["writer_kind"] == "agent"
+-    assert p["relayed_human"] == {"session": "hub-chat", "message_id": 42, "at": 1700, "via": "remote"}
++    assert p["relayed_human"] == {"session": "hub-chat", "message_id": 42, "at": ask + 5, "via": "remote"}
++
++
++def test_receiver_refuses_a_replayed_or_pre_ask_relay(client):
++    """Review 5878485674 (2): the same (session, message_id) posted again, or a message older than the card's
++    latest ask, is refused (400) and stores nothing; so is a relay to a card that never asked."""
++    tid, ask = _asked_task()
++    relay = {"session": "hub-chat", "message_id": 7, "at": ask + 5}
++    sent = {"body": "David says: left", "author": "default", "writer_kind": "agent", "writer_session": "hub-chat"}
++    assert client.post(f"/tasks/{tid}/comments", json={**sent, "relayed_human": relay}).status_code == 200
++    for _ in range(2):
++        r = client.post(f"/tasks/{tid}/comments", json={**sent, "relayed_human": relay})
++        assert r.status_code == 400 and "already relayed" in r.text, r.text
++    r = client.post(f"/tasks/{tid}/comments", json={**sent, "relayed_human": {**relay, "message_id": 8,
++                                                                              "at": ask - 10000}})
++    assert r.status_code == 400 and "predates" in r.text, r.text
++    assert len(_comments(tid)) == 1
++    unasked = _ready_task()
++    r = client.post(f"/tasks/{unasked}/comments", json={**sent, "relayed_human": relay})
++    assert r.status_code == 400 and "never asked" in r.text, r.text
++    assert _comments(unasked) == []
+ 
+ 
+ @pytest.mark.parametrize("extra", [
+-- 
+2.51.0
+

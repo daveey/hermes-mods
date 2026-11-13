@@ -1,0 +1,471 @@
+From 2a5defb2ff75e18ef795c8a083734aded0736c8b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:26:52 +0000
+Subject: [PATCH] [daveey] kanban chat links: the owner publishes its hub
+ subscriptions' chat links, so a chat's task list does not wait on its own
+ sync
+
+During laptop-1's Board sync outage (sync role given up, SchemaAhead, 2026-11-13) a chat placed six cards on
+worker-2/4/7 and the hub. Their done notices arrived (hub.db `sessions` links), but with
+`kanban.sync.links_reader: replica` the chat's task list, sidebar counts and ask-gate read only Board
+`task_chat_links` rows, which only the chat's own gateway wrote (from its origin ledger) through the sync that was
+down. None of the six cards had a row.
+
+The owner's links pass now turns each counted `platform='hub'` subscription `<gw>/<profile>/<session>` on an open
+card it owns into an unreleased link row for that chat (`_owner_hub_links`): the same subscriptions hermes-hub
+publishes as the card's `sessions`, so notices and the task list read one membership.
+
+- Same uid the chat's gateway writes for that link (`created` when the card carries a courier origin intent, the
+  ledger's `via: origin`; `shepherd` otherwise), so the recovered gateway upserts this row, never a second one.
+- Insert-only, once: nothing is written while any row for that card and chat exists in the board file or the
+  replica, released included, so a release the chat's gateway made is never reopened. An unreadable replica writes
+  nothing that pass. Touch/send_refused subs, placeholder and worker sessions, and the owner's own chats are skipped.
+- The chat's gateway releases these rows when the card closes: `_owner_written_releases` now covers `shepherd`
+  as well as `created`.
+
+Tests (tests/hermes_cli/test_kanban_chat_links_owner_hub_subs.py): two gateways on one fake Board, the chat
+gateway's sync given up the real way (PR #2033's fixture). A courier-placed card is in `session_tasks` once, counted,
+with a clean links_diff after one replica pull (fails on main); after the sync recovers there is still exactly one
+unreleased row; a card done during the outage is released by the recovered gateway; filtering and
+never-reopen/unreadable-replica cases. Live proof on scratch homes with the real CLI (`kanban origin-create`,
+`kanban sync links/run`, `kanban chat-tasks --expect`): exit 4 on main, exit 0 with this change.
+
+Card: t_01a1d44d87ea4bef
+---
+ hermes_cli/kanban_chat_links.py               | 118 +++++++-
+ .../test_kanban_chat_links_owner_hub_subs.py  | 263 ++++++++++++++++++
+ 2 files changed, 375 insertions(+), 6 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_chat_links_owner_hub_subs.py
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index 462fb55e7b..b66960664b 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -7,7 +7,9 @@ with one local query.
+ - :func:`reconcile` (run by the sync loop, idempotent, so its first run is the backfill) writes this gateway's
+   links into a board file: chats that created a card here (``tasks.session_id``), chats that shepherd a card here
+   (``tui`` subscriptions), and this gateway's chats' links to other gateways' cards from the origin-ledger
+-  projection, with its released state. Links it no longer finds are marked released, never deleted.
++  projection, with its released state. Links it no longer finds are marked released, never deleted. As a card's
++  owner it also publishes, insert-only, the link of each chat on another gateway its ``platform='hub'``
++  subscriptions name (``_owner_hub_links``), so that chat's task list does not wait on that gateway's own sync.
+ - :func:`replica_cards` answers a chat lineage's cards on other gateways from the replicas; ``session_tasks`` AND the
+   sidebar counts use it instead of the origin ledger when ``kanban.sync.links_reader`` is ``replica``, so the
+   count and the task strip are one projection in each mode.
+@@ -159,11 +161,12 @@ def _ledger_links(board: str, gateway: str) -> dict[str, dict[str, Any]]:
+ 
+ 
+ def _owner_written_releases(board: str, gateway: str, want: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+-    """Released copies of the ``created`` links another gateway (the card's owner) wrote for this gateway's chats,
+-    once the replica shows the card closed (``done``/``archived``). [daveey]
++    """Released copies of the ``created`` and ``shepherd`` links another gateway (the card's owner) wrote for this
++    gateway's chats, once the replica shows the card closed (``done``/``archived``). [daveey]
+ 
+     The owner writes them in ``kanban_creator_chats`` (``initialize_ownership`` / ``inherit_chats``) for a remote
+-    origin chat. The owner's reconcile manages only its own chats' links, so nothing released them: a done card
++    origin chat, and from its ``platform='hub'`` subscriptions (``_owner_hub_links``, ``created`` or ``shepherd``).
++    The owner's reconcile manages only its own chats' links, so nothing released them: a done card
+     whose origin ledger had no row for that chat (no ledger link with the same uid, no released shepherd sibling)
+     stayed an ``unknown`` obligation in ``replica_cards`` forever (4 hub cards on macbook chat
+     20261027_134353_5ab65c, 2026-11-01). The chat's gateway releases them by writing the same uid (the same row on
+@@ -187,8 +190,8 @@ def _owner_written_releases(board: str, gateway: str, want: dict[str, dict[str,
+             rows = [dict(r) for r in conn.execute(
+                 "SELECT l.uid, l.task_id, l.chat_gateway, l.chat_profile, l.chat_session, l.kind, l.created_at, "
+                 "t.status FROM task_chat_links l JOIN tasks t ON t.id = l.task_id "
+-                "WHERE l.chat_gateway = ? AND l.kind = 'created' AND l.released = 0 AND l.uid IS NOT NULL "
+-                "AND t.created_on IS NOT NULL AND t.created_on != ?",
++                "WHERE l.chat_gateway = ? AND l.kind IN ('created', 'shepherd') AND l.released = 0 "
++                "AND l.uid IS NOT NULL AND t.created_on IS NOT NULL AND t.created_on != ?",
+                 (gateway, gateway))]
+         finally:
+             conn.close()
+@@ -212,6 +215,99 @@ def _owner_written_releases(board: str, gateway: str, want: dict[str, dict[str,
+     return out
+ 
+ 
++def _owner_hub_links(conn: sqlite3.Connection, board: str, gateway: str) -> list[dict[str, Any]]:
++    """Links this gateway (the card's owner) publishes for chats on OTHER gateways: one per counted ``platform='hub'``
++    subscription ``<gw>/<profile>/<session>`` on an open card it owns, the same subscriptions the hermes-hub collector
++    publishes as the card's ``sessions`` (so notices and the task list read one membership). [daveey]
++
++    Before this only the chat's own gateway wrote that link, from its origin ledger, so while its Board sync was down
++    (laptop-1 gave up the sync role, SchemaAhead, 2026-11-13) six cards it placed elsewhere had no row on the Board:
++    its task list, sidebar counts and ask-gate missed them although their done notices arrived through hub.db.
++
++    The row is the one the chat's gateway writes for the same link (same uid: ``created`` for a courier-bound origin,
++    whose ledger row is ``via: origin``; ``shepherd`` otherwise), so when that gateway's reconcile comes back it
++    upserts this very row, never a second one. It is written once and never changed here: the chat's gateway owns
++    its release (its ledger, ``_owner_written_releases``). Nothing is written while any row for that card and chat
++    exists in this file or the replica, released included, so a release the chat's gateway already made is never
++    reopened; an unreadable replica writes nothing this pass."""
++    from hermes_cli import kanban_sync_client as ksc
++    from hermes_cli.kanban_lockguard import connect
++    from hermes_cli.kanban_origin import OriginError, parse_origin
++    from hermes_cli.kanban_origin_intent_carry import EVENT_KIND
++    from hermes_cli.kanban_placement import is_placeholder_session
++    from hermes_cli.kanban_session_activity import _counted_sub_clause
++    task_cols = {c[1] for c in conn.execute("PRAGMA table_info(tasks)")}
++    mine = "AND (t.created_on IS NULL OR t.created_on = '' OR t.created_on = ?)" if "created_on" in task_cols else ""
++    try:
++        subs = conn.execute(
++            f"SELECT s.task_id, s.chat_id, s.created_at FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
++            f"WHERE s.platform = 'hub' AND s.chat_id != '' AND t.status NOT IN ({', '.join('?' * len(TERMINAL_STATUSES))}) "
++            f"AND {_counted_sub_clause(conn)} {mine} ORDER BY s.task_id, s.chat_id",
++            (*TERMINAL_STATUSES, *((gateway,) if mine else ()))).fetchall()
++    except sqlite3.Error:  # board predates notify subscriptions
++        return []
++    wanted: dict[tuple, dict[str, Any]] = {}
++    for task_id, chat_id, created_at in subs:
++        try:
++            origin = parse_origin(chat_id)
++        except OriginError:
++            continue
++        if origin.gateway == gateway or is_placeholder_session(origin.session):
++            continue  # this gateway's own chats are its ``tui`` subscriptions (``_local_links``)
++        wanted.setdefault((task_id, origin.gateway, origin.profile, origin.session),
++                          {"created_at": int(created_at or time.time())})
++    if not wanted:
++        return []
++    groups: dict[tuple[str, str], list[str]] = {}
++    for _tid, gw, profile, session in wanted:
++        groups.setdefault((gw, profile), []).append(session)
++    headless = {(gw, profile): _worker_shepherds(sessions, gw, profile) for (gw, profile), sessions in groups.items()}
++    wanted = {k: v for k, v in wanted.items() if k[3] not in headless[(k[1], k[2])]}
++    task_ids = sorted({k[0] for k in wanted})
++    have: set[tuple] = set()
++    bound: set[tuple] = set()
++    path = ksc.shadow_path(board)
++    try:
++        replica = connect(f"file:{path}?mode=ro", uri=True, timeout=5) if path.exists() else None
++    except sqlite3.Error as exc:
++        _log.info("kanban chat links: replica %s unreadable for owner hub links (%s)", path, exc)
++        return []
++    try:
++        for db in (conn, replica):
++            if db is None:
++                continue
++            for i in range(0, len(task_ids), 500):
++                chunk = task_ids[i:i + 500]
++                have.update(tuple(r) for r in db.execute(
++                    "SELECT task_id, chat_gateway, COALESCE(chat_profile, 'default'), chat_session FROM task_chat_links "
++                    f"WHERE task_id IN ({', '.join('?' * len(chunk))})", chunk))
++        for i in range(0, len(task_ids), 500):
++            chunk = task_ids[i:i + 500]
++            for task_id, payload in conn.execute(
++                    f"SELECT task_id, payload FROM task_events WHERE kind = ? AND task_id IN "
++                    f"({', '.join('?' * len(chunk))})", (EVENT_KIND, *chunk)):
++                try:
++                    origin = json.loads(json.loads(payload)["binding_json"])["origin"]
++                    bound.add((task_id, origin["gateway"], origin["profile"], origin["session"]))
++                except (KeyError, TypeError, ValueError):
++                    continue
++    except sqlite3.Error as exc:  # nothing is written from a partial read; the next pass retries
++        _log.info("kanban chat links: owner hub links unreadable for %s (%s)", board, exc)
++        return []
++    finally:
++        if replica is not None:
++            replica.close()
++    out = []
++    for key, extra in wanted.items():
++        if key in have:
++            continue
++        task_id, gw, profile, session = key
++        kind = "created" if key in bound else "shepherd"
++        out.append({"uid": link_uid(task_id, gw, profile, session, kind), "task_id": task_id, "chat_gateway": gw,
++                    "chat_profile": profile, "chat_session": session, "kind": kind, "released": 0, **extra})
++    return out
++
++
+ def ledger_boards(gateway: str) -> set[str]:
+     """Boards on which this gateway's chats have cards, per the origin-ledger projection."""
+     from hermes_cli.kanban_session_activity import _remote_links
+@@ -290,7 +386,17 @@ def reconcile(conn: sqlite3.Connection, board: str, gateway: str, *, ledger: boo
+     placeholders = {r[0] for r in rows if is_placeholder_session(r[2]) or (
+         str(r[2] or "") in headless[(type(r[5]), r[5])] and not (r[1] and r[3] == "created"))}
+     added = changed = released = retired = 0
++    owner_links = _owner_hub_links(conn, board, gateway)  # read before the write lock, like ``_plan``
+     with write_txn(conn):
++        for link in owner_links:
++            # Insert-only, and only while no row for this card and chat exists (a concurrent write, or a pull that
++            # brought the chat gateway's own row in, wins). See ``_owner_hub_links``.
++            added += conn.execute(
++                "INSERT INTO task_chat_links (uid, task_id, chat_gateway, chat_profile, chat_session, kind, released, "
++                "created_at) SELECT :uid, :task_id, :chat_gateway, :chat_profile, :chat_session, :kind, 0, :created_at "
++                "WHERE NOT EXISTS (SELECT 1 FROM task_chat_links WHERE task_id = :task_id AND chat_gateway = "
++                ":chat_gateway AND COALESCE(chat_profile, 'default') = :chat_profile AND chat_session = :chat_session)",
++                link).rowcount
+         for uid in placeholders - set(want):
+             conn.execute("DELETE FROM task_chat_links WHERE uid = ?", (uid,))
+             have.pop(uid)
+diff --git a/tests/hermes_cli/test_kanban_chat_links_owner_hub_subs.py b/tests/hermes_cli/test_kanban_chat_links_owner_hub_subs.py
+new file mode 100644
+index 0000000000..e33432c728
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_chat_links_owner_hub_subs.py
+@@ -0,0 +1,263 @@
++"""A chat's cards placed on another gateway reach its task list while its own Board sync is down. [daveey]
++
++Incident (2026-11-13, laptop-1): the gateway gave up the Board sync role (``SchemaAhead``) at 23:53 PT. Chat
++20261026_235722_bef6c6 then placed six cards on worker-2/4/7 and the hub. Their done notices arrived (hub.db
++``sessions`` links, ``kanban_remote_notices``), but with ``kanban.sync.links_reader: replica`` the chat's task list,
++sidebar counts and ask-gate read only Board ``task_chat_links`` rows, and only the chat's own gateway wrote those, from
++its origin ledger, through the sync that was down. None of the six cards had a row (t_01a1d44d87ea4bef).
++
++The owner now publishes the link from its ``platform='hub'`` subscription (``kanban_chat_links._owner_hub_links``):
++the same uid the chat's gateway writes, insert-only, so the recovered chat gateway upserts that one row.
++
++Two gateways run here against one fake Board, each in its own home: the chat's (macbook) and the owner (worker-7).
++The stopped sync is produced the real way (``tests/tools/test_kanban_board_delivery._give_up_the_sync_role``).
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_runstate as runstate
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++ME, OWNER, BOARD = "macbook", "worker-7", "default"
++CHAT = "20261026_235722_bef6c6"
++
++
++class Gateways:
++    """Two gateway homes in one process: ``at(name)`` points HERMES_HOME (and the sync client) at one of them."""
++
++    def __init__(self, tmp_path: Path, monkeypatch, svc: FakeService):
++        self.mp, self.svc, self.ledger = monkeypatch, svc, []
++        self.homes = {name: tmp_path / name / ".hermes" for name in (ME, OWNER)}
++        for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK",
++                    "HERMES_KANBAN_RUN_ID", "HERMES_ORIGIN_SESSION", "HERMES_SESSION_ID", "HERMES_SESSION_KEY"):
++            monkeypatch.delenv(var, raising=False)
++        # The chat gateway's origin ledger (``_remote_links``): what its placement recorded for its chats. The
++        # owner's ledger has no rows for macbook chats (``_ledger_links`` keeps only its own origin's rows).
++        monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: list(self.ledger))
++        self.conns: dict[str, sqlite3.Connection] = {}
++        for name, home in self.homes.items():
++            home.mkdir(parents=True)
++            reader = "    links_reader: replica\n" if name == ME else ""
++            (home / "config.yaml").write_text(f"kanban:\n  sync:\n    enabled: true\n{reader}")
++            self.at(name)
++            conn = kbc.connect(home / "kanban.db")
++            ksc.ensure_identity(conn, BOARD, name)
++            sync.set_mode(conn, "primary")
++            self.conns[name] = conn
++
++    def at(self, name: str) -> Path:
++        home = self.homes[name]
++        self.mp.setenv("HERMES_HOME", str(home))
++        self.mp.setenv("HERMES_KANBAN_HOME", str(home))
++        self.mp.setattr(Path, "home", lambda: home.parent)
++        self.mp.setattr(ksc, "load_identity", lambda cfg=None: ksc.Identity("https://board.test", "k", name))
++        ksc.reset_board_watch()
++        ksa._reset_cache_for_tests()
++        links._reset_for_tests()
++        sync.consume_dispatcher_wake()
++        return home
++
++    def links_pass(self, name: str) -> None:
++        """The sync loop's links pass on ``name`` (``reconcile_links``), as run before each push."""
++        home = self.at(name)
++        ksc.reconcile_links([(BOARD, home / "kanban.db")], name)
++
++    def round(self, name: str) -> None:
++        """One full sync round on ``name``: its links pass, then push the outbox and pull (live + replica)."""
++        self.links_pass(name)
++        home = self.at(name)
++        result = ksc.sync_board(BOARD, home / "kanban.db", self.svc.hub(name), name)
++        assert not result.error, result
++
++    def pull_replica(self, name: str) -> None:
++        self.at(name)
++        ksc._pull_replica(BOARD, self.svc.hub(name), name)
++
++    def replica_rows(self, name: str, task_id: str) -> list[tuple]:
++        self.at(name)
++        conn = sqlite3.connect(f"file:{ksc.shadow_path(BOARD)}?mode=ro", uri=True)
++        try:
++            return [tuple(r) for r in conn.execute(
++                "SELECT uid, chat_gateway, chat_profile, chat_session, kind, released FROM task_chat_links "
++                "WHERE task_id = ? ORDER BY uid", (task_id,))]
++        finally:
++            conn.close()
++
++    def close(self) -> None:
++        for conn in self.conns.values():
++            conn.close()
++
++
++@pytest.fixture
++def gws(tmp_path, monkeypatch):
++    previous = sync.set_lease_client(support.FakeLeaseClient())
++    g = Gateways(tmp_path, monkeypatch, FakeService())
++    try:
++        yield g
++    finally:
++        g.close()
++        sync.set_lease_client(previous)
++        ksa._reset_cache_for_tests()
++        links._reset_for_tests()
++
++
++def _give_up(gws: Gateways) -> None:
++    """The chat gateway's sync loop meets a board a newer core migrated and gives up its role (PR #2033's fixture)."""
++    from tests.tools.test_kanban_board_delivery import _give_up_the_sync_role
++    home = gws.at(ME)
++    with pytest.MonkeyPatch.context() as mp:
++        _give_up_the_sync_role(home, mp)
++    assert runstate.down() and "SchemaAhead" in runstate.down()["reason"]
++
++
++def _placed(gws: Gateways, title: str = "placed from the chat") -> str:
++    """The chat places a card on worker-7: the owner's courier create (``kanban_create`` with an origin intent)."""
++    from tools.registry import registry
++    import tools.kanban_tools  # registers kanban_create
++    gws.at(OWNER)
++    intent = {"request_id": f"placement:{ME}:{abs(hash(title)):016x}",
++              "owner": {"gateway": OWNER, "profile": "default", "board": BOARD},
++              "origin": {"gateway": ME, "profile": "default", "session": CHAT}}
++    res = json.loads(registry.dispatch("kanban_create", {"title": title, "assignee": "default"}, origin_intent=intent))
++    assert res.get("created") is True, res
++    tid = res["task_id"]
++    gws.ledger.append({"id": tid, "board": BOARD, "gateway": OWNER, "profile": "default",
++                       "key": f"{OWNER}/default/{BOARD}/{tid}", "session": CHAT, "via": "origin",
++                       "origin_gateway": ME, "origin_profile": "default", "released": False, "status": "ready",
++                       "unfinished": True, "title": title})
++    return tid
++
++
++def _chat_view(gws: Gateways) -> tuple[list[str], int, dict]:
++    gws.at(ME)
++    tasks = [t["id"] for t in ksa.session_tasks([CHAT])]
++    return tasks, ksa.active_task_counts().get(CHAT, 0), links.links_diff(ME)
++
++
++def test_a_card_placed_while_the_chat_gateways_sync_is_down_shows_in_its_task_list(gws):
++    _give_up(gws)
++    tid = _placed(gws)
++    gws.round(OWNER)  # the owner's sync runs: its links pass publishes the chat's link with the card
++    gws.pull_replica(ME)  # one replica pull on the chat's gateway
++    assert runstate.down()  # still stopped: nothing of the chat gateway's own reached the Board
++    tasks, count, diff = _chat_view(gws)
++    # Before the fix: [] and 0, and links_diff listed the card only in the ledger.
++    assert tasks == [tid] and count == 1
++    assert diff["clean"], diff
++    rows = gws.replica_rows(ME, tid)
++    assert rows == [(links.link_uid(tid, ME, "default", CHAT, "created"), ME, "default", CHAT, "created", 0)]
++
++
++def test_the_recovered_chat_gateway_upserts_the_same_row_never_a_second(gws):
++    _give_up(gws)
++    tid = _placed(gws)
++    gws.round(OWNER)
++    gws.pull_replica(ME)
++    runstate.clear()  # a fixed core restarts the loop: the chat gateway's links pass and push run again
++    gws.round(ME)
++    gws.round(OWNER)
++    gws.round(ME)
++    rows = gws.replica_rows(ME, tid)
++    assert [r for r in rows if r[5] == 0] == [
++        (links.link_uid(tid, ME, "default", CHAT, "created"), ME, "default", CHAT, "created", 0)]
++    assert len(rows) == 1
++    tasks, count, diff = _chat_view(gws)
++    assert tasks == [tid] and count == 1
++    assert diff["clean"], diff
++    # The chat gateway wrote the uid itself, so it owns the row now; the owner's passes add nothing more.
++    assert gws.conns[ME].execute("SELECT COUNT(*) FROM task_chat_links WHERE task_id = ?", (tid,)).fetchone()[0] == 1
++
++
++def test_a_card_finished_during_the_outage_is_released_by_the_recovered_chat_gateway(gws):
++    _give_up(gws)
++    tid = _placed(gws)
++    gws.round(OWNER)
++    gws.at(OWNER)
++    assert kb.complete_task(gws.conns[OWNER], tid, result="done")
++    gws.round(OWNER)
++    # The chat gateway's ledger released the obligation (verified done), so its projection no longer lists it.
++    gws.ledger.clear()
++    runstate.clear()
++    gws.pull_replica(ME)  # the replica shows the card done
++    gws.round(ME)
++    gws.pull_replica(ME)
++    assert [r[5] for r in gws.replica_rows(ME, tid)] == [1]
++    tasks, count, diff = _chat_view(gws)
++    assert tasks == [] and count == 0 and diff["clean"], diff
++
++
++def _sub(conn, tid, chat_id, reason=None):
++    meta = json.dumps({"reason": reason}) if reason else None
++    with kbc.write_txn(conn):
++        conn.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, thread_id, delivery_metadata, "
++                     "created_at) VALUES (?, 'hub', ?, '', ?, 5)", (tid, chat_id, meta))
++
++
++def _owner_links(conn, tid):
++    return sorted(tuple(r) for r in conn.execute(
++        "SELECT chat_gateway, chat_profile, chat_session, kind, released FROM task_chat_links WHERE task_id = ?",
++        (tid,)))
++
++
++def test_owner_publishes_counted_hub_subscriptions_of_open_cards_only(gws):
++    gws.at(OWNER)
++    conn = gws.conns[OWNER]
++    tid = kb.create_task(conn, title="watched", assignee="default")
++    done = kb.create_task(conn, title="finished", assignee="default")
++    _sub(conn, tid, "hub/alice/chat-shepherd", "shepherd")          # a cross_task shepherd on another gateway
++    _sub(conn, tid, "mini/default/chat-touch", "touch")             # notice-only: never the chat's work
++    _sub(conn, tid, "mini/default/chat-refused", "send_refused")
++    _sub(conn, tid, f"{OWNER}/default/own-chat")                     # this gateway's own chat: its tui subs say it
++    _sub(conn, tid, "mini/default/kanban-placement-mini")            # a placement attribution id, never a chat
++    _sub(conn, tid, "mini/default/local-" + "7c" * 32)                # a worker receipt hash, never a chat
++    _sub(conn, tid, "not a chat ref")
++    _sub(conn, done, "hub/default/chat-late")
++    assert kb.complete_task(conn, done, result="ok")
++    out = links.reconcile(conn, BOARD, OWNER)
++    assert _owner_links(conn, tid) == [("hub", "alice", "chat-shepherd", "shepherd", 0)]
++    assert _owner_links(conn, done) == []
++    assert out["added"] >= 1
++    # Idempotent: a second pass writes nothing and queues nothing.
++    queued = conn.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE table_name = 'task_chat_links'").fetchone()[0]
++    assert links.reconcile(conn, BOARD, OWNER)["added"] == 0
++    assert conn.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE table_name = 'task_chat_links'"
++                        ).fetchone()[0] == queued
++
++
++def test_owner_never_reopens_or_doubles_a_link_the_chat_gateway_already_wrote(gws):
++    gws.at(OWNER)
++    conn = gws.conns[OWNER]
++    tid = kb.create_task(conn, title="watched", assignee="default")
++    _sub(conn, tid, "hub/default/chat-a", "shepherd")
++    _sub(conn, tid, "hub/default/chat-b", "shepherd")
++    # chat-a: the chat's gateway already released its link (same card and chat, either kind); chat-b: it wrote the
++    # ``created`` kind for it. Both reached the owner's replica only.
++    rep = ksc.shadow_path(BOARD)
++    replica = ksc.open_shadow(BOARD, OWNER)
++    replica.close()
++    raw = sqlite3.connect(rep)
++    raw.executemany("INSERT INTO task_chat_links (uid, task_id, chat_gateway, chat_profile, chat_session, kind, "
++                    "released, created_at) VALUES (?, ?, 'hub', 'default', ?, ?, ?, 1)",
++                    [(links.link_uid(tid, "hub", "default", "chat-a", "shepherd"), tid, "chat-a", "shepherd", 1),
++                     (links.link_uid(tid, "hub", "default", "chat-b", "created"), tid, "chat-b", "created", 0)])
++    raw.commit()
++    raw.close()
++    links.reconcile(conn, BOARD, OWNER)
++    assert _owner_links(conn, tid) == []
++    # A replica that cannot be read writes nothing this pass (never a guess over a release it could not see).
++    _sub(conn, tid, "hub/default/chat-c", "shepherd")
++    rep.write_bytes(b"not a database")
++    links.reconcile(conn, BOARD, OWNER)
++    assert _owner_links(conn, tid) == []
+-- 
+2.51.0
+

@@ -1,0 +1,998 @@
+From 0932d6e175989983bf9dc47e0ac2d24d270d07fd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:16:52 +0000
+Subject: [PATCH] [daveey] hub admission phase 2: deterministic score, queue
+ --explain and capacity effect report
+
+kanban_admission_score.rank scores hub-local ready/review rows over the full replica: capped effective priority
++ class + bounded open descendants + bounded current-interval aging - failures, weights in kanban.admission.weights
+(validated, finite). Opted-in hubs order each lane by score, then keep the marked-first pool partition; workers keep
+plain priority. queue_note carries the score summary; 'hermes kanban queue [--explain ID] [--json]' prints order,
+breakdown, position and pools; 'queue --report' measures ready-wait p50 around each capacity card's completion and
+flags repeat no-effect origins (recommendation only).
+---
+ docs/kanban-hub-admission-v2.md               |  47 ++-
+ hermes_cli/kanban.py                          |   3 +-
+ hermes_cli/kanban_admission_explain.py        |  92 +++++
+ hermes_cli/kanban_admission_pools.py          |  52 ++-
+ hermes_cli/kanban_admission_report.py         |  81 ++++
+ hermes_cli/kanban_admission_score.py          | 181 +++++++++
+ hermes_cli/kanban_parser.py                   |   4 +
+ hermes_cli/kanban_queue_position.py           |   6 +-
+ tests/hermes_cli/test_kanban_hub_admission.py | 345 ++++++++++++++++++
+ 9 files changed, 784 insertions(+), 27 deletions(-)
+ create mode 100644 hermes_cli/kanban_admission_explain.py
+ create mode 100644 hermes_cli/kanban_admission_report.py
+ create mode 100644 hermes_cli/kanban_admission_score.py
+
+diff --git a/docs/kanban-hub-admission-v2.md b/docs/kanban-hub-admission-v2.md
+index 7f23f482a4..203095bfd9 100644
+--- a/docs/kanban-hub-admission-v2.md
++++ b/docs/kanban-hub-admission-v2.md
+@@ -27,11 +27,15 @@ Core now reports the policy and both pool counts from one root configuration
+ snapshot and one census, rechecks configuration after CPU sampling, and removes
+ the entire new tuple on an old Board's atomic 400 compatibility retry.
+ 
+-Still pending: queue notes, complete Board adversarial coverage and delivery,
+-composed courier receiver compatibility, full malformed-config/receipt tests, sync replay
+-coverage, guard mutations, scoring, reporting and live activation. Do not enable
+-this incomplete implementation. `priority_slots` is currently opt-in (absent = 0)
+-until the full Board-compatible rollout is ready; the enabled-hub target is 3.
++Phase 2 is implemented on the same branch: `hermes_cli/kanban_admission_score.py`
++(`rank`), score-ordered lanes on opted-in hubs (marked-first partition kept), the
++queue-note score summary, `hermes kanban queue [--explain ID] [--json]` and the
++capacity effect report `hermes kanban queue --report [--days N]`.
++
++Still pending: delivery (exact-head review, CI, Board deploy before core
++activation), read-only old/new replay over real boards, natural hub install and
++live activation. Do not enable before the Board side is deployed. `priority_slots`
++is opt-in (absent = 0); the enabled-hub target is 3.
+ 
+ ## Policy and rollout
+ 
+@@ -148,21 +152,32 @@ its maximum contribution is 1500 after ten hours. Ties use readiness timestamp,
+ then task ID. Scoring is read-only and never rewrites stored priorities.
+ 
+ Score selects order only; it cannot bypass placement, either pool cap, CPU,
+-memory, origin cap or update holds. Workers keep plain dispatch order.
+-
+-`queue_note` and `hermes kanban queue --explain ID` show component values, position,
+-placement, current class, applicable refusal and `regular N/7, priority M/3`.
++memory, origin cap or update holds. Workers keep plain dispatch order. On the
++opted-in hub, lanes are ranked by score and then stably partitioned marked-first,
++so the class weight orders within a group and never undoes the pool partition.
++An unreadable replica or invalid weights falls back to priority order (logged).
++`rank(conn, rows, *, now_ms=None, weights=None)` is the shared contract for the
++foreign-pickup stage: one call is one read-only snapshot over the full replica
++(local rows and a local child's edge set override it), nothing is cached.
++
++`queue_note` appends `score T (priority P + class C + unblock U + age A - failures F)`
++on an opted-in hub. `hermes kanban queue --explain ID` prints the lane position,
++`score T = priority P + class W*r + unblock W*d + age W*a - failures W*f`, the
++pools line `regular N/7, priority M/3` and the cards ahead; off the hub it says the
++score is not used (plain priority). `hermes kanban queue --json` lists both lanes.
+ Ready-wait notices recommend class/placement corrections, never priority bidding.
+ 
+ ## Effect reporting
+ 
+-A weekly hub report lists capacity claims with their stated frees metric,
+-claim-time and post-completion observations, ready-wait p50 and worker free slots.
+-Unknown/missing/incomparable data is explicitly unknown, not a success or failure.
+-Before implementation of automatic class loss, encode and test a deterministic
+-repeated-no-effect policy using comparable observations; retain auditable origin,
+-measurement window and evidence. Do not demote creators merely because unrelated
+-queue load rose. Reporting must run on the hub, not a sleeping Mac.
++`hermes kanban queue --report [--days 7] [--json]` (run on the hub) lists capacity
++cards completed in the window with their `frees:` claim and claim-time origin, and
++the local ready-wait p50 (claim start minus that ready interval's start) of other
++cards claimed in the 24 h before and after completion. With fewer than 3 claims on
++either side the effect is `unknown`, never a success or failure; `moved` means
++after <= 0.9 * before, otherwise `no_effect`. An origin with at least 2 measured
++no-effect cards and none moved is flagged `revoke_recommended`; the report only
++recommends, an operator acts (`hermes kanban edit <id> --class normal`). Worker
++free slots are not yet part of the report.
+ 
+ ## Acceptance
+ 
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index e96fcc1028..aa6f7628b7 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -49,6 +49,7 @@ from hermes_cli.kanban_ops import (
+ )
+ from hermes_cli.kanban_parser import build_parser, cmd_resume as _cmd_resume, cmd_quota_release as _cmd_quota_release
+ from hermes_cli.kanban_sync_cli import cmd_sync as _cmd_sync
++from hermes_cli.kanban_admission_explain import cmd_queue as _cmd_queue
+ from hermes_cli.kanban_archive_scope import (  # moved here from this module; re-exported for callers
+     _capability_owner_waiting_card, _creator_task_id, _is_stranded_runs_on_copy,
+     _worker_may_archive_capability_owner, _worker_may_archive_own,
+@@ -1869,7 +1870,7 @@ _HANDLERS = {
+     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
+     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
+     "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
+-    "gc": _cmd_gc, "sync": _cmd_sync,
++    "gc": _cmd_gc, "sync": _cmd_sync, "queue": _cmd_queue,
+ }
+ 
+ 
+diff --git a/hermes_cli/kanban_admission_explain.py b/hermes_cli/kanban_admission_explain.py
+new file mode 100644
+index 0000000000..b3041b8110
+--- /dev/null
++++ b/hermes_cli/kanban_admission_explain.py
+@@ -0,0 +1,92 @@
++"""``hermes kanban queue``: hub admission order with score breakdowns (``--explain <id>`` for one card). [daveey]"""
++from __future__ import annotations
++
++import argparse
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli.kanban_output import _json_out
++
++LANES = ("review", "ready")
++
++
++def snapshot(conn) -> dict:
++    """Both lanes in dispatch order, each row with its score breakdown, plus the pool census when opted in."""
++    from hermes_cli import kanban_admission_pools as pools
++    from hermes_cli import kanban_admission_score as score
++    from hermes_cli import kanban_queue_position as qp
++
++    scored = pools.score_enabled()
++    out = {"scored": scored, "pools": None}
++    for lane in LANES:
++        rows = pools.lane_rows(conn, lane)
++        # Off the opted-in hub the score is display-only: default weights, never a config read that could refuse.
++        parts = {row["id"]: p.as_dict() for row, p in score.rank(conn, rows, weights=None if scored else {})}
++        details = {r["id"]: r for r in conn.execute(
++            "SELECT id, title, priority, admission_class FROM tasks WHERE status=?", (lane,))}
++        out[lane] = [{"id": row["id"], "title": details[row["id"]]["title"],
++                      "priority": details[row["id"]]["priority"],
++                      "admission_class": details[row["id"]]["admission_class"] or "normal",
++                      "score": parts[row["id"]]} for row in rows]
++    if scored:
++        _running, limit = qp._running_and_limit(conn, None)
++        out["pools"] = pools.queue_fields(limit, "normal").get("admission_pools")
++    return out
++
++
++def _pools_line(census) -> str:
++    def part(name):
++        count, cap = census[name], census[name + "_cap"]
++        return f"{name} {'?' if count is None else count}/{'?' if cap is None else cap}"
++    return "pools: " + ", ".join(part(name) for name in ("regular", "priority"))
++
++
++def _explain(conn, snap, task_id) -> list[str]:
++    from hermes_cli.kanban_admission_score import explain
++
++    task = kb.get_task(conn, task_id)
++    if task is None:
++        return [f"no such task: {task_id}"]
++    lane = snap.get(task.status) if task.status in LANES else None
++    ids = [row["id"] for row in lane or ()]
++    if lane is None or task_id not in ids:
++        return [f"{task_id}: not in a ready or review lane (status {task.status})"]
++    index = ids.index(task_id)
++    row = lane[index]
++    lines = [f"{task_id}: {task.status} lane position {index + 1}/{len(ids)} (class {row['admission_class']})"]
++    if not snap["scored"]:
++        lines.append("hub admission score not enabled here: plain priority order")
++    lines.append(explain(row["score"]))
++    if snap["pools"]:
++        lines.append(_pools_line(snap["pools"]))
++    if index:
++        lines.append("ahead: " + ", ".join(ids[:min(index, 10)]) + (" …" if index > 10 else ""))
++    return lines
++
++
++def cmd_queue(args: argparse.Namespace) -> int:
++    if getattr(args, "report", False):
++        from hermes_cli import kanban_admission_report as report
++
++        with kbc.connect_closing() as conn:
++            data = report.capacity_report(conn, days=args.days)
++        if not _json_out(args, data):
++            print(report.render(data))
++        return 0
++    with kbc.connect_closing() as conn:
++        snap = snapshot(conn)
++        if args.explain:
++            lines = _explain(conn, snap, args.explain)
++            print("\n".join(lines))
++            return 1 if lines[0].startswith("no such task") else 0
++    if _json_out(args, snap):
++        return 0
++    print("hub admission score order" if snap["scored"] else "plain priority order (hub admission not enabled)")
++    if snap["pools"]:
++        print(_pools_line(snap["pools"]))
++    for lane in LANES:
++        print(f"{lane}:")
++        for index, row in enumerate(snap[lane], 1):
++            print(f"  {index:3d}. {row['id']}  {row['admission_class']:8s}  "
++                  f"{row['score']['total']:g}  {row['title']}")
++    return 0
+diff --git a/hermes_cli/kanban_admission_pools.py b/hermes_cli/kanban_admission_pools.py
+index 95fda3951d..55cf41ab92 100644
+--- a/hermes_cli/kanban_admission_pools.py
++++ b/hermes_cli/kanban_admission_pools.py
+@@ -1,4 +1,9 @@
+ """Deterministic selection for separate regular and marked-only hub pools."""
++import logging
++import sqlite3
++
++_LOG = logging.getLogger(__name__)
++MARKED = ("capacity", "urgent")
+ 
+ 
+ def select_pool(admission_class, *, regular, priority, regular_cap, priority_cap):
+@@ -38,8 +43,8 @@ def board_pools(conn, *, own=None, excluded=(), origins=None):
+     return counts
+ 
+ 
+-def root_settings():
+-    """Opt-in root policy; absent priority_slots leaves the existing scalar gate intact."""
++def admission_policy() -> dict:
++    """Root ``kanban.admission`` mapping (``{}`` when absent); malformed nesting raises ValueError."""
+     from pathlib import Path
+     from hermes_constants import get_default_hermes_root
+     from hermes_cli.config_backend import read_config_doc_readonly
+@@ -47,7 +52,7 @@ def root_settings():
+     try:
+         doc = read_config_doc_readonly(Path(get_default_hermes_root()) / "config.yaml")
+     except FileNotFoundError:
+-        return 0, 85
++        return {}
+     policy = {} if doc is None else doc
+     for key in ("kanban", "admission"):
+         if not isinstance(policy, dict):
+@@ -55,6 +60,12 @@ def root_settings():
+         policy = policy.get(key, {})
+     if not isinstance(policy, dict):
+         raise ValueError("admission configuration must be mappings")
++    return policy
++
++
++def root_settings():
++    """Opt-in root policy; absent priority_slots leaves the existing scalar gate intact."""
++    policy = admission_policy()
+     slots = policy.get("priority_slots", 0)
+     ceiling = policy.get("priority_cpu_busy_below_pct", 85)
+     if type(slots) is not int or slots < 0:
+@@ -64,13 +75,30 @@ def root_settings():
+     return slots, ceiling
+ 
+ 
++def score_enabled() -> bool:
++    """Hub admission ordering (marked-first + score) applies only on an opted-in hub; workers keep priority."""
++    from hermes_cli import machine_cpu_metrics as cpu
++
++    return cpu.root_limit()[0] == cpu.ON and root_settings()[0] > 0
++
++
+ def lane_rows(conn, status):
+     """Offer marked candidates before normal rows only on an opted-in hub."""
+-    from hermes_cli import machine_cpu_metrics as cpu
+     from hermes_cli.kanban_db_dispatch_queries import lane_rows as query
+ 
+-    marked_first = cpu.root_limit()[0] == cpu.ON and root_settings()[0] > 0
+-    return query(conn, status, marked_first=marked_first)
++    marked_first = score_enabled()
++    rows = query(conn, status, marked_first=marked_first)
++    if not marked_first:
++        return rows
++    from hermes_cli import kanban_admission_score as score
++
++    try:
++        ranked = [row for row, _parts in score.rank(conn, rows)]
++    except (sqlite3.Error, OSError, ValueError):
++        _LOG.warning("admission score unavailable; using priority order", exc_info=True)
++        return rows
++    ranked.sort(key=lambda row: row["admission_class"] not in MARKED)
++    return ranked
+ 
+ 
+ def dispatch_remaining(regular_cap):
+@@ -102,7 +130,7 @@ def host_remaining(regular_cap, running_count, board):
+     return remaining
+ 
+ 
+-def queue_fields(regular_cap, admission_class):
++def queue_fields(regular_cap, admission_class, conn=None, task_id=None):
+     """Advisory whole-host census; unknown counts are never rendered as free slots."""
+     from hermes_cli import machine_cpu_metrics as cpu, machine_metrics
+ 
+@@ -114,8 +142,14 @@ def queue_fields(regular_cap, admission_class):
+     detail = {"pools": {"regular": 0, "priority": 0}}
+     active = machine_metrics.active_card_runs(detail=detail)
+     counts = detail["pools"] if active is not None else {"regular": None, "priority": None}
+-    return {"admission_class": admission_class,
+-            "admission_pools": {**counts, "regular_cap": regular_cap, "priority_cap": slots}}
++    fields = {"admission_class": admission_class,
++              "admission_pools": {**counts, "regular_cap": regular_cap, "priority_cap": slots}}
++    if conn is not None and task_id is not None:
++        from hermes_cli import kanban_admission_score as score
++
++        rows = conn.execute("SELECT id FROM tasks WHERE id=?", (task_id,)).fetchall()
++        fields["admission_score"] = score.rank(conn, rows)[0][1].as_dict() if rows else None
++    return fields
+ 
+ 
+ def advisory_limit(conn, task_id, regular_limit):
+diff --git a/hermes_cli/kanban_admission_report.py b/hermes_cli/kanban_admission_report.py
+new file mode 100644
+index 0000000000..5bd73ab541
+--- /dev/null
++++ b/hermes_cli/kanban_admission_report.py
+@@ -0,0 +1,81 @@
++"""Weekly capacity-class effect report (docs/kanban-hub-admission-v2.md §4). [daveey]
++
++For each ``capacity`` card completed in the window, compare the local ready-wait p50 (claim start minus the start of
++that ready interval) of other cards claimed in the 24 h before and after its completion. Fewer than
++``MIN_SAMPLES`` claims on either side is ``unknown``: missing evidence is never a success or a failure. An origin
++with at least ``REVOKE_AFTER`` measured no-effect cards and none that moved is flagged ``revoke_recommended``; the
++report recommends, an operator acts (``hermes kanban edit <id> --class normal``).
++"""
++from __future__ import annotations
++
++import statistics
++import time
++from typing import Optional
++
++from hermes_cli.kanban_diagnostics import _READY_WAIT_FLOOR_KINDS
++
++SIDE_S = 86_400
++MIN_SAMPLES = 3
++MOVED_RATIO = 0.9
++REVOKE_AFTER = 2
++_CLAIM_KINDS = ("claimed", "spawned")
++
++
++def _waits(conn, start: int, end: int, exclude: str) -> list[int]:
++    kinds = sorted(_READY_WAIT_FLOOR_KINDS - set(_CLAIM_KINDS))
++    marks = ",".join("?" for _ in kinds)
++    rows = conn.execute(
++        "SELECT r.started_at, t.created_at, "
++        f"(SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = r.task_id AND e.kind IN ({marks}) "
++        " AND e.created_at <= r.started_at), "
++        "(SELECT MAX(p.ended_at) FROM task_runs p WHERE p.task_id = r.task_id AND p.id < r.id) "
++        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
++        "WHERE r.started_at >= ? AND r.started_at < ? AND r.task_id != ?",
++        (*kinds, start, end, exclude)).fetchall()
++    return [max(0, started - max(created or 0, event or 0, ended or 0)) for started, created, event, ended in rows]
++
++
++def _p50(values: list[int]) -> Optional[float]:
++    return statistics.median(values) if len(values) >= MIN_SAMPLES else None
++
++
++def capacity_report(conn, *, now_s: Optional[int] = None, days: int = 7) -> dict:
++    now_s = int(time.time()) if now_s is None else now_s
++    cards = []
++    for tid, title, frees, completed, origin in conn.execute(
++        "SELECT t.id, t.title, t.admission_frees, t.completed_at, "
++        "(SELECT r.admission_origin FROM task_runs r WHERE r.task_id = t.id AND r.admission_class = 'capacity' "
++        " ORDER BY r.id LIMIT 1) "
++        "FROM tasks t WHERE t.admission_class = 'capacity' AND t.status = 'done' AND t.completed_at >= ? "
++        "ORDER BY t.completed_at, t.id", (now_s - days * 86_400,)).fetchall():
++        before = _p50(_waits(conn, completed - SIDE_S, completed, tid))
++        after = _p50(_waits(conn, completed, min(now_s, completed + SIDE_S), tid))
++        if before is None or after is None:
++            effect = "unknown"
++        else:
++            effect = "moved" if after <= before * MOVED_RATIO else "no_effect"
++        cards.append({"id": tid, "title": title, "frees": frees, "origin": origin or "unknown",
++                      "completed_at": completed, "ready_wait_p50_before_s": before,
++                      "ready_wait_p50_after_s": after, "effect": effect})
++    origins: dict[str, dict] = {}
++    for card in cards:
++        tally = origins.setdefault(card["origin"], {"moved": 0, "no_effect": 0, "unknown": 0})
++        tally[card["effect"]] += 1
++    for tally in origins.values():
++        tally["revoke_recommended"] = tally["no_effect"] >= REVOKE_AFTER and tally["moved"] == 0
++    return {"days": days, "generated_at": now_s, "cards": cards, "origins": origins}
++
++
++def render(data: dict) -> str:
++    def secs(value):
++        return "?" if value is None else f"{value:g}s"
++
++    lines = [f"capacity cards completed in the last {data['days']} day(s): {len(data['cards'])}"]
++    for card in data["cards"]:
++        lines.append(f"  {card['id']}  {card['effect']:9s}  ready-wait p50 {secs(card['ready_wait_p50_before_s'])}"
++                     f" -> {secs(card['ready_wait_p50_after_s'])}  {card['origin']}  {card['frees'] or ''}")
++    for origin, tally in sorted(data["origins"].items()):
++        verdict = " -> remove capacity class from new cards" if tally["revoke_recommended"] else ""
++        lines.append(f"{origin}: {tally['moved']} moved, {tally['no_effect']} no effect, "
++                     f"{tally['unknown']} unknown{verdict}")
++    return "\n".join(lines)
+diff --git a/hermes_cli/kanban_admission_score.py b/hermes_cli/kanban_admission_score.py
+new file mode 100644
+index 0000000000..1eb73cdd2f
+--- /dev/null
++++ b/hermes_cli/kanban_admission_score.py
+@@ -0,0 +1,181 @@
++"""Deterministic hub admission score (phase 2 of docs/kanban-hub-admission-v2.md). [daveey]
++
++``score = min(PRIORITY_CAP, effective_priority) + class * class_rank + unblock * min(open_descendants, 20)
++         + age * min(ready_minutes // 10, 60) - failure * consecutive_failures``
++
++Effective priority and open descendants come from the same graph as
++:func:`kanban_dispatch_priority.order_with_remote_waiters`: the full replica, with local rows and a local child's
++edge set overriding it. Readiness age is the current ready/review interval (the stranded-ready diagnostic's floor:
++latest ready-entry event, latest run end, else creation), not card age. One call is one snapshot: nothing is cached
++or written (stored priority included), so completion, unlink or archive take effect on the next call.
++"""
++from __future__ import annotations
++
++import math
++import sqlite3
++from collections import defaultdict
++from dataclasses import dataclass
++from typing import Optional
++
++from hermes_cli.kanban_priority import PRIORITY_CAP
++
++DEFAULT_WEIGHTS = {"class": 500, "unblock": 25, "age": 25, "failure": 100}
++CLASS_RANK = {"normal": 0, "capacity": 1, "urgent": 2}
++DESCENDANT_CAP, AGE_BUCKET_S, AGE_CAP = 20, 600, 60
++
++
++@dataclass(frozen=True)
++class ScoreBreakdown:
++    effective_priority: int
++    class_rank: int
++    descendants: int
++    age_buckets: int
++    failures: int
++    total: float
++    ready_since: int
++    weights: tuple = tuple(sorted(DEFAULT_WEIGHTS.items()))
++
++    def as_dict(self) -> dict:
++        return {"effective_priority": self.effective_priority, "class_rank": self.class_rank,
++                "descendants": self.descendants, "age_buckets": self.age_buckets, "failures": self.failures,
++                "total": self.total, "ready_since": self.ready_since, "weights": dict(self.weights)}
++
++
++def _n(value) -> str:
++    return f"{value:g}"
++
++
++def explain(parts: dict) -> str:
++    """``score T = priority P + class W*r + unblock W*d + age W*a - failures W*f`` for an ``as_dict`` breakdown."""
++    w = parts["weights"]
++    return (f"score {_n(parts['total'])} = priority {parts['effective_priority']} + class {_n(w['class'])}*"
++            f"{parts['class_rank']} + unblock {_n(w['unblock'])}*{parts['descendants']} + age {_n(w['age'])}*"
++            f"{parts['age_buckets']} - failures {_n(w['failure'])}*{parts['failures']}")
++
++
++def summary(parts: dict) -> str:
++    """Points per component for queue notes: ``score T (priority P + class C + unblock U + age A - failures F)``."""
++    w = parts["weights"]
++    return (f"score {_n(parts['total'])} (priority {parts['effective_priority']} + class "
++            f"{_n(w['class'] * parts['class_rank'])} + unblock {_n(w['unblock'] * parts['descendants'])} + age "
++            f"{_n(w['age'] * parts['age_buckets'])} - failures {_n(w['failure'] * parts['failures'])})")
++
++
++def validate_weights(raw) -> dict:
++    """``kanban.admission.weights``: a mapping of known keys to nonnegative numbers; absent keys use defaults."""
++    if raw is None:
++        return dict(DEFAULT_WEIGHTS)
++    if not isinstance(raw, dict):
++        raise ValueError("admission weights must be a mapping")
++    unknown = sorted(set(raw) - set(DEFAULT_WEIGHTS))
++    if unknown:
++        raise ValueError(f"unknown admission weight(s): {', '.join(map(str, unknown))}")
++    out = dict(DEFAULT_WEIGHTS)
++    for key, value in raw.items():
++        if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
++            raise ValueError(f"admission weight {key} must be a nonnegative number")
++        out[key] = value
++    return out
++
++
++def configured_weights() -> dict:
++    """Root ``kanban.admission.weights`` (validated)."""
++    from hermes_cli.kanban_admission_pools import admission_policy
++
++    return validate_weights(admission_policy().get("weights"))
++
++
++def _graph(conn: sqlite3.Connection):
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_worker_node as wn
++
++    remote, edges = [], []
++    if sync.board_mode(conn) == "primary":
++        replica = wn.open_replica(conn)
++        if replica is not None:
++            try:
++                remote = replica.execute(
++                    "SELECT id, priority, status FROM tasks WHERE status NOT IN ('done', 'archived')").fetchall()
++                edges = replica.execute("SELECT parent_id, child_id FROM task_links").fetchall()
++            finally:
++                replica.close()
++    local = conn.execute("SELECT id, priority, status FROM tasks").fetchall()
++    local_ids = {r[0] for r in local}
++    tasks = {r[0]: (r[1] or 0, r[2]) for r in remote}
++    tasks.update((r[0], (r[1] or 0, r[2])) for r in local)
++    edges = [(p, c) for p, c in edges if c not in local_ids]
++    edges.extend(tuple(r) for r in conn.execute("SELECT parent_id, child_id FROM task_links").fetchall())
++    children = defaultdict(set)
++    for parent, child in edges:
++        if child in tasks and tasks[child][1] not in ("done", "archived"):
++            children[parent].add(child)
++    return tasks, children
++
++
++def _descendants(tid, children):
++    seen, pending = {tid}, list(children.get(tid, ()))
++    while pending:
++        child = pending.pop()
++        if child in seen:
++            continue
++        seen.add(child)
++        pending.extend(children.get(child, ()))
++    seen.discard(tid)
++    return seen
++
++
++def _ready_since(conn: sqlite3.Connection, ids: list[str]) -> dict[str, int]:
++    from hermes_cli.kanban_diagnostics import _READY_WAIT_FLOOR_KINDS
++
++    if not ids:
++        return {}
++    marks = ",".join("?" for _ in ids)
++    kinds = sorted(_READY_WAIT_FLOOR_KINDS)
++    kind_marks = ",".join("?" for _ in kinds)
++    since = {r[0]: int(r[1] or 0) for r in conn.execute(
++        f"SELECT id, created_at FROM tasks WHERE id IN ({marks})", ids)}
++    for tid, ts in conn.execute(
++        f"SELECT task_id, MAX(created_at) FROM task_events WHERE task_id IN ({marks}) AND (kind IN ({kind_marks}) "
++        "OR (kind = 'continued' AND json_extract(payload, '$.status') = 'ready')) GROUP BY task_id",
++        (*ids, *kinds)):
++        since[tid] = max(since.get(tid, 0), int(ts or 0))
++    for tid, ts in conn.execute(
++        f"SELECT task_id, MAX(ended_at) FROM task_runs WHERE task_id IN ({marks}) GROUP BY task_id", ids):
++        since[tid] = max(since.get(tid, 0), int(ts or 0))
++    return since
++
++
++def rank(conn: sqlite3.Connection, rows, *, now_ms: Optional[int] = None, weights: Optional[dict] = None):
++    """``rows`` (local task rows with ``id``) in admission order, each with its :class:`ScoreBreakdown`.
++
++    Pure and read-only. Ties break on the earlier ready-interval start, then task id."""
++    import time
++
++    rows = list(rows)
++    if not rows:
++        return []
++    weights = configured_weights() if weights is None else validate_weights(weights)
++    now_s = (time.time() * 1000 if now_ms is None else now_ms) / 1000
++    tasks, children = _graph(conn)
++    ids = [row["id"] for row in rows]
++    marks = ",".join("?" for _ in ids)
++    local = {r[0]: (r[1] or "normal", r[2] or 0) for r in conn.execute(
++        f"SELECT id, admission_class, consecutive_failures FROM tasks WHERE id IN ({marks})", ids)}
++    since = _ready_since(conn, ids)
++    scored = []
++    for row in rows:
++        tid = row["id"]
++        below = _descendants(tid, children)
++        priority = max([tasks.get(tid, (0, None))[0], *(tasks[c][0] for c in below)])
++        klass, failures = local.get(tid, ("normal", 0))
++        class_rank = CLASS_RANK.get(klass, 0)
++        start = since.get(tid, 0)
++        buckets = min(AGE_CAP, max(0, int(now_s - start)) // AGE_BUCKET_S)
++        descendants = min(DESCENDANT_CAP, len(below))
++        effective = min(PRIORITY_CAP, priority)
++        total = (effective + weights["class"] * class_rank + weights["unblock"] * descendants
++                 + weights["age"] * buckets - weights["failure"] * failures)
++        scored.append((row, ScoreBreakdown(effective, class_rank, descendants, buckets, failures, total, start,
++                                           tuple(sorted(weights.items())))))
++    scored.sort(key=lambda item: (-item[1].total, item[1].ready_since, item[0]["id"]))
++    return scored
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index aa3ab15456..576fcfd870 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -606,6 +606,10 @@ _SPECS = [
+         _arg("--interval", type=float, default=0.5, help="Poll interval in seconds (default: 0.5)"),
+     ], help="Live-stream task_events to the terminal (Ctrl+C to exit)"),
+     _cmd("stats", [_json_flag()], help="Per-status + per-assignee counts + oldest-ready age"),
++    _cmd("queue", [_arg("--explain", metavar="TASK_ID", help="Score breakdown, lane position and pools for one card"),
++                   _arg("--report", action="store_true", help="Capacity-class effect report (ready-wait p50)"),
++                   _arg("--days", type=int, default=7, help="Report window in days (default 7)"),
++                   _json_flag()], help="Ready/review dispatch order with hub admission score breakdowns"),
+     _cmd("notify-subscribe", [
+         _TASK_ID,
+         *_NOTIFY_TARGET,
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index 33a9ccf9f6..4db7c10816 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -198,7 +198,7 @@ def _position(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Op
+         elsewhere = None
+     place = {"lane": "local", "ahead": _ahead(conn, task), "running": running, "limit": limit, "approximate": True,
+              "board": khc.board_of(conn) or board, "observed_at": int(time.time()),
+-             **queue_fields(limit, getattr(task, "admission_class", "normal"))}
++             **queue_fields(limit, getattr(task, "admission_class", "normal"), conn, task.id)}
+     if elsewhere:  # only when other boards' cards rank ahead: the single-board payload keeps its shape
+         place["ahead_other_boards"] = elsewhere
+     from hermes_cli import kanban_dispatch_skip as skips
+@@ -333,6 +333,10 @@ def local_words(place: dict[str, Any]) -> str:
+         census = ", ".join(f"{name} {pools[name] if pools[name] is not None else '?'}/"
+                            f"{pools[name + '_cap'] if pools[name + '_cap'] is not None else '?'}"
+                            for name in ("regular", "priority"))
++        scored = place.get("admission_score")
++        if scored:
++            from hermes_cli.kanban_admission_score import summary
++            census += "; " + summary(scored)
+         return (f"{words}, {census}; class {place['admission_class']}. "
+                 "Queued, not stuck: check class/placement and available capacity; priority slots are marked-only. "
+                 "Do not run its work outside the dispatcher")
+diff --git a/tests/hermes_cli/test_kanban_hub_admission.py b/tests/hermes_cli/test_kanban_hub_admission.py
+index c552ddb9e7..a0ebdabd2d 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission.py
++++ b/tests/hermes_cli/test_kanban_hub_admission.py
+@@ -11,6 +11,7 @@ import pytest
+ 
+ from hermes_cli import admission_fence as af
+ from hermes_cli import kanban_admission as ka
++from hermes_cli import kanban_admission_score as score
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_db_sync as sync
+@@ -987,3 +988,347 @@ def test_claim_inside_the_hold_budget_still_admits(board, monkeypatch):
+     monkeypatch.setattr(cm, "sample", fake_sample(10.0, check=lambda: time.sleep(0.1)))  # health: allow HX013 -- a short stand-in sample
+     t = task(conn)
+     assert kb.claim_task(conn, t) is not None
++
++
++# --- Phase 2: deterministic admission score over the full replica ---------------------------------------
++
++def ready(conn, title, priority=0, created_at=None, admission_class="normal", failures=0):
++    tid = task(conn, title=title)
++    fields = {"priority": priority}
++    if admission_class != "normal":
++        fields["admission_class"] = admission_class
++        if admission_class == "capacity":
++            fields["admission_frees"] = "frees: worker slots"
++    kb.edit_task(conn, tid, **fields)
++    with kb.write_txn(conn):
++        if created_at is not None:
++            conn.execute("UPDATE tasks SET created_at=? WHERE id=?", (created_at, tid))
++            conn.execute("UPDATE task_events SET created_at=? WHERE task_id=?", (created_at, tid))
++        conn.execute("UPDATE tasks SET consecutive_failures=? WHERE id=?", (failures, tid))
++    return tid
++
++
++def rows(conn, *ids):
++    marks = ",".join("?" for _ in ids)
++    return conn.execute(f"SELECT id, assignee, admission_class FROM tasks WHERE id IN ({marks})", ids).fetchall()
++
++
++def order(conn, now_s, *ids, weights=None):
++    return [row["id"] for row, _ in score.rank(conn, rows(conn, *ids), now_ms=now_s * 1000, weights=weights)]
++
++
++def test_breakdown_sums_every_component_with_default_weights(board):
++    conn, _home = board
++    now = 1_800_000_000
++    tid = ready(conn, "parent", priority=300, created_at=now - 35 * 60, admission_class="capacity", failures=1)
++    for index in range(3):
++        child = task(conn, title=f"child {index}")
++        kb.link_tasks(conn, tid, child)
++    (row, parts), = score.rank(conn, rows(conn, tid), now_ms=now * 1000)
++    assert row["id"] == tid
++    assert (parts.effective_priority, parts.class_rank, parts.descendants, parts.age_buckets, parts.failures) == \
++        (300, 1, 3, 3, 1)
++    assert parts.total == 300 + 500 + 25 * 3 + 25 * 3 - 100
++
++
++def test_capacity_card_outranks_higher_priority_normal_card(board):
++    conn, _home = board
++    now = 1_800_000_000
++    normal = ready(conn, "normal", priority=400, created_at=now)
++    capacity = ready(conn, "capacity", priority=0, created_at=now, admission_class="capacity")
++    assert order(conn, now, normal, capacity) == [capacity, normal]
++
++
++def test_descendants_raise_score_and_are_capped(board):
++    conn, _home = board
++    now = 1_800_000_000
++    plain = ready(conn, "plain", priority=100, created_at=now - 1)
++    parent = ready(conn, "parent", priority=60, created_at=now)
++    for index in range(25):
++        kb.link_tasks(conn, parent, task(conn, title=f"child {index}"))
++    assert order(conn, now, plain, parent) == [parent, plain]
++    (_row, parts), = score.rank(conn, rows(conn, parent), now_ms=now * 1000)
++    assert parts.descendants == 20
++
++
++def test_aging_lifts_starved_card_within_bound(board):
++    conn, _home = board
++    now = 1_800_000_000
++    starved = ready(conn, "starved", priority=0, created_at=now - 10 * 3600)
++    fresh = ready(conn, "fresh", priority=1000, created_at=now)
++    (_row, parts), = score.rank(conn, rows(conn, starved), now_ms=now * 1000)
++    assert parts.age_buckets == 60
++    # 60 buckets * 25 = 1500 > the 1000 priority cap: ten hours lift any card past fresh capped priority.
++    assert order(conn, now, fresh, starved) == [starved, fresh]
++    # The bound: aging never exceeds 60 buckets, so an older card gains nothing more.
++    older = ready(conn, "older", priority=0, created_at=now - 100 * 3600)
++    (_row, parts), = score.rank(conn, rows(conn, older), now_ms=now * 1000)
++    assert parts.age_buckets == 60
++
++
++def test_age_counts_current_ready_interval_not_card_age(board):
++    conn, _home = board
++    now = 1_800_000_000
++    tid = ready(conn, "requeued", created_at=now - 10 * 3600)
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, "promoted", {})
++        conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='promoted'", (now - 25 * 60, tid))
++    (_row, parts), = score.rank(conn, rows(conn, tid), now_ms=now * 1000)
++    assert parts.age_buckets == 2
++    assert parts.ready_since == now - 25 * 60
++
++
++def test_consecutive_failures_lower_the_score(board):
++    conn, _home = board
++    now = 1_800_000_000
++    failing = ready(conn, "failing", priority=150, created_at=now - 1, failures=2)
++    steady = ready(conn, "steady", priority=0, created_at=now)
++    assert order(conn, now, failing, steady) == [steady, failing]
++    (_row, parts), = score.rank(conn, rows(conn, failing), now_ms=now * 1000)
++    assert (parts.failures, parts.total) == (2, 150 - 200)
++
++
++def test_equal_scores_break_on_ready_start_then_id(board):
++    conn, _home = board
++    now = 1_800_000_000
++    later = ready(conn, "later", created_at=now - 60)
++    earlier = ready(conn, "earlier", created_at=now - 120)
++    assert order(conn, now, later, earlier) == [earlier, later]
++    twin_a, twin_b = ready(conn, "a", created_at=now - 60), ready(conn, "b", created_at=now - 60)
++    assert order(conn, now, twin_b, twin_a) == sorted([twin_a, twin_b])
++
++
++def test_configured_weights_are_validated_and_applied(board):
++    conn, home = board
++    now = 1_800_000_000
++    normal = ready(conn, "normal", priority=400, created_at=now)
++    capacity = ready(conn, "capacity", created_at=now, admission_class="capacity")
++    configure(home, limit=None)
++    with (home / "config.yaml").open("a") as config:
++        config.write("  admission:\n    weights:\n      class: 100\n")
++    assert score.configured_weights() == {**score.DEFAULT_WEIGHTS, "class": 100}
++    assert [row["id"] for row, _ in score.rank(conn, rows(conn, normal, capacity), now_ms=now * 1000)] == \
++        [normal, capacity]
++
++
++@pytest.mark.parametrize("weights,reason", [
++    ([], "admission weights must be a mapping"),
++    ({"bump": 1}, "unknown admission weight(s): bump"),
++    ({"age": -1}, "admission weight age must be a nonnegative number"),
++    ({"age": True}, "admission weight age must be a nonnegative number"),
++    ({"age": "25"}, "admission weight age must be a nonnegative number"),
++    ({"age": float("inf")}, "admission weight age must be a nonnegative number"),
++    ({"age": float("nan")}, "admission weight age must be a nonnegative number"),
++])
++def test_invalid_weights_refuse_with_their_own_reason(weights, reason):
++    with pytest.raises(ValueError) as error:
++        score.validate_weights(weights)
++    assert str(error.value) == reason
++
++
++@pytest.fixture
++def replica(board, tmp_path, monkeypatch):
++    from hermes_cli import kanban_worker_node as wn
++    path = tmp_path / "replica.db"
++    remote = kbc.connect(path)
++    monkeypatch.setattr(sync, "board_mode", lambda conn: "primary")
++    monkeypatch.setattr(wn, "open_replica", lambda conn: kbc.connect(path))
++    try:
++        yield remote
++    finally:
++        remote.close()
++
++
++def _copy_task(remote, conn, tid):
++    row = conn.execute("SELECT id, title, assignee, priority, status, created_at FROM tasks WHERE id=?",
++                       (tid,)).fetchone()
++    with kb.write_txn(remote):
++        remote.execute("INSERT INTO tasks (id, title, assignee, priority, status, created_at) VALUES (?,?,?,?,?,?)",
++                       tuple(row))
++
++
++def test_replica_descendants_count_and_local_unlink_or_completion_wins(board, replica):
++    conn, _home = board
++    now = 1_800_000_000
++    parent = ready(conn, "imported parent", priority=0, created_at=now)
++    local_work = ready(conn, "local", priority=100, created_at=now)
++    _copy_task(replica, conn, parent)
++    waiter = kb.create_task(replica, title="remote waiter", assignee="default", priority=900, parents=[parent])
++    assert order(conn, now, local_work, parent) == [parent, local_work]
++    (_row, parts), = score.rank(conn, rows(conn, parent), now_ms=now * 1000)
++    assert (parts.effective_priority, parts.descendants) == (900, 1)
++    # A local edge set for the child overrides the replica edges: after a local unlink the waiter donates nothing.
++    _copy_task(conn, replica, waiter)
++    assert order(conn, now, local_work, parent) == [local_work, parent]
++    # Re-linked locally, then completed locally: a done child is no longer an open descendant.
++    kb.link_tasks(conn, parent, waiter)
++    assert order(conn, now, local_work, parent) == [parent, local_work]
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (waiter,))
++    assert order(conn, now, local_work, parent) == [local_work, parent]
++    assert conn.execute("SELECT priority FROM tasks WHERE id=?", (parent,)).fetchone()[0] == 0
++
++
++def _enable(home):
++    configure(home, cap=7)
++    with (home / "config.yaml").open("a") as config:
++        config.write("    priority_slots: 3\n")
++
++
++def test_opted_in_hub_lane_order_uses_score_and_keeps_marked_first(board):
++    from hermes_cli import kanban_admission_pools as pools
++    conn, home = board
++    now = int(time.time())
++    starved = ready(conn, "starved", priority=0, created_at=now - 11 * 3600)
++    fresh = ready(conn, "fresh", priority=1000, created_at=now)
++    marked = ready(conn, "marked", priority=0, created_at=now, admission_class="capacity")
++    _enable(home)
++    assert [r["id"] for r in pools.lane_rows(conn, "ready")] == [marked, starved, fresh]
++
++
++@pytest.mark.parametrize("enabled,slots", [(False, 3), (True, 0)])
++def test_worker_lane_order_keeps_plain_priority(board, enabled, slots):
++    from hermes_cli import kanban_admission_pools as pools
++    conn, home = board
++    now = int(time.time())
++    starved = ready(conn, "starved", priority=0, created_at=now - 11 * 3600)
++    fresh = ready(conn, "fresh", priority=1000, created_at=now)
++    configure(home, cap=7, limit=50 if enabled else None)
++    with (home / "config.yaml").open("a") as config:
++        config.write(("" if enabled else "  admission:\n") + f"    priority_slots: {slots}\n")
++    assert [r["id"] for r in pools.lane_rows(conn, "ready")] == [fresh, starved]
++
++
++def _explain_board(conn, home, monkeypatch):
++    now = int(time.time())
++    configure(home, limit=None)
++    assert kb.claim_task(conn, task(conn, title="regular running"))
++    _enable(home)
++    advisory(home)
++    monkeypatch.setattr(cm, "sample", fake_sample(10))
++    fresh = ready(conn, "fresh", priority=900, created_at=now)
++    starved = ready(conn, "starved", priority=0, created_at=now - 11 * 3600)
++    marked = ready(conn, "marked", priority=0, created_at=now - 25 * 60, admission_class="capacity")
++    return fresh, starved, marked
++
++
++def test_queue_note_carries_score_breakdown_on_opted_in_hub(board, monkeypatch):
++    from hermes_cli import kanban_queue_position as qp
++    conn, home = board
++    fresh, _starved, marked = _explain_board(conn, home, monkeypatch)
++    monkeypatch.setattr(qp, "_running_and_limit", lambda *a: (1, 7))
++    place = qp.read(conn, kb.get_task(conn, fresh))
++    assert place["ahead"] == 2
++    assert place["admission_score"]["effective_priority"] == 900
++    note = qp.describe(place)
++    assert "score 900 (priority 900 + class 0 + unblock 0 + age 0 - failures 0)" in note
++    assert "bump" not in note
++    assert qp.read(conn, kb.get_task(conn, marked))["admission_score"]["class_rank"] == 1
++
++
++def test_queue_explain_prints_breakdown_position_and_pools(board, monkeypatch):
++    from hermes_cli import kanban as kc
++    conn, home = board
++    fresh, starved, marked = _explain_board(conn, home, monkeypatch)
++    text = kc.run_slash(f"queue --explain {starved}")
++    assert f"{starved}: ready lane position 2/3" in text
++    assert "score 1500 = priority 0 + class 500*0 + unblock 25*0 + age 25*60 - failures 100*0" in text
++    assert "pools: regular 1/7, priority 0/3" in text
++    assert f"ahead: {marked}" in text
++    listing = json.loads(kc.run_slash("queue --json"))
++    assert [row["id"] for row in listing["ready"]] == [marked, starved, fresh]
++    assert listing["ready"][0]["score"]["class_rank"] == 1
++    assert listing["scored"] is True
++
++
++def test_queue_explain_on_worker_reports_plain_priority(board):
++    from hermes_cli import kanban as kc
++    conn, home = board
++    configure(home, limit=None)
++    tid = ready(conn, "worker card", priority=5)
++    text = kc.run_slash(f"queue --explain {tid}")
++    assert "hub admission score not enabled here: plain priority order" in text
++    assert f"{tid}: ready lane position 1/1" in text
++    assert json.loads(kc.run_slash("queue --json"))["scored"] is False
++
++
++def test_queue_explain_unknown_or_unqueued_card(board):
++    from hermes_cli import kanban as kc
++    conn, home = board
++    configure(home, limit=None)
++    blocked = task(conn)
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (blocked,))
++    assert "not in a ready or review lane (status blocked)" in kc.run_slash(f"queue --explain {blocked}")
++    assert "no such task: t_missing" in kc.run_slash("queue --explain t_missing")
++
++
++def _claimed_run(conn, title, *, ready_at, started_at, admission_class="normal", origin=None, completed_at=None):
++    tid = ready(conn, title, created_at=ready_at, admission_class=admission_class)
++    with kb.write_txn(conn):
++        conn.execute("INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, "
++                     "admission_pool, admission_class, admission_origin) VALUES (?, 'default', 'done', ?, ?, "
++                     "'completed', ?, ?, ?)",
++                     (tid, started_at, completed_at, "priority" if admission_class != "normal" else "regular",
++                      admission_class, origin))
++        if completed_at is not None:
++            conn.execute("UPDATE tasks SET status='done', completed_at=? WHERE id=?", (completed_at, tid))
++    return tid
++
++
++def _waits(conn, around, before_wait, after_wait, n=3):
++    for index in range(n):
++        start = around - 3600 - index * 60
++        _claimed_run(conn, f"before {index}", ready_at=start - before_wait, started_at=start)
++        start = around + 3600 + index * 60
++        _claimed_run(conn, f"after {index}", ready_at=start - after_wait, started_at=start)
++
++
++def test_capacity_report_measures_ready_wait_p50_around_completion(board):
++    from hermes_cli import kanban_admission_report as report
++    conn, _home = board
++    now = 1_800_000_000
++    done_at = now - 2 * 86400
++    moved = _claimed_run(conn, "add worker", ready_at=done_at - 7200, started_at=done_at - 3600,
++                         admission_class="capacity", origin="chat:a", completed_at=done_at)
++    _waits(conn, done_at, before_wait=3000, after_wait=600)
++    data = report.capacity_report(conn, now_s=now, days=7)
++    entry, = data["cards"]
++    assert entry["id"] == moved
++    assert entry["frees"] == "frees: worker slots"
++    assert entry["origin"] == "chat:a"
++    assert (entry["ready_wait_p50_before_s"], entry["ready_wait_p50_after_s"]) == (3000, 600)
++    assert entry["effect"] == "moved"
++
++
++def test_capacity_report_flags_repeat_no_effect_origin_and_unknown_is_not_failure(board):
++    from hermes_cli import kanban_admission_report as report
++    conn, _home = board
++    now = 1_800_000_000
++    for index, day in enumerate((2, 4)):
++        done_at = now - day * 86400
++        _claimed_run(conn, f"no effect {index}", ready_at=done_at - 7200, started_at=done_at - 3600,
++                     admission_class="capacity", origin="chat:b", completed_at=done_at)
++        _waits(conn, done_at, before_wait=600, after_wait=600)
++    sparse_at = now - 6 * 86400
++    _claimed_run(conn, "unmeasured", ready_at=sparse_at - 7200, started_at=sparse_at - 3600,
++                 admission_class="capacity", origin="chat:c", completed_at=sparse_at)
++    data = report.capacity_report(conn, now_s=now, days=7)
++    effects = {card["origin"]: card["effect"] for card in data["cards"]}
++    assert sorted(card["effect"] for card in data["cards"] if card["origin"] == "chat:b") == ["no_effect"] * 2
++    assert effects["chat:c"] == "unknown"
++    assert data["origins"]["chat:b"] == {"moved": 0, "no_effect": 2, "unknown": 0, "revoke_recommended": True}
++    assert data["origins"]["chat:c"]["revoke_recommended"] is False
++    text = report.render(data)
++    assert "chat:b: 0 moved, 2 no effect, 0 unknown -> remove capacity class from new cards" in text
++
++
++def test_capacity_report_cli_window_excludes_old_cards(board):
++    from hermes_cli import kanban as kc
++    conn, home = board
++    configure(home, limit=None)
++    old = int(time.time()) - 30 * 86400
++    _claimed_run(conn, "old capacity", ready_at=old - 60, started_at=old, admission_class="capacity",
++                 origin="chat:a", completed_at=old + 60)
++    assert json.loads(kc.run_slash("queue --report --days 7 --json"))["cards"] == []
++    assert len(json.loads(kc.run_slash("queue --report --days 60 --json"))["cards"]) == 1
+-- 
+2.51.0
+

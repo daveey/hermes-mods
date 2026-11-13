@@ -1,0 +1,133 @@
+From cafe619e86653818ce2d654de60ea722c58512ec Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 00:13:01 +0000
+Subject: [PATCH] [daveey] fix(kanban): kanban_complete names triage (and any
+ no-run status) instead of stale_run
+
+A triage card refused completion as 'unknown id, stale run, or already
+terminal' because the tool named only scheduled/todo/ready. Classify by
+the statuses where a refusal really is a stale run (running, blocked,
+review, done, archived); every other status gets not_running naming it,
+and triage says to promote or archive. A parametrized test over every
+board status guards against a fourth mislabel (self-heal 9daba10d8d).
+---
+ hermes_cli/kanban_watch.py                    | 18 +++++++
+ .../test_kanban_complete_rejection_class.py   | 50 +++++++++++++++++++
+ tools/kanban_tools.py                         | 10 ++--
+ 3 files changed, 73 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_watch.py b/hermes_cli/kanban_watch.py
+index e83452a0de..f623d23912 100644
+--- a/hermes_cli/kanban_watch.py
++++ b/hermes_cli/kanban_watch.py
+@@ -121,3 +121,21 @@ def chat_hold_hint(conn: sqlite3.Connection, task_id: str, *, now: Optional[floa
+ NOT_RUNNING_TEMPLATE = (
+     "could not complete {tid}: card is {status} with no run; to close it unverified, archive it with a comment; "
+     "to keep the check but free the chat, re-park it with watch=true")
++TRIAGE_NOT_RUNNING_TEMPLATE = (
++    "could not complete {tid}: card is triage with no run (not yet specified/promoted); "
++    "promote it to ready or archive it with a comment")
++# Statuses where a refused kanban_complete really is a stale run: the card runs (or waits in
++# blocked/review) under another run, or is already terminal. [daveey]
++STALE_RUN_STATUSES = frozenset({"running", "blocked", "review", "done", "archived"})
++
++
++def not_running_reason(tid: str, status: str) -> Optional[str]:
++    """Refusal text naming ``status`` for a card with no run, or None when the refusal is a
++    stale run. Classified by the stale-run statuses, not a list of waiting ones, so a status
++    added later is named instead of mislabeled "stale run" (triage was, after todo and
++    scheduled). [daveey]"""
++    if status in STALE_RUN_STATUSES:
++        return None
++    if status == "triage":
++        return TRIAGE_NOT_RUNNING_TEMPLATE.format(tid=tid)
++    return NOT_RUNNING_TEMPLATE.format(tid=tid, status=status)
+diff --git a/tests/tools/test_kanban_complete_rejection_class.py b/tests/tools/test_kanban_complete_rejection_class.py
+index a3195e1287..c0c6148648 100644
+--- a/tests/tools/test_kanban_complete_rejection_class.py
++++ b/tests/tools/test_kanban_complete_rejection_class.py
+@@ -185,3 +185,53 @@ def test_success_has_no_rejection(board, monkeypatch):
+     _claim(board, monkeypatch)
+     out = json.loads(kt._handle_complete({"summary": "really done"}))
+     assert out.get("ok") is True and "rejection" not in out
++
++
++# Every status the board can hold, with no run: a refusal names the card's status unless the
++# card is terminal. Classifying refusals by exclusion mislabeled PR acceptance, then
++# scheduled/todo, then triage as "stale run"; this sweep makes a fourth status fail here. [daveey]
++_TERMINAL = {"done", "archived"}
++
++
++def _all_statuses():
++    from hermes_cli.kanban_workflow import DEFAULT_STATUSES
++    return sorted(DEFAULT_STATUSES)
++
++
++@pytest.mark.parametrize("status", _all_statuses())
++def test_refusal_names_status_for_every_status(board, monkeypatch, status):
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++    with kbc.connect() as conn:
++        tid = board.create_task(conn, title="no run", assignee="op")
++        with board.write_txn(conn):
++            conn.execute("UPDATE tasks SET status=?, current_run_id=NULL, claim_lock=NULL, "
++                         "worker_pid=NULL WHERE id=?", (status, tid))
++    out = json.loads(kt._handle_complete({"task_id": tid, "summary": "done"}))
++    if out.get("ok") is True:
++        assert status not in _TERMINAL, out
++        return
++    assert out["rejection"] in kt.COMPLETE_REJECTION_CLASSES
++    if status in _TERMINAL:
++        assert out["rejection"] == "stale_run", out
++    else:
++        assert out["rejection"] == "not_running", out
++        assert f"card is {status}" in out["error"], out
++        assert "stale run" not in out["error"], out
++
++
++def test_triage_refusal_says_promote(board, monkeypatch):
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++    with kbc.connect() as conn:
++        tid = board.create_task(conn, title="spec me", assignee="op", triage=True)
++        assert board.get_task(conn, tid).status == "triage"
++    out = json.loads(kt._handle_complete({"task_id": tid, "summary": "done"}))
++    assert out["rejection"] == "not_running", out
++    assert "triage" in out["error"] and "promote it to ready" in out["error"], out
++
++
++def test_unknown_id_is_stale_run(board, monkeypatch):
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_complete({"task_id": "t_doesnotexist00", "summary": "done"}))
++    assert out["rejection"] == "stale_run", out
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 36d7e560c4..af0bfc8d4c 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -162,7 +162,7 @@ COMPLETE_REJECTION_CLASSES = frozenset({
+     "empty",          # no summary/result, or an evidence-free completion
+     "live_claim",     # another live dispatcher worker owns the card
+     "stale_run",      # run superseded, card already terminal, or unknown id
+-    "not_running",    # card waits (scheduled/todo/ready) with no run: archive it or re-park it as a watch [daveey]
++    "not_running",    # card waits (triage/todo/scheduled/ready) with no run: archive it or re-park it as a watch [daveey]
+     "foreign_card",   # card exists here only as a Board replica copy; its owner gateway must write it [daveey]
+     "review_contract",  # ship review card completed without metadata ship can read [daveey]
+     "review_independence",  # ship review verdict recorded outside the card's dispatched worker run [daveey]
+@@ -960,10 +960,10 @@ def _handle_complete(args: dict, **kw) -> str:
+                 raise _Reject(
+                     f"could not complete {tid}: unsatisfied parent dependencies: "
+                     f"{detail}; complete the parents first (done or archived)", "parents")
+-            if task and task.status in ("scheduled", "todo", "ready") and not _kc.pr_acceptance_refused(
+-                    conn, tid, event_mark):
+-                from hermes_cli.kanban_watch import NOT_RUNNING_TEMPLATE  # [daveey] not a vague "stale run"
+-                raise _Reject(NOT_RUNNING_TEMPLATE.format(tid=tid, status=task.status), "not_running")
++            from hermes_cli.kanban_watch import not_running_reason  # [daveey] not a vague "stale run"
++            named = task and not_running_reason(tid, task.status)
++            if named and not _kc.pr_acceptance_refused(conn, tid, event_mark):
++                raise _Reject(named, "not_running")
+             reason = (task.last_failure_error if task else None) or \
+                 f"could not complete {tid} (unknown id, stale run, or already terminal)"
+             _check(False, reason, "pr_acceptance" if _kc.pr_acceptance_refused(conn, tid, event_mark)
+-- 
+2.51.0
+

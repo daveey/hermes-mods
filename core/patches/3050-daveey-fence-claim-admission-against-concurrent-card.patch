@@ -1,0 +1,117 @@
+From 268188f789fa4e4a5dd879cd44e3debb32524de3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 23:09:59 +0000
+Subject: [PATCH] [daveey] fence claim admission against concurrent card and
+ event changes
+
+---
+ hermes_cli/kanban_hub_admission_claim.py      | 21 +++++++++------
+ .../test_kanban_hub_admission_claim.py        | 27 ++++++++++++++++++-
+ 2 files changed, 39 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/kanban_hub_admission_claim.py b/hermes_cli/kanban_hub_admission_claim.py
+index d0eba38d05..c45fd26006 100644
+--- a/hermes_cli/kanban_hub_admission_claim.py
++++ b/hermes_cli/kanban_hub_admission_claim.py
+@@ -86,6 +86,10 @@ def keep_reason(conn: sqlite3.Connection, card: sqlite3.Row, fields: dict, cfg:
+     return None
+ 
+ 
++def _event_head(conn: sqlite3.Connection, tid: str) -> int:
++    return conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?", (tid,)).fetchone()[0]
++
++
+ def screen(conn: sqlite3.Connection, *, cfg: Optional[dict] = None) -> Counts:
+     """Judge this hub's ready, label-less, unjudged cards before the claim pass; see the module docstring."""
+     from hermes_cli import kanban_db_sync as sync
+@@ -103,6 +107,7 @@ def screen(conn: sqlite3.Connection, *, cfg: Optional[dict] = None) -> Counts:
+     down = False
+     for card in _candidates(conn):
+         tid = card["id"]
++        event_head = _event_head(conn, tid)
+         if pickup.verdict(conn, tid) is not None:
+             continue
+         if down:
+@@ -130,26 +135,26 @@ def screen(conn: sqlite3.Connection, *, cfg: Optional[dict] = None) -> Counts:
+                 kept = NO_QUEUE
+             if kept:
+                 audit["kept"] = kept
+-        if _apply(conn, own, tid, audit, target):
++        applied = _apply(conn, own, tid, audit, target, expected=card, event_head=event_head)
++        if applied:
+             counts.moved += 1
+-        elif "kept" in audit:
++        elif applied is False and "kept" in audit:
+             counts.kept += 1
+     if counts != Counts():
+         _log.info(counts.line())
+     return counts
+ 
+ 
+-def _apply(conn: sqlite3.Connection, own: str, tid: str, audit: dict, target: Optional[list[str]]) -> bool:
++def _apply(conn: sqlite3.Connection, own: str, tid: str, audit: dict, target: Optional[list[str]],
++           *, expected: sqlite3.Row, event_head: int) -> Optional[bool]:
+     """Record the verdict; move a denied card to ``target``. True when moved. Skips a card that changed meanwhile."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_move as km
+     from hermes_cli import kanban_worker_node as wn
+     with kb.write_txn(conn):
+-        row = conn.execute("SELECT status, claim_lock, runs_on, placement_policy FROM tasks WHERE id = ?",
+-                           (tid,)).fetchone()
+-        if (row is None or row["status"] != "ready" or row["claim_lock"] is not None
+-                or row["runs_on"] not in (None, "", "[]") or row["placement_policy"] is not None):
+-            return False  # claimed, parked or re-placed while judged: its new owner decides
++        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
++        if row is None or dict(row) != dict(expected) or _event_head(conn, tid) != event_head:
++            return None  # the verdict and route belong only to the snapshot the judge saw
+         kb._append_event(conn, tid, "hub_admission", audit)
+         if target is None:
+             return False
+diff --git a/tests/hermes_cli/test_kanban_hub_admission_claim.py b/tests/hermes_cli/test_kanban_hub_admission_claim.py
+index 34a6c79e37..8125511ef7 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission_claim.py
++++ b/tests/hermes_cli/test_kanban_hub_admission_claim.py
+@@ -249,7 +249,9 @@ def test_screen_makes_no_model_call_inside_a_write_transaction(gws, hub_judge):
+ 
+ @pytest.mark.parametrize("change", [
+     "runs_on = '[\"linux\"]'", "placement_policy = 'worker-first-v1'", "status = 'blocked'",
+-    "claim_lock = 'hermes-hub:1'"])
++    "claim_lock = 'hermes-hub:1'", "body = 'needs signed-in hub Chrome'",
++    "title = 'new brief'", "workspace_kind = 'dir'", "requires = '[\"host_repo\"]'",
++    "assignee = 'other'", "workspace_path = '/home/example/work'", "created_on = 'other'"])
+ def test_a_card_changed_while_judged_is_left_to_its_new_owner(gws, monkeypatch, change):
+     hub, _worker, _svc = gws
+     tid = _hub_card(hub)
+@@ -268,6 +270,29 @@ def test_a_card_changed_while_judged_is_left_to_its_new_owner(gws, monkeypatch,
+     assert after == (before if "runs_on" not in change else '["linux"]'), change
+ 
+ 
++@pytest.mark.parametrize("kind,payload", [
++    ("scheduled", {"wake_check": "test -f ~/.hermes/cache/new-probe"}),
++    ("hub_admission", {"admit": True, "entry": "move", "why": "new decision"}),
++])
++def test_event_change_before_apply_invalidates_the_decision(gws, hub_judge, monkeypatch, kind, payload):
++    hub, _worker, _svc = gws
++    hub_judge.admit_next = False
++    tid = _hub_card(hub)
++    apply = hac._apply
++
++    def changed(*args, **kwargs):
++        with kb.write_txn(hub.conn):
++            kb._append_event(hub.conn, tid, kind, payload)
++        return apply(*args, **kwargs)
++
++    monkeypatch.setattr(hac, "_apply", changed)
++    hub.enter()
++    counts = hac.screen(hub.conn)
++    assert counts.moved == 0 and counts.kept == 0
++    assert _events(hub.conn, tid, "moved") == []
++    assert _events(hub.conn, tid, "hub_admission") == ([payload] if kind == "hub_admission" else [])
++
++
+ def test_unjudged_claims_is_empty_before_the_gate_and_ignores_later_verdicts(gws, monkeypatch):
+     hub, _worker, _svc = gws
+     monkeypatch.setattr(judge, "admit", lambda card, hub_reason=None: judge.Verdict())  # outage: fail open
+-- 
+2.51.0
+

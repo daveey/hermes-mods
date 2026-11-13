@@ -1,0 +1,414 @@
+From bfc5f0f6aa601cd205b7a84c615821f860aff6d7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:43:47 +0000
+Subject: [PATCH] [daveey] kanban: ready-wait notices check the live board
+ against its pulled replica (no "no worker" from a lagging copy)
+
+Defect t_01a1d390d19239dd (2026-11-12 22:11 PST, MacBook): chat_wait_unclaimed told a chat that
+t_01a1d1292db9d3cb and t_01a1d12a594c8fd7 were "ready with no worker claiming it" 30 min after the
+Board completed them. After a sync-loop stall the live feed cursor (1650734) trailed the board's own
+pulled replica (sync-shadow, 1713384) by ~62k rows, so the live rows still read ready, and sweep()
+stated the Board fact from them with no freshness check.
+
+- hermes_cli/kanban_replica_freshness.py (new): reads the pulled replica (cursor and the mark_pulled
+  stamp kanban_chat_links already uses). lag_hold() says why Board facts must wait: live feed more
+  than MAX_FEED_LAG_ROWS (2000) behind the replica, or a replica pull older than
+  REPLICA_STALE_SECONDS (600). newer_rows() returns replica rows with a strictly newer sync_version
+  than the live rows. Fail-open: an unsynced board, no replica or an unreadable one changes nothing.
+- kanban_chat_wait.sweep(): defers every notice while lag_hold() holds (the episode keeps its
+  ready@since key, so it fires once when the lag closes, if still ready), and skips a card whose
+  newer replica row is no longer ready or is a later ready episode. Both log the reason.
+- kanban_wake_fold._live_task() (refresh_card, #1443's claim-time relabel): the replica's status
+  wins when its revision is newer than the live row's.
+
+Tests: (a)-(c) plus a stale-pull case in test_kanban_ready_wait_checkpoint.py, (d) in
+test_kanban_wake_fold.py. (a), (b), the stale-pull case and (d) fail on origin/main; dropping the
+replica cross-check fails (a); dropping the lag defer fails (b) and the stale-pull case.
+---
+ gateway/kanban_wake_fold.py                   |   9 +-
+ hermes_cli/kanban_chat_wait.py                |  27 +++-
+ hermes_cli/kanban_replica_freshness.py        | 129 ++++++++++++++++++
+ tests/gateway/test_kanban_wake_fold.py        |  48 +++++++
+ .../test_kanban_ready_wait_checkpoint.py      | 107 +++++++++++++++
+ 5 files changed, 315 insertions(+), 5 deletions(-)
+ create mode 100644 hermes_cli/kanban_replica_freshness.py
+
+diff --git a/gateway/kanban_wake_fold.py b/gateway/kanban_wake_fold.py
+index 9b69cfc724..98b7932205 100644
+--- a/gateway/kanban_wake_fold.py
++++ b/gateway/kanban_wake_fold.py
+@@ -179,13 +179,20 @@ def _keep_notices(old, new):
+ def _live_task(card):
+     """``(status, latest handoff summary)`` of the card on its board, or ``(None, '')``. The board slug
+     came from the notifier's board enumeration, so it resolves like the notifier read it
+-    (``pin_first_board_resolution``): a ``HERMES_KANBAN_DB`` pin outranks it."""
++    (``pin_first_board_resolution``): a ``HERMES_KANBAN_DB`` pin outranks it. When the board's pulled
++    replica holds a newer Board revision of the card than the live row (a live copy lagging after a sync
++    stall), the replica's status wins (``kanban_replica_freshness``, t_01a1d390d19239dd)."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_replica_freshness as fresh
+     with kb.pin_first_board_resolution(), contextlib.closing(kbc.connect(board=card.get('board') or None)) as conn:
+         task = kb.get_task(conn, card['task_id'])
+         if task is None:
+             return None, ''
++        newer = fresh.newer_rows(conn, [card['task_id']]).get(card['task_id'])
++        if newer is not None and newer['status']:
++            summary = (newer.get('summary') or newer.get('result') or '') if newer['status'] == 'done' else ''
++            return newer['status'], summary.strip()
+         summary = (kb.latest_summary(conn, card['task_id']) or task.result or '') if task.status == 'done' else ''
+         return task.status, summary.strip()
+ 
+diff --git a/hermes_cli/kanban_chat_wait.py b/hermes_cli/kanban_chat_wait.py
+index ecec7e5fb0..91eb2a39f7 100644
+--- a/hermes_cli/kanban_chat_wait.py
++++ b/hermes_cli/kanban_chat_wait.py
+@@ -169,16 +169,35 @@ def _clock_hold_unchecked(conn, task_id: str, since: int, now: float) -> dict[st
+ 
+ 
+ def sweep(conn, *, now: Optional[float] = None) -> int:
+-    """Append the once-per-ready-episode notice for every qualifying card; returns how many were appended."""
++    """Append the once-per-ready-episode notice for every qualifying card; returns how many were appended.
++
++    "No worker claiming it" is a Board fact read from this gateway's live copy, so it is checked against the pulled
++    replica first (``kanban_replica_freshness``, t_01a1d390d19239dd): while the live feed lags the replica past the
++    bound every notice waits (the episode keeps its key, so it fires once when the lag closes, if still ready), and
++    a card whose newer replica row has left this ready episode is skipped."""
++    from hermes_cli import kanban_replica_freshness as fresh
+     from hermes_cli.kanban_sync_diagnostics import missing_board, update_hold
+     now = time.time() if now is None else now
+-    drain = update_hold()
+-    posted = 0
+     rows = conn.execute(_CANDIDATES, (int(now - MAX_EPISODE_SECONDS), int(now - THRESHOLD_SECONDS))).fetchall()
++    due = []
+     for row in rows:
+         since = pu.ready_since(conn, row["id"], row["created_at"])
+         ready_for = now - since
+-        if ready_for < THRESHOLD_SECONDS or ready_for > MAX_EPISODE_SECONDS:
++        if THRESHOLD_SECONDS <= ready_for <= MAX_EPISODE_SECONDS:
++            due.append((row, since, ready_for))
++    if not due:
++        return 0
++    lag = fresh.lag_hold(conn, now=now)
++    if lag is not None:
++        _log.info("kanban chat-wait: %d notice(s) deferred: %s", len(due), lag["reason"])
++        return 0
++    newer = fresh.newer_rows(conn, [row["id"] for row, _since, _for in due])
++    drain = update_hold()
++    posted = 0
++    for row, since, ready_for in due:
++        moved = fresh.moved_past(newer.get(row["id"]))
++        if moved:
++            _log.info("kanban chat-wait: %s skipped: %s", row["id"], moved)
+             continue
+         if pu.post_notice(conn, row["id"], row["id"], wait_key=f"ready@{since}", waited_seconds=ready_for,
+                           ready_seconds=ready_for, parent_title=row["title"], kind=NOTICE_KIND,
+diff --git a/hermes_cli/kanban_replica_freshness.py b/hermes_cli/kanban_replica_freshness.py
+new file mode 100644
+index 0000000000..928523e303
+--- /dev/null
++++ b/hermes_cli/kanban_replica_freshness.py
+@@ -0,0 +1,129 @@
++"""Is this gateway's live board copy current enough to state a Board fact? Asked of its pulled replica. [daveey]
++
++Defect t_01a1d390d19239dd (2026-11-12, MacBook): the dispatcher posted ``chat_wait_unclaimed`` ("ready with no
++worker claiming it") for t_01a1d1292db9d3cb and t_01a1d12a594c8fd7 at 22:11 PST, 30 min after the Board completed
++them. The live board's feed cursor (1650734) was ~62k rows behind its own pulled replica (``sync-shadow``, 1713384)
++after a sync-loop stall, so the live rows still read ``ready``. Nothing compared the live copy with the replica.
++
++The replica is the same Board feed applied into ``kanban/sync-shadow/<board>.db``; each successful pull stamps
++``kanban_sync_state.pulled_at`` (``kanban_db_sync.mark_pulled``), the stamp ``kanban_chat_links`` already derives
++replica staleness from. Two reads, both fail-open (no replica, an unsynced board or an unreadable file is no
++evidence, and callers keep their old behaviour):
++
++- :func:`lag_hold`: why every ready-wait notice waits now, when the live feed position trails the replica by more
++  than :data:`MAX_FEED_LAG_ROWS` rows, or the replica's last pull is older than :data:`REPLICA_STALE_SECONDS` (a
++  stalled sync loop stops both copies, so the row gap alone cannot see it).
++- :func:`newer_rows`: the replica's rows of some cards where they carry a newer Board revision (``sync_version``)
++  than the live rows.
++"""
++from __future__ import annotations
++
++import logging
++import sqlite3
++import time
++from pathlib import Path
++from typing import Any, Iterable, Optional
++
++_log = logging.getLogger(__name__)
++
++# Feed rows the live board may trail its replica before Board facts from it wait (~6 min at ~359 rows/min).
++MAX_FEED_LAG_ROWS = 2000
++# A replica not pulled for this long vouches for nothing: the sync loop (live apply included) is not running.
++REPLICA_STALE_SECONDS = 600
++
++
++def _live_state(conn) -> Optional[tuple[str, int]]:
++    """``(board slug, feed cursor)`` of a live board attached to the Board service, else None."""
++    try:
++        row = conn.execute("SELECT board_id, cursor FROM kanban_sync_state LIMIT 1").fetchone()
++    except sqlite3.OperationalError:  # never synced: no sync tables
++        return None
++    if row is None or not row[0] or str(row[0]).startswith("local:"):
++        return None
++    return str(row[0]), int(row[1] or 0)
++
++
++def _replica(conn) -> Optional[tuple[Path, int]]:
++    """``(replica path, live cursor)`` when this live board has a pulled replica on disk."""
++    state = _live_state(conn)
++    if state is None:
++        return None
++    from hermes_cli import kanban_sync_client as ksc
++    path = ksc.shadow_path(state[0])
++    return (path, state[1]) if path.exists() else None
++
++
++def lag_hold(conn, *, now: Optional[float] = None) -> Optional[dict[str, Any]]:
++    """``{"reason", "feed_lag_rows", "replica_pull_age_s"}`` while Board facts read from ``conn`` must wait, else
++    None (no replica, an unreadable one, or a live copy within bounds)."""
++    found = _replica(conn)
++    if found is None:
++        return None
++    path, live_cursor = found
++    now = time.time() if now is None else now
++    from hermes_cli.kanban_session_activity import cached_ro  # lazy: a heavy module
++    try:
++        with cached_ro(path) as rconn:
++            row = rconn.execute("SELECT cursor, pulled_at FROM kanban_sync_state LIMIT 1").fetchone()
++    except sqlite3.Error as exc:
++        _log.debug("kanban replica freshness: %s unreadable (%s)", path, exc)
++        return None
++    if row is None:
++        return None
++    lag = int(row[0] or 0) - live_cursor
++    age = None if row[1] is None else now - float(row[1])
++    out = {"feed_lag_rows": lag, "replica_pull_age_s": None if age is None else int(age)}
++    if lag > MAX_FEED_LAG_ROWS:
++        return {**out, "reason": f"live feed {lag} rows behind its replica (bound {MAX_FEED_LAG_ROWS})"}
++    if age is not None and age > REPLICA_STALE_SECONDS:
++        return {**out, "reason": f"replica last pulled {int(age)} s ago (bound {REPLICA_STALE_SECONDS} s)"}
++    return None
++
++
++def newer_rows(conn, task_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
++    """``{task_id: replica row}`` for the cards whose replica row carries a strictly newer Board revision
++    (``sync_version``) than the live row. A row is ``{"status", "ready_since", "sync_version", "result",
++    "summary", "live_ready_since"}``. Cards with no replica row, or an older or equal one, are absent; so is
++    everything when there is no readable replica."""
++    ids = [str(t) for t in task_ids if t]
++    found = _replica(conn) if ids else None
++    if found is None:
++        return {}
++    path = found[0]
++    marks = ",".join("?" * len(ids))
++    try:
++        live = {r[0]: (int(r[1] or 0), r[2]) for r in conn.execute(
++            f"SELECT id, sync_version, ready_since FROM tasks WHERE id IN ({marks})", ids).fetchall()}
++    except sqlite3.OperationalError:  # a board without the sync columns has no revision to compare
++        return {}
++    from hermes_cli.kanban_session_activity import cached_ro
++    try:
++        with cached_ro(path) as rconn:
++            rows = rconn.execute(
++                f"SELECT id, status, ready_since, sync_version, result FROM tasks WHERE id IN ({marks})",
++                ids).fetchall()
++            out = {r[0]: {"status": r[1], "ready_since": r[2], "sync_version": int(r[3] or 0), "result": r[4],
++                          "live_ready_since": live.get(r[0], (0, None))[1]}
++                   for r in rows if int(r[3] or 0) > live.get(r[0], (0, None))[0]}
++            for tid, row in out.items():
++                if row["status"] == "done":
++                    s = rconn.execute(
++                        "SELECT summary FROM task_runs WHERE task_id = ? AND summary IS NOT NULL AND summary != '' "
++                        "ORDER BY COALESCE(ended_at, started_at) DESC, id DESC LIMIT 1", (tid,)).fetchone()
++                    row["summary"] = s[0] if s else None
++    except sqlite3.Error as exc:
++        _log.debug("kanban replica freshness: %s unreadable (%s)", path, exc)
++        return {}
++    return out
++
++
++def moved_past(row: Optional[dict[str, Any]]) -> Optional[str]:
++    """Why a replica row (from :func:`newer_rows`) shows the live ``ready`` episode is over, or None: the Board
++    has the card in another status, or ready again from a later episode (``ready_since``)."""
++    if row is None:
++        return None
++    if row["status"] != "ready":
++        return f"replica has it {row['status']} (revision {row['sync_version']})"
++    if row.get("ready_since") and row.get("live_ready_since") and row["ready_since"] != row["live_ready_since"]:
++        return f"replica has a later ready episode (revision {row['sync_version']})"
++    return None
+diff --git a/tests/gateway/test_kanban_wake_fold.py b/tests/gateway/test_kanban_wake_fold.py
+index 3af6c3a55b..618c4a33d7 100644
+--- a/tests/gateway/test_kanban_wake_fold.py
++++ b/tests/gateway/test_kanban_wake_fold.py
+@@ -466,3 +466,51 @@ def test_every_wake_kind_has_a_status_label():
+     labelled = [kind for kind in _WAKE_KINDS if kind != 'failure_finalized']
+     missing = [kind for kind in labelled if t(f'gateway.kanban.wake.{kind}') == f'gateway.kanban.wake.{kind}']
+     assert not missing
++
++
++def test_the_relabel_reads_the_fresher_replica_status(tmp_path, monkeypatch):
++    """(d) t_01a1d390d19239dd: a live board lagging after a sync stall still read the card ready, so a queued
++    ``chat_wait_unclaimed`` wake kept its false premise. The pulled replica holds a newer revision: done."""
++    import sqlite3
++
++    from hermes_cli import kanban_session_activity as ksa
++    from hermes_cli import kanban_sync_client as ksc
++    from tests.hermes_cli import kanban_sync_support as support
++    home = support.kanban_home(tmp_path, monkeypatch)
++    for key in ('HERMES_KANBAN_DB', 'HERMES_KANBAN_BOARD'):
++        monkeypatch.delenv(key, raising=False)
++    support.write_sync_config(home, True)
++    ksa._reset_cache_for_tests()
++    conn = kbc.connect(home / 'kanban.db')
++    try:
++        ksc.ensure_identity(conn, 'default', 'macbook')
++        tid = kb.create_task(conn, title='waited on', assignee='worker')
++        conn.execute('UPDATE tasks SET sync_version = 5 WHERE id = ?', (tid,))
++        conn.commit()
++    finally:
++        conn.close()
++    path = ksc.shadow_path('default')
++    path.parent.mkdir(parents=True, exist_ok=True)
++    rep = sqlite3.connect(path)
++    rep.executescript(
++        'CREATE TABLE kanban_sync_state (cursor INTEGER, pulled_at REAL);'
++        'CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, ready_since INTEGER, sync_version INTEGER, '
++        'result TEXT);'
++        'CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, started_at INTEGER, '
++        'ended_at INTEGER);')
++    rep.execute("INSERT INTO tasks VALUES (?, 'done', NULL, 7, NULL)", (tid,))
++    rep.execute("INSERT INTO task_runs (task_id, summary, started_at, ended_at) VALUES (?, 'landed PR #1', 1, 2)",
++                (tid,))
++    rep.commit()
++    rep.close()
++    card = {'task_id': tid, 'board': '', 'kinds': ['chat_wait_unclaimed'],
++            'text': f'[kanban] Task {tid} is ready with no worker claiming it.\nBoard: default'}
++    try:
++        refreshed = kanban_wake_fold.refresh_card(card)
++    finally:
++        ksa._reset_cache_for_tests()
++    lines = refreshed['text'].split('\n')
++    assert lines[0] == f'[kanban] Task {tid} completed.'
++    assert 'Live status: done.' in lines[1]
++    assert lines[2] == 'Result: landed PR #1'
++    assert refreshed['kinds'] == ['completed']
+diff --git a/tests/hermes_cli/test_kanban_ready_wait_checkpoint.py b/tests/hermes_cli/test_kanban_ready_wait_checkpoint.py
+index 0552aa76d5..2856a1d449 100644
+--- a/tests/hermes_cli/test_kanban_ready_wait_checkpoint.py
++++ b/tests/hermes_cli/test_kanban_ready_wait_checkpoint.py
+@@ -208,3 +208,110 @@ def test_old_payload_without_the_field_renders_unchanged(render):
+     sentence = f'Last checkpoint (08:00Z): "{LANDED}". {SENTENCE} '
+     assert sentence in with_field
+     assert with_field.replace(sentence, "") == before
++
++
++# --- a live board lagging its pulled replica (t_01a1d390d19239dd) -----------------------------------------------
++# 2026-11-12 22:11 PST, MacBook: chat_wait_unclaimed for t_01a1d1292db9d3cb and t_01a1d12a594c8fd7, done on the Board
++# 30 min earlier. The live feed cursor (1650734) trailed its own replica (1713384) after a sync-loop stall, so the
++# live rows still read ready. These model that pair: a synced live board and a replica at sync-shadow/default.db.
++
++
++@pytest.fixture
++def synced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
++    from hermes_cli import kanban_session_activity as ksa
++    from hermes_cli import kanban_sync_client as ksc
++    from tests.hermes_cli import kanban_sync_support as support
++    home = support.kanban_home(tmp_path, monkeypatch)
++    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK"):
++        monkeypatch.delenv(key, raising=False)
++    support.write_sync_config(home, True)
++    c = kbc.connect(home / "kanban.db")
++    ksc.ensure_identity(c, "default", "macbook")
++    ksa._reset_cache_for_tests()
++    yield c
++    c.close()
++    ksa._reset_cache_for_tests()
++
++
++def _set_live(conn, tid, *, cursor, version):
++    conn.execute("UPDATE kanban_sync_state SET cursor = ?", (cursor,))
++    conn.execute("UPDATE tasks SET sync_version = ? WHERE id = ?", (version, tid))
++    conn.commit()
++
++
++def _set_replica(*rows, cursor, pulled_at=None):
++    """The pulled replica: its feed cursor, its ``mark_pulled`` stamp and ``(id, status, sync_version)`` rows."""
++    import sqlite3
++    from hermes_cli import kanban_sync_client as ksc
++    path = ksc.shadow_path("default")
++    path.parent.mkdir(parents=True, exist_ok=True)
++    rep = sqlite3.connect(path)
++    rep.executescript(
++        "CREATE TABLE IF NOT EXISTS kanban_sync_state (id INTEGER PRIMARY KEY CHECK (id = 1), cursor INTEGER, "
++        "pulled_at REAL);"
++        "CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, status TEXT, ready_since INTEGER, "
++        "sync_version INTEGER, result TEXT);"
++        "CREATE TABLE IF NOT EXISTS task_runs (id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, "
++        "started_at INTEGER, ended_at INTEGER);")
++    rep.execute("INSERT OR REPLACE INTO kanban_sync_state VALUES (1, ?, ?)",
++                (cursor, time.time() if pulled_at is None else pulled_at))
++    rep.executemany("INSERT OR REPLACE INTO tasks (id, status, sync_version) VALUES (?, ?, ?)", rows)
++    rep.commit()
++    rep.close()
++
++
++def _waiting(conn):
++    tid = kb.create_task(conn, title="waited on", assignee="default")
++    _subscribe(conn, tid)
++    _age(conn, tid)
++    return tid
++
++
++def test_replica_completed_later_skips_the_notice(synced, caplog):
++    """(a) Live row ready 31 min; the replica, at the same feed position, has the card done at a newer revision."""
++    tid = _waiting(synced)
++    _set_live(synced, tid, cursor=1000, version=5)
++    _set_replica((tid, "done", 7), cursor=1000)
++    with caplog.at_level("INFO", logger="hermes_cli.kanban_chat_wait"):
++        assert cw.sweep(synced) == 0
++    assert _notices(synced, tid, cw.NOTICE_KIND) == []
++    assert f"{tid} skipped: replica has it done (revision 7)" in caplog.text
++
++
++def test_live_feed_lag_defers_the_notice_until_it_closes(synced, caplog):
++    """(b) The replica also has the card ready, but the live feed trails it past the bound: nothing is said until
++    the lag closes, then exactly one notice for the same episode."""
++    from hermes_cli import kanban_replica_freshness as fresh
++    tid = _waiting(synced)
++    head = 1000 + fresh.MAX_FEED_LAG_ROWS + 1
++    _set_live(synced, tid, cursor=1000, version=5)
++    _set_replica((tid, "ready", 5), cursor=head)
++    with caplog.at_level("INFO", logger="hermes_cli.kanban_chat_wait"):
++        assert cw.sweep(synced) == 0
++    assert _notices(synced, tid, cw.NOTICE_KIND) == []
++    assert "1 notice(s) deferred: live feed" in caplog.text
++    _set_live(synced, tid, cursor=head, version=5)
++    assert cw.sweep(synced) == 1
++    assert cw.sweep(synced) == 0
++    assert len(_notices(synced, tid, cw.NOTICE_KIND)) == 1
++
++
++def test_stale_replica_pull_defers_the_notice(synced):
++    """A stalled sync loop stops both copies, so their cursors agree: the replica's pull stamp is what shows it."""
++    from hermes_cli import kanban_replica_freshness as fresh
++    tid = _waiting(synced)
++    _set_live(synced, tid, cursor=1000, version=5)
++    _set_replica((tid, "ready", 5), cursor=1000, pulled_at=time.time() - fresh.REPLICA_STALE_SECONDS - 60)
++    assert cw.sweep(synced) == 0
++    _set_replica((tid, "ready", 5), cursor=1000)
++    assert cw.sweep(synced) == 1
++
++
++def test_in_sync_replica_still_ready_posts_once(synced):
++    """(c) Regression guard: no lag and the replica agrees the card is ready, so the notice goes out once."""
++    tid = _waiting(synced)
++    _set_live(synced, tid, cursor=1000, version=5)
++    _set_replica((tid, "ready", 5), cursor=1000)
++    assert cw.sweep(synced) == 1
++    assert cw.sweep(synced) == 0
++    assert len(_notices(synced, tid, cw.NOTICE_KIND)) == 1
+-- 
+2.51.0
+

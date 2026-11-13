@@ -1,0 +1,160 @@
+From 13375b757e0335eb1829168c1fd471f032a601d2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 02:48:00 +0000
+Subject: [PATCH] [daveey] kanban: local_words keeps a recorded skip with the
+ pool hint; unrecorded-skip advice defers to the re-place
+
+PR #1829 review nits (t_01a1d2bee37e8d99, review 5885232570):
+1. local_words without the admission census returned the pool re-place before rendering a recorded dispatcher
+   skip, so the skip reason vanished; the census branch kept it. Both branches now frame the skip first and use
+   pool_words as the advice.
+2. ready_hint (and the chat-wait notices, via the pool_hint payload field) followed 'Re-place it ...' with the
+   unrecorded-skip advice 'Read the live verdict ... before changing anything; priority changes are not the fix'.
+   With a pool hint notice_advice now returns UNRECORDED_POOL_ADVICE (the fact + dispatcher warning only);
+   ready_hint passes its pool sentence to _options as pool_hint.
+
+Proof: 4 new tests RED on e5605842bd (3 fail, no-pool control passes), GREEN after; 28 importer/notice files
+646 passed; 6 mutants over the new conditions all killed (M5 after adding the pool-hint-without-skip case).
+---
+ hermes_cli/kanban_dispatch_skip.py            |  8 ++-
+ hermes_cli/kanban_parent_unclaimed.py         |  3 +-
+ hermes_cli/kanban_queue_position.py           |  9 +--
+ .../test_kanban_wait_notice_pool_hint.py      | 62 +++++++++++++++++++
+ 4 files changed, 76 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_dispatch_skip.py b/hermes_cli/kanban_dispatch_skip.py
+index 8b9916e9d0..fba2adbd81 100644
+--- a/hermes_cli/kanban_dispatch_skip.py
++++ b/hermes_cli/kanban_dispatch_skip.py
+@@ -323,6 +323,10 @@ def advice(skip: dict[str, Any]) -> str:
+ UNRECORDED_ADVICE = (f"{UNRECORDED}: slots are free, yet no tick recorded why it passed this card over. Read the live "
+                      "verdict (`hermes kanban dispatch --dry-run --json`) before changing anything; priority changes "
+                      "are not the fix. Do not run its work outside the dispatcher")
++# After a pool re-place hint ("Re-place it ..."), "read the verdict before changing anything" contradicts the named
++# fix, so a notice carrying ``pool_hint`` keeps only the fact and the dispatcher warning (PR #1829 review). [daveey]
++UNRECORDED_POOL_ADVICE = (f"{UNRECORDED}: slots are free, yet no tick recorded why it passed this card over. "
++                          "Do not run its work outside the dispatcher")
+ 
+ 
+ def unrecorded(place: Optional[dict[str, Any]], ready_seconds: Optional[float]) -> bool:
+@@ -348,4 +352,6 @@ def notice_advice(payload: dict[str, Any]) -> Optional[str]:
+     skip = payload.get("dispatch_skip")
+     if isinstance(skip, dict) and skip and not is_ordering(skip):
+         return advice(skip)
+-    return UNRECORDED_ADVICE if payload.get("skip_unrecorded") else None
++    if not payload.get("skip_unrecorded"):
++        return None
++    return UNRECORDED_POOL_ADVICE if str(payload.get("pool_hint") or "").strip() else UNRECORDED_ADVICE
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index 2902c0701c..11400a10c7 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -136,8 +136,9 @@ def ready_hint(conn, task, *, now: Optional[float] = None) -> Optional[str]:
+         return f"Ready {_minutes(waited)} min, unclaimed; {kqp.describe(place)}. {checkpoint}".rstrip()
+     from hermes_cli.kanban_dispatch_skip import notice_fields
+     pool = _pool_sentence(place)
++    fields = {**notice_fields(place, waited), **({"pool_hint": pool} if pool else {})}  # _options defers to it
+     return (f"Ready {_minutes(waited)} min, unclaimed; {_queue_words(place)}. " + (f"{pool}. " if pool else "")
+-            + checkpoint + _options(task.id, lane_evidence(conn, task.id), notice_fields(place, waited)) + ".")
++            + checkpoint + _options(task.id, lane_evidence(conn, task.id), fields) + ".")
+ 
+ 
+ _CANDIDATES = (
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index 477c6d709a..121b51147d 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -354,12 +354,13 @@ def local_words(place: dict[str, Any]) -> str:
+         words += f", {place['running']}/{place['limit']} running"
+     elif place.get("limit") is not None and "running" in place:
+         words += f", running count unknown (cap {place['limit']})"
+-    if place.get("pool_could_run"):
+-        return words + ". " + pool_words(place)
++    # One shape with the census branch: a recorded skip is framed first, and a pool re-place is its advice. This
++    # branch used to return the pool hint before the skip, dropping the skip reason (PR #1829 review). [daveey]
++    pool_advice = pool_words(place) if place.get("pool_could_run") else None
+     if not skip:
+-        return words + ". " + _NOT_STUCK
++        return words + ". " + (pool_advice or _NOT_STUCK)
+     words = f"last dispatcher skip of this ready episode: {skips.words(skip)} ({words})"
+-    return words + ". " + (_NOT_STUCK if skips.is_ordering(skip) else skips.advice(skip))
++    return words + ". " + (pool_advice or (_NOT_STUCK if skips.is_ordering(skip) else skips.advice(skip)))
+ 
+ 
+ def pool_words(place: dict[str, Any], *, advice: bool = True) -> str:
+diff --git a/tests/hermes_cli/test_kanban_wait_notice_pool_hint.py b/tests/hermes_cli/test_kanban_wait_notice_pool_hint.py
+index 2ff3a72e6a..0a620ba3e5 100644
+--- a/tests/hermes_cli/test_kanban_wait_notice_pool_hint.py
++++ b/tests/hermes_cli/test_kanban_wait_notice_pool_hint.py
+@@ -99,6 +99,68 @@ def test_kanban_show_keeps_the_pool_hint_under_the_admission_census():
+     assert "--runs-on" not in unpooled and unpooled.endswith("Do not run its work outside the dispatcher")
+ 
+ 
++def test_kanban_show_keeps_the_recorded_skip_with_a_pool_hint_without_the_census():
++    """PR #1829 review: without ``admission_pools``, ``local_words`` returned the pool hint before rendering the
++    recorded skip, so the skip reason vanished there while the census branch kept it. One shape for both: the skip
++    framing first, the pool re-place as its advice."""
++    skip = {"reason": "pinned_quota_wall", "detail": "claude-opus-5-5 (anthropic)"}
++    place = {**_PLACE, "skip": skip, "pool_could_run": ["worker-2"], "task_id": "t_x"}
++    from hermes_cli import kanban_dispatch_skip as skips
++    words = kqp.local_words(place)
++    assert words.startswith("last dispatcher skip of this ready episode: " + skips.words(skip)), words
++    assert "(waiting for a local slot: ~16 ahead, 7/7 running)" in words, words
++    assert words.endswith(kqp.pool_words(place)), words  # the pool re-place is the advice, said once
++    _assert_pool_hint(words, "t_x")
++    assert skips.advice(skip) not in words
++    pools = {"regular": 7, "regular_cap": 7, "priority": 0, "priority_cap": 2}
++    census = kqp.local_words({**place, "admission_pools": pools, "admission_class": "normal"})
++    assert census.startswith("last dispatcher skip of this ready episode: " + skips.words(skip)), census
++    assert census.endswith(kqp.pool_words(place)), census  # same shape on both branches
++    unskipped = kqp.local_words({**place, "skip": None})
++    assert unskipped.startswith("waiting for a local slot") and unskipped.endswith(kqp.pool_words(place))
++    unpooled = kqp.local_words({**place, "pool_could_run": None})
++    assert unpooled.endswith(skips.advice(skip)) and "--runs-on" not in unpooled
++
++
++_UNRECORDED_CLAUSE = "before changing anything"
++
++
++def test_options_defer_to_the_pool_hint_when_the_skip_is_unrecorded():
++    """PR #1829 review: after "Re-place it ...", the unrecorded-skip advice said "Read the live verdict ... before
++    changing anything; priority changes are not the fix". With a pool hint that clause is dropped."""
++    unrecorded = {"skip_unrecorded": True}
++    plain = pu._options("t_x", None, unrecorded)
++    assert _UNRECORDED_CLAUSE in plain and "priority changes are not the fix" in plain
++    pooled = pu._options("t_x", None, {**unrecorded, "pool_hint": "Home-only ... Re-place it"})
++    assert _UNRECORDED_CLAUSE not in pooled and "priority changes are not the fix" not in pooled
++    assert "dispatcher skip reason unrecorded" in pooled and pooled.endswith("outside the dispatcher")
++    assert pu._options("t_x", None, {**unrecorded, "pool_hint": "  "}) == plain  # a blank hint is no hint
++    assert pu._options("t_x", None, {"pool_hint": "Re-place it"}) == pu._options("t_x", None, {})  # no skip fact
++    recorded = {"dispatch_skip": {"reason": "pinned_quota_wall", "detail": "x"}, "pool_hint": "Re-place it"}
++    assert pu._options("t_x", None, recorded) == pu._options("t_x", None, {"dispatch_skip": recorded["dispatch_skip"]})
++
++
++def test_ready_hint_defers_the_unrecorded_advice_to_the_pool_hint(home, pool, monkeypatch):
++    """The ready-wait hint carries the pool hint into ``_options`` (its payload has no ``pool_hint`` otherwise)."""
++    monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: 9)  # free local slots: the skip is unrecorded
++    with kbc.connect_closing() as conn:
++        tid = _waiting_card(conn)
++        hint = pu.ready_hint(conn, kb.get_task(conn, tid))
++    assert hint is not None
++    _assert_pool_hint(hint, tid)
++    assert "dispatcher skip reason unrecorded" in hint, hint
++    assert _UNRECORDED_CLAUSE not in hint, hint
++    assert hint.count("outside the dispatcher") == 1, hint
++
++
++def test_ready_hint_without_pool_keeps_the_unrecorded_advice(home, monkeypatch):
++    monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: 9)
++    with kbc.connect_closing() as conn:
++        tid = _waiting_card(conn)
++        hint = pu.ready_hint(conn, kb.get_task(conn, tid))
++    assert hint is not None and _UNRECORDED_CLAUSE in hint, hint
++
++
+ def _assert_pool_sentence_outside_parens(text: str) -> None:
+     """The multi-sentence pool hint follows the parenthesised queue clause, and the dispatcher warning is said once
+     (by the advice that ends the notice). PR #1821 review nit."""
+-- 
+2.51.0
+

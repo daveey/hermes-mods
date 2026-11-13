@@ -1,0 +1,204 @@
+From eb477c15aebd75b9212b3e066ae59898ed54a656 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 03:28:44 +0000
+Subject: [PATCH] =?UTF-8?q?[daveey]=20test(hub-admission):=20RED=20?=
+ =?UTF-8?q?=E2=80=94=20the=20final=20gate's=20census=20under=20GIL=20conte?=
+ =?UTF-8?q?ntion=20eats=20the=20sample's=20hold?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../test_hub_cpu_gate_contention.py           | 180 ++++++++++++++++++
+ 1 file changed, 180 insertions(+)
+ create mode 100644 tests/hermes_cli/test_hub_cpu_gate_contention.py
+
+diff --git a/tests/hermes_cli/test_hub_cpu_gate_contention.py b/tests/hermes_cli/test_hub_cpu_gate_contention.py
+new file mode 100644
+index 0000000000..81156cbf19
+--- /dev/null
++++ b/tests/hermes_cli/test_hub_cpu_gate_contention.py
+@@ -0,0 +1,180 @@
++"""Hub CPU gate under GIL contention: the whole-host census must not eat the sample's hold (t_01a1d2d60475a488).
++
++Inside the gateway every ``sqlite3`` call releases the GIL and has to win it back from busy Python threads (the Kanban
++sync loop, the event loop); under that contention each handoff costs about one switch interval (5 ms). The final gate
++runs the whole-host census twice under ``admission.lock`` (cap check before the ~1 s sample, recount after it), inside
++a 2.25 s hold. A census that iterates ``PRAGMA table_info`` and row-by-row cursors makes ~100 handoffs per board, so on
++the hub (10 boards) it took ~5 s and every hub claim was refused before sampling as ``hub_cpu_unknown`` from
++2026-11-13 02:03Z. The model below charges one switch interval per sqlite call/row step on a virtual clock, so the
++test is deterministic and fast.
++"""
++import json
++import logging
++import sqlite3
++import sys
++import time
++import types
++from contextlib import closing
++
++import pytest
++
++from hermes_cli import kanban_admission as ka
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import machine_cpu_metrics as cm
++from hermes_cli import machine_metrics as mm
++from tests.hermes_cli.test_kanban_hub_admission import advisory, board, claim, fake_sample, refused, task
++
++pytestmark = pytest.mark.platforms("posix")
++
++HUB_BOARDS = 10  # hermes-hub: the default board plus 9 named boards with a kanban.db
++
++
++class _Clock:
++    """``time.monotonic`` plus virtual GIL-handoff and sample time."""
++
++    def __init__(self, handoff_s):
++        self.handoff_s, self.offset, self.handoffs = handoff_s, 0.0, 0
++
++    def now(self):
++        return time.monotonic() + self.offset
++
++    def tick(self, n=1):
++        self.handoffs += n
++        self.offset += n * self.handoff_s
++
++
++class _Cursor:
++    def __init__(self, cur, clock):
++        self._cur, self._clock = cur, clock
++
++    def __iter__(self):
++        for row in self._cur:
++            self._clock.tick()
++            yield row
++        self._clock.tick()  # the final step that returns SQLITE_DONE
++
++    def fetchone(self):
++        self._clock.tick()
++        return self._cur.fetchone()
++
++    def fetchall(self):
++        rows = self._cur.fetchall()
++        self._clock.tick(len(rows) + 1)
++        return rows
++
++
++class _Conn:
++    def __init__(self, conn, clock):
++        self._conn, self._clock = conn, clock
++
++    def execute(self, *a):
++        self._clock.tick()
++        return _Cursor(self._conn.execute(*a), self._clock)
++
++    def close(self):
++        self._clock.tick()
++        self._conn.close()
++
++
++def _contended(monkeypatch, handoff_s):
++    """Charge one handoff per census sqlite call on a virtual clock the gate's hold budget reads."""
++    clock = _Clock(handoff_s)
++
++    def connect(*a, **k):
++        clock.tick()
++        return _Conn(sqlite3.connect(*a, **k), clock)
++    monkeypatch.setattr(mm, "sqlite3", types.SimpleNamespace(connect=connect, Error=sqlite3.Error,
++                                                             OperationalError=sqlite3.OperationalError))
++    monkeypatch.setattr(ka, "time", types.SimpleNamespace(monotonic=clock.now, time=time.time))
++    return clock
++
++
++def _hub_boards(conn, home, *, cap=20):
++    """The hub's shape: pools on (priority slots), the CPU gate on, one running card on each of 10 boards."""
++    (home / "config.yaml").write_text(f"kanban:\n  max_in_progress: {cap}\n  admission:\n"
++                                      "    cpu_busy_below_pct: 50\n    priority_slots: 3\n")
++    advisory(home)
++    paths = [home / "kanban.db"]
++    for index in range(HUB_BOARDS - 1):
++        folder = kb.boards_root() / f"hub-{index}"
++        folder.mkdir(parents=True)
++        (folder / "board.json").write_text("{}")
++        paths.append(folder / "kanban.db")
++    for path in paths:
++        with closing(kbc.connect(path)) as other:
++            busy = kb.create_task(other, title="running elsewhere", assignee="default")
++            with kb.write_txn(other):
++                other.execute("UPDATE tasks SET status='running', claim_lock='peer' WHERE id=?", (busy,))
++
++
++def _sample_taking(clock, window_s=1.0, pct=10.0):
++    def sample(*a, **k):
++        clock.offset += window_s
++        return {"cpu_busy_pct": pct, "cpu_busy_window_ms": round(window_s * 1000),
++                "cpu_busy_sample_end_ms": int(time.time() * 1000)}
++    return sample
++
++
++@pytest.mark.parametrize("review", [False, True])
++def test_contended_census_leaves_the_sample_room_inside_the_hold(board, monkeypatch, review):
++    """RED before the fix: ~100 handoffs per board x 10 boards ~ 5 s refused every claim before sampling."""
++    conn, home = board
++    _hub_boards(conn, home)
++    t = task(conn, review)
++    clock = _contended(monkeypatch, sys.getswitchinterval())
++    monkeypatch.setattr(cm, "sample", _sample_taking(clock))
++    claimed = claim(conn, t, review)
++    assert claimed is not None, (sync.pop_claim_deferral(t), clock.handoffs)
++    # Two censuses (before the sample, recount after it) over 10 boards: a handful of sqlite calls per board each.
++    assert clock.handoffs <= 2 * HUB_BOARDS * 8, clock.handoffs
++    payload = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='claimed' "
++                                      "ORDER BY id DESC", (t,)).fetchone()[0])
++    assert payload["hub_admission"]["pools"] == {"regular": HUB_BOARDS, "priority": 0}
++
++
++def test_census_counts_are_unchanged_by_the_cheaper_reads(board):
++    """Control: pool receipts, capacity origins and the own-holder filter read exactly as before."""
++    conn, home = board
++    _hub_boards(conn, home)
++    detail = {"pools": {"regular": 0, "priority": 0}, "capacity_origins": {}}
++    assert mm.active_card_runs(detail=detail) == HUB_BOARDS
++    assert detail["pools"] == {"regular": HUB_BOARDS, "priority": 0}
++    assert detail["capacity_origins"] == {} and detail["excluded"] == 0
++    assert mm.active_card_runs() == HUB_BOARDS
++
++
++def test_an_overrun_names_its_stage_and_hold_in_the_refusal(board, monkeypatch, caplog):
++    """A hold that still cannot fit (heavier contention) refuses with the stage and the measured hold logged, so a
++    budget overrun is told apart from an invalid sample, an expired lease or an unknown limit."""
++    conn, home = board
++    _hub_boards(conn, home)
++    t = task(conn)
++    clock = _contended(monkeypatch, 0.2)  # 200 ms per handoff: even a few calls per board overrun 2.25 s
++    monkeypatch.setattr(cm, "sample", lambda *a, **k: pytest.fail("no room left: refuse before sampling"))
++    with caplog.at_level(logging.INFO, logger="hermes_cli.kanban_admission"):
++        assert kb.claim_task(conn, t) is None
++    refused(conn, t, False, "hub_cpu_unknown")
++    line = next(r.getMessage() for r in caplog.records if "Hub admission refused" in r.getMessage())
++    assert "'stage': 'hold_before_sample'" in line, line
++    assert "'hold_ms':" in line and "'budget_ms': 2250" in line, line
++    assert clock.handoffs > 0
++
++
++@pytest.mark.parametrize("stage,setup", [
++    ("sample_invalid", lambda mp: mp.setattr(cm, "sample", fake_sample(None))),
++    ("lease_expired_before_sample", lambda mp: mp.setattr(ka, "_expired", lambda gate: True)),
++])
++def test_each_unknown_branch_names_its_stage(board, monkeypatch, caplog, stage, setup):
++    conn, home = board
++    (home / "config.yaml").write_text("kanban:\n  admission:\n    cpu_busy_below_pct: 50\n")
++    advisory(home)
++    monkeypatch.setattr(sync, "claim_gate", lambda conn, task_id, expires, lane="ready": sync.ClaimGate(expires))
++    setup(monkeypatch)
++    t = task(conn)
++    with caplog.at_level(logging.INFO, logger="hermes_cli.kanban_admission"):
++        assert kb.claim_task(conn, t) is None
++    refused(conn, t, False, "hub_cpu_unknown")
++    line = next(r.getMessage() for r in caplog.records if "Hub admission refused" in r.getMessage())
++    assert f"'stage': '{stage}'" in line, line
+-- 
+2.51.0
+

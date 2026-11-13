@@ -1,0 +1,464 @@
+From e00022d08138fac8e24f5e552c7bf40d3a060d14 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 19:33:49 +0000
+Subject: [PATCH] [daveey] remote kanban notices: deliver an observed notice
+ late instead of settling it stale past FRESH_S
+
+Hub card t_01a1c86d86cc1db7's done notice was first seen on the MacBook at
+04:23:33 PST, refused while its chat stayed busy, and settled stale (delivered=2)
+6 h 0 m 2 s later by collect(): no transcript row, no log line.
+
+observe() now returns which states this host observed (observations.first_seen
+set) apart from states seeded by a source's first snapshot (first_seen NULL).
+An observed state past FRESH_S and within LATE_MAX_S (72 h) of its first
+observation is claimed as before and grouped into the existing 'Late notices'
+group by both collect() and the sweep. Past LATE_MAX_S collect settles it
+'expired' with one WARNING naming card, chat, first_seen and age. Seeded states
+still settle silently as 'stale'.
+---
+ .../tui_gateway/test_kanban_remote_arrival.py |   8 +-
+ .../test_kanban_remote_idle_read.py           |   7 +-
+ .../test_kanban_remote_late_observed.py       | 179 ++++++++++++++++++
+ .../test_kanban_remote_observations.py        |   7 +-
+ tui_gateway/kanban_remote_notices.py          |  77 +++++++-
+ tui_gateway/kanban_remote_observations.py     |  27 ++-
+ 6 files changed, 292 insertions(+), 13 deletions(-)
+ create mode 100644 tests/tui_gateway/test_kanban_remote_late_observed.py
+
+diff --git a/tests/tui_gateway/test_kanban_remote_arrival.py b/tests/tui_gateway/test_kanban_remote_arrival.py
+index 5b780df9e6..b9bae26c5f 100644
+--- a/tests/tui_gateway/test_kanban_remote_arrival.py
++++ b/tests/tui_gateway/test_kanban_remote_arrival.py
+@@ -101,7 +101,13 @@ def test_release_and_replica_rewrite_do_not_extend_arrival_window(tmp_path):
+     with sqlite3.connect(replica) as conn:
+         conn.execute("UPDATE replica SET seq=2")
+     krn._reset_for_tests()
+-    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now + krn.FRESH_S + 1) == []
++    # [daveey] Neither the release nor the rewrite moved first_seen: past FRESH_S it is one late notice, and past
++    # LATE_MAX_S of the first observation it is gone.
++    late = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now + krn.FRESH_S + 1)
++    assert len(late) == 1 and late[0]["text"].startswith("Late notices")
++    assert krn.release(late[0], ledger=ledger)
++    krn._reset_for_tests()
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now + krn.LATE_MAX_S + 1) == []
+ 
+ 
+ def test_late_legacy_and_superseded_rows_do_not_get_local_freshness(tmp_path):
+diff --git a/tests/tui_gateway/test_kanban_remote_idle_read.py b/tests/tui_gateway/test_kanban_remote_idle_read.py
+index 25e756d381..ab5a98545b 100644
+--- a/tests/tui_gateway/test_kanban_remote_idle_read.py
++++ b/tests/tui_gateway/test_kanban_remote_idle_read.py
+@@ -290,7 +290,12 @@ def test_unchanged_replica_still_releases_reoffers_and_expires_claims(tmp_path):
+     assert [c["ref"] for c in krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=NOW + 2)] == \
+         [first[0]["ref"]]
+     assert krn.release(first[0], ledger=ledger)
+-    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=NOW + krn.FRESH_S + 1) == []
++    # [daveey] Observed and never delivered: past FRESH_S it is one late notice, not a silent settle; the
++    # window still runs from the first observation, so past LATE_MAX_S it is gone.
++    late = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=NOW + krn.FRESH_S + 1)
++    assert [c["ref"] for c in late[0]["children"]] == [first[0]["ref"]]
++    assert krn.release(late[0], ledger=ledger)
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=NOW + krn.LATE_MAX_S + 1) == []
+ 
+ 
+ def _rewrite(path, data):
+diff --git a/tests/tui_gateway/test_kanban_remote_late_observed.py b/tests/tui_gateway/test_kanban_remote_late_observed.py
+new file mode 100644
+index 0000000000..eb53c3593f
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_remote_late_observed.py
+@@ -0,0 +1,179 @@
++"""A remote notice this host observed while fresh is never settled silently. [daveey]
++
++Hub card t_01a1c86d86cc1db7 (MacBook ledger, 2026-11-12): its done notice was first seen at 04:23:33 PST, refused
++while its chat stayed busy, and at 10:23:35 (6 h 0 m 2 s later) ``collect`` settled it ``stale`` with no transcript
++row and no log line. Past ``FRESH_S`` an OBSERVED state is now delivered once as a late notice; only a state seeded
++by the first replica snapshot settles silently, and an observed one dropped past ``LATE_MAX_S`` logs one WARNING.
++"""
++import contextlib
++import json
++import logging
++import sqlite3
++
++import pytest
++
++from hermes_state import SessionDB
++from tests.tui_gateway.test_kanban_remote_notices import CHAT, _card, _hub as _base_hub, _ledger_row as _maybe_row
++from tui_gateway import kanban_remote_notices as krn
++
++T0 = 1_800_000_000.0
++TID = "t_01a1c86d86cc1db7"
++REF = f"hub/default/default/{TID}"
++
++
++def _ledger_row(ledger, session, ref) -> dict:
++    row = _maybe_row(ledger, session, ref)
++    assert row is not None, f"no ledger row for {session} {ref}"
++    return row
++
++
++def _hub(tmp_path, cards):
++    path = _base_hub(tmp_path, cards)
++    with sqlite3.connect(path) as conn:  # caught up: observe() records a baseline
++        conn.executemany("INSERT INTO meta VALUES (?,?)", [("cursor", "100"), ("head", "100")])
++    return path
++
++
++def _arrive(replica, card):
++    with sqlite3.connect(replica) as conn:
++        conn.execute("INSERT INTO replica VALUES ('hub','tasks',?,?,1)", (card["key"], json.dumps(card["task"])))
++
++
++@contextlib.contextmanager
++def _chat(tmp_path):
++    with SessionDB(tmp_path / "state.db") as db:
++        db.create_session(CHAT, "desktop")
++
++        @contextlib.contextmanager
++        def opener(profile, sid):
++            yield (db, db.get_compression_tip(sid) or sid) if sid == CHAT else (None, None)
++
++        yield db, opener
++
++
++def _deliver(db, ledger, items):
++    for item in items:
++        keys = item.get("event_keys") or [item["event_key"]]
++        db.append_kanban_notice(CHAT, item["text"], {"notice_id": keys[0], "kanban_event_keys": keys})
++        assert krn.ack(item, ledger=ledger)
++
++
++def _observed_then_starved(tmp_path, ledger):
++    """Baseline at T0, the card turns done at T0+60 and is observed at T0+120, then every pass is refused busy
++    (claim, release) until the notice is past FRESH_S."""
++    replica = _hub(tmp_path, [])
++    krn._reset_for_tests()
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=T0) == []
++    _arrive(replica, _card(TID, CHAT, status="done", at=T0 + 60, summary="shipped"))
++    for at in (T0 + 120, T0 + 3600, T0 + 3 * 3600, T0 + 120 + krn.FRESH_S - 60):
++        got = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=at)
++        assert len(got) == 1
++        assert krn.release(got[0], ledger=ledger)  # the chat is busy: the turn refused it
++    return replica
++
++
++def _stale_rows(ledger):
++    with sqlite3.connect(ledger) as conn:
++        return conn.execute("SELECT COUNT(*) FROM notices WHERE delivered=2 AND IFNULL(settled,'stale')='stale'"
++                            ).fetchone()[0]
++
++
++def test_starved_observed_notice_is_delivered_once_late_by_collect(tmp_path):
++    ledger = tmp_path / "ledger.db"
++    with _chat(tmp_path) as (db, opener):
++        replica = _observed_then_starved(tmp_path, ledger)
++        late = T0 + 120 + krn.FRESH_S + 300  # past FRESH_S since the first observation; the chat is idle now
++        got = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=late)
++        assert len(got) == 1, "an observed, undelivered notice must not be settled stale past FRESH_S"
++        assert got[0]["text"].startswith("Late notices — remote updates:") and TID in got[0]["text"]
++        _deliver(db, ledger, got)
++        krn._reset_for_tests()  # a restarted backend: neither door offers it again
++        assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=late + 60) == []
++        assert krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                        ledger=ledger, now=late + 60) == []
++        assert len(db.get_messages(CHAT)) == 1
++    row = _ledger_row(ledger, CHAT, REF)
++    assert row["delivered"] == krn.DELIVERED and row["settled"] is None
++    assert _stale_rows(ledger) == 0
++
++
++def test_starved_observed_notice_is_delivered_once_late_by_the_sweep(tmp_path):
++    ledger = tmp_path / "ledger.db"
++    with _chat(tmp_path) as (db, opener):
++        replica = _observed_then_starved(tmp_path, ledger)
++        late = T0 + 120 + krn.FRESH_S + 300  # the chat closed while busy: only the idle sweep can reach it
++        out = krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                       ledger=ledger, now=late)
++        assert [item["wake"] for item in out] == ["persisted"]
++        krn._reset_for_tests()
++        assert krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                        ledger=ledger, now=late + 60) == []
++        assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=late + 60) == []
++        messages = db.get_messages(CHAT)
++        assert len(messages) == 1 and "Late notices — remote updates:" in messages[0]["content"]
++    assert _ledger_row(ledger, CHAT, REF)["delivered"] == krn.DELIVERED
++    assert _stale_rows(ledger) == 0
++
++
++def test_observed_notice_dropped_past_the_late_window_logs_one_warning(tmp_path, caplog):
++    ledger = tmp_path / "ledger.db"
++    with _chat(tmp_path) as (db, _opener):
++        replica = _observed_then_starved(tmp_path, ledger)
++        gone = T0 + 120 + 72 * 3600 + 600  # still refused until past the 72 h late window too
++        with caplog.at_level(logging.INFO, logger=krn.logger.name):
++            assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=gone) == []
++            krn._reset_for_tests()
++            assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=gone + 60) == []
++        assert db.get_messages(CHAT) == []
++    warnings = [r for r in caplog.records if r.levelno == logging.WARNING and r.name == krn.logger.name]
++    assert len(warnings) == 1, [r.getMessage() for r in warnings]
++    text = warnings[0].getMessage()
++    assert TID in text and CHAT in text
++    assert "first seen 2027-01-15T08:02:00Z" in text  # T0 + 120, UTC
++    assert "age 72h10m" in text
++    row = _ledger_row(ledger, CHAT, REF)
++    assert row["delivered"] == krn.SETTLED and row["settled"] == "expired"
++
++
++@pytest.mark.parametrize("door", ["collect", "sweep"])
++def test_seeded_state_older_than_fresh_still_settles_silently(tmp_path, caplog, door):
++    """Guard: a state the first snapshot seeded (older than FRESH_S) is history, not a late notice."""
++    ledger = tmp_path / "ledger.db"
++    replica = _hub(tmp_path, [_card(TID, CHAT, status="done", at=T0 - 8 * 3600)])
++    krn._reset_for_tests()
++    with _chat(tmp_path) as (db, opener), caplog.at_level(logging.INFO, logger=krn.logger.name):
++        for at in (T0, T0 + 60, T0 + krn.FRESH_S + 60):
++            if door == "collect":
++                assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=at) == []
++            else:
++                assert krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                                ledger=ledger, now=at) == []
++        assert db.get_messages(CHAT) == []
++    assert not [r for r in caplog.records if r.levelno >= logging.WARNING and r.name == krn.logger.name]
++    if door == "collect":
++        assert _ledger_row(ledger, CHAT, REF)["delivered"] == krn.SETTLED
++
++
++@pytest.mark.parametrize("door", ["collect", "sweep"])
++def test_fresh_notice_delivered_normally_yields_exactly_one_row(tmp_path, door):
++    """Guard: an observed notice delivered inside FRESH_S is one row, never repeated as a late one."""
++    ledger = tmp_path / "ledger.db"
++    replica = _hub(tmp_path, [])
++    krn._reset_for_tests()
++    with _chat(tmp_path) as (db, opener):
++        assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=T0) == []
++        _arrive(replica, _card(TID, CHAT, status="done", at=T0 + 60, summary="shipped"))
++        if door == "collect":
++            got = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=T0 + 120)
++            assert len(got) == 1 and not got[0]["text"].startswith("Late notices")
++            _deliver(db, ledger, got)
++        else:
++            assert len(krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                                ledger=ledger, now=T0 + 120)) == 1
++        for at in (T0 + 180, T0 + krn.FRESH_S + 600, T0 + 72 * 3600 + 600):  # literal: the guard runs on main too
++            krn._reset_for_tests()
++            assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=at) == []
++            assert krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                            ledger=ledger, now=at) == []
++        assert len(db.get_messages(CHAT)) == 1
++    assert _ledger_row(ledger, CHAT, REF)["delivered"] == krn.DELIVERED
+diff --git a/tests/tui_gateway/test_kanban_remote_observations.py b/tests/tui_gateway/test_kanban_remote_observations.py
+index 6348186002..52308ae286 100644
+--- a/tests/tui_gateway/test_kanban_remote_observations.py
++++ b/tests/tui_gateway/test_kanban_remote_observations.py
+@@ -53,7 +53,12 @@ def test_cached_first_seen_still_ages_out(tmp_path):
+     first = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now)
+     assert len(first) == 1
+     assert krn.release(first[0], ledger=ledger)
+-    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now + krn.FRESH_S + 1) == []
++    # [daveey] Past FRESH_S an observed, undelivered state is one late notice; the cached first_seen still ages
++    # it out of the late window.
++    late = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now + krn.FRESH_S + 1)
++    assert len(late) == 1 and late[0]["text"].startswith("Late notices")
++    assert krn.release(late[0], ledger=ledger)
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now + krn.LATE_MAX_S + 1) == []
+ 
+ 
+ def test_changed_snapshot_decodes_only_the_rows_whose_seq_moved(tmp_path, monkeypatch):
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 9581abb1e3..8ffa9ab529 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -16,6 +16,9 @@ died first is re-offered, unless that key is already in the transcript. A refuse
+ (``release``) so the owner of the chat re-claims it. Freshness is the later of the owner's terminal time
+ and this host's durable first observation of that terminal state. The initial replica snapshot seeds old
+ states silently (and frozen legacy keys never get a local window), so a fresh host never floods history.
++A state this host OBSERVED (``observations.first_seen`` set) that was never delivered inside ``FRESH_S`` (a busy
++chat, a down backend) is still delivered once as a late notice until ``LATE_MAX_S`` after its first observation;
++past that it is dropped with one WARNING, never silently.
+ A legacy
+ ``delivered=1`` row from before this (claimed before the write) inside ``FRESH_S`` whose notice is in no
+ transcript of the chat is re-offered once.
+@@ -38,6 +41,11 @@ from hermes_cli.kanban_withdrawal_notice import envelope as _withdrawal
+ from tui_gateway.kanban_remote_notice_state import state as _notice_state
+ 
+ FRESH_S = 6 * 3600.0
++# [daveey] How long, from this host's first observation, a state it OBSERVED (not one seeded by a source's first
++# snapshot) is still delivered once it is past ``FRESH_S``, as a late notice. Past it the notice is dropped with one
++# WARNING. 72 h spans a weekend with the Mac asleep after observing (hub card t_01a1c86d86cc1db7 was settled stale
++# silently 6 h after it was first seen, while its chat stayed busy).
++LATE_MAX_S = 72 * 3600.0
+ # ``notices.delivered``: 0 = in flight (or an old silent record), DELIVERED = the notice is in the chat transcript,
+ # SETTLED = recorded without a notice (stale, or a local placeholder reports it). Only a transcript write (``ack``)
+ # or a keyed transcript row (``_claim_notice``) sets DELIVERED; a SETTLED row also gets a ``swept`` row with the
+@@ -469,8 +477,9 @@ def _claim_notice(conn, *, session, ref, state, now, fresh, notice_key, task_id,
+ 
+     A fresh claim is in flight (delivered=0, this process's pid + start). It becomes delivered only in
+     :func:`ack`, after the transcript write. A holder that is gone is re-offered unless the key is already
+-    in the transcript. A state that is not fresh is recorded SETTLED (never DELIVERED) with a ``swept`` row
+-    carrying ``settle_reason`` when ``swept_key`` is given.
++    in the transcript. A state that is not fresh is recorded SETTLED (never DELIVERED, ``settled`` =
++    ``settle_reason``) with a ``swept`` row carrying ``settle_reason`` when ``swept_key`` is given; that first
++    settle returns ``settled``.
+ 
+     [daveey] The dead-holder check matches the claim's own key only. It used ``notice_in_transcript``'s legacy
+     ``Kanban <task id>`` text match too, so ANY earlier notice of the same card (an earlier blocked state)
+@@ -490,8 +499,10 @@ def _claim_notice(conn, *, session, ref, state, now, fresh, notice_key, task_id,
+                 (session, ref, state, now, 0 if fresh else SETTLED, pid if fresh else None,
+                  start if fresh else None, notice_key, 0 if fresh else 1))
+             if not fresh:
++                conn.execute("UPDATE notices SET settled=? WHERE session=? AND ref=? AND state=?",
++                             (settle_reason, session, ref, state))
+                 _swept_row(conn, swept_key, settle_reason)
+-        return "offer" if fresh else "skip"
++        return "offer" if fresh else "settled"
+     if row["delivered"]:
+         return "skip"
+     holder = row["holder_pid"]
+@@ -546,6 +557,26 @@ def _claim_notice(conn, *, session, ref, state, now, fresh, notice_key, task_id,
+     return "offer" if cur.rowcount == 1 else "skip"
+ 
+ 
++def _observed_first_seen(fresh_times, ident: tuple) -> Optional[float]:
++    from tui_gateway.kanban_remote_observations import first_seen_of
++    return first_seen_of(fresh_times, ident)
++
++
++def _late_verdict(now: float, first_seen: float) -> str:
++    """``late`` while an observed state is inside ``LATE_MAX_S`` of its first observation, else ``expired``."""
++    return "late" if now - first_seen <= LATE_MAX_S else "expired"
++
++
++def _log_dropped(task: dict, ref: str, state: str, session: str, first_seen: float, now: float) -> None:
++    """The one WARNING for an observed notice that is settled without ever reaching its chat."""
++    from datetime import UTC, datetime
++    minutes = int((now - first_seen) // 60)
++    logger.warning("remote kanban: dropped undelivered notice for card %s (%s %s) to chat %s: first seen %s, "
++                   "age %dh%02dm, past the %.0fh late window", task.get("id"), ref, state, session,
++                   datetime.fromtimestamp(first_seen, UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
++                   minutes // 60, minutes % 60, LATE_MAX_S / 3600)
++
++
+ def collect(session_key: str, profile: str, *, hub_db: Optional[Path] = None, ledger: Optional[Path] = None,
+             now: Optional[float] = None, lineage: tuple[str, ...] = (),
+             skip: Optional[Callable[[str], bool]] = None,
+@@ -594,22 +625,33 @@ def collect(session_key: str, profile: str, *, hub_db: Optional[Path] = None, le
+                 state = _notice_state(task)
+                 if (ref, state) in offered:
+                     continue
+-                at_fresh = fresh_times.get((card["gw"], card["key"], state), _fresh_at(task))
++                ident = (card["gw"], card["key"], state)
++                at_fresh = fresh_times.get(ident, _fresh_at(task))
+                 fresh = at_fresh is not None and now - at_fresh <= FRESH_S
+-                if not fresh and (card["gw"], card["key"], state) not in fresh_times:
++                if not fresh and ident not in fresh_times:
+                     continue  # partial sync: don't permanently settle a not-yet-observed arrival
+-                reason = "stale"
+                 sid = card.get("sid") or session_key
+                 claim_session = sid if per_link else session_key
++                key = _shared_key(card["gw"], card["key"], task, profile, sid)
++                # [daveey] A state this host observed while fresh and never delivered (a busy chat, a down backend)
++                # is still claimed past FRESH_S, as a late notice (its owner time is old, so ``_notice_item`` puts
++                # it in the late group). Only a seeded state (first snapshot) settles silently as ``stale``.
++                first_seen = _observed_first_seen(fresh_times, ident)
++                reason = "stale" if fresh or first_seen is None else _late_verdict(now, first_seen)
++                if reason == "late":
++                    fresh = True
++                elif reason == "expired" and transcript_has is not None and transcript_has(key, ""):
++                    reason = "transcript"  # already in the chat (another session id of it): nothing was lost
+                 if fresh and skip is not None and conn.execute(
+                         "SELECT 1 FROM notices WHERE session=? AND ref=? AND state=?",
+                         (claim_session, ref, state)).fetchone() is None and skip(str(task["id"])):
+                     fresh, reason = False, "placeholder"  # recorded silently: the placeholder's notice covers it
+-                key = _shared_key(card["gw"], card["key"], task, profile, sid)
+                 swept_key = (str(path), profile, sid, _notice_id(card["gw"], card["key"], task, profile, sid))
+                 verdict = _claim_notice(conn, session=claim_session, ref=ref, state=state, now=now, fresh=fresh,
+                                         notice_key=key, task_id=str(task["id"]), transcript_has=transcript_has,
+                                         swept_key=swept_key, settle_reason=reason)
++                if verdict == "settled" and reason == "expired":
++                    _log_dropped(task, ref, state, claim_session, first_seen or 0.0, now)  # expired: observed
+                 if verdict == "offer":
+                     out.append(_notice_item(card, claim_session, me, profile, now))
+                     offered.add((ref, state))
+@@ -1138,10 +1180,14 @@ def _deliver_fresh_cards(cards, fresh_times, me, now, path, live, session_db, le
+     for owner, key, task, links in cards:
+         ref, state = f"{owner}/{key}", _notice_state(task)
+         observed_at = fresh_times.get((owner, key, state), _fresh_at(task))
+-        if observed_at is None or now - observed_at > FRESH_S:
++        first_seen = _observed_first_seen(fresh_times, (owner, key, state))
++        overdue = observed_at is None or now - observed_at > FRESH_S
++        if overdue and (first_seen is None or _late_verdict(now, first_seen) != "late"):
+             counts["stale"] = counts.get("stale", 0) + 1
+             continue
+         for link in links:
++            if overdue and _late_link_settled(owner, key, task, link, ref, state, path, settled):
++                continue  # [daveey] one ledger read, then the memo: a settled late card never reopens state.db
+             late = owner_time(task, now) is not None
+             target = batches.target(owner, key, task, link, path) if late else waker
+             results = [] if late else delivered
+@@ -1150,6 +1196,21 @@ def _deliver_fresh_cards(cards, fresh_times, me, now, path, live, session_db, le
+                           delivered=results, swept=swept, waker=target, observed_at=observed_at, now=now)
+ 
+ 
++def _late_link_settled(owner, key, task, link, ref, state, path, settled) -> bool:
++    """An observed card past ``FRESH_S`` that this link already settled (delivered, stale or by a placeholder)
++    under its own session id. Checked before ``_deliver_link`` opens the chat's state.db, and remembered."""
++    profile, sid = link.get("profile"), link.get("session")
++    if not profile or not sid:
++        return False
++    memo_key = (str(path), profile, sid, _notice_id(owner, key, task, profile, sid))
++    if memo_key in _delivered:
++        return True
++    if settled((sid,), ref, state):
++        _remember_delivered(memo_key)
++        return True
++    return False
++
++
+ def _sweep_snapshot(path, me: str) -> tuple:
+     """Cache only replica-derived data, never claim recovery or time/liveness decisions.
+ 
+diff --git a/tui_gateway/kanban_remote_observations.py b/tui_gateway/kanban_remote_observations.py
+index eb5888ed8f..2ecb21a7e7 100644
+--- a/tui_gateway/kanban_remote_observations.py
++++ b/tui_gateway/kanban_remote_observations.py
+@@ -176,11 +176,34 @@ def _persist(source: str, cards: list[tuple], ledger, now: float) -> dict[tuple,
+     return _fresh_map(states, {**(known or {}), **added})
+ 
+ 
+-def _fresh_map(states: list[tuple], first_seen: dict) -> dict[tuple, float | None]:
+-    fresh = {}
++class Observed(dict):
++    """``{(owner, key, state): freshness time}``, plus ``first_seen``: the same keys' local first observation, for
++    states this host OBSERVED (``observations.first_seen`` not NULL) only. A state seeded silently by a source's
++    first snapshot (old, legacy key, unknown owner time) is absent from ``first_seen``. [daveey]
++
++    ``collect`` and the sweep read it to keep an observed notice that aged past ``FRESH_S`` undelivered (a busy
++    chat, a down backend) as a late notice instead of settling it stale (hub card t_01a1c86d86cc1db7, MacBook
++    2026-11-12: first seen 04:23:33 PST, settled stale 6 h 0 m 2 s later, never in its chat)."""
++
++    first_seen: dict
++
++    def __init__(self, *args, first_seen: dict | None = None, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.first_seen = first_seen or {}
++
++
++def first_seen_of(fresh_times, ident: tuple) -> float | None:
++    """This host's first observation of ``ident`` = (owner, key, state); None for a seeded or unknown state."""
++    return getattr(fresh_times, "first_seen", {}).get(ident)
++
++
++def _fresh_map(states: list[tuple], first_seen: dict) -> Observed:
++    fresh = Observed()
+     for owner, key, state, ref, at in states:
+         first = first_seen[(ref, state)]
+         fresh[(owner, key, state)] = max(at, first) if at is not None and first is not None else at
++        if first is not None:
++            fresh.first_seen[(owner, key, state)] = first
+     return fresh
+ 
+ 
+-- 
+2.51.0
+

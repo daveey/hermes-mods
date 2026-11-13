@@ -1,0 +1,159 @@
+From 2415ed22926464cc5699c22419482a5f8e52426a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:49:47 +0000
+Subject: [PATCH] [daveey] tests: FakeService spawn_failed release is fenced
+ and validated before its refusal; document unmodelled
+ failure_limit/block_kind
+
+Both FakeService release routes refused spawn_failed with NotImplementedError before
+the lease fence, but transitions.ts releaseTask fences (and validates failure_limit,
+block_kind, extra, diagnostic) first, so a stale-lease spawn_failed is lease_lost there.
+Move the refusal after the fence and input checks on both routes, and raise on the
+leases route regardless of lease_runs, as release_op always did.
+
+release_inputs' docstring now states releaseTask's real order and that the fake models
+neither failure_limit nor block_kind validation.
+
+Follow-up to PR #2036 review 5888641902.
+---
+ tests/hermes_cli/kanban_sync_fake_board.py    | 34 ++++++++++++-------
+ .../hermes_cli/test_kanban_sync_rejections.py | 32 +++++++++++++++--
+ 2 files changed, 50 insertions(+), 16 deletions(-)
+
+diff --git a/tests/hermes_cli/kanban_sync_fake_board.py b/tests/hermes_cli/kanban_sync_fake_board.py
+index eafd2ce755..604eb50bd2 100644
+--- a/tests/hermes_cli/kanban_sync_fake_board.py
++++ b/tests/hermes_cli/kanban_sync_fake_board.py
+@@ -195,9 +195,12 @@ class FakeService:
+ 
+     @classmethod
+     def release_inputs(cls, op: dict) -> Optional[dict]:
+-        """releaseTask's post-fence validation, before any write, in its order: ``op.extra ?? {}`` that is not an
+-        object is ``invalid`` ("failure extra must be an object"), then :meth:`release_diagnostic`. Returns the
+-        diagnostic, or None when the caller refuses the release ``invalid``."""
++        """Part of releaseTask's post-fence validation, before any write. The real order is ``failure_limit``
++        (a positive safe integer when present), ``block_kind`` (transient | assignment | capability), ``op.extra ??
++        {}``, then releaseDiagnostic. The fake models neither ``failure_limit`` nor ``block_kind`` validation (a bad
++        value is not refused here); of the rest, in that order: an ``extra`` that is not an object is ``invalid``
++        ("failure extra must be an object"), then :meth:`release_diagnostic`. Returns the diagnostic, or None when
++        the caller refuses the release ``invalid``."""
+         extra = op.get("extra")
+         if extra is not None and not isinstance(extra, dict):
+             return None
+@@ -220,14 +223,13 @@ class FakeService:
+         """As transitions.ts releaseTask: only the lease holder's run is released; the Board ends that run, emits
+         its one outcome event (carrying :meth:`release_evidence`) and books a charged outcome exactly once.
+         Not modelled: the protocol-violation streak (a ``protocol_violation`` crash is charged like any crash), and
+-        ``spawn_failed`` (endCustody + recordTaskFailure(releaseClaim, endRun)), refused with NotImplementedError
+-        as on the leases route."""
++        ``spawn_failed`` (endCustody + recordTaskFailure(releaseClaim, endRun)). As in releaseTask, a spawn_failed
++        release is fenced and its inputs validated first (a stale lease is ``lease_lost``, a non-object extra or
++        diagnostic ``invalid``, nothing changed); one that passes both raises NotImplementedError, as on the leases
++        route."""
+         task, run = op["task"], op["run_uid"]
+         if op.get("outcome", "released") not in self.RELEASE_OUTCOMES:
+             return {"status": "rejected", "reason": "invalid"}
+-        if op.get("outcome") == "spawn_failed":
+-            raise NotImplementedError("FakeService.release_op: spawn_failed release (endCustody + "
+-                                      "recordTaskFailure) is not modelled")
+         lease = b["leases"].get(task)
+         if not lease or lease["holder"] != gw or lease["run_uid"] != run:
+             return {"status": "rejected", "reason": "lease_lost"}
+@@ -235,6 +237,9 @@ class FakeService:
+         diagnostic = self.release_inputs(op)
+         if diagnostic is None:
+             return {"status": "rejected", "reason": "invalid"}
++        if op.get("outcome") == "spawn_failed":
++            raise NotImplementedError("FakeService.release_op: spawn_failed release (endCustody + "
++                                      "recordTaskFailure) is not modelled")
+         outcome, op_id = op.get("outcome", "released"), op["client_op_id"]
+         clock = f"{9_999_999_999_999:013d}-0002-board"
+         error = str(op.get("error") or outcome)[:500]
+@@ -392,9 +397,6 @@ class FakeHub:
+             if str(body.get("outcome") or "released") not in self.svc.RELEASE_OUTCOMES:
+                 # releaseTask checks the outcome before its fence: an unknown one (a test typo) is ``invalid``.
+                 return {"status": "rejected", "reason": "invalid", "lease": cur}
+-            if self.svc.lease_runs and body.get("outcome") == "spawn_failed":
+-                raise NotImplementedError("FakeHub.leases: spawn_failed release (endCustody + recordTaskFailure) is "
+-                                          "not modelled; see _release_run")
+             if self.svc.lease_runs and (not cur or cur["holder"] != gw or cur["run_uid"] != run):
+                 # releaseTask's fence(): a release that does not name this gateway's live lease run is refused and
+                 # changes nothing (the card keeps its lease and mirror).
+@@ -404,6 +406,11 @@ class FakeHub:
+             diagnostic = self.svc.release_inputs(body)
+             if diagnostic is None:
+                 return {"status": "rejected", "reason": "invalid", "lease": cur}
++            if body.get("outcome") == "spawn_failed":
++                # As release_op: fenced and validated first (releaseTask's order), then refused loudly whatever
++                # lease_runs says, before any write.
++                raise NotImplementedError("FakeHub.leases: spawn_failed release (endCustody + recordTaskFailure) is "
++                                          "not modelled; see _release_run")
+             b["leases"].pop(task, None)
+             runs, card = b["rows"].get("task_runs", {}), b["rows"].get("tasks", {}).get(task)
+             if self.svc.lease_runs and card is not None:
+@@ -438,8 +445,9 @@ class FakeHub:
+ 
+         Not modelled: failure accounting (recordTaskFailure: consecutive_failures, failure_finalized, the breaker,
+         the protocol-violation streak); :meth:`FakeService.release_op` covers it for the ops path. ``spawn_failed``
+-        is refused with NotImplementedError by :meth:`leases`: the real releaseTask hands it to endCustody +
+-        recordTaskFailure(releaseClaim, endRun), whose run/event shape is that accounting."""
++        is refused with NotImplementedError by :meth:`leases` after its fence (with ``lease_runs``) and input checks,
++        as releaseTask orders them: the real releaseTask hands it to endCustody + recordTaskFailure(releaseClaim,
++        endRun), whose run/event shape is that accounting."""
+         gw, svc = self.gateway, self.svc
+         outcome = str(body.get("outcome") or "released")
+         error = str(body.get("error") or outcome)[:500]
+diff --git a/tests/hermes_cli/test_kanban_sync_rejections.py b/tests/hermes_cli/test_kanban_sync_rejections.py
+index 1be5ca1cce..2bd47efa78 100644
+--- a/tests/hermes_cli/test_kanban_sync_rejections.py
++++ b/tests/hermes_cli/test_kanban_sync_rejections.py
+@@ -552,10 +552,10 @@ def test_fake_release_diagnostic_counts_numbers_like_json_stringify(number, lite
+     assert FakeService.release_diagnostic({"v": number, "tail": "x" * (fill + 1)}) == {"diagnostic_truncated": True}
+ 
+ 
+-@pytest.mark.parametrize("route,lease_runs", [("leases", True), ("ops", True)])
++@pytest.mark.parametrize("route,lease_runs", [("leases", True), ("leases", False), ("ops", True)])
+ def test_fake_release_spawn_failed_is_not_modelled(live, kanban_home, route, lease_runs):
+-    """releaseTask hands spawn_failed to endCustody + recordTaskFailure; the fake refuses it loudly on both
+-    routes and changes nothing."""
++    """releaseTask hands spawn_failed to endCustody + recordTaskFailure; the fake refuses it loudly on every
++    route and changes nothing."""
+     svc = FakeService(lease_runs=lease_runs)
+     hub, tid = _leased(live, svc)
+     before = copy.deepcopy(svc.board(BOARD))
+@@ -565,6 +565,32 @@ def test_fake_release_spawn_failed_is_not_modelled(live, kanban_home, route, lea
+     assert svc.board(BOARD)["leases"][tid]["run_uid"] == RUN
+ 
+ 
++@pytest.mark.parametrize("route", ["leases", "ops"])
++def test_fake_release_spawn_failed_is_fenced_first(live, kanban_home, route):
++    """releaseTask runs fence() before the spawn_failed branch: a stale-lease spawn_failed is ``lease_lost``
++    (not the fake's NotImplementedError) and changes nothing."""
++    svc = FakeService(lease_runs=True)
++    hub, tid = _leased(live, svc)
++    svc.board(BOARD)["leases"][tid]["run_uid"] = "run-newer"
++    before = copy.deepcopy(svc.board(BOARD))
++    res = _release(route, svc, hub, tid, outcome="spawn_failed")
++    assert (res["status"], res["reason"]) == ("rejected", "lease_lost")
++    assert svc.board(BOARD) == before
++
++
++@pytest.mark.parametrize("route,lease_runs", [("leases", True), ("leases", False), ("ops", True)])
++@pytest.mark.parametrize("bad", [{"extra": "host"}, {"diagnostic": "boom"}])
++def test_fake_release_spawn_failed_validates_inputs_first(live, kanban_home, route, lease_runs, bad):
++    """releaseTask validates extra and the diagnostic before the spawn_failed branch: a bad one is ``invalid``
++    and changes nothing."""
++    svc = FakeService(lease_runs=lease_runs)
++    hub, tid = _leased(live, svc)
++    before = copy.deepcopy(svc.board(BOARD))
++    res = _release(route, svc, hub, tid, outcome="spawn_failed", **bad)
++    assert (res["status"], res["reason"]) == ("rejected", "invalid")
++    assert svc.board(BOARD) == before
++
++
+ def test_release_local_change_during_read_vetoes(live, svc, monkeypatch):
+     lost_release(live, svc)
+     hub = svc.hub(ME)
+-- 
+2.51.0
+

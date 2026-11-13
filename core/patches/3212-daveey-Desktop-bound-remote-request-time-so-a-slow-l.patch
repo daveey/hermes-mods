@@ -1,0 +1,850 @@
+From 95decfefb82e64f6e391b7e2a18acd4d69df28cd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:05:33 +0000
+Subject: [PATCH] [daveey] Desktop: bound remote request time so a slow link
+ can't wedge the hub connection
+
+On a ~1-2 Mbps link (2026-11-12, MacBook on a guest network, Tailscale via
+DERP) the Desktop held 51 sockets to the hub tunnel, so every new request
+queued in the 50-socket JSON Agent with no bound: `req.setTimeout` is an idle
+timer that starts only once a socket is assigned, and a trickling response
+never trips it. A 10 s /api/health dispatch probe ran 227 s and tore down
+healthy tunnels, and a down-gate trial held its slot for 3.5 min while every
+hub call failed fast with "reconnect in progress".
+
+1. fetchJson / fetchPublicJson: a total per-attempt deadline
+   (startRequestDeadline in api-transport.ts) started before http.request,
+   covering Agent queue wait, connect and response. On expiry the promise
+   rejects with the existing "Timed out connecting to Hermes backend after
+   Nms" error first, then the request is destroyed, so down-gate and retry
+   classification are unchanged. The idle timeout is kept.
+2. Down gate: a trial (connect + request) gets a 20 s total deadline
+   (REMOTE_DOWN_TRIAL_DEADLINE_MS). On expiry the owning trial calls
+   markDown (escalates the backoff, frees the slot) and rejects with a
+   timeout; the abandoned work no longer owns the trial.
+3. The dispatch probe (ensureHealthyPooledRemoteBackendForDispatch) asks for
+   pool 'probe': a dedicated keep-alive Agent with maxSockets 2, so a
+   saturated JSON pool can't fail the probe.
+
+Tests (each RED on the pre-fix code): a request queued behind a full Agent
+and a trickling response reject by the deadline; the probe answers while the
+JSON pool holds 50 hung requests to the same server; a trial whose connect or
+request hangs frees the slot by its deadline and the next trial runs; the
+dispatch probe requests the probe pool.
+
+multipartBody moves from main.ts to api-transport.ts unchanged, offsetting
+main.ts's FILE_LINES growth.
+
+Card: t_01a1d3b1a4a9d420 (found on t_01a1d36e8c0752f8).
+---
+ apps/desktop/electron/api-transport.test.ts   | 171 ++++++++++++++++++
+ apps/desktop/electron/api-transport.ts        |  92 +++++++++-
+ apps/desktop/electron/main.ts                 |  53 +++---
+ .../desktop/electron/remote-down-gate.test.ts | 147 +++++++++++++++
+ apps/desktop/electron/remote-down-gate.ts     |  65 +++++--
+ apps/desktop/electron/remote-liveness.test.ts |   9 +-
+ apps/desktop/electron/remote-liveness.ts      |  10 +-
+ 7 files changed, 497 insertions(+), 50 deletions(-)
+
+diff --git a/apps/desktop/electron/api-transport.test.ts b/apps/desktop/electron/api-transport.test.ts
+index d7ab264b7d..3e9c3cfe2c 100644
+--- a/apps/desktop/electron/api-transport.test.ts
++++ b/apps/desktop/electron/api-transport.test.ts
+@@ -24,6 +24,7 @@ import {
+   isTransientTransportError,
+   jsonAgentFor,
+   shouldRetryRequest,
++  startRequestDeadline,
+   withRetry
+ } from './api-transport'
+ 
+@@ -413,3 +414,173 @@ describe('htmlResponseError', () => {
+     ).toMatch(/authentication proxy/)
+   })
+ })
++
++// ---------------------------------------------------------------------------
++// [daveey] Total request deadline + dedicated probe pool (2026-11-12: MacBook on a
++// 1-2 Mbps link held 51 sockets to the hub tunnel; requests queued in the full
++// Agent with no bound, a 10 s health probe ran 227 s and tore down a healthy
++// tunnel).
++// ---------------------------------------------------------------------------
++
++/** One GET shaped exactly like main.ts fetchJson: deadline started before http.request, armed right after. */
++function deadlineJsonGet(url: string, agent: http.Agent, timeoutMs: number): Promise<any> {
++  return new Promise((resolve, reject) => {
++    const deadline = startRequestDeadline(timeoutMs)
++
++    const req = http.request(new URL(url), { agent, method: 'GET' }, res => {
++      const chunks: Buffer[] = []
++      res.on('error', reject)
++      res.on('data', c => chunks.push(c))
++      res.on('end', () => resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || 'null')))
++    })
++
++    req.on('error', reject)
++    deadline.arm(req, reject)
++    req.end()
++  })
++}
++
++/** Settles with the outcome, or 'still pending' once `ms` passed (so a RED run fails instead of hanging). */
++function settleWithin<T>(promise: Promise<T>, ms: number): Promise<{ error?: Error; pending?: true; value?: T }> {
++  return Promise.race([
++    promise.then(
++      value => ({ value }),
++      error => ({ error })
++    ),
++    new Promise<{ pending: true }>(resolve => setTimeout(() => resolve({ pending: true }), ms))
++  ])
++}
++
++/** Server whose /hang requests never answer (held until cleanup) and whose /api/health answers at once. */
++function hangingServer() {
++  const held: http.ServerResponse[] = []
++
++  const server = http.createServer((req, res) => {
++    if (req.url === '/api/health') {
++      res.writeHead(200, { 'Content-Type': 'application/json' })
++      res.end('{"ok":true}')
++
++      return
++    }
++
++    if (req.url === '/trickle') {
++      res.writeHead(200, { 'Content-Type': 'application/json' })
++      res.write(' ')
++      const tick = setInterval(() => res.write(' '), 20)
++      res.on('close', () => clearInterval(tick))
++      held.push(res)
++
++      return
++    }
++
++    held.push(res)
++  })
++
++  const close = async () => {
++    for (const res of held) {
++      res.destroy()
++    }
++
++    server.closeAllConnections()
++    await new Promise(resolve => server.close(resolve))
++  }
++
++  return { close, held, server }
++}
++
++describe('live: total request deadline (startRequestDeadline)', () => {
++  it('rejects a request queued behind a full Agent by its deadline, not after a socket frees up', async () => {
++    const { close, held, server } = hangingServer()
++    const base = await listen(server)
++    const agent = new http.Agent({ keepAlive: true, maxSockets: 1 })
++
++    try {
++      // Occupy the only socket with a request the server never answers.
++      const blocker = deadlineJsonGet(`${base}/hang`, agent, 10_000)
++      blocker.catch(() => {})
++      await new Promise<void>(resolve => {
++        const wait = () => (held.length > 0 ? resolve() : setTimeout(wait, 5))
++        wait()
++      })
++
++      const startedAt = performance.now()
++      const outcome = await settleWithin(deadlineJsonGet(`${base}/api/health`, agent, 150), 1_500)
++
++      expect(outcome.pending).toBeUndefined()
++      expect(String(outcome.error?.message)).toBe('Timed out connecting to Hermes backend after 150ms')
++      expect(performance.now() - startedAt).toBeLessThan(1_000)
++    } finally {
++      agent.destroy()
++      await close()
++    }
++  })
++
++  it('rejects a trickling response by its deadline (an idle timer alone never fires)', async () => {
++    const { close, server } = hangingServer()
++    const base = await listen(server)
++    const agent = new http.Agent({ keepAlive: true, maxSockets: 4 })
++
++    try {
++      const outcome = await settleWithin(deadlineJsonGet(`${base}/trickle`, agent, 200), 1_500)
++
++      expect(outcome.pending).toBeUndefined()
++      expect(String(outcome.error?.message)).toBe('Timed out connecting to Hermes backend after 200ms')
++    } finally {
++      agent.destroy()
++      await close()
++    }
++  })
++
++  it('a request that answers in time is not destroyed when its deadline would have passed', async () => {
++    const { close, server } = hangingServer()
++    const base = await listen(server)
++    const agent = new http.Agent({ keepAlive: true, maxSockets: 1 })
++
++    try {
++      await expect(deadlineJsonGet(`${base}/api/health`, agent, 100)).resolves.toEqual({ ok: true })
++      await new Promise(resolve => setTimeout(resolve, 150))
++      // The kept-alive socket survived (no late destroy): the next request reuses it and answers.
++      await expect(deadlineJsonGet(`${base}/api/health`, agent, 100)).resolves.toEqual({ ok: true })
++    } finally {
++      agent.destroy()
++      await close()
++    }
++  })
++})
++
++describe('live: dispatch probe pool', () => {
++  it('the probe answers while the JSON pool is saturated with hung requests to the same tunnel', async () => {
++    const { close, held, server } = hangingServer()
++    const base = await listen(server)
++    const jsonPool = jsonAgentFor('http:')
++    const hung: Promise<unknown>[] = []
++
++    try {
++      for (let i = 0; i < 50; i += 1) {
++        const pending = deadlineJsonGet(`${base}/hang`, jsonPool, 10_000)
++        pending.catch(() => {})
++        hung.push(pending)
++      }
++
++      await new Promise<void>(resolve => {
++        const wait = () => (held.length >= 50 ? resolve() : setTimeout(wait, 5))
++        wait()
++      })
++
++      // Control: the JSON pool is full, so a health check there just queues.
++      const queued = await settleWithin(deadlineJsonGet(`${base}/api/health`, jsonPool, 200), 1_500)
++      expect(String(queued.error?.message)).toContain('Timed out connecting to Hermes backend')
++
++      // The dispatch probe's own pool is not behind that queue.
++      const probe = await settleWithin(
++        deadlineJsonGet(`${base}/api/health`, jsonAgentFor('http:', 'probe'), 1_000),
++        1_500
++      )
++
++      expect(probe.error).toBeUndefined()
++      expect(probe.value).toEqual({ ok: true })
++    } finally {
++      await close()
++    }
++  })
++})
+diff --git a/apps/desktop/electron/api-transport.ts b/apps/desktop/electron/api-transport.ts
+index 4b59e2841b..639ae26ca1 100644
+--- a/apps/desktop/electron/api-transport.ts
++++ b/apps/desktop/electron/api-transport.ts
+@@ -33,6 +33,7 @@
+  *        caller. When in doubt, don't retry a non-idempotent request.
+  */
+ 
++import crypto from 'node:crypto'
+ import http from 'node:http'
+ import https from 'node:https'
+ 
+@@ -45,7 +46,23 @@ const HTTPS_JSON_AGENT = new https.Agent({ keepAlive: true, maxSockets: 50 })
+ const HTTP_DOWNLOAD_AGENT = new http.Agent({ keepAlive: true, maxSockets: 8 })
+ const HTTPS_DOWNLOAD_AGENT = new https.Agent({ keepAlive: true, maxSockets: 8 })
+ 
+-function jsonAgentFor(protocol) {
++// [daveey] Probe pool: the dispatch-time /api/health probe of a pooled remote
++// (ensureHealthyPooledRemoteBackendForDispatch). On a slow link the JSON pool
++// filled up (51 sockets to one tunnel on 2026-11-12), the probe queued behind
++// it for minutes, failed, and tore down a tunnel that was answering fine.
++// Its own tiny pool keeps the health verdict about the remote, not about our
++// local socket queue.
++const PROBE_POOL_MAX_SOCKETS = 2
++const HTTP_PROBE_AGENT = new http.Agent({ keepAlive: true, maxSockets: PROBE_POOL_MAX_SOCKETS })
++const HTTPS_PROBE_AGENT = new https.Agent({ keepAlive: true, maxSockets: PROBE_POOL_MAX_SOCKETS })
++
++export type JsonRequestPool = 'json' | 'probe'
++
++function jsonAgentFor(protocol: string, pool: JsonRequestPool = 'json') {
++  if (pool === 'probe') {
++    return protocol === 'https:' ? HTTPS_PROBE_AGENT : HTTP_PROBE_AGENT
++  }
++
+   return protocol === 'https:' ? HTTPS_JSON_AGENT : HTTP_JSON_AGENT
+ }
+ 
+@@ -56,11 +73,79 @@ function downloadAgentFor(protocol) {
+ // Close pooled sockets so lingering keep-alive connections can't hold the
+ // process open (or leak FDs) across quit. Wired to app 'will-quit' in main.ts.
+ function destroyKeepaliveAgents() {
+-  for (const agent of [HTTP_JSON_AGENT, HTTPS_JSON_AGENT, HTTP_DOWNLOAD_AGENT, HTTPS_DOWNLOAD_AGENT]) {
++  for (const agent of [
++    HTTP_JSON_AGENT,
++    HTTPS_JSON_AGENT,
++    HTTP_PROBE_AGENT,
++    HTTPS_PROBE_AGENT,
++    HTTP_DOWNLOAD_AGENT,
++    HTTPS_DOWNLOAD_AGENT
++  ]) {
+     agent.destroy()
+   }
+ }
+ 
++function requestTimeoutError(timeoutMs: number): Error {
++  return new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`)
++}
++
++// Assemble a single-file multipart/form-data body (FastAPI `UploadFile`
++// endpoints, e.g. kanban attachments). Hand-rolled because node's http has no
++// FormData and the payload is one file — a dependency would be overkill.
++function multipartBody(upload: any) {
++  const boundary = `----hermes-${crypto.randomBytes(12).toString('hex')}`
++  const filename = String(upload.filename || 'file').replace(/["\r\n]/g, '_')
++
++  const body = Buffer.concat([
++    Buffer.from(
++      `--${boundary}\r\n` +
++        `Content-Disposition: form-data; name="file"; filename="${filename}"\r\n` +
++        `Content-Type: ${upload.contentType || 'application/octet-stream'}\r\n\r\n`
++    ),
++    Buffer.from(upload.bytes),
++    Buffer.from(`\r\n--${boundary}--\r\n`)
++  ])
++
++  return { body, contentType: `multipart/form-data; boundary=${boundary}` }
++}
++
++/**
++ * [daveey] Bound one JSON request by a TOTAL deadline, not only an idle one.
++ *
++ * `req.setTimeout` is a per-socket idle timer that starts only once the Agent
++ * hands the request a socket, so time spent queued behind a full pool is
++ * unbounded, and a response that trickles bytes never trips it. On a slow link
++ * (2026-11-12, MacBook on a 1-2 Mbps guest network) that let a 10 s health
++ * probe run 227 s and a down-gate trial hold its slot for 3.5 min.
++ *
++ * Call this BEFORE `http.request` so the clock starts at call time, then
++ * `arm(req, reject)` right after: on expiry the caller's promise rejects with
++ * the usual "Timed out connecting to Hermes backend" error FIRST (so down-gate
++ * and retry classification are unchanged: a timeout is not a transient
++ * transport error) and only then is the request destroyed, so a socket error
++ * raised by the destroy can't win the race. The idle timeout is kept too.
++ */
++function startRequestDeadline(timeoutMs: number, now: () => number = Date.now) {
++  const startedAt = now()
++
++  return {
++    arm(req: http.ClientRequest, onTimeout: (error: Error) => void): void {
++      const expire = () => {
++        const error = requestTimeoutError(timeoutMs)
++        onTimeout(error)
++        req.destroy(error)
++      }
++
++      const timer = setTimeout(expire, Math.max(0, timeoutMs - (now() - startedAt)))
++      const clear = () => clearTimeout(timer)
++
++      req.once('close', clear)
++      req.once('response', (res: http.IncomingMessage) => res.once('close', clear))
++      req.setTimeout(timeoutMs, expire)
++    }
++  }
++}
++
+ // Transient transport errors: retry MAY be safe (subject to verb gating).
+ const TRANSIENT_CODES = new Set([
+   'ECONNRESET',
+@@ -276,8 +361,11 @@ export {
+   isIdempotentMethod,
+   isTransientTransportError,
+   jsonAgentFor,
++  multipartBody,
+   readJsonErrorBody,
+   readStatusCode,
++  requestTimeoutError,
+   shouldRetryRequest,
++  startRequestDeadline,
+   withRetry
+ }
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 3e6459a03f..267c77483c 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -51,8 +51,10 @@ import {
+   htmlResponseError,
+   httpStatusError,
+   jsonAgentFor,
++  multipartBody,
+   readJsonErrorBody,
+   readStatusCode,
++  startRequestDeadline,
+   withRetry
+ } from './api-transport'
+ import { appIconCandidates, resolveAppIcon, shouldOverrideDockIcon } from './app-icon'
+@@ -5211,32 +5213,15 @@ async function ensureRuntime(
+   throw new Error(`Unexpected bootstrap backend: ${backend.kind}`)
+ }
+ 
+-// Assemble a single-file multipart/form-data body (FastAPI `UploadFile`
+-// endpoints, e.g. kanban attachments). Hand-rolled because node's http has no
+-// FormData and the payload is one file — a dependency would be overkill.
+-function multipartBody(upload) {
+-  const boundary = `----hermes-${crypto.randomBytes(12).toString('hex')}`
+-  const filename = String(upload.filename || 'file').replace(/["\r\n]/g, '_')
+-
+-  const body = Buffer.concat([
+-    Buffer.from(
+-      `--${boundary}\r\n` +
+-        `Content-Disposition: form-data; name="file"; filename="${filename}"\r\n` +
+-        `Content-Type: ${upload.contentType || 'application/octet-stream'}\r\n\r\n`
+-    ),
+-    Buffer.from(upload.bytes),
+-    Buffer.from(`\r\n--${boundary}--\r\n`)
+-  ])
+-
+-  return { body, contentType: `multipart/form-data; boundary=${boundary}` }
+-}
+-
+ function fetchJson(url, token, options: any = {}) {
+   // Retry policy lives in api-transport.ts: idempotent verbs retry on any
+   // transient transport error; POST/PUT/DELETE only when the request provably
+   // never reached the server (see shouldRetryRequest) — never double-submit.
+   return withRetry(
+     async (requestState: any) => {
++      // [daveey] Total per-attempt deadline from here: covers grant minting, Agent queue wait, connect and response.
++      const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
++      const deadline = startRequestDeadline(timeoutMs)
+       // Mint inside each retry: a grant authorizes exactly one HTTP request.
+       const nativeHeaders = options.gatewayDescriptor
+         ? await nativeGatewayHttpHeaders(options.gatewayDescriptor, url, HERMES_HOME, options.method || 'GET', options.upload ? undefined : options.body)
+@@ -5252,8 +5237,8 @@ function fetchJson(url, token, options: any = {}) {
+ 
+         const parsed = new URL(url)
+         const client = parsed.protocol === 'https:' ? https : http
+-        const agent = jsonAgentFor(parsed.protocol)
+-        const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
++        // The dispatch health probe rides its own small pool (pool: 'probe') so a saturated JSON pool can't fail it.
++        const agent = jsonAgentFor(parsed.protocol, options.pool === 'probe' ? 'probe' : 'json')
+ 
+         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+           reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
+@@ -5341,9 +5326,7 @@ function fetchJson(url, token, options: any = {}) {
+         )
+ 
+         req.on('error', reject)
+-        req.setTimeout(timeoutMs, () => {
+-          req.destroy(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
+-        })
++        deadline.arm(req, reject)
+ 
+         // From here the request goes on the wire: a later transport error can no
+         // longer prove the server didn't process it, so non-idempotent verbs must
+@@ -5370,6 +5353,8 @@ function fetchPublicJson(url, options: any = {}) {
+   return withRetry(
+     (requestState: any) =>
+       new Promise((resolve, reject) => {
++        const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
++        const deadline = startRequestDeadline(timeoutMs)
+         const body = options.body === undefined ? undefined : Buffer.from(JSON.stringify(options.body))
+         let parsed
+ 
+@@ -5383,7 +5368,6 @@ function fetchPublicJson(url, options: any = {}) {
+ 
+         const client = parsed.protocol === 'https:' ? https : http
+         const agent = jsonAgentFor(parsed.protocol)
+-        const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+ 
+         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+           reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
+@@ -5446,9 +5430,7 @@ function fetchPublicJson(url, options: any = {}) {
+         )
+ 
+         req.on('error', reject)
+-        req.setTimeout(timeoutMs, () => {
+-          req.destroy(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
+-        })
++        deadline.arm(req, reject)
+ 
+         // Past this point the request is on the wire — see fetchJson.
+         requestState.bodySent = true
+@@ -15065,7 +15047,15 @@ async function getJsonForBackend(descriptor, path, opts: any = {}) {
+ async function fetchJsonForBackend(
+   descriptor,
+   path,
+-  opts: { method?: string; body?: unknown; upload?: unknown; timeoutMs?: number; profileScoped?: boolean } = {}
++  opts: {
++    method?: string
++    body?: unknown
++    upload?: unknown
++    timeoutMs?: number
++    profileScoped?: boolean
++    // 'probe' = the dispatch health probe's dedicated socket pool (api-transport.ts).
++    pool?: 'json' | 'probe'
++  } = {}
+ ) {
+   const url = `${descriptor.baseUrl}${path}`
+ 
+@@ -15111,7 +15101,7 @@ async function fetchJsonForBackend(
+ 
+     const answer = await requestWithOauthFallback(descriptor.baseUrl, {
+       ensureNativeAccessToken,
+-      requestWithBearer: (bearer: string) => fetchJson(url, null, { ...options, bearer }),
++      requestWithBearer: (bearer: string) => fetchJson(url, null, { ...options, bearer, pool: opts.pool }),
+       requestWithCookie: () => fetchJsonViaOauthSession(url, options)
+     })
+ 
+@@ -15126,6 +15116,7 @@ async function fetchJsonForBackend(
+     upload: opts.upload,
+     timeoutMs,
+     headers: descriptor.headers,
++    pool: opts.pool,
+     gatewayDescriptor: descriptor.gatewayEndpoint ? descriptor : undefined
+   })
+ 
+diff --git a/apps/desktop/electron/remote-down-gate.test.ts b/apps/desktop/electron/remote-down-gate.test.ts
+index 291a9f9221..d30ce075b6 100644
+--- a/apps/desktop/electron/remote-down-gate.test.ts
++++ b/apps/desktop/electron/remote-down-gate.test.ts
+@@ -9,6 +9,7 @@ import {
+   isRemoteTransportFailure,
+   REMOTE_DOWN_INITIAL_BACKOFF_MS,
+   REMOTE_DOWN_MAX_BACKOFF_MS,
++  REMOTE_DOWN_TRIAL_DEADLINE_MS,
+   RemoteDownGate
+ } from './remote-down-gate'
+ 
+@@ -278,9 +279,155 @@ describe('remote down gate', () => {
+   })
+ })
+ 
++// [daveey] 2026-11-12: a trial on a ~1-2 Mbps link held the slot from 22:47:46 to 22:51:13; every hub call meanwhile
++// failed fast with "reconnect in progress" although the tunnel answered /api/health in 0.44 s.
++describe('remote down gate: trial deadline', () => {
++  const TRIAL_DEADLINE_MS = 60
++
++  function downHarness() {
++    const h = harness()
++    h.gate.markDown(KEY, 'reset')
++    h.time.advance(REMOTE_DOWN_INITIAL_BACKOFF_MS)
++
++    const runTrial = (connect: () => Promise<{ baseUrl: string }>, request: () => Promise<unknown>) =>
++      dispatchThroughRemoteDownGate({
++        gate: h.gate,
++        key: KEY,
++        connect,
++        request,
++        forgetAnswer: h.forgetAnswer,
++        log: h.log,
++        trialDeadlineMs: TRIAL_DEADLINE_MS
++      })
++
++    return { ...h, runTrial }
++  }
++
++  async function settleWithin(promise: Promise<unknown>, ms: number) {
++    return Promise.race([
++      promise.then(
++        value => ({ value }),
++        (error: Error) => ({ error })
++      ),
++      new Promise<{ pending: true }>(resolve => setTimeout(() => resolve({ pending: true }), ms))
++    ]) as Promise<{ error?: Error; pending?: true; value?: unknown }>
++  }
++
++  it('defaults to a 20 s trial budget', () => {
++    expect(REMOTE_DOWN_TRIAL_DEADLINE_MS).toBe(20_000)
++  })
++
++  it('a trial whose connect hangs frees the slot by its deadline and the next trial runs', async () => {
++    const h = downHarness()
++
++    const hung = h.runTrial(
++      () => new Promise(() => {}),
++      async () => 'never'
++    )
++
++    // While the trial is in flight, others fail fast.
++    await expect(h.run(async () => 'other')).rejects.toSatisfy(isRemoteBackendDownError)
++
++    const outcome = await settleWithin(hung, 1_000)
++    expect(outcome.pending).toBeUndefined()
++    expect(String(outcome.error?.message)).toMatch(/Timed out connecting to Hermes backend/)
++    expect(h.gate.isDown(KEY)).toBe(true)
++
++    // A failed trial escalates the backoff (2x), then admits the next trial.
++    h.time.advance(REMOTE_DOWN_INITIAL_BACKOFF_MS)
++    await expect(h.run(async () => 'x')).rejects.toSatisfy(isRemoteBackendDownError)
++    h.time.advance(REMOTE_DOWN_INITIAL_BACKOFF_MS)
++    await expect(
++      h.runTrial(
++        async () => ({ baseUrl: BASE_URL }),
++        async () => 'back'
++      )
++    ).resolves.toBe('back')
++    expect(h.gate.isDown(KEY)).toBe(false)
++  })
++
++  it('a trial whose request hangs frees the slot by its deadline and the next trial runs', async () => {
++    const h = downHarness()
++
++    const hung = h.runTrial(
++      async () => ({ baseUrl: BASE_URL }),
++      () => new Promise(() => {})
++    )
++
++    const outcome = await settleWithin(hung, 1_000)
++    expect(outcome.pending).toBeUndefined()
++    expect(String(outcome.error?.message)).toMatch(/Timed out connecting to Hermes backend/)
++    expect(h.forgetAnswer).toHaveBeenCalledWith(BASE_URL)
++
++    h.time.advance(2 * REMOTE_DOWN_INITIAL_BACKOFF_MS)
++    await expect(
++      h.runTrial(
++        async () => ({ baseUrl: BASE_URL }),
++        async () => 'back'
++      )
++    ).resolves.toBe('back')
++    expect(h.gate.isDown(KEY)).toBe(false)
++  })
++
++  it('a late failure from the abandoned trial cannot escalate the backoff again', async () => {
++    const h = downHarness()
++
++    let failLate: (error: Error) => void = () => {}
++
++    const hung = h.runTrial(
++      async () => ({ baseUrl: BASE_URL }),
++      () => new Promise((_r, reject) => (failLate = reject))
++    )
++
++    await settleWithin(hung, 1_000)
++    failLate(reset())
++    await new Promise(resolve => setTimeout(resolve, 0))
++
++    // Still the 2x backoff from the deadline, not 4x.
++    h.time.advance(2 * REMOTE_DOWN_INITIAL_BACKOFF_MS)
++    await expect(
++      h.runTrial(
++        async () => ({ baseUrl: BASE_URL }),
++        async () => 'back'
++      )
++    ).resolves.toBe('back')
++  })
++
++  it('a non-trial request is not cut by the trial deadline', async () => {
++    const h = harness()
++
++    const slow = dispatchThroughRemoteDownGate({
++      gate: h.gate,
++      key: KEY,
++      connect: h.connect,
++      request: () => new Promise(resolve => setTimeout(() => resolve('slow'), 3 * TRIAL_DEADLINE_MS)),
++      trialDeadlineMs: TRIAL_DEADLINE_MS
++    })
++
++    await expect(slow).resolves.toBe('slow')
++  })
++})
++
+ describe('main.ts wiring', () => {
+   const main = readFileSync(join(__dirname, 'main.ts'), 'utf8')
+ 
++  it('fetchJson and fetchPublicJson start the total deadline before http.request and arm it on the request', () => {
++    for (const name of ['function fetchJson(', 'function fetchPublicJson(']) {
++      const body = main.slice(main.indexOf(name), main.indexOf(name) + 9000)
++      const start = body.indexOf('startRequestDeadline(timeoutMs)')
++
++      expect(start).toBeGreaterThan(0)
++      expect(start).toBeLessThan(body.indexOf('client.request('))
++      expect(body).toMatch(/deadline\.arm\(req, reject\)/)
++    }
++  })
++
++  it('fetchJson picks the probe pool when asked and fetchJsonForBackend forwards it', () => {
++    expect(main).toMatch(/jsonAgentFor\(parsed\.protocol, options\.pool === 'probe' \? 'probe' : 'json'\)/)
++    const body = main.slice(main.indexOf('async function fetchJsonForBackend('))
++    expect(body.slice(0, 4000)).toMatch(/pool: opts\.pool/)
++  })
++
+   it('routes registry requests to remote connections through the gate', () => {
+     const body = main.slice(main.indexOf('async function dispatchRegistryApiRequest('))
+ 
+diff --git a/apps/desktop/electron/remote-down-gate.ts b/apps/desktop/electron/remote-down-gate.ts
+index 9792d4cc0e..9c7ec04ef1 100644
+--- a/apps/desktop/electron/remote-down-gate.ts
++++ b/apps/desktop/electron/remote-down-gate.ts
+@@ -15,6 +15,10 @@
+ 
+ export const REMOTE_DOWN_INITIAL_BACKOFF_MS = 2_000
+ export const REMOTE_DOWN_MAX_BACKOFF_MS = 30_000
++// [daveey] A trial (connect, which may redial and probe, plus the request) must settle within this or it is
++// treated as a failed trial: the slot is freed and the backoff escalates. Without it a trial on a slow link held the
++// slot for 3.5 min (2026-11-12) while every other request failed fast with "reconnect in progress".
++export const REMOTE_DOWN_TRIAL_DEADLINE_MS = 20_000
+ 
+ export const REMOTE_BACKEND_DOWN_CODE = 'REMOTE_BACKEND_DOWN'
+ 
+@@ -49,7 +53,8 @@ const TRANSPORT_CODES = new Set([
+   'EPIPE'
+ ])
+ 
+-const TRANSPORT_MESSAGE_RE = /\b(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|EPIPE|EHOSTUNREACH|ENETUNREACH|EHOSTDOWN)\b|socket hang up/i
++const TRANSPORT_MESSAGE_RE =
++  /\b(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|EPIPE|EHOSTUNREACH|ENETUNREACH|EHOSTDOWN)\b|socket hang up/i
+ const TIMEOUT_MESSAGE_RE = /Timed out connecting to Hermes backend/i
+ 
+ /** The connection itself broke (reset, refused, hung up): the backend behind the tunnel is gone. */
+@@ -235,6 +240,8 @@ export interface GatedRemoteDispatchOptions<TConnection extends { baseUrl?: null
+   // Drop the "answered recently" mark so the next dispatch re-probes /api/health instead of trusting a dead tunnel.
+   forgetAnswer?: (baseUrl: null | string | undefined) => void
+   log?: (message: string) => void
++  // Total budget for a trial (connect + request); defaults to REMOTE_DOWN_TRIAL_DEADLINE_MS.
++  trialDeadlineMs?: number
+ }
+ 
+ /**
+@@ -243,22 +250,56 @@ export interface GatedRemoteDispatchOptions<TConnection extends { baseUrl?: null
+  * - known down → RemoteBackendDownError immediately (no dial, no timeout wait);
+  * - the connection breaks (connect fails, or the request resets/refuses/hangs up) → mark down;
+  * - any answer from the backend, HTTP errors included → mark up;
+- * - a request timeout → forget the answer mark (next dispatch re-probes) and, if it was the trial, stay down.
++ * - a request timeout → forget the answer mark (next dispatch re-probes) and, if it was the trial, stay down;
++ * - a trial that has not settled within its deadline → failed trial: mark down (escalates the backoff, frees the
++ *   slot) and reject with a timeout. The abandoned connect/request may still settle later; it no longer owns the
++ *   trial, so only a fresh answer can still reopen the gate.
+  */
+-export async function dispatchThroughRemoteDownGate<TConnection extends { baseUrl?: null | string }, TResult>({
+-  gate,
+-  key,
+-  connect,
+-  request,
+-  forgetAnswer,
+-  log
+-}: GatedRemoteDispatchOptions<TConnection, TResult>): Promise<TResult> {
++export async function dispatchThroughRemoteDownGate<TConnection extends { baseUrl?: null | string }, TResult>(
++  options: GatedRemoteDispatchOptions<TConnection, TResult>
++): Promise<TResult> {
++  const { gate, key, trialDeadlineMs = REMOTE_DOWN_TRIAL_DEADLINE_MS, log } = options
+   const admission = gate.admit(key)
++
++  if (!admission.trial) {
++    return runGatedDispatch(options, admission)
++  }
++
++  const state: { connection?: TConnection } = {}
++  const run = runGatedDispatch(options, admission, state)
++  let timer: ReturnType<typeof setTimeout> | undefined
++
++  const deadline = new Promise<never>((_resolve, reject) => {
++    timer = setTimeout(() => {
++      const message = `Timed out connecting to Hermes backend after ${trialDeadlineMs}ms (down-gate trial deadline)`
++      options.forgetAnswer?.(state.connection?.baseUrl)
++      gate.markDown(key, message, admission)
++      log?.(`[remote-down] ${key} trial exceeded ${trialDeadlineMs} ms; slot freed, backoff escalated`)
++      reject(new Error(message))
++    }, trialDeadlineMs)
++  })
++
++  // The loser of the race must never surface as an unhandled rejection.
++  run.catch(() => {})
++
++  try {
++    return await Promise.race([run, deadline])
++  } finally {
++    clearTimeout(timer)
++  }
++}
++
++async function runGatedDispatch<TConnection extends { baseUrl?: null | string }, TResult>(
++  { gate, key, connect, request, forgetAnswer, log }: GatedRemoteDispatchOptions<TConnection, TResult>,
++  admission: RemoteDownAdmission,
++  state: { connection?: TConnection } = {}
++): Promise<TResult> {
+   const { trial } = admission
+   let connection: TConnection
+ 
+   try {
+     connection = await connect()
++    state.connection = connection
+   } catch (error) {
+     if (isRemoteBackendDownError(error)) {
+       throw error
+@@ -280,7 +321,9 @@ export async function dispatchThroughRemoteDownGate<TConnection extends { baseUr
+     gate.markDown(key, `connect failed: ${message}`, admission)
+ 
+     if (wasUp) {
+-      log?.(`[remote-down] ${key} marked down (connect failed: ${message.slice(0, 160)}); failing fast until it answers`)
++      log?.(
++        `[remote-down] ${key} marked down (connect failed: ${message.slice(0, 160)}); failing fast until it answers`
++      )
+     }
+ 
+     throw error
+diff --git a/apps/desktop/electron/remote-liveness.test.ts b/apps/desktop/electron/remote-liveness.test.ts
+index d80a4504d6..95faeef00f 100644
+--- a/apps/desktop/electron/remote-liveness.test.ts
++++ b/apps/desktop/electron/remote-liveness.test.ts
+@@ -287,7 +287,8 @@ describe('ensureHealthyPooledRemoteBackendForDispatch', () => {
+     ).resolves.toBe(healthy)
+ 
+     expect(probe).toHaveBeenCalledWith(healthy, '/api/health', {
+-      timeoutMs: POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS
++      timeoutMs: POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS,
++      pool: 'probe'
+     })
+     expect(retire).not.toHaveBeenCalled()
+     expect(reconnect).not.toHaveBeenCalled()
+@@ -412,7 +413,8 @@ describe('ensureHealthyPooledRemoteBackendForDispatch', () => {
+     ).resolves.toBe(replacement)
+ 
+     expect(probe).toHaveBeenCalledWith(stale, '/api/health', {
+-      timeoutMs: POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS
++      timeoutMs: POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS,
++      pool: 'probe'
+     })
+     expect(retire).toHaveBeenCalledOnce()
+     expect(reconnect).toHaveBeenCalledOnce()
+@@ -442,7 +444,8 @@ describe('ensureHealthyPooledRemoteBackendForDispatch', () => {
+     ).resolves.toBe(legacy)
+ 
+     expect(probe).toHaveBeenCalledWith(legacy, '/api/status', {
+-      timeoutMs: POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS
++      timeoutMs: POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS,
++      pool: 'probe'
+     })
+     expect(retire).not.toHaveBeenCalled()
+     expect(reconnect).not.toHaveBeenCalled()
+diff --git a/apps/desktop/electron/remote-liveness.ts b/apps/desktop/electron/remote-liveness.ts
+index d836427034..3f6d2e4a31 100644
+--- a/apps/desktop/electron/remote-liveness.ts
++++ b/apps/desktop/electron/remote-liveness.ts
+@@ -117,7 +117,9 @@ export class RemoteRevalidationCoordinator {
+ interface EnsureHealthyPooledRemoteBackendForDispatchOptions<TConnection extends RemoteConnectionDescriptor> {
+   connectionPromise: Promise<TConnection>
+   currentConnectionPromise: () => null | Promise<TConnection>
+-  probe: (connection: TConnection, path: string, options: { timeoutMs: number }) => Promise<unknown>
++  // The probe asks for pool 'probe': its own small socket pool, so a JSON pool saturated by a slow link can't fail
++  // the health verdict and tear down a tunnel that answers.
++  probe: (connection: TConnection, path: string, options: { timeoutMs: number; pool?: 'probe' }) => Promise<unknown>
+   reconnect: () => Promise<TConnection>
+   retire: (error: unknown) => Promise<void> | void
+   // Skip the probe when the backend answered within skipWindowMs (0 forces it, e.g. the prewarm keepalive).
+@@ -171,7 +173,8 @@ export async function ensureHealthyPooledRemoteBackendForDispatch<TConnection ex
+ 
+     try {
+       await probe(connection, '/api/health', {
+-        timeoutMs: POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS
++        timeoutMs: POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS,
++        pool: 'probe'
+       })
+     } catch (healthError) {
+       // A remote that predates /api/health would otherwise 404 every dispatch,
+@@ -182,7 +185,8 @@ export async function ensureHealthyPooledRemoteBackendForDispatch<TConnection ex
+       }
+ 
+       await probe(connection, '/api/status', {
+-        timeoutMs: POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS
++        timeoutMs: POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS,
++        pool: 'probe'
+       })
+     }
+   } catch (error) {
+-- 
+2.51.0
+

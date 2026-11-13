@@ -1,0 +1,102 @@
+From 918b131d2e55a2b9e6cd8876ef9bddc8c6118f18 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:54:44 +0000
+Subject: [PATCH] [daveey] kanban chat-wait: a lag stall ends only when the lag
+ closes, not when nothing is due
+
+PR #2057 review nits (review 5889046385, t_01a1d44e6eccacaa):
+
+1. The nothing-due early return discarded the board from _LAG_WARNED without
+   checking lag_hold, so a due card claimed mid-lag followed by a new due card
+   in the same replica lag WARNed twice for one stall, contradicting the comment
+   ("its stall (if any) is over") and the docstring ("first deferred sweep of
+   each stall logs at WARNING"). Pick the stricter semantics: the stall is the
+   replica lag the WARNING reports, so the nothing-due sweep discards only when
+   lag_hold is None. lag_hold runs there only for a board already in the set
+   (a lagging board), so healthy boards pay nothing extra.
+2. test_board_with_nothing_due_ends_its_stall now pins _LAG_WARNED after the
+   still-lagging nothing-due sweep (kept) and after the lag closes (cleared),
+   and a new due card within the same lag logs at INFO.
+---
+ hermes_cli/kanban_chat_wait.py                    | 15 ++++++++++-----
+ .../test_kanban_ready_wait_checkpoint.py          | 11 +++++++++--
+ 2 files changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_chat_wait.py b/hermes_cli/kanban_chat_wait.py
+index 852a0cda1d..a3161ca2c7 100644
+--- a/hermes_cli/kanban_chat_wait.py
++++ b/hermes_cli/kanban_chat_wait.py
+@@ -34,8 +34,11 @@ THRESHOLD_SECONDS = pu.THRESHOLD_SECONDS
+ MAX_EPISODE_SECONDS = 6 * 3600
+ # Boards (main DB file of the swept conn) whose current lag stall has logged its WARNING; the rest of that stall logs
+ # at INFO. Keyed per board: the dispatcher sweeps each board separately, so a healthy board's undeferred sweep must
+-# not re-arm a lagging board's WARNING every tick. A board leaves the set on its own undeferred sweep, or on its own
+-# sweep with nothing due (a stall that ends with no card waiting would otherwise make the next one log only at INFO).
++# not re-arm a lagging board's WARNING every tick. A stall is one run of replica lag, so a board leaves the set only on
++# its own sweep that finds the lag closed: an undeferred sweep, or one with nothing due whose lag_hold is None (a
++# stall that ends with no card waiting would otherwise make the next one log only at INFO). Cards that come due and
++# get claimed within one lag log at INFO after the first WARNING; lag_hold runs on a nothing-due sweep only for a
++# board in the set.
+ _LAG_WARNED: set[str] = set()
+ NO_PROMISE = "check placement and available capacity first; re-place if suitable; don't promise a pickup"
+ 
+@@ -187,7 +190,7 @@ def sweep(conn, *, now: Optional[float] = None) -> int:
+     bound every notice waits (the episode keeps its key, so it fires once when the lag closes, if still ready), and
+     a card whose newer replica row has left this ready episode is skipped. A deferral that outlasts
+     ``MAX_EPISODE_SECONDS`` drops that episode's notice for good (the stall itself is the sync loop's to report), so
+-    the first deferred sweep of each stall logs at WARNING."""
++    the first deferred sweep of each stall (one run of replica lag, see :data:`_LAG_WARNED`) logs at WARNING."""
+     from hermes_cli import kanban_replica_freshness as fresh
+     from hermes_cli.kanban_sync_diagnostics import missing_board, update_hold
+     now = time.time() if now is None else now
+@@ -198,9 +201,11 @@ def sweep(conn, *, now: Optional[float] = None) -> int:
+         ready_for = now - since
+         if THRESHOLD_SECONDS <= ready_for <= MAX_EPISODE_SECONDS:
+             due.append((row, since, ready_for))
+-    if not due:  # nothing waits on this board, so its stall (if any) is over
++    if not due:  # the stall is the lag, not the waiting card: it ends when the lag closes, even with nothing due
+         if _LAG_WARNED:
+-            _LAG_WARNED.discard(_board_key(conn))
++            board = _board_key(conn)
++            if board in _LAG_WARNED and fresh.lag_hold(conn, now=now) is None:
++                _LAG_WARNED.discard(board)
+         return 0
+     lag = fresh.lag_hold(conn, now=now)
+     board = _board_key(conn)
+diff --git a/tests/hermes_cli/test_kanban_ready_wait_checkpoint.py b/tests/hermes_cli/test_kanban_ready_wait_checkpoint.py
+index ea3c07760c..0803f9a15d 100644
+--- a/tests/hermes_cli/test_kanban_ready_wait_checkpoint.py
++++ b/tests/hermes_cli/test_kanban_ready_wait_checkpoint.py
+@@ -410,7 +410,9 @@ def test_lagging_board_warns_once_per_stall_while_another_board_is_healthy(tmp_p
+ def test_board_with_nothing_due_ends_its_stall(tmp_path, monkeypatch, caplog):
+     """PR #2041 review nit 2: the stall's due card is claimed before the lag closes, so the board's next sweep has
+     nothing due and returns early. That sweep must still end the stall: a later stall with a due card warns again
+-    instead of logging only at INFO."""
++    instead of logging only at INFO. PR #2057 review nit: the stall is the replica lag, so a nothing-due sweep while
++    the board still lags keeps its key; a new due card in that same lag logs at INFO, and only the lag closing ends
++    the stall."""
+     from hermes_cli import kanban_replica_freshness as fresh
+     home = tmp_path / ".hermes"
+     home.mkdir()
+@@ -428,12 +430,17 @@ def test_board_with_nothing_due_ends_its_stall(tmp_path, monkeypatch, caplog):
+             assert cw.sweep(a) == 0
+             assert kb.claim_task(a, first)  # a worker takes it while the replica still lags: nothing is due now
+             assert cw.sweep(a) == 0
++            assert cw._LAG_WARNED == {_db_file(a)}  # still lagging: the stall goes on with nothing due
++            second = _waiting(a)  # a new due card in the same lag
++            assert cw.sweep(a) == 0
++            assert kb.claim_task(a, second)
+             lagging.clear()
+             assert cw.sweep(a) == 0  # the lag closes with nothing due
++            assert cw._LAG_WARNED == set()
+             lagging.add(_db_file(a))
+             _waiting(a)  # a new stall with a due card
+             assert cw.sweep(a) == 0
+         deferred = [r.levelname for r in caplog.records if "deferred" in r.getMessage()]
+-        assert deferred == ["WARNING", "WARNING"]
++        assert deferred == ["WARNING", "INFO", "WARNING"]
+     finally:
+         a.close()
+-- 
+2.51.0
+

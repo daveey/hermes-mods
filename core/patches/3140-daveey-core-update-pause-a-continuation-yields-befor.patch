@@ -1,0 +1,460 @@
+From 2a2e0292f9470e9fa9136adcadedae20821fea82 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 04:51:16 +0000
+Subject: [PATCH] [daveey] core-update pause: a continuation yields before its
+ first step boundary (t_01a1d31bf400d56c)
+
+hermes-hub 2026-11-13: the instant drainer released a pause without an apply, the paused Desktop turns were
+continued in place (kind=auto_continue) and asked to pause again, but a pause landed only at a step boundary:
+a continuation reached its first one ~3 min after admission (setup incl. a 30 s pre_llm_call hook timeout, a
+30 s first request, a 20 s tool). Its admission reservation stayed unpublished meanwhile, so every apply past the
+60 s cap was refused and the next release re-admitted the turns into the next window.
+
+A continuation re-runs a paused request, so until its first model request it has done nothing its next
+continuation would not redo. The Desktop/TUI gateway now marks an auto_continue turn
+(agent.update_pause_first_request) and such a turn:
+- returns paused without starting (no request, nothing persisted) when the pause is already requested;
+- pauses at its first iteration, before the first request (turn_iteration_prep._step_boundary_pause);
+- lets the mid-tool cancel reach its first model request after the usual grace (model_request_can_yield),
+  whose refunded iteration then pauses before any request.
+Every other turn keeps waiting for a real step boundary.
+---
+ agent/conversation_loop.py                    |   4 +-
+ agent/turn_iteration_prep.py                  |  11 +-
+ agent/update_pause_cancel.py                  |  42 +++++-
+ .../test_step_boundary_pause_first_request.py | 121 ++++++++++++++++++
+ .../test_update_pause_first_request.py        |  60 +++++++++
+ .../test_update_pause_first_request_model.py  |  88 +++++++++++++
+ tui_gateway/prompt_turn.py                    |   3 +
+ 7 files changed, 320 insertions(+), 9 deletions(-)
+ create mode 100644 tests/agent/test_step_boundary_pause_first_request.py
+ create mode 100644 tests/tui_gateway/test_update_pause_first_request.py
+ create mode 100644 tests/tui_gateway/test_update_pause_first_request_model.py
+
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index b67f8b5453..49d84a3b56 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -40,7 +40,7 @@ from hermes_cli.observability.shared_metrics_efficiency import record_cache_brea
+ from hermes_cli.plugins_dispatch import held_stream_transforms
+ from agent.turn_retry_state import TurnRetryState
+ from agent.turn_scripted_prelude import Prelude, play_prelude
+-from agent.update_pause_cancel import reset as update_pause_cancel_reset
++from agent.update_pause_cancel import pause_before_turn, reset as update_pause_cancel_reset
+ # Phase helpers of the turn loop, bound at import so a source-tree swap cannot load a
+ # skewed phase mid-turn.
+ from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call
+@@ -1845,6 +1845,8 @@ def run_conversation(
+     update_pause_cancel_reset(agent)  # [daveey] and its mid-tool cancel (agent/update_pause_cancel.py)
+     # Per-provider-response context accounting starts empty every turn (agent/context_usage.py).
+     begin_turn_context_usage(agent)
++    if (paused := pause_before_turn(agent, conversation_history)) is not None:  # [daveey] t_01a1d31bf400d56c
++        return paused  # a continuation dispatched under a pending core-update pause never starts
+     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
+     # it does not embed the same pixels a second time into the same request (#76411).
+     with native_turn_images(user_message):
+diff --git a/agent/turn_iteration_prep.py b/agent/turn_iteration_prep.py
+index e5d3f2d306..4b4dfbe7f0 100644
+--- a/agent/turn_iteration_prep.py
++++ b/agent/turn_iteration_prep.py
+@@ -352,12 +352,15 @@ class IterationStart:
+ 
+ def _step_boundary_pause(agent: Any, messages: Any, api_call_count: Any) -> Any:
+     """The installed pause hook's reason, consulted only at a real step boundary: at least one model
+-    call ran this turn and the transcript ends on a tool result. A failing hook never pauses."""
++    call ran this turn and the transcript ends on a tool result. A failing hook never pauses. [daveey]
++    t_01a1d31bf400d56c: a continuation's first iteration counts too, before its first request is spent."""
+     hook = getattr(agent, "step_boundary_pause", None)
+-    if not callable(hook) or not api_call_count or not messages:
++    if not callable(hook) or not messages:
+         return None
+-    last = messages[-1]
+-    if not isinstance(last, dict) or last.get("role") != "tool":
++    if not api_call_count:
++        if not update_pause_cancel.first_request_can_pause(agent):
++            return None
++    elif not isinstance(messages[-1], dict) or messages[-1].get("role") != "tool":
+         return None
+     try:
+         return hook() or None
+diff --git a/agent/update_pause_cancel.py b/agent/update_pause_cancel.py
+index 227d77ac69..96e58a5573 100644
+--- a/agent/update_pause_cancel.py
++++ b/agent/update_pause_cancel.py
+@@ -131,12 +131,16 @@ def _yield_requested(agent: Any, call_id: str) -> bool:
+ MODEL_CALL_ID = "model-request"
+ 
+ 
+-def model_request_can_yield(messages: Any, *, api_call_count: int) -> bool:
++def model_request_can_yield(messages: Any, *, api_call_count: int, first_request_ok: bool = False) -> bool:
+     """The request about to run sits at a step boundary: an earlier model call ran this turn
+     (``api_call_count`` already counts this one, begin_iteration reserved it) and the transcript ends on a tool
+-    result, so a pause landing here loses nothing but this request (``_step_boundary_pause``'s precondition)."""
+-    if api_call_count - 1 <= 0 or not isinstance(messages, list) or not messages:
++    result, so a pause landing here loses nothing but this request (``_step_boundary_pause``'s precondition).
++    [daveey] t_01a1d31bf400d56c: ``first_request_ok`` (a continuation, ``first_request_can_pause``) makes its first
++    request yield too: the refunded iteration then pauses before any request (begin_iteration)."""
++    if not isinstance(messages, list) or not messages:
+         return False
++    if api_call_count - 1 <= 0:
++        return first_request_ok and api_call_count == 1
+     last = messages[-1]
+     return isinstance(last, dict) and last.get("role") == "tool"
+ 
+@@ -147,7 +151,8 @@ def model_request_in_flight(agent: Any, messages: Any, *, api_call_count: int) -
+     watcher's cancel reaches it after the same grace. Without this a long request (169 s on the hub) held the
+     turn's admission reservation unpublished past the instant update's cap: a pause lands only at a step boundary.
+     The turn's first request (no tool result yet) is not tracked: there is no boundary to pause at."""
+-    tracked = model_request_can_yield(messages, api_call_count=api_call_count)
++    tracked = model_request_can_yield(messages, api_call_count=api_call_count,
++                                      first_request_ok=first_request_can_pause(agent))
+     if tracked:
+         started(agent, MODEL_CALL_ID)
+     try:
+@@ -157,6 +162,35 @@ def model_request_in_flight(agent: Any, messages: Any, *, api_call_count: int) -
+             finished(agent, MODEL_CALL_ID)
+ 
+ 
++# [daveey] t_01a1d31bf400d56c: set by the Desktop/TUI gateway for the turn of a continuation (kind ``auto_continue``)
++# only. Until its first model request such a turn has done nothing its next continuation would not redo, so a
++# pending pause may end it there too: a step boundary it would otherwise reach only after a whole first step
++# (setup hooks, a first request, a first tool: 203 s on the hub while the update stayed due).
++FIRST_REQUEST_ATTR = "update_pause_first_request"
++
++
++def first_request_can_pause(agent: Any) -> bool:
++    """The gateway marked this turn a continuation (a literal True: a mock's auto-attribute is no mark)."""
++    return getattr(agent, FIRST_REQUEST_ATTR, False) is True
++
++
++def pause_before_turn(agent: Any, conversation_history: Any) -> dict | None:
++    """The result of a continuation that yields to an already-pending pause before its turn starts: no request,
++    nothing persisted, the transcript unchanged (the next continuation sends the same note). None otherwise."""
++    hook = getattr(agent, "step_boundary_pause", None)
++    if not first_request_can_pause(agent) or not callable(hook):
++        return None
++    try:
++        reason = hook() or None
++    except Exception:  # health: allow BLE001 -- a failing pause hook never pauses (as _step_boundary_pause)
++        return None
++    if not reason:
++        return None
++    return {"final_response": "", "messages": list(conversation_history or []), "api_calls": 0,
++            "completed": False, "interrupted": True, "paused_for_update": reason,
++            "turn_exit_reason": f"paused_for_update({reason})"}
++
++
+ def model_yield_requested(agent: Any) -> bool:
+     """The update's cancel covered the running model request and is still the pending interrupt (no Stop since):
+     its output is discarded and the turn pauses at the boundary it was issued from."""
+diff --git a/tests/agent/test_step_boundary_pause_first_request.py b/tests/agent/test_step_boundary_pause_first_request.py
+new file mode 100644
+index 0000000000..7b7619de8b
+--- /dev/null
++++ b/tests/agent/test_step_boundary_pause_first_request.py
+@@ -0,0 +1,121 @@
++"""[daveey] t_01a1d31bf400d56c: a core-update continuation yields to a pending pause before its first model request.
++
++hermes-hub 2026-11-13 04:21:57-04:25:20: the drainer released its pause (apply refused), a paused Desktop turn
++(20261111_090650_1247e7) was continued in place at once (kind=auto_continue), and the drainer asked it to pause
++again 5 s later. A pause landed only at a step boundary (a tool result after a model call), and this turn's
++first boundary came 203 s after admission (turn setup with a 30 s pre_llm_call hook timeout, alternation repair,
++a 21 s first request, a final-answer gate, a second request, an 11 s tool). Its admission reservation stayed
++unpublished meanwhile, every apply past the 60 s cap was refused, and the release re-admitted the next paused
++turn into the next window: the hub update stayed due for over 20 minutes.
++
++A continuation re-runs a paused request: until its first model request it has done nothing the next backend's
++continuation would not do again. So a turn the gateway marks ``update_pause_first_request`` asks its pause hook
++before the turn starts (nothing is written: the transcript and the request are untouched) and again at the first
++iteration (before the first request is spent). Any other turn keeps waiting for a real step boundary.
++"""
++
++from __future__ import annotations
++
++import threading
++from unittest.mock import patch
++
++from tests.agent.test_step_boundary_pause import _final_response, _make_agent, _tool_response
++
++HISTORY = [{"role": "user", "content": "run the job"}, {"role": "assistant", "content": None,
++            "tool_calls": [{"id": "c0", "type": "function", "function": {"name": "web_search", "arguments": "{}"}}]},
++           {"role": "tool", "tool_call_id": "c0", "content": "ok"}]
++NOTE = "[System note: Your previous turn was interrupted mid-run — it was paused at a step boundary ...]"
++
++
++def _run(agent, responses, events, *, history=HISTORY, message=NOTE):
++    agent.client.chat.completions.create.side_effect = responses
++
++    def _persist(messages, *_a, **_k):
++        events.append(("persist", [m.get("role") for m in messages]))
++
++    with (
++        patch.object(agent, "_flush_messages_to_session_db", return_value=True),
++        patch.object(agent, "_persist_session", side_effect=_persist),
++        patch.object(agent, "_save_trajectory"),
++        patch.object(agent, "_cleanup_task_resources"),
++    ):
++        return agent.run_conversation(message, conversation_history=[dict(m) for m in history])
++
++
++def test_continuation_with_a_pending_pause_yields_before_the_turn_starts():
++    """The pause is already requested when the continuation is dispatched: no request is sent, nothing is
++    persisted, and the transcript comes back unchanged (the next continuation re-sends the same note)."""
++    events: list = []
++    calls: list = []
++    agent = _make_agent(events)
++    agent.step_boundary_pause = lambda: calls.append(1) or "core_update_pause"
++    agent.update_pause_first_request = True
++
++    result = _run(agent, [_tool_response(1), _final_response()], events)
++
++    assert agent.client.chat.completions.create.call_count == 0
++    assert calls == [1]
++    assert result["interrupted"] is True and result["completed"] is False
++    assert result["paused_for_update"] == "core_update_pause"
++    assert result["api_calls"] == 0
++    assert result["messages"] == HISTORY  # the note was never added
++    assert not [e for e in events if e[0] == "persist"]
++
++
++def test_continuation_paused_during_setup_yields_before_its_first_request():
++    """The pause is requested after the turn started (during its setup): it lands at the first iteration,
++    before the first request is spent, with the note persisted as the transcript's last row."""
++    events: list = []
++    requested = threading.Event()
++    asked: list = []
++
++    def _hook():
++        asked.append(requested.is_set())
++        if not requested.is_set():
++            requested.set()  # the drainer's request lands right after the pre-turn check
++            return None
++        return "core_update_pause"
++
++    agent = _make_agent(events)
++    agent.step_boundary_pause = _hook
++    agent.update_pause_first_request = True
++
++    result = _run(agent, [_tool_response(1), _final_response()], events)
++
++    assert agent.client.chat.completions.create.call_count == 0
++    assert asked == [False, True]
++    assert result["paused_for_update"] == "core_update_pause"
++    assert result["messages"][-1]["role"] == "user"
++    assert any(e[0] == "persist" and e[1][-1] == "user" for e in events)
++
++
++def test_continuation_without_a_pause_runs_as_before():
++    events: list = []
++    agent = _make_agent(events)
++    agent.step_boundary_pause = lambda: None
++    agent.update_pause_first_request = True
++    result = _run(agent, [_tool_response(1), _final_response()], events)
++    assert agent.client.chat.completions.create.call_count == 2
++    assert result["completed"] is True and not result.get("paused_for_update")
++
++
++def test_ordinary_turn_still_waits_for_a_real_step_boundary():
++    """A turn the gateway did not mark keeps the original rule: never consulted before its first request."""
++    events: list = []
++    calls: list = []
++    agent = _make_agent(events)
++    agent.step_boundary_pause = lambda: calls.append(1) or "core_update_pause"
++    result = _run(agent, [_tool_response(1), _final_response()], events, message="do some tool work")
++    assert calls == [1]  # only at the boundary after the first tool
++    assert agent.client.chat.completions.create.call_count == 1
++    assert result["paused_for_update"] == "core_update_pause"
++    assert result["messages"][-1]["role"] == "tool"
++
++
++def test_only_a_literal_true_marks_a_continuation():
++    """A mock agent's auto-attribute is not the gateway's mark."""
++    from unittest.mock import MagicMock
++
++    from agent import update_pause_cancel
++    agent = MagicMock()
++    assert update_pause_cancel.pause_before_turn(agent, HISTORY) is None
+diff --git a/tests/tui_gateway/test_update_pause_first_request.py b/tests/tui_gateway/test_update_pause_first_request.py
+new file mode 100644
+index 0000000000..c8669f580a
+--- /dev/null
++++ b/tests/tui_gateway/test_update_pause_first_request.py
+@@ -0,0 +1,60 @@
++"""[daveey] t_01a1d31bf400d56c: the gateway marks only continuation turns (kind ``auto_continue``) as able to yield
++to a core-update pause before their first model request, for that turn alone (see
++tests/agent/test_step_boundary_pause_first_request.py for the agent side)."""
++
++from __future__ import annotations
++
++import threading
++import types
++
++import pytest
++
++from tests.tui_gateway.test_update_pause_mid_tool import _InlineThread
++from tui_gateway import server
++from tui_gateway import update_pause as up
++
++CFG = {"desktop": {"auto_continue": {"enabled": True, "resume_on_startup": True, "freshness_minutes": 240,
++                                     "max_attempts": 2}}}
++
++
++@pytest.fixture()
++def home(monkeypatch, tmp_path):
++    monkeypatch.setattr(server, "_hermes_home", tmp_path)
++    monkeypatch.setattr(server, "_load_cfg", lambda: CFG)
++    monkeypatch.setattr(up, "start_mid_tool_cancel", lambda *a: (lambda: None))
++    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
++    for name, value in {"_emit": lambda *a, **k: None, "_wire_callbacks": lambda sid: None,
++                        "_sync_agent_model_with_config": lambda sid, s: None,
++                        "_session_cwd": lambda s: str(tmp_path), "_register_session_cwd": lambda s: None,
++                        "_tts_stream_begin": lambda: None, "_sync_session_key_after_compress": lambda *a, **k: None,
++                        "_get_usage": lambda a: {}}.items():
++        monkeypatch.setattr(server, name, value)
++    return tmp_path
++
++
++def _submit(home, **kwargs):
++    seen = []
++
++    def _run(message, **_kw):
++        seen.append((getattr(agent, "update_pause_first_request", None), callable(agent.step_boundary_pause)))
++        return {"final_response": "done", "messages": []}
++
++    agent = types.SimpleNamespace(session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None)
++    session = {"agent": agent, "session_key": "session-key", "history": [], "history_lock": threading.RLock(),
++               "history_version": 0, "running": True, "attached_images": [], "image_counter": 0, "cols": 80,
++               "slash_worker": None, "show_reasoning": False, "tool_progress_mode": "all", "inflight_turn": None,
++               "profile_home": str(home)}
++    server._run_prompt_submit("rid", "ui-sid", session, "go", **kwargs)
++    return seen, agent
++
++
++def test_a_continuation_turn_may_yield_before_its_first_request(home):
++    seen, agent = _submit(home, display_kind="auto_continue")
++    assert seen == [(True, True)]
++    assert agent.update_pause_first_request is False  # for that turn only
++
++
++@pytest.mark.parametrize("kind", [None, "kanban_notice", "process_complete"])
++def test_any_other_turn_waits_for_a_real_step_boundary(home, kind):
++    seen, _agent = _submit(home, display_kind=kind)
++    assert seen == [(False, True)]
+diff --git a/tests/tui_gateway/test_update_pause_first_request_model.py b/tests/tui_gateway/test_update_pause_first_request_model.py
+new file mode 100644
+index 0000000000..6ffc5fa161
+--- /dev/null
++++ b/tests/tui_gateway/test_update_pause_first_request_model.py
+@@ -0,0 +1,88 @@
++"""[daveey] t_01a1d31bf400d56c: a continuation's first model request yields to a core-update pause.
++
++A continuation (kind ``auto_continue``) re-runs a paused request, so its first model request redoes nothing the
++next backend's continuation would not redo. The mid-tool cancel reaches it after the same grace as a boundary
++request (t_01a1d293248f5e12) and the turn pauses before any request, instead of after a whole first step
++(hermes-hub 2026-11-13: 30 s first request + 21 s tool, 203 s after admission). Any other turn's first request
++is still left alone (tests/tui_gateway/test_update_pause_model_request.py)."""
++
++from __future__ import annotations
++
++import threading
++import time
++
++import pytest
++
++from hermes_cli import admission_fence as af
++from tests.tui_gateway import test_update_pause_model_request as base
++from tui_gateway import server
++from tui_gateway import update_pause as up
++from tui_gateway.turn_marker import read_turn_marker, record_turn_start
++
++NOTE = "[System note: Your previous turn was paused for a Hermes update ...]"
++
++
++@pytest.fixture()
++def home(monkeypatch, tmp_path):
++    monkeypatch.setattr("agent.title_generator.maybe_auto_title", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_hermes_home", tmp_path)
++    monkeypatch.setattr(server, "_load_cfg", lambda: base.CFG)
++    monkeypatch.setattr(up, "MID_TOOL_GRACE_S", 0.3)
++    monkeypatch.setattr(up, "MID_TOOL_POLL_S", 0.05)
++    return tmp_path
++
++
++def _drive_continuation(home, tmp_path, monkeypatch, responses):
++    record_turn_start(home, "session-key", "run the quick job")
++    agent = base._make_agent(tmp_path)
++    session = {"agent": agent, "session_key": "session-key", "profile_home": str(home),
++               "history_lock": threading.RLock()}
++    model = base._Model(responses, 1)
++    agent.client.chat.completions.create.side_effect = model
++    reservation = af.reserve(home)
++    assert reservation is not None
++    base._pause_when(home, model.slow_started)
++    out = {}
++
++    def _turn():
++        agent.step_boundary_pause = up.boundary_pause_hook(session, "session-key")
++        agent.update_pause_first_request = True  # tui_gateway.prompt_turn marks an auto_continue turn
++        stop = up.start_mid_tool_cancel(session, "session-key", agent)
++        try:
++            out["result"] = agent.run_conversation(NOTE, conversation_history=[
++                {"role": "user", "content": "run the quick job"}])
++        finally:
++            stop()
++            agent.step_boundary_pause = None
++            reservation.close()
++            out["at"] = time.monotonic()
++
++    started = time.monotonic()
++    thread = threading.Thread(target=_turn, daemon=True)
++    thread.start()
++    thread.join(base.SLOW_MODEL_S * 3)
++    assert not thread.is_alive()
++    return agent, model, out["result"], out["at"] - started
++
++
++def test_a_continuations_first_request_yields_and_the_turn_pauses(home, tmp_path, monkeypatch):
++    agent, model, result, took = _drive_continuation(
++        home, tmp_path, monkeypatch, [base._response(), base._response()])
++
++    assert model.slow_started.is_set() and not model.slow_finished
++    assert took < base.SLOW_MODEL_S / 2
++    assert af.state(home)["reservations"] == 0
++    assert result["interrupted"] is True and result["paused_for_update"] == up.PAUSE_REASON
++    assert model.calls == 1
++    assert read_turn_marker(home, "session-key")["reason"] == "core_update_pause"
++    # Nothing but user rows (alternation repair may merge the note into the prompt): no partial or interrupt row.
++    assert {m["role"] for m in result["messages"]} == {"user"}
++    assert not agent._interrupt_requested
++
++
++def test_first_request_counts_as_in_flight_only_for_a_continuation():
++    from agent import update_pause_cancel as upc
++    first = [{"role": "user", "content": "go"}]
++    assert upc.model_request_can_yield(first, api_call_count=1) is False
++    assert upc.model_request_can_yield(first, api_call_count=1, first_request_ok=True) is True
++    assert upc.model_request_can_yield([], api_call_count=1, first_request_ok=True) is False
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 608beaa21c..37d62d1dae 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -1031,6 +1031,8 @@ def _invoke_agent(
+     from tui_gateway.update_pause import boundary_pause_hook, install_clarify_pause_provider, start_mid_tool_cancel
+     pause_key = st.marker_key or _carried_pause_key(session)
+     agent.step_boundary_pause = boundary_pause_hook(session, pause_key) if pause_key else None
++    # [daveey] t_01a1d31bf400d56c: a continuation may yield before its first model request (it redoes nothing).
++    agent.update_pause_first_request = bool(st.marker_key) and display_kind == "auto_continue"
+     _mid_tool_stop = None
+     if pause_key:
+         install_clarify_pause_provider()  # a blocked clarify is withdrawn so the pause can land
+@@ -1050,6 +1052,7 @@ def _invoke_agent(
+                 agent._pending_cli_user_message = None
+     finally:
+         agent.step_boundary_pause = None
++        agent.update_pause_first_request = False
+         if _mid_tool_stop is not None:
+             _mid_tool_stop()
+         # Stop AND join before anything emits: a tick surviving past message.complete would
+-- 
+2.51.0
+

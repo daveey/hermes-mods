@@ -1,0 +1,386 @@
+From 764f1731c5856e9bb5ada893480a3720cd097143 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:09:08 +0000
+Subject: [PATCH] [daveey] fix(kanban): a run the holder ends frees its Board
+ lease while the outbox is stalled
+
+On a primary board the Board frees a run's lease only when the pushed card row leaves `running`.
+With a host's push loop down (laptop-1 2026-11-13, SchemaAhead) that row never left the outbox, so
+a run that parked normally kept its lease and the Board's stale-lease reaper booked it as a crash at
+expiry: t_01a1d05e8be13a6a got two `stale_lease=macbook` failures and tripped its retry breaker.
+Claims and renewals still reached the Board as direct calls; only the release was lost.
+
+Every run-ending transition the holder makes now queues the run in the new
+`kanban_run_end_lease.note` inside its txn (schedule, block, review handoff and the timed/escalation
+parks through `_end_or_synthesize_run`; complete, request_changes, continue, archive, descendant
+reopen), and `write_txn` sends `sync.release_lease(task, run_uid)` after COMMIT, the way operator
+reclaim does. Best effort: any error is logged and the lease expires on the server as before; the
+transition never fails. Rollback drops the queue, and a run whose end did not commit is skipped.
+Crash/timeout/reclaim accounting paths do not queue (they release with their own charged outcome).
+
+Gated on a stalled outbox (a due pending row older than 120 s). Board `releaseTask` returns a card it
+still sees `running` to `ready` (and drops a placement card's runs_on). On a healthy host a direct
+release would usually beat the row push, leaving a parked or done card claimable elsewhere until the
+push lands, while the pushed row already ends the lease there.
+
+Tests (tests/hermes_cli/test_kanban_run_end_lease.py): schedule, block, complete, review and continue
+release that run's run_uid with the outbox stalled (fail on main); a failing release (client error or
+any exception) leaves the park intact (fails on main); a draining outbox, a crash end and a
+rolled-back end send no release.
+
+Card: t_01a1d41ac87b214b
+---
+ hermes_cli/kanban_continuation.py             |   2 +
+ hermes_cli/kanban_db.py                       |  21 ++-
+ hermes_cli/kanban_db_archive.py               |   2 +
+ hermes_cli/kanban_db_connect.py               |   4 +
+ hermes_cli/kanban_run_end_lease.py            |  84 ++++++++++++
+ tests/hermes_cli/test_kanban_run_end_lease.py | 129 ++++++++++++++++++
+ 6 files changed, 231 insertions(+), 11 deletions(-)
+ create mode 100644 hermes_cli/kanban_run_end_lease.py
+ create mode 100644 tests/hermes_cli/test_kanban_run_end_lease.py
+
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index 19b5eeee47..3f5472fd2a 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -202,6 +202,8 @@ def continue_task(
+             conn, task_id, outcome=CONTINUED_OUTCOME, status=CONTINUED_OUTCOME,
+             summary=kb._first_line(checkpoint, 400) or "checkpoint", metadata=meta,
+         )
++        from hermes_cli import kanban_run_end_lease
++        kanban_run_end_lease.note(conn, task_id, run_id)  # [daveey] free the Board lease after commit
+         payload = {"continuation": streak + 1, "status": new_status, "resume_status": source_status}
+         # Server-derived ordering proof for PR comments sharing this checkpoint's second.
+         # Persist inside the same transaction; caller metadata cannot override it.
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index e4d4e7a18a..ab3f80ba68 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -37,6 +37,7 @@ from hermes_cli.kanban_db_values import _first_line, _opt_int, _json_or_null
+ from hermes_cli.kanban_db_event import Event  # public kb.Event; helpers import lazily: no cycle
+ from hermes_cli.kanban_worker_placement import resolved_db_placement, validate_creation
+ from hermes_cli import kanban_placement_forward as _placement_fwd  # stdlib-only at import: no cycle
++from hermes_cli import kanban_run_end_lease as _run_end_lease  # stdlib-only at import: no cycle
+ from hermes_cli.kanban_host_identity import is_local_claim as _claim_is_local
+ from hermes_cli.kanban_db_dispatch_queries import DISPATCH_ORDER  # stdlib-only at import: no cycle
+ from hermes_cli.kanban_admission import admission_hold_set, claim_transaction, claim_and_open_run, hub_cpu_advisory
+@@ -1835,6 +1836,7 @@ def _end_or_synthesize_run(
+     run — transitions that reassign the task (e.g. review handoff) pass the
+     acting profile captured before the rewrite."""
+     run_id = _end_run(conn, task_id, outcome=outcome, status=status, summary=summary, metadata=metadata)
++    _run_end_lease.note(conn, task_id, run_id)  # [daveey] free the Board lease after commit
+     if run_id is None and synthesize:
+         run_id = _synthesize_ended_run(conn, task_id, outcome=outcome, summary=summary, metadata=metadata, profile=profile)
+     return run_id
+@@ -2554,10 +2556,9 @@ def complete_task(
+             return False
+         if isinstance(metadata, dict):
+             staged.extend(_stage_completion_artifacts(conn, task_id, metadata, now))
+-        run_id = _end_run(
+-            conn, task_id, outcome="completed", status="done", summary=handoff_summary,
+-            metadata=metadata,
+-        )
++        run_id = _end_run(conn, task_id, outcome="completed", status="done", summary=handoff_summary,
++                          metadata=metadata)
++        _run_end_lease.note(conn, task_id, run_id)  # [daveey] free the Board lease after commit
+         # Never-claimed task: synthesize a run so the handoff fields survive.
+         if run_id is None and (summary or metadata or result or prior_status == "review"):
+             synth_summary, synth_metadata = handoff_summary, metadata
+@@ -3252,9 +3253,8 @@ def request_changes(
+         ))
+         if cur.rowcount != 1:
+             return False, "task changed during review handoff"
+-        run_id = _end_run(
+-            conn, task_id, outcome="changes_requested", status=new_status, summary=reason,
+-        )
++        run_id = _end_run(conn, task_id, outcome="changes_requested", status=new_status, summary=reason)
++        _run_end_lease.note(conn, task_id, run_id)  # [daveey] free the Board lease after commit
+         _append_event(
+             conn,
+             task_id,
+@@ -3498,10 +3498,9 @@ def invalidate_descendants_for_parent_reopen(
+             elif previous_status == "running":
+                 resume_status = _retry_status_for_run(conn, row["id"], row["current_run_id"])
+                 terminations.append((row["worker_pid"], row["claim_lock"], row["worker_started_at"]))
+-                run_id = _end_run(
+-                    conn, row["id"], outcome="reclaimed", status="todo",
+-                    summary=f"ancestor {task_id} reopened",
+-                )
++                run_id = _end_run(conn, row["id"], outcome="reclaimed", status="todo",
++                                  summary=f"ancestor {task_id} reopened")
++                _run_end_lease.note(conn, row["id"], run_id)  # [daveey] free the Board lease after commit
+             # consecutive_failures = 0: deliberate operator reset — see
+             # docstring for why this diverges from reopen_review_task.
+             conn.execute(
+diff --git a/hermes_cli/kanban_db_archive.py b/hermes_cli/kanban_db_archive.py
+index 744f46b41c..a938b84101 100644
+--- a/hermes_cli/kanban_db_archive.py
++++ b/hermes_cli/kanban_db_archive.py
+@@ -49,6 +49,8 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None, via:
+             conn, task_id, outcome="reclaimed", status="reclaimed",
+             summary="task archived with run still active",
+         )
++        from hermes_cli import kanban_run_end_lease
++        kanban_run_end_lease.note(conn, task_id, run_id)  # [daveey] free the Board lease after commit
+         # [daveey] via: archived outside the creator scope; event_extra: e.g. a forwarded run (kanban_owner_archive_relay)
+         payload = {"source_status": row["status"], **({"via": via} if via else {}), **(event_extra or {})}
+         kb._append_event(conn, task_id, "archived", payload, run_id=run_id)
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 6f5d7aff1a..d9dfc956af 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
+ from __future__ import annotations
+ 
+ from hermes_cli import kanban_lockguard as _kanban_lockguard
++from hermes_cli import kanban_run_end_lease as _run_end_lease
+ import contextlib
+ import json
+ import os
+@@ -1516,6 +1517,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
+         # don't let this secondary failure shadow the real one.
+         with contextlib.suppress(sqlite3.OperationalError):
+             conn.execute("ROLLBACK")
++        _run_end_lease.flush(conn, committed=False)
+         raise
+     else:
+         try:
+@@ -1525,7 +1527,9 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
+             # connection isn't poisoned for the next BEGIN IMMEDIATE.
+             with contextlib.suppress(sqlite3.OperationalError):
+                 conn.execute("ROLLBACK")
++            _run_end_lease.flush(conn, committed=False)
+             raise
++        _run_end_lease.flush(conn, committed=True)  # [daveey] Board lease of a run this txn ended
+         # Post-commit torn-extend check — raise now rather than silently corrupt.
+         _check_file_length_invariant(conn)
+ 
+diff --git a/hermes_cli/kanban_run_end_lease.py b/hermes_cli/kanban_run_end_lease.py
+new file mode 100644
+index 0000000000..9aada21275
+--- /dev/null
++++ b/hermes_cli/kanban_run_end_lease.py
+@@ -0,0 +1,84 @@
++"""Free the Board lease when the holder's own transition ends its run. [daveey]
++
++On a primary board the Board frees a run's lease when the pushed card row leaves ``running`` (rows.ts:
++the holder moving its card out of ``running`` ends the lease). With this host's push loop down, that
++row never leaves the outbox, the lease outlives the run, and at expiry the Board's stale-lease reaper
++books it as a crash (``reclaimed`` + ``failure_finalized``, ``stale_lease=<holder>``): a card that
++parked normally trips its retry breaker (t_01a1d05e8be13a6a, laptop-1 2026-11-13, sync down on
++SchemaAhead). Claims and renewals still reached the Board as direct calls; only the release was lost.
++
++So every run-ending transition the holder makes (schedule, block, complete, review handoff, request
++changes, continue, archive, descendant reopen) queues :func:`note` inside its write txn, and
++``write_txn`` calls :func:`flush` after COMMIT: a direct ``release`` call, best-effort, the way
++operator reclaim already does. A failed release keeps today's fallback (the lease expires on the
++server) and never fails the transition. Crash, timeout and reclaim accounting paths do not queue: they
++release with their own outcome, and a neutral release sent first would hide the charge.
++
++Only while the outbox is stalled (:func:`outbox_stalled`). Board ``releaseTask`` returns a card it still
++sees ``running`` to ``ready`` (and drops a placement card's ``runs_on``). On a healthy host the direct
++release would usually beat the row push, so a parked or done card would read ``ready`` on the Board
++until the push lands, open to a claim from another machine. There the row push ends the lease itself,
++so nothing is sent.
++"""
++from __future__ import annotations
++
++import logging
++import sqlite3
++import time
++from typing import Optional
++
++_log = logging.getLogger("hermes_cli.kanban_db_sync")
++
++# A due pending outbox row older than this means the push loop is not draining (a healthy loop pushes
++# within seconds; a held row with a future ``retry_after`` does not count).
++OUTBOX_STALL_SECONDS = 120
++
++# id(conn) -> [(task_id, run_uid)] queued inside the open write txn of that connection.
++_PENDING: dict[int, list[tuple[str, str]]] = {}
++
++
++def outbox_stalled(conn: sqlite3.Connection, now: Optional[float] = None) -> bool:
++    """True when a due ``pending`` outbox row is older than :data:`OUTBOX_STALL_SECONDS`."""
++    now = time.time() if now is None else now
++    row = conn.execute(
++        "SELECT MIN(created_at) FROM kanban_sync_outbox WHERE state = 'pending' "
++        "AND (retry_after IS NULL OR retry_after <= ?)", (int(now),)).fetchone()
++    return bool(row) and row[0] is not None and int(row[0]) <= int((now - OUTBOX_STALL_SECONDS) * 1000)
++
++
++def note(conn: sqlite3.Connection, task_id: str, run_id: Optional[int]) -> None:
++    """Queue the lease release for ``run_id``, which the holder's transition just ended in this txn."""
++    from hermes_cli import kanban_db_sync as sync
++    if run_id is None or sync.board_mode(conn) != "primary":
++        return
++    uid = sync.run_uid(conn, run_id)
++    if uid is None:
++        return
++    if getattr(conn, "in_transaction", False):
++        _PENDING.setdefault(id(conn), []).append((task_id, uid))
++    else:
++        _release(conn, task_id, uid)
++
++
++def flush(conn: sqlite3.Connection, *, committed: bool) -> None:
++    """``write_txn`` after COMMIT (``committed``) or rollback (drops the queue)."""
++    pending = _PENDING.pop(id(conn), None) if _PENDING else None
++    if not committed or not pending:
++        return
++    for task_id, uid in pending:
++        _release(conn, task_id, uid)
++
++
++def _release(conn: sqlite3.Connection, task_id: str, uid: str) -> None:
++    from hermes_cli import kanban_db_sync as sync
++    try:
++        row = conn.execute("SELECT ended_at FROM task_runs WHERE uid = ?", (uid,)).fetchone()
++        if row is None or row[0] is None:
++            return  # the end did not commit (a rolled-back savepoint): the run still holds its lease
++        if not outbox_stalled(conn):
++            return  # the row push ends the lease on the Board, with no window where the card reads ready
++        _log.info("kanban sync: outbox stalled; releasing the Board lease of %s run %s at its end", task_id, uid)
++        sync.release_lease(conn, task_id, uid)
++    except Exception as exc:  # health: allow BLE001 -- best-effort: the lease expires on the server instead
++        _log.warning("kanban sync: lease release for %s run %s failed (%s: %s); it expires on the server",
++                     task_id, uid, type(exc).__name__, exc)
+diff --git a/tests/hermes_cli/test_kanban_run_end_lease.py b/tests/hermes_cli/test_kanban_run_end_lease.py
+new file mode 100644
+index 0000000000..38ddf0c9f0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_run_end_lease.py
+@@ -0,0 +1,129 @@
++"""A run the holder ends itself frees its Board lease while this host's push loop is down. [daveey]
++
++t_01a1d05e8be13a6a (laptop-1 2026-11-13): with sync down on SchemaAhead, two runs that parked
++normally kept their Board lease (only the pushed ``scheduled`` row frees it, and it never left the
++outbox); at expiry the Board reaped each as a crash (``stale_lease=macbook``) and the second tripped
++the retry breaker. The Board service is a stub (kanban_sync_support.FakeLeaseClient).
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from tests.hermes_cli import kanban_sync_support as support
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def lease_client():
++    yield from support.lease_client()
++
++
++@pytest.fixture
++def synced_conn(kanban_home):
++    yield from support.synced_conn(kanban_home)
++
++
++@pytest.fixture
++def primary(synced_conn):
++    sync.set_mode(synced_conn, "primary")
++    return synced_conn
++
++
++def _claimed(conn, lease_client, title="parks"):
++    tid = kb.create_task(conn, title=title, assignee="worker")
++    assert kb.claim_task(conn, tid) is not None
++    run_uid = lease_client.calls[-1][1]["run_uid"]
++    assert lease_client.calls[-1][0] == "acquire"
++    return tid, run_uid
++
++
++def _stall_outbox(conn):
++    """The push loop is down: everything queued so far has sat in the outbox for ten minutes."""
++    conn.execute("UPDATE kanban_sync_outbox SET created_at = created_at - 600000")
++    conn.commit()
++
++
++def _releases(lease_client):
++    return [req for kind, req in lease_client.calls if kind == "release"]
++
++
++def test_schedule_releases_the_run_lease_while_the_outbox_is_stalled(primary, lease_client):
++    tid, run_uid = _claimed(primary, lease_client)
++    _stall_outbox(primary)
++    assert kb.schedule_task(primary, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z", clock_only=True)
++    [req] = _releases(lease_client)
++    assert req["task_uid"] == tid and req["run_uid"] == run_uid
++
++
++@pytest.mark.parametrize("end", ["block", "complete", "review", "continue"])
++def test_block_complete_review_and_continue_release_the_run_lease(primary, lease_client, end):
++    tid, run_uid = _claimed(primary, lease_client)
++    _stall_outbox(primary)
++    if end == "block":
++        assert kb.block_task(primary, tid, reason="needs an answer", kind="time", clock_only=True)
++    elif end == "complete":
++        assert kb.complete_task(primary, tid, summary="done")
++    elif end == "review":
++        assert kb.request_review(primary, tid, summary="please review")
++    else:
++        from hermes_cli import kanban_continuation
++        assert kanban_continuation.continue_task(primary, tid, checkpoint="halfway")["ok"]
++    assert [r["run_uid"] for r in _releases(lease_client)] == [run_uid]
++
++
++@pytest.mark.parametrize("error", [sync.LeaseUnavailable("connection refused"), RuntimeError("bad answer")])
++def test_a_failed_release_leaves_the_park_intact(primary, lease_client, monkeypatch, error):
++    tid, run_uid = _claimed(primary, lease_client)
++    _stall_outbox(primary)
++
++    def release(**kw):
++        lease_client.calls.append(("release", kw))
++        raise error
++
++    monkeypatch.setattr(lease_client, "release", release)
++    assert kb.schedule_task(primary, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z", clock_only=True)
++    assert [r["run_uid"] for r in _releases(lease_client)] == [run_uid]
++    task = kb.get_task(primary, tid)
++    assert task.status == "scheduled"
++    run = primary.execute("SELECT outcome, ended_at FROM task_runs WHERE uid = ?", (run_uid,)).fetchone()
++    assert run["outcome"] == "scheduled" and run["ended_at"] is not None
++
++
++def test_a_draining_outbox_leaves_the_release_to_the_row_push(primary, lease_client):
++    """Board releaseTask turns a card it still sees running back to ready: on a healthy host the pushed
++    row ends the lease itself, so a direct release would only open a window for another machine's claim."""
++    tid, _run_uid = _claimed(primary, lease_client)
++    assert kb.schedule_task(primary, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z", clock_only=True)
++    assert _releases(lease_client) == []
++
++
++def test_a_crash_end_does_not_send_a_neutral_release(primary, lease_client):
++    """Crash accounting releases with its own outcome; a neutral release sent first would hide the charge."""
++    tid, _run_uid = _claimed(primary, lease_client)
++    _stall_outbox(primary)
++    with kb.write_txn(primary):
++        kb._end_run(primary, tid, outcome="crashed")
++    assert _releases(lease_client) == []
++
++
++def test_a_rolled_back_end_keeps_the_lease(primary, lease_client):
++    tid, _run_uid = _claimed(primary, lease_client)
++    _stall_outbox(primary)
++    with pytest.raises(RuntimeError):
++        with kb.write_txn(primary):
++            run_id = kb._end_or_synthesize_run(primary, tid, outcome="scheduled", status="scheduled",
++                                               synthesize=False)
++            assert run_id is not None
++            raise RuntimeError("abort")
++    assert _releases(lease_client) == []
++    # The next txn on the same connection does not inherit the dropped queue.
++    with kb.write_txn(primary):
++        primary.execute("SELECT 1")
++    assert _releases(lease_client) == []
+-- 
+2.51.0
+

@@ -1,0 +1,95 @@
+From edc82b24f1232ef1b42ed5abc9bf0731020bdc6d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:28:19 +0000
+Subject: [PATCH] [daveey] fix(kanban): remember uncoded persistent 4xx/501
+ self-check repin refusals
+
+A Board or proxy without the repin route answers an uncoded 404/405 HTML
+body (or a 501) every tick. _remember_selfcheck_refusal only recorded coded
+4xx, so such a card re-asked the repin forever and never fell back to the
+reserve. Any 4xx except 408/425/429, coded or not, and a 501 now count as
+a refusal at that revision (not_claimable keeps its own backoff); other 5xx
+and 408/425/429 stay transient. Also fix the stale _selfcheck_refused
+comment. Follow-up to PR #1973 review nits.
+---
+ hermes_cli/kanban_worker_placement.py         | 15 ++++++-----
+ .../test_kanban_pool_deny_runs_on.py          | 27 +++++++++++++++++++
+ 2 files changed, 36 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 04ec7352b4..305310a30a 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -17,11 +17,13 @@ DISPATCH_NETWORK_BUDGET_S = 2.0
+ # Re-asking at the same revision every dispatcher tick only repeats the refusal; wait for a new revision instead.
+ NOT_CLAIMABLE_BACKOFF_S = 600.0
+ _refused: dict[tuple[str, str], tuple[int, float]] = {}  # (board, task) -> (refused revision, retry after)
+-# (board, task) -> revision at which the Board refused the worker-first self-check's repin (any code but
+-# not_claimable, which _refused covers). While the card stays at that revision it goes back to the reserve rather
++# (board, task) -> revision at which the Board refused the worker-first self-check's repin: any 4xx but
++# 408/425/429, coded or not, and a 501; except not_claimable, which _refused covers. Other 5xx and 408/425/429 are
++# outages, retried next tick. While the card stays at that revision it goes back to the reserve rather
+ # than re-asking a repin the Board already refused; a new revision asks again. Explicit kanban_move repins never
+ # fall back: a reserve would hand the run's move straight back to the pool.
+ _selfcheck_refused: dict[tuple[str, str], int] = {}
++_RETRYABLE_4XX = frozenset({408, 425, 429})  # request timeout, too early, rate limited: not the Board's answer
+ # No assigned keepalive exists here. Sixty seconds bounds queue probes while still discovering
+ # registry-only capacity changes without waiting for a task revision. Assigned renewals are unchanged.
+ RESERVE_KEEPALIVE_S = 60.0
+@@ -530,10 +532,11 @@ def _selfcheck_unrefused(key, row, labels, why):
+ def _remember_selfcheck_refusal(key, revision, why, exc):
+     """Record a Board refusal of a self-check repin (``not_claimable`` is :data:`_refused`'s backoff instead).
+ 
+-    Only a coded 4xx is the Board's answer: a 5xx/429 (an outage) or an uncoded body is retried on the next tick."""
+-    status, code = getattr(exc, "status", None), rejection_code(exc)
+-    transient = type(status) is not int or not 400 <= status <= 499 or status == 429
+-    if why is None or transient or code in (None, "not_claimable"):
++    Any 4xx but 408/425/429, coded or not (a Board or proxy without the repin route answers an uncoded 404/405 HTML
++    body every tick), and a 501 are persistent. Other 5xx and 408/425/429 are outages, retried on the next tick."""
++    status = getattr(exc, "status", None)
++    persistent = type(status) is int and (400 <= status <= 499 or status == 501) and status not in _RETRYABLE_4XX
++    if why is None or not persistent or rejection_code(exc) == "not_claimable":
+         return
+     _selfcheck_refused[key] = revision  # popped by _selfcheck_unrefused first, so this is the newest entry
+     if len(_selfcheck_refused) > 1024:  # cards that left the query never come back to clear theirs
+diff --git a/tests/hermes_cli/test_kanban_pool_deny_runs_on.py b/tests/hermes_cli/test_kanban_pool_deny_runs_on.py
+index e50345a0e7..591666b897 100644
+--- a/tests/hermes_cli/test_kanban_pool_deny_runs_on.py
++++ b/tests/hermes_cli/test_kanban_pool_deny_runs_on.py
+@@ -260,6 +260,33 @@ def test_a_transient_board_error_on_a_self_check_repin_is_retried_next_tick(hub,
+     assert board.reserves == [] and not wp._selfcheck_refused
+ 
+ 
++@pytest.mark.parametrize("status,body", [(404, "<html><body>404 Not Found</body></html>"),
++                                         (405, "Method Not Allowed"), (501, "<html>Not Implemented</html>"),
++                                         (400, "Bad Request")])
++def test_an_uncoded_persistent_refusal_of_a_self_check_repin_reserves(hub, no_pull, status, body):
++    """A Board or proxy without the repin route answers an uncoded 404/405/501 every tick: that is a persistent
++    refusal, so the card goes back to the reserve at that revision instead of re-asking the repin forever."""
++    _home, conn = hub
++    tid = _stranded(conn, age=36 * 60)
++    board = RecordingHub(refuse_repin="missing", refuse_status=status, refuse_detail=body)
++    for _ in range(2):
++        wp.reevaluate(conn, board, BOARD, ME, cfg=CFG)
++    assert len(board.repins) == 1, "the refused self-check repin was re-asked at the same revision"
++    assert [(r["task_id"], r["expected_revision"]) for r in board.reserves] == [(tid, 4)]
++    assert wp._selfcheck_refused == {(BOARD, tid): 4}
++
++
++@pytest.mark.parametrize("status", [408, 425])
++def test_an_uncoded_retryable_4xx_on_a_self_check_repin_is_retried(hub, no_pull, status):
++    _home, conn = hub
++    tid = _stranded(conn, age=36 * 60)
++    board = RecordingHub(refuse_repin="transient", refuse_status=status, refuse_detail="try again")
++    for _ in range(2):
++        wp.reevaluate(conn, board, BOARD, ME, cfg=CFG)
++    assert [(r["task_id"], r["expected_revision"]) for r in board.repins] == [(tid, 4)] * 2
++    assert board.reserves == [] and not wp._selfcheck_refused
++
++
+ def test_a_forbidden_self_check_repin_still_reserves_at_the_refused_revision(hub, no_pull):
+     _home, conn = hub
+     tid = _stranded(conn, age=36 * 60)
+-- 
+2.51.0
+

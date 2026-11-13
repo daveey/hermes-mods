@@ -1,0 +1,437 @@
+From 4cfe61445dc16cec6371d12f3090f49e5e33502d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 22:05:49 +0000
+Subject: [PATCH] fix(notices): single-flight replica snapshots outside
+ publication lock [daveey]
+
+---
+ .../test_kanban_observation_singleflight.py   | 186 ++++++++++++++++++
+ tui_gateway/kanban_remote_notices.py          |   7 +-
+ tui_gateway/kanban_remote_observations.py     | 119 +++++++----
+ 3 files changed, 271 insertions(+), 41 deletions(-)
+ create mode 100644 tests/tui_gateway/test_kanban_observation_singleflight.py
+
+diff --git a/tests/tui_gateway/test_kanban_observation_singleflight.py b/tests/tui_gateway/test_kanban_observation_singleflight.py
+new file mode 100644
+index 0000000000..e37921954f
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_observation_singleflight.py
+@@ -0,0 +1,186 @@
++"""Count snapshot work under overlapping notice polls, not machine-dependent time."""
++from concurrent.futures import ThreadPoolExecutor
++import math
++import threading
++
++import sqlite3
++import json
++import pytest
++
++from tests.tui_gateway.test_kanban_remote_arrival import CHAT, _card
++from tests.tui_gateway.test_kanban_remote_observations_lock import NOW, _move, _world
++from tui_gateway import kanban_remote_notices as krn
++from tui_gateway import kanban_remote_observations as obs
++
++# Folded capture has no thread IDs. 992.15 poller thread-seconds / 83 sampled
++# seconds gives 12 concurrent-equivalent callers, not an exact thread census.
++CALLERS = math.ceil(992.15 / 83.0)
++
++
++class OwnedLock:
++    def __init__(self):
++        self.lock = threading.Lock()
++        self.owner = None
++
++    def __enter__(self):
++        self.lock.acquire()
++        self.owner = threading.get_ident()
++        return self
++
++    def __exit__(self, *args):
++        self.owner = None
++        self.lock.release()
++
++    def locked(self):
++        return self.lock.locked()
++
++    def owned(self):
++        return self.owner == threading.get_ident()
++
++
++def test_concurrent_snapshot_is_singleflight_outside_publication_lock(tmp_path, monkeypatch):
++    replica, ledger, _ = _world(tmp_path)
++    lock = OwnedLock()
++    monkeypatch.setattr(obs, "_lock", lock)
++    snapshots, statements = [], []
++    real_snapshot, real_ro, real_persist = obs._snapshot, krn._ro, obs._persist
++    start = threading.Barrier(CALLERS)
++    # No memo can be published until every caller has obtained its snapshot.
++    persist = threading.Barrier(CALLERS)
++
++    def snapshot(*args):
++        snapshots.append(lock.owned())
++        return real_snapshot(*args)
++
++    def ro(path):
++        conn = real_ro(path)
++        conn.set_trace_callback(lambda sql: statements.append((sql, lock.owned())))
++        return conn
++
++    def save(*args):
++        persist.wait(timeout=20)
++        return real_persist(*args)
++
++    def poll(_):
++        start.wait(timeout=20)
++        return obs.observe(replica, ledger, NOW)
++
++    monkeypatch.setattr(obs, "_snapshot", snapshot)
++    monkeypatch.setattr(krn, "_ro", ro)
++    monkeypatch.setattr(obs, "_persist", save)
++    with ThreadPoolExecutor(max_workers=CALLERS) as pool:
++        results = list(pool.map(poll, range(CALLERS)))
++    assert len(results[0]) == 20 and all(result == results[0] for result in results)
++    assert statements
++    assert sum(held for _, held in statements) == 0
++    assert snapshots == [False]
++
++
++def test_shared_snapshot_matches_uncached_path_across_changes(tmp_path, monkeypatch):
++    replica, ledger, cards = _world(tmp_path)
++    oracle_ledger = tmp_path / "oracle.db"
++    second_ledger = tmp_path / "second.db"
++    snapshots = []
++    original = obs._snapshot
++
++    def counted(*args):
++        snapshots.append(args[0])
++        return original(*args)
++
++    monkeypatch.setattr(obs, "_snapshot", counted)
++    for step in range(4):
++        if step == 1:
++            card = _card("t_insert", CHAT, status="done", at=NOW + 1)
++            with sqlite3.connect(replica) as conn:
++                conn.execute("INSERT INTO replica VALUES ('hub','tasks',?,?,100)",
++                             (card["key"], json.dumps(card["task"])))
++        if step == 2:
++            _move(replica, cards[0], "blocked", NOW + 2)
++        if step == 3:
++            with sqlite3.connect(replica) as conn:
++                conn.execute("UPDATE replica SET data='broken json', seq=seq+1000 WHERE key=?",
++                             (cards[1]["key"],))
++        now = NOW + step
++        ready, raw, _ = original(replica, None, {})
++        assert ready
++        expected = obs._persist(str(replica.resolve()), raw, oracle_ledger, now)
++        assert obs.observe(replica, ledger, now) == expected
++        assert obs.observe(replica, second_ledger, now) == expected
++        assert len(snapshots) == step + 1
++
++
++def test_slow_replica_does_not_hold_publication_or_other_replica(tmp_path, monkeypatch):
++    (tmp_path / "slow").mkdir()
++    (tmp_path / "other").mkdir()
++    replica, ledger, _ = _world(tmp_path / "slow")
++    other, other_ledger, _ = _world(tmp_path / "other")
++    entered, release = threading.Event(), threading.Event()
++    original = obs._snapshot
++
++    def held(path, *args):
++        if path == replica:
++            entered.set()
++            assert release.wait(20)
++        return original(path, *args)
++
++    monkeypatch.setattr(obs, "_snapshot", held)
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        slow = pool.submit(obs.observe, replica, ledger, NOW)
++        try:
++            assert entered.wait(20)
++            assert obs._lock.acquire(timeout=5)
++            obs._lock.release()
++            assert len(pool.submit(obs.observe, other, other_ledger, NOW).result(20)) == 20
++        finally:
++            release.set()
++        assert len(slow.result(20)) == 20
++
++
++def test_real_newer_snapshot_wins_over_delayed_ledger_write(tmp_path, monkeypatch):
++    replica, ledger, cards = _world(tmp_path)
++    entered, release = threading.Event(), threading.Event()
++    original = obs._persist
++
++    def delayed(source, rows, ledger_, now):
++        if now == NOW:
++            entered.set()
++            assert release.wait(20)
++        return original(source, rows, ledger_, now)
++
++    monkeypatch.setattr(obs, "_persist", delayed)
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        old = pool.submit(obs.observe, replica, ledger, NOW)
++        try:
++            assert entered.wait(20)
++            _move(replica, cards[0], "blocked", NOW + 1)
++            newer = obs.observe(replica, ledger, NOW + 2)
++        finally:
++            release.set()
++        assert old.result(20) != newer
++    assert obs.observe(replica, ledger, NOW + 3) == newer
++    assert next(iter(obs._memo.values()))[1] == newer
++
++
++def test_failed_snapshot_releases_lane_and_retries(tmp_path, monkeypatch):
++    replica, ledger, _ = _world(tmp_path)
++    original = obs._snapshot
++
++    def failed(*args):
++        raise sqlite3.OperationalError("controlled failure")
++
++    monkeypatch.setattr(obs, "_snapshot", failed)
++    with pytest.raises(sqlite3.OperationalError, match="controlled failure"):
++        obs.observe(replica, ledger, NOW)
++    monkeypatch.setattr(obs, "_snapshot", original)
++    assert len(obs.observe(replica, ledger, NOW)) == 20
++
++
++def test_idle_lane_bound_retains_active_lane_identity():
++    krn._reset_for_tests()
++    active = obs._replica_flight("active")
++    for i in range(20):
++        obs._replica_flight(str(i))
++    assert len(obs._retained) == 16
++    assert "active" not in obs._retained
++    assert obs._replica_flight("active") is active
++    assert len(obs._flights) == 16
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 0c814e17e9..bc80a76796 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -760,7 +760,8 @@ def _record_swept(keys: list[tuple], ledger: Optional[Path], *, reason: str) ->
+ 
+ def _reset_for_tests() -> None:
+     """Forget this process's memos, as a restarted backend would (the ledger file stays)."""
+-    from tui_gateway.kanban_remote_observations import _decoded, _decoded_files, _generation, _known, _memo
++    from tui_gateway.kanban_remote_observations import _decoded, _generation, _known, _memo
++    from tui_gateway.kanban_remote_observations import _flights, _retained
+     from tui_gateway.kanban_replica_observer import reset as reset_observers
+     from tui_gateway.remote_sweep_projection import reset as reset_projection
+ 
+@@ -774,7 +775,9 @@ def _reset_for_tests() -> None:
+     _known.clear()
+     _generation.clear()
+     _decoded.clear()
+-    _decoded_files.clear()
++
++    _flights.clear()
++    _retained.clear()
+     _index_memo = None
+     _delivered.clear()
+     _swept_loaded.clear()
+diff --git a/tui_gateway/kanban_remote_observations.py b/tui_gateway/kanban_remote_observations.py
+index 28cdd2e342..c7edbe0ec4 100644
+--- a/tui_gateway/kanban_remote_observations.py
++++ b/tui_gateway/kanban_remote_observations.py
+@@ -4,7 +4,9 @@ from __future__ import annotations
+ import contextlib
+ import json
+ import threading
++from collections import OrderedDict
+ from pathlib import Path
++from weakref import WeakValueDictionary
+ from hermes_cli.kanban_withdrawal_notice import envelope as _withdrawal
+ from tui_gateway.kanban_remote_notice_state import state as _notice_state
+ 
+@@ -13,7 +15,7 @@ _memo: dict[tuple, tuple] = {}
+ _generation: dict[tuple, int] = {}  # observe key -> ledger writes started, so only the newest publishes its memo
+ 
+ 
+-def _snapshot(replica: Path, previous=None) -> tuple[bool, list[tuple] | None, tuple | None]:
++def _snapshot(replica: Path, previous=None, decoded=None) -> tuple[bool, list[tuple] | None, tuple | None]:
+     """Read readiness and ALL canonical terminal states from the same SQLite snapshot.
+ 
+     The hub client sets gateway before pulling and commits each feed page. Until
+@@ -48,7 +50,7 @@ def _snapshot(replica: Path, previous=None) -> tuple[bool, list[tuple] | None, t
+                     if isinstance(task, dict) and (task.get("status") in _TERMINAL or _withdrawal(task) is not None):
+                         cards.append((owner, key, task))
+             return ready, cards, signature
+-        cards = _changed_rows_cards(conn, replica, meta.get("gateway"))
++        cards = _changed_rows_cards(conn, replica, meta.get("gateway"), decoded)
+     return ready, cards, signature
+ 
+ 
+@@ -57,7 +59,7 @@ def _snapshot(replica: Path, previous=None) -> tuple[bool, list[tuple] | None, t
+ # so decoding every row per change kept the notice pollers busy while Desktop sat idle. A row
+ # is re-read only when its seq moved; the summary keeps just the fields _persist reads.
+ _decoded: dict[tuple, tuple] = {}
+-_decoded_files: dict[str, tuple | None] = {}  # replica -> file identity its _decoded rows came from
++
+ 
+ 
+ def _summary(task) -> dict | None:
+@@ -86,11 +88,12 @@ def _terminal_states():
+     return _TERMINAL
+ 
+ 
+-def _changed_rows_cards(conn, replica: Path, me) -> list[tuple]:
++def _changed_rows_cards(conn, replica: Path, me, decoded=None) -> list[tuple]:
+     from tui_gateway.kanban_remote_notices import _canonical
+ 
+-    # One SQLite result row avoids a GIL reacquisition per task while observe's
+-    # shared lock is held; payload point reads remain proportional to changes.
++    decoded = _decoded if decoded is None else decoded
++    # One SQLite result row avoids a GIL reacquisition per task;
++    # payload point reads remain proportional to changes.
+     sql = "SELECT json_group_array(json_array(gw, key, seq, NULL)) FROM replica WHERE coll = 'tasks'"
+     row = conn.execute(sql + " AND gw != ?", (me,)).fetchone() if me else conn.execute(sql).fetchone()
+     rows = _canonical([tuple(item) for item in json.loads(row[0])])
+@@ -100,18 +103,18 @@ def _changed_rows_cards(conn, replica: Path, me) -> list[tuple]:
+     for owner, key, seq, _ in rows:
+         ident = (tag, owner, key)
+         seen.add(ident)
+-        hit = _decoded.get(ident)
++        hit = decoded.get(ident)
+         if hit is None or hit[0] != seq:
+             raw = conn.execute("SELECT data FROM replica WHERE gw = ? AND coll = 'tasks' AND key = ?",
+                                (owner, key)).fetchone()
+             summary = None
+             with contextlib.suppress(TypeError, ValueError):
+                 summary = _summary(json.loads(raw[0])) if raw else None
+-            hit = _decoded[ident] = (seq, summary)
++            hit = decoded[ident] = (seq, summary)
+         if hit[1] is not None:
+             cards.append((owner, key, hit[1]))
+-    for ident in [ident for ident in _decoded if ident[0] == tag and ident not in seen]:
+-        del _decoded[ident]
++    for ident in [ident for ident in decoded if ident[0] == tag and ident not in seen]:
++        del decoded[ident]
+     return cards
+ 
+ 
+@@ -197,6 +200,52 @@ def _file_id(path: Path) -> tuple | None:
+         return None
+ 
+ 
++class _ReplicaFlight:
++    def __init__(self):
++        self.lock = threading.Lock()
++        self.decoded = {}
++        self.result = None
++
++    def read(self, replica, stamp, ident):
++        from tui_gateway.kanban_replica_observer import file_identity, fingerprint
++
++        previous = self.result
++        if previous is not None and stamp is not None and previous[3] == stamp:
++            return previous
++        if ident is None or previous is None or previous[4] != ident:
++            self.decoded.clear()
++            previous = None
++        ready, cards, signature = _snapshot(replica, previous[2] if previous else None, self.decoded)
++        if cards is None:
++            cards = previous[1]
++        after = fingerprint(replica)
++        if stamp is None or after != stamp:
++            stamp = None
++            ident = ident if file_identity(after) == ident else None
++        self.result = (ready, cards, signature, stamp, ident)
++        return self.result
++
++
++# Active callers retain their lane even when its idle-cache slot is evicted.
++# Weak indexing prevents a second lane for that replica until all borrowers finish.
++_flights: WeakValueDictionary = WeakValueDictionary()
++_retained: OrderedDict = OrderedDict()
++
++
++def _replica_flight(tag):
++    evicted = []  # Drop large decoded maps only after releasing the publication lock.
++    with _lock:
++        flight = _flights.get(tag)
++        if flight is None:
++            flight = _ReplicaFlight()
++            _flights[tag] = flight
++        _retained[tag] = flight
++        _retained.move_to_end(tag)
++        while len(_retained) > 16:
++            evicted.append(_retained.popitem(last=False))
++    return flight
++
++
+ def observe(replica: Path, ledger, now: float) -> dict[tuple, float | None]:
+     """Only changed replica snapshots decode cards and touch the observation ledger.
+ 
+@@ -211,40 +260,37 @@ def observe(replica: Path, ledger, now: float) -> dict[tuple, float | None]:
+ 
+     ledger = Path(ledger) if ledger is not None else ledger_path()
+     key = (str(replica.resolve()), str(ledger.resolve()))
+-    tag = str(replica)
+-    with _lock:
++    flight = _replica_flight(key[0])
++    # Wait/read/decode on this replica's lane, never on the publication lock.
++    # Keep the lane through generation assignment so snapshot order is preserved.
++    with flight.lock:
+         stamp = fingerprint(replica)
+         ident = file_identity(stamp)
+-        cached = _memo.get(key)  # (signature, fresh, ledger id, key or None, replica file identity)
+-        if cached is not None and (cached[2] != _file_id(ledger) or cached[4] != ident):
+-            _memo.pop(key)  # a replaced ledger, or a replaced/recreated/unreadable replica
+-            cached = None
+-        if cached is not None and stamp is not None and cached[3] == stamp:
+-            return cached[1]
+-        if ident is None or _decoded_files.pop(tag, None) != ident:
+-            _forget_decoded(tag)  # another db file may reuse a key at an equal seq with other contents
+-        ready, cards, signature = _snapshot(replica, cached[0] if cached else None)
+-        after = fingerprint(replica)
+-        if stamp is None or after != stamp:
+-            stamp = None  # a commit raced the read: keep nothing that would skip the next poll
+-            ident = ident if file_identity(after) == ident else None
+-        _decoded_files[tag] = ident
+-        while len(_decoded_files) > 16:
+-            _forget_decoded(next(iter(_decoded_files)))
++        ledger_id = _file_id(ledger)
++        with _lock:
++            cached = _memo.get(key)
++            if cached is not None and (cached[2] != ledger_id or cached[4] != ident):
++                _memo.pop(key)
++                cached = None
++            if cached is not None and stamp is not None and cached[3] == stamp:
++                return cached[1]
++        ready, cards, signature, stamp, ident = flight.read(replica, stamp, ident)
+         if not ready:
+             return {}
+-        if cards is None and cached is not None:
+-            fresh = cached[1]
+-            _remember(key, (signature, fresh, _file_id(ledger), stamp, ident))
+-            return fresh
+-        _generation[key] = generation = _generation.get(key, 0) + 1
++        with _lock:
++            if cached is not None and signature is not None and signature == cached[0]:
++                fresh = cached[1]
++                _remember(key, (signature, fresh, ledger_id, stamp, ident))
++                return fresh
++            _generation[key] = generation = _generation.get(key, 0) + 1
+     # [daveey] The ledger write runs without ``_lock``: holding it there kept every notice poller waiting on one
+     # poller's transaction. ``cards`` is this call's own snapshot, so the answer is the one it would have had under
+     # the lock; only the newest snapshot started for ``key`` publishes its memo, and only after its commit.
+     fresh = _persist(key[0], cards or [], ledger, now)
++    ledger_id = _file_id(ledger)
+     with _lock:
+         if _generation.get(key) == generation:
+-            _remember(key, (signature, fresh, _file_id(ledger), stamp, ident))
++            _remember(key, (signature, fresh, ledger_id, stamp, ident))
+         return fresh
+ 
+ 
+@@ -257,8 +303,3 @@ def _remember(key: tuple, entry: tuple) -> None:
+     while len(_memo) > 16:
+         _memo.pop(next(iter(_memo)))
+ 
+-
+-def _forget_decoded(tag: str) -> None:
+-    _decoded_files.pop(tag, None)
+-    for ident in [ident for ident in _decoded if ident[0] == tag]:
+-        del _decoded[ident]
+-- 
+2.51.0
+

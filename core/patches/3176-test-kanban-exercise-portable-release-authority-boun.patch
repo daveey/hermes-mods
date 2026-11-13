@@ -1,0 +1,197 @@
+From 34330fcce34b2415c996ef6c22833add64edb0f7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 22:33:44 +0000
+Subject: [PATCH] test(kanban): exercise portable release authority boundaries
+ [daveey]
+
+---
+ ...test_kanban_observed_pr_hold_boundaries.py |  57 +++++++++
+ .../test_kanban_review_release_boundaries.py  | 112 ++++++++++++++++++
+ 2 files changed, 169 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_observed_pr_hold_boundaries.py
+ create mode 100644 tests/hermes_cli/test_kanban_review_release_boundaries.py
+
+diff --git a/tests/hermes_cli/test_kanban_observed_pr_hold_boundaries.py b/tests/hermes_cli/test_kanban_observed_pr_hold_boundaries.py
+new file mode 100644
+index 0000000000..d5608c7f5c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_observed_pr_hold_boundaries.py
+@@ -0,0 +1,57 @@
++"""Ready-episode identity fences for imported dispatcher observations."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_dependency_history as history
++from hermes_cli import kanban_observed_pr_hold as observed
++
++
++@pytest.fixture
++def stores():
++    connections = [sqlite3.connect(":memory:") for _ in range(2)]
++    for conn in connections:
++        conn.row_factory = sqlite3.Row
++        conn.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, "
++                     "kind TEXT, created_at TEXT, payload TEXT, uid TEXT)")
++        conn.execute("INSERT INTO task_events VALUES (1,'task','promoted',"
++                     "'2026-01-01T00:00:00Z','{}','ready-episode')")
++    yield connections
++    for conn in connections:
++        conn.close()
++
++
++@pytest.mark.parametrize("case", ["matching", "different", "missing_uid", "no_hold", "consumed", "invalid_clock"])
++def test_fresh_replica_must_match_home_episode(stores, monkeypatch, case):
++    home, replica = stores
++    if case != "no_hold":
++        replica.execute("INSERT INTO task_events VALUES (2,'task','respawn_guarded',"
++                        "'2026-01-01T00:00:01Z','{\"reason\":\"active_pr\"}','hold')")
++    mutations = {
++        "different": (replica, "UPDATE task_events SET uid='other-episode' WHERE id=1"),
++        "missing_uid": (home, "UPDATE task_events SET uid=NULL WHERE id=1"),
++        "consumed": (replica, "INSERT INTO task_events VALUES (3,'task','claimed',"
++                     "'2026-01-01T00:00:02Z','{}','claim')"),
++        "invalid_clock": (replica, "UPDATE task_events SET created_at='invalid' WHERE id=2"),
++    }
++    target, sql = mutations.get(case, (replica, "SELECT 1"))
++    target.execute(sql)
++    monkeypatch.setattr(history, "_with_fresh_replica", lambda conn, since, read, fallback: read(replica))
++    assert observed.observed(home, "task") is (case == "matching")
++
++
++@pytest.mark.parametrize("case", ["no_boundary", "bad_clock", "diagnostic", "wrong_reason", "before_boundary"])
++def test_local_observation_requires_ready_boundary(stores, monkeypatch, case):
++    home, _ = stores
++    home.execute("INSERT INTO task_events VALUES (2,'task','respawn_guarded',"
++                 "'2026-01-01T00:00:01Z','{\"reason\":\"active_pr\"}','hold')")
++    mutations = {
++        "no_boundary": "DELETE FROM task_events WHERE id=1",
++        "bad_clock": "UPDATE task_events SET created_at='invalid' WHERE id=2",
++        "diagnostic": "UPDATE task_events SET kind='commented' WHERE id=2",
++        "wrong_reason": "UPDATE task_events SET payload='{\"reason\":\"other\"}' WHERE id=2",
++        "before_boundary": "UPDATE task_events SET created_at='2025-01-01T00:00:00Z' WHERE id=2",
++    }
++    home.execute(mutations[case])
++    monkeypatch.setattr(history, "_with_fresh_replica", lambda *args: False)
++    assert not observed.observed(home, "task")
+diff --git a/tests/hermes_cli/test_kanban_review_release_boundaries.py b/tests/hermes_cli/test_kanban_review_release_boundaries.py
+new file mode 100644
+index 0000000000..d68be0c7ea
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_review_release_boundaries.py
+@@ -0,0 +1,112 @@
++"""Receipt field boundaries independently reject malformed continuation grants."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_review_release as release
++from tests.hermes_cli import test_kanban_dependency_review as helpers
++
++board = helpers.board
++PR = helpers.PR
++
++
++@pytest.mark.parametrize("section,key,value", [
++    ("stamp", "version", 2),
++    ("stamp", "scope", "forever"),
++    ("stamp", "merge_authorized", True),
++    ("stamp", "checkpoint", {}),
++    ("stamp", "discharged", {PR: True}),
++    ("stamp", "discharged", [123]),
++    ("stamp", "discharged", [PR + "9"]),
++    ("stamp", "reviews", {}),
++    ("stamp", "reviews", [None]),
++    ("proof", "metadata", []),
++    ("proof", "head", 123),
++    ("proof", "head", "short"),
++    ("proof", "parent", "other-parent"),
++    ("proof", "prs", {PR: True}),
++    ("proof", "prs", [123]),
++    ("proof", "prs", [PR + "9"]),
++    ("proof", "result", {"run_uid": "other-result"}),
++])
++def test_corrupt_receipt_is_not_authority(board, section, key, value):
++    task, reviews = helpers.parked(board)
++    helpers.finish_reviews(board, reviews)
++    assert release.released(board, task, {PR})
++    event = board.execute("SELECT id,payload FROM task_events WHERE task_id=? "
++                          "AND kind='promoted' ORDER BY id DESC LIMIT 1", (task,)).fetchone()
++    payload = json.loads(event["payload"])
++    stamp = payload["review_release"]
++    # Retain one proof so a later redundant proof cannot mask a malformed one.
++    stamp["reviews"] = stamp["reviews"][:1]
++    target = stamp if section == "stamp" else stamp["reviews"][0]
++    target[key] = value
++    board.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), event["id"]))
++    board.commit()
++    assert not release.released(board, task, {PR}), (section, key, value)
++
++
++@pytest.mark.parametrize("defect", ["reopened", "origin", "old_promotion", "new_pr", "no_promotion"])
++def test_lifecycle_and_scope_boundaries(board, defect):
++    task, reviews = helpers.parked(board)
++    helpers.finish_reviews(board, reviews)
++    assert release.released(board, task, {PR})
++    urls = {PR, PR + "9"} if defect == "new_pr" else {PR}
++    board.execute("ALTER TABLE tasks ADD COLUMN created_on TEXT")
++    board.execute("UPDATE tasks SET created_on='home' WHERE id=?", (task,))
++    mutations = {
++        "reopened": ("UPDATE tasks SET status='todo' WHERE id=?", reviews[0]),
++        "origin": ("UPDATE task_events SET origin_gateway='foreign' WHERE task_id=? AND kind='promoted'", task),
++        "old_promotion": ("UPDATE task_events SET created_at='2000-01-01T00:00:00Z' WHERE task_id=? AND kind='promoted'", task),
++        "no_promotion": ("DELETE FROM task_events WHERE task_id=? AND kind='promoted'", task),
++        "new_pr": ("SELECT ?", task),
++    }
++    sql, target = mutations[defect]
++    board.execute(sql, (target,))
++    board.commit()
++    assert not release.released(board, task, urls)
++
++
++@pytest.mark.parametrize("fence", ["foreign", "pending", "unauthenticated"])
++def test_prepare_never_evaluates_ineligible_owner(board, monkeypatch, fence):
++    from hermes_cli import kanban_wake_check
++    task, reviews = helpers.parked(board, authenticated=fence != "unauthenticated")
++    if fence != "pending":
++        helpers.finish_reviews(board, reviews)
++    board.execute("UPDATE tasks SET status='todo' WHERE id=?", (task,))
++    board.commit()
++    if fence == "foreign":
++        monkeypatch.setattr(kanban_wake_check, "foreign_ids", lambda conn: {task})
++
++    def forbidden(conn, tid):
++        pytest.fail("ineligible owner reached external release evaluation")
++
++    monkeypatch.setattr(release, "_build", forbidden)
++    assert task not in release.prepare(board)
++
++
++def test_promotion_transaction_rechecks_prepared_evidence(board):
++    task, reviews = helpers.parked(board)
++    helpers.finish_reviews(board, reviews)
++    board.execute("UPDATE tasks SET status='todo' WHERE id=?", (task,))
++    board.commit()
++    prepared = release.prepare(board)
++    assert task in prepared
++    assert "review_release" in release.promotion_payload(board, task, "ready", prepared)
++    kb.add_comment(board, task, "reviewer", "Evidence changed during precompute")
++    assert release.promotion_payload(board, task, "ready", prepared) is None
++
++
++@pytest.mark.parametrize("park_delay", [0, 5])
++def test_checkpoint_comment_before_park_releases_partial_replica(board, monkeypatch, park_delay):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    from hermes_cli import kanban_db_dispatch_pr_state as prs
++    task, reviews = helpers.parked(board, park_delay=park_delay)
++    helpers.finish_reviews(board, reviews)
++    assert release.released(board, task, {PR})
++    board.execute("DELETE FROM task_events WHERE task_id IN (?,?)", reviews)
++    board.execute("DELETE FROM task_runs WHERE task_id IN (?,?)", reviews)
++    board.commit()
++    monkeypatch.setattr(prs, "pr_state", lambda _: None)
++    assert dispatch.check_respawn_guard(board, task) is None
+-- 
+2.51.0
+

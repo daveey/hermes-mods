@@ -1,0 +1,250 @@
+From 917f6fd490861f8da9c7ea8556cf70f8214fcb42 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:15:00 +0000
+Subject: [PATCH] [daveey] kanban operator: be/being govern only across
+ adverbs; any spaced or verb-glued hyphen run is a dash; one replica caller
+ check per call
+
+PR #2037 review nits (review 5889053807, card t_01a1d44a80b28f8c):
+
+1. be/being were in _NOT_CLAIM, so they governed from anywhere in the 3-word
+   window: "To be safe I posted the summary to t_X" and "Being thorough I
+   posted to t_X" stopped being claims (an undocumented fail-open). be/being
+   now govern only when nothing but adverbs stands between them and the verb
+   ("to be posted", "to be soon posted", "is being quickly sent"); those two
+   read as claims again. "Queued to be posted", "Queued: to be posted" and
+   "Queued (to be posted" stay non-claims.
+2. A hyphen run of any length that touches a space or the clause edge on
+   either side is a dash boundary: "Not done --- posted", "Not done -posted"
+   and "Not done- posted" are claims. Intra-word hyphens ("re-posted") are
+   unaffected.
+3. apply_incoming runs _caller_replica_refusal once per call and passes it to
+   _home_check and _caller_refusal, instead of repeating the task_runs and
+   claimed-event replica queries. Replica refusal still runs before the
+   deferral.
+4. _home_check's docstring states the bounded cost of a deferral: each tick
+   pages the request tail past a held watermark, and a caller that passes the
+   replica checks but fails Board evidence can hold the watermark up to
+   CREATION_SYNC_GRACE_S.
+
+Proof: RED at 26a1896f38 (7 new cases fail: 6 classifier, 1 replica-once).
+GREEN: 9 operator/consent files, 270 passed. Mutants 11/11 killed.
+---
+ hermes_cli/kanban_operator_call.py            | 35 +++++++++++----
+ hermes_cli/kanban_operator_delivery.py        | 45 +++++++++++++------
+ .../test_kanban_consent_provenance.py         | 24 +++++++++-
+ .../test_kanban_operator_delivery.py          | 15 +++++++
+ 4 files changed, 95 insertions(+), 24 deletions(-)
+
+diff --git a/hermes_cli/kanban_operator_call.py b/hermes_cli/kanban_operator_call.py
+index c7bc399650..316d94a939 100644
+--- a/hermes_cli/kanban_operator_call.py
++++ b/hermes_cli/kanban_operator_call.py
+@@ -567,9 +567,17 @@ def _caller_replica_refusal(rep: sqlite3.Connection, event: dict, payload: dict)
+     return None
+ 
+ 
+-def _caller_refusal(rep: sqlite3.Connection, board: str, event: dict, payload: dict) -> tuple[Optional[str], bool]:
+-    """``(refusal, retry)``: None when the caller is proven; ``retry`` when the Board could not be read."""
+-    refusal = _caller_replica_refusal(rep, event, payload)
++_UNCHECKED = object()
++
++
++def _caller_refusal(rep: sqlite3.Connection, board: str, event: dict, payload: dict,
++                    replica: Any = _UNCHECKED) -> tuple[Optional[str], bool]:
++    """``(refusal, retry)``: None when the caller is proven; ``retry`` when the Board could not be read.
++
++    ``replica`` is ``_caller_replica_refusal``'s result when the caller already ran it (``apply_incoming`` runs it
++    once per call, before the deferral check), so its task_runs and claimed-event queries are not repeated.
++    """
++    refusal = _caller_replica_refusal(rep, event, payload) if replica is _UNCHECKED else replica
+     if refusal is not None:
+         return refusal, False
+     gw, task, at = payload["caller"]["gateway"], payload["caller"]["task_id"], payload["requested_at"]
+@@ -729,13 +737,21 @@ def _incoming(conn: sqlite3.Connection, own: str, raw: Optional[str]) -> Optiona
+     return payload
+ 
+ 
+-def _home_check(rep: sqlite3.Connection, event: dict, payload: dict, target) -> tuple[Optional[str], bool]:
++def _home_check(rep: sqlite3.Connection, payload: dict, target,
++                replica_refusal: Optional[str]) -> tuple[Optional[str], bool]:
+     """``home_refusal`` (unsynced created event: retry, then refuse), only for a caller the replica proves.
+ 
+-    Replica-only caller checks run first: an unproven caller is refused, never deferred, so a forged call (one
+-    with a future requested_at too) cannot pin the watermark and page the whole request tail every tick.
++    ``replica_refusal`` is ``_caller_replica_refusal``'s result for this call, run once by the caller and passed on
++    to ``_caller_refusal``. Replica-only caller checks run first: an unproven caller is refused, never deferred, so
++    a forged call (one with a future requested_at too) cannot pin the watermark and page the whole request tail
++    every tick.
++
++    Cost of a deferral, bounded: while any hold is set, each tick rescans from the held watermark and pages the
++    whole request tail past it (up to MAX_PER_TICK handled calls), and a caller that passes the replica checks but
++    would fail the Board evidence check (``_caller_refusal``) is still deferred first, so it can hold the watermark
++    for up to ``CREATION_SYNC_GRACE_S`` before it is refused.
+     """
+-    if _caller_replica_refusal(rep, event, payload) is not None:
++    if replica_refusal is not None:
+         return None, False  # _caller_refusal refuses it
+     from hermes_cli.kanban_consent import home_refusal
+     return home_refusal(rep, payload, target)
+@@ -778,7 +794,8 @@ def apply_incoming(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+                     hi, stop = eid - 1, True
+                     break
+                 event = {"id": eid, "uid": euid, "task_id": etask}
+-                home = _home_check(rep, event, payload, target)
++                replica = _caller_replica_refusal(rep, event, payload)
++                home = _home_check(rep, payload, target, replica)
+                 if home[1]:
+                     # Only this caller lags: keep the watermark below it (retried next tick) and go on with the
+                     # rest. A deferral takes no tick slot and no Board read; calls handled meanwhile are logged,
+@@ -786,7 +803,7 @@ def apply_incoming(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+                     hold = eid - 1 if hold is None else min(hold, eid - 1)
+                     continue
+                 handled += 1
+-                refusal, retry = _caller_refusal(rep, board, event, payload)
++                refusal, retry = _caller_refusal(rep, board, event, payload, replica)
+                 if retry:  # unreachable Board: every later call would retry too
+                     hi, stop = eid - 1, True
+                     break
+diff --git a/hermes_cli/kanban_operator_delivery.py b/hermes_cli/kanban_operator_delivery.py
+index bf45027ce9..20177fb2d7 100644
+--- a/hermes_cli/kanban_operator_delivery.py
++++ b/hermes_cli/kanban_operator_delivery.py
+@@ -15,25 +15,44 @@ _CLAIM = frozenset({"posted", "sent", "delivered", "commented", "relayed"})
+ # claim, so it still needs the exact receipt (fail closed).
+ _NOT_CLAIM = frozenset({"not", "never", "no", "nothing", "none", "neither", "nor", "without", "queued", "pending",
+                         "failed", "refused", "rejected", "unable", "will", "would", "could", "should", "may",
+-                        "might", "if", "once", "until", "awaiting", "waiting", "yet", "be", "being"})
++                        "might", "if", "once", "until", "awaiting", "waiting", "yet"})
+ _GOVERN_WINDOW = 3  # words before the verb: "has not yet been posted", "will later be sent"
+-# A comma, ':', a dash (a standalone spaced '-' or '--' too, never an intra-word hyphen; U+2212 minus), '(' or a
+-# conjunction ends the governing span: "filed no card, so I posted ..." and "No longer pending - posted to ..." are
+-# claims.
+-_BOUNDARY = frozenset({",", ":", "—", "–", "−", "-", "--", "(", "so", "and", "but", "then", "after", "before",
++# A comma, ':', a dash, '(' or a conjunction ends the governing span: "filed no card, so I posted ..." and "No
++# longer pending - posted to ..." are claims. A dash is an em/en dash, U+2212, or an ASCII hyphen run of any length
++# that touches a space or the clause edge on either side ("pending - posted", "pending --- posted", "pending -posted",
++# "pending- posted"); an intra-word hyphen ("re-posted") is no dash.
++_BOUNDARY = frozenset({",", ":", "—", "–", "−", "(", "so", "and", "but", "then", "after", "before",
+                        "because", "which", "while", "that"})
+-_WORD = re.compile(r"[\w’']+|[,:—–−(]|(?<!\S)--?(?!\S)")
++_WORD = re.compile(r"[\w’']+|[,:—–−(]|(?<!\S)-+|-+(?!\S)")
+ _TASK_ID = re.compile(r"\bt_[0-9a-f]{8}(?:[0-9a-f]{8})?\b")
++_BE = ("be", "being")
++# Only adverbs may stand between be/being and the verb for it to govern ("to be soon posted", "is being quickly
++# sent"); "To be safe I posted ..." and "Being thorough I posted ..." stay claims (fail closed).
++_ADVERBS = frozenset({"soon", "later", "eventually", "still", "also", "again", "just", "now", "only", "first",
++                      "properly", "manually", "automatically"})
++
++
++def _is_boundary(w):
++    return w in _BOUNDARY or not w.strip("-")
++
++
++def _adverb(w):
++    return w in _ADVERBS or (len(w) > 3 and w.endswith("ly"))
+ 
+ 
+ def _governed(words, i):
+-    if i and words[i - 1] in ("be", "being"):
+-        # "to be posted", "will be sent", "is being posted": an infinitive, future or progressive form is never a
+-        # past claim, whatever boundary cuts it from its queue word ("Queued: to be posted to ..."). Known
+-        # fail-open: the rare past-tense infinitive "it turned out to be posted twice to t_X" is not a claim.
+-        return True
+-    for w in reversed(words[max(0, i - _GOVERN_WINDOW):i]):
+-        if w in _BOUNDARY:
++    lo = max(0, i - _GOVERN_WINDOW)
++    for j in range(i - 1, -1, -1):
++        # "to be posted", "will be sent", "is being posted", "to be later posted": an infinitive, future or
++        # progressive form is never a past claim, whatever boundary cuts it from its queue word ("Queued: to be
++        # posted to ..."). Known fail-open: the rare past-tense infinitive "it turned out to be posted twice to
++        # t_X" is not a claim.
++        if words[j] in _BE:
++            return True
++        if not _adverb(words[j]):
++            break
++    for w in reversed(words[lo:i]):
++        if _is_boundary(w):
+             return False
+         if w in _NOT_CLAIM or w.endswith(("n't", "n’t")):
+             return True
+diff --git a/tests/hermes_cli/test_kanban_consent_provenance.py b/tests/hermes_cli/test_kanban_consent_provenance.py
+index 38cb236330..92f4cc0ca1 100644
+--- a/tests/hermes_cli/test_kanban_consent_provenance.py
++++ b/tests/hermes_cli/test_kanban_consent_provenance.py
+@@ -348,10 +348,10 @@ def test_unreachable_board_stops_paging_behind_a_deferral(fleet, monkeypatch, tm
+              for i in range(3)]
+     real, down = kox._caller_refusal, {"on": True}
+ 
+-    def flaky(rep, board, event, payload):
++    def flaky(rep, board, event, payload, *replica):
+         if down["on"] and (payload.get("args") or {}).get("text") == "s0":
+             return None, True
+-        return real(rep, board, event, payload)
++        return real(rep, board, event, payload, *replica)
+     monkeypatch.setattr(kox, "_caller_refusal", flaky)
+     helpers._round(f)
+     assert [_outcome(f, r["request_id"]) for r in later] == [None] * 3, "a call after the retry was applied first"
+@@ -377,6 +377,22 @@ def test_caller_refusal_wins_over_a_deferral_refusal(fleet, monkeypatch, tmp_pat
+     assert "consent_unproven" not in request["result"][0]["detail"]
+ 
+ 
++def test_replica_caller_checks_run_once_per_call(fleet, monkeypatch):
++    """The deferral check and the caller refusal share one replica caller check (task_runs + claimed scan)."""
++    from hermes_cli import kanban_operator_call as kox
++    f = fleet
++    real, calls = kox._caller_replica_refusal, []
++
++    def counted(rep, event, payload):
++        calls.append(payload.get("request_uid"))
++        return real(rep, event, payload)
++    monkeypatch.setattr(kox, "_caller_replica_refusal", counted)
++    later = helpers._submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "once"})
++    helpers._round(f)
++    assert _outcome(f, later["request_id"]) == "applied"
++    assert calls and len(calls) == len(set(calls)), f"replica caller checks repeated per call: {calls}"
++
++
+ @pytest.mark.parametrize("ahead", [0, 3600])
+ def test_unproven_caller_is_refused_not_deferred(fleet, monkeypatch, ahead):
+     """A forged call whose caller is unproven and whose created event is missing is refused at once (a future
+@@ -417,6 +433,10 @@ def test_future_requested_at_never_defers_a_home_refusal():
+     caller = {"gateway": "worker-5", "task_id": "t_" + "9" * 16, "run_uid": "x"}
+     assert "in the future" in kox._caller_replica_refusal(
+         rep, {"task_id": caller["task_id"]}, {"caller": caller, "requested_at": now + 3600})
++    # Called without a precomputed replica result, _caller_refusal still runs the replica checks itself.
++    refusal, retry = kox._caller_refusal(rep, "default", {"task_id": caller["task_id"]},
++                                         {"caller": caller, "requested_at": now + 3600})
++    assert retry is False and "in the future" in (refusal or "")
+ 
+ 
+ def test_without_a_deferral_one_tick_reads_one_batch(fleet, monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_operator_delivery.py b/tests/hermes_cli/test_kanban_operator_delivery.py
+index f65b8be26d..83c9ff79dc 100644
+--- a/tests/hermes_cli/test_kanban_operator_delivery.py
++++ b/tests/hermes_cli/test_kanban_operator_delivery.py
+@@ -302,6 +302,21 @@ def test_negation_outside_the_claim_verb_still_needs_a_receipt(fleet, summary):
+     ("Queued: to be later posted to t_0123456789abcdef.", False),
+     ("Queued: to be eventually sent to t_0123456789abcdef.", False),
+     ("The note to t_0123456789abcdef is being posted.", False),
++    ("Queued to be soon posted to t_0123456789abcdef.", False),
++    ("The note to t_0123456789abcdef is being quickly posted.", False),
++    # Windowed be/being governs only across an adverb gap: an unrelated "to be safe" or "being thorough" before
++    # an affirmative claim leaves it a claim (fail closed).
++    ("To be safe I posted the summary to t_0123456789abcdef.", True),
++    ("Being thorough I posted to t_0123456789abcdef.", True),
++    ("To be sure, posted to t_0123456789abcdef.", True),
++    # A spaced dash run of any length is a boundary, and a hyphen glued to either side of the verb splits too.
++    ("Not done --- posted to t_0123456789abcdef.", True),
++    ("Not done ---- posted to t_0123456789abcdef.", True),
++    ("Not done -posted to t_0123456789abcdef.", True),
++    ("Not done- posted to t_0123456789abcdef.", True),
++    ("Comment to t_0123456789abcdef --- not posted.", False),
++    ("Comment to t_0123456789abcdef -not posted.", False),
++    ("The note to t_0123456789abcdef was never re-posted.", False),
+ ])
+ def test_claimed_targets_scopes_negation_to_the_verb(text, claimed):
+     from hermes_cli.kanban_operator_delivery import claimed_targets
+-- 
+2.51.0
+

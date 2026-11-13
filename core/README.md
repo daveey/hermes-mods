@@ -17,10 +17,10 @@ The last public/private series reconciliation (what was already equivalent, what
 [Hostname normalization](hostname-normalization.md) documents the subsequent privacy
 repair, regex policy rules, fingerprint re-pins and successful 1923-entry replay.
 The [2253 regex escape repair](hostname-escape-repair.md) is a **mandatory post-replay
-overlay** in the Applying recipe below, re-bound to snapshot 2926 by `repair_hostname_escapes_2926.py` (snapshot 2678: `repair_hostname_escapes_2678.py`; snapshot 2563: `repair_hostname_escapes_2563.py`; snapshot 2491: `repair_hostname_escapes_2491.py`; snapshot 2409: `repair_hostname_escapes_2409.py`). The immutable mails alone retain two invalid
+overlay** in the Applying recipe below, re-bound to snapshot 3423 by `repair_hostname_escapes_3423.py` (snapshot 2926: `repair_hostname_escapes_2926.py`; snapshot 2678: `repair_hostname_escapes_2678.py`; snapshot 2563: `repair_hostname_escapes_2563.py`; snapshot 2491: `repair_hostname_escapes_2491.py`; snapshot 2409: `repair_hostname_escapes_2409.py`). The immutable mails alone retain two invalid
 placement regexes; the original verifier proves historical fidelity, not regex validity.
 
-2926 patches, one entry per non-merge source commit through `7c2041e566300d382437e3c0fd8976219a110f14`.
+3423 patches, one entry per non-merge source commit through `4b24631c6ebfb8e42c592fb56abbf707ab5a0d27`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -28,12 +28,516 @@ later-dated mainline commits: ordinals 1203 onward include such entries, and 128
 follows 1281 although it sorts at position 1259 by date. Each patch is identified by its SHA header, never by its
 position in the log. `core/verify_mirror.py` checks exactly this: contiguous ordinals, unique headers, header set equal
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
-Upstream exclusion tip: `e3bf4be5df04cf72dab4914b073361c71af1dbe1`; current merge-base: `78abaafcccec20a546c94e8734a70e38c08a6a69`.
-Replay starts at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. All forty-one published bridges remain unchanged; three source-derived integration bridges precede entries 2254, 2255 and 2256 (44 total). The bridge before 2087 excludes the six byte-identical path deltas carried by patch 2087. Entries 1626, 1649 and 1656 are applied and tree-verified at their source parents, then represented by ancestry-only merge markers in the main replay. Entries 2410–2491, 2492–2563, 2564–2678 and 2679–2726 and 2727–2926 contain no merges and need no new bridge. Current snapshot: [mirror-replay-2926.json](mirror-replay-2926.json), [mirror-policy-2926.json](mirror-policy-2926.json), and [executed proof](mirror-2926-verification.md). Previous snapshots: [mirror-2678-verification.md](mirror-2678-verification.md), [mirror-2563-verification.md](mirror-2563-verification.md), [mirror-2491-verification.md](mirror-2491-verification.md), [mirror-2409-verification.md](mirror-2409-verification.md), [mirror-2253-verification.md](mirror-2253-verification.md). The following links retain historical verification:
+Upstream exclusion tip: `d01ed2bfac3469fa582b9aaeec746f3e123bd78a`; current merge-base: `d01ed2bfac3469fa582b9aaeec746f3e123bd78a`.
+Replay starts at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. All forty-one published bridges remain unchanged; three source-derived integration bridges precede entries 2254, 2255 and 2256, and one more (upstream `d01ed2bfac` via fork merge `91c2b94744`) precedes entry 3185 (45 total). The bridge before 2087 excludes the six byte-identical path deltas carried by patch 2087. Entries 1626, 1649 and 1656 are applied and tree-verified at their source parents, then represented by ancestry-only merge markers in the main replay. Entries 2410–2491, 2492–2563, 2564–2678 and 2679–2726 and 2727–2926 contain no merges and need no new bridge. Current snapshot: [mirror-replay-3423.json](mirror-replay-3423.json), [mirror-policy-3423.json](mirror-policy-3423.json), and [executed proof](mirror-3423-verification.md). Previous snapshots: [mirror-2926-verification.md](mirror-2926-verification.md), [mirror-2678-verification.md](mirror-2678-verification.md), [mirror-2563-verification.md](mirror-2563-verification.md), [mirror-2491-verification.md](mirror-2491-verification.md), [mirror-2409-verification.md](mirror-2409-verification.md), [mirror-2253-verification.md](mirror-2253-verification.md). The following links retain historical verification:
 Previous replay: [mirror-replay-2018.json](mirror-replay-2018.json) (twenty-four hash-pinned bridges and three source-checked ancestry-only entries) and [mirror-policy-2018.json](mirror-policy-2018.json). Executed checks: [mirror-2018-verification.md](mirror-2018-verification.md); previous snapshots: [mirror-2909-verification.md](mirror-2909-verification.md), [mirror-2726-verification.md](mirror-2726-verification.md), [mirror-2017-verification.md](mirror-2017-verification.md), [mirror-2016-verification.md](mirror-2016-verification.md), [mirror-2015-verification.md](mirror-2015-verification.md), [mirror-2010-verification.md](mirror-2010-verification.md), [mirror-2005-verification.md](mirror-2005-verification.md), [mirror-2004-verification.md](mirror-2004-verification.md), [mirror-1988-verification.md](mirror-1988-verification.md), [mirror-1979-verification.md](mirror-1979-verification.md), [mirror-1932-verification.md](mirror-1932-verification.md), [mirror-1923-verification.md](mirror-1923-verification.md), [mirror-1918-verification.md](mirror-1918-verification.md), [mirror-1821-verification.md](mirror-1821-verification.md), [mirror-1702-verification.md](mirror-1702-verification.md), [mirror-1625-verification.md](mirror-1625-verification.md).
 The preceding snapshot's executed checks are in [mirror-1427-verification.md](mirror-1427-verification.md), with its policy [mirror-policy-1427.json](mirror-policy-1427.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror 2927–3423
+
+Patches through `4b24631c6e`; verification in [mirror-3423-verification.md](mirror-3423-verification.md).
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Kanban replica consistency tests and lag guard](mirror-3423-a-replica-consistency.md) | 2927 | Adds tests pinning last-good run evidence on a failed replica read and re-projection of expired runs in warm counts. |
+| [Kanban pool placement and repin fixes](mirror-3423-a-pool-placement.md) | 2928 | Park pin asks the remote before calling URL-pushed work unpushed. |
+| [Kanban pool placement and repin fixes](mirror-3423-a-pool-placement.md) | 2929 | Non-pool assignee refusal names the assignee, the pool profiles and the pool route. |
+| [One-shot gateway chat: stable retry identities and closed refused redials](mirror-3423-a-gateway-chat-retry.md) | 2930 | Reuses request and input ids across retries of one run and closes refused redial sockets. |
+| [CI review bot: retry failed review-status downloads](mirror-3423-a-ci-review-retry.md) | 2931 | Retries failed review-status downloads and marks a failed refresh while queuing one re-refresh. |
+| [Process completion custody across gateway restarts](mirror-3423-a-process-completion-custody.md) | 2932 | Writes a delivery obligation with the result receipt so a restart re-admits an owed completion once. |
+| [Process completion custody across gateway restarts](mirror-3423-a-process-completion-custody.md) | 2933 | Explicit kill settles the owed notice and settlement runs under the registry lock. |
+| [Compression yields during a core-update pause](mirror-3423-a-update-pause-compression.md) | 2934 | Refunds update-pause yields and guards scripted preludes from yielding. |
+| [Compression yields during a core-update pause](mirror-3423-a-update-pause-compression.md) | 2935 | Excludes the reserved preflight call from pause eligibility. |
+| [Compression yields during a core-update pause](mirror-3423-a-update-pause-compression.md) | 2936 | Resets the compression boundary count before replayed preludes. |
+| [Kanban pool placement and repin fixes](mirror-3423-a-pool-placement.md) | 2937 | Pool repin preserves ready, scheduled or todo status with ownership fences intact. |
+| [Session lifecycle fixes: remote card outcomes, subagent sweep, deleted-chat resume](mirror-3423-a-session-lifecycle.md) | 2938 | Refreshes chat outcomes when remote cards change. |
+| [Session lifecycle fixes: remote card outcomes, subagent sweep, deleted-chat resume](mirror-3423-a-session-lifecycle.md) | 2939 | Ended-parent subagent sweep treats a compressed delegator as ended only when its continuation tip is. |
+| [Credential relay pull: isolated subprocess environment](mirror-3423-a-relay-pull-env.md) | 2940 | Isolates relay pull Python imports from the agent runtime. |
+| [Credential relay pull: isolated subprocess environment](mirror-3423-a-relay-pull-env.md) | 2941 | Uses the shared subprocess environment factory for the relay pull. |
+| [Session lifecycle fixes: remote card outcomes, subagent sweep, deleted-chat resume](mirror-3423-a-session-lifecycle.md) | 2942 | Resume treats deleted chats as terminal and retires their startup markers. |
+| [Gateway exec spawn ownership and discovery test stability](mirror-3423-a-gateway-exec-stability.md) | 2943 | Raises the discovery fixture shutdown wait bound to avoid CPU-starvation flakes. |
+| [Outcomes: turn-end refresh keeps declared waits and newer turns](mirror-3423-a-outcome-turn-end.md) | 2944 | Turn-end refresh keeps a declared wait through its own turn but not a newer one. |
+| [Outcomes: turn-end refresh keeps declared waits and newer turns](mirror-3423-a-outcome-turn-end.md) | 2945 | Turn-end refresh names only its own turn's evidence instead of a snapshot. |
+| [Outcomes: turn-end refresh keeps declared waits and newer turns](mirror-3423-a-outcome-turn-end.md) | 2946 | Freezes the concluding identity before readmission. |
+| [Update checkpoint accounting, update-pause alarms and update docs](mirror-3423-a-update-checkpoint-alarms.md) | 2947 | Publishes disjoint checkpoint residual accounting for cut cron turns. |
+| [Process completion custody across gateway restarts](mirror-3423-a-process-completion-custody.md) | 2948 | Bounds malformed completion receipts and keeps over-cap owed receipts retrievable. |
+| [Gateway exec spawn ownership and discovery test stability](mirror-3423-a-gateway-exec-stability.md) | 2949 | Retains exec spawn ownership across cancellation. |
+| [Gateway exec spawn ownership and discovery test stability](mirror-3423-a-gateway-exec-stability.md) | 2950 | Adds an exec command success control test. |
+| [Hub admission: capacity class metadata on cards](mirror-3423-a-hub-admission-metadata.md) | 2951 | Persists admission class and frees metadata on tasks. |
+| [Hub admission: capacity class metadata on cards](mirror-3423-a-hub-admission-metadata.md) | 2952 | Validates admission metadata edits atomically. |
+| [Hub admission: capacity class metadata on cards](mirror-3423-a-hub-admission-metadata.md) | 2953 | Exposes admission metadata in CLI creation. |
+| [Hub admission: priority claim pools and capacity budgets](mirror-3423-a-hub-admission-pools.md) | 2954 | Adds the opt-in priority claim pool foundation with immutable claim receipts. |
+| [Hub admission: priority claim pools and capacity budgets](mirror-3423-a-hub-admission-pools.md) | 2955 | Records priority pool claim evidence and invalidates census on unknown receipts. |
+| [Hub admission: priority claim pools and capacity budgets](mirror-3423-a-hub-admission-pools.md) | 2956 | Extends the dispatch budget and captures capacity origins. |
+| [Hub admission: priority claim pools and capacity budgets](mirror-3423-a-hub-admission-pools.md) | 2957 | Prioritizes marked candidates within dispatch lanes. |
+| [Hub admission: capacity class metadata on cards](mirror-3423-a-hub-admission-metadata.md) | 2958 | Refuses legacy courier placement that would drop admission metadata. |
+| [Hub admission: priority claim pools and capacity budgets](mirror-3423-a-hub-admission-pools.md) | 2959 | Reports a coherent admission policy and pool census in machine metrics. |
+| [Hub admission: priority claim pools and capacity budgets](mirror-3423-a-hub-admission-pools.md) | 2960 | Documents the Board pool admission and runtime support contract. |
+| [Hub admission: priority claim pools and capacity budgets](mirror-3423-a-hub-admission-pools.md) | 2961 | Exposes pool queues in queue notes and resets platform claim receipts. |
+| [Hub admission: priority claim pools and capacity budgets](mirror-3423-a-hub-admission-pools.md) | 2962 | Carries original chat custody when importing capacity cards. |
+| [Hub admission: priority claim pools and capacity budgets](mirror-3423-a-hub-admission-pools.md) | 2963 | Adds concurrent cross-board pool and own-grant echo receipt tests. |
+| [Hub admission: priority claim pools and capacity budgets](mirror-3423-a-hub-admission-pools.md) | 2964 | Keeps marked lane order across replica waiter ranking. |
+| [Hub admission: priority claim pools and capacity budgets](mirror-3423-a-hub-admission-pools.md) | 2965 | Adds guard tests for surviving mutants and drops a redundant SQL ordering prefix. |
+| [Hub admission phase 2: score ordering, queue explain and capacity report](mirror-3423-a-hub-admission-score.md) | 2966 | Adds deterministic score ordering, queue explain output and a capacity effect report. |
+| [Hub admission: priority claim pools and capacity budgets](mirror-3423-a-hub-admission-pools.md) | 2967 | Ports the policy recheck test to the nonblocking CPU sampler seam. |
+| [Hub admission phase 2: score ordering, queue explain and capacity report](mirror-3423-a-hub-admission-score.md) | 2968 | Moves the assignees listing out of the CLI facade. |
+| [Hub admission phase 2: score ordering, queue explain and capacity report](mirror-3423-a-hub-admission-score.md) | 2969 | Adds tests killing score and report mutation survivors. |
+| [Hub admission: capacity class metadata on cards](mirror-3423-a-hub-admission-metadata.md) | 2970 | Keeps foreign chat links out of pickup copies and keeps the courier create envelope JSON and retry-compatible. |
+| [Hub admission: capacity class metadata on cards](mirror-3423-a-hub-admission-metadata.md) | 2971 | Updates the Board row-field snapshot for admission class and frees. |
+| [Hub admission: priority claim pools and capacity budgets](mirror-3423-a-hub-admission-pools.md) | 2972 | Ports the policy-recheck test to the sampler-thread seam. |
+| [Hub admission: priority claim pools and capacity budgets](mirror-3423-a-hub-admission-pools.md) | 2973 | Adds pool-aware dispatch and pickup budgets so normal cards make no claim attempts when regular is full. |
+| [Hub admission: priority claim pools and capacity budgets](mirror-3423-a-hub-admission-pools.md) | 2974 | Drops a no-op reservation filter and covers pickup with a pool budget and legacy rows. |
+| [Hub admission: priority claim pools and capacity budgets](mirror-3423-a-hub-admission-pools.md) | 2975 | Keeps the dispatcher skip reason in the pool queue note. |
+| [Hub admission: capacity class metadata on cards](mirror-3423-a-hub-admission-metadata.md) | 2976 | Refuses class/frees combined with requires. |
+| [Hub admission: capacity class metadata on cards](mirror-3423-a-hub-admission-metadata.md) | 2977 | Moves the separate-transaction admission refusal into edit_preflight. |
+| [Process completion custody across gateway restarts](mirror-3423-a-process-completion-custody.md) | 2978 | Does not reopen a failed admission whose result a Desktop client already delivered. |
+| [Update checkpoint accounting, update-pause alarms and update docs](mirror-3423-a-update-checkpoint-alarms.md) | 2979 | Documents when to enable terminal.update_survivable_processes. |
+| [Kanban: slow plugin guard no longer costs a worker its park/report](mirror-3423-a-guard-refusal.md) | 2980 | A slow pre-tool-call guard no longer refuses park/report calls or books a protocol violation. |
+| [Kanban: slow plugin guard no longer costs a worker its park/report](mirror-3423-a-guard-refusal.md) | 2981 | Guard-refusal classification requires the result to be the refusal on a terminal call. |
+| [Kanban: slow plugin guard no longer costs a worker its park/report](mirror-3423-a-guard-refusal.md) | 2982 | Passes the lockguard for the state read and counts refusals with an appended budget notice. |
+| [Kanban: mandatory model pins on the worker pool](mirror-3423-a-mandatory-pin.md) | 2983 | Lets a mandatory model pin ride the worker pool with exact-model or refuse semantics. |
+| [Kanban: mandatory model pins on the worker pool](mirror-3423-a-mandatory-pin.md) | 2984 | A mandatory pin leaves home only through the worker queue and every move keeps its label. |
+| [Kanban: mandatory model pins on the worker pool](mirror-3423-a-mandatory-pin.md) | 2985 | Marking a placed card mandatory adds its label and a worker-first card refuses the mark. |
+| [Kanban replica consistency tests and lag guard](mirror-3423-a-replica-consistency.md) | 2986 | Never replaces a worker copy from a replica lagging behind this gateway's push. |
+| [Hub admission: retired hub-write needs](mirror-3423-a-hub-needs-retired.md) | 2987 | Hub admission stops admitting the board admin key and instance role needs. |
+| [Update checkpoint accounting, update-pause alarms and update docs](mirror-3423-a-update-checkpoint-alarms.md) | 2988 | Update-pause alarm key names the host and links sibling hosts' open alarms. |
+| [Update-pause sibling alarm: lead selection, refusal classes, ownership](mirror-3423-b-update-pause-sibling-alarm.md) | 2989 | Sibling lookup joins the lead alarm, refusal classes keep the busy cause head, own cards are adopted under any host name. |
+| [Update-pause sibling alarm: lead selection, refusal classes, ownership](mirror-3423-b-update-pause-sibling-alarm.md) | 2990 | Routes sibling-module dependencies to the e2e_upgrade CI lane and adopts non-primary own keys only by created_on. |
+| [Cron restart-cut reruns and one-shot admission holds](mirror-3423-b-cron-restart-rerun-and-oneshot-holds.md) | 2991 | Expires the pending guard after a skipped cut rerun so a later deferred fire gets its own rerun. |
+| [Cron restart-cut reruns and one-shot admission holds](mirror-3423-b-cron-restart-rerun-and-oneshot-holds.md) | 2992 | Test fix giving sequential frozen-clock executions distinct claim times. |
+| [Machine metrics: bounded token totals by model](mirror-3423-b-machine-metrics-token-models.md) | 2993 | Reports bounded token totals grouped by model with unknown and other buckets and a no-model compatibility retry. |
+| [Kanban gate-only assignees](mirror-3423-b-kanban-gate-only-assignees.md) | 2994 | Refuses card creates onto a gate-only assignee configured in kanban.gate_only_assignees, naming the queue assignee instead. |
+| [Kanban gate-only assignees](mirror-3423-b-kanban-gate-only-assignees.md) | 2995 | Triage decomposer drops gate-only profiles from its roster and files any gate-only pick under its queue. |
+| [Hub admission: claim-time screening and evidence rules](mirror-3423-b-hub-admission-claim-screen.md) | 2996 | Makes hub refusal assignee remedies complete and conditional. |
+| [Kanban: a chat's verified relay of the user's reply counts as human progress](mirror-3423-b-kanban-relayed-human-progress.md) | 2997 | Adds verified relayed_human comments that reset the no-progress budget, plus suspect-relay logging. |
+| [Kanban: a chat's verified relay of the user's reply counts as human progress](mirror-3423-b-kanban-relayed-human-progress.md) | 2998 | Relay verification picks only typed user messages and the card holder refuses replayed or pre-ask relays. |
+| [Kanban: a chat's verified relay of the user's reply counts as human progress](mirror-3423-b-kanban-relayed-human-progress.md) | 2999 | Relay skips every registered synthetic user row, a running loop tick row and the storeless kanban notice. |
+| [Kanban: a chat's verified relay of the user's reply counts as human progress](mirror-3423-b-kanban-relayed-human-progress.md) | 3000 | A reply after an interrupted loop tick still counts and the heartbeat frame is treated as synthetic. |
+| [Kanban: a chat's verified relay of the user's reply counts as human progress](mirror-3423-b-kanban-relayed-human-progress.md) | 3001 | Relay reads state.db past the lock guard, baselines its plugin import, and finds the tick row with the reply scan filters. |
+| [Kanban sync, lock discovery and event index robustness](mirror-3423-b-kanban-sync-and-lock-robustness.md) | 3002 | Replica-lag acknowledgement parsing accepts parsed field dicts as well as JSON strings. |
+| [Kanban ready-wait checkpoint selection evidence](mirror-3423-b-kanban-ready-wait-checkpoint-evidence.md) | 3003 | Records checkpoint selection reason and emitter evidence alongside ready-wait notices. |
+| [Kanban ready-wait checkpoint selection evidence](mirror-3423-b-kanban-ready-wait-checkpoint-evidence.md) | 3004 | Resolves the diagnostic boot fingerprint through the canonical install root. |
+| [Cron restart-cut reruns and one-shot admission holds](mirror-3423-b-cron-restart-rerun-and-oneshot-holds.md) | 3005 | Preserves one-shot jobs awaiting admission settlement during the due scan. |
+| [Async delegation: wake an unloaded parent chat](mirror-3423-b-delegation-unloaded-parent-wake.md) | 3006 | Sweeper wakes a parent chat for a terminal delegation result that no live poller delivers. |
+| [Async delegation: wake an unloaded parent chat](mirror-3423-b-delegation-unloaded-parent-wake.md) | 3007 | Never wakes an archived or moved parent chat and warns when the post-turn ack finds a lapsed claim. |
+| [Async delegation: wake an unloaded parent chat](mirror-3423-b-delegation-unloaded-parent-wake.md) | 3008 | Runs dead-owner delegation recovery at most every five minutes per ledger. |
+| [Async delegation: wake an unloaded parent chat](mirror-3423-b-delegation-unloaded-parent-wake.md) | 3009 | Reaches display metadata through server to satisfy the split-module import rule. |
+| [Gateway test deflakes](mirror-3423-b-gateway-test-deflakes.md) | 3010 | Deflakes the API admission writer test with an event handshake instead of wall-clock gaps. |
+| [Machine metrics: bounded token totals by model](mirror-3423-b-machine-metrics-token-models.md) | 3011 | Corrects the documented compatibility retry send budget; runtime behavior unchanged. |
+| [Kanban sync, lock discovery and event index robustness](mirror-3423-b-kanban-sync-and-lock-robustness.md) | 3012 | Credits the sync thread's own repair-revision steps and counts repair rounds. |
+| [Gateway test deflakes](mirror-3423-b-gateway-test-deflakes.md) | 3013 | Makes the gateway admission expiry test use a virtual clock instead of a wall-clock window. |
+| [Kanban sync, lock discovery and event index robustness](mirror-3423-b-kanban-sync-and-lock-robustness.md) | 3014 | Indexes event-kind history lookups, including on reopen of an existing database. |
+| [Kanban sync, lock discovery and event index robustness](mirror-3423-b-kanban-sync-and-lock-robustness.md) | 3015 | Bounds the root lease's fast claim retry to a 30 s window per contention episode. |
+| [Remote notices: single-flight replica snapshots](mirror-3423-b-notice-replica-singleflight.md) | 3016 | Single-flights replica snapshots per lane outside the publication lock. |
+| [Remote notices: single-flight replica snapshots](mirror-3423-b-notice-replica-singleflight.md) | 3017 | Tests shared-signature reuse and uncertain read boundaries. |
+| [Remote notices: single-flight replica snapshots](mirror-3423-b-notice-replica-singleflight.md) | 3018 | Test that legacy replicas without sequence signatures never reuse an old memo. |
+| [Remote notices: single-flight replica snapshots](mirror-3423-b-notice-replica-singleflight.md) | 3019 | Test that unknown fingerprints never reuse a shared snapshot. |
+| [Kanban: ship review verdicts must come from the dispatched worker run](mirror-3423-b-ship-review-independence.md) | 3020 | Refuses a ship-review verdict completed outside the card's dispatched worker run in the tool, CLI and dashboard. |
+| [Kanban: ship review verdicts must come from the dispatched worker run](mirror-3423-b-ship-review-independence.md) | 3021 | Baselines the dashboard's import of the review contract in the boundary lint. |
+| [Gateway turn outcome: run-owned custody](mirror-3423-b-gateway-outcome-run-custody.md) | 3022 | Freezes run-owned outcome evidence across retry and handler displacement. |
+| [Gateway turn outcome: run-owned custody](mirror-3423-b-gateway-outcome-run-custody.md) | 3023 | Keeps outcome scope cleanup in the topical helper. |
+| [Gateway turn outcome: run-owned custody](mirror-3423-b-gateway-outcome-run-custody.md) | 3024 | Retains outcome custody on abandoned worker waits and preserves finished receipts. |
+| [Gateway turn outcome: run-owned custody](mirror-3423-b-gateway-outcome-run-custody.md) | 3025 | Moves the gateway worker wait into a topical sibling module to keep the facade file cap. |
+| [Gateway turn outcome: run-owned custody](mirror-3423-b-gateway-outcome-run-custody.md) | 3026 | Captures a queued follow-up's lease on worker abandonment, gated on this executor future. |
+| [Gateway turn outcome: run-owned custody](mirror-3423-b-gateway-outcome-run-custody.md) | 3027 | Gives the host-sleep poll fixture a real executor future. |
+| [Update-pause sibling alarm: lead selection, refusal classes, ownership](mirror-3423-b-update-pause-sibling-alarm.md) | 3028 | Respects gateway ownership in update-pause sibling notifications. |
+| [Cron restart-cut reruns and one-shot admission holds](mirror-3423-b-cron-restart-rerun-and-oneshot-holds.md) | 3029 | Types shutdown-interrupted last_failure as kind lifecycle_interrupt. |
+| [Background delegation stopped by gateway shutdown wakes its parent](mirror-3423-b-delegation-shutdown-stop-wakes-parent.md) | 3030 | Stamps shutdown-stopped background subagents so their parent wakes with a shutdown-not-user message. |
+| [Background delegation stopped by gateway shutdown wakes its parent](mirror-3423-b-delegation-shutdown-stop-wakes-parent.md) | 3031 | Adds tests for shutdown warning exclusions and closed-chat logging; production code unchanged. |
+| [Typed /loop tick rows](mirror-3423-b-loop-tick-typed-rows.md) | 3032 | Types a slash loop tick's submitted prompt as a loop_tick row in the TUI, gateway and Desktop history. |
+| [Process recovery never adopts a held foreground command](mirror-3423-b-survivable-process-recovery-hold.md) | 3033 | Recovery skips held foreground commands and release drops the hold and its checkpoint entry together. |
+| [Remote notices: single-flight replica snapshots](mirror-3423-b-notice-replica-singleflight.md) | 3034 | Pins lane-through-generation ordering with a test and drops the unused decode fallback. |
+| [Kanban move refuses to leave a host holding unpushed work](mirror-3423-b-kanban-move-unpushed-guard.md) | 3035 | Refuses to move a card off a host that holds its dirty or unpushed trees unless forced. |
+| [Update shutdown: spent cron grace is not renewed](mirror-3423-b-update-cron-grace-not-renewed.md) | 3036 | Stops shutdown from restoring the cron floor after a checkpoint cron cut has spent its restart grace. |
+| [Machine metrics: bounded token totals by model](mirror-3423-b-machine-metrics-token-models.md) | 3037 | A timed-out bounded sync call keeps its worker's own schedstat. |
+| [Kanban sync, lock discovery and event index robustness](mirror-3423-b-kanban-sync-and-lock-robustness.md) | 3038 | Verifies singleton sidecar owners through fdinfo before global lock discovery. |
+| [Typed /loop tick rows](mirror-3423-b-loop-tick-typed-rows.md) | 3039 | Pins PRODUCER_CARD_KINDS to an explicit list that excludes loop_tick. |
+| [Background delegation stopped by gateway shutdown wakes its parent](mirror-3423-b-delegation-shutdown-stop-wakes-parent.md) | 3040 | Keeps a requested stop's intent across shutdown and logs not-woken only for notes. |
+| [Cron restart-cut reruns and one-shot admission holds](mirror-3423-b-cron-restart-rerun-and-oneshot-holds.md) | 3041 | Holds one-shots on uncheckable admission journals, naming the journal. |
+| [Worker pool repins: live-registry checks and hub:read placement](mirror-3423-b-worker-pool-repin-placement.md) | 3042 | Refuses pool repins without an eligible machine in the live registry. |
+| [Worker pool repins: live-registry checks and hub:read placement](mirror-3423-b-worker-pool-repin-placement.md) | 3043 | Refuses pool repins that would use a stale registry fallback. |
+| [Hub admission: claim-time screening and evidence rules](mirror-3423-b-hub-admission-claim-screen.md) | 3044 | Rejects a producer's pin sentence as admission evidence and routes hub work through hub-admin in the move tool text. |
+| [Process recovery never adopts a held foreground command](mirror-3423-b-survivable-process-recovery-hold.md) | 3045 | Documentation naming the commands terminal.update_survivable_processes covers. |
+| [Worker pool repins: live-registry checks and hub:read placement](mirror-3423-b-worker-pool-repin-placement.md) | 3046 | Aligns hub:read pool eligibility with the Board attestation contract. |
+| [Hub admission: claim-time screening and evidence rules](mirror-3423-b-hub-admission-claim-screen.md) | 3047 | Judges pre-gate hub-local cards at claim time, admitting or re-placing them and recording a claim admission event. |
+| [Hub admission: claim-time screening and evidence rules](mirror-3423-b-hub-admission-claim-screen.md) | 3048 | Test coverage for change-while-judged, empty-label and policy candidates and detector edges. |
+| [Hub admission: claim-time screening and evidence rules](mirror-3423-b-hub-admission-claim-screen.md) | 3049 | Test for creation-time verdicts in the detector and pins a same-second gate to remove flakiness. |
+| [Hub admission: claim-time screening and evidence rules](mirror-3423-b-hub-admission-claim-screen.md) | 3050 | Fences claim admission against concurrent card and event changes. |
+| [Proof-home isolation for restart-proof backends](mirror-3423-c-proof-home-guard.md) | 3051 | Adds the `--proof-home` selector, agent-origin refusal on production homes, tool-child provenance stamps and recovery refusals. |
+| [Proof-home isolation for restart-proof backends](mirror-3423-c-proof-home-guard.md) | 3052 | Drops agent provenance stamps on Desktop launches (Python and Electron) while serve and dashboard keep them. |
+| [Proof-home isolation for restart-proof backends](mirror-3423-c-proof-home-guard.md) | 3053 | Keys the agent proof refusal on Desktop backend ownership instead of the inherited Desktop env var. |
+| [Kanban pool-move and pickup-stall placement fixes](mirror-3423-c-kanban-pool-move-placement.md) | 3054 | Refreshes URL-pushed remote tips without inherited stdin and with pinned failure handling. |
+| [Kanban pool-move and pickup-stall placement fixes](mirror-3423-c-kanban-pool-move-placement.md) | 3055 | Prioritizes branch destinations within the remote refresh cap. |
+| [Process registry release never rewrites without its lock](mirror-3423-c-process-release-lock.md) | 3056 | Skips the processes.json rewrite on release when the checkpoint lock was not taken and adds race tests. |
+| [Process registry release never rewrites without its lock](mirror-3423-c-process-release-lock.md) | 3057 | Docstring fix clarifying what the checkpoint-lock return value means. |
+| [input_origin for pre_llm_call plugins](mirror-3423-c-input-origin-pre-llm-call.md) | 3058 | Passes input_origin (agent, human or unknown) to pre_llm_call per client submit. |
+| [Hub admission: pin-line self-assertion and hub-admin placement](mirror-3423-c-hub-admission-pin-spans.md) | 3059 | Denies admits quoting only from inside a pin line and gives relayed owner denies a specific reason. |
+| [Kanban sync: repair window and batched provenance](mirror-3423-c-kanban-sync-repair-and-links.md) | 3060 | Tidies own-write credit naming and drops the unused revisions parameter from pull(). |
+| [Kanban chat-tasks projection check](mirror-3423-c-kanban-chat-tasks-projection.md) | 3061 | Adds a chat-tasks projection check for origin cards and repoints binding guidance at it. |
+| [Kanban chat-tasks projection check](mirror-3423-c-kanban-chat-tasks-projection.md) | 3062 | Honors profile-qualified identities in projection checks. |
+| [Proof-home isolation for restart-proof backends](mirror-3423-c-proof-home-guard.md) | 3063 | Matches the equals form of the SSH token-file flag and pins the provenance key lists on both sides. |
+| [Hub admission: pin-line self-assertion and hub-admin placement](mirror-3423-c-hub-admission-pin-spans.md) | 3064 | Stops an abbreviation dot from ending a wrapped pin's span and documents the whole-line deny. |
+| [Worker compute containment and admission](mirror-3423-c-worker-compute-capacity.md) | 3065 | Starts worker compute containment and occupied-owner accounting. |
+| [Worker compute containment and admission](mirror-3423-c-worker-compute-capacity.md) | 3066 | Verifies worker CPU budgets at managed interpreter launch. |
+| [Worker compute containment and admission](mirror-3423-c-worker-compute-capacity.md) | 3067 | Gates worker claims on load and detached cgroup occupancy. |
+| [Bounded worker test slots and CI wiring](mirror-3423-c-worker-test-budget.md) | 3068 | Adds bounded worker test slots with verified lock inheritance. |
+| [Worker compute containment and admission](mirror-3423-c-worker-compute-capacity.md) | 3069 | Binds worker policy to the account root and test receipts to acquisitions. |
+| [Worker compute containment and admission](mirror-3423-c-worker-compute-capacity.md) | 3070 | Serializes worker admission across installation roots with an account lock. |
+| [Worker compute containment and admission](mirror-3423-c-worker-compute-capacity.md) | 3071 | Retires idle worker boards under admission fences and reports detached occupancy. |
+| [Worker compute containment and admission](mirror-3423-c-worker-compute-capacity.md) | 3072 | Recovers interrupted idle board retirement and bounds pressure contention. |
+| [Worker compute containment and admission](mirror-3423-c-worker-compute-capacity.md) | 3073 | Binds worker capacity to the execution DB identity and allows occupied-owner resumes. |
+| [Worker compute containment and admission](mirror-3423-c-worker-compute-capacity.md) | 3074 | Adds an independent sustained worker-load observer with a durable alert outbox. |
+| [Worker compute containment and admission](mirror-3423-c-worker-compute-capacity.md) | 3075 | Binds legacy worker ownership to a live cgroup identity. |
+| [Worker compute containment and admission](mirror-3423-c-worker-compute-capacity.md) | 3076 | Satisfies code-health and cross-platform lint gates for the worker capacity modules. |
+| [Bounded worker test slots and CI wiring](mirror-3423-c-worker-test-budget.md) | 3077 | Gives runner probe trees the worker test-budget imports. |
+| [Bounded worker test slots and CI wiring](mirror-3423-c-worker-test-budget.md) | 3078 | Covers worker budget imports and policy isolation in CI fixtures and classification. |
+| [Bounded worker test slots and CI wiring](mirror-3423-c-worker-test-budget.md) | 3079 | Routes worker test budget changes to the standalone macOS state CI workflow. |
+| [Bounded worker test slots and CI wiring](mirror-3423-c-worker-test-budget.md) | 3080 | Aligns worker admission test doubles with the final-gate keywords and policy reads. |
+| [input_origin for pre_llm_call plugins](mirror-3423-c-input-origin-pre-llm-call.md) | 3081 | Classifies room plumbing rather than hidden sessions as agent and forwards origin to compute-host turns. |
+| [Proof-home isolation for restart-proof backends](mirror-3423-c-proof-home-guard.md) | 3082 | Disables argparse abbreviation on both serve parsers so abbreviated flags cannot bypass the guard. |
+| [Test deflakes: admission trace, free-tier turn, scope inode](mirror-3423-c-test-flake-fixes.md) | 3083 | Deflakes the API admission test by swapping the writer trace only under the database lock. |
+| [Process registry release never rewrites without its lock](mirror-3423-c-process-release-lock.md) | 3084 | Docstring fix saying the lock-less drop only tries to remove the entry. |
+| [Kanban wait notices: pool re-place hints and skip advice](mirror-3423-c-kanban-wait-notice-pool-hints.md) | 3085 | Names pool workers that could run the card in chat-wait notices and ready hints. |
+| [Kanban review independence and worker-shell completion](mirror-3423-c-kanban-review-independence.md) | 3086 | Lets a card's own proven worker shell complete its run through the CLI. |
+| [Kanban overlap, respawn and priority/help guards](mirror-3423-c-kanban-card-lifecycle-guards.md) | 3087 | Matches duplicate card titles that name the same code file. |
+| [Kanban overlap, respawn and priority/help guards](mirror-3423-c-kanban-card-lifecycle-guards.md) | 3088 | Grants one continuation to a PR owner requeued by a core update after publishing. |
+| [Kanban pool-move and pickup-stall placement fixes](mirror-3423-c-kanban-pool-move-placement.md) | 3089 | Maps declared access requirements to the hyphenated capability labels at every pickup-stall need site. |
+| [Per-invocation outcome receipts for queued follow-ups](mirror-3423-c-outcome-receipt-per-run.md) | 3090 | Gives each run-agent invocation its own outcome receipt so late predecessor writes cannot conclude a follow-up. |
+| [input_origin for pre_llm_call plugins](mirror-3423-c-input-origin-pre-llm-call.md) | 3091 | Pins the room-plumbing rule to the resume rule and reads only three columns per submit. |
+| [Hub admission: pin-line self-assertion and hub-admin placement](mirror-3423-c-hub-admission-pin-spans.md) | 3092 | Restricts span extension to letter-dot abbreviations so filenames, versions and URLs end the pin. |
+| [Core update: pause long model requests and bound gateway exit](mirror-3423-c-core-update-exit-bounds.md) | 3093 | Cancels a long model request at a step boundary so a core update pause can land. |
+| [Kanban review independence and worker-shell completion](mirror-3423-c-kanban-review-independence.md) | 3094 | Shares the live-ancestor check and tests the spawn-pid fallback. |
+| [Kanban wait notices: pool re-place hints and skip advice](mirror-3423-c-kanban-wait-notice-pool-hints.md) | 3095 | Keeps the pool hint under the admission census and prints it after the queue clause. |
+| [Kanban overlap, respawn and priority/help guards](mirror-3423-c-kanban-card-lifecycle-guards.md) | 3096 | Documents priority restore limits and pins mixed-state refusal. |
+| [input_origin for pre_llm_call plugins](mirror-3423-c-input-origin-pre-llm-call.md) | 3097 | Makes the turn session-id helper in turn_outcome public. |
+| [Test deflakes: admission trace, free-tier turn, scope inode](mirror-3423-c-test-flake-fixes.md) | 3098 | Makes the free-tier prompt-turn test wait for real threads instead of patching Thread. |
+| [Test deflakes: admission trace, free-tier turn, scope inode](mirror-3423-c-test-flake-fixes.md) | 3099 | Derives the stale inode in the legacy-scope test from the recreated scope. |
+| [Hub admission: pin-line self-assertion and hub-admin placement](mirror-3423-c-hub-admission-pin-spans.md) | 3100 | Keeps claim-gate-refused hub denies at home and treats hub-admin-wrapped actions as needing hub-write. |
+| [Kanban pool-move and pickup-stall placement fixes](mirror-3423-c-kanban-pool-move-placement.md) | 3101 | Refuses a pickup-stall pool move for access the Board cannot place. |
+| [Kanban wait notices: pool re-place hints and skip advice](mirror-3423-c-kanban-wait-notice-pool-hints.md) | 3102 | Keeps a recorded skip with the pool hint and defers unrecorded-skip advice to the re-place. |
+| [Kanban sync: repair window and batched provenance](mirror-3423-c-kanban-sync-repair-and-links.md) | 3103 | Defers repair passes triggered by other processes' writes to one per 30-second window. |
+| [Kanban review independence and worker-shell completion](mirror-3423-c-kanban-review-independence.md) | 3104 | Gates review verdicts whose own reviewed_pr names a core pull. |
+| [Kanban pool-move and pickup-stall placement fixes](mirror-3423-c-kanban-pool-move-placement.md) | 3105 | Refuses a pool move when the stored requires is not a JSON list of strings. |
+| [Kanban review independence and worker-shell completion](mirror-3423-c-kanban-review-independence.md) | 3106 | Docstring noting the reviewed_pr core-pull fallback in independence_refusal. |
+| [Kanban sync: repair window and batched provenance](mirror-3423-c-kanban-sync-repair-and-links.md) | 3107 | Classifies chat-link and backfill sessions in per-home batches instead of per row. |
+| [Kanban wait notices: pool re-place hints and skip advice](mirror-3423-c-kanban-wait-notice-pool-hints.md) | 3108 | Unifies skip advice across surfaces and drops the pool re-place for quota-wall skips. |
+| [Kanban overlap, respawn and priority/help guards](mirror-3423-c-kanban-card-lifecycle-guards.md) | 3109 | Aligns hub-reason CLI help with the admission schema wording. |
+| [Kanban sync: repair window and batched provenance](mirror-3423-c-kanban-sync-repair-and-links.md) | 3110 | Drops the unused decide() parameter and documents deferred link repairs with a window test. |
+| [Core update: pause long model requests and bound gateway exit](mirror-3423-c-core-update-exit-bounds.md) | 3111 | Bounds the gateway post-stop tail to the core update checkpoint's exit promise. |
+| [Terminal background spawns get foreground PATH](mirror-3423-c-terminal-background-path.md) | 3112 | Gives background terminal spawns the foreground PATH dirs and flags masked missing commands. |
+| [Pool placement labels and profile parity](mirror-3423-d-pool-placement-labels.md) | 3113 | A mandatory-pin mark labels a pool card regardless of the process's sync mode. |
+| [Worker inventory board registry hardening](mirror-3423-d-worker-inventory-boards.md) | 3114 | Tests never register in the real worker inventory and garbage-collected scratch boards retire. |
+| [Pool placement labels and profile parity](mirror-3423-d-pool-placement-labels.md) | 3115 | A pickup-stall pool move reads the card's skills like the Board. |
+| [Test deflakes and small review follow-ups](mirror-3423-d-test-flakes-and-small-followups.md) | 3116 | Deflakes the managed-worker group-close reap check by counting dead processes as gone. |
+| [Kanban parks and requeued publishers](mirror-3423-d-park-wake-check-and-publisher.md) | 3117 | An earlier PR needs a recorded handoff to the requeued claim; schema probed once. |
+| [Kanban parks and requeued publishers](mirror-3423-d-park-wake-check-and-publisher.md) | 3118 | A granted continuation's own requeue chain hands the publisher's PR on. |
+| [Test deflakes and small review follow-ups](mirror-3423-d-test-flakes-and-small-followups.md) | 3119 | Pins the hub-reason CLI help to the tool schema description with a parity test. |
+| [Test deflakes and small review follow-ups](mirror-3423-d-test-flakes-and-small-followups.md) | 3120 | Pins plain-card worker-shell completion and documents the pid coercion in descends_from_live_pid. |
+| [Hub admission: CPU gate census and claim screen](mirror-3423-d-hub-admission-cpu-gate.md) | 3121 | Adds RED tests for the final gate census under thread contention. |
+| [Hub admission: CPU gate census and claim screen](mirror-3423-d-hub-admission-cpu-gate.md) | 3122 | One-statement board census so the final gate fits its sample, with stage-named refusals. |
+| [Hub admission: CPU gate census and claim screen](mirror-3423-d-hub-admission-cpu-gate.md) | 3123 | Re-exports the board fixture in the contention test without shadowing. |
+| [Terminal masked-success hints](mirror-3423-d-terminal-hints.md) | 3124 | Process log of exited sessions carries exit fields and missing-command shapes anchor to line heads. |
+| [Explicit card review requirements and review receipts](mirror-3423-d-review-required-cards.md) | 3125 | Adds the review_required card flag across CLI, tool, sync and the completion gate. |
+| [Explicit card review requirements and review receipts](mirror-3423-d-review-required-cards.md) | 3126 | Retains the review guards inside worker subprocesses. |
+| [Explicit card review requirements and review receipts](mirror-3423-d-review-required-cards.md) | 3127 | Routes review-required completion refusals through receipt_refusal to keep kanban.py under its line cap. |
+| [Explicit card review requirements and review receipts](mirror-3423-d-review-required-cards.md) | 3128 | Folds review_required edit/create wiring to keep kanban.py at its line cap. |
+| [Pool placement labels and profile parity](mirror-3423-d-pool-placement-labels.md) | 3129 | Pickup-stall repin needs profile:default for a card with no assignee. |
+| [Worker inventory board registry hardening](mirror-3423-d-worker-inventory-boards.md) | 3130 | Guards stripped-env pytest children and retires collected records only under the fence. |
+| [Kanban sync: retire moot lease_lost releases](mirror-3423-d-kanban-sync-lease-release.md) | 3131 | Retires a lease_lost release whose run the Board already ended. |
+| [Update pause: continuations and synthesized turns](mirror-3423-d-update-pause-continuations.md) | 3132 | A synthesized turn over a paused marker pauses at its next step boundary. |
+| [Test deflakes and small review follow-ups](mirror-3423-d-test-flakes-and-small-followups.md) | 3133 | descends_from_live_pid refuses non-integral float pids instead of truncating. |
+| [Terminal masked-success hints](mirror-3423-d-terminal-hints.md) | 3134 | Missing-command hint keeps spaced command paths and flags env shebang errors. |
+| [Kanban show and completion refusal wording](mirror-3423-d-kanban-status-messages.md) | 3135 | Sentence-cases skip advice after a full stop and offers pool re-place for an expired quota wall. |
+| [Worker inventory board registry hardening](mirror-3423-d-worker-inventory-boards.md) | 3136 | Skips a record unlinked mid-listing and treats only FileNotFoundError as retiring. |
+| [Kanban show and completion refusal wording](mirror-3423-d-kanban-status-messages.md) | 3137 | kanban_complete names triage and other no-run statuses instead of stale_run. |
+| [Desktop stripe: red reasons and stale prompts](mirror-3423-d-desktop-stripe-red-reason.md) | 3138 | A dead runtime's prompt no longer keeps a chat red and every red row reports why. |
+| [Kanban parks and requeued publishers](mirror-3423-d-park-wake-check-and-publisher.md) | 3139 | CI/deploy park premise includes the head SHAs its park names. |
+| [Update pause: continuations and synthesized turns](mirror-3423-d-update-pause-continuations.md) | 3140 | A continuation yields to a pending pause before its first step boundary. |
+| [Kanban parks and requeued publishers](mirror-3423-d-park-wake-check-and-publisher.md) | 3141 | A worker's re-park of a hub card relays a board-reading wake_check to the hub. |
+| [Kanban show and completion refusal wording](mirror-3423-d-kanban-status-messages.md) | 3142 | An expired quota wall reads reset passed instead of starts on its own. |
+| [Remote kanban notices: late delivery and single-flight](mirror-3423-d-remote-notice-delivery.md) | 3143 | Pollers of one replica snapshot share a single persist pass. |
+| [Kanban placement markers and pool queue](mirror-3423-d-placement-markers.md) | 3144 | A required-check name is no longer treated as a macOS marker. |
+| [Kanban placement markers and pool queue](mirror-3423-d-placement-markers.md) | 3145 | Moves the product-marker test cases to their own file for the line cap. |
+| [Kanban show and completion refusal wording](mirror-3423-d-kanban-status-messages.md) | 3146 | Pins the statuses a no-run card completes from in the every-status sweep. |
+| [Pool placement labels and profile parity](mirror-3423-d-pool-placement-labels.md) | 3147 | Pickup-stall alarm placement reads a NULL or empty assignee as profile:default. |
+| [Kanban sync: retire moot lease_lost releases](mirror-3423-d-kanban-sync-lease-release.md) | 3148 | Fake board mirrors lease_run_uid with an end-to-end lease-held release veto test. |
+| [Kanban sync: retire moot lease_lost releases](mirror-3423-d-kanban-sync-lease-release.md) | 3149 | Fake lease release clears the card's lease mirror after the run ended. |
+| [Worker inventory board registry hardening](mirror-3423-d-worker-inventory-boards.md) | 3150 | Only ENOENT counts as missing in every inventory existence check via a shared helper. |
+| [Hub admission: CPU gate census and claim screen](mirror-3423-d-hub-admission-cpu-gate.md) | 3151 | Hub claim screen defers edited cards and caps judge calls per tick. |
+| [Hub admission: CPU gate census and claim screen](mirror-3423-d-hub-admission-cpu-gate.md) | 3152 | Claim screen judges in dispatch order so the budget never defers top priority. |
+| [Remote kanban notices: late delivery and single-flight](mirror-3423-d-remote-notice-delivery.md) | 3153 | Observed remote notices are delivered late within 72 hours instead of settling stale. |
+| [Desktop stripe: red reasons and stale prompts](mirror-3423-d-desktop-stripe-red-reason.md) | 3154 | Keeps turn-live prompts, re-reports a moved prompt and fixes as-of wording. |
+| [Kanban consent stops and operator delivery receipts](mirror-3423-d-kanban-consent-stops.md) | 3155 | Carries approval stops in creation provenance and binds delivery claims to exact operator receipts. |
+| [Worker inventory board registry hardening](mirror-3423-d-worker-inventory-boards.md) | 3156 | Pins ENOTDIR as not missing and keeps an unreadable board's record after failed removal. |
+| [Kanban placement markers and pool queue](mirror-3423-d-placement-markers.md) | 3157 | A pool worker's built-in local-marker hit joins the pool queue. |
+| [Hub admission: CPU gate census and claim screen](mirror-3423-d-hub-admission-cpu-gate.md) | 3158 | Final hub gate reads the sampler's fresh sample instead of measuring under the lock. |
+| [Hub admission: CPU gate census and claim screen](mirror-3423-d-hub-admission-cpu-gate.md) | 3159 | Renames the slow-window test stand-in to describe what it widens. |
+| [Hub admission: CPU gate census and claim screen](mirror-3423-d-hub-admission-cpu-gate.md) | 3160 | Keeps the stage-tagged refusals on the sampler-read final gate. |
+| [Kanban sync: retire moot lease_lost releases](mirror-3423-d-kanban-sync-lease-release.md) | 3161 | Fake lease release is fenced on the holder's run and an ended run retries the card. |
+| [Hub admission: CPU gate census and claim screen](mirror-3423-d-hub-admission-cpu-gate.md) | 3162 | Real previous_runs_on on a deny move and unjudged_claims counts created-payload verdicts. |
+| [Test deflakes and small review follow-ups](mirror-3423-d-test-flakes-and-small-followups.md) | 3163 | Completion-recovery second reconcile starts fresh and last-admission-only marker is documented. |
+| [Update pause: continuations and synthesized turns](mirror-3423-d-update-pause-continuations.md) | 3164 | A paused turn's continuation refused during start-up keeps an owner and re-arms a watcher. |
+| [Update pause: continuations and synthesized turns](mirror-3423-d-update-pause-continuations.md) | 3165 | Resume note warns that earlier tool output may be stale. |
+| [OOM-killed command takes the command, not the run](mirror-3423-d-worker-oom-policy.md) | 3166 | Kanban run scopes use OOMPolicy=continue and OOM kills are named. |
+| [OOM-killed command takes the command, not the run](mirror-3423-d-worker-oom-policy.md) | 3167 | Allowlists the OOMPolicy probe's systemd-run lookup in the resolution guard. |
+| [Pool placement labels and profile parity](mirror-3423-d-pool-placement-labels.md) | 3168 | One shared profile_label helper for the Board's profile rule. |
+| [Explicit card review requirements and review receipts](mirror-3423-d-review-required-cards.md) | 3169 | review_required refusals name the operator rule and refuse before the goal judge. |
+| [Desktop stripe: red reasons and stale prompts](mirror-3423-d-desktop-stripe-red-reason.md) | 3170 | Reconnect retires turn-live-only claims and only needs-input rows track prompt inputs. |
+| [Test deflakes and small review follow-ups](mirror-3423-d-test-flakes-and-small-followups.md) | 3171 | Peer member gateway test boots on an API-server port it owns. |
+| [Pool placement labels and profile parity](mirror-3423-d-pool-placement-labels.md) | 3172 | Denied cards keep the worker queue across a restart and self-check repins stranded worker-first cards. |
+| [Explicit card review requirements and review receipts](mirror-3423-d-review-required-cards.md) | 3173 | Carries home review continuation receipts to replicas. |
+| [Explicit card review requirements and review receipts](mirror-3423-d-review-required-cards.md) | 3174 | Fences portable receipts on origin and contradictory evidence. |
+| [Kanban review-release authority: boundary tests and replica-only stamp](mirror-3423-e-kanban-review-release-tests.md) | 3175 | Tests that a home review receipt crosses the snapshot feed and pickup, including baseline-guard failure. |
+| [Kanban review-release authority: boundary tests and replica-only stamp](mirror-3423-e-kanban-review-release-tests.md) | 3176 | Adds boundary suites for portable release authority and observed-PR hold. |
+| [Kanban review-release authority: boundary tests and replica-only stamp](mirror-3423-e-kanban-review-release-tests.md) | 3177 | Adds mutation-killing release/observation guard tests and drops a duplicate producer parent fence. |
+| [Kanban review-release authority: boundary tests and replica-only stamp](mirror-3423-e-kanban-review-release-tests.md) | 3178 | Drops a provably redundant missing-origin operand in the review-release consumer. |
+| [Kanban review-release authority: boundary tests and replica-only stamp](mirror-3423-e-kanban-review-release-tests.md) | 3179 | Makes only a replica honour the home's review-release stamp. |
+| [Kanban review-release authority: boundary tests and replica-only stamp](mirror-3423-e-kanban-review-release-tests.md) | 3180 | Makes the review-release consumer check home origin unconditionally. |
+| [Kanban pool placement: park pin, repin fallback, local-marker queueing](mirror-3423-e-kanban-pool-placement.md) | 3181 | Park pin ignores a text-named shared checkout and treats untracked remote branches and single-branch clones correctly. |
+| [Kanban hub admission: refusal reasons, claim-time denies, home routing](mirror-3423-e-kanban-hub-admission.md) | 3182 | Review nits: hub-admin lookbehind, normalized requires list on the home route, and reporting home denies. |
+| [Update-pause auto-continue: refused kickoffs, stale refusals, yield before error accounting](mirror-3423-e-update-pause-continue.md) | 3183 | A refused auto-continue kickoff drops its marker inputs and caps its watcher re-arms. |
+| [Desktop: single holdsTurnClaim predicate](mirror-3423-e-desktop-turn-claim-predicate.md) | 3184 | Adds one holdsTurnClaim predicate for busy, awaiting and turnLive state. |
+| [Upstream sync d01ed2bfac: merge fixups and code-health ratchets](mirror-3423-e-upstream-sync-d01ed2bfac.md) | 3185 | Hosted reads skip the host-home guard and the composed worker test advances generation 0 after the upstream merge. |
+| [Upstream sync d01ed2bfac: merge fixups and code-health ratchets](mirror-3423-e-upstream-sync-d01ed2bfac.md) | 3186 | Code-health ratchet moves: notify-identity helper, authority_cwd fixture and HX016 allowances, no behavior change. |
+| [Upstream sync d01ed2bfac: merge fixups and code-health ratchets](mirror-3423-e-upstream-sync-d01ed2bfac.md) | 3187 | Full-suite fixes after the merge across worker env/client, state schema and sidecar keys, and several tests. |
+| [Upstream sync d01ed2bfac: merge fixups and code-health ratchets](mirror-3423-e-upstream-sync-d01ed2bfac.md) | 3188 | Brings prompt_builder back under the file-line target. |
+| [Upstream sync d01ed2bfac: merge fixups and code-health ratchets](mirror-3423-e-upstream-sync-d01ed2bfac.md) | 3189 | Restores file-line targets in prompt_builder, kanban and kanban_tools after merging main. |
+| [Upstream sync d01ed2bfac: merge fixups and code-health ratchets](mirror-3423-e-upstream-sync-d01ed2bfac.md) | 3190 | Delegated children get the private-scratch note on fresh runs only; continue tests pin turns without it. |
+| [Upstream sync d01ed2bfac: merge fixups and code-health ratchets](mirror-3423-e-upstream-sync-d01ed2bfac.md) | 3191 | Drops an unused noqa in a delegate test. |
+| [Upstream sync d01ed2bfac: merge fixups and code-health ratchets](mirror-3423-e-upstream-sync-d01ed2bfac.md) | 3192 | Adapts main's new gateway tests to claimed admissions, resumes_parent and the private-scratch note. |
+| [Upstream sync d01ed2bfac: merge fixups and code-health ratchets](mirror-3423-e-upstream-sync-d01ed2bfac.md) | 3193 | Keeps the merged prompt builder within its line cap. |
+| [Upstream sync d01ed2bfac: merge fixups and code-health ratchets](mirror-3423-e-upstream-sync-d01ed2bfac.md) | 3194 | Aligns new fork test fixtures with upstream claim and completion contracts. |
+| [Upstream sync d01ed2bfac: merge fixups and code-health ratchets](mirror-3423-e-upstream-sync-d01ed2bfac.md) | 3195 | Unviewed-delegation tests: success resumes (upstream) while a requested stop stays a note (fork). |
+| [Upstream sync d01ed2bfac: merge fixups and code-health ratchets](mirror-3423-e-upstream-sync-d01ed2bfac.md) | 3196 | Regenerates the serve handler ledger after the main merge. |
+| [Upstream sync d01ed2bfac: merge fixups and code-health ratchets](mirror-3423-e-upstream-sync-d01ed2bfac.md) | 3197 | Brings conversation_loop under 2000 lines after the main merge. |
+| [Test hygiene: shared helpers, deflakes and pins](mirror-3423-e-test-hygiene.md) | 3198 | Moves placement ROUTE/decide test helpers into a shared helpers module. |
+| [Test hygiene: shared helpers, deflakes and pins](mirror-3423-e-test-hygiene.md) | 3199 | Deflakes the hosted-room cancel test by observing the interrupt on receipt. |
+| [CI review comment: retry budget, re-refresh queueing, budget pins](mirror-3423-e-ci-review-comment-budget.md) | 3200 | Gives the review-comment sweep a wall-clock retry budget and one re-refresh per head. |
+| [CI review comment: retry budget, re-refresh queueing, budget pins](mirror-3423-e-ci-review-comment-budget.md) | 3201 | The re-refresh's own failed footer points at the hourly sweep. |
+| [Test hygiene: shared helpers, deflakes and pins](mirror-3423-e-test-hygiene.md) | 3202 | Pins the run_heads sort so head order never changes a CI premise. |
+| [Desktop: keep a slow-but-alive SSH backend (slow-link mode)](mirror-3423-e-desktop-slow-link.md) | 3203 | Keeps a slow-but-alive SSH backend with slow-link state, stretched timeouts, poll thinning and prefetch pause. |
+| [Desktop: keep a slow-but-alive SSH backend (slow-link mode)](mirror-3423-e-desktop-slow-link.md) | 3204 | Follows noteRemoteAnswer into slow-link.ts in the warm-dispatch test and tests the answer ledger and first-request log. |
+| [Desktop: single holdsTurnClaim predicate](mirror-3423-e-desktop-turn-claim-predicate.md) | 3205 | Routes holdsUpdateHeldPromptIdle through holdsTurnClaim. |
+| [Test hygiene: shared helpers, deflakes and pins](mirror-3423-e-test-hygiene.md) | 3206 | Group peer suites set member config through the fixture and boot via _member. |
+| [Kanban hub admission: refusal reasons, claim-time denies, home routing](mirror-3423-e-kanban-hub-admission.md) | 3207 | Gives each hub final-gate refusal branch its own reason and cuts census column reads to one row. |
+| [Kanban sync: SQLite divergence prefilter, off-thread links pass, FakeHub lease release](mirror-3423-e-kanban-sync-perf-fakehub.md) | 3208 | Test FakeHub lease release always emits the run-outcome event and honors the outcome. |
+| [Upstream sync d01ed2bfac: merge fixups and code-health ratchets](mirror-3423-e-upstream-sync-d01ed2bfac.md) | 3209 | Keeps the fork-local dike plugin catalog pin during upstream sync. |
+| [Test and pm environments borrow the account's verified tool store](mirror-3423-e-tool-store-borrowing.md) | 3210 | run_tests.sh with a custom HERMES_HOME borrows the account tool store. |
+| [Test and pm environments borrow the account's verified tool store](mirror-3423-e-tool-store-borrowing.md) | 3211 | A borrower declines an optional default the account store never installed. |
+| [Desktop: bounded remote request deadlines](mirror-3423-e-desktop-request-deadlines.md) | 3212 | Adds a total per-attempt request deadline, a dedicated probe pool and a 20 s down-gate trial deadline. |
+| [Kanban pool placement: park pin, repin fallback, local-marker queueing](mirror-3423-e-kanban-pool-placement.md) | 3213 | Worker-first self-check reserves when the board refuses its repin at the same revision. |
+| [Kanban sync: SQLite divergence prefilter, off-thread links pass, FakeHub lease release](mirror-3423-e-kanban-sync-perf-fakehub.md) | 3214 | Divergence repair compares settled cards in SQLite and the chat-link pass runs off the round thread. |
+| [Kanban hub admission: refusal reasons, claim-time denies, home routing](mirror-3423-e-kanban-hub-admission.md) | 3215 | A claim-time hub deny moves portable cards to the worker queue and self-check re-places denied cards. |
+| [Kanban priority capture: replay open/terminal churn to the final head](mirror-3423-e-kanban-priority-feed-churn.md) | 3216 | Priority capture replays open and terminal churn to the final head. |
+| [Kanban consent and delivery: verb-scoped negation, fail-closed provenance, stop lineage](mirror-3423-e-kanban-consent-delivery.md) | 3217 | Scopes claim negation to the verb and fails closed on unsynced creation provenance. |
+| [Kanban consent and delivery: verb-scoped negation, fail-closed provenance, stop lineage](mirror-3423-e-kanban-consent-delivery.md) | 3218 | Stops follow compression lineage and worker comments and summary edits are fenced. |
+| [Kanban tool surface: completion receipt schema, wake summary, review wording](mirror-3423-e-kanban-tool-surface.md) | 3219 | Moves _store_attachment into the attach-url sibling module for a line-count offset. |
+| [Plugin `*_nowait` probes never wait on a held sweep](mirror-3423-e-plugin-nowait-probes.md) | 3220 | Plugin nowait probes serve known sets instead of waiting on a sweep another thread holds. |
+| [Kanban hub admission: refusal reasons, claim-time denies, home routing](mirror-3423-e-kanban-hub-admission.md) | 3221 | A re-pickup prior-deny skip names its home reason and path-qualified hub-admin stays home. |
+| [Desktop: bounded remote request deadlines](mirror-3423-e-desktop-request-deadlines.md) | 3222 | Adds an upload body budget, documents the trial-deadline trade-off and tests a late answer. |
+| [Gateway update exit bound and always-on keep-alive drain](mirror-3423-e-gateway-exit-and-drain.md) | 3223 | Bounds asyncio.run's shutdown and the outer finally to a core update's exit target. |
+| [Update-pause auto-continue: refused kickoffs, stale refusals, yield before error accounting](mirror-3423-e-update-pause-continue.md) | 3224 | Auto-continue kickoff clears a stale turn-owner refusal before its submit. |
+| [Update-pause auto-continue: refused kickoffs, stale refusals, yield before error accounting](mirror-3423-e-update-pause-continue.md) | 3225 | Update-pause yields before API-error accounting and pins api-error, crossed-cancel and streamed-bubble paths. |
+| [Gateway update exit bound and always-on keep-alive drain](mirror-3423-e-gateway-exit-and-drain.md) | 3226 | Drains keep-alive sockets before a superseded always-on backend retires. |
+| [Kanban tool surface: completion receipt schema, wake summary, review wording](mirror-3423-e-kanban-tool-surface.md) | 3227 | kanban_complete advertises the metadata.completion_receipt v1 shape. |
+| [Kanban pool placement: park pin, repin fallback, local-marker queueing](mirror-3423-e-kanban-pool-placement.md) | 3228 | Queues a local-marker card only when one live machine holds its whole label set. |
+| [Test hygiene: shared helpers, deflakes and pins](mirror-3423-e-test-hygiene.md) | 3229 | The lockguard stranded-fd scan matches only the board's own sidecars. |
+| [Test and pm environments borrow the account's verified tool store](mirror-3423-e-tool-store-borrowing.md) | 3230 | A fresh HERMES_HOME links the account's verified tools, uv cache and source snapshot. |
+| [CI review comment: retry budget, re-refresh queueing, budget pins](mirror-3423-e-ci-review-comment-budget.md) | 3231 | Pins the budget check before each artifact's first download. |
+| [Kanban tool surface: completion receipt schema, wake summary, review wording](mirror-3423-e-kanban-tool-surface.md) | 3232 | Kanban show states what wakes a scheduled card on the status line and in JSON. |
+| [Kanban sync: SQLite divergence prefilter, off-thread links pass, FakeHub lease release](mirror-3423-e-kanban-sync-perf-fakehub.md) | 3233 | FakeHub lease release guards outcomes, merges diagnostic/extra and refuses spawn_failed. |
+| [Plugin `*_nowait` probes never wait on a held sweep](mirror-3423-e-plugin-nowait-probes.md) | 3234 | Documents and logs the empty on-loop fallback of plugin nowait probes. |
+| [Kanban tool surface: completion receipt schema, wake summary, review wording](mirror-3423-e-kanban-tool-surface.md) | 3235 | An in-review review_required card is never told it is not in review. |
+| [Desktop: bounded remote request deadlines](mirror-3423-e-desktop-request-deadlines.md) | 3236 | Tests a mid-transfer upload stall and routes request sending through sendWithRequestDeadline. |
+| [Kanban priority capture reads the inventory at one fixed head](mirror-3423-f-kanban-priority-capture-fixed-head.md) | 3237 | Priority capture refuses snapshot page heads that decrease. |
+| [Lifecycle guard budget refusals name the file and the cap](mirror-3423-f-lifecycle-guard-budget-refusal-messages.md) | 3238 | Budget refusals name the file and which limit (bytes, lines, longest line) was hit. |
+| [Kanban worker scope: capability checks and scratch-home fence](mirror-3423-f-kanban-worker-scope-and-capability-checks.md) | 3239 | Exempts the fenced root's auto-pruned scratch directory from the Kanban path fence so probe homes stop leaking. |
+| [Core-update pause: carried turns and first-request follow-ups](mirror-3423-f-update-pause-carried-turns.md) | 3240 | Announces a carried turn's pause and names the paused notification turn in its continuation. |
+| [Core-update pause: carried turns and first-request follow-ups](mirror-3423-f-update-pause-carried-turns.md) | 3241 | Only a turn without its own marker counts as carried; a retried own pause does not. |
+| [Kanban operator delivery claims and completion-receipt schema](mirror-3423-f-kanban-operator-delivery-and-completion-receipts.md) | 3242 | Colon, dash and open parenthesis end the claim negation window, and only the unsynced caller's call is deferred. |
+| [Kanban worker scope: capability checks and scratch-home fence](mirror-3423-f-kanban-worker-scope-and-capability-checks.md) | 3243 | Capability checks read the assignee policy inside a bound worker scope. |
+| [Kanban worker-first self-check repin refusals](mirror-3423-f-kanban-selfcheck-repin-refusals.md) | 3244 | Denied-card self-check reads the screen's verdict and skips the history read for kept cards; documents portable_wake_probes. |
+| [Model-scoped quota cooldown recovery and contradiction reporting](mirror-3423-f-quota-cooldown-recovery.md) | 3245 | Scoped cooldown recovery with generation-aware clear receipts that survives stale pool writers. |
+| [Model-scoped quota cooldown recovery and contradiction reporting](mirror-3423-f-quota-cooldown-recovery.md) | 3246 | Wires quota recovery and owner-side contradiction reporting into auth, workers and dispatch. |
+| [Model-scoped quota cooldown recovery and contradiction reporting](mirror-3423-f-quota-cooldown-recovery.md) | 3247 | Validates quota proof response bodies and bounds streaming recovery. |
+| [Model-scoped quota cooldown recovery and contradiction reporting](mirror-3423-f-quota-cooldown-recovery.md) | 3248 | Adds socket-level tests proving quota recovery identity and transport boundaries. |
+| [Model-scoped quota cooldown recovery and contradiction reporting](mirror-3423-f-quota-cooldown-recovery.md) | 3249 | Bounds quota proof DNS lifetime with a reaped resolver. |
+| [Model-scoped quota cooldown recovery and contradiction reporting](mirror-3423-f-quota-cooldown-recovery.md) | 3250 | Keeps account status on an unchanged-pair flush, annotates the contradiction DB, and widens DNS test slack. |
+| [Kanban worker-first self-check repin refusals](mirror-3423-f-kanban-selfcheck-repin-refusals.md) | 3251 | A transient Board error no longer disables the self-check repin. |
+| [Kanban operator delivery claims and completion-receipt schema](mirror-3423-f-kanban-operator-delivery-and-completion-receipts.md) | 3252 | The completion_receipt schema lists evidence.operator_delivery and states the timezone and byte-cap rules. |
+| [macOS state lane CI routing](mirror-3423-f-macos-state-lane-ci-routing.md) | 3253 | Stops running the macOS hermes_state lane on main pushes and adds a scheduled backstop. |
+| [Gateway event-loop stalls and kanban scratch GC](mirror-3423-f-gateway-loop-stalls-and-scratch-gc.md) | 3254 | Removes per-request stat and realpath work from the event loop and moves scratch GC off the board lock. |
+| [Package manager: borrowing homes and tool-store pins](mirror-3423-f-pm-borrowing-home-environment.md) | 3255 | A borrowing home compiles bytecode eagerly when PYTHONDONTWRITEBYTECODE is set. |
+| [Desktop JSON fetch seam and probe pool tests](mirror-3423-f-desktop-json-fetch-seam.md) | 3256 | Moves fetchJson and fetchPublicJson into json-fetch.ts so tests drive them directly. |
+| [Kanban parked waits: CI runs that cannot start and show park display](mirror-3423-f-kanban-ci-wait-and-park-display.md) | 3257 | Refuses a CI-wait park on a run with no runner and wakes a parked card whose run stops starting. |
+| [Kanban parked waits: CI runs that cannot start and show park display](mirror-3423-f-kanban-ci-wait-and-park-display.md) | 3258 | CI run progress resolves gh through the platform resolver. |
+| [Gateway post-tail exit bound: exit code, diagnostics, hand-back](mirror-3423-f-gateway-post-tail-exit-bound.md) | 3259 | The post-tail bound uses the unwinding exit code, writes an exit-diag record and wakes a parked funnel on hand-back. |
+| [Kanban operator delivery claims and completion-receipt schema](mirror-3423-f-kanban-operator-delivery-and-completion-receipts.md) | 3260 | An operator completing an in-review card with a run id is told to omit it. |
+| [execute_code sandbox terminal() returns complete output](mirror-3423-f-execute-code-terminal-full-output.md) | 3261 | Sandbox terminal() returns the complete spilled output with truncated false instead of the chat window. |
+| [execute_code sandbox terminal() returns complete output](mirror-3423-f-execute-code-terminal-full-output.md) | 3262 | Pending-approval terminal results keep their exact shape. |
+| [execute_code sandbox terminal() returns complete output](mirror-3423-f-execute-code-terminal-full-output.md) | 3263 | Reports truncated true for a windowed output with no readable spill. |
+| [Profile config scope inside a bound launch scope](mirror-3423-f-profile-config-scope-bound-launch.md) | 3264 | profile_config_scope binds the launch scope inside a bound scope instead of raising. |
+| [Kanban parked waits: CI runs that cannot start and show park display](mirror-3423-f-kanban-ci-wait-and-park-display.md) | 3265 | kanban show reads the park through the dispatcher's lookup and says a legacy human park will be blocked. |
+| [Kanban PR-owner holds, handoffs and review release](mirror-3423-f-kanban-pr-owner-holds-and-handoffs.md) | 3266 | Review release skips held cards in prepare() and adds a real-feed resume test. |
+| [Kanban PR-owner holds, handoffs and review release](mirror-3423-f-kanban-pr-owner-holds-and-handoffs.md) | 3267 | Notes that review_release stamp authority depends on task_events.origin_gateway. |
+| [Package manager: borrowing homes and tool-store pins](mirror-3423-f-pm-borrowing-home-environment.md) | 3268 | Documents the sticky borrower decline and makes run_tests.sh read-only for the store. |
+| [Package manager: borrowing homes and tool-store pins](mirror-3423-f-pm-borrowing-home-environment.md) | 3269 | Documents that the decline clears only on a same-target pm install. |
+| [Kanban replica freshness, ready-wait notices and sync diagnostics](mirror-3423-f-kanban-replica-freshness-and-sync-diagnostics.md) | 3270 | The chat-link pass logs how long it took. |
+| [Kanban worker scope: capability checks and scratch-home fence](mirror-3423-f-kanban-worker-scope-and-capability-checks.md) | 3271 | The capsule requirement warning names the policy exception. |
+| [Kanban worker scope: capability checks and scratch-home fence](mirror-3423-f-kanban-worker-scope-and-capability-checks.md) | 3272 | Capability checks the own profile under its launch secret scope. |
+| [Kanban replica freshness, ready-wait notices and sync diagnostics](mirror-3423-f-kanban-replica-freshness-and-sync-diagnostics.md) | 3273 | Fake hub and service release routes share diagnostic and evidence helpers. |
+| [Package manager: borrowing homes and tool-store pins](mirror-3423-f-pm-borrowing-home-environment.md) | 3274 | A borrowing home runs the owner's committed environment. |
+| [Kanban hub CPU alert threshold and OOM attribution](mirror-3423-f-kanban-hub-cpu-alert-and-oom-attribution.md) | 3275 | The hub CPU alert uses the pre-lease advisory's 10 s staleness limit. |
+| [Kanban hub CPU alert threshold and OOM attribution](mirror-3423-f-kanban-hub-cpu-alert-and-oom-attribution.md) | 3276 | OOM victim lookup after a restart, bounded journal read and honest exit-137 attribution. |
+| [Kanban PR-owner holds, handoffs and review release](mirror-3423-f-kanban-pr-owner-holds-and-handoffs.md) | 3277 | Hub resume accepts a runner-only active_pr hold after any latest transition. |
+| [Kanban PR-owner holds, handoffs and review release](mirror-3423-f-kanban-pr-owner-holds-and-handoffs.md) | 3278 | Releases a PR owner whose same-second park or awaited exact-head review handed it off. |
+| [Kanban worker-first self-check repin refusals](mirror-3423-f-kanban-selfcheck-repin-refusals.md) | 3279 | Remembers uncoded persistent 4xx and 501 self-check repin refusals. |
+| [Core-update pause: carried turns and first-request follow-ups](mirror-3423-f-update-pause-carried-turns.md) | 3280 | Documents first-request pause follow-ups without a behavior change. |
+| [Kanban operator delivery claims and completion-receipt schema](mirror-3423-f-kanban-operator-delivery-and-completion-receipts.md) | 3281 | The completion_receipt schema advertises the strict evidence.operator_delivery shape from shared constants. |
+| [Kanban replica freshness, ready-wait notices and sync diagnostics](mirror-3423-f-kanban-replica-freshness-and-sync-diagnostics.md) | 3282 | Backfill looks provenance verdicts up before its write transaction and prefetch skips foreign refs. |
+| [Kanban replica freshness, ready-wait notices and sync diagnostics](mirror-3423-f-kanban-replica-freshness-and-sync-diagnostics.md) | 3283 | Ready-wait notices check the live board against its pulled replica. |
+| [Kanban replica freshness, ready-wait notices and sync diagnostics](mirror-3423-f-kanban-replica-freshness-and-sync-diagnostics.md) | 3284 | Replica freshness compares only primary-mode boards and keeps live rows with unpushed changes. |
+| [Desktop JSON fetch seam and probe pool tests](mirror-3423-f-desktop-json-fetch-seam.md) | 3285 | json-fetch tests derive the probe pool size and share one loopback server helper. |
+| [Profile config scope inside a bound launch scope](mirror-3423-f-profile-config-scope-bound-launch.md) | 3286 | Pins TurnScope preservation when profile_config_scope re-enters the bound launch home. |
+| [macOS state lane CI routing](mirror-3423-f-macos-state-lane-ci-routing.md) | 3287 | Starts the macOS state lane for hermes_state's load-time imports. |
+| [macOS state lane CI routing](mirror-3423-f-macos-state-lane-ci-routing.md) | 3288 | The import scanner reads only bare TYPE_CHECKING guards as type-only and walks match-case bodies. |
+| [Gateway event-loop stalls and kanban scratch GC](mirror-3423-f-gateway-loop-stalls-and-scratch-gc.md) | 3289 | Kanban gc sweeps stale gc-rm trash, logs a SELECT abort, and resets one home-key memo. |
+| [Lifecycle guard budget refusals name the file and the cap](mirror-3423-f-lifecycle-guard-budget-refusal-messages.md) | 3290 | The budget refusal reports the file's own line count. |
+| [Lifecycle guard budget refusals name the file and the cap](mirror-3423-f-lifecycle-guard-budget-refusal-messages.md) | 3291 | A cap-line file read after earlier text reports what was left of the budget. |
+| [Gateway post-tail exit bound: exit code, diagnostics, hand-back](mirror-3423-f-gateway-post-tail-exit-bound.md) | 3292 | The post-tail watcher hands the exit back on any BaseException and shares one SystemExit code mapping. |
+| [Kanban priority capture reads the inventory at one fixed head](mirror-3423-f-kanban-priority-capture-fixed-head.md) | 3293 | Capture reads the inventory at one fixed head so mid-window creations join it. |
+| [Kanban source receipt on the status-leaving wire op (spike R1)](mirror-3423-f-kanban-source-receipt-spike.md) | 3294 | Adds spike tests for source_receipt on the status-leaving wire op. |
+| [Kanban source receipt on the status-leaving wire op (spike R1)](mirror-3423-f-kanban-source-receipt-spike.md) | 3295 | Adds the pending receipt table and trigger pair. |
+| [Kanban source receipt on the status-leaving wire op (spike R1)](mirror-3423-f-kanban-source-receipt-spike.md) | 3296 | Replaces it with a one-statement pending receipt and purges it in _end_run. |
+| [Kanban source receipt on the status-leaving wire op (spike R1)](mirror-3423-f-kanban-source-receipt-spike.md) | 3297 | Allows virtual wire fields through _wire_fields and keeps them on an unseen full row. |
+| [Kanban source receipt on the status-leaving wire op (spike R1)](mirror-3423-f-kanban-source-receipt-spike.md) | 3298 | An old Board's forbidden_field on a virtual wire field drops it without an omission. |
+| [Kanban workspace_source v1 (inert core PR-1)](mirror-3423-g-kanban-workspace-source-v1.md) | 3299 | Trims kanban_db.py to fit its health line budget. |
+| [Kanban workspace_source v1 (inert core PR-1)](mirror-3423-g-kanban-workspace-source-v1.md) | 3300 | Wraps every voluntary ending and escalate in with_source_receipt, adds an AST guard and the multi-field strip-and-resend path. |
+| [Kanban workspace_source v1 (inert core PR-1)](mirror-3423-g-kanban-workspace-source-v1.md) | 3301 | Adds the inert workspace_source core: manifest, clone proof and attestation, grant snapshot, routing, resolver with typed refusals, field fence. |
+| [Kanban workspace_source v1 (inert core PR-1)](mirror-3423-g-kanban-workspace-source-v1.md) | 3302 | Health fixes: lint annotations, utf-8 git decoding, live checkout via project_root_str. |
+| [Kanban workspace_source v1 (inert core PR-1)](mirror-3423-g-kanban-workspace-source-v1.md) | 3303 | Pins the Board row-field list to the merged Board change. |
+| [Kanban workspace_source v1 (inert core PR-1)](mirror-3423-g-kanban-workspace-source-v1.md) | 3304 | Releases unused source grants without retaining custody and adds the refusal-block module. |
+| [Kanban workspace_source v1 (inert core PR-1)](mirror-3423-g-kanban-workspace-source-v1.md) | 3305 | Review follow-ups for source refusals: orphan follow-up retention, feed-safety on follow-up failure, subprocess guards. |
+| [Kanban review follow-ups: hold test name, GC logging, priority feed rows](mirror-3423-g-kanban-review-nit-followups.md) | 3306 | Renames the local observed-hold test to the hold-after-latest-boundary rule. |
+| [Own-profile capability check honors the launch TERMINAL_* env](mirror-3423-g-kanban-own-profile-launch-terminal-env.md) | 3307 | Own-profile capability check applies the launch TERMINAL_* overlay. |
+| [Borrowing launch hands its verdict across the store-Python relaunch](mirror-3423-g-venv-sync-borrowed-launch-handoff.md) | 3308 | A served borrowing launch hands its verdict across the relaunch so probes are not repeated. |
+| [kanban_complete receipt schema: text pattern and size budget](mirror-3423-g-kanban-completion-receipt-schema.md) | 3309 | Receipt text fields advertise the writer's nonblank no-control pattern via one shared TEXT_PATTERN. |
+| [CI review comments: refresh budget and budget-skip marking](mirror-3423-g-ci-review-budget-skip.md) | 3310 | Lowers the max refresh delay and marks budget-skipped targeted PRs as refresh failed. |
+| [Chat-wait lag warning once per stall per board](mirror-3423-g-kanban-chat-wait-lag-warning.md) | 3311 | Keys the lag-warned state per board so a lagging board warns once per stall. |
+| [Hub claim screen: named deferrals and origin-aware skip wording](mirror-3423-g-kanban-hub-claim-screen-deferrals.md) | 3312 | Names deferred cards in tick diagnostics and re-reads each card's row at its turn. |
+| [CI-run progress check reads GitHub through the credential broker prefix](mirror-3423-g-kanban-ci-run-progress-broker.md) | 3313 | CI-run progress reads GitHub through the configured broker prefix. |
+| [Update-pause: carried pause stamp taken back; doc nits](mirror-3423-g-update-pause-carried-turn-stamp.md) | 3314 | Takes back a carried pause's stamp when the pause does not stand. |
+| [Kanban review follow-ups: hold test name, GC logging, priority feed rows](mirror-3423-g-kanban-review-nit-followups.md) | 3315 | Scratch GC logs each swept detached tree and fixes a comment. |
+| [Kanban review follow-ups: hold test name, GC logging, priority feed rows](mirror-3423-g-kanban-review-nit-followups.md) | 3316 | Priority feed keeps terminal arrivals in capture rows and documents fixed-head limits. |
+| [Hub claim screen: named deferrals and origin-aware skip wording](mirror-3423-g-kanban-hub-claim-screen-deferrals.md) | 3317 | Hub admission tests share a support module and the no-JSON1 fallback is documented. |
+| [Kanban session provenance: reads_local_store shares scoped_sources routing](mirror-3423-g-kanban-provenance-local-store-routing.md) | 3318 | reads_local_store shares scoped_sources' routing through one helper. |
+| [Kanban: say so when a write is queued locally while Board sync is stopped](mirror-3423-g-kanban-queued-local-board-delivery.md) | 3319 | Writes kept local by a stopped Board sync report queued_local instead of promising live-run delivery. |
+| [Kanban: say so when a write is queued locally while Board sync is stopped](mirror-3423-g-kanban-queued-local-board-delivery.md) | 3320 | A create placed elsewhere while sync is stopped says the chat link waits. |
+| [Kanban worker: fail-closed resolver exit and owner capsule preadmission proof](mirror-3423-g-kanban-worker-owner-refusals.md) | 3321 | A resolver child that exits early fails closed instead of raising BrokenPipeError. |
+| [Kanban sync links pass serialization and fake-board fidelity](mirror-3423-g-kanban-sync-links-pass-and-fake-board.md) | 3322 | Test fake Board release refuses non-object extra, counts numbers like JSON.stringify, refuses spawn_failed on ops. |
+| [CI review comments: refresh budget and budget-skip marking](mirror-3423-g-ci-review-budget-skip.md) | 3323 | Tests the CI-triggered budget-skip marker and words the skip log line per mode. |
+| [Kanban: a run the holder ends frees its Board lease while the outbox is stalled](mirror-3423-g-kanban-run-end-lease-release.md) | 3324 | Run-ending transitions queue a direct lease release when the outbox is stalled. |
+| [kanban_complete receipt schema: text pattern and size budget](mirror-3423-g-kanban-completion-receipt-schema.md) | 3325 | Shortens TEXT_PATTERN and documents the schema cost. |
+| [Kanban sync links pass serialization and fake-board fidelity](mirror-3423-g-kanban-sync-links-pass-and-fake-board.md) | 3326 | Serializes links passes across loop restarts with a process-wide lock and adds a run-ref prefilter test. |
+| [Kanban worker: fail-closed resolver exit and owner capsule preadmission proof](mirror-3423-g-kanban-worker-owner-refusals.md) | 3327 | An owner's pre-session capsule refusal books a preadmission proof and requeues. |
+| [Own-profile capability check honors the launch TERMINAL_* env](mirror-3423-g-kanban-own-profile-launch-terminal-env.md) | 3328 | launch_terminal_env reads the live env until multiplexing and never freezes early. |
+| [Chat-wait lag warning once per stall per board](mirror-3423-g-kanban-chat-wait-lag-warning.md) | 3329 | A sweep with nothing due ends the board's lag stall. |
+| [Hub claim screen: named deferrals and origin-aware skip wording](mirror-3423-g-kanban-hub-claim-screen-deferrals.md) | 3330 | Sibling hub admission suites import the shared support module instead of another test module. |
+| [Kanban operator delivery: claim classifier and unproven-caller refusal](mirror-3423-g-kanban-operator-claim-classifier.md) | 3331 | Spaced hyphen ends the claim window, be-posted is never a claim, deferrals take no tick slot. |
+| [Kanban operator delivery: claim classifier and unproven-caller refusal](mirror-3423-g-kanban-operator-claim-classifier.md) | 3332 | Refuses an unproven caller before deferring it and extends dash and be/being handling. |
+| [Desktop: session writes ride across a hub reconnect](mirror-3423-g-desktop-session-write-reconnect.md) | 3333 | Archive, pin and unread writes retry across a hub reconnect and replay with the same identity. |
+| [Kanban placement: whole-label-set liveness and promotion keep reasons](mirror-3423-g-kanban-placement-label-liveness.md) | 3334 | A no-marker card queues only when one live machine holds queue and coordination labels. |
+| [Kanban placement: whole-label-set liveness and promotion keep reasons](mirror-3423-g-kanban-placement-label-liveness.md) | 3335 | Annotates label_machines as str or Iterable of str. |
+| [Hub claim screen: named deferrals and origin-aware skip wording](mirror-3423-g-kanban-hub-claim-screen-deferrals.md) | 3336 | Claim deferrals carry their origin and skip wording reads it. |
+| [Kanban: a tui notice and its chat's local wake deliver each event once](mirror-3423-g-tui-notice-wake-custody.md) | 3337 | Delivers each tui notice and local wake event once and lets the gateway claim follow the wake-sibling rules. |
+| [Kanban: a tui notice and its chat's local wake deliver each event once](mirror-3423-g-tui-notice-wake-custody.md) | 3338 | A settled held claim stays resolved after recovery and the poller sees lineage-root ownership. |
+| [Kanban: a tui notice and its chat's local wake deliver each event once](mirror-3423-g-tui-notice-wake-custody.md) | 3339 | A root local wake settles and floors tui rows on compression tips too. |
+| [Kanban: a tui notice and its chat's local wake deliver each event once](mirror-3423-g-tui-notice-wake-custody.md) | 3340 | Moves the left-open notice suffix to kanban_notice_text and shares a lineage helper. |
+| [Kanban: a tui notice and its chat's local wake deliver each event once](mirror-3423-g-tui-notice-wake-custody.md) | 3341 | Legacy hand-back uses the gateway claim's predicate and probes owner state once per chat per poll. |
+| [Kanban session provenance: reads_local_store shares scoped_sources routing](mirror-3423-g-kanban-provenance-local-store-routing.md) | 3342 | Resolves local_gateway=None through one shared resolver. |
+| [Turn finalizer: a failed turn with a tool tail keeps its reason](mirror-3423-g-turn-finalizer-failed-tool-tail.md) | 3343 | A failed turn with a tool tail keeps its failure reason instead of pending_tool_result. |
+| [CI-run progress check reads GitHub through the credential broker prefix](mirror-3423-g-kanban-ci-run-progress-broker.md) | 3344 | Binds the dispatching home in the CI-run sweep, warns per home and fixes gh-missing wording. |
+| [Kanban: say so when a write is queued locally while Board sync is stopped](mirror-3423-g-kanban-queued-local-board-delivery.md) | 3345 | CLI writes kept local by the stopped sync print a queued-locally notice. |
+| [Kanban sync links pass serialization and fake-board fidelity](mirror-3423-g-kanban-sync-links-pass-and-fake-board.md) | 3346 | Warns once per hold when another runner's pass holds the pass lock. |
+| [Update-pause: carried pause stamp taken back; doc nits](mirror-3423-g-update-pause-carried-turn-stamp.md) | 3347 | Comment and docstring nits only. |
+| [execute_code: cap the spill a remote file-RPC terminal result inlines](mirror-3423-g-execute-code-remote-spill-cap.md) | 3348 | Caps the spill a remote file-RPC terminal result inlines and documents raw spill output. |
+| [execute_code: cap the spill a remote file-RPC terminal result inlines](mirror-3423-g-execute-code-remote-spill-cap.md) | 3349 | Bounds the encoded JSON result rather than just the raw spill. |
+| [Chat-wait lag warning once per stall per board](mirror-3423-g-kanban-chat-wait-lag-warning.md) | 3350 | A lag stall ends only when the lag closes, not when nothing is due. |
+| [kanban_complete receipt schema: text pattern and size budget](mirror-3423-g-kanban-completion-receipt-schema.md) | 3351 | Budgets schema bytes instead of pattern length and corrects the ref cost note. |
+| [Kanban: a run the holder ends frees its Board lease while the outbox is stalled](mirror-3423-g-kanban-run-end-lease-release.md) | 3352 | Pins all holder run-end lease releases in tests and documents the stalled window. |
+| [Kanban missing-parent detection judged only from a fresh replica](mirror-3423-g-kanban-missing-parent-freshness.md) | 3353 | Judges missing parents and unclaimed-ready notices only from a replica copy at the feed head. |
+| [Kanban missing-parent detection judged only from a fresh replica](mirror-3423-g-kanban-missing-parent-freshness.md) | 3354 | Scopes a missing-parent streak to its parents and ends it at an unblock or link. |
+| [Kanban missing-parent detection judged only from a fresh replica](mirror-3423-g-kanban-missing-parent-freshness.md) | 3355 | A detached board judges missing parents itself and only a link to a missing parent restarts the window. |
+| [Kanban missing-parent detection judged only from a fresh replica](mirror-3423-g-kanban-missing-parent-freshness.md) | 3356 | Reports a stalled replica's deferral once per stale stamp at INFO. |
+| [Kanban missing-parent detection judged only from a fresh replica](mirror-3423-g-kanban-missing-parent-freshness.md) | 3357 | A fresh pull vouches only once the mirror is refreshed from it. |
+| [Kanban missing-parent detection judged only from a fresh replica](mirror-3423-g-kanban-missing-parent-freshness.md) | 3358 | Repeats the deferral line when the deferred count changes. |
+| [Kanban placement: whole-label-set liveness and promotion keep reasons](mirror-3423-g-kanban-placement-label-liveness.md) | 3359 | Placement recovery promotion applies the hub claim screen's keep reasons. |
+| [Own-profile capability check honors the launch TERMINAL_* env](mirror-3423-g-kanban-own-profile-launch-terminal-env.md) | 3360 | profile_config_scope reuses launch_terminal_env and stale frozen wording is dropped. |
+| [Kanban sync links pass: lag, hold and failure diagnostics](mirror-3423-h-kanban-sync-links-pass-diagnostics.md) | 3361 | Pins that a nothing-due chat-wait sweep of an unwarned board skips the lag hold. |
+| [Kanban move unpushed-work guard follow-ups](mirror-3423-h-kanban-move-unpushed-guard.md) | 3362 | Move guard scans the move's checkpoint, skips other cards' trees, bounds git time and guards the queue repin. |
+| [Kanban move unpushed-work guard follow-ups](mirror-3423-h-kanban-move-unpushed-guard.md) | 3363 | Queue-repin follow-up tests stub the Board registry that pool eligibility reads. |
+| [Kanban move unpushed-work guard follow-ups](mirror-3423-h-kanban-move-unpushed-guard.md) | 3364 | Pool-queue unpushed test stub accepts the timeout keyword of deadline-bounded git calls. |
+| [Lifecycle guard: heredoc body masking and nested-shell proofs](mirror-3423-h-lifecycle-guard-heredoc-masking.md) | 3365 | Masks data-consumer heredoc bodies behind wrappers, in functions and nested, and treats call-syntax paths as mentions. |
+| [Lifecycle guard: heredoc body masking and nested-shell proofs](mirror-3423-h-lifecycle-guard-heredoc-masking.md) | 3366 | Closes four fail-open shapes with a wrapper option allowlist and strict nested-owner rules. |
+| [Lifecycle guard: heredoc body masking and nested-shell proofs](mirror-3423-h-lifecycle-guard-heredoc-masking.md) | 3367 | Requires proven variable bindings and intact stdin before nested heredoc masking. |
+| [Lifecycle guard: heredoc body masking and nested-shell proofs](mirror-3423-h-lifecycle-guard-heredoc-masking.md) | 3368 | Preserves shell prefix and startup provenance and treats reserved environment assignments as non-transparent. |
+| [Lifecycle guard: heredoc body masking and nested-shell proofs](mirror-3423-h-lifecycle-guard-heredoc-masking.md) | 3369 | Refuses masking for startup-reading shells and keyword-led subshells with possible aliases. |
+| [Lifecycle guard: heredoc body masking and nested-shell proofs](mirror-3423-h-lifecycle-guard-heredoc-masking.md) | 3370 | Keeps the startup-file execution proof test hermetic under a PATH-resetting system profile. |
+| [Lifecycle guard: heredoc body masking and nested-shell proofs](mirror-3423-h-lifecycle-guard-heredoc-masking.md) | 3371 | Gates the startup-file execution proof test on the startup file having been sourced. |
+| [Lifecycle guard: heredoc body masking and nested-shell proofs](mirror-3423-h-lifecycle-guard-heredoc-masking.md) | 3372 | Validates every stdin-shell option after -s instead of returning at the first one. |
+| [Lifecycle guard: heredoc body masking and nested-shell proofs](mirror-3423-h-lifecycle-guard-heredoc-masking.md) | 3373 | Adds a generated shape corpus checked against real bash for nested-heredoc masking. |
+| [Lifecycle guard: heredoc body masking and nested-shell proofs](mirror-3423-h-lifecycle-guard-heredoc-masking.md) | 3374 | Makes session-snapshot aliases visible to the guard and runs startup-file proofs on CI. |
+| [Update pause: carried-turn stamp handling](mirror-3423-h-update-pause-carried-turn-stamp.md) | 3375 | Keeps a carried turn's pause stamp when a backend exit cuts it short and pins job-stop take-back. |
+| [Kanban chat task lists while a chat's own Board sync is down](mirror-3423-h-kanban-chat-links-owner-published.md) | 3376 | Anchors the stopped-sync queued create note on an exact head constant instead of rstrip. |
+| [Desktop Kanban drawer: foreground reads on a slow link](mirror-3423-h-desktop-kanban-drawer-foreground-reads.md) | 3377 | Logs the slow-link entry line before any answer and tags first drawer reads as foreground. |
+| [Kanban and terminal OOM attribution follow-ups](mirror-3423-h-kanban-oom-attribution-followups.md) | 3378 | Skips the kernel-log read on a clean exit and notes OOM kills in a command's own scope on rc 0. |
+| [TUI gateway Kanban notice custody and sweep logging](mirror-3423-h-tui-kanban-notice-custody.md) | 3379 | Legacy hand-back and gateway claim read the ledger by one lineage rule, and the restore gap is pinned. |
+| [Kanban park and release guards: run-end lease and awaited-review head](mirror-3423-h-kanban-park-release-guards.md) | 3380 | Tests a real blocked park and a savepoint-undone run end against the run-end lease release. |
+| [Kanban sync links pass: lag, hold and failure diagnostics](mirror-3423-h-kanban-sync-links-pass-diagnostics.md) | 3381 | Repeats the held-lock warning past REWARN_S and pins the per-hold reset. |
+| [Failed tool-tail turns close with the typed failed-turn row](mirror-3423-h-failed-tool-tail-turn-boundary.md) | 3382 | Stamps the failed-tool-tail close row as the typed failed-turn boundary with failure metadata. |
+| [Kanban chat task lists while a chat's own Board sync is down](mirror-3423-h-kanban-chat-links-owner-published.md) | 3383 | The card owner publishes hub-subscription chat links so a chat's task list does not wait on its own sync. |
+| [Managed worker adopts only its own session's orphaned jobs](mirror-3423-h-managed-worker-session-scoped-recovery.md) | 3384 | Managed worker startup recovery adopts only orphaned jobs of its own route and session. |
+| [Kanban operator claim parsing: be/being, dashes, adverbs](mirror-3423-h-kanban-operator-claim-parsing.md) | 3385 | be/being govern only across adverbs, spaced or glued hyphen runs are dashes, and the replica caller check runs once per call. |
+| [execute_code remote file-RPC result bounds and encoding](mirror-3423-h-execute-code-rpc-wire-encoding.md) | 3386 | Bounds every remote file-RPC result by shipped bytes and ships lone surrogates as escapes. |
+| [Kanban hub placement, admission and recovery follow-ups](mirror-3423-h-kanban-placement-admission-followups.md) | 3387 | Placement recovery threads the board into hub_keep_reason and exposes public card_fields with a fail-closed test. |
+| [Kanban hub placement, admission and recovery follow-ups](mirror-3423-h-kanban-placement-admission-followups.md) | 3388 | The hub CPU advisory names an unreadable pool limit as its own reason code. |
+| [Aux client close safety against abandoned provider daemons](mirror-3423-h-aux-client-tls-fd-safety.md) | 3389 | Never closes a per-call aux client under its abandoned provider daemon's TLS read. |
+| [Aux client close safety against abandoned provider daemons](mirror-3423-h-aux-client-tls-fd-safety.md) | 3390 | Defers the abandoned client's close before the shutdown, scopes native-adapter streams and enables the tripwire via config. |
+| [Launch overlay documentation: live env until multiplexing](mirror-3423-h-launch-overlay-docs.md) | 3391 | Corrects launch-overlay docstrings and comments to say the env is live until multiplexing is active. |
+| [Terminal guard: sanctioned-route hint when refusing hermes-sync](mirror-3423-h-hermes-sync-refusal-hint.md) | 3392 | Refusing hermes-sync in the gateway now names the sanctioned deploy route. |
+| [Desktop Kanban drawer: foreground reads on a slow link](mirror-3423-h-desktop-kanban-drawer-foreground-reads.md) | 3393 | A retried first drawer read stays foreground and a warm-cache re-open still sends its read. |
+| [Kanban quota recovery: OAuth proof wire and failed-proof cooldown](mirror-3423-h-kanban-quota-recovery-proof-wire.md) | 3394 | Quota recovery proof uses the OAuth client's wire headers, adds a failed-proof cooldown and guards the drain and resolver timeout. |
+| [macOS WAL-holder scan: serve an expired clean verdict while refreshing](mirror-3423-h-darwin-wal-holder-stale-verdict.md) | 3395 | Serves an expired same-key clean WAL-holder verdict while one pass refreshes it. |
+| [Kanban chat task lists while a chat's own Board sync is down](mirror-3423-h-kanban-chat-links-owner-published.md) | 3396 | A card placed from a chat carries the chat's created link to the Board from its owner. |
+| [Package manager account-seed opt-out and per-lock seed marker](mirror-3423-h-pm-account-seed-opt-out.md) | 3397 | Adds the HERMES_PM_ACCOUNT_SEED=0 opt-out, a per-lock seed marker and one hash per seeded install. |
+| [TUI gateway Kanban notice custody and sweep logging](mirror-3423-h-tui-kanban-notice-custody.md) | 3398 | Remote-notice sweep skips and live-poller claims log once per reason and the busy non-owner hand-back is pinned. |
+| [Desktop boot waits out a remote's own update](mirror-3423-h-desktop-remote-update-boot-wait.md) | 3399 | Boot polls past a remote's own update refusal instead of parking on the could-not-start overlay. |
+| [Code skew ignores tests, docs and CI-only commits](mirror-3423-h-code-skew-restart-ignore-paths.md) | 3400 | A checkout move over tests, docs and CI commits only is no skew and triggers no restart. |
+| [Delta responses for large reads over the Desktop's SSH tunnel](mirror-3423-h-desktop-delta-responses.md) | 3401 | Adds zstd delta encoding for large JSON reads between the gateway and the Desktop's tunnel client. |
+| [Managed worker adopts only its own session's orphaned jobs](mirror-3423-h-managed-worker-session-scoped-recovery.md) | 3402 | Documents the recovery scope and passes a recover stub into the _execute test helper. |
+| [execute_code remote file-RPC result bounds and encoding](mirror-3423-h-execute-code-rpc-wire-encoding.md) | 3403 | Shipped files use strict UTF-8 and the oversize-result error says the call ran. |
+| [Kanban move unpushed-work guard follow-ups](mirror-3423-h-kanban-move-unpushed-guard.md) | 3404 | Reports unchecked cause on spent budget or timeout and shares the repin leaving rule. |
+| [Host loop lease: one flock-held owner per Hermes home](mirror-3423-h-host-loop-lease.md) | 3405 | Adds a flock-held lease giving host-wide background loops one owner per Hermes home, with doctor output. |
+| [Kanban and terminal OOM attribution follow-ups](mirror-3423-h-kanban-oom-attribution-followups.md) | 3406 | Reads the worker log once on reclaim and uses firm OOM wording only for kill exits. |
+| [Kanban sync links pass: lag, hold and failure diagnostics](mirror-3423-h-kanban-sync-links-pass-diagnostics.md) | 3407 | Names the acquire window in the held-elsewhere warning and makes the clock patch fail loudly. |
+| [Kanban operator claim parsing: be/being, dashes, adverbs](mirror-3423-h-kanban-operator-claim-parsing.md) | 3408 | Hyphen prefixes stay under be/being, common -ly non-adverbs do not govern, and glued hyphen runs are dashes. |
+| [Kanban hub placement, admission and recovery follow-ups](mirror-3423-h-kanban-placement-admission-followups.md) | 3409 | Pins the available_mode board hop and makes card_fields raise LookupError. |
+| [Kanban hub placement, admission and recovery follow-ups](mirror-3423-h-kanban-placement-admission-followups.md) | 3410 | Wording-only fix limiting hub_cpu_pool_limit_unknown to the priority-pool settings read. |
+| [Update pause: carried-turn stamp handling](mirror-3423-h-update-pause-carried-turn-stamp.md) | 3411 | A carried turn the exit did not interrupt takes its stamp back, with one user-stop constant. |
+| [Kanban sync links pass: lag, hold and failure diagnostics](mirror-3423-h-kanban-sync-links-pass-diagnostics.md) | 3412 | Times failed boards and names slow-but-unchanged boards in the links pass. |
+| [Kanban hub placement, admission and recovery follow-ups](mirror-3423-h-kanban-placement-admission-followups.md) | 3413 | The deny route queues only when one fresh machine holds the whole label set. |
+| [Kanban sync links pass: lag, hold and failure diagnostics](mirror-3423-h-kanban-sync-links-pass-diagnostics.md) | 3414 | Test fake board fences and validates spawn_failed release before refusing it. |
+| [Terminal guard: sanctioned-route hint when refusing hermes-sync](mirror-3423-h-hermes-sync-refusal-hint.md) | 3415 | Ties the refusal hint to an executed hermes-sync and the root sync log. |
+| [Aux client close safety against abandoned provider daemons](mirror-3423-h-aux-client-tls-fd-safety.md) | 3416 | Gates the abandoned daemon's client close on the owner's shutdown sweep and documents the debug_ssl_close option. |
+| [Scratch custody pressure API for worker disk reclaim](mirror-3423-h-kanban-scratch-custody-pressure-api.md) | 3417 | Adds a pressure API so disk reclaim can see and safely remove evicted-owner trees. |
+| [Kanban missing-parent repair card may unblock its child](mirror-3423-h-kanban-missing-parent-repair-unblock.md) | 3418 | Lets a missing-parent repair card unblock its own parent_missing child via the tool and operator call. |
+| [Kanban missing-parent repair card may unblock its child](mirror-3423-h-kanban-missing-parent-repair-unblock.md) | 3419 | The repair grant refuses a re-held child and a stale repair run. |
+| [Kanban missing-parent repair card may unblock its child](mirror-3423-h-kanban-missing-parent-repair-unblock.md) | 3420 | Test pinning that the repair grant needs the child to still be blocked. |
+| [Kanban park and release guards: run-end lease and awaited-review head](mirror-3423-h-kanban-park-release-guards.md) | 3421 | Awaited-review release re-reads the PR head, uses one gh read, one parked-run definition and strict wait-check parsing. |
+| [Evidence-based work state observations (execution observations v1)](execution-observations.md) | 3422 | A parked remote card projects one record (status-derived last_known_state, owner, ask) in the session task list and in the sidebar counts / session-idle-check path. |
+| [Desktop Kanban drawer: foreground reads on a slow link](mirror-3423-h-desktop-kanban-drawer-foreground-reads.md) | 3423 | A drawer kind whose reads keep failing stops sending foreground refetches. |
 
 ## Mirror follow-ups 2910–2926
 
@@ -1678,16 +2182,16 @@ not something the public fixture CI can perform without the source repository.
 
 ## Applying
 
-For the current **2926-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply forty-four bridges and three ancestry-only markers from `mirror-replay-2926.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
+For the current **3423-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply forty-five bridges and three ancestry-only markers from `mirror-replay-3423.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
 
 ```bash
 set -e
 SOURCE=$(pwd)
 python3 -B "$MODS/core/verify_mirror.py" --source-repo "$SOURCE" \
-  --source-tip 7c2041e566300d382437e3c0fd8976219a110f14 \
-  --base e3bf4be5df04cf72dab4914b073361c71af1dbe1 \
-  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-2926.json" \
-  --replay-plan "$MODS/core/mirror-replay-2926.json"
+  --source-tip 4b24631c6ebfb8e42c592fb56abbf707ab5a0d27 \
+  --base d01ed2bfac3469fa582b9aaeec746f3e123bd78a \
+  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-3423.json" \
+  --replay-plan "$MODS/core/mirror-replay-3423.json"
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1
 cd ../hermes-mods-test
 patches=("$MODS"/core/patches/*.patch)
@@ -1828,12 +2332,15 @@ git commit -m 'Explicit upstream integration bridge before 2255'
 git am -3 --empty=keep "${patches[@]:2254:1}"
 git apply --index --3way "$MODS/core/bridges/upstream-78abaafcccec-via-9f84f76fc8c.diff"
 git commit -m 'Explicit upstream integration bridge before 2256'
-git am -3 --empty=keep "${patches[@]:2255:671}"
+git am -3 --empty=keep "${patches[@]:2255:929}"
+git apply --index --3way "$MODS/core/bridges/upstream-d01ed2bfac-via-91c2b94744.diff"
+git commit -m 'Explicit upstream integration bridge before 3185'
+git am -3 --empty=keep "${patches[@]:3184:239}"
 # Mandatory additive repair: historical mails intentionally remain immutable.
-python3 -B "$MODS/core/repair_hostname_escapes_2926.py" --tree "$PWD"
+python3 -B "$MODS/core/repair_hostname_escapes_3423.py" --tree "$PWD"
 git add hermes_cli/kanban_placement.py
 git commit -m 'Repair historical hostname regex word boundaries'
-python3 -B "$MODS/core/repair_hostname_escapes_2926.py" --source-repo "$SOURCE" --applied "$(git rev-parse HEAD)"
+python3 -B "$MODS/core/repair_hostname_escapes_3423.py" --source-repo "$SOURCE" --applied "$(git rev-parse HEAD)"
 ```
 
 The source object store must contain historical patch-index blobs (see verification prerequisites above). Use Git 2.51 or newer for the replay: Git 2.43's three-way merge conflicts on patch 0032 (`apps/shared/src/gateway-contract.openrpc.json`), which later Git versions merge cleanly. Run the full verifier with its policy and replay plan to check final source equivalence; successful application alone is insufficient. Intermediate trees and standalone feature-patch application are not certified. Remove the throwaway worktree when finished.

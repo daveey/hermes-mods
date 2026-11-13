@@ -1,0 +1,448 @@
+From f37d15570308edbaedc2f6b3e5bf3d7fd53a4066 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 20:34:00 +0000
+Subject: [PATCH] [daveey] resume: deleted chats are terminal, not unfinished
+ drafts (desktop-03cd4d73b3)
+
+session.resume treated a missing row plus a surviving minted_session_keys
+record as a never-persisted draft and tried to materialize it; the
+transactional resurrection fence refused with RuntimeStoreError(not_found),
+logged as a WARNING traceback, and the boot sweep kept the turn marker so it
+retried every restart in the freshness window.
+
+- methods_session: check the selected store's retirement fence before
+  materializing a minted key; a retired id returns 4007 with
+  data.reason=session_deleted and an INFO log. A delete racing the
+  create (fence refuses with not_found) is the same terminal outcome,
+  quiet. Other storage failures keep their warning.
+- startup_resume: on session_deleted, retire the marker in its own
+  profile home (clear_turn_marker) and log an INFO skip; a plain 4007
+  or store error keeps the marker.
+- tests: real temp-DB delete/retire cases, racing delete, named profile
+  store, unexpected-failure and valid-draft controls.
+---
+ ..._session_resume_materializes_minted_key.py | 118 +++++++++++++++++-
+ tests/tui_gateway/test_startup_resume.py      |  57 +++++++++
+ tui_gateway/methods_session.py                |  58 ++-------
+ tui_gateway/methods_session_minted.py         |  86 +++++++++++++
+ tui_gateway/startup_resume.py                 |  16 +++
+ 5 files changed, 287 insertions(+), 48 deletions(-)
+ create mode 100644 tui_gateway/methods_session_minted.py
+
+diff --git a/tests/tui_gateway/test_session_resume_materializes_minted_key.py b/tests/tui_gateway/test_session_resume_materializes_minted_key.py
+index 592c9763f8..364fc53003 100644
+--- a/tests/tui_gateway/test_session_resume_materializes_minted_key.py
++++ b/tests/tui_gateway/test_session_resume_materializes_minted_key.py
+@@ -221,4 +221,120 @@ def test_resume_minted_key_claimed_by_other_profile_fails_closed(real_db):
+     ],
+ )
+ def test_is_server_minted_key_shape(value, expected):
+-    assert server._is_server_minted_key(value) is expected
+\ No newline at end of file
++    assert server._is_server_minted_key(value) is expected
++
++
++# ── Deleted chats are not unfinished drafts (desktop-03cd4d73b3) ──────────────────────────────────
++# Startup recovery resumed a chat deleted after its writer exited: the missing row plus the surviving
++# ``minted_session_keys`` record read as a never-persisted draft, so resume tried to materialize it, the
++# resurrection fence (``insert_session_row_in_transaction``) refused with RuntimeStoreError('not_found'),
++# and the refusal was logged as a WARNING traceback. A retired id is terminal: 4007 ``session_deleted``,
++# no create attempt, no warning. Unexpected storage failures still warn.
++
++MATERIALIZE_WARNING = "failed to materialize session row"
++
++
++def _mint_prompt_delete(db, key=MINTED_KEY):
++    """A minted key whose chat was persisted, then permanently deleted (the fence stays)."""
++    db.record_minted_session_key(key)
++    db.create_session(key, source="tui", model="test-model")
++    db.append_message(key, "user", "scratch acceptance")
++    db.delete_session(key)
++    assert db.get_session(key) is None
++    assert db.was_session_key_minted(key), "the mint record outlives the delete (the incident's state)"
++
++
++def _warnings(caplog):
++    return [r for r in caplog.records if r.levelno >= 30 and r.name.startswith("tui_gateway")]
++
++
++def test_resume_deleted_minted_key_is_terminal_not_a_draft(real_db, monkeypatch, caplog):
++    _mint_prompt_delete(real_db)
++    creates = []
++    real_create = real_db.create_session
++    monkeypatch.setattr(real_db, "create_session", lambda *a, **k: creates.append(a) or real_create(*a, **k))
++    caplog.set_level("INFO")
++
++    resp = _resume(session_id=MINTED_KEY)
++
++    assert resp.get("error", {}).get("code") == 4007, resp
++    assert (resp["error"].get("data") or {}).get("reason") == "session_deleted", resp
++    assert creates == [], "a retired id must not reach the materializing create"
++    assert real_db.get_session(MINTED_KEY) is None, "no resurrection"
++    assert not _warnings(caplog), [r.getMessage() for r in _warnings(caplog)]
++    assert any("retired" in r.getMessage() and MINTED_KEY in r.getMessage() for r in caplog.records), \
++        "the retired-session skip is logged at INFO (detection guard)"
++
++
++def test_resume_deletion_after_preflight_is_quiet_and_terminal(real_db, monkeypatch, caplog):
++    """A delete landing between the retirement check and the create: the fence refuses the insert
++    with RuntimeStoreError('not_found'); that known outcome is terminal and quiet, not a traceback."""
++    real_db.record_minted_session_key(MINTED_KEY)
++    real_create = real_db.create_session
++
++    def racing_create(sid, *a, **k):
++        from hermes_state_mutation_retirement import RETIRED_PREFIX
++        real_db._execute_write(lambda conn: conn.execute(
++            "INSERT INTO state_meta (key, value) VALUES (?, '1')", (RETIRED_PREFIX + sid,)))
++        return real_create(sid, *a, **k)
++
++    monkeypatch.setattr(real_db, "create_session", racing_create)
++    caplog.set_level("INFO")
++
++    resp = _resume(session_id=MINTED_KEY)
++
++    assert resp.get("error", {}).get("code") == 4007, resp
++    assert (resp["error"].get("data") or {}).get("reason") == "session_deleted", resp
++    assert real_db.get_session(MINTED_KEY) is None, "the fence still holds"
++    assert not _warnings(caplog), [r.getMessage() for r in _warnings(caplog)]
++
++
++def test_resume_unexpected_materialize_failure_still_warns(real_db, monkeypatch, caplog):
++    """Control: a genuine storage failure keeps its warning diagnostics and is not called a deletion."""
++    real_db.record_minted_session_key(MINTED_KEY)
++
++    def broken(*_a, **_k):
++        raise RuntimeError("disk I/O error")
++
++    monkeypatch.setattr(real_db, "create_session", broken)
++    caplog.set_level("INFO")
++
++    resp = _resume(session_id=MINTED_KEY)
++
++    assert resp.get("error", {}).get("code") == 4007, resp
++    assert (resp["error"].get("data") or {}).get("reason") != "session_deleted", resp
++    assert any(MATERIALIZE_WARNING in r.getMessage() for r in _warnings(caplog))
++
++
++def test_resume_retirement_checked_in_the_selected_profile_store(real_db, monkeypatch, tmp_path, caplog):
++    """The fence read is the resumed profile's store: a retirement in the launch store does not block a
++    valid draft in the profile store, and the profile store's own retirement does."""
++    profile_db = SessionDB(db_path=tmp_path / "work-state.db")
++    work_home = tmp_path / "profiles" / "work"
++    work_home.mkdir(parents=True)
++    monkeypatch.setattr(server, "_profile_home", lambda name: work_home if name else None)
++    monkeypatch.setattr(server, "_profile_session_db", lambda home: (profile_db, False) if home else (real_db, False))
++    try:
++        # launch store deleted this id; the profile store holds a valid, never-persisted draft
++        _mint_prompt_delete(real_db)
++        profile_db.record_minted_session_key(MINTED_KEY)
++        _assert_resumed_ok(_resume(session_id=MINTED_KEY, profile="work"), MINTED_KEY)
++        assert profile_db.get_session(MINTED_KEY) is not None
++        assert real_db.get_session(MINTED_KEY) is None
++
++        other = "20261112_200520_1827ba"
++        _mint_prompt_delete(profile_db, other)
++        caplog.set_level("INFO")
++        resp = _resume(session_id=other, profile="work")
++        assert (resp.get("error", {}).get("data") or {}).get("reason") == "session_deleted", resp
++        assert profile_db.get_session(other) is None
++        assert not _warnings(caplog)
++    finally:
++        profile_db.close()
++
++
++def test_resume_valid_draft_still_materializes_after_retirement_check(real_db):
++    """Control: the retirement check leaves a minted, never-deleted draft recoverable."""
++    real_db.record_minted_session_key(MINTED_KEY)
++    _assert_resumed_ok(_resume(session_id=MINTED_KEY), MINTED_KEY)
++    assert real_db.get_session(MINTED_KEY) is not None
+\ No newline at end of file
+diff --git a/tests/tui_gateway/test_startup_resume.py b/tests/tui_gateway/test_startup_resume.py
+index ad09deae4e..234dc36dd6 100644
+--- a/tests/tui_gateway/test_startup_resume.py
++++ b/tests/tui_gateway/test_startup_resume.py
+@@ -80,3 +80,60 @@ def test_start_is_noop_when_disabled(monkeypatch):
+     from hermes_cli import config
+     monkeypatch.setattr(config, "load_config", lambda: {"desktop": {"auto_continue": {"resume_on_startup": False}}})
+     assert sr.start_startup_resume_sweep() is None
++
++
++# ── Deleted chats (desktop-03cd4d73b3) ─────────────────────────────────────────────────────────────
++# A chat deleted after its writer exited kept its interrupted-turn marker, so every boot sweep in the
++# freshness window resumed it again. A ``session_deleted`` refusal is terminal: the sweep retires that
++# marker (in the marker's own profile home) and logs an informational skip. Any other failure (an
++# unreadable store, a plain 4007 for a merely absent row) keeps the marker for the next sweep.
++
++DELETED = {"error": {"code": 4007, "message": "session not found", "data": {"reason": "session_deleted"}}}
++
++
++def _markers(home):
++    p = home / "desktop" / "interrupted_turns.json"
++    return set(json.loads(p.read_text())) if p.exists() else set()
++
++
++def test_deleted_session_marker_is_retired_and_not_resumed_again(tmp_path, caplog):
++    _write(tmp_path, {"gone": _entry(age=10), "kept": _entry(age=20)})
++    calls = []
++
++    def resume(rid, params):
++        calls.append(params["session_id"])
++        return DELETED if params["session_id"] == "gone" else {"result": {"auto_continue": {"attempt": 1}}}
++
++    caplog.set_level("INFO")
++    out = sr.resume_interrupted_sessions(resume, tmp_path, CFG)
++
++    by_key = {r["session_key"]: r for r in out}
++    assert by_key["gone"].get("deleted") is True
++    assert "gone" not in _markers(tmp_path), "a deleted chat's marker is retired"
++    assert "kept" in _markers(tmp_path)
++    assert not [r for r in caplog.records if r.levelno >= 30]
++    assert any("deleted" in r.getMessage() and "gone" in r.getMessage() for r in caplog.records)
++
++    calls.clear()
++    sr.resume_interrupted_sessions(resume, tmp_path, CFG)
++    assert "gone" not in calls, "no repeated recovery of a deleted chat"
++
++
++def test_deleted_session_marker_retired_in_its_named_profile_home(tmp_path):
++    _write(tmp_path, {"gone": _entry(age=10)})  # same key in the launch home is NOT deleted
++    work = tmp_path / "profiles" / "work"
++    _write(work, {"gone": _entry(age=5)})
++
++    def resume(rid, params):
++        return DELETED if params.get("profile") == "work" else {"error": {"code": 5000, "message": "db unavailable"}}
++
++    sr.resume_interrupted_sessions(resume, tmp_path, CFG)
++    assert "gone" not in _markers(work)
++    assert "gone" in _markers(tmp_path), "an unreadable store is not proof of deletion"
++
++
++def test_plain_not_found_is_not_proof_of_deletion(tmp_path):
++    _write(tmp_path, {"absent": _entry(age=10)})
++    sr.resume_interrupted_sessions(lambda rid, p: {"error": {"code": 4007, "message": "session not found"}},
++                                   tmp_path, CFG)
++    assert "absent" in _markers(tmp_path)
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index 0d3318026c..b1d869bb27 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -614,6 +614,7 @@ class _Resume:
+     def __init__(self, rid, params: dict, target: str) -> None:
+         self.rid, self.params, self.target = rid, params, target
+         self.db, self.owns_db, self.found, self.profile_resume_cwd = None, False, None, ""
++        self.retired = False  # the selected store's deletion fence covers ``target`` (terminal 4007)
+         self.cols = _int_param(params, "cols", 80)
+         # ``profile`` (app-global remote mode): resume from another local profile's state.db.
+         self.profile = (params.get("profile") or "").strip() or None
+@@ -770,49 +771,6 @@ def _resume_adopt_stranded(ctx: _Resume) -> None:
+         logger.exception("stranded-session adoption failed for %s", ctx.target)
+ 
+ 
+-def _resume_materialize_minted(ctx: _Resume) -> None:
+-    """Row for a minted-but-never-persisted key (#96793): adopt the id, not 4007.
+-
+-    Only for keys THIS backend's store recorded at ``session.create``
+-    (``was_session_key_minted``). The key shape is not proof of ownership: with
+-    several gateways (e.g. two Macs) every one mints the same shape, and a client
+-    probing this backend for another gateway's key must get 4007 so it routes the
+-    resume to the owner — materializing here fabricated empty, runtime-less rows.
+-
+-    ``session.create`` mints the stored key but intentionally writes no state.db row
+-    until the first prompt (no "Untitled" litter). If the backend dies in that window,
+-    the key exists client-side (pinned tile, stored id) but has no row anywhere — and
+-    after a restart the in-memory live-lazy lookup above can't find it either, so the
+-    resume 4007ed forever. When the target is a well-formed server-minted key, mint
+-    the row here and let the normal resume path continue with empty history. Abandoned
+-    drafts still leave no row: nothing is written until a client explicitly resumes
+-    the exact key. ``create_session`` is an upsert, so a concurrently persisted row is
+-    not clobbered (only its NULL model/source columns would fill in).
+-    """
+-    try:
+-        ctx.db.create_session(
+-            ctx.target,
+-            source=_resolve_session_source(_str_param(ctx.params, "source") or None),
+-            model=_resolve_model(),
+-            profile_name=profile_name_for_home(ctx.profile_home) or _response_profile_name(ctx.profile),
+-        )
+-        ctx.found = ctx.db.get_session(ctx.target)
+-        logger.info(
+-            "materialized session row for minted-but-unpersisted key %s (resume no longer 4007s)",
+-            ctx.target,
+-        )
+-    except Exception:
+-        logger.warning("failed to materialize session row for %s", ctx.target, exc_info=True)
+-
+-
+-def _was_minted_here(ctx: _Resume) -> bool:
+-    try:
+-        return bool(ctx.db.was_session_key_minted(ctx.target))
+-    except Exception:
+-        logger.warning("minted-key lookup failed for %s; not materializing", ctx.target, exc_info=True)
+-        return False
+-
+-
+ def _resume_locate(ctx: _Resume) -> dict | None:
+     """Resolve ``ctx.target`` to a stored row (``ctx.found``); a dict is an early response."""
+     ctx.found = ctx.db.get_session(ctx.target)
+@@ -835,8 +793,12 @@ def _resume_locate(ctx: _Resume) -> dict | None:
+     # Materialize only a key this store minted: a foreign gateway's key must 4007 so the client routes to its owner.
+     if not ctx.found and not ctx.lazy and _is_server_minted_key(ctx.target) \
+             and not _any_live_session_claims_key(ctx.target) and _was_minted_here(ctx):
+-        _resume_materialize_minted(ctx)
+-    return None if ctx.found else _err(ctx.rid, 4007, "session not found")
++        _resume_materialize_or_refuse(ctx)
++    if ctx.found:
++        return None
++    if ctx.retired:  # typed terminal refusal: startup recovery retires the stale turn marker on it
++        return _err(ctx.rid, 4007, "session not found", {"reason": "session_deleted"})
++    return _err(ctx.rid, 4007, "session not found")
+ 
+ 
+ def _resume_follow_tip(ctx: _Resume) -> None:
+@@ -2375,6 +2337,8 @@ def register(server) -> None:
+     from .methods_session_params import _int_param, _str_param
+     server._int_param, server._str_param = _int_param, _str_param
+     bind_module(globals(), server, skip=("_",))
+-    from . import methods_session_branch, methods_session_interrupt, methods_session_start_requests
+-    for module in (methods_session_branch, methods_session_interrupt, methods_session_start_requests):
++    from . import methods_session_branch, methods_session_interrupt, methods_session_minted
++    from . import methods_session_start_requests
++    for module in (methods_session_branch, methods_session_interrupt, methods_session_minted,
++                   methods_session_start_requests):
+         module.register(server)
+diff --git a/tui_gateway/methods_session_minted.py b/tui_gateway/methods_session_minted.py
+new file mode 100644
+index 0000000000..56c6077067
+--- /dev/null
++++ b/tui_gateway/methods_session_minted.py
+@@ -0,0 +1,86 @@
++"""Minted-draft materialization for ``session.resume`` (``methods_session`` split).
++
++Moved from ``tui_gateway/methods_session.py`` (file-line ratchet): the bodies close over server.py
++globals through ``method_ctx.bind_module`` exactly as before; publication runs from the parent's
++``register()``. A minted key whose chat was deleted is terminal, never a draft (desktop-03cd4d73b3).
++"""
++
++from __future__ import annotations
++
++from .method_ctx import bind_module
++
++
++def _resume_materialize_minted(ctx: _Resume) -> None:
++    """Row for a minted-but-never-persisted key (#96793): adopt the id, not 4007.
++
++    Only for keys THIS backend's store recorded at ``session.create``
++    (``was_session_key_minted``). The key shape is not proof of ownership: with
++    several gateways (e.g. two Macs) every one mints the same shape, and a client
++    probing this backend for another gateway's key must get 4007 so it routes the
++    resume to the owner — materializing here fabricated empty, runtime-less rows.
++
++    ``session.create`` mints the stored key but intentionally writes no state.db row
++    until the first prompt (no "Untitled" litter). If the backend dies in that window,
++    the key exists client-side (pinned tile, stored id) but has no row anywhere — and
++    after a restart the in-memory live-lazy lookup above can't find it either, so the
++    resume 4007ed forever. When the target is a well-formed server-minted key, mint
++    the row here and let the normal resume path continue with empty history. Abandoned
++    drafts still leave no row: nothing is written until a client explicitly resumes
++    the exact key. ``create_session`` is an upsert, so a concurrently persisted row is
++    not clobbered (only its NULL model/source columns would fill in).
++    """
++    try:
++        ctx.db.create_session(
++            ctx.target,
++            source=_resolve_session_source(_str_param(ctx.params, "source") or None),
++            model=_resolve_model(),
++            profile_name=profile_name_for_home(ctx.profile_home) or _response_profile_name(ctx.profile),
++        )
++        ctx.found = ctx.db.get_session(ctx.target)
++        logger.info(
++            "materialized session row for minted-but-unpersisted key %s (resume no longer 4007s)",
++            ctx.target,
++        )
++    except Exception as exc:
++        # A delete that landed after the retirement preflight: the transactional resurrection fence
++        # refuses the insert with ``not_found``. That is the deletion's normal terminal outcome.
++        if getattr(exc, "reason", None) == "not_found" and _session_retired(ctx):
++            ctx.retired = True
++            logger.info("resume of %s: deleted while materializing; the deletion fence held", ctx.target)
++            return
++        logger.warning("failed to materialize session row for %s", ctx.target, exc_info=True)
++
++
++def _session_retired(ctx: _Resume) -> bool:
++    """True iff the SELECTED store holds the durable deletion fence for ``ctx.target``.
++
++    Only the fence proves deletion: an absent row may be an unpersisted draft, and an unreadable store
++    proves nothing, so a failed read answers False (the caller keeps its ordinary path)."""
++    try:
++        from hermes_state_mutation_retirement import retired_session
++        return bool(retired_session(ctx.db, ctx.target))
++    except Exception:
++        logger.warning("retirement lookup failed for %s", ctx.target, exc_info=True)
++        return False
++
++
++def _was_minted_here(ctx: _Resume) -> bool:
++    try:
++        return bool(ctx.db.was_session_key_minted(ctx.target))
++    except Exception:
++        logger.warning("minted-key lookup failed for %s; not materializing", ctx.target, exc_info=True)
++        return False
++
++
++def _resume_materialize_or_refuse(ctx: _Resume) -> None:
++    """A deleted chat keeps its mint record: its retirement fence, not the missing row, is the truth."""
++    if _session_retired(ctx):
++        ctx.retired = True
++        logger.info("resume of %s: session was deleted (retired); not materializing a draft", ctx.target)
++    else:
++        _resume_materialize_minted(ctx)
++
++
++def register(server) -> None:
++    """Publish this module's helpers onto ``server`` (rebound to its globals)."""
++    bind_module(globals(), server, skip=("_",))
+diff --git a/tui_gateway/startup_resume.py b/tui_gateway/startup_resume.py
+index d336f9b91f..fdddba86b3 100644
+--- a/tui_gateway/startup_resume.py
++++ b/tui_gateway/startup_resume.py
+@@ -27,6 +27,7 @@ from tui_gateway.turn_marker import (
+     UPDATE_HOLD_QUEUE_REASON,
+     _load,
+     _marker_path,
++    clear_turn_marker,
+     freshness_since,
+     marker_writer_state,
+     read_turn_marker,
+@@ -118,6 +119,12 @@ def pending_resumes(home: Path, cfg: dict | None, *, now: float | None = None,
+     return out
+ 
+ 
++def _session_deleted(err: Any) -> bool:
++    """``session.resume``'s typed refusal for a session whose deletion fence the selected store holds."""
++    data = err.get("data") if isinstance(err, dict) else None
++    return isinstance(data, dict) and data.get("reason") == "session_deleted"
++
++
+ def resume_interrupted_sessions(resume: Callable[[str, dict], Any], home: Path, cfg: dict | None,
+                                 *, paused_only: bool = False) -> list[dict]:
+     """Call ``resume(rid, params)`` (the ``session.resume`` handler) for each pending marker; returns outcomes."""
+@@ -137,6 +144,15 @@ def resume_interrupted_sessions(resume: Callable[[str, dict], Any], home: Path,
+             continue
+         err = env.get("error") if isinstance(env, dict) else None
+         res = env.get("result") if isinstance(env, dict) else None
++        if _session_deleted(err):
++            # [daveey] A deleted chat is terminal, not an interrupted draft (desktop-03cd4d73b3): retire its
++            # marker in its own profile home so later boot sweeps don't resume it again. Only the store's
++            # typed ``session_deleted`` refusal proves deletion; a plain 4007 or a store error keeps the marker.
++            clear_turn_marker(row["home"], row["session_key"])
++            logger.info("startup resume %s (profile=%s): skipped, session was deleted; turn marker retired",
++                        row["session_key"], row["profile"] or "default")
++            results.append({**row, "ok": True, "scheduled": False, "deleted": True})
++            continue
+         scheduled = bool(isinstance(res, dict) and res.get("auto_continue"))
+         logger.info("startup resume %s (profile=%s): %s", row["session_key"], row["profile"] or "default",
+                     "auto-continue scheduled" if scheduled else (err or "resumed, no continuation scheduled"))
+-- 
+2.51.0
+

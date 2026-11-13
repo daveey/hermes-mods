@@ -1,0 +1,142 @@
+From 58343c86ab4fe2875d2959392efad2fae85f2bf8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:27:53 +0000
+Subject: [PATCH] [daveey] fix(kanban): completion_receipt schema advertises
+ the strict evidence.operator_delivery shape
+
+PR #1989 review nit (t_01a1d3f736a7af53): evidence.operator_delivery was advertised as a bare
+{type: object}, but the writer's _operator_delivery() admits exactly ten fields (positive-int
+comment_id, lowercase 64-hex content_sha256, the rest nonempty text of at most 128 characters),
+so a strictly validating client could still build a receipt the writer refuses.
+
+hermes_completion_receipt now names the field set and text cap (OPERATOR_DELIVERY_FIELDS,
+OPERATOR_DELIVERY_TEXT_MAX) and validates against them; tools/kanban_tools_schemas.py derives
+properties, required and additionalProperties:false from the same constants. The new test reads
+the validator's required set and bounds from its behaviour (drop each key, add one, probe each
+limit), not from the shared constant, so either side drifting turns it red. Every maxLength stays
+128 (< 2000, llama.cpp grammar limit).
+
+Card: t_01a1d3fe1979c947
+---
+ hermes_completion_receipt.py                  | 11 +++--
+ .../test_kanban_complete_receipt_schema.py    | 42 +++++++++++++++++++
+ tools/kanban_tools_schemas.py                 | 16 ++++++-
+ 3 files changed, 64 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_completion_receipt.py b/hermes_completion_receipt.py
+index b986e6be9f..41a6b37c13 100644
+--- a/hermes_completion_receipt.py
++++ b/hermes_completion_receipt.py
+@@ -19,6 +19,12 @@ MAX_REMAINING = 32
+ MAX_TEXT = 2000
+ MAX_REF = 2048
+ MAX_BYTES = 32768  # canonical (compact, ASCII) JSON of the whole receipt
++# evidence.operator_delivery: every field required, no others; comment_id a positive int, content_sha256 lowercase
++# hex SHA-256, the rest text of at most OPERATOR_DELIVERY_TEXT_MAX. tools/kanban_tools_schemas.py advertises these.
++OPERATOR_DELIVERY_FIELDS: tuple[str, ...] = (
++    "request_uid", "target_task_id", "board", "caller_task_id", "caller_run_uid",
++    "caller_gateway", "executor_gateway", "comment_id", "content_sha256", "result_event_uid")
++OPERATOR_DELIVERY_TEXT_MAX = 128
+ _QUALIFIED_OWNER = re.compile(r"@(task|session):[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+/[^\s/@]+\Z")
+ 
+ 
+@@ -49,10 +55,9 @@ def _array(value: Any, name: str, limit: int, *, nonempty: bool = False) -> list
+ 
+ 
+ def _operator_delivery(value):
+-    fields = {"request_uid", "target_task_id", "board", "caller_task_id", "caller_run_uid",
+-              "caller_gateway", "executor_gateway", "comment_id", "content_sha256", "result_event_uid"}
++    fields = set(OPERATOR_DELIVERY_FIELDS)
+     raw = _object(value, fields)
+-    out = {key: _text(raw[key], key, 128) for key in fields - {"comment_id"}}
++    out = {key: _text(raw[key], key, OPERATOR_DELIVERY_TEXT_MAX) for key in fields - {"comment_id"}}
+     if type(raw["comment_id"]) is not int or raw["comment_id"] <= 0:
+         raise ValueError("completion_receipt: comment_id needs a positive integer")
+     if not re.fullmatch(r"[0-9a-f]{64}", out["content_sha256"]):
+diff --git a/tests/tools/test_kanban_complete_receipt_schema.py b/tests/tools/test_kanban_complete_receipt_schema.py
+index f25475e517..eb25543cf8 100644
+--- a/tests/tools/test_kanban_complete_receipt_schema.py
++++ b/tests/tools/test_kanban_complete_receipt_schema.py
+@@ -84,3 +84,45 @@ def test_description_states_timezone_and_byte_cap():
+         assert str(hcr.MAX_BYTES) in str(exc)
+     else:
+         raise AssertionError("over-cap receipt admitted")
++
++
++_DELIVERY = {"request_uid": "r", "target_task_id": "t_x", "board": "default", "caller_task_id": "t_y",
++             "caller_run_uid": "u", "caller_gateway": "a", "executor_gateway": "b", "comment_id": 7,
++             "content_sha256": "0" * 64, "result_event_uid": "e"}
++
++
++def _admits(delivery) -> bool:
++    receipt = {"version": 1, "items": [{
++        "scope": "comment on the foreign card", "disposition": "delivered", "remaining": [],
++        "evidence": [{"ref": "operator comment 7", "observed_at": "2026-11-13T06:40:00+00:00",
++                      "verification": "independently_checked", "operator_delivery": delivery}]}]}
++    try:
++        hcr.validate_completion_receipt(receipt)
++    except ValueError:
++        return False
++    return True
++
++
++def test_operator_delivery_schema_is_the_validators_strict_shape():
++    # PR #1989 review nit: a bare {type: object} lets a strictly validating client build a delivery proof the
++    # writer refuses. The advertised keys, required set and per-field bounds must be what the validator enforces,
++    # read from its behaviour here, not from a shared constant, so either side drifting turns this red.
++    schema = _evidence_schema()["properties"]["operator_delivery"]
++    assert _admits(_DELIVERY)
++    validator_required = {key for key in _DELIVERY if not _admits({k: v for k, v in _DELIVERY.items() if k != key})}
++    assert validator_required == set(_DELIVERY)
++    assert not _admits({**_DELIVERY, "extra": "x"})
++    assert schema["additionalProperties"] is False
++    assert set(schema["properties"]) == validator_required
++    assert set(schema["required"]) == validator_required
++    props = schema["properties"]
++    assert props["comment_id"] == {"type": "integer", "minimum": 1}
++    assert not _admits({**_DELIVERY, "comment_id": 0}) and not _admits({**_DELIVERY, "comment_id": "7"})
++    sha = props["content_sha256"]
++    assert sha["type"] == "string" and sha["pattern"] == "^[0-9a-f]{64}$"
++    assert not _admits({**_DELIVERY, "content_sha256": "A" * 64})
++    for key in validator_required - {"comment_id", "content_sha256"}:
++        limit = props[key]["maxLength"]
++        assert props[key]["type"] == "string" and props[key]["minLength"] == 1 and limit < 2000
++        assert _admits({**_DELIVERY, key: "x" * limit}) and not _admits({**_DELIVERY, key: "x" * (limit + 1)})
++        assert not _admits({**_DELIVERY, key: ""})
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index ef60f6baf1..ce4c06aaef 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -100,6 +100,19 @@ KANBAN_LIST_SCHEMA = _schema(
+     [],
+ )
+ 
++
++def _operator_delivery_schema() -> dict[str, Any]:
++    """evidence.operator_delivery as the validator admits it: exactly hcr.OPERATOR_DELIVERY_FIELDS."""
++    text = {"type": "string", "minLength": 1, "maxLength": hcr.OPERATOR_DELIVERY_TEXT_MAX}
++    special = {"comment_id": {"type": "integer", "minimum": 1},
++               "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
++    return {
++        "type": "object", "additionalProperties": False, "required": list(hcr.OPERATOR_DELIVERY_FIELDS),
++        "description": "Optional: the applied operator result's operator_delivery, verbatim",
++        "properties": {key: dict(special.get(key, text)) for key in hcr.OPERATOR_DELIVERY_FIELDS},
++    }
++
++
+ def _completion_receipt_schema() -> dict[str, Any]:
+     """metadata.completion_receipt v1, from the validator's own limits (hermes_completion_receipt) so the
+     advertised shape never drifts from what the card writer admits (self-heal agent-f82d813de9)."""
+@@ -146,8 +159,7 @@ def _completion_receipt_schema() -> dict[str, Any]:
+                             "observed_at": {"type": "string", "maxLength": 64, "description": (
+                                 "ISO-8601 with timezone, e.g. 2026-11-13T06:40:00+00:00")},
+                             "verification": {"type": "string", "enum": list(hcr.VERIFICATIONS)},
+-                            "operator_delivery": {"type": "object", "description": (
+-                                "Optional: the applied operator result's operator_delivery, verbatim")},
++                            "operator_delivery": _operator_delivery_schema(),
+                         }}},
+                     "remaining": {"type": "array", "maxItems": hcr.MAX_REMAINING, "items": {
+                         "type": "object", "additionalProperties": False,
+-- 
+2.51.0
+

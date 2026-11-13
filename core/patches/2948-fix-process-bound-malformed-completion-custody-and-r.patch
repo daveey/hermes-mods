@@ -1,0 +1,248 @@
+From 3f3789037c5cd22eedc31fd116920e211d033ae0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 20:58:07 +0000
+Subject: [PATCH] fix(process): bound malformed completion custody and retain
+ retrieval [daveey]
+
+---
+ .../test_process_completion_receipt_nits.py   | 139 ++++++++++++++++++
+ tools/process_registry_obligations.py         |  29 ++--
+ tools/process_registry_results.py             |   7 +-
+ 3 files changed, 164 insertions(+), 11 deletions(-)
+ create mode 100644 tests/tools/test_process_completion_receipt_nits.py
+
+diff --git a/tests/tools/test_process_completion_receipt_nits.py b/tests/tools/test_process_completion_receipt_nits.py
+new file mode 100644
+index 0000000000..f0e2e3cd5b
+--- /dev/null
++++ b/tests/tools/test_process_completion_receipt_nits.py
+@@ -0,0 +1,139 @@
++"""Bounded malformed custody, retrieval visibility and serialized kill settlement."""
++import json
++import logging
++import os
++import threading
++import time
++from concurrent.futures import ThreadPoolExecutor
++
++import pytest
++
++from tools import process_registry_obligations as ob
++from tools import process_registry_results as results
++from tools.process_registry import ProcessRegistry, ProcessSession
++
++
++@pytest.fixture
++def receipt(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_SESSION_ID", "parent")
++
++    def make(sid="proc_aaaaaaaaaaaa"):
++        session = ProcessSession(id=sid, command="true", task_id="t", parent_session_id="parent",
++                                 session_key="agent:main:local:dm:x", started_at=time.time(),
++                                 notify_on_complete=True, watcher_platform="local", watcher_chat_id="x",
++                                 watcher_interval=5, exited=True, exit_code=0)
++        results.save_completed_result(session, ob.obligation_for(session))
++        return session, ob.receipt_path(sid)
++    return make
++
++
++@pytest.mark.parametrize("budget", ["age", "starts", "bad_age", "bad_starts", "nan_age", "inf_starts"])
++def test_malformed_receipt_is_bounded_without_stopping_other_recovery(receipt, budget):
++    _, path = receipt()
++    valid, _ = receipt("proc_bbbbbbbbbbbb")
++    record = json.loads(path.read_text())
++    del record["exit_code"]
++    owed = record[ob.OBLIGATION_KEY]
++    if budget == "age":
++        owed["owed_since"] = time.time() - ob.OBLIGATION_MAX_AGE_SECONDS - 1
++    elif budget == "starts":
++        owed["recoveries"] = ob.OBLIGATION_MAX_RECOVERIES
++    else:
++        key, value = {"bad_age": ("owed_since", "bad"), "bad_starts": ("recoveries", "bad"),
++                      "nan_age": ("owed_since", float("nan")),
++                      "inf_starts": ("recoveries", float("inf"))}[budget]
++        owed[key] = value
++    path.write_text(json.dumps(record))
++    registry = ProcessRegistry()
++    registry.recover_from_checkpoint(owner="gateway")
++    assert ob.OBLIGATION_KEY not in json.loads(path.read_text())
++    assert [w["session_id"] for w in registry.pending_watchers] == [valid.id]
++
++
++def test_failed_reconstruction_spends_start_budget(receipt):
++    _, path = receipt()
++    record = json.loads(path.read_text())
++    del record["exit_code"]
++    path.write_text(json.dumps(record))
++    for _ in range(ob.OBLIGATION_MAX_RECOVERIES + 1):
++        ProcessRegistry().recover_from_checkpoint(owner="gateway")
++    assert ob.OBLIGATION_KEY not in json.loads(path.read_text())
++
++
++def test_retained_over_cap_owed_receipt_is_retrievable(receipt, monkeypatch):
++    session, path = receipt()
++    old = time.time() - 60
++    os.utime(path, (old, old))
++    monkeypatch.setattr(results, "MAX_RETAINED_RESULTS", 1)
++    receipt("proc_bbbbbbbbbbbb")
++    assert path.exists()
++    assert session.id in results.load_completed_results(session.id)
++
++
++def test_explicit_kill_rewrite_logs_settlement(receipt, caplog):
++    session, path = receipt()
++    with caplog.at_level(logging.INFO, logger="tools.process_registry"):
++        ProcessRegistry()._rewrite_killed_receipt(session, consume_output=True)
++    assert ob.OBLIGATION_KEY not in json.loads(path.read_text())
++    assert f"Completion of {session.id} settled (consumed via kill)" in caplog.text
++
++
++@pytest.mark.parametrize("gate", ["foreign_profile", "live_writer", "tui", None])
++def test_bad_budget_preserves_non_owned_custody(receipt, monkeypatch, gate):
++    _, path = receipt()
++    record = json.loads(path.read_text())
++    record[ob.OBLIGATION_KEY]["recoveries"] = "bad"
++    registry = ProcessRegistry()
++    if gate == "foreign_profile":
++        record["session_key"] = "agent:other:local:dm:x"
++        registry.profile_scoped_checkpoints = True
++    elif gate == "live_writer":
++        record[ob.OBLIGATION_KEY]["writer_pid"] = -1
++        monkeypatch.setattr(registry, "_writer_alive", lambda owed: True)
++    before = json.dumps(record)
++    path.write_text(before)
++    registry.recover_from_checkpoint(owner="gateway" if gate in ("foreign_profile", "live_writer") else gate)
++    assert path.read_text() == before
++    assert registry.pending_watchers == []
++
++
++@pytest.mark.parametrize("first", ["kill", "settle"])
++def test_settlement_and_kill_rewrite_serialize(receipt, monkeypatch, first):
++    session, path = receipt()
++    registry = ProcessRegistry()
++    entered, release, contended = threading.Event(), threading.Event(), threading.Event()
++    lock = threading.Lock()
++
++    class ObservedLock:
++        def __enter__(self):
++            if lock.locked():
++                contended.set()
++            lock.acquire()
++
++        def __exit__(self, *args):
++            lock.release()
++
++    registry._lock = ObservedLock()
++    original = ob.owed_still if first == "kill" else ob._rewrite
++
++    def pause(*args, **kwargs):
++        value = original(*args, **kwargs)
++        entered.set()
++        assert release.wait(5)
++        return value
++
++    monkeypatch.setattr(ob, "owed_still" if first == "kill" else "_rewrite", pause)
++    kill = lambda: registry._rewrite_killed_receipt(session, consume_output=False)
++    settle = lambda: registry.settle_completion(session.id, "admitted")
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        one = pool.submit(kill if first == "kill" else settle)
++        try:
++            assert entered.wait(5)
++            two = pool.submit(settle if first == "kill" else kill)
++            assert contended.wait(5), "competing receipt writer did not take the registry lock"
++        finally:
++            release.set()
++        one.result(timeout=5)
++        two.result(timeout=5)
++    assert ob.OBLIGATION_KEY not in json.loads(path.read_text())
+diff --git a/tools/process_registry_obligations.py b/tools/process_registry_obligations.py
+index 05245474c8..70f5436cbc 100644
+--- a/tools/process_registry_obligations.py
++++ b/tools/process_registry_obligations.py
+@@ -32,6 +32,7 @@ from __future__ import annotations
+ 
+ import json
+ import logging
++import math
+ import os
+ import re
+ import time
+@@ -179,6 +180,8 @@ class ProcessObligationMixin:
+         keeps the one the receipt carries (never re-creates it). Read and write under ``self._lock``."""
+         from tools import process_registry as registry_module  # its save name (tests patch it there)
+         with self._lock:
++            if consume_output:
++                settle_quietly(session.id, "consumed via kill")
+             registry_module.save_completed_result(session, None if consume_output else owed_still(session.id))
+ 
+     def _recover_owed_completions_locked(self, owner: Optional[str]) -> int:
+@@ -209,28 +212,36 @@ class ProcessObligationMixin:
+                 continue
+             if owed.get("writer_pid") != os.getpid() and self._writer_alive(owed):
+                 continue  # a live gateway still has this watcher
++            reason, tries = "", 0
+             try:
+                 age, tries = now - float(owed.get("owed_since") or 0), int(owed.get("recoveries") or 0)
+-                session = self._owed_session(record, owed)
+-            except (KeyError, TypeError, ValueError):
+-                # One malformed receipt must not stop the owed receipts after it from being re-armed.
+-                logger.warning("Skipping the unreadable owed completion %s", sid, exc_info=True)
+-                continue
+-            if age > OBLIGATION_MAX_AGE_SECONDS or tries >= OBLIGATION_MAX_RECOVERIES:
++                if not math.isfinite(age) or tries < 0:
++                    raise ValueError("invalid recovery budget")
++                if tries >= OBLIGATION_MAX_RECOVERIES:
++                    reason = f"{tries} gateway starts did not admit it"
++                elif age > OBLIGATION_MAX_AGE_SECONDS:
++                    reason = f"owed for {int(age)}s"
++            except (TypeError, ValueError, OverflowError):
++                reason = "unreadable recovery budget"
++            if reason:
+                 record.pop(OBLIGATION_KEY, None)
+                 with suppress(OSError):
+                     _rewrite(path, record)
+                 logger.warning("Dropped the owed completion of %s (session %s): %s", sid,
+-                               record.get("session_key") or "-",
+-                               f"{tries} gateway starts did not admit it" if tries >= OBLIGATION_MAX_RECOVERIES
+-                               else f"owed for {int(age)}s")
++                               record.get("session_key") or "-", reason)
+                 continue
++            # Failed reconstruction spends a start too; otherwise malformed sessions never hit the cap.
+             record[OBLIGATION_KEY] = {**owed, "recoveries": tries + 1, **_writer()}
+             try:
+                 _rewrite(path, record)
+             except OSError:
+                 logger.warning("Could not claim the owed completion of %s", sid, exc_info=True)
+                 continue
++            try:
++                session = self._owed_session(record, owed)
++            except (KeyError, TypeError, ValueError, OverflowError):
++                logger.warning("Skipping the unreadable owed completion %s", sid, exc_info=True)
++                continue
+             with self._lock:
+                 self._finished[sid] = session
+             self.pending_watchers.append(self._recovered_watcher(session))
+diff --git a/tools/process_registry_results.py b/tools/process_registry_results.py
+index 6a36ac302e..5ca54a7f99 100644
+--- a/tools/process_registry_results.py
++++ b/tools/process_registry_results.py
+@@ -41,10 +41,13 @@ def _result_paths():
+         except FileNotFoundError:
+             continue  # Another producer pruned it.
+     retained.sort(key=lambda item: (item[0], item[1].name), reverse=True)
++    visible = [path for _, path in retained[:MAX_RETAINED_RESULTS]]
+     for _, path in retained[MAX_RETAINED_RESULTS:]:
+-        if not _owed(path):  # an owed notice keeps its receipt until settled or aged out [daveey]
++        if _owed(path):  # retained custody must also remain retrievable [daveey]
++            visible.append(path)
++        else:
+             path.unlink(missing_ok=True)
+-    return [path for _, path in retained[:MAX_RETAINED_RESULTS]]
++    return visible
+ 
+ 
+ def _owed(path) -> bool:
+-- 
+2.51.0
+

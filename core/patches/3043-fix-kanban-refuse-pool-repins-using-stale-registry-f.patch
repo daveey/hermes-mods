@@ -1,0 +1,97 @@
+From bd847692492d3ce6ef27ac25614eb74b164f79b2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 21:39:14 +0000
+Subject: [PATCH] fix(kanban): refuse pool repins using stale registry fallback
+ [daveey]
+
+---
+ hermes_cli/kanban_worker_repin.py            |  2 +-
+ tests/hermes_cli/test_kanban_worker_repin.py | 38 ++++++++++++++++++--
+ 2 files changed, 36 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_worker_repin.py b/hermes_cli/kanban_worker_repin.py
+index fe3b5bb511..2783c9ae8b 100644
+--- a/hermes_cli/kanban_worker_repin.py
++++ b/hermes_cli/kanban_worker_repin.py
+@@ -137,7 +137,7 @@ def eligibility(conn: sqlite3.Connection, task_id: str, labels: list[str]) -> di
+     if pool:
+         from hermes_cli import kanban_move as km
+         from hermes_cli import kanban_worker_node as wn
+-        registry = wn.registry()
++        registry = wn.registry(require_fresh=True)
+         if registry is None:
+             return _refuse("registry_unavailable", "the Board machine registry is unreachable; try again")
+         matches = km.matching_machines(labels, registry.get("machines") or {}, me=me, exclude_me=False)
+diff --git a/tests/hermes_cli/test_kanban_worker_repin.py b/tests/hermes_cli/test_kanban_worker_repin.py
+index 83f47d5a45..43de081138 100644
+--- a/tests/hermes_cli/test_kanban_worker_repin.py
++++ b/tests/hermes_cli/test_kanban_worker_repin.py
+@@ -32,8 +32,10 @@ svc = node_fixtures.svc
+ @pytest.fixture(autouse=True)
+ def pool_registry(monkeypatch):
+     from hermes_cli import kanban_worker_node as wn
+-    monkeypatch.setattr(wn, "registry", lambda: {"machines": {
++    original = wn.registry
++    monkeypatch.setattr(wn, "registry", lambda **kw: {"machines": {
+         "worker-1": {"labels": ["pool:worker", "capability:hub-write"]}}})
++    return original
+ 
+ 
+ @pytest.mark.parametrize("status", ["ready", "scheduled", "todo"])
+@@ -50,7 +52,7 @@ def test_cli_started_pool_requires_live_complete_label_match(conn, monkeypatch,
+     }
+     if available:
+         machines["capable"] = {"labels": target}
+-    monkeypatch.setattr(wn, "registry", lambda: {"machines": machines})
++    monkeypatch.setattr(wn, "registry", lambda **kw: {"machines": machines})
+     before = list(conn.iterdump())
+     calls = []
+ 
+@@ -81,13 +83,43 @@ def test_cli_started_pool_requires_live_complete_label_match(conn, monkeypatch,
+ def test_pool_registry_unavailable_refuses_without_write(conn, monkeypatch):
+     from hermes_cli import kanban_worker_node as wn
+     tid = _acknowledged(conn, started_at=1)
+-    monkeypatch.setattr(wn, "registry", lambda: None)
++    monkeypatch.setattr(wn, "registry", lambda **kw: None)
+     before = list(conn.iterdump())
+     out = km.move_queued(conn, tid, runs_on=["pool:worker"], reason="queue", hub=NoCallHub())
+     assert out["reason_code"] == "registry_unavailable"
+     assert list(conn.iterdump()) == before
+ 
+ 
++@pytest.mark.parametrize("retry_cached", [False, True])
++def test_pool_failed_registry_refresh_preserves_reservation(conn, monkeypatch, pool_registry, retry_cached):
++    from hermes_cli import kanban_worker_node as wn
++    tid = _acknowledged(conn, started_at=1, requires=json.dumps(["hub:write"]))
++    monkeypatch.setattr(wn, "registry", pool_registry)
++    clock = [100.0]
++    monkeypatch.setattr(wn.time, "monotonic", lambda: clock[0])
++    fetches = []
++
++    def fetch():
++        fetches.append(clock[0])
++        if len(fetches) > 1:
++            raise OSError("registry offline")
++        return {"machines": [{"name": "capable", "labels": ["pool:worker", "capability:hub-write"]}]}
++
++    wn.set_registry_fetch(fetch)
++    try:
++        assert wn.registry()["machines"]["capable"]
++        clock[0] += wn.REGISTRY_TTL_S + 1
++        if retry_cached:
++            assert wn.registry()["machines"]["capable"]  # discovery retains last good on failure
++        before = list(conn.iterdump())
++        out = km.move_queued(conn, tid, runs_on=["pool:worker"], reason="queue", hub=NoCallHub())
++        assert out["reason_code"] == "registry_unavailable", out
++        assert list(conn.iterdump()) == before
++        assert len(fetches) == 2
++    finally:
++        wn.set_registry_fetch(None)
++
++
+ class RepinHub(FakeHub):
+     """FakeHub plus the Board's ``repinWorker`` (worker/src/worker_placement.ts): creator only, ready and unleased,
+     exact revision, then clear policy + set the pin in one Board write."""
+-- 
+2.51.0
+

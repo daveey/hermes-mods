@@ -1,0 +1,170 @@
+From dd9bf012452625496b86969b72f692c71b604f3c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:55:14 +0000
+Subject: [PATCH] [daveey] kanban sync links pass: warn once when another
+ runner's pass holds _PASS_LOCK
+
+LinksPass.request() refused silently while a stopped runner's pass held the
+process-wide _PASS_LOCK, so a hung reconcile_links refused every later links
+pass in the process with no signal. The pass now records its hold (runner,
+monotonic start, token) while it holds the lock; a request refused because
+another runner holds it logs one warning per hold naming how long it has been
+held. Later refusals for the same hold stay quiet; a new hold warns again.
+
+Review nit on PR #2006 (t_01a1d4101c33c709); card t_01a1d418d1ac7603.
+---
+ hermes_cli/kanban_sync_links_pass.py          | 38 +++++++++++++---
+ .../test_kanban_sync_links_thread.py          | 43 +++++++++++++++++++
+ 2 files changed, 76 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_links_pass.py b/hermes_cli/kanban_sync_links_pass.py
+index 4338bb0d3b..7f734972f7 100644
+--- a/hermes_cli/kanban_sync_links_pass.py
++++ b/hermes_cli/kanban_sync_links_pass.py
+@@ -9,13 +9,16 @@ and never calls the loop's ``keep_running`` (callers count its calls); the loop
+ 
+ ``stop`` waits only ``JOIN_S`` for a running pass, so a slow pass can outlive its loop. Passes are serialized per
+ process (``_PASS_LOCK``): a restarted loop's runner refuses requests while a stopped runner's pass still runs, and
+-never runs ``reconcile_links`` alongside it (both would share ``kanban_sync_client._LINKS_DONE``).
++never runs ``reconcile_links`` alongside it (both would share ``kanban_sync_client._LINKS_DONE``). A request refused
++because another runner holds the lock logs one warning per hold: a hung pass would otherwise refuse every later pass
++in the process silently.
+ """
+ from __future__ import annotations
+ 
+ import contextvars
+ import logging
+ import threading
++import time
+ from pathlib import Path
+ from typing import Optional
+ 
+@@ -23,6 +26,10 @@ _log = logging.getLogger("hermes_cli.kanban_sync_client")
+ 
+ # Held for the length of one ``reconcile_links`` call by whichever runner (live, or stopped but still running) owns it.
+ _PASS_LOCK = threading.Lock()
++# (runner, monotonic acquire time, hold token) while a pass holds ``_PASS_LOCK``, and the token of the last hold a
++# refusal warned about: a wedged pass warns once, not on every refused request.
++_HOLD: Optional[tuple[LinksPass, float, object]] = None
++_WARNED_HOLD: Optional[object] = None
+ 
+ 
+ class LinksPass:
+@@ -40,7 +47,10 @@ class LinksPass:
+     def request(self, boards: list[tuple[str, Path]]) -> bool:
+         """Start a pass over ``boards`` unless one is running: this runner's, or an earlier loop's that outlived its
+         ``stop``. True when it started."""
+-        if not self._idle.is_set() or _PASS_LOCK.locked():
++        if not self._idle.is_set():
++            return False
++        if _PASS_LOCK.locked():
++            self._warn_held_elsewhere()
+             return False
+         self._boards = list(boards)
+         self._idle.clear()
+@@ -52,6 +62,16 @@ class LinksPass:
+             self._thread.start()
+         return True
+ 
++    def _warn_held_elsewhere(self) -> None:
++        global _WARNED_HOLD
++        hold = _HOLD
++        if hold is None or hold[0] is self or hold[2] is _WARNED_HOLD:
++            return
++        _WARNED_HOLD = hold[2]
++        _log.warning("kanban sync: chat links pass refused: another runner's pass has held the pass lock for %.0fs "
++                     "(reconcile_links may be hung); later refusals stay quiet until it returns",
++                     time.monotonic() - hold[1])
++
+     def wait_idle(self, timeout: Optional[float] = None) -> bool:
+         return self._idle.wait(timeout)
+ 
+@@ -61,6 +81,16 @@ class LinksPass:
+         if self._thread is not None:
+             self._thread.join(self.JOIN_S)
+ 
++    def _pass(self, client) -> None:
++        global _HOLD
++        with _PASS_LOCK:  # a request that raced past ``request``'s check waits here, never overlaps
++            _HOLD = (self, time.monotonic(), object())
++            try:
++                if not self._stopped:
++                    client.reconcile_links(self._boards, self._gateway, skip_unchanged=True)
++            finally:
++                _HOLD = None
++
+     def _run(self) -> None:
+         from hermes_cli import kanban_sync_client as client  # module attribute: tests replace reconcile_links
+         from hermes_cli.kanban_sync_connections import connection_scope
+@@ -73,9 +103,7 @@ class LinksPass:
+                     if self._stopped:
+                         break
+                     try:
+-                        with _PASS_LOCK:  # a request that raced past ``request``'s check waits here, never overlaps
+-                            if not self._stopped:
+-                                client.reconcile_links(self._boards, self._gateway, skip_unchanged=True)
++                        self._pass(client)
+                     except Exception as exc:  # health: allow BLE001 -- a failed pass must not end the thread
+                         _log.warning("kanban sync: chat links pass failed (%s: %s)", type(exc).__name__, exc)
+                     finally:
+diff --git a/tests/hermes_cli/test_kanban_sync_links_thread.py b/tests/hermes_cli/test_kanban_sync_links_thread.py
+index afdd191e3d..54ed90b8a5 100644
+--- a/tests/hermes_cli/test_kanban_sync_links_thread.py
++++ b/tests/hermes_cli/test_kanban_sync_links_thread.py
+@@ -5,6 +5,7 @@ outbox push, so the replica went 13 min stale and hub cards waiting on worker ca
+ """
+ from __future__ import annotations
+ 
++import logging
+ import threading
+ from pathlib import Path
+ from types import SimpleNamespace
+@@ -129,3 +130,45 @@ def test_a_restarted_loop_never_runs_a_pass_beside_the_stopped_loops(monkeypatch
+     assert second["calls_while_blocked"] == 1, f"the restarted loop ran a pass beside the stopped one: {calls}"
+     assert state["max"] == 1, f"{state['max']} concurrent reconcile_links passes"
+     assert len(calls) == 2 and calls[1] is not slow, "the restarted loop never ran its own pass"
++
++
++def test_a_pass_refused_behind_a_stopped_loops_pass_warns_once(monkeypatch, caplog):
++    """A stopped runner's hung ``reconcile_links`` refuses every later pass in the process: say so once per hold
++    rather than refusing silently (review nit on PR #2006)."""
++    from hermes_cli.kanban_sync_links_pass import LinksPass
++    monkeypatch.setattr(LinksPass, "JOIN_S", 0.05)
++    release, entered = threading.Event(), threading.Event()
++    calls: list[threading.Thread] = []
++
++    def reconcile(boards, gateway, **kwargs):
++        calls.append(threading.current_thread())
++        entered.set()
++        release.wait(10)
++
++    first = {"n": 0}
++
++    def first_wait(*args):
++        first["n"] += 1
++        assert entered.wait(10), "the first loop's pass never started"
++
++    try:
++        _run_loop(monkeypatch, reconcile=reconcile, sync_all_once=lambda *a, **k: [], wait=first_wait,
++                  keep_running=lambda: first["n"] < 1)
++        assert len(calls) == 1 and calls[0].is_alive(), "the first pass must outlive its loop"
++        caplog.clear()
++        second = {"n": 0}
++
++        def second_wait(*args):
++            second["n"] += 1
++
++        with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_sync_client"):
++            _run_loop(monkeypatch, reconcile=reconcile, sync_all_once=lambda *a, **k: [], wait=second_wait,
++                      keep_running=lambda: second["n"] < 2)  # two iterations: two refused requests
++        assert second["n"] == 2 and len(calls) == 1, f"the restarted loop's requests were not refused: {calls}"
++        held = [r for r in caplog.records if "held the pass lock" in r.getMessage()]
++        assert len(held) == 1, f"expected one warning for the hold, got {[r.getMessage() for r in held]}"
++        assert held[0].levelno == logging.WARNING
++    finally:
++        release.set()
++        for thread in calls:
++            thread.join(10)
+-- 
+2.51.0
+

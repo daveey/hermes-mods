@@ -1,0 +1,139 @@
+From 4eed4237ff77cb5832e98749e68d6e37704df4bd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 04:43:38 +0000
+Subject: [PATCH] [daveey] test(kanban-sync): FakeService mirrors
+ lease_run_uid; end-to-end lease_held release veto
+
+FakeService's lease grant/clear never wrote lease_run_uid on the task row,
+unlike hermes-hub transitions.ts setLease/clearLease, so the release
+mootness veto in kanban_sync_rejections (card still leased by that run_uid
+-> unresolved) was covered only by hand-set fixture rows.
+
+- grant (lease_runs=True) sets lease_run_uid with lease_holder/lease_expires;
+  every clear path (holder leaving running, release op, lease release) nulls it.
+- New lease_runs=True test: grant via hub.leases, holder ends its run and drops
+  current_run_uid while keeping the lease -> rejected release stays
+  unresolved/retained; holder leaves running (clearLease) -> moot/retired.
+
+Proof: RED without the fake change (KeyError lease_run_uid); mutants killed:
+veto without lease_run_uid -> moot (expected unresolved); row_op clear
+without lease_run_uid -> mirror stays set. All 49 test files importing the
+fake board: 883 passed. Test-only; follow-up to PR #1866 review 5886021750.
+---
+ tests/hermes_cli/kanban_sync_fake_board.py    | 18 ++++----
+ .../hermes_cli/test_kanban_sync_rejections.py | 41 +++++++++++++++++++
+ 2 files changed, 52 insertions(+), 7 deletions(-)
+
+diff --git a/tests/hermes_cli/kanban_sync_fake_board.py b/tests/hermes_cli/kanban_sync_fake_board.py
+index 45def2be5f..989cb2e5a6 100644
+--- a/tests/hermes_cli/kanban_sync_fake_board.py
++++ b/tests/hermes_cli/kanban_sync_fake_board.py
+@@ -22,8 +22,9 @@ class FakeService:
+         self.boards: dict[str, dict[str, Any]] = {}
+         self.calls: list[tuple[str, str, Any]] = []
+         self.offline = False
+-        # Like transitions.ts grantLease/releaseTask: a grant writes the card running plus its run row, a release
+-        # ends that run and returns the card to ready. Off by default (the older tests count rows).
++        # Like transitions.ts grantLease/releaseTask: a grant writes the card running plus its run row (setLease
++        # mirrors lease_holder/lease_run_uid/lease_expires onto the card), a release ends that run, clears that
++        # mirror (clearLease) and returns the card to ready. Off by default (the older tests count rows).
+         self.lease_runs = lease_runs
+         # Opt-in placement, like transitions.ts checkPlacement's runs_on rule: a grant needs every runs_on label
+         # on the claiming machine ({name: {"labels": [...]}}; machine:<name> is implicit). None = no check.
+@@ -97,8 +98,8 @@ class FakeService:
+                               {"status": "released", "outcome": "released",
+                                "error": f"card left running ({won['status']})", "ended_at": int(time.time())},
+                               gw, op["client_op_id"], op["hlc"])
+-                row = self._put(b, table, uid, {"lease_holder": None, "lease_expires": None}, gw, op["client_op_id"],
+-                                op["hlc"])
++                row = self._put(b, table, uid, {"lease_holder": None, "lease_run_uid": None, "lease_expires": None}, gw,
++                                op["client_op_id"], op["hlc"])
+             return {"status": "applied" if len(won) == len(f) else "merged", "row": row}
+         if table == "task_links":
+             # rows.ts upsertLink: a link needs both of its cards on the Board.
+@@ -141,7 +142,8 @@ class FakeService:
+         self._put(b, "task_events", f"ev-{op_id}-{kind}", {"task_id": task, "run_uid": run, "kind": kind,
+                                                             "payload": json.dumps(payload), "created_at": int(time.time())},
+                   "server", op_id, clock)
+-        fields: dict = {"status": "ready", "current_run_uid": None, "lease_holder": None, "lease_expires": None}
++        fields: dict = {"status": "ready", "current_run_uid": None, "lease_holder": None, "lease_run_uid": None,
++                        "lease_expires": None}
+         if canonical:
+             failures = int(card.get("consecutive_failures") or 0) + 1
+             limit = card.get("max_retries") or op.get("failure_limit") or 2
+@@ -236,8 +238,10 @@ class FakeHub:
+             if self.svc.lease_runs and task in b["rows"].get("tasks", {}):
+                 self.svc._put(b, "task_runs", run, {"task_id": task, "status": "running", "started_at": 1,
+                                                     "ended_at": None, "outcome": None}, gw, op_id, hlc)
++                # setLease mirrors the lease onto the card: lease_holder, lease_run_uid, lease_expires.
+                 version = self.svc._put(b, "tasks", task, {"status": "running", "current_run_uid": run,
+-                                                           "lease_holder": gw, "lease_expires": 9_999_999_999_999},
++                                                           "lease_holder": gw, "lease_run_uid": run,
++                                                           "lease_expires": 9_999_999_999_999},
+                                         gw, op_id, hlc)["version"]
+                 # As the Board's grantLease (hermes-hub worker/src/transitions.ts): the claimed event, tagged with
+                 # the lane the claim came from, so a reviewer run retries to ``review``.
+@@ -269,7 +273,7 @@ class FakeHub:
+                                                           "unused_grant": True}, separators=(",", ":")),
+                                    "created_at": int(time.time())}, gw, op_id, hlc)
+                 self.svc._put(b, "tasks", task, {"status": "ready", "current_run_uid": None, "lease_holder": None,
+-                                                 "lease_expires": None}, gw, op_id, hlc)
++                                                 "lease_run_uid": None, "lease_expires": None}, gw, op_id, hlc)
+             return {"status": "applied", "lease": None}
+         return {"status": "applied", "lease": b["leases"][task], "version": version}
+ 
+diff --git a/tests/hermes_cli/test_kanban_sync_rejections.py b/tests/hermes_cli/test_kanban_sync_rejections.py
+index 0b1921014b..e5d93e8258 100644
+--- a/tests/hermes_cli/test_kanban_sync_rejections.py
++++ b/tests/hermes_cli/test_kanban_sync_rejections.py
+@@ -267,6 +267,47 @@ def test_release_retirement_needs_ended_run_off_the_lease(live, svc, monkeypatch
+     assert live.execute("SELECT state FROM kanban_sync_outbox WHERE op_id='release-op'").fetchone()[0] == "rejected"
+ 
+ 
++def test_live_lease_by_the_run_keeps_release_end_to_end(live, kanban_home):
++    """The ``lease_held`` veto through real Board transitions, not a hand-set row: the grant mirrors the lease
++    onto the card (setLease), the holder then ends its run row and drops ``current_run_uid`` while keeping the
++    lease, so only ``lease_run_uid`` still names the run. Once the holder leaves ``running`` (clearLease), the same
++    release is moot."""
++    svc = FakeService(lease_runs=True)
++    hub = svc.hub(ME)
++    tid = kb.create_task(live, title="leased", assignee="worker")
++    client.push(live, hub, BOARD, ME, primary=False)
++    granted = hub.leases(BOARD, {"action": "grant", "task": tid, "run_uid": RUN, "client_op_id": "grant-op"})
++    assert granted["status"] == "applied"
++    card = svc.board(BOARD)["rows"]["tasks"][tid]
++    assert (card["lease_run_uid"], card["lease_holder"]) == (RUN, ME)
++
++    def holder(op_id, table, uid, fields):
++        res = hub.ops(BOARD, [{"client_op_id": op_id, "table": table, "uid": uid, "op": "upsert", "fields": fields,
++                               "hlc": f"{9_999_999_999_999:013d}-0001-{ME}"}])["results"][0]
++        assert res["status"] == "applied", res
++
++    holder("run-end", "task_runs", RUN, {"ended_at": 1794527437, "status": "crashed", "outcome": "crashed"})
++    holder("drop-current", "tasks", tid, {"current_run_uid": None})
++    card = svc.board(BOARD)["rows"]["tasks"][tid]
++    assert (card["status"], card["current_run_uid"], card["lease_run_uid"]) == ("running", None, RUN)
++    with kbc.write_txn(live):
++        live.execute("INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at,state,last_error,"
++                     "attempts) VALUES ('release-op','tasks',?,'release',?,'',1,'rejected',?,1)",
++                     (tid, json.dumps({"run_uid": RUN, "outcome": "crashed"}),
++                      "lease_lost: this run no longer holds the lease"))
++    from hermes_cli.kanban_sync_rejections import resolve_rejections
++    report = next(r for r in resolve_rejections(live, hub, BOARD) if r["op_id"] == "release-op")
++    assert (report["classification"], report["action"]) == ("unresolved", "retained")
++    assert report["evidence"]["row"]["lease_run_uid"] == RUN
++    assert client.status(live)["rejected"] == 1
++
++    holder("leave-running", "tasks", tid, {"status": "blocked"})
++    assert svc.board(BOARD)["rows"]["tasks"][tid]["lease_run_uid"] is None
++    report = next(r for r in resolve_rejections(live, hub, BOARD) if r["op_id"] == "release-op")
++    assert (report["classification"], report["action"]) == ("moot", "retired")
++    assert client.status(live)["rejected"] == 0
++
++
+ def test_release_local_change_during_read_vetoes(live, svc, monkeypatch):
+     lost_release(live, svc)
+     hub = svc.hub(ME)
+-- 
+2.51.0
+

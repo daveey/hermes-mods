@@ -1,0 +1,307 @@
+From f4913706cc44dbca179062770bb8ebae0c4f5a53 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 05:02:58 +0000
+Subject: [PATCH] [daveey] fix(update-pause): announce a carried turn's pause;
+ its continuation names the paused notification turn
+
+Follow-up to PR #1870 review nits (review 5886094345, t_01a1d331f7c35630):
+
+1. A synthesized turn that runs over a paused marker and is itself paused for the next window left its
+   interrupted action only as transcript context: the continuation note named just the original paused
+   request. The hook now stamps the marker `carried_turn_paused` when the pause it pays is a carried one
+   (the same condition that already skipped counting it again), and the continuation appends
+   CARRIED_TURN_NOTE telling the model a notification turn was paused too and its partial work is above.
+   A turn's own fresh marker (record_turn_start) clears the flag.
+2. The carried turn never called announce_pause: pause_stands was keyed on its empty marker key, so Desktop
+   got a plain message.complete for a turn paused for the update. Publication now keys on
+   update_pause.effective_pause_key (own marker key, else the carried paused key; replaces
+   prompt_turn._carried_pause_key so the hook and the publication share one definition). The in-place
+   watcher is still started there only for a turn's own marker; a carried turn's is re-armed exactly once by
+   _rearm_carried_pause_watcher.
+3. Test: a user Stop (real session.interrupt RPC) of a carried turn after its hook paid the pause:
+   user_stop_wins returns False, the paused request survives as core_update_pause with its prompt, the
+   watcher is re-armed and in_place_resume_action says resume.
+
+Proof: tests/tui_gateway/test_update_pause_superseded.py, 4 new tests; the announce and the
+carried_turn_paused/note tests fail before (announce_pause never called; no flag) and pass after, the Stop
+test pins existing behaviour (18 passed). 129 test files referencing update_pause/turn_marker/prompt_turn/
+session_auto_continue: 2536 passed, 2 failed in tests/gateway/test_kanban_restart_continuation.py, which
+fail identically on the unchanged base (worker_account_boards refuses registration in the real worker
+inventory on this worker node).
+---
+ .../test_update_pause_superseded.py           | 83 +++++++++++++++++++
+ tui_gateway/prompt_turn.py                    | 25 ++----
+ tui_gateway/session_auto_continue.py          |  3 +-
+ tui_gateway/turn_marker.py                    |  8 +-
+ tui_gateway/update_pause.py                   | 39 +++++++--
+ 5 files changed, 131 insertions(+), 27 deletions(-)
+
+diff --git a/tests/tui_gateway/test_update_pause_superseded.py b/tests/tui_gateway/test_update_pause_superseded.py
+index 39e93b75dd..d6bb07e1a2 100644
+--- a/tests/tui_gateway/test_update_pause_superseded.py
++++ b/tests/tui_gateway/test_update_pause_superseded.py
+@@ -336,3 +336,86 @@ def test_synthesized_turn_over_a_paused_marker_arms_the_mid_tool_cancel_and_clar
+     session["running"] = True
+     assert server._notif_run_submit("__notif__1", "ui-sid", session, "[Background process proc_1 finished]")
+     assert armed == ["session-key"] and stopped == ["session-key"] and clarify == [True]
++
++
++# --- PR #1870 review (t_01a1d331f7c35630): the carried turn's pause is announced like any pause, a user Stop of
++# that turn after its hook paid the pause keeps the paused request (it was not the Stop's turn), and the
++# continuation names the notification turn that the pause interrupted.
++
++def _hook_pauses(agent, seen):
++    seen["reason"] = reason = agent.step_boundary_pause()
++    return {"final_response": "", "messages": [], "interrupted": bool(reason), "completed": not reason,
++            "paused_for_update": reason}
++
++
++def test_a_carried_turn_paused_for_the_update_is_announced(env, monkeypatch):
++    announced = []
++    monkeypatch.setattr(up, "announce_pause", lambda sid, payload: announced.append(sid))
++    session = _paused_session(env.home)
++    announced.clear()  # the paused turn's own announcement
++    env.watchers.clear()
++
++    session["agent"].run_conversation = lambda message, **kw: _run_with_window(env, session, _hook_pauses)
++    session["running"] = True
++    assert server._notif_run_submit("__notif__1", "ui-sid", session, "[Background process proc_1 finished]")
++
++    assert announced == ["ui-sid"], "Desktop got a plain message.complete for a turn paused for the update"
++    assert env.watchers == [("ui-sid", "session-key")], "exactly one watcher continues the paused turn"
++
++
++def _run_with_window(env, session, during_turn, seen=None):
++    af.set_hold(env.home)
++    af.request_pause(env.home, expires_at=time.time() + 120)
++    try:
++        return during_turn(session["agent"], {} if seen is None else seen)
++    finally:
++        af.clear_pause_request(env.home)
++        af.clear_hold(env.home)
++
++
++def test_a_user_stop_of_a_carried_turn_after_its_hook_paused_keeps_the_paused_request(env):
++    seen = {}
++    session = _paused_session(env.home)
++    server._sessions["ui-sid"] = session
++
++    def _turn(agent, seen):
++        seen["reason"] = agent.step_boundary_pause()
++        assert session.get("_update_pause_marker_key") == "session-key"  # the hook paid the carried pause
++        seen["stop_wins"] = up.user_stop_wins(session)
++        reply = server._methods["session.interrupt"]("rid-stop", {"session_id": "ui-sid", "origin": "stop_button"})
++        seen["stop"] = reply.get("result", {}).get("status")
++        return {"final_response": "", "messages": [], "interrupted": True, "completed": False}  # the Stop won
++
++    session["agent"].run_conversation = lambda message, **kw: _run_with_window(env, session, _turn, seen)
++    session["agent"].interrupt = lambda *a, **k: None
++    session["running"] = True
++    try:
++        assert server._notif_run_submit("__notif__1", "ui-sid", session, "[Background process proc_1 finished]")
++    finally:
++        server._sessions.pop("ui-sid", None)
++
++    assert seen["reason"] == up.PAUSE_REASON and seen["stop"] == "interrupted"
++    assert seen["stop_wins"] is False, "a Stop of the carried turn dropped the paused turn's pause"
++    marker = read_turn_marker(env.home, "session-key")
++    assert marker is not None and marker["reason"] == up.PAUSE_REASON and marker["prompt"] == "the long task"
++    assert env.watchers[-1] == ("ui-sid", "session-key")
++    assert not session.get("running")
++    assert up.in_place_resume_action(session, "session-key", skew=lambda: None) == "resume"
++
++
++def test_the_continuation_of_a_pause_a_carried_turn_paid_names_the_interrupted_notification_turn(env, monkeypatch):
++    _session, seen = _carried_turn_with_window(env, _hook_pauses)
++    assert seen["reason"] == up.PAUSE_REASON
++    marker = read_turn_marker(env.home, "session-key")
++    assert marker is not None and marker.get("carried_turn_paused") is True
++    note = up.pause_note(marker["prompt"], marker.get("killed_jobs"), carried=True)
++    assert note.endswith(up.CARRIED_TURN_NOTE) and "the long task" in note
++    assert up.CARRIED_TURN_NOTE not in up.pause_note("the long task")
++    from tests.tui_gateway.test_update_pause_user_stop import _fresh_backend_continues
++    assert _fresh_backend_continues(env, monkeypatch) == [note]  # what the next backend really sends
++
++
++def test_a_pause_the_paused_turn_paid_itself_does_not_name_a_notification_turn(env):
++    _paused_session(env.home)
++    marker = read_turn_marker(env.home, "session-key")
++    assert marker is not None and not marker.get("carried_turn_paused")
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 8322eea34a..f0818689da 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -233,20 +233,6 @@ def _carry_paused_marker(session: dict, home, marker_key: str) -> bool:
+     return True
+ 
+ 
+-def _carried_pause_key(session: dict) -> str:
+-    """[daveey] The paused turn's marker key a synthesized turn runs over (``_carry_paused_marker``), or "".
+-
+-    Such a turn writes no marker of its own, but it still holds an admission reservation, and hermes-sync's
+-    drainer skips ``core_update_pause`` markers, so it never waits on it. Without a step-boundary hook it ran
+-    straight through the next drain window, and an instant apply (which refuses a reservation no gateway
+-    publishes) deferred until it ended: hermes-hub 2026-11-13, one notification turn ran 12 min and the core
+-    update stayed deferred for over an hour (t_01a1d3083b2dae09). With the hook it ends at its next step
+-    boundary like any turn; the pause it lands on is the one it carries (``mark_turn_paused`` does not count it
+-    again), and ``_rearm_carried_pause_watcher`` continues the paused turn after the window."""
+-    with session["history_lock"]:
+-        return str(session.get("_paused_marker_carried") or "")
+-
+-
+ def _rearm_carried_pause_watcher(sid: str, session: dict, st) -> None:
+     """[daveey] A synthesized turn that ran over a core-update-paused marker re-arms the in-place watcher however
+     it ended (complete, raised, refused at prepare): otherwise, on a backend that already restarted, nothing
+@@ -1026,8 +1012,9 @@ def _invoke_agent(
+         "session.title", sid, {"session_id": _k, "title": t})
+     _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
+     # [daveey] Core-update pause: consulted by the agent loop at each step boundary of this turn only.
+-    from tui_gateway.update_pause import boundary_pause_hook, install_clarify_pause_provider, start_mid_tool_cancel
+-    pause_key = st.marker_key or _carried_pause_key(session)
++    from tui_gateway.update_pause import boundary_pause_hook, effective_pause_key, install_clarify_pause_provider, \
++        start_mid_tool_cancel
++    pause_key = effective_pause_key(session, st.marker_key)
+     agent.step_boundary_pause = boundary_pause_hook(session, pause_key) if pause_key else None
+     # [daveey] t_01a1d31bf400d56c: a continuation may yield before its first model request (it redoes nothing).
+     agent.update_pause_first_request = bool(st.marker_key) and display_kind == "auto_continue"
+@@ -1464,12 +1451,14 @@ def _run_admitted_prompt(
+             # Payload construction may yield to Stop. Decide and publish under the same lock
+             # that drops the pause, rather than carrying a pre-construction pause snapshot.
+             with update_pause.publication_lock(session):
+-                paused_for_update = update_pause.pause_stands(session, st.marker_key, st.result)
++                # [daveey] A carried turn's pause is announced too; its watcher is re-armed in the finally.
++                pause_key = update_pause.effective_pause_key(session, st.marker_key)
++                paused_for_update = update_pause.pause_stands(session, pause_key, st.result)
+                 if paused_for_update:
+                     update_pause.announce_pause(sid, payload)
+                 _record_stop_notice(session, status)
+                 _emit("message.complete", sid, payload)
+-                if paused_for_update:
++                if paused_for_update and st.marker_key:
+                     update_pause.start_in_place_watcher(sid, session, st.marker_key)
+             from tui_gateway.turn_outcome import turn_sid, concluding_turn_identity
+             concluding = concluding_turn_identity(st.agent, st.own_marker)
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index ceac6b0af6..3d396eeef7 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -266,7 +266,8 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+         attempt, text = marker["attempts"], marker["prompt"]
+     elif paused:
+         from tui_gateway.update_pause import pause_note
+-        attempt, text = marker["attempts"], pause_note(marker["prompt"], marker.get("killed_jobs"))
++        attempt, text = marker["attempts"], pause_note(marker["prompt"], marker.get("killed_jobs"),
++                                                 carried=bool(marker.get("carried_turn_paused")))
+     elif receipt:
+         attempt, text = marker["attempts"], jobs_stopped_note(marker.get("killed_jobs"))
+     else:
+diff --git a/tui_gateway/turn_marker.py b/tui_gateway/turn_marker.py
+index 21a93363ab..725e443509 100644
+--- a/tui_gateway/turn_marker.py
++++ b/tui_gateway/turn_marker.py
+@@ -283,17 +283,18 @@ def mark_turn_tool_started(home: Path | str, session_key: str) -> bool:
+ 
+ 
+ def mark_turn_paused(home: Path | str, session_key: str, reason: str,
+-                     *, killed_jobs: list | None = None, increment: bool = True) -> bool:
++                     *, killed_jobs: list | None = None, increment: bool = True, carried: bool = False) -> bool:
+     """[daveey] Stamp a live turn's marker as paused at a step boundary for a core update: ``reason``,
+     ``paused_at``, ``pauses`` + 1, and this process as its writer. ``auto_continue`` stays as recorded.
+     ``killed_jobs`` are the jobs this pause actually stopped; they ride the same write so a resume
+-    after restart can list them. True when a marker existed to stamp."""
++    after restart can list them. ``carried``: a synthesized turn running over this paused marker paid the
++    pause (``carried_turn_paused``, read by the continuation note). True when a marker existed to stamp."""
+     def mutate(entries):
+         entry = entries.get(session_key)
+         if not isinstance(entry, dict):
+             return None
+         entry.update(reason=str(reason), paused_at=time.time(), pauses=int(entry.get("pauses") or 0) + int(increment),
+-                     **_writer_identity())
++                     **_writer_identity(), **({"carried_turn_paused": True} if carried else {}))
+         if killed_jobs:
+             entry["killed_jobs"] = list(killed_jobs)
+         return entries
+@@ -381,6 +382,7 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
+                 **({"parked_at": float(entry["parked_at"])} if entry.get("parked_at") else {}),
+                 **({"paused_at": float(entry["paused_at"])} if entry.get("paused_at") else {}),
+                 **({"until_tool": True} if entry.get("until_tool") else {}),
++                **({"carried_turn_paused": True} if entry.get("carried_turn_paused") else {}),
+                 **({"notification_category": "diagnostic"}
+                    if entry.get("notification_category") == "diagnostic" else {}),
+                 **({"killed_jobs": killed} if killed else {})}
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index d5028e5dbb..b4d83af1c1 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -279,11 +279,13 @@ def boundary_pause_hook(session: dict, marker_key: str) -> Callable[[], str | No
+         killed = list(jobs.values())
+         # Write-ahead journal: even a crash during kill or a later disk failure leaves an
+         # explicit uncertain-outcome record. Never claim an unverified kill succeeded.
+-        if not mark_turn_paused(home, marker_key, PAUSE_REASON, killed_jobs=killed,
+-                                increment=marker.get("reason") != PAUSE_REASON):
++        carried = marker.get("reason") == PAUSE_REASON  # a synthesized turn over the paused marker pays it
++        if not mark_turn_paused(home, marker_key, PAUSE_REASON, killed_jobs=killed, increment=not carried,
++                                carried=carried):
+             return None
+         def save() -> bool:
+-            return mark_turn_paused(home, marker_key, PAUSE_REASON, killed_jobs=killed, increment=False)
++            return mark_turn_paused(home, marker_key, PAUSE_REASON, killed_jobs=killed, increment=False,
++                                    carried=carried)
+         try:
+             if not stop_owned_jobs_for_update_pause(killed, save):
+                 return None
+@@ -337,6 +339,26 @@ def user_stop_wins(session: dict) -> bool:
+     return True
+ 
+ 
++def effective_pause_key(session: dict, marker_key: str) -> str:
++    """[daveey] The key a turn pauses under: its own marker key, else the paused turn's marker key a synthesized
++    turn runs over (``prompt_turn._carry_paused_marker``), else "".
++
++    Such a turn writes no marker of its own, but it still holds an admission reservation, and hermes-sync's
++    drainer skips ``core_update_pause`` markers, so it never waits on it. Without a step-boundary hook it ran
++    straight through the next drain window, and an instant apply (which refuses a reservation no gateway
++    publishes) deferred until it ended: hermes-hub 2026-11-13, one notification turn ran 12 min and the core
++    update stayed deferred for over an hour (t_01a1d3083b2dae09). Keyed on this, it gets the hook, the mid-tool
++    cancel, the clarify withdrawal and the pause announcement like any turn. The pause it lands on is the one it
++    carries: ``mark_turn_paused`` does not count it again and stamps ``carried_turn_paused``, so the continuation
++    (the paused request, unchanged) also names the interrupted notification turn (``CARRIED_TURN_NOTE``), and
++    ``prompt_turn._rearm_carried_pause_watcher`` continues it after the window. A user Stop of that turn keeps the
++    pause (``user_stop_wins``: not that turn's own), so the paused request still continues."""
++    if marker_key:
++        return marker_key
++    with session["history_lock"]:
++        return str(session.get("_paused_marker_carried") or "")
++
++
+ def pause_stands(session: dict, marker_key: str, result: Any) -> bool:
+     """The turn's end: it ended paused for the update AND the session still keeps this turn's marker (a Stop
+     that won dropped it). A turn whose hook paused it but which did not end paused (the Stop won in the agent
+@@ -454,7 +476,13 @@ def install_clarify_pause_provider() -> None:
+         _clarify_provider_installed = True
+ 
+ 
+-def pause_note(prompt: str, killed_jobs: list | None = None) -> str:
++# [daveey] The continuation resumes the paused request only; a notification turn that ran over the pause and was
++# itself paused for a later window survives as transcript context, so the note points the model at it.
++CARRIED_TURN_NOTE = ("[A notification turn that ran after this pause was itself paused for the update before it "
++                     "finished; its partial work is above. Finish what it still needs too.]")
++
++
++def pause_note(prompt: str, killed_jobs: list | None = None, *, carried: bool = False) -> str:
+     from tui_gateway.session_history import _AUTO_CONTINUE_NOTE_PREFIX
+     note = (f"{_AUTO_CONTINUE_NOTE_PREFIX} — it was paused at a step boundary for a Hermes update. Every "
+             "tool result above is complete; continue with the next step and don't redo finished steps. "
+@@ -462,7 +490,8 @@ def pause_note(prompt: str, killed_jobs: list | None = None) -> str:
+             "may itself be one of those changes. "
+             f"The paused request was:]\n\n{prompt}")
+     report = killed_jobs_report(killed_jobs, "Background jobs stopped for this Hermes update:")
+-    return f"{note}\n\n{report}" if report else note
++    note = f"{note}\n\n{report}" if report else note
++    return f"{note}\n\n{CARRIED_TURN_NOTE}" if carried else note
+ 
+ 
+ def killed_jobs_report(killed_jobs: list | None, heading: str) -> str:
+-- 
+2.51.0
+

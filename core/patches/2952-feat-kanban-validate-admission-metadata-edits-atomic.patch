@@ -1,0 +1,276 @@
+From a7fb0a9b4f5c8bd55c9755e29d213a6e197a9bf3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:16:29 +0000
+Subject: [PATCH] feat(kanban): validate admission metadata edits atomically
+ [daveey]
+
+---
+ hermes_cli/kanban.py                          | 17 +++--
+ hermes_cli/kanban_admission_class.py          | 22 +++++-
+ hermes_cli/kanban_db.py                       | 13 +---
+ hermes_cli/kanban_db_edit.py                  |  6 +-
+ hermes_cli/kanban_db_values.py                | 14 ++++
+ hermes_cli/kanban_parser.py                   |  3 +
+ tests/hermes_cli/test_kanban_hub_admission.py | 72 +++++++++++++++++++
+ 7 files changed, 128 insertions(+), 19 deletions(-)
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 8bf6fae987..295cf48ce5 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1289,7 +1289,13 @@ _OPERATOR_EDIT_FLAGS = ("max_retries", "goal_mode", "goal_max_turns", "max_runti
+ 
+ 
+ def _cmd_edit(args: argparse.Namespace) -> int:
++    from hermes_cli.kanban_admission_class import AdmissionMetadataError
+     from hermes_cli.kanban_requires_edit import edit_preflight  # --requires / --completion-contract / --reason
++    admission = {name: getattr(args, name, None) for name in ("admission_class", "admission_frees")}
++    if any(value is not None for value in admission.values()):
++        for flag in ("completion_contract", "requires"):
++            if getattr(args, flag, None) is not None:
++                return _err(f"kanban edit: admission metadata cannot be combined with --{flag.replace('_', '-')}", 2)
+     if (rc := edit_preflight(args)) is not None:
+         return rc
+     reason = getattr(args, "reason", None)
+@@ -1309,9 +1315,12 @@ def _cmd_edit(args: argparse.Namespace) -> int:
+     if operator["goal_mode"] is not None:
+         operator["goal_mode"] = operator["goal_mode"] == "on"
+     has_operator = any(value is not None for value in operator.values())
++    has_admission = any(value is not None for value in admission.values())
++    if has_operator and has_admission:
++        return _err("kanban edit: admission metadata cannot be combined with operator fields", 2)
+     if result is None and (summary is not None or raw_metadata is not None):
+         return _err("kanban edit: --summary and --metadata require --result", 2)
+-    if all(value is None for value in (title, body, priority, priority_bump, result)) and not has_operator:
++    if all(value is None for value in (title, body, priority, priority_bump, result)) and not (has_operator or has_admission):
+         return _err(
+             "kanban edit: provide --title, --body, --priority, --result, --max-retries, --goal-mode, "
+             "--goal-max-turns, --max-runtime-seconds, --session-id, or --completion-contract", 2,
+@@ -1341,14 +1350,14 @@ def _cmd_edit(args: argparse.Namespace) -> int:
+                 return _err(f"kanban edit: {exc}")
+             if changed is None:
+                 return _err(f"cannot edit {args.task_id} (unknown id)")
+-        if any(value is not None for value in (title, body, priority, priority_bump, result)):
++        if has_admission or any(value is not None for value in (title, body, priority, priority_bump, result)):
+             try:
+                 ok = kb.edit_task(
+                     conn, args.task_id, title=title, body=body, priority=priority,
+-                    result=result, summary=summary, metadata=metadata,
++                    result=result, summary=summary, metadata=metadata, **admission,
+                     priority_reason=reason, require_lower_reason=True, priority_bump=priority_bump,
+                 )
+-            except (kb.PriorityLowerRefused, ReceiptEditRefused) as exc:
++            except (kb.PriorityLowerRefused, AdmissionMetadataError, ReceiptEditRefused) as exc:
+                 return _err(f"kanban edit: {exc}")
+             if not ok:
+                 return _err(f"cannot edit {args.task_id} (unknown id, or --result used on a task that is not done)")
+diff --git a/hermes_cli/kanban_admission_class.py b/hermes_cli/kanban_admission_class.py
+index 08c1c095f4..d9fc87682b 100644
+--- a/hermes_cli/kanban_admission_class.py
++++ b/hermes_cli/kanban_admission_class.py
+@@ -2,12 +2,30 @@
+ import re
+ 
+ 
++class AdmissionMetadataError(ValueError):
++    """Invalid class/frees pair, distinct from storage failures."""
++
++
++def edit_fields(conn, task_id: str, admission_class, admission_frees) -> dict:
++    """Validate the postimage from the caller's writer transaction."""
++    if admission_class is None and admission_frees is None:
++        return {}
++    current_class, current_frees = conn.execute(
++        "SELECT admission_class, admission_frees FROM tasks WHERE id=?", (task_id,),
++    ).fetchone()
++    validate(admission_class if admission_class is not None else current_class,
++             admission_frees if admission_frees is not None else current_frees)
++    return {field: value for field, value in (
++        ("admission_class", admission_class), ("admission_frees", admission_frees),
++    ) if value is not None}
++
++
+ def validate(admission_class: str, admission_frees: str | None) -> None:
+     """Reject unrecognized classes and capacity labels without a concrete claim."""
+     if admission_class not in ("normal", "capacity", "urgent"):
+-        raise ValueError("admission_class must be normal, capacity or urgent")
++        raise AdmissionMetadataError("admission_class must be normal, capacity or urgent")
+     if admission_class == "capacity" and (
+         not isinstance(admission_frees, str)
+         or re.fullmatch(r"frees: [^\r\n]*\S[^\r\n]*", admission_frees) is None
+     ):
+-        raise ValueError("capacity requires a one-line frees: claim")
++        raise AdmissionMetadataError("capacity requires a one-line frees: claim")
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index e00c3ebedf..3e589966db 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -49,18 +49,7 @@ _log = logging.getLogger(__name__)
+ 
+ # --- Shared micro-helpers (row access, JSON, env, git) ---
+ 
+-def _lossy_text(value: Any) -> Any:
+-    """``bytes`` -> ``str`` with U+FFFD for undecodable sequences; anything else passes through.
+-
+-    Installed as every board connection's ``text_factory`` (a TEXT cell holding
+-    invalid UTF-8 otherwise aborts the whole ``fetchall`` with "Could not decode
+-    to UTF-8") and applied to BLOB-typed cells in the ``from_row`` constructors
+-    (task, comment, event, run), so one
+-    corrupt row degrades to replacement characters instead of taking the board
+-    listing down."""
+-    if isinstance(value, bytes):
+-        return value.decode("utf-8", errors="replace")
+-    return value
++from hermes_cli.kanban_db_values import _lossy_text
+ 
+ 
+ def _row_get(row: Any, col: str, default: Any = None) -> Any:
+diff --git a/hermes_cli/kanban_db_edit.py b/hermes_cli/kanban_db_edit.py
+index e2ccf9c87f..f2f4dd3683 100644
+--- a/hermes_cli/kanban_db_edit.py
++++ b/hermes_cli/kanban_db_edit.py
+@@ -27,6 +27,7 @@ def edit_task(
+     metadata: Optional[dict] = None, board: Optional[str] = None,
+     priority_reason: Optional[str] = None, require_lower_reason: bool = False,
+     priority_bump: Optional[int] = None,
++    admission_class: Optional[str] = None, admission_frees: Optional[str] = None,
+ ) -> bool:
+     """Edit task fields, optionally backfilling a completed task's result.
+ 
+@@ -60,7 +61,10 @@ def edit_task(
+                 raise PriorityLowerRefused(task_id, current, priority)
+         assignments = []
+         params = []
+-        for field, value in (("title", title), ("body", body), ("priority", priority)):
++        from hermes_cli.kanban_admission_class import edit_fields
++        admission = edit_fields(conn, task_id, admission_class, admission_frees)
++        changed_fields.extend(admission)
++        for field, value in (("title", title), ("body", body), ("priority", priority), *admission.items()):
+             if value is not None:
+                 assignments.append(f"{field} = ?")
+                 params.append(value)
+diff --git a/hermes_cli/kanban_db_values.py b/hermes_cli/kanban_db_values.py
+index 49094052a1..0b54487c29 100644
+--- a/hermes_cli/kanban_db_values.py
++++ b/hermes_cli/kanban_db_values.py
+@@ -5,6 +5,20 @@ import json
+ from typing import Any, Optional
+ 
+ 
++def _lossy_text(value: Any) -> Any:
++    """``bytes`` -> ``str`` with U+FFFD for undecodable sequences; anything else passes through.
++
++    Installed as every board connection's ``text_factory`` (a TEXT cell holding
++    invalid UTF-8 otherwise aborts the whole ``fetchall`` with "Could not decode
++    to UTF-8") and applied to BLOB-typed cells in the ``from_row`` constructors
++    (task, comment, event, run), so one
++    corrupt row degrades to replacement characters instead of taking the board
++    listing down."""
++    if isinstance(value, bytes):
++        return value.decode("utf-8", errors="replace")
++    return value
++
++
+ def _first_line(text: Optional[str], limit: int) -> str:
+     """First non-blank-stripped line of ``text`` capped at ``limit`` chars; "" when empty."""
+     lines = (text or "").strip().splitlines()
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 9efd0c06a7..42433fdc84 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -481,6 +481,9 @@ _SPECS = [
+                   "Idle open cards only; workspace/skill needs remain. Cannot combine with other edit flags."),
+         _arg("--title", help="Replace the task title"),
+         _arg("--body", help="Replace the task body"),
++        _arg("--class", dest="admission_class", choices=["normal", "capacity", "urgent"],
++             help="Admission class (capacity requires --frees)"),
++        _arg("--frees", dest="admission_frees", help="Single-line frees: claim"),
+         _arg("--priority", type=int, help="Replace priority (cap 1000; lowering requires --reason)"),
+         _arg("--priority-bump", type=int, help="Atomically raise priority by this positive amount (cap 1000)"),
+         _arg("--result", help="Backfilled task result text for a done task"),
+diff --git a/tests/hermes_cli/test_kanban_hub_admission.py b/tests/hermes_cli/test_kanban_hub_admission.py
+index 5943ebacba..599de83ca1 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission.py
++++ b/tests/hermes_cli/test_kanban_hub_admission.py
+@@ -95,6 +95,78 @@ def test_invalid_admission_metadata_refuses_before_insertion(board, admission_cl
+     assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == before
+ 
+ 
++def test_admission_edit_validates_resulting_pair_atomically(board):
++    conn, _home = board
++    task_id = kb.create_task(conn, title="Disk headroom")
++    assert kb.edit_task(conn, task_id, admission_class="capacity",
++                        admission_frees="frees: worker disk slots")
++    assert kb.get_task(conn, task_id).admission_class == "capacity"
++    before = conn.execute("SELECT count(*) FROM task_events").fetchone()[0]
++    with pytest.raises(ValueError, match="^capacity requires a one-line frees: claim$"):
++        kb.edit_task(conn, task_id, title="Must roll back", admission_frees="")
++    stored = kb.get_task(conn, task_id)
++    assert stored.title == "Disk headroom"
++    assert stored.admission_frees == "frees: worker disk slots"
++    assert conn.execute("SELECT count(*) FROM task_events").fetchone()[0] == before
++    assert kb.edit_task(conn, task_id, admission_class="normal", admission_frees="")
++    assert kb.get_task(conn, task_id).admission_class == "normal"
++    assert kb.get_task(conn, task_id).admission_frees == ""
++
++
++def test_cli_edit_admission_metadata(board, monkeypatch):
++    import argparse
++    from hermes_cli import kanban as cli
++
++    conn, home = board
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
++    task_id = kb.create_task(conn, title="Disk headroom")
++    parser = argparse.ArgumentParser()
++    cli.build_parser(parser.add_subparsers())
++    args = parser.parse_args(["kanban", "edit", task_id, "--class", "capacity",
++                              "--frees", "frees: worker disk slots"])
++    assert cli._cmd_edit(args) == 0
++    assert kb.get_task(conn, task_id).admission_class == "capacity"
++    args = parser.parse_args(["kanban", "edit", task_id, "--frees", ""])
++    assert cli._cmd_edit(args) != 0
++    assert kb.get_task(conn, task_id).admission_frees == "frees: worker disk slots"
++
++
++@pytest.mark.parametrize("options,reason", [
++    (["--max-retries", "4"], "operator fields"),
++    (["--completion-contract", "local-only", "--reason", "test"], "--completion-contract"),
++])
++def test_cli_admission_refuses_separate_transaction_edits(board, monkeypatch, capsys, options, reason):
++    import argparse
++    from hermes_cli import kanban as cli
++
++    conn, home = board
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
++    task_id = kb.create_task(conn, title="Unchanged")
++    before = tuple(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
++    parser = argparse.ArgumentParser()
++    cli.build_parser(parser.add_subparsers())
++    args = parser.parse_args(["kanban", "edit", task_id, "--class", "urgent", *options])
++    assert cli._cmd_edit(args) == 2
++    assert f"admission metadata cannot be combined with {reason}" in capsys.readouterr().err
++    assert tuple(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()) == before
++
++
++@pytest.mark.parametrize("changes,reason", [
++    ({"admission_class": "capacity"}, "capacity requires a one-line frees: claim"),
++    ({"admission_class": "unknown"}, "admission_class must be normal, capacity or urgent"),
++    ({"admission_class": []}, "admission_class must be normal, capacity or urgent"),
++])
++def test_invalid_admission_edit_preserves_task_and_events(board, changes, reason):
++    conn, _home = board
++    task_id = kb.create_task(conn, title="Unchanged")
++    before = tuple(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
++    event_count = conn.execute("SELECT count(*) FROM task_events").fetchone()[0]
++    with pytest.raises(ValueError, match=f"^{reason}$"):
++        kb.edit_task(conn, task_id, title="Invalid edit", **changes)
++    assert tuple(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()) == before
++    assert conn.execute("SELECT count(*) FROM task_events").fetchone()[0] == event_count
++
++
+ def runs(conn):
+     return conn.execute("SELECT count(*) FROM task_runs").fetchone()[0]
+ 
+-- 
+2.51.0
+

@@ -1,0 +1,376 @@
+From db76c240838e0e04fbbb9bdf6f28bcdff64b0c8c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:35:38 +0000
+Subject: [PATCH] fix(delegation): a background subagent stopped by gateway
+ shutdown wakes its parent [daveey]
+
+A core update restarted the gateway while a background subagent waited on CI. The shutdown sweep
+stopped it with the same cooperative stop /stop uses, so its result read 'interrupted' like a
+requested stop: the unviewed local parent got a silent note, ran no turn, and the user heard
+nothing until he asked (self-heal defect agent-b24ce546ae).
+
+- async_delegation.interrupt_all(reason, by_shutdown=True) stamps each running unit; the
+  completion event carries interrupted_by=<reason> (persisted, so the post-restart replay has it).
+  /stop, CLI exit and interrupt_for_session (chat closed, /new) stay unstamped.
+- gateway/run_shutdown passes by_shutdown=True.
+- delegation_wakes_parent counts an interrupted/cancelled child as failed when interrupted_by is
+  set (as it already does for the stall monitor's stop); the result text says it was stopped by
+  the shutdown, not the user: re-dispatch or tell the user.
+- Detection: WARNING 'parent <sid> not woken: ...' when a local result with unfinished children
+  will not wake its parent, and when a waking result is kept as a note (chat closed / wake limit).
+
+Tests: tests/tools/test_delegate_shutdown_stop_wakes_parent.py (new), shutdown-sweep case in
+tests/gateway/test_shutdown_kill_restart_source.py, replayed shutdown result runs as a turn in
+tests/gateway/test_unviewed_delegation_failure_turn.py. 7 fail on the base, all pass after.
+---
+ gateway/run_notifications.py                  |  7 +-
+ gateway/run_shutdown.py                       |  2 +-
+ gateway/session_completion_notes.py           |  7 +-
+ .../test_shutdown_kill_restart_source.py      | 15 ++++
+ .../test_unviewed_delegation_failure_turn.py  | 37 ++++++++-
+ ...est_delegate_shutdown_stop_wakes_parent.py | 83 +++++++++++++++++++
+ tools/async_delegation.py                     | 12 ++-
+ tools/process_registry_notifications.py       | 45 ++++++++--
+ 8 files changed, 192 insertions(+), 16 deletions(-)
+ create mode 100644 tests/tools/test_delegate_shutdown_stop_wakes_parent.py
+
+diff --git a/gateway/run_notifications.py b/gateway/run_notifications.py
+index ff2180c29f..aec1476f58 100644
+--- a/gateway/run_notifications.py
++++ b/gateway/run_notifications.py
+@@ -178,9 +178,14 @@ def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
+         # A local completion persists as the async-result card the in-process TUI wrote, and a tick
+         # carries its CLI receipt; messaging rows stay internal_notification, as on main.
+         metadata.update(_local_completion_card(evt))
+-        from tools.process_registry_notifications import delegation_wakes_parent
++        from tools.process_registry_notifications import delegation_unfinished_statuses, delegation_wakes_parent
+         if delegation_wakes_parent(evt):
+             metadata["completion_wakes_parent"] = True
++        elif evt.get("role") != "cron_run" and (unfinished := delegation_unfinished_statuses(evt)):
++            # A stop someone asked for: with no viewer attached it becomes a note and nothing runs. Say so,
++            # so a parent left asleep on unfinished work is visible in the log, not only to the user.
++            logger.warning("Async delegation %s: parent %s not woken: %s (a requested stop; a note if unviewed)",
++                           evt.get("delegation_id"), parent_session_id or session_key or "?", ",".join(unfinished))
+     proven_session_id = str(evt.get("proven_session_id") or "").strip()
+     if proven_session_id:
+         metadata["gateway_proven_session_id"] = proven_session_id
+diff --git a/gateway/run_shutdown.py b/gateway/run_shutdown.py
+index d952331bac..2506cbe1bd 100644
+--- a/gateway/run_shutdown.py
++++ b/gateway/run_shutdown.py
+@@ -1745,7 +1745,7 @@ class GatewayShutdownMixin(GatewayRestartWaitMixin, GatewaySessionEndMixin, Gate
+             from tools.async_delegation import interrupt_all as _interrupt_async
+             _count_step(
+                 "Shutdown (%s): interrupted %d background delegation(s)",
+-                lambda: _interrupt_async(reason=f"gateway shutdown ({phase})"),
++                lambda: _interrupt_async(reason=f"gateway shutdown ({phase})", by_shutdown=True),
+             )
+ 
+         _step("process_registry.kill_all", _kill_processes)
+diff --git a/gateway/session_completion_notes.py b/gateway/session_completion_notes.py
+index b671a0bfa6..615ccb8cd0 100644
+--- a/gateway/session_completion_notes.py
++++ b/gateway/session_completion_notes.py
+@@ -56,7 +56,12 @@ def _wakes_unviewed_parent(authority, session_id, live, descriptor):
+     if not descriptor.get('wakes_parent'):
+         return False
+     from tools.async_delegation import refused_for_session
+-    if refused_for_session((authority.profile_id, session_id)) or live.unattended_wakes >= UNATTENDED_WAKE_LIMIT:
++    closed = refused_for_session((authority.profile_id, session_id))
++    if closed or live.unattended_wakes >= UNATTENDED_WAKE_LIMIT:
++        import logging
++        logging.getLogger(__name__).warning(
++            'parent %s not woken: failed delegation result kept as a note (%s)', session_id,
++            'its chat was closed' if closed else f'{UNATTENDED_WAKE_LIMIT} unattended wakes in a row')
+         return False
+     live.unattended_wakes += 1
+     return True
+diff --git a/tests/gateway/test_shutdown_kill_restart_source.py b/tests/gateway/test_shutdown_kill_restart_source.py
+index 3f3f0d1897..5171a5d986 100644
+--- a/tests/gateway/test_shutdown_kill_restart_source.py
++++ b/tests/gateway/test_shutdown_kill_restart_source.py
+@@ -57,6 +57,21 @@ async def test_off_loop_sweep_forwards_restarting(monkeypatch, restarting, sourc
+     assert sources == [source]
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize("restarting", [True, False])
++async def test_shutdown_sweep_marks_delegation_stops_as_shutdown(monkeypatch, restarting):
++    """The background subagents the sweep stops carry the shutdown as their stop reason, so their unviewed
++    parents wake instead of filing a requested-stop note (``tools/async_delegation.interrupt_all``)."""
++    calls: list = []
++    _runner(monkeypatch, [], restarting=restarting)
++    monkeypatch.setattr("tools.async_delegation.interrupt_all", lambda *a, **k: calls.append(k) or 0)
++
++    await GatewayShutdownMixin._stop_kill_tool_subprocesses_off_loop("final-cleanup", restarting=restarting)
++
++    assert len(calls) == 1 and calls[0].get("by_shutdown") is True, calls
++    assert calls[0]["reason"].startswith("gateway shutdown"), calls
++
++
+ def test_restart_source_is_a_lifecycle_sweep():
+     from tools.process_registry import ProcessRegistry
+ 
+diff --git a/tests/gateway/test_unviewed_delegation_failure_turn.py b/tests/gateway/test_unviewed_delegation_failure_turn.py
+index a816d36b23..4f55f20989 100644
+--- a/tests/gateway/test_unviewed_delegation_failure_turn.py
++++ b/tests/gateway/test_unviewed_delegation_failure_turn.py
+@@ -168,6 +168,37 @@ async def test_unit_the_stall_monitor_stopped_wakes_the_parent(tmp_path, monkeyp
+         authority.db.close()
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize("stop,turn", [({"interrupted_by": "gateway shutdown (restart)"}, True), ({}, False)],
++                         ids=["gateway-shutdown", "user-stop"])
++async def test_unit_a_gateway_shutdown_stopped_wakes_the_parent(tmp_path, monkeypatch, caplog, stop, turn):
++    """A core update restarted the gateway mid-delegation: its child reports ``interrupted`` as a user stop
++    does, and the parent slept on a note until the user asked. The persisted (replayed after the restart)
++    result carries the shutdown as its stop reason, which makes it a failure the parent must act on. A
++    parent left asleep on unfinished work is logged."""
++    import json
++    import logging
++    caplog.set_level(logging.WARNING)
++    runner, authority, ref, _actor = await _local(tmp_path, monkeypatch)
++    try:
++        route, target = authority.sessions[ref.session_id].route, _target(runner, authority, ref)
++        evt = json.loads(json.dumps(dict(_batch(route, "deleg_restart", "interrupted"), parent_session_id=target,
++                                         **stop)))
++        assert await runner._deliver_async_delegation_group([evt]) is True
++        seen = _turns(runner, authority, target, "deleg_restart")
++        await authority._drain(ref)
++        assert len(seen) == int(turn)
++        assert len(_notes(authority, target, "deleg_restart")) == int(not turn)
++        if turn:
++            assert "stopped by gateway shutdown (restart), not by you or the user" in seen[0][0]
++        not_woken = [r.getMessage() for r in caplog.records if "not woken" in r.getMessage()]
++        assert bool(not_woken) is (not turn), not_woken
++        if not turn:
++            assert "deleg_restart" in not_woken[0] and "interrupted" in not_woken[0]
++    finally:
++        authority.db.close()
++
++
+ @pytest.mark.asyncio
+ async def test_failed_manual_cron_run_stays_a_note(tmp_path, monkeypatch):
+     """``cronjob(action='run')`` reports through the same event with ``role=cron_run``. Its outcome is
+@@ -205,10 +236,12 @@ async def _fail(runner, authority, ref, route, target, name):
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_unattended_wakes_stop_at_the_limit_until_the_user_returns(tmp_path, monkeypatch):
++async def test_unattended_wakes_stop_at_the_limit_until_the_user_returns(tmp_path, monkeypatch, caplog):
+     """A woken parent that re-dispatches into the same failure (billing, a usage limit) would wake
+     itself without end. After ``UNATTENDED_WAKE_LIMIT`` wakes in a row nobody watched, the next failure
+     is a note; the user's own message starts the count again."""
++    import logging
++    caplog.set_level(logging.WARNING)
+     from gateway.session_completion_notes import UNATTENDED_WAKE_LIMIT
+     runner, authority, ref, _actor = await _local(tmp_path, monkeypatch)
+     try:
+@@ -220,6 +253,8 @@ async def test_unattended_wakes_stop_at_the_limit_until_the_user_returns(tmp_pat
+         assert len(woken) == UNATTENDED_WAKE_LIMIT, "the loop is bounded"
+         assert all(f"deleg_loop{i}" in woken[i] for i in range(UNATTENDED_WAKE_LIMIT))
+         assert len(_notes(authority, target, "deleg_loop")) == 2, "later failures are kept as notes"
++        assert sum("not woken" in r.getMessage() and "unattended wakes" in r.getMessage()
++                   for r in caplog.records) == 2, "each parent left asleep is logged"
+         _human(authority, ref, "back", "what happened?")
+         await authority._drain(ref)
+         await _fail(runner, authority, ref, route, target, "deleg_loop_after")
+diff --git a/tests/tools/test_delegate_shutdown_stop_wakes_parent.py b/tests/tools/test_delegate_shutdown_stop_wakes_parent.py
+new file mode 100644
+index 0000000000..88dbd3c575
+--- /dev/null
++++ b/tests/tools/test_delegate_shutdown_stop_wakes_parent.py
+@@ -0,0 +1,83 @@
++"""A background subagent stopped by a gateway shutdown wakes its parent; a stop someone asked for does not.
++
++A core update restarted the gateway while a background subagent waited on CI. Shutdown stopped it with
++the same cooperative stop ``/stop`` uses, so its result read ``interrupted`` like a requested stop: the
++unviewed parent got a silent note, never ran a turn, and the user heard nothing for 35 minutes until he
++asked. ``interrupt_all(..., by_shutdown=True)`` now stamps why the unit stopped onto its result, and a
++stamped stop counts as a failure the parent must act on (re-dispatch or tell the user).
++"""
++import threading
++
++from tests.tools.test_async_delegation import _drain_for
++from tools import async_delegation as ad
++from tools.process_registry_notifications import delegation_wakes_parent, format_process_notification
++
++
++def _dispatch_batch(interrupted: threading.Event, **kwargs):
++    """A unit whose runner blocks until stopped, then returns its child as interrupted."""
++    def runner():
++        interrupted.wait(timeout=10)
++        return {"results": [{"task_index": 0, "status": "interrupted", "summary": "partial"}]}
++    res = ad.dispatch_async_delegation_batch(
++        goals=["wait on CI"], context=None, toolsets=None, role="leaf", model="m", session_key="", runner=runner,
++        interrupt_fn=interrupted.set, max_async_children=1, **kwargs)
++    assert res["status"] == "dispatched", res
++    return res["delegation_id"]
++
++
++def _dispatch_single(interrupted: threading.Event, **kwargs):
++    def runner():
++        interrupted.wait(timeout=10)
++        return {"status": "interrupted", "summary": "partial", "error": None, "exit_reason": "interrupted"}
++    res = ad.dispatch_async_delegation(
++        goal="wait on CI", context=None, toolsets=None, role="leaf", model="m", session_key="", runner=runner,
++        interrupt_fn=interrupted.set, max_async_children=1, **kwargs)
++    assert res["status"] == "dispatched", res
++    return res["delegation_id"]
++
++
++def setup_function(_fn):
++    ad._reset_for_tests()
++
++
++def teardown_function(_fn):
++    ad._reset_for_tests()
++
++
++def test_shutdown_stop_of_a_batch_is_stamped_and_wakes_the_parent():
++    delegation_id = _dispatch_batch(threading.Event())
++    assert ad.interrupt_all(reason="gateway shutdown (restart)", by_shutdown=True) == 1
++    evt = _drain_for(delegation_id, timeout=5.0)
++    assert evt is not None and [r["status"] for r in evt["results"]] == ["interrupted"]
++    assert evt.get("interrupted_by") == "gateway shutdown (restart)", evt
++    assert delegation_wakes_parent(evt)
++    text = format_process_notification(evt) or ""
++    assert "stopped by gateway shutdown (restart), not by you or the user" in text, text
++
++
++def test_shutdown_stop_of_a_single_unit_is_stamped_and_wakes_the_parent():
++    delegation_id = _dispatch_single(threading.Event())
++    assert ad.interrupt_all(reason="gateway shutdown (restart)", by_shutdown=True) == 1
++    evt = _drain_for(delegation_id, timeout=5.0)
++    assert evt is not None and evt["status"] == "interrupted", evt
++    assert evt.get("interrupted_by") == "gateway shutdown (restart)", evt
++    assert delegation_wakes_parent(evt)
++    assert "not by you or the user" in (format_process_notification(evt) or "")
++
++
++def test_requested_stop_stays_asleep():
++    """``/stop`` (and any caller that does not say shutdown) is a stop someone asked for."""
++    delegation_id = _dispatch_batch(threading.Event())
++    assert ad.interrupt_all(reason="/stop") == 1
++    evt = _drain_for(delegation_id, timeout=5.0)
++    assert evt is not None and "interrupted_by" not in evt, evt
++    assert not delegation_wakes_parent(evt)
++
++
++def test_session_end_stop_stays_asleep():
++    """The chat closed (exit, /new): that ended the session's work, so nothing is stamped."""
++    delegation_id = _dispatch_batch(threading.Event(), parent_session_id="parent-1")
++    assert ad.interrupt_for_session(parent_session_id="parent-1") == 1
++    evt = _drain_for(delegation_id, timeout=5.0)
++    assert evt is not None and "interrupted_by" not in evt, evt
++    assert not delegation_wakes_parent(evt)
+diff --git a/tools/async_delegation.py b/tools/async_delegation.py
+index e3c942812c..c453ce41fb 100644
+--- a/tools/async_delegation.py
++++ b/tools/async_delegation.py
+@@ -1341,7 +1341,8 @@ def _push_completion_event(record: dict[str, Any], result: dict[str, Any], statu
+         "status": status, **payload, "dispatched_at": dispatched_at, "completed_at": completed_at,
+         **({} if is_batch else {"exit_reason": result.get("exit_reason")}),
+         **{k: record[k] for k in _ROUTING_KEYS if record.get(k)},
+-        **{k: result[k] for k in _STALL_META_KEYS if k in result}}
++        **{k: result[k] for k in _STALL_META_KEYS if k in result},
++        **({"interrupted_by": record["_interrupted_by"]} if record.get("_interrupted_by") else {})}
+     try:
+         _persist_completion(evt, result)
+     except Exception as exc:
+@@ -1587,12 +1588,17 @@ def _interrupt_records(targets: list[dict[str, Any]], caller: str, reason: str,
+     return count
+ 
+ 
+-def interrupt_all(reason: str = "shutdown") -> int:
++def interrupt_all(reason: str = "shutdown", *, by_shutdown: bool = False) -> int:
+     """Signal every running async delegation to stop (``/stop``, shutdown). Returns how
+     many. The child still emits a completion event (status='interrupted') via the
+-    normal finalize path."""
++    normal finalize path. ``by_shutdown`` (the gateway's shutdown sweep) stamps *reason* on each
++    unit's result as ``interrupted_by``: nobody asked for that stop, so its parent wakes to
++    re-dispatch or report (``delegation_wakes_parent``) instead of sleeping on a note."""
+     with _records_lock:
+         targets = [r for r in _records.values() if r.get("status") in _ACTIVE_STATES]
++        if by_shutdown:
++            for r in targets:
++                r["_interrupted_by"] = reason
+     return _interrupt_records(targets, "interrupt_all", reason, "Interrupted %d async delegation(s) (%s)")
+ 
+ 
+diff --git a/tools/process_registry_notifications.py b/tools/process_registry_notifications.py
+index ec849ff628..c337cba822 100644
+--- a/tools/process_registry_notifications.py
++++ b/tools/process_registry_notifications.py
+@@ -172,17 +172,42 @@ def delegation_wakes_parent(evt: dict) -> bool:
+         return True
+     if evt.get("role") == "cron_run":
+         return False  # a manual cron run's outcome is finished text, like a scheduled one's: a note
++    stopped = () if _unrequested_stop(evt) else _STOPPED
++    return any(s not in stopped for s in delegation_unfinished_statuses(evt))
++
++
++def _unit_results(evt: dict) -> list[dict]:
++    """No child results (a single child's event, or a crashed batch's ``results=[]``): the unit's own
++    status decides. Otherwise the children do, so an interrupted-only batch's aggregate error stays asleep."""
+     raw = evt.get("results")
+-    # No child results (a single child's event, or a crashed batch's ``results=[]``): the unit's own
+-    # status decides. Otherwise the children do, so an interrupted-only batch's aggregate error stays asleep.
+     results = [r for r in raw if isinstance(r, dict)] if isinstance(raw, list) else []
+-    results = results or [evt]
+-    # The stall monitor stops a stuck unit with the same cooperative stop a user's does; its stall
+-    # context on the event is what tells the two apart (``async_delegation._finalize``).
+-    stopped = () if evt.get("stalled_after_quiet_seconds") is not None else _STOPPED
+-    return any(
+-        (r.get("status") or ("failed" if r.get("error") else "completed")) not in (*_DONE, *stopped)
+-        for r in results)
++    return results or [evt]
++
++
++def _child_status(r: dict) -> str:
++    return r.get("status") or ("failed" if r.get("error") else "completed")
++
++
++def _unrequested_stop(evt: dict) -> bool:
++    """The stall monitor and the gateway's shutdown sweep stop a unit with the same cooperative stop a
++    user's does; the stall context or ``interrupted_by`` on the event tells them apart
++    (``async_delegation._finalize`` / ``async_delegation.interrupt_all``)."""
++    return evt.get("stalled_after_quiet_seconds") is not None or bool(evt.get("interrupted_by"))
++
++
++def delegation_unfinished_statuses(evt: dict) -> list[str]:
++    """Statuses of an async delegation result's units that did not finish (done ones left out)."""
++    if evt.get("type") != "async_delegation" or evt.get("task_failure_notice"):
++        return []
++    return [s for s in map(_child_status, _unit_results(evt)) if s not in _DONE]
++
++
++def _shutdown_stop_lines(evt: dict, results) -> list[str]:
++    """What the parent should do about work the gateway's shutdown stopped (``interrupt_all``)."""
++    if not evt.get("interrupted_by") or not any(_child_status(r) in _STOPPED for r in results):
++        return []
++    return [f"This work was stopped by {evt['interrupted_by']}, not by you or the user: re-dispatch the "
++            "unfinished part, or tell the user it stopped."]
+ 
+ 
+ _CONTENT_POLICY_RECOVERY = (
+@@ -283,6 +308,7 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
+     if evt.get("stalled_after_quiet_seconds") is not None and any(r.get("status") in _STOPPED for r in results):
+         lines.append(f"The stall monitor stopped this unit after {evt['stalled_after_quiet_seconds']:g}s without "
+                      "progress: an interrupted task below was stuck, not stopped by you or the user.")
++    lines += _shutdown_stop_lines(evt, results)
+     if evt.get("error") and not results:
+         lines += ["--- ERROR ---", f"The batch did not complete successfully: {evt['error']}"]
+         return "\n".join(lines)
+@@ -367,6 +393,7 @@ def _format_async_delegation(evt: dict) -> str:
+     else:
+         if status == "interrupted":
+             lines.append("The subagent was interrupted before completing" + (f": {error}" if error else "."))
++            lines += _shutdown_stop_lines(evt, [evt])
+         else:  # error / timeout / failed / unknown (owner died)
+             lines.append(
+                 f"The subagent did not complete successfully (status={status})." + (f"\n{error}" if error else ""))
+-- 
+2.51.0
+

@@ -1,0 +1,142 @@
+From fbffe03bc3554ed746558ab72fdba26238a3f379 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:13:27 +0000
+Subject: [PATCH] [daveey] kanban: an owner's pre-session
+ capsule_observation_missing refusal books a preadmission proof
+
+worker-3 2026-11-13 07:21-08:25Z: the owner refused kanban.run for t_01a1d1197fa00599 with
+capsule_observation_missing (session_kanban.run_task raises it before creating any session) six
+times; the submitter booked each as a plain exit 1 with no proof, so the runs were counted crashes
+(triage) and hermes-core-wt-land could not tell them from an agent turn (review independence refused).
+
+The refusal is the owner's own transport state, like storage_unavailable: the worker client now asks
+again before admission and, when the owner keeps refusing, exits owner-unavailable (69) with
+kanban_host_refusal.preadmission_proof {kind: owner_capsule_unavailable, phase: preadmission,
+reason: capsule_observation_missing} on its receipt. The sweep requeues it uncounted (bounded by
+NEUTRAL_STREAK_LIMIT), files the host notice, and the land gate's preadmission exemption accepts it.
+An admitted claim (or a continuing one) still treats the refusal as final.
+---
+ hermes_cli/kanban_host_refusal.py            | 19 ++++++++---
+ hermes_cli/kanban_worker_client.py           |  6 ++--
+ tests/hermes_cli/test_kanban_host_refusal.py | 36 ++++++++++++++++++++
+ 3 files changed, 54 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_host_refusal.py b/hermes_cli/kanban_host_refusal.py
+index 4e5129d0a7..542b86202e 100644
+--- a/hermes_cli/kanban_host_refusal.py
++++ b/hermes_cli/kanban_host_refusal.py
+@@ -24,7 +24,8 @@ dead-worker sweep, never a blanket pass for routing errors and never text matchi
+   submitter, not a later run). ``kanban_owner_unavailable.note`` then requeues it uncounted despite
+   the admission, still bounded by ``NEUTRAL_STREAK_LIMIT``.
+ - ``preadmission_proof`` (submitter side, ``kanban_worker_client``) marks a run whose owner kept
+-  refusing it with ``storage_unavailable`` before any admission. Such a run is requeued uncounted
++  refusing it with ``storage_unavailable`` or ``capsule_observation_missing`` (both raised before the
++  owner creates a session) before any admission. Such a run is requeued uncounted
+   without it; the proof (the run's sole result, from its own submitter pid, nothing bound) only names
+   the host fault for the notice, so a restart drain (an owner that is silent) files none.
+ - ``notify`` surfaces either host fault as ONE Kanban card per host on the board (agent-fixable, so
+@@ -46,9 +47,12 @@ PROOF_KEY = "host_refusal"
+ REGISTRY_EMPTY = "managed_registry_empty"
+ REGISTRY_INVALID = "managed_registry_invalid"
+ OWNER_STORAGE_UNAVAILABLE = "owner_storage_unavailable"
++OWNER_CAPSULE_UNAVAILABLE = "owner_capsule_unavailable"
+ STARTUP_KINDS = frozenset({REGISTRY_EMPTY, REGISTRY_INVALID})
+-# ``kanban.run`` refusal reasons that name the owner host's own state (``kanban_worker_client``).
+-PREADMISSION_KINDS = {"storage_unavailable": OWNER_STORAGE_UNAVAILABLE}
++# ``kanban.run`` refusal reasons that name the owner host's own state (``kanban_worker_client``), each raised
++# before the owner creates a session for the claim.
++PREADMISSION_KINDS = {"storage_unavailable": OWNER_STORAGE_UNAVAILABLE,
++                      "capsule_observation_missing": OWNER_CAPSULE_UNAVAILABLE}
+ NOTICE_WINDOW_SECONDS = 15 * 60
+ NOTICE_KEY_PREFIX = "host-refusal:"
+ NOTICE_EVENT = "host_refusal_notice"
+@@ -149,6 +153,10 @@ def _cause(proof: dict, task_id: Optional[str] = None) -> str:
+         claim = f"card {task_id}'s claim" if task_id else "the claim"
+         return (f"the profile owner kept refusing {claim} with {proof.get('reason') or 'storage_unavailable'} "
+                 "(its runtime store or session policy could not be read)")
++    if kind == OWNER_CAPSULE_UNAVAILABLE:
++        claim = f"card {task_id}'s claim" if task_id else "the claim"
++        return (f"the profile owner kept refusing {claim} with capsule_observation_missing (no live run-bound "
++                "capsule transport, or a profile policy it could not read made it require one)")
+     pin = "/".join(p for p in (proof.get("provider"), proof.get("model")) if p) or "its pin"
+     return f"the host's model-routing registry served no subscription pin when {whose} worker started ({pin})"
+ 
+@@ -195,8 +203,9 @@ def _notify(conn, task_id, proof):
+                     kb._append_event(conn, existing, NOTICE_EVENT, marker)
+                 return existing
+             body = (f"{line}\n\nA host fault refuses Kanban workers on this host before or during a turn: an empty, "
+-                    "unreadable or invalid `model_routing` registry when a worker starts, or a profile owner whose "
+-                    "runtime store or session policy cannot be read (`storage_unavailable`). The refused cards are "
++                    "unreadable or invalid `model_routing` registry when a worker starts, a profile owner whose "
++                    "runtime store or session policy cannot be read (`storage_unavailable`), or one that refuses "
++                    "the claim without capsule transport (`capsule_observation_missing`). The refused cards are "
+                     "requeued uncounted (up to the owner-unavailable streak limit, then they count), and this card "
+                     "is commented at most once per 15 minutes while it lasts.\n\n"
+                     "Fix: inspect the profile owner's storage health and config.yaml (the `model_routing` "
+diff --git a/hermes_cli/kanban_worker_client.py b/hermes_cli/kanban_worker_client.py
+index 362f681a2e..c02d9da1a8 100644
+--- a/hermes_cli/kanban_worker_client.py
++++ b/hermes_cli/kanban_worker_client.py
+@@ -63,8 +63,10 @@ ADMISSION_ANSWER_MARGIN_S = 60.0
+ # cards to triage. Before an admission the worker asks again (``kanban.run`` is idempotent per
+ # attempt), and an owner that keeps refusing for ``OWNER_WAIT_S`` ends the run owner-unavailable (69:
+ # requeued uncounted, bounded by ``NEUTRAL_STREAK_LIMIT``). Once admitted a turn may be running, so the
+-# refusal stays final there.
+-_HOST_REFUSAL_REASONS = frozenset({'storage_unavailable'})
++# refusal stays final there. ``capsule_observation_missing`` is the owner's transport state too: it refuses
++# before creating any session (``session_kanban.run_task``). worker-3 2026-11-13 booked six of them for
++# t_01a1d1197fa00599 as unproven crashes (an unreadable default policy made its owner require a capsule).
++_HOST_REFUSAL_REASONS = frozenset({'storage_unavailable', 'capsule_observation_missing'})
+ 
+ 
+ def admission_answer_budget():
+diff --git a/tests/hermes_cli/test_kanban_host_refusal.py b/tests/hermes_cli/test_kanban_host_refusal.py
+index 168e645bca..18683084bb 100644
+--- a/tests/hermes_cli/test_kanban_host_refusal.py
++++ b/tests/hermes_cli/test_kanban_host_refusal.py
+@@ -428,6 +428,42 @@ def test_preadmission_storage_refusals_file_one_host_notice_per_window(home, mon
+         assert "storage_unavailable" in again["body"]
+ 
+ 
++def test_preadmission_capsule_refusal_books_its_proof_and_requeues(home, monkeypatch):
++    # worker-3 2026-11-13 07:21-08:25Z (t_01a1d1197fa00599 runs 56160..56810): the owner refused
++    # ``kanban.run`` with capsule_observation_missing before any session; the client booked a plain exit 1
++    # with no proof, so the runs were crashed (triage) and no land gate could tell them from an agent turn.
++    hr = importlib.import_module("hermes_cli.kanban_host_refusal")
++    _fake_clock(monkeypatch)
++    proof = {"kind": "owner_capsule_unavailable", "phase": "preadmission", "reason": "capsule_observation_missing"}
++    with kbc.connect() as conn:
++        tid, rc = _submitted_run(conn, monkeypatch, owner=_owner("capsule_observation_missing"))
++        assert rc == ou.KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
++        (result,) = [json.loads(p) for (p,) in conn.execute(
++            "SELECT payload FROM task_events WHERE task_id=? AND kind='worker_result'", (tid,))]
++        assert result["submitter"] is True and result["pid"] == os.getpid()
++        assert result[hr.PROOF_KEY] == proof
++        kbd.detect_crashed_workers(conn)
++        task = kb.get_task(conn, tid)
++        assert task.status == "ready" and task.consecutive_failures == 0
++        (run,) = _runs(conn, tid)
++        assert run["outcome"] == "owner_unavailable" and "capsule" in run["error"]
++        (meta,) = conn.execute("SELECT metadata FROM task_runs WHERE task_id=?", (tid,)).fetchone()
++        assert json.loads(meta)[hr.PROOF_KEY] == proof
++        (notice,) = _notices(conn)
++        assert "capsule_observation_missing" in notice["body"] and tid in notice["body"]
++
++
++def test_an_admitted_capsule_refusal_gets_no_preadmission_proof():
++    from hermes_cli import gateway_client
++    from hermes_cli import kanban_worker_client as wc
++    exc = gateway_client.GatewayRPCError("capsule_observation_missing", 5001, {})
++    assert wc._host_refusal(exc, wc._Claim(answered=0.0))
++    admitted = wc._Claim(answered=0.0)
++    admitted.admission_id = "a1"
++    assert not wc._host_refusal(exc, admitted)
++    assert importlib.import_module("hermes_cli.kanban_host_refusal").preadmission_proof("capsule_unknown") is None
++
++
+ def test_startup_and_preadmission_host_faults_share_one_host_card(home, monkeypatch):
+     _fake_clock(monkeypatch)
+     with kbc.connect() as conn:
+-- 
+2.51.0
+

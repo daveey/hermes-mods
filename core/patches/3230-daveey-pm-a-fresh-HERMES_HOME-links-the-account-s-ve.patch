@@ -1,0 +1,610 @@
+From 487ccc22e5ee583f4768fed870670adeebd934f0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 05:31:30 +0000
+Subject: [PATCH] [daveey] pm: a fresh HERMES_HOME links the account's verified
+ tools, uv cache and source snapshot
+
+A test, review or mutation home (HERMES_HOME=<scratch>, real HOME) downloaded
+and unpacked every tool (~1.5 GiB), kept its own uv cache (~400 MiB) that its
+environments hard-linked into, compiled ~70 MiB of bytecode per environment and
+copied ~67 MiB of source per generation: ~2.1 GiB per home (27 GiB of
+toolchains on worker-2's done-card workspaces).
+
+pm.environments.account_home_root() names the account's default home when the
+active home is another one on the same filesystem. Such a home now:
+- links each tool entry from the account store when it records the same pin
+  (version + target + artifact sha256s); the linked tree must hash to the
+  recorded digest, else it is dropped and the pin downloads as before. A link
+  that cannot be made copies; Windows always copies; cross-target stages never
+  link.
+- shares the account's uv cache (content-keyed, uv-locked), so environments
+  link into it instead of a per-home cache.
+- skips --compile-bytecode for its own installs/ environments (modules compile
+  on first import).
+- links unchanged source-snapshot files from the account's selected generation
+  for the same checkout (or its own hermes-agent), compared byte-for-byte and
+  by mode.
+
+Proof: HERMES_HOME=$(mktemp -d) scripts/run-in-hermes-env true on worker-6:
+tools 0 MiB and installs 7.4 MiB of nlink=1 files (9 s); a --shared clone at
+main~3: tools 0, installs 9.8 MiB, no cache/uv (15 s). Before: 1.5 GiB tools +
+603 MiB installs + 392 MiB cache/uv. tests/pm/test_account_seed.py: 18 tests,
+RED on main (11 fail), 16/16 condition mutants killed.
+---
+ pm/environment.py             |  19 ++-
+ pm/environments.py            |  38 +++++
+ pm/install.py                 |  67 ++++++++
+ pm/packages.py                |  12 +-
+ pm/workspace.py               |  44 ++++-
+ tests/pm/test_account_seed.py | 296 ++++++++++++++++++++++++++++++++++
+ 6 files changed, 473 insertions(+), 3 deletions(-)
+ create mode 100644 tests/pm/test_account_seed.py
+
+diff --git a/pm/environment.py b/pm/environment.py
+index 1e85193d3f..d99b2ce30d 100644
+--- a/pm/environment.py
++++ b/pm/environment.py
+@@ -437,7 +437,9 @@ class PythonEnvironment:
+         # uv writes no __pycache__ (pip does): without --compile-bytecode the first import
+         # of every module in the foreground of a user request compiles it (#100461).
+         command = ["sync", "--locked" if locked else "--frozen", "--all-packages",
+-                   "--python", str(self.python), "--compile-bytecode"]
++                   "--python", str(self.python)]
++        if self._compile_bytecode():
++            command.append("--compile-bytecode")
+         if no_default_groups:
+             command.append("--no-default-groups")
+         if all_extras:
+@@ -460,6 +462,21 @@ class PythonEnvironment:
+         if result.returncode:
+             raise classify_uv_failure("sync", result.returncode, result.stderr or result.stdout)
+ 
++    def _compile_bytecode(self) -> bool:
++        """Compile eagerly, except an environment of a home that borrows the account's state.
++
++        Every other file of such an environment is a link into the account's uv cache; its
++        bytecode is the one copy it would own, ~70 MiB per environment, mostly for modules a
++        test or review run never imports. Those compile on first import instead."""
++        from pm.environments import account_home_root, installs_root
++
++        if account_home_root() is None:
++            return True
++        try:
++            return not self.destination.resolve().is_relative_to(installs_root().resolve())
++        except OSError:
++            return True
++
+     def _sync_attempt(self, command: list[str], *, cwd: Path, timeout: int) -> subprocess.CompletedProcess:
+         result = self._run(command, cwd=cwd, timeout=timeout)
+         if _is_bytecode_compile_failure(result):
+diff --git a/pm/environments.py b/pm/environments.py
+index 9c3844d790..a66e9bd3d3 100644
+--- a/pm/environments.py
++++ b/pm/environments.py
+@@ -34,6 +34,44 @@ def installs_root() -> Path:
+     return dependency_home_root() / "installs"
+ 
+ 
++def account_home_root() -> Path | None:
++    """The account's default home when the active home is another one on its filesystem, else ``None``.
++
++    A test, review or mutation home (``HERMES_HOME=<scratch>``) then reuses the account's
++    immutable, content-checked state (verified tool entries, uv's cache, source snapshots) by
++    hard link instead of fetching and unpacking its own ~2 GiB copy. Another filesystem keeps
++    the home's own state: a link cannot cross it.
++    """
++    from hermes_constants import _get_platform_default_hermes_home
++
++    account = _get_platform_default_hermes_home()
++    active = dependency_home_root()
++    while not active.exists() and active.parent != active:
++        active = active.parent
++    try:
++        if not account.is_dir() or os.path.samefile(account, active):
++            return None
++        if os.stat(account).st_dev != os.stat(active).st_dev:
++            return None
++    except OSError:
++        return None
++    return account
++
++
++def account_environment(project_root: Path) -> Path | None:
++    """The environment the account home has selected for *project_root*, or ``None``. Read-only."""
++    account = account_home_root()
++    if account is None:
++        return None
++    try:
++        data = json.loads((account / "installs" / install_key(project_root) / "facts.json")
++                          .read_text(encoding="utf-8-sig"))
++        value = data["packages"]["venv"]["environment"]
++    except (OSError, ValueError, KeyError, TypeError):
++        return None
++    return Path(value) if isinstance(value, str) else None
++
++
+ def install_state_dir(project_root: Path) -> Path:
+     return installs_root() / install_key(project_root)
+ 
+diff --git a/pm/install.py b/pm/install.py
+index e0714ed36c..8805ff555d 100644
+--- a/pm/install.py
++++ b/pm/install.py
+@@ -420,6 +420,71 @@ def _copy_verified_source(package, lockfile, copy_from, staged, version, target)
+         raise InstallError(package.name, "copied bytes do not match the bundled source")
+ 
+ 
++def _link_or_copy(src, dst, *, follow_symlinks=True):
++    """``copytree``'s copy function for a seed: a hard link, or a copy where none can be made
++    (another filesystem, a link-count limit). Windows always copies: a running executable locks
++    every name of its file, so a shared inode would couple the two homes' updates."""
++    if os.name != "nt":
++        try:
++            os.link(src, dst)
++            return dst
++        except OSError:
++            pass
++    return shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
++
++
++def _account_seed(package, lockfile, store: Store, version, target) -> tuple[dict, Store] | None:
++    """The account home's tool store, when it already holds this exact pin and *store* is another.
++
++    A fresh ``HERMES_HOME`` (a review clone's home, a mutation-test home) otherwise downloads and
++    unpacks every tool again, about 2 GiB per home. Read-only: the seed is never written."""
++    try:
++        from pm.environments import account_home_root
++    except ImportError:  # the Docker toolchain stage runs pm/ alone, without hermes_constants
++        return None
++    from pm.filesystem import long_root
++
++    account = account_home_root()
++    if account is None:
++        return None
++    seed = Store(long_root(account / "tools"))
++    try:
++        if os.path.samefile(seed.root, store.root):
++            return None
++        facts = Facts(seed.root / "facts.json", strict=True)
++    except (OSError, ValueError):
++        return None
++    fact = facts.get(package.name)
++    if (not facts.installed(package.name, version, seed.root, _identity(lockfile, package.name, target))
++            or not fact or not fact.get("digest")):
++        return None
++    return fact, seed
++
++
++def _seed_from_account(package, lockfile, store, staged, version, target) -> bool:
++    """Stage *package* by linking the account store's entry; False leaves the download to the caller.
++
++    Entries are immutable once published and every name is replaced by rename, so a link shares
++    bytes without sharing a tree. The staged tree must still hash to the digest the account
++    recorded for this exact pin; a seed that changes mid-link fails that check and is dropped."""
++    seed = _account_seed(package, lockfile, store, version, target)
++    if seed is None:
++        return False
++    fact, source_store = seed
++    try:
++        shutil.copytree(source_store.entry(fact["entry"]), staged, symlinks=True, copy_function=_link_or_copy)
++        if digest_matches(staged, fact["digest"]):
++            LOG.info("%s: linked from %s", package.name, native(source_store.root))
++            return True
++        LOG.warning("%s: %s does not match its recorded digest; downloading", package.name,
++                    native(source_store.entry(fact["entry"])))
++    except OSError as exc:
++        LOG.warning("%s: cannot link from %s (%s); downloading", package.name, native(source_store.root), exc)
++    if staged.exists():
++        remove_tree(staged)
++    return False
++
++
+ def _log_repair(package, previous, version, artifacts) -> None:
+     """Work item 6: replacing an ESTABLISHED fact is a repair — log it,
+     no transaction system, no receipt file."""
+@@ -489,6 +554,8 @@ def _install(
+             try:
+                 if copy_from is not None:
+                     _copy_verified_source(package, lockfile, copy_from, staged, version, target)
++                elif facts is not None and _seed_from_account(package, lockfile, store, staged, version, target):
++                    pass
+                 else:
+                     staged = _prepare_artifacts(package, store, scratch, artifacts, version, target,
+                                                 progress=progress, pause_event=pause_event,
+diff --git a/pm/packages.py b/pm/packages.py
+index 9eb59cdc1e..c4b32a5839 100644
+--- a/pm/packages.py
++++ b/pm/packages.py
+@@ -405,9 +405,19 @@ def _seed_tree(src: Path, dst: Path) -> None:
+ 
+ 
+ def uv_cache_path() -> Path:
+-    """Where the hermes-owned uv cache lives; unlike uv_cache_dir(), never seeds or writes."""
++    """Where the hermes-owned uv cache lives; unlike uv_cache_dir(), never seeds or writes.
++
++    A custom ``HERMES_HOME`` on the account home's filesystem shares the account's cache: uv
++    hard-links each environment's files out of its cache, so a per-home cache made every fresh
++    home's environments cost their full size again. uv locks its cache, and entries are
++    content-keyed, so two homes never disagree about one."""
+     from hermes_constants import get_default_hermes_root
++    from pm.environments import account_home_root
+ 
++    account = account_home_root()
++    shared = account / "cache" / "uv" if account is not None else None
++    if shared is not None and os.access(shared, os.W_OK):
++        return shared
+     return get_default_hermes_root() / "cache" / "uv"
+ 
+ 
+diff --git a/pm/workspace.py b/pm/workspace.py
+index 644f7d8600..16bc1d5ba0 100644
+--- a/pm/workspace.py
++++ b/pm/workspace.py
+@@ -86,11 +86,53 @@ def _published_store_entries(directory: Path) -> frozenset[str]:
+     return frozenset(name for name in names if (directory / name).is_dir())
+ 
+ 
++def _snapshot_donor(source: Path) -> Path | None:
++    """A source snapshot the account home already holds for this checkout (or for its own).
++
++    Only a home borrowing the account's state has one (``account_home_root``): its snapshot
++    links the files the donor holds byte-for-byte instead of copying ~70 MiB of source again."""
++    from pm.environments import account_environment, account_home_root
++
++    account = account_home_root()
++    if account is None:
++        return None
++    for project in (source, account / "hermes-agent"):
++        environment = account_environment(project)
++        if environment is not None and (environment.parent / "workspace").is_dir():
++            return environment.parent / "workspace"
++    return None
++
++
++def _snapshot_copier(source: Path, donor: Path | None):
++    """``copytree``'s copy function: a link to the donor's copy of a file when it has the same
++    bytes and mode (snapshots are never written in place), else a real copy."""
++    if donor is None or os.name == "nt":
++        return shutil.copy2
++    import filecmp
++    import stat
++
++    def copy(src, dst, *, follow_symlinks=True):
++        twin = donor / Path(src).relative_to(source)
++        try:
++            mine, theirs = os.stat(src), os.lstat(twin)
++            if (stat.S_ISREG(theirs.st_mode) and theirs.st_size == mine.st_size
++                    and stat.S_IMODE(theirs.st_mode) == stat.S_IMODE(mine.st_mode)
++                    and filecmp.cmp(src, twin, shallow=False)):
++                os.link(twin, dst)
++                return dst
++        except (OSError, ValueError):
++            pass
++        return shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
++
++    return copy
++
++
+ def _copy_core_inputs(source: Path, destination: Path) -> None:
+     """Build from a writable snapshot, never from signed/read-only source."""
+     import fnmatch
+     import tomllib
+ 
++    copy = _snapshot_copier(source, _snapshot_donor(source))
+     metadata = tomllib.loads((source / "pyproject.toml").read_text(encoding="utf-8-sig"))
+     project = metadata.get("project", {})
+     setuptools = metadata.get("tool", {}).get("setuptools", {})
+@@ -126,7 +168,7 @@ def _copy_core_inputs(source: Path, destination: Path) -> None:
+                 and (entry.name in where_roots
+                      or any(fnmatch.fnmatchcase(entry.name, pattern) for pattern in package_roots))):
+             target = destination / entry.name
+-            shutil.copytree(entry, target, ignore=ignore)
++            shutil.copytree(entry, target, ignore=ignore, copy_function=copy)
+     for name in files:
+         entry = source / name
+         if not entry.is_file() or entry.is_symlink():
+diff --git a/tests/pm/test_account_seed.py b/tests/pm/test_account_seed.py
+new file mode 100644
+index 0000000000..19a9edfb44
+--- /dev/null
++++ b/tests/pm/test_account_seed.py
+@@ -0,0 +1,296 @@
++"""A fresh HERMES_HOME links the account home's verified state instead of fetching its own copy."""
++from __future__ import annotations
++
++import errno
++import hashlib
++import importlib
++import io
++import json
++import os
++from pathlib import Path
++from types import SimpleNamespace
++import zipfile
++
++import pytest
++
++from pm import paths
++from pm.lock import Facts, Lockfile
++from pm.package import InstallError, Package
++from pm.store import Store, current_target
++from tests.pm._range_server import RangeHandler, url
++from tests.pm._range_server import dl_server as dl_server  # noqa: PLC0414 -- the self-alias suppresses F811 for the fixture parameter
++
++pytestmark = pytest.mark.skipif(os.name == "nt", reason="Windows seeds copy, never link")
++
++engine = importlib.import_module("pm.install")
++
++
++def _zip(body: bytes) -> bytes:
++    data = io.BytesIO()
++    with zipfile.ZipFile(data, "w") as archive:
++        archive.writestr("tool.txt", body)
++    return data.getvalue()
++
++
++@pytest.fixture
++def tool(tmp_path, dl_server, monkeypatch):
++    """One pinned package, installed into the account home's store by a real download."""
++    monkeypatch.setattr(paths, "partials_root", lambda: tmp_path / "partials")
++    package = Package()
++    package.name = "seed-tool"
++    lock = Lockfile(tmp_path / "lock.json")
++
++    def pin(version: str, body: bytes):
++        archive = _zip(body)
++        digest = hashlib.sha256(archive).hexdigest()
++        RangeHandler.payloads[f"/{version}.zip"] = archive
++        lock.set_pin(package.name, version, {"any": {"url": url(dl_server, f"/{version}.zip"), "sha256": digest}})
++
++    pin("1.0", b"pinned bytes")
++    account = Store(tmp_path / ".hermes" / "tools")
++    account_facts = Facts(account.root / "facts.json")
++    engine._install(package, lock, account_facts, account, current_target())
++
++    borrower = tmp_path / "borrower"
++    borrower.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(borrower))
++    store = Store(borrower / "tools")
++
++    fact = account_facts.get(package.name)
++    assert fact is not None
++    t = SimpleNamespace(package=package, lock=lock, pin=pin, store=store, account=account,
++                        account_file=account.entry(fact["entry"]) / "tool.txt")
++
++    def install():
++        facts = Facts(store.root / "facts.json")
++        entry = engine._install(package, lock, facts, store, current_target())
++        recorded = facts.get(package.name)
++        assert recorded is not None and recorded["digest"]
++        return entry / "tool.txt"
++
++    t.install = install
++    return t
++
++
++def test_borrowing_home_links_the_account_entry_without_downloading(tool):
++    RangeHandler.payloads.clear()  # a download would now fail the install
++    installed = tool.install()
++    assert installed.read_bytes() == b"pinned bytes"
++    assert os.stat(installed).st_ino == os.stat(tool.account_file).st_ino
++
++
++def test_link_failure_copies_the_verified_entry(tool, monkeypatch):
++    def refuse(src, dst):
++        raise OSError(errno.EXDEV, "cross-device")
++
++    monkeypatch.setattr(engine.os, "link", refuse)
++    RangeHandler.payloads.clear()
++    installed = tool.install()
++    assert installed.read_bytes() == b"pinned bytes"
++    assert os.stat(installed).st_ino != os.stat(tool.account_file).st_ino
++
++
++def test_seed_that_vanishes_mid_link_falls_back_to_download(tool, monkeypatch):
++    def vanish(src, dst, **_):
++        raise FileNotFoundError(errno.ENOENT, "gone", src)
++
++    monkeypatch.setattr(engine, "_link_or_copy", vanish)
++    installed = tool.install()
++    assert installed.read_bytes() == b"pinned bytes"
++    assert os.stat(installed).st_ino != os.stat(tool.account_file).st_ino
++
++
++def test_tampered_seed_is_never_linked(tool):
++    tool.account_file.write_bytes(b"tampered")  # same inode, bytes no longer match the recorded digest
++    installed = tool.install()
++    assert installed.read_bytes() == b"pinned bytes"
++    assert tool.account_file.read_bytes() == b"tampered"
++
++
++def test_seed_on_another_pin_is_not_used(tool):
++    tool.pin("2.0", b"new pin")
++    installed = tool.install()
++    assert installed.read_bytes() == b"new pin"
++
++
++@pytest.mark.parametrize("damage", ["no-digest", "corrupt"])
++def test_unreadable_or_unvouched_account_facts_download(tool, damage):
++    facts_path = tool.account.root / "facts.json"
++    if damage == "corrupt":
++        facts_path.write_text("{not json", encoding="utf-8")
++    else:
++        data = json.loads(facts_path.read_text(encoding="utf-8"))
++        del data["packages"][tool.package.name]["digest"]
++        facts_path.write_text(json.dumps(data), encoding="utf-8")
++    installed = tool.install()
++    assert installed.read_bytes() == b"pinned bytes"
++    assert os.stat(installed).st_ino != os.stat(tool.account_file).st_ino
++
++
++def test_account_home_installs_never_seed_from_themselves(tool, monkeypatch, tmp_path):
++    # A borrowing home whose store IS the account's (HERMES_RUNTIME_DIR) has nothing to seed.
++    assert engine._account_seed(tool.package, tool.lock, tool.account, "1.0", current_target()) is None
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
++    assert engine._account_seed(tool.package, tool.lock, tool.store, "1.0", current_target()) is None
++
++
++def test_failed_seed_leaves_nothing_in_the_downloaded_tree(tool, monkeypatch):
++    """An unpack that does not empty its destination (npm, .deb) must not inherit a dropped seed."""
++    def merge_unpack(archive, staged, target):
++        staged.mkdir(parents=True, exist_ok=True)
++        with zipfile.ZipFile(archive) as opened:
++            opened.extractall(staged)
++
++    monkeypatch.setattr(tool.package, "unpack", merge_unpack)
++    (tool.account_file.parent / "extra.txt").write_bytes(b"not in the pin")  # digest no longer matches
++    installed = tool.install()
++    assert installed.read_bytes() == b"pinned bytes"
++    assert not (installed.parent / "extra.txt").exists()
++
++
++def test_cross_target_stages_are_never_linked(tool, monkeypatch):
++    """A stage feeds a bundle that tooling may rewrite in place, so it never shares inodes."""
++    monkeypatch.setattr(engine, "_lockfile", lambda: tool.lock)
++    monkeypatch.setattr(engine, "_store", lambda: tool.store)
++    monkeypatch.setattr(engine, "get_package", lambda _: tool.package)
++    RangeHandler.payloads.clear()
++    with pytest.raises(InstallError):
++        engine.stage_only(tool.package.name, current_target())
++
++
++# --- account_home_root ------------------------------------------------------------------------
++
++def test_account_home_root_is_only_another_home_on_the_same_filesystem(tmp_path, monkeypatch):
++    from pm import environments
++
++    account = tmp_path / ".hermes"
++    assert environments.account_home_root() is None  # the account home itself
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "fresh" / "not-yet-created"))
++    assert environments.account_home_root() == account
++
++    real_stat = os.stat
++
++    def other_device(path, *args, **kwargs):
++        result = real_stat(path, *args, **kwargs)
++        if Path(path) == account:
++            fields = list(result)
++            fields[2] += 1  # st_dev
++            return os.stat_result(fields)
++        return result
++
++    monkeypatch.setattr(environments.os, "stat", other_device)
++    assert environments.account_home_root() is None
++
++
++def test_no_account_home_means_no_borrowing(tmp_path, monkeypatch):
++    from pm import environments
++
++    monkeypatch.setenv("HOME", str(tmp_path / "nobody"))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path / "nobody")
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "fresh"))
++    assert environments.account_home_root() is None
++
++
++# --- uv cache ---------------------------------------------------------------------------------
++
++def test_borrowing_home_shares_the_account_uv_cache(tmp_path, monkeypatch):
++    from pm.packages import uv_cache_path
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "fresh"))
++    assert uv_cache_path() == tmp_path / "fresh" / "cache" / "uv"  # the account has no cache to share
++    shared = tmp_path / ".hermes" / "cache" / "uv"
++    shared.mkdir(parents=True)
++    assert uv_cache_path() == shared
++    shared.chmod(0o500)
++    try:
++        if not os.access(shared, os.W_OK):  # root ignores the mode
++            assert uv_cache_path() == tmp_path / "fresh" / "cache" / "uv"
++    finally:
++        shared.chmod(0o700)
++
++
++# --- bytecode ---------------------------------------------------------------------------------
++
++def _environment(destination: Path):
++    from pm.environment import PythonEnvironment
++
++    return PythonEnvironment(uv=Path("uv"), python=Path("python"), destination=destination,
++                             cache=Path("cache"), env={})
++
++
++def test_borrowing_home_environments_compile_bytecode_lazily(tmp_path, monkeypatch):
++    from pm.environments import installs_root
++
++    assert _environment(installs_root() / "k" / "environments" / "g" / "venv")._compile_bytecode()
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "fresh"))
++    assert not _environment(installs_root() / "k" / "environments" / "g" / "venv")._compile_bytecode()
++    assert _environment(tmp_path / "payload" / "venv")._compile_bytecode()  # a bundle build keeps it
++
++
++def test_sync_passes_compile_bytecode_only_when_wanted(tmp_path, monkeypatch):
++    import subprocess
++
++    from pm.environment import PythonEnvironment
++
++    seen = []
++
++    def run(self, args, *, cwd, timeout):
++        seen.append(args)
++        return subprocess.CompletedProcess(args, 0, "", "")
++
++    monkeypatch.setattr(PythonEnvironment, "_run", run)
++    for wanted in (True, False):
++        monkeypatch.setattr(PythonEnvironment, "_compile_bytecode", lambda self, w=wanted: w)
++        _environment(tmp_path / "venv").sync(tmp_path)
++        assert ("--compile-bytecode" in seen[-1]) is wanted
++
++
++# --- source snapshot --------------------------------------------------------------------------
++
++def test_snapshot_links_identical_files_from_the_donor(tmp_path):
++    from pm.workspace import _snapshot_copier
++
++    source, donor, out = tmp_path / "src", tmp_path / "donor", tmp_path / "out"
++    for root in (source, donor, out):
++        root.mkdir()
++    for name, mine, theirs in (("same.py", b"a", b"a"), ("changed.py", b"new", b"old"),
++                               ("mode.py", b"m", b"m"), ("only-mine.py", b"x", None)):
++        (source / name).write_bytes(mine)
++        if theirs is not None:
++            (donor / name).write_bytes(theirs)
++    (source / "mode.py").chmod(0o755)
++    (donor / "mode.py").chmod(0o644)
++    copy = _snapshot_copier(source, donor)
++    for name in ("same.py", "changed.py", "mode.py", "only-mine.py"):
++        copy(str(source / name), str(out / name))
++        assert (out / name).read_bytes() == (source / name).read_bytes()
++    assert os.stat(out / "same.py").st_ino == os.stat(donor / "same.py").st_ino
++    for name in ("changed.py", "mode.py", "only-mine.py"):
++        assert os.stat(out / name).st_nlink == 1
++
++
++def test_snapshot_donor_is_the_account_selection_for_this_checkout(tmp_path, monkeypatch):
++    from pm.environments import install_key
++    from pm.workspace import _snapshot_donor
++
++    source = tmp_path / "checkout"
++    source.mkdir()
++    state = tmp_path / ".hermes" / "installs" / install_key(source)
++    generation = state / "environments" / "g"
++    (generation / "workspace").mkdir(parents=True)
++    (state / "facts.json").write_text(json.dumps(
++        {"schema": 1, "packages": {"venv": {"environment": str(generation / "venv")}}}), encoding="utf-8")
++    assert _snapshot_donor(source) is None  # the account home borrows from nobody
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "fresh"))
++    assert _snapshot_donor(source) == generation / "workspace"
++    assert _snapshot_donor(tmp_path / "other-checkout") is None
++    (generation / "workspace").rmdir()
++    assert _snapshot_donor(source) is None  # a selection whose snapshot is gone is no donor
++
++
++def test_install_error_is_not_swallowed_by_the_seed(tool, monkeypatch):
++    """A seed refusal never hides the real install's failure."""
++    RangeHandler.payloads.clear()
++    tool.account_file.write_bytes(b"tampered")
++    with pytest.raises(InstallError):
++        tool.install()
+-- 
+2.51.0
+

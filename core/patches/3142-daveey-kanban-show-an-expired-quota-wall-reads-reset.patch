@@ -1,0 +1,305 @@
+From 6c2dbcd278ac9cf932aa9129e826cb431f61cf17 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 04:24:00 +0000
+Subject: [PATCH] [daveey] kanban show: an expired quota wall reads '(reset
+ passed)', not 'starts on its own when that wall resets'
+
+PR #1865 review nit 2 (t_01a1d31b227be614, review 5885960246): once a pinned_quota_wall skip's `until` has passed
+and no later tick has replaced it, pool_replace_helps offers the pool re-place, but the same `kanban show` text still
+read "quota-walled until HH:MMZ ... It starts on its own when that wall resets". The two halves contradicted.
+
+- kanban_dispatch_skip: new _wall_passed(skip, now), the exact complement of the pool_replace_helps suppression.
+  words(skip, now=) appends " (reset passed)" after the until stamp; advice(skip, now=) / sentence_advice drop
+  "starts on its own when that wall resets" for it ("that wall's reset has passed; the next dispatcher tick
+  re-checks the pin ..."). A future, missing or unparseable until keeps today's wording.
+- kanban_queue_position.local_words(place, now=): one `now` (default time.time()) feeds pool_replace_helps, words
+  and the skip advice, so both halves agree at the boundary (until == now counts as passed on both).
+- kanban_parent_unclaimed: ready_hint threads its `now`; post_notice uses the payload's observed_at for the queue
+  words and pool hint, and notice_advice defaults to that observed_at when the notice is rendered later.
+
+Proof: 8 new cases RED on the #1865 head (expired wall: no marker, reset clause present; signature for now=), GREEN
+after; 27 importer/notice test files: 661 passed; scripts/check --base origin/main ok.
+---
+ hermes_cli/kanban_dispatch_skip.py            | 32 ++++++++---
+ hermes_cli/kanban_parent_unclaimed.py         | 23 ++++----
+ hermes_cli/kanban_queue_position.py           | 22 ++++----
+ .../test_kanban_wait_notice_pool_hint.py      | 53 +++++++++++++++++++
+ 4 files changed, 103 insertions(+), 27 deletions(-)
+
+diff --git a/hermes_cli/kanban_dispatch_skip.py b/hermes_cli/kanban_dispatch_skip.py
+index 35a9056898..07f5a36fb2 100644
+--- a/hermes_cli/kanban_dispatch_skip.py
++++ b/hermes_cli/kanban_dispatch_skip.py
+@@ -301,6 +301,8 @@ def words(skip: dict[str, Any], *, now: Optional[float] = None) -> str:
+     text = _WORDS.get(reason, "skipped: {reason} ({detail})").format(reason=reason, detail=detail)
+     if skip.get("until"):
+         text += f" until {_stamp(skip['until'], now)}"
++        if _wall_passed(skip, now):
++            text += " (reset passed)"
+     return text
+ 
+ 
+@@ -311,8 +313,13 @@ def is_ordering(skip: Optional[dict[str, Any]]) -> bool:
+                            or skip.get("reason") == "per_profile_capped")
+ 
+ 
+-def advice(skip: dict[str, Any]) -> str:
+-    """What to do about a non-ordering skip; never a priority change."""
++def advice(skip: dict[str, Any], *, now: Optional[float] = None) -> str:
++    """What to do about a non-ordering skip; never a priority change. A quota wall whose ``until`` has passed by
++    ``now`` (default ``time.time()``) drops "starts on its own when that wall resets": :func:`pool_replace_helps`
++    offers the pool re-place for it at the same ``now`` (PR #1865 review). [daveey]"""
++    if _wall_passed(skip, now):
++        return ("that wall's reset has passed; the next dispatcher tick re-checks the pin. Priority changes do not "
++                "clear a quota wall. Do not run its work outside the dispatcher")
+     if skip.get("reason") == PINNED_QUOTA_WALL:
+         return ("it starts on its own when that wall resets. Re-pin it (`hermes kanban set-model <id> ...`) only if it "
+                 "cannot wait; priority changes do not clear a quota wall. Do not run its work outside the dispatcher")
+@@ -320,10 +327,10 @@ def advice(skip: dict[str, Any]) -> str:
+             "Do not run its work outside the dispatcher")
+ 
+ 
+-def sentence_advice(skip: dict[str, Any]) -> str:
++def sentence_advice(skip: dict[str, Any], *, now: Optional[float] = None) -> str:
+     """:func:`advice` as a sentence of its own, for a join after a full stop (``kanban show``); the notices keep the
+     lowercase clause after their ``NO_FIX: `` prefix. [daveey] PR #1846 review nit."""
+-    text = advice(skip)
++    text = advice(skip, now=now)
+     return text[:1].upper() + text[1:]
+ 
+ 
+@@ -337,6 +344,12 @@ def _wall_lasts(skip: dict[str, Any], now: Optional[float]) -> bool:
+     return until != until or until > (time.time() if now is None else now)  # NaN is unparseable too
+ 
+ 
++def _wall_passed(skip: dict[str, Any], now: Optional[float]) -> bool:
++    """A ``pinned_quota_wall`` skip whose readable ``until`` is at or before ``now``: the exact complement of the
++    :func:`pool_replace_helps` suppression, so the wording and the re-place offer agree."""
++    return skip.get("reason") == PINNED_QUOTA_WALL and not _wall_lasts(skip, now)
++
++
+ def pool_replace_helps(skip: Optional[dict[str, Any]], *, now: Optional[float] = None) -> bool:
+     """False when a pool re-place cannot clear ``skip``, so no surface may offer one. [daveey] PR #1835 review: a
+     ``pinned_quota_wall`` hold follows the pin to any machine, and ``_pool_could_run`` never reads the pool workers'
+@@ -372,11 +385,16 @@ def notice_fields(place: Optional[dict[str, Any]], ready_seconds: Optional[float
+     return {"skip_unrecorded": True} if unrecorded(place, ready_seconds) else {}
+ 
+ 
+-def notice_advice(payload: dict[str, Any]) -> Optional[str]:
+-    """The advice for a notice payload carrying :func:`notice_fields`, or None for the ordinary capacity advice."""
++def notice_advice(payload: dict[str, Any], *, now: Optional[float] = None) -> Optional[str]:
++    """The advice for a notice payload carrying :func:`notice_fields`, or None for the ordinary capacity advice.
++    ``now`` defaults to the payload's ``observed_at`` (when its queue words and pool hint were written), else the
++    current time."""
+     skip = payload.get("dispatch_skip")
+     if isinstance(skip, dict) and skip and not is_ordering(skip):
+-        return advice(skip)
++        seen = payload.get("observed_at")
++        if now is None and isinstance(seen, (int, float)) and not isinstance(seen, bool):
++            now = seen
++        return advice(skip, now=now)
+     if not payload.get("skip_unrecorded"):
+         return None
+     return UNRECORDED_POOL_ADVICE if str(payload.get("pool_hint") or "").strip() else UNRECORDED_ADVICE
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index a8affd84c8..56537fef76 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -50,7 +50,7 @@ def _place(conn, parent_id: str) -> dict[str, Any]:
+         return {}
+ 
+ 
+-def _queue_words(place: dict[str, Any]) -> str:
++def _queue_words(place: dict[str, Any], now: Optional[float] = None) -> str:
+     if place.get("lane") == "worker_pool":
+         return f"waiting for a pool worker ({place.get('reason') or 'no reason recorded'})"
+     if place.get("lane") in ("machine", "unplaceable"):
+@@ -67,16 +67,16 @@ def _queue_words(place: dict[str, Any]) -> str:
+     elif place.get("limit") is not None and "running" in place:
+         words += f", running count unknown (cap {place['limit']})"
+     if place.get("skip"):  # the recorded reason comes first: a bare queue place read as an ordering wait [daveey]
+-        words = f"{skips.words(place['skip'])}; {words}"
++        words = f"{skips.words(place['skip'], now=now)}; {words}"
+     return words
+ 
+ 
+-def _pool_sentence(place: dict[str, Any]) -> str:
++def _pool_sentence(place: dict[str, Any], now: Optional[float] = None) -> str:
+     """The pool re-place sentence when a pool worker could start the card now, else ``""``. Kept out of
+     :func:`_queue_words`: the notices print that clause in parentheses, and their advice already says not to run the
+     work outside the dispatcher (PR #1821 review). Dropped from these notices before (kanban-e7a33105a4). [daveey]"""
+     from hermes_cli.kanban_dispatch_skip import pool_replace_helps
+-    if not place.get("pool_could_run") or not pool_replace_helps(place.get("skip")):  # a quota wall (PR #1835)
++    if not place.get("pool_could_run") or not pool_replace_helps(place.get("skip"), now=now):  # quota wall (#1835)
+         return ""
+     from hermes_cli.kanban_queue_position import pool_words
+     return pool_words(place, advice=False)
+@@ -100,11 +100,11 @@ def _observation(payload: dict[str, Any]) -> str:
+ 
+ 
+ def _options(parent_id: str, evidence: Optional[dict[str, Any]] = None,
+-             payload: Optional[dict[str, Any]] = None) -> str:
++             payload: Optional[dict[str, Any]] = None, now: Optional[float] = None) -> str:
+     """Capacity advice, or the recorded skip's (or the unrecorded skip's) advice without priority changes."""
+     from hermes_cli.kanban_dispatch_skip import notice_advice
+     from hermes_cli.kanban_priority import advice
+-    return f"{NO_FIX}: " + (notice_advice(payload or {}) or advice(parent_id, evidence))
++    return f"{NO_FIX}: " + (notice_advice(payload or {}, now=now) or advice(parent_id, evidence))
+ 
+ 
+ def notice_text(payload: Any) -> str:
+@@ -136,10 +136,10 @@ def ready_hint(conn, task, *, now: Optional[float] = None) -> Optional[str]:
+     if place.get("lane") == "respawn_guard":
+         return f"Ready {_minutes(waited)} min, unclaimed; {kqp.describe(place)}. {checkpoint}".rstrip()
+     from hermes_cli.kanban_dispatch_skip import notice_fields
+-    pool = _pool_sentence(place)
++    pool = _pool_sentence(place, now)
+     fields = {**notice_fields(place, waited), **({"pool_hint": pool} if pool else {})}  # _options defers to it
+-    return (f"Ready {_minutes(waited)} min, unclaimed; {_queue_words(place)}. " + (f"{pool}. " if pool else "")
+-            + checkpoint + _options(task.id, lane_evidence(conn, task.id), fields) + ".")
++    return (f"Ready {_minutes(waited)} min, unclaimed; {_queue_words(place, now)}. " + (f"{pool}. " if pool else "")
++            + checkpoint + _options(task.id, lane_evidence(conn, task.id), fields, now) + ".")
+ 
+ 
+ _CANDIDATES = (
+@@ -212,7 +212,7 @@ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_se
+                 "admission": ({"reason": "core_update_hold", "status": "held"} if (extra or {}).get("core_update_hold")
+                               else {"reason": None, "status": "unknown"})}
+     guard = place.get("reason") if place.get("lane") == "respawn_guard" else None
+-    pool_hint = "" if guard else _pool_sentence(place)  # outside the parenthesised queue clause (PR #1821) [daveey]
++    pool_hint = "" if guard else _pool_sentence(place, observed["observed_at"])  # outside the queue clause (#1821)
+     checkpoint = last_checkpoint.notice_fields(conn, waiting_on)  # same lookup supplies fields and evidence [daveey]
+     with kb.write_txn(conn):
+         if _already_posted(conn, task_id, waiting_on, wait_key, kind):
+@@ -225,7 +225,8 @@ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_se
+         kb._append_event(conn, task_id, kind, {
+             "parent": waiting_on, "parent_title": parent_title, "wait_event_id": wait_key,
+             "wait_minutes": _minutes(waited_seconds), "ready_minutes": _minutes(ready_seconds),
+-            "queue": kqp.describe(place) if guard else _queue_words(place), **observed, **checkpoint,
++            "queue": kqp.describe(place) if guard else _queue_words(place, observed["observed_at"]),
++            **observed, **checkpoint,
+             **({"pool_hint": pool_hint} if pool_hint else {}),
+             **(extra or {}),
+             "respawn_guard": guard,
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index 6da5a65a29..5b976dd664 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -321,11 +321,14 @@ def _describe_lane(place: Optional[dict[str, Any]]) -> Optional[str]:
+     return local_words(place)
+ 
+ 
+-def local_words(place: dict[str, Any]) -> str:
+-    """``describe`` for the ``local`` lane: the recorded dispatcher skip first, when there is one."""
++def local_words(place: dict[str, Any], *, now: Optional[float] = None) -> str:
++    """``describe`` for the ``local`` lane: the recorded dispatcher skip first, when there is one. One ``now``
++    (default ``time.time()``) feeds the re-place gate and the skip's words and advice, so an expired quota wall is
++    not offered the re-place while still said to start "when that wall resets" (PR #1865 review). [daveey]"""
+     from hermes_cli import kanban_dispatch_skip as skips
++    now = time.time() if now is None else now
+     skip = place.get("skip")
+-    pooled = bool(place.get("pool_could_run")) and skips.pool_replace_helps(skip)
++    pooled = bool(place.get("pool_could_run")) and skips.pool_replace_helps(skip, now=now)
+     ahead = place.get("ahead")
+     words = (ahead_words(place, "waiting for a local slot: ~{n} ahead") if ahead is not None
+              else "waiting for a local slot")
+@@ -348,8 +351,8 @@ def local_words(place: dict[str, Any]) -> str:
+             pool_advice = pool_words(place)
+         if not skip:
+             return f"{words}. {pool_advice}"
+-        words = f"last dispatcher skip of this ready episode: {skips.words(skip)} ({words})"
+-        return words + ". " + _skip_advice(place, skip, pool_advice, pooled)
++        words = f"last dispatcher skip of this ready episode: {skips.words(skip, now=now)} ({words})"
++        return words + ". " + _skip_advice(place, skip, pool_advice, pooled, now)
+     if place.get("running") is not None and place.get("limit") is not None:
+         words += f", {place['running']}/{place['limit']} running"
+     elif place.get("limit") is not None and "running" in place:
+@@ -359,11 +362,12 @@ def local_words(place: dict[str, Any]) -> str:
+     pool_advice = pool_words(place) if pooled else _NOT_STUCK
+     if not skip:
+         return words + ". " + pool_advice
+-    words = f"last dispatcher skip of this ready episode: {skips.words(skip)} ({words})"
+-    return words + ". " + _skip_advice(place, skip, pool_advice, pooled)
++    words = f"last dispatcher skip of this ready episode: {skips.words(skip, now=now)} ({words})"
++    return words + ". " + _skip_advice(place, skip, pool_advice, pooled, now)
+ 
+ 
+-def _skip_advice(place: dict[str, Any], skip: dict[str, Any], ordering_advice: str, pooled: bool) -> str:
++def _skip_advice(place: dict[str, Any], skip: dict[str, Any], ordering_advice: str, pooled: bool,
++                 now: Optional[float] = None) -> str:
+     """The advice after a recorded skip, by the rule the chat notices follow (``kanban_parent_unclaimed._options``):
+     an ordering skip takes the lane's own advice (the pool re-place when a pool worker could run it); any other skip
+     keeps its own advice, after the re-place sentence when one applies. [daveey] PR #1835 review: ``kanban show``
+@@ -371,7 +375,7 @@ def _skip_advice(place: dict[str, Any], skip: dict[str, Any], ordering_advice: s
+     from hermes_cli import kanban_dispatch_skip as skips
+     if skips.is_ordering(skip):
+         return ordering_advice
+-    return (pool_words(place, advice=False) + ". " if pooled else "") + skips.sentence_advice(skip)
++    return (pool_words(place, advice=False) + ". " if pooled else "") + skips.sentence_advice(skip, now=now)
+ 
+ 
+ def pool_words(place: dict[str, Any], *, advice: bool = True) -> str:
+diff --git a/tests/hermes_cli/test_kanban_wait_notice_pool_hint.py b/tests/hermes_cli/test_kanban_wait_notice_pool_hint.py
+index d8fb4501ee..287e669856 100644
+--- a/tests/hermes_cli/test_kanban_wait_notice_pool_hint.py
++++ b/tests/hermes_cli/test_kanban_wait_notice_pool_hint.py
+@@ -344,3 +344,56 @@ def test_an_expired_quota_wall_skip_offers_the_pool_re_place_on_every_surface(ho
+         hint = pu.ready_hint(conn, kb.get_task(conn, tid))
+     assert hint is not None
+     _assert_pool_hint(hint, tid)
++
++
++_WALL_RESETS = "starts on its own when that wall resets"
++
++
++@pytest.mark.parametrize("census", [True, False])
++@pytest.mark.parametrize("offset", [-60, 0])  # the gate keeps the wall only while until > now: until == now passed
++def test_kanban_show_marks_an_expired_quota_wall_reset_passed(census, offset):
++    """PR #1865 review nit 2: once a quota wall's ``until`` has passed (no later tick replaced the skip),
++    ``kanban show`` offers the pool re-place, so the same text must not still say the card "starts on its own when
++    that wall resets". Both halves read one ``now``."""
++    from hermes_cli import kanban_dispatch_skip as skips
++    now = 1_800_000_000.0
++    skip = {"reason": skips.PINNED_QUOTA_WALL, "detail": "claude-opus-5-5 (anthropic)", "until": now + offset}
++    place = {**_PLACE, "skip": skip, "pool_could_run": ["worker-2"], "task_id": "t_x", **(_CENSUS if census else {})}
++    shown = kqp.local_words(place, now=now)
++    _assert_pool_hint(shown, "t_x")
++    assert _WALL_RESETS not in shown, shown
++    assert "(reset passed)" in shown, shown
++    assert shown.count("outside the dispatcher") == 1, shown
++
++
++@pytest.mark.parametrize("until", [3600, None, "soon"])
++def test_a_lasting_or_unreadable_quota_wall_keeps_its_wording(until):
++    """A future wall, or one with a missing/unparseable ``until``, keeps "starts on its own" and no marker."""
++    from hermes_cli import kanban_dispatch_skip as skips
++    now = 1_800_000_000.0
++    at = now + until if isinstance(until, int) else until
++    skip = {"reason": skips.PINNED_QUOTA_WALL, "detail": "claude-opus-5-5 (anthropic)", "until": at}
++    place = {**_PLACE, "skip": skip, "pool_could_run": ["worker-2"], "task_id": "t_x"}
++    shown = kqp.local_words(place, now=now)
++    assert _WALL_RESETS in shown and "(reset passed)" not in shown and "--runs-on" not in shown, shown
++    assert _WALL_RESETS in skips.advice(skip, now=now)
++    assert "(reset passed)" not in skips.words(skip, now=now)
++
++
++def test_an_expired_quota_wall_drops_the_reset_clause_on_every_surface(home, pool):
++    """The notices and ``ready_hint`` follow ``kanban show``: with the re-place offered, no "starts on its own"."""
++    from hermes_cli import kanban_dispatch_skip as skips
++    skip = {"reason": skips.PINNED_QUOTA_WALL, "detail": "claude-opus-5-5 (anthropic)", "until": time.time() - 60}
++    shown = kqp.local_words({**_PLACE, "skip": skip, "pool_could_run": ["worker-2"], "task_id": "t_x"})
++    assert _WALL_RESETS not in shown and "(reset passed)" in shown, shown
++    with kbc.connect_closing() as conn:
++        tid = _waiting_card(conn)
++        _record_skip(conn, tid, skips.PINNED_QUOTA_WALL, "claude-opus-5-5 (anthropic)", until=time.time() - 60)
++        hint = pu.ready_hint(conn, kb.get_task(conn, tid))
++        assert cw.sweep(conn) == 1
++        notice = cw.notice_text(_notice(conn, tid, cw.NOTICE_KIND))
++    assert hint is not None
++    for text in (hint, notice):
++        _assert_pool_hint(text, tid)
++        assert _WALL_RESETS not in text and "(reset passed)" in text, text
++        assert text.count("outside the dispatcher") == 1, text
+-- 
+2.51.0
+

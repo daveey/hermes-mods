@@ -1,0 +1,372 @@
+From 181d67f1fbdf92d439c140df0642fbb93507c190 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 22:40:59 -0800
+Subject: [PATCH] [daveey] serve an expired same-key clean WAL-holder verdict
+ while one pass refreshes it
+
+Under GIL load a macOS libproc holder pass outran its 5 s budget, so every
+writable SessionDB open after each 30 s clean-verdict TTL blocked for 5 s
+(49 'deleted-WAL holder scan timed out' lines in one hour on laptop-1,
+2026-11-12, against Desktop deadlines of 4-10 s).
+
+_iter_darwin_sidecar_holders now returns [] at once when the cached clean
+verdict has expired but its key (sidecar identity incl. birth time) is
+unchanged and the pass that produced it is younger than
+_DARWIN_FD_STALE_CLEAN_MAX_SECONDS (300 s); it starts or joins the
+single-flight pass without waiting, which publishes under the usual rules.
+A holder now also voids any earlier clean verdict, so a positive is never
+served stale. A changed key, no prior verdict, or one older than 300 s
+keeps the blocking join and fail-open. Linux /proc walks synchronously on
+the caller with no single-flight pass, so it is left alone.
+
+Card: t_01a1d389a055fbc0
+---
+ hermes_state_dbfile.py                        |  94 ++++++---
+ ...t_darwin_fd_scan_stale_while_revalidate.py | 184 ++++++++++++++++++
+ 2 files changed, 256 insertions(+), 22 deletions(-)
+ create mode 100644 tests/hermes_state/test_darwin_fd_scan_stale_while_revalidate.py
+
+diff --git a/hermes_state_dbfile.py b/hermes_state_dbfile.py
+index 81d2e6c2d9..056ef8e865 100644
+--- a/hermes_state_dbfile.py
++++ b/hermes_state_dbfile.py
+@@ -337,7 +337,13 @@ _SCAN_THREAD = _interpreter_thread_class()
+ # verdicts are never cached. A cached verdict also holds only while the sidecars cannot have been
+ # retired since: see :func:`_darwin_clean_key`.
+ _DARWIN_FD_CLEAN_TTL_SECONDS = 30.0
+-_darwin_clean_until: dict[str, tuple[float, tuple]] = {}
++# [daveey] Past its TTL, a clean verdict whose key still matches is served for up to this long
++# (measured from the pass that produced it) while one refresh pass runs in the background: see
++# :func:`_iter_darwin_sidecar_holders`. Under GIL load a pass outran the 5 s budget, so every
++# writer open after each 30 s TTL blocked for 5 s (49 times in one hour on laptop-1, 2026-11-12).
++_DARWIN_FD_STALE_CLEAN_MAX_SECONDS = 300.0
++# ``base -> (valid until, key, recorded at)``, all monotonic seconds except the key.
++_darwin_clean_until: dict[str, tuple[float, tuple, float]] = {}
+ 
+ 
+ def _darwin_libproc():
+@@ -531,6 +537,14 @@ def _darwin_clean_cached(base: str, key: tuple) -> bool:
+     return cached is not None and cached[0] > time.monotonic() and cached[1] == key
+ 
+ 
++def _darwin_clean_servable_stale(base: str, key: tuple) -> bool:
++    """[daveey] Whether an expired clean verdict for *base* may still be served: same key, and the
++    pass that produced it is younger than ``_DARWIN_FD_STALE_CLEAN_MAX_SECONDS``."""
++    cached = _darwin_clean_until.get(base)
++    return (cached is not None and cached[1] == key and len(cached) > 2
++            and time.monotonic() - cached[2] < _DARWIN_FD_STALE_CLEAN_MAX_SECONDS)
++
++
+ class _DarwinFdScan:
+     """One libproc pass, shared by every caller that arrives while it runs.
+ 
+@@ -584,9 +598,14 @@ class _DarwinFdScan:
+                     # Publish caches and retire the flight atomically: every caller
+                     # that joined this pass has a verdict, including late joiners.
+                     for base, (key, _watched) in self.watchers.items():
+-                        if not self.verdicts[base] and _clean_key_settled(key, self.taken[base]):
++                        if self.verdicts[base]:
++                            # [daveey] A holder voids any earlier clean verdict, so it is never
++                            # served stale either.
++                            _darwin_clean_until.pop(base, None)
++                        elif _clean_key_settled(key, self.taken[base]):
++                            now = time.monotonic()
+                             _darwin_clean_until[base] = (
+-                                time.monotonic() + _DARWIN_FD_CLEAN_TTL_SECONDS, key)
++                                now + _DARWIN_FD_CLEAN_TTL_SECONDS, key, now)
+                     if _DARWIN_SCAN_IN_FLIGHT is self:
+                         _DARWIN_SCAN_IN_FLIGHT = None
+                     return
+@@ -613,6 +632,38 @@ def _darwin_holders(candidates, watched: dict[str, str]) -> list[tuple[int, str]
+ _DARWIN_SCAN_CACHED = _DarwinFdScan(0.0)  # sentinel, never run: a clean verdict appeared while waiting for the lock
+ 
+ 
++def _claim_darwin_fd_scan(base, key, watched, taken_ns) -> _DarwinFdScan | None:
++    """The in-flight pass, started if none is alive, with the caller registered as a watcher.
++
++    Caller holds ``_DARWIN_SCAN_LOCK``. ``None`` when the pass in flight is stuck past its deadline;
++    ``_DARWIN_SCAN_CACHED`` when no pass is in flight and a fresh clean verdict for *base* exists."""
++    global _DARWIN_SCAN_IN_FLIGHT
++    scan = _DARWIN_SCAN_IN_FLIGHT
++    if scan is not None and time.monotonic() > scan.deadline:
++        return None  # stuck past its deadline (kernel-blocked): it can only end expired
++    if scan is None and base is not None and key is not None and _darwin_clean_cached(base, key):
++        return _DARWIN_SCAN_CACHED
++    if scan is None:
++        scan = _DarwinFdScan(time.monotonic() + _DARWIN_FD_SCAN_TIMEOUT_SECONDS)
++        _DARWIN_SCAN_IN_FLIGHT = scan
++        try:
++            _SCAN_THREAD(target=scan.run, name=_DARWIN_FD_SCAN_THREAD_NAME, daemon=True).start()
++        except BaseException:
++            _DARWIN_SCAN_IN_FLIGHT = None
++            raise
++    if base is not None and key is not None and watched is not None:
++        if base not in scan.watchers:
++            scan.watchers[base] = (key, watched)
++            scan.taken[base] = taken_ns  # 0 (none given): nothing settles, nothing is cached
++    return scan
++
++
++def _refresh_darwin_fd_scan(base: str, key: tuple, watched: dict[str, str], taken_ns: int) -> None:
++    """[daveey] Start or join a pass for *base* without waiting for it; it publishes as usual."""
++    with _DARWIN_SCAN_LOCK:
++        _claim_darwin_fd_scan(base, key, watched, taken_ns)
++
++
+ def _join_darwin_fd_scan(base: str | None = None, key: tuple | None = None,
+                          watched: dict[str, str] | None = None,
+                          taken_ns: int = 0) -> _DarwinFdScan | None:
+@@ -621,27 +672,12 @@ def _join_darwin_fd_scan(base: str | None = None, key: tuple | None = None,
+     With *base*/*key*/*watched*, returns ``_DARWIN_SCAN_CACHED`` when a pass that just finished
+     already recorded a clean verdict for *base*, and registers the caller so the pass records its
+     verdict before it leaves the in-flight slot."""
+-    global _DARWIN_SCAN_IN_FLIGHT
+     timeout = _DARWIN_FD_SCAN_TIMEOUT_SECONDS
+     with _DARWIN_SCAN_LOCK:
+-        scan = _DARWIN_SCAN_IN_FLIGHT
+-        if scan is not None and time.monotonic() > scan.deadline:
+-            return None  # stuck past its deadline (kernel-blocked): it can only end expired
+-        if scan is None and base is not None and key is not None and _darwin_clean_cached(base, key):
+-            return _DARWIN_SCAN_CACHED
+-        if scan is None:
+-            scan = _DarwinFdScan(time.monotonic() + timeout)
+-            _DARWIN_SCAN_IN_FLIGHT = scan
+-            try:
+-                _SCAN_THREAD(target=scan.run, name=_DARWIN_FD_SCAN_THREAD_NAME, daemon=True).start()
+-            except BaseException:
+-                _DARWIN_SCAN_IN_FLIGHT = None
+-                raise
++        scan = _claim_darwin_fd_scan(base, key, watched, taken_ns)
++        if scan is None or scan is _DARWIN_SCAN_CACHED:
++            return scan
+         scan.waiters += 1
+-        if base is not None and key is not None and watched is not None:
+-            if base not in scan.watchers:
+-                scan.watchers[base] = (key, watched)
+-                scan.taken[base] = taken_ns  # 0 (none given): nothing settles, nothing is cached
+     try:
+         # ponytail: a kernel-blocked proc_pidfdinfo cannot be interrupted, so that one thread
+         # may outlive us; it is the only one, and it dies with the process.
+@@ -658,7 +694,18 @@ def _iter_darwin_sidecar_holders(db_path) -> list[tuple[int, str]]:
+ 
+     The watched side is resolved with ``os.path.realpath`` because libproc reports the kernel's
+     path for the vnode, while ``os.path.abspath`` does not resolve symlinks -- a textual compare
+-    of the two silently misses every sidecar under a symlinked prefix (on macOS ``/var`` itself)."""
++    of the two silently misses every sidecar under a symlinked prefix (on macOS ``/var`` itself).
++
++    [daveey] Stale-while-revalidate: once a clean verdict's TTL has passed, the open still returns
++    ``[]`` at once when the key is unchanged and the verdict's pass is younger than
++    ``_DARWIN_FD_STALE_CLEAN_MAX_SECONDS``, and only starts (or joins) a refresh pass in the
++    background, which publishes under the usual rules (a holder is never cached and voids the old
++    verdict). A changed key, no prior clean verdict, or one older than that bound still blocks on
++    the pass and fails open after the budget, as before. Safe because a retired generation needs a
++    watched sidecar path to be unlinked, renamed away or replaced, which changes the path's identity
++    and so the key (:func:`_darwin_clean_key`): with the key unchanged since a clean pass, nothing
++    can have been retired since, so that pass's verdict is no weaker than the fail-open ``[]`` the
++    open would return anyway when a pass outruns its budget under GIL load."""
+     base = os.path.realpath(os.path.abspath(os.fspath(db_path)))
+     # APFS/HFS+ are case-insensitive by default and libproc reports the pathname as the opener
+     # spelled it; ``os.path.normcase`` is the identity on darwin, so fold case here.
+@@ -667,6 +714,9 @@ def _iter_darwin_sidecar_holders(db_path) -> list[tuple[int, str]]:
+     key = _darwin_clean_key(base)  # taken before the pass, so a change during it invalidates
+     if _darwin_clean_cached(base, key):
+         return []
++    if _darwin_clean_servable_stale(base, key):
++        _refresh_darwin_fd_scan(base, key, watched, taken_ns)
++        return []
+     scan = _join_darwin_fd_scan(base, key, watched, taken_ns)
+     if scan is _DARWIN_SCAN_CACHED:
+         return []
+diff --git a/tests/hermes_state/test_darwin_fd_scan_stale_while_revalidate.py b/tests/hermes_state/test_darwin_fd_scan_stale_while_revalidate.py
+new file mode 100644
+index 0000000000..5abb3ab0c7
+--- /dev/null
++++ b/tests/hermes_state/test_darwin_fd_scan_stale_while_revalidate.py
+@@ -0,0 +1,184 @@
++"""[daveey] Expired-but-unchanged clean verdicts are served while one pass refreshes them.
++
++Under GIL load a libproc pass outran its 5 s budget, so every writable SessionDB open after each
++30 s clean-verdict TTL blocked for the full 5 s (49 ``deleted-WAL holder scan timed out`` lines in
++one hour on laptop-1, 2026-11-12). With the key unchanged since a clean pass nothing can have been
++retired, so the open now returns that verdict at once and refreshes in the background; a changed
++key, a verdict older than ``_DARWIN_FD_STALE_CLEAN_MAX_SECONDS`` or a holder still block as before.
++libproc is faked with a slow pass, so these run on every platform.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import os
++import struct
++import threading
++import time
++
++import pytest
++
++import hermes_state_dbfile as dbfile
++from hermes_state_dbfile import (
++    _DARWIN_FD_DEV_OFFSET,
++    _DARWIN_FD_INO_OFFSET,
++    _DARWIN_FD_PATH_OFFSET,
++    _DARWIN_FD_RECORD_SIZE,
++    _iter_darwin_sidecar_holders,
++)
++
++SLOW_PASS = 2.0  # an injected slow scan, far below the 5 s budget
++BUDGET = 5.0
++GUARD = 30.0
++
++
++@pytest.fixture(autouse=True)
++def _fresh_scan_state(monkeypatch, settled_clean_keys):
++    monkeypatch.setattr(dbfile, "_darwin_clean_until", {})
++    monkeypatch.setattr(dbfile, "_DARWIN_SCAN_IN_FLIGHT", None)
++    monkeypatch.setattr(dbfile, "_DARWIN_FD_SCAN_TIMEOUT_SECONDS", BUDGET)
++    monkeypatch.setattr(dbfile, "_darwin_all_pids", lambda _lib: [4242])
++    yield
++    scan = dbfile._DARWIN_SCAN_IN_FLIGHT
++    if scan is not None:
++        scan.done.wait(GUARD)
++
++
++class _SlowLibproc:
++    """One pid whose fd listing takes ``delay``; with a ``target`` it holds that path at ``identity``."""
++
++    def __init__(self, delay, target=None, identity=(0xDEAD, 0xBEEF)):
++        self.delay = delay
++        self.target = target
++        self.identity = identity
++        self.passes = 0
++
++    def proc_pidinfo(self, pid, flavor, arg, buf, size):
++        self.passes += 1
++        threading.Event().wait(self.delay)  # health: allow HX013 -- the slow pass IS the behaviour under test
++        if self.target is None:
++            return 0  # no fds: a clean pass
++        payload = struct.pack("<iI", 7, 1)
++        ctypes.memmove(buf, payload, len(payload))
++        return len(payload)
++
++    def proc_pidfdinfo(self, pid, fd, flavor, record, size):
++        blob = bytearray(_DARWIN_FD_RECORD_SIZE)
++        struct.pack_into("<I", blob, _DARWIN_FD_DEV_OFFSET, self.identity[0])
++        struct.pack_into("<Q", blob, _DARWIN_FD_INO_OFFSET, self.identity[1])
++        encoded = self.target.encode("utf-8")
++        blob[_DARWIN_FD_PATH_OFFSET:_DARWIN_FD_PATH_OFFSET + len(encoded)] = encoded
++        ctypes.memmove(record, bytes(blob), len(blob))
++        return 1
++
++
++def _db_with_sidecars(tmp_path):
++    db = tmp_path / "state.db"
++    for suffix in ("", "-wal", "-shm"):
++        (tmp_path / f"state.db{suffix}").write_bytes(b"x")
++    base = os.path.realpath(os.fspath(db))
++    return db, base
++
++
++def _plant_clean_verdict(base, *, age, key=None):
++    """A clean verdict recorded ``age`` seconds ago whose 30 s TTL has passed."""
++    now = time.monotonic()
++    recorded = now - age
++    dbfile._darwin_clean_until[base] = (
++        min(recorded + dbfile._DARWIN_FD_CLEAN_TTL_SECONDS, now - 0.001),
++        dbfile._darwin_clean_key(base) if key is None else key,
++        recorded,
++    )
++
++
++def _timed(db):
++    started = time.monotonic()
++    result = _iter_darwin_sidecar_holders(db)
++    return result, time.monotonic() - started
++
++
++def _wait_refresh():
++    scan = dbfile._DARWIN_SCAN_IN_FLIGHT
++    assert scan is not None, "no refresh pass was started"
++    assert scan.done.wait(GUARD)
++
++
++def test_expired_same_key_verdict_returns_at_once_and_refreshes(monkeypatch, tmp_path):
++    """(a) The open must not wait on the slow pass; the pass still runs and renews the verdict."""
++    db, base = _db_with_sidecars(tmp_path)
++    lib = _SlowLibproc(SLOW_PASS)
++    monkeypatch.setattr(dbfile, "_darwin_libproc", lambda: lib)
++    _plant_clean_verdict(base, age=60)
++    old_recorded = dbfile._darwin_clean_until[base][2]
++
++    result, elapsed = _timed(db)
++
++    assert result == []
++    assert elapsed < 0.05, f"stale clean verdict blocked the open for {elapsed:.2f}s"
++    _wait_refresh()
++    assert lib.passes == 1
++    until, key, recorded = dbfile._darwin_clean_until[base]
++    assert key == dbfile._darwin_clean_key(base)
++    assert recorded > old_recorded and until > time.monotonic(), "the refresh did not renew the verdict"
++
++
++def test_changed_key_still_blocks_and_reports_a_holder(monkeypatch, tmp_path):
++    """(b) A sidecar unlinked since the clean pass changes the key: the open waits for the pass
++    and its positive verdict, so the refusal still happens."""
++    db, base = _db_with_sidecars(tmp_path)
++    _plant_clean_verdict(base, age=60)
++    os.unlink(base + "-wal")  # a retired generation: some process still holds the old inode
++    lib = _SlowLibproc(SLOW_PASS, target=base + "-wal")
++    monkeypatch.setattr(dbfile, "_darwin_libproc", lambda: lib)
++
++    result, elapsed = _timed(db)
++
++    assert result == [(4242, base + "-wal")]
++    assert elapsed >= SLOW_PASS * 0.9, "a changed key must wait for the pass"
++    assert base not in dbfile._darwin_clean_until
++
++
++def test_positive_verdict_is_never_served_stale(monkeypatch, tmp_path):
++    """(c) Even with an unchanged key, a refresh that finds a holder voids the clean verdict, so
++    the next open blocks and refuses instead of being served the old ``[]``."""
++    db, base = _db_with_sidecars(tmp_path)
++    _plant_clean_verdict(base, age=60)
++    lib = _SlowLibproc(0.2, target=base + "-wal")  # identity differs from the path's inode
++    monkeypatch.setattr(dbfile, "_darwin_libproc", lambda: lib)
++
++    assert _iter_darwin_sidecar_holders(db) == []  # served stale while the refresh runs
++    _wait_refresh()
++    assert base not in dbfile._darwin_clean_until, "a positive refresh left the clean verdict cached"
++
++    result, elapsed = _timed(db)
++    assert result == [(4242, base + "-wal")]
++    assert elapsed >= 0.2 * 0.9
++    assert base not in dbfile._darwin_clean_until
++
++
++def test_verdict_older_than_stale_bound_blocks(monkeypatch, tmp_path):
++    """(d) Past ``_DARWIN_FD_STALE_CLEAN_MAX_SECONDS`` the open waits for a fresh pass."""
++    db, base = _db_with_sidecars(tmp_path)
++    assert dbfile._DARWIN_FD_STALE_CLEAN_MAX_SECONDS == 300
++    _plant_clean_verdict(base, age=dbfile._DARWIN_FD_STALE_CLEAN_MAX_SECONDS + 1)
++    lib = _SlowLibproc(SLOW_PASS)
++    monkeypatch.setattr(dbfile, "_darwin_libproc", lambda: lib)
++
++    result, elapsed = _timed(db)
++
++    assert result == []
++    assert elapsed >= SLOW_PASS * 0.9, "a verdict past the stale bound must not be served"
++    assert lib.passes == 1
++    assert dbfile._darwin_clean_until[base][0] > time.monotonic()
++
++
++def test_no_prior_verdict_blocks(monkeypatch, tmp_path):
++    """No clean verdict at all keeps today's blocking join."""
++    db, _base = _db_with_sidecars(tmp_path)
++    lib = _SlowLibproc(SLOW_PASS)
++    monkeypatch.setattr(dbfile, "_darwin_libproc", lambda: lib)
++
++    result, elapsed = _timed(db)
++
++    assert result == []
++    assert elapsed >= SLOW_PASS * 0.9
+-- 
+2.51.0
+

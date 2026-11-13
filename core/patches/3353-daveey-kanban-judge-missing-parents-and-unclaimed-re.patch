@@ -1,0 +1,378 @@
+From 6c473abf5b7dd636c9daf5b211d9c04ce9200876 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:40:34 +0000
+Subject: [PATCH] [daveey] kanban: judge missing parents and unclaimed-ready
+ notices only from a copy at the feed head
+
+A sync round stuck in a long pull (2026-11-12, laptop-1 ~75k changes behind) left the
+remote-parent mirror and the live board old. The missing-parent detector then blocked two
+rework cards whose parents were done on the Board and filed repair cards, and the 30-min
+"ready with no worker" notices reported three cards that were running or scheduled elsewhere.
+
+New kanban_replica_freshness: the replica's mark_pulled stamp (pulled_at, written only after a
+pull reaches the feed head) must be within 600 s on the same board.
+- note_missing_parents (readiness txn): on a synced board an absent parent is unknown unless the
+  replica is at head: no parent_missing streak event, no block, one DEBUG line
+  'parent status unknown: replica not at head'. A fresh replica that lacks the parent still
+  blocks and files one repair card.
+- kanban_parent_unclaimed.sweep: no notice while the replica shows lag (kanban_chat_wait.sweep is
+  covered by main's lag_hold, t_01a1d390d19239dd, now in the same module);
+  the ready timer keeps running, so a card still unclaimed after catch-up is reported next tick.
+
+Recurrence: hub t_01a1d2c873e82536 (18:41 PT) was the same false positive (hub mirror got the
+done parent only after a delayed replica pull).
+---
+ hermes_cli/kanban_db.py                       | 10 +-
+ hermes_cli/kanban_db_graph.py                 | 22 ++++-
+ hermes_cli/kanban_parent_unclaimed.py         |  6 +-
+ hermes_cli/kanban_replica_freshness.py        | 60 ++++++++++++
+ .../test_kanban_cross_gateway_parents.py      | 60 ++++++++++++
+ .../test_kanban_replica_freshness.py          | 91 +++++++++++++++++++
+ 6 files changed, 241 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_replica_freshness.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 584e192d08..30478e6a6e 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1931,7 +1931,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None)
+     remote = _sync.has_remote_parents(conn)
+     releases = kanban_review_release.prepare(conn, failure_limit)
+     with write_txn(conn):
+-        copies = foreign_ids(conn)
++        copies, fresh = foreign_ids(conn), {}  # fresh: the mirror-freshness verdict, read once per pass
+         todo_rows = conn.execute(
+             "SELECT id, status, consecutive_failures, max_retries "
+             "FROM tasks WHERE status IN ('todo', 'blocked') OR ("
+@@ -1951,7 +1951,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None)
+             if recovery_held(conn, row, failure_limit):
+                 continue
+             states = parent_states(conn, task_id, remote=remote)
+-            if cur_status == "todo" and _note_missing_parents(conn, task_id, states):
++            if cur_status == "todo" and _note_missing_parents(conn, task_id, states, remote=remote, fresh=fresh):
+                 continue
+             if all(st in ("done", "archived") for _pid, st in states):
+                 resume_status = _resume_status_from_events(conn, task_id)
+@@ -2005,13 +2005,13 @@ def parent_states(
+ 
+ 
+ def _note_missing_parents(
+-    conn: sqlite3.Connection, task_id: str, states: list[tuple[str, Optional[str]]],
++    conn: sqlite3.Connection, task_id: str, states: list[tuple[str, Optional[str]]], *, remote=False, fresh=None,
+ ) -> bool:
+     """Inside :func:`recompute_ready`'s txn, for a ``todo`` child: record when a parent goes missing
+     (``parent_missing`` event, once per streak), clear the streak when it comes back (``parent_found``), and block
+-    the child after :data:`PARENT_MISSING_BLOCK_SECONDS`. True when the child was blocked here."""
++    the child after :data:`PARENT_MISSING_BLOCK_SECONDS` (synced: fresh mirror only). True when blocked here."""
+     from hermes_cli.kanban_db_graph import note_missing_parents
+-    return note_missing_parents(conn, task_id, states)
++    return note_missing_parents(conn, task_id, states, remote=remote, fresh=fresh)
+ 
+ 
+ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
+diff --git a/hermes_cli/kanban_db_graph.py b/hermes_cli/kanban_db_graph.py
+index ea2d739785..f7805a88be 100644
+--- a/hermes_cli/kanban_db_graph.py
++++ b/hermes_cli/kanban_db_graph.py
+@@ -1,19 +1,37 @@
+ """Task graph initialization and atomic decomposition persistence."""
+ from __future__ import annotations
+ 
++import logging
+ import sqlite3
+ import time
+ from typing import Any, Optional
+ 
++_log = logging.getLogger(__name__)
++
++
+ def note_missing_parents(
+-    conn: sqlite3.Connection, task_id: str, states: list[tuple[str, Optional[str]]],
++    conn: sqlite3.Connection, task_id: str, states: list[tuple[str, Optional[str]]], *,
++    remote: bool = False, fresh: Optional[dict] = None,
+ ) -> bool:
+-    """Track a missing-parent streak inside the home gateway's readiness transaction."""
++    """Track a missing-parent streak inside the home gateway's readiness transaction.
++
++    On a synced board (``remote``) a parent with no status is unknown, not missing, unless the mirror's replica is
++    at the feed head (``kanban_replica_freshness.replica_at_head``, read once per readiness pass into ``fresh``):
++    otherwise no streak event is recorded and nothing is blocked. The child still waits: an unknown parent gates."""
+     from hermes_cli import kanban_db as kb
+ 
+     if not states:
+         return False
+     missing = [pid for pid, st in states if st is None]
++    if missing and remote:
++        from hermes_cli.kanban_replica_freshness import replica_at_head
++        cache = {} if fresh is None else fresh
++        if "fresh" not in cache:
++            cache["fresh"] = replica_at_head(conn)
++            if not cache["fresh"]:
++                _log.debug("parent status unknown: replica not at head")
++        if not cache["fresh"]:
++            return False
+     last = conn.execute(
+         "SELECT kind, created_at FROM task_events WHERE task_id = ? AND kind IN ('parent_missing', 'parent_found') "
+         "ORDER BY id DESC LIMIT 1", (task_id,),
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index 56537fef76..14db23e23d 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -154,9 +154,13 @@ _CANDIDATES = (
+ def sweep(conn, *, now: Optional[float] = None) -> int:
+     """Append the once-per-wait notice for every qualifying (child, parent); returns how many were appended."""
+     from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_replica_freshness import local_copy_stale
+     now = time.time() if now is None else now
+     posted = 0
+-    for row in conn.execute(_CANDIDATES).fetchall():
++    rows = conn.execute(_CANDIDATES).fetchall()
++    if rows and local_copy_stale(conn, "parent-unclaimed notice"):  # a stale copy's "unclaimed" proves nothing
++        return 0
++    for row in rows:
+         wait = conn.execute(
+             "SELECT id, created_at FROM task_events WHERE task_id = ? AND kind = 'dependency_wait' "
+             "ORDER BY id DESC LIMIT 1", (row["child"],)).fetchone()
+diff --git a/hermes_cli/kanban_replica_freshness.py b/hermes_cli/kanban_replica_freshness.py
+index 910dde00b7..564559881d 100644
+--- a/hermes_cli/kanban_replica_freshness.py
++++ b/hermes_cli/kanban_replica_freshness.py
+@@ -18,6 +18,14 @@ without bound; on an ``off``/disabled board the replica stays on disk while pull
+   stalled sync loop stops both copies, so the row gap alone cannot see it).
+ - :func:`newer_rows`: the replica's rows of some cards where they carry a newer Board revision (``sync_version``)
+   than the live rows.
++
++Absence judgements read the replica's own freshness instead (t_01a1d36dcde2b6ed, 2026-11-12, laptop-1: a sync round
++stuck in a ~75k-change pull left the remote-parent mirror old, and the missing-parent detector blocked two rework
++cards whose parents were done on the Board and filed repair cards):
++
++- :func:`replica_at_head`: the replica last pulled to the feed head within :data:`FRESH_SECONDS` on the same board.
++  The missing-parent detector (``kanban_db_graph.note_missing_parents``) fails closed on it: no proof, no block.
++- :func:`local_copy_stale`: the parent-unclaimed notice waits while a synced board's replica shows lag.
+ """
+ from __future__ import annotations
+ 
+@@ -142,3 +150,55 @@ def moved_past(row: Optional[dict[str, Any]]) -> Optional[str]:
+     if row.get("ready_since") and row.get("live_ready_since") and row["ready_since"] != row["live_ready_since"]:
+         return f"replica has a later ready episode (revision {row['sync_version']})"
+     return None
++
++
++# --- absence judgements: is the replica itself at the feed head? (t_01a1d36dcde2b6ed) ---------------------------
++
++# The last pull must have reached the feed head this recently.
++FRESH_SECONDS = REPLICA_STALE_SECONDS
++
++
++def replica_at_head(conn: sqlite3.Connection) -> bool:
++    """Whether the replica of ``conn``'s synced board last pulled to the feed head within :data:`FRESH_SECONDS`, on
++    the same board. A missing, unreadable, other-board, unstamped or future-stamped replica is not at head."""
++    return _replica_at_head(conn) is True
++
++
++def _replica_at_head(conn: sqlite3.Connection):
++    """True/False as :func:`replica_at_head`; None when there is no readable replica to judge by."""
++    from hermes_cli.kanban_db_connect import _main_db_file
++    from hermes_cli.kanban_foreign_card import open_replica
++
++    try:
++        local = conn.execute("SELECT board_id FROM kanban_sync_state LIMIT 1").fetchone()
++        if local is None:
++            return None
++        with open_replica(_main_db_file(conn)) as replica:
++            if replica is None:
++                return None
++            state = replica.execute("SELECT board_id, pulled_at FROM kanban_sync_state LIMIT 1").fetchone()
++    except (sqlite3.Error, OSError, ValueError):
++        return None
++    if state is None or state["board_id"] != local["board_id"]:
++        return False
++    pulled = state["pulled_at"]
++    return type(pulled) in (int, float) and 0 <= time.time() - pulled <= FRESH_SECONDS
++
++
++def synced(conn: sqlite3.Connection) -> bool:
++    """Whether ``conn`` is a board the Board service syncs (mode ``primary`` or ``shadow``)."""
++    try:
++        row = conn.execute("SELECT mode FROM kanban_sync_state LIMIT 1").fetchone()
++    except sqlite3.Error:
++        return False
++    return row is not None and row["mode"] in ("primary", "shadow")
++
++
++def local_copy_stale(conn: sqlite3.Connection, what: str) -> bool:
++    """True (and one DEBUG line naming ``what``) when ``conn`` is a synced board whose replica shows it is not at
++    the feed head. An unsynced board is its own authority, and with no readable replica there is no evidence of
++    lag: both are never stale here (a notice is a report, unlike the missing-parent block, which needs proof)."""
++    if not synced(conn) or _replica_at_head(conn) is not False:
++        return False
++    _log.debug("%s: local copy not at the feed head; deferring to the next tick", what)
++    return True
+diff --git a/tests/hermes_cli/test_kanban_cross_gateway_parents.py b/tests/hermes_cli/test_kanban_cross_gateway_parents.py
+index 0ceb3b5779..3be5c9aed4 100644
+--- a/tests/hermes_cli/test_kanban_cross_gateway_parents.py
++++ b/tests/hermes_cli/test_kanban_cross_gateway_parents.py
+@@ -223,3 +223,63 @@ def test_a_worker_node_does_not_copy_a_ready_card_whose_parent_is_open(kanban_ho
+         assert {r["id"] for r in wn.candidates(replica, OTHER)} == {"t_c", "t_free"}
+     finally:
+         replica.close()
++
++
++# --- synced board: the mirror's silence counts only when its replica is at the feed head ----------------------
++# 2026-11-12, laptop-1: a sync round stuck for hours in a long pull never refreshed the remote-parent mirror, so two
++# rework cards whose parents were done on the Board were blocked "parent ... missing" and two repair cards filed.
++
++def _stamp_replica(at):
++    replica = kbc.connect(ksc.shadow_path(BOARD))
++    try:
++        with kbc.write_txn(replica):
++            replica.execute("UPDATE kanban_sync_state SET pulled_at = ?", (at,))
++    finally:
++        replica.close()
++
++
++def _repairs(conn, child):
++    return conn.execute("SELECT id FROM tasks WHERE created_by = 'missing-parent-detector' AND title LIKE ?",
++                        (f"%{child}",)).fetchall()
++
++
++def _age_streak(conn, child):
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE task_events SET created_at = created_at - ? WHERE task_id = ? AND kind = 'parent_missing'",
++                     (kb.PARENT_MISSING_BLOCK_SECONDS + 1, child))
++
++
++def test_a_stale_replica_never_starts_or_expires_a_missing_parent_streak(live, svc, kanban_home):
++    child = kb.create_task(live, title="child", assignee="worker")
++    _round(kanban_home, svc)  # the replica exists and holds the Board
++    _link_raw(live, "t_after_offline", child)  # a foreign parent the stalled round never mirrored
++    _stamp_replica(time.time() - kb.PARENT_MISSING_BLOCK_SECONDS - 1)  # last reached the feed head > 10 min ago
++    assert kb.parent_states(live, child) == [("t_after_offline", None)]
++    kb.recompute_ready(live)
++    assert not _events(live, child, "parent_missing")  # before the fix: the streak started from stale evidence
++    assert kb.get_task(live, child).status == "todo"  # an unknown parent still gates
++    # A streak begun while the replica was fresh is not expired by a replica that has since gone stale.
++    with kbc.write_txn(live):
++        kb._append_event(live, child, "parent_missing", {"parents": ["t_after_offline"]})
++    _age_streak(live, child)
++    kb.recompute_ready(live)
++    assert kb.get_task(live, child).status == "todo" and not _events(live, child, "blocked")
++    assert not _repairs(live, child)
++
++
++def test_a_fresh_replica_that_lacks_the_parent_still_blocks_and_files_one_repair(live, svc, kanban_home):
++    child = kb.create_task(live, title="child", assignee="worker")
++    _round(kanban_home, svc)
++    _link_raw(live, "t_ghost", child)
++    _stamp_replica(time.time())  # at the feed head now: the Board really has no t_ghost
++    kb.recompute_ready(live)
++    assert len(_events(live, child, "parent_missing")) == 1
++    assert kb.get_task(live, child).status == "todo"
++    _age_streak(live, child)
++    kb.recompute_ready(live)
++    t = kb.get_task(live, child)
++    assert (t.status, t.block_kind) == ("blocked", "transient")
++    [(payload, _at)] = _events(live, child, "blocked")
++    assert "parent t_ghost missing from this board" in payload
++    kb.recompute_ready(live)
++    assert len(_repairs(live, child)) == 1
+diff --git a/tests/hermes_cli/test_kanban_replica_freshness.py b/tests/hermes_cli/test_kanban_replica_freshness.py
+new file mode 100644
+index 0000000000..f4f83d9218
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replica_freshness.py
+@@ -0,0 +1,91 @@
++"""Ready-and-unclaimed notices judge only from a copy at the feed head. [daveey]
++
++2026-11-12 22:07-22:12 PT: laptop-1's live board was ~74k changes behind the Board (its sync round was stuck in a
++long pull). The 30-minute "ready with no worker" notice told a chat that three cards had no worker while on the Board
++one was running on worker-2, one was scheduled on its CI wake-check and one was running on worker-3. Neither the
++direct chat-wait sweep nor the parent-unclaimed sweep may judge "unclaimed" from a copy whose replica last reached
++the feed head more than ``kanban_replica_freshness.FRESH_SECONDS`` ago; the ready timer keeps running, so a card still
++unclaimed after catch-up is reported on the next tick.
++"""
++from __future__ import annotations
++
++import time
++
++from hermes_cli import kanban_chat_wait as cw
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_notify as kn
++from hermes_cli import kanban_parent_unclaimed as pu
++from hermes_cli import kanban_replica_freshness as fresh
++from tests.hermes_cli import test_kanban_cross_gateway_parents as cg
++
++kanban_home, svc, live = cg.kanban_home, cg.svc, cg.live
++STALE = fresh.FRESH_SECONDS + 1
++
++
++def _count(conn, tid, kind):
++    return conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = ?", (tid, kind)).fetchone()[0]
++
++
++def _backdate(conn, ids, seconds):
++    then = int(time.time()) - seconds
++    for tid in ids:
++        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (then, tid))
++        conn.execute("UPDATE task_events SET created_at = ? WHERE task_id = ?", (then, tid))
++    conn.commit()
++
++
++def _chat_ready_card(conn, kanban_home, svc):
++    tid = kb.create_task(conn, title="ready card a chat waits on", assignee="worker")
++    conn.execute("UPDATE tasks SET session_id = 'origin' WHERE id = ?", (tid,))
++    conn.commit()
++    cg._round(kanban_home, svc)  # the replica exists, stamped at the feed head
++    _backdate(conn, [tid], 31 * 60)
++    return tid
++
++
++def _waiting_child(conn, kanban_home, svc):
++    parent = kb.create_task(conn, title="parent", assignee="default", initial_status="running")
++    child = kb.create_task(conn, title="child", assignee="default", parents=[parent])
++    kn.add_notify_sub(conn, task_id=child, platform="tui", chat_id="origin-chat", delivery_metadata={"reason": "x"})
++    cg._round(kanban_home, svc)
++    _backdate(conn, [parent, child], 31 * 60)
++    return parent, child
++
++
++def test_chat_wait_sends_nothing_from_a_stale_copy_then_reports_after_catch_up(live, svc, kanban_home):
++    tid = _chat_ready_card(live, kanban_home, svc)
++    cg._stamp_replica(time.time() - STALE)
++    assert cw.sweep(live) == 0  # before the fix: "ready 30 min with no worker" from a copy 74k changes behind
++    assert _count(live, tid, cw.NOTICE_KIND) == 0
++    cg._stamp_replica(time.time())  # caught up and the card is really still unclaimed: the next tick reports it
++    assert cw.sweep(live) == 1
++    assert _count(live, tid, cw.NOTICE_KIND) == 1
++
++
++def test_chat_wait_from_a_fresh_copy_is_unchanged(live, svc, kanban_home):
++    tid = _chat_ready_card(live, kanban_home, svc)
++    assert cw.sweep(live) == 1 and cw.sweep(live) == 0
++    assert _count(live, tid, cw.NOTICE_KIND) == 1
++
++
++def test_parent_unclaimed_sends_nothing_from_a_stale_copy(live, svc, kanban_home):
++    parent, child = _waiting_child(live, kanban_home, svc)
++    assert kb.get_task(live, parent).status == "ready" and kb.get_task(live, child).status == "todo"
++    cg._stamp_replica(time.time() - STALE)
++    assert pu.sweep(live) == 0
++    assert _count(live, child, pu.NOTICE_KIND) == 0
++    cg._stamp_replica(time.time())
++    assert pu.sweep(live) == 1
++    assert _count(live, child, pu.NOTICE_KIND) == 1
++
++
++def test_an_unsynced_board_is_its_own_authority(tmp_path, monkeypatch):
++    from tests.hermes_cli import kanban_sync_support as support
++    from hermes_cli import kanban_db_connect as kbc
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, False)
++    conn = kbc.connect(home / "kanban.db")
++    try:
++        assert not fresh.local_copy_stale(conn, "test")
++    finally:
++        conn.close()
+-- 
+2.51.0
+

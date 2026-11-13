@@ -1,0 +1,230 @@
+From 57a73059ec1e6c4a18f0e99019e609f93b31fe53 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 03:11:48 +0000
+Subject: [PATCH] fix(terminal): background spawns get the foreground's Hermes
+ PATH dirs; flag masked missing commands [daveey]
+
+Background terminal commands built PATH via _terminal_env(_sanitize_subprocess_env(...)),
+which never appended the sane / Hermes-managed ($HERMES_HOME/bin, pm node) / ~/.local/bin
+dirs that the foreground _make_run_env adds. On a systemd gateway (hermes-hub) whose
+service PATH lacks ~/.hermes/bin, terminal(background=true) could not find hermes-core-wt
+while the foreground could (self-heal defect agent-dab059c232).
+
+- _terminal_env now applies _user_tools_first(_append_missing_sane_path_entries(...)),
+  the same composition as _make_run_env (pipe and PTY spawns both use it).
+- terminal_hints: missing-command shapes ("command not found", "failed to run command
+  'x': No such file", env/nice/timeout ENOENT) count as failure shapes, so an exit-0
+  `... | tail` over them gets the masked-success hint.
+- process_manage poll/wait/log exited-0 results get the same hint.
+
+Tests: tests/tools/test_background_spawn_path_parity.py (red on main), new
+TestMaskedMissingCommand / TestProcessResultMaskedHint in test_terminal_hints.py.
+---
+ .../test_background_spawn_path_parity.py      | 43 +++++++++++++++
+ tests/tools/test_terminal_hints.py            | 52 +++++++++++++++++++
+ tools/environments/local.py                   |  8 ++-
+ tools/process_registry.py                     |  4 +-
+ tools/process_registry_wait_policy.py         | 18 +++++++
+ tools/terminal_hints.py                       |  7 +++
+ 6 files changed, 128 insertions(+), 4 deletions(-)
+ create mode 100644 tests/tools/test_background_spawn_path_parity.py
+
+diff --git a/tests/tools/test_background_spawn_path_parity.py b/tests/tools/test_background_spawn_path_parity.py
+new file mode 100644
+index 0000000000..a405a8ed9f
+--- /dev/null
++++ b/tests/tools/test_background_spawn_path_parity.py
+@@ -0,0 +1,43 @@
++"""Background terminal PATH matches the foreground's Hermes-managed dirs.
++
++A gateway started by systemd lacks ``$HERMES_HOME/bin`` on PATH. The foreground
++terminal (``_make_run_env``) appended it, the background spawn
++(``ProcessRegistry._spawn_env``) did not, so ``terminal(background=true)`` ran
++``hermes-core-wt`` as "No such file or directory" on the hub while the same
++command in the foreground worked.
++"""
++
++import os
++
++import pytest
++
++from tools.environments import local as local_mod
++from tools.environments.local import _make_run_env
++from tools.process_registry import ProcessRegistry
++
++pytestmark = pytest.mark.platforms("posix")
++
++
++@pytest.fixture
++def hermes_bin(monkeypatch, tmp_path):
++    home = tmp_path / "hermes-home"
++    (home / "bin").mkdir(parents=True)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HOME", str(tmp_path / "user-home"))
++    monkeypatch.setenv("PATH", "/usr/bin:/bin")
++    monkeypatch.setattr(local_mod, "_git_bash_bin_dirs", list)
++    monkeypatch.setattr(local_mod, "_resolve_hermes_bin_dir", lambda: None)
++    return str(home / "bin")
++
++
++def test_background_spawn_env_has_hermes_home_bin(hermes_bin):
++    entries = ProcessRegistry._spawn_env({})["PATH"].split(os.pathsep)
++    assert hermes_bin in entries
++    # The user's own entries keep precedence over appended Hermes dirs.
++    assert entries.index("/usr/bin") < entries.index(hermes_bin)
++
++
++def test_background_path_is_superset_of_foreground_path(hermes_bin):
++    foreground = set(_make_run_env({})["PATH"].split(os.pathsep))
++    background = set(ProcessRegistry._spawn_env({})["PATH"].split(os.pathsep))
++    assert foreground - background == set()
+diff --git a/tests/tools/test_terminal_hints.py b/tests/tools/test_terminal_hints.py
+index f61dd268f1..d0e6c2db54 100644
+--- a/tests/tools/test_terminal_hints.py
++++ b/tests/tools/test_terminal_hints.py
+@@ -2,6 +2,7 @@
+ 
+ from unittest.mock import patch as mock_patch
+ 
++import pytest
+ 
+ from tools.terminal_hints import annotate_failure, annotate_masked_success
+ 
+@@ -275,3 +276,54 @@ class TestStatusEchoWrapper:
+         out = "error: could not compile `x`\n"
+         assert "pipeline" in (annotate_masked_success("cargo build | tail -5", out) or "")
+         assert "`||` fallback" in (annotate_masked_success("cargo build || echo FAILED", out) or "")
++
++
++class TestMaskedMissingCommand:
++    """A missing command hidden behind a pipe's exit 0 (incident agent-dab059c232: a background
++    `timeout 600 hermes-core-wt test ... | tail -15` printed `timeout: failed to run command
++    'hermes-core-wt': No such file or directory` and reported exit 0)."""
++
++    INCIDENT = "timeout 600 hermes-core-wt test --wt x tests/foo.py 2>&1 | tail -15"
++
++    @pytest.mark.parametrize("output", [
++        "timeout: failed to run command 'hermes-core-wt': No such file or directory\n",
++        "timeout: failed to run command \u2018hermes-core-wt\u2019: No such file or directory\n",
++        "bash: line 1: hermes-core-wt: command not found\n",
++        "nice: \u2018hermes-core-wt\u2019: No such file or directory\n",
++        "env: 'hermes-core-wt': No such file or directory\n",
++    ])
++    def test_missing_command_behind_pipe_flagged(self, output):
++        assert "pipeline" in (annotate_masked_success(self.INCIDENT, output) or "")
++
++    def test_ordinary_no_such_file_not_flagged(self):
++        # A plain ENOENT from a tool's own file argument is content, not a missing command.
++        out = "cat: notes.txt: No such file or directory\n"
++        assert annotate_masked_success("make docs 2>&1 | tail -5", out) is None
++
++
++class TestProcessResultMaskedHint:
++    """poll/wait results on a background process carry the same masked-success hint as the
++    foreground terminal result and the completion notice."""
++
++    def test_wait_result_gets_hint(self, monkeypatch):
++        import json
++
++        from tools import process_registry as pr
++
++        result = {"session_id": "proc_x", "status": "exited", "exit_code": 0,
++                  "command": TestMaskedMissingCommand.INCIDENT,
++                  "output": "timeout: failed to run command 'hermes-core-wt': No such file or directory\n"}
++        monkeypatch.setitem(pr._SESSION_ACTIONS, "wait", (lambda sid, a: dict(result), True))
++        out = json.loads(pr._handle_process({"action": "wait", "session_id": "proc_x"}))
++        assert "pipeline" in out.get("hint", ""), out
++
++    def test_clean_wait_result_has_no_hint(self, monkeypatch):
++        import json
++
++        from tools import process_registry as pr
++
++        result = {"session_id": "proc_x", "status": "exited", "exit_code": 0,
++                  "command": TestMaskedMissingCommand.INCIDENT, "output": "12 passed\n"}
++        monkeypatch.setitem(pr._SESSION_ACTIONS, "wait", (lambda sid, a: dict(result), True))
++        out = json.loads(pr._handle_process({"action": "wait", "session_id": "proc_x"}))
++        assert "hint" not in out
+diff --git a/tools/environments/local.py b/tools/environments/local.py
+index e9d65a7496..7b6bc440e9 100644
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -354,10 +354,14 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
+ 
+ 
+ def _terminal_env(env: dict) -> dict:
+-    """*env* with the user's tools first on PATH (``_user_tools_first``), for background commands."""
++    """*env* with the foreground terminal's PATH completion, for background commands: missing
++    sane / Hermes-managed (``$HERMES_HOME/bin``, pm node) / ``~/.local/bin`` dirs appended, then
++    the user's tools first. Same composition as ``_make_run_env``, so a command that resolves in
++    the foreground also resolves under ``terminal(background=true)`` on a gateway whose service
++    PATH lacks those dirs (systemd on the hub)."""
+     path_key = _path_env_key(env)
+     if path_key is not None:
+-        env[path_key] = _user_tools_first(env[path_key])
++        env[path_key] = _user_tools_first(_append_missing_sane_path_entries(env[path_key]))
+     return env
+ 
+ 
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 5711a9b538..9ef56a817c 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -2666,8 +2666,8 @@ def _handle_process(args, **kw):
+         if not session_id:
+             return tool_error(f"session_id is required for {action}")
+         handler, redact = _SESSION_ACTIONS[action]
+-        from tools.process_registry_wait_policy import apply_wait_poll_policy
+-        result = apply_wait_poll_policy(action, session_id, handler(session_id, args))
++        from tools.process_registry_wait_policy import apply_wait_poll_policy, with_masked_success_hint
++        result = with_masked_success_hint(apply_wait_poll_policy(action, session_id, handler(session_id, args)))
+         return json.dumps(_redact_process_result(result) if redact else result, ensure_ascii=False)
+     return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close, handoff")
+ 
+diff --git a/tools/process_registry_wait_policy.py b/tools/process_registry_wait_policy.py
+index ed5bd28ad2..152a965840 100644
+--- a/tools/process_registry_wait_policy.py
++++ b/tools/process_registry_wait_policy.py
+@@ -186,3 +186,21 @@ def apply_wait_poll_policy(action: str, session_id: str, result: dict) -> dict:
+     else:
+         result["note"] = note
+     return result
++
++
++def with_masked_success_hint(result):
++    """*result* with the foreground terminal's masked-success ``hint`` when an exited-0
++    poll/wait/log shows a hidden failure (`| tail` over "command not found"). Advice only: the
++    exit code is unchanged (agent-dab059c232: a background `timeout ... | tail` reported exit 0
++    without ever running). Results with no output (write/submit/close) pass through."""
++    if not isinstance(result, dict) or result.get("exit_code") != 0 or "hint" in result:
++        return result
++    output = result.get("output") or result.get("output_preview")
++    if isinstance(output, str) and output:
++        try:
++            from tools.terminal_hints import annotate_masked_success
++            if note := annotate_masked_success(str(result.get("command") or ""), output):
++                result["hint"] = note
++        except Exception:
++            logger.debug("masked-success hint failed", exc_info=True)
++    return result
+diff --git a/tools/terminal_hints.py b/tools/terminal_hints.py
+index 3a898a07c0..b42d389a56 100644
+--- a/tools/terminal_hints.py
++++ b/tools/terminal_hints.py
+@@ -153,6 +153,13 @@ _FAILURE_SHAPES = re.compile(
+     r"|BUILD FAILED|Build FAILED"             # gradle/msbuild/echoed fallbacks
+     r"|FAILED: "                              # ninja
+     r"|(?m:^make(?:\[\d+\])?: \*\*\*)"        # make
++    # A missing command: the shell's own message, or a wrapper (timeout/env/nice/...) that
++    # could not exec it. Behind `| tail` the run "passed" without running at all
++    # (agent-dab059c232). A tool's own file argument (`cat: x: No such file`) is not matched.
++    r"|(?m:^[^\n]*: command not found$)"
++    r"|failed to run command [\u2018'\"][^\u2019'\"\n]+[\u2019'\"]: No such file or directory"
++    r"|(?m:^(?:env|nice|nohup|stdbuf|xargs|timeout|sudo|ionice|setsid|chrt|taskset): "
++    r"[\u2018'\"][^\u2019'\"\n]+[\u2019'\"]: No such file or directory)"
+     r")")
+ 
+ 
+-- 
+2.51.0
+

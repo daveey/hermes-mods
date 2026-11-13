@@ -1,0 +1,392 @@
+From f9f406d6dd4ec1ccedd2a2381f90439fdbc4019e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:00:11 +0000
+Subject: [PATCH] [daveey] Retire idle worker boards under admission fences and
+ report detached occupancy
+
+---
+ hermes_cli/kanban_db_boards.py                |   6 +
+ hermes_cli/machine_metrics.py                 |  18 ++-
+ hermes_cli/worker_account_boards.py           |  56 +++++++
+ hermes_cli/worker_resource_admission.py       |  48 +++---
+ .../test_worker_board_retirement.py           | 151 ++++++++++++++++++
+ .../test_worker_resource_admission.py         |  15 ++
+ 6 files changed, 272 insertions(+), 22 deletions(-)
+ create mode 100644 tests/hermes_cli/test_worker_board_retirement.py
+
+diff --git a/hermes_cli/kanban_db_boards.py b/hermes_cli/kanban_db_boards.py
+index 4aabbefe02..1f001b15c8 100644
+--- a/hermes_cli/kanban_db_boards.py
++++ b/hermes_cli/kanban_db_boards.py
+@@ -196,6 +196,12 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
+ 
+ 
+ def _remove_board_locked(slug: str, *, archive: bool = True) -> dict:
++    from hermes_cli.worker_account_boards import removing
++    with removing(_kb.board_dir(slug) / "kanban.db"):
++        return _remove_board_files_locked(slug, archive=archive)
++
++
++def _remove_board_files_locked(slug: str, *, archive: bool = True) -> dict:
+     """Archive (to ``boards/_archived/<slug>-<ts>/``) or delete a board;
+     ``default`` cannot be removed. Returns ``{"slug", "action", "new_path"}``."""
+     _kb._assert_not_delegated_child_mutation()
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index 7be71f997f..f177c3c589 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -154,7 +154,23 @@ def collect(disk_path: Optional[Path] = None) -> dict[str, Any]:
+     """``{cpu_load1, cpus, mem_used_pct, disk_free_gb, disk_total_gb}`` plus the throughput counters
+     (``machine_throughput_metrics``); a value that cannot be read is left out."""
+     from hermes_cli import machine_admission_metrics, machine_drain_metrics, machine_throughput_metrics
+-    out: dict[str, Any] = machine_admission_metrics.collect(active_card_runs)
++    from hermes_cli import worker_compute_capacity as capacity
++    from hermes_cli.worker_resource_admission import occupied_count_for_host
++    out: dict[str, Any]
++    try:
++        worker = capacity.worker_enabled()
++    except Exception:  # health: allow BLE001 -- malformed worker observations must report unknown capacity
++        worker = None
++    if worker is None:
++        out = {"active_card_runs": None}
++    elif worker:
++        # [daveey] Worker occupancy includes parked owners' detached cgroups; hub pool telemetry does not apply.
++        try:
++            out = {"active_card_runs": occupied_count_for_host()}
++        except Exception:  # health: allow BLE001 -- malformed worker observations must report unknown capacity
++            out = {"active_card_runs": None}
++    else:
++        out = machine_admission_metrics.collect(active_card_runs)
+     out.update(machine_drain_metrics.collect())
+     out.update(machine_throughput_metrics.cached_counters())
+     try:
+diff --git a/hermes_cli/worker_account_boards.py b/hermes_cli/worker_account_boards.py
+index 7a6c804e90..82b849eef5 100644
+--- a/hermes_cli/worker_account_boards.py
++++ b/hermes_cli/worker_account_boards.py
+@@ -6,7 +6,9 @@ jobs vanished. Missing registered DBs are unknown, never silently free capacity.
+ """
+ from __future__ import annotations
+ 
++import contextlib
+ import hashlib
++import sqlite3
+ import json
+ from pathlib import Path
+ import os
+@@ -39,6 +41,60 @@ def register(conn) -> None:
+         temporary.unlink(missing_ok=True)
+ 
+ 
++@contextlib.contextmanager
++def removing(path: Path):
++    """Fence board removal against claims; retire only a proven idle database.
++
++    Detached jobs remain counted by their cgroups, independently of this record.
++    A failed removal keeps the registration. A missing DB is never proof of idle.
++    The caller already owns the board dispatch lock; admission locks are taken
++    nonblocking, matching claim_transaction's deadlock-avoidance contract.
++    """
++    from hermes_constants import get_default_hermes_root
++    from hermes_cli.admission_fence import AdmissionBusy, SUPPORTED, admission_lock
++
++    path = path.resolve()
++    account = capacity.policy_root().resolve()
++    record = account / 'worker-resources' / 'boards' / (
++        hashlib.sha256(str(path).encode()).hexdigest() + '.json')
++    if not SUPPORTED:
++        if capacity.worker_enabled() or record.exists():
++            raise ValueError('worker board removal requires admission fencing')
++        yield
++        return
++    roots = list(dict.fromkeys([account, Path(get_default_hermes_root()).resolve()]))
++    with contextlib.ExitStack() as stack:
++        try:
++            for root in roots:
++                stack.enter_context(admission_lock(root, timeout=0))
++            registered = record.exists()
++            if registered and json.loads(record.read_text(encoding='utf-8')) != str(path):
++                raise ValueError('invalid registered board')
++            verify = registered or (capacity.worker_enabled() and path.exists())
++            if verify:
++                conn = sqlite3.connect(path.as_uri() + '?mode=rw', uri=True, timeout=0)
++                try:
++                    # Refuse an in-flight writer, not its uncommitted row.
++                    conn.execute('BEGIN IMMEDIATE')
++                    if conn.execute("SELECT 1 FROM tasks WHERE status = 'running' LIMIT 1").fetchone():
++                        raise ValueError('worker board has running cards; drain before removal')
++                finally:
++                    conn.rollback()
++                    conn.close()
++        except (AdmissionBusy, sqlite3.Error) as exc:
++            raise ValueError(f'board busy or unreadable; retry removal: {exc}') from exc
++        # Claims cannot pass their final gate until after removal and retirement.
++        succeeded = False
++        try:
++            yield
++            succeeded = True
++        finally:
++            # Rename can succeed before a later tombstone write fails. The
++            # fenced idle proof also permits retirement in that partial state.
++            if succeeded or (verify and not path.exists()):
++                record.unlink(missing_ok=True)
++
++
+ def paths() -> list[Path]:
+     root = capacity.policy_root()
+     found = []
+diff --git a/hermes_cli/worker_resource_admission.py b/hermes_cli/worker_resource_admission.py
+index 24bbefd6c4..67cbefbc92 100644
+--- a/hermes_cli/worker_resource_admission.py
++++ b/hermes_cli/worker_resource_admission.py
+@@ -60,6 +60,31 @@ def pool_occupancy(pool: Path, owners, active):
+     return capacity.occupied_owners(pool, owners, active)
+ 
+ 
++def occupied_count_for_host(echo=None) -> int | None:
++    """One census for admission and Board reports; never mutate pressure state."""
++    from hermes_cli import machine_metrics
++    from hermes_cli.worker_account_boards import paths
++    active_owners = set()
++    active = machine_metrics.active_card_runs(exclude=echo, owner_output=active_owners, extra_paths=paths())
++    if active is None:
++        return None
++    owners = {}
++    owner_dir = capacity.policy_root() / 'worker-resources' / 'owners'
++    if owner_dir.exists():
++        for path in owner_dir.iterdir():
++            if path.suffix != '.json':
++                continue
++            owner = json.loads(path.read_text(encoding='utf-8'))
++            if (not isinstance(owner, list) or len(owner) != 2
++                    or not all(isinstance(value, str) and value for value in owner)
++                    or capacity.owner_slice(*owner) != path.stem):
++                raise ValueError('invalid worker owner map')
++            owners[path.stem] = tuple(owner)
++    occupied = pool_occupancy(capacity.pool_path(), owners, active_owners)
++    # Distinct installations can contain copied IDs. Preserve their row count.
++    return len(occupied) + max(0, active - len(active_owners))
++
++
+ def refusal(echo=None, *, enabled=None) -> str | None:
+     """Pre-lease and final-lock check. Unknown observations fail closed."""
+     try:
+@@ -68,30 +93,11 @@ def refusal(echo=None, *, enabled=None) -> str | None:
+         directory = capacity.policy_root() / 'worker-resources'
+         if _pressure(directory):
+             return 'worker_load_pressure'
+-        from hermes_cli import machine_metrics
++        occupied_count = occupied_count_for_host(echo)
+         from hermes_cli.kanban_admission import _root_max_in_progress
+-        active_owners = set()
+-        from hermes_cli.worker_account_boards import paths
+-        active = machine_metrics.active_card_runs(exclude=echo, owner_output=active_owners, extra_paths=paths())
+         ok, cap = _root_max_in_progress(root=capacity.policy_root())
+-        if active is None or not ok or cap is None:
++        if occupied_count is None or not ok or cap is None:
+             return 'worker_resources_unknown'
+-        owners = {}
+-        owner_dir = directory / 'owners'
+-        if owner_dir.exists():
+-            for path in owner_dir.iterdir():
+-                if path.suffix != '.json':
+-                    continue
+-                owner = json.loads(path.read_text(encoding='utf-8'))
+-                if (not isinstance(owner, list) or len(owner) != 2
+-                        or not all(isinstance(value, str) and value for value in owner)
+-                        or capacity.owner_slice(*owner) != path.stem):
+-                    raise ValueError('invalid worker owner map')
+-                owners[path.stem] = tuple(owner)
+-        occupied = pool_occupancy(capacity.pool_path(), owners, active_owners)
+-        # Distinct installations can contain copied board/task IDs. Until a
+-        # cgroup supplies canonical custody, never collapse their running rows.
+-        occupied_count = len(occupied) + max(0, active - len(active_owners))
+         if occupied_count >= cap:
+             return 'worker_capacity_full'
+         return None
+diff --git a/tests/hermes_cli/test_worker_board_retirement.py b/tests/hermes_cli/test_worker_board_retirement.py
+new file mode 100644
+index 0000000000..4391c8efc2
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_board_retirement.py
+@@ -0,0 +1,151 @@
++"""Removal cannot strand account registrations or race final admission."""
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import worker_account_boards as inventory
++from hermes_cli import worker_compute_capacity as capacity
++from hermes_cli.admission_fence import AdmissionBusy, admission_lock
++
++
++@pytest.fixture
++def registered(monkeypatch, tmp_path):
++    root = tmp_path / 'hermes_test'
++    root.mkdir(exist_ok=True)
++    monkeypatch.setenv('HERMES_HOME', str(root))
++    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
++    monkeypatch.delenv('HERMES_KANBAN_BOARD', raising=False)
++    monkeypatch.setattr(capacity, 'policy_root', lambda: root)
++    monkeypatch.setattr(capacity, 'worker_enabled', lambda: True)
++    kb.create_board('retiring')
++    path = kb.board_dir('retiring') / 'kanban.db'
++    with sqlite3.connect(path) as conn:
++        inventory.register(conn)
++    return root, path
++
++
++@pytest.mark.parametrize('archive', [True, False])
++def test_public_remove_retires_registration(registered, archive):
++    root, path = registered
++    assert path in inventory.paths()
++    assert list((capacity.policy_root() / 'worker-resources' / 'boards').glob('*.json'))
++    result = kb.remove_board('retiring', archive=archive)
++    assert result['action'] == ('archived' if archive else 'deleted')
++    assert not path.exists()
++    assert path not in inventory.paths()
++    assert not list((root / 'worker-resources' / 'boards').glob('*.json'))
++    if archive:
++        assert (Path(result['new_path']) / 'kanban.db').exists()
++
++
++def test_running_row_preserves_board_and_pointer(registered):
++    _, path = registered
++    with sqlite3.connect(path) as conn:
++        # Use the full production schema's defaults, no actual worker spawned.
++        conn.execute("INSERT INTO tasks (id, title, status, assignee, created_at) "
++                     "VALUES ('t_busy', 'Busy', 'running', 'default', 1)")
++    with pytest.raises(ValueError, match='running cards'):
++        kb.remove_board('retiring')
++    assert path.exists()
++    assert path in inventory.paths()
++    assert list((capacity.policy_root() / 'worker-resources' / 'boards').glob('*.json'))
++
++
++def test_inflight_writer_refuses_removal(registered):
++    _, path = registered
++    conn = sqlite3.connect(path)
++    try:
++        conn.execute('BEGIN IMMEDIATE')
++        with pytest.raises(ValueError, match='locked'):
++            kb.remove_board('retiring')
++        assert path in inventory.paths()
++        assert list((capacity.policy_root() / 'worker-resources' / 'boards').glob('*.json'))
++    finally:
++        conn.rollback()
++        conn.close()
++
++
++def test_removal_retains_account_lock_until_files_gone(registered, monkeypatch):
++    root, path = registered
++    from hermes_cli import kanban_db_boards as boards
++    original = boards._remove_board_files_locked
++
++    def remove(*args, **kwargs):
++        from hermes_cli.kanban_admission import claim_transaction
++        conn = sqlite3.connect(path)
++        try:
++            with claim_transaction(conn) as admitted:
++                assert admitted is False
++        finally:
++            conn.close()
++        with pytest.raises(AdmissionBusy):
++            with admission_lock(root, timeout=0):
++                pytest.fail('concurrent final claim acquired account fence')
++        return original(*args, **kwargs)
++
++    monkeypatch.setattr(boards, '_remove_board_files_locked', remove)
++    kb.remove_board('retiring')
++    with admission_lock(root, timeout=0):
++        assert not path.exists()
++
++
++def test_failed_removal_keeps_registration(registered, monkeypatch):
++    _, path = registered
++    from hermes_cli import kanban_db_boards as boards
++
++    def fail(*args, **kwargs):
++        raise OSError('fixture removal failed')
++
++    monkeypatch.setattr(boards, '_remove_board_files_locked', fail)
++    with pytest.raises(OSError, match='fixture removal failed'):
++        kb.remove_board('retiring')
++    assert path in inventory.paths()
++    assert list((capacity.policy_root() / 'worker-resources' / 'boards').glob('*.json'))
++
++
++def test_post_rename_failure_retires_proven_idle_record(registered, monkeypatch):
++    root, path = registered
++    from hermes_cli import kanban_db_boards as boards
++
++    def fail(*args, **kwargs):
++        raise OSError('tombstone write failed')
++
++    monkeypatch.setattr(boards, '_write_board_metadata_locked', fail)
++    with pytest.raises(OSError, match='tombstone'):
++        kb.remove_board('retiring')
++    assert not path.exists()
++    assert not list((root / 'worker-resources' / 'boards').glob('*.json'))
++    inventory.paths()  # must not poison all account claims
++
++
++def test_enabled_metadata_only_board_can_be_removed(registered):
++    root, path = registered
++    # An unregistered board with metadata but no DB has no rows to retire.
++    for record in (root / 'worker-resources' / 'boards').glob('*.json'):
++        record.unlink()
++    path.unlink()
++    assert kb.remove_board('retiring')['action'] == 'archived'
++
++
++def test_account_and_installation_fences_both_held(registered, monkeypatch, tmp_path):
++    root, path = registered
++    import hermes_constants
++    other = tmp_path / 'other_installation'
++    monkeypatch.setattr(hermes_constants, 'get_default_hermes_root', lambda: other)
++    with inventory.removing(path):
++        for home in (root, other):
++            with pytest.raises(AdmissionBusy):
++                with admission_lock(home, timeout=0):
++                    pytest.fail('missing fence')
++
++
++def test_missing_registered_database_never_retires(registered):
++    root, path = registered
++    path.unlink()
++    with pytest.raises(ValueError):
++        kb.remove_board('retiring')
++    assert list((root / 'worker-resources' / 'boards').glob('*.json'))
++    with pytest.raises(FileNotFoundError):
++        inventory.paths()
+diff --git a/tests/hermes_cli/test_worker_resource_admission.py b/tests/hermes_cli/test_worker_resource_admission.py
+index 6f634a3607..c2babed2c8 100644
+--- a/tests/hermes_cli/test_worker_resource_admission.py
++++ b/tests/hermes_cli/test_worker_resource_admission.py
+@@ -55,6 +55,21 @@ def test_worker_own_grant_echo_does_not_take_extra_slot(worker_rig, lane):
+     assert claim(rig.conn, t, lane) is not None
+ 
+ 
++def test_reporter_counts_detached_jobs_and_unknowns(worker_rig):
++    from hermes_cli import machine_metrics
++    rig, pool = worker_rig
++    rig.fill(1)
++    group = pool / 'detached.scope'
++    group.mkdir()
++    events = group / 'cgroup.events'
++    events.write_text('populated 1\n')
++    assert machine_metrics.collect(rig.home)['active_card_runs'] == 2
++    events.write_text('populated 0\n')
++    assert machine_metrics.collect(rig.home)['active_card_runs'] == 1
++    events.unlink()
++    assert machine_metrics.collect(rig.home)['active_card_runs'] is None
++
++
+ def test_persistent_hysteresis_and_bad_state_refuse(worker_rig, monkeypatch):
+     from hermes_cli.worker_resource_admission import refusal
+     rig, _ = worker_rig
+-- 
+2.51.0
+

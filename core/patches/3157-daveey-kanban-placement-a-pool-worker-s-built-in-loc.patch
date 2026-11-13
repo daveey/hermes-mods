@@ -1,0 +1,457 @@
+From 3cde49def6e359e994b45eee3f81d1fb37b39ae0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 01:06:29 +0000
+Subject: [PATCH] [daveey] kanban placement: a pool worker's built-in
+ local-marker hit joins the pool queue
+
+On a gateway whose Board registry entry carries 'linux' and which is not the hub,
+a built-in local-marker hit (Keychain, Chrome, a Desktop chat, a ship review's
+CI line naming the macOS check, a device skill) no longer keeps the card as a
+local row only its creator can claim (workers pick up only runs_on cards).
+It queues for the worker_queue label like any portable card, with
+capability:tailnet-exec for Mac/Desktop markers and a note naming the route to
+the real need. Operator patterns, every other portability reason, an unreadable
+registry, the hub (judge path) and the Macs are unchanged.
+
+Observed: t_01a1d2434cf3676c, and t_01a1d2662553185d itself (kept on worker-1
+for 'chrome' in its own spec text). Spec: t_01a1d25d4318974b.
+---
+ hermes_cli/kanban_placement.py             |  86 ++++++++++-
+ hermes_cli/kanban_placement_diagnostics.py |   6 +-
+ hermes_cli/kanban_worker_placement.py      |  56 +++++++-
+ tests/hermes_cli/test_kanban_pool_queue.py | 159 +++++++++++++++++++++
+ tools/kanban_tools_placement.py            |  10 +-
+ 5 files changed, 305 insertions(+), 12 deletions(-)
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index d64d59895c..c233ee96bf 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -51,6 +51,14 @@ automatic card is enrolled in the worker pool with ``requires: [hub:write]`` (Bo
+ non-default board, uncarried options, assignee) are unchanged and never call the judge, and non-hub
+ gateways make zero judge calls unless the caller names the hub.
+ 
++On a pool worker (a gateway whose Board registry entry carries ``linux`` and which is not the hub) a built-in
++local-marker hit is not a reason to keep the card: no Board machine a card can lease runs macOS, and every pool
++worker has the same capabilities, so keeping it on its creator only made it a one-worker pin (workers pick up only
++``runs_on`` cards). Such a card joins the ``worker_queue`` like any portable card, with the labels its marker group
++needs (:data:`LOCAL_MARKER_GROUPS`; Mac and Desktop markers add ``capability:tailnet-exec``) and a note naming the
++route to the real need (:func:`markers_unmeetable_here`, :func:`hermes_cli.kanban_worker_placement.queue_decision`).
++Operator patterns, every other portability reason, an unreadable registry, the hub and the Macs are unchanged.
++
+ Heavy work (tests, builds, benchmarks, installs: :data:`DEFAULT_HEAVY_MARKERS`, replaced by
+ ``kanban.placement.heavy_markers``) with no local-only need goes to a worker node instead of the target
+ when ``kanban.placement.heavy_route`` maps this gateway to one (``{"macbook": "worker-1"}``): the card is
+@@ -186,6 +194,26 @@ DEFAULT_LOCAL_SKILL_MARKERS = (
+     r"^apple", r"^imessage$", r"^findmy$", r"^macos-", r"^mac-", r"^invisible-chrome-agent$",
+     r"^local-chrome-remote-debugging$", r"^computer-use$", r"^myapp", r"^bb-", r"^ios-",
+ )
++# Who can meet each built-in local marker (t_01a1d2662553185d), read from the Board registry on 2026-11-13:
++# mac / desktop: only the Macs, which take no Board leases; a pool worker reaches them over tailnet_exec/ssh.
++# browser: the hub's signed-in Chrome; pool workers have a headless one. sso: the MacBook's SSO profile; pool workers
++# get credentials from token-broker. context: a product/repo skill any pool worker carries. Every built-in marker
++# and skill marker has a group (a test enforces it), so a new marker cannot ship unclassified.
++LOCAL_MARKER_GROUPS = {
++    **dict.fromkeys((
++        r"\bkeychain\b", r"\bcodesign", r"\bnotari[sz]", r"\btcc\b", r"\bosascript\b", r"\bapple ?script\b",
++        r"\bapple (photos|notes|reminders|contacts|calendar|music)\b", r"\bphotos\.app\b", r"\bimessage\b",
++        r"\bfind ?my\b", r"\bremindctl\b", r"\bshortcuts? app\b", r"\blaunchd\b", r"\blaunchctl\b", r"launchagents",
++        r"~/library/", r"\bmacbook\b", MACOS_MARKER, r"\bmac ?mini\b", r"\bthe mini\b", r"\mini-1\b",
++        BABYBEAR_MARKER, r"\bxcode\b", r"\bsimulator\b", r"\bwhatsapp\b", r"\bscreen ?shot",
++        r"^apple", r"^imessage$", r"^findmy$", r"^macos-", r"^mac-", r"^computer-use$", r"^ios-"), "mac"),
++    **dict.fromkeys((r"\bhermes\.app\b", HERMES_DESKTOP_MARKER, DESKTOP_SURFACE_MARKER, LIVE_DESKTOP_MARKER,
++                     DESKTOP_ACTION_MARKER, r"\bdesktop\s+dom\b"), "desktop"),
++    **dict.fromkeys((r"\bchrome\b", r"\bcdp\b", r"^invisible-chrome-agent$", r"^local-chrome-remote-debugging$"),
++                    "browser"),
++    **dict.fromkeys((r"\bexample-org\b", r"\bdavid-bloomin-sso\b", r"--profile softmax"), "sso"),
++    **dict.fromkeys((r"^myapp", r"^bb-"), "context"),
++}
+ # Skill markers that only say what a card is about (a Baby Bear repo skill on a Python fix), not that it drives this
+ # machine: an explicit placement='auto' drops them from the local-marker scan. Device-bound skills (apple-*, macos-,
+ # computer-use, ios-, a local Chrome) stay local even then, since 'auto' is also the routine default callers spell
+@@ -418,8 +446,9 @@ def is_placeholder_session(value: str, *, placement_config: Optional[dict] = Non
+     return bool(session) and session in values
+ 
+ 
+-def _local_marker(title: str, body: str, skills, cfg: _Cfg) -> Optional[str]:
+-    """The first local-only hit, or None. Host-name markers (see
++def _local_marker_hits(title: str, body: str, skills, cfg: _Cfg) -> Iterator[tuple[str, str]]:
++    """Every local-only hit in scan order, as ``(why, pattern)``; ``pattern`` is the marker or skill-marker string
++    that matched (the key of :data:`LOCAL_MARKER_GROUPS` for a built-in). Host-name markers (see
+     :data:`TITLE_ONLY_LOCAL_MARKERS`) scan the title only, unless the caller replaced the list.
+     A product name (:data:`PRODUCT_NAME_MARKERS`) does not pin a card whose text names Linux
+     and no Apple or device-bound work (same exception: not with a replaced list)."""
+@@ -435,12 +464,59 @@ def _local_marker(title: str, body: str, skills, cfg: _Cfg) -> Optional[str]:
+         text = (title or "") if (not replaced and rx.pattern in TITLE_ONLY_LOCAL_MARKERS) else full
+         m = rx.search(text)
+         if m:
+-            return f"mentions {m.group(0).lower()!r}"
++            yield f"mentions {m.group(0).lower()!r}", rx.pattern
+     for s in skills or []:
+         for rx in cfg.skill_markers():
+             if rx.search(str(s)):
+-                return f"skill {s}"
+-    return None
++                yield f"skill {s}", rx.pattern
++
++
++def _local_marker_match(title: str, body: str, skills, cfg: _Cfg) -> Optional[tuple[str, str]]:
++    """The first local-only hit as ``(why, pattern)``, or None."""
++    return next(_local_marker_hits(title, body, skills, cfg), None)
++
++
++def _local_marker(title: str, body: str, skills, cfg: _Cfg) -> Optional[str]:
++    """The first local-only hit (``mentions '<text>'`` or ``skill <name>``), or None."""
++    hit = _local_marker_match(title, body, skills, cfg)
++    return hit[0] if hit else None
++
++
++def builtin_marker_groups(args: dict, cfg: Optional[dict] = None) -> Optional[dict[str, str]]:
++    """``{group: first hit}`` over every local-marker hit of ``args``, or None when there is no hit or any hit is not
++    a classified built-in: a replaced ``local_markers``/``local_skill_markers`` list or an ``extra_local_markers``
++    hit is the operator's own pattern, which nothing here can classify, so it keeps its card. [daveey]"""
++    c = _Cfg(config() if cfg is None else cfg)
++    if any(isinstance(c.raw.get(k), list) for k in ("local_markers", "local_skill_markers")):
++        return None
++    title, body = args.get("title") or "", args.get("body") or ""
++    extra = c.raw.get("extra_local_markers")
++    if isinstance(extra, list) and extra and _local_marker(
++            title, body, None, _Cfg({"local_markers": [], "extra_local_markers": extra})):
++        return None
++    builtin = _Cfg({k: v for k, v in c.raw.items() if k != "extra_local_markers"})
++    groups: dict[str, str] = {}
++    for why, pattern in _local_marker_hits(title, body, marker_skills(args, builtin), builtin):
++        group = LOCAL_MARKER_GROUPS.get(pattern)
++        if group is None:
++            return None
++        groups.setdefault(group, why)
++    return groups or None
++
++
++def markers_unmeetable_here(self_gw: Optional[str], cfg: Optional[dict], machines: Optional[dict] = None) -> bool:
++    """True when this gateway is a Linux Board machine other than the hub: no built-in local marker can be met here
++    better than by any pool worker (see :data:`LOCAL_MARKER_GROUPS`). Reads the attested registry labels, not
++    ``sys.platform`` (Linux CI simulates the MacBook gateway); an unreadable registry or no entry for this gateway
++    is False, which keeps today's local keep. [daveey]"""
++    from hermes_cli.kanban_hub_admission_placement import is_hub
++    if not self_gw or is_hub(self_gw, cfg or {}):
++        return False
++    if machines is None:
++        from hermes_cli import kanban_worker_node as wn
++        machines = dict((wn.registry() or {}).get("machines") or {})
++    entry = machines.get(self_gw)
++    return isinstance(entry, dict) and "linux" in (entry.get("labels") or [])
+ 
+ 
+ def _heavy_marker(title: str, body: str, cfg: _Cfg) -> Optional[str]:
+diff --git a/hermes_cli/kanban_placement_diagnostics.py b/hermes_cli/kanban_placement_diagnostics.py
+index 2150897c42..85e68422da 100644
+--- a/hermes_cli/kanban_placement_diagnostics.py
++++ b/hermes_cli/kanban_placement_diagnostics.py
+@@ -4,11 +4,13 @@ from __future__ import annotations
+ import re
+ 
+ 
+-def portability(args: dict, cfg=None) -> tuple[str | None, str | None]:
++def portability(args: dict, cfg=None, *, local_markers: bool = True) -> tuple[str | None, str | None]:
+     """Return the stable reason and its actual marker evidence in one classifier pass.
+ 
+     Keep ordering and exemptions identical for admission and diagnostics. In particular,
+     never rescan raw text for an explanation after evidence/coordination filtering.
++    ``local_markers=False`` skips only the local-marker step (a pool worker re-checks a card whose built-in markers
++    it cannot meet: every other reason still applies, in the same order). [daveey]
+     """
+     from hermes_cli import kanban_placement as p
+     from hermes_cli import kanban_placement_coordination as coordination
+@@ -23,7 +25,7 @@ def portability(args: dict, cfg=None) -> tuple[str | None, str | None]:
+     if refusal := coordination.board_refusal(reqs):
+         return refusal, None
+     title, body = p.marker_work_text(args.get("title")), p.marker_work_text(args.get("body"))
+-    if hit := p._local_marker(title, body, p.marker_skills(args, c), c):
++    if local_markers and (hit := p._local_marker(title, body, p.marker_skills(args, c), c)):
+         return "local marker", hit
+     full = without_carried_inputs(f"{title}\n{body}", c.raw)
+     if refusal := coordination.check(full, c.raw, skills=args.get("skills"), requires=reqs):
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 2fa25d5197..587471cf71 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -53,6 +53,45 @@ def _notice_from_stored(conn, task_id, gateway, pool):
+ 
+ QUEUED_WHY = ("portable: queued for any machine labelled {label} (kanban.placement.worker_queue); the first one "
+               "with a free slot claims it through the Board lease")
++UNMET_WHY = " (local marker {hit} not met on {gateway})"
++TAILNET_LABEL = "capability:tailnet-exec"
++# Labels a built-in local-marker group adds on a pool worker (kanban_placement.LOCAL_MARKER_GROUPS).
++UNMET_GROUP_LABELS = {"mac": (TAILNET_LABEL,), "desktop": (TAILNET_LABEL,)}
++_MAC_NOTE = ("{hit}: no Board machine this card can lease runs macOS (the Macs take no Board leases); it joins the "
++             "pool with capability:tailnet-exec, so a run that needs the Mac reaches it with tailnet_exec/ssh, and a "
++             "GUI-only step (a TCC or Keychain prompt, a signing UI) is a human_request.")
++UNMET_GROUP_NOTES = {
++    "mac": _MAC_NOTE, "desktop": _MAC_NOTE,
++    "browser": ("{hit}: pool workers have a headless browser without sign-in; work that needs the hub's signed-in "
++                "Chrome must be created with runs_on=['machine:hub'] and hub_reason (admission-judged)."),
++    "sso": "{hit}: credentials come from token-broker; an SSO login only David can do is a human_request.",
++    "context": "{hit}: a context skill every pool worker carries.",
++}
++
++
++def _hit_name(why):
++    return why.removeprefix("mentions ")
++
++
++def unmet_markers(args, cfg, gateway):
++    """``{labels, note, hit}`` when this gateway cannot meet any of the card's local markers better than the pool and
++    nothing else keeps the card here; else None (t_01a1d2662553185d). [daveey]"""
++    from hermes_cli import kanban_placement as placement
++    from hermes_cli.kanban_placement_diagnostics import portability
++
++    groups = placement.builtin_marker_groups(args, cfg)
++    if not groups or not placement.markers_unmeetable_here(gateway, cfg):
++        return None
++    if portability(args, cfg, local_markers=False)[0]:
++        return None
++    labels, notes = set(), []
++    for group, why in groups.items():
++        labels.update(UNMET_GROUP_LABELS.get(group, ()))
++        note = UNMET_GROUP_NOTES[group].format(hit=_hit_name(why))
++        if note not in notes and not (group == "desktop" and "mac" in groups):
++            notes.append(note)
++    first = next(iter(groups.values()))
++    return {"labels": labels, "note": " ".join(notes), "hit": _hit_name(first)}
+ 
+ 
+ def queue_decision(args, cfg, gateway, pin, machine_ok=None):
+@@ -61,7 +100,8 @@ def queue_decision(args, cfg, gateway, pin, machine_ok=None):
+     One queue instead of a machine pin: no worker is chosen at creation, so a held or full worker never strands the
+     card while another has free slots. None (legacy routing applies) for a pin, an explicit ``runs_on``,
+     non-portable work, or when no active, unheld machine carries the label. Courier and origin-bound creates queue
+-    too: chat ownership pins storage, not execution (t_01a1d0571c2f07d6). [daveey]
++    too: chat ownership pins storage, not execution (t_01a1d0571c2f07d6). On a pool worker a built-in local-marker
++    hit queues too, with its group's labels and a ``note`` (:func:`unmet_markers`). [daveey]
+     """
+     from hermes_cli import kanban_placement as placement
+     from hermes_cli import kanban_placement_coordination as coordination
+@@ -69,12 +109,22 @@ def queue_decision(args, cfg, gateway, pin, machine_ok=None):
+     label = placement._Cfg(cfg).queue_label(gateway)
+     if not label or pin not in ("", "auto") or args.get("runs_on") is not None:
+         return None
+-    if placement.portable_reason(args, cfg):
++    unmet = None
++    reason = placement.portable_reason(args, cfg)
++    if reason == "local marker":
++        unmet = unmet_markers(args, cfg, gateway)
++        if unmet is None:
++            return None
++    elif reason:
+         return None
+     extra = coordination.required_labels(args, cfg)
+     if extra is None or not (machine_ok or placement._machine_picks_up)(label):
+         return None
+-    return {"where": "local", "runs_on": [label, *sorted(extra - {label})], "why": QUEUED_WHY.format(label=label)}
++    if unmet is None:
++        return {"where": "local", "runs_on": [label, *sorted(extra - {label})], "why": QUEUED_WHY.format(label=label)}
++    extra = extra | unmet["labels"]
++    return {"where": "local", "runs_on": [label, *sorted(extra - {label})], "note": unmet["note"],
++            "why": QUEUED_WHY.format(label=label) + UNMET_WHY.format(hit=unmet["hit"], gateway=gateway)}
+ 
+ 
+ def creation_decision(args, cfg, gateway, pin, origin_intent, machine_ok=None, queue=True):
+diff --git a/tests/hermes_cli/test_kanban_pool_queue.py b/tests/hermes_cli/test_kanban_pool_queue.py
+index 53611cfd94..8c3d4b5cff 100644
+--- a/tests/hermes_cli/test_kanban_pool_queue.py
++++ b/tests/hermes_cli/test_kanban_pool_queue.py
+@@ -684,3 +684,162 @@ def test_a_callers_runs_on_beats_a_queued_landing(monkeypatch):
+     assert ktp._landing_placement(None, {}, object(), None, None, ["machine:worker-2"], title="t") == (
+         queued, ["machine:worker-2"])
+     assert ktp._landing_placement(None, {}, object(), None, None, None, title="t") == (queued, [POOL])
++
++
++# --- local markers a pool worker cannot meet (t_01a1d2662553185d) ----------------------------------------------
++# 11-13: on a pool worker a built-in local-marker hit (Keychain, Chrome, a Desktop chat, a ship review's CI line
++# naming the macOS check) kept the card as a local row only its creating worker could claim (workers pick up only
++# runs_on cards). No Board machine a card can lease runs macOS, so the creator was never better than the pool.
++# Observed: t_01a1d2434cf3676c, and t_01a1d2662553185d itself (its spec names Chrome).
++
++TAILNET = "capability:tailnet-exec"
++SHIP_TITLE = "Independent exact-head review PR #1789 @370a13d80c (core-wt ship review required)"
++SHIP_BODY = (
++    "Independent exact-head review of https://github.com/example-org/hermes/pull/1789 at "
++    "**370a13d80c0000000000000000000000000000ab**.\n"
++    "CI at filing: green: All required checks pass (v2): success; macOS state required (v1): success.\n"
++    "Required CI passed before filing.\n\n"
++    "An independent exact-head review was explicitly requested before landing.\n"
++    "The ship gate lands only a head approved at its exact sha. This card was filed by ship; the landing session "
++    "must not be the one reviewing.\n\n"
++    "Finish with kanban_complete metadata exactly:\n"
++    '  {"verdict": "approve" | "request_changes", "reviewed_sha": "370a13d80c0000000000000000000000000000ab", '
++    '"reviewed_pr": "https://github.com/example-org/hermes/pull/1789"}\n')
++
++
++def _pool_machines():
++    w1 = {**W1, "labels": ["linux", POOL, TAILNET]}
++    w2 = {**W2, "labels": ["linux", POOL, TAILNET]}
++    return {m["name"]: m for m in (MACHINES[HUB], w1, w2, MACHINES["macbook"])}
++
++
++def _on(monkeypatch, gateway, cfg, machines):
++    from hermes_cli import kanban_skill_check
++    monkeypatch.setattr("hermes_cli.kanban_capability_registry.self_gateway", lambda: gateway)
++    monkeypatch.setattr(kp, "config", lambda: cfg)
++    monkeypatch.setattr(kanban_skill_check, "check_task_skills", lambda *a, **k: None)  # no skills dir here
++    wn.set_registry_fetch(lambda: {"me": gateway, "machines": list(machines.values())})
++
++
++@pytest.fixture
++def on_w2(w2, monkeypatch):
++    _on(monkeypatch, "worker-2", {"worker_queue": {"worker-2": POOL}}, _pool_machines())
++    return w2
++
++
++def _create(**card):
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_create({"assignee": "default", "requires": [], **card}))
++    assert out.get("ok"), out
++    return out
++
++
++def test_a_keychain_card_from_a_pool_worker_joins_the_pool_with_the_mac_reach_label(on_w2):
++    out = _create(title="rotate the CI token in the Keychain")
++    # The Board stores labels normalized (sorted): the label set is the contract; the reply keeps the queue first.
++    assert _runs_on(on_w2.conn, out["task_id"]) == sorted([POOL, TAILNET]), out
++    assert out["placement"]["runs_on"] == [POOL, TAILNET], out
++    assert "tailnet_exec" in out["note"] and out["placement"]["note"] == out["note"], out
++    assert "remedy" not in out, out
++    why = out["placement"]["why"]
++    assert why.startswith("portable: queued for any machine labelled pool:worker"), why
++    assert why.endswith("(local marker 'keychain' not met on worker-2)"), why
++    # Any pool worker may claim it, not only the creator.
++    card = dict(on_w2.conn.execute("SELECT * FROM tasks WHERE id = ?", (out["task_id"],)).fetchone())
++    assert wn.eligible(card, "worker-1", _pool_machines()) is None
++    # The audit stays truthful: the card did hit a local marker.
++    assert _created(on_w2.conn, out["task_id"])["portable_reason"] == "local marker"
++
++
++def test_a_chrome_card_from_a_pool_worker_joins_the_pool_and_names_the_hub_route(on_w2):
++    out = _create(title="read the dashboard in Chrome")
++    assert _runs_on(on_w2.conn, out["task_id"]) == [POOL], out
++    assert "machine:hub" in out["note"] and "hub_reason" in out["note"], out
++
++
++def test_a_desktop_chat_card_from_a_pool_worker_carries_the_mac_reach_label(on_w2):
++    out = _create(title="Fix Desktop chat sidebar ordering")
++    assert TAILNET in (_runs_on(on_w2.conn, out["task_id"]) or []), out
++
++
++def test_a_device_skill_card_from_a_pool_worker_carries_the_mac_reach_label(on_w2):
++    out = _create(title="Click through the Settings pane", skills=["computer-use"])
++    assert TAILNET in (_runs_on(on_w2.conn, out["task_id"]) or []), out
++
++
++def test_a_ship_review_card_naming_the_macos_check_joins_the_pool(on_w2):
++    out = _create(title=SHIP_TITLE, body=SHIP_BODY)
++    assert POOL in (_runs_on(on_w2.conn, out["task_id"]) or []), out
++
++
++def test_cli_create_of_a_keychain_card_on_a_pool_worker_joins_the_pool(on_w2):
++    from hermes_cli import kanban as kcli
++    out = kcli.run_slash('create "rotate the Keychain token" --assignee default --json')
++    assert _runs_on(on_w2.conn, json.loads(out)["id"]) == sorted([POOL, TAILNET]), out
++
++
++def test_direct_create_task_of_a_keychain_card_on_a_pool_worker_joins_the_pool(on_w2):
++    tid = kb.create_task(on_w2.conn, title="rotate the CI token in the Keychain", assignee="default", requires=[])
++    assert _runs_on(on_w2.conn, tid) == sorted([POOL, TAILNET])
++
++
++def test_every_built_in_local_marker_has_a_group():
++    assert set(kp.DEFAULT_LOCAL_MARKERS) | set(kp.DEFAULT_LOCAL_SKILL_MARKERS) <= set(kp.LOCAL_MARKER_GROUPS)
++    assert set(kp.LOCAL_MARKER_GROUPS.values()) <= {"mac", "desktop", "browser", "sso", "context"}
++
++
++def test_markers_are_unmeetable_only_on_a_linux_non_hub_registry_entry():
++    machines = _pool_machines()
++    assert kp.markers_unmeetable_here("worker-2", {}, machines) is True
++    assert kp.markers_unmeetable_here(HUB, {}, machines) is False  # linux, but the hub (admission judge path)
++    assert kp.markers_unmeetable_here("macbook", {}, machines) is False
++    assert kp.markers_unmeetable_here("worker-9", {}, machines) is False  # no registry entry
++    assert kp.markers_unmeetable_here(None, {}, machines) is False
++
++
++# Controls: green before and after.
++
++def test_hub_keychain_card_still_asks_the_admission_judge(hub, judge):
++    from tools import kanban_tools as kt
++    _registry()
++    out = json.loads(kt._handle_create({"title": "rotate the CI token in the Keychain", "assignee": "default",
++                                        "requires": []}))
++    assert out.get("task_id") and len(judge.calls) == 1, out
++
++
++def test_macbook_keychain_card_stays_local(w2, monkeypatch):
++    _on(monkeypatch, "macbook", {"route": {"macbook": HUB}, "worker_queue": {"macbook": POOL}}, _pool_machines())
++    d = kp.decide({"title": "rotate the CI token in the Keychain"}, live=lambda _t: None, carries=True)
++    assert d["where"] == "local" and "runs_on" not in d and d["why"].startswith("local marker"), d
++
++
++def test_pool_worker_keeps_a_marker_card_when_the_registry_is_unreadable(w2, monkeypatch):
++    _on(monkeypatch, "worker-2", {"worker_queue": {"worker-2": POOL}}, _pool_machines())
++
++    def down():
++        raise OSError("board unreachable")
++    wn.set_registry_fetch(down)
++    out = _create(title="rotate the CI token in the Keychain")
++    assert _runs_on(w2.conn, out["task_id"]) is None and out["placement"]["why"].startswith("local marker"), out
++
++
++@pytest.mark.parametrize("cfg,title", [
++    ({"extra_local_markers": [r"\bgrafana\b"]}, "fix the grafana panel"),
++    ({"extra_local_markers": [r"\bgrafana\b"]}, "rotate the Keychain token the grafana panel reads"),  # + built-in
++    ({"local_markers": [r"\bkeychain\b"]}, "rotate the CI token in the Keychain"),  # a replaced list
++])
++def test_pool_worker_keeps_an_operator_marker(w2, monkeypatch, cfg, title):
++    _on(monkeypatch, "worker-2", {"worker_queue": {"worker-2": POOL}, **cfg}, _pool_machines())
++    out = _create(title=title)
++    assert _runs_on(w2.conn, out["task_id"]) is None and out["placement"]["why"].startswith("local marker"), out
++
++
++@pytest.mark.parametrize("card", [
++    {"title": "systemctl " + "restart x"},
++    {"title": "rotate the CI token in the Keychain", "placement": "local"},
++    {"title": "rotate the CI token in the Keychain", "workspace_kind": "dir", "workspace_path": "/srv/x"},
++])
++def test_pool_worker_leaves_other_keeps_unchanged(on_w2, card):
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_create({"assignee": "default", "requires": [], **card}))
++    assert out.get("task_id") and _runs_on(on_w2.conn, out["task_id"]) is None, out
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index 02847b8d7e..f9104d8f7a 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -159,7 +159,10 @@ def _local_placement(kp, view: dict, decision: dict, *, machine_ok, note_local_p
+         return {"where": "local", "defer": decision["defer"], "why": why}
+     if decision.get("runs_on"):
+         logger.info("kanban placement: local, runs_on %s (%s)", decision["runs_on"], why)
+-        return {"where": "local", "runs_on": decision["runs_on"], "why": why}
++        placement = {"where": "local", "runs_on": decision["runs_on"], "why": why}
++        if decision.get("note"):  # a pool worker's unmet local marker: where the real need is met
++            placement["note"] = decision["note"]
++        return placement
+     logger.info("kanban placement: local (%s)", why)
+     if why.startswith("local marker"):
+         return {"where": "local", "why": why, "remedy": kp.marker_remedy(why, None, view)}
+@@ -216,7 +219,10 @@ def _marker_placement_fields(conn, new_tid: str, marker_placement: Optional[dict
+                          f"forwards it there and this card completes when that one does.")}
+     if (marker_placement.get("runs_on") or marker_placement.get("placement_policy")
+             or marker_placement.get("hub_admission")):
+-        return {"placement": dict(marker_placement)}
++        enrolled = {"placement": dict(marker_placement)}
++        if marker_placement.get("note"):
++            enrolled["note"] = marker_placement["note"]  # a pool worker's unmet local marker (queue_decision)
++        return enrolled
+     out: dict = {"placement": {"where": marker_placement["where"], "why": marker_placement["why"]}}
+     if marker_placement.get("remedy"):
+         out["remedy"] = marker_placement["remedy"]
+-- 
+2.51.0
+

@@ -1,0 +1,463 @@
+From 02d6a905628b2a65c6deb9cebc30f039ba0d74af Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:38:33 +0000
+Subject: [PATCH] [daveey] kanban placement: deny route queues only when one
+ fresh machine holds the whole label set
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes the non-blocking nits of the independent exact-head review of PR #2001
+(t_01a1d416d71f0738, GitHub review 5888504189).
+
+1. pool_route (hub admission deny route) judged liveness on the queue label alone but queued
+   [pool:worker, *coordination labels] (capability:hub-write rides along for hub:write), so with no
+   single live machine holding both the denied card sat unclaimable. It now builds runs_on once and
+   judges the whole tuple with the same source queue_decision uses (the machine_ok seam, handed the
+   label tuple, or _machine_picks_up); with no joint holder today's fallback (worker-first, or the
+   mandatory-pin refusal) stands. Pickup's re-place target (hub_admission_pickup._target) follows.
+2. machine_ok annotations in kanban_placement widen to Callable[[str | tuple[str, ...]], bool].
+3. _machine_picks_up: one branch for any non-string label collection or pool label
+   (`not isinstance(name, str) or is_pool_label(name)`), annotated str | Iterable[str].
+4. label_machines counts only members seen within coordination's FRESH_S window (the same _fresh
+   check attestation uses: missing, future, non-finite or >300 s old last_seen is stale), so a stale
+   active/unheld entry holding the full set no longer makes a queue look live (marker path too).
+
+Tests: registry fixtures that feed the queue now stamp last_seen at fetch time
+(_placement_helpers.seen_now); machine_ok/_machine_picks_up fakes that said "pool:worker is live"
+accept the label tuple.
+
+Proof: RED on b398342d11 — label_machines freshness 5 cases, deny route split/stale + seam tuple
+(3) fail; GREEN on head: the 102 test files importing the placement modules (2565 passed).
+---
+ hermes_cli/kanban_hub_admission_placement.py  | 10 ++--
+ hermes_cli/kanban_placement.py                | 25 +++++-----
+ tests/hermes_cli/_placement_helpers.py        |  9 ++++
+ .../test_kanban_hub_admission_pickup.py       | 10 +++-
+ tests/hermes_cli/test_kanban_placement.py     | 34 +++++++++++++
+ .../test_kanban_pool_deny_runs_on.py          |  5 +-
+ tests/hermes_cli/test_kanban_pool_queue.py    |  9 ++--
+ ...test_kanban_hub_admission_create_report.py |  2 +-
+ ...est_kanban_hub_admission_decision_cards.py |  2 +-
+ tests/test_kanban_hub_admission_entry.py      |  2 +-
+ tests/test_kanban_hub_admission_placement.py  | 49 +++++++++++++++++--
+ 11 files changed, 129 insertions(+), 28 deletions(-)
+
+diff --git a/hermes_cli/kanban_hub_admission_placement.py b/hermes_cli/kanban_hub_admission_placement.py
+index aadfd8e19c..682882beb0 100644
+--- a/hermes_cli/kanban_hub_admission_placement.py
++++ b/hermes_cli/kanban_hub_admission_placement.py
+@@ -526,7 +526,8 @@ def hub_stay_remedy(structural, labels, *, assignee=None, pool_profiles=()):
+ 
+ def pool_route(args, cfg, gateway, audit, requires, *, queue=True, machine_ok=None):
+     """Where a denied card goes: the worker queue (``runs_on: [<pool label>, ...]``) when ``queue``
+-    and ``kanban.placement.worker_queue`` names a live label for this gateway, else worker-first.
++    and ``kanban.placement.worker_queue`` names a label for this gateway that one live machine holds together
++    with every coordination label, else worker-first.
+ 
+     Never a ``machine:worker-N`` pin. The queue's coordination labels include ``requires``'
+     (``hub:write`` -> ``capability:hub-write``), so only a hub-write worker claims it.
+@@ -551,8 +552,11 @@ def pool_route(args, cfg, gateway, audit, requires, *, queue=True, machine_ok=No
+             # The declared list, normalized: a decision card's raw view can carry a bare string.
+             out["requires"] = [declared] if isinstance(declared, str) else list(declared)
+         return out
+-    if label and (machine_ok or kp._machine_picks_up)(label):
+-        out = {"where": "local", "runs_on": [label, *sorted(extra - {label})],
++    runs_on = [label, *sorted(extra - {label})] if label else []
++    # One liveness source for the whole set, as queue_decision judges it: one active, unheld, fresh pickup machine
++    # must hold every label (hub:write rides as capability:hub-write), else nobody could claim the queued card.
++    if label and (machine_ok or kp._machine_picks_up)(label if len(runs_on) == 1 else tuple(runs_on)):
++        out = {"where": "local", "runs_on": runs_on,
+                "why": QUEUED_WHY.format(label=label), "hub_admission": audit}
+     elif why := worker_first_refusal(args):
+         # No attested queue: a denied mandatory pin is refused, as it was while the pin counted as uncarried.
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 2ce74b3949..a5db821ea4 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -275,15 +275,18 @@ def route_labels(dest: str) -> list[str]:
+ 
+ 
+ def label_machines(label: str | Iterable[str], machines: Optional[dict] = None) -> list[str]:
+-    """Active, unheld registry machines that carry ``label`` (or every label of a list/set) and pick up other
+-    gateways' cards (sorted)."""
++    """Active, unheld, fresh registry machines that carry ``label`` (or every label of a list/set) and pick up
++    other gateways' cards (sorted). Fresh is coordination attestation's window (``last_seen`` within
++    ``FRESH_S``): a stale entry holding the whole set leases nothing, so it must not make a queue look live."""
+     from hermes_cli import kanban_worker_node as wn
++    from hermes_cli.kanban_placement_coordination import _fresh
+     if machines is None:
+         machines = (wn.registry() or {}).get("machines") or {}
+     wanted = {label} if isinstance(label, str) else set(label)
++    now = time.time()
+     return sorted(name for name, entry in machines.items()
+                   if isinstance(entry, dict) and entry.get("state", "active") == "active" and not entry.get("hold")
+-                  and ("pickup" not in entry or wn.advertises_pickup(entry))
++                  and ("pickup" not in entry or wn.advertises_pickup(entry)) and _fresh(entry, now)
+                   and wanted <= set(entry.get("labels") or []))
+ 
+ 
+@@ -649,7 +652,8 @@ def portable_reason(args: dict, cfg: Optional[dict] = None) -> Optional[str]:
+ 
+ 
+ def _routeless_heavy(args: dict, c: _Cfg, self_gw: Optional[str],
+-                     machine_ok: Optional[Callable[[str], bool]], *, skip: bool = False) -> Optional[dict]:
++                     machine_ok: Optional[Callable[[str | tuple[str, ...]], bool]], *,
++                     skip: bool = False) -> Optional[dict]:
+     """Legacy heavy routing; worker pools reuse portability without changing this opt-out path."""
+     from hermes_cli.kanban_placement_coordination import legacy_refusal
+     worker = c.heavy_target(self_gw)
+@@ -663,16 +667,15 @@ def _routeless_heavy(args: dict, c: _Cfg, self_gw: Optional[str],
+             "why": f"heavy work ({heavy}): runs on {worker} through the Board lease"}
+ 
+ 
+-def _machine_picks_up(name: str | tuple[str, ...]) -> bool:
++def _machine_picks_up(name: str | Iterable[str]) -> bool:
+     """``name`` is an active machine in the Board registry that is not held (draining) and has not turned
+     pickup off. The Board registry does not publish ``pickup`` today (10-28: every entry lacked it, the hub
+     and worker-1 included, though both claim ``runs_on`` cards), so a missing field counts as on:
+     ``heavy_route`` naming the worker is the operator saying it picks up. A pool label (:func:`is_pool_label`) is
+-    live when some such machine carries it; a label tuple (queue label + coordination labels) when one carries all."""
++    live when some fresh such machine carries it; a label collection (queue label + coordination labels) when one
++    carries all (:func:`label_machines`)."""
+     from hermes_cli import kanban_worker_node as wn
+-    if isinstance(name, (tuple, list, set, frozenset)):
+-        return bool(label_machines(name))
+-    if is_pool_label(name):
++    if not isinstance(name, str) or is_pool_label(name):
+         return bool(label_machines(name))
+     entry = ((wn.registry() or {}).get("machines") or {}).get(name)
+     if not entry or entry.get("state", "active") != "active" or entry.get("hold"):
+@@ -910,7 +913,7 @@ def _raw_explicit_pin(args: dict) -> str:
+ def decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg: Optional[dict] = None,
+            self_gw: Optional[str] = None, live: Optional[Callable[[str], Optional[str]]] = None,
+            locate: Optional[Callable[[str], dict]] = None, carries: Optional[bool] = None,
+-           machine_ok: Optional[Callable[[str], bool]] = None,
++           machine_ok: Optional[Callable[[str | tuple[str, ...]], bool]] = None,
+            info: Optional[Callable[[str], dict]] = None) -> dict:
+     """``_decide`` plus one rule: a caller who pinned another gateway never gets a silent local card.
+ 
+@@ -952,7 +955,7 @@ def decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg:
+ def _decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg: Optional[dict] = None,
+             self_gw: Optional[str] = None, live: Optional[Callable[[str], Optional[str]]] = None,
+             locate: Optional[Callable[[str], dict]] = None, carries: Optional[bool] = None,
+-            machine_ok: Optional[Callable[[str], bool]] = None,
++            machine_ok: Optional[Callable[[str | tuple[str, ...]], bool]] = None,
+             info: Optional[Callable[[str], dict]] = None) -> dict:
+     """``{"where": "local"|<gateway>, "why": str}`` for a ``kanban_create`` call; heavy work bound for a
+     worker is ``{"where": "local", "runs_on": [machine:<worker>], "why": ...}``. Never raises."""
+diff --git a/tests/hermes_cli/_placement_helpers.py b/tests/hermes_cli/_placement_helpers.py
+index 9274544db4..299434a4da 100644
+--- a/tests/hermes_cli/_placement_helpers.py
++++ b/tests/hermes_cli/_placement_helpers.py
+@@ -5,6 +5,8 @@ depends on another test module's internals.
+ """
+ from __future__ import annotations
+ 
++import time
++
+ from hermes_cli import kanban_placement as kp
+ 
+ ROUTE = {"route": {"macbook": "hub"}, "creator_session": {"hub": "20261023_052109_5b3dee"}}
+@@ -14,6 +16,13 @@ NOWHERE = lambda need: {"need": need, "local": "absent", "holders": [], "stale":
+ SILENT = lambda target: {"profiles": None, "tools": None}
+ 
+ 
++def seen_now(machines):
++    """Registry entries stamped as seen just now: label_machines counts only members seen within
++    kanban_placement_coordination.FRESH_S. Call it inside a registry fetch so every read is fresh."""
++    now = int(time.time() * 1000)
++    return [{**m, "last_seen": now} for m in machines]
++
++
+ def decide(args, **kw):
+     kw.setdefault("cfg", ROUTE)
+     kw.setdefault("self_gw", "macbook")
+diff --git a/tests/hermes_cli/test_kanban_hub_admission_pickup.py b/tests/hermes_cli/test_kanban_hub_admission_pickup.py
+index 649d1b4854..7fa533837c 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission_pickup.py
++++ b/tests/hermes_cli/test_kanban_hub_admission_pickup.py
+@@ -22,6 +22,7 @@ from hermes_cli import kanban_hub_admission_pickup as hap
+ from hermes_cli import kanban_placement as kp
+ from hermes_cli import kanban_worker_node as wn
+ from tests.hermes_cli import hub_judge_support
++from tests.hermes_cli._placement_helpers import seen_now
+ from tests.hermes_cli.kanban_sync_fake_board import FakeService
+ from tests.hermes_cli.test_kanban_worker_node import BOARD, HUB, WORKER, Gateway
+ 
+@@ -59,7 +60,7 @@ def _registry_enter(g):
+ 
+     def enter():
+         out = base()
+-        wn.set_registry_fetch(lambda: {"me": g.name, "machines": list(MACHINES.values())})
++        wn.set_registry_fetch(lambda: {"me": g.name, "machines": seen_now(MACHINES.values())})
+         return out
+     return enter
+ 
+@@ -166,7 +167,9 @@ def test_screen_makes_no_model_call_inside_a_write_transaction(gws, hub_judge):
+ 
+ 
+ def test_target_follows_the_creation_time_deny_route(monkeypatch):
+-    wn.set_registry_fetch(lambda: {"me": HUB, "machines": list(MACHINES.values())})
++    worker = {**MACHINES[WORKER], "labels": [*MACHINES[WORKER]["labels"], "capability:hub-write"]}
++    hub_write = {**MACHINES, WORKER: worker}
++    wn.set_registry_fetch(lambda: {"me": HUB, "machines": seen_now(hub_write.values())})
+     try:
+         fields = {"title": "t", "body": "b", "assignee": "default", "workspace_kind": "scratch",
+                   "requires": ["terminal"], "skills": None, "board": "default"}
+@@ -177,6 +180,9 @@ def test_target_follows_the_creation_time_deny_route(monkeypatch):
+         assert "capability:hub-write" not in hap._target(fields, HUB, CFG, {})
+         monkeypatch.setattr(kp, "portable_reason", lambda args, cfg=None: "home gateway marker")
+         assert "capability:hub-write" in hap._target(fields, HUB, CFG, {})
++        # No live machine holds pool:worker + capability:hub-write: the deny route falls back to worker-first.
++        wn.set_registry_fetch(lambda: {"me": HUB, "machines": seen_now(MACHINES.values())})
++        assert hap._target(fields, HUB, CFG, {}) is None
+     finally:
+         wn.set_registry_fetch(None)
+ 
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index d67566b658..524cf5d690 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -1435,6 +1435,40 @@ def test_heavy_route_machine_check_reads_the_board_registry(monkeypatch, entry,
+     assert kp._machine_picks_up("worker-1") is ok
+ 
+ 
++# PR #2001 review nit 4 (t_01a1d416d71f0738): coordination attestation counts only members seen within FRESH_S, but
++# label_machines ignored last_seen, so a stale active/unheld entry holding the whole set still let a card queue.
++@pytest.mark.parametrize("age_s,listed", [(0, True), (60, True), (None, False), (301, False), (3600, False),
++                                          (-120, False), ("nan", False)])
++def test_label_machines_counts_only_fresh_members(monkeypatch, age_s, listed):
++    from hermes_cli import kanban_placement_coordination as coord
++    from hermes_cli import kanban_worker_node as wn
++    entry = {"state": "active", "labels": ["pool:worker", "capability:hub-write"]}
++    if age_s == "nan":
++        entry["last_seen"] = float("nan")
++    elif age_s is not None:
++        entry["last_seen"] = (time.time() - age_s) * 1000
++    assert coord.FRESH_S == 300
++    monkeypatch.setattr(wn, "registry", lambda: {"me": "hub", "machines": {"worker-1": entry}})
++    want = ["worker-1"] if listed else []
++    assert kp.label_machines("pool:worker") == want
++    assert kp.label_machines(("pool:worker", "capability:hub-write")) == want
++    assert kp._machine_picks_up(("pool:worker", "capability:hub-write")) is listed
++
++
++# Review nit 3: any non-string label collection is a joint label set, judged in one place.
++@pytest.mark.parametrize("shape", [tuple, list, set, frozenset])
++def test_machine_picks_up_takes_any_label_collection(monkeypatch, shape):
++    from hermes_cli import kanban_worker_node as wn
++    seen = int(time.time() * 1000)
++    machines = {"worker-1": {"state": "active", "last_seen": seen, "labels": ["pool:worker"]},
++                "worker-5": {"state": "active", "last_seen": seen, "labels": ["capability:hub-write"]}}
++    monkeypatch.setattr(wn, "registry", lambda: {"me": "hub", "machines": machines})
++    assert kp._machine_picks_up(shape(["pool:worker"])) is True
++    assert kp._machine_picks_up(shape(["pool:worker", "capability:hub-write"])) is False
++    machines["worker-1"]["labels"].append("capability:hub-write")
++    assert kp._machine_picks_up(shape(["pool:worker", "capability:hub-write"])) is True
++
++
+ @pytest.mark.parametrize("title", ["Analyze public data", "Run the full test suite"])
+ def test_tool_creates_worker_policy_atomically_and_reports_queue(mac, monkeypatch, title):
+     from tools import kanban_tools as kt
+diff --git a/tests/hermes_cli/test_kanban_pool_deny_runs_on.py b/tests/hermes_cli/test_kanban_pool_deny_runs_on.py
+index 591666b897..7dcb693965 100644
+--- a/tests/hermes_cli/test_kanban_pool_deny_runs_on.py
++++ b/tests/hermes_cli/test_kanban_pool_deny_runs_on.py
+@@ -28,6 +28,7 @@ from hermes_cli import kanban_worker_node as wn
+ from hermes_cli import kanban_worker_placement as wp
+ from tests.hermes_cli import hub_judge_support
+ from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli._placement_helpers import seen_now
+ from tests.hermes_cli.kanban_sync_fake_board import FakeService
+ from tools import kanban_tools as kt
+ 
+@@ -56,7 +57,7 @@ def hub(tmp_path, monkeypatch, hub_judge):
+     sync.set_mode(conn, "primary")
+     monkeypatch.setattr(placement.reg, "self_gateway", lambda: ME)
+     monkeypatch.setattr(kt, "_persisted_identity", lambda: "default")
+-    wn.set_registry_fetch(lambda: {"me": ME, "machines": [WORKER]})
++    wn.set_registry_fetch(lambda: {"me": ME, "machines": seen_now([WORKER])})
+     hub_judge.admit_next = False
+     try:
+         yield home, conn
+@@ -206,7 +207,7 @@ def test_self_check_leaves_other_worker_first_cards_to_the_reserve(hub, no_pull,
+     tid = _stranded(conn, age=60 if case == "young" else 3600)
+     cfg = {"worker_pools": CFG["worker_pools"]} if case == "no_queue" else CFG
+     if case == "no_machine":
+-        wn.set_registry_fetch(lambda: {"me": ME, "machines": [{**WORKER, "labels": ["pool:worker"]}]})
++        wn.set_registry_fetch(lambda: {"me": ME, "machines": seen_now([{**WORKER, "labels": ["pool:worker"]}])})
+     if case == "registry_down":
+         wn.set_registry_fetch(lambda: (_ for _ in ()).throw(OSError("board unreachable")))
+     if case == "pinned":  # the Board already assigned it: runs_on machine:worker-N is not the bug state
+diff --git a/tests/hermes_cli/test_kanban_pool_queue.py b/tests/hermes_cli/test_kanban_pool_queue.py
+index eb3e49f7b5..aa32233529 100644
+--- a/tests/hermes_cli/test_kanban_pool_queue.py
++++ b/tests/hermes_cli/test_kanban_pool_queue.py
+@@ -21,6 +21,7 @@ from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import kanban_move as km
+ from hermes_cli import kanban_placement as kp
+ from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli._placement_helpers import seen_now
+ from tests.hermes_cli.kanban_sync_fake_board import FakeService
+ from tests.hermes_cli.test_kanban_worker_node import HUB, MACHINES, WORKER, Gateway
+ 
+@@ -36,7 +37,7 @@ def _machines(*, held=()):
+ 
+ def _registry(*, held=()):
+     machines = list(_machines(held=held).values())
+-    wn.set_registry_fetch(lambda: {"me": HUB, "machines": machines})
++    wn.set_registry_fetch(lambda: {"me": HUB, "machines": seen_now(machines)})
+ 
+ 
+ @pytest.fixture
+@@ -623,7 +624,7 @@ def test_a_worker_created_card_joins_the_pool_and_a_pin_to_the_ship_host_stays(w
+     monkeypatch.setattr("hermes_cli.kanban_capability_registry.self_gateway", lambda: "worker-2")
+     monkeypatch.setattr(kp, "config", lambda: {"worker_queue": {"worker-2": POOL}})
+     machines = list(_machines().values())
+-    wn.set_registry_fetch(lambda: {"me": "worker-2", "machines": machines})
++    wn.set_registry_fetch(lambda: {"me": "worker-2", "machines": seen_now(machines)})
+     out = json.loads(kt._handle_create({"title": "summarise the failing CI jobs", "assignee": "default",
+                                         "requires": []}))
+     assert out.get("ok") and _runs_on(w2.conn, out["task_id"]) == [POOL], out
+@@ -721,7 +722,7 @@ def test_courier_create_denied_by_hub_admission_joins_the_pool_queue(hub, judge,
+     monkeypatch.setattr(kp, "config", lambda: {**CFG, **({"worker_pools": {HUB: ["worker-1"]}} if pools else {})})
+     machines = [{**m, "labels": [*m["labels"], "capability:hub-write"]} if m["name"] == "worker-2" else m
+                 for m in _machines(held=("worker-1",)).values()]
+-    wn.set_registry_fetch(lambda: {"me": HUB, "machines": machines})  # worker-2 is a hub-write worker
++    wn.set_registry_fetch(lambda: {"me": HUB, "machines": seen_now(machines)})  # worker-2: hub-write
+     judge.admit_next = False
+     args = {"title": "Read ~/.hermes/logs/agent.log on the hub", "requires": [], "assignee": "default"}
+     out = json.loads(kt._handle_create(dict(args), origin_intent=_intent(f"request-courier-{pools}")))
+@@ -866,7 +867,7 @@ def _on(monkeypatch, gateway, cfg, machines):
+     monkeypatch.setattr("hermes_cli.kanban_capability_registry.self_gateway", lambda: gateway)
+     monkeypatch.setattr(kp, "config", lambda: cfg)
+     monkeypatch.setattr(kanban_skill_check, "check_task_skills", lambda *a, **k: None)  # no skills dir here
+-    wn.set_registry_fetch(lambda: {"me": gateway, "machines": list(machines.values())})
++    wn.set_registry_fetch(lambda: {"me": gateway, "machines": seen_now(machines.values())})
+ 
+ 
+ @pytest.fixture
+diff --git a/tests/test_kanban_hub_admission_create_report.py b/tests/test_kanban_hub_admission_create_report.py
+index 556f7d759e..26bd14426b 100644
+--- a/tests/test_kanban_hub_admission_create_report.py
++++ b/tests/test_kanban_hub_admission_create_report.py
+@@ -38,7 +38,7 @@ def _cli_create(*argv):
+ @pytest.fixture
+ def hub(monkeypatch, hub_judge):
+     monkeypatch.setattr(placement.reg, "self_gateway", lambda: "hub")
+-    monkeypatch.setattr(placement, "_machine_picks_up", lambda label: label == "pool:worker")
++    monkeypatch.setattr(placement, "_machine_picks_up", lambda labels: "pool:worker" in labels)
+     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+     monkeypatch.delenv("HERMES_KANBAN_WORKER_TASK", raising=False)
+     return hub_judge
+diff --git a/tests/test_kanban_hub_admission_decision_cards.py b/tests/test_kanban_hub_admission_decision_cards.py
+index a853171f4d..82da6c890c 100644
+--- a/tests/test_kanban_hub_admission_decision_cards.py
++++ b/tests/test_kanban_hub_admission_decision_cards.py
+@@ -64,7 +64,7 @@ def test_blocked_decision_card_on_hub_makes_no_judge_call(gate, pin):
+ 
+ 
+ def test_blocked_decision_card_follows_worker_queue(gate):
+-    result = decide(decision_card(), cfg=QUEUE_CFG, machine_ok=lambda label: label == "pool:worker")
++    result = decide(decision_card(), cfg=QUEUE_CFG, machine_ok=lambda labels: "pool:worker" in labels)
+     assert gate == []
+     assert result["runs_on"][0] == "pool:worker"
+     assert "capability:hub-write" in result["runs_on"]
+diff --git a/tests/test_kanban_hub_admission_entry.py b/tests/test_kanban_hub_admission_entry.py
+index cf7c821ec9..bf52172690 100644
+--- a/tests/test_kanban_hub_admission_entry.py
++++ b/tests/test_kanban_hub_admission_entry.py
+@@ -68,7 +68,7 @@ def test_cli_denied_follows_worker_queue(hub_cli, monkeypatch, mode, queued):
+     from hermes_cli import kanban_db_sync as sync
+     monkeypatch.setattr(placement, "config", lambda: {"worker_pools": {"hub": []},
+                                                       "worker_queue": {"hub": "pool:worker"}})
+-    monkeypatch.setattr(placement, "_machine_picks_up", lambda label: label == "pool:worker")
++    monkeypatch.setattr(placement, "_machine_picks_up", lambda labels: "pool:worker" in labels)
+     monkeypatch.setattr(sync, "board_mode", lambda _conn: mode)
+     hub_cli.admit_next = False
+     assert _cli_create(MARKED) == 0
+diff --git a/tests/test_kanban_hub_admission_placement.py b/tests/test_kanban_hub_admission_placement.py
+index 81f79c904d..64ec4651ad 100644
+--- a/tests/test_kanban_hub_admission_placement.py
++++ b/tests/test_kanban_hub_admission_placement.py
+@@ -170,7 +170,7 @@ def test_denied_follows_worker_queue(gate, cfg):
+     """Operator 11-12 (PR #1247): a denied card joins the one worker queue, never machine:worker-N;
+     hub:write rides along as capability:hub-write so only a hub-write worker claims it."""
+     result = placement.decide({"title": "Read ~/.hermes/logs on the hub"}, self_gw="hub", cfg=cfg,
+-                              live=lambda _: None, carries=True, machine_ok=lambda label: label == "pool:worker")
++                              live=lambda _: None, carries=True, machine_ok=lambda labels: "pool:worker" in labels)
+     assert result["where"] == "local"
+     assert result["runs_on"][0] == "pool:worker"
+     assert "capability:hub-write" in result["runs_on"]
+@@ -204,6 +204,49 @@ def test_origin_and_courier_denies_never_queue(gate, monkeypatch):
+     assert hap.pool_route({"title": "x"}, QUEUE_CFG, "hub", audit, ["hub:write"])["runs_on"][0] == "pool:worker"
+ 
+ 
++# PR #2001 review nit 1 (t_01a1d416d71f0738): the deny route judged liveness on the queue label alone but queued
++# [pool:worker, capability:hub-write], so with no single live machine holding both the card sat unclaimable.
++@pytest.mark.parametrize("kind", ["split", "held", "stale", "joint"])
++def test_denied_queues_only_when_one_live_machine_holds_every_label(gate, monkeypatch, kind):
++    import time
++    from hermes_cli import kanban_hub_admission_placement as hap
++    from hermes_cli import kanban_worker_node as wn
++    seen = time.time() * 1000
++    machines = {"worker-1": {"state": "active", "last_seen": seen, "labels": ["pool:worker"]},
++                "worker-5": {"state": "active", "last_seen": seen, "labels": ["capability:hub-write"]}}
++    if kind != "split":
++        machines["worker-1"]["labels"].append("capability:hub-write")
++    if kind == "held":
++        machines["worker-1"]["hold"] = True
++    elif kind == "stale":
++        machines["worker-1"]["last_seen"] = seen - 3600 * 1000
++    monkeypatch.setattr(wn, "registry", lambda: {"me": "hub", "machines": machines})
++    out = hap.pool_route({"title": "x"}, HUB_CFG, "hub", {"admit": False}, ["hub:write"])
++    if kind == "joint":
++        assert out["runs_on"] == ["pool:worker", "capability:hub-write"], out
++        assert "placement_policy" not in out
++    else:
++        assert "runs_on" not in out, out  # today's fallback: worker-first, never an unclaimable queue
++        assert out["placement_policy"] == "worker-first-v1"
++    assert out["requires"] == ["hub:write"]
++
++
++def test_denied_machine_ok_seam_sees_the_whole_label_tuple(gate):
++    from hermes_cli import kanban_hub_admission_placement as hap
++    seen = []
++
++    def ok(labels):
++        seen.append(labels)
++        return labels == ("pool:worker", "capability:hub-write")
++    out = hap.pool_route({"title": "x"}, HUB_CFG, "hub", {"admit": False}, ["hub:write"], machine_ok=ok)
++    assert out["runs_on"] == ["pool:worker", "capability:hub-write"]
++    assert seen == [("pool:worker", "capability:hub-write")]
++    seen.clear()
++    out = hap.pool_route({"title": "x"}, HUB_CFG, "hub", {"admit": False}, None, machine_ok=ok)
++    assert seen == ["pool:worker"]  # a lone queue label is passed as the label itself
++    assert "runs_on" not in out and out["placement_policy"] == "worker-first-v1"
++
++
+ @pytest.mark.parametrize("assignee", [None, ""])
+ def test_omitted_assignee_remedy_names_default(gate, assignee):
+     fields = {"title": "Portable work", "placement": "local"}
+@@ -270,7 +313,7 @@ def test_claim_stall_template_no_worker_can_claim_stays_home(gate, queue_live):
+     """A denied card whose text the pickup claim gate refuses on every worker is not enrolled anywhere."""
+     from hermes_cli import kanban_placement_coordination as coord
+     result = placement.decide(_claim_stall(CLAIM_STALL_BARE), self_gw="hub", cfg=HUB_CFG, live=lambda _: None,
+-                              carries=True, machine_ok=lambda label: queue_live and label == "pool:worker")
++                              carries=True, machine_ok=lambda labels: queue_live and "pool:worker" in labels)
+     assert result["where"] == "local"
+     assert "runs_on" not in result and "placement_policy" not in result
+     assert "requires" not in result  # the deny route's hub:write is a worker label; home keeps the declaration
+@@ -287,7 +330,7 @@ def test_claim_stall_template_via_hub_admin_queues_for_hub_write_workers(gate, m
+     from hermes_cli import kanban_placement_coordination as coord
+     from hermes_cli import kanban_worker_node as wn
+     result = placement.decide(_claim_stall(CLAIM_STALL_HUB_ADMIN), self_gw="hub", cfg=HUB_CFG,
+-                              live=lambda _: None, carries=True, machine_ok=lambda label: label == "pool:worker")
++                              live=lambda _: None, carries=True, machine_ok=lambda labels: "pool:worker" in labels)
+     assert result["runs_on"][0] == "pool:worker"
+     assert "capability:hub-write" in result["runs_on"]
+     assert "capability:coordination-read" not in result["runs_on"]
+-- 
+2.51.0
+

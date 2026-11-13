@@ -1,0 +1,322 @@
+From 899d9bfc6a9d8d1403064e8647239ce836d77670 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:01:09 +0000
+Subject: [PATCH] [daveey] kanban operator: spaced '-' ends the claim window,
+ "to be posted" is never a claim; deferrals take no tick slot
+
+Follow-up to the PR #1983 review nits (t_01a1d3f6c41855df, review t_01a1d3f19d46db17).
+
+1. Delivery claim classifier: a standalone spaced ASCII hyphen (" - ") now ends
+   the governing span like ':' and the em/en dashes, so "No longer pending -
+   posted to t_X." is a claim and needs the exact operator receipt. Intra-word
+   hyphens ("not re-posted") are not boundaries. Controls "not posted",
+   "queued", "failed and was not sent" after " - " stay non-claims.
+
+2. Same classifier: a claim verb directly after "be" ("to be posted", "will be
+   sent") is never a past claim, whatever boundary separates it from its queue
+   word. "Queued to be posted", "Queued (to be posted ...)" and "Queued: to be
+   posted ..." are all non-claims again; "No longer pending: posted to t_X"
+   stays a claim and "has been posted" is still a claim.
+
+3. Home executor: a call deferred for creation sync lag no longer takes a
+   MAX_PER_TICK slot (the cheap replica read that decides the deferral now runs
+   before the slot count and before the Board evidence read), and while the
+   watermark is held below a deferral the scan pages on past SCAN_BATCH request
+   rows, so later synced calls are not stalled up to CREATION_SYNC_GRACE_S.
+   Without a deferral a tick still reads one batch. Deferred calls are still
+   refused consent_unproven after the grace; a caller refusal still wins over
+   the consent refusal.
+
+Proof: RED on 147e0606cb: 4 classifier cases ("No longer pending - posted",
+"Queued (to be posted ...)", "Queued: to be posted ...", "Done (to be
+delivered ...)") and test_deferred_calls_take_no_tick_slot /
+test_scan_continues_past_a_full_batch_behind_a_deferral failed. GREEN: 10
+operator/consent test files, 278 passed. Mutants: 13/13 killed (be-guard,
+hyphen tokenizer/boundary, deferral slot, page always/never, stop on
+unreachable Board while paging, watermark hold, home refusal kept, caller
+refusal precedence). Replay: old vs new claimed_targets over 81,718 real
+summaries/results/comments on worker-4's boards + sync-shadow: 2 changed,
+both "... to be posted ..." future forms that are now (correctly)
+non-claims; no new claims from the spaced hyphen.
+---
+ hermes_cli/kanban_operator_call.py            | 92 +++++++++--------
+ hermes_cli/kanban_operator_delivery.py        | 12 ++-
+ .../test_kanban_consent_provenance.py         | 99 +++++++++++++++++++
+ .../test_kanban_operator_delivery.py          | 16 +++
+ 4 files changed, 174 insertions(+), 45 deletions(-)
+
+diff --git a/hermes_cli/kanban_operator_call.py b/hermes_cli/kanban_operator_call.py
+index dfe8e85b3f..f8905f946b 100644
+--- a/hermes_cli/kanban_operator_call.py
++++ b/hermes_cli/kanban_operator_call.py
+@@ -718,51 +718,61 @@ def apply_incoming(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+             with kb.write_txn(conn):
+                 ensure_schema(conn)
+         last = _scan_start(conn, board, rep)
+-        rows = rep.execute("SELECT id, uid, task_id, payload FROM task_events WHERE id > ? AND kind = ? "
+-                           "ORDER BY id LIMIT ?", (last, REQUEST_KIND, SCAN_BATCH)).fetchall()
+-        hi = rep.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0] if len(rows) < SCAN_BATCH \
+-            else rows[-1][0]
++        from hermes_cli.kanban_consent import home_refusal
+         handled = 0
+-        hold = hi  # below the first call deferred for creation sync lag
+-        for eid, euid, etask, raw in rows:
+-            try:
+-                payload = json.loads(raw or "{}")
+-            except ValueError:
+-                continue
+-            uid, target = payload.get("request_uid"), payload.get("target_task_id")
+-            labels = payload.get("action") == LABEL_PUBLISH
+-            if labels:
+-                # A machine has no home card: the call names its executor, and only that gateway takes it.
+-                if not uid or own != kol.HOME or payload.get("home") != own:
++        hold = None  # below the first call deferred for creation sync lag
++        cursor, stop = last, False
++        while True:
++            rows = rep.execute("SELECT id, uid, task_id, payload FROM task_events WHERE id > ? AND kind = ? "
++                               "ORDER BY id LIMIT ?", (cursor, REQUEST_KIND, SCAN_BATCH)).fetchall()
++            full = len(rows) >= SCAN_BATCH
++            hi = rows[-1][0] if full else rep.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0]
++            for eid, euid, etask, raw in rows:
++                try:
++                    payload = json.loads(raw or "{}")
++                except ValueError:
+                     continue
+-            elif not uid or not target or not _is_home(conn, own, target):
+-                continue
+-            if conn.execute("SELECT 1 FROM operator_calls WHERE request_uid = ? AND side = 'execute'",
+-                            (uid,)).fetchone():
+-                continue
+-            if handled >= MAX_PER_TICK:
+-                hi = eid - 1
+-                break
+-            handled += 1
+-            event = {"id": eid, "uid": euid, "task_id": etask}
+-            refusal, retry = _caller_refusal(rep, board, event, payload)
+-            if retry:  # unreachable Board: every later call would retry too
+-                hi = eid - 1
+-                break
+-            if refusal is None:
+-                from hermes_cli.kanban_consent import home_refusal
+-                refusal, defer = home_refusal(rep, payload, target)  # unsynced created event: retry, then refuse
+-                if defer:
++                uid, target = payload.get("request_uid"), payload.get("target_task_id")
++                labels = payload.get("action") == LABEL_PUBLISH
++                if labels:
++                    # A machine has no home card: the call names its executor, and only that gateway takes it.
++                    if not uid or own != kol.HOME or payload.get("home") != own:
++                        continue
++                elif not uid or not target or not _is_home(conn, own, target):
++                    continue
++                if conn.execute("SELECT 1 FROM operator_calls WHERE request_uid = ? AND side = 'execute'",
++                                (uid,)).fetchone():
++                    continue
++                if handled >= MAX_PER_TICK:
++                    hi, stop = eid - 1, True
++                    break
++                home = home_refusal(rep, payload, target)  # unsynced created event: retry, then refuse
++                if home[1]:
+                     # Only this caller lags: keep the watermark below it (retried next tick) and go on with the
+-                    # rest; calls handled meanwhile are logged, so the rescan skips them.
+-                    hold = min(hold, eid - 1)
++                    # rest. A deferral takes no tick slot and no Board read; calls handled meanwhile are logged,
++                    # so the rescan skips them.
++                    hold = eid - 1 if hold is None else min(hold, eid - 1)
+                     continue
+-            if labels:
+-                done.append((uid, kol.handle(conn, own, event, payload, refusal)))
+-                continue
+-            outcome, _detail = _execute_one(conn, payload, own, refusal)
+-            done.append((uid, outcome))
+-        hi = min(int(hi), hold)
++                handled += 1
++                event = {"id": eid, "uid": euid, "task_id": etask}
++                refusal, retry = _caller_refusal(rep, board, event, payload)
++                if retry:  # unreachable Board: every later call would retry too
++                    hi, stop = eid - 1, True
++                    break
++                if refusal is None:
++                    refusal = home[0]
++                if labels:
++                    done.append((uid, kol.handle(conn, own, event, payload, refusal)))
++                    continue
++                outcome, _detail = _execute_one(conn, payload, own, refusal)
++                done.append((uid, outcome))
++            # A held watermark rescans from the deferred call each tick: page on past it, or calls more than
++            # SCAN_BATCH request rows later would wait out the deferral's whole grace.
++            if stop or not full or hold is None:
++                break
++            cursor = rows[-1][0]
++        if hold is not None:
++            hi = min(int(hi), hold)
+         stored = conn.execute("SELECT last_id, last_uid FROM operator_call_scan WHERE board = ?",
+                               (board,)).fetchone()
+         new, anchor = _anchor(rep, max(int(hi), last))
+diff --git a/hermes_cli/kanban_operator_delivery.py b/hermes_cli/kanban_operator_delivery.py
+index f1a1b58e32..6b11095a3a 100644
+--- a/hermes_cli/kanban_operator_delivery.py
++++ b/hermes_cli/kanban_operator_delivery.py
+@@ -17,15 +17,19 @@ _NOT_CLAIM = frozenset({"not", "never", "no", "nothing", "none", "neither", "nor
+                         "failed", "refused", "rejected", "unable", "will", "would", "could", "should", "may",
+                         "might", "if", "once", "until", "awaiting", "waiting", "yet"})
+ _GOVERN_WINDOW = 3  # words before the verb: "has not yet been posted", "will later be sent"
+-# A comma, ':', a dash, '(' or a conjunction ends the governing span: "filed no card, so I posted ..." and
+-# "No longer pending: posted to ..." are claims.
+-_BOUNDARY = frozenset({",", ":", "—", "–", "(", "so", "and", "but", "then", "after", "before", "because", "which",
++# A comma, ':', a dash (a standalone spaced '-' too, never an intra-word hyphen), '(' or a conjunction ends the
++# governing span: "filed no card, so I posted ..." and "No longer pending - posted to ..." are claims.
++_BOUNDARY = frozenset({",", ":", "—", "–", "-", "(", "so", "and", "but", "then", "after", "before", "because", "which",
+                        "while", "that"})
+-_WORD = re.compile(r"[\w’']+|[,:—–(]")
++_WORD = re.compile(r"[\w’']+|[,:—–(]|(?<!\S)-(?!\S)")
+ _TASK_ID = re.compile(r"\bt_[0-9a-f]{8}(?:[0-9a-f]{8})?\b")
+ 
+ 
+ def _governed(words, i):
++    if i and words[i - 1] == "be":
++        # "to be posted", "will be sent": an infinitive/future form is never a past claim, whatever boundary
++        # cuts it from its queue word ("Queued: to be posted to ...").
++        return True
+     for w in reversed(words[max(0, i - _GOVERN_WINDOW):i]):
+         if w in _BOUNDARY:
+             return False
+diff --git a/tests/hermes_cli/test_kanban_consent_provenance.py b/tests/hermes_cli/test_kanban_consent_provenance.py
+index ec4a2d742b..ebf1d2ce65 100644
+--- a/tests/hermes_cli/test_kanban_consent_provenance.py
++++ b/tests/hermes_cli/test_kanban_consent_provenance.py
+@@ -293,6 +293,105 @@ def test_unsynced_caller_defers_only_its_own_call(fleet, monkeypatch, tmp_path):
+     assert [r[0] for r in f.h.execute("SELECT body FROM task_comments WHERE task_id=?", (f.target,))] == ["second"]
+ 
+ 
++def _outcome(f, rid):
++    result = requests.get_request(f.w, rid).get("result")
++    return result[0].get("outcome") if isinstance(result, list) and result else None
++
++
++def test_deferred_calls_take_no_tick_slot(fleet, monkeypatch, tmp_path):
++    """MAX_PER_TICK+1 lagging callers ahead of a synced one: the synced call applies in the same tick."""
++    from hermes_cli import kanban_consent as consent
++    from hermes_cli import kanban_operator_call as kox
++    f = fleet
++    lagging = [_stopped_home_call(f, monkeypatch, tmp_path, f"lag{i}") for i in range(kox.MAX_PER_TICK + 1)]
++    for caller, _rid in lagging:
++        _hide_created(f, monkeypatch, caller)
++    later = helpers._submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "synced"})
++    helpers._round(f)
++    assert _outcome(f, later["request_id"]) == "applied", "deferred calls used up the tick's slots"
++    assert all(requests.get_request(f.w, rid)["status"] != "done" for _c, rid in lagging)
++    monkeypatch.setattr(consent, "CREATION_SYNC_GRACE_S", -1)
++    for _ in range(2):  # MAX_PER_TICK refusals per tick
++        helpers._round(f)
++    for _caller, rid in lagging:
++        request = requests.get_request(f.w, rid)
++        assert request["result"][0]["outcome"] == "refused", request
++        assert "consent_unproven" in request["result"][0]["detail"]
++    assert [r[0] for r in f.h.execute("SELECT body FROM task_comments WHERE task_id=?", (f.target,))] == ["synced"]
++
++
++def test_scan_continues_past_a_full_batch_behind_a_deferral(fleet, monkeypatch, tmp_path):
++    """A held watermark must not hide calls more than SCAN_BATCH request rows past it."""
++    from hermes_cli import kanban_operator_call as kox
++    f = fleet
++    monkeypatch.setattr(kox, "SCAN_BATCH", 2)
++    caller, rid = _stopped_home_call(f, monkeypatch, tmp_path, "lagbatch")
++    _hide_created(f, monkeypatch, caller)
++    later = [helpers._submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": f"s{i}"})
++             for i in range(3)]
++    for _ in range(2):  # the watermark stays held below the deferred call across ticks
++        helpers._round(f)
++    assert [_outcome(f, r["request_id"]) for r in later] == ["applied"] * 3, "calls past the batch stalled"
++    assert requests.get_request(f.w, rid)["status"] != "done"
++    assert sorted(r[0] for r in f.h.execute("SELECT body FROM task_comments WHERE task_id=?", (f.target,))) == \
++        ["s0", "s1", "s2"]
++
++
++def test_unreachable_board_stops_paging_behind_a_deferral(fleet, monkeypatch, tmp_path):
++    """An unreachable Board ends the tick even while a held watermark pages on: no later call jumps the retry."""
++    from hermes_cli import kanban_operator_call as kox
++    f = fleet
++    monkeypatch.setattr(kox, "SCAN_BATCH", 2)
++    caller, rid = _stopped_home_call(f, monkeypatch, tmp_path, "lagretry")
++    _hide_created(f, monkeypatch, caller)
++    later = [helpers._submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": f"s{i}"})
++             for i in range(3)]
++    real, down = kox._caller_refusal, {"on": True}
++
++    def flaky(rep, board, event, payload):
++        if down["on"] and (payload.get("args") or {}).get("text") == "s0":
++            return None, True
++        return real(rep, board, event, payload)
++    monkeypatch.setattr(kox, "_caller_refusal", flaky)
++    helpers._round(f)
++    assert [_outcome(f, r["request_id"]) for r in later] == [None] * 3, "a call after the retry was applied first"
++    down["on"] = False
++    helpers._round(f)
++    assert [_outcome(f, r["request_id"]) for r in later] == ["applied"] * 3
++    assert requests.get_request(f.w, rid)["status"] != "done"
++
++
++def test_caller_refusal_wins_over_a_deferral_refusal(fleet, monkeypatch, tmp_path):
++    """A call refused for its caller keeps that reason even when its created event also never synced."""
++    from hermes_cli import kanban_consent as consent
++    from hermes_cli import kanban_operator_call as kox
++    f = fleet
++    caller, rid = _stopped_home_call(f, monkeypatch, tmp_path, "lagcaller")
++    _hide_created(f, monkeypatch, caller)
++    monkeypatch.setattr(consent, "CREATION_SYNC_GRACE_S", -1)
++    monkeypatch.setattr(kox, "_caller_refusal", lambda *a: ("caller_unproven: isolated probe", False))
++    helpers._round(f)
++    request = requests.get_request(f.w, rid)
++    assert request["result"][0]["outcome"] == "refused", request
++    assert "caller_unproven: isolated probe" in request["result"][0]["detail"]
++    assert "consent_unproven" not in request["result"][0]["detail"]
++
++
++def test_without_a_deferral_one_tick_reads_one_batch(fleet, monkeypatch):
++    """Paging past a full batch is only for a held watermark; otherwise the next tick resumes after it."""
++    from hermes_cli import kanban_operator_call as kox
++    f = fleet
++    monkeypatch.setattr(kox, "SCAN_BATCH", 2)
++    later = [helpers._submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": f"s{i}"})
++             for i in range(3)]
++    requests.drain(f.w)
++    f.board()
++    assert len(kox.apply_incoming(f.h)) == 2
++    assert len(kox.apply_incoming(f.h)) == 1
++    helpers._round(f)
++    assert [_outcome(f, r["request_id"]) for r in later] == ["applied"] * 3
++
++
+ def test_submitting_session_stop_is_enforced_and_inherited(fleet, monkeypatch, tmp_path):
+     """A worker run's own timed-out approval binds its submissions and the cards it creates."""
+     from gateway.session_context import scoped_current_session_id
+diff --git a/tests/hermes_cli/test_kanban_operator_delivery.py b/tests/hermes_cli/test_kanban_operator_delivery.py
+index 40bf66b637..0f478bc1c6 100644
+--- a/tests/hermes_cli/test_kanban_operator_delivery.py
++++ b/tests/hermes_cli/test_kanban_operator_delivery.py
+@@ -278,6 +278,22 @@ def test_negation_outside_the_claim_verb_still_needs_a_receipt(fleet, summary):
+     ("Comment to t_0123456789abcdef: queued.", False),
+     ("Comment to t_0123456789abcdef — failed and was not sent.", False),
+     ("Comment to t_0123456789abcdef (not posted).", False),
++    # A standalone spaced ASCII hyphen is a dash too; an intra-word hyphen is not.
++    ("No longer pending - posted to t_0123456789abcdef.", True),
++    ("Comment to t_0123456789abcdef - not posted.", False),
++    ("Comment to t_0123456789abcdef - queued.", False),
++    ("Comment to t_0123456789abcdef - failed and was not sent.", False),
++    ("The note to t_0123456789abcdef was not re-posted.", False),
++    ("Re-posted the note to t_0123456789abcdef.", True),
++    # A future/infinitive form ("to be posted", "will be sent") is never a claim, across any boundary.
++    ("Queued to be posted to t_0123456789abcdef.", False),
++    ("Queued (to be posted to t_0123456789abcdef).", False),
++    ("Queued: to be posted to t_0123456789abcdef.", False),
++    ("Queued - to be posted to t_0123456789abcdef.", False),
++    ("Queued: will be sent to t_0123456789abcdef.", False),
++    ("Done (to be delivered to t_0123456789abcdef).", False),
++    ("Has been posted to t_0123456789abcdef.", True),
++    ("Posted to t_0123456789abcdef as it should be.", True),
+ ])
+ def test_claimed_targets_scopes_negation_to_the_verb(text, claimed):
+     from hermes_cli.kanban_operator_delivery import claimed_targets
+-- 
+2.51.0
+

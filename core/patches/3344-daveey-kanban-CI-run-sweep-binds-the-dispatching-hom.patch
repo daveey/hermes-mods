@@ -1,0 +1,383 @@
+From d409b7e46d775e695cd91407859b7cb6b9f22b74 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:47:30 +0000
+Subject: [PATCH] [daveey] kanban: CI-run sweep binds the dispatching home;
+ per-home no-credential warning; "gh not installed" wording
+
+PR #2039 review follow-ups (review 5888753558):
+
+1. submit_sweep ran _sweep_db on a pool thread, which does not inherit the
+   dispatcher thread's context-local home, so dispatcher_gh_argv() read the
+   launch home's kanban.pr_acceptance.gh_command_prefix for every board.
+   submit_sweep now resolves the home on the dispatcher thread and _sweep_db
+   binds it (bind_profile_scope, no secret hydration).
+2. _WARNED_AT was one process-global timestamp, so one home's hourly
+   no-credential WARNING hid another's. It is now keyed by (home, board db).
+3. A missing gh binary raised NoCredential, whose WARNING told the operator to
+   set gh_command_prefix or log gh in. kanban_gh_argv now raises
+   GhNotInstalled (a GhArgvUnavailable subclass), surfaced as Progress.gh_missing
+   with a "gh not installed: ... Install the GitHub CLI" WARNING.
+4. Docs: dispatcher-side GitHub reads (PR state, CI-run progress) use the
+   dispatcher home's gh_command_prefix, not the assignee's.
+
+Tests (tests/hermes_cli/test_kanban_ci_progress.py), each RED before the fix:
+test_sweep_on_a_pool_thread_uses_the_dispatching_homes_prefix,
+test_no_credential_warning_is_per_home,
+test_missing_gh_warns_gh_not_installed_not_a_credential_fix.
+---
+ hermes_cli/kanban_ci_progress.py            |  73 +++++++++-----
+ hermes_cli/kanban_gh_argv.py                |  10 +-
+ tests/hermes_cli/test_kanban_ci_progress.py | 105 ++++++++++++++++++--
+ website/docs/user-guide/features/kanban.md  |  10 ++
+ 4 files changed, 166 insertions(+), 32 deletions(-)
+
+diff --git a/hermes_cli/kanban_ci_progress.py b/hermes_cli/kanban_ci_progress.py
+index fcefd7f13f..a2b350362a 100644
+--- a/hermes_cli/kanban_ci_progress.py
++++ b/hermes_cli/kanban_ci_progress.py
+@@ -23,7 +23,9 @@ check names the repo (``gh run view <id> -R owner/repo``). Anything else (a PR,
+ GitHub is read through the home's ``kanban.pr_acceptance.gh_command_prefix`` (the credential broker), as the
+ dispatcher's PR-state read does (:mod:`hermes_cli.kanban_gh_argv`): the hub's ``gh`` has no login, and a bare read
+ failed open on every run, so the check never fired there (agent-c2b8fc1abf). A fail-open for want of a credential is
+-logged as one WARNING per ``NO_CREDENTIAL_WARN_SECONDS`` per process, so a disabled check is visible, not silent.
++logged as one WARNING per ``NO_CREDENTIAL_WARN_SECONDS`` per home and board, so a disabled check is visible, not
++silent; a missing ``gh`` binary gets its own wording (install gh), since no prefix or login fixes it. The sweep runs
++on a pool thread with the dispatching home rebound, so each board reads its own home's prefix.
+ """
+ from __future__ import annotations
+ 
+@@ -60,7 +62,11 @@ Fetch = Callable[[str, str], dict]
+ 
+ 
+ class NoCredential(RuntimeError):
+-    """gh has no usable login here (exit 4 / HTTP 401), or no gh argv could be built."""
++    """gh has no usable login here (exit 4 / HTTP 401), or the broker prefix is unusable."""
++
++
++class GhMissing(RuntimeError):
++    """No ``gh`` executable: the fix is installing it, not a credential."""
+ 
+ 
+ @dataclass
+@@ -72,6 +78,7 @@ class Progress:
+     queued_seconds: int = 0
+     detail: str = ""
+     no_credential: bool = False
++    gh_missing: bool = False
+ 
+ 
+ def run_target(ref: str, hint: str = "") -> Optional[tuple[str, str]]:
+@@ -90,10 +97,13 @@ def run_target(ref: str, hint: str = "") -> Optional[tuple[str, str]]:
+ 
+ def _fetch_jobs(repo: str, run_id: str) -> dict:
+     """The run's jobs from the GitHub API through the home's broker prefix + ``gh``. Raises on any failure:
+-    :class:`NoCredential` when gh has no usable login or no argv can be built (config text never included)."""
+-    from hermes_cli.kanban_gh_argv import GhArgvUnavailable, dispatcher_gh_argv
++    :class:`GhMissing` with no gh; :class:`NoCredential` when gh has no usable login or the prefix is unusable
++    (config text never included)."""
++    from hermes_cli.kanban_gh_argv import GhArgvUnavailable, GhNotInstalled, dispatcher_gh_argv
+     try:
+         gh = dispatcher_gh_argv()
++    except GhNotInstalled as exc:
++        raise GhMissing(str(exc)) from None
+     except GhArgvUnavailable as exc:
+         raise NoCredential(f"gh unavailable: {exc}") from None
+     p = subprocess.run([*gh, "api", f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"],
+@@ -127,6 +137,8 @@ def ci_run_progress(ref: str, *, hint: str = "", fetch: Optional[Fetch] = None,
+     repo, run_id = target
+     try:
+         data = (fetch or _fetch_jobs)(repo, run_id)
++    except GhMissing as exc:
++        return Progress("unknown", repo, run_id, detail=str(exc)[-300:], gh_missing=True)
+     except NoCredential as exc:
+         return Progress("unknown", repo, run_id, detail=str(exc)[-300:], no_credential=True)
+     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+@@ -183,20 +195,26 @@ def confirm(awaiting: Optional[dict], *, hint: str = "", fetch: Optional[Fetch]
+ _LOCK = threading.Lock()
+ _LAST_CHECK: dict[tuple[str, str], float] = {}
+ _SWEEPS: dict[str, Future] = {}
+-_WARNED_AT: Optional[float] = None
++# (home, board db) -> monotonic time of the last disabled-check WARNING. Keyed like ``_LAST_CHECK`` (and by home,
++# whose gh_command_prefix the read used) so one home's warning never hides another's in a multi-home process.
++_WARNED_AT: dict[tuple[str, str], float] = {}
+ 
+ 
+-def _warn_no_credential(p: Progress) -> None:
+-    """One WARNING per ``NO_CREDENTIAL_WARN_SECONDS`` per process: without a credential every read fails open."""
+-    global _WARNED_AT
++def _warn_disabled(p: Progress, key: tuple[str, str]) -> None:
++    """One WARNING per ``NO_CREDENTIAL_WARN_SECONDS`` per ``key``: with no gh or no credential every read fails open."""
+     with _LOCK:
+         now = time.monotonic()
+-        if _WARNED_AT is not None and now - _WARNED_AT < NO_CREDENTIAL_WARN_SECONDS:
++        last = _WARNED_AT.get(key)
++        if last is not None and now - last < NO_CREDENTIAL_WARN_SECONDS:
+             return
+-        _WARNED_AT = now
+-    logger.warning("kanban ci run progress: %s; no credential: CI-run progress check disabled (cards parked on CI "
+-                   "runs are neither refused nor woken). Set kanban.pr_acceptance.gh_command_prefix to the "
+-                   "credential broker or log gh in.", p.detail)
++        _WARNED_AT[key] = now
++    disabled = "CI-run progress check disabled (cards parked on CI runs are neither refused nor woken)"
++    if p.gh_missing:
++        logger.warning("kanban ci run progress: %s; gh not installed: %s. Install the GitHub CLI (gh) on PATH, "
++                       "~/bin or ~/.local/bin of this host.", p.detail, disabled)
++    else:
++        logger.warning("kanban ci run progress: %s; no credential: %s. Set kanban.pr_acceptance.gh_command_prefix "
++                       "to the credential broker or log gh in.", p.detail, disabled)
+ 
+ 
+ def _ci_waits(conn: sqlite3.Connection) -> list[tuple[str, str, str]]:
+@@ -246,10 +264,12 @@ def sweep(conn: sqlite3.Connection, *, fetch: Optional[Fetch] = None) -> list[st
+     """Re-read every CI-waiting card's run (at most once per ``RECHECK_SECONDS`` per card) and wake the cards
+     whose run is not starting. Network: run it off the dispatcher thread (``submit_sweep``). Never raises."""
+     from hermes_cli import kanban_db_connect as kbc
++    from hermes_constants import get_hermes_home
+ 
+     woken: list[str] = []
+     try:
+         db = str(kbc._main_db_file(conn) or "")
++        warn_key = (str(get_hermes_home()), db)
+         for task_id, ref, hint in _ci_waits(conn):
+             key = (db, task_id)
+             with _LOCK:
+@@ -258,8 +278,8 @@ def sweep(conn: sqlite3.Connection, *, fetch: Optional[Fetch] = None) -> list[st
+                     continue
+                 _LAST_CHECK[key] = time.monotonic()
+             p = ci_run_progress(ref, hint=hint, fetch=fetch)
+-            if p.no_credential:
+-                _warn_no_credential(p)
++            if p.no_credential or p.gh_missing:
++                _warn_disabled(p, warn_key)
+             elif p.state == "unknown":
+                 logger.warning("ci run progress for %s (%s) unreadable: %s", task_id, ref, p.detail)
+             if p.state == NOT_STARTING and apply(conn, task_id, ref, p):
+@@ -269,29 +289,36 @@ def sweep(conn: sqlite3.Connection, *, fetch: Optional[Fetch] = None) -> list[st
+     return woken
+ 
+ 
+-def _sweep_db(db_path: str) -> list[str]:
++def _sweep_db(db_path: str, home: str) -> list[str]:
++    """:func:`sweep` on a pool thread with the dispatching ``home`` bound: a pool thread does not inherit the
++    caller's context-local home, so ``dispatcher_gh_argv`` would read the launch home's gh_command_prefix."""
+     from pathlib import Path
+ 
++    from agent.runtime_scope import bind_profile_scope
+     from hermes_cli import kanban_db_connect as kbc
+-    conn = kbc.connect(Path(db_path))
+-    try:
+-        return sweep(conn)
+-    finally:
+-        conn.close()
++    with bind_profile_scope(home, hydrate_secrets=False):
++        conn = kbc.connect(Path(db_path))
++        try:
++            return sweep(conn)
++        finally:
++            conn.close()
+ 
+ 
+ def submit_sweep(conn: sqlite3.Connection, pool) -> Optional[Future]:
+-    """Start one :func:`sweep` of this board on ``pool`` unless one is already running. Never raises."""
++    """Start one :func:`sweep` of this board on ``pool`` unless one is already running. Never raises. The home
++    is resolved here, on the dispatcher thread that has the board's home bound, and rebound on the pool thread."""
+     from hermes_cli import kanban_db_connect as kbc
++    from hermes_constants import get_hermes_home
+     try:
+         db = str(kbc._main_db_file(conn) or "")
+         if not db or not _ci_waits(conn):
+             return None
++        home = str(get_hermes_home())
+         with _LOCK:
+             running = _SWEEPS.get(db)
+             if running is not None and not running.done():
+                 return None
+-            fut = pool.submit(_sweep_db, db)
++            fut = pool.submit(_sweep_db, db, home)
+             _SWEEPS[db] = fut
+         return fut
+     except Exception:
+diff --git a/hermes_cli/kanban_gh_argv.py b/hermes_cli/kanban_gh_argv.py
+index 96164f304f..77059dc53e 100644
+--- a/hermes_cli/kanban_gh_argv.py
++++ b/hermes_cli/kanban_gh_argv.py
+@@ -14,14 +14,20 @@ class GhArgvUnavailable(RuntimeError):
+     """No ``gh`` argv can be built. The message is fixed text: config errors may carry credentials."""
+ 
+ 
++class GhNotInstalled(GhArgvUnavailable):
++    """No ``gh`` executable on PATH, ~/bin or ~/.local/bin: an install problem, not a credential one."""
++
++
+ def dispatcher_gh_argv() -> list[str]:
+-    """``[*gh_command_prefix, gh]`` for this home. Raises :class:`GhArgvUnavailable` with no config text."""
++    """``[*gh_command_prefix, gh]`` for this home: ``get_hermes_home()``, the bound override else the launch home.
++    A caller on a pool thread binds the board's home first (``kanban_ci_progress._sweep_db``). Raises
++    :class:`GhNotInstalled` with no gh, :class:`GhArgvUnavailable` (no config text) for an unusable prefix."""
+     from hermes_cli import kanban_pr_acceptance as kpa
+     from hermes_platform.resolver import github as ghres
+ 
+     resolved = ghres.resolve_gh()
+     if not resolved.found:
+-        raise GhArgvUnavailable("gh not found on PATH, ~/bin or ~/.local/bin")
++        raise GhNotInstalled("gh not installed (not found on PATH, ~/bin or ~/.local/bin)")
+     try:
+         prefix = kpa._gh_command_prefix(None)
+     except (RuntimeError, OSError, ValueError, TypeError, ImportError):
+diff --git a/tests/hermes_cli/test_kanban_ci_progress.py b/tests/hermes_cli/test_kanban_ci_progress.py
+index 7a5e67806e..bdad332a9c 100644
+--- a/tests/hermes_cli/test_kanban_ci_progress.py
++++ b/tests/hermes_cli/test_kanban_ci_progress.py
+@@ -190,7 +190,7 @@ def no_login(fake_gh, monkeypatch):
+     from hermes_cli import kanban_ci_progress as kcp
+     monkeypatch.setenv("FAKE_GH_NEEDS_TOKEN", "1")
+     monkeypatch.delenv("FAKE_BROKER_TOKEN", raising=False)
+-    monkeypatch.setattr(kcp, "_WARNED_AT", None, raising=False)
++    monkeypatch.setattr(kcp, "_WARNED_AT", {}, raising=False)
+     return fake_gh
+ 
+ 
+@@ -239,7 +239,8 @@ def test_no_credential_warns_once_an_hour(kanban_home, no_login, monkeypatch, ca
+         assert len(first) == 1, caplog.text
+         assert "gh api exit 4" in first[0] and "no credential: CI-run progress check disabled" in first[0], first
+         assert _sweep_warnings(caplog, conn) == [], caplog.text
+-        monkeypatch.setattr(kcp, "_WARNED_AT", time.monotonic() - kcp.NO_CREDENTIAL_WARN_SECONDS - 1)
++        stale = time.monotonic() - kcp.NO_CREDENTIAL_WARN_SECONDS - 1
++        monkeypatch.setattr(kcp, "_WARNED_AT", {k: stale for k in kcp._WARNED_AT})
+         assert len(_sweep_warnings(caplog, conn)) == 1, caplog.text
+ 
+ 
+@@ -260,14 +261,104 @@ def test_other_github_errors_are_not_credential_errors(kanban_home, fake_gh, mon
+     assert p.state == "unknown" and not p.no_credential, p
+ 
+ 
+-def test_refused_token_and_missing_gh_are_credential_errors(kanban_home, fake_gh, monkeypatch) -> None:
+-    import types
++def test_refused_token_is_a_credential_error(kanban_home, fake_gh, monkeypatch) -> None:
+     from hermes_cli.kanban_ci_progress import ci_run_progress
+-    from hermes_platform.resolver import github as ghres
+     fake_gh.serve(age=20 * 60)
+     monkeypatch.setenv("FAKE_GH_401", "1")
+     p = ci_run_progress(RUN_URL)
+     assert p.state == "unknown" and p.no_credential and "HTTP 401" in p.detail, p
++
++
++def _no_gh(monkeypatch) -> None:
++    import types
++    from hermes_platform.resolver import github as ghres
+     monkeypatch.setattr(ghres, "resolve_gh", lambda path=None: types.SimpleNamespace(found=False, command=[]))
+-    p = ci_run_progress(RUN_URL)
+-    assert p.state == "unknown" and p.no_credential and "gh not found" in p.detail, p
++
++
++def test_missing_gh_warns_gh_not_installed_not_a_credential_fix(kanban_home, no_login, monkeypatch, caplog) -> None:
++    """PR #2039 review: a missing gh was a ``NoCredential`` whose WARNING said to set gh_command_prefix or log gh
++    in. Neither helps when there is no gh binary; the operator must install it."""
++    from hermes_cli.kanban_ci_progress import ci_run_progress
++    no_login.serve(age=2 * 60)
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        assert _park_on_run().get("status") == "scheduled"
++        monkeypatch.delenv("HERMES_KANBAN_TASK")
++        _no_gh(monkeypatch)
++        p = ci_run_progress(RUN_URL)
++        assert p.state == "unknown" and p.gh_missing and not p.no_credential, p
++        warned = _sweep_warnings(caplog, conn)
++    assert len(warned) == 1, caplog.text
++    assert "gh not installed" in warned[0], warned
++    assert "gh_command_prefix" not in warned[0] and "log gh in" not in warned[0], warned
++
++
++# --- a multi-home process: each board's sweep uses its own home (PR #2039 review) ---------------------------
++
++def _other_home(tmp_path: Path) -> Path:
++    other = tmp_path / "other-home"
++    other.mkdir()
++    return other
++
++
++def _park_stuck_card_in(home: Path, monkeypatch, gh) -> tuple[str, str]:
++    """Under ``home``'s override: a board in that home with a card parked on RUN, whose run then stops starting.
++    Returns ``(task id, board db path)``."""
++    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++    token = set_hermes_home_override(home)
++    try:
++        kb.init_db()
++        with kbc.connect_closing() as conn:
++            tid = _running(conn)
++            _as_worker(monkeypatch, conn, tid)
++            gh.serve(age=2 * 60)
++            assert _park_on_run().get("status") == "scheduled"
++            monkeypatch.delenv("HERMES_KANBAN_TASK")
++            db = str(kbc._main_db_file(conn))
++    finally:
++        reset_hermes_home_override(token)
++    gh.serve(age=20 * 60)
++    return tid, db
++
++
++def test_sweep_on_a_pool_thread_uses_the_dispatching_homes_prefix(kanban_home, tmp_path, no_login,
++                                                                    monkeypatch) -> None:
++    """The launch home has no gh_command_prefix; the dispatching home (bound in the dispatcher thread) has the
++    broker. ``submit_sweep`` runs ``_sweep_db`` on a pool thread, where the context-local home override is not
++    inherited, so the read used the launch home's (empty) prefix, failed auth and never woke the card."""
++    from concurrent.futures import ThreadPoolExecutor
++
++    from hermes_cli import kanban_ci_progress as kcp
++    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++    other = _other_home(tmp_path)
++    wrapper = tmp_path / "broker-other"
++    wrapper.write_text("#!/bin/sh\n[ \"$1\" = -- ] && shift\nFAKE_BROKER_TOKEN=granted exec \"$@\"\n")
++    wrapper.chmod(0o755)
++    _configure_prefix(other, [str(wrapper), "--"])
++    tid, db = _park_stuck_card_in(other, monkeypatch, no_login)
++    kcp._LAST_CHECK.clear()
++    token = set_hermes_home_override(other)
++    try:
++        with kbc.connect_closing(Path(db)) as conn, ThreadPoolExecutor(1) as pool:
++            fut = kcp.submit_sweep(conn, pool)
++            assert fut is not None
++            assert fut.result(timeout=60) == [tid]
++    finally:
++        reset_hermes_home_override(token)
++
++
++def test_no_credential_warning_is_per_home(kanban_home, tmp_path, no_login, monkeypatch, caplog) -> None:
++    """One home's hourly no-credential WARNING must not hide another home's in the same process."""
++    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++    other = _other_home(tmp_path)
++    warned = []
++    for home in (kanban_home, other):
++        _tid, db = _park_stuck_card_in(home, monkeypatch, no_login)
++        token = set_hermes_home_override(home)
++        try:
++            with kbc.connect_closing(Path(db)) as conn:
++                warned.append(_sweep_warnings(caplog, conn))
++        finally:
++            reset_hermes_home_override(token)
++    assert [len(w) for w in warned] == [1, 1], warned
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 22f31556ae..13f01b6089 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -149,6 +149,16 @@ launch profile's wrapper. `gh` is resolved on the child PATH, then in `~/bin` an
+ `~/.local/bin`; a missing CLI or invalid wrapper setting is a `setup` rejection,
+ not a transient infrastructure failure.
+ 
++The dispatcher's own GitHub reads use the same setting from the **dispatcher's
++home** (the home whose dispatcher ticks the board), not the assignee's: the
++PR-state read that releases cards held on an active PR, and the CI-run progress
++sweep that wakes a card parked (`awaiting` kind `ci`) on a GitHub Actions run
++that no runner is picking up. Configure the prefix there too when that home's
++`gh` has no ambient login (a hub or service host), or those reads fail open:
++merged-PR holds wait out their cap, and the CI-run check is disabled with an
++hourly `no credential` WARNING per home and board (`gh not installed` when the
++CLI itself is missing, which no prefix fixes).
++
+ Rejection retains the active card and workspace. Durable `pr_acceptance` events
+ store PR URL, SHA, required contexts, check IDs/URLs, classifications and recovery
+ instructions; `last_failure_error` surfaces the next step. Fix failures, rerun
+-- 
+2.51.0
+

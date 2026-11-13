@@ -1,0 +1,229 @@
+From de51cb0d9d065aaa0c460c8dabbbfebaf09ccf1d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 05:48:48 +0000
+Subject: [PATCH] [daveey] run_tests.sh: a custom HERMES_HOME borrows the
+ account tool store too
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A card's fake HERMES_HOME for a cloned checkout (`HERMES_HOME=$PWD/hh
+scripts/run_tests.sh ...`) still ran setup-hermes.sh into that home and
+downloaded the whole managed toolchain there: python, uv, node, npm, pnpm,
+ripgrep, just, ffmpeg, chromium and cua-driver, 1.5 GB per home. On
+worker-2 the done scratch trees held 27 GiB of such tools/ dirs
+(t_01a1d33425752810). The faked-HOME sharing rule (5624aefd74, 4bc973abd3)
+refused any HERMES_HOME outside $HOME/.hermes, and a real HOME never
+qualified at all.
+
+The sharing decision now keys on the Hermes root PM resolves for the run
+(get_default_hermes_root: HERMES_HOME's root, else HOME's), decided in
+scripts/tool_store_pins.py: the run borrows the account store when that
+root is not the store's own root (the account home or one of its profiles)
+and holds no store of its own. The existing guards stay: an explicit
+HERMES_RUNTIME_DIR opts out, the store must be writable and record this
+checkout's pins with no heal or env re-record, and pytest children still
+start from `env -i` without HERMES_RUNTIME_DIR. A bash fast path keeps the
+owner's own runs (HERMES_HOME unset under the account HOME, or HERMES_HOME
+equal to the account root) free of a Python spawn. No new env var.
+
+Proof (worker-3, fresh checkout ~/code/_wt/fakehome-store-borrow, real
+HOME, HERMES_HOME=$(mktemp -d -p /tmp),
+`scripts/run_tests.sh tests/scripts/test_tool_store_pins.py`):
+- before: home 2.1 GB = tools/ 1.5 GB + cache/uv 392 MB + installs 221 MB
+- after: "▶ borrowed Hermes root: using the account's tool store
+  /home/ubuntu/.hermes/tools"; home 612 MB, no tools/; the account's
+  tools/facts.json mtime unchanged.
+- tests/scripts/test_tool_store_pins.py: 4 new tests (custom HERMES_HOME and
+  its profile borrow, faked HOME borrows, the store's own root and its
+  profiles never borrow, a root with its own store keeps it). Without the
+  tool_store_pins.py change the two refusal tests fail.
+
+Remaining per-home cost (per-checkout dependency env + the home's own uv
+cache) is a separate follow-up.
+---
+ scripts/run_tests.sh                  | 25 +++++++++-----
+ scripts/tool_store_pins.py            | 25 ++++++++++++--
+ tests/scripts/test_tool_store_pins.py | 50 +++++++++++++++++++++++++--
+ 3 files changed, 87 insertions(+), 13 deletions(-)
+
+diff --git a/scripts/run_tests.sh b/scripts/run_tests.sh
+index d05749ac30..2bddd82a04 100755
+--- a/scripts/run_tests.sh
++++ b/scripts/run_tests.sh
+@@ -54,9 +54,11 @@ _has_pytest() { [ -n "$1" ] && [ -x "$1" ] && "$1" -c 'import pytest' 2>/dev/nul
+ # shellcheck source=scripts/_activation.sh
+ . "$SCRIPT_DIR/_activation.sh"
+ 
+-# A test run under a faked HOME (worktree lanes, probe homes) provisions its
+-# test environment from the OS account's tool store instead of downloading
+-# ~1 GB of tools into every temporary home, but only while that store already
++# A test run whose Hermes root is not the account's -- a faked HOME (worktree
++# lanes, probe homes) or a HERMES_HOME outside the account root (a card's fake
++# home for a cloned checkout) -- provisions its test environment from the OS
++# account's tool store instead of downloading ~1.5 GB of tools into every
++# temporary home, but only while that store already
+ # records this checkout's pins (_store_has_pins). The check runs unlocked
+ # before `pm install` takes the store's install lock, so it keeps runs that
+ # START on different pins apart; it does not cover the window in between, where
+@@ -67,17 +69,22 @@ _has_pytest() { [ -n "$1" ] && [ -x "$1" ] && "$1" -c 'import pytest' 2>/dev/nul
+ # install or update resolve their own stores. Their PATH still holds the
+ # account store's tool dirs, so a test writing through a PATH tool
+ # (`pip install`, `npm -g`) would write into the account store. An explicit
+-# HERMES_RUNTIME_DIR, a custom HERMES_HOME, a home that already holds a store,
+-# or an account without a usable store keep today's per-home layout.
++# HERMES_RUNTIME_DIR, the account's own root (or a profile of it), a root that
++# already holds a store, or an account without a usable store keep today's
++# per-home layout; tool_store_pins.py resolves the root exactly as PM does.
+ # Prints the account home, then the pinned Python minor.
+ _account_tool_store() {
+   local account py_minor
+   [ -z "${HERMES_RUNTIME_DIR:-}" ] || return 1
+-  case "${HERMES_HOME:-}" in "" | "$HOME/.hermes" | "$HOME/.hermes/"*) ;; *) return 1 ;; esac
+-  [ ! -f "$HOME/.hermes/tools/facts.json" ] || return 1
+   account="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+   [ -n "$account" ] || account="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: *//p')"
+-  [ -n "$account" ] && [ -d "$account" ] && [ ! "$account" -ef "$HOME" ] || return 1
++  [ -n "$account" ] && [ -d "$account" ] || return 1
++  # Fast path for the owner's own runs, which never borrow: no Python spawn.
++  if [ -z "${HERMES_HOME:-}" ]; then
++    [ ! "$account" -ef "$HOME" ] || return 1
++  else
++    [ ! "$HERMES_HOME" -ef "$account/.hermes" ] || return 1
++  fi
+   [ -f "$account/.hermes/tools/facts.json" ] && [ -w "$account/.hermes/tools" ] || return 1
+   py_minor="$(_store_has_pins "$account/.hermes/tools")" || return 1
+   printf '%s\n%s\n' "$account" "$py_minor"
+@@ -98,7 +105,7 @@ if _shared="$(_account_tool_store)"; then
+       && compgen -G "$_account/.local/share/uv/python/cpython-${_shared#*$'\n'}[.-]*" >/dev/null; then
+     export UV_PYTHON_INSTALL_DIR="$_account/.local/share/uv/python"
+   fi
+-  echo "▶ faked HOME: using the account's tool store $HERMES_RUNTIME_DIR"
++  echo "▶ borrowed Hermes root: using the account's tool store $HERMES_RUNTIME_DIR"
+ fi
+ unset _account _shared
+ if [ -z "${__HERMES_ACTIVATED:-}" ] && _has_pytest "${HERMES_PYTHON:-}"; then
+diff --git a/scripts/tool_store_pins.py b/scripts/tool_store_pins.py
+index 1d2303b6a5..60a0606374 100644
+--- a/scripts/tool_store_pins.py
++++ b/scripts/tool_store_pins.py
+@@ -1,10 +1,16 @@
+-"""Exit 0 only when a tool store already holds this checkout's pins.
++"""Exit 0 only when this run borrows a tool store that already holds this checkout's pins.
+ 
+ Usage: python -I -B scripts/tool_store_pins.py REPO STORE
+ (on success prints the pinned Python major.minor)
+ 
+ scripts/run_tests.sh asks this before sharing the account's tool store with a
+-faked HOME. facts.json selects ONE entry per package, not one per version:
++run whose Hermes root is not the account's: a faked HOME, or a HERMES_HOME
++outside the account root (a card's fake home, a probe home). Such a root holds
++no store of its own, so without sharing setup-hermes.sh downloads the whole
++toolchain (~1.5 GB) into it. The root is the one PM resolves for this process
++(HERMES_HOME's root, else HOME's). It borrows only when it is not STORE's own
++root and holds no store: the owner provisions its own store, and a root with a
++store keeps it. facts.json selects ONE entry per package, not one per version:
+ provisioning a checkout with other pins re-points the account's own runtime at
+ them and pulls the selection from under a concurrent run on the store's pins.
+ So share only when every tool `pm install` would provision here (cmd_install's
+@@ -27,8 +33,23 @@ def _setup_uv(store: Path, target: str, version: str) -> Path:
+     return store / f"uv-{version}-{os_arch}" / ("uv.exe" if os_arch.startswith("win32") else "uv")
+ 
+ 
++def borrows(store: Path) -> bool:
++    """Is this process's Hermes root another root than STORE's, with no store of its own?"""
++    from hermes_constants import get_default_hermes_root
++
++    root = get_default_hermes_root()
++    try:
++        if root.resolve() == store.resolve().parent:
++            return False
++    except (OSError, RuntimeError):
++        return False
++    return not (root / "tools" / "facts.json").exists()
++
++
+ def main(repo: str, store: Path) -> int:
+     sys.path.insert(0, repo)
++    if not borrows(store):
++        return 1
+     from pm.defaults import default_packages
+     from pm.install import _installed_location
+     from pm.lock import Facts, Lockfile
+diff --git a/tests/scripts/test_tool_store_pins.py b/tests/scripts/test_tool_store_pins.py
+index d8aad7a4de..0a718ce0ed 100644
+--- a/tests/scripts/test_tool_store_pins.py
++++ b/tests/scripts/test_tool_store_pins.py
+@@ -7,6 +7,7 @@ differs from what this checkout's package code records makes `pm install`
+ re-record the shared facts.json.
+ """
+ import json
++import os
+ import subprocess
+ import sys
+ from pathlib import Path
+@@ -52,10 +53,16 @@ def _matching_store(store: Path) -> Path:
+     return _executable(store / f"uv-{lock.version('uv')}-{'-'.join(target.split('-')[:2])}" / "uv")
+ 
+ 
+-def _shares(store: Path) -> bool:
++def _shares(store: Path, *, hermes_home: Path | None = None, home: Path | None = None) -> bool:
++    """Run the check as run_tests.sh does; by default from a borrowing HERMES_HOME beside STORE's root."""
++    env = {k: v for k, v in os.environ.items() if k not in ("HERMES_HOME", "HERMES_DATA_DIR_SUFFIX")}
++    if home is not None:
++        env["HOME"] = str(home)
++    else:
++        env["HERMES_HOME"] = str(hermes_home or store.parent / "borrower")
+     result = subprocess.run(
+         [sys.executable, "-I", "-B", str(ROOT / "scripts/tool_store_pins.py"), str(ROOT), str(store)],
+-        capture_output=True, text=True, timeout=60, check=False,
++        capture_output=True, text=True, timeout=60, check=False, env=env,
+     )
+     return result.returncode == 0
+ 
+@@ -95,3 +102,42 @@ def test_store_running_from_which_would_write_to_it_is_not_shared(tmp_path, brea
+     after = sorted((p.relative_to(store), p.is_file() and p.read_bytes(), p.stat().st_mode)
+                    for p in store.rglob("*"))
+     assert after == before, "the check must stay read-only (no heal, no re-record, no .corrupt)"
++
++
++def _account_store(tmp_path: Path) -> Path:
++    store = tmp_path / "account" / ".hermes" / "tools"
++    _matching_store(store)
++    return store
++
++
++@pytest.mark.platforms("posix")
++def test_a_custom_hermes_home_borrows_the_account_store(tmp_path):
++    """A card's fake HERMES_HOME (outside the account root) used to download the whole toolchain."""
++    store = _account_store(tmp_path)
++    assert _shares(store, hermes_home=tmp_path / "card" / "hh")
++    assert _shares(store, hermes_home=tmp_path / "card" / "hh" / "profiles" / "p"), "a profile of a borrower"
++
++
++@pytest.mark.platforms("posix")
++def test_a_faked_home_borrows_the_account_store(tmp_path):
++    store = _account_store(tmp_path)
++    assert _shares(store, home=tmp_path / "fake-home")
++
++
++@pytest.mark.platforms("posix")
++def test_the_stores_own_root_never_borrows_it(tmp_path):
++    """The owner (or one of its profiles) provisions its own store: no borrowed sharing decision."""
++    store = _account_store(tmp_path)
++    assert not _shares(store, hermes_home=store.parent)
++    assert not _shares(store, hermes_home=store.parent / "profiles" / "work")
++    assert not _shares(store, home=tmp_path / "account"), "HERMES_HOME unset under the account HOME"
++
++
++@pytest.mark.platforms("posix")
++def test_a_root_with_its_own_store_keeps_it(tmp_path):
++    store = _account_store(tmp_path)
++    borrower = tmp_path / "card" / "hh"
++    assert _shares(store, hermes_home=borrower), "control"
++    (borrower / "tools").mkdir(parents=True)
++    (borrower / "tools" / "facts.json").write_text('{"packages": {}, "schema": 1}')
++    assert not _shares(store, hermes_home=borrower)
+-- 
+2.51.0
+

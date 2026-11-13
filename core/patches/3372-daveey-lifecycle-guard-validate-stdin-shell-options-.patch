@@ -1,0 +1,169 @@
+From 69d9c60efa7f094bc46578ddf76a02d27fc46f2f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:59:58 +0000
+Subject: [PATCH] [daveey] lifecycle guard: validate stdin-shell options after
+ -s (review 5887281618)
+
+Bash keeps parsing options after `-s` until the first non-option word or
+`--`, so `_is_stdin_shell` no longer returns at the first `-s`: every option
+word up to the operands is checked, and `-o`/`+o` operands must be in an
+allowlist matching the accepted letter flags (+ pipefail/posix). This
+closes `bash -s -i`, `bash -s -l`, `-o history -o histexpand`,
+`bash -s -H -o history` and the ssh remote form, which main refuses.
+
+Tests: options-after-s verdicts (17), real-Bash history-expansion proofs
+(4), more plain shapes that still nest-mask (5). The startup-file test's
+fallback now emits a warning so CI logs show when the proof was skipped.
+Comment on _may_define_alias: deliberately broad, fail closed.
+---
+ cron/lifecycle_guard.py                       |  6 ++-
+ .../cron/test_lifecycle_guard_heredoc_walk.py | 48 ++++++++++++++++++-
+ tools/shell_heredoc.py                        | 24 ++++++++--
+ 3 files changed, 71 insertions(+), 7 deletions(-)
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 40696f371b..4b4307bdb0 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -774,7 +774,11 @@ def _opens_call_arguments(segment: list[str]) -> bool:
+ def _may_define_alias(text: str) -> bool:
+     """Whether *text* may define or enable an alias (``alias T=' '``, ``BASH_ALIASES[T]=…``,
+     ``shopt -s expand_aliases``), even quote-split (``al''ias``) or ANSI-C quoted (``$'…'``).
+-    An alias can expand to a keyword prefix, so ``T ( bash big.sh )`` may run a subshell."""
++    An alias can expand to a keyword prefix, so ``T ( bash big.sh )`` may run a subshell.
++
++    Deliberately broad: any "alias" substring (a path, ``BASH_ALIASES``, prose) counts. A false
++    positive only makes call-argument paths executed again (fail closed); narrowing it to whole
++    words or ``alias NAME=`` would let quote-split or ``$'…'`` spellings fail open. Do not tighten."""
+     # Dropping every quote and backslash rejoins quote-split words (`al''ias`, `al\ias`).
+     return "alias" in re.sub(r"[\"'\\\\]", "", text).lower() or "$'" in text
+ 
+diff --git a/tests/cron/test_lifecycle_guard_heredoc_walk.py b/tests/cron/test_lifecycle_guard_heredoc_walk.py
+index b5a4b28d79..369217b6fb 100644
+--- a/tests/cron/test_lifecycle_guard_heredoc_walk.py
++++ b/tests/cron/test_lifecycle_guard_heredoc_walk.py
+@@ -716,6 +716,8 @@ _WALK_ONLY_BODY = "python3 - <<'PY'\nbash -c 'hermes gateway \"restart\"'\nPY\n"
+ def test_startup_files_and_prompt_hooks_cannot_authorize_nested_masking(tmp_path, shape):
+     """Review 5882059941 #1: login/interactive shells source `$HOME` startup files and run
+     PROMPT_COMMAND before each line; either can rewrite the stdin script (main refuses)."""
++    import warnings
++
+     from tools.shell_heredoc import strip_inert_heredoc_bodies
+ 
+     home = tmp_path / "home"
+@@ -749,7 +751,9 @@ def test_startup_files_and_prompt_hooks_cannot_authorize_nested_masking(tmp_path
+         # all that is checked. A startup file that ran yet failed to rewrite stdin still fails.
+         ran = startup_ran.read_text() if startup_ran.exists() else ""
+         assert shape != "prompt-command" and not ran, f"startup file: {ran!r}\n{stderr}"
+-        print(f"execution proof unavailable on this host (startup file not sourced): {stderr[-500:]!r}")
++        # A warning (not a print, which pytest captures) so a CI log shows the proof was skipped.
++        warnings.warn(f"{shape}: execution proof unavailable on this host (startup file not "
++                      f"sourced); guard verdicts only: {stderr[-300:]!r}", stacklevel=1)
+     assert strip_inert_heredoc_bodies(command, nested=True) == command
+     assert guard(command, cwd=str(tmp_path)) is True
+ 
+@@ -767,7 +771,11 @@ def test_startup_reading_shells_are_not_verbatim_stdin_shells(opener):
+     assert strip_inert_heredoc_bodies(command, nested=True) == command
+ 
+ 
+-@pytest.mark.parametrize("opener", ["bash -s", "bash -e -s", "sh -eu", "bash --norc --noprofile -s"])
++@pytest.mark.parametrize("opener", [
++    "bash -s", "bash -e -s", "sh -eu", "bash --norc --noprofile -s",
++    "bash -s -o pipefail", "bash -o errexit -s -u", "bash -s -- -i", "T=1 bash -s x -i -l",
++    "ssh h 'bash -s -o pipefail'",
++])
+ def test_plain_stdin_shells_still_nest_mask(opener):
+     from tools.shell_heredoc import strip_inert_heredoc_bodies
+ 
+@@ -775,6 +783,42 @@ def test_plain_stdin_shells_still_nest_mask(opener):
+     assert strip_inert_heredoc_bodies(command, nested=True) != command
+ 
+ 
++@pytest.mark.parametrize("opener", [
++    "bash -s -i", "bash -s -l", "bash -s --login", "bash -s -H", "bash -s -k", "bash -es -il",
++    "bash -o history -o histexpand -s", "bash -s -o history -o histexpand", "bash -s -H -o history",
++    "bash -s -o keyword", "bash -s +o interactive-comments", "bash -s -o vi", "bash -s -o",
++    "bash -s -O expand_aliases", "bash -s -", "ssh h 'bash -o history -o histexpand -s'",
++    "ssh h 'bash -s -i'",
++])
++def test_options_after_dash_s_are_still_validated(opener):
++    """Review 5887281618: bash keeps parsing options after `-s`, so `-s` must not end the check,
++    and `-o`/`+o` operands are allowlisted (main refuses these shapes)."""
++    from tools.shell_heredoc import strip_inert_heredoc_bodies
++
++    command = opener + " <<'R'\npython3 - <<'PY'\nx\nPY\nR\n"
++    assert strip_inert_heredoc_bodies(command, nested=True) == command
++
++
++@pytest.mark.parametrize("opener", [
++    "bash -o history -o histexpand -s", "bash -s -o history -o histexpand", "bash -s -H -o history",
++    "ssh h 'bash -o history -o histexpand -s'",
++])
++def test_history_expansion_after_dash_s_runs_walk_only_body(tmp_path, opener):
++    """Review 5887281618: with history expansion on, `timeout !!:1-3 python3 -` runs
++    `timeout 5 bash -s python3 -`, so the inner body is shell, not Python. Real-Bash proof."""
++    from tools.shell_heredoc import strip_inert_heredoc_bodies
++
++    ssh = tmp_path / "ssh"
++    # Local SSH transport control; no network access.
++    ssh.write_text('#!/bin/sh\nshift\nexec /bin/sh -c "$*"\n')
++    ssh.chmod(0o755)
++    command = (opener + " <<'R'\n: 5 bash -s\ntimeout !!:1-3 python3 - <<'PY'\n"
++               "bash -c 'hermes gateway \"restart\"'\nPY\nR\n")
++    _assert_bash_marker(tmp_path, command)
++    assert strip_inert_heredoc_bodies(command, nested=True) == command
++    assert guard(command, cwd=str(tmp_path)) is True
++
++
+ def _keyword_led_subshell_command(tmp_path, shape):
+     big = tmp_path / "big.sh"
+     big.write_text("# padding\n" * 130000 + 'hermes gateway "restart"\n')
+diff --git a/tools/shell_heredoc.py b/tools/shell_heredoc.py
+index aa06e64372..569716462b 100644
+--- a/tools/shell_heredoc.py
++++ b/tools/shell_heredoc.py
+@@ -60,6 +60,14 @@ _STDIN_SHELLS = frozenset({"bash", "sh", "dash", "ksh"})
+ # rewrite the stdin script; ``-H`` (history expansion) and ``-k`` (keyword assignments) change how
+ # its lines are read. No word containing them, alone or combined, is a verbatim stdin shell.
+ _SHELL_FLAG_RE = re.compile(r"[-+][abefhmnpstuvxBCEPT]+|--(?:noprofile|norc|posix)")
++# ``-o``/``+o`` operands with the same effect as the letters above (plus pipefail/posix).
++# ``history``, ``histexpand``, ``keyword``, ``interactive-comments``, ``emacs``/``vi`` and the
++# rest are excluded: they change how the stdin script's lines are read.
++_SHELL_SET_OPTIONS = frozenset({
++    "allexport", "notify", "errexit", "noglob", "hashall", "monitor", "noexec", "privileged",
++    "onecmd", "nounset", "verbose", "xtrace", "braceexpand", "noclobber", "errtrace", "physical",
++    "functrace", "pipefail", "posix",
++})
+ _SSH_VALUE_OPTIONS = frozenset("BbcDEeFIiJLlmOoPpQRSWw")
+ _SSH_FLAG_OPTIONS = frozenset("46AaCgKkMnqTtVvXxYy")
+ _PURE_EXPANSION_RE = re.compile(r"^\$(?:\{[A-Za-z_]\w*(?::?[-=+?][^}]*)?\}|[A-Za-z_]\w*)$")
+@@ -152,14 +160,22 @@ def _is_stdin_shell(words: list[str]) -> bool:
+     peeled = _peeled_command(words)
+     if peeled is None or peeled[1] not in _STDIN_SHELLS:
+         return False
++    # Bash keeps parsing options after `-s` until the first non-option word or `--`, so every
++    # option word up to there is validated (`bash -s -i`, `bash -s -o history` are not verbatim).
++    reads_stdin = False
+     arguments = iter(words[peeled[0] + 1:])
+     for word in arguments:
+         if word in ("-o", "+o"):
+-            next(arguments, None)
++            if next(arguments, None) not in _SHELL_SET_OPTIONS:
++                return False  # `-o history`/`histexpand`/`keyword`/…, or a bare `-o` listing
++        elif word == "--":
++            return reads_stdin  # `bash -s -- args`; `bash -- file` runs the file
++        elif word[:1] not in ("-", "+"):
++            return reads_stdin  # positional parameters after `-s`, else a script-file operand
+         elif not _SHELL_FLAG_RE.fullmatch(word):
+-            return False  # `--`, `-c`, or a script-file operand: stdin is not the script
+-        elif not word.startswith("--") and "s" in word:
+-            return True  # `-s`: the remaining words are positional parameters
++            return False  # `-c`, `-i`, `-l`, `-H`, `-O shopt`, …: stdin is not run verbatim
++        elif word.startswith("-") and not word.startswith("--") and "s" in word:
++            reads_stdin = True
+     return True
+ 
+ 
+-- 
+2.51.0
+

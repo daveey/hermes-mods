@@ -1,0 +1,481 @@
+From ce46dc5bbe1587a85d1cb7af2afa37e32b292fc5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 03:32:04 +0000
+Subject: [PATCH] [daveey] fix(kanban): hub-admission-denied cards keep the
+ worker queue across a gateway restart; self-check repins stranded
+ worker-first cards
+
+Incident (11-13, hermes-hub, t_01a1d2a8ea3dfbdb): kanban_create reported a denied card placed on the
+pool but stored it worker-first with runs_on NULL. It sat ready 36 min while pool workers claimed 63
+other cards, until a manual `hermes kanban move --pool`.
+
+Cause: every gateway restart records the sync loop "stopped" (kanban_sync_runstate), and the new loop
+cleared that only after its first completed round, which took ~20 min on the hub after a restart
+(02:02:46 -> 02:23:05). In that window the tool's machine check (`not runstate.down()`) read the worker
+queue as unreachable, so pool_route fell back to worker-first. Every denied card created 00:56-02:21
+was worker-first, each just after a restart; those before and after queued.
+
+- kanban_sync_runstate.started(): a loop that passed its start checks drops an earlier loop's
+  graceful-stop record. Crash and start-refusal records still wait for a completed round.
+- Dispatcher self-check (kanban_worker_first_selfcheck, from reevaluate): a ready worker-first card
+  created here with runs_on NULL, no claim/lease, ready >= 5 min, on a gateway whose worker queue a
+  live machine carries for the card's labels, gets the same Board repin `kanban move --pool` makes
+  ([pool:worker, *coordination labels]); logged at WARNING and recorded on its moved event.
+
+Tests: tests/hermes_cli/test_kanban_pool_deny_runs_on.py (create through the denied path during a
+restarted loop's first round: runs_on set locally and on the fake Board; self-check repin and its
+non-cases). Red on main: 3 of 8 fail.
+---
+ hermes_cli/kanban_sync_client.py              |   3 +-
+ hermes_cli/kanban_sync_runstate.py            |  20 +-
+ hermes_cli/kanban_sync_stop.py                |   2 +-
+ hermes_cli/kanban_worker_first_selfcheck.py   |  56 +++++
+ hermes_cli/kanban_worker_placement.py         |  22 +-
+ .../test_kanban_pool_deny_runs_on.py          | 215 ++++++++++++++++++
+ .../test_kanban_sync_slow_round_cpu.py        |   2 +-
+ .../hermes_cli/test_machine_metrics_sender.py |   2 +-
+ 8 files changed, 312 insertions(+), 10 deletions(-)
+ create mode 100644 hermes_cli/kanban_worker_first_selfcheck.py
+ create mode 100644 tests/hermes_cli/test_kanban_pool_deny_runs_on.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index fb9ac83791..0d5a7fe9cc 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1461,6 +1461,7 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+     sync.set_lease_client(HubLeaseClient(hub))
+     period = float(interval or sync.sync_config().get("interval_seconds") or DEFAULT_INTERVAL_S)
+     _log.info("kanban sync: running as gateway %s against %s (feed sockets; poll every %.1fs)", ident.gateway, ident.url, period)
++    runstate.started()  # an earlier loop's graceful stop no longer describes this host
+     wake = threading.Event()
+     from hermes_cli.kanban_sync_work import SyncWork
+     work = SyncWork(period)
+@@ -1513,7 +1514,7 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+     finally:
+         sender.close()
+         sampler.close()
+-    runstate.record_down("stopped (gateway stopping, or the host sync lease went to another gateway)")
++    runstate.record_down(runstate.STOPPED)
+ 
+ 
+ def _schema_ahead_boards(boards: list[tuple[str, Path]]) -> list[tuple[str, str]]:
+diff --git a/hermes_cli/kanban_sync_runstate.py b/hermes_cli/kanban_sync_runstate.py
+index e3b3acb74e..41e691fc2b 100644
+--- a/hermes_cli/kanban_sync_runstate.py
++++ b/hermes_cli/kanban_sync_runstate.py
+@@ -18,11 +18,13 @@ from pathlib import Path
+ from typing import Any, Optional
+ 
+ __all__ = [
+-    "SyncNotRunning", "clear", "describe", "down", "explicit_runs_on", "path", "placement_runs_on", "record_down",
+-    "stranded_create",
++    "STOPPED", "SyncNotRunning", "clear", "describe", "down", "explicit_runs_on", "path", "placement_runs_on",
++    "record_down", "started", "stranded_create",
+ ]
+ 
+ _FILE = ".sync-state.json"
++# A graceful stop's record (gateway stopping, or the host sync lease went to another gateway): see :func:`started`.
++STOPPED = "stopped (gateway stopping, or the host sync lease went to another gateway)"
+ 
+ 
+ class SyncNotRunning(ValueError):
+@@ -64,6 +66,20 @@ def clear() -> None:
+         pass
+ 
+ 
++def started() -> None:
++    """A new loop passed its start checks: drop an earlier loop's graceful-stop record.
++
++    Every gateway restart writes :data:`STOPPED` on the way down, and the next loop's first completed round (which
++    clears it) took 20 min on the hub after a restart (a full repair pass). Meanwhile :func:`down` called the running
++    loop stopped, so ``kanban_create`` read the worker queue as unreachable and enrolled hub-admission-denied cards
++    worker-first with ``runs_on`` NULL (t_01a1d2a8ea3dfbdb sat ready 36 min, 11-13). A refusal to start or a crash
++    keeps its record until a round completes, as before. [daveey]
++    """
++    record = _read(path())
++    if record and record.get("running") is False and record.get("reason") == STOPPED:
++        clear()
++
++
+ def _read(target: Path) -> Optional[dict[str, Any]]:
+     try:
+         record = json.loads(target.read_text(encoding="utf-8-sig"))
+diff --git a/hermes_cli/kanban_sync_stop.py b/hermes_cli/kanban_sync_stop.py
+index 577a6cba4b..badf530308 100644
+--- a/hermes_cli/kanban_sync_stop.py
++++ b/hermes_cli/kanban_sync_stop.py
+@@ -26,7 +26,7 @@ def run_loop(loop, keep_running: Callable[[], bool], interval) -> None:
+         with stop_scope(keep_running):
+             loop(keep_running, interval, runstate)
+     except SyncStopped:
+-        runstate.record_down("stopped (gateway stopping, or the host sync lease went to another gateway)")
++        runstate.record_down(runstate.STOPPED)
+     except BaseException as exc:
+         runstate.record_down(f"kanban sync loop crashed: {type(exc).__name__}: {exc}")
+         raise
+diff --git a/hermes_cli/kanban_worker_first_selfcheck.py b/hermes_cli/kanban_worker_first_selfcheck.py
+new file mode 100644
+index 0000000000..9da97d0e25
+--- /dev/null
++++ b/hermes_cli/kanban_worker_first_selfcheck.py
+@@ -0,0 +1,56 @@
++"""Dispatcher self-check: a worker-first card left with no ``runs_on`` joins the worker queue. [daveey]
++
++Incident (11-13, hermes-hub): ``kanban_create`` enrolled t_01a1d2a8ea3dfbdb worker-first (``runs_on`` NULL) after
++hub admission denied it, because the sync loop's runstate still read "stopped" from the previous gateway during the
++restarted loop's 20-minute first round. The Board never assigned it and its reserves failed on the dispatch network
++budget, so it sat ready 36 min while pool workers claimed 63 other cards, until a manual ``hermes kanban move --pool``.
++
++The root cause is fixed at the loop (:func:`hermes_cli.kanban_sync_runstate.started`). This is the backstop for any
++other way a card lands there: a ready ``worker-first-v1`` card created on this gateway, with no ``runs_on``, no claim
++and no lease, ready for :data:`STALE_S` while this gateway has a worker queue label that a live machine carries for
++the card's labels, gets the same Board repin ``hermes kanban move --pool`` makes (``[<pool label>, *coordination
++labels]``, so ``requires: [hub:write]`` keeps ``capability:hub-write``). :func:`hermes_cli.kanban_worker_placement.
++reevaluate` makes the repin in place of a reserve; the card's ``moved`` event records why.
++"""
++from __future__ import annotations
++
++import logging
++import time
++
++logger = logging.getLogger(__name__)
++
++STALE_S = 300
++REASON = ("dispatcher self-check: ready {minutes} min as a worker-first card with no runs_on; queued for the worker "
++          "pool (what `hermes kanban move --pool` does)")
++
++
++def pool_target(conn, row, gateway, cfg, *, now=None):
++    """``(labels, reason)`` for a stranded worker-first card, else None. Read-only; no network beyond the cached
++    machine registry, which must be fresh (an unreadable registry waits for the next tick)."""
++    from hermes_cli import kanban_move as km
++    from hermes_cli import kanban_placement as placement
++    from hermes_cli import kanban_worker_node as node
++    from hermes_cli import kanban_worker_repin as repin
++    from hermes_cli.kanban_parent_unclaimed import ready_since
++    from hermes_cli.kanban_worker_placement import POLICY
++
++    if (row["placement_policy"] != POLICY or row["runs_on"] is not None or row["status"] != "ready"
++            or row["created_on"] != gateway or row["claim_lock"] is not None or row["lease_holder"] is not None):
++        return None
++    if placement._Cfg(cfg).queue_label(gateway) != placement.POOL_LABEL:
++        return None  # no worker queue here (or another label): worker-first is this gateway's route
++    waited = (time.time() if now is None else now) - ready_since(conn, row["id"], row["created_at"])
++    if waited < STALE_S:
++        return None
++    labels = repin._pool_target(row)
++    if labels is None:
++        return None  # an action no pool worker is labelled for keeps its worker-first placement
++    registry = node.registry(require_fresh=True)
++    if registry is None or not km.matching_machines(labels, registry.get("machines") or {}, me=gateway,
++                                                    exclude_me=False):
++        return None
++    return labels, REASON.format(minutes=int(waited // 60))
++
++
++def log_repin(task_id, labels, reason):
++    logger.warning("kanban worker-first self-check: repinned %s to %s (%s)", task_id, labels, reason)
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 587471cf71..a449cb3f37 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -364,7 +364,7 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+             if len(_refused) > 1024:  # cards that left the query never come back to clear their entry
+                 for stale in [k for k, (_, until) in _refused.items() if until <= now]:
+                     del _refused[stale]
+-            labels = None if mode else requested_move(conn, row["id"])
++            labels, why = (None, None) if mode else _move_target(conn, row, gateway, cfg)
+             stage = "recover" if mode else ("reserve" if labels is None else "repin")
+             held = _queued.get(key)
+             identity = _local_identity(conn, row["id"]) if labels is None else None
+@@ -381,7 +381,7 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+                     reply = hub.repin(board, task_id=row["id"], expected_revision=row["sync_version"], runs_on=labels)
+                     queue.clear_streak(gateway, row["id"])
+                     try:
+-                        _record_repin(conn, row["id"], gateway, labels, reply)
++                        _record_repin(conn, row["id"], gateway, labels, reply, reason=why)
+                     except sqlite3.Error:
+                         logger.warning("repinned %s on the Board but could not record it locally", row["id"],
+                                        exc_info=True)
+@@ -496,15 +496,29 @@ def requested_move(conn, task_id):
+     return labels or None
+ 
+ 
+-def _record_repin(conn, task_id, gateway, labels, reply):
++def _move_target(conn, row, gateway, cfg):
++    """``(labels, self-check reason)``: the run's unapplied ``kanban_move`` (reason None), else the worker-first
++    self-check's pool target for a card stranded with no ``runs_on``, else ``(None, None)`` (reserve)."""
++    labels = requested_move(conn, row["id"])
++    if labels is not None:
++        return labels, None
++    from hermes_cli.kanban_worker_first_selfcheck import pool_target
++    return pool_target(conn, row, gateway, cfg) or (None, None)
++
++
++def _record_repin(conn, task_id, gateway, labels, reply, *, reason=None):
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_move as km
+     from hermes_cli.kanban_worker_repin import REPINNED_EVENT_FLAG
+ 
+     version = reply.get("version") if isinstance(reply, dict) else None
++    if reason:  # the worker-first self-check's repin (the Board has committed it)
++        from hermes_cli.kanban_worker_first_selfcheck import log_repin
++        log_repin(task_id, labels, reason)
+     with kb.write_txn(conn):
+         kb._append_event(conn, task_id, km.MOVED_EVENT, {
+-            "from_machine": gateway, "runs_on": labels, "reason": "applied the run's kanban_move as the creator repin",
++            "from_machine": gateway, "runs_on": labels,
++            "reason": reason or "applied the run's kanban_move as the creator repin",
+             "queued": True, REPINNED_EVENT_FLAG: True, "board_version": version})
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_pool_deny_runs_on.py b/tests/hermes_cli/test_kanban_pool_deny_runs_on.py
+new file mode 100644
+index 0000000000..e34a44c94a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pool_deny_runs_on.py
+@@ -0,0 +1,215 @@
++"""Hub-admission-denied cards queue for the worker pool, even across a gateway restart. [daveey]
++
++Incident (11-13, hermes-hub): ``kanban_create`` reported t_01a1d2a8ea3dfbdb as placed on the pool after hub admission
++denied it, but stored it worker-first with ``runs_on`` NULL. It sat ready 36 min while pool workers claimed 63
++other cards, until a manual ``hermes kanban move --pool`` gave it ``[pool:worker, capability:hub-write]``. Cause: every
++gateway restart records the sync loop "stopped", and the new loop cleared that only after its first round (20 min
++on the hub after a restart). In that window the tool's machine check read the queue as unreachable. Cards created
++00:56-02:21 (each just after a restart) were all worker-first; the ones before and after queued.
++
++Entry paths: ``kanban_create`` during a restarted loop's first round (``run_forever`` against the fake Board), and
++the dispatcher's self-check (``kanban_worker_placement.reevaluate``) for a card that is already stranded.
++"""
++from __future__ import annotations
++
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_move as km
++from hermes_cli import kanban_placement as placement
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_runstate as runstate
++from hermes_cli import kanban_worker_node as wn
++from hermes_cli import kanban_worker_placement as wp
++from tests.hermes_cli import hub_judge_support
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tools import kanban_tools as kt
++
++hub_judge = hub_judge_support.hub_judge
++
++ME, BOARD = "hub", "default"
++WORKER = {"name": "worker-1", "state": "active", "labels": ["pool:worker", "capability:hub-write"], "pickup": "all",
++          "hold": False, "pinned_only": False, "max_card_runs": 12}
++CONFIG = ("kanban:\n  sync:\n    enabled: true\n  placement:\n    worker_pools:\n      hub: [worker-1]\n"
++          "    worker_queue:\n      hub: pool:worker\n")
++# Hub-state wording: the deny route adds hub:write, so the queue needs capability:hub-write.
++TITLE = "Read ~/.hermes/logs/agent.log on the hub and fix the self-heal lane"
++QUEUE = {"pool:worker", "capability:hub-write"}
++CFG = {"worker_pools": {ME: ["worker-1"]}, "worker_queue": {ME: "pool:worker"}}
++
++
++@pytest.fixture
++def hub(tmp_path, monkeypatch, hub_judge):
++    for var in ("HERMES_SESSION_ID", "HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK", "HERMES_KANBAN_RUN_ID"):
++        monkeypatch.delenv(var, raising=False)
++    home = support.kanban_home(tmp_path, monkeypatch)
++    (home / "config.yaml").write_text(CONFIG)
++    kb.init_db()
++    conn = kbc.connect(home / "kanban.db")
++    ksc.ensure_identity(conn, BOARD, ME)
++    sync.set_mode(conn, "primary")
++    monkeypatch.setattr(placement.reg, "self_gateway", lambda: ME)
++    monkeypatch.setattr(kt, "_persisted_identity", lambda: "default")
++    wn.set_registry_fetch(lambda: {"me": ME, "machines": [WORKER]})
++    hub_judge.admit_next = False
++    try:
++        yield home, conn
++    finally:
++        conn.close()
++        wn.set_registry_fetch(None)
++        sync.set_lease_client(None)
++
++
++def _loop(home, svc, monkeypatch, during_round=None):
++    """One ``run_forever`` round against the fake Board; ``during_round`` runs before that round syncs."""
++    from hermes_cli import machine_metrics
++
++    board_hub = svc.hub(ME)
++    monkeypatch.setattr(ksc, "load_identity", lambda: board_hub.ident)
++    monkeypatch.setattr(ksc, "Hub", lambda ident: board_hub)
++    monkeypatch.setattr(ksc.sync, "set_lease_client", lambda value: None)
++    monkeypatch.setattr(ksc, "board_paths", lambda: [(BOARD, home / "kanban.db")])
++    monkeypatch.setattr(ksc, "reconcile_links", lambda *args, **kwargs: None)
++    monkeypatch.setattr(machine_metrics, "Reporter", lambda *args: type(
++        "R", (), {"report_due": lambda self: None, "pending_wake_in": lambda self: None})())
++    monkeypatch.setattr(board_hub, "report_metrics", lambda *args: None, raising=False)
++
++    class Feed:
++        def __init__(self, *args, **kwargs):
++            pass
++
++        def run(self):
++            return None
++
++    monkeypatch.setattr(ksc, "FeedWatcher", Feed)
++    real = ksc.sync_all_once
++    rounds = []
++
++    def round_(hub_, boards=None):
++        if during_round is not None and not rounds:
++            during_round()
++        rounds.append(True)
++        return real(hub_, boards=boards)
++
++    monkeypatch.setattr(ksc, "sync_all_once", round_)
++    monkeypatch.setattr(ksc, "wait_for_work", lambda *args: None)
++    ksc.run_forever(lambda: not rounds, interval=1)
++
++
++def test_denied_create_during_a_restarted_loops_first_round_joins_the_worker_queue(hub, monkeypatch):
++    home, conn = hub
++    svc = FakeService()
++    _loop(home, svc, monkeypatch)  # the previous gateway's loop: it stops, recording "stopped"
++    record = runstate.down()
++    assert record is not None and record["reason"].startswith("stopped (gateway stopping")
++    made = []
++
++    def create():
++        made.append(json.loads(kt._handle_create({"title": TITLE, "requires": ["terminal", "file", "git"]})))
++
++    _loop(home, svc, monkeypatch, during_round=create)  # the restarted gateway: a card created mid first round
++    [result] = made
++    assert result.get("ok"), result
++    tid = result["task_id"]
++    assert result["placement"]["where"] == "pool" and set(result["placement"]["runs_on"]) == QUEUE, result
++    row = conn.execute("SELECT placement_policy, runs_on, requires FROM tasks WHERE id=?", (tid,)).fetchone()
++    assert row["placement_policy"] is None
++    assert set(json.loads(row["runs_on"])) == QUEUE
++    assert "hub:write" in json.loads(row["requires"])
++    # The Board queue receives it on the loop's next push: a pool worker carrying both labels can lease it.
++    ksc.sync_board(BOARD, home / "kanban.db", svc.hub(ME), ME)
++    board_row = svc.board(BOARD)["rows"]["tasks"][tid]
++    assert set(json.loads(board_row["runs_on"])) == QUEUE
++    assert not board_row.get("placement_policy")
++
++
++def test_a_crash_or_start_refusal_record_still_waits_for_a_completed_round(hub):
++    for reason in ("kanban sync loop crashed: RuntimeError: x", "not starting: board default: schema ahead"):
++        runstate.record_down(reason)
++        runstate.started()
++        record = runstate.down()
++        assert record is not None and record["reason"] == reason
++    runstate.record_down(runstate.STOPPED)
++    runstate.started()
++    assert runstate.down() is None
++
++
++# --- dispatcher self-check -------------------------------------------------------------------------------------
++
++class RecordingHub:
++    def __init__(self):
++        self.reserves, self.repins = [], []
++
++    def reserve(self, board, **body):
++        self.reserves.append(body)
++        return {"state": "queued", "reason": "waiting_for_worker_capacity"}
++
++    def repin(self, board, **body):
++        self.repins.append(body)
++        return {"version": 9, "runs_on": body["runs_on"], "placement_policy": None}
++
++
++@pytest.fixture
++def no_pull(monkeypatch):
++    monkeypatch.setattr(ksc, "pull", lambda *a, **kw: None)
++    wp._refused.clear()
++    wp._queued.clear()
++    yield
++    wp._refused.clear()
++    wp._queued.clear()
++
++
++def _stranded(conn, *, age, requires=("terminal", "file", "git", "hub:write")):
++    """An acknowledged worker-first card with runs_on NULL, ready for ``age`` seconds."""
++    tid = kb.create_task(conn, title="Self-heal lane fix", assignee="default", placement_policy=wp.POLICY,
++                         requires=list(requires))
++    created = int(time.time()) - age
++    conn.execute("UPDATE kanban_sync_state SET applying=1")
++    conn.execute("UPDATE tasks SET sync_version=4, created_on=?, created_at=? WHERE id=?", (ME, created, tid))
++    conn.execute("UPDATE task_events SET created_at=? WHERE task_id=?", (created, tid))
++    conn.execute("UPDATE kanban_sync_state SET applying=0")
++    conn.execute("DELETE FROM kanban_sync_outbox")
++    conn.commit()
++    return tid
++
++
++def test_self_check_repins_a_stranded_worker_first_card_to_the_pool(hub, no_pull, caplog):
++    _home, conn = hub
++    tid = _stranded(conn, age=36 * 60)
++    board = RecordingHub()
++    with caplog.at_level("WARNING", logger="hermes_cli.kanban_worker_first_selfcheck"):
++        wp.reevaluate(conn, board, BOARD, ME, cfg=CFG)
++    assert board.reserves == []
++    assert [(r["task_id"], r["expected_revision"]) for r in board.repins] == [(tid, 4)]
++    assert set(board.repins[0]["runs_on"]) == QUEUE and board.repins[0]["runs_on"][0] == "pool:worker"
++    [moved] = [e.payload for e in kb.list_events(conn, tid) if e.kind == km.MOVED_EVENT]
++    assert moved["repinned"] is True and "self-check" in moved["reason"] and "36 min" in moved["reason"]
++    assert any(tid in r.getMessage() and "self-check" in r.getMessage() for r in caplog.records)
++    # The applied repin is never replayed as a run's move request.
++    assert wp.requested_move(conn, tid) is None
++
++
++@pytest.mark.parametrize("case", ["young", "no_queue", "no_machine", "registry_down", "pinned"])
++def test_self_check_leaves_other_worker_first_cards_to_the_reserve(hub, no_pull, case):
++    _home, conn = hub
++    tid = _stranded(conn, age=60 if case == "young" else 3600)
++    cfg = {"worker_pools": CFG["worker_pools"]} if case == "no_queue" else CFG
++    if case == "no_machine":
++        wn.set_registry_fetch(lambda: {"me": ME, "machines": [{**WORKER, "labels": ["pool:worker"]}]})
++    if case == "registry_down":
++        wn.set_registry_fetch(lambda: (_ for _ in ()).throw(OSError("board unreachable")))
++    if case == "pinned":  # the Board already assigned it: runs_on machine:worker-N is not the bug state
++        conn.execute("UPDATE kanban_sync_state SET applying=1")
++        conn.execute("UPDATE tasks SET runs_on=? WHERE id=?", (json.dumps(["machine:worker-1"]), tid))
++        conn.execute("UPDATE kanban_sync_state SET applying=0")
++        conn.commit()
++    board = RecordingHub()
++    wp.reevaluate(conn, board, BOARD, ME, cfg=cfg)
++    assert board.repins == []
++    assert [r["task_id"] for r in board.reserves] == [tid]
+diff --git a/tests/hermes_cli/test_kanban_sync_slow_round_cpu.py b/tests/hermes_cli/test_kanban_sync_slow_round_cpu.py
+index 0bf949dace..385e7dc975 100644
+--- a/tests/hermes_cli/test_kanban_sync_slow_round_cpu.py
++++ b/tests/hermes_cli/test_kanban_sync_slow_round_cpu.py
+@@ -72,7 +72,7 @@ def test_slow_sync_rounds_keep_the_hub_cpu_advisory_fresh(tmp_path, monkeypatch)
+     monkeypatch.setattr(client, "FeedWatcher", lambda *a, **kw: SimpleNamespace(run=lambda: None))
+     monkeypatch.setattr(client, "wait_for_work", lambda wake, paths, remaining, keep_running:
+                         waits.append(remaining) or "period")
+-    state = SimpleNamespace(clear=lambda: None, record_down=lambda msg: None)
++    state = SimpleNamespace(clear=lambda: None, record_down=lambda msg: None, started=lambda: None, STOPPED="stopped")
+ 
+     client._run_forever(lambda: len(rounds) < ROUNDS, 30.0, state)
+     # The loop owns the sampler's lifetime: once it returns, the advisory is no longer refreshed (fail-closed).
+diff --git a/tests/hermes_cli/test_machine_metrics_sender.py b/tests/hermes_cli/test_machine_metrics_sender.py
+index a418f79f93..dc60d6b462 100644
+--- a/tests/hermes_cli/test_machine_metrics_sender.py
++++ b/tests/hermes_cli/test_machine_metrics_sender.py
+@@ -550,7 +550,7 @@ def test_a_long_blocked_round_still_yields_reports_from_the_sender(tmp_path, mon
+     monkeypatch.setattr(client, "sync_all_once", blocked_round)
+     monkeypatch.setattr(client, "FeedWatcher", lambda *a, **kw: SimpleNamespace(run=lambda: None))
+     monkeypatch.setattr(client, "wait_for_work", lambda *a: "period")
+-    state = SimpleNamespace(clear=lambda: None, record_down=lambda msg: None)
++    state = SimpleNamespace(clear=lambda: None, record_down=lambda msg: None, started=lambda: None, STOPPED="stopped")
+ 
+     client._run_forever(lambda: len(rounds) < 1, 30.0, state)
+     assert not [t for t in threading.enumerate() if t.name == ms.THREAD_NAME]  # closed with the loop
+-- 
+2.51.0
+

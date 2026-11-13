@@ -1,0 +1,661 @@
+From 87b1e0cbbe2cc31ab29e57595de98a72968fa31c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:49:30 +0000
+Subject: [PATCH] [daveey] Desktop: test a mid-transfer upload stall; pin
+ fetchJson's body-size deadline by behaviour, not a main.ts regex
+
+Follow-ups from the PR #1966 review (pullrequestreview-5887725393):
+
+1. New test: the server takes one chunk of a 32 MiB multipart upload and stops
+   reading (socket backpressure, no response). The idle timer rejects it at the
+   caller's 150 ms timeout, not the ~268 s body-scaled total budget, and the
+   server provably received only part of the body. RED with the idle timer at
+   the budget or removed.
+
+2. fetchJson / fetchPublicJson now put the request on the wire through
+   api-transport's sendWithRequestDeadline(deadline, open, {body, onError,
+   requestState}): it takes the already-started deadline (so it started before
+   http.request), opens the request, arms the deadline with the byte size of the
+   same body it writes, marks requestState.bodySent, writes and ends. The
+   regex over main.ts source in remote-down-gate.test.ts ("main.ts wiring",
+   a banned test shape) is deleted; behavioural tests drive the helper with a
+   fake request (order open -> arm -> end, armed with 20 bytes for a
+   10-character UTF-8 body, bodySent set) and end to end against a live server
+   (a body gets its upload allowance, the same wait without one times out). The
+   existing deadline tests now go through the same helper. RED with arm()
+   missing the body, using the character length, or not setting bodySent.
+---
+ apps/desktop/electron/api-transport.test.ts   | 165 ++++++++--
+ apps/desktop/electron/api-transport.ts        |  38 +++
+ apps/desktop/electron/main.ts                 | 295 +++++++++---------
+ .../desktop/electron/remote-down-gate.test.ts |  11 -
+ 4 files changed, 316 insertions(+), 193 deletions(-)
+
+diff --git a/apps/desktop/electron/api-transport.test.ts b/apps/desktop/electron/api-transport.test.ts
+index 5f74df82dc..f516493318 100644
+--- a/apps/desktop/electron/api-transport.test.ts
++++ b/apps/desktop/electron/api-transport.test.ts
+@@ -23,7 +23,9 @@ import {
+   isIdempotentMethod,
+   isTransientTransportError,
+   jsonAgentFor,
++  multipartBody,
+   requestDeadlineBudgetMs,
++  sendWithRequestDeadline,
+   shouldRetryRequest,
+   startRequestDeadline,
+   withRetry
+@@ -423,21 +425,22 @@ describe('htmlResponseError', () => {
+ // tunnel).
+ // ---------------------------------------------------------------------------
+ 
+-/** One GET shaped exactly like main.ts fetchJson: deadline started before http.request, armed right after. */
++/** One GET through fetchJson's send path: deadline started first, then sendWithRequestDeadline opens and arms. */
+ function deadlineJsonGet(url: string, agent: http.Agent, timeoutMs: number): Promise<any> {
+   return new Promise((resolve, reject) => {
+     const deadline = startRequestDeadline(timeoutMs)
+ 
+-    const req = http.request(new URL(url), { agent, method: 'GET' }, res => {
+-      const chunks: Buffer[] = []
+-      res.on('error', reject)
+-      res.on('data', c => chunks.push(c))
+-      res.on('end', () => resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || 'null')))
+-    })
+-
+-    req.on('error', reject)
+-    deadline.arm(req, reject)
+-    req.end()
++    sendWithRequestDeadline(
++      deadline,
++      () =>
++        http.request(new URL(url), { agent, method: 'GET' }, res => {
++          const chunks: Buffer[] = []
++          res.on('error', reject)
++          res.on('data', c => chunks.push(c))
++          res.on('end', () => resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || 'null')))
++        }),
++      { onError: reject }
++    )
+   })
+ }
+ 
+@@ -549,37 +552,56 @@ describe('live: total request deadline (startRequestDeadline)', () => {
+   })
+ })
+ 
+-/** One POST shaped exactly like main.ts fetchJson with a body: deadline armed with the body's size. */
+-function deadlineJsonPost(url: string, agent: http.Agent, timeoutMs: number, body: Buffer): Promise<any> {
++/** One POST through fetchJson's send path (sendWithRequestDeadline), which arms the deadline with the body it writes. */
++function deadlineJsonPost(
++  url: string,
++  agent: http.Agent,
++  timeoutMs: number,
++  body: Buffer,
++  requestState: { bodySent?: boolean } = {}
++): Promise<any> {
+   return new Promise((resolve, reject) => {
+     const deadline = startRequestDeadline(timeoutMs)
+ 
+-    const req = http.request(
+-      new URL(url),
+-      { agent, method: 'POST', headers: { 'Content-Length': String(body.length) } },
+-      res => {
+-        const chunks: Buffer[] = []
+-        res.on('error', reject)
+-        res.on('data', c => chunks.push(c))
+-        res.on('end', () => resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || 'null')))
+-      }
++    sendWithRequestDeadline(
++      deadline,
++      () =>
++        http.request(
++          new URL(url),
++          { agent, method: 'POST', headers: { 'Content-Length': String(body.length) } },
++          res => {
++            const chunks: Buffer[] = []
++            res.on('error', reject)
++            res.on('data', c => chunks.push(c))
++            res.on('end', () => resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || 'null')))
++          }
++        ),
++      { body, onError: reject, requestState }
+     )
+-
+-    req.on('error', reject)
+-    deadline.arm(req, reject, body?.length)
+-    req.write(body)
+-    req.end()
+   })
+ }
+ 
+ /**
+  * /slow-upload reads the whole body, then keeps the connection busy for `busyMs` (a byte every 20 ms, so the idle
+  * timer never fires) before answering with the byte count: on a loopback socket this stands in for an upload whose
+- * transfer outlasts the JSON deadline. /silent-upload reads the body and then never answers.
++ * transfer outlasts the JSON deadline. /silent-upload reads the body and then never answers. /stall-upload stops
++ * reading after the first chunk and never answers: the client's writes back up in the socket buffers mid-transfer.
+  */
+ function uploadServer(busyMs: number) {
++  const received = { stalled: 0 }
++
+   const server = http.createServer((req, res) => {
+     let bytes = 0
++
++    if (req.url === '/stall-upload') {
++      req.once('data', chunk => {
++        received.stalled += chunk.length
++        req.pause()
++      })
++
++      return
++    }
++
+     req.on('data', chunk => (bytes += chunk.length))
+     req.on('end', () => {
+       if (req.url === '/silent-upload') {
+@@ -600,7 +622,7 @@ function uploadServer(busyMs: number) {
+     await new Promise(resolve => server.close(resolve))
+   }
+ 
+-  return { close, server }
++  return { close, received, server }
+ }
+ 
+ describe('total request deadline: request bodies (uploads)', () => {
+@@ -665,6 +687,91 @@ describe('total request deadline: request bodies (uploads)', () => {
+       await close()
+     }
+   })
++
++  it('an upload stalled mid-transfer (server stops reading, socket backpressure) is cut by the idle timer', async () => {
++    const { close, received, server } = uploadServer(0)
++    const base = await listen(server)
++    const agent = new http.Agent({ keepAlive: true, maxSockets: 4 })
++    // A 32 MiB multipart attachment: far more than loopback socket buffers hold, so the transfer stalls partway.
++    const { body } = multipartBody({ bytes: Buffer.alloc(32 * 1024 * 1024, 7), filename: 'big.bin' })
++    // Its total budget is ~268 s: only the 150 ms idle timer can settle this inside the test's window.
++    expect(requestDeadlineBudgetMs(150, body.length)).toBeGreaterThan(200_000)
++
++    try {
++      const startedAt = performance.now()
++      const outcome = await settleWithin(deadlineJsonPost(`${base}/stall-upload`, agent, 150, body), 3_000)
++
++      expect(outcome.pending).toBeUndefined()
++      expect(String(outcome.error?.message)).toBe('Timed out connecting to Hermes backend after 150ms')
++      expect(performance.now() - startedAt).toBeLessThan(1_500)
++      // The server really stopped partway: it took one chunk of the body, not the whole upload.
++      expect(received.stalled).toBeGreaterThan(0)
++      expect(received.stalled).toBeLessThan(body.length)
++    } finally {
++      agent.destroy()
++      await close()
++    }
++  })
++})
++
++describe('sendWithRequestDeadline (fetchJson / fetchPublicJson send path)', () => {
++  it('arms the deadline with the byte size of the body it writes, after the deadline started', () => {
++    const order: string[] = []
++    const armed: Array<number | undefined> = []
++    const writes: Buffer[] = []
++
++    const deadline = {
++      arm: (_req: http.ClientRequest, _onTimeout: (error: Error) => void, bodyBytes?: number) => {
++        order.push('arm')
++        armed.push(bodyBytes)
++      }
++    } as ReturnType<typeof startRequestDeadline>
++
++    const fakeRequest = () => {
++      order.push('open')
++
++      return {
++        end: () => order.push('end'),
++        on: () => undefined,
++        write: (chunk: Buffer) => writes.push(chunk)
++      } as unknown as http.ClientRequest
++    }
++
++    const requestState: { bodySent?: boolean } = {}
++    const body = Buffer.from('é'.repeat(10)) // 20 bytes, 10 characters: the budget counts bytes
++    sendWithRequestDeadline(deadline, fakeRequest, { body, onError: () => {}, requestState })
++
++    expect(order).toEqual(['open', 'arm', 'end'])
++    expect(armed).toEqual([20])
++    expect(writes).toEqual([body])
++    expect(requestState.bodySent).toBe(true)
++
++    // No body: armed with no allowance, nothing written.
++    sendWithRequestDeadline(deadline, fakeRequest, { onError: () => {} })
++    expect(armed).toEqual([20, undefined])
++    expect(writes).toHaveLength(1)
++  })
++
++  it('a body sent through it gets its upload allowance end to end; the same wait with no body times out', async () => {
++    const { close, server } = uploadServer(400)
++    const base = await listen(server)
++    const agent = new http.Agent({ keepAlive: true, maxSockets: 4 })
++    const body = Buffer.alloc(256 * 1024, 7) // +2098 ms of budget at 125 bytes/ms
++    const requestState: { bodySent?: boolean } = {}
++
++    try {
++      const sized = await settleWithin(deadlineJsonPost(`${base}/slow-upload`, agent, 150, body, requestState), 3_000)
++      expect(sized.error).toBeUndefined()
++      expect(sized.value).toEqual({ bytes: body.length })
++      expect(requestState.bodySent).toBe(true)
++
++      const empty = await settleWithin(deadlineJsonPost(`${base}/slow-upload`, agent, 150, Buffer.alloc(0)), 3_000)
++      expect(String(empty.error?.message)).toBe('Timed out connecting to Hermes backend after 150ms')
++    } finally {
++      agent.destroy()
++      await close()
++    }
++  })
+ })
+ 
+ describe('live: dispatch probe pool', () => {
+diff --git a/apps/desktop/electron/api-transport.ts b/apps/desktop/electron/api-transport.ts
+index d0c02457fe..483bdae3da 100644
+--- a/apps/desktop/electron/api-transport.ts
++++ b/apps/desktop/electron/api-transport.ts
+@@ -164,6 +164,43 @@ function startRequestDeadline(timeoutMs: number, now: () => number = Date.now) {
+   }
+ }
+ 
++type RequestDeadline = ReturnType<typeof startRequestDeadline>
++
++/**
++ * [daveey] Put one JSON request on the wire under its already-started total deadline (fetchJson / fetchPublicJson).
++ *
++ * Taking the started deadline and an `open` callback (the `http.request` call) makes the ordering structural: the
++ * clock started before the request was created. The body is passed once and used both to arm the deadline (its byte
++ * size grows the total budget) and as what is written, so the budget always matches the bytes sent. Marks
++ * `requestState.bodySent` before writing: from here a transport error can't prove the server didn't process it.
++ */
++function sendWithRequestDeadline(
++  deadline: RequestDeadline,
++  open: () => http.ClientRequest,
++  {
++    body,
++    onError,
++    requestState
++  }: { body?: Buffer; onError: (error: Error) => void; requestState?: { bodySent?: boolean } }
++): http.ClientRequest {
++  const req = open()
++
++  req.on('error', onError)
++  deadline.arm(req, onError, body?.length)
++
++  if (requestState) {
++    requestState.bodySent = true
++  }
++
++  if (body) {
++    req.write(body)
++  }
++
++  req.end()
++
++  return req
++}
++
+ // Transient transport errors: retry MAY be safe (subject to verb gating).
+ const TRANSIENT_CODES = new Set([
+   'ECONNRESET',
+@@ -384,6 +421,7 @@ export {
+   readStatusCode,
+   requestDeadlineBudgetMs,
+   requestTimeoutError,
++  sendWithRequestDeadline,
+   shouldRetryRequest,
+   startRequestDeadline,
+   withRetry
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 3186d002fe..d8704d30c2 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -54,6 +54,7 @@ import {
+   multipartBody,
+   readJsonErrorBody,
+   readStatusCode,
++  sendWithRequestDeadline,
+   startRequestDeadline,
+   withRetry
+ } from './api-transport'
+@@ -5246,98 +5247,92 @@ function fetchJson(url, token, options: any = {}) {
+           return
+         }
+ 
+-        const req = client.request(
+-          parsed,
+-          {
+-            agent,
+-            method: options.method || 'GET',
+-            headers: {
+-              ...headersForRemoteRequest(url),
+-              // [daveey] Transcript pages: slim + gzip when the backend supports it (display-transcript.ts).
+-              ...displayTranscriptHeaders(options.method, url),
+-              ...(options.headers || {}),
+-              'Content-Type': contentType,
+-              ...(nativeHeaders || { 'X-Hermes-Session-Token': token }),
+-              // RFC 8252 native flow authenticates the gated gateway with a bearer
+-              // token instead of the loopback session-token header. When
+-              // ``options.bearer`` is set we send Authorization: Bearer <token>;
+-              // the gateway's OAuth gate verifies it via the provider stack with
+-              // no cookie involved.
+-              ...(options.bearer ? { Authorization: `Bearer ${options.bearer}` } : {}),
+-              ...(body ? { 'Content-Length': String(body.length) } : {})
+-            }
+-          },
+-          res => {
+-            const chunks = []
+-            res.on('error', reject)
+-            res.on('data', chunk => chunks.push(chunk))
+-            res.on('end', () => {
+-              let text: string
+-
+-              try {
+-                text = decodeResponseBody(Buffer.concat(chunks), res.headers['content-encoding'])
+-              } catch (error) {
+-                reject(error)
+-
+-                return
+-              }
+-
+-              if ((res.statusCode || 500) >= 400) {
+-                reject(httpStatusError(res.statusCode, text, res.statusMessage))
+-
+-                return
+-              }
+-
+-              // http.request never follows redirects, so any 3xx -- with an HTML
+-              // login page, an empty body, whatever -- is the request bouncing
+-              // off a proxy or a scheme/slash mismatch, never JSON.
+-              if (res.statusCode >= 300) {
+-                reject(htmlResponseError(url, res.statusCode, res.headers.location))
+-
+-                return
+-              }
+-
+-              if (!text) {
+-                resolve(null)
+-
+-                return
++        // On the wire from here (api-transport sendWithRequestDeadline): the deadline is armed with the body's size,
++        // and requestState.bodySent is set, so a later transport error no longer proves the server didn't process it
++        // and non-idempotent verbs are not retried.
++        sendWithRequestDeadline(
++          deadline,
++          () =>
++            client.request(
++              parsed,
++              {
++                agent,
++                method: options.method || 'GET',
++                headers: {
++                  ...headersForRemoteRequest(url),
++                  // [daveey] Transcript pages: slim + gzip when the backend supports it (display-transcript.ts).
++                  ...displayTranscriptHeaders(options.method, url),
++                  ...(options.headers || {}),
++                  'Content-Type': contentType,
++                  ...(nativeHeaders || { 'X-Hermes-Session-Token': token }),
++                  // RFC 8252 native flow authenticates the gated gateway with a bearer
++                  // token instead of the loopback session-token header. When
++                  // ``options.bearer`` is set we send Authorization: Bearer <token>;
++                  // the gateway's OAuth gate verifies it via the provider stack with
++                  // no cookie involved.
++                  ...(options.bearer ? { Authorization: `Bearer ${options.bearer}` } : {}),
++                  ...(body ? { 'Content-Length': String(body.length) } : {})
++                }
++              },
++              res => {
++                const chunks = []
++                res.on('error', reject)
++                res.on('data', chunk => chunks.push(chunk))
++                res.on('end', () => {
++                  let text: string
++
++                  try {
++                    text = decodeResponseBody(Buffer.concat(chunks), res.headers['content-encoding'])
++                  } catch (error) {
++                    reject(error)
++
++                    return
++                  }
++
++                  if ((res.statusCode || 500) >= 400) {
++                    reject(httpStatusError(res.statusCode, text, res.statusMessage))
++
++                    return
++                  }
++
++                  // http.request never follows redirects, so any 3xx -- with an HTML
++                  // login page, an empty body, whatever -- is the request bouncing
++                  // off a proxy or a scheme/slash mismatch, never JSON.
++                  if (res.statusCode >= 300) {
++                    reject(htmlResponseError(url, res.statusCode, res.headers.location))
++
++                    return
++                  }
++
++                  if (!text) {
++                    resolve(null)
++
++                    return
++                  }
++
++                  // A 2xx response whose body is HTML means the request fell through
++                  // to the SPA index.html (e.g. an unregistered /api path). JSON.parse
++                  // would throw an opaque `Unexpected token '<'` here, so surface a
++                  // clear diagnostic with the offending URL instead.
++                  const looksHtml = /^\s*<(?:!doctype|html)/i.test(text)
++                  const contentType = String(res.headers['content-type'] || '')
++
++                  if (looksHtml || contentType.includes('text/html')) {
++                    reject(htmlResponseError(url, res.statusCode))
++
++                    return
++                  }
++
++                  try {
++                    resolve(JSON.parse(text))
++                  } catch {
++                    reject(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
++                  }
++                })
+               }
+-
+-              // A 2xx response whose body is HTML means the request fell through
+-              // to the SPA index.html (e.g. an unregistered /api path). JSON.parse
+-              // would throw an opaque `Unexpected token '<'` here, so surface a
+-              // clear diagnostic with the offending URL instead.
+-              const looksHtml = /^\s*<(?:!doctype|html)/i.test(text)
+-              const contentType = String(res.headers['content-type'] || '')
+-
+-              if (looksHtml || contentType.includes('text/html')) {
+-                reject(htmlResponseError(url, res.statusCode))
+-
+-                return
+-              }
+-
+-              try {
+-                resolve(JSON.parse(text))
+-              } catch {
+-                reject(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
+-              }
+-            })
+-          }
++            ),
++          { body, onError: reject, requestState }
+         )
+-
+-        req.on('error', reject)
+-        deadline.arm(req, reject, body?.length)
+-
+-        // From here the request goes on the wire: a later transport error can no
+-        // longer prove the server didn't process it, so non-idempotent verbs must
+-        // not be retried past this point.
+-        requestState.bodySent = true
+-
+-        if (body) {
+-          req.write(body)
+-        }
+-
+-        req.end()
+       })
+     },
+     { method: options.method || 'GET' }
+@@ -5375,71 +5370,65 @@ function fetchPublicJson(url, options: any = {}) {
+           return
+         }
+ 
+-        const req = client.request(
+-          parsed,
+-          {
+-            agent,
+-            method: options.method || 'GET',
+-            headers: {
+-              ...headersForRemoteRequest(url),
+-              ...(options.headers || {}),
+-              'Content-Type': 'application/json',
+-              ...(body ? { 'Content-Length': String(body.length) } : {})
+-            }
+-          },
+-          res => {
+-            const chunks = []
+-            res.on('data', chunk => chunks.push(chunk))
+-            res.on('end', () => {
+-              const text = Buffer.concat(chunks).toString('utf8')
+-
+-              if ((res.statusCode || 500) >= 400) {
+-                reject(httpStatusError(res.statusCode, text, res.statusMessage))
+-
+-                return
+-              }
+-
+-              if (res.statusCode >= 300) {
+-                reject(htmlResponseError(url, res.statusCode, res.headers.location))
+-
+-                return
+-              }
+-
+-              if (!text) {
+-                resolve(null)
+-
+-                return
+-              }
+-
+-              const looksHtml = /^\s*<(?:!doctype|html)/i.test(text)
+-              const contentType = String(res.headers['content-type'] || '')
+-
+-              if (looksHtml || contentType.includes('text/html')) {
+-                reject(htmlResponseError(url, res.statusCode))
+-
+-                return
+-              }
+-
+-              try {
+-                resolve(JSON.parse(text))
+-              } catch {
+-                reject(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
++        // Past this point the request is on the wire — see fetchJson.
++        sendWithRequestDeadline(
++          deadline,
++          () =>
++            client.request(
++              parsed,
++              {
++                agent,
++                method: options.method || 'GET',
++                headers: {
++                  ...headersForRemoteRequest(url),
++                  ...(options.headers || {}),
++                  'Content-Type': 'application/json',
++                  ...(body ? { 'Content-Length': String(body.length) } : {})
++                }
++              },
++              res => {
++                const chunks = []
++                res.on('data', chunk => chunks.push(chunk))
++                res.on('end', () => {
++                  const text = Buffer.concat(chunks).toString('utf8')
++
++                  if ((res.statusCode || 500) >= 400) {
++                    reject(httpStatusError(res.statusCode, text, res.statusMessage))
++
++                    return
++                  }
++
++                  if (res.statusCode >= 300) {
++                    reject(htmlResponseError(url, res.statusCode, res.headers.location))
++
++                    return
++                  }
++
++                  if (!text) {
++                    resolve(null)
++
++                    return
++                  }
++
++                  const looksHtml = /^\s*<(?:!doctype|html)/i.test(text)
++                  const contentType = String(res.headers['content-type'] || '')
++
++                  if (looksHtml || contentType.includes('text/html')) {
++                    reject(htmlResponseError(url, res.statusCode))
++
++                    return
++                  }
++
++                  try {
++                    resolve(JSON.parse(text))
++                  } catch {
++                    reject(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
++                  }
++                })
+               }
+-            })
+-          }
++            ),
++          { body, onError: reject, requestState }
+         )
+-
+-        req.on('error', reject)
+-        deadline.arm(req, reject, body?.length)
+-
+-        // Past this point the request is on the wire — see fetchJson.
+-        requestState.bodySent = true
+-
+-        if (body) {
+-          req.write(body)
+-        }
+-
+-        req.end()
+       }),
+     { method: options.method || 'GET' }
+   )
+diff --git a/apps/desktop/electron/remote-down-gate.test.ts b/apps/desktop/electron/remote-down-gate.test.ts
+index 33c20cffa4..c6a9e692a9 100644
+--- a/apps/desktop/electron/remote-down-gate.test.ts
++++ b/apps/desktop/electron/remote-down-gate.test.ts
+@@ -436,17 +436,6 @@ describe('remote down gate: trial deadline', () => {
+ describe('main.ts wiring', () => {
+   const main = readFileSync(join(__dirname, 'main.ts'), 'utf8')
+ 
+-  it('fetchJson and fetchPublicJson start the total deadline before http.request and arm it on the request', () => {
+-    for (const name of ['function fetchJson(', 'function fetchPublicJson(']) {
+-      const body = main.slice(main.indexOf(name), main.indexOf(name) + 9000)
+-      const start = body.indexOf('startRequestDeadline(timeoutMs)')
+-
+-      expect(start).toBeGreaterThan(0)
+-      expect(start).toBeLessThan(body.indexOf('client.request('))
+-      expect(body).toMatch(/deadline\.arm\(req, reject, body\?\.length\)/)
+-    }
+-  })
+-
+   it('fetchJson picks the probe pool when asked and fetchJsonForBackend forwards it', () => {
+     expect(main).toMatch(/jsonAgentFor\(parsed\.protocol, options\.pool === 'probe' \? 'probe' : 'json'\)/)
+     const body = main.slice(main.indexOf('async function fetchJsonForBackend('))
+-- 
+2.51.0
+

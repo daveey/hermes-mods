@@ -1,0 +1,160 @@
+From 41ae5143f0b0e2fd1b3761fd2dd2f0161f8aa05b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 21:26:34 +0000
+Subject: [PATCH] [daveey] Refresh URL-pushed remote tips without inherited
+ stdin
+
+Proof: new-branch and rewritten-root URL pushes followed by remote advancement fail before and pass after; bad URL and timeout retain machine pins and assert DEVNULL. Pool queue: 35 passed; cross-cutting subprocess scans: 1219 passed. Refresh remains bounded to five fetches and fifty ancestry checks.
+---
+ hermes_cli/kanban_move_pool.py             | 33 ++++++----
+ tests/hermes_cli/test_kanban_pool_queue.py | 73 ++++++++++++++++++++++
+ 2 files changed, 95 insertions(+), 11 deletions(-)
+
+diff --git a/hermes_cli/kanban_move_pool.py b/hermes_cli/kanban_move_pool.py
+index 3f29054329..e3f3ff234d 100644
+--- a/hermes_cli/kanban_move_pool.py
++++ b/hermes_cli/kanban_move_pool.py
+@@ -117,19 +117,23 @@ def pushed_on_remote(tree: str) -> bool:
+     its worker (11-12: t_01a1d0a1eaa00371 sat ready on ``machine:worker-2`` while worker-2 was on a Board hold).
+     So ask the remote: HEAD is a remote branch tip, or a stale tracking ref HEAD builds on, once refreshed from
+     the remote, contains HEAD."""
++    from functools import partial
+     from hermes_cli.worktree_ops import _git_out, _worktree_has_unpushed_commits
++    # Keep credential helpers for private remotes, but never consume the caller's stdin.
++    git_out = partial(_git_out, stdin=subprocess.DEVNULL)
+     try:
+-        head = _git_out(["rev-parse", "HEAD"], tree)
+-        remotes = (_git_out(["remote"], tree) or "").split()
++        head = git_out(["rev-parse", "HEAD"], tree)
++        remotes = (git_out(["remote"], tree) or "").split()
+         if not head or not remotes:
+             return False
+         stale: list[tuple[str, str, str]] = []
++        fallback: list[tuple[str, str, str]] = []
+         checks = 0
+         for remote in remotes:
+-            listing = _git_out(["ls-remote", "--heads", remote], tree, timeout=_REMOTE_TIMEOUT)
++            listing = git_out(["ls-remote", "--heads", remote], tree, timeout=_REMOTE_TIMEOUT)
+             if not listing:
+                 continue
+-            tracked = dict(line.split(" ", 1)[::-1] for line in (_git_out(
++            tracked = dict(line.split(" ", 1)[::-1] for line in (git_out(
+                 ["for-each-ref", "--format=%(objectname) %(refname)", f"refs/remotes/{remote}"], tree) or ""
+             ).splitlines() if " " in line)
+             for line in listing.splitlines():
+@@ -138,14 +142,21 @@ def pushed_on_remote(tree: str) -> bool:
+                     return True
+                 tracking = f"refs/remotes/{remote}/{ref[len('refs/heads/'):]}"
+                 local = tracked.get(tracking)
+-                if not local or local == sha or checks >= _MAX_ANCESTRY_CHECKS:
++                if local == sha:
+                     continue
+-                checks += 1
+-                if _git_out(["merge-base", "--is-ancestor", local, "HEAD"], tree) is not None:
+-                    stale.append((remote, ref, tracking))
+-        for remote, ref, tracking in stale[:_MAX_REFRESHES]:
+-            _git_out(["fetch", "--no-tags", "-q", remote, f"+{ref}:{tracking}"], tree, timeout=_REMOTE_TIMEOUT)
+-        return bool(stale) and not _worktree_has_unpushed_commits(tree)
++                candidate = (remote, ref, tracking)
++                if local and checks < _MAX_ANCESTRY_CHECKS:
++                    checks += 1
++                    if git_out(["merge-base", "--is-ancestor", local, "HEAD"], tree) is not None:
++                        stale.append(candidate)
++                        continue
++                # New URL-pushed branches have no tracking ref; rebased URL pushes
++                # can leave a tracking tip unrelated to HEAD. Both need a refresh.
++                fallback.append(candidate)
++        refresh = (stale + fallback)[:_MAX_REFRESHES]
++        for remote, ref, tracking in refresh:
++            git_out(["fetch", "--no-tags", "-q", remote, f"+{ref}:{tracking}"], tree, timeout=_REMOTE_TIMEOUT)
++        return bool(refresh) and not _worktree_has_unpushed_commits(tree)
+     except (OSError, subprocess.SubprocessError, ValueError):
+         return False
+ 
+diff --git a/tests/hermes_cli/test_kanban_pool_queue.py b/tests/hermes_cli/test_kanban_pool_queue.py
+index 29c89001bc..3362e799fe 100644
+--- a/tests/hermes_cli/test_kanban_pool_queue.py
++++ b/tests/hermes_cli/test_kanban_pool_queue.py
+@@ -340,6 +340,79 @@ def test_park_keeps_work_pushed_by_url_on_the_pool_even_after_the_remote_branch_
+     assert _placement_events(conn, tid)[-1][1]["unpushed_state"] == f"unpushed commits in {tree.resolve()}"
+ 
+ 
++@pytest.mark.parametrize("rebased", [False, True])
++def test_url_push_moved_tip_without_ancestral_tracking(w2, tmp_path, monkeypatch, rebased):
++    from tools import kanban_tools as kt
++    tree = _pushed_clone(tmp_path, tmp_path / "url-tip")
++    remote = str(tmp_path / "url-tip-remote.git")
++    if rebased:
++        _git(tree, "commit", "--amend", "-qm", "rewritten root")
++    else:
++        _commit(tree, "new.txt")
++    branch = "wt/x" if rebased else "wt/new"
++    _git(tree, "push", "-q", "--force", remote, f"HEAD:refs/heads/{branch}")
++    other = tmp_path / "other-tip"
++    _git(tmp_path, "clone", "-q", "-b", branch, remote, str(other))
++    _commit(other, "advanced.txt")
++    _git(other, "push", "-q", "origin", f"HEAD:refs/heads/{branch}")
++    tid = kb.create_task(w2.conn, title="URL pushed tip", assignee="default", runs_on=[POOL])
++    _run(w2, monkeypatch, tid)
++    out = json.loads(kt._handle_continue({"checkpoint": f"Pushed work in {tree}"}))
++    assert out.get("ok"), out
++    assert _runs_on(w2.conn, tid) == [POOL]
++
++
++@pytest.mark.parametrize("failure", ["bad-url", "timeout"])
++def test_remote_failure_pins_without_reading_stdin(w2, tmp_path, monkeypatch, failure):
++    from hermes_cli import worktree_ops
++    from tools import kanban_tools as kt
++    tree = _pushed_clone(tmp_path, tmp_path / "unreachable")
++    _commit(tree, "local.txt")
++    _git(tree, "remote", "set-url", "origin", str(tmp_path / "missing.git"))
++    original = worktree_ops._git_out
++    calls = []
++
++    def observe(args, cwd, **kwargs):
++        if args[0] == "ls-remote":
++            calls.append(kwargs)
++            if failure == "timeout":
++                raise subprocess.TimeoutExpired(args, 20)
++        return original(args, cwd, **kwargs)
++
++    monkeypatch.setattr(worktree_ops, "_git_out", observe)
++    tid = kb.create_task(w2.conn, title="unreachable remote", assignee="default", runs_on=[POOL])
++    _run(w2, monkeypatch, tid)
++    out = json.loads(kt._handle_continue({"checkpoint": f"Local work in {tree}"}))
++    assert out.get("ok"), out
++    assert _runs_on(w2.conn, tid) == ["machine:worker-2"]
++    assert calls and all(call.get("stdin") == subprocess.DEVNULL for call in calls)
++    assert all("env" not in call for call in calls)  # retain private HTTPS credential helpers
++
++
++def test_remote_refresh_caps_and_stdin(monkeypatch):
++    from hermes_cli import kanban_move_pool as kmp, worktree_ops
++    calls = []
++
++    def git_out(args, cwd, **kwargs):
++        calls.append((args, kwargs))
++        if args[0] == "rev-parse":
++            return "head"
++        if args[0] == "remote":
++            return "origin"
++        if args[0] == "ls-remote":
++            return "\n".join(f"new{i}\trefs/heads/b{i}" for i in range(60))
++        if args[0] == "for-each-ref":
++            return "\n".join(f"old{i} refs/remotes/origin/b{i}" for i in range(60))
++        return None  # unrelated old tips and failed fetches must not prove publication
++
++    monkeypatch.setattr(worktree_ops, "_git_out", git_out)
++    monkeypatch.setattr(worktree_ops, "_worktree_has_unpushed_commits", lambda tree: True)
++    assert not kmp.pushed_on_remote("unused")
++    assert sum(args[0] == "merge-base" for args, _ in calls) == 50
++    assert sum(args[0] == "fetch" for args, _ in calls) == 5
++    assert all(kw.get("stdin") == subprocess.DEVNULL and "env" not in kw for _, kw in calls)
++
++
+ def test_a_head_that_is_a_remote_branch_tip_counts_as_pushed(tmp_path):
+     from hermes_cli import kanban_move_pool as kmp
+     tree = _pushed_clone(tmp_path, tmp_path / "tip")
+-- 
+2.51.0
+

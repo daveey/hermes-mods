@@ -1,0 +1,323 @@
+From 49749fbfe200f20e18fad33dc0f3af02de2132c1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 16:51:22 +0000
+Subject: [PATCH] [daveey] kanban: refuse creates onto a gate-only assignee
+ (kanban.gate_only_assignees)
+
+Five-whys t_01a1d08fbacf4432 (stranded t_01a1cdf7bbf44625): since 10-28, 9 cards were created on the
+mini's bb board with assignee bb-repair-native (8 by bb-dev/default workers via kanban_create, 1 by the
+resume requester copying its target's assignee). The dispatcher spawned the native worker at once, bb_gate
+reclaimed it ("native worker lacks gate authorization") and recorded native_rejected, so each card sat
+unadmitted until a manual STANDARD-RENEWAL review. Prose (bb-self-fix skill) and detection (bb_stranded)
+were already shipped; this enforces it at the failure point.
+
+- New hermes_cli/kanban_gate_only.py: kanban.gate_only_assignees maps a profile only an admission gate may
+  assign to the queue a new card waits under ({bb-repair-native: bb-queue}). Read like queue_assignees
+  (active profile config + board home config); malformed entries are skipped.
+- validate_create_assignment (every create_task: kanban_create tool, `hermes kanban create`, kernel
+  producers) raises GateOnlyAssigneeError (a ValueError) naming the queue assignee to use instead.
+- The resume requester files a gate-only target's recovery card under its queue; goal recovery never
+  picks a gate-only profile.
+- assign_task (bb_gate_assignment.mutate's path) is unchanged; nothing changes without the config key.
+
+Proof: tests/hermes_cli/test_kanban_gate_only.py 9 pass; 5 of them fail on base (create_task, worker
+kanban_create tool, CLI create, resume requester, goal recovery); gate reassignment and no-config controls
+pass on both. 8/8 mutants of kanban_gate_only.py killed. 16 related files (223 tests) green.
+---
+ hermes_cli/kanban_db_creation.py          |   2 +
+ hermes_cli/kanban_gate_only.py            |  71 ++++++++++
+ hermes_cli/kanban_goal_recovery.py        |   3 +-
+ hermes_cli/kanban_resume_requester.py     |   4 +-
+ tests/hermes_cli/test_kanban_gate_only.py | 159 ++++++++++++++++++++++
+ 5 files changed, 237 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/kanban_gate_only.py
+ create mode 100644 tests/hermes_cli/test_kanban_gate_only.py
+
+diff --git a/hermes_cli/kanban_db_creation.py b/hermes_cli/kanban_db_creation.py
+index a207422813..da8d0957a7 100644
+--- a/hermes_cli/kanban_db_creation.py
++++ b/hermes_cli/kanban_db_creation.py
+@@ -100,7 +100,9 @@ def validate_create_assignment(conn, assignee, *, runs_on, requires, workspace_k
+     from hermes_cli.kanban_pin_provider import require_remote_pin_provider, resolve_pin_provider
+     from hermes_cli.kanban_runs_on_capabilities import check_create, runs_elsewhere
+     from hermes_cli.kanban_skill_check import check_task_skills
++    from hermes_cli.kanban_gate_only import refuse_create
+ 
++    refuse_create(assignee)  # kanban.gate_only_assignees: only the gate assigns them, by reassignment [daveey]
+     remote = runs_elsewhere(conn, runs_on)
+     check_task_skills(skills, assignee, enabled=validate_skills and not remote)
+     required = validate_assignment(assignee, requires=requires, workspace_kind=workspace_kind,
+diff --git a/hermes_cli/kanban_gate_only.py b/hermes_cli/kanban_gate_only.py
+new file mode 100644
+index 0000000000..a8e84fb5f2
+--- /dev/null
++++ b/hermes_cli/kanban_gate_only.py
+@@ -0,0 +1,71 @@
++"""Gate-only assignees: profiles only an external admission gate may hand a card to. [daveey]
++
++``kanban.gate_only_assignees`` maps such a profile to the queue assignee a new card waits under instead,
++e.g. ``{bb-repair-native: bb-queue}`` on the mini's bb board. The gate (bb_gate) admits a queued card by
++reassigning it (``assign_task``), never by creating one, so a create naming the gate-only profile skips
++admission: the dispatcher spawns the native worker at once, the gate reclaims it as unauthorized and
++records ``native_rejected``, and the card is stranded until a manual renewal (five-whys
++t_01a1d08fbacf4432: 9 cards since 10-28, 8 by worker ``kanban_create``, 1 by the resume requester).
++
++So :func:`refuse_create` refuses every create naming one (the ``kanban_create`` tool and ``hermes kanban
++create`` both reach it through ``create_task``), and :func:`create_assignee` lets a kernel producer that
++copies an existing card's assignee (the resume requester) file under the queue assignee instead.
++Reassignment (``assign_task``) is untouched. Read like ``queue_assignees``: the active profile's config
++and the board home's config.
++"""
++from __future__ import annotations
++
++
++class GateOnlyAssigneeError(ValueError):
++    """A create named an assignee only the admission gate may assign."""
++
++    def __init__(self, assignee: str, queue: str):
++        self.assignee, self.queue = assignee, queue
++        super().__init__(
++            f"assignee {assignee!r} is gate-only (kanban.gate_only_assignees): only its admission gate may "
++            f"assign it, by reassigning a queued card. Create the card with assignee {queue!r} instead; "
++            "the gate admits it from there.")
++
++
++def gate_only_assignees() -> dict[str, str]:
++    """``{gate-only profile: queue assignee}`` from config. Never raises; malformed entries are ignored."""
++    names: dict[str, str] = {}
++
++    def _add(cfg) -> None:
++        raw = ((cfg or {}).get("kanban") or {}).get("gate_only_assignees")
++        if not isinstance(raw, dict):
++            return
++        for name, queue in raw.items():
++            if isinstance(name, str) and name.strip() and isinstance(queue, str) and queue.strip():
++                names[name.strip()] = queue.strip()
++
++    try:
++        from hermes_cli.config import load_config_readonly
++        _add(load_config_readonly())
++    except Exception:  # health: allow BLE001 S110 -- a policy read never breaks create; default is none
++        pass
++    try:
++        from hermes_cli.config_backend import config_exists, read_config_doc_readonly
++        from hermes_cli.kanban_db import kanban_home
++        path = kanban_home() / "config.yaml"
++        if config_exists(path):
++            _add(read_config_doc_readonly(path))
++    except Exception:  # health: allow BLE001 S110 -- an unreadable board config declares none
++        pass
++    return names
++
++
++def refuse_create(assignee) -> None:
++    """Raise :class:`GateOnlyAssigneeError` when a create names a gate-only assignee."""
++    if not isinstance(assignee, str) or not assignee:
++        return
++    queue = gate_only_assignees().get(assignee.strip())
++    if queue:
++        raise GateOnlyAssigneeError(assignee.strip(), queue)
++
++
++def create_assignee(assignee):
++    """The assignee a kernel-made card copying *assignee* is created under: its queue when gate-only."""
++    if not isinstance(assignee, str) or not assignee:
++        return assignee
++    return gate_only_assignees().get(assignee.strip(), assignee)
+diff --git a/hermes_cli/kanban_goal_recovery.py b/hermes_cli/kanban_goal_recovery.py
+index b236989db8..638db2269d 100644
+--- a/hermes_cli/kanban_goal_recovery.py
++++ b/hermes_cli/kanban_goal_recovery.py
+@@ -82,7 +82,8 @@ def recovery_assignee(task):
+ 
+     cfg = load_config_readonly()
+     candidates = [task.assignee, (cfg.get('kanban') or {}).get('orchestrator_profile'), 'default']
+-    queues = queue_assignees()
++    from hermes_cli.kanban_gate_only import gate_only_assignees
++    queues = queue_assignees() | set(gate_only_assignees())  # gate-only names are refused at create [daveey]
+     for name in dict.fromkeys(candidates):
+         if not isinstance(name, str) or not name or name in queues:
+             continue
+diff --git a/hermes_cli/kanban_resume_requester.py b/hermes_cli/kanban_resume_requester.py
+index 31badbb8ba..bdbbebe531 100644
+--- a/hermes_cli/kanban_resume_requester.py
++++ b/hermes_cli/kanban_resume_requester.py
+@@ -163,7 +163,9 @@ def ensure_recovery_cards(conn: sqlite3.Connection) -> list[str]:
+             from hermes_cli.kanban_goal_recovery import current_park, recovery_assignee
+             task = kb.get_task(conn, target)
+             goal = current_park(conn, target)
+-            assignee = recovery_assignee(task) if goal else row['assignee'] or 'default'
++            from hermes_cli.kanban_gate_only import create_assignee
++            # A gate-only target (bb-repair-native) files its recovery under its queue, never the gate's profile.
++            assignee = recovery_assignee(task) if goal else create_assignee(row['assignee'] or 'default')
+             if not assignee:
+                 continue
+             rec = kb.create_task(
+diff --git a/tests/hermes_cli/test_kanban_gate_only.py b/tests/hermes_cli/test_kanban_gate_only.py
+new file mode 100644
+index 0000000000..72a9acc38d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_gate_only.py
+@@ -0,0 +1,159 @@
++"""Creates naming a gate-only assignee are refused; the gate's reassignment still works. [daveey]
++
++Five-whys t_01a1d08fbacf4432 (stranded t_01a1cdf7bbf44625): 9 cards since 10-28 were created on the mini's
++``bb`` board with assignee ``bb-repair-native`` (8 by bb-dev/default workers via ``kanban_create``, 1 by the
++resume requester copying its target's assignee). The dispatcher spawned the native worker at once, bb_gate
++reclaimed it ("native worker lacks gate authorization") and recorded ``native_rejected``, and the card was never
++admitted again. ``kanban.gate_only_assignees: {bb-repair-native: bb-queue}`` now refuses such a create at every
++create surface, files kernel recovery cards under the queue, and leaves ``assign_task`` (the gate's path) alone.
++Every test runs on an isolated board under ``tmp_path``.
++"""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_gate_only as go
++
++GATE = "kanban:\n  queue_assignees: [bb-queue]\n  gate_only_assignees:\n    bb-repair-native: bb-queue\n"
++
++
++@pytest.fixture
++def home(monkeypatch, tmp_path):
++    h = tmp_path / ".hermes"
++    h.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(h))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub-state"))
++    for var in ("HERMES_SESSION_ID", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    from hermes_cli import kanban_capability_registry as reg
++    monkeypatch.setattr(reg, "self_gateway", lambda: "hub")
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    assert str(kb.kanban_db_path()).startswith(str(tmp_path))
++    return h
++
++
++def _gate(home, text=GATE):
++    (home / "config.yaml").write_text(text)
++
++
++def _titles(conn):
++    return [t.title for t in kb.list_tasks(conn)]
++
++
++def _as_worker(monkeypatch, conn, tid):
++    assert kb.claim_task(conn, tid) is not None
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb._current_run_id(conn, tid)))
++
++
++def test_create_task_refuses_a_gate_only_assignee_and_inserts_nothing(home):
++    _gate(home)
++    with kbc.connect() as conn:
++        with pytest.raises(go.GateOnlyAssigneeError) as caught:
++            kb.create_task(conn, title="fix BB-12", assignee="bb-repair-native", created_by="bb-dev")
++        assert isinstance(caught.value, ValueError)
++        assert "'bb-queue'" in str(caught.value) and "gate-only" in str(caught.value)
++        assert _titles(conn) == []
++        # The queue assignee (what the gate admits from) and other profiles still create.
++        queued = kb.create_task(conn, title="fix BB-12", assignee="bb-queue", created_by="bb-dev")
++        assert kb.get_task(conn, queued).assignee == "bb-queue"
++        assert kb.create_task(conn, title="other", assignee="default", created_by="bb-dev")
++
++
++def test_without_the_config_the_same_create_is_unchanged(home):
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="fix BB-12", assignee="bb-repair-native", created_by="bb-dev")
++        assert kb.get_task(conn, tid).assignee == "bb-repair-native"
++
++
++def test_worker_kanban_create_tool_is_refused_naming_the_queue(home, monkeypatch):
++    _gate(home)
++    with kbc.connect() as conn:
++        me = kb.create_task(conn, title="bb-dev worker card", assignee="default", created_by="default")
++        _as_worker(monkeypatch, conn, me)
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_create({"title": "BB-12 native repair", "body": "repair it",
++                                        "assignee": "bb-repair-native", "requires": [], "parents": [me]}))
++    assert "error" in out or out.get("ok") is False, out
++    assert "gate-only" in json.dumps(out) and "bb-queue" in json.dumps(out)
++    with kbc.connect() as conn:
++        assert _titles(conn) == ["bb-dev worker card"]
++
++
++def test_cli_create_is_refused(home, monkeypatch):
++    _gate(home)
++    from hermes_cli import kanban as cli
++    out = cli.run_slash("create 'BB-12 native repair' --assignee bb-repair-native --json")
++    assert "gate-only" in out and "bb-queue" in out, out
++    with kbc.connect() as conn:
++        assert _titles(conn) == []
++
++
++def test_gate_reassignment_onto_the_gate_only_profile_still_works(home):
++    _gate(home)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="fix BB-12", assignee="bb-queue", created_by="bb-dev")
++        assert kb.assign_task(conn, tid, "bb-repair-native")  # bb_gate_assignment.mutate's call
++        assert kb.get_task(conn, tid).assignee == "bb-repair-native"
++
++
++def test_resume_requester_files_a_gate_only_targets_recovery_under_the_queue(home):
++    from tests.hermes_cli import test_kanban_resume_requester as rrt
++    from hermes_cli import kanban_resume_requester as rr
++    with kbc.connect() as conn:
++        target = kb.create_task(conn, title="native repair", assignee="bb-repair-native", created_by="bb-gate")
++        rrt._exhaust(conn, target)
++        _gate(home)  # declared after the card exists (the 10-28..11-12 strays predate it)
++        rrt._tick(conn)
++        (rec,) = rrt._recovery_cards(conn, target)
++        assert kb.get_task(conn, rec).assignee == "bb-queue"
++
++
++def test_goal_recovery_never_picks_a_gate_only_profile(home):
++    from hermes_cli.kanban_goal_recovery import recovery_assignee
++    prof = home / "profiles" / "bb-repair-native"
++    prof.mkdir(parents=True)
++    (prof / "config.yaml").write_text("toolsets: [terminal, file, kanban]\n")
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="native repair", assignee="bb-repair-native", created_by="bb-gate")
++        task = kb.get_task(conn, tid)
++    assert recovery_assignee(task) == "bb-repair-native"  # capable profile: picked without the config
++    _gate(home)
++    assert recovery_assignee(task) == "default"
++
++
++def test_config_shapes(home, monkeypatch, tmp_path):
++    _gate(home, "kanban:\n  gate_only_assignees: [bb-repair-native]\n")  # a list names no queue: ignored
++    assert go.gate_only_assignees() == {}
++    # Malformed entries first: each must be skipped, not abort the read of the valid one after it. A dict
++    # straight from the loader, since YAML config loading itself refuses some of these shapes.
++    from hermes_cli import config
++    monkeypatch.setattr(config, "load_config_readonly", lambda: {"kanban": {"gate_only_assignees": {
++        1: "q", "x": 3, "y": " ", "": "q", " bb-repair-native ": " bb-queue "}}})
++    monkeypatch.setattr(kb, "kanban_home", lambda: tmp_path / "no-board-config")
++    assert go.gate_only_assignees() == {"bb-repair-native": "bb-queue"}
++    assert go.create_assignee("bb-repair-native") == "bb-queue"
++    assert go.create_assignee("default") == "default"
++    assert go.create_assignee(None) is None
++    go.refuse_create(None)
++    go.refuse_create("")
++    with pytest.raises(go.GateOnlyAssigneeError):
++        go.refuse_create(" bb-repair-native ")
++
++
++def test_board_home_config_declares_it_too(home, monkeypatch, tmp_path):
++    board_home = tmp_path / "board-home"
++    board_home.mkdir()
++    (board_home / "config.yaml").write_text(GATE)
++    monkeypatch.setattr(kb, "kanban_home", lambda: board_home)
++    from hermes_cli import config
++    monkeypatch.setattr(config, "load_config_readonly", dict)
++    assert go.gate_only_assignees() == {"bb-repair-native": "bb-queue"}
+-- 
+2.51.0
+

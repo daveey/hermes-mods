@@ -1,0 +1,153 @@
+From 5ad0bdcf60b3409383fb00fbb37e90c040a69786 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:31:22 +0000
+Subject: [PATCH] [daveey] tests: FakeHub lease release always emits the
+ run-outcome event and honors outcome
+
+Follow-up to PR #1896 review 5886812281 (non-blocking nit). The fake's
+leases release wrote a `released` event only for unused_grant and ignored
+`outcome`. As hermes-hub transitions.ts releaseTask, it now always appends
+the run-outcome event carrying retry_status (review when the run was
+claimed out of review), maps neutral outcomes through NEUTRAL_RELEASES
+(run outcome + event kind, owner_restart metadata), ends terminal_provider
+as crashed with the canonical notice, and sets unused_grant only for a
+plain released outcome. The card goes back to its retry lane only while
+running. Failure accounting stays on FakeService.release_op (ops path).
+
+Test-only change.
+---
+ tests/hermes_cli/kanban_sync_fake_board.py    | 69 ++++++++++++++-----
+ .../hermes_cli/test_kanban_sync_rejections.py | 34 +++++++++
+ 2 files changed, 84 insertions(+), 19 deletions(-)
+
+diff --git a/tests/hermes_cli/kanban_sync_fake_board.py b/tests/hermes_cli/kanban_sync_fake_board.py
+index 43b7d4c07a..851ae56e70 100644
+--- a/tests/hermes_cli/kanban_sync_fake_board.py
++++ b/tests/hermes_cli/kanban_sync_fake_board.py
+@@ -273,28 +273,59 @@ class FakeHub:
+             if self.svc.lease_runs and card is not None:
+                 retry = self.svc.retry_status_for_run(b, card.get("current_run_uid"))
+                 if run in runs and runs[run].get("ended_at") is None:
+-                    unused = bool(body.get("unused_grant"))
+-                    # As the Board's releaseTask with ``unused_grant: true`` (live t_01a1a1dea9c64d6a run 164239):
+-                    # the run's metadata and the ``released`` event both say the grant never started anything.
+-                    self.svc._put(b, "task_runs", run, {"status": "released", "outcome": "released", "ended_at": 2,
+-                                                        **({"metadata": json.dumps({"unused_grant": True},
+-                                                                                   separators=(",", ":"))}
+-                                                           if unused else {})},
+-                                  gw, op_id, hlc)
+-                    if unused:
+-                        self.svc._put(b, "task_events", f"ev-rel-{run}",
+-                                      {"task_id": task, "run_uid": run, "kind": "released",
+-                                       "payload": json.dumps({"error": None, "retry_status": retry,
+-                                                              "unused_grant": True}, separators=(",", ":")),
+-                                       "created_at": int(time.time())}, gw, op_id, hlc)
+-                # clearLease drops the lease mirror; a still-running card goes back to retryStatusForRun; endRun
+-                # clears current_run_uid even when the holder already ended its run row.
+-                self.svc._put(b, "tasks", task, {**({"status": retry} if card.get("status") == "running" else {}),
+-                                                 "current_run_uid": None, "lease_holder": None,
+-                                                 "lease_run_uid": None, "lease_expires": None}, gw, op_id, hlc)
++                    self._release_run(b, task, run, body, retry, op_id, hlc)
++                else:
++                    # clearLease drops the lease mirror; a still-running card goes back to retryStatusForRun; endRun
++                    # clears current_run_uid even when the holder already ended its run row.
++                    self.svc._put(b, "tasks", task, {**({"status": retry} if card.get("status") == "running" else {}),
++                                                     "current_run_uid": None, "lease_holder": None,
++                                                     "lease_run_uid": None, "lease_expires": None}, gw, op_id, hlc)
+             return {"status": "applied", "lease": None}
+         return {"status": "applied", "lease": b["leases"][task], "version": version}
+ 
++    def _release_run(self, b: dict, task: str, run: str, body: dict, retry: str, op_id: Optional[str],
++                     hlc: str) -> None:
++        """As transitions.ts releaseTask (via board.ts ``leases`` release) for the holder's live run: the run ends,
++        a running card goes back to ``retry`` (retryStatusForRun) and the run-outcome event always carries it as
++        ``retry_status``.
++
++        A neutral outcome (``FakeService.NEUTRAL`` = NEUTRAL_RELEASES) ends the run as its mapped outcome and emits
++        its mapped event; anything else ends as ``outcome`` (``terminal_provider`` -> ``crashed``) and emits that
++        kind. Failure accounting (recordTaskFailure for crashed/timed_out/spawn_failed) is not modelled on this
++        path; :meth:`FakeService.release_op` covers it for the ops path. ``unused_grant`` (live t_01a1a1dea9c64d6a
++        run 164239) marks the run metadata and the event only for a plain ``released`` outcome."""
++        gw, svc = self.gateway, self.svc
++        outcome = str(body.get("outcome") or "released")
++        error = str(body.get("error") or outcome)[:500]
++        card = b["rows"]["tasks"][task]
++        running = card.get("status") == "running"
++        neutral = svc.NEUTRAL.get(outcome)
++        if neutral:
++            ended, kind = neutral
++            meta = {"owner_restart": True} if outcome == "owner_restart" else {}
++            run_fields = {"error": error, "metadata": json.dumps(meta, separators=(",", ":")) if meta else None}
++            payload: dict = {**meta, "error": error, "retry_status": retry}
++            task_fields = {"status": retry, "last_failure_error": error} if running else {}
++        else:
++            ended = kind = "crashed" if outcome == "terminal_provider" else outcome
++            unused = bool(body.get("unused_grant")) and outcome == "released" and running
++            canonical = outcome in ("crashed", "timed_out", "terminal_provider")
++            err = None if outcome == "released" else error
++            run_fields = {"error": err, **({"metadata": json.dumps({"unused_grant": True}, separators=(",", ":"))}
++                                           if unused else {})}
++            payload = {**({"failure_notice": "canonical"} if canonical else {}), "error": err, "retry_status": retry,
++                       **({"terminal_provider": True} if outcome == "terminal_provider" else {}),
++                       **({"unused_grant": True} if unused else {})}
++            task_fields = {"status": retry, **({"last_failure_error": error} if outcome == "rate_limited" else {})} \
++                if running else {}
++        svc._put(b, "task_runs", run, {"status": ended, "outcome": ended, "ended_at": 2, **run_fields}, gw, op_id, hlc)
++        svc._put(b, "task_events", f"ev-rel-{run}",
++                 {"task_id": task, "run_uid": run, "kind": kind,
++                  "payload": json.dumps(payload, separators=(",", ":")), "created_at": int(time.time())},
++                 gw, op_id, hlc)
++        svc._put(b, "tasks", task, {**task_fields, "current_run_uid": None, "lease_holder": None,
++                                    "lease_run_uid": None, "lease_expires": None}, gw, op_id, hlc)
++
+     def sessions(self, board: str, body: dict) -> dict:
+         """As board.ts ``sessions``: ``get`` -> {owners}; ``move`` is a CAS signed by the current owner. The target
+         must be an active, unheld registry machine (with ``machines`` None, any name) other than the caller.
+diff --git a/tests/hermes_cli/test_kanban_sync_rejections.py b/tests/hermes_cli/test_kanban_sync_rejections.py
+index 2d3fa167bf..f8c677ef24 100644
+--- a/tests/hermes_cli/test_kanban_sync_rejections.py
++++ b/tests/hermes_cli/test_kanban_sync_rejections.py
+@@ -362,6 +362,40 @@ def test_fake_lease_release_is_fenced_on_the_holders_run(live, kanban_home, gate
+     assert b["rows"]["task_runs"][RUN]["ended_at"] is None
+ 
+ 
++@pytest.mark.parametrize("extra,lane,run_outcome,kind,payload,status", [
++    # An ordinary release (no unused_grant) still emits its run-outcome event with retry_status.
++    ({}, "ready", "released", "released", {"error": None, "retry_status": "ready"}, "ready"),
++    ({"unused_grant": True}, "ready", "released", "released",
++     {"error": None, "retry_status": "ready", "unused_grant": True}, "ready"),
++    # retryStatusForRun: a run claimed out of review retries to review.
++    ({}, "review", "released", "released", {"error": None, "retry_status": "review"}, "review"),
++    # NEUTRAL_RELEASES maps the outcome to its run outcome and event kind.
++    ({"outcome": "owner_restart", "error": "gateway restarted"}, "ready", "reclaimed", "owner_restart_lost",
++     {"owner_restart": True, "error": "gateway restarted", "retry_status": "ready"}, "ready"),
++    ({"outcome": "rate_limited"}, "ready", "rate_limited", "rate_limited",
++     {"error": "rate_limited", "retry_status": "ready"}, "ready"),
++    ({"outcome": "terminal_provider", "error": "bad key"}, "ready", "crashed", "crashed",
++     {"failure_notice": "canonical", "error": "bad key", "retry_status": "ready", "terminal_provider": True}, "ready"),
++])
++def test_fake_lease_release_emits_run_outcome_event(live, kanban_home, extra, lane, run_outcome, kind, payload,
++                                                    status):
++    """As transitions.ts releaseTask: every release of the holder's live run emits its run-outcome event carrying
++    ``retry_status`` (``unused_grant`` only when set), with neutral outcomes mapped through NEUTRAL_RELEASES."""
++    svc = FakeService(lease_runs=True)
++    hub = svc.hub(ME)
++    tid = kb.create_task(live, title="leased", assignee="worker")
++    client.push(live, hub, BOARD, ME, primary=False)
++    grant = {"action": "grant", "task": tid, "run_uid": RUN, "client_op_id": "g", "lane": lane}
++    assert hub.leases(BOARD, grant)["status"] == "applied"
++    release = {"action": "release", "task": tid, "run_uid": RUN, "client_op_id": "r", **extra}
++    assert hub.leases(BOARD, release)["status"] == "applied"
++    rows = svc.board(BOARD)["rows"]
++    events = [e for e in rows["task_events"].values() if e["run_uid"] == RUN and e["kind"] != "claimed"]
++    assert [(e["kind"], json.loads(e["payload"])) for e in events] == [(kind, payload)]
++    assert (rows["task_runs"][RUN]["outcome"], rows["tasks"][tid]["status"]) == (run_outcome, status)
++    assert rows["tasks"][tid]["lease_run_uid"] is None
++
++
+ def test_release_local_change_during_read_vetoes(live, svc, monkeypatch):
+     lost_release(live, svc)
+     hub = svc.hub(ME)
+-- 
+2.51.0
+

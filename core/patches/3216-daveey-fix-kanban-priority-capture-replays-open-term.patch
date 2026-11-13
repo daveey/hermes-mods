@@ -1,0 +1,384 @@
+From 95fed77843d3d93c3e8d3dd0a1aa57493ec45443 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:57:21 +0000
+Subject: [PATCH] [daveey] fix(kanban): priority capture replays
+ open<->terminal churn to the final head
+
+The paged priority snapshot is not taken at one head: a row paged late can
+already show a later state than an intermediate feed change. check_interval
+compared every intermediate change with that row, so a card created or
+reopened and then finished inside the ~160 s MacBook capture window (seq
+1725387, t_01a1d3a1083e4f69: snapshot done, replayed upsert ready), or any
+open<->done flip, refused with "canonical inventory changed". On a busy
+board 8 of 8 origins/migrate captures failed (preflight t_01a1d1661daa4ab9).
+
+Replay the feed from the first head through the fixed final head and
+compare the FINAL replayed status with each snapshot row:
+- status is replayed onto the rows, so a card finishing or reopening in
+  the window yields the inventory at the final head (excluded from, or
+  added to, the open rows the manifest ranks);
+- a card missing from the snapshot that is terminal at the final head
+  (created and finished in the window) is out of manifest scope;
+- still refused: any in-window id/created_on/priority value differing from
+  the row (a real priority change, including one before a completion),
+  deletes, malformed/missing uids or statuses, and a card missing from the
+  snapshot that is open or of unknown status at the final head.
+
+Snapshot page size is unchanged (client already asks for 1000 rows; the
+server cap is outside this change).
+
+Proof: new tests/hermes_cli/test_kanban_priority_window_churn.py (created
+then completed mid-window, absent or paged late as done; existing card
+completed paged before/after; reopened; statusless patches; real priority
+/origin/identity changes at every window seq still refuse; membership
+refusals). 8 of its tests fail on the old feed module. Mutation run: 10/10
+mutants of the new conditions killed. All 18 test files importing
+kanban_priority* pass (303 tests). first_head/feed tests that pinned
+refusal of a terminal flip now pin its replay from the first head instead.
+
+[card:t_01a1d3a565291706]
+---
+ hermes_cli/kanban_priority_feed.py            |  65 ++++---
+ tests/hermes_cli/test_kanban_priority_feed.py |  10 +-
+ .../test_kanban_priority_first_head.py        |  18 +-
+ .../test_kanban_priority_window_churn.py      | 160 ++++++++++++++++++
+ 4 files changed, 231 insertions(+), 22 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_priority_window_churn.py
+
+diff --git a/hermes_cli/kanban_priority_feed.py b/hermes_cli/kanban_priority_feed.py
+index b60a851de6..6ff95173d9 100644
+--- a/hermes_cli/kanban_priority_feed.py
++++ b/hermes_cli/kanban_priority_feed.py
+@@ -1,19 +1,34 @@
+ """Validate the finite feed interval covering a raw paged priority inventory."""
+ from __future__ import annotations
+ 
++_CHANGED = 'canonical inventory changed; capture a new manifest'
++_TERMINAL = ('done', 'archived')
++
+ 
+ def check_interval(hub, board: str, rows: list[dict], first: int, target: int) -> None:
+-    """Ignore unrelated traffic; refuse changed task membership or migration inputs.
++    """Ignore unrelated traffic; bring the inventory to its state at ``target``.
++
++    The snapshot is not transactional: each page reflects its own read time, so
++    a row paged late can already carry a later state than an intermediate feed
++    change. Replay from the FIRST head through the final observed head (never a
++    moving head that could starve forever) and compare the FINAL replayed state
++    with each snapshot row, not every intermediate change.
+ 
+-    The snapshot is not transactional. Replay from its FIRST head through the
+-    final observed head, not through a moving head that could starve forever.
+-    No import or priority clipping occurs. Local apply still requires atomic CAS.
++    Status is replayed onto the rows, so an open<->terminal flip inside the
++    window (a card finishing or reopening) yields the inventory at ``target``.
++    Identity, origin and priority are never replayed: any in-window value that
++    differs from the row refuses, as do deletes and a card missing from the
++    snapshot that is open (or of unknown status) at ``target``. A card missing
++    from the snapshot that is terminal at ``target`` (created and finished in
++    the window) is out of manifest scope. No import or priority clipping
++    occurs. Local apply still requires atomic CAS.
+     """
+     inventory = {row['id']: row for row in rows}
++    final: dict[str, str | None] = {}
+     cursor = first
+     for _ in range(10000):
+         if cursor >= target:
+-            return
++            break
+         page = hub.changes(board, cursor)
+         batch, nxt = page.get('changes'), page.get('next')
+         if (not isinstance(batch, list) or not batch or type(nxt) is not int
+@@ -26,28 +41,40 @@ def check_interval(hub, board: str, rows: list[dict], first: int, target: int) -
+                 raise ValueError('invalid canonical feed ordering')
+             previous = change['seq']
+             if previous <= target and change['table'] == 'tasks':
+-                _check_task(inventory, change)
++                _check_task(inventory, final, change)
+         if nxt != previous:
+             raise ValueError('invalid canonical feed cursor')
+         cursor = nxt
+         if cursor < target and not page['more']:
+             raise ValueError('canonical feed ended before observed head')
+-    raise ValueError('canonical feed page limit exceeded')
++    else:
++        raise ValueError('canonical feed page limit exceeded')
++    for uid, status in final.items():
++        row = inventory.get(uid)
++        if row is None:
++            if status not in _TERMINAL:
++                raise ValueError(_CHANGED)
++        elif status is not None:
++            row['status'] = status
+ 
+ 
+-def _check_task(inventory: dict, change: dict) -> None:
+-    row = inventory.get(change.get('uid'))
++def _check_task(inventory: dict, final: dict, change: dict) -> None:
++    uid = change.get('uid')
+     fields = change.get('fields')
+-    if row is None or change.get('op') != 'upsert' or not isinstance(fields, dict):
+-        raise ValueError('canonical inventory changed; capture a new manifest')
+-    # Full-row and patch-shaped feed entries are both accepted. Open-status
+-    # transitions do not change ranks; replay them for exception audit evidence.
++    if not isinstance(uid, str) or change.get('op') != 'upsert' or not isinstance(fields, dict):
++        raise ValueError(_CHANGED)
++    # Full-row and patch-shaped feed entries are both accepted; a patch without
++    # a status leaves the last replayed (or snapshot) status in place.
+     from hermes_cli.kanban_priority_manifest import STATUSES
+-    status = fields.get('status', row['status'])
+-    if (status not in STATUSES
+-            or (status in ('done', 'archived')) != (row['status'] in ('done', 'archived'))):
+-        raise ValueError('canonical inventory changed; capture a new manifest')
+-    row['status'] = status
++    if 'status' in fields:
++        if not isinstance(fields['status'], str) or fields['status'] not in STATUSES:
++            raise ValueError(_CHANGED)
++        final[uid] = fields['status']
++    else:
++        final.setdefault(uid, None)
++    row = inventory.get(uid)
++    if row is None:
++        return
+     for key in ('id', 'created_on', 'priority'):
+         if key in fields and (type(fields[key]) is not type(row.get(key)) or fields[key] != row.get(key)):
+-            raise ValueError('canonical inventory changed; capture a new manifest')
++            raise ValueError(_CHANGED)
+diff --git a/tests/hermes_cli/test_kanban_priority_feed.py b/tests/hermes_cli/test_kanban_priority_feed.py
+index ec8e23702e..0b2bf886e6 100644
+--- a/tests/hermes_cli/test_kanban_priority_feed.py
++++ b/tests/hermes_cli/test_kanban_priority_feed.py
+@@ -90,7 +90,7 @@ def test_busy_capture_and_verify_ignore_unrelated_changes():
+     assert prepare.verify(Busy(), manifest, undo=True)['verified'] == 1
+ 
+ 
+-@pytest.mark.parametrize('fields', [{'priority': 2}, {'created_on': 'other'}, {'status': 'done'}])
++@pytest.mark.parametrize('fields', [{'priority': 2}, {'created_on': 'other'}])
+ def test_relevant_task_change_refuses(fields):
+     class Changed(Busy):
+         def changes(self, board, since):
+@@ -100,6 +100,14 @@ def test_relevant_task_change_refuses(fields):
+         prepare.capture(Changed(), board_id='board', exceptions=[])
+ 
+ 
++def test_terminal_task_change_is_replayed_to_final_head():
++    class Finished(Busy):
++        def changes(self, board, since):
++            return {'changes': [{'seq': 4, 'table': 'tasks', 'uid': 'a', 'op': 'upsert',
++                                 'fields': {'status': 'done'}}], 'next': 4, 'more': False}
++    assert prepare.capture(Finished(), board_id='board', exceptions=[])['rows'] == []
++
++
+ @pytest.mark.parametrize('uid,op', [('a', 'delete'), ('new', 'upsert')])
+ def test_membership_change_refuses(uid, op):
+     class Changed(Busy):
+diff --git a/tests/hermes_cli/test_kanban_priority_first_head.py b/tests/hermes_cli/test_kanban_priority_first_head.py
+index 0ffbbe439e..7018633edb 100644
+--- a/tests/hermes_cli/test_kanban_priority_first_head.py
++++ b/tests/hermes_cli/test_kanban_priority_first_head.py
+@@ -1,7 +1,8 @@
+ """Capture/verify replay the feed from the FIRST snapshot head, never a later one.
+ 
+ Busy-style fixtures whose relevant task changes land between the first page
+-head and a later page head (seq 2/3) must refuse; a page head that regresses
++head and a later page head (seq 2/3) must refuse, or for an open<->terminal
++flip be replayed into the inventory; a page head that regresses
+ below the first head is a malformed snapshot. The real ``check_interval`` feed
+ reconciliation runs in every case: only the hub's ``changes`` calls are recorded.
+ """
+@@ -37,12 +38,25 @@ class Between(Busy):
+ RELEVANT = [
+     pytest.param({'table': 'tasks', 'uid': 'a', 'fields': {'priority': 2}}, id='priority'),
+     pytest.param({'table': 'tasks', 'uid': 'a', 'fields': {'created_on': 'other'}}, id='origin'),
+-    pytest.param({'table': 'tasks', 'uid': 'a', 'fields': {'status': 'done'}}, id='terminal'),
+     pytest.param({'table': 'tasks', 'uid': 'a', 'op': 'delete'}, id='delete'),
+     pytest.param({'table': 'tasks', 'uid': 'new'}, id='insert'),
+ ]
+ 
+ 
++@pytest.mark.parametrize('seq', [2, 3])
++def test_terminal_change_between_first_and_last_page_head_is_replayed(seq):
++    # A terminal flip is replayed onto the rows, not refused: a replay that
++    # started after the first head would miss seq 2 and keep 'a' open.
++    terminal = _change(seq, table='tasks', uid='a', fields={'status': 'done'})
++    hub = Between(terminal)
++    manifest = prepare.capture(hub, board_id='board', exceptions=['b'])
++    assert manifest['rows'] == [] and hub.since[0] == 1
++    before = prepare.capture(Between(), board_id='board', exceptions=['b'])
++    verifier = Between(terminal)
++    assert prepare.verify(verifier, before, undo=True)['verified'] == 0
++    assert verifier.since[0] == 1
++
++
+ def _relevant(seq, spec):
+     return _change(seq, **spec)
+ 
+diff --git a/tests/hermes_cli/test_kanban_priority_window_churn.py b/tests/hermes_cli/test_kanban_priority_window_churn.py
+new file mode 100644
+index 0000000000..509f778db2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_priority_window_churn.py
+@@ -0,0 +1,160 @@
++"""Open<->terminal churn inside the paged capture window replays to the final head.
++
++A paged snapshot is not taken at one head: a row paged late can already show a
++later state than an intermediate feed change (2026-11-13 MacBook capture, seq
++1725387: snapshot ``done``, replayed upsert ``ready``). Capture and verify must
++compare the FINAL replayed state with the snapshot rows, so a card finishing
++or reopening mid-window no longer refuses. Priority, origin, identity, deletes
++and open cards missing from the snapshot still refuse.
++"""
++import pytest
++
++from hermes_cli import kanban_priority_prepare as prepare
++from hermes_cli.kanban_priority_feed import check_interval
++
++
++def _row(key, status='ready', priority=10000, origin='one'):
++    return {'id': key, 'status': status, 'created_on': origin, 'priority': priority}
++
++
++def _task(seq, uid, op='upsert', **fields):
++    return {'seq': seq, 'table': 'tasks', 'uid': uid, 'op': op, 'fields': fields}
++
++
++class Window:
++    """Two snapshot pages (heads 1 then 3), a final head of 5, and a task feed."""
++
++    def __init__(self, rows, changes):
++        self.rows = rows
++        self.log = [{'seq': s, 'table': 'task_events', 'uid': 'e', 'op': 'upsert', 'fields': {}}
++                    for s in range(2, 6)]
++        for change in changes:
++            self.log[change['seq'] - 2] = change
++        self.since = []
++
++    def snapshot_page(self, board, table, after='', limit=1000):
++        if limit == 1:
++            return {'table': 'tasks', 'head': 5, 'rows': self.rows[:1], 'more': True,
++                    'next': self.rows[0]['id']}
++        half = (len(self.rows) + 1) // 2
++        batch = self.rows[half:] if after else self.rows[:half]
++        return {'table': 'tasks', 'head': 3 if after else 1, 'rows': batch, 'more': not after,
++                'next': batch[-1]['id'] if batch else after}
++
++    def changes(self, board, since):
++        self.since.append(since)
++        batch = [c for c in self.log if c['seq'] > since][:2]
++        return {'changes': batch, 'next': batch[-1]['seq'], 'more': batch[-1]['seq'] < 5}
++
++
++def _ids(manifest):
++    return [row['id'] for row in manifest['rows']]
++
++
++@pytest.mark.parametrize('terminal', ['done', 'archived'])
++def test_card_created_then_completed_mid_window_absent_from_snapshot(terminal):
++    hub = Window([_row('a'), _row('b')], [_task(2, 'z', **_row('z')), _task(4, 'z', status=terminal)])
++    assert _ids(prepare.capture(hub, board_id='board', exceptions=[])) == ['a', 'b']
++    assert hub.since[0] == 1
++
++
++def test_card_created_then_completed_mid_window_paged_late_as_done():
++    # The incident shape: the late page already shows done, the replay has ready.
++    hub = Window([_row('a'), _row('z', status='done')],
++                 [_task(2, 'z', **_row('z')), _task(3, 'z', status='ready'),
++                  _task(4, 'z', status='done')])
++    assert _ids(prepare.capture(hub, board_id='board', exceptions=[])) == ['a']
++
++
++@pytest.mark.parametrize('snapshot', ['ready', 'done'], ids=['paged-before', 'paged-after'])
++def test_existing_card_completed_mid_window(snapshot):
++    rows = [_row('a', status=snapshot), _row('b')]
++    hub = Window(rows, [_task(4, 'a', **{**_row('a'), 'status': 'done'})])
++    assert _ids(prepare.capture(hub, board_id='board', exceptions=[])) == ['b']
++    assert rows[0]['status'] == 'done'
++
++
++def test_existing_card_reopened_mid_window_joins_manifest():
++    rows = [_row('a', status='done', priority=7), _row('b')]
++    hub = Window(rows, [_task(4, 'a', status='ready')])
++    manifest = prepare.capture(hub, board_id='board', exceptions=[])
++    assert [(r['id'], r['old']) for r in manifest['rows']] == [('a', 7), ('b', 10000)]
++
++
++def test_open_status_patch_without_status_keeps_replayed_terminal_state():
++    rows = [_row('a'), _row('b')]
++    hub = Window(rows, [_task(2, 'a', status='done'), _task(4, 'a', title='renamed')])
++    assert _ids(prepare.capture(hub, board_id='board', exceptions=[])) == ['b']
++
++
++def test_statusless_patch_keeps_snapshot_status():
++    rows = [_row('a', status='done'), _row('b', status='blocked')]
++    hub = Window(rows, [_task(3, 'a', title='renamed'), _task(4, 'b', title='renamed')])
++    assert _ids(prepare.capture(hub, board_id='board', exceptions=[])) == ['b']
++    assert [row['status'] for row in rows] == ['done', 'blocked']
++
++
++def test_completion_mid_window_resolves_terminal_exception():
++    hub = Window([_row('a'), _row('b')], [_task(3, 'a', status='archived')])
++    manifest = prepare.capture(hub, board_id='board', exceptions=['a'])
++    assert manifest['exceptions'] == [{'id': 'a', 'origin': 'one', 'old': 10000, 'status': 'archived'}]
++
++
++def test_verify_accepts_manifest_row_completed_mid_window():
++    manifest = prepare.capture(Window([_row('a'), _row('b')], []), board_id='board', exceptions=[])
++    hub = Window([_row('a'), _row('b')], [_task(2, 'a', status='done')])
++    result = prepare.verify(hub, manifest, undo=True)
++    assert result['verified'] == 1
++
++
++@pytest.mark.parametrize('seq', [2, 3, 4, 5])
++@pytest.mark.parametrize('fields', [
++    pytest.param({'priority': 2}, id='priority'),
++    pytest.param({'priority': 2, 'status': 'done'}, id='priority-then-terminal'),
++    pytest.param({'created_on': 'other'}, id='origin'),
++    pytest.param({'id': 'other'}, id='identity'),
++])
++def test_real_change_mid_window_still_refuses(seq, fields):
++    hub = Window([_row('a'), _row('b')], [_task(seq, 'a', **fields)])
++    with pytest.raises(ValueError, match='changed'):
++        prepare.capture(hub, board_id='board', exceptions=[])
++
++
++def test_priority_change_before_completion_still_refuses_against_late_done_row():
++    hub = Window([_row('a'), _row('z', status='done')],
++                 [_task(2, 'z', **_row('z', priority=4)), _task(4, 'z', status='done')])
++    with pytest.raises(ValueError, match='changed'):
++        prepare.capture(hub, board_id='board', exceptions=[])
++
++
++@pytest.mark.parametrize('changes', [
++    pytest.param([_task(2, 'z', **_row('z'))], id='created-open'),
++    pytest.param([_task(2, 'z', **_row('z')), _task(3, 'z', status='done'),
++                  _task(4, 'z', status='ready')], id='created-done-reopened'),
++    pytest.param([_task(2, 'z', title='no status')], id='unknown-status'),
++    pytest.param([_task(2, 'z', status='done'), _task(4, 'z', op='delete')], id='missing-delete'),
++    pytest.param([_task(3, 'a', op='delete')], id='delete'),
++    pytest.param([_task(3, None, status='done')], id='no-uid'),
++])
++def test_membership_change_mid_window_still_refuses(changes):
++    hub = Window([_row('a'), _row('b')], changes)
++    with pytest.raises(ValueError, match='changed'):
++        prepare.capture(hub, board_id='board', exceptions=[])
++
++
++def test_changes_after_final_head_are_ignored():
++    rows = [_row('a')]
++
++    class Feed:
++        def changes(self, board, since):
++            return {'changes': [_task(2, 'a', status='done'), _task(3, 'z', **_row('z'))],
++                    'next': 3, 'more': False}
++
++    check_interval(Feed(), 'board', rows, 1, 2)
++    assert rows[0]['status'] == 'done'
++
++
++@pytest.mark.parametrize('status', [None, ['done'], 'invalid'])
++def test_invalid_replayed_status_refuses(status):
++    with pytest.raises(ValueError, match='changed'):
++        check_interval(Window([_row('a')], [_task(2, 'z', status=status)]), 'board', [_row('a')], 1, 5)
+-- 
+2.51.0
+

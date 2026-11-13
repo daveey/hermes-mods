@@ -1,0 +1,138 @@
+From 1089256e1dfac041a95d726bab15a6b79eb6da1e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:21:36 +0000
+Subject: [PATCH] [daveey] tool_store_pins: a borrower declines an optional
+ default the account store never installed
+
+worker-7's account store has no cua-driver (it fails headless: no libXi), so
+every fake HERMES_HOME refused to borrow and downloaded the whole toolchain.
+A default the store records at no version is now declined in the borrower's
+own install state (never STORE), after every other check passed; a default
+recorded at other pins still refuses.
+---
+ scripts/tool_store_pins.py            | 18 ++++++++--
+ tests/scripts/test_tool_store_pins.py | 50 ++++++++++++++++++++++++++-
+ 2 files changed, 64 insertions(+), 4 deletions(-)
+
+diff --git a/scripts/tool_store_pins.py b/scripts/tool_store_pins.py
+index 60a0606374..c10dc001cd 100644
+--- a/scripts/tool_store_pins.py
++++ b/scripts/tool_store_pins.py
+@@ -21,6 +21,13 @@ and a missing or non-executable binary (setup-hermes.sh's uv copy included)
+ sends setup or `pm install` into a re-stage whose unlocked remove + publish
+ races other runs on the shared store. Read-only: no lock, no install, no
+ bytecode; any unreadable record or error means "do not share".
++
++One exception to "every tool": an optional default (Chromium, cua-driver) the
++store records at no version at all, because the owner declined it or it failed
++to install (cua-driver on a headless Linux worker lacks libXi). The borrower
++declines it too, so its own `pm install` never stages it into the shared store.
++That decline, written only once every check passed, is this script's one write,
++and it lands in the borrower's install state, never in STORE.
+ """
+ import os
+ import sys
+@@ -50,7 +57,7 @@ def main(repo: str, store: Path) -> int:
+     sys.path.insert(0, repo)
+     if not borrows(store):
+         return 1
+-    from pm.defaults import default_packages
++    from pm.defaults import default_packages, record_declined
+     from pm.install import _installed_location
+     from pm.lock import Facts, Lockfile
+     from pm.package import StatePackage
+@@ -60,9 +67,12 @@ def main(repo: str, store: Path) -> int:
+ 
+     lock = Lockfile(Path(repo, "pm", "lock.json"))
+     # Strict first: PM's lenient read would quarantine an unparsable file as .corrupt.
+-    Facts(store / "facts.json", strict=True)
++    store_facts = Facts(store / "facts.json", strict=True)
+     names, target = lock.names(), current_target()
+-    for package in walk(tool_roots(names) + developer_tools(names) + default_packages(names) + ["venv"]):
++    defaults = default_packages(names)
++    absent = [name for name in defaults if store_facts.get(name) is None]
++    carried = [name for name in defaults if name not in absent]
++    for package in walk(tool_roots(names) + developer_tools(names) + carried + ["venv"]):
+         if isinstance(package, StatePackage):
+             continue
+         location = _installed_location(package, lock, target, roots=(store,), heal=False)
+@@ -75,6 +85,8 @@ def main(repo: str, store: Path) -> int:
+     uv = _setup_uv(store, target, lock.version("uv"))
+     if not uv.is_file() or not (os.name == "nt" or os.access(uv, os.X_OK)):
+         return 1
++    if absent:
++        record_declined(add=absent, project_root=Path(repo))
+     # The runner reuses uv's interpreter cache only when it already holds this minor.
+     print(".".join(lock.version("python").split("+")[0].split(".")[:2]))
+     return 0
+diff --git a/tests/scripts/test_tool_store_pins.py b/tests/scripts/test_tool_store_pins.py
+index 0a718ce0ed..96d566011f 100644
+--- a/tests/scripts/test_tool_store_pins.py
++++ b/tests/scripts/test_tool_store_pins.py
+@@ -14,7 +14,8 @@ from pathlib import Path
+ 
+ import pytest
+ 
+-from pm.defaults import default_packages
++from pm.defaults import DECLINED_FILENAME, default_packages
++from pm.environments import install_key
+ from pm.lock import Facts, Lockfile
+ from pm.package import StatePackage
+ from pm.registry import get_package, tool_roots, walk
+@@ -133,6 +134,53 @@ def test_the_stores_own_root_never_borrows_it(tmp_path):
+     assert not _shares(store, home=tmp_path / "account"), "HERMES_HOME unset under the account HOME"
+ 
+ 
++def _drop_fact(store: Path, name: str) -> None:
++    data = json.loads((store / "facts.json").read_text())
++    del data["packages"][name]
++    (store / "facts.json").write_text(json.dumps(data))
++
++
++def _snapshot(root: Path) -> list:
++    return sorted((p.relative_to(root), p.is_file() and p.read_bytes(), p.stat().st_mode) for p in root.rglob("*"))
++
++
++@pytest.mark.platforms("posix")
++def test_an_optional_default_the_store_never_installed_is_declined_by_the_borrower(tmp_path):
++    """worker-7: cua-driver fails to install headless (no libXi), so the account store has no
++    fact for it. That used to refuse sharing, and every fake home downloaded the whole toolchain."""
++    store = _account_store(tmp_path)
++    lock = Lockfile(ROOT / "pm" / "lock.json")
++    defaults = default_packages(lock.names(), declined_names=frozenset())
++    if not defaults:
++        pytest.skip("no optional default on this target")
++    for name in defaults:
++        _drop_fact(store, name)
++    before = _snapshot(store)
++    borrower = tmp_path / "card" / "hh"
++    assert _shares(store, hermes_home=borrower)
++    assert _snapshot(store) == before, "the decline must not touch the shared store"
++    record = borrower / "installs" / install_key(ROOT) / DECLINED_FILENAME
++    assert record.is_file(), "the borrower records its own decline, so its pm install skips the default"
++    assert set(json.loads(record.read_text())["declined"]) >= set(defaults)
++    assert _shares(store, hermes_home=borrower), "a rerun still shares"
++    assert not (borrower / "tools").exists()
++
++
++@pytest.mark.platforms("posix")
++def test_an_optional_default_at_another_version_is_still_not_shared(tmp_path):
++    """Only a default absent at every version is declined; one recorded at other pins would be re-staged."""
++    store = _account_store(tmp_path)
++    defaults = default_packages(Lockfile(ROOT / "pm" / "lock.json").names(), declined_names=frozenset())
++    if not defaults:
++        pytest.skip("no optional default on this target")
++    data = json.loads((store / "facts.json").read_text())
++    data["packages"][defaults[0]]["version"] = "0.0.0-other"
++    (store / "facts.json").write_text(json.dumps(data))
++    borrower = tmp_path / "card" / "hh"
++    assert not _shares(store, hermes_home=borrower)
++    assert not borrower.exists(), "a refusal writes nothing, not even the borrower's decline"
++
++
+ @pytest.mark.platforms("posix")
+ def test_a_root_with_its_own_store_keeps_it(tmp_path):
+     store = _account_store(tmp_path)
+-- 
+2.51.0
+

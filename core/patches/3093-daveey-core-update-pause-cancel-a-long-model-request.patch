@@ -1,0 +1,405 @@
+From 1a652983ea16f636aa27139c3ea32f12f9ccd5fd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 02:05:03 +0000
+Subject: [PATCH] [daveey] core-update pause: cancel a long model request at a
+ step boundary (t_01a1d293248f5e12)
+
+hermes-hub 2026-11-13 01:22:19-01:25:08: a Desktop turn sat in a 169 s model request
+right after its tool results. The update pause lands only at a step boundary and the
+mid-tool cancel covered tool calls and compressions, so the turn kept its admission
+reservation unpublished and every instant apply after the 60 s cap was refused
+('1 unpublished reservation(s)'); the update applied 274 s after it was due.
+
+A model request issued at a step boundary (an earlier call ran this turn and the
+transcript ends on a tool result) now registers with agent.update_pause_cancel as
+'model-request'. After MID_TOOL_GRACE_S the watcher cancels it; the request's output
+(partial, crossed response, or a provider error caused by the cancel) is dropped and
+the same logical iteration is re-issued through the redirect restart, so
+begin_iteration takes the pending cancel and pauses at that boundary (resumable,
+reservation released). The turn's first request is not a boundary and is untouched;
+a user Stop still wins.
+---
+ agent/turn_api_call.py                        |  39 +++-
+ agent/turn_api_error.py                       |   7 +
+ agent/update_pause_cancel.py                  |  42 +++-
+ .../test_update_pause_model_request.py        | 205 ++++++++++++++++++
+ 4 files changed, 284 insertions(+), 9 deletions(-)
+ create mode 100644 tests/tui_gateway/test_update_pause_model_request.py
+
+diff --git a/agent/turn_api_call.py b/agent/turn_api_call.py
+index 3581e153e8..00ceaffd59 100644
+--- a/agent/turn_api_call.py
++++ b/agent/turn_api_call.py
+@@ -19,6 +19,7 @@ from agent.agent_runtime_helpers_placeholders import hidden_interrupt_placeholde
+ from agent.message_metadata import append_message
+ from agent.repetition_guard import REPETITION_LOOP_INTERRUPTED, is_runaway_repetition
+ from agent.turn_failure_copy import site_copy, stamp_failure
++from agent import update_pause_cancel
+ 
+ logger = logging.getLogger("agent.conversation_loop")
+ 
+@@ -76,7 +77,7 @@ def perform_api_call(
+     agent: Any, *, api_kwargs: Any, _original_api_kwargs: Any, _llm_middleware_trace: Any,
+     _moa_prepared_request: Any, _retry: Any, thinking_spinner: Any, retry_count: Any,
+     api_call_count: Any, api_request_id: Any, effective_task_id: Any, turn_id: Any,
+-    interrupted: Any,
++    interrupted: Any, messages: Any = None,
+ ) -> ApiCallVerdict:
+     """Issue the request (see ``_should_stream`` for the streaming decision)."""
+     response = None
+@@ -141,13 +142,15 @@ def perform_api_call(
+         if _model_request_active is not None:
+             _model_request_active.set()
+     try:
+-        response = run_llm_execution_middleware(
+-            api_kwargs, _perform_api_call, original_request=_original_api_kwargs,
+-            task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
+-            session_id=agent.session_id or "", platform=agent.platform or "", model=agent.model,
+-            provider=agent.provider, base_url=agent.base_url, api_mode=agent.api_mode,
+-            api_call_count=api_call_count, middleware_trace=list(_llm_middleware_trace),
+-        )
++        # [daveey] t_01a1d293248f5e12: a request issued at a step boundary yields to a core-update pause.
++        with update_pause_cancel.model_request_in_flight(agent, messages, api_call_count=api_call_count):
++            response = run_llm_execution_middleware(
++                api_kwargs, _perform_api_call, original_request=_original_api_kwargs,
++                task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
++                session_id=agent.session_id or "", platform=agent.platform or "", model=agent.model,
++                provider=agent.provider, base_url=agent.base_url, api_mode=agent.api_mode,
++                api_call_count=api_call_count, middleware_trace=list(_llm_middleware_trace),
++            )
+     finally:
+         with _bracket:
+             if _model_request_active is not None:
+@@ -165,9 +168,24 @@ def perform_api_call(
+         else:
+             interrupted = True
+         return _verdict("break")
++    if update_pause_cancel.model_yield_requested(agent):
++        # The update's cancel landed as the response arrived: drop it like a cancelled one, so the turn
++        # pauses at the boundary the request was issued from instead of acting with the pause pending.
++        thinking_spinner = stop_thinking_spinner(agent, thinking_spinner)
++        response = None
++        yield_to_update_pause(_retry)
++        return _verdict("break")
+     return _verdict("fallthrough")
+ 
+ 
++def yield_to_update_pause(_retry: Any) -> None:
++    """[daveey] t_01a1d293248f5e12: a model request the core-update pause cancelled produced nothing to keep.
++    Re-issue the same logical iteration (the redirect restart: iteration count and budget refunded, bounded by
++    ``max_retries``); ``begin_iteration`` then takes the pending cancel and pauses at the step boundary, with no
++    partial or interrupt row after the tool results."""
++    _retry.restart_with_redirected_messages = True
++
++
+ @dataclass
+ class ApiInterruptVerdict:
+     """Always ``action == "break"`` (leave the retry loop): either a redirect restart was
+@@ -195,6 +213,11 @@ def handle_api_interrupt(
+     if agent._has_pending_redirect() and agent.clear_interrupt(preserve_redirect=True):
+         _retry.restart_with_redirected_messages = True
+         return ApiInterruptVerdict("break", thinking_spinner, interrupted, final_response)
++    if update_pause_cancel.model_yield_requested(agent):
++        # [daveey] t_01a1d293248f5e12: the core-update pause cancelled this boundary request. Its partial text is
++        # dropped (the resumed turn re-issues the request); the pause lands at the boundary (begin_iteration).
++        yield_to_update_pause(_retry)
++        return ApiInterruptVerdict("break", thinking_spinner, interrupted, final_response)
+     api_elapsed = time.time() - api_start_time
+     agent._vprint(f"{agent.log_prefix}⚡ Interrupted during API call.", force=True)
+     interrupted = True
+diff --git a/agent/turn_api_error.py b/agent/turn_api_error.py
+index b2e2e04213..5828490c75 100644
+--- a/agent/turn_api_error.py
++++ b/agent/turn_api_error.py
+@@ -16,6 +16,8 @@ import time
+ from typing import Any, Dict, Optional
+ 
+ from agent.api_error_summary import is_provider_stream_parse_error
++from agent import update_pause_cancel
++from agent.turn_api_call import yield_to_update_pause
+ from agent.error_classifier import CODEX_BARE_400_MARKER, RETRYABLE_CLIENT_REASONS, FailoverReason, classify_api_error
+ from agent.turn_offline_wait import wait_out_offline
+ from agent.route_verdicts import route_visit
+@@ -205,6 +207,11 @@ def handle_api_error(
+     )
+ 
+     if agent._interrupt_requested:
++        if update_pause_cancel.model_yield_requested(agent):
++            # [daveey] t_01a1d293248f5e12: the core-update pause cancelled this boundary request and the
++            # cancel surfaced as a provider error: yield exactly as an InterruptedError would (turn_api_call).
++            yield_to_update_pause(_retry)
++            return _verdict("break")
+         # Preserve a pending redirect: the user is steering, not stopping — rebuild the
+         # turn from the correction instead of aborting.
+         if agent.clear_interrupt(preserve_redirect=True):
+diff --git a/agent/update_pause_cancel.py b/agent/update_pause_cancel.py
+index 73347face4..227d77ac69 100644
+--- a/agent/update_pause_cancel.py
++++ b/agent/update_pause_cancel.py
+@@ -118,11 +118,51 @@ def compression_can_yield(trigger: Any, messages: Any, *, api_call_count: int) -
+ 
+ def compression_yield_requested(agent: Any) -> bool:
+     """The update's cancel covered the running compression and is still the pending interrupt (no Stop since)."""
++    return _yield_requested(agent, COMPRESSION_CALL_ID)
++
++
++def _yield_requested(agent: Any, call_id: str) -> bool:
+     record = _slots(agent).get(_CANCEL)
+-    return bool(record) and COMPRESSION_CALL_ID in record["calls"] \
++    return bool(record) and call_id in record["calls"] \
+         and bool(getattr(agent, "_interrupt_requested", False)) and interrupt_issuer(agent) == _ISSUER
+ 
+ 
++# [daveey] t_01a1d293248f5e12: the in-flight id of a model request issued at a step boundary.
++MODEL_CALL_ID = "model-request"
++
++
++def model_request_can_yield(messages: Any, *, api_call_count: int) -> bool:
++    """The request about to run sits at a step boundary: an earlier model call ran this turn
++    (``api_call_count`` already counts this one, begin_iteration reserved it) and the transcript ends on a tool
++    result, so a pause landing here loses nothing but this request (``_step_boundary_pause``'s precondition)."""
++    if api_call_count - 1 <= 0 or not isinstance(messages, list) or not messages:
++        return False
++    last = messages[-1]
++    return isinstance(last, dict) and last.get("role") == "tool"
++
++
++@contextmanager
++def model_request_in_flight(agent: Any, messages: Any, *, api_call_count: int) -> Iterator[bool]:
++    """[daveey] t_01a1d293248f5e12: a model request at a step boundary is in flight like a tool call, so the
++    watcher's cancel reaches it after the same grace. Without this a long request (169 s on the hub) held the
++    turn's admission reservation unpublished past the instant update's cap: a pause lands only at a step boundary.
++    The turn's first request (no tool result yet) is not tracked: there is no boundary to pause at."""
++    tracked = model_request_can_yield(messages, api_call_count=api_call_count)
++    if tracked:
++        started(agent, MODEL_CALL_ID)
++    try:
++        yield tracked
++    finally:
++        if tracked:
++            finished(agent, MODEL_CALL_ID)
++
++
++def model_yield_requested(agent: Any) -> bool:
++    """The update's cancel covered the running model request and is still the pending interrupt (no Stop since):
++    its output is discarded and the turn pauses at the boundary it was issued from."""
++    return _yield_requested(agent, MODEL_CALL_ID)
++
++
+ def _continues_in_background(result: Any) -> bool:
+     """``result`` is the terminal tool's JSON for a foreground command handed to the background."""
+     if not isinstance(result, str) or '"continues_in_background"' not in result:
+diff --git a/tests/tui_gateway/test_update_pause_model_request.py b/tests/tui_gateway/test_update_pause_model_request.py
+new file mode 100644
+index 0000000000..84059b60d8
+--- /dev/null
++++ b/tests/tui_gateway/test_update_pause_model_request.py
+@@ -0,0 +1,205 @@
++"""[daveey] t_01a1d293248f5e12: a core-update pause no longer waits out a long model request.
++
++hermes-hub 2026-11-13 01:22:19-01:25:08: a Desktop turn (20261111_200009_edbe39) sat in a 169 s model request
++right after its tool results. The drainer asked it to pause at 01:22:21, but a pause lands only at a step
++boundary and the mid-tool cancel covered tool calls and compressions, not the model request. The turn kept its
++admission reservation unpublished the whole time, so every instant apply after the 60 s cap was refused
++("1 unpublished reservation(s)") and the update applied 274 s after it was due.
++
++A model request issued at a step boundary (the transcript ends on this turn's tool results) now registers with
++``agent.update_pause_cancel``: after the same ``MID_TOOL_GRACE_S`` the watcher cancels it, its partial output is
++discarded, and the turn pauses at that same boundary (resumable, reservation released). The turn's first
++request (no tool result yet) is not a boundary and is left alone.
++
++These drive a real ``AIAgent`` turn through the real retry loop, the real admission fence and the gateway's real
++hook and watcher; only the model (a request that keeps running) and the tool body are fakes.
++"""
++
++from __future__ import annotations
++
++import tempfile
++import threading
++import time
++import types
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from agent import update_pause_cancel
++from hermes_cli import admission_fence as af
++from hermes_state import SessionDB
++from run_agent import AIAgent
++from tui_gateway import server
++from tui_gateway import update_pause as up
++from tui_gateway.turn_marker import read_turn_marker, record_turn_start
++
++CFG = {"desktop": {"auto_continue": {"enabled": True, "resume_on_startup": True, "freshness_minutes": 240,
++                                     "max_attempts": 2}}}
++SLOW_MODEL_S = 8.0  # a model request left alone runs this long, then answers
++_TICK = threading.Event()  # never set: ``_TICK.wait(s)`` paces the fake request without a wall-clock sleep
++
++
++@pytest.fixture(autouse=True)
++def _quiet(monkeypatch):
++    monkeypatch.setattr("agent.title_generator.maybe_auto_title", lambda *a, **k: None)
++
++
++@pytest.fixture()
++def home(monkeypatch, tmp_path):
++    monkeypatch.setattr(server, "_hermes_home", tmp_path)
++    monkeypatch.setattr(server, "_load_cfg", lambda: CFG)
++    monkeypatch.setattr(up, "MID_TOOL_GRACE_S", 0.3)
++    monkeypatch.setattr(up, "MID_TOOL_POLL_S", 0.05)
++    return tmp_path
++
++
++def _make_agent(tmp_path: Path) -> AIAgent:
++    hermes_home = Path(tempfile.mkdtemp(prefix="hermes-test-home-", dir=tmp_path))
++    (hermes_home / "logs").mkdir(parents=True, exist_ok=True)
++    defs = [{"type": "function", "function": {"name": "quick_job", "description": "quick_job",
++                                              "parameters": {"type": "object", "properties": {}}}}]
++    with (
++        patch("model_tools.get_tool_definitions", return_value=defs),
++        patch("model_tools.check_toolset_requirements", return_value={}),
++        patch("agent.process_bootstrap.OpenAI"),
++        patch("run_agent._hermes_home", hermes_home),
++        patch("agent.model_metadata.fetch_model_metadata", return_value={}),
++    ):
++        agent = AIAgent(api_key="test-key", base_url="https://openrouter.ai/api/v1", quiet_mode=True,
++                        skip_context_files=True, skip_memory=True)
++    agent.client = MagicMock()
++    agent._cached_system_prompt = "You are helpful."
++    agent._use_prompt_caching = False
++    agent.compression_enabled = False
++    agent.save_trajectories = False
++    db = SessionDB(db_path=tmp_path / "state.db")
++    db.create_session(session_id="session-key", source="tui", model="test/model")
++    agent._session_db, agent._session_db_created, agent.session_id = db, True, "session-key"
++    agent._last_flushed_db_idx, agent._flushed_db_message_ids = 0, set()
++    agent._flushed_db_message_session_id, agent._persist_disabled = None, False
++    return agent
++
++
++def _response(*calls):
++    message = types.SimpleNamespace(content=None if calls else "done", reasoning_content=None, reasoning=None,
++                                    tool_calls=list(calls) or None)
++    return types.SimpleNamespace(choices=[types.SimpleNamespace(
++        message=message, finish_reason="tool_calls" if calls else "stop")], model="test/model", usage=None)
++
++
++def _call(call_id):
++    return types.SimpleNamespace(id=call_id, type="function",
++                                 function=types.SimpleNamespace(name="quick_job", arguments="{}"))
++
++
++class _Model:
++    """The provider: scripted responses; the request numbered ``slow`` runs ``SLOW_MODEL_S`` and sets
++    ``slow_started`` when it begins (the drainer's pause is issued then, mid-request)."""
++
++    def __init__(self, responses, slow: int):
++        self.responses = list(responses)
++        self.slow = slow
++        self.calls = 0
++        self.slow_started = threading.Event()
++        self.slow_finished = False
++
++    def __call__(self, *a, **kw):
++        self.calls += 1
++        if self.calls == self.slow:
++            self.slow_started.set()
++            _TICK.wait(SLOW_MODEL_S)
++            self.slow_finished = True
++        return self.responses.pop(0)
++
++
++def _pause_when(home, event):
++    def _issue():
++        if event.wait(5):
++            af.set_hold(home)
++            af.request_pause(home, expires_at=time.time() + 120)
++    threading.Thread(target=_issue, daemon=True).start()
++
++
++def _drive(home, tmp_path, monkeypatch, responses, slow):
++    record_turn_start(home, "session-key", "run the quick job")
++    agent = _make_agent(tmp_path)
++    session = {"agent": agent, "session_key": "session-key", "profile_home": str(home),
++               "history_lock": threading.RLock()}
++    model = _Model(responses, slow)
++    agent.client.chat.completions.create.side_effect = model
++    monkeypatch.setattr("model_tools.handle_function_call", lambda name, *a, **k: "quick result")
++    reservation = af.reserve(home)  # the turn's admission reservation, as the Desktop backend takes it
++    assert reservation is not None
++    _pause_when(home, model.slow_started)
++    out = {}
++
++    def _turn():
++        agent.step_boundary_pause = up.boundary_pause_hook(session, "session-key")
++        stop = up.start_mid_tool_cancel(session, "session-key", agent)
++        try:
++            out["result"] = agent.run_conversation("run the quick job")
++        finally:
++            stop()
++            agent.step_boundary_pause = None
++            reservation.close()  # the backend releases the reservation at the turn's end
++            out["at"] = time.monotonic()
++
++    started = time.monotonic()
++    thread = threading.Thread(target=_turn, daemon=True)
++    thread.start()
++    thread.join(SLOW_MODEL_S * 3)
++    assert not thread.is_alive()
++    return agent, model, out["result"], out["at"] - started
++
++
++def test_a_long_model_request_at_a_step_boundary_yields_and_the_turn_pauses(home, tmp_path, monkeypatch):
++    agent, model, result, took = _drive(
++        home, tmp_path, monkeypatch, [_response(_call("call_1")), _response(), _response()], slow=2)
++
++    assert model.slow_started.is_set()
++    assert took < SLOW_MODEL_S / 2  # the drainer sees the reservation gone long before the request would end
++    assert af.state(home)["reservations"] == 0
++    assert result["interrupted"] is True and result["paused_for_update"] == up.PAUSE_REASON
++    assert model.calls == 2  # no further model call after the yield
++    marker = read_turn_marker(home, "session-key")
++    assert marker["reason"] == "core_update_pause" and marker["pauses"] == 1
++    # The boundary is the tool result: the cancelled request left no assistant row (partial or stub) behind it.
++    assert result["messages"][-1]["role"] == "tool"
++    assert not agent._interrupt_requested
++    assert update_pause_cancel.in_flight(agent) == {}
++
++
++def test_the_first_model_request_is_not_a_boundary_and_is_left_alone(home, tmp_path, monkeypatch):
++    _agent, model, result, took = _drive(home, tmp_path, monkeypatch, [_response()], slow=1)
++
++    assert model.slow_finished  # nothing cancelled it: there is no tool result to pause after
++    assert took >= SLOW_MODEL_S
++    assert not result.get("paused_for_update")
++    assert result["final_response"] == "done"
++
++
++def test_model_request_counts_as_in_flight_only_at_a_boundary():
++    agent = types.SimpleNamespace(_interrupt_requested=False)
++    agent.interrupt = lambda **kw: setattr(agent, "_interrupt_requested", True) or setattr(
++        agent, "_tool_interrupt_reason", kw.get("tool_reason"))
++    at_boundary = [{"role": "user", "content": "go"}, {"role": "assistant", "content": None},
++                   {"role": "tool", "content": "r"}]
++    with update_pause_cancel.model_request_in_flight(agent, [{"role": "user", "content": "go"}], api_call_count=1):
++        assert update_pause_cancel.in_flight(agent) == {}
++    with update_pause_cancel.model_request_in_flight(agent, at_boundary, api_call_count=2):
++        assert list(update_pause_cancel.in_flight(agent)) == [update_pause_cancel.MODEL_CALL_ID]
++        assert not update_pause_cancel.model_yield_requested(agent)
++        assert update_pause_cancel.cancel(agent, "stamp") == [update_pause_cancel.MODEL_CALL_ID]
++        assert update_pause_cancel.model_yield_requested(agent)
++        assert not update_pause_cancel.compression_yield_requested(agent)
++    assert update_pause_cancel.in_flight(agent) == {}
++    assert update_pause_cancel.take_pending(agent) is True
++
++
++def test_a_user_stop_is_not_a_model_yield():
++    agent = types.SimpleNamespace(_interrupt_requested=True, _tool_interrupt_reason="user interrupt")
++    at_boundary = [{"role": "user", "content": "go"}, {"role": "tool", "content": "r"}]
++    with update_pause_cancel.model_request_in_flight(agent, at_boundary, api_call_count=2):
++        assert update_pause_cancel.cancel(agent, "stamp") is None
++        assert not update_pause_cancel.model_yield_requested(agent)
+-- 
+2.51.0
+

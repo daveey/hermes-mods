@@ -1,0 +1,421 @@
+From b6eecbad057030c47b18417b5aa81ca005000b33 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 05:03:01 +0000
+Subject: [PATCH] [daveey] fix(worker-boards): only ENOENT is missing in every
+ inventory existence check
+
+Path.exists() is version-dependent: Python 3.14+ returns False on any
+OSError, while 3.11-3.13 (still allowed by requires-python) raise e.g.
+PermissionError. On 3.14 an unsearchable worker-resources/ made paths()
+silently drop every registered board from the capacity census.
+
+- worker_board_retirement.missing(): stat + except FileNotFoundError, the
+  single shared helper (worker_account_boards._missing now aliases it), with
+  a docstring stating the version-specific behaviour.
+- paths(): default/boards/worker-resources checks and the named-board file
+  check use it; an unreadable location raises instead of returning a census
+  without its boards.
+- register() destination, removing() record/path checks, retirement
+  pending()/recover() use it. removing()'s finally treats an unreadable path
+  as not removed (keeps the record) instead of masking the original error.
+- discard(): unlink + except FileNotFoundError (no check/unlink race).
+- Tests: os.stat EACCES on each inventory location -> paths() raises;
+  unreadable record -> register() raises; missing()/discard() ENOENT-only.
+  The vanished-record test uses record_paths() instead of hard-coding the
+  sha256 naming; function-local imports moved to module level.
+
+Follow-up to PR #1877 review nits 1-3.
+---
+ hermes_cli/worker_account_boards.py           | 55 +++++------
+ hermes_cli/worker_board_retirement.py         | 27 +++++-
+ .../hermes_cli/test_worker_account_boards.py  | 95 +++++++++++++++----
+ 3 files changed, 125 insertions(+), 52 deletions(-)
+
+diff --git a/hermes_cli/worker_account_boards.py b/hermes_cli/worker_account_boards.py
+index e4cd47f89a..1d73ae5035 100644
+--- a/hermes_cli/worker_account_boards.py
++++ b/hermes_cli/worker_account_boards.py
+@@ -28,9 +28,12 @@ import sqlite3
+ import json
+ from pathlib import Path
+ import os
++import stat
+ import tempfile
+ 
+ from hermes_cli import worker_compute_capacity as capacity
++from hermes_cli import worker_board_retirement as retirement
++from hermes_cli.worker_board_retirement import missing as _missing
+ 
+ 
+ def _refuse_test_registration() -> None:
+@@ -75,20 +78,6 @@ def _collected(path: Path) -> bool:
+     return any(path.is_relative_to(root) for root in _ephemeral_roots())
+ 
+ 
+-def _missing(path: Path) -> bool:
+-    """Only FileNotFoundError is absence, as in ``paths()``.
+-
+-    ``Path.exists()`` returns False on any OSError, so a board behind a
+-    permission error would look collected and be retired silently instead of
+-    refused loudly by ``paths()``. Other errors propagate to the caller.
+-    """
+-    try:
+-        path.stat()
+-    except FileNotFoundError:
+-        return True
+-    return False
+-
+-
+ def _retire_collected(directory: Path) -> None:
+     """Unlink records of garbage-collected boards. Caller holds the account fence.
+ 
+@@ -120,16 +109,15 @@ def register(conn) -> None:
+     if not raw:
+         raise ValueError('worker admission requires a file-backed board')
+     path = Path(raw).resolve(strict=True)
+-    from hermes_cli.worker_board_retirement import record_paths, discard
+     # A fresh admission invalidates any interrupted pre-rename idle proof.
+     # The caller retains the account fence through the subsequent claim.
+-    _, intent = record_paths(path)
+-    discard(intent)
++    _, intent = retirement.record_paths(path)
++    retirement.discard(intent)
+     directory = capacity.policy_root() / 'worker-resources' / 'boards'
+     directory.mkdir(parents=True, exist_ok=True)
+     _retire_collected(directory)
+     destination = directory / (hashlib.sha256(str(path).encode()).hexdigest() + '.json')
+-    if destination.exists():
++    if not _missing(destination):
+         if json.loads(destination.read_text(encoding='utf-8-sig')) != str(path):
+             raise ValueError('invalid registered board')
+         return
+@@ -166,7 +154,7 @@ def removing(path: Path):
+     record = account / 'worker-resources' / 'boards' / (
+         hashlib.sha256(str(path).encode()).hexdigest() + '.json')
+     if not SUPPORTED:
+-        if capacity.worker_enabled() or record.exists():
++        if capacity.worker_enabled() or not _missing(record):
+             raise ValueError('worker board removal requires admission fencing')
+         yield
+         return
+@@ -175,10 +163,10 @@ def removing(path: Path):
+         try:
+             for root in roots:
+                 stack.enter_context(admission_lock(root, timeout=0))
+-            registered = record.exists()
++            registered = not _missing(record)
+             if registered and json.loads(record.read_text(encoding='utf-8-sig')) != str(path):
+                 raise ValueError('invalid registered board')
+-            verify = registered or (capacity.worker_enabled() and path.exists())
++            verify = registered or (capacity.worker_enabled() and not _missing(path))
+             if verify:
+                 conn = sqlite3.connect(path.as_uri() + '?mode=rw', uri=True, timeout=0)
+                 try:
+@@ -192,7 +180,6 @@ def removing(path: Path):
+         except (AdmissionBusy, sqlite3.Error) as exc:
+             raise ValueError(f'board busy or unreadable; retry removal: {exc}') from exc
+         # Claims cannot pass their final gate until after removal and retirement.
+-        from hermes_cli import worker_board_retirement as retirement
+         _, intent = retirement.record_paths(path)
+         if verify:
+             retirement.prepare(path)
+@@ -203,25 +190,39 @@ def removing(path: Path):
+         finally:
+             # Keep the durable proof if record retirement is interrupted after
+             # rename. A later explicit recovery must take the account fence.
+-            if succeeded or (verify and not path.exists()):
++            try:
++                removed = verify and _missing(path)
++            except OSError:
++                removed = False  # unreadable is not removed: keep the record
++            if succeeded or removed:
+                 retirement.discard(record)
+             retirement.discard(intent)
+ 
+ 
++def _board_file(path: Path) -> bool:
++    """A named board's DB file; none (or a non-directory slug entry) is no board."""
++    try:
++        return stat.S_ISREG(path.stat().st_mode)
++    except (FileNotFoundError, NotADirectoryError):
++        return False
++
++
+ def paths() -> list[Path]:
+     root = capacity.policy_root()
+     found = []
++    # Only ENOENT is absence (``_missing``): an unreadable directory raises
++    # instead of silently dropping every board under it.
+     # Account installation boards count even before their first new claim.
+     default = root / 'kanban.db'
+-    if default.exists():
++    if not _missing(default):
+         found.append(default)
+     boards = root / 'kanban' / 'boards'
+-    if boards.exists():
++    if not _missing(boards):
+         from hermes_cli import kanban_db as kb
+         found.extend(child / 'kanban.db' for child in boards.iterdir()
+-                     if kb._BOARD_SLUG_RE.match(child.name) and (child / 'kanban.db').is_file())
++                     if kb._BOARD_SLUG_RE.match(child.name) and _board_file(child / 'kanban.db'))
+     directory = root / 'worker-resources' / 'boards'
+-    if directory.exists():
++    if not _missing(directory):
+         for record in directory.iterdir():
+             if record.suffix != '.json':
+                 continue
+diff --git a/hermes_cli/worker_board_retirement.py b/hermes_cli/worker_board_retirement.py
+index d206d9ceb9..88d23f1cf1 100644
+--- a/hermes_cli/worker_board_retirement.py
++++ b/hermes_cli/worker_board_retirement.py
+@@ -28,11 +28,28 @@ def sync_directory(path: Path) -> None:
+         os.close(fd)
+ 
+ 
++def missing(path: Path) -> bool:
++    """Only FileNotFoundError (ENOENT) is absence; other OSErrors propagate.
++
++    ``Path.exists()`` is version-dependent: Python 3.14+ returns False on any
++    OSError, while 3.11-3.13 raise e.g. PermissionError. Inventory and
++    retirement decisions must not depend on that: an unreadable path read as
++    absent would drop or retire a board silently instead of refusing loudly.
++    """
++    try:
++        path.stat()
++    except FileNotFoundError:
++        return True
++    return False
++
++
+ def discard(path: Path) -> None:
+     """Make invalidation durable before allowing a new claim."""
+-    if path.exists():
++    try:
+         path.unlink()
+-        sync_directory(path.parent)
++    except FileNotFoundError:
++        return
++    sync_directory(path.parent)
+ 
+ 
+ def prepare(path: Path) -> None:
+@@ -61,7 +78,7 @@ def pending(conn) -> Path | None:
+     if not raw:
+         return None
+     _, intent = record_paths(Path(raw).resolve())
+-    return intent if intent.exists() else None
++    return None if missing(intent) else intent
+ 
+ 
+ def recover(path: Path) -> None:
+@@ -75,7 +92,7 @@ def recover(path: Path) -> None:
+     root = capacity.policy_root().resolve()
+     record, intent = record_paths(path)
+     with admission_lock(root, timeout=0):
+-        if path.exists():
++        if not missing(path):
+             raise ValueError('source exists; use normal board removal')
+         raw = json.loads(intent.read_text(encoding='utf-8-sig'))
+         if (not isinstance(raw, dict) or raw.get('version') != 1
+@@ -83,7 +100,7 @@ def recover(path: Path) -> None:
+                 or type(raw.get('device')) is not int
+                 or type(raw.get('inode')) is not int or raw['inode'] <= 0):
+             raise ValueError('invalid board retirement proof')
+-        if record.exists():
++        if not missing(record):
+             if json.loads(record.read_text(encoding='utf-8-sig')) != str(path):
+                 raise ValueError('registered identity differs from retirement proof')
+             discard(record)
+diff --git a/tests/hermes_cli/test_worker_account_boards.py b/tests/hermes_cli/test_worker_account_boards.py
+index 477dc72236..77c8a1ee19 100644
+--- a/tests/hermes_cli/test_worker_account_boards.py
++++ b/tests/hermes_cli/test_worker_account_boards.py
+@@ -1,9 +1,20 @@
+ """Registered installation boards remain visible across dispatcher roots."""
++import errno
++import os
++import shutil
+ import sqlite3
++import stat
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
+ 
+ import pytest
+ 
++import hermes_constants
++import hermes_state_guard
+ from hermes_cli import worker_account_boards as inventory
++from hermes_cli import worker_board_retirement
+ from hermes_cli import worker_compute_capacity as capacity
+ from hermes_cli import machine_metrics, kanban_db as kb
+ 
+@@ -45,8 +56,6 @@ def test_corrupt_inventory_fails_closed(monkeypatch, tmp_path, raw):
+ 
+ 
+ def test_register_directory_fsync_failure_propagates(monkeypatch, tmp_path):
+-    import os
+-    import stat
+     monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path)
+     real_fsync = os.fsync
+     def fsync(fd):
+@@ -82,7 +91,6 @@ def _registered(conn_path):
+ 
+ def test_garbage_collected_scratch_board_retires_its_record(monkeypatch, tmp_path):
+     """A scratch HERMES_HOME's board whose workspace was pruned no longer holds every claim."""
+-    import shutil
+     monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path)
+     workspace = tmp_path / 'cache' / 'scratch' / 't_bench-x' / 'home'
+     workspace.mkdir(parents=True)
+@@ -102,7 +110,6 @@ def test_garbage_collected_scratch_board_retires_its_record(monkeypatch, tmp_pat
+ def test_concurrent_register_of_recreated_scratch_board_keeps_its_record(monkeypatch, tmp_path):
+     """paths() saw the board collected; a register() of the recreated path then
+     kept the existing record. The read must not unlink it afterwards."""
+-    import shutil
+     monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path)
+     board = tmp_path / 'cache' / 'scratch' / 'run' / 'kanban.db'
+     board.parent.mkdir(parents=True)
+@@ -129,7 +136,6 @@ def test_concurrent_register_of_recreated_scratch_board_keeps_its_record(monkeyp
+ 
+ def test_missing_board_stays_unknown_unless_its_scratch_dir_is_gone(monkeypatch, tmp_path):
+     """Fail closed for real boards: a non-ephemeral root, or a surviving scratch dir."""
+-    import shutil
+     account = tmp_path / 'account'
+     account.mkdir()
+     monkeypatch.setattr(capacity, 'policy_root', lambda: account)
+@@ -151,16 +157,13 @@ def test_missing_board_stays_unknown_unless_its_scratch_dir_is_gone(monkeypatch,
+ def test_record_unlinked_between_listing_and_read_is_skipped(monkeypatch, tmp_path):
+     """paths() runs unfenced: a fenced register()/removing() may unlink a record
+     after iterdir() listed it. That record is gone, not a reason to fail the census."""
+-    from pathlib import Path
+     monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path)
+     kept = tmp_path / 'kept' / 'kanban.db'
+     gone = tmp_path / 'gone' / 'kanban.db'
+     for board in (kept, gone):
+         board.parent.mkdir()
+         _registered(board)
+-    directory = tmp_path / 'worker-resources' / 'boards'
+-    import hashlib
+-    victim = directory / (hashlib.sha256(str(gone.resolve()).encode()).hexdigest() + '.json')
++    victim = worker_board_retirement.record_paths(gone.resolve())[0]
+     assert victim.exists()
+     real_read_text = Path.read_text
+ 
+@@ -181,8 +184,6 @@ def test_record_unlinked_between_listing_and_read_is_skipped(monkeypatch, tmp_pa
+ def test_unreadable_collected_looking_board_is_not_retired(monkeypatch, tmp_path):
+     """_retire_collected and paths() agree: only FileNotFoundError means missing.
+     A PermissionError on the board's stat keeps the record and refuses loudly."""
+-    import shutil
+-    from pathlib import Path
+     monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path)
+     board = tmp_path / 'cache' / 'scratch' / 'run' / 'kanban.db'
+     board.parent.mkdir(parents=True)
+@@ -192,12 +193,12 @@ def test_unreadable_collected_looking_board_is_not_retired(monkeypatch, tmp_path
+     denied = {board.resolve(), board.resolve().parent}
+     real_stat = Path.stat
+ 
+-    def stat(self, *args, **kwargs):
++    def denied_stat(self, *args, **kwargs):
+         if self in denied:
+             raise PermissionError(13, 'Permission denied', str(self))
+         return real_stat(self, *args, **kwargs)
+ 
+-    monkeypatch.setattr(Path, 'stat', stat)
++    monkeypatch.setattr(Path, 'stat', denied_stat)
+     other = tmp_path / 'cache' / 'scratch' / 'other' / 'kanban.db'
+     other.parent.mkdir(parents=True)
+     _registered(other)  # runs _retire_collected under the fence
+@@ -206,8 +207,68 @@ def test_unreadable_collected_looking_board_is_not_retired(monkeypatch, tmp_path
+         inventory.paths()
+ 
+ 
++def _deny_os_stat(monkeypatch, *denied):
++    """EACCES from os.stat for *denied*: Path.stat and Path.exists both go through it,
++    so this reproduces an unsearchable directory on every Python version (and as root)."""
++    blocked = {os.fspath(path) for path in denied}
++    real_stat = os.stat
++
++    def denied_stat(path, *args, **kwargs):
++        if isinstance(path, (str, os.PathLike)) and os.fspath(path) in blocked:
++            raise PermissionError(errno.EACCES, 'Permission denied', os.fspath(path))
++        return real_stat(path, *args, **kwargs)
++
++    monkeypatch.setattr(os, 'stat', denied_stat)
++
++
++@pytest.mark.parametrize('denied', [
++    ('worker-resources', 'boards'), ('kanban', 'boards'), ('kanban.db',)])
++def test_unreadable_inventory_location_refuses_instead_of_dropping(monkeypatch, tmp_path, denied):
++    """Only ENOENT is absence. Path.exists() returns False on EACCES on Python
++    3.14+ (3.11-3.13 raise): paths() must raise, never return a census that
++    silently dropped every board behind an unsearchable directory."""
++    monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path)
++    (tmp_path / 'kanban.db').touch()
++    named = tmp_path / 'kanban' / 'boards' / 'other' / 'kanban.db'
++    named.parent.mkdir(parents=True)
++    named.touch()
++    foreign = tmp_path / 'foreign' / 'kanban.db'
++    foreign.parent.mkdir()
++    _registered(foreign)
++    assert len(inventory.paths()) == 3
++    _deny_os_stat(monkeypatch, tmp_path.joinpath(*denied))
++    with pytest.raises(PermissionError):
++        inventory.paths()
++
++
++def test_unreadable_registration_record_is_not_rewritten(monkeypatch, tmp_path):
++    """register() treats only a missing record as absent; EACCES propagates."""
++    monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path)
++    board = tmp_path / 'board' / 'kanban.db'
++    board.parent.mkdir()
++    _registered(board)
++    record = worker_board_retirement.record_paths(board.resolve())[0]
++    _deny_os_stat(monkeypatch, record)
++    with pytest.raises(PermissionError):
++        _registered(board)
++
++
++def test_retirement_missing_and_discard_treat_only_enoent_as_absent(monkeypatch, tmp_path):
++    absent = tmp_path / 'absent.json'
++    assert worker_board_retirement.missing(absent)
++    worker_board_retirement.discard(absent)  # no-op, no race window between check and unlink
++    present = tmp_path / 'present.json'
++    present.write_text('"x"')
++    assert not worker_board_retirement.missing(present)
++    with monkeypatch.context() as denied:
++        _deny_os_stat(denied, present)
++        with pytest.raises(PermissionError):
++            worker_board_retirement.missing(present)
++    worker_board_retirement.discard(present)
++    assert worker_board_retirement.missing(present)
++
++
+ def test_ephemeral_roots_never_cover_the_account(monkeypatch, tmp_path):
+-    import tempfile
+     account = tmp_path / 'home' / '.hermes'
+     monkeypatch.setattr(capacity, 'policy_root', lambda: account)
+     monkeypatch.setattr(tempfile, 'gettempdir', lambda: str(tmp_path / 'home'))
+@@ -218,8 +279,6 @@ def test_ephemeral_roots_never_cover_the_account(monkeypatch, tmp_path):
+ 
+ def test_pytest_never_registers_in_the_real_account_inventory(monkeypatch, tmp_path):
+     """monkeypatch.undo() drops conftest's policy_root isolation; register must still refuse."""
+-    import hermes_constants
+-    import hermes_state_guard
+     monkeypatch.setattr(hermes_constants, '_account_home', lambda: tmp_path)
+     monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path / '.hermes')
+     conn = sqlite3.connect(tmp_path / 'board.db')
+@@ -248,10 +307,6 @@ def test_pytest_never_registers_in_the_real_account_inventory(monkeypatch, tmp_p
+ 
+ def test_stripped_env_child_with_isolation_marker_is_refused(tmp_path):
+     """A real child process whose env lost PYTEST_* but kept HERMES_TEST_ISOLATION."""
+-    import os
+-    import subprocess
+-    import sys
+-    from pathlib import Path
+     repo = Path(inventory.__file__).resolve().parents[1]
+     env = {k: v for k, v in os.environ.items() if not k.startswith('PYTEST_')}
+     env['HERMES_TEST_ISOLATION'] = str(tmp_path)
+-- 
+2.51.0
+

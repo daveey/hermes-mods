@@ -1,0 +1,371 @@
+From bf90ff7e56dbfa9e571b0fc91bc17dbe95fff368 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:00:10 +0000
+Subject: [PATCH] [daveey] Add bounded worker test slots and verified lock
+ inheritance
+
+---
+ scripts/run_tests_host_slots.py          | 28 ++++++--
+ scripts/run_tests_parallel.py            | 13 ++--
+ scripts/worker_test_budget.py            | 86 ++++++++++++++++++++++++
+ tests/conftest.py                        | 18 ++++-
+ tests/scripts/test_worker_test_budget.py | 84 +++++++++++++++++++++++
+ 5 files changed, 218 insertions(+), 11 deletions(-)
+ create mode 100644 scripts/worker_test_budget.py
+ create mode 100644 tests/scripts/test_worker_test_budget.py
+
+diff --git a/scripts/run_tests_host_slots.py b/scripts/run_tests_host_slots.py
+index 973dc3ccb7..3e43d15614 100644
+--- a/scripts/run_tests_host_slots.py
++++ b/scripts/run_tests_host_slots.py
+@@ -75,6 +75,9 @@ def _config_slots() -> int | None:
+ 
+ def host_slot_count() -> int:
+     """``HERMES_TEST_HOST_SLOTS`` env, else the host's ``tests.host_slots`` config, else ``os.cpu_count()``."""
++    from hermes_cli.worker_compute_capacity import worker_enabled, effective_cores
++    if worker_enabled():
++        return max(1, int(effective_cores() // 4))
+     raw = os.environ.get("HERMES_TEST_HOST_SLOTS", "").strip()
+     if raw:
+         try:
+@@ -95,6 +98,9 @@ def xdist_worker_budget() -> int:
+     16-core Mac ran 32+ workers and the load average passed 100 (ready Kanban cards then sat unclaimed).
+     Capping each holder's workers at its share of the cores keeps slots x workers <= cores. [daveey]
+     """
++    from hermes_cli.worker_compute_capacity import worker_enabled
++    if worker_enabled():
++        return 1
+     raw = os.environ.get("HERMES_TEST_XDIST_MAX", "").strip()
+     if raw:
+         try:
+@@ -108,11 +114,18 @@ def xdist_worker_budget() -> int:
+ 
+ 
+ def host_slot_dir() -> str:
+-    return os.environ.get("HERMES_TEST_SLOT_DIR") or f"/tmp/hermes-test-slots-{os.getuid()}"  # windows-footgun: ok — POSIX test host slots  # no-tmp: ok — host-wide shared slot dir must be outside per-run scratch
++    from hermes_cli.worker_compute_capacity import worker_enabled
++    override = None if worker_enabled() else os.environ.get("HERMES_TEST_SLOT_DIR")
++    return override or f"/tmp/hermes-test-slots-{os.getuid()}"  # windows-footgun: ok — POSIX test host slots  # no-tmp: ok — host-wide shared slot dir must be outside per-run scratch
+ 
+ 
+ def host_slots_enabled() -> bool:
+-    return os.name == "posix" and host_slot_count() > 0 and os.environ.get(HELD_ENV) != "1"
++    from hermes_cli.worker_compute_capacity import worker_enabled
++    inherited = os.environ.get(HELD_ENV) == "1" and not worker_enabled()
++    if worker_enabled():
++        from scripts.worker_test_budget import inherited_slot
++        inherited = inherited_slot()
++    return os.name == "posix" and host_slot_count() > 0 and not inherited
+ 
+ 
+ def slot_max_age_s() -> int:
+@@ -208,6 +221,9 @@ def reclaim_stale_slots(directory: str, count: int, now: float | None = None) ->
+     import fcntl
+ 
+     now = time.time() if now is None else now
++    from hermes_cli.worker_compute_capacity import worker_enabled
++    if worker_enabled():
++        return []  # A held inode is capacity, regardless of age or recorded PID.
+     max_age = slot_max_age_s()
+     notes: list[str] = []
+     for n in range(count):
+@@ -267,6 +283,10 @@ def acquire_host_slot(on_wait=None) -> int | None:
+     """
+     if not host_slots_enabled():
+         return None
++    from hermes_cli.worker_compute_capacity import worker_enabled
++    from scripts.worker_test_budget import RECEIPT_ENV
++    if worker_enabled() and (os.environ.get(HELD_ENV) or os.environ.get(RECEIPT_ENV)):
++        raise RuntimeError('invalid inherited worker test-slot receipt')
+     directory = host_slot_dir()
+     os.makedirs(directory, mode=0o700, exist_ok=True)
+     order = list(range(host_slot_count()))
+@@ -303,10 +323,10 @@ def release_host_slot(fd: int | None) -> None:
+ 
+ 
+ @contextlib.contextmanager
+-def host_test_slot(on_wait=None) -> Iterator[None]:
++def host_test_slot(on_wait=None) -> Iterator[int | None]:
+     """Hold one host slot for the body. ``on_wait()`` is called once if every slot is taken."""
+     fd = acquire_host_slot(on_wait)
+     try:
+-        yield
++        yield fd
+     finally:
+         release_host_slot(fd)
+diff --git a/scripts/run_tests_parallel.py b/scripts/run_tests_parallel.py
+index c71a8602bb..cd927723af 100644
+--- a/scripts/run_tests_parallel.py
++++ b/scripts/run_tests_parallel.py
+@@ -64,7 +64,8 @@ from typing import Callable, Dict, List, Optional, Tuple
+ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+ from scripts.ci.list_os_marked_tests import gated_specs, spec_hosts
+ from scripts import run_tests_parallel_rss as _rss  # [daveey] per-file peak RSS
+-from scripts.run_tests_host_slots import HELD_ENV as HOST_SLOT_HELD_ENV, host_slot_count, host_slot_dir, host_test_slot
++from scripts.run_tests_host_slots import host_slot_count, host_slot_dir, host_test_slot
++from scripts.worker_test_budget import child_environment, inherited_slot
+ from scripts.run_tests_launch import start_pytest
+ 
+ 
+@@ -799,8 +800,8 @@ def _run_one_file_once(
+     targets: list[str] | None = None,
+ ) -> tuple[Path, int, str, dict[str, int], float]:
+     """One attempt, run while holding a host-wide test slot (scripts/run_tests_host_slots.py)."""
+-    with host_test_slot(on_wait=_note_host_slot_wait):
+-        return _run_one_file_attempt(file, pytest_args, repo_root, file_timeout, targets)
++    with host_test_slot(on_wait=_note_host_slot_wait) as slot_fd:
++        return _run_one_file_attempt(file, pytest_args, repo_root, file_timeout, targets, slot_fd=slot_fd)
+ 
+ 
+ def _run_one_file_attempt(
+@@ -809,6 +810,7 @@ def _run_one_file_attempt(
+     repo_root: Path,
+     file_timeout: float,
+     targets: list[str] | None = None,
++    *, slot_fd: int | None = None,
+ ) -> tuple[Path, int, str, dict[str, int], float]:
+     """Single attempt of a per-file pytest subprocess (see _run_one_file).
+ 
+@@ -832,7 +834,7 @@ def _run_one_file_attempt(
+     # One root for each subprocess removes the shared directory that the race
+     # needs. The parent deletes the root after the attempt.
+     env = os.environ.copy()
+-    env[HOST_SLOT_HELD_ENV] = "1"  # a run nested in this file must not wait on the slot we hold
++    child_environment(env, slot_fd)
+     temproot = tempfile.mkdtemp(prefix="r-", dir=_runner_scratch_root())
+     env["PYTEST_DEBUG_TEMPROOT"] = temproot
+     # Every tempfile.* call inside the test process lands in the same per-run root, so the
+@@ -1855,6 +1857,9 @@ def main() -> int:
+         sys.path.insert(0, str(repo_root))
+     _sweep_killed_run_roots(_runner_scratch_root())
+ 
++    from hermes_cli.worker_compute_capacity import worker_enabled
++    if worker_enabled():
++        args.jobs = 1 if inherited_slot() else min(args.jobs, host_slot_count())
+     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+         # Duration cache for the timeout scaler: known-slow files get
+         # proportional headroom instead of a false timeout-kill under
+diff --git a/scripts/worker_test_budget.py b/scripts/worker_test_budget.py
+new file mode 100644
+index 0000000000..477450ce01
+--- /dev/null
++++ b/scripts/worker_test_budget.py
+@@ -0,0 +1,86 @@
++"""Linux worker test-slot inheritance: evidence, not a caller-supplied flag.
++
++Receipts are process metadata, not configuration. Only a live ancestor holding
++an exclusive flock on a canonical slot can waive reacquisition. Never unlink a
++held slot: age/deleted cwd cannot prove the holder's descendants stopped.
++"""
++from __future__ import annotations
++
++import json
++import os
++from collections.abc import MutableMapping
++from pathlib import Path
++
++RECEIPT_ENV = 'HERMES_TEST_SLOT_RECEIPT'
++THREAD_VARS = ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
++               'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS', 'BLIS_NUM_THREADS')
++
++
++def _stat(pid: int) -> tuple[int, int]:
++    parts = Path(f'/proc/{pid}/stat').read_text(encoding='utf-8').rsplit(')', 1)[1].split()
++    return int(parts[1]), int(parts[19])
++
++
++def inherited_slot() -> bool:
++    from scripts.run_tests_host_slots import host_slot_dir, host_slot_count
++    try:
++        rec = json.loads(os.environ.get(RECEIPT_ENV, 'null'))
++        if not isinstance(rec, dict):
++            return False
++        pid, fd, birth, slot = (rec[k] for k in ('pid', 'fd', 'birth', 'slot'))
++        if any(type(v) is not int for v in (pid, fd, birth, slot)) or pid < 1 or fd < 0:
++            return False
++        if not 0 <= slot < host_slot_count():
++            return False
++        current = os.getpid()
++        for _ in range(128):
++            parent, started = _stat(current)
++            if current == pid:
++                if started != birth:
++                    return False
++                break
++            if parent <= 0 or parent == current:
++                return False
++            current = parent
++        else:
++            return False
++        expected = Path(host_slot_dir()) / f'{slot}.lock'
++        st = expected.stat()
++        held = os.stat(f'/proc/{pid}/fd/{fd}')
++        if (st.st_dev, st.st_ino) != (held.st_dev, held.st_ino):
++            return False
++        identity = f'{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}'
++        for line in Path(f'/proc/{pid}/fdinfo/{fd}').read_text(encoding='utf-8').splitlines():
++            fields = line.split()
++            if (len(fields) == 9 and fields[0] == 'lock:' and
++                    fields[2:6] == ['FLOCK', 'ADVISORY', 'WRITE', str(pid)] and
++                    fields[6:] == [identity, '0', 'EOF']):
++                return _stat(pid)[1] == birth
++    except (OSError, ValueError, KeyError, TypeError, IndexError):
++        return False
++    return False
++
++
++def child_environment(env: MutableMapping[str, str], fd: int | None) -> None:
++    from hermes_cli.worker_compute_capacity import worker_enabled
++    from scripts.run_tests_host_slots import HELD_ENV, host_slot_dir, host_slot_count
++    env[HELD_ENV] = '1'
++    if not worker_enabled():
++        return
++    env.update(dict.fromkeys(THREAD_VARS, '1'))
++    if fd is None:
++        if not inherited_slot():
++            raise RuntimeError('worker test child has no verified host slot')
++        env[RECEIPT_ENV] = os.environ[RECEIPT_ENV]
++        return
++    st = os.fstat(fd)
++    for slot in range(host_slot_count()):
++        path = Path(host_slot_dir()) / f'{slot}.lock'
++        if not path.exists():
++            continue
++        candidate = path.stat()
++        if (candidate.st_dev, candidate.st_ino) == (st.st_dev, st.st_ino):
++            env[RECEIPT_ENV] = json.dumps({'pid': os.getpid(), 'birth': _stat(os.getpid())[1],
++                                         'fd': fd, 'slot': slot})
++            return
++    raise RuntimeError('worker test lock is outside canonical slot domain')
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 6533315ef3..c8ea099aa9 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -1473,10 +1473,20 @@ def _take_host_test_slot(config) -> None:
+     scripts/run_tests.sh) holds one host-wide test slot for the whole session, like each per-file
+     process of the runner does. Runner children inherit HERMES_TEST_SLOT_HELD=1 and skip this; so
+     does anything this run spawns. xdist workers skip it (the controller holds the slot)."""
+-    if hasattr(config, "workerinput"):
+-        return
++    worker = True  # A policy-read failure must not silently disable containment.
+     try:
++        from hermes_cli.worker_compute_capacity import worker_enabled
++        from scripts.worker_test_budget import child_environment, THREAD_VARS
++        worker = worker_enabled()
+         slots = _host_slots_module()
++        if worker:
++            os.environ.update(dict.fromkeys(THREAD_VARS, '1'))
++            tx = getattr(getattr(config, 'option', None), 'tx', None)
++            if tx and any(spec != 'popen' for spec in tx):
++                raise ValueError('worker test budget requires local popen xdist')
++            _cap_xdist_workers(config, slots.xdist_worker_budget())
++        if hasattr(config, "workerinput") and not worker:
++            return
+         if not slots.host_slots_enabled():
+             return
+ 
+@@ -1487,8 +1497,10 @@ def _take_host_test_slot(config) -> None:
+ 
+         _cap_xdist_workers(config, slots.xdist_worker_budget())
+         config._hermes_host_slot_fd = slots.acquire_host_slot(on_wait=note)
+-        os.environ[slots.HELD_ENV] = "1"
++        child_environment(os.environ, config._hermes_host_slot_fd)
+     except Exception as exc:  # the cap is advisory; never fail a run on it
++        if worker:
++            raise pytest.UsageError(f'worker host test slot unavailable: {exc}') from exc
+         sys.stderr.write(f"(host test slot unavailable: {exc})\n")
+ 
+ 
+diff --git a/tests/scripts/test_worker_test_budget.py b/tests/scripts/test_worker_test_budget.py
+new file mode 100644
+index 0000000000..4793003679
+--- /dev/null
++++ b/tests/scripts/test_worker_test_budget.py
+@@ -0,0 +1,84 @@
++"""Worker test admission must not be widened by per-run environment."""
++import os
++
++import pytest
++
++from hermes_cli import worker_compute_capacity as capacity
++from scripts import run_tests_host_slots as slots
++
++
++@pytest.mark.parametrize('requested', ['0', '64', '1'])
++def test_worker_fixed_host_domain(monkeypatch, requested, tmp_path):
++    monkeypatch.setattr(capacity, 'worker_enabled', lambda: True)
++    monkeypatch.setattr(capacity, 'effective_cores', lambda: 16)
++    monkeypatch.setenv('HERMES_TEST_HOST_SLOTS', requested)
++    monkeypatch.setenv('HERMES_TEST_SLOT_DIR', '/noncanonical')
++    monkeypatch.setenv('HERMES_TEST_XDIST_MAX', '64')
++    monkeypatch.setenv(slots.HELD_ENV, '1')
++    assert slots.host_slot_count() == 4
++    assert slots.host_slot_dir() == f'/tmp/hermes-test-slots-{os.getuid()}'
++    assert slots.xdist_worker_budget() == 1
++    assert slots.host_slots_enabled(), 'a bare inherited flag proves no lock'
++    monkeypatch.setattr(slots, 'host_slot_dir', lambda: str(tmp_path))
++    def unexpected_lock(path):
++        pytest.fail('invalid inherited receipt must not wait for another slot')
++    monkeypatch.setattr(slots, '_try_slot', unexpected_lock)
++    with pytest.raises(RuntimeError, match='invalid inherited'):
++        slots.acquire_host_slot()
++
++
++def test_receipt_requires_live_exclusive_lock(monkeypatch, tmp_path):
++    from scripts import worker_test_budget as budget
++    import fcntl
++    monkeypatch.setattr(capacity, 'worker_enabled', lambda: True)
++    monkeypatch.setattr(slots, 'host_slot_dir', lambda: str(tmp_path))
++    monkeypatch.setattr(slots, 'host_slot_count', lambda: 1)
++    monkeypatch.delenv(budget.RECEIPT_ENV, raising=False)
++    monkeypatch.delenv(slots.HELD_ENV, raising=False)
++    with slots.host_test_slot() as fd:
++        env = {}
++        budget.child_environment(env, fd)
++        monkeypatch.setenv(budget.RECEIPT_ENV, env[budget.RECEIPT_ENV])
++        assert not slots.host_slots_enabled()
++        fcntl.flock(fd, fcntl.LOCK_UN)
++        assert slots.host_slots_enabled(), 'unlocked descriptor is not a receipt'
++        fcntl.flock(fd, fcntl.LOCK_SH)
++        assert slots.host_slots_enabled(), 'shared lock is not a capacity slot'
++    assert slots.host_slots_enabled(), 'closed receipt cannot waive admission'
++
++
++def test_inherited_controller_still_caps_xdist(monkeypatch):
++    from tests import conftest
++    from types import SimpleNamespace
++    monkeypatch.setattr(capacity, 'worker_enabled', lambda: True)
++    monkeypatch.setattr(slots, 'host_slots_enabled', lambda: False)
++    monkeypatch.setattr(conftest, '_host_slots_module', lambda: slots)
++    config = SimpleNamespace(option=SimpleNamespace(tx=['popen'] * 16, numprocesses=16))
++    conftest._take_host_test_slot(config)
++    assert config.option.tx == ['popen']
++    assert os.environ['OPENBLAS_NUM_THREADS'] == '1'
++
++
++def test_worker_slot_errors_fail_closed(monkeypatch):
++    from tests import conftest
++    from types import SimpleNamespace
++    monkeypatch.setattr(capacity, 'worker_enabled', lambda: True)
++    monkeypatch.setattr(conftest, '_host_slots_module', lambda: slots)
++    def broken():
++        raise OSError('controller unavailable')
++    monkeypatch.setattr(slots, 'host_slots_enabled', broken)
++    with pytest.raises(pytest.UsageError, match='controller unavailable'):
++        conftest._take_host_test_slot(SimpleNamespace())
++
++
++def test_worker_never_reclaims_held_inode(monkeypatch, tmp_path):
++    monkeypatch.setattr(capacity, 'worker_enabled', lambda: True)
++    monkeypatch.setattr(slots, 'host_slot_dir', lambda: str(tmp_path))
++    monkeypatch.setattr(slots, 'host_slot_count', lambda: 1)
++    monkeypatch.setattr(slots, '_stale_reason', lambda *a: ('old', False))
++    monkeypatch.setattr(slots, 'slot_max_age_s', lambda: 1)
++    monkeypatch.delenv(slots.HELD_ENV, raising=False)
++    with slots.host_test_slot():
++        inode = (tmp_path / '0.lock').stat().st_ino
++        assert slots.reclaim_stale_slots(str(tmp_path), 1) == []
++        assert (tmp_path / '0.lock').stat().st_ino == inode
+-- 
+2.51.0
+

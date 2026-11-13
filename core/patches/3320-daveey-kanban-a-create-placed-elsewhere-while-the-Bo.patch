@@ -1,0 +1,145 @@
+From a70ba819d5e0598c40ce87a9f571b1b4c79a59b9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:14:19 +0000
+Subject: [PATCH] [daveey] kanban: a create placed elsewhere while the Board
+ sync is stopped says the chat link waits
+
+01:09 PT, laptop-1 (sync role given up): kanban_create placed four cards on worker-4/7/2
+(t_01a1d42acdce8e23, t_01a1d42adb60bf5d, t_01a1d42af9e117f8, t_01a1d42b1337cea7). Each result said
+"It runs there and shows in this chat's tasks"; the Board had no task_chat_links row for any, because
+the link reaches the Board only through this gateway's sync.
+
+While the sync is down, a create placed on another gateway for a chat now says the card shows in this
+chat's tasks once this gateway's Board sync recovers, with chat_link: queued_local and board_sync. The
+card itself is on the target, so board_delivery is not set. RED on the previous head: 2 fail; GREEN 15.
+---
+ tests/tools/test_kanban_board_delivery.py | 52 +++++++++++++++++++++++
+ tools/kanban_tools_board_delivery.py      | 33 +++++++++++++-
+ 2 files changed, 83 insertions(+), 2 deletions(-)
+
+diff --git a/tests/tools/test_kanban_board_delivery.py b/tests/tools/test_kanban_board_delivery.py
+index 4544a4f53b..eae93bb371 100644
+--- a/tests/tools/test_kanban_board_delivery.py
++++ b/tests/tools/test_kanban_board_delivery.py
+@@ -218,6 +218,58 @@ def test_reads_and_refusals_while_stopped_are_unchanged(home, monkeypatch):
+     assert "error" in refused and "board_delivery" not in refused
+ 
+ 
++CHAT = "20261026_235722_bef6c6"
++SHOWS_PROMISE = "shows in this chat's tasks."
++
++
++def _place_on_worker(home, monkeypatch, *, task_id):
++    """kanban_create from a chat, placed on worker-4 (01:09 PT: t_01a1d42acdce8e23 and three more). ``task_id``
++    None = the target has not answered yet (the queued-request note)."""
++    from hermes_cli import kanban_capability_registry as reg
++    from hermes_cli import kanban_placement as kp
++    from hermes_state import SessionDB
++    db = SessionDB(db_path=home / "state.db")
++    db.create_session(session_id=CHAT, source="desktop")
++    db.close()
++    monkeypatch.setenv("HERMES_SESSION_ID", CHAT)
++    monkeypatch.setattr(reg, "self_gateway", lambda: ME)
++    monkeypatch.setattr(runstate, "placement_runs_on", lambda conn, placement: None)  # worker-4: a gateway pin
++    monkeypatch.setattr(kp, "decide", lambda *a, **k: {"where": "worker-4", "why": "explicit placement"})
++    monkeypatch.setattr(kp, "create_remote", lambda args, **kw: {
++        "ok": True, "request_id": "placement:macbook:t1", "queued_only": task_id is None})
++    monkeypatch.setattr(kp, "await_task_id", lambda rid, **kw: (task_id, "running"))
++    return json.loads(kt._handle_create({"title": "core update", "assignee": "default", "placement": "worker-4",
++                                         "body": "runs on worker-4", "requires": []}))
++
++
++def test_create_placed_elsewhere_while_the_sync_role_is_given_up_says_the_chat_link_is_queued(home, monkeypatch):
++    path, _conn = home
++    _give_up_the_sync_role(path, monkeypatch)
++    out = _place_on_worker(path, monkeypatch, task_id="t_01a1d42acdce8e23")
++    assert out["ok"] is True and out["task_id"] == "t_01a1d42acdce8e23" and out["runs_where"] == "worker-4", out
++    assert out["placed"]["origin_session"] == CHAT
++    assert out["chat_link"] == "queued_local" and "board_delivery" not in out  # the card itself is on worker-4
++    assert SHOWS_PROMISE not in out["note"]
++    assert "shows in this chat's tasks once this gateway's Board sync recovers" in out["note"]
++    assert "queued locally: this gateway's Board sync has been stopped since " in out["note"]
++    assert "gave up the sync role" in out["board_sync"]
++
++
++def test_create_queued_on_a_target_while_stopped_says_the_chat_link_waits(home, monkeypatch):
++    path, _conn = home
++    _give_up_the_sync_role(path, monkeypatch)
++    out = _place_on_worker(path, monkeypatch, task_id=None)
++    assert out["ok"] is True and out["status"] == "queued" and out["chat_link"] == "queued_local", out
++    assert "(this chat's tasks once this gateway's Board sync recovers, " in out["note"]
++
++
++def test_create_placed_elsewhere_while_the_sync_runs_is_unchanged(home, monkeypatch):
++    path, _conn = home
++    out = _place_on_worker(path, monkeypatch, task_id="t_01a1d42acdce8e23")
++    assert out["ok"] is True and SHOWS_PROMISE in out["note"], out
++    assert "chat_link" not in out and "board_sync" not in out and "board_delivery" not in out
++
++
+ def test_a_finished_remote_card_has_no_live_run_host(home):
+     from hermes_cli.kanban_board_delivery import remote_runner
+     _path, conn = home
+diff --git a/tools/kanban_tools_board_delivery.py b/tools/kanban_tools_board_delivery.py
+index 1e91280feb..3019c58e59 100644
+--- a/tools/kanban_tools_board_delivery.py
++++ b/tools/kanban_tools_board_delivery.py
+@@ -14,17 +14,43 @@ BOARD_WRITE_TOOLS = frozenset({
+     "kanban_link", "kanban_unlink", "kanban_archive",
+ })
+ 
++# A create placed on another gateway for this chat: the card is made there, but this chat's link row reaches the
++# Board only through this gateway's sync (01:09 PT: four cards placed on workers said "shows in this chat's tasks";
++# the Board had no task_chat_links row for any of them).
++_SHOWS = " and shows in this chat's tasks"
++_SHOWS_QUEUED = "(this chat's tasks, "
++_LATER = " once this gateway's Board sync recovers"
++
++
++def _placed_for_this_chat(payload: dict) -> bool:
++    placed = payload.get("placed")
++    return isinstance(placed, dict) and bool(placed.get("origin_session"))
++
++
++def _chat_link_queued(payload: dict, board_sync: str) -> None:
++    """The placed create's card exists on the target; only its link to this chat waits in the outbox."""
++    from hermes_cli.kanban_board_delivery import QUEUED_LOCAL
++    text = str(payload.get("note") or "")
++    text = text.replace(_SHOWS, _SHOWS + _LATER, 1).replace(_SHOWS_QUEUED, "(this chat's tasks" + _LATER + ", ", 1)
++    payload["note"] = f"{text} This chat's link to the card is {board_sync}."
++    payload["chat_link"] = QUEUED_LOCAL
++    payload["board_sync"] = board_sync
++
+ 
+ def annotate(board: Callable[..., Any], tool_name: str, args: dict, out: str) -> str:
+     """``out`` plus ``board_delivery: queued_local`` when the write stayed local; a comment on a card another
+-    gateway runs loses its live-run ``delivery`` promise. Unchanged while the sync runs (or on any read error)."""
+-    if tool_name not in BOARD_WRITE_TOOLS or not out.startswith('{"ok": true'):
++    gateway runs loses its live-run ``delivery`` promise, and a create placed elsewhere for this chat loses its
++    "shows in this chat's tasks" promise (``chat_link: queued_local``). Unchanged while the sync runs (or on any
++    read error)."""
++    if (tool_name not in BOARD_WRITE_TOOLS and tool_name != "kanban_create") or not out.startswith('{"ok": true'):
+         return out
+     from hermes_cli import kanban_sync_runstate as runstate
+     if not runstate.down():  # the common case: one config read and one stat, no board connection
+         return out
+     try:
+         payload = json.loads(out)
++        if tool_name == "kanban_create" and not _placed_for_this_chat(payload):
++            return out  # a local create: the card and this chat's task list read this file
+         tid = (payload.get("task_id") or args.get("task_id")) if tool_name == "kanban_comment" else None
+         from hermes_cli.kanban_board_delivery import queued_local
+         with board(args.get("board"), quiet_close=True) as (_kb, conn):
+@@ -34,6 +60,9 @@ def annotate(board: Callable[..., Any], tool_name: str, args: dict, out: str) ->
+         return out
+     if not note:
+         return out
++    if tool_name == "kanban_create":  # the card itself is on the target, not queued here: only the link is
++        _chat_link_queued(payload, note["board_sync"])
++        return json.dumps(payload)
+     if note.get("live_run_host"):
+         payload["delivery"] = f"{note['board_sync']}; {note['route']}"
+     payload.update(note)
+-- 
+2.51.0
+

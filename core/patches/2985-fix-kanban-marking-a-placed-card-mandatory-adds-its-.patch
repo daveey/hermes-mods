@@ -1,0 +1,201 @@
+From ae58bf49daf894e7f1276ce3ca6f8849819108a7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:01:23 +0000
+Subject: [PATCH] fix(kanban): marking a placed card mandatory adds its label;
+ a worker-first card refuses the mark [daveey]
+
+Review 5879416189 on #1622: `hermes kanban set-model <id> --mandatory` (set_pin_mandatory, advertised by the
+pin-reroute quota comment) set model_pin_mandatory=1 but left runs_on=[pool:worker] and any worker-first-v1
+policy as they were, so an old-core member could still lease the card and run it on another model.
+
+- kanban_mandatory_pin.mark(): in one write, sets the column and unions capability:mandatory-model-pin into a
+  non-empty runs_on through carry() (a pin to this machine stays as is). The model_pin_mandatory_set event
+  records runs_on/previous_runs_on; the Board push carries runs_on.
+- mark_refusal(): a card with placement_policy set (worker-first, Board-owned runs_on) refuses the mark with
+  the move it needs first. set_model_cli checks it before writing a new model, so a refused mark changes nothing.
+- Unmarking is unchanged; the label stays (every attesting worker also serves plain pins).
+
+Tests (tests/hermes_cli/test_kanban_mandatory_pin.py, +5, 27 total): the 4 placed/worker-first cases fail on
+f47c468997 and pass here; the needs-a-pin/missing/archived control passes on both. 283/283 across the 10 test
+files that reference kanban_pin_reroute / kanban_mandatory_pin / set-model; code health ok.
+---
+ hermes_cli/kanban_mandatory_pin.py            | 53 +++++++++++++++
+ hermes_cli/kanban_pin_reroute.py              | 16 +++--
+ tests/hermes_cli/test_kanban_mandatory_pin.py | 65 +++++++++++++++++++
+ 3 files changed, 127 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_mandatory_pin.py b/hermes_cli/kanban_mandatory_pin.py
+index 71b32652cd..caffa8dec2 100644
+--- a/hermes_cli/kanban_mandatory_pin.py
++++ b/hermes_cli/kanban_mandatory_pin.py
+@@ -83,6 +83,59 @@ def carry(labels: list[str], item: Mapping[str, Any], *, me: str = "") -> list[s
+     return sorted(set(labels) | need)
+ 
+ 
++def mark_refusal(conn: Any, task_id: str) -> Optional[str]:
++    """Why ``task_id`` may not be marked mandatory now, or None. A worker-first card's ``runs_on`` is Board-owned
++    (its pool lease never checks :data:`LABEL`), so marking it would let an old core run it on another model."""
++    from hermes_cli import kanban_db_sync as sync
++    if "placement_policy" not in sync.table_columns(conn, "tasks"):
++        return None
++    row = conn.execute("SELECT placement_policy FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if row is None or not row[0]:
++        return None
++    return (f"{task_id} is placed worker-first ({row[0]}): {WORKER_FIRST_REASON}. Move it to the worker queue "
++            f"(`hermes kanban move {task_id} --pool --reason ...`) first, or recreate it with the mark")
++
++
++def mark(conn: Any, task_id: str) -> bool:
++    """Set ``model_pin_mandatory`` on a placed card and union :data:`LABEL` into its ``runs_on`` in the same write
++    (``hermes kanban set-model <id> --mandatory``), so a later mark is fenced like a create-time one (review
++    5879416189 on #1622). Raises ValueError for a card without a model pin or a worker-first card
++    (:func:`mark_refusal`), RuntimeError for an archived one. False when the card does not exist."""
++    import json
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_db_connect import write_txn
++    synced = "runs_on" in sync.table_columns(conn, "tasks") and sync.board_mode(conn) == "primary"
++    me = str(sync._state(conn)["gateway_id"] or "") if synced else ""
++    fields: tuple[str, ...] = ("model_pin_mandatory",)
++    with write_txn(conn):
++        row = conn.execute("SELECT status, model_override, " + ("runs_on" if synced else "NULL") +
++                           " FROM tasks WHERE id = ?", (task_id,)).fetchone()
++        if row is None:
++            return False
++        if row[0] == "archived":
++            raise RuntimeError(f"cannot change the model pin on archived task {task_id}")
++        if not _str(row[1]):
++            raise ValueError("--mandatory needs a model pin: set a model first")
++        if (why := mark_refusal(conn, task_id)) is not None:
++            raise ValueError(why)
++        conn.execute("UPDATE tasks SET model_pin_mandatory = 1 WHERE id = ?", (task_id,))
++        payload: dict[str, Any] = {"mandatory": True}
++        try:
++            labels = json.loads(row[2]) if row[2] else []
++        except ValueError:
++            labels = []
++        if isinstance(labels, list) and labels:
++            new = carry(labels, {"model_override": row[1], "model_pin_mandatory": 1}, me=me)
++            if new != labels:
++                conn.execute("UPDATE tasks SET runs_on = ? WHERE id = ?", (json.dumps(new), task_id))
++                payload.update(runs_on=new, previous_runs_on=labels)
++                fields = ("model_pin_mandatory", "runs_on")
++        kb._append_event(conn, task_id, "model_pin_mandatory_set", payload)
++    kb.notify_task_updated(conn, task_id, fields)
++    return True
++
++
+ def refusal(card: Mapping[str, Any], *, me: str = "") -> Optional[str]:
+     """None when this machine can run ``card``'s mandatory pin exactly (or it has none), else why not.
+ 
+diff --git a/hermes_cli/kanban_pin_reroute.py b/hermes_cli/kanban_pin_reroute.py
+index 59dd9226de..8c21825989 100644
+--- a/hermes_cli/kanban_pin_reroute.py
++++ b/hermes_cli/kanban_pin_reroute.py
+@@ -238,14 +238,12 @@ def mandatory_column(pin_mandatory: Any, model_override: Optional[str]) -> Optio
+ def set_pin_mandatory(conn: Any, task_id: str, mandatory: bool) -> bool:
+     """Mark (or unmark) a card's model pin as mandatory: a quota wall never moves a mandatory pin."""
+     from hermes_cli import kanban_db as kb
+-    if mandatory:
+-        row = conn.execute("SELECT model_override FROM tasks WHERE id=?", (task_id,)).fetchone()
+-        if row is not None and not _norm(row[0]):
+-            raise ValueError("--mandatory needs a model pin: set a model first")
+-    value = 1 if mandatory else None
++    if mandatory:  # also fences the placed card: kanban_mandatory_pin.mark
++        from hermes_cli.kanban_mandatory_pin import mark
++        return mark(conn, task_id)
+     return kb._set_task_override(
+-        conn, task_id, "UPDATE tasks SET model_pin_mandatory = ? WHERE id = ?", (value,),
+-        "model_pin_mandatory_set", {"mandatory": bool(mandatory)}, ("model_pin_mandatory",),
++        conn, task_id, "UPDATE tasks SET model_pin_mandatory = ? WHERE id = ?", (None,),
++        "model_pin_mandatory_set", {"mandatory": False}, ("model_pin_mandatory",),
+         archived_msg="cannot change the model pin")
+ 
+ 
+@@ -256,6 +254,10 @@ def set_model_cli(conn: Any, task_id: str, raw_model: Optional[str], model: Opti
+     from hermes_cli import kanban_db as kb
+     if raw_model is None and mandatory is not None:
+         return set_pin_mandatory(conn, task_id, mandatory), False
++    if mandatory:  # refuse before the model write, so a refused mark changes nothing
++        from hermes_cli.kanban_mandatory_pin import mark_refusal
++        if (why := mark_refusal(conn, task_id)) is not None:
++            raise ValueError(why)
+     found = kb.set_model_override(conn, task_id, model, provider=provider)
+     if found and mandatory is not None:
+         set_pin_mandatory(conn, task_id, mandatory)
+diff --git a/tests/hermes_cli/test_kanban_mandatory_pin.py b/tests/hermes_cli/test_kanban_mandatory_pin.py
+index f233fb7a5b..182917b141 100644
+--- a/tests/hermes_cli/test_kanban_mandatory_pin.py
++++ b/tests/hermes_cli/test_kanban_mandatory_pin.py
+@@ -299,3 +299,68 @@ def test_carry_leaves_a_pin_to_this_machine_alone():
+     assert mp.carry([f"machine:{HUB}"], card, me=HUB) == [f"machine:{HUB}"]  # this core refuses what it can't serve
+     assert mp.carry([f"machine:{WORKER}"], card, me=HUB) == [mp.LABEL, f"machine:{WORKER}"]
+     assert mp.carry([POOL], {"model_override": "x"}, me=HUB) == [POOL]
++
++
++# --- review 5879416189: a later mark is fenced like a create-time one -------------------------------------------
++# `hermes kanban set-model <id> --mandatory` (the quota-reroute comment advertises it) used to set only the column:
++# a placed [pool:worker] card kept runs_on without the label, and a worker-first card kept its Board-owned lease.
++
++def _placed(hub, *, model="claude-opus-5-5"):
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="review", assignee="default", model_override=model,
++                         provider_override="anthropic" if model else None)
++    with kb.write_txn(hub.conn):
++        wn.set_runs_on(hub.conn, tid, [POOL])
++    return tid
++
++
++@pytest.mark.parametrize("raw_model", [None, "claude-opus-5-5"])
++def test_marking_a_placed_card_mandatory_adds_the_label(gws, raw_model):
++    from hermes_cli import kanban_pin_reroute as pr
++    hub, _ = gws
++    tid = _placed(hub)
++    found, _ = pr.set_model_cli(hub.conn, tid, raw_model, raw_model, "anthropic" if raw_model else None, True)
++    assert found
++    assert kb.get_task(hub.conn, tid).model_pin_mandatory == 1
++    assert _runs_on(hub.conn, tid) == sorted([POOL, mp.LABEL])
++    [ev] = [json.loads(p) for (p,) in hub.conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'model_pin_mandatory_set'", (tid,))]
++    assert ev == {"mandatory": True, "runs_on": sorted([POOL, mp.LABEL]), "previous_runs_on": [POOL]}
++    # Unmarking leaves the label (harmless: every attesting worker also serves plain pins); a home card has none.
++    assert pr.set_pin_mandatory(hub.conn, tid, False)
++    assert kb.get_task(hub.conn, tid).model_pin_mandatory is None
++    home = kb.create_task(hub.conn, title="home", assignee="default", model_override="claude-opus-5-5",
++                          provider_override="anthropic")
++    assert pr.set_pin_mandatory(hub.conn, home, True) and _runs_on(hub.conn, home) is None
++
++
++@pytest.mark.parametrize("raw_model", [None, "claude-sonnet-5"])
++def test_marking_a_worker_first_card_mandatory_is_refused_and_changes_nothing(gws, raw_model):
++    from hermes_cli import kanban_pin_reroute as pr
++    hub, _ = gws
++    tid = _placed(hub)
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET placement_policy = 'worker-first-v1' WHERE id = ?", (tid,))
++    with pytest.raises(ValueError, match="worker-first"):
++        pr.set_model_cli(hub.conn, tid, raw_model, raw_model, "anthropic" if raw_model else None, True)
++    task = kb.get_task(hub.conn, tid)
++    assert (task.model_override, task.model_pin_mandatory) == ("claude-opus-5-5", None)
++    assert _runs_on(hub.conn, tid) == [POOL]
++    # Without the mark the same card still takes a new plain pin.
++    assert pr.set_model_cli(hub.conn, tid, "claude-sonnet-5", "claude-sonnet-5", "anthropic", None) == (True, True)
++
++
++def test_marking_needs_a_pin_and_a_live_card(gws):
++    from hermes_cli import kanban_pin_reroute as pr
++    hub, _ = gws
++    tid = _placed(hub, model=None)
++    with pytest.raises(ValueError, match="needs a model pin"):
++        pr.set_pin_mandatory(hub.conn, tid, True)
++    assert _runs_on(hub.conn, tid) == [POOL]
++    assert pr.set_pin_mandatory(hub.conn, "t_missing", True) is False
++    from hermes_cli.kanban_db_archive import archive_task
++    gone = _placed(hub)
++    archive_task(hub.conn, gone)
++    with pytest.raises(RuntimeError, match="archived"):
++        pr.set_pin_mandatory(hub.conn, gone, True)
++    assert kb.get_task(hub.conn, gone).model_pin_mandatory is None
+-- 
+2.51.0
+

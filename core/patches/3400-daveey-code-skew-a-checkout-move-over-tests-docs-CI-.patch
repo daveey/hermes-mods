@@ -1,0 +1,364 @@
+From fdf7b97c99142698dd59d365aae3b7e65c6b1fe2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:38:07 +0000
+Subject: [PATCH] [daveey] code skew: a checkout move over tests/docs/CI
+ commits only is no skew (RESTART_IGNORE_GLOBS)
+
+hermes-hub applies every main commit within minutes and restarted the gateway and every serve
+backend on each apply: 78 restarts in 3 h for 129 commits on 2026-11-13, 28 of them touching
+only tests, docs or CI. hermes_cli/restart_ignore_paths.py holds the one exact list
+(tests/**, docs/**, .github/**, top-level README*/CONTRIBUTING*/SECURITY*, .mailmap; never
+*.md in general: SKILL.md, AGENTS.md, SOUL.md and prompts are runtime inputs) and
+range_restart_free(): a strict-ancestor range whose every commit (merges against each parent)
+touches only those paths. detect_code_skew() treats such a drift as no skew, so no
+'Restart required', skew retirement or update-pause skew release fires for it. hermes-sync
+reads the tuple from HEAD to fast-forward such ranges without a restart (t_01a1d471b754e5bc).
+---
+ gateway/code_skew.py                          |  28 +++-
+ hermes_cli/restart_ignore_paths.py            |  84 ++++++++++
+ tests/hermes_cli/test_restart_ignore_paths.py | 145 ++++++++++++++++++
+ tests/hermes_cli/test_web_server_skew_exit.py |  33 ++++
+ 4 files changed, 289 insertions(+), 1 deletion(-)
+ create mode 100644 hermes_cli/restart_ignore_paths.py
+ create mode 100644 tests/hermes_cli/test_restart_ignore_paths.py
+
+diff --git a/gateway/code_skew.py b/gateway/code_skew.py
+index 1a6e457447..d43d7deff4 100644
+--- a/gateway/code_skew.py
++++ b/gateway/code_skew.py
+@@ -12,6 +12,7 @@ from __future__ import annotations
+ 
+ from pathlib import Path
+ 
++from hermes_cli import restart_ignore_paths as _restart_ignore_paths  # at boot: a lazy import would be pinned
+ from hermes_cli._startup_fast import project_root_str
+ 
+ _PROJECT_ROOT = Path(project_root_str())
+@@ -97,13 +98,38 @@ def current_code_sha() -> str | None:
+ 
+ 
+ def detect_code_skew() -> tuple[str, str] | None:
+-    """``(boot_rev, disk_rev)`` short labels if the checkout drifted since boot, else ``None``."""
++    """``(boot_rev, disk_rev)`` short labels if the checkout drifted since boot, else ``None``.
++
++    [daveey] A forward drift whose every commit touches only ``RESTART_IGNORE_GLOBS`` paths (tests, docs, CI)
++    is no skew: this process runs exactly the code on disk, and hermes-sync moves the hub checkout over such a
++    range without restarting anything (t_01a1d471b754e5bc)."""
+     current = _fingerprint() if _boot_fingerprint is not None else None
+     if current is None or current == _boot_fingerprint:
+         return None
++    if _drift_restart_free(_boot_fingerprint, current):
++        return None
+     return _short(_boot_fingerprint), _short(current)
+ 
+ 
++# (boot sha, disk sha) -> range_restart_free verdict. A commit range never changes, so a verdict is final; the
++# watchdogs poll every few seconds and would otherwise run two git commands per poll for the same pair.
++_restart_free_verdicts: dict[tuple[str, str], bool] = {}
++
++
++def _drift_restart_free(boot_fingerprint: str | None, current: str) -> bool:
++    boot_sha = (boot_fingerprint or "").rsplit(":", 1)[-1]
++    disk_sha = current.rsplit(":", 1)[-1]
++    key = (boot_sha, disk_sha)
++    verdict = _restart_free_verdicts.get(key)
++    if verdict is None:
++        # range_restart_free never raises: an unprovable drift (git failure, odd revisions) is False = skew, as before
++        verdict = _restart_ignore_paths.range_restart_free(str(_PROJECT_ROOT), boot_sha, disk_sha)
++        if len(_restart_free_verdicts) > 64:
++            _restart_free_verdicts.clear()
++        _restart_free_verdicts[key] = verdict
++    return verdict
++
++
+ _import_mix_noted: set[tuple[str, str]] = set()
+ 
+ 
+diff --git a/hermes_cli/restart_ignore_paths.py b/hermes_cli/restart_ignore_paths.py
+new file mode 100644
+index 0000000000..e7f998b632
+--- /dev/null
++++ b/hermes_cli/restart_ignore_paths.py
+@@ -0,0 +1,84 @@
++"""[daveey] Checkout paths no running Hermes process loads: a checkout move over only these owes no restart.
++
++hermes-hub applies every main commit within minutes (instant core updates), and each apply restarted the gateway
++and every serve backend: 78 restarts in 3 h for 129 commits on 2026-11-13, while 28 of those commits touched only
++tests, docs or CI (t_01a1d471b754e5bc). A running process never imports or reads those files, so a checkout that
++moved past its boot commit by such commits only is still running the code on disk.
++
++``RESTART_IGNORE_GLOBS`` is the one list for that decision. ``gateway.code_skew.detect_code_skew`` reads such a
++drift as no skew (no "Restart required", no skew retirement), and hermes-sync reads this tuple from the
++checkout's HEAD (``git show HEAD:hermes_cli/restart_ignore_paths.py``, parsed as a literal, so keep it a plain
++tuple of strings) to fast-forward such a range without the gateway/serve restart. Its naming mirrors hermes-sync's
++``DASHBOARD_IGNORE_GLOBS``; that list is broader (``**/*.md``) and covers hermes-mods plugin trees, not core.
++
++The list is exact on purpose. Never add ``*.md`` in general: SKILL.md, AGENTS.md, SOUL.md and prompt files are
++runtime inputs. Patterns are repo-relative: ``<dir>/**`` is everything under that top-level directory, any other
++pattern matches a top-level file name only (``fnmatch``, case-sensitive).
++"""
++
++from __future__ import annotations
++
++import fnmatch
++import os
++import subprocess
++from typing import Iterable, Optional
++
++RESTART_IGNORE_GLOBS = (
++    "tests/**",
++    "docs/**",
++    ".github/**",
++    "README*",
++    "CONTRIBUTING*",
++    "SECURITY*",
++    ".mailmap",
++)
++
++_GIT_TIMEOUT_S = 15
++_GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
++                 "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES")
++_HEX = frozenset("0123456789abcdef")
++
++
++def path_restart_ignored(path: str, globs: Iterable[str] = RESTART_IGNORE_GLOBS) -> bool:
++    """True when the repo-relative ``path`` matches one of ``globs`` (see the module docstring)."""
++    if not path or path.startswith("/") or "\\" in path:
++        return False
++    for glob in globs:
++        if glob.endswith("/**"):
++            if path.startswith(glob[:-2]) and len(path) > len(glob) - 2:
++                return True
++        elif "/" not in path and fnmatch.fnmatchcase(path, glob):
++            return True
++    return False
++
++
++def _is_sha(value: object) -> bool:
++    return isinstance(value, str) and len(value) in (40, 64) and set(value) <= _HEX
++
++
++def _git(root: str, *args: str) -> Optional[subprocess.CompletedProcess]:
++    env = {k: v for k, v in os.environ.items() if k not in _GIT_ENV_DROP}
++    try:
++        return subprocess.run(["git", "--no-replace-objects", "-C", root, *args], capture_output=True,
++                              timeout=_GIT_TIMEOUT_S, env=env, stdin=subprocess.DEVNULL, check=False)
++    except (OSError, subprocess.SubprocessError):
++        return None
++
++
++def range_restart_free(root: str, base: str, head: str, globs: Iterable[str] = RESTART_IGNORE_GLOBS) -> bool:
++    """True when ``base`` is a strict ancestor of ``head`` and every commit in ``base..head`` (merges against
++    each parent) touches only ``globs`` paths. Anything unprovable (not full shas, equal, unrelated or reversed
++    revisions, a git failure) is False: the caller then treats the move as a code change, exactly as before."""
++    if not (_is_sha(base) and _is_sha(head)) or base == head:
++        return False
++    globs = tuple(globs)
++    ancestor = _git(root, "merge-base", "--is-ancestor", base, head)
++    if ancestor is None or ancestor.returncode != 0:
++        return False
++    listed = _git(root, "log", "-m", "--no-renames", "--name-only", "-z", "--format=", f"{base}..{head}")
++    if listed is None or listed.returncode != 0:
++        return False
++    paths = [p.decode("utf-8", "surrogateescape").strip("\n") for p in listed.stdout.split(b"\0")]
++    paths = [p for p in paths if p]
++    # A range of empty commits only is left to the old rule (a move is a move): nothing proves it needs no restart.
++    return bool(paths) and all(path_restart_ignored(p, globs) for p in paths)
+diff --git a/tests/hermes_cli/test_restart_ignore_paths.py b/tests/hermes_cli/test_restart_ignore_paths.py
+new file mode 100644
+index 0000000000..ffeb788911
+--- /dev/null
++++ b/tests/hermes_cli/test_restart_ignore_paths.py
+@@ -0,0 +1,145 @@
++"""[daveey] RESTART_IGNORE_GLOBS and range_restart_free (t_01a1d471b754e5bc): which checkout moves owe no restart."""
++
++import ast
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from gateway import code_skew
++from hermes_cli import restart_ignore_paths as rip
++
++
++@pytest.mark.parametrize("path", [
++    "tests/test_x.py", "tests/gateway/conftest.py", "docs/a b.md", ".github/workflows/ci.yml",
++    "README.md", "README.zh-CN.md", "CONTRIBUTING.md", "SECURITY.es.md", ".mailmap",
++])
++def test_ignored_paths(path):
++    assert rip.path_restart_ignored(path)
++
++
++@pytest.mark.parametrize("path", [
++    # runtime inputs that only look like docs
++    "skills/productivity/notion/SKILL.md", "agent/prompts/system.md", "AGENTS.md", "SOUL.md",
++    "plugins/x/README.md", "tui_gateway/tests/test_x.py", "hermes_cli/docs/x.py",
++    # code and build inputs
++    "gateway/run.py", "pyproject.toml", "uv.lock", "apps/desktop/src/app.ts", "tests", "docs", "testsx/a.py",
++    "", "/tests/a", "tests\\a",
++])
++def test_runtime_paths(path):
++    assert not rip.path_restart_ignored(path)
++
++
++def test_globs_stay_a_plain_literal_tuple():
++    """hermes-sync reads the list from the checkout's HEAD with ast.literal_eval: it must stay a literal."""
++    tree = ast.parse(Path(rip.__file__).read_text())
++    [value] = [n.value for n in tree.body if isinstance(n, ast.Assign)
++               and any(getattr(t, "id", None) == "RESTART_IGNORE_GLOBS" for t in n.targets)]
++    assert ast.literal_eval(value) == rip.RESTART_IGNORE_GLOBS
++    assert all(isinstance(g, str) for g in rip.RESTART_IGNORE_GLOBS)
++    assert not any(g.endswith(".md") or g == "**/*.md" for g in rip.RESTART_IGNORE_GLOBS)
++
++
++def _git(repo, *args):
++    return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args], cwd=repo,
++                          check=True, capture_output=True, text=True).stdout.strip()
++
++
++def _commit(repo, files, msg):
++    for name, text in files.items():
++        p = repo / name
++        p.parent.mkdir(parents=True, exist_ok=True)
++        p.write_text(text)
++    _git(repo, "add", "-A")
++    _git(repo, "commit", "-q", "--allow-empty", "-m", msg)
++    return _git(repo, "rev-parse", "HEAD")
++
++
++@pytest.fixture()
++def repo(tmp_path):
++    _git(tmp_path, "init", "-q", "-b", "main")
++    base = _commit(tmp_path, {"gateway/run.py": "x = 1\n"}, "base")
++    return tmp_path, base
++
++
++def test_tests_only_range_is_restart_free(repo):
++    root, base = repo
++    _commit(root, {"tests/test_a.py": "def test(): pass\n"}, "t1")
++    head = _commit(root, {"docs/x.md": "x\n", ".github/workflows/ci.yml": "on: push\n", "README.md": "r\n"}, "t2")
++    assert rip.range_restart_free(str(root), base, head)
++
++
++def test_mixed_range_is_not(repo):
++    root, base = repo
++    _commit(root, {"tests/test_a.py": "def test(): pass\n"}, "t1")
++    head = _commit(root, {"gateway/run.py": "x = 2\n"}, "code")
++    assert not rip.range_restart_free(str(root), base, head)
++
++
++@pytest.mark.parametrize("path", ["skills/x/SKILL.md", "agent/prompts/system.md"])
++def test_prompt_and_skill_markdown_is_not(repo, path):
++    root, base = repo
++    head = _commit(root, {path: "prompt\n"}, "prompt")
++    assert not rip.range_restart_free(str(root), base, head)
++
++
++def test_a_revert_pair_over_code_is_not(repo):
++    """Every commit counts, not the net tree diff."""
++    root, base = repo
++    _commit(root, {"gateway/run.py": "x = 2\n"}, "code")
++    head = _commit(root, {"gateway/run.py": "x = 1\n"}, "revert")
++    assert not rip.range_restart_free(str(root), base, head)
++
++
++def test_empty_equal_reversed_and_bogus_ranges_are_not(repo):
++    root, base = repo
++    head = _commit(root, {"tests/test_a.py": "x\n"}, "t1")
++    assert not rip.range_restart_free(str(root), base, base)          # nothing moved: no verdict to give
++    assert not rip.range_restart_free(str(root), head, base)          # backwards (a downgrade)
++    assert not rip.range_restart_free(str(root), "abc1234", head)     # not a full sha
++    assert not rip.range_restart_free(str(root), "f" * 40, head)      # unknown commit
++    assert not rip.range_restart_free(str(root / "nope"), base, head)  # not a repo
++
++
++def test_empty_commits_only_are_not(repo):
++    root, base = repo
++    head = _commit(root, {}, "empty")
++    assert not rip.range_restart_free(str(root), base, head)
++    head = _commit(root, {"tests/test_a.py": "x\n"}, "t1")
++    assert rip.range_restart_free(str(root), base, head)  # an empty commit beside a tests commit is fine
++
++
++def test_merge_bringing_code_is_not(repo):
++    root, base = repo
++    _git(root, "checkout", "-q", "-b", "side")
++    _commit(root, {"gateway/run.py": "x = 3\n"}, "side code")
++    _git(root, "checkout", "-q", "main")
++    _commit(root, {"tests/test_a.py": "x\n"}, "t1")
++    _git(root, "merge", "-q", "--no-ff", "-m", "merge side", "side")
++    head = _git(root, "rev-parse", "HEAD")
++    assert not rip.range_restart_free(str(root), base, head)
++
++
++def test_detect_code_skew_ignores_restart_free_drift(repo, monkeypatch):
++    root, base = repo
++    tests_only = _commit(root, {"tests/test_a.py": "x\n"}, "t1")
++    code = _commit(root, {"gateway/run.py": "x = 9\n"}, "code")
++    monkeypatch.setattr(code_skew, "_PROJECT_ROOT", root)
++    monkeypatch.setattr(code_skew, "_restart_free_verdicts", {})
++    monkeypatch.setattr(code_skew, "_boot_fingerprint", f"git:refs/heads/main:{base}")
++    monkeypatch.setattr(code_skew, "_fingerprint", lambda: f"git:refs/heads/main:{tests_only}")
++    assert code_skew.detect_code_skew() is None
++    monkeypatch.setattr(code_skew, "_fingerprint", lambda: f"git:refs/heads/main:{code}")
++    assert code_skew.detect_code_skew() == (base[:10], code[:10])
++
++
++def test_detect_code_skew_fails_closed_when_git_fails(repo, monkeypatch):
++    root, base = repo
++    tests_only = _commit(root, {"tests/test_a.py": "x\n"}, "t1")
++    monkeypatch.setattr(code_skew, "_PROJECT_ROOT", root)
++    monkeypatch.setattr(code_skew, "_restart_free_verdicts", {})
++    monkeypatch.setattr(code_skew, "_boot_fingerprint", f"git:refs/heads/main:{base}")
++    monkeypatch.setattr(code_skew, "_fingerprint", lambda: f"git:refs/heads/main:{tests_only}")
++
++    monkeypatch.setattr(rip, "_git", lambda *_a, **_k: None)  # git missing / timed out
++    assert code_skew.detect_code_skew() == (base[:10], tests_only[:10])
+diff --git a/tests/hermes_cli/test_web_server_skew_exit.py b/tests/hermes_cli/test_web_server_skew_exit.py
+index b0348b5592..dd9e1ba658 100644
+--- a/tests/hermes_cli/test_web_server_skew_exit.py
++++ b/tests/hermes_cli/test_web_server_skew_exit.py
+@@ -97,6 +97,39 @@ def test_default_probe_retires_once_the_checkout_moves_past_the_boot_revision(tm
+     assert moved.should_exit is True
+ 
+ 
++def test_default_probe_keeps_a_backend_whose_checkout_moved_by_tests_only(tmp_path, monkeypatch):
++    """[daveey] A move over tests/docs/CI commits only is no code change: no retirement (t_01a1d471b754e5bc)."""
++    from gateway import code_skew
++
++    repo = tmp_path / "repo"
++    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
++    subprocess.run(["git", "init", "-q", str(repo)], check=True)
++    (repo / "run.py").write_text("x = 1\n")
++    subprocess.run([*git, "add", "-A"], check=True)
++    subprocess.run([*git, "commit", "-q", "-m", "one"], check=True)
++    monkeypatch.setattr(code_skew, "_PROJECT_ROOT", repo)
++    monkeypatch.setattr(code_skew, "_boot_fingerprint", None)
++    monkeypatch.setattr(code_skew, "_restart_free_verdicts", {})
++    code_skew.record_boot_fingerprint()
++
++    (repo / "tests").mkdir()
++    (repo / "tests" / "test_run.py").write_text("def test(): pass\n")
++    subprocess.run([*git, "add", "-A"], check=True)
++    subprocess.run([*git, "commit", "-q", "-m", "tests only"], check=True)
++    fence = _Fence(idle=True)
++    tests_only = _Server()
++    start_code_skew_watchdog(tests_only, update_probe=lambda: False, fence=fence,
++                             poll_s=0.01, max_polls=4).join(timeout=5)
++    assert tests_only.should_exit is False
++
++    (repo / "run.py").write_text("x = 2\n")
++    subprocess.run([*git, "commit", "-q", "-am", "code"], check=True)
++    moved = _Server()
++    start_code_skew_watchdog(moved, update_probe=lambda: False, fence=fence,
++                             poll_s=0.01, max_polls=4).join(timeout=5)
++    assert moved.should_exit is True
++
++
+ def _run_runtime(fence, intact, *, update=False, **kw):
+     server = _Server()
+     seq = iter(intact)
+-- 
+2.51.0
+

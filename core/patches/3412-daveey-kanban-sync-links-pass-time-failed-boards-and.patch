@@ -1,0 +1,198 @@
+From 34f98d690c4fddd4643304f0c9ddef86d9e9e150 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:53:25 +0000
+Subject: [PATCH] [daveey] kanban sync links pass: time failed boards and name
+ slow-but-unchanged boards
+
+A board's links-pass failure warning now carries 'failed after <s>s' (a slow failure is a lock/busy wait, the case
+the duration logging exists for), and a board skipped as unchanged after an inputs read of LINKS_SLOW_LOG_S or more
+logs '<board> chat links unchanged, skipped in <s>s' instead of only the unnamed whole-pass line.
+
+The skip decision moves into _links_unchanged (reconcile_links NESTING cap), and the pure _ledger_slices and
+_links_signature move to kanban_sync_links_inputs.py (kanban_sync_client.py FILE_LINES cap), re-imported under
+their old names. PR #2007 review nits (t_01a1d40f42f110be); card t_01a1d4125b4a125d.
+---
+ hermes_cli/kanban_sync_client.py              | 51 ++++++++-----------
+ hermes_cli/kanban_sync_links_inputs.py        | 31 +++++++++++
+ .../test_kanban_sync_steady_links.py          | 40 +++++++++++++++
+ 3 files changed, 92 insertions(+), 30 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_links_inputs.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index f7820e0702..a7e064e8a7 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -52,6 +52,7 @@ from hermes_cli.kanban_sync_repair_window import (  # shared per-board repair-wi
+     next_deferred_repair, note_round, reset as reset_repair_window,
+ )
+ from hermes_cli.kanban_sync_own_writes import credited, reset as reset_own_writes, take as take_credited
++from hermes_cli.kanban_sync_links_inputs import ledger_slices as _ledger_slices, links_signature as _links_signature
+ 
+ _log = logging.getLogger(__name__)
+ 
+@@ -1192,8 +1193,10 @@ def _links_clock() -> float:
+ 
+ # A board's links pass logs its duration with its counts (``kanban sync: <board> chat links {...} in <s>s``); a pass
+ # with no changes logs only when it took this long, so a slow pass is visible even when it changed nothing; a whole
+-# pass this slow (ledger read included) also logs ``kanban sync: chat links pass over N board(s) took <s>s``. The hub
+-# pass ran ~10 min on 2026-11-13 and the line carried no duration to measure it by (t_01a1d35d8d7e22a7). [daveey]
++# pass this slow (ledger read included) also logs ``kanban sync: chat links pass over N board(s) took <s>s``. A board
++# skipped as unchanged after a slow inputs read logs ``<board> chat links unchanged, skipped in <s>s``, and a failed
++# board's warning carries ``failed after <s>s``. The hub pass ran ~10 min on 2026-11-13 and the line carried no
++# duration to measure it by (t_01a1d35d8d7e22a7). [daveey]
+ LINKS_SLOW_LOG_S = 10.0
+ 
+ 
+@@ -1205,28 +1208,18 @@ def _links_pass_clock() -> float:
+ _LINKS_RUNNER: Any = None  # a kanban_sync_links_pass.LinksPass while the loop runs
+ 
+ 
+-def _ledger_slices(cards: Iterable[Mapping[str, Any]], gateway: str) -> dict[str, frozenset]:
+-    """Per board, every field of this gateway's origin-ledger rows that a links pass reads (``ledger_boards``,
+-    ``kanban_chat_links._ledger_links``). Compared by value: a re-projection with the same rows is no change."""
+-    out: dict[str, set] = {}
+-    for c in cards:
+-        if not c.get("board") or c.get("origin_gateway") not in (None, gateway):
+-            continue
+-        out.setdefault(str(c["board"]), set()).add(
+-            (c.get("id"), c.get("session"), c.get("via"), c.get("origin_profile"), bool(c.get("released"))))
+-    return {board: frozenset(rows) for board, rows in out.items()}
+-
+-
+-def _links_signature(gateway: str, placement: Mapping[str, Any]) -> Optional[tuple]:
+-    """The configuration a links pass reads besides its board: gateway names, profile, homes, placement config."""
+-    try:
+-        from hermes_constants import get_hermes_home
+-        from hermes_cli.kanban_origin import gateway_names
+-        from hermes_cli.profiles import get_active_profile_name
+-        return (gateway, gateway_names()[0], get_active_profile_name(), str(get_hermes_home()),
+-                json.dumps(placement, sort_keys=True, default=str))
+-    except (OSError, sqlite3.Error, TypeError, ValueError):
+-        return None
++def _links_unchanged(key: str, inputs: Optional[tuple], slug: str, began: float) -> tuple[bool, float]:
++    """(whether a board's links-pass inputs equal its last completed pass's, under ``LINKS_MAX_AGE_S`` ago, so the
++    pass is skipped; the pass start to record). A skip whose inputs read took ``LINKS_SLOW_LOG_S`` names its board."""
++    done = _LINKS_DONE.pop(key, None)
++    started = _links_clock()
++    if inputs is None or done is None or done[0] != inputs or started - done[1] >= LINKS_MAX_AGE_S:
++        return False, started
++    _LINKS_DONE[key] = done
++    took = _links_pass_clock() - began
++    if took >= LINKS_SLOW_LOG_S:
++        _log.info("kanban sync: %s chat links unchanged, skipped in %.1fs", slug, took)
++    return True, started
+ 
+ 
+ def _links_inputs(conn: sqlite3.Connection, path: Path, slug: str, gateway: str, mode: str,
+@@ -1295,11 +1288,8 @@ def reconcile_links(boards: list[tuple[str, Path]], gateway: str, *, skip_unchan
+                     inputs, started = None, 0.0
+                     if skip_unchanged:
+                         inputs = _links_inputs(conn, path, slug, gateway, mode, ledger, signature)
+-                        done = _LINKS_DONE.pop(key, None)
+-                        started = _links_clock()
+-                        if inputs is not None and done is not None and done[0] == inputs \
+-                                and started - done[1] < LINKS_MAX_AGE_S:
+-                            _LINKS_DONE[key] = done
++                        skip, started = _links_unchanged(key, inputs, slug, began)
++                        if skip:
+                             continue
+                     counts = kanban_chat_links.reconcile(conn, slug, gateway)
+                     if inputs is not None:
+@@ -1308,7 +1298,8 @@ def reconcile_links(boards: list[tuple[str, Path]], gateway: str, *, skip_unchan
+                 if any(counts.values()) or took >= LINKS_SLOW_LOG_S:
+                     _log.info("kanban sync: %s chat links %s in %.1fs", slug, counts, took)
+             except Exception as exc:  # health: allow BLE001 -- one board's links must not stop the sync loop
+-                _log.warning("kanban sync: chat links for %s failed (%s: %s)", slug, type(exc).__name__, exc)
++                _log.warning("kanban sync: chat links for %s failed after %.1fs (%s: %s)", slug,
++                             _links_pass_clock() - began, type(exc).__name__, exc)
+     took = _links_pass_clock() - pass_began
+     if took >= LINKS_SLOW_LOG_S:
+         _log.info("kanban sync: chat links pass over %d board(s) took %.1fs", len(boards), took)
+diff --git a/hermes_cli/kanban_sync_links_inputs.py b/hermes_cli/kanban_sync_links_inputs.py
+new file mode 100644
+index 0000000000..12bb4988eb
+--- /dev/null
++++ b/hermes_cli/kanban_sync_links_inputs.py
+@@ -0,0 +1,31 @@
++"""Pure inputs of a sync-loop chat-links pass (``kanban_sync_client._links_inputs``): this gateway's origin-ledger
++slices and the configuration signature. Moved from kanban_sync_client.py (FILE_LINES cap). [daveey]"""
++from __future__ import annotations
++
++import json
++import sqlite3
++from typing import Any, Iterable, Mapping, Optional
++
++
++def ledger_slices(cards: Iterable[Mapping[str, Any]], gateway: str) -> dict[str, frozenset]:
++    """Per board, every field of this gateway's origin-ledger rows that a links pass reads (``ledger_boards``,
++    ``kanban_chat_links._ledger_links``). Compared by value: a re-projection with the same rows is no change."""
++    out: dict[str, set] = {}
++    for c in cards:
++        if not c.get("board") or c.get("origin_gateway") not in (None, gateway):
++            continue
++        out.setdefault(str(c["board"]), set()).add(
++            (c.get("id"), c.get("session"), c.get("via"), c.get("origin_profile"), bool(c.get("released"))))
++    return {board: frozenset(rows) for board, rows in out.items()}
++
++
++def links_signature(gateway: str, placement: Mapping[str, Any]) -> Optional[tuple]:
++    """The configuration a links pass reads besides its board: gateway names, profile, homes, placement config."""
++    try:
++        from hermes_constants import get_hermes_home
++        from hermes_cli.kanban_origin import gateway_names
++        from hermes_cli.profiles import get_active_profile_name
++        return (gateway, gateway_names()[0], get_active_profile_name(), str(get_hermes_home()),
++                json.dumps(placement, sort_keys=True, default=str))
++    except (OSError, sqlite3.Error, TypeError, ValueError):
++        return None
+diff --git a/tests/hermes_cli/test_kanban_sync_steady_links.py b/tests/hermes_cli/test_kanban_sync_steady_links.py
+index 8180a22e3b..c5b6129b1b 100644
+--- a/tests/hermes_cli/test_kanban_sync_steady_links.py
++++ b/tests/hermes_cli/test_kanban_sync_steady_links.py
+@@ -483,3 +483,43 @@ def test_the_links_log_line_carries_the_pass_duration(live, ledger, kanban_home,
+     assert _link_lines(caplog) == [
+         f"kanban sync: {BOARD} chat links {{'added': 0, 'changed': 0, 'released': 0, 'retired': 0}} in 12.0s",
+         "kanban sync: chat links pass over 1 board(s) took 12.0s"]
++
++
++def test_a_failed_board_logs_how_long_it_ran(live, ledger, kanban_home, scope, slow_reconcile, monkeypatch, caplog):
++    """A slow failure (a lock or busy wait) is what the duration logging is for, so its warning carries it too."""
++    caplog.set_level("INFO", logger="hermes_cli.kanban_sync_client")
++    slow_reconcile[0] = 7.5
++    timed = links.reconcile
++
++    def boom(*a, **k):
++        timed(*a, **k)  # spends the fake 7.5 s
++        raise sqlite3.OperationalError("database is locked")
++
++    monkeypatch.setattr(links, "reconcile", boom)
++    _pass(kanban_home)
++    assert _link_lines(caplog) == [
++        f"kanban sync: chat links for {BOARD} failed after 7.5s (OperationalError: database is locked)"]
++
++
++def test_a_slow_unchanged_skip_names_its_board(live, ledger, kanban_home, scope, spies, monkeypatch, caplog):
++    """A board whose inputs read is slow but unchanged is skipped; it still logs its name at LINKS_SLOW_LOG_S."""
++    _settled(live, ledger, kanban_home, spies)
++    now, cost = [1000.0], [0.0]
++    real_inputs = ksc._links_inputs
++
++    def slow_inputs(*a, **k):
++        now[0] += cost[0]
++        return real_inputs(*a, **k)
++
++    monkeypatch.setattr(ksc, "_links_pass_clock", lambda: now[0])
++    monkeypatch.setattr(ksc, "_links_inputs", slow_inputs)
++    caplog.set_level("INFO", logger="hermes_cli.kanban_sync_client")
++    caplog.clear()  # the settling passes' own lines
++    cost[0] = 9.9  # under the threshold: silent
++    _pass(kanban_home)
++    assert _link_lines(caplog) == []
++    cost[0] = 11.0
++    _pass(kanban_home)
++    assert spies["reconcile"] == 0, spies  # both passes skipped as unchanged
++    assert _link_lines(caplog) == [f"kanban sync: {BOARD} chat links unchanged, skipped in 11.0s",
++                                   "kanban sync: chat links pass over 1 board(s) took 11.0s"]
+-- 
+2.51.0
+

@@ -1,0 +1,459 @@
+From 17dac7e341b080157013b63a96dbbb93718267a2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 20:48:42 +0000
+Subject: [PATCH] [daveey] Prove quota recovery identity and transport
+ boundaries
+
+---
+ tests/agent/test_model_cooldown_recovery.py   |  57 ++-
+ .../test_kanban_quota_completion_mutations.py | 361 ++++++++++++++++++
+ 2 files changed, 416 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_quota_completion_mutations.py
+
+diff --git a/tests/agent/test_model_cooldown_recovery.py b/tests/agent/test_model_cooldown_recovery.py
+index b7507178dd..2f140eaf3c 100644
+--- a/tests/agent/test_model_cooldown_recovery.py
++++ b/tests/agent/test_model_cooldown_recovery.py
+@@ -189,7 +189,7 @@ def test_sanitized_borrowed_row_recovers_by_fingerprint_without_persisting_secre
+ 
+ 
+ @pytest.mark.parametrize("source", ["env:ANTHROPIC_TOKEN", "claude_code"])
+-@pytest.mark.parametrize("change", ["fingerprint", "source", "disabled"])
++@pytest.mark.parametrize("change", ["fingerprint", "source", "secret_source", "base_url", "auth_type", "disabled"])
+ def test_sanitized_borrowed_row_refuses_changed_identity(pool, source, change):
+     from agent.credential_pool_disabled import set_credential_disabled
+     from hermes_cli import auth
+@@ -203,9 +203,62 @@ def test_sanitized_borrowed_row_refuses_changed_identity(pool, source, change):
+             row = store["credential_pool"]["anthropic"][0]
+             if change == "fingerprint":
+                 row["secret_fingerprint"] = "sha256:0000000000000000"
+-            else:
++            elif change == "source":
+                 row["source"] = "env:OTHER" if source == "claude_code" else "claude_code"
++            else:
++                row[change] = {"secret_source": "peer-secret-location",
++                               "base_url": "https://peer.example.com/v1", "auth_type": "api_key"}[change]
+             auth._save_auth_store(store)
+     before = auth.read_credential_pool("anthropic")
+     assert not borrowed.clear_verified_model_cooldown(observed, A)
+     assert auth.read_credential_pool("anthropic") == before
++
++
++@pytest.mark.parametrize("source", ["manual", "hermes_pkce"])
++def test_owned_row_without_secret_cannot_recover_by_borrowed_fingerprint(pool, source):
++    from agent.credential_pool import CredentialPool, PooledCredential
++    from agent.credential_persistence import fingerprint_secret_value, is_borrowed_credential_source
++    from hermes_cli import auth
++
++    observed = bench(pool)
++    observed.source = source
++    row = observed.to_dict()
++    # A damaged owned row may retain a fingerprint, but is not a borrowed reference.
++    row.pop("access_token", None)
++    row.pop("refresh_token", None)
++    row["secret_fingerprint"] = fingerprint_secret_value(observed.runtime_api_key)
++    auth.write_credential_pool("anthropic", [row])
++    current = PooledCredential.from_dict("anthropic", auth.read_credential_pool("anthropic")[0])
++    assert not current.runtime_api_key
++    assert not is_borrowed_credential_source(current.source, "anthropic")
++    assert current.source == observed.source
++    assert current.extra["secret_fingerprint"] == fingerprint_secret_value(observed.runtime_api_key)
++    owned = CredentialPool("anthropic", [observed])
++    before = auth._load_auth_store()
++    assert not owned.clear_verified_model_cooldown(observed, A)
++    assert auth._load_auth_store() == before
++    assert A in (owned.entries()[0].model_cooldowns or {})
++
++
++def test_recovery_refuses_disabled_observation_when_current_label_is_enabled(pool):
++    from agent.credential_pool import PooledCredential
++    from agent.credential_pool_disabled import disabled_keys, matches
++    from hermes_cli import auth
++
++    observed = bench(pool)
++    with auth._auth_store_lock():
++        store = auth._load_auth_store()
++        # Label drift is not a CAS identity change. A label-only disable record
++        # matches the verified snapshot but not the renamed persisted row.
++        store["credential_pool"]["anthropic"][0]["label"] = "renamed-seat"
++        store["disabled_credentials"] = {"anthropic": [{"label": observed.label}]}
++        auth._save_auth_store(store)
++    before = auth._load_auth_store()
++    current = PooledCredential.from_dict("anthropic", before["credential_pool"]["anthropic"][0])
++    keys = disabled_keys("anthropic")
++    assert not matches(current, keys)
++    assert matches(observed, keys)
++    assert current.runtime_api_key == observed.runtime_api_key
++    assert not pool.clear_verified_model_cooldown(observed, A)
++    assert auth._load_auth_store() == before
++    assert A in pool.entries()[0].model_cooldowns
+diff --git a/tests/hermes_cli/test_kanban_quota_completion_mutations.py b/tests/hermes_cli/test_kanban_quota_completion_mutations.py
+new file mode 100644
+index 0000000000..630d671c74
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_quota_completion_mutations.py
+@@ -0,0 +1,361 @@
++"""Behaviour-killing proofs for quota completion: completed body, absolute deadline, concurrent recover.
++
++Every scenario speaks real TCP/HTTP to a local server (no MockTransport). Each "mutant" test
++re-runs the same scenario with one production guard disabled and asserts the observable
++outcome flips, so the guard is proven load-bearing rather than merely present.
++"""
++import json
++import socket
++import threading
++import time
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import httpx
++import pytest
++
++from hermes_cli import kanban_quota_recovery as recovery
++
++MESSAGE = json.dumps({'type': 'message', 'role': 'assistant', 'content': [{'type': 'text', 'text': 'O'}],
++                      'stop_reason': 'max_tokens'}).encode()
++ERROR_BODY = b'{"type":"error","error":{"type":"overloaded_error"}}'
++NO_STOP = b'{"type":"message","role":"assistant","content":[],"stop_reason":null}'
++SSE_OK = b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'
++SSE_CREATED = b'data: {"type":"response.created"}\n\n'
++SSE_FAILED_STATUS = b'data: {"type":"response.completed","response":{"status":"failed"}}\n\n'
++SSE_FAILED_THEN_OK = (b'data: {"type":"response.failed"}\n\n' + SSE_OK)
++
++_REAL_STREAM = httpx.AsyncClient.stream
++JSON_HEAD = b'HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: %d\r\n\r\n'
++SSE_HEAD = b'HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n'
++
++
++class Server:
++    """Threaded raw-socket server; behaviour is chosen by the bearer token (= mode name)."""
++
++    def __init__(self, modes, trickle_limit=30.0):
++        self.modes, self.trickle_limit = modes, trickle_limit
++        self.sock = socket.socket()
++        self.sock.bind(('127.0.0.1', 0))
++        self.sock.listen(8)
++        self.port = self.sock.getsockname()[1]
++        self.connected, self.closed, self.lock = {}, {}, threading.Lock()
++        self.stop = threading.Event()
++        self.sock.settimeout(0.1)  # accept() must wake to observe stop; close() alone may not
++        self.threads, self._tlock = [], threading.Lock()
++        self._spawn(self._accept)
++
++    def _spawn(self, fn, *args):
++        t = threading.Thread(target=fn, args=args, daemon=True)
++        with self._tlock:
++            self.threads.append(t)
++        t.start()
++
++    def _accept(self):
++        while not self.stop.is_set():
++            try:
++                conn, _ = self.sock.accept()
++            except TimeoutError:
++                continue
++            except OSError:
++                return
++            self._spawn(self._serve, conn)
++
++    def _serve(self, conn):
++        conn.settimeout(0.5)
++        try:
++            self._serve_inner(conn)
++        except OSError:  # includes recv timeouts
++            pass
++        finally:
++            conn.close()
++
++    def _serve_inner(self, conn):
++        data = b''
++        while b'\r\n\r\n' not in data:
++            chunk = conn.recv(65536)
++            if not chunk:
++                return
++            data += chunk
++        head, _, rest = data.partition(b'\r\n\r\n')
++        want = next((int(l.split(b':')[1]) for l in head.split(b'\r\n')
++                     if l.lower().startswith(b'content-length')), 0)
++        while len(rest) < want:  # drain the request body so close() never RSTs the response
++            chunk = conn.recv(65536)
++            if not chunk:
++                return
++            rest += chunk
++        token = next(l.split(b'Bearer ')[1].decode().strip() for l in data.split(b'\r\n')
++                     if l.lower().startswith(b'authorization'))
++        with self.lock:
++            self.connected[token] = time.monotonic()
++            self.closed[token] = threading.Event()
++        self.modes[token](self, conn, token)
++
++    def trickle(self, conn, token, head):
++        conn.sendall(head)
++        end = time.monotonic() + self.trickle_limit
++        try:
++            while time.monotonic() < end:
++                conn.sendall(b' ')
++                if self.stop.wait(0.03):
++                    return
++        except OSError:
++            self.closed[token].set()  # peer hung up on us
++            return
++        # Never saw a peer close within the limit.
++
++    def close(self):
++        self.stop.set()
++        self.sock.close()
++        with self._tlock:
++            threads = list(self.threads)
++        for t in threads:
++            t.join(5)
++        assert not any(t.is_alive() for t in threads), 'server thread leaked'
++
++
++def _json(body, delay=0.0):
++    def mode(srv, conn, token):
++        srv.stop.wait(delay)
++        conn.sendall(JSON_HEAD % len(body) + body)
++        srv.stop.wait(0.05)
++    return mode
++
++
++def _sse(body, delay=0.0):
++    def mode(srv, conn, token):
++        srv.stop.wait(delay)
++        conn.sendall(SSE_HEAD + body)
++        srv.stop.wait(0.05)
++    return mode
++
++
++def _trickle_json(srv, conn, token):
++    srv.trickle(conn, token, JSON_HEAD % 100000)
++
++
++def _trickle_sse(srv, conn, token):
++    srv.trickle(conn, token, SSE_HEAD)
++
++
++@pytest.fixture
++def serve(monkeypatch):
++    servers = []
++
++    def start(modes, **kw):
++        srv = Server(modes, **kw)
++        servers.append(srv)
++        monkeypatch.setattr(recovery, '_client', lambda timeout: httpx.AsyncClient(timeout=30))
++        monkeypatch.setattr(httpx.AsyncClient, 'stream', lambda self, method, url, **kw2: _REAL_STREAM(
++            self, method, f'http://127.0.0.1:{srv.port}/', **kw2))
++        return srv
++    yield start
++    for s in servers:
++        s.close()
++
++
++def _entry(key):
++    return SimpleNamespace(id=key, provider='anthropic', auth_type='oauth', runtime_api_key=key,
++                           last_status='ready', last_error_code=None, last_error_reason=None,
++                           model_cooldowns={'m': 9999999999}, extra={})
++
++
++def _probe(serve, provider, key, mode, seconds=2.0, **kw):
++    serve({key: mode}, **kw)
++    start = time.monotonic()
++    ok = recovery.completion_succeeds(provider, 'm', _entry(key), start + seconds)
++    return ok, time.monotonic() - start
++
++
++# ---------------------------------------------------------------- completed body
++
++BODY_CASES = [
++    ('anthropic', 'ok', _json(MESSAGE), True),
++    ('anthropic', 'err', _json(ERROR_BODY), False),
++    ('anthropic', 'nostop', _json(NO_STOP), False),
++    ('openai-codex', 'ok', _sse(SSE_OK), True),
++    ('openai-codex', 'created', _sse(SSE_CREATED), False),
++    ('openai-codex', 'badstatus', _sse(SSE_FAILED_STATUS), False),
++    ('openai-codex', 'failed_then_ok', _sse(SSE_FAILED_THEN_OK), False),
++]
++
++
++@pytest.mark.parametrize('provider,key,mode,expected', BODY_CASES, ids=[c[1] + '-' + c[0] for c in BODY_CASES])
++def test_real_socket_completed_body_decides_outcome(serve, provider, key, mode, expected):
++    ok, _ = _probe(serve, provider, key, mode)
++    assert ok is expected
++
++
++@pytest.mark.parametrize('key,mutant,provider,mode', [
++    ('err', ('_valid_message', lambda raw: True), 'anthropic', _json(ERROR_BODY)),
++    ('nostop', ('_valid_message', lambda raw: True), 'anthropic', _json(NO_STOP)),
++    ('created', ('_read_codex', None), 'openai-codex', _sse(SSE_CREATED)),
++    ('badstatus', ('_read_codex', None), 'openai-codex', _sse(SSE_FAILED_STATUS)),
++    ('failed_then_ok', ('_read_codex', None), 'openai-codex', _sse(SSE_FAILED_THEN_OK)),
++])
++def test_mutant_that_accepts_200_without_completed_body_is_killed(serve, monkeypatch, key, mutant, provider, mode):
++    name, replacement = mutant
++    if name == '_read_codex':
++        async def replacement(response):  # mutant: any 200 stream that ends counts as proof
++            async for _ in response.aiter_bytes():
++                pass
++            return True
++    # Sanity: the real code rejects this exact wire exchange...
++    ok, _ = _probe(serve, provider, key, mode)
++    assert ok is False
++    # ...and the mutant accepts it, so the body check above is what rejected it.
++    monkeypatch.setattr(recovery, name, replacement)
++    ok, _ = _probe(serve, provider, key, mode)
++    assert ok is True
++
++
++# ---------------------------------------------------------------- absolute deadline
++
++@pytest.mark.parametrize('provider,mode', [('anthropic', _trickle_json), ('openai-codex', _trickle_sse)])
++def test_trickle_cut_at_absolute_deadline_and_peer_sees_close(serve, provider, mode):
++    srv_modes = {'t': mode}
++    srv = serve(srv_modes)
++    start = time.monotonic()
++    assert recovery.completion_succeeds(provider, 'm', _entry('t'), start + 0.8) is False
++    assert time.monotonic() - start < 2.0
++    assert srv.closed['t'].wait(3)
++
++
++@pytest.mark.parametrize('provider,mode', [('anthropic', _trickle_json), ('openai-codex', _trickle_sse)])
++def test_mutant_without_absolute_deadline_overruns_and_is_killed(serve, monkeypatch, provider, mode):
++    async def no_deadline(provider_, url, headers, body, deadline):
++        async with recovery._client(30) as client, client.stream('POST', url, headers=headers, json=body) as r:
++            if r.status_code != 200:
++                return False
++            return await (recovery._read_anthropic if provider_ == 'anthropic' else recovery._read_codex)(r)
++    monkeypatch.setattr(recovery, '_attempt', no_deadline)
++    serve({'t': mode}, trickle_limit=3.0)  # peer gives up after 3s, bounding the mutant run
++    start = time.monotonic()
++    assert recovery.completion_succeeds(provider, 'm', _entry('t'), start + 0.8) is False
++    assert time.monotonic() - start > 2.5  # real code returns < 2.0 (test above)
++
++
++@pytest.mark.parametrize('provider,mode', [('anthropic', _json(MESSAGE, delay=1.2)), ('openai-codex', _sse(SSE_OK, delay=1.2))])
++def test_valid_body_arriving_after_deadline_is_not_proof(serve, monkeypatch, provider, mode):
++    serve({'late': mode})
++    start = time.monotonic()
++    assert recovery.completion_succeeds(provider, 'm', _entry('late'), start + 0.5) is False
++    assert time.monotonic() - start < 1.1  # cancelled at the deadline, not after the body
++    # Mutant: no deadline at all -> the stale completion is accepted.
++    async def no_deadline(provider_, url, headers, body, deadline):
++        async with recovery._client(30) as client, client.stream('POST', url, headers=headers, json=body) as r:
++            return r.status_code == 200 and await (
++                recovery._read_anthropic if provider_ == 'anthropic' else recovery._read_codex)(r)
++    monkeypatch.setattr(recovery, '_attempt', no_deadline)
++    assert recovery.completion_succeeds(provider, 'm', _entry('late'), time.monotonic() + 0.5) is True
++
++
++def test_expired_deadline_makes_no_connection(serve):
++    srv = serve({'x': _json(MESSAGE)})
++    assert recovery.completion_succeeds('anthropic', 'm', _entry('x'), time.monotonic() - 1) is False
++    assert not srv.connected
++
++
++# ---------------------------------------------------------------- concurrent recover
++
++def _pool(entries):
++    return SimpleNamespace(entries=lambda: entries, clear_verified_model_cooldown=Mock(return_value=True))
++
++
++def _concurrent_modes():
++    """fast answers only once slow is also connected: serial probing cannot pass."""
++    def fast(srv, conn, token):
++        deadline = time.monotonic() + 3
++        while 'slow' not in srv.connected and time.monotonic() < deadline:
++            srv.stop.wait(0.01)
++        _json(MESSAGE)(srv, conn, token)
++    return {'fast': fast, 'slow': _trickle_json}
++
++
++def test_recover_probes_concurrently_clears_only_proven_and_cuts_slow_peer(serve, monkeypatch):
++    srv = serve(_concurrent_modes())
++    entries = [_entry('slow'), _entry('fast')]
++    pool = _pool(entries)
++    monkeypatch.setattr('agent.credential_pool.load_pool', lambda *a, **k: pool)
++    monkeypatch.setattr('agent.credential_pool_disabled.disabled_keys', lambda p: set())
++    monkeypatch.setattr(recovery, '_eligible', lambda *a: True)
++    monkeypatch.setattr('hermes_cli.kanban_quota_detector.record_contradiction', lambda *a: None)
++    start = time.monotonic()
++    assert recovery.recover('anthropic', 'm', seconds=1.5) is True
++    assert time.monotonic() - start < 2.5
++    assert [c.args[0].runtime_api_key for c in pool.clear_verified_model_cooldown.call_args_list] == ['fast']
++    assert srv.closed['slow'].wait(3)  # shared deadline closed the stalled socket
++
++
++def test_mutant_serial_probing_is_killed(serve, monkeypatch):
++    serve(_concurrent_modes())
++    entries = [_entry('slow'), _entry('fast')]
++    pool = _pool(entries)
++    monkeypatch.setattr('agent.credential_pool.load_pool', lambda *a, **k: pool)
++    monkeypatch.setattr('agent.credential_pool_disabled.disabled_keys', lambda p: set())
++    monkeypatch.setattr(recovery, '_eligible', lambda *a: True)
++    monkeypatch.setattr('hermes_cli.kanban_quota_detector.record_contradiction', lambda *a: None)
++    real = recovery.ThreadPoolExecutor
++    monkeypatch.setattr(recovery, 'ThreadPoolExecutor', lambda max_workers, **kw: real(max_workers=1, **kw))
++    assert recovery.recover('anthropic', 'm', seconds=1.5) is False  # slow starves fast
++    pool.clear_verified_model_cooldown.assert_not_called()
++
++
++def test_recover_all_stalled_clears_nothing_within_deadline(serve, monkeypatch):
++    serve({'slow': _trickle_json, 'slow2': _trickle_sse})
++    pool = _pool([_entry('slow'), _entry('slow2')])
++    monkeypatch.setattr('agent.credential_pool.load_pool', lambda *a, **k: pool)
++    monkeypatch.setattr('agent.credential_pool_disabled.disabled_keys', lambda p: set())
++    monkeypatch.setattr(recovery, '_eligible', lambda *a: True)
++    start = time.monotonic()
++    assert recovery.recover('anthropic', 'm', seconds=0.8) is False
++    assert time.monotonic() - start < 2.0
++    pool.clear_verified_model_cooldown.assert_not_called()
++
++
++# ---------------------------------------------------------------- DNS executor finalization
++
++@pytest.fixture
++def hang_dns(monkeypatch):
++    """Bounded DNS stub: blocks until released (or 3s) then fails; never touches the network.
++
++    Teardown releases the stub and joins every thread it spawned (asyncio default-executor
++    and recover() workers) BEFORE monkeypatch restores getaddrinfo, so nothing escapes.
++    """
++    release = threading.Event()
++    baseline = set(threading.enumerate())
++
++    def stub(*a, **k):
++        release.wait(3.0)
++        raise socket.gaierror(socket.EAI_AGAIN, 'stubbed DNS failure')
++    monkeypatch.setattr(socket, 'getaddrinfo', stub)
++    yield release
++    release.set()
++    leaked = [t for t in threading.enumerate() if t not in baseline and t is not threading.current_thread()]
++    for t in leaked:
++        t.join(5)
++    assert not [t for t in leaked if t.is_alive()], 'DNS worker thread leaked'
++
++
++@pytest.mark.xfail(strict=True, reason=(
++    'KNOWN PRODUCTION LEAK: asyncio.run() joins the default executor on exit, so a hung '
++    'getaddrinfo keeps completion_succeeds() alive past its absolute deadline. Remove this '
++    'xfail once production stops joining it (e.g. own loop + shutdown_default_executor skipped).'))
++def test_hung_dns_does_not_extend_completion_past_deadline(hang_dns):
++    start = time.monotonic()
++    assert recovery.completion_succeeds('anthropic', 'm', _entry('k'), start + 0.5) is False
++    assert time.monotonic() - start < 1.5
++
++
++def test_recover_stays_bounded_under_hung_dns_and_never_clears(monkeypatch, hang_dns):
++    """recover() abandons workers at the shared deadline (shutdown(wait=False)), so the leak
++    above delays only a detached thread, never the caller or a CAS."""
++    pool = _pool([_entry('k')])
++    monkeypatch.setattr('agent.credential_pool.load_pool', lambda *a, **k: pool)
++    monkeypatch.setattr('agent.credential_pool_disabled.disabled_keys', lambda p: set())
++    monkeypatch.setattr(recovery, '_eligible', lambda *a: True)
++    start = time.monotonic()
++    assert recovery.recover('anthropic', 'm', seconds=0.5) is False
++    assert time.monotonic() - start < 1.5
++    pool.clear_verified_model_cooldown.assert_not_called()
+-- 
+2.51.0
+

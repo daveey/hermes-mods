@@ -1,0 +1,191 @@
+From f46110f07e7e5f6085aead5c19ab093e8ca7e4f5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:53:52 +0000
+Subject: [PATCH] [daveey] kanban: a missing-parent streak is scoped to its
+ parents and ends at an unblock or a link
+
+2026-11-12 22:32 PT, laptop-1: t_01a1cfbe6c8d46e7 was blocked parent_missing 127 s after worker-4 linked
+a brand-new parent (done on the Board 4 min later), with no fresh parent_missing before the block. The
+streak was just the child's newest parent_missing/parent_found event: the 21:09 streak (another parent,
+blocked 21:20, unblocked 21:37 straight to ready, so no pass ever wrote parent_found) still counted as
+open, and 600 s had "elapsed". The mirror-freshness gate alone would not catch it (~1000 changes behind).
+
+note_missing_parents now treats the newest parent_missing as the open streak only when it is newer than
+the child's last unblocked/linked event (and the parent_found check as before) and names every parent
+missing now; otherwise it appends a fresh parent_missing for the current set and does not block that tick.
+A reopened child whose same parent is still missing (no unblock event) keeps re-blocking as before.
+---
+ hermes_cli/kanban_db_graph.py                 | 28 +++++-
+ .../test_kanban_missing_parent_detector.py    | 94 +++++++++++++++++++
+ 2 files changed, 118 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_graph.py b/hermes_cli/kanban_db_graph.py
+index f7805a88be..330ce2adc6 100644
+--- a/hermes_cli/kanban_db_graph.py
++++ b/hermes_cli/kanban_db_graph.py
+@@ -1,6 +1,7 @@
+ """Task graph initialization and atomic decomposition persistence."""
+ from __future__ import annotations
+ 
++import json
+ import logging
+ import sqlite3
+ import time
+@@ -17,7 +18,9 @@ def note_missing_parents(
+ 
+     On a synced board (``remote``) a parent with no status is unknown, not missing, unless the mirror's replica is
+     at the feed head (``kanban_replica_freshness.replica_at_head``, read once per readiness pass into ``fresh``):
+-    otherwise no streak event is recorded and nothing is blocked. The child still waits: an unknown parent gates."""
++    otherwise no streak event is recorded and nothing is blocked. The child still waits: an unknown parent gates.
++    A streak is scoped (``_streak_open``): a parent missing after an unblock or a link, or one the open streak does
++    not name, starts a fresh ``parent_missing`` and waits its own :data:`PARENT_MISSING_BLOCK_SECONDS`."""
+     from hermes_cli import kanban_db as kb
+ 
+     if not states:
+@@ -33,14 +36,14 @@ def note_missing_parents(
+         if not cache["fresh"]:
+             return False
+     last = conn.execute(
+-        "SELECT kind, created_at FROM task_events WHERE task_id = ? AND kind IN ('parent_missing', 'parent_found') "
+-        "ORDER BY id DESC LIMIT 1", (task_id,),
++        "SELECT id, kind, created_at, payload FROM task_events WHERE task_id = ? "
++        "AND kind IN ('parent_missing', 'parent_found') ORDER BY id DESC LIMIT 1", (task_id,),
+     ).fetchone()
+     if not missing:
+         if last is not None and last["kind"] == "parent_missing":
+             kb._append_event(conn, task_id, "parent_found", None)
+         return False
+-    if last is None or last["kind"] != "parent_missing":
++    if not _streak_open(conn, task_id, last, missing):
+         kb._append_event(conn, task_id, "parent_missing", {"parents": missing})
+         return False
+     if int(kb.time.time()) - int(last["created_at"] or 0) < kb.PARENT_MISSING_BLOCK_SECONDS:
+@@ -61,6 +64,23 @@ def note_missing_parents(
+     return True
+ 
+ 
++def _streak_open(conn: sqlite3.Connection, task_id: str, last, missing: list[str]) -> bool:
++    """The newest ``parent_missing`` is this streak only when no ``unblocked``/``linked`` event follows it and it
++    names every parent missing now: a later incident must not inherit an earlier one's elapsed time."""
++    if last is None or last["kind"] != "parent_missing":
++        return False
++    reset = conn.execute(
++        "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind IN ('unblocked', 'linked')", (task_id,),
++    ).fetchone()[0]
++    if reset is not None and reset > last["id"]:
++        return False
++    try:
++        named = set(json.loads(last["payload"] or "{}").get("parents") or ())
++    except (TypeError, ValueError, AttributeError):
++        return False
++    return set(missing) <= named
++
++
+ def missing_parent_repair(conn: sqlite3.Connection, task_id: str, missing: list[str]) -> str:
+     """Compose repair admission in the readiness transaction, once per open incident."""
+     from hermes_cli import kanban_db as kb
+diff --git a/tests/hermes_cli/test_kanban_missing_parent_detector.py b/tests/hermes_cli/test_kanban_missing_parent_detector.py
+index 11eabd40b4..094ce6f0fc 100644
+--- a/tests/hermes_cli/test_kanban_missing_parent_detector.py
++++ b/tests/hermes_cli/test_kanban_missing_parent_detector.py
+@@ -70,3 +70,97 @@ def test_returned_parent_does_not_raise_repair(local):
+     kb.recompute_ready(local)
+     assert kb.parent_states(local, child) == [(parent, 'ready')]
+     assert not local.execute("SELECT id FROM tasks WHERE created_by = 'missing-parent-detector'").fetchall()
++
++
++# --- a streak belongs to the parents it names and ends at an unblock or a link ---------------------------------
++# 2026-11-12 22:32 PT, laptop-1: t_01a1cfbe6c8d46e7 was blocked 127 s after worker-4 linked a brand-new parent,
++# because its 21:09 streak (another parent, unblocked at 21:37 with no parent_found) still counted as open.
++
++kanban_home, svc, live = support.kanban_home, support.svc, support.live
++
++
++def _age(conn, child):
++    with kb.write_txn(conn):
++        conn.execute("UPDATE task_events SET created_at = created_at - ? WHERE task_id = ? AND kind = 'parent_missing'",
++                     (kb.PARENT_MISSING_BLOCK_SECONDS + 1, child))
++
++
++def _repairs(conn, child):
++    return [r[0] for r in conn.execute(
++        "SELECT id FROM tasks WHERE created_by = 'missing-parent-detector' AND title LIKE ? ORDER BY rowid",
++        (f"%{child}",))]
++
++
++def _missing_named(conn, child):
++    return json.loads(support._events(conn, child, "parent_missing")[-1]["payload"])["parents"]
++
++
++def test_a_parent_linked_after_an_unblock_starts_its_own_streak(live, svc, kanban_home):
++    child = kb.create_task(live, title="rework", assignee="worker")
++    support._round(kanban_home, svc)
++    support._link_raw(live, "t_a", child)
++    support._stamp_replica(support.time.time())  # a fresh replica: the Board really lacks t_a for now
++    kb.recompute_ready(live)
++    _age(live, child)
++    kb.recompute_ready(live)
++    assert kb.get_task(live, child).status == "blocked"
++    [first] = _repairs(live, child)
++    with kb.write_txn(live):  # t_a turns up; the repair card finishes and unblocks the child
++        live.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('t_a', 'a', 'done', 0)")
++        live.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (first,))
++    assert kb.unblock_task(live, child)
++    assert kb.get_task(live, child).status == "ready"  # straight to ready: no pass ever wrote parent_found
++    support._link_raw(live, "t_b", child)  # worker-4 links a parent created a second ago, not mirrored yet
++    with kb.write_txn(live):
++        kb._append_event(live, child, "linked", {"parent": "t_b", "child": child})
++    kb.recompute_ready(live)
++    assert kb.get_task(live, child).status == "todo"  # before the fix: blocked at once on the 82-min-old streak
++    assert _missing_named(live, child) == ["t_b"]
++    kb.recompute_ready(live)
++    assert kb.get_task(live, child).status == "todo"
++    _age(live, child)
++    kb.recompute_ready(live)
++    kb.recompute_ready(live)
++    assert kb.get_task(live, child).status == "blocked"
++    assert len(support._events(live, child, "blocked")) == 2
++    assert len(_repairs(live, child)) == 2  # exactly one new repair card, for t_b
++
++
++@pytest.mark.parametrize("linked_event", [True, False])
++def test_a_newly_missing_parent_waits_its_own_window(local, linked_event):
++    """No unblock: an old open streak for t_a must not expire t_b, whether the link arrived with a ``linked``
++    event or only as a row (then the streak's parent list, which lacks t_b, is what reopens it)."""
++    child = kb.create_task(local, title="dependent", assignee="worker")
++    with kb.write_txn(local):
++        local.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('t_a', 'a', 'running', 0)")
++    support._link_raw(local, "t_a", child)
++    with kb.write_txn(local):  # a streak for t_a that no pass closed
++        kb._append_event(local, child, "parent_missing", {"parents": ["t_a"]})
++    _age(local, child)
++    support._link_raw(local, "t_b", child)
++    if linked_event:
++        with kb.write_txn(local):
++            kb._append_event(local, child, "linked", {"parent": "t_b", "child": child})
++    kb.recompute_ready(local)
++    assert kb.get_task(local, child).status == "todo"  # before the fix: blocked at once
++    assert _missing_named(local, child) == ["t_b"]
++    kb.recompute_ready(local)
++    assert kb.get_task(local, child).status == "todo"
++    _age(local, child)
++    kb.recompute_ready(local)
++    assert kb.get_task(local, child).status == "blocked"
++    assert len(_repairs(local, child)) == 1
++
++
++def test_a_streak_naming_more_parents_still_covers_the_ones_left(local):
++    child = kb.create_task(local, title="dependent", assignee="worker")
++    support._link_raw(local, "t_a", child)
++    support._link_raw(local, "t_b", child)
++    kb.recompute_ready(local)
++    assert sorted(_missing_named(local, child)) == ["t_a", "t_b"]
++    with kb.write_txn(local):
++        local.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('t_a', 'a', 'running', 0)")
++    _age(local, child)
++    kb.recompute_ready(local)
++    assert kb.get_task(local, child).status == "blocked"
++    assert len(support._events(local, child, "parent_missing")) == 1
+-- 
+2.51.0
+

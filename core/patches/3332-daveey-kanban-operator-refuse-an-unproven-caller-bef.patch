@@ -1,0 +1,307 @@
+From 38a8d3de57d8eb344da30919c80cf365136638e0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:25:46 +0000
+Subject: [PATCH] [daveey] kanban operator: refuse an unproven caller before
+ deferring it; '--'/U+2212 dashes; be/being govern
+
+Review t_01a1d4254843641b (PR #2037 @051fdf9621, GitHub review 5888574999).
+
+Blocking: apply_incoming ran home_refusal before _caller_refusal, so a forged
+call whose caller has no created event in the replica was deferred before its
+caller was proven. With a future requested_at (payload-supplied, no clock
+check) it was retried every tick, never refused, and the held watermark paged
+the whole request tail each tick. Now the replica-only caller checks
+(_caller_replica_refusal, split out of _caller_refusal; no Board read) run
+first: an unproven caller is refused, never deferred. A requested_at more than
+SKEW_S in the future is caller_unproven, and home_refusal defers only within
+[-CREATION_SYNC_SKEW_S, CREATION_SYNC_GRACE_S] of now (defence in depth).
+The filter and the home check move into _incoming/_home_check (apply_incoming
+CC stays under target).
+
+Nits: a spaced ASCII '--' and U+2212 are dash boundaries ("Not done -- posted
+to t_X" is a claim); "be"/"being" join _NOT_CLAIM, so "to be later posted",
+"to be eventually sent" and "is being posted" are not claims; the guard
+comment notes the accepted fail-open "turned out to be posted twice".
+
+Proof: RED on 051fdf9621: 7 new cases fail (forged unproven caller at now and
+at now+3600 deferred instead of refused, home_refusal future defer, 5
+classifier cases). GREEN: 7 operator/consent test files, 325 passed. Mutant
+(home_refusal without the replica-first gate) killed by the now-offset case.
+---
+ hermes_cli/kanban_consent.py                  |  4 +-
+ hermes_cli/kanban_operator_call.py            | 77 +++++++++++++------
+ hermes_cli/kanban_operator_delivery.py        | 20 ++---
+ .../test_kanban_consent_provenance.py         | 42 ++++++++++
+ .../test_kanban_operator_delivery.py          |  8 ++
+ 5 files changed, 118 insertions(+), 33 deletions(-)
+
+diff --git a/hermes_cli/kanban_consent.py b/hermes_cli/kanban_consent.py
+index 4607ecfd00..78d8901a60 100644
+--- a/hermes_cli/kanban_consent.py
++++ b/hermes_cli/kanban_consent.py
+@@ -222,6 +222,7 @@ def enforce(conn, requester, ops, session=None):
+ 
+ # How long the home waits for a caller's created event to reach its replica before refusing.
+ CREATION_SYNC_GRACE_S = 600
++CREATION_SYNC_SKEW_S = 120  # clock skew allowed on a deferred call's requested_at
+ 
+ 
+ def home_refusal(rep, payload, target):
+@@ -240,7 +241,8 @@ def home_refusal(rep, payload, target):
+     stops = _created_stops(rep, caller)
+     if stops is None:
+         at = payload.get("requested_at")
+-        if isinstance(at, (int, float)) and time.time() - at <= CREATION_SYNC_GRACE_S:
++        # A requested_at in the future (beyond clock skew) never defers: it would hold the watermark for good.
++        if isinstance(at, (int, float)) and -CREATION_SYNC_SKEW_S <= time.time() - at <= CREATION_SYNC_GRACE_S:
+             return None, True
+         return (f"consent_unproven: the created event of {caller} never reached this replica, so its "
+                 "approval stops cannot be checked"), False
+diff --git a/hermes_cli/kanban_operator_call.py b/hermes_cli/kanban_operator_call.py
+index f8905f946b..c7bc399650 100644
+--- a/hermes_cli/kanban_operator_call.py
++++ b/hermes_cli/kanban_operator_call.py
+@@ -536,19 +536,21 @@ def _is_home(conn: sqlite3.Connection, own: str, target: str) -> bool:
+     return bool(row and row[0] and row[0] == own and kcr.card_home(conn, target) is None)
+ 
+ 
+-def _caller_refusal(rep: sqlite3.Connection, board: str, event: dict, payload: dict) -> tuple[Optional[str], bool]:
+-    """``(refusal, retry)``: None when the caller is proven; ``retry`` when the Board could not be read."""
++def _caller_replica_refusal(rep: sqlite3.Connection, event: dict, payload: dict) -> Optional[str]:
++    """The caller checks that need only the replica (no Board read): None when they pass."""
+     caller = payload.get("caller") or {}
+     gw, task, run_uid = caller.get("gateway"), caller.get("task_id"), caller.get("run_uid")
+     at = payload.get("requested_at")
+     if not gw or not task or not run_uid or not isinstance(at, (int, float)):
+-        return "caller_unproven: the request names no caller gateway, card, run uid and time", False
++        return "caller_unproven: the request names no caller gateway, card, run uid and time"
++    if at > time.time() + SKEW_S:
++        return "caller_unproven: the request time is in the future"
+     if event["task_id"] != task:
+-        return "caller_unproven: the request event is not on the caller's card", False
++        return "caller_unproven: the request event is not on the caller's card"
+     run = rep.execute("SELECT started_at, ended_at FROM task_runs WHERE task_id = ? AND uid = ?",
+                       (task, run_uid)).fetchone()
+     if run is None or not run[0] or int(run[0]) > at + SKEW_S or (run[1] and int(run[1]) < at - SKEW_S):
+-        return f"caller_unproven: run {run_uid} of {task} was not live when the call was made", False
++        return f"caller_unproven: run {run_uid} of {task} was not live when the call was made"
+     claimed = False
+     for (raw,) in rep.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'claimed'", (task,)):
+         try:
+@@ -559,9 +561,18 @@ def _caller_refusal(rep: sqlite3.Connection, board: str, event: dict, payload: d
+             claimed = True
+             break
+     if not claimed:
+-        return f"caller_unproven: the Board never leased run {run_uid} of {task} to {gw}", False
++        return f"caller_unproven: the Board never leased run {run_uid} of {task} to {gw}"
+     if not event.get("uid"):
+-        return "caller_unproven: the request event has no Board uid", False
++        return "caller_unproven: the request event has no Board uid"
++    return None
++
++
++def _caller_refusal(rep: sqlite3.Connection, board: str, event: dict, payload: dict) -> tuple[Optional[str], bool]:
++    """``(refusal, retry)``: None when the caller is proven; ``retry`` when the Board could not be read."""
++    refusal = _caller_replica_refusal(rep, event, payload)
++    if refusal is not None:
++        return refusal, False
++    gw, task, at = payload["caller"]["gateway"], payload["caller"]["task_id"], payload["requested_at"]
+     try:
+         ev = _evidence(board, event["uid"])
+     except Exception as exc:  # health: allow BLE001 -- unreachable Board: retry next tick
+@@ -699,6 +710,37 @@ def _scan_start(conn: sqlite3.Connection, board: str, rep: sqlite3.Connection) -
+     return 0
+ 
+ 
++def _incoming(conn: sqlite3.Connection, own: str, raw: Optional[str]) -> Optional[dict]:
++    """The request payload when this gateway executes it and has not yet; None otherwise."""
++    from hermes_cli import kanban_operator_labels as kol
++    try:
++        payload = json.loads(raw or "{}")
++    except ValueError:
++        return None
++    uid, target = payload.get("request_uid"), payload.get("target_task_id")
++    if payload.get("action") == LABEL_PUBLISH:
++        # A machine has no home card: the call names its executor, and only that gateway takes it.
++        if not uid or own != kol.HOME or payload.get("home") != own:
++            return None
++    elif not uid or not target or not _is_home(conn, own, target):
++        return None
++    if conn.execute("SELECT 1 FROM operator_calls WHERE request_uid = ? AND side = 'execute'", (uid,)).fetchone():
++        return None
++    return payload
++
++
++def _home_check(rep: sqlite3.Connection, event: dict, payload: dict, target) -> tuple[Optional[str], bool]:
++    """``home_refusal`` (unsynced created event: retry, then refuse), only for a caller the replica proves.
++
++    Replica-only caller checks run first: an unproven caller is refused, never deferred, so a forged call (one
++    with a future requested_at too) cannot pin the watermark and page the whole request tail every tick.
++    """
++    if _caller_replica_refusal(rep, event, payload) is not None:
++        return None, False  # _caller_refusal refuses it
++    from hermes_cli.kanban_consent import home_refusal
++    return home_refusal(rep, payload, target)
++
++
+ def apply_incoming(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+     """Home side, each dispatcher tick: execute calls naming this gateway's own cards. Returns (uid, outcome)."""
+     from hermes_cli import kanban_db as kb
+@@ -718,7 +760,6 @@ def apply_incoming(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+             with kb.write_txn(conn):
+                 ensure_schema(conn)
+         last = _scan_start(conn, board, rep)
+-        from hermes_cli.kanban_consent import home_refusal
+         handled = 0
+         hold = None  # below the first call deferred for creation sync lag
+         cursor, stop = last, False
+@@ -728,25 +769,16 @@ def apply_incoming(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+             full = len(rows) >= SCAN_BATCH
+             hi = rows[-1][0] if full else rep.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0]
+             for eid, euid, etask, raw in rows:
+-                try:
+-                    payload = json.loads(raw or "{}")
+-                except ValueError:
++                payload = _incoming(conn, own, raw)
++                if payload is None:
+                     continue
+-                uid, target = payload.get("request_uid"), payload.get("target_task_id")
++                uid, target = payload["request_uid"], payload.get("target_task_id")
+                 labels = payload.get("action") == LABEL_PUBLISH
+-                if labels:
+-                    # A machine has no home card: the call names its executor, and only that gateway takes it.
+-                    if not uid or own != kol.HOME or payload.get("home") != own:
+-                        continue
+-                elif not uid or not target or not _is_home(conn, own, target):
+-                    continue
+-                if conn.execute("SELECT 1 FROM operator_calls WHERE request_uid = ? AND side = 'execute'",
+-                                (uid,)).fetchone():
+-                    continue
+                 if handled >= MAX_PER_TICK:
+                     hi, stop = eid - 1, True
+                     break
+-                home = home_refusal(rep, payload, target)  # unsynced created event: retry, then refuse
++                event = {"id": eid, "uid": euid, "task_id": etask}
++                home = _home_check(rep, event, payload, target)
+                 if home[1]:
+                     # Only this caller lags: keep the watermark below it (retried next tick) and go on with the
+                     # rest. A deferral takes no tick slot and no Board read; calls handled meanwhile are logged,
+@@ -754,7 +786,6 @@ def apply_incoming(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+                     hold = eid - 1 if hold is None else min(hold, eid - 1)
+                     continue
+                 handled += 1
+-                event = {"id": eid, "uid": euid, "task_id": etask}
+                 refusal, retry = _caller_refusal(rep, board, event, payload)
+                 if retry:  # unreachable Board: every later call would retry too
+                     hi, stop = eid - 1, True
+diff --git a/hermes_cli/kanban_operator_delivery.py b/hermes_cli/kanban_operator_delivery.py
+index 6b11095a3a..bf45027ce9 100644
+--- a/hermes_cli/kanban_operator_delivery.py
++++ b/hermes_cli/kanban_operator_delivery.py
+@@ -15,20 +15,22 @@ _CLAIM = frozenset({"posted", "sent", "delivered", "commented", "relayed"})
+ # claim, so it still needs the exact receipt (fail closed).
+ _NOT_CLAIM = frozenset({"not", "never", "no", "nothing", "none", "neither", "nor", "without", "queued", "pending",
+                         "failed", "refused", "rejected", "unable", "will", "would", "could", "should", "may",
+-                        "might", "if", "once", "until", "awaiting", "waiting", "yet"})
++                        "might", "if", "once", "until", "awaiting", "waiting", "yet", "be", "being"})
+ _GOVERN_WINDOW = 3  # words before the verb: "has not yet been posted", "will later be sent"
+-# A comma, ':', a dash (a standalone spaced '-' too, never an intra-word hyphen), '(' or a conjunction ends the
+-# governing span: "filed no card, so I posted ..." and "No longer pending - posted to ..." are claims.
+-_BOUNDARY = frozenset({",", ":", "—", "–", "-", "(", "so", "and", "but", "then", "after", "before", "because", "which",
+-                       "while", "that"})
+-_WORD = re.compile(r"[\w’']+|[,:—–(]|(?<!\S)-(?!\S)")
++# A comma, ':', a dash (a standalone spaced '-' or '--' too, never an intra-word hyphen; U+2212 minus), '(' or a
++# conjunction ends the governing span: "filed no card, so I posted ..." and "No longer pending - posted to ..." are
++# claims.
++_BOUNDARY = frozenset({",", ":", "—", "–", "−", "-", "--", "(", "so", "and", "but", "then", "after", "before",
++                       "because", "which", "while", "that"})
++_WORD = re.compile(r"[\w’']+|[,:—–−(]|(?<!\S)--?(?!\S)")
+ _TASK_ID = re.compile(r"\bt_[0-9a-f]{8}(?:[0-9a-f]{8})?\b")
+ 
+ 
+ def _governed(words, i):
+-    if i and words[i - 1] == "be":
+-        # "to be posted", "will be sent": an infinitive/future form is never a past claim, whatever boundary
+-        # cuts it from its queue word ("Queued: to be posted to ...").
++    if i and words[i - 1] in ("be", "being"):
++        # "to be posted", "will be sent", "is being posted": an infinitive, future or progressive form is never a
++        # past claim, whatever boundary cuts it from its queue word ("Queued: to be posted to ..."). Known
++        # fail-open: the rare past-tense infinitive "it turned out to be posted twice to t_X" is not a claim.
+         return True
+     for w in reversed(words[max(0, i - _GOVERN_WINDOW):i]):
+         if w in _BOUNDARY:
+diff --git a/tests/hermes_cli/test_kanban_consent_provenance.py b/tests/hermes_cli/test_kanban_consent_provenance.py
+index ebf1d2ce65..38cb236330 100644
+--- a/tests/hermes_cli/test_kanban_consent_provenance.py
++++ b/tests/hermes_cli/test_kanban_consent_provenance.py
+@@ -377,6 +377,48 @@ def test_caller_refusal_wins_over_a_deferral_refusal(fleet, monkeypatch, tmp_pat
+     assert "consent_unproven" not in request["result"][0]["detail"]
+ 
+ 
++@pytest.mark.parametrize("ahead", [0, 3600])
++def test_unproven_caller_is_refused_not_deferred(fleet, monkeypatch, ahead):
++    """A forged call whose caller is unproven and whose created event is missing is refused at once (a future
++    requested_at too): it must never be deferred (that would pin the watermark and page the tail every tick)."""
++    import time
++
++    from hermes_cli import kanban_operator_call as kox
++    f = fleet
++    other = f.card(f.h, "unrelated hub card")
++    ghost = "t_" + "9" * 16  # no created event anywhere: home_refusal alone would defer it
++    with kb.write_txn(f.h):
++        kb._append_event(f.h, other, kox.REQUEST_KIND, {
++            "request_uid": "future-forged", "board": "default", "action": "comment", "target_task_id": other,
++            "args": {"text": "spoofed"}, "caller": {"gateway": "worker-5", "task_id": ghost, "run_id": 1,
++                                                     "run_uid": "x"}, "requested_at": int(time.time()) + ahead})
++    f.board()
++    kox.apply_incoming(f.h)
++    row = next((r for r in helpers._log(f.h, "execute") if r["request_uid"] == "future-forged"), None)
++    assert row is not None, "the unproven call was deferred instead of refused"
++    assert row["outcome"] == "refused" and "caller_unproven" in row["detail"], row
++    assert not f.h.execute("SELECT 1 FROM task_comments WHERE task_id = ?", (other,)).fetchone()
++
++
++def test_future_requested_at_never_defers_a_home_refusal():
++    """home_refusal defers only within the grace window: a future time beyond skew is refused, not deferred."""
++    import sqlite3
++    import time
++
++    from hermes_cli import kanban_consent as consent
++    rep = sqlite3.connect(":memory:")
++    rep.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT, uid TEXT)")
++    payload = {"action": "comment", "caller": {"task_id": "t_" + "9" * 16}}
++    now = time.time()
++    assert consent.home_refusal(rep, {**payload, "requested_at": now}, "t_x")[1] is True
++    refusal, defer = consent.home_refusal(rep, {**payload, "requested_at": now + 3600}, "t_x")
++    assert defer is False and "consent_unproven" in refusal
++    from hermes_cli import kanban_operator_call as kox
++    caller = {"gateway": "worker-5", "task_id": "t_" + "9" * 16, "run_uid": "x"}
++    assert "in the future" in kox._caller_replica_refusal(
++        rep, {"task_id": caller["task_id"]}, {"caller": caller, "requested_at": now + 3600})
++
++
+ def test_without_a_deferral_one_tick_reads_one_batch(fleet, monkeypatch):
+     """Paging past a full batch is only for a held watermark; otherwise the next tick resumes after it."""
+     from hermes_cli import kanban_operator_call as kox
+diff --git a/tests/hermes_cli/test_kanban_operator_delivery.py b/tests/hermes_cli/test_kanban_operator_delivery.py
+index 0f478bc1c6..f65b8be26d 100644
+--- a/tests/hermes_cli/test_kanban_operator_delivery.py
++++ b/tests/hermes_cli/test_kanban_operator_delivery.py
+@@ -294,6 +294,14 @@ def test_negation_outside_the_claim_verb_still_needs_a_receipt(fleet, summary):
+     ("Done (to be delivered to t_0123456789abcdef).", False),
+     ("Has been posted to t_0123456789abcdef.", True),
+     ("Posted to t_0123456789abcdef as it should be.", True),
++    # A spaced ASCII double hyphen and U+2212 are dashes as well.
++    ("Not done -- posted to t_0123456789abcdef.", True),
++    ("Not done − posted to t_0123456789abcdef.", True),
++    ("Comment to t_0123456789abcdef -- not posted.", False),
++    # "be"/"being" govern from inside the window too: adverbs and the progressive are not claims.
++    ("Queued: to be later posted to t_0123456789abcdef.", False),
++    ("Queued: to be eventually sent to t_0123456789abcdef.", False),
++    ("The note to t_0123456789abcdef is being posted.", False),
+ ])
+ def test_claimed_targets_scopes_negation_to_the_verb(text, claimed):
+     from hermes_cli.kanban_operator_delivery import claimed_targets
+-- 
+2.51.0
+

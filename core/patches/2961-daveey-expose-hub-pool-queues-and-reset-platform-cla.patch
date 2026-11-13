@@ -1,0 +1,203 @@
+From c5a09674bf6f313f1e9c3cf0daccd7be719b4230 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:16:51 +0000
+Subject: [PATCH] [daveey] expose hub pool queues and reset platform claim
+ receipts
+
+---
+ hermes_cli/kanban_admission.py                |  1 +
+ hermes_cli/kanban_admission_pools.py          | 16 ++++
+ hermes_cli/kanban_queue_position.py           | 21 +++--
+ tests/hermes_cli/test_kanban_hub_admission.py | 82 +++++++++++++++++++
+ 4 files changed, 115 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index 12cfcace34..242bd99c3b 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -306,6 +306,7 @@ def claim_transaction(conn, *, task_id=None, gate=None):
+ 
+     if conn.in_transaction:
+         raise RuntimeError("Kanban claim cannot run inside an existing transaction")
++    _decision.pool = "regular"
+     if not SUPPORTED:
+         with write_txn(conn):
+             if disk_admission_refused(task_id):
+diff --git a/hermes_cli/kanban_admission_pools.py b/hermes_cli/kanban_admission_pools.py
+index 63473fb5a1..95fda3951d 100644
+--- a/hermes_cli/kanban_admission_pools.py
++++ b/hermes_cli/kanban_admission_pools.py
+@@ -102,6 +102,22 @@ def host_remaining(regular_cap, running_count, board):
+     return remaining
+ 
+ 
++def queue_fields(regular_cap, admission_class):
++    """Advisory whole-host census; unknown counts are never rendered as free slots."""
++    from hermes_cli import machine_cpu_metrics as cpu, machine_metrics
++
++    if cpu.root_limit()[0] != cpu.ON:
++        return {}
++    slots, _ceiling = root_settings()
++    if not slots:
++        return {}
++    detail = {"pools": {"regular": 0, "priority": 0}}
++    active = machine_metrics.active_card_runs(detail=detail)
++    counts = detail["pools"] if active is not None else {"regular": None, "priority": None}
++    return {"admission_class": admission_class,
++            "admission_pools": {**counts, "regular_cap": regular_cap, "priority_cap": slots}}
++
++
+ def advisory_limit(conn, task_id, regular_limit):
+     """Advisory may admit a marked candidate to final arbitration, never grant a slot."""
+     slots, ceiling = root_settings()
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index 2edc5b3284..33a9ccf9f6 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -23,13 +23,14 @@ def _ahead(conn: sqlite3.Connection, task) -> int:
+     """Unclaimed ready cards of the same assignee the dispatcher reaches first, in its own lane order
+     (``DISPATCH_ORDER``: effective priority, then cards others wait on, then age). Worker-first cards wait for the
+     pool, not a local slot, so they are not ahead."""
+-    from hermes_cli.kanban_db_dispatch_queries import DISPATCH_ORDER
++    from hermes_cli.kanban_admission_pools import lane_rows
+     from hermes_cli.kanban_worker_placement import POLICY
+-    ids = [r[0] for r in conn.execute(
++    eligible = {r[0] for r in conn.execute(
+         "SELECT id FROM tasks WHERE status = 'ready' AND claim_lock IS NULL AND assignee IS ? "
+-        f"AND (placement_policy IS NOT ? OR id = ?) ORDER BY {DISPATCH_ORDER}",
++        "AND (placement_policy IS NOT ? OR id = ?)",
+         (task.assignee, POLICY, task.id),
+-    ).fetchall()]
++    ).fetchall()}
++    ids = [r[0] for r in lane_rows(conn, "ready") if r[0] in eligible]
+     return ids.index(task.id) if task.id in ids else len(ids)
+ 
+ 
+@@ -189,13 +190,15 @@ def _position(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Op
+     from hermes_cli import kanban_host_counts as khc
+     running, limit = _running_and_limit(conn, board)
+     from hermes_cli import kanban_board_share as share
++    from hermes_cli.kanban_admission_pools import queue_fields
+     try:
+         elsewhere = share.ahead_elsewhere(conn, task.id)
+     except Exception:  # health: allow BLE001 -- other boards are advisory; an unreadable count is unknown
+         _log.debug("kanban queue position: other boards unavailable", exc_info=True)
+         elsewhere = None
+     place = {"lane": "local", "ahead": _ahead(conn, task), "running": running, "limit": limit, "approximate": True,
+-             "board": khc.board_of(conn) or board, "observed_at": int(time.time())}
++             "board": khc.board_of(conn) or board, "observed_at": int(time.time()),
++             **queue_fields(limit, getattr(task, "admission_class", "normal"))}
+     if elsewhere:  # only when other boards' cards rank ahead: the single-board payload keeps its shape
+         place["ahead_other_boards"] = elsewhere
+     from hermes_cli import kanban_dispatch_skip as skips
+@@ -325,6 +328,14 @@ def local_words(place: dict[str, Any]) -> str:
+     ahead = place.get("ahead")
+     words = (ahead_words(place, "waiting for a local slot: ~{n} ahead") if ahead is not None
+              else "waiting for a local slot")
++    pools = place.get("admission_pools")
++    if pools is not None:
++        census = ", ".join(f"{name} {pools[name] if pools[name] is not None else '?'}/"
++                           f"{pools[name + '_cap'] if pools[name + '_cap'] is not None else '?'}"
++                           for name in ("regular", "priority"))
++        return (f"{words}, {census}; class {place['admission_class']}. "
++                "Queued, not stuck: check class/placement and available capacity; priority slots are marked-only. "
++                "Do not run its work outside the dispatcher")
+     if place.get("running") is not None and place.get("limit") is not None:
+         words += f", {place['running']}/{place['limit']} running"
+     elif place.get("limit") is not None and "running" in place:
+diff --git a/tests/hermes_cli/test_kanban_hub_admission.py b/tests/hermes_cli/test_kanban_hub_admission.py
+index de5a952868..169eae0dd3 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission.py
++++ b/tests/hermes_cli/test_kanban_hub_admission.py
+@@ -126,6 +126,88 @@ def test_claim_persists_immutable_regular_receipt(board):
+                               (task_id,)).fetchone()) == ("regular", "capacity")
+ 
+ 
++def test_queue_note_reports_pools_and_marked_lane_order(board, monkeypatch):
++    from hermes_cli import kanban_queue_position as qp
++    conn, home = board
++    configure(home, limit=None)
++    assert kb.claim_task(conn, task(conn, title="regular running"))
++    configure(home, cap=7)
++    with (home / "config.yaml").open("a") as config:
++        config.write("    priority_slots: 3\n")
++    advisory(home)
++    monkeypatch.setattr(cm, "sample", fake_sample(10))
++    active = task(conn, title="marked running")
++    kb.edit_task(conn, active, admission_class="urgent")
++    assert kb.claim_task(conn, active)
++    ordinary = task(conn, title="ordinary waiting")
++    kb.edit_task(conn, ordinary, priority=1000)
++    marked = task(conn, title="marked waiting")
++    kb.edit_task(conn, marked, admission_class="capacity", admission_frees="frees: runner slots")
++    monkeypatch.setattr(qp, "_running_and_limit", lambda *a: (2, 7))
++    place = qp.read(conn, kb.get_task(conn, marked))
++    assert place["ahead"] == 0
++    assert place["admission_pools"] == {"regular": 1, "priority": 1, "regular_cap": 7, "priority_cap": 3}
++    note = qp.describe(place)
++    assert "regular 1/7, priority 1/3" in note
++    assert "class capacity" in note
++    assert "bump" not in note
++    assert qp.read(conn, kb.get_task(conn, ordinary))["ahead"] == 1
++
++
++@pytest.mark.parametrize("enabled,slots", [(False, 3), (True, 0)])
++def test_queue_pool_details_do_not_change_legacy_workers(board, monkeypatch, enabled, slots):
++    from hermes_cli import kanban_queue_position as qp
++    conn, home = board
++    configure(home, cap=7, limit=50 if enabled else None)
++    if enabled:
++        with (home / "config.yaml").open("a") as config:
++            config.write(f"    priority_slots: {slots}\n")
++    else:
++        with (home / "config.yaml").open("a") as config:
++            config.write(f"  admission:\n    priority_slots: {slots}\n")
++    ordinary = task(conn)
++    kb.edit_task(conn, ordinary, priority=1000)
++    marked = task(conn)
++    kb.edit_task(conn, marked, admission_class="urgent")
++    monkeypatch.setattr(qp, "_running_and_limit", lambda *a: (0, 7))
++    place = qp.read(conn, kb.get_task(conn, marked))
++    assert place["ahead"] == 1
++    assert "admission_pools" not in place
++
++
++def test_queue_unknown_pool_census_does_not_look_empty(board, monkeypatch):
++    from hermes_cli import kanban_queue_position as qp
++    conn, home = board
++    configure(home, cap=7)
++    with (home / "config.yaml").open("a") as config:
++        config.write("    priority_slots: 3\n")
++    monkeypatch.setattr(qp, "_running_and_limit", lambda *a: (None, 7))
++    monkeypatch.setattr(mm, "active_card_runs", lambda **kw: None)
++    place = qp.read(conn, kb.get_task(conn, task(conn)))
++    assert place["admission_pools"]["regular"] is None
++    assert place["admission_pools"]["priority"] is None
++    assert "regular ?/7, priority ?/3" in qp.describe(place)
++
++
++def test_unsupported_fence_resets_prior_priority_receipt(board, monkeypatch):
++    conn, home = board
++    configure(home, cap=7)
++    with (home / "config.yaml").open("a") as config:
++        config.write("    priority_slots: 3\n")
++    advisory(home)
++    monkeypatch.setattr(cm, "sample", fake_sample(10))
++    marked = task(conn)
++    kb.edit_task(conn, marked, admission_class="urgent")
++    assert kb.claim_task(conn, marked)
++    assert conn.execute("SELECT admission_pool FROM task_runs WHERE task_id=?", (marked,)).fetchone()[0] == "priority"
++    # A later unsupported-platform claim must not inherit thread-local evidence.
++    configure(home, limit=None)
++    monkeypatch.setattr(af, "SUPPORTED", False)
++    ordinary = task(conn)
++    assert kb.claim_task(conn, ordinary)
++    assert conn.execute("SELECT admission_pool FROM task_runs WHERE task_id=?", (ordinary,)).fetchone()[0] == "regular"
++
++
+ def test_claim_captures_created_origin_not_mutable_shepherd(board):
+     conn, home = board
+     configure(home, limit=None)
+-- 
+2.51.0
+

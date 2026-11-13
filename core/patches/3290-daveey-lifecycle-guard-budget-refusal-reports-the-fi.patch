@@ -1,0 +1,258 @@
+From 3f9ea6550936e0c2b90110ec9a516ff080343d63 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:19:33 +0000
+Subject: [PATCH] [daveey] lifecycle guard: budget refusal reports the file's
+ own line count
+
+The line-cap refusal reported the budget's charged count (newlines + 1), so a
+newline-terminated file read one more than `wc -l` (a 17001-line runner said
+17002), and a cron script with no prompt read two more because of the
+leading join newline (a 6-line job.sh said 8).
+
+Report the text's own lines instead (count of '\n', +1 only when the text
+does not end in '\n'), minus the join newline cron adds for an empty prompt.
+When the own count alone would fit, the charged count is named too
+("has 3 lines (4 counted), over the 3-line scan cap"). Verdicts are
+unchanged: the budget still charges exactly what it charged before.
+
+Follow-up to PR #1979 review (t_01a1d3eef15b82eb).
+---
+ cron/lifecycle_guard.py                       | 42 ++++++++++----
+ .../test_lifecycle_guard_budget_refusal.py    | 58 +++++++++++++++++--
+ 2 files changed, 85 insertions(+), 15 deletions(-)
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index dc4a48311e..02b1edaa75 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -484,9 +484,10 @@ class _LifecycleScanBudget:
+         "paths_remaining",
+         "refusal",
+         "remote_reads_remaining",
++        "separator_lines",
+     )
+ 
+-    def __init__(self) -> None:
++    def __init__(self, *, separator_lines: int = 0) -> None:
+         # Read the module constants at construction so tests/operators can lower them at runtime.
+         self.bytes_remaining = _MAX_LIFECYCLE_SCAN_BYTES
+         self.lines_remaining = _MAX_LIFECYCLE_SCAN_LINES
+@@ -496,6 +497,9 @@ class _LifecycleScanBudget:
+         # Message-only: which limit the last refused ``charge_text`` hit, e.g. "has 17340 lines,
+         # over the 16384-line scan cap". Never consulted for a verdict.
+         self.overrun: Optional[str] = None
++        # Message-only: newlines a caller added when joining the root text (cron's empty-prompt
++        # join). Charged like any line, never reported as the text's own; spent on the first charge.
++        self.separator_lines = separator_lines
+ 
+     def charge_text(self, text: str) -> bool:
+         """Charge *text* before tokenization; False when it does not fit (``overrun`` says why)."""
+@@ -507,9 +511,15 @@ class _LifecycleScanBudget:
+         if encoded > self.bytes_remaining:
+             self.overrun = _overrun("is", encoded, "byte", self.bytes_remaining, _MAX_LIFECYCLE_SCAN_BYTES)
+             return False
++        separators, self.separator_lines = self.separator_lines, 0
+         lines = text.count("\n") + 1
+         if lines > self.lines_remaining:
+-            self.overrun = _overrun("has", lines, "line", self.lines_remaining, _MAX_LIFECYCLE_SCAN_LINES)
++            # Report the text's own lines (`wc -l` for a newline-terminated file), not the charged
++            # count, which adds one for the last line and one per join separator.
++            own = text.count("\n") - separators + (0 if text.endswith("\n") else 1)
++            self.overrun = _overrun(
++                "has", own, "line", self.lines_remaining, _MAX_LIFECYCLE_SCAN_LINES, charged=lines,
++            )
+             return False
+         # One huge token is the quadratic shlex case; bound the longest physical line (chars, a
+         # lower bound on bytes — tight enough for a DoS bound without a per-line encode).
+@@ -576,12 +586,18 @@ def _format_size(size: int) -> str:
+     return f"{size} bytes"
+ 
+ 
+-def _overrun(verb: str, amount: int, unit: str, remaining: int, cap: int) -> str:
++def _overrun(
++    verb: str, amount: int, unit: str, remaining: int, cap: int, *, charged: Optional[int] = None,
++) -> str:
+     """``has 17340 lines, over the 16384-line scan cap``, or ``over the N lines left of`` that cap
+-    when the text alone would fit but earlier text in the same walk already spent part of it."""
+-    if amount > cap:
+-        return f"{verb} {amount} {unit}s, over the {cap}-{unit} scan cap"
+-    return f"{verb} {amount} {unit}s, over the {remaining} {unit}s left of the {cap}-{unit} scan cap"
++    when the text alone would fit but earlier text in the same walk already spent part of it.
++    *charged* is the budget's own count when it differs from *amount*; it is named only when
++    *amount* alone does not exceed what was left."""
++    charged = amount if charged is None else charged
++    counted = f" ({charged} counted)" if amount <= remaining else ""
++    if charged > cap:
++        return f"{verb} {amount} {unit}s{counted}, over the {cap}-{unit} scan cap"
++    return f"{verb} {amount} {unit}s{counted}, over the {remaining} {unit}s left of the {cap}-{unit} scan cap"
+ 
+ 
+ def _budget_exhausted(
+@@ -1244,11 +1260,13 @@ def scan_gateway_lifecycle(
+     command: str, *, cwd: Optional[str] = None,
+     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+     source: Optional[str] = None,
++    separator_lines: int = 0,
+ ) -> tuple[bool, Optional[str]]:
+     """``(unsafe, refusal)``: *refusal* names a non-lifecycle reason the walk failed closed (budget,
+     size, device, live SQLite, cloud) so callers can tell the model; ``None`` when the verdict is a
+     real lifecycle command or the command is allowed. *source* names the root text in a budget
+-    refusal (default "the command").
++    refusal (default "the command"); *separator_lines* counts newlines the caller added to join it,
++    left out of a refusal's reported line count (the budget still charges them).
+ 
+     Total by construction: never raises. Direct scans are pure string ops; the referenced-script
+     walk (filesystem, remote backends, shlex on decoded bytes) is best-effort defense-in-depth — an
+@@ -1259,7 +1277,7 @@ def scan_gateway_lifecycle(
+     every terminal command until the gateway restarts (#77780, #78256), which is strictly worse than either
+     verdict.
+     """
+-    budget = _LifecycleScanBudget()
++    budget = _LifecycleScanBudget(separator_lines=separator_lines)
+     try:
+         unsafe = _contains_unsafe_gateway_action(
+             command, cwd=cwd, depth=0, visited=set(), budget=budget,
+@@ -1298,6 +1316,8 @@ def check_gateway_lifecycle(prompt: Optional[str], script: Optional[str] = None)
+     python_script = False
+     refusal: Optional[str] = None
+     source: Optional[str] = None
++    # An empty prompt still gets the join newline below: charged, but not a line of the script.
++    separator_lines = 0
+     if script:
+         source = f"the job prompt plus `{script}`" if prompt else f"`{script}`"
+         resolved_script = _resolve_script_path(script)
+@@ -1319,6 +1339,7 @@ def check_gateway_lifecycle(prompt: Optional[str], script: Optional[str] = None)
+         python_script = resolved_script is not None and resolved_script.suffix == ".py"
+         script_text, refusal = _read_script_for_scanning(script)
+         if script_text:
++            separator_lines = 0 if combined else 1
+             combined = f"{combined}\n{script_text}"
+ 
+     if refusal:
+@@ -1330,7 +1351,7 @@ def check_gateway_lifecycle(prompt: Optional[str], script: Optional[str] = None)
+         # The data-exemption masker tokenizes with shlex, so it is charged against the walk budget.
+         # The direct command regex below still scans the full text, so a literal `hermes gateway restart`
+         # embedded in a .py script is still blocked. See #77131, #78398.
+-        budget = _LifecycleScanBudget()
++        budget = _LifecycleScanBudget(separator_lines=separator_lines)
+         if not budget.charge_text(combined):
+             unsafe = _budget_exhausted(budget, "text", 0, source=source)
+             refusal = budget.refusal
+@@ -1339,6 +1360,7 @@ def check_gateway_lifecycle(prompt: Optional[str], script: Optional[str] = None)
+     else:
+         unsafe, refusal = scan_gateway_lifecycle(
+             combined, cwd=_resolve_script_directory(script) if script else None, source=source,
++            separator_lines=separator_lines,
+         )
+     if unsafe and refusal:
+         raise GatewayLifecycleBlocked(
+diff --git a/tests/cron/test_lifecycle_guard_budget_refusal.py b/tests/cron/test_lifecycle_guard_budget_refusal.py
+index cf25ab1006..07986af489 100644
+--- a/tests/cron/test_lifecycle_guard_budget_refusal.py
++++ b/tests/cron/test_lifecycle_guard_budget_refusal.py
+@@ -10,6 +10,7 @@ from __future__ import annotations
+ 
+ import json
+ import shlex
++import subprocess
+ from pathlib import Path
+ from types import SimpleNamespace
+ 
+@@ -25,6 +26,10 @@ def _executable(path: Path, text: str) -> Path:
+     return path
+ 
+ 
++def _wc_l(path: Path) -> int:
++    return int(subprocess.run(["wc", "-l", str(path)], capture_output=True, text=True, check=True).stdout.split()[0])
++
++
+ def test_line_cap_refusal_names_script_and_cap(tmp_path):
+     script = _executable(tmp_path / "hermes-sync", "#!/bin/sh\n" + "echo ok\n" * 17000)
+ 
+@@ -33,20 +38,44 @@ def test_line_cap_refusal_names_script_and_cap(tmp_path):
+     assert unsafe is True
+     assert refusal is not None
+     assert str(script) in refusal
+-    assert "17002 lines, over the 16384-line scan cap (text at depth 1)" in refusal
++    assert _wc_l(script) == 17001
++    assert "has 17001 lines, over the 16384-line scan cap (text at depth 1)" in refusal
++
++
++def test_line_count_without_trailing_newline_counts_the_last_line(monkeypatch, tmp_path):
++    monkeypatch.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_LINES", 4)
++    script = _executable(tmp_path / "s.sh", "echo ok\n" * 5 + "echo last")  # wc -l says 5
++
++    unsafe, refusal = scan_gateway_lifecycle(shlex.quote(str(script)))
++
++    assert unsafe is True
++    assert refusal is not None
++    assert f"`{script}` has 6 lines, over the 4-line scan cap" in refusal
++
++
++def test_line_count_at_the_cap_names_the_charged_count(monkeypatch):
++    """Verdict unchanged: the budget charges the empty line after a final newline, so text with
++    exactly the cap's own lines is still refused, and the message says why."""
++    monkeypatch.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_LINES", 3)
++
++    assert scan_gateway_lifecycle("one\ntwo\nthree\n") == (
++        True,
++        "the scan budget was exhausted: the command has 3 lines (4 counted), "
++        "over the 3-line scan cap (text at depth 0)",
++    )
+ 
+ 
+ def test_line_cap_refusal_names_remaining_budget(monkeypatch, tmp_path):
+     """A file under the cap that overruns what earlier text left says so."""
+     monkeypatch.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_LINES", 10)
+-    script = _executable(tmp_path / "s.sh", "echo ok\n" * 9)  # 10 lines
++    script = _executable(tmp_path / "s.sh", "echo ok\n" * 9)  # 9 lines, charged as 10
+ 
+     unsafe, refusal = scan_gateway_lifecycle(f"true\ntrue\n{shlex.quote(str(script))}")
+ 
+     assert unsafe is True
+     assert refusal is not None
+     assert str(script) in refusal
+-    assert "has 10 lines, over the 7 lines left of the 10-line scan cap" in refusal
++    assert "has 9 lines, over the 7 lines left of the 10-line scan cap" in refusal
+ 
+ 
+ def test_long_line_refusal_names_script_and_cap(monkeypatch, tmp_path):
+@@ -113,14 +142,33 @@ def test_cron_refusal_names_prompt_and_script(monkeypatch, tmp_path, suffix):
+     monkeypatch.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_LINES", 4)
+     script = tmp_path / f"job{suffix}"
+     script.write_text("x = 1\n" * 6, encoding="utf-8")
++    assert _wc_l(script) == 6
+ 
+     with pytest.raises(lifecycle_guard.GatewayLifecycleBlocked) as excinfo:
+         lifecycle_guard.check_gateway_lifecycle("run report", str(script))
+-    assert f"the job prompt plus `{script}` has 8 lines, over the 4-line scan cap" in str(excinfo.value)
++    assert f"the job prompt plus `{script}` has 7 lines, over the 4-line scan cap" in str(excinfo.value)
++
++    # No prompt: the join newline is charged but is not a line of the script.
++    for prompt in ("", None):
++        with pytest.raises(lifecycle_guard.GatewayLifecycleBlocked) as excinfo:
++            lifecycle_guard.check_gateway_lifecycle(prompt, str(script))
++        assert f": `{script}` has 6 lines, over the 4-line scan cap" in str(excinfo.value)
++
++
++@pytest.mark.parametrize("suffix", [".sh", ".py"])
++def test_cron_script_without_prompt_verdict_still_charges_the_join(monkeypatch, tmp_path, suffix):
++    """Verdict unchanged: a 6-line script with no prompt is charged 8 lines, so a 7-line cap
++    refuses it, and the message names its own 6 lines with the charged count."""
++    monkeypatch.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_LINES", 7)
++    script = tmp_path / f"job{suffix}"
++    script.write_text("x = 1\n" * 6, encoding="utf-8")
+ 
+     with pytest.raises(lifecycle_guard.GatewayLifecycleBlocked) as excinfo:
+         lifecycle_guard.check_gateway_lifecycle("", str(script))
+-    assert f": `{script}` has 8 lines, over the 4-line scan cap" in str(excinfo.value)
++    assert f": `{script}` has 6 lines (8 counted), over the 7-line scan cap" in str(excinfo.value)
++
++    monkeypatch.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_LINES", 8)
++    lifecycle_guard.check_gateway_lifecycle("", str(script))
+ 
+ 
+ def test_scan_budget_summary_formats_sizes_exactly():
+-- 
+2.51.0
+

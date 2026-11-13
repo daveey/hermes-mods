@@ -1,0 +1,1474 @@
+From e07187e4a3824dcbe3ceef3606f6b5d3e74ff596 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 00:31:29 -0800
+Subject: [PATCH] feat: delta responses for large reads over the Desktop's SSH
+ tunnel [daveey]
+
+Measured 2026-11-13 on the hub: six list/poll reads (sessions sidebar, projects tree, kanban board, sessions list,
+cron jobs, runners fleet) carry almost all the bytes the Desktop pulls through its tunnel: 2,052 KB a round, 286 KB
+gzipped. Fetched again 20 s later and encoded against the first copy they are 12 KB, for under 8 ms of CPU each.
+On a 60-175 KB/s link the polls filled the link.
+
+Nothing changes what a request returns: every request reaches the backend, the handler runs, and the client ends
+up with its exact bytes. Only the encoding on the wire changes, and only for a client that asks.
+
+Gateway (hermes_cli/web_delta_response.py, pure ASGI, inside the auth gates): a GET with
+`X-Hermes-Delta-Accept: zstd` whose answer is a 200 application/json body of 16 KB-8 MB with a Content-Length and
+no Content-Encoding is remembered by hash (64 MB LRU) and sent with `X-Hermes-Body-Hash`; when the
+`X-Hermes-Delta-Base` the client named is still remembered and the result is smaller, the body is a zstd frame that
+uses that base as its prefix (window sized to base + body, long-distance matching on: a 3.5 MB body with one
+changed field is 430 bytes, not the 36 KB of the default window).
+- Bodies are remembered per credential (hash of the session-token / Authorization / Cookie headers): a delta's
+  length says how much the answer shares with its base, so a base is only usable by the credential it was served
+  to. Requests with no credential (the public paths) share a namespace of their own. A credential that changes on
+  every request never gets a delta.
+- If encoding raises, or the body is not its declared length, the handler's response goes out as it was.
+- Other methods (HEAD included), statuses, streams, encoded or small bodies, and a Python without
+  compression.zstd pass through untouched.
+Known difference for an asking client: an eligible response is held until its body is complete, so a handler that
+fails after its start message now yields a clean 500 where it used to yield a truncated 200.
+
+Desktop (apps/desktop/electron/delta-reads.ts): fetchJson asks on every GET to an SSH-tunnelled backend and keeps
+the newest and the previous body per remote scope and path (48 MB / 96 reads, memory only). Per scope, so the
+refetch after a tunnel rebuild is a delta when the backend process still remembers the base; the previous body, so
+two reads in flight on the same base both decode. A delta is decoded against the base it names and its hash
+verified; base not held, bad frame, wrong hash, missing hash or non-200 drops the read's copies and fails the
+attempt with HERMES_DELTA_RETRY, which api-transport retries for a GET, now without a base. A torn-down tunnel is
+unbound, so a reused local port is not asked. A transcript page read keeps its own slim+gzip ask. An older backend
+ignores the headers.
+
+Tests: tests/hermes_cli/test_web_delta_response.py (whole body + hash; delta decodes to the exact current body and
+chains; unchanged body; unknown and evicted base; each ineligible response and HEAD untouched; writes; chunked
+body with a Content-Length; other headers incl. duplicate Set-Cookie survive; per-credential isolation; encoding
+failure; a no-smaller delta; one-field change at 0.5 and 3.5 MB; size bounds; no zstd; store bound; the middleware
+sits inside the auth gates of the dashboard app) and apps/desktop/electron/delta-reads.test.ts (ask rules; chain of
+deltas; a frame made by Python; tunnel rebuild and unbind; concurrent reads on one base; withRetry re-asking
+without a base; every failure drops the copy; forged hash; what is never kept; pass-through; store bounds; and
+fetchJson itself (json-fetch.ts) driven against a live server speaking the protocol: not asked until bound, whole
+body once, then deltas, and a damaged frame retried for the whole body inside the same call). Checked by hand over real HTTP with
+Desktop's Electron 44 as the client and a session-token credential: a 3.4 MB answer was 368 bytes on the wire,
+twice in a chain.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ apps/desktop/electron/api-transport.ts      |   5 +-
+ apps/desktop/electron/delta-reads.test.ts   | 448 ++++++++++++++++++++
+ apps/desktop/electron/delta-reads.ts        | 277 ++++++++++++
+ apps/desktop/electron/json-fetch.ts         |   8 +-
+ apps/desktop/electron/slow-link.ts          |   3 +
+ hermes_cli/web_delta_response.py            | 211 +++++++++
+ hermes_cli/web_server.py                    |   6 +
+ tests/hermes_cli/test_web_delta_response.py | 350 +++++++++++++++
+ 8 files changed, 1303 insertions(+), 5 deletions(-)
+ create mode 100644 apps/desktop/electron/delta-reads.test.ts
+ create mode 100644 apps/desktop/electron/delta-reads.ts
+ create mode 100644 hermes_cli/web_delta_response.py
+ create mode 100644 tests/hermes_cli/test_web_delta_response.py
+
+diff --git a/apps/desktop/electron/api-transport.ts b/apps/desktop/electron/api-transport.ts
+index 2404c0719a..02f47f12e8 100644
+--- a/apps/desktop/electron/api-transport.ts
++++ b/apps/desktop/electron/api-transport.ts
+@@ -210,7 +210,10 @@ const TRANSIENT_CODES = new Set([
+   'EAI_AGAIN',
+   'ENOTFOUND',
+   'EHOSTUNREACH',
+-  'ENETUNREACH'
++  'ENETUNREACH',
++  // [daveey] delta-reads.ts: a delta response that could not be decoded. The copy it needed is dropped, so the
++  // retry asks without a base and gets the whole body. Only GETs ask for deltas.
++  'HERMES_DELTA_RETRY'
+ ])
+ 
+ // Errors that prove the request never reached the server: the TCP connection
+diff --git a/apps/desktop/electron/delta-reads.test.ts b/apps/desktop/electron/delta-reads.test.ts
+new file mode 100644
+index 0000000000..0f25d04d8a
+--- /dev/null
++++ b/apps/desktop/electron/delta-reads.test.ts
+@@ -0,0 +1,448 @@
++import http from 'node:http'
++import type { AddressInfo } from 'node:net'
++import { gzipSync, zstdCompressSync } from 'node:zlib'
++
++import { afterAll, describe, expect, it } from 'vitest'
++
++import { destroyKeepaliveAgents, shouldRetryRequest, withRetry } from './api-transport'
++import {
++  bodyHash,
++  decodeDeltaBody,
++  DELTA_ACCEPT_HEADER,
++  DELTA_BASE_HEADER,
++  DELTA_RETRY_CODE,
++  DELTA_STORE_MAX_BYTES,
++  DELTA_STORE_MAX_ENTRIES,
++  DeltaBodyStore,
++  deltaBodyStore,
++  deltaRequestHeaders,
++  DeltaRetryError,
++  readEncodingHeaders
++} from './delta-reads'
++import { fetchJsonWith, type JsonFetchDeps } from './json-fetch'
++import { noteRemoteConnect, slowLinkTracker } from './slow-link'
++
++const HUB = 'http://127.0.0.1:49882'
++const SCOPE = 'conn:hermes-hub::default'
++const BOARD = `${HUB}/api/plugins/kanban/board?board=default`
++
++const cards = (count: number, done = -1) =>
++  Buffer.from(JSON.stringify({ cards: Array.from({ length: count }, (_, id) => ({ id, status: id === done ? 'done' : 'todo', title: `card ${id}` })) }))
++
++const whole = (body: Buffer, extra: Record<string, string> = {}) => ({
++  headers: { 'content-type': 'application/json', 'x-hermes-body-hash': bodyHash(body), ...extra },
++  statusCode: 200
++})
++
++const delta = (base: Buffer, next: Buffer, over: Record<string, string> = {}) => ({
++  body: zstdCompressSync(next, { dictionary: base }),
++  response: {
++    headers: {
++      'content-type': 'application/vnd.hermes.delta+zstd',
++      'x-hermes-body-hash': bodyHash(next),
++      'x-hermes-delta': 'zstd',
++      'x-hermes-delta-base': bodyHash(base),
++      ...over
++    },
++    statusCode: 200
++  }
++})
++
++function bound() {
++  const store = new DeltaBodyStore()
++
++  store.bindRemote(`${HUB}/`, SCOPE)
++
++  return store
++}
++
++describe('asking for a delta', () => {
++  it('asks only on a GET to a bound remote backend, and names the base once a copy is held', () => {
++    const store = bound()
++
++    expect(deltaRequestHeaders('GET', BOARD, store)).toEqual({ [DELTA_ACCEPT_HEADER]: 'zstd' })
++    expect(deltaRequestHeaders(undefined, BOARD, store)).toEqual({ [DELTA_ACCEPT_HEADER]: 'zstd' })
++    expect(deltaRequestHeaders('POST', BOARD, store)).toEqual({})
++    // A local backend, or a remote one that is not SSH-tunnelled, is never asked.
++    expect(deltaRequestHeaders('GET', 'http://127.0.0.1:9119/api/plugins/kanban/board', store)).toEqual({})
++    expect(deltaRequestHeaders('GET', 'not a url', store)).toEqual({})
++
++    const first = cards(40)
++
++    decodeDeltaBody(BOARD, whole(first), first, store)
++    expect(deltaRequestHeaders('GET', BOARD, store)).toEqual({ [DELTA_ACCEPT_HEADER]: 'zstd', [DELTA_BASE_HEADER]: bodyHash(first) })
++    // Another query is another read.
++    expect(deltaRequestHeaders('GET', `${HUB}/api/plugins/kanban/board?board=runners`, store)).toEqual({ [DELTA_ACCEPT_HEADER]: 'zstd' })
++  })
++
++  it('a transcript page read keeps its own slim+gzip ask and does not also ask for a delta', () => {
++    const store = bound()
++    const transcript = `${HUB}/api/sessions/20261112_185653_5ff5dc/messages?limit=120&order=latest`
++
++    expect(readEncodingHeaders('GET', transcript, store)).toMatchObject({ 'Accept-Encoding': 'gzip' })
++    expect(readEncodingHeaders('GET', transcript, store)).not.toHaveProperty(DELTA_ACCEPT_HEADER)
++    expect(readEncodingHeaders('GET', BOARD, store)).toEqual({ [DELTA_ACCEPT_HEADER]: 'zstd' })
++  })
++
++  it('a torn-down tunnel stops being asked: its port may be reused by a backend that is not this scope', () => {
++    const store = bound()
++    const body = cards(40)
++
++    decodeDeltaBody(BOARD, whole(body), body, store)
++    store.unbindScope(SCOPE)
++
++    expect(deltaRequestHeaders('GET', BOARD, store)).toEqual({})
++    // The copies wait for the rebuilt tunnel.
++    store.bindRemote('http://127.0.0.1:61511', SCOPE)
++    expect(deltaRequestHeaders('GET', 'http://127.0.0.1:61511/api/plugins/kanban/board?board=default', store)[DELTA_BASE_HEADER]).toBe(bodyHash(body))
++  })
++
++  it('dropping a pooled backend (slowLinkTracker.forgetScope) unbinds its tunnel in the shared store', () => {
++    const url = 'http://127.0.0.1:50888/api/cron/jobs'
++
++    noteRemoteConnect('http://127.0.0.1:50888', 'conn:hermes-hub::alpha', Date.now())
++    expect(deltaRequestHeaders('GET', url)).toEqual({ [DELTA_ACCEPT_HEADER]: 'zstd' })
++
++    slowLinkTracker.forgetScope('conn:hermes-hub::alpha')
++    expect(deltaRequestHeaders('GET', url)).toEqual({})
++  })
++
++  it('noteRemoteConnect binds a tunnel to its scope in the shared store', () => {
++    const url = 'http://127.0.0.1:50777/api/cron/jobs'
++
++    expect(deltaRequestHeaders('GET', url)).toEqual({})
++    noteRemoteConnect('http://127.0.0.1:50777', 'conn:mac-mini::default', Date.now())
++    expect(deltaRequestHeaders('GET', url)).toEqual({ [DELTA_ACCEPT_HEADER]: 'zstd' })
++    expect(deltaBodyStore.keyFor(url)).toBe('conn:mac-mini::default\u0000/api/cron/jobs')
++  })
++})
++
++describe('decoding', () => {
++  it('whole body, then a delta against it, then a delta against that: each returns the exact current body', () => {
++    const store = bound()
++    const v1 = cards(4000)
++    const v2 = cards(4001, 1234)
++    const v3 = cards(4001, 77)
++
++    expect(decodeDeltaBody(BOARD, whole(v1), v1, store)).toBe(v1.toString('utf8'))
++
++    const second = delta(v1, v2)
++
++    expect(second.body.length).toBeLessThan(v2.length / 100)
++    expect(decodeDeltaBody(BOARD, second.response, second.body, store)).toBe(v2.toString('utf8'))
++
++    const third = delta(v2, v3)
++
++    expect(decodeDeltaBody(BOARD, third.response, third.body, store)).toBe(v3.toString('utf8'))
++    expect(deltaRequestHeaders('GET', BOARD, store)[DELTA_BASE_HEADER]).toBe(bodyHash(v3))
++  })
++
++  it('decodes a frame made by the gateway side (Python compression.zstd, prefix dictionary)', () => {
++    const store = bound()
++    const base = cards(40)
++    const next = cards(41, 7)
++
++    // Produced by: zstd.compress(new, level=3, zstd_dict=zstd.ZstdDict(old, is_raw=True).as_prefix), Python 3.14.
++    const frame = Buffer.from('KLUv/WADBv0AAFh7ZG9uZTQwIn1dfQUAkoAY/AlfwBj4KUfbrIAL6go=', 'base64')
++
++    expect(bodyHash(base)).toBe('534e8f50b28c0e95528daf1f36a43a0c')
++    decodeDeltaBody(BOARD, whole(base), base, store)
++
++    const response = {
++      headers: {
++        'x-hermes-body-hash': '611f65f648a6b3b611140694997e4b95',
++        'x-hermes-delta': 'zstd',
++        'x-hermes-delta-base': '534e8f50b28c0e95528daf1f36a43a0c'
++      },
++      statusCode: 200
++    }
++
++    expect(decodeDeltaBody(BOARD, response, frame, store)).toBe(next.toString('utf8'))
++  })
++
++  it('survives a tunnel rebuild: the copy is per scope and path, not per local port', () => {
++    const store = bound()
++    const v1 = cards(400)
++    const v2 = cards(401)
++
++    decodeDeltaBody(BOARD, whole(v1), v1, store)
++    store.bindRemote('http://127.0.0.1:61511', SCOPE) // the rebuilt tunnel
++
++    const rebuilt = 'http://127.0.0.1:61511/api/plugins/kanban/board?board=default'
++
++    expect(deltaRequestHeaders('GET', rebuilt, store)[DELTA_BASE_HEADER]).toBe(bodyHash(v1))
++
++    const next = delta(v1, v2)
++
++    expect(decodeDeltaBody(rebuilt, next.response, next.body, store)).toBe(v2.toString('utf8'))
++  })
++
++  it.each([
++    ['the base is not held', (b: Buffer, n: Buffer) => delta(b, n), false],
++    ['it names another base', (b: Buffer, n: Buffer) => delta(b, n, { 'x-hermes-delta-base': 'f'.repeat(32) }), true],
++    ['the decoded body does not match its hash', (b: Buffer, n: Buffer) => delta(b, n, { 'x-hermes-body-hash': '0'.repeat(32) }), true],
++    ['the frame is corrupt', (b: Buffer, n: Buffer) => ({ ...delta(b, n), body: Buffer.from('not a zstd frame') }), true],
++    ['it was encoded against other bytes', (b: Buffer, n: Buffer) => ({ ...delta(b, n), body: zstdCompressSync(n, { dictionary: cards(9) }) }), true]
++  ])('fails for a retry and drops the copy when %s', (_name, make, seed) => {
++    const store = bound()
++    const base = cards(300)
++    const next = cards(301, 5)
++
++    if (seed) {
++      decodeDeltaBody(BOARD, whole(base), base, store)
++    }
++
++    const bad = make(base, next)
++    let thrown: unknown
++
++    try {
++      decodeDeltaBody(BOARD, bad.response, bad.body, store)
++    } catch (error) {
++      thrown = error
++    }
++
++    expect(thrown).toBeInstanceOf(DeltaRetryError)
++    expect((thrown as DeltaRetryError).code).toBe(DELTA_RETRY_CODE)
++    // The retry asks without a base, so the backend sends the whole body.
++    expect(deltaRequestHeaders('GET', BOARD, store)).toEqual({ [DELTA_ACCEPT_HEADER]: 'zstd' })
++    // api-transport retries it for a GET and never for a write.
++    expect(shouldRetryRequest(thrown, 'GET', { bodySent: true })).toBe(true)
++    expect(shouldRetryRequest(thrown, 'POST', { bodySent: true })).toBe(false)
++  })
++
++  it('two reads in flight on the same base: the second delta still decodes after the first replaced the copy', () => {
++    const store = bound()
++    const v0 = cards(3000)
++    const v1 = cards(3001, 10)
++    const v2 = cards(3001, 20)
++
++    decodeDeltaBody(BOARD, whole(v0), v0, store)
++
++    // Both requests were built while v0 was the copy, so both deltas name v0.
++    expect(deltaRequestHeaders('GET', BOARD, store)[DELTA_BASE_HEADER]).toBe(bodyHash(v0))
++
++    const first = delta(v0, v1)
++    const second = delta(v0, v2)
++
++    expect(decodeDeltaBody(BOARD, first.response, first.body, store)).toBe(v1.toString('utf8'))
++    expect(decodeDeltaBody(BOARD, second.response, second.body, store)).toBe(v2.toString('utf8'))
++    // The newest answer is the next base; the one before it is still held for a read already in flight.
++    expect(deltaRequestHeaders('GET', BOARD, store)[DELTA_BASE_HEADER]).toBe(bodyHash(v2))
++    expect(store.find(store.keyFor(BOARD)!, bodyHash(v1))).toBeDefined()
++    expect(store.find(store.keyFor(BOARD)!, bodyHash(v0))).toBeUndefined()
++  })
++
++  it('a failed delta is retried by the transport without a base, and the caller gets the whole body', async () => {
++    const store = bound()
++    const base = cards(300)
++    const current = cards(301, 5)
++
++    decodeDeltaBody(BOARD, whole(base), base, store)
++
++    const asked: Record<string, string>[] = []
++
++    // One attempt as fetchJson makes it: headers from the store, then the response through decodeDeltaBody.
++    const attempt = async () => {
++      const headers = deltaRequestHeaders('GET', BOARD, store)
++
++      asked.push(headers)
++
++      if (headers[DELTA_BASE_HEADER]) {
++        // The backend's frame is damaged in transit.
++        return decodeDeltaBody(BOARD, delta(base, current).response, Buffer.from('damaged'), store)
++      }
++
++      return decodeDeltaBody(BOARD, whole(current), current, store)
++    }
++
++    await expect(withRetry(attempt, { delayFn: async () => undefined, method: 'GET' })).resolves.toBe(current.toString('utf8'))
++    expect(asked).toEqual([{ [DELTA_ACCEPT_HEADER]: 'zstd', [DELTA_BASE_HEADER]: bodyHash(base) }, { [DELTA_ACCEPT_HEADER]: 'zstd' }])
++  })
++
++  it.each([
++    ['no body hash', { 'x-hermes-body-hash': '' }, 200],
++    ['a status other than 200', {}, 206]
++  ])('a delta with %s also drops the copy, so the retry cannot fail the same way', (_name, over, statusCode) => {
++    const store = bound()
++    const base = cards(300)
++
++    decodeDeltaBody(BOARD, whole(base), base, store)
++
++    const bad = delta(base, cards(301), over)
++
++    expect(() => decodeDeltaBody(BOARD, { ...bad.response, statusCode }, bad.body, store)).toThrow(DeltaRetryError)
++    expect(deltaRequestHeaders('GET', BOARD, store)).toEqual({ [DELTA_ACCEPT_HEADER]: 'zstd' })
++  })
++
++  it('never returns a body that fails verification, even when the frame decodes', () => {
++    const store = bound()
++    const base = cards(300)
++
++    decodeDeltaBody(BOARD, whole(base), base, store)
++
++    const forged = delta(base, cards(301), { 'x-hermes-body-hash': bodyHash(cards(302)) })
++
++    expect(() => decodeDeltaBody(BOARD, forged.response, forged.body, store)).toThrow(DeltaRetryError)
++  })
++
++  it('does not keep a whole body whose bytes are not the hashed bytes, a non-200, or an unbound backend', () => {
++    const store = bound()
++    const body = cards(50)
++
++    // gzip on the wire: the hash is of the plain body, which we do not hold here.
++    const zipped = gzipSync(body)
++
++    expect(decodeDeltaBody(BOARD, whole(body, { 'content-encoding': 'gzip' }), zipped, store)).toBe(body.toString('utf8'))
++    // A wrong hash header.
++    decodeDeltaBody(BOARD, { headers: { 'x-hermes-body-hash': '0'.repeat(32) }, statusCode: 200 }, body, store)
++    // An error answer.
++    decodeDeltaBody(BOARD, { ...whole(body), statusCode: 500 }, body, store)
++    // A local backend.
++    decodeDeltaBody('http://127.0.0.1:9119/api/plugins/kanban/board', whole(body), body, store)
++
++    expect(store.size).toBe(0)
++  })
++
++  it('passes an ordinary response through untouched: no headers, old backend', () => {
++    const store = bound()
++    const body = Buffer.from('{"ok":true}')
++
++    expect(decodeDeltaBody(BOARD, { headers: {}, statusCode: 200 }, body, store)).toBe('{"ok":true}')
++    expect(decodeDeltaBody(BOARD, { headers: { 'content-encoding': 'gzip' }, statusCode: 200 }, gzipSync(body), store)).toBe('{"ok":true}')
++    expect(store.size).toBe(0)
++  })
++})
++
++describe('the copy store', () => {
++  it('is bounded by entries and by bytes, dropping the least recently used', () => {
++    const store = bound()
++    const body = Buffer.alloc(1024, 1)
++
++    for (let i = 0; i < DELTA_STORE_MAX_ENTRIES + 10; i += 1) {
++      store.put(`k${i}`, 'h', body)
++    }
++
++    expect(store.size).toBe(DELTA_STORE_MAX_ENTRIES)
++    expect(store.get('k0')).toBeUndefined()
++    expect(store.get(`k${DELTA_STORE_MAX_ENTRIES + 9}`)).toBeDefined()
++
++    const big = Buffer.alloc(DELTA_STORE_MAX_BYTES / 2, 1)
++    const bytes = new DeltaBodyStore()
++
++    bytes.put('a', 'h', big)
++    bytes.put('b', 'h', big)
++    bytes.get('a') // a is now the most recently used
++    bytes.put('c', 'h', big)
++
++    expect(bytes.get('b')).toBeUndefined()
++    expect(bytes.get('a')).toBeDefined()
++    expect(bytes.bytes).toBeLessThanOrEqual(DELTA_STORE_MAX_BYTES)
++
++    bytes.put('huge', 'h', Buffer.alloc(DELTA_STORE_MAX_BYTES + 1))
++    expect(bytes.get('huge')).toBeUndefined()
++
++    // One read keeps two copies at most, and sheds its own previous copy before evicting itself.
++    const pair = new DeltaBodyStore()
++
++    pair.put('r', 'h1', big)
++    pair.put('r', 'h2', big)
++    pair.put('r', 'h3', big)
++    expect(pair.find('r', 'h1')).toBeUndefined()
++    expect(pair.find('r', 'h2')).toBeDefined()
++    expect(pair.get('r')?.hash).toBe('h3')
++    expect(pair.bytes).toBe(DELTA_STORE_MAX_BYTES)
++
++    pair.put('r', 'h4', Buffer.alloc(DELTA_STORE_MAX_BYTES / 2 + 1, 1))
++    expect(pair.get('r')?.hash).toBe('h4')
++    expect(pair.find('r', 'h3')).toBeUndefined()
++    expect(pair.bytes).toBe(DELTA_STORE_MAX_BYTES / 2 + 1)
++  })
++})
++
++describe('fetchJson itself (json-fetch.ts), against a live server that speaks the gateway protocol', () => {
++  const seen: { base: string; accept: string; token: string }[] = []
++  const known = new Map<string, Buffer>()
++  let version = 0
++  let damageNext = false
++
++  const board = () => cards(3000, version)
++
++  const server = http.createServer((req, res) => {
++    const base = String(req.headers['x-hermes-delta-base'] ?? '')
++
++    seen.push({ accept: String(req.headers['x-hermes-delta-accept'] ?? ''), base, token: String(req.headers['x-hermes-session-token'] ?? '') })
++
++    const body = board()
++
++    known.set(bodyHash(body), body)
++
++    const held = known.get(base)
++
++    if (!held) {
++      res.writeHead(200, { 'Content-Type': 'application/json', 'X-Hermes-Body-Hash': bodyHash(body) })
++      res.end(body)
++
++      return
++    }
++
++    const frame = damageNext ? Buffer.from('damaged in transit') : zstdCompressSync(body, { dictionary: held })
++
++    damageNext = false
++    res.writeHead(200, {
++      'Content-Type': 'application/vnd.hermes.delta+zstd',
++      'X-Hermes-Body-Hash': bodyHash(body),
++      'X-Hermes-Delta': 'zstd',
++      'X-Hermes-Delta-Base': base
++    })
++    res.end(frame)
++  })
++
++  const deps: JsonFetchDeps = { nativeHeaders: async () => null, remoteHeaders: () => ({}) }
++
++  afterAll(async () => {
++    destroyKeepaliveAgents()
++    server.closeAllConnections()
++    await new Promise<void>(resolve => server.close(() => resolve()))
++  })
++
++  it('asks, takes the whole body once, then deltas; a damaged delta is retried for the whole body', async () => {
++    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
++
++    const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
++    const url = `${origin}/api/plugins/kanban/board?board=default`
++    const read = () => fetchJsonWith(deps, url, 'session-token', {})
++
++    // Not bound yet: an ordinary backend is not asked, and its answer is parsed as before.
++    version = 1
++    expect(await read()).toEqual(JSON.parse(board().toString('utf8')))
++    expect(seen.at(-1)).toEqual({ accept: '', base: '', token: 'session-token' })
++
++    noteRemoteConnect(origin, 'conn:fetch-json-test::default', Date.now())
++
++    expect(await read()).toEqual(JSON.parse(board().toString('utf8')))
++    expect(seen.at(-1)).toMatchObject({ accept: 'zstd', base: '' })
++
++    version = 2
++    const second = bodyHash(cards(3000, 1))
++
++    expect(await read()).toEqual(JSON.parse(board().toString('utf8')))
++    expect(seen.at(-1)).toMatchObject({ accept: 'zstd', base: second })
++
++    // The frame arrives damaged: the same call still resolves with the current body, after one retry with no base.
++    version = 3
++    damageNext = true
++
++    const before = seen.length
++
++    expect(await read()).toEqual(JSON.parse(board().toString('utf8')))
++    expect(seen.slice(before)).toEqual([
++      { accept: 'zstd', base: bodyHash(cards(3000, 2)), token: 'session-token' },
++      { accept: 'zstd', base: '', token: 'session-token' }
++    ])
++
++    // And the next read is a delta again, against the body the retry delivered.
++    version = 4
++    expect(await read()).toEqual(JSON.parse(board().toString('utf8')))
++    expect(seen.at(-1)).toMatchObject({ base: bodyHash(cards(3000, 3)) })
++  })
++})
+diff --git a/apps/desktop/electron/delta-reads.ts b/apps/desktop/electron/delta-reads.ts
+new file mode 100644
+index 0000000000..894afd275a
+--- /dev/null
++++ b/apps/desktop/electron/delta-reads.ts
+@@ -0,0 +1,277 @@
++// [daveey] Delta responses: a large read of a remote backend arrives as the difference from the copy we already hold.
++//
++// Measured 2026-11-13 against the hub: six list/poll reads (sessions sidebar, projects tree, kanban board, sessions
++// list, cron jobs, runners fleet) carry almost all the bytes the Desktop pulls through its SSH tunnel, 2,052 KB for
++// one round. Fetched again 20 s later and encoded against the first copy they are 12 KB (gzip: 286 KB), for under
++// 8 ms of CPU each. On a 60-175 KB/s link that is the difference between the polls filling the link and not.
++//
++// Protocol (gateway half: hermes_cli/web_delta_response.py). Nothing here changes WHAT a request returns or when:
++// every request still reaches the backend and gets its current answer. Only the encoding on the wire changes.
++// - A GET to an SSH-tunnelled backend says `X-Hermes-Delta-Accept: zstd` and, when a copy of that read is held,
++//   `X-Hermes-Delta-Base: <hash of the copy>`.
++// - A large JSON 200 comes back either whole with `X-Hermes-Body-Hash` (we keep it as the next base), or as
++//   `X-Hermes-Delta: zstd` + `X-Hermes-Delta-Base` + `X-Hermes-Body-Hash`: a zstd frame that decodes against the
++//   base. The decoded body must hash to X-Hermes-Body-Hash; anything else (base gone, wrong base, bad frame, wrong
++//   hash) drops the copy and fails the attempt with DELTA_RETRY_CODE, which api-transport retries, now without a
++//   base, so the backend sends the whole body.
++// A backend that predates this ignores the request headers and answers as before.
++//
++// Copies are kept per remote scope and path (not per tunnel port), so the full refetch after a tunnel rebuild,
++// which is when a slow link hurts most, is a delta too. Memory only: a relaunch starts with whole bodies.
++
++import { createHash } from 'node:crypto'
++import { zstdDecompressSync } from 'node:zlib'
++
++import { decodeResponseBody, displayTranscriptHeaders } from './display-transcript'
++
++export const DELTA_ACCEPT_HEADER = 'X-Hermes-Delta-Accept'
++export const DELTA_BASE_HEADER = 'X-Hermes-Delta-Base'
++export const DELTA_ENCODING = 'zstd'
++export const DELTA_RETRY_CODE = 'HERMES_DELTA_RETRY'
++export const DELTA_STORE_MAX_BYTES = 48 * 1024 * 1024
++export const DELTA_STORE_MAX_ENTRIES = 96
++export const DELTA_COPIES_PER_READ = 2
++// A decoded body larger than this is never a delta we asked for (the gateway caps what it encodes).
++export const DELTA_MAX_DECODED_BYTES = 16 * 1024 * 1024
++
++export const bodyHash = (body: Buffer) => createHash('sha256').update(body).digest('hex').slice(0, 32)
++
++type HeaderValue = string | string[] | undefined
++
++const header = (headers: Record<string, HeaderValue>, name: string) => {
++  const value = headers[name.toLowerCase()]
++
++  return String(Array.isArray(value) ? value[0] : (value ?? '')).trim()
++}
++
++export class DeltaRetryError extends Error {
++  readonly code = DELTA_RETRY_CODE
++
++  constructor(url: string, why: string) {
++    super(`Delta response for ${url} could not be used (${why}); retrying for the whole body`)
++    this.name = 'DeltaRetryError'
++  }
++}
++
++interface Copy {
++  body: Buffer
++  hash: string
++}
++
++/**
++ * The copies deltas are decoded against, and which tunnel baseUrl belongs to which remote scope.
++ *
++ * Each read keeps its newest copy and the one before it. Two reads of the same URL can be in flight at once: both
++ * name the same base, the first answer replaces it, and the second answer's delta still names the older one. With
++ * only the newest copy that second read would fail and refetch the whole body.
++ */
++export class DeltaBodyStore {
++  // Newest copy last, at most COPIES_PER_READ per key; keys in least-recently-used order.
++  readonly #copies = new Map<string, Copy[]>()
++  readonly #scopes = new Map<string, string>()
++  #bytes = 0
++
++  /** A remote (SSH-tunnelled) backend now answers at baseUrl for this pool scope. */
++  bindRemote(baseUrl: null | string | undefined, scope: string): void {
++    const origin = originOf(baseUrl)
++
++    if (origin && scope) {
++      this.#scopes.set(origin, scope)
++    }
++  }
++
++  /**
++   * The scope's tunnel is gone: its local port may be handed to something else, which must not be asked for
++   * deltas or have its answers filed under this scope. The copies stay: a rebuilt tunnel binds a new port.
++   */
++  unbindScope(scope: string): void {
++    for (const [origin, bound] of this.#scopes) {
++      if (bound === scope) {
++        this.#scopes.delete(origin)
++      }
++    }
++  }
++
++  /** `<scope><path+query>` for a URL of a bound remote backend; null for anything else (local backends included). */
++  keyFor(url: string): null | string {
++    try {
++      const parsed = new URL(url)
++      const scope = this.#scopes.get(parsed.origin)
++
++      return scope ? `${scope}\u0000${parsed.pathname}${parsed.search}` : null
++    } catch {
++      return null
++    }
++  }
++
++  /** The newest copy of a read: the base to name in the next request. */
++  get(key: string): Copy | undefined {
++    return this.#touch(key)?.at(-1)
++  }
++
++  /** The held copy with this hash, newest or previous: the base a delta response says it was encoded against. */
++  find(key: string, hash: string): Copy | undefined {
++    return this.#touch(key)?.find(copy => copy.hash === hash)
++  }
++
++  put(key: string, hash: string, body: Buffer): void {
++    if (body.length > DELTA_STORE_MAX_BYTES) {
++      this.delete(key)
++
++      return
++    }
++
++    const kept = (this.#copies.get(key) ?? []).filter(copy => copy.hash !== hash)
++
++    this.delete(key)
++
++    const copies = [...kept, { body, hash }].slice(-DELTA_COPIES_PER_READ)
++
++    this.#copies.set(key, copies)
++    this.#bytes += copies.reduce((sum, copy) => sum + copy.body.length, 0)
++
++    while (this.#bytes > DELTA_STORE_MAX_BYTES || this.#copies.size > DELTA_STORE_MAX_ENTRIES) {
++      const oldest = this.#copies.keys().next().value as string
++      const [previous, ...rest] = this.#copies.get(oldest) ?? []
++
++      // Shed a read's previous copy before the read itself, unless it is another read's turn to go entirely.
++      if (oldest === key && rest.length > 0 && previous) {
++        this.#copies.set(key, rest)
++        this.#bytes -= previous.body.length
++      } else {
++        this.delete(oldest)
++      }
++    }
++  }
++
++  delete(key: string): void {
++    for (const copy of this.#copies.get(key) ?? []) {
++      this.#bytes -= copy.body.length
++    }
++
++    this.#copies.delete(key)
++  }
++
++  get size(): number {
++    return this.#copies.size
++  }
++
++  get bytes(): number {
++    return this.#bytes
++  }
++
++  #touch(key: string): Copy[] | undefined {
++    const copies = this.#copies.get(key)
++
++    if (copies) {
++      this.#copies.delete(key) // most recently used last
++      this.#copies.set(key, copies)
++    }
++
++    return copies
++  }
++}
++
++function originOf(baseUrl: null | string | undefined): string {
++  try {
++    return new URL(String(baseUrl ?? '')).origin
++  } catch {
++    return ''
++  }
++}
++
++export const deltaBodyStore = new DeltaBodyStore()
++
++/** Request headers that ask a remote backend for a delta. Empty for a non-GET and for a backend that is not bound. */
++export function deltaRequestHeaders(
++  method: string | undefined,
++  url: string,
++  store: DeltaBodyStore = deltaBodyStore
++): Record<string, string> {
++  if (String(method || 'GET').toUpperCase() !== 'GET') {
++    return {}
++  }
++
++  const key = store.keyFor(url)
++
++  if (!key) {
++    return {}
++  }
++
++  const copy = store.get(key)
++
++  return { [DELTA_ACCEPT_HEADER]: DELTA_ENCODING, ...(copy ? { [DELTA_BASE_HEADER]: copy.hash } : {}) }
++}
++
++/**
++ * Every "how to encode the answer" request header fetchJson sends: the transcript slim/gzip ask and the delta ask.
++ * A transcript page read asks for gzip, which the gateway never delta-encodes, so the two do not combine.
++ */
++export function readEncodingHeaders(
++  method: string | undefined,
++  url: string,
++  store: DeltaBodyStore = deltaBodyStore
++): Record<string, string> {
++  const transcript = displayTranscriptHeaders(method, url)
++
++  return Object.keys(transcript).length > 0 ? transcript : deltaRequestHeaders(method, url, store)
++}
++
++/**
++ * The response body as text. A delta is decoded against the held copy and verified; a whole body that carries a
++ * hash becomes the next base. Everything else passes through decodeResponseBody unchanged.
++ */
++export function decodeDeltaBody(
++  url: string,
++  response: { headers: Record<string, HeaderValue>; statusCode?: number },
++  body: Buffer,
++  store: DeltaBodyStore = deltaBodyStore
++): string {
++  const { headers } = response
++  const hash = header(headers, 'x-hermes-body-hash')
++  const key = store.keyFor(url)
++
++  if (header(headers, 'x-hermes-delta') !== DELTA_ENCODING) {
++    // Whole body. Keep it as the next base only when the bytes we hold are exactly the bytes that were hashed.
++    if (key && hash && response.statusCode === 200 && !header(headers, 'content-encoding') && bodyHash(body) === hash) {
++      store.put(key, hash, body)
++    }
++
++    return decodeResponseBody(body, headers['content-encoding'])
++  }
++
++  // Every failure drops this read's copies, so the retry names no base and cannot fail the same way again.
++  const fail = (why: string): never => {
++    if (key) {
++      store.delete(key)
++    }
++
++    throw new DeltaRetryError(url, why)
++  }
++
++  if (!key || !hash || response.statusCode !== 200) {
++    return fail('not a 200 with a hash from a bound remote backend')
++  }
++
++  const base = store.find(key, header(headers, 'x-hermes-delta-base'))
++
++  if (!base) {
++    return fail('the base it was encoded against is not held')
++  }
++
++  let decoded: Buffer
++
++  try {
++    decoded = zstdDecompressSync(body, { dictionary: base.body, maxOutputLength: DELTA_MAX_DECODED_BYTES })
++  } catch (error) {
++    return fail(`bad frame: ${String((error as Error)?.message ?? error).slice(0, 80)}`)
++  }
++
++  if (bodyHash(decoded) !== hash) {
++    return fail('decoded body does not match its hash')
++  }
++
++  store.put(key, hash, decoded)
++
++  return decoded.toString('utf8')
++}
+diff --git a/apps/desktop/electron/json-fetch.ts b/apps/desktop/electron/json-fetch.ts
+index 3f321bb7a5..78cf40bd11 100644
+--- a/apps/desktop/electron/json-fetch.ts
++++ b/apps/desktop/electron/json-fetch.ts
+@@ -19,7 +19,7 @@ import {
+   startRequestDeadline,
+   withRetry
+ } from './api-transport'
+-import { decodeResponseBody, displayTranscriptHeaders } from './display-transcript'
++import { decodeDeltaBody, readEncodingHeaders } from './delta-reads'
+ import { DEFAULT_FETCH_TIMEOUT_MS, resolveTimeoutMs } from './hardening'
+ 
+ /** What main.ts supplies: headers configured for remote gateways, and one-use native gateway grants. */
+@@ -80,8 +80,8 @@ export function fetchJsonWith(deps: JsonFetchDeps, url: string, token: null | st
+                 method: options.method || 'GET',
+                 headers: {
+                   ...deps.remoteHeaders(url),
+-                  // [daveey] Transcript pages: slim + gzip when the backend supports it (display-transcript.ts).
+-                  ...displayTranscriptHeaders(options.method, url),
++                  // [daveey] Transcript pages slim + gzip (display-transcript.ts); large reads as deltas (delta-reads.ts).
++                  ...readEncodingHeaders(options.method, url),
+                   ...(options.headers || {}),
+                   'Content-Type': contentType,
+                   ...(nativeHeaders || { 'X-Hermes-Session-Token': token }),
+@@ -102,7 +102,7 @@ export function fetchJsonWith(deps: JsonFetchDeps, url: string, token: null | st
+                   let text: string
+ 
+                   try {
+-                    text = decodeResponseBody(Buffer.concat(chunks), res.headers['content-encoding'])
++                    text = decodeDeltaBody(url, res, Buffer.concat(chunks))
+                   } catch (error) {
+                     reject(error)
+ 
+diff --git a/apps/desktop/electron/slow-link.ts b/apps/desktop/electron/slow-link.ts
+index 3599a75c8a..9538693a9a 100644
+--- a/apps/desktop/electron/slow-link.ts
++++ b/apps/desktop/electron/slow-link.ts
+@@ -25,6 +25,7 @@
+ //   stretched 40 s, and between probes requests wait up to SLOW_LINK_TIMEOUT_CAP_MS (60 s) each. Such a hang now
+ //   takes minutes to retire instead of ~10 s.
+ 
++import { deltaBodyStore } from './delta-reads'
+ import { isBackgroundRead, type PowerSettleRequest, PowerSettlingError } from './power-settle'
+ import { isRemoteTimeout } from './remote-down-gate'
+ import { remoteAnswerLedger } from './remote-liveness'
+@@ -261,6 +262,7 @@ export class SlowLinkTracker {
+   forgetScope(scope: string): void {
+     this.forget(this.#scopes.get(scope))
+     this.#scopes.delete(scope)
++    deltaBodyStore.unbindScope(scope) // the tunnel is going away: its port must stop being asked for deltas
+   }
+ 
+   #leave(url: string, reason: string): void {
+@@ -355,6 +357,7 @@ const remoteFirstRequestPending = new Map<string, { scope: string; startedAt: nu
+ 
+ export function noteRemoteConnect(baseUrl: string, scope: string, startedAt: number): void {
+   remoteFirstRequestPending.set(baseUrl, { scope, startedAt })
++  deltaBodyStore.bindRemote(baseUrl, scope) // delta-reads.ts: this tunnel's reads may come back as deltas
+ }
+ 
+ /** A backend answered `path` after elapsedMs: the answer ledger, the slow-link tracker and the first-request line. */
+diff --git a/hermes_cli/web_delta_response.py b/hermes_cli/web_delta_response.py
+new file mode 100644
+index 0000000000..40124320e7
+--- /dev/null
++++ b/hermes_cli/web_delta_response.py
+@@ -0,0 +1,211 @@
++"""[daveey] Delta responses: answer a large JSON read with the difference from the copy the client holds.
++
++Measured 2026-11-13 on the hub: six list/poll reads (sessions sidebar, projects tree, kanban board, sessions list,
++cron jobs, runners fleet) carry almost all the bytes the Desktop pulls through its SSH tunnel, 2,052 KB a round.
++Fetched again 20 s later and encoded against the first copy they are 12 KB (gzip: 286 KB) for under 8 ms of CPU
++each. On a 60-175 KB/s link the polls filled the link; as deltas they do not.
++
++Nothing here changes what a request returns or when: the handler runs as before and its exact bytes reach the
++client. Only the encoding on the wire changes, and only for a client that asks (Desktop half:
++apps/desktop/electron/delta-reads.ts).
++
++- Request: ``X-Hermes-Delta-Accept: zstd`` and, optionally, ``X-Hermes-Delta-Base: <hash>`` of a body it holds.
++- A GET whose answer is a 200 ``application/json`` body with a Content-Length in [MIN_BYTES, MAX_BYTES] and no
++  Content-Encoding is remembered by its hash and answered with ``X-Hermes-Body-Hash``; when the named base is still
++  remembered and the encoding is smaller, the body is a zstd frame using that base as its prefix, marked
++  ``X-Hermes-Delta: zstd`` + ``X-Hermes-Delta-Base``. The client decodes, checks the hash, and on any mismatch asks
++  again without a base.
++- Everything else (no ask, other methods and statuses, streams, small or huge bodies, Python without
++  ``compression.zstd``) passes through untouched.
++
++Bodies are remembered per credential: the store key is (hash of the request's session-token / Authorization /
++Cookie headers, hash of the body), so a caller can only name a base that was served to that same credential. A
++delta's length says how much the answer shares with its base, which must not become a way to probe what another
++profile or principal was sent. A caller with no credential (the public paths pass auth without one) shares one
++namespace that holds only what such callers were sent. A credential that changes on every request (single-use
++grants) simply never gets a delta.
++
++Failure never costs the answer: if encoding raises, or the body's length is not its declared Content-Length, the
++handler's response goes out as it was.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import hashlib
++import logging
++import math
++import threading
++from collections import OrderedDict
++from typing import Optional
++
++from starlette.datastructures import Headers, MutableHeaders
++from starlette.types import ASGIApp, Message, Receive, Scope, Send
++
++try:  # Python 3.14+
++    from compression import zstd as _zstd
++except ImportError:  # pragma: no cover - older interpreters serve whole bodies
++    _zstd = None
++
++ACCEPT_HEADER = "x-hermes-delta-accept"
++BASE_HEADER = "x-hermes-delta-base"
++HASH_HEADER = "x-hermes-body-hash"
++DELTA_HEADER = "x-hermes-delta"
++ENCODING = "zstd"
++DELTA_MEDIA_TYPE = "application/vnd.hermes.delta+zstd"
++MIN_BYTES = 16 * 1024
++MAX_BYTES = 8 * 1024 * 1024
++STORE_MAX_BYTES = 64 * 1024 * 1024
++ZSTD_LEVEL = 3
++CREDENTIAL_HEADERS = ("x-hermes-session-token", "authorization", "cookie")
++
++logger = logging.getLogger(__name__)
++
++
++def body_hash(body: bytes) -> str:
++    return hashlib.sha256(body).hexdigest()[:32]
++
++
++def credential_namespace(request: Headers) -> str:
++    """One namespace per credential presented; "" for a request that presents none."""
++    presented = [f"{name}={request.get(name, '')}" for name in CREDENTIAL_HEADERS if request.get(name)]
++    return hashlib.sha256("\n".join(presented).encode()).hexdigest()[:32] if presented else ""
++
++
++def encode_delta(body: bytes, base: bytes) -> bytes:
++    """``body`` as a zstd frame that decodes only with ``base`` as its (raw-content) dictionary.
++
++    The window covers base + body and long-distance matching is on: at the default 2 MiB window a 3.5 MB body
++    with one changed field encoded to 36 KB; with both it is 430 bytes for 2 ms more (measured 2026-11-13)."""
++    window_log = min(27, max(10, math.ceil(math.log2(len(base) + len(body) + 1))))
++    options = {
++        _zstd.CompressionParameter.compression_level: ZSTD_LEVEL,
++        _zstd.CompressionParameter.window_log: window_log,
++        _zstd.CompressionParameter.enable_long_distance_matching: 1,
++    }
++    return _zstd.compress(body, options=options, zstd_dict=_zstd.ZstdDict(base, is_raw=True).as_prefix)
++
++
++class BodyStore:
++    """Recently served bodies by hash, least recently used first out, bounded by total bytes."""
++
++    def __init__(self, max_bytes: int = STORE_MAX_BYTES):
++        self._max_bytes = max_bytes
++        self._bodies: OrderedDict[str, bytes] = OrderedDict()
++        self._bytes = 0
++        self._lock = threading.Lock()
++
++    def get(self, digest: str) -> Optional[bytes]:
++        with self._lock:
++            body = self._bodies.get(digest)
++            if body is not None:
++                self._bodies.move_to_end(digest)
++            return body
++
++    def put(self, digest: str, body: bytes) -> None:
++        with self._lock:
++            if digest in self._bodies:
++                self._bodies.move_to_end(digest)
++                return
++            self._bodies[digest] = body
++            self._bytes += len(body)
++            while self._bytes > self._max_bytes and self._bodies:
++                _, dropped = self._bodies.popitem(last=False)
++                self._bytes -= len(dropped)
++
++    def __len__(self) -> int:
++        return len(self._bodies)
++
++
++def _eligible(message: Message) -> bool:
++    """A complete, plain JSON 200 of a size worth encoding (a stream has no Content-Length)."""
++    if message["status"] != 200:
++        return False
++    headers = Headers(raw=message["headers"])
++    length = headers.get("content-length", "")
++    return (
++        headers.get("content-type", "").split(";", 1)[0].strip().lower() == "application/json"
++        and "content-encoding" not in headers
++        and length.isascii()
++        and length.isdecimal()
++        and MIN_BYTES <= int(length) <= MAX_BYTES
++    )
++
++
++def _encode(body: bytes, base_digest: str, namespace: str, store: BodyStore) -> tuple[str, Optional[bytes]]:
++    """(hash of body, delta frame or None). Runs off the event loop: hashing and zstd release the GIL."""
++    digest = body_hash(body)
++    base = store.get(f"{namespace}:{base_digest}") if base_digest else None
++    store.put(f"{namespace}:{digest}", body)
++    if base is None:
++        return digest, None
++    frame = encode_delta(body, base)
++    return digest, frame if len(frame) < len(body) else None
++
++
++class DeltaResponseMiddleware:
++    """See the module docstring. Pure ASGI: a response that is not eligible is never buffered."""
++
++    def __init__(self, app: ASGIApp, store: Optional[BodyStore] = None):
++        self.app = app
++        self.store = store if store is not None else BodyStore()
++
++    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
++        if _zstd is None or scope["type"] != "http" or scope["method"] != "GET":
++            await self.app(scope, receive, send)
++            return
++        request = Headers(scope=scope)
++        if request.get(ACCEPT_HEADER, "").strip().lower() != ENCODING:
++            await self.app(scope, receive, send)
++            return
++        held = _DeltaSend(send, request.get(BASE_HEADER, "").strip(), credential_namespace(request), self.store)
++        await self.app(scope, receive, held)
++
++
++class _DeltaSend:
++    """The ``send`` of one asked request: holds an eligible response until its body is complete."""
++
++    def __init__(self, send: Send, base_digest: str, namespace: str, store: BodyStore):
++        self._send = send
++        self._base_digest = base_digest
++        self._namespace = namespace
++        self._store = store
++        self._start: Optional[Message] = None
++        self._chunks: list[bytes] = []
++
++    async def __call__(self, message: Message) -> None:
++        if message["type"] == "http.response.start" and _eligible(message):
++            self._start = message
++            return
++        if self._start is None or message["type"] != "http.response.body":
++            await self._send(message)
++            return
++        self._chunks.append(message.get("body", b""))
++        if not message.get("more_body", False):
++            await self._finish(b"".join(self._chunks))
++
++    async def _finish(self, body: bytes) -> None:
++        start = self._start
++        self._start = None
++        digest, frame = "", None
++        # A body that is not its declared length is the server's to report, exactly as without this middleware.
++        if len(body) == int(Headers(raw=start["headers"])["content-length"]):
++            try:
++                digest, frame = await asyncio.to_thread(
++                    _encode, body, self._base_digest, self._namespace, self._store
++                )
++            except Exception:  # encoding is an optimisation: the answer still goes out whole
++                logger.warning("delta response: encoding failed; sending the whole body", exc_info=True)
++        if not digest:
++            await self._send(start)
++            await self._send({"type": "http.response.body", "body": body})
++            return
++        headers = MutableHeaders(raw=list(start["headers"]))
++        headers[HASH_HEADER] = digest
++        if frame is not None:
++            headers[DELTA_HEADER] = ENCODING
++            headers[BASE_HEADER] = self._base_digest
++            headers["content-type"] = DELTA_MEDIA_TYPE
++            headers["content-length"] = str(len(frame))
++        await self._send({**start, "headers": headers.raw})
++        await self._send({"type": "http.response.body", "body": frame if frame is not None else body})
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index e92c27a925..f98c797eda 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -449,6 +449,12 @@ from hermes_cli.web_upload_limit import ChatFileUploadLimitMiddleware
+ # and the receive limit runs before FastAPI can spool a multipart attachment.
+ app.add_middleware(ChatFileUploadLimitMiddleware)
+ 
++# [daveey] Inside auth too: a refused request is never remembered or delta-encoded, and what is remembered is
++# kept per credential (web_delta_response.py).
++from hermes_cli.web_delta_response import DeltaResponseMiddleware
++
++app.add_middleware(DeltaResponseMiddleware)
++
+ # Endpoints that do NOT require the session token; everything else under /api/
+ # is gated below. Shared with the OAuth gate so the two allowlists cannot
+ # drift (/api/status once 401'd under the OAuth gate, breaking the portal probe).
+diff --git a/tests/hermes_cli/test_web_delta_response.py b/tests/hermes_cli/test_web_delta_response.py
+new file mode 100644
+index 0000000000..a5fa40caf5
+--- /dev/null
++++ b/tests/hermes_cli/test_web_delta_response.py
+@@ -0,0 +1,350 @@
++"""Delta responses (hermes_cli/web_delta_response.py): the exact handler bytes, as a zstd delta when asked."""
++
++from __future__ import annotations
++
++import gzip
++import json
++
++import pytest
++from starlette.applications import Starlette
++from starlette.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
++from starlette.routing import Route
++from starlette.testclient import TestClient
++
++from hermes_cli import web_delta_response as wdr
++
++try:
++    from compression import zstd
++except ImportError:  # Python < 3.14: the middleware passes everything through, which two tests below still check
++    zstd = None
++
++needs_zstd = pytest.mark.skipif(zstd is None, reason="compression.zstd needs Python 3.14+")
++
++ASK = {"X-Hermes-Delta-Accept": "zstd"}
++
++
++def board(count: int, done: int = -1) -> dict:
++    return {"cards": [{"id": i, "status": "done" if i == done else "todo", "title": f"card {i}"} for i in range(count)]}
++
++
++def decode(frame: bytes, base: bytes) -> bytes:
++    return zstd.decompress(frame, zstd_dict=zstd.ZstdDict(base, is_raw=True).as_prefix)
++
++
++@pytest.fixture
++def served():
++    """A tiny app whose /board answer the test can change, behind the middleware."""
++    state = {"board": board(2000), "calls": 0}
++
++    async def get_board(request):
++        state["calls"] += 1
++        return JSONResponse(state["board"])
++
++    async def small(request):
++        return JSONResponse({"ok": True})
++
++    async def text(request):
++        return PlainTextResponse("x" * 50_000)
++
++    async def missing(request):
++        return JSONResponse({"detail": "x" * 50_000}, status_code=404)
++
++    async def zipped(request):
++        body = gzip.compress(json.dumps(state["board"]).encode())
++        return Response(body, media_type="application/json", headers={"content-encoding": "gzip"})
++
++    async def stream(request):
++        async def chunks():
++            yield b'{"big":"' + b"x" * 50_000 + b'"}'
++
++        return StreamingResponse(chunks(), media_type="application/json")
++
++    async def chunked(request):
++        body = json.dumps(state["board"]).encode()
++
++        async def chunks():
++            for at in range(0, len(body), 7000):
++                yield body[at:at + 7000]
++
++        # A Content-Length with the body in many chunks (what a file response does).
++        return StreamingResponse(chunks(), media_type="application/json", headers={"content-length": str(len(body))})
++
++    async def cookie(request):
++        response = JSONResponse(state["board"], headers={"cache-control": "no-store", "etag": '"abc"'})
++        response.set_cookie("a", "1")
++        response.set_cookie("b", "2")
++        return response
++
++    app = Starlette(routes=[
++        Route("/board", get_board, methods=["GET", "POST", "HEAD"]),
++        Route("/small", small), Route("/text", text), Route("/missing", missing),
++        Route("/zipped", zipped), Route("/stream", stream), Route("/chunked", chunked), Route("/cookie", cookie),
++    ])
++    store = wdr.BodyStore()
++    app.add_middleware(wdr.DeltaResponseMiddleware, store=store)
++    return TestClient(app), state, store
++
++
++def test_unasked_request_is_untouched(served):
++    client, state, store = served
++    response = client.get("/board")
++    assert response.json() == state["board"]
++    assert wdr.HASH_HEADER not in response.headers and wdr.DELTA_HEADER not in response.headers
++    assert len(store) == 0
++
++
++@needs_zstd
++def test_first_ask_gets_the_whole_body_with_its_hash(served):
++    client, state, store = served
++    response = client.get("/board", headers=ASK)
++    assert response.headers["content-type"] == "application/json"
++    assert response.json() == state["board"]
++    assert response.headers[wdr.HASH_HEADER] == wdr.body_hash(response.content)
++    assert wdr.DELTA_HEADER not in response.headers
++    assert len(store) == 1
++
++
++@needs_zstd
++def test_known_base_gets_a_small_delta_that_decodes_to_the_exact_current_body(served):
++    client, state, _ = served
++    first = client.get("/board", headers=ASK)
++    state["board"] = board(2001, done=1234)
++
++    second = client.get("/board", headers={**ASK, "X-Hermes-Delta-Base": first.headers[wdr.HASH_HEADER]})
++
++    assert second.status_code == 200
++    assert second.headers[wdr.DELTA_HEADER] == "zstd"
++    assert second.headers[wdr.BASE_HEADER] == first.headers[wdr.HASH_HEADER]
++    assert second.headers["content-type"] == wdr.DELTA_MEDIA_TYPE
++    assert int(second.headers["content-length"]) == len(second.content)
++    current = decode(second.content, first.content)
++    assert json.loads(current) == state["board"]
++    assert second.headers[wdr.HASH_HEADER] == wdr.body_hash(current)
++    assert len(second.content) < len(current) / 50
++    assert state["calls"] == 2  # the handler ran both times: the answer is never served from the store
++
++    # The delta itself can be the next base.
++    state["board"] = board(2001, done=77)
++    third = client.get("/board", headers={**ASK, "X-Hermes-Delta-Base": second.headers[wdr.HASH_HEADER]})
++    assert json.loads(decode(third.content, current)) == state["board"]
++
++
++@needs_zstd
++def test_unchanged_body_is_a_tiny_delta(served):
++    client, _, _ = served
++    first = client.get("/board", headers=ASK)
++    again = client.get("/board", headers={**ASK, "X-Hermes-Delta-Base": first.headers[wdr.HASH_HEADER]})
++    assert again.headers[wdr.DELTA_HEADER] == "zstd"
++    assert len(again.content) < 200
++    assert decode(again.content, first.content) == first.content
++
++
++@needs_zstd
++@pytest.mark.parametrize("base", ["f" * 32, "", "not-a-hash"])
++def test_unknown_base_gets_the_whole_body(served, base):
++    client, state, _ = served
++    response = client.get("/board", headers={**ASK, "X-Hermes-Delta-Base": base})
++    assert wdr.DELTA_HEADER not in response.headers
++    assert response.json() == state["board"]
++    assert response.headers[wdr.HASH_HEADER] == wdr.body_hash(response.content)
++
++
++@needs_zstd
++def test_base_evicted_from_the_store_gets_the_whole_body(served):
++    client, state, store = served
++    first = client.get("/board", headers=ASK)
++    store._bodies.clear()  # a restart, or the store rolled past it
++    store._bytes = 0
++    response = client.get("/board", headers={**ASK, "X-Hermes-Delta-Base": first.headers[wdr.HASH_HEADER]})
++    assert wdr.DELTA_HEADER not in response.headers
++    assert response.json() == state["board"]
++
++
++@needs_zstd
++@pytest.mark.parametrize("path", ["/small", "/text", "/missing", "/zipped", "/stream"])
++def test_ineligible_responses_pass_through_untouched(served, path):
++    """Small, non-JSON, non-200, already encoded and streamed answers are never hashed, stored or encoded."""
++    client, _, store = served
++    plain = client.get(path)
++    asked = client.get(path, headers={**ASK, "X-Hermes-Delta-Base": "f" * 32})
++    assert asked.status_code == plain.status_code
++    assert asked.content == plain.content
++    assert asked.headers.get("content-type") == plain.headers.get("content-type")
++    assert wdr.HASH_HEADER not in asked.headers and wdr.DELTA_HEADER not in asked.headers
++    assert len(store) == 0
++
++
++@needs_zstd
++def test_a_write_is_never_encoded(served):
++    client, state, store = served
++    response = client.post("/board", headers={**ASK, "X-Hermes-Delta-Base": "f" * 32})
++    assert response.json() == state["board"]
++    assert wdr.HASH_HEADER not in response.headers
++    assert len(store) == 0
++
++
++@needs_zstd
++def test_a_delta_no_smaller_than_the_body_is_not_sent(served, monkeypatch):
++    client, state, _ = served
++    first = client.get("/board", headers=ASK)
++    monkeypatch.setattr(wdr, "encode_delta", lambda body, base: body + b"!")
++    response = client.get("/board", headers={**ASK, "X-Hermes-Delta-Base": first.headers[wdr.HASH_HEADER]})
++    assert wdr.DELTA_HEADER not in response.headers
++    assert response.json() == state["board"]
++
++
++def test_without_zstd_every_request_passes_through(served, monkeypatch):
++    client, state, store = served
++    monkeypatch.setattr(wdr, "_zstd", None)
++    response = client.get("/board", headers=ASK)
++    assert response.json() == state["board"]
++    assert wdr.HASH_HEADER not in response.headers
++    assert len(store) == 0
++
++
++def test_store_is_bounded_by_bytes_and_drops_the_least_recently_used():
++    store = wdr.BodyStore(max_bytes=3000)
++    store.put("a", b"a" * 1000)
++    store.put("b", b"b" * 1000)
++    store.put("c", b"c" * 1000)
++    assert store.get("a") is not None  # a is now the most recently used
++    store.put("d", b"d" * 1000)
++    assert store.get("b") is None
++    assert store.get("a") is not None and store.get("c") is not None and store.get("d") is not None
++    store.put("a", b"ignored: same hash is the same bytes")
++    assert store.get("a") == b"a" * 1000
++
++
++@needs_zstd
++def test_frame_matches_the_fixture_the_desktop_test_decodes():
++    """apps/desktop/electron/delta-reads.test.ts decodes this exact frame with Node's zstd: keep the two in step."""
++    old = json.dumps(board(40), separators=(",", ":")).encode()
++    new = json.dumps(board(41, done=7), separators=(",", ":")).encode()
++    assert wdr.body_hash(old) == "534e8f50b28c0e95528daf1f36a43a0c"
++    assert wdr.body_hash(new) == "611f65f648a6b3b611140694997e4b95"
++    assert decode(wdr.encode_delta(new, old), old) == new
++
++
++def test_the_dashboard_app_serves_through_the_middleware():
++    from hermes_cli import web_server
++
++    assert any(m.cls is wdr.DeltaResponseMiddleware for m in web_server.app.user_middleware)
++
++
++@needs_zstd
++def test_chunked_body_with_a_content_length_is_encoded_as_one(served):
++    client, state, _ = served
++    first = client.get("/chunked", headers=ASK)
++    assert first.json() == state["board"]
++    state["board"] = board(2001, done=5)
++    second = client.get("/chunked", headers={**ASK, "X-Hermes-Delta-Base": first.headers[wdr.HASH_HEADER]})
++    assert second.headers[wdr.DELTA_HEADER] == "zstd"
++    assert json.loads(decode(second.content, first.content)) == state["board"]
++
++
++@needs_zstd
++def test_other_headers_survive_a_delta_duplicates_included(served):
++    client, _, _ = served
++    first = client.get("/cookie", headers=ASK)
++    client.cookies.clear()  # the test client would send them back, which is another credential (see below)
++    second = client.get("/cookie", headers={**ASK, "X-Hermes-Delta-Base": first.headers[wdr.HASH_HEADER]})
++    assert second.headers[wdr.DELTA_HEADER] == "zstd"
++    assert second.headers["cache-control"] == "no-store" and second.headers["etag"] == '"abc"'
++    assert sorted(second.headers.get_list("set-cookie"))[0].startswith("a=1")
++    assert len(second.headers.get_list("set-cookie")) == 2
++
++
++def test_head_is_untouched(served):
++    client, _, store = served
++    response = client.head("/board", headers=ASK)
++    assert wdr.HASH_HEADER not in response.headers
++    assert len(store) == 0
++
++
++@needs_zstd
++def test_a_base_is_only_usable_by_the_credential_it_was_served_to(served):
++    """The delta's length depends on its base: one credential must not be able to probe another's answers."""
++    client, state, store = served
++    alice = {**ASK, "X-Hermes-Session-Token": "alice"}
++    first = client.get("/board", headers=alice)
++    digest = first.headers[wdr.HASH_HEADER]
++
++    for other in ({"X-Hermes-Session-Token": "bob"}, {"Authorization": "Bearer bob"}, {"Cookie": "s=bob"}, {}):
++        probe = client.get("/board", headers={**ASK, **other, "X-Hermes-Delta-Base": digest})
++        assert wdr.DELTA_HEADER not in probe.headers, other
++        assert probe.json() == state["board"]
++
++    again = client.get("/board", headers={**alice, "X-Hermes-Delta-Base": digest})
++    assert again.headers[wdr.DELTA_HEADER] == "zstd"
++    # The same bytes are held once per credential that was sent them (alice, three bobs, no credential).
++    assert len(store) == 5
++
++
++def test_credential_namespace_separates_credentials_and_is_empty_without_one():
++    from starlette.datastructures import Headers
++
++    def ns(**headers):
++        return wdr.credential_namespace(Headers(headers))
++
++    assert ns() == ""
++    assert ns(**{"x-hermes-session-token": "a"}) == ns(**{"x-hermes-session-token": "a", "accept": "x"})
++    assert len({ns(**{"x-hermes-session-token": "a"}), ns(**{"x-hermes-session-token": "b"}),
++                ns(authorization="a"), ns(cookie="a"), ns()}) == 5
++
++
++@needs_zstd
++def test_encoding_failure_sends_the_handler_answer_unchanged(served, monkeypatch):
++    client, state, _ = served
++    first = client.get("/board", headers=ASK)
++
++    def boom(body, base):
++        raise RuntimeError("zstd exploded")
++
++    monkeypatch.setattr(wdr, "encode_delta", boom)
++    response = client.get("/board", headers={**ASK, "X-Hermes-Delta-Base": first.headers[wdr.HASH_HEADER]})
++    assert response.status_code == 200
++    assert response.headers["content-type"] == "application/json"
++    assert wdr.DELTA_HEADER not in response.headers and wdr.HASH_HEADER not in response.headers
++    assert response.json() == state["board"]
++
++
++@needs_zstd
++@pytest.mark.parametrize("megabytes", [0.5, 3.5])
++def test_a_one_field_change_stays_tiny_past_the_default_zstd_window(megabytes):
++    """At the default 2 MiB window a 3.5 MB body with one change encoded to 36 KB (measured 2026-11-13)."""
++    def body(done):
++        rows = [{"id": i, "status": "done" if i == done else "todo", "body": "lorem ipsum dolor " * 6}
++                for i in range(int(megabytes * 7000))]
++        return json.dumps({"cards": rows}).encode()
++
++    old, new = body(-1), body(1000)
++    assert len(new) > megabytes * 0.9e6
++    frame = wdr.encode_delta(new, old)
++    assert len(frame) < 2000
++    assert decode(frame, old) == new
++
++
++def test_size_bounds_of_what_is_encoded():
++    def start(length, **over):
++        headers = {"content-type": "application/json; charset=utf-8", "content-length": str(length), **over}
++        return {"type": "http.response.start", "status": 200,
++                "headers": [(k.encode(), v.encode()) for k, v in headers.items()]}
++
++    assert wdr._eligible(start(wdr.MIN_BYTES)) and wdr._eligible(start(wdr.MAX_BYTES))
++    assert not wdr._eligible(start(wdr.MIN_BYTES - 1)) and not wdr._eligible(start(wdr.MAX_BYTES + 1))
++    assert not wdr._eligible(start(50_000, **{"content-encoding": "gzip"}))
++    assert not wdr._eligible(start(50_000, **{"content-type": "text/html"}))
++    assert not wdr._eligible({**start(50_000), "status": 206})
++    assert not wdr._eligible({**start(50_000), "headers": [(b"content-type", b"application/json")]})
++
++
++def test_the_middleware_sits_inside_every_auth_gate_of_the_dashboard_app():
++    """Starlette runs the last-added middleware first: auth gates are added after it, so they answer a refused
++    request before this middleware ever sees one."""
++    from hermes_cli import web_server
++
++    chain = [m.cls for m in web_server.app.user_middleware]
++    at = chain.index(wdr.DeltaResponseMiddleware)
++    outer = chain[:at]
++    assert len(outer) >= 5
++    assert web_server.ChatFileUploadLimitMiddleware in chain[at + 1:]
+-- 
+2.51.0
+

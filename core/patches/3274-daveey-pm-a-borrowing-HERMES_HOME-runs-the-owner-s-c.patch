@@ -1,0 +1,568 @@
+From 43806ad740507335eb04556c8c6adc1ec0e6dcd7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:11:31 +0000
+Subject: [PATCH] [daveey] pm: a borrowing HERMES_HOME runs the owner's
+ committed environment
+
+A launch under a HERMES_HOME that borrows the owner's checkout (a test's temporary
+home, a per-task home) synced a full environment of its own on every new home,
+and `HERMES_HOME=<tmp> hermes --version` refused outright: _METADATA_FLAGS skips
+prepare_launch, then activate_dependencies found nothing committed under the
+borrower and raised 'no dependency environment is committed'.
+
+- pm.environments.borrowed_venv: the generation the owning root committed for the
+  checkout (owner facts.json, read-only; must be a generation of the owner's own state).
+- activate_dependencies: on PM's store Python with nothing committed, lease that
+  generation in place (a lock file in the owner's <gen>/.leases, the same pin the
+  owner's processes take) instead of refusing; no owner generation still refuses.
+- pm.install.borrowed_venv_is_current: the owner generation serves the borrower when
+  the borrower has no selection of its own and the stamp recomputed for the
+  borrower's first-sync request and plugin members equals the owner's stamp.
+- venv_sync._prepare_borrowed_launch asks that through a new 'borrowed' launch
+  probe operation and skips its own sync when it holds; a borrower with other
+  plugins/extras, or no answer, keeps syncing its own.
+
+Never writes the owner's facts or inputs stamps.
+---
+ hermes_cli/launch_probe.py                    |  16 +-
+ hermes_cli/venv_sync.py                       |  38 ++++-
+ pm/environments.py                            |  89 +++++++---
+ pm/install.py                                 |  33 ++++
+ tests/hermes_cli/test_borrowed_home_launch.py |  38 +++++
+ tests/hermes_cli/test_launch_probe.py         |  15 ++
+ tests/pm/test_borrowed_owner_environment.py   | 160 ++++++++++++++++++
+ 7 files changed, 357 insertions(+), 32 deletions(-)
+ create mode 100644 tests/pm/test_borrowed_owner_environment.py
+
+diff --git a/hermes_cli/launch_probe.py b/hermes_cli/launch_probe.py
+index c3e49badc5..35a74ae2ea 100644
+--- a/hermes_cli/launch_probe.py
++++ b/hermes_cli/launch_probe.py
+@@ -1,12 +1,14 @@
+ """Bounded, passive dependency-environment probe for launchers.
+ 
+ ``probe(root)`` asks an isolated worker (``sys.executable -I -S``) whether the
+-environment recorded for ``root`` is current, or (``operation='runtime'``) to
++environment recorded for ``root`` is current, (``operation='borrowed'``) whether the
++owner's committed environment serves a root that borrows the checkout
++(``pm.install.borrowed_venv_is_current``), or (``operation='runtime'``) to
+ activate it and report the resulting PATH. It never installs or repairs.
+ 
+ Contract (stdlib only, so a bootstrap interpreter can import it):
+ 
+-* ``{"schema": 1, "state": "current" | "stale"}`` for ``currency``.
++* ``{"schema": 1, "state": "current" | "stale"}`` for ``currency`` and ``borrowed``.
+ * ``{"schema": 1, "state": "runtime", "problems": [str], "path": str}`` for ``runtime``.
+ * ``{"schema": 1, "state": "error", "detail": str}`` when the worker ran and failed.
+   Permission failures with a denied path also carry ``permission_error`` with
+@@ -57,6 +59,12 @@ try:
+     if operation == "currency":
+         import pm
+         reply = {"schema": 1, "state": "current" if pm.venv_is_current(project_root=root) else "stale"}
++    elif operation == "borrowed":
++        # A borrowing root with no PM runtime of its own: judge on the owner's generation.
++        from pm.environments import activate_dependencies
++        activate_dependencies(root)
++        from pm.install import borrowed_venv_is_current
++        reply = {"schema": 1, "state": "current" if borrowed_venv_is_current(project_root=root) else "stale"}
+     else:
+         from pm.environments import activate_dependencies
+         activate_dependencies(root)  # before any third-party import
+@@ -88,7 +96,7 @@ def _valid(operation: str, reply: Any) -> bool:
+                 and (error["errno"] is None or type(error["errno"]) is int)
+                 and (error["strerror"] is None or isinstance(error["strerror"], str))
+                 and isinstance(error["filename"], str))
+-    if operation == "currency":
++    if operation in ("currency", "borrowed"):
+         return state in ("current", "stale") and set(reply) == {"schema", "state"}
+     problems = reply.get("problems")
+     return (state == "runtime" and isinstance(problems, list)
+@@ -132,7 +140,7 @@ def probe(root: str | os.PathLike[str], operation: str = "currency",
+     """Run one passive probe for ``root``; see the module docstring for the result shapes."""
+     if timeout is None:
+         timeout = DEFAULT_TIMEOUT
+-    if os.name != "posix" or operation not in ("currency", "runtime") or not timeout > 0:
++    if os.name != "posix" or operation not in ("currency", "borrowed", "runtime") or not timeout > 0:
+         return None
+     deadline = time.monotonic() + timeout
+     try:
+diff --git a/hermes_cli/venv_sync.py b/hermes_cli/venv_sync.py
+index baa3611c50..5e768e9b56 100644
+--- a/hermes_cli/venv_sync.py
++++ b/hermes_cli/venv_sync.py
+@@ -190,6 +190,8 @@ def collect_superseded_generations(project_root: Path) -> None:
+ #: Answered from the tree alone; a metadata query must never wait on (or fail with)
+ #: a network-bound source-update completion.
+ _METADATA_FLAGS = frozenset({"-h", "--help", "-V", "--version"})
++# Longer than the currency probe's second: the alternative to an answer is a full dependency sync.
++_BORROWED_PROBE_SECONDS = 5.0
+ 
+ 
+ def _is_read_only_gateway_status(command: list[str]) -> bool:
+@@ -717,16 +719,36 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
+     return None
+ 
+ 
++def _owner_environment_serves(root: Path) -> bool:
++    """Does the owner's committed generation serve this borrowing root (``pm.install.borrowed_venv_is_current``)?
++
++    Asked through the bounded launch probe: plugin discovery may read this root's config, which
++    needs the owner's packages, and a fresh borrowing root has no PM runtime of its own to ask.
++    No answer (a timeout, a probe error, no owner generation) is no: the borrower builds its own.
++    """
++    from hermes_cli.launch_probe import probe
++    from pm.environments import borrowed_venv
++
++    if borrowed_venv(root) is None:
++        return False
++    result = probe(root, "borrowed", timeout=_BORROWED_PROBE_SECONDS)
++    return result is not None and result["state"] == "current"
++
++
+ def _prepare_borrowed_launch(root: Path, owner: Path, *, current: bool) -> Path | None:
+     """Launch a checkout that another data root owns (#123238).
+ 
+-    Dependency state is per data root, so a borrowing root -- a test's temporary
+-    ``HERMES_HOME``, a per-task home -- still gets an environment of its own, synced exactly
+-    as a process spawned under a live update syncs. The rest is the checkout's, and so the
+-    owner's: launchers, product builds, post-update maintenance, the install stamp and the
+-    owner's own update markers. None of it is armed, run or published from here, so a
+-    borrowing launch cannot rebind the shared launchers, rebuild products another root is
+-    serving, or race the owner's tail under a lock that lives in a different home.
++    Dependency state is per data root, but a borrowing root -- a test's temporary
++    ``HERMES_HOME``, a per-task home -- that has committed nothing of its own runs the owner's
++    committed generation when that generation serves its request (``pm.borrowed_venv_is_current``:
++    same lock, Python and plugin members, extras including the first-sync request), leased in
++    place (``pm.environments.activate_dependencies``). Otherwise it gets an environment of its
++    own, synced exactly as a process spawned under a live update syncs. The rest is the
++    checkout's, and so the owner's: launchers, product builds, post-update maintenance, the
++    install stamp, the owner's own update markers and its dependency facts. None of it is armed,
++    run, written or published from here, so a borrowing launch cannot rebind the shared
++    launchers, rebuild products another root is serving, or race the owner's tail under a lock
++    that lives in a different home.
+     """
+     import os
+     import sys
+@@ -734,7 +756,7 @@ def _prepare_borrowed_launch(root: Path, owner: Path, *, current: bool) -> Path
+     from hermes_cli._launchers import resolve_store_python
+     from hermes_cli.update_lock import UpdateLock
+ 
+-    if not current:
++    if not current and not _owner_environment_serves(root):
+         lock = UpdateLock(install_root=root, checkout_first=False)  # R6, as in prepare_launch
+         if not lock.acquire():
+             raise RuntimeError("an update is still running; wait for it to exit, then relaunch Hermes")
+diff --git a/pm/environments.py b/pm/environments.py
+index a66e9bd3d3..dc0fae72c6 100644
+--- a/pm/environments.py
++++ b/pm/environments.py
+@@ -110,6 +110,32 @@ def owning_home_root(project_root: Path) -> Path | None:
+     return owner
+ 
+ 
++def borrowed_venv(project_root: Path) -> Path | None:
++    """The environment the owning root committed for *project_root*, when the active root borrows it.
++
++    ``None`` for the owner itself, for a root with no owner, and for an owner record that does not
++    name a generation of its own state. Read-only: the owner's facts and input stamps are the
++    owner's. A borrower with nothing committed runs this generation (``activate_dependencies``)
++    instead of refusing, and a launch whose request it serves skips building one of its own
++    (``pm.install.borrowed_venv_is_current``).
++    """
++    owner = owning_home_root(project_root)
++    if owner is None:
++        return None
++    state = owner / "installs" / install_key(project_root)
++    try:
++        value = json.loads((state / "facts.json").read_text(encoding="utf-8-sig"))["packages"]["venv"]["environment"]
++        if not isinstance(value, str):
++            return None
++        environment = Path(value).resolve()
++        if (not environment.is_relative_to((state / "environments").resolve())
++                or not (environment / "pyvenv.cfg").is_file()):
++            return None
++    except (OSError, ValueError, KeyError, TypeError):
++        return None
++    return environment
++
++
+ def _launcher_bound_root(project_root: Path, candidates: list[Path]) -> Path | None:
+     """The candidate whose ``tools/`` holds the live interpreter the checkout's launcher execs."""
+     from hermes_cli._launchers import _launcher_python
+@@ -485,18 +511,41 @@ class NoCommittedEnvironment(RuntimeError):
+     """PM's store Python with no committed generation: no retry fixes it, only `hermes pm repair`."""
+ 
+ 
+-def _require_own_dependencies(project_root: Path) -> None:
++def _require_own_dependencies(project_root: Path) -> Path | None:
+     """With nothing committed, an interpreter keeps the packages it booted with.
+ 
+-    PM's store Python boots with none, so for it there is nothing to keep: refuse instead of
+-    running on whatever PYTHONPATH it inherited (historically the pre-PM in-tree venv).
++    PM's store Python boots with none, so for it there is nothing to keep. A root that borrows
++    the checkout runs the owner's committed generation instead (``borrowed_venv``); with no such
++    generation it refuses rather than running on whatever PYTHONPATH it inherited (historically
++    the pre-PM in-tree venv). Any other interpreter (a developer .venv, a test env) gets ``None``
++    and keeps its own packages.
++
++    The borrowed generation is leased as the owner's own processes and profiles lease it: a
++    per-process lock file in the owner's ``<generation>/.leases``, so the owner's collector never
++    removes it under a running borrower. Nothing else of the owner's state is written and its lock
++    is not taken: the selection is re-read after leasing, as an unlocked reader does. A lease
++    directory this user cannot write leaves the refusal in place.
+     """
+     import sys
+ 
+     if sys.prefix != sys.base_prefix:
+-        return  # a venv interpreter (developer .venv, test env) carries its own packages
+-    if Path(sys.base_prefix).resolve().is_relative_to(store_root(project_root).resolve()):
++        return None
++    if not Path(sys.base_prefix).resolve().is_relative_to(store_root(project_root).resolve()):
++        return None
++    environment = borrowed_venv(project_root)
++    if environment is not None:
++        from hermes_cli.runtime_state import lease_generation
++
++        try:
++            release = lease_generation(environment)
++            while (current := borrowed_venv(project_root)) not in (None, environment):
++                release()
++                environment, release = current, lease_generation(current)
++        except OSError:
++            environment = None
++    if environment is None:
+         raise NoCommittedEnvironment("no dependency environment is committed for this install")
++    return environment
+ 
+ 
+ def activate_dependencies(project_root: Path) -> None:
+@@ -517,26 +566,26 @@ def activate_dependencies(project_root: Path) -> None:
+             if held:
+                 recover_publication(project_root)
+             environment = committed_venv(project_root)
+-            if environment is None:
+-                return _require_own_dependencies(project_root)
+-            release = lease_generation(environment)
+-            # Without the lock, an installer may commit a new generation between the
+-            # read and the lease, leaving the leased one unselected and collectable.
+-            while not held and (current := committed_venv(project_root)) not in (None, environment):
+-                release()
+-                environment, release = current, lease_generation(current)
+-            selected = site_packages(environment)
+-            if not selected.is_dir() and not runtime_facts_path(project_root).is_file():
+-                return
++            if environment is not None:
++                release = lease_generation(environment)
++                # Without the lock, an installer may commit a new generation between the
++                # read and the lease, leaving the leased one unselected and collectable.
++                while not held and (current := committed_venv(project_root)) not in (None, environment):
++                    release()
++                    environment, release = current, lease_generation(current)
++                if not site_packages(environment).is_dir() and not runtime_facts_path(project_root).is_file():
++                    return
+     else:
+         # Sealed payloads still select once, before imports.
+         # Never consult VIRTUAL_ENV: it can describe the invoking shell's Python.
+         environment = payload_venv(project_root)
+-        if environment is None:
+-            return _require_own_dependencies(project_root)
+-        selected = site_packages(environment)
+-        if not selected.is_dir():
++        if environment is not None and not site_packages(environment).is_dir():
+             return  # External/Nix interpreter owns its original sys.path.
++    if environment is None:
++        environment = _require_own_dependencies(project_root)
++        if environment is None:
++            return
++    selected = site_packages(environment)
+     if not selected.is_dir():
+         raise RuntimeError(f"dependency environment has no site-packages: {selected}")
+     import site
+diff --git a/pm/install.py b/pm/install.py
+index 8805ff555d..4dc86f7617 100644
+--- a/pm/install.py
++++ b/pm/install.py
+@@ -801,6 +801,39 @@ def venv_is_current(*, extras: list[str] | None = None, plugins: Members | Candi
+     return _runtime_state_matches(fact, stamp, project_root=root)
+ 
+ 
++def borrowed_venv_is_current(*, project_root: Path | None = None) -> bool:
++    """Does the owner's committed generation serve a borrowing root that has none of its own?
++
++    A borrowing launch (``pm.environments.owning_home_root``) with no selection recorded asks for
++    what any first sync asks for (``first_generation_selection`` plus a pre-PM venv's extras). The
++    owner's generation serves it when its recorded extras already include that request and the
++    stamp recomputed here -- the checkout's lock, layout and Python, the plugin members THIS root
++    enables -- equals the owner's recorded stamp. A borrower enabling other plugins, or with a
++    selection of its own, keeps its own environment. Read-only: the owner's facts are only read.
++    """
++    from pm.environments import borrowed_venv, install_key, owning_home_root, runtime_facts_path
++    from pm.extras import first_generation_selection, pre_pm_baseline
++    from pm.packages import Venv
++
++    root = paths.repo_root() if project_root is None else Path(project_root).absolute()
++    owner = owning_home_root(root)
++    environment = borrowed_venv(root)
++    if owner is None or environment is None or Facts(runtime_facts_path(root), strict=True).get("venv") is not None:
++        return False
++    try:
++        fact = Facts(owner / "installs" / install_key(root) / "facts.json", strict=True).get("venv")
++    except (OSError, ValueError):
++        return False
++    if (not isinstance(fact, dict) or not isinstance(fact.get("stamp"), str) or not fact["stamp"]
++            or not isinstance(fact.get("extras"), list)
++            or any(not isinstance(extra, str) for extra in fact["extras"])):
++        return False
++    package = Venv(root)
++    requested = set(first_generation_selection(root) or []) | set(pre_pm_baseline(root))
++    enabled = sorted(set(_still_declared(package, fact["extras"])) | requested)
++    return package.expected_stamp(enabled) == fact["stamp"]
++
++
+ def _feature_policy(extras: Optional[list[str]], *, repair: bool) -> tuple[list[str] | None, list[str] | None]:
+     """Refuse extras this platform or a frozen bundle cannot carry; return (shipped, frozen)."""
+     from pm.features import read_features
+diff --git a/tests/hermes_cli/test_borrowed_home_launch.py b/tests/hermes_cli/test_borrowed_home_launch.py
+index ceda51fd05..144b4dd270 100644
+--- a/tests/hermes_cli/test_borrowed_home_launch.py
++++ b/tests/hermes_cli/test_borrowed_home_launch.py
+@@ -237,6 +237,44 @@ def test_borrowed_launch_already_on_the_store_interpreter_does_not_reexec(tmp_pa
+     assert borrowed_facts.is_file()
+ 
+ 
++@pytest.mark.parametrize("serves", [True, False])
++def test_a_borrowing_launch_runs_the_owners_generation_when_it_serves(tmp_path, monkeypatch, completion_tail, serves):
++    """When the owner's committed generation serves the borrower's request, the launch builds nothing
++    of its own: it relaunches on the store interpreter, whose boot leases the owner's generation."""
++    import pm
++    from hermes_cli import _launchers
++
++    root = _checkout(tmp_path, monkeypatch)
++    facts = _state(tmp_path / ".hermes", root)
++    owner_facts = facts.read_bytes()
++    _home(monkeypatch, tmp_path / "tmp" / "borrowed")
++    syncs = []
++    python = tmp_path / ".hermes" / "tools" / "python" / "bin" / "python3"
++    monkeypatch.setattr(pm, "venv_is_current", lambda **kw: bool(syncs))  # nothing of the borrower's own until it syncs
++    monkeypatch.setattr(venv_sync, "_owner_environment_serves", lambda r: serves)
++    monkeypatch.setattr(pm, "sync_venv", lambda extras=None, **kw: syncs.append(extras))
++    monkeypatch.setattr(_launchers, "resolve_store_python", lambda _, **__: python)
++    monkeypatch.setattr(venv_sync, "publish_launchers", lambda *a, **kw: pytest.fail("published the owner's launchers"))
++
++    assert venv_sync.prepare_launch(root, ["config", "path"]) == python
++    assert len(syncs) == (0 if serves else 1)
++    if serves:
++        assert not install_state_dir(root).exists(), "the borrower built state of its own"
++    assert facts.read_bytes() == owner_facts, "a borrowing launch wrote the owner's facts"
++    assert completion_tail == []
++
++
++def test_the_owner_check_needs_an_owner_generation_before_probing(tmp_path, monkeypatch):
++    """No generation named in the owner's facts: no probe, the borrower syncs its own."""
++    from hermes_cli import launch_probe
++
++    root = _checkout(tmp_path, monkeypatch)
++    _state(tmp_path / ".hermes", root)  # a record naming no environment
++    _home(monkeypatch, tmp_path / "tmp" / "borrowed")
++    monkeypatch.setattr(launch_probe, "probe", lambda *a, **kw: pytest.fail("probed with no owner generation"))
++    assert venv_sync._owner_environment_serves(root) is False
++
++
+ def test_temp_home_relaunch_imports_hermes_state_without_dropping_venv_deps(tmp_path):
+     """A venv-launched script under a temp HERMES_HOME re-enters on a bare interpreter.
+ 
+diff --git a/tests/hermes_cli/test_launch_probe.py b/tests/hermes_cli/test_launch_probe.py
+index e7bd50fcf7..fde7d2de90 100644
+--- a/tests/hermes_cli/test_launch_probe.py
++++ b/tests/hermes_cli/test_launch_probe.py
+@@ -80,6 +80,21 @@ def test_currency_reports_pm_verdict_for_requested_root(tmp_path, use_source, cu
+     assert seen.read_text() == str(tmp_path / "fixture-root")
+ 
+ 
++@posix
++@pytest.mark.parametrize("current", [True, False])
++def test_borrowed_activates_then_reports_the_owner_generation_verdict(tmp_path, use_source, current):
++    order = tmp_path / "order.txt"
++    source = _fake_source(tmp_path, "return True", f"open({str(order)!r}, 'a').write('deps ')")
++    (source / "pm" / "install.py").write_text(
++        "def borrowed_venv_is_current(*, project_root):\n"
++        f"    open({str(order)!r}, 'a').write('borrowed:' + str(project_root))\n"
++        f"    return {current}\n")
++    use_source(source)
++    assert launch_probe.probe(tmp_path / "r", "borrowed", timeout=BOUND) == {
++        "schema": 1, "state": "current" if current else "stale"}
++    assert order.read_text() == f"deps borrowed:{tmp_path / 'r'}"
++
++
+ @posix
+ def test_runtime_activates_dependencies_before_pm_and_returns_path(tmp_path, use_source):
+     order = tmp_path / "order.txt"
+diff --git a/tests/pm/test_borrowed_owner_environment.py b/tests/pm/test_borrowed_owner_environment.py
+new file mode 100644
+index 0000000000..ff5a775633
+--- /dev/null
++++ b/tests/pm/test_borrowed_owner_environment.py
+@@ -0,0 +1,160 @@
++"""A root that borrows a checkout runs the owner's committed generation instead of building its own.
++
++Layout: the owner is ``<tmp>/owner`` and the checkout ``<tmp>/owner/hermes-agent`` (the root the
++checkout sits in owns it, ``owning_home_root``); the borrower is a fresh ``HERMES_HOME``.
++"""
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++from pm import environments
++from pm.environments import borrowed_venv, install_key, install_state_dir, owning_home_root
++
++posix = pytest.mark.platforms("linux", "macos")
++
++
++def _checkout(tmp_path: Path, monkeypatch) -> Path:
++    import hermes_constants
++
++    monkeypatch.setattr(hermes_constants, "_get_platform_default_hermes_home", lambda: tmp_path / "default")
++    root = tmp_path / "owner" / "hermes-agent"
++    root.mkdir(parents=True)
++    (root / "pyproject.toml").write_text("[project]\nname='example'\n[project.optional-dependencies]\nall=[]\n",
++                                         encoding="utf-8")
++    return root
++
++
++def _owner_generation(owner: Path, root: Path, *, stamp: str = "owner-stamp", extras=("all",),
++                      environment: Path | None = None) -> Path:
++    state = owner / "installs" / install_key(root)
++    venv = state / "environments" / "gen" / "venv"
++    environments.site_packages(venv).mkdir(parents=True)
++    (venv / "pyvenv.cfg").write_text("home = test\n", encoding="utf-8")
++    (venv.parent / ".lease-managed").write_text("", encoding="utf-8")
++    (environments.site_packages(venv) / "owner_only.py").write_text("", encoding="utf-8")
++    (state / "facts.json").write_text(json.dumps({"schema": 1, "packages": {"venv": {
++        "environment": str(environment or venv), "extras": list(extras), "stamp": stamp}}}), encoding="utf-8")
++    return venv
++
++
++def _borrow(tmp_path: Path, monkeypatch) -> Path:
++    home = tmp_path / "scratch" / "borrower"
++    home.mkdir(parents=True)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    return home
++
++
++def test_a_borrower_resolves_the_owners_generation_read_only(tmp_path, monkeypatch):
++    root = _checkout(tmp_path, monkeypatch)
++    venv = _owner_generation(tmp_path / "owner", root)
++    facts = (tmp_path / "owner" / "installs" / install_key(root) / "facts.json").read_bytes()
++    _borrow(tmp_path, monkeypatch)
++    assert owning_home_root(root) == tmp_path / "owner"
++    assert borrowed_venv(root) == venv.resolve()
++    assert not install_state_dir(root).exists()
++    assert (tmp_path / "owner" / "installs" / install_key(root) / "facts.json").read_bytes() == facts
++
++    # The owner itself borrows nothing.
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "owner"))
++    assert borrowed_venv(root) is None
++
++
++def test_an_owner_record_outside_its_own_state_is_not_borrowed(tmp_path, monkeypatch):
++    root = _checkout(tmp_path, monkeypatch)
++    elsewhere = tmp_path / "elsewhere" / "venv"
++    elsewhere.mkdir(parents=True)
++    (elsewhere / "pyvenv.cfg").write_text("home = test\n", encoding="utf-8")
++    _owner_generation(tmp_path / "owner", root, environment=elsewhere)
++    _borrow(tmp_path, monkeypatch)
++    assert borrowed_venv(root) is None
++
++
++@pytest.fixture
++def stamps(monkeypatch):
++    """Stand in for the lock/layout digest: the stamp names the enabled extras and plugin members."""
++    from pm import extras, install, packages
++
++    members: list[str] = []
++    monkeypatch.setattr(packages.Venv, "expected_stamp",
++                        lambda self, enabled, **kw: "stamp:" + ",".join(sorted(enabled)) + "|" + ",".join(members))
++    monkeypatch.setattr(extras, "first_generation_selection", lambda root: ["all"])
++    monkeypatch.setattr(extras, "pre_pm_baseline", lambda root: [])
++    return members
++
++
++def test_the_owners_generation_serves_a_borrower_with_the_same_request(tmp_path, monkeypatch, stamps):
++    from pm.install import borrowed_venv_is_current
++
++    root = _checkout(tmp_path, monkeypatch)
++    _owner_generation(tmp_path / "owner", root, stamp="stamp:all|")
++    _borrow(tmp_path, monkeypatch)
++    assert borrowed_venv_is_current(project_root=root)
++    assert not install_state_dir(root).exists(), "the check wrote borrower state"
++
++    # A borrower enabling other plugins keeps its own environment.
++    stamps.append("plugin-x")
++    assert not borrowed_venv_is_current(project_root=root)
++
++
++def test_a_borrower_with_a_selection_of_its_own_keeps_it(tmp_path, monkeypatch, stamps):
++    from pm.install import borrowed_venv_is_current
++
++    root = _checkout(tmp_path, monkeypatch)
++    _owner_generation(tmp_path / "owner", root, stamp="stamp:all|")
++    _borrow(tmp_path, monkeypatch)
++    own = install_state_dir(root) / "facts.json"
++    own.parent.mkdir(parents=True)
++    own.write_text(json.dumps({"schema": 1, "packages": {"venv": {"environment": "x", "stamp": "s"}}}),
++                   encoding="utf-8")
++    assert not borrowed_venv_is_current(project_root=root)
++
++
++def test_an_owner_generation_missing_requested_extras_does_not_serve(tmp_path, monkeypatch, stamps):
++    from pm import extras
++    from pm.install import borrowed_venv_is_current
++
++    root = _checkout(tmp_path, monkeypatch)
++    _owner_generation(tmp_path / "owner", root, stamp="stamp:all|", extras=())
++    _borrow(tmp_path, monkeypatch)
++    monkeypatch.setattr(extras, "first_generation_selection", lambda root: ["all", "voice"])
++    assert not borrowed_venv_is_current(project_root=root)
++
++
++@posix
++@pytest.mark.parametrize("owned", [True, False])
++def test_a_store_python_borrower_activates_the_owners_generation(tmp_path, monkeypatch, owned):
++    """`HERMES_HOME=<tmp> hermes --version`: nothing committed under the borrower, so PM's store Python
++    runs the owner's generation (leased in place) instead of refusing; with no owner it still refuses."""
++    root = _checkout(tmp_path, monkeypatch)
++    venv = _owner_generation(tmp_path / "owner", root) if owned else None
++    home = _borrow(tmp_path, monkeypatch)
++    base_prefix = Path(sys.base_prefix).resolve()
++    repo = Path(__file__).resolve().parents[2]
++    code = (
++        "import sys, importlib.util; from pathlib import Path; sys.path.insert(0, sys.argv[1])\n"
++        "import hermes_constants; hermes_constants._get_platform_default_hermes_home = lambda: Path(sys.argv[3])\n"
++        "from pm.environments import activate_dependencies\n"
++        "try:\n    activate_dependencies(Path(sys.argv[2]))\n"
++        "except RuntimeError as exc:\n    print('refused:', exc); raise SystemExit(0)\n"
++        "import os\n"
++        "print('owner importable:', importlib.util.find_spec('owner_only') is not None)\n"
++        "print('leases:', len(os.listdir(sys.argv[4])) if os.path.isdir(sys.argv[4]) else 0)\n"
++    )
++    env = {**os.environ, "HERMES_HOME": str(home), "HERMES_RUNTIME_DIR": str(base_prefix.parent)}
++    env.pop("PYTHONPATH", None)
++    leases = str(venv.parent / ".leases") if venv else str(tmp_path / "none")
++    result = subprocess.run([getattr(sys, "_base_executable", sys.executable), "-I", "-c", code, str(repo),
++                             str(root), str(tmp_path / "default"), leases],
++                            env=env, capture_output=True, text=True, timeout=30, check=False)
++    assert result.returncode == 0, result.stderr
++    if owned:
++        assert result.stdout.splitlines() == ["owner importable: True", "leases: 1"], result.stdout
++        assert not (home / "installs").exists(), "the borrower built state of its own"
++    else:
++        assert result.stdout.startswith("refused: no dependency environment is committed"), result.stdout
+-- 
+2.51.0
+

@@ -1,0 +1,255 @@
+From 3153a2603635c7e2c828fcd72c4ff300a98870fc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:14:44 +0000
+Subject: [PATCH] [daveey] tests: FakeHub/FakeService release share
+ releaseDiagnostic + evidence helpers
+
+Follow-up to PR #1960 exact-head review 5887860374 (three non-blocking
+nits), checked against hermes-hub worker/src/transitions.ts
+releaseTask/releaseDiagnostic on main:
+
+- One helper for both routes: FakeService.release_diagnostic (as
+  releaseDiagnostic) and FakeService.release_evidence (run metadata +
+  event evidence) are used by the leases release (_release_run) and by
+  FakeService.release_op, as the real releaseTask is one function for
+  both. release_op now truncates past MAX_DIAGNOSTIC_CHARS, marks a
+  protocol_violation crash in run metadata and merges a neutral
+  release's extra (+ owner_restart) like the leases path. The
+  protocol-violation streak stays unmodelled (docstring).
+- Truncation length matches JSON.stringify(value).length: compact
+  separators, ensure_ascii=False, counted in UTF-16 code units, so
+  non-ASCII is not over-counted and astral characters count two.
+- A diagnostic that is not an object (string, list, 0, false, "") is
+  refused `invalid` for every outcome on both routes and changes
+  nothing. As in releaseTask the check runs after fence() (a non-holder
+  still gets lease_lost) and before any write.
+
+Tests (tests/hermes_cli/test_kanban_sync_rejections.py): 82 new cases;
+78 fail on the #1960 fake, the other 4 (leases-path ASCII truncation
+and neutral extra) guard already-modelled behaviour. All 55 test files
+importing kanban_sync_fake_board / FakeService: 1089 passed, 10 skipped.
+---
+ tests/hermes_cli/kanban_sync_fake_board.py    | 71 ++++++++++++++-----
+ .../hermes_cli/test_kanban_sync_rejections.py | 68 ++++++++++++++++++
+ 2 files changed, 121 insertions(+), 18 deletions(-)
+
+diff --git a/tests/hermes_cli/kanban_sync_fake_board.py b/tests/hermes_cli/kanban_sync_fake_board.py
+index 4d08918d19..28b13aaf88 100644
+--- a/tests/hermes_cli/kanban_sync_fake_board.py
++++ b/tests/hermes_cli/kanban_sync_fake_board.py
+@@ -133,28 +133,61 @@ class FakeService:
+     RELEASE_OUTCOMES = frozenset({"released", *NEUTRAL, "crashed", "timed_out", "spawn_failed", "terminal_provider"})
+     # transitions.ts MAX_DIAGNOSTIC_CHARS: a larger holder diagnostic is replaced by ``{diagnostic_truncated: true}``.
+     MAX_DIAGNOSTIC_CHARS = 8000
++    CANONICAL = frozenset({"crashed", "timed_out", "terminal_provider"})
++
++    @classmethod
++    def release_diagnostic(cls, value: object) -> Optional[dict]:
++        """As transitions.ts releaseDiagnostic: absent -> ``{}``; anything but an object -> None (the caller
++        refuses the release ``invalid``); past MAX_DIAGNOSTIC_CHARS of ``JSON.stringify`` (UTF-16 code units, no
++        ASCII escaping) -> ``{diagnostic_truncated: true}``; else a copy."""
++        if value is None:
++            return {}
++        if not isinstance(value, dict):
++            return None
++        text = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
++        return {"diagnostic_truncated": True} if len(text.encode("utf-16-le")) // 2 > cls.MAX_DIAGNOSTIC_CHARS \
++            else dict(value)
++
++    @classmethod
++    def release_evidence(cls, outcome: str, op: dict, diagnostic: dict) -> tuple[dict, dict]:
++        """releaseTask's (run metadata, event evidence) for ``outcome``, shared by the ops and leases routes (the
++        real releaseTask is one function for both). Neutral: the holder's ``extra`` (+ ``owner_restart: true``)
++        for both. Otherwise the diagnostic is evidence only for a canonical failure, and a ``crashed`` release
++        with ``protocol_violation: true`` also marks the run metadata. ``unused_grant`` is the caller's."""
++        if outcome in cls.NEUTRAL:
++            meta = {**(op.get("extra") or {}), **({"owner_restart": True} if outcome == "owner_restart" else {})}
++            return meta, meta
++        evidence = diagnostic if outcome in cls.CANONICAL else {}
++        protocol = outcome == "crashed" and op.get("protocol_violation") is True
++        return {**evidence, **({"protocol_violation": True} if protocol else {})}, evidence
+ 
+     def release_op(self, b: dict, op: dict, gw: str) -> dict:
+         """As transitions.ts releaseTask: only the lease holder's run is released; the Board ends that run, emits
+-        its one outcome event (carrying the holder's ``diagnostic``) and books a charged outcome exactly once."""
++        its one outcome event (carrying :meth:`release_evidence`) and books a charged outcome exactly once.
++        Not modelled: the protocol-violation streak (a ``protocol_violation`` crash is charged like any crash)."""
+         task, run = op["task"], op["run_uid"]
+         if op.get("outcome", "released") not in self.RELEASE_OUTCOMES:
+             return {"status": "rejected", "reason": "invalid"}
+         lease = b["leases"].get(task)
+         if not lease or lease["holder"] != gw or lease["run_uid"] != run:
+             return {"status": "rejected", "reason": "lease_lost"}
++        # releaseDiagnostic runs after fence(), before any write, for every outcome.
++        diagnostic = self.release_diagnostic(op.get("diagnostic"))
++        if diagnostic is None:
++            return {"status": "rejected", "reason": "invalid"}
+         outcome, op_id = op.get("outcome", "released"), op["client_op_id"]
+         clock = f"{9_999_999_999_999:013d}-0002-board"
+         error = str(op.get("error") or outcome)[:500]
+         card = b["rows"]["tasks"][task]
+         b["leases"].pop(task, None)
+         ended, kind = self.NEUTRAL.get(outcome, ("crashed" if outcome == "terminal_provider" else outcome,) * 2)
+-        canonical = outcome in ("crashed", "timed_out", "terminal_provider")
+-        diag = dict(op.get("diagnostic") or {}) if canonical else {}
++        canonical = outcome in self.CANONICAL
++        meta, evidence = self.release_evidence(outcome, op, diagnostic)
+         self._put(b, "task_runs", run, {"status": ended, "outcome": ended, "ended_at": int(time.time()),
+                                         "error": None if outcome == "released" else error,
+-                                        "metadata": json.dumps(diag) if diag else None}, "server", op_id, clock)
+-        payload = {**diag, **({"failure_notice": "canonical"} if canonical else {}), "error": error, "retry_status": "ready"}
++                                        "metadata": json.dumps(meta) if meta else None}, "server", op_id, clock)
++        payload = {**evidence, **({"failure_notice": "canonical"} if canonical else {}), "error": error,
++                   "retry_status": "ready"}
+         self._put(b, "task_events", f"ev-{op_id}-{kind}", {"task_id": task, "run_uid": run, "kind": kind,
+                                                             "payload": json.dumps(payload), "created_at": int(time.time())},
+                   "server", op_id, clock)
+@@ -280,12 +313,17 @@ class FakeHub:
+                 # releaseTask's fence(): a release that does not name this gateway's live lease run is refused and
+                 # changes nothing (the card keeps its lease and mirror).
+                 return {"status": "rejected", "reason": "lease_lost", "lease": cur}
++            # releaseDiagnostic runs after fence(), before any write: a non-object diagnostic is ``invalid`` for
++            # every outcome and changes nothing.
++            diagnostic = self.svc.release_diagnostic(body.get("diagnostic"))
++            if diagnostic is None:
++                return {"status": "rejected", "reason": "invalid", "lease": cur}
+             b["leases"].pop(task, None)
+             runs, card = b["rows"].get("task_runs", {}), b["rows"].get("tasks", {}).get(task)
+             if self.svc.lease_runs and card is not None:
+                 retry = self.svc.retry_status_for_run(b, card.get("current_run_uid"))
+                 if run in runs and runs[run].get("ended_at") is None:
+-                    self._release_run(b, task, run, body, retry, op_id, hlc)
++                    self._release_run(b, task, run, body, retry, op_id, hlc, diagnostic)
+                 else:
+                     # clearLease drops the lease mirror; a still-running card goes back to retryStatusForRun; endRun
+                     # clears current_run_uid even when the holder already ended its run row.
+@@ -296,12 +334,14 @@ class FakeHub:
+         return {"status": "applied", "lease": b["leases"][task], "version": version}
+ 
+     def _release_run(self, b: dict, task: str, run: str, body: dict, retry: str, op_id: Optional[str],
+-                     hlc: str) -> None:
++                     hlc: str, diagnostic: dict) -> None:
+         """As transitions.ts releaseTask (via board.ts ``leases`` release) for the holder's live run: the run ends,
+         a running card goes back to ``retry`` (retryStatusForRun) and the run-outcome event always carries it as
+         ``retry_status``.
+ 
+-        Modelled outcomes (anything outside ``FakeService.RELEASE_OUTCOMES`` is refused ``invalid`` before this):
++        Modelled outcomes (anything outside ``FakeService.RELEASE_OUTCOMES``, or a non-object ``diagnostic``, is
++        refused ``invalid`` before this); run metadata and event evidence come from
++        :meth:`FakeService.release_evidence`, shared with :meth:`FakeService.release_op`:
+         - neutral (``FakeService.NEUTRAL`` = NEUTRAL_RELEASES): the run ends as its mapped outcome and emits its
+           mapped event; the holder's ``extra`` (plus ``owner_restart: true``) is merged into run metadata and payload.
+         - ``released``, ``crashed``, ``timed_out``, ``terminal_provider`` (-> ``crashed``): the run ends as that
+@@ -320,25 +360,20 @@ class FakeHub:
+         card = b["rows"]["tasks"][task]
+         running = card.get("status") == "running"
+         neutral = svc.NEUTRAL.get(outcome)
++        meta, evidence = svc.release_evidence(outcome, body, diagnostic)
+         if neutral:
+             ended, kind = neutral
+-            meta = {**(body.get("extra") or {}), **({"owner_restart": True} if outcome == "owner_restart" else {})}
+             run_fields = {"error": error, "metadata": json.dumps(meta, separators=(",", ":")) if meta else None}
+-            payload: dict = {**meta, "error": error, "retry_status": retry}
++            payload: dict = {**evidence, "error": error, "retry_status": retry}
+             task_fields = {"status": retry, "last_failure_error": error} if running else {}
+         else:
+             ended = kind = "crashed" if outcome == "terminal_provider" else outcome
+             unused = bool(body.get("unused_grant")) and outcome == "released" and running
+-            canonical = outcome in ("crashed", "timed_out", "terminal_provider")
++            canonical = outcome in svc.CANONICAL
+             err = None if outcome == "released" else error
+-            diag = dict(body.get("diagnostic") or {}) if canonical else {}
+-            if len(json.dumps(diag, separators=(",", ":"))) > svc.MAX_DIAGNOSTIC_CHARS:
+-                diag = {"diagnostic_truncated": True}
+-            meta = {**diag, **({"protocol_violation": True}
+-                               if outcome == "crashed" and body.get("protocol_violation") is True else {}),
+-                    **({"unused_grant": True} if unused else {})}
++            meta = {**meta, **({"unused_grant": True} if unused else {})}
+             run_fields = {"error": err, **({"metadata": json.dumps(meta, separators=(",", ":"))} if meta else {})}
+-            payload = {**diag, **({"failure_notice": "canonical"} if canonical else {}), "error": err,
++            payload = {**evidence, **({"failure_notice": "canonical"} if canonical else {}), "error": err,
+                        "retry_status": retry, **({"terminal_provider": True} if outcome == "terminal_provider" else {}),
+                        **({"unused_grant": True} if unused else {})}
+             task_fields = {"status": retry, **({"last_failure_error": error} if outcome == "rate_limited" else {})} \
+diff --git a/tests/hermes_cli/test_kanban_sync_rejections.py b/tests/hermes_cli/test_kanban_sync_rejections.py
+index 2b6808abd5..15cc82baeb 100644
+--- a/tests/hermes_cli/test_kanban_sync_rejections.py
++++ b/tests/hermes_cli/test_kanban_sync_rejections.py
+@@ -444,6 +444,74 @@ def test_fake_lease_release_rejects_unknown_outcome(live, kanban_home, lease_run
+     assert svc.board(BOARD) == before
+ 
+ 
++def _release(route, svc, hub, tid, **fields):
++    """Release RUN through the leases route or the ops route (both are transitions.ts releaseTask)."""
++    if route == "leases":
++        return hub.leases(BOARD, {"action": "release", "task": tid, "run_uid": RUN, "client_op_id": "r", **fields})
++    return svc.release_op(svc.board(BOARD), {"op": "release", "task": tid, "run_uid": RUN, "client_op_id": "r",
++                                             **fields}, ME)
++
++
++def _outcome_event(svc, kind):
++    [event] = [e for e in svc.board(BOARD)["rows"]["task_events"].values()
++               if e["run_uid"] == RUN and e["kind"] == kind]
++    return json.loads(event["payload"])
++
++
++@pytest.mark.parametrize("route", ["leases", "ops"])
++@pytest.mark.parametrize("tail,truncated", [
++    # JSON.stringify counts UTF-16 code units with no \uXXXX escaping: 3000 "é" is 3011 chars, kept (ASCII
++    # escaping would count 18011 and truncate)...
++    ("é" * 3000, False),
++    # ...and an astral character is two code units: 3995 emoji is 8001 chars, truncated (code points: 4006).
++    ("\U0001F600" * 3995, True),
++    ("x" * 7989, False),  # {"tail":"..."} is exactly MAX_DIAGNOSTIC_CHARS: kept.
++    ("x" * 7990, True),
++], ids=["e-acute-3000-kept", "emoji-3995-truncated", "ascii-at-limit-kept", "ascii-over-limit-truncated"])
++def test_fake_release_truncates_diagnostic_like_json_stringify(live, kanban_home, route, tail, truncated):
++    """As releaseDiagnostic on both routes: ``JSON.stringify(value).length > MAX_DIAGNOSTIC_CHARS`` replaces the
++    diagnostic by ``{diagnostic_truncated: true}`` in run metadata and the event, with a protocol_violation crash
++    also marked in run metadata."""
++    svc = FakeService(lease_runs=True)
++    hub, tid = _leased(live, svc)
++    res = _release(route, svc, hub, tid, outcome="crashed", diagnostic={"tail": tail}, protocol_violation=True)
++    assert res["status"] == "applied"
++    evidence = {"diagnostic_truncated": True} if truncated else {"tail": tail}
++    run = svc.board(BOARD)["rows"]["task_runs"][RUN]
++    assert json.loads(run["metadata"]) == {**evidence, "protocol_violation": True}
++    payload = _outcome_event(svc, "crashed")
++    assert {k: payload.get(k) for k in evidence} == evidence
++    assert "protocol_violation" not in payload
++
++
++@pytest.mark.parametrize("route", ["leases", "ops"])
++def test_fake_release_neutral_merges_extra_on_both_routes(live, kanban_home, route):
++    """As releaseTask's NEUTRAL_RELEASES branch on both routes: the holder's ``extra`` (+ ``owner_restart``) lands
++    in run metadata and the event; a diagnostic does not."""
++    svc = FakeService(lease_runs=True)
++    hub, tid = _leased(live, svc)
++    res = _release(route, svc, hub, tid, outcome="owner_restart", extra={"host": "mini"}, diagnostic={"rc": 1})
++    assert res["status"] == "applied"
++    assert json.loads(svc.board(BOARD)["rows"]["task_runs"][RUN]["metadata"]) == {"host": "mini",
++                                                                                   "owner_restart": True}
++    payload = _outcome_event(svc, "owner_restart_lost")
++    assert (payload["host"], payload["owner_restart"], "rc" in payload) == ("mini", True, False)
++
++
++@pytest.mark.parametrize("route,lease_runs", [("leases", True), ("leases", False), ("ops", True)])
++@pytest.mark.parametrize("outcome", ["released", "crashed", "timed_out", "owner_down"])
++@pytest.mark.parametrize("diagnostic", ["boom", [["exit_code", 1]], [], "", 0, False])
++def test_fake_release_rejects_non_object_diagnostic(live, kanban_home, route, lease_runs, outcome, diagnostic):
++    """As releaseDiagnostic: a diagnostic that is not an object is ``invalid`` for every outcome (not only the
++    canonical failures that use it) and changes nothing."""
++    svc = FakeService(lease_runs=lease_runs)
++    hub, tid = _leased(live, svc)
++    before = copy.deepcopy(svc.board(BOARD))
++    res = _release(route, svc, hub, tid, outcome=outcome, diagnostic=diagnostic)
++    assert (res["status"], res["reason"]) == ("rejected", "invalid")
++    assert svc.board(BOARD) == before
++
++
+ def test_fake_lease_release_spawn_failed_is_not_modelled(live, kanban_home):
+     """releaseTask hands spawn_failed to endCustody + recordTaskFailure; the fake refuses it loudly."""
+     svc = FakeService(lease_runs=True)
+-- 
+2.51.0
+

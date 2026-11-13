@@ -1,0 +1,755 @@
+From e4afb133ddb7cf856966485405d345307a6683f9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 18:30:50 +0000
+Subject: [PATCH] feat(kanban): enforce explicit card review requirements
+ [daveey]
+
+---
+ hermes_cli/kanban.py                          |  11 +-
+ hermes_cli/kanban_db.py                       |  26 +--
+ hermes_cli/kanban_db_connect.py               |   1 +
+ hermes_cli/kanban_db_operator.py              |   9 +-
+ hermes_cli/kanban_db_sync.py                  |   2 +-
+ hermes_cli/kanban_output.py                   |   2 +-
+ hermes_cli/kanban_parser.py                   |   2 +
+ hermes_cli/kanban_placement.py                |   6 +-
+ hermes_cli/kanban_placement_forward.py        |   1 +
+ hermes_cli/kanban_review_required.py          |  26 +++
+ .../test_kanban_review_required_plumbing.py   | 203 ++++++++++++++++++
+ tests/tools/test_kanban_review_required.py    | 116 ++++++++++
+ tools/kanban_tools.py                         |  18 +-
+ tools/kanban_tools_schemas.py                 |   1 +
+ 14 files changed, 393 insertions(+), 31 deletions(-)
+ create mode 100644 hermes_cli/kanban_review_required.py
+ create mode 100644 tests/hermes_cli/test_kanban_review_required_plumbing.py
+ create mode 100644 tests/tools/test_kanban_review_required.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 64491e751a..ec42318916 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -480,6 +480,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+                 max_retries=max_retries, model_override=getattr(args, "model_override", None),
+                 provider_override=getattr(args, "provider_override", None), pin_mandatory=bool(getattr(args, "pin_mandatory", False)),
+                 goal_mode=bool(getattr(args, "goal_mode", False)),
++                review_required=bool(getattr(args, "review_required", False)),
+                 goal_max_turns=getattr(args, "goal_max_turns", None),
+                 reasoning_effort=getattr(args, "reasoning_effort", None),
+                 completion_contract=getattr(args, "completion_contract", None),
+@@ -1219,6 +1220,7 @@ def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint:
+ 
+ def _cmd_complete(args: argparse.Namespace) -> int:
+     """Mark one or more tasks done. Supports a single id or a list."""
++    from hermes_cli.kanban_review_required import ReviewRequiredError
+     ids, rc = _require_ids(args)
+     if rc:
+         return rc
+@@ -1260,6 +1262,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
+             except _review_contract.IndependenceRefused as outside:  # --force does not override it [daveey]
+                 fail_msg[tid] = f"cannot complete {tid}: {outside}"
+                 return False
++            except ReviewRequiredError as review_err:
++                fail_msg[tid] = str(review_err)
++                return False
+             except kb.LiveClaimError:
+                 fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
+                                  f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
+@@ -1287,7 +1292,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
+         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
+ 
+ 
+-_OPERATOR_EDIT_FLAGS = ("max_retries", "goal_mode", "goal_max_turns", "max_runtime_seconds", "session_id")
++_OPERATOR_EDIT_FLAGS = ("max_retries", "goal_mode", "goal_max_turns", "max_runtime_seconds", "session_id", "review_required")
+ 
+ 
+ def _cmd_edit(args: argparse.Namespace) -> int:
+@@ -1312,6 +1317,8 @@ def _cmd_edit(args: argparse.Namespace) -> int:
+     operator = {name: getattr(args, name, None) for name in _OPERATOR_EDIT_FLAGS}
+     if operator["goal_mode"] is not None:
+         operator["goal_mode"] = operator["goal_mode"] == "on"
++    if operator["review_required"] is not None:
++        operator["review_required"] = operator["review_required"] == "on"
+     has_operator = any(value is not None for value in operator.values())
+     has_admission = any(value is not None for value in admission.values())
+     if has_operator and has_admission:
+@@ -1321,7 +1328,7 @@ def _cmd_edit(args: argparse.Namespace) -> int:
+     if all(value is None for value in (title, body, priority, priority_bump, result)) and not (has_operator or has_admission):
+         return _err(
+             "kanban edit: provide --title, --body, --priority, --result, --max-retries, --goal-mode, "
+-            "--goal-max-turns, --max-runtime-seconds, --session-id, or --completion-contract", 2,
++            "--goal-max-turns, --max-runtime-seconds, --session-id, --review-required, or --completion-contract", 2,
+         )
+     if getattr(args, "force", False) and operator["session_id"] is None:
+         return _err("kanban edit: --force only applies to --session-id", 2)
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index defa7b8f3d..59db15152f 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -651,6 +651,7 @@ class Task:
+     # done / budget exhausted (-> kanban_block); ``goal_max_turns`` None -> goals default.
+     goal_mode: bool = False
+     goal_max_turns: Optional[int] = None
++    review_required: bool = False
+     session_id: Optional[str] = None         # originating HERMES_SESSION_ID; NULL from CLI/dashboard
+     # VALID_BLOCK_KINDS or None (legacy); kept across unblock so a same-kind re-block reads as a loop.
+     block_kind: Optional[str] = None
+@@ -679,6 +680,7 @@ class Task:
+             human_request=_json_or(g("human_request")),
+             requires=_json_or(g("requires")) or [],
+             goal_mode=bool(g("goal_mode")),
++            review_required=bool(g("review_required", 0)),
+             block_recurrences=int(g("block_recurrences") or 0),
+             admission_class=g("admission_class", "normal"),
+             admission_frees=g("admission_frees"),
+@@ -853,13 +855,11 @@ CREATE TABLE IF NOT EXISTS tasks (
+     -- case) falls through to the dispatcher-level ``kanban.failure_limit``
+     -- config and then ``DEFAULT_FAILURE_LIMIT``.
+     max_retries          INTEGER,
+-    -- When 1, the dispatched worker runs in a Ralph-style goal loop: an
+-    -- auxiliary judge re-evaluates the worker's response against the
+-    -- card title/body after each turn and feeds a continuation prompt
+-    -- back into the SAME session until the judge agrees the work is done
+-    -- or ``goal_max_turns`` is exhausted. NULL/0 = classic single-shot
+-    -- worker (the default).
++    -- Goal loop: an auxiliary judge checks each turn against the card title/body,
++    -- continuing in the SAME session until done or ``goal_max_turns`` is exhausted.
++    -- NULL/0 = classic single-shot worker (the default).
+     goal_mode            INTEGER NOT NULL DEFAULT 0,
++    review_required      INTEGER NOT NULL DEFAULT 0,
+     -- Goal-loop turn budget for ``goal_mode`` workers. NULL = use the
+     -- goals-engine default.
+     goal_max_turns       INTEGER,
+@@ -1195,7 +1195,7 @@ def create_task(
+     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
+     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
+     project_source_task_id: Optional[str] = None, creator_task_id: Optional[str] = None,
+-    completion_contract: Optional[str] = None,
++    completion_contract: Optional[str] = None, review_required: bool = False,
+     validate_workspace: bool = False, validate_skills: bool = False,
+     human_request: Optional[dict] = None,
+     origin_intent: Optional[dict] = None, chat_origin: Optional[str] = None,
+@@ -1348,8 +1348,8 @@ def create_task(
+                         branch_name, project_id, tenant, idempotency_key, max_runtime_seconds,
+                         skills, max_retries, model_override, provider_override, model_pin_mandatory, reasoning_effort,
+                         goal_mode, goal_max_turns, session_id, completion_contract, requires, placement_policy,
+-                        admission_class, admission_frees
+-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                        admission_class, admission_frees, review_required
++                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     """,
+                     (
+                         task_id, title.strip(), body, assignee, task_status, kanban_priority.bounded(priority),
+@@ -1358,7 +1358,7 @@ def create_task(
+                         json.dumps(skills_list) if skills_list is not None else None,
+                         _opt_int(max_retries), model_override, provider_override, pin_column,
+                         reasoning_effort, 1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+-                        json.dumps(required), placement_policy, admission_class, admission_frees,
++                        json.dumps(required), placement_policy, admission_class, admission_frees, int(bool(review_required)),
+                     ),
+                 )
+                 _sync.set_runs_on(conn, task_id, runs_on)  # placement labels (RFC "Placement"), synced boards only
+@@ -2504,10 +2504,11 @@ def complete_task(
+     whitespace-only evidence raises :class:`EmptyCompletionError` after an
+     auditable event. Approving a card out of ``review`` stays exempt.
+     """
++    from hermes_cli.kanban_review_required import require_review
++    require_review(conn, task_id, expected_run_id, placement_settled=placement_settled)
+     from hermes_cli import kanban_completion_receipt as receipt_admission
+     metadata, receipt_owners = receipt_admission.prepare(conn, task_id, metadata)
+     now = int(time.time())
+-    # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
+     if not _parents_satisfied(conn, task_id):
+         return False
+     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
+@@ -2523,8 +2524,7 @@ def complete_task(
+     from hermes_cli.kanban_metadata_files import discard_on_error
+     staged: list[Path] = []
+     with discard_on_error(staged), write_txn(conn):
+-        # Hard invariant even for human review approval: a parent may have
+-        # reopened while this task waited.
++        require_review(conn, task_id, expected_run_id, placement_settled=placement_settled)
+         if not _parents_satisfied(conn, task_id):
+             return False
+         receipt_admission.recheck(conn, task_id, receipt_owners)
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 7fc78c92b0..850e924e75 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1075,6 +1075,7 @@ _LATER_TASK_COLUMNS = (
+     ("reasoning_effort", "reasoning_effort TEXT"),
+     # Ralph-style goal loop toggle; 0 = classic single-shot worker.
+     ("goal_mode", "goal_mode INTEGER NOT NULL DEFAULT 0"),
++    ("review_required", "review_required INTEGER NOT NULL DEFAULT 0"),
+     ("goal_max_turns", "goal_max_turns INTEGER"),
+     ("completion_contract", "completion_contract TEXT"),
+     ("placement_policy", "placement_policy TEXT"),
+diff --git a/hermes_cli/kanban_db_operator.py b/hermes_cli/kanban_db_operator.py
+index 4f465b1f98..8a10e2bb05 100644
+--- a/hermes_cli/kanban_db_operator.py
++++ b/hermes_cli/kanban_db_operator.py
+@@ -5,6 +5,7 @@ which sqlite-live-guard refuses. [daveey]"""
+ 
+ from __future__ import annotations
+ 
++import os
+ import sqlite3
+ import time
+ from typing import Any, Optional
+@@ -18,7 +19,7 @@ class KanbanEditRefused(ValueError):
+ 
+ def edit_operator_fields(
+     conn: sqlite3.Connection, task_id: str, *, max_retries: Optional[int] = None,
+-    goal_mode: Optional[bool] = None, goal_max_turns: Optional[int] = None,
++    goal_mode: Optional[bool] = None, goal_max_turns: Optional[int] = None, review_required: Optional[bool] = None,
+     max_runtime_seconds: Optional[int] = None, session_id: Optional[str] = None,
+     force: bool = False, board: Optional[str] = None,
+ ) -> Optional[dict[str, dict[str, Any]]]:
+@@ -39,6 +40,10 @@ def edit_operator_fields(
+         wanted[field] = int(value)
+     if goal_mode is not None:
+         wanted["goal_mode"] = 1 if goal_mode else 0
++    if review_required is not None:
++        if not review_required and os.environ.get("HERMES_KANBAN_TASK"):
++            raise KanbanEditRefused("review_required can only be disabled by an orchestrator, not a worker")
++        wanted["review_required"] = int(bool(review_required))
+     if session_id is not None:
+         sid = str(session_id).strip()
+         if not sid:
+@@ -46,7 +51,7 @@ def edit_operator_fields(
+         wanted["session_id"] = sid
+     with _kb.write_txn(conn):
+         row = conn.execute(
+-            "SELECT max_retries, goal_mode, goal_max_turns, max_runtime_seconds, session_id "
++            "SELECT max_retries, goal_mode, goal_max_turns, max_runtime_seconds, session_id, review_required "
+             "FROM tasks WHERE id = ?", (task_id,),
+         ).fetchone()
+         if row is None:
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index b39426b9eb..b84ab57460 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -59,7 +59,7 @@ SYNCED_COLUMNS: dict[str, frozenset[str]] = {
+         "workflow_template_id", "current_step_key", "skills", "requires", "model_override",
+         "provider_override", "model_pin_mandatory", "reasoning_effort", "max_retries", "goal_mode", "goal_max_turns",
+         "block_kind", "human_request", "block_recurrences", "completion_contract", "runs_on", "placement_policy",
+-        "admission_class", "admission_frees",
++        "admission_class", "admission_frees", "review_required",
+     }),
+     "task_links": frozenset({"parent_id", "child_id"}),
+     "task_comments": frozenset({"task_id", "author", "body", "created_at"}),
+diff --git a/hermes_cli/kanban_output.py b/hermes_cli/kanban_output.py
+index 24132a63f3..bfb017a19c 100644
+--- a/hermes_cli/kanban_output.py
++++ b/hermes_cli/kanban_output.py
+@@ -18,7 +18,7 @@ _TASK_DICT_FIELDS = (
+     "human_request", "current_run_id",
+     "workspace_kind", "workspace_path", "branch_name", "project_id",
+     "created_by", "created_at", "started_at", "completed_at", "result",
+-    "skills", "max_runtime_seconds", "max_retries", "goal_mode", "goal_max_turns",
++    "skills", "max_runtime_seconds", "max_retries", "goal_mode", "goal_max_turns", "review_required",
+     "model_override", "provider_override",
+     "session_id", "workflow_template_id", "current_step_key", "completion_contract", "last_failure_error",
+ )
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 21ff6b1550..e22b4a9e20 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -309,6 +309,7 @@ _SPECS = [
+                   "Requires --model."),
+         _arg("--completion-contract", metavar="CONTRACT",
+              help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
++        _arg("--review-required", action="store_true", help="Require a reviewer before completion"),
+         _arg("--goal", action="store_true", dest="goal_mode",
+              help="Run the worker in a goal loop: after each turn a judge checks the "
+                   "response against the card title/body and, if not done, the worker "
+@@ -504,6 +505,7 @@ _SPECS = [
+              help="Per-task failure circuit breaker: block on the Nth consecutive failure"),
+         _arg("--goal-mode", choices=["on", "off"], dest="goal_mode",
+              help="Run the worker in a goal loop (on) or single-shot (off)"),
++        _arg("--review-required", choices=["on", "off"], help="Require review (workers cannot turn it off)"),
+         _arg("--goal-max-turns", type=int, metavar="N", dest="goal_max_turns",
+              help="Turn budget for goal-mode workers"),
+         _arg("--max-runtime-seconds", type=int, metavar="N", dest="max_runtime_seconds",
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index c9375bdbbb..1ec315f7fb 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -214,11 +214,11 @@ POOL_CARRIED_OPTIONS = ("pin_mandatory",)
+ # kanban_create options a hermes-hub client with `create-task --option KEY=JSON` carries to the card.
+ # (hermes-hub also allows reasoning_effort, but kanban_create has no such parameter.)
+ CARRIED_OPTIONS = ("skills", "max_runtime_seconds", "priority", "model", "provider", "goal_mode",
+-                   "goal_max_turns", "completion_contract", "idempotency_key", "requires", "triage",
++                   "goal_max_turns", "completion_contract", "idempotency_key", "requires", "triage", "review_required",
+                    "distinct_from", "distinct_reason", "admission_class", "admission_frees")
+ IDENTITY_OPTIONS = ("idempotency_key", "distinct_from", "distinct_reason")
+ # Of those, the ones an older client (no --option) cannot express at all: the card stays local.
+-LEGACY_UNCARRIED = ("model", "provider", "goal_mode", "triage", *IDENTITY_OPTIONS,
++LEGACY_UNCARRIED = ("model", "provider", "goal_mode", "triage", "review_required", *IDENTITY_OPTIONS,
+                     "admission_class", "admission_frees")
+ HELP_CACHE_SECONDS = 600
+ # Profile tools (``requires`` entries) a target can satisfy when it does not publish its profiles'
+@@ -706,7 +706,7 @@ def carried_options(args: dict) -> dict:
+             continue
+         if v in (None, "", [], False):
+             continue
+-        if k in ("goal_mode", "triage"):
++        if k in ("goal_mode", "triage", "review_required"):
+             if _bool(v):
+                 out[k] = True
+         elif k in ("max_runtime_seconds", "priority", "goal_max_turns"):
+diff --git a/hermes_cli/kanban_placement_forward.py b/hermes_cli/kanban_placement_forward.py
+index 0ee4ad0119..4a510c43cc 100644
+--- a/hermes_cli/kanban_placement_forward.py
++++ b/hermes_cli/kanban_placement_forward.py
+@@ -447,6 +447,7 @@ def remote_args(conn: sqlite3.Connection, task, *, self_gw: str) -> dict:
+         "model": task.model_override, "provider": task.provider_override if task.model_override else None,
+         "goal_mode": bool(task.goal_mode), "goal_max_turns": task.goal_max_turns if task.goal_mode else None,
+         "completion_contract": task.completion_contract,
++        "review_required": bool(task.review_required),
+ 
+     }
+ 
+diff --git a/hermes_cli/kanban_review_required.py b/hermes_cli/kanban_review_required.py
+new file mode 100644
+index 0000000000..4136be46fe
+--- /dev/null
++++ b/hermes_cli/kanban_review_required.py
+@@ -0,0 +1,26 @@
++"""Completion admission for cards with an explicit review requirement."""
++from __future__ import annotations
++
++import os
++
++
++class ReviewRequiredError(ValueError):
++    """The current lane cannot approve a review-required card."""
++
++
++def require_review(conn, task_id: str, expected_run_id: int | None, *, placement_settled: bool = False) -> None:
++    from hermes_cli import kanban_db as kb
++
++    task = kb.get_task(conn, task_id)
++    if task is None or not task.review_required or placement_settled:
++        return
++    if task.status == "review" and expected_run_id is None and not os.environ.get("HERMES_KANBAN_TASK"):
++        return  # An operator may approve a pending review without claiming it.
++    if (task.status == "running" and task.current_run_id is not None
++            and (expected_run_id is None or expected_run_id == task.current_run_id)
++            and kb._retry_status_for_run(conn, task_id, task.current_run_id) == "review"):
++        return
++    raise ReviewRequiredError(
++        f"{task_id} requires review: use kanban_request_review, then a reviewer may complete it. "
++        "The implementer cannot complete this card, even with --force."
++    )
+diff --git a/tests/hermes_cli/test_kanban_review_required_plumbing.py b/tests/hermes_cli/test_kanban_review_required_plumbing.py
+new file mode 100644
+index 0000000000..9db8d483f1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_review_required_plumbing.py
+@@ -0,0 +1,203 @@
++"""review_required plumbing: parser, CLI/tool create, edit, migration default, sync capture, remote forwarding."""
++import argparse
++import json
++
++
++import pytest
++
++from hermes_cli import kanban as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_operator as kbo
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_placement as placement
++from hermes_cli import kanban_placement_forward as forward
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    h = tmp_path / ".hermes"
++    h.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(h))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_DB",
++                "HERMES_KANBAN_BOARD", "HERMES_SESSION_ID"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setattr(kc, "_check_dispatcher_presence", lambda **kw: (True, ""))
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    return h
++
++
++def parse(*argv):
++    root = argparse.ArgumentParser(prog="hermes")
++    kc.build_parser(root.add_subparsers())
++    return root.parse_args(["kanban", *argv])
++
++
++def get(conn, task_id):
++    task = kb.get_task(conn, task_id)
++    assert task is not None
++    return task
++
++
++def flag(task_id):
++    with kbc.connect_closing() as conn:
++        return get(conn, task_id).review_required
++
++
++def make(review_required=False):
++    with kbc.connect_closing() as conn:
++        return kb.create_task(conn, title="plumbing fixture", assignee="default",
++                              review_required=review_required)
++
++
++# --- parser ---
++
++def test_create_parser_flag_default_and_set():
++    assert parse("create", "t", "--assignee", "default").review_required is False
++    assert parse("create", "t", "--assignee", "default", "--review-required").review_required is True
++
++
++def test_edit_parser_accepts_on_off_and_rejects_other():
++    assert parse("edit", "t_1", "--review-required", "on").review_required == "on"
++    assert parse("edit", "t_1", "--review-required", "off").review_required == "off"
++    assert parse("edit", "t_1").review_required is None
++    with pytest.raises(SystemExit):
++        parse("edit", "t_1", "--review-required", "maybe")
++
++
++# --- CLI handlers ---
++
++@pytest.mark.parametrize("extra,expected", [([], False), (["--review-required"], True)])
++def test_cli_create_handler_persists_flag(home, extra, expected):
++    args = parse("create", "CLI review plumbing", "--assignee", "default", "--json", *extra)
++    assert kc._cmd_create(args) == 0
++    with kbc.connect_closing() as conn:
++        (task,) = [t for t in kb.list_tasks(conn) if t.title == "CLI review plumbing"]
++    assert task.review_required is expected
++
++
++def test_cli_edit_handler_enables_then_disables_for_operator(home, capsys):
++    tid = make()
++    assert kc._cmd_edit(parse("edit", tid, "--review-required", "on")) == 0
++    assert flag(tid) is True
++    assert "review_required" in capsys.readouterr().out
++    assert kc._cmd_edit(parse("edit", tid, "--review-required", "off")) == 0
++    assert flag(tid) is False
++
++
++def test_cli_edit_review_required_alone_is_a_valid_edit(home):
++    tid = make()
++    assert kc._cmd_edit(parse("edit", tid, "--review-required", "on")) == 0  # no "provide --title..." error
++
++
++def test_cli_edit_worker_cannot_disable(home, monkeypatch, capsys):
++    tid = make(True)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    assert kc._cmd_edit(parse("edit", tid, "--review-required", "off")) != 0
++    assert "orchestrator" in capsys.readouterr().err
++    assert flag(tid) is True
++
++
++# --- operator edit (DB layer) ---
++
++def test_operator_edit_worker_cannot_disable_but_can_enable(home, monkeypatch):
++    tid = make(True)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
++    with kbc.connect_closing() as conn:
++        with pytest.raises(kbo.KanbanEditRefused):
++            kbo.edit_operator_fields(conn, tid, review_required=False)
++        assert get(conn, tid).review_required is True
++    other = make(False)
++    with kbc.connect_closing() as conn:
++        changed = kbo.edit_operator_fields(conn, other, review_required=True)
++        assert changed is not None
++        assert "review_required" in changed
++        assert get(conn, other).review_required is True
++
++
++def test_operator_edit_non_worker_can_disable(home):
++    tid = make(True)
++    with kbc.connect_closing() as conn:
++        changed = kbo.edit_operator_fields(conn, tid, review_required=False)
++        assert changed is not None
++        assert changed["review_required"]["new"] in (0, False)
++        assert get(conn, tid).review_required is False
++
++
++# --- tool create ---
++
++def test_tool_create_flag_true_and_default_false(home):
++    from tools import kanban_tools as kt
++    on = json.loads(kt._handle_create({"title": "tool review on", "assignee": "default", "review_required": True}))
++    off = json.loads(kt._handle_create({"title": "tool review default", "assignee": "default"}))
++    assert not on.get("error"), on
++    assert not off.get("error"), off
++    assert flag(on["task_id"]) is True
++    assert flag(off["task_id"]) is False
++
++
++def test_tool_schema_declares_boolean_flag():
++    from tools import kanban_tools_schemas as schemas
++    props = schemas.KANBAN_CREATE_SCHEMA["parameters"]["properties"]
++    assert props["review_required"]["type"] == "boolean"
++
++
++# --- migration ---
++
++def test_migration_adds_column_default_false_to_legacy_db(home):
++    path = kb.kanban_db_path()
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="legacy row", assignee="default")
++        # Reconstruct the pre-column schema, including its pre-column trigger set.
++        triggers = conn.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='tasks'").fetchall()
++        for row in triggers:
++            conn.execute('DROP TRIGGER "' + row[0].replace('"', '""') + '"')
++        conn.execute("ALTER TABLE tasks DROP COLUMN review_required")
++        conn.commit()
++        assert "review_required" not in [r[1] for r in conn.execute("PRAGMA table_info(tasks)")]
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    with kbc.connect_closing() as conn:
++        cols = {r[1]: r for r in conn.execute("PRAGMA table_info(tasks)")}
++        assert "review_required" in cols
++        assert cols["review_required"][3] == 1 and str(cols["review_required"][4]) == "0"  # NOT NULL DEFAULT 0
++        assert get(conn, tid).review_required is False
++    assert path
++
++
++def test_new_task_default_is_false(home):
++    assert flag(make()) is False
++    assert flag(make(True)) is True
++
++
++# --- sync capture ---
++
++def test_sync_declares_and_captures_review_required(home):
++    assert "review_required" in sync.SYNCED_COLUMNS["tasks"]
++    with kbc.connect_closing() as conn:
++        assert "review_required" in sync.captured_columns(conn, "tasks")
++        assert "review_required" not in sync.undeclared_columns(conn).get("tasks", set())
++
++
++# --- remote forwarding ---
++
++def test_carried_options_keeps_true_and_drops_default():
++    assert "review_required" in placement.CARRIED_OPTIONS
++    assert placement.carried_options({"title": "t", "review_required": True})["review_required"] is True
++    assert "review_required" not in placement.carried_options({"title": "t", "review_required": False})
++    assert "review_required" not in placement.carried_options({"title": "t"})
++
++
++def test_legacy_clients_without_option_support_cannot_carry_flag():
++    assert "review_required" in placement.LEGACY_UNCARRIED
++
++
++@pytest.mark.parametrize("required", [True, False])
++def test_remote_args_preserves_flag(home, required):
++    tid = make(required)
++    with kbc.connect_closing() as conn:
++        task = get(conn, tid)
++        args = forward.remote_args(conn, task, self_gw="gw-a")
++    assert args["review_required"] is required
+diff --git a/tests/tools/test_kanban_review_required.py b/tests/tools/test_kanban_review_required.py
+new file mode 100644
+index 0000000000..67bbe6d903
+--- /dev/null
++++ b/tests/tools/test_kanban_review_required.py
+@@ -0,0 +1,116 @@
++"""Structured review requirements survive every completion entry point."""
++import argparse
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tools import kanban_tools as kt
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_DB",
++                "HERMES_KANBAN_BOARD", "HERMES_SESSION_ID"):
++        monkeypatch.delenv(key, raising=False)
++    kb._INITIALIZED_PATHS.clear()
++    with kbc.connect_closing() as conn:
++        yield conn
++
++
++def claimed(conn, monkeypatch, required=True):
++    tid = kb.create_task(conn, title="Review gate fixture", assignee="default", review_required=required)
++    task = kb.claim_task(conn, tid)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
++    return tid, task.current_run_id
++
++
++@pytest.mark.parametrize("surface", ["tool", "cli"])
++@pytest.mark.parametrize("required", [True, False])
++def test_completion_gate(board, monkeypatch, capsys, surface, required):
++    tid, _run = claimed(board, monkeypatch, required)
++    if surface == "tool":
++        out = json.loads(kt._handle_complete({"task_id": tid, "summary": "implemented"}))
++        assert bool(out.get("error")) == required
++        if required:
++            assert out["rejection"] == "review_required"
++            assert "kanban_request_review" in out["error"]
++    else:
++        from hermes_cli import kanban
++        rc = kanban._cmd_complete(argparse.Namespace(
++            task_ids=[tid], result=None, summary="implemented", metadata=None, force=True))
++        assert (rc != 0) == required
++        if required:
++            output = capsys.readouterr()
++            assert "kanban_request_review" in output.err + output.out
++    assert kb.get_task(board, tid).status == ("running" if required else "done")
++    if required:
++        assert kb.latest_run(board, tid).ended_at is None
++
++
++@pytest.mark.parametrize("surface", ["tool", "cli"])
++def test_reviewer_completion_allowed(board, monkeypatch, surface):
++    tid, run = claimed(board, monkeypatch)
++    assert kb.request_review(board, tid, summary="implemented", expected_run_id=run)
++    reviewer = kb.claim_review_task(board, tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(reviewer.current_run_id))
++    if surface == "tool":
++        out = json.loads(kt._handle_complete({"task_id": tid, "summary": "review approved"}))
++        assert out.get("ok"), out
++    else:
++        from hermes_cli import kanban
++        assert kanban._cmd_complete(argparse.Namespace(
++            task_ids=[tid], result=None, summary="review approved", metadata=None, force=False)) == 0
++    assert kb.get_task(board, tid).status == "done"
++
++
++def test_operator_can_approve_review_but_implementer_cannot(board, monkeypatch):
++    tid, run = claimed(board, monkeypatch)
++    assert kb.request_review(board, tid, summary="implemented", expected_run_id=run)
++    with pytest.raises(ValueError, match="kanban_request_review"):
++        kb.complete_task(board, tid, summary="skip", expected_run_id=run)
++    monkeypatch.delenv("HERMES_KANBAN_TASK")
++    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
++    assert kb.complete_task(board, tid, summary="operator approved")
++
++
++def test_rework_requires_another_review(board, monkeypatch):
++    tid, run = claimed(board, monkeypatch)
++    assert kb.request_review(board, tid, summary="implemented", expected_run_id=run)
++    reviewer = kb.claim_review_task(board, tid)
++    assert kb.request_changes(board, tid, reason="fix it", expected_run_id=reviewer.current_run_id)[0]
++    implementer = kb.claim_task(board, tid)
++    with pytest.raises(ValueError, match="kanban_request_review"):
++        kb.complete_task(board, tid, summary="fixed", expected_run_id=implementer.current_run_id)
++    assert kb.request_review(board, tid, summary="fixed", expected_run_id=implementer.current_run_id)
++    reviewer = kb.claim_review_task(board, tid)
++    assert kb.complete_task(board, tid, summary="approved", expected_run_id=reviewer.current_run_id)
++
++
++def test_flag_rechecked_after_preflight(board, monkeypatch):
++    from hermes_cli import kanban_pr_acceptance_store as store
++    from hermes_cli.kanban_db_operator import edit_operator_fields
++    tid, run = claimed(board, monkeypatch, required=False)
++    original = store.prepare_acceptance
++
++    def flag_during_preflight(*args, **kwargs):
++        result = original(*args, **kwargs)
++        edit_operator_fields(board, tid, review_required=True)
++        return result
++
++    monkeypatch.setattr(store, "prepare_acceptance", flag_during_preflight)
++    with pytest.raises(ValueError, match="kanban_request_review"):
++        kb.complete_task(board, tid, summary="skip", expected_run_id=run)
++    assert kb.get_task(board, tid).status == "running"
++
++
++def test_internal_forwarded_completion_receipt_can_settle_stub(board, monkeypatch):
++    tid, run = claimed(board, monkeypatch)
++    # Only the internal forwarder supplies this after verifying remote done;
++    # neither the public tool schema nor CLI exposes this switch.
++    assert kb.complete_task(board, tid, summary="remote card reviewed and done",
++                            expected_run_id=run, placement_settled=True)
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index c966ea6a35..36d7e560c4 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -156,7 +156,7 @@ def _check(cond: Any, message: str, rejection: Optional[str] = None) -> None:
+ # Stable ``rejection`` classes on every kanban_complete tool_error. Consumers
+ # (coach digests, board analytics) key on these strings: add, never rename.
+ COMPLETE_REJECTION_CLASSES = frozenset({
+-    "goal_judge",     # goal-mode completion judge said not done / blocked
++    "review_required", "goal_judge",  # required review or goal-mode judge refused completion
+     "phantom_cards",  # created_cards names ids this worker did not create
+     "artifacts",      # declared artifacts could not be preserved
+     "empty",          # no summary/result, or an evidence-free completion
+@@ -536,7 +536,7 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+ _TASK_FIELDS = tuple(
+     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
+     "created_at started_at completed_at result current_run_id model_override "
+-    "provider_override completion_contract last_failure_error block_kind human_request".split())
++    "provider_override completion_contract review_required last_failure_error block_kind human_request".split())
+ _TASK_SUMMARY_FIELDS = tuple(
+     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
+     "created_at started_at completed_at current_run_id model_override provider_override block_kind human_request".split())
+@@ -873,6 +873,7 @@ def _handle_list(args: dict, **kw) -> str:
+ def _handle_complete(args: dict, **kw) -> str:
+     """Mark the current task done with a structured handoff. Every refusal
+     carries a ``rejection`` class from ``COMPLETE_REJECTION_CLASSES``."""
++    from hermes_cli.kanban_review_required import ReviewRequiredError
+     try:
+         tid = _worker_guard("kanban_complete", args)
+     except _Reject as e:
+@@ -914,12 +915,10 @@ def _handle_complete(args: dict, **kw) -> str:
+             ok = kb.complete_task(
+                 conn, tid, result=result, summary=summary, metadata=metadata,
+                 created_cards=created_cards, expected_run_id=run_id, goal_verification=goal_verification)
++        except ReviewRequiredError as review_err:
++            return tool_error(str(review_err), rejection="review_required")
+         except kb.ArtifactPreservationError as artifact_err:
+-            # Structured rejection — surface the phantom ids so the worker can retry with a corrected list
+-            # or drop the field. Audit event already landed in the DB. The task itself was NOT mutated (the
+-            # gate runs before the write txn), so the worker can simply call kanban_complete again. Spell
+-            # that out — without it the model often interprets a tool_error as a terminal failure and either
+-            # blocks or crashes the run instead of retrying. See #22923.
++            # Artifact admission runs before writes: keep the worker in-flight for a corrected retry.
+             return tool_error(
+                 f"kanban_complete could not preserve the declared artifacts: {artifact_err}. "
+                 f"Your task is still in-flight and its scratch workspace was kept. Fix the "
+@@ -1568,9 +1567,9 @@ def _handle_create(args: dict, **kw) -> str:
+     # See #67567. ``project=""`` is an explicit "no project" (no ``or`` collapse, #106342).
+     project_id = args["project"] if "project" in args else args.get("project_id")
+     project_source_task_id = None
+-    triage, skills, goal_mode, pin_mandatory = (
++    triage, skills, goal_mode, pin_mandatory, review_required = (
+         _parse_bool_arg(args, "triage"), _coerce_str_list(args.get("skills"), "skills", "skill names"),
+-        _parse_bool_arg(args, "goal_mode"), _parse_bool_arg(args, "pin_mandatory"))
++        _parse_bool_arg(args, "goal_mode"), _parse_bool_arg(args, "pin_mandatory"), _parse_bool_arg(args, "review_required"))
+     model_override, provider_override = args.get("model"), args.get("provider")
+     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
+     max_retries = _ca.max_retries_arg(args)
+@@ -1685,6 +1684,7 @@ def _handle_create(args: dict, **kw) -> str:
+                 require_declaration=origin_intent is None and declaration_required(),  # couriers exempt [daveey]
+                 model_override=model_override, provider_override=provider_override, pin_mandatory=pin_mandatory,
+                 goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
++                review_required=review_required,
+                 completion_contract=args.get("completion_contract"),
+                 initial_status=str(args.get("initial_status") or "running"),
+                 human_request=kb.redact_review_value(args.get("human_request")),
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 478364c807..56d750cc74 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -908,6 +908,7 @@ KANBAN_CREATE_SCHEMA = _schema(
+                 "assignee's profile."
+             ),
+         },
++        "review_required": _prop("boolean", "Require a reviewer before completion. Defaults to false."),
+         "goal_mode": _prop("boolean", (
+                 "Run the dispatched worker in a goal loop. When true, "
+                 "after each turn an auxiliary judge checks the worker's "
+-- 
+2.51.0
+

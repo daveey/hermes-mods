@@ -1,0 +1,656 @@
+From d3da15a55e4477f9f2f095daa054f38829d2d631 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:14:29 +0000
+Subject: [PATCH] fix(kanban): a chat's verified relay of the user's reply
+ counts as human progress for the no-progress budget [daveey]
+
+kanban-d1b921f32e: t_01a1cc1a8bb39958 was stopped for 5 no-progress runs although David
+answered every needs_input ask; each answer reached the card as an agent comment from his chat.
+
+- kanban_comment relays_user_message=true: verified (interactive chat, not a worker/child; a user
+  message newer than the card's latest ask; one relay per message per card) and recorded as
+  relayed_human {session, message_id, at} on the commented event; writer_kind stays agent.
+- dashboard POST /comments accepts relayed_human from the cross_task courier beside
+  writer_kind=agent and stores it as sent (via=remote).
+- kanban_no_progress.progress_marker counts commented events carrying relayed_human.
+- detection: an escalation right after a chat unblocked a needs_input block with no marked relay
+  logs no_progress_relay_suspect (event + owner-card note).
+---
+ hermes_cli/kanban_db_comment_ids.py           |  12 +-
+ hermes_cli/kanban_no_progress.py              |  41 ++++-
+ hermes_cli/kanban_relayed_human.py            | 147 ++++++++++++++++++
+ plugins/kanban/dashboard/plugin_api.py        |   5 +-
+ .../dashboard/plugin_api_comment_actor.py     |  16 ++
+ tests/hermes_cli/test_kanban_no_progress.py   |  51 ++++++
+ tests/hermes_cli/test_kanban_relayed_human.py | 128 +++++++++++++++
+ .../test_kanban_dashboard_comment_actor.py    |  25 +++
+ tools/kanban_tools.py                         |  18 +--
+ tools/kanban_tools_schemas.py                 |   5 +
+ 10 files changed, 428 insertions(+), 20 deletions(-)
+ create mode 100644 hermes_cli/kanban_relayed_human.py
+ create mode 100644 tests/hermes_cli/test_kanban_relayed_human.py
+
+diff --git a/hermes_cli/kanban_db_comment_ids.py b/hermes_cli/kanban_db_comment_ids.py
+index faef583ee6..a4d5b22d1d 100644
+--- a/hermes_cli/kanban_db_comment_ids.py
++++ b/hermes_cli/kanban_db_comment_ids.py
+@@ -96,13 +96,19 @@ def agent_comment_ids(conn: sqlite3.Connection, task_id: str, comment_ids: list[
+ 
+ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str, *,
+                 origin_gateway: Optional[str] = None, writer_kind: Optional[str] = None,
+-                writer_session: Optional[str] = None) -> int:
++                writer_session: Optional[str] = None, relayed_human: Optional[dict] = None) -> int:
+     """Append a comment (moved from ``kanban_db``; re-exported there). ``origin_gateway``: the gateway it came from (the hermes-hub relay passes the
+     sender); default: the gateway the author spelling names, else this gateway (kanban_comment_origin). [daveey]
+ 
+     ``writer_kind`` ("agent" | "human") records who typed it on the ``commented`` event, with the
+     agent's ``writer_session``: David and his agents share one profile, so the author can't say.
+-    Unset (system writers, legacy callers) leaves the payload as before. [daveey]"""
++    Unset (system writers, legacy callers) leaves the payload as before. [daveey]
++
++    ``relayed_human`` (``{session, message_id, at}``, verified by ``kanban_relayed_human``) marks an agent
++    comment that carries the user's reply from a chat: the no-progress budget counts it as a human answer,
++    while ``writer_kind`` stays ``agent`` so it gains no operator authority (kanban-d1b921f32e). [daveey]"""
++    if relayed_human is not None and writer_kind != "agent":
++        raise ValueError("relayed_human marks an agent's relay of the user's message; it needs writer_kind='agent'")
+     if not body or not body.strip():
+         raise ValueError("comment body is required")
+     if not author or not author.strip():
+@@ -130,6 +136,8 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str,
+             payload["writer_kind"] = writer_kind
+             if writer_session:
+                 payload["writer_session"] = str(writer_session)
++        if relayed_human:
++            payload["relayed_human"] = dict(relayed_human)
+         _kb._append_event(conn, task_id, "commented", payload)
+         return cid
+ 
+diff --git a/hermes_cli/kanban_no_progress.py b/hermes_cli/kanban_no_progress.py
+index 9268620541..ca0d804922 100644
+--- a/hermes_cli/kanban_no_progress.py
++++ b/hermes_cli/kanban_no_progress.py
+@@ -12,8 +12,12 @@ The budget counts trailing closed runs that ended in a wait (``scheduled``, ``bl
+ attachment, body/assignee/placement/pin edit, a met wake condition, a human comment, or a completion, archive,
+ review or edit on a linked (parent or child) card. Crashes, reclaims, quota releases and other run losses are
+ neutral: they neither count nor reset. Agent comments are never progress -- they are what the loop produces --
+-and neither is a bare ``unblocked`` (t_7e2ee45c's recovery loop was 11 of them); an unblock that resolved
+-something comes with its evidence (a completed parent, a human comment, an edit).
++except a chat's verified relay of the user's reply (``relayed_human`` on the ``commented`` event,
++``kanban_relayed_human``): an answered ask is a human answer, whoever typed it onto the card. Neither is a bare
++``unblocked`` (t_7e2ee45c's recovery loop was 11 of them); an unblock that resolved
++something comes with its evidence (a completed parent, a human comment, an edit). An escalation right after a
++chat unblocked a ``needs_input`` block with no marked relay records ``no_progress_relay_suspect``: most likely
++David answered and the relay was not marked.
+ 
+ At ``kanban.no_progress_runs`` (default 5; 0 disables) such runs, the dispatcher does not spawn. Instead (decided
+ again under the write lock, and never under another dispatcher's live claim):
+@@ -83,7 +87,8 @@ def progress_marker(conn: sqlite3.Connection, task_id: str, *, before: Optional[
+     own = conn.execute(
+         f"SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND created_at < ? "
+         f"AND (kind IN ({_marks(CARD_PROGRESS_EVENTS)}) "
+-        "OR (kind = 'commented' AND json_extract(payload, '$.writer_kind') = 'human'))",
++        "OR (kind = 'commented' AND (json_extract(payload, '$.writer_kind') = 'human' "
++        "OR json_extract(payload, '$.relayed_human') IS NOT NULL)))",
+         (task_id, cut, *CARD_PROGRESS_EVENTS),
+     ).fetchone()[0]
+     linked = conn.execute(
+@@ -240,37 +245,61 @@ def _owner_body(task, runs: int, marker: int) -> str:
+ 
+ def _escalate(conn, task, runs: int, marker: int, now: int) -> Optional[str]:
+     from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_relayed_human as krh
+     from hermes_cli.kanban_awaiting import _supervisor_profile
+ 
+     note = _note(runs, marker)
++    # Detection for an unmarked relay (kanban-d1b921f32e): the ask was answered in a chat and the chat only
++    # unblocked the card, so nothing here could tell an answered ask from an idle run.
++    suspect = krh.relay_suspect(conn, task.id, now=now)
++    extra: dict[str, Any] = {"relay_suspect": suspect} if suspect else {}
++    if suspect:
++        note += (". Suspect: a chat unblocked its needs_input block just before this, with no comment marked "
++                 "relays_user_message; if David answered, re-post the answer with kanban_comment "
++                 "relays_user_message=true (cross_task: relays_user_message) instead of only unblocking")
++
++    def _flag() -> None:
++        if suspect:
++            logger.warning("kanban: %s on %s: needs_input unblocked by a chat at %s with no marked relay",
++                           krh.SUSPECT_EVENT, task.id, suspect["unblocked_at"])
++            kb._append_event(conn, task.id, krh.SUSPECT_EVENT, {"runs": runs, **suspect})
++
+     # Runs inside hold()'s write transaction.
+     if task.created_by == CREATED_BY:
+         cur = conn.execute("UPDATE tasks SET status = 'triage', claim_lock = NULL, claim_expires = NULL, "
+                            "worker_pid = NULL WHERE id = ? AND status IN ('ready', 'review') "
+                            "AND current_run_id IS NULL AND " + _UNCLAIMED, (task.id, now))
+         if cur.rowcount == 1:
++            _flag()
+             kb._append_event(conn, task.id, ESCALATED_EVENT, {"runs": runs, "since": marker, "owner": None,
+-                                                              "status": "triage", "reason": note})
++                                                              "status": "triage", "reason": note, **extra})
+         return None if cur.rowcount != 1 else ""
+     cur = conn.execute("UPDATE tasks SET status = 'todo', claim_lock = NULL, claim_expires = NULL, "
+                        "worker_pid = NULL WHERE id = ? AND status IN ('ready', 'review') "
+                        "AND current_run_id IS NULL AND " + _UNCLAIMED, (task.id, now))
+     if cur.rowcount != 1:
+         return None
++    _flag()
+     key = f"no-progress:{task.id}:{marker}"
+     existing = conn.execute("SELECT id, status FROM tasks WHERE idempotency_key = ?", (key,)).fetchone()
+     owner = existing[0] if existing and existing[1] not in ("done", "archived") else None
+     if owner is None:
+         supervisor = _supervisor_profile(task)
++        body = _owner_body(task, runs, marker)
++        if suspect:
++            body += ("\n\nRelay suspect (`no_progress_relay_suspect`): a chat unblocked this card's needs_input "
++                     "block just before the stop and no comment was marked as carrying David's reply. If he "
++                     "answered, post his answer on the card with `kanban_comment(relays_user_message=true)` "
++                     "(cross-gateway: `cross_task` with `relays_user_message`); that counts as progress.")
+         owner = kb.create_task(
+             conn, title=f"Unstick {task.id}: {runs} runs with no progress"[:200],
+-            body=_owner_body(task, runs, marker), assignee=supervisor, created_by=CREATED_BY,
++            body=body, assignee=supervisor, created_by=CREATED_BY,
+             workspace_kind="scratch", triage=supervisor is None, idempotency_key=None if existing else key,
+             creator_task_id=task.id, session_id=task.session_id, tenant=task.tenant, priority=task.priority,
+         )
+     kb._link(conn, owner, task.id)
+     kb._append_event(conn, task.id, ESCALATED_EVENT, {"runs": runs, "since": marker, "owner": owner,
+-                                                      "status": "todo", "reason": note})
++                                                      "status": "todo", "reason": note, **extra})
+     return owner
+ 
+ 
+diff --git a/hermes_cli/kanban_relayed_human.py b/hermes_cli/kanban_relayed_human.py
+new file mode 100644
+index 0000000000..ba7d066738
+--- /dev/null
++++ b/hermes_cli/kanban_relayed_human.py
+@@ -0,0 +1,147 @@
++"""A chat relaying David's answer to a card: verified provenance for the no-progress budget. [daveey]
++
++The designed ask-and-answer path is: a card blocks ``needs_input``, David answers in a chat, and the chat
++passes the answer on with ``kanban_comment`` (or ``cross_task`` across gateways). Those writers always record
++``writer_kind='agent'`` -- correctly, since an agent typed the comment -- so the no-progress budget, which
++counts only human comments, saw five answered asks as five idle runs and stopped the card
++(t_01a1cc1a8bb39958, defect kanban-d1b921f32e).
++
++A relay may now say so: ``relayed_human = {session, message_id, at}`` on the ``commented`` event. It never
++raises ``writer_kind`` (no operator authority is gained); it only tells the budget that a person answered.
++The origin (the chat writing the comment) verifies it:
++
++* only an interactive chat session: not a Kanban worker, not a delegated child (the tool rejects those);
++* that session's newest real user message is newer than the card's latest ask (its newest ``blocked`` or
++  ``scheduled`` event): an answer cannot predate the question;
++* one relay per user message per card: the same user turn cannot mark two comments.
++
++A receiver of a cross-gateway relay stores the field as sent (``via='remote'``); its origin verified it.
++"""
++from __future__ import annotations
++
++import json
++import os
++import sqlite3
++from typing import Any, Optional
++
++RELAY_FIELD = "relayed_human"
++SUSPECT_EVENT = "no_progress_relay_suspect"
++# A chat unblock this close to the escalation (and no relayed comment) is most likely an unmarked relay.
++SUSPECT_WINDOW_SECONDS = 15 * 60
++
++
++class RelayRefused(ValueError):
++    """The comment cannot be marked as carrying the user's message."""
++
++
++def _latest_ask(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
++    row = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND kind IN ('blocked', 'scheduled')",
++                       (task_id,)).fetchone()
++    return int(row[0]) if row and row[0] is not None else None
++
++
++def _latest_user_message(session_id: str, db_path: Optional[str] = None) -> Optional[tuple[int, float]]:
++    """``(message_id, timestamp)`` of the session's newest user row in ``state.db`` (the user turn is persisted
++    before the first model call, so it is there while the turn's tools run)."""
++    if db_path is None:
++        from hermes_constants import get_hermes_home
++        db_path = os.path.join(str(get_hermes_home()), "state.db")
++    if not os.path.exists(db_path):
++        return None
++    uri = f"file:{db_path}?mode=ro"
++    try:
++        with sqlite3.connect(uri, uri=True, timeout=5) as sdb:
++            row = sdb.execute("SELECT id, timestamp FROM messages WHERE session_id = ? AND role = 'user' "
++                              "ORDER BY id DESC LIMIT 1", (session_id,)).fetchone()
++    except sqlite3.Error:
++        return None
++    return (int(row[0]), float(row[1])) if row else None
++
++
++def verify(conn: sqlite3.Connection, task_id: str, *, session_id: Optional[str],
++           state_db: Optional[str] = None, latest_user: Optional[tuple[int, float]] = None) -> dict:
++    """The ``relayed_human`` payload for a relay from ``session_id`` to ``task_id``; :class:`RelayRefused` if
++    it cannot be proven. ``latest_user`` overrides the ``state.db`` read (cross-gateway origin, tests)."""
++    if os.environ.get("HERMES_KANBAN_TASK"):
++        raise RelayRefused("relays_user_message is for a chat passing on the user's reply; a Kanban worker "
++                           "has no user turn to relay")
++    sid = str(session_id or "").strip()
++    if not sid:
++        raise RelayRefused("relays_user_message needs an interactive chat session (no session id here)")
++    msg = latest_user if latest_user is not None else _latest_user_message(sid, state_db)
++    if msg is None:
++        raise RelayRefused(f"session {sid} has no user message to relay")
++    message_id, at = int(msg[0]), float(msg[1])
++    ask = _latest_ask(conn, task_id)
++    if ask is None:
++        raise RelayRefused(f"{task_id} never asked (no blocked or scheduled park): nothing to answer")
++    if at <= ask:
++        raise RelayRefused(f"the newest user message in session {sid} predates {task_id}'s latest ask; "
++                           "relay only a reply given after the card asked")
++    used = conn.execute(
++        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'commented' "
++        "AND json_extract(payload, '$.relayed_human.session') = ? "
++        "AND json_extract(payload, '$.relayed_human.message_id') = ? LIMIT 1", (task_id, sid, message_id)).fetchone()
++    if used:
++        raise RelayRefused(f"user message {message_id} was already relayed to {task_id}; one relay per user turn")
++    return {"session": sid, "message_id": message_id, "at": int(at)}
++
++
++def from_tool_args(conn: sqlite3.Connection, task_id: str, args: dict, session_id: Optional[str], *,
++                   reject: type[Exception]) -> Optional[dict]:
++    """``kanban_comment``'s ``relays_user_message``: the verified ``relayed_human`` when the flag is set,
++    ``None`` when not; a refusal is raised as ``reject`` (the tool's rejection type)."""
++    flag = args.get("relays_user_message")
++    if not (flag is True or str(flag).strip().lower() == "true"):
++        return None
++    try:
++        return verify(conn, task_id, session_id=session_id)
++    except RelayRefused as refused:
++        raise reject(f"relays_user_message refused: {refused}. Post it without the flag if it is not the "
++                     "user's reply.") from None
++
++
++def from_remote(raw: Any) -> Optional[dict]:
++    """A cross-gateway relay's field as its origin verified it, normalized; ``None`` when absent/malformed."""
++    if not isinstance(raw, dict):
++        return None
++    sid = str(raw.get("session") or "").strip()[:200]
++    try:
++        message_id, at = int(str(raw.get("message_id"))), int(str(raw.get("at")))
++    except (TypeError, ValueError):
++        return None
++    if not sid:
++        return None
++    return {"session": sid, "message_id": message_id, "at": at, "via": "remote"}
++
++
++def relay_suspect(conn: sqlite3.Connection, task_id: str, *, now: int) -> Optional[dict]:
++    """Detection for a relay that was not marked: the card's last park was a ``needs_input`` block that a
++    chat (not the card's own run, not a human shell) unblocked within ``SUSPECT_WINDOW_SECONDS``, with no
++    relayed comment since. ``{"blocked_at", "unblocked_at"}`` or ``None``."""
++    blocked = conn.execute("SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind = 'blocked' "
++                           "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++    if not blocked:
++        return None
++    try:
++        payload = json.loads(blocked[0] or "{}")
++    except ValueError:
++        return None
++    if not isinstance(payload, dict) or payload.get("kind") != "needs_input":
++        return None
++    unblocked = conn.execute("SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind = 'unblocked' "
++                             "AND created_at >= ? ORDER BY id DESC LIMIT 1", (task_id, blocked[1])).fetchone()
++    if not unblocked or now - int(unblocked[1]) > SUSPECT_WINDOW_SECONDS:
++        return None
++    try:
++        up = json.loads(unblocked[0] or "{}")
++    except ValueError:
++        up = {}
++    if isinstance(up, dict) and str(up.get("actor") or "") == "user":
++        return None  # a human shell unblocked it
++    relayed = conn.execute("SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'commented' AND created_at >= ? "
++                           "AND json_extract(payload, '$.relayed_human') IS NOT NULL LIMIT 1",
++                           (task_id, blocked[1])).fetchone()
++    if relayed:
++        return None
++    return {"blocked_at": int(blocked[1]), "unblocked_at": int(unblocked[1])}
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index eadaf778ff..7959847b42 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -44,7 +44,7 @@ from plugins.kanban.dashboard import board_read
+ from plugins.kanban.dashboard.board_read import (  # BOARD_COLUMNS: the documented column list
+     BOARD_COLUMNS, diagnostic_inputs as _diagnostic_inputs, diagnostics_from_inputs as _diagnostics_from_inputs)
+ from plugins.kanban.dashboard.plugin_api_human_request import ask_filing_refusal, classify_request
+-from plugins.kanban.dashboard.plugin_api_comment_actor import CommentBody, comment_writer
++from plugins.kanban.dashboard.plugin_api_comment_actor import CommentBody, comment_relay, comment_writer
+ from hermes_cli.kanban_db_attachment_names import _collision_free_path, _safe_attachment_name
+ 
+ log = logging.getLogger(__name__)
+@@ -926,11 +926,12 @@ def add_comment(task_id: str, payload: CommentBody, request: Request, board: Opt
+     if not payload.body.strip():
+         raise HTTPException(status_code=400, detail="body is required")
+     writer_kind, writer_session = comment_writer(payload, request.scope)
++    relayed_human = comment_relay(payload, writer_kind)
+     with _board_conn(board) as (board, conn):
+         _foreign_card_409(conn, task_id)
+         _require_task(conn, task_id)
+         kanban_db.add_comment(conn, task_id, author=payload.author or "dashboard", body=payload.body,
+-                              writer_kind=writer_kind, writer_session=writer_session)
++                              writer_kind=writer_kind, writer_session=writer_session, relayed_human=relayed_human)
+         return {"ok": True}
+ 
+ 
+diff --git a/plugins/kanban/dashboard/plugin_api_comment_actor.py b/plugins/kanban/dashboard/plugin_api_comment_actor.py
+index 719b12f48d..fbdfa2226c 100644
+--- a/plugins/kanban/dashboard/plugin_api_comment_actor.py
++++ b/plugins/kanban/dashboard/plugin_api_comment_actor.py
+@@ -25,6 +25,22 @@ class CommentBody(BaseModel):
+     # Set only by an agent courier (session-mentions serving ``cross_task``), never by the GUI.
+     writer_kind: Optional[str] = None
+     writer_session: Optional[str] = None
++    # A chat's relay of the user's reply, verified by its origin (``cross_task`` relays_user_message);
++    # stored as sent, and only beside writer_kind='agent' (kanban-d1b921f32e). [daveey]
++    relayed_human: Optional[dict] = None
++
++
++def comment_relay(payload: CommentBody, writer_kind: Optional[str]) -> Optional[dict]:
++    """The normalized ``relayed_human`` to store for ``payload``; HTTP 400 when it is malformed or not an agent's."""
++    if payload.relayed_human is None:
++        return None
++    from hermes_cli.kanban_relayed_human import from_remote
++
++    relay = from_remote(payload.relayed_human)
++    if writer_kind != "agent" or relay is None:
++        raise HTTPException(status_code=400, detail=(
++            "relayed_human needs writer_kind='agent' and {session, message_id, at} from the relaying chat"))
++    return relay
+ 
+ 
+ def comment_writer(payload: CommentBody, scope: Optional[dict] = None) -> tuple[str, Optional[str]]:
+diff --git a/tests/hermes_cli/test_kanban_no_progress.py b/tests/hermes_cli/test_kanban_no_progress.py
+index 7c69dae25c..771374d8e3 100644
+--- a/tests/hermes_cli/test_kanban_no_progress.py
++++ b/tests/hermes_cli/test_kanban_no_progress.py
+@@ -402,3 +402,54 @@ def test_payload_json_roundtrip(kanban_home):
+         raw = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
+                            (tid, knp.PARKED_EVENT)).fetchone()[0]
+         assert json.loads(raw)["runs"] == knp.DEFAULT_LIMIT
++
++
++# --- kanban-d1b921f32e: David's answers relayed by a chat are human progress ------------------
++
++def _ask_answered_by_relay(conn, tid: str, at: int, msg_id: int, *, relay: bool = True) -> None:
++    """One t_01a1cc1a8bb39958 run: it blocked needs_input, David answered in his chat, the chat relayed it."""
++    _run(conn, tid, "blocked", at=at)
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, "blocked", {"kind": "needs_input", "reason": "which ring?"})
++        conn.execute("UPDATE task_events SET created_at = ? WHERE id = (SELECT MAX(id) FROM task_events "
++                     "WHERE task_id = ? AND kind = 'blocked')", (at, tid))
++    kwargs = {"relayed_human": {"session": "chat-1", "message_id": msg_id, "at": at + 5}} if relay else {}
++    kb.add_comment(conn, tid, "default", "David says: the left ring.", writer_kind="agent",
++                   writer_session="chat-1", **kwargs)
++    with kb.write_txn(conn):
++        conn.execute("UPDATE task_events SET created_at = ? WHERE id = (SELECT MAX(id) FROM task_events "
++                     "WHERE task_id = ? AND kind = 'commented')", (at + 5, tid))
++
++
++def test_relayed_answers_reset_the_budget(kanban_home):
++    """Five needs_input parks, each answered by a relayed comment: no idle streak, no escalation."""
++    with kbc.connect_closing() as conn:
++        t = _card(conn, "Pebble ring probe")
++        base = int(time.time()) - 10_000
++        for i in range(knp.DEFAULT_LIMIT):
++            _ask_answered_by_relay(conn, t, base + i * 100, msg_id=100 + i)
++        assert knp.streak(conn, t)[0] == 0
++        assert knp.hold(conn, t) is None
++        commented = [json.loads(r[0]) for r in conn.execute(
++            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'commented'", (t,))]
++        assert all(p["writer_kind"] == "agent" and p["relayed_human"]["session"] == "chat-1" for p in commented)
++
++
++def test_unmarked_relays_still_count_and_flag_a_suspect(kanban_home):
++    """Without the mark the streak still counts (agent comments are not progress), and an escalation right
++    after a chat unblocked a needs_input block logs the relay suspect on the event and the owner card."""
++    with kbc.connect_closing() as conn:
++        t = _card(conn, "Pebble ring probe")
++        base = int(time.time()) - 10_000
++        for i in range(knp.DEFAULT_LIMIT):
++            _ask_answered_by_relay(conn, t, base + i * 100, msg_id=100 + i, relay=False)
++        with kb.write_txn(conn):
++            kb._append_event(conn, t, "unblocked", {})
++        assert knp.streak(conn, t)[0] == knp.DEFAULT_LIMIT
++        out = knp.hold(conn, t)
++        assert out and out.startswith("escalated:")
++        ev = _events(conn, t, knp.ESCALATED_EVENT)[-1]
++        assert ev.payload.get("relay_suspect")
++        assert _events(conn, t, "no_progress_relay_suspect")
++        owner = kb.get_task(conn, out.split(":", 1)[1])
++        assert "relays_user_message" in owner.body
+diff --git a/tests/hermes_cli/test_kanban_relayed_human.py b/tests/hermes_cli/test_kanban_relayed_human.py
+new file mode 100644
+index 0000000000..336e03d692
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_relayed_human.py
+@@ -0,0 +1,128 @@
++"""kanban-d1b921f32e: a chat's relay of David's answer is verified before it can count as human. [daveey]"""
++from __future__ import annotations
++
++import json
++import sqlite3
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_relayed_human as krh
++
++
++@pytest.fixture
++def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_BOARD", "HERMES_SESSION_ID",
++                "HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    return home
++
++
++def _state_db(home: Path, session: str, user_at: float) -> int:
++    db = sqlite3.connect(home / "state.db")
++    db.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, "
++               "role TEXT, content TEXT, timestamp REAL)")
++    cur = db.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', 'left ring', ?)",
++                     (session, user_at))
++    db.commit()
++    db.close()
++    return int(cur.lastrowid or 0)
++
++
++def _asked(conn, at: int) -> str:
++    tid = kb.create_task(conn, title="Pebble ring probe", assignee="default")
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, "blocked", {"kind": "needs_input", "reason": "which ring?"})
++        conn.execute("UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'blocked'", (at, tid))
++    return tid
++
++
++def test_verify_accepts_one_newer_user_message_per_card(kanban_home):
++    now = int(time.time())
++    with kbc.connect_closing() as conn:
++        tid = _asked(conn, now - 100)
++        mid = _state_db(kanban_home, "chat-1", now - 10)
++        relay = krh.verify(conn, tid, session_id="chat-1")
++        assert relay == {"session": "chat-1", "message_id": mid, "at": now - 10}
++        kb.add_comment(conn, tid, "default", "David: left ring", writer_kind="agent", writer_session="chat-1",
++                       relayed_human=relay)
++        with pytest.raises(krh.RelayRefused, match="already relayed"):
++            krh.verify(conn, tid, session_id="chat-1")
++
++
++def test_verify_refuses_a_reply_older_than_the_ask(kanban_home):
++    now = int(time.time())
++    with kbc.connect_closing() as conn:
++        tid = _asked(conn, now - 10)
++        _state_db(kanban_home, "chat-1", now - 100)
++        with pytest.raises(krh.RelayRefused, match="predates"):
++            krh.verify(conn, tid, session_id="chat-1")
++
++
++def test_verify_refuses_workers_and_sessionless_callers(kanban_home, monkeypatch):
++    now = int(time.time())
++    with kbc.connect_closing() as conn:
++        tid = _asked(conn, now - 100)
++        _state_db(kanban_home, "chat-1", now - 10)
++        with pytest.raises(krh.RelayRefused, match="session"):
++            krh.verify(conn, tid, session_id=None)
++        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_other")
++        with pytest.raises(krh.RelayRefused, match="Kanban worker"):
++            krh.verify(conn, tid, session_id="chat-1")
++
++
++def test_relay_requires_agent_writer(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = _asked(conn, int(time.time()) - 100)
++        with pytest.raises(ValueError, match="relayed_human"):
++            kb.add_comment(conn, tid, "daveey", "x", writer_kind="human",
++                           relayed_human={"session": "s", "message_id": 1, "at": 1})
++
++
++def _tool_comment(args: dict) -> dict:
++    from tools import kanban_tools as kt
++    return json.loads(kt._handle_comment(args))
++
++
++def test_kanban_comment_tool_records_a_verified_relay(kanban_home, monkeypatch):
++    now = int(time.time())
++    monkeypatch.setenv("HERMES_SESSION_ID", "chat-1")
++    with kbc.connect_closing() as conn:
++        tid = _asked(conn, now - 100)
++    _state_db(kanban_home, "chat-1", now - 10)
++    out = _tool_comment({"task_id": tid, "body": "David says: left ring", "relays_user_message": True})
++    assert out.get("ok") is True and out.get("relayed_human"), out
++    with kbc.connect_closing() as conn:
++        p = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'commented'",
++                                    (tid,)).fetchone()[0])
++    assert p["writer_kind"] == "agent" and p["relayed_human"]["session"] == "chat-1"
++    refused = _tool_comment({"task_id": tid, "body": "and again", "relays_user_message": True})
++    assert refused.get("ok") is not True and "already relayed" in json.dumps(refused)
++
++
++def test_kanban_comment_tool_refuses_a_worker_relay(kanban_home, monkeypatch):
++    now = int(time.time())
++    with kbc.connect_closing() as conn:
++        tid = _asked(conn, now - 100)
++    _state_db(kanban_home, "chat-1", now - 10)
++    monkeypatch.setenv("HERMES_SESSION_ID", "chat-1")
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    out = _tool_comment({"task_id": tid, "body": "self-relay", "relays_user_message": True})
++    assert out.get("ok") is not True and "Kanban worker" in json.dumps(out)
++
++
++def test_remote_relay_is_stored_as_sent():
++    assert krh.from_remote({"session": "hub-chat", "message_id": "7", "at": 5}) == {
++        "session": "hub-chat", "message_id": 7, "at": 5, "via": "remote"}
++    assert krh.from_remote({"session": "", "message_id": 7, "at": 5}) is None
++    assert krh.from_remote("yes") is None
+diff --git a/tests/tools/test_kanban_dashboard_comment_actor.py b/tests/tools/test_kanban_dashboard_comment_actor.py
+index 5173427b84..4e5884709e 100644
+--- a/tests/tools/test_kanban_dashboard_comment_actor.py
++++ b/tests/tools/test_kanban_dashboard_comment_actor.py
+@@ -73,6 +73,31 @@ def test_courier_agent_comment_without_session_is_still_agent(client):
+     assert p["writer_kind"] == "agent" and "writer_session" not in p
+ 
+ 
++def test_courier_relay_of_the_user_reply_is_stored_as_sent(client):
++    """kanban-d1b921f32e: a cross_task relay of David's reply carries its origin-verified relayed_human;
++    the receiver stores it (via='remote') beside writer_kind='agent'."""
++    tid = _ready_task()
++    r = client.post(f"/tasks/{tid}/comments", json={
++        "body": "David says: the left ring", "author": "default", "writer_kind": "agent",
++        "writer_session": "hub-chat", "relayed_human": {"session": "hub-chat", "message_id": 42, "at": 1700}})
++    assert r.status_code == 200, r.text
++    p = _last_payload(tid)
++    assert p["writer_kind"] == "agent"
++    assert p["relayed_human"] == {"session": "hub-chat", "message_id": 42, "at": 1700, "via": "remote"}
++
++
++@pytest.mark.parametrize("extra", [
++    {"relayed_human": {"session": "s", "message_id": 1, "at": 1}},                         # no agent kind (GUI)
++    {"writer_kind": "agent", "relayed_human": {"session": "", "message_id": 1, "at": 1}},  # malformed
++    {"writer_kind": "agent", "relayed_human": {"session": "s", "message_id": "x", "at": 1}},
++])
++def test_relay_without_agent_kind_or_malformed_is_refused(client, extra):
++    tid = _ready_task()
++    r = client.post(f"/tasks/{tid}/comments", json={"body": "x", "author": "a", **extra})
++    assert r.status_code == 400, r.text
++    assert _comments(tid) == []
++
++
+ @pytest.mark.parametrize("author", ["desktop", "user", "dashboard", None])
+ def test_gui_comment_without_actor_stays_human(client, author):
+     """The Kanban drawer (author 'desktop'), the blocked panel ('user') and the web dashboard send
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index b44e9fbe8c..144f8e3e1f 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1355,27 +1355,25 @@ def _handle_comment(args: dict, **kw) -> str:
+             "dispatcher-assigned task to default to. Discover task ids with "
+             "kanban_list, or pass the task id you mean.")
+     body = _redact(_require_text(args, "body"))
+-    # Author comes from the worker's runtime identity (``_persisted_identity``), never
+-    # caller args: comments are injected into future workers' system prompts, so an
+-    # args["author"] override could forge a directive from ``hermes-system``.
+-    # Cross-task commenting stays unrestricted — it is the handoff channel between tasks.
+-    # Comments are injected into the next worker's system prompt by ``build_worker_context`` as
+-    # ``**{author}** (timestamp): {body}`` — accepting an ``args["author"]`` override let a worker forge a
+-    # comment from an authoritative-looking name like ``hermes-system`` and poison the future-worker context
+-    # with what reads as a system directive. See #19713.
++    # Author comes from the worker's runtime identity (``_persisted_identity``), never caller args: comments are
++    # injected into future workers' system prompts (``build_worker_context``), so an ``args["author"]`` override
++    # could forge a directive from ``hermes-system``. Cross-task commenting stays unrestricted. See #19713.
+     author = _persisted_identity()
+     with _board(args.get("board")) as (kb, conn):
+         from hermes_cli import kanban_foreign_card as _kfc
++        from hermes_cli import kanban_relayed_human as _krh
+         foreign = _kfc.refusal(conn, str(tid))  # [daveey] only a replica copy here: name the owner
+         if foreign:
+             raise _Reject(foreign, _kfc.REJECTION)
+         # [daveey] This tool is always an agent: record it, so no reader guesses (agent-261aa31f49).
+         from gateway.session_context import get_session_env
++        writer_session = get_session_env("HERMES_SESSION_ID", "") or None
++        relayed = _krh.from_tool_args(conn, str(tid), args, writer_session, reject=_Reject)  # kanban-d1b921f32e
+         cid = kb.add_comment(conn, tid, author=author, body=str(body), writer_kind="agent",
+-                             writer_session=get_session_env("HERMES_SESSION_ID", "") or None)
++                             writer_session=writer_session, relayed_human=relayed)
+         subscribed = _maybe_subscribe_on_touch(conn, str(tid))
+         live = kb.live_run_id(conn, str(tid))
+-        extra: dict = {"live_run": live is not None}
++        extra: dict = {"live_run": live is not None, **({"relayed_human": relayed} if relayed else {})}
+         if live is not None and _worker_run_id(str(tid)) != live:
+             extra["delivery"] = (
+                 "the card has a live worker run: it gets this note at its next model call "
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 4f75d93feb..74c95ddfb8 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -639,6 +639,11 @@ KANBAN_COMMENT_SCHEMA = _schema(
+                 "kanban_list to discover ids."
+         )),
+         "body": _prop("string", "Markdown-supported comment body."),
++        "relays_user_message": _prop("boolean", (
++                "Set true when this comment passes on the user's reply from this chat to a card that asked "
++                "(e.g. a needs_input block). Counts as a human answer for the card's no-progress budget; "
++                "the comment stays attributed to the agent. Only an interactive chat may set it, once per "
++                "user message per card, and only for a message sent after the card's latest ask.")),
+     },
+     ["task_id", "body"],
+ )
+-- 
+2.51.0
+

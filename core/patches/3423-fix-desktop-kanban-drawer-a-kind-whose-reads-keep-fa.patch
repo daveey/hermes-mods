@@ -1,0 +1,204 @@
+From 4b24631c6ebfb8e42c592fb56abbf707ab5a0d27 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:16:11 +0000
+Subject: [PATCH] fix(desktop): kanban drawer: a kind whose reads keep failing
+ stops sending foreground refetches [daveey]
+
+Follow-up to PR #2102 (review 5889787422, non-blocking points 1-2).
+
+1. Unbounded foreground on failing reads. userOpenReads counted a kind as delivered only after a successful read, so
+   when every read failed (gateway unreachable, task gone, timeouts on a very slow link) each interval refetch of
+   that open stayed priority 'foreground': the task every 30 s, the log every 3-15 s, all bypassing the slow-link
+   thinner and the power-settle hold. The open read of a kind now settles when a read answers OR when a fetch whose
+   reads all failed has spent React Query's retries. The query function passes `retryingFetch(context)`: React
+   Query counts a fetch's failures (fetchFailureCount) before each retry and resets the count when a new fetch
+   starts, so a retry keeps the foreground tag while the next fetch after a failed one is a background poll.
+   Per-open state, so a re-open of a task whose cached query is in error is still the user's foreground read.
+2. Interval comment. The warm-cache test comment said "15-30 s later"; the drawer said "3-30 s". The test covers the
+   task query (30 s): the test now says "the task query's interval refetch 30 s later" and the drawer comment
+   spells out "3-30 s later (log 3-15 s, task 30 s)".
+
+Test (fails before, passes after), drawer.test.tsx:
+- "makes the refetches of a kind whose reads all fail polls once its first fetch spent its retries"
+  (retry: 1; before: ['foreground','foreground','foreground','foreground'], after:
+  ['foreground','foreground',undefined,undefined]: the retried first read stays foreground).
+Kanban plugin vitest 145/145, tsc --noEmit clean, eslint clean on the touched files.
+---
+ apps/desktop/src/plugins/kanban/api.ts        | 44 +++++++++++++++----
+ .../src/plugins/kanban/drawer.test.tsx        | 31 ++++++++++++-
+ apps/desktop/src/plugins/kanban/drawer.tsx    | 15 ++++---
+ 3 files changed, 74 insertions(+), 16 deletions(-)
+
+diff --git a/apps/desktop/src/plugins/kanban/api.ts b/apps/desktop/src/plugins/kanban/api.ts
+index 4215477b48..f46d1eed79 100644
+--- a/apps/desktop/src/plugins/kanban/api.ts
++++ b/apps/desktop/src/plugins/kanban/api.ts
+@@ -863,22 +863,48 @@ export async function fetchBoard(archived: boolean): Promise<KanbanBoard> {
+ }
+ 
+ /** [daveey] One opening of a task detail view. Its reads of each kind (`kind` names the query) go out as priority
+- *  'foreground' until one has answered, so a slow link's poll thinner never skips the user's read: not on a re-open
+- *  within the thinning gap, and not on React Query's retry of a failed first read (a kind counts as delivered only
+- *  after a successful read). Every later read of that kind (interval or socket refetch) is a background poll again
+- *  and may be thinned (electron/slow-link.ts). */
+-export function userOpenReads(): <T>(kind: string, read: (options: PluginRestOptions) => Promise<T>) => Promise<T> {
++ *  'foreground' until that kind's open read has settled, so a slow link's poll thinner never skips the user's read:
++ *  not on a re-open within the thinning gap, and not on React Query's retry of a failed first read (`retry`: this
++ *  call retries a failed read of the same fetch). The open read settles when a read answers, or when a fetch whose
++ *  reads all failed has spent its retries: the next fetch then starts with `retry` false. Every later read of that
++ *  kind (interval or socket refetch) is a background poll again and may be thinned (electron/slow-link.ts), so a kind
++ *  whose reads keep failing (gateway unreachable, task gone, timeouts on a very slow link) stops bypassing the
++ *  thinner after its first fetch. */
++export function userOpenReads(): <T>(
++  kind: string,
++  read: (options: PluginRestOptions) => Promise<T>,
++  retry?: boolean
++) => Promise<T> {
+   const delivered = new Set<string>()
++  const failed = new Set<string>()
+ 
+-  return async (kind, read) => {
+-    const result = await read(delivered.has(kind) ? {} : { priority: 'foreground' })
++  return async (kind, read, retry = false) => {
++    if (failed.has(kind) && !retry) {
++      delivered.add(kind)
++    }
++
++    try {
++      const result = await read(delivered.has(kind) ? {} : { priority: 'foreground' })
++
++      delivered.add(kind)
+ 
+-    delivered.add(kind)
++      return result
++    } catch (error) {
++      failed.add(kind)
+ 
+-    return result
++      throw error
++    }
+   }
+ }
+ 
++/** [daveey] What `retryingFetch` reads of a React Query function context. */
++export type ReadFetchContext = { client: typeof queryClient; queryKey: readonly unknown[] }
++
++/** [daveey] Whether React Query is calling a query function to retry a failed read of the same fetch: it counts the
++ *  fetch's failures before each retry and resets the count when a new fetch starts. */
++export const retryingFetch = ({ client, queryKey }: ReadFetchContext) =>
++  (client.getQueryState(queryKey)?.fetchFailureCount ?? 0) > 0
++
+ export const fetchTask = async (id: string, owner?: TaskOwner, read: PluginRestOptions = {}) => {
+   const downloadAttachment = captureGatewayFileDownload(owner ? { connectionId: owner.gateway, profile: owner.profile } : undefined)
+   const [path, opts] = forTask(id, `/tasks/${id}`, {}, owner)
+diff --git a/apps/desktop/src/plugins/kanban/drawer.test.tsx b/apps/desktop/src/plugins/kanban/drawer.test.tsx
+index d52db0a56a..d9486b1a02 100644
+--- a/apps/desktop/src/plugins/kanban/drawer.test.tsx
++++ b/apps/desktop/src/plugins/kanban/drawer.test.tsx
+@@ -34,9 +34,11 @@ let disposeApi: () => void
+ let disposeLocales: () => void
+ // A GET path whose next read fails once (a dropped first read that React Query then retries).
+ let failOnce = new Set<string>()
++// A GET path whose every read fails (gateway unreachable, task gone, a very slow link timing out).
++let failAlways = new Set<string>()
+ 
+ const rest = vi.fn(async (path: string, options?: PluginRestOptions): Promise<unknown> => {
+-  if (!options?.method && failOnce.delete(path)) {
++  if (!options?.method && (failOnce.delete(path) || failAlways.has(path))) {
+     throw new Error(`dropped read: ${path}`)
+   }
+ 
+@@ -81,6 +83,7 @@ beforeEach(() => {
+ 
+ afterEach(() => {
+   failOnce = new Set()
++  failAlways = new Set()
+   setApiRequestConnection(null)
+   setApiRequestProfile(null)
+   clearNotifications()
+@@ -318,10 +321,34 @@ describe('task modal dialog', () => {
+     expect(taskReads()).toEqual(['foreground', 'foreground'])
+   })
+ 
++  it('makes the refetches of a kind whose reads all fail polls once its first fetch spent its retries', async () => {
++    detail = { ...legacyDetail, attachments: [] }
++    client = new QueryClient({ defaultOptions: { queries: { retry: 1, retryDelay: 0 } } })
++    failAlways = new Set(['/tasks/t_example'])
++
++    const taskReads = () =>
++      rest.mock.calls
++        .filter(([path, options]) => path === '/tasks/t_example' && !options?.method)
++        .map(([, options]) => options?.priority)
++
++    openDrawer()
++    // The open's read and its retry are the user's.
++    await waitFor(() =>
++      expect(client.getQueryCache().findAll({ predicate: q => q.state.status === 'error' })).toHaveLength(1)
++    )
++    expect(taskReads()).toEqual(['foreground', 'foreground'])
++
++    // The interval refetch after the retries ran out (and its own retry) is a background poll, thinned on a slow link.
++    await act(async () => {
++      await client.refetchQueries({ queryKey: ['kanban'] })
++    })
++    await waitFor(() => expect(taskReads()).toEqual(['foreground', 'foreground', undefined, undefined]))
++  })
++
+   it('sends a foreground read when a task is re-opened while its cache is still fresh', async () => {
+     detail = { ...legacyDetail, attachments: [] }
+     // The shared client's staleTime (60 s): without a mount refetch a warm re-open sends nothing, and its first
+-    // request is the interval refetch 15-30 s later.
++    // request is the task query's interval refetch 30 s later.
+     client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 60_000 } } })
+ 
+     const taskReads = () =>
+diff --git a/apps/desktop/src/plugins/kanban/drawer.tsx b/apps/desktop/src/plugins/kanban/drawer.tsx
+index 844dbaf107..25489e94a3 100644
+--- a/apps/desktop/src/plugins/kanban/drawer.tsx
++++ b/apps/desktop/src/plugins/kanban/drawer.tsx
+@@ -51,8 +51,10 @@ import {
+   logKey,
+   patchTask,
+   profilesKey,
++  type ReadFetchContext,
+   reassignTask,
+   reclaimTask,
++  retryingFetch,
+   routedToScope,
+   taskKey,
+   type TaskOwner,
+@@ -860,15 +862,17 @@ export function TaskDrawer({
+   const scope = useKanbanScope()
+   const slug = useValue($boardSlug)
+   // [daveey] The drawer mounts once per open (keyed by its task): the task and log reads of this open are the user's
+-  // (foreground, never thinned on a slow link, retries included) until each has answered; the interval and socket
+-  // refetches after that are polls. refetchOnMount 'always': the shared staleTime (60 s) would otherwise skip the
+-  // mount read of a re-open with warm cache, leaving its first request the interval refetch 3-30 s later.
++  // (foreground, never thinned on a slow link, retries included) until each has settled: answered, or failed with
++  // React Query's retries spent. The interval and socket refetches after that are polls. refetchOnMount 'always': the
++  // shared staleTime (60 s) would otherwise skip the mount read of a re-open with warm cache, leaving its first
++  // request the interval refetch 3-30 s later (log 3-15 s, task 30 s).
+   const [openRead] = useState(userOpenReads)
+ 
+   // Socket-invalidated (bindApi); the interval is only the socketless heartbeat.
+   const { data: detail, error } = useQuery({
+     enabled: query => !!id && (!!owner || routedToScope(query)),
+-    queryFn: () => openRead(`task:${id}`, read => fetchTask(id!, owner, read)),
++    queryFn: (context: ReadFetchContext) =>
++      openRead(`task:${id}`, read => fetchTask(id!, owner, read), retryingFetch(context)),
+     queryKey: taskKey(scope, slug, id ?? '', owner),
+     refetchInterval: 30_000,
+     refetchOnMount: 'always'
+@@ -880,7 +884,8 @@ export function TaskDrawer({
+ 
+   const { data: log } = useQuery({
+     enabled: query => !!id && (!!owner || routedToScope(query)),
+-    queryFn: () => openRead(`log:${id}`, read => fetchLog(id!, owner, read)),
++    queryFn: (context: ReadFetchContext) =>
++      openRead(`log:${id}`, read => fetchLog(id!, owner, read), retryingFetch(context)),
+     queryKey: logKey(scope, slug, id ?? '', owner),
+     refetchInterval: running ? 3_000 : 15_000,
+     refetchOnMount: 'always'
+-- 
+2.51.0
+

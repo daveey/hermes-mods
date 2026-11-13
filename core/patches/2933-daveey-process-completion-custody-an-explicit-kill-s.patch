@@ -1,0 +1,241 @@
+From 90460aea717a6d431e088e3779c3e06d22c69542 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 19:37:23 +0000
+Subject: [PATCH] [daveey] process completion custody: an explicit kill settles
+ the owed notice; review follow-ups
+
+Review 5880232292 on PR #1675 (request changes):
+- Blocker: a kill with consume_output=True that loses the finish race to the reader
+  rewrote the receipt keeping the delivery obligation, so the next gateway start
+  re-armed a notice the caller already had. The kill-path rewrite now settles it for an
+  explicit kill and keeps (never re-creates) it for a bulk cleanup kill.
+- The kill-path read+write and the watcher's acknowledgement both run under the
+  registry lock (settle_completion), so a rewrite cannot resurrect a settled obligation.
+- One malformed owed receipt no longer aborts recovery of the owed receipts after it.
+- Count pruning (MAX_RETAINED_RESULTS) keeps owed receipts; age pruning (7 d) is past
+  the 48 h obligation cap.
+- The subagent handoff note is redacted before it reaches the receipt; the watcher
+  route fields are the checkpoint's own (persisted there verbatim already).
+
+Task: t_01a1d0f2824382ab
+---
+ gateway/run_process_watcher.py                |  3 +-
+ .../test_background_process_notifications.py  |  5 ++
+ .../test_process_completion_custody.py        | 57 +++++++++++++++++++
+ tools/process_registry.py                     |  4 +-
+ tools/process_registry_obligations.py         | 32 +++++++++--
+ tools/process_registry_results.py             | 11 +++-
+ 6 files changed, 103 insertions(+), 9 deletions(-)
+
+diff --git a/gateway/run_process_watcher.py b/gateway/run_process_watcher.py
+index 68b7c9697f..751a620739 100644
+--- a/gateway/run_process_watcher.py
++++ b/gateway/run_process_watcher.py
+@@ -145,8 +145,7 @@ class GatewayProcessWatcherMixin:
+                 )
+         if settled_by is not None:
+             # In the owning profile's scope (bound by _run_process_watcher): its receipt holds the obligation.
+-            from tools.process_registry_obligations import settle_quietly
+-            await asyncio.to_thread(settle_quietly, session_id, settled_by)
++            await asyncio.to_thread(process_registry.settle_completion, session_id, settled_by)
+         logger.debug("Process watcher ended%s: %s", " (silent)" if silent else "", session_id)
+ 
+     # Former name of the poll loop (fork tests and callers).
+diff --git a/tests/gateway/test_background_process_notifications.py b/tests/gateway/test_background_process_notifications.py
+index e4834780e6..6ba633416b 100644
+--- a/tests/gateway/test_background_process_notifications.py
++++ b/tests/gateway/test_background_process_notifications.py
+@@ -49,6 +49,11 @@ class _FakeRegistry:
+     def is_completion_consumed(self, session_id):
+         return self._consumed
+ 
++    def settle_completion(self, session_id, how):
++        """The watcher's owed-completion acknowledgement (process_registry_obligations)."""
++        self.settled = (session_id, how)
++        return False
++
+ 
+ def _build_runner(monkeypatch, tmp_path, mode: str) -> GatewayRunner:
+     """Create a GatewayRunner with a fake config for the given mode."""
+diff --git a/tests/gateway/test_process_completion_custody.py b/tests/gateway/test_process_completion_custody.py
+index bc247865cf..2524e40c44 100644
+--- a/tests/gateway/test_process_completion_custody.py
++++ b/tests/gateway/test_process_completion_custody.py
+@@ -181,6 +181,63 @@ async def test_wait_or_log_consumption_suppresses_the_notice_across_restart(rig,
+     assert _completion_admissions(h) == []
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize("consume_output", [True, False])
++async def test_kill_that_races_the_reader_exit_settles_only_an_explicit_kill(rig, consume_output):
++    """The reader records a plain exit (owed receipt) during the kill's signal wait; the kill then rewrites
++    the receipt as killed. An explicit kill handed the output to its caller, so nothing is owed across a
++    restart; a bulk cleanup kill (consume_output=False) keeps the notice owed."""
++    h = await rig["setup"]()
++    registry, session = _job(h)
++
++    def reader_exits_mid_signal(sess, sid, consume):
++        _settle_exit(registry, sess, 0)
++        assert OBLIGATION_KEY in _receipt(h)
++    registry._signal_kill = reader_exits_mid_signal
++    result = registry.kill_process(session.id, consume_output=consume_output)
++    assert result["status"] == "killed" and _receipt(h)["completion_reason"] == "killed"
++    assert (OBLIGATION_KEY in _receipt(h)) is (not consume_output)
++    registry = h["restart"]()
++    assert len(await _run_watchers(h, registry)) == (0 if consume_output else 1)
++    assert len(_completion_admissions(h)) == (0 if consume_output else 1)
++
++
++def test_owed_receipts_survive_retention_and_a_malformed_one_skips_alone(tmp_path, monkeypatch):
++    """Count pruning keeps owed receipts; a broken owed receipt does not stop recovery of the rest;
++    a subagent's handoff note is redacted before it reaches the receipt."""
++    import os
++    from tools import process_registry_results as results
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr(results, "MAX_RETAINED_RESULTS", 2)
++    registry = ProcessRegistry()
++    secret = "sk-proj-" + "A1b2C3d4" * 6
++    for n, sid in enumerate(("proc_eeeeeeeeeeee", "proc_ffffffffffff")):
++        session = ProcessSession(id=sid, command="true", task_id="t", session_key="agent:main:local:dm:x",
++                                 started_at=STARTED + n, notify_on_complete=True, watcher_platform="local",
++                                 watcher_chat_id="x", watcher_interval=5, handoff_note=f"key {secret}")
++        with registry._lock:
++            registry._running[sid] = session
++        registry._finish_exited(session, 0)
++    directory = tmp_path / "logs" / "process-results"
++    owed = json.loads((directory / "proc_eeeeeeeeeeee.json").read_text())
++    assert secret not in json.dumps(owed) and "key " in owed[OBLIGATION_KEY]["handoff_note"]
++    for n in range(3):  # newer ordinary receipts push both owed ones past the count cap
++        (directory / f"proc_00000000000{n}.json").write_text(json.dumps({"id": f"proc_00000000000{n}"}))
++    broken = json.loads((directory / "proc_eeeeeeeeeeee.json").read_text())
++    del broken["exit_code"]
++    (directory / "proc_eeeeeeeeeeee.json").write_text(json.dumps(broken))
++    import time
++    old = time.time() - 3600
++    for sid in ("proc_eeeeeeeeeeee", "proc_ffffffffffff"):  # older than the 3 ordinary ones, inside retention
++        os.utime(directory / f"{sid}.json", (old, old))
++    results._result_paths()
++    assert (directory / "proc_eeeeeeeeeeee.json").exists() and (directory / "proc_ffffffffffff.json").exists()
++    assert len(list(directory.glob("proc_0*"))) == 2, "ordinary receipts past the cap are still pruned"
++    gateway = ProcessRegistry()
++    gateway.recover_from_checkpoint(owner="gateway")
++    assert [w["session_id"] for w in gateway.pending_watchers] == ["proc_ffffffffffff"]
++
++
+ @pytest.mark.asyncio
+ async def test_no_notify_and_other_profile_jobs_do_not_wake(rig):
+     h = await rig["setup"]()
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 99ae7cd603..a41919b0af 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -40,7 +40,7 @@ from tools.process_registry_output_log import ProcessOutputLogMixin, open_output
+ from tools.process_registry_survivable import ProcessForegroundHoldMixin, enabled as survivable_enabled
+ from tools.process_registry_ownership import ProcessOwnershipMixin
+ from tools.process_registry_termination import ProcessTerminationMixin
+-from tools.process_registry_obligations import ProcessObligationMixin, owed_still
++from tools.process_registry_obligations import ProcessObligationMixin
+ from tools.process_registry_results import load_completed_results, save_completed_result
+ from tools.process_registry_env_log import env_poller_loop, log_delta_command
+ from tools.process_registry_wsl import _is_wsl_launcher_command
+@@ -2153,7 +2153,7 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+             self._log_lifecycle_kill(session, source)
+             # A reader can persist a plain exit during the SIGKILL wait; rewrite the receipt.
+             if not self._move_to_finished(session):
+-                save_completed_result(session, owed_still(session.id))
++                self._rewrite_killed_receipt(session, consume_output)
+             self._write_checkpoint()
+             return {
+                 "status": "killed", "session_id": session.id, "completion_reason": session.completion_reason,
+diff --git a/tools/process_registry_obligations.py b/tools/process_registry_obligations.py
+index 61df0afbc0..05245474c8 100644
+--- a/tools/process_registry_obligations.py
++++ b/tools/process_registry_obligations.py
+@@ -97,8 +97,13 @@ def owes_gateway_delivery(session) -> bool:
+ 
+ 
+ def obligation_for(session, *, owed_since: Optional[float] = None) -> dict:
+-    return {**{f: getattr(session, f) for f in _ROUTE_FIELDS}, "owed_since": owed_since or time.time(),
+-            "recoveries": 0, **_writer()}
++    from agent.redact import redact_sensitive_text
++    owed = {f: getattr(session, f) for f in _ROUTE_FIELDS}
++    # The route fields are the checkpoint's own (persisted there verbatim); the subagent's free-text
++    # handoff note is not, so it gets the receipt command's redaction before it reaches disk.
++    if owed.get("handoff_note"):
++        owed["handoff_note"] = redact_sensitive_text(str(owed["handoff_note"]), force=True)
++    return {**owed, "owed_since": owed_since or time.time(), "recoveries": 0, **_writer()}
+ 
+ 
+ def settle(session_id: str, how: str) -> bool:
+@@ -162,6 +167,20 @@ class ProcessObligationMixin:
+             self._completion_consumed.add(session_id)
+             settle_quietly(session_id, "consumed via wait/log")
+ 
++    def settle_completion(self, session_id: str, how: str) -> bool:
++        """The watcher's acknowledgement, under ``self._lock`` like every other receipt rewrite, so a
++        concurrent kill-path rewrite cannot read the obligation before it and write it back after."""
++        with self._lock:
++            return settle_quietly(session_id, how)
++
++    def _rewrite_killed_receipt(self, session, consume_output: bool) -> None:
++        """A kill that lost the finish race rewrites the reader's receipt as killed. An explicit kill
++        (``consume_output``) hands the output to its caller, so it settles the obligation; any other kill
++        keeps the one the receipt carries (never re-creates it). Read and write under ``self._lock``."""
++        from tools import process_registry as registry_module  # its save name (tests patch it there)
++        with self._lock:
++            registry_module.save_completed_result(session, None if consume_output else owed_still(session.id))
++
+     def _recover_owed_completions_locked(self, owner: Optional[str]) -> int:
+         """Under the checkpoint file lock: re-arm a watcher for each owed receipt of this profile."""
+         from tools.process_registry_readopt import OWNER_GATEWAY, owner_accepts
+@@ -190,7 +209,13 @@ class ProcessObligationMixin:
+                 continue
+             if owed.get("writer_pid") != os.getpid() and self._writer_alive(owed):
+                 continue  # a live gateway still has this watcher
+-            age, tries = now - float(owed.get("owed_since") or 0), int(owed.get("recoveries") or 0)
++            try:
++                age, tries = now - float(owed.get("owed_since") or 0), int(owed.get("recoveries") or 0)
++                session = self._owed_session(record, owed)
++            except (KeyError, TypeError, ValueError):
++                # One malformed receipt must not stop the owed receipts after it from being re-armed.
++                logger.warning("Skipping the unreadable owed completion %s", sid, exc_info=True)
++                continue
+             if age > OBLIGATION_MAX_AGE_SECONDS or tries >= OBLIGATION_MAX_RECOVERIES:
+                 record.pop(OBLIGATION_KEY, None)
+                 with suppress(OSError):
+@@ -206,7 +231,6 @@ class ProcessObligationMixin:
+             except OSError:
+                 logger.warning("Could not claim the owed completion of %s", sid, exc_info=True)
+                 continue
+-            session = self._owed_session(record, owed)
+             with self._lock:
+                 self._finished[sid] = session
+             self.pending_watchers.append(self._recovered_watcher(session))
+diff --git a/tools/process_registry_results.py b/tools/process_registry_results.py
+index d5c1287dbf..6a36ac302e 100644
+--- a/tools/process_registry_results.py
++++ b/tools/process_registry_results.py
+@@ -42,10 +42,19 @@ def _result_paths():
+             continue  # Another producer pruned it.
+     retained.sort(key=lambda item: (item[0], item[1].name), reverse=True)
+     for _, path in retained[MAX_RETAINED_RESULTS:]:
+-        path.unlink(missing_ok=True)
++        if not _owed(path):  # an owed notice keeps its receipt until settled or aged out [daveey]
++            path.unlink(missing_ok=True)
+     return [path for _, path in retained[:MAX_RETAINED_RESULTS]]
+ 
+ 
++def _owed(path) -> bool:
++    try:
++        record = json.loads(path.read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        return False
++    return isinstance(record, dict) and isinstance(record.get("delivery_obligation"), dict)
++
++
+ def save_completed_result(session, obligation: dict | None = None) -> None:
+     """``obligation``: the completion is still owed to a gateway watcher (``process_registry_obligations``);
+     it rides this same atomic write, so it is durable before the checkpoint entry goes. [daveey]"""
+-- 
+2.51.0
+

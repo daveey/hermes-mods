@@ -1,0 +1,134 @@
+From 8714f2149a5db29dc16a5deda97cfe38006bca8b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:36:33 +0000
+Subject: [PATCH] [daveey] kanban: a detached board judges missing parents
+ itself; only a link to a missing parent restarts its window
+
+Review 5887627668 on PR #1931 @bd78a1ae6c:
+- Blocking: set_mode('off') keeps the remote-parent mirror table but leaves no
+  readable replica, so the freshness gate returned early forever on a detached
+  board (no parent_missing, no block, no repair). The gate now applies only to a
+  synced board (mode primary/shadow), as local_copy_stale already did.
+- Nit: a 'linked' event restarted the streak even for a parent that is present.
+  Only an unblock, or a link naming a parent missing now (or naming none), opens
+  a fresh streak.
+
+RED on bd78a1ae6c: test_a_detached_board_keeps_its_mirror_table_but_still_blocks_a_missing_parent
+and test_a_link_to_a_present_parent_does_not_restart_a_missing_ones_window.
+---
+ hermes_cli/kanban_db_graph.py                 | 33 +++++++++++--------
+ .../test_kanban_cross_gateway_parents.py      | 18 ++++++++++
+ .../test_kanban_missing_parent_detector.py    | 15 +++++++++
+ 3 files changed, 53 insertions(+), 13 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_graph.py b/hermes_cli/kanban_db_graph.py
+index 330ce2adc6..daef77d9e9 100644
+--- a/hermes_cli/kanban_db_graph.py
++++ b/hermes_cli/kanban_db_graph.py
+@@ -27,10 +27,10 @@ def note_missing_parents(
+         return False
+     missing = [pid for pid, st in states if st is None]
+     if missing and remote:
+-        from hermes_cli.kanban_replica_freshness import replica_at_head
++        from hermes_cli.kanban_replica_freshness import replica_at_head, synced
+         cache = {} if fresh is None else fresh
+-        if "fresh" not in cache:
+-            cache["fresh"] = replica_at_head(conn)
++        if "fresh" not in cache:  # a detached board (sync off) keeps its mirror table but is its own authority
++            cache["fresh"] = replica_at_head(conn) if synced(conn) else True
+             if not cache["fresh"]:
+                 _log.debug("parent status unknown: replica not at head")
+         if not cache["fresh"]:
+@@ -65,20 +65,27 @@ def note_missing_parents(
+ 
+ 
+ def _streak_open(conn: sqlite3.Connection, task_id: str, last, missing: list[str]) -> bool:
+-    """The newest ``parent_missing`` is this streak only when no ``unblocked``/``linked`` event follows it and it
+-    names every parent missing now: a later incident must not inherit an earlier one's elapsed time."""
++    """The newest ``parent_missing`` is this streak only when no ``unblocked`` event, nor a ``linked`` event for a
++    parent missing now (or naming none), follows it, and it names every parent missing now: a later incident must
++    not inherit an earlier one's elapsed time, and a link to a present parent does not restart a missing one's."""
+     if last is None or last["kind"] != "parent_missing":
+         return False
+-    reset = conn.execute(
+-        "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind IN ('unblocked', 'linked')", (task_id,),
+-    ).fetchone()[0]
+-    if reset is not None and reset > last["id"]:
+-        return False
++    for kind, payload in conn.execute(
++        "SELECT kind, payload FROM task_events WHERE task_id = ? AND id > ? AND kind IN ('unblocked', 'linked')",
++        (task_id, last["id"]),
++    ).fetchall():
++        if kind == "unblocked" or _event_field(payload, "parent") in (None, *missing):
++            return False
++    named = _event_field(last["payload"], "parents")
++    return isinstance(named, list) and set(missing) <= set(named)
++
++
++def _event_field(payload, key: str):
++    """``key`` of a JSON event payload; None when absent or unreadable."""
+     try:
+-        named = set(json.loads(last["payload"] or "{}").get("parents") or ())
++        return (json.loads(payload or "{}") or {}).get(key)
+     except (TypeError, ValueError, AttributeError):
+-        return False
+-    return set(missing) <= named
++        return None
+ 
+ 
+ def missing_parent_repair(conn: sqlite3.Connection, task_id: str, missing: list[str]) -> str:
+diff --git a/tests/hermes_cli/test_kanban_cross_gateway_parents.py b/tests/hermes_cli/test_kanban_cross_gateway_parents.py
+index 3be5c9aed4..06fdf306ae 100644
+--- a/tests/hermes_cli/test_kanban_cross_gateway_parents.py
++++ b/tests/hermes_cli/test_kanban_cross_gateway_parents.py
+@@ -283,3 +283,21 @@ def test_a_fresh_replica_that_lacks_the_parent_still_blocks_and_files_one_repair
+     assert "parent t_ghost missing from this board" in payload
+     kb.recompute_ready(live)
+     assert len(_repairs(live, child)) == 1
++
++
++def test_a_detached_board_keeps_its_mirror_table_but_still_blocks_a_missing_parent(live, svc, kanban_home):
++    """Sync off (``set_mode('off')``) keeps the mirror table but leaves no replica to judge by: the board is its own
++    authority again, so the freshness gate must not switch the detector off for good."""
++    child = kb.create_task(live, title="child", assignee="worker")
++    _round(kanban_home, svc)
++    _link_raw(live, "t_ghost", child)
++    sync.set_mode(live, "off")
++    support.write_sync_config(kanban_home, False)
++    assert sync.has_remote_parents(live)
++    kb.recompute_ready(live)
++    assert len(_events(live, child, "parent_missing")) == 1  # before the fix: no event, todo forever
++    _age_streak(live, child)
++    kb.recompute_ready(live)
++    assert kb.get_task(live, child).status == "blocked"
++    kb.recompute_ready(live)
++    assert len(_repairs(live, child)) == 1
+diff --git a/tests/hermes_cli/test_kanban_missing_parent_detector.py b/tests/hermes_cli/test_kanban_missing_parent_detector.py
+index 094ce6f0fc..b53de80567 100644
+--- a/tests/hermes_cli/test_kanban_missing_parent_detector.py
++++ b/tests/hermes_cli/test_kanban_missing_parent_detector.py
+@@ -152,6 +152,21 @@ def test_a_newly_missing_parent_waits_its_own_window(local, linked_event):
+     assert len(_repairs(local, child)) == 1
+ 
+ 
++def test_a_link_to_a_present_parent_does_not_restart_a_missing_ones_window(local):
++    child = kb.create_task(local, title="dependent", assignee="worker")
++    support._link_raw(local, "t_a", child)
++    kb.recompute_ready(local)
++    _age(local, child)
++    with kb.write_txn(local):  # an unrelated, present parent is linked while t_a is still missing
++        local.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('t_ok', 'ok', 'running', 0)")
++    support._link_raw(local, "t_ok", child)
++    with kb.write_txn(local):
++        kb._append_event(local, child, "linked", {"parent": "t_ok", "child": child})
++    kb.recompute_ready(local)
++    assert kb.get_task(local, child).status == "blocked"  # before: the link restarted t_a's 600 s window
++    assert len(support._events(local, child, "parent_missing")) == 1
++
++
+ def test_a_streak_naming_more_parents_still_covers_the_ones_left(local):
+     child = kb.create_task(local, title="dependent", assignee="worker")
+     support._link_raw(local, "t_a", child)
+-- 
+2.51.0
+

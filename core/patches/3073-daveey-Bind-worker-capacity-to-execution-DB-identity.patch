@@ -1,0 +1,309 @@
+From 5c4afd21b1ba58818e6d8f0b1d2ded24cbf79c2c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:00:12 +0000
+Subject: [PATCH] [daveey] Bind worker capacity to execution DB identity and
+ allow occupied-owner resumes
+
+---
+ hermes_cli/kanban_admission.py                | 15 +++-
+ hermes_cli/kanban_db_dispatch.py              |  3 +-
+ hermes_cli/machine_metrics.py                 |  4 +-
+ hermes_cli/worker_compute_capacity.py         | 18 +++-
+ hermes_cli/worker_resource_admission.py       | 11 ++-
+ .../test_worker_compute_configuration.py      |  6 +-
+ .../hermes_cli/test_worker_owner_identity.py  | 90 +++++++++++++++++++
+ .../test_worker_resource_admission.py         |  5 +-
+ 8 files changed, 134 insertions(+), 18 deletions(-)
+ create mode 100644 tests/hermes_cli/test_worker_owner_identity.py
+
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index 9e7dcdecf6..0193b1a3a2 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -38,7 +38,13 @@ def hub_cpu_advisory(task_id=None, *, conn=None):
+     from hermes_cli import machine_metrics
+ 
+     from hermes_cli.worker_resource_admission import refusal
+-    if reason := refusal():
++    from hermes_cli.worker_compute_capacity import worker_enabled, owner_for_connection
++    try:
++        claimant = owner_for_connection(conn, task_id) if conn is not None and worker_enabled() else None
++    except Exception:  # health: allow BLE001 -- malformed worker policy/identity must refuse prelease
++        _defer(task_id, 'worker_resources_unknown')
++        return 'worker_resources_unknown'
++    if reason := refusal(claimant=claimant):
+         _defer(task_id, reason)
+         return reason
+     state, limit = cpu.root_limit()
+@@ -128,7 +134,7 @@ def _over_budget(started, needed_s=0.0):
+     return started is not None and time.monotonic() - started + needed_s > _hold_budget_s()
+ 
+ 
+-def _final_hub_gate(gate, started=None, *, conn=None, task_id=None):
++def _final_hub_gate(gate, started=None, claimant=None, *, conn=None, task_id=None):
+     """Under admission.lock: ``(reason, evidence)``; reason None admits. Never touches the network.
+ 
+     Cheap checks (whole-host cap, lease deadline) run BEFORE the ~1 s sample so a claim that must be refused anyway
+@@ -148,7 +154,7 @@ def _final_hub_gate(gate, started=None, *, conn=None, task_id=None):
+         return "worker_resources_unknown", None
+     if worker and not getattr(_decision, "worker_fenced", True):
+         return "worker_resources_unknown", None
+-    if reason := refusal(echo, enabled=worker):
++    if reason := refusal(echo, enabled=worker, claimant=claimant):
+         return reason, None
+     if worker and (_expired(gate) or _over_budget(started)):
+         return "worker_resources_unknown", None
+@@ -392,7 +398,8 @@ def claim_transaction(conn, *, task_id=None, gate=None):
+             previous_fenced = getattr(_decision, "worker_fenced", True)
+             _decision.worker_fenced = worker
+             try:
+-                reason, evidence = _final_hub_gate(gate, started, conn=conn, task_id=task_id)
++                claimant = capacity.owner_for_connection(conn, task_id) if worker and task_id is not None else None
++                reason, evidence = _final_hub_gate(gate, started, claimant, conn=conn, task_id=task_id)
+             finally:
+                 _decision.worker_fenced = previous_fenced
+             if reason is not None:
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 6d26a1ad92..37f48c3337 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2708,7 +2708,8 @@ def _restart_safe_worker_argv(task: Task, command: list[str], board: Optional[st
+     ).argv)
+     # OOM recovery raises the cap; bounded_scope adds the shared pool (kanban_aggregate_scope)
+     return _aggregate_scope.bounded_scope(
+-        _worker_scope.apply_oom_recovery(argv, task.id, board), task_id=task.id, board=board or 'default')
++        _worker_scope.apply_oom_recovery(argv, task.id, board), task_id=task.id,
++        board=str(_kb.kanban_db_path(board=board).resolve()))
+ 
+ 
+ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None, observation=None) -> Optional[int]:
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index f177c3c589..608dd38c9e 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -137,8 +137,8 @@ def active_card_runs(exclude=None, detail: Optional[dict] = None, *, owner_outpu
+                     for pool, count in counts.items():
+                         detail["pools"][pool] += count
+                 if owner_output is not None:
+-                    from hermes_cli.kanban_db_sync import board_slug_for_path
+-                    owners.update((board_slug_for_path(str(path)), task) for task in ids)
++                    from hermes_cli.worker_compute_capacity import owner_for_db
++                    owners.update(owner_for_db(path, task) for task in ids)
+             finally:
+                 db.close()
+         if detail is not None:
+diff --git a/hermes_cli/worker_compute_capacity.py b/hermes_cli/worker_compute_capacity.py
+index 94cf5aec30..43b7976186 100644
+--- a/hermes_cli/worker_compute_capacity.py
++++ b/hermes_cli/worker_compute_capacity.py
+@@ -44,14 +44,26 @@ def effective_cores() -> float:
+     return cores
+ 
+ 
++def owner_for_db(database, task: str) -> tuple[str, str]:
++    """Stable local execution identity, independent of caller board labels."""
++    if not isinstance(database, (str, Path)) or not database or not Path(database).is_absolute():
++        raise ValueError('Worker identity requires an absolute database path')
++    if not isinstance(task, str) or not task:
++        raise ValueError('Worker identity requires a task')
++    return str(Path(database).resolve()), task
++
++
++def owner_for_connection(conn, task: str) -> tuple[str, str]:
++    from hermes_cli.kanban_db_connect import _main_db_file
++    return owner_for_db(_main_db_file(conn), task)
++
++
+ def managed_target(policy, target: Path | None) -> bool:
+     """Validate the actual owner-launched interpreter's destination before spawn."""
+     if not policy or not getattr(policy, 'kanban_json', None) or not worker_enabled():
+         return False
+     context = json.loads(policy.kanban_json)
+-    board, task = context.get('board') or 'default', context.get('task_id')
+-    if not isinstance(board, str) or not isinstance(task, str) or not task:
+-        raise ValueError('Worker compute scope requires board and task identity')
++    board, task = owner_for_db(context.get('db'), context.get('task_id'))
+     name = configure_card(board, task)
+     if target is None or target.parent.name != name:
+         raise ValueError('Managed worker is outside its card CPU slice')
+diff --git a/hermes_cli/worker_resource_admission.py b/hermes_cli/worker_resource_admission.py
+index 6a2d00a801..781b780d15 100644
+--- a/hermes_cli/worker_resource_admission.py
++++ b/hermes_cli/worker_resource_admission.py
+@@ -79,7 +79,7 @@ def pool_occupancy(pool: Path, owners, active):
+     return capacity.occupied_owners(pool, owners, active)
+ 
+ 
+-def occupied_count_for_host(echo=None) -> int | None:
++def occupied_count_for_host(echo=None, *, claimant=None) -> int | None:
+     """One census for admission and Board reports; never mutate pressure state."""
+     from hermes_cli import machine_metrics
+     from hermes_cli.worker_account_boards import paths
+@@ -100,11 +100,14 @@ def occupied_count_for_host(echo=None) -> int | None:
+                 raise ValueError('invalid worker owner map')
+             owners[path.stem] = tuple(owner)
+     occupied = pool_occupancy(capacity.pool_path(), owners, active_owners)
++    # A prospective resume in a populated slice does not take a second slot.
++    if claimant is not None:
++        occupied.add(claimant)
+     # Distinct installations can contain copied IDs. Preserve their row count.
+     return len(occupied) + max(0, active - len(active_owners))
+ 
+ 
+-def refusal(echo=None, *, enabled=None) -> str | None:
++def refusal(echo=None, *, enabled=None, claimant=None) -> str | None:
+     """Pre-lease and final-lock check. Unknown observations fail closed."""
+     try:
+         if not (capacity.worker_enabled() if enabled is None else enabled):
+@@ -112,12 +115,12 @@ def refusal(echo=None, *, enabled=None) -> str | None:
+         directory = capacity.policy_root() / 'worker-resources'
+         if _pressure(directory):
+             return 'worker_load_pressure'
+-        occupied_count = occupied_count_for_host(echo)
++        occupied_count = occupied_count_for_host(echo, claimant=claimant)
+         from hermes_cli.kanban_admission import _root_max_in_progress
+         ok, cap = _root_max_in_progress(root=capacity.policy_root())
+         if occupied_count is None or not ok or cap is None:
+             return 'worker_resources_unknown'
+-        if occupied_count >= cap:
++        if occupied_count > cap if claimant is not None else occupied_count >= cap:
+             return 'worker_capacity_full'
+         return None
+     except Exception:  # health: allow BLE001 -- any unreadable policy/controller must refuse claims
+diff --git a/tests/hermes_cli/test_worker_compute_configuration.py b/tests/hermes_cli/test_worker_compute_configuration.py
+index 04117ec649..4d2666b496 100644
+--- a/tests/hermes_cli/test_worker_compute_configuration.py
++++ b/tests/hermes_cli/test_worker_compute_configuration.py
+@@ -75,9 +75,11 @@ def test_cpu_weight_readback_required(configured):
+ 
+ def test_managed_worker_requires_card_slice_and_sets_priority(monkeypatch, configured):
+     monkeypatch.setattr(capacity, 'worker_enabled', lambda: True)
+-    scope = configured.card / 'hermes-worker-kanban-task-run-1.scope'
++    database = configured.home / 'kanban.db'
++    card = configured.card.rename(configured.pool / capacity.owner_slice(str(database), 'task'))
++    scope = card / 'hermes-worker-kanban-task-run-1.scope'
+     scope.mkdir()
+-    policy = SimpleNamespace(kanban_json=json.dumps({'task_id': 'task', 'board': 'board'}))
++    policy = SimpleNamespace(kanban_json=json.dumps({'task_id': 'task', 'board': 'wrong-label', 'db': str(database)}))
+     assert capacity.managed_target(policy, scope) is True
+     with pytest.raises(ValueError):
+         capacity.managed_target(policy, configured.pool / scope.name)
+diff --git a/tests/hermes_cli/test_worker_owner_identity.py b/tests/hermes_cli/test_worker_owner_identity.py
+new file mode 100644
+index 0000000000..a97a1447b6
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_owner_identity.py
+@@ -0,0 +1,90 @@
++"""Execution DB identity, not caller board labels, owns worker capacity."""
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import worker_compute_capacity as capacity
++from tests.hermes_cli import test_worker_resource_admission as helpers
++from tests.hermes_cli.test_kanban_hub_admission_grant_echo import claim
++
++worker_rig = helpers.worker_rig
++
++
++def _job(rig, pool, owner):
++    name = capacity.owner_slice(*owner)
++    group = pool / name
++    group.mkdir()
++    (group / 'cgroup.events').write_text('populated 1\n')
++    directory = rig.home / 'worker-resources' / 'owners'
++    directory.mkdir(exist_ok=True)
++    (directory / f'{name}.json').write_text(json.dumps(owner))
++
++
++@pytest.mark.parametrize('lane', ['ready', 'review'])
++@pytest.mark.parametrize('echo', [False, True])
++def test_same_owner_resume_at_capacity(worker_rig, lane, echo):
++    rig, pool = worker_rig
++    rig.fill(1)
++    task = rig.card(lane)
++    owner = capacity.owner_for_connection(rig.conn, task)
++    _job(rig, pool, owner)
++    if echo:
++        rig.echo_between_gate_and_txn()
++    assert claim(rig.conn, task, lane) is not None
++    from hermes_cli.worker_resource_admission import occupied_count_for_host
++    assert occupied_count_for_host() == 2
++
++
++@pytest.mark.parametrize('lane', ['ready', 'review'])
++def test_same_task_in_foreign_installation_does_not_resume(worker_rig, tmp_path, lane):
++    rig, pool = worker_rig
++    rig.fill(1)
++    task = rig.card(lane)
++    _job(rig, pool, capacity.owner_for_db(tmp_path / 'foreign' / 'kanban.db', task))
++    assert claim(rig.conn, task, lane) is None
++
++
++def test_db_pin_alias_and_managed_owner_ignore_board_label(worker_rig, tmp_path, monkeypatch):
++    rig, _ = worker_rig
++    task = rig.card('ready')
++    owner = capacity.owner_for_connection(rig.conn, task)
++    alias = tmp_path / 'alias.db'
++    alias.symlink_to(owner[0])
++    assert capacity.owner_for_db(alias, task) == owner
++    seen = []
++    name = capacity.owner_slice(*owner)
++    monkeypatch.setattr(capacity, 'configure_card', lambda *args: seen.append(args) or name)
++    policy = SimpleNamespace(kanban_json=json.dumps({'board': 'wrong-label', 'db': str(alias), 'task_id': task}))
++    assert capacity.managed_target(policy, tmp_path / name / 'run.scope')
++    assert seen == [owner]
++
++
++def test_dispatch_uses_pinned_execution_db_not_board_label(worker_rig, monkeypatch):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    from hermes_cli import kanban_aggregate_scope as aggregate
++    from tools import process_registry as processes
++    rig, _ = worker_rig
++    task = rig.card('ready')
++    owner = capacity.owner_for_connection(rig.conn, task)
++    monkeypatch.setenv('HERMES_KANBAN_DB', owner[0])
++    monkeypatch.setattr(aggregate, 'configure_pool', lambda: None)
++    monkeypatch.setattr(dispatch._worker_scope, 'apply_oom_recovery', lambda argv, *args: argv)
++    monkeypatch.setattr(processes, 'restart_safe_gateway_child_argv', lambda argv, **kw: SimpleNamespace(
++        argv=['systemd-run', '--user', '--scope', '--', *argv], mode='scope'))
++    seen = []
++    name = capacity.owner_slice(*owner)
++    monkeypatch.setattr(capacity, 'configure_card', lambda *args: seen.append(args) or name)
++    from hermes_cli import kanban_db as kb
++    with kb.pin_first_board_resolution():
++        argv = dispatch._restart_safe_worker_argv(SimpleNamespace(id=task, current_run_id=1), ['worker'], board='wrong-label')
++    assert seen == [owner]
++    assert f'--slice={name}' in argv
++    assert argv[argv.index('--') + 1:] == ['nice', '-n', '15', 'worker']
++
++
++@pytest.mark.parametrize('db', [None, '', 'relative.db'])
++def test_managed_owner_requires_absolute_db(worker_rig, tmp_path, db):
++    policy = SimpleNamespace(kanban_json=json.dumps({'board': 'default', 'db': db, 'task_id': 't_x'}))
++    with pytest.raises(ValueError, match='database'):
++        capacity.managed_target(policy, tmp_path / 'run.scope')
+diff --git a/tests/hermes_cli/test_worker_resource_admission.py b/tests/hermes_cli/test_worker_resource_admission.py
+index 06d2ac9fd4..d4708bc99b 100644
+--- a/tests/hermes_cli/test_worker_resource_admission.py
++++ b/tests/hermes_cli/test_worker_resource_admission.py
+@@ -44,12 +44,13 @@ def test_final_gate_counts_new_detached_jobs_and_releases_grant(worker_rig, lane
+ def test_worker_own_grant_echo_does_not_take_extra_slot(worker_rig, lane):
+     rig, pool = worker_rig
+     started = rig.fill(1)
+-    name = capacity.owner_slice('default', started[0])
++    owner = capacity.owner_for_connection(rig.conn, started[0])
++    name = capacity.owner_slice(*owner)
+     (pool / name).mkdir()
+     (pool / name / 'cgroup.events').write_text('populated 1\n')
+     directory = rig.home / 'worker-resources' / 'owners'
+     directory.mkdir()
+-    (directory / f'{name}.json').write_text(json.dumps(['default', started[0]]))
++    (directory / f'{name}.json').write_text(json.dumps(owner))
+     t = rig.card(lane)
+     rig.echo_between_gate_and_txn()
+     assert claim(rig.conn, t, lane) is not None
+-- 
+2.51.0
+

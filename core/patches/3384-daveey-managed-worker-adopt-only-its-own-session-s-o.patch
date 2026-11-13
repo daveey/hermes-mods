@@ -1,0 +1,385 @@
+From 91ff285c0ac3e8b86c6ade6b4dde9375eae4b418 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:28:18 +0000
+Subject: [PATCH] [daveey] managed worker: adopt only its own session's
+ orphaned background jobs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A Kanban managed worker's startup recover_from_checkpoint() adopted every
+orphan on the host. On hermes-hub 2026-11-13 the always-on Desktop backend
+@9148 rolled over at 00:10:01 while Desktop chat 20261112_002413_39be4c's
+persist_on_release + notify_on_complete job proc_70810e2dae05 ran. A Kanban
+worker (pid 49656, session local-0581b9b9…, 00:10:14-00:15:47) started 17 s
+later and adopted the job. Its writer stamp fenced the successor backend's
+30 s keeper, so process_manage returned not_found at 00:11:38. Its log reader
+collected the exit at 00:15:02 (receipt mtime 00:15) into a completion queue
+nobody reads, and the chat never got its notice.
+
+recover_from_checkpoint gains session_keys=. The worker passes its route and
+session id (F24's intent: "a previous admission of this session"), and every
+other entry stays untouched for its owner's recovery. Gateway and Desktop
+recovery are unchanged.
+
+Regression: tests/gateway/test_managed_worker_checkpoint_scope.py drives the
+real managed-worker execute and recovery against a Desktop orphan plus an
+orphan of the worker's own session. RED before the fix: the worker adopts
+proc_desktop00001, and session_keys is a TypeError.
+---
+ agent/managed_worker.py                       |   6 +-
+ .../test_managed_worker_observation_bind.py   |   2 +-
+ .../test_managed_worker_observer_load.py      |   2 +-
+ tests/gateway/test_bot_chat_follow_entry.py   |   2 +-
+ tests/gateway/test_managed_turn_contract.py   |   2 +-
+ .../test_managed_worker_checkpoint_scope.py   | 104 ++++++++++++++++++
+ ...st_managed_worker_hard_stop_frame_fence.py |   2 +-
+ .../gateway/test_managed_worker_route_key.py  |   2 +-
+ .../test_managed_worker_routing_kwargs.py     |   2 +-
+ .../gateway/test_managed_worker_rpc_close.py  |   2 +-
+ .../test_model_switch_worker_composed.py      |   2 +-
+ .../tools/test_update_survivable_processes.py |   8 +-
+ tools/process_registry_checkpoint.py          |  20 ++--
+ 13 files changed, 134 insertions(+), 22 deletions(-)
+ create mode 100644 tests/gateway/test_managed_worker_checkpoint_scope.py
+
+diff --git a/agent/managed_worker.py b/agent/managed_worker.py
+index af0a2d2442..37ea9887b7 100644
+--- a/agent/managed_worker.py
++++ b/agent/managed_worker.py
+@@ -351,9 +351,11 @@ def execute(frame, channel):
+     from agent.observation_bind import observation_bind, observation_finish, observation_revoke
+     observation_bind(frame)
+     # Background processes a previous admission of this session started outlive that worker
+-    # (F24); adopt them so process_manage in this turn can poll and kill them.
++    # (F24); adopt them so process_manage in this turn can poll and kill them. Only this session's:
++    # another chat's orphan (a Desktop job whose backend just rolled over) would finish in this
++    # per-turn process, whose completion queue nobody reads, and its notice was lost. [daveey]
+     from tools.process_registry import process_registry
+-    process_registry.recover_from_checkpoint()
++    process_registry.recover_from_checkpoint(session_keys=(frame['route'], scope['session_id']))
+     # Store construction binds the delegation ledger before tool discovery.
+     from gateway.session_policy import restore_policy, policy_scope, register_worker_hooks, surface_label
+     policy = restore_policy(frame['policy'])
+diff --git a/tests/agent/test_managed_worker_observation_bind.py b/tests/agent/test_managed_worker_observation_bind.py
+index cbd916b70a..2085efdbf8 100644
+--- a/tests/agent/test_managed_worker_observation_bind.py
++++ b/tests/agent/test_managed_worker_observation_bind.py
+@@ -246,7 +246,7 @@ def _execute(tmp_path, monkeypatch, events, context, *, start=None, agent_error=
+     monkeypatch.setattr('agent.runtime_session_store.WorkerRPC', RPC)
+     monkeypatch.setattr('agent.runtime_session_store.RuntimeSessionStore', Store)
+     monkeypatch.setattr('tools.process_registry.process_registry.recover_from_checkpoint',
+-                        lambda: events.append('recover'))
++                        lambda **_k: events.append('recover'))
+     monkeypatch.setattr('run_agent.AIAgent', Agent)
+     monkeypatch.setattr('tools.capsule_workspace.bind_worker_workspace', bind_workspace)
+     # In-process the socketpair's creator is this pid, not an ancestor; the real ancestry check is
+diff --git a/tests/agent/test_managed_worker_observer_load.py b/tests/agent/test_managed_worker_observer_load.py
+index 7ba33c1cd2..736ea48032 100644
+--- a/tests/agent/test_managed_worker_observer_load.py
++++ b/tests/agent/test_managed_worker_observer_load.py
+@@ -535,7 +535,7 @@ def _execute(tmp_path, monkeypatch, events, *, fail):
+     monkeypatch.setattr('gateway.session_policy.register_worker_hooks', lambda policy: None)
+     monkeypatch.setattr('agent.runtime_session_store.WorkerRPC', RPC)
+     monkeypatch.setattr('agent.runtime_session_store.RuntimeSessionStore', Store)
+-    monkeypatch.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda: None)
++    monkeypatch.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda **_k: None)
+     monkeypatch.setattr('run_agent.AIAgent', Agent)
+     monkeypatch.setattr('tools.capsule_workspace.bind_worker_workspace', bind_workspace)
+     # In-process the socketpair's creator is this pid, not an ancestor (the real ancestry check is in the
+diff --git a/tests/gateway/test_bot_chat_follow_entry.py b/tests/gateway/test_bot_chat_follow_entry.py
+index 89277f64b5..89cfe8179f 100644
+--- a/tests/gateway/test_bot_chat_follow_entry.py
++++ b/tests/gateway/test_bot_chat_follow_entry.py
+@@ -392,7 +392,7 @@ def _managed_turn(authority, db, ref, monkeypatch, rid):
+         m.setattr(worker, 'retire_agent', lambda agent: None)
+         m.setattr(worker, 'WorkerControls', Controls)
+         m.setattr('agent.runtime_session_store.WorkerRPC', rpc_factory)
+-        m.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda: None)
++        m.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda **_k: None)
+         m.setattr('run_agent.AIAgent', Agent)
+         worker.execute(frame, SimpleNamespace(send=lambda kind, **payload: sent.append(kind)))
+     assert len(captured) == 1 and sent[-1] == 'finished', sent
+diff --git a/tests/gateway/test_managed_turn_contract.py b/tests/gateway/test_managed_turn_contract.py
+index 4ac58d9f91..94f568ebce 100644
+--- a/tests/gateway/test_managed_turn_contract.py
++++ b/tests/gateway/test_managed_turn_contract.py
+@@ -76,7 +76,7 @@ def test_child_executes_under_finite_policy_and_preserves_receipt(tmp_path, monk
+     monkeypatch.setattr(worker, 'WorkerControls', Controls)
+     monkeypatch.setattr('agent.runtime_session_store.WorkerRPC', lambda home: lambda *a, **k: {'owner_epoch': 3})
+     monkeypatch.setattr('agent.runtime_session_store.RuntimeSessionStore', Store)
+-    monkeypatch.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda: None)
++    monkeypatch.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda **_k: None)
+     monkeypatch.setattr('run_agent.AIAgent', Agent)
+     monkeypatch.setattr('agent.title_generator.wait_for_title_upgrades', lambda: None)
+     clear_session('managed-contract')  # the child owns a fresh approval registry
+diff --git a/tests/gateway/test_managed_worker_checkpoint_scope.py b/tests/gateway/test_managed_worker_checkpoint_scope.py
+new file mode 100644
+index 0000000000..264d2ba67e
+--- /dev/null
++++ b/tests/gateway/test_managed_worker_checkpoint_scope.py
+@@ -0,0 +1,104 @@
++"""A managed worker adopts only its own session's orphaned background jobs. [daveey]
++
++Regression for proc_70810e2dae05 (Desktop chat 20261112_002413_39be4c, hermes-hub, 2026-11-13):
++the always-on Desktop backend that spawned the ``persist_on_release`` + ``notify_on_complete`` job
++rolled over at 00:10:01, and a Kanban managed worker started 17 s later. The worker's startup
++``recover_from_checkpoint()`` adopted every orphan on the host, this Desktop job included. Its writer
++stamp then fenced the successor Desktop backend's re-adoption (``process_manage`` -> not_found at
++00:11:38), and the worker's log reader collected the exit at 00:15:02 into a completion queue nobody
++reads. The receipt was written and the chat never got its notice.
++"""
++import subprocess
++import sys
++import time
++from unittest.mock import patch
++
++import pytest
++
++from tests.gateway.test_managed_turn_contract import assignment
++from tests.gateway.test_managed_worker_route_key import _execute
++from tools.process_registry import ProcessRegistry
++from tools.process_registry_readopt import recover_tui_orphaned_processes
++
++DESKTOP_KEY = "20261112_002413_39be4c"
++
++
++def _dead_pid() -> int:
++    proc = subprocess.Popen([sys.executable, "-c", "pass"])
++    proc.wait()
++    return proc.pid
++
++
++def _entry(sid: str, pid: int, key: str) -> dict:
++    return {
++        "session_id": sid, "command": "sleep 60", "pid": pid, "pid_scope": "host",
++        "host_start_time": ProcessRegistry._safe_host_start_time(pid), "started_at": time.time(),
++        "task_id": f"session:{key}", "owner_task_id": key, "session_key": key, "notify_on_complete": True,
++        "persist_on_release": True, "writer_pid": _dead_pid(), "writer_start_time": None,
++    }
++
++
++@pytest.fixture()
++def orphans(tmp_path, monkeypatch):
++    """Two orphaned jobs (their writers are gone): one of a Desktop chat, one of the worker's own session."""
++    import json
++    started = [subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], stdin=subprocess.DEVNULL)
++               for _ in range(2)]
++    path = tmp_path / "processes.json"
++    path.write_text(json.dumps([_entry("proc_desktop00001", started[0].pid, DESKTOP_KEY),
++                                _entry("proc_ownturn00001", started[1].pid, "managed-contract")]))
++    monkeypatch.setattr("hermes_cli.process_identity.is_desktop_owned_backend", lambda argv=None: True)
++    with patch("tools.process_registry.CHECKPOINT_PATH", path):
++        yield path
++    for proc in started:
++        proc.kill()
++        proc.wait()
++
++
++def _worker_recovery_kwargs(tmp_path, monkeypatch) -> dict:
++    """Run the real managed-worker ``execute`` and capture exactly how it asks for recovery."""
++    calls = []
++    frame, _ = assignment(tmp_path, monkeypatch)
++    real_setattr = monkeypatch.setattr
++
++    def setattr_spy(target, *args, **kwargs):
++        if target == 'tools.process_registry.process_registry.recover_from_checkpoint':
++            args = (lambda *a, **k: calls.append((a, k)),)
++        return real_setattr(target, *args, **kwargs)
++    monkeypatch.setattr = setattr_spy
++    try:
++        _execute(frame, monkeypatch)
++    finally:
++        monkeypatch.setattr = real_setattr
++    assert len(calls) == 1, calls
++    args, kwargs = calls[0]
++    assert not args, args
++    return kwargs
++
++
++def test_managed_worker_leaves_a_desktop_chats_orphan_to_the_desktop_backend(tmp_path, monkeypatch, orphans):
++    kwargs = _worker_recovery_kwargs(tmp_path, monkeypatch)
++    worker = ProcessRegistry()
++    worker.recover_from_checkpoint(**kwargs)
++    # The worker's own session's job is still adopted (F24: process_manage in this turn reaches it) ...
++    assert worker.get("proc_ownturn00001") is not None
++    # ... but another chat's orphan is not: this process cannot deliver its completion.
++    assert worker.get("proc_desktop00001") is None
++    # The entry stays an orphan for its owner, so the Desktop backend's keeper adopts it and wakes the chat.
++    # (Both registries live in this one test process, so the keeper may also see the worker's own entry.)
++    desktop = ProcessRegistry()
++    assert recover_tui_orphaned_processes(desktop) >= 1
++    adopted = desktop.get("proc_desktop00001")
++    assert adopted is not None and adopted.session_key == DESKTOP_KEY
++    assert adopted._completion_via_readopt_sink is True
++
++
++def test_session_scoped_recovery_leaves_other_entries_untouched(orphans):
++    import json
++    before = {e["session_id"]: e for e in json.loads(orphans.read_text())}
++    registry = ProcessRegistry()
++    assert registry.recover_from_checkpoint(session_keys=("managed-contract",)) == 1
++    after = {e["session_id"]: e for e in json.loads(orphans.read_text())}
++    # The other chat's entry keeps its original (dead) writer stamp: nothing fenced it off.
++    assert after["proc_desktop00001"]["writer_pid"] == before["proc_desktop00001"]["writer_pid"]
++    assert registry.get("proc_desktop00001") is None
+diff --git a/tests/gateway/test_managed_worker_hard_stop_frame_fence.py b/tests/gateway/test_managed_worker_hard_stop_frame_fence.py
+index d0664d23b2..159a951138 100644
+--- a/tests/gateway/test_managed_worker_hard_stop_frame_fence.py
++++ b/tests/gateway/test_managed_worker_hard_stop_frame_fence.py
+@@ -60,7 +60,7 @@ def test_worker_stop_hard_cancels_the_agent_before_and_after_construction(tmp_pa
+     monkeypatch.setattr(worker, 'WorkerControls', Latched)
+     monkeypatch.setattr('agent.runtime_session_store.WorkerRPC', lambda home: lambda *a, **k: {'owner_epoch': 1})
+     monkeypatch.setattr('agent.runtime_session_store.RuntimeSessionStore', Store)
+-    monkeypatch.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda: None)
++    monkeypatch.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda **_k: None)
+     monkeypatch.setattr('run_agent.AIAgent', _Agent)
+     monkeypatch.setattr('agent.title_generator.wait_for_title_upgrades', lambda: None)
+     worker.execute(frame, SimpleNamespace(send=lambda kind, **payload: None))
+diff --git a/tests/gateway/test_managed_worker_route_key.py b/tests/gateway/test_managed_worker_route_key.py
+index 0087e0a54a..ed3dc22ccb 100644
+--- a/tests/gateway/test_managed_worker_route_key.py
++++ b/tests/gateway/test_managed_worker_route_key.py
+@@ -61,7 +61,7 @@ def _execute(frame, monkeypatch, base=object, built=None, result=None, sent=None
+     monkeypatch.setattr(worker, 'WorkerControls', Controls)
+     monkeypatch.setattr('agent.runtime_session_store.WorkerRPC', lambda home: lambda *a, **k: {'owner_epoch': 1})
+     monkeypatch.setattr('agent.runtime_session_store.RuntimeSessionStore', Store)
+-    monkeypatch.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda: None)
++    monkeypatch.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda **_k: None)
+     monkeypatch.setattr('run_agent.AIAgent', Agent)
+     monkeypatch.setattr('agent.title_generator.wait_for_title_upgrades', lambda: None)
+     sent = [] if sent is None else sent
+diff --git a/tests/gateway/test_managed_worker_routing_kwargs.py b/tests/gateway/test_managed_worker_routing_kwargs.py
+index 128793197b..90540d16a4 100644
+--- a/tests/gateway/test_managed_worker_routing_kwargs.py
++++ b/tests/gateway/test_managed_worker_routing_kwargs.py
+@@ -52,7 +52,7 @@ def test_managed_worker_agent_gets_the_session_provider_routing(tmp_path, monkey
+     monkeypatch.setattr(worker, 'WorkerControls', Controls)
+     monkeypatch.setattr('agent.runtime_session_store.WorkerRPC', lambda home: lambda *a, **k: {'owner_epoch': 1})
+     monkeypatch.setattr('agent.runtime_session_store.RuntimeSessionStore', Store)
+-    monkeypatch.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda: None)
++    monkeypatch.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda **_k: None)
+     monkeypatch.setattr('run_agent.AIAgent', Agent)
+     monkeypatch.setattr('agent.title_generator.wait_for_title_upgrades', lambda: None)
+     worker.execute(frame, SimpleNamespace(send=lambda kind, **payload: None))
+diff --git a/tests/gateway/test_managed_worker_rpc_close.py b/tests/gateway/test_managed_worker_rpc_close.py
+index d12ab34156..eeb1672702 100644
+--- a/tests/gateway/test_managed_worker_rpc_close.py
++++ b/tests/gateway/test_managed_worker_rpc_close.py
+@@ -48,7 +48,7 @@ def _execute(tmp_path, monkeypatch, events, *, start_error=None, close_error=Non
+     monkeypatch.setattr(worker, 'WorkerControls', Controls)
+     monkeypatch.setattr('agent.runtime_session_store.WorkerRPC', RPC)
+     monkeypatch.setattr('agent.runtime_session_store.RuntimeSessionStore', Store)
+-    monkeypatch.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda: None)
++    monkeypatch.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda **_k: None)
+     monkeypatch.setattr('run_agent.AIAgent', Agent)
+     monkeypatch.setattr('agent.title_generator.wait_for_title_upgrades', lambda: None)
+     worker.execute(frame, SimpleNamespace(send=lambda kind, **payload: events.append(kind)))
+diff --git a/tests/gateway/test_model_switch_worker_composed.py b/tests/gateway/test_model_switch_worker_composed.py
+index 13315d7c9d..b8806ddb4e 100644
+--- a/tests/gateway/test_model_switch_worker_composed.py
++++ b/tests/gateway/test_model_switch_worker_composed.py
+@@ -164,7 +164,7 @@ def _worker_build(authority, db, ref, monkeypatch, execution_id):
+         m.setattr(worker, 'retire_agent', lambda agent: None)
+         m.setattr(worker, 'WorkerControls', Controls)
+         m.setattr('agent.runtime_session_store.WorkerRPC', rpc_factory)
+-        m.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda: None)
++        m.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda **_k: None)
+         m.setattr('run_agent.AIAgent', Agent)
+         worker.execute(frame, SimpleNamespace(send=lambda kind, **payload: sent.append(kind)))
+     assert len(captured) == 1 and sent[-1] == 'finished', sent
+diff --git a/tests/tools/test_update_survivable_processes.py b/tests/tools/test_update_survivable_processes.py
+index 8de9d48eef..ad0a316213 100644
+--- a/tests/tools/test_update_survivable_processes.py
++++ b/tests/tools/test_update_survivable_processes.py
+@@ -319,9 +319,9 @@ def test_recovery_racing_a_foreground_release_never_adopts_it(tmp_path, monkeypa
+     recovered = []
+     real_locked = registry._recover_from_checkpoint_locked
+ 
+-    def locked(owner):
++    def locked(owner, *rest):
+         in_recovery.set()
+-        return real_locked(owner)
++        return real_locked(owner, *rest)
+ 
+     registry._recover_from_checkpoint_locked = locked
+     racer = threading.Thread(target=lambda: recovered.append(registry.recover_from_checkpoint()), daemon=True)
+@@ -419,13 +419,13 @@ def test_recovery_racing_a_real_handoff_tracks_the_command_once(tmp_path, monkey
+                                 daemon=True, name="recovery")
+     real_locked = registry._recover_from_checkpoint_locked
+ 
+-    def locked(owner):  # recovery owns the file lock and is about to decide
++    def locked(owner, *rest):  # recovery owns the file lock and is about to decide
+         racing.set()
+         if first == "recovery":
+             handoff.start()
+             popped.wait(0.3)  # fixed: the handoff waits for our lock before it drops the hold
+         try:
+-            return real_locked(owner)
++            return real_locked(owner, *rest)
+         finally:
+             decided.set()
+ 
+diff --git a/tools/process_registry_checkpoint.py b/tools/process_registry_checkpoint.py
+index 39dc647365..56704d00e1 100644
+--- a/tools/process_registry_checkpoint.py
++++ b/tools/process_registry_checkpoint.py
+@@ -5,7 +5,7 @@ import logging
+ import os
+ import threading
+ import time
+-from typing import Any, Dict, List, Optional
++from typing import Any, Dict, Iterable, List, Optional
+ 
+ from agent.redact import redact_sensitive_text
+ 
+@@ -267,18 +267,24 @@ class ProcessCheckpointMixin:
+             logger.debug("Checkpoint reassert failed", exc_info=True)
+             return False
+ 
+-    def recover_from_checkpoint(self, owner: Optional[str] = None) -> int:
++    def recover_from_checkpoint(self, owner: Optional[str] = None, *,
++                                session_keys: Optional[Iterable[str]] = None) -> int:
+         """On startup, probe PIDs from the checkpoint file; returns how many were
+         recovered as detached sessions.
+ 
+         ``owner`` limits adoption to one kind of entry (see
+         ``tools.process_registry_readopt``): ``"gateway"`` (messaging session keys and
+         legacy keyless entries) or ``"tui"`` (Desktop/TUI session ids). ``None`` adopts
+-        every orphan. The whole read-decide-write runs under the checkpoint file lock,
+-        so two backends starting together adopt an orphan once. [daveey]"""
++        every orphan. ``session_keys`` limits it further to those sessions' jobs and leaves
++        every other entry untouched: a managed worker serves one turn of one session, and
++        adopting another chat's orphan (a Desktop job whose backend had just rolled over)
++        took its exit into a process with no consumer for it (proc_70810e2dae05). The whole
++        read-decide-write runs under the checkpoint file lock, so two backends starting
++        together adopt an orphan once. [daveey]"""
++        keys = None if session_keys is None else frozenset(k for k in session_keys if k)
+         try:
+             with self._checkpoint_file_lock():
+-                recovered, foreign, settled, source = self._recover_from_checkpoint_locked(owner)
++                recovered, foreign, settled, source = self._recover_from_checkpoint_locked(owner, keys)
+                 # Completions a stopped gateway still owed (exit settled before its watcher ticked). [daveey]
+                 try:
+                     recovered += self._recover_owed_completions_locked(owner)
+@@ -296,7 +302,7 @@ class ProcessCheckpointMixin:
+             logger.warning("Settling other profiles' process checkpoints failed", exc_info=True)
+         return recovered
+ 
+-    def _recover_from_checkpoint_locked(self, owner: Optional[str]):
++    def _recover_from_checkpoint_locked(self, owner: Optional[str], session_keys: Optional[frozenset] = None):
+         """Returns (recovered count, entries another profile owns, settled ids, this checkpoint's path)."""
+         from tools.process_registry import (
+             ProcessSession, _CHECKPOINT_FIELDS, _checkpoint_path,
+@@ -323,7 +329,7 @@ class ProcessCheckpointMixin:
+         scope = scope_profile()
+         for entry in entries:
+             pid, pid_scope = entry.get("pid"), entry.get("pid_scope", "host")
+-            if not pid:
++            if not pid or (session_keys is not None and entry.get("session_key") not in session_keys):
+                 continue
+             # The registry is process-global, so every profile's checkpoint carries every live
+             # process; a multiplexer recovering several homes must adopt each session once.
+-- 
+2.51.0
+

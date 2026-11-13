@@ -1,0 +1,824 @@
+From d0ab656ed1376995c9bc8562866166f4b64bf701 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 23:15:07 +0000
+Subject: [PATCH] [daveey] Isolate proof backend homes before bootstrap
+ consumers
+
+gateway-9aaf151a15: a restart-proof backend (serve --isolated + HERMES_DESKTOP=1)
+started by an agent on the real home ran startup recovery and adopted an
+unrelated chat; the probe's SIGTERM then interrupted it. Endpoint isolation
+was never state isolation.
+
+- hermes_cli/proof_home.py (stdlib + hermes_constants/_parser only):
+  `hermes serve|dashboard --proof-home DIR` or HERMES_PROOF_HOME selects
+  HERMES_HOME in hermes_bootstrap, after tree repair and before scratch export,
+  config or recovery. DIR must be an existing disposable directory, never the
+  production root, root/profiles/* or the launching agent home
+  (HERMES_AGENT_HOME), resolved through aliases/symlinks; not combinable with
+  --profile. Invalid -> exit 2 with a safe recipe, before any write.
+- Agent-originated restart-proof shapes (--isolated or HERMES_DESKTOP=1 with
+  HERMES_AGENT_TOOL_CALL / HERMES_AGENT_ORIGIN / HERMES_KANBAN_TASK /
+  HERMES_KANBAN_WORKER_TASK / HERMES_DELEGATED_CHILD_CONTEXT) on a production
+  home exit 2. Absent stamps change nothing: Desktop (incl. SSH token-file)
+  and always-on backends keep today's behaviour; --status/--stop/--help pass.
+- web_server re-checks before the server/lifespan consumers start.
+- Tool children (terminal, process, execute_code) are stamped with
+  HERMES_AGENT_TOOL_CALL=1, HERMES_AGENT_ORIGIN and HERMES_AGENT_HOME after env
+  scrubbing; the SSH terminal backend re-exports the origin remotely.
+- Defense in depth: startup_resume and process re-adoption refuse production
+  state from an agent/proof backend; a proof home still recovers its OWN jobs.
+
+Tests: tests/hermes_cli/test_serve_proof_home.py (+ _recovery: real serve,
+SIGTERM/restart, own job re-adopted, sentinel untouched).
+---
+ hermes_bootstrap.py                           |   6 +
+ hermes_cli/proof_home.py                      | 212 ++++++++++++
+ hermes_cli/subcommands/dashboard.py           |   2 +
+ hermes_cli/web_server.py                      |   2 +
+ pyproject.toml                                |   2 +-
+ tests/hermes_cli/test_serve_proof_home.py     | 304 ++++++++++++++++++
+ .../test_serve_proof_home_recovery.py         |  87 +++++
+ .../tools/test_code_execution_windows_env.py  |   3 +
+ tools/code_execution_env.py                   |   3 +-
+ tools/environments/local.py                   |   3 +-
+ tools/environments/ssh.py                     |   5 +-
+ tools/process_registry_readopt.py             |   5 +
+ tui_gateway/startup_resume.py                 |   6 +-
+ 13 files changed, 635 insertions(+), 5 deletions(-)
+ create mode 100644 hermes_cli/proof_home.py
+ create mode 100644 tests/hermes_cli/test_serve_proof_home.py
+ create mode 100644 tests/hermes_cli/test_serve_proof_home_recovery.py
+
+diff --git a/hermes_bootstrap.py b/hermes_bootstrap.py
+index cae371f4ae..4cc6c768df 100644
+--- a/hermes_bootstrap.py
++++ b/hermes_bootstrap.py
+@@ -635,5 +635,11 @@ if not _pm_repair:
+         if command_argv(sys.argv[1:])[:1] != ["pm"]:
+             print(f"hermes: {exc}; run `hermes pm repair`", file=sys.stderr)
+             raise SystemExit(1) from None
++if {"serve", "dashboard"} & set(sys.argv[1:]):
++    # Select or refuse a proof backend's home before scratch export, config or recovery read it.
++    # After the repair above, so a torn tree is mended before this module is needed.
++    from hermes_cli.proof_home import prepare_backend_argv
++
++    prepare_backend_argv()
+ install_happy_eyeballs_socket_connect()
+ export_scratch_tmp_env()
+diff --git a/hermes_cli/proof_home.py b/hermes_cli/proof_home.py
+new file mode 100644
+index 0000000000..5477b50ebd
+--- /dev/null
++++ b/hermes_cli/proof_home.py
+@@ -0,0 +1,212 @@
++"""State isolation for agent-launched restart proofs, before bootstrap consumers.
++
++Endpoint isolation (``--isolated``, ``--port 0``) is NOT state isolation: a restart-proof backend
++started by an agent on the real home ran startup recovery and adopted an unrelated chat
++(gateway-9aaf151a15). Two rules, enforced in ``hermes_bootstrap`` before any config, recovery or
++background consumer imports, and re-checked in ``web_server`` before the server is built:
++
++* ``hermes serve|dashboard --proof-home DIR`` (or ``HERMES_PROOF_HOME``) selects ``HERMES_HOME``.
++  DIR must be an existing disposable directory: never the production root, ``<root>/profiles/*``
++  or the launching agent's home (``HERMES_AGENT_HOME``), resolved through aliases and symlinks.
++* An agent-originated restart-proof shape (``--isolated`` or ``HERMES_DESKTOP=1``) on a
++  production home exits 2 with a safe recipe.
++
++Agent origin is any stamp below. Tool spawners stamp it after their env scrubbing; the SSH terminal
++backend re-exports it remotely; the hub-admin forced command stamps every call. Stamps are
++provenance, not authentication: their absence never authorizes anything beyond today's behaviour,
++and a process with arbitrary environment control is out of scope. Stdlib-only (bootstrap path).
++"""
++from __future__ import annotations
++
++import os
++from pathlib import Path
++import shlex
++import sys
++from typing import Mapping, NoReturn, Optional, Sequence
++
++TOOL_CALL_ENV = "HERMES_AGENT_TOOL_CALL"  # health: allow HX002 -- process provenance stamp, not a setting
++ORIGIN_ENV = "HERMES_AGENT_ORIGIN"  # health: allow HX002 -- process provenance stamp, not a setting
++AGENT_HOME_ENV = "HERMES_AGENT_HOME"  # health: allow HX002 -- launching home stamp, not a setting
++PROOF_HOME_ENV = "HERMES_PROOF_HOME"  # health: allow HX002 -- per-process proof selector, like HERMES_HOME
++ORIGIN_KEYS = (TOOL_CALL_ENV, ORIGIN_ENV, "HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK",
++               "HERMES_DELEGATED_CHILD_CONTEXT")
++_BACKENDS = ("serve", "dashboard")
++_LIFECYCLE_FLAGS = ("--help", "-h", "--status", "--stop")
++RECIPE = ('Use an existing disposable directory: mkdir -p "$TMPDIR/hermes-proof" && '
++          'hermes serve --proof-home "$TMPDIR/hermes-proof" --isolated --port 0. '
++          'Never copy production state or credentials into it.')
++
++
++def agent_origin(environ: Optional[Mapping[str, str]] = None) -> bool:
++    env = os.environ if environ is None else environ
++    return any(env.get(key) for key in ORIGIN_KEYS)
++
++
++def _path(raw: str | Path) -> Path:
++    return Path(os.path.expandvars(str(raw))).expanduser().resolve()
++
++
++def production_home(home: str | Path) -> bool:
++    """True for (an alias of) the platform/account root, any of its profiles, or the caller's home."""
++    from hermes_constants import _get_platform_default_hermes_home, account_default_hermes_home
++
++    target = _path(home)
++    roots = {_get_platform_default_hermes_home().resolve(), account_default_hermes_home().resolve()}
++    agent = os.environ.get(AGENT_HOME_ENV)
++    if agent:
++        caller = _path(agent)
++        if target == caller:
++            return True
++        roots.add(caller.parent.parent if caller.parent.name == "profiles" else caller)
++    for root in roots:
++        profiles = root / "profiles"
++        if target == root or target.is_relative_to(profiles.resolve()):
++            return True
++        # A named profile can itself be a symlink to a directory outside the root.
++        if profiles.is_dir() and any(target == p.resolve() for p in profiles.iterdir() if p.is_dir()):
++            return True
++    return False
++
++
++def _refuse(reason: str) -> NoReturn:
++    print(f"Refused proof backend: {reason}. {RECIPE}", file=sys.stderr, flush=True)
++    raise SystemExit(2)
++
++
++def validate_proof_home(raw: str | Path) -> Path:
++    try:
++        home = _path(raw)
++        unsafe = not home.is_dir() or production_home(home)
++    except (OSError, RuntimeError, ValueError):
++        _refuse("--proof-home could not be resolved safely")
++    if unsafe:
++        _refuse("--proof-home must be an existing disposable directory, never a production or agent home")
++    return home
++
++
++def _production_or_unknown(home: str | Path) -> bool:
++    try:
++        return production_home(home)
++    except (OSError, RuntimeError, ValueError):
++        return True
++
++
++def _current_home() -> Path:
++    from hermes_constants import get_hermes_home
++
++    return get_hermes_home()
++
++
++def _scan(argv: Sequence[str]) -> Optional[tuple[bool, list[str]]]:
++    """(profile flag given, backend flags) for ``hermes [top flags] serve|dashboard ...``; else None."""
++    from hermes_cli._parser import _OPTIONAL_VALUE_FLAGS_FALLBACK, _VALUE_FLAGS_FALLBACK
++
++    profile, index = False, 0
++    while index < len(argv):
++        arg = argv[index]
++        if arg in ("-p", "--profile"):
++            profile, index = True, index + 2
++        elif arg.startswith("--profile="):
++            profile, index = True, index + 1
++        elif arg.startswith("-") and arg != "--":
++            index += 2 if arg in _VALUE_FLAGS_FALLBACK and arg not in _OPTIONAL_VALUE_FLAGS_FALLBACK else 1
++        else:
++            break
++    if index >= len(argv) or argv[index] not in _BACKENDS:
++        return None
++    return profile, list(argv[index + 1:])
++
++
++def requested_proof_home(flags: Sequence[str]) -> Optional[str]:
++    selected = None
++    for pos, flag in enumerate(flags):
++        if flag == "--proof-home":
++            if pos + 1 >= len(flags) or flags[pos + 1].startswith("-"):
++                _refuse("--proof-home needs a directory")
++            selected = flags[pos + 1]
++        elif flag.startswith("--proof-home="):
++            selected = flag.split("=", 1)[1]
++    return selected
++
++
++def _enforce_agent_shape(isolated: bool) -> None:
++    if agent_origin() and (isolated or os.environ.get("HERMES_DESKTOP") == "1"):
++        if _production_or_unknown(_current_home()):
++            _refuse("an agent-launched restart-proof backend cannot use production recovery state")
++
++
++def prepare_backend_argv(argv: Optional[Sequence[str]] = None) -> None:
++    """Bootstrap boundary: select or refuse the home before anything reads it."""
++    scanned = _scan(list(sys.argv[1:] if argv is None else argv))
++    if scanned is None:
++        return
++    profile, flags = scanned
++    if any(flag in _LIFECYCLE_FLAGS for flag in flags):
++        return
++    selected = requested_proof_home(flags)
++    if selected is None:
++        selected = os.environ.get(PROOF_HOME_ENV)
++    if selected is None:
++        _enforce_agent_shape("--isolated" in flags)
++        return
++    if not selected.strip():
++        _refuse("--proof-home is empty")
++    if profile:
++        _refuse("--proof-home cannot be combined with --profile")
++    home = validate_proof_home(selected)
++    os.environ[PROOF_HOME_ENV] = str(home)
++    os.environ["HERMES_HOME"] = str(home)
++
++
++def assert_backend_home(*, isolated: bool, argv: Optional[Sequence[str]] = None) -> None:
++    """``web_server`` re-check before the server and lifespan consumers start.
++
++    Config is already imported here, so this can only refuse: a ``--proof-home`` that the bootstrap
++    did not select (an entry point that skipped it) must not run on whatever home was loaded.
++    """
++    scanned = _scan(list(sys.argv[1:] if argv is None else argv))
++    flagged = requested_proof_home(scanned[1]) if scanned else None
++    selected = flagged if flagged is not None else os.environ.get(PROOF_HOME_ENV)
++    if selected is None:
++        _enforce_agent_shape(isolated)
++        return
++    home = validate_proof_home(selected)
++    try:
++        current = _current_home().resolve()
++    except (OSError, RuntimeError, ValueError):
++        current = None
++    if current != home or os.environ.get(PROOF_HOME_ENV) != str(home):
++        _refuse("--proof-home was not selected before configuration loaded")
++
++
++def recovery_home_allowed(home: str | Path) -> bool:
++    """Defense in depth for startup recovery: a proof backend recovers its OWN state, never production."""
++    if not agent_origin() and PROOF_HOME_ENV not in os.environ:
++        return True
++    if _production_or_unknown(home):
++        return False
++    selected = os.environ.get(PROOF_HOME_ENV)
++    if selected is None:
++        return True
++    try:
++        return _path(home) == validate_proof_home(selected)
++    except SystemExit:
++        return False
++
++
++def stamp_tool_child(env: dict[str, str]) -> dict[str, str]:
++    """Stamp a tool child's final env (after overrides/scrubbing) with origin and launching home."""
++    env[TOOL_CALL_ENV] = "1"
++    env[ORIGIN_ENV] = os.environ.get(ORIGIN_ENV) or "tool"
++    try:
++        env[AGENT_HOME_ENV] = str(_current_home().resolve())
++    except (OSError, RuntimeError, ValueError):
++        pass
++    return env
++
++
++def remote_origin_prefix(environ: Optional[Mapping[str, str]] = None) -> str:
++    """Shell prefix re-exporting the agent origin on a remote host (sshd starts a clean env)."""
++    env = os.environ if environ is None else environ
++    origin = env.get(ORIGIN_ENV) or "tool"
++    return f"export {TOOL_CALL_ENV}=1 {ORIGIN_ENV}={shlex.quote(origin)}; "
+diff --git a/hermes_cli/subcommands/dashboard.py b/hermes_cli/subcommands/dashboard.py
+index b577cf65fc..c7c8bb4caa 100644
+--- a/hermes_cli/subcommands/dashboard.py
++++ b/hermes_cli/subcommands/dashboard.py
+@@ -14,6 +14,8 @@ from typing import Callable
+ 
+ def _add_server_runtime_args(parser) -> None:
+     """Runtime flags shared by ``dashboard`` and ``serve`` (same ``web_server.start_server``)."""
++    parser.add_argument("--proof-home", metavar="DIR", default=None,
++                        help="Use an existing disposable home for restart proofs (never production state)")
+     parser.add_argument(
+         "--port", type=int, default=9119, help="Port (default 9119, 0 for auto-assign by OS)")
+     parser.add_argument("--host", default="127.0.0.1", help="Host (default 127.0.0.1)")
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index a34786225f..9dfa71ca1d 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -1673,6 +1673,8 @@ def _start_server_runtime(
+     until the ready sentinel is written so its SDK import can't hold the GIL
+     against the pre-bind path.
+     """
++    from hermes_cli.proof_home import assert_backend_home
++    assert_backend_home(isolated=isolated)  # before the server, config consumers and lifespan start
+     from hermes_cli.update_proxy_env import restore_user_proxy_env
+     restore_user_proxy_env()  # a backend an update replayed keeps the user's proxy env, not the update's
+     _apply_ssh_session_token(ssh_session_token or "")
+diff --git a/pyproject.toml b/pyproject.toml
+index 2f026abc56..8da68249d0 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -609,7 +609,7 @@ opt-in-extras = ["kittentts"]
+ # files updates its path here.
+ update-startup-files = [
+   "hermes_bootstrap.py", "hermes_cli/_parser.py", "hermes_cli/_launchers.py",
+-  "hermes_cli/git_fingerprint.py",
++  "hermes_cli/git_fingerprint.py", "hermes_cli/proof_home.py",
+   "hermes_cli/_early_recovery.py", "hermes_cli/update_lock.py", "hermes_cli/update_custody.py",
+   "hermes_cli/update_handoff.py", "hermes_cli/venv_sync.py", "pm/__init__.py", "pm/environments.py",
+   "hermes_cli/main.py", "hermes_cli/config.py", "hermes_cli/__init__.py",
+diff --git a/tests/hermes_cli/test_serve_proof_home.py b/tests/hermes_cli/test_serve_proof_home.py
+new file mode 100644
+index 0000000000..07be27d079
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_proof_home.py
+@@ -0,0 +1,304 @@
++"""Proof backends must select disposable state before any config consumer.
++
++The subprocess tripwire stops old code at its first config import, so RED never
++starts consumers (even against the disposable sentinel). No production signals:
++every home is a temporary directory and every launched process is owned here.
++"""
++import json
++import os
++from pathlib import Path
++import shlex
++import subprocess
++import sys
++import time
++
++import pytest
++
++from tools.environments.local import build_subprocess_env
++
++ROOT = Path(__file__).resolve().parents[2]
++_ORIGINS = ("HERMES_AGENT_TOOL_CALL", "HERMES_AGENT_ORIGIN", "HERMES_KANBAN_TASK",
++            "HERMES_KANBAN_WORKER_TASK", "HERMES_DELEGATED_CHILD_CONTEXT")
++_BOUNDARY = '''
++import importlib.abc, os, runpy, sys
++class ConfigBoundary(importlib.abc.MetaPathFinder):
++    def find_spec(self, fullname, path=None, target=None):
++        if fullname == 'hermes_cli.config':
++            print('CONFIG_HOME=' + os.environ.get('HERMES_HOME', ''), flush=True)
++            raise SystemExit(87)
++sys.meta_path.insert(0, ConfigBoundary())
++sys.argv = ['hermes'] + sys.argv[1:]
++runpy.run_module('hermes_cli.main', run_name='__main__')
++'''
++
++
++@pytest.fixture
++def sentinel(tmp_path):
++    return make_sentinel(tmp_path)
++
++
++def make_sentinel(tmp_path):
++    """A production-shaped home (it IS ``$HOME/.hermes`` for the launched processes)."""
++    from hermes_state import SessionDB
++
++    home = tmp_path / '.hermes'
++    home.mkdir()
++    db = SessionDB(home / 'state.db')
++    db.create_session('unrelated-desktop', source='desktop')
++    db.close()
++    # An actually exited owned child, not a guessed PID that might be live.
++    dead = subprocess.Popen([sys.executable, '-c', 'pass'], env=build_subprocess_env())
++    assert dead.wait(timeout=5) == 0
++    marker = home / 'desktop' / 'interrupted_turns.json'
++    marker.parent.mkdir()
++    marker.write_text(json.dumps({'unrelated-desktop': {
++        'prompt': 'unrelated recoverable fixture', 'started_at': time.time(),
++        'attempts': 0, 'auto_continue': True, 'writer_pid': dead.pid,
++    }}))
++    (home / 'processes.json').write_text(json.dumps([{
++        'session_id': 'proc_unrelated', 'session_key': 'unrelated-desktop', 'pid': dead.pid,
++        'persist_on_release': True, 'notify_on_complete': True,
++    }]))
++    return home
++
++
++def _snapshot(home):
++    return {str(p.relative_to(home)): p.read_bytes() for p in home.rglob('*') if p.is_file()}
++
++
++def _clean_env(sentinel, origin=None, extra=None):
++    env = build_subprocess_env(base={'PATH': os.environ['PATH']}, inherit_profile_home=False,
++                               scrub_secrets=False)
++    # Isolation is explicit: never inherit account, routing, launcher or worker state.
++    env = {k: v for k, v in env.items() if not k.startswith('HERMES_')}
++    env.update(HOME=str(sentinel.parent), HERMES_HOME=str(sentinel),
++               TMPDIR=str(sentinel.parent), PYTHONPATH=str(ROOT))
++    if origin:
++        env[origin] = '1'
++    env.update(extra or {})
++    return env
++
++
++def _launch(sentinel, args, origin=None, *, extra=None, wrapper=None):
++    env = _clean_env(sentinel, origin, extra)
++    command = [sys.executable, '-c', _BOUNDARY, *args]
++    if wrapper == 'python':
++        command = [sys.executable, '-c',
++                   'import subprocess,sys; raise SystemExit(subprocess.call(sys.argv[1:]))', *command]
++    elif wrapper == 'remote':
++        # What the SSH terminal backend runs on the far side: sshd's clean env + the origin prefix.
++        from hermes_cli.proof_home import remote_origin_prefix
++
++        env = {k: v for k, v in env.items() if k not in _ORIGINS}
++        command = ['bash', '-c', remote_origin_prefix({'HERMES_AGENT_ORIGIN': 'tool'})
++                   + 'exec ' + shlex.join(command)]
++    return subprocess.run(command, env=env, cwd=ROOT, capture_output=True,
++                          text=True, encoding='utf-8', timeout=10, check=False)
++
++
++def _assert_refused(result, sentinel, before):
++    assert result.returncode == 2, (result.stdout, result.stderr)
++    assert '--proof-home' in result.stderr
++    assert 'CONFIG_HOME=' not in result.stdout
++    assert _snapshot(sentinel) == before
++
++
++@pytest.mark.parametrize('origin', _ORIGINS)
++@pytest.mark.parametrize('command', ['serve', 'dashboard'])
++def test_agent_production_home_rejected_before_config(sentinel, origin, command):
++    before = _snapshot(sentinel)
++    started = time.monotonic()
++    result = _launch(sentinel, [command, '--isolated', '--port', '0'], origin)
++    _assert_refused(result, sentinel, before)
++    assert time.monotonic() - started < 10
++
++
++@pytest.mark.parametrize('wrapper', ['python', 'remote'])
++def test_wrapped_tool_origin_rejected_without_worker_vars(sentinel, wrapper):
++    before = _snapshot(sentinel)
++    origin = 'HERMES_AGENT_TOOL_CALL' if wrapper == 'python' else None
++    result = _launch(sentinel, ['serve', '--isolated'], origin, wrapper=wrapper)
++    _assert_refused(result, sentinel, before)
++
++
++def test_desktop_env_without_isolated_still_rejected(sentinel):
++    before = _snapshot(sentinel)
++    result = _launch(sentinel, ['serve'], 'HERMES_AGENT_TOOL_CALL', extra={'HERMES_DESKTOP': '1'})
++    _assert_refused(result, sentinel, before)
++
++
++def test_profile_alias_of_production_rejected(sentinel, tmp_path):
++    (sentinel / 'profiles' / 'work').mkdir(parents=True)
++    alias = tmp_path / 'work-alias'
++    alias.symlink_to(sentinel / 'profiles' / 'work', target_is_directory=True)
++    before = _snapshot(sentinel)
++    result = _launch(sentinel, ['serve', '--isolated'], 'HERMES_KANBAN_TASK', extra={'HERMES_HOME': str(alias)})
++    _assert_refused(result, sentinel, before)
++
++
++@pytest.mark.parametrize('surface', ['terminal', 'process', 'execute_code'])
++def test_tool_child_stamp_without_worker_vars(monkeypatch, sentinel, surface):
++    from tools.environments import local
++    from tools.code_execution_env import _scrub_child_env
++
++    for key in _ORIGINS:
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setenv('HERMES_HOME', str(sentinel))
++    surfaces = {
++        'terminal': lambda: local._scrubbed_env([({'PATH': os.environ['PATH']}, False)], frozenset(), lambda p: p),
++        'process': lambda: local._sanitize_subprocess_env({'PATH': os.environ['PATH']}),
++        'execute_code': lambda: _scrub_child_env({'PATH': os.environ['PATH']}),
++    }
++    result = surfaces[surface]()
++    assert result.get('HERMES_AGENT_TOOL_CALL') == '1'
++    assert result.get('HERMES_AGENT_ORIGIN')
++    assert result.get('HERMES_AGENT_HOME') == str(sentinel)
++
++
++def test_ssh_backend_reexports_origin_remotely(monkeypatch):
++    from tools.environments import ssh
++
++    seen = {}
++    env = ssh.SSHEnvironment.__new__(ssh.SSHEnvironment)
++    monkeypatch.setattr(env, '_build_ssh_command', lambda send_env=None: ['ssh', 'host'], raising=False)
++    monkeypatch.setattr(ssh, '_popen_bash', lambda cmd, stdin, env=None: seen.setdefault('cmd', cmd))
++    monkeypatch.setattr(ssh, 'resolve_passthrough_env', lambda **_: ({}, set()))
++    monkeypatch.delenv('HERMES_AGENT_ORIGIN', raising=False)
++    env._run_bash('hermes serve --isolated')
++    remote = seen['cmd'][-1]
++    assert 'HERMES_AGENT_TOOL_CALL=1' in remote and 'HERMES_AGENT_ORIGIN=tool' in remote
++    assert remote.index('HERMES_AGENT_TOOL_CALL') < remote.index('hermes serve')
++
++
++@pytest.mark.parametrize('selection', ['flag', 'env'])
++def test_explicit_proof_home_selected_before_config(sentinel, tmp_path, selection):
++    proof = tmp_path / 'proof'
++    proof.mkdir()
++    before = _snapshot(sentinel)
++    args = ['serve', '--isolated']
++    extra = {'HERMES_AGENT_HOME': str(sentinel)}
++    if selection == 'flag':
++        args += ['--proof-home', str(proof)]
++    else:
++        extra['HERMES_PROOF_HOME'] = str(proof)
++    result = _launch(sentinel, args, 'HERMES_AGENT_TOOL_CALL', extra=extra)
++    assert result.returncode == 87, (result.stdout, result.stderr)
++    assert 'CONFIG_HOME=' + str(proof) in result.stdout
++    assert _snapshot(sentinel) == before
++
++
++def _invalid_target(kind, sentinel, tmp_path, extra):
++    if kind == 'alias':
++        target = tmp_path / 'alias'
++        target.symlink_to(sentinel, target_is_directory=True)
++        return target
++    if kind in ('profile', 'profile_alias'):
++        target = sentinel / 'profiles' / 'work'
++        if kind == 'profile':
++            target.mkdir(parents=True)
++            return target
++        outside = tmp_path / 'outside-profile'
++        outside.mkdir()
++        target.parent.mkdir(parents=True)
++        target.symlink_to(outside, target_is_directory=True)
++        return outside
++    if kind == 'agent':
++        target = tmp_path / 'custom-agent'
++        target.mkdir()
++        extra['HERMES_AGENT_HOME'] = str(target)
++        return target
++    if kind == 'file':
++        (tmp_path / 'file').touch()
++    return {'default': sentinel, 'missing': tmp_path / 'missing', 'file': tmp_path / 'file'}[kind]
++
++
++@pytest.mark.parametrize('kind', ['default', 'alias', 'profile', 'profile_alias', 'agent', 'missing', 'file'])
++def test_invalid_proof_home_is_read_only(sentinel, tmp_path, kind):
++    extra = {}
++    target = _invalid_target(kind, sentinel, tmp_path, extra)
++    before = _snapshot(sentinel)
++    result = _launch(sentinel, ['serve', '--proof-home', str(target)], extra=extra)
++    _assert_refused(result, sentinel, before)
++
++
++def test_proof_home_with_profile_flag_rejected(sentinel, tmp_path):
++    proof = tmp_path / 'proof'
++    proof.mkdir()
++    before = _snapshot(sentinel)
++    result = _launch(sentinel, ['-p', 'work', 'serve', '--proof-home', str(proof)])
++    _assert_refused(result, sentinel, before)
++
++
++@pytest.mark.parametrize('extra,args', [
++    ({}, ['serve', '--isolated']),
++    ({'HERMES_DESKTOP': '1', 'HERMES_DASHBOARD_SESSION_TOKEN': 'fixture-only'}, ['serve', '--isolated']),
++    ({'HERMES_DESKTOP': '1'}, ['serve', '--isolated', '--ssh-session-token-file', '/fixture/token']),
++    ({'HERMES_DESKTOP': '1', 'HERMES_ALWAYS_ON_DASHBOARD': '1'},
++     ['serve', '--isolated', '--ssh-session-token-file', '/fixture/token']),
++    # An agent may still run a plain production dashboard; only restart-proof shapes are refused.
++    ({'HERMES_KANBAN_TASK': 't_fixture'}, ['dashboard', '--port', '0']),
++    ({'HERMES_AGENT_TOOL_CALL': '1'}, ['serve', '--isolated', '--status']),
++])
++def test_existing_backend_contracts_reach_config(sentinel, extra, args):
++    result = _launch(sentinel, args, extra=extra)
++    assert result.returncode == 87, (result.stdout, result.stderr)
++    assert 'Refused proof backend' not in result.stderr
++
++
++def test_web_server_recheck_refuses_unselected_proof_home(monkeypatch, sentinel, tmp_path):
++    from hermes_cli.proof_home import assert_backend_home
++
++    proof = tmp_path / 'proof'
++    proof.mkdir()
++    monkeypatch.setenv('HERMES_HOME', str(sentinel))
++    monkeypatch.delenv('HERMES_PROOF_HOME', raising=False)
++    with pytest.raises(SystemExit) as exc:
++        assert_backend_home(isolated=True, argv=['serve', '--proof-home', str(proof)])
++    assert exc.value.code == 2
++    monkeypatch.setenv('HERMES_HOME', str(proof))
++    monkeypatch.setenv('HERMES_PROOF_HOME', str(proof))
++    assert_backend_home(isolated=True, argv=['serve', '--proof-home', str(proof)])
++
++
++def test_recovery_refuses_production_before_config(monkeypatch, sentinel):
++    from tui_gateway import startup_resume
++    from hermes_cli import config
++
++    monkeypatch.setenv('HERMES_AGENT_TOOL_CALL', '1')
++    monkeypatch.setenv('HERMES_AGENT_HOME', str(sentinel))
++    monkeypatch.setenv('HERMES_HOME', str(sentinel))
++    monkeypatch.setattr(config, 'load_config', lambda: pytest.fail('production config was loaded'))
++    assert startup_resume.start_startup_resume_sweep() is None
++
++
++def test_readopt_refuses_production_jobs(monkeypatch, sentinel):
++    from tools import process_registry_readopt as readopt
++
++    class Registry:
++        def recover_from_checkpoint(self, owner=None):
++            pytest.fail('production processes.json was recovered')
++
++    monkeypatch.setenv('HERMES_DESKTOP', '1')
++    monkeypatch.setenv('HERMES_DASHBOARD_SESSION_TOKEN', 'fixture-only')
++    monkeypatch.setenv('HERMES_KANBAN_WORKER_TASK', 't_fixture')
++    monkeypatch.setenv('HERMES_AGENT_HOME', str(sentinel))
++    monkeypatch.setenv('HERMES_HOME', str(sentinel))
++    before = _snapshot(sentinel)
++    assert readopt.recover_tui_orphaned_processes(Registry()) == 0
++    assert _snapshot(sentinel) == before
++
++
++def test_disposable_home_recovery_is_not_globally_disabled(monkeypatch, sentinel, tmp_path):
++    from hermes_cli.proof_home import recovery_home_allowed
++
++    home = tmp_path / 'proof'
++    home.mkdir()
++    monkeypatch.setenv('HERMES_AGENT_TOOL_CALL', '1')
++    monkeypatch.setenv('HERMES_AGENT_HOME', str(sentinel))
++    monkeypatch.setenv('HERMES_PROOF_HOME', str(home))
++    assert recovery_home_allowed(home)
++    assert not recovery_home_allowed(sentinel)
++    monkeypatch.delenv('HERMES_PROOF_HOME')
++    for key in _ORIGINS + ('HERMES_AGENT_HOME',):
++        monkeypatch.delenv(key, raising=False)
++    assert recovery_home_allowed(sentinel)  # production backends keep their own recovery
+diff --git a/tests/hermes_cli/test_serve_proof_home_recovery.py b/tests/hermes_cli/test_serve_proof_home_recovery.py
+new file mode 100644
+index 0000000000..5004a1b5c1
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_proof_home_recovery.py
+@@ -0,0 +1,87 @@
++"""A disposable proof-home backend keeps recovering its OWN persisted job across SIGTERM/restart.
++
++Real ``hermes serve`` processes, all owned by this test: the sentinel is a production-shaped
++``$HOME/.hermes`` holding an unrelated recoverable chat, a dead-writer turn marker and a persisted
++job; the backend runs as an agent tool child with ``--proof-home``. Only fixture PIDs are signalled.
++"""
++import json
++import os
++import signal
++import subprocess
++import sys
++import time
++
++import pytest
++
++from tests.hermes_cli.test_serve_proof_home import ROOT, _clean_env, _snapshot, make_sentinel
++from tests.waiting import wait_until
++
++pytestmark = pytest.mark.platforms("linux")  # host start-time identity reads /proc
++
++BOOT_S = 120.0
++
++
++def _start_time(pid):
++    from tools.process_registry import ProcessRegistry
++
++    return ProcessRegistry._safe_host_start_time(pid)
++
++
++def _adopted_by(proof, pid):
++    try:
++        entries = json.loads((proof / 'processes.json').read_text(encoding='utf-8'))
++    except (OSError, ValueError):
++        return False
++    return any(e.get('session_id') == 'proc_proof_fixture' and e.get('writer_pid') == pid for e in entries)
++
++
++def _serve(proof, env):
++    return subprocess.Popen([sys.executable, '-m', 'hermes_cli.main', 'serve', '--proof-home', str(proof),
++                             '--isolated', '--host', '127.0.0.1', '--port', '0'],
++                            env=env, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
++                            stderr=subprocess.DEVNULL, start_new_session=True)
++
++
++def _stop(proc):
++    if proc.poll() is None:
++        os.killpg(proc.pid, signal.SIGTERM)
++        try:
++            proc.wait(timeout=30)
++        except subprocess.TimeoutExpired:
++            os.killpg(proc.pid, signal.SIGKILL)
++            proc.wait(timeout=10)
++
++
++def test_proof_home_backend_recovers_own_job_through_restart(tmp_path):
++    sentinel = make_sentinel(tmp_path)
++    proof = tmp_path / 'proof'
++    proof.mkdir()
++    job = subprocess.Popen(['sleep', '600'], start_new_session=True)  # the proof's own persisted job
++    gone = subprocess.Popen([sys.executable, '-c', 'pass'])
++    gone.wait(timeout=5)
++    (proof / 'processes.json').write_text(json.dumps([{
++        'session_id': 'proc_proof_fixture', 'command': 'sleep 600', 'pid': job.pid, 'pid_scope': 'host',
++        'host_start_time': _start_time(job.pid), 'started_at': time.time(), 'cwd': str(proof),
++        'session_key': '20261112_000000_proof', 'persist_on_release': True, 'notify_on_complete': False,
++        'writer_pid': gone.pid,
++    }]))
++    before = _snapshot(sentinel)
++    env = _clean_env(sentinel, 'HERMES_AGENT_TOOL_CALL', {
++        'HERMES_AGENT_HOME': str(sentinel), 'HERMES_DESKTOP': '1',
++        'HERMES_DASHBOARD_SESSION_TOKEN': 'proof-fixture-token'})
++    backends = []
++    try:
++        for _ in range(2):  # boot, SIGTERM, boot again
++            backends.append(_serve(proof, env))
++            proc = backends[-1]
++            wait_until(lambda: _adopted_by(proof, proc.pid) or proc.poll() is not None, timeout=BOOT_S,
++                       interval=0.5, what='proof backend re-adopting its own job')
++            assert proc.poll() is None, f'proof backend exited {proc.returncode}'
++            assert job.poll() is None, 'the adopted job must survive its backend'
++            _stop(proc)
++        assert _snapshot(sentinel) == before
++    finally:
++        for proc in backends:
++            _stop(proc)
++        job.kill()
++        job.wait(timeout=10)
+diff --git a/tests/tools/test_code_execution_windows_env.py b/tests/tools/test_code_execution_windows_env.py
+index 35082b13e7..18c1ca35ff 100644
+--- a/tests/tools/test_code_execution_windows_env.py
++++ b/tests/tools/test_code_execution_windows_env.py
+@@ -39,6 +39,9 @@ def test_native_essentials_and_passthrough_priority(windows, passthrough):
+               "RANDOM_UNKNOWN_VAR": "unknown"}
+     result = _scrub_child_env({**essentials, **safe, **secret}, is_windows=windows,
+                              is_passthrough=lambda k: passthrough and k == "TENOR_API_KEY")
++    # Provenance stamps (hermes_cli.proof_home.stamp_tool_child), not inherited values.
++    assert result.pop("HERMES_AGENT_TOOL_CALL") == "1" and result.pop("HERMES_AGENT_ORIGIN")
++    result.pop("HERMES_AGENT_HOME", None)
+     assert result == {**safe, **(essentials if windows else {}),
+                       **({"TENOR_API_KEY": "fake-third-party"} if passthrough else {})}
+ 
+diff --git a/tools/code_execution_env.py b/tools/code_execution_env.py
+index 10c6083758..ada55b555e 100644
+--- a/tools/code_execution_env.py
++++ b/tools/code_execution_env.py
+@@ -116,7 +116,8 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None, toolchain
+         for key in (DELEGATED_CHILD_ENV_MARKER, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
+             if key in scoped:
+                 scrubbed[key] = scoped[key]
+-    return delegated_child_subprocess_env(scrubbed)
++    from hermes_cli.proof_home import stamp_tool_child
++    return stamp_tool_child(delegated_child_subprocess_env(scrubbed))
+ 
+ 
+ # Session identity (non-secret ids) the sandbox child needs so a script shelling out to
+diff --git a/tools/environments/local.py b/tools/environments/local.py
+index 697ca8edec..e9d65a7496 100644
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -342,7 +342,8 @@ def _scrubbed_env(parts, plugin_strip: frozenset, fix_path) -> dict:
+         # [daveey] bare python3 -> the Developer-ID Hermes Python.app, so macOS TCC uses its grants.
+         from hermes_cli._launchers import prefer_signed_python_on_path
+         out[path_key] = prefer_signed_python_on_path(out[path_key])
+-    return _finalize_child_env(out)
++    from hermes_cli.proof_home import stamp_tool_child
++    return stamp_tool_child(_finalize_child_env(out))
+ 
+ 
+ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
+diff --git a/tools/environments/ssh.py b/tools/environments/ssh.py
+index 9e8b10616b..5dc26c7fcd 100644
+--- a/tools/environments/ssh.py
++++ b/tools/environments/ssh.py
+@@ -290,8 +290,11 @@ class SSHEnvironment(BaseEnvironment):
+         client's env carries the values, so secrets never enter the remote ``bash -c`` argv. The
+         remote sshd must ``AcceptEnv`` them (#14091). Profile-scoped names missing from the active
+         scope are unset remotely so a shared host cannot serve another profile's value."""
++        from hermes_cli.proof_home import remote_origin_prefix  # sshd drops the tool-call origin stamp
++
+         values, unset_names = resolve_passthrough_env(hermes_env_loader=_load_hermes_env_vars)
+-        cmd = self._build_ssh_command(send_env=values) + bash_argv(shlex.quote(prepend_unset(cmd_string, unset_names)), login)
++        remote = remote_origin_prefix() + prepend_unset(cmd_string, unset_names)
++        cmd = self._build_ssh_command(send_env=values) + bash_argv(shlex.quote(remote), login)
+         client_env = client_env_with(values)
+         return _popen_bash(cmd, stdin_data, env=client_env) if client_env is not None else _popen_bash(cmd, stdin_data)
+ 
+diff --git a/tools/process_registry_readopt.py b/tools/process_registry_readopt.py
+index 6a2a802359..c6fd271de3 100644
+--- a/tools/process_registry_readopt.py
++++ b/tools/process_registry_readopt.py
+@@ -328,6 +328,11 @@ def recover_tui_orphaned_processes(registry=None, *, sweep_interval: float = DET
+     if not is_desktop_owned_backend():
+         logger.debug("not a Desktop-owned backend: leaving orphaned chat processes for the Desktop backend")
+         return 0
++    from hermes_cli.proof_home import recovery_home_allowed
++    from hermes_constants import get_hermes_home
++    if not recovery_home_allowed(get_hermes_home()):
++        logger.warning("process re-adoption skipped: a proof backend never adopts production jobs")
++        return 0
+     if registry is None:
+         from tools.process_registry import process_registry as registry
+     try:
+diff --git a/tui_gateway/startup_resume.py b/tui_gateway/startup_resume.py
+index fdddba86b3..9424f50405 100644
+--- a/tui_gateway/startup_resume.py
++++ b/tui_gateway/startup_resume.py
+@@ -173,9 +173,13 @@ def _paused_markers_remain(home: Path, cfg: dict | None) -> bool:
+ 
+ def start_startup_resume_sweep() -> threading.Thread | None:
+     """Backend boot hook: run the sweep on a daemon thread after a short settle delay (no-op unless enabled)."""
++    from hermes_cli.proof_home import recovery_home_allowed
++    from hermes_constants import get_hermes_home
++    if not recovery_home_allowed(get_hermes_home()):
++        logger.warning("startup resume: skipped, a proof backend never adopts production chats")
++        return None
+     try:
+         from hermes_cli.config import load_config
+-        from hermes_constants import get_hermes_home
+         cfg = load_config()
+     except Exception:
+         logger.debug("startup resume: config unavailable", exc_info=True)
+-- 
+2.51.0
+

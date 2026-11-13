@@ -1,0 +1,100 @@
+From cfc3d681ce1c2d8e7cf8893027c879e9b78fbbf9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 01:40:34 +0000
+Subject: [PATCH] [daveey] kanban placement: queue a local-marker card only
+ when one live machine holds its whole label set
+
+Review nit on PR #1807 (t_01a1d28879d22917): queue_decision checked liveness for the queue label only, so a Mac or
+Desktop marker card queued as [pool:worker, capability:tailnet-exec] even when no active, unheld machine attests
+both; the create then failed validation instead of keeping the card. label_machines now accepts a label set, and
+the unmet-marker path falls back to today's local keep ("local marker") unless one live machine holds the queue,
+group and coordination labels together. (t_01a1d28cfe17f578)
+---
+ hermes_cli/kanban_placement.py             |  8 +++++---
+ hermes_cli/kanban_worker_placement.py      |  5 ++++-
+ tests/hermes_cli/test_kanban_pool_queue.py | 21 +++++++++++++++++++++
+ 3 files changed, 30 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index c233ee96bf..5e6ef2c8d1 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -274,15 +274,17 @@ def route_labels(dest: str) -> list[str]:
+     return [dest] if is_pool_label(dest) else [f"machine:{dest}"]
+ 
+ 
+-def label_machines(label: str, machines: Optional[dict] = None) -> list[str]:
+-    """Active, unheld registry machines that carry ``label`` and pick up other gateways' cards (sorted)."""
++def label_machines(label, machines: Optional[dict] = None) -> list[str]:
++    """Active, unheld registry machines that carry ``label`` (or every label of a list/set) and pick up other
++    gateways' cards (sorted)."""
+     from hermes_cli import kanban_worker_node as wn
+     if machines is None:
+         machines = (wn.registry() or {}).get("machines") or {}
++    wanted = {label} if isinstance(label, str) else set(label)
+     return sorted(name for name, entry in machines.items()
+                   if isinstance(entry, dict) and entry.get("state", "active") == "active" and not entry.get("hold")
+                   and ("pickup" not in entry or wn.advertises_pickup(entry))
+-                  and label in (entry.get("labels") or []))
++                  and wanted <= set(entry.get("labels") or []))
+ 
+ 
+ class _Cfg:
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index a754445a55..15fa4b11f7 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -106,7 +106,8 @@ def queue_decision(args, cfg, gateway, pin, machine_ok=None):
+     card while another has free slots. None (legacy routing applies) for a pin, an explicit ``runs_on``,
+     non-portable work, or when no active, unheld machine carries the label. Courier and origin-bound creates queue
+     too: chat ownership pins storage, not execution (t_01a1d0571c2f07d6). On a pool worker a built-in local-marker
+-    hit queues too, with its group's labels and a ``note`` (:func:`unmet_markers`). [daveey]
++    hit queues too, with its group's labels and a ``note`` (:func:`unmet_markers`), but only when one active, unheld
++    machine holds the whole label set (queue, group and coordination labels); else the local keep stands. [daveey]
+     """
+     from hermes_cli import kanban_placement as placement
+     from hermes_cli import kanban_placement_coordination as coordination
+@@ -128,6 +129,8 @@ def queue_decision(args, cfg, gateway, pin, machine_ok=None):
+     if unmet is None:
+         return {"where": "local", "runs_on": [label, *sorted(extra - {label})], "why": QUEUED_WHY.format(label=label)}
+     extra = extra | unmet["labels"]
++    if not placement.label_machines([label, *extra]):
++        return None  # no live machine holds every label: nobody could claim it, so keep today's local keep
+     return {"where": "local", "runs_on": [label, *sorted(extra - {label})], "note": unmet["note"],
+             "why": QUEUED_WHY.format(label=label) + UNMET_WHY.format(hit=unmet["hit"], gateway=gateway)}
+ 
+diff --git a/tests/hermes_cli/test_kanban_pool_queue.py b/tests/hermes_cli/test_kanban_pool_queue.py
+index 428c8f3bff..7a7da3393e 100644
+--- a/tests/hermes_cli/test_kanban_pool_queue.py
++++ b/tests/hermes_cli/test_kanban_pool_queue.py
+@@ -930,6 +930,27 @@ def test_direct_create_task_of_a_keychain_card_on_a_pool_worker_joins_the_pool(o
+     assert _runs_on(on_w2.conn, tid) == sorted([POOL, TAILNET])
+ 
+ 
++def _no_live_tailnet_pool_worker(kind):
++    machines = _machines()  # worker-1/2: linux + pool:worker, no tailnet attestation
++    if kind == "held":
++        machines["worker-1"] = {**machines["worker-1"], "labels": ["linux", POOL, TAILNET], "hold": True}
++    elif kind == "split":  # a live machine has the tailnet label but not the queue label
++        machines["worker-5"] = {**W1, "name": "worker-5", "labels": ["linux", TAILNET]}
++    return machines
++
++
++# 11-13 review nit (t_01a1d28879d22917): queue_decision checked only that the queue label is live, so a Mac-group
++# card queued as [pool:worker, capability:tailnet-exec] even when no live machine holds both: nobody could claim it.
++@pytest.mark.parametrize("kind", ["none", "held", "split"])
++def test_pool_worker_keeps_a_mac_marker_card_when_no_live_machine_holds_every_label(w2, monkeypatch, kind):
++    _on(monkeypatch, "worker-2", {"worker_queue": {"worker-2": POOL}}, _no_live_tailnet_pool_worker(kind))
++    out = _create(title="rotate the CI token in the Keychain")
++    assert _runs_on(w2.conn, out["task_id"]) is None and out["placement"]["why"].startswith("local marker"), out
++    # A group that adds no label still queues: only the unmet label set falls back.
++    out = _create(title="read the dashboard in Chrome")
++    assert _runs_on(w2.conn, out["task_id"]) == [POOL], out
++
++
+ def test_every_built_in_local_marker_has_a_group():
+     assert set(kp.DEFAULT_LOCAL_MARKERS) | set(kp.DEFAULT_LOCAL_SKILL_MARKERS) <= set(kp.LOCAL_MARKER_GROUPS)
+     assert set(kp.LOCAL_MARKER_GROUPS.values()) <= {"mac", "desktop", "browser", "sso", "context"}
+-- 
+2.51.0
+

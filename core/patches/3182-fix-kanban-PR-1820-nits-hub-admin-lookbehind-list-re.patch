@@ -1,0 +1,229 @@
+From 4e3dfef68692f47e9ebc2cf39cd5a0b64064bacb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 03:07:36 +0000
+Subject: [PATCH] fix(kanban): PR #1820 nits: hub-admin lookbehind, list
+ requires on home route, report home denies [daveey]
+
+Follow-up to review 5885349086 on PR #1820 (claim-gate-refused hub denies stay home).
+
+- kanban_placement_coordination._HUB_ADMIN: use the same (?<![\w/.-]) lookbehind as _HUB, so
+  `my-hub-admin '...'` / `hermes-hub-admin '...'` no longer open a hub-write quote (the action inside
+  is judged as a bare spelling and stays home).
+- kanban_hub_admission_placement.pool_route: the home branch returns the declared requires normalized
+  to a list; decision_card_route passes the raw view, so a bare-string requires came back a string.
+- Observability for the home route (it overrides a judge deny and spends a hub slot):
+  * claim screen: a deny kept home records kept = ACTION_REASON ("needs home coordination action"),
+    not the generic "no worker queue fits"; Counts gains home= (a subset of kept) in its log line.
+  * pickup._target copies hub_admission.home into the recorded verdict; pickup's skip reason says
+    "kept home (<reason>)" instead of "no worker queue fits".
+  * describe() (`hermes kanban show` hub: line, kanban_show tool) appends "; kept home: <reason>".
+
+Tests: lookalike prefixes stay home while plain hub-admin still needs hub-write; pool_route home
+branch normalizes str/tuple/list/None requires; decision card with string requires; claim-time
+home deny records kept/home and the home=1 count; describe line. RED before, GREEN after.
+---
+ hermes_cli/kanban_hub_admission_claim.py      |  7 +++--
+ hermes_cli/kanban_hub_admission_pickup.py     |  5 +++-
+ hermes_cli/kanban_hub_admission_placement.py  |  9 ++++--
+ hermes_cli/kanban_placement_coordination.py   |  2 +-
+ .../test_kanban_coordination_placement.py     |  9 ++++++
+ .../test_kanban_hub_admission_claim.py        | 18 ++++++++++-
+ tests/test_kanban_hub_admission_placement.py  | 30 +++++++++++++++++++
+ 7 files changed, 72 insertions(+), 8 deletions(-)
+
+diff --git a/hermes_cli/kanban_hub_admission_claim.py b/hermes_cli/kanban_hub_admission_claim.py
+index a2345327e3..f173940958 100644
+--- a/hermes_cli/kanban_hub_admission_claim.py
++++ b/hermes_cli/kanban_hub_admission_claim.py
+@@ -51,6 +51,7 @@ class Counts:
+     denied: int = 0
+     moved: int = 0
+     kept: int = 0
++    home: int = 0  # of ``kept``: denies the claim gate would refuse on every worker (the home route)
+     unavailable: int = 0
+     deferred: int = 0
+     deferred_ids: frozenset = field(default_factory=frozenset)  # not claimable this tick: judged next tick
+@@ -61,7 +62,7 @@ class Counts:
+ 
+     def line(self) -> str:
+         return ("hub admission: claim screen judged={judged} denied={denied} moved={moved} kept={kept} "
+-                "unavailable={unavailable} deferred={deferred}").format(**asdict(self))
++                "home={home} unavailable={unavailable} deferred={deferred}").format(**asdict(self))
+ 
+ 
+ def _candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+@@ -154,7 +155,8 @@ def screen(conn: sqlite3.Connection, *, cfg: Optional[dict] = None, budget: int
+             kept = keep_reason(conn, card, fields, cfg)
+             target = None if kept else pickup._target(fields, own, cfg, audit)
+             if kept is None and target is None:
+-                kept = NO_QUEUE
++                # A deny pool_route keeps home (the claim gate refuses the text on every worker) names that reason.
++                kept = audit.get("home") or NO_QUEUE
+             if kept:
+                 audit["kept"] = kept
+         applied = _apply(conn, own, tid, audit, target, expected=card, event_head=event_head)
+@@ -164,6 +166,7 @@ def screen(conn: sqlite3.Connection, *, cfg: Optional[dict] = None, budget: int
+             counts.defer(tid)  # edited while judged: no verdict, so never claimed unjudged this tick
+         elif "kept" in audit:
+             counts.kept += 1
++            counts.home += "home" in audit
+     if counts != Counts():
+         _log.info(counts.line())
+     return counts
+diff --git a/hermes_cli/kanban_hub_admission_pickup.py b/hermes_cli/kanban_hub_admission_pickup.py
+index bd97a9500e..6d1d41a6d9 100644
+--- a/hermes_cli/kanban_hub_admission_pickup.py
++++ b/hermes_cli/kanban_hub_admission_pickup.py
+@@ -95,6 +95,8 @@ def _target(fields: dict, own: str, cfg: dict, audit: dict) -> Optional[list[str
+     if kp.portable_reason({**fields, "runs_on": None}, cfg):
+         requires = list(dict.fromkeys([*requires, "hub:write"]))
+     out = hp.pool_route(fields, cfg, own, audit, requires or None, queue=True)
++    if home := (out.get("hub_admission") or {}).get("home"):
++        audit["home"] = home  # the recorded verdict says why no queue fits: the claim gate refuses the text
+     return out.get("runs_on") or None
+ 
+ 
+@@ -172,7 +174,8 @@ def apply(conn: sqlite3.Connection, own: str, plans: Mapping[str, dict], importe
+                 kb._append_event(conn, tid, "hub_admission", audit)
+                 if audit["admit"]:
+                     continue
+-                out[tid] = ("other", why + ("" if target else "; no worker queue fits, left for its creator"))
++                kept = f"kept home ({audit['home']})" if audit.get("home") else "no worker queue fits"
++                out[tid] = ("other", why + ("" if target else f"; {kept}, left for its creator"))
+                 if target is None:
+                     continue  # the backstop (refusals) keeps it unclaimed here
+                 previous = wn._parse(row["runs_on"])
+diff --git a/hermes_cli/kanban_hub_admission_placement.py b/hermes_cli/kanban_hub_admission_placement.py
+index a83fc3cdd4..aadfd8e19c 100644
+--- a/hermes_cli/kanban_hub_admission_placement.py
++++ b/hermes_cli/kanban_hub_admission_placement.py
+@@ -175,7 +175,8 @@ def describe(verdict):
+         return f"hub admission: not judged ({(verdict.get('why') or verdict['skipped'])[:160]})"
+     if verdict.get("admit"):
+         return f"hub admission: admitted, {verdict.get('need')}: \"{(verdict.get('evidence') or '')[:120]}\""
+-    return f"hub admission: denied ({(verdict.get('why') or '')[:160]})"
++    home = f"; kept home: {verdict['home']}" if verdict.get("home") else ""
++    return f"hub admission: denied ({(verdict.get('why') or '')[:160]}){home}"
+ 
+ 
+ def _event_verdict(events):
+@@ -545,8 +546,10 @@ def pool_route(args, cfg, gateway, audit, requires, *, queue=True, machine_ok=No
+         out = {"where": "local", "why": f"hub admission denied, but the text {coordination.ACTION_REASON} "
+                                         "no pool worker is attested for, so it stays here",
+                "hub_admission": {**audit, "home": coordination.ACTION_REASON}}
+-        if args.get("requires"):
+-            out["requires"] = args["requires"]
++        declared = args.get("requires")
++        if declared:
++            # The declared list, normalized: a decision card's raw view can carry a bare string.
++            out["requires"] = [declared] if isinstance(declared, str) else list(declared)
+         return out
+     if label and (machine_ok or kp._machine_picks_up)(label):
+         out = {"where": "local", "runs_on": [label, *sorted(extra - {label})],
+diff --git a/hermes_cli/kanban_placement_coordination.py b/hermes_cli/kanban_placement_coordination.py
+index ba7b6fadc8..078aa9d058 100644
+--- a/hermes_cli/kanban_placement_coordination.py
++++ b/hermes_cli/kanban_placement_coordination.py
+@@ -25,7 +25,7 @@ _EXECUTION = re.compile(r"(?:\b(?:run|execute|invoke|call|use|via|with)\s+`?|`|[
+ # still-open quote acts with the hub's identity and replica, so it needs ``capability:hub-write`` (the hub-admin
+ # attestation), not this worker's own hermes-hub install. A worker's ``hermes-hub outcomes --id`` reads only its
+ # OWN sent requests (the hub's request read back as ``state: null`` on worker-1, 11-13), so bare spellings stay home.
+-_HUB_ADMIN = re.compile(r"\bhub-admin\s+(['\"])(?:(?!\1).)*$", re.IGNORECASE)
++_HUB_ADMIN = re.compile(r"(?<![\w/.-])hub-admin\s+(['\"])(?:(?!\1).)*$", re.IGNORECASE)
+ HUB_WRITE = "capability:hub-write"
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_coordination_placement.py b/tests/hermes_cli/test_kanban_coordination_placement.py
+index d21ebf4293..bf8e76246e 100644
+--- a/tests/hermes_cli/test_kanban_coordination_placement.py
++++ b/tests/hermes_cli/test_kanban_coordination_placement.py
+@@ -518,3 +518,12 @@ def test_hub_admin_wrapped_action_needs_hub_write(text):
+ def test_bare_or_unwrapped_action_still_stays_home(text):
+     from hermes_cli import kanban_placement_coordination as coord
+     assert coord.requirements(text)[1] == coord.ACTION_REASON
++
++
++@pytest.mark.parametrize("prefix", ["my-hub-admin", "hermes-hub-admin", "tools/hub-admin", "x.hub-admin",
++                                    "my_hub-admin"])
++def test_hub_admin_lookalike_names_do_not_open_a_hub_write_quote(prefix):
++    """Only the hub-admin command itself runs on the hub: a longer name ending in it is another tool."""
++    from hermes_cli import kanban_placement_coordination as coord
++    assert coord.requirements(f"{prefix} 'hermes-hub outcomes --id t_x'")[1] == coord.ACTION_REASON
++    assert coord.requirements("run hub-admin 'hermes-hub outcomes --id t_x'") == ({"capability:hub-write"}, None)
+diff --git a/tests/hermes_cli/test_kanban_hub_admission_claim.py b/tests/hermes_cli/test_kanban_hub_admission_claim.py
+index 0b2fa81b32..fb7ce05af5 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission_claim.py
++++ b/tests/hermes_cli/test_kanban_hub_admission_claim.py
+@@ -157,6 +157,22 @@ def test_a_deny_with_no_worker_queue_is_kept_and_claimed(gws, hub_judge, monkeyp
+     assert verdict["kept"] == hac.NO_QUEUE and _events(hub.conn, tid, "moved") == []
+ 
+ 
++def test_a_deny_no_worker_can_claim_is_kept_home_with_the_action_reason(gws, hub_judge, caplog):
++    """The home route (the pickup claim gate refuses the text on every worker) records its own reason and count,
++    not the generic no-queue one: it overrides the judge's deny and spends a hub slot."""
++    from hermes_cli import kanban_placement_coordination as coord
++    hub, _worker, svc = gws
++    hub_judge.admit_next = False
++    tid = _hub_card(hub, title="claim-stall incident", body="Read each request with `hermes-hub outcomes --id <id>`.")
++    with caplog.at_level(logging.INFO, logger=hac.__name__):
++        _tick(hub)
++    assert _holder(svc, tid) == HUB
++    [verdict] = _events(hub.conn, tid, "hub_admission")
++    assert verdict["kept"] == coord.ACTION_REASON and verdict["home"] == coord.ACTION_REASON
++    assert _events(hub.conn, tid, "moved") == []
++    assert "kept=1 home=1" in caplog.text
++
++
+ def test_an_unavailable_judge_fails_open_once_per_tick(gws, monkeypatch, caplog):
+     hub, _worker, svc = gws
+     calls = []
+@@ -172,7 +188,7 @@ def test_an_unavailable_judge_fails_open_once_per_tick(gws, monkeypatch, caplog)
+     for tid in tids:
+         assert _holder(svc, tid) == HUB, tid  # fail open: a judge outage never freezes the hub
+         assert _events(hub.conn, tid, "hub_admission") == []  # no verdict: judged at its next ready
+-    assert "hub admission: claim screen judged=0 denied=0 moved=0 kept=0 unavailable=3" in caplog.text
++    assert "hub admission: claim screen judged=0 denied=0 moved=0 kept=0 home=0 unavailable=3" in caplog.text
+ 
+ 
+ def test_an_unavailable_verdict_is_not_recorded(gws, monkeypatch):
+diff --git a/tests/test_kanban_hub_admission_placement.py b/tests/test_kanban_hub_admission_placement.py
+index d7e866fa45..81f79c904d 100644
+--- a/tests/test_kanban_hub_admission_placement.py
++++ b/tests/test_kanban_hub_admission_placement.py
+@@ -299,3 +299,33 @@ def test_claim_stall_template_via_hub_admin_queues_for_hub_write_workers(gate, m
+     assert coord.claim_refusal(row, "worker-1") is None
+     entry["labels"] = ["capability:coordination-read"]
+     assert coord.claim_refusal(row, "worker-1") == coord.REASON
++
++
++@pytest.mark.parametrize("declared,expected", [("terminal", ["terminal"]), (["terminal", "git"], ["terminal", "git"]),
++                                               (("git",), ["git"]), (None, None), ([], None)])
++def test_home_route_returns_the_normalized_declared_requires(declared, expected):
++    """The home branch persists the declaration as a list: a decision card's raw view can carry a bare string."""
++    from hermes_cli import kanban_hub_admission_placement as hap
++    args = {**_claim_stall(CLAIM_STALL_BARE), "requires": declared}
++    out = hap.pool_route(args, HUB_CFG, "hub", {"admit": False}, ["terminal", "hub:write"],
++                         machine_ok=lambda _: True)
++    assert "runs_on" not in out and out["hub_admission"]["home"]
++    assert out.get("requires") == expected
++
++
++def test_decision_card_with_string_requires_stays_home_with_a_list(gate):
++    from hermes_cli import kanban_hub_admission_placement as hap
++    args = {**_claim_stall(CLAIM_STALL_BARE), "requires": "terminal", "initial_status": "blocked",
++            "human_request": {"action": "Reply A or B. Unblock = A; archive = drop."}}
++    out = hap.decision_card_route(args, {"where": "local"}, "hub", HUB_CFG, machine_ok=lambda _: True)
++    assert out is not None
++    assert out["requires"] == ["terminal"] and "runs_on" not in out
++
++
++def test_show_line_names_the_home_override():
++    """`kanban show` says a denied card still holds a hub slot, and why."""
++    from hermes_cli import kanban_hub_admission_placement as hap
++    from hermes_cli import kanban_placement_coordination as coord
++    line = hap.describe({"admit": False, "why": "portable repo work", "home": coord.ACTION_REASON})
++    assert line == f"hub admission: denied (portable repo work); kept home: {coord.ACTION_REASON}"
++    assert hap.describe({"admit": False, "why": "x"}) == "hub admission: denied (x)"
+-- 
+2.51.0
+

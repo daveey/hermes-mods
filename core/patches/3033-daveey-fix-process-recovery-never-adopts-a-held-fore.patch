@@ -1,0 +1,327 @@
+From dee152823f20724888f1806b5e5fa981e673a3ed Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 23:25:06 +0000
+Subject: [PATCH] [daveey] fix(process): recovery never adopts a held
+ foreground command (989239fff3)
+
+Recovery checked only _running, so a same-registry pass adopted a survivable
+foreground command the terminal tool was still waiting on; its background
+reader then reported lost/-1 for a call that exited 0. Release also rewrote
+processes.json while the call's .log/.exit still existed, so the merge kept
+the released entry as an adoptable worker handoff.
+
+- recovery skips ids held in _foreground_holds (under the registry lock)
+- release drops the hold and its entry (drop_ids) in one step under the
+  checkpoint file lock; convert_foreground moves hold->_running under it too
+- _track_started refuses (ERROR log) to track a still-held command
+- tests: same-registry recovery, recovery racing release, release with
+  log/exit present, adoption-boundary detection; controls for dead owner
+  and deliberate handoff
+---
+ .../tools/test_update_survivable_processes.py | 150 ++++++++++++++++++
+ tools/process_registry.py                     |   6 +-
+ tools/process_registry_checkpoint.py          |  12 +-
+ tools/process_registry_survivable.py          |  54 ++++++-
+ 4 files changed, 210 insertions(+), 12 deletions(-)
+
+diff --git a/tests/tools/test_update_survivable_processes.py b/tests/tools/test_update_survivable_processes.py
+index 4159a5b68e..99de8e53e9 100644
+--- a/tests/tools/test_update_survivable_processes.py
++++ b/tests/tools/test_update_survivable_processes.py
+@@ -262,6 +262,156 @@ def test_held_foreground_command_is_checkpointed_until_released(tmp_path, monkey
+         proc.wait()
+ 
+ 
++def _held_sleep(tmp_path, monkeypatch, registry=None):
++    """A held survivable foreground command around an owned ``sleep 30`` child, in an isolated home."""
++    home = tmp_path / "home"
++    home.mkdir(exist_ok=True)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(pr, "_checkpoint_path", lambda: tmp_path / "processes.json")
++    registry = registry or ProcessRegistry()
++    proc = subprocess.Popen(["sleep", "30"])
++    session = registry._new_session("sleep 30", "t", "t", "k", str(tmp_path), persist_on_release=True)
++    session.pid, session.host_start_time = proc.pid, registry._safe_host_start_time(proc.pid)
++    session.output_log = str(tmp_path / f"{session.id}.log")
++    session.notify_on_complete, session.watcher_interval = True, 5
++    registry.hold_foreground(session)
++    return registry, session, proc, home
++
++
++def _assert_not_adopted(registry, session, home):
++    assert registry.get(session.id) is None, "a held foreground command was adopted as a background job"
++    assert session.id not in registry._running
++    assert not registry.pending_watchers, "recovery queued a completion watcher for a foreground command"
++    assert not (home / "logs" / "process-results" / f"{session.id}.json").exists()
++
++
++def test_recovery_never_adopts_a_held_foreground_command_of_this_registry(tmp_path, monkeypatch):
++    """989239fff3: a recovery pass while the tool still waits on the command adopted it as a background
++    job; its reader then reported ``lost``/-1 for a call that finished with exit 0."""
++    registry, session, proc, home = _held_sleep(tmp_path, monkeypatch)
++    try:
++        assert registry.recover_from_checkpoint() == 0
++        _assert_not_adopted(registry, session, home)
++        registry.release_foreground(session.id)  # the foreground wait finishes normally
++        _assert_not_adopted(registry, session, home)
++        assert json.loads((tmp_path / "processes.json").read_text()) == []
++    finally:
++        proc.kill()
++        proc.wait()
++
++
++def test_recovery_racing_a_foreground_release_never_adopts_it(tmp_path, monkeypatch):
++    """Recovery that reads processes.json after release dropped the hold but before the checkpoint
++    rewrite must not see an unowned entry: the release settles under the checkpoint file lock."""
++    import threading
++
++    class Holds(dict):
++        def pop(self, *a):
++            value = super().pop(*a)
++            if value is not None and not racer.is_alive():
++                racer.start()
++                in_recovery.wait(0.5)  # pre-fix: recovery owns the file lock now; post-fix: it waits for ours
++            return value
++
++    registry = ProcessRegistry()
++    registry._foreground_holds = Holds()
++    in_recovery = threading.Event()
++    recovered = []
++    real_locked = registry._recover_from_checkpoint_locked
++
++    def locked(owner):
++        in_recovery.set()
++        return real_locked(owner)
++
++    registry._recover_from_checkpoint_locked = locked
++    racer = threading.Thread(target=lambda: recovered.append(registry.recover_from_checkpoint()), daemon=True)
++    registry, session, proc, home = _held_sleep(tmp_path, monkeypatch, registry)
++    try:
++        registry.release_foreground(session.id)
++        racer.join(10)
++        assert recovered == [0]
++        _assert_not_adopted(registry, session, home)
++        assert json.loads((tmp_path / "processes.json").read_text()) == []
++    finally:
++        proc.kill()
++        proc.wait()
++
++
++def test_release_drops_the_entry_even_while_its_log_and_exit_file_remain(tmp_path, monkeypatch):
++    """Release rewrites the checkpoint before the call's .log/.exit are unlinked: the merge must not
++    keep the released entry as an adoptable worker handoff (the next recovery adopted it, then its
++    reader lost the files and reported lost/-1)."""
++    registry, session, proc, _home = _held_sleep(tmp_path, monkeypatch)
++    from tools.process_registry_output_log import _exit_path, output_dir
++    log = output_dir() / f"{session.id}.log"
++    log.parent.mkdir(parents=True, exist_ok=True)
++    session.output_log = str(log)
++    registry.hold_foreground(session)  # re-checkpoint with the profile's real output-log path
++    log.write_text("Thu Nov 12 22:13:44 UTC 2026\n")
++    _exit_path(log).write_text("0\n")
++    import tools.process_registry_profiles as profiles
++    seen_before_cross_profile_drop = []
++    real_drop = profiles.drop_from_every_checkpoint
++
++    def drop(ids):  # the local rewrite must already have dropped it: other processes read the file now
++        seen_before_cross_profile_drop.append(json.loads((tmp_path / "processes.json").read_text()))
++        return real_drop(ids)
++
++    monkeypatch.setattr(profiles, "drop_from_every_checkpoint", drop)
++    try:
++        registry.release_foreground(session.id)
++        assert seen_before_cross_profile_drop == [[]]
++        assert json.loads((tmp_path / "processes.json").read_text()) == []
++        assert ProcessRegistry().recover_from_checkpoint() == 0
++    finally:
++        proc.kill()
++        proc.wait()
++
++
++def test_recovery_racing_a_handoff_tracks_the_command_once(tmp_path, monkeypatch):
++    """A deliberate handoff (update/shutdown interrupt) moves the hold to ``_running`` atomically: a
++    concurrent recovery neither re-adopts it nor finds it unowned."""
++    registry, session, proc, _home = _held_sleep(tmp_path, monkeypatch)
++    started = []
++    monkeypatch.setattr(registry, "_track_started",
++                        lambda s, *a, **k: (started.append(s.id), registry._running.__setitem__(s.id, s)))
++    try:
++        registry.convert_foreground(session)
++        assert registry.recover_from_checkpoint() == 0
++        assert started == [session.id]
++        assert registry._running[session.id] is session
++        assert session.id not in registry.held_foreground()
++    finally:
++        proc.kill()
++        proc.wait()
++
++
++def test_adoption_boundary_refuses_a_held_foreground_command(tmp_path, monkeypatch, caplog):
++    """Detection: any path that tracks a still-held command as a background job is refused and logged."""
++    registry, session, proc, home = _held_sleep(tmp_path, monkeypatch)
++    try:
++        registry._track_started(session, lambda s: None, "reader")
++        _assert_not_adopted(registry, session, home)
++        assert "a foreground tool call still holds it" in caplog.text
++    finally:
++        registry.release_foreground(session.id)
++        proc.kill()
++        proc.wait()
++
++
++def test_a_dead_owners_held_command_is_still_recovered(tmp_path, monkeypatch):
++    """Control: a held command whose owner registry is gone (a crash mid-wait) is still an orphan the
++    next owner recovers."""
++    _, session, proc, _home = _held_sleep(tmp_path, monkeypatch)
++    successor = ProcessRegistry()
++    try:
++        assert successor.recover_from_checkpoint() == 1
++        assert successor.get(session.id) is not None
++    finally:
++        proc.kill()
++        proc.wait()
++
++
+ # ── integration (real transient user service, stopped like the gateway) ──────
+ 
+ 
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index a41919b0af..5711a9b538 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -1144,15 +1144,15 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+     def _track_started(self, session: ProcessSession, reader_target, reader_name: str, extra_args=(), *, ownership_scope=None) -> None:
+         """Register before the reader can publish completion, even for an exited child."""
+         from contextvars import copy_context
+-
+         # Reader completion must retain the producer's multiplex profile scope.
+         reader = threading.Thread(target=copy_context().run, args=(reader_target, session, *extra_args),
+                                   daemon=True, name=reader_name)
+         session._reader_thread = reader
+         with self._lock:
++            if self._refuse_held_locked(session.id):  # a foreground call still owns it (989239fff3) [daveey]
++                return
+             self._prune_if_needed()
+-            # Completion takes this lock too. Starting here also leaves no
+-            # ghost entry if the interpreter cannot start another thread.
++            # Completion takes this lock too; starting here leaves no ghost entry if no thread can start.
+             reader.start()
+             self._running[session.id] = session
+             if ownership_scope is not None:
+diff --git a/tools/process_registry_checkpoint.py b/tools/process_registry_checkpoint.py
+index dbe15c2cfe..2936de1f62 100644
+--- a/tools/process_registry_checkpoint.py
++++ b/tools/process_registry_checkpoint.py
+@@ -21,11 +21,18 @@ class ProcessCheckpointMixin:
+     # Set by the multiplexed gateway: one registry serves every profile, so an ``agent:main:`` key names
+     # the default profile rather than "whoever wrote it" (see tools.process_registry_profiles). [daveey]
+     profile_scoped_checkpoints: bool = False
++    _lock: Any
++    _running: dict
+ 
+     def _owned_here(self, session_key, scope=None) -> bool:
+         from tools.process_registry_profiles import owned_here
+         return owned_here(session_key, multiplexed=self.profile_scoped_checkpoints, scope=scope)
+ 
++    def _tracked_or_held_locked(self, session_id: Any) -> bool:
++        """Caller holds ``self._lock``: this registry already owns *session_id*, as a background job or as
++        a held survivable foreground command (process_registry_survivable). [daveey]"""
++        return session_id in self._running or session_id in vars(self).get("_foreground_holds", {})
++
+     def _detached_host_fate(self, pid: Optional[int], expected_start: Optional[int]) -> str:
+         """Subclass supplies the live PID decision. See ProcessRegistry."""
+         raise NotImplementedError
+@@ -312,8 +319,11 @@ class ProcessCheckpointMixin:
+                 continue
+             # The registry is process-global, so every profile's checkpoint carries every live
+             # process; a multiplexer recovering several homes must adopt each session once.
++            # A survivable foreground command the terminal tool still waits on is checkpointed too (so a
++            # crash mid-wait leaves it to the next owner), but while it is held here it is ours: adopting it
++            # made a second, background owner whose reader reported lost/-1 for a call that exited 0. [daveey]
+             with self._lock:
+-                already_tracked = entry.get("session_id") in self._running
++                already_tracked = self._tracked_or_held_locked(entry.get("session_id"))
+             if already_tracked:
+                 continue
+             # Its exit was already observed (a result receipt exists in some profile): re-attaching would start
+diff --git a/tools/process_registry_survivable.py b/tools/process_registry_survivable.py
+index 2c7a937f4f..09c1027831 100644
+--- a/tools/process_registry_survivable.py
++++ b/tools/process_registry_survivable.py
+@@ -26,7 +26,7 @@ import os
+ import shlex
+ import subprocess
+ import threading
+-from contextlib import suppress
++from contextlib import ExitStack, suppress
+ from pathlib import Path
+ from typing import Any, Optional
+ 
+@@ -259,19 +259,57 @@ class ProcessForegroundHoldMixin:
+         with self._lock:
+             return list(self._holds().values())
+ 
++    def _refuse_held_locked(self, session_id: str) -> bool:
++        """Detection at the adoption boundary (caller holds ``self._lock``): True, logged as an ERROR, when
++        something tries to track a still-held foreground command as a background job. That gives the call a
++        second owner whose reader reports a false lost/-1 completion (defect 989239fff3); a deliberate
++        handoff (``convert_foreground``) drops the hold first. [daveey]"""
++        if session_id not in self._holds():
++            return False
++        logger.error("Refusing to track %s as a background job: a foreground tool call still holds it", session_id)
++        return True
++
+     def hold_foreground(self, session) -> None:
+         with self._lock:
+             self._holds()[session.id] = session
+         self._write_checkpoint()
+ 
+     def release_foreground(self, session_id: str) -> None:
+-        with self._lock:
+-            dropped = self._holds().pop(session_id, None)
++        """Drop the hold and its checkpoint entry in one step under the checkpoint file lock: recovery
++        holds that lock across its read-decide-write, so it sees either the held entry (ours, skipped) or
++        no entry, never an on-disk entry that no table of ours owns any more (it adopted that). [daveey]"""
++        with ExitStack() as stack:
++            self._enter_checkpoint_lock(stack)
++            with self._lock:
++                dropped = self._holds().pop(session_id, None)
++            if dropped is not None:
++                try:
++                    # drop_ids: the entry's child is still alive, so without it the merge keeps it as
++                    # another writer's live entry until drop_from_every_checkpoint, the same window.
++                    self._write_checkpoint_locked(drop_ids=frozenset({session_id}))
++                except Exception:
++                    logger.debug("Failed to write checkpoint file: %s", session_id, exc_info=True)
+         if dropped is not None:
+-            self._write_checkpoint(settled_id=session_id)
++            # Other profiles' checkpoints take their own locks, outside ours (see _write_checkpoint).
++            from tools.process_registry_profiles import drop_from_every_checkpoint
++            try:
++                drop_from_every_checkpoint([session_id])
++            except Exception:
++                logger.debug("Dropping %s from other checkpoints failed", session_id, exc_info=True)
+ 
+     def convert_foreground(self, session) -> None:
+-        """Track a held command as a running background job, tailing its log (the pipe is closed)."""
+-        with self._lock:
+-            self._holds().pop(session.id, None)
+-        self._track_started(session, self._log_reader_loop, f"proc-log-reader-{session.id}")
++        """Track a held command as a running background job, tailing its log (the pipe is closed). The
++        hold moves to ``_running`` under the checkpoint file lock, so a concurrent recovery never finds
++        it in neither table."""
++        with ExitStack() as stack:
++            self._enter_checkpoint_lock(stack)
++            with self._lock:
++                self._holds().pop(session.id, None)
++            self._track_started(session, self._log_reader_loop, f"proc-log-reader-{session.id}")
++
++    def _enter_checkpoint_lock(self, stack: ExitStack) -> None:
++        """The processes.json lock when it can be had; a release or handoff never fails for want of it."""
++        try:
++            stack.enter_context(self._checkpoint_file_lock())
++        except Exception:
++            logger.debug("Checkpoint file lock unavailable; settling the hold without it", exc_info=True)
+-- 
+2.51.0
+

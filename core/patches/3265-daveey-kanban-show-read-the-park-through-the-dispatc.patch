@@ -1,0 +1,337 @@
+From 20ad77df0203885945a1c975857eb21d3d4589b6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:19:46 +0000
+Subject: [PATCH] [daveey] kanban show: read the park through the dispatcher's
+ lookup; a legacy human park says it will be blocked
+
+Follow-up to PR #1920's review nits (t_01a1d39d64436143).
+
+1. One park lookup. `kanban_wake_summary.wakes()` re-implemented the latest
+   SCHEDULED_ENTRY_EVENTS lookup and the no-event fallback that
+   `kanban_continuation.pending_wake`/`missing_wake` use. New
+   `kanban_continuation.park_state(conn, task_id)` -> {payload, parked_at, timed}
+   is now the only reader: pending_wake, missing_wake (which takes an
+   optional pre-read `park=`), `_enforce_wake_invariant` and `wakes()` all
+   go through it, so the shown backstop cannot drift from the wake the
+   dispatcher acts on.
+
+2. A legacy scheduled card with no timed wake and a human block_kind
+   (needs_input/capability) is moved to `blocked` by `_enforce_wake_invariant`
+   on the next tick, never woken; `kanban show` still said "wakes at T".
+   New `kanban_continuation.blocks_for_human(park, block_kind)` is the
+   invariant's own predicate (the dispatcher now calls it too) and
+   `wakes()` reports it as `blocks_for_human` (backstop_at None). The status
+   line / worker_context then read "no timed wake: the dispatcher blocks it
+   for a human on its next tick". The JSON `wakes` object gains the
+   `blocks_for_human` bool (additive).
+
+Display only: scheduling decisions are unchanged (the invariant's condition
+`missing_wake is not None and block_kind in HUMAN_BLOCK_KINDS` is exactly
+`blocks_for_human(park, block_kind)` once missing_wake is non-None).
+
+Proof:
+- tests/hermes_cli/test_kanban_show_wake.py: 8 of 13 red on origin/main
+  (new contract + human case), 13/13 green here. New: display backstop ==
+  dispatcher wake == expected absolute time for wake_check, clock-only,
+  legacy SCHEDULED_UNTIL marker and no-parking-event parks; a monkeypatched
+  park_state moves display and dispatcher together; legacy human park says
+  blocked and wake_due_continuations does block it; non-human legacy and
+  timed human parks still say "wakes at" and are not blocked.
+- Mutants (sdlc-review mutants.py, 10/10 killed): blocks_for_human
+  ignoring timed / kind, phrase ignoring the flag, backstop kept for human,
+  wakes() passing no block_kind, missing_wake ignoring park=, park_state
+  timed always False, untimed payload dropped, no-event parked_at changed,
+  invariant using `if True`.
+- Related suites green: kanban continuation, timed_park, blocker_park_wake,
+  sync_running_heal, wake_check, awaiting, park_producer_finished, notifier,
+  notice_guarantee, kanban_show tool suites (313 tests).
+---
+ hermes_cli/kanban_continuation.py         | 60 ++++++++++-----
+ hermes_cli/kanban_wake_summary.py         | 34 ++++----
+ tests/hermes_cli/test_kanban_show_wake.py | 94 ++++++++++++++++++++++-
+ 3 files changed, 150 insertions(+), 38 deletions(-)
+
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index 2f6d779963..e9837093c7 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -245,14 +245,34 @@ def pending_wake_payload(kind: Optional[str], payload: Any) -> Optional[dict]:
+     return data if isinstance(data.get("wake_at"), (int, float)) else None
+ 
+ 
+-def pending_wake(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+-    """``continued`` payload (with ``wake_at``) of the event that parked ``task_id`` in ``scheduled``."""
++def park_state(conn: sqlite3.Connection, task_id: str) -> dict:
++    """The park holding ``task_id`` in ``scheduled``, read one way for the dispatcher
++    (:func:`pending_wake`, :func:`missing_wake`) and every display (``kanban_wake_summary``), so
++    the shown wake cannot drift from the one acted on. [daveey]
++
++    ``{"payload", "parked_at", "timed"}``: the latest ``SCHEDULED_ENTRY_EVENTS`` payload and its
++    time; ``timed`` when that payload carries ``wake_at``. With no parking event the payload is
++    empty and ``parked_at`` is the card's last event (else now)."""
++    from hermes_cli import kanban_db as kb
++
+     marks = ",".join("?" for _ in SCHEDULED_ENTRY_EVENTS)
+     event = conn.execute(
+-        f"SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN ({marks}) "
++        f"SELECT kind, payload, created_at FROM task_events WHERE task_id = ? AND kind IN ({marks}) "
+         "ORDER BY id DESC LIMIT 1", (task_id, *SCHEDULED_ENTRY_EVENTS),
+     ).fetchone()
+-    return pending_wake_payload(event[0], event[1]) if event else None
++    if event is None:
++        last = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ?", (task_id,)).fetchone()
++        parked_at = int(last[0]) if last and last[0] else int(time.time())
++        return {"payload": {}, "parked_at": parked_at, "timed": False}
++    timed = pending_wake_payload(event[0], event[1])
++    return {"payload": timed if timed is not None else kb._json_dict(event[1]),
++            "parked_at": int(event[2]), "timed": timed is not None}
++
++
++def pending_wake(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
++    """``continued`` payload (with ``wake_at``) of the event that parked ``task_id`` in ``scheduled``."""
++    park = park_state(conn, task_id)
++    return park["payload"] if park["timed"] else None
+ 
+ 
+ def wake_due_continuations(conn: sqlite3.Connection, *, now: Optional[int] = None) -> list[str]:
+@@ -303,29 +323,26 @@ def wake_due_continuations(conn: sqlite3.Connection, *, now: Optional[int] = Non
+ HUMAN_BLOCK_KINDS = ("needs_input", "capability")
+ 
+ 
+-def missing_wake(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
++def missing_wake(conn: sqlite3.Connection, task_id: str, *, park: Optional[dict] = None) -> Optional[dict]:
+     """For a ``scheduled`` card with no timed wake: ``{"parked_at", "wake_at", "reason"}`` with the
+-    wake implied by ``kanban_timed_park.implied_wake`` (None when the card has a real wake). [daveey]"""
+-    from hermes_cli import kanban_db as kb
++    wake implied by ``kanban_timed_park.implied_wake`` (None when the card has a real wake).
++    ``park`` is a :func:`park_state` the caller already read. [daveey]"""
+     from hermes_cli.kanban_timed_park import implied_wake
+ 
+-    marks = ",".join("?" for _ in SCHEDULED_ENTRY_EVENTS)
+-    event = conn.execute(
+-        f"SELECT kind, payload, created_at FROM task_events WHERE task_id = ? AND kind IN ({marks}) "
+-        "ORDER BY id DESC LIMIT 1", (task_id, *SCHEDULED_ENTRY_EVENTS),
+-    ).fetchone()
+-    if event is not None and pending_wake_payload(event[0], event[1]) is not None:
++    park = park_state(conn, task_id) if park is None else park
++    if park["timed"]:
+         return None
+-    if event is None:
+-        last = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ?", (task_id,)).fetchone()
+-        parked_at = int(last[0]) if last and last[0] else int(time.time())
+-        payload: dict = {}
+-    else:
+-        parked_at, payload = int(event[2]), kb._json_dict(event[1])
++    payload, parked_at = park["payload"], park["parked_at"]
+     reason = payload.get("reason") if isinstance(payload.get("reason"), str) else None
+     return {"parked_at": parked_at, "wake_at": implied_wake(payload, parked_at), "reason": reason}
+ 
+ 
++def blocks_for_human(park: dict, block_kind: Optional[str]) -> bool:
++    """True when :func:`_enforce_wake_invariant` moves this park to ``blocked`` instead of waking
++    it: no timed wake and a human ``block_kind``. Displays read this, not their own rule. [daveey]"""
++    return not park["timed"] and block_kind in HUMAN_BLOCK_KINDS
++
++
+ def _enforce_wake_invariant(conn, tid: str, block_kind: Optional[str], now: int, woken: list) -> bool:
+     """A scheduled card without a wake (parked by older code, or by ``kanban_schedule`` before
+     every park carried one): a human-kind card goes to ``blocked`` at once -- it waits on a
+@@ -333,10 +350,11 @@ def _enforce_wake_invariant(conn, tid: str, block_kind: Optional[str], now: int,
+     anything else wakes at its implied time. True when the card moved. [daveey]"""
+     from hermes_cli import kanban_db as kb
+ 
+-    info = missing_wake(conn, tid)
++    park = park_state(conn, tid)
++    info = missing_wake(conn, tid, park=park)
+     if info is None:
+         return False
+-    if block_kind in HUMAN_BLOCK_KINDS:
++    if blocks_for_human(park, block_kind):
+         from hermes_cli.kanban_block_routing import latest_block_reason
+ 
+         reason = latest_block_reason(conn, tid) or info["reason"] or (
+diff --git a/hermes_cli/kanban_wake_summary.py b/hermes_cli/kanban_wake_summary.py
+index d2466c7b38..cb7047e083 100644
+--- a/hermes_cli/kanban_wake_summary.py
++++ b/hermes_cli/kanban_wake_summary.py
+@@ -21,15 +21,17 @@ def _stamp(ts: int, fmt: str = "%Y-%m-%d %H:%M") -> str:
+ 
+ def wakes(conn: sqlite3.Connection, task: Any, *, wake_check: Optional[dict] = None,
+           check_loaded: bool = False) -> Optional[dict]:
+-    """``{"check", "next_probe_at", "backstop_at"}`` for a scheduled card, else None.
++    """``{"check", "next_probe_at", "backstop_at", "blocks_for_human"}`` for a scheduled card, else None.
+ 
+     ``check`` is the armed wake-check command (None for a pure clock park); ``backstop_at`` is
+-    the park's deadline. Pass ``wake_check`` with ``check_loaded=True`` when the caller already
+-    read ``kanban_wake_check.get_state``."""
++    the park's deadline. The park is read through ``kanban_continuation.park_state``, the same
++    lookup the dispatcher wakes on. ``blocks_for_human``: a legacy park with no timed wake and a
++    human ``block_kind``, which the dispatcher's wake invariant moves to ``blocked`` on its next
++    tick instead of waking (``backstop_at`` is then None). Pass ``wake_check`` with
++    ``check_loaded=True`` when the caller already read ``kanban_wake_check.get_state``."""
+     if getattr(task, "status", None) != "scheduled":
+         return None
+-    from hermes_cli import kanban_db as kb
+-    from hermes_cli.kanban_continuation import SCHEDULED_ENTRY_EVENTS
++    from hermes_cli.kanban_continuation import blocks_for_human, park_state
+     from hermes_cli.kanban_timed_park import implied_wake
+ 
+     if not check_loaded:
+@@ -37,27 +39,27 @@ def wakes(conn: sqlite3.Connection, task: Any, *, wake_check: Optional[dict] = N
+         wake_check = kwc.get_state(conn, task.id)
+     if wake_check and wake_check.get("purpose") == "ask_resolved":
+         wake_check = None  # a human ask's resolved_check, not this park's wake
+-    marks = ",".join("?" for _ in SCHEDULED_ENTRY_EVENTS)
+-    row = conn.execute(
+-        f"SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind IN ({marks}) "
+-        "ORDER BY id DESC LIMIT 1", (task.id, *SCHEDULED_ENTRY_EVENTS)).fetchone()
+-    if row is not None:
+-        payload, parked_at = kb._json_dict(row[0]), int(row[1])
+-    else:
+-        last = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ?", (task.id,)).fetchone()
+-        payload, parked_at = {}, int(last[0]) if last and last[0] else int(time.time())
++    park = park_state(conn, task.id)
++    human = blocks_for_human(park, getattr(task, "block_kind", None))
+     return {
+         "check": wake_check.get("cmd") if wake_check else None,
+         "next_probe_at": int(wake_check["next_at"]) if wake_check and wake_check.get("next_at") is not None else None,
+-        "backstop_at": implied_wake(payload, parked_at),
++        "backstop_at": None if human else implied_wake(park["payload"], park["parked_at"]),
++        "blocks_for_human": human,
+     }
+ 
+ 
++HUMAN_BLOCK_PHRASE = "no timed wake: the dispatcher blocks it for a human on its next tick"
++
++
+ def phrase(w: Optional[dict], *, now: Optional[int] = None) -> str:
+     """``wakes when `cmd` passes (next probe HH:MM), backstop YYYY-MM-DD HH:MM`` or ``wakes at …``;
+-    empty for None. The deadline is called a backstop only when a check can wake the card first."""
++    empty for None. The deadline is called a backstop only when a check can wake the card first.
++    A park the dispatcher will block for a human says so instead of naming a wake."""
+     if not w:
+         return ""
++    if w.get("blocks_for_human"):
++        return HUMAN_BLOCK_PHRASE
+     now = int(time.time()) if now is None else int(now)
+     if not w.get("check"):
+         return f"wakes at {_stamp(w['backstop_at'])}"
+diff --git a/tests/hermes_cli/test_kanban_show_wake.py b/tests/hermes_cli/test_kanban_show_wake.py
+index 38b16bc019..7e91473f80 100644
+--- a/tests/hermes_cli/test_kanban_show_wake.py
++++ b/tests/hermes_cli/test_kanban_show_wake.py
+@@ -19,6 +19,7 @@ import pytest
+ from hermes_cli import kanban as kc
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
++from hermes_cli.kanban_timed_park import DEFAULT_WAKE_SECONDS
+ 
+ 
+ @pytest.fixture
+@@ -80,7 +81,7 @@ def test_json_has_a_wakes_object(kanban_home: Path) -> None:
+ 
+     tid2, wake2, _ = _park(kanban_home, with_check=False)
+     wakes2 = json.loads(kc.run_slash(f"show {tid2} --json"))["wakes"]
+-    assert wakes2 == {"check": None, "next_probe_at": None, "backstop_at": wake2}
++    assert wakes2 == {"check": None, "next_probe_at": None, "backstop_at": wake2, "blocks_for_human": False}
+ 
+ 
+ def test_unscheduled_card_has_no_wake(kanban_home: Path) -> None:
+@@ -113,3 +114,94 @@ def test_kanban_show_tool_returns_wakes(kanban_home: Path) -> None:
+     out = json.loads(show({"task_id": tid}))
+     assert out["wakes"]["check"] == probe and out["wakes"]["backstop_at"] == wake
+     assert f"when `{probe}` passes" in out["worker_context"]
++
++
++# --- display and dispatcher read one park (PR #1920 review nits) ---------------------------------
++
++def _legacy_scheduled(*, block_kind: str | None = None, reason: str | None = None) -> str:
++    """A card parked by older code: ``scheduled`` with no timed wake. ``reason`` given -> a
++    ``scheduled`` event without ``wake_at`` (``SCHEDULED_UNTIL=`` marker); else no parking event."""
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="legacy park", assignee="alice")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status = 'scheduled', block_kind = ? WHERE id = ?", (block_kind, tid))
++            if reason is not None:
++                kb._append_event(conn, tid, "scheduled", {"reason": reason})
++    return tid
++
++
++def _until(ts: int) -> str:
++    return datetime.fromtimestamp(ts, tz=UTC).isoformat().replace("+00:00", "Z")
++
++
++@pytest.mark.parametrize("shape", ["wake_check", "clock_only", "legacy_marker", "no_event"])
++def test_display_backstop_is_the_wake_the_dispatcher_acts_on(kanban_home: Path, shape: str) -> None:
++    from hermes_cli import kanban_continuation as kcont
++    from hermes_cli.kanban_wake_summary import wakes
++
++    if shape in ("wake_check", "clock_only"):
++        tid, expected, _ = _park(kanban_home, with_check=shape == "wake_check")
++    elif shape == "legacy_marker":
++        expected = int(time.time()) + 7200
++        tid = _legacy_scheduled(reason=f"SCHEDULED_UNTIL={_until(expected)} legacy")
++    else:
++        tid = _legacy_scheduled()
++        with kbc.connect_closing() as conn:  # no parking event: implied from the card's last event
++            (last,) = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ?", (tid,)).fetchone()
++        expected = int(last) + DEFAULT_WAKE_SECONDS
++    with kbc.connect_closing() as conn:
++        shown = wakes(conn, kb.get_task(conn, tid))
++        timed, missing = kcont.pending_wake(conn, tid), kcont.missing_wake(conn, tid)
++    assert (timed is None) != (missing is None)  # exactly one dispatcher path owns the card
++    acted_on = timed["wake_at"] if timed is not None else missing["wake_at"]
++    assert shown["backstop_at"] == acted_on == expected
++    assert shown["blocks_for_human"] is False
++
++
++def test_display_and_dispatcher_share_one_park_lookup(kanban_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++    """Both sides read ``kanban_continuation.park_state``: replacing it moves both at once."""
++    from hermes_cli import kanban_continuation as kcont
++    from hermes_cli.kanban_wake_summary import wakes
++
++    tid = _legacy_scheduled()
++    fake = {"payload": {"wake_at": 1234567890, "x": 1}, "parked_at": 1, "timed": True}
++    monkeypatch.setattr(kcont, "park_state", lambda conn, task_id: fake)
++    with kbc.connect_closing() as conn:
++        assert wakes(conn, kb.get_task(conn, tid))["backstop_at"] == 1234567890
++        assert kcont.pending_wake(conn, tid) == fake["payload"]
++        assert kcont.missing_wake(conn, tid) is None
++
++
++def test_legacy_human_park_says_it_will_be_blocked_not_wakes_at(kanban_home: Path) -> None:
++    from hermes_cli import kanban_continuation as kcont
++    from hermes_cli.kanban_wake_summary import HUMAN_BLOCK_PHRASE
++
++    tid = _legacy_scheduled(block_kind="needs_input",
++                            reason=f"SCHEDULED_UNTIL={_until(int(time.time()) + 7200)} waiting on David")
++    (line,) = _status_lines(kc.run_slash(f"show {tid}"))
++    assert line.split()[1] == "scheduled"
++    assert HUMAN_BLOCK_PHRASE in line and "wakes at" not in line
++    w = json.loads(kc.run_slash(f"show {tid} --json"))["wakes"]
++    assert w["blocks_for_human"] is True and w["backstop_at"] is None
++    with kbc.connect_closing() as conn:
++        assert HUMAN_BLOCK_PHRASE in (kb.build_worker_context(conn, tid) or "")
++        kcont.wake_due_continuations(conn)  # the display matches what the dispatcher does
++        assert kb.get_task(conn, tid).status == "blocked"
++
++
++def test_legacy_non_human_park_and_timed_human_park_still_say_wakes_at(kanban_home: Path) -> None:
++    from hermes_cli.kanban_wake_summary import HUMAN_BLOCK_PHRASE
++
++    plain = _legacy_scheduled(block_kind="transient")
++    (line,) = _status_lines(kc.run_slash(f"show {plain}"))
++    assert "wakes at" in line and HUMAN_BLOCK_PHRASE not in line
++    timed, wake, _ = _park(kanban_home, with_check=False)  # a timed wake: the invariant never blocks it
++    with kbc.connect_closing() as conn, kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET block_kind = 'needs_input' WHERE id = ?", (timed,))
++    (line,) = _status_lines(kc.run_slash(f"show {timed}"))
++    assert f"wakes at {_stamp(wake)}" in line and HUMAN_BLOCK_PHRASE not in line
++    from hermes_cli import kanban_continuation as kcont
++    with kbc.connect_closing() as conn:
++        kcont.wake_due_continuations(conn)
++        assert kb.get_task(conn, timed).status == "scheduled"  # not blocked, as the display says
++        assert kb.get_task(conn, plain).status == "scheduled"  # implied wake not due; never blocked
+-- 
+2.51.0
+

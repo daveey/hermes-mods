@@ -1,0 +1,122 @@
+From dcb13d43149a37c06adf15dfcf4ab4831d1bd9d6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:54:42 +0000
+Subject: [PATCH] [daveey] ended-parent subagent sweep: a compressed delegator
+ is ended only when its continuation tip is
+
+end_subagents_of_ended_parents treated a delegator with end_reason='compression' as ended,
+so the idle child of an async parent that compressed mid-run (or of a subagent segment B
+while B2 runs) was reaped after the idle guard although its owner was still live on the
+continuation tip. Walk the delegator forward along continuation edges in one recursive
+CTE and require every row of that lineage to be ended (review 5879422404, nit 1).
+---
+ hermes_state_maintenance.py                   | 20 ++++++--
+ .../test_async_delegation_child_row_end.py    | 47 +++++++++++++++++++
+ 2 files changed, 63 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_state_maintenance.py b/hermes_state_maintenance.py
+index 457f48b605..839c1dd871 100644
+--- a/hermes_state_maintenance.py
++++ b/hermes_state_maintenance.py
+@@ -113,6 +113,18 @@ _SUBAGENT_SEGMENT_PARENT_SQL = ("SELECT p.id FROM sessions c JOIN sessions p ON
+                                 f" WHERE c.id = ? AND p.source = 'subagent' AND {_CONTINUATION_EDGE_SQL}")
+ _LINEAGE_WALK_CAP = 1000
+ 
++# The delegator is ended only when its whole compression lineage is: walk forward along continuation edges and
++# look for an open row. A delegator that compressed mid-run (an async parent, or a subagent segment B whose
++# delegate G outlives it while B2 runs) still owns its child through its open continuation tip. ``UNION`` dedups
++# ids, so a corrupt cycle terminates.
++_DELEGATOR_ENDED_SQL = ("WITH RECURSIVE fwd(id) AS ("
++                        " SELECT ?"
++                        " UNION"
++                        " SELECT c.id FROM fwd JOIN sessions p ON p.id = fwd.id JOIN sessions c ON c.parent_session_id = p.id"
++                        f" WHERE {_CONTINUATION_EDGE_SQL}"
++                        ") SELECT 1 FROM sessions d WHERE d.id = ? AND d.ended_at IS NOT NULL AND NOT EXISTS ("
++                        " SELECT 1 FROM fwd JOIN sessions s ON s.id = fwd.id WHERE s.ended_at IS NULL)")
++
+ 
+ def _delegating_parent_on(conn, session_id: str) -> Optional[str]:
+     """The row that delegated *session_id*: the ``parent_session_id`` of the first segment of its compression
+@@ -130,8 +142,7 @@ def _delegating_parent_on(conn, session_id: str) -> Optional[str]:
+ 
+ def _delegator_ended_on(conn, session_id: str) -> bool:
+     delegator = _delegating_parent_on(conn, session_id)
+-    return bool(delegator) and conn.execute(
+-        "SELECT 1 FROM sessions WHERE id = ? AND ended_at IS NOT NULL", (delegator,)).fetchone() is not None
++    return bool(delegator) and conn.execute(_DELEGATOR_ENDED_SQL, (delegator, delegator)).fetchone() is not None
+ 
+ 
+ class SessionMaintenanceMixin:
+@@ -251,8 +262,9 @@ class SessionMaintenanceMixin:
+         idle (by ``started_at`` AND canonical last activity) at least ``max_idle_seconds``. A delegate child's real
+         owner is the process that ran its parent's turn, so ``sweep_orphaned_sessions``' heartbeat guess (any live
+         backend started before the row could own it) kept such rows open for as long as some backend outlived them,
+-        which on a host whose backends restart many times a day is indefinitely. A parent that has ended (reaped,
+-        closed or rotated by compression) has no turn left to own the child. A compressed child's continuation has
++        which on a host whose backends restart many times a day is indefinitely. A parent that has ended (reaped or
++        closed) has no turn left to own the child; one rotated by compression counts as ended only once its open
++        continuation tip has ended too (``_DELEGATOR_ENDED_SQL``). A compressed child's continuation has
+         its own compressed segment as ``parent_session_id``, so the delegating parent is found by walking past those
+         segments (``_delegating_parent_on``): an open delegator keeps its child's continuation. ``end_reason``
+         differs from ``startup_orphan_reap`` so the reap's killed-subagent notice is not re-sent hours late to a chat
+diff --git a/tests/tools/test_async_delegation_child_row_end.py b/tests/tools/test_async_delegation_child_row_end.py
+index e646c38b1d..30774b7145 100644
+--- a/tests/tools/test_async_delegation_child_row_end.py
++++ b/tests/tools/test_async_delegation_child_row_end.py
+@@ -264,6 +264,53 @@ def test_startup_sweep_spares_pinned_subagent(db, monkeypatch):
+     assert db.get_session("child")["ended_at"] is None
+ 
+ 
++def _child_of_compressed_delegator(db, *, nested: bool = False):
++    """Delegator ``parent`` compressed into the open tip ``parent-2`` (via ``parent-1b``) while its idle child
++    ``child`` still points at the first segment. ``nested``: the delegator is itself a subagent segment (a
++    delegate G of segment B while B2 is open)."""
++    stale = time.time() - 8 * 3600
++    if nested:
++        db.create_session("root", source="desktop")
++        parent_cfg = {"_delegate_from": "root"}
++        db.create_session("parent", source="subagent", parent_session_id="root", model_config=parent_cfg)
++    else:
++        parent_cfg = None
++        db.create_session("parent", source="desktop")
++    db.create_session("child", source="subagent", parent_session_id="parent",
++                      model_config={"_delegate_from": "parent"})
++    db.end_session("parent", "compression")
++    db.create_session("parent-1b", source="subagent" if nested else "desktop", parent_session_id="parent",
++                      model_config=parent_cfg)
++    db.end_session("parent-1b", "compression")
++    db.create_session("parent-2", source="subagent" if nested else "desktop", parent_session_id="parent-1b",
++                      model_config=parent_cfg)
++    for sid in ("parent", "parent-1b", "parent-2", "child"):
++        _backdate(db, sid, stale)
++
++
++@pytest.mark.parametrize("nested", [False, True])
++def test_child_of_compressed_delegator_with_open_tip_is_left_alone(db, nested):
++    """Nit 1 of review 5879422404: a delegator that ended by compression still runs on its continuation tip."""
++    _child_of_compressed_delegator(db, nested=nested)
++    assert db.end_subagents_of_ended_parents(max_idle_seconds=IDLE_S) == []
++    assert db.get_session("child")["ended_at"] is None
++
++    db.end_session("parent-2", "agent_close")
++    assert db.end_subagents_of_ended_parents(max_idle_seconds=IDLE_S) == ["child"]
++    assert db.get_session("child")["end_reason"] == "parent_ended_reap"
++
++
++def test_compressed_delegator_with_no_continuation_counts_as_ended(db):
++    """A compression-ended row whose continuation was never written (or was pruned) is its own ended tip."""
++    db.create_session("parent", source="desktop")
++    db.create_session("child", source="subagent", parent_session_id="parent",
++                      model_config={"_delegate_from": "parent"})
++    db.end_session("parent", "compression")
++    for sid in ("parent", "child"):
++        _backdate(db, sid, time.time() - 8 * 3600)
++    assert db.end_subagents_of_ended_parents(max_idle_seconds=IDLE_S) == ["child"]
++
++
+ def _seed_compressed_unit_child(home):
+     """``child-1`` (the id dispatch persisted) compressed into ``child-1b``, which compressed into the open tip
+     ``child-1c``. ``grandchild`` is a delegate child of a segment, not a continuation, so it is not the unit's."""
+-- 
+2.51.0
+

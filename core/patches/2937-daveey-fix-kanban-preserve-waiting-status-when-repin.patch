@@ -1,0 +1,205 @@
+From 22b434664a12c3036d3d0d415ba3d68e355b4c36 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 20:24:38 +0000
+Subject: [PATCH] [daveey] fix(kanban): preserve waiting status when repinning
+ legacy cards to pool
+
+Allow ready/scheduled/todo pool migrations while keeping origin repin ready-only and retaining creator, lease and revision fences. Pending readback reports the precondition status rather than inventing ready.
+
+Proof: scheduled/todo eligibility RED on 433a5f064b (prior run); pending-readback HTTP regression 4 failed before fix, 65 passed after; authoritative-feed integration 69 passed. Board waiting-state extension is deployed separately before migrations.
+---
+ hermes_cli/kanban_worker_repin.py            | 19 +++--
+ tests/hermes_cli/test_kanban_worker_repin.py | 87 +++++++++++++++++++-
+ 2 files changed, 96 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/kanban_worker_repin.py b/hermes_cli/kanban_worker_repin.py
+index d4b711a3e0..2543d41ab6 100644
+--- a/hermes_cli/kanban_worker_repin.py
++++ b/hermes_cli/kanban_worker_repin.py
+@@ -5,12 +5,14 @@ A ``worker-first-v1`` card's ``runs_on`` and ``placement_policy`` are Board-owne
+ field edit (``placement_fenced``) and the outbox strips ``runs_on`` from a policy card's push
+ (:func:`hermes_cli.kanban_worker_placement.acknowledged_outbox`). So a generic ``move_queued`` relabel of such a card
+ would report success while nothing changes. The one supported change is the Board's explicit CAS repin
+-(``POST /v2/boards/<id>/placement/repin``, worker ``repinWorker``): creator-only, ``ready`` with no lease, at the
+-exact acknowledged revision; it clears the policy and its reservation and sets the pin.
++(``POST /v2/boards/<id>/placement/repin``, worker ``repinWorker``): creator-only, with no lease, at the
++exact acknowledged revision; it clears the policy and its reservation and sets the pin without changing status.
++The Board must support its waiting-state worker-queue extension before scheduled/todo migrations can succeed.
+ 
+ Scope (everything else refuses and writes nothing):
+ 
+-* the card is ``worker-first-v1``, ``ready``, created on this gateway, with no local claim and no Board lease;
++* the card is ``worker-first-v1``, created on this gateway, with no local claim and no Board lease;
++* pool moves accept ``ready``, ``scheduled`` and ``todo``; origin moves remain ``ready`` only;
+ * the target is ``[<pool label>]`` (``--pool``: the Board gets ``[<pool label>, *the card's coordination labels]``,
+   so ``requires: [hub:write]`` keeps ``capability:hub-write``; a started card may go, since any worker resumes
+   it from what it pushed), or exactly ``[machine:<this gateway>]`` (the origin) for a card with no ``started_at``
+@@ -101,7 +103,7 @@ def eligibility(conn: sqlite3.Connection, task_id: str, labels: list[str]) -> di
+     origin = f"machine:{me}"
+     pool = labels == [_pool_label()]
+     unavailable = (f"{task_id} is placed by the worker-first policy; the supported moves are the Board repin of a "
+-                   f"ready card to the worker queue (--pool) or of an unstarted ready card to its origin "
++                   f"ready/scheduled/todo card to the worker queue (--pool) or of an unstarted ready card to its origin "
+                    f"(--runs-on {origin})")
+     if row["placement_policy"] != wp.POLICY:
+         return _refuse("repin_unavailable", f"{task_id} has unknown placement policy {row['placement_policy']!r}")
+@@ -109,8 +111,9 @@ def eligibility(conn: sqlite3.Connection, task_id: str, labels: list[str]) -> di
+         return _refuse("repin_unavailable", unavailable + f"; {labels} is not that target")
+     if row["created_on"] != me:
+         return _refuse("repin_unavailable", unavailable + f"; it was created on {row['created_on']!r}, not {me}")
+-    if row["status"] != "ready":
+-        return _refuse("repin_unavailable", unavailable + f"; it is {row['status']}, not ready")
++    allowed_statuses = ("ready", "scheduled", "todo") if pool else ("ready",)
++    if row["status"] not in allowed_statuses:
++        return _refuse("repin_unavailable", unavailable + f"; it is {row['status']}, not {'/'.join(allowed_statuses)}")
+     if row["claim_lock"] is not None or row["lease_holder"] is not None:
+         return _refuse("repin_unavailable", unavailable + "; it holds a claim or Board lease")
+     # A started card may join the queue: any worker resumes it from what it pushed (t_01a1d0571c2f07d6). Only the
+@@ -135,7 +138,7 @@ def eligibility(conn: sqlite3.Connection, task_id: str, labels: list[str]) -> di
+     except (TypeError, ValueError):
+         previous = None
+     return {"ok": True, "me": me, "board": board, "revision": int(row["sync_version"]), "previous": previous,
+-            "labels": labels, "matches": [] if pool else [me]}
++            "labels": labels, "matches": [] if pool else [me], "status": row["status"]}
+ 
+ 
+ def repin_to_origin(conn: sqlite3.Connection, task_id: str, labels: list[str], reason: str, *,
+@@ -203,7 +206,7 @@ def repin_to_origin(conn: sqlite3.Connection, task_id: str, labels: list[str], r
+     except sqlite3.Error:
+         pass  # the Board's own placement_repinned event still records the change
+ 
+-    out = {"ok": True, "runs_on": pre["labels"], "matches": pre["matches"], "move_no": move_no, "status": "ready",
++    out = {"ok": True, "runs_on": pre["labels"], "matches": pre["matches"], "move_no": move_no, "status": pre["status"],
+            REPINNED_EVENT_FLAG: True, "board_version": version, "readback": "pending"}
+     try:
+         client.pull(conn, hub, board, observers=True, partition=me)
+diff --git a/tests/hermes_cli/test_kanban_worker_repin.py b/tests/hermes_cli/test_kanban_worker_repin.py
+index 9bf25800f3..cf582a90c5 100644
+--- a/tests/hermes_cli/test_kanban_worker_repin.py
++++ b/tests/hermes_cli/test_kanban_worker_repin.py
+@@ -50,8 +50,17 @@ class RepinHub(FakeHub):
+             refuse("not_found")
+         if task.get("created_on") != self.gateway:
+             refuse("not_creator")
+-        if task.get("status") != "ready" or task_id in b["leases"]:
++        status = task.get("status")
++        if status not in ("ready", "scheduled", "todo") or task_id in b["leases"]:
+             refuse("not_claimable")
++        # Waiting-state extension: server contract owned/tested in hermes-hub worker_placement.ts.
++        if status != "ready":
++            if task.get("placement_policy") != wp.POLICY:
++                refuse("invalid_policy")
++            if "pool:worker" not in runs_on or any(
++                    label != "pool:worker" and not label.startswith(("capability:", "profile:", "skill:"))
++                    for label in runs_on):
++                refuse("invalid_pool_pin")
+         if expected_revision != task["version"]:
+             refuse("revision_conflict")
+         row = self.svc._put(b, "tasks", task_id, {"placement_policy": None, "runs_on": json.dumps(runs_on)},
+@@ -303,6 +312,22 @@ def test_http_success_with_failed_readback_keeps_local_policy(conn, board_stub,
+     assert _local(conn, tid) == (wp.POLICY, None, "ready")
+ 
+ 
++@pytest.mark.parametrize("status", ["scheduled", "todo"])
++@pytest.mark.parametrize("started", [False, True])
++def test_waiting_http_success_with_failed_readback_retains_status(conn, board_stub, monkeypatch, status, started):
++    tid = _acknowledged(conn, status=status, started_at=1 if started else None)
++    # Exact 200 response contract from Board worker_placement.ts, verified by its HTTP tests.
++    board_stub.update(status=200, body={"version": 5, "runs_on": ["pool:worker"], "placement_policy": None})
++    monkeypatch.setattr(ksc, "pull", lambda *a, **kw: (_ for _ in ()).throw(ksc.HubError(503, "down")))
++    res = km.move_queued(conn, tid, runs_on=["pool:worker"], reason="pool migration", hub=board_stub["hub"])
++    assert res["ok"] and res["readback"] == "pending", res
++    assert res["status"] == status
++    assert board_stub["received"] == [("/v2/boards/default/placement/repin",
++                                       {"task_id": tid, "expected_revision": 4, "runs_on": ["pool:worker"]})]
++    assert _local(conn, tid) == (wp.POLICY, None, status)
++    assert _moved(conn, tid)[-1]["repinned"] is True
++
++
+ def test_http_transport_failure_has_unknown_outcome(conn):
+     tid = _acknowledged(conn)
+     hub = ksc.Hub(ksc.Identity("http://127.0.0.1:9", "synthetic", "hub"), timeout=2)
+@@ -406,6 +431,29 @@ def test_cli_move_pool_repins_a_started_worker_first_card(gws, svc, monkeypatch)
+     assert out["matches"] == [] == ev["matches"]  # the queue names no machine: whichever worker is free claims it
+ 
+ 
++@pytest.mark.parametrize("status", ["scheduled", "todo"])
++@pytest.mark.parametrize("started", [False, True])
++def test_cli_waiting_pool_repin_keeps_authoritative_status(gws, svc, monkeypatch, status, started):
++    from hermes_cli import kanban as kcli
++    origin, _ = gws
++    tid, _ = _policy_card(origin)
++    if started:
++        _started(origin, tid)
++    b = svc.board(BOARD)
++    svc._put(b, "tasks", tid, {"status": status}, HUB, None, "9999999999996-0000-board")
++    origin.round()
++    assert _local(origin.conn, tid)[2] == status
++    monkeypatch.setattr(ksc, "load_identity", lambda cfg=None: ksc.Identity("https://hub.test", "k", HUB))
++    monkeypatch.setattr(ksc, "Hub", lambda ident, *a, **kw: RepinHub(svc, ident.gateway))
++    before = dict(b["rows"]["tasks"][tid])
++    out = json.loads(kcli.run_slash(f'move {tid} --pool --reason "preserve waiting state" --json'))
++    assert out["ok"] and out["readback"] == "confirmed" and out["status"] == status, out
++    assert _local(origin.conn, tid) == (None, ["pool:worker"], status)
++    after = b["rows"]["tasks"][tid]
++    assert after["status"] == before["status"]
++    assert _moved(origin.conn, tid)[-1]["repinned"] is True
++
++
+ def test_move_pool_keeps_the_cards_coordination_labels(gws, svc):
+     origin, _ = gws
+     origin.enter()
+@@ -423,7 +471,7 @@ def test_move_pool_keeps_the_cards_coordination_labels(gws, svc):
+ 
+ 
+ @pytest.mark.parametrize("fields,code", [
+-    ({"status": "todo"}, "repin_unavailable"),
++    ({"status": "blocked"}, "repin_unavailable"),
+     ({"claim_lock": "local:1"}, "repin_unavailable"),
+     ({"lease_holder": "worker-1", "lease_expires": 1}, "repin_unavailable"),
+     ({"created_on": "other"}, "repin_unavailable"),
+@@ -455,6 +503,41 @@ def test_move_pool_of_a_started_card_reaches_the_board(conn, started):
+     assert origin["reason_code"] == "repin_unavailable" and "started" in origin["error"]  # origin repin unchanged
+ 
+ 
++@pytest.mark.parametrize("status", ["scheduled", "todo"])
++@pytest.mark.parametrize("started", [False, True])
++def test_waiting_pool_repin_eligibility_preserves_state(conn, status, started):
++    tid = _acknowledged(conn, status=status, started_at=1 if started else None)
++    before = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    result = repin.eligibility(conn, tid, ["pool:worker"])
++    assert result["ok"], result
++    assert result["status"] == status
++    assert result["labels"] == ["pool:worker"]
++    assert dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()) == before
++    origin = repin.eligibility(conn, tid, ["machine:hub"])
++    assert not origin["ok"] and "not ready" in origin["error"]
++
++
++@pytest.mark.parametrize("status", ["scheduled", "todo"])
++@pytest.mark.parametrize("fields,fragment", [
++    ({"claim_lock": "local:1"}, "holds a claim"),
++    ({"lease_holder": "worker-1"}, "holds a claim"),
++    ({"created_on": "other"}, "was created on"),
++    ({"sync_version": None}, "not acknowledged"),
++])
++def test_waiting_pool_repin_keeps_ownership_fences(conn, status, fields, fragment):
++    tid = _acknowledged(conn, status=status, **fields)
++    result = km.move_queued(conn, tid, runs_on=["pool:worker"], reason="x", hub=NoCallHub())
++    assert not result["ok"] and fragment in result["error"], result
++    assert not _moved(conn, tid)
++
++
++@pytest.mark.parametrize("status", ["blocked", "review", "running", "done", "archived"])
++def test_pool_repin_rejects_nonwaiting_status(conn, status):
++    tid = _acknowledged(conn, status=status)
++    result = repin.eligibility(conn, tid, ["pool:worker"])
++    assert not result["ok"] and f"it is {status}, not" in result["error"], result
++
++
+ def test_move_to_another_single_machine_still_refuses(conn):
+     tid = _acknowledged(conn)
+     res = km.move_queued(conn, tid, runs_on=["machine:worker-1"], reason="x", hub=NoCallHub())
+-- 
+2.51.0
+

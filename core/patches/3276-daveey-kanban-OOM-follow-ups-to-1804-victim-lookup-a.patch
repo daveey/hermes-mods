@@ -1,0 +1,484 @@
+From ebde9c724a8cff2542d1818280a4bad684c71693 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:30:47 +0000
+Subject: [PATCH] [daveey] kanban OOM follow-ups to #1804: victim lookup after
+ a restart, bounded journal read, honest 137 attribution
+
+Review nits on #1804 (reviews 5884824785, 5885069810, 5886864029):
+
+- read_failure looks up the kernel's OOM victim restricted to the worker pid
+  whenever the pid is known. It used to need this process's probe verdict
+  (_oom_continue_supported), so a dispatcher restarted between spawn and the
+  agent's own OOM death (no snapshot after SIGKILL, --collect scope GC'd)
+  booked a generic crash and the retry's memory cap was not doubled.
+- The kernel-log read runs inside the reclaim write txn, so it is bounded by
+  the run's start (journalctl -S @<task_runs.started_at>) instead of -24h.
+- OomWatch no longer pins a concurrent job's OOM kill on the foreground
+  command: it reads the kernel's victim since the command started. A victim
+  already in the run scope before the command gets a note naming it and no
+  claim about the command; no kernel record gives a hedged "exited by SIGKILL
+  while the OOM killer fired" note. A survivable command's own transient scope
+  is checked too (its kill never moved the run scope's count).
+- A call-site comment and a compute-policy test pin that OOMPolicy=continue is
+  added before bounded_scope's `-- nice -n 15`, where apply_toolchain_env
+  finds it.
+- Docstring reflow in tools/process_registry_persist_scope.py.
+---
+ hermes_cli/kanban_db_dispatch.py              |  4 +-
+ hermes_cli/kanban_worker_scope.py             | 35 ++++++--
+ .../test_kanban_oom_policy_continue.py        | 78 +++++++++++++++++
+ tests/tools/test_terminal_oom.py              | 85 +++++++++++++++++--
+ tools/process_registry_persist_scope.py       |  7 +-
+ tools/terminal_oom.py                         | 75 ++++++++++++++--
+ tools/terminal_tool.py                        |  2 +-
+ 7 files changed, 257 insertions(+), 29 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index f6fa56fd36..afbfa74d77 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1181,7 +1181,7 @@ def _classify_dead_worker(
+     worker see WHY instead of a bare label; a rate-limited requeue does not need it.
+     """
+     log = _kb.read_worker_log(task_id, tail_bytes=None, board=board) if task_id and run_id else ""
+-    failure = _worker_scope.read_failure(task_id, run_id, log or "", pid=pid) if task_id else None
++    failure = _worker_scope.read_failure(task_id, run_id, log or "", pid=pid, started_at=_worker_scope.run_started_at(conn, run_id)) if task_id else None
+     if failure:
+         kind = "oom_killed" if failure["scope_result"] == "oom-kill" else "signaled"
+         if kind == "oom_killed" and task_id:
+@@ -2682,7 +2682,7 @@ def _restart_safe_worker_argv(task: Task, command: list[str], board: Optional[st
+         require_restart_safe_scope=True,
+         outlives_parent=True,
+     ).argv)
+-    argv = _worker_scope.oom_policy_continue(_worker_scope.apply_oom_recovery(argv, task.id, board))  # raised cap; OOM kill takes a command, not the run
++    argv = _worker_scope.oom_policy_continue(_worker_scope.apply_oom_recovery(argv, task.id, board))  # before bounded_scope: its `-- nice -n 15` must follow OOMPolicy, which apply_toolchain_env reads before the first `--`
+     return _aggregate_scope.bounded_scope(argv, task_id=task.id, board=str(_kb.kanban_db_path(board=board).resolve()))  # pool + per-card slice
+ 
+ 
+diff --git a/hermes_cli/kanban_worker_scope.py b/hermes_cli/kanban_worker_scope.py
+index eae6125402..2b54f277b1 100644
+--- a/hermes_cli/kanban_worker_scope.py
++++ b/hermes_cli/kanban_worker_scope.py
+@@ -84,13 +84,18 @@ def _systemctl(*args: str) -> subprocess.CompletedProcess | None:
+         return None
+ 
+ 
+-def read_failure(task_id: str, run_id: int | None, log: str = "", *, pid: int | None = None) -> dict | None:
++def read_failure(task_id: str, run_id: int | None, log: str = "", *, pid: int | None = None,
++                 started_at: float | None = None) -> dict | None:
+     """The run scope's failure, or None when the scope did not fail.
+ 
+     Under ``OOMPolicy=continue`` a child's OOM kill leaves the scope running, so the
+     worker's own ``oom_kill`` count no longer means the worker died of it. The kernel's
+     record names the victim instead: the run failed by OOM only when that victim is the
+-    worker ``pid`` itself (the agent was the largest process in its scope).
++    worker ``pid`` itself (the agent was the largest process in its scope). That lookup
++    runs whenever ``pid`` is known, not only when this process probed the policy: a
++    dispatcher restarted after the spawn has no probe verdict, and the agent's own SIGKILL
++    leaves no snapshot. ``started_at`` (the run's start, epoch seconds) bounds the
++    kernel-log read, which runs inside the reclaim write transaction.
+     """
+     if run_id is None:
+         return None
+@@ -106,10 +111,11 @@ def read_failure(task_id: str, run_id: int | None, log: str = "", *, pid: int |
+     if snapshot.get("oom_kill", 0) > 0 and not continued:
+         result = "oom-kill"
+     victim = None
++    since = journal_since(started_at)
+     if result == "oom-kill":
+-        victim = kernel_oom_victim(unit)
+-    elif result != "signal" and pid and (continued or _oom_continue_supported):
+-        victim = kernel_oom_victim(unit, pid=pid)
++        victim = kernel_oom_victim(unit, since=since)
++    elif result != "signal" and pid:
++        victim = kernel_oom_victim(unit, pid=pid, since=since)
+         result = "oom-kill" if victim else result
+     if result not in {"oom-kill", "signal"}:
+         return None
+@@ -130,6 +136,25 @@ _KILLED_LINE = re.compile(r"Killed process (\d+) \(.*?\).*?anon-rss:(\d+)kB")
+ _USAGE_LINE = re.compile(r"memory: usage \d+kB, limit (\d+)kB")
+ 
+ 
++def run_started_at(conn: sqlite3.Connection | None, run_id: int | None) -> int | None:
++    """The run's start (epoch): it bounds the kernel-log read under the reclaim write txn."""
++    if conn is None or run_id is None:
++        return None
++    try:
++        row = conn.execute("SELECT started_at FROM task_runs WHERE id = ?", (run_id,)).fetchone()
++        return int(row[0]) if row and row[0] is not None else None
++    except (sqlite3.Error, TypeError, ValueError):
++        return None
++
++
++def journal_since(started_at: float | None) -> str:
++    """``journalctl -S`` for records no older than ``started_at`` (epoch seconds); a day when unknown."""
++    try:
++        return f"@{int(started_at)}" if started_at and float(started_at) > 0 else "-24h"
++    except (TypeError, ValueError):
++        return "-24h"
++
++
+ def kernel_oom_victim(unit: str, *, pid: int | None = None, since: str = "-24h") -> dict | None:
+     """The kernel's last OOM victim in ``unit`` (``pid`` restricts it to that process).
+ 
+diff --git a/tests/hermes_cli/test_kanban_oom_policy_continue.py b/tests/hermes_cli/test_kanban_oom_policy_continue.py
+index 28b62bf579..065f5b705a 100644
+--- a/tests/hermes_cli/test_kanban_oom_policy_continue.py
++++ b/tests/hermes_cli/test_kanban_oom_policy_continue.py
+@@ -196,3 +196,81 @@ def test_continue_policy_worker_itself_oom_killed_still_fails(monkeypatch):
+     assert failure["scope_result"] == "oom-kill"
+     assert failure["memory_max_bytes"] == 8388608 * 1024  # from the kernel record; the scope is gone
+     assert "kernel victim: the worker itself, python3 pid 1870933" in scope.describe(failure)
++
++
++def _journal_argv(monkeypatch, text=KERNEL, props=""):
++    """Like ``_kernel``, and returns the list of journalctl argvs it was asked to run."""
++    seen = []
++
++    def run(argv, **kwargs):
++        if argv[0] == "journalctl":
++            seen.append(argv)
++            return subprocess.CompletedProcess(argv, 0, text, "")
++        return subprocess.CompletedProcess(argv, 0, props, "")
++    monkeypatch.setattr(subprocess, "run", run)
++    monkeypatch.setattr("tools.process_registry.systemd_user_bus_env", dict)
++    return seen
++
++
++def test_fresh_dispatcher_still_finds_the_agent_as_oom_victim(monkeypatch):
++    """Restarted after the spawn: no probe verdict in this process, no snapshot (SIGKILL), scope GC'd."""
++    monkeypatch.setattr(scope, "_oom_continue_supported", None)
++    seen = _journal_argv(monkeypatch, props="LoadState=not-found\n")
++    failure = scope.read_failure("t_x", 1, "", pid=1870933)
++    assert failure is not None and failure["scope_result"] == "oom-kill"
++    assert failure["oom_victim"]["is_worker"]
++    assert all(argv[0] == "journalctl" for argv in seen)  # no systemd-run probe was needed
++    assert scope._oom_continue_supported is None
++    # A child victim is still no failure of the run.
++    assert scope.read_failure("t_x", 1, "", pid=999) is None
++
++
++def test_kernel_log_read_is_bounded_by_the_run_start(monkeypatch):
++    """It runs under the reclaim write txn: read from the run's start, not a day back."""
++    seen = _journal_argv(monkeypatch, props="LoadState=loaded\nResult=oom-kill\nMemoryMax=8589934592\n")
++    scope.read_failure("t_x", 1, "", pid=999, started_at=1794550650)
++    scope.read_failure("t_x", 1, "", pid=1870933, started_at=1794550650.9)
++    assert [argv[argv.index("-S") + 1] for argv in seen] == ["@1794550650", "@1794550650"]
++    seen.clear()
++    scope.read_failure("t_x", 1, "", pid=999)  # unknown start: the old day-long window
++    assert seen[0][seen[0].index("-S") + 1] == "-24h"
++
++
++def test_classify_dead_worker_passes_the_run_start(monkeypatch):
++    import sqlite3
++    from hermes_cli import kanban_db_dispatch as kbd
++    conn = sqlite3.connect(":memory:")
++    conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, started_at INTEGER)")
++    conn.execute("INSERT INTO task_runs VALUES (5, 1794550650)")
++    assert scope.run_started_at(conn, 5) == 1794550650
++    assert scope.run_started_at(conn, 6) is None and scope.run_started_at(None, 5) is None
++    seen = {}
++    monkeypatch.setattr(kbd._kb, "read_worker_log", lambda *a, **kw: "")
++    monkeypatch.setattr(kbd._worker_scope, "read_failure",
++                        lambda *a, **kw: seen.update(kw) or {"systemd_unit": UNIT, "scope_result": "signal",
++                                                             "memory_max_bytes": None, "memory_peak_bytes": None})
++    monkeypatch.setattr(kbd, "crash_worker_output", lambda *a, **kw: "")
++    kbd._classify_dead_worker(4242, "h:1", None, task_id="t_x", run_id=5, conn=conn)
++    assert seen == {"pid": 4242, "started_at": 1794550650}
++
++
++def test_compute_policy_nice_wrapper_keeps_the_oom_policy_env(probe, monkeypatch):
++    """bounded_scope's own ``-- nice -n 15`` comes after the policy; the worker env still learns it."""
++    from hermes_cli import kanban_aggregate_scope
++    from hermes_cli import kanban_db_dispatch as kbd
++    from hermes_cli import worker_compute_capacity as wcc
++    from tools import process_registry as pr
++    monkeypatch.setattr(kanban_aggregate_scope, "configure_pool", lambda: None)
++    monkeypatch.setattr(wcc, "worker_enabled", lambda: True)
++    monkeypatch.setattr(wcc, "configure_card", lambda board, task_id: "hermes-kanban-" + "0" * 64 + ".slice")
++    monkeypatch.setattr(scope, "consecutive_oom_runs", lambda *a, **kw: 0)
++    monkeypatch.setattr(pr, "restart_safe_gateway_child_argv",
++                        lambda command, **kw: SimpleNamespace(argv=["systemd-run", "--user", "--scope", "--collect",
++                                                                    "--", *command], mode="scoped"))
++    argv = kbd._restart_safe_worker_argv(SimpleNamespace(id="t_x", current_run_id=1), ["hermes", "chat"])
++    boundary = argv.index("--")
++    assert "OOMPolicy=continue" in argv[:boundary]
++    assert argv[boundary:boundary + 4] == ["--", "nice", "-n", "15"]
++    env = {}
++    scope.apply_toolchain_env(env, argv)
++    assert env[scope.OOM_POLICY_ENV] == "continue"
+diff --git a/tests/tools/test_terminal_oom.py b/tests/tools/test_terminal_oom.py
+index 6c4316f3aa..1ddd78c01b 100644
+--- a/tests/tools/test_terminal_oom.py
++++ b/tests/tools/test_terminal_oom.py
+@@ -1,15 +1,21 @@
+ """A foreground command OOM-killed at the Kanban run's memory cap says so."""
+ import json
++from types import SimpleNamespace
++
++import pytest
+ 
+ from tools import terminal_oom
+ from tools.terminal_tool_result import finalize_foreground_result
+ 
++RUN_UNIT = "hermes-worker-kanban-t_x-run-7.scope"
++
+ 
+-def _scope(tmp_path, monkeypatch, oom_kill=0, name="hermes-worker-kanban-t_x-run-7.scope"):
++def _scope(tmp_path, monkeypatch, oom_kill=0, name=RUN_UNIT, procs=""):
+     cgroup = tmp_path / "cg" / name
+     cgroup.mkdir(parents=True, exist_ok=True)
+     (cgroup / "memory.max").write_text("268435456\n")
+     (cgroup / "memory.events").write_text(f"low 0\nhigh 0\nmax 3\noom 1\noom_kill {oom_kill}\n")
++    (cgroup / "cgroup.procs").write_text(procs)
+     monkeypatch.setattr(terminal_oom, "_CGROUP_ROOT", tmp_path / "cg")
+     proc_cgroup = tmp_path / "proc_cgroup"
+     proc_cgroup.write_text(f"0::/{name}\n")
+@@ -17,40 +23,103 @@ def _scope(tmp_path, monkeypatch, oom_kill=0, name="hermes-worker-kanban-t_x-run
+     return cgroup
+ 
+ 
++@pytest.fixture
++def kernel(monkeypatch):
++    """The kernel's OOM record per unit (``kernel.records[unit] = {...}``); ``kernel.calls`` records lookups."""
++    state = SimpleNamespace(records={}, calls=[])
++
++    def victim(unit, since):
++        state.calls.append((unit, since))
++        return state.records.get(unit)
++
++    monkeypatch.setattr(terminal_oom, "_kernel_victim", victim)
++    return state
++
++
+ def _finalize(result):
+     return json.loads(finalize_foreground_result(
+         command="python3 big.py", result=result, env=None, env_type="local", effective_task_id="t",
+         task_id="t", session_id="s", session_key="k", workdir=None, command_cwd=None, approval_note=None))
+ 
+ 
+-def test_oom_killed_foreground_command_names_the_run_cap(tmp_path, monkeypatch):
+-    cgroup = _scope(tmp_path, monkeypatch)
++def test_oom_killed_foreground_command_names_the_run_cap(tmp_path, monkeypatch, kernel):
++    cgroup = _scope(tmp_path, monkeypatch, procs="100\n101\n")
+     watch = terminal_oom.OomWatch()
++    kernel.records[RUN_UNIT] = {"pid": 4242, "task": "python3", "limit_bytes": 268435456}  # born during the command
+     (cgroup / "memory.events").write_text("oom 1\noom_kill 1\n")
+     note = watch.note(137)
+-    assert note == ("killed by the OOM killer at the run's memory cap (256 MiB); run it under "
+-                    "`systemd-run --user --scope -p MemoryMax=…` or reduce its footprint")
++    assert note == ("killed by the OOM killer at the run's memory cap (256 MiB; kernel victim: python3 pid 4242); "
++                    "run it under `systemd-run --user --scope -p MemoryMax=…` or reduce its footprint")
++    assert kernel.calls == [(RUN_UNIT, watch.since)]  # the journal read starts at the command, not a day back
+     out = _finalize({"output": "Killed", "returncode": 137, "oom_note": note})
+     assert out["exit_code"] == 137
+     assert out["exit_code_meaning"] == note
+ 
+ 
+-def test_sigkill_without_an_oom_kill_keeps_the_generic_note(tmp_path, monkeypatch):
++def test_concurrent_victim_is_not_pinned_on_the_command(tmp_path, monkeypatch, kernel):
++    """A background job already in the scope was the kernel's victim: the note does not say the command was."""
++    cgroup = _scope(tmp_path, monkeypatch, procs="100\n55\n")
++    watch = terminal_oom.OomWatch()
++    kernel.records[RUN_UNIT] = {"pid": 55, "task": "node", "limit_bytes": 268435456}
++    (cgroup / "memory.events").write_text("oom_kill 1\n")
++    note = watch.note(137)
++    assert "already running before this command (node pid 55)" in note
++    assert "concurrent command or background job" in note
++    assert not note.startswith("killed by the OOM killer")
++
++
++def test_no_kernel_record_softens_the_sigkill_wording(tmp_path, monkeypatch, kernel):
++    cgroup = _scope(tmp_path, monkeypatch)
++    watch = terminal_oom.OomWatch()
++    (cgroup / "memory.events").write_text("oom_kill 1\n")
++    note = watch.note(137)
++    assert note.startswith("exited by SIGKILL while the OOM killer fired at the run's memory cap (256 MiB)")
++    assert "probably the victim" in note
++
++
++def test_survivable_command_in_its_own_scope_gets_the_note(tmp_path, monkeypatch, kernel):
++    """Its own transient scope holds only the command, so the run scope's count never moves."""
++    _scope(tmp_path, monkeypatch)
++    unit = "hermes-worker-proc_ab12.scope"
++    watch = terminal_oom.OomWatch(SimpleNamespace(session=SimpleNamespace(systemd_unit=unit)))
++    kernel.records[unit] = {"pid": 77, "task": "cc1plus", "limit_bytes": 4294967296}
++    note = watch.note(-15)  # its own scope keeps OOMPolicy=stop: systemd stops it
++    assert note == ("killed by the OOM killer at its scope's memory cap (4096 MiB; kernel victim: cc1plus pid 77); "
++                    "run it under `systemd-run --user --scope -p MemoryMax=…` or reduce its footprint")
++    assert kernel.calls == [(unit, watch.since)]
++    assert watch.note(0) is None
++
++
++def test_sigkill_without_an_oom_kill_keeps_the_generic_note(tmp_path, monkeypatch, kernel):
+     _scope(tmp_path, monkeypatch, oom_kill=2)
+     watch = terminal_oom.OomWatch()
+     assert watch.note(137) is None
++    assert kernel.calls == []  # no count change: the kernel log is never read
+     out = _finalize({"output": "Killed", "returncode": 137, "oom_note": None})
+     assert "signal 9" in out["exit_code_meaning"]
+ 
+ 
+-def test_pipeline_masking_an_oom_kill_is_still_named(tmp_path, monkeypatch):
++def test_pipeline_masking_an_oom_kill_is_still_named(tmp_path, monkeypatch, kernel):
+     cgroup = _scope(tmp_path, monkeypatch)
+     watch = terminal_oom.OomWatch()
+     (cgroup / "memory.events").write_text("oom_kill 1\n")
+     assert "while this command ran" in watch.note(0)
+ 
+ 
+-def test_outside_a_kanban_run_scope_nothing_is_read(tmp_path, monkeypatch):
++def test_outside_a_kanban_run_scope_nothing_is_read(tmp_path, monkeypatch, kernel):
+     _scope(tmp_path, monkeypatch, name="app-hermes.scope")
+     watch = terminal_oom.OomWatch()
+     assert watch.cgroup is None and watch.note(137) is None
++
++
++def test_kernel_victim_reads_the_journal_from_the_watch_start(monkeypatch):
++    import subprocess
++    seen = []
++
++    def run(argv, **kwargs):
++        seen.append(argv)
++        return subprocess.CompletedProcess(argv, 1, "", "")
++
++    monkeypatch.setattr(subprocess, "run", run)
++    assert terminal_oom._kernel_victim(RUN_UNIT, 1794550000.7) is None
++    assert seen[0][0] == "journalctl" and seen[0][seen[0].index("-S") + 1] == "@1794550000"
+diff --git a/tools/process_registry_persist_scope.py b/tools/process_registry_persist_scope.py
+index 0a20d6d896..8ebf67e955 100644
+--- a/tools/process_registry_persist_scope.py
++++ b/tools/process_registry_persist_scope.py
+@@ -2,10 +2,9 @@
+ 
+ A Kanban worker runs in ``hermes-worker-kanban-<task>-run-<n>.scope`` (KillMode=control-group;
+ OOMPolicy=continue on systemd >= 253, else stop, which stops the run on any OOM kill), which the
+-dispatcher stops after the
+-run ends. A ``persist_on_release`` job spawned inside it died with the worker (a paid-rental
+-watchdog on the hub, 2026-11-03), so it gets its own transient scope in the same
+-aggregate-bounded ``hermes-kanban.slice``, with the run scope's own memory cap.
++dispatcher stops after the run ends. A ``persist_on_release`` job spawned inside it died with the
++worker (a paid-rental watchdog on the hub, 2026-11-03), so it gets its own transient scope in the
++same aggregate-bounded ``hermes-kanban.slice``, with the run scope's own memory cap.
+ 
+ Any other user unit kills it the same way: Desktop's hub backend runs in
+ ``hermes-always-on-dashboard.service`` (KillMode=control-group), which every hub update restarts, so
+diff --git a/tools/terminal_oom.py b/tools/terminal_oom.py
+index bcadad9fdf..b2e2713cd7 100644
+--- a/tools/terminal_oom.py
++++ b/tools/terminal_oom.py
+@@ -5,7 +5,8 @@ A Kanban run scope (``hermes-worker-kanban-<task>-run-<n>.scope``) runs with
+ so a command that fills the run's ``MemoryMax`` is killed alone and the agent keeps
+ going. A bare ``exit_code: 137`` then reads like any SIGKILL; this reads the scope's
+ ``memory.events`` ``oom_kill`` count before and after the command and, when it rose,
+-says what happened and what to do instead.
++says what happened and what to do instead. The kernel's record (``journalctl -k``) says
++whose process died, so a concurrent job's kill is not pinned on the command.
+ """
+ from __future__ import annotations
+ 
+@@ -55,24 +56,80 @@ def _memory_max(cgroup: Path) -> str:
+     return f"{int(raw) / (1024 * 1024):g} MiB" if raw.isdecimal() else raw
+ 
+ 
++def _procs(cgroup: Optional[Path]) -> frozenset:
++    """The pids in ``cgroup`` now (its ``cgroup.procs``), empty when unreadable."""
++    if cgroup is None:
++        return frozenset()
++    try:
++        return frozenset(int(p) for p in (cgroup / "cgroup.procs").read_text(encoding="utf-8-sig").split())
++    except (OSError, ValueError):
++        return frozenset()
++
++
++def _kernel_victim(unit: str, since: float) -> Optional[dict]:
++    """The kernel's last OOM victim in ``unit`` since ``since`` (None when unreadable)."""
++    from hermes_cli.kanban_worker_scope import journal_since, kernel_oom_victim
++    return kernel_oom_victim(unit, since=journal_since(since))
++
++
++def _size(limit_bytes) -> str:
++    return f"{limit_bytes / (1024 * 1024):g} MiB" if isinstance(limit_bytes, int) else "MemoryMax unknown"
++
++
++_ADVICE = "run it under `systemd-run --user --scope -p MemoryMax=…` or reduce its footprint"
++
++
+ class OomWatch:
+-    """Snapshot before a foreground command; :meth:`note` after it ends."""
++    """Snapshot before a foreground command; :meth:`note` after it ends.
++
++    The run scope is shared with the agent and any background job, so its ``oom_kill`` count
++    rising does not say whose process died. The kernel's record does: the note asserts the
++    command was killed only when the victim is not a process that was already running when
++    the command started; otherwise it names the victim and says no more. A ``survivable``
++    foreground command runs in its own transient scope, where any victim is the command's.
++    """
+ 
+-    def __init__(self) -> None:
++    def __init__(self, survivable=None) -> None:
++        import time
++        self.since = time.time() - 1
++        self.survivable = survivable
+         self.cgroup = run_scope_cgroup()
+         self.before = oom_kills(self.cgroup)
++        self.procs = _procs(self.cgroup)
+ 
+     def note(self, returncode) -> Optional[str]:
+-        """The model-facing note when the run scope's OOM killer fired during the command."""
+-        if self.cgroup is None or self.before is None:
+-            return None
++        """The model-facing note when an OOM kill hit the command's scope while it ran."""
++        own = self._own_scope_note(returncode)
++        if own or self.cgroup is None or self.before is None:
++            return own
+         after = oom_kills(self.cgroup)
+         if after is None or after <= self.before:
+             return None
+         cap = _memory_max(self.cgroup)
++        victim = _kernel_victim(self.cgroup.name, self.since)
++        if victim is not None and victim["pid"] in self.procs:  # a process older than this command
++            return (f"a process already running before this command ({victim['task']} pid {victim['pid']}) was "
++                    f"killed by the OOM killer at the run's memory cap ({cap}) while it ran; a concurrent "
++                    "command or background job shares the cap")
++        named = f"; kernel victim: {victim['task']} pid {victim['pid']}" if victim else ""
+         if returncode in _SIGKILL_EXITS:
+-            return (f"killed by the OOM killer at the run's memory cap ({cap}); run it under "
+-                    "`systemd-run --user --scope -p MemoryMax=…` or reduce its footprint")
+-        return (f"a process was killed by the OOM killer at the run's memory cap ({cap}) while "
++            if victim is None:  # no kernel record: the count alone does not say whose process died
++                return (f"exited by SIGKILL while the OOM killer fired at the run's memory cap ({cap}); it was "
++                        "probably the victim, but a concurrent command or background job shares the cap; "
++                        + _ADVICE)
++            return f"killed by the OOM killer at the run's memory cap ({cap}{named}); {_ADVICE}"
++        return (f"a process was killed by the OOM killer at the run's memory cap ({cap}{named}) while "
+                 "this command ran (a pipeline may hide its exit status); run memory-heavy steps "
+                 "under `systemd-run --user --scope -p MemoryMax=…` or reduce their footprint")
++
++    def _own_scope_note(self, returncode) -> Optional[str]:
++        """A survivable command's own scope holds only it: any OOM victim there is the command's."""
++        session = getattr(self.survivable, "session", None)
++        unit = getattr(session, "systemd_unit", None)
++        if not isinstance(unit, str) or not unit or returncode in (0, None):
++            return None
++        victim = _kernel_victim(unit, self.since)
++        if victim is None:
++            return None
++        return (f"killed by the OOM killer at its scope's memory cap ({_size(victim.get('limit_bytes'))}; "
++                f"kernel victim: {victim['task']} pid {victim['pid']}); {_ADVICE}")
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index 203525d561..cb1bfc9774 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -1433,7 +1433,7 @@ def _run_foreground(
+             if survivable is not None:
+                 exec_kwargs.update(survivable=survivable, yield_handler=functools.partial(survivable.handoff, yielded=True))
+             result = None
+-            oom_watch = OomWatch() if env_type == "local" else None  # run-scope OOM kills [daveey]
++            oom_watch = OomWatch(survivable) if env_type == "local" else None  # OOM kills in its scope [daveey]
+             try:
+                 result = env.execute(command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
+                                      **exec_kwargs)
+-- 
+2.51.0
+

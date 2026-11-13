@@ -1,0 +1,262 @@
+From cadcf9d5588a781ba96ee1c77a66610f5b7cb2d4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 23:44:13 +0000
+Subject: [PATCH] fix(cron): hold one-shots on uncheckable admission journals,
+ naming the journal [daveey]
+
+Follow-up to the three non-blocking review points on PR #1757 (review card t_01a1d1debe8ca7cc):
+
+1. A malformed admission journal (bad JSON, missing/non-dict params, or a journal naming this
+   job under the wrong key) still fails closed: the exhausted one-shot is kept and the journal
+   is never deleted. The due scan now logs a warning naming the journal path instead of
+   "Skipping malformed cron job <healthy job>".
+2. claim_dispatch no longer lets a failed journal check escape to run_one_job's crash path
+   (crash notice + mark_job_run(False) on an already-spent one-shot) in the concurrent
+   exhaustion race: it holds the fire like any other pending-admission hold.
+3. has_pending_admission and _sibling_pauses share one identity-checked journal iterator
+   (_job_journals), so the identity rule lives in one place. Damaged journals raise
+   CronJournalCorrupt (a ValueError carrying the path).
+
+Tests: composed headless-tick test over five corrupt-journal shapes (job kept, journal kept,
+journal named, healthy one-shot unaffected, legacy wedged cleanup resumes once the operator
+removes the file) and a real run_one_job race test (no booking, no notice). RED on main:
+6 failed (misleading "Skipping malformed cron job 'probe'" log; run_one_job returns False via
+the crash path). GREEN: tests/cron 211 files, 1862 passed.
+---
+ cron/jobs.py                   |  8 +--
+ cron/scheduler_authority.py    | 78 ++++++++++++++++++++---------
+ tests/cron/test_restart_cut.py | 89 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 147 insertions(+), 28 deletions(-)
+
+diff --git a/cron/jobs.py b/cron/jobs.py
+index 7b4ddca92e..ff5a20f83d 100644
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -2696,8 +2696,8 @@ def claim_dispatch(job_id: str) -> bool:
+         completed = repeat.get("completed", 0)
+         label = job.get("name", job.get("id", "?"))
+         if completed >= times:
+-            from cron.scheduler_authority import has_pending_admission
+-            if has_pending_admission(job_id):
++            from cron.scheduler_authority import admission_holds
++            if admission_holds(job, logger):
+                 return False  # settlement owns the record; no dispatch and no retirement
+             if job.get("last_run_at") is not None:
+                 # A prior run completed normally (mark_job_run raced this tick). Retain the terminal
+@@ -3249,8 +3249,8 @@ def _oneshot_dispatch_limit_reached(job: dict[str, Any], scan: _DueScan) -> bool
+     completed = repeat.get("completed", 0)
+     if times is None or times <= 0 or completed < times:
+         return False
+-    from cron.scheduler_authority import has_pending_admission
+-    if has_pending_admission(job["id"]):
++    from cron.scheduler_authority import admission_holds
++    if admission_holds(job, logger):
+         return True  # a dead firer can still have a canonical receipt awaiting reconciliation
+     name = job.get("name", job.get("id", "?"))
+     # A live run must never have its job record deleted underneath it (#62002): a run that outlives the
+diff --git a/cron/scheduler_authority.py b/cron/scheduler_authority.py
+index 204377178b..bdb4052f42 100644
+--- a/cron/scheduler_authority.py
++++ b/cron/scheduler_authority.py
+@@ -63,24 +63,65 @@ def journal_path(job_id, request_id):
+     return get_hermes_home() / 'cron' / 'admissions' / (key + '.json')
+ 
+ 
+-def has_pending_admission(job_id):
+-    """An admission journal owns settlement, even after its firer died. Do not retire its job.
++class CronJournalCorrupt(ValueError):
++    """[daveey] An admission journal is unreadable or does not carry the identity its name
++    encodes. Its owner job cannot be known, so callers hold (never retire) and name ``path``."""
++
++    def __init__(self, path, detail):
++        super().__init__(f'cron journal {detail}: {path}')
++        self.path = path
++
+ 
+-    Only a matching, identity-checked journal holds the job; unrelated journals do not. Read
+-    errors propagate so a damaged journal cannot turn an uncertain fire into destructive cleanup.
++def _job_journals(job_id, *, skip=None):
++    """Yield ``(path, record)`` for each identity-checked admission journal of ``job_id``.
++
++    The one home of the journal identity rule: a journal names its job and request in
++    ``params`` and must live at ``journal_path`` of exactly that pair. An unreadable journal
++    raises CronJournalCorrupt naming its path, because its owner may be this job.
+     """
+     root = journal_path(job_id, '').parent
+-    for path in root.glob('*.json'):
++    for path in sorted(root.glob('*.json')):
++        if path == skip:
++            continue
+         try:
+             record = json.loads(path.read_text(encoding='utf-8-sig'))
++            params = record['params']
++            owner = params['job_id']
++            mine = owner == job_id and path == journal_path(job_id, params['request_id'])
+         except FileNotFoundError:
+             continue  # reconciliation just retired it
+-        params = record['params']
+-        if params['job_id'] == job_id:
+-            if path != journal_path(job_id, params['request_id']):
+-                raise ValueError('cron journal identity conflict')
+-            return True
+-    return False
++        except (OSError, ValueError, KeyError, TypeError) as exc:
++            raise CronJournalCorrupt(path, f'unreadable ({type(exc).__name__}: {exc})') from exc
++        if owner == job_id:
++            if not mine:
++                raise CronJournalCorrupt(path, 'identity conflict')
++            yield path, record
++
++
++def has_pending_admission(job_id):
++    """An admission journal owns settlement, even after its firer died. Do not retire its job.
++
++    Only a matching, identity-checked journal holds the job; unrelated journals do not. A damaged
++    journal raises CronJournalCorrupt naming its path, so it cannot turn an uncertain fire into
++    destructive cleanup; callers hold the job (``admission_holds``).
++    """
++    return next(_job_journals(job_id), None) is not None
++
++
++def admission_holds(job, logger):
++    """[daveey] True when an exhausted one-shot must be kept: a journal owns its settlement, or the
++    journal check itself failed. A failure books nothing and blames the journal path (not the
++    healthy job) so an operator can repair or remove that file; it never escapes to the caller's
++    crash path (failure notice + booked failed run on a one-shot whose fire was already spent)."""
++    try:
++        return has_pending_admission(job['id'])
++    except Exception as exc:
++        where = getattr(exc, 'path', None) or journal_path(job['id'], '').parent
++        logger.warning(
++            "Job '%s': one-shot dispatch limit reached but admission journal %s could not be "
++            "checked (%s) — holding the job unretired until that journal is repaired or reconciled",
++            job.get('name') or job['id'], where, exc, exc_info=True)
++        return True
+ 
+ 
+ def _pause_identity(paused):
+@@ -96,19 +137,8 @@ def replayable_completions(job_id, completions):
+ 
+ def _sibling_pauses(job_id, execution_id):
+     """Pause identities still needed by other journaled fires of this job."""
+-    own = journal_path(job_id, execution_id)
+-    for path in own.parent.glob('*.json'):
+-        if path == own:
+-            continue
+-        try:
+-            record = json.loads(path.read_text(encoding='utf-8-sig'))
+-        except FileNotFoundError:
+-            continue
+-        params = record['params']
+-        if params['job_id'] == job_id:
+-            if path != journal_path(job_id, params['request_id']):
+-                raise ValueError('cron journal identity conflict')
+-            yield record.get('pause_recorded')
++    for _path, record in _job_journals(job_id, skip=journal_path(job_id, execution_id)):
++        yield record.get('pause_recorded')
+ 
+ 
+ def pause_for_unknown(job_id, execution_id, reason):
+diff --git a/tests/cron/test_restart_cut.py b/tests/cron/test_restart_cut.py
+index c9c8102abe..edda27bb9e 100644
+--- a/tests/cron/test_restart_cut.py
++++ b/tests/cron/test_restart_cut.py
+@@ -350,6 +350,95 @@ def test_oneshot_due_scan_before_journal_recovery(home, monkeypatch, owner_ops,
+     assert not _due(job["id"])
+ 
+ 
++def _corrupt_journal(shape, job_id):
++    """A damaged admission journal: unreadable, or naming this job under the wrong key."""
++    payload = {"json": "{not json", "no-params": json.dumps({"receipt": None}),
++               "not-a-dict": json.dumps([1]), "bad-params": json.dumps({"params": None}),
++               "misnamed": json.dumps({"params": {"job_id": job_id, "request_id": "r1"}})}[shape]
++    path = scheduler_authority.journal_path(job_id, "").parent / f"{shape}.json"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(payload)
++    return path
++
++
++@pytest.mark.parametrize("shape", ["json", "no-params", "not-a-dict", "bad-params", "misnamed"])
++def test_oneshot_corrupt_journal_holds_and_names_the_journal(home, monkeypatch, owner_ops, caplog,
++                                                             shape):
++    """[daveey] A damaged journal fails closed (the exhausted one-shot is kept, the journal is never
++    deleted) and the due scan names the journal, not the healthy job, as the cause."""
++    from datetime import UTC, datetime, timedelta
++    import logging
++
++    now = datetime.now(UTC)
++    monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
++    job = jobs.create_job(prompt="probe", schedule="in 1m", repeat=1, name="probe", deliver="local")
++    now += timedelta(minutes=1, seconds=1)
++    jobs.claim_job_for_fire(job["id"], return_job=True)
++    assert jobs.claim_dispatch(job["id"])
++    fire = executions.create_execution(job["id"], source="builtin")["id"]
++    executions.mark_execution_running(fire)
++    corrupt = _corrupt_journal(shape, job["id"])
++    _dead_firer(monkeypatch)
++    caplog.set_level(logging.INFO)
++    with monkeypatch.context() as headless:
++        headless.setattr("gateway.session_cron.owner_for_home", lambda home: None)
++        headless.setattr(scheduler, "_maybe_run_worktree_maintenance", lambda: None)
++        headless.setattr(scheduler, "_sweep_mcp_orphans", lambda: None)
++        assert scheduler.tick(verbose=False, headless=True) == 0
++    assert jobs.get_job(job["id"]) is not None, "an uncheckable journal must not retire the job"
++    assert not _due(job["id"])
++    messages = [r.getMessage() for r in caplog.records]
++    assert not [m for m in messages if "Skipping malformed cron job" in m], messages
++    assert [m for m in messages if str(corrupt) in m and "holding the job unretired" in m], messages
++    assert not jobs.claim_dispatch(job["id"])
++    assert jobs.get_job(job["id"]) is not None
++    scheduler_authority.reconcile_pending()
++    assert corrupt.exists(), "an uncertain journal is never deleted by recovery"
++    assert jobs.get_job(job["id"]) is not None
++    # Healthy one-shots never reach the journal check; their dispatch is unaffected.
++    other = jobs.create_job(prompt="other", schedule="in 1m", repeat=1, deliver="local")
++    assert jobs.claim_dispatch(other["id"])
++    # Once the operator removes the damaged journal, the old wedged-claim cleanup resumes.
++    corrupt.unlink()
++    assert not jobs.claim_dispatch(job["id"])
++    assert jobs.get_job(job["id"]) is None
++
++
++def test_claim_dispatch_race_with_corrupt_journal_holds_without_bookkeeping(home, monkeypatch, caplog):
++    """[daveey] The scan saw budget left, another process spent it before this claim, and a damaged
++    journal makes the check raise: hold the fire, never book a failed run or send a crash notice."""
++    from datetime import UTC, datetime, timedelta
++    import logging
++
++    now = datetime.now(UTC)
++    monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
++    job = jobs.create_job(prompt="probe", schedule="in 1m", repeat=1, name="probe", deliver="local")
++    now += timedelta(minutes=1, seconds=1)
++    claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
++    assert isinstance(claimed, dict) and claimed["repeat"]["completed"] == 0
++    assert jobs.claim_dispatch(job["id"])  # the concurrent firer exhausts the one-shot
++    corrupt = _corrupt_journal("json", job["id"])
++    claimed["execution_id"] = executions.create_execution(job["id"], source="builtin")["id"]
++    booked, notices = [], []
++    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda _job: False)
++    monkeypatch.setattr(scheduler, "mark_job_run", lambda *a, **k: booked.append(a) or True)
++    monkeypatch.setattr(scheduler, "_deliver_crash_failure",
++                        lambda *a, **k: notices.append(a) or (None, "suppressed"))
++    monkeypatch.setattr(scheduler, "run_job", lambda *a, **k: pytest.fail("must not run"))
++    caplog.set_level(logging.WARNING)
++
++    assert scheduler.run_one_job(claimed) is True
++
++    assert booked == [] and notices == []
++    saved = jobs.get_job(job["id"])
++    assert saved["repeat"] == {"times": 1, "completed": 1}
++    assert saved.get("last_status") is None and int(saved.get("failure_streak") or 0) == 0
++    row = executions.get_execution(claimed["execution_id"])
++    assert "Dispatch claim rejected" in row["error"]
++    assert corrupt.exists()
++    assert [r for r in caplog.records if str(corrupt) in r.getMessage()]
++
++
+ def test_manual_fire_refused_while_draining_is_deferred_not_failed(home, monkeypatch, owner_ops):
+     """Hub sample 2: ``hermes cron run`` while the owner drains: refused, never admitted."""
+     from hermes_state_runtime import RuntimeStoreError
+-- 
+2.51.0
+

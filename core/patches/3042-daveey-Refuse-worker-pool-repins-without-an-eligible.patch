@@ -1,0 +1,192 @@
+From e59a79d14857366046960cca9a67887385ea2b86 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 21:28:43 +0000
+Subject: [PATCH] [daveey] Refuse worker pool repins without an eligible
+ machine
+
+Resolve the full coordination-label target against the live registry before Board CAS; retain policy and events on no_machine, and report eligible machines. Remove unused queue_decision origin_intent.
+
+Proof: regression red on base (8 failures); focused consumers 222 passed; removed no_machine guard killed by 3 queued-status tests; CLI eligible output covered; scripts/check all 18 checks green.
+---
+ hermes_cli/kanban_worker_placement.py         |  7 +--
+ hermes_cli/kanban_worker_repin.py             | 12 +++-
+ .../test_kanban_pool_carried_inputs.py        |  2 +-
+ tests/hermes_cli/test_kanban_pool_queue.py    |  2 +-
+ tests/hermes_cli/test_kanban_worker_repin.py  | 61 ++++++++++++++++++-
+ 5 files changed, 76 insertions(+), 8 deletions(-)
+
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 256e6091dc..2fa25d5197 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -55,7 +55,7 @@ QUEUED_WHY = ("portable: queued for any machine labelled {label} (kanban.placeme
+               "with a free slot claims it through the Board lease")
+ 
+ 
+-def queue_decision(args, cfg, gateway, pin, origin_intent, machine_ok=None):
++def queue_decision(args, cfg, gateway, pin, machine_ok=None):
+     """``runs_on: [<pool label>, *coordination labels]`` for a portable card of a ``worker_queue`` gateway, or None.
+ 
+     One queue instead of a machine pin: no worker is chosen at creation, so a held or full worker never strands the
+@@ -66,7 +66,6 @@ def queue_decision(args, cfg, gateway, pin, origin_intent, machine_ok=None):
+     from hermes_cli import kanban_placement as placement
+     from hermes_cli import kanban_placement_coordination as coordination
+ 
+-    del origin_intent  # kept for callers; it does not change execution routing
+     label = placement._Cfg(cfg).queue_label(gateway)
+     if not label or pin not in ("", "auto") or args.get("runs_on") is not None:
+         return None
+@@ -84,7 +83,7 @@ def creation_decision(args, cfg, gateway, pin, origin_intent, machine_ok=None, q
+ 
+     if pin in ("local", "here", (gateway or "").lower()):
+         return {"where": "local", "why": PINNED_LOCAL_WHY}
+-    queued = queue_decision(args, cfg, gateway, pin, origin_intent, machine_ok) if queue else None
++    queued = queue_decision(args, cfg, gateway, pin, machine_ok) if queue else None
+     if queued is not None:
+         return queued
+     pools = cfg.get("worker_pools")
+@@ -208,7 +207,7 @@ def cli_runs_on(conn, args, body, workspace_kind, workspace_path, board, *, assi
+         return None
+     fields = _cli_fields(args, body, workspace_kind, workspace_path, board, assignee=assignee)
+     fields.pop("runs_on", None)
+-    result = queue_decision(fields, cfg, placement.reg.self_gateway(), "auto", None)
++    result = queue_decision(fields, cfg, placement.reg.self_gateway(), "auto")
+     return (result or {}).get("runs_on")
+ 
+ 
+diff --git a/hermes_cli/kanban_worker_repin.py b/hermes_cli/kanban_worker_repin.py
+index 2543d41ab6..fe3b5bb511 100644
+--- a/hermes_cli/kanban_worker_repin.py
++++ b/hermes_cli/kanban_worker_repin.py
+@@ -133,12 +133,22 @@ def eligibility(conn: sqlite3.Connection, task_id: str, labels: list[str]) -> di
+             "LIMIT 1", (task_id,)).fetchone() is not None:
+         return _refuse("not_acknowledged", f"{task_id} has a task edit the Board has not acknowledged yet; "
+                                            "retry after the next sync")
++    matches = [me]
++    if pool:
++        from hermes_cli import kanban_move as km
++        from hermes_cli import kanban_worker_node as wn
++        registry = wn.registry()
++        if registry is None:
++            return _refuse("registry_unavailable", "the Board machine registry is unreachable; try again")
++        matches = km.matching_machines(labels, registry.get("machines") or {}, me=me, exclude_me=False)
++        if not matches:
++            return _refuse("no_machine", f"no active, unheld machine has every label in {labels}")
+     try:
+         previous = json.loads(row["runs_on"]) if row["runs_on"] else None
+     except (TypeError, ValueError):
+         previous = None
+     return {"ok": True, "me": me, "board": board, "revision": int(row["sync_version"]), "previous": previous,
+-            "labels": labels, "matches": [] if pool else [me], "status": row["status"]}
++            "labels": labels, "matches": matches, "status": row["status"]}
+ 
+ 
+ def repin_to_origin(conn: sqlite3.Connection, task_id: str, labels: list[str], reason: str, *,
+diff --git a/tests/hermes_cli/test_kanban_pool_carried_inputs.py b/tests/hermes_cli/test_kanban_pool_carried_inputs.py
+index b9632d531c..0f9ce56a2a 100644
+--- a/tests/hermes_cli/test_kanban_pool_carried_inputs.py
++++ b/tests/hermes_cli/test_kanban_pool_carried_inputs.py
+@@ -105,7 +105,7 @@ def test_queue_labels_skip_a_verified_carried_path(carried):
+     args = {"title": "Implement plan", "body": carried["body"], "assignee": "default"}
+     assert kp.portable_reason(args, cfg) is None
+     # Before: runs_on [pool:worker, capability:token-broker], a label no pool machine carries.
+-    assert wp.queue_decision(args, cfg, "hub", "", None, machine_ok=lambda _: True) == {
++    assert wp.queue_decision(args, cfg, "hub", "", machine_ok=lambda _: True) == {
+         "where": "local", "runs_on": [POOL], "why": wp.QUEUED_WHY.format(label=POOL)}
+     assert coord.required_labels(args, cfg) == set()
+     # The same path without a covering receipt keeps its label, and a real tool mention still needs one.
+diff --git a/tests/hermes_cli/test_kanban_pool_queue.py b/tests/hermes_cli/test_kanban_pool_queue.py
+index db0d7785ad..29c89001bc 100644
+--- a/tests/hermes_cli/test_kanban_pool_queue.py
++++ b/tests/hermes_cli/test_kanban_pool_queue.py
+@@ -573,7 +573,7 @@ def test_origin_bound_explicit_pins_still_win(hub, origin_ok, monkeypatch):
+ 
+ def test_queue_decision_does_not_exclude_courier_creation():
+     from hermes_cli import kanban_worker_placement as wp
+-    out = wp.queue_decision({"title": "summarise CI"}, CFG, HUB, "auto", {"request_id": "r"}, lambda _label: True)
++    out = wp.creation_decision({"title": "summarise CI"}, CFG, HUB, "auto", {"request_id": "r"}, lambda _label: True)
+     assert out is not None and out["runs_on"] == [POOL], out
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_worker_repin.py b/tests/hermes_cli/test_kanban_worker_repin.py
+index cf582a90c5..83f47d5a45 100644
+--- a/tests/hermes_cli/test_kanban_worker_repin.py
++++ b/tests/hermes_cli/test_kanban_worker_repin.py
+@@ -29,6 +29,65 @@ gws = node_fixtures.gws
+ svc = node_fixtures.svc
+ 
+ 
++@pytest.fixture(autouse=True)
++def pool_registry(monkeypatch):
++    from hermes_cli import kanban_worker_node as wn
++    monkeypatch.setattr(wn, "registry", lambda: {"machines": {
++        "worker-1": {"labels": ["pool:worker", "capability:hub-write"]}}})
++
++
++@pytest.mark.parametrize("status", ["ready", "scheduled", "todo"])
++@pytest.mark.parametrize("available", [False, True])
++def test_cli_started_pool_requires_live_complete_label_match(conn, monkeypatch, status, available):
++    from hermes_cli import kanban as kcli
++    from hermes_cli import kanban_worker_node as wn
++    tid = _acknowledged(conn, status=status, started_at=1, requires=json.dumps(["hub:write"]))
++    target = ["pool:worker", "capability:hub-write"]
++    machines = {
++        "plain": {"labels": ["pool:worker"]},
++        "held": {"labels": target, "hold": True},
++        "offline": {"labels": target, "state": "offline"},
++    }
++    if available:
++        machines["capable"] = {"labels": target}
++    monkeypatch.setattr(wn, "registry", lambda: {"machines": machines})
++    before = list(conn.iterdump())
++    calls = []
++
++    class Hub:
++        ident = NoCallHub.ident
++
++        def repin(self, board, **kw):
++            calls.append(kw)
++            return {"version": 5}
++
++    monkeypatch.setattr(ksc, "load_identity", lambda cfg=None: Hub.ident)
++    monkeypatch.setattr(ksc, "Hub", lambda *a, **kw: Hub())
++    monkeypatch.setattr(ksc, "pull", lambda *a, **kw: None)
++    out = json.loads(kcli.run_slash(f'move {tid} --pool --reason "queue" --json'))
++    if available:
++        assert out["ok"] and out["matches"] == ["capable"], out
++        assert calls == [{"task_id": tid, "expected_revision": 4, "runs_on": target}]
++        assert _moved(conn, tid)[-1]["matches"] == ["capable"]
++        text = kcli.run_slash(f'move {tid} --pool --reason "queue"')
++        assert "eligible: capable" in text
++    else:
++        assert not out["ok"] and out["reason_code"] == "no_machine", out
++        assert out["error"] == f"no active, unheld machine has every label in {target}"
++        assert calls == []
++        assert list(conn.iterdump()) == before  # row, reservation, outbox and every event unchanged
++
++
++def test_pool_registry_unavailable_refuses_without_write(conn, monkeypatch):
++    from hermes_cli import kanban_worker_node as wn
++    tid = _acknowledged(conn, started_at=1)
++    monkeypatch.setattr(wn, "registry", lambda: None)
++    before = list(conn.iterdump())
++    out = km.move_queued(conn, tid, runs_on=["pool:worker"], reason="queue", hub=NoCallHub())
++    assert out["reason_code"] == "registry_unavailable"
++    assert list(conn.iterdump()) == before
++
++
+ class RepinHub(FakeHub):
+     """FakeHub plus the Board's ``repinWorker`` (worker/src/worker_placement.ts): creator only, ready and unleased,
+     exact revision, then clear policy + set the pin in one Board write."""
+@@ -428,7 +487,7 @@ def test_cli_move_pool_repins_a_started_worker_first_card(gws, svc, monkeypatch)
+     assert _local(origin.conn, tid) == (None, ["pool:worker"], "ready")
+     [ev] = _moved(origin.conn, tid)
+     assert ev["repinned"] is True and ev["runs_on"] == ["pool:worker"] and ev["previous_runs_on"] is None, ev
+-    assert out["matches"] == [] == ev["matches"]  # the queue names no machine: whichever worker is free claims it
++    assert out["matches"] == ["worker-1"] == ev["matches"]
+ 
+ 
+ @pytest.mark.parametrize("status", ["scheduled", "todo"])
+-- 
+2.51.0
+

@@ -1,0 +1,199 @@
+From c8633ea4e94b4ecb3b1b3832bf5691378294d2a7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 20:49:50 +0000
+Subject: [PATCH] fix(update): publish disjoint checkpoint residual accounting
+ [daveey]
+
+---
+ gateway/session_runtime_workers.py            | 10 +++-
+ gateway/update_checkpoint.py                  | 19 ++++++-
+ ...test_update_checkpoint_census_agreement.py | 55 +++++++++++++++----
+ 3 files changed, 67 insertions(+), 17 deletions(-)
+
+diff --git a/gateway/session_runtime_workers.py b/gateway/session_runtime_workers.py
+index 8cd988d946..da56443f55 100644
+--- a/gateway/session_runtime_workers.py
++++ b/gateway/session_runtime_workers.py
+@@ -46,7 +46,7 @@ def kanban_managed_count(runner):
+                for worker in getattr(authority, '_managed_workers', {}).values())
+ 
+ 
+-def cron_turn_count(runner):
++def cron_turn_count(runner, *, mapped_only=False):
+     """Executing authority turns of scheduled-job sessions (frozen policy source ``cron``).
+ 
+     An agent cron fire runs its turn on the owner (``session_cron.operation('submit')``), so the
+@@ -72,10 +72,16 @@ def cron_turn_count(runner):
+                 policy = policy_for_source(runner, getattr(live, 'source', None))
+             except Exception:  # health: allow BLE001 -- unreadable policy: not provably a cron turn, stays awaited
+                 continue
+-            count += getattr(policy, 'source', None) == 'cron'
++            count += (getattr(policy, 'source', None) == 'cron'
++                      and (not mapped_only or getattr(live, 'route', None) in running))
+     return count
+ 
+ 
++def cron_chat_count(runner):
++    """The cut-cron turns also counted in the named chat bucket (not all cron turns)."""
++    return cron_turn_count(runner, mapped_only=True)
++
++
+ def managed_worker_units(authority):
+     """One ``active_work`` entry per live managed worker of *authority*: its session and its own process."""
+     return [{'kind': 'managed', 'session': sid, 'pid': (worker.worker or (worker.process.pid,))[0]}
+diff --git a/gateway/update_checkpoint.py b/gateway/update_checkpoint.py
+index d86aa84372..327540e7fe 100644
+--- a/gateway/update_checkpoint.py
++++ b/gateway/update_checkpoint.py
+@@ -16,7 +16,7 @@ from hermes_constants import get_default_hermes_root, get_hermes_home
+ from hermes_cli import admission_fence
+ from gateway.cron_pause import preserve_cron_slots
+ from gateway.status import _pid_exists
+-from gateway.session_runtime_workers import cron_turn_count, kanban_managed_count
++from gateway.session_runtime_workers import cron_chat_count, cron_turn_count, kanban_managed_count
+ from gateway.run_shutdown_restart_wait import CORE_UPDATE_KANBAN_WAIT_S, CORE_UPDATE_KANBAN_STOP_LEASH_S
+ 
+ CHECKPOINT_PAUSE = True
+@@ -73,14 +73,25 @@ def checkpoint_work(runner, *, cron_cut: bool) -> dict:
+     Kanban card or (when cron is cut) a cron run or its agent turn. The ``active-work`` verb publishes
+     the same dict, so an updater census decides with this predicate instead of guessing from unit kinds:
+     a ``managed`` unit there also covers unmapped turns, side agents and managed turns that are not
+-    cards, none of which a checkpoint preserves (example-host 2026-11-12 18:11Z)."""
++    cards, none of which a checkpoint preserves (example-host 2026-11-12 18:11Z).
++    ``unlisted`` excludes the union of preserved work and named chat/API/deferred buckets:
++    a cut cron's mapped agent turn belongs to both, so add that intersection back once."""
+     cron = runner._active_cron_job_count() + cron_turn_count(runner) if cron_cut else 0
+     managed = kanban_managed_count(runner)
+     total = runner._active_work_count()
++    named = sum(_named_work_counts(runner))
++    overlap = cron_chat_count(runner) if cron_cut else 0
+     return {"active": total, "preservable_managed": managed, "cron": cron,
++            "unlisted": max(0, total - managed - cron - named + overlap),
+             "preservable": total == managed + cron}
+ 
+ 
++def _named_work_counts(runner):
++    """Chat/API/deferred buckets; absent probes are supported by older runner adapters."""
++    return [getattr(runner, name, lambda: 0)() for name in
++            ("_running_agent_count", "_active_api_run_count", "_active_deferred_agent_worker_count")]
++
++
+ def _unpreservable_work(runner, managed: int, cron: int) -> str:
+     """Name the work a checkpoint cannot carry, by kind (and session for chat turns), for the refusal
+     reason the updater prints. Best effort: the count check itself already decided."""
+@@ -107,7 +118,9 @@ def _unpreservable_work(runner, managed: int, cron: int) -> str:
+         total = int(runner._active_work_count())
+     except Exception:  # health: allow BLE001 -- see above
+         total = -1
+-    if (other := total - managed - cron - named) > 0:
++    # Cut cron turns in the chat bucket were already subtracted in ``cron``.
++    overlap = min(cron, cron_chat_count(runner))
++    if (other := total - managed - cron - named + overlap) > 0:
+         parts.append(f"{other} other unit{'s' if other != 1 else ''} (an unmapped turn, a side agent or "
+                      "a managed turn that is not a Kanban card)")
+     summary = "; ".join(parts) or "work the gateway cannot classify"
+diff --git a/tests/gateway/test_update_checkpoint_census_agreement.py b/tests/gateway/test_update_checkpoint_census_agreement.py
+index 9575488507..fffa4653ee 100644
+--- a/tests/gateway/test_update_checkpoint_census_agreement.py
++++ b/tests/gateway/test_update_checkpoint_census_agreement.py
+@@ -1,11 +1,11 @@
+ """The ``active-work`` census and the instant-update checkpoint agree on what the checkpoint preserves.
+ 
+-example-host 2026-11-12 18:11Z: at the instant cap hermes-sync's census read ``active=7 units=7
+-(cron,managed)``, found no unpreservable kind and launched the update; 9 s later the gateway refused the
+-checkpoint (``preservable managed=3, cron=3``). Three units were Kanban cards and three were cron runs; the
+-seventh was an executing session outside ``_running_agents`` (a turn before its agent is mapped), which
+-``_describe_active_work`` lists as a sessionless ``managed`` unit while ``kanban_managed_count`` (rightly)
+-does not preserve it. Once its agent was mapped it became the "1 chat turn" the refusal named.
++Synthetic accounting scenario consistent with hermes-hub's 2026-11-12 18:11Z logs: the census read
++``active=7 units=7 (cron,managed)``; nine seconds later a checkpoint refused with
++``preservable managed=3, cron=3`` and a named chat. Those aggregate snapshots do not prove continuity
++of the seventh unit. This fixture demonstrates one possible representation gap: an executing session
++outside ``_running_agents`` is listed as sessionless ``managed`` but is not a preservable card.
++Mapping that synthetic session then makes it a named chat; this is not a historical identity claim.
+ 
+ Real ``GatewayRunner`` accounting (``_describe_active_work``, ``_active_work_count``, the legacy
+ ``_running_agents`` view, ``uncounted_runtime_work``, ``kanban_managed_count``, ``cron_turn_count``) over
+@@ -43,7 +43,7 @@ def _card_worker(pid):
+ 
+ @pytest.fixture
+ def hub(tmp_path, monkeypatch):
+-    """The 18:11:25Z gateway: 3 Kanban card workers, 3 cron runs, 1 executing turn not yet mapped."""
++    """Synthetic gateway: 3 Kanban card workers, 3 cron runs, 1 executing turn not yet mapped."""
+     from cron import scheduler
+     from gateway import update_checkpoint as checkpoint
+     monkeypatch.setattr(session_policy, "policy_for_source",
+@@ -91,10 +91,11 @@ def ask_checkpoint(hub):
+ def test_the_census_at_the_cap_reports_the_unit_the_checkpoint_refuses(hub):
+     answer = census(hub.runner)
+     kinds = sorted({unit["kind"] for unit in answer["active_work"]})
+-    # What hermes-sync logged: kinds alone show nothing the checkpoint refuses...
++    # The same aggregate shape as the log: kinds alone show nothing the checkpoint refuses...
+     assert answer["active_agents"] == len(answer["active_work"]) == 7 and kinds == ["cron", "managed"]
+     # ...but the census now carries the checkpoint's own verdict on the same work.
+-    assert answer["checkpoint"] == {"active": 7, "preservable_managed": 3, "cron": 3, "preservable": False}
++    assert answer["checkpoint"] == {"active": 7, "preservable_managed": 3, "cron": 3,
++                                    "unlisted": 1, "preservable": False}
+     refused = ask_checkpoint(hub)
+     assert refused["busy"] and not refused.get("pausing")
+     hub.runner.request_restart.assert_not_called()
+@@ -104,8 +105,8 @@ def test_the_census_at_the_cap_reports_the_unit_the_checkpoint_refuses(hub):
+ 
+ 
+ def test_once_mapped_the_same_turn_is_a_named_chat_turn_in_both(hub):
+-    """9 s later the turn's agent was mapped: census shows a chat unit, the refusal names its session key
+-    (the live ``_running_agents`` is a SessionFieldView, not a dict, so the key used to be dropped)."""
++    """A possible mapping transition: census and refusal name the synthetic session's chat turn.
++    The live ``_running_agents`` is a SessionFieldView, not a dict."""
+     hub.runner._running_agents["agent:main:local:dm:local-dcf9"] = SimpleNamespace()
+     answer = census(hub.runner)
+     assert [u["session"] for u in answer["active_work"] if u["kind"] == "chat"] == ["agent:main:local:dm:local-dcf9"]
+@@ -118,7 +119,8 @@ def test_cards_and_cut_cron_alone_are_preservable_in_both(hub):
+     authority = hub.runner.session_authorities[0]
+     del authority.sessions["local-dcf9"]
+     answer = census(hub.runner)
+-    assert answer["checkpoint"] == {"active": 6, "preservable_managed": 3, "cron": 3, "preservable": True}
++    assert answer["checkpoint"] == {"active": 6, "preservable_managed": 3, "cron": 3,
++                                    "unlisted": 0, "preservable": True}
+     assert ask_checkpoint(hub)["pausing"] is True
+ 
+ 
+@@ -132,6 +134,35 @@ def test_a_managed_turn_that_is_not_a_card_is_unpreservable_in_both(hub):
+     assert "1 other unit" in ask_checkpoint(hub)["reason"]
+ 
+ 
++@pytest.mark.parametrize("mapped", [False, True])
++def test_cut_cron_turn_does_not_mask_hidden_noncard(hub, monkeypatch, mapped):
++    from cron import scheduler
++    authority = hub.runner.session_authorities[0]
++    authority.sessions.clear()
++    authority._managed_workers.clear()
++    authority.sessions["cron_j"] = _live("cron_j", "cron")
++    authority.sessions["hidden"] = _live("hidden", "gui")
++    authority._managed_workers["hidden"] = _card_worker(1001)
++    authority._managed_workers["hidden"].kanban_card = False
++    monkeypatch.setattr(scheduler, "get_running_job_ids", lambda: frozenset({"j"}))
++    monkeypatch.setattr(scheduler, "get_running_job_details", lambda: [
++        {"job_id": "j", "elapsed_s": 60.0, "worker_pid": None, "restart_safe": False}])
++    if mapped:
++        hub.runner._running_agents["cron_j"] = SimpleNamespace()
++    answer = census(hub.runner)
++    assert answer["checkpoint"]["active"] == 3
++    assert answer["checkpoint"]["cron"] == 2
++    refused = ask_checkpoint(hub)
++    assert refused["busy"] and "1 other unit" in refused["reason"]
++    assert answer["checkpoint"]["unlisted"] == 1
++    hub.runner.request_restart.assert_not_called()
++    hub.checkpoint.preserve_cron_slots.assert_not_called()
++    # Without cron cutting, the mapped chat remains named but the cron job is also unlisted.
++    uncut = hub.checkpoint.checkpoint_work(hub.runner, cron_cut=False)
++    assert uncut["unlisted"] == (2 if mapped else 3)
++    assert uncut["preservable"] is False
++
++
+ def test_an_unreadable_verdict_is_omitted_not_reported_preservable(hub, monkeypatch):
+     monkeypatch.setattr(hub.checkpoint, "kanban_managed_count", Mock(side_effect=RuntimeError("boom")))
+     answer = census(hub.runner)
+-- 
+2.51.0
+

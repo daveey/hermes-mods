@@ -1,0 +1,183 @@
+From 88b1c127db9cef92d2d90238dc529900524a1b3b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 22:49:15 -0800
+Subject: [PATCH] [daveey] Start the mini's macOS state lane for hermes_state's
+ load-time imports
+
+hermes_state* imports 17 first-party modules at load time (hermes_constants,
+hermes_cli/timefmt, hermes_startup_watchdog, agent/context_compressor, ...).
+A change to one alone did not select the PR lane, though a break there fails
+`import hermes_state` on the mini (#1538 review notes 4/5).
+
+classify_changes.HERMES_STATE_IMPORTS lists them and joins _HERMES_STATE_PATHS.
+The new tests/ci/test_macos_state_import_surface.py reads the imports from the
+source with ast (module level, try/else/class bodies; not function-local imports
+or `if TYPE_CHECKING:`) and fails until the list equals them, so a new import
+must be added and a dropped one removed. Their own imports stay out: the
+transitive closure is 182 files and would start the lane on far more PRs; the
+4-hourly schedule (now carded on failure by ci_main_watch) covers main for the
+rest.
+
+Main pushes no longer start the standalone lane (e1ebb6dc94), so no workflow
+push.paths change is needed; this only widens PR selection.
+
+RED (constant empty, no routing): 18 failed (17 modules + exact-list test).
+GREEN: CI-routing tests pass. Mutants caught: drop a module from the classifier,
+or add a new import to hermes_state.py.
+
+Card: t_01a1d05e8be13a6a
+---
+ scripts/ci/classify_changes.py              |  28 +++++-
+ tests/ci/test_macos_state_import_surface.py | 101 ++++++++++++++++++++
+ 2 files changed, 127 insertions(+), 2 deletions(-)
+ create mode 100644 tests/ci/test_macos_state_import_surface.py
+
+diff --git a/scripts/ci/classify_changes.py b/scripts/ci/classify_changes.py
+index 20b0023b1d..5164cb95d1 100644
+--- a/scripts/ci/classify_changes.py
++++ b/scripts/ci/classify_changes.py
+@@ -281,8 +281,32 @@ _PY_TEST_HARNESS = (
+ )
+ # The macOS state lane (hermes-state-macos.yml runs tests/hermes_state/ on the mini):
+ # hermes_state.py and every hermes_state_* sibling, their tests, the shared pytest harness
+-# that runs them, and the dependency manifests they import through.
+-_HERMES_STATE_PATHS = ("hermes_state", "tests/hermes_state/", *_PY_TEST_HARNESS, *_DEP_MANIFESTS)
++# that runs them, the dependency manifests they import through, and the first-party
++# modules hermes_state* imports at load time (a break there fails ``import hermes_state``).
++# tests/ci/test_macos_state_import_surface.py reads those imports from the source and
++# fails until this list equals them; lazy imports and their own imports are left out.
++HERMES_STATE_IMPORTS = (
++    "agent/__init__.py",
++    "agent/compaction_display.py",
++    "agent/context_compressor.py",
++    "agent/conversation_compression_archive.py",
++    "agent/memory_context.py",
++    "agent/message_metadata.py",
++    "agent/message_sanitization.py",
++    "agent/model_routing_switch_intent.py",
++    "agent/session_activity.py",
++    "agent/skill_commands.py",
++    "hermes_cli/__init__.py",
++    "hermes_cli/sqlite_runtime.py",
++    "hermes_cli/timefmt.py",
++    "hermes_constants.py",
++    "hermes_dir_acl.py",
++    "hermes_startup_watchdog.py",
++    "utils.py",
++)
++_HERMES_STATE_PATHS = (
++    "hermes_state", "tests/hermes_state/", *_PY_TEST_HARNESS, *_DEP_MANIFESTS, *HERMES_STATE_IMPORTS,
++)
+ # The native memory lane (native-memory-macos.yml): the Darwin memory reader, its one
+ # caller, their macOS-only tests and the lane's own wiring. Exact files, kept equal to the
+ # standalone workflow's ``push.paths`` by tests/ci/test_native_memory_gate.py.
+diff --git a/tests/ci/test_macos_state_import_surface.py b/tests/ci/test_macos_state_import_surface.py
+new file mode 100644
+index 0000000000..8050376238
+--- /dev/null
++++ b/tests/ci/test_macos_state_import_surface.py
+@@ -0,0 +1,101 @@
++"""The macOS state lane starts for every first-party module hermes_state* imports at load time.
++
++A break in such a module fails ``import hermes_state`` on the mini, yet a change to it
++alone did not select the PR lane (#1538 review notes 4 and 5). The
++surface is exactly the import-time imports, read from the source: function-local
++(lazy) imports and ``if TYPE_CHECKING:`` blocks are left out, and so are the
++imports of those modules (the 4-hourly schedule tests main for the rest).
++"""
++import ast
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from scripts.ci.classify_changes import HERMES_STATE_IMPORTS, classify
++
++ROOT = Path(__file__).resolve().parents[2]
++
++
++def _module_files(root, dotted):
++    """Repo files Python executes for ``import <dotted>``: each package __init__, then the module."""
++    parts, out = dotted.split('.'), []
++    for i in range(1, len(parts) + 1):
++        base = root.joinpath(*parts[:i])
++        if (base / '__init__.py').is_file():
++            out.append(base / '__init__.py')
++        elif i == len(parts) and base.with_suffix('.py').is_file():
++            out.append(base.with_suffix('.py'))
++        elif not base.is_dir():
++            return out if i > 1 else []  # an attribute of the module above, or not first-party
++    return out
++
++
++def _load_time_import_nodes(tree):
++    stack = list(tree.body)
++    while stack:
++        node = stack.pop()
++        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
++            continue
++        if isinstance(node, ast.If) and 'TYPE_CHECKING' in ast.unparse(node.test):
++            stack.extend(node.orelse)
++            continue
++        if isinstance(node, (ast.Import, ast.ImportFrom)):
++            yield node
++            continue
++        for child in ast.iter_child_nodes(node):
++            if isinstance(child, (ast.stmt, ast.excepthandler)):
++                stack.append(child)
++
++
++def load_time_imports(root, path):
++    """First-party files executed when ``path`` (a top-level module) is imported."""
++    tree = ast.parse(path.read_text(encoding='utf-8'), str(path))
++    package = list(path.relative_to(root).parent.parts)
++    files = set()
++    for node in _load_time_import_nodes(tree):
++        if isinstance(node, ast.Import):
++            names = [alias.name for alias in node.names]
++        else:
++            module = node.module
++            if node.level:
++                module = '.'.join(package[:len(package) - node.level + 1] + ([module] if module else []))
++            names = [module] + [f'{module}.{alias.name}' for alias in node.names if alias.name != '*']
++        for name in filter(None, names):
++            files.update(_module_files(root, name))
++    return {f.relative_to(root).as_posix() for f in files}
++
++
++def state_import_surface(root):
++    tracked = subprocess.run(['git', 'ls-files', '-z', '--', 'hermes_state*.py', 'hermes_state*/**.py'],
++                             cwd=root, capture_output=True, text=True, check=True, timeout=60)
++    seeds = [root / f for f in tracked.stdout.split('\0') if f]
++    assert seeds, 'no hermes_state* modules found'
++    found = set().union(*(load_time_imports(root, seed) for seed in seeds))
++    return sorted(f for f in found if not f.startswith('hermes_state'))
++
++
++def test_scanner_reads_only_load_time_first_party_imports(tmp_path):
++    for rel in ('pkg/__init__.py', 'pkg/sub.py', 'pkg/lazy.py', 'pkg/typed.py', 'top.py', 'guarded.py',
++                'fallback.py', 'other.py'):
++        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
++        (tmp_path / rel).write_text('')
++    seed = tmp_path / 'hermes_state_x.py'
++    seed.write_text(
++        'import os\nfrom typing import TYPE_CHECKING\nimport top\nfrom pkg import sub, NAME\n'
++        'if TYPE_CHECKING:\n    from pkg import typed\nelse:\n    import other\n'
++        'try:\n    import guarded\nexcept ImportError:\n    import fallback\n'
++        'def f():\n    from pkg import lazy\n'
++        'class C:\n    import top as again\n')
++    assert load_time_imports(tmp_path, seed) == {
++        'top.py', 'pkg/__init__.py', 'pkg/sub.py', 'other.py', 'guarded.py', 'fallback.py'}
++
++
++def test_surface_lists_exactly_hermes_states_load_time_imports():
++    # New import -> add it; dropped import -> remove it. Keeps the lane narrow and complete.
++    assert sorted(HERMES_STATE_IMPORTS) == state_import_surface(ROOT)
++
++
++@pytest.mark.parametrize('path', state_import_surface(ROOT))
++def test_each_import_starts_lane_on_pr(path):
++    assert classify([path])['hermes_state'], path
+-- 
+2.51.0
+

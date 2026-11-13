@@ -1,0 +1,464 @@
+From a265779ae69281209b36d10ced77463dfece1ab9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 00:52:32 +0000
+Subject: [PATCH] [daveey] Pass input_origin to pre_llm_call
+ (agent/human/unknown per client submit)
+
+The coach complaint lane filed defects from agent-driven Desktop proof chats:
+no signal told a pre_llm_call plugin whether a person or an agent script
+(/api/ws?client=agent) wrote the turn.
+
+- tui_gateway/human_input.input_origin(rid, params, text, *, transport, session)
+  classifies a client prompt.submit: 'agent' (agent transport, agent_created or
+  pending_hidden session, _turn_author/_hosted_* params, hidden widget intent,
+  cross-session header), 'human' (is_human_typed_submit), else ''. note_submit
+  reuses it and returns it; it still stamps only human submits.
+- prompt.submit stashes the origin on the claimed session; _run_after_agent_ready
+  consumes it and passes it to _run_prompt_submit, which sets agent._input_origin
+  on EVERY turn (injected turns: Kanban notices, auto-continue, queued drains,
+  prompt.admit -> ''). Faked helper signatures (_dispatch_admitted_prompt,
+  _run_after_agent_ready) are unchanged.
+- agent/turn_context passes input_origin=getattr(agent, '_input_origin', '') or ''
+  to pre_llm_call (signature-filtered dispatch: narrow callbacks unaffected).
+  CLI/gateway platforms leave it ''.
+
+Proof: RED on origin/main (23 failed: no input_origin attr / hook kwarg KeyError /
+turns ran with origin unset); GREEN 99 tests; 109 files importing the touched
+seams 3436 passed; 15/15 mutants killed; scripts/check --base origin/main ok.
+---
+ agent/turn_context.py                     |   2 +
+ tests/agent/test_turn_context.py          |  19 ++
+ tests/tui_gateway/test_human_input.py     | 231 ++++++++++++++++++++++
+ tui_gateway/human_input.py                |  47 +++--
+ tui_gateway/methods_prompt.py             |   7 +-
+ tui_gateway/methods_prompt_admission.py   |   1 +
+ tui_gateway/prompt_turn.py                |   5 +-
+ website/docs/user-guide/features/hooks.md |   2 +-
+ 8 files changed, 295 insertions(+), 19 deletions(-)
+ create mode 100644 tests/tui_gateway/test_human_input.py
+
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index b0f0003298..8ab3f47388 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -970,6 +970,8 @@ def _collect_pre_llm_call_context(
+             platform=getattr(agent, "platform", None) or "",
+             parent_session_id=getattr(agent, "_parent_session_id", None) or "",
+             sender_id=getattr(agent, "_user_id", None) or "",
++            # [daveey] "agent" / "human" / "" (unknown) from tui_gateway/human_input.py
++            input_origin=getattr(agent, "_input_origin", "") or "",
+         )
+         try:
+             # Spill oversized per-hook context to disk so a runaway plugin can't inflate every subsequent
+diff --git a/tests/agent/test_turn_context.py b/tests/agent/test_turn_context.py
+index d9b14ca0cb..30239fb21f 100644
+--- a/tests/agent/test_turn_context.py
++++ b/tests/agent/test_turn_context.py
+@@ -772,3 +772,22 @@ def test_prologue_forwards_the_submit_title_preview_to_the_titler():
+               "display_metadata": {"title_preview": "Pasted 5000 chars"}}],
+         )
+     assert titler.call_args.kwargs["title_preview"] == "Pasted 5000 chars"
++
++
++@pytest.mark.parametrize("origin,expected", [("agent", "agent"), ("human", "human"), (None, ""), ("<unset>", "")])
++def test_pre_llm_call_receives_the_turn_input_origin(monkeypatch, tmp_path, origin, expected):
++    """``prompt.submit`` stamps ``agent._input_origin``; ``pre_llm_call`` plugins read it as ``input_origin``
++    ("" when unknown: injected turns, CLI and gateway platforms). [daveey]"""
++    from types import SimpleNamespace
++    from agent.turn_context import _collect_pre_llm_call_context
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    calls = []
++    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda name, **kw: calls.append((name, kw)) or [])
++    agent = SimpleNamespace(session_id="s", model="m", _current_turn_id="t")
++    if origin != "<unset>":
++        agent._input_origin = origin
++    rows = [{"role": "user", "content": "hi"}]
++    _collect_pre_llm_call_context(agent, effective_task_id="task", turn_id="turn", original_user_message="hi",
++                                  messages=rows, conversation_history=[], current_turn_user_idx=0)
++    assert [(name, kw["input_origin"]) for name, kw in calls] == [("pre_llm_call", expected)]
+diff --git a/tests/tui_gateway/test_human_input.py b/tests/tui_gateway/test_human_input.py
+new file mode 100644
+index 0000000000..4aca4cd204
+--- /dev/null
++++ b/tests/tui_gateway/test_human_input.py
+@@ -0,0 +1,231 @@
++"""Who wrote this turn? ``prompt.submit`` stamps ``agent._input_origin`` for ``pre_llm_call`` plugins. [daveey]
++
++The coach complaint lane (hermes-mods) filed defects from agent-driven Desktop proof chats: an agent script
++dialing ``/api/ws?client=agent`` reads to a plugin exactly like David typing. ``human_input.input_origin``
++classifies each client submit as ``"agent"``, ``"human"`` or ``""`` (unknown), ``prompt.submit`` carries it to
++the turn, and ``_collect_pre_llm_call_context`` passes it as the ``input_origin`` hook kwarg. Injected turns
++(Kanban notices, auto-continue) run ``_run_prompt_submit`` directly and carry ``""``.
++"""
++
++from __future__ import annotations
++
++import threading
++import types
++
++import pytest
++
++from tests.tui_gateway import test_prompt_admission as admission_tests
++from tui_gateway import human_input, server
++
++
++class _Transport:
++    """A stub WS transport (hashable: a session keys its viewers by transport)."""
++
++    auth_identity = None
++    _peer = "t"
++
++    def __init__(self, client_kind=None):
++        self.client_kind = client_kind
++
++    def write(self, obj):
++        return True
++
++    def close(self):
++        return None
++
++
++def _transport(client_kind=None):
++    return _Transport(client_kind)
++
++
++def _bound(client_kind=None):
++    from tui_gateway.transport import bind_transport
++
++    return bind_transport(_transport(client_kind))
++
++
++# ── the classifier ───────────────────────────────────────────────────────────────────────────────────────
++
++
++def test_input_origin_human_for_a_typed_desktop_submit():
++    assert human_input.input_origin("r", {"text": "hi"}, "hi") == "human"
++    assert human_input.input_origin("r", {"text": "hi"}, "hi", session={"agent_created": False}) == "human"
++
++
++def test_input_origin_agent_for_an_agent_transport():
++    from tui_gateway.transport import reset_transport
++
++    assert human_input.input_origin("r", {}, "hi", transport=_transport("agent")) == "agent"
++    token = _bound("agent")
++    try:
++        assert human_input.input_origin("r", {}, "hi") == "agent", "defaults to the bound transport"
++    finally:
++        reset_transport(token)
++    assert human_input.input_origin("r", {}, "hi", transport=_transport("renderer")) == "human"
++
++
++@pytest.mark.parametrize("session", [{"agent_created": True}, {"pending_hidden": True}])
++def test_input_origin_agent_for_agent_created_or_hidden_sessions(session):
++    assert human_input.input_origin("r", {}, "hi", session=session) == "agent"
++
++
++@pytest.mark.parametrize("params", [
++    {"_turn_author": object()}, {"_hosted_task": {}}, {"_hosted_terminal_callback": print},
++    {"display_kind": "hidden"}])
++def test_input_origin_agent_for_relayed_hosted_and_hidden_submits(params):
++    assert human_input.input_origin("r", params, "hi") == "agent"
++
++
++def test_input_origin_agent_for_a_cross_session_send():
++    text = human_input.CROSS_SESSION_HEADER + ' "planner" (@session:default/abc)]\n\nplease check X'
++    assert human_input.input_origin("r", {}, "  " + text) == "agent"
++
++
++@pytest.mark.parametrize("rid,params,text", [
++    (None, {}, "start chat"),  # start_chat's in-process submit
++    (None, {"display_kind": "hidden"}, "widget"),  # in-process: unknown, whatever its params
++    ("r", {}, "   "),
++    ("r", {}, None),
++    ("r", None, "hi"),
++])
++def test_input_origin_unknown_otherwise(rid, params, text):
++    assert human_input.input_origin(rid, params, text) == ""
++
++
++def test_input_origin_never_raises(monkeypatch):
++    import tui_gateway.transport as transport_mod
++
++    def boom(t):
++        raise RuntimeError("broken transport")
++
++    monkeypatch.setattr(transport_mod, "is_agent_transport", boom)
++    assert human_input.input_origin("r", {}, "hi", transport=_transport()) == ""
++
++
++def test_note_submit_returns_the_origin_and_stamps_only_humans(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    stamps = []
++    monkeypatch.setattr(human_input, "record_human_input", lambda sid="", home=None: stamps.append(sid))
++    assert human_input.note_submit("r", {"session_id": "a"}, "hi", transport=_transport("agent")) == "agent"
++    assert human_input.note_submit("r", {"session_id": "b"}, "hi", session={"pending_hidden": True}) == "agent"
++    assert human_input.note_submit(None, {"session_id": "c"}, "hi") == ""
++    assert human_input.note_submit("r", {"session_id": "d"}, "hi", transport=_transport()) == "human"
++    assert stamps == ["d"]
++
++
++# ── prompt.submit carries the origin onto the agent for the turn ─────────────────────────────────────────
++
++
++class _InlineThread:
++    def __init__(self, target=None, daemon=None, args=(), kwargs=None, name=None):
++        self._target, self._args, self._kwargs = target, args, kwargs or {}
++
++    def start(self):
++        if self._target is not None:
++            self._target(*self._args, **self._kwargs)
++
++    def is_alive(self):
++        return False
++
++    def join(self, timeout=None):
++        return None
++
++
++def _session(agent, **extra):
++    ready = threading.Event()
++    ready.set()
++    return {"agent": agent, "agent_ready": ready, "agent_error": None, "session_key": "session-key",
++            "history": [], "history_lock": threading.Lock(), "history_version": 0, "running": False,
++            "attached_images": [], "image_counter": 0, "cols": 80, "slash_worker": None, "show_reasoning": False,
++            "tool_progress_mode": "all", "inflight_turn": None, "transport": None, **extra}
++
++
++@pytest.fixture()
++def turn_env(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr(server, "_hermes_home", tmp_path)
++    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
++    from hermes_cli import kanban_session_activity as activity
++    monkeypatch.setattr(activity, "_refresh_links_in_background", lambda scope: None)
++    for name in ("_emit", "_wire_callbacks", "_sync_agent_model_with_config", "_register_session_cwd",
++                 "_tts_stream_begin", "_sync_session_key_after_compress"):
++        monkeypatch.setattr(server, name, lambda *a, **k: None)
++    monkeypatch.setattr(server, "_session_cwd", lambda session: str(tmp_path))
++    monkeypatch.setattr(server, "_get_usage", lambda agent: {})
++    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda sid, session: None)
++    monkeypatch.setattr(server, "_persist_session_row_for_submit", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_restart_completed_failed_agent_build", lambda *a, **k: True)
++    monkeypatch.setattr(server, "_start_session_work", lambda fn, **kw: fn())
++    seen: list = []
++
++    def make_agent():
++        agent = types.SimpleNamespace(session_id="session-key", clear_interrupt=lambda: None)
++        agent.run_conversation = lambda message, **kw: (
++            seen.append(getattr(agent, "_input_origin", "<unset>")) or {"final_response": "ok"})
++        return agent
++
++    return make_agent, seen
++
++
++def _submit_on(client_kind, session, text="prove the fix"):
++    from tui_gateway.transport import reset_transport
++
++    server._sessions["origin-sid"] = session
++    token = _bound(client_kind)
++    try:
++        return server._methods["prompt.submit"]("r1", {"session_id": "origin-sid", "text": text})
++    finally:
++        reset_transport(token)
++        server._sessions.pop("origin-sid", None)
++
++
++def test_prompt_submit_over_an_agent_transport_runs_with_origin_agent(turn_env):
++    make_agent, seen = turn_env
++    resp = _submit_on("agent", _session(make_agent()))
++    assert resp.get("result", {}).get("status") == "streaming", resp
++    assert seen == ["agent"]
++
++
++def test_prompt_submit_into_an_agent_created_session_runs_with_origin_agent(turn_env):
++    make_agent, seen = turn_env
++    _submit_on(None, _session(make_agent(), agent_created=True))
++    assert seen == ["agent"]
++
++
++def test_prompt_submit_typed_on_desktop_runs_with_origin_human(turn_env):
++    make_agent, seen = turn_env
++    _submit_on(None, _session(make_agent()))
++    assert seen == ["human"]
++
++
++def test_injected_turn_resets_a_previous_origin(turn_env):
++    make_agent, seen = turn_env
++    agent = make_agent()
++    session = _session(agent)
++    _submit_on(None, session)
++    session["running"] = True
++    server._run_prompt_submit("rid", "origin-sid", session, "[injected] card done", display_kind="kanban_notice")
++    assert seen == ["human", ""], "an injected turn must not inherit the last typed turn's origin"
++
++
++def test_prompt_submit_consumes_the_stashed_origin(turn_env):
++    make_agent, seen = turn_env
++    session = _session(make_agent())
++    _submit_on("agent", session)
++    assert seen == ["agent"] and "_submit_input_origin" not in session, "read once, never left for a later turn"
++
++
++# ── prompt.admit (in-process owner services) never inherits a client submit's origin ─────────────────────
++
++owner = admission_tests.owner
++
++
++def test_admitted_prompt_drops_a_stale_client_origin(owner, monkeypatch):
++    _db, session, params, started = owner
++    session["_submit_input_origin"] = "human"  # e.g. left by a client turn whose dispatch never started
++    assert "result" in admission_tests.call("prompt.admit", params)
++    seen = []
++    monkeypatch.setattr(server, "_run_after_agent_ready",
++                        lambda *a, **kw: seen.append(session.get("_submit_input_origin", "")))
++    started[0]()
++    assert seen == [""]
+diff --git a/tui_gateway/human_input.py b/tui_gateway/human_input.py
+index db74105712..ce7a723a46 100644
+--- a/tui_gateway/human_input.py
++++ b/tui_gateway/human_input.py
+@@ -67,21 +67,38 @@ def record_human_input(session_id: str = "", home: Path | None = None) -> None:
+         logger.debug("could not record the last human input", exc_info=True)
+ 
+ 
+-def note_submit(rid, params: dict, text, *, transport=None, session: dict | None = None) -> None:
+-    """Record ``prompt.submit`` when a human typed it. Never raises.
++def input_origin(rid, params, text, *, transport=None, session: dict | None = None) -> str:
++    """Who wrote this client ``prompt.submit``: ``"agent"``, ``"human"`` or ``""`` (unknown). Never raises.
+ 
+-    Agent traffic never stamps: a submit over a websocket opened with ``/api/ws?client=agent`` (*transport*,
+-    default the bound one), or into a session such a connection created (*session* ``agent_created``)."""
++    ``"agent"``: a websocket opened with ``/api/ws?client=agent`` (*transport*, default the bound one), a session
++    such a connection created or a hidden (bot plumbing) one (*session*), a relayed/hosted turn, a hidden widget
++    intent, or a cross-session send. ``"human"``: :func:`is_human_typed_submit`. ``pre_llm_call`` plugins read it
++    as ``input_origin`` (agent/turn_context.py); injected turns never reach here and stay ``""``."""
+     try:
+-        if transport is None:
+-            from tui_gateway.transport import current_transport
+-
+-            transport = current_transport()
+-        from tui_gateway.transport import is_agent_transport
++        from tui_gateway.transport import current_transport, is_agent_transport
++
++        if is_agent_transport(current_transport() if transport is None else transport):
++            return "agent"
++        if isinstance(session, dict) and (session.get("agent_created") or session.get("pending_hidden")):
++            return "agent"
++        if rid is None or not isinstance(params, dict):
++            return ""
++        if any(params.get(k) is not None for k in _INTERNAL_PARAMS) or params.get("display_kind") == "hidden":
++            return "agent"
++        if isinstance(text, str) and text.lstrip().startswith(CROSS_SESSION_HEADER):
++            return "agent"
++        return "human" if is_human_typed_submit(rid, params, text) else ""
++    except Exception:  # health: allow BLE001 -- a classification must never fail a prompt
++        logger.debug("input-origin check failed", exc_info=True)
++        return ""
++
++
++def note_submit(rid, params: dict, text, *, transport=None, session: dict | None = None) -> str:
++    """Record ``prompt.submit`` when a human typed it; return its :func:`input_origin`. Never raises.
+ 
+-        if is_agent_transport(transport) or (isinstance(session, dict) and session.get("agent_created")):
+-            return
+-        if is_human_typed_submit(rid, params, text):
+-            record_human_input(str(params.get("session_id") or ""))
+-    except Exception:  # health: allow BLE001 -- a stamp must never fail a prompt
+-        logger.debug("human-input check failed", exc_info=True)
++    Agent traffic never stamps: a submit over a websocket opened with ``/api/ws?client=agent`` (*transport*,
++    default the bound one), or into a session such a connection created (*session* ``agent_created``)."""
++    origin = input_origin(rid, params, text, transport=transport, session=session)
++    if origin == "human":
++        record_human_input(str(params.get("session_id") or ""))
++    return origin
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index a7bb6d3cf8..67bca62cad 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -707,6 +707,7 @@ def _run_after_agent_ready(
+     # The wait delivers the prompt when the still-running build completes, honors a cancel promptly, notices
+     # the user once past the slow threshold, and only errors when the build itself fails or the bounded cap
+     # expires. See #63078.
++    input_origin = session.pop("_submit_input_origin", "")  # [daveey] set by prompt.submit for this turn
+     err = _wait_agent_for_prompt(session, rid, sid)
+     from tui_gateway.turn_admission import owns
+     with session["history_lock"]:
+@@ -751,7 +752,7 @@ def _run_after_agent_ready(
+     _run_prompt_submit(
+         rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata,
+         image_paths=hosted_images, terminal_callback=hosted_terminal_callback, turn_author=turn_author,
+-        auto_continue=auto_continue)
++        auto_continue=auto_continue, input_origin=input_origin)
+ 
+ 
+ _TRUNCATION_PARAMS = (
+@@ -897,7 +898,7 @@ def _(rid, params: dict) -> dict:
+     # [daveey] Stamp the last human-typed prompt (local and desktop-ssh clients) before any refusal: hermes-sync
+     # opens core-update drain windows only while the user is away (tui_gateway/human_input.py).
+     from tui_gateway.human_input import note_submit
+-    note_submit(rid, params, raw_text, session=_sessions.get(sid) if isinstance(sid, str) else None)
++    input_origin = note_submit(rid, params, raw_text, session=_sessions.get(sid) if isinstance(sid, str) else None)
+     if (stopped := _typed_stop_phrase_response(rid, text, sid)) is not None:
+         return stopped
+     if params.get("interrupted"):
+@@ -994,6 +995,8 @@ def _(rid, params: dict) -> dict:
+         if busy_response is not None:
+             return busy_response
+     from tui_gateway.turn_admission import stage
++    # [daveey] The claimed turn's pre_llm_call input_origin; _run_after_agent_ready consumes it.
++    session["_submit_input_origin"] = input_origin
+     with stage(session):
+         return _dispatch_admitted_prompt(rid, sid, session, text, turn_isolation, turn_author,
+             display_kind, display_metadata, survivor_fields, hosted_terminal_callback, hosted_images)
+diff --git a/tui_gateway/methods_prompt_admission.py b/tui_gateway/methods_prompt_admission.py
+index 24334efc12..9c5b107553 100644
+--- a/tui_gateway/methods_prompt_admission.py
++++ b/tui_gateway/methods_prompt_admission.py
+@@ -129,6 +129,7 @@ def _dispatch(server, rid, sid, session, text, profile):
+         # next boot continues the decision instead of dropping it (self-heal desktop-3a6213ce74).
+         with session["history_lock"]:
+             session["_marker_until_tool"] = True
++            session.pop("_submit_input_origin", None)  # [daveey] never a prior client submit's origin
+         server._run_after_agent_ready(rid, sid, session, text, None, None, None, auto_continue=True)
+ 
+     worker = server._start_session_work(run, name="prompt-admission", session=session)
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index c92977543d..0c749104f0 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -1357,7 +1357,7 @@ def _run_admitted_prompt(
+     queued_prompt_generation: int | None = None,
+     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
+     turn_author: dict | None = None, auto_continue: bool = True,
+-    report_ownership_refusal: bool = True) -> bool:
++    report_ownership_refusal: bool = True, input_origin: str = "") -> bool:
+     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
+     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
+     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
+@@ -1375,6 +1375,9 @@ def _run_admitted_prompt(
+             settle(session)
+         return False
+     images, agent = admitted
++    # [daveey] pre_llm_call's input_origin (tui_gateway/human_input.py): set every turn, so an injected turn
++    # (Kanban notice, auto-continue, queued drain) reads "" instead of the last client submit's origin.
++    agent._input_origin = input_origin
+     from gateway.warning_notifications import diagnostic_turn_muted
+     from agent.notification_presentation import notification_config_snapshot
+     with _session_profile_runtime_scope(session):
+diff --git a/website/docs/user-guide/features/hooks.md b/website/docs/user-guide/features/hooks.md
+index aecd96f49f..c7b04f58db 100644
+--- a/website/docs/user-guide/features/hooks.md
++++ b/website/docs/user-guide/features/hooks.md
+@@ -458,7 +458,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
+ | `transform_tool_result` | Transform | After `post_tool_call`, before conversation append; first string replaces the result. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `conversation_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message` | Exposes the full model-bound result and arguments. |
+ | `transform_terminal_output` | Transform | After bounded foreground process capture, before final output limiting; first string replaces output. | `command`, `output`, `returncode`, `task_id`, `env_type` | Command/output may contain credentials. |
+ | `pre_transcription` | Transform | Fired by the STT dispatcher after provider resolution and before any backend (built-in, command-type, or plugin-registered) is invoked; dict results are applied in registration order, last-writer-wins per field (`prompt`, `language`, `model`; `file_path` is read-only). | `file_path`, `provider`, `model`, `language`, `prompt`, `source` | The final prompt is uploaded to the configured STT provider with the audio — keep secrets out of hook returns. |
+-| `pre_llm_call` | Directive/control | Once per turn before the loop; all valid string/`{"context": ...}` returns are joined and injected into the user message; the first valid `{"action": "block", "message": ...}` ends the turn before any inference request. | `session_id`, `task_id`, `turn_id`, `user_message`, `conversation_history`, `is_first_turn`, `model`, `platform`, `parent_session_id`, `sender_id` | Full user message and conversation history. |
++| `pre_llm_call` | Directive/control | Once per turn before the loop; all valid string/`{"context": ...}` returns are joined and injected into the user message; the first valid `{"action": "block", "message": ...}` ends the turn before any inference request. | `session_id`, `task_id`, `turn_id`, `user_message`, `conversation_history`, `is_first_turn`, `model`, `platform`, `parent_session_id`, `sender_id`, `input_origin` (`"agent"`, `"human"`, or `""` when unknown; set for Desktop/TUI client submits) | Full user message and conversation history. |
+ | `post_llm_call` | Observer | Successful, non-interrupted turn finalization; return ignored. | `session_id`, `task_id`, `turn_id`, `user_message`, `assistant_response`, `conversation_history`, `model`, `platform`, `side_question_token` | Full prompt, response, and history. |
+ | `transform_llm_output` | Transform | Before `post_llm_call` and final delivery; first non-empty string replaces the response. | `response_text`, `session_id`, `model`, `platform` | Full final assistant text. |
+ | `pre_verify` | Directive/control | At the bounded edited-code verify gate; first valid continue/block-stop directive keeps the turn going. | `session_id`, `platform`, `model`, `coding`, `attempt`, `final_response`, `changed_paths` | Draft response and changed paths. |
+-- 
+2.51.0
+

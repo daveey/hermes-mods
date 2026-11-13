@@ -1,0 +1,113 @@
+From 23488c64d5aad64d845a248a7ed2f19b073303d1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 03:36:03 +0000
+Subject: [PATCH] [daveey] fix(kanban): a mandatory-pin mark labels a pool card
+ whatever this process's sync mode
+
+kanban_mandatory_pin.mark() read runs_on (and so added capability:mandatory-model-pin) only when this
+process saw board_mode == 'primary'. A process without sync that writes to an attached board uploaded
+model_pin_mandatory=1 with a bare [pool:worker], so an old-core pool worker could lease it (review
+5879616348 on #1622, nit 2).
+
+mark() now reads runs_on whenever the column exists and takes "me" from the board file's own
+kanban_sync_state row, not from board_mode. The shared carry() gate always adds the label when runs_on
+has any pool:* label (fail closed); the machine:<me> exemption applies only without a pool label.
+
+Test: a synced board whose process forgets sync (board_mode 'off'), a [pool:worker] card, set-model
+--mandatory -> runs_on gains the label; a machine:<me> card stays unlabeled. RED on main (2 of 27),
+GREEN on head.
+---
+ hermes_cli/kanban_mandatory_pin.py            | 25 +++++++++++++++----
+ tests/hermes_cli/test_kanban_mandatory_pin.py | 20 +++++++++++++++
+ 2 files changed, 40 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_mandatory_pin.py b/hermes_cli/kanban_mandatory_pin.py
+index caffa8dec2..9f0b0dbe3f 100644
+--- a/hermes_cli/kanban_mandatory_pin.py
++++ b/hermes_cli/kanban_mandatory_pin.py
+@@ -73,12 +73,14 @@ def worker_first_refusal(item: Mapping[str, Any]) -> Optional[str]:
+ def carry(labels: list[str], item: Mapping[str, Any], *, me: str = "") -> list[str]:
+     """``labels`` (a new ``runs_on``) with :data:`LABEL` added when ``item`` has a mandatory pin, so a move keeps
+     the attestation (``[pool:worker]`` alone would let an old core lease it). Unchanged when every ``machine:``
+-    label names ``me``: this machine runs this core, which refuses a pin it cannot serve."""
++    label names ``me`` and no ``pool:`` label is present: this machine runs this core, which refuses a pin it
++    cannot serve. A ``pool:`` label always gets it (fail closed: the pool may hold an old core)."""
+     need = requirements(item)
+     if not need or need <= set(labels):
+         return list(labels)
+     machines = [label[8:] for label in labels if label.startswith("machine:")]
+-    if machines and me and all(name == me for name in machines):
++    pooled = any(label.startswith("pool:") for label in labels)
++    if not pooled and machines and me and all(name == me for name in machines):
+         return list(labels)
+     return sorted(set(labels) | need)
+ 
+@@ -105,11 +107,13 @@ def mark(conn: Any, task_id: str) -> bool:
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_db_sync as sync
+     from hermes_cli.kanban_db_connect import write_txn
+-    synced = "runs_on" in sync.table_columns(conn, "tasks") and sync.board_mode(conn) == "primary"
+-    me = str(sync._state(conn)["gateway_id"] or "") if synced else ""
++    # Read runs_on whatever this process's sync mode: a process without sync writing to an attached board must
++    # still label a pool card, or the Board would lease the mark to an old core (review 5879616348 on #1622).
++    placed = "runs_on" in sync.table_columns(conn, "tasks")
++    me = _gateway_id(conn) if placed else ""
+     fields: tuple[str, ...] = ("model_pin_mandatory",)
+     with write_txn(conn):
+-        row = conn.execute("SELECT status, model_override, " + ("runs_on" if synced else "NULL") +
++        row = conn.execute("SELECT status, model_override, " + ("runs_on" if placed else "NULL") +
+                            " FROM tasks WHERE id = ?", (task_id,)).fetchone()
+         if row is None:
+             return False
+@@ -136,6 +140,17 @@ def mark(conn: Any, task_id: str) -> bool:
+     return True
+ 
+ 
++def _gateway_id(conn: Any) -> str:
++    """The board file's own gateway id (``kanban_sync_state``), or "" when it was never attached. Read from the
++    file, not ``board_mode``: that answers ``off`` in a process that did not install sync."""
++    import sqlite3
++    try:
++        row = conn.execute("SELECT gateway_id FROM kanban_sync_state LIMIT 1").fetchone()
++    except sqlite3.Error:
++        return ""
++    return _str(row[0]) if row else ""
++
++
+ def refusal(card: Mapping[str, Any], *, me: str = "") -> Optional[str]:
+     """None when this machine can run ``card``'s mandatory pin exactly (or it has none), else why not.
+ 
+diff --git a/tests/hermes_cli/test_kanban_mandatory_pin.py b/tests/hermes_cli/test_kanban_mandatory_pin.py
+index 182917b141..9cf4b858ef 100644
+--- a/tests/hermes_cli/test_kanban_mandatory_pin.py
++++ b/tests/hermes_cli/test_kanban_mandatory_pin.py
+@@ -299,6 +299,26 @@ def test_carry_leaves_a_pin_to_this_machine_alone():
+     assert mp.carry([f"machine:{HUB}"], card, me=HUB) == [f"machine:{HUB}"]  # this core refuses what it can't serve
+     assert mp.carry([f"machine:{WORKER}"], card, me=HUB) == [mp.LABEL, f"machine:{WORKER}"]
+     assert mp.carry([POOL], {"model_override": "x"}, me=HUB) == [POOL]
++    # A pool label always takes the attestation, even beside this machine: the pool may hold an old core.
++    assert mp.carry([f"machine:{HUB}", POOL], card, me=HUB) == sorted([mp.LABEL, f"machine:{HUB}", POOL])
++
++
++def test_marking_labels_a_pool_card_in_a_process_without_sync(gws, monkeypatch):
++    # Review 5879616348 on #1622: a process that did not install sync (board_mode 'off') writing to an attached
++    # board used to skip runs_on, so the Board got model_pin_mandatory=1 without the label for an old core to lease.
++    from hermes_cli import kanban_pin_reroute as pr
++    hub, _ = gws
++    tid = _placed(hub)
++    mine = _placed(hub)
++    with kb.write_txn(hub.conn):
++        wn.set_runs_on(hub.conn, mine, [f"machine:{HUB}"])
++    monkeypatch.setattr(sync, "_SYNCED_PATHS", set())
++    assert sync.board_mode(hub.conn) == "off"
++    assert pr.set_pin_mandatory(hub.conn, tid, True)
++    assert _runs_on(hub.conn, tid) == sorted([POOL, mp.LABEL])
++    # The file's own gateway id still names this machine: a pin to it stays unlabeled.
++    assert pr.set_pin_mandatory(hub.conn, mine, True)
++    assert _runs_on(hub.conn, mine) == [f"machine:{HUB}"]
+ 
+ 
+ # --- review 5879416189: a later mark is fenced like a create-time one -------------------------------------------
+-- 
+2.51.0
+

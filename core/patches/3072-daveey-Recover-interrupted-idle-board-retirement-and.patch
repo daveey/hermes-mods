@@ -1,0 +1,487 @@
+From bc43061d5c7d60fc33fc20d7e80ad28397a5f05d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:00:11 +0000
+Subject: [PATCH] [daveey] Recover interrupted idle board retirement and bound
+ pressure contention
+
+---
+ docs/worker-compute-capacity.md               |  38 ++++++
+ hermes_cli/kanban_admission.py                |   6 +-
+ hermes_cli/worker_account_boards.py           |  16 ++-
+ hermes_cli/worker_board_retirement.py         | 105 ++++++++++++++
+ hermes_cli/worker_resource_admission.py       |  25 +++-
+ .../test_worker_resource_admission.py         |  54 ++++++++
+ .../test_worker_retirement_recovery.py        | 129 ++++++++++++++++++
+ 7 files changed, 366 insertions(+), 7 deletions(-)
+ create mode 100644 docs/worker-compute-capacity.md
+ create mode 100644 hermes_cli/worker_board_retirement.py
+ create mode 100644 tests/hermes_cli/test_worker_retirement_recovery.py
+
+diff --git a/docs/worker-compute-capacity.md b/docs/worker-compute-capacity.md
+new file mode 100644
+index 0000000000..e8efcad0d9
+--- /dev/null
++++ b/docs/worker-compute-capacity.md
+@@ -0,0 +1,38 @@
++# Worker compute capacity — rollout status and recovery
++
++This implementation is opt-in and is **not enabled by committing it**. Enrollment
++must install/read back the parent/user CPU quotas, bootstrap all account execution
++boards and map surviving legacy scopes before setting `kanban.worker_resources.enabled`.
++The final slot cap requires the two-worker one-hour normal-work acceptance window;
++the provisional four-slot design is not a measured recommendation.
++
++## Interrupted board retirement
++
++Normal board archive/delete takes account and installation admission fences,
++verifies there are no running rows, and publishes a durable idle proof before
++moving files. Detached jobs still occupy capacity through their cgroups.
++
++If the remover crashes after moving the database but before retiring its account
++registration, admission remains closed. An operator can recover the exact original
++absolute database path using the installed interpreter:
++
++```
++python -m hermes_cli.worker_board_retirement /absolute/original/kanban.db
++```
++
++Recovery takes the account admission fence and requires a matching durable idle
++proof and an absent source. It does not search for similar boards or discard
++arbitrary missing registrations. A subsequent claim invalidates any old proof
++under the account fence before committing, even if worker resource policy has
++since been disabled. Manual database deletion is not a supported lifecycle.
++
++A missing database with no proof cannot be recovered by this command. Restore the
++original database from a trusted backup, verify/drain its work, and use normal
++board removal. Never delete a registration merely to make admission green.
++
++## Pressure contention
++
++Hysteresis writers wait up to 250 ms for the pressure lock, then refuse as unknown.
++The successful waiter rereads state and samples current load under the lock. The
++final gate independently retains its overall lock/lease time budget. A timeout
++never clears the saved brake.
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index 3626d2279d..9e7dcdecf6 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -349,13 +349,17 @@ def claim_transaction(conn, *, task_id=None, gate=None):
+                 # installation's updater fence and avoid taking one lock twice.
+                 roots = [installation]
+                 worker = capacity.worker_enabled()
+-                if worker:
++                from hermes_cli import worker_board_retirement as retirement
++                pending_retirement = retirement.pending(conn)
++                if worker or pending_retirement is not None:
+                     account = capacity.policy_root().resolve()
+                     if account != installation:
+                         roots.insert(0, account)
+                 fences = [stack.enter_context(admission_lock(home, timeout=0)) for home in roots]
+                 held = any(is_held(root) for root in fences)
+                 waiting = not held and any(turns_waiting(root) for root in fences)
++                if not held and not waiting and pending_retirement is not None:
++                    retirement.discard(pending_retirement)
+                 if not held and not waiting and worker:
+                     from hermes_cli.worker_account_boards import register
+                     register(conn)
+diff --git a/hermes_cli/worker_account_boards.py b/hermes_cli/worker_account_boards.py
+index 82b849eef5..b3302c1312 100644
+--- a/hermes_cli/worker_account_boards.py
++++ b/hermes_cli/worker_account_boards.py
+@@ -23,6 +23,11 @@ def register(conn) -> None:
+     if not raw:
+         raise ValueError('worker admission requires a file-backed board')
+     path = Path(raw).resolve(strict=True)
++    from hermes_cli.worker_board_retirement import record_paths, discard
++    # A fresh admission invalidates any interrupted pre-rename idle proof.
++    # The caller retains the account fence through the subsequent claim.
++    _, intent = record_paths(path)
++    discard(intent)
+     directory = capacity.policy_root() / 'worker-resources' / 'boards'
+     directory.mkdir(parents=True, exist_ok=True)
+     destination = directory / (hashlib.sha256(str(path).encode()).hexdigest() + '.json')
+@@ -84,15 +89,20 @@ def removing(path: Path):
+         except (AdmissionBusy, sqlite3.Error) as exc:
+             raise ValueError(f'board busy or unreadable; retry removal: {exc}') from exc
+         # Claims cannot pass their final gate until after removal and retirement.
++        from hermes_cli import worker_board_retirement as retirement
++        _, intent = retirement.record_paths(path)
++        if verify:
++            retirement.prepare(path)
+         succeeded = False
+         try:
+             yield
+             succeeded = True
+         finally:
+-            # Rename can succeed before a later tombstone write fails. The
+-            # fenced idle proof also permits retirement in that partial state.
++            # Keep the durable proof if record retirement is interrupted after
++            # rename. A later explicit recovery must take the account fence.
+             if succeeded or (verify and not path.exists()):
+-                record.unlink(missing_ok=True)
++                retirement.discard(record)
++            retirement.discard(intent)
+ 
+ 
+ def paths() -> list[Path]:
+diff --git a/hermes_cli/worker_board_retirement.py b/hermes_cli/worker_board_retirement.py
+new file mode 100644
+index 0000000000..01afce43ff
+--- /dev/null
++++ b/hermes_cli/worker_board_retirement.py
+@@ -0,0 +1,105 @@
++"""Durable idle proofs for interrupted worker-board removal.
++
++Only the fenced remover writes these proofs; every subsequent registration
++invalidates them before a claim. Recovery never guesses from a missing path.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++from pathlib import Path
++import tempfile
++
++from hermes_cli import worker_compute_capacity as capacity
++
++
++def record_paths(path: Path) -> tuple[Path, Path]:
++    key = hashlib.sha256(str(path).encode()).hexdigest() + '.json'
++    root = capacity.policy_root() / 'worker-resources'
++    return root / 'boards' / key, root / 'retiring' / key
++
++
++def sync_directory(path: Path) -> None:
++    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
++    try:
++        os.fsync(fd)
++    finally:
++        os.close(fd)
++
++
++def discard(path: Path) -> None:
++    """Make invalidation durable before allowing a new claim."""
++    if path.exists():
++        path.unlink()
++        sync_directory(path.parent)
++
++
++def prepare(path: Path) -> None:
++    """Caller holds account/installation fences and has verified no running rows."""
++    _, intent = record_paths(path)
++    stat = path.stat()
++    intent.parent.mkdir(parents=True, exist_ok=True)
++    sync_directory(intent.parent.parent)
++    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=intent.parent, delete=False) as handle:
++        temporary = Path(handle.name)
++        json.dump({'version': 1, 'path': str(path), 'device': stat.st_dev,
++                   'inode': stat.st_ino, 'idle': True}, handle)
++        handle.flush()
++        os.fsync(handle.fileno())
++    try:
++        os.replace(temporary, intent)
++        sync_directory(intent.parent)
++    finally:
++        temporary.unlink(missing_ok=True)
++
++
++def pending(conn) -> Path | None:
++    """Find a proof to invalidate even if resource policy was since disabled."""
++    from hermes_cli.kanban_db_connect import _main_db_file
++    raw = _main_db_file(conn)
++    if not raw:
++        return None
++    _, intent = record_paths(Path(raw).resolve())
++    return intent if intent.exists() else None
++
++
++def recover(path: Path) -> None:
++    """Explicit operator recovery of an interrupted, previously proven removal.
++
++    Missing registrations without a durable idle proof require restoring the
++    original database and draining/removing it normally; they are not dropped.
++    """
++    from hermes_cli.admission_fence import admission_lock
++    path = path.resolve()
++    root = capacity.policy_root().resolve()
++    record, intent = record_paths(path)
++    with admission_lock(root, timeout=0):
++        if path.exists():
++            raise ValueError('source exists; use normal board removal')
++        raw = json.loads(intent.read_text(encoding='utf-8'))
++        if (not isinstance(raw, dict) or raw.get('version') != 1
++                or raw.get('path') != str(path) or raw.get('idle') is not True
++                or type(raw.get('device')) is not int
++                or type(raw.get('inode')) is not int or raw['inode'] <= 0):
++            raise ValueError('invalid board retirement proof')
++        if record.exists():
++            if json.loads(record.read_text(encoding='utf-8')) != str(path):
++                raise ValueError('registered identity differs from retirement proof')
++            discard(record)
++        discard(intent)
++
++
++def main() -> None:
++    import argparse
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('database', type=Path, help='original absolute database path')
++    args = parser.parse_args()
++    if not args.database.is_absolute():
++        parser.error('database must be an absolute original path')
++    recover(args.database)
++    print('Recovered proven-idle board retirement; detached jobs remain accounted.')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/hermes_cli/worker_resource_admission.py b/hermes_cli/worker_resource_admission.py
+index 67cbefbc92..6a2d00a801 100644
+--- a/hermes_cli/worker_resource_admission.py
++++ b/hermes_cli/worker_resource_admission.py
+@@ -6,20 +6,39 @@ import json
+ import os
+ from pathlib import Path
+ import tempfile
++import time
+ 
+ from hermes_cli import worker_compute_capacity as capacity
+ 
++# Short hysteresis writers should not cause prelease/final-gate churn. Keep the
++# wait bounded; final admission also checks its whole-lock budget after sampling.
++PRESSURE_LOCK_TIMEOUT = 0.25
++
++
++def _lock_pressure(lock):
++    import fcntl
++    deadline = time.monotonic() + PRESSURE_LOCK_TIMEOUT
++    while True:
++        try:
++            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++            return
++        except BlockingIOError:
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise
++            time.sleep(min(0.01, remaining))
++
+ 
+ def _pressure(directory: Path) -> bool:
+     """Serialize hysteresis updates, including pre-lease callers across boards.
+ 
+     The observation is taken inside the lock, never replayed from a reporter.
+-    Corrupt state or a busy lock refuses rather than erasing a held brake.
++    Corrupt state or a lock still busy after a bounded wait refuses rather than
++    erasing a held brake.
+     """
+-    import fcntl
+     directory.mkdir(parents=True, exist_ok=True)
+     with (directory / 'pressure.lock').open('a') as lock:
+-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        _lock_pressure(lock)
+         path = directory / 'pressure.json'
+         try:
+             state = json.loads(path.read_text(encoding='utf-8'))
+diff --git a/tests/hermes_cli/test_worker_resource_admission.py b/tests/hermes_cli/test_worker_resource_admission.py
+index c2babed2c8..06d2ac9fd4 100644
+--- a/tests/hermes_cli/test_worker_resource_admission.py
++++ b/tests/hermes_cli/test_worker_resource_admission.py
+@@ -159,6 +159,60 @@ def test_worker_only_final_deadline_and_budget(worker_rig, monkeypatch, expired,
+     assert reason == ('worker_resources_unknown' if expired or slow else None)
+ 
+ 
++def test_pressure_waits_for_short_writer_and_keeps_hysteresis(worker_rig, monkeypatch):
++    import fcntl
++    import threading
++    from hermes_cli.worker_resource_admission import refusal
++    rig, _ = worker_rig
++    directory = rig.home / 'worker-resources'
++    directory.mkdir(exist_ok=True)
++    (directory / 'pressure.json').write_text(json.dumps({'held': True}))
++    monkeypatch.setattr('os.getloadavg', lambda: (20, 0, 0))
++    observed = threading.Event()
++    real_flock = fcntl.flock
++    def flock(fd, flags):
++        try:
++            return real_flock(fd, flags)
++        except BlockingIOError:
++            observed.set()
++            raise
++    monkeypatch.setattr(fcntl, 'flock', flock)
++    with (directory / 'pressure.lock').open('a') as lock:
++        real_flock(lock, fcntl.LOCK_EX)
++        result = []
++        thread = threading.Thread(target=lambda: result.append(refusal()))
++        thread.start()
++        try:
++            assert observed.wait(2)
++        finally:
++            real_flock(lock, fcntl.LOCK_UN)
++            thread.join(2)
++    assert not thread.is_alive()
++    assert result == ['worker_load_pressure']
++    assert json.loads((directory / 'pressure.json').read_text())['held'] is True
++
++
++def test_pressure_contention_timeout_preserves_state(worker_rig, monkeypatch):
++    import fcntl
++    import time
++    from hermes_cli import worker_resource_admission as resources
++    rig, _ = worker_rig
++    directory = rig.home / 'worker-resources'
++    directory.mkdir(exist_ok=True)
++    path = directory / 'pressure.json'
++    original = json.dumps({'held': True})
++    path.write_text(original)
++    monkeypatch.setattr(resources, 'PRESSURE_LOCK_TIMEOUT', 0.05)
++    with (directory / 'pressure.lock').open('a') as lock:
++        fcntl.flock(lock, fcntl.LOCK_EX)
++        start = time.monotonic()
++        assert resources.refusal() == 'worker_resources_unknown'
++        assert 0.04 <= time.monotonic() - start < 1
++    assert path.read_text() == original
++    monkeypatch.setattr('os.getloadavg', lambda: (16, 0, 0))
++    assert resources.refusal() is None
++
++
+ def test_policy_enabled_after_lock_selection_refuses(worker_rig, monkeypatch):
+     from hermes_cli import machine_cpu_metrics as cpu
+     rig, _ = worker_rig
+diff --git a/tests/hermes_cli/test_worker_retirement_recovery.py b/tests/hermes_cli/test_worker_retirement_recovery.py
+new file mode 100644
+index 0000000000..0fafdce3db
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_retirement_recovery.py
+@@ -0,0 +1,129 @@
++"""Interrupted retirement keeps a durable proof, not an absence heuristic."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import worker_account_boards as inventory
++from hermes_cli import worker_board_retirement as retirement
++from hermes_cli import worker_compute_capacity as capacity
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    account = tmp_path / 'account'
++    account.mkdir()
++    monkeypatch.setattr(capacity, 'policy_root', lambda: account)
++    monkeypatch.setattr(capacity, 'worker_enabled', lambda: True)
++    monkeypatch.setattr('hermes_constants.get_default_hermes_root', lambda: account)
++    path = tmp_path / 'foreign' / 'kanban.db'
++    path.parent.mkdir()
++    with sqlite3.connect(path) as conn:
++        conn.execute('CREATE TABLE tasks (status TEXT)')
++        inventory.register(conn)
++    return path
++
++
++def test_remover_publishes_idle_proof_before_filesystem_change(board):
++    record, intent = retirement.record_paths(board)
++    with inventory.removing(board):
++        proof = json.loads(intent.read_text())
++        assert proof == {'version': 1, 'path': str(board), 'idle': True,
++                         'device': board.stat().st_dev, 'inode': board.stat().st_ino}
++        assert record.exists()
++        board.unlink()
++    assert not record.exists()
++    assert not intent.exists()
++
++
++def test_crash_after_rename_recovers_only_matching_proof(board, monkeypatch):
++    record, intent = retirement.record_paths(board)
++    discard = retirement.discard
++    def interrupted(path):
++        if path == record:
++            raise OSError('simulated process interruption before retirement')
++        discard(path)
++    monkeypatch.setattr(retirement, 'discard', interrupted)
++    with pytest.raises(OSError, match='interruption'):
++        with inventory.removing(board):
++            board.rename(board.with_suffix('.archived'))
++    assert record.exists() and intent.exists()
++    with pytest.raises(FileNotFoundError):
++        inventory.paths()
++    monkeypatch.setattr(retirement, 'discard', discard)
++    retirement.recover(board)
++    assert not record.exists() and not intent.exists()
++    assert inventory.paths() == []
++
++
++def test_registration_invalidates_old_idle_proof_before_claim(board):
++    retirement.prepare(board)
++    with sqlite3.connect(board) as conn:
++        inventory.register(conn)
++    _, intent = retirement.record_paths(board)
++    assert not intent.exists()
++    board.unlink()
++    with pytest.raises(FileNotFoundError):
++        retirement.recover(board)
++
++
++def test_recovery_refuses_unproven_missing_database(board):
++    record, _ = retirement.record_paths(board)
++    board.unlink()
++    with pytest.raises(FileNotFoundError):
++        retirement.recover(board)
++    assert record.exists()
++
++
++def test_recovery_refuses_existing_source_or_different_identity(board):
++    record, intent = retirement.record_paths(board)
++    retirement.prepare(board)
++    with pytest.raises(ValueError, match='source exists'):
++        retirement.recover(board)
++    board.unlink()
++    raw = json.loads(intent.read_text())
++    raw['path'] += '.other'
++    intent.write_text(json.dumps(raw))
++    with pytest.raises(ValueError, match='invalid board retirement proof'):
++        retirement.recover(board)
++    assert record.exists()
++
++
++def test_recovery_is_fenced_against_claims(board):
++    from hermes_cli.admission_fence import admission_lock, AdmissionBusy
++    retirement.prepare(board)
++    board.unlink()
++    record, intent = retirement.record_paths(board)
++    with admission_lock(capacity.policy_root(), timeout=0):
++        with pytest.raises(AdmissionBusy):
++            retirement.recover(board)
++    assert record.exists() and intent.exists()
++
++
++def test_claim_with_disabled_policy_invalidates_proof_under_account_fence(board, monkeypatch):
++    from hermes_cli import kanban_admission as admission
++    from hermes_cli.admission_fence import admission_lock
++    retirement.prepare(board)
++    _, intent = retirement.record_paths(board)
++    monkeypatch.setattr(capacity, 'worker_enabled', lambda: False)
++    monkeypatch.setattr('hermes_constants.get_default_hermes_root', lambda: board.parent)
++    monkeypatch.setattr(admission, '_final_hub_gate', lambda *a: (None, None))
++    with sqlite3.connect(board) as conn:
++        with admission_lock(capacity.policy_root(), timeout=0):
++            with admission.claim_transaction(conn) as accepted:
++                assert not accepted
++            assert intent.exists()
++        with admission.claim_transaction(conn) as accepted:
++            assert accepted
++            assert not intent.exists()
++    board.unlink()
++    with pytest.raises(FileNotFoundError):
++        retirement.recover(board)
++
++
++def test_failed_removal_cancels_proof(board):
++    record, intent = retirement.record_paths(board)
++    with pytest.raises(RuntimeError):
++        with inventory.removing(board):
++            raise RuntimeError('before rename')
++    assert record.exists() and not intent.exists()
+-- 
+2.51.0
+

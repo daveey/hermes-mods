@@ -1,0 +1,420 @@
+From a263e710cb95c6987a525742df962dba74db45a2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:41:29 +0000
+Subject: [PATCH] fix(kanban-move): refuse to move a card off a host that holds
+ its unpushed work [daveey]
+
+Self-heal agent-e575f77d7d. On 11-11 21:25Z `hermes kanban move t_01a1cc2e2445efac
+--runs-on machine:worker-2` moved a hub card whose ~/code/_wt trees held unpushed
+commits; worker-2 could not reach them and moved it straight back. It recurred on
+11-12 (hub -> worker-3). kanban_move.check() never looked at the card's trees on the
+host it was leaving.
+
+check() now, when no match is this host, reads the card's trees here
+(kanban_move_pool.card_trees_state: workspace, owner-marked linked worktrees, and
+linked worktrees named in the body, newest comment or newest checkpoint) and refuses
+`unpushed_state_here` on a dirty tree or commits on no remote. force leaves it and the
+moved event records `left_unpushed_state`. Text-named shared main checkouts (a body
+mentioning ~/code/myapp, dirty on the hub) are not the card's work and are skipped.
+Every caller inherits it: the CLI ([unpushed_state_here]), the kanban_move tool,
+move_reclaim, the operator call and the pickup-stall re-place (refusal, card stays).
+A move issued from another host stays blind to the trees (documented).
+
+Tests: tests/hermes_cli/test_kanban_move_unpushed.py and a pickup-stall case; an
+autouse fixture keeps card-tree globs off the developer's real ~/code/_wt.
+---
+ hermes_cli/kanban_move.py                     |  40 ++++
+ hermes_cli/kanban_move_pool.py                |  19 +-
+ tests/_fixtures/card_trees.py                 |  19 ++
+ tests/conftest.py                             |   1 +
+ tests/hermes_cli/test_kanban_move_unpushed.py | 175 ++++++++++++++++++
+ .../test_kanban_pickup_stall_repin.py         |  27 +++
+ 6 files changed, 275 insertions(+), 6 deletions(-)
+ create mode 100644 tests/_fixtures/card_trees.py
+ create mode 100644 tests/hermes_cli/test_kanban_move_unpushed.py
+
+diff --git a/hermes_cli/kanban_move.py b/hermes_cli/kanban_move.py
+index 3fad4f9e55..501fb13bc9 100644
+--- a/hermes_cli/kanban_move.py
++++ b/hermes_cli/kanban_move.py
+@@ -24,6 +24,12 @@ Guards:
+   in addition to satisfying the assignee's existing profile-tool check.
+ * a reason claiming ship/landing custody needs ``host_reason`` (``ship_custody_portable``): ship lands from every
+   machine (:mod:`hermes_cli.kanban_move_ship`).
++* a card leaving this host (no match is this host) while a tree of it here is dirty or has commits on no remote is
++  refused ``unpushed_state_here`` unless ``force`` (then the event carries ``left_unpushed_state``). Its trees are
++  :func:`hermes_cli.kanban_move_pool.card_trees`: the workspace, owner-marked linked worktrees (``~/code/_wt/<slug>``)
++  and linked worktrees named in the body, the newest comment or the newest checkpoint. On 11-11 a hub card whose
++  ``~/code/_wt`` trees held unpushed commits was moved to worker-2, which could not reach them and moved it back.
++  Limitation: only the host holding the trees can see them, so a move issued from another host is blind to them.
+ 
+ Every move is a ``moved`` event ``{from_machine, runs_on, previous_runs_on, reason, move_no, forced}``: the audit log.
+ """
+@@ -35,6 +41,7 @@ from typing import Any, Mapping, Optional
+ 
+ DEFAULT_MAX_MOVES = 3
+ MOVED_EVENT = "moved"
++UNPUSHED_HERE = "unpushed_state_here"
+ 
+ 
+ class MoveRefused(ValueError):
+@@ -183,10 +190,43 @@ def check(conn: sqlite3.Connection, task_id: str, runs_on: Any, *, force: bool =
+     back = [m for m in matches if m in left]
+     if back and len(back) == len(matches) and not force:
+         raise MoveRefused("ping_pong", f"the card already left {', '.join(back)}; pass force to move it back")
++    if me not in matches:  # git reads: check() runs before every caller's write transaction
++        _trees, state = kmp.card_trees_state(task_id, row["workspace_path"], _card_text(conn, task_id),
++                                             linked_text_only=True)
++        if state and not force:
++            raise MoveRefused(UNPUSHED_HERE, (
++                f"{state} on {me}: another machine cannot resume it. Push the branch (or let the card's run publish "
++                "it) and move again, or pass force to leave it"))
++        if state:
++            host = {**host, "left_unpushed_state": state}
+     return {"runs_on": labels, "previous": wn._parse(row["runs_on"]), "matches": matches, "move_no": len(past) + 1,
+             "forced": bool(back and force), "me": me, "host": host}
+ 
+ 
++def _card_text(conn: sqlite3.Connection, task_id: str) -> str:
++    """Body, newest comment and newest checkpoint: where a card names its ``~/code/_wt/<slug>`` trees."""
++    parts = []
++    for sql in ("SELECT body FROM tasks WHERE id = ?",
++                "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT 1"):
++        try:
++            row = conn.execute(sql, (task_id,)).fetchone()
++        except sqlite3.Error:
++            row = None
++        parts.append(str(row[0] or "") if row else "")
++    try:
++        row = conn.execute("SELECT metadata, summary FROM task_runs WHERE task_id = ? AND outcome = 'continued' "
++                           "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++    except sqlite3.Error:
++        row = None
++    if row:
++        try:
++            meta = json.loads(row[0]) if row[0] else {}
++        except ValueError:
++            meta = {}
++        parts.append(str((meta.get("checkpoint") if isinstance(meta, dict) else None) or row[1] or ""))
++    return "\n".join(parts)
++
++
+ def move_task(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason: str, checkpoint: str,
+               expected_run_id: Optional[int] = None, force: bool = False,
+               machines: Optional[Mapping[str, Mapping[str, Any]]] = None, me: Optional[str] = None,
+diff --git a/hermes_cli/kanban_move_pool.py b/hermes_cli/kanban_move_pool.py
+index dc82014994..3f29054329 100644
+--- a/hermes_cli/kanban_move_pool.py
++++ b/hermes_cli/kanban_move_pool.py
+@@ -53,6 +53,11 @@ def _is_tree(path: Path) -> bool:
+     return (path / ".git").exists()
+ 
+ 
++def _trees_home() -> Path:
++    """Root of the card worktree globs (a seam: tests point it away from the developer's real ``~/code/_wt``)."""
++    return Path.home()
++
++
+ def _owner(tree: Path) -> Optional[str]:
+     """``task_id`` from the worktree-owner marker in a linked worktree's gitdir, else None."""
+     try:
+@@ -69,9 +74,11 @@ def _owner(tree: Path) -> Optional[str]:
+ 
+ 
+ def card_trees(task_id: Optional[str], path: Optional[str], text: Optional[str] = "",
+-               extra: Iterable[str] = ()) -> list[str]:
++               extra: Iterable[str] = (), *, linked_text_only: bool = False) -> list[str]:
+     """Git trees on this host that hold the card's work: the workspace and its direct children, linked worktrees
+-    whose worktree-owner marker names the card, trees the park text names (``~/code/_wt/<slug>``), and ``extra``."""
++    whose worktree-owner marker names the card, trees the park text names (``~/code/_wt/<slug>``), and ``extra``.
++    ``linked_text_only`` keeps only linked worktrees (a ``.git`` file) among the text-named trees: a shared main
++    checkout a card body merely mentions (``~/code/myapp``) is not the card's work."""
+     found: list[Path] = []
+     root = Path(path).expanduser() if path else None
+     if root is not None and root.is_dir():
+@@ -81,12 +88,12 @@ def card_trees(task_id: Optional[str], path: Optional[str], text: Optional[str]
+         except OSError:
+             pass
+     if task_id:
+-        home = Path.home()
++        home = _trees_home()
+         for pattern in _WORKTREE_GLOBS:
+             found += [p for p in sorted(home.glob(pattern)) if p.is_dir() and _owner(p) == task_id]
+     for raw in [*_PATH.findall(text or ""), *extra]:
+         p = Path(raw.rstrip(".,;:)]'\"")).expanduser()
+-        if p.is_dir() and _is_tree(p):
++        if p.is_dir() and _is_tree(p) and not (linked_text_only and (p / ".git").is_dir()):
+             found.append(p)
+     out: list[str] = []
+     for p in found:
+@@ -157,9 +164,9 @@ def tree_state(trees: Iterable[str]) -> Optional[str]:
+ 
+ 
+ def card_trees_state(task_id: Optional[str], path: Optional[str], text: Optional[str] = "",
+-                     extra: Iterable[str] = ()) -> tuple[list[str], Optional[str]]:
++                     extra: Iterable[str] = (), *, linked_text_only: bool = False) -> tuple[list[str], Optional[str]]:
+     """``(trees found, unpushed state or None)`` for the card on this host."""
+-    trees = card_trees(task_id, path, text, extra)
++    trees = card_trees(task_id, path, text, extra, linked_text_only=linked_text_only)
+     return trees, tree_state(trees)
+ 
+ 
+diff --git a/tests/_fixtures/card_trees.py b/tests/_fixtures/card_trees.py
+new file mode 100644
+index 0000000000..8085190cb9
+--- /dev/null
++++ b/tests/_fixtures/card_trees.py
+@@ -0,0 +1,19 @@
++"""Card worktree lookups never read the developer's real ``~/code/_wt`` in tests. [daveey]"""
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++
++@pytest.fixture(autouse=True)
++def _card_trees_off_the_real_home(monkeypatch, tmp_path_factory):
++    """Card worktree lookups (``kanban_move_pool.card_trees``: every move and pool park) glob ``~/code/_wt`` etc.
++    HOME stays real in tests, so on a developer host they would read real trees (and their gitdirs under the real
++    Hermes home). Unless a test points ``Path.home`` at its own tmp dir, they see an empty home."""
++    from hermes_cli import kanban_move_pool
++
++    real = Path.home()
++    empty = tmp_path_factory.getbasetemp() / "no-card-trees-home"
++    empty.mkdir(exist_ok=True)
++    monkeypatch.setattr(kanban_move_pool, "_trees_home", lambda: empty if Path.home() == real else Path.home())
+diff --git a/tests/conftest.py b/tests/conftest.py
+index a13438bbb0..6533315ef3 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -286,6 +286,7 @@ from tests._fixtures.live_system_guard import (
+ )
+ from tests._fixtures.fake_dns import public_dns  # opt-in offline resolver for SSRF-guard tests
+ from tests._fixtures.model_peer import model_peer  # fixture registers here
++from tests._fixtures.card_trees import _card_trees_off_the_real_home  # autouse: no real ~/code/_wt
+ from tests._fixtures.offline_catalogs import (
+     _offline_metadata_transport, _offline_registry_transport, _offline_video_catalog,
+ )
+diff --git a/tests/hermes_cli/test_kanban_move_unpushed.py b/tests/hermes_cli/test_kanban_move_unpushed.py
+new file mode 100644
+index 0000000000..61ac00696c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_move_unpushed.py
+@@ -0,0 +1,175 @@
++"""A move never strands a card's unpushed work on the host it leaves (self-heal agent-e575f77d7d). [daveey]
++
++2026-11-11 21:25Z: ``hermes kanban move t_01a1cc2e2445efac --runs-on machine:worker-2`` moved a hub card whose
++``~/code/_wt/*`` trees held unpushed commits. Worker-2 could not reach them and moved it straight back; it recurred on
++11-12 (hub -> worker-3). ``kanban_move.check`` now reads the card's trees on this host when the card leaves it and
++refuses ``unpushed_state_here`` (``force`` leaves it, recorded as ``left_unpushed_state``). Every entry path goes
++through ``check``: the queued move, the running card's own move, the CLI (which prints the code) and the
++pickup-stall alarm's re-place (which leaves the card where it is).
++"""
++from __future__ import annotations
++
++import json
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_move as km
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_worker_node import HUB, MACHINES, WORKER, Gateway
++
++TARGET = [f"machine:{WORKER}"]
++
++
++@pytest.fixture
++def hub(tmp_path, monkeypatch):
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)  # card worktrees are looked up under ~/code/_wt
++    sync.consume_dispatcher_wake()
++    gw = Gateway(tmp_path, HUB, FakeService(lease_runs=True, machines=MACHINES), monkeypatch, pickup=False)
++    gw.enter()
++    yield gw
++    gw.conn.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++def _git(cwd, *args):
++    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *args], cwd=cwd, check=True,
++                   capture_output=True)
++
++
++def _commit(tree, name):
++    (tree / name).write_text(name + "\n")
++    _git(tree, "add", name)
++    _git(tree, "commit", "-qm", name)
++
++
++def _worktree(tmp_path, slug, owner=None):
++    """``~/code/_wt/<slug>``: a linked worktree of a clone whose commits are on its remote, marked for ``owner``."""
++    remote, main = tmp_path / f"{slug}-remote.git", tmp_path / f"{slug}-main"
++    _git(tmp_path, "init", "--bare", "-q", str(remote))
++    _git(tmp_path, "clone", "-q", str(remote), str(main))
++    _commit(main, "a.txt")
++    _git(main, "push", "-q", "origin", "HEAD:refs/heads/main")
++    tree = tmp_path / "code" / "_wt" / slug
++    _git(main, "worktree", "add", "-q", "-b", f"wt/{slug}", str(tree))
++    if owner:
++        gitdir = (tree / ".git").read_text().split(":", 1)[1].strip()
++        (Path(gitdir) / "hermes-owner.json").write_text(json.dumps({"task_id": owner}))
++    return tree
++
++
++def _card(hub, title="scratch card", **kw):
++    return kb.create_task(hub.conn, title=title, assignee="default", **kw)
++
++
++def _moved(conn, tid):
++    return [json.loads(p) for (p,) in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'moved' ORDER BY id", (tid,))]
++
++
++def _runs_on(conn, tid):
++    raw = conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    return json.loads(raw) if raw else None
++
++
++def _refused(res, tree):
++    assert not res["ok"] and res["reason_code"] == "unpushed_state_here", res
++    assert str(tree.resolve()) in res["error"] and HUB in res["error"], res
++
++
++def test_an_owner_marked_tree_with_an_unpushed_commit_keeps_the_card_here(hub, tmp_path):
++    tid = _card(hub)
++    tree = _worktree(tmp_path, "impl", owner=tid)
++    _commit(tree, "b.txt")  # on wt/impl only: no remote has it
++    res = km.move_queued(hub.conn, tid, runs_on=TARGET, reason="worker-1 has slots")
++    _refused(res, tree)
++    assert "unpushed commits" in res["error"]
++    assert _moved(hub.conn, tid) == [] and _runs_on(hub.conn, tid) != TARGET
++
++
++def test_a_dirty_owner_marked_tree_keeps_the_card_here(hub, tmp_path):
++    tid = _card(hub)
++    tree = _worktree(tmp_path, "dirty", owner=tid)
++    _git(tree, "push", "-q", "origin", "HEAD:refs/heads/wt/dirty")
++    (tree / "wip.txt").write_text("not committed\n")
++    res = km.move_queued(hub.conn, tid, runs_on=TARGET, reason="worker-1 has slots")
++    _refused(res, tree)
++    assert "dirty worktree" in res["error"]
++
++
++def test_a_clean_tree_whose_commits_are_pushed_moves(hub, tmp_path):
++    tid = _card(hub)
++    tree = _worktree(tmp_path, "pushed", owner=tid)
++    _commit(tree, "b.txt")
++    _git(tree, "push", "-q", "origin", "HEAD:refs/heads/wt/pushed")
++    res = km.move_queued(hub.conn, tid, runs_on=TARGET, reason="worker-1 has slots")
++    assert res["ok"], res
++    assert "left_unpushed_state" not in _moved(hub.conn, tid)[-1]
++
++
++def test_a_tree_named_only_in_the_newest_comment_keeps_the_card_here(hub, tmp_path):
++    tid = _card(hub)
++    tree = _worktree(tmp_path, "named")  # no owner marker: only the comment ties it to the card
++    _commit(tree, "b.txt")
++    kb.add_comment(hub.conn, tid, "default", "older note, no path")
++    kb.add_comment(hub.conn, tid, "default", f"Implementation is in {tree}, commit b not pushed yet.")
++    _refused(km.move_queued(hub.conn, tid, runs_on=TARGET, reason="worker-1 has slots"), tree)
++
++
++def test_a_shared_main_checkout_the_body_mentions_is_not_the_cards_work(hub, tmp_path):
++    main = tmp_path / "code" / "myapp"
++    main.mkdir(parents=True)
++    _git(main, "init", "-q")
++    (main / "untracked.txt").write_text("someone else's\n")
++    tid = _card(hub, body=f"Fix the parser in {main}.")
++    assert km.move_queued(hub.conn, tid, runs_on=TARGET, reason="worker-1 has slots")["ok"]
++
++
++def test_force_leaves_the_state_and_the_event_records_it(hub, tmp_path):
++    tid = _card(hub)
++    tree = _worktree(tmp_path, "forced", owner=tid)
++    _commit(tree, "b.txt")
++    res = km.move_queued(hub.conn, tid, runs_on=TARGET, reason="abandon the hub copy", force=True)
++    assert res["ok"], res
++    ev = _moved(hub.conn, tid)[-1]
++    assert ev["left_unpushed_state"] == f"unpushed commits in {tree.resolve()}", ev
++
++
++def test_a_queued_move_whose_matches_include_this_host_is_not_refused(hub, tmp_path):
++    tid = _card(hub)
++    tree = _worktree(tmp_path, "stays", owner=tid)
++    _commit(tree, "b.txt")
++    res = km.move_queued(hub.conn, tid, runs_on=["linux"], reason="any linux host, this one included")
++    assert res["ok"] and HUB in res["matches"], res
++    assert "left_unpushed_state" not in _moved(hub.conn, tid)[-1]
++
++
++def test_a_running_cards_own_move_is_refused_and_its_run_goes_on(hub, tmp_path):
++    tid = _card(hub, runs_on=[f"machine:{HUB}"])
++    hub.round()
++    hub.tick()
++    run_id = hub.conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    assert kb.get_task(hub.conn, tid).status == "running"
++    tree = _worktree(tmp_path, "running", owner=tid)
++    _commit(tree, "b.txt")
++    res = km.move_task(hub.conn, tid, runs_on=TARGET, reason="r", checkpoint="c", expected_run_id=run_id)
++    _refused(res, tree)
++    assert kb.get_task(hub.conn, tid).status == "running"
++
++
++def test_the_cli_prints_the_refusal_code(hub, tmp_path):
++    from hermes_cli import kanban as kcli
++    tid = _card(hub)
++    tree = _worktree(tmp_path, "cli", owner=tid)
++    _commit(tree, "b.txt")
++    out = json.loads(kcli.run_slash(f'move {tid} --runs-on machine:{WORKER} --reason "slots" --json'))
++    assert out["reason_code"] == "unpushed_state_here", out
++    text = kcli.run_slash(f'move {tid} --runs-on machine:{WORKER} --reason "slots"')
++    assert "[unpushed_state_here]" in text and "pass force to leave it" in text, text
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall_repin.py b/tests/hermes_cli/test_kanban_pickup_stall_repin.py
+index c885140535..b9a233089d 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall_repin.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall_repin.py
+@@ -353,6 +353,33 @@ def test_the_alarms_pool_move_keeps_a_mandatory_pins_label(held, monkeypatch):
+     assert place._pin(hub.conn, a) == sorted([POOL, mp.LABEL])
+ 
+ 
++def test_the_alarms_run_leaves_a_card_whose_unpushed_tree_is_on_this_host(held, tmp_path, monkeypatch):
++    """agent-e575f77d7d: the re-place is an ordinary queued move, so ``unpushed_state_here`` refuses it; the card
++    stays pinned and the alarm's run goes on (a refusal, not an error that loops)."""
++    import subprocess
++    from pathlib import Path
++    hub, _worker_gw, alarm, (a, b), _unlisted = held
++    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
++    tree = tmp_path / "home" / "code" / "_wt" / "stalled"
++    git = ["git", "-c", "user.email=t@t", "-c", "user.name=t"]
++    main = tmp_path / "stalled-main"
++    subprocess.run([*git, "init", "-q", str(main)], check=True, capture_output=True)
++    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "base"], cwd=main, check=True, capture_output=True)
++    subprocess.run([*git, "worktree", "add", "-q", "-b", "wt/stalled", str(tree)], cwd=main, check=True,
++                   capture_output=True)
++    gitdir = (tree / ".git").read_text().split(":", 1)[1].strip()
++    (Path(gitdir) / "hermes-owner.json").write_text(json.dumps({"task_id": a}))
++    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "wip"], cwd=tree, check=True, capture_output=True)
++    out = _move(a, [f"machine:{X}"])
++    # The tool error carries move_queued's message, not its reason_code.
++    assert out.get("ok") is not True and "unpushed commits in" in out["error"], out
++    assert "another machine cannot resume it" in out["error"], out
++    assert place._pin(hub.conn, a) == [f"machine:{M}"]
++    assert not hub.conn.execute("SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'moved'", (a,)).fetchone()
++    assert _move(b, [f"machine:{X}"]).get("ok") is True  # a card with no tree here still moves
++    assert kb.get_task(hub.conn, alarm).status == "running"
++
++
+ def test_the_hold_alarm_text_names_the_supported_command():
+     assert "kanban_move command below" in kps._HOST_GROUPS["hold"][2]
+     text = rp.howto(M)
+-- 
+2.51.0
+

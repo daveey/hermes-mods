@@ -1,0 +1,74 @@
+From d94325c18f1c42b19fc7be904a7ebd498e21e16a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:18:05 +0000
+Subject: [PATCH] [daveey] kanban quota recovery: resolver child that exits
+ early fails closed, not BrokenPipeError
+
+_getaddrinfo writes the request to the isolated DNS child's stdin. When the
+child exits before the parent flushes (a starved parent on a loaded CI
+runner, or a child that dies at startup), stdin.close() raised
+BrokenPipeError, which escaped instead of the closed 'DNS resolution failed'
+path. Ignore EPIPE on the request write, as subprocess.communicate does, and
+let the child's exit status decide.
+
+Deflakes tests/hermes_cli/test_kanban_quota_dns_deadline.py::
+test_resolver_failure_is_closed_and_reaped (CI run 43397574061: "Actual
+message: '[Errno 32] Broken pipe'"). The test now also forces the
+child-exits-first ordering deterministically (RED before the fix with the
+exact CI message, GREEN after).
+
+Kanban: t_01a1d430533b67bd
+---
+ hermes_cli/kanban_quota_recovery.py                |  7 +++++--
+ tests/hermes_cli/test_kanban_quota_dns_deadline.py | 14 +++++++++++++-
+ 2 files changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_quota_recovery.py b/hermes_cli/kanban_quota_recovery.py
+index 2b01bd6860..c5515bad1e 100644
+--- a/hermes_cli/kanban_quota_recovery.py
++++ b/hermes_cli/kanban_quota_recovery.py
+@@ -38,8 +38,11 @@ async def _getaddrinfo(host, port, *, family=0, type=0, proto=0, flags=0):
+             stdin=subprocess.PIPE, stdout=output, stderr=subprocess.DEVNULL,
+             env=build_subprocess_env(base={}))
+         try:
+-            process.stdin.write(json.dumps([host, port, family, type, proto, flags]).encode('utf-8'))
+-            process.stdin.close()
++            try:
++                process.stdin.write(json.dumps([host, port, family, type, proto, flags]).encode('utf-8'))
++                process.stdin.close()
++            except BrokenPipeError:
++                pass  # the child already exited; its exit status below decides the result
+             while process.poll() is None:
+                 await asyncio.sleep(0.01)
+             if process.returncode != 0:
+diff --git a/tests/hermes_cli/test_kanban_quota_dns_deadline.py b/tests/hermes_cli/test_kanban_quota_dns_deadline.py
+index 8c0904b0d5..97943dc1bd 100644
+--- a/tests/hermes_cli/test_kanban_quota_dns_deadline.py
++++ b/tests/hermes_cli/test_kanban_quota_dns_deadline.py
+@@ -63,10 +63,22 @@ def test_resolver_roundtrips_addresses_without_network():
+     assert all(row[0] == socket.AF_INET and row[4] == ('127.0.0.1', 443) for row in rows)
+ 
+ 
+-def test_resolver_failure_is_closed_and_reaped(monkeypatch):
++@pytest.mark.parametrize('child_exits_first', [False, True])
++def test_resolver_failure_is_closed_and_reaped(monkeypatch, child_exits_first):
+     import asyncio
+ 
+     monkeypatch.setattr(recovery, '_DNS_SCRIPT', 'import sys; sys.exit(1)')
++    if child_exits_first:
++        # A starved parent can be scheduled after the child has already exited:
++        # writing the request then hits EPIPE. Force that ordering deterministically.
++        real_popen = subprocess.Popen
++
++        def exited_popen(*args, **kw):
++            process = real_popen(*args, **kw)
++            process.wait(timeout=30)
++            return process
++
++        monkeypatch.setattr(subprocess, 'Popen', exited_popen)
+     with pytest.raises(OSError, match='DNS resolution failed'):
+         asyncio.run(recovery._getaddrinfo('unused.invalid', 443))
+ 
+-- 
+2.51.0
+

@@ -1,0 +1,857 @@
+From 9c58fa1888c619195e99b6ded939d250d0427cef Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:48:50 +0000
+Subject: [PATCH] [daveey] host_loop_lease: one flock-held owner per Hermes
+ home for host-wide background loops
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Infrastructure for design t_01a1d45d75851804 §2a (card t_01a1d470ec8f86ca); no loop is moved
+onto it here.
+
+hermes_cli/host_loop_lease.HostLoopLease(name, role, interval=...):
+- flock(LOCK_EX|LOCK_NB) on <realpath(root home)>/run/host-loops/<name>.lock (root home, so
+  profile processes share one owner); fd O_CLOEXEC; the kernel frees it on death. A forked
+  child closes its shared copy (never LOCK_UN, which would free the parent's lock).
+- Holder metadata in the lock file: pid, start time, role, priority, core sha, heartbeat_at
+  (beat() once per pass); released_at on release.
+- Watchdog: no beat() for > 3x interval -> the holder releases; standbys log one WARNING per
+  holder on a stale heartbeat.
+- Priority gateway > serve > dashboard: a higher-priority standby writes <name>.want (pid +
+  start, liveness-checked) and blocks on LOCK_EX in a daemon thread; the holder hands off in
+  beat(); any other standby that wins the release window drops the lock again while a live
+  .want of priority >= its own exists.
+- held() costs one flock syscall when not holder (holder: none); kill switch
+  HERMES_HOST_LOOP_LEASE=0 -> held() always True.
+- Unopenable lock (no fcntl, uncreatable file, flock error) fails OPEN (held() True, logged
+  once): duplicated passes are today's safe behaviour; failing closed would stop the loops.
+  An existing read-only lock file is still locked through a read-only fd, as update_lock does.
+- hermes doctor: "Host Loop Leases" lists each lease's holder (role, pid, core, beat age).
+
+Tests: tests/hermes_cli/test_host_loop_lease.py (real child processes: one holder of two,
+kill -> standby within an interval, priority hand-off with a fast same-priority poller never
+stealing, gateway never preempted by serve, wedged holder released by its watchdog, kill
+switch, unwritable dir, read-only lock file, root-home key, stale warning once, doctor rows).
+---
+ hermes_cli/doctor.py                     |   3 +-
+ hermes_cli/doctor_state.py               |  25 ++
+ hermes_cli/host_loop_lease.py            | 428 +++++++++++++++++++++++
+ tests/hermes_cli/test_host_loop_lease.py | 313 +++++++++++++++++
+ 4 files changed, 768 insertions(+), 1 deletion(-)
+ create mode 100644 hermes_cli/host_loop_lease.py
+ create mode 100644 tests/hermes_cli/test_host_loop_lease.py
+
+diff --git a/hermes_cli/doctor.py b/hermes_cli/doctor.py
+index 34daf8b24a..cdf469b405 100644
+--- a/hermes_cli/doctor.py
++++ b/hermes_cli/doctor.py
+@@ -54,6 +54,7 @@ from hermes_cli.doctor_state import (
+     _check_cron_store,
+     _check_directory_structure,
+     _check_hub_admission_claims,
++    _check_host_loop_leases,
+     _check_memory_provider,
+     _check_plugin_dir_conflicts,
+     _check_plugins_disabled_by_update,
+@@ -131,7 +132,7 @@ DOCTOR_CHECKS = (
+     ('Memory Provider', _check_memory_provider), ('Plugin Directories', _check_plugin_dir_conflicts),
+     (None, _check_plugins_disabled_by_update), (None, _check_plugins_in_both_lists),
+     ('NeMo Relay Plugins', _check_relay_plugins),
+-    (None, _check_profiles), (None, _check_hub_admission_claims),
++    (None, _check_profiles), (None, _check_hub_admission_claims), (None, _check_host_loop_leases),
+ )
+ 
+ 
+diff --git a/hermes_cli/doctor_state.py b/hermes_cli/doctor_state.py
+index 8213b47b0d..aceed47311 100644
+--- a/hermes_cli/doctor_state.py
++++ b/hermes_cli/doctor_state.py
+@@ -702,6 +702,31 @@ def _check_plugins_in_both_lists(should_fix: bool, f: Finding) -> None:
+                                f"memory.provider set), or keep it off with `hermes plugins disable {name}`")
+ 
+ 
++@doctor_check("")  # best-effort: an unreadable lease directory must never break doctor
++def _check_host_loop_leases(should_fix: bool, f: Finding) -> None:
++    """Who runs each host-wide background loop of this home (``hermes_cli.host_loop_lease``). [daveey]"""
++    import time
++    from hermes_cli import host_loop_lease as hll
++    leases = hll.holders()
++    if not leases:
++        return
++    _section("Host Loop Leases")
++    if not hll.enabled():
++        check_info(f"{hll.KILL_SWITCH_ENV}=0: every process runs its own host passes")
++    for meta in leases:
++        name = meta.get("name")
++        if not meta.get("live"):
++            check_info(f"{name}: no live holder (the next process to poll takes it)")
++            continue
++        age = time.time() - float(meta.get("heartbeat_at") or 0)
++        interval = float(meta.get("interval") or 0)
++        detail = f"({meta.get('role')} pid {meta.get('pid')}, core {str(meta.get('sha') or '?')[:10]}, beat {age:.0f}s ago)"
++        if interval and age > hll.WATCHDOG_FACTOR * interval:
++            check_warn(f"{name}: holder heartbeat is stale", detail)
++        else:
++            check_ok(f"{name}: held", detail)
++
++
+ @doctor_check("")  # best-effort: a busy or missing board must never break doctor
+ def _check_hub_admission_claims(should_fix: bool, f: Finding) -> None:
+     """On the hub: its claims of cards with no hub-admission verdict in the last week (should be 0). [daveey]"""
+diff --git a/hermes_cli/host_loop_lease.py b/hermes_cli/host_loop_lease.py
+new file mode 100644
+index 0000000000..dec3d29bb6
+--- /dev/null
++++ b/hermes_cli/host_loop_lease.py
+@@ -0,0 +1,428 @@
++"""One owner per Hermes home for host-wide background loops (design t_01a1d45d75851804 §2a). [daveey]
++
++The gateway, every Desktop ``serve`` backend and the dashboard each start the same background loops
++(unloaded sweeps, producer admission, chat-closeout, annotation refresh). Their passes are host-wide
++work, so N processes do it N times. A loop that adopts this lease runs its host pass only while
++``lease.held()``::
++
++    lease = HostLoopLease("kanban-unloaded", "serve", interval=30)
++    while not stopped.wait(30):
++        if lease.held():
++            run_host_pass()
++            lease.beat()
++
++The lock is ``flock(LOCK_EX | LOCK_NB)`` on ``<realpath(root home)>/run/host-loops/<name>.lock``. The
++key is the profile-tree ROOT home (the passes iterate the root and ``profiles/*``), never a profile
++home, so profile processes of one install share one owner.
++
++* **Death.** The kernel drops the lock when the holder's last descriptor closes, so a killed holder
++  frees it at once and a standby takes it on its next ``held()`` (one interval). The fd is opened
++  ``O_CLOEXEC``: an exec'd child never inherits it. A ``fork()`` WITHOUT exec shares the open file
++  description, and a flock belongs to that description, so the child would keep the lock alive after
++  the parent dies. :func:`_after_fork_child` therefore closes the child's copy and resets its state
++  (never ``LOCK_UN`` there: that would release the parent's lock too).
++* **Metadata.** The holder writes pid, process start time, role, core sha and ``heartbeat_at`` into the
++  lock file; :meth:`HostLoopLease.beat` refreshes the heartbeat once per pass.
++* **Watchdog.** A pass that runs longer than ``3 × interval`` without a ``beat()`` makes the holder's
++  watchdog thread release the lock, so one wedged pass cannot stop the host loop. The wedged pass may
++  still finish concurrently with the new holder's pass; that is safe because callers claim their work
++  by cursor CAS / ledger rows. A standby that reads a stale heartbeat logs one WARNING per holder.
++* **Priority** gateway > Desktop serve > dashboard. A standby of higher priority than the holder writes
++  ``<name>.want`` (pid + start time, verified alive) and blocks on ``LOCK_EX`` in a daemon thread, so it
++  gets the lock the moment it is released (no polling gap). The holder reads ``.want`` in ``beat()`` at
++  the end of each pass and releases. Any other standby that wins the lock in that release window drops
++  it again while a live ``.want`` of priority >= its own exists.
++* **Kill switch** ``HERMES_HOST_LOOP_LEASE=0``: ``held()`` is always True (every process runs its own
++  pass, the behaviour before this lease).
++* **Unavailable lock** (no ``fcntl``, a directory nobody can create the file in, a filesystem without
++  flock): the lease fails OPEN, ``held()`` True, logged once. Duplicated passes are today's safe
++  behaviour; failing closed would stop the host loops on every process of that home. An existing lock
++  file this process may not write is opened read-only (flock works on it, as in ``update_lock``); such a
++  holder holds the lock but cannot record metadata.
++
++``hermes doctor`` lists the holders (:func:`holders`).
++"""
++
++from __future__ import annotations
++
++import contextvars
++import json
++import logging
++import os
++import re
++import threading
++import time
++import weakref
++from pathlib import Path
++
++try:
++    import fcntl
++except ImportError:  # Windows: no flock; the lease fails open (every process runs its passes).
++    fcntl = None  # type: ignore[assignment]
++
++logger = logging.getLogger(__name__)
++
++KILL_SWITCH_ENV = "HERMES_HOST_LOOP_LEASE"  # health: allow HX002 -- the card's required kill switch
++WATCHDOG_FACTOR = 3
++ROLE_PRIORITY = {"gateway": 3, "serve": 2, "dashboard": 1}
++_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
++_LEASES: weakref.WeakSet = weakref.WeakSet()
++
++
++def enabled() -> bool:
++    return os.environ.get(KILL_SWITCH_ENV, "").strip() != "0"
++
++
++def lease_dir(home: str | Path | None = None) -> Path:
++    """``<realpath(root home)>/run/host-loops``: one directory per install, shared by its profiles."""
++    from hermes_constants import get_default_hermes_root
++    return Path(os.path.realpath(get_default_hermes_root(home=home))) / "run" / "host-loops"
++
++
++def _start_of(pid: int):
++    try:
++        from gateway.status import _get_process_start_time
++        return _get_process_start_time(int(pid))
++    except (ImportError, OSError, ValueError, TypeError):
++        return None
++
++
++def _alive(pid, start) -> bool:
++    """True unless ``pid`` is provably gone (dead, or recycled with another start time)."""
++    try:
++        pid = int(pid)
++    except (TypeError, ValueError, OverflowError):
++        return False
++    if pid <= 0:
++        return False
++    try:
++        from gateway.status import _pid_exists
++        if not _pid_exists(pid):
++            return False
++    except PermissionError:
++        pass  # exists, owned by someone else
++    except (OSError, ValueError, OverflowError):
++        return False
++    if start is None:
++        return True
++    current = _start_of(pid)
++    if current is None:
++        return True
++    try:
++        from gateway.status import start_time_fingerprints_match
++        return start_time_fingerprints_match(start, current)
++    except (TypeError, ValueError):
++        return False
++
++
++def _read_json(path: Path) -> dict | None:
++    try:
++        raw = json.loads(path.read_bytes() or b"null")
++    except (OSError, ValueError):
++        return None
++    return raw if isinstance(raw, dict) else None
++
++
++_ME: tuple | None = None
++_SHA: list = []
++
++
++def _me() -> tuple:
++    """``(pid, start-time fingerprint)`` of this process, cached per pid (a fork re-reads it)."""
++    global _ME
++    if _ME is None or _ME[0] != os.getpid():
++        _ME = (os.getpid(), _start_of(os.getpid()))
++    return _ME
++
++
++def _core_sha() -> str | None:
++    """The code this process booted from (read once)."""
++    if not _SHA:
++        try:
++            from hermes_cli.version_info import get_code_identity
++            sha = get_code_identity().get("sha")
++        except Exception:  # health: allow BLE001 -- metadata only: a broken identity probe must never stop a host loop
++            logger.debug("host loop lease: code identity unavailable", exc_info=True)
++            sha = None
++        _SHA.append(sha if isinstance(sha, str) and sha else None)
++    return _SHA[0]
++
++
++def _spawn(target, name: str) -> None:
++    thread = threading.Thread(target=contextvars.copy_context().run, args=(target,), name=name, daemon=True)
++    thread.start()
++
++
++class HostLoopLease:
++    """A per-home flock lease for one host loop; see the module docstring."""
++
++    def __init__(self, name: str, role: str, *, interval: float, home: str | Path | None = None) -> None:
++        if not _NAME_RE.fullmatch(name or ""):
++            raise ValueError(f"host loop lease name must match {_NAME_RE.pattern}: {name!r}")
++        if not interval or interval <= 0:
++            raise ValueError("interval must be > 0 seconds")
++        self.name, self.role, self.interval = name, role, float(interval)
++        self.priority = ROLE_PRIORITY.get(role, 0)
++        self.directory = lease_dir(home)
++        self.path = self.directory / f"{name}.lock"
++        self.want_path = self.directory / f"{name}.want"
++        self._mu = threading.RLock()
++        self._fd: int | None = None
++        self._writable = False
++        self._held = False
++        self._waiting = False        # a daemon thread blocks on LOCK_EX for a .want hand-off
++        self._cancel_wait = False    # release() while waiting: drop the lock when the thread gets it
++        self._stop: threading.Event | None = None  # the current holding's watchdog stop flag
++        self._last_beat = 0.0
++        self._acquired_at = 0.0
++        self._next_probe = 0.0
++        self._next_open = 0.0
++        self._unavailable_logged = False
++        self._stale_warned: tuple | None = None
++        _LEASES.add(self)
++
++    # -- public API ----------------------------------------------------------------------------
++
++    def held(self) -> bool:
++        """True when this process should run the host pass now. One ``flock`` syscall when not holder."""
++        if not enabled() or self._held:
++            return True
++        if self._waiting:
++            return False
++        with self._mu:
++            if self._held:
++                return True
++            if self._waiting:
++                return False
++            fd = self._fd if self._fd is not None else self._open()
++            if fd is None:
++                return True  # fail open (logged once)
++            try:
++                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++            except BlockingIOError:
++                self._standby_probe()
++                return False
++            except OSError as exc:  # ENOLCK and friends: no usable lock on this filesystem
++                self._unavailable(f"flock failed: {exc}")
++                return True
++            want = self._live_want()
++            if want is not None and want.get("pid") != os.getpid() and want.get("priority", 0) >= self.priority:
++                fcntl.flock(fd, fcntl.LOCK_UN)  # a higher-priority waiter is due this lock
++                return False
++            self._become_holder()
++            return True
++
++    def beat(self) -> None:
++        """End of a pass: refresh the heartbeat, then hand off to a live higher-priority ``.want``."""
++        if not enabled() or not self._held:
++            return
++        with self._mu:
++            if not self._held:
++                return
++            self._last_beat = time.monotonic()
++            self._write_meta(held=True)
++            want = self._live_want()
++            if want is not None and want.get("pid") != os.getpid() and want.get("priority", 0) > self.priority:
++                logger.info("host loop %s: handing the lease to %s pid %s", self.name, want.get("role"),
++                            want.get("pid"))
++                self._drop()
++
++    def release(self) -> None:
++        """Give the lease up (shutdown). A later ``held()`` competes for it again."""
++        with self._mu:
++            if self._held:
++                self._drop()
++            self._clear_own_want()
++            if self._waiting:
++                self._cancel_wait = True  # the blocked thread drops the lock and closes the fd
++                return
++            if self._fd is not None:
++                os.close(self._fd)
++                self._fd = None
++
++    # -- internals -----------------------------------------------------------------------------
++
++    def _unavailable(self, why: str) -> None:
++        self._next_open = time.monotonic() + self.interval
++        if not self._unavailable_logged:
++            self._unavailable_logged = True
++            logger.warning("host loop %s: lease %s unavailable (%s); running this process's own pass",
++                           self.name, self.path, why)
++
++    def _open(self) -> int | None:
++        if fcntl is None:
++            self._unavailable("no fcntl on this platform")
++            return None
++        if time.monotonic() < self._next_open:
++            return None
++        flags = os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
++        try:
++            self.directory.mkdir(parents=True, exist_ok=True)
++        except OSError:
++            pass  # the file may still exist and open
++        try:
++            self._fd, self._writable = os.open(self.path, os.O_RDWR | os.O_CREAT | flags, 0o644), True
++        except OSError as exc:
++            try:  # flock works on a read-only fd (a lock file another user left behind)
++                self._fd, self._writable = os.open(self.path, os.O_RDONLY | flags), False
++            except OSError:
++                self._unavailable(exc.strerror or str(exc))
++                return None
++        return self._fd
++
++    def _become_holder(self) -> None:
++        self._held = True
++        self._acquired_at = time.time()
++        self._last_beat = time.monotonic()
++        self._write_meta(held=True)
++        stop = self._stop = threading.Event()
++        _spawn(lambda: self._watch(stop), f"host-loop-watchdog-{self.name}")
++        logger.info("host loop %s: this %s process holds the lease", self.name, self.role)
++
++    def _drop(self) -> None:
++        """Release a held lock (caller holds ``_mu``). Metadata first: after LOCK_UN it is the next holder's."""
++        self._write_meta(held=False)
++        self._held = False
++        if self._stop is not None:
++            self._stop.set()
++            self._stop = None
++        if self._fd is not None:
++            fcntl.flock(self._fd, fcntl.LOCK_UN)
++
++    def _watch(self, stop: threading.Event) -> None:
++        limit = WATCHDOG_FACTOR * self.interval
++        while not stop.wait(min(self.interval, limit) / 2):
++            with self._mu:
++                if stop.is_set() or not self._held:
++                    return
++                silent = time.monotonic() - self._last_beat
++                if silent > limit:
++                    logger.warning("host loop %s: no beat() for %.1fs (> %d x %.1fs interval); releasing the "
++                                   "lease so a standby runs the next pass", self.name, silent, WATCHDOG_FACTOR,
++                                   self.interval)
++                    self._drop()
++                    return
++
++    def _write_meta(self, *, held: bool) -> None:
++        if not self._writable or self._fd is None:
++            return
++        now = time.time()
++        meta = {"name": self.name, "held": held, "pid": _me()[0], "start": _me()[1],
++                "role": self.role, "priority": self.priority, "sha": _core_sha(), "interval": self.interval,
++                "acquired_at": self._acquired_at, "heartbeat_at": now}
++        if not held:
++            meta["released_at"] = now
++        data = json.dumps(meta).encode()
++        try:
++            os.pwrite(self._fd, data, 0)
++            os.ftruncate(self._fd, len(data))
++        except OSError as exc:
++            logger.debug("host loop %s: metadata write failed: %s", self.name, exc)
++
++    def _live_want(self) -> dict | None:
++        want = _read_json(self.want_path)
++        if want is None or not _alive(want.get("pid"), want.get("start")):
++            return None
++        return want
++
++    def _clear_own_want(self) -> None:
++        want = _read_json(self.want_path)
++        if want is not None and want.get("pid") == os.getpid():
++            try:
++                self.want_path.unlink()
++            except OSError:
++                pass
++
++    def _standby_probe(self) -> None:
++        """At most once per interval: warn on a stale holder, and claim a lower-priority holder's lease."""
++        now = time.monotonic()
++        if now < self._next_probe:
++            return
++        self._next_probe = now + self.interval
++        meta = _read_json(self.path)
++        if not meta or not meta.get("held") or not _alive(meta.get("pid"), meta.get("start")):
++            return
++        holder = (meta.get("pid"), meta.get("start"))
++        interval = float(meta.get("interval") or self.interval)
++        age = time.time() - float(meta.get("heartbeat_at") or 0)
++        if age > WATCHDOG_FACTOR * interval and self._stale_warned != holder:
++            self._stale_warned = holder
++            logger.warning("host loop %s: holder %s pid %s last beat %.0fs ago (> %d x %.0fs interval)",
++                           self.name, meta.get("role"), holder[0], age, WATCHDOG_FACTOR, interval)
++        if int(meta.get("priority") or 0) >= self.priority:
++            return
++        want = self._live_want()
++        if want is not None and want.get("pid") != os.getpid() and want.get("priority", 0) >= self.priority:
++            return  # another process of at least our priority is already next
++        self._want()
++
++    def _want(self) -> None:
++        """Publish ``.want`` and block on LOCK_EX in a daemon thread (caller holds ``_mu``)."""
++        if not self._writable or self._fd is None:
++            return
++        record = {"pid": _me()[0], "start": _me()[1], "role": self.role,
++                  "priority": self.priority, "at": time.time()}
++        tmp = self.want_path.with_name(f".{self.want_path.name}.{os.getpid()}")
++        try:
++            tmp.write_text(json.dumps(record), encoding="utf-8")
++            os.replace(tmp, self.want_path)
++        except OSError as exc:
++            logger.debug("host loop %s: cannot write %s: %s", self.name, self.want_path, exc)
++            return
++        self._waiting, self._cancel_wait = True, False
++        fd = self._fd
++        logger.info("host loop %s: %s outranks the holder; waiting for its hand-off", self.name, self.role)
++        _spawn(lambda: self._wait_for_lock(fd), f"host-loop-want-{self.name}")
++
++    def _wait_for_lock(self, fd: int) -> None:
++        try:
++            fcntl.flock(fd, fcntl.LOCK_EX)
++        except OSError as exc:
++            logger.debug("host loop %s: blocking acquire failed: %s", self.name, exc)
++            with self._mu:
++                self._waiting = False
++                self._clear_own_want()  # a live .want nobody waits on would hold every standby off
++            return
++        with self._mu:
++            self._waiting = False
++            if self._fd != fd:  # forked child state reset or fd replaced: not ours any more
++                return
++            if self._cancel_wait:
++                fcntl.flock(fd, fcntl.LOCK_UN)
++                os.close(fd)
++                self._fd = None
++                return
++            self._become_holder()
++            self._clear_own_want()
++
++
++def holders(home: str | Path | None = None) -> list[dict]:
++    """Every lease of this home: its last metadata plus ``live`` (a live process says it holds it)."""
++    directory = lease_dir(home)
++    try:
++        paths = sorted(directory.glob("*.lock"))
++    except OSError:
++        return []
++    out = []
++    for path in paths:
++        meta = _read_json(path) or {}
++        meta.setdefault("name", path.stem)
++        meta["live"] = bool(meta.get("held")) and _alive(meta.get("pid"), meta.get("start"))
++        out.append(meta)
++    return out
++
++
++def _after_fork_child() -> None:
++    """A forked child shares the parent's lock (one open file description): close its copy, never LOCK_UN."""
++    for lease in list(_LEASES):
++        if lease._fd is not None:
++            try:
++                os.close(lease._fd)
++            except OSError:
++                pass
++        lease._fd, lease._held, lease._waiting, lease._stop = None, False, False, None
++        lease._mu = threading.RLock()
++
++
++if hasattr(os, "register_at_fork"):
++    os.register_at_fork(after_in_child=_after_fork_child)
+diff --git a/tests/hermes_cli/test_host_loop_lease.py b/tests/hermes_cli/test_host_loop_lease.py
+new file mode 100644
+index 0000000000..f2861c4bde
+--- /dev/null
++++ b/tests/hermes_cli/test_host_loop_lease.py
+@@ -0,0 +1,313 @@
++"""host_loop_lease: one flock-held owner per Hermes home for host-wide loops (t_01a1d470ec8f86ca). [daveey]
++
++The multi-process tests run real child processes against one temporary home: each child polls
++``held()`` every ``interval`` and prints ``HELD`` / ``STANDBY`` on every change, so the parent sees
++exactly when each process owns the lease.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import queue
++import signal
++import subprocess
++import sys
++import threading
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import host_loop_lease as hll
++from tests.waiting import wait_until
++
++ROOT = Path(__file__).resolve().parents[2]
++INTERVAL = 0.2
++
++CHILD = r"""
++import logging, sys, threading
++sys.path.insert(0, sys.argv[1])
++logging.basicConfig(level=logging.INFO, stream=sys.stderr)
++from hermes_cli.host_loop_lease import HostLoopLease
++home, name, role, interval, mode = sys.argv[2], sys.argv[3], sys.argv[4], float(sys.argv[5]), sys.argv[6]
++lease = HostLoopLease(name, role, interval=interval, home=home)
++tick, state = threading.Event(), None
++while True:
++    held = lease.held()
++    if held != state:
++        state = held
++        print("HELD" if held else "STANDBY", flush=True)
++    if held and mode == "wedge":
++        print("WEDGED", flush=True)
++        tick.wait()  # a pass that never ends: no beat() again
++    if held:
++        lease.beat()
++    tick.wait(interval)
++"""
++
++
++class Child:
++    def __init__(self, home: Path, role: str, *, interval: float = INTERVAL, mode: str = "loop",
++                 name: str = "test-loop", env: dict | None = None) -> None:
++        self.lines: queue.Queue = queue.Queue()
++        self.seen: list[str] = []
++        self.proc = subprocess.Popen(
++            [sys.executable, "-c", CHILD, str(ROOT), str(home), name, role, str(interval), mode],
++            stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True,
++            env={**os.environ, **(env or {})})
++        self.stderr: list[str] = []
++        threading.Thread(target=self._pump, args=(self.proc.stdout, self.lines), daemon=True).start()
++        threading.Thread(target=self._drain, daemon=True).start()
++
++    @staticmethod
++    def _pump(stream, out: queue.Queue) -> None:
++        for line in stream:
++            out.put(line.strip())
++
++    def _drain(self) -> None:
++        for line in self.proc.stderr:
++            self.stderr.append(line)
++
++    def _collect(self) -> None:
++        while True:
++            try:
++                self.seen.append(self.lines.get_nowait())
++            except queue.Empty:
++                return
++
++    def state(self) -> str | None:
++        self._collect()
++        states = [s for s in self.seen if s in ("HELD", "STANDBY")]
++        return states[-1] if states else None
++
++    def ever(self, what: str) -> bool:
++        self._collect()
++        return what in self.seen
++
++    def kill(self) -> None:
++        if self.proc.poll() is None:
++            self.proc.send_signal(signal.SIGKILL)
++        self.proc.wait(timeout=10)
++
++
++@pytest.fixture
++def home(tmp_path):
++    root = tmp_path / "home"
++    root.mkdir()
++    return root
++
++
++@pytest.fixture
++def spawn(home):
++    children: list[Child] = []
++
++    def make(role: str, **kw) -> Child:
++        child = Child(home, role, **kw)
++        children.append(child)
++        return child
++
++    yield make
++    for child in children:
++        child.kill()
++
++
++def _holders(children):
++    return [c for c in children if c.state() == "HELD"]
++
++
++def test_two_processes_only_one_holds(spawn, home):
++    a, b = spawn("serve"), spawn("serve")
++    wait_until(lambda: a.state() and b.state(), timeout=20, what="both children polled")
++    # several intervals of steady state: exactly one holder throughout
++    deadline = time.monotonic() + 5 * INTERVAL
++    while time.monotonic() < deadline:
++        assert len(_holders([a, b])) == 1, (a.seen, b.seen)
++        threading.Event().wait(INTERVAL / 4)  # health: allow HX013 -- sampling a steady state is the behaviour under test
++    holder = _holders([a, b])[0]
++    meta = json.loads((hll.lease_dir(home) / "test-loop.lock").read_text())
++    assert meta["pid"] == holder.proc.pid and meta["held"] is True and meta["role"] == "serve"
++    assert meta["start"] is not None and meta["heartbeat_at"] > 0
++
++
++def test_holder_killed_standby_takes_over_within_an_interval(spawn):
++    a = spawn("serve")
++    wait_until(lambda: a.state() == "HELD", timeout=20, what="first holder")
++    b = spawn("serve")
++    wait_until(lambda: b.state() == "STANDBY", timeout=20, what="standby")
++    a.kill()
++    killed = time.monotonic()
++    wait_until(lambda: b.state() == "HELD", timeout=5, what="standby takes over")
++    # one poll interval plus scheduling slack for a loaded CI host
++    assert time.monotonic() - killed < INTERVAL + 1.5
++
++
++def test_priority_handoff_third_process_does_not_steal(spawn, home):
++    dash = spawn("dashboard")
++    wait_until(lambda: dash.state() == "HELD", timeout=20, what="dashboard holds")
++    # an aggressive same-priority standby polling far faster than the holder's pass
++    thief = spawn("dashboard", interval=0.01)
++    wait_until(lambda: thief.state() == "STANDBY", timeout=20, what="thief standby")
++    gateway = spawn("gateway")
++    wait_until(lambda: gateway.state() == "HELD", timeout=10, what="gateway takes the lease")
++    wait_until(lambda: dash.state() == "STANDBY", timeout=5, what="dashboard handed off")
++    threading.Event().wait(5 * INTERVAL)  # health: allow HX013 -- no steal over several passes is the behaviour under test
++    assert gateway.state() == "HELD"
++    assert not thief.ever("HELD"), thief.seen
++    assert not (hll.lease_dir(home) / "test-loop.want").exists()  # the winner cleared its want
++
++
++def test_lower_priority_never_preempts(spawn):
++    gateway = spawn("gateway")
++    wait_until(lambda: gateway.state() == "HELD", timeout=20, what="gateway holds")
++    serve = spawn("serve")
++    wait_until(lambda: serve.state() == "STANDBY", timeout=20, what="serve standby")
++    threading.Event().wait(5 * INTERVAL)  # health: allow HX013 -- no preemption over several passes is the behaviour under test
++    assert gateway.state() == "HELD" and serve.state() == "STANDBY"
++
++
++def test_wedged_holder_released_by_watchdog(spawn):
++    wedged = spawn("serve", mode="wedge")
++    wait_until(lambda: wedged.ever("WEDGED"), timeout=20, what="holder wedged")
++    wedged_at = time.monotonic()
++    standby = spawn("serve")
++    wait_until(lambda: standby.state() == "HELD", timeout=10, what="standby takes over a wedged holder")
++    assert time.monotonic() - wedged_at < hll.WATCHDOG_FACTOR * INTERVAL + 3
++    assert wedged.proc.poll() is None  # released by its own watchdog, not by dying
++    wait_until(lambda: any("releasing the lease" in line for line in wedged.stderr), timeout=5,
++               what="watchdog warning")
++
++
++def test_kill_switch_every_process_holds(spawn):
++    a = spawn("serve", env={hll.KILL_SWITCH_ENV: "0"})
++    b = spawn("serve", env={hll.KILL_SWITCH_ENV: "0"})
++    wait_until(lambda: a.state() == "HELD" and b.state() == "HELD", timeout=20, what="both hold")
++
++
++def test_kill_switch_in_process(monkeypatch, home):
++    monkeypatch.setenv(hll.KILL_SWITCH_ENV, "0")
++    a = hll.HostLoopLease("ks", "serve", interval=1, home=home)
++    b = hll.HostLoopLease("ks", "serve", interval=1, home=home)
++    assert a.held() and b.held()
++    assert not (hll.lease_dir(home) / "ks.lock").exists()  # no lock touched at all
++
++
++@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
++def test_unwritable_dir_fails_open_and_logs_once(home, caplog):
++    directory = hll.lease_dir(home)
++    directory.mkdir(parents=True)
++    directory.chmod(0o500)
++    try:
++        lease = hll.HostLoopLease("ro", "serve", interval=0.01, home=home)
++        with caplog.at_level(logging.WARNING, logger=hll.__name__):
++            assert lease.held() is True
++            lease._next_open = 0.0  # the retry window has passed: the second call reopens and fails again
++            assert lease.held() is True
++        warnings = [r for r in caplog.records if "unavailable" in r.getMessage()]
++        assert len(warnings) == 1
++    finally:
++        directory.chmod(0o700)
++
++
++@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
++def test_read_only_lock_file_still_locks(home):
++    directory = hll.lease_dir(home)
++    directory.mkdir(parents=True)
++    (directory / "rof.lock").write_text("")
++    (directory / "rof.lock").chmod(0o444)
++    a = hll.HostLoopLease("rof", "serve", interval=1, home=home)
++    assert a.held() is True
++    probe = hll.HostLoopLease("rof", "serve", interval=1, home=home)
++    assert probe.held() is False  # separate open file description: excluded by the kernel lock
++    a.release()
++    assert probe.held() is True
++    probe.release()
++
++
++def test_key_is_the_root_home_not_the_profile(tmp_path):
++    root = tmp_path / "custom-root"
++    (root / "profiles" / "coder").mkdir(parents=True)
++    assert hll.lease_dir(root / "profiles" / "coder") == hll.lease_dir(root)
++    assert hll.lease_dir(root) == Path(os.path.realpath(root)) / "run" / "host-loops"
++
++
++def test_stale_heartbeat_warns_once_per_holder(home, caplog):
++    holder = hll.HostLoopLease("stale", "serve", interval=0.05, home=home)
++    assert holder.held()
++    holder._stop.set()  # silence the watchdog: the holder stays wedged-but-holding
++    meta_path = hll.lease_dir(home) / "stale.lock"
++    meta = json.loads(meta_path.read_text())
++    meta["heartbeat_at"] -= 60
++    os.pwrite(holder._fd, json.dumps(meta).encode(), 0)
++    os.ftruncate(holder._fd, len(json.dumps(meta)))
++    standby = hll.HostLoopLease("stale", "serve", interval=0.01, home=home)
++    # same process: the flock still excludes a second open file description
++    with caplog.at_level(logging.WARNING, logger=hll.__name__):
++        for _ in range(4):
++            assert standby.held() is False
++            standby._next_probe = 0.0
++    stale = [r for r in caplog.records if "last beat" in r.getMessage()]
++    assert len(stale) == 1
++    holder._held = False
++    holder.release()
++    standby.release()
++
++
++def test_release_lets_a_standby_in_and_records_release(home):
++    a = hll.HostLoopLease("rel", "serve", interval=1, home=home)
++    b = hll.HostLoopLease("rel", "serve", interval=1, home=home)
++    assert a.held() and not b.held()
++    a.release()
++    meta = json.loads((hll.lease_dir(home) / "rel.lock").read_text())
++    assert meta["held"] is False and "released_at" in meta
++    assert b.held()
++    rows = {m["name"]: m for m in hll.holders(home)}
++    assert rows["rel"]["live"] is True and rows["rel"]["pid"] == os.getpid()
++    b.release()
++    assert hll.holders(home)[0]["live"] is False
++
++
++def test_release_window_standby_defers_to_live_want(home):
++    """The window between the holder's LOCK_UN and the waiter's wake-up: a standby that wins the
++    flock there must hand it straight back while a live ``.want`` of at least its priority exists."""
++    directory = hll.lease_dir(home)
++    directory.mkdir(parents=True)
++    waiter = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE)
++    try:
++        want = {"pid": waiter.pid, "start": hll._start_of(waiter.pid), "priority": 3, "role": "gateway"}
++        (directory / "win.want").write_text(json.dumps(want))
++        thief = hll.HostLoopLease("win", "dashboard", interval=1, home=home)
++        assert thief.held() is False
++        other = hll.HostLoopLease("win", "dashboard", interval=1, home=home)
++        assert other.held() is False  # the thief did not keep the flock either
++        peer = hll.HostLoopLease("win", "gateway", interval=1, home=home)
++        assert peer.held() is False  # equal priority: the process that asked first goes first
++    finally:
++        waiter.communicate(b"")
++    assert thief.held() is True  # the wanter is gone: its .want no longer counts
++    thief.release()
++
++
++def test_dead_want_is_ignored(home):
++    directory = hll.lease_dir(home)
++    directory.mkdir(parents=True)
++    dead = subprocess.Popen([sys.executable, "-c", "pass"])
++    dead.wait()
++    (directory / "dw.want").write_text(json.dumps({"pid": dead.pid, "start": 1, "priority": 3, "role": "gateway"}))
++    lease = hll.HostLoopLease("dw", "dashboard", interval=1, home=home)
++    assert lease.held() is True
++    lease.beat()
++    assert lease.held() is True
++    lease.release()
++
++
++def test_doctor_lists_holders(home, monkeypatch, capsys):
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    lease = hll.HostLoopLease("doc-loop", "gateway", interval=30)
++    assert lease.held()
++    from hermes_cli.doctor_state import _check_host_loop_leases
++    _check_host_loop_leases(False)
++    out = capsys.readouterr().out
++    assert "Host Loop Leases" in out and "doc-loop: held" in out and f"pid {os.getpid()}" in out
++    lease.release()
+-- 
+2.51.0
+

@@ -1,0 +1,519 @@
+From 40a158bb657ab820b3d87203f58239350328ad17 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 17:09:12 +0000
+Subject: [PATCH] fix(kanban): a mandatory model pin rides the worker pool; the
+ claiming worker runs exactly it or refuses [daveey]
+
+A card created with kanban_create(model=..., pin_mandatory=true) never reached a pool worker. An example is
+t_01a1cefa6145100f, an Opus exact-head review that stayed on the hub with `option: pin_mandatory=1`.
+Pool portability (kanban_placement.portable_reason) reused the courier's UNCARRIED_OPTIONS, and that list
+names pin_mandatory, so every such card got `uncarried option`. The pool route never used the courier.
+model_override, provider_override and model_pin_mandatory are Board row fields (kanban_db_sync.SYNCED_COLUMNS)
+that a worker's pickup already copies.
+
+Five whys
+1. Why did the Opus review stay on the hub? portable_reason returned `uncarried option`.
+2. Why? pin_mandatory is in UNCARRIED_OPTIONS, and pool portability checks that list.
+3. Why is it in that list? `hermes-hub create-task` (the cross-gateway courier) cannot carry the mark. The list
+   was written for the courier, and pool portability borrowed it whole.
+4. Why was that wrong for the pool? The pool replicates the card row, mark included, so the pin was already
+   transported. The only real gap was on the worker side: nothing stopped a worker from running a mandatory pin
+   it could not serve. route_model_mismatch -> clear_refused_pin would even drop the pin for the profile default.
+5. Why did no test catch it? The placement tests covered the courier options, and the pin-reroute tests covered
+   the quota path. No test followed a mandatory pin through pool enrollment and a worker claim.
+
+Fix
+- kanban_placement.POOL_CARRIED_OPTIONS = ("pin_mandatory",). Pool portability skips it. The courier
+  (_uncarried) still refuses it, unchanged.
+- New hermes_cli/kanban_mandatory_pin.py:
+  - LABEL capability:mandatory-model-pin: the attestation that a destination's core refuses a mandatory pin
+    it cannot serve.
+  - requirements() adds that label to a mandatory-pin card's required labels:
+    - worker queue: runs_on [pool:worker, capability:mandatory-model-pin], so the Board leases it only to
+      attesting machines;
+    - worker-first pool: every eligible member must attest at create (placement_diagnostics), and the actual
+      destination is rechecked at claim/execution (coordination.claim_refusal).
+  - An old-core pool, or an unknown registry, keeps the card home with `mandatory model pin unattested`.
+    Mixed versions fail closed.
+  - refusal() runs on the claiming worker (runs_on_capabilities.claim_refusal). It leaves the card on the Board
+    when this host cannot run the exact model/provider: no profile, family mismatch, managed registry refusal,
+    provider disabled, or an unroutable class pin. It never falls back to another model.
+- clear_refused_pin never clears a mandatory pin; its CAS requires model_pin_mandatory = 0.
+- coordination.stranded also names a card created home for want of this attestation.
+- A non-mandatory pin keeps every substitution it had: quota reroute and registry clear.
+
+The label is published by the state repo's worker capability proof (hosts/hermes-workers/capability-proofs,
+`mandatory-model-pin`, a static read of the installed core). Until it is published, mandatory-pin cards stay
+on the hub exactly as before.
+
+Tests: tests/hermes_cli/test_kanban_mandatory_pin.py (14). On base (with a no-op stub of the new module, since
+the module does not exist there) 10 fail. The 4 that pass are controls: a non-mandatory pin is not refused, a
+servable pin is not refused, a mark without a model pins nothing, and the courier still refuses.
+All 15 mutants of the new conditions are killed. tests/hermes_cli/test_kanban_*.py: 9933 passed, 0 failed.
+---
+ hermes_cli/kanban_mandatory_pin.py            | 104 ++++++++
+ hermes_cli/kanban_model_assignment.py         |   3 +-
+ hermes_cli/kanban_placement.py                |   6 +-
+ hermes_cli/kanban_placement_coordination.py   |  18 +-
+ hermes_cli/kanban_placement_diagnostics.py    |   3 +
+ hermes_cli/kanban_runs_on_capabilities.py     |   3 +
+ tests/hermes_cli/test_kanban_mandatory_pin.py | 222 ++++++++++++++++++
+ 7 files changed, 352 insertions(+), 7 deletions(-)
+ create mode 100644 hermes_cli/kanban_mandatory_pin.py
+ create mode 100644 tests/hermes_cli/test_kanban_mandatory_pin.py
+
+diff --git a/hermes_cli/kanban_mandatory_pin.py b/hermes_cli/kanban_mandatory_pin.py
+new file mode 100644
+index 0000000000..679de7943a
+--- /dev/null
++++ b/hermes_cli/kanban_mandatory_pin.py
+@@ -0,0 +1,104 @@
++"""A mandatory model pin travels with a pool card: the claiming worker runs exactly that pin or refuses. [daveey]
++
++``kanban_create(model=..., pin_mandatory=true)`` used to keep every card on its home gateway: placement listed
++``pin_mandatory`` among the courier's uncarried options, and pool portability reused that list, so the card's
++``portable_reason`` was ``uncarried option`` (t_01a1cefa6145100f, an Opus exact-head review, 11-12). The pool
++never needed the courier: ``model_override``, ``provider_override`` and ``model_pin_mandatory`` are Board row
++fields (``kanban_db_sync.SYNCED_COLUMNS``) a worker's pickup copies with the card.
++
++What the pool route needs instead, and where it lives:
++
++* every pool destination must run a core that refuses a mandatory pin it cannot serve. That is the
++  attestation :data:`LABEL` (published only for a worker whose core contains this change, like
++  ``pool:worker``). The creator checks it on every eligible pool member (:func:`requirements` through
++  ``kanban_placement_diagnostics.portability``), the destination checks it on itself
++  (``kanban_placement_coordination.claim_refusal``). A pool without it, or an unknown registry, keeps
++  the card home (:data:`REASON`): mixed versions fail closed;
++* the claiming machine refuses a mandatory pin it cannot run exactly (:func:`refusal`): the card stays on
++  the Board for a machine that can. There is never a fallback to another model, and a stored mandatory
++  pin is never cleared (``kanban_model_assignment.route_model_mismatch``).
++
++A pin that is not mandatory keeps every substitution it had (quota reroute, registry clear).
++"""
++from __future__ import annotations
++
++import logging
++from typing import Any, Mapping, Optional
++
++_log = logging.getLogger(__name__)
++
++LABEL = "capability:mandatory-model-pin"
++REASON = "mandatory model pin unattested"
++_logged: set[tuple[str, str]] = set()
++
++
++def _str(value: Any) -> str:
++    return str(value or "").strip()
++
++
++def pin_of(item: Mapping[str, Any]) -> Optional[tuple[str, str]]:
++    """``(model, provider)`` of a mandatory pin, from create args (``pin_mandatory``/``model``/``provider``) or a
++    card row (``model_pin_mandatory``/``model_override``/``provider_override``); None when there is none.
++    A mark without a model pins nothing (``kanban_pin_reroute.mandatory_column`` refuses it at create)."""
++    if not (item.get("pin_mandatory") or item.get("model_pin_mandatory")):
++        return None
++    model = _str(item.get("model_override")) or _str(item.get("model"))
++    if not model:
++        return None
++    return model, (_str(item.get("provider_override")) or _str(item.get("provider"))).lower()
++
++
++def requirements(item: Mapping[str, Any]) -> set[str]:
++    """The attestation labels a destination must carry to take ``item`` (create args or a card row)."""
++    return {LABEL} if pin_of(item) else set()
++
++
++def refusal(card: Mapping[str, Any], *, me: str = "") -> Optional[str]:
++    """None when this machine can run ``card``'s mandatory pin exactly (or it has none), else why not.
++
++    Configuration checks a worker would otherwise fail at startup, or answer with another model: the assignee
++    profile must exist here, the model/provider family must match, the managed routing registry must accept the
++    pin, the provider must not be disabled, and a class pin must be routable. Credential exhaustion is a quota
++    wall (``kanban_quota_episode``), not a refusal. Never raises: an unreadable config refuses."""
++    pin = pin_of(card)
++    if pin is None:
++        return None
++    model, provider = pin
++    reason = _why_not(card.get("assignee"), model, provider)
++    if reason is None:
++        return None
++    reason = f"mandatory model pin {model}{f' on {provider}' if provider else ''} cannot run here: {reason}"
++    key = (str(card.get("id")), reason)
++    if key not in _logged:
++        _logged.add(key)
++        _log.info("kanban: not claiming %s on %s, left for a machine that serves its pin: %s",
++                  card.get("id"), me or "this machine", reason)
++    return reason
++
++
++def _why_not(assignee: Any, model: str, provider: str) -> Optional[str]:
++    from agent.model_routing import is_class_selector
++    from hermes_cli.kanban_model_assignment import (
++        ModelProviderMismatchError, _assignee_config, validate_model_assignment,
++    )
++    try:
++        config = _assignee_config(_str(assignee) or None)
++    except Exception as exc:  # health: allow BLE001 -- an unreadable profile refuses, it never guesses
++        return f"profile config unreadable ({type(exc).__name__})"
++    if not isinstance(config, dict):
++        return f"no profile {_str(assignee)!r} here"
++    if is_class_selector(model):
++        from hermes_cli.kanban_model_tier import class_unroutable_reason
++        why = class_unroutable_reason(model, config)
++        return f"class unroutable ({why})" if why else None
++    try:
++        validate_model_assignment(_str(assignee) or None, model, provider or None)
++    except ModelProviderMismatchError as exc:
++        return exc.code
++    if provider and provider != "auto":
++        from hermes_cli.config import is_provider_enabled
++        providers = config.get("providers")
++        block = providers.get(provider) if isinstance(providers, dict) else None
++        if not is_provider_enabled(block if isinstance(block, dict) else None):
++            return "provider disabled"
++    return None
+diff --git a/hermes_cli/kanban_model_assignment.py b/hermes_cli/kanban_model_assignment.py
+index 9de30ed3a3..9651299b78 100644
+--- a/hermes_cli/kanban_model_assignment.py
++++ b/hermes_cli/kanban_model_assignment.py
+@@ -154,7 +154,8 @@ def clear_refused_pin(conn, task_id, model, provider, allowed, *, author=REFUSED
+     with kb.write_txn(conn):
+         cur = conn.execute(
+             "UPDATE tasks SET model_override = NULL, provider_override = NULL "
+-            "WHERE id = ? AND model_override IS ? AND provider_override IS ? AND status != 'archived'",
++            "WHERE id = ? AND model_override IS ? AND provider_override IS ? AND status != 'archived' "
++            "AND COALESCE(model_pin_mandatory, 0) = 0",  # a mandatory pin is never dropped for the default
+             (task_id, model, provider))
+         if cur.rowcount != 1:
+             return False
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index f288491bbb..c9375bdbbb 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -208,6 +208,9 @@ UNCARRIED_OPTIONS = ("initial_status", "human_request", "workspace_path", "proje
+                      # target's own queue (11-11: placement="hub", runs_on=[machine:worker-1]). The labels work
+                      # from the creating board (Board lease), so such a card stays here; with a pin it is refused.
+                      "runs_on", "pin_mandatory")  # courier cannot preserve mandatory model pins either
++# Of those, the ones the pool route carries anyway: Board row fields a worker's pickup copies. A mandatory model
++# pin rides model_pin_mandatory; kanban_mandatory_pin gates it on the destination's attestation. [daveey]
++POOL_CARRIED_OPTIONS = ("pin_mandatory",)
+ # kanban_create options a hermes-hub client with `create-task --option KEY=JSON` carries to the card.
+ # (hermes-hub also allows reasoning_effort, but kanban_create has no such parameter.)
+ CARRIED_OPTIONS = ("skills", "max_runtime_seconds", "priority", "model", "provider", "goal_mode",
+@@ -529,7 +532,8 @@ def structural_reason(args: dict, cfg: Optional[dict] = None) -> Optional[str]:
+     # Explicit tool defaults are equivalent to omission, as on the CLI path.
+     # A blocked initial status still needs origin-side human-request handling.
+     if any(args.get(k) not in (None, "", [], False)
+-           for k in UNCARRIED_OPTIONS if not (k == "initial_status" and args.get(k) == "running")):
++           for k in UNCARRIED_OPTIONS
++           if k not in POOL_CARRIED_OPTIONS and not (k == "initial_status" and args.get(k) == "running")):
+         return "uncarried option"
+     reqs = args.get("requires") or []
+     reqs = [reqs] if isinstance(reqs, str) else list(reqs)
+diff --git a/hermes_cli/kanban_placement_coordination.py b/hermes_cli/kanban_placement_coordination.py
+index f1f21b412d..a68bf62498 100644
+--- a/hermes_cli/kanban_placement_coordination.py
++++ b/hermes_cli/kanban_placement_coordination.py
+@@ -241,8 +241,12 @@ def claim_refusal(card, me):
+             return "invalid worker access requirements"
+     if not isinstance(requires, list) or not all(isinstance(r, str) for r in requires):
+         return "invalid worker access requirements"
+-    return check(text, {}, target=me, skills=_loads(card.get("skills"), []),
+-                 requires=requires)
++    if refusal := check(text, {}, target=me, skills=_loads(card.get("skills"), []), requires=requires):
++        return refusal
++    from hermes_cli import kanban_mandatory_pin as mandatory
++    if (pin := mandatory.requirements(card)) and not attested([me], pin):
++        return mandatory.REASON  # this machine's core is not attested to refuse a pin it cannot serve
++    return None
+ 
+ 
+ def _free_slot(entry):
+@@ -259,13 +263,15 @@ def stranded(card, cfg, created_reason):
+     needs and has a free slot, and the card is otherwise portable (its full ``portable_reason`` judged against just
+     those members is None, so a home marker the early refusal hid still counts), the wait is the stale creation
+     verdict, not capacity. Read-only and advisory."""
+-    if created_reason != REASON or card.get("placement_policy") or not isinstance(cfg, dict):
++    from hermes_cli.kanban_mandatory_pin import REASON as PIN_REASON
++    if created_reason not in (REASON, PIN_REASON) or card.get("placement_policy") or not isinstance(cfg, dict):
+         return []
+     from hermes_cli import kanban_capability_registry as reg
+     from hermes_cli.kanban_placement import portable_reason
+     from hermes_cli.kanban_runs_on_capabilities import _loads
+     args = {k: card.get(k) for k in ("title", "body", "assignee", "workspace_kind", "workspace_path", "tenant",
+-                                     "project_id", "max_retries")}
++                                     "project_id", "max_retries", "model_override", "provider_override",
++                                     "model_pin_mandatory")}
+     args.update(skills=_loads(card.get("skills"), []), requires=_loads(card.get("requires"), []),
+                 runs_on=_loads(card.get("runs_on"), None))
+     if not isinstance(args["requires"], list):
+@@ -296,7 +302,9 @@ def required_labels(args, cfg=None):
+     required, refusal = requirements(text)
+     if refusal:
+         return None
+-    return required | skill_requirements(args.get("skills")) | access_requirements(args.get("requires"))
++    from hermes_cli.kanban_mandatory_pin import requirements as pin_requirements
++    return (required | skill_requirements(args.get("skills")) | access_requirements(args.get("requires"))
++            | pin_requirements(args))
+ 
+ 
+ def legacy_refusal(args, cfg=None):
+diff --git a/hermes_cli/kanban_placement_diagnostics.py b/hermes_cli/kanban_placement_diagnostics.py
+index 3d4868add6..2150897c42 100644
+--- a/hermes_cli/kanban_placement_diagnostics.py
++++ b/hermes_cli/kanban_placement_diagnostics.py
+@@ -28,6 +28,9 @@ def portability(args: dict, cfg=None) -> tuple[str | None, str | None]:
+     full = without_carried_inputs(f"{title}\n{body}", c.raw)
+     if refusal := coordination.check(full, c.raw, skills=args.get("skills"), requires=reqs):
+         return refusal, None
++    from hermes_cli import kanban_mandatory_pin as mandatory
++    if (pin := mandatory.requirements(args)) and not coordination.attested(coordination.destinations(c.raw), pin):
++        return mandatory.REASON, None  # an old-core pool member would not refuse a pin it cannot serve
+     marker_full = coordination.access_text(coordination.marker_text(full), c.raw, requires=reqs)
+     extra = c.raw.get("extra_home_markers")
+     exemptible = (p.HUB_CLI_COMMAND, r"\btoken-broker\b", r"\bssh\b", r"\bon the hub\b", r"\bthe hub's\b",
+diff --git a/hermes_cli/kanban_runs_on_capabilities.py b/hermes_cli/kanban_runs_on_capabilities.py
+index a43cae6a4d..ae3a353a86 100644
+--- a/hermes_cli/kanban_runs_on_capabilities.py
++++ b/hermes_cli/kanban_runs_on_capabilities.py
+@@ -244,6 +244,9 @@ def claim_refusal(card: Mapping[str, Any], *, me: str = "") -> Optional[str]:
+     from hermes_cli.kanban_placement_coordination import claim_refusal as coordination_refusal
+     if refusal := coordination_refusal(card, me):
+         return refusal
++    from hermes_cli.kanban_mandatory_pin import refusal as mandatory_pin_refusal
++    if refusal := mandatory_pin_refusal(card, me=me):
++        return refusal  # never claim a mandatory pin to run another model: left for a machine that serves it
+     assignee = card.get("assignee")
+     if not assignee:
+         return None
+diff --git a/tests/hermes_cli/test_kanban_mandatory_pin.py b/tests/hermes_cli/test_kanban_mandatory_pin.py
+new file mode 100644
+index 0000000000..3923cbc43d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_mandatory_pin.py
+@@ -0,0 +1,222 @@
++"""A mandatory model pin rides the pool: enrolled, claimed by a worker that runs exactly it, refused elsewhere. [daveey]
++
++t_01a1cefa6145100f (an Opus exact-head review, ``pin_mandatory=1``) stayed on the hub with ``uncarried option``:
++pool portability reused the courier's uncarried list, though the pin is three Board row fields a pickup copies.
++Here: create enrolls such a card for the worker queue only when every pool member attests
++``capability:mandatory-model-pin`` (an old-core pool keeps it home), the worker that claims it records the pinned
++model in its ``run_route``, a worker that cannot serve the pin leaves it on the Board, and no repair ever swaps
++the pin for the profile default. The courier still cannot carry it.
++"""
++from __future__ import annotations
++
++import json
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_mandatory_pin as mp
++from hermes_cli import kanban_placement as kp
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_worker_node import BOARD, HUB, MACHINES, WORKER, Gateway
++
++POOL = "pool:worker"
++CFG = {"worker_queue": {HUB: POOL}}
++PIN = {"model": "claude-opus-5-5", "provider": "anthropic", "pin_mandatory": True}
++REVIEW = {"title": "Independent exact-head review: PR 1 @abc", "assignee": "default", "requires": []}
++
++
++def _attest(monkeypatch, *, carries=True):
++    """worker-1 is the pool; with ``carries`` its core attests the mandatory-pin refusal."""
++    labels = ["linux", POOL] + ([mp.LABEL] if carries else [])
++    monkeypatch.setitem(MACHINES[WORKER], "labels", labels)
++    monkeypatch.setitem(MACHINES[WORKER], "last_seen", time.time() * 1000)  # a fresh attestation
++
++
++@pytest.fixture
++def svc():
++    return FakeService(lease_runs=True, machines=MACHINES)
++
++
++@pytest.fixture
++def gws(tmp_path, monkeypatch, svc):
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    monkeypatch.setattr(kp, "config", lambda: CFG)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    sync.consume_dispatcher_wake()
++    hub = Gateway(tmp_path, HUB, svc, monkeypatch, pickup=False)
++    worker = Gateway(tmp_path, WORKER, svc, monkeypatch, pickup="true")
++    yield hub, worker
++    for g in (hub, worker):
++        g.conn.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++def _create(hub, **extra):
++    from tools import kanban_tools
++    hub.enter()
++    monkey_self = "hermes_cli.kanban_capability_registry.self_gateway"
++    with pytest.MonkeyPatch.context() as m:
++        m.setattr(monkey_self, lambda: HUB)
++        out = json.loads(kanban_tools._handle_create({**REVIEW, **extra}))
++    assert out.get("ok"), out
++    return out
++
++
++def _runs_on(conn, tid):
++    raw = conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    return json.loads(raw) if raw else None
++
++
++def _route(conn, tid):
++    rows = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'run_route' ORDER BY id",
++                        (tid,)).fetchall()
++    return [json.loads(p) for (p,) in rows]
++
++
++# --- create ----------------------------------------------------------------------------------------------------
++
++def test_a_mandatory_pin_card_is_enrolled_for_the_attested_pool(gws, monkeypatch):
++    hub, _ = gws
++    _attest(monkeypatch)
++    args = {**REVIEW, **PIN}
++    hub.enter()
++    with monkeypatch.context() as m:
++        m.setattr("hermes_cli.kanban_capability_registry.self_gateway", lambda: HUB)
++        assert kp.portable_reason(args, CFG) is None
++    out = _create(hub, **PIN)
++    assert sorted(_runs_on(hub.conn, out["task_id"])) == sorted([POOL, mp.LABEL]), out
++    row = hub.conn.execute("SELECT model_override, provider_override, model_pin_mandatory FROM tasks WHERE id = ?",
++                           (out["task_id"],)).fetchone()
++    assert tuple(row) == ("claude-opus-5-5", "anthropic", 1)
++
++
++def test_an_old_core_pool_keeps_the_mandatory_pin_card_home(gws, monkeypatch):
++    hub, _ = gws
++    _attest(monkeypatch, carries=False)  # worker-1 runs a core that would not refuse a pin it cannot serve
++    hub.enter()
++    with monkeypatch.context() as m:
++        m.setattr("hermes_cli.kanban_capability_registry.self_gateway", lambda: HUB)
++        assert kp.portable_reason({**REVIEW, **PIN}, CFG) == mp.REASON
++    out = _create(hub, **PIN)
++    assert _runs_on(hub.conn, out["task_id"]) is None, out
++    # Without the mark the same pin is ordinary portable work, attestation or not.
++    out = _create(hub, title="Summarise the failing CI jobs", model="claude-opus-5-5", provider="anthropic")
++    assert _runs_on(hub.conn, out["task_id"]) == [POOL], out
++
++
++# --- claim -----------------------------------------------------------------------------------------------------
++
++def test_a_worker_that_serves_the_pin_claims_it_and_runs_exactly_that_model(gws, svc, monkeypatch):
++    hub, worker = gws
++    _attest(monkeypatch)
++    tid = _create(hub, **PIN)["task_id"]
++    assert sorted(_runs_on(hub.conn, tid)) == sorted([POOL, mp.LABEL])  # queued for the pool, not a default-placement copy
++    hub.round()
++    worker.round()
++    worker.tick()
++    assert svc.board(BOARD)["leases"][tid]["holder"] == WORKER
++    [route] = _route(worker.conn, tid)
++    assert (route["model"], route["provider"]) == ("claude-opus-5-5", "anthropic"), route
++    assert kb.get_task(worker.conn, tid).model_pin_mandatory == 1
++
++
++def test_a_worker_that_cannot_serve_the_pin_refuses_the_claim(gws, svc, monkeypatch):
++    hub, worker = gws
++    _attest(monkeypatch)
++    cfg = worker.home / "config.yaml"
++    cfg.write_text(cfg.read_text() + "providers:\n  anthropic:\n    enabled: false\n")
++    tid = _create(hub, **PIN)["task_id"]
++    assert sorted(_runs_on(hub.conn, tid)) == sorted([POOL, mp.LABEL])  # queued for the pool, not a default-placement copy
++    hub.round()
++    worker.round()
++    worker.tick()
++    assert tid not in svc.board(BOARD)["leases"]
++    assert kb.get_task(worker.conn, tid) is None  # left on the Board for a machine that serves it
++    reason = mp.refusal({"id": tid, "assignee": "default", "model_override": "claude-opus-5-5",
++                         "provider_override": "anthropic", "model_pin_mandatory": 1}, me=WORKER)
++    assert reason and "provider disabled" in reason
++
++
++@pytest.mark.parametrize("card,want", [
++    ({"model_override": "claude-opus-5-5", "provider_override": "openai-codex", "model_pin_mandatory": 1},
++     "model_provider_mismatch"),
++    ({"model_override": "claude-opus-5-5", "provider_override": "openai-codex"}, None),  # not mandatory
++    ({"model_override": "claude-opus-5-5", "provider_override": "anthropic", "model_pin_mandatory": 1}, None),
++    ({"model_override": "claude-opus-5-5", "model_pin_mandatory": 1, "assignee": "nobody"}, "no profile"),
++])
++def test_refusal_names_why_the_exact_pin_cannot_run_here(tmp_path, monkeypatch, card, want):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    (tmp_path / "config.yaml").write_text("model:\n  provider: anthropic\n")
++    got = mp.refusal({"id": "t", "assignee": "default", **card})
++    assert (got is None) if want is None else (want in got), got
++
++
++def test_a_mark_without_a_model_pins_nothing():
++    # A Board row can carry model_pin_mandatory after `set-model` cleared the model (kanban_db keeps the mark
++    # NULL then, but a wire row is not trusted): nothing to serve, so no label demand and no refusal.
++    card = {"id": "t", "assignee": "default", "model_override": None, "model_pin_mandatory": 1}
++    assert mp.pin_of(card) is None and mp.requirements(card) == set() and mp.refusal(card) is None
++    assert mp.requirements({"title": "x", "pin_mandatory": True, "model": "  "}) == set()
++
++
++def test_a_class_pin_is_refused_where_class_routing_is_off(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    card = {"id": "t", "assignee": "default", "model_override": "class:deep", "model_pin_mandatory": 1}
++    (tmp_path / "config.yaml").write_text("model:\n  provider: anthropic\n")
++    assert "class unroutable (routing_disabled)" in mp.refusal(card)
++    (tmp_path / "config.yaml").write_text("model:\n  provider: anthropic\nmodel_routing:\n  enabled: true\n")
++    assert "routing_disabled" not in (mp.refusal(card) or "")
++
++
++def test_a_home_card_waiting_on_the_attestation_is_named_stranded_once_the_pool_attests(monkeypatch):
++    from hermes_cli import kanban_placement_coordination as coord
++    entry = {"state": "active", "pickup": "all", "last_seen": time.time() * 1000, "labels": [],
++             "max_card_runs": 2, "metrics": {"active_card_runs": 0}}
++    monkeypatch.setattr(wn, "registry", lambda: {"machines": {"worker": entry}})
++    monkeypatch.setattr(kp.reg, "self_gateway", lambda: HUB)
++    cfg = {"worker_pools": {HUB: ["worker"]}, "assignees": ["default"]}
++    card = {"title": "Review PR 1", "body": "", "assignee": "default", "workspace_kind": "scratch",
++            "requires": "[]", "model_override": "claude-opus-5-5", "model_pin_mandatory": 1}
++    assert coord.stranded(card, cfg, mp.REASON) == []
++    entry["labels"] = [mp.LABEL]
++    assert coord.stranded(card, cfg, mp.REASON) == ["worker"]
++
++
++def test_a_claim_on_an_unattested_destination_is_refused(monkeypatch):
++    from hermes_cli import kanban_placement_coordination as coord
++    machines = {"w": {"state": "active", "pickup": "true", "last_seen": time.time() * 1000,
++                      "labels": [POOL]}}
++    monkeypatch.setattr(wn, "registry", lambda: {"machines": machines})
++    card = {"title": "review", "placement_policy": "worker-first-v1", "model_override": "claude-opus-5-5",
++            "model_pin_mandatory": 1}
++    assert coord.claim_refusal(card, "w") == mp.REASON
++    machines["w"]["labels"].append(mp.LABEL)
++    assert coord.claim_refusal(card, "w") is None
++
++
++# --- no fallback -----------------------------------------------------------------------------------------------
++
++def test_a_refused_mandatory_pin_is_never_cleared_to_the_profile_default(tmp_path):
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli.kanban_model_assignment import clear_refused_pin
++    conn = kbc.connect(tmp_path / "kanban.db")
++    keep = kb.create_task(conn, title="keep", assignee="default", model_override="claude-opus-5-5",
++                          provider_override="anthropic", pin_mandatory=True)
++    drop = kb.create_task(conn, title="drop", assignee="default", model_override="claude-opus-5-5",
++                          provider_override="anthropic")
++    assert not clear_refused_pin(conn, keep, "claude-opus-5-5", "anthropic", [])
++    assert kb.get_task(conn, keep).model_override == "claude-opus-5-5"
++    assert clear_refused_pin(conn, drop, "claude-opus-5-5", "anthropic", [])  # a plain pin may still be dropped
++    assert kb.get_task(conn, drop).model_override is None
++    conn.close()
++
++
++def test_the_courier_still_cannot_carry_a_mandatory_pin():
++    used = kp._uncarried({**REVIEW, **PIN}, kp._Cfg({}), True)
++    assert used == ["pin_mandatory"]
+-- 
+2.51.0
+

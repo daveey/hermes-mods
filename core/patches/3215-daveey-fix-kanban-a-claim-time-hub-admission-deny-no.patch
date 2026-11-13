@@ -1,0 +1,453 @@
+From a407e7aac3f92f5037381058735f0bd5902b9e45 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:55:51 +0000
+Subject: [PATCH] [daveey] fix(kanban): a claim-time hub admission deny no
+ longer strands a card on the hub; self-check re-places denied cards
+
+Incident (11-13, hermes-hub, t_01a184cee94603eb "Standing: support Eve on Ask Eve"): the hub's claim
+screen denied it at 01:40Z (a worker with ssh + hub-admin can do it) but recorded
+`kept: wake_check reads a hub-local path`, because its wake_check runs
+/home/ubuntu/.hermes/bin/alpha-hub-escalation-check.py. That probe is portable: the fleet installs it at
+the same path on every worker (state hosts/hermes-workers/install-core-tools.py HUB_PROBES), and off the
+hub it delegates to the hub copy through hub-admin. A recorded verdict is never revisited, so the card
+stayed label-less on the hub, which claimed and released it (unused_grant) for ~3 h while workers had free
+slots. Not NO_QUEUE, not a changed snapshot, not a local-only write: claim-time denies with no `kept`
+move through runs_on + outbox and are claimed by a worker (live: t_01a1d29656215c4e).
+
+- keep_reason: a `~/.hermes/bin/<name>` probe in PORTABLE_WAKE_PROBES (default
+  alpha-hub-escalation-check.py; `kanban.placement.portable_wake_probes` overrides) is not hub-local.
+  Any other hub path in the same command still keeps the card.
+- Dispatcher self-check (kanban_worker_first_selfcheck.denied_target, run by the claim screen for judged
+  candidates): a ready, label-less card created here with no claim/lease whose latest hub_admission is a
+  non-forced deny, ready >= 5 min, that no keep reason holds for *now* (no `kept`, or a `kept` that no
+  longer holds), and whose worker-queue labels a live other machine carries, gets the claim-time deny
+  route's runs_on (what `kanban move --pool` gives) and a `moved` event with the reason
+  (self_check=hub_admission_denied); logged at WARNING; no new judge call. A kept reason that still holds
+  (dir workspace, host_repo, hub worktree, hub-local wake_check, no queue) keeps the card. A self-check
+  failure skips only that card.
+
+Tests: tests/hermes_cli/test_kanban_claim_deny_selfcheck.py (18). Red on main: the portable-probe deny
+and both self-check repins fail; the keep cases pass there too.
+---
+ hermes_cli/kanban_hub_admission_claim.py      |  61 ++++-
+ hermes_cli/kanban_worker_first_selfcheck.py   |  55 ++++-
+ .../test_kanban_claim_deny_selfcheck.py       | 217 ++++++++++++++++++
+ 3 files changed, 330 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_claim_deny_selfcheck.py
+
+diff --git a/hermes_cli/kanban_hub_admission_claim.py b/hermes_cli/kanban_hub_admission_claim.py
+index f173940958..32e283a9c3 100644
+--- a/hermes_cli/kanban_hub_admission_claim.py
++++ b/hermes_cli/kanban_hub_admission_claim.py
+@@ -14,6 +14,10 @@ every hub run passes, so before the hub claims a ready, label-less card with no
+   citing the verdict, so it is not claimed here;
+ * deny of a card that must stay (structural restriction, ``host_repo``, a hub worktree in the brief, a hub-local
+   wake_check, or no worker queue fits): the verdict carries ``kept: <reason>`` and the card is claimed as before;
++  a fleet probe under ``~/.hermes/bin`` in :data:`PORTABLE_WAKE_PROBES` (or ``kanban.placement.
++  portable_wake_probes``) is not hub-local;
++* an earlier deny that left the card here (a ``kept`` that no longer holds, or none) is re-placed on the worker
++  queue once it has waited ready 5 min (``kanban_worker_first_selfcheck.denied_target``), with no new judge call;
+ * judge unavailable: claimed as before, warning logged, nothing recorded (judged at its next ready). Failing open
+   here keeps a judge outage from freezing the hub; only pre-gate cards reach this path.
+ * deferred (``Counts.deferred_ids``, left out of this tick's claims and judged next tick): a card edited while the
+@@ -43,6 +47,9 @@ WINDOW_SECONDS = 7 * 86400
+ MAX_JUDGED_PER_TICK = 3  # judge calls per dispatcher tick; the rest wait, unclaimed, for the next tick
+ # A wake_check that reads hub-local state (Hermes home, a hub worktree) is probed where the card lives.
+ _HUB_PATH = r"(?:~|\$HOME|\$\{HOME\}|/home/[^/\s]+)/\.hermes/"
++# Hub wake probes the fleet installs at the same ~/.hermes/bin path on every worker (state repo
++# hosts/hermes-workers/install-core-tools.py HUB_PROBES); kanban.placement.portable_wake_probes overrides.
++PORTABLE_WAKE_PROBES = ("alpha-hub-escalation-check.py",)
+ 
+ 
+ @dataclass
+@@ -54,6 +61,7 @@ class Counts:
+     home: int = 0  # of ``kept``: denies the claim gate would refuse on every worker (the home route)
+     unavailable: int = 0
+     deferred: int = 0
++    repinned: int = 0  # earlier denied cards the self-check re-placed (kanban_worker_first_selfcheck.denied_target)
+     deferred_ids: frozenset = field(default_factory=frozenset)  # not claimable this tick: judged next tick
+ 
+     def defer(self, tid: str) -> None:
+@@ -62,7 +70,7 @@ class Counts:
+ 
+     def line(self) -> str:
+         return ("hub admission: claim screen judged={judged} denied={denied} moved={moved} kept={kept} "
+-                "home={home} unavailable={unavailable} deferred={deferred}").format(**asdict(self))
++                "home={home} unavailable={unavailable} deferred={deferred} repinned={repinned}").format(**asdict(self))
+ 
+ 
+ def _candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+@@ -96,13 +104,29 @@ def keep_reason(conn: sqlite3.Connection, card: sqlite3.Row, fields: dict, cfg:
+     if re.search(kp.HOST_WORKTREE_PATH, text, re.IGNORECASE) or re.search(kp.LOCAL_WORKTREE_PATH, text,
+                                                                            re.IGNORECASE):
+         return "hub worktree path in the brief"
+-    probe = _latest_wake_check(conn, card["id"])
++    probe = _without_portable_probes(_latest_wake_check(conn, card["id"]), cfg)
+     if probe and any(re.search(p, probe, re.IGNORECASE) for p in (_HUB_PATH, kp.HOST_WORKTREE_PATH,
+                                                                    kp.LOCAL_WORKTREE_PATH)):
+         return "wake_check reads a hub-local path"
+     return None
+ 
+ 
++def _without_portable_probes(probe: str, cfg: dict) -> str:
++    """``probe`` minus each ``~/.hermes/bin/<name>`` the fleet installs on every worker at the hub's path
++    (``kanban.placement.portable_wake_probes``: basenames; default :data:`PORTABLE_WAKE_PROBES`). Such a probe runs
++    wherever the card parks, delegating to its hub copy through hub-admin, so it does not tie the card to the hub
++    (t_01a184cee94603eb was kept on the hub ~3 h by ``alpha-hub-escalation-check.py``). Any other hub path in the
++    same command still keeps it."""
++    names = (cfg.get("portable_wake_probes") if isinstance(cfg, dict) and "portable_wake_probes" in cfg
++             else PORTABLE_WAKE_PROBES)
++    if not probe or not isinstance(names, (list, tuple)):
++        return probe
++    for name in names:
++        if isinstance(name, str) and name and "/" not in name:
++            probe = re.sub(_HUB_PATH + r"bin/" + re.escape(name) + r"(?![\w.-])", " ", probe, flags=re.IGNORECASE)
++    return probe
++
++
+ def _event_head(conn: sqlite3.Connection, tid: str) -> int:
+     return conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?", (tid,)).fetchone()[0]
+ 
+@@ -128,6 +152,7 @@ def screen(conn: sqlite3.Connection, *, cfg: Optional[dict] = None, budget: int
+         tid = card["id"]
+         event_head = _event_head(conn, tid)
+         if pickup.verdict(conn, tid) is not None:
++            _self_check(conn, card, own, cfg, board, event_head, counts)
+             continue
+         if down:
+             counts.unavailable += 1
+@@ -195,6 +220,38 @@ def _apply(conn: sqlite3.Connection, own: str, tid: str, audit: dict, target: Op
+     return True
+ 
+ 
++def _self_check(conn: sqlite3.Connection, card: sqlite3.Row, own: str, cfg: dict, board: str, event_head: int,
++                counts: Counts) -> None:
++    """Re-place a judged card an earlier deny left here (``kanban_worker_first_selfcheck.denied_target``). A failure
++    skips only this card: the screen of the unjudged cards behind it must still run."""
++    from hermes_cli.kanban_worker_first_selfcheck import denied_target, log_repin
++    try:
++        found = denied_target(conn, card, own, cfg, board=board)
++        if found and _replace(conn, own, card["id"], *found, expected=card, event_head=event_head):
++            counts.repinned += 1
++            log_repin(card["id"], *found)
++    except Exception:  # health: allow BLE001 -- a backstop; the card is claimed here as before
++        _log.warning("hub admission: denied-card self-check failed for %s", card["id"], exc_info=True)
++
++
++def _replace(conn: sqlite3.Connection, own: str, tid: str, target: list[str], reason: str,
++             *, expected: sqlite3.Row, event_head: int) -> bool:
++    """The self-check's re-placement of an earlier denied card (no new verdict): runs_on + a ``moved`` event."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_move as km
++    from hermes_cli import kanban_worker_node as wn
++    with kb.write_txn(conn):
++        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
++        if row is None or dict(row) != dict(expected) or _event_head(conn, tid) != event_head:
++            return False  # changed since the check read it: the next tick decides again
++        wn.set_runs_on(conn, tid, target)
++        kb._append_event(conn, tid, km.MOVED_EVENT, {
++            "from_machine": own, "runs_on": target, "previous_runs_on": wn._parse(row["runs_on"]),
++            "reason": reason, "move_no": len(km.history(conn, tid)) + 1, "forced": False, "matches": [],
++            "queued": True, "self_check": "hub_admission_denied"})
++    return True
++
++
+ def safe_screen(conn: sqlite3.Connection) -> frozenset:
+     """Dispatcher seam: the ids this tick must not claim. A failed screen never stops the tick (the cards are
+     claimed as before)."""
+diff --git a/hermes_cli/kanban_worker_first_selfcheck.py b/hermes_cli/kanban_worker_first_selfcheck.py
+index 9da97d0e25..f11ae4dc27 100644
+--- a/hermes_cli/kanban_worker_first_selfcheck.py
++++ b/hermes_cli/kanban_worker_first_selfcheck.py
+@@ -11,6 +11,9 @@ and no lease, ready for :data:`STALE_S` while this gateway has a worker queue la
+ the card's labels, gets the same Board repin ``hermes kanban move --pool`` makes (``[<pool label>, *coordination
+ labels]``, so ``requires: [hub:write]`` keeps ``capability:hub-write``). :func:`hermes_cli.kanban_worker_placement.
+ reevaluate` makes the repin in place of a reserve; the card's ``moved`` event records why.
++
++:func:`denied_target` is the same backstop for a card hub admission denied at claim time (not worker-first, so its
++``runs_on`` is written locally and pushed like any field, by the hub's claim screen).
+ """
+ from __future__ import annotations
+ 
+@@ -53,4 +56,54 @@ def pool_target(conn, row, gateway, cfg, *, now=None):
+ 
+ 
+ def log_repin(task_id, labels, reason):
+-    logger.warning("kanban worker-first self-check: repinned %s to %s (%s)", task_id, labels, reason)
++    logger.warning("kanban dispatcher self-check: repinned %s to %s (%s)", task_id, labels, reason)
++
++
++DENIED_REASON = ("dispatcher self-check: ready {minutes} min here after hub admission denied it ({why}); queued for "
++                 "the worker pool (what `hermes kanban move --pool` does)")
++
++
++def denied_target(conn, row, gateway, cfg, *, board, now=None):
++    """``(labels, reason)`` for a ready card hub admission denied that still waits here with no ``runs_on``, else
++    None. Read-only (cached, fresh machine registry only).
++
++    Incident (11-13, hermes-hub): the claim screen denied t_01a184cee94603eb at 01:40Z but kept it, because its
++    wake_check named a fleet probe under ``~/.hermes/bin`` that every worker also installs; the verdict was never
++    revisited, so the hub claimed and released it for ~3 h while workers had free slots. The kept rule is fixed in
++    :func:`hermes_cli.kanban_hub_admission_claim.keep_reason`; this backstop covers the rest: a ready, label-less
++    (``placement_policy`` NULL) card created here, with no claim or lease, whose latest ``hub_admission`` event is a
++    non-forced deny, ready for :data:`STALE_S`, that no keep reason holds for *now* (a recorded ``kept`` that still
++    holds, e.g. a dir workspace, ``host_repo`` or a hub-local wake_check, keeps it), and whose worker-queue labels a
++    live machine other than this one carries. The caller writes the same ``runs_on`` the claim-time deny route
++    writes (``hermes kanban move --pool``'s labels) and a ``moved`` event with the reason."""
++    from hermes_cli import kanban_hub_admission_claim as claim
++    from hermes_cli import kanban_hub_admission_pickup as pickup
++    from hermes_cli import kanban_move as km
++    from hermes_cli import kanban_worker_node as node
++    from hermes_cli.kanban_hub_admission_placement import latest_verdict
++    from hermes_cli.kanban_parent_unclaimed import ready_since
++
++    # created_on NULL is this gateway's own card the Board has not stamped yet (kanban_sync_client "mine").
++    if (row["placement_policy"] is not None or row["runs_on"] not in (None, "", "[]") or row["status"] != "ready"
++            or row["created_on"] not in (None, gateway) or row["claim_lock"] is not None
++            or row["lease_holder"] is not None):
++        return None
++    verdict = latest_verdict(conn, row["id"])
++    if not verdict or verdict.get("admit") is not False or verdict.get("forced"):
++        return None
++    waited = (time.time() if now is None else now) - ready_since(conn, row["id"], row["created_at"])
++    if waited < STALE_S:
++        return None
++    fields = pickup._fields(row, board)
++    if claim.keep_reason(conn, row, fields, cfg):
++        return None
++    labels = pickup._target(fields, gateway, cfg, dict(verdict))
++    if not labels:
++        return None
++    registry = node.registry(require_fresh=True)
++    if registry is None or not km.matching_machines(labels, registry.get("machines") or {}, me=gateway):
++        return None
++    why = str(verdict.get("why") or "no reason recorded")[:200]
++    if verdict.get("kept"):
++        why = f"{why}; kept for '{verdict['kept']}', which no longer holds"
++    return labels, DENIED_REASON.format(minutes=int(waited // 60), why=why)
+diff --git a/tests/hermes_cli/test_kanban_claim_deny_selfcheck.py b/tests/hermes_cli/test_kanban_claim_deny_selfcheck.py
+new file mode 100644
+index 0000000000..7fc84607b6
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_claim_deny_selfcheck.py
+@@ -0,0 +1,217 @@
++"""A claim-time hub admission deny never leaves a card waiting on the hub with no ``runs_on``. [daveey]
++
++Incident (11-13, hermes-hub, t_01a184cee94603eb "Standing: support Eve on Ask Eve"): the hub's claim screen denied
++it at 01:40Z (a worker with ssh + hub-admin can do it) but recorded ``kept: wake_check reads a hub-local path``,
++because its wake_check runs ``/home/ubuntu/.hermes/bin/alpha-hub-escalation-check.py``. That probe is portable: the
++fleet installs it at the same path on every worker, and off the hub it delegates to the hub copy through hub-admin.
++The card was never re-placed, so the hub claimed and released it (``unused_grant``) for ~3 h while workers had
++free slots. Two fixes:
++
++* ``keep_reason`` ignores a ``~/.hermes/bin/<name>`` probe the fleet installs on every worker
++  (``PORTABLE_WAKE_PROBES``, overridable by ``kanban.placement.portable_wake_probes``);
++* the dispatcher self-check (``kanban_worker_first_selfcheck.denied_target``, run by the claim screen) re-places a
++  ready, label-less card created here whose latest verdict is a deny that no keep reason holds for now, once it has
++  waited 5 min and a live worker carries the queue labels. A ``kept`` that still holds keeps the card.
++"""
++from __future__ import annotations
++
++import logging
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_hub_admission_claim as hac
++from hermes_cli import kanban_parent_unclaimed as unclaimed
++from hermes_cli import kanban_placement as kp
++from hermes_cli import kanban_worker_first_selfcheck as selfcheck
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import hub_judge_support
++from tests.hermes_cli import test_kanban_hub_admission_pickup as pickup_suite
++from tests.hermes_cli.test_kanban_worker_node import BOARD, HUB, WORKER
++
++hub_judge = hub_judge_support.hub_judge
++gws = pickup_suite.gws
++POOL = pickup_suite.POOL
++PROBE_NAME = "alpha-hub-escalation-check.py"
++PROBE = f"/usr/bin/python3 -S /home/ubuntu/.hermes/bin/{PROBE_NAME} --after 1794533719.848279"
++STALE_KEPT = {"admit": False, "entry": "claim", "why": "a worker with ssh + hub-admin can do it",
++              "kept": "wake_check reads a hub-local path", "runs_on": None, "created_on": HUB}
++
++
++def _events(conn, tid, kind):
++    return pickup_suite._events(conn, tid, kind)
++
++
++def _holder(svc, tid):
++    return (svc.board(BOARD)["leases"].get(tid) or {}).get("holder")
++
++
++@pytest.fixture
++def portable(monkeypatch):
++    cfg = {**pickup_suite.CFG, "portable_wake_probes": [PROBE_NAME]}
++    monkeypatch.setattr(kp, "config", lambda: cfg)
++    return cfg
++
++
++def _card(hub, *, wake_check=None, verdict=None, **kw):
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="Standing: support Eve on Ask Eve",
++                         body="Answer the hand-offs Alpha posts for Eve.", assignee="default", **kw)
++    with kb.write_txn(hub.conn):
++        if wake_check:
++            kb._append_event(hub.conn, tid, "scheduled", {"wake_check": wake_check})
++        if verdict:
++            kb._append_event(hub.conn, tid, "hub_admission", verdict)
++    return tid
++
++
++def _waited(monkeypatch, seconds):
++    monkeypatch.setattr(unclaimed, "ready_since", lambda conn, tid, created_at=None: int(time.time()) - seconds)
++
++
++def _tick(hub):
++    hub.round()
++    return hub.tick()
++
++
++# --- keep_reason: a portable fleet probe is not a hub-local wake_check ------------------------------------------
++
++def test_a_claim_deny_with_a_portable_fleet_probe_moves_to_the_worker_queue(gws, hub_judge):
++    """The live t_01a184cee94603eb shape, with the default probe list: red on main (kept on the hub)."""
++    hub, worker, svc = gws
++    hub_judge.admit_next = False
++    tid = _card(hub, wake_check=PROBE)
++    _tick(hub)
++    [verdict] = _events(hub.conn, tid, "hub_admission")
++    assert verdict["admit"] is False and "kept" not in verdict
++    [moved] = _events(hub.conn, tid, "moved")
++    assert moved["runs_on"][0] == POOL and _holder(svc, tid) != HUB
++    hub.round()
++    worker.round()
++    worker.tick()
++    assert _holder(svc, tid) == WORKER
++
++
++@pytest.mark.parametrize("probe", [
++    f"{PROBE} && test -f ~/.hermes/cache/ready.flag",  # another hub path in the same command still keeps it
++    "python3 /home/ubuntu/.hermes/bin/mini-ssh.py 'true'",  # not listed as portable
++    f"python3 ~/.hermes/bin/{PROBE_NAME}.bak",  # a different file that only starts with the name
++])
++def test_hub_local_probes_still_keep_a_denied_card(gws, hub_judge, portable, probe):
++    hub, _worker, svc = gws
++    hub_judge.admit_next = False
++    tid = _card(hub, wake_check=probe)
++    _tick(hub)
++    [verdict] = _events(hub.conn, tid, "hub_admission")
++    assert verdict["kept"] == "wake_check reads a hub-local path" and _holder(svc, tid) == HUB
++
++
++def test_an_empty_portable_probe_list_makes_a_bin_probe_hub_local(gws, hub_judge, monkeypatch):
++    hub, _worker, svc = gws
++    monkeypatch.setattr(kp, "config", lambda: {**pickup_suite.CFG, "portable_wake_probes": []})
++    hub_judge.admit_next = False
++    tid = _card(hub, wake_check=PROBE)
++    _tick(hub)
++    [verdict] = _events(hub.conn, tid, "hub_admission")
++    assert verdict["kept"] == "wake_check reads a hub-local path" and _holder(svc, tid) == HUB
++
++
++# --- self-check: an earlier deny left on the hub is re-placed ---------------------------------------------------
++
++@pytest.mark.parametrize("case", ["stale_kept", "no_kept"])
++def test_self_check_repins_a_denied_card_left_ready_on_the_hub(gws, hub_judge, portable, monkeypatch, caplog, case):
++    """Red on main: a recorded deny is never revisited, so the hub claims the card."""
++    hub, worker, svc = gws
++    verdict = STALE_KEPT if case == "stale_kept" else {k: v for k, v in STALE_KEPT.items() if k != "kept"}
++    tid = _card(hub, wake_check=PROBE, verdict=verdict)
++    _waited(monkeypatch, 3 * 3600)
++    with caplog.at_level(logging.WARNING, logger=selfcheck.__name__):
++        counts = hac.screen(hub.conn)
++    [moved] = _events(hub.conn, tid, "moved")  # on main: none, the hub claims the card
++    assert counts.repinned == 1 and hub_judge.calls == []  # no new verdict, no model call
++    assert moved["runs_on"][0] == POOL and moved["previous_runs_on"] is None and moved["queued"] is True
++    assert moved["self_check"] == "hub_admission_denied"
++    assert moved["reason"].startswith("dispatcher self-check: ready 180 min here after hub admission denied it")
++    assert "a worker with ssh + hub-admin can do it" in moved["reason"]
++    assert ("no longer holds" in moved["reason"]) is (case == "stale_kept")
++    assert f"repinned {tid}" in caplog.text
++    assert len(_events(hub.conn, tid, "hub_admission")) == 1
++    _tick(hub)
++    assert _holder(svc, tid) != HUB
++    hub.round()
++    worker.round()
++    worker.tick()
++    assert _holder(svc, tid) == WORKER
++
++
++def _fetch_down():
++    raise OSError("board unreachable")
++
++
++def _linux_only():
++    return {"me": HUB, "machines": [{**m, "labels": ["linux"]} for m in pickup_suite.MACHINES.values()]}
++
++
++# case -> (card kwargs, verdict overrides or a whole verdict, wake_check, waited seconds, cfg override, registry)
++_STAY = {
++    "young": ({}, {}, PROBE, 60, None, None),
++    "kept_holds": ({}, {}, "test -f ~/.hermes/cache/ready.flag", 3 * 3600, None, None),
++    "dir_workspace": ({"workspace_kind": "dir"}, {"kept": "host workspace"}, PROBE, 3 * 3600, None, None),
++    "host_repo": ({"requires": ["terminal", "host_repo"]}, {"kept": "uncarried requirement"}, PROBE, 3 * 3600,
++                  None, None),
++    "forced": ({}, {"forced": True}, PROBE, 3 * 3600, None, None),
++    "admitted": ({}, {"admit": True, "need": "hub_chrome", "evidence": "x", "why": "ok", "kept": None}, PROBE,
++                 3 * 3600, None, None),
++    "no_machine": ({}, {}, PROBE, 3 * 3600, None, _linux_only),
++    "registry_down": ({}, {}, PROBE, 3 * 3600, None, _fetch_down),
++    "no_queue": ({}, {}, PROBE, 3 * 3600, {"worker_pools": {HUB: [WORKER]}, "portable_wake_probes": [PROBE_NAME]},
++                 None),
++}
++
++
++@pytest.mark.parametrize("case", sorted(_STAY))
++def test_self_check_leaves_other_cards_on_the_hub(gws, hub_judge, portable, monkeypatch, tmp_path, case):
++    hub, _worker, _svc = gws
++    kw, overrides, probe, waited, cfg, fetch = _STAY[case]
++    if kw.get("workspace_kind") == "dir":
++        kw = {**kw, "workspace_path": str(tmp_path / "ws")}
++    if cfg is not None:
++        monkeypatch.setattr(kp, "config", lambda: cfg)
++    verdict = {k: v for k, v in {**STALE_KEPT, **overrides}.items() if v is not None}
++    tid = _card(hub, wake_check=probe, verdict=verdict, **kw)
++    _waited(monkeypatch, waited)
++    if fetch is not None:
++        hub.enter()
++        wn.set_registry_fetch(fetch)
++        wn._REGISTRY.update({"at": None, "value": None})
++    assert hac.screen(hub.conn).repinned == 0, case
++    assert _events(hub.conn, tid, "moved") == [], case
++    assert hub.conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0] is None, case
++
++
++def test_a_failed_self_check_still_screens_the_unjudged_cards(gws, hub_judge, portable, monkeypatch, caplog):
++    hub, _worker, _svc = gws
++    _card(hub, wake_check=PROBE, verdict=STALE_KEPT)
++    hub_judge.admit_next = False
++    fresh = _card(hub)
++
++    def broken(*args, **kwargs):
++        raise RuntimeError("registry exploded")
++    monkeypatch.setattr(selfcheck, "denied_target", broken)
++    with caplog.at_level(logging.WARNING, logger=hac.__name__):
++        counts = hac.screen(hub.conn)
++    assert counts.judged == 1 and counts.moved == 1 and len(_events(hub.conn, fresh, "moved")) == 1
++    assert "denied-card self-check failed" in caplog.text
++
++
++def test_self_check_skips_a_card_that_changed_while_checked(gws, portable, monkeypatch):
++    hub, _worker, _svc = gws
++    tid = _card(hub, wake_check=PROBE, verdict=STALE_KEPT)
++    _waited(monkeypatch, 3 * 3600)
++    row = hub.conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
++    with kb.write_txn(hub.conn):
++        kb._append_event(hub.conn, tid, "commented", {"author": "x"})
++    head = hac._event_head(hub.conn, tid) - 1
++    assert hac._replace(hub.conn, HUB, tid, [POOL], "r", expected=row, event_head=head) is False
++    assert _events(hub.conn, tid, "moved") == []
+-- 
+2.51.0
+

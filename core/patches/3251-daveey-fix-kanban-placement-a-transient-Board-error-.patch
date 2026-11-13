@@ -1,0 +1,93 @@
+From ca4c937acb7a32aaaacacd978048fbd30308f1dd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:41:42 +0000
+Subject: [PATCH] [daveey] fix(kanban-placement): a transient Board error no
+ longer disables the self-check repin
+
+_remember_selfcheck_refusal recorded every HubError except not_claimable,
+including 5xx/429 outages, so one transient Board error sent a stranded
+worker-first card back to the reserve until its sync_version moved or the
+process restarted. Only a coded 4xx refusal (other than not_claimable and
+429) is remembered now; outages retry the repin on the next tick.
+
+Follow-up to the review nit on #1948 (card t_01a1d3d49172a8c9).
+---
+ hermes_cli/kanban_worker_placement.py         |  8 ++++--
+ .../test_kanban_pool_deny_runs_on.py          | 27 +++++++++++++++++--
+ 2 files changed, 31 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 15fa4b11f7..04ec7352b4 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -528,8 +528,12 @@ def _selfcheck_unrefused(key, row, labels, why):
+ 
+ 
+ def _remember_selfcheck_refusal(key, revision, why, exc):
+-    """Record a Board refusal of a self-check repin (``not_claimable`` is :data:`_refused`'s backoff instead)."""
+-    if why is None or rejection_code(exc) == "not_claimable":
++    """Record a Board refusal of a self-check repin (``not_claimable`` is :data:`_refused`'s backoff instead).
++
++    Only a coded 4xx is the Board's answer: a 5xx/429 (an outage) or an uncoded body is retried on the next tick."""
++    status, code = getattr(exc, "status", None), rejection_code(exc)
++    transient = type(status) is not int or not 400 <= status <= 499 or status == 429
++    if why is None or transient or code in (None, "not_claimable"):
+         return
+     _selfcheck_refused[key] = revision  # popped by _selfcheck_unrefused first, so this is the newest entry
+     if len(_selfcheck_refused) > 1024:  # cards that left the query never come back to clear theirs
+diff --git a/tests/hermes_cli/test_kanban_pool_deny_runs_on.py b/tests/hermes_cli/test_kanban_pool_deny_runs_on.py
+index 881beb9ea2..e50345a0e7 100644
+--- a/tests/hermes_cli/test_kanban_pool_deny_runs_on.py
++++ b/tests/hermes_cli/test_kanban_pool_deny_runs_on.py
+@@ -143,8 +143,9 @@ def test_a_crash_or_start_refusal_record_still_waits_for_a_completed_round(hub):
+ # --- dispatcher self-check -------------------------------------------------------------------------------------
+ 
+ class RecordingHub:
+-    def __init__(self, *, refuse_repin=None):
++    def __init__(self, *, refuse_repin=None, refuse_status=403, refuse_detail=None):
+         self.reserves, self.repins, self.refuse_repin = [], [], refuse_repin
++        self.refuse_status, self.refuse_detail = refuse_status, refuse_detail
+ 
+     def reserve(self, board, **body):
+         self.reserves.append(body)
+@@ -153,7 +154,7 @@ class RecordingHub:
+     def repin(self, board, **body):
+         self.repins.append(body)
+         if self.refuse_repin:
+-            raise ksc.HubError(403, json.dumps({"error": self.refuse_repin}))
++            raise ksc.HubError(self.refuse_status, self.refuse_detail or json.dumps({"error": self.refuse_repin}))
+         return {"version": 9, "runs_on": body["runs_on"], "placement_policy": None}
+ 
+ 
+@@ -246,6 +247,28 @@ def test_a_refused_self_check_repin_falls_back_to_the_reserve_until_the_revision
+     assert (BOARD, tid) not in wp._selfcheck_refused
+ 
+ 
++@pytest.mark.parametrize("status,body", [(503, "upstream unavailable"), (502, '{"error": "bad_gateway"}'),
++                                         (429, '{"error": "rate_limited"}')])
++def test_a_transient_board_error_on_a_self_check_repin_is_retried_next_tick(hub, no_pull, status, body):
++    """A 5xx/429 is an outage, not the Board's answer: the next tick asks the repin again instead of reserving."""
++    _home, conn = hub
++    tid = _stranded(conn, age=36 * 60)
++    board = RecordingHub(refuse_repin="transient", refuse_status=status, refuse_detail=body)
++    for _ in range(2):
++        wp.reevaluate(conn, board, BOARD, ME, cfg=CFG)
++    assert [(r["task_id"], r["expected_revision"]) for r in board.repins] == [(tid, 4)] * 2
++    assert board.reserves == [] and not wp._selfcheck_refused
++
++
++def test_a_forbidden_self_check_repin_still_reserves_at_the_refused_revision(hub, no_pull):
++    _home, conn = hub
++    tid = _stranded(conn, age=36 * 60)
++    board = RecordingHub(refuse_repin="forbidden", refuse_status=403)
++    for _ in range(2):
++        wp.reevaluate(conn, board, BOARD, ME, cfg=CFG)
++    assert len(board.repins) == 1 and [r["task_id"] for r in board.reserves] == [tid]
++
++
+ def test_a_refused_explicit_move_repin_is_not_downgraded_to_a_reserve(hub, no_pull):
+     """Only the self-check falls back: a run's kanban_move must never be handed back to the pool by a reserve."""
+     _home, conn = hub
+-- 
+2.51.0
+

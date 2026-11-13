@@ -1,0 +1,157 @@
+From fd426d4fefda1c2d5794eac40c3247dc43c32b21 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 19:30:29 +0000
+Subject: [PATCH] =?UTF-8?q?[daveey]=20spike(R1):=20pending=20receipt=20tab?=
+ =?UTF-8?q?le=20+=20trigger=20pair,=20staged=20as=20plan=20v4=20=C2=A72.1?=
+ =?UTF-8?q?=20wrote=20it=20(first=20txn=20statement)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ hermes_cli/kanban_db.py             |  4 ++
+ hermes_cli/kanban_db_connect.py     |  2 +
+ hermes_cli/kanban_db_schedule.py    |  2 +
+ hermes_cli/kanban_db_sync.py        |  6 +++
+ hermes_cli/kanban_source_receipt.py | 61 +++++++++++++++++++++++++++++
+ 5 files changed, 75 insertions(+)
+ create mode 100644 hermes_cli/kanban_source_receipt.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 1c21e58ef5..8134439c2e 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2511,6 +2511,8 @@ def complete_task(
+     from hermes_cli.kanban_metadata_files import discard_on_error
+     staged: list[Path] = []
+     with discard_on_error(staged), write_txn(conn):
++        from hermes_cli.kanban_source_receipt import stage_pending
++        stage_pending(conn, task_id)  # plan v4 §2.1: first statement of the ending txn
+         require_review(conn, task_id, expected_run_id, placement_settled=placement_settled)
+         if not _parents_satisfied(conn, task_id):
+             return False
+@@ -2867,6 +2869,8 @@ def block_task(
+     human_request = validate_block_request(human_request, kind)
+     pin = _park_pin.plan(conn, task_id, reason)  # git reads stay outside the write txn
+     with write_txn(conn), reason_comment(conn, task_id, comment) as noted:
++        from hermes_cli.kanban_source_receipt import stage_pending
++        stage_pending(conn, task_id)  # plan v4 §2.1: first statement of the ending txn
+         if not record_block(conn, task_id, goal_rejection, reason, expected_run_id, kind, human_request):
+             return False
+         cur_row = conn.execute("SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,)).fetchone()
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index a4ba954ab7..6f5d7aff1a 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -969,6 +969,8 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
+                 _migrate_add_optional_columns(conn)
+                 from hermes_cli.kanban_wake_episode import ensure_schema
+                 ensure_schema(conn)
++                from hermes_cli import kanban_source_receipt
++                kanban_source_receipt.ensure_schema(conn)  # before the capture triggers that read it
+                 _kb._sync.install_or_remove(conn, resolved)
+                 _ensure_activity_revision(conn, resolved)
+                 _INITIALIZED_PATHS.add(resolved)
+diff --git a/hermes_cli/kanban_db_schedule.py b/hermes_cli/kanban_db_schedule.py
+index c026f00c98..47ce73efb1 100644
+--- a/hermes_cli/kanban_db_schedule.py
++++ b/hermes_cli/kanban_db_schedule.py
+@@ -38,6 +38,8 @@ def schedule_task(
+     from hermes_cli import kanban_park_pin as kpp
+     pin = kpp.plan(conn, task_id, reason)  # git reads stay outside the write txn
+     with _kb.write_txn(conn), reason_comment(conn, task_id, comment) as noted:
++        from hermes_cli.kanban_source_receipt import stage_pending
++        stage_pending(conn, task_id)  # plan v4 §2.1: first statement of the ending txn
+         if _kb._awaiting_human_answer(conn, task_id):
+             return False
+         from hermes_cli.kanban_timed_park import scheduled_payload
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 9456b34550..89f5fa814d 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -574,9 +574,15 @@ def _update_trigger(table: str, columns: list[str]) -> str:
+         f"SELECT '{_wire_name(table, c)}' AS k, {_wire_value(table, c, 'NEW')} AS v WHERE OLD.{c} IS NOT NEW.{c}"
+         for c in columns
+     )
++    if table == "tasks":  # the virtual receipt rides the status-leaving op (kanban_source_receipt)
++        from hermes_cli.kanban_source_receipt import trigger_pair
++        pairs += f" UNION ALL {trigger_pair()}"
+     fields = f"(SELECT json_group_object(k, json(v)) FROM ({pairs}))"
+     base = "NEW.sync_version" if table == "tasks" else "NULL"
+     body = _outbox_insert(table, "upsert", _row_uid_sql(table, "NEW"), fields, base)
++    if table == "tasks":  # plan v4 §2.1: the trigger body deletes the pending row it used
++        body += (" DELETE FROM kanban_source_receipt_pending WHERE task_id = NEW.id AND run_id = OLD.current_run_id "
++                 "AND OLD.status = 'running' AND NEW.status IS NOT 'running';")
+     return (f"CREATE TRIGGER kanban_sync_{table}_upd AFTER UPDATE ON {table} "
+             f"WHEN {_NOT_APPLYING} AND ({changed}) BEGIN {body} END")
+ 
+diff --git a/hermes_cli/kanban_source_receipt.py b/hermes_cli/kanban_source_receipt.py
+new file mode 100644
+index 0000000000..633d8c912d
+--- /dev/null
++++ b/hermes_cli/kanban_source_receipt.py
+@@ -0,0 +1,61 @@
++"""Spike R1 (t_01a1d0bdfa1955d5): the source receipt rides the outbox op that moves a card out of ``running``.
++
++The receipt is computed before the ending's write transaction (the preflight; here a stub carrier, ``staged``)
++and parked in the local, never-synced ``kanban_source_receipt_pending`` row. The tasks UPDATE capture trigger
++(``kanban_db_sync._update_trigger``) reads it into the same outbox op as the status change, only when that UPDATE
++leaves ``running`` for the run the row names.
++"""
++from __future__ import annotations
++
++import contextlib
++import contextvars
++import json
++import sqlite3
++from typing import Any, Optional
++
++TABLE = "kanban_source_receipt_pending"
++DDL = (f"CREATE TABLE IF NOT EXISTS {TABLE} (task_id TEXT PRIMARY KEY, run_id INTEGER NOT NULL, "
++       "receipt TEXT NOT NULL CHECK (json_valid(receipt)))")
++# Stub preflight carrier: (task_id, run_id) -> receipt computed before the write transaction.
++_STAGED: contextvars.ContextVar[dict] = contextvars.ContextVar("kanban_source_receipt_staged", default={})
++
++
++def ensure_schema(conn: sqlite3.Connection) -> None:
++    conn.execute(DDL)
++
++
++def trigger_pair() -> str:
++    """The ``(k, v)`` row the tasks UPDATE capture trigger adds to its ``UNION ALL``."""
++    return (f"SELECT 'source_receipt' AS k, p.receipt AS v FROM {TABLE} AS p WHERE p.task_id = NEW.id "
++            "AND p.run_id = OLD.current_run_id AND OLD.status = 'running' AND NEW.status IS NOT 'running'")
++
++
++@contextlib.contextmanager
++def staged(task_id: str, run_id: int, receipt: Any):
++    token = _STAGED.set({**_STAGED.get(), (task_id, int(run_id)): receipt})
++    try:
++        yield
++    finally:
++        _STAGED.reset(token)
++
++
++def staged_receipt(task_id: str, run_id: Optional[int]) -> Any:
++    return None if run_id is None else _STAGED.get().get((task_id, int(run_id)))
++
++
++def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
++    row = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    return row[0] if row else None
++
++
++def _text(receipt: Any) -> str:
++    return receipt if isinstance(receipt, str) else json.dumps(receipt, sort_keys=True, separators=(",", ":"))
++
++
++def stage_pending(conn: sqlite3.Connection, task_id: str) -> None:
++    """Plan v4 §2.1 as written: the first statement of the ending's write transaction."""
++    run_id = _current_run_id(conn, task_id)
++    receipt = staged_receipt(task_id, run_id)
++    if receipt is not None:
++        conn.execute(f"INSERT OR REPLACE INTO {TABLE} (task_id, run_id, receipt) VALUES (?, ?, ?)",
++                     (task_id, run_id, _text(receipt)))
+-- 
+2.51.0
+

@@ -1,0 +1,89 @@
+From a5fc13a0d0669052f1099b900872a2f41821c1eb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 19:43:10 +0000
+Subject: [PATCH] [daveey] Verify singleton sidecar owners through fdinfo
+ before global lock discovery
+
+---
+ gateway/kanban_singleton.py                   | 17 ++++++++++++---
+ .../test_kanban_host_lock_visibility.py       | 21 ++++++++++++++++---
+ 2 files changed, 32 insertions(+), 6 deletions(-)
+
+diff --git a/gateway/kanban_singleton.py b/gateway/kanban_singleton.py
+index 02124405d3..153319927f 100644
+--- a/gateway/kanban_singleton.py
++++ b/gateway/kanban_singleton.py
+@@ -125,12 +125,23 @@ def _environ_home(pid: int) -> Optional[str]:
+ def holder_info(lock_path: Path) -> Optional[dict]:
+     """``{pid, hermes_home, root, since}`` for the process holding *lock_path*, or None when free/unknown.
+ 
+-    The pid comes from ``/proc/locks`` when readable (authoritative), else from the holder sidecar
+-    while that pid is alive. ``since`` is the wall time the holder took the lock (sidecar), or None.
++    The pid is verified against the sidecar candidate's Linux fdinfo, then discovered
++    through ``/proc/locks``; elsewhere a live sidecar pid is used. ``since`` is the
++    wall time the holder took the lock (sidecar), or None.
+     """
+     lock_path = Path(lock_path)
+     side = _read_json(_sidecar(lock_path, "holder.json")) or {}
+-    pid = _lock_holder_pid(lock_path)
++    # The global /proc/locks table can omit a held lock during unrelated churn.
++    # A sidecar is only a candidate: verify its exact PID/device/inode in fdinfo.
++    pid = None
++    side_pid = side.get("pid")
++    if isinstance(side_pid, int) and side_pid > 0:
++        from gateway.kanban_dispatcher_health import _owns_lock
++        with contextlib.suppress(OSError):
++            if _owns_lock(lock_path, side_pid):
++                pid = side_pid
++    if pid is None:
++        pid = _lock_holder_pid(lock_path)
+     if pid is None:
+         side_pid = side.get("pid")
+         # With /proc/locks readable a free lock means no holder; elsewhere trust a live sidecar pid.
+diff --git a/tests/hermes_cli/test_kanban_host_lock_visibility.py b/tests/hermes_cli/test_kanban_host_lock_visibility.py
+index ebec4bb5a0..a9ad7e77d3 100644
+--- a/tests/hermes_cli/test_kanban_host_lock_visibility.py
++++ b/tests/hermes_cli/test_kanban_host_lock_visibility.py
+@@ -33,7 +33,19 @@ def _no_gateway(monkeypatch):
+                         lambda **kw: SimpleNamespace(pid=None, probe_error=None))
+ 
+ 
+-def test_presence_reports_host_dispatcher_held_by_another_home(root, monkeypatch):
++@pytest.mark.parametrize("omit_global_lock", [False, True])
++def test_presence_reports_host_dispatcher_held_by_another_home(root, monkeypatch, omit_global_lock):
++    if omit_global_lock:
++        if not Path("/proc/self/fdinfo").exists():
++            pytest.skip("needs Linux fdinfo")
++        read_text = Path.read_text
++
++        def read_without_global_lock(path, *args, **kwargs):
++            if path == Path("/proc/locks"):
++                return ""  # A changing global lock table can omit a still-held lock.
++            return read_text(path, *args, **kwargs)
++
++        monkeypatch.setattr(Path, "read_text", read_without_global_lock)
+     from gateway import kanban_singleton as ks
+     from hermes_cli import kanban as cli
+     monkeypatch.setenv("HERMES_HOME", str(root))
+@@ -96,7 +108,8 @@ def test_at_capacity_names_where_the_cap_came_from(root, monkeypatch, configured
+     assert "cap_source=" in kbd.stuck_warning(6, [res])
+ 
+ 
+-def test_lock_holder_unaffected_by_unheld_sidecar(root, monkeypatch):
++@pytest.mark.parametrize("side_pid", [None, -1, "bad", "self"])
++def test_lock_holder_unaffected_by_unheld_sidecar(root, monkeypatch, side_pid):
+     """A stale holder sidecar from a dead gateway is not reported as a holder on Linux."""
+     from gateway import kanban_singleton as ks
+     if not Path("/proc/locks").exists():
+@@ -105,5 +118,7 @@ def test_lock_holder_unaffected_by_unheld_sidecar(root, monkeypatch):
+     handle, state = _acquire_singleton_lock(path)
+     assert state == "held"
+     _release_singleton_lock(handle)
+-    ks._write_json(Path(f"{path}.holder.json"), {"pid": 1, "hermes_home": "/x"})
++    import os
++    pid = os.getpid() if side_pid == "self" else side_pid
++    ks._write_json(Path(f"{path}.holder.json"), {"pid": pid, "hermes_home": "/x"})
+     assert ks.holder_info(path) is None
+-- 
+2.51.0
+

@@ -1,0 +1,353 @@
+From 9425368b693273e4062f328bc0427a6f3dcdc2cb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 00:07:35 +0000
+Subject: [PATCH] [daveey] delegation: keep a requested stop across shutdown;
+ log "not woken" only for notes
+
+Follow-up to PR #1683 review 5880847320 (non-blocking nits).
+
+1. A /stop (interrupt_all reason='/stop', or the gateway's interrupt_for_session
+   reason='stop_command') followed by a gateway shutdown before the unit's runner
+   unwound let interrupt_all(by_shutdown=True) stamp the still-active unit with
+   interrupted_by, so its result woke the parent on work the user chose to stop.
+   _mark_stop records the first stop's intent: a requested stop marks
+   _stop_requested and a later shutdown sweep no longer stamps it; a shutdown stop
+   stays stamped when a requested stop follows.
+
+2. _watch_notification_metadata warned "parent not woken" for every requested-stop
+   delegation result, including viewed parents whose result then runs as a turn.
+   It now only flags the admission (completion_requested_stop -> descriptor
+   requested_stop, validated against the stopped statuses); note_if_unviewed logs
+   the warning when the result is actually kept as a note (no viewer attached).
+
+Tests: Event-controlled regressions for /stop and stop_command before a shutdown
+sweep (plus shutdown-only and shutdown-then-stop controls), metadata validation,
+and the real viewed/unviewed executor route. Red on base (12 fail); 11/11 mutants
+killed; 37 related files 542 passed, 1 skipped.
+---
+ gateway/run_notifications.py                  |  8 +-
+ gateway/session_automation.py                 | 17 +++-
+ gateway/session_completion_notes.py           |  6 ++
+ .../test_unviewed_delegation_failure_turn.py  | 53 +++++++++++
+ ...est_delegate_shutdown_stop_wakes_parent.py | 90 +++++++++++++++++--
+ tools/async_delegation.py                     | 21 ++++-
+ tools/process_registry_notifications.py       |  2 +
+ 7 files changed, 182 insertions(+), 15 deletions(-)
+
+diff --git a/gateway/run_notifications.py b/gateway/run_notifications.py
+index aec1476f58..e5bebfc57b 100644
+--- a/gateway/run_notifications.py
++++ b/gateway/run_notifications.py
+@@ -182,10 +182,10 @@ def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
+         if delegation_wakes_parent(evt):
+             metadata["completion_wakes_parent"] = True
+         elif evt.get("role") != "cron_run" and (unfinished := delegation_unfinished_statuses(evt)):
+-            # A stop someone asked for: with no viewer attached it becomes a note and nothing runs. Say so,
+-            # so a parent left asleep on unfinished work is visible in the log, not only to the user.
+-            logger.warning("Async delegation %s: parent %s not woken: %s (a requested stop; a note if unviewed)",
+-                           evt.get("delegation_id"), parent_session_id or session_key or "?", ",".join(unfinished))
++            # A stop someone asked for: a viewed parent runs it as its turn, an unviewed one gets a note,
++            # which the executor logs once it knows (gateway/session_completion_notes.py) so a parent left
++            # asleep on unfinished work is visible in the log, not only to the user.
++            metadata["completion_requested_stop"] = sorted(set(unfinished))
+     proven_session_id = str(evt.get("proven_session_id") or "").strip()
+     if proven_session_id:
+         metadata["gateway_proven_session_id"] = proven_session_id
+diff --git a/gateway/session_automation.py b/gateway/session_automation.py
+index d9f817161c..6f3259dbb9 100644
+--- a/gateway/session_automation.py
++++ b/gateway/session_automation.py
+@@ -431,7 +431,7 @@ def automation_display_metadata(metadata):
+ _AUTOMATION_METADATA = frozenset({'gateway_session_key', 'gateway_session_id', 'automation_identities',
+     'turn_author', 'notification_origin', 'original_trigger_message_id', 'notification_category',
+     'display_kind', 'display_text', 'gateway_proven_session_id', 'gateway_completion_ids', 'heartbeat_tick',
+-    'completion_wakes_parent', 'kanban_cards', 'kanban_event_keys'})
++    'completion_wakes_parent', 'completion_requested_stop', 'kanban_cards', 'kanban_event_keys'})
+ 
+ 
+ def admission_display(payload):
+@@ -550,6 +550,20 @@ def _local_automation_owner(authority, adapter, event, entry):
+     return ref, live
+ 
+ 
++def requested_stop_metadata(metadata):
++    """A delegation result stopped on request (``completion_requested_stop``): its stopped statuses, so
++    the executor logs a parent left asleep only when it lands as a note (gateway/session_completion_notes.py).
++    Stored only when present, so an older admission's fingerprint is unchanged."""
++    if 'completion_requested_stop' not in metadata:
++        return {}
++    from tools.process_registry_notifications import DELEGATION_STOPPED_STATUSES
++    stopped = metadata['completion_requested_stop']
++    if (not isinstance(stopped, list) or not stopped
++            or not all(isinstance(s, str) and s in DELEGATION_STOPPED_STATUSES for s in stopped)):
++        raise RuntimeStoreError('invalid_params')
++    return {'requested_stop': sorted(set(stopped))}
++
++
+ def snapshot_local_automation(authority, adapter, event, identity, entry):
+     ref, _live = _local_automation_owner(authority, adapter, event, entry)
+     descriptor = {'identity': identity, 'owner': ref.session_id,
+@@ -566,6 +580,7 @@ def snapshot_local_automation(authority, adapter, event, identity, entry):
+         if event.metadata['completion_wakes_parent'] is not True:
+             raise RuntimeStoreError('invalid_params')
+         descriptor['wakes_parent'] = True
++    descriptor.update(requested_stop_metadata(event.metadata))
+     if event.metadata.get('turn_author') is not None:
+         from agent.turn_author import parse_turn_author
+         descriptor['turn_author'] = parse_turn_author(event.metadata['turn_author'])
+diff --git a/gateway/session_completion_notes.py b/gateway/session_completion_notes.py
+index 615ccb8cd0..8d709137d6 100644
+--- a/gateway/session_completion_notes.py
++++ b/gateway/session_completion_notes.py
+@@ -97,6 +97,12 @@ async def note_if_unviewed(authority, ref, row):
+         await reopen_for_turn(authority, ref)
+         return None
+     metadata = note_metadata(descriptor)
++    if descriptor.get('requested_stop'):
++        # Unfinished work someone stopped, and nobody is watching to see it: the parent stays asleep on it.
++        import logging
++        logging.getLogger(__name__).warning(
++            'parent %s not woken: delegation %s stopped on request (%s), kept as a note (no viewer attached)',
++            ref.session_id, descriptor['identity'], ','.join(descriptor['requested_stop']))
+     # Keyed by its admission: a claim is never replayed, and this keeps a write retry exact.
+     target = await _write_note(authority, ref, lambda target: tracked_write(authority, partial(
+         authority.db.append_completion_note, target, row['admission_id'], row['payload']['text'],
+diff --git a/tests/gateway/test_unviewed_delegation_failure_turn.py b/tests/gateway/test_unviewed_delegation_failure_turn.py
+index 7594f1b050..3c64883480 100644
+--- a/tests/gateway/test_unviewed_delegation_failure_turn.py
++++ b/tests/gateway/test_unviewed_delegation_failure_turn.py
+@@ -199,6 +199,59 @@ async def test_unit_a_gateway_shutdown_stopped_wakes_the_parent(tmp_path, monkey
+         authority.db.close()
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize("viewed", [False, True], ids=["unviewed", "viewed"])
++async def test_requested_stop_is_logged_only_when_it_is_kept_as_a_note(tmp_path, monkeypatch, caplog, viewed):
++    """A stop someone asked for never wakes an unviewed parent: it becomes a note, logged so a parent left
++    asleep on unfinished work shows in the log. With a viewer attached it runs as the parent's turn, so a
++    'not woken' warning would be false; none is logged. The decision is the executor's, at run time."""
++    import json
++    import logging
++    caplog.set_level(logging.WARNING)
++    runner, authority, ref, actor = await _local(tmp_path, monkeypatch)
++    try:
++        route, target = authority.sessions[ref.session_id].route, _target(runner, authority, ref)
++        if viewed:
++            authority.sessions[ref.session_id].subscribers["watching"] = actor
++        evt = json.loads(json.dumps(dict(_batch(route, "deleg_asked", "interrupted", "completed"),
++                                         parent_session_id=target)))
++        assert await runner._deliver_async_delegation_group([evt]) is True
++        [row] = _admissions(authority, ref)
++        assert row["payload"]["local_automation_v1"].get("requested_stop") == ["interrupted"]
++        assert not row["payload"]["local_automation_v1"].get("wakes_parent")
++        seen = _turns(runner, authority, target, "deleg_asked")
++        await authority._drain(ref)
++        assert len(seen) == int(viewed)
++        assert len(_notes(authority, target, "deleg_asked")) == int(not viewed)
++        not_woken = [r.getMessage() for r in caplog.records if "not woken" in r.getMessage()]
++        if viewed:
++            assert not_woken == []
++        else:
++            assert len(not_woken) == 1, not_woken
++            assert "deleg_asked" in not_woken[0] and "stopped on request (interrupted)" in not_woken[0]
++            assert ref.session_id in not_woken[0]
++    finally:
++        authority.db.close()
++
++
++@pytest.mark.asyncio
++async def test_unviewed_successful_result_is_a_note_without_a_warning(tmp_path, monkeypatch, caplog):
++    """A finished result the parent reads next time is the ordinary note: nothing was left undone."""
++    import logging
++    caplog.set_level(logging.WARNING)
++    runner, authority, ref, _actor = await _local(tmp_path, monkeypatch)
++    try:
++        route, target = authority.sessions[ref.session_id].route, _target(runner, authority, ref)
++        evt = dict(_batch(route, "deleg_done", "completed"), parent_session_id=target)
++        assert await runner._deliver_async_delegation_group([evt]) is True
++        assert "requested_stop" not in _admissions(authority, ref)[0]["payload"]["local_automation_v1"]
++        await authority._drain(ref)
++        assert len(_notes(authority, target, "deleg_done")) == 1
++        assert not any("not woken" in r.getMessage() for r in caplog.records)
++    finally:
++        authority.db.close()
++
++
+ @pytest.mark.asyncio
+ async def test_failed_manual_cron_run_stays_a_note(tmp_path, monkeypatch):
+     """``cronjob(action='run')`` reports through the same event with ``role=cron_run``. Its outcome is
+diff --git a/tests/tools/test_delegate_shutdown_stop_wakes_parent.py b/tests/tools/test_delegate_shutdown_stop_wakes_parent.py
+index 577e38f2d1..26c3d16ca4 100644
+--- a/tests/tools/test_delegate_shutdown_stop_wakes_parent.py
++++ b/tests/tools/test_delegate_shutdown_stop_wakes_parent.py
+@@ -80,24 +80,102 @@ def test_shutdown_stamp_without_stopped_children_has_no_stop_guidance(statuses):
+     assert delegation_wakes_parent(evt) is ("failed" in statuses)
+ 
+ 
+-@pytest.mark.parametrize("extra,warns", [
++@pytest.mark.parametrize("extra,flagged", [
+     ({}, True),
+     ({"type": "completion"}, False),
+     ({"task_failure_notice": True}, False),
+     ({"role": "cron_run"}, False),
+ ])
+-def test_requested_stop_warning_only_for_final_delegations(caplog, extra, warns):
++def test_requested_stop_is_flagged_only_for_final_delegations(caplog, extra, flagged):
++    """The metadata step cannot know whether a viewer will be attached when the admission runs, so it only
++    flags the requested stop; the executor logs it if it becomes a note (test_unviewed_delegation_failure_turn)."""
++    import logging
+     from gateway.config import Platform
+     from gateway.run_notifications import _watch_notification_metadata
+ 
++    caplog.set_level(logging.WARNING)
+     evt = {"type": "async_delegation", "delegation_id": "deleg_warning", "status": "interrupted",
+            "parent_session_id": "parent-warning", **extra}
+     metadata = _watch_notification_metadata(evt, SimpleNamespace(platform=Platform.LOCAL))
+     assert not metadata.get("completion_wakes_parent")
+-    warnings = [record.getMessage() for record in caplog.records if "not woken" in record.getMessage()]
+-    assert bool(warnings) is warns, warnings
+-    if warns:
+-        assert "parent-warning" in warnings[0] and "interrupted" in warnings[0]
++    assert ("completion_requested_stop" in metadata) is flagged, metadata
++    if flagged:
++        assert metadata["completion_requested_stop"] == ["interrupted"]
++    assert not [r.getMessage() for r in caplog.records if "not woken" in r.getMessage()]
++
++
++@pytest.mark.parametrize("value,ok", [
++    (["interrupted"], True), (["cancelled", "interrupted", "cancelled"], True),
++    ([], False), ("interrupted", False), (["failed"], False), ([None], False), (True, False),
++])
++def test_requested_stop_admission_metadata_is_validated(value, ok):
++    from gateway.session_automation import requested_stop_metadata
++    from hermes_state_runtime import RuntimeStoreError
++
++    assert requested_stop_metadata({}) == {}
++    if ok:
++        assert requested_stop_metadata({"completion_requested_stop": value}) == {
++            "requested_stop": sorted(set(value))}
++    else:
++        with pytest.raises(RuntimeStoreError):
++            requested_stop_metadata({"completion_requested_stop": value})
++
++
++def _dispatch_held_batch(stopped: threading.Event, release: threading.Event, **kwargs):
++    """A unit whose runner unwinds only on *release*: a stop sets *stopped* but leaves it active (running),
++    the window between a stop request and the unit's finalize."""
++    def runner():
++        assert release.wait(timeout=10)
++        return {"results": [{"task_index": 0, "status": "interrupted", "summary": "partial"}]}
++    res = ad.dispatch_async_delegation_batch(
++        goals=["wait on CI"], context=None, toolsets=None, role="leaf", model="m", session_key="", runner=runner,
++        interrupt_fn=stopped.set, max_async_children=1, parent_session_id="parent-1", **kwargs)
++    assert res["status"] == "dispatched", res
++    return res["delegation_id"]
++
++
++_REQUESTED_STOPS = {
++    "slash-stop": lambda: ad.interrupt_all(reason="/stop"),
++    "gateway-stop-command": lambda: ad.interrupt_for_session(parent_session_id="parent-1", reason="stop_command"),
++}
++
++
++@pytest.mark.parametrize("first", [*_REQUESTED_STOPS, None], ids=[*_REQUESTED_STOPS, "shutdown-only"])
++def test_shutdown_before_finalize_keeps_the_first_stops_intent(first):
++    """A user stopped the unit, then the gateway shut down before its runner unwound: the shutdown sweep
++    still reaches the active unit, but the stop was asked for, so the parent is not woken. With no earlier
++    stop the sweep's stop is the only one and wakes the parent (the control)."""
++    stopped, release = threading.Event(), threading.Event()
++    delegation_id = _dispatch_held_batch(stopped, release)
++    if first is not None:
++        assert _REQUESTED_STOPS[first]() == 1
++        assert stopped.is_set()
++        stopped.clear()
++    assert ad.interrupt_all(reason="gateway shutdown (restart)", by_shutdown=True) == 1, "still active"
++    assert stopped.is_set(), "the sweep still stops it"
++    release.set()
++    evt = _drain_for(delegation_id, timeout=5.0)
++    assert evt is not None and [r["status"] for r in evt["results"]] == ["interrupted"], evt
++    if first is None:
++        assert evt.get("interrupted_by") == "gateway shutdown (restart)", evt
++        assert delegation_wakes_parent(evt)
++    else:
++        assert "interrupted_by" not in evt, evt
++        assert not delegation_wakes_parent(evt)
++        assert "not by you or the user" not in (format_process_notification(evt) or "")
++
++
++@pytest.mark.parametrize("then", list(_REQUESTED_STOPS))
++def test_shutdown_stop_stays_stamped_when_a_requested_stop_follows(then):
++    """The first stop decides: work the shutdown already stopped still wakes its parent."""
++    stopped, release = threading.Event(), threading.Event()
++    delegation_id = _dispatch_held_batch(stopped, release)
++    assert ad.interrupt_all(reason="gateway shutdown (restart)", by_shutdown=True) == 1
++    assert _REQUESTED_STOPS[then]() == 1
++    release.set()
++    evt = _drain_for(delegation_id, timeout=5.0)
++    assert evt is not None and evt.get("interrupted_by") == "gateway shutdown (restart)", evt
++    assert delegation_wakes_parent(evt)
+ 
+ 
+ def test_requested_stop_stays_asleep():
+diff --git a/tools/async_delegation.py b/tools/async_delegation.py
+index c453ce41fb..3da4a3ae41 100644
+--- a/tools/async_delegation.py
++++ b/tools/async_delegation.py
+@@ -1588,17 +1588,28 @@ def _interrupt_records(targets: list[dict[str, Any]], caller: str, reason: str,
+     return count
+ 
+ 
++def _mark_stop(targets: list[dict[str, Any]], reason: str, *, by_shutdown: bool) -> None:
++    """Record why *targets* were stopped; the first stop's intent wins (caller holds ``_records_lock``).
++    A requested stop (``/stop``, a session ending) marks ``_stop_requested``; a later shutdown sweep that
++    reaches the unit before its runner unwinds must not restamp it as ``interrupted_by`` and wake the
++    parent on work someone chose to stop. A shutdown stop stays stamped if a requested stop follows."""
++    for r in targets:
++        if not by_shutdown:
++            r.setdefault("_stop_requested", reason)
++        elif not r.get("_stop_requested"):
++            r.setdefault("_interrupted_by", reason)
++
++
+ def interrupt_all(reason: str = "shutdown", *, by_shutdown: bool = False) -> int:
+     """Signal every running async delegation to stop (``/stop``, shutdown). Returns how
+     many. The child still emits a completion event (status='interrupted') via the
+     normal finalize path. ``by_shutdown`` (the gateway's shutdown sweep) stamps *reason* on each
+     unit's result as ``interrupted_by``: nobody asked for that stop, so its parent wakes to
+-    re-dispatch or report (``delegation_wakes_parent``) instead of sleeping on a note."""
++    re-dispatch or report (``delegation_wakes_parent``) instead of sleeping on a note. A unit already
++    stopped on request keeps that intent (``_mark_stop``)."""
+     with _records_lock:
+         targets = [r for r in _records.values() if r.get("status") in _ACTIVE_STATES]
+-        if by_shutdown:
+-            for r in targets:
+-                r["_interrupted_by"] = reason
++        _mark_stop(targets, reason, by_shutdown=by_shutdown)
+     return _interrupt_records(targets, "interrupt_all", reason, "Interrupted %d async delegation(s) (%s)")
+ 
+ 
+@@ -1608,6 +1619,8 @@ def interrupt_for_session(
+     """Signal running async delegations owned by ONE ending session to stop (any
+     selector matches, see ``_session_records``). Returns how many."""
+     targets = _session_records(_ACTIVE_STATES, session_key, origin_ui_session_id, parent_session_id)
++    with _records_lock:
++        _mark_stop(targets, reason, by_shutdown=False)
+     return _interrupt_records(
+         targets, "interrupt_for_session", reason, "Interrupted %d async delegation(s) for ending session (%s)")
+ 
+diff --git a/tools/process_registry_notifications.py b/tools/process_registry_notifications.py
+index c337cba822..62878b4271 100644
+--- a/tools/process_registry_notifications.py
++++ b/tools/process_registry_notifications.py
+@@ -159,6 +159,8 @@ def _is_truncated(entry: dict) -> bool:
+ 
+ # A stop the parent or user asked for is not a failure the parent has to recover from.
+ _STOPPED = frozenset({"interrupted", "cancelled"})
++# Public name for the gateway's validation of a requested-stop admission (gateway/session_automation.py).
++DELEGATION_STOPPED_STATUSES = _STOPPED
+ 
+ 
+ def delegation_wakes_parent(evt: dict) -> bool:
+-- 
+2.51.0
+

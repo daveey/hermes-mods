@@ -1,0 +1,266 @@
+From c70088244e712f93cb59e6b848293b6d6b9cfb14 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 20:55:41 +0000
+Subject: [PATCH] fix(lifecycle): preserve shell prefix and startup provenance
+ [daveey]
+
+---
+ cron/lifecycle_guard.py                       |  32 ++++--
+ .../cron/test_lifecycle_guard_heredoc_walk.py | 102 ++++++++++++++++++
+ tools/shell_heredoc.py                        |  34 ++++--
+ 3 files changed, 155 insertions(+), 13 deletions(-)
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index d4a50a8f78..91d2555200 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -733,13 +733,31 @@ _SUBSHELL_OPENING_WORDS = frozenset({
+ })
+ 
+ 
+-def _opens_call_arguments(previous: str) -> bool:
+-    """Whether a bare ``(`` after the word *previous* is interpreter call syntax, not a subshell.
++def _opens_call_arguments(segment: list[str]) -> bool:
++    """Whether ``(`` follows an interpreter call, not a shell command prefix.
+ 
+-    In the shell a subshell ``(`` only starts a command, so ``word (`` is a syntax error there;
+-    it is how interpreter code tokenized as shell looks (``expanduser("~/x")``, ``Path('/d')``).
+-    ``$(``, ``<(``, ``>(`` and ``x=(`` keep today's executed treatment."""
+-    return previous not in _SUBSHELL_OPENING_WORDS and not previous.endswith(("$", "<", ">", "="))
++    Keywords are recognized in command position, including operands such as
++    ``time -p`` and ``coproc name``. Merely inspecting the adjacent word mistakes
++    these executable subshells for inert interpreter arguments. Conversely an
++    ordinary command's argument named ``time`` is not a shell keyword.
++    """
++    index = 0
++    while index < len(segment):
++        word = segment[index]
++        if word not in _SUBSHELL_OPENING_WORDS:
++            break
++        index += 1
++        if word == "time":
++            if index < len(segment) and segment[index] == "-p":
++                index += 1
++            if index < len(segment) and segment[index] == "--":
++                index += 1
++        elif word == "coproc" and index < len(segment):
++            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", segment[index]):
++                index += 1
++    if index == len(segment):
++        return False
++    return not segment[-1].endswith(("$", "<", ">", "="))
+ 
+ 
+ def _iter_positioned_command_segments(command: str) -> Iterator[tuple[list[str], bool]]:
+@@ -750,7 +768,7 @@ def _iter_positioned_command_segments(command: str) -> Iterator[tuple[list[str],
+         call_argument = False
+         for token in tokens:
+             if token and set(token) <= _CONTROL_CHARS:
+-                next_is_call = token == "(" and bool(segment) and _opens_call_arguments(segment[-1])
++                next_is_call = token == "(" and bool(segment) and _opens_call_arguments(segment)
+                 if segment:
+                     yield segment, call_argument
+                     segment = []
+diff --git a/tests/cron/test_lifecycle_guard_heredoc_walk.py b/tests/cron/test_lifecycle_guard_heredoc_walk.py
+index 57eea976c4..12b09da3ec 100644
+--- a/tests/cron/test_lifecycle_guard_heredoc_walk.py
++++ b/tests/cron/test_lifecycle_guard_heredoc_walk.py
+@@ -588,3 +588,105 @@ def test_refused_scripts_verbatim_are_not_refused(tmp_path, monkeypatch, script,
+     monkeypatch.setenv("HOME", str(home))  # the scripts' `~/` paths point into tmp_path
+     command = f"bash {_FIXTURES / script} 1.2.3.4 t_x f.txt"
+     assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
++
++
++# Independent review: prove execution with a fake hermes, never a real gateway.
++def _assert_bash_marker(tmp_path, command):
++    import os
++    import subprocess
++
++    marker = tmp_path / "marker"
++    hermes = tmp_path / "hermes"
++    hermes.write_text('#!/bin/sh\nprintf called > "$MARKER"\n')
++    hermes.chmod(0o755)
++    result = subprocess.run(
++        ["/bin/bash"], input=command, text=True, capture_output=True, timeout=10, check=False,
++        env={**os.environ, "PATH": f"{tmp_path}:/usr/bin:/bin", "MARKER": str(marker),
++             "BASH_ENV": "", "ENV": ""}, cwd=tmp_path,
++    )
++    assert marker.read_text() == "called", result.stderr
++
++
++@pytest.mark.parametrize("depth", [0, 1])
++@pytest.mark.parametrize("mutation", ["CMD=transform;", "CMD=transform &&", "read CMD <<<transform;"])
++def test_same_line_binding_mutation_keeps_transformed_body_visible(tmp_path, depth, mutation):
++    from tools.shell_heredoc import strip_inert_heredoc_bodies
++
++    transform = tmp_path / "transform"
++    transform.write_text('#!/bin/sh\nsed s/python3/bash/ | bash\n')
++    transform.chmod(0o755)
++    command = ("CMD='bash -s'\n" + mutation + " $CMD <<'R'\npython3 - <<'PY'\n"
++               "bash -c 'hermes gateway \"restart\"'\nPY\nR\n")
++    if depth:
++        command = "bash -s <<'OUTER'\n" + command + "OUTER\n"
++    _assert_bash_marker(tmp_path, command)
++    assert strip_inert_heredoc_bodies(command, nested=True) == command
++    assert guard(command, cwd=str(tmp_path)) is True
++
++
++@pytest.mark.parametrize("shape", ["assignment", "env", "export", "export-heredoc", "remote", "in-body"])
++def test_shell_startup_environment_cannot_authorize_nested_masking(tmp_path, shape):
++    from tools.shell_heredoc import strip_inert_heredoc_bodies
++
++    startup = tmp_path / "startup"
++    # Clear BASH_ENV for the replacement shell: only the target shell's stdin is rewritten.
++    startup.write_text("unset BASH_ENV\nexec 0< <(sed s/python3/bash/)\n")
++    body = "python3 - <<'PY'\nbash -c 'hermes gateway \"restart\"'\nPY\n"
++    ssh = tmp_path / "ssh"
++    # Local SSH transport control; no network access.
++    ssh.write_text('#!/bin/sh\nshift\nexec /bin/sh -c "$*"\n')
++    ssh.chmod(0o755)
++    opener = {
++        "env": f"env BASH_ENV={startup} bash -s",
++        "export": f"export BASH_ENV={startup}\nbash -s",
++        "export-heredoc": f"source /dev/stdin <<'INIT'\nexport BASH_ENV={startup}\nINIT\nbash -s",
++        "remote": f"ssh h 'BASH_ENV={startup} bash -s'",
++    }.get(shape, f"BASH_ENV={startup} bash -s")
++    command = opener + " <<'R'\n" + body + "R\n"
++    if shape == "in-body":
++        command = "bash -s <<'OUTER'\n" + command + "OUTER\n"
++    _assert_bash_marker(tmp_path, command)
++    assert strip_inert_heredoc_bodies(command, nested=True) == command
++    assert guard(command, cwd=str(tmp_path)) is True
++
++
++@pytest.mark.parametrize("name", ["BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "PATH", "BASH_FUNC_python3%%"])
++@pytest.mark.parametrize("wrapper", ["", "env ", "sudo "])
++def test_reserved_environment_assignments_are_not_transparent(name, wrapper):
++    from tools.shell_heredoc import strip_inert_heredoc_bodies
++
++    command = wrapper + name + "=/untrusted bash -s <<'R'\npython3 - <<'PY'\nx\nPY\nR\n"
++    assert strip_inert_heredoc_bodies(command, nested=True) == command
++
++
++@pytest.mark.parametrize("prefix", [
++    "eval 'python3() { command bash; }'; export -f python3",
++    "eval 'python3() { command bash; }'; declare -fx python3",
++    "export PATH=EVIL:$PATH",
++])
++def test_outer_prefix_must_preserve_nested_interpreter_identity(tmp_path, prefix):
++    from tools.shell_heredoc import strip_inert_heredoc_bodies
++
++    evil = tmp_path / "evil"
++    evil.mkdir()
++    python = evil / "python3"
++    python.write_text('#!/bin/sh\nexec /bin/bash "$@"\n')
++    python.chmod(0o755)
++    command = (prefix.replace("EVIL", str(evil)) + "\nbash -s <<'R'\npython3 - <<'PY'\n"
++               "bash -c 'hermes gateway \"restart\"'\nPY\nR\n")
++    _assert_bash_marker(tmp_path, command)
++    assert strip_inert_heredoc_bodies(command, nested=True) == command
++    assert guard(command, cwd=str(tmp_path)) is True
++
++
++@pytest.mark.parametrize("prefix", ["time -p", "time --", "time -p --", "coproc worker", "! time -p", "if time -p"])
++def test_keyword_operands_before_parens_still_execute_scripts(tmp_path, prefix):
++    from cron.lifecycle_guard import scan_gateway_lifecycle
++
++    big = tmp_path / "big.sh"
++    big.write_text("# padding\n" * 130000 + 'hermes gateway "restart"\n')
++    command = f"{prefix} ( bash {big} )"
++    command += "; then :; fi" if prefix.startswith("if ") else "; wait"
++    _assert_bash_marker(tmp_path, command)
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe is True and "scan cap" in refusal
+diff --git a/tools/shell_heredoc.py b/tools/shell_heredoc.py
+index d2a0a1ef38..f369193032 100644
+--- a/tools/shell_heredoc.py
++++ b/tools/shell_heredoc.py
+@@ -122,9 +122,22 @@ def _peeled_command(words: list[str]) -> tuple[int, str] | None:
+     # The strict walk must land exactly where the lifecycle guard's own peeling lands.
+     if peeled is None or peeled >= len(words) or peeled != _peel_transparent_prefixes(words, index):
+         return None
++    # Startup hooks, option imports, command lookup and exported functions can
++    # replace the apparent consumer or rewrite the shell's source stream. Check
++    # every prefix word, including assignments introduced by env/sudo.
++    if any(_reserved_assignment(word) for word in words[:peeled]):
++        return None
+     return peeled, words[peeled].rsplit("/", 1)[-1]
+ 
+ 
++def _reserved_assignment(word: str) -> bool:
++    """Environment words that invalidate interpreter/stream provenance."""
++    name, separator, _value = word.partition("=")
++    return bool(separator) and (name in {
++        "PATH", "IFS", "ENV", "CDPATH", "GLOBIGNORE", "SHELLOPTS", "PS4",
++    } or name.startswith("BASH"))
++
++
+ def _is_stdin_shell(words: list[str]) -> bool:
+     """Whether *words* run a POSIX shell that reads its script from stdin (``bash``, ``bash -s
+     args``, ``T=1 sh -e``), never ``-c`` or a script-file operand."""
+@@ -181,7 +194,7 @@ def _literal_assignment(unit: str) -> tuple[str, str] | None:
+             or any(char in match[2] for char in "$`\\\n;|&<>(){}~*?[]")):
+         return None
+     name = match[1]
+-    if name in {"PATH", "IFS", "ENV", "CDPATH", "GLOBIGNORE", "SHELLOPTS", "PS4"} or name.startswith("BASH"):
++    if _reserved_assignment(unit):
+         return None
+     try:
+         words = shlex.split(match[2])
+@@ -241,6 +254,10 @@ def _owner_feeds_shell(command: str, command_start: int, owner_start: int, specs
+         return False
+     first = next((i for i, word in enumerate(words) if not _ASSIGNMENT_WORD_RE.match(word)), None)
+     if first is not None and _PURE_EXPANSION_RE.match(words[first]):
++        # The binding proof ends at command_start, not owner_start. A same-line
++        # list prefix can change that binding (including via read/eval/functions).
++        if command[command_start:owner_start].strip():
++            return False
+         value = _variable_value(command, words[first].strip("${}"), command_start)
+         if not value:
+             return False
+@@ -549,8 +566,10 @@ def strip_inert_heredoc_bodies(command: str, *, nested: bool = False, _depth: in
+         if unknown_operator:
+             return command
+         if not specs:
+-            if _depth:
+-                stdin.observe_unit(command[command_start:command_end])
++            # At depth zero this state gates only recursive masking: direct
++            # data consumers retain their existing handling. Unknown commands
++            # can export functions or alter PATH/startup hooks for a later shell.
++            stdin.observe_unit(command[command_start:command_end])
+             if command_end >= len(command):
+                 break
+             command_start = command_end + 1
+@@ -565,7 +584,8 @@ def strip_inert_heredoc_bodies(command: str, *, nested: bool = False, _depth: in
+         consumer = None
+         if all(quoted) and not post_heredoc_list_operator:
+             consumer = _owner_runs_inert_consumer(command, command_start, command_end, owner_start)
+-        if _depth and not stdin.before_heredoc(command, command_start, owner_start):
++        prefix_intact = stdin.before_heredoc(command, command_start, owner_start)
++        if _depth and not prefix_intact:
+             # Once a previous command could steal stdin, no later source lines can
+             # be interpreted as the shell's untouched program.
+             return _apply_replacements(command, replacements)
+@@ -576,7 +596,7 @@ def strip_inert_heredoc_bodies(command: str, *, nested: bool = False, _depth: in
+             function_masks += consumer == "function"
+             replacements += [(start, end, "\n" * command.count("\n", start, end), consumer)
+                              for start, _terminator, end in bodies]
+-        elif nested and _depth < _MAX_NESTED_HEREDOC_DEPTH and all(quoted) and _owner_feeds_shell(
++        elif nested and prefix_intact and _depth < _MAX_NESTED_HEREDOC_DEPTH and all(quoted) and _owner_feeds_shell(
+                 command, command_start, owner_start, specs):
+             # An unquoted outer body expands locally first (`$(…)` runs here), and any owner but a
+             # verbatim stdin shell may rewrite the body: only then are nested heredocs judged.
+@@ -586,7 +606,9 @@ def strip_inert_heredoc_bodies(command: str, *, nested: bool = False, _depth: in
+                 masked = strip_inert_heredoc_bodies(inner, nested=True, _depth=_depth + 1)
+                 if masked != inner:
+                     replacements.append((start, terminator, masked, "nested"))
+-        if _depth and not consumer:
++        # A preceding non-consumer heredoc can execute state changes too (for
++        # example source /dev/stdin with an export in its body), at any depth.
++        if not consumer:
+             stdin.intact = False
+         command_start = body_cursor
+     result = _apply_replacements(command, replacements)
+-- 
+2.51.0
+

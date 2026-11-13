@@ -1,0 +1,413 @@
+From e3c63ffda0e856a656193831b6fab2ee565a6334 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:02:44 +0000
+Subject: [PATCH] [daveey] always-on: drain keep-alive sockets before a
+ superseded backend retires
+
+Desktop's keep-alive sockets stay pinned to a superseded blue/green backend
+through the TCP-splice proxy; retiring it with them open hung up every in-flight
+request at once (hub 06:47:16Z Nov 13: 9/9 keep-alive connections dropped), and
+on the MacBook a hang-up tears down and redials the hub SSH transport.
+
+While superseded, every HTTP response now carries Connection: close, so each
+pinned socket closes after its next response and the next request goes to the
+active backend. The superseded watchdog asks the idle fence only after >= 8 s
+superseded with no open uvicorn HTTP connection (WebSockets excluded), or at a
+30 s cap; an aborted roll stops the drain. Fence and reaper unchanged.
+
+Card t_01a1d09123dbb9c4.
+---
+ hermes_cli/web_server.py                    |   3 +
+ hermes_cli/web_server_skew_exit.py          |  87 ++++++++-
+ tests/hermes_cli/test_always_on_drain.py    | 201 ++++++++++++++++++++
+ tests/hermes_cli/test_always_on_rollover.py |  16 +-
+ 4 files changed, 302 insertions(+), 5 deletions(-)
+ create mode 100644 tests/hermes_cli/test_always_on_drain.py
+
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 87771b7688..e55eea8c45 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -1269,8 +1269,11 @@ def _build_uvicorn_server(host: str, port: int, *, ssh_isolated: bool = False):
+         ping_interval, ping_timeout = TUNNEL_WS_PING_INTERVAL_S, TUNNEL_WS_PING_TIMEOUT_S
+ 
+     _uvicorn_console_logging()  # log_config=None: uvicorn's dictConfig would close every live handler
++    from hermes_cli.web_server_skew_exit import wrap_asgi_close_when_draining
+     from hermes_cli.web_server_transport import transport_observed_app
+ 
++    # [daveey] A superseded always-on backend closes keep-alive sockets after each response (drain).
++    served_app = wrap_asgi_close_when_draining(served_app)
+     forwarded_allow_ips = _dashboard_forwarded_allow_ips(_dash_cfg)
+     served_app = transport_observed_app(
+         served_app, proxy_headers=bool(app.state.auth_required), forwarded_allow_ips=forwarded_allow_ips)
+diff --git a/hermes_cli/web_server_skew_exit.py b/hermes_cli/web_server_skew_exit.py
+index d08d59b5b1..4c6ebfa397 100644
+--- a/hermes_cli/web_server_skew_exit.py
++++ b/hermes_cli/web_server_skew_exit.py
+@@ -244,10 +244,75 @@ def start_code_skew_watchdog(server, *, skew_fn: Optional[Callable[[], Skew]] =
+     return thread
+ 
+ 
++# [daveey] Keep-alive drain of a superseded always-on backend. Its clients' keep-alive sockets stay pinned
++# to it through the TCP-splice proxy, and retiring with them open hangs up every in-flight request
++# (Desktop then tears down and redials its SSH transport). While draining, every HTTP response carries
++# ``Connection: close`` so each pinned socket closes cleanly after its next response and the client's next
++# request opens a new proxy connection to the active backend. The watchdog asks the fence only once the
++# backend was superseded for DRAIN_MIN_S (> uvicorn's 5 s keep-alive timeout + one poll, so idle pinned
++# sockets are gone) and has no open HTTP connection, or after DRAIN_CAP_S (a long stream, unreadable state).
++DRAIN_MIN_S = 8.0
++DRAIN_CAP_S = 30.0
++_DRAINING = threading.Event()
++_CLOSE = (b"connection", b"close")
++
++
++def draining() -> bool:
++    return _DRAINING.is_set()
++
++
++def _close_headers(headers) -> list:
++    """Response headers with ``connection: close`` (replacing a keep-alive value; an upgrade is kept)."""
++    out, seen = [], False
++    for name, value in headers or []:
++        if bytes(name).lower() == b"connection":
++            if b"upgrade" in bytes(value).lower():
++                return list(headers)
++            if not seen:
++                out.append(_CLOSE)
++                seen = True
++            continue
++        out.append((name, value))
++    if not seen:
++        out.append(_CLOSE)
++    return out
++
++
++def wrap_asgi_close_when_draining(app, *, is_draining: Callable[[], bool] = draining):
++    """ASGI wrapper: while this backend drains, HTTP responses ask the client to close the connection.
++    WebSocket and lifespan scopes pass straight through; a no-op unless the superseded watchdog drains."""
++
++    async def _app(scope, receive, send):
++        if scope.get("type") != "http":
++            return await app(scope, receive, send)
++
++        async def _send(message):
++            if message.get("type") == "http.response.start" and is_draining():
++                message = {**message, "headers": _close_headers(message.get("headers"))}
++            await send(message)
++
++        return await app(scope, receive, _send)
++
++    return _app
++
++
++def open_http_connections(server) -> Optional[int]:
++    """Open uvicorn HTTP connections (keep-alive or in flight; WebSockets excluded), or None when unreadable.
++    The set is mutated on the event loop thread, so it is copied and a concurrent change reads as unknown."""
++    try:
++        conns = list(server.server_state.connections)
++    except (AttributeError, RuntimeError, TypeError):
++        return None
++    return sum(1 for c in conns if type(c).__module__.startswith("uvicorn.protocols.http"))
++
++
+ def start_superseded_watchdog(server, *, port: int, superseded: Optional[Callable[[int], bool]] = None,
+                               pending: Optional[Callable[[int], bool]] = None,
+                               fence=None, poll_s: float = SUPERSEDED_POLL_S,
+-                              max_polls: Optional[int] = None) -> threading.Thread:
++                              max_polls: Optional[int] = None,
++                              http_connections: Optional[Callable[[], Optional[int]]] = None,
++                              drain_min_s: float = DRAIN_MIN_S, drain_cap_s: float = DRAIN_CAP_S,
++                              clock: Callable[[], float] = time.monotonic) -> threading.Thread:
+     """[daveey] An always-on blue/green backend (``hermes_cli/always_on_rollover``) runs this INSTEAD of the
+     code-skew watchdog: the roller replaces it with a warmed successor, so it must not exit on skew before
+     that successor serves. It retires (through the same idle fence) once ``active.json`` names neither its
+@@ -259,12 +324,30 @@ def start_superseded_watchdog(server, *, port: int, superseded: Optional[Callabl
+ 
+     check: Callable[[int], bool] = superseded or always_on_rollover.is_superseded
+     on_the_way: Callable[[int], bool] = pending or always_on_rollover.successor_pending
++    count: Callable[[], Optional[int]] = http_connections or (lambda: open_http_connections(server))
++    since: list[Optional[float]] = [None]
+ 
+     def _observe() -> Optional[str]:
+         if not check(port):
++            if since[0] is not None:
++                _log.info("always-on backend :%s is active again; keep-alive drain stopped", port)
++            since[0] = None
++            _DRAINING.clear()
+             return None
++        now = clock()
++        if since[0] is None:
++            since[0] = now
++            _DRAINING.set()
++            _log.info("always-on backend :%s superseded; draining keep-alive connections", port)
++        elapsed = now - since[0]
++        if elapsed < drain_cap_s:
++            if elapsed < drain_min_s:
++                return None
++            open_now = count()
++            if open_now is None or open_now > 0:
++                return None
+         return (f"always-on backend :{port} was superseded by a warmed successor (active.json); "
+-                "retiring now that it is idle.")
++                f"retiring now that it is idle (drained {elapsed:.0f}s).")
+ 
+     thread = _run_retirement_watchdog(server, observe=_observe, fence=fence, poll_s=poll_s,
+                                       max_polls=max_polls, thread_name="always-on-superseded-watchdog",
+diff --git a/tests/hermes_cli/test_always_on_drain.py b/tests/hermes_cli/test_always_on_drain.py
+new file mode 100644
+index 0000000000..4627ae1424
+--- /dev/null
++++ b/tests/hermes_cli/test_always_on_drain.py
+@@ -0,0 +1,201 @@
++"""Keep-alive drain of a superseded always-on backend (hermes_cli/web_server_skew_exit).
++
++Desktop's keep-alive sockets stay pinned to a superseded backend through the TCP-splice proxy. Retiring it
++with them open hung up every in-flight request at once (hub poll 06:47:16Z Nov 13: 9/9 keep-alive
++connections RemoteDisconnected), and on the MacBook a hang-up tears down and redials the SSH transport.
++While draining, responses carry ``Connection: close`` and retirement waits for the HTTP connections to go.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import http.client
++import socket
++import threading
++
++import pytest
++import uvicorn
++
++from hermes_cli import web_server_skew_exit as skew
++from tests.waiting import wait_until
++
++
++@pytest.fixture(autouse=True)
++def _not_draining():
++    skew._DRAINING.clear()
++    yield
++    skew._DRAINING.clear()
++
++
++# ── the response header ───────────────────────────────────────────────────────────────────────────────
++
++
++def test_close_headers_adds_or_replaces_connection_but_keeps_an_upgrade():
++    assert skew._close_headers([(b"content-type", b"text/plain")]) == [
++        (b"content-type", b"text/plain"), (b"connection", b"close")]
++    assert skew._close_headers([(b"Connection", b"keep-alive"), (b"x", b"1"), (b"connection", b"x")]) == [
++        (b"connection", b"close"), (b"x", b"1")]
++    upgrade = [(b"connection", b"Upgrade"), (b"upgrade", b"websocket")]
++    assert skew._close_headers(upgrade) == upgrade
++    assert skew._close_headers(None) == [(b"connection", b"close")]
++
++
++def _run(app, scope):
++    sent = []
++
++    async def receive():
++        return {"type": "http.request", "body": b"", "more_body": False}
++
++    async def send(message):
++        sent.append(message)
++
++    asyncio.run(app(scope, receive, send))
++    return sent
++
++
++async def _inner(scope, receive, send):
++    if scope["type"] == "http":
++        await send({"type": "http.response.start", "status": 200, "headers": [(b"content-length", b"2")]})
++        await send({"type": "http.response.body", "body": b"ok"})
++    else:
++        await send({"type": scope["type"] + ".marker"})
++
++
++def test_wrapper_adds_close_only_to_http_while_draining():
++    state = {"on": False}
++    app = skew.wrap_asgi_close_when_draining(_inner, is_draining=lambda: state["on"])
++    assert _run(app, {"type": "http"})[0]["headers"] == [(b"content-length", b"2")]
++    state["on"] = True
++    sent = _run(app, {"type": "http"})
++    assert sent[0]["headers"] == [(b"content-length", b"2"), (b"connection", b"close")]
++    assert sent[1] == {"type": "http.response.body", "body": b"ok"}
++    assert _run(app, {"type": "websocket"}) == [{"type": "websocket.marker"}]
++    assert _run(app, {"type": "lifespan"}) == [{"type": "lifespan.marker"}]
++
++
++# ── the watchdog waits for the drain ──────────────────────────────────────────────────────────────────
++
++
++class _Server:
++    should_exit = False
++
++
++class _Fence:
++    def __init__(self):
++        self.prepared = 0
++
++    def prepare(self):
++        self.prepared += 1
++        return {"ok": True, "token": "t"}
++
++    def commit(self, token):
++        return {"ok": True}
++
++
++class _Clock:
++    """Advances one second per poll (each poll reads the clock once while superseded)."""
++
++    def __init__(self):
++        self.now = 1000.0
++
++    def __call__(self):
++        self.now += 1.0
++        return self.now
++
++
++def _watch(*, superseded=lambda p: True, connections=lambda: 0, polls=40, **kw):
++    server, fence, clock = _Server(), _Fence(), _Clock()
++    seen = []
++
++    def check(port):
++        seen.append(skew.draining())
++        return superseded(port)
++
++    skew.start_superseded_watchdog(server, port=9149, superseded=check, fence=fence, poll_s=0.001,
++                                   max_polls=polls, http_connections=connections, clock=clock,
++                                   **kw).join(10)
++    return server, fence, clock, seen
++
++
++def test_superseded_backend_drains_before_it_asks_the_fence():
++    server, fence, clock, _ = _watch(connections=lambda: 0)
++    assert server.should_exit is True and skew.draining() is True
++    # first observation at t0; the reason needs DRAIN_MIN_S, then two confirming polls
++    assert clock.now - 1001.0 >= skew.DRAIN_MIN_S
++    assert fence.prepared == 1
++
++
++def test_open_connections_hold_retirement_until_they_close():
++    calls = {"n": 0}
++
++    def connections():
++        calls["n"] += 1
++        return 3 if calls["n"] <= 12 else 0
++
++    server, _fence, clock, _ = _watch(connections=connections, polls=40)
++    assert server.should_exit is True and calls["n"] > 12
++    assert clock.now - 1001.0 >= skew.DRAIN_MIN_S + 12  # waited for the connections, not just the minimum
++
++
++def test_unknown_or_stuck_connections_retire_at_the_cap():
++    for connections in (lambda: None, lambda: 2):
++        server, _fence, clock, _ = _watch(connections=connections, polls=60)
++        assert server.should_exit is True
++        assert skew.DRAIN_CAP_S <= clock.now - 1001.0 <= skew.DRAIN_CAP_S + 3
++    server, fence, clock, _ = _watch(connections=lambda: 2, polls=20)
++    assert server.should_exit is False and fence.prepared == 0  # under the cap: still draining
++
++
++def test_an_aborted_roll_stops_the_drain():
++    flips = iter([True, True, True] + [False] * 10)
++    server, fence, _, seen = _watch(superseded=lambda p: next(flips, False), polls=12)
++    assert server.should_exit is False and fence.prepared == 0
++    assert seen[1] is True and skew.draining() is False
++
++
++def test_open_http_connections_counts_http_protocols_only():
++    class H11Like:
++        pass
++
++    H11Like.__module__ = "uvicorn.protocols.http.h11_impl"
++
++    class WsLike:
++        pass
++
++    WsLike.__module__ = "uvicorn.protocols.websockets.websockets_impl"
++    server = type("S", (), {})()
++    server.server_state = type("St", (), {"connections": {H11Like(), H11Like(), WsLike()}})()
++    assert skew.open_http_connections(server) == 2
++    assert skew.open_http_connections(object()) is None
++
++
++# ── a real uvicorn: a pinned keep-alive socket closes after its next response ──────────────────────────
++
++
++@pytest.fixture
++def served():
++    sock = socket.socket()
++    sock.bind(("127.0.0.1", 0))
++    server = uvicorn.Server(uvicorn.Config(skew.wrap_asgi_close_when_draining(_inner), log_level="warning",
++                                           log_config=None, lifespan="off"))
++    thread = threading.Thread(target=lambda: asyncio.run(server.serve(sockets=[sock])), daemon=True)
++    thread.start()
++    wait_until(lambda: server.started, what="uvicorn start")
++    yield server, sock.getsockname()[1]
++    server.should_exit = True
++    thread.join(10)
++
++
++def test_keep_alive_socket_closes_after_the_next_response_once_draining(served):
++    server, port = served
++    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
++    conn.request("GET", "/")
++    first = conn.getresponse()
++    assert first.read() == b"ok" and first.getheader("connection") is None
++    assert wait_until(lambda: skew.open_http_connections(server) == 1, what="one keep-alive connection")
++    skew._DRAINING.set()
++    conn.request("GET", "/")  # same pinned socket
++    second = conn.getresponse()
++    assert second.read() == b"ok" and second.getheader("connection") == "close"
++    wait_until(lambda: skew.open_http_connections(server) == 0, what="the server to close the socket")
++    conn.close()
+diff --git a/tests/hermes_cli/test_always_on_rollover.py b/tests/hermes_cli/test_always_on_rollover.py
+index 6de55d3812..4ba4eb2d5d 100644
+--- a/tests/hermes_cli/test_always_on_rollover.py
++++ b/tests/hermes_cli/test_always_on_rollover.py
+@@ -525,6 +525,16 @@ class _Server:
+     should_exit = False
+ 
+ 
++# No keep-alive drain wait: these tests cover the fence and poll cadence (test_always_on_drain covers the drain).
++_DRAINED = {"drain_min_s": 0.0, "http_connections": lambda: 0}
++
++
++@pytest.fixture(autouse=True)
++def _not_draining():
++    yield
++    skew._DRAINING.clear()
++
++
+ class _Fence:
+     def __init__(self, idle=True):
+         self.idle, self.committed = idle, False
+@@ -540,7 +550,7 @@ class _Fence:
+ def test_superseded_backend_retires_through_the_idle_fence():
+     server, fence = _Server(), _Fence()
+     thread = skew.start_superseded_watchdog(server, port=9148, superseded=lambda p: True, fence=fence,
+-                                            poll_s=0.01, max_polls=5)
++                                            poll_s=0.01, max_polls=5, **_DRAINED)
+     assert thread in skew._SKEW_WATCHDOGS
+     thread.join(5)
+     assert server.should_exit is True and fence.committed is True
+@@ -553,7 +563,7 @@ def test_active_or_busy_backend_stays_up():
+     assert server.should_exit is False
+     server = _Server()
+     skew.start_superseded_watchdog(server, port=9148, superseded=lambda p: True, fence=_Fence(idle=False),
+-                                   poll_s=0.01, max_polls=4).join(5)
++                                   poll_s=0.01, max_polls=4, **_DRAINED).join(5)
+     assert server.should_exit is False  # a live turn holds it
+ 
+ 
+@@ -567,7 +577,7 @@ def test_superseded_watchdog_polls_fast_and_reports_its_successor(monkeypatch):
+     state = {"pending": True}
+     busy = skew.start_superseded_watchdog(_Server(), port=9148, superseded=lambda p: True,
+                                           pending=lambda p: state["pending"], fence=_Fence(idle=False),
+-                                          max_polls=4)
++                                          max_polls=4, **_DRAINED)
+     busy.join(5)
+     # a busy superseded backend re-tries the fence at the slower busy cadence, not every 2 s
+     assert sleeps == [skew.SUPERSEDED_POLL_S, skew.SUPERSEDED_BUSY_POLL_S, skew.SUPERSEDED_BUSY_POLL_S,
+-- 
+2.51.0
+

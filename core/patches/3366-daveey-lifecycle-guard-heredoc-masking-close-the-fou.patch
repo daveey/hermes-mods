@@ -1,0 +1,503 @@
+From 27342457f5835f348e5e5dfe6dbffb143c90c9d5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:47:23 +0000
+Subject: [PATCH] [daveey] lifecycle guard heredoc masking: close the four
+ fail-open shapes from review 5879950534
+
+- Wrappers: only stdin-passing wrappers with an explicit per-wrapper option allowlist peel to a
+  data consumer (timeout/nice/ionice/nohup/setsid/stdbuf/env/command/exec/eatmydata/sudo/doas).
+  Any other option word refuses masking: env -S'bash -s' / --split-string=, exec -a NAME,
+  sudo -D/-R/--chdir/-s. The strict walk must land where _peel_transparent_prefixes lands.
+- Nested heredocs are judged only for the executed-path walk (strip_inert_heredoc_bodies(...,
+  nested=True)); text scanners keep seeing nested bodies, so a rewritten or stdin-hijacked body's
+  lifecycle text still blocks. The outer owner must hand its single, non-<<- body unchanged to a
+  stdin shell: bash/sh/... (no -c, no script operand), ssh whose remote command is such a shell
+  with no operators, or $SSH resolved from an earlier plain assignment. sed ... <<'R' | bash,
+  bash <<-'R', an unknown $CMD and shadowed ssh/bash names mask nothing.
+- Function-body consumers: never cat (its output is its body); python/osascript bodies stay
+  visible to text scans when the command could hand a function's output to a shell
+  (|, $(, `, <(, eval, source, .).
+
+Tests: test_lifecycle_guard_heredoc_walk.py 63 -> 96 cases (16 must-refuse shell-runs-body rows,
+all pass on origin/main and fail on 004c14deb336; 12 untrusted-owner and 5 trusted-owner strip
+unit cases). 670 passed across lifecycle_guard*/terminal*/self_repo_guard.
+
+Kanban: t_01a1d0ea6db6c158
+---
+ cron/lifecycle_guard.py                       |   2 +-
+ .../cron/test_lifecycle_guard_heredoc_walk.py |  77 ++++-
+ tools/shell_heredoc.py                        | 294 ++++++++++++++----
+ 3 files changed, 312 insertions(+), 61 deletions(-)
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 7d20072dd0..d4a50a8f78 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -1235,7 +1235,7 @@ def _contains_unsafe_gateway_action(
+     # oversized data file mentioned there otherwise fails closed as a "script".
+     from tools.shell_heredoc import strip_inert_heredoc_bodies
+ 
+-    walk_command = strip_inert_heredoc_bodies(command)
++    walk_command = strip_inert_heredoc_bodies(command, nested=True)
+ 
+     for payload in _iter_shell_command_payloads(walk_command):
+         # An `sh -c` payload is text of the same file (or command) it appears in.
+diff --git a/tests/cron/test_lifecycle_guard_heredoc_walk.py b/tests/cron/test_lifecycle_guard_heredoc_walk.py
+index 49e33cd730..1638071e08 100644
+--- a/tests/cron/test_lifecycle_guard_heredoc_walk.py
++++ b/tests/cron/test_lifecycle_guard_heredoc_walk.py
+@@ -163,12 +163,87 @@ def test_data_consumer_heredoc_mention_is_not_refused(tmp_path, shape, body_kind
+ 
+     db = _big_sqlite(tmp_path / "big.db")
+     command = _CONSUMER_SHAPES[shape].format(body=_bodies(db)[body_kind])
+-    masked = strip_inert_heredoc_bodies(command)
++    masked = strip_inert_heredoc_bodies(command, nested=True)  # the executed-path walk's view
+     assert str(db) not in masked, masked  # the consumer body is masked, wherever it sits
+     assert masked.count("\n") == command.count("\n")
++    # Text scanners still see a NESTED body (its outer body could rewrite it); others are masked.
++    assert (str(db) in strip_inert_heredoc_bodies(command)) == shape.startswith("nested")
+     assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
+ 
+ 
++# Shapes where a shell really runs the "consumer" body (or rewrites it first): main refuses each,
++# and so must the peeled/nested masking (review of PR #1671 @004c14deb336, plus the function
++# output and stdin-hijack variants of the same class).
++_SHELL_RUNS_BODY = {
++    "exec-a": "exec -a python3 bash <<'R'\nhermes gateway restart\nR",
++    "env-S-attached-single": "env -S'bash -s' python3 <<'R'\nhermes gateway restart\nR",
++    "env-S-attached-double": "env -S\"bash -s\" python3 <<'R'\nhermes gateway restart\nR",
++    "env-split-string=": "env --split-string='bash -s' python3 <<'R'\nhermes gateway restart\nR",
++    "sudo-D": "sudo -D python3 bash <<'R'\nhermes gateway restart\nR",
++    "sudo-R": "sudo -R python3 bash <<'R'\nhermes gateway restart\nR",
++    "sudo-chdir": "sudo --chdir=/ python3 - <<'R'\nhermes gateway restart\nR",
++    "outer-tab-strip": "bash <<-'R'\n\tpython3 - <<'PY'\n\tprint(1)\n\tPY\n"
++                       "\thermes gateway restart\nPY\nR",
++    "outer-transform": "sed 's/python3 - /bash -s /' <<'R' | bash\npython3 - <<'PY'\n"
++                       "hermes gateway restart\nPY\nR",
++    "outer-unknown-var": "$CMD <<'R'\npython3 - <<'PY'\nhermes gateway restart\nPY\nR",
++    "outer-stdin-hijack": "bash -s <<'R'\nsed 's/^python3 - /bash -s /' | bash\npython3 - <<'PY'\n"
++                          "hermes gateway restart\nPY\nR",
++    "outer-ssh-remote-pipe": "ssh h 'sed s/python3/bash/ | bash' <<'R'\npython3 - <<'PY'\n"
++                             "hermes gateway restart\nPY\nR",
++    "fn-cat-piped": "f() { cat <<'PY'\nhermes gateway restart\nPY\n}\nf | bash",
++    "fn-python-piped": "f() { python3 - <<'PY'\nprint('hermes gateway restart')\nPY\n}\nf | bash",
++    "fn-python-eval": "f() { python3 - <<'PY'\nprint('hermes gateway restart')\nPY\n}\neval \"$(f)\"",
++    "ssh-shadow": "ssh() { sed s/python3/bash/ | bash; }\nssh h 'bash -s' <<'R'\npython3 - <<'PY'\n"
++                  "hermes gateway restart\nPY\nR",
++}
++
++
++@pytest.mark.parametrize("shape", sorted(_SHELL_RUNS_BODY))
++def test_bodies_a_shell_runs_stay_refused(tmp_path, shape):
++    from cron.lifecycle_guard import scan_gateway_lifecycle
++
++    assert scan_gateway_lifecycle(_SHELL_RUNS_BODY[shape], cwd=str(tmp_path)) == (True, None)
++
++
++@pytest.mark.parametrize("command", [
++    # wrappers outside the stdin-passing allowlist, or with options it does not know
++    "exec -a python3 bash <<'R'\npython3 - <<'PY'\nx\nPY\nR",
++    "env -S'bash -s' python3 - <<'PY'\nx\nPY",
++    "sudo -D / python3 - <<'PY'\nx\nPY",
++    # nested only under a single, tab-preserving body that a stdin shell reads verbatim
++    "bash <<-'R'\npython3 - <<'PY'\nx\nPY\nR",
++    "sed s/a/b/ <<'R' | bash\npython3 - <<'PY'\nx\nPY\nR",
++    "bash -c 'sed s/a/b/ | bash' <<'R'\npython3 - <<'PY'\nx\nPY\nR",
++    "bash script.sh <<'R'\npython3 - <<'PY'\nx\nPY\nR",
++    "ssh h 'cat | bash' <<'R'\npython3 - <<'PY'\nx\nPY\nR",
++    "ssh h 'bash -s | bash' <<'R'\npython3 - <<'PY'\nx\nPY\nR",
++    "SSH=\"$(pick)\"\n$SSH h 'bash -s' <<'R'\npython3 - <<'PY'\nx\nPY\nR",
++    # a shadowed outer shell/ssh, and `cat` (its output is its body) inside a function
++    "ssh() { cat; }\nssh h 'bash -s' <<'R'\npython3 - <<'PY'\nx\nPY\nR",
++    "f() { cat <<'PY'\nx\nPY\n}\nf",
++])
++def test_untrusted_owner_masks_nothing(command):
++    from tools.shell_heredoc import strip_inert_heredoc_bodies
++
++    assert strip_inert_heredoc_bodies(command, nested=True) == command
++
++
++@pytest.mark.parametrize("command", [
++    "timeout --signal=KILL -k 5 20 nice -n 5 stdbuf -oL env -i A=1 python3 - x <<'PY'\nx\nPY",
++    "sudo -u root -E python3 - <<'PY'\nx\nPY",
++    "bash -eu -o pipefail -s a b <<'R'\npython3 - <<'PY'\nx\nPY\nR",
++    "ssh -o BatchMode=yes -p 22 -tt h 'T=1 bash -s' <<'R'\npython3 - <<'PY'\nx\nPY\nR",
++    "SSH=\"timeout 60 ssh -o A=b ${XOPTS:-} u@$IP\"\n$SSH \"T=$T bash -s\" <<'R' 2>&1 | grep x\n"
++    "python3 - <<'PY'\nx\nPY\nR",
++])
++def test_trusted_owner_masks_the_data_body(command):
++    from tools.shell_heredoc import strip_inert_heredoc_bodies
++
++    masked = strip_inert_heredoc_bodies(command, nested=True)
++    assert "\nx\n" not in masked and masked.count("\n") == command.count("\n"), masked
++
++
+ @pytest.mark.parametrize("command", [
+     # su's operand is a USER and its shell reads stdin; env -S hands a string to a shell
+     "su python3 - <<'EOF'\nhermes gateway restart\nEOF",
+diff --git a/tools/shell_heredoc.py b/tools/shell_heredoc.py
+index a64bdbb6e1..dc964c7313 100644
+--- a/tools/shell_heredoc.py
++++ b/tools/shell_heredoc.py
+@@ -5,65 +5,216 @@ executes), so a body is masked ONLY when every delimiter is quoted, every heredo
+ terminator line, the owning simple command (after transparent wrappers such as ``timeout 20`` are
+ peeled; optionally the first command of a ``name() {`` body) is an allowlisted non-shell
+ interpreter, and no list operator follows the heredoc. Otherwise the command is returned
+-untouched: a false positive is acceptable, hiding shell syntax from a guard is not. A quoted body
+-that stays visible (``ssh h 'bash -s' <<'R'``) is literal text, so data-consumer heredocs nested in
+-it are judged by the same rules.
++untouched: a false positive is acceptable, hiding shell syntax from a guard is not. For the
++lifecycle guard's executed-path walk only (``nested=True``), data-consumer heredocs nested in the
++quoted body of an outer heredoc that a shell reads verbatim (``ssh h 'bash -s' <<'R'``) are judged
++by the same rules; text scanners still see those nested bodies.
+ Masked bodies keep their newline count (re.MULTILINE)."""
+ 
+ from __future__ import annotations
+ 
+ import re
++import shlex
+ 
+ # Non-shell interpreters whose quoted heredoc bodies are data for THAT interpreter, judged on the
+-# command the owner actually runs: VAR=... assignments and transparent wrappers (``timeout 20``,
++# command the owner actually runs: VAR=... assignments and stdin-passing wrappers (``timeout 20``,
+ # ``nice``, ``env VAR=1``, ``command``) are peeled, a path prefix is allowed, positional arguments
+ # may follow. Narrow on purpose: unmatched = visible.
+ _INERT_HEREDOC_CONSUMER_RE = re.compile(r"^(?:python(?:3(?:\.\d+)*)?|osascript|cat)$", re.IGNORECASE)
+-# Wrappers that run their operand with the heredoc on its stdin. Excluded: ``su``/``runuser`` (the
+-# operand is a USER and a shell reads stdin) and every other privilege/namespace wrapper.
+-_INERT_HEREDOC_WRAPPERS = frozenset({
+-    "timeout", "nice", "ionice", "nohup", "setsid", "stdbuf", "env", "command", "exec",
+-    "eatmydata", "sudo", "doas",
+-})
+-# A wrapper option that hands a STRING to a shell (``env -S 'bash -s'``) or starts one (``sudo
+-# -s``) makes the peeled word unreliable: keep the body visible.
+-_SHELL_STARTING_WRAPPER_OPTIONS = frozenset({
+-    "-S", "--split-string", "-c", "--command", "-s", "--shell", "-i", "--login",
+-})
++# Wrappers that run their operand with the heredoc on its stdin, each with the ONLY options it may
++# carry: (options taking the next word, regex of self-contained option words, leading operands).
++# Any other option (``env -S'bash -s'``, ``exec -a python3 bash``, ``sudo -s``/``-D dir``) or any
++# other wrapper (``su``/``runuser``: the operand is a USER and a shell reads stdin) = visible.
++_INERT_HEREDOC_WRAPPERS: dict[str, tuple[frozenset[str], re.Pattern[str], int]] = {
++    name: (frozenset(values), re.compile(flags), operands)
++    for name, values, flags, operands in (
++        ("timeout", {"-s", "-k", "--signal", "--kill-after"},
++         r"--preserve-status|--foreground|-v|--verbose|--(?:signal|kill-after)=\S+|-[sk]\S+", 1),
++        ("nice", {"-n", "--adjustment"}, r"-n\S+|--adjustment=\S+|-\d+", 0),
++        ("ionice", {"-c", "-n", "--class", "--classdata"},
++         r"-t|--ignore|-[cn]\d+|--class(?:data)?=\S+", 0),
++        ("nohup", set(), r"(?!)", 0),
++        ("setsid", set(), r"-f|--fork|-w|--wait", 0),
++        ("stdbuf", {"-i", "-o", "-e", "--input", "--output", "--error"},
++         r"-[ioe]\S+|--(?:input|output|error)=\S+", 0),
++        ("env", {"-u", "--unset", "-C", "--chdir"},
++         r"-|-i|--ignore-environment|-0|--null|-u\S+|--unset=\S+|-C\S+|--chdir=\S+", 0),
++        ("command", set(), r"-p", 0),
++        ("exec", set(), r"(?!)", 0),
++        ("eatmydata", set(), r"(?!)", 0),
++        ("sudo", {"-u", "-g", "-p", "--user", "--group", "--prompt"},
++         r"-[EHnPk]+|--preserve-env(?:=\S+)?|--set-home|--non-interactive|--preserve-groups"
++         r"|--(?:user|group|prompt)=\S+|-[ugp]\S+", 0),
++        ("doas", {"-u"}, r"-n|-u\S+", 0),
++    )
++}
++# Wrappers whose operand list may start with VAR=value words.
++_ASSIGNING_WRAPPERS = frozenset({"env", "sudo"})
++# Outer owners whose quoted heredoc body a SHELL parses verbatim: only their bodies' nested
++# heredocs may be judged as shell text. A POSIX shell reading its script from stdin.
++_STDIN_SHELLS = frozenset({"bash", "sh", "dash", "zsh", "ksh"})
++_SHELL_FLAG_RE = re.compile(r"[-+][abefhkmnpstuvxBCEHPTil]+|--(?:login|noprofile|norc|posix)")
++_SSH_VALUE_OPTIONS = frozenset("BbcDEeFIiJLlmOoPpQRSWw")
++_SSH_FLAG_OPTIONS = frozenset("46AaCgKkMnqTtVvXxYy")
++_PURE_EXPANSION_RE = re.compile(r"^\$(?:\{[A-Za-z_]\w*(?::?[-=+?][^}]*)?\}|[A-Za-z_]\w*)$")
++_REMOTE_SHELL_UNSAFE = ("|", ";", "&", "<", ">", "(", ")", "`", "$(", "\n")
+ _ASSIGNMENT_WORD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+ # ``name() {`` / ``function name {`` opening a function body on the heredoc's own line.
+ _FUNCTION_HEADER_RE = re.compile(
+     r"\s*(?:function\s+[A-Za-z_][\w.:-]*\s*(?:\(\s*\))?|[A-Za-z_][\w.:-]*\s*\(\s*\))\s*\{\s+")
+ # Nested heredocs inside a quoted outer body are classified recursively, this deep at most.
+ _MAX_NESTED_HEREDOC_DEPTH = 4
+-# A command that (re)defines a consumer or wrapper name as a function or alias anywhere
+-# (``python3() { bash; }``) may run a shell where the peeled word says "python": mask nothing.
++# A command that (re)defines a consumer, wrapper or outer-shell name as a function or alias
++# anywhere (``python3() { bash; }``) may run a shell where the peeled word says "python": mask nothing.
+ _CONSUMER_SHADOW_RE = re.compile(
+     r"(?:^|[\s;&|(){{}}])(?:(?:function\s+)?{names}\s*\(\s*\)|function\s+{names}\s+\{{"
+     r"|alias\s+{names}=)".format(
+         names=r"(?:python[\d.]*|osascript|cat|timeout|nice|ionice|nohup|setsid|stdbuf|env|command"
+-              r"|exec|eatmydata|sudo|doas)"),
++              r"|exec|eatmydata|sudo|doas|ssh|bash|sh|dash|zsh|ksh)"),
+     re.IGNORECASE)
+ 
+ 
+-def _runs_inert_consumer(owner_words: list[str]) -> bool:
+-    """Whether the simple command *owner_words* (quotes masked, heredoc operators removed) runs
+-    an allowlisted data consumer, after the same wrapper peeling as the lifecycle guard."""
+-    from cron.lifecycle_guard import _TRANSPARENT_COMMAND_PREFIXES, _peel_transparent_prefixes
++def _peel_stdin_wrappers(words: list[str], index: int) -> int | None:
++    """Index of the command a chain of stdin-passing wrappers runs, or None when any wrapper or
++    option outside ``_INERT_HEREDOC_WRAPPERS`` appears (then the peeled word is not trusted)."""
++    from cron.lifecycle_guard import _MAX_PREFIX_PEELS, _TRANSPARENT_COMMAND_PREFIXES
+ 
+-    index = next((i for i, word in enumerate(owner_words) if not _ASSIGNMENT_WORD_RE.match(word)), None)
++    for _ in range(_MAX_PREFIX_PEELS):
++        if index >= len(words):
++            return None
++        name = words[index].rsplit("/", 1)[-1]
++        if name not in _TRANSPARENT_COMMAND_PREFIXES:
++            return index
++        if name not in _INERT_HEREDOC_WRAPPERS:
++            return None
++        value_options, flag_re, operands = _INERT_HEREDOC_WRAPPERS[name]
++        index += 1
++        while index < len(words):
++            word = words[index]
++            if word == "--":
++                index += 1
++                break
++            if word in value_options:
++                index += 2
++            elif word.startswith("-"):
++                if not flag_re.fullmatch(word):
++                    return None
++                index += 1
++            elif name in _ASSIGNING_WRAPPERS and _ASSIGNMENT_WORD_RE.match(word):
++                index += 1
++            else:
++                break
++        for _ in range(operands):
++            if index >= len(words) or words[index].startswith("-"):
++                return None
++            index += 1
++    return None
++
++
++def _peeled_command(words: list[str]) -> tuple[int, str] | None:
++    """``(index, basename)`` of the command *words* runs after assignments and stdin wrappers."""
++    from cron.lifecycle_guard import _peel_transparent_prefixes
++
++    index = next((i for i, word in enumerate(words) if not _ASSIGNMENT_WORD_RE.match(word)), None)
+     if index is None:
++        return None
++    peeled = _peel_stdin_wrappers(words, index)
++    # The strict walk must land exactly where the lifecycle guard's own peeling lands.
++    if peeled is None or peeled >= len(words) or peeled != _peel_transparent_prefixes(words, index):
++        return None
++    return peeled, words[peeled].rsplit("/", 1)[-1]
++
++
++def _is_stdin_shell(words: list[str]) -> bool:
++    """Whether *words* run a POSIX shell that reads its script from stdin (``bash``, ``bash -s
++    args``, ``T=1 sh -e``), never ``-c`` or a script-file operand."""
++    peeled = _peeled_command(words)
++    if peeled is None or peeled[1] not in _STDIN_SHELLS:
++        return False
++    arguments = iter(words[peeled[0] + 1:])
++    for word in arguments:
++        if word in ("-o", "+o"):
++            next(arguments, None)
++        elif not _SHELL_FLAG_RE.fullmatch(word):
++            return False  # `--`, `-c`, or a script-file operand: stdin is not the script
++        elif not word.startswith("--") and "s" in word:
++            return True  # `-s`: the remaining words are positional parameters
++    return True
++
++
++def _ssh_runs_stdin_shell(words: list[str]) -> bool:
++    """Whether *words* are ``ssh [opts] host 'remote command'`` whose remote command is a plain
++    stdin shell (``T=$T bash -s``): ssh hands the heredoc to it unchanged."""
++    peeled = _peeled_command(words)
++    if peeled is None or peeled[1] != "ssh":
+         return False
+-    peeled = _peel_transparent_prefixes(owner_words, index)
+-    if peeled >= len(owner_words):
++    index = peeled[0] + 1
++    while index < len(words) and (
++            words[index].startswith("-") or _PURE_EXPANSION_RE.match(words[index])):
++        word = words[index]
++        index += 1
++        if not word.startswith("-"):
++            continue  # `${XOPTS:-}`: more ssh options; the remote command is still checked below
++        for position, letter in enumerate(word[1:], 1):
++            if letter in _SSH_VALUE_OPTIONS:
++                index += position == len(word) - 1  # `-o X` consumes the next word, `-oX` not
++                break
++            if letter not in _SSH_FLAG_OPTIONS:
++                return False
++    remote = " ".join(words[index + 1:])  # ssh joins the words after the host with spaces
++    if not remote.strip() or any(marker in remote for marker in _REMOTE_SHELL_UNSAFE):
+         return False
+-    for word in owner_words[index:peeled]:
+-        name = word.rsplit("/", 1)[-1]
+-        if word in _SHELL_STARTING_WRAPPER_OPTIONS or (
+-            name in _TRANSPARENT_COMMAND_PREFIXES and name not in _INERT_HEREDOC_WRAPPERS
+-        ):
++    try:
++        return _is_stdin_shell(shlex.split(remote))
++    except ValueError:
++        return False
++
++
++def _variable_value(command: str, name: str, before: int) -> str | None:
++    """Value of the last plain ``NAME=value`` assignment in ``command[:before]``, or None."""
++    pattern = re.compile(r"(?:^|[\s;&|])" + re.escape(name)
++                         + r"""=("(?:[^"\\]|\\.)*"|'[^']*'|[^\s;&|'"]*)(?=[\s;&|]|$)""")
++    matches = list(pattern.finditer(command, 0, before))
++    if not matches or "$(" in matches[-1].group(1) or "`" in matches[-1].group(1):
++        return None
++    try:
++        words = shlex.split(matches[-1].group(1))
++    except ValueError:
++        return None
++    return words[0] if len(words) == 1 else None
++
++
++def _owner_feeds_shell(command: str, command_start: int, owner_start: int, specs: list) -> bool:
++    """Whether the owner of the heredoc opened in ``command[command_start:]`` hands its single,
++    tab-preserving body unchanged to a shell: ``bash -s``, ``ssh h 'bash -s'``, or ``$SSH h
++    'bash -s'`` with ``SSH`` assigned earlier in *command*. Anything else (``sed … <<'R' | bash``,
++    an unknown ``$CMD``, ``<<-`` stripping the inner terminator's tabs) may change the body's
++    lines before a shell parses them, so its nested heredocs are not judged."""
++    if len(specs) != 1 or specs[0][1]:
++        return False
++    lexer = shlex.shlex(command[owner_start:], posix=True, punctuation_chars=True)
++    lexer.whitespace_split = True
++    words: list[str] = []
++    try:
++        for token in lexer:
++            if token == "<<":
++                break
++            if token[:1] in ("<", ">", "|", ";", "&", "(", ")") or "\n" in token:
++                return False
++            words.append(token)
++        else:
+             return False
+-    return bool(_INERT_HEREDOC_CONSUMER_RE.match(owner_words[peeled].rsplit("/", 1)[-1]))
++    except ValueError:
++        return False
++    if any("$(" in word or "`" in word for word in words):
++        return False
++    first = next((i for i, word in enumerate(words) if not _ASSIGNMENT_WORD_RE.match(word)), None)
++    if first is not None and _PURE_EXPANSION_RE.match(words[first]):
++        value = _variable_value(command, words[first].strip("${}"), command_start)
++        if not value:
++            return False
++        words[first:first + 1] = value.split()
++    return _is_stdin_shell(words) or _ssh_runs_stdin_shell(words)
+ 
+ 
+ def _span_end(command: str, cursor: int, closer: str) -> int:
+@@ -225,29 +376,44 @@ def _find_heredoc_close(
+ 
+ 
+ def _owner_runs_inert_consumer(
+-        command: str, command_start: int, command_end: int, owner_start: int) -> bool:
+-    """Whether the heredoc opener line is a plain simple command (optionally the first command of
+-    a ``name() {`` function body) whose peeled command is an allowlisted data consumer."""
++        command: str, command_start: int, command_end: int, owner_start: int) -> str | None:
++    """``"plain"`` or ``"function"`` when the heredoc opener line is a plain simple command
++    (``"function"``: the first command of a ``name() {`` body) whose peeled command is an
++    allowlisted data consumer, else None."""
+     header = _FUNCTION_HEADER_RE.match(command, command_start, command_end)
+     opener_start = header.end() if header else command_start
+     masked_opener = _mask_simple_quotes(command[opener_start:command_end])
+     if any(marker in masked_opener for marker in ("$(", "`", "<(", ">(", "(", ")", "{", "}")):
+-        return False
+-    owner = command[max(owner_start, opener_start):command_end]
+-    return _runs_inert_consumer(_mask_simple_quotes(owner).split())
++        return None
++    owner = _mask_simple_quotes(command[max(owner_start, opener_start):command_end]).split()
++    peeled = _peeled_command(owner)
++    if peeled is None or not _INERT_HEREDOC_CONSUMER_RE.match(peeled[1]):
++        return None
++    if header is None:
++        return "plain"
++    # `cat`'s output IS its body; a function's caller may pipe it on (`f | bash`).
++    return None if peeled[1].lower() == "cat" else "function"
++
+ 
++# Anything that could hand a function's OUTPUT to a shell (`f | bash`, `eval "$(f)"`, `. <(f)`).
++_OUTPUT_EXECUTOR_RE = re.compile(r"\||\$\(|`|<\(|>\(|\beval\b|\bsource\b|(?:^|[\s;&(])\.\s")
+ 
+-def strip_inert_heredoc_bodies(command: str, *, _depth: int = 0) -> str:
+-    """Mask heredoc bodies that are provably inert data (see module docstring). The body of a
+-    quoted-delimiter heredoc that is NOT masked (``ssh h 'bash -s' <<'R'``) stays visible, but
+-    data-consumer heredocs nested inside it are classified and masked the same way."""
++
++def strip_inert_heredoc_bodies(command: str, *, nested: bool = False, _depth: int = 0) -> str:
++    """Mask heredoc bodies that are provably inert data (see module docstring).
++
++    ``nested=True`` (the lifecycle guard's executed-path walk only) also masks data-consumer
++    heredocs nested in the single quoted body of an outer heredoc a shell reads verbatim (``ssh h
++    'bash -s' <<'R'``); the outer body's own lines stay visible. Text scanners keep the default:
++    a nested body's literal text stays visible to them, whatever the outer body does with it."""
+     # Runs on every terminal call: skip the state machine when no '<<' exists; stop past the last.
+     if "<<" not in command:
+         return command
+     if _CONSUMER_SHADOW_RE.search(command):
+         return command
+     last_opener_index = command.rfind("<<")
+-    replacements: list[tuple[int, int, str]] = []
++    replacements: list[tuple[int, int, str, str]] = []
++    function_masks = 0
+     command_start = 0
+     while command_start <= last_opener_index:
+         (
+@@ -275,27 +441,37 @@ def strip_inert_heredoc_bodies(command: str, *, _depth: int = 0) -> str:
+             bodies.append((body_cursor, *closed))
+             body_cursor = closed[1]
+         quoted = [spec_quoted for _delimiter, _strip_tabs, spec_quoted in specs]
+-        if (
+-            all(quoted)
+-            and not post_heredoc_list_operator
+-            and _owner_runs_inert_consumer(command, command_start, command_end, owner_start)
+-        ):
+-            replacements += [(start, end, "\n" * command.count("\n", start, end))
++        consumer = None
++        if all(quoted) and not post_heredoc_list_operator:
++            consumer = _owner_runs_inert_consumer(command, command_start, command_end, owner_start)
++        if consumer:
++            function_masks += consumer == "function"
++            replacements += [(start, end, "\n" * command.count("\n", start, end), consumer)
+                              for start, _terminator, end in bodies]
+-        elif _depth < _MAX_NESTED_HEREDOC_DEPTH:
+-            # An unquoted outer body expands locally first (`$(…)` runs here), so only a quoted
+-            # one is literal text whose nested heredocs can be judged on their own.
+-            for (start, terminator, _end), body_quoted in zip(bodies, quoted):
+-                inner = command[start:terminator]
+-                if body_quoted and "<<" in inner:
+-                    masked = strip_inert_heredoc_bodies(inner, _depth=_depth + 1)
+-                    if masked != inner:
+-                        replacements.append((start, terminator, masked))
++        elif nested and _depth < _MAX_NESTED_HEREDOC_DEPTH and all(quoted) and _owner_feeds_shell(
++                command, command_start, owner_start, specs):
++            # An unquoted outer body expands locally first (`$(…)` runs here), and any owner but a
++            # verbatim stdin shell may rewrite the body: only then are nested heredocs judged.
++            start, terminator, _end = bodies[0]
++            inner = command[start:terminator]
++            if "<<" in inner:
++                masked = strip_inert_heredoc_bodies(inner, nested=True, _depth=_depth + 1)
++                if masked != inner:
++                    replacements.append((start, terminator, masked, "nested"))
+         command_start = body_cursor
+-    # Single-pass rebuild (replacements are sorted and non-overlapping).
++    result = _apply_replacements(command, replacements)
++    if function_masks and not nested and _OUTPUT_EXECUTOR_RE.search(_mask_simple_quotes(result)):
++        # A function's output may reach a shell here: its consumer bodies stay visible to text scans.
++        result = _apply_replacements(
++            command, [item for item in replacements if item[3] != "function"])
++    return result
++
++
++def _apply_replacements(command: str, replacements: list[tuple[int, int, str, str]]) -> str:
++    """Single-pass rebuild (replacements are sorted and non-overlapping)."""
+     parts: list[str] = []
+     previous = 0
+-    for start, end, replacement in replacements:
++    for start, end, replacement, _kind in replacements:
+         parts += [command[previous:start], replacement]
+         previous = end
+     return "".join(parts) + command[previous:]
+-- 
+2.51.0
+

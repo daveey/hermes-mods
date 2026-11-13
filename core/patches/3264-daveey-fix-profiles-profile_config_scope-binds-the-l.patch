@@ -1,0 +1,110 @@
+From b533e3fb13c1bffe489dbeb45ddc481460709092 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:09:28 +0000
+Subject: [PATCH] [daveey] fix(profiles): profile_config_scope binds the launch
+ scope inside a bound scope
+
+profile_config_scope(launch home) on a single-profile host unbound an
+enclosing secondary with three legacy setters, ending in
+set_terminal_scope(None). Inside a bound scope (bind_profile_scope, a scoped
+turn) clearing the terminal policy always raises ScopeSwitchRefused, so
+profile provisioning for the launch profile failed there.
+
+With a scope bound, bind the launch profile whole instead: bind_state over
+scope_for_profile(launch), launch secrets unstamped, terminal policy over the
+LIVE TERMINAL_* env (not launch_terminal_env, which would freeze the launch
+snapshot before multiplex activation). The no-scope and multiplex paths are
+unchanged.
+
+Reachability: kanban_db_dispatch's bind_profile_scope wraps only config/toolset
+reads and the spawn-env build, which never reach profile_config_scope, so the
+dispatcher does not hit this on main; it is latent for any caller that runs
+provisioning inside a bound scope on a single-profile host.
+
+Task: t_01a1d3eb07d8da1a
+---
+ .../tui_gateway/test_profile_config_scope.py  | 36 +++++++++++++++++++
+ tui_gateway/launch_profile_policy.py          | 12 ++++++-
+ 2 files changed, 47 insertions(+), 1 deletion(-)
+
+diff --git a/tests/tui_gateway/test_profile_config_scope.py b/tests/tui_gateway/test_profile_config_scope.py
+index 2802335637..cbe68576fc 100644
+--- a/tests/tui_gateway/test_profile_config_scope.py
++++ b/tests/tui_gateway/test_profile_config_scope.py
+@@ -70,3 +70,39 @@ def test_the_launch_home_keeps_the_launch_rules(homes):
+         else:
+             assert (get_hermes_home_override(), get_terminal_scope()) == (None, None)
+     assert (get_hermes_home_override(), current_secret_scope(), get_terminal_scope()) == (None, None, None)
++
++
++@pytest.mark.parametrize("bound", ["launch", "work"])
++def test_the_launch_home_inside_a_bound_scope_binds_the_launch_scope(homes, bound):
++    """A kanban dispatch or scoped gateway turn binds a whole profile scope (``bind_profile_scope``);
++    unbinding its terminal policy is refused there, so the launch home binds its own scope."""
++    from agent.runtime_scope import bind_profile_scope
++    from hermes_scope import current_scope
++
++    launch, work, multiplex = homes
++    frozen_before = policy._snapshot
++    with bind_profile_scope(launch if bound == "launch" else work, hydrate_secrets=False) as outer:
++        with policy.profile_config_scope(launch, launch_home=launch):
++            assert Path(current_scope().agent) == launch
++            assert get_hermes_home() == launch
++            assert current_secret_scope_home() is None
++            assert _secrets() == {"LAUNCH_FILE_KEY": "launch-file", "LAUNCH_ENV_ONLY": "env-only", "WORK_KEY": None,
++                                  "SHARED_KEY": "launch"}
++            assert (get_terminal_scope() or {}).get("TERMINAL_ENV") == "local"
++        assert current_scope() == outer
++        assert get_hermes_home() == (launch if bound == "launch" else work)
++    assert (get_hermes_home_override(), current_secret_scope(), get_terminal_scope()) == (None, None, None)
++    if bound == "work" and not multiplex:
++        assert policy._snapshot is frozen_before is None  # a single-profile host's launch env is not frozen early
++
++
++def test_a_secondary_home_inside_a_bound_launch_scope_gets_only_its_own_files(homes):
++    from agent.runtime_scope import bind_profile_scope
++
++    launch, work, _ = homes
++    with bind_profile_scope(launch, hydrate_secrets=False):
++        with policy.profile_config_scope(work, launch_home=launch):
++            assert get_hermes_home() == work
++            assert _secrets() == {"LAUNCH_FILE_KEY": None, "LAUNCH_ENV_ONLY": None, "WORK_KEY": "work", "SHARED_KEY": "work"}
++            assert (get_terminal_scope() or {}).get("TERMINAL_ENV") == "docker"
++        assert get_hermes_home() == launch
+diff --git a/tui_gateway/launch_profile_policy.py b/tui_gateway/launch_profile_policy.py
+index 6e7efc1b55..5e96ff2223 100644
+--- a/tui_gateway/launch_profile_policy.py
++++ b/tui_gateway/launch_profile_policy.py
+@@ -214,11 +214,14 @@ def profile_config_scope(home: str | Path, *, launch_home: str | Path | None = N
+ 
+     The launch home (``launch_home``, default ``get_process_hermes_home()``) gets its launch secret
+     scope with no home override or terminal scope (an enclosing secondary's are unbound for the
+-    body), or the full :func:`launch_profile_runtime_scope` once the process multiplexes. Any other
++    body), or the full :func:`launch_profile_runtime_scope` once the process multiplexes. Inside a
++    bound scope (which refuses those unbinds) it binds the launch profile's whole scope. Any other
+     home gets only its own files, stamped as foreign. No external-source hydration.
+     """
++    from agent.runtime_scope import bind_state, scope_for_profile
+     from agent.secret_scope import build_profile_secret_scope, is_multiplex_active, reset_secret_scope, set_secret_scope
+     from hermes_constants import get_process_hermes_home, reset_hermes_home_override, set_hermes_home_override
++    from hermes_scope import current_scope
+     from tools.terminal_scope import install_profile_terminal_scope, reset_terminal_scope, set_terminal_scope
+ 
+     home = Path(home)
+@@ -227,6 +230,13 @@ def profile_config_scope(home: str | Path, *, launch_home: str | Path | None = N
+         if home.resolve() == launch.resolve():
+             if is_multiplex_active():
+                 stack.enter_context(launch_profile_runtime_scope(launch))
++            elif current_scope() is not None:
++                # A bound scope (kanban dispatch, a scoped turn) refuses the unbinds below: bind the
++                # launch profile whole instead, from the LIVE env (single-profile: freezing it here
++                # would capture it before activation, see ``_launch_env``).
++                stack.enter_context(bind_state(
++                    scope_for_profile(launch), secrets=launch_secret_scope(launch), stamp_home=False,
++                    env_overlay={k: v for k, v in _launch_env().items() if k.startswith("TERMINAL_")}))
+             else:
+                 # Unbind an enclosing secondary's home and terminal, or the launch secrets would
+                 # pair with that profile's config. Unset resolves to the process home, which is the
+-- 
+2.51.0
+

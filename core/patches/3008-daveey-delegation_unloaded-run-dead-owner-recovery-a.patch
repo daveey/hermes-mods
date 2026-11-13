@@ -1,0 +1,106 @@
+From a4202717ff90f8dd1d41e71fa3b4689355637751 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:21:27 +0000
+Subject: [PATCH] [daveey] delegation_unloaded: run dead-owner recovery at most
+ every 5 min per ledger
+
+Review 5879600272 (non-blocking): the pass called recover_abandoned_delegations
+on every 30 s tick while a ledger was non-quiet. It now runs it at most once per
+RECOVER_EVERY_S (300 s) per ledger home in this process (unclaimed_pending_completions
+gains recover=).
+---
+ tests/tui_gateway/test_delegation_unloaded_wake.py | 14 ++++++++++++++
+ tools/async_delegation.py                          |  6 ++++--
+ tui_gateway/delegation_unloaded.py                 | 10 +++++++++-
+ 3 files changed, 27 insertions(+), 3 deletions(-)
+
+diff --git a/tests/tui_gateway/test_delegation_unloaded_wake.py b/tests/tui_gateway/test_delegation_unloaded_wake.py
+index c51cb4b35c..30ef6f2300 100644
+--- a/tests/tui_gateway/test_delegation_unloaded_wake.py
++++ b/tests/tui_gateway/test_delegation_unloaded_wake.py
+@@ -205,6 +205,20 @@ def test_an_archived_or_moved_parent_is_never_woken(home, mark, verdict):
+     assert row["delivery_attempts"] == 0  # unclaimed: an unarchived/reopened chat's poller can still take it
+ 
+ 
++def test_dead_owner_recovery_runs_at_most_every_recover_every_s(home, monkeypatch):
++    _completion()
++    calls = []
++    real = ad.unclaimed_pending_completions
++    monkeypatch.setattr(ad, "unclaimed_pending_completions",
++                        lambda **kw: calls.append(kw["recover"]) or real(**kw))
++    t0 = time.time()
++
++    for dt in (0.0, 30.0, du.RECOVER_EVERY_S - 1, du.RECOVER_EVERY_S + 1):
++        _sweep(home, _Waker("busy"), now=t0 + dt)
++
++    assert calls == [True, False, False, True]
++
++
+ def test_a_lapsed_claim_at_ack_is_logged_as_a_warning(home, monkeypatch, caplog):
+     _completion()
+     monkeypatch.setattr(ad, "complete_completion_delivery", lambda did, claim: False)
+diff --git a/tools/async_delegation.py b/tools/async_delegation.py
+index 78e182665f..e3c942812c 100644
+--- a/tools/async_delegation.py
++++ b/tools/async_delegation.py
+@@ -458,7 +458,8 @@ def restore_undelivered_completions(target_queue) -> int:
+         return _replay_pending(conn, rows, target_queue, now, startup=True)
+ 
+ 
+-def unclaimed_pending_completions(*, min_age_s: float, now: Optional[float] = None) -> list[dict[str, Any]]:
++def unclaimed_pending_completions(*, min_age_s: float, now: Optional[float] = None,
++                                  recover: bool = True) -> list[dict[str, Any]]:
+     """[daveey] This home's terminal completions still pending delivery, not under a live claim, and at least
+     ``min_age_s`` past completion: ``[{"delegation_id", "event"}]``, oldest first. Expired rows are dropped first
+     (as the replay does). For the unloaded-parent waker (``tui_gateway.delegation_unloaded``), which claims each
+@@ -470,7 +471,8 @@ def unclaimed_pending_completions(*, min_age_s: float, now: Optional[float] = No
+     from tools.async_delegation_idle import ledger_quiet
+     if ledger_quiet(_db_path()):
+         return []
+-    recover_abandoned_delegations()  # an owner that died while no poller ran here: classify it first
++    if recover:  # an owner that died while no poller ran here: classify it first (the caller throttles this)
++        recover_abandoned_delegations()
+     now = time.time() if now is None else now
+     with _DB_LOCK, _transaction() as conn:
+         _expire_pending_completions(conn, now)
+diff --git a/tui_gateway/delegation_unloaded.py b/tui_gateway/delegation_unloaded.py
+index a610338ee3..6e164126aa 100644
+--- a/tui_gateway/delegation_unloaded.py
++++ b/tui_gateway/delegation_unloaded.py
+@@ -53,8 +53,10 @@ WAKES_PER_HOUR = 6
+ MAX_PARALLEL_WAKES = 2
+ RETRY_S = 120.0
+ RETRY_MAX_S = 1800.0
++RECOVER_EVERY_S = 300.0  # dead-owner classification per ledger; the pass itself ticks every 30 s
+ 
+ _lock = threading.Lock()
++_recovered_at: dict[str, float] = {}  # ledger home -> last recover_abandoned_delegations run (this process)
+ _wake_times: dict[str, list[float]] = {}  # chat -> started wakes (this process)
+ _retry: dict[str, tuple[float, float]] = {}  # delegation id -> (not before, last delay)
+ _wake_slots = threading.BoundedSemaphore(MAX_PARALLEL_WAKES)
+@@ -65,6 +67,7 @@ def _reset_for_tests() -> None:
+     with _lock:
+         _wake_times.clear()
+         _retry.clear()
++        _recovered_at.clear()
+     _wake_slots = threading.BoundedSemaphore(MAX_PARALLEL_WAKES)
+ 
+ 
+@@ -211,8 +214,13 @@ def sweep_once(*, now: Optional[float] = None, grace_s: float = GRACE_S,
+     out: list[dict] = []
+     for home in homes():
+         with _home_scope(home):
++            with _lock:
++                key = str(home or "")
++                recover = now - _recovered_at.get(key, float("-inf")) >= RECOVER_EVERY_S
++                if recover:
++                    _recovered_at[key] = now
+             try:
+-                rows = ad.unclaimed_pending_completions(min_age_s=grace_s, now=now)
++                rows = ad.unclaimed_pending_completions(min_age_s=grace_s, now=now, recover=recover)
+             except Exception:
+                 logger.debug("%s: ledger of %s unreadable", LABEL, home or "launch home", exc_info=True)
+                 continue
+-- 
+2.51.0
+

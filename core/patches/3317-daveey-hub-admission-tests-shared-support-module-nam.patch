@@ -1,0 +1,227 @@
+From 1395789384008cbb19340b4b262ac8c3b16f9b6d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 05:16:51 +0000
+Subject: [PATCH] [daveey] hub admission tests: shared support module; name the
+ no-JSON1 fallback in _running_rows
+
+PR #1859 review nits (t_01a1d3181167992b): test_hub_cpu_gate_contention no longer imports
+test_kanban_hub_admission (or re-exports its board fixture); both use
+tests/hermes_cli/hub_admission_support.py. _running_rows' docstring and comment now name
+'no such function: json_group_array' (SQLite without JSON1) as a long-path fallback too.
+---
+ hermes_cli/machine_metrics.py                 |  7 +-
+ tests/hermes_cli/hub_admission_support.py     | 72 +++++++++++++++++++
+ .../test_hub_cpu_gate_contention.py           | 10 ++-
+ tests/hermes_cli/test_kanban_hub_admission.py | 57 +--------------
+ 4 files changed, 88 insertions(+), 58 deletions(-)
+ create mode 100644 tests/hermes_cli/hub_admission_support.py
+
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index 2ccb623a57..97a468070e 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -86,12 +86,15 @@ _LOCAL_SQL = f"SELECT (SELECT count(*) FROM pragma_table_info('tasks') WHERE nam
+ 
+ def _running_rows(db) -> Optional[tuple[bool, Any, list]]:
+     """``(synced, own gateway id, [(task_id, run_id, pool, class, origin), ...])`` for the running rows this host
+-    counts, read in one statement; ``None`` when the board's schema predates claim receipts, or has lease holders
+-    without sync state (read it the long way, which decides those exactly as before)."""
++    counts, read in one statement; ``None`` when the board's schema predates claim receipts, when this SQLite lacks
++    JSON1 (``no such function: json_group_array``), or when it has lease holders without sync state (read it the long
++    way, which decides those exactly as before)."""
+     for synced, sql in ((True, _SYNCED_SQL), (False, _LOCAL_SQL)):
+         try:
+             head, rows = db.execute(sql).fetchone()
+         except sqlite3.OperationalError as exc:
++            # "no such table/column" (pre-receipt schema, unsynced board) or "no such function" (no JSON1): both
++            # fall through to the long path, which needs neither.
+             if str(exc).startswith("no such "):
+                 continue
+             raise
+diff --git a/tests/hermes_cli/hub_admission_support.py b/tests/hermes_cli/hub_admission_support.py
+new file mode 100644
+index 0000000000..aeb3fca9a9
+--- /dev/null
++++ b/tests/hermes_cli/hub_admission_support.py
+@@ -0,0 +1,72 @@
++"""Shared board and claim helpers for the hub-admission suites. [daveey]
++
++``test_kanban_hub_admission`` and ``test_hub_cpu_gate_contention`` both build a throwaway board, write the admission
++config and drive claims through the CPU gate; they import these helpers from here so neither test module imports the
++other. Each module declares its own ``board`` fixture over :func:`open_board`.
++"""
++from __future__ import annotations
++
++import time
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import machine_metrics as mm
++
++
++def open_board(tmp_path, monkeypatch):
++    """Generator body for a ``board`` fixture: ``(conn, home)`` on a fresh board with HERMES_HOME pointed at it."""
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    conn = kbc.connect(tmp_path / "kanban.db")
++    try:
++        yield conn, tmp_path
++    finally:
++        conn.close()
++
++
++def configure(home, limit=50, cap=None):
++    lines = ["kanban:"]
++    if cap is not None:
++        lines.append(f"  max_in_progress: {cap}")
++    if limit is not None:
++        lines += ["  admission:", f"    cpu_busy_below_pct: {limit}"]
++    (home / "config.yaml").write_text("\n".join(lines) + "\n")
++
++
++def advisory(home, pct=10.0, age_ms=0):
++    mm.record_hub_cpu_sample({"cpu_busy_pct": pct, "cpu_busy_window_ms": 1000,
++                              "cpu_busy_sample_end_ms": int(time.time() * 1000) - age_ms}, root=home)
++
++
++def task(conn, review=False, title="gate"):
++    t = kb.create_task(conn, title=title, assignee="default")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status=? WHERE id=?", ("review" if review else "ready", t))
++    return t
++
++
++def claim(conn, t, review):
++    return (kb.claim_review_task if review else kb.claim_task)(conn, t)
++
++
++def fake_sample(pct, calls=None, check=None):
++    def sample(*a, **k):
++        if check:
++            check()
++        if calls is not None:
++            calls.append(time.monotonic())
++        if pct is None:
++            return None
++        return {"cpu_busy_pct": pct, "cpu_busy_window_ms": 1000, "cpu_busy_sample_end_ms": int(time.time() * 1000)}
++    return sample
++
++
++def runs(conn):
++    return conn.execute("SELECT count(*) FROM task_runs").fetchone()[0]
++
++
++def refused(conn, t, review, reason):
++    assert kb.get_task(conn, t).status == ("review" if review else "ready")
++    assert runs(conn) == 0
++    assert sync.pop_claim_deferral(t) == reason
+diff --git a/tests/hermes_cli/test_hub_cpu_gate_contention.py b/tests/hermes_cli/test_hub_cpu_gate_contention.py
+index 6c0ca3b651..477c860f1e 100644
+--- a/tests/hermes_cli/test_hub_cpu_gate_contention.py
++++ b/tests/hermes_cli/test_hub_cpu_gate_contention.py
+@@ -25,11 +25,17 @@ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import machine_cpu_metrics as cm
+ from hermes_cli import machine_metrics as mm
+-from tests.hermes_cli.test_kanban_hub_admission import advisory, claim, fake_sample, refused, task
+-from tests.hermes_cli.test_kanban_hub_admission import board as board  # noqa: PLC0414 -- pytest fixture re-export
++from tests.hermes_cli import hub_admission_support as support
++from tests.hermes_cli.hub_admission_support import advisory, claim, fake_sample, refused, task
+ 
+ pytestmark = pytest.mark.platforms("posix")
+ 
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    yield from support.open_board(tmp_path, monkeypatch)
++
++
+ HUB_BOARDS = 10  # hermes-hub: the default board plus 9 named boards with a kanban.db
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_hub_admission.py b/tests/hermes_cli/test_kanban_hub_admission.py
+index a2d65bf98f..fd0c676f93 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission.py
++++ b/tests/hermes_cli/test_kanban_hub_admission.py
+@@ -18,6 +18,8 @@ from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import kanban_queue_reason as queue
+ from hermes_cli import machine_cpu_metrics as cm
+ from hermes_cli import machine_metrics as mm
++from tests.hermes_cli import hub_admission_support as support
++from tests.hermes_cli.hub_admission_support import advisory, claim, configure, fake_sample, refused, runs, task
+ from tests.tools import test_kanban_tools as tool_helpers
+ 
+ pytestmark = pytest.mark.platforms("posix")
+@@ -25,50 +27,7 @@ pytestmark = pytest.mark.platforms("posix")
+ 
+ @pytest.fixture
+ def board(tmp_path, monkeypatch):
+-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+-    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+-    conn = kbc.connect(tmp_path / "kanban.db")
+-    try:
+-        yield conn, tmp_path
+-    finally:
+-        conn.close()
+-
+-
+-def configure(home, limit=50, cap=None):
+-    lines = ["kanban:"]
+-    if cap is not None:
+-        lines.append(f"  max_in_progress: {cap}")
+-    if limit is not None:
+-        lines += ["  admission:", f"    cpu_busy_below_pct: {limit}"]
+-    (home / "config.yaml").write_text("\n".join(lines) + "\n")
+-
+-
+-def advisory(home, pct=10.0, age_ms=0):
+-    mm.record_hub_cpu_sample({"cpu_busy_pct": pct, "cpu_busy_window_ms": 1000,
+-                              "cpu_busy_sample_end_ms": int(time.time() * 1000) - age_ms}, root=home)
+-
+-
+-def task(conn, review=False, title="gate"):
+-    t = kb.create_task(conn, title=title, assignee="default")
+-    with kb.write_txn(conn):
+-        conn.execute("UPDATE tasks SET status=? WHERE id=?", ("review" if review else "ready", t))
+-    return t
+-
+-
+-def claim(conn, t, review):
+-    return (kb.claim_review_task if review else kb.claim_task)(conn, t)
+-
+-
+-def fake_sample(pct, calls=None, check=None):
+-    def sample(*a, **k):
+-        if check:
+-            check()
+-        if calls is not None:
+-            calls.append(time.monotonic())
+-        if pct is None:
+-            return None
+-        return {"cpu_busy_pct": pct, "cpu_busy_window_ms": 1000, "cpu_busy_sample_end_ms": int(time.time() * 1000)}
+-    return sample
++    yield from support.open_board(tmp_path, monkeypatch)
+ 
+ 
+ def locked(monkeypatch, read):
+@@ -813,16 +772,6 @@ def test_cli_create_capacity_without_frees_refuses_cleanly(board, monkeypatch, c
+     assert kb.list_tasks(conn) == []
+ 
+ 
+-def runs(conn):
+-    return conn.execute("SELECT count(*) FROM task_runs").fetchone()[0]
+-
+-
+-def refused(conn, t, review, reason):
+-    assert kb.get_task(conn, t).status == ("review" if review else "ready")
+-    assert runs(conn) == 0
+-    assert sync.pop_claim_deferral(t) == reason
+-
+-
+ @pytest.mark.parametrize("review", [False, True])
+ def test_gate_absent_admits_without_sampling(board, monkeypatch, review):
+     conn, _home = board
+-- 
+2.51.0
+

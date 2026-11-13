@@ -1,0 +1,317 @@
+From 34f31bc5e1748bbb35f526c804dfc70cf2d5e664 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:16:29 +0000
+Subject: [PATCH] feat(kanban): persist admission class metadata foundation
+ [daveey]
+
+---
+ docs/kanban-hub-admission-v2.md               | 150 ++++++++++++++++++
+ hermes_cli/kanban_admission_class.py          |  13 ++
+ hermes_cli/kanban_db.py                       |  14 +-
+ hermes_cli/kanban_db_connect.py               |   2 +
+ hermes_cli/kanban_db_sync.py                  |   1 +
+ tests/hermes_cli/test_kanban_hub_admission.py |  26 +++
+ 6 files changed, 203 insertions(+), 3 deletions(-)
+ create mode 100644 docs/kanban-hub-admission-v2.md
+ create mode 100644 hermes_cli/kanban_admission_class.py
+
+diff --git a/docs/kanban-hub-admission-v2.md b/docs/kanban-hub-admission-v2.md
+new file mode 100644
+index 0000000000..c8811d5875
+--- /dev/null
++++ b/docs/kanban-hub-admission-v2.md
+@@ -0,0 +1,150 @@
++# Hub admission v2
++
++Status: approved design, implementation in progress. This document describes the
++full contract, not a claim that the current branch implements it all.
++
++## Policy and rollout
++
++Ship phase 1 (separate pools) first, then phase 2 (scoring, explanation and effect
++reporting). The final slot amendment supersedes the original reserved-slot design:
++
++- `kanban.max_in_progress` remains the regular pool, configured as 7 on the hub.
++- `kanban.admission.priority_slots` is a separate pool, default 3 on an enabled hub.
++- Only `capacity` and `urgent` cards may enter the priority pool. Numeric priority
++  never grants eligibility. Marked cards prefer priority, then regular capacity.
++- An idle priority slot never falls through to normal work. An eighth normal card
++  waits even when all three priority slots are idle.
++- Priority claims require CPU busy strictly below
++  `kanban.admission.priority_cpu_busy_below_pct` (default 85). Regular claims retain
++  the installation-root `cpu_busy_below_pct` policy (50 on the hub).
++- Activation is hub-only, tied to the existing installation-root CPU admission
++  policy; workers with that policy off retain existing behavior. Invalid root
++  settings fail closed; a profile override cannot increase host capacity.
++- Critical memory pressure admits none. Elevated pressure allows at most one new
++  run per dispatcher tick across both pools, not one per pool. Existing drain,
++  update, turn-waiter, lease expiry and lock-budget fences remain intact.
++
++No full-pool default changes apply to workers. A higher CPU ceiling does not
++change placement or allow portable work to ignore worker-first routing.
++
++## Metadata
++
++Tasks gain synced fields:
++
++| Field | Contract |
++| --- | --- |
++| `admission_class` | `normal` (default), `capacity`, or `urgent` |
++| `admission_frees` | Capacity requires a nonempty single-line `frees: ...` claim |
++
++Expose these through `kanban_create`, CLI create/edit (`--class`, `--frees`),
++normal task readback and detector producers. Validate at the shared database
++boundary, not only argparse/tool schemas. Editing class or frees validates the
++resulting pair within the same write transaction. Existing cards migrate to
++normal; no title-based automatic upgrades.
++
++Runs gain a local, immutable admission receipt: selected pool (`regular` or
++`priority`), claim-time class and origin key. Keep it separate from mutable
++completion metadata. NULL legacy receipts count as regular. Class edits must not
++move an active run between pools or erase its capacity-origin charge.
++
++Capacity-origin limit: at most two active capacity runs per originating chat
++across all host execution boards. Prefer the original creator chat tuple
++(gateway, profile, session), not a shepherd or a current worker session. Without
++one, fall back to (creating gateway, created_by), with missing identity sharing a
++conservative unknown bucket. Urgent runs do not count against the capacity-only
++origin limit, but still consume one of the two pools.
++
++## Authorities and integration
++
++The installation-root `admission.lock` is the whole-host execution authority.
++Inside its existing bounded transaction:
++
++1. Read current task class and origin.
++2. Count immutable run receipts across execution boards, deduplicating file
++   identities and excluding remote-held replicas.
++3. Exclude only the exact proven unused Board-grant echo, using the existing
++   task/run UID, holder and claim-lock proof.
++4. Select an eligible pool and enforce origin concurrency.
++5. Sample CPU independently under the lock; recount before commit and refuse
++   expired leases or an exceeded lock hold budget.
++6. Persist the selected receipt with the claimed run and event before releasing
++   the lock. Claimed evidence includes both pool occupancies and CPU ceiling.
++
++The dispatcher budget and pre-lease advisory must use the same pool policy so
++neither an early seven-slot cap nor the 50% advisory prevents eligible priority
++work from reaching final admission. Advisory snapshots never grant authority.
++
++The Board service is a separate integration boundary. Its lease cap and
++worker-first overflow/review gates currently use a scalar machine cap and CPU
++ceiling. They must understand the new eligibility policy before enabling the
++extension. A Board lease is a reservation, not proof an interpreter started.
++Board Durable Objects serialize per board, not across boards; they do not replace
++the local host lock. Preserve existing total-cap behavior for unenabled machines.
++Task metadata must round-trip through Board migrations/field allowlists; local
++run receipts must not be overwritten by a later feed or placeholder adoption.
++
++Deployment order: compatible Board schema/policy first, compatible core next,
++then enable and verify hub configuration. No unsupported live SQL backfill and no
++forced updater restart. Keep legacy reads conservative during the transition.
++
++## Phase 2: deterministic score
++
++For eligible hub-local ready/review candidates:
++
++```
++score = min(effective_priority, 1000)
++      + 500 * class_rank
++      + 25 * min(unique_open_descendants, 20)
++      + 25 * min(floor(ready_minutes / 10), 60)
++      - 100 * consecutive_failures
++```
++
++`class_rank` is normal=0, capacity=1, urgent=2. Defaults live under
++`kanban.admission.weights` (`class`, `unblock`, `age`, `failure`). Validate finite,
++nonnegative numeric weights. Effective priority retains existing transitive
++priority donation. Descendants are unique, cycle-safe and stop at terminal nodes.
++Aging uses the current ready/review interval, not creation age or prior run wait;
++its maximum contribution is 1500 after ten hours. Ties use readiness timestamp,
++then task ID. Scoring is read-only and never rewrites stored priorities.
++
++Score selects order only; it cannot bypass placement, either pool cap, CPU,
++memory, origin cap or update holds. Workers keep plain dispatch order.
++
++`queue_note` and `hermes kanban queue --explain ID` show component values, position,
++placement, current class, applicable refusal and `regular N/7, priority M/3`.
++Ready-wait notices recommend class/placement corrections, never priority bidding.
++
++## Effect reporting
++
++A weekly hub report lists capacity claims with their stated frees metric,
++claim-time and post-completion observations, ready-wait p50 and worker free slots.
++Unknown/missing/incomparable data is explicitly unknown, not a success or failure.
++Before implementation of automatic class loss, encode and test a deterministic
++repeated-no-effect policy using comparable observations; retain auditable origin,
++measurement window and evidence. Do not demote creators merely because unrelated
++queue load rose. Reporting must run on the hub, not a sleeping Mac.
++
++## Acceptance
++
++All original CPU/fence/grant-echo tests remain. Add cases to
++`tests/hermes_cli/test_kanban_hub_admission.py` proving:
++
++- marked claim with seven regular runs active;
++- fourth marked claim falls back to a free regular slot or waits;
++- idle priority pool never admits an eighth normal card;
++- numeric priority alone never qualifies;
++- exact 85% boundary, unknown CPU, critical/elevated memory and unchanged workers;
++- ready/review races across boards, own-grant echo and immutable receipt accounting;
++- capacity origin cap survives active task class edits;
++- aging, descendants, score breakdown and explain output.
++
++Per-guard mutation tests and read-only old/new replay across real boards and
++sync-shadow inputs accompany broader classifiers. Require independent exact-head
++review and green required CI through `hermes-core-wt ship` for each phase.
++
++After natural hub installation, class the designated capacity work through the
++supported edit path; read back a claimed event in the priority pool while regular
++occupancy is seven. Record ready-wait p50 before and after with sample counts and
++windows. If original target cards have finished, preserve that history and use
++remaining real capacity work, documenting the substitution rather than inventing
++a live claim. Final handoff is review, not completion before live proof.
+diff --git a/hermes_cli/kanban_admission_class.py b/hermes_cli/kanban_admission_class.py
+new file mode 100644
+index 0000000000..08c1c095f4
+--- /dev/null
++++ b/hermes_cli/kanban_admission_class.py
+@@ -0,0 +1,13 @@
++"""Admission-class metadata shared by task producers and editors."""
++import re
++
++
++def validate(admission_class: str, admission_frees: str | None) -> None:
++    """Reject unrecognized classes and capacity labels without a concrete claim."""
++    if admission_class not in ("normal", "capacity", "urgent"):
++        raise ValueError("admission_class must be normal, capacity or urgent")
++    if admission_class == "capacity" and (
++        not isinstance(admission_frees, str)
++        or re.fullmatch(r"frees: [^\r\n]*\S[^\r\n]*", admission_frees) is None
++    ):
++        raise ValueError("capacity requires a one-line frees: claim")
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index e66523985c..e00c3ebedf 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -668,6 +668,8 @@ class Task:
+     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
+     completion_contract: Optional[str] = None
+     placement_policy: Optional[str] = None
++    admission_class: str = "normal"
++    admission_frees: Optional[str] = None
+ 
+     @classmethod
+     def from_row(cls, row: sqlite3.Row) -> Task:
+@@ -688,6 +690,8 @@ class Task:
+             requires=_json_or(g("requires")) or [],
+             goal_mode=bool(g("goal_mode")),
+             block_recurrences=int(g("block_recurrences") or 0),
++            admission_class=g("admission_class", "normal"),
++            admission_frees=g("admission_frees"),
+         )
+ 
+ 
+@@ -1210,6 +1214,7 @@ def create_task(
+     placement_policy: Optional[str] = None,
+     placement_checked: bool = False,
+     insert_guard: Optional[Callable[[sqlite3.Connection], None]] = None, placement_audit: Optional[dict] = None,
++    admission_class: str = "normal", admission_frees: Optional[str] = None,
+ ) -> str:
+     """Create a task (optionally under ``parents``); returns its id.
+ 
+@@ -1234,6 +1239,8 @@ def create_task(
+     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
+     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
+     """
++    from hermes_cli.kanban_admission_class import validate as validate_admission_class
++    validate_admission_class(admission_class, admission_frees)
+     validate_creation(placement_policy, runs_on=runs_on, workspace_kind=workspace_kind,
+                       workspace_path=workspace_path, project=project_id,
+                       origin_intent=origin_intent, board=board)
+@@ -1351,8 +1358,9 @@ def create_task(
+                         id, title, body, assignee, status, priority, created_by, created_at, workspace_kind, workspace_path,
+                         branch_name, project_id, tenant, idempotency_key, max_runtime_seconds,
+                         skills, max_retries, model_override, provider_override, model_pin_mandatory, reasoning_effort,
+-                        goal_mode, goal_max_turns, session_id, completion_contract, requires, placement_policy
+-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                        goal_mode, goal_max_turns, session_id, completion_contract, requires, placement_policy,
++                        admission_class, admission_frees
++                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     """,
+                     (
+                         task_id, title.strip(), body, assignee, task_status, kanban_priority.bounded(priority),
+@@ -1361,7 +1369,7 @@ def create_task(
+                         json.dumps(skills_list) if skills_list is not None else None,
+                         _opt_int(max_retries), model_override, provider_override, pin_column,
+                         reasoning_effort, 1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+-                        json.dumps(required), placement_policy,
++                        json.dumps(required), placement_policy, admission_class, admission_frees,
+                     ),
+                 )
+                 _sync.set_runs_on(conn, task_id, runs_on)  # placement labels (RFC "Placement"), synced boards only
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 83e1c02256..3f6ceae7f0 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1078,6 +1078,8 @@ _LATER_TASK_COLUMNS = (
+     ("goal_max_turns", "goal_max_turns INTEGER"),
+     ("completion_contract", "completion_contract TEXT"),
+     ("placement_policy", "placement_policy TEXT"),
++    ("admission_class", "admission_class TEXT NOT NULL DEFAULT 'normal'"),
++    ("admission_frees", "admission_frees TEXT"),
+     ("session_id", "session_id TEXT"),
+     # Typed operational reason; neither NULL nor capability implies a human ask.
+     ("block_kind", "block_kind TEXT"),
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 989ab76ba8..6345acad3a 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -59,6 +59,7 @@ SYNCED_COLUMNS: dict[str, frozenset[str]] = {
+         "workflow_template_id", "current_step_key", "skills", "requires", "model_override",
+         "provider_override", "model_pin_mandatory", "reasoning_effort", "max_retries", "goal_mode", "goal_max_turns",
+         "block_kind", "human_request", "block_recurrences", "completion_contract", "runs_on", "placement_policy",
++        "admission_class", "admission_frees",
+     }),
+     "task_links": frozenset({"parent_id", "child_id"}),
+     "task_comments": frozenset({"task_id", "author", "body", "created_at"}),
+diff --git a/tests/hermes_cli/test_kanban_hub_admission.py b/tests/hermes_cli/test_kanban_hub_admission.py
+index 355dfca728..5943ebacba 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission.py
++++ b/tests/hermes_cli/test_kanban_hub_admission.py
+@@ -69,6 +69,32 @@ def fake_sample(pct, calls=None, check=None):
+     return sample
+ 
+ 
++def test_capacity_class_and_frees_claim_survive_task_readback(board):
++    conn, _home = board
++    task_id = kb.create_task(
++        conn, title="Restore worker disk headroom", assignee="default",
++        admission_class="capacity", admission_frees="frees: worker disk slots",
++    )
++    stored = kb.get_task(conn, task_id)
++    assert stored.admission_class == "capacity"
++    assert stored.admission_frees == "frees: worker disk slots"
++
++
++@pytest.mark.parametrize("admission_class,frees,reason", [
++    ("boosted", None, "admission_class must be normal, capacity or urgent"),
++    ("capacity", None, "capacity requires a one-line frees: claim"),
++    ("capacity", "disk", "capacity requires a one-line frees: claim"),
++    ("capacity", "frees:   ", "capacity requires a one-line frees: claim"),
++    ("capacity", "frees: disk\nother", "capacity requires a one-line frees: claim"),
++])
++def test_invalid_admission_metadata_refuses_before_insertion(board, admission_class, frees, reason):
++    conn, _home = board
++    before = conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
++    with pytest.raises(ValueError, match=f"^{reason}$"):
++        kb.create_task(conn, title="Invalid class", admission_class=admission_class, admission_frees=frees)
++    assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == before
++
++
+ def runs(conn):
+     return conn.execute("SELECT count(*) FROM task_runs").fetchone()[0]
+ 
+-- 
+2.51.0
+

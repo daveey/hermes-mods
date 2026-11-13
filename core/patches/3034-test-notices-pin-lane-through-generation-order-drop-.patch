@@ -1,0 +1,279 @@
+From 27a10f3f992974bf37d20684ac6638d6ca9d6b45 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 23:49:51 +0000
+Subject: [PATCH] test(notices): pin lane-through-generation order; drop unused
+ _decoded fallback [daveey]
+
+Follow-up to #1768 review nits.
+
+- New deterministic interleaving test: an older snapshot's poller is gated at
+  each post-read publication-lock entry until it owns the replica lane with the
+  newer poller blocked on it (or the newer poller finished). Generations must
+  follow snapshot order and the newer snapshot's memo must be the one published.
+- `_snapshot`/`_changed_rows_cards` now require the caller's decode map:
+  observe always passes the per-lane `_ReplicaFlight.decoded`, so the
+  module-level `_decoded` fallback had no production caller. The direct-helper
+  bounded-read test passes its own map; `_reset_for_tests` stops clearing it.
+- Stray blank lines removed.
+
+Proof: mutants (each x4 runs, no flaky retry pass) all fail the new test:
+  block_out (signature check + generation moved after the lane),
+  gen_out (only generation moved after the lane),
+  no_gen_check (publish regardless of generation).
+32 test files importing kanban_remote_{observations,notices}: 462 passed.
+---
+ .../test_kanban_observation_singleflight.py   | 112 +++++++++++++++++-
+ .../tui_gateway/test_replica_bounded_reads.py |  12 +-
+ tui_gateway/kanban_remote_notices.py          |   4 +-
+ tui_gateway/kanban_remote_observations.py     |  25 ++--
+ 4 files changed, 129 insertions(+), 24 deletions(-)
+
+diff --git a/tests/tui_gateway/test_kanban_observation_singleflight.py b/tests/tui_gateway/test_kanban_observation_singleflight.py
+index 364489da7a..063b198411 100644
+--- a/tests/tui_gateway/test_kanban_observation_singleflight.py
++++ b/tests/tui_gateway/test_kanban_observation_singleflight.py
+@@ -161,6 +161,116 @@ def test_real_newer_snapshot_wins_over_delayed_ledger_write(tmp_path, monkeypatc
+     assert next(iter(obs._memo.values()))[1] == newer
+ 
+ 
++class _LaneLock:
++    """A replica lane lock that reports its owner and which threads are blocked on it."""
++
++    def __init__(self, cond):
++        self.lock, self.cond, self.waiting, self.owner = threading.Lock(), cond, set(), None
++
++    def __enter__(self):
++        me = threading.get_ident()
++        if not self.lock.acquire(blocking=False):
++            with self.cond:
++                self.waiting.add(me)
++                self.cond.notify_all()
++            self.lock.acquire()
++        with self.cond:
++            self.waiting.discard(me)
++            self.owner = me
++            self.cond.notify_all()
++        return self
++
++    def __exit__(self, *args):
++        with self.cond:
++            self.owner = None
++            self.lock.release()
++            self.cond.notify_all()
++
++
++class _GatedLock:
++    """``_lock`` stand-in. After its snapshot, the gated poller enters only while it owns the replica lane and the
++    other poller is blocked on that lane, or once the other poller has finished. A lane released before this
++    poller's generation therefore lets the other poller run a whole observe first, without timing."""
++
++    def __init__(self, cond, lane, other_done):
++        self.lock, self.cond, self.lane, self.other_done = threading.Lock(), cond, lane, other_done
++        self.gated: int | None = None
++
++    def _ready(self):
++        me = threading.get_ident()
++        return self.other_done.is_set() or (self.lane.owner == me and bool(self.lane.waiting - {me}))
++
++    def __enter__(self):
++        if self.gated == threading.get_ident():
++            with self.cond:
++                assert self.cond.wait_for(self._ready, timeout=20)
++        self.lock.acquire()
++        return self
++
++    def __exit__(self, *args):
++        self.lock.release()
++
++    def locked(self):
++        return self.lock.locked()
++
++
++class _Generations(dict):
++    def __init__(self, order):
++        super().__init__()
++        self.order = order
++
++    def __setitem__(self, key, value):
++        self.order.append((threading.current_thread().name, value))
++        super().__setitem__(key, value)
++
++
++def test_lane_is_held_through_generation_so_older_snapshot_never_outranks_newer(tmp_path, monkeypatch):
++    replica, ledger, cards = _world(tmp_path)
++    cond, b_done = threading.Condition(), threading.Event()
++    lane = _LaneLock(cond)
++    gate = _GatedLock(cond, lane, b_done)
++    flight = obs._replica_flight(str(replica.resolve()))  # Strong ref: the lane is weakly indexed.
++    monkeypatch.setattr(flight, "lock", lane)
++    order = []
++    monkeypatch.setattr(obs, "_lock", gate)
++    monkeypatch.setattr(obs, "_generation", _Generations(order))
++    real_snapshot, a_read = obs._snapshot, threading.Event()
++
++    def snapshot(*args):
++        got = real_snapshot(*args)
++        if threading.current_thread().name == "old":
++            _move(replica, cards[0], "blocked", NOW + 1)  # A newer replica state lands after the old read.
++            gate.gated = threading.get_ident()
++            a_read.set()
++        return got
++
++    monkeypatch.setattr(obs, "_snapshot", snapshot)
++    results = {}
++
++    def poll(name, now, done=None):
++        try:
++            results[name] = obs.observe(replica, ledger, now)
++        finally:
++            if done is not None:
++                with cond:
++                    done.set()
++                    cond.notify_all()
++
++    old = threading.Thread(target=poll, args=("old", NOW), name="old")
++    old.start()
++    assert a_read.wait(20)
++    new = threading.Thread(target=poll, args=("new", NOW + 2, b_done), name="new")
++    new.start()
++    old.join(20)
++    new.join(20)
++    assert not old.is_alive() and not new.is_alive()
++    assert any(state.startswith("blocked@") for _, _, state in results["new"])
++    assert not any(state.startswith("blocked@") for _, _, state in results["old"])
++    # Generations follow lane (snapshot) order, so the newer snapshot's memo is the one published.
++    assert order == [("old", 1), ("new", 2)]
++    assert [entry[1] for entry in obs._memo.values()] == [results["new"]]
++
++
+ def test_failed_snapshot_releases_lane_and_retries(tmp_path, monkeypatch):
+     replica, ledger, _ = _world(tmp_path)
+     original = obs._snapshot
+@@ -195,7 +305,7 @@ def test_signature_reuse_still_supplies_cards_to_a_new_ledger(tmp_path):
+     assert obs.observe(replica, tmp_path / "new-ledger.db", NOW) == expected
+     flight = obs._replica_flight(str(replica.resolve()))
+     assert len(flight.decoded) == 20
+-    assert obs._decoded == {}  # Observe never uses the legacy direct-helper cache.
++    assert not hasattr(obs, "_decoded")  # No module-level decode map outlives a replica lane.
+ 
+ 
+ def test_same_signature_refresh_does_not_repeat_persistence(tmp_path, monkeypatch):
+diff --git a/tests/tui_gateway/test_replica_bounded_reads.py b/tests/tui_gateway/test_replica_bounded_reads.py
+index 7e11f6e298..8226107b42 100644
+--- a/tests/tui_gateway/test_replica_bounded_reads.py
++++ b/tests/tui_gateway/test_replica_bounded_reads.py
+@@ -84,25 +84,23 @@ def test_remote_links_miss_preserves_rows_with_bounded_fetches(tmp_path, monkeyp
+     assert conn.fetched <= 12 + pages
+ 
+ 
+-def test_warm_observation_identity_scan_is_bounded(tmp_path, monkeypatch):
++def test_warm_observation_identity_scan_is_bounded(tmp_path):
+     from tui_gateway import kanban_remote_observations as observations
+ 
+     conn = sqlite3.connect(':memory:', factory=CountingConnection)
+     replica = tmp_path / 'replica.db'
+     rows = [('remote', f'default/default/t_{i}', i + 1, '{}', 'tasks') for i in range(12000)]
+-    monkeypatch.setattr(observations, '_decoded', {
+-        (str(replica), owner, key): (seq, {'status': 'done'})
+-        for owner, key, seq, _, _ in rows
+-    })
++    decoded = {(str(replica), owner, key): (seq, {'status': 'done'}) for owner, key, seq, _, _ in rows}
+     try:
+         conn.execute('CREATE TABLE replica (gw TEXT, key TEXT, seq INTEGER, data TEXT, coll TEXT)')
+         conn.executemany('INSERT INTO replica VALUES (?,?,?,?,?)', rows)
+         conn.execute("DELETE FROM replica WHERE key='default/default/t_1'")
+         conn.execute("UPDATE replica SET seq=13000, data='{bad' WHERE key='default/default/t_2'")
+         conn.fetched = 0
+-        result = observations._changed_rows_cards(conn, replica, 'local')
++        result = observations._changed_rows_cards(conn, replica, 'local', decoded)
+         assert result == [(owner, key, {'status': 'done'}) for owner, key, seq, _, _ in rows if seq not in (2, 3)]
+-        assert (str(replica), 'remote', 'default/default/t_1') not in observations._decoded
++        assert (str(replica), 'remote', 'default/default/t_1') not in decoded
++        assert decoded[(str(replica), 'remote', 'default/default/t_2')] == (13000, None)
+         assert conn.fetched <= 3
+     finally:
+         conn.close()
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index bc80a76796..b3df9ed8d7 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -760,7 +760,7 @@ def _record_swept(keys: list[tuple], ledger: Optional[Path], *, reason: str) ->
+ 
+ def _reset_for_tests() -> None:
+     """Forget this process's memos, as a restarted backend would (the ledger file stays)."""
+-    from tui_gateway.kanban_remote_observations import _decoded, _generation, _known, _memo
++    from tui_gateway.kanban_remote_observations import _generation, _known, _memo
+     from tui_gateway.kanban_remote_observations import _flights, _retained
+     from tui_gateway.kanban_replica_observer import reset as reset_observers
+     from tui_gateway.remote_sweep_projection import reset as reset_projection
+@@ -774,8 +774,6 @@ def _reset_for_tests() -> None:
+     _memo.clear()
+     _known.clear()
+     _generation.clear()
+-    _decoded.clear()
+-
+     _flights.clear()
+     _retained.clear()
+     _index_memo = None
+diff --git a/tui_gateway/kanban_remote_observations.py b/tui_gateway/kanban_remote_observations.py
+index c7edbe0ec4..baadfc70fc 100644
+--- a/tui_gateway/kanban_remote_observations.py
++++ b/tui_gateway/kanban_remote_observations.py
+@@ -15,7 +15,7 @@ _memo: dict[tuple, tuple] = {}
+ _generation: dict[tuple, int] = {}  # observe key -> ledger writes started, so only the newest publishes its memo
+ 
+ 
+-def _snapshot(replica: Path, previous=None, decoded=None) -> tuple[bool, list[tuple] | None, tuple | None]:
++def _snapshot(replica: Path, previous, decoded: dict) -> tuple[bool, list[tuple] | None, tuple | None]:
+     """Read readiness and ALL canonical terminal states from the same SQLite snapshot.
+ 
+     The hub client sets gateway before pulling and commits each feed page. Until
+@@ -54,14 +54,6 @@ def _snapshot(replica: Path, previous=None, decoded=None) -> tuple[bool, list[tu
+     return ready, cards, signature
+ 
+ 
+-# (replica, owner, key) -> (seq, terminal summary or None). The replica holds thousands of
+-# task rows (~30 MB of JSON on a busy fleet) and its signature moves whenever any card does,
+-# so decoding every row per change kept the notice pollers busy while Desktop sat idle. A row
+-# is re-read only when its seq moved; the summary keeps just the fields _persist reads.
+-_decoded: dict[tuple, tuple] = {}
+-
+-
+-
+ def _summary(task) -> dict | None:
+     from tui_gateway.kanban_remote_notices import drop_mark
+ 
+@@ -88,10 +80,16 @@ def _terminal_states():
+     return _TERMINAL
+ 
+ 
+-def _changed_rows_cards(conn, replica: Path, me, decoded=None) -> list[tuple]:
++def _changed_rows_cards(conn, replica: Path, me, decoded: dict) -> list[tuple]:
++    """``decoded`` is the caller's (replica, owner, key) -> (seq, terminal summary or None) map.
++
++    The replica holds thousands of task rows (~30 MB of JSON on a busy fleet) and its signature moves whenever any
++    card does, so decoding every row per change kept the notice pollers busy while Desktop sat idle. A row is
++    re-read only when its seq moved; the summary keeps just the fields _persist reads. ``observe`` owns one map per
++    replica lane (``_ReplicaFlight.decoded``), so no module-level map outlives a lane.
++    """
+     from tui_gateway.kanban_remote_notices import _canonical
+ 
+-    decoded = _decoded if decoded is None else decoded
+     # One SQLite result row avoids a GIL reacquisition per task;
+     # payload point reads remain proportional to changes.
+     sql = "SELECT json_group_array(json_array(gw, key, seq, NULL)) FROM replica WHERE coll = 'tasks'"
+@@ -261,8 +259,9 @@ def observe(replica: Path, ledger, now: float) -> dict[tuple, float | None]:
+     ledger = Path(ledger) if ledger is not None else ledger_path()
+     key = (str(replica.resolve()), str(ledger.resolve()))
+     flight = _replica_flight(key[0])
+-    # Wait/read/decode on this replica's lane, never on the publication lock.
+-    # Keep the lane through generation assignment so snapshot order is preserved.
++    # Wait/read/decode on this replica's lane, never on the publication lock. Keep the lane through generation
++    # assignment: generations then follow snapshot order, so an older snapshot whose ledger write finishes last
++    # cannot publish over a newer one's memo (pinned by test_lane_is_held_through_generation_...).
+     with flight.lock:
+         stamp = fingerprint(replica)
+         ident = file_identity(stamp)
+-- 
+2.51.0
+

@@ -1,0 +1,1284 @@
+From 4860ee05a9ac1a5b77cce08d9b6b44b5358ebd40 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 22:34:38 -0800
+Subject: [PATCH] fix(desktop): keep a slow-but-alive SSH backend instead of
+ reconnecting it in a loop [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On 2026-11-12 the MacBook sat on a ~60-175 KB/s network. The tunnel to the hub was alive, but the 10 s dispatch
+/api/health probe timed out, the pooled backend was retired, its SSH master torn down, and the reconnect refetched
+everything over the same link, so the next probe timed out too: "failed its dispatch probe ... reconnecting on
+demand" every 1-2 minutes for an hour while a trivial command through the tunnel took 34 s.
+
+- remote-liveness: a dispatch probe that TIMES OUT while the SSH master is alive keeps the descriptor (slow, not
+  down). Refused/reset/hang-up, a dead master, or 3 timeouts with no answer in between still retire it.
+- slow-link.ts: per-backend slow state. Entered only by that live-transport probe timeout (answer times alone
+  never enter it); left when the median of the last 5 answers is under 1 s, or after 10 min without slow
+  evidence; cleared whenever the pooled descriptor is dropped (stopPoolBackend). While slow:
+  fetchJsonForBackend stretches every request and probe timeout x4 (cap 60 s); the timer-polled paths
+  (/api/plugins/*, /api/session-kanban-tasks) run one per scope and path at most every 30 s, the rest failing as
+  a quiet PowerSettlingError (user-driven reads such as opening a session are never thinned, and a poll that
+  never reached the wire frees its slot); the transcript prefetch pass skips that connection.
+- ssh-connection: Compression=yes on Desktop's own ssh options (the traffic is almost all JSON).
+
+Known cost: `ssh -O check` proves the master process, not the link. After a silent network drop the master lives
+until its keepalive gives up (~45 s), and for that window requests wait their stretched timeout instead of
+failing after the 10 s probe.
+
+Not in this change: the renderer still says "Reconnecting to Hermes…" when its WebSocket is down (a "slow
+connection" indicator is a follow-up), and the three background revalidation paths get the stretched timeouts but
+no live-transport tolerance.
+
+Tests: slow-link.test.ts (tracker entry/exit/expiry/strikes, poll thinning per scope, session opens never
+thinned, unsent poll frees its slot, a backend answering after 12 s is kept and a 4 s request then fits, three
+probe timeouts end to end retire it, held error carries the renderer guard's marker, main.ts wiring pinned by
+source text), remote-liveness.test.ts (kept when alive; retired when dead, refused, reset, hung up, the transport
+check throws, or given up), transcript-prefetch.test.ts (paused connection skipped, resumes),
+ssh-connection.test.ts (Compression=yes). main.ts is over its line cap, so its wiring lives in slow-link.ts
+(dispatchSlowLink, thinnedPoll, noteRemoteAnswer; the remote-timing first-request helper moved with it) and those
+helpers are executed by tests; the remaining call sites in main.ts are pinned by source text.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ apps/desktop/electron/main.ts                 |  61 ++-
+ apps/desktop/electron/remote-liveness.test.ts |  87 ++++
+ apps/desktop/electron/remote-liveness.ts      |  31 +-
+ apps/desktop/electron/slow-link.test.ts       | 427 ++++++++++++++++++
+ apps/desktop/electron/slow-link.ts            | 357 +++++++++++++++
+ apps/desktop/electron/ssh-connection.test.ts  |   2 +
+ apps/desktop/electron/ssh-connection.ts       |   6 +-
+ .../desktop/electron/transcript-cache-host.ts |   3 +
+ .../electron/transcript-prefetch.test.ts      |  26 ++
+ apps/desktop/electron/transcript-prefetch.ts  |   7 +-
+ 10 files changed, 972 insertions(+), 35 deletions(-)
+ create mode 100644 apps/desktop/electron/slow-link.test.ts
+ create mode 100644 apps/desktop/electron/slow-link.ts
+
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index fce4d5c5e4..3e6459a03f 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -590,6 +590,7 @@ import {
+ import { ensureLoginShellPath } from './shell-path'
+ import { installSidebarBootSnapshot } from './sidebar-boot-snapshot'
+ import { removeStaleSingletonLock } from './singleton-lock'
++import { dispatchSlowLink, noteRemoteAnswer, noteRemoteConnect, slowLinkTracker, thinnedPoll } from './slow-link'
+ import { createSourcePythonBackend, resolveSourceInstallationBackend, type SourceBackend } from './source-backend'
+ import { resolveSourcePython } from './source-python'
+ import { registerSpellcheckDictionaryIpc } from './spellcheck-dictionary-ipc'
+@@ -9651,7 +9652,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
+     `[remote-timing] ${scope} ${result.alwaysOn ? 'reuse always-on' : result.reused ? 'reuse owned' : 'spawn'} ` +
+       `pid=${result.pid} ssh=${created ? 'dialed' : 'master reused'} +${Date.now() - timingStartedAt} ms`
+   )
+-  remoteFirstRequestPending.set(result.baseUrl, { scope, startedAt: timingStartedAt })
++  noteRemoteConnect(result.baseUrl, scope, timingStartedAt)
+   sshRememberLog(
+     `[ssh] connection ${result.reused ? 'REUSED' : 'spawned'} dashboard: ` +
+       `${result.hermesVersion || 'hermes (version unknown)'} at ${result.hermesPath || '?'}`
+@@ -10603,6 +10604,8 @@ async function ensureRegistryBackend(
+           }
+         },
+         reconnect: () => ensureRegistryBackend(id, profile, '', { passive }),
++        // [daveey] An SSH tunnel whose probe times out while its master is alive is slow, not down (slow-link.ts).
++        slowLink: source.kind === 'ssh' ? dispatchSlowLink(key, () => sshConnections.get(key)?.ssh?.isAlive()) : undefined,
+         retire: async (error: any) => {
+           // A late failure from an old descriptor must never tear down a newer
+           // entry that another caller has already installed.
+@@ -11390,6 +11393,7 @@ async function restartAttachedLocalGateway(profile: string): Promise<void> {
+ function stopPoolBackend(profile: string, _reason?: SshTeardownReason): Promise<void> {
+   registryReconnectService.assertCanStop(profile)
+   backendPool.delete(profile)
++  slowLinkTracker.forgetScope(profile) // every drop of a pooled descriptor: the rebuilt tunnel starts clean
+ 
+   return Promise.resolve()
+ }
+@@ -15087,6 +15091,10 @@ async function fetchJsonForBackend(
+     }
+   }
+ 
++  // [daveey] slow-link.ts: a slow link gets a stretched timeout, and every answer's time is how slow mode ends.
++  const timeoutMs = slowLinkTracker.scaleTimeout(descriptor.baseUrl, resolveTimeoutMs(opts.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS))
++  const startedAt = Date.now()
++
+   if (descriptor.authMode === 'oauth') {
+     // The OAuth cookie path rides electron.net with JSON headers; multipart
+     // isn't wired there. Fail loudly rather than corrupting the upload.
+@@ -15097,7 +15105,7 @@ async function fetchJsonForBackend(
+     const options = {
+       method: opts.method,
+       body: opts.body,
+-      timeoutMs: opts.timeoutMs,
++      timeoutMs,
+       headers: descriptor.headers
+     }
+ 
+@@ -15107,7 +15115,7 @@ async function fetchJsonForBackend(
+       requestWithCookie: () => fetchJsonViaOauthSession(url, options)
+     })
+ 
+-    noteRemoteAnswer(descriptor.baseUrl, path)
++    noteRemoteAnswer(descriptor.baseUrl, path, Date.now() - startedAt, rememberLog)
+ 
+     return answer
+   }
+@@ -15116,30 +15124,16 @@ async function fetchJsonForBackend(
+     method: opts.method,
+     body: opts.body,
+     upload: opts.upload,
+-    timeoutMs: opts.timeoutMs,
++    timeoutMs,
+     headers: descriptor.headers,
+     gatewayDescriptor: descriptor.gatewayEndpoint ? descriptor : undefined
+   })
+ 
+-  noteRemoteAnswer(descriptor.baseUrl, path)
++  noteRemoteAnswer(descriptor.baseUrl, path, Date.now() - startedAt, rememberLog)
+ 
+   return answer
+ }
+ 
+-// Remote connection timing (part B, instant session loads): connect-start, reuse/spawn and the first request a
+-// new descriptor serves, per scope, as `[remote-timing]` lines in desktop.log.
+-const remoteFirstRequestPending = new Map<string, { scope: string; startedAt: number }>()
+-
+-function noteRemoteAnswer(baseUrl: string, path: string) {
+-  remoteAnswerLedger.recordAnswer(baseUrl)
+-  const pending = remoteFirstRequestPending.get(baseUrl)
+-
+-  if (pending) {
+-    remoteFirstRequestPending.delete(baseUrl)
+-    rememberLog(`[remote-timing] ${pending.scope} first-request ${path} served +${Date.now() - pending.startedAt} ms`)
+-  }
+-}
+-
+ ipcMain.handle('hermes:connection-config:probe', async (_event, rawUrl) => probeRemoteAuthMode(rawUrl))
+ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl, rawOpts) => {
+   // Capability-gated login (RFC 8252). Probe the gateway's public /api/status
+@@ -15901,9 +15895,13 @@ async function dispatchRegistryApiRequest(
+ 
+   let requestPath = ''
+   let connection: any = null
++  const gateKey = remoteDownGateKey(registryConnectionId, routeProfile)
++  // [daveey] On a slow link a timer poll runs one per scope and path every 30 s; the rest are skipped (slow-link.ts).
++  const poll = thinnedPoll(gateKey, request)
+ 
+   const send = (descriptor: any) => {
+     connection = descriptor
++    poll.sent(descriptor.baseUrl)
+     requestPath = pathForRegistryBackendRequest(request.path, requestProfile, descriptor, request?.method || 'GET')
+ 
+     return fetchJsonForBackend(descriptor, requestPath, {
+@@ -15916,18 +15914,18 @@ async function dispatchRegistryApiRequest(
+ 
+   // [daveey] Remote (non-local) connections go through the down gate: while the pooled backend is known down
+   // (reset, refused, failed dispatch probe) its requests reject at once instead of each burning a 4-10 s timeout.
+-  const gateKey = remoteDownGateKey(registryConnectionId, routeProfile)
+-
+-  const response = gateKey
+-    ? await dispatchThroughRemoteDownGate({
+-        gate: remoteDownGate,
+-        key: gateKey,
+-        connect,
+-        request: send,
+-        forgetAnswer: baseUrl => remoteAnswerLedger.forget(baseUrl),
+-        log: rememberLog
+-      })
+-    : await send(await connect())
++  const response = await poll.run(async () =>
++    gateKey
++      ? dispatchThroughRemoteDownGate({
++          gate: remoteDownGate,
++          key: gateKey,
++          connect,
++          request: send,
++          forgetAnswer: baseUrl => remoteAnswerLedger.forget(baseUrl),
++          log: rememberLog
++        })
++      : send(await connect())
++  )
+ 
+   desktopProfilePreferences.afterProfileRequest(registryConnectionId, request, response, connection.mode)
+ 
+@@ -17824,6 +17822,7 @@ app.whenReady().then(() => {
+   // first window: the renderer's cache read is a sync IPC. Prefetch waits out boot.
+   try {
+     transcriptCacheHost = installTranscriptCache({
++      prefetchPaused: connectionId => slowLinkTracker.isConnectionSlow(connectionId),
+       backendFor: (connectionId, { passive }) =>
+         backendDialClaims.run(backendDialClaimKey(connectionId, null), () =>
+           ensureRegistryBackend(connectionId, null, '', { passive })
+diff --git a/apps/desktop/electron/remote-liveness.test.ts b/apps/desktop/electron/remote-liveness.test.ts
+index f24129048d..d80a4504d6 100644
+--- a/apps/desktop/electron/remote-liveness.test.ts
++++ b/apps/desktop/electron/remote-liveness.test.ts
+@@ -8,6 +8,7 @@ import {
+   REMOTE_LIVENESS_FAILURE_WINDOW_MS,
+   REMOTE_LIVENESS_TIMEOUT_MS,
+   REMOTE_POOLED_LIVENESS_FAILURE_WINDOW_MS,
++  RemoteAnswerLedger,
+   RemoteLivenessTracker,
+   RemoteRevalidationCoordinator,
+   revalidatePooledRemoteBackends,
+@@ -292,6 +293,92 @@ describe('ensureHealthyPooledRemoteBackendForDispatch', () => {
+     expect(reconnect).not.toHaveBeenCalled()
+   })
+ 
++  describe('[daveey] slow link: a probe timeout with the transport alive keeps the descriptor', () => {
++    const timeout = () => new Error(`Timed out connecting to Hermes backend after ${POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS}ms`)
++    const isTimeout = (error: unknown) => /Timed out connecting/.test(String((error as Error)?.message))
++
++    function harness(over: { alive?: boolean; giveUp?: boolean; probeError?: Error } = {}) {
++      const slow = { baseUrl: 'http://127.0.0.1:49882', mode: 'remote' }
++      const replacement = { baseUrl: 'http://127.0.0.1:53968', mode: 'remote' }
++      const connectionPromise = Promise.resolve(slow)
++      const retire = vi.fn()
++      const reconnect = vi.fn(async () => replacement)
++      const probe = vi.fn().mockRejectedValue(over.probeError ?? timeout())
++      const noteTimeout = vi.fn(() => ({ giveUp: over.giveUp === true }))
++      const transportAlive = vi.fn(async () => over.alive !== false)
++      const onProbe = vi.fn()
++      const answers = new RemoteAnswerLedger()
++
++      const run = () =>
++        ensureHealthyPooledRemoteBackendForDispatch({
++          answers,
++          connectionPromise,
++          currentConnectionPromise: () => connectionPromise,
++          onProbe,
++          probe,
++          reconnect,
++          retire,
++          slowLink: { isTimeout, noteTimeout, transportAlive }
++        })
++
++      return { answers, noteTimeout, onProbe, reconnect, replacement, retire, run, slow, transportAlive }
++    }
++
++    it('returns the same descriptor without retiring or reconnecting, and skips the next probe', async () => {
++      const h = harness()
++
++      await expect(h.run()).resolves.toBe(h.slow)
++
++      expect(h.noteTimeout).toHaveBeenCalledWith(h.slow)
++      expect(h.retire).not.toHaveBeenCalled()
++      expect(h.reconnect).not.toHaveBeenCalled()
++      expect(h.onProbe).toHaveBeenCalledWith('slow', expect.any(Number))
++      expect(h.answers.answeredWithin(h.slow.baseUrl, 30_000)).toBe(true)
++    })
++
++    it('still retires when the transport is dead', async () => {
++      const h = harness({ alive: false })
++
++      await expect(h.run()).resolves.toBe(h.replacement)
++
++      expect(h.noteTimeout).not.toHaveBeenCalled()
++      expect(h.retire).toHaveBeenCalledOnce()
++      expect(h.answers.answeredWithin(h.slow.baseUrl, 30_000)).toBe(false)
++    })
++
++    it.each(['connect ECONNREFUSED 127.0.0.1:49882', 'read ECONNRESET', 'socket hang up'])(
++      'still retires on "%s", without asking about the transport',
++      async message => {
++        const h = harness({ probeError: new Error(message) })
++
++        await expect(h.run()).resolves.toBe(h.replacement)
++
++        expect(h.transportAlive).not.toHaveBeenCalled()
++        expect(h.retire).toHaveBeenCalledOnce()
++      }
++    )
++
++    it('still retires when the transport check itself throws', async () => {
++      const h = harness()
++
++      h.transportAlive.mockRejectedValue(new Error('ssh -O check failed'))
++
++      await expect(h.run()).resolves.toBe(h.replacement)
++
++      expect(h.noteTimeout).not.toHaveBeenCalled()
++      expect(h.retire).toHaveBeenCalledOnce()
++    })
++
++    it('still retires once the slow-link tracker gives up on a backend that never answers', async () => {
++      const h = harness({ giveUp: true })
++
++      await expect(h.run()).resolves.toBe(h.replacement)
++
++      expect(h.noteTimeout).toHaveBeenCalledOnce()
++      expect(h.retire).toHaveBeenCalledOnce()
++    })
++  })
++
+   it('retires a dead cached descriptor and gives dispatch the replacement', async () => {
+     const stale = { baseUrl: 'http://127.0.0.1:49525', mode: 'remote' }
+     const replacement = { baseUrl: 'http://127.0.0.1:53968', mode: 'remote' }
+diff --git a/apps/desktop/electron/remote-liveness.ts b/apps/desktop/electron/remote-liveness.ts
+index 5a92fad4d1..d836427034 100644
+--- a/apps/desktop/electron/remote-liveness.ts
++++ b/apps/desktop/electron/remote-liveness.ts
+@@ -123,7 +123,15 @@ interface EnsureHealthyPooledRemoteBackendForDispatchOptions<TConnection extends
+   // Skip the probe when the backend answered within skipWindowMs (0 forces it, e.g. the prewarm keepalive).
+   answers?: RemoteAnswerLedger
+   skipWindowMs?: number
+-  onProbe?: (outcome: 'ran' | 'skipped', elapsedMs: number) => void
++  onProbe?: (outcome: 'ran' | 'skipped' | 'slow', elapsedMs: number) => void
++  // [daveey] Slow-link tolerance (slow-link.ts). A probe that TIMES OUT while the transport is still alive means
++  // the link is slow, not that the backend is gone: retiring it only makes the reconnect refetch everything over
++  // the same slow link. Such a descriptor is kept until noteTimeout reports giveUp.
++  slowLink?: {
++    isTimeout: (error: unknown) => boolean
++    transportAlive: () => Promise<boolean>
++    noteTimeout: (connection: TConnection) => { giveUp: boolean }
++  }
+ }
+ 
+ /**
+@@ -142,7 +150,8 @@ export async function ensureHealthyPooledRemoteBackendForDispatch<TConnection ex
+   retire,
+   answers,
+   skipWindowMs = DISPATCH_PROBE_SKIP_WINDOW_MS,
+-  onProbe
++  onProbe,
++  slowLink
+ }: EnsureHealthyPooledRemoteBackendForDispatchOptions<TConnection>): Promise<TConnection> {
+   let connection: TConnection | undefined
+   const startedAt = Date.now()
+@@ -177,6 +186,24 @@ export async function ensureHealthyPooledRemoteBackendForDispatch<TConnection ex
+       })
+     }
+   } catch (error) {
++    if (
++      slowLink &&
++      connection &&
++      currentConnectionPromise() === connectionPromise &&
++      slowLink.isTimeout(error) &&
++      (await slowLink.transportAlive().catch(() => false)) &&
++      currentConnectionPromise() === connectionPromise &&
++      !slowLink.noteTimeout(connection).giveUp
++    ) {
++      // Slow, not down: keep the descriptor and let the request go out with its stretched timeout. The answer
++      // mark is set so the dispatches queued behind this one do not each pay another probe timeout; a request
++      // that times out forgets it again (remote-down-gate.ts), and the next dispatch probes and counts a strike.
++      answers?.recordAnswer(connection.baseUrl)
++      onProbe?.('slow', Date.now() - startedAt)
++
++      return connection
++    }
++
+     answers?.forget(connection?.baseUrl)
+ 
+     if (currentConnectionPromise() === connectionPromise) {
+diff --git a/apps/desktop/electron/slow-link.test.ts b/apps/desktop/electron/slow-link.test.ts
+new file mode 100644
+index 0000000000..08c7f6e2da
+--- /dev/null
++++ b/apps/desktop/electron/slow-link.test.ts
+@@ -0,0 +1,427 @@
++import { readFileSync } from 'node:fs'
++import { join } from 'node:path'
++
++import { describe, expect, it, vi } from 'vitest'
++
++import { isPowerSettlingError } from './power-settle'
++import { isRemoteTimeout } from './remote-down-gate'
++import {
++  ensureHealthyPooledRemoteBackendForDispatch,
++  POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS,
++  RemoteAnswerLedger
++} from './remote-liveness'
++import {
++  dispatchSlowLink,
++  isThinnedPollPath,
++  SLOW_LINK_BACKGROUND_GAP_MS,
++  SLOW_LINK_EXIT_SAMPLES,
++  SLOW_LINK_FAST_MS,
++  SLOW_LINK_IDLE_EXPIRY_MS,
++  SLOW_LINK_STRIKE_LIMIT,
++  SLOW_LINK_TIMEOUT_CAP_MS,
++  SLOW_LINK_TIMEOUT_FACTOR,
++  SlowLinkHeldError,
++  SlowLinkTracker,
++  thinnedPoll
++} from './slow-link'
++
++const HUB = 'http://127.0.0.1:49882'
++const SCOPE = 'conn:hermes-hub::default'
++const POLL = '/api/plugins/kanban/board?board=default'
++
++function harness() {
++  let clock = 1_000_000
++  const lines: string[] = []
++  const tracker = new SlowLinkTracker({ log: line => lines.push(line), now: () => clock })
++
++  tracker.bind(SCOPE, `${HUB}/`)
++
++  return { advance: (ms: number) => (clock += ms), lines, tracker }
++}
++
++describe('SlowLinkTracker', () => {
++  it('leaves a backend alone until a probe times out: slow answers alone never enter slow mode', () => {
++    const { lines, tracker } = harness()
++
++    for (let i = 0; i < 20; i += 1) {
++      tracker.noteAnswer(HUB, 9_000) // a heavy endpoint on a fast link
++    }
++
++    expect(tracker.isSlow(HUB)).toBe(false)
++    expect(tracker.scaleTimeout(HUB, 4_000)).toBe(4_000)
++    tracker.admitBackground(SCOPE, POLL)(true)
++    tracker.admitBackground(SCOPE, POLL)(true)
++    expect(lines).toEqual([])
++  })
++
++  it('enters slow mode on a probe timeout with the transport alive, and stretches timeouts up to the cap', () => {
++    const { lines, tracker } = harness()
++
++    expect(tracker.noteTimeoutWhileAlive(HUB)).toEqual({ giveUp: false, strikes: 1 })
++    expect(tracker.isSlow(HUB)).toBe(true)
++    expect(tracker.isScopeSlow(SCOPE)).toBe(true)
++    expect(tracker.isConnectionSlow('hermes-hub')).toBe(true)
++    expect(tracker.isConnectionSlow('mac-mini')).toBe(false)
++    expect(tracker.scaleTimeout(HUB, 4_000)).toBe(4_000 * SLOW_LINK_TIMEOUT_FACTOR)
++    expect(tracker.scaleTimeout(HUB, 30_000)).toBe(SLOW_LINK_TIMEOUT_CAP_MS)
++    // A budget already above the cap is never shortened.
++    expect(tracker.scaleTimeout(HUB, 120_000)).toBe(120_000)
++    expect(lines).toHaveLength(1)
++    expect(lines[0]).toContain('[slow-link]')
++  })
++
++  it('leaves slow mode when the median of the last answers is fast; one heavy answer does not keep it slow', () => {
++    const { lines, tracker } = harness()
++
++    tracker.noteTimeoutWhileAlive(HUB)
++
++    for (let i = 0; i < SLOW_LINK_EXIT_SAMPLES; i += 1) {
++      tracker.noteAnswer(HUB, SLOW_LINK_FAST_MS + 3_000)
++    }
++
++    expect(tracker.isSlow(HUB)).toBe(true)
++
++    tracker.noteAnswer(HUB, 50)
++    tracker.noteAnswer(HUB, 50)
++    expect(tracker.isSlow(HUB)).toBe(true) // 3 slow, 2 fast
++
++    tracker.noteAnswer(HUB, 6_000) // a heavy endpoint among fast answers
++    tracker.noteAnswer(HUB, 50)
++    tracker.noteAnswer(HUB, 50)
++    tracker.noteAnswer(HUB, 50)
++
++    expect(tracker.isSlow(HUB)).toBe(false)
++    expect(tracker.scaleTimeout(HUB, 4_000)).toBe(4_000)
++    expect(lines.at(-1)).toContain('fast again')
++  })
++
++  it('expires slow mode after SLOW_LINK_IDLE_EXPIRY_MS with no slow answer or timeout', () => {
++    const { advance, tracker } = harness()
++
++    tracker.noteTimeoutWhileAlive(HUB)
++    advance(SLOW_LINK_IDLE_EXPIRY_MS - 1)
++    expect(tracker.isSlow(HUB)).toBe(true)
++
++    tracker.noteAnswer(HUB, 50) // fast answers are not evidence of slowness
++    advance(1)
++    expect(tracker.isSlow(HUB)).toBe(false)
++
++    tracker.noteTimeoutWhileAlive(HUB)
++    advance(SLOW_LINK_IDLE_EXPIRY_MS - 1)
++    tracker.noteAnswer(HUB, SLOW_LINK_FAST_MS) // a slow answer renews it
++    advance(SLOW_LINK_IDLE_EXPIRY_MS - 1)
++    expect(tracker.isSlow(HUB)).toBe(true)
++  })
++
++  it('gives up after the strike limit with no answer in between; an answer resets the strikes', () => {
++    const { tracker } = harness()
++
++    for (let strike = 1; strike < SLOW_LINK_STRIKE_LIMIT; strike += 1) {
++      expect(tracker.noteTimeoutWhileAlive(HUB)).toEqual({ giveUp: false, strikes: strike })
++    }
++
++    tracker.noteAnswer(HUB, 8_000) // slow, but it answered
++
++    for (let strike = 1; strike < SLOW_LINK_STRIKE_LIMIT; strike += 1) {
++      expect(tracker.noteTimeoutWhileAlive(HUB).giveUp).toBe(false)
++    }
++
++    expect(tracker.noteTimeoutWhileAlive(HUB)).toEqual({ giveUp: true, strikes: SLOW_LINK_STRIKE_LIMIT })
++    // Given up: the rebuilt backend starts clean.
++    expect(tracker.isSlow(HUB)).toBe(false)
++  })
++
++  it('thins timer polls on a slow link: one in flight per scope and path, then a minimum gap', () => {
++    const { advance, tracker } = harness()
++
++    tracker.noteTimeoutWhileAlive(HUB)
++
++    const release = tracker.admitBackground(SCOPE, POLL)
++
++    expect(() => tracker.admitBackground(SCOPE, POLL)).toThrow(SlowLinkHeldError)
++    // Another path is its own slot.
++    tracker.admitBackground(SCOPE, '/api/plugins/hub-sync/status')(true)
++
++    release(true)
++    advance(SLOW_LINK_BACKGROUND_GAP_MS - 1)
++    expect(() => tracker.admitBackground(SCOPE, POLL)).toThrow(SlowLinkHeldError)
++
++    advance(1)
++    tracker.admitBackground(SCOPE, POLL)(true)
++  })
++
++  it('never thins a read that is not a known timer poll, such as opening a session', () => {
++    const { tracker } = harness()
++
++    tracker.noteTimeoutWhileAlive(HUB)
++
++    expect(isThinnedPollPath('/api/sessions/20261112_185653_5ff5dc/messages?limit=200')).toBe(false)
++    expect(isThinnedPollPath('/api/profiles/sessions')).toBe(false)
++    expect(isThinnedPollPath(POLL)).toBe(true)
++    expect(isThinnedPollPath('/api/session-kanban-tasks?session_id=x')).toBe(true)
++
++    for (let i = 0; i < 3; i += 1) {
++      tracker.admitBackground(SCOPE, '/api/sessions/20261112_185653_5ff5dc/messages?limit=200')
++    }
++  })
++
++  it('keeps one profile from holding another profile on the same backend', () => {
++    const { tracker } = harness()
++    const other = 'conn:hermes-hub::alpha'
++
++    tracker.bind(other, HUB) // named profiles on an SSH connection share the default backend's baseUrl
++    tracker.noteTimeoutWhileAlive(HUB)
++
++    tracker.admitBackground(SCOPE, POLL)
++    tracker.admitBackground(other, POLL)
++    expect(() => tracker.admitBackground(other, POLL)).toThrow(SlowLinkHeldError)
++  })
++
++  it('gives the slot straight back when the poll never reached the wire', () => {
++    const { tracker } = harness()
++
++    tracker.noteTimeoutWhileAlive(HUB)
++
++    tracker.admitBackground(SCOPE, POLL)(false) // down gate refused it, or the dial failed
++    tracker.admitBackground(SCOPE, POLL)(true)
++    expect(() => tracker.admitBackground(SCOPE, POLL)).toThrow(SlowLinkHeldError)
++  })
++
++  it('a held poll is a power-settling error, so the renderer guard and the api handler treat it as a quiet skip', () => {
++    const held = new SlowLinkHeldError()
++
++    expect(isPowerSettlingError(held)).toBe(true)
++    expect(held.message).toContain('slow')
++    // Electron strips `code` across IPC: the renderer only sees "<name>: <message>" inside the invoke error, and
++    // its guard (a separate tsconfig project, so read as text here) matches on exactly that name marker.
++    const guard = readFileSync(join(__dirname, '..', 'src', 'lib', 'power-settling-rejections.ts'), 'utf8')
++    const marker = /POWER_SETTLING_MARKER = '([^']+)'/.exec(guard)?.[1]
++
++    expect(marker).toBe('PowerSettlingError:')
++    expect(`${held.name}: ${held.message}`).toContain(marker)
++  })
++
++  it('forgetScope drops the slow state and the poll slots of a retired backend', () => {
++    const { tracker } = harness()
++
++    tracker.noteTimeoutWhileAlive(HUB)
++    tracker.admitBackground(SCOPE, POLL)
++    tracker.forgetScope(SCOPE)
++
++    expect(tracker.isSlow(HUB)).toBe(false)
++    expect(tracker.isScopeSlow(SCOPE)).toBe(false)
++
++    // A rebuilt tunnel that lands on the same local port starts clean.
++    tracker.bind(SCOPE, HUB)
++    expect(tracker.isSlow(HUB)).toBe(false)
++    tracker.admitBackground(SCOPE, POLL)(true)
++    tracker.admitBackground(SCOPE, POLL)(true)
++  })
++})
++
++describe('three probe timeouts with no answer in between retire the backend', () => {
++  it('keeps it twice, then retires and reconnects on the third', async () => {
++    const tracker = new SlowLinkTracker()
++    const answers = new RemoteAnswerLedger()
++    const connection = { baseUrl: HUB, mode: 'remote' }
++    const replacement = { baseUrl: 'http://127.0.0.1:53968', mode: 'remote' }
++    const connectionPromise = Promise.resolve(connection)
++    const retire = vi.fn()
++    const reconnect = vi.fn(async () => replacement)
++
++    const dispatch = () =>
++      ensureHealthyPooledRemoteBackendForDispatch({
++        answers,
++        connectionPromise,
++        currentConnectionPromise: () => connectionPromise,
++        probe: async () => {
++          throw new Error('Timed out connecting to Hermes backend after 40000ms')
++        },
++        reconnect,
++        retire,
++        slowLink: {
++          isTimeout: isRemoteTimeout,
++          noteTimeout: target => tracker.noteTimeoutWhileAlive(target.baseUrl),
++          transportAlive: async () => true
++        }
++      })
++
++    for (let strike = 1; strike < SLOW_LINK_STRIKE_LIMIT; strike += 1) {
++      await expect(dispatch()).resolves.toBe(connection)
++      answers.forget(HUB) // the request it let through timed out too (remote-down-gate.ts)
++    }
++
++    expect(retire).not.toHaveBeenCalled()
++
++    await expect(dispatch()).resolves.toBe(replacement)
++    expect(retire).toHaveBeenCalledOnce()
++    expect(tracker.isSlow(HUB)).toBe(false)
++  })
++})
++
++describe('a backend that answers every request after 12 s over a live tunnel', () => {
++  const LATENCY_MS = 12_000
++
++  // The transport the real fetch gives: an answer after LATENCY_MS, or the timeout error when the budget is shorter.
++  const slowFetch = async (timeoutMs: number) => {
++    if (timeoutMs < LATENCY_MS) {
++      throw new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`)
++    }
++
++    return { ok: true }
++  }
++
++  it('is kept (no retire, no reconnect) and a 4 s request then fits its stretched timeout', async () => {
++    const tracker = new SlowLinkTracker()
++    const answers = new RemoteAnswerLedger()
++    const connection = { baseUrl: HUB, mode: 'remote' }
++    const connectionPromise = Promise.resolve(connection)
++    const retire = vi.fn()
++    const reconnect = vi.fn()
++
++    const dispatch = () =>
++      ensureHealthyPooledRemoteBackendForDispatch({
++        answers,
++        connectionPromise,
++        currentConnectionPromise: () => connectionPromise,
++        probe: (target, _path, options) => slowFetch(tracker.scaleTimeout(target.baseUrl, options.timeoutMs)),
++        reconnect,
++        retire,
++        slowLink: {
++          isTimeout: isRemoteTimeout,
++          noteTimeout: target => tracker.noteTimeoutWhileAlive(target.baseUrl),
++          transportAlive: async () => true
++        }
++      })
++
++    // Before: the 10 s probe cannot fit 12 s, and a 4 s request would time out too.
++    expect(POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS).toBeLessThan(LATENCY_MS)
++    await expect(slowFetch(tracker.scaleTimeout(HUB, 4_000))).rejects.toThrow(/Timed out/)
++
++    await expect(dispatch()).resolves.toBe(connection)
++    expect(tracker.isSlow(HUB)).toBe(true)
++
++    // The request the dispatch was for now gets 16 s and completes.
++    await expect(slowFetch(tracker.scaleTimeout(HUB, 4_000))).resolves.toEqual({ ok: true })
++
++    // The next dispatch probes with a stretched budget, so it passes outright.
++    answers.forget(HUB)
++    await expect(dispatch()).resolves.toBe(connection)
++
++    expect(retire).not.toHaveBeenCalled()
++    expect(reconnect).not.toHaveBeenCalled()
++  })
++})
++
++describe('main.ts wiring helpers', () => {
++  it('dispatchSlowLink: a timeout with a live master binds the scope and counts a strike; a dead or absent master is not alive', async () => {
++    const { tracker } = harness()
++    const scope = 'conn:mac-mini::default'
++    const mini = 'http://127.0.0.1:50111'
++    const option = dispatchSlowLink(scope, async () => true, tracker)
++
++    expect(option.isTimeout(new Error('Timed out connecting to Hermes backend after 10000ms'))).toBe(true)
++    expect(option.isTimeout(new Error('socket hang up'))).toBe(false)
++    await expect(option.transportAlive()).resolves.toBe(true)
++    expect(option.noteTimeout({ baseUrl: mini })).toEqual({ giveUp: false, strikes: 1 })
++    expect(tracker.isScopeSlow(scope)).toBe(true)
++
++    await expect(dispatchSlowLink(scope, async () => false, tracker).transportAlive()).resolves.toBe(false)
++    await expect(dispatchSlowLink(scope, () => undefined, tracker).transportAlive()).resolves.toBe(false)
++  })
++
++  it('thinnedPoll: holds a repeated timer poll, frees an unsent one, and never holds a foreground or non-GET request', async () => {
++    const { tracker } = harness()
++    const poll = { method: 'GET', path: POLL }
++
++    tracker.noteTimeoutWhileAlive(HUB)
++
++    // Sent: the slot stays taken for the gap, even though the request failed.
++    const first = thinnedPoll(SCOPE, poll, tracker)
++
++    await expect(
++      first.run(async () => {
++        first.sent(HUB)
++        throw new Error('Timed out connecting to Hermes backend after 16000ms')
++      })
++    ).rejects.toThrow(/Timed out/)
++    expect(() => thinnedPoll(SCOPE, poll, tracker)).toThrow(SlowLinkHeldError)
++
++    // Never sent (down gate refused it): the slot is free again at once.
++    const other = { method: 'GET', path: '/api/plugins/hub-sync/status' }
++
++    await expect(
++      thinnedPoll(SCOPE, other, tracker).run(async () => {
++        throw new Error('Remote backend is down')
++      })
++    ).rejects.toThrow(/down/)
++    await expect(thinnedPoll(SCOPE, other, tracker).run(async () => 'ok')).resolves.toBe('ok')
++
++    // User-driven work passes however often it repeats.
++    for (const request of [
++      { method: 'GET', path: POLL, priority: 'foreground' },
++      { method: 'POST', path: POLL },
++      { method: 'GET', path: '/api/sessions/abc/messages' }
++    ]) {
++      thinnedPoll(SCOPE, request, tracker)
++      thinnedPoll(SCOPE, request, tracker)
++    }
++
++    // A local request has no scope and is never thinned.
++    thinnedPoll(null, poll, tracker)
++    thinnedPoll(null, poll, tracker)
++  })
++
++  it('thinnedPoll.sent binds the scope to its baseUrl, which is what lets prefetch pause for that connection', () => {
++    const tracker = new SlowLinkTracker()
++    const scope = 'conn:mac-mini::default'
++    const mini = 'http://127.0.0.1:50111'
++
++    thinnedPoll(scope, { method: 'GET', path: POLL }, tracker).sent(mini)
++    tracker.noteTimeoutWhileAlive(mini)
++
++    expect(tracker.isConnectionSlow('mac-mini')).toBe(true)
++  })
++})
++
++describe('main.ts wiring', () => {
++  const main = readFileSync(join(__dirname, 'main.ts'), 'utf8')
++
++  it('keeps a slow SSH tunnel at dispatch: SSH sources get dispatchSlowLink over the live master check', () => {
++    const dispatch = main.slice(main.indexOf('ensureHealthyPooledRemoteBackendForDispatch({'))
++    const slowLink = dispatch.indexOf('slowLink:')
++
++    expect(slowLink).toBeGreaterThan(0)
++    expect(slowLink).toBeLessThan(dispatch.indexOf('retire: async'))
++    expect(dispatch.slice(slowLink, slowLink + 300).replace(/\s+/g, ' ')).toContain(
++      "source.kind === 'ssh' ? dispatchSlowLink(key, () => sshConnections.get(key)?.ssh?.isAlive()) : undefined"
++    )
++  })
++
++  it('stretches every backend request timeout and times every answer in fetchJsonForBackend', () => {
++    const fetcher = main.slice(main.indexOf('async function fetchJsonForBackend('))
++    const body = fetcher.slice(0, fetcher.indexOf('\nipcMain.handle('))
++
++    expect(body).toContain('slowLinkTracker.scaleTimeout(')
++    expect(body).not.toMatch(/timeoutMs: opts\.timeoutMs,\s+headers/)
++    expect(body.match(/noteRemoteAnswer\(descriptor\.baseUrl, path, Date\.now\(\) - startedAt, rememberLog\)/g)).toHaveLength(2)
++  })
++
++  it('wraps the registry dispatch, down gate included, in the poll thinner and reports the send', () => {
++    const dispatch = main.slice(main.indexOf('const poll = thinnedPoll(gateKey, request)'))
++    const run = dispatch.indexOf('await poll.run(')
++
++    expect(dispatch.indexOf('poll.sent(descriptor.baseUrl)')).toBeGreaterThan(0)
++    expect(dispatch.indexOf('poll.sent(descriptor.baseUrl)')).toBeLessThan(dispatch.indexOf('return fetchJsonForBackend('))
++    expect(run).toBeGreaterThan(0)
++    expect(run).toBeLessThan(dispatch.indexOf('dispatchThroughRemoteDownGate({'))
++  })
++
++  it('pauses transcript prefetch for a slow connection and clears slow state wherever a pooled descriptor is dropped', () => {
++    expect(main).toContain('prefetchPaused: connectionId => slowLinkTracker.isConnectionSlow(connectionId)')
++
++    const stop = main.slice(main.indexOf('function stopPoolBackend('))
++
++    expect(stop.slice(0, 300)).toContain('slowLinkTracker.forgetScope(profile)')
++  })
++})
+diff --git a/apps/desktop/electron/slow-link.ts b/apps/desktop/electron/slow-link.ts
+new file mode 100644
+index 0000000000..e3ddc28f75
+--- /dev/null
++++ b/apps/desktop/electron/slow-link.ts
+@@ -0,0 +1,357 @@
++// [daveey] Keep a remote backend usable over a slow link instead of reconnecting it in a loop.
++//
++// On 2026-11-12 the MacBook sat on a ~60-175 KB/s network. The SSH tunnel to the hub was alive, but answers came
++// late: the dispatch /api/health probe (10 s) timed out, the pooled backend was retired and its SSH master torn
++// down, and the reconnect refetched everything (sessions, boards, transcripts) over the same link, which made the
++// next probe time out too. desktop.log showed "failed its dispatch probe ... reconnecting on demand" every 1-2
++// minutes for an hour while a trivial command through the tunnel took 34 s. Nothing was down; it was slow.
++//
++// This module holds the slow-link state per remote backend (by its forwarded baseUrl):
++// - it enters slow mode ONLY when a dispatch probe times out while the transport (SSH master) is still alive
++//   (noteTimeoutWhileAlive). Answer times alone never enter it: a slow endpoint on a fast link is not a slow link;
++// - while slow, request and probe timeouts are stretched (scaleTimeout), the known background polls are thinned to
++//   one in flight per scope and path with a minimum gap (admitBackground), and bulk work can pause (isSlow);
++// - it leaves slow mode when the median of the last SLOW_LINK_EXIT_SAMPLES answers is fast, or after
++//   SLOW_LINK_IDLE_EXPIRY_MS with no slow answer or timeout.
++// A backend that never answers is still given up on: SLOW_LINK_STRIKE_LIMIT timeouts with no answer in between
++// report giveUp, and the caller retires it as before. A dead transport is never treated as slow.
++//
++// Known cost: `ssh -O check` proves the master process is alive, not that the link carries traffic. When a network
++// drops without a reset, the master lives until its keepalive gives up (~45 s), so for that window requests wait
++// their stretched timeout instead of failing after the 10 s probe.
++
++import { isBackgroundRead, type PowerSettleRequest, PowerSettlingError } from './power-settle'
++import { isRemoteTimeout } from './remote-down-gate'
++import { remoteAnswerLedger } from './remote-liveness'
++
++export const SLOW_LINK_FAST_MS = 1_000
++export const SLOW_LINK_EXIT_SAMPLES = 5
++export const SLOW_LINK_IDLE_EXPIRY_MS = 10 * 60_000
++export const SLOW_LINK_TIMEOUT_FACTOR = 4
++export const SLOW_LINK_TIMEOUT_CAP_MS = 60_000
++export const SLOW_LINK_STRIKE_LIMIT = 3
++export const SLOW_LINK_BACKGROUND_GAP_MS = 30_000
++
++// The renderer's untagged GETs include user-driven reads (opening a session), so thinning is limited to the paths
++// that are polled on a timer: plugin status/board/outbox reads and the session-kanban strip. A skipped read of one
++// of these leaves the view on the copy the previous poll delivered.
++const THINNED_POLL_PREFIXES = ['/api/plugins/', '/api/session-kanban-tasks']
++
++export function isThinnedPollPath(path: string): boolean {
++  return THINNED_POLL_PREFIXES.some(prefix => path.startsWith(prefix))
++}
++
++/**
++ * A background poll held back because its backend is on a slow link. It is a PowerSettlingError on purpose: the
++ * renderer already treats that as "skipped, the next poll retries" (src/lib/power-settling-rejections.ts) and the
++ * hermes:api handler rethrows it without a stack line, which is exactly the contract a thinned poll needs.
++ */
++export class SlowLinkHeldError extends PowerSettlingError {
++  constructor() {
++    super()
++    this.message = 'Background read skipped: the connection to this backend is slow; the next poll retries.'
++  }
++}
++
++interface LinkState {
++  // When the link last looked slow (entered, a timeout, or an answer slower than SLOW_LINK_FAST_MS).
++  evidenceAt: number
++  samples: number[]
++  strikes: number
++}
++
++interface BackgroundSlot {
++  inFlight: boolean
++  startedAt: number
++}
++
++export interface SlowLinkOptions {
++  log?: (line: string) => void
++  now?: () => number
++}
++
++const normalize = (baseUrl: null | string | undefined) => String(baseUrl ?? '').replace(/\/+$/, '')
++
++const median = (values: readonly number[]) => {
++  const sorted = [...values].sort((a, b) => a - b)
++
++  return sorted[Math.floor((sorted.length - 1) / 2)] ?? 0
++}
++
++export class SlowLinkTracker {
++  readonly #links = new Map<string, LinkState>()
++  readonly #scopes = new Map<string, string>()
++  readonly #background = new Map<string, BackgroundSlot>()
++  readonly #now: () => number
++  #log: ((line: string) => void) | undefined
++
++  constructor(options: SlowLinkOptions = {}) {
++    this.#now = options.now ?? Date.now
++    this.#log = options.log
++  }
++
++  setLog(log: ((line: string) => void) | undefined): void {
++    this.#log = log
++  }
++
++  /** Remember which forwarded baseUrl a pool scope (`conn:<id>::<profile>`) is served from. */
++  bind(scope: string, baseUrl: null | string | undefined): void {
++    const url = normalize(baseUrl)
++
++    if (scope && url) {
++      this.#scopes.set(scope, url)
++    }
++  }
++
++  isSlow(baseUrl: null | string | undefined): boolean {
++    const url = normalize(baseUrl)
++    const state = this.#links.get(url)
++
++    if (!state) {
++      return false
++    }
++
++    if (this.#now() - state.evidenceAt >= SLOW_LINK_IDLE_EXPIRY_MS) {
++      this.#leave(url, 'no slow answer for a while')
++
++      return false
++    }
++
++    return true
++  }
++
++  isScopeSlow(scope: string): boolean {
++    return this.isSlow(this.#scopes.get(scope))
++  }
++
++  /** Any profile of one registry connection is on a slow link (bulk work pauses per connection). */
++  isConnectionSlow(connectionId: string): boolean {
++    const prefix = `conn:${connectionId}::`
++
++    for (const [scope, baseUrl] of this.#scopes) {
++      if (scope.startsWith(prefix) && this.isSlow(baseUrl)) {
++        return true
++      }
++    }
++
++    return false
++  }
++
++  /** The timeout to use for a request to this backend: stretched while its link is slow. */
++  scaleTimeout(baseUrl: null | string | undefined, timeoutMs: number): number {
++    if (!this.isSlow(baseUrl) || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
++      return timeoutMs
++    }
++
++    return Math.max(timeoutMs, Math.min(timeoutMs * SLOW_LINK_TIMEOUT_FACTOR, SLOW_LINK_TIMEOUT_CAP_MS))
++  }
++
++  /** The backend answered a request successfully after elapsedMs. Only a backend in slow mode keeps samples. */
++  noteAnswer(baseUrl: null | string | undefined, elapsedMs: number): void {
++    const url = normalize(baseUrl)
++    const state = this.#links.get(url)
++
++    if (!state || !Number.isFinite(elapsedMs) || elapsedMs < 0) {
++      return
++    }
++
++    state.strikes = 0
++    state.samples.push(elapsedMs)
++
++    if (state.samples.length > SLOW_LINK_EXIT_SAMPLES) {
++      state.samples.shift()
++    }
++
++    if (elapsedMs >= SLOW_LINK_FAST_MS) {
++      state.evidenceAt = this.#now()
++    }
++
++    if (state.samples.length >= SLOW_LINK_EXIT_SAMPLES && median(state.samples) < SLOW_LINK_FAST_MS) {
++      this.#leave(url, 'answers are fast again')
++    }
++  }
++
++  /**
++   * A dispatch probe timed out while the transport (SSH master) was still alive: slow, not down. giveUp is true
++   * once SLOW_LINK_STRIKE_LIMIT of these arrived with no answer in between; the caller then retires the backend.
++   */
++  noteTimeoutWhileAlive(baseUrl: null | string | undefined): { giveUp: boolean; strikes: number } {
++    const url = normalize(baseUrl)
++
++    if (!url) {
++      return { giveUp: true, strikes: 0 }
++    }
++
++    let state = this.#links.get(url)
++
++    if (!state) {
++      state = { evidenceAt: this.#now(), samples: [], strikes: 0 }
++      this.#links.set(url, state)
++      this.#log?.(
++        `[slow-link] ${url} is slow (probe timed out with the SSH connection alive); keeping the connection, stretching timeouts x${SLOW_LINK_TIMEOUT_FACTOR} and thinning background polls`
++      )
++    }
++
++    state.strikes += 1
++    state.evidenceAt = this.#now()
++    state.samples.length = 0
++
++    if (state.strikes >= SLOW_LINK_STRIKE_LIMIT) {
++      const strikes = state.strikes
++      this.forget(url)
++      this.#log?.(`[slow-link] ${url} timed out ${strikes} times with no answer; treating it as down`)
++
++      return { giveUp: true, strikes }
++    }
++
++    return { giveUp: false, strikes: state.strikes }
++  }
++
++  /**
++   * Thin the timer-driven polls (isThinnedPollPath) to a slow backend: per scope and path, one in flight and at most
++   * one start per SLOW_LINK_BACKGROUND_GAP_MS. Throws SlowLinkHeldError for a poll to skip; otherwise returns the
++   * release to call when the request settles, with whether it was actually sent (an unsent one frees its slot at
++   * once, so a refused dial does not cost the path its next 30 s). A fast link admits everything.
++   */
++  admitBackground(scope: string, path: string): (sent: boolean) => void {
++    if (!isThinnedPollPath(path) || !this.isScopeSlow(scope)) {
++      return () => undefined
++    }
++
++    const key = `${scope}\u0000${path}`
++    const now = this.#now()
++    const slot = this.#background.get(key)
++
++    if (slot && (slot.inFlight || now - slot.startedAt < SLOW_LINK_BACKGROUND_GAP_MS)) {
++      throw new SlowLinkHeldError()
++    }
++
++    // Paths carry session ids and queries: drop the slots whose gap has passed so a long slow spell stays bounded.
++    for (const [other, old] of this.#background) {
++      if (!old.inFlight && now - old.startedAt >= SLOW_LINK_BACKGROUND_GAP_MS) {
++        this.#background.delete(other)
++      }
++    }
++
++    const mine: BackgroundSlot = { inFlight: true, startedAt: now }
++    this.#background.set(key, mine)
++
++    return sent => {
++      mine.inFlight = false
++
++      if (!sent && this.#background.get(key) === mine) {
++        this.#background.delete(key)
++      }
++    }
++  }
++
++  /** The backend was retired or its tunnel torn down: a rebuilt one starts with a clean record. */
++  forget(baseUrl: null | string | undefined): void {
++    const url = normalize(baseUrl)
++
++    this.#links.delete(url)
++    this.#dropBackground(url)
++  }
++
++  forgetScope(scope: string): void {
++    this.forget(this.#scopes.get(scope))
++    this.#scopes.delete(scope)
++  }
++
++  #leave(url: string, reason: string): void {
++    this.#links.delete(url)
++    this.#dropBackground(url)
++    this.#log?.(`[slow-link] ${url}: ${reason}; normal timeouts and polling restored`)
++  }
++
++  #dropBackground(url: string): void {
++    for (const [scope, bound] of this.#scopes) {
++      if (bound !== url) {
++        continue
++      }
++
++      const prefix = `${scope}\u0000`
++
++      for (const key of this.#background.keys()) {
++        if (key.startsWith(prefix)) {
++          this.#background.delete(key)
++        }
++      }
++    }
++  }
++}
++
++export const slowLinkTracker = new SlowLinkTracker()
++
++// --- main.ts wiring. It lives here because main.ts is over its line cap and may only shrink. ---
++
++/** The `slowLink` option of ensureHealthyPooledRemoteBackendForDispatch for one SSH pool scope. */
++export function dispatchSlowLink(
++  scope: string,
++  masterAlive: () => Promise<boolean> | undefined,
++  tracker: SlowLinkTracker = slowLinkTracker
++) {
++  return {
++    isTimeout: isRemoteTimeout,
++    noteTimeout: (connection: { baseUrl?: null | string }) => {
++      tracker.bind(scope, connection.baseUrl)
++
++      return tracker.noteTimeoutWhileAlive(connection.baseUrl)
++    },
++    transportAlive: async () => (await masterAlive()) === true
++  }
++}
++
++/**
++ * One registry request as the poll thinner sees it. Building it throws SlowLinkHeldError for a timer poll to skip.
++ * `sent` is called when the request goes on the wire (it also ties the scope to its baseUrl); `run` wraps the
++ * dispatch and frees the slot afterwards, at once if nothing was sent (down gate, failed dial).
++ */
++export function thinnedPoll(
++  scope: null | string,
++  request: (PowerSettleRequest & { path?: unknown }) | null | undefined,
++  tracker: SlowLinkTracker = slowLinkTracker
++) {
++  const release =
++    scope && isBackgroundRead(request) ? tracker.admitBackground(scope, String(request?.path || '')) : null
++
++  let wasSent = false
++
++  return {
++    async run<T>(dispatch: () => Promise<T>): Promise<T> {
++      try {
++        return await dispatch()
++      } finally {
++        release?.(wasSent)
++      }
++    },
++    sent(baseUrl: null | string | undefined): void {
++      wasSent = true
++
++      if (scope) {
++        tracker.bind(scope, baseUrl)
++      }
++    }
++  }
++}
++
++// Remote connection timing (part B, instant session loads): connect-start, reuse/spawn and the first request a
++// new descriptor serves, per scope, as `[remote-timing]` lines in desktop.log.
++const remoteFirstRequestPending = new Map<string, { scope: string; startedAt: number }>()
++
++export function noteRemoteConnect(baseUrl: string, scope: string, startedAt: number): void {
++  remoteFirstRequestPending.set(baseUrl, { scope, startedAt })
++}
++
++/** A backend answered `path` after elapsedMs: the answer ledger, the slow-link tracker and the first-request line. */
++export function noteRemoteAnswer(baseUrl: string, path: string, elapsedMs: number, log: (line: string) => void): void {
++  remoteAnswerLedger.recordAnswer(baseUrl)
++  slowLinkTracker.setLog(log)
++  slowLinkTracker.noteAnswer(baseUrl, elapsedMs)
++  const pending = remoteFirstRequestPending.get(baseUrl)
++
++  if (pending) {
++    remoteFirstRequestPending.delete(baseUrl)
++    log(`[remote-timing] ${pending.scope} first-request ${path} served +${Date.now() - pending.startedAt} ms`)
++  }
++}
+diff --git a/apps/desktop/electron/ssh-connection.test.ts b/apps/desktop/electron/ssh-connection.test.ts
+index 9ccec9b66e..e08e7d210f 100644
+--- a/apps/desktop/electron/ssh-connection.test.ts
++++ b/apps/desktop/electron/ssh-connection.test.ts
+@@ -164,6 +164,8 @@ test('baseSshOptions carries the house ControlMaster/BatchMode/accept-new policy
+   assert.match(joined, /ServerAliveInterval=15/)
+   assert.match(joined, /ServerAliveCountMax=3/)
+   assert.match(joined, /TCPKeepAlive=yes/)
++  // [daveey] Tunnel traffic is JSON: compression is what keeps polls inside their timeouts on a slow link.
++  assert.match(joined, /Compression=yes/)
+   assert.ok(!joined.includes('StrictHostKeyChecking=no'), 'never disables host-key checking')
+ })
+ 
+diff --git a/apps/desktop/electron/ssh-connection.ts b/apps/desktop/electron/ssh-connection.ts
+index 2b60caced6..fd6b6a151a 100644
+--- a/apps/desktop/electron/ssh-connection.ts
++++ b/apps/desktop/electron/ssh-connection.ts
+@@ -267,7 +267,11 @@ function baseSshOptions(controlPath, connectTimeoutMs?) {
+     '-o',
+     'ServerAliveCountMax=3',
+     '-o',
+-    'TCPKeepAlive=yes'
++    'TCPKeepAlive=yes',
++    // [daveey] Tunnel traffic is almost all JSON, which compresses several-fold: on a slow link (2026-11-12,
++    // ~60-175 KB/s) that is the difference between a poll fitting its timeout and not. Cheap on a fast one.
++    '-o',
++    'Compression=yes'
+   ]
+ }
+ 
+diff --git a/apps/desktop/electron/transcript-cache-host.ts b/apps/desktop/electron/transcript-cache-host.ts
+index 977da0949b..73a3aa6bc2 100644
+--- a/apps/desktop/electron/transcript-cache-host.ts
++++ b/apps/desktop/electron/transcript-cache-host.ts
+@@ -39,6 +39,8 @@ export interface TranscriptCacheHostDeps {
+   getJson: (descriptor: unknown, requestPath: string, opts: { timeoutMs: number }) => Promise<any>
+   ipcMain: IpcMain
+   log: (line: string) => void
++  /** True while a connection's link is slow: the background prefetch pass skips it (slow-link.ts). */
++  prefetchPaused?: (connectionId: string) => boolean
+   /** Registry snapshot: the primary id ('' connection ids mean it) and every connection id. */
+   registry: () => { connectionIds: string[]; primary: string }
+   /** Tests: start the store worker themselves. The app passes `workerFile` instead. */
+@@ -288,6 +290,7 @@ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+ 
+   const prefetcher = new TranscriptPrefetcher({
+     connectionForGateway,
++    paused: deps.prefetchPaused,
+     fetchLatest: async (key, limit) => {
+       const descriptor = await deps.backendFor(key.connectionId, dialOptions(key.connectionId))
+ 
+diff --git a/apps/desktop/electron/transcript-prefetch.test.ts b/apps/desktop/electron/transcript-prefetch.test.ts
+index 476132890a..d56ece8e2b 100644
+--- a/apps/desktop/electron/transcript-prefetch.test.ts
++++ b/apps/desktop/electron/transcript-prefetch.test.ts
+@@ -101,6 +101,32 @@ describe('prefetch selection', () => {
+   })
+ })
+ 
++describe('[daveey] prefetch pauses for a connection on a slow link', () => {
++  it('skips the paused connection, still fetches the others, and resumes when the pause lifts', async () => {
++    const clock = 1_000_000
++    const store = new TranscriptCacheStore(':memory:', { now: () => clock })
++    const fetchLatest = vi.fn(async (key: TranscriptCacheKey) => [{ content: key.sessionId, id: 1 }])
++    let slow = true
++
++    const prefetcher = new TranscriptPrefetcher({
++      connectionForGateway: gateway => CONNECTIONS[gateway],
++      fetchLatest,
++      listHubSessions: async () => [record('hub', 'a', 1), record('hub', 'b', 2), record('mini', 'c', 3)],
++      now: () => clock,
++      paused: connectionId => slow && connectionId === 'hermes-hub',
++      store
++    })
++
++    expect(await prefetcher.tick()).toMatchObject({ fetched: 1, skipped: 2, targets: 3 })
++    expect(fetchLatest.mock.calls.map(([key]) => key.sessionId)).toEqual(['c'])
++
++    slow = false
++    fetchLatest.mockClear()
++    expect(await prefetcher.tick()).toMatchObject({ fetched: 2 })
++    expect(fetchLatest.mock.calls.map(([key]) => key.sessionId).sort()).toEqual(['a', 'b'])
++  })
++})
++
+ describe('prefetch refresh on activity change', () => {
+   function harness(records: HubSessionRecord[]) {
+     let clock = 1_000_000
+diff --git a/apps/desktop/electron/transcript-prefetch.ts b/apps/desktop/electron/transcript-prefetch.ts
+index 219f7821af..2b29ed9ed0 100644
+--- a/apps/desktop/electron/transcript-prefetch.ts
++++ b/apps/desktop/electron/transcript-prefetch.ts
+@@ -68,6 +68,8 @@ export interface PrefetchDeps {
+   listHubSessions: () => Promise<HubSessionRecord[] | null>
+   log?: (line: string) => void
+   now?: () => number
++  /** [daveey] True while this connection's link is slow (slow-link.ts): bulk prefetch waits, opens still fetch. */
++  paused?: (connectionId: string) => boolean
+   store: PrefetchStore
+ }
+ 
+@@ -467,7 +469,10 @@ export class TranscriptPrefetcher {
+       [...queues].map(async ([connectionId, queue]) => {
+         const worker = async () => {
+           while (queue.length > 0) {
+-            if ((this.downUntil.get(connectionId) ?? 0) > (this.deps.now?.() ?? Date.now())) {
++            if (
++              (this.downUntil.get(connectionId) ?? 0) > (this.deps.now?.() ?? Date.now()) ||
++              this.deps.paused?.(connectionId)
++            ) {
+               result.skipped += queue.length
+               queue.length = 0
+ 
+-- 
+2.51.0
+

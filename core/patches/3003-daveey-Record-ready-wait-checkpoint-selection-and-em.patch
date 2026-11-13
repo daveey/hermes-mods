@@ -1,0 +1,190 @@
+From 633a1cd0f3ec199bf3e0d6da74b1fef528ab34c4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 22:42:10 +0000
+Subject: [PATCH] [daveey] Record ready-wait checkpoint selection and emitter
+ evidence
+
+---
+ hermes_cli/kanban_last_checkpoint.py          | 45 ++++++++++-
+ hermes_cli/kanban_parent_unclaimed.py         |  2 +-
+ .../test_kanban_ready_wait_checkpoint.py      | 81 +++++++++++++++++++
+ 3 files changed, 124 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_last_checkpoint.py b/hermes_cli/kanban_last_checkpoint.py
+index a08f399b6b..b8ea22c1c2 100644
+--- a/hermes_cli/kanban_last_checkpoint.py
++++ b/hermes_cli/kanban_last_checkpoint.py
+@@ -23,23 +23,62 @@ PARK_OUTCOMES = frozenset({"continued", "blocked", "scheduled"})
+ LIMIT = 200
+ 
+ 
+-def fields(conn, task_id: str) -> dict[str, Any]:
++def fields(conn, task_id: str, *, diagnostic: dict[str, Any] | None = None) -> dict[str, Any]:
+     """``{"last_checkpoint", "last_checkpoint_at"}`` when ``task_id``'s latest run (core-update requeues and
+     unused Board grants skipped) ended by parking with a summary; ``{}`` otherwise. Advisory: a failed read
+     drops the fields, never the notice."""
++    diagnostic = {} if diagnostic is None else diagnostic
++    diagnostic["reason"] = "lookup_error"
+     try:
+         from hermes_cli import kanban_db as kb
+         from hermes_cli.kanban_core_update_requeue import latest_run_skipping_requeues
+         run = latest_run_skipping_requeues(conn, task_id)
+-        if run is None or run["outcome"] not in PARK_OUTCOMES or run["ended_at"] is None:
++        if run is None:
++            diagnostic["reason"] = "no_run"
++            return {}
++        diagnostic.update(run_id=run["id"], outcome=run["outcome"], ended_at=run["ended_at"],
++                          run_uid=run["uid"] if "uid" in run.keys() else None)
++        if run["outcome"] not in PARK_OUTCOMES:
++            diagnostic["reason"] = "nonpark"
++            return {}
++        if run["ended_at"] is None:
++            diagnostic["reason"] = "unfinished"
+             return {}
+         text = kb._first_line(run["summary"], LIMIT)
+-        return {"last_checkpoint": text, "last_checkpoint_at": int(kb._to_epoch(run["ended_at"]) or 0)} if text else {}
++        result = {"last_checkpoint": text, "last_checkpoint_at": int(kb._to_epoch(run["ended_at"]) or 0)} if text else {}
++        diagnostic["reason"] = "included" if text else "empty_summary"
++        return result
+     except Exception:  # health: allow BLE001 -- the checkpoint is advisory; the notice must still go out
+         _log.warning("last-checkpoint: lookup failed for %s", task_id, exc_info=True)
+         return {}
+ 
+ 
++def notice_fields(conn, task_id: str) -> dict[str, Any]:
++    """Persist bounded lookup evidence alongside a notice, not a second lookup or another event.
++
++    Boot revision is intentionally unknown for unbootstrapped callers: today's disk HEAD cannot
++    establish what an old process loaded. Run IDs are local; the UID correlates replicated rows.
++    """
++    import os
++    import socket
++    from pathlib import Path
++    from hermes_cli.git_fingerprint import process_boot_fingerprint
++    from hermes_cli.kanban_sync_client import SyncUnavailable, load_identity
++
++    fingerprint = process_boot_fingerprint(Path(__file__).resolve().parents[1])
++    diagnostic: dict[str, Any] = {
++        "emitter_pid": os.getpid(), "emitter_host": socket.gethostname(),
++        "core_revision": fingerprint.rsplit(":", 1)[-1] if fingerprint else None,
++        "emitter_gateway": None,
++    }
++    try:
++        diagnostic["emitter_gateway"] = load_identity().gateway
++    except (SyncUnavailable, OSError, ValueError):
++        pass  # local-only boards have no enrollment; host/PID still identify the emitter
++    result = fields(conn, task_id, diagnostic=diagnostic)
++    return {**result, "checkpoint_diagnostic": diagnostic}
++
++
+ def sentence(payload: Any) -> str:
+     """``Last checkpoint (HH:MMZ): "<text>". Read it before ...; resume or finish what it records. `` (trailing
+     space), or "" when ``payload`` has no ``last_checkpoint``."""
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index 5d85cac43a..ff3ec5e119 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -192,7 +192,7 @@ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_se
+                 "admission": ({"reason": "core_update_hold", "status": "held"} if (extra or {}).get("core_update_hold")
+                               else {"reason": None, "status": "unknown"})}
+     guard = place.get("reason") if place.get("lane") == "respawn_guard" else None
+-    checkpoint = last_checkpoint.fields(conn, waiting_on)  # what the card already did (kanban-3debc730ab) [daveey]
++    checkpoint = last_checkpoint.notice_fields(conn, waiting_on)  # same lookup supplies fields and evidence [daveey]
+     with kb.write_txn(conn):
+         if _already_posted(conn, task_id, waiting_on, wait_key, kind):
+             return False
+diff --git a/tests/hermes_cli/test_kanban_ready_wait_checkpoint.py b/tests/hermes_cli/test_kanban_ready_wait_checkpoint.py
+index d693c9493f..0552aa76d5 100644
+--- a/tests/hermes_cli/test_kanban_ready_wait_checkpoint.py
++++ b/tests/hermes_cli/test_kanban_ready_wait_checkpoint.py
+@@ -117,6 +117,87 @@ def test_card_without_a_prior_run_gets_no_checkpoint(conn, monkeypatch):
+     assert "Last checkpoint" not in (json.loads(kanban_show.show({"task_id": tid})).get("queue_hint") or "")
+ 
+ 
++@pytest.mark.parametrize("kind", [cw.NOTICE_KIND, pu.NOTICE_KIND])
++@pytest.mark.parametrize("state", ["included", "no_run", "nonpark", "unfinished", "empty_summary", "lookup_error"])
++def test_notice_records_selection_and_emitter_without_summary(conn, monkeypatch, kind, state):
++    from hermes_cli import kanban_core_update_requeue as requeue
++    from hermes_cli import git_fingerprint
++    from hermes_cli import kanban_sync_client as sync
++    from types import SimpleNamespace
++    import os
++
++    tid = _continued(conn)
++    run = conn.execute("SELECT * FROM task_runs WHERE task_id=?", (tid,)).fetchone()
++    if state == "no_run":
++        monkeypatch.setattr(requeue, "latest_run_skipping_requeues", lambda *_: None)
++    elif state == "lookup_error":
++        def fail(*_):
++            raise OSError("private detail must not reach event")
++        monkeypatch.setattr(requeue, "latest_run_skipping_requeues", fail)
++    elif state != "included":
++        updates = {"nonpark": ("completed", run["ended_at"], LANDED),
++                   "unfinished": ("continued", None, LANDED),
++                   "empty_summary": ("continued", run["ended_at"], "")}
++        conn.execute("UPDATE task_runs SET outcome=?,ended_at=?,summary=? WHERE id=?", (*updates[state], run["id"]))
++        conn.commit()
++    monkeypatch.setattr(sync, "load_identity", lambda: SimpleNamespace(gateway="emitting-worker"))
++    monkeypatch.setattr(git_fingerprint, "process_boot_fingerprint", lambda _: "git:HEAD:" + "a" * 40)
++    assert pu.post_notice(conn, tid, tid, wait_key="diagnostic", waited_seconds=1900,
++                          ready_seconds=1900, kind=kind)
++    [payload] = _notices(conn, tid, kind)
++    diagnostic = payload["checkpoint_diagnostic"]
++    assert diagnostic["reason"] == state
++    assert diagnostic["emitter_gateway"] == "emitting-worker"
++    assert diagnostic["emitter_pid"] == os.getpid()
++    assert diagnostic["core_revision"] == "a" * 40
++    if state not in {"no_run", "lookup_error"}:
++        assert diagnostic["run_id"] == run["id"]
++        assert diagnostic["outcome"] == ("completed" if state == "nonpark" else "continued")
++        assert diagnostic["ended_at"] == (None if state == "unfinished" else run["ended_at"])
++    assert ("last_checkpoint" in payload) == (state == "included")
++    assert LANDED not in json.dumps(diagnostic)
++    assert "private detail" not in json.dumps(diagnostic)
++    assert not pu.post_notice(conn, tid, tid, wait_key="diagnostic", waited_seconds=1900,
++                              ready_seconds=1900, kind=kind)
++
++
++@pytest.mark.parametrize("guard", [None, "active_pr"])
++def test_sweep_records_checkpoint_before_or_after_guard_observation(conn, monkeypatch, guard):
++    tid = _continued(conn)
++    _subscribe(conn, tid)
++    _age(conn, tid)
++    monkeypatch.setattr(pu, "_place", lambda *_: {
++        "lane": "respawn_guard" if guard else "skipped_ineligible", "reason": guard,
++        "board": "default", "observed_at": int(time.time()),
++    })
++    assert cw.sweep(conn) == 1
++    [payload] = _notices(conn, tid, cw.NOTICE_KIND)
++    assert payload["checkpoint_diagnostic"]["reason"] == "included"
++    assert payload["last_checkpoint"] == LANDED
++    assert payload["respawn_guard"] == guard
++    assert cw.sweep(conn) == 0
++
++
++def test_unknown_boot_and_unenrolled_emitter_still_posts(conn, monkeypatch):
++    from hermes_cli import git_fingerprint
++    from hermes_cli import kanban_sync_client as sync
++    monkeypatch.setattr(git_fingerprint, "process_boot_fingerprint", lambda _: None)
++    def unavailable():
++        raise sync.SyncUnavailable("private path")
++    monkeypatch.setattr(sync, "load_identity", unavailable)
++    tid = _continued(conn)
++    _subscribe(conn, tid)
++    _age(conn, tid)
++    assert cw.sweep(conn) == 1
++    [payload] = _notices(conn, tid, cw.NOTICE_KIND)
++    diagnostic = payload["checkpoint_diagnostic"]
++    assert diagnostic["core_revision"] is None
++    assert diagnostic["emitter_gateway"] is None
++    assert diagnostic["emitter_host"]
++    assert diagnostic["reason"] == "included"
++    assert "private path" not in json.dumps(diagnostic)
++
++
+ @pytest.mark.parametrize("render", [cw.notice_text, pu.notice_text])
+ def test_old_payload_without_the_field_renders_unchanged(render):
+     old = {"parent": "t_old", "parent_title": "old card", "wait_minutes": 40, "ready_minutes": 35,
+-- 
+2.51.0
+

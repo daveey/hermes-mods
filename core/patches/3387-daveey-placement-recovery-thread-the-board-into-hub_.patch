@@ -1,0 +1,203 @@
+From 29f86c3fc87e5af455767cd09e9822e0930487c2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:30:14 +0000
+Subject: [PATCH] [daveey] placement recovery: thread the board into
+ hub_keep_reason; public pickup.card_fields; fail-closed test
+
+Follow-up to PR #2038 review 5888732161 (non-blocking nits):
+- hub_keep_reason no longer hardcodes board "default": available_mode -> recovery_mode -> promotion_mode ->
+  hub_keep_reason pass the reevaluated board (keyword, default "default"; reevaluate still only runs on default).
+- kanban_hub_admission_pickup._fields is now the public card_fields; every caller (claim screen, worker-first
+  selfcheck, placement recovery, mandatory-pin test) uses the new name. No other users, so no alias.
+- Tests: an unreadable row (missing column; card_fields raising KeyError/TypeError/ValueError) keeps the card
+  on the hub with no recover(promote) call; the threaded board reaches card_fields (a non-default board keeps it).
+
+Task: t_01a1d4387504745e
+---
+ hermes_cli/kanban_hub_admission_claim.py      |  2 +-
+ hermes_cli/kanban_hub_admission_pickup.py     |  7 ++--
+ hermes_cli/kanban_placement_recovery.py       | 17 +++++-----
+ hermes_cli/kanban_worker_first_selfcheck.py   |  2 +-
+ tests/hermes_cli/test_kanban_mandatory_pin.py |  4 +--
+ .../test_kanban_placement_recovery.py         | 33 +++++++++++++++++++
+ 6 files changed, 51 insertions(+), 14 deletions(-)
+
+diff --git a/hermes_cli/kanban_hub_admission_claim.py b/hermes_cli/kanban_hub_admission_claim.py
+index 0bde04bb84..91bbf369cc 100644
+--- a/hermes_cli/kanban_hub_admission_claim.py
++++ b/hermes_cli/kanban_hub_admission_claim.py
+@@ -176,7 +176,7 @@ def screen(conn: sqlite3.Connection, *, cfg: Optional[dict] = None, budget: int
+             counts.defer(tid)
+             continue
+         calls += 1
+-        fields = pickup._fields(card, board)
++        fields = pickup.card_fields(card, board)
+         try:
+             found = judge.admit({"title": fields["title"], "body": fields["body"]})
+         except Exception:  # health: allow BLE001 -- a failed judge is unavailable: claimed as before, unjudged
+diff --git a/hermes_cli/kanban_hub_admission_pickup.py b/hermes_cli/kanban_hub_admission_pickup.py
+index 21fa0fa773..023ece9909 100644
+--- a/hermes_cli/kanban_hub_admission_pickup.py
++++ b/hermes_cli/kanban_hub_admission_pickup.py
+@@ -67,7 +67,10 @@ def _labels(raw: Any) -> Optional[list[str]]:
+     return wn._parse(raw)
+ 
+ 
+-def _fields(card: Mapping[str, Any], board: str) -> dict:
++def card_fields(card: Mapping[str, Any], board: str) -> dict:
++    """The admission view of a ``tasks`` row, shared by the claim screen and placement-recovery promotion.
++
++    A non-list ``requires``/``skills`` reads as None; a missing column raises KeyError."""
+     from hermes_cli.kanban_placement import without_placement_note
+ 
+     def _list(raw):
+@@ -147,7 +150,7 @@ def screen(conn: sqlite3.Connection, replica: sqlite3.Connection, own: str, ids:
+                 _log.warning("hub admission: pickup of %s deferred, the board connection is in a transaction", tid)
+             skips[tid] = ("other", UNAVAILABLE)
+             continue
+-        fields = _fields(card, board)
++        fields = card_fields(card, board)
+         try:
+             found = judge.admit({"title": fields["title"], "body": fields["body"]})
+         except Exception:  # health: allow BLE001 -- a failed judge is unavailable: never claimed unjudged
+diff --git a/hermes_cli/kanban_placement_recovery.py b/hermes_cli/kanban_placement_recovery.py
+index 0057a8bf82..a3e3339b8e 100644
+--- a/hermes_cli/kanban_placement_recovery.py
++++ b/hermes_cli/kanban_placement_recovery.py
+@@ -55,7 +55,7 @@ def unavailable_endpoint(hub, board, gateway, error, mode):
+ 
+ def available_mode(conn, row, cfg, hub, board, gateway):
+     # Existing policy cards still renew through reserve while recovery is unavailable.
+-    return recovery_mode(conn, row, cfg) if endpoint_available(hub, board, gateway) else None
++    return recovery_mode(conn, row, cfg, board=board) if endpoint_available(hub, board, gateway) else None
+ 
+ 
+ def request_assignment(hub, board, row, mode, candidates):
+@@ -74,7 +74,7 @@ def unchanged_ready(conn, row):
+         "AND state IN ('pending','rejected') LIMIT 1", (row["id"],)).fetchone()
+ 
+ 
+-def recovery_mode(conn, row, cfg):
++def recovery_mode(conn, row, cfg, *, board="default"):
+     """Propose a stale-pin recovery only from an affirmative registry observation."""
+     from hermes_cli import kanban_worker_node as node
+     from hermes_cli.kanban_worker_placement import requested_move
+@@ -82,7 +82,7 @@ def recovery_mode(conn, row, cfg):
+     if row.get("placement_policy") and requested_move(conn, row["id"]) is not None:
+         return None  # an unapplied owner move takes precedence over automatic recovery
+     if row.get("runs_on") is None:
+-        return promotion_mode(conn, row, cfg) if row.get("placement_policy") is None else None
++        return promotion_mode(conn, row, cfg, board=board) if row.get("placement_policy") is None else None
+     try:
+         labels = node.normalize_runs_on(row["runs_on"])
+     except (TypeError, ValueError):
+@@ -136,7 +136,7 @@ def current_portable(conn, row, cfg):
+         return False
+ 
+ 
+-def promotion_mode(conn, row, cfg):
++def promotion_mode(conn, row, cfg, *, board="default"):
+     """Legacy local routing was not a machine pin; preserve explicit durable intent.
+ 
+     An old policy cleared by an owner repin must never be silently re-enrolled.
+@@ -159,19 +159,20 @@ def promotion_mode(conn, row, cfg):
+         return None
+     if not current_portable(conn, row, cfg):
+         return None
+-    return None if hub_keep_reason(conn, row, cfg) else "promote"
++    return None if hub_keep_reason(conn, row, cfg, board=board) else "promote"
+ 
+ 
+-def hub_keep_reason(conn, row, cfg):
++def hub_keep_reason(conn, row, cfg, *, board="default"):
+     """The hub claim screen's reason to keep this card here (``kanban_hub_admission_claim.keep_reason``: a
+     hub-local wake_check, a hub worktree in the brief, host_repo, ...), or None.
+ 
+     Promotion must not move a card the claim screen would keep: whichever of the two reaches a legacy-routed hub
+     card first decides it, so both read the same rules. An unreadable card keeps it (no promotion).
++    ``board`` is the reevaluated board (only "default" today: ``reevaluate`` returns early for any other).
+     """
+     from hermes_cli.kanban_hub_admission_claim import keep_reason
+-    from hermes_cli.kanban_hub_admission_pickup import _fields
++    from hermes_cli.kanban_hub_admission_pickup import card_fields
+     try:
+-        return keep_reason(conn, row, _fields(row, "default"), cfg)
++        return keep_reason(conn, row, card_fields(row, board), cfg)
+     except (KeyError, TypeError, ValueError):
+         return "card fields unreadable"
+diff --git a/hermes_cli/kanban_worker_first_selfcheck.py b/hermes_cli/kanban_worker_first_selfcheck.py
+index 7741cde2d3..c094ded04d 100644
+--- a/hermes_cli/kanban_worker_first_selfcheck.py
++++ b/hermes_cli/kanban_worker_first_selfcheck.py
+@@ -96,7 +96,7 @@ def denied_target(conn, row, gateway, cfg, *, board, now=None):
+     verdict = pickup.verdict(conn, row["id"])
+     if not verdict or verdict.get("admit") is not False or verdict.get("forced"):
+         return None
+-    fields = pickup._fields(row, board)
++    fields = pickup.card_fields(row, board)
+     if claim.keep_reason(conn, row, fields, cfg):
+         return None
+     waited = (time.time() if now is None else now) - unclaimed.ready_since(conn, row["id"], row["created_at"])
+diff --git a/tests/hermes_cli/test_kanban_mandatory_pin.py b/tests/hermes_cli/test_kanban_mandatory_pin.py
+index 9cf4b858ef..f405a6b2c3 100644
+--- a/tests/hermes_cli/test_kanban_mandatory_pin.py
++++ b/tests/hermes_cli/test_kanban_mandatory_pin.py
+@@ -266,9 +266,9 @@ def test_a_hub_pickup_re_place_keeps_the_label(monkeypatch):
+     card = {"title": "review", "body": "", "assignee": "default", "workspace_kind": "scratch", "requires": "[]",
+             "skills": None, "model_override": "claude-opus-5-5", "provider_override": "anthropic",
+             "model_pin_mandatory": 1}
+-    assert sorted(hap._target(hap._fields(card, BOARD), HUB, CFG, {})) == sorted([POOL, mp.LABEL])
++    assert sorted(hap._target(hap.card_fields(card, BOARD), HUB, CFG, {})) == sorted([POOL, mp.LABEL])
+     plain = {**card, "model_pin_mandatory": None}
+-    assert hap._target(hap._fields(plain, BOARD), HUB, CFG, {}) == [POOL]
++    assert hap._target(hap.card_fields(plain, BOARD), HUB, CFG, {}) == [POOL]
+ 
+ 
+ def _machines(*, attest):
+diff --git a/tests/hermes_cli/test_kanban_placement_recovery.py b/tests/hermes_cli/test_kanban_placement_recovery.py
+index 092d85c312..3f0e0a777d 100644
+--- a/tests/hermes_cli/test_kanban_placement_recovery.py
++++ b/tests/hermes_cli/test_kanban_placement_recovery.py
+@@ -85,6 +85,39 @@ def test_promotion_applies_the_claim_screens_keep_reasons(setup, probe, promoted
+     assert [body["mode"] for _board, body in hub.calls] == (["promote"] if promoted else [])
+ 
+ 
++def test_unreadable_card_fields_keep_the_card_on_the_hub(setup, monkeypatch):
++    """The keep-reason screen fails closed: a row it cannot read (a missing column) is never promoted."""
++    from hermes_cli import kanban_hub_admission_pickup as pickup
++    from hermes_cli import kanban_placement_recovery as recovery
++    conn, hub = setup
++    tid = make(conn)
++    row = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    cfg = placement.config()
++    assert recovery.promotion_mode(conn, row, cfg) == "promote"  # readable: promoted
++    del row["title"]
++    assert recovery.hub_keep_reason(conn, row, cfg) == "card fields unreadable"
++    for error in (KeyError("title"), TypeError("requires"), ValueError("requires")):
++        def unreadable(_card, _board, error=error):
++            raise error
++        monkeypatch.setattr(pickup, "card_fields", unreadable)
++        assert wp.reevaluate(conn, hub, "default", "hub") == 0
++    assert not hub.calls
++
++
++def test_promotion_reads_the_keep_reasons_on_the_reevaluated_board(setup, monkeypatch):
++    from hermes_cli import kanban_hub_admission_pickup as pickup
++    from hermes_cli import kanban_placement_recovery as recovery
++    conn, _hub = setup
++    row = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (make(conn),)).fetchone())
++    seen = []
++    real = pickup.card_fields
++    monkeypatch.setattr(pickup, "card_fields", lambda card, board: seen.append(board) or real(card, board))
++    assert recovery.available_mode(conn, row, placement.config(), object(), "default", "hub") == "promote"
++    # A non-default board is a structural keep reason, so the threaded board is what the screen judged.
++    assert recovery.promotion_mode(conn, row, placement.config(), board="other") is None
++    assert seen == ["default", "other"]
++
++
+ def test_promotion_preserves_explicit_local_intent(setup):
+     conn, hub = setup
+     tid = make(conn)
+-- 
+2.51.0
+

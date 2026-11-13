@@ -1,0 +1,158 @@
+From 4f5683045494b65f39c2531a4a0cb96b37a20786 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 22:05:42 +0000
+Subject: [PATCH] fix(cron): expire the pending guard after a cut rerun is
+ skipped [daveey]
+
+---
+ cron/restart_rerun.py            | 10 ++++++--
+ tests/cron/test_restart_cut.py   | 42 +++++++++++++++++++++++++++++---
+ tests/cron/test_restart_rerun.py | 32 ++++++++++++++++++++++++
+ 3 files changed, 78 insertions(+), 6 deletions(-)
+
+diff --git a/cron/restart_rerun.py b/cron/restart_rerun.py
+index b8652cb512..c292eea683 100644
+--- a/cron/restart_rerun.py
++++ b/cron/restart_rerun.py
+@@ -57,7 +57,7 @@ def _skip_reason(
+         rescheduled_at = _parse(marker.get("at"))
+         # A deferral re-arms a fire that never ran (defer_unadmitted), so it spends no rerun: neither
+         # the attempt a deferral leads to nor a deferred rerun (re-armed, still the rerun) is skipped.
+-        if (not deferred and not marker.get("deferred")
++        if (not deferred and not marker.get("deferred") and not marker.get("settled")
+                 and rescheduled_at is not None and claimed >= rescheduled_at):
+             # Claimed after a reschedule that no real outcome has settled: the rerun itself.
+             return "the interrupted attempt was itself a restart rerun"
+@@ -101,7 +101,8 @@ def _marker(job: dict[str, Any], record: dict[str, Any], now: str, deferred: boo
+     if not deferred:
+         return {"execution_id": record["id"], "at": now}
+     prior = job.get(MARKER_KEY)
+-    if isinstance(prior, dict) and not prior.get("deferred") and _parse(prior.get("at")) is not None:
++    if (isinstance(prior, dict) and not prior.get("deferred") and not prior.get("settled")
++            and _parse(prior.get("at")) is not None):
+         return {"execution_id": record["id"], "at": prior["at"]}
+     return {"execution_id": record["id"], "at": now, "deferred": True}
+ 
+@@ -174,6 +175,11 @@ def reschedule_interrupted(record: dict[str, Any], *, restart_cut: bool = False,
+         now = _hermes_now()
+         reason = _skip_reason(job, record, claimed, now, restart_cut, deferred)
+         if reason is not None:
++            if reason == "the interrupted attempt was itself a restart rerun":
++                # Expire the pending-rerun guard, not the replay guard. Popping it would let a
++                # repeated settlement of this same cut attempt schedule a second rerun.
++                job[MARKER_KEY] = {"execution_id": record["id"], "at": now.isoformat(), "settled": True}
++                save_jobs(jobs)
+             logger.info("cron: not rescheduling %s (execution %s) after restart interruption: %s",
+                         job_id, record["id"], reason)
+             return False
+diff --git a/tests/cron/test_restart_cut.py b/tests/cron/test_restart_cut.py
+index f1d59dcf0e..70fd933660 100644
+--- a/tests/cron/test_restart_cut.py
++++ b/tests/cron/test_restart_cut.py
+@@ -95,7 +95,12 @@ def test_rerun_cut_again_is_not_rerun_a_second_time(home, monkeypatch):
+     assert isinstance(rerun, dict)
+     assert scheduler.run_one_job(rerun) is True
+     saved = jobs.get_job(job["id"])
+-    assert saved["restart_rerun"]["execution_id"] == first["execution_id"]
++    assert saved["restart_rerun"]["execution_id"] == rerun["execution_id"]
++    assert saved["restart_rerun"]["settled"] is True
++    from cron.restart_rerun import reschedule_interrupted
++
++    assert not reschedule_interrupted(executions.get_execution(rerun["execution_id"]), restart_cut=True)
++    assert jobs.get_job(job["id"]) == saved
+     assert not _due(job["id"]), "a rerun cut again waits for its schedule"
+     assert int(saved.get("failure_streak") or 0) == 0
+ 
+@@ -393,14 +398,43 @@ def test_rerun_after_a_deferral_cut_again_is_not_rerun(home, monkeypatch, owner_
+     waits for the schedule."""
+     job = jobs.create_job(prompt="probe", schedule=FAR_FUTURE, name="probe", deliver="local")
+     _defer_while_draining(job["id"], monkeypatch, owner_ops)
+-    first_cut = _cut_next_attempt(job["id"], monkeypatch)
+-    assert _due(job["id"])
+     _cut_next_attempt(job["id"], monkeypatch)
++    assert _due(job["id"])
++    rerun_cut = _cut_next_attempt(job["id"], monkeypatch)
+     saved = jobs.get_job(job["id"])
+-    assert saved["restart_rerun"]["execution_id"] == first_cut
++    assert saved["restart_rerun"]["execution_id"] == rerun_cut
++    assert saved["restart_rerun"]["settled"] is True
+     assert not _due(job["id"]), "a rerun cut again waits for its schedule"
+ 
+ 
++def test_later_natural_fire_deferred_after_a_skipped_rerun_gets_its_own_rerun(
++        home, monkeypatch, owner_ops):
++    from datetime import datetime, timedelta
++
++    clock = [datetime.fromisoformat("2026-10-28T09:00:00-07:00")]
++    monkeypatch.setattr(jobs, "_hermes_now", lambda: clock[0])
++    monkeypatch.setattr(executions, "_hermes_now", lambda: clock[0])
++    job = jobs.create_job(prompt="probe", schedule="every 60m", name="probe", deliver="local")
++    real_run_job = scheduler.run_job
++    clock[0] += timedelta(minutes=61)
++    _cut_next_attempt(job["id"], monkeypatch)
++    clock[0] += timedelta(minutes=1)
++    _cut_next_attempt(job["id"], monkeypatch)
++    assert not _due(job["id"])
++
++    clock[0] = datetime.fromisoformat(jobs.get_job(job["id"])["next_run_at"])
++    assert _due(job["id"])
++    monkeypatch.setattr(scheduler, "run_job", real_run_job)
++    _defer_while_draining(job["id"], monkeypatch, owner_ops)
++    cut = _cut_next_attempt(job["id"], monkeypatch)
++    assert _due(job["id"]), "the later natural fire has not spent its restart rerun"
++    saved = jobs.get_job(job["id"])
++    assert saved["restart_rerun"]["execution_id"] == cut
++    assert not saved["restart_rerun"].get("settled")
++    _cut_next_attempt(job["id"], monkeypatch)
++    assert not _due(job["id"]), "the later fire also gets only one rerun"
++
++
+ def test_deferring_a_pending_rerun_keeps_it_a_rerun(home, monkeypatch, owner_ops):
+     """A rerun refused while draining is deferred, but stays the rerun: cut again, it is not rerun."""
+     job = jobs.create_job(prompt="probe", schedule=FAR_FUTURE, name="probe", deliver="local")
+diff --git a/tests/cron/test_restart_rerun.py b/tests/cron/test_restart_rerun.py
+index 83b4b55d3d..810ba6112a 100644
+--- a/tests/cron/test_restart_rerun.py
++++ b/tests/cron/test_restart_rerun.py
+@@ -126,6 +126,38 @@ def test_rerun_cut_off_again_is_not_rescheduled(clock, monkeypatch, caplog):
+     assert _due_ids() == []
+ 
+ 
++@pytest.mark.parametrize("settled", [False, True])
++def test_deferral_inherits_only_a_pending_rerun_marker(settled):
++    from cron.restart_rerun import _marker
++
++    old = "2026-10-28T09:00:00-07:00"
++    now = "2026-10-28T10:00:00-07:00"
++    job = {"restart_rerun": {"execution_id": "old", "at": old, "settled": settled}}
++    marker = _marker(job, {"id": "deferred"}, now, deferred=True)
++    assert marker == ({"execution_id": "deferred", "at": now, "deferred": True} if settled
++                      else {"execution_id": "deferred", "at": old})
++
++
++def test_skipped_rerun_expires_guard_but_still_rejects_replay(clock, monkeypatch):
++    from cron.restart_rerun import reschedule_interrupted
++
++    job = create_job("crashy", "every 60m", name="crashy")
++    clock["now"] += timedelta(minutes=61)
++    _start(job["id"])
++    assert _restart(monkeypatch) == 1
++    clock["now"] += timedelta(minutes=1)
++    _claimed, rerun = _start(job["id"])
++    assert _restart(monkeypatch) == 1
++    saved = get_job(job["id"])
++    assert not reschedule_interrupted(rerun)
++    assert get_job(job["id"]) == saved
++
++    clock["now"] = datetime.fromisoformat(saved["next_run_at"])
++    _start(job["id"])
++    assert _restart(monkeypatch) == 1
++    assert _due_ids() == [job["id"]], "a later natural execution gets its own rerun"
++
++
+ def test_paused_deleted_or_edited_jobs_do_not_rerun(clock, monkeypatch, caplog):
+     paused = create_job("a", "every 60m", name="paused")
+     deleted = create_job("b", "every 60m", name="deleted")
+-- 
+2.51.0
+

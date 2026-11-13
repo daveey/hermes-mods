@@ -1,0 +1,187 @@
+From bb3036bfbdc2c9e08447486f69808d184b17a45a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:01:53 +0000
+Subject: [PATCH] [daveey] placement recovery: promotion applies the hub claim
+ screen's keep reasons
+
+A real Board serves recover(mode=promote). When a sync round's reevaluate reached a
+legacy-routed hub card before the claim screen, it promoted cards the screen would keep
+on the hub (a hub-local wake_check, a hub worktree in the brief, host_repo). promotion_mode
+now asks kanban_hub_admission_claim.keep_reason before proposing promote; an unreadable card
+is kept.
+
+Tests: the fake Board can serve recover (FakeService(recover=True), else 404 like a Board
+without the route); the hub-admission fixture serves it. A hub card with a hub-local
+wake_check stays on the hub after a sync round + dispatch tick (RED on main: promoted);
+a portable card is still promoted; unit coverage in test_kanban_placement_recovery.py.
+
+Task: t_01a1d4125c1130dc
+---
+ hermes_cli/kanban_placement_recovery.py       | 19 ++++++++++-
+ tests/hermes_cli/kanban_sync_fake_board.py    | 30 +++++++++++++++-
+ .../test_kanban_hub_admission_claim.py        | 34 +++++++++++++++++++
+ .../test_kanban_hub_admission_pickup.py       |  2 +-
+ .../test_kanban_placement_recovery.py         | 14 ++++++++
+ 5 files changed, 96 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_placement_recovery.py b/hermes_cli/kanban_placement_recovery.py
+index e998146d48..0057a8bf82 100644
+--- a/hermes_cli/kanban_placement_recovery.py
++++ b/hermes_cli/kanban_placement_recovery.py
+@@ -157,4 +157,21 @@ def promotion_mode(conn, row, cfg):
+     if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind IN "
+                     "('moved','placement_repinned') LIMIT 1", (row["id"],)).fetchone():
+         return None
+-    return "promote" if current_portable(conn, row, cfg) else None
++    if not current_portable(conn, row, cfg):
++        return None
++    return None if hub_keep_reason(conn, row, cfg) else "promote"
++
++
++def hub_keep_reason(conn, row, cfg):
++    """The hub claim screen's reason to keep this card here (``kanban_hub_admission_claim.keep_reason``: a
++    hub-local wake_check, a hub worktree in the brief, host_repo, ...), or None.
++
++    Promotion must not move a card the claim screen would keep: whichever of the two reaches a legacy-routed hub
++    card first decides it, so both read the same rules. An unreadable card keeps it (no promotion).
++    """
++    from hermes_cli.kanban_hub_admission_claim import keep_reason
++    from hermes_cli.kanban_hub_admission_pickup import _fields
++    try:
++        return keep_reason(conn, row, _fields(row, "default"), cfg)
++    except (KeyError, TypeError, ValueError):
++        return "card fields unreadable"
+diff --git a/tests/hermes_cli/kanban_sync_fake_board.py b/tests/hermes_cli/kanban_sync_fake_board.py
+index 790e327f24..eafd2ce755 100644
+--- a/tests/hermes_cli/kanban_sync_fake_board.py
++++ b/tests/hermes_cli/kanban_sync_fake_board.py
+@@ -60,7 +60,9 @@ def _js_stringify(value: object) -> str:
+ 
+ 
+ class FakeService:
+-    def __init__(self, *, lease_runs: bool = False, machines: Optional[dict] = None) -> None:
++    def __init__(self, *, lease_runs: bool = False, machines: Optional[dict] = None, recover: bool = False) -> None:
++        # Serve ``FakeHub.recover`` (placement recovery assigns the card); off = a Board without the route (404).
++        self.recover = recover
+         self.boards: dict[str, dict[str, Any]] = {}
+         self.calls: list[tuple[str, str, Any]] = []
+         self.offline = False
+@@ -280,6 +282,32 @@ class FakeHub:
+         if self.svc.offline:
+             raise OSError("hub unreachable")
+ 
++    def recover(self, board: str, *, task_id: str, expected_revision: int, mode: str, candidates: list) -> dict:
++        """``POST /placement/recover`` (worker/src/board.ts): off by default, answered like a Board without the
++        route (404, so the origin backs off recovery). With ``FakeService(recover=True)`` it assigns the card at
++        ``expected_revision`` to the first candidate: ``promote`` sets ``runs_on=[machine:<it>]`` and the worker
++        placement policy, ``stale_pin`` swaps the machine label; both write a ``moved`` event the feed carries."""
++        self._check()
++        if not self.svc.recover:
++            raise ksc.HubError(404, "not found")
++        from hermes_cli.kanban_worker_placement import POLICY
++        self.svc.calls.append(("recover", board, {"task_id": task_id, "mode": mode, "candidates": candidates}))
++        b = self.svc.board(board)
++        row = b["rows"].get("tasks", {}).get(task_id)
++        if row is None or row["version"] != expected_revision or not candidates:
++            raise ksc.HubError(409, json.dumps({"error": "not_claimable"}))
++        old = json.loads(row["runs_on"]) if isinstance(row.get("runs_on"), str) else (row.get("runs_on") or [])
++        labels = [f"machine:{candidates[0]}"] + ([x for x in old if not x.startswith("machine:")]
++                                                 if mode == "stale_pin" else [])
++        hlc = f"{9_999_999_999_997:013d}-0000-board"
++        updated = self.svc._put(b, "tasks", task_id, {"runs_on": json.dumps(labels), "placement_policy": (
++            POLICY if mode == "promote" else row.get("placement_policy"))}, "board", None, hlc)
++        self.svc._put(b, "task_events", f"recover-{task_id}-{updated['version']}", {
++            "task_id": task_id, "kind": "moved", "created_at": int(time.time()),
++            "payload": json.dumps({"repinned": True, "runs_on": labels, "reason": "recovery:" + mode})},
++            "board", None, hlc)
++        return {"state": "assigned", "machine": candidates[0], "task_version": updated["version"]}
++
+     def ops(self, board: str, ops: list[dict]) -> dict:
+         self._check()
+         self.svc.calls.append(("ops", board, ops))
+diff --git a/tests/hermes_cli/test_kanban_hub_admission_claim.py b/tests/hermes_cli/test_kanban_hub_admission_claim.py
+index 0ceb9fd0a2..82af4370be 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission_claim.py
++++ b/tests/hermes_cli/test_kanban_hub_admission_claim.py
+@@ -121,6 +121,40 @@ def test_a_denied_card_that_must_stay_is_claimed_and_kept_recorded(gws, hub_judg
+     assert _events(hub.conn, tid, "moved") == []
+ 
+ 
++def _recovered(svc, tid):
++    return [body for kind, _board, body in svc.calls if kind == "recover" and body["task_id"] == tid]
++
++
++@pytest.mark.parametrize("admit", [False, True])
++def test_promotion_keeps_a_card_with_a_hub_local_wake_check_on_the_hub(gws, hub_judge, admit):
++    """The Board serves recover(mode=promote): the sync round's reevaluate reaches the legacy-routed card before
++    the claim screen does, and must apply the screen's keep reasons (t_01a1d4125c1130dc)."""
++    hub, _worker, svc = gws
++    hub_judge.admit_next = admit
++    tid = _hub_card(hub)
++    with kb.write_txn(hub.conn):
++        kb._append_event(hub.conn, tid, "scheduled", {"wake_check": "test -f ~/.hermes/cache/ready.flag"})
++    hub.round()  # push: the Board acks the hub-created card
++    _tick(hub)  # the feed echo stamps created_on, so this round's reevaluate sees it; then the claim screen
++    assert _recovered(svc, tid) == [] and _events(hub.conn, tid, "moved") == []
++    assert _holder(svc, tid) == HUB
++    [verdict] = _events(hub.conn, tid, "hub_admission")
++    assert verdict["admit"] is admit and verdict.get("kept") == (None if admit else "wake_check reads a hub-local path")
++
++
++def test_promotion_still_moves_a_portable_hub_card_to_the_pool(gws, hub_judge):
++    hub, _worker, svc = gws
++    tid = _hub_card(hub)
++    hub.round()
++    hub.round()  # the echo stamps created_on; reevaluate promotes, and the feed carries the Board's placement
++    assert [b["mode"] for b in _recovered(svc, tid)] == ["promote"]
++    assert json.loads(svc.board(BOARD)["rows"]["tasks"][tid]["runs_on"]) == [f"machine:{WORKER}"]
++    hub.tick()
++    assert json.loads(hub.conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0]) == [
++        f"machine:{WORKER}"]  # the round's feed pull applied the Board's placement
++    assert _holder(svc, tid) != HUB and hub_judge.calls == []  # labelled: never screened, never claimed here
++
++
+ @pytest.mark.parametrize("probe", ["git -C ~/code/hermes merge-base --is-ancestor abc HEAD",
+                                    "gh api repos/o/r/tags --jq '.[].name' | grep -q v2"])
+ def test_a_portable_wake_check_does_not_keep_a_denied_card(gws, hub_judge, probe):
+diff --git a/tests/hermes_cli/test_kanban_hub_admission_pickup.py b/tests/hermes_cli/test_kanban_hub_admission_pickup.py
+index d6041a1333..649d1b4854 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission_pickup.py
++++ b/tests/hermes_cli/test_kanban_hub_admission_pickup.py
+@@ -39,7 +39,7 @@ CFG = {"worker_queue": {HUB: POOL}, "worker_pools": {HUB: [WORKER]}}
+ 
+ @pytest.fixture
+ def gws(tmp_path, monkeypatch):
+-    svc = FakeService(lease_runs=True, machines=MACHINES)
++    svc = FakeService(lease_runs=True, machines=MACHINES, recover=True)  # a real Board serves recovery
+     monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
+     monkeypatch.setattr(kp, "config", lambda: CFG)
+     sync.consume_dispatcher_wake()
+diff --git a/tests/hermes_cli/test_kanban_placement_recovery.py b/tests/hermes_cli/test_kanban_placement_recovery.py
+index aaf000461e..092d85c312 100644
+--- a/tests/hermes_cli/test_kanban_placement_recovery.py
++++ b/tests/hermes_cli/test_kanban_placement_recovery.py
+@@ -71,6 +71,20 @@ def test_promotion_does_not_trust_creation_portability(setup):
+     assert kb.get_task(conn, tid).requires == ["host_repo"]
+ 
+ 
++@pytest.mark.parametrize("probe, promoted", [
++    ("test -f ~/.hermes/cache/ready.flag", False),  # hub-local: the claim screen keeps it, so promotion must too
++    ("git -C ~/code/_wt/fix merge-base --is-ancestor abc HEAD", False),
++    ("gh pr view 1 --json state", True),
++])
++def test_promotion_applies_the_claim_screens_keep_reasons(setup, probe, promoted):
++    conn, hub = setup
++    tid = make(conn)
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, "scheduled", {"wake_check": probe})
++    assert wp.reevaluate(conn, hub, "default", "hub") == int(promoted)
++    assert [body["mode"] for _board, body in hub.calls] == (["promote"] if promoted else [])
++
++
+ def test_promotion_preserves_explicit_local_intent(setup):
+     conn, hub = setup
+     tid = make(conn)
+-- 
+2.51.0
+

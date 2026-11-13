@@ -1,0 +1,1042 @@
+From 53638e3f239a203fcb4b4bdafee07b3290e0e031 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 04:38:02 +0000
+Subject: [PATCH] fix(desktop): a dead runtime's prompt no longer keeps a chat
+ red; every red row reports why [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+selfheal desktop-54ae373894 (t_01a1d3142a47913f). Session 20261111_060430_751449 sat with a red `stuck`
+stripe at 06:54 with no blocked card, no review wait and a `done` outcome, and its agent, asked "why are you
+red", blamed a scheduled card.
+
+Problem: red stripe on a finished chat with no open question or blocked card.
+Why 1: the dot was `needs-input` — $attentionSessionIds still held the stored session.
+Why 2: runtime 66877047 kept `needsInput` from a clarify (06:15:34) open when the hub backend died (06:32:02,
+  turn interrupted); startup resume auto-continued the session on a NEW runtime c442506d whose turn finished.
+Why 3: nothing retires a prompt on a runtime the backend replaced: reconnect keeps `needsInput` on purpose
+  (same-backend blip), only the active gateway's active_list poll reaps vanished runtimes, and evictable()
+  keeps needsInput states. Reproduced: session-states-stale-prompt.test.ts, 3 of 8 cases fail on the base.
+Root (happened): no rule that a turn on runtime R of stored session S proves S's other, non-busy prompt
+  runtimes dead.
+Root (not caught): the red verdict lived only in the renderer; desktop.log skipped first sightings and named
+  no inputs, and no tool showed the agent its own stripe's reasons, so it guessed.
+
+Countermeasures:
+- symptom/root: publishSessionState retires the prompt of every other non-busy runtime of the same stored
+  session once one runtime runs a turn (busy/turnLive) — session-states-superseded-prompts.ts.
+- detection: stuckReasons() names each red input (needs-input:prompt runtime=<ids> | paused-queue | unknown,
+  stalled, kanban-blocked:<n> on=<cards> held= asks=, review:<pr>, outcome:decision). Every red edge (first
+  sighting, cause change, way out) goes into the stripe-transition log line and is POSTed to the session's
+  own gateway (POST /api/sessions/{id}/stripe-report), which logs it and keeps it in
+  <home>/logs/desktop-stripe.jsonl (2 MiB, one rotation). `hermes sessions outcome <id>` (and --json
+  `desktop_stripe`) prints the latest report for the chat's lineage.
+
+Proof: vitest src/store/session-states-stale-prompt.test.ts red on base (3 failed), green after; 70 desktop
+store/sidebar/outcome files (890 tests) pass; tsc -p . clean; pytest test_session_outcome_surfaces.py +
+test_serve_handler_ledger.py pass.
+---
+ apps/desktop/src/api/sessions.ts              |  23 +++
+ .../app/chat/sidebar/session-row-stripe.tsx   |  16 +-
+ .../src/store/session-dot-state.test.ts       |  93 ++++++++++++
+ apps/desktop/src/store/session-dot-state.ts   | 138 +++++++++++++++++-
+ .../src/store/session-states-live-turn.ts     |  37 +++++
+ .../store/session-states-stale-prompt.test.ts | 117 +++++++++++++++
+ .../session-states-superseded-prompts.ts      |  32 ++++
+ apps/desktop/src/store/session-states.ts      |  50 ++-----
+ hermes_cli/desktop_stripe_report.py           | 111 ++++++++++++++
+ hermes_cli/sessions_cmd_outcome.py            |  24 ++-
+ hermes_cli/web_models.py                      |   8 +
+ hermes_cli/web_routers/sessions.py            |  16 +-
+ tests/hermes_cli/serve_handler_ledger.json    |   3 +-
+ .../test_session_outcome_surfaces.py          |  53 +++++++
+ 14 files changed, 674 insertions(+), 47 deletions(-)
+ create mode 100644 apps/desktop/src/store/session-states-live-turn.ts
+ create mode 100644 apps/desktop/src/store/session-states-stale-prompt.test.ts
+ create mode 100644 apps/desktop/src/store/session-states-superseded-prompts.ts
+ create mode 100644 hermes_cli/desktop_stripe_report.py
+
+diff --git a/apps/desktop/src/api/sessions.ts b/apps/desktop/src/api/sessions.ts
+index dd5c65fbc9..737e0196f5 100644
+--- a/apps/desktop/src/api/sessions.ts
++++ b/apps/desktop/src/api/sessions.ts
+@@ -472,6 +472,29 @@ export function setSessionMutedRemote(
+   })
+ }
+ 
++/** [daveey] Tell the row's own gateway why the sidebar painted it (red `stuck` reasons), so an agent asked "why are
++ *  you red" reads the real inputs (`hermes sessions outcome <id>`) instead of guessing. Fire-and-forget: an older
++ *  backend without the route 404s and the caller drops it. */
++export function reportSessionStripeRemote(
++  row: Pick<SessionInfo, 'connection_id' | 'id' | 'profile'>,
++  stripe: null | string,
++  previous: null | string,
++  reasons: readonly string[]
++): Promise<{ ok: boolean }> {
++  const owner = sessionWriteProfile(row.profile)
++
++  const scope: ProfileScope = row.connection_id
++    ? { connectionId: row.connection_id, profile: owner ?? 'default' }
++    : owner
++
++  return hermesApi<{ ok: boolean }>({
++    ...sessionScoped(scope),
++    path: `/api/sessions/${encodeURIComponent(row.id)}/stripe-report`,
++    method: 'POST',
++    body: { previous, reasons: [...reasons], stripe, ...(owner ? { profile: owner } : {}) }
++  })
++}
++
+ // Full-text search over one profile's sessions. Pass the profile the caller is
+ // showing: an unscoped request lands on the primary backend, which searches
+ // its launch profile's state.db whatever profile the sidebar is on. `null`
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx b/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx
+index ba78c62267..d7c3357087 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx
+@@ -3,7 +3,7 @@ import { useEffect } from 'react'
+ 
+ import { Codicon } from '@/components/ui/codicon'
+ import { Tip } from '@/components/ui/tooltip'
+-import type { SessionInfo } from '@/hermes'
++import { reportSessionStripeRemote, type SessionInfo } from '@/hermes'
+ import { useI18n } from '@/i18n'
+ import { outcomeHasCrons, outcomeStripe, outcomeTooltip } from '@/lib/session-outcome'
+ import { sessionStatusStripeColor } from '@/lib/session-status-stripe'
+@@ -14,15 +14,25 @@ import { stuckOnPausedQueue } from '@/store/owner-queue-landed'
+ import { $pausedQueueSessionIds } from '@/store/owner-queue-reconcile'
+ import { $sessions } from '@/store/session'
+ import {
+-
+   kanbanStripeCounts,
+   outcomePaintsStripe,
+   recordStripeTransition,
+   type SessionDotState,
+   sessionStatusStripe,
+-  type SessionStatusStripe
++  type SessionStatusStripe,
++  setStripeReasonReporter
+ } from '@/store/session-dot-state'
+ 
++// [daveey] Every red edge (with its reasons) also goes to the session's own gateway, where the agent can read it.
++setStripeReasonReporter((row, stripe, previous, reasons) =>
++  reportSessionStripeRemote(
++    { connection_id: row.connection_id, id: row.id, profile: row.profile },
++    stripe,
++    previous,
++    reasons
++  )
++)
++
+ /**
+  * [daveey] The sidebar row's left stripe: the session's status. Green = its turn is done and waiting on you (stays
+  * after you open it); red = not done but stuck (blocked on a prompt, gone quiet mid-turn, kanban cards it made are
+diff --git a/apps/desktop/src/store/session-dot-state.test.ts b/apps/desktop/src/store/session-dot-state.test.ts
+index 4051caab1f..63b274607a 100644
+--- a/apps/desktop/src/store/session-dot-state.test.ts
++++ b/apps/desktop/src/store/session-dot-state.test.ts
+@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import { createClientSessionState } from '@/lib/chat-runtime'
+ import type { SessionInfo } from '@/types/hermes'
+ 
++import { $queuedPromptsBySession } from './composer-queue'
+ import { $kanbanObservationTick } from './kanban-observation'
+ import {
+   $cronSessions,
+@@ -31,8 +32,10 @@ import {
+   recordStripeTransition,
+   resetStripeTransitionLog,
+   sessionStatusStripe,
++  setStripeReasonReporter,
+   showsRunningArc,
+   STRIPE_TRANSITION_LOG_CAP_PER_MIN,
++  stuckReasons,
+   takeSessionListRefreshReason,
+   unreadSessionCount,
+   withoutBackgroundProcess,
+@@ -919,3 +922,93 @@ describe('recordStripeTransition', () => {
+     expect(String(logLine.mock.lastCall?.[0])).toContain('suppressed=4')
+   })
+ })
++
++// [daveey] selfheal desktop-54ae373894 (t_01a1d3142a47913f): a chat sat red with no blocked card and no visible
++// question, and its agent, asked "why are you red", guessed wrong. Every red verdict now carries its inputs.
++describe('stuckReasons and the red report', () => {
++  const report = vi.fn()
++  const logLine = vi.fn()
++  let previousBridge: unknown
++  const row = { connection_id: 'hub-ec2', id: 'red-chat', profile: 'default' }
++
++  beforeEach(() => {
++    resetStripeTransitionLog()
++    report.mockReset()
++    logLine.mockReset()
++    setStripeReasonReporter(report)
++    previousBridge = (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
++    ;(window as unknown as { hermesDesktop?: unknown }).hermesDesktop = { logLine }
++  })
++
++  afterEach(() => {
++    setStripeReasonReporter(null)
++    ;(window as unknown as { hermesDesktop?: unknown }).hermesDesktop = previousBridge
++    clearAllSessionStates()
++    $queuedPromptsBySession.set({})
++    setSessions([])
++    resetStripeTransitionLog()
++  })
++
++  it('names the runtime holding the prompt, a paused queue, or says unknown', () => {
++    publishSessionState('rt-dead', { ...createClientSessionState('red-chat'), needsInput: true })
++    publishSessionState('rt-other', { ...createClientSessionState('other-chat'), needsInput: true })
++    expect(stuckReasons(row, 'needs-input')).toEqual(['needs-input:prompt runtime=rt-dead'])
++
++    $queuedPromptsBySession.set({ 'red-chat': [{ attachments: [], id: 'q1', serverStatus: 'unknown', text: 'hi' }] } as never)
++    expect(stuckReasons(row, 'needs-input')).toEqual(['needs-input:prompt runtime=rt-dead', 'needs-input:paused-queue'])
++
++    clearAllSessionStates()
++    $queuedPromptsBySession.set({})
++    expect(stuckReasons(row, 'needs-input')).toEqual(['needs-input:unknown'])
++  })
++
++  it('names a quiet turn, blocked cards with their ids, a review wait and a decision outcome', () => {
++    expect(stuckReasons(row, 'stalled')).toEqual(['stalled'])
++    expect(
++      stuckReasons({ ...row, kanban_blocked: 1, kanban_blocked_on: ['default/t_a'], kanban_held: 2 }, 'background')
++    ).toEqual(['kanban-blocked:3 on=default/t_a held=2'])
++    expect(stuckReasons({ ...row, review_wait: 'stuck', review_wait_pr: 'o/r#9' }, 'idle')).toEqual(['review:o/r#9'])
++    expect(stuckReasons({ ...row, review_wait: 'stuck' }, 'idle')).toEqual(['review:?'])
++    expect(stuckReasons({ ...row, outcome: { kind: 'decision' } } as never, 'idle')).toEqual(['outcome:decision'])
++    // A working turn beats cards, reviews and the stored outcome, exactly as sessionStatusStripe does.
++    expect(
++      stuckReasons({ ...row, kanban_blocked: 1, outcome: { kind: 'decision' }, review_wait: 'stuck' } as never, 'working')
++    ).toEqual([])
++    expect(stuckReasons({ ...row, review_wait: 'parked', outcome: { kind: 'done' } } as never, 'idle')).toEqual([])
++  })
++
++  it('reports a red first sighting, each new red cause, and the way out; logs the reasons', () => {
++    publishSessionState('rt-dead', { ...createClientSessionState('red-chat'), needsInput: true })
++
++    recordStripeTransition(row, 'stuck', 'needs-input', 1_000)
++    expect(report).toHaveBeenCalledTimes(1)
++    expect(report.mock.calls[0].slice(1)).toEqual(['stuck', null, ['needs-input:prompt runtime=rt-dead']])
++    expect(logLine).not.toHaveBeenCalled() // first sightings stay out of the log, as before
++
++    recordStripeTransition(row, 'stuck', 'needs-input', 1_500) // same cause: nothing
++    expect(report).toHaveBeenCalledTimes(1)
++
++    recordStripeTransition({ ...row, kanban_blocked: 1, kanban_blocked_on: ['t_b'] }, 'stuck', 'background', 2_000)
++    expect(report).toHaveBeenCalledTimes(2)
++    expect(report.mock.calls[1].slice(1)).toEqual(['stuck', 'stuck', ['kanban-blocked:1 on=t_b']])
++    expect(String(logLine.mock.lastCall?.[0])).toContain('stuck->stuck')
++    expect(String(logLine.mock.lastCall?.[0])).toContain('stuck=[kanban-blocked:1_on=t_b]')
++
++    recordStripeTransition(row, 'done', 'idle', 3_000)
++    expect(report.mock.calls[2].slice(1)).toEqual(['done', 'stuck', []])
++
++    recordStripeTransition(row, 'waiting', 'background', 4_000) // not red on either side: log only
++    expect(report).toHaveBeenCalledTimes(3)
++    expect(logLine).toHaveBeenCalledTimes(3)
++  })
++
++  it('never reports an offline-cached row and survives a throwing reporter', () => {
++    recordStripeTransition({ ...row, offline_cached: true }, 'stuck', 'stalled', 1_000)
++    expect(report).not.toHaveBeenCalled()
++
++    setStripeReasonReporter(() => {
++      throw new Error('boom')
++    })
++    expect(() => recordStripeTransition({ ...row, id: 'x' }, 'stuck', 'stalled', 1_000)).not.toThrow()
++  })
++})
+diff --git a/apps/desktop/src/store/session-dot-state.ts b/apps/desktop/src/store/session-dot-state.ts
+index 8274d5c3ca..862b5385fe 100644
+--- a/apps/desktop/src/store/session-dot-state.ts
++++ b/apps/desktop/src/store/session-dot-state.ts
+@@ -690,6 +690,8 @@ const STRIPE_TRANSITION_WINDOW_MS = 60_000
+ 
+ interface StripeTraceEntry {
+   stripe: null | SessionStatusStripe
++  /** The red reasons last logged (`stuckReasons` joined); empty unless `stuck`. */
++  reasonsKey: string
+   emitted: number[]
+   suppressed: number
+ }
+@@ -710,9 +712,11 @@ export type StripeTraceRow = Pick<SessionInfo, 'id'> &
+       | 'background_active'
+       | 'connection_id'
+       | 'cron_active'
++      | 'execution_observations'
+       | 'goal_active'
+       | 'kanban_active'
+       | 'kanban_blocked'
++      | 'kanban_blocked_on'
+       | 'kanban_held'
+       | 'kanban_observed_at'
+       | 'kanban_parked'
+@@ -723,6 +727,8 @@ export type StripeTraceRow = Pick<SessionInfo, 'id'> &
+       | 'outcome'
+       | 'offline_synced_at'
+       | 'profile'
++      | 'review_wait'
++      | 'review_wait_pr'
+     >
+   >
+ 
+@@ -744,13 +750,119 @@ function rowListSource(row: StripeTraceRow): string {
+   return row.offline_synced_at !== undefined ? 'fallback' : 'project-tree'
+ }
+ 
++/** [daveey] WHY a row's stripe is red (`stuck`), one entry per input that holds, in the same terms as
++ *  `sessionStatusStripe`: `needs-input:prompt runtime=<ids>` (a blocking prompt on those runtimes),
++ *  `needs-input:paused-queue`, `stalled` (a quiet turn), `kanban-blocked:<n> on=<cards>` (+ `held=` / `asks=`),
++ *  `review:<pr>`, `outcome:decision`. Agents could not see the renderer-only half of this and guessed
++ *  (selfheal desktop-54ae373894), so every red edge is logged and reported to the session's gateway with it. */
++export function stuckReasons(
++  row: StripeTraceRow,
++  dotState: SessionDotState,
++  nowSeconds: number = Date.now() / 1000
++): string[] {
++  const reasons: string[] = []
++
++  if (dotState === 'needs-input') {
++    const aliases = new Set(lineageAliases(row.id, $sessions.get()))
++    aliases.add(row.id)
++
++    const runtimes = Object.entries($sessionStates.get())
++      .filter(([runtimeId, s]) => s?.needsInput && aliases.has(s.storedSessionId ?? runtimeId))
++      .map(([runtimeId]) => runtimeId)
++
++    const paused = $pausedQueueSessionIds.get().some(id => aliases.has(id))
++
++    if (runtimes.length > 0) {
++      reasons.push(`needs-input:prompt runtime=${runtimes.join(',')}`)
++    }
++
++    if (paused) {
++      reasons.push('needs-input:paused-queue')
++    }
++
++    if (!runtimes.length && !paused) {
++      reasons.push('needs-input:unknown')
++    }
++  }
++
++  if (dotState === 'stalled') {
++    reasons.push('stalled')
++  }
++
++  if (dotState !== 'working') {
++    const counts = kanbanStripeCounts(row, nowSeconds)
++
++    if (counts.blocked > 0) {
++      const exec = rowExecution(row, nowSeconds)
++      const parts = [`kanban-blocked:${counts.blocked}`]
++
++      if (row.kanban_blocked_on?.length) {
++        parts.push(`on=${row.kanban_blocked_on.join(',')}`)
++      }
++
++      if ((row.kanban_held ?? 0) > 0) {
++        parts.push(`held=${row.kanban_held}`)
++      }
++
++      if (exec && Math.max(exec.needsUser, exec.outstanding) > 0) {
++        parts.push(`asks=${Math.max(exec.needsUser, exec.outstanding)}`)
++      }
++
++      reasons.push(parts.join(' '))
++    }
++
++    if (row.review_wait === 'stuck') {
++      reasons.push(`review:${row.review_wait_pr ?? '?'}`)
++    }
++  }
++
++  if (!hasOwnLiveTurn(dotState) && outcomeStripe(row.outcome) === 'stuck') {
++    reasons.push(`outcome:${row.outcome?.kind}`)
++  }
++
++  return reasons
++}
++
++/** Where a red edge goes besides desktop.log: the session's own gateway (`POST /api/sessions/<id>/stripe-report`),
++ *  which keeps it for `hermes sessions outcome <id>`. Set by the sidebar; a no-op until then (tests, early boot). */
++export type StripeReasonReporter = (
++  row: StripeTraceRow,
++  stripe: null | SessionStatusStripe,
++  previous: null | SessionStatusStripe,
++  reasons: readonly string[]
++) => Promise<unknown> | void
++
++let stripeReasonReporter: null | StripeReasonReporter = null
++
++export const setStripeReasonReporter = (reporter: null | StripeReasonReporter): void => {
++  stripeReasonReporter = reporter
++}
++
++function reportStripeReason(
++  row: StripeTraceRow,
++  stripe: null | SessionStatusStripe,
++  previous: null | SessionStatusStripe,
++  reasons: readonly string[]
++): void {
++  if (!stripeReasonReporter || row.offline_cached) {
++    return
++  }
++
++  try {
++    void Promise.resolve(stripeReasonReporter(row, stripe, previous, reasons)).catch(() => undefined)
++  } catch {
++    // Diagnostics only.
++  }
++}
++
+ /** Build the desktop.log line for one transition. Exported for tests. */
+ export function formatStripeTransition(
+   row: StripeTraceRow,
+   from: null | SessionStatusStripe,
+   to: null | SessionStatusStripe,
+   dotState: SessionDotState,
+-  suppressed = 0
++  suppressed = 0,
++  reasons: readonly string[] = []
+ ): string {
+   const fields: [string, unknown][] = [
+     ['conn', row.connection_id ?? 'primary'],
+@@ -777,6 +889,10 @@ export function formatStripeTransition(
+     fields.push(['suppressed', suppressed])
+   }
+ 
++  if (reasons.length > 0) {
++    fields.push(['stuck', `[${reasons.map(r => r.replace(/\s+/g, '_')).join(';')}]`])
++  }
++
+   return `stripe-transition ${row.id} ${from ?? 'none'}->${to ?? 'none'} ${fields
+     .map(([key, value]) => `${key}=${traceValue(value)}`)
+     .join(' ')}`
+@@ -795,19 +911,29 @@ export function recordStripeTransition(
+   try {
+     const key = `${row.connection_id ?? ''}\u0000${row.profile ?? ''}\u0000${row.id}`
+     const entry = stripeTrace.get(key)
++    const reasons = stripe === 'stuck' ? stuckReasons(row, dotState, now / 1000) : []
++    const reasonsKey = reasons.join('|')
+ 
+     if (!entry) {
+-      stripeTrace.set(key, { emitted: [], stripe, suppressed: 0 })
++      stripeTrace.set(key, { emitted: [], reasonsKey, stripe, suppressed: 0 })
++
++      // [daveey] A row already red when first seen (after a restart, a reconnect) is exactly the red nobody can
++      // explain later: report it, though the log still skips first sightings.
++      if (stripe === 'stuck') {
++        reportStripeReason(row, stripe, null, reasons)
++      }
+ 
+       return
+     }
+ 
+-    if (entry.stripe === stripe) {
++    // A red row whose cause changed (the prompt answered but a card blocked) is a new red: log and report it.
++    if (entry.stripe === stripe && (stripe !== 'stuck' || entry.reasonsKey === reasonsKey)) {
+       return
+     }
+ 
+     const from = entry.stripe
+     entry.stripe = stripe
++    entry.reasonsKey = reasonsKey
+     entry.emitted = entry.emitted.filter(at => now - at < STRIPE_TRANSITION_WINDOW_MS)
+ 
+     if (entry.emitted.length >= STRIPE_TRANSITION_LOG_CAP_PER_MIN) {
+@@ -817,9 +943,13 @@ export function recordStripeTransition(
+     }
+ 
+     entry.emitted.push(now)
+-    const line = formatStripeTransition(row, from, stripe, dotState, entry.suppressed)
++    const line = formatStripeTransition(row, from, stripe, dotState, entry.suppressed, reasons)
+     entry.suppressed = 0
+ 
++    if (stripe === 'stuck' || from === 'stuck') {
++      reportStripeReason(row, stripe, from, reasons)
++    }
++
+     if (typeof window !== 'undefined') {
+       const win = new URLSearchParams(window.location.search).get('win') || 'main'
+       window.hermesDesktop?.logLine?.(`[sidebar win=${win}] ${line}`)
+diff --git a/apps/desktop/src/store/session-states-live-turn.ts b/apps/desktop/src/store/session-states-live-turn.ts
+new file mode 100644
+index 0000000000..b9227220f5
+--- /dev/null
++++ b/apps/desktop/src/store/session-states-live-turn.ts
+@@ -0,0 +1,37 @@
++export type LiveTurnVerdict = 'ended' | 'running' | 'unknown'
++
++export interface LiveTurnStatusResponse {
++  sessions?: { id?: string; last_active?: number | null; status?: string }[]
++}
++
++/** What one `session.active_list` snapshot says about `runtimeId`'s turn. A
++ *  runtime missing from a well-formed list has been reaped: its turn is over.
++ *  `starting` is an agent build for a turn the backend accepted. */
++export function liveTurnVerdict(
++  response: LiveTurnStatusResponse | null | undefined,
++  runtimeId: string
++): LiveTurnVerdict {
++  if (!Array.isArray(response?.sessions)) {
++    return 'unknown'
++  }
++
++  const status = response.sessions.find(session => session.id?.trim() === runtimeId)?.status
++
++  if (status === undefined || status === 'idle') {
++    return 'ended'
++  }
++
++  return status === 'starting' || status === 'waiting' || status === 'working' ? 'running' : 'unknown'
++}
++
++/** [daveey] When `runtimeId`'s turn last did anything, per the backend (ms), or
++ *  null when the snapshot doesn't say (older backend, runtime absent). */
++export function liveTurnLastActiveMs(
++  response: LiveTurnStatusResponse | null | undefined,
++  runtimeId: string
++): null | number {
++  const lastActive = response?.sessions?.find(session => session.id?.trim() === runtimeId)?.last_active
++  const ms = Number(lastActive) * 1000
++
++  return lastActive != null && Number.isFinite(ms) && ms > 0 ? ms : null
++}
+diff --git a/apps/desktop/src/store/session-states-stale-prompt.test.ts b/apps/desktop/src/store/session-states-stale-prompt.test.ts
+new file mode 100644
+index 0000000000..423bbf3c24
+--- /dev/null
++++ b/apps/desktop/src/store/session-states-stale-prompt.test.ts
+@@ -0,0 +1,117 @@
++import { registryBackendScopeKey } from '@hermes/shared'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import type { ClientSessionState } from '@/app/types'
++import { createClientSessionState } from '@/lib/chat-runtime'
++
++import { $activeSessionId, $selectedStoredSessionId, $unreadFinishedSessionIds } from './session'
++import {
++  $attentionSessionIds,
++  $sessionStates,
++  clearAllSessionStates,
++  publishSessionState,
++  reconcileBusyStatesOnReconnect,
++  recordSessionEventScope
++} from './session-states'
++
++function state(over: Partial<ClientSessionState> = {}): ClientSessionState {
++  return { ...createClientSessionState(null), storedSessionId: 's1', ...over }
++}
++
++const HUB = { connectionId: 'hub', profile: 'default' }
++const HUB_SCOPE = registryBackendScopeKey(HUB.connectionId, HUB.profile)
++
++// selfheal desktop-54ae373894 (t_01a1d3142a47913f): a clarify was pending on runtime 66877047 when the hub backend
++// restarted (ws close 1012). Startup resume auto-continued the stored session on a NEW runtime (c442506d), whose turn
++// ran and finished. The old runtime's `needsInput` was never retired: reconnect deliberately leaves it, the
++// active_list reap only covers the active gateway's polled runtimes, and `evictable()` keeps needsInput states. So the
++// stored session stayed in $attentionSessionIds → dot `needs-input` → red `stuck` stripe with no open question.
++describe('a blocking prompt on a runtime the backend replaced', () => {
++  beforeEach(() => {
++    vi.useFakeTimers()
++    $selectedStoredSessionId.set(null)
++    $unreadFinishedSessionIds.set([])
++  })
++
++  afterEach(() => {
++    vi.clearAllTimers()
++    vi.useRealTimers()
++    clearAllSessionStates()
++    $activeSessionId.set(null)
++  })
++
++  it('retires when the same stored session runs a turn on a new runtime (scoped reconnect)', () => {
++    recordSessionEventScope({ ...HUB, session_id: 'rt-old' })
++    publishSessionState('rt-old', state({ busy: true, needsInput: true }))
++    expect($attentionSessionIds.get()).toEqual(['s1'])
++
++    reconcileBusyStatesOnReconnect(HUB_SCOPE)
++    // Reconnect keeps a blocking prompt on purpose: on a same-backend blip it is still live.
++    expect($attentionSessionIds.get()).toEqual(['s1'])
++
++    recordSessionEventScope({ ...HUB, session_id: 'rt-new' })
++    publishSessionState('rt-new', state({ busy: true, turnLive: true }))
++    publishSessionState('rt-new', state({ busy: false }))
++
++    expect($attentionSessionIds.get()).toEqual([])
++    expect($sessionStates.get()['rt-old']?.needsInput).not.toBe(true)
++  })
++
++  it('retires on the primary socket too, without any active_list poll', () => {
++    publishSessionState('rt-old', state({ busy: true, needsInput: true }))
++    reconcileBusyStatesOnReconnect()
++
++    publishSessionState('rt-new', state({ busy: true }))
++
++    expect($attentionSessionIds.get()).toEqual([])
++  })
++
++  it("keeps the prompt when the new runtime belongs to another stored session", () => {
++    publishSessionState('rt-old', state({ needsInput: true })) // as reconnect leaves it
++    publishSessionState('rt-other', state({ busy: true, storedSessionId: 's2' }))
++
++    expect($attentionSessionIds.get()).toEqual(['s1'])
++  })
++
++  it('keeps the prompt when a sibling runtime only appears idle (no turn proves the old one dead)', () => {
++    publishSessionState('rt-old', state({ needsInput: true })) // as reconnect leaves it
++    publishSessionState('rt-new', state({ busy: false }))
++
++    expect($attentionSessionIds.get()).toEqual(['s1'])
++  })
++
++  it('keeps a prompt raised by the running runtime itself', () => {
++    publishSessionState('rt-old', state({ busy: true, needsInput: true }))
++    publishSessionState('rt-new', state({ needsInput: true, turnLive: true }))
++
++    expect($attentionSessionIds.get()).toEqual(['s1'])
++    expect($sessionStates.get()['rt-new']?.needsInput).toBe(true)
++  })
++
++  it('leaves a sibling that still claims a turn to its own terminal events', () => {
++    publishSessionState('rt-busy', state({ busy: true, needsInput: true }))
++    publishSessionState('rt-awaiting', state({ awaitingResponse: true, needsInput: true }))
++    publishSessionState('rt-new', state({ busy: true }))
++
++    expect($sessionStates.get()['rt-busy']?.needsInput).toBe(true)
++    expect($sessionStates.get()['rt-awaiting']?.needsInput).toBe(true)
++    expect($attentionSessionIds.get()).toEqual(['s1'])
++  })
++
++  it('never pairs runtimes that have no stored session yet', () => {
++    publishSessionState('rt-old', state({ needsInput: true, storedSessionId: null }))
++    publishSessionState('rt-new', state({ busy: true, storedSessionId: null }))
++
++    expect($sessionStates.get()['rt-old']?.needsInput).toBe(true)
++  })
++
++  it('a turnLive claim alone proves the old runtime dead', () => {
++    const idle = state({})
++    publishSessionState('rt-idle', idle)
++    publishSessionState('rt-old', state({ needsInput: true }))
++    publishSessionState('rt-new', state({ turnLive: true }))
++
++    expect($sessionStates.get()['rt-old']?.needsInput).toBe(false)
++    expect($sessionStates.get()['rt-idle']).toBe(idle) // a sibling with no prompt is not republished
++  })
++})
+diff --git a/apps/desktop/src/store/session-states-superseded-prompts.ts b/apps/desktop/src/store/session-states-superseded-prompts.ts
+new file mode 100644
+index 0000000000..9cb4fff2f0
+--- /dev/null
++++ b/apps/desktop/src/store/session-states-superseded-prompts.ts
+@@ -0,0 +1,32 @@
++import type { ClientSessionState } from '@/app/types'
++
++/** [daveey] A turn running on runtime R for stored session S proves that every OTHER runtime of S holding a
++ *  blocking prompt is dead: the backend runs one turn per stored session, and a respawned backend re-mints runtime
++ *  ids (startup resume auto-continues the session on a fresh one). Reconnect leaves `needsInput` alone on purpose
++ *  (on a same-backend blip the prompt is still live) and only the active gateway's active_list poll reaps vanished
++ *  runtimes, so a clarify open when a REMOTE backend restarted kept its stored session in `$attentionSessionIds`
++ *  forever: a `needs-input` dot and a red `stuck` stripe with no question anywhere (selfheal desktop-54ae373894).
++ *  Only a sibling no longer running is retired (reconnect already downgraded its busy claim); a sibling still
++ *  busy is left to its own terminal events. Returns the runtime ids whose prompt `publishSessionState` clears. */
++export function supersededPromptRuntimes(
++  states: Readonly<Record<string, ClientSessionState | undefined>>,
++  runtimeId: string,
++  state: ClientSessionState
++): string[] {
++  const storedId = state.storedSessionId
++
++  if (!storedId || !(state.busy || state.turnLive)) {
++    return []
++  }
++
++  return Object.entries(states)
++    .filter(
++      ([otherId, other]) =>
++        otherId !== runtimeId &&
++        other?.needsInput &&
++        !other.busy &&
++        !other.awaitingResponse &&
++        other.storedSessionId === storedId
++    )
++    .map(([otherId]) => otherId)
++}
+diff --git a/apps/desktop/src/store/session-states.ts b/apps/desktop/src/store/session-states.ts
+index 579971250e..9f115cb171 100644
+--- a/apps/desktop/src/store/session-states.ts
++++ b/apps/desktop/src/store/session-states.ts
+@@ -95,6 +95,13 @@ import {
+   type SessionOwnerScope,
+   type SessionProfileRoute
+ } from './session-request-router'
++import {
++  liveTurnLastActiveMs,
++  type LiveTurnStatusResponse,
++  type LiveTurnVerdict,
++  liveTurnVerdict
++} from './session-states-live-turn'
++import { supersededPromptRuntimes } from './session-states-superseded-prompts'
+ import { orderTilesByTree } from './session-tile-order'
+ import { ackStoredSessionId, isMessagingCompletion, markSessionUnreadFinished } from './session-unread'
+ import { migrateTranscriptTailsForProfile } from './transcript-tail-cache'
+@@ -395,43 +402,7 @@ export function isLiveTurnAwaitingEvents(state: ClientSessionState | undefined):
+   return Boolean(state && (state.busy || state.awaitingResponse || state.turnLive) && !state.needsInput)
+ }
+ 
+-export type LiveTurnVerdict = 'ended' | 'running' | 'unknown'
+-
+-interface LiveTurnStatusResponse {
+-  sessions?: { id?: string; last_active?: number | null; status?: string }[]
+-}
+-
+-/** What one `session.active_list` snapshot says about `runtimeId`'s turn. A
+- *  runtime missing from a well-formed list has been reaped: its turn is over.
+- *  `starting` is an agent build for a turn the backend accepted. */
+-export function liveTurnVerdict(
+-  response: LiveTurnStatusResponse | null | undefined,
+-  runtimeId: string
+-): LiveTurnVerdict {
+-  if (!Array.isArray(response?.sessions)) {
+-    return 'unknown'
+-  }
+-
+-  const status = response.sessions.find(session => session.id?.trim() === runtimeId)?.status
+-
+-  if (status === undefined || status === 'idle') {
+-    return 'ended'
+-  }
+-
+-  return status === 'starting' || status === 'waiting' || status === 'working' ? 'running' : 'unknown'
+-}
+-
+-/** [daveey] When `runtimeId`'s turn last did anything, per the backend (ms), or
+- *  null when the snapshot doesn't say (older backend, runtime absent). */
+-export function liveTurnLastActiveMs(
+-  response: LiveTurnStatusResponse | null | undefined,
+-  runtimeId: string
+-): null | number {
+-  const lastActive = response?.sessions?.find(session => session.id?.trim() === runtimeId)?.last_active
+-  const ms = Number(lastActive) * 1000
+-
+-  return lastActive != null && Number.isFinite(ms) && ms > 0 ? ms : null
+-}
++export { liveTurnLastActiveMs, type LiveTurnVerdict, liveTurnVerdict } from './session-states-live-turn'
+ 
+ /** [daveey] The backend's activity decides the quiet hint for a running turn.
+  *  The renderer watchdog only measures events reaching THIS window, and a turn
+@@ -932,6 +903,11 @@ export function publishSessionState(runtimeId: string, state: ClientSessionState
+ 
+   $sessionStates.set({ ...current, [runtimeId]: state })
+   handleTransition(prev, state, runtimeId)
++
++  // [daveey] A turn on a new runtime retires a dead runtime's prompt (selfheal desktop-54ae373894).
++  for (const otherId of supersededPromptRuntimes($sessionStates.get(), runtimeId, state)) {
++    publishSessionState(otherId, { ...$sessionStates.get()[otherId], needsInput: false })
++  }
+ }
+ 
+ /** Keep the cheap status projection for a cold session while releasing its
+diff --git a/hermes_cli/desktop_stripe_report.py b/hermes_cli/desktop_stripe_report.py
+new file mode 100644
+index 0000000000..314f5d37e8
+--- /dev/null
++++ b/hermes_cli/desktop_stripe_report.py
+@@ -0,0 +1,111 @@
++"""Why the Desktop painted a chat red: the stripe reasons the Desktop reports, kept where the agent can read them.
++
++[daveey] The sidebar's red ``stuck`` stripe is derived in the Desktop renderer from inputs only it holds (a pending
++prompt on some runtime, a paused owner queue, a quiet turn) plus row fields the backend stamps (blocked cards, a
++review wait, a ``decision`` outcome). An agent asked "why are you red" could see none of the renderer half and
++guessed (selfheal desktop-54ae373894: it blamed a scheduled card while the real cause was a dead runtime's clarify).
++
++The Desktop now POSTs every change of a row's red verdict (into stuck, reasons changed, out of stuck) to the
++session's own gateway. This module appends it to ``<profile home>/logs/desktop-stripe.jsonl`` (size-capped, one
++rotation) and logs one INFO line; ``hermes sessions outcome <id>`` prints the latest report next to the outcome.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import threading
++import time
++from pathlib import Path
++from typing import Any, Iterable, Optional
++
++logger = logging.getLogger(__name__)
++
++FILE_NAME = "desktop-stripe.jsonl"
++MAX_BYTES = 2 * 1024 * 1024
++MAX_REASONS = 16
++MAX_REASON_CHARS = 200
++_TAIL_BYTES = 256 * 1024
++_STRIPES = frozenset({"attention", "blocked", "done", "periodic", "stalled", "stuck", "waiting", "none"})
++_lock = threading.Lock()
++
++
++def report_path(home: Path) -> Path:
++    return Path(home) / "logs" / FILE_NAME
++
++
++def _clean_reasons(reasons: Iterable[Any]) -> list[str]:
++    out: list[str] = []
++    for reason in reasons or ():
++        text = " ".join(str(reason).split())[:MAX_REASON_CHARS]
++        if text:
++            out.append(text)
++        if len(out) >= MAX_REASONS:
++            break
++    return out
++
++
++def record(home: Path, session_id: str, stripe: Optional[str], reasons: Iterable[Any], *,
++           previous: Optional[str] = None, now: Optional[float] = None) -> dict[str, Any]:
++    """Append one report and log it. ``stripe`` None means the row has no stripe (``none``)."""
++    entry = {
++        "at": round(now if now is not None else time.time(), 3),
++        "session_id": str(session_id),
++        "stripe": stripe if stripe in _STRIPES else ("none" if not stripe else "unknown"),
++        "previous": previous if previous in _STRIPES else ("none" if not previous else "unknown"),
++        "reasons": _clean_reasons(reasons),
++    }
++    logger.info("desktop stripe report: session=%s %s->%s reasons=%s", entry["session_id"], entry["previous"],
++                entry["stripe"], ",".join(entry["reasons"]) or "-")
++    path = report_path(home)
++    line = json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
++    with _lock:
++        path.parent.mkdir(parents=True, exist_ok=True)
++        try:
++            if path.stat().st_size + len(line) > MAX_BYTES:
++                os.replace(path, path.with_name(FILE_NAME + ".1"))
++        except FileNotFoundError:
++            pass
++        with path.open("a", encoding="utf-8") as fh:
++            fh.write(line)
++    return entry
++
++
++def _tail_lines(path: Path) -> list[str]:
++    try:
++        with path.open("rb") as fh:
++            fh.seek(0, os.SEEK_END)
++            size = fh.tell()
++            fh.seek(max(0, size - _TAIL_BYTES))
++            data = fh.read()
++    except FileNotFoundError:
++        return []
++    lines = data.decode("utf-8", errors="replace").splitlines()
++    return lines[1:] if size > _TAIL_BYTES else lines
++
++
++def latest(home: Path, session_ids: Iterable[str]) -> Optional[dict[str, Any]]:
++    """The newest report for any of ``session_ids`` (a lineage), or None."""
++    wanted = {str(s) for s in session_ids if s}
++    if not wanted:
++        return None
++    path = report_path(home)
++    for candidate in (path, path.with_name(FILE_NAME + ".1")):
++        for line in reversed(_tail_lines(candidate)):
++            try:
++                entry = json.loads(line)
++            except ValueError:
++                continue
++            if isinstance(entry, dict) and entry.get("session_id") in wanted:
++                return entry
++    return None
++
++
++def describe(entry: Optional[dict[str, Any]], *, now: Optional[float] = None) -> str:
++    if not entry:
++        return "no Desktop stripe report"
++    age = max(0.0, (now if now is not None else time.time()) - float(entry.get("at") or 0))
++    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(entry.get("at") or 0)))
++    reasons = ", ".join(entry.get("reasons") or ()) or "-"
++    return f"Desktop stripe {entry.get('stripe')} since {when} ({age / 60:.0f} min ago): {reasons}"
+diff --git a/hermes_cli/sessions_cmd_outcome.py b/hermes_cli/sessions_cmd_outcome.py
+index 0d5a885359..9f6406cf97 100644
+--- a/hermes_cli/sessions_cmd_outcome.py
++++ b/hermes_cli/sessions_cmd_outcome.py
+@@ -74,13 +74,35 @@ def cmd_outcome(db, args):
+     if not sid:
+         return 1
+     outcome = refresh_outcome(sid, "manual", db=db) if args.refresh else get_outcome(sid, db=db)
++    stripe = _stripe_report(db, sid)
+     if args.json:
+-        print(json.dumps({"session_id": sid, "outcome": outcome}, indent=2, ensure_ascii=False))
++        print(json.dumps({"session_id": sid, "outcome": outcome, "desktop_stripe": stripe}, indent=2,
++                         ensure_ascii=False))
+     else:
+         print(f"{sid}  {_describe(outcome)}")
++        if stripe:
++            # [daveey] Why the Desktop painted the row (red inputs only the renderer holds): t_01a1d3142a47913f.
++            from hermes_cli.desktop_stripe_report import describe
++
++            print(f"{' ' * len(sid)}  {describe(stripe)}")
+     return None
+ 
+ 
++def _stripe_report(db, sid: str):
++    """The Desktop's latest stripe report for the chat's lineage (``desktop_stripe_report``), or None."""
++    import sqlite3
++    from pathlib import Path
++
++    from hermes_cli.desktop_stripe_report import latest
++    from hermes_state_outcome import _lineage_ids
++
++    try:
++        ids = _lineage_ids(db, sid)
++    except sqlite3.Error:  # a lineage read failure falls back to the exact id
++        ids = [sid]
++    return latest(Path(db.db_path).parent, [sid, *ids])
++
++
+ def sidebar_rows(db, limit: int = AUDIT_DEFAULT_LIMIT) -> list[dict[str, Any]]:
+     """The rows the Desktop sidebar lists for this profile."""
+     from pathlib import Path
+diff --git a/hermes_cli/web_models.py b/hermes_cli/web_models.py
+index 4bb6600b52..10f566242c 100644
+--- a/hermes_cli/web_models.py
++++ b/hermes_cli/web_models.py
+@@ -302,6 +302,14 @@ class SessionMute(BaseModel):
+     profile: Optional[str] = None
+ 
+ 
++class SessionStripeReport(BaseModel):
++    """POST /api/sessions/{id}/stripe-report: why the Desktop painted the row (its red reasons). [daveey]"""
++    stripe: Optional[str] = None
++    previous: Optional[str] = None
++    reasons: list[str] = Field(default_factory=list, max_length=64)
++    profile: Optional[str] = None
++
++
+ class SessionOwnerBackfill(BaseModel):
+     """POST /api/sessions/owner-backfill (legacy migration). ``profile`` scopes WHICH state.db is
+     stamped; the stamped value is always that store's own serving-profile identity — the caller
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index fa9c955691..0060199ff8 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -36,7 +36,7 @@ from hermes_cli.web_server_gateway import _strip_session_list_rows
+ from hermes_cli.web_server_sessions import _session_latest_descendant
+ from hermes_cli.web_models import (
+     BackgroundProcessStop, BulkDeleteSessions, SessionImport, SessionMute, SessionOwnerBackfill, SessionPrune,
+-    SessionRename)
++    SessionRename, SessionStripeReport)
+ from hermes_cli.web_routers._common import (
+     CORRUPT_STORE_DETAIL, corrupt_store_as_status, log as _log, destructive_profile, http_failure,
+ )
+@@ -1209,6 +1209,20 @@ async def mute_session_endpoint(session_id: str, body: SessionMute, request: Req
+     return await _write_on_owner(request, body.profile, _mute)
+ 
+ 
++@manage_router.post("/api/sessions/{session_id}/stripe-report")
++async def stripe_report_endpoint(session_id: str, body: SessionStripeReport):
++    """[daveey] The Desktop's reason for painting this row (red ``stuck`` inputs), kept for the agent and the log."""
++    from hermes_cli import desktop_stripe_report
++
++    def _record(db):
++        sid = _resolve_session_id(db, session_id) or session_id
++        entry = desktop_stripe_report.record(Path(db.db_path).parent, sid, body.stripe, body.reasons,
++                                             previous=body.previous)
++        return {"ok": True, "report": entry}
++
++    return await asyncio.to_thread(_with_db, body.profile, _record, read_only=True)
++
++
+ @manage_router.get("/api/sessions/{session_id}/outcome")
+ async def get_session_outcome_endpoint(session_id: str, request: Request, refresh: bool = False,
+                                        profile: Optional[str] = None):
+diff --git a/tests/hermes_cli/serve_handler_ledger.json b/tests/hermes_cli/serve_handler_ledger.json
+index 976c10a596..76d3cf4b84 100644
+--- a/tests/hermes_cli/serve_handler_ledger.json
++++ b/tests/hermes_cli/serve_handler_ledger.json
+@@ -2,7 +2,7 @@
+  "counts": {
+   "http": {
+    "keep-host-wide": 1,
+-   "undecided": 349
++   "undecided": 350
+   },
+   "rpc": {
+    "authority": 109,
+@@ -322,6 +322,7 @@
+   {"current_path": "hermes_cli.web_routers.sessions:prune_sessions_endpoint", "decision": "undecided", "handler": "POST /api/sessions/prune", "kind": "http", "ref": ""},
+   {"current_path": "hermes_cli.web_routers.sessions:stop_session_background_process", "decision": "undecided", "handler": "POST /api/sessions/{session_id}/background-processes/{process_id}/stop", "kind": "http", "ref": ""},
+   {"current_path": "hermes_cli.web_routers.sessions:mute_session_endpoint", "decision": "undecided", "handler": "POST /api/sessions/{session_id}/mute", "kind": "http", "ref": ""},
++  {"current_path": "hermes_cli.web_routers.sessions:stripe_report_endpoint", "decision": "undecided", "handler": "POST /api/sessions/{session_id}/stripe-report", "kind": "http", "ref": ""},
+   {"current_path": "hermes_cli.web_routers.skills:create_skill", "decision": "undecided", "handler": "POST /api/skills", "kind": "http", "ref": ""},
+   {"current_path": "hermes_cli.web_routers.skills:install_skill_hub", "decision": "undecided", "handler": "POST /api/skills/hub/install", "kind": "http", "ref": ""},
+   {"current_path": "hermes_cli.web_routers.skills:uninstall_skill_hub", "decision": "undecided", "handler": "POST /api/skills/hub/uninstall", "kind": "http", "ref": ""},
+diff --git a/tests/hermes_cli/test_session_outcome_surfaces.py b/tests/hermes_cli/test_session_outcome_surfaces.py
+index 47bb050068..b875fac407 100644
+--- a/tests/hermes_cli/test_session_outcome_surfaces.py
++++ b/tests/hermes_cli/test_session_outcome_surfaces.py
+@@ -128,6 +128,59 @@ def test_cli_mute_unmute_and_outcome(homes, capsys):
+     assert run_cli("mute", "missing") == 1
+ 
+ 
++def test_stripe_report_is_kept_and_read_back_by_the_cli(client, homes, capsys):
++    """t_01a1d3142a47913f: the Desktop's reason for a red row reaches the session's gateway, which keeps it
++    (JSONL + log line) where the agent can read it with ``hermes sessions outcome``."""
++    from hermes_cli import desktop_stripe_report
++
++    seed(homes["default"])
++    run_cli("outcome", "chat")
++    assert "Desktop stripe" not in capsys.readouterr().out  # no report yet: the line stays as before
++
++    resp = client.post("/api/sessions/chat/stripe-report",
++                       json={"stripe": "stuck", "previous": "done", "reasons": ["needs-input:prompt runtime=old1"]})
++    assert resp.status_code == 200 and resp.json()["report"]["stripe"] == "stuck"
++    path = desktop_stripe_report.report_path(homes["default"])
++    assert json.loads(path.read_text().splitlines()[-1])["reasons"] == ["needs-input:prompt runtime=old1"]
++
++    run_cli("outcome", "chat")
++    out = capsys.readouterr().out
++    assert "Desktop stripe stuck since" in out and "needs-input:prompt runtime=old1" in out
++    run_cli("outcome", "chat", "--json")
++    assert json.loads(capsys.readouterr().out)["desktop_stripe"]["previous"] == "done"
++
++    client.post("/api/sessions/chat/stripe-report", json={"stripe": None, "previous": "stuck", "reasons": []})
++    run_cli("outcome", "chat", "--json")
++    assert json.loads(capsys.readouterr().out)["desktop_stripe"]["stripe"] == "none"
++
++
++def test_stripe_report_routes_to_the_owning_profile_and_ignores_other_sessions(client, homes):
++    from hermes_cli import desktop_stripe_report
++
++    seed(homes["worker_beta"], "worker-chat")
++    resp = client.post("/api/sessions/worker-chat/stripe-report",
++                       json={"stripe": "stuck", "reasons": ["stalled"], "profile": "worker_beta"})
++    assert resp.status_code == 200
++    assert desktop_stripe_report.latest(homes["worker_beta"], ["worker-chat"])["reasons"] == ["stalled"]
++    assert desktop_stripe_report.latest(homes["default"], ["worker-chat"]) is None
++    assert desktop_stripe_report.latest(homes["worker_beta"], ["other"]) is None
++
++
++def test_stripe_report_file_is_capped_and_reasons_bounded(tmp_path, monkeypatch):
++    from hermes_cli import desktop_stripe_report as dsr
++
++    monkeypatch.setattr(dsr, "MAX_BYTES", 600)
++    for i in range(12):
++        dsr.record(tmp_path, f"s{i}", "stuck", [f"r{i}"] * 40 + ["x" * 999], now=1000.0 + i)
++    path = dsr.report_path(tmp_path)
++    assert path.stat().st_size <= 600 and path.with_name(dsr.FILE_NAME + ".1").exists()
++    last = dsr.latest(tmp_path, ["s11"])
++    assert len(last["reasons"]) == dsr.MAX_REASONS and last["stripe"] == "stuck"
++    assert dsr.latest(tmp_path, ["s10"])["session_id"] == "s10"  # still readable from the rotated file
++    assert dsr.record(tmp_path, "s", "bogus", [])["stripe"] == "unknown"
++    assert dsr.describe(None) == "no Desktop stripe report"
++
++
+ def test_cli_outcome_audit_lists_exactly_the_sidebar_rows(homes, capsys):
+     (homes["default"] / "config.yaml").write_text("sessions:\n  interactive_sources: [desktop]\n", encoding="utf-8")
+     seed(homes["default"], "done-chat")
+-- 
+2.51.0
+

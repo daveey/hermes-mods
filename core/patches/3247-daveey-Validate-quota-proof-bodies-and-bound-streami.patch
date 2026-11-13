@@ -1,0 +1,585 @@
+From 88924d0bf5c0edb28e7262ef2af3a6260fe0d7b2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 20:32:19 +0000
+Subject: [PATCH] [daveey] Validate quota proof bodies and bound streaming
+ recovery
+
+---
+ agent/credential_pool_recovery.py             |  28 +++-
+ agent/request_bucket_context.py               |  12 +-
+ hermes_cli/kanban_quota_recovery.py           | 101 ++++++++----
+ tests/agent/test_model_cooldown_recovery.py   |  53 +++++++
+ .../test_quota_cooldown_contradictions.py     | 146 ++++++++++++++++++
+ .../hermes_cli/test_kanban_quota_recovery.py  |  78 +++++++++-
+ 6 files changed, 380 insertions(+), 38 deletions(-)
+
+diff --git a/agent/credential_pool_recovery.py b/agent/credential_pool_recovery.py
+index c3b2eeb434..9be0f40582 100644
+--- a/agent/credential_pool_recovery.py
++++ b/agent/credential_pool_recovery.py
+@@ -13,6 +13,7 @@ def clear_verified_model_cooldown(pool, observed, model: str) -> bool:
+     """
+     from agent import credential_pool as cp
+     from agent.credential_pool_disabled import disabled_keys, matches
++    from agent.credential_persistence import fingerprint_secret_value, is_borrowed_credential_source
+     from hermes_cli import auth
+ 
+     if not model or observed.provider != pool.provider:
+@@ -31,10 +32,23 @@ def clear_verified_model_cooldown(pool, observed, model: str) -> bool:
+                 if row is None:
+                     return False
+                 current = cp.PooledCredential.from_dict(pool.provider, row)
+-                if (not observed.runtime_api_key or current.runtime_api_key != observed.runtime_api_key
+-                        or (current.access_token, current.refresh_token, current.base_url, current.auth_type)
+-                        != (observed.access_token, observed.refresh_token, observed.base_url, observed.auth_type)
+-                        or matches(current, disabled_keys(pool.provider))):
++                observed_secret = observed.runtime_api_key
++                disabled = disabled_keys(pool.provider)
++                if not observed_secret or matches(current, disabled) or matches(observed, disabled):
++                    return False
++                hydrate = False
++                if current.runtime_api_key:
++                    same_secret = current.runtime_api_key == observed_secret and (
++                        current.access_token, current.refresh_token) == (observed.access_token, observed.refresh_token)
++                else:
++                    # Sanitized borrowed row: the store keeps no token, only source + fingerprint.
++                    stored_fp = current.extra.get("secret_fingerprint")
++                    same_secret = (is_borrowed_credential_source(current.source, pool.provider)
++                                   and bool(stored_fp) and stored_fp == fingerprint_secret_value(observed_secret)
++                                   and current.source == observed.source
++                                   and current.extra.get("secret_source") == observed.extra.get("secret_source"))
++                    hydrate = same_secret
++                if not same_secret or (current.base_url, current.auth_type) != (observed.base_url, observed.auth_type):
+                     return False
+                 status_fields = ("last_status", "last_status_at", "last_error_code", "last_error_reason",
+                                  "last_error_message", "last_error_reset_at", "status_cleared_at")
+@@ -67,9 +81,13 @@ def clear_verified_model_cooldown(pool, observed, model: str) -> bool:
+                 auth._save_auth_store(store, target_path=target)
+                 adopted = cp.PooledCredential.from_dict(pool.provider, row)
+                 live = pool._find(lambda e: e.id == observed.id)
++                persisted_pair = (adopted.access_token, adopted.refresh_token)
+                 if live is not None:
++                    if hydrate:  # runtime secret stays in memory only; the saved row stays sanitized
++                        adopted.access_token, adopted.refresh_token = observed.access_token, observed.refresh_token
++                        adopted.agent_key = observed.agent_key
+                     pool._replace_entry(live, adopted)
+-                pool._persisted_token_pairs[observed.id] = (adopted.access_token, adopted.refresh_token)
++                pool._persisted_token_pairs[observed.id] = persisted_pair
+                 return True
+         except Exception:
+             # Failure to lock/read/write is not evidence of recovery.
+diff --git a/agent/request_bucket_context.py b/agent/request_bucket_context.py
+index ea393d1b7b..15c7819650 100644
+--- a/agent/request_bucket_context.py
++++ b/agent/request_bucket_context.py
+@@ -1,6 +1,8 @@
+ """Keep a request-bucket reset separate from subscription usage windows."""
+ from __future__ import annotations
+ 
++import math
++
+ from agent.credential_pool_timestamps import _parse_absolute_timestamp
+ from agent.retry_utils import parse_retry_after_seconds
+ 
+@@ -23,10 +25,16 @@ def request_bucket_context(error, context, *, now):
+         'anthropic-ratelimit-requests-remaining', 'x-ratelimit-remaining-requests'))
+     if not exhausted:
+         return context
+-    seconds = parse_retry_after_seconds(headers)
++    # Validate before the shared parser clamps NaN / -Infinity to zero.
++    raw_retry = headers.get('retry-after')
++    try:
++        finite_retry = math.isfinite(float(raw_retry))
++    except (TypeError, ValueError):
++        finite_retry = True  # HTTP-date or malformed: let the shared parser decide.
++    seconds = parse_retry_after_seconds(headers) if finite_retry else None
+     if seconds is None:
+         reset = _parse_absolute_timestamp(headers.get('anthropic-ratelimit-requests-reset'))
+         seconds = reset - now if reset is not None else None
+-    if seconds is None or seconds < 0:
++    if seconds is None or not math.isfinite(seconds) or seconds < 0:
+         return context
+     return {**context, 'reset_at': now + seconds}
+diff --git a/hermes_cli/kanban_quota_recovery.py b/hermes_cli/kanban_quota_recovery.py
+index 144b81c3de..a108722b4c 100644
+--- a/hermes_cli/kanban_quota_recovery.py
++++ b/hermes_cli/kanban_quota_recovery.py
+@@ -1,23 +1,91 @@
+ """Bounded completion proof for stale model quota benches; only the caller mutates state."""
+ from __future__ import annotations
+ 
++import asyncio
+ import json
+ import time
+ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+ from contextvars import copy_context
+ 
++MAX_RESPONSE_BYTES = 1 << 20
++
+ 
+ def _client(timeout):
+     import httpx
+-    return httpx.Client(timeout=timeout, follow_redirects=False)
++    return httpx.AsyncClient(timeout=timeout, follow_redirects=False)
+ 
+ 
+-def completion_succeeds(provider, model, observed, deadline):
+-    """One request, no SDK retry/refresh, and no response or credential diagnostics."""
+-    import httpx
++def _valid_message(raw):
++    """A completed Anthropic message: not error-shaped, not truncated, not headers-only."""
++    try:
++        data = json.loads(raw)
++    except ValueError:
++        return False
++    return (isinstance(data, dict) and data.get('type') == 'message' and data.get('role') == 'assistant'
++            and isinstance(data.get('content'), list) and bool(data.get('stop_reason')))
++
++
++async def _read_anthropic(response):
++    chunks, size = [], 0
++    async for chunk in response.aiter_bytes():
++        size += len(chunk)
++        if size > MAX_RESPONSE_BYTES:
++            return False
++        chunks.append(chunk)
++    return _valid_message(b''.join(chunks))
++
++
++async def _read_codex(response):
++    buffer, size = b'', 0
++    async for chunk in response.aiter_bytes():
++        size += len(chunk)
++        buffer += chunk
++        # Bound total bytes and any single unterminated line.
++        if size > MAX_RESPONSE_BYTES or len(buffer) > MAX_RESPONSE_BYTES:
++            return False
++        *lines, buffer = buffer.split(b'\n')
++        for raw in lines:
++            line = raw.decode('utf-8', 'replace').rstrip('\r')
++            if not line.startswith('data:'):
++                continue
++            try:
++                event = json.loads(line[5:].strip())
++            except ValueError:
++                continue
++            if not isinstance(event, dict):
++                continue
++            if event.get('type') in ('response.failed', 'response.incomplete', 'error'):
++                return False
++            if event.get('type') == 'response.completed':
++                final = event.get('response')
++                return isinstance(final, dict) and final.get('status') == 'completed'
++    return False
++
++
++async def _attempt(provider, url, headers, body, deadline):
+     remaining = deadline - time.monotonic()
+     if remaining <= 0:
+         return False
++
++    async def run():
++        async with _client(remaining) as client, client.stream('POST', url, headers=headers, json=body) as response:
++            if response.status_code != 200:
++                return False
++            return await (_read_anthropic if provider == 'anthropic' else _read_codex)(response)
++
++    # Cancellation unwinds the async-with blocks, which closes the transport/socket.
++    return bool(await asyncio.wait_for(run(), remaining)) and time.monotonic() < deadline
++
++
++def completion_succeeds(provider, model, observed, deadline):
++    """One request, no SDK retry/refresh, and no response or credential diagnostics.
++
++    The absolute deadline is enforced by asyncio cancellation (closes the connection), so a
++    trickling or newline-less peer cannot keep a worker thread alive past it.
++    """
++    import httpx
++    if deadline - time.monotonic() <= 0:
++        return False
+     headers = {'Authorization': f'Bearer {observed.runtime_api_key}'}
+     if provider == 'anthropic':
+         url = 'https://api.anthropic.com/v1/messages'
+@@ -39,30 +107,9 @@ def completion_succeeds(provider, model, observed, deadline):
+     else:
+         return False
+     try:
+-        with _client(remaining) as client, client.stream('POST', url, headers=headers, json=body) as response:
+-            if response.status_code != 200:
+-                return False
+-            if provider == 'anthropic':
+-                return time.monotonic() < deadline
+-            for line in response.iter_lines():
+-                if time.monotonic() >= deadline:
+-                    return False
+-                if not line.startswith('data:'):
+-                    continue
+-                try:
+-                    event = json.loads(line[5:].strip())
+-                except ValueError:
+-                    continue
+-                if not isinstance(event, dict):
+-                    continue
+-                if event.get('type') in ('response.failed', 'response.incomplete', 'error'):
+-                    return False
+-                if event.get('type') == 'response.completed':
+-                    final = event.get('response')
+-                    return isinstance(final, dict) and final.get('status') == 'completed'
+-    except (httpx.HTTPError, OSError, ValueError):
++        return asyncio.run(_attempt(provider, url, headers, body, deadline))
++    except (httpx.HTTPError, OSError, ValueError, TimeoutError):
+         return False
+-    return False
+ 
+ 
+ def _eligible(entry, provider, model, now, disabled):
+diff --git a/tests/agent/test_model_cooldown_recovery.py b/tests/agent/test_model_cooldown_recovery.py
+index e24d03948d..b7507178dd 100644
+--- a/tests/agent/test_model_cooldown_recovery.py
++++ b/tests/agent/test_model_cooldown_recovery.py
+@@ -156,3 +156,56 @@ def test_new_account_failure_does_not_erase_model_reset_receipt():
+     stale = {"id": "seat", "model_cooldowns": {A: time.time() + 3600},
+              "model_cooldown_recorded_at": {A: 150.0}}
+     assert not _merge_disk_cooldown_state(stale, merged, "anthropic")["model_cooldowns"]
++
++
++def _borrowed_pool(source, token="sk-ant-oat-live-secret"):
++    from agent.credential_pool import CredentialPool, PooledCredential
++    from hermes_cli import auth
++
++    now = time.time()
++    row = {"id": "borrowed", "label": source, "auth_type": "oauth", "priority": 0, "source": source,
++           "access_token": token, "refresh_token": "rt-live-secret",
++           "model_cooldowns": {A: now + 3600}, "model_cooldown_recorded_at": {A: now}}
++    auth.write_credential_pool("anthropic", [row])
++    stored = auth.read_credential_pool("anthropic")[0]
++    assert "access_token" not in stored and stored["secret_fingerprint"]  # sanitized on disk
++    live = PooledCredential.from_dict("anthropic", row)
++    return CredentialPool("anthropic", [live]), live
++
++
++@pytest.mark.parametrize("source", ["env:ANTHROPIC_TOKEN", "claude_code"])
++def test_sanitized_borrowed_row_recovers_by_fingerprint_without_persisting_secret(pool, source):
++    from hermes_cli import auth
++
++    borrowed, observed = _borrowed_pool(source)
++    assert borrowed.clear_verified_model_cooldown(observed, A)
++    stored = auth.read_credential_pool("anthropic")[0]
++    assert A not in stored["model_cooldowns"]
++    assert "access_token" not in stored and "refresh_token" not in stored
++    assert "live-secret" not in str(auth._load_auth_store())
++    kept = borrowed.entries()[0]  # hydrated secret stays in memory
++    assert kept.runtime_api_key == "sk-ant-oat-live-secret" and kept.refresh_token == "rt-live-secret"
++    assert A not in (kept.model_cooldowns or {})
++
++
++@pytest.mark.parametrize("source", ["env:ANTHROPIC_TOKEN", "claude_code"])
++@pytest.mark.parametrize("change", ["fingerprint", "source", "disabled"])
++def test_sanitized_borrowed_row_refuses_changed_identity(pool, source, change):
++    from agent.credential_pool_disabled import set_credential_disabled
++    from hermes_cli import auth
++
++    borrowed, observed = _borrowed_pool(source)
++    if change == "disabled":
++        set_credential_disabled("anthropic", observed, True)
++    else:
++        with auth._auth_store_lock():
++            store = auth._load_auth_store()
++            row = store["credential_pool"]["anthropic"][0]
++            if change == "fingerprint":
++                row["secret_fingerprint"] = "sha256:0000000000000000"
++            else:
++                row["source"] = "env:OTHER" if source == "claude_code" else "claude_code"
++            auth._save_auth_store(store)
++    before = auth.read_credential_pool("anthropic")
++    assert not borrowed.clear_verified_model_cooldown(observed, A)
++    assert auth.read_credential_pool("anthropic") == before
+diff --git a/tests/agent/test_quota_cooldown_contradictions.py b/tests/agent/test_quota_cooldown_contradictions.py
+index a7b1cef319..e9a07aa84c 100644
+--- a/tests/agent/test_quota_cooldown_contradictions.py
++++ b/tests/agent/test_quota_cooldown_contradictions.py
+@@ -1,8 +1,21 @@
+ """Captured weekly rejection and contradictory model cooldown regressions."""
+ from types import SimpleNamespace
+ 
++import pytest
++
++from agent.request_bucket_context import request_bucket_context
++
+ from tests.agent import test_anthropic_model_cooldowns as helpers
+ 
++
++@pytest.mark.parametrize('retry_after', ['NaN', 'Infinity', '-Infinity', float('nan'), float('inf')])
++def test_nonfinite_request_retry_falls_back_to_request_reset(retry_after):
++    headers = {'retry-after': retry_after, 'anthropic-ratelimit-requests-remaining': '0',
++               'anthropic-ratelimit-requests-reset': str(CAPTURED_AT + 7)}
++    context = {'reset_at': 1794672000, 'message': MESSAGE}
++    assert request_bucket_context(_error(headers), context, now=CAPTURED_AT) == {
++        **context, 'reset_at': CAPTURED_AT + 7}
++
+ pool = helpers.pool
+ MODEL = helpers.MODEL_A
+ KEY = helpers.KEY
+@@ -52,6 +65,139 @@ def test_request_bucket_retry_after_not_usage_reset(pool, monkeypatch):
+     assert 0 < until - CAPTURED_AT <= 2
+ 
+ 
++@pytest.mark.parametrize('reset', ['NaN', 'Infinity', '-Infinity', float('nan'), float('inf')])
++def test_nonfinite_request_reset_preserves_context(reset):
++    context = {'reset_at': 1794672000, 'reason': 'weekly', 'message': MESSAGE}
++    error = _error({'anthropic-ratelimit-requests-remaining': '0',
++                    'anthropic-ratelimit-requests-reset': reset})
++    assert request_bucket_context(error, context, now=CAPTURED_AT) is context
++
++
++@pytest.mark.parametrize('remaining_header', [
++    'anthropic-ratelimit-requests-remaining', 'X-RateLimit-Remaining-Requests'])
++@pytest.mark.parametrize('retry_after', ['2', '0', '2.5'])
++def test_header_only_request_retry_preserves_other_context(remaining_header, retry_after):
++    context = {'reason': 'rate_limit', 'message': MESSAGE, 'sentinel': object()}
++    original = dict(context)
++    headers = {remaining_header: ' 0 ', 'ReTrY-AfTeR': retry_after,
++               'anthropic-ratelimit-requests-reset': str(CAPTURED_AT + 100)}
++    result = request_bucket_context(_error(headers), context, now=CAPTURED_AT)
++    assert result == {**context, 'reset_at': CAPTURED_AT + float(retry_after)}
++    assert result is not context
++    assert context == original
++
++
++@pytest.mark.parametrize('retry_after', [None, '', 'garbage', True])
++@pytest.mark.parametrize('reset', [1794511821, '1794511821', '1794511821000',
++                                   '2026-11-12T19:30:21Z'])
++def test_request_reset_fallback(retry_after, reset):
++    context = {'message': MESSAGE, 'reset_at': 1794672000}
++    headers = {'retry-after': retry_after, 'anthropic-ratelimit-requests-remaining': '0',
++               'anthropic-ratelimit-requests-reset': reset}
++    assert request_bucket_context(_error(headers), context, now=CAPTURED_AT) == {
++        **context, 'reset_at': 1794511821}
++
++
++@pytest.mark.parametrize('reset', [None, '', 'garbage', '2026-99-99', 0, -1, CAPTURED_AT - 1])
++def test_invalid_or_past_request_reset_preserves_context(reset):
++    context = {'reset_at': 1794672000, 'message': MESSAGE}
++    headers = {'retry-after': 'garbage', 'anthropic-ratelimit-requests-remaining': '0',
++               'anthropic-ratelimit-requests-reset': reset}
++    assert request_bucket_context(_error(headers), context, now=CAPTURED_AT) is context
++
++
++@pytest.mark.parametrize('headers', [None, {}, {'retry-after': '2'},
++    {'retry-after': '2', 'anthropic-ratelimit-requests-remaining': '1'},
++    {'retry-after': '2', 'anthropic-ratelimit-requests-remaining': 'garbage'},
++    {'retry-after': '2', 'anthropic-ratelimit-tokens-remaining': '0'},
++    {'retry-after': '2', 'anthropic-ratelimit-requests-remaining': '-1'}])
++def test_no_positive_request_bucket_evidence_preserves_context(headers):
++    context = {'reset_at': 1794672000, 'message': MESSAGE}
++    assert request_bucket_context(_error(headers), context, now=CAPTURED_AT) is context
++
++
++@pytest.mark.parametrize('status', [None, 200, 401, 403, 500, '429'])
++def test_non_429_preserves_context(status):
++    error = _error({'retry-after': '2', 'anthropic-ratelimit-requests-remaining': '0'})
++    error.status_code = status
++    context = {'reset_at': 1794672000}
++    assert request_bucket_context(error, context, now=CAPTURED_AT) is context
++
++
++def test_missing_response_preserves_context():
++    context = {'reset_at': 1794672000}
++    error = SimpleNamespace(status_code=429)
++    assert request_bucket_context(error, context, now=CAPTURED_AT) is context
++
++
++@pytest.mark.parametrize('status_header', ['Anthropic-Ratelimit-Unified-Status',
++    'anthropic-ratelimit-unified-7d-status', 'anthropic-ratelimit-unified-5h-status'])
++def test_rejected_unified_window_wins_over_short_request_bucket(status_header):
++    context = {'reset_at': 1794672000, 'message': MESSAGE}
++    headers = {status_header: 'ReJeCtEd', 'retry-after': '2',
++               'anthropic-ratelimit-requests-remaining': '0'}
++    assert request_bucket_context(_error(headers), context, now=CAPTURED_AT) is context
++
++
++@pytest.mark.parametrize('status_header, status', [
++    ('anthropic-ratelimit-unified-status', 'allowed'),
++    ('anthropic-ratelimit-unified-status', 'allowed_warning'),
++    ('other-status', 'rejected'),
++    ('anthropic-ratelimit-unified-representative-claim', 'rejected')])
++def test_nonrejected_unified_window_does_not_mask_request_bucket(status_header, status):
++    context = {'reset_at': 1794672000}
++    headers = {status_header: status, 'retry-after': '2',
++               'anthropic-ratelimit-requests-remaining': '0'}
++    assert request_bucket_context(_error(headers), context, now=CAPTURED_AT) == {
++        'reset_at': CAPTURED_AT + 2}
++
++
++def test_header_only_extraction_has_short_reset(monkeypatch):
++    from agent.agent_runtime_helpers import extract_api_error_context
++    monkeypatch.setattr('time.time', lambda: CAPTURED_AT)
++    error = _error({'retry-after': '2', 'anthropic-ratelimit-requests-remaining': '0'})
++    assert extract_api_error_context(error)['reset_at'] == CAPTURED_AT + 2
++
++
++def test_nonfinite_retry_extraction_uses_valid_request_reset(monkeypatch):
++    from agent.agent_runtime_helpers import extract_api_error_context
++    monkeypatch.setattr('time.time', lambda: CAPTURED_AT)
++    error = _error({'retry-after': 'NaN', 'anthropic-ratelimit-requests-remaining': '0',
++                    'anthropic-ratelimit-requests-reset': str(CAPTURED_AT + 7)},
++                   reset_at=1794672000)
++    assert extract_api_error_context(error)['reset_at'] == CAPTURED_AT + 7
++
++
++def test_http_date_request_retry(monkeypatch):
++    from datetime import datetime, UTC
++    from agent import retry_utils
++
++    class FrozenDateTime(datetime):
++        @classmethod
++        def now(cls, tz=None):
++            return datetime.fromtimestamp(int(CAPTURED_AT), UTC)
++
++    monkeypatch.setattr(retry_utils, 'datetime', FrozenDateTime)
++    error = _error({'retry-after': 'Thu, 12 Nov 2026 19:30:21 GMT',
++                    'anthropic-ratelimit-requests-remaining': '0'})
++    assert request_bucket_context(error, {}, now=int(CAPTURED_AT)) == {'reset_at': 1794511821}
++
++
++def test_exhausted_bucket_without_reset_preserves_context():
++    context = {'reset_at': 1794672000}
++    error = _error({'anthropic-ratelimit-requests-remaining': '0'})
++    assert request_bucket_context(error, context, now=CAPTURED_AT) is context
++
++
++def test_weekly_and_short_request_headers_keep_weekly_pool_bench(pool, monkeypatch):
++    from agent.agent_runtime_helpers import extract_api_error_context
++    monkeypatch.setattr('time.time', lambda: CAPTURED_AT)
++    headers = {**WEEKLY_HEADERS, 'retry-after': '2',
++               'anthropic-ratelimit-requests-remaining': '0'}
++    context = extract_api_error_context(_error(headers, reset_at=1794672000))
++    assert _bench(pool, context) == 1794672000
++
++
+ def test_external_model_reset_is_seen_by_existing_pool(pool):
+     from hermes_cli.auth import read_credential_pool, write_credential_pool
+     import time
+diff --git a/tests/hermes_cli/test_kanban_quota_recovery.py b/tests/hermes_cli/test_kanban_quota_recovery.py
+index 844869e1ac..bdba4e082e 100644
+--- a/tests/hermes_cli/test_kanban_quota_recovery.py
++++ b/tests/hermes_cli/test_kanban_quota_recovery.py
+@@ -1,5 +1,9 @@
+ """Completion proof, deadline custody, and startup retry for quota recovery."""
++import subprocess
++import sys
++import textwrap
+ import threading
++import time
+ from types import SimpleNamespace
+ from unittest.mock import Mock
+ 
+@@ -9,6 +13,8 @@ import pytest
+ from tests.agent import test_model_cooldown_recovery as pool_helpers
+ 
+ api_pool = pool_helpers.pool
++MESSAGE = {'type': 'message', 'role': 'assistant', 'content': [{'type': 'text', 'text': 'O'}],
++           'stop_reason': 'max_tokens'}
+ 
+ 
+ @pytest.fixture
+@@ -34,8 +40,8 @@ def test_completion_uses_claude_code_wire(monkeypatch):
+     def handle(request):
+         import json
+         seen.append((request, json.loads(request.content)))
+-        return httpx.Response(200, json={'content': []})
+-    monkeypatch.setattr(recovery, '_client', lambda timeout: httpx.Client(transport=httpx.MockTransport(handle)))
++        return httpx.Response(200, json=MESSAGE)
++    monkeypatch.setattr(recovery, '_client', lambda timeout: httpx.AsyncClient(transport=httpx.MockTransport(handle)))
+     assert recovery.completion_succeeds('anthropic', 'model', _entry(), recovery.time.monotonic() + 5)
+     request, body = seen[0]
+     assert request.url == 'https://api.anthropic.com/v1/messages'
+@@ -57,7 +63,7 @@ def test_codex_requires_completed(monkeypatch, data, ok):
+     from hermes_cli import kanban_quota_recovery as recovery
+     def handle(request):
+         return httpx.Response(200, text=data)
+-    monkeypatch.setattr(recovery, '_client', lambda timeout: httpx.Client(transport=httpx.MockTransport(handle)))
++    monkeypatch.setattr(recovery, '_client', lambda timeout: httpx.AsyncClient(transport=httpx.MockTransport(handle)))
+     assert recovery.completion_succeeds('openai-codex', 'model', _entry(), recovery.time.monotonic() + 5) is ok
+ 
+ 
+@@ -130,7 +136,7 @@ def test_rejected_completion_never_retries(monkeypatch, status):
+     def handle(request):
+         calls.append(request)
+         return httpx.Response(status)
+-    monkeypatch.setattr(recovery, '_client', lambda timeout: httpx.Client(transport=httpx.MockTransport(handle)))
++    monkeypatch.setattr(recovery, '_client', lambda timeout: httpx.AsyncClient(transport=httpx.MockTransport(handle)))
+     assert not recovery.completion_succeeds('anthropic', 'model', _entry(), recovery.time.monotonic() + 5)
+     assert len(calls) == 1
+ 
+@@ -248,3 +254,67 @@ def test_three_recoveries_record_accounts_and_owner_files_one_card(pool, monkeyp
+     finally:
+         conn.close()
+ 
++
++
++@pytest.mark.parametrize('content', [
++    b'', b'{"type":"message","role":"assistant","content":[', b'not json', b'[]',
++    b'{"type":"error","error":{"type":"overloaded_error"}}',
++    b'{"type":"message","role":"assistant","content":[],"stop_reason":null}',
++    b'{"content":[]}',
++])
++def test_anthropic_200_requires_valid_completed_body(monkeypatch, content):
++    from hermes_cli import kanban_quota_recovery as recovery
++    monkeypatch.setattr(recovery, '_client', lambda timeout: httpx.AsyncClient(
++        transport=httpx.MockTransport(lambda request: httpx.Response(200, content=content))))
++    assert not recovery.completion_succeeds('anthropic', 'model', _entry(), recovery.time.monotonic() + 5)
++
++
++@pytest.mark.parametrize('provider', ['anthropic', 'openai-codex'])
++def test_response_bytes_are_bounded(monkeypatch, provider):
++    from hermes_cli import kanban_quota_recovery as recovery
++    monkeypatch.setattr(recovery, 'MAX_RESPONSE_BYTES', 1000, raising=False)
++    big = (b'{"type":"message","role":"assistant","stop_reason":"end_turn","content":[],"x":"' + b'a' * 2000 + b'"}'
++           if provider == 'anthropic' else b'data: ' + b'a' * 2000)
++    monkeypatch.setattr(recovery, '_client', lambda timeout: httpx.AsyncClient(
++        transport=httpx.MockTransport(lambda request: httpx.Response(200, content=big))))
++    assert not recovery.completion_succeeds(provider, 'model', _entry(), recovery.time.monotonic() + 5)
++
++
++_SERVER = textwrap.dedent(r'''
++    import socket, sys, time
++    mode = sys.argv[1]
++    s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(1)
++    print(s.getsockname()[1], flush=True)
++    c, _ = s.accept()
++    c.recv(65536)
++    head = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n"
++    if mode == "anthropic":
++        head = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100000\r\n\r\n"
++    c.sendall(head)
++    try:
++        while True:
++            c.sendall(b" ")  # trickle: never a newline, never a complete body
++            time.sleep(0.05)
++    except OSError:
++        print("PEER_CLOSED", flush=True)
++''')
++
++
++@pytest.mark.parametrize('provider', ['anthropic', 'openai-codex'])
++def test_trickling_stream_is_cancelled_at_deadline_and_peer_sees_close(monkeypatch, provider):
++    from hermes_cli import kanban_quota_recovery as recovery
++    proc = subprocess.Popen([sys.executable, '-c', _SERVER, provider], stdout=subprocess.PIPE, text=True)
++    try:
++        port = int(proc.stdout.readline())
++        monkeypatch.setattr(recovery, '_client', lambda timeout: httpx.AsyncClient(timeout=30))
++        real = httpx.AsyncClient.stream
++        monkeypatch.setattr(httpx.AsyncClient, 'stream',
++                            lambda self, method, url, **kw: real(self, method, f'http://127.0.0.1:{port}/', **kw))
++        start = time.monotonic()
++        assert not recovery.completion_succeeds(provider, 'model', _entry(), start + 1.0)
++        assert time.monotonic() - start < 2.5
++        assert proc.stdout.readline().strip() == 'PEER_CLOSED'
++        assert proc.wait(5) == 0
++    finally:
++        proc.kill()
++        proc.wait()
+-- 
+2.51.0
+

@@ -1,0 +1,72 @@
+From d3542029dd4376c69917fe99d6e683b8fad75ceb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 01:47:41 +0000
+Subject: [PATCH] [daveey] Deflake API admission test: swap the writer trace
+ only under db._lock
+
+test_api_admission_off_loop hung its CI shard for 600 s (run 43344150789,
+job 131619619143). The test installed and removed a Python trace callback on
+the owner's shared writer connection from the loop thread. set_trace_callback
+takes SQLite's connection mutex while holding the GIL, and a statement running
+in a worker thread holds that mutex while it calls the Python trace, which
+needs the GIL. The chat door still runs a post-turn owner transaction ~3 ms
+after the HTTP response settles, so removing the trace then could interleave
+with that statement and deadlock the whole process (no asyncio timeout can
+fire). faulthandler under CPU load showed exactly that: the loop thread at
+set_trace_callback(None), the worker inside _execute_write.
+
+Swap the trace in a worker thread while holding db._lock, which every
+writer-connection user holds, bounded by WAIT_S.
+
+Repro: 4 x 30 loops of the file under 12 CPU burners hung 4 of the first 31
+runs; a fault-injected harness that holds the post-response statement for
+0.3 s deadlocks every time with the old removal and passes with the new one.
+---
+ tests/gateway/test_api_admission_off_loop.py | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/tests/gateway/test_api_admission_off_loop.py b/tests/gateway/test_api_admission_off_loop.py
+index ceb9441fb8..6cd3287739 100644
+--- a/tests/gateway/test_api_admission_off_loop.py
++++ b/tests/gateway/test_api_admission_off_loop.py
+@@ -19,6 +19,21 @@ DOORS = [
+ ]
+ 
+ 
++async def set_writer_trace(db, callback):
++    """Swap the writer connection's trace callback only while no thread is inside a statement on it.
++
++    ``set_trace_callback`` takes SQLite's connection mutex while holding the GIL, and a statement
++    running in a worker thread holds that mutex while it calls the Python trace (which needs the
++    GIL): swapping it mid-statement deadlocks the whole process. Writes still run after the HTTP
++    response (the chat door's post-turn transaction), so take ``db._lock`` (every writer-connection
++    user holds it) in a worker thread, never the loop, bounded by ``WAIT_S``.
++    """
++    def swap():
++        with db._lock:
++            db._conn.set_trace_callback(callback)
++    await asyncio.wait_for(asyncio.to_thread(swap), WAIT_S)
++
++
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize('name,path,body,headers,expected', DOORS, ids=[d[0] for d in DOORS])
+ async def test_admission_waits_for_the_writer_off_the_owner_loop(api, owner, monkeypatch, name, path, body,
+@@ -58,7 +73,7 @@ async def test_admission_waits_for_the_writer_off_the_owner_loop(api, owner, mon
+                     holder.rollback()
+                 loop.call_soon_threadsafe(writer_started.set)
+ 
+-        owner.db._conn.set_trace_callback(trace)
++        await set_writer_trace(owner.db, trace)
+         request = asyncio.create_task(client.post(path, json=body, headers={**AUTH, **headers}))
+         try:
+             await asyncio.wait_for(writer_started.wait(), WAIT_S)
+@@ -73,5 +88,5 @@ async def test_admission_waits_for_the_writer_off_the_owner_loop(api, owner, mon
+             try:
+                 response = await asyncio.wait_for(request, WAIT_S)
+             finally:
+-                owner.db._conn.set_trace_callback(None)
++                await set_writer_trace(owner.db, None)
+         assert response.status == expected, await response.text()
+-- 
+2.51.0
+

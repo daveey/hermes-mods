@@ -1,0 +1,235 @@
+From 44a29a7f4e3f003570e111d676010eacc04dbe5c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 03:12:18 +0000
+Subject: [PATCH] [daveey] kanban: one skip-advice rule for kanban show and
+ notices; quota-wall skips offer no pool re-place
+
+PR #1835 review nits (t_01a1d2da4ff64b39, review 5885415248):
+1. For a recorded non-ordering skip plus a pool hint, `kanban show` (local_words) replaced the skip advice with
+   the pool re-place, while chat notices and ready_hint (_options -> notice_advice -> advice(skip)) kept both.
+   One rule now (local_words._skip_advice): the re-place sentence, then the skip's own advice, said once.
+   Ordering skips keep the lane's own advice, as before.
+2. A pinned_quota_wall skip advised a pool re-place on both local_words branches, dropping "starts on its own
+   when that wall resets / re-pin". _pool_could_run (placement_coordination.stranded) never reads the pool
+   workers' quota and a re-place keeps the walled pin, so kanban_dispatch_skip.pool_replace_helps() is False for
+   that skip: local_words and _pool_sentence (ready_hint, chat-wait and parent-unclaimed notices) drop the
+   re-place and keep the quota-wall advice.
+3. UNRECORDED_ADVICE and UNRECORDED_POOL_ADVICE share UNRECORDED_FACT.
+
+Proof: 3 new tests RED at bb32212d43 (all 3 fail), GREEN after; the #1835 no-census test moves to an owner_down
+skip under the new rule. 27 importer/notice test files: 633 passed. scripts/check --base origin/main ok.
+---
+ hermes_cli/kanban_dispatch_skip.py            | 17 ++--
+ hermes_cli/kanban_parent_unclaimed.py         |  3 +-
+ hermes_cli/kanban_queue_position.py           | 27 +++++--
+ .../test_kanban_wait_notice_pool_hint.py      | 79 +++++++++++++++++--
+ 4 files changed, 107 insertions(+), 19 deletions(-)
+
+diff --git a/hermes_cli/kanban_dispatch_skip.py b/hermes_cli/kanban_dispatch_skip.py
+index fba2adbd81..91a08cbcbb 100644
+--- a/hermes_cli/kanban_dispatch_skip.py
++++ b/hermes_cli/kanban_dispatch_skip.py
+@@ -320,13 +320,20 @@ def advice(skip: dict[str, Any]) -> str:
+             "Do not run its work outside the dispatcher")
+ 
+ 
+-UNRECORDED_ADVICE = (f"{UNRECORDED}: slots are free, yet no tick recorded why it passed this card over. Read the live "
+-                     "verdict (`hermes kanban dispatch --dry-run --json`) before changing anything; priority changes "
+-                     "are not the fix. Do not run its work outside the dispatcher")
++def pool_replace_helps(skip: Optional[dict[str, Any]]) -> bool:
++    """False when a pool re-place cannot clear ``skip``, so no surface may offer one. [daveey] PR #1835 review: a
++    ``pinned_quota_wall`` hold follows the pin to any machine, and ``_pool_could_run`` never reads the pool workers'
++    quota; its own advice (wait for the reset, or re-pin) stands. Any other skip's advice is kept after the
++    re-place sentence (``kanban_queue_position.local_words`` and the notices' ``_options`` alike)."""
++    return not skip or skip.get("reason") != PINNED_QUOTA_WALL
++
++
++UNRECORDED_FACT = f"{UNRECORDED}: slots are free, yet no tick recorded why it passed this card over."
++UNRECORDED_ADVICE = (f"{UNRECORDED_FACT} Read the live verdict (`hermes kanban dispatch --dry-run --json`) before "
++                     "changing anything; priority changes are not the fix. Do not run its work outside the dispatcher")
+ # After a pool re-place hint ("Re-place it ..."), "read the verdict before changing anything" contradicts the named
+ # fix, so a notice carrying ``pool_hint`` keeps only the fact and the dispatcher warning (PR #1829 review). [daveey]
+-UNRECORDED_POOL_ADVICE = (f"{UNRECORDED}: slots are free, yet no tick recorded why it passed this card over. "
+-                          "Do not run its work outside the dispatcher")
++UNRECORDED_POOL_ADVICE = f"{UNRECORDED_FACT} Do not run its work outside the dispatcher"
+ 
+ 
+ def unrecorded(place: Optional[dict[str, Any]], ready_seconds: Optional[float]) -> bool:
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index 11400a10c7..a8affd84c8 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -75,7 +75,8 @@ def _pool_sentence(place: dict[str, Any]) -> str:
+     """The pool re-place sentence when a pool worker could start the card now, else ``""``. Kept out of
+     :func:`_queue_words`: the notices print that clause in parentheses, and their advice already says not to run the
+     work outside the dispatcher (PR #1821 review). Dropped from these notices before (kanban-e7a33105a4). [daveey]"""
+-    if not place.get("pool_could_run"):
++    from hermes_cli.kanban_dispatch_skip import pool_replace_helps
++    if not place.get("pool_could_run") or not pool_replace_helps(place.get("skip")):  # a quota wall (PR #1835)
+         return ""
+     from hermes_cli.kanban_queue_position import pool_words
+     return pool_words(place, advice=False)
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index 121b51147d..64acaca858 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -325,6 +325,7 @@ def local_words(place: dict[str, Any]) -> str:
+     """``describe`` for the ``local`` lane: the recorded dispatcher skip first, when there is one."""
+     from hermes_cli import kanban_dispatch_skip as skips
+     skip = place.get("skip")
++    pooled = bool(place.get("pool_could_run")) and skips.pool_replace_helps(skip)
+     ahead = place.get("ahead")
+     words = (ahead_words(place, "waiting for a local slot: ~{n} ahead") if ahead is not None
+              else "waiting for a local slot")
+@@ -343,24 +344,34 @@ def local_words(place: dict[str, Any]) -> str:
+         words = f"{words}, {census}; class {place['admission_class']}"
+         pool_advice = ("Queued, not stuck: check class/placement and available capacity; priority slots are "
+                        "marked-only. Do not run its work outside the dispatcher")
+-        if place.get("pool_could_run"):  # a pool worker could start it now: the census must not hide that (#1821)
++        if pooled:  # a pool worker could start it now: the census must not hide that (#1821)
+             pool_advice = pool_words(place)
+         if not skip:
+             return f"{words}. {pool_advice}"
+         words = f"last dispatcher skip of this ready episode: {skips.words(skip)} ({words})"
+-        return words + ". " + (pool_advice if skips.is_ordering(skip) or place.get("pool_could_run")
+-                               else skips.advice(skip))
++        return words + ". " + _skip_advice(place, skip, pool_advice, pooled)
+     if place.get("running") is not None and place.get("limit") is not None:
+         words += f", {place['running']}/{place['limit']} running"
+     elif place.get("limit") is not None and "running" in place:
+         words += f", running count unknown (cap {place['limit']})"
+-    # One shape with the census branch: a recorded skip is framed first, and a pool re-place is its advice. This
+-    # branch used to return the pool hint before the skip, dropping the skip reason (PR #1829 review). [daveey]
+-    pool_advice = pool_words(place) if place.get("pool_could_run") else None
++    # One shape with the census branch: a recorded skip is framed first, then its advice. This branch used to
++    # return the pool hint before the skip, dropping the skip reason (PR #1829 review). [daveey]
++    pool_advice = pool_words(place) if pooled else _NOT_STUCK
+     if not skip:
+-        return words + ". " + (pool_advice or _NOT_STUCK)
++        return words + ". " + pool_advice
+     words = f"last dispatcher skip of this ready episode: {skips.words(skip)} ({words})"
+-    return words + ". " + (pool_advice or (_NOT_STUCK if skips.is_ordering(skip) else skips.advice(skip)))
++    return words + ". " + _skip_advice(place, skip, pool_advice, pooled)
++
++
++def _skip_advice(place: dict[str, Any], skip: dict[str, Any], ordering_advice: str, pooled: bool) -> str:
++    """The advice after a recorded skip, by the rule the chat notices follow (``kanban_parent_unclaimed._options``):
++    an ordering skip takes the lane's own advice (the pool re-place when a pool worker could run it); any other skip
++    keeps its own advice, after the re-place sentence when one applies. [daveey] PR #1835 review: ``kanban show``
++    replaced that advice with the re-place while the notices kept both."""
++    from hermes_cli import kanban_dispatch_skip as skips
++    if skips.is_ordering(skip):
++        return ordering_advice
++    return (pool_words(place, advice=False) + ". " if pooled else "") + skips.advice(skip)
+ 
+ 
+ def pool_words(place: dict[str, Any], *, advice: bool = True) -> str:
+diff --git a/tests/hermes_cli/test_kanban_wait_notice_pool_hint.py b/tests/hermes_cli/test_kanban_wait_notice_pool_hint.py
+index 0a620ba3e5..448f05efce 100644
+--- a/tests/hermes_cli/test_kanban_wait_notice_pool_hint.py
++++ b/tests/hermes_cli/test_kanban_wait_notice_pool_hint.py
+@@ -102,20 +102,20 @@ def test_kanban_show_keeps_the_pool_hint_under_the_admission_census():
+ def test_kanban_show_keeps_the_recorded_skip_with_a_pool_hint_without_the_census():
+     """PR #1829 review: without ``admission_pools``, ``local_words`` returned the pool hint before rendering the
+     recorded skip, so the skip reason vanished there while the census branch kept it. One shape for both: the skip
+-    framing first, the pool re-place as its advice."""
+-    skip = {"reason": "pinned_quota_wall", "detail": "claude-opus-5-5 (anthropic)"}
++    framing first, then the skip's own advice after the pool re-place (PR #1835 review: the notices' rule)."""
++    skip = {"reason": "owner_down", "detail": "default:inactive"}
+     place = {**_PLACE, "skip": skip, "pool_could_run": ["worker-2"], "task_id": "t_x"}
+     from hermes_cli import kanban_dispatch_skip as skips
++    tail = kqp.pool_words(place, advice=False) + ". " + skips.advice(skip)
+     words = kqp.local_words(place)
+     assert words.startswith("last dispatcher skip of this ready episode: " + skips.words(skip)), words
+     assert "(waiting for a local slot: ~16 ahead, 7/7 running)" in words, words
+-    assert words.endswith(kqp.pool_words(place)), words  # the pool re-place is the advice, said once
++    assert words.endswith(tail), words  # the re-place, then the skip's advice; the warning said once
+     _assert_pool_hint(words, "t_x")
+-    assert skips.advice(skip) not in words
+     pools = {"regular": 7, "regular_cap": 7, "priority": 0, "priority_cap": 2}
+     census = kqp.local_words({**place, "admission_pools": pools, "admission_class": "normal"})
+     assert census.startswith("last dispatcher skip of this ready episode: " + skips.words(skip)), census
+-    assert census.endswith(kqp.pool_words(place)), census  # same shape on both branches
++    assert census.endswith(tail), census  # same shape on both branches
+     unskipped = kqp.local_words({**place, "skip": None})
+     assert unskipped.startswith("waiting for a local slot") and unskipped.endswith(kqp.pool_words(place))
+     unpooled = kqp.local_words({**place, "pool_could_run": None})
+@@ -161,6 +161,75 @@ def test_ready_hint_without_pool_keeps_the_unrecorded_advice(home, monkeypatch):
+     assert hint is not None and _UNRECORDED_CLAUSE in hint, hint
+ 
+ 
++_CENSUS = {"admission_pools": {"regular": 7, "regular_cap": 7, "priority": 0, "priority_cap": 2},
++           "admission_class": "normal"}
++
++
++def _record_skip(conn, tid: str, reason: str, detail: str, until=None) -> None:
++    from hermes_cli import kanban_dispatch_skip as skips
++    assert skips.record(conn, tid, reason, detail=detail, until=until)
++
++
++def test_recorded_skip_with_a_pool_hint_keeps_both_on_every_surface(home, pool):
++    """PR #1835 review: for a recorded non-ordering skip plus a pool hint, ``kanban show`` replaced the skip advice
++    with the re-place while the chat notices and ``ready_hint`` kept both. One rule now: a skip whose advice does not
++    contradict a re-place keeps it after the pool sentence, on every surface, and the dispatcher warning is said
++    once."""
++    from hermes_cli import kanban_dispatch_skip as skips
++    skip = {"reason": "owner_down", "detail": "default:inactive"}
++    tail = skips.advice(skip)
++    place = {**_PLACE, "skip": skip, "pool_could_run": ["worker-2"], "task_id": "t_x"}
++    for shown in (kqp.local_words(place), kqp.local_words({**place, **_CENSUS})):
++        assert shown.startswith("last dispatcher skip of this ready episode: " + skips.words(skip)), shown
++        assert kqp.pool_words(place, advice=False) + ". " + tail in shown, shown
++        assert shown.endswith(tail) and shown.count("outside the dispatcher") == 1, shown
++    with kbc.connect_closing() as conn:
++        tid = _waiting_card(conn)
++        _record_skip(conn, tid, "owner_down", "default:inactive")
++        hint = pu.ready_hint(conn, kb.get_task(conn, tid))
++        assert cw.sweep(conn) == 1
++        notice = cw.notice_text(_notice(conn, tid, cw.NOTICE_KIND))
++    assert hint is not None
++    for text in (hint, notice):
++        _assert_pool_hint(text, tid)
++        assert text.endswith(tail + "."), text
++        assert text.count("outside the dispatcher") == 1, text
++
++
++def test_pinned_quota_wall_skip_keeps_its_advice_and_drops_the_pool_re_place(home, pool):
++    """PR #1835 review: ``local_words`` advised a pool re-place for a ``pinned_quota_wall`` skip, dropping "starts
++    on its own when that wall resets / re-pin". ``_pool_could_run`` never reads the pool workers' quota, and a
++    re-place keeps the walled pin, so the quota-wall advice stands and no surface offers the re-place."""
++    from hermes_cli import kanban_dispatch_skip as skips
++    skip = {"reason": skips.PINNED_QUOTA_WALL, "detail": "claude-opus-5-5 (anthropic)"}
++    place = {**_PLACE, "skip": skip, "pool_could_run": ["worker-2"], "task_id": "t_x"}
++    for shown in (kqp.local_words(place), kqp.local_words({**place, **_CENSUS})):
++        assert shown.startswith("last dispatcher skip of this ready episode: " + skips.words(skip)), shown
++        assert shown.endswith(skips.advice(skip)), shown
++        assert "--runs-on" not in shown and "pool worker(s)" not in shown, shown
++    assert pu._pool_sentence(place) == ""
++    with kbc.connect_closing() as conn:
++        tid = _waiting_card(conn)
++        _record_skip(conn, tid, skips.PINNED_QUOTA_WALL, "claude-opus-5-5 (anthropic)", until=time.time() + 3600)
++        hint = pu.ready_hint(conn, kb.get_task(conn, tid))
++        assert cw.sweep(conn) == 1
++        payload = _notice(conn, tid, cw.NOTICE_KIND)
++    assert "pool_hint" not in payload and hint is not None
++    for text in (hint, cw.notice_text(payload)):
++        assert "--runs-on" not in text and "pool worker(s)" not in text, text
++        assert "starts on its own when that wall resets" in text, text
++
++
++def test_unrecorded_advice_variants_share_one_fact_sentence():
++    """PR #1835 review: ``UNRECORDED_POOL_ADVICE`` repeated ``UNRECORDED_ADVICE``'s fact sentence verbatim."""
++    from hermes_cli import kanban_dispatch_skip as skips
++    assert skips.UNRECORDED_FACT.startswith(skips.UNRECORDED + ": ")
++    for text in (skips.UNRECORDED_ADVICE, skips.UNRECORDED_POOL_ADVICE):
++        assert text.startswith(skips.UNRECORDED_FACT + " "), text
++        assert text.endswith("Do not run its work outside the dispatcher"), text
++    assert skips.UNRECORDED_POOL_ADVICE == skips.UNRECORDED_FACT + " Do not run its work outside the dispatcher"
++
++
+ def _assert_pool_sentence_outside_parens(text: str) -> None:
+     """The multi-sentence pool hint follows the parenthesised queue clause, and the dispatcher warning is said once
+     (by the advice that ends the notice). PR #1821 review nit."""
+-- 
+2.51.0
+

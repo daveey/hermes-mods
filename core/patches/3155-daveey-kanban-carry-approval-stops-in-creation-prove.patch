@@ -1,0 +1,1283 @@
+From d122d975d9ea07d9a8c03ff988de85b6ef4afa50 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 23:57:32 +0000
+Subject: [PATCH] [daveey] kanban: carry approval stops in creation provenance;
+ bind delivery claims to exact operator receipts
+
+Consent: a typed human timeout/deny at the approval boundary on a direct
+`hermes kanban comment <t_id>` command is recorded in state.db and stamped
+onto every card the session (or its descendant cards) creates as
+created.consent_stops. Supervisor submission and the home executor refuse
+an operator comment on a stopped target (consent_stop), across hosts.
+Technical outcomes never stop or grant; an ordinary next user turn never
+clears a stop; only an explicit same-session same-target approval
+supersedes it for later cards. Created snapshots stay immutable.
+
+Delivery: the operator result event carries operator_delivery (exact
+request, target, caller run, executor, comment id and full SHA-256 of the
+read-back body). The existing completion receipt accepts it as evidence
+and complete_task verifies it against the Board's canonical request and
+result rows; a summary that claims delivery to a target this card filed
+an operator comment for, or to a replica-only foreign card, needs that
+receipt. Pending/failed/unrelated/wrong actor/target/digest never prove
+delivery. Transport (home execution, caller poll) uses the same canonical
+decoder.
+
+Task t_01a1d1d7998cda2a.
+---
+ hermes_cli/kanban_completion_receipt.py       |  30 ++-
+ hermes_cli/kanban_consent.py                  | 135 ++++++++++
+ hermes_cli/kanban_db.py                       |   2 +-
+ hermes_cli/kanban_db_creation.py              |   2 +
+ hermes_cli/kanban_operator_call.py            |  43 ++-
+ hermes_cli/kanban_operator_delivery.py        | 190 ++++++++++++++
+ hermes_cli/kanban_supervisor_requests.py      |   2 +
+ hermes_completion_receipt.py                  |  22 +-
+ .../test_kanban_consent_provenance.py         | 208 +++++++++++++++
+ tests/hermes_cli/test_kanban_operator_call.py |  18 +-
+ .../test_kanban_operator_canonical.py         |  82 ++++++
+ .../test_kanban_operator_delivery.py          | 246 ++++++++++++++++++
+ .../hermes_cli/test_kanban_operator_labels.py |   2 +
+ tests/test_kanban_hub_admission_audit.py      |   2 +
+ tools/approval_context.py                     |  10 +-
+ 15 files changed, 972 insertions(+), 22 deletions(-)
+ create mode 100644 hermes_cli/kanban_consent.py
+ create mode 100644 hermes_cli/kanban_operator_delivery.py
+ create mode 100644 tests/hermes_cli/test_kanban_consent_provenance.py
+ create mode 100644 tests/hermes_cli/test_kanban_operator_canonical.py
+ create mode 100644 tests/hermes_cli/test_kanban_operator_delivery.py
+
+diff --git a/hermes_cli/kanban_completion_receipt.py b/hermes_cli/kanban_completion_receipt.py
+index 1f7688baf1..313ff4da58 100644
+--- a/hermes_cli/kanban_completion_receipt.py
++++ b/hermes_cli/kanban_completion_receipt.py
+@@ -85,16 +85,39 @@ def _check_external(conn, task_id, ref):
+         raise refusal(ref, "owner is not open")
+ 
+ 
+-def prepare(conn, task_id, metadata):
++def _unproved(targets):
++    return ("completion_receipt: cross-card claim requires exact operator delivery receipt for "
++            f"{', '.join(sorted(targets))}: attach the applied result's operator_delivery as "
++            "completion_receipt evidence, or word a queued/pending request (or another actor's comment) "
++            "without claiming this card delivered it")
++
++
++def prepare(conn, task_id, metadata, *, summary=None):
+     """Return copied metadata and locally recheckable owners; reject before any write.
+ 
+     Legacy metadata is untouched. Refusing unknown ownership is intentional: a
+     plausible reference, stale replica, or new created_cards claim is not a link.
+     """
++    from hermes_cli.kanban_operator_delivery import gated_claims, verify
++    claims = gated_claims(conn, task_id, summary)
+     if not isinstance(metadata, dict) or "completion_receipt" not in metadata:
++        if claims:
++            raise ValueError(_unproved(claims))
+         return metadata, ()
+     receipt = validate_completion_receipt(metadata["completion_receipt"])
+     checks = []
++    proved = set()
++    for item in receipt["items"]:
++        for evidence in item["evidence"]:
++            proof = evidence.get("operator_delivery")
++            if proof:
++                if item["disposition"] != "delivered":
++                    raise ValueError("completion_receipt: operator delivery requires delivered disposition")
++                verify(conn, task_id, proof)
++                checks.append((proof, "operator_delivery"))
++                proved.add(proof["target_task_id"])
++    if claims - proved:
++        raise ValueError(_unproved(claims - proved))
+     owners = pending_owners(receipt)
+     if owners:
+         board, gateway = board_scope(conn)
+@@ -165,7 +188,10 @@ def _check_session_local(board, identity, ref):
+ def recheck(conn, task_id, owners):
+     """Recheck under the completion transaction, before any event/terminal write."""
+     for ref, local in owners:
+-        if local:
++        if local == "operator_delivery":
++            from hermes_cli.kanban_operator_delivery import verify_local
++            verify_local(conn, task_id, ref)
++        elif local:
+             _check_local(conn, task_id, ref)
+         else:
+             _, scope, gateway, identity = owner_parts(ref)
+diff --git a/hermes_cli/kanban_consent.py b/hermes_cli/kanban_consent.py
+new file mode 100644
+index 0000000000..02076b0470
+--- /dev/null
++++ b/hermes_cli/kanban_consent.py
+@@ -0,0 +1,135 @@
++"""Core consent provenance for card-scoped approval stops.
++
++The approval decision is durable in the existing state DB; created events carry
++its snapshot to workers. This is authorization state, not a delivery receipt.
++Ordinary user turns and elapsed time never remove a stop.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import os
++import re
++import shlex
++import time
++
++from hermes_constants import get_hermes_home
++
++_TARGET = re.compile(r"\bt_[0-9a-f]{8}(?:[0-9a-f]{8})?\b")
++def _comment_targets(command):
++    """Parse supported direct CLI invocations, never IDs inside body text.
++
++    This only records stops; it cannot create grants. Shell wrappers and other
++    approval transports must supply normalized operation identity separately.
++    """
++    if not isinstance(command, str):
++        return []
++    try:
++        argv = shlex.split(command)
++    except ValueError:
++        return []
++    if len(argv) < 4 or os.path.basename(argv[0]) != "hermes" or argv[1] != "kanban":
++        return []
++    args = argv[2:]
++    if args[:1] == ["--board"] and len(args) >= 3:
++        args = args[2:]
++    if len(args) >= 2 and args[0] == "comment" and _TARGET.fullmatch(args[1]):
++        return [args[1]]
++    return []
++
++
++
++_GRANTS = ("once", "session", "always")
++
++
++def observe_approval(payload):
++    """Consume typed human outcomes, never denial-looking tool output.
++
++    Timeout/deny records a stop. Only a later explicit human approval of the
++    same action on the same target supersedes it (stop history stays); an
++    ordinary chat turn, elapsed time or a different target never does.
++    """
++    choice = payload.get("choice")
++    session = payload.get("session_id") or payload.get("session_key")
++    command = payload.get("command") or ""
++    if choice not in ("timeout", "deny", *_GRANTS) or not session:
++        return
++    targets = _comment_targets(command)
++    if not targets:
++        return
++    outcome = {"timeout": "timeout", "deny": "denied"}.get(choice, "approved")
++    try:
++        _record(session, {"targets": targets, "outcome": outcome, "action": "comment",
++                          "at": time.time(), "origin_session": session})
++    except Exception:
++        if outcome != "approved":
++            raise  # a lost stop would let delegation act on a genuine non-consent: fail closed
++        # A lost grant only leaves the earlier stop in force; never block the approved command.
++        logging.getLogger(__name__).warning("kanban consent: could not record approval for %s", targets,
++                                            exc_info=True)
++
++
++def _record(session, stop):
++    from hermes_state import SessionDB
++    db = SessionDB(get_hermes_home() / "state.db")
++    try:
++        def record(conn):
++            conn.execute("CREATE TABLE IF NOT EXISTS kanban_consent_stops ("
++                         "id INTEGER PRIMARY KEY, origin_session TEXT NOT NULL, payload TEXT NOT NULL)")
++            conn.execute("INSERT INTO kanban_consent_stops(origin_session,payload) VALUES (?,?)",
++                         (session, json.dumps(stop)))
++        db._execute_write(record)
++    finally:
++        db.close()
++
++
++def _active(decisions):
++    """Stops still in force after explicit same-target approvals, in order."""
++    active = []
++    for d in decisions:
++        if d.get("outcome") == "approved":
++            granted = set(d.get("targets") or [])
++            active = [{**s, "targets": [t for t in s["targets"] if t not in granted]} for s in active]
++            active = [s for s in active if s["targets"]]
++        else:
++            active.append(d)
++    return active
++
++
++def session_stops(session):
++    if not session or not (get_hermes_home() / "state.db").exists():
++        return []
++    from hermes_state import SessionDB
++    db = SessionDB(get_hermes_home() / "state.db", read_only=True)
++    try:
++        if not db._read_one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_consent_stops'"):
++            return []
++        return _active([json.loads(r[0]) for r in db._read_all(
++            "SELECT payload FROM kanban_consent_stops WHERE origin_session=? ORDER BY id", (session,))])
++    finally:
++        db.close()
++
++
++def creation_stops(conn, task_id):
++    if not task_id:
++        return []
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='created' ORDER BY id LIMIT 1",
++                       (task_id,)).fetchone()
++    return json.loads(row[0] or "{}").get("consent_stops", []) if row else []
++
++
++def snapshot(conn, task_id, creator_task_id):
++    row = conn.execute("SELECT session_id FROM tasks WHERE id=?", (task_id,)).fetchone()
++    session = (row[0] if row else None) or os.environ.get("HERMES_SESSION_ID")
++    stops = creation_stops(conn, creator_task_id) + session_stops(session)
++    return list({json.dumps(s, sort_keys=True): s for s in stops}.values())
++
++
++def enforce(conn, requester, ops):
++    from hermes_cli.kanban_supervisor_requests import SupervisorRequestError
++    for stop in creation_stops(conn, requester):
++        for op in ops:
++            if (op.get("op") == "operator" and op.get("action") == "comment"
++                    and op.get("task_id") in stop.get("targets", [])):
++                raise SupervisorRequestError("consent_stop", "the originating approval did not consent to this "
++                                             "target; delegation does not authorize it")
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 59db15152f..a4280ad180 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2507,7 +2507,7 @@ def complete_task(
+     from hermes_cli.kanban_review_required import require_review
+     require_review(conn, task_id, expected_run_id, placement_settled=placement_settled)
+     from hermes_cli import kanban_completion_receipt as receipt_admission
+-    metadata, receipt_owners = receipt_admission.prepare(conn, task_id, metadata)
++    metadata, receipt_owners = receipt_admission.prepare(conn, task_id, metadata, summary=summary or result)
+     now = int(time.time())
+     if not _parents_satisfied(conn, task_id):
+         return False
+diff --git a/hermes_cli/kanban_db_creation.py b/hermes_cli/kanban_db_creation.py
+index da8d0957a7..a7497bf109 100644
+--- a/hermes_cli/kanban_db_creation.py
++++ b/hermes_cli/kanban_db_creation.py
+@@ -28,6 +28,7 @@ def record_created(conn, task_id, *, assignee, status, parents, creator_task_id,
+                    skills, goal_mode, model_override, provider_override, created_by, requires,
+                    placement_policy, human_request=None, placement_audit=None):
+     from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_consent import snapshot
+ 
+     kb._append_event(conn, task_id, "created", {
+         "assignee": assignee,
+@@ -48,6 +49,7 @@ def record_created(conn, task_id, *, assignee, status, parents, creator_task_id,
+         **(placement_audit if isinstance(placement_audit, dict) else {}),
+         # Final insertion policy, not a later assignment or a caller's diagnostic override.
+         "placement_policy": placement_policy,
++        "consent_stops": snapshot(conn, task_id, creator_task_id),
+     })
+     if isinstance(placement_audit, dict) and placement_audit.get("hub_admission"):
+         kb._append_event(conn, task_id, "hub_admission", placement_audit["hub_admission"])
+diff --git a/hermes_cli/kanban_operator_call.py b/hermes_cli/kanban_operator_call.py
+index 9a93fbad37..35406fa790 100644
+--- a/hermes_cli/kanban_operator_call.py
++++ b/hermes_cli/kanban_operator_call.py
+@@ -458,12 +458,16 @@ def _result_for(conn: sqlite3.Connection, target: str, uid: str, home: Optional[
+             _log.info("kanban: operator call result evidence for %s unavailable (%s); retrying", euid, exc)
+             retry = True
+             continue
+-        row = ev.get("row") if isinstance(ev, dict) else None
+-        if not isinstance(row, dict) or row.get("origin_gateway") != home or row.get("task_id") not in (None, target):
+-            _log.warning("kanban: ignoring operator_call_result %s for %s: the Board says %r wrote it, not %r",
+-                         euid, uid, (row or {}).get("origin_gateway"), home)
++        from hermes_cli.kanban_operator_delivery import canonical_payload
++        try:
++            canonical = canonical_payload(ev, euid, target, RESULT_KIND, home)
++        except ValueError:
++            _log.warning("kanban: ignoring operator_call_result %s: invalid Board identity", euid)
++            continue
++        if canonical != p:
++            _log.warning("kanban: ignoring operator_call_result %s: payload differs from Board", euid)
+             continue
+-        return p
++        return {**canonical, "result_event_uid": euid}
+     return _RETRY if retry else None
+ 
+ 
+@@ -499,6 +503,9 @@ def poll(conn: sqlite3.Connection, executor: str, *, now: Optional[int] = None)
+             status = _STATUS.get(outcome, "failed")
+         results = [{**op, "outcome": outcome, **({"detail": detail} if detail else {}),
+                     "home": res.get("executor_gateway") if res else state.get("home")}]
++        if status == "done" and res and res.get("operator_delivery"):
++            results[0]["operator_delivery"] = {**res["operator_delivery"],
++                                               "result_event_uid": res["result_event_uid"]}
+         with kb.write_txn(conn):
+             log(conn, request_uid=state["request_uid"], side="request",
+                 outcome={"done": "done", "rejected": "rejected"}.get(status, "failed"), detail=detail, finished=True)
+@@ -560,9 +567,14 @@ def _caller_refusal(rep: sqlite3.Connection, board: str, event: dict, payload: d
+     except Exception as exc:  # health: allow BLE001 -- unreachable Board: retry next tick
+         _log.info("kanban: operator call evidence for %s unavailable (%s); retrying", event["uid"], exc)
+         return None, True
+-    row = ev.get("row") if isinstance(ev, dict) else None
+-    if not isinstance(row, dict) or row.get("origin_gateway") != gw or row.get("task_id") not in (None, task):
+-        return f"caller_unproven: the Board says the request event came from {(row or {}).get('origin_gateway')}", False
++    from hermes_cli.kanban_operator_delivery import canonical_payload
++    try:
++        canonical = canonical_payload(ev, event["uid"], task, REQUEST_KIND, gw)
++    except ValueError:
++        return "caller_unproven: invalid canonical request identity", False
++    if canonical != payload:
++        return "caller_unproven: request payload differs from the Board", False
++    row = ev["row"]
+     created = row.get("created_at")
+     when = int(created) if isinstance(created, (int, float)) else int(at)
+     if when > 10 ** 11:  # Board timestamps are milliseconds
+@@ -733,6 +745,14 @@ def apply_incoming(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+             handled += 1
+             event = {"id": eid, "uid": euid, "task_id": etask}
+             refusal, retry = _caller_refusal(rep, board, event, payload)
++            if refusal is None and not retry:
++                from hermes_cli.kanban_consent import enforce
++                from hermes_cli.kanban_supervisor_requests import SupervisorRequestError
++                try:
++                    enforce(rep, (payload.get("caller") or {}).get("task_id"), [{
++                        "op": "operator", "action": payload.get("action"), "task_id": target}])
++                except SupervisorRequestError as exc:
++                    refusal = str(exc)
+             if retry:
+                 hi = eid - 1
+                 break
+@@ -767,9 +787,13 @@ def _execute_one(conn: sqlite3.Connection, payload: dict, own: str, refusal: Opt
+     op = {"action": action, "task_id": target, **(payload.get("args") or {})}
+     if refusal is None and action not in ACTIONS:
+         refusal = f"operator_action_refused: {action} stays with the card's owner"
++    proof = None
+     if refusal is None:
+         try:
+             outcome, detail = _apply(conn, payload, own)
++            if action == "comment" and outcome in ("applied", "already_applied"):
++                from hermes_cli.kanban_operator_delivery import applied_proof
++                proof = applied_proof(conn, payload, own)
+         except Exception as exc:  # health: allow BLE001 -- recorded as a failed call, never silent
+             _log.exception("kanban: operator call %s on %s failed", uid, target)
+             outcome, detail = "failed", f"{type(exc).__name__}: {exc}"[:500]
+@@ -781,7 +805,8 @@ def _execute_one(conn: sqlite3.Connection, payload: dict, own: str, refusal: Opt
+             supervisor_request_id=payload.get("supervisor_request_id"), finished=True)
+         kb._append_event(conn, target, RESULT_KIND, {
+             "request_uid": uid, "action": action, "outcome": outcome, "detail": detail, "executor_gateway": own,
+-            "caller": {k: (payload.get("caller") or {}).get(k) for k in ("gateway", "task_id", "run_id")}})
++            **({"operator_delivery": proof} if proof else {}),
++            "caller": {k: (payload.get("caller") or {}).get(k) for k in ("gateway", "task_id", "run_id", "run_uid")}})
+     _log.info("kanban: operator call %s %s on %s from %s: %s", uid, action, target,
+               (payload.get("caller") or {}).get("gateway"), outcome)
+     return outcome, detail or ""
+diff --git a/hermes_cli/kanban_operator_delivery.py b/hermes_cli/kanban_operator_delivery.py
+new file mode 100644
+index 0000000000..8fe3bcf56b
+--- /dev/null
++++ b/hermes_cli/kanban_operator_delivery.py
+@@ -0,0 +1,190 @@
++"""Exact comment identity attached to the existing operator result event."""
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++import sqlite3
++
++
++_CLAIM = re.compile(r"\b(?:posted|sent|delivered|commented|relayed)\b", re.IGNORECASE)
++# A clause that reports a non-delivery, a queue or an intent is never a claim:
++# pending stays queued wording and must not need (or fake) a delivery proof.
++_NOT_CLAIM = re.compile(r"(?:n't|n’t)\b|\b(?:not|never|no|queued|pending|failed|refused|rejected|unable|will|"
++                        r"would|could|should|may|might|if|once|until|awaiting|waiting)\b", re.IGNORECASE)
++_TASK_ID = re.compile(r"\bt_[0-9a-f]{8}(?:[0-9a-f]{8})?\b")
++
++
++def claimed_targets(text):
++    """Explicit affirmative past-tense delivery claims, one clause at a time."""
++    targets = set()
++    for clause in re.split(r"[.!?;\n]", text if isinstance(text, str) else ""):
++        if _CLAIM.search(clause) and not _NOT_CLAIM.search(clause):
++            targets.update(_TASK_ID.findall(clause))
++    return targets
++
++
++def gated_claims(conn, task_id, text):
++    """Claims that only an operator delivery can make true.
++
++    A card on this host's board can be commented directly and stays outside this
++    gate. A replica-only (foreign) card, or any target this card asked an
++    operator call to comment on, needs the exact receipt: an unrelated comment,
++    a pending request or a failed one never proves delivery.
++    """
++    claims = claimed_targets(text) - {task_id}
++    if not claims:
++        return set()
++    from hermes_cli import kanban_operator_call as calls
++    requested = set()
++    if calls._has_log(conn):
++        requested = {r[0] for r in conn.execute(
++            "SELECT target_task_id FROM operator_calls WHERE side='request' AND action='comment' "
++            "AND caller_task_id=?", (task_id,))}
++    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='supervisor_requests'").fetchone():
++        # Filed but not yet forwarded: still only a queued request, never delivery.
++        for (raw,) in conn.execute("SELECT ops_json FROM supervisor_requests WHERE requester_task_id=?",
++                                   (task_id,)):
++            try:
++                ops = json.loads(raw)
++            except ValueError:
++                continue
++            requested.update(op.get("task_id") for op in ops if isinstance(op, dict)
++                             and op.get("op") == "operator" and op.get("action") == "comment")
++    rest = claims - requested
++    if rest:
++        own = calls._own_gateway(conn)
++        with calls._replica(conn) as rep:
++            for t in rest:
++                local = conn.execute("SELECT 1 FROM tasks WHERE id=?", (t,)).fetchone()
++                row = None if local else calls._target_row(rep, t)
++                if row is not None and row["created_on"] != own and not _own_synced_comment(rep, t, own, task_id):
++                    requested.add(t)  # replica-only foreign card with no comment of ours synced back
++    return claims & requested
++
++
++def _own_synced_comment(rep, target, own, task_id):
++    """A direct hub comment by this card, synced back authored ``<gateway>/<task>``.
++
++    Only for targets with no operator request: those always need the exact
++    receipt. Authorship is the binding here; content is not (no request text).
++    """
++    try:
++        return rep.execute("SELECT 1 FROM task_comments WHERE task_id=? AND author=? LIMIT 1",
++                           (target, f"{own}/{task_id}")).fetchone() is not None
++    except sqlite3.Error:
++        return False
++
++
++def verify_local(conn, task_id, proof):
++    """Recheck the same-run request under the completion transaction."""
++    row = conn.execute("SELECT * FROM operator_calls WHERE request_uid=? AND side='request'",
++                       (proof["request_uid"],)).fetchone()
++    run = conn.execute("SELECT r.uid FROM task_runs r JOIN tasks t ON t.current_run_id=r.id WHERE t.id=?",
++                       (task_id,)).fetchone()
++    if row is None or row["outcome"] != "done":
++        raise ValueError("completion_receipt: operator request is pending, failed or missing")
++    if (row["caller_task_id"] != task_id or proof["caller_task_id"] != task_id or run is None
++            or row["caller_run_uid"] != run[0] or proof["caller_run_uid"] != run[0]):
++        raise ValueError("completion_receipt: operator caller/run mismatch")
++    from hermes_cli import kanban_operator_call as calls
++    if (row["action"] != "comment" or row["target_task_id"] != proof["target_task_id"]
++            or row["board"] != proof["board"] or calls._board_slug(conn) != proof["board"]
++            or row["caller_gateway"] != proof["caller_gateway"]):
++        raise ValueError("completion_receipt: operator target/board/actor mismatch")
++    event = conn.execute("SELECT payload FROM task_events WHERE uid=? AND task_id=? AND kind=?",
++                         (row["request_event_uid"], task_id, calls.REQUEST_KIND)).fetchone()
++    if event is None:
++        raise ValueError("completion_receipt: request event missing")
++    request = json.loads(event[0])
++    _bind_request(request, row, proof)
++    return row, request
++
++
++def _bind_request(request, row, proof):
++    from hermes_cli import kanban_operator_call as calls
++    caller, args = request.get("caller") or {}, request.get("args") or {}
++    text = args.get("text")
++    if (request.get("request_uid") != proof["request_uid"] or request.get("action") != "comment"
++            or request.get("target_task_id") != proof["target_task_id"]
++            or request.get("board") != proof["board"] or request.get("home") != proof["executor_gateway"]
++            or any(caller.get(k) != proof[p] for k, p in (
++                ("task_id", "caller_task_id"), ("run_uid", "caller_run_uid"), ("gateway", "caller_gateway")))
++            or not isinstance(text, str)
++            or hashlib.sha256(text.encode("utf-8")).hexdigest() != proof["content_sha256"]
++            or calls._digest({"action": "comment", "task_id": proof["target_task_id"], **args}) != row["args_digest"]):
++        raise ValueError("completion_receipt: exact request/content binding mismatch")
++
++
++def _canonical_event(board, uid, task, kind, gateway):
++    from hermes_cli import kanban_operator_call as calls
++    try:
++        evidence = calls._evidence(board, uid)
++    except Exception as exc:  # health: allow BLE001 -- unreachable Board refuses completion; retry later
++        raise ValueError(f"completion_receipt: canonical Board evidence unavailable ({type(exc).__name__})") from exc
++    return canonical_payload(evidence, uid, task, kind, gateway)
++
++
++def canonical_payload(evidence, uid, task, kind, gateway):
++    """Decode an exact authenticated event; shared by transport and completion."""
++    row = evidence.get("row") if isinstance(evidence, dict) else None
++    if (not isinstance(row, dict) or evidence.get("state") != "live"
++            or evidence.get("table") != "task_events" or evidence.get("uid") != uid
++            or row.get("uid") != uid or row.get("task_id") != task or row.get("kind") != kind
++            or row.get("origin_gateway") != gateway or row.get("deleted_at") is not None):
++        raise ValueError("completion_receipt: canonical event identity unavailable or mismatched")
++    payload = row.get("payload")
++    payload = json.loads(payload) if isinstance(payload, str) else payload
++    if not isinstance(payload, dict):
++        raise ValueError("completion_receipt: malformed canonical event payload")
++    return payload
++
++
++def verify(conn, task_id, proof):
++    from hermes_cli import kanban_operator_call as calls
++    row, local_request = verify_local(conn, task_id, proof)
++    request = _canonical_event(proof["board"], row["request_event_uid"], task_id,
++                               calls.REQUEST_KIND, row["caller_gateway"])
++    if request != local_request:
++        raise ValueError("completion_receipt: canonical request differs from submitted request")
++    _bind_request(request, row, proof)
++    with calls._replica(conn) as rep:
++        target = calls._target_row(rep, proof["target_task_id"])
++    if target is None or target["created_on"] != request["home"]:
++        raise ValueError("completion_receipt: target home mismatch")
++    result = _canonical_event(proof["board"], proof["result_event_uid"], proof["target_task_id"],
++                              calls.RESULT_KIND, request["home"])
++    if (result.get("outcome") not in ("applied", "already_applied") or result.get("action") != "comment"
++            or result.get("request_uid") != proof["request_uid"]
++            or result.get("executor_gateway") != request["home"]
++            or result.get("caller") != {k: request["caller"].get(k) for k in (
++                "gateway", "task_id", "run_id", "run_uid")}):
++        raise ValueError("completion_receipt: no verified applied operator result")
++    expected = {**(result.get("operator_delivery") or {}), "result_event_uid": proof["result_event_uid"]}
++    if expected != proof:
++        raise ValueError("completion_receipt: exact operator result/digest mismatch")
++
++
++def applied_proof(conn, payload, own):
++    """Read back the actual comment, including on an idempotent replay."""
++    from hermes_cli.kanban_operator_call import COMMENT_MARK
++    target, uid = payload["target_task_id"], payload["request_uid"]
++    caller = payload.get("caller") or {}
++    for row in conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC",
++                            (target, COMMENT_MARK)):
++        marker = json.loads(row[0])
++        if marker.get("operator_request_uid") != uid:
++            continue
++        comment = conn.execute("SELECT body, author, origin_gateway FROM task_comments WHERE task_id=? AND id=?",
++                               (target, marker["comment_id"])).fetchone()
++        if comment is None or comment[0] != (payload.get("args") or {}).get("text") \
++                or comment[1] != f"{caller.get('gateway')}/{caller.get('task_id')}" \
++                or comment[2] != caller.get("gateway") or marker.get("operator_caller") != {
++                    k: caller.get(k) for k in ("gateway", "task_id", "run_id", "run_uid")}:
++            raise ValueError("operator delivery comment identity mismatch")
++        return {"request_uid": uid, "target_task_id": target, "board": payload["board"],
++                "caller_task_id": caller["task_id"], "caller_run_uid": caller["run_uid"],
++                "caller_gateway": caller["gateway"], "executor_gateway": own,
++                "comment_id": marker["comment_id"],
++                "content_sha256": hashlib.sha256(comment[0].encode("utf-8")).hexdigest()}
++    raise ValueError("operator delivery comment missing")
+diff --git a/hermes_cli/kanban_supervisor_requests.py b/hermes_cli/kanban_supervisor_requests.py
+index 8db39e1821..81ebd33804 100644
+--- a/hermes_cli/kanban_supervisor_requests.py
++++ b/hermes_cli/kanban_supervisor_requests.py
+@@ -401,6 +401,8 @@ def _submit(conn: sqlite3.Connection, *, env_task: Optional[str], env_run: Optio
+ 
+     norm = normalize_ops(ops)
+     requester, run_id = validate_origin(conn, env_task, env_run)
++    from hermes_cli.kanban_consent import enforce
++    enforce(conn, requester, norm)
+     verdicts = preflight(conn, requester, norm)
+     available = executor_available(conn)
+     summary = {"ops": verdicts, "executor_available": available}
+diff --git a/hermes_completion_receipt.py b/hermes_completion_receipt.py
+index 2df02acff1..2c9bca4030 100644
+--- a/hermes_completion_receipt.py
++++ b/hermes_completion_receipt.py
+@@ -47,8 +47,21 @@ def _array(value: Any, name: str, limit: int, *, nonempty: bool = False) -> list
+     return value
+ 
+ 
++def _operator_delivery(value):
++    fields = {"request_uid", "target_task_id", "board", "caller_task_id", "caller_run_uid",
++              "caller_gateway", "executor_gateway", "comment_id", "content_sha256", "result_event_uid"}
++    raw = _object(value, fields)
++    out = {key: _text(raw[key], key, 128) for key in fields - {"comment_id"}}
++    if type(raw["comment_id"]) is not int or raw["comment_id"] <= 0:
++        raise ValueError("completion_receipt: comment_id needs a positive integer")
++    if not re.fullmatch(r"[0-9a-f]{64}", out["content_sha256"]):
++        raise ValueError("completion_receipt: content_sha256 needs full lowercase SHA256")
++    out["comment_id"] = raw["comment_id"]
++    return out
++
++
+ def _evidence(value: Any) -> dict:
+-    raw = _object(value, {"ref", "observed_at", "verification"})
++    raw = _object(value, {"ref", "observed_at", "verification"}, {"operator_delivery"})
+     observed_at = _text(raw["observed_at"], "observed_at", 64)
+     try:
+         stamp = datetime.fromisoformat(observed_at)
+@@ -56,8 +69,11 @@ def _evidence(value: Any) -> dict:
+         raise ValueError("completion_receipt: observed_at needs an ISO8601 timestamp with timezone") from exc
+     if stamp.tzinfo is None:
+         raise ValueError("completion_receipt: observed_at needs a timezone")
+-    return {"ref": _text(raw["ref"], "evidence ref", MAX_REF), "observed_at": observed_at,
+-            "verification": _enum(raw["verification"], VERIFICATIONS, "verification")}
++    out = {"ref": _text(raw["ref"], "evidence ref", MAX_REF), "observed_at": observed_at,
++           "verification": _enum(raw["verification"], VERIFICATIONS, "verification")}
++    if "operator_delivery" in raw:
++        out["operator_delivery"] = _operator_delivery(raw["operator_delivery"])
++    return out
+ 
+ 
+ def _remaining(value: Any) -> dict:
+diff --git a/tests/hermes_cli/test_kanban_consent_provenance.py b/tests/hermes_cli/test_kanban_consent_provenance.py
+new file mode 100644
+index 0000000000..a6c0e98a61
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_consent_provenance.py
+@@ -0,0 +1,208 @@
++"""Consent authority must survive delegation to a host without the originating chat."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_supervisor_requests as requests
++from tests.hermes_cli import test_kanban_operator_call as helpers
++from tools import approval_context
++
++fleet = helpers.fleet
++
++
++@pytest.mark.parametrize("outcome", ["timeout", "deny", "notify_failed", "cancelled"])
++def test_real_gateway_settlement_carries_consent_to_worker(fleet, monkeypatch, tmp_path, outcome):
++    from tools import approval as approvals
++    from tools import approval_gateway_wait as wait
++    from hermes_cli import kanban_consent as consent
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "gateway-home"))
++    session = "isolated-consent-gateway"
++    command = f"hermes kanban comment {fleet.target} 'isolated probe'"
++
++    def notify(data):
++        if outcome == "notify_failed":
++            raise OSError("isolated transport unavailable")
++        if outcome == "deny":
++            assert approvals.resolve_gateway_approval(session, "deny") == 1
++        elif outcome == "cancelled":
++            approvals.clear_session(session)
++
++    monkeypatch.setattr(wait, "_poll_event", lambda *a, **kw: "timeout" if outcome == "timeout" else "set")
++    try:
++        wait._await_gateway_decision(session, notify, {
++            "command": command, "description": "isolated", "pattern_key": "test", "pattern_keys": ["test"]})
++        caller = fleet.card(fleet.w, "settled child", session_id=session)
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "gateway-worker-home"))
++        op = {"op": "operator", "action": "comment", "task_id": fleet.target}
++        if outcome in ("timeout", "deny"):
++            with pytest.raises(requests.SupervisorRequestError, match="consent_stop"):
++                consent.enforce(fleet.w, caller, [op])
++        else:
++            consent.enforce(fleet.w, caller, [op])
++    finally:
++        approvals.clear_session(session)
++
++
++@pytest.mark.parametrize("template,expected", [
++    ("hermes kanban comment {target} 'See t_0000000000000000'", "target"),
++    ("hermes kanban supervisor-requests list --requester {target}", "none"),
++    ("printf '%s' 'hermes kanban comment {target} body'", "none"),
++    ("hermes kanban --board default comment {target} 'body'", "target"),
++])
++def test_consent_binds_command_target_not_body_mentions(fleet, monkeypatch, tmp_path, template, expected):
++    from hermes_cli import kanban_consent as consent
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "parser-home"))
++    approval_context._fire_approval_hook(
++        "post_approval_response", session_id="parser-chat",
++        command=template.format(target=fleet.target), choice="deny", surface="gateway")
++    stops = consent.session_stops("parser-chat")
++    assert [s["targets"] for s in stops] == ([[fleet.target]] if expected == "target" else [])
++
++
++@pytest.mark.parametrize("choice", ["notify_failed", "transport_error", "cancelled", "smart_deny"])
++def test_technical_or_machine_refusal_is_not_human_nonconsent(fleet, monkeypatch, tmp_path, choice):
++    from hermes_cli import kanban_consent as consent
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "technical-home"))
++    approval_context._fire_approval_hook(
++        "post_approval_response", session_id="technical-chat",
++        command=f"hermes kanban comment {fleet.target} 'probe'", choice=choice, surface="gateway")
++    assert consent.session_stops("technical-chat") == []
++
++
++def test_user_turn_does_not_clear_stop_and_child_inherits(fleet, monkeypatch, tmp_path):
++    from hermes_cli import kanban_consent as consent
++    from hermes_state import SessionDB
++    home = tmp_path / "persistent-home"
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    approval_context._fire_approval_hook(
++        "post_approval_response", session_id="persistent-chat",
++        command=f"hermes kanban comment {fleet.target} 'probe'", choice="deny", surface="gateway")
++    db = SessionDB(home / "state.db")
++    try:
++        db.create_session(session_id="persistent-chat", source="cli", model="test")
++        db.append_message("persistent-chat", "user", "What is the weather?")
++    finally:
++        db.close()
++    parent = fleet.card(fleet.w, "first child", session_id="persistent-chat")
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "grandchild-host"))
++    child = fleet.card(fleet.w, "second child", creator_task_id=parent)
++    with pytest.raises(requests.SupervisorRequestError, match="consent_stop"):
++        consent.enforce(fleet.w, child, [{"op": "operator", "action": "comment", "task_id": fleet.target}])
++
++
++def test_comment_stop_does_not_deny_unrelated_action(fleet, monkeypatch, tmp_path):
++    from hermes_cli import kanban_consent as consent
++    f = fleet
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "action-home"))
++    approval_context._fire_approval_hook(
++        "post_approval_response", session_id="action-chat",
++        command=f"hermes kanban comment {f.target} 'probe payload'", choice="deny", surface="gateway")
++    caller = f.card(f.w, "scoped child", session_id="action-chat")
++    consent.enforce(f.w, caller, [{"op": "operator", "action": "move", "task_id": f.target}])
++    with pytest.raises(requests.SupervisorRequestError, match="consent_stop"):
++        consent.enforce(f.w, caller, [{"op": "operator", "action": "comment", "task_id": f.target}])
++
++
++def test_home_executor_enforces_creation_stop_from_old_worker(fleet, monkeypatch, tmp_path):
++    from hermes_cli import kanban_consent as consent
++    f = fleet
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "origin-consent"))
++    approval_context._fire_approval_hook(
++        "post_approval_response", session_id="stopped-chat",
++        command=f"hermes kanban comment {f.target} 'probe payload'", choice="timeout", surface="gateway")
++    caller = f.card(f.w, "stopped child", session_id="stopped-chat")
++    kb.claim_task(f.w, caller)
++    run = kb._current_run_id(f.w, caller)
++    f.run_uid(f.w, caller)
++    f.board()
++    # Model an older submitting worker: the home must enforce independently.
++    with monkeypatch.context() as old_worker:
++        old_worker.setattr(consent, "enforce", lambda *args: None)
++        result = requests.submit(f.w, env_task=caller, env_run=str(run), ops=[{
++            "op": "operator", "action": "comment", "task_id": f.target, "text": "probe payload"}])
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home-without-chat"))
++    helpers._round(f)
++    request = requests.get_request(f.w, result["request_id"])
++    assert request["result"][0]["outcome"] == "refused", request
++    assert "consent_stop" in request["result"][0]["detail"]
++    assert not f.h.execute("SELECT 1 FROM task_comments WHERE task_id=?", (f.target,)).fetchone()
++
++
++def test_timeout_creation_provenance_refuses_cross_host_relay(fleet, monkeypatch, tmp_path):
++    f = fleet
++    session = "consent-origin"
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "consent-home"))
++    monkeypatch.setenv("HERMES_SESSION_ID", session)
++    approval_context._fire_approval_hook(
++        "post_approval_response", session_id=session, session_key=session,
++        command=f"hermes kanban comment {f.target} 'probe payload'", choice="timeout", surface="gateway")
++    caller = f.card(f.w, "independent follow-up", session_id=session)
++    payload = json.loads(f.w.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='created'", (caller,)).fetchone()[0])
++    assert payload.get("consent_stops"), "creation dropped the approval timeout"
++    assert payload["consent_stops"][0]["targets"] == [f.target]
++    assert payload["consent_stops"][0]["origin_session"] == session
++    assert payload["consent_stops"][0]["outcome"] == "timeout"
++    kb.claim_task(f.w, caller)
++    run = kb._current_run_id(f.w, caller)
++    f.run_uid(f.w, caller)
++    f.board()
++    # A worker on a different host has neither this chat nor its host-local stop cache.
++    other_home = tmp_path / "other-host"
++    other_home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(other_home))
++    monkeypatch.setenv("HERMES_SESSION_ID", "worker-session")
++    with pytest.raises(requests.SupervisorRequestError, match="consent_stop"):
++        requests.submit(f.w, env_task=caller, env_run=str(run), ops=[{
++            "op": "operator", "action": "comment", "task_id": f.target, "text": "probe payload"}])
++    assert not f.h.execute("SELECT 1 FROM task_comments WHERE task_id=?", (f.target,)).fetchone()
++
++
++def _decide(target, choice, session="regrant-chat"):
++    approval_context._fire_approval_hook(
++        "post_approval_response", session_id=session,
++        command=f"hermes kanban comment {target} 'probe payload'", choice=choice, surface="gateway")
++
++
++def test_explicit_same_target_approval_supersedes_stop(fleet, monkeypatch, tmp_path):
++    from hermes_cli import kanban_consent as consent
++    f = fleet
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "regrant-home"))
++    _decide(f.target, "timeout")
++    stopped = f.card(f.w, "stopped child", session_id="regrant-chat")
++    _decide(f.target, "once")
++    granted = f.card(f.w, "granted child", session_id="regrant-chat")
++    consent.enforce(f.w, granted, [{"op": "operator", "action": "comment", "task_id": f.target}])
++    # A card created under the stop keeps its immutable creation provenance.
++    with pytest.raises(requests.SupervisorRequestError, match="consent_stop"):
++        consent.enforce(f.w, stopped, [{"op": "operator", "action": "comment", "task_id": f.target}])
++
++
++@pytest.mark.parametrize("choice", ["smart_approve", "notify_failed", "cancelled"])
++def test_other_target_or_machine_approval_never_grants(fleet, monkeypatch, tmp_path, choice):
++    from hermes_cli import kanban_consent as consent
++    f = fleet
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "nogrant-home"))
++    _decide(f.target, "deny")
++    _decide("t_" + "1" * 16, "always")
++    _decide(f.target, choice)
++    child = f.card(f.w, "still stopped", session_id="regrant-chat")
++    with pytest.raises(requests.SupervisorRequestError, match="consent_stop"):
++        consent.enforce(f.w, child, [{"op": "operator", "action": "comment", "task_id": f.target}])
++
++
++@pytest.mark.parametrize("choice,raises", [("timeout", True), ("deny", True), ("once", False)])
++def test_store_failure_fails_closed_without_blocking_an_approved_command(monkeypatch, tmp_path, choice, raises):
++    """A lost stop must surface (the denial stays a denial); a lost grant only keeps the stop."""
++    import hermes_state
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "broken-store"))
++
++    def broken(self, fn):
++        raise hermes_state.sqlite3.OperationalError("database is locked")
++    monkeypatch.setattr(hermes_state.SessionDB, "_execute_write", broken)
++    if raises:
++        with pytest.raises(Exception, match="locked"):
++            _decide("t_" + "2" * 16, choice)
++    else:
++        _decide("t_" + "2" * 16, choice)
+diff --git a/tests/hermes_cli/test_kanban_operator_call.py b/tests/hermes_cli/test_kanban_operator_call.py
+index 7b0838195d..2ce22f36fb 100644
+--- a/tests/hermes_cli/test_kanban_operator_call.py
++++ b/tests/hermes_cli/test_kanban_operator_call.py
+@@ -28,6 +28,7 @@ class Fleet:
+         self.rep = connect(tmp_path / "replica.db")
+         self.gw = {id(self.w): "worker-5", id(self.h): "hub"}
+         self.origin: dict[str, str] = {}
++        self.canonical: dict[str, dict] = {}
+         self.evidence_down = False
+         for c in (self.w, self.h, self.rep):
+             for table, col in (("tasks", "created_on"), ("task_events", "uid"), ("task_runs", "uid")):
+@@ -72,6 +73,7 @@ class Fleet:
+                     self.rep.execute("INSERT INTO task_events (task_id, kind, payload, created_at, uid) "
+                                      "VALUES (?,?,?,?,?)", tuple(r))
+                     self.origin[r["uid"]] = gw
++                    self.canonical[r["uid"]] = dict(r)
+         # The feed: events on each gateway's own cards that another gateway wrote (none here) would come back.
+ 
+     def run_uid(self, conn, tid) -> str:
+@@ -102,16 +104,21 @@ def fleet(tmp_path, monkeypatch):
+     def evidence(_board, uid):
+         if f.evidence_down:
+             raise OSError("board unreachable")
+-        row = f.rep.execute("SELECT task_id, created_at FROM task_events WHERE uid = ?", (uid,)).fetchone()
+-        return {"table": "task_events", "uid": uid,
+-                "row": {"origin_gateway": f.origin.get(uid), "task_id": row[0] if row else None,
+-                        "created_at": int(time.time() * 1000)}}
++        row = f.canonical.get(uid)
++        return {"table": "task_events", "uid": uid, "state": "live" if row else "never_existed",
++                "row": {**row, "origin_gateway": f.origin.get(uid)} if row else None}
+ 
+     monkeypatch.setattr(kox, "_own_gateway", f.name)
+     monkeypatch.setattr(kox, "_replica", replica)
+     monkeypatch.setattr(kox, "_synced", lambda conn: True)
+     monkeypatch.setattr(kox, "_evidence", evidence)
+-    monkeypatch.setattr(kox, "_outbox_rows", lambda c: c.execute("SELECT COUNT(*) FROM task_events").fetchone()[0])
++    def outbox_rows(c):
++        # Production assigns event UIDs in the append transaction, before start logs it.
++        for (eid,) in c.execute("SELECT id FROM task_events WHERE uid IS NULL").fetchall():
++            c.execute("UPDATE task_events SET uid=? WHERE id=?", (str(uuid.uuid4()), eid))
++        return c.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]
++
++    monkeypatch.setattr(kox, "_outbox_rows", outbox_rows)
+     monkeypatch.setattr(kox, "_board_slug", lambda conn: "default")
+     kox._MARK.clear()
+     kox._PERSISTED.clear()
+@@ -543,6 +550,7 @@ def test_rebuilt_replica_is_rescanned_even_at_a_reused_position(fleet):
+             f.rep.execute("INSERT INTO task_events (task_id, kind, payload, created_at, uid) VALUES (?,?,?,?,?)",
+                           (r[0], r[1], r[2], r[3], r[4] + "-rebuilt"))
+             f.origin[r[4] + "-rebuilt"] = f.origin.get(r[4])
++            f.canonical[r[4] + "-rebuilt"] = {**f.canonical[r[4]], "uid": r[4] + "-rebuilt"}
+     top = f.rep.execute("SELECT MAX(id) FROM task_events").fetchone()[0]
+     assert top >= last  # the old watermark position still exists, holding a different event
+     kox.apply_incoming(f.h)
+diff --git a/tests/hermes_cli/test_kanban_operator_canonical.py b/tests/hermes_cli/test_kanban_operator_canonical.py
+new file mode 100644
+index 0000000000..83b16d840b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_operator_canonical.py
+@@ -0,0 +1,82 @@
++"""The Board payload, not an origin-only attestation, authorizes relay."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_operator_call as calls
++from hermes_cli import kanban_supervisor_requests as requests
++from tests.hermes_cli import test_kanban_operator_call as helpers
++
++fleet = helpers.fleet
++
++
++@pytest.mark.parametrize("side", ["request", "result"])
++@pytest.mark.parametrize("field,value", [
++    ("state", "deleted"), ("table", "task_comments"), ("uid", "other"),
++    ("row.uid", "other"), ("row.task_id", "other"), ("row.kind", "commented"),
++    ("row.origin_gateway", "impostor"), ("row.deleted_at", 1),
++    ("row.payload", "[]"), ("row.payload", "{"),
++])
++def test_transport_requires_exact_canonical_envelope(fleet, monkeypatch, side, field, value):
++    f = fleet
++    submitted = helpers._submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "approved"})
++    requests.drain(f.w)
++    f.board()
++    if side == "result":
++        requests.drain(f.h)
++        f.board()
++    kind = calls.REQUEST_KIND if side == "request" else calls.RESULT_KIND
++    uid = f.rep.execute("SELECT uid FROM task_events WHERE kind=?", (kind,)).fetchone()[0]
++    original = calls._evidence
++
++    def evidence(board, event_uid):
++        result = original(board, event_uid)
++        if event_uid == uid:
++            if field.startswith("row."):
++                result["row"][field[4:]] = value
++            else:
++                result[field] = value
++        return result
++
++    monkeypatch.setattr(calls, "_evidence", evidence)
++    if side == "request":
++        requests.drain(f.h)
++        assert not f.h.execute("SELECT 1 FROM task_comments WHERE task_id=?", (f.target,)).fetchone()
++        f.board()
++    requests.drain(f.w)
++    request = requests.get_request(f.w, submitted["request_id"])
++    assert request["status"] == ("rejected" if side == "request" else "accepted")
++
++
++def test_changed_replica_request_never_executes(fleet):
++    f = fleet
++    submitted = helpers._submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "approved"})
++    requests.drain(f.w)
++    f.board()
++    event = f.rep.execute("SELECT uid,payload FROM task_events WHERE kind=?", (calls.REQUEST_KIND,)).fetchone()
++    payload = json.loads(event[1])
++    payload["args"]["text"] = "not approved"
++    with kb.write_txn(f.rep):
++        f.rep.execute("UPDATE task_events SET payload=? WHERE uid=?", (json.dumps(payload), event[0]))
++    requests.drain(f.h)
++    assert not f.h.execute("SELECT 1 FROM task_comments WHERE task_id=?", (f.target,)).fetchone()
++    f.board()
++    requests.drain(f.w)
++    assert requests.get_request(f.w, submitted["request_id"])["status"] == "rejected"
++
++
++def test_changed_replica_result_cannot_finish_call(fleet):
++    f = fleet
++    submitted = helpers._submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "approved"})
++    requests.drain(f.w)
++    f.board()
++    requests.drain(f.h)
++    f.board()
++    event = f.rep.execute("SELECT uid,payload FROM task_events WHERE kind=?", (calls.RESULT_KIND,)).fetchone()
++    payload = json.loads(event[1])
++    payload["detail"] = "fabricated receipt detail"
++    with kb.write_txn(f.rep):
++        f.rep.execute("UPDATE task_events SET payload=? WHERE uid=?", (json.dumps(payload), event[0]))
++    requests.drain(f.w)
++    assert requests.get_request(f.w, submitted["request_id"])["status"] == "accepted"
+diff --git a/tests/hermes_cli/test_kanban_operator_delivery.py b/tests/hermes_cli/test_kanban_operator_delivery.py
+new file mode 100644
+index 0000000000..fc6fde3d5b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_operator_delivery.py
+@@ -0,0 +1,246 @@
++"""Exact delivery proof rides the existing operator result, not a second ledger."""
++import hashlib
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++
++from hermes_cli import kanban_supervisor_requests as requests
++from tests.hermes_cli import test_kanban_operator_call as helpers
++
++fleet = helpers.fleet
++
++
++def test_completion_cannot_claim_delivery_with_unrelated_comment(fleet):
++    f = fleet
++    kb.add_comment(f.h, f.target, "someone-else", "unrelated")
++    with pytest.raises(ValueError, match="exact operator delivery receipt"):
++        kb.complete_task(f.w, f.caller, expected_run_id=f.run_id,
++                         summary=f"Posted the findings to {f.target}.")
++    assert kb.get_task(f.w, f.caller).status == "running"
++
++
++def _receipt(proof):
++    return {"completion_receipt": {"version": 1, "items": [{
++        "scope": "cross-card findings", "disposition": "delivered", "remaining": [],
++        "evidence": [{"ref": "operator request", "observed_at": "2026-11-12T00:00:00Z",
++                      "verification": "independently_checked", "operator_delivery": proof}]}]}}
++
++
++def test_exact_receipt_admitted_at_canonical_completion(fleet):
++    f = fleet
++    submitted = helpers._submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "exact"})
++    helpers._round(f)
++    proof = requests.get_request(f.w, submitted["request_id"])["result"][0]["operator_delivery"]
++    assert kb.complete_task(f.w, f.caller, expected_run_id=f.run_id,
++                            summary=f"Posted the findings to {f.target}.", metadata=_receipt(proof))
++    assert kb.get_task(f.w, f.caller).status == "done"
++
++
++def _delivered(f):
++    submitted = helpers._submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "exact"})
++    helpers._round(f)
++    return requests.get_request(f.w, submitted["request_id"])["result"][0]["operator_delivery"]
++
++
++@pytest.mark.parametrize("field,value", [
++    ("content_sha256", "0" * 64), ("caller_gateway", "impostor"),
++    ("request_uid", "wrong-request"), ("target_task_id", "t_0000000000000000"),
++    ("caller_run_uid", "old-run"), ("executor_gateway", "impostor"), ("board", "other"),
++])
++def test_forged_replica_receipt_rejected(fleet, field, value):
++    f = fleet
++    proof = _delivered(f)
++    proof[field] = value
++    # A forged replica and receipt agree; the independent Board copy does not.
++    raw = f.rep.execute("SELECT payload FROM task_events WHERE uid=?", (proof["result_event_uid"],)).fetchone()[0]
++    payload = json.loads(raw)
++    payload["operator_delivery"] = {k: v for k, v in proof.items() if k != "result_event_uid"}
++    if field == "executor_gateway":
++        payload["executor_gateway"] = value
++        f.origin[proof["result_event_uid"]] = value
++    with kb.write_txn(f.rep):
++        f.rep.execute("UPDATE task_events SET payload=? WHERE uid=?", (json.dumps(payload), proof["result_event_uid"]))
++    with pytest.raises(ValueError, match="completion_receipt"):
++        kb.complete_task(f.w, f.caller, expected_run_id=f.run_id, metadata=_receipt(proof))
++    assert kb.get_task(f.w, f.caller).status == "running"
++
++
++@pytest.mark.parametrize("outcome", ["forwarded", "failed", "rejected"])
++def test_nonterminal_or_failed_request_is_not_delivery(fleet, outcome):
++    f = fleet
++    proof = _delivered(f)
++    with kb.write_txn(f.w):
++        f.w.execute("UPDATE operator_calls SET outcome=? WHERE request_uid=?", (outcome, proof["request_uid"]))
++    with pytest.raises(ValueError, match="completion_receipt"):
++        kb.complete_task(f.w, f.caller, expected_run_id=f.run_id, metadata=_receipt(proof))
++
++
++@pytest.mark.parametrize("change", ["args", "actor", "request", "target", "home"])
++def test_canonical_request_must_bind_delivery(fleet, change):
++    f = fleet
++    proof = _delivered(f)
++    uid = f.w.execute("SELECT request_event_uid FROM operator_calls WHERE request_uid=?", (proof["request_uid"],)).fetchone()[0]
++    payload = json.loads(f.canonical[uid]["payload"])
++    container, key, value = {
++        "args": (payload["args"], "text", "different content"),
++        "actor": (payload["caller"], "gateway", "impostor"),
++        "request": (payload, "request_uid", "other"),
++        "target": (payload, "target_task_id", "t_0000000000000000"),
++        "home": (payload, "home", "impostor"),
++    }[change]
++    container[key] = value
++    f.canonical[uid]["payload"] = json.dumps(payload)
++    with pytest.raises(ValueError, match="completion_receipt"):
++        kb.complete_task(f.w, f.caller, expected_run_id=f.run_id, metadata=_receipt(proof))
++
++
++@pytest.mark.parametrize("field,value", [
++    ("outcome", "failed"), ("outcome", "pending"), ("request_uid", "wrong"),
++    ("action", "move"), ("executor_gateway", "impostor"), ("caller", {}),
++    ("operator_delivery", {}),
++])
++def test_canonical_result_must_attest_exact_application(fleet, field, value):
++    f = fleet
++    proof = _delivered(f)
++    row = f.canonical[proof["result_event_uid"]]
++    payload = json.loads(row["payload"])
++    payload[field] = value
++    row["payload"] = json.dumps(payload)
++    with pytest.raises(ValueError, match="completion_receipt"):
++        kb.complete_task(f.w, f.caller, expected_run_id=f.run_id, metadata=_receipt(proof))
++
++
++@pytest.mark.parametrize("field,value", [
++    ("uid", "other"), ("task_id", "t_0000000000000000"), ("kind", "commented"),
++    ("origin_gateway", "impostor"), ("deleted_at", 1), ("payload", "[]"),
++])
++def test_canonical_event_identity_required(fleet, field, value):
++    f = fleet
++    proof = _delivered(f)
++    uid = proof["result_event_uid"]
++    if field == "origin_gateway":
++        f.origin[uid] = value
++    else:
++        f.canonical[uid][field] = value
++    with pytest.raises(ValueError, match="completion_receipt"):
++        kb.complete_task(f.w, f.caller, expected_run_id=f.run_id, metadata=_receipt(proof))
++
++
++def test_rejected_disposition_cannot_prove_delivery(fleet):
++    f = fleet
++    proof = _delivered(f)
++    metadata = _receipt(proof)
++    metadata["completion_receipt"]["items"][0]["disposition"] = "rejected"
++    with pytest.raises(ValueError, match="completion_receipt"):
++        kb.complete_task(f.w, f.caller, expected_run_id=f.run_id,
++                         summary=f"Posted findings to {f.target}.", metadata=metadata)
++
++
++@pytest.mark.parametrize("field,value", [("body", "changed"), ("author", "other"), ("origin_gateway", "other")])
++def test_executor_readback_rejects_changed_comment(fleet, field, value):
++    from hermes_cli.kanban_operator_delivery import applied_proof
++    f = fleet
++    proof = _delivered(f)
++    uid = f.w.execute("SELECT request_event_uid FROM operator_calls WHERE request_uid=?", (proof["request_uid"],)).fetchone()[0]
++    request = json.loads(f.canonical[uid]["payload"])
++    with kb.write_txn(f.h):
++        f.h.execute(f"UPDATE task_comments SET {field}=? WHERE id=?", (value, proof["comment_id"]))
++    with pytest.raises(ValueError, match="operator delivery"):
++        applied_proof(f.h, request, "hub")
++
++
++@pytest.mark.parametrize("field,value", [("comment_id", True), ("comment_id", 0), ("content_sha256", "a" * 16),
++                                         ("extra", "x"), ("caller_gateway", ""), ("board", [])])
++def test_malformed_delivery_schema_rejected(fleet, field, value):
++    f = fleet
++    proof = _delivered(f)
++    proof[field] = value
++    with pytest.raises(ValueError, match="completion_receipt"):
++        kb.complete_task(f.w, f.caller, expected_run_id=f.run_id, metadata=_receipt(proof))
++
++
++def test_applied_result_carries_exact_delivery_identity(fleet):
++    f = fleet
++    text = "Exact payload: café\nsecond line"
++    submitted = helpers._submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": text})
++    helpers._round(f)
++    result = requests.get_request(f.w, submitted["request_id"])["result"][0]
++    proof = result.get("operator_delivery")
++    assert proof, "applied result lost exact delivery proof"
++    assert proof["content_sha256"] == hashlib.sha256(text.encode("utf-8")).hexdigest()
++    assert proof["target_task_id"] == f.target
++    assert proof["caller_task_id"] == f.caller
++    assert proof["caller_run_uid"] == f.w.execute("SELECT uid FROM task_runs WHERE id=?", (f.run_id,)).fetchone()[0]
++    assert proof["executor_gateway"] == "hub"
++    row = f.rep.execute("SELECT task_id, payload FROM task_events WHERE uid=?", (proof["result_event_uid"],)).fetchone()
++    assert row[0] == f.target
++    payload = json.loads(row[1])
++    assert payload["request_uid"] == proof["request_uid"]
++    assert payload["operator_delivery"] == {k: v for k, v in proof.items() if k != "result_event_uid"}
++    comment = f.h.execute("SELECT body, author FROM task_comments WHERE id=?", (proof["comment_id"],)).fetchone()
++    assert tuple(comment) == (text, f"worker-5/{f.caller}")
++
++
++@pytest.mark.parametrize("summary", [
++    "Did not post the findings to {t}.", "Queued a comment to {t}; the home has not applied it yet.",
++    "Will relay the findings to {t} once the home applies it.", "The comment to {t} failed and was not sent.",
++    "The findings weren't posted to {t}.", "Haven't sent anything to {t}.",
++])
++def test_non_delivery_wording_is_not_a_claim(fleet, summary):
++    f = fleet
++    helpers._submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "queued"})
++    assert kb.complete_task(f.w, f.caller, expected_run_id=f.run_id, summary=summary.format(t=f.target))
++
++
++def test_pending_request_cannot_be_claimed_as_delivered(fleet):
++    f = fleet
++    helpers._submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "pending"})
++    with pytest.raises(ValueError, match="exact operator delivery receipt"):
++        kb.complete_task(f.w, f.caller, expected_run_id=f.run_id, summary=f"Posted the findings to {f.target}.")
++    assert kb.get_task(f.w, f.caller).status == "running"
++
++
++def test_local_card_comment_claim_stays_outside_operator_gate(fleet):
++    f = fleet
++    local = f.card(f.w, "local sibling")
++    kb.add_comment(f.w, local, "default", "direct local comment")
++    assert kb.complete_task(f.w, f.caller, expected_run_id=f.run_id, summary=f"Commented the findings on {local}.")
++
++
++def test_own_synced_comment_on_foreign_card_stays_outside_operator_gate(fleet):
++    # A direct hub comment (not an operator call) syncs back authored "<gateway>/<caller>".
++    # Real-row replay: 5 of 261 done cards on worker-3 claimed such deliveries.
++    f = fleet
++    kb.add_comment(f.rep, f.target, f"worker-5/{f.caller}", "findings")
++    assert kb.complete_task(f.w, f.caller, expected_run_id=f.run_id, summary=f"Posted the findings to {f.target}.")
++
++
++@pytest.mark.parametrize("author", ["worker-5/t_00000000deadbeef", "worker-9/{c}", "default"])
++def test_other_authors_synced_comment_is_not_own_delivery(fleet, author):
++    f = fleet
++    kb.add_comment(f.rep, f.target, author.format(c=f.caller), "findings")
++    with pytest.raises(ValueError, match="exact operator delivery receipt"):
++        kb.complete_task(f.w, f.caller, expected_run_id=f.run_id, summary=f"Posted the findings to {f.target}.")
++
++
++def test_own_synced_comment_never_replaces_a_filed_request_receipt(fleet):
++    f = fleet
++    helpers._submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "pending"})
++    kb.add_comment(f.rep, f.target, f"worker-5/{f.caller}", "findings")
++    with pytest.raises(ValueError, match="exact operator delivery receipt"):
++        kb.complete_task(f.w, f.caller, expected_run_id=f.run_id, summary=f"Posted the findings to {f.target}.")
++
++
++def test_unreachable_board_refuses_delivery_proof_cleanly(fleet, monkeypatch):
++    from hermes_cli import kanban_operator_call as calls
++    f = fleet
++    proof = _delivered(f)
++
++    def down(*_a, **_k):
++        raise OSError("board unreachable")
++    monkeypatch.setattr(calls, "_evidence", down)
++    with pytest.raises(ValueError, match="canonical Board evidence unavailable"):
++        kb.complete_task(f.w, f.caller, expected_run_id=f.run_id, metadata=_receipt(proof))
++    assert kb.get_task(f.w, f.caller).status == "running"
+diff --git a/tests/hermes_cli/test_kanban_operator_labels.py b/tests/hermes_cli/test_kanban_operator_labels.py
+index 41376099ff..009b5d88e1 100644
+--- a/tests/hermes_cli/test_kanban_operator_labels.py
++++ b/tests/hermes_cli/test_kanban_operator_labels.py
+@@ -83,6 +83,8 @@ def hub(fleet, monkeypatch):
+             f.rep.execute("INSERT INTO task_events (task_id, kind, payload, created_at, uid) VALUES (?,?,?,?,?)",
+                           (task_id, kox.RESULT_KIND, json.dumps(payload), int(time.time()), event_uid))
+         f.origin[event_uid] = own
++        f.canonical[event_uid] = {"task_id": task_id, "kind": kox.RESULT_KIND,
++                                  "payload": json.dumps(payload), "created_at": int(time.time()), "uid": event_uid}
+         return "applied", ""
+ 
+     monkeypatch.setattr(kol, "_admin", reg.admin)
+diff --git a/tests/test_kanban_hub_admission_audit.py b/tests/test_kanban_hub_admission_audit.py
+index 19590d2e26..153fffcf39 100644
+--- a/tests/test_kanban_hub_admission_audit.py
++++ b/tests/test_kanban_hub_admission_audit.py
+@@ -31,6 +31,8 @@ def test_created_emits_separate_admission_event(monkeypatch, receipt):
+     events = []
+     monkeypatch.setattr(kb, "_append_event", lambda conn, tid, kind, payload:
+                         events.append((kind, payload)))
++    from hermes_cli import kanban_consent
++    monkeypatch.setattr(kanban_consent, "snapshot", lambda *_a: [])  # Mock conn has no board rows
+     creation.record_created(Mock(), "t_test", assignee="default", status="ready", parents=[],
+                             creator_task_id=None, tenant=None, workspace_kind="scratch",
+                             workspace_path=None, branch_name=None, project_id=None, skills=[],
+diff --git a/tools/approval_context.py b/tools/approval_context.py
+index 4604ede32c..4adf9af2bc 100644
+--- a/tools/approval_context.py
++++ b/tools/approval_context.py
+@@ -55,9 +55,15 @@ def _fire_approval_hook(hook_name: str, **kwargs) -> None:
+     """Invoke a plugin lifecycle hook (pre_approval_request / post_approval_response).
+ 
+     Lazy-imports the plugin manager (approval.py is imported long before plugins
+-    are discovered). Never raises: approval flow is safety-critical, plugin
+-    observability is not.
++    are discovered). Plugin observability failures never escape. Core consent
++    persistence runs first: a storage error recording a timeout/deny stop
++    propagates (the command is already refused; the lost stop must not pass
++    silently into later delegation); a failure recording a grant is logged and
++    only leaves the earlier stop in force.
+     """
++    if hook_name == "post_approval_response":
++        from hermes_cli.kanban_consent import observe_approval
++        observe_approval({**kwargs, "session_id": kwargs.get("session_id") or _approval_session_id.get()})
+     try:
+         from hermes_cli.lifecycle import invoke_hook
+     except Exception:
+-- 
+2.51.0
+

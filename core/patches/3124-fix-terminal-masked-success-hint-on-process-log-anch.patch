@@ -1,0 +1,141 @@
+From c5aaabf6b077c59e8d889bc14638e803614db78f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 03:59:27 +0000
+Subject: [PATCH] fix(terminal): masked-success hint on process log, anchor
+ missing-command shapes, pin poll fallback [daveey]
+
+Follow-ups from the PR #1852 review:
+- process_manage log of an exited session now carries exit_code/completion_reason/
+  termination_source like poll/wait, so with_masked_success_hint can flag a masked
+  missing command there too (it returned early without exit_code).
+- _FAILURE_SHAPES: 'command not found' and 'failed to run command' only match at a
+  '<program>: ' line head, so quoted content (git show | tail over a test or log line)
+  no longer counts as a failure.
+- Tests: poll result hint via the output_preview fallback, log hint end to end, and
+  quoted-message negatives.
+---
+ tests/tools/test_terminal_hints.py | 65 +++++++++++++++++++++++++++++-
+ tools/process_registry.py          |  6 +--
+ tools/terminal_hints.py            |  7 +++-
+ 3 files changed, 72 insertions(+), 6 deletions(-)
+
+diff --git a/tests/tools/test_terminal_hints.py b/tests/tools/test_terminal_hints.py
+index d0e6c2db54..e26c1a7dae 100644
+--- a/tests/tools/test_terminal_hints.py
++++ b/tests/tools/test_terminal_hints.py
+@@ -300,9 +300,30 @@ class TestMaskedMissingCommand:
+         out = "cat: notes.txt: No such file or directory\n"
+         assert annotate_masked_success("make docs 2>&1 | tail -5", out) is None
+ 
++    @pytest.mark.parametrize("output", [
++        # A diff/source line quoting the message (`git show | tail`) is content.
++        "+        \"timeout: failed to run command 'hermes-core-wt': No such file or directory\\n\",\n",
++        "+    assert out == 'bash: line 1: foo: command not found'\n",
++        # A log line quoting the message after a timestamp/prefix.
++        "2026-11-13 INFO saw: timeout: failed to run command 'x': No such file or directory\n",
++        "[worker] note: the old run printed 'bash: x: command not found'\n",
++        "    bash: foo: command not found\n",
++    ])
++    def test_quoted_missing_command_message_not_flagged(self, output):
++        assert annotate_masked_success("git show HEAD | tail -40", output) is None
++        assert annotate_masked_success("make docs 2>&1 | tail -5", output) is None
++
++    @pytest.mark.parametrize("output", [
++        "-bash: hermes-core-wt: command not found\n",
++        "/bin/bash: hermes-core-wt: command not found\n",
++        "nohup: failed to run command 'hermes-core-wt': No such file or directory\n",
++    ])
++    def test_shell_and_wrapper_line_heads_still_flagged(self, output):
++        assert "pipeline" in (annotate_masked_success(self.INCIDENT, output) or "")
++
+ 
+ class TestProcessResultMaskedHint:
+-    """poll/wait results on a background process carry the same masked-success hint as the
++    """poll/wait/log results on a background process carry the same masked-success hint as the
+     foreground terminal result and the completion notice."""
+ 
+     def test_wait_result_gets_hint(self, monkeypatch):
+@@ -327,3 +348,45 @@ class TestProcessResultMaskedHint:
+         monkeypatch.setitem(pr._SESSION_ACTIONS, "wait", (lambda sid, a: dict(result), True))
+         out = json.loads(pr._handle_process({"action": "wait", "session_id": "proc_x"}))
+         assert "hint" not in out
++
++    def test_poll_result_hint_reads_output_preview(self, monkeypatch):
++        # poll carries no "output", only "output_preview": the hint must fall back to it.
++        import json
++
++        from tools import process_registry as pr
++
++        result = {"session_id": "proc_x", "status": "exited", "exit_code": 0,
++                  "command": TestMaskedMissingCommand.INCIDENT,
++                  "output_preview": "bash: line 1: hermes-core-wt: command not found\n"}
++        monkeypatch.setitem(pr._SESSION_ACTIONS, "poll", (lambda sid, a: dict(result), True))
++        out = json.loads(pr._handle_process({"action": "poll", "session_id": "proc_x"}))
++        assert "output" not in out
++        assert "pipeline" in out.get("hint", ""), out
++
++    def test_log_of_exited_session_gets_hint(self, monkeypatch):
++        # read_log carries the exit fields once the session exited, so `log` gets the hint too.
++        import json
++
++        from tools import process_registry as pr
++
++        reg = pr.ProcessRegistry()
++        session = pr.ProcessSession(
++            id="proc_logx", command=TestMaskedMissingCommand.INCIDENT, task_id="t1",
++            exited=True, exit_code=0,
++            output_buffer="timeout: failed to run command 'hermes-core-wt': No such file or directory\n")
++        reg._finished[session.id] = session
++        monkeypatch.setattr(pr, "process_registry", reg)
++        log = reg.read_log(session.id)
++        assert log["status"] == "exited" and log["exit_code"] == 0, log
++        out = json.loads(pr._handle_process({"action": "log", "session_id": session.id}))
++        assert "pipeline" in out.get("hint", ""), out
++
++    def test_log_of_running_session_has_no_exit_fields(self, monkeypatch):
++        from tools import process_registry as pr
++
++        reg = pr.ProcessRegistry()
++        session = pr.ProcessSession(id="proc_logr", command="sleep 9 | tail", task_id="t1",
++                                    output_buffer="bash: foo: command not found\n")
++        reg._running[session.id] = session
++        log = reg.read_log(session.id)
++        assert log["status"] == "running" and "exit_code" not in log
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 9ef56a817c..d4d593503d 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -1982,9 +1982,9 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+             selected = lines[offset:offset + limit]
+             stop = slice(offset, offset + limit).indices(total_lines)[1]
+             observed_completion_output = total_lines == 0 or (bool(selected) and stop == total_lines)
+-        result = {
+-            **self._status_head(session), "output": "\n".join(selected),
+-            "total_lines": total_lines, "showing": f"{len(selected)} lines"}
++        result = {  # exit fields as in poll/wait, so an exited-0 log gets the masked-success hint too
++            **self._status_head(session), **(self._exit_fields(session) if exited else {}),
++            "output": "\n".join(selected), "total_lines": total_lines, "showing": f"{len(selected)} lines"}
+         if exited and observed_completion_output and not finalizing:
+             self._consume_completion(session_id)
+         return result
+diff --git a/tools/terminal_hints.py b/tools/terminal_hints.py
+index b42d389a56..eca87dad24 100644
+--- a/tools/terminal_hints.py
++++ b/tools/terminal_hints.py
+@@ -156,8 +156,11 @@ _FAILURE_SHAPES = re.compile(
+     # A missing command: the shell's own message, or a wrapper (timeout/env/nice/...) that
+     # could not exec it. Behind `| tail` the run "passed" without running at all
+     # (agent-dab059c232). A tool's own file argument (`cat: x: No such file`) is not matched.
+-    r"|(?m:^[^\n]*: command not found$)"
+-    r"|failed to run command [\u2018'\"][^\u2019'\"\n]+[\u2019'\"]: No such file or directory"
++    # Both anchored to a `<program>: ` line head, so quoted content carrying the message (a diff
++    # or source line behind `git show | tail`) does not match.
++    r"|(?m:^[\w./-]+:(?: line \d+:)? [^\s:]+: command not found$)"
++    r"|(?m:^[\w./-]+: failed to run command "
++    r"[\u2018'\"][^\u2019'\"\n]+[\u2019'\"]: No such file or directory)"
+     r"|(?m:^(?:env|nice|nohup|stdbuf|xargs|timeout|sudo|ionice|setsid|chrt|taskset): "
+     r"[\u2018'\"][^\u2019'\"\n]+[\u2019'\"]: No such file or directory)"
+     r")")
+-- 
+2.51.0
+

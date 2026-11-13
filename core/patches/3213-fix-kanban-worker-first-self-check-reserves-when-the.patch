@@ -1,0 +1,163 @@
+From 823b68edd8a49fa3e4925fa98f4e51b00e7f30c3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:51:23 +0000
+Subject: [PATCH] fix(kanban): worker-first self-check reserves when the Board
+ refuses its repin at the same revision [daveey]
+
+A self-check repin (stranded worker-first card, runs_on NULL) refused with a
+HubError other than not_claimable was re-asked every dispatcher tick and the
+card never returned to the reserve. Remember the refused revision per
+(board, task) and reserve while the card stays there; a new sync_version asks
+the repin again. Explicit kanban_move repins are unchanged (never reserved).
+
+Follow-up to review t_01a1d38a8cc4d263 on PR #1851.
+---
+ hermes_cli/kanban_worker_placement.py         | 29 ++++++++++-
+ .../test_kanban_pool_deny_runs_on.py          | 49 ++++++++++++++++++-
+ 2 files changed, 75 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index a449cb3f37..a754445a55 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -17,6 +17,11 @@ DISPATCH_NETWORK_BUDGET_S = 2.0
+ # Re-asking at the same revision every dispatcher tick only repeats the refusal; wait for a new revision instead.
+ NOT_CLAIMABLE_BACKOFF_S = 600.0
+ _refused: dict[tuple[str, str], tuple[int, float]] = {}  # (board, task) -> (refused revision, retry after)
++# (board, task) -> revision at which the Board refused the worker-first self-check's repin (any code but
++# not_claimable, which _refused covers). While the card stays at that revision it goes back to the reserve rather
++# than re-asking a repin the Board already refused; a new revision asks again. Explicit kanban_move repins never
++# fall back: a reserve would hand the run's move straight back to the pool.
++_selfcheck_refused: dict[tuple[str, str], int] = {}
+ # No assigned keepalive exists here. Sixty seconds bounds queue probes while still discovering
+ # registry-only capacity changes without waiting for a task revision. Assigned renewals are unchanged.
+ RESERVE_KEEPALIVE_S = 60.0
+@@ -364,7 +369,8 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+             if len(_refused) > 1024:  # cards that left the query never come back to clear their entry
+                 for stale in [k for k, (_, until) in _refused.items() if until <= now]:
+                     del _refused[stale]
+-            labels, why = (None, None) if mode else _move_target(conn, row, gateway, cfg)
++            labels, why = (None, None) if mode else _selfcheck_unrefused(
++                key, row, *_move_target(conn, row, gateway, cfg))
+             stage = "recover" if mode else ("reserve" if labels is None else "repin")
+             held = _queued.get(key)
+             identity = _local_identity(conn, row["id"]) if labels is None else None
+@@ -402,6 +408,7 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+                     logger.info("Board recovery endpoint unavailable; backing off for %ss", recovery.RECOVERY_RETRY_S)
+                     continue
+                 fence = None
++                _remember_selfcheck_refusal(key, row["sync_version"], why, exc)
+                 if rejection_code(exc) == "not_claimable":
+                     # The Board already has it leased or not ready: our copy is behind. Back off at this revision.
+                     _refused[key] = (row["sync_version"], now + NOT_CLAIMABLE_BACKOFF_S)
+@@ -506,6 +513,26 @@ def _move_target(conn, row, gateway, cfg):
+     return pool_target(conn, row, gateway, cfg) or (None, None)
+ 
+ 
++def _selfcheck_unrefused(key, row, labels, why):
++    """``(labels, why)``, except a self-check repin (``why`` set) the Board refused at this revision becomes the
++    reserve ``(None, None)``. A new revision clears the refusal so the repin is asked again."""
++    if why is None:
++        return labels, why
++    if _selfcheck_refused.get(key) == row["sync_version"]:
++        return None, None
++    _selfcheck_refused.pop(key, None)
++    return labels, why
++
++
++def _remember_selfcheck_refusal(key, revision, why, exc):
++    """Record a Board refusal of a self-check repin (``not_claimable`` is :data:`_refused`'s backoff instead)."""
++    if why is None or rejection_code(exc) == "not_claimable":
++        return
++    _selfcheck_refused[key] = revision  # popped by _selfcheck_unrefused first, so this is the newest entry
++    if len(_selfcheck_refused) > 1024:  # cards that left the query never come back to clear theirs
++        del _selfcheck_refused[next(iter(_selfcheck_refused))]
++
++
+ def _record_repin(conn, task_id, gateway, labels, reply, *, reason=None):
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_move as km
+diff --git a/tests/hermes_cli/test_kanban_pool_deny_runs_on.py b/tests/hermes_cli/test_kanban_pool_deny_runs_on.py
+index e34a44c94a..881beb9ea2 100644
+--- a/tests/hermes_cli/test_kanban_pool_deny_runs_on.py
++++ b/tests/hermes_cli/test_kanban_pool_deny_runs_on.py
+@@ -143,8 +143,8 @@ def test_a_crash_or_start_refusal_record_still_waits_for_a_completed_round(hub):
+ # --- dispatcher self-check -------------------------------------------------------------------------------------
+ 
+ class RecordingHub:
+-    def __init__(self):
+-        self.reserves, self.repins = [], []
++    def __init__(self, *, refuse_repin=None):
++        self.reserves, self.repins, self.refuse_repin = [], [], refuse_repin
+ 
+     def reserve(self, board, **body):
+         self.reserves.append(body)
+@@ -152,6 +152,8 @@ class RecordingHub:
+ 
+     def repin(self, board, **body):
+         self.repins.append(body)
++        if self.refuse_repin:
++            raise ksc.HubError(403, json.dumps({"error": self.refuse_repin}))
+         return {"version": 9, "runs_on": body["runs_on"], "placement_policy": None}
+ 
+ 
+@@ -160,9 +162,11 @@ def no_pull(monkeypatch):
+     monkeypatch.setattr(ksc, "pull", lambda *a, **kw: None)
+     wp._refused.clear()
+     wp._queued.clear()
++    wp._selfcheck_refused.clear()
+     yield
+     wp._refused.clear()
+     wp._queued.clear()
++    wp._selfcheck_refused.clear()
+ 
+ 
+ def _stranded(conn, *, age, requires=("terminal", "file", "git", "hub:write")):
+@@ -213,3 +217,44 @@ def test_self_check_leaves_other_worker_first_cards_to_the_reserve(hub, no_pull,
+     wp.reevaluate(conn, board, BOARD, ME, cfg=cfg)
+     assert board.repins == []
+     assert [r["task_id"] for r in board.reserves] == [tid]
++
++
++def _bump(conn, tid, version):
++    conn.execute("UPDATE kanban_sync_state SET applying=1")
++    conn.execute("UPDATE tasks SET sync_version=? WHERE id=?", (version, tid))
++    conn.execute("UPDATE kanban_sync_state SET applying=0")
++    conn.commit()
++
++
++def test_a_refused_self_check_repin_falls_back_to_the_reserve_until_the_revision_moves(hub, no_pull):
++    """A Board refusal other than not_claimable (e.g. forbidden) must not hold the card on a repin re-asked every
++    tick: at the refused revision it goes back to the reserve, and a new revision asks the repin again."""
++    _home, conn = hub
++    tid = _stranded(conn, age=36 * 60)
++    board = RecordingHub(refuse_repin="forbidden")
++    wp.reevaluate(conn, board, BOARD, ME, cfg=CFG)
++    assert [r["expected_revision"] for r in board.repins] == [4] and board.reserves == []
++    assert wp.requested_move(conn, tid) is None  # nothing was recorded as applied
++    wp.reevaluate(conn, board, BOARD, ME, cfg=CFG)
++    assert len(board.repins) == 1, "the refused self-check repin was re-asked at the same revision"
++    assert [(r["task_id"], r["expected_revision"]) for r in board.reserves] == [(tid, 4)]
++    _bump(conn, tid, 5)
++    board.refuse_repin = None
++    wp.reevaluate(conn, board, BOARD, ME, cfg=CFG)
++    assert [r["expected_revision"] for r in board.repins] == [4, 5]
++    assert len(board.reserves) == 1
++    assert (BOARD, tid) not in wp._selfcheck_refused
++
++
++def test_a_refused_explicit_move_repin_is_not_downgraded_to_a_reserve(hub, no_pull):
++    """Only the self-check falls back: a run's kanban_move must never be handed back to the pool by a reserve."""
++    _home, conn = hub
++    tid = _stranded(conn, age=36 * 60)
++    kb._append_event(conn, tid, km.MOVED_EVENT, {"from_machine": "worker-1", "runs_on": ["machine:hub"],
++                                                 "reason": "r", "move_no": 1, "forced": False, "matches": [ME]})
++    conn.commit()
++    board = RecordingHub(refuse_repin="forbidden")
++    for _ in range(2):
++        wp.reevaluate(conn, board, BOARD, ME, cfg=CFG)
++    assert [r["runs_on"] for r in board.repins] == [["machine:hub"]] * 2
++    assert board.reserves == [] and not wp._selfcheck_refused
+-- 
+2.51.0
+

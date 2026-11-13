@@ -1,0 +1,269 @@
+From 654cf8c340d7febadd28708144cca9e6215eaefa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:21:13 +0000
+Subject: [PATCH] [daveey] kanban: a fresh replica pull vouches for a missing
+ parent only once the mirror is refreshed from it
+
+Review 5888215084 on #1931, nit 1. The sync round stamps the replica's
+pulled_at before its live partition pull and before refresh_remote_parents.
+A streak that aged through a stall could therefore block a child and file a
+repair card in the first readiness pass after catch-up, while the mirror was
+still from before the stall.
+
+The round now records mirror_pulled_at = pulled_at on the replica
+(kanban_db_sync.mark_mirrored) once the mirror reflects that pull: refreshed
+in the round, or unchanged inputs since the last refresh. On a primary board
+the detector (kanban_replica_freshness.mirror_at_head) treats a parent as
+missing only when mirror_pulled_at >= pulled_at. The stamp lives on the
+replica, so an unchanged round takes no write lock on the live file, and
+kanban_sync_state is not a synced table, so no SchemaAhead for older cores.
+---
+ hermes_cli/kanban_db_graph.py                 |  7 ++-
+ hermes_cli/kanban_db_sync.py                  | 16 ++++++
+ hermes_cli/kanban_replica_freshness.py        | 57 ++++++++++++++-----
+ hermes_cli/kanban_sync_client.py              |  2 +
+ .../test_kanban_cross_gateway_parents.py      | 41 ++++++++++++-
+ 5 files changed, 104 insertions(+), 19 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_graph.py b/hermes_cli/kanban_db_graph.py
+index cd727a4749..f0985975cc 100644
+--- a/hermes_cli/kanban_db_graph.py
++++ b/hermes_cli/kanban_db_graph.py
+@@ -14,7 +14,8 @@ def note_missing_parents(
+     """Track a missing-parent streak inside the home gateway's readiness transaction.
+ 
+     On a synced board (``remote``) a parent with no status is unknown, not missing, unless the mirror's replica is
+-    at the feed head (``kanban_replica_freshness.replica_at_head``, read once per readiness pass into ``fresh``):
++    at the feed head and, on a primary board, the mirror was refreshed from that pull
++    (``kanban_replica_freshness.mirror_at_head``, read once per readiness pass into ``fresh``):
+     otherwise no streak event is recorded and nothing is blocked. The child still waits: an unknown parent gates.
+     Each deferral is counted in ``fresh["deferred"]`` and the pass logs one INFO line per board per stale replica
+     stamp (``kanban_replica_freshness.report_deferred``). A replica that never catches up is alarmed in awake time
+@@ -28,10 +29,10 @@ def note_missing_parents(
+         return False
+     missing = [pid for pid, st in states if st is None]
+     if missing and remote:
+-        from hermes_cli.kanban_replica_freshness import replica_at_head, synced
++        from hermes_cli.kanban_replica_freshness import mirror_at_head, synced
+         cache = {} if fresh is None else fresh
+         if "fresh" not in cache:  # a detached board (sync off) keeps its mirror table but is its own authority
+-            cache["fresh"] = replica_at_head(conn) if synced(conn) else True
++            cache["fresh"] = mirror_at_head(conn) if synced(conn) else True
+         if not cache["fresh"]:
+             cache["deferred"] = cache.get("deferred", 0) + 1
+             return False
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index f156c32752..c98a14240f 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -259,6 +259,8 @@ _SYNC_COLUMN_DDL = (
+     ("kanban_sync_state", "seconds_repaired", "seconds_repaired INTEGER NOT NULL DEFAULT 0"),
+     # Wall time of the last successful feed pull into this file (replicas): readers derive staleness from it. [daveey]
+     ("kanban_sync_state", "pulled_at", "pulled_at REAL"),
++    # Replicas: the ``pulled_at`` of the pull the live remote-parent mirror was last refreshed from. [daveey]
++    ("kanban_sync_state", "mirror_pulled_at", "mirror_pulled_at REAL"),
+     # Local-only round-robin position; refused revisions must not monopolize bounded batches.
+     ("kanban_sync_state", "worker_reserve_cursor", "worker_reserve_cursor TEXT"),
+ )
+@@ -708,6 +710,20 @@ def mark_pulled(conn: sqlite3.Connection, at: Optional[float] = None) -> None:
+         conn.execute("UPDATE kanban_sync_state SET pulled_at = ? WHERE pulled_at IS NOT ?", (stamp, stamp))
+ 
+ 
++def mark_mirrored(replica: sqlite3.Connection, board: str = "") -> None:
++    """Record on the replica that the live remote-parent mirror now reflects its last pull (``mirror_pulled_at`` =
++    ``pulled_at``). The round stamps ``pulled_at`` before it refreshes the mirror, so a fresh ``pulled_at`` alone
++    does not prove the mirror is current; the missing-parent detector also needs this one. A failed stamp only
++    leaves the detector deferring (fail closed), so it is logged, not raised. [daveey]"""
++    from hermes_cli.kanban_db_connect import write_txn
++    try:
++        with write_txn(replica):
++            replica.execute("UPDATE kanban_sync_state SET mirror_pulled_at = pulled_at "
++                            "WHERE mirror_pulled_at IS NOT pulled_at")
++    except sqlite3.Error as exc:
++        _log.warning("kanban sync: %s remote-parent mirror not stamped (%s)", board, exc)
++
++
+ def new_task_id(conn: sqlite3.Connection) -> str:
+     """Synced boards: ``t_`` + 16 hex (48-bit ms timestamp + 16 random bits), safe
+     across gateways and offline creation; otherwise the classic 8-hex id."""
+diff --git a/hermes_cli/kanban_replica_freshness.py b/hermes_cli/kanban_replica_freshness.py
+index ee5357d09c..e2327cfaaa 100644
+--- a/hermes_cli/kanban_replica_freshness.py
++++ b/hermes_cli/kanban_replica_freshness.py
+@@ -169,28 +169,52 @@ def _replica_at_head(conn: sqlite3.Connection):
+     return _replica_state(conn)[0]
+ 
+ 
++def mirror_at_head(conn: sqlite3.Connection) -> bool:
++    """:func:`replica_at_head`, and on a ``primary`` board the live remote-parent mirror was refreshed from that same
++    pull or a later one (``mirror_pulled_at`` >= ``pulled_at``, stamped by ``kanban_db_sync.mark_mirrored``). The
++    round stamps ``pulled_at`` before its live pull and mirror refresh, so between the two a fresh stamp vouches for
++    a mirror that may still be hours old (review 5888215084 on #1931). Only the missing-parent detector reads the
++    mirror; a ``shadow`` board never refreshes one, so its replica's stamp is enough."""
++    verdict, _board, pulled, mirrored = _replica_state(conn)
++    if verdict is not True:
++        return False
++    return _mode(conn) != "primary" or (type(mirrored) in (int, float) and mirrored >= pulled)
++
++
++def _mode(conn: sqlite3.Connection) -> Optional[str]:
++    try:
++        row = conn.execute("SELECT mode FROM kanban_sync_state LIMIT 1").fetchone()
++    except sqlite3.Error:
++        return None
++    return None if row is None else row["mode"]
++
++
+ def _replica_state(conn: sqlite3.Connection) -> tuple:
+-    """``(verdict, board_id, pulled_at)``: the :func:`_replica_at_head` verdict, the live board's id (None when
+-    unsynced or unreadable) and the replica's numeric ``pulled_at`` stamp (None when it has none)."""
++    """``(verdict, board_id, pulled_at, mirror_pulled_at)``: the :func:`_replica_at_head` verdict, the live board's
++    id (None when unsynced or unreadable), the replica's numeric ``pulled_at`` stamp (None when it has none) and the
++    ``pulled_at`` the remote-parent mirror was last refreshed from (None when unknown)."""
+     from hermes_cli.kanban_db_connect import _main_db_file
+     from hermes_cli.kanban_foreign_card import open_replica
+ 
+     try:
+         local = conn.execute("SELECT board_id FROM kanban_sync_state LIMIT 1").fetchone()
+         if local is None:
+-            return None, None, None
++            return None, None, None, None
+         with open_replica(_main_db_file(conn)) as replica:
+             if replica is None:
+-                return None, local["board_id"], None
+-            state = replica.execute("SELECT board_id, pulled_at FROM kanban_sync_state LIMIT 1").fetchone()
++                return None, local["board_id"], None, None
++            state = replica.execute("SELECT * FROM kanban_sync_state LIMIT 1").fetchone()
+     except (sqlite3.Error, OSError, ValueError):
+-        return None, None, None
++        return None, None, None, None
+     if state is None or state["board_id"] != local["board_id"]:
+-        return False, local["board_id"], None
++        return False, local["board_id"], None, None
++    if "pulled_at" not in state.keys():  # unreadable, as when this was read by name
++        return None, local["board_id"], None, None
+     pulled = state["pulled_at"]
++    mirrored = state["mirror_pulled_at"] if "mirror_pulled_at" in state.keys() else None
+     if type(pulled) not in (int, float):
+-        return False, local["board_id"], None
+-    return 0 <= time.time() - pulled <= FRESH_SECONDS, local["board_id"], pulled
++        return False, local["board_id"], None, mirrored
++    return 0 <= time.time() - pulled <= FRESH_SECONDS, local["board_id"], pulled, mirrored
+ 
+ 
+ def synced(conn: sqlite3.Connection) -> bool:
+@@ -212,23 +236,26 @@ def local_copy_stale(conn: sqlite3.Connection, what: str) -> bool:
+     return True
+ 
+ 
+-# Live board file -> the replica stamp its last deferral line named: one INFO line per board per stale stamp.
++# Live board file -> (replica stamps, count) its last deferral line named: one INFO line per board per stale stamp
++# and deferred count.
+ _reported: dict[str, object] = {}
+ 
+ 
+ def report_deferred(conn: sqlite3.Connection, deferred: int) -> None:
+     """One INFO line when a readiness pass deferred ``deferred`` missing-parent judgements because the replica is
+-    not at the feed head, repeated only when the replica's ``pulled_at`` changes. It names the board, the replica's
+-    last time at the head (or "no readable replica") and the count. There is deliberately no wall-clock escalation
++    not at the feed head (or the remote-parent mirror not yet refreshed from it), repeated only when the replica's
++    stamps or the count change: a line keyed on the stamp alone kept the first pass's count while more children
++    joined the wait (review 5888215084 on #1931). It names the board, the replica's last time at the head (or "no
++    readable replica") and the count. There is deliberately no wall-clock escalation
+     here: after a laptop sleeps for hours its stamp is hours old on wake, so a bound would fire at once and bring
+     back the false blocks this gate removes. A replica that never catches up is alarmed in awake time by the
+     sync-freshness check of t_01a1d3df5e5d0757, which files one card per incident."""
+     from datetime import UTC, datetime
+     from hermes_cli.kanban_db_connect import _main_db_file
+ 
+-    verdict, board, pulled = _replica_state(conn)
++    verdict, board, pulled, mirrored = _replica_state(conn)
+     key = str(_main_db_file(conn) or board)
+-    stamp = "unreadable" if verdict is None else pulled
++    stamp = "unreadable" if verdict is None else (pulled, mirrored)
+     if key in _reported and _reported[key] == stamp:
+         return
+     _reported[key] = stamp
+@@ -239,5 +266,7 @@ def report_deferred(conn: sqlite3.Connection, deferred: int) -> None:
+     else:
+         last = "replica last at the feed head " + datetime.fromtimestamp(pulled, UTC).isoformat(
+             timespec="seconds")
++        if verdict:
++            last += ", remote-parent mirror not refreshed from that pull yet"
+     _log.info("missing-parent check deferred on board %s (%s): %s; %d child(ren) wait with parent status unknown",
+               board or "?", key, last, deferred)
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 6d263cd604..f7820e0702 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1028,6 +1028,8 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+                     _REPAIR_CREDIT.pop(key, None)
+             note_round(slug, outcome, _repair_clock())
+             if mode == "primary":
++                # The mirror matches this round's pull (refreshed above, or inputs unchanged since the last refresh)
++                sync.mark_mirrored(replica, slug)  # only then can a parent be missing (kanban_replica_freshness)
+                 heal_clobbered_completions(live)
+                 from hermes_cli.kanban_sync_divergence import heal_running_over_ended_run
+                 heal_running_over_ended_run(live)
+diff --git a/tests/hermes_cli/test_kanban_cross_gateway_parents.py b/tests/hermes_cli/test_kanban_cross_gateway_parents.py
+index b2cbf5646a..1b17411b7c 100644
+--- a/tests/hermes_cli/test_kanban_cross_gateway_parents.py
++++ b/tests/hermes_cli/test_kanban_cross_gateway_parents.py
+@@ -229,11 +229,14 @@ def test_a_worker_node_does_not_copy_a_ready_card_whose_parent_is_open(kanban_ho
+ # 2026-11-12, laptop-1: a sync round stuck for hours in a long pull never refreshed the remote-parent mirror, so two
+ # rework cards whose parents were done on the Board were blocked "parent ... missing" and two repair cards filed.
+ 
+-def _stamp_replica(at):
++def _stamp_replica(at, mirrored=...):
++    """Stamp the replica's last pull at ``at``. A whole round also refreshes the remote-parent mirror from that pull,
++    so ``mirror_pulled_at`` follows it unless ``mirrored`` names an older refresh (or None: never refreshed)."""
+     replica = kbc.connect(ksc.shadow_path(BOARD))
+     try:
+         with kbc.write_txn(replica):
+-            replica.execute("UPDATE kanban_sync_state SET pulled_at = ?", (at,))
++            replica.execute("UPDATE kanban_sync_state SET pulled_at = ?, mirror_pulled_at = ?",
++                            (at, at if mirrored is ... else mirrored))
+     finally:
+         replica.close()
+ 
+@@ -333,3 +336,37 @@ def test_a_stalled_replica_is_reported_once_per_stale_stamp_at_info(live, svc, k
+     kb.recompute_ready(live)
+     assert len(lines()) == 3 and "no readable replica" in lines()[-1]
+     assert all(kb.get_task(live, c).status == "todo" and not _events(live, c, "parent_missing") for c in children)
++
++
++def _replica_stamps():
++    replica = kbc.connect(ksc.shadow_path(BOARD))
++    try:
++        row = replica.execute("SELECT pulled_at, mirror_pulled_at FROM kanban_sync_state").fetchone()
++        return row["pulled_at"], row["mirror_pulled_at"]
++    finally:
++        replica.close()
++
++
++def test_a_fresh_pull_does_not_vouch_for_a_mirror_not_yet_refreshed_from_it(live, svc, kanban_home):
++    """Review nit 1 (5888215084) on #1931: the round stamps ``pulled_at`` before its live pull and mirror refresh.
++    A streak that aged through a stall must not block, nor file a repair, in the pass between the two."""
++    child = kb.create_task(live, title="child", assignee="worker")
++    _round(kanban_home, svc)
++    pulled, mirrored = _replica_stamps()
++    assert mirrored == pulled  # a whole round stamps the mirror refresh from its own pull
++    _link_raw(live, "t_new_foreign", child)  # linked while the mirror was fresh: the streak starts
++    kb.recompute_ready(live)
++    assert len(_events(live, child, "parent_missing")) == 1
++    _age_streak(live, child)  # ... then the sync stalls for longer than the block window
++    now = time.time()
++    _stamp_replica(now, mirrored=now - 3600)  # caught up to the feed head; mirror still from before the stall
++    kb.recompute_ready(live)
++    assert kb.get_task(live, child).status == "todo"  # before the fix: blocked on the stale mirror
++    assert not _events(live, child, "blocked") and not _repairs(live, child)
++    _round(kanban_home, svc)  # the round refreshes the mirror: the Board really lacks the parent
++    pulled, mirrored = _replica_stamps()
++    assert mirrored == pulled
++    kb.recompute_ready(live)
++    assert kb.get_task(live, child).status == "blocked"
++    kb.recompute_ready(live)
++    assert len(_repairs(live, child)) == 1
+-- 
+2.51.0
+

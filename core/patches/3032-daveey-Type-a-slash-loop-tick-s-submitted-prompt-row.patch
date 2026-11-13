@@ -1,0 +1,587 @@
+From ae0b2ec20f4eb6803d8332962bd429f1f4f824d3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 23:26:48 +0000
+Subject: [PATCH] [daveey] Type a slash /loop tick's submitted prompt row
+ loop_tick (TUI + gateway)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A /loop 10m /skill tick submitted the expanded command's prompt as an untyped
+role='user' row in the TUI, so once the tick completed kanban_relayed_human read
+it as the newest person row (review 5879164478 nit on #1583). Both producers now
+type it loop_tick with a language-neutral display_text (↻ /loop /recap):
+
+- TUI _notif_slash_loop_tick and gateway _loop_wakeup_fire_one (via the
+  producer-card path; loop_tick joins PRODUCER_NOTICE_DISPLAY_KINDS, so silence
+  rules match the internal_notification it replaces).
+- The relay's legacy in-flight first-untyped-row skip applies only when no typed
+  loop_tick row exists since the fire, so a reply during a typed tick is kept.
+- Compressor: loop_tick starts a new turn; Desktop hydration/oracle/types, TUI
+  transcript and CLI resume recap render it as its loop line. Not an
+  automation-replay kind: the loop owns its own retry.
+---
+ agent/context_compressor_turns.py             |   2 +-
+ apps/desktop/e2e/core/oracle.ts               |   1 +
+ apps/desktop/src/lib/chat-messages.test.ts    |  19 +++
+ .../src/lib/chat-messages/hydration.ts        |   6 +
+ apps/desktop/src/types/hermes.ts              |   2 +
+ gateway/response_filters.py                   |   6 +-
+ gateway/run_goals.py                          |   7 +-
+ hermes_cli/cli_agent_setup_mixin.py           |   4 +
+ hermes_cli/kanban_relayed_human.py            |  12 +-
+ hermes_cli/loops.py                           |  11 ++
+ tests/hermes_cli/test_kanban_relayed_human.py |  34 ++++-
+ tests/hermes_cli/test_loop_tick_display.py    | 143 ++++++++++++++++++
+ tui_gateway/session_notifications.py          |   4 +-
+ ui-tui/src/__tests__/messages.test.ts         |  18 +++
+ ui-tui/src/domain/messages.ts                 |  78 +++++-----
+ 15 files changed, 295 insertions(+), 52 deletions(-)
+ create mode 100644 tests/hermes_cli/test_loop_tick_display.py
+
+diff --git a/agent/context_compressor_turns.py b/agent/context_compressor_turns.py
+index 7558df31d9..b8c25311fb 100644
+--- a/agent/context_compressor_turns.py
++++ b/agent/context_compressor_turns.py
+@@ -11,7 +11,7 @@ from typing import Any
+ # User-row kinds that start a new turn (persisted notices, not same-turn continuations such as
+ # auto_continue or steer): after a completed reply, one of these means the earlier request is done.
+ TURN_STARTING_NOTICE_KINDS = frozenset(
+-    {"kanban_notice", "internal_notification", "process_complete", "async_delegation_complete"}
++    {"kanban_notice", "internal_notification", "process_complete", "async_delegation_complete", "loop_tick"}
+ )
+ 
+ 
+diff --git a/apps/desktop/e2e/core/oracle.ts b/apps/desktop/e2e/core/oracle.ts
+index bf04cded9a..aa781f6b16 100644
+--- a/apps/desktop/e2e/core/oracle.ts
++++ b/apps/desktop/e2e/core/oracle.ts
+@@ -430,6 +430,7 @@ const NOTICE_KINDS = new Set([
+   'failed_turn',
+   'turn_stopped',
+   'kanban_notice',
++  'loop_tick',
+   'hidden'
+ ])
+ 
+diff --git a/apps/desktop/src/lib/chat-messages.test.ts b/apps/desktop/src/lib/chat-messages.test.ts
+index 0dfe4fcd25..965988fc33 100644
+--- a/apps/desktop/src/lib/chat-messages.test.ts
++++ b/apps/desktop/src/lib/chat-messages.test.ts
+@@ -597,6 +597,25 @@ describe('toChatMessages', () => {
+     expect(chatMessageText(messages[1])).toBe('✔ Kanban t_1 done — shipped')
+   })
+ 
++  it('renders a /loop slash tick prompt as its loop line, not a user bubble', () => {
++    // [daveey] hermes_cli/loops.py loop_tick_display: the expanded command is the loop's, not the user's words.
++    const messages = toChatMessages([
++      { role: 'user', content: 'start the loop', timestamp: 1 },
++      {
++        role: 'user',
++        content: 'Run the recap skill now',
++        display_kind: 'loop_tick',
++        display_metadata: { display_text: '↻ /loop /recap' },
++        timestamp: 2
++      },
++      { role: 'user', content: 'Run it again', display_kind: 'loop_tick', timestamp: 3 }
++    ])
++
++    expect(messages.map(message => message.role)).toEqual(['user', 'system', 'system'])
++    expect(chatMessageText(messages[1])).toBe('↻ /loop /recap')
++    expect(chatMessageText(messages[2])).toBe('↻ /loop')
++  })
++
+   // [daveey] session-outcome: the backend marks a blocked notice `stale` once its card leaves `blocked`.
+   it('flags a kanban notice the backend marked stale, and only that one', () => {
+     const messages = toChatMessages([
+diff --git a/apps/desktop/src/lib/chat-messages/hydration.ts b/apps/desktop/src/lib/chat-messages/hydration.ts
+index b0bda70b23..f3640a1b32 100644
+--- a/apps/desktop/src/lib/chat-messages/hydration.ts
++++ b/apps/desktop/src/lib/chat-messages/hydration.ts
+@@ -188,6 +188,8 @@ const NOTICE_DISPLAY_KINDS = [
+   'turn_stopped',
+   // [daveey] A kanban result persisted into a chat no backend had loaded.
+   'kanban_notice',
++  // [daveey] A slash-command /loop tick's expanded prompt (hermes_cli/loops.py loop_tick_display).
++  'loop_tick',
+   // A safety-refused turn retained for display: the user's own message, shown
+   // greyed with a notice. Rendered through the system path, never a user bubble.
+   'content_refused'
+@@ -388,6 +390,10 @@ function timelineDisplayContent(message: SessionMessage, content: string): strin
+     return timelineDisplayText(message.display_metadata) ?? content
+   }
+ 
++  if (message.display_kind === 'loop_tick') {
++    return timelineDisplayText(message.display_metadata) ?? '↻ /loop'
++  }
++
+   if (message.display_kind === 'async_delegation_complete') {
+     const count = timelineTaskCount(message.display_metadata)
+ 
+diff --git a/apps/desktop/src/types/hermes.ts b/apps/desktop/src/types/hermes.ts
+index 480f61101c..09f79f04bb 100644
+--- a/apps/desktop/src/types/hermes.ts
++++ b/apps/desktop/src/types/hermes.ts
+@@ -792,6 +792,8 @@ export interface SessionMessage {
+     | 'failed_turn'
+     | 'hidden'
+     | 'kanban_notice'
++    // A slash-command /loop tick's expanded prompt, shown as its `↻ /loop /cmd` line.
++    | 'loop_tick'
+     | 'model_switch'
+     | 'personality_switch'
+     | 'process_complete'
+diff --git a/gateway/response_filters.py b/gateway/response_filters.py
+index b65c1077d5..38512b7de5 100644
+--- a/gateway/response_filters.py
++++ b/gateway/response_filters.py
+@@ -32,8 +32,10 @@ _BRACKETED_SILENCE_MARKERS = tuple(
+ # machinery kinds may vanish on a bare silence marker.
+ INTERNAL_NOTIFICATION_DISPLAY_KIND = "internal_notification"
+ # Async-result cards the in-process TUI persisted: a producer's internal event naming one (with a
+-# display_text) persists as that row kind instead of internal_notification.
+-PRODUCER_NOTICE_DISPLAY_KINDS = frozenset({"process_complete", "async_delegation_complete", "kanban_notice"})
++# display_text) persists as that row kind instead of internal_notification. A slash-command /loop tick's
++# expanded prompt names ``loop_tick`` (hermes_cli/loops.py) the same way. [daveey]
++PRODUCER_NOTICE_DISPLAY_KINDS = frozenset(
++    {"process_complete", "async_delegation_complete", "kanban_notice", "loop_tick"})
+ MACHINERY_DISPLAY_KINDS = frozenset({INTERNAL_NOTIFICATION_DISPLAY_KIND, *PRODUCER_NOTICE_DISPLAY_KINDS})
+ # What a gateway producer's card may name (a liveness tick names internal_notification for its CLI
+ # receipt). Closed, and kept apart from the silence set above so a kind added there never becomes
+diff --git a/gateway/run_goals.py b/gateway/run_goals.py
+index 4a8bf3b4a9..e2cca98929 100644
+--- a/gateway/run_goals.py
++++ b/gateway/run_goals.py
+@@ -516,7 +516,12 @@ class GatewayGoalsMixin:
+             # Under a session authority the tick commits to the FIFO (never a classic turn beside an
+             # admitted one); a slash-command loop is a command and keeps the command path.
+             if wakeup.lstrip().startswith("/") or not await admit_route_wake(self, adapter, source, wakeup, "loop-tick"):
+-                await adapter.handle_message(self._synthetic_prompt_event(source, wakeup, internal=True))
++                event = self._synthetic_prompt_event(source, wakeup, internal=True)
++                if wakeup.lstrip().startswith("/"):  # [daveey] the expanded command's row is typed loop_tick
++                    from hermes_cli.loops import loop_tick_display
++                    display = loop_tick_display(wakeup)
++                    event.metadata.update(display_kind=display["display_kind"], **display["display_metadata"])
++                await adapter.handle_message(event)
+             # Slash-command loops dispatch through the command path and never hit the post-turn
+             # completion hook — complete the tick immediately (caps + scheduling).
+             if wakeup.lstrip().startswith("/"):
+diff --git a/hermes_cli/cli_agent_setup_mixin.py b/hermes_cli/cli_agent_setup_mixin.py
+index cf44e8388d..0e8c882d45 100644
+--- a/hermes_cli/cli_agent_setup_mixin.py
++++ b/hermes_cli/cli_agent_setup_mixin.py
+@@ -192,6 +192,10 @@ def _collect_resume_entries(display_history, disp: dict, clean_assistant):
+         tool_calls = msg.get("tool_calls") or []
+         if display_kind == "hidden":
+             continue
++        if display_kind == "loop_tick":  # a /loop slash tick's expanded prompt: its ``↻ /loop /cmd`` line
++            label = (msg.get("display_metadata") or {}).get("display_text")
++            entries.append(("event", _sanitize_display_text(label if isinstance(label, str) and label else "↻ /loop")))
++            continue
+         if display_kind in _RESUME_EVENT_KEYS:
+             metadata = msg.get("display_metadata") or {}
+             label = metadata.get("display_text") if display_kind in ("async_delegation_complete", "process_complete") else None
+diff --git a/hermes_cli/kanban_relayed_human.py b/hermes_cli/kanban_relayed_human.py
+index 08ce894092..c3b3b8a697 100644
+--- a/hermes_cli/kanban_relayed_human.py
++++ b/hermes_cli/kanban_relayed_human.py
+@@ -19,8 +19,9 @@ Only a row a person typed is a reply: a plain or ``steer`` user row, never a syn
+ card's own ``kanban_notice``, hidden scaffolding, process/delegation completions, internal notifications,
+ compaction summaries, ``[System:`` notices or cross-session deliveries). Untyped synthetic rows are recognized
+ by their producers' registered openings (runtime scaffolding, the pre-final gate's held-draft notice, auto-continue
+-notes, the ``/loop`` wakeup and ``/heartbeat`` frames) and an in-flight slash ``/loop`` tick's first row; a Kanban
+-notice is always typed ``kanban_notice``, the no-store fallback included.
++notes, the ``/loop`` wakeup and ``/heartbeat`` frames). A slash ``/loop`` tick's expanded prompt is typed
++``loop_tick`` (TUI and gateway); an in-flight tick's first untyped row is still skipped for rows written before that
++typing. A Kanban notice is always typed ``kanban_notice``, the no-store fallback included.
+ 
+ The card's holder checks every relay before storing it (``admit``, inside ``add_comment``'s write transaction,
+ so the one-relay rule is atomic), a cross-gateway one included: the card asked, the message is not older than
+@@ -108,8 +109,11 @@ def _latest_user_message(session_id: str, db_path: Optional[str] = None) -> Opti
+     try:
+         with sqlite3.connect(uri, uri=True, timeout=5) as sdb:  # noqa: kanban-lockguard (state.db, read-only)
+             tick_id = None
+-            if (loop_since := _slash_loop_tick_since(sdb, session_id)) is not None:
+-                # the oldest untyped, uncompressed, non-synthetic row at/after the fire: the tick's own prompt
++            if (loop_since := _slash_loop_tick_since(sdb, session_id)) is not None and sdb.execute(
++                    "SELECT 1 FROM messages WHERE session_id = ? AND role = 'user' AND display_kind = 'loop_tick' "
++                    "AND timestamp >= ? LIMIT 1", (session_id, loop_since - 1)).fetchone() is None:
++                # a tick written before loop_tick typing (a typed one leaves every untyped row to the person):
++                # the oldest untyped, uncompressed, non-synthetic row at/after the fire is the tick's own prompt
+                 for row_id, row_content in sdb.execute(
+                         "SELECT id, content FROM messages WHERE session_id = ? AND role = 'user' "
+                         "AND COALESCE(display_kind, '') = '' AND COALESCE(_compressed_summary, 0) = 0 "
+diff --git a/hermes_cli/loops.py b/hermes_cli/loops.py
+index 404b7e6158..5fc6c961b2 100644
+--- a/hermes_cli/loops.py
++++ b/hermes_cli/loops.py
+@@ -67,6 +67,17 @@ WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE = (
+     "that stops the loop."
+ )
+ 
++# [daveey] Row kind of the prompt a slash-command tick (``/loop 10m /recap``) submits: the expanded command, not
++# words the user typed. Typed so no reader takes a finished tick for a person's reply (kanban_relayed_human).
++LOOP_TICK_DISPLAY_KIND = "loop_tick"
++
++
++def loop_tick_display(wakeup: str) -> dict:
++    """``display_kind``/``display_metadata`` for a slash tick's submitted prompt row; renderers show the
++    language-neutral ``display_text`` (``↻ /loop /recap``) as a notice, never the expanded prompt."""
++    return {"display_kind": LOOP_TICK_DISPLAY_KIND,
++            "display_metadata": {"display_text": f"↻ /loop {' '.join(str(wakeup or '').split())}".rstrip()}}
++
+ 
+ def parse_interval_token(token: str) -> Optional[int]:
+     """Total seconds for ``30s``/``5m``/``2h``/``1h30m``, else None.
+diff --git a/tests/hermes_cli/test_kanban_relayed_human.py b/tests/hermes_cli/test_kanban_relayed_human.py
+index 7802c1a725..a42bf38399 100644
+--- a/tests/hermes_cli/test_kanban_relayed_human.py
++++ b/tests/hermes_cli/test_kanban_relayed_human.py
+@@ -137,6 +137,7 @@ def test_remote_relay_is_stored_as_sent():
+     {"display_kind": "async_delegation_complete", "content": "child done"},
+     {"display_kind": "internal_notification", "content": "note"},
+     {"display_kind": "auto_continue", "content": "continue"},
++    {"display_kind": "loop_tick", "content": "Run the recap skill now"},
+     {"compressed": 1, "content": "summary of earlier turns"},
+     {"content": "[System: the stream was cut; retry the tool call]"},
+     {"content": "[Message from another Hermes session @session:default/abc]\nplease relay"},
+@@ -170,8 +171,9 @@ def _loop_state(home: Path, session: str, *, awaiting: bool, fired_at: float, pr
+ 
+ 
+ def test_a_running_slash_loop_ticks_prompt_is_not_a_reply(kanban_home):
+-    """Review 5878871802: a ``/loop 10m /skill`` tick submits the command's prompt untyped. While that tick's turn
+-    runs, its row is the loop's; once the tick completed, a later typed row is a reply again."""
++    """Review 5878871802: a ``/loop 10m /skill`` tick written before ``loop_tick`` typing submitted the command's
++    prompt untyped. While that tick's turn runs, its row is the loop's; once the tick completed, an untyped row is a
++    reply again (legacy rows only: new ticks are typed, see the next test)."""
+     now = int(time.time())
+     with kbc.connect_closing() as conn:
+         tid = _asked(conn, now - 100)
+@@ -183,6 +185,34 @@ def test_a_running_slash_loop_ticks_prompt_is_not_a_reply(kanban_home):
+         assert krh.verify(conn, tid, session_id="chat-1")["message_id"] == tick
+ 
+ 
++def test_a_completed_typed_slash_tick_row_is_skipped(kanban_home):
++    """Review 5879164478 nit: a slash tick's row is typed ``loop_tick`` by its producers, so it is never the reply,
++    after the tick completed as well as while it runs."""
++    from hermes_cli.loops import loop_tick_display
++    now = int(time.time())
++    kind = loop_tick_display("/recap")["display_kind"]
++    with kbc.connect_closing() as conn:
++        tid = _asked(conn, now - 100)
++        reply = _state_db(kanban_home, "chat-1", now - 50)
++        _loop_state(kanban_home, "chat-1", awaiting=True, fired_at=now - 10)
++        _state_db(kanban_home, "chat-1", now - 10, content="Run the recap skill now", display_kind=kind)
++        assert krh.verify(conn, tid, session_id="chat-1")["message_id"] == reply
++        _loop_state(kanban_home, "chat-1", awaiting=False, fired_at=now - 10)
++        assert krh.verify(conn, tid, session_id="chat-1")["message_id"] == reply
++
++
++def test_a_reply_during_a_typed_slash_tick_is_the_reply(kanban_home):
++    """With the tick's row typed, the legacy first-untyped-row skip must not eat the person's reply that lands while
++    the tick is still in flight (``awaiting_response``)."""
++    now = int(time.time())
++    with kbc.connect_closing() as conn:
++        tid = _asked(conn, now - 100)
++        _loop_state(kanban_home, "chat-1", awaiting=True, fired_at=now - 20)
++        _state_db(kanban_home, "chat-1", now - 20, content="Run the recap skill now", display_kind="loop_tick")
++        reply = _state_db(kanban_home, "chat-1", now - 10, content="left ring")
++        assert krh.verify(conn, tid, session_id="chat-1")["message_id"] == reply
++
++
+ @pytest.mark.parametrize("prompt", ["/recap", "check the ring card"])
+ def test_a_reply_after_an_interrupted_loop_tick_is_the_reply(kanban_home, prompt):
+     """Review 5879164478 (2): an interrupted or errored tick is never completed, so ``awaiting_response`` stays
+diff --git a/tests/hermes_cli/test_loop_tick_display.py b/tests/hermes_cli/test_loop_tick_display.py
+new file mode 100644
+index 0000000000..873283ca30
+--- /dev/null
++++ b/tests/hermes_cli/test_loop_tick_display.py
+@@ -0,0 +1,143 @@
++"""A slash-command /loop tick's submitted prompt row is typed ``loop_tick`` (TUI and gateway) and every reader treats
++it like the other typed synthetic rows: never a person's reply, a notice in transcripts, a turn boundary for the
++compressor, machinery for silence, and not an automation-replay turn (the loop owns its own retry). [daveey]"""
++from __future__ import annotations
++
++import asyncio
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import loops
++from hermes_cli.loops import LOOP_TICK_DISPLAY_KIND, loop_tick_display
++
++
++def test_loop_tick_display_names_the_command_not_the_expanded_prompt():
++    assert loop_tick_display("  /recap   the  ring ") == {
++        "display_kind": "loop_tick", "display_metadata": {"display_text": "↻ /loop /recap the ring"}}
++
++
++def test_tui_slash_tick_submits_its_prompt_typed(monkeypatch):
++    from tui_gateway import server
++    monkeypatch.setitem(server._methods, "command.dispatch",
++                        lambda rid, params: {"result": {"type": "send", "message": "Run the recap skill now"}})
++    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
++    submitted: list = []
++    monkeypatch.setattr(server, "_notif_submit", lambda *a, **k: submitted.append((a, k)) or True)
++    session = {"history_lock": threading.RLock(), "running": True, "history": []}
++    mgr = SimpleNamespace(abandon_tick=lambda: None, complete_tick=lambda text: {})
++
++    server._notif_slash_loop_tick("rid", "sid", session, mgr, "/recap")
++
++    (args, kwargs), = submitted
++    assert args[3] == "Run the recap skill now"
++    assert kwargs == loop_tick_display("/recap")
++
++
++class _Runner:
++    """The few GatewayRunner seams ``_loop_wakeup_fire_one`` touches."""
++
++    def __init__(self, adapter):
++        self._adapter, self._running_agents = adapter, {}
++
++    def _adapters_for_profile(self, profile):
++        from gateway.config import Platform
++        return {Platform.DISCORD: self._adapter}
++
++    def _build_process_event_source(self, evt):
++        return SimpleNamespace(chat_id=evt["chat_id"], thread_id="", message_id=None, profile=None)
++
++    def _session_key_for_source(self, source):
++        return "agent:main:discord:dm:42"
++
++    async def _run_in_executor_with_context(self, func, *args):
++        return func(*args)
++
++    async def _publish_local_control(self, source):
++        return None
++
++
++@pytest.mark.parametrize("wakeup, typed", [("/recap", True), ("check the ring card", False)])
++def test_gateway_slash_tick_event_persists_as_loop_tick(monkeypatch, wakeup, typed):
++    from gateway import run_goals, session_automation
++    from gateway.response_filters import display_kind_for_event, display_metadata_for_event, \
++        is_machinery_display_kind
++
++    events: list = []
++
++    async def handle_message(event):
++        events.append(event)
++    adapter = SimpleNamespace(handle_message=handle_message)
++    runner = _Runner(adapter)
++    runner._synthetic_prompt_event = run_goals.GatewayGoalsMixin._synthetic_prompt_event
++
++    class Loop:
++        state = SimpleNamespace(ticks_fired=1)
++
++        def __init__(self, session_id=None):
++            pass
++
++        def is_due(self, now=None):
++            return True
++
++        def fire_tick(self):
++            return wakeup
++
++        def complete_tick(self, text):
++            return {}
++
++        def abandon_tick(self):
++            raise AssertionError("the tick was injected")
++    monkeypatch.setattr(loops, "LoopManager", Loop)
++    monkeypatch.setattr(loops, "goal_blocks_loop_tick", lambda sid: False)
++    monkeypatch.setattr("agent.estop.check_paused", lambda *a, **k: False)
++
++    async def no_authority(*a, **k):
++        return False
++    monkeypatch.setattr(session_automation, "admit_route_wake", no_authority)
++    route = {"platform": "discord", "chat_id": "42", "chat_type": "dm", "user_id": "42"}
++    asyncio.run(run_goals.GatewayGoalsMixin._loop_wakeup_fire_one(
++        runner, "sid-1", SimpleNamespace(awaiting_response=False, next_due_at=0, route=route), 1e12, set()))
++
++    event, = events
++    assert event.internal is True
++    if typed:
++        assert display_kind_for_event(event) == LOOP_TICK_DISPLAY_KIND
++        assert display_metadata_for_event(event) == loop_tick_display(wakeup)["display_metadata"]
++    else:  # a wakeup-framed loop keeps its generic internal row (its frame identifies it)
++        assert display_kind_for_event(event) == "internal_notification"
++    assert is_machinery_display_kind(display_kind_for_event(event))  # silence rules unchanged for the tick
++
++
++def test_compressor_treats_a_loop_tick_as_a_new_turn_and_not_human_input():
++    from agent.context_compressor import ContextCompressor
++    from agent.context_compressor_turns import turn_ended_after
++    messages = [{"role": "user", "content": "fix the header"},
++                {"role": "assistant", "content": "done"},
++                {"role": "user", "content": "Run the recap skill now", "display_kind": "loop_tick"},
++                {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]}]
++    assert turn_ended_after(messages, 0) is True
++    assert ContextCompressor._is_actionable_user_turn(messages[2]) is False
++
++
++def test_history_projection_keeps_the_loop_tick_kind_and_its_line():
++    from tui_gateway.server import _history_to_messages
++    meta = loop_tick_display("/recap")["display_metadata"]
++    projected, = _history_to_messages([{"role": "user", "content": "Run the recap skill now",
++                                        "display_kind": "loop_tick", "display_metadata": meta}])
++    assert projected["display_kind"] == "loop_tick" and projected["display_metadata"] == meta
++
++
++def test_cli_resume_recap_shows_the_loop_line_not_the_prompt():
++    from hermes_cli.cli_agent_setup_mixin import _collect_resume_entries
++    rows = [{"role": "user", "content": "Run the recap skill now", **loop_tick_display("/recap")},
++            {"role": "user", "content": "Run it again", "display_kind": "loop_tick"}]
++    entries, _, _ = _collect_resume_entries(rows, {}, lambda s: s)
++    assert entries == [("event", "↻ /loop /recap"), ("event", "↻ /loop")]
++
++
++def test_a_loop_tick_is_not_an_automation_replay_turn():
++    """The loop schedules its own next tick; a failed tick is not replayed by automation_replay."""
++    from tui_gateway import automation_replay
++    assert automation_replay.is_automation(LOOP_TICK_DISPLAY_KIND) is False
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 8202f9278d..b55e333139 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -412,7 +412,9 @@ def _notif_slash_loop_tick(rid: str, sid: str, session: dict, mgr, wakeup: str)
+                 _publish_session_control_snapshot(sid, session)  # back to the countdown, not "running now"
+                 return
+             # Releases the claim on failure: the swallow below would otherwise leave the session busy for good.
+-            _notif_submit(rid, sid, session, payload["message"], "loop wakeup send failed")
++            # Typed loop_tick: the expanded command is the loop's, never read as a person's reply. [daveey]
++            from hermes_cli.loops import loop_tick_display
++            _notif_submit(rid, sid, session, payload["message"], "loop wakeup send failed", **loop_tick_display(wakeup))
+             return
+     except Exception:
+         pass
+diff --git a/ui-tui/src/__tests__/messages.test.ts b/ui-tui/src/__tests__/messages.test.ts
+index 0e3c04b70d..6594b1a317 100644
+--- a/ui-tui/src/__tests__/messages.test.ts
++++ b/ui-tui/src/__tests__/messages.test.ts
+@@ -97,6 +97,24 @@ describe('toTranscriptMessages', () => {
+     expect(result[0]?.text).toBeTruthy()
+     expect(result[0]?.text).not.toBe('event')
+   })
++
++  it('projects a /loop slash tick prompt as its loop line, never the expanded prompt', () => {
++    const rows = [
++      {
++        role: 'user',
++        text: 'Run the recap skill now',
++        display_kind: 'loop_tick',
++        display_metadata: { display_text: '↻ /loop /recap' }
++      },
++      { role: 'user', text: 'Run it again', display_kind: 'loop_tick' }
++    ]
++
++    const result = toTranscriptMessages(rows)
++    expect(result.map(m => [m.kind, m.role, m.text])).toEqual([
++      ['event', 'system', '↻ /loop /recap'],
++      ['event', 'system', '↻ /loop']
++    ])
++  })
+ })
+ 
+ describe('MessageLine', () => {
+diff --git a/ui-tui/src/domain/messages.ts b/ui-tui/src/domain/messages.ts
+index f71da6444c..386af53e5b 100644
+--- a/ui-tui/src/domain/messages.ts
++++ b/ui-tui/src/domain/messages.ts
+@@ -23,6 +23,38 @@ export const userDisplay = (text: string) => {
+ const storedRowId = (role: string, rowId: unknown): Pick<Msg, 'rowId'> =>
+   role === 'user' && Number.isSafeInteger(rowId) && (rowId as number) > 0 ? { rowId: rowId as number } : {}
+ 
++type RowMeta = TranscriptRow['display_metadata']
++
++const metaText = (meta: RowMeta): string | undefined =>
++  typeof meta?.display_text === 'string' && meta.display_text.trim() ? meta.display_text : undefined
++
++const agentsFinished = (meta: RowMeta) => {
++  const count = meta && typeof meta.task_count === 'number' ? meta.task_count : undefined
++
++  return count === undefined
++    ? t('libText.messages.backgroundAgentWorkFinished')
++    : t(
++        count === 1 ? 'libText.messages.backgroundAgentsFinishedOne' : 'libText.messages.backgroundAgentsFinishedOther',
++        count
++      )
++}
++
++// display_kind -> its event line. Rows of these kinds are backend notices, drawn as markers, never messages.
++const TIMELINE_EVENTS: Record<string, (meta: RowMeta) => string> = {
++  model_switch: () => t('libText.messages.modelChanged'),
++  auto_continue: () => t('libText.messages.resumedInterruptedTurn'),
++  personality_switch: () => t('libText.messages.personalityChanged'),
++  // A slash-command /loop tick's expanded prompt: its `↻ /loop /cmd` line, never the prompt.
++  loop_tick: meta => metaText(meta) ?? '↻ /loop',
++  async_delegation_complete: meta =>
++    typeof meta?.display_text === 'string' ? meta.display_text : agentsFinished(meta),
++  process_complete: meta =>
++    typeof meta?.display_text === 'string' ? meta.display_text : t('libText.messages.backgroundProcessFinished')
++}
++
++const timelineEventText = (displayKind: string, meta: RowMeta): string | undefined =>
++  Object.hasOwn(TIMELINE_EVENTS, displayKind) ? TIMELINE_EVENTS[displayKind]!(meta) : undefined
++
+ export const toTranscriptMessages = (rows: unknown): Msg[] => {
+   if (!Array.isArray(rows)) {
+     return []
+@@ -57,48 +89,12 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
+       continue
+     }
+ 
+-    if (display_kind === 'model_switch') {
+-      out.push({ kind: 'event', role: 'system', text: t('libText.messages.modelChanged') })
+-      pending = []
+-
+-      continue
+-    }
+-
+-    if (display_kind === 'auto_continue') {
+-      out.push({ kind: 'event', role: 'system', text: t('libText.messages.resumedInterruptedTurn') })
+-      pending = []
+-
+-      continue
+-    }
+-
+-    if (display_kind === 'personality_switch') {
+-      out.push({ kind: 'event', role: 'system', text: t('libText.messages.personalityChanged') })
+-      pending = []
+-
+-      continue
+-    }
++    const eventText = display_kind
++      ? timelineEventText(display_kind, (row as TranscriptRow).display_metadata)
++      : undefined
+ 
+-    if (display_kind === 'async_delegation_complete' || display_kind === 'process_complete') {
+-      const meta = (row as TranscriptRow).display_metadata
+-      const count = meta && typeof meta.task_count === 'number' ? meta.task_count : undefined
+-
+-      const label =
+-        display_kind === 'process_complete'
+-          ? t('libText.messages.backgroundProcessFinished')
+-          : count === undefined
+-            ? t('libText.messages.backgroundAgentWorkFinished')
+-            : t(
+-                count === 1
+-                  ? 'libText.messages.backgroundAgentsFinishedOne'
+-                  : 'libText.messages.backgroundAgentsFinishedOther',
+-                count
+-              )
+-
+-      out.push({
+-        kind: 'event',
+-        role: 'system',
+-        text: typeof meta?.display_text === 'string' ? meta.display_text : label
+-      })
++    if (eventText !== undefined) {
++      out.push({ kind: 'event', role: 'system', text: eventText })
+       pending = []
+ 
+       continue
+-- 
+2.51.0
+

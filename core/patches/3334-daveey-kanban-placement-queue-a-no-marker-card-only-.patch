@@ -1,0 +1,162 @@
+From 73ebb749625af2bb9312ad33c2cb43c3d25e265e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:52:37 +0000
+Subject: [PATCH] [daveey] kanban placement: queue a no-marker card only when
+ one live machine holds queue + coordination labels
+
+PR #1908 applied the whole-label-set liveness rule only to local-marker cards. A card with no marker hit still
+checked the queue label alone, so with worker_pools naming a member that attests a coordination label (say
+capability:hub-write) while no live pool:worker machine carries it, the card queued as
+[pool:worker, capability:hub-write] and nobody could claim it. Both paths now build the full runs_on set once and
+judge it with one liveness source: the injected machine_ok seam (handed the label tuple) or _machine_picks_up,
+which now accepts a label tuple via label_machines. None keeps today's local keep.
+
+Review nits 1 and 3 of t_01a1d38bd571fd44 (PR #1908).
+---
+ hermes_cli/kanban_placement.py             |  6 ++-
+ hermes_cli/kanban_worker_placement.py      | 21 +++++---
+ tests/hermes_cli/test_kanban_pool_queue.py | 58 ++++++++++++++++++++++
+ 3 files changed, 75 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 5e6ef2c8d1..93dbb53f32 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -663,13 +663,15 @@ def _routeless_heavy(args: dict, c: _Cfg, self_gw: Optional[str],
+             "why": f"heavy work ({heavy}): runs on {worker} through the Board lease"}
+ 
+ 
+-def _machine_picks_up(name: str) -> bool:
++def _machine_picks_up(name: str | tuple[str, ...]) -> bool:
+     """``name`` is an active machine in the Board registry that is not held (draining) and has not turned
+     pickup off. The Board registry does not publish ``pickup`` today (10-28: every entry lacked it, the hub
+     and worker-1 included, though both claim ``runs_on`` cards), so a missing field counts as on:
+     ``heavy_route`` naming the worker is the operator saying it picks up. A pool label (:func:`is_pool_label`) is
+-    live when some such machine carries it."""
++    live when some such machine carries it; a label tuple (queue label + coordination labels) when one carries all."""
+     from hermes_cli import kanban_worker_node as wn
++    if isinstance(name, (tuple, list, set, frozenset)):
++        return bool(label_machines(name))
+     if is_pool_label(name):
+         return bool(label_machines(name))
+     entry = ((wn.registry() or {}).get("machines") or {}).get(name)
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 305310a30a..5c3dffb93d 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -108,8 +108,9 @@ def queue_decision(args, cfg, gateway, pin, machine_ok=None):
+     card while another has free slots. None (legacy routing applies) for a pin, an explicit ``runs_on``,
+     non-portable work, or when no active, unheld machine carries the label. Courier and origin-bound creates queue
+     too: chat ownership pins storage, not execution (t_01a1d0571c2f07d6). On a pool worker a built-in local-marker
+-    hit queues too, with its group's labels and a ``note`` (:func:`unmet_markers`), but only when one active, unheld
+-    machine holds the whole label set (queue, group and coordination labels); else the local keep stands. [daveey]
++    hit queues too, with its group's labels and a ``note`` (:func:`unmet_markers`). Either way the card queues only
++    when one active, unheld machine holds the whole label set (queue, group and coordination labels), judged by
++    ``machine_ok`` (given the label tuple) or the registry; else the local keep stands. [daveey]
+     """
+     from hermes_cli import kanban_placement as placement
+     from hermes_cli import kanban_placement_coordination as coordination
+@@ -126,14 +127,18 @@ def queue_decision(args, cfg, gateway, pin, machine_ok=None):
+     elif reason:
+         return None
+     extra = coordination.required_labels(args, cfg)
+-    if extra is None or not (machine_ok or placement._machine_picks_up)(label):
++    if extra is None:
++        return None
++    if unmet is not None:
++        extra = extra | unmet["labels"]
++    runs_on = [label, *sorted(extra - {label})]
++    # One liveness source for the whole set, marker hit or not: an active, unheld pickup machine must hold every
++    # label, else nobody could claim the card and today's local keep stands. The machine_ok seam sees the set.
++    if not (machine_ok or placement._machine_picks_up)(label if len(runs_on) == 1 else tuple(runs_on)):
+         return None
+     if unmet is None:
+-        return {"where": "local", "runs_on": [label, *sorted(extra - {label})], "why": QUEUED_WHY.format(label=label)}
+-    extra = extra | unmet["labels"]
+-    if not placement.label_machines([label, *extra]):
+-        return None  # no live machine holds every label: nobody could claim it, so keep today's local keep
+-    return {"where": "local", "runs_on": [label, *sorted(extra - {label})], "note": unmet["note"],
++        return {"where": "local", "runs_on": runs_on, "why": QUEUED_WHY.format(label=label)}
++    return {"where": "local", "runs_on": runs_on, "note": unmet["note"],
+             "why": QUEUED_WHY.format(label=label) + UNMET_WHY.format(hit=unmet["hit"], gateway=gateway)}
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_pool_queue.py b/tests/hermes_cli/test_kanban_pool_queue.py
+index 7a7da3393e..8c1eb579d0 100644
+--- a/tests/hermes_cli/test_kanban_pool_queue.py
++++ b/tests/hermes_cli/test_kanban_pool_queue.py
+@@ -10,6 +10,7 @@ from __future__ import annotations
+ 
+ import json
+ import subprocess
++import time
+ from pathlib import Path
+ 
+ import pytest
+@@ -951,6 +952,63 @@ def test_pool_worker_keeps_a_mac_marker_card_when_no_live_machine_holds_every_la
+     assert _runs_on(w2.conn, out["task_id"]) == [POOL], out
+ 
+ 
++HUB_WRITE = "capability:hub-write"
++# worker_pools names worker-5: portability attests coordination labels on those members, not on the queue's machines.
++POOLS_CFG = {**CFG, "worker_pools": {HUB: ["worker-5"]}}
++
++
++def _hub_write_registry(kind):
++    machines = _machines()  # worker-1/2: linux + pool:worker, no hub-write attestation
++    machines["worker-5"] = {**W1, "name": "worker-5", "labels": ["linux", HUB_WRITE]}  # no queue label
++    if kind == "held":
++        machines["worker-1"] = {**machines["worker-1"], "labels": ["linux", POOL, HUB_WRITE], "hold": True}
++    elif kind == "joint":
++        machines["worker-1"] = {**machines["worker-1"], "labels": ["linux", POOL, HUB_WRITE]}
++    seen = int(time.time() * 1000)  # coordination attestation only counts fresh members
++    listed = [{**m, "last_seen": seen} for m in machines.values()]
++    wn.set_registry_fetch(lambda: {"me": HUB, "machines": listed})
++
++
++# 11-13 review nit 3 (t_01a1d38bd571fd44): with no local-marker hit, queue_decision checked only the queue label, so
++# a card whose coordination label the attested pool members hold, but no live queue machine also holds, queued where
++# nobody could claim it.
++@pytest.mark.parametrize("kind", ["none", "held", "joint"])
++def test_no_marker_card_queues_only_when_one_live_machine_holds_queue_and_coordination_labels(hub, kind):
++    from hermes_cli import kanban_worker_placement as wp
++    _hub_write_registry(kind)
++    args = {"title": "summarise CI", "requires": ["hub:write"], "assignee": "default"}
++    assert kp.portable_reason(args, POOLS_CFG) is None  # worker-5 attests hub-write: portable
++    out = wp.queue_decision(args, POOLS_CFG, HUB, "")
++    if kind == "joint":
++        assert out is not None and out["runs_on"] == [POOL, HUB_WRITE], out
++    else:
++        assert out is None, out  # today's local keep (worker-first enrollment) instead of an unclaimable queue
++    # A card with no coordination label still queues on the queue label alone.
++    plain = wp.queue_decision({"title": "summarise CI", "assignee": "default"}, POOLS_CFG, HUB, "")
++    assert plain is not None and plain["runs_on"] == [POOL], plain
++
++
++# Review nit 1: the injected machine_ok seam is the one liveness source for the whole label set, on both paths.
++def test_machine_ok_seam_judges_the_whole_label_set_on_both_paths(w2, monkeypatch):
++    from hermes_cli import kanban_worker_placement as wp
++    seen = []
++
++    def ok(labels):
++        seen.append(labels)
++        return True
++    monkeypatch.setattr("hermes_cli.kanban_capability_registry.self_gateway", lambda: HUB)
++    _hub_write_registry("none")  # the real registry has no joint holder; the seam says there is one
++    out = wp.queue_decision({"title": "summarise CI", "requires": ["hub:write"]}, POOLS_CFG, HUB, "", machine_ok=ok)
++    assert out is not None and out["runs_on"] == [POOL, HUB_WRITE] and seen == [(POOL, HUB_WRITE)], (out, seen)
++    seen.clear()
++    w2_cfg = {"worker_queue": {"worker-2": POOL}}
++    _on(monkeypatch, "worker-2", w2_cfg, _no_live_tailnet_pool_worker("none"))
++    keychain = {"title": "rotate the CI token in the Keychain"}
++    out = wp.queue_decision(keychain, w2_cfg, "worker-2", "", machine_ok=ok)
++    assert out is not None and out["runs_on"] == [POOL, TAILNET] and seen == [(POOL, TAILNET)], (out, seen)
++    assert wp.queue_decision(keychain, w2_cfg, "worker-2", "", machine_ok=lambda _labels: False) is None
++
++
+ def test_every_built_in_local_marker_has_a_group():
+     assert set(kp.DEFAULT_LOCAL_MARKERS) | set(kp.DEFAULT_LOCAL_SKILL_MARKERS) <= set(kp.LOCAL_MARKER_GROUPS)
+     assert set(kp.LOCAL_MARKER_GROUPS.values()) <= {"mac", "desktop", "browser", "sso", "context"}
+-- 
+2.51.0
+

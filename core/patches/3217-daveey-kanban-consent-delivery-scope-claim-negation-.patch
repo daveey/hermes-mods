@@ -1,0 +1,396 @@
+From e053d3494147e2a68e9bcaaf002a491933101f22 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 03:23:12 +0000
+Subject: [PATCH] [daveey] kanban consent/delivery: scope claim negation to the
+ verb; fail closed on unsynced provenance
+
+Follow-up to PR #1783 review (5885372987) non-blocking points:
+
+1. claimed_targets: a negation/intent word only undoes a delivery claim when it
+   governs the verb (up to 3 words before it, stopping at a comma or
+   conjunction). "Delivered the note to t_X with no errors" now needs the exact
+   receipt; "not posted", "queued, not yet posted", "failed and was not sent"
+   stay outside the gate. Read-only replay over 339 local done summaries: the
+   only change is one real claim the old rule missed.
+2. Home executor: a caller whose created event has not reached the replica is
+   retried (like an unreachable Board) and refused as consent_unproven after
+   CREATION_SYNC_GRACE_S, never applied on an empty read.
+3. _submit also enforces the submitting session's own stops, and cards created
+   by a session inherit that session's stops even when they carry the parent's
+   origin-chat session_id. The remaining limit (home cannot see a submitting
+   host's session stops; later stops do not reach existing cards) is documented
+   in kanban_consent.
+4. The snapshot fallback reads the request-scoped session
+   (get_session_env('HERMES_SESSION_ID')), not os.environ.
+---
+ hermes_cli/kanban_consent.py                  |  79 ++++++++++++-
+ hermes_cli/kanban_operator_call.py            |   9 +-
+ hermes_cli/kanban_operator_delivery.py        |  37 ++++--
+ hermes_cli/kanban_supervisor_requests.py      |   4 +-
+ .../test_kanban_consent_provenance.py         | 108 +++++++++++++++++-
+ .../test_kanban_operator_delivery.py          |  29 +++++
+ 6 files changed, 243 insertions(+), 23 deletions(-)
+
+diff --git a/hermes_cli/kanban_consent.py b/hermes_cli/kanban_consent.py
+index 02076b0470..d9c964cc90 100644
+--- a/hermes_cli/kanban_consent.py
++++ b/hermes_cli/kanban_consent.py
+@@ -3,6 +3,14 @@
+ The approval decision is durable in the existing state DB; created events carry
+ its snapshot to workers. This is authorization state, not a delivery receipt.
+ Ordinary user turns and elapsed time never remove a stop.
++
++Where stops are enforced: at submission (the requester card's created snapshot
++plus the submitting session's own host-local stops) and again at the home
++executor (the created snapshot, read from the replica; an unsynced created event
++is retried, then refused). Cards created by a session inherit its stops even when
++they carry another origin session_id. Known limit: a stop recorded in a session
++after a card was created does not reach that card, and the home cannot see a
++submitting session's host-local stops (only the submitting host checks them).
+ """
+ from __future__ import annotations
+ 
+@@ -110,26 +118,85 @@ def session_stops(session):
+         db.close()
+ 
+ 
+-def creation_stops(conn, task_id):
++def _created_stops(conn, task_id):
++    """The stops stamped on *task_id*'s created event; None when that event is absent."""
+     if not task_id:
+         return []
+     row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='created' ORDER BY id LIMIT 1",
+                        (task_id,)).fetchone()
+-    return json.loads(row[0] or "{}").get("consent_stops", []) if row else []
++    return None if row is None else json.loads(row[0] or "{}").get("consent_stops", [])
++
++
++def creation_stops(conn, task_id):
++    """Local-board read: a card with no created event here carries no stops (the home fails closed)."""
++    return _created_stops(conn, task_id) or []
++
++
++def current_session():
++    """The request-scoped session (what ``_create_session_id`` binds), never another chat's process env."""
++    from gateway.session_context import get_session_env
++    return get_session_env("HERMES_SESSION_ID") or None
+ 
+ 
+ def snapshot(conn, task_id, creator_task_id):
++    """Creator stops + the card's origin session + the creating session (a worker run's own stops).
++
++    Children of a worker card inherit the parent's origin-chat session_id, so the
++    worker run's session is added explicitly: a stop it recorded binds them too.
++    """
+     row = conn.execute("SELECT session_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+-    session = (row[0] if row else None) or os.environ.get("HERMES_SESSION_ID")
+-    stops = creation_stops(conn, creator_task_id) + session_stops(session)
++    current = current_session()
++    sessions = dict.fromkeys(s for s in ((row[0] if row else None) or current, current) if s)
++    stops = list(creation_stops(conn, creator_task_id))
++    for session in sessions:
++        stops += session_stops(session)
+     return list({json.dumps(s, sort_keys=True): s for s in stops}.values())
+ 
+ 
+-def enforce(conn, requester, ops):
++def _check(stops, ops):
+     from hermes_cli.kanban_supervisor_requests import SupervisorRequestError
+-    for stop in creation_stops(conn, requester):
++    for stop in stops:
+         for op in ops:
+             if (op.get("op") == "operator" and op.get("action") == "comment"
+                     and op.get("task_id") in stop.get("targets", [])):
+                 raise SupervisorRequestError("consent_stop", "the originating approval did not consent to this "
+                                              "target; delegation does not authorize it")
++
++
++def enforce(conn, requester, ops, session=None):
++    """Submission check: the requester's creation stops plus the submitting session's own stops.
++
++    The home re-checks the creation stops (``home_refusal``) and fails closed when
++    it cannot read them; this local check reads the caller's own board.
++    """
++    _check(list(creation_stops(conn, requester)) + session_stops(session), ops)
++
++
++# How long the home waits for a caller's created event to reach its replica before refusing.
++CREATION_SYNC_GRACE_S = 600
++
++
++def home_refusal(rep, payload, target):
++    """``(refusal, retry)`` for the home executor, from the caller's created event in the replica.
++
++    A missing created event (sync lag) is retried like an unreachable Board, then
++    refused after ``CREATION_SYNC_GRACE_S``: the stops cannot be checked, so the
++    call is never applied on an empty read. Known limit: the submitting session's
++    host-local stops are checked only at submission (``enforce``), never here.
++    """
++    from hermes_cli.kanban_supervisor_requests import SupervisorRequestError
++    if payload.get("action") != "comment":
++        return None, False  # stops only bind comments; other actions need no provenance read
++    caller = (payload.get("caller") or {}).get("task_id")
++    stops = _created_stops(rep, caller)
++    if stops is None:
++        at = payload.get("requested_at")
++        if isinstance(at, (int, float)) and time.time() - at <= CREATION_SYNC_GRACE_S:
++            return None, True
++        return (f"consent_unproven: the created event of {caller} never reached this replica, so its "
++                "approval stops cannot be checked"), False
++    try:
++        _check(stops, [{"op": "operator", "action": payload.get("action"), "task_id": target}])
++    except SupervisorRequestError as exc:
++        return str(exc), False
++    return None, False
+diff --git a/hermes_cli/kanban_operator_call.py b/hermes_cli/kanban_operator_call.py
+index 35406fa790..5d91962599 100644
+--- a/hermes_cli/kanban_operator_call.py
++++ b/hermes_cli/kanban_operator_call.py
+@@ -746,13 +746,8 @@ def apply_incoming(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+             event = {"id": eid, "uid": euid, "task_id": etask}
+             refusal, retry = _caller_refusal(rep, board, event, payload)
+             if refusal is None and not retry:
+-                from hermes_cli.kanban_consent import enforce
+-                from hermes_cli.kanban_supervisor_requests import SupervisorRequestError
+-                try:
+-                    enforce(rep, (payload.get("caller") or {}).get("task_id"), [{
+-                        "op": "operator", "action": payload.get("action"), "task_id": target}])
+-                except SupervisorRequestError as exc:
+-                    refusal = str(exc)
++                from hermes_cli.kanban_consent import home_refusal
++                refusal, retry = home_refusal(rep, payload, target)  # unsynced created event: retry, then refuse
+             if retry:
+                 hi = eid - 1
+                 break
+diff --git a/hermes_cli/kanban_operator_delivery.py b/hermes_cli/kanban_operator_delivery.py
+index 8fe3bcf56b..4d60ad6569 100644
+--- a/hermes_cli/kanban_operator_delivery.py
++++ b/hermes_cli/kanban_operator_delivery.py
+@@ -7,19 +7,42 @@ import re
+ import sqlite3
+ 
+ 
+-_CLAIM = re.compile(r"\b(?:posted|sent|delivered|commented|relayed)\b", re.IGNORECASE)
+-# A clause that reports a non-delivery, a queue or an intent is never a claim:
+-# pending stays queued wording and must not need (or fake) a delivery proof.
+-_NOT_CLAIM = re.compile(r"(?:n't|n’t)\b|\b(?:not|never|no|queued|pending|failed|refused|rejected|unable|will|"
+-                        r"would|could|should|may|might|if|once|until|awaiting|waiting)\b", re.IGNORECASE)
++_CLAIM = frozenset({"posted", "sent", "delivered", "commented", "relayed"})
++# A negation, queue or intent word governs a claim verb only from just before it
++# ("was not posted", "queued and will be sent", "once delivered"): pending stays
++# queued wording and must not need (or fake) a delivery proof. The same word
++# elsewhere in the clause ("Delivered to t_X with no errors") does not undo the
++# claim, so it still needs the exact receipt (fail closed).
++_NOT_CLAIM = frozenset({"not", "never", "no", "nothing", "none", "neither", "nor", "without", "queued", "pending",
++                        "failed", "refused", "rejected", "unable", "will", "would", "could", "should", "may",
++                        "might", "if", "once", "until", "awaiting", "waiting", "yet"})
++_GOVERN_WINDOW = 3  # words before the verb: "has not yet been posted", "will later be sent"
++# A comma or conjunction ends the governing span: "filed no card, so I posted ..." is a claim.
++_BOUNDARY = frozenset({",", "so", "and", "but", "then", "after", "before", "because", "which", "while", "that"})
++_WORD = re.compile(r"[\w’']+|,")
+ _TASK_ID = re.compile(r"\bt_[0-9a-f]{8}(?:[0-9a-f]{8})?\b")
+ 
+ 
++def _governed(words, i):
++    for w in reversed(words[max(0, i - _GOVERN_WINDOW):i]):
++        if w in _BOUNDARY:
++            return False
++        if w in _NOT_CLAIM or w.endswith(("n't", "n’t")):
++            return True
++    return False
++
++
+ def claimed_targets(text):
+-    """Explicit affirmative past-tense delivery claims, one clause at a time."""
++    """Explicit affirmative past-tense delivery claims, one clause at a time.
++
++    A clause claims delivery when one of its claim verbs is not governed by a
++    negation/intent word in the few words before it; every card id in that
++    clause is then claimed.
++    """
+     targets = set()
+     for clause in re.split(r"[.!?;\n]", text if isinstance(text, str) else ""):
+-        if _CLAIM.search(clause) and not _NOT_CLAIM.search(clause):
++        words = [w.lower() for w in _WORD.findall(clause)]
++        if any(w in _CLAIM and not _governed(words, i) for i, w in enumerate(words)):
+             targets.update(_TASK_ID.findall(clause))
+     return targets
+ 
+diff --git a/hermes_cli/kanban_supervisor_requests.py b/hermes_cli/kanban_supervisor_requests.py
+index 81ebd33804..b2b03f4a0e 100644
+--- a/hermes_cli/kanban_supervisor_requests.py
++++ b/hermes_cli/kanban_supervisor_requests.py
+@@ -401,8 +401,8 @@ def _submit(conn: sqlite3.Connection, *, env_task: Optional[str], env_run: Optio
+ 
+     norm = normalize_ops(ops)
+     requester, run_id = validate_origin(conn, env_task, env_run)
+-    from hermes_cli.kanban_consent import enforce
+-    enforce(conn, requester, norm)
++    from hermes_cli.kanban_consent import current_session, enforce
++    enforce(conn, requester, norm, session=current_session())  # creation stops + this session's own stops
+     verdicts = preflight(conn, requester, norm)
+     available = executor_available(conn)
+     summary = {"ops": verdicts, "executor_available": available}
+diff --git a/tests/hermes_cli/test_kanban_consent_provenance.py b/tests/hermes_cli/test_kanban_consent_provenance.py
+index a6c0e98a61..3cd81e5105 100644
+--- a/tests/hermes_cli/test_kanban_consent_provenance.py
++++ b/tests/hermes_cli/test_kanban_consent_provenance.py
+@@ -118,7 +118,7 @@ def test_home_executor_enforces_creation_stop_from_old_worker(fleet, monkeypatch
+     f.board()
+     # Model an older submitting worker: the home must enforce independently.
+     with monkeypatch.context() as old_worker:
+-        old_worker.setattr(consent, "enforce", lambda *args: None)
++        old_worker.setattr(consent, "enforce", lambda *args, **kw: None)
+         result = requests.submit(f.w, env_task=caller, env_run=str(run), ops=[{
+             "op": "operator", "action": "comment", "task_id": f.target, "text": "probe payload"}])
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home-without-chat"))
+@@ -206,3 +206,109 @@ def test_store_failure_fails_closed_without_blocking_an_approved_command(monkeyp
+             _decide("t_" + "2" * 16, choice)
+     else:
+         _decide("t_" + "2" * 16, choice)
++
++
++def _stopped_home_call(f, monkeypatch, tmp_path, name):
++    from hermes_cli import kanban_consent as consent
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / f"{name}-origin"))
++    approval_context._fire_approval_hook(
++        "post_approval_response", session_id=f"{name}-chat",
++        command=f"hermes kanban comment {f.target} 'probe payload'", choice="timeout", surface="gateway")
++    caller = f.card(f.w, f"{name} child", session_id=f"{name}-chat")
++    kb.claim_task(f.w, caller)
++    run = kb._current_run_id(f.w, caller)
++    f.run_uid(f.w, caller)
++    f.board()
++    with monkeypatch.context() as old_worker:
++        old_worker.setattr(consent, "enforce", lambda *args, **kw: None)
++        result = requests.submit(f.w, env_task=caller, env_run=str(run), ops=[{
++            "op": "operator", "action": "comment", "task_id": f.target, "text": "probe payload"}])
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / f"{name}-home"))
++    return caller, result["request_id"]
++
++
++def _hide_created(f, monkeypatch, caller):
++    """Model replica sync lag: the caller's created event has not reached the home's replica."""
++    real = f.board
++
++    def lagging():
++        real()
++        with kb.write_txn(f.rep):
++            f.rep.execute("DELETE FROM task_events WHERE task_id=? AND kind='created'", (caller,))
++    monkeypatch.setattr(f, "board", lagging)
++    lagging()
++    return real
++
++
++def test_home_executor_retries_while_creation_provenance_is_unsynced(fleet, monkeypatch, tmp_path):
++    from hermes_cli import kanban_operator_call as kox
++    f = fleet
++    caller, rid = _stopped_home_call(f, monkeypatch, tmp_path, "lag")
++    real = _hide_created(f, monkeypatch, caller)
++    helpers._round(f)
++    assert not f.h.execute("SELECT 1 FROM operator_calls WHERE side='execute'").fetchone(), \
++        "the home applied a call whose consent provenance it could not read"
++    assert not f.h.execute("SELECT 1 FROM task_comments WHERE task_id=?", (f.target,)).fetchone()
++    # Once the created event syncs, the home sees the stop and refuses.
++    monkeypatch.setattr(f, "board", real)
++    kox._MARK.clear()
++    helpers._round(f)
++    request = requests.get_request(f.w, rid)
++    assert request["result"][0]["outcome"] == "refused", request
++    assert "consent_stop" in request["result"][0]["detail"]
++    assert not f.h.execute("SELECT 1 FROM task_comments WHERE task_id=?", (f.target,)).fetchone()
++
++
++def test_home_executor_refuses_when_creation_provenance_never_syncs(fleet, monkeypatch, tmp_path):
++    from hermes_cli import kanban_consent as consent
++    f = fleet
++    caller, rid = _stopped_home_call(f, monkeypatch, tmp_path, "never")
++    _hide_created(f, monkeypatch, caller)
++    monkeypatch.setattr(consent, "CREATION_SYNC_GRACE_S", -1)
++    helpers._round(f)
++    request = requests.get_request(f.w, rid)
++    assert request["result"][0]["outcome"] == "refused", request
++    assert "consent_unproven" in request["result"][0]["detail"]
++    assert not f.h.execute("SELECT 1 FROM task_comments WHERE task_id=?", (f.target,)).fetchone()
++
++
++def test_submitting_session_stop_is_enforced_and_inherited(fleet, monkeypatch, tmp_path):
++    """A worker run's own timed-out approval binds its submissions and the cards it creates."""
++    from gateway.session_context import scoped_current_session_id
++    f = fleet
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "worker-run-home"))
++    approval_context._fire_approval_hook(
++        "post_approval_response", session_id="worker-run-session",
++        command=f"hermes kanban comment {f.target} 'probe payload'", choice="timeout", surface="gateway")
++    op = {"op": "operator", "action": "comment", "task_id": f.target, "text": "probe payload"}
++    with scoped_current_session_id("worker-run-session"):
++        with pytest.raises(requests.SupervisorRequestError, match="consent_stop"):
++            requests.submit(f.w, env_task=f.caller, env_run=str(f.run_id), ops=[op])
++        child = f.card(f.w, "child of the stopped run", creator_task_id=f.caller, session_id="origin-chat")
++    from hermes_cli import kanban_consent as consent
++    with pytest.raises(requests.SupervisorRequestError, match="consent_stop"):
++        consent.enforce(f.w, child, [{"op": "operator", "action": "comment", "task_id": f.target}])
++    # Control: another session's submission is not bound by this run's stop.
++    with scoped_current_session_id("other-session"):
++        assert requests.submit(f.w, env_task=f.caller, env_run=str(f.run_id), ops=[op])["status"] == "pending"
++
++
++def test_snapshot_uses_request_scoped_session_not_process_env(fleet, monkeypatch, tmp_path):
++    """Two chats in one gateway: os.environ holds whichever bound last; the card follows its own request."""
++    import contextvars
++    from gateway.session_context import scoped_current_session_id
++    from hermes_cli import kanban_consent as consent
++    f = fleet
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "multi-chat-home"))
++    _decide(f.target, "deny", session="chat-a")
++    monkeypatch.setenv("HERMES_SESSION_ID", "chat-a")  # chat A set the process env last
++
++    def create(session):
++        with scoped_current_session_id(session):
++            return f.card(f.w, f"card from {session}")
++    from_b = contextvars.copy_context().run(create, "chat-b")
++    from_a = contextvars.copy_context().run(create, "chat-a")
++    op = [{"op": "operator", "action": "comment", "task_id": f.target}]
++    consent.enforce(f.w, from_b, op)
++    with pytest.raises(requests.SupervisorRequestError, match="consent_stop"):
++        consent.enforce(f.w, from_a, op)
+diff --git a/tests/hermes_cli/test_kanban_operator_delivery.py b/tests/hermes_cli/test_kanban_operator_delivery.py
+index fc6fde3d5b..8955de0791 100644
+--- a/tests/hermes_cli/test_kanban_operator_delivery.py
++++ b/tests/hermes_cli/test_kanban_operator_delivery.py
+@@ -244,3 +244,32 @@ def test_unreachable_board_refuses_delivery_proof_cleanly(fleet, monkeypatch):
+     with pytest.raises(ValueError, match="canonical Board evidence unavailable"):
+         kb.complete_task(f.w, f.caller, expected_run_id=f.run_id, metadata=_receipt(proof))
+     assert kb.get_task(f.w, f.caller).status == "running"
++
++
++@pytest.mark.parametrize("summary", [
++    "Delivered the note to {t} with no errors.", "Posted the findings to {t} once the review finished.",
++    "Sent the summary to {t} so it may be closed.", "Relayed the findings to {t}, if anyone asks.",
++])
++def test_negation_outside_the_claim_verb_still_needs_a_receipt(fleet, summary):
++    """A negation/intent word elsewhere in the clause does not govern the delivery verb (fail closed)."""
++    f = fleet
++    helpers._submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "pending"})
++    with pytest.raises(ValueError, match="exact operator delivery receipt"):
++        kb.complete_task(f.w, f.caller, expected_run_id=f.run_id, summary=summary.format(t=f.target))
++    assert kb.get_task(f.w, f.caller).status == "running"
++
++
++@pytest.mark.parametrize("text,claimed", [
++    ("Delivered the note to t_0123456789abcdef with no errors.", True),
++    ("The note to t_0123456789abcdef was not posted.", False),
++    ("Comment to t_0123456789abcdef queued, not yet posted.", False),
++    ("The comment to t_0123456789abcdef failed and was not sent.", False),
++    ("The comment to t_0123456789abcdef is queued and will be posted later.", False),
++    ("Never actually got delivered to t_0123456789abcdef.", False),
++    ("No probes were found, so nothing was commented on t_0123456789abcdef.", False),
++    ("Ship filed no card, so I posted both IDs on t_0123456789abcdef.", True),
++    ("Posted to t_0123456789abcdef; no errors.", True),
++])
++def test_claimed_targets_scopes_negation_to_the_verb(text, claimed):
++    from hermes_cli.kanban_operator_delivery import claimed_targets
++    assert claimed_targets(text) == ({"t_0123456789abcdef"} if claimed else set())
+-- 
+2.51.0
+

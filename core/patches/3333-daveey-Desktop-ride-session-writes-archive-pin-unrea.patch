@@ -1,0 +1,392 @@
+From 7ea9a61d3f97f688df89e92ed315c96d5524a07a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:39:47 +0000
+Subject: [PATCH] [daveey] Desktop: ride session writes (archive/pin/unread)
+ across a hub reconnect
+
+Archive (and every fenced session write) now waits out a remote backend
+reconnect and replays the same intent, instead of failing on the first
+socket hang up / down-gate fail-fast and making the user click again.
+
+Evidence (laptop-1 desktop.log, 2026-11-12 21:10 -> 2026-11-13 00:13 PST,
+bundle ea936d5d20): nine hub PATCH /api/sessions/<id> failures on
+conn=hermes-hub - "socket hang up", the remote-down gate's "Remote backend
+... is down ...; reconnect in progress. Failing fast instead of waiting for
+a timeout.", "Passive read: no warm backend", and dial timeouts - each in a
+[session-freshness] gateway-unavailable window that ended seconds later.
+
+Five whys (fail-fast path):
+1. Why did the archive fail? The PATCH hit a hub tunnel reset (socket hang
+   up), and the next tries were refused at once by the remote-down gate.
+2. Why refused at once? The gate (electron/remote-down-gate.ts) fails every
+   request fast while the hub is down, so UI polls don't stack 4-30 s
+   timeouts; it lets one trial through per backoff window.
+3. Why did that end the user's archive? mutateSessionHttp sent the fenced
+   write exactly once; any rejection went to commitArchive, which restored
+   the row and showed a Retry toast.
+4. Why was there no automatic replay? The write was treated like a read:
+   nothing distinguished "the route to the owner is down" from a verdict,
+   although the mutation client already retains the request_id/expected
+   revision for a non-definitive failure, so a replay is idempotent.
+5. Why was that not used? Retry was only wired to the explicit toast button
+   (5da2d6c856); no layer below it waited for the reconnect.
+
+Fix: withSessionWriteReconnect (src/api/session-write-reconnect.ts) wraps
+mutateSessionHttp. A transport failure (hang up, ECONN*, down-gate refusal,
+dial timeout, passive no-warm-backend) is retried with 1/2/4/8/10 s backoff,
+never earlier than the gate's own "next try in Ns", for up to 60 s, replaying
+the retained identity (same request_id, same expected revision), so an owner
+that already committed answers from its receipt. The archive row stays
+optimistically hidden meanwhile. Backend answers are never retried here:
+definitive refusals (conflict, not found, client_upgrade_required, ...) and
+503 owner_unavailable (already ridden out server-side) still reach the user.
+Failure stays visible: past the window the existing restore + "Archive
+failed" toast with Retry runs, and every replay, landing and give-up writes
+a [session-write] line to desktop.log.
+
+The 409 client_upgrade_required failures (conn=primary, which on the MBP is
+the hub: "conn:hermes-hub::default via=primary") were not archives and not
+app/backend drift: bundle ea936d5d20 is an ancestor of core 2cc7101849 (2
+commits apart). They are the hermes-mods inbox plugin's markRead, a raw
+PATCH {unread:false} with no request_id/expected_revision, fired on focus
+(24 of them on Nov 12 repeat every ~30 s per focused chat); the backend
+correctly names an identity-less write client_upgrade_required. The plugin
+swallows the error, so the user saw nothing. Fixed separately in hermes-mods
+(follow-up card); this commit pins that such a refusal is never replayed.
+
+Tests: session-write-reconnect.test.ts (each logged hub failure replays;
+each backend answer does not; gate hint honoured; budget gives the error
+back) and sessions.test.ts (a hub archive that hits hang-up then fail-fast
+lands on the third PATCH with one request_id; client_upgrade_required is
+sent once). RED on the old sessions.ts: the reconnect test fails.
+---
+ .../src/api/session-write-reconnect.test.ts   | 107 ++++++++++++++++++
+ .../src/api/session-write-reconnect.ts        | 102 +++++++++++++++++
+ apps/desktop/src/api/sessions.test.ts         |  56 ++++++++-
+ apps/desktop/src/api/sessions.ts              |   6 +-
+ 4 files changed, 269 insertions(+), 2 deletions(-)
+ create mode 100644 apps/desktop/src/api/session-write-reconnect.test.ts
+ create mode 100644 apps/desktop/src/api/session-write-reconnect.ts
+
+diff --git a/apps/desktop/src/api/session-write-reconnect.test.ts b/apps/desktop/src/api/session-write-reconnect.test.ts
+new file mode 100644
+index 0000000000..a31694cfe7
+--- /dev/null
++++ b/apps/desktop/src/api/session-write-reconnect.test.ts
+@@ -0,0 +1,107 @@
++import { describe, expect, it, vi } from 'vitest'
++
++import { isReconnectableSessionWriteError, withSessionWriteReconnect } from './session-write-reconnect'
++
++// The failures the MacBook logged for hub session PATCHes on 2026-11-12 (desktop.log, conn=hermes-hub).
++const HUB_FAILURES = [
++  "Error invoking remote method 'hermes:api': Error: socket hang up",
++  'Remote backend "conn:hermes-hub::default" is down (socket hang up, 3s ago); reconnect in progress. Failing fast instead of waiting for a timeout.',
++  'Remote backend "conn:hermes-hub::default" is down (dispatch probe failed: Timed out connecting to Hermes backend after 10000ms, 10s ago); next try in 4s. Failing fast instead of waiting for a timeout.',
++  'Passive read: no warm backend for "conn:hermes-hub::default"',
++  'Timed out connecting to Hermes backend after 30000ms',
++  'connect ECONNREFUSED 127.0.0.1:58610'
++]
++
++const DEFINITIVE = [
++  '503: {"detail":"owner_unavailable: control_timeout: the gateway that owns this profile did not answer in time; nothing was changed, retry"}',
++  '409: {"detail":"revision_conflict"}',
++  '404: {"detail":"not_found"}',
++  '409: {"detail":"client_upgrade_required: this app is out of sync (different versions) with the Hermes backend; update the app to edit sessions"}',
++  '409: {"detail":"mutation_identity_required"}',
++  'Session mutation snapshot unavailable; refresh before trying again'
++]
++
++function clock() {
++  let t = 0
++  const waits: number[] = []
++
++  return {
++    now: () => t,
++    sleep: async (ms: number) => {
++      waits.push(ms)
++      t += ms
++    },
++    advance: (ms: number) => {
++      t += ms
++    },
++    waits
++  }
++}
++
++describe('isReconnectableSessionWriteError', () => {
++  it.each(HUB_FAILURES)('replays a transport failure: %s', message => {
++    expect(isReconnectableSessionWriteError(new Error(message))).toBe(true)
++  })
++
++  it.each(DEFINITIVE)('never replays a backend answer: %s', message => {
++    expect(isReconnectableSessionWriteError(new Error(message))).toBe(false)
++  })
++})
++
++describe('withSessionWriteReconnect', () => {
++  it('rides out a hub reconnect and lands the write without a user retry', async () => {
++    const c = clock()
++    const log = vi.fn()
++
++    const run = vi
++      .fn()
++      .mockRejectedValueOnce(new Error('socket hang up'))
++      .mockRejectedValueOnce(new Error(HUB_FAILURES[1]))
++      .mockResolvedValueOnce({ ok: true })
++
++    await expect(
++      withSessionWriteReconnect(run, { label: 'PATCH s', log, now: c.now, sleep: c.sleep })
++    ).resolves.toEqual({ ok: true })
++    expect(run).toHaveBeenCalledTimes(3)
++    expect(c.waits).toEqual([1_000, 2_000])
++    expect(log.mock.calls.at(-1)?.[0]).toMatch(/\[session-write\] PATCH s landed on attempt 3/)
++  })
++
++  it('waits at least as long as the down gate says before the next try', async () => {
++    const c = clock()
++    const run = vi.fn().mockRejectedValueOnce(new Error(HUB_FAILURES[2])).mockResolvedValueOnce({ ok: true })
++
++    await withSessionWriteReconnect(run, { label: 'PATCH s', log: vi.fn(), now: c.now, sleep: c.sleep })
++    expect(c.waits).toEqual([4_000])
++  })
++
++  it('does not retry a definitive refusal', async () => {
++    const c = clock()
++    const refusal = new Error(DEFINITIVE[0])
++    const run = vi.fn().mockRejectedValue(refusal)
++
++    await expect(
++      withSessionWriteReconnect(run, { label: 'PATCH s', log: vi.fn(), now: c.now, sleep: c.sleep })
++    ).rejects.toBe(refusal)
++    expect(run).toHaveBeenCalledOnce()
++    expect(c.waits).toEqual([])
++  })
++
++  it('gives the failure back to the caller once the reconnect window is spent', async () => {
++    const c = clock()
++    const log = vi.fn()
++    const down = new Error('socket hang up')
++
++    const run = vi.fn(async () => {
++      c.advance(5_000)
++      throw down
++    })
++
++    await expect(
++      withSessionWriteReconnect(run, { budgetMs: 30_000, label: 'PATCH s', log, now: c.now, sleep: c.sleep })
++    ).rejects.toBe(down)
++    // 5 s per attempt plus 1, 2, 4 s of backoff: the fourth failure (at 27 s) has no room for an 8 s wait.
++    expect(run).toHaveBeenCalledTimes(4)
++    expect(log.mock.calls.at(-1)?.[0]).toMatch(/failed on attempt 4/)
++  })
++})
+diff --git a/apps/desktop/src/api/session-write-reconnect.ts b/apps/desktop/src/api/session-write-reconnect.ts
+new file mode 100644
+index 0000000000..630eadb0b7
+--- /dev/null
++++ b/apps/desktop/src/api/session-write-reconnect.ts
+@@ -0,0 +1,102 @@
++import { isDefinitiveSessionMutationRefusal } from '../../../shared/src/session-http-mutations'
++
++/**
++ * [daveey] Ride a session write (archive, pin, unread, delete) across a backend reconnect.
++ *
++ * A remote backend (the hub) drops several times a day: a `hermes update` there retires its serve
++ * process, the SSH tunnel resets, and Electron's remote-down gate then fails every request fast
++ * ("Remote backend … is down …; reconnect in progress") until a trial request reopens it. On
++ * 2026-11-12 the MacBook logged nine hub session PATCHes that died that way (`socket hang up`,
++ * the fail-fast refusal, a dial timeout, `Passive read: no warm backend`), each one a user click
++ * that had to be repeated once the hub was back a few seconds later.
++ *
++ * A session write is safe to replay: the mutation client keeps the same request_id and expected
++ * revision for the same intent until the owner answers definitively, so a write the owner already
++ * committed is answered from its receipt instead of applied twice. So a transport failure (the
++ * renderer never reached the owner, or lost its reply) is retried here with backoff for a bounded
++ * window, and only a write that still fails after it reaches the caller (archive then restores the
++ * row and offers Retry). A backend verdict is never retried here: a definitive refusal (conflict,
++ * not found, permission, client upgrade) ends the write, and a 503 owner_unavailable already rode
++ * out the owner's stall server-side before answering, so it goes to the user's Retry.
++ */
++export const SESSION_WRITE_RECONNECT_BUDGET_MS = 60_000
++const FIRST_DELAY_MS = 1_000
++const MAX_DELAY_MS = 10_000
++
++const RECONNECTABLE =
++  /socket hang up|\b(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|EPIPE|EHOSTUNREACH|ENETUNREACH|EHOSTDOWN|ETIMEDOUT)\b|Remote backend "[^"]*" is down|Timed out connecting to Hermes backend|Passive read: no warm backend/i
++
++/** True for a failure that says nothing about the write itself: the route to its owner was down. */
++export function isReconnectableSessionWriteError(error: unknown): boolean {
++  const message = error instanceof Error ? error.message : String(error)
++
++  return (
++    RECONNECTABLE.test(message) &&
++    !isDefinitiveSessionMutationRefusal(message) &&
++    !/client_upgrade_required|mutation_identity_required/.test(message)
++  )
++}
++
++/** The remote-down gate's own "next try in Ns" hint, so a retry never lands inside its backoff. */
++function gateRetryHintMs(error: unknown): number {
++  const match = /next try in (\d+)s/.exec(error instanceof Error ? error.message : String(error))
++
++  return match ? Number(match[1]) * 1_000 : 0
++}
++
++export interface SessionWriteReconnectOptions {
++  /** Short label for the log line, e.g. `PATCH 20261112_055658_bb1bdd`. */
++  label: string
++  budgetMs?: number
++  now?: () => number
++  sleep?: (ms: number) => Promise<void>
++  log?: (line: string) => void
++}
++
++function desktopLog(line: string): void {
++  try {
++    console.info(line)
++    window.hermesDesktop?.logLine?.(line)
++  } catch {
++    // logging must never break a write
++  }
++}
++
++export async function withSessionWriteReconnect<T>(
++  run: () => Promise<T>,
++  options: SessionWriteReconnectOptions
++): Promise<T> {
++  const { label, budgetMs = SESSION_WRITE_RECONNECT_BUDGET_MS, now = Date.now, log = desktopLog } = options
++  const sleep = options.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)))
++  const started = now()
++  let delay = FIRST_DELAY_MS
++
++  for (let attempt = 1; ; attempt += 1) {
++    try {
++      const result = await run()
++
++      if (attempt > 1) {
++        log(`[session-write] ${label} landed on attempt ${attempt} after ${now() - started} ms`)
++      }
++
++      return result
++    } catch (error) {
++      const wait = Math.max(delay, gateRetryHintMs(error))
++      const reason = (error instanceof Error ? error.message : String(error)).slice(0, 160)
++
++      if (!isReconnectableSessionWriteError(error) || now() - started + wait > budgetMs) {
++        if (attempt > 1 || isReconnectableSessionWriteError(error)) {
++          log(`[session-write] ${label} failed on attempt ${attempt} after ${now() - started} ms: ${reason}`)
++        }
++
++        throw error
++      }
++
++      log(
++        `[session-write] ${label} attempt ${attempt} hit a reconnect (${reason}); replaying the same intent in ${wait} ms`
++      )
++      await sleep(wait)
++      delay = Math.min(delay * 2, MAX_DELAY_MS)
++    }
++  }
++}
+diff --git a/apps/desktop/src/api/sessions.test.ts b/apps/desktop/src/api/sessions.test.ts
+index 381c01a6bc..248a2a3cc1 100644
+--- a/apps/desktop/src/api/sessions.test.ts
++++ b/apps/desktop/src/api/sessions.test.ts
+@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import type { SidebarSessionsResponse } from './sessions'
+ 
+-vi.mock('@/lib/gateway-rpc', () => ({ isMissingRestEndpoint: () => false }))
++vi.mock('@/lib/gateway-rpc', () => ({ isMissingRestEndpoint: () => false, isUnroutedRestPath: () => false }))
+ vi.mock('@/store/transcript-tail', () => ({ pageHonorsLatestOrder: () => true, recordTranscriptTail: vi.fn() }))
+ vi.mock('./client', () => ({
+   ambientOwnerConnectionId: vi.fn(() => 'prometheus'),
+@@ -196,6 +196,60 @@ describe('setSessionArchived profile scoping', () => {
+     expect(patch.body.request_id).not.toBe('')
+   })
+ 
++  it('replays a hub archive that hit a reconnect with the SAME identity, without a user retry', async () => {
++    // Regression (MacBook 2026-11-12, hub chat 20261111_091916_d2d36a): the hub PATCH died with
++    // "socket hang up", then the down gate failed the next tries fast ("reconnect in progress"), and
++    // the user had to click Archive again. The write now waits out the reconnect and replays the
++    // retained request_id/expected_revision, so an owner that already committed it answers from its receipt.
++    vi.useFakeTimers()
++
++    try {
++      vi.mocked(client.capabilityScoped).mockReturnValue({ profile: 'default', connectionId: 'hermes-hub' })
++      let patches = 0
++      hermesApi.mockImplementation((async (request: { method?: string }) => {
++        if (request.method !== 'PATCH') {
++          return { exists: true, runtime_revision: 7, runtime_generation: 3 }
++        }
++
++        patches += 1
++
++        if (patches === 1) {
++          throw new Error("Error invoking remote method 'hermes:api': Error: socket hang up")
++        }
++
++        if (patches === 2) {
++          throw new Error('Remote backend "conn:hermes-hub::default" is down (socket hang up, 3s ago); reconnect in progress. Failing fast instead of waiting for a timeout.')
++        }
++
++        return { ok: true }
++      }) as never)
++
++      const archived = setSessionArchived('sess-reconnect', true, { connectionId: 'hermes-hub', profile: 'default' })
++      await vi.advanceTimersByTimeAsync(5_000)
++
++      await expect(archived).resolves.toEqual({ ok: true })
++      const sent = hermesApi.mock.calls.map(([request]) => request as Record<string, any>).filter(request => request.method === 'PATCH')
++      expect(sent).toHaveLength(3)
++      expect(new Set(sent.map(request => request.body.request_id)).size).toBe(1)
++      expect(sent.every(request => request.connectionId === 'hermes-hub' && request.body.expected_revision === 7)).toBe(true)
++    } finally {
++      vi.useRealTimers()
++    }
++  })
++
++  it('does not replay a definitive refusal (client_upgrade_required)', async () => {
++    hermesApi.mockImplementation((async (request: { method?: string }) => {
++      if (request.method !== 'PATCH') {
++        return { exists: true, runtime_revision: 7, runtime_generation: 3 }
++      }
++
++      throw new Error('409: {"detail":"client_upgrade_required: this app is out of sync (different versions) with the Hermes backend; update the app to edit sessions"}')
++    }) as never)
++
++    await expect(setSessionArchived('sess-refused', true, 'default')).rejects.toThrow(/client_upgrade_required/)
++    expect(hermesApi.mock.calls.filter(([request]) => request.method === 'PATCH')).toHaveLength(1)
++  })
++
+   it('omits the profile from the body only when there is no active profile at all', async () => {
+     hermesApi.mockResolvedValue({ ok: true, exists: true, runtime_revision: 5, runtime_generation: 2 } as never)
+ 
+diff --git a/apps/desktop/src/api/sessions.ts b/apps/desktop/src/api/sessions.ts
+index 737e0196f5..5a69c9faa1 100644
+--- a/apps/desktop/src/api/sessions.ts
++++ b/apps/desktop/src/api/sessions.ts
+@@ -23,6 +23,7 @@ import {
+   profileScoped,
+   sessionReadOwnerPin
+ } from './client'
++import { withSessionWriteReconnect } from './session-write-reconnect'
+ 
+ const SESSION_LIST_REQUEST_TIMEOUT_MS = 60_000
+ 
+@@ -426,7 +427,10 @@ function mutateSessionHttp<T>(id: string, method: 'PATCH' | 'DELETE', payload: R
+       body: { ...payload, ...identity, ...(scope.profile ? { profile: scope.profile } : {}) } })
+   }
+ 
+-  return mutateSessionFenced(key, () => hermesApi<SessionMutationSnapshot>({ ...scope, path: `${path}/mutation-snapshot${suffix}` }), send)
++  // A reconnect (hub restart, tunnel reset) replays the same intent with its retained identity.
++  return withSessionWriteReconnect(() => mutateSessionFenced(key,
++    () => hermesApi<SessionMutationSnapshot>({ ...scope, path: `${path}/mutation-snapshot${suffix}` }), send),
++  { label: `${method} ${id}` })
+ }
+ 
+ // Mutations take the owning `profile` so Electron can route them to the correct
+-- 
+2.51.0
+

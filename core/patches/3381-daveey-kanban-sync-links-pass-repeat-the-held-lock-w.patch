@@ -1,0 +1,189 @@
+From c51a9ad043e756c99b8a1e977126954c4228fd7f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:17:40 +0000
+Subject: [PATCH] [daveey] kanban sync links pass: repeat the held-lock warning
+ past REWARN_S; pin per-hold reset
+
+Follow-ups from the exact-head review of PR #2073 (t_01a1d46221c22ed6):
+
+- One warning per hold logged a pass wedged for hours once, with a duration
+  near 0 s. A refusal now warns again once the same hold has gone REWARN_S
+  (600 s) since its last warning, naming how long the pass has held the lock;
+  at most once per interval. The pass start and the warning times come from a
+  module clock seam (_clock), so the test steps time instead of sleeping.
+- New test pins the per-hold reset: after the first wedged pass returns, the
+  next hold warns again.
+- Drop the unreachable `hold[0] is self` guard (and the runner from _HOLD):
+  a runner's own pass keeps its _idle clear, so request() returns before the
+  warning, and _pass clears _HOLD before releasing the lock. A comment says why.
+
+Card t_01a1d46585b0b01f.
+---
+ hermes_cli/kanban_sync_links_pass.py          | 38 +++++----
+ .../test_kanban_sync_links_thread.py          | 81 +++++++++++++++++++
+ 2 files changed, 105 insertions(+), 14 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_links_pass.py b/hermes_cli/kanban_sync_links_pass.py
+index 7f734972f7..1a777c9abe 100644
+--- a/hermes_cli/kanban_sync_links_pass.py
++++ b/hermes_cli/kanban_sync_links_pass.py
+@@ -10,8 +10,9 @@ and never calls the loop's ``keep_running`` (callers count its calls); the loop
+ ``stop`` waits only ``JOIN_S`` for a running pass, so a slow pass can outlive its loop. Passes are serialized per
+ process (``_PASS_LOCK``): a restarted loop's runner refuses requests while a stopped runner's pass still runs, and
+ never runs ``reconcile_links`` alongside it (both would share ``kanban_sync_client._LINKS_DONE``). A request refused
+-because another runner holds the lock logs one warning per hold: a hung pass would otherwise refuse every later pass
+-in the process silently.
++because another runner holds the lock logs a warning naming how long the pass has held it: once when the hold is first
++seen, then again at most every ``REWARN_S`` while that same hold lasts, so a pass wedged for hours does not log only
++one near-0 s duration. A hung pass would otherwise refuse every later pass in the process silently.
+ """
+ from __future__ import annotations
+ 
+@@ -26,10 +27,14 @@ _log = logging.getLogger("hermes_cli.kanban_sync_client")
+ 
+ # Held for the length of one ``reconcile_links`` call by whichever runner (live, or stopped but still running) owns it.
+ _PASS_LOCK = threading.Lock()
+-# (runner, monotonic acquire time, hold token) while a pass holds ``_PASS_LOCK``, and the token of the last hold a
+-# refusal warned about: a wedged pass warns once, not on every refused request.
+-_HOLD: Optional[tuple[LinksPass, float, object]] = None
+-_WARNED_HOLD: Optional[object] = None
++# (monotonic acquire time, hold token) while a pass holds ``_PASS_LOCK``, and (token, monotonic time) of the last
++# refusal warning: a wedged pass warns when first seen and then every ``REWARN_S``, not on every refused request.
++_HOLD: Optional[tuple[float, object]] = None
++_WARNED: Optional[tuple[object, float]] = None
++# Seconds between repeat warnings for one hold.
++REWARN_S = 600.0
++# Clock seam: tests step it instead of sleeping.
++_clock = time.monotonic
+ 
+ 
+ class LinksPass:
+@@ -62,15 +67,20 @@ class LinksPass:
+             self._thread.start()
+         return True
+ 
+-    def _warn_held_elsewhere(self) -> None:
+-        global _WARNED_HOLD
+-        hold = _HOLD
+-        if hold is None or hold[0] is self or hold[2] is _WARNED_HOLD:
++    @staticmethod
++    def _warn_held_elsewhere() -> None:
++        # The holder is never this runner: its own pass keeps ``_idle`` clear, so ``request`` returns before here,
++        # and ``_pass`` clears ``_HOLD`` before releasing the lock. ``_HOLD`` is None only in that release window.
++        global _WARNED
++        hold, warned, now = _HOLD, _WARNED, _clock()
++        if hold is None:
+             return
+-        _WARNED_HOLD = hold[2]
++        if warned is not None and warned[0] is hold[1] and now - warned[1] < REWARN_S:
++            return
++        _WARNED = (hold[1], now)
+         _log.warning("kanban sync: chat links pass refused: another runner's pass has held the pass lock for %.0fs "
+-                     "(reconcile_links may be hung); later refusals stay quiet until it returns",
+-                     time.monotonic() - hold[1])
++                     "(reconcile_links may be hung); repeats every %.0fs while it holds it",
++                     now - hold[0], REWARN_S)
+ 
+     def wait_idle(self, timeout: Optional[float] = None) -> bool:
+         return self._idle.wait(timeout)
+@@ -84,7 +94,7 @@ class LinksPass:
+     def _pass(self, client) -> None:
+         global _HOLD
+         with _PASS_LOCK:  # a request that raced past ``request``'s check waits here, never overlaps
+-            _HOLD = (self, time.monotonic(), object())
++            _HOLD = (_clock(), object())
+             try:
+                 if not self._stopped:
+                     client.reconcile_links(self._boards, self._gateway, skip_unchanged=True)
+diff --git a/tests/hermes_cli/test_kanban_sync_links_thread.py b/tests/hermes_cli/test_kanban_sync_links_thread.py
+index 54ed90b8a5..a8f3816492 100644
+--- a/tests/hermes_cli/test_kanban_sync_links_thread.py
++++ b/tests/hermes_cli/test_kanban_sync_links_thread.py
+@@ -172,3 +172,84 @@ def test_a_pass_refused_behind_a_stopped_loops_pass_warns_once(monkeypatch, capl
+         release.set()
+         for thread in calls:
+             thread.join(10)
++
++
++class _HeldPass:
++    """A runner whose ``reconcile_links`` blocks until released, so it holds ``_PASS_LOCK`` while a test refuses
++    another runner's requests."""
++
++    def __init__(self, monkeypatch):
++        self.entered, self.release = threading.Event(), threading.Event()
++        monkeypatch.setattr(ksc, "reconcile_links", self._reconcile)
++        from hermes_cli.kanban_sync_links_pass import LinksPass
++        self.runner = LinksPass("holder")
++
++    def _reconcile(self, boards, gateway, **kwargs):
++        self.entered.set()
++        self.release.wait(10)
++
++    def hold(self):
++        self.entered.clear()
++        self.release.clear()
++        assert self.runner.request([("default", Path("/nonexistent/kanban.db"))]), "the holder's pass did not start"
++        assert self.entered.wait(10), "the holder's pass never entered reconcile_links"
++
++    def drop(self):
++        self.release.set()
++        assert self.runner.wait_idle(10), "the holder's pass never returned"
++
++    def close(self):
++        self.release.set()
++        self.runner.stop()
++
++
++def _held_warnings(caplog):
++    return [r.getMessage() for r in caplog.records if "held the pass lock" in r.getMessage()]
++
++
++def test_a_new_hold_warns_again_after_the_first_one_ends(monkeypatch, caplog):
++    """The quiet-after-warning state is per hold: once a wedged pass returns, the next pass that holds the lock
++    warns again (review nit on PR #2073)."""
++    from hermes_cli.kanban_sync_links_pass import LinksPass
++    held, refused = _HeldPass(monkeypatch), LinksPass("refused")
++    boards = [("default", Path("/nonexistent/kanban.db"))]
++    try:
++        with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_sync_client"):
++            held.hold()
++            assert not refused.request(boards) and not refused.request(boards)
++            assert len(_held_warnings(caplog)) == 1, _held_warnings(caplog)
++            held.drop()
++            held.hold()
++            assert not refused.request(boards)
++        assert len(_held_warnings(caplog)) == 2, f"the second hold did not warn: {_held_warnings(caplog)}"
++    finally:
++        held.close()
++
++
++def test_a_hold_past_the_threshold_warns_again_naming_its_duration(monkeypatch, caplog):
++    """One warning per hold logs a pass wedged for hours once, near 0 s: past ``REWARN_S`` the same hold warns
++    again, naming how long it has held the lock, then at most once per interval (review nit on PR #2073)."""
++    from hermes_cli import kanban_sync_links_pass as lp
++    now = {"t": 1000.0}
++    monkeypatch.setattr(lp, "_clock", lambda: now["t"], raising=False)  # base has no seam: the real clock barely moves
++    held, refused = _HeldPass(monkeypatch), lp.LinksPass("refused")
++    boards = [("default", Path("/nonexistent/kanban.db"))]
++    try:
++        with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_sync_client"):
++            held.hold()
++            now["t"] += 5
++            assert not refused.request(boards)
++            now["t"] += 599  # 604 s held, 599 s since the warning: still quiet
++            assert not refused.request(boards)
++            now["t"] += 1  # 605 s held, 600 s since the warning: warns again
++            assert not refused.request(boards)
++            now["t"] += 300
++            assert not refused.request(boards)
++            now["t"] += 300  # 1205 s held, 600 s since the repeat
++            assert not refused.request(boards)
++        warnings = _held_warnings(caplog)
++        assert len(warnings) == 3, f"expected the first warning plus two repeats: {warnings}"
++        assert ["for 5s" in warnings[0], "for 605s" in warnings[1], "for 1205s" in warnings[2]] == [True] * 3, \
++            warnings
++    finally:
++        held.close()
+-- 
+2.51.0
+

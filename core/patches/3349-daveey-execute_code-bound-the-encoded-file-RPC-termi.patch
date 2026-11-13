@@ -1,0 +1,127 @@
+From 1fdf694212906315f1656da2f9f7dd31fb7b143a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:12:30 +0000
+Subject: [PATCH] [daveey] execute_code: bound the encoded file-RPC terminal
+ result, not just the raw spill
+
+Answers review 5888560421 on #2027 (card t_01a1d332eeab779a).
+
+- The remote cap now bounds the UTF-8 JSON result the poller ships: json
+  escaping doubles newline-dense text, so an 800 KB spill of "1\n" lines
+  became ~1.2 MB of JSON. A result over 1 MiB keeps the window with
+  truncated: True and full_output_path (base64 stays under ~1.4 MB).
+- The cap comment says it covers every file-RPC backend, ssh/docker pipe
+  mode included.
+- Drop the doc-keyword test; the prompt-surface snapshot pins that text.
+---
+ ...est_code_execution_terminal_full_output.py | 17 +++++++----
+ tools/code_execution_rpc.py                   | 30 ++++++++++++-------
+ 2 files changed, 30 insertions(+), 17 deletions(-)
+
+diff --git a/tests/tools/test_code_execution_terminal_full_output.py b/tests/tools/test_code_execution_terminal_full_output.py
+index 998eeb1450..e349487e43 100644
+--- a/tests/tools/test_code_execution_terminal_full_output.py
++++ b/tests/tools/test_code_execution_terminal_full_output.py
+@@ -170,12 +170,17 @@ def test_remote_file_rpc_ships_small_full_output(tmp_path, monkeypatch):
+     assert r["truncated"] is False
+ 
+ 
+-def test_terminal_doc_line_names_what_the_spill_omits():
+-    """Code gets the redacted raw stream: sudo notes and transform-hook rewrites that the
+-    chat result carries are not in a spill-backed ``output``."""
+-    from tools.code_execution_tool import _TOOL_DOC_LINES
+-    doc = dict(_TOOL_DOC_LINES)["terminal"]
+-    assert "raw" in doc and "hook" in doc
++def test_remote_file_rpc_bounds_the_escaped_result(tmp_path, monkeypatch):
++    """The cap bounds the shipped JSON, not the raw spill: newline-dense text doubles under
++    json escaping, so a spill under 1 MiB on disk can still overflow the remote result."""
++    spill = tmp_path / "out.log"
++    spill.write_text("1\n" * 400_000)  # 800 KB raw, ~1.2 MB once each newline is escaped
++    r, shipped = _file_rpc_result(monkeypatch, {
++        "output": WINDOW, "exit_code": 0, "error": None, "full_output_path": str(spill)})
++    assert r["output"] == WINDOW
++    assert r["truncated"] is True
++    assert r["full_output_path"] == str(spill)
++    assert shipped < 2 * 1024 * 1024
+ 
+ 
+ def test_short_output_is_marked_complete():
+diff --git a/tools/code_execution_rpc.py b/tools/code_execution_rpc.py
+index c451706588..f13aa06bfc 100644
+--- a/tools/code_execution_rpc.py
++++ b/tools/code_execution_rpc.py
+@@ -95,7 +95,8 @@ def _handle_rpc_request(request: dict, *, allowed_tools: frozenset, tool_call_co
+                         where: str, full_output_cap: int | None = None) -> str:
+     """Enforce allow-list + budget, then dispatch one authenticated request. Only a dispatched
+     call consumes budget and is logged; refusals are free. ``full_output_cap`` bounds the spill
+-    a terminal() result may inline (default: the local socket cap)."""
++    a terminal() result may inline and the encoded result that carries it (default: the local
++    socket cap on the spill alone)."""
+     tool_name = request.get("tool", "")
+     tool_args = request.get("args", {})
+     if tool_name not in allowed_tools:
+@@ -116,7 +117,8 @@ def _handle_rpc_request(request: dict, *, allowed_tools: frozenset, tool_call_co
+         result = tool_error(str(exc))
+     tool_call_counter[0] += 1
+     if tool_name == "terminal":
+-        result = _complete_terminal_output(result, full_output_cap or _FULL_OUTPUT_READ_CAP_BYTES)
++        result = (_complete_terminal_output(result) if full_output_cap is None else
++                  _complete_terminal_output(result, full_output_cap, encoded_cap=full_output_cap))
+     entry = {"tool": tool_name, "args_preview": str(tool_args)[:80],
+              "duration": round(time.monotonic() - call_start, 2)}
+     error = _result_error(result)
+@@ -128,8 +130,11 @@ def _handle_rpc_request(request: dict, *, allowed_tools: frozenset, tool_call_co
+ 
+ _FULL_OUTPUT_READ_CAP_BYTES = 20 * 1024 * 1024
+ # The file-RPC poller ships each result base64 (+33%) through env.execute stdin: Modal's legacy
+-# server path caps one stdin buffer at 2 MB and Daytona/Vercel stage it as an uploaded file, so a
+-# remote result inlines at most 1 MiB of spill; a bigger one stays truncated with its path.
++# server path caps one stdin buffer at 2 MB and Daytona/Vercel stage it as an uploaded file. A
++# remote result inlines a spill only while the whole JSON result stays within 1 MiB of UTF-8
++# (json escaping can double newline-dense text), so its base64 stays under ~1.4 MB; a bigger one
++# keeps the window, truncated, with its path. One cap covers every file-RPC backend, including
++# ssh/docker pipe mode, which has no 2 MB stdin limit but gets no backend-specific branch.
+ _REMOTE_FULL_OUTPUT_READ_CAP_BYTES = 1024 * 1024
+ _SPILL_CAPPED_MARK = "[spill capped at "
+ 
+@@ -158,7 +163,8 @@ def _looks_windowed(body: dict) -> bool:
+     return bool(body.get("truncation_note")) or contains_truncation_notice(output)
+ 
+ 
+-def _complete_terminal_output(result, cap: int = _FULL_OUTPUT_READ_CAP_BYTES):
++def _complete_terminal_output(result, cap: int = _FULL_OUTPUT_READ_CAP_BYTES, *,
++                              encoded_cap: int | None = None):
+     """Give code the complete stdout of a sandbox ``terminal()`` call. The terminal tool
+     renders a head+tail window sized for the chat; a script that writes ``output`` to disk
+     as data must not get that window (defect agent-7ac9c5fa93: a checksum manifest shipped
+@@ -168,7 +174,8 @@ def _complete_terminal_output(result, cap: int = _FULL_OUTPUT_READ_CAP_BYTES):
+     pushed the text over the limit) a windowed ``output`` still reports ``truncated: True``.
+     When the spill replaces the window, notes the terminal tool appended after collection
+     (timeout/interrupt text, the sudo notice, a transform hook's rewrite) are not carried;
+-    ``exit_code`` and ``exit_code_meaning`` still report a timeout or interrupt."""
++    ``exit_code`` and ``exit_code_meaning`` still report a timeout or interrupt. With
++    *encoded_cap*, a spill-backed result whose UTF-8 JSON exceeds it keeps the window."""
+     try:
+         body = json.loads(result)
+     except (TypeError, ValueError):
+@@ -180,11 +187,12 @@ def _complete_terminal_output(result, cap: int = _FULL_OUTPUT_READ_CAP_BYTES):
+     spill_path = body.get("full_output_path")
+     full = _read_full_output(spill_path, cap) if spill_path else None
+     if full is not None:
+-        body["output"] = full
+-        body.pop("truncation_note", None)
+-        body["truncated"] = False
+-    else:
+-        body["truncated"] = bool(spill_path) or _looks_windowed(body)
++        whole = dict(body, output=full, truncated=False)
++        whole.pop("truncation_note", None)
++        text = json.dumps(whole, ensure_ascii=False)
++        if encoded_cap is None or len(text.encode("utf-8", "surrogatepass")) <= encoded_cap:
++            return text
++    body["truncated"] = bool(spill_path) or _looks_windowed(body)
+     return json.dumps(body, ensure_ascii=False)
+ 
+ 
+-- 
+2.51.0
+

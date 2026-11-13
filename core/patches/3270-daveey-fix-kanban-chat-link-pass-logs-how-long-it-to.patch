@@ -1,0 +1,139 @@
+From 7ad33e08f9bef14c52cecca7a88e51cbe6671b64 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:22:32 +0000
+Subject: [PATCH] [daveey] fix(kanban): chat-link pass logs how long it took
+
+The hub's default chat-link pass ran ~10 min on 2026-11-13 (04:14-04:24Z) and
+`kanban sync: <board> chat links {...}` carried only counts, so pass length could
+only be guessed from line spacing (t_01a1d35d8d7e22a7).
+
+- The per-board line now ends `in <s>s` (time for that board's inputs + reconcile).
+- A board pass with no changes still logs when it took LINKS_SLOW_LOG_S (10 s) or more.
+- A whole pass (shared ledger read included) that slow logs
+  `kanban sync: chat links pass over N board(s) took <s>s`.
+
+Measured on the hub after #1882 and the tracemalloc config fix (t_01a1d36b55b6911b):
+60 s py-spy --idle record of gateway 3970343 at 08:17:54Z, links thread 2281 samples,
+98.0% idle between passes, 0 samples waiting on _links_lock, 6 in _publish_links,
+40 in creator-chats backfill. No projection change is needed now; this makes the
+next regression measurable.
+
+Test: test_the_links_log_line_carries_the_pass_duration fails at base (line has
+no ` in 2.5s`) and passes here.
+---
+ hermes_cli/kanban_sync_client.py              | 22 ++++++++-
+ .../test_kanban_sync_steady_links.py          | 45 +++++++++++++++++++
+ 2 files changed, 65 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index e5b69f2367..e2004582d1 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1183,6 +1183,17 @@ def _links_clock() -> float:
+     return time.monotonic()
+ 
+ 
++# A board's links pass logs its duration with its counts (``kanban sync: <board> chat links {...} in <s>s``); a pass
++# with no changes logs only when it took this long, so a slow pass is visible even when it changed nothing; a whole
++# pass this slow (ledger read included) also logs ``kanban sync: chat links pass over N board(s) took <s>s``. The hub
++# pass ran ~10 min on 2026-11-13 and the line carried no duration to measure it by (t_01a1d35d8d7e22a7). [daveey]
++LINKS_SLOW_LOG_S = 10.0
++
++
++def _links_pass_clock() -> float:
++    return time.monotonic()
++
++
+ # The running loop's links pass (tests wait on it to observe a pass deterministically).
+ _LINKS_RUNNER: Any = None  # a kanban_sync_links_pass.LinksPass while the loop runs
+ 
+@@ -1250,6 +1261,7 @@ def reconcile_links(boards: list[tuple[str, Path]], gateway: str, *, skip_unchan
+     the loop's connection scope (``kanban_sync_connections``). [daveey]"""
+     from hermes_cli import kanban_chat_links
+     from hermes_cli.kanban_placement import config_snapshot
++    pass_began = _links_pass_clock()
+     with config_snapshot() as placement:
+         ledger: Optional[dict[str, frozenset]] = None
+         try:
+@@ -1266,6 +1278,8 @@ def reconcile_links(boards: list[tuple[str, Path]], gateway: str, *, skip_unchan
+         signature = _links_signature(gateway, placement) if skip_unchanged else None
+         for slug, path in boards:
+             key = str(path)
++            counts: dict = {}
++            began = _links_pass_clock()
+             try:
+                 with connection(path, lambda: _connect(path)) as conn:
+                     mode = sync.board_mode(conn)
+@@ -1283,10 +1297,14 @@ def reconcile_links(boards: list[tuple[str, Path]], gateway: str, *, skip_unchan
+                     counts = kanban_chat_links.reconcile(conn, slug, gateway)
+                     if inputs is not None:
+                         _LINKS_DONE[key] = (inputs, started)
+-                if any(counts.values()):
+-                    _log.info("kanban sync: %s chat links %s", slug, counts)
++                took = _links_pass_clock() - began
++                if any(counts.values()) or took >= LINKS_SLOW_LOG_S:
++                    _log.info("kanban sync: %s chat links %s in %.1fs", slug, counts, took)
+             except Exception as exc:  # health: allow BLE001 -- one board's links must not stop the sync loop
+                 _log.warning("kanban sync: chat links for %s failed (%s: %s)", slug, type(exc).__name__, exc)
++    took = _links_pass_clock() - pass_began
++    if took >= LINKS_SLOW_LOG_S:
++        _log.info("kanban sync: chat links pass over %d board(s) took %.1fs", len(boards), took)
+ 
+ 
+ class _BoardWatch:
+diff --git a/tests/hermes_cli/test_kanban_sync_steady_links.py b/tests/hermes_cli/test_kanban_sync_steady_links.py
+index 139712db37..8180a22e3b 100644
+--- a/tests/hermes_cli/test_kanban_sync_steady_links.py
++++ b/tests/hermes_cli/test_kanban_sync_steady_links.py
+@@ -438,3 +438,48 @@ def test_the_sync_loop_skips_unchanged_links_passes(live, ledger, svc, kanban_ho
+     ksc.run_forever(lambda: iterations["n"] < 10, interval=1)
+     assert (tid, "s_between", "created", 0) in _links(live)
+     assert per_iteration[6:] == [4, 5, 5, 5], per_iteration  # the change, its own writes once, then skipped
++
++
++@pytest.fixture
++def slow_reconcile(monkeypatch):
++    """Each board reconcile costs ``cost[0]`` seconds on a fake pass clock (t_01a1d35d8d7e22a7)."""
++    now, cost = [1000.0], [0.0]
++    real = links.reconcile
++
++    def reconcile(*a, **k):
++        now[0] += cost[0]
++        return real(*a, **k)
++
++    monkeypatch.setattr(ksc, "_links_pass_clock", lambda: now[0], raising=False)  # absent at base: fails on the line
++    monkeypatch.setattr(links, "reconcile", reconcile)
++    return cost
++
++
++def _link_lines(caplog):
++    return [r.getMessage() for r in caplog.records if "chat links" in r.getMessage()]
++
++
++def test_the_links_log_line_carries_the_pass_duration(live, ledger, kanban_home, scope, slow_reconcile, caplog):
++    """The hub's ~10 min pass (2026-11-13) logged only its counts, so no pass length could be read from the log.
++    A pass with changes logs ``in <s>s``; an unchanged pass logs only at ``LINKS_SLOW_LOG_S`` (10 s) or more, with
++    a whole-pass line naming the boards it covered."""
++    caplog.set_level("INFO", logger="hermes_cli.kanban_sync_client")
++    _seed(live, ledger)
++    slow_reconcile[0] = 2.5
++    _pass(kanban_home)
++    changed = _link_lines(caplog)
++    assert changed and changed[0].startswith(f"kanban sync: {BOARD} chat links {{") and changed[0].endswith(" in 2.5s")
++    assert not any("pass over" in m for m in changed), "a 2.5 s pass is under the 10 s slow-pass line"
++
++    for _ in range(3):
++        ksc.reconcile_links([(BOARD, kanban_home / "kanban.db")], ME)
++    caplog.clear()
++    slow_reconcile[0] = 9.9  # unchanged, under the threshold: silent
++    ksc.reconcile_links([(BOARD, kanban_home / "kanban.db")], ME)
++    assert _link_lines(caplog) == []
++
++    slow_reconcile[0] = 12.0  # unchanged but slow: logged with zero counts and its duration
++    ksc.reconcile_links([(BOARD, kanban_home / "kanban.db")], ME)
++    assert _link_lines(caplog) == [
++        f"kanban sync: {BOARD} chat links {{'added': 0, 'changed': 0, 'released': 0, 'retired': 0}} in 12.0s",
++        "kanban sync: chat links pass over 1 board(s) took 12.0s"]
+-- 
+2.51.0
+

@@ -1,0 +1,414 @@
+From 9b190c56e2332e325fa608eadde12f11be8d5fea Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:39:14 +0000
+Subject: [PATCH] [daveey] kanban gc: sweep stale gc-rm trash; SELECT abort
+ log; one home-key reset
+
+Follow-ups to PR #1982's exact-head review (t_01a1d3fd707849a7, review 5888112869):
+
+- gc_task_scratch: a detached `.<id>.gc-rm-<hex>` tree whose rmtree failed was only warned
+  about and then reported owner_unverified on every later run. Each run now sweeps those
+  names (workspaces root and beside each candidate; never a symlink, only names GC mints)
+  after the candidate SELECT and outside any write txn, and _report_unowned_scratch skips them.
+- The candidate SELECT is back inside the try: an unreadable board logs
+  "Scratch GC aborted ..." and returns 0 instead of raising.
+- env_loader._home_key's memo moves to hermes_constants.resolved_home_str (same semantics: no
+  expanduser, no normcase, missing paths not memoized), so reset_hermes_home_key_cache()
+  clears it together with hermes_home_key's.
+- Docs: the control socket's 30 s cached "no symlinked ancestor" pass (an ancestor swapped for
+  a symlink is admitted for up to 30 s) in developer-guide gateway-internals.md, with a pointer
+  in gateway/AGENTS.md.
+
+Tests: RED on base (5 failures), GREEN:
+tests/hermes_cli/test_kanban_scratch_gc_trash_sweep.py (5),
+tests/test_hermes_home_key_cache.py (TestOneResetForEveryHomeMemo).
+Every test file referencing the changed functions (86 files, 1409 tests) passes.
+
+Card: t_01a1d4036f42d021
+---
+ gateway/AGENTS.md                             |   4 +
+ hermes_cli/env_loader.py                      |  17 +--
+ hermes_cli/kanban_worktree_gc.py              |  59 ++++++++--
+ hermes_constants.py                           |  26 ++++-
+ .../test_kanban_scratch_gc_trash_sweep.py     | 109 ++++++++++++++++++
+ .../hermes_cli/test_loop_fs_request_paths.py  |   3 +-
+ tests/test_hermes_home_key_cache.py           |  27 +++++
+ .../docs/developer-guide/gateway-internals.md |  11 ++
+ 8 files changed, 230 insertions(+), 26 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_scratch_gc_trash_sweep.py
+
+diff --git a/gateway/AGENTS.md b/gateway/AGENTS.md
+index 1710a1f70a..d18e744e1d 100644
+--- a/gateway/AGENTS.md
++++ b/gateway/AGENTS.md
+@@ -87,6 +87,10 @@ replaced by #92091's `pause-for-update`. Do NOT "fix" gateway-dies-with-app by r
+ gateway under the backend, and do NOT "fix" update locks by widening the tree-kill. Gateways stamp
+ `code_sha`/`code_version` into `gateway_state.json` (`status.py`) so the updater can verify a fleet.
+ 
++**Control socket peer check:** the home's "no symlinked ancestor" verdict is cached 30 s (passes
++only), so an ancestor swapped for a symlink is admitted for up to 30 s. Details: developer-guide
++`gateway-internals.md`, "Home check and its cache".
++
+ ## Profile scope (adapters, turns, and everything between turns)
+ 
+ - **One identity per inbound event, canonicalized FIRST.** `gateway/session_identity.py::resolve_identity`
+diff --git a/hermes_cli/env_loader.py b/hermes_cli/env_loader.py
+index 125b022e86..29c47dc18a 100644
+--- a/hermes_cli/env_loader.py
++++ b/hermes_cli/env_loader.py
+@@ -189,20 +189,11 @@ def _home_key(hermes_home: str | os.PathLike) -> str:
+     """``str(Path(hermes_home).resolve())``, the key of the per-home source maps, memoized per input
+     for a home that exists (a missing one is resolved again: it may yet appear as a symlink). The
+     dashboard and control paths build a secret scope on the event loop for every request, and a
+-    per-request realpath stalled that loop for seconds under FS pressure."""
+-    raw = os.fspath(hermes_home)
+-    cached = _HOME_KEYS.get(raw)
+-    if cached is not None:
+-        return cached
+-    try:
+-        key = str(Path(raw).resolve(strict=True))
+-    except OSError:
+-        return str(Path(raw).resolve())
+-    _HOME_KEYS[raw] = key
+-    return key
+-
++    per-request realpath stalled that loop for seconds under FS pressure. The memo lives in
++    ``hermes_constants`` so ``reset_hermes_home_key_cache()`` clears it with ``hermes_home_key``'s."""
++    from hermes_constants import resolved_home_str
+ 
+-_HOME_KEYS: dict[str, str] = {}
++    return resolved_home_str(hermes_home)
+ 
+ 
+ def get_secret_source_values(hermes_home: str | os.PathLike) -> dict[str, str]:
+diff --git a/hermes_cli/kanban_worktree_gc.py b/hermes_cli/kanban_worktree_gc.py
+index c22257a5c5..6dae8b40c8 100644
+--- a/hermes_cli/kanban_worktree_gc.py
++++ b/hermes_cli/kanban_worktree_gc.py
+@@ -60,15 +60,15 @@ def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: int | None = N
+     # every rmtree run outside it (they took 11 min for 29 trees on a loaded Mac, holding BEGIN
+     # IMMEDIATE on the board throughout); each removal re-checks its owner in a short write txn
+     # and detaches the tree by rename there, so a card resumed mid-GC never sees it half-deleted.
+-    with kb.write_txn(conn):
+-        rows = conn.execute(
+-            "SELECT t.id, t.workspace_path, t.workspace_kind, t.completed_at, t.created_at, "
+-            "(SELECT MAX(created_at) FROM task_events e WHERE e.task_id=t.id "
+-            " AND e.kind NOT LIKE 'workspace%') AS last_event "
+-            "FROM tasks t WHERE t.workspace_kind='scratch' "
+-            f"AND t.status IN {ws._TERMINAL_STATUSES_SQL}"
+-        ).fetchall()
+     try:
++        with kb.write_txn(conn):
++            rows = conn.execute(
++                "SELECT t.id, t.workspace_path, t.workspace_kind, t.completed_at, t.created_at, "
++                "(SELECT MAX(created_at) FROM task_events e WHERE e.task_id=t.id "
++                " AND e.kind NOT LIKE 'workspace%') AS last_event "
++                "FROM tasks t WHERE t.workspace_kind='scratch' "
++                f"AND t.status IN {ws._TERMINAL_STATUSES_SQL}"
++            ).fetchall()
+         known_paths = _scratch_owner_paths(conn)
+         for board in ws._sibling_board_db_files(conn):
+             with _read_board(board) as other:
+@@ -76,6 +76,7 @@ def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: int | None = N
+     except (OSError, sqlite3.Error):
+         log.warning("Scratch GC aborted: cannot read all boards; preserving workspaces", exc_info=True)
+         return 0
++    _sweep_detached_trash(kb.workspaces_root(), rows)
+     try:
+         _report_unowned_scratch(kb.workspaces_root(), known_paths)
+     except OSError:
+@@ -103,7 +104,7 @@ def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: int | None = N
+                 aged.append((row["id"], path, row["completed_at"]))
+                 continue
+             ws.release_lsp_clients(str(path))
+-            trash = path.with_name(f".{path.name}.gc-rm-{uuid.uuid4().hex}")
++            trash = path.with_name(f".{path.name}{_TRASH_INFIX}{uuid.uuid4().hex}")
+             try:
+                 os.rename(path, trash)
+             except OSError:
+@@ -122,6 +123,42 @@ def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: int | None = N
+     return removed
+ 
+ 
++# A tree detached for removal: ``.<workspace name>.gc-rm-<uuid4 hex>``, a sibling of the workspace.
++# Only this GC creates the name, after the owner check passed and the removal was logged.
++_TRASH_INFIX = ".gc-rm-"
++_TRASH_NAME = re.compile(r"\..+\.gc-rm-[0-9a-f]{32}")
++
++
++def _is_detached_trash(path: Path) -> bool:
++    return _TRASH_NAME.fullmatch(path.name) is not None
++
++
++def _sweep_detached_trash(root: Path, rows) -> None:
++    """Finish removals an earlier run detached but could not rmtree (no board lock is held here).
++
++    Looks in the workspaces root and beside each candidate's workspace, never follows a symlink,
++    and only touches names this GC mints."""
++    import shutil
++
++    parents = {root}
++    for row in rows:
++        if row["workspace_path"]:
++            path = Path(row["workspace_path"]).expanduser()
++            if ws._is_managed_scratch_path(path):
++                parents.add(path.parent)
++    for parent in parents:
++        try:
++            entries = [p for p in parent.iterdir() if _is_detached_trash(p)]
++        except OSError:
++            continue
++        for trash in entries:
++            if trash.is_symlink() or not trash.is_dir():
++                continue
++            shutil.rmtree(trash, ignore_errors=True)
++            if os.path.lexists(trash):
++                log.warning("Scratch GC left detached tree %s; retried next run", trash)
++
++
+ def _scratch_owner_unchanged(conn: sqlite3.Connection, row: sqlite3.Row, path: Path) -> bool:
+     """Inside the removal txn: the candidate's task still owns ``path`` exactly as selected, is
+     still terminal and has no active children (it may have been resumed or reassigned since)."""
+@@ -161,8 +198,8 @@ def _report_unowned_scratch(root: Path, known_paths: set[Path]) -> None:
+     represented = {root_key / known.relative_to(root_key).parts[0]
+                    for known in known_paths if known.is_relative_to(root_key) and known != root_key}
+     for path in root.iterdir():
+-        if path.is_symlink() or not path.is_dir():
+-            continue
++        if path.is_symlink() or not path.is_dir() or _is_detached_trash(path):
++            continue  # detached trash is swept by gc_task_scratch, not an unknown owner
+         if path.resolve() not in represented:
+             log.warning("Scratch preserved: reason=owner_unverified path=%s; "
+                         "no local task workspace record; moved or unknown ownership; "
+diff --git a/hermes_constants.py b/hermes_constants.py
+index cfb7fe39fc..10cbf47725 100644
+--- a/hermes_constants.py
++++ b/hermes_constants.py
+@@ -252,8 +252,32 @@ def hermes_home_key(path: str | Path | None = None) -> str:
+ 
+ 
+ def reset_hermes_home_key_cache() -> None:
+-    """Forget every remembered home key (for tests that move a home dir on disk)."""
++    """Forget every remembered home key (for tests that move a home dir on disk).
++
++    Clears :func:`resolved_home_str`'s memo too, so one reset covers every home-path memo."""
+     _HOME_KEY_CACHE.clear()
++    _RESOLVED_HOME_CACHE.clear()
++
++
++_RESOLVED_HOME_CACHE: dict[str, str] = {}
++
++
++def resolved_home_str(path: str | os.PathLike) -> str:
++    """``str(Path(path).resolve())`` memoized per input for a path that exists.
++
++    Unlike :func:`hermes_home_key` it neither expands ``~`` nor normcases: ``env_loader`` keys its
++    per-home secret maps this way. A missing path is resolved again each call (it may yet appear
++    as a symlink). Shares :func:`reset_hermes_home_key_cache` with ``hermes_home_key``."""
++    raw = os.fspath(path)
++    cached = _RESOLVED_HOME_CACHE.get(raw)
++    if cached is not None:
++        return cached
++    try:
++        key = str(Path(raw).resolve(strict=True))
++    except OSError:
++        return str(Path(raw).resolve())
++    _RESOLVED_HOME_CACHE[raw] = key
++    return key
+ 
+ 
+ def get_process_hermes_home() -> Path:
+diff --git a/tests/hermes_cli/test_kanban_scratch_gc_trash_sweep.py b/tests/hermes_cli/test_kanban_scratch_gc_trash_sweep.py
+new file mode 100644
+index 0000000000..db6ac47b7d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scratch_gc_trash_sweep.py
+@@ -0,0 +1,109 @@
++"""PR #1982 review follow-ups for scratch GC (t_01a1d4036f42d021).
++
++A detached ``.<id>.gc-rm-<hex>`` tree whose rmtree failed is retried by the next GC run (outside
++the board's write lock) and never reported as unowned scratch; a board that cannot be read at the
++candidate SELECT aborts the run with the usual log line instead of raising.
++"""
++import contextlib
++import logging
++import shutil
++import sqlite3
++import threading
++import time
++import uuid
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_worktree_gc as gc
++from tests.hermes_cli import test_kanban_scratch_gc_archive as helpers
++
++board = helpers.board
++
++
++def _run_gc():
++    with kbc.connect_closing() as conn:
++        return gc.gc_task_scratch(conn, older_than_days=7)
++
++
++def _stale_trash(name="t_gone"):
++    root = kb.workspaces_root()
++    root.mkdir(parents=True, exist_ok=True)
++    trash = root / f".{name}.gc-rm-{uuid.uuid4().hex}"
++    (trash / "sub").mkdir(parents=True)
++    (trash / "sub" / "file.txt").write_text("left over")
++    return trash
++
++
++def test_stale_detached_tree_is_swept_and_not_reported(board, caplog):
++    trash = _stale_trash()
++    with caplog.at_level(logging.WARNING, logger=gc.log.name):
++        assert _run_gc() == 0
++    assert not trash.exists()
++    assert "owner_unverified" not in caplog.text
++
++
++def test_sweep_leaves_lookalike_names_alone(board, caplog):
++    root = kb.workspaces_root()
++    root.mkdir(parents=True, exist_ok=True)
++    keep = [root / ".t_x.gc-rm-notahexsuffix", root / "t_x.gc-rm-" f"{uuid.uuid4().hex}"]
++    for path in keep:
++        path.mkdir()
++    real = root / "real-target"
++    real.mkdir()
++    (real / "precious.txt").write_text("keep")
++    link = root / f".t_link.gc-rm-{uuid.uuid4().hex}"
++    link.symlink_to(real, target_is_directory=True)
++    _run_gc()
++    assert all(p.is_dir() for p in keep)
++    assert (real / "precious.txt").exists()
++    assert link.is_symlink()
++
++
++def test_undeletable_trash_is_reported_as_detached_not_unowned(board, caplog, monkeypatch):
++    trash = _stale_trash()
++    monkeypatch.setattr(shutil, "rmtree", lambda *a, **k: None)
++    with caplog.at_level(logging.WARNING, logger=gc.log.name):
++        _run_gc()
++    assert trash.exists()
++    assert "owner_unverified" not in caplog.text
++    assert f"detached tree {trash}" in caplog.text
++
++
++def test_board_writable_while_stale_trash_is_swept(board, monkeypatch):
++    _stale_trash()
++    with kbc.connect_closing() as conn:
++        db = conn.execute("PRAGMA database_list").fetchone()["file"]
++    real_rmtree, waits = shutil.rmtree, []
++
++    def slow_rmtree(path, *args, **kwargs):
++        other = sqlite3.connect(db, timeout=0.5, isolation_level=None)
++        started = time.monotonic()
++        try:
++            other.execute("BEGIN IMMEDIATE")
++            other.execute("ROLLBACK")
++            waits.append(time.monotonic() - started)
++        except sqlite3.OperationalError as exc:
++            waits.append(exc)
++        finally:
++            other.close()
++        threading.Event().wait(0.2)  # health: allow HX013 -- a slow rmtree IS the behaviour under test
++        return real_rmtree(path, *args, **kwargs)
++
++    monkeypatch.setattr(shutil, "rmtree", slow_rmtree)
++    _run_gc()
++    assert waits and all(isinstance(w, float) and w < 0.5 for w in waits), waits
++
++
++def test_unreadable_board_at_candidate_select_aborts_with_log(board, caplog, monkeypatch):
++    _tid, path = helpers._task()
++
++    @contextlib.contextmanager
++    def locked(conn, *a, **k):
++        raise sqlite3.OperationalError("database is locked")
++        yield  # pragma: no cover
++
++    monkeypatch.setattr(kb, "write_txn", locked)
++    with caplog.at_level(logging.WARNING, logger=gc.log.name):
++        assert _run_gc() == 0
++    assert "Scratch GC aborted" in caplog.text
++    assert path.exists()
+diff --git a/tests/hermes_cli/test_loop_fs_request_paths.py b/tests/hermes_cli/test_loop_fs_request_paths.py
+index 0241954507..cf0af1755f 100644
+--- a/tests/hermes_cli/test_loop_fs_request_paths.py
++++ b/tests/hermes_cli/test_loop_fs_request_paths.py
+@@ -118,9 +118,10 @@ def test_secret_source_values_reuse_the_resolved_home(tmp_path, monkeypatch):
+ 
+ def test_missing_home_key_is_not_memoized(tmp_path):
+     from hermes_cli import env_loader
++    import hermes_constants
+     home = tmp_path / "later"
+     assert env_loader._home_key(home) == str(home.resolve())
+-    assert str(home) not in env_loader._HOME_KEYS
++    assert str(home) not in hermes_constants._RESOLVED_HOME_CACHE
+     real = tmp_path / "real"
+     real.mkdir()
+     home.symlink_to(real)
+diff --git a/tests/test_hermes_home_key_cache.py b/tests/test_hermes_home_key_cache.py
+index add7378a8b..d8435741a8 100644
+--- a/tests/test_hermes_home_key_cache.py
++++ b/tests/test_hermes_home_key_cache.py
+@@ -114,6 +114,33 @@ class TestSymlinks:
+         assert hc.hermes_home_key(str(link)) == hc.hermes_home_key(str(target))
+ 
+ 
++class TestOneResetForEveryHomeMemo:
++    def test_reset_also_forgets_the_env_loader_home_key(self, tmp_path):
++        # env_loader keys its per-home secret maps by a memoized resolve too; a test that moves a
++        # home on disk resets once and must see the new answer from both (PR #1982 review).
++        from hermes_cli import env_loader
++
++        home, real = tmp_path / "home", tmp_path / "real"
++        home.mkdir()
++        real.mkdir()
++        assert env_loader._home_key(home) == str(home.resolve())
++        home.rmdir()
++        try:
++            home.symlink_to(real, target_is_directory=True)
++        except (OSError, NotImplementedError):
++            pytest.skip("this platform or account cannot create symlinks")
++        hc.reset_hermes_home_key_cache()
++        assert env_loader._home_key(home) == str(real.resolve())
++
++    def test_env_loader_key_keeps_its_no_expanduser_semantics(self, tmp_path):
++        from hermes_cli import env_loader
++
++        (tmp_path / "real").mkdir()
++        target = str(tmp_path / "real" / ".." / "real")
++        assert env_loader._home_key(target) == str(Path(target).resolve())
++        assert env_loader._home_key("~nobody-such-user/x") == str(Path("~nobody-such-user/x").resolve())
++
++
+ class TestRegistryLookupsDoNotHitTheDisk:
+     def test_scope_key_resolves_the_path_once(self, monkeypatch):
+         # The reason this cache exists. ToolRegistry.current_scope_key() runs
+diff --git a/website/docs/developer-guide/gateway-internals.md b/website/docs/developer-guide/gateway-internals.md
+index 682cc7b914..68eb7f326e 100644
+--- a/website/docs/developer-guide/gateway-internals.md
++++ b/website/docs/developer-guide/gateway-internals.md
+@@ -575,6 +575,17 @@ same-user lock left at mode 0644 by an older Hermes is narrowed to 0600, as
+ `hermes gateway attach` does. None of this protects against code already running as your user,
+ or root.
+ 
++**Home check and its cache.** Before it mints a ticket on POSIX, `_posix_peer_subject` requires
++the gateway's home to be a real directory owned by its uid with a safe mode and no symlinked path
++component. The home itself is `lstat`ed on every connection, so the home turning into a symlink
++or changing owner or mode is refused at once. The "no symlinked component" verdict (a `realpath`,
++one `lstat` per ancestor) is reused for `_HOME_REALPATH_TTL_SECS` (30 s), and only a pass is
++reused: **an ancestor of the home swapped for a symlink is still admitted for up to 30 s**, until
++the cached pass expires. A refusal is never cached, so a repaired home is admitted on the next
++connection. The cache exists because a per-connection `realpath` on the event loop held
++session-ticket bootstraps for 25-45 s under filesystem pressure; changing the TTL or caching
++refusals changes this window.
++
+ The contract is pinned by `apps/shared/src/node/control-socket.vectors.json`: request and reply
+ pairs a client in any language can replay, run against the gateway by
+ `tests/gateway/test_control_socket_vectors.py`.
+-- 
+2.51.0
+

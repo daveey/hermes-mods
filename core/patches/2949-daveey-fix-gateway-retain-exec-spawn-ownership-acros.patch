@@ -1,0 +1,154 @@
+From caca6161a33805bfab5dcbfc15f101f3d6177edc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 21:28:43 +0000
+Subject: [PATCH] [daveey] fix(gateway): retain exec spawn ownership across
+ cancellation
+
+---
+ gateway/run_inbound_hooks.py                  | 22 ++++-
+ tests/gateway/test_exec_quick_command_tree.py | 80 +++++++++++++++++++
+ 2 files changed, 100 insertions(+), 2 deletions(-)
+
+diff --git a/gateway/run_inbound_hooks.py b/gateway/run_inbound_hooks.py
+index 8772f42380..0e7239e62e 100644
+--- a/gateway/run_inbound_hooks.py
++++ b/gateway/run_inbound_hooks.py
+@@ -45,6 +45,16 @@ async def _stop_exec_tree(proc) -> None:
+         await asyncio.wait_for(proc.wait(), timeout=5)
+ 
+ 
++async def _stop_pending_exec_tree(spawn) -> None:
++    """Retain spawn ownership until its handle is available, then stop the tree."""
++    try:
++        proc = await spawn
++    except OSError:
++        # A failed spawn has no process to stop; preserve the caller's cancellation.
++        return
++    await _stop_exec_tree(proc)
++
++
+ def _carry_replied_voice_answer(event, rewritten, new_text: str) -> None:
+     """``dataclasses.replace`` drops the adapter's private typed-answer attribute, and without it a
+     clarify reads the replied-to voice note's speech as the answer. Carry it: the plugin's rewritten
+@@ -193,13 +203,21 @@ class GatewayInboundHooksMixin:
+         proc = None
+         try:
+             from tools.environments.local import build_subprocess_env
+-            proc = await asyncio.create_subprocess_shell(
++            # The shell can run before asyncio finishes connecting its pipes. Keep
++            # ownership of the spawn across cancellation so its children cannot escape.
++            spawn = asyncio.create_task(asyncio.create_subprocess_shell(
+                 exec_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                 env=build_subprocess_env(), cwd=cwd,
+                 # Its own process group, so cleanup can reach what the shell started (POSIX;
+                 # Windows ignores it and _stop_exec_tree walks the tree with taskkill /T).
+                 start_new_session=True,  # detached-spawn: ok — awaited; the timeout/cancel path kills its group
+-            )
++            ))
++            try:
++                proc = await asyncio.shield(spawn)
++            except asyncio.CancelledError:
++                # Cleanup owns the spawn even if shutdown cancels this caller again.
++                await asyncio.shield(_stop_pending_exec_tree(spawn))
++                raise
+             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_EXEC_QUICK_COMMAND_TIMEOUT)
+             output = (stdout or stderr).decode().strip()
+             if output:
+diff --git a/tests/gateway/test_exec_quick_command_tree.py b/tests/gateway/test_exec_quick_command_tree.py
+index fc3e0907e6..f0f417fb79 100644
+--- a/tests/gateway/test_exec_quick_command_tree.py
++++ b/tests/gateway/test_exec_quick_command_tree.py
+@@ -4,6 +4,7 @@ Killing only the shell left ``sleep 120 & wait``'s sleep alive, and a cancelled
+ shutdown on the WebSocket path) skipped cleanup entirely.
+ """
+ import asyncio
++import contextlib
+ from pathlib import Path
+ 
+ import psutil
+@@ -51,3 +52,82 @@ async def test_cancelled_exec_command_kills_shell_and_child(tmp_path):
+         await task
+     await async_wait_until(lambda: not _alive(shell) and not _alive(child), timeout=10,
+                            what='the shell and its child to stop')
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.asyncio
++@pytest.mark.parametrize('cancel_twice', [False, True])
++async def test_cancelled_exec_during_spawn_kills_child(tmp_path, monkeypatch, cancel_twice):
++    # The shell can publish child.pid before asyncio finishes connecting its pipes.
++    # Hold that ownership-transfer boundary, not the command's communicate await.
++    create_shell = asyncio.create_subprocess_shell
++    spawned = asyncio.Event()
++    release = asyncio.Event()
++    processes = []
++
++    async def held_spawn(*args, **kwargs):
++        proc = await create_shell(*args, **kwargs)
++        processes.append(proc)
++        spawned.set()
++        await release.wait()
++        return proc
++
++    cleanup_started = asyncio.Event()
++    cleanups = []
++    stop_pending = run_inbound_hooks._stop_pending_exec_tree
++
++    async def observed_cleanup(spawn):
++        cleanups.append(asyncio.current_task())
++        cleanup_started.set()
++        await stop_pending(spawn)
++
++    monkeypatch.setattr(run_inbound_hooks, '_stop_pending_exec_tree', observed_cleanup)
++    monkeypatch.setattr(asyncio, 'create_subprocess_shell', held_spawn)
++    task = asyncio.create_task(
++        GatewayInboundHooksMixin()._hm_run_exec_quick_command('probe', _TREE, cwd=str(tmp_path)))
++    try:
++        await asyncio.wait_for(spawned.wait(), timeout=30)
++        child = await async_wait_until(lambda: _pid(tmp_path / 'child.pid'), timeout=30)
++        assert _alive(child)
++        task.cancel()
++        if cancel_twice:
++            await asyncio.wait_for(cleanup_started.wait(), timeout=30)
++            task.cancel()
++        release.set()
++        with pytest.raises(asyncio.CancelledError):
++            await asyncio.wait_for(task, timeout=30)
++        await async_wait_until(lambda: not _alive(processes[0].pid) and not _alive(child),
++                               timeout=10, what='the cancelled spawn tree to stop')
++    finally:
++        release.set()
++        task.cancel()
++        with contextlib.suppress(asyncio.CancelledError):
++            await task
++        await asyncio.gather(*cleanups, return_exceptions=True)
++        for proc in processes:
++            await run_inbound_hooks._stop_exec_tree(proc)
++
++
++@pytest.mark.asyncio
++async def test_cancelled_exec_spawn_failure_preserves_cancellation(monkeypatch):
++    started = asyncio.Event()
++    release = asyncio.Event()
++
++    async def failed_spawn(*args, **kwargs):
++        started.set()
++        await release.wait()
++        raise OSError('spawn failed')
++
++    monkeypatch.setattr(asyncio, 'create_subprocess_shell', failed_spawn)
++    task = asyncio.create_task(GatewayInboundHooksMixin()._hm_run_exec_quick_command('probe', 'unused'))
++    try:
++        await asyncio.wait_for(started.wait(), timeout=30)
++        task.cancel()
++        release.set()
++        with pytest.raises(asyncio.CancelledError):
++            await asyncio.wait_for(task, timeout=30)
++    finally:
++        release.set()
++        task.cancel()
++        with contextlib.suppress(asyncio.CancelledError):
++            await task
+-- 
+2.51.0
+

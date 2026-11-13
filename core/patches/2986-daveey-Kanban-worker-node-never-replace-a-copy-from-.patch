@@ -1,0 +1,355 @@
+From 28aa9dfe31fd67572c7b68db78ecb036172a60d7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 13:47:24 +0000
+Subject: [PATCH] [daveey] Kanban worker node: never replace a copy from a
+ replica behind this gateway's push
+
+A sync round pulls the replica first and pushes the live outbox second, so rows this gateway just pushed reach
+the replica only with the next round's pull. A dispatcher tick in that window (the gateway runs the sync loop
+and the dispatcher concurrently) evicted a ready worker copy (empty outbox, no respawn_guarded recorded yet)
+and re-imported it from the replica without those rows. After an out-of-band lease release (`kanban reclaim`,
+dashboard reclaim, reassign --reclaim-first) the replica already showed the card ready, so a crashed PR
+owner's copy came back without its `Opened <PR>` comment and `reclaimed` event, active_pr did not hold and
+the owner was respawned with no handoff (t_01a1cfedbfe95b4f).
+
+kanban_replica_lag records, in the gateway process, which cards the Board acknowledged after the replica's
+last completed pull (push -> acked; _pulled_replica -> pull generation). evict keeps a lagging copy the
+local guard holds, and pickup does not re-import a lagging card until the replica holds the push. Entries
+expire after 120 s, so a replica whose pulls keep failing never pins a copy; a process that never pushed
+(CLI dispatch) behaves as before. Held-copy pickup-budget behaviour is unchanged.
+---
+ hermes_cli/kanban_replica_lag.py              | 116 +++++++++++++++++
+ hermes_cli/kanban_sync_client.py              |   4 +
+ hermes_cli/kanban_worker_node.py              |   7 +-
+ .../test_kanban_hub_admission_pickup.py       |   1 +
+ .../test_kanban_pickup_replica_lag.py         | 121 ++++++++++++++++++
+ 5 files changed, 248 insertions(+), 1 deletion(-)
+ create mode 100644 hermes_cli/kanban_replica_lag.py
+ create mode 100644 tests/hermes_cli/test_kanban_pickup_replica_lag.py
+
+diff --git a/hermes_cli/kanban_replica_lag.py b/hermes_cli/kanban_replica_lag.py
+new file mode 100644
+index 0000000000..8a2b1c4705
+--- /dev/null
++++ b/hermes_cli/kanban_replica_lag.py
+@@ -0,0 +1,116 @@
++"""[daveey] Cards this gateway pushed after its replica's last completed pull (t_01a1cfedbfe95b4f).
++
++A sync round pulls the replica (the whole board) first and pushes the live outbox second, so a row this gateway
++just pushed reaches the replica only with the next round's pull. A worker copy evicted in between and copied back
++from the replica lost it: a crashed PR owner's ``Opened <PR>`` comment and its ``reclaimed`` event were pushed in
++one round, the next tick evicted the copy (empty outbox, no ``respawn_guarded`` recorded yet) and re-imported it
++without them, ``active_pr`` did not hold and the owner was respawned with no handoff.
++
++The sync loop (``_pulled_replica``, ``push``) and the dispatcher (``kanban_worker_node.pickup``) run in one
++gateway process, so the record is in memory, keyed by the replica's path. A process that never pushed (a CLI
++dispatch) sees nothing and behaves as before; an entry older than ``MAX_LAG_S`` is dropped, so a replica that
++never catches up (pull failing) cannot pin a copy forever.
++"""
++from __future__ import annotations
++
++import logging
++import sqlite3
++import threading
++import time
++from typing import Iterable, Optional
++
++_log = logging.getLogger(__name__)
++MAX_LAG_S = 120.0
++
++_LOCK = threading.Lock()
++_STARTED: dict[str, int] = {}  # replica path -> generation of the newest pull started
++_DONE: dict[str, int] = {}  # replica path -> newest generation whose pull completed
++_ACKED: dict[str, dict[str, tuple[int, float]]] = {}  # replica path -> task id -> (generation at ack, when)
++
++
++def _monotonic() -> float:
++    return time.monotonic()
++
++
++def reset() -> None:
++    """Tests: forget every record."""
++    with _LOCK:
++        _STARTED.clear()
++        _DONE.clear()
++        _ACKED.clear()
++
++
++def pull_started(path) -> int:
++    """A replica pull begins; returns its generation for :func:`pull_done`."""
++    key = str(path)
++    with _LOCK:
++        _STARTED[key] = _STARTED.get(key, 0) + 1
++        return _STARTED[key]
++
++
++def pull_done(path, generation: int) -> None:
++    """The pull of ``generation`` completed: it holds every row the Board acknowledged before it started."""
++    key = str(path)
++    with _LOCK:
++        _DONE[key] = max(_DONE.get(key, 0), generation)
++
++
++def acked(path, task_ids: Iterable[Optional[str]]) -> None:
++    """The Board acknowledged rows of ``task_ids``; only a pull started after now can hold them."""
++    key = str(path)
++    now = _monotonic()
++    with _LOCK:
++        generation = _STARTED.get(key, 0)
++        cards = _ACKED.setdefault(key, {})
++        for tid in task_ids:
++            if tid:
++                cards[str(tid)] = (generation, now)
++
++
++def lagging(path, task_ids: Iterable[str]) -> set[str]:
++    """Of ``task_ids``, those with a push the replica at ``path`` does not hold yet."""
++    key = str(path)
++    now = _monotonic()
++    with _LOCK:
++        cards = _ACKED.get(key)
++        if not cards:
++            return set()
++        done = _DONE.get(key, 0)
++        for tid in [t for t, (gen, at) in cards.items() if gen < done or now - at > MAX_LAG_S]:
++            del cards[tid]
++        return {t for t in task_ids if t in cards}
++
++
++def acked_task_ids(rows: Iterable[dict]) -> list[str]:
++    """The card each acknowledged outbox row belongs to (``tasks`` rows are the card; children carry task_id)."""
++    import json
++    out: list[Optional[str]] = []
++    for row in rows:
++        if row.get("table_name") == "tasks":
++            out.append(row.get("row_uid"))
++            continue
++        try:
++            fields = json.loads(row.get("fields") or "{}")
++        except (TypeError, ValueError):
++            continue
++        if isinstance(fields, dict):
++            out.append(fields.get("task_id") or fields.get("child_id"))
++    return [t for t in out if t]
++
++
++def held_copies(conn: sqlite3.Connection, path, ids: list[str]) -> set[str]:
++    """Copies in ``ids`` the local guard holds while the replica lacks this gateway's push for them: evicting
++    one now would re-import it without the rows the hold rests on. Kept until the replica catches up, when the
++    recorded-hold rule (``kanban_worker_node._guard_held``) decides as before."""
++    from hermes_cli import kanban_db_dispatch as dispatch
++    held: set[str] = set()
++    for tid in lagging(path, ids):
++        try:
++            row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
++            if row is None or row["status"] not in ("ready", "review"):
++                continue
++            if dispatch.check_respawn_guard(conn, tid, lane=row["status"]) is not None:
++                held.add(tid)
++        except Exception:  # health: allow BLE001 -- a failed check evicts as before; the lease still decides
++            _log.warning("kanban replica lag: guard check for copy %s failed", tid, exc_info=True)
++    return held
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 615c5d5572..74486ae28e 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -41,6 +41,7 @@ from pathlib import Path
+ from typing import Any, Callable, Iterable, Mapping, Optional
+ 
+ from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_replica_lag as lag  # pushed rows the replica holds only after its next pull
+ from hermes_cli import kanban_sync_timing as sync_timing  # off unless kanban.sync.diagnostics.timing_until arms it
+ from hermes_cli.kanban_sync_connections import connection, connection_scope, invalidate
+ from hermes_cli.kanban_sync_hub_routes import HubRoutesMixin
+@@ -690,6 +691,7 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+                     from hermes_cli.kanban_sync_omissions import acknowledge
+                     sent = next(op.get('fields', {}) for op in wire if op['client_op_id'] == op_id)
+                     acknowledge(conn, op_id, res.get("row"), sent=sent)
++                    lag.acked(shadow_path(board), lag.acked_task_ids([row]))  # the replica has it after its next pull
+                     conn.execute("DELETE FROM kanban_sync_outbox WHERE op_id = ?", (op_id,))
+                     if row["table_name"] == "tasks" and row["op"] != "release" and res.get("version"):
+                         conn.execute("UPDATE tasks SET sync_version = MAX(COALESCE(sync_version, 0), ?) WHERE id = ?",
+@@ -924,6 +926,7 @@ def _pulled_replica(slug: str, hub: Hub, gateway: str):
+     with ExitStack() as stack:
+         replica = stack.enter_context(connection(path, lambda: open_shadow(slug, gateway)))
+         rebuilt = False
++        generation = lag.pull_started(path)  # done only below: a failed pull leaves this gateway's pushes lagging
+         try:
+             pulled = pull(replica, hub, slug, observers=False)
+         except Resync:
+@@ -934,6 +937,7 @@ def _pulled_replica(slug: str, hub: Hub, gateway: str):
+             replica = stack.enter_context(connection(path, lambda: open_shadow(slug, gateway)))
+             rebuilt = True
+             pulled = resync(replica, hub, slug, observers=False)
++        lag.pull_done(path, generation)
+         try:  # readers derive the replica's staleness from this (kanban_chat_links); a failed stamp only ages it
+             sync.mark_pulled(replica)
+         except sqlite3.Error as exc:
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index bd58a782b9..46380d43f8 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -327,6 +327,8 @@ def evict(conn: sqlite3.Connection) -> list[str]:
+     if not rows:
+         return gone
+     held = _guard_held(conn, [tid for (tid,) in rows])
++    from hermes_cli import kanban_replica_lag as lag  # never hand a held copy to a replica behind our push
++    held |= lag.held_copies(conn, _replica_path(conn), [tid for (tid,) in rows if tid not in held])
+     present = {t for t in (*_CHILD_TABLES, "task_chat_links")
+                if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (t,)).fetchone()}
+     from hermes_cli.kanban_db_connect import write_txn
+@@ -652,8 +654,11 @@ def pickup(conn: sqlite3.Connection, *, budget: Any,
+     try:
+         picked, skips = _evaluate(conn, replica, own, mode=mode, limit=limit, profile_exists=profile_exists,
+                                   full_detail="pickup batch full this tick", held=held)
++        from hermes_cli import kanban_replica_lag as lag  # copied back next tick, once the replica holds our push
++        behind = lag.lagging(_replica_path(conn), picked)
++        skips.update({tid: ("other", "replica behind this gateway's push") for tid in behind})
+         # [daveey] The hub judges a hub-bound foreign card before copying it (t_01a1cf65a941bf43).
+-        picked, plans, judged = admission.screen(conn, replica, own, picked)
++        picked, plans, judged = admission.screen(conn, replica, own, [tid for tid in picked if tid not in behind])
+         skips.update(judged)
+         imported = import_cards(conn, replica, picked)
+     finally:
+diff --git a/tests/hermes_cli/test_kanban_hub_admission_pickup.py b/tests/hermes_cli/test_kanban_hub_admission_pickup.py
+index bb0ff39dd5..b9544222ed 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission_pickup.py
++++ b/tests/hermes_cli/test_kanban_hub_admission_pickup.py
+@@ -262,6 +262,7 @@ def test_dispatch_refuses_a_hub_bound_foreign_copy_without_an_admit_verdict(gws,
+     # With pickup back, the copy is evicted, re-copied through the gate, judged, then claimed.
+     monkeypatch.setattr(wn, "pickup", real)
+     hub.round()  # push what the refused tick wrote, so the copy can be evicted
++    hub.round()  # ... and let the replica take that push: a lagging replica never re-copies it (replica_lag)
+     hub.tick()
+     assert _claimed_on_hub(svc, tid) and _events(hub.conn, tid, "hub_admission")[-1]["admit"] is True, (
+         kb.get_task(hub.conn, tid), hub.conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ?",
+diff --git a/tests/hermes_cli/test_kanban_pickup_replica_lag.py b/tests/hermes_cli/test_kanban_pickup_replica_lag.py
+new file mode 100644
+index 0000000000..73faf8a69e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pickup_replica_lag.py
+@@ -0,0 +1,121 @@
++"""A worker copy is never replaced by a replica older than what this gateway already pushed for it.
++
++The sync round pulls the replica first and pushes the live outbox second, so rows this gateway just pushed (a
++crashed PR owner's ``Opened <PR>`` comment, the ``reclaimed`` event) reach the replica only on the next round's
++pull. A tick in between evicted the copy (outbox empty, no ``respawn_guarded`` recorded yet) and re-imported
++it from the replica without those rows: ``active_pr`` did not hold and the PR owner was respawned with no
++handoff (t_01a1cfedbfe95b4f)."""
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_dispatch_pr_state as prs
++from hermes_cli import kanban_replica_lag as lag
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import kanban_guard_helpers as guard_helpers
++from tests.hermes_cli import test_kanban_worker_node as support
++
++svc = support.svc
++gws = support.gws
++PIN = [f"machine:{support.WORKER}"]
++PR = "https://github.com/daveey/hermes/pull/4242"
++
++
++@pytest.fixture
++def clock(monkeypatch):
++    now = [float(int(time.time()))]
++    monkeypatch.setattr(time, "time", lambda: now[0])
++    monkeypatch.setattr(prs, "pr_state", lambda url: "OPEN")
++    lag.reset()
++    yield now
++    lag.reset()
++
++
++@pytest.fixture
++def imports(monkeypatch):
++    seen: list[str] = []
++    real = wn.import_cards
++
++    def counting(conn, replica, ids):
++        done = real(conn, replica, ids)
++        seen.extend(done)
++        return done
++    monkeypatch.setattr(wn, "import_cards", counting)
++    return seen
++
++
++def _crash_after_pr(worker, tid, clock):
++    worker.round()
++    worker.tick()
++    assert kb.get_task(worker.conn, tid).status == "running"
++    guard_helpers.worker_comment(worker.conn, tid, "default", f"Opened {PR}")
++    clock[0] += 60
++    assert kb.reclaim_task(worker.conn, tid, reason="worker crashed", signal_fn=lambda *_: None)
++    assert kb.get_task(worker.conn, tid).status == "ready"
++    assert kbd.check_respawn_guard(worker.conn, tid, lane="ready") == "active_pr"
++
++
++def _comments(conn, tid):
++    return conn.execute("SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (tid,)).fetchone()[0]
++
++
++def test_a_crashed_pr_owner_stays_guarded_when_the_replica_lags_its_push(gws, clock, imports):
++    hub, worker = gws
++    tid = support._hub_card(hub, runs_on=PIN)
++    _crash_after_pr(worker, tid, clock)
++    worker.round()  # ONE round: the replica was pulled before this round pushed the comment and `reclaimed`
++    clock[0] += 60
++    worker.tick()
++    task = kb.get_task(worker.conn, tid)
++    assert task.status == "ready"  # not respawned
++    assert _comments(worker.conn, tid) == 1  # the copy kept its PR comment
++    assert imports.count(tid) == 1  # never replaced from the lagging replica
++    assert kbd.check_respawn_guard(worker.conn, tid, lane="ready") == "active_pr"
++    kinds = [r[0] for r in worker.conn.execute(
++        "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (tid,))]
++    assert "respawn_guarded" in kinds and "reclaimed" in kinds
++    # Once the replica has caught up the recorded hold keeps the copy (unchanged held-copy rule).
++    worker.round()
++    clock[0] += 60
++    worker.tick()
++    assert kb.get_task(worker.conn, tid).status == "ready" and imports.count(tid) == 1
++
++
++def test_a_lagging_card_is_not_reimported_until_the_replica_catches_up(gws, clock, imports):
++    """An evicted copy (guard not holding) is not copied back from a replica that lacks this gateway's push."""
++    hub, worker = gws
++    tid = support._hub_card(hub, runs_on=PIN)
++    worker.round()
++    worker.tick()
++    assert kb.get_task(worker.conn, tid).status == "running"
++    clock[0] += 60
++    assert kb.reclaim_task(worker.conn, tid, reason="worker crashed", signal_fn=lambda *_: None)
++    worker.round()  # pushes `reclaimed`; the replica pulled before it
++    worker.enter()
++    assert lag.lagging(wn._replica_path(worker.conn), [tid]) == {tid}
++    assert wn.evict(worker.conn) == [tid]  # no hold: evicted as before
++    assert wn.pickup(worker.conn, budget=4) == []  # ... but not re-imported from the lagging replica
++    assert imports.count(tid) == 1
++    worker.round()  # the replica now holds the push
++    worker.enter()
++    assert lag.lagging(wn._replica_path(worker.conn), [tid]) == set()
++    assert wn.pickup(worker.conn, budget=4) == [tid]
++    kinds = [r[0] for r in worker.conn.execute("SELECT kind FROM task_events WHERE task_id = ?", (tid,))]
++    assert "reclaimed" in kinds  # the re-imported copy carries what this gateway pushed
++
++
++def test_a_lag_entry_expires(monkeypatch):
++    lag.reset()
++    mono = [1000.0]
++    monkeypatch.setattr(lag, "_monotonic", lambda: mono[0])
++    lag.acked("/r.db", ["t_1"])
++    assert lag.lagging("/r.db", ["t_1", "t_2"]) == {"t_1"}
++    mono[0] += lag.MAX_LAG_S + 1
++    assert lag.lagging("/r.db", ["t_1"]) == set()  # a replica that never catches up does not pin a copy forever
++    lag.acked("/r.db", ["t_1"])
++    token = lag.pull_started("/r.db")
++    lag.pull_done("/r.db", token)
++    assert lag.lagging("/r.db", ["t_1"]) == set()
++    lag.reset()
+-- 
+2.51.0
+

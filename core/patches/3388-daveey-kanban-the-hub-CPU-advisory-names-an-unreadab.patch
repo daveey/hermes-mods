@@ -1,0 +1,247 @@
+From 6b887e9b6eca0ee18542b0dcbdf4a71763f0262d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:05:16 +0000
+Subject: [PATCH] [daveey] kanban: the hub CPU advisory names an unreadable
+ pool limit; one measured census step count
+
+Follow-up to PR #1863 (review t_01a1d3154dc65cfb's non-blocking nits; card t_01a1d32c4a18538a).
+
+1. Switch interval: nothing to narrow. The reviewed head ca7e41506a ran the whole admission.lock hold at a 0.25 ms
+   switch interval, including the ~1 s cpu.sample() wait. The landed 142553d6f0 was rebased onto cc9d41d953
+   (one-statement census) and 6bd4b97b00 (the gate re-reads the sampler's sample, no sample under the lock) and
+   carries no setswitchinterval at all; main's hold now has no sample wait to cover. Hub evidence (task_events,
+   last 8 h): no hub_admission_overrun or final-gate refusal since the fix landed, hub_cpu_unknown last at 04:28Z,
+   claims with hub_cpu evidence through 06:50Z. The CPU limit, cap and CLAIM_MAX_HOLD_S are unchanged.
+2. The lock-free advisory returned hub_cpu_unknown both for its sample and when advisory_limit() raised (priority-pool
+   settings or the card's admission class unreadable). The pool-limit failure now defers as
+   hub_cpu_pool_limit_unknown (in kanban_queue_reason.CODES), so hub_cpu_unknown means the sample only (missing,
+   stale, future-dated or malformed: a non-number field, busy % outside 0-100, window outside 1-2 s). The docstring,
+   the reason-block comment and docs/worker-first-v1.md name every cause.
+3. One measured census step count: on a copy of a real board (55-column tasks, 22-column task_runs, 8 running rows;
+   the hub's kanban.db has the same 55/22 columns) the pre-cc9d41d953 census made 95 sqlite steps and main's
+   one-statement census makes 4. machine_metrics (module comment and table_columns), the convoy and contention test
+   docstrings now say 95 / 55 / 22 instead of ~80, ~70, ~840 and ~130.
+
+Tests: test_kanban_hub_admission_guards::test_invalid_pool_policy_defers_at_advisory_before_lease now expects
+hub_cpu_pool_limit_unknown; test_kanban_hub_gate_convoy adds the advisory pool-limit unit test and puts the new code
+through the queue-line/CODES check; test_kanban_hub_admission's advisory pre-check adds malformed pct (150, "text")
+cases that stay hub_cpu_unknown. RED on origin/main code (tests only): convoy fails at collection
+(no HUB_CPU_POOL_LIMIT_UNKNOWN), guards 2 failed ('hub_cpu_unknown' == 'hub_cpu_pool_limit_unknown').
+GREEN: 5 hub gate files 197 passed; 19 queue-reason/admission consumer files 465 passed; scripts/check ok.
+---
+ docs/worker-first-v1.md                       |  2 +-
+ hermes_cli/kanban_admission.py                | 18 ++++++++++------
+ hermes_cli/kanban_queue_reason.py             |  2 +-
+ hermes_cli/machine_metrics.py                 | 12 ++++++-----
+ .../test_hub_cpu_gate_contention.py           | 13 ++++++------
+ tests/hermes_cli/test_kanban_hub_admission.py |  3 ++-
+ .../test_kanban_hub_admission_guards.py       |  4 ++--
+ .../hermes_cli/test_kanban_hub_gate_convoy.py | 21 ++++++++++++++++---
+ 8 files changed, 50 insertions(+), 25 deletions(-)
+
+diff --git a/docs/worker-first-v1.md b/docs/worker-first-v1.md
+index ce3d31404d..9d077ecfd2 100644
+--- a/docs/worker-first-v1.md
++++ b/docs/worker-first-v1.md
+@@ -7,7 +7,7 @@
+ Workers always win. The Board reserves the origin hub for a portable card only when **every** compatible member of the origin's *configured* pool (never the request subset) is known, fresh and refused solely for pressure (score >= .85) or full slots, AND the hub's reported measured CPU busy is fresh (conservative end within 15 s) and strictly below the operator's threshold, AND hub capacity/memory/drain allow it, AND no other hub overflow reservation is outstanding, AND the sample's conservative start is after the last hub overflow grant. Unknown, stale, held, draining or offline workers veto overflow and the card queues. Zero compatible workers queues with `no_eligible_worker` (overflow path only; with overflow off the same card queues with the per-candidate rollup `capability_mismatch` or `mixed`, and core treats that as the same state when every configured pool member carries a structural `supports()` reason): the automatic structural origin repin was removed (only the explicit owner repin clears the fence). The origin then posts one owner notice per card revision (`hermes_cli/kanban_repin_notice.py`): a comment naming the missing labels and the exact `hermes kanban move <id> --runs-on machine:<origin> --reason "no pool worker can run it"` command, plus a `worker_repin_notice` event its origin chat receives; the dispatcher stuck summary lists such cards as "waiting for a manual repin" instead of a stall. Nothing repins automatically. Prior runs, host-bound cards and running leases are never moved.
+ 
+ * Board: operator-owned `worker_overflow` setting, e.g. `{"hub": {"machine": "hub", "cpu_busy_below_pct": 50}}`; `{}`/absent disables it. The lease grant re-runs the decision with the current registry and records the consumed sample; a worker freeing up, a CPU rise, a used sample or a disabled setting refuses the grant.
+-* Core: `kanban.admission.cpu_busy_below_pct` in the **installation-root** config enables (a) a 10 s metrics report carrying `cpu_busy_pct`/`cpu_busy_window_ms`/`cpu_busy_sample_end_ms` (2 s hard total, never replayed), (b) a lock-free advisory pre-check before any Board lease (sampler sample at most 10 s old), and (c) the final gate: with `admission.lock` held and before the claim commits, the same advisory sampler sample (at most 15 s old, re-read from `cache/hub-cpu-sample.json`, never a new sample under the lock) must be strictly below the limit and the host running count below the root `kanban.max_in_progress`, inside the 2.25 s hold. Any unknown refuses, each with its own reason in the skip event and queue line: an unreadable config or bad value is `hub_cpu_limit_unknown`, a deadline already passed is `hub_cpu_gate_expired` (or `hub_cpu_gate_expired_counting` when it passed during the census), a missing/stale/malformed sample is `hub_cpu_sample_stale`, and a hold overrun is `hub_admission_overrun`. The lock-free advisory alone reports `hub_cpu_unknown`. The 5 s gap between the two ages keeps a sample the advisory accepted fresh through the lease round-trip, so the hub does not take a lease it then cannot use. (Until 2026-11-13 the gate took an independent ~1 s sample under the lock and counted the host twice around it; in the GIL-busy hub gateway that overran the hold after every lease and was reported as `hub_cpu_unknown` while the advisory was fresh.) The gate applies to every new ready/review claim on that host (legacy, host-bound and policy cards); the worker load formula is not used for the origin's own cards.
++* Core: `kanban.admission.cpu_busy_below_pct` in the **installation-root** config enables (a) a 10 s metrics report carrying `cpu_busy_pct`/`cpu_busy_window_ms`/`cpu_busy_sample_end_ms` (2 s hard total, never replayed), (b) a lock-free advisory pre-check before any Board lease (sampler sample at most 10 s old), and (c) the final gate: with `admission.lock` held and before the claim commits, the same advisory sampler sample (at most 15 s old, re-read from `cache/hub-cpu-sample.json`, never a new sample under the lock) must be strictly below the limit and the host running count below the root `kanban.max_in_progress`, inside the 2.25 s hold. Any unknown refuses, each with its own reason in the skip event and queue line: an unreadable config or bad value is `hub_cpu_limit_unknown`, a deadline already passed is `hub_cpu_gate_expired` (or `hub_cpu_gate_expired_counting` when it passed during the census), a missing/stale/malformed sample is `hub_cpu_sample_stale`, and a hold overrun is `hub_admission_overrun`. The lock-free advisory alone reports `hub_cpu_unknown` (its sample missing, stale, future-dated or malformed), and `hub_cpu_pool_limit_unknown` when it cannot read the priority-pool limit it compares against. The 5 s gap between the two ages keeps a sample the advisory accepted fresh through the lease round-trip, so the hub does not take a lease it then cannot use. (Until 2026-11-13 the gate took an independent ~1 s sample under the lock and counted the host twice around it; in the GIL-busy hub gateway that overran the hold after every lease and was reported as `hub_cpu_unknown` while the advisory was fresh.) The gate applies to every new ready/review claim on that host (legacy, host-bound and policy cards); the worker load formula is not used for the origin's own cards.
+ * Rollout order: deploy Boards and clients first; set root `cpu_busy_below_pct`; verify reports; only then enable Board `worker_overflow`. Rollback: set Board `worker_overflow` to `{}` and read it back (outstanding hub reservations become unclaimable). Rollback keeps the root CPU guard and `kanban.max_in_progress` (7): removing the root key or raising the cap is a separate, explicit operator decision, never part of rollback. After rollback the Board still admits the origin hub's review continuation of a card it already ran on the hub (review ruling 11), on the hub's non-CPU admission only (active, unheld, pickup, capability, fresh metrics, no drain, memory < 85 %, a free slot under a known cap); the root CPU guard is then that claim's only CPU check, which is why rollback keeps it. Rollback never creates an overflow, a hub reservation or a new hub assignment, and there is no operator move of a review card to ready: a review card the hub can never admit moves only once its refusal reason is cleared or overflow is re-enabled.
+ * The advisory is fed only by the sync loop's advisory sampler thread (`hermes_cli/machine_cpu_sampler.py`, `cache/hub-cpu-sample.json`): a full ~1 s sample every 5 s on its own thread, written independently of the Board POST, so neither a Board outage nor a slow sync round (3-20 s on the hub) starves it. Each metrics report attaches the newest sample not yet reported (at most 10 s old). The loop starts the thread and stops it when the loop ends, so when the sync loop is not running (sync role given up, no identity) every hub claim on that host defers as `hub_cpu_unknown`: fail-closed by design. When the advisory stays stale for 60 s of dispatcher observation while the root limit is on, the dispatcher opens one Kanban card per incident (`hermes_cli/kanban_hub_cpu_alert.py`, key `hub-cpu-advisory-stale`). An earlier design measured inside the loop and validated the 1-2 s window across loop iterations; on the hub every sample was dropped (2026-11-12).
+ * Turns are not refused by a claim's sample: on **every** host (whether or not the root limit is set), chat, notification and review turns wait out a busy `admission.lock` for longer than its longest designed hold (`admission_fence.CLAIM_MAX_HOLD_S`), a waiting turn makes the next claims defer to their next tick (also on hosts without the CPU gate, e.g. worker-1: `BUSY_WAIT_S` rose from 0.5 s to 3.0 s for all turn sources), and `prompt.admit` waits outside the session resume lock and then retries its admission once (nothing durable precedes admission, so no duplicate turn).
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index c3cbe7b3bb..80d0b0c4d9 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -46,8 +46,11 @@ def _defer(task_id, reason):
+ def hub_cpu_advisory(task_id=None, *, conn=None):
+     """Lock-free pre-check before a Board lease (review ruling 5). Returns a refusal reason or None.
+ 
+-    Off unless the root limit is set. Uses the advisory sampler's latest complete sample: missing, stale (>10 s),
+-    future or malformed reads as unknown and defers; a fresh value at or above the limit defers. Advisory only.
++    Off unless the root limit is set. Uses the advisory sampler's latest complete sample: missing, stale (>10 s here),
++    future or malformed (a non-number field, a busy % outside 0-100, a window outside 1-2 s) defers as
++    ``hub_cpu_unknown``; a fresh value at or above the limit defers. An unreadable root limit defers as
++    ``hub_cpu_limit_unknown``, an unreadable pool limit (priority-pool settings or the card's class) as
++    ``hub_cpu_pool_limit_unknown``. Advisory only.
+     Freshness here is ``PRELEASE_MAX_AGE_MS`` (``ADVISORY_MAX_AGE_MS - PRELEASE_HEADROOM_MS``, 10 s): the locked
+     gate re-reads the same file with the looser ``ADVISORY_MAX_AGE_MS``, so a sample accepted before the lease is not
+     stale by the time the gate reads it."""
+@@ -73,8 +76,9 @@ def hub_cpu_advisory(task_id=None, *, conn=None):
+             try:
+                 limit = advisory_limit(conn, task_id, limit)
+             except (OSError, ValueError, TypeError):
+-                _defer(task_id, reason)
+-                return reason
++                # the priority-pool settings or the card's admission class is unreadable: not a sample problem
++                _defer(task_id, HUB_CPU_POOL_LIMIT_UNKNOWN)
++                return HUB_CPU_POOL_LIMIT_UNKNOWN
+         last = sampler_sample(PRELEASE_MAX_AGE_MS)
+         if last is not None:
+             if cpu.below(last["cpu_busy_pct"], limit):
+@@ -156,9 +160,11 @@ def _cap_full(echo=None, *, conn=None, task_id=None):
+ COMMIT_RESERVE_S = 0.25  # lock time left for the SQL commit after the gate admits
+ 
+ # [daveey] One reason per final-gate refusal branch (hub 2026-11-13: the branches shared ``hub_cpu_unknown``, so the
+-# skip event and the queue line could not say which fired). The lock-free advisory keeps ``hub_cpu_unknown`` for its
+-# own missing/stale/malformed sample or unreadable pool limit; a hold overrun is ``OVERRUN``.
++# skip event and the queue line could not say which fired). The lock-free advisory keeps ``hub_cpu_unknown`` only for
++# its own missing/stale/future/malformed sample and reports ``HUB_CPU_POOL_LIMIT_UNKNOWN`` when the pool limit it
++# compares against cannot be read; a hold overrun is ``OVERRUN``.
+ HUB_CPU_LIMIT_UNKNOWN = "hub_cpu_limit_unknown"  # root kanban.admission.cpu_busy_below_pct unreadable/invalid
++HUB_CPU_POOL_LIMIT_UNKNOWN = "hub_cpu_pool_limit_unknown"  # advisory: priority-pool settings or card class unreadable
+ HUB_CPU_GATE_EXPIRED = "hub_cpu_gate_expired"  # the claim/lease deadline had passed before the census
+ HUB_CPU_SAMPLE_STALE = "hub_cpu_sample_stale"  # the sampler's sample is missing, stale or malformed at the lock
+ HUB_CPU_GATE_EXPIRED_COUNTING = "hub_cpu_gate_expired_counting"  # the deadline passed during the census
+diff --git a/hermes_cli/kanban_queue_reason.py b/hermes_cli/kanban_queue_reason.py
+index fea4faf082..e1666096b2 100644
+--- a/hermes_cli/kanban_queue_reason.py
++++ b/hermes_cli/kanban_queue_reason.py
+@@ -16,7 +16,7 @@ CODES = {"reserved", "draining", "admission_limits", "no_live_candidate", "capab
+          "workers_unknown", "no_eligible_worker", "workers_saturated", "hub_cpu_at_or_above_limit",
+          "hub_cpu_unknown", "hub_capacity_full", "hub_sample_already_used", "hub_overflow_reserved",
+          "hub_admission_overrun", "hub_cpu_limit_unknown", "hub_cpu_gate_expired", "hub_cpu_sample_stale",
+-         "hub_cpu_gate_expired_counting"}
++         "hub_cpu_gate_expired_counting", "hub_cpu_pool_limit_unknown"}
+ _REJECTIONS = {"invalid_policy", "not_creator", "not_claimable", "worker_pool_disabled",
+                "unauthorized_candidate", "explicit_pin", "revision_conflict", "not_found"}
+ _TOKEN = re.compile(r"^[A-Za-z0-9_.:/+-]{1,120}$")
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index 97a468070e..ca187018dc 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -73,8 +73,9 @@ def _mem_used_pct() -> Optional[float]:
+ 
+ # One statement, one result row, whatever the column or running-row count. In the gateway every sqlite3 call and row
+ # step releases the GIL and must win it back from busy Python threads (~one 5 ms switch interval each under
+-# contention); iterating ``PRAGMA table_info`` and the running rows made ~80 handoffs a board, ~4 s for the hub's
+-# 10 boards, so the final hub gate (which runs this census twice under admission.lock) overran its 2.25 s hold.
++# contention); iterating ``PRAGMA table_info`` and the running rows cost 95 sqlite steps for one board (measured: the
++# hub's 55-column ``tasks``, 22-column ``task_runs``, 8 running rows; this statement makes 4), seconds over the hub's
++# boards, so the final hub gate (which then ran this census twice under admission.lock) overran its 2.25 s hold.
+ _RECEIPTS = ("json_group_array(json_array(t.id, t.current_run_id, r.admission_pool, r.admission_class, "
+              "r.admission_origin)) FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id AND r.task_id = t.id "
+              "WHERE t.status = 'running'")
+@@ -109,9 +110,10 @@ def table_columns(db, table: str) -> set:
+ 
+     [daveey] Runs under admission.lock in the gateway. CPython's sqlite3 drops the GIL around every row step, and
+     in a process with a GIL-bound thread each re-acquire waits out the switch interval (~5 ms). ``PRAGMA
+-    table_info`` returns one row per column (~70 for ``tasks``), so per-column steps on every board cost seconds
+-    (hub 2026-11-13: ~840 handoffs per census; a probe beside one busy thread took 4.2 s instead of 20 ms, and every
+-    hub claim overran its hold). ``table`` is a fixed identifier from our own code, never user input."""
++    table_info`` returns one row per column (55 for the hub's ``tasks``, 22 for ``task_runs``), so per-column steps
++    made one board's census 95 sqlite steps (see ``_RECEIPTS``; a hub probe beside one busy thread took 4.2 s instead
++    of 20 ms, and every hub claim overran its hold). ``table`` is a fixed identifier from our own code, never user
++    input."""
+     row = db.execute("SELECT group_concat(name, char(31)) FROM pragma_table_info(?)", (table,)).fetchone()
+     return set(row[0].split("\x1f")) if row and row[0] else set()
+ 
+diff --git a/tests/hermes_cli/test_hub_cpu_gate_contention.py b/tests/hermes_cli/test_hub_cpu_gate_contention.py
+index 477c860f1e..b73fb58dc4 100644
+--- a/tests/hermes_cli/test_hub_cpu_gate_contention.py
++++ b/tests/hermes_cli/test_hub_cpu_gate_contention.py
+@@ -4,10 +4,10 @@ Inside the gateway every ``sqlite3`` call releases the GIL and has to win it bac
+ sync loop, the event loop); under that contention each handoff costs about one switch interval (5 ms). The final gate
+ ran the whole-host census twice under ``admission.lock`` (cap check before a ~1 s sample, recount after it), inside
+ a 2.25 s hold; it now runs one census and re-reads the sampler's sample. A census that iterates ``PRAGMA table_info``
+-and row-by-row cursors makes ~80 handoffs per board, so on
+-the hub (10 boards) it took ~4 s (7 s measured with one busy thread) and every hub claim was refused before sampling
+-as ``hub_cpu_unknown`` from 2026-11-13 02:03Z. The model below charges one switch interval per sqlite call/row step
+-on a virtual clock, so the test is deterministic and fast.
++and row-by-row cursors makes 95 handoffs per board (measured: the hub's 55-column ``tasks``, 8 running rows; the
++one-statement census makes 4), so on the hub (10 boards) it took seconds (7 s measured with one busy thread) and every
++hub claim was refused before sampling as ``hub_cpu_unknown`` from 2026-11-13 02:03Z. The model below charges one switch
++interval per sqlite call/row step on a virtual clock, so the test is deterministic and fast.
+ """
+ import json
+ import logging
+@@ -129,8 +129,9 @@ def _hub_boards(conn, home, *, cap=20, synced=False):
+ @pytest.mark.parametrize("synced", [True, False])
+ @pytest.mark.parametrize("review", [False, True])
+ def test_contended_census_fits_inside_the_hold(board, monkeypatch, review, synced):
+-    """RED before the census fix: ~80 handoffs per board x 10 boards ~ 4 s overran the hold on every claim. The gate
+-    now runs one census and re-reads the sampler's sample (never samples), so the claim commits inside 2.25 s."""
++    """RED before the census fix: 95 handoffs per board x 10 boards overran the hold on every claim. The gate now
++    runs one census (4 steps per board) and re-reads the sampler's sample (never samples), so the claim commits
++    inside 2.25 s."""
+     conn, home = board
+     _hub_boards(conn, home, synced=synced)
+     t = task(conn, review)
+diff --git a/tests/hermes_cli/test_kanban_hub_admission.py b/tests/hermes_cli/test_kanban_hub_admission.py
+index 63efedd519..70351db2c0 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission.py
++++ b/tests/hermes_cli/test_kanban_hub_admission.py
+@@ -845,7 +845,8 @@ def test_sample_is_taken_while_admission_lock_is_held(board, monkeypatch, review
+ 
+ @pytest.mark.parametrize("review", [False, True])
+ @pytest.mark.parametrize("advice,reason", [(80.0, "hub_cpu_at_or_above_limit"), ("stale", "hub_cpu_unknown"),
+-                                           ("missing", "hub_cpu_unknown"), ("future", "hub_cpu_unknown")])
++                                           ("missing", "hub_cpu_unknown"), ("future", "hub_cpu_unknown"),
++                                           (150.0, "hub_cpu_unknown"), ("text", "hub_cpu_unknown")])
+ def test_advisory_precheck_defers_before_any_lease_or_sample(board, monkeypatch, review, advice, reason):
+     conn, home = board
+     configure(home)
+diff --git a/tests/hermes_cli/test_kanban_hub_admission_guards.py b/tests/hermes_cli/test_kanban_hub_admission_guards.py
+index ab3387ac08..3a6a262cd3 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission_guards.py
++++ b/tests/hermes_cli/test_kanban_hub_admission_guards.py
+@@ -104,11 +104,11 @@ def test_invalid_pool_policy_defers_at_advisory_before_lease(board, monkeypatch,
+     configure(home, cap=7)
+     with (home / "config.yaml").open("a") as config:
+         config.write("    priority_slots: wrong\n")
+-    advisory(home)
++    advisory(home)  # a fresh, low sample: the refusal is the pool limit's, never reported as a sample problem
+     no_lease_or_sample(monkeypatch)
+     t = task(conn, review)
+     assert claim(conn, t, review) is None
+-    refused(conn, t, review, "hub_cpu_unknown")
++    refused(conn, t, review, "hub_cpu_pool_limit_unknown")
+ 
+ 
+ @pytest.mark.parametrize("review", [False, True])
+diff --git a/tests/hermes_cli/test_kanban_hub_gate_convoy.py b/tests/hermes_cli/test_kanban_hub_gate_convoy.py
+index ebcd000da4..b9fdba090b 100644
+--- a/tests/hermes_cli/test_kanban_hub_gate_convoy.py
++++ b/tests/hermes_cli/test_kanban_hub_gate_convoy.py
+@@ -3,8 +3,9 @@
+ Two things made that undiagnosable and slow. Every final-gate refusal branch (unreadable limit, expired lease, stale
+ sample, hold overrun) reported the same ``hub_cpu_unknown``, so the skip event could not say which fired. And under
+ admission.lock the census and the pool/origin lookups read ``PRAGMA table_info`` row by row (one sqlite step per
+-column, ~70 for ``tasks``); in the gateway each step drops the GIL and re-acquires it behind CPU-bound threads, so the
+-lookups cost seconds per claim. ``_Steps`` counts those steps deterministically, with no real contention.
++column: 55 for the hub's ``tasks``, 22 for ``task_runs``; 95 steps for one board's census, 4 now); in the gateway
++each step drops the GIL and re-acquires it behind CPU-bound threads, so the lookups cost seconds per claim.
++``_Steps`` counts those steps deterministically, with no real contention.
+ """
+ import sqlite3
+ import types
+@@ -124,8 +125,22 @@ def test_final_gate_refusals_each_have_their_own_reason():
+     assert "hub_cpu_unknown" not in reasons and ka.OVERRUN in reasons
+ 
+ 
+-@pytest.mark.parametrize("reason", ka.FINAL_GATE_REASONS)
++@pytest.mark.parametrize("reason", (*ka.FINAL_GATE_REASONS, ka.HUB_CPU_POOL_LIMIT_UNKNOWN))
+ def test_queue_line_names_the_branch(reason):
+     from hermes_cli import kanban_dispatch_skip as skip
+     assert f"({reason})" in skip.words({"reason": "claim_deferred", "detail": reason})
+     assert reason in qr.CODES  # a Board queue observation carrying it is kept, not flattened to unavailable
++
++
++def test_advisory_pool_limit_failure_is_not_reported_as_a_sample_problem(monkeypatch):
++    """The advisory's ``hub_cpu_unknown`` means its sample; an unreadable pool limit has its own reason."""
++    from hermes_cli import kanban_admission_pools as pools
++    from hermes_cli import machine_cpu_metrics as cpu
++
++    def unreadable(*a, **k):
++        raise ValueError("priority_slots: wrong")
++    monkeypatch.setattr(cpu, "root_limit", lambda: (cpu.ON, 50.0))
++    monkeypatch.setattr(pools, "advisory_limit", unreadable)
++    monkeypatch.setattr(ka, "sampler_sample", lambda *a, **k: pytest.fail("no sample read after a limit failure"))
++    assert ka.hub_cpu_advisory(conn=object()) == ka.HUB_CPU_POOL_LIMIT_UNKNOWN != "hub_cpu_unknown"
++    assert ka.HUB_CPU_POOL_LIMIT_UNKNOWN not in ka.FINAL_GATE_REASONS  # advisory-only: the final gate never returns it
+-- 
+2.51.0
+

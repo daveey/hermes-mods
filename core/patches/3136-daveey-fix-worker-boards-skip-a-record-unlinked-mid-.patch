@@ -1,0 +1,161 @@
+From f84a6613710d563e90f7755d9582b62c0e963647 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 04:36:19 +0000
+Subject: [PATCH] [daveey] fix(worker-boards): skip a record unlinked
+ mid-listing; only FileNotFoundError retires
+
+paths() runs unfenced (machine_metrics census); a fenced register()/removing()
+can unlink a record between iterdir() and read_text(). Skip that record; a
+vanished board still fails closed.
+
+_retire_collected used Path.exists(), which is False on any OSError, so a
+scratch board behind a permission error was retired silently while paths()
+would refuse it. Use stat() with FileNotFoundError as the only absence, in
+_collected too, so both paths agree.
+
+Follow-up to PR #1871 review nits.
+---
+ hermes_cli/worker_account_boards.py           | 32 ++++++++--
+ .../hermes_cli/test_worker_account_boards.py  | 58 +++++++++++++++++++
+ 2 files changed, 86 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/worker_account_boards.py b/hermes_cli/worker_account_boards.py
+index ea984c1277..e4cd47f89a 100644
+--- a/hermes_cli/worker_account_boards.py
++++ b/hermes_cli/worker_account_boards.py
+@@ -8,7 +8,8 @@ temp, the account scratch dir): that workspace was garbage-collected, so its
+ record retires instead of holding every claim on the host forever.
+ 
+ Reads (``paths()``, called by ``refusal()`` and the never-mutating
+-``occupied_count_for_host`` census) only skip a collected record. Its file is
++``occupied_count_for_host`` census) only skip a collected record, or a record a
++fenced writer unlinked after the listing. Its file is
+ unlinked by ``register()``, which runs under the account admission fence: an
+ unfenced unlink could delete the record a concurrent ``register()`` of the same
+ recreated scratch path had just found and kept, losing that board until its next
+@@ -69,11 +70,25 @@ def _collected(path: Path) -> bool:
+     A real board (installation root, any non-ephemeral path) or a missing file in
+     a surviving directory stays unknown and keeps refusing claims.
+     """
+-    if path.parent.exists():
++    if not _missing(path.parent):
+         return False
+     return any(path.is_relative_to(root) for root in _ephemeral_roots())
+ 
+ 
++def _missing(path: Path) -> bool:
++    """Only FileNotFoundError is absence, as in ``paths()``.
++
++    ``Path.exists()`` returns False on any OSError, so a board behind a
++    permission error would look collected and be retired silently instead of
++    refused loudly by ``paths()``. Other errors propagate to the caller.
++    """
++    try:
++        path.stat()
++    except FileNotFoundError:
++        return True
++    return False
++
++
+ def _retire_collected(directory: Path) -> None:
+     """Unlink records of garbage-collected boards. Caller holds the account fence.
+ 
+@@ -89,7 +104,11 @@ def _retire_collected(directory: Path) -> None:
+         if (not isinstance(raw, str) or not Path(raw).is_absolute()
+                 or record.stem != hashlib.sha256(raw.encode()).hexdigest()):
+             continue
+-        if not Path(raw).exists() and _collected(Path(raw)):
++        try:
++            gone = _missing(Path(raw)) and _collected(Path(raw))
++        except OSError:
++            continue  # unreadable is not missing: paths() refuses it loudly
++        if gone:
+             record.unlink(missing_ok=True)
+ 
+ 
+@@ -206,7 +225,12 @@ def paths() -> list[Path]:
+         for record in directory.iterdir():
+             if record.suffix != '.json':
+                 continue
+-            raw = json.loads(record.read_text(encoding='utf-8-sig'))
++            try:
++                raw = json.loads(record.read_text(encoding='utf-8-sig'))
++            except FileNotFoundError:
++                # A fenced register()/removing() unlinked it after iterdir():
++                # the record is gone, not its board. A vanished board is below.
++                continue
+             if not isinstance(raw, str) or not Path(raw).is_absolute():
+                 raise ValueError('invalid registered board path')
+             if record.stem != hashlib.sha256(raw.encode()).hexdigest():
+diff --git a/tests/hermes_cli/test_worker_account_boards.py b/tests/hermes_cli/test_worker_account_boards.py
+index f7a7d485ee..477dc72236 100644
+--- a/tests/hermes_cli/test_worker_account_boards.py
++++ b/tests/hermes_cli/test_worker_account_boards.py
+@@ -148,6 +148,64 @@ def test_missing_board_stays_unknown_unless_its_scratch_dir_is_gone(monkeypatch,
+         inventory.paths()
+ 
+ 
++def test_record_unlinked_between_listing_and_read_is_skipped(monkeypatch, tmp_path):
++    """paths() runs unfenced: a fenced register()/removing() may unlink a record
++    after iterdir() listed it. That record is gone, not a reason to fail the census."""
++    from pathlib import Path
++    monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path)
++    kept = tmp_path / 'kept' / 'kanban.db'
++    gone = tmp_path / 'gone' / 'kanban.db'
++    for board in (kept, gone):
++        board.parent.mkdir()
++        _registered(board)
++    directory = tmp_path / 'worker-resources' / 'boards'
++    import hashlib
++    victim = directory / (hashlib.sha256(str(gone.resolve()).encode()).hexdigest() + '.json')
++    assert victim.exists()
++    real_read_text = Path.read_text
++
++    def unlink_then_read(self, *args, **kwargs):
++        if self == victim:
++            self.unlink()  # the concurrent fenced writer wins the race
++        return real_read_text(self, *args, **kwargs)
++
++    monkeypatch.setattr(Path, 'read_text', unlink_then_read)
++    assert inventory.paths() == [kept.resolve()]
++    # A vanished *board* (not its record) still fails closed as before.
++    monkeypatch.setattr(Path, 'read_text', real_read_text)
++    kept.unlink()
++    with pytest.raises(FileNotFoundError):
++        inventory.paths()
++
++
++def test_unreadable_collected_looking_board_is_not_retired(monkeypatch, tmp_path):
++    """_retire_collected and paths() agree: only FileNotFoundError means missing.
++    A PermissionError on the board's stat keeps the record and refuses loudly."""
++    import shutil
++    from pathlib import Path
++    monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path)
++    board = tmp_path / 'cache' / 'scratch' / 'run' / 'kanban.db'
++    board.parent.mkdir(parents=True)
++    _registered(board)
++    record, = (tmp_path / 'worker-resources' / 'boards').glob('*.json')
++    shutil.rmtree(board.parent)
++    denied = {board.resolve(), board.resolve().parent}
++    real_stat = Path.stat
++
++    def stat(self, *args, **kwargs):
++        if self in denied:
++            raise PermissionError(13, 'Permission denied', str(self))
++        return real_stat(self, *args, **kwargs)
++
++    monkeypatch.setattr(Path, 'stat', stat)
++    other = tmp_path / 'cache' / 'scratch' / 'other' / 'kanban.db'
++    other.parent.mkdir(parents=True)
++    _registered(other)  # runs _retire_collected under the fence
++    assert record.exists(), 'a permission error is not proof the board was collected'
++    with pytest.raises(PermissionError):
++        inventory.paths()
++
++
+ def test_ephemeral_roots_never_cover_the_account(monkeypatch, tmp_path):
+     import tempfile
+     account = tmp_path / 'home' / '.hermes'
+-- 
+2.51.0
+

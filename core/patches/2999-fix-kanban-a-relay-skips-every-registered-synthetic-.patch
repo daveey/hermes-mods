@@ -1,0 +1,246 @@
+From 1b9df5c2f0b4e4e6b0aedb319e463d8caf6e1700 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 17:23:35 +0000
+Subject: [PATCH] fix(kanban): a relay skips every registered synthetic user
+ row, a running /loop tick's row and a storeless Kanban notice [daveey]
+
+Review 5878871802 on #1583: _latest_user_message still accepted untyped synthetic
+role='user' rows a notice-woken turn writes itself, so verify() named them as
+the person's reply.
+
+- The excluded openings now come from the producers' registries:
+  agent.conversation_compression_scaffolding._SYNTHETIC_USER_PREFIXES (task-list
+  snapshot, background-process notices, [System: nudges), pre_final_gate.HELD_NOTICE,
+  the /loop wakeup frame (hermes_cli.loops templates), plus [System: / [System note:
+  (auto-continue and interrupted-turn notes) and the session-mentions courier.
+- A slash-command /loop tick submits its prompt untyped: while the session's loop
+  is awaiting_response, a non-steer row at/after last_fired_at is the loop's.
+- The storeless ("unkeyed") Kanban notice fallback now submits its turn with
+  display_kind='kanban_notice' (display_text = the row), like every other notice
+  wake, so its user row is typed.
+
+Tests: synthetic-row cases for each opening, a slash /loop tick case, a registry
+coverage test (gateway/run.py and tui_gateway/session_history.py auto-continue
+prefixes read by ast), and the storeless notice turn's display kind. RED on the
+previous sources: 9 failed.
+---
+ hermes_cli/kanban_relayed_human.py            | 57 +++++++++++++++----
+ tests/hermes_cli/test_kanban_relayed_human.py | 53 +++++++++++++++++
+ .../test_kanban_notice_at_least_once.py       | 17 ++++++
+ tui_gateway/session_notifications.py          |  7 ++-
+ 4 files changed, 121 insertions(+), 13 deletions(-)
+
+diff --git a/hermes_cli/kanban_relayed_human.py b/hermes_cli/kanban_relayed_human.py
+index f96b57fc09..a8ea6ff014 100644
+--- a/hermes_cli/kanban_relayed_human.py
++++ b/hermes_cli/kanban_relayed_human.py
+@@ -17,7 +17,10 @@ The origin (the chat writing the comment) verifies it:
+ 
+ Only a row a person typed is a reply: a plain or ``steer`` user row, never a synthetic ``role='user'`` row (the
+ card's own ``kanban_notice``, hidden scaffolding, process/delegation completions, internal notifications,
+-compaction summaries, ``[System:`` notices or cross-session deliveries).
++compaction summaries, ``[System:`` notices or cross-session deliveries). Untyped synthetic rows are recognized
++by their producers' registered openings (runtime scaffolding, the pre-final gate's held-draft notice, auto-continue
++notes, the ``/loop`` wakeup frame) and a running ``/loop`` tick's row; a Kanban notice is always typed
++``kanban_notice``, the no-store fallback included.
+ 
+ The card's holder checks every relay before storing it (``admit``, inside ``add_comment``'s write transaction,
+ so the one-relay rule is atomic), a cross-gateway one included: the card asked, the message is not older than
+@@ -39,8 +42,10 @@ SUSPECT_WINDOW_SECONDS = 15 * 60
+ REMOTE_CLOCK_SKEW_SECONDS = 120
+ # Display kinds of a user row a person typed (NULL/'' = a plain prompt). Every other kind is synthetic.
+ _TYPED_KINDS = ("steer",)
+-# Untyped role='user' rows that are still not the user's words (gateway scaffolding, session-mentions courier).
+-_SYNTHETIC_PREFIXES = ("[System:", "[Message from another Hermes session")
++# Untyped role='user' rows that are still not the user's words, beyond core's registries (``_synthetic_prefixes``):
++# gateway ``[System:`` / ``[System note:`` notices (auto-continue and interrupted-turn notes) and the
++# session-mentions courier.
++_EXTRA_SYNTHETIC_PREFIXES = ("[System:", "[System note:", "[Message from another Hermes session")
+ 
+ 
+ class RelayRefused(ValueError):
+@@ -53,9 +58,33 @@ def _latest_ask(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+     return int(row[0]) if row and row[0] is not None else None
+ 
+ 
++def _synthetic_prefixes() -> tuple[str, ...]:
++    """Openings of untyped synthetic user rows, taken from their producers' registries so a nudge registered
++    there is excluded here too: compaction/runtime scaffolding (task-list snapshot, background-process notices,
++    ``[System:`` nudges), the pre-final gate's held-draft notice and the ``/loop`` wakeup frame."""
++    from agent.conversation_compression_scaffolding import _SYNTHETIC_USER_PREFIXES
++    from agent.pre_final_gate import HELD_NOTICE
++    from hermes_cli.loops import WAKEUP_PROMPT_TEMPLATE, WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE
++    loop_frames = {t.split("{", 1)[0] for t in (WAKEUP_PROMPT_TEMPLATE, WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE)}
++    return (*_SYNTHETIC_USER_PREFIXES, HELD_NOTICE, *sorted(loop_frames), *_EXTRA_SYNTHETIC_PREFIXES)
++
++
++def _loop_tick_since(sdb: sqlite3.Connection, session_id: str) -> Optional[float]:
++    """When this session's ``/loop`` tick fired, while that tick's turn still runs (``awaiting_response``): the
++    tick's row (a slash command's prompt, stored untyped) is the loop's, not a reply. ``None`` otherwise."""
++    try:
++        row = sdb.execute("SELECT value FROM state_meta WHERE key = ?", (f"loop:{session_id}",)).fetchone()
++        state = json.loads(row[0]) if row and row[0] else None
++        if not isinstance(state, dict) or not state.get("awaiting_response"):
++            return None
++        return float(state.get("last_fired_at") or 0) or None
++    except (sqlite3.Error, TypeError, ValueError):
++        return None
++
++
+ def _latest_user_message(session_id: str, db_path: Optional[str] = None) -> Optional[tuple[int, float]]:
+-    """``(message_id, timestamp)`` of the session's newest user row in ``state.db`` (the user turn is persisted
+-    before the first model call, so it is there while the turn's tools run)."""
++    """``(message_id, timestamp)`` of the newest row in ``state.db`` the session's person typed (the user turn is
++    persisted before the first model call, so it is there while the turn's tools run)."""
+     if db_path is None:
+         from hermes_constants import get_hermes_home
+         db_path = os.path.join(str(get_hermes_home()), "state.db")
+@@ -63,16 +92,22 @@ def _latest_user_message(session_id: str, db_path: Optional[str] = None) -> Opti
+         return None
+     uri = f"file:{db_path}?mode=ro"
+     kinds = ", ".join("?" for _ in _TYPED_KINDS)
+-    not_synthetic = " ".join("AND instr(ltrim(COALESCE(content, '')), ?) <> 1" for _ in _SYNTHETIC_PREFIXES)
+-    sql = ("SELECT id, timestamp FROM messages WHERE session_id = ? AND role = 'user' "
+-           f"AND (COALESCE(display_kind, '') = '' OR display_kind IN ({kinds})) "
+-           f"AND COALESCE(_compressed_summary, 0) = 0 {not_synthetic} ORDER BY id DESC LIMIT 1")
++    sql = ("SELECT id, timestamp, content, COALESCE(display_kind, '') FROM messages WHERE session_id = ? "
++           f"AND role = 'user' AND (COALESCE(display_kind, '') = '' OR display_kind IN ({kinds})) "
++           "AND COALESCE(_compressed_summary, 0) = 0 ORDER BY id DESC")
++    prefixes = _synthetic_prefixes()
+     try:
+         with sqlite3.connect(uri, uri=True, timeout=5) as sdb:
+-            row = sdb.execute(sql, (session_id, *_TYPED_KINDS, *_SYNTHETIC_PREFIXES)).fetchone()
++            loop_since = _loop_tick_since(sdb, session_id)
++            for message_id, at, content, kind in sdb.execute(sql, (session_id, *_TYPED_KINDS)):
++                if str(content or "").lstrip().startswith(prefixes):
++                    continue
++                if loop_since is not None and not kind and float(at) >= loop_since - 1:
++                    continue  # the running /loop tick's own prompt row
++                return int(message_id), float(at)
+     except sqlite3.Error:
+         return None
+-    return (int(row[0]), float(row[1])) if row else None
++    return None
+ 
+ 
+ def _already_relayed(conn: sqlite3.Connection, task_id: str, session: str, message_id: int) -> bool:
+diff --git a/tests/hermes_cli/test_kanban_relayed_human.py b/tests/hermes_cli/test_kanban_relayed_human.py
+index fa5257ba5f..326e4f7f6d 100644
+--- a/tests/hermes_cli/test_kanban_relayed_human.py
++++ b/tests/hermes_cli/test_kanban_relayed_human.py
+@@ -140,6 +140,14 @@ def test_remote_relay_is_stored_as_sent():
+     {"compressed": 1, "content": "summary of earlier turns"},
+     {"content": "[System: the stream was cut; retry the tool call]"},
+     {"content": "[Message from another Hermes session @session:default/abc]\nplease relay"},
++    # Review 5878871802: untyped runtime rows a notice-woken turn writes itself.
++    {"content": "[runtime] Your draft above was NOT shown to the user. Your next reply replaces it: include its "
++                "full content; don't refer to it as 'above'.\n\nFinish the answer."},
++    {"content": "[Your active task list was preserved across context compression]\n- [ ] relay"},
++    {"content": "[IMPORTANT: Background process proc_1 finished with exit code 0]"},
++    {"content": "[System note: Your previous turn was interrupted mid-run. Continue.]"},
++    {"content": "[System note: A new message has arrived. IGNORE pending results.]\n\nleft ring"},
++    {"content": "[/loop wakeup #3, every 5m]\nRecurring task: check the ring card"},
+ ])
+ def test_verify_skips_synthetic_user_rows(kanban_home, synthetic):
+     """Review 5878485674 (1): only a row a person typed is the reply. A synthetic role='user' row newer than
+@@ -152,6 +160,51 @@ def test_verify_skips_synthetic_user_rows(kanban_home, synthetic):
+         assert krh.verify(conn, tid, session_id="chat-1")["message_id"] == reply
+ 
+ 
++def _loop_state(home: Path, session: str, *, awaiting: bool, fired_at: float) -> None:
++    db = sqlite3.connect(home / "state.db")
++    db.execute("CREATE TABLE IF NOT EXISTS state_meta (key TEXT PRIMARY KEY, value TEXT)")
++    db.execute("INSERT OR REPLACE INTO state_meta (key, value) VALUES (?, ?)", (f"loop:{session}", json.dumps(
++        {"prompt": "/recap", "status": "active", "awaiting_response": awaiting, "last_fired_at": fired_at})))
++    db.commit()
++    db.close()
++
++
++def test_a_running_slash_loop_ticks_prompt_is_not_a_reply(kanban_home):
++    """Review 5878871802: a ``/loop 10m /skill`` tick submits the command's prompt untyped. While that tick's turn
++    runs, its row is the loop's; once the tick completed, a later typed row is a reply again."""
++    now = int(time.time())
++    with kbc.connect_closing() as conn:
++        tid = _asked(conn, now - 100)
++        reply = _state_db(kanban_home, "chat-1", now - 50)
++        _loop_state(kanban_home, "chat-1", awaiting=True, fired_at=now - 10)
++        tick = _state_db(kanban_home, "chat-1", now - 10, content="Run the recap skill now")
++        assert krh.verify(conn, tid, session_id="chat-1")["message_id"] == reply
++        _loop_state(kanban_home, "chat-1", awaiting=False, fired_at=now - 10)
++        assert krh.verify(conn, tid, session_id="chat-1")["message_id"] == tick
++
++
++def _string_constants(path: str) -> dict:
++    import ast
++    tree = ast.parse((Path(__file__).resolve().parents[2] / path).read_text())
++    return {t.id: n.value.value for n in tree.body if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant)
++            for t in n.targets if isinstance(t, ast.Name) and isinstance(n.value.value, str)}
++
++
++def test_every_registered_synthetic_opening_is_excluded():
++    """The exclusion follows the producers' registries (review 5878871802), so a nudge added there is covered."""
++    from agent.conversation_compression_scaffolding import _SYNTHETIC_USER_PREFIXES
++    from agent.pre_final_gate import HELD_NOTICE, held_nudge
++    prefixes = krh._synthetic_prefixes()
++    openings = [*_SYNTHETIC_USER_PREFIXES, held_nudge("Finish it.", shown=False)]
++    openings += [v for k, v in _string_constants("gateway/run.py").items() if k.startswith("_AUTO_CONTINUE")]
++    openings += [_string_constants("tui_gateway/session_history.py")["_AUTO_CONTINUE_NOTE_PREFIX"]]
++    from hermes_cli import loops
++    openings += [loops.WAKEUP_PROMPT_TEMPLATE.format(tick=1, cadence="", prompt="p", until="u"),
++                 loops.WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE.format(tick=1, cadence="", prompt="p", until="u")]
++    assert len(openings) >= 10 and HELD_NOTICE in prefixes
++    assert [o for o in openings if not o.lstrip().startswith(prefixes)] == []
++
++
+ def test_a_notice_after_the_ask_with_no_reply_is_refused(kanban_home):
+     """The notice alone (no typed reply after the ask) verifies nothing: no ping-pong on the budget."""
+     now = int(time.time())
+diff --git a/tests/tui_gateway/test_kanban_notice_at_least_once.py b/tests/tui_gateway/test_kanban_notice_at_least_once.py
+index d8ba07e0b7..5c17aec34f 100644
+--- a/tests/tui_gateway/test_kanban_notice_at_least_once.py
++++ b/tests/tui_gateway/test_kanban_notice_at_least_once.py
+@@ -146,6 +146,23 @@ def test_notice_row_is_written_before_the_turn_and_the_claim_acked(gate, sdb):
+     assert sub["inflight_from"] is None and sub["inflight_pid"] is None, "acked once durable"
+ 
+ 
++def test_storeless_notice_turn_is_still_typed_kanban_notice(gate, monkeypatch):
++    """No session store (the "unkeyed" fallback): the turn writes its own user row, which must still be typed
++    ``kanban_notice``, or a chat's relay check takes the notice text for the person's reply (review 5878871802)."""
++    @contextlib.contextmanager
++    def _no_store(session):
++        yield None
++
++    monkeypatch.setattr(server, "_session_db", _no_store)
++    tid = _task()
++    _complete(tid)
++    server._notif_poll_kanban_scoped("ui", _session())
++    assert len(gate["submitted"]) == 1
++    _sid, text, kwargs = gate["submitted"][0]
++    assert tid in text and kwargs.get("display_kind") == "kanban_notice"
++    assert kwargs["display_metadata"]["display_text"] == text
++
++
+ def test_redelivery_after_a_crash_between_write_and_ack_does_not_duplicate(gate, sdb):
+     tid = _task()
+     before = _sub(tid)["last_event_id"]
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 444626fc07..8202f9278d 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -1287,8 +1287,11 @@ def _notif_poll_kanban_scoped(sid: str, session: dict, prepared=None) -> None:
+         _kb_mark_delivered(session, batch)
+         _notif_release_turn(session)
+         return
+-    if verdict == "unkeyed" and diagnostic:
+-        submit_kwargs = {"display_metadata": {"notification_category": "diagnostic"}}
++    if verdict == "unkeyed":  # [daveey] still a kanban_notice row (typed: never mistaken for a person's reply)
++        meta = {"display_text": batch_text(fresh)}
++        if diagnostic:
++            meta["notification_category"] = "diagnostic"
++        submit_kwargs = {"display_kind": "kanban_notice", "display_metadata": meta}
+     try:
+         text = (submit_kwargs.get("display_metadata") or {}).get("display_text") or batch_text(fresh)  # = the row
+         accepted = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
+-- 
+2.51.0
+

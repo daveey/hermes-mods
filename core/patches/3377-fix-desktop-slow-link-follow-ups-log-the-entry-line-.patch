@@ -1,0 +1,308 @@
+From ed5dcae3c08e83b8d2a444c25aaf7ce8fd012a7d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:19:19 +0000
+Subject: [PATCH] fix(desktop): slow-link follow-ups: log the entry line before
+ any answer, foreground plugin detail opens, document the hang cost [daveey]
+
+Follow-up to PR #1928 (review 5887354507, non-blocking points 1-3).
+
+1. slow-link.ts "Known costs" now also documents the second cost: a remote process that hangs while its tunnel
+   stays alive looks like a slow link and is retired only after 3 probe timeouts with no answer in between (40 s
+   stretched probes, requests waiting up to 60 s in between): minutes instead of ~10 s.
+2. dispatchSlowLink takes the log and wires it into the tracker when the dispatch option is built, so a probe that
+   times out before any remote request has answered in this process still writes the
+   "[slow-link] ... is slow" entry line (noteRemoteAnswer was the only place that set it). main.ts passes
+   rememberLog (one line changed, no growth).
+3. A user-driven plugin GET is no longer thinned on a slow link: PluginRestOptions gains priority 'foreground'
+   (pluginRest forwards it), and the Kanban task drawer tags the first task and log read of each open
+   (userOpenReads; the drawer mounts once per open). Re-opening the same task within the 30 s thinning gap is
+   therefore sent; the interval and socket refetches of that open stay background polls and are still thinned.
+   The thinned prefixes are unchanged.
+
+Tests (fail before, pass after): slow-link.test.ts "dispatchSlowLink logs the slow-link entry line when a probe
+times out before any remote has answered" (+ main.ts wiring pin with rememberLog); plugins.test.ts priority
+passthrough cases; drawer.test.tsx "tags the reads of each open foreground, so a slow link never skips a re-open;
+refetches stay polls". The main-side thinner already never holds a foreground GET (existing thinnedPoll test).
+---
+ apps/desktop/electron/main.ts                 |  2 +-
+ apps/desktop/electron/slow-link.test.ts       | 19 +++++++++---
+ apps/desktop/electron/slow-link.ts            | 22 +++++++++++---
+ apps/desktop/src/api/plugins.test.ts          |  5 +++-
+ apps/desktop/src/api/plugins.ts               |  7 ++++-
+ apps/desktop/src/plugins/kanban/api.ts        | 29 ++++++++++++++++--
+ .../src/plugins/kanban/drawer.test.tsx        | 30 +++++++++++++++++++
+ apps/desktop/src/plugins/kanban/drawer.tsx    | 10 +++++--
+ 8 files changed, 107 insertions(+), 17 deletions(-)
+
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 92681baecd..e14396b691 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -10361,7 +10361,7 @@ async function ensureRegistryBackend(
+         },
+         reconnect: () => ensureRegistryBackend(id, profile, '', { passive }),
+         // [daveey] An SSH tunnel whose probe times out while its master is alive is slow, not down (slow-link.ts).
+-        slowLink: source.kind === 'ssh' ? dispatchSlowLink(key, () => sshConnections.get(key)?.ssh?.isAlive()) : undefined,
++        slowLink: source.kind === 'ssh' ? dispatchSlowLink(key, () => sshConnections.get(key)?.ssh?.isAlive(), rememberLog) : undefined,
+         retire: async (error: any) => {
+           // A late failure from an old descriptor must never tear down a newer
+           // entry that another caller has already installed.
+diff --git a/apps/desktop/electron/slow-link.test.ts b/apps/desktop/electron/slow-link.test.ts
+index e30153afef..333e0e805d 100644
+--- a/apps/desktop/electron/slow-link.test.ts
++++ b/apps/desktop/electron/slow-link.test.ts
+@@ -321,7 +321,7 @@ describe('main.ts wiring helpers', () => {
+     const { tracker } = harness()
+     const scope = 'conn:mac-mini::default'
+     const mini = 'http://127.0.0.1:50111'
+-    const option = dispatchSlowLink(scope, async () => true, tracker)
++    const option = dispatchSlowLink(scope, async () => true, undefined, tracker)
+ 
+     expect(option.isTimeout(new Error('Timed out connecting to Hermes backend after 10000ms'))).toBe(true)
+     expect(option.isTimeout(new Error('socket hang up'))).toBe(false)
+@@ -329,8 +329,19 @@ describe('main.ts wiring helpers', () => {
+     expect(option.noteTimeout({ baseUrl: mini })).toEqual({ giveUp: false, strikes: 1 })
+     expect(tracker.isScopeSlow(scope)).toBe(true)
+ 
+-    await expect(dispatchSlowLink(scope, async () => false, tracker).transportAlive()).resolves.toBe(false)
+-    await expect(dispatchSlowLink(scope, () => undefined, tracker).transportAlive()).resolves.toBe(false)
++    await expect(dispatchSlowLink(scope, async () => false, undefined, tracker).transportAlive()).resolves.toBe(false)
++    await expect(dispatchSlowLink(scope, () => undefined, undefined, tracker).transportAlive()).resolves.toBe(false)
++  })
++
++  it('dispatchSlowLink logs the slow-link entry line when a probe times out before any remote has answered', () => {
++    // A fresh process: no log wired yet, and nothing has answered, so noteRemoteAnswer never set one.
++    const tracker = new SlowLinkTracker()
++    const lines: string[] = []
++    const mini = 'http://127.0.0.1:50111'
++    const option = dispatchSlowLink('conn:mac-mini::default', async () => true, line => lines.push(line), tracker)
++
++    expect(option.noteTimeout({ baseUrl: mini })).toEqual({ giveUp: false, strikes: 1 })
++    expect(lines).toEqual([expect.stringMatching(/^\[slow-link\] http:\/\/127\.0\.0\.1:50111 is slow \(probe timed out/)])
+   })
+ 
+   it('thinnedPoll: holds a repeated timer poll, frees an unsent one, and never holds a foreground or non-GET request', async () => {
+@@ -416,7 +427,7 @@ describe('main.ts wiring', () => {
+     expect(slowLink).toBeGreaterThan(0)
+     expect(slowLink).toBeLessThan(dispatch.indexOf('retire: async'))
+     expect(dispatch.slice(slowLink, slowLink + 300).replace(/\s+/g, ' ')).toContain(
+-      "source.kind === 'ssh' ? dispatchSlowLink(key, () => sshConnections.get(key)?.ssh?.isAlive()) : undefined"
++      "source.kind === 'ssh' ? dispatchSlowLink(key, () => sshConnections.get(key)?.ssh?.isAlive(), rememberLog) : undefined"
+     )
+   })
+ 
+diff --git a/apps/desktop/electron/slow-link.ts b/apps/desktop/electron/slow-link.ts
+index e3ddc28f75..3599a75c8a 100644
+--- a/apps/desktop/electron/slow-link.ts
++++ b/apps/desktop/electron/slow-link.ts
+@@ -16,9 +16,14 @@
+ // A backend that never answers is still given up on: SLOW_LINK_STRIKE_LIMIT timeouts with no answer in between
+ // report giveUp, and the caller retires it as before. A dead transport is never treated as slow.
+ //
+-// Known cost: `ssh -O check` proves the master process is alive, not that the link carries traffic. When a network
+-// drops without a reset, the master lives until its keepalive gives up (~45 s), so for that window requests wait
+-// their stretched timeout instead of failing after the 10 s probe.
++// Known costs:
++// - `ssh -O check` proves the master process is alive, not that the link carries traffic. When a network drops
++//   without a reset, the master lives until its keepalive gives up (~45 s), so for that window requests wait their
++//   stretched timeout instead of failing after the 10 s probe.
++// - A remote process that hangs while its tunnel stays alive looks exactly like a slow link. It is retired only after
++//   SLOW_LINK_STRIKE_LIMIT (3) probe timeouts with no answer in between: from the second strike each probe waits its
++//   stretched 40 s, and between probes requests wait up to SLOW_LINK_TIMEOUT_CAP_MS (60 s) each. Such a hang now
++//   takes minutes to retire instead of ~10 s.
+ 
+ import { isBackgroundRead, type PowerSettleRequest, PowerSettlingError } from './power-settle'
+ import { isRemoteTimeout } from './remote-down-gate'
+@@ -285,12 +290,21 @@ export const slowLinkTracker = new SlowLinkTracker()
+ 
+ // --- main.ts wiring. It lives here because main.ts is over its line cap and may only shrink. ---
+ 
+-/** The `slowLink` option of ensureHealthyPooledRemoteBackendForDispatch for one SSH pool scope. */
++/**
++ * The `slowLink` option of ensureHealthyPooledRemoteBackendForDispatch for one SSH pool scope. `log` is wired here,
++ * before any probe can time out, so the "[slow-link] ... is slow" entry line is written even when no remote request
++ * has answered yet in this process (noteRemoteAnswer wires it too, but only once something answers).
++ */
+ export function dispatchSlowLink(
+   scope: string,
+   masterAlive: () => Promise<boolean> | undefined,
++  log?: (line: string) => void,
+   tracker: SlowLinkTracker = slowLinkTracker
+ ) {
++  if (log) {
++    tracker.setLog(log)
++  }
++
+   return {
+     isTimeout: isRemoteTimeout,
+     noteTimeout: (connection: { baseUrl?: null | string }) => {
+diff --git a/apps/desktop/src/api/plugins.test.ts b/apps/desktop/src/api/plugins.test.ts
+index bcee0aeaec..9f37e76e03 100644
+--- a/apps/desktop/src/api/plugins.test.ts
++++ b/apps/desktop/src/api/plugins.test.ts
+@@ -21,7 +21,10 @@ describe('plugin REST qualified owner', () => {
+     { opts: { connectionId: 'owner' }, expected: { connectionId: 'owner' } },
+     { opts: { connectionId: 'owner', profile: null }, expected: { connectionId: 'owner' } },
+     { opts: { profile: null }, expected: { connectionId: 'ambient-gw' } },
+-    { opts: { profile: 'worker' }, expected: { connectionId: 'ambient-gw', priority: 'foreground', profile: 'worker' } }
++    { opts: { profile: 'worker' }, expected: { connectionId: 'ambient-gw', priority: 'foreground', profile: 'worker' } },
++    // A user-driven read (opening a detail view) carries its foreground tag, so main never thins or holds it.
++    { opts: { priority: 'foreground' as const }, expected: { connectionId: 'ambient-gw', priority: 'foreground', profile: 'ambient' } },
++    { opts: { connectionId: 'owner', priority: 'foreground' as const }, expected: { connectionId: 'owner', priority: 'foreground' } }
+   ])('preserves scoped semantics for $opts', async ({ opts, expected }) => {
+     const api = vi.fn().mockResolvedValue({ ok: true })
+     Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: { api } })
+diff --git a/apps/desktop/src/api/plugins.ts b/apps/desktop/src/api/plugins.ts
+index 569950384e..0a7f4fecd8 100644
+--- a/apps/desktop/src/api/plugins.ts
++++ b/apps/desktop/src/api/plugins.ts
+@@ -50,6 +50,10 @@ export interface PluginRestOptions {
+   timeoutMs?: number
+   /** Read an already-running backend without starting one for a background probe. */
+   passive?: boolean
++  /** [daveey] A read the user asked for just now (opening a detail view), not a timer poll: Desktop never thins,
++   *  holds or skips a 'foreground' request, while an untagged plugin GET may be skipped as a background poll on
++   *  a slow link or after wake (electron/slow-link.ts, power-settle.ts). Interval refetches stay untagged. */
++  priority?: 'foreground'
+   /** [daveey] Send this call to ONE registry connection (its id) instead of
+    *  the active gateway — for plugins that read every gateway at once (the
+    *  Kanban board). The ambient profile is NOT carried: a profile name belongs
+@@ -95,7 +99,8 @@ export async function pluginRest<T>(pluginId: string, path: string, opts: Plugin
+     timeoutMs: opts.timeoutMs,
+     ...(opts.passive ? { passive: true } : {}),
+     ...(opts.connectionId ? { connectionId: opts.connectionId } : {}),
+-    ...(opts.profile !== undefined ? profileScoped(opts.profile) : opts.connectionId ? {} : profileScoped())
++    ...(opts.profile !== undefined ? profileScoped(opts.profile) : opts.connectionId ? {} : profileScoped()),
++    ...(opts.priority === 'foreground' ? { priority: 'foreground' as const } : {})
+   })
+ }
+ 
+diff --git a/apps/desktop/src/plugins/kanban/api.ts b/apps/desktop/src/plugins/kanban/api.ts
+index 86920f8016..c81d937cfc 100644
+--- a/apps/desktop/src/plugins/kanban/api.ts
++++ b/apps/desktop/src/plugins/kanban/api.ts
+@@ -862,15 +862,38 @@ export async function fetchBoard(archived: boolean): Promise<KanbanBoard> {
+   return rememberOwners(board, slug)
+ }
+ 
+-export const fetchTask = async (id: string, owner?: TaskOwner) => {
++/** [daveey] One opening of a task detail view. Its first read of each kind (`kind` names the query) is the user's
++ *  and goes out as priority 'foreground', so a slow link's poll thinner never skips it, even when the same task is
++ *  re-opened within the thinning gap. Every later read of that kind (interval or socket refetch) is a background
++ *  poll again and may be thinned (electron/slow-link.ts). */
++export function userOpenReads(): (kind: string) => PluginRestOptions {
++  const read = new Set<string>()
++
++  return kind => {
++    if (read.has(kind)) {
++      return {}
++    }
++
++    read.add(kind)
++
++    return { priority: 'foreground' }
++  }
++}
++
++export const fetchTask = async (id: string, owner?: TaskOwner, read: PluginRestOptions = {}) => {
+   const downloadAttachment = captureGatewayFileDownload(owner ? { connectionId: owner.gateway, profile: owner.profile } : undefined)
+-  const detail = await call<KanbanTaskDetail>(...forTask(id, `/tasks/${id}`, {}, owner))
++  const [path, opts] = forTask(id, `/tasks/${id}`, {}, owner)
++  const detail = await call<KanbanTaskDetail>(path, { ...opts, ...read })
+ 
+   return { ...detail, downloadAttachment }
+ }
+ 
+ /** Worker stdout/stderr tail (last 16 KiB — plenty for the drawer). */
+-export const fetchLog = (id: string, owner?: TaskOwner) => call<WorkerLog>(...forTask(id, `/tasks/${id}/log`, { tail: '16384' }, owner))
++export const fetchLog = (id: string, owner?: TaskOwner, read: PluginRestOptions = {}) => {
++  const [path, opts] = forTask(id, `/tasks/${id}/log`, { tail: '16384' }, owner)
++
++  return call<WorkerLog>(path, { ...opts, ...read })
++}
+ 
+ /** Every gateway's boards as one list: union by slug, card totals summed,
+  *  `current` = the routed gateway's. A remote-only board is listed too, so
+diff --git a/apps/desktop/src/plugins/kanban/drawer.test.tsx b/apps/desktop/src/plugins/kanban/drawer.test.tsx
+index f4510df7b8..a0f3808aa8 100644
+--- a/apps/desktop/src/plugins/kanban/drawer.test.tsx
++++ b/apps/desktop/src/plugins/kanban/drawer.test.tsx
+@@ -265,6 +265,36 @@ describe('task attachment compatibility', () => {
+ })
+ 
+ describe('task modal dialog', () => {
++  it('tags the reads of each open foreground, so a slow link never skips a re-open; refetches stay polls', async () => {
++    detail = { ...legacyDetail, attachments: [] }
++
++    const priorities = (match: (path: string) => boolean) =>
++      rest.mock.calls
++        .filter(([path, options]) => match(path) && !options?.method)
++        .map(([, options]) => options?.priority)
++
++    const taskReads = () => priorities(path => path === '/tasks/t_example')
++
++    const logReads = () => priorities(path => path.startsWith('/tasks/t_example/log?'))
++
++    const first = openDrawer()
++    await waitFor(() => expect(taskReads()).toEqual(['foreground']))
++    await waitFor(() => expect(logReads()).toEqual(['foreground']))
++
++    // The socket invalidation / interval heartbeat of the same open: a background poll, thinned on a slow link.
++    await act(async () => {
++      await client.invalidateQueries({ queryKey: ['kanban'] })
++    })
++    await waitFor(() => expect(taskReads()).toEqual(['foreground', undefined]))
++    await waitFor(() => expect(logReads()).toEqual(['foreground', undefined]))
++
++    // Closing and re-opening the same task within seconds (cache still warm) is the user's read again.
++    first.unmount()
++    openDrawer()
++    await waitFor(() => expect(taskReads()).toEqual(['foreground', undefined, 'foreground']))
++    await waitFor(() => expect(logReads()).toEqual(['foreground', undefined, 'foreground']))
++  })
++
+   it('is a modal dialog named by the task title that Esc dismisses', async () => {
+     detail = { ...legacyDetail, attachments: [] }
+     const onClose = vi.fn()
+diff --git a/apps/desktop/src/plugins/kanban/drawer.tsx b/apps/desktop/src/plugins/kanban/drawer.tsx
+index 617a8c79d3..b41a7e3352 100644
+--- a/apps/desktop/src/plugins/kanban/drawer.tsx
++++ b/apps/desktop/src/plugins/kanban/drawer.tsx
+@@ -56,7 +56,8 @@ import {
+   routedToScope,
+   taskKey,
+   type TaskOwner,
+-  useKanbanScope
++  useKanbanScope,
++  userOpenReads
+ } from './api'
+ import { uploadFiles, useFileDrop } from './attach-drop'
+ import { ModelOverrideField, overridePatch } from './model-override'
+@@ -858,11 +859,14 @@ export function TaskDrawer({
+   const qc = useQueryClient()
+   const scope = useKanbanScope()
+   const slug = useValue($boardSlug)
++  // [daveey] The drawer mounts once per open (keyed by its task): the first task and log read of this open are the
++  // user's (foreground, never thinned on a slow link); the interval and socket refetches after them are polls.
++  const [openRead] = useState(userOpenReads)
+ 
+   // Socket-invalidated (bindApi); the interval is only the socketless heartbeat.
+   const { data: detail, error } = useQuery({
+     enabled: query => !!id && (!!owner || routedToScope(query)),
+-    queryFn: () => fetchTask(id!, owner),
++    queryFn: () => fetchTask(id!, owner, openRead(`task:${id}`)),
+     queryKey: taskKey(scope, slug, id ?? '', owner),
+     refetchInterval: 30_000
+   })
+@@ -873,7 +877,7 @@ export function TaskDrawer({
+ 
+   const { data: log } = useQuery({
+     enabled: query => !!id && (!!owner || routedToScope(query)),
+-    queryFn: () => fetchLog(id!, owner),
++    queryFn: () => fetchLog(id!, owner, openRead(`log:${id}`)),
+     queryKey: logKey(scope, slug, id ?? '', owner),
+     refetchInterval: running ? 3_000 : 15_000
+   })
+-- 
+2.51.0
+

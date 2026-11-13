@@ -1,0 +1,537 @@
+From 1bddf67ce8b7d51d93f179673a3fa795a56f5f92 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:09:32 +0000
+Subject: [PATCH] [daveey] pm: HERMES_PM_ACCOUNT_SEED=0 opt-out (set by
+ setup-pm), per-lock uv seed marker, one hash per seeded install
+
+Follow-up to #1895 (account-seed hardlinks), its review's five non-blocking points:
+
+1. CI and the live uv cache. A self-hosted runner whose login has a live ~/.hermes
+   on the same filesystem resolved uv-cache-path to that account's cache, which the
+   setup-pm action then restores/saves with actions/cache and prunes with
+   --exact-lock. HERMES_PM_ACCOUNT_SEED=0 (pm.environments.account_seed_enabled; also
+   honoured by run_tests.sh's tool-store borrowing) turns borrowing off; setup-pm's
+   setup_toolchain.py exports it to every later step and sets it for its own phases.
+   The mini's hermes-state lane (runner = the daveey login, HOME=/Users/me, same
+   APFS device 16777231 as RUNNER_TEMP, live ~/.hermes/cache/uv -> uv.noindex) does
+   not use setup-pm: no cache action, no prune. It keeps borrowing; its comment now
+   says what it shares and why that is safe instead of "never touches ~/.hermes".
+2. A primary home outside ~/.hermes beside a stale ~/.hermes: documented in
+   account_home_root and pm/AGENTS.md; the same opt-out keeps its state its own.
+3. The uv cache's .seeded marker keeps one line per lock (newest first, at most 8),
+   written atomically, so homes on different uv.lock digests sharing one cache no
+   longer re-run each other's payload merge. A payload seed still supersedes its own
+   lock's older payload suffix (the +payload -> +payload2 heal).
+4. pm/AGENTS.md states the invariant: published tool entries and snapshot files are
+   never written in place; _heal_exec_bit's +x is the one sanctioned change. Tests
+   catch a borrower's install/heal/re-pin or a snapshot rewrite changing an account
+   inode's bytes.
+5. A seeded install records the digest it verified (pm.store.verified_digest)
+   instead of hashing the published tree again; a staged repair drops it.
+
+tests/pm/test_account_seed.py: 12 new tests; on main 6 fail (opt-out x4, marker,
+single hash); the two invariant guards pass on main and each kills a mutant (a
+linked root pyproject.toml, an in-place append in _heal_exec_bit).
+---
+ .github/workflows/hermes-state-macos.yml |  15 +-
+ pm/AGENTS.md                             |  19 +++
+ pm/environments.py                       |  16 ++
+ pm/install.py                            |  28 ++--
+ pm/packages.py                           |  36 ++++-
+ pm/store.py                              |  13 +-
+ scripts/ci/setup_toolchain.py            |   5 +
+ scripts/run_tests.sh                     |   2 +
+ tests/pm/test_account_seed.py            | 178 +++++++++++++++++++++++
+ 9 files changed, 295 insertions(+), 17 deletions(-)
+
+diff --git a/.github/workflows/hermes-state-macos.yml b/.github/workflows/hermes-state-macos.yml
+index b584c1a21d..e0dca84f41 100644
+--- a/.github/workflows/hermes-state-macos.yml
++++ b/.github/workflows/hermes-state-macos.yml
+@@ -23,8 +23,19 @@ name: hermes_state (macOS)
+ # regression (disk, runner loss, host timeouts; t_01a1d37abf5db0ae). ci-probe/**
+ # branches keep an unfiltered push trigger for probing the runner.
+ #
+-# HERMES_HOME points at a throwaway temp dir so the lane can never touch the
+-# live ~/.hermes of anything else running on the mini.
++# HERMES_HOME points at a throwaway temp dir, so the lane writes none of the live
++# ~/.hermes's config, state, sessions or environments. The runner is the daveey
++# login (HOME=/Users/me, same APFS volume as RUNNER_TEMP), so the temp home
++# BORROWS that account's content-checked state (pm/AGENTS.md, Homes that borrow
++# the account's state): run_tests.sh provisions from its tool store when the
++# pins match, pm hard-links its verified tool entries and unchanged snapshot
++# files (never written in place), and uv shares its cache. uv locks that cache
++# and keys it by content, the same contract the account's own concurrent
++# processes rely on; this lane runs no actions/cache and no cache prune on it
++# (setup-pm, which does, sets HERMES_PM_ACCOUNT_SEED=0), and the seed marker is
++# kept per uv.lock, so a lane on another lock never re-triggers the account's
++# payload merge. Set HERMES_PM_ACCOUNT_SEED=0 here to borrow nothing (the run
++# then downloads its own ~2 GiB of tools and uv cache).
+ 
+ on:
+   push:
+diff --git a/pm/AGENTS.md b/pm/AGENTS.md
+index 91efbfc5c1..60d0e66867 100644
+--- a/pm/AGENTS.md
++++ b/pm/AGENTS.md
+@@ -35,3 +35,22 @@ dependencies themselves have to"; dates are checked by us, not users; pinned dep
+ JS: `minimumReleaseAge` (14 days) in `pnpm-workspace.yaml`; an exemption is one exact
+ `- name@1.2.3  # why` line in `minimumReleaseAgeExclude`, which `hermes pm update --pnpm` names
+ and later drops (`website/docs/reference/package-management.md` § Release age and package mirrors).
++
++## Homes that borrow the account's state
++
++A home other than the account's `~/.hermes` on the same filesystem (a test, review or mutation
++`HERMES_HOME`) hard-links the account's verified tool entries and unchanged source-snapshot files,
++and shares its uv cache (`pm/environments.py::account_home_root`). A linked file is ONE inode in
++both homes, so **published tool entries and source snapshots are never written in place**: replace
++a file by writing a sibling and renaming it over (or remove the tree and stage it again); never
++open it for writing, `write_text` or append to a path inside a published entry or a snapshot
++package directory. The one sanctioned in-place change is `pm/install.py::_heal_exec_bit`, which
++only ADDS execute bits (the digest excludes modes, and the account's copy needs +x as well). Files
++a snapshot rewrites (the root `pyproject.toml`, generated members) are real copies, never links.
++`tests/pm/test_account_seed.py` fails when a borrower's install, re-pin or snapshot changes the
++bytes of an account inode.
++
++`HERMES_PM_ACCOUNT_SEED=0` turns borrowing off. CI sets it (`setup-pm`, whose `actions/cache`
++save/restore and `--exact-lock` prune act on the uv cache path), and so should a primary home kept
++outside `~/.hermes` beside a stale `~/.hermes`: it would otherwise share that home's uv cache and
++compile bytecode on first import instead of eagerly.
+diff --git a/pm/environments.py b/pm/environments.py
+index efeaf0e299..be91bccf02 100644
+--- a/pm/environments.py
++++ b/pm/environments.py
+@@ -34,6 +34,14 @@ def installs_root() -> Path:
+     return dependency_home_root() / "installs"
+ 
+ 
++ACCOUNT_SEED_ENV = "HERMES_PM_ACCOUNT_SEED"
++
++
++def account_seed_enabled() -> bool:
++    """False when ``HERMES_PM_ACCOUNT_SEED`` is ``0``/``false``/``no``/``off``: borrow nothing."""
++    return os.environ.get(ACCOUNT_SEED_ENV, "").strip().lower() not in {"0", "false", "no", "off"}
++
++
+ def account_home_root() -> Path | None:
+     """The account's default home when the active home is another one on its filesystem, else ``None``.
+ 
+@@ -41,9 +49,17 @@ def account_home_root() -> Path | None:
+     immutable, content-checked state (verified tool entries, uv's cache, source snapshots) by
+     hard link instead of fetching and unpacking its own ~2 GiB copy. Another filesystem keeps
+     the home's own state: a link cannot cross it.
++
++    The signal is only "another home on the same filesystem", so it also catches a primary
++    home kept outside ``~/.hermes`` while a stale ``~/.hermes`` remains: that home shares the
++    old home's uv cache and compiles bytecode on first import instead of eagerly. Such a home,
++    and CI (whose cache save/restore and prune act on the uv cache path), set
++    ``HERMES_PM_ACCOUNT_SEED=0`` (``ACCOUNT_SEED_ENV``) to keep every piece of state its own.
+     """
+     from hermes_constants import _get_platform_default_hermes_home
+ 
++    if not account_seed_enabled():
++        return None
+     account = _get_platform_default_hermes_home()
+     active = dependency_home_root()
+     while not active.exists() and active.parent != active:
+diff --git a/pm/install.py b/pm/install.py
+index 4dc86f7617..8216576640 100644
+--- a/pm/install.py
++++ b/pm/install.py
+@@ -20,7 +20,7 @@ from pm.lock import Facts, Lockfile
+ from pm.package import InstallError, Package, Runner, StatePackage, compose_env
+ from pm.plugin_inputs import Candidates, Members, PluginInput, Selection, StagedUpdate
+ from pm.registry import get_package, walk
+-from pm.store import Store, current_target, digest_matches, merge_tree, tree_digest
++from pm.store import Store, current_target, digest_matches, merge_tree, tree_digest, verified_digest
+ 
+ LOG = logging.getLogger(__name__)
+ 
+@@ -461,28 +461,32 @@ def _account_seed(package, lockfile, store: Store, version, target) -> tuple[dic
+     return fact, seed
+ 
+ 
+-def _seed_from_account(package, lockfile, store, staged, version, target) -> bool:
+-    """Stage *package* by linking the account store's entry; False leaves the download to the caller.
++def _seed_from_account(package, lockfile, store, staged, version, target) -> str | None:
++    """Stage *package* by linking the account store's entry and return its verified digest;
++    ``None`` leaves the download to the caller.
+ 
+     Entries are immutable once published and every name is replaced by rename, so a link shares
+     bytes without sharing a tree. The staged tree must still hash to the digest the account
+-    recorded for this exact pin; a seed that changes mid-link fails that check and is dropped."""
++    recorded for this exact pin; a seed that changes mid-link fails that check and is dropped.
++    The returned digest is ``tree_digest(staged)``, computed once while verifying; the caller
++    records it rather than hashing the published tree again."""
+     seed = _account_seed(package, lockfile, store, version, target)
+     if seed is None:
+-        return False
++        return None
+     fact, source_store = seed
+     try:
+         shutil.copytree(source_store.entry(fact["entry"]), staged, symlinks=True, copy_function=_link_or_copy)
+-        if digest_matches(staged, fact["digest"]):
++        digest = verified_digest(staged, fact["digest"])
++        if digest is not None:
+             LOG.info("%s: linked from %s", package.name, native(source_store.root))
+-            return True
++            return digest
+         LOG.warning("%s: %s does not match its recorded digest; downloading", package.name,
+                     native(source_store.entry(fact["entry"])))
+     except OSError as exc:
+         LOG.warning("%s: cannot link from %s (%s); downloading", package.name, native(source_store.root), exc)
+     if staged.exists():
+         remove_tree(staged)
+-    return False
++    return None
+ 
+ 
+ def _log_repair(package, previous, version, artifacts) -> None:
+@@ -551,10 +555,13 @@ def _install(
+             )
+         with store.scratch() as scratch:
+             staged = scratch / "tree"
++            # The seeded tree's digest, hashed once while verifying the seed; a repair drops it.
++            seeded_digest = None
+             try:
+                 if copy_from is not None:
+                     _copy_verified_source(package, lockfile, copy_from, staged, version, target)
+-                elif facts is not None and _seed_from_account(package, lockfile, store, staged, version, target):
++                elif facts is not None and (seeded_digest := _seed_from_account(
++                        package, lockfile, store, staged, version, target)) is not None:
+                     pass
+                 else:
+                     staged = _prepare_artifacts(package, store, scratch, artifacts, version, target,
+@@ -566,6 +573,7 @@ def _install(
+                     progress("verify", 0, 0, "")
+                 reason, remedy = package.verify(staged, target), ""
+                 if reason:
++                    seeded_digest = None  # the repair may rewrite the staged tree
+                     reason, remedy = package.repair_staged_verification(staged, target, reason)
+                 if reason:
+                     raise InstallError(package.name, f"staged entry failed verification: {reason}", remedy)
+@@ -576,7 +584,7 @@ def _install(
+                         facts.record(
+                             package.name, version, entry_name, package.env(entry, target), store.root,
+                             target=target, artifacts=[a["sha256"] for a in artifacts],
+-                            digest=tree_digest(entry),
++                            digest=seeded_digest or tree_digest(entry),
+                         )
+                 _remove_downloads(store, artifacts)
+             except (InstallError, DownloadPaused):
+diff --git a/pm/packages.py b/pm/packages.py
+index c4b32a5839..2833034677 100644
+--- a/pm/packages.py
++++ b/pm/packages.py
+@@ -454,9 +454,10 @@ def uv_cache_dir() -> Path:
+         # merge once and the directory-shaped entries the old copy left are healed in place.
+         seed += "+payload2"
+     try:
+-        current = marker.read_text(encoding="utf-8-sig").strip() == seed
++        recorded = _seed_marker_lines(marker)
+     except OSError:
+-        current = False
++        recorded = []
++    current = seed in recorded
+     if not current:
+         # Seed from a shipped bundle cache when present (payload root =
+         # store_root().parent on a sealed install). Record completion ONLY after a clean copy: a
+@@ -487,12 +488,41 @@ def uv_cache_dir() -> Path:
+         else:
+             try:
+                 marker.parent.mkdir(parents=True, exist_ok=True)
+-                marker.write_text(seed, encoding="utf-8")
++                _write_seed_marker(marker, seed, recorded)
+             except OSError:
+                 pass
+     return machine_cache
+ 
+ 
++# One line per lock whose seed this cache holds. Homes on different locks share one cache (a
++# borrowing home uses the account's, ``uv_cache_path``); a single-value marker flipped between
++# them and made each re-run its payload merge after the other.
++_SEED_MARKER_LOCKS = 8
++
++
++def _seed_marker_lines(marker: Path) -> list[str]:
++    return [line.strip() for line in marker.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
++
++
++def _write_seed_marker(marker: Path, seed: str, recorded: list[str]) -> None:
++    """Record *seed* first. A payload seed supersedes its own lock's other payload suffixes (their
++    copy semantics are stale); every other line, the seedless form included, stays."""
++    lock, _, suffix = seed.partition("+")
++
++    def superseded(line: str) -> bool:
++        other_lock, _, other_suffix = line.partition("+")
++        return bool(suffix) and other_lock == lock and bool(other_suffix) and other_suffix != suffix
++
++    lines = [seed, *(line for line in recorded if line != seed and not superseded(line))]
++    fd, staging = tempfile.mkstemp(prefix=".seeded-", dir=marker.parent)
++    try:
++        with os.fdopen(fd, "w", encoding="utf-8") as stream:
++            stream.write("\n".join(lines[:_SEED_MARKER_LOCKS]))
++        os.replace(staging, marker)
++    finally:
++        Path(staging).unlink(missing_ok=True)
++
++
+ @register
+ class Venv(StatePackage):
+     """The project venv: pyproject.toml + setup.py + uv.lock + enabled extras.
+diff --git a/pm/store.py b/pm/store.py
+index f33a39f89a..7ca8b76f4c 100644
+--- a/pm/store.py
++++ b/pm/store.py
+@@ -345,8 +345,17 @@ def tree_digest(root: Path) -> str:
+ 
+ def digest_matches(root: Path, recorded: str | None) -> bool:
+     """Facts recorded before desktop metadata was skipped hashed it as payload."""
+-    return recorded is not None and (
+-        tree_digest(root) == recorded or _tree_digest(root, skip_metadata=False) == recorded)
++    return verified_digest(root, recorded) is not None
++
++
++def verified_digest(root: Path, recorded: str | None) -> str | None:
++    """``tree_digest(root)`` when *root* matches *recorded* (as ``digest_matches``), else ``None``.
++
++    The caller that records the tree next reuses it instead of hashing the tree again."""
++    if recorded is None:
++        return None
++    digest = tree_digest(root)
++    return digest if digest == recorded or _tree_digest(root, skip_metadata=False) == recorded else None
+ 
+ 
+ def _tree_digest(root: Path, *, skip_metadata: bool) -> str:
+diff --git a/scripts/ci/setup_toolchain.py b/scripts/ci/setup_toolchain.py
+index 40d9b5dea9..df04417a02 100644
+--- a/scripts/ci/setup_toolchain.py
++++ b/scripts/ci/setup_toolchain.py
+@@ -104,6 +104,10 @@ def prepare(args) -> None:
+     file_commands("GITHUB_ENV", {
+         "HERMES_HOME": home,
+         "HERMES_RUNTIME_DIR": home / "tools",
++        # A self-hosted runner's account may have a live ~/.hermes on this filesystem: borrowing
++        # it would point uv-cache-path, the cache save/restore and the exact-lock prune at the
++        # account's own uv cache (pm/AGENTS.md, Homes that borrow the account's state).
++        "HERMES_PM_ACCOUNT_SEED": "0",
+         "PYTHONUTF8": "1",
+     })
+ 
+@@ -307,6 +311,7 @@ def main() -> None:
+         parser.error("Python dependencies require the python or all toolchain")
+     os.environ["HERMES_HOME"] = str(args.home.resolve())
+     os.environ["HERMES_RUNTIME_DIR"] = str(args.home.resolve() / "tools")
++    os.environ["HERMES_PM_ACCOUNT_SEED"] = "0"
+     phases[args.phase](args)
+ 
+ 
+diff --git a/scripts/run_tests.sh b/scripts/run_tests.sh
+index fb9ede6a40..5c6f110f1f 100755
+--- a/scripts/run_tests.sh
++++ b/scripts/run_tests.sh
+@@ -76,6 +76,8 @@ _has_pytest() { [ -n "$1" ] && [ -x "$1" ] && "$1" -c 'import pytest' 2>/dev/nul
+ _account_tool_store() {
+   local account py_minor
+   [ -z "${HERMES_RUNTIME_DIR:-}" ] || return 1
++  # The same opt-out as pm.environments.account_seed_enabled (pm/AGENTS.md).
++  case "${HERMES_PM_ACCOUNT_SEED:-}" in 0|[Ff][Aa][Ll][Ss][Ee]|[Nn][Oo]|[Oo][Ff][Ff]) return 1 ;; esac
+   account="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+   [ -n "$account" ] || account="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: *//p')"
+   [ -n "$account" ] && [ -d "$account" ] || return 1
+diff --git a/tests/pm/test_account_seed.py b/tests/pm/test_account_seed.py
+index eae3317f02..73f5a1e502 100644
+--- a/tests/pm/test_account_seed.py
++++ b/tests/pm/test_account_seed.py
+@@ -25,6 +25,12 @@ pytestmark = pytest.mark.skipif(os.name == "nt", reason="Windows seeds copy, nev
+ engine = importlib.import_module("pm.install")
+ 
+ 
++@pytest.fixture(autouse=True)
++def _borrowing_enabled(monkeypatch):
++    """CI's setup-pm exports the opt-out; these tests exercise the borrowing it turns off."""
++    monkeypatch.delenv("HERMES_PM_ACCOUNT_SEED", raising=False)
++
++
+ def _zip(body: bytes) -> bytes:
+     data = io.BytesIO()
+     with zipfile.ZipFile(data, "w") as archive:
+@@ -305,3 +311,175 @@ def test_install_error_is_not_swallowed_by_the_seed(tool, monkeypatch):
+     tool.account_file.write_bytes(b"tampered")
+     with pytest.raises(InstallError):
+         tool.install()
++
++
++# --- opt-out ----------------------------------------------------------------------------------
++
++@pytest.mark.parametrize("value", ["0", "off", "False", " no "])
++def test_opt_out_borrows_nothing(tool, monkeypatch, tmp_path, value):
++    """CI (setup-pm) and a primary home beside a stale ~/.hermes keep every piece of state their own."""
++    from pm import environments
++    from pm.packages import uv_cache_path
++
++    (tmp_path / ".hermes" / "cache" / "uv").mkdir(parents=True)
++    monkeypatch.setenv("HERMES_PM_ACCOUNT_SEED", value)
++    assert environments.account_home_root() is None
++    assert uv_cache_path() == tmp_path / "borrower" / "cache" / "uv"
++    assert _environment(environments.installs_root() / "k" / "environments" / "g" / "venv")._compile_bytecode()
++    installed = tool.install()
++    assert installed.read_bytes() == b"pinned bytes"
++    assert os.stat(installed).st_ino != os.stat(tool.account_file).st_ino
++
++
++@pytest.mark.parametrize("value", ["", "1", "yes"])
++def test_other_opt_out_values_keep_borrowing(tmp_path, monkeypatch, value):
++    from pm import environments
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "fresh"))
++    monkeypatch.setenv("HERMES_PM_ACCOUNT_SEED", value)
++    assert environments.account_home_root() == tmp_path / ".hermes"
++
++
++# --- seed marker ------------------------------------------------------------------------------
++
++def test_homes_on_different_locks_do_not_rerun_each_others_seed(tmp_path, monkeypatch):
++    """The account and a borrowing home share one uv cache; the marker keeps each lock's seed.
++
++    Regression: a single-value ``.seeded`` flipped to the borrower's lock, so the account merged
++    its whole payload cache again on its next call."""
++    from pm import packages
++
++    shared = tmp_path / ".hermes" / "cache" / "uv"
++    shared.mkdir(parents=True)
++    payload = tmp_path / "payload"
++    (payload / "uv-cache" / "archive-v0" / "bucket").mkdir(parents=True)
++    (payload / "uv-cache" / "archive-v0" / "bucket" / "module.py").write_text("seeded = True\n", encoding="utf-8")
++    (payload / "tools").mkdir()
++    checkouts = {}
++    for name in ("account", "borrower"):
++        checkouts[name] = tmp_path / f"code-{name}"
++        checkouts[name].mkdir()
++        (checkouts[name] / "uv.lock").write_text(f"version = 1\n# {name}\n", encoding="utf-8")
++    merges = []
++    real_seed_tree = packages._seed_tree
++
++    def counting_seed_tree(src, dst):
++        if src.parent.name == "uv-cache":  # one payload bucket merged; nested calls recurse
++            merges.append(src)
++        real_seed_tree(src, dst)
++
++    monkeypatch.setattr(packages, "_seed_tree", counting_seed_tree)
++
++    def call(home):
++        if home == "account":
++            monkeypatch.delenv("HERMES_HOME", raising=False)
++            monkeypatch.setattr(paths, "store_root", lambda: payload / "tools")
++        else:
++            monkeypatch.setenv("HERMES_HOME", str(tmp_path / "fresh"))
++            monkeypatch.setattr(paths, "store_root", lambda: tmp_path / "fresh" / "tools")
++        monkeypatch.setattr(paths, "repo_root", lambda: checkouts[home])
++        assert packages.uv_cache_dir().resolve() == shared.resolve()
++
++    call("account")
++    assert len(merges) == 1
++    call("borrower")
++    call("account")
++    assert len(merges) == 1, "the borrower's lock evicted the account's seed record"
++    assert (shared / "archive-v0" / "bucket" / "module.py").is_file()
++
++
++def _recorded_digest(store: Store, name: str) -> str:
++    fact = Facts(store.root / "facts.json").get(name)
++    assert fact is not None
++    return fact["digest"]
++
++
++# --- shared inodes are never written in place --------------------------------------------------
++
++def test_borrower_lifecycle_never_rewrites_an_account_inode(tool):
++    """Install, heal, re-pin: every account byte and its recorded digest survive the borrower.
++
++    A borrowing home's entry files ARE the account's inodes (pm/AGENTS.md); only
++    ``_heal_exec_bit`` may change one in place, and only by adding execute bits."""
++    from pm.store import digest_matches
++
++    account_entry = tool.account_file.parent
++    tool.account_file.chmod(0o644)
++    before = {path: path.read_bytes() for path in account_entry.rglob("*") if path.is_file()}
++    recorded = _recorded_digest(tool.account, tool.package.name)
++
++    installed = tool.install()
++    assert os.stat(installed).st_ino == os.stat(tool.account_file).st_ino
++    assert engine._heal_exec_bit(installed)
++    assert os.stat(tool.account_file).st_mode & 0o777 == 0o755  # +x is the one shared change
++    tool.pin("2.0", b"new pin")
++    assert tool.install().read_bytes() == b"new pin"
++
++    assert {path: path.read_bytes() for path in account_entry.rglob("*") if path.is_file()} == before
++    assert digest_matches(account_entry, recorded)
++
++
++def test_snapshot_rewrites_never_reach_a_donor_file(tmp_path, monkeypatch):
++    """The generation's own rewrites (the root pyproject.toml drops the release-age cutoff) land
++    on copies; only unchanged package files are links to the account's snapshot."""
++    from pm import workspace
++
++    source, donor, root = tmp_path / "checkout", tmp_path / "donor", tmp_path / "generation"
++    pyproject = ('[project]\nname = "core"\nversion = "0"\n'
++                 '[tool.setuptools.packages.find]\ninclude = ["pkg*"]\n'
++                 '[tool.uv]\nexclude-newer = "3 days"\n')
++    for tree in (source, donor):
++        (tree / "pkg").mkdir(parents=True)
++        (tree / "pkg" / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
++        (tree / "pyproject.toml").write_text(pyproject, encoding="utf-8")
++    monkeypatch.setattr(workspace, "_snapshot_donor", lambda _source: donor)
++    before = {path: path.read_bytes() for path in donor.rglob("*") if path.is_file()}
++
++    workspace._generate_pyproject([], root, source=source, python=Path("python"))
++
++    assert os.stat(root / "pkg" / "mod.py").st_ino == os.stat(donor / "pkg" / "mod.py").st_ino
++    assert "exclude-newer" not in (root / "pyproject.toml").read_text(encoding="utf-8")
++    assert {path: path.read_bytes() for path in donor.rglob("*") if path.is_file()} == before
++
++
++# --- digest reuse -----------------------------------------------------------------------------
++
++def test_seeded_install_hashes_the_tree_once(tool, monkeypatch):
++    """The digest verified against the account's fact is the one recorded, not a second hash."""
++    from pm import store as store_module
++
++    hashed = []
++    real = store_module._tree_digest
++
++    def counting(root, *, skip_metadata):
++        hashed.append(Path(root))
++        return real(root, skip_metadata=skip_metadata)
++
++    monkeypatch.setattr(store_module, "_tree_digest", counting)
++    RangeHandler.payloads.clear()
++    tool.install()
++    assert len(hashed) == 1, hashed
++    assert _recorded_digest(tool.store, tool.package.name) == _recorded_digest(tool.account, tool.package.name)
++
++
++def test_repaired_seed_records_the_published_digest(tool, monkeypatch):
++    """A staged repair may rewrite the seed, so the verified digest is not reused after one."""
++    from pm.store import tree_digest
++
++    seen = []
++
++    def fail_once(entry, target):
++        if not seen:
++            seen.append(entry)
++            return "needs repair"
++        return ""
++
++    def repair(entry, target, reason):
++        (entry / "repaired.txt").write_bytes(b"added by repair")
++        return "", ""
++
++    monkeypatch.setattr(tool.package, "verify", fail_once)
++    monkeypatch.setattr(tool.package, "repair_staged_verification", repair)
++    RangeHandler.payloads.clear()
++    installed = tool.install()
++    assert _recorded_digest(tool.store, tool.package.name) == tree_digest(installed.parent)
+-- 
+2.51.0
+

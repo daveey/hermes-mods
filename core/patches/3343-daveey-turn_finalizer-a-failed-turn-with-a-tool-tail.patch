@@ -1,0 +1,198 @@
+From 8ae4a23b8fd1f0ed6e7300f3a0b3005c6f758df9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:21:23 +0000
+Subject: [PATCH] [daveey] turn_finalizer: a failed turn with a tool tail keeps
+ its reason, not pending_tool_result
+
+A tool result that could not be saved stops the turn as session_persistence_failed with
+the tool row last; the silent-stop close then relabelled it pending_tool_result ("send
+continue"), hiding the storage failure. Skip the relabel when the turn already failed
+(failed, or an exit reason that fails the turn), log a WARNING, and close the tool tail
+with the real reason's explainer (PARTIAL_FAILED_TURN_NOTICE when the explainer is off).
+
+Self-heal defect gateway-a8b8d01aa4 (t_01a1d431b35e9f9f).
+---
+ agent/turn_finalizer.py                       | 52 +++++++++--
+ ...st_turn_finalizer_interrupt_alternation.py | 91 +++++++++++++++++++
+ 2 files changed, 136 insertions(+), 7 deletions(-)
+
+diff --git a/agent/turn_finalizer.py b/agent/turn_finalizer.py
+index d23c3836b1..a7e77a0c44 100644
+--- a/agent/turn_finalizer.py
++++ b/agent/turn_finalizer.py
+@@ -15,7 +15,7 @@ from typing import Any, Callable, List, Optional, Tuple
+ from agent.codex_responses_adapter import _summarize_user_message_for_log
+ from agent.delegation_context import is_dispatcher_owned_worker_context
+ from agent.interrupt_control import interrupted_during_api_call_reason
+-from agent.turn_failure_copy import exit_reason_failure, stamp_failure
++from agent.turn_failure_copy import PARTIAL_FAILED_TURN_NOTICE, exit_reason_failure, stamp_failure
+ from agent.context_compressor import _DB_PERSISTED_MARKER
+ from agent.message_content import flatten_message_text
+ from agent.message_metadata import append_message, stamp_message_timestamp
+@@ -712,6 +712,46 @@ def _mirror_turn_to_memory(
+             )
+ 
+ 
++def _silent_tool_tail(agent, final_response, interrupted, messages) -> bool:
++    """The turn left the loop on a raw ``tool`` row with no reply and no streamed text."""
++    return bool(
++        not final_response
++        and not interrupted
++        and messages
++        and isinstance(messages[-1], dict)
++        and messages[-1].get("role") == "tool"
++        and not (getattr(agent, "_current_streamed_assistant_text", "") or "").strip()
++    )
++
++
++def _close_failed_tool_tail(agent, messages, failed, turn_exit_reason, logger) -> bool:
++    """Close the tool tail of a turn that already failed (``failed``, or an exit reason that
++    fails the turn, e.g. ``session_persistence_failed`` when the tool result could not be
++    saved) with that reason's own explanation; return False for a turn that had not failed.
++    Relabelling such a turn ``pending_tool_result`` would hide the real cause behind "send
++    continue", which cannot help (gateway-a8b8d01aa4)."""
++    verdict = exit_reason_failure(turn_exit_reason)
++    if not failed and not (verdict is not None and verdict.fails_turn):
++        return False
++    logger.warning(
++        "finalize_turn: tool tail on failed turn %r kept its reason (not pending_tool_result)",
++        turn_exit_reason,
++    )
++    text = ""
++    try:
++        if agent._turn_completion_explainer_enabled():
++            text = agent._format_turn_completion_explanation(
++                turn_exit_reason, getattr(agent, "_last_persistence_error_cause", None),
++                db_path=getattr(getattr(agent, "_session_db", None), "db_path", None),
++                model=str(getattr(agent, "model", "") or ""),
++            )
++    except Exception:
++        logger.warning("turn-completion explainer failed for %r", turn_exit_reason, exc_info=True)
++    # The tool already ran, so the fallback is the partial-failure notice.
++    append_message(messages, {"role": "assistant", "content": text or PARTIAL_FAILED_TURN_NOTICE})
++    return True
++
++
+ def finalize_turn(
+     agent, *, final_response, api_call_count, interrupted, failed, messages, conversation_history,
+     effective_task_id, turn_id, user_message, original_user_message, _should_review_memory,
+@@ -748,13 +788,11 @@ def finalize_turn(
+     # exit reason, fail the turn, and synthesize the visible close so the tail close in
+     # ``_persist_step`` persists an assistant row. A turn that already streamed text is
+     # left alone: ``_recover_final_from_stream`` owns that recovery (#95514).
++    # A turn that already failed is not a silent stop: ``_close_failed_tool_tail`` keeps its
++    # reason and closes the tail itself, so the relabel below never hides the real cause.
+     if (
+-        not final_response
+-        and not interrupted
+-        and messages
+-        and isinstance(messages[-1], dict)
+-        and messages[-1].get("role") == "tool"
+-        and not (getattr(agent, "_current_streamed_assistant_text", "") or "").strip()
++        _silent_tool_tail(agent, final_response, interrupted, messages)
++        and not _close_failed_tool_tail(agent, messages, failed, _turn_exit_reason, logger)
+     ):
+         _turn_exit_reason = "pending_tool_result"
+         failed = True
+diff --git a/tests/agent/test_turn_finalizer_interrupt_alternation.py b/tests/agent/test_turn_finalizer_interrupt_alternation.py
+index cd9c30b5d1..a2986b2cfb 100644
+--- a/tests/agent/test_turn_finalizer_interrupt_alternation.py
++++ b/tests/agent/test_turn_finalizer_interrupt_alternation.py
+@@ -263,3 +263,94 @@ def test_tool_tail_with_non_tool_last_role_is_untouched():
+     )
+     assert result["turn_exit_reason"] == "interrupted_by_user"  # unchanged passthrough
+     assert result["failed"] is False
++
++
++def _finalize_failed(agent, messages, *, exit_reason, failed):
++    return finalize_turn(
++        agent, final_response="", api_call_count=1, interrupted=False, failed=failed,
++        messages=messages, conversation_history=None, effective_task_id="task-1",
++        turn_id="turn-1", user_message="summarize the log",
++        original_user_message="summarize the log", _should_review_memory=False,
++        _turn_exit_reason=exit_reason,
++    )
++
++
++def test_persistence_failed_tool_tail_keeps_its_reason():
++    """A tool result that could not be saved stops the turn as ``session_persistence_failed``
++    with the tool row last. The silent-stop close must not relabel it ``pending_tool_result``
++    ("send continue", which cannot work on a broken store): the reason and its cause survive and
++    the tool tail is still closed by a visible assistant row."""
++    agent = _StubAgent()
++    agent._last_persistence_error_cause = "corrupt"
++    messages = _pending_tool_result_tail()
++    result = _finalize_failed(agent, messages, exit_reason="session_persistence_failed", failed=True)
++
++    assert result["turn_exit_reason"] == "session_persistence_failed"
++    assert result["failure_reason"] == "session_persistence_failed:corrupt"
++    assert result["failed"] is True
++    assert result["completed"] is False
++    assert messages[-1]["role"] == "assistant"
++    assert messages[-1]["content"].strip()
++    assert "continue" not in messages[-1]["content"].lower()
++    _assert_no_tool_then_user(messages + [{"role": "user", "content": "are you done"}])
++
++
++def _turn_failing_exit_reasons():
++    from agent.turn_failure_copy import _EXIT_REASON_FAILURES
++
++    reasons = [prefix for prefix, _code, _retry, fails in _EXIT_REASON_FAILURES
++               if fails and prefix != "pending_tool_result"]
++    return [(r, False) for r in reasons] + [(r, True) for r in reasons] + [
++        ("session_persistence_failed", True)]
++
++
++def test_no_failed_turn_with_tool_tail_is_relabelled_pending():
++    """Detection guard: every exit reason that already fails the turn keeps its own reason
++    when the transcript ends on a tool row; ``pending_tool_result`` is only for turns that
++    stopped silently without any other failure. New failing reasons are covered automatically."""
++    for exit_reason, failed in _turn_failing_exit_reasons():
++        agent = _StubAgent()
++        messages = _pending_tool_result_tail()
++        result = _finalize_failed(agent, messages, exit_reason=exit_reason, failed=failed)
++        assert result["turn_exit_reason"] == exit_reason, (exit_reason, failed)
++        assert result["failed"] is True, (exit_reason, failed)
++        assert result.get("failure_reason") != "loop_error" or exit_reason in (
++            "repeated_outer_errors", "error_near_max_iterations"), (exit_reason, failed)
++        assert messages[-1]["role"] == "assistant", (exit_reason, failed)
++        assert messages[-1]["content"].strip(), (exit_reason, failed)
++
++
++def test_advisory_exit_reason_with_tool_tail_still_closes_as_pending():
++    """An advisory exit reason (``fails_turn`` False, e.g. ``empty_response_exhausted``) on a
++    turn that has not failed is still a silent stop: the tool tail keeps the
++    ``pending_tool_result`` close. Only reasons that fail the turn keep their own label."""
++    from agent.turn_failure_copy import _EXIT_REASON_FAILURES
++
++    advisory = [prefix for prefix, _code, _retry, fails in _EXIT_REASON_FAILURES if not fails]
++    assert advisory
++    for exit_reason in advisory:
++        agent = _StubAgent()
++        messages = _pending_tool_result_tail()
++        result = _finalize_failed(agent, messages, exit_reason=exit_reason, failed=False)
++        assert result["turn_exit_reason"] == "pending_tool_result", exit_reason
++        assert result["failed"] is True, exit_reason
++        assert messages[-1]["role"] == "assistant", exit_reason
++
++
++def test_persistence_failed_tool_tail_close_uses_the_storage_explainer():
++    """With the explainer on, the close row carries the storage failure's own explanation,
++    never the pending-tool "send continue" copy."""
++    from agent.turn_explainers import TurnExplainersMixin
++
++    agent = _StubAgent()
++    agent._turn_completion_explainer_enabled = lambda: True
++    agent._format_turn_completion_explanation = TurnExplainersMixin._format_turn_completion_explanation
++    agent._last_persistence_error_cause = "locked"
++    messages = _pending_tool_result_tail()
++    result = _finalize_failed(agent, messages, exit_reason="session_persistence_failed", failed=True)
++
++    expected = TurnExplainersMixin._format_turn_completion_explanation("session_persistence_failed", "locked")
++    pending = TurnExplainersMixin._format_turn_completion_explanation("pending_tool_result")
++    assert expected and messages[-1] == {**messages[-1], "role": "assistant", "content": expected}
++    assert messages[-1]["content"] != pending
++    assert result["failure_reason"] == "session_persistence_failed:locked"
+-- 
+2.51.0
+

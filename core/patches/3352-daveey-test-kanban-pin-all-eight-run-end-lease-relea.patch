@@ -1,0 +1,158 @@
+From fedc433cef33911f40b7af1dda0dd16fe96197b3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:56:32 +0000
+Subject: [PATCH] [daveey] test(kanban): pin all eight run-end lease releases;
+ document the stalled window and _PENDING keying
+
+Follow-up to PR #2042 review nits (review 5888978349, card t_01a1d44c3b749d6e).
+
+1. The parametrized release test now also covers request_changes, archive and the
+   descendant reopen (table-driven), so every run-ending transition that calls
+   kanban_run_end_lease.note() is pinned: removing any one of the six note() call sites
+   turns its case red (mutation-checked); main's test file let the request_changes,
+   archive and reopen mutants pass.
+2. Module docstring: in the stalled-outbox case the direct release makes the Board return
+   the card to ready (retryStatusForRun) at once and drop a placement card's runs_on, so
+   another machine may claim a card done/parked here until the outbox drains. Accepted:
+   the same window previously opened at lease expiry, via the charged stale-lease reaper.
+   Also notes that archive and reopen close runs "reclaimed" but, being uncharged operator
+   transitions, do queue.
+3. _PENDING stays keyed by id(conn): sqlite3.Connection takes no weak references
+   (WeakKeyDictionary raises TypeError), so the invariant is documented instead: only
+   write_txn drains it, every note() caller runs in write_txn, and a stranded entry under
+   a reused id can at most release a run _release finds ended on that connection's own
+   board while its outbox is stalled.
+---
+ hermes_cli/kanban_run_end_lease.py            | 20 +++++-
+ tests/hermes_cli/test_kanban_run_end_lease.py | 70 +++++++++++++++----
+ 2 files changed, 75 insertions(+), 15 deletions(-)
+
+diff --git a/hermes_cli/kanban_run_end_lease.py b/hermes_cli/kanban_run_end_lease.py
+index 9aada21275..8246d9a00d 100644
+--- a/hermes_cli/kanban_run_end_lease.py
++++ b/hermes_cli/kanban_run_end_lease.py
+@@ -12,13 +12,28 @@ changes, continue, archive, descendant reopen) queues :func:`note` inside its wr
+ ``write_txn`` calls :func:`flush` after COMMIT: a direct ``release`` call, best-effort, the way
+ operator reclaim already does. A failed release keeps today's fallback (the lease expires on the
+ server) and never fails the transition. Crash, timeout and reclaim accounting paths do not queue: they
+-release with their own outcome, and a neutral release sent first would hide the charge.
++release with their own outcome, and a neutral release sent first would hide the charge. (Archive and
++descendant reopen close the run ``reclaimed`` too, but as uncharged operator transitions, so they queue.)
+ 
+ Only while the outbox is stalled (:func:`outbox_stalled`). Board ``releaseTask`` returns a card it still
+ sees ``running`` to ``ready`` (and drops a placement card's ``runs_on``). On a healthy host the direct
+ release would usually beat the row push, so a parked or done card would read ``ready`` on the Board
+ until the push lands, open to a claim from another machine. There the row push ends the lease itself,
+ so nothing is sent.
++
++The stalled case has the same window, accepted: the direct release makes the Board return the card to
++``ready`` at once (``retryStatusForRun``) and drop a placement card's ``runs_on``, so another machine may
++claim a card that is done or parked here until this host's outbox drains. Without the release the same
++window opened anyway, only later (at lease expiry) and through the stale-lease reaper, which also
++charged the run as a crash.
++
++``_PENDING`` is keyed by ``id(conn)``: ``sqlite3.Connection`` takes no weak references, so a
++``WeakKeyDictionary`` is not an option. Only ``write_txn`` drains it (``flush`` on COMMIT or rollback),
++and every caller of :func:`note` runs inside ``write_txn``; outside a transaction ``note`` releases at
++once. Were an entry ever stranded (a raw ``BEGIN`` caller, a connection closed mid-txn) and its id reused
++by a later connection, that connection's next commit would send at most the release of a run that
++:func:`_release` finds ended in that connection's own ``task_runs`` (a run of another board is not found,
++so nothing is sent), and only while its outbox is stalled.
+ """
+ from __future__ import annotations
+ 
+@@ -33,7 +48,8 @@ _log = logging.getLogger("hermes_cli.kanban_db_sync")
+ # within seconds; a held row with a future ``retry_after`` does not count).
+ OUTBOX_STALL_SECONDS = 120
+ 
+-# id(conn) -> [(task_id, run_uid)] queued inside the open write txn of that connection.
++# id(conn) -> [(task_id, run_uid)] queued inside the open write txn of that connection (keying and
++# draining invariant: module docstring).
+ _PENDING: dict[int, list[tuple[str, str]]] = {}
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_run_end_lease.py b/tests/hermes_cli/test_kanban_run_end_lease.py
+index 38ddf0c9f0..a3baa62afa 100644
+--- a/tests/hermes_cli/test_kanban_run_end_lease.py
++++ b/tests/hermes_cli/test_kanban_run_end_lease.py
+@@ -62,20 +62,64 @@ def test_schedule_releases_the_run_lease_while_the_outbox_is_stalled(primary, le
+     assert req["task_uid"] == tid and req["run_uid"] == run_uid
+ 
+ 
+-@pytest.mark.parametrize("end", ["block", "complete", "review", "continue"])
+-def test_block_complete_review_and_continue_release_the_run_lease(primary, lease_client, end):
+-    tid, run_uid = _claimed(primary, lease_client)
++def _review_run(conn, lease_client):
++    """A reviewer run claimed from ``review`` (the run ``request_changes`` ends)."""
++    tid, _impl_uid = _claimed(conn, lease_client, title="reviewed")
++    assert kb.request_review(conn, tid, summary="v1", reviewer="reviewer")
++    assert kb.claim_review_task(conn, tid) is not None
++    assert lease_client.calls[-1][0] == "acquire"
++    return tid, lease_client.calls[-1][1]["run_uid"], None
++
++
++def _reopened_descendant(conn, lease_client):
++    """A running child of a done parent (the run a parent reopen ends); the parent rides along."""
++    parent = kb.create_task(conn, title="parent", assignee="worker")
++    assert kb.claim_task(conn, parent) is not None
++    assert kb.complete_task(conn, parent, summary="done")
++    child = kb.create_task(conn, title="child", assignee="worker", parents=[parent])
++    assert kb.claim_task(conn, child) is not None
++    assert lease_client.calls[-1][0] == "acquire"
++    return child, lease_client.calls[-1][1]["run_uid"], parent
++
++
++def _plain_run(conn, lease_client):
++    return (*_claimed(conn, lease_client), None)
++
++
++def _continue(conn, tid, _ctx):
++    from hermes_cli import kanban_continuation
++    return kanban_continuation.continue_task(conn, tid, checkpoint="halfway")["ok"]
++
++
++def _reopen(conn, tid, parent):
++    result = kb.invalidate_descendants_for_parent_reopen(conn, parent, author="operator")
++    return [i["id"] for i in result["invalidated"]] == [tid]
++
++
++# Every run-ending transition that calls note() (schedule has its own test above): name -> (the run it
++# ends, the transition). Removing any one note() call turns its case red.
++_RUN_ENDS = {
++    "block": (_plain_run, lambda c, t, _: kb.block_task(c, t, reason="needs an answer", kind="time",
++                                                       clock_only=True)),
++    "complete": (_plain_run, lambda c, t, _: kb.complete_task(c, t, summary="done")),
++    "review": (_plain_run, lambda c, t, _: kb.request_review(c, t, summary="please review")),
++    "continue": (_plain_run, _continue),
++    "request_changes": (_review_run, lambda c, t, _: kb.request_changes(c, t, reason="fix it")[0]),
++    "archive": (_plain_run, lambda c, t, _: kb.archive_task(c, t, signal_fn=lambda *a, **k: None)),
++    "reopen": (_reopened_descendant, _reopen),
++}
++
++
++@pytest.mark.parametrize("end", sorted(_RUN_ENDS))
++def test_every_holder_run_end_releases_the_run_lease(primary, lease_client, end):
++    setup, transition = _RUN_ENDS[end]
++    tid, run_uid, ctx = setup(primary, lease_client)
+     _stall_outbox(primary)
+-    if end == "block":
+-        assert kb.block_task(primary, tid, reason="needs an answer", kind="time", clock_only=True)
+-    elif end == "complete":
+-        assert kb.complete_task(primary, tid, summary="done")
+-    elif end == "review":
+-        assert kb.request_review(primary, tid, summary="please review")
+-    else:
+-        from hermes_cli import kanban_continuation
+-        assert kanban_continuation.continue_task(primary, tid, checkpoint="halfway")["ok"]
+-    assert [r["run_uid"] for r in _releases(lease_client)] == [run_uid]
++    lease_client.calls.clear()
++    assert transition(primary, tid, ctx)
++    run = primary.execute("SELECT ended_at FROM task_runs WHERE uid = ?", (run_uid,)).fetchone()
++    assert run["ended_at"] is not None
++    assert [(r["task_uid"], r["run_uid"]) for r in _releases(lease_client)] == [(tid, run_uid)]
+ 
+ 
+ @pytest.mark.parametrize("error", [sync.LeaseUnavailable("connection refused"), RuntimeError("bad answer")])
+-- 
+2.51.0
+

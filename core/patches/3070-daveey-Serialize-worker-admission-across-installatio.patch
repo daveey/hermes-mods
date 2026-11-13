@@ -1,0 +1,418 @@
+From b39d757ae7c9ff0ad4c2b6a147874443adf5f9fa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:00:11 +0000
+Subject: [PATCH] [daveey] Serialize worker admission across installation roots
+
+---
+ hermes_cli/kanban_admission.py                | 41 +++++++--
+ hermes_cli/machine_metrics.py                 |  4 +-
+ hermes_cli/worker_account_boards.py           | 66 +++++++++++++
+ hermes_cli/worker_resource_admission.py       | 12 ++-
+ .../test_worker_account_admission.py          | 92 +++++++++++++++++++
+ .../hermes_cli/test_worker_account_boards.py  | 54 +++++++++++
+ .../test_worker_resource_admission.py         | 23 +++++
+ 7 files changed, 280 insertions(+), 12 deletions(-)
+ create mode 100644 hermes_cli/worker_account_boards.py
+ create mode 100644 tests/hermes_cli/test_worker_account_admission.py
+ create mode 100644 tests/hermes_cli/test_worker_account_boards.py
+
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index a8a0f642c1..3626d2279d 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -141,8 +141,17 @@ def _final_hub_gate(gate, started=None, *, conn=None, task_id=None):
+ 
+     echo = getattr(gate, "echo", None)
+     from hermes_cli.worker_resource_admission import refusal
+-    if reason := refusal(echo):
++    from hermes_cli.worker_compute_capacity import worker_enabled
++    try:
++        worker = worker_enabled()
++    except Exception:  # health: allow BLE001 -- malformed worker policy refuses admission
++        return "worker_resources_unknown", None
++    if worker and not getattr(_decision, "worker_fenced", True):
++        return "worker_resources_unknown", None
++    if reason := refusal(echo, enabled=worker):
+         return reason, None
++    if worker and (_expired(gate) or _over_budget(started)):
++        return "worker_resources_unknown", None
+     state, limit = cpu.root_limit()
+     if state == cpu.OFF:
+         return None, None
+@@ -331,10 +340,25 @@ def claim_transaction(conn, *, task_id=None, gate=None):
+     with contextlib.ExitStack() as stack:
+         with write_txn(conn):
+             try:
+-                root = stack.enter_context(admission_lock(get_default_hermes_root(), timeout=0))
++                from hermes_cli import worker_compute_capacity as capacity
++                installation = Path(get_default_hermes_root()).resolve()
+                 started = time.monotonic()
+-                held = is_held(root)
+-                waiting = not held and turns_waiting(root)
++                # Account policy must serialize different HERMES_HOME installs.
++                # Both locks are nonblocking while the DB writer is held; the
++                # stack retains them THROUGH commit/rollback. Preserve each
++                # installation's updater fence and avoid taking one lock twice.
++                roots = [installation]
++                worker = capacity.worker_enabled()
++                if worker:
++                    account = capacity.policy_root().resolve()
++                    if account != installation:
++                        roots.insert(0, account)
++                fences = [stack.enter_context(admission_lock(home, timeout=0)) for home in roots]
++                held = any(is_held(root) for root in fences)
++                waiting = not held and any(turns_waiting(root) for root in fences)
++                if not held and not waiting and worker:
++                    from hermes_cli.worker_account_boards import register
++                    register(conn)
+             except AdmissionBusy:
+                 # [daveey] Designed contention: another claimer (or hermes-sync) holds admission.lock
+                 # through its commit. A normal defer, not a failure: no WARNING/traceback, which the
+@@ -342,7 +366,7 @@ def claim_transaction(conn, *, task_id=None, gate=None):
+                 logging.getLogger(__name__).info("Update admission lock busy; deferring Kanban claim to the next tick")
+                 yield False
+                 return
+-            except (OSError, TimeoutError):
++            except Exception:  # health: allow BLE001 -- malformed account policy/inventory must fail closed
+                 logging.getLogger(__name__).warning("Update admission unavailable; deferring Kanban claim", exc_info=True)
+                 yield False
+                 return
+@@ -361,7 +385,12 @@ def claim_transaction(conn, *, task_id=None, gate=None):
+             _bind_echo(conn, task_id, gate)
+             _decision.counts = None
+             _decision.pool = "regular"
+-            reason, evidence = _final_hub_gate(gate, started, conn=conn, task_id=task_id)
++            previous_fenced = getattr(_decision, "worker_fenced", True)
++            _decision.worker_fenced = worker
++            try:
++                reason, evidence = _final_hub_gate(gate, started, conn=conn, task_id=task_id)
++            finally:
++                _decision.worker_fenced = previous_fenced
+             if reason is not None:
+                 logging.getLogger(__name__).info("Hub admission refused Kanban claim %s: %s %s", task_id, reason,
+                                                  getattr(_decision, "counts", None) or {})
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index d063e2c248..7be71f997f 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -70,7 +70,7 @@ def _mem_used_pct() -> Optional[float]:
+     return None
+ 
+ 
+-def active_card_runs(exclude=None, detail: Optional[dict] = None, *, owner_output=None) -> Optional[int]:
++def active_card_runs(exclude=None, detail: Optional[dict] = None, *, owner_output=None, extra_paths=()) -> Optional[int]:
+     """All profiles share the kanban root. Count its execution boards, not replicas.
+ 
+     Unreadable/schema-unknown boards invalidate the whole sample. Conservative
+@@ -86,7 +86,7 @@ def active_card_runs(exclude=None, detail: Optional[dict] = None, *, owner_outpu
+ 
+     try:
+         default = kb.kanban_home() / "kanban.db"
+-        paths = [default, *(p for _, p in named_board_db_files())]
++        paths = [default, *(p for _, p in named_board_db_files()), *extra_paths]
+         total = excluded = 0
+         owners = set()
+         seen = set()
+diff --git a/hermes_cli/worker_account_boards.py b/hermes_cli/worker_account_boards.py
+new file mode 100644
+index 0000000000..7a6c804e90
+--- /dev/null
++++ b/hermes_cli/worker_account_boards.py
+@@ -0,0 +1,66 @@
++"""Account-wide inventory of execution DBs admitted by worker installations.
++
++Registration happens under account admission.lock before the final gate. Records
++survive process exits: a parked dispatcher is not evidence its running rows or
++jobs vanished. Missing registered DBs are unknown, never silently free capacity.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++from pathlib import Path
++import os
++import tempfile
++
++from hermes_cli import worker_compute_capacity as capacity
++
++
++def register(conn) -> None:
++    from hermes_cli.kanban_db_connect import _main_db_file
++    raw = _main_db_file(conn)
++    if not raw:
++        raise ValueError('worker admission requires a file-backed board')
++    path = Path(raw).resolve(strict=True)
++    directory = capacity.policy_root() / 'worker-resources' / 'boards'
++    directory.mkdir(parents=True, exist_ok=True)
++    destination = directory / (hashlib.sha256(str(path).encode()).hexdigest() + '.json')
++    if destination.exists():
++        if json.loads(destination.read_text(encoding='utf-8')) != str(path):
++            raise ValueError('invalid registered board')
++        return
++    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=directory, delete=False) as handle:
++        temporary = Path(handle.name)
++        json.dump(str(path), handle)
++        handle.flush()
++        os.fsync(handle.fileno())
++    try:
++        os.replace(temporary, destination)
++    finally:
++        temporary.unlink(missing_ok=True)
++
++
++def paths() -> list[Path]:
++    root = capacity.policy_root()
++    found = []
++    # Account installation boards count even before their first new claim.
++    default = root / 'kanban.db'
++    if default.exists():
++        found.append(default)
++    boards = root / 'kanban' / 'boards'
++    if boards.exists():
++        from hermes_cli import kanban_db as kb
++        found.extend(child / 'kanban.db' for child in boards.iterdir()
++                     if kb._BOARD_SLUG_RE.match(child.name) and (child / 'kanban.db').is_file())
++    directory = root / 'worker-resources' / 'boards'
++    if directory.exists():
++        for record in directory.iterdir():
++            if record.suffix != '.json':
++                continue
++            raw = json.loads(record.read_text(encoding='utf-8'))
++            if not isinstance(raw, str) or not Path(raw).is_absolute():
++                raise ValueError('invalid registered board path')
++            if record.stem != hashlib.sha256(raw.encode()).hexdigest():
++                raise ValueError('invalid registered board identity')
++            Path(raw).stat()  # disappearance is unknown, including default boards
++            found.append(Path(raw))
++    return found
+diff --git a/hermes_cli/worker_resource_admission.py b/hermes_cli/worker_resource_admission.py
+index fa32262479..24bbefd6c4 100644
+--- a/hermes_cli/worker_resource_admission.py
++++ b/hermes_cli/worker_resource_admission.py
+@@ -60,10 +60,10 @@ def pool_occupancy(pool: Path, owners, active):
+     return capacity.occupied_owners(pool, owners, active)
+ 
+ 
+-def refusal(echo=None) -> str | None:
++def refusal(echo=None, *, enabled=None) -> str | None:
+     """Pre-lease and final-lock check. Unknown observations fail closed."""
+     try:
+-        if not capacity.worker_enabled():
++        if not (capacity.worker_enabled() if enabled is None else enabled):
+             return None
+         directory = capacity.policy_root() / 'worker-resources'
+         if _pressure(directory):
+@@ -71,7 +71,8 @@ def refusal(echo=None) -> str | None:
+         from hermes_cli import machine_metrics
+         from hermes_cli.kanban_admission import _root_max_in_progress
+         active_owners = set()
+-        active = machine_metrics.active_card_runs(exclude=echo, owner_output=active_owners)
++        from hermes_cli.worker_account_boards import paths
++        active = machine_metrics.active_card_runs(exclude=echo, owner_output=active_owners, extra_paths=paths())
+         ok, cap = _root_max_in_progress(root=capacity.policy_root())
+         if active is None or not ok or cap is None:
+             return 'worker_resources_unknown'
+@@ -88,7 +89,10 @@ def refusal(echo=None) -> str | None:
+                     raise ValueError('invalid worker owner map')
+                 owners[path.stem] = tuple(owner)
+         occupied = pool_occupancy(capacity.pool_path(), owners, active_owners)
+-        if len(occupied) >= cap:
++        # Distinct installations can contain copied board/task IDs. Until a
++        # cgroup supplies canonical custody, never collapse their running rows.
++        occupied_count = len(occupied) + max(0, active - len(active_owners))
++        if occupied_count >= cap:
+             return 'worker_capacity_full'
+         return None
+     except Exception:  # health: allow BLE001 -- any unreadable policy/controller must refuse claims
+diff --git a/tests/hermes_cli/test_worker_account_admission.py b/tests/hermes_cli/test_worker_account_admission.py
+new file mode 100644
+index 0000000000..e03178fe31
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_account_admission.py
+@@ -0,0 +1,92 @@
++"""Account capacity serializes installation roots through real SQL commit."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import admission_fence as fence
++from hermes_cli import kanban_admission as admission
++from hermes_cli import worker_compute_capacity as capacity
++
++
++@pytest.fixture
++def account(monkeypatch, tmp_path):
++    root = tmp_path / 'account'
++    root.mkdir()
++    monkeypatch.setattr(capacity, 'policy_root', lambda: root)
++    monkeypatch.setattr(capacity, 'worker_enabled', lambda: True)
++    monkeypatch.setattr(admission, '_final_hub_gate', lambda *a: (None, None))
++    return root
++
++
++def connection(path):
++    conn = sqlite3.connect(path)
++    conn.execute('CREATE TABLE sample (value INTEGER)')
++    conn.commit()
++    return conn
++
++
++def test_two_installations_share_account_lock_through_commit(account, monkeypatch, tmp_path):
++    import hermes_constants
++    first = connection(tmp_path / 'one.db')
++    second = connection(tmp_path / 'two.db')
++    try:
++        monkeypatch.setattr(hermes_constants, 'get_default_hermes_root', lambda: tmp_path / 'install-one')
++        with admission.claim_transaction(first) as accepted:
++            assert accepted
++            first.execute('INSERT INTO sample VALUES (1)')
++            monkeypatch.setattr(hermes_constants, 'get_default_hermes_root', lambda: tmp_path / 'install-two')
++            with admission.claim_transaction(second) as other:
++                assert not other
++            with pytest.raises(fence.AdmissionBusy):
++                with fence.admission_lock(account, timeout=0):
++                    pass
++        with fence.admission_lock(account, timeout=0):
++            assert first.execute('SELECT * FROM sample').fetchall() == [(1,)]
++        with admission.claim_transaction(second) as accepted:
++            assert accepted
++    finally:
++        first.close()
++        second.close()
++
++
++def test_account_lock_released_after_rollback(account, monkeypatch, tmp_path):
++    import hermes_constants
++    monkeypatch.setattr(hermes_constants, 'get_default_hermes_root', lambda: tmp_path / 'installation')
++    conn = connection(tmp_path / 'rollback.db')
++    try:
++        with pytest.raises(RuntimeError, match='rollback'):
++            with admission.claim_transaction(conn) as accepted:
++                assert accepted
++                conn.execute('INSERT INTO sample VALUES (1)')
++                raise RuntimeError('rollback')
++        assert conn.execute('SELECT * FROM sample').fetchall() == []
++        with fence.admission_lock(account, timeout=0):
++            pass
++    finally:
++        conn.close()
++
++
++def test_same_account_and_installation_does_not_self_contend(account, monkeypatch, tmp_path):
++    import hermes_constants
++    monkeypatch.setattr(hermes_constants, 'get_default_hermes_root', lambda: account)
++    conn = connection(tmp_path / 'same.db')
++    try:
++        with admission.claim_transaction(conn) as accepted:
++            assert accepted
++    finally:
++        conn.close()
++
++
++def test_installation_update_hold_still_refuses(account, monkeypatch, tmp_path):
++    import hermes_constants
++    root = tmp_path / 'installation'
++    marker = root / 'core-update' / 'holds' / 'hermes-sync'
++    marker.parent.mkdir(parents=True)
++    marker.touch()
++    monkeypatch.setattr(hermes_constants, 'get_default_hermes_root', lambda: root)
++    conn = connection(tmp_path / 'held.db')
++    try:
++        with admission.claim_transaction(conn) as accepted:
++            assert not accepted
++    finally:
++        conn.close()
+diff --git a/tests/hermes_cli/test_worker_account_boards.py b/tests/hermes_cli/test_worker_account_boards.py
+new file mode 100644
+index 0000000000..5fd5f2b1f0
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_account_boards.py
+@@ -0,0 +1,54 @@
++"""Registered installation boards remain visible across dispatcher roots."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import worker_account_boards as inventory
++from hermes_cli import worker_compute_capacity as capacity
++from hermes_cli import machine_metrics, kanban_db as kb
++
++
++def test_registered_foreign_board_counts_after_installation_changes(monkeypatch, tmp_path):
++    account = tmp_path / 'account'
++    account.mkdir()
++    monkeypatch.setattr(capacity, 'policy_root', lambda: account)
++    foreign = tmp_path / 'foreign' / 'kanban.db'
++    foreign.parent.mkdir()
++    conn = sqlite3.connect(foreign)
++    conn.execute('CREATE TABLE tasks (id TEXT, status TEXT)')
++    conn.execute("INSERT INTO tasks VALUES ('t_foreign', 'running')")
++    conn.commit()
++    try:
++        inventory.register(conn)
++        inventory.register(conn)
++        monkeypatch.setattr(kb, 'kanban_home', lambda: account)
++        monkeypatch.setattr('hermes_cli.kanban_db_boards.named_board_db_files', list)
++        owners = set()
++        assert machine_metrics.active_card_runs(extra_paths=inventory.paths(), owner_output=owners) == 1
++        assert owners == {('default', 't_foreign')}
++        assert machine_metrics.active_card_runs(extra_paths=[foreign, foreign]) == 1
++    finally:
++        conn.close()
++    foreign.unlink()
++    with pytest.raises(FileNotFoundError):
++        inventory.paths()
++
++
++@pytest.mark.parametrize('raw', ['{broken', '7', '"relative.db"'])
++def test_corrupt_inventory_fails_closed(monkeypatch, tmp_path, raw):
++    monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path)
++    records = tmp_path / 'worker-resources' / 'boards'
++    records.mkdir(parents=True)
++    (records / 'bad.json').write_text(raw)
++    with pytest.raises(ValueError):
++        inventory.paths()
++
++
++def test_unregistered_account_boards_count(monkeypatch, tmp_path):
++    monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path)
++    default = tmp_path / 'kanban.db'
++    default.touch()
++    named = tmp_path / 'kanban' / 'boards' / 'other' / 'kanban.db'
++    named.parent.mkdir(parents=True)
++    named.touch()
++    assert set(inventory.paths()) == {default, named}
+diff --git a/tests/hermes_cli/test_worker_resource_admission.py b/tests/hermes_cli/test_worker_resource_admission.py
+index e15bddab8d..6f634a3607 100644
+--- a/tests/hermes_cli/test_worker_resource_admission.py
++++ b/tests/hermes_cli/test_worker_resource_admission.py
+@@ -130,3 +130,26 @@ def test_worker_brake_is_not_bypassed_by_disabled_hub(monkeypatch, tmp_path):
+     assert admission._final_hub_gate(None)[0] == 'worker_load_pressure'
+     state = tmp_path / 'worker-resources' / 'pressure.json'
+     assert json.loads(state.read_text())['held'] is True
++
++
++@pytest.mark.parametrize('expired,slow', [(True, False), (False, True), (False, False)])
++def test_worker_only_final_deadline_and_budget(worker_rig, monkeypatch, expired, slow):
++    import time
++    from types import SimpleNamespace
++    from hermes_cli import machine_cpu_metrics as cpu
++    monkeypatch.setattr(cpu, 'root_limit', lambda: (cpu.OFF, None))
++    gate = SimpleNamespace(expires=time.time() + (-10 if expired else 60))
++    started = time.monotonic() - (10 if slow else 0)
++    reason, _ = admission._final_hub_gate(gate, started)
++    assert reason == ('worker_resources_unknown' if expired or slow else None)
++
++
++def test_policy_enabled_after_lock_selection_refuses(worker_rig, monkeypatch):
++    from hermes_cli import machine_cpu_metrics as cpu
++    rig, _ = worker_rig
++    monkeypatch.setattr(cpu, 'root_limit', lambda: (cpu.OFF, None))
++    observations = iter([False, True])
++    monkeypatch.setattr(capacity, 'worker_enabled', lambda: next(observations))
++    with admission.claim_transaction(rig.conn) as accepted:
++        assert not accepted
++
+-- 
+2.51.0
+

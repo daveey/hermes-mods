@@ -1,0 +1,176 @@
+From 6b9a9d690b92d956844a29ef00aa01818ef824e2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:56:38 +0000
+Subject: [PATCH] [daveey] fix(kanban): completion_receipt text fields
+ advertise the writer's nonblank, no-control pattern
+
+PR #2015 review nit 1: every receipt text field advertised only minLength:1, but
+hermes_completion_receipt._text also refuses whitespace-only values and C0 control
+characters (other than tab/newline), so a strictly validating client could still build
+`board: " "` and have the card writer refuse it.
+
+hermes_completion_receipt.TEXT_PATTERN is now the single rule: _text fullmatches it, and
+tools/kanban_tools_schemas.py advertises it as `pattern` on every _text field (scope,
+superseded_by, evidence.ref/observed_at, remaining.scope/owner/reason and the text keys
+of evidence.operator_delivery), so schema and writer cannot drift. It uses only anchors,
+character classes and \x/\u escapes, which Python re, ECMA-262 and llama.cpp's
+json-schema-to-grammar pattern converter all accept.
+
+Tests: whitespace-only (ASCII and Unicode) and control-char values fail every advertised
+text field schema under Draft 2020-12 (red before); TEXT_PATTERN equals the old
+strip()/control rule for every BMP character, alone and padded.
+---
+ hermes_completion_receipt.py                  | 16 +++--
+ .../test_kanban_complete_receipt_schema.py    | 59 +++++++++++++++++++
+ tools/kanban_tools_schemas.py                 | 12 ++--
+ 3 files changed, 78 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_completion_receipt.py b/hermes_completion_receipt.py
+index 41a6b37c13..bd65c5c95c 100644
+--- a/hermes_completion_receipt.py
++++ b/hermes_completion_receipt.py
+@@ -25,6 +25,14 @@ OPERATOR_DELIVERY_FIELDS: tuple[str, ...] = (
+     "request_uid", "target_task_id", "board", "caller_task_id", "caller_run_uid",
+     "caller_gateway", "executor_gateway", "comment_id", "content_sha256", "result_event_uid")
+ OPERATOR_DELIVERY_TEXT_MAX = 128
++# Every _text field: no C0 control but tab/newline, and not all str.isspace() (what strip() removes). One regex both
++# _text and the advertised JSON-schema `pattern` (tools/kanban_tools_schemas.py) read, so they cannot drift; anchors,
++# character classes and \x/\u escapes only, valid in Python re, ECMA-262 and llama.cpp's grammar converter.
++_CONTROL = "\\x00-\\x08\\x0b-\\x1f"
++_BLANK = "\\t\\n\\x20\\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000"  # isspace() minus _CONTROL
++TEXT_PATTERN = f"^[^{_CONTROL}]*[^{_CONTROL}{_BLANK}][^{_CONTROL}]*$"
++_TEXT = re.compile(TEXT_PATTERN)
++_CONTROL_CHAR = re.compile(f"[{_CONTROL}]")
+ _QUALIFIED_OWNER = re.compile(r"@(task|session):[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+/[^\s/@]+\Z")
+ 
+ 
+@@ -35,11 +43,11 @@ def _object(value: Any, required: set[str], optional: set[str] | None = None) ->
+ 
+ 
+ def _text(value: Any, name: str, limit: int = MAX_TEXT) -> str:
+-    if not isinstance(value, str) or not value.strip() or len(value) > limit:
+-        raise ValueError(f"completion_receipt: {name} needs nonempty text of at most {limit} characters")
+-    if any(ord(c) < 32 and c not in "\n\t" for c in value):
++    if isinstance(value, str) and len(value) <= limit and _TEXT.fullmatch(value):
++        return value
++    if isinstance(value, str) and _CONTROL_CHAR.search(value):
+         raise ValueError(f"completion_receipt: {name} contains control characters")
+-    return value
++    raise ValueError(f"completion_receipt: {name} needs nonempty text of at most {limit} characters")
+ 
+ 
+ def _enum(value: Any, choices: tuple[str, ...], name: str) -> str:
+diff --git a/tests/tools/test_kanban_complete_receipt_schema.py b/tests/tools/test_kanban_complete_receipt_schema.py
+index eb25543cf8..dc69181677 100644
+--- a/tests/tools/test_kanban_complete_receipt_schema.py
++++ b/tests/tools/test_kanban_complete_receipt_schema.py
+@@ -126,3 +126,62 @@ def test_operator_delivery_schema_is_the_validators_strict_shape():
+         assert props[key]["type"] == "string" and props[key]["minLength"] == 1 and limit < 2000
+         assert _admits({**_DELIVERY, key: "x" * limit}) and not _admits({**_DELIVERY, key: "x" * (limit + 1)})
+         assert not _admits({**_DELIVERY, key: ""})
++
++
++def _text_field_schemas():
++    """(path, schema) of every receipt string field whose writer check is ``_text``."""
++    item = _receipt_schema()["properties"]["items"]["items"]["properties"]
++    evidence = _evidence_schema()["properties"]
++    remaining = item["remaining"]["items"]["properties"]
++    delivery = evidence["operator_delivery"]["properties"]
++    fields = {"scope": item["scope"], "superseded_by": item["superseded_by"], "evidence.ref": evidence["ref"],
++              "evidence.observed_at": evidence["observed_at"], "remaining.scope": remaining["scope"],
++              "remaining.owner": remaining["owner"], "remaining.reason": remaining["reason"]}
++    fields.update({f"operator_delivery.{key}": schema for key, schema in delivery.items() if key != "comment_id"})
++    return fields
++
++
++def test_text_fields_advertise_the_writers_nonblank_no_control_rule():
++    # PR #2015 review nit: minLength:1 alone lets a strictly validating client build `board: " "` or a ref with a
++    # control character, which _text refuses at write time. Every _text field must refuse them in the schema too.
++    from jsonschema.validators import Draft202012Validator
++
++    fields = _text_field_schemas()
++    assert len(fields) == 16
++    refused = [" ", "   ", "\t\n", "\u3000", "\u00a0", "ok\x00", "ok\x1b[0m", "a\rb", "\x0b"]
++    for path, schema in fields.items():
++        check = Draft202012Validator(schema)
++        for value in refused:
++            assert not check.is_valid(value), (path, value)
++    for path, schema in fields.items():
++        if path.startswith("operator_delivery.") or path in ("evidence.observed_at", "remaining.owner"):
++            continue  # their own length/format bounds; the shared pattern is still asserted below
++        check = Draft202012Validator(schema)
++        for value in ("x", " padded\tline\none ", "caf\u00e9 \u2014 \U0001f600", "a\x7fb"):
++            assert check.is_valid(value), (path, value)
++    for path, schema in fields.items():
++        assert schema.get("pattern") == (
++            "^[0-9a-f]{64}$" if path == "operator_delivery.content_sha256" else hcr.TEXT_PATTERN), path
++
++
++def test_text_pattern_is_exactly_the_writers_text_rule():
++    # _text reads the same constant; prove it still means "no C0 control but tab/newline, not all str.isspace()"
++    # for every BMP character, alone and padded, so the advertised pattern is the writer's real rule.
++    import re
++
++    rule = re.compile(hcr.TEXT_PATTERN)
++    for code in range(0x10000):
++        c = chr(code)
++        control = code < 32 and c not in "\n\t"
++        assert bool(rule.fullmatch(c)) == (not control and not c.isspace()), hex(code)
++        assert bool(rule.fullmatch(f" {c}\t")) == (not control and not c.isspace()), hex(code)
++        assert bool(rule.fullmatch(f"x{c}")) == (not control), hex(code)
++    for value, why in ((" ", "nonempty text"), ("\u3000", "nonempty text"), ("ok\x01", "control characters"),
++                       ("\n\t", "nonempty text")):
++        try:
++            hcr._text(value, "f")
++        except ValueError as exc:
++            assert why in str(exc), (value, exc)
++            continue
++        raise AssertionError(f"_text admitted {value!r}")
++    assert hcr._text("a\tb\nc", "f") == "a\tb\nc"
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index ce4c06aaef..3beb7b75ec 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -103,7 +103,8 @@ KANBAN_LIST_SCHEMA = _schema(
+ 
+ def _operator_delivery_schema() -> dict[str, Any]:
+     """evidence.operator_delivery as the validator admits it: exactly hcr.OPERATOR_DELIVERY_FIELDS."""
+-    text = {"type": "string", "minLength": 1, "maxLength": hcr.OPERATOR_DELIVERY_TEXT_MAX}
++    text = {"type": "string", "minLength": 1, "maxLength": hcr.OPERATOR_DELIVERY_TEXT_MAX,
++            "pattern": hcr.TEXT_PATTERN}
+     special = {"comment_id": {"type": "integer", "minimum": 1},
+                "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+     return {
+@@ -125,8 +126,8 @@ def _completion_receipt_schema() -> dict[str, Any]:
+                        "reason": "not in this card's scope"}]}]}
+     # No maxLength: llama.cpp's grammar converter rejects any bound >= 2000 (MAX_TEXT, MAX_REF) and refuses the
+     # whole request; the card writer enforces the caps, and the description states them.
+-    text = {"type": "string", "minLength": 1}
+-    ref = {"type": "string", "minLength": 1}
++    text = {"type": "string", "minLength": 1, "pattern": hcr.TEXT_PATTERN}
++    ref = {"type": "string", "minLength": 1, "pattern": hcr.TEXT_PATTERN}
+     return {
+         "type": "object", "additionalProperties": False, "required": ["version", "items"],
+         "description": (
+@@ -156,7 +157,8 @@ def _completion_receipt_schema() -> dict[str, Any]:
+                         "required": ["ref", "observed_at", "verification"],
+                         "properties": {
+                             "ref": ref,
+-                            "observed_at": {"type": "string", "maxLength": 64, "description": (
++                            "observed_at": {"type": "string", "maxLength": 64, "pattern": hcr.TEXT_PATTERN,
++                                            "description": (
+                                 "ISO-8601 with timezone, e.g. 2026-11-13T06:40:00+00:00")},
+                             "verification": {"type": "string", "enum": list(hcr.VERIFICATIONS)},
+                             "operator_delivery": _operator_delivery_schema(),
+@@ -167,7 +169,7 @@ def _completion_receipt_schema() -> dict[str, Any]:
+                         "properties": {
+                             "scope": text,
+                             "state": {"type": "string", "enum": ["pending", "deferred"]},
+-                            "owner": {"type": ["string", "null"]},
++                            "owner": {"type": ["string", "null"], "pattern": hcr.TEXT_PATTERN},
+                             "reason": text,
+                         }}},
+                 }}},
+-- 
+2.51.0
+

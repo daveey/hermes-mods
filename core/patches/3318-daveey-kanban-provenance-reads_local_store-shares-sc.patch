@@ -1,0 +1,239 @@
+From be71cb93e77ec8148b018888816b7dd4142f4bb9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:08:04 +0000
+Subject: [PATCH] [daveey] kanban provenance: reads_local_store shares
+ scoped_sources' routing; pin the unnamed-host replica premise
+
+Follow-up to PR #2013 review nits (t_01a1d41a82ced7d9).
+
+1. reads_local_store claimed "the same rule" as scoped_sources but over-approximated:
+   an empty ref, a qualified ref with an empty sid, or a gw/profile/sid ref whose
+   outer gateway/profile contradicts the scope was reported as a read, while
+   scoped_sources answers those unknown without one (a map miss then failed closed:
+   safe, but not the documented rule). Both now share one helper (_local_scope), and
+   reads_local_store takes the profile scope; machine_verdicts and LinkVerdicts pass it.
+   Test: for a mixed corpus x gateway x profile x local name, reads_local_store is
+   true exactly when scoped_sources opens a home (RED at base: 12 cases).
+
+2. LinkVerdicts.read leaves the replica unopened without a hub.db gateway name. Kept,
+   with the premise now stated and tested: chat_gateway is NOT NULL in the synced
+   schema (no bare replica link exists), and with no local name scoped_sources
+   answers every named ref without a read, so a map miss gets the per-row verdict
+   and no state.db read under write_txn. Opening the replica there would also break
+   the all-local laziness test_all_local_backfill_never_opens_replica pins.
+---
+ hermes_cli/kanban_creator_chats.py            |  8 +-
+ hermes_cli/kanban_session_provenance.py       | 51 ++++++-----
+ .../test_kanban_chat_links_bulk_provenance.py | 90 +++++++++++++++++++
+ 3 files changed, 125 insertions(+), 24 deletions(-)
+
+diff --git a/hermes_cli/kanban_creator_chats.py b/hermes_cli/kanban_creator_chats.py
+index a4a4028408..003f7b1e34 100644
+--- a/hermes_cli/kanban_creator_chats.py
++++ b/hermes_cli/kanban_creator_chats.py
+@@ -293,7 +293,7 @@ class LinkVerdicts:
+         hit = self.verdicts.get((gateway, profile, str(session or "")))
+         if hit is not None:
+             return hit
+-        if reads_local_store(gateway, session, local_gateway=self.local_gateway):
++        if reads_local_store(gateway, session, local_gateway=self.local_gateway, profile=profile):
+             return True
+         return is_machine_session(gateway, session, local_gateway=self.local_gateway, profile=profile)
+ 
+@@ -305,8 +305,10 @@ class LinkVerdicts:
+         from hermes_cli.kanban_session_provenance import machine_verdicts
+         me = gateway_names()[0]
+         keys: dict[tuple, None] = {}
+-        # Without a gateway name nothing here is synced: links of named gateways need no read, and the replica
+-        # stays unopened until a creator is missing locally (``_ReplicaReader``).
++        # Without a gateway name the replica stays unopened until a creator is missing locally (``_ReplicaReader``):
++        # its links all name a gateway (``chat_gateway`` is NOT NULL in the synced schema), and with no local name
++        # ``scoped_sources`` answers every such ref unknown without a read, so a lookup that misses this map gets
++        # the same verdict with no state.db read (t_01a1d41a82ced7d9).
+         for db in (conn, replica_reader.open() if me else None):
+             try:
+                 if db is None or not db.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
+diff --git a/hermes_cli/kanban_session_provenance.py b/hermes_cli/kanban_session_provenance.py
+index 5d512b8fac..711c4419d1 100644
+--- a/hermes_cli/kanban_session_provenance.py
++++ b/hermes_cli/kanban_session_provenance.py
+@@ -84,6 +84,25 @@ def _local_homes(profile: Optional[str]) -> list[Path]:
+     return list(dict.fromkeys([get_hermes_home(), *(get_profile_dir(p) for p in list_profile_names())]))
+ 
+ 
++def _local_scope(gateway: Any, profile: Any, ref: str, me: Any) -> Optional[tuple[Any, str]]:
++    """``(profile, sid)`` when :func:`scoped_sources` looks ``ref`` up in this host's state.db, else None (answered
++    unknown without a read): a malformed or empty ref, a ``gw/profile/sid`` ref whose outer gateway or profile
++    contradicts the scope, or another gateway's ref. [daveey]"""
++    parts = ref.split("/")
++    gw, prof = gateway, profile
++    if len(parts) == 3:
++        gw, prof, sid = parts
++        if (gateway is not None and gateway != gw) or (profile is not None and profile != prof):
++            return None
++    elif len(parts) == 1:
++        sid = ref
++    else:
++        return None
++    if not sid or (gw is not None and (not me or gw != me)):
++        return None
++    return prof, sid
++
++
+ def scoped_sources(gateway: Any, sessions: Iterable[Any], *, local_gateway=None, profile=None) -> dict[str, Optional[str]]:
+     """No network lookup: foreign/ambiguous provenance is unknown, never human proof."""
+     from hermes_cli.kanban_origin import gateway_names
+@@ -91,19 +110,8 @@ def scoped_sources(gateway: Any, sessions: Iterable[Any], *, local_gateway=None,
+     grouped: dict[Optional[str], dict[str, str]] = {}
+     out: dict[str, Optional[str]] = {str(s or ""): None for s in sessions}
+     for ref in out:
+-        parts = ref.split("/")
+-        gw, prof = gateway, profile
+-        if len(parts) == 3:
+-            gw, prof, sid = parts
+-            if (gateway is not None and gateway != gw) or (profile is not None and profile != prof):
+-                continue
+-        elif len(parts) == 1:
+-            sid = ref
+-        else:
+-            continue
+-        if not sid or (gw is not None and (not me or gw != me)):
+-            continue
+-        grouped.setdefault(prof, {})[ref] = sid
++        if (scope := _local_scope(gateway, profile, ref, me)) is not None:
++            grouped.setdefault(scope[0], {})[ref] = scope[1]
+     for prof, refs in grouped.items():
+         observations = [_local_session_sources(refs.values(), home=home) for home in _local_homes(prof)]
+         for ref, sid in refs.items():
+@@ -128,12 +136,12 @@ def prefetch_sources(refs: Iterable[Any], *, local_gateway=None) -> None:
+             _local_session_sources(sids, home=home)
+ 
+ 
+-def reads_local_store(gateway: Any, session: Any, *, local_gateway: Any) -> bool:
+-    """Whether :func:`scoped_sources` may open a state.db for ``session`` scoped to ``gateway`` (the same rule it
+-    applies): only another gateway's ref is answered unknown without a read. [daveey]"""
+-    parts = str(session or "").split("/")
+-    gw = parts[0] if len(parts) == 3 else gateway
+-    return len(parts) in (1, 3) and (gw is None or bool(local_gateway and gw == local_gateway))
++def reads_local_store(gateway: Any, session: Any, *, local_gateway: Any, profile: Any = None) -> bool:
++    """Whether :func:`scoped_sources` (``local_gateway=local_gateway, profile=profile``) may open a state.db for
++    ``session`` scoped to ``gateway``. It shares that function's routing (:func:`_local_scope`), so a ref answered
++    unknown without a read (another gateway's, or a qualified ref whose outer gateway/profile contradicts the
++    scope) is never reported as a read. [daveey]"""
++    return _local_scope(gateway, profile, str(session or ""), local_gateway) is not None
+ 
+ 
+ def machine_verdicts(keys: Iterable[tuple[Any, Any, Any]], *, local_gateway) -> dict[tuple, bool]:
+@@ -144,8 +152,9 @@ def machine_verdicts(keys: Iterable[tuple[Any, Any, Any]], *, local_gateway) ->
+     groups: dict[tuple, list[str]] = {}
+     for gw, prof, session in keys:
+         groups.setdefault((gw, prof), []).append(str(session or ""))
+-    prefetch_sources([s for (gw, _p), refs in groups.items() for s in refs
+-                      if reads_local_store(gw, s, local_gateway=local_gateway)], local_gateway=local_gateway)
++    prefetch_sources([s for (gw, prof), refs in groups.items() for s in refs
++                      if reads_local_store(gw, s, local_gateway=local_gateway, profile=prof)],
++                     local_gateway=local_gateway)
+     out: dict[tuple, bool] = {}
+     for (gw, prof), refs in groups.items():
+         machine = machine_sessions(gw, refs, local_gateway=local_gateway, profile=prof)
+diff --git a/tests/hermes_cli/test_kanban_chat_links_bulk_provenance.py b/tests/hermes_cli/test_kanban_chat_links_bulk_provenance.py
+index 34ff3ac603..1e50336463 100644
+--- a/tests/hermes_cli/test_kanban_chat_links_bulk_provenance.py
++++ b/tests/hermes_cli/test_kanban_chat_links_bulk_provenance.py
+@@ -576,3 +576,93 @@ def test_prefetch_leaves_scoped_verdicts_unchanged(home, gateway, profile):
+     provenance.prefetch_sources(MIXED)
+     assert provenance.scoped_sources(gateway, MIXED, local_gateway=GW, profile=profile) == cold
+     assert any(v is not None for v in cold.values()) or gateway == "away"
++
++
++def test_backfill_resolves_replica_links_on_a_host_without_a_gateway_name(home, opens, monkeypatch):
++    """t_01a1d41a82ced7d9 (PR #2013 review nit 1): without a hub.db gateway name ``LinkVerdicts.read`` leaves the
++    replica unopened, yet ``_ReplicaReader`` still resolves creators from it. Safe because every replica link names
++    a gateway (``chat_gateway`` is NOT NULL in the synced schema, so no bare link exists) and, with no local name,
++    ``scoped_sources`` answers each such ref without a read: a map miss gets the per-row verdict, with no
++    provenance read under ``write_txn`` even as the source cache expires before each use."""
++    from hermes_cli import kanban_db as kdb
++    monkeypatch.setattr("hermes_cli.kanban_origin.gateway_names", lambda: ("", set()))
++    rep = ksc.shadow_path("default")
++    rep.parent.mkdir(parents=True, exist_ok=True)
++    kbc.init_db(rep)
++    rows = [("away", None, "20261101_000000_human"), ("", "default", "20261101_000000_cron"),
++            (GW, None, DESKTOP), ("away", "research", WORKER), (GW, "default", "20261101_000000_nosuch")]
++    with kbc.connect_closing(rep) as remote:
++        creator = kdb.create_task(remote, title="creator synced from another machine", assignee="default")
++        with kbc.write_txn(remote):
++            for gw, prof, sid in rows:
++                _link(remote, creator, sid, gateway=gw, profile=prof)
++        with pytest.raises(sqlite3.IntegrityError, match="chat_gateway"):  # the premise: no bare link
++            _link(remote, creator, DESKTOP, gateway=None)
++    notify._source_cache.clear()
++    want = {r for r in rows if not notify.is_machine_session(r[0], r[2], local_gateway="", profile=r[1])}
++    assert want and want != set(rows)  # owners kept and machine links dropped
++    seen, board = opens
++    calls: list[tuple[str, bool]] = []
++
++    def spy(name):
++        real = getattr(provenance, name)
++
++        def wrapped(*a, **kw):
++            conn = board.get("conn")
++            calls.append((name, bool(conn is not None and conn.in_transaction)))
++            return real(*a, **kw)
++        monkeypatch.setattr(provenance, name, wrapped)
++
++    for name in ("_local_session_sources",):  # a map miss calls scoped_sources, which answers without this read
++        spy(name)
++    with kbc.connect_closing() as conn:
++        assert not conn.execute("SELECT 1 FROM tasks WHERE id=?", (creator,)).fetchone()
++        with kbc.write_txn(conn):
++            _add_task(conn, "t_child", payload={"creator_task_id": creator})
++        notify._source_cache.clear()
++        monkeypatch.setattr(provenance, "time", _SlowClock)
++        board["conn"] = conn
++        seen.clear()
++        calls.clear()
++        out = creator_chats.backfill(conn)
++        board.clear()
++        owned = conn.execute("SELECT chat_gateway, chat_profile, chat_session FROM task_chat_links "
++                             "WHERE task_id='t_child' AND released=0").fetchall()
++        resolved = conn.execute("SELECT payload FROM task_events WHERE task_id='t_child' "
++                                "AND kind='creator_chats_resolved'").fetchone()
++    assert out == {"attempted": ["t_child"], "unresolved": []}
++    assert {tuple(r) for r in owned} == want
++    assert json.loads(resolved[0])["source"] == "replica"
++    inside = [n for n, in_txn in calls if in_txn] + [p for p, in_txn in seen if in_txn]
++    assert not inside, f"{len(inside)} provenance reads inside write_txn: {sorted(set(inside))}"
++
++
++_SCOPE_REFS = [*MIXED, f"{GW}/research/{RCHAT}", f"away/research/{RCHAT}", f"{GW}//{DESKTOP}", f"{GW}/default/",
++               "", "x/y/z/w"]
++
++
++@pytest.mark.parametrize("local_gateway", [GW, ""])
++@pytest.mark.parametrize("gateway", [None, GW, "away"])
++@pytest.mark.parametrize("profile", [None, "default", "research"])
++def test_reads_local_store_is_exactly_when_scoped_sources_reads(home, monkeypatch, local_gateway, gateway, profile):
++    """t_01a1d41a82ced7d9 (PR #2013 review nit 2): ``reads_local_store`` answers the same rule as ``scoped_sources``,
++    including a qualified ``gw/profile/sid`` ref whose outer gateway or profile contradicts the scope (answered
++    unknown without a read, so not reported as a read either)."""
++    real = provenance._local_homes
++    reads: list[Any] = []
++
++    def counted(prof):
++        reads.append(prof)
++        return real(prof)
++    monkeypatch.setattr(provenance, "_local_homes", counted)
++    mismatched = 0
++    for ref in _SCOPE_REFS:
++        reads.clear()
++        provenance.scoped_sources(gateway, [ref], local_gateway=local_gateway, profile=profile)
++        claim = provenance.reads_local_store(gateway, ref, local_gateway=local_gateway, profile=profile)
++        assert claim == bool(reads), (ref, claim, reads)
++        parts = ref.split("/")
++        mismatched += len(parts) == 3 and parts[0] == local_gateway and (
++            (gateway is not None and gateway != parts[0]) or (profile is not None and profile != parts[1]))
++    if local_gateway and (gateway == "away" or profile is not None):
++        assert mismatched  # the corpus holds the over-approximated case for this scope
+-- 
+2.51.0
+

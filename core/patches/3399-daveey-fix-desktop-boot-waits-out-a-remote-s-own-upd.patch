@@ -1,0 +1,610 @@
+From 8af368b973cf366890f2630dc4cf0ca912387491 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 02:50:07 -0800
+Subject: [PATCH] [daveey] fix(desktop): boot waits out a remote's own update
+ instead of parking on "Hermes couldn't start"
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Observed on laptop-1 2026-11-13 02:33 PST: hermes-hub ran its own `hermes update`, the SSH preflight refused
+startup ("Remote Hermes update process 1779396 is still running; SSH startup is paused."), and the renderer
+showed the full-window "Hermes couldn't start" overlay. The update pid was gone by 02:34:44, yet the overlay
+was still up at 02:36: nothing re-ran boot, so David had to press Retry.
+
+Five whys:
+1. Why did the overlay stay? boot() caught the refusal and called failDesktopBoot(); nothing schedules
+   another boot after that.
+2. Why no automatic retry? The bounded boot retry (#82679) only fires when main's boot snapshot says
+   retryable:true or the renderer was dialing the socket. The startup route goes through
+   hermes:connection:for (connectDesktopProfileRoute), which never updates the boot snapshot, so it read
+   retryable:false. Even when it is retryable, 5 attempts span about a minute, shorter than an update.
+3. Why does main's own update gate not recover it? RemoteUpdatePause only probes when a caller arrives;
+   once the renderer gave up, no caller came.
+4. Why wasn't it caught? No test drove boot through a remote-update refusal; the gate's tests cover main's
+   dial dedup only.
+5. Root gap: the renderer treated "remote is updating" (a condition that ends on its own) like a generic
+   boot failure with a short retry budget.
+
+Fix: the renderer recognises the refusal by the phrase every producer shares ("SSH startup is paused";
+the error crosses IPC as text, so `kind`/`code` are lost) and keeps polling every 5 s outside the bounded
+budget, showing "Waiting for the remote Hermes update to finish…" instead of the overlay. Main's gate
+answers polls from its cached refusal without dialing until its own backoff (≤30 s) opens, so the poll costs
+one IPC round-trip. A pause longer than 30 min still ends on the recovery overlay.
+
+Tests:
+- use-gateway-boot-remote-update.test.tsx: three minutes of refusals (past the 5-attempt budget, snapshot
+  retryable:false) keep the overlay down with no notifyError; once the update exits, the next poll connects
+  and boot completes with no click (RED on main: the overlay shows on the first refusal). Past the cap the
+  overlay still shows.
+- remote-update-wait.test.ts: matcher accepts the IPC-wrapped and cached forms and rejects other failures;
+  every electron producer of the refusal (remote-lifecycle, windows-remote-lifecycle, remote-update-pause)
+  still uses the matched phrase; the wait cap and reset.
+---
+ .../use-gateway-boot-remote-update.test.tsx   | 203 ++++++++++++++++++
+ .../src/app/gateway/hooks/use-gateway-boot.ts |  20 ++
+ .../app/gateway/remote-update-wait.test.ts    |  65 ++++++
+ .../src/app/gateway/remote-update-wait.ts     |  56 +++++
+ apps/desktop/src/i18n/ar_boot.ts              |   3 +-
+ apps/desktop/src/i18n/de_boot.ts              |   3 +-
+ apps/desktop/src/i18n/en_boot.ts              |   3 +-
+ apps/desktop/src/i18n/es_boot.ts              |   3 +-
+ apps/desktop/src/i18n/fr_boot.ts              |   3 +-
+ apps/desktop/src/i18n/ja_boot.ts              |   3 +-
+ apps/desktop/src/i18n/ru_boot.ts              |   3 +-
+ apps/desktop/src/i18n/types_boot.ts           |   1 +
+ apps/desktop/src/i18n/zh-hant_boot.ts         |   3 +-
+ apps/desktop/src/i18n/zh_boot.ts              |   3 +-
+ locales/_keys.desktop.json                    |   1 +
+ 15 files changed, 364 insertions(+), 9 deletions(-)
+ create mode 100644 apps/desktop/src/app/gateway/hooks/use-gateway-boot-remote-update.test.tsx
+ create mode 100644 apps/desktop/src/app/gateway/remote-update-wait.test.ts
+ create mode 100644 apps/desktop/src/app/gateway/remote-update-wait.ts
+
+diff --git a/apps/desktop/src/app/gateway/hooks/use-gateway-boot-remote-update.test.tsx b/apps/desktop/src/app/gateway/hooks/use-gateway-boot-remote-update.test.tsx
+new file mode 100644
+index 0000000000..6c3e0ec477
+--- /dev/null
++++ b/apps/desktop/src/app/gateway/hooks/use-gateway-boot-remote-update.test.tsx
+@@ -0,0 +1,203 @@
++import { act, cleanup, render } from '@testing-library/react'
++import { afterEach, beforeEach, expect, it, vi } from 'vitest'
++
++import { $desktopBoot } from '@/store/boot'
++import { closeSecondaryGateways } from '@/store/gateway'
++import { notifyError } from '@/store/notifications'
++import { $activeGatewayProfile } from '@/store/profile'
++import { $connection, $gatewayState } from '@/store/session'
++
++import { FakeWebSocket } from '../../../test/fake-gateway-socket'
++import { REMOTE_UPDATE_WAIT_MAX_MS } from '../remote-update-wait'
++
++import { takeGatewaySurvivor } from './gateway-hmr-survivor'
++import { useGatewayBoot } from './use-gateway-boot'
++
++// [daveey] A remote's own `hermes update` pauses SSH startup. laptop-1 2026-11-13: the hub's update paused it,
++// boot landed on "Hermes couldn't start", and the overlay stayed after the update pid exited until Retry was pressed
++// by hand. Shares the fake socket with use-gateway-boot.test.tsx; the desktop bridge carries only what boot touches.
++
++vi.mock(import('@/store/notifications'), async importOriginal => ({
++  ...(await importOriginal()),
++  notifyError: vi.fn()
++}))
++
++vi.mock(import('@/store/terminal-backend-warning'), () => ({
++  warnIfTerminalBackendUnavailable: vi.fn(async () => false)
++}))
++
++const primaryConn = {
++  authMode: 'token' as const,
++  baseUrl: 'https://vps.example.com',
++  connectionId: 'primary-vps',
++  profile: 'default',
++  token: 't',
++  wsUrl: 'wss://vps.example.com/api/ws?token=t'
++}
++
++function fakeDesktop() {
++  let bootProgressHandler: ((payload: Record<string, unknown>) => void) | null = null
++  const unsubscribe = () => () => undefined
++
++  return {
++    getConnection: vi.fn(async () => primaryConn),
++    getGatewayWsUrl: vi.fn(async (conn?: { wsUrl?: string }) => conn?.wsUrl ?? primaryConn.wsUrl),
++    getBootProgress: vi.fn(async () => ({
++      error: null,
++      fakeMode: false,
++      message: '',
++      phase: 'init',
++      progress: 0,
++      retryable: false,
++      running: true,
++      timestamp: Date.now()
++    })),
++    onBootProgress: vi.fn(callback => {
++      bootProgressHandler = callback
++
++      return () => {
++        bootProgressHandler = null
++      }
++    }),
++    emitBootProgress(payload: Record<string, unknown>) {
++      bootProgressHandler?.(payload)
++    },
++    onBackendExit: vi.fn(unsubscribe),
++    onConnectionApplied: vi.fn(unsubscribe),
++    onPowerResume: vi.fn(unsubscribe),
++    revalidateConnection: vi.fn(async () => ({ ok: true, rebuilt: false })),
++    onWindowStateChanged: vi.fn(unsubscribe),
++    profile: { get: vi.fn(async () => ({ profile: 'default' })) }
++  }
++}
++
++function Harness() {
++  useGatewayBoot({
++    beforeConnectionSwitch: () => undefined,
++    handleGatewayEvent: () => undefined,
++    handleServerRequest: () => false,
++    onConnectionReady: () => undefined,
++    onGatewayReady: () => undefined,
++    refreshHermesConfig: async () => undefined,
++    refreshSessions: async () => undefined
++  })
++
++  return null
++}
++
++function closeSurvivor() {
++  try {
++    takeGatewaySurvivor()?.gateway.close()
++  } catch {
++    // ignore
++  }
++}
++
++const originalWebSocket = globalThis.WebSocket
++
++beforeEach(() => {
++  closeSurvivor()
++  closeSecondaryGateways()
++  $activeGatewayProfile.set('default')
++  $connection.set(null)
++  vi.useFakeTimers()
++  FakeWebSocket.mode = 'open'
++  FakeWebSocket.instances = []
++  FakeWebSocket.pingMode = 'pong'
++  vi.mocked(notifyError).mockReset()
++  ;(globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket
++  $gatewayState.set('idle')
++  $desktopBoot.set({
++    error: null,
++    fakeMode: false,
++    message: '',
++    phase: 'init',
++    progress: 0,
++    running: true,
++    timestamp: Date.now(),
++    visible: true
++  })
++})
++
++afterEach(() => {
++  cleanup()
++  closeSurvivor()
++  closeSecondaryGateways()
++  $connection.set(null)
++  vi.useRealTimers()
++  ;(globalThis as { WebSocket: unknown }).WebSocket = originalWebSocket
++  delete (window as { hermesDesktop?: unknown }).hermesDesktop
++})
++
++async function flushAsync() {
++  await act(async () => {
++    await vi.advanceTimersByTimeAsync(0)
++  })
++}
++
++const remoteUpdatePaused = () =>
++  new Error(
++    "Error invoking remote method 'hermes:connection:for': Error: Remote Hermes update process 1779396 is still running; SSH startup is paused."
++  )
++
++it('INITIAL boot during a remote update keeps waiting past the bounded retry budget, then connects without a click once the update exits', async () => {
++  let updateRunning = true
++  const desktop = fakeDesktop()
++  desktop.getConnection = vi.fn(async () => {
++    if (updateRunning) {
++      throw remoteUpdatePaused()
++    }
++
++    return primaryConn
++  })
++  ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
++
++  render(<Harness />)
++  await flushAsync()
++
++  // Three minutes of update: far past BOOT_RETRY_MAX_ATTEMPTS. Main's snapshot stays retryable:false (the
++  // hermes:connection:for path never marks it), yet the overlay never shows and nothing asks for Retry.
++  for (let i = 0; i < 36; i++) {
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(5_000)
++    })
++    expect($desktopBoot.get().error).toBeNull()
++  }
++
++  expect(desktop.getConnection.mock.calls.length).toBeGreaterThan(5)
++  expect($desktopBoot.get().phase).toBe('renderer.boot.retry')
++  expect($desktopBoot.get().message).toMatch(/remote Hermes update/i)
++  expect(notifyError).not.toHaveBeenCalled()
++
++  // The remote update pid exits: the next poll dials through and boot completes on its own.
++  updateRunning = false
++  await act(async () => {
++    await vi.advanceTimersByTimeAsync(5_000)
++  })
++  await act(async () => {
++    await vi.advanceTimersByTimeAsync(1_000)
++  })
++
++  expect($gatewayState.get()).toBe('open')
++  expect($desktopBoot.get().error).toBeNull()
++  expect($desktopBoot.get().running).toBe(false)
++  expect($desktopBoot.get().visible).toBe(false)
++})
++
++it('a remote update that pauses SSH startup past the wait cap still ends in the recovery overlay', async () => {
++  const desktop = fakeDesktop()
++  desktop.getConnection = vi.fn(async () => {
++    throw remoteUpdatePaused()
++  })
++  ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
++
++  render(<Harness />)
++  await flushAsync()
++
++  await act(async () => {
++    await vi.advanceTimersByTimeAsync(REMOTE_UPDATE_WAIT_MAX_MS + 60_000)
++  })
++
++  expect($desktopBoot.get().error).toMatch(/SSH startup is paused/)
++  expect($desktopBoot.get().running).toBe(false)
++})
+diff --git a/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts b/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts
+index 9b483dc979..25435e0c9a 100644
+--- a/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts
++++ b/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts
+@@ -110,6 +110,8 @@ import {
+ import { warnIfTerminalBackendUnavailable } from '@/store/terminal-backend-warning'
+ import { isPeerInstanceWindow, windowProfileOverride } from '@/store/windows'
+ 
++import { isRemoteUpdatePausedBootError, RemoteUpdateWait } from '../remote-update-wait'
++
+ import { stashGatewaySurvivor, survivorIsStale, takeGatewaySurvivor } from './gateway-hmr-survivor'
+ import { notifyPrimaryReauth } from './primary-reauth-notice'
+ import { useConnectionsRegistry } from './use-connections-registry'
+@@ -440,6 +442,7 @@ export function useGatewayBoot({
+     // Bounded automatic boot retry for transient REMOTE failures (#82679).
+     let bootRetryAttempt = 0
+     let bootRetryTimer: ReturnType<typeof setTimeout> | null = null
++    const remoteUpdateWait = new RemoteUpdateWait()
+ 
+     const clearBootRetryTimer = () => {
+       if (bootRetryTimer !== null) {
+@@ -1754,6 +1757,7 @@ export function useGatewayBoot({
+         completeDesktopBoot()
+         bootCompleted = true
+         bootRetryAttempt = 0
++        remoteUpdateWait.reset()
+         // A drop before bootCompleted was not redialed by the close handler.
+         scheduleReconnect()
+         // A Docker/SSH terminal backend that fails its probe means shell
+@@ -1763,6 +1767,22 @@ export function useGatewayBoot({
+       } catch (err) {
+         if (!cancelled) {
+           const message = err instanceof Error ? err.message : String(err)
++          // [daveey] A remote's own update pauses SSH startup: poll past the bounded budget until it exits.
++          const updateDelay = isRemoteUpdatePausedBootError(err) ? remoteUpdateWait.next() : null
++
++          if (updateDelay !== null) {
++            bootFailed = false
++            resumeDesktopBootForRetry(translateNow('boot.steps.waitingForRemoteUpdate'))
++            clearBootRetryTimer()
++            bootRetryTimer = setTimeout(() => {
++              bootRetryTimer = null
++              void boot()
++            }, updateDelay)
++
++            return
++          }
++
++          remoteUpdateWait.reset()
+ 
+           // Main's classification (#82679) still decides every failure it can
+           // see. The one it cannot see is the renderer-owned WebSocket dial:
+diff --git a/apps/desktop/src/app/gateway/remote-update-wait.test.ts b/apps/desktop/src/app/gateway/remote-update-wait.test.ts
+new file mode 100644
+index 0000000000..6df7ab3bf5
+--- /dev/null
++++ b/apps/desktop/src/app/gateway/remote-update-wait.test.ts
+@@ -0,0 +1,65 @@
++import { readFileSync } from 'node:fs'
++import { join } from 'node:path'
++
++import { describe, expect, it } from 'vitest'
++
++import {
++  isRemoteUpdatePausedBootError,
++  REMOTE_UPDATE_POLL_MS,
++  REMOTE_UPDATE_WAIT_MAX_MS,
++  RemoteUpdateWait
++} from './remote-update-wait'
++
++const electronSource = (name: string) => readFileSync(join(process.cwd(), 'electron', name), 'utf8')
++
++describe('isRemoteUpdatePausedBootError', () => {
++  it("recognises the refusal as it crosses IPC, and the gate's cached form", () => {
++    expect(
++      isRemoteUpdatePausedBootError(
++        new Error(
++          "Error invoking remote method 'hermes:connection:for': Error: Remote Hermes update process 1779396 is still running; SSH startup is paused."
++        )
++      )
++    ).toBe(true)
++    expect(isRemoteUpdatePausedBootError(new Error('Remote Hermes update in progress; SSH startup is paused.'))).toBe(
++      true
++    )
++  })
++
++  it('ignores other boot failures', () => {
++    expect(isRemoteUpdatePausedBootError(new Error('Hermes backend did not become ready: timeout'))).toBe(false)
++    expect(isRemoteUpdatePausedBootError(undefined)).toBe(false)
++  })
++
++  // The renderer only sees text, so every producer of the refusal must keep the shared phrase.
++  it.each(['remote-lifecycle.ts', 'windows-remote-lifecycle.ts', 'remote-update-pause.ts'])(
++    '%s still words its update refusal with the phrase the renderer matches',
++    name => {
++      const messages = electronSource(name).match(/['`][^'`]*SSH startup is paused[^'`]*['`]/g) ?? []
++
++      expect(messages.length).toBeGreaterThan(0)
++
++      for (const message of messages) {
++        expect(isRemoteUpdatePausedBootError(message)).toBe(true)
++      }
++    }
++  )
++})
++
++describe('RemoteUpdateWait', () => {
++  it('polls until the cap, then gives up; reset starts a fresh wait', () => {
++    let now = 1_000
++    const wait = new RemoteUpdateWait(() => now)
++
++    expect(wait.waiting).toBe(false)
++    expect(wait.next()).toBe(REMOTE_UPDATE_POLL_MS)
++    expect(wait.waiting).toBe(true)
++    now += REMOTE_UPDATE_WAIT_MAX_MS - 1
++    expect(wait.next()).toBe(REMOTE_UPDATE_POLL_MS)
++    now += 1
++    expect(wait.next()).toBeNull()
++    wait.reset()
++    expect(wait.waiting).toBe(false)
++    expect(wait.next()).toBe(REMOTE_UPDATE_POLL_MS)
++  })
++})
+diff --git a/apps/desktop/src/app/gateway/remote-update-wait.ts b/apps/desktop/src/app/gateway/remote-update-wait.ts
+new file mode 100644
+index 0000000000..bc8c56a36d
+--- /dev/null
++++ b/apps/desktop/src/app/gateway/remote-update-wait.ts
+@@ -0,0 +1,56 @@
++// [daveey] A remote host running its own `hermes update` refuses SSH startup until the update process exits
++// (electron/remote-lifecycle.ts assertRemoteInstallUpdateClear, windows-remote-lifecycle.ts, and main's
++// remote-update-pause gate, which answers from the cached refusal without dialing until its backoff opens).
++// That refusal crosses IPC as plain text, e.g.
++//   "Error invoking remote method 'hermes:connection:for': Error: Remote Hermes update process 1779396 is still
++//    running; SSH startup is paused."
++// so the renderer recognises it by the phrase every producer shares.
++//
++// A remote update routinely outlasts the bounded boot retry (5 attempts, about a minute), and the
++// hermes:connection:for path does not mark main's boot snapshot retryable at all, so boot used to land on the
++// "Hermes couldn't start" overlay and stay there after the update finished until the user pressed Retry. The boot
++// loop instead keeps polling on this schedule, outside the bounded budget, until the update ends or the wait cap.
++
++const REMOTE_UPDATE_PAUSED_RE = /SSH startup is paused/i
++
++// Poll interval. Main's gate fails fast (no SSH dial) until its own backoff window opens (2 s → 30 s), so a short
++// renderer poll costs one IPC round-trip, and recovery lands within one gate step of the update exiting.
++export const REMOTE_UPDATE_POLL_MS = 5_000
++
++// An update that pauses SSH startup longer than this is stuck, not finishing: surface the recovery overlay.
++export const REMOTE_UPDATE_WAIT_MAX_MS = 30 * 60_000
++
++export function isRemoteUpdatePausedBootError(error: unknown): boolean {
++  const message = error instanceof Error ? error.message : String(error ?? '')
++
++  return REMOTE_UPDATE_PAUSED_RE.test(message)
++}
++
++// Tracks one continuous remote-update wait for the boot loop. `next()` returns the delay before the next poll, or
++// null once the wait has run past the cap (the caller then fails boot as usual).
++export class RemoteUpdateWait {
++  #startedAt: null | number = null
++  readonly #now: () => number
++
++  constructor(now: () => number = Date.now) {
++    this.#now = now
++  }
++
++  get waiting(): boolean {
++    return this.#startedAt !== null
++  }
++
++  next(): null | number {
++    const now = this.#now()
++
++    if (this.#startedAt === null) {
++      this.#startedAt = now
++    }
++
++    return now - this.#startedAt >= REMOTE_UPDATE_WAIT_MAX_MS ? null : REMOTE_UPDATE_POLL_MS
++  }
++
++  reset(): void {
++    this.#startedAt = null
++  }
++}
+diff --git a/apps/desktop/src/i18n/ar_boot.ts b/apps/desktop/src/i18n/ar_boot.ts
+index a37852ed57..87ec231b3f 100644
+--- a/apps/desktop/src/i18n/ar_boot.ts
++++ b/apps/desktop/src/i18n/ar_boot.ts
+@@ -12,7 +12,8 @@ export const arBoot = {
+       loadingSessions: 'جار تحميل الجلسات الأخيرة',
+       retryingRemoteBackend: 'جارٍ إعادة الاتصال بخادم Hermes البعيد…',
+       startingDesktopConnection: 'جار بدء اتصال سطح المكتب',
+-      startingHermesDesktop: 'جار تشغيل Hermes Desktop...'
++      startingHermesDesktop: 'جار تشغيل Hermes Desktop...',
++      waitingForRemoteUpdate: 'بانتظار انتهاء تحديث Hermes البعيد…'
+     },
+     errors: {
+       backgroundExited: 'خرجت عملية Hermes الخلفية.',
+diff --git a/apps/desktop/src/i18n/de_boot.ts b/apps/desktop/src/i18n/de_boot.ts
+index c2874c89da..e2357373bd 100644
+--- a/apps/desktop/src/i18n/de_boot.ts
++++ b/apps/desktop/src/i18n/de_boot.ts
+@@ -11,7 +11,8 @@ export const deBoot = {
+       loadingSessions: 'Letzte Sessions werden geladen',
+       retryingRemoteBackend: 'Wird mit dem Remote-Hermes-Backend neu verbunden…',
+       startingDesktopConnection: 'Desktop-Verbindung wird gestartet',
+-      startingHermesDesktop: 'Hermes Desktop wird gestartet…'
++      startingHermesDesktop: 'Hermes Desktop wird gestartet…',
++      waitingForRemoteUpdate: 'Warten, bis das Update des Remote-Hermes abgeschlossen ist…'
+     },
+     errors: {
+       backgroundExited: 'Der Hermes-Hintergrundprozess wurde beendet.',
+diff --git a/apps/desktop/src/i18n/en_boot.ts b/apps/desktop/src/i18n/en_boot.ts
+index 5b8e34dcd4..b3f09477d5 100644
+--- a/apps/desktop/src/i18n/en_boot.ts
++++ b/apps/desktop/src/i18n/en_boot.ts
+@@ -11,7 +11,8 @@ export const enBoot = {
+       loadingSessions: 'Loading recent sessions',
+       retryingRemoteBackend: 'Reconnecting to the remote Hermes backend…',
+       startingDesktopConnection: 'Starting desktop connection',
+-      startingHermesDesktop: 'Starting Hermes Desktop…'
++      startingHermesDesktop: 'Starting Hermes Desktop…',
++      waitingForRemoteUpdate: 'Waiting for the remote Hermes update to finish…'
+     },
+     errors: {
+       backgroundExited:
+diff --git a/apps/desktop/src/i18n/es_boot.ts b/apps/desktop/src/i18n/es_boot.ts
+index 1ffe91e893..9c0986d708 100644
+--- a/apps/desktop/src/i18n/es_boot.ts
++++ b/apps/desktop/src/i18n/es_boot.ts
+@@ -11,7 +11,8 @@ export const esBoot = {
+       loadingSessions: 'Cargando sesiones recientes',
+       retryingRemoteBackend: 'Reconectando al backend remoto de Hermes…',
+       startingDesktopConnection: 'Iniciando la conexión de escritorio',
+-      startingHermesDesktop: 'Iniciando Hermes Desktop…'
++      startingHermesDesktop: 'Iniciando Hermes Desktop…',
++      waitingForRemoteUpdate: 'Esperando a que termine la actualización del Hermes remoto…'
+     },
+     errors: {
+       backgroundExited:
+diff --git a/apps/desktop/src/i18n/fr_boot.ts b/apps/desktop/src/i18n/fr_boot.ts
+index 16cf10185f..7a6d0eb915 100644
+--- a/apps/desktop/src/i18n/fr_boot.ts
++++ b/apps/desktop/src/i18n/fr_boot.ts
+@@ -11,7 +11,8 @@ export const frBoot = {
+       loadingSessions: 'Chargement des sessions récentes',
+       retryingRemoteBackend: 'Reconnexion au backend Hermes distant…',
+       startingDesktopConnection: 'Démarrage de la connexion desktop',
+-      startingHermesDesktop: 'Démarrage de Hermes Desktop…'
++      startingHermesDesktop: 'Démarrage de Hermes Desktop…',
++      waitingForRemoteUpdate: 'En attente de la fin de la mise à jour du Hermes distant…'
+     },
+     errors: {
+       backgroundExited: "Le processus en arrière-plan de Hermes s'est arrêté.",
+diff --git a/apps/desktop/src/i18n/ja_boot.ts b/apps/desktop/src/i18n/ja_boot.ts
+index c94d2365ef..0e393ea5e2 100644
+--- a/apps/desktop/src/i18n/ja_boot.ts
++++ b/apps/desktop/src/i18n/ja_boot.ts
+@@ -11,7 +11,8 @@ export const jaBoot = {
+       loadingSessions: '最近のセッションを読み込み中',
+       retryingRemoteBackend: 'リモート Hermes バックエンドに再接続中…',
+       startingDesktopConnection: 'デスクトップ接続を開始中',
+-      startingHermesDesktop: 'Hermes Desktop を起動中…'
++      startingHermesDesktop: 'Hermes Desktop を起動中…',
++      waitingForRemoteUpdate: 'リモート Hermes のアップデート完了を待っています…'
+     },
+     errors: {
+       backgroundExited: 'Hermes バックグラウンドプロセスが終了しました。',
+diff --git a/apps/desktop/src/i18n/ru_boot.ts b/apps/desktop/src/i18n/ru_boot.ts
+index 26c497f268..af1a2b8dd9 100644
+--- a/apps/desktop/src/i18n/ru_boot.ts
++++ b/apps/desktop/src/i18n/ru_boot.ts
+@@ -11,7 +11,8 @@ export const ruBoot = {
+       loadingSessions: 'Загрузка последних сеансов',
+       retryingRemoteBackend: 'Переподключение к удалённому бэкенду Hermes…',
+       startingDesktopConnection: 'Запуск подключения приложения',
+-      startingHermesDesktop: 'Запуск Hermes Desktop…'
++      startingHermesDesktop: 'Запуск Hermes Desktop…',
++      waitingForRemoteUpdate: 'Ожидание завершения обновления удалённого Hermes…'
+     },
+     errors: {
+       backgroundExited: 'Фоновый процесс Hermes завершён.',
+diff --git a/apps/desktop/src/i18n/types_boot.ts b/apps/desktop/src/i18n/types_boot.ts
+index 1bec837f3a..9ad569f718 100644
+--- a/apps/desktop/src/i18n/types_boot.ts
++++ b/apps/desktop/src/i18n/types_boot.ts
+@@ -9,6 +9,7 @@ export interface BootTranslations {
+     retryingRemoteBackend: string
+     startingDesktopConnection: string
+     startingHermesDesktop: string
++    waitingForRemoteUpdate: string
+   }
+   errors: {
+     backgroundExited: string
+diff --git a/apps/desktop/src/i18n/zh-hant_boot.ts b/apps/desktop/src/i18n/zh-hant_boot.ts
+index 58a22e91b8..496c4f2efa 100644
+--- a/apps/desktop/src/i18n/zh-hant_boot.ts
++++ b/apps/desktop/src/i18n/zh-hant_boot.ts
+@@ -12,7 +12,8 @@ export const zhHantBoot = {
+       loadingSessions: '正在載入最近工作階段',
+       retryingRemoteBackend: '正在重新連線遠端 Hermes 後端…',
+       startingDesktopConnection: '正在啟動桌面連線',
+-      startingHermesDesktop: '正在啟動 Hermes Desktop…'
++      startingHermesDesktop: '正在啟動 Hermes Desktop…',
++      waitingForRemoteUpdate: '正在等待遠端 Hermes 更新完成…'
+     },
+     errors: {
+       backgroundExited: 'Hermes 背景程序已結束。',
+diff --git a/apps/desktop/src/i18n/zh_boot.ts b/apps/desktop/src/i18n/zh_boot.ts
+index a72ca40a58..ea659dd0b6 100644
+--- a/apps/desktop/src/i18n/zh_boot.ts
++++ b/apps/desktop/src/i18n/zh_boot.ts
+@@ -11,7 +11,8 @@ export const zhBoot = {
+       loadingSessions: '正在加载最近会话',
+       retryingRemoteBackend: '正在重新连接远程 Hermes 后端…',
+       startingDesktopConnection: '正在启动桌面连接',
+-      startingHermesDesktop: '正在启动 Hermes 桌面版…'
++      startingHermesDesktop: '正在启动 Hermes 桌面版…',
++      waitingForRemoteUpdate: '正在等待远程 Hermes 更新完成…'
+     },
+     errors: {
+       backgroundExited: 'Hermes 后台进程已退出。',
+diff --git a/locales/_keys.desktop.json b/locales/_keys.desktop.json
+index 7456dbc102..a6b997de69 100644
+--- a/locales/_keys.desktop.json
++++ b/locales/_keys.desktop.json
+@@ -584,6 +584,7 @@
+     "boot.steps.retryingRemoteBackend",
+     "boot.steps.startingDesktopConnection",
+     "boot.steps.startingHermesDesktop",
++    "boot.steps.waitingForRemoteUpdate",
+     "boot.updateHold.checkAgain",
+     "boot.updateHold.confirmBody",
+     "boot.updateHold.confirmKeepWaiting",
+-- 
+2.51.0
+

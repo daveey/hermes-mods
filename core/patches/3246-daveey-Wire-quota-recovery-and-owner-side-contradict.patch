@@ -1,0 +1,1105 @@
+From 55076a7842614017d63f517599968c7bbf46568f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 20:14:58 +0000
+Subject: [PATCH] [daveey] Wire quota recovery and owner-side contradiction
+ reporting
+
+---
+ agent/credential_pool_model_state.py          |   2 +
+ agent/managed_worker.py                       |  21 +-
+ hermes_cli/auth.py                            |  27 +-
+ hermes_cli/auth_pool_merge.py                 |  30 +++
+ hermes_cli/kanban_db_dispatch.py              |   7 +-
+ hermes_cli/kanban_dispatch_maintenance.py     |  10 +
+ hermes_cli/kanban_quota_detector.py           | 185 +++++++++++++
+ hermes_cli/kanban_quota_probe.py              |  21 +-
+ hermes_cli/kanban_quota_recovery.py           | 150 +++++++++++
+ tests/agent/test_model_cooldown_recovery.py   |   8 +
+ .../test_auth_pool_identity_transplant.py     |  57 ++++
+ .../hermes_cli/test_kanban_quota_detector.py  | 159 +++++++++++
+ .../hermes_cli/test_kanban_quota_recovery.py  | 250 ++++++++++++++++++
+ 13 files changed, 894 insertions(+), 33 deletions(-)
+ create mode 100644 hermes_cli/kanban_dispatch_maintenance.py
+ create mode 100644 hermes_cli/kanban_quota_detector.py
+ create mode 100644 hermes_cli/kanban_quota_recovery.py
+ create mode 100644 tests/hermes_cli/test_auth_pool_identity_transplant.py
+ create mode 100644 tests/hermes_cli/test_kanban_quota_detector.py
+ create mode 100644 tests/hermes_cli/test_kanban_quota_recovery.py
+
+diff --git a/agent/credential_pool_model_state.py b/agent/credential_pool_model_state.py
+index 23242f8ade..91939e8e8d 100644
+--- a/agent/credential_pool_model_state.py
++++ b/agent/credential_pool_model_state.py
+@@ -41,6 +41,8 @@ def merge_model_state(*rows: dict[str, Any]) -> dict[str, Any]:
+ 
+ def resync_model_state(pool, entry):
+     """Read resets even when the credential has no account-wide failure status."""
++    if not entry.model_cooldowns:
++        return entry
+     from hermes_cli.auth import read_credential_pool
+     try:
+         row = next((r for r in read_credential_pool(pool.provider) if r.get("id") == entry.id), None)
+diff --git a/agent/managed_worker.py b/agent/managed_worker.py
+index 2bc06455ab..af0a2d2442 100644
+--- a/agent/managed_worker.py
++++ b/agent/managed_worker.py
+@@ -450,13 +450,20 @@ def execute(frame, channel):
+ def _construct_agent(frame, factory, policy, **kwargs):
+     """Agent construction resolves the provider credentials; a Kanban attempt that fails here
+     still books the one-shot exit mapping (quota wall 75, re-login 78) before the crash."""
+-    try:
+-        from gateway.session_worker_construct import worker_route
+-        return factory(**{**kwargs, **worker_route(policy, kwargs)})
+-    except Exception as exc:
+-        from gateway.session_kanban import record_start_failure
+-        record_start_failure(frame, exc)
+-        raise
++    from gateway.session_worker_construct import worker_route
++    from hermes_cli.kanban_quota_recovery import recover_exception
++    for attempt in range(2):
++        try:
++            return factory(**{**kwargs, **worker_route(policy, kwargs)})
++        except Exception as exc:
++            if json.loads(frame['policy'].get('kanban_json') or 'null') is not None:
++                healed = attempt == 0 and recover_exception(exc)
++                exc._kanban_quota_probe_attempted = True
++                if healed:
++                    continue
++            from gateway.session_kanban import record_start_failure
++            record_start_failure(frame, exc)
++            raise
+ 
+ 
+ def hello():
+diff --git a/hermes_cli/auth.py b/hermes_cli/auth.py
+index 09119f417a..7ee923745f 100644
+--- a/hermes_cli/auth.py
++++ b/hermes_cli/auth.py
+@@ -34,7 +34,8 @@ from hermes_constants import OPENROUTER_BASE_URL, hermes_home_key, secure_parent
+ from agent.credential_persistence import sanitize_borrowed_credential_payload
+ from utils import atomic_json_write, env_float, file_cache_version, is_truthy_value
+ # Re-exported: callers and auth_codex/auth_oauth_grants read these via hermes_cli.auth.
+-from hermes_cli.auth_pool_merge import _POOL_STATUS_FIELDS, _merge_disk_cooldown_state
++from hermes_cli.auth_pool_merge import (
++    _POOL_STATUS_FIELDS, _credential_token_pair, _codex_identity_changed, _merge_disk_cooldown_state)
+ from hermes_cli.auth_zai_kimi import (
+     KIMI_CODE_BASE_URL, ZAI_ENDPOINTS, _normalize_lmstudio_runtime_base_url, _resolve_kimi_base_url,
+     _resolve_zai_base_url, detect_zai_endpoint)
+@@ -970,12 +971,6 @@ _POOL_TOKEN_GENERATION_FIELDS = (
+ )
+ 
+ 
+-def _credential_token_pair(row: Any) -> tuple[Any, Any]:
+-    if not isinstance(row, dict):
+-        return (None, None)
+-    return row.get("access_token"), row.get("refresh_token")
+-
+-
+ def _token_pairs_by_id(rows: Iterable[Any]) -> dict[str, tuple[Any, Any]]:
+     """Token-generation base per row id, INCLUDING ``(None, None)`` for token-less rows.
+ 
+@@ -993,12 +988,7 @@ def _merge_pool_row_generation(
+     base_pair: Optional[tuple[Any, Any]] = None,
+     status_cleared: bool = False,
+ ) -> dict[str, Any]:
+-    """Keep a newer on-disk token generation authoritative during stale writes.
+-
+-    Only a terminal auth verdict (``last_status == dead``) is scoped to the token pair
+-    it was observed on; account-wide cooldowns (402 billing, 429 throttle) from the
+-    stale writer still apply to the rotated pair and go through the ordinary recency
+-    merge in ``_merge_disk_cooldown_state``."""
++    """Keep disk token generations and cross-account status authoritative during stale writes."""
+     from agent.credential_pool import STATUS_DEAD
+ 
+     merge_disk = None if status_cleared else disk_entry
+@@ -1018,8 +1008,17 @@ def _merge_pool_row_generation(
+                 merged.pop(field, None)
+ 
+     _take_from_disk(_POOL_TOKEN_GENERATION_FIELDS)
+-    if not status_cleared and entry.get("last_status") == STATUS_DEAD:
++    # Both pairs decode to DIFFERENT accounts: the disk row was re-pointed at another
++    # identity, so the writer's cooldown/quarantine describes an account that no longer
++    # owns this row. Same-account refreshes keep real exhaustion (ordinary merge below).
++    cross_account = provider_id == 'openai-codex' and _codex_identity_changed(
++        base_pair[0] or entry.get("access_token"), disk_pair[0])
++    if cross_account or (not status_cleared and entry.get("last_status") == STATUS_DEAD):
+         _take_from_disk((*_POOL_STATUS_FIELDS, "failure_reason"))
++    if cross_account:
++        _take_from_disk(('model_cooldowns', 'model_cooldown_recorded_at', 'model_cooldown_cleared_at',
++                         'cooldown_until', 'bench_status_at', 'bench_token_fp'))
++        return merged
+     return _merge_disk_cooldown_state(merged, merge_disk, provider_id)
+ 
+ 
+diff --git a/hermes_cli/auth_pool_merge.py b/hermes_cli/auth_pool_merge.py
+index 69807d99b7..41e3fe54fd 100644
+--- a/hermes_cli/auth_pool_merge.py
++++ b/hermes_cli/auth_pool_merge.py
+@@ -71,3 +71,33 @@ def _merge_disk_cooldown_state(
+         return {**merged, **disk_status_fields}
+     except Exception:  # pragma: no cover - best-effort merge
+         return entry
++
++
++def _token_identity(token: Any) -> Optional[str]:
++    """Codex JWT identity: ``chatgpt_account_id`` (+ ``sub``) first, else email; None if undecodable."""
++    from hermes_cli.auth_constants import _decode_jwt_claims
++    claims = _decode_jwt_claims(token)
++    if not claims:
++        return None
++    auth = claims.get("https://api.openai.com/auth")
++    account = auth.get("chatgpt_account_id") if isinstance(auth, dict) else None
++    if isinstance(account, str) and account.strip():
++        sub = claims.get("sub")
++        sub = sub.strip() if isinstance(sub, str) else ""
++        return f"acct:{account.strip()}/{sub}"
++    email = claims.get("email")
++    if isinstance(email, str) and email.strip():
++        return f"email:{email.strip()}".lower()
++    return None
++
++
++def _credential_token_pair(row: Any) -> tuple[Any, Any]:
++    if not isinstance(row, dict):
++        return (None, None)
++    return row.get("access_token"), row.get("refresh_token")
++
++
++def _codex_identity_changed(old_token: Any, new_token: Any) -> bool:
++    """True only when both tokens carry a decodable identity and the identities differ."""
++    old, new = _token_identity(old_token), _token_identity(new_token)
++    return bool(old and new and old != new)
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index c7b0cb9b8c..f6fa56fd36 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2274,11 +2274,8 @@ def _dispatch_once_locked(
+         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board, dry_run=dry_run,
+     )
+     if not dry_run:
+-        # Agent-owned blocks get one triage respawn after 2h; standing human asks are re-checked every tick.
+-        from hermes_cli.kanban_block_policy import sweep_blocked_cards
+-        sweep_blocked_cards(conn, result)
+-        _guard_notice.sweep_remote_guard_holds(conn, result)
+-        _parent_unclaimed.safe_sweep(conn)  # before the spawn cap: a capped host is when a parent starves [daveey]
++        from hermes_cli.kanban_dispatch_maintenance import sweep
++        sweep(conn, result, _guard_notice, _parent_unclaimed)
+     from hermes_cli.kanban_gateway_drain import dispatch_paused
+     if dispatch_paused():
+         _kb._log.info('kanban dispatcher: scheduling paused — gateway draining or restart requested')
+diff --git a/hermes_cli/kanban_dispatch_maintenance.py b/hermes_cli/kanban_dispatch_maintenance.py
+new file mode 100644
+index 0000000000..244598c195
+--- /dev/null
++++ b/hermes_cli/kanban_dispatch_maintenance.py
+@@ -0,0 +1,10 @@
++"""Owner maintenance before the spawn cap, including worker quota evidence."""
++
++
++def sweep(conn, result, guard_notice, parent_unclaimed):
++    from hermes_cli.kanban_block_policy import sweep_blocked_cards
++    from hermes_cli.kanban_quota_detector import drain_owner
++    sweep_blocked_cards(conn, result)
++    guard_notice.sweep_remote_guard_holds(conn, result)
++    drain_owner(conn)
++    parent_unclaimed.safe_sweep(conn)  # A capped host is when a parent starves.
+diff --git a/hermes_cli/kanban_quota_detector.py b/hermes_cli/kanban_quota_detector.py
+new file mode 100644
+index 0000000000..c22a99c161
+--- /dev/null
++++ b/hermes_cli/kanban_quota_detector.py
+@@ -0,0 +1,185 @@
++"""Durable local contradiction counter. No board access from managed workers.
++
++Workers/recovery call :func:`record_contradiction` (local SQLite only, fail-soft).
++The dispatcher tick calls :func:`drain_owner`, which is a no-op in any worker or
++fenced descendant context, and writes through ``kanban_db.create_task`` /
++``add_comment`` (the supported canonical path).
++
++Schema (``<kanban_home>/quota_contradictions.db``):
++  observations(scope, at, accounts)  accounts = JSON [{"id": pool row id, "cooldown_until": epoch|null}]
++  reports(scope PK, at, payload, receipt)  receipt NULL = pending owner delivery
++Only pool row IDs and cooldown ends are stored: never tokens, emails or labels.
++The report key identifies host/provider/model.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import logging
++import os
++import re
++import socket
++import sqlite3
++import time
++from contextlib import closing
++
++log = logging.getLogger(__name__)
++WINDOW_SECONDS = 1800
++THRESHOLD = 3
++_ID = re.compile(r'[A-Za-z0-9_.:-]{1,64}')
++
++
++def clean_accounts(accounts):
++    """Keep only (row id, cooldown end); anything else (tokens, emails) is dropped."""
++    out = []
++    for a in accounts or ():
++        if isinstance(a, str):
++            a = {'id': a}
++        aid = a.get('id') if isinstance(a, dict) else None
++        if not isinstance(aid, str) or not _ID.fullmatch(aid):
++            continue
++        cd = a.get('cooldown_until')
++        ok = isinstance(cd, (int, float)) and not isinstance(cd, bool)
++        out.append({'id': aid, 'cooldown_until': float(cd) if ok else None})
++    return out
++
++
++class Detector:
++    def __init__(self, path, *, timeout=0.25):
++        self.path = path
++        self.timeout = timeout
++
++    def _connect(self):
++        conn = sqlite3.connect(self.path, timeout=self.timeout)
++        conn.execute('CREATE TABLE IF NOT EXISTS observations (scope TEXT, at REAL, accounts TEXT)')
++        if 'accounts' not in [r[1] for r in conn.execute('PRAGMA table_info(observations)')]:
++            conn.execute('ALTER TABLE observations ADD COLUMN accounts TEXT')
++        conn.execute('CREATE TABLE IF NOT EXISTS reports '
++                     '(scope TEXT PRIMARY KEY, at REAL, payload TEXT, receipt TEXT)')
++        conn.commit()
++        return conn
++
++    def record(self, host, provider, model, *, now, accounts=()):
++        """Record a proven contradiction (including one successfully healed).
++
++        One pending report or delivered report per rolling window per scope.
++        BEGIN IMMEDIATE serializes threshold checks across worker processes.
++        """
++        scope = 'quota-contradiction:' + hashlib.sha256(
++            json.dumps([host, provider, model], separators=(',', ':')).encode()).hexdigest()
++        with closing(self._connect()) as conn, conn:
++            conn.execute('BEGIN IMMEDIATE')
++            conn.execute('DELETE FROM observations WHERE at < ?', (now - WINDOW_SECONDS,))
++            conn.execute('INSERT INTO observations VALUES (?, ?, ?)',
++                         (scope, now, json.dumps(clean_accounts(accounts))))
++            count = conn.execute('SELECT COUNT(*) FROM observations WHERE scope=? AND at<=?',
++                                 (scope, now)).fetchone()[0]
++            old = conn.execute('SELECT at, receipt FROM reports WHERE scope=?', (scope,)).fetchone()
++            if count < THRESHOLD or (old and (old[1] is None or now - old[0] < WINDOW_SECONDS)):
++                return None
++            merged = {}
++            for (raw,) in conn.execute('SELECT accounts FROM observations WHERE scope=? AND at<=?',
++                                       (scope, now)):
++                for a in json.loads(raw or '[]'):
++                    known = [v for v in (a['cooldown_until'], merged.get(a['id'])) if v is not None]
++                    merged[a['id']] = max(known) if known else None
++            report = dict(key=scope, host=host, provider=provider, model=model, count=count,
++                          window_seconds=WINDOW_SECONDS, observed_at=now,
++                          accounts=[{'id': k, 'cooldown_until': v} for k, v in sorted(merged.items())])
++            conn.execute('INSERT OR REPLACE INTO reports VALUES (?, ?, ?, NULL)',
++                         (scope, now, json.dumps(report)))
++            return report
++
++    def pending(self):
++        with closing(self._connect()) as conn:
++            return [json.loads(row[0]) for row in conn.execute(
++                'SELECT payload FROM reports WHERE receipt IS NULL ORDER BY at')]
++
++    def deliver(self, create_or_comment):
++        """Owner-only drain; callback must dedup by key, including uncertain replies.
++
++        Failed/unknown submissions remain pending. The owner callback, not this
++        local outbox, decides whether an existing card is still open.
++        """
++        delivered = 0
++        for report in self.pending():
++            try:
++                receipt = create_or_comment(report)
++                if not isinstance(receipt, str) or not receipt:
++                    continue
++                with closing(self._connect()) as conn, conn:
++                    changed = conn.execute('UPDATE reports SET receipt=? WHERE scope=? AND payload=? '
++                                           'AND receipt IS NULL',
++                                           (receipt, report['key'], json.dumps(report))).rowcount
++                delivered += changed
++            except Exception:  # health: allow BLE001 -- owner reporting is best effort; retain pending evidence
++                log.warning('quota contradiction owner delivery deferred')
++        return delivered
++
++
++def default_path():
++    """Profile-local evidence store, shared with this home's dispatcher."""
++    from hermes_cli.kanban_db import kanban_home
++    return str(kanban_home() / 'quota_contradictions.db')
++
++
++def record_contradiction(provider, model, accounts=(), *, host=None, now=None, path=None):
++    """Worker-safe entry point: local SQLite only; never raises. Returns a new report or None."""
++    try:
++        return Detector(path or default_path()).record(
++            host or socket.gethostname(), provider, model,
++            now=time.time() if now is None else now, accounts=accounts)
++    except Exception:  # health: allow BLE001 -- evidence is best effort, never break the worker
++        log.warning('quota contradiction record failed', exc_info=True)
++        return None
++
++
++def _body(report):
++    lines = [f"Quota contradiction x{report['count']} within {report['window_seconds']}s on "
++             f"host={report['host']} provider={report['provider']} model={report['model']}.",
++             'Accounts (pool row id: cooldown end epoch):']
++    lines += [f"- {a['id']}: {a['cooldown_until']}" for a in report['accounts']] or ['- (none reported)']
++    return '\n'.join(lines) + f"\nreport: {report['key']}@{int(report['observed_at'])}"
++
++
++def create_or_comment(conn, report):
++    """Owner-side canonical writer: comment on the open card for this scope, else create one.
++
++    The idempotency key embeds the report time so a finished card never swallows a later report.
++    """
++    from hermes_cli import kanban_db as kb
++    marker = f"{report['key']}@{int(report['observed_at'])}"
++    row = conn.execute("SELECT id FROM tasks WHERE idempotency_key LIKE ? AND status NOT IN "
++                       "('done','archived') ORDER BY created_at DESC LIMIT 1",
++                       (report['key'] + '@%',)).fetchone()
++    if row:
++        tid = row[0]
++        if not any(marker in (c.body or '') for c in kb.list_comments(conn, tid)):
++            kb.add_comment(conn, tid, 'quota-detector', _body(report))
++        return tid
++    return kb.create_task(
++        conn, title=f"Quota contradiction: {report['provider']}/{report['model']} on {report['host']}",
++        body=_body(report), created_by='quota-detector', triage=True, idempotency_key=marker)
++
++
++def drain_owner(conn, *, detector=None, writer=None):
++    """Owner-side drain, called from the dispatcher tick. Fail-soft; 0 in worker/fenced contexts."""
++    try:
++        if os.environ.get('HERMES_KANBAN_TASK'):
++            return 0
++        from agent.delegation_context import is_delegated_child_process_context
++        if is_delegated_child_process_context():
++            return 0
++        det = detector or Detector(default_path())
++        if not det.pending():
++            return 0
++        import fcntl  # one drainer at a time: create_task's idempotency check is not atomic
++        with open(str(det.path) + '.drain.lock', 'ab') as lock:
++            try:
++                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++            except OSError:
++                return 0
++            return det.deliver(lambda r: (writer or create_or_comment)(conn, r))
++    except Exception:  # health: allow BLE001 -- maintenance must not break dispatch
++        log.warning('quota contradiction drain failed', exc_info=True)
++        return 0
+diff --git a/hermes_cli/kanban_quota_probe.py b/hermes_cli/kanban_quota_probe.py
+index 64c82090ac..79f0f0af87 100644
+--- a/hermes_cli/kanban_quota_probe.py
++++ b/hermes_cli/kanban_quota_probe.py
+@@ -7,8 +7,8 @@ accounts had weekly headroom. The only way out was hand SQL on the ``quota_episo
+ ``live_verdict`` reads every pooled OAuth account's live usage windows (``agent.account_usage``, the
+ ``/api/oauth/usage`` read for anthropic, read-only for Codex). Two callers:
+ 
+-- ``contradicted``: a start-time ``SubscriptionQuotaUnavailable`` the live read contradicts is booked as an
+-  unconfirmed retry (no reset, so no quota episode and no provider wall).
++- ``contradicted``: a start-time ``SubscriptionQuotaUnavailable`` is checked by the bounded live
++  completion recovery helper, not usage alone. Managed workers retry construction once after a clear.
+ - ``hermes kanban quota-release <id> --probe`` (``kanban_quota_episode_release``): the operator release
+   refuses, with an audited ``quota_release_refused`` event, unless every walled provider shows headroom.
+ """
+@@ -94,12 +94,13 @@ def verdicts(walls, model, verdict=None):
+     return {provider: verdict(provider, model)._asdict() for provider in names}
+ 
+ 
+-def contradicted(exc, *, verdict=live_verdict):
+-    """A start-time typed quota refusal the live usage read contradicts becomes an unconfirmed retry.
++def contradicted(exc, *, verdict=None):
++    """Start-time quota recovery; usage-only injection is retained for read-only verdict callers.
+ 
+-    The worker books the returned exception instead of *exc* (``gateway.session_kanban``): exit 75 with
+-    no reset, so no quota episode or provider wall rests on a pool view the provider itself disputes.
+-    Any other exception, or a probe that confirms or cannot read the wall, returns *exc* unchanged."""
++    Default recovery requires a successful completion and a persisted compare-and-swap clear.
++    A managed startup already attempted recovery before its single retry; never probe it twice.
++    Operator ``live_verdict`` remains read-only and separate from this mutation path.
++    """
+     from agent.model_routing_unavailable import (
+         QuotaContradicted, SubscriptionAuthUnavailable, SubscriptionQuotaUnavailable)
+     wall, seen = exc, set()
+@@ -108,6 +109,12 @@ def contradicted(exc, *, verdict=live_verdict):
+         wall = wall.__cause__ or wall.__context__
+     if wall is None or isinstance(wall, SubscriptionAuthUnavailable) or not isinstance(wall, SubscriptionQuotaUnavailable):
+         return exc
++    if getattr(exc, '_kanban_quota_probe_attempted', False):
++        return exc
++    if verdict is None:
++        from hermes_cli.kanban_quota_recovery import recover_exception
++        return (QuotaContradicted(wall.provider, wall.model, 'live completion verified; stale bench cleared')
++                if recover_exception(exc) else exc)
+     try:
+         found = verdict(wall.provider, wall.model)
+     except Exception:  # health: allow BLE001 -- a failed probe keeps the typed refusal (fail closed) [daveey]
+diff --git a/hermes_cli/kanban_quota_recovery.py b/hermes_cli/kanban_quota_recovery.py
+new file mode 100644
+index 0000000000..144b81c3de
+--- /dev/null
++++ b/hermes_cli/kanban_quota_recovery.py
+@@ -0,0 +1,150 @@
++"""Bounded completion proof for stale model quota benches; only the caller mutates state."""
++from __future__ import annotations
++
++import json
++import time
++from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
++from contextvars import copy_context
++
++
++def _client(timeout):
++    import httpx
++    return httpx.Client(timeout=timeout, follow_redirects=False)
++
++
++def completion_succeeds(provider, model, observed, deadline):
++    """One request, no SDK retry/refresh, and no response or credential diagnostics."""
++    import httpx
++    remaining = deadline - time.monotonic()
++    if remaining <= 0:
++        return False
++    headers = {'Authorization': f'Bearer {observed.runtime_api_key}'}
++    if provider == 'anthropic':
++        url = 'https://api.anthropic.com/v1/messages'
++        headers.update({'anthropic-version': '2023-06-01',
++                        'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20',
++                        'user-agent': 'claude-code/2.1.280 (external, cli)', 'x-app': 'cli'})
++        body = {'model': model, 'max_tokens': 1,
++                'system': [{'type': 'text', 'text': "You are Claude Code, Anthropic's official CLI for Claude."}],
++                'messages': [{'role': 'user', 'content': 'Reply OK.'}]}
++    elif provider == 'openai-codex':
++        from agent.codex_headers import CODEX_AUX_BASE_URL, codex_cloudflare_headers
++        headers.update(codex_cloudflare_headers(observed.runtime_api_key))
++        headers['Accept'] = 'text/event-stream'
++        url = CODEX_AUX_BASE_URL + '/responses'
++        # Codex requires stream + store=false and does not accept max_output_tokens.
++        body = {'model': model, 'instructions': 'Reply OK.', 'store': False, 'stream': True,
++                'input': [{'role': 'user', 'content': [{'type': 'input_text', 'text': 'Reply OK.'}]}],
++                'reasoning': {'effort': 'low'}}
++    else:
++        return False
++    try:
++        with _client(remaining) as client, client.stream('POST', url, headers=headers, json=body) as response:
++            if response.status_code != 200:
++                return False
++            if provider == 'anthropic':
++                return time.monotonic() < deadline
++            for line in response.iter_lines():
++                if time.monotonic() >= deadline:
++                    return False
++                if not line.startswith('data:'):
++                    continue
++                try:
++                    event = json.loads(line[5:].strip())
++                except ValueError:
++                    continue
++                if not isinstance(event, dict):
++                    continue
++                if event.get('type') in ('response.failed', 'response.incomplete', 'error'):
++                    return False
++                if event.get('type') == 'response.completed':
++                    final = event.get('response')
++                    return isinstance(final, dict) and final.get('status') == 'completed'
++    except (httpx.HTTPError, OSError, ValueError):
++        return False
++    return False
++
++
++def _eligible(entry, provider, model, now, disabled):
++    from agent.credential_pool import STATUS_DEAD, STATUS_EXHAUSTED
++    from agent.credential_pool_disabled import matches
++    from agent.credential_pool_model_cooldowns import model_cooldown_until
++    if (entry.auth_type != 'oauth' or not entry.runtime_api_key or entry.last_status == STATUS_DEAD
++            or entry.last_error_code in (401, 402, 403) or matches(entry, disabled)
++            or entry.last_error_reason in ('billing', 'billing_unverified')
++            or entry.extra.get('failure_reason') in ('billing', 'billing_unverified')):
++        return False
++    if entry.last_status == STATUS_EXHAUSTED:
++        return provider == 'openai-codex' and entry.last_error_code == 429
++    return (model_cooldown_until(entry, model) or 0) > now
++
++
++def recover(provider, model, *, seconds=None):
++    """Probe every eligible bench concurrently, CAS completed proofs before the shared deadline.
++
++    Futures hold detached observations, never the pool. Timed-out futures can finish but cannot
++    clear anything. Usage endpoints are intentionally not prerequisites: unknown usage is common.
++    """
++    from copy import deepcopy
++    from agent.credential_pool import load_pool
++    from agent.credential_pool_disabled import disabled_keys
++    from hermes_cli.kanban_quota_probe import PROBE_DEADLINE_SECONDS
++    deadline = time.monotonic() + (PROBE_DEADLINE_SECONDS if seconds is None else seconds)
++    if provider not in ('anthropic', 'openai-codex') or not model:
++        return False
++    pool = load_pool(provider, allowed_auth_types={'oauth'})
++    disabled = disabled_keys(provider)
++    entries = [deepcopy(e) for e in pool.entries() if _eligible(e, provider, model, time.time(), disabled)]
++    if not entries or time.monotonic() >= deadline:
++        return False
++    executor = ThreadPoolExecutor(max_workers=len(entries), thread_name_prefix='quota-proof')
++    cleared = False
++    verified = []
++    try:
++        futures = {executor.submit(copy_context().run, completion_succeeds, provider, model, e, deadline): e
++                   for e in entries}
++        try:
++            for future in as_completed(futures, timeout=max(0, deadline - time.monotonic())):
++                if time.monotonic() >= deadline:
++                    break
++                if not future.exception() and future.result() and time.monotonic() < deadline:
++                    observed = futures[future]
++                    if pool.clear_verified_model_cooldown(observed, model):
++                        cleared = True
++                        verified.append({'id': getattr(observed, 'id', ''),
++                                         'cooldown_until': (observed.model_cooldowns or {}).get(model)
++                                         or getattr(observed, 'last_error_reset_at', None)})
++        except TimeoutError:
++            pass
++    finally:
++        executor.shutdown(wait=False, cancel_futures=True)
++    if cleared:
++        import logging
++        from hermes_cli.kanban_quota_detector import record_contradiction
++        logging.getLogger(__name__).info(
++            'QuotaContradicted cleared provider=%s model=%s accounts=%s',
++            provider, model, len(verified))
++        record_contradiction(provider, model, verified)
++    return cleared
++
++
++def quota_exception(exc):
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    seen = set()
++    while exc is not None and id(exc) not in seen:
++        if isinstance(exc, SubscriptionQuotaUnavailable):
++            return exc
++        seen.add(id(exc))
++        exc = exc.__cause__ or exc.__context__
++    return None
++
++
++def recover_exception(exc):
++    """Fail closed while preserving the original typed startup refusal."""
++    wall = quota_exception(exc)
++    if wall is None:
++        return False
++    try:
++        return recover(wall.provider, wall.model)
++    except Exception:  # health: allow BLE001 -- probe failure must preserve the original startup refusal
++        return False
+diff --git a/tests/agent/test_model_cooldown_recovery.py b/tests/agent/test_model_cooldown_recovery.py
+index 1cddae37e3..e24d03948d 100644
+--- a/tests/agent/test_model_cooldown_recovery.py
++++ b/tests/agent/test_model_cooldown_recovery.py
+@@ -15,6 +15,14 @@ def bench(pool, model=A):
+     return pool.entries()[0]
+ 
+ 
++def test_healthy_selection_does_not_read_model_state(pool, monkeypatch):
++    from hermes_cli import auth
++    def unexpected_read(*args, **kwargs):
++        pytest.fail("healthy selection must not read model state")
++    monkeypatch.setattr(auth, "read_credential_pool", unexpected_read)
++    assert pool.select(model=A) is not None
++
++
+ def test_verified_recovery_clears_only_observed_model(pool):
+     from agent.credential_pool import load_pool
+     from hermes_cli.auth import read_credential_pool
+diff --git a/tests/hermes_cli/test_auth_pool_identity_transplant.py b/tests/hermes_cli/test_auth_pool_identity_transplant.py
+new file mode 100644
+index 0000000000..d804247714
+--- /dev/null
++++ b/tests/hermes_cli/test_auth_pool_identity_transplant.py
+@@ -0,0 +1,57 @@
++"""Cross-account exhaustion transplant through _merge_pool_row_generation (fake tokens only).
++
++Controlled reproduced shape, NOT a proven historical incident."""
++import base64
++import json
++import time
++
++from hermes_cli.auth import _merge_pool_row_generation
++
++
++def _jwt(account_id, sub, email):
++    def b(d):
++        return base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
++    return f"{b({'alg': 'none'})}.{b({'sub': sub, 'email': email, 'https://api.openai.com/auth': {'chatgpt_account_id': account_id}})}.sig"
++
++
++def _exhausted_row(access, refresh, now):
++    return {"id": "r1", "access_token": access, "refresh_token": refresh,
++            "last_status": "exhausted", "last_status_at": now,
++            "last_error_code": 429, "last_error_reset_at": now + 3600}
++
++
++def test_account_swap_does_not_inherit_old_account_exhaustion():
++    now = time.time()
++    a = _jwt("acct-A", "user-A", "same@example.com")  # same email, different account id
++    b = _jwt("acct-B", "user-B", "same@example.com")
++    stale = _exhausted_row(a, "rA", now)
++    disk = {"id": "r1", "access_token": b, "refresh_token": "rB", "last_status": "ok",
++            "last_status_at": now - 100}
++    out = _merge_pool_row_generation(stale, disk, "openai-codex", base_pair=(a, "rA"))
++    assert out["access_token"] == b
++    assert out.get("last_status") != "exhausted"
++    assert not out.get("last_error_reset_at")
++
++
++def test_same_account_refresh_preserves_real_exhaustion():
++    now = time.time()
++    a1 = _jwt("acct-A", "user-A", "a@example.com")
++    a2 = _jwt("acct-A", "user-A", "a@example.com") + "x"  # rotated token, same identity
++    stale = _exhausted_row(a1, "r1", now)
++    disk = {"id": "r1", "access_token": a2, "refresh_token": "r2", "last_status": "ok",
++            "last_status_at": now - 100}
++    out = _merge_pool_row_generation(stale, disk, "openai-codex", base_pair=(a1, "r1"))
++    assert out["access_token"] == a2
++    assert out["last_status"] == "exhausted"
++
++
++def test_account_swap_adopts_all_disk_model_state():
++    a, b = _jwt('A', 'uA', 'a@example.com'), _jwt('B', 'uB', 'b@example.com')
++    stale = {**_exhausted_row(a, 'rA', time.time()), 'model_cooldowns': {'old': 1234}}
++    disk = {'id': 'r1', 'access_token': b, 'refresh_token': 'rB', 'last_status': 'ok',
++            'model_cooldowns': {'new': 5678}, 'model_cooldown_recorded_at': {'new': 100},
++            'model_cooldown_cleared_at': {'cleared': 90}, 'cooldown_until': 42}
++    out = _merge_pool_row_generation(stale, disk, 'openai-codex', base_pair=(a, 'rA'))
++    for field in ('model_cooldowns', 'model_cooldown_recorded_at', 'model_cooldown_cleared_at', 'cooldown_until'):
++        assert out[field] == disk[field]
++
+diff --git a/tests/hermes_cli/test_kanban_quota_detector.py b/tests/hermes_cli/test_kanban_quota_detector.py
+new file mode 100644
+index 0000000000..1f3e81368f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_quota_detector.py
+@@ -0,0 +1,159 @@
++"""Isolated detector proofs; never open a real board."""
++from concurrent.futures import ThreadPoolExecutor
++
++
++def test_threshold_persists_across_instances_and_scopes(tmp_path):
++    from hermes_cli.kanban_quota_detector import Detector
++    path = tmp_path / 'detector.db'
++    for now in (100, 101):
++        assert Detector(path).record('host', 'anthropic', 'model', now=now) is None
++    assert Detector(path).record('other', 'anthropic', 'model', now=102) is None
++    report = Detector(path).record('host', 'anthropic', 'model', now=103)
++    assert report['count'] == 3
++    assert report['host'] == 'host'
++    assert len(Detector(path).pending()) == 1
++
++
++def test_expired_events_do_not_count(tmp_path):
++    from hermes_cli.kanban_quota_detector import Detector
++    detector = Detector(tmp_path / 'detector.db')
++    assert detector.record('h', 'p', 'm', now=0) is None
++    assert detector.record('h', 'p', 'm', now=1) is None
++    assert detector.record('h', 'p', 'm', now=1802) is None
++
++
++def test_concurrent_threshold_has_one_outbox_receipt(tmp_path):
++    from hermes_cli.kanban_quota_detector import Detector
++    # Exercise transactional dedup, not the production fail-soft busy deadline under CI starvation.
++    detector = Detector(tmp_path / 'detector.db', timeout=5)
++    detector.record('h', 'p', 'm', now=10)
++    detector.record('h', 'p', 'm', now=11)
++    with ThreadPoolExecutor(max_workers=8) as pool:
++        results = list(pool.map(lambda _: detector.record('h', 'p', 'm', now=12), range(8)))
++    assert sum(result is not None for result in results) == 1
++    assert len(detector.pending()) == 1
++
++
++def test_owner_delivery_failure_retains_pending(tmp_path):
++    from hermes_cli.kanban_quota_detector import Detector
++    detector = Detector(tmp_path / 'detector.db')
++    for now in (1, 2, 3):
++        detector.record('h', 'p', 'm', now=now)
++    def offline(report):
++        raise OSError('offline')
++    assert detector.deliver(offline) == 0
++    assert len(detector.pending()) == 1
++    receipts = []
++    assert detector.deliver(lambda report: receipts.append(report) or 'card-1') == 1
++    assert receipts[0]['key'].startswith('quota-contradiction:')
++    assert detector.pending() == []
++
++
++ACCTS = [{'id': 'acct-1', 'cooldown_until': 5000, 'token': 'sk-secret', 'email': 'a@b.c'},
++         {'id': 'a@b.c', 'cooldown_until': 1}, 'acct-2']
++
++
++def _board(tmp_path, monkeypatch):
++    monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'kanban.db'))
++    for k in ('HERMES_KANBAN_TASK', 'HERMES_DELEGATED_CHILD_CONTEXT'):
++        monkeypatch.delenv(k, raising=False)
++    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++    return kb, kbc.connect(tmp_path / 'kanban.db')
++
++
++def _three(path, **kw):
++    from hermes_cli.kanban_quota_detector import record_contradiction
++    for now in (100, 101, 102):
++        record_contradiction('anthropic', 'm', ACCTS, host='h', now=now, path=path, **kw)
++
++
++def test_record_contradiction_stores_only_ids_and_cooldowns(tmp_path):
++    from hermes_cli.kanban_quota_detector import Detector
++    path = tmp_path / 'd.db'
++    _three(path)
++    (report,) = Detector(path).pending()
++    assert report['accounts'] == [{'id': 'acct-1', 'cooldown_until': 5000.0},
++                                  {'id': 'acct-2', 'cooldown_until': None}]
++    assert 'sk-secret' not in str(report) and '@' not in str(report)
++
++
++def test_owner_drain_creates_one_card_then_comments_when_open(tmp_path, monkeypatch):
++    from hermes_cli.kanban_quota_detector import Detector, drain_owner, record_contradiction
++    _kb, conn = _board(tmp_path, monkeypatch)
++    path = tmp_path / 'd.db'
++    _three(path)
++    det = Detector(path)
++    assert drain_owner(conn, detector=det) == 1
++    assert drain_owner(conn, detector=det) == 0
++    rows = conn.execute('SELECT id, status FROM tasks').fetchall()
++    assert len(rows) == 1
++    # a later window while the card is open -> comment, no second card
++    for now in (3000, 3001, 3002):
++        record_contradiction('anthropic', 'm', ['acct-3'], host='h', now=now, path=path)
++    assert drain_owner(conn, detector=det) == 1
++    assert len(conn.execute('SELECT id FROM tasks').fetchall()) == 1
++    assert len(_kb.list_comments(conn, rows[0][0])) == 1
++
++
++def test_drain_after_card_done_creates_new_card(tmp_path, monkeypatch):
++    from hermes_cli.kanban_quota_detector import Detector, drain_owner, record_contradiction
++    _kb, conn = _board(tmp_path, monkeypatch)
++    path = tmp_path / 'd.db'
++    _three(path)
++    det = Detector(path)
++    drain_owner(conn, detector=det)
++    conn.execute("UPDATE tasks SET status='done'")
++    conn.commit()
++    for now in (3000, 3001, 3002):
++        record_contradiction('anthropic', 'm', [], host='h', now=now, path=path)
++    drain_owner(conn, detector=det)
++    assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 2
++
++
++def test_managed_worker_cannot_drain(tmp_path, monkeypatch):
++    from hermes_cli.kanban_quota_detector import Detector, drain_owner
++    _kb, conn = _board(tmp_path, monkeypatch)
++    path = tmp_path / 'd.db'
++    _three(path)
++    monkeypatch.setenv('HERMES_KANBAN_TASK', 't_x')
++    assert drain_owner(conn, detector=Detector(path)) == 0
++    assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 0
++    assert len(Detector(path).pending()) == 1
++
++
++def test_drain_failsoft_and_concurrent_owners_single_card(tmp_path, monkeypatch):
++    from hermes_cli.kanban_quota_detector import Detector, drain_owner
++    _kb, conn = _board(tmp_path, monkeypatch)
++    path = tmp_path / 'd.db'
++    _three(path)
++    def boom(c, r):
++        raise RuntimeError('board down')
++    assert drain_owner(conn, detector=Detector(path), writer=boom) == 0
++    assert len(Detector(path).pending()) == 1
++
++    def one(_):
++        c = __import__("hermes_cli.kanban_db_connect", fromlist=["x"]).connect(tmp_path / 'kanban.db')
++        try:
++            return drain_owner(c, detector=Detector(path))
++        finally:
++            c.close()
++    with ThreadPoolExecutor(max_workers=4) as pool:
++        list(pool.map(one, range(4)))
++    assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
++
++
++def test_record_contradiction_failsoft(tmp_path):
++    from hermes_cli.kanban_quota_detector import record_contradiction
++    assert record_contradiction('p', 'm', [], path=str(tmp_path / 'no' / 'such' / 'x.db')) is None
++
++
++def test_dispatch_tick_drains_via_owner_hook(tmp_path, monkeypatch):
++    from hermes_cli import kanban_db_dispatch as kbd
++    from hermes_cli.kanban_quota_detector import Detector
++    _kb, conn = _board(tmp_path, monkeypatch)
++    path = tmp_path / 'd.db'
++    monkeypatch.setattr('hermes_cli.kanban_quota_detector.default_path', lambda: str(path))
++    _three(path)
++    kbd._dispatch_once_locked(conn, spawn_fn=lambda *a: None, max_spawn=0)
++    assert Detector(path).pending() == []
++    assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
+diff --git a/tests/hermes_cli/test_kanban_quota_recovery.py b/tests/hermes_cli/test_kanban_quota_recovery.py
+new file mode 100644
+index 0000000000..844869e1ac
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_quota_recovery.py
+@@ -0,0 +1,250 @@
++"""Completion proof, deadline custody, and startup retry for quota recovery."""
++import threading
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import httpx
++import pytest
++
++from tests.agent import test_model_cooldown_recovery as pool_helpers
++
++api_pool = pool_helpers.pool
++
++
++@pytest.fixture
++def pool(api_pool):
++    from agent.credential_pool import load_pool
++    from hermes_cli import auth
++    with auth._auth_store_lock():
++        store = auth._load_auth_store()
++        store['credential_pool']['anthropic'][0]['auth_type'] = 'oauth'
++        auth._save_auth_store(store)
++    return load_pool('anthropic', allowed_auth_types={'oauth'})
++
++
++def _entry(**kw):
++    return SimpleNamespace(provider='anthropic', auth_type='oauth', runtime_api_key='test-secret',
++                           last_status='ready', last_error_code=None, last_error_reason=None,
++                           model_cooldowns={'model': 9999999999}, extra={}, **kw)
++
++
++def test_completion_uses_claude_code_wire(monkeypatch):
++    from hermes_cli import kanban_quota_recovery as recovery
++    seen = []
++    def handle(request):
++        import json
++        seen.append((request, json.loads(request.content)))
++        return httpx.Response(200, json={'content': []})
++    monkeypatch.setattr(recovery, '_client', lambda timeout: httpx.Client(transport=httpx.MockTransport(handle)))
++    assert recovery.completion_succeeds('anthropic', 'model', _entry(), recovery.time.monotonic() + 5)
++    request, body = seen[0]
++    assert request.url == 'https://api.anthropic.com/v1/messages'
++    assert request.headers['x-app'] == 'cli'
++    assert 'oauth-2025-04-20' in request.headers['anthropic-beta']
++    assert request.headers['user-agent'].startswith('claude-code/2.1.280')
++    assert body['max_tokens'] == 1 and body['model'] == 'model'
++    assert body['system'][0]['text'] == "You are Claude Code, Anthropic's official CLI for Claude."
++    assert len(seen) == 1
++
++
++@pytest.mark.parametrize('data,ok', [
++    ('data: {"type":"response.created"}\n\n', False),
++    ('data: {"type":"response.failed"}\n\n', False),
++    ('data: {"type":"response.completed","response":{"status":"completed"}}\n\n', True),
++    ('data: {"type":"response.completed","response":{"status":"failed"}}\n\n', False),
++])
++def test_codex_requires_completed(monkeypatch, data, ok):
++    from hermes_cli import kanban_quota_recovery as recovery
++    def handle(request):
++        return httpx.Response(200, text=data)
++    monkeypatch.setattr(recovery, '_client', lambda timeout: httpx.Client(transport=httpx.MockTransport(handle)))
++    assert recovery.completion_succeeds('openai-codex', 'model', _entry(), recovery.time.monotonic() + 5) is ok
++
++
++def test_recovery_cas_only_on_caller_and_success(monkeypatch):
++    from hermes_cli import kanban_quota_recovery as recovery
++    entries = [_entry(), _entry()]
++    entries[1].runtime_api_key = 'other-secret'
++    pool = SimpleNamespace(entries=lambda: entries, clear_verified_model_cooldown=Mock(return_value=True))
++    monkeypatch.setattr('agent.credential_pool.load_pool', lambda *a, **k: pool)
++    caller = threading.get_ident()
++    def clear(observed, model):
++        assert threading.get_ident() == caller
++        return True
++    pool.clear_verified_model_cooldown.side_effect = clear
++    monkeypatch.setattr(recovery, 'completion_succeeds', lambda p, m, e, d: e.runtime_api_key == 'test-secret')
++    assert recovery.recover('anthropic', 'model')
++    pool.clear_verified_model_cooldown.assert_called_once_with(entries[0], 'model')
++
++
++def test_late_completion_never_clears(monkeypatch):
++    from hermes_cli import kanban_quota_recovery as recovery
++    started, release, finished = threading.Event(), threading.Event(), threading.Event()
++    pool = SimpleNamespace(entries=lambda: [_entry()], clear_verified_model_cooldown=Mock())
++    monkeypatch.setattr('agent.credential_pool.load_pool', lambda *a, **k: pool)
++    def complete(*args):
++        started.set()
++        release.wait(5)
++        finished.set()
++        return True
++    monkeypatch.setattr(recovery, 'completion_succeeds', complete)
++    try:
++        assert not recovery.recover('anthropic', 'model', seconds=2.0)
++        assert started.is_set()
++    finally:
++        release.set()
++    assert finished.wait(5)
++    pool.clear_verified_model_cooldown.assert_not_called()
++
++
++@pytest.mark.parametrize('healed,second_fails', [(True, False), (True, True), (False, False)])
++def test_startup_retries_once_without_double_probe(monkeypatch, healed, second_fails):
++    from agent.managed_worker import _construct_agent
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    from hermes_cli import kanban_quota_recovery as recovery
++    from gateway import session_kanban
++    error = SubscriptionQuotaUnavailable('anthropic', 'model', 9999999999)
++    factory = Mock(side_effect=[error, error if second_fails else 'agent'])
++    probe = Mock(return_value=healed)
++    monkeypatch.setattr(recovery, 'recover_exception', probe)
++    monkeypatch.setattr('gateway.session_worker_construct.worker_route', lambda *a: {})
++    booked = Mock()
++    monkeypatch.setattr(session_kanban, 'record_start_failure', booked)
++    frame = {'policy': {'kanban_json': '{}'}}
++    if healed and not second_fails:
++        assert _construct_agent(frame, factory, None) == 'agent'
++        booked.assert_not_called()
++    else:
++        with pytest.raises(SubscriptionQuotaUnavailable):
++            _construct_agent(frame, factory, None)
++        booked.assert_called_once_with(frame, error)
++        assert error._kanban_quota_probe_attempted
++    assert factory.call_count == (2 if healed else 1)
++    probe.assert_called_once_with(error)
++
++
++@pytest.mark.parametrize('status', [401, 402, 403, 429, 500])
++def test_rejected_completion_never_retries(monkeypatch, status):
++    from hermes_cli import kanban_quota_recovery as recovery
++    calls = []
++    def handle(request):
++        calls.append(request)
++        return httpx.Response(status)
++    monkeypatch.setattr(recovery, '_client', lambda timeout: httpx.Client(transport=httpx.MockTransport(handle)))
++    assert not recovery.completion_succeeds('anthropic', 'model', _entry(), recovery.time.monotonic() + 5)
++    assert len(calls) == 1
++
++
++@pytest.mark.parametrize('change', [
++    {'auth_type': 'api_key'}, {'runtime_api_key': ''}, {'last_status': 'dead'},
++    {'last_error_code': 401}, {'last_error_code': 402}, {'last_error_code': 403},
++    {'last_error_reason': 'billing'}, {'extra': {'failure_reason': 'billing'}},
++    {'model_cooldowns': {}},
++])
++def test_ineligible_rows_never_probe(monkeypatch, change):
++    from hermes_cli import kanban_quota_recovery as recovery
++    entry = _entry()
++    for key, value in change.items():
++        setattr(entry, key, value)
++    pool = SimpleNamespace(entries=lambda: [entry], clear_verified_model_cooldown=Mock())
++    monkeypatch.setattr('agent.credential_pool.load_pool', lambda *a, **k: pool)
++    complete = Mock(return_value=True)
++    monkeypatch.setattr(recovery, 'completion_succeeds', complete)
++    assert not recovery.recover('anthropic', 'model')
++    complete.assert_not_called()
++    pool.clear_verified_model_cooldown.assert_not_called()
++
++
++def test_default_contradiction_requires_persisted_recovery_and_skips_second_probe(monkeypatch):
++    from hermes_cli import kanban_quota_probe as probe, kanban_quota_recovery as recovery
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable, QuotaContradicted
++    error = SubscriptionQuotaUnavailable('anthropic', 'model', 9999999999)
++    heal = Mock(return_value=False)
++    monkeypatch.setattr(recovery, 'recover_exception', heal)
++    assert probe.contradicted(error) is error
++    heal.return_value = True
++    assert isinstance(probe.contradicted(error), QuotaContradicted)
++    heal.reset_mock()
++    error._kanban_quota_probe_attempted = True
++    assert probe.contradicted(error) is error
++    heal.assert_not_called()
++
++
++def test_completion_without_successful_cas_is_not_recovery(monkeypatch):
++    from hermes_cli import kanban_quota_recovery as recovery
++    pool = SimpleNamespace(entries=lambda: [_entry()], clear_verified_model_cooldown=Mock(return_value=False))
++    monkeypatch.setattr('agent.credential_pool.load_pool', lambda *a, **k: pool)
++    monkeypatch.setattr(recovery, 'completion_succeeds', lambda *args: True)
++    assert not recovery.recover('anthropic', 'model')
++    assert pool.clear_verified_model_cooldown.call_count == 1
++
++
++def test_real_benched_pool_heals_and_startup_runs_without_usage_or_failure_booking(pool, monkeypatch):
++    from agent.credential_pool import load_pool
++    from agent.managed_worker import _construct_agent
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    from hermes_cli.auth import read_credential_pool
++    from hermes_cli import kanban_quota_recovery as recovery
++    from gateway import session_kanban
++    pool_helpers.bench(pool, pool_helpers.B)
++    pool_helpers.bench(pool, pool_helpers.A)
++    attempts = []
++    def factory(**kw):
++        attempts.append(kw)
++        selected = load_pool('anthropic').select(model=pool_helpers.A)
++        if selected is None:
++            raise SubscriptionQuotaUnavailable('anthropic', pool_helpers.A, 9999999999)
++        return selected
++    monkeypatch.setattr('gateway.session_worker_construct.worker_route', lambda *args: {})
++    monkeypatch.setattr('agent.account_usage.fetch_account_usage', lambda *a, **kw: pytest.fail('usage is not proof'))
++    complete = Mock(return_value=True)
++    monkeypatch.setattr(recovery, 'completion_succeeds', complete)
++    booked = Mock()
++    monkeypatch.setattr(session_kanban, 'record_start_failure', booked)
++    selected = _construct_agent({'policy': {'kanban_json': '{}'}}, factory, None)
++    assert selected.runtime_api_key == pool_helpers.KEY
++    assert len(attempts) == 2
++    assert complete.call_count == 1
++    booked.assert_not_called()
++    cooldowns = read_credential_pool('anthropic')[0]['model_cooldowns']
++    assert pool_helpers.A not in cooldowns and pool_helpers.B in cooldowns
++
++
++def test_disabled_account_is_not_probed(pool, monkeypatch):
++    from agent.credential_pool_disabled import set_credential_disabled
++    from hermes_cli import kanban_quota_recovery as recovery
++    entry = pool_helpers.bench(pool)
++    set_credential_disabled('anthropic', entry, True)
++    complete = Mock(return_value=True)
++    monkeypatch.setattr(recovery, 'completion_succeeds', complete)
++    assert not recovery.recover('anthropic', pool_helpers.A)
++    complete.assert_not_called()
++
++
++def test_three_recoveries_record_accounts_and_owner_files_one_card(pool, monkeypatch, tmp_path):
++    from hermes_cli import kanban_quota_recovery as recovery, kanban_quota_detector as detector
++    from hermes_cli import kanban_db_connect as kb
++    path = tmp_path / 'contradictions.db'
++    monkeypatch.setattr(detector, 'default_path', lambda: str(path))
++    monkeypatch.setattr(recovery, 'completion_succeeds', lambda *args: True)
++    for _ in range(3):
++        entry = pool_helpers.bench(pool)
++        assert recovery.recover('anthropic', pool_helpers.A)
++        # Re-load after the verified clear before recording a fresh failure.
++        from agent.credential_pool import load_pool
++        pool = load_pool('anthropic', allowed_auth_types={'oauth'})
++    pending = detector.Detector(path).pending()
++    assert len(pending) == 1
++    assert pending[0]['count'] == 3
++    assert pending[0]['accounts'][0]['id'] == entry.id
++    assert pending[0]['accounts'][0]['cooldown_until'] > 0
++    monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
++    monkeypatch.setattr('agent.delegation_context.is_delegated_child_process_context', lambda: False)
++    conn = kb.connect(tmp_path / 'board.db')
++    try:
++        assert detector.drain_owner(conn) == 1
++        assert detector.drain_owner(conn) == 0
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
++    finally:
++        conn.close()
++
+-- 
+2.51.0
+

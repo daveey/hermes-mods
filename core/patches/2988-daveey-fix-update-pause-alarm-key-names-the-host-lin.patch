@@ -1,0 +1,487 @@
+From f4527edb07aaa082f9ad4c14222a38c4c07112a0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 16:51:22 +0000
+Subject: [PATCH] [daveey] fix(update-pause): alarm key names the host; link
+ sibling hosts' open alarms for one refusal
+
+Every worker shares the install root and the gateway unit, so every worker's
+update-pause alarm had one idempotency key (update-pause-deferred:156199e9...).
+On 2026-11-12 worker-5, worker-1 and worker-6 each filed a card for one
+fleet-wide refusal; three owners investigated from scratch and two opened
+competing PRs (#1554, #1564).
+
+- the key is sha256(host, install root, unit); an open card of this host under
+  the pre-host key is still kept
+- before filing, look board-wide (live file, then Board replica) for an open
+  alarm for the same unit and refusal class on another host; the new card names
+  it as the likely shared cause and parks on its fix first
+- the sibling hears of this host (host, time, refusal line): directly when the
+  card is writable here, else from its home on its next deferral
+
+Card: t_01a1d0a5affda05c
+---
+ hermes_cli/update_pause_deferrals.py          |  43 +++--
+ hermes_cli/update_pause_siblings.py           | 166 ++++++++++++++++
+ .../hermes_cli/test_update_pause_deferrals.py | 180 ++++++++++++++++++
+ 3 files changed, 377 insertions(+), 12 deletions(-)
+ create mode 100644 hermes_cli/update_pause_siblings.py
+
+diff --git a/hermes_cli/update_pause_deferrals.py b/hermes_cli/update_pause_deferrals.py
+index 004dbb9f50..faf7bd327c 100644
+--- a/hermes_cli/update_pause_deferrals.py
++++ b/hermes_cli/update_pause_deferrals.py
+@@ -8,12 +8,13 @@ attempt. From the third consecutive deferral naming the same gateway, this files
+ card for an agent to clear it, but only once that streak is ``MIN_STREAK_S`` old: the instant
+ hub drainer retries a refused apply several times inside its retry window and then cools off
+ 10 min, so only a streak older than 15 min has outlived a cool-off and been refused again;
+-three quick retries against a gateway busy with a chat turn are not a wall. [daveey]
++three quick retries against a gateway busy with a chat turn are not a wall. The card's key names
++the host, and an open alarm for the same refusal on another host is named as the likely shared
++cause (``update_pause_siblings``). [daveey]
+ """
+ from __future__ import annotations
+ 
+ import argparse
+-import hashlib
+ import json
+ import logging
+ import os
+@@ -161,40 +162,55 @@ def main(argv: list[str] | None = None) -> int:
+     return 0
+ 
+ 
+-def _report(conn, unit: str, count: int, first_at: str, reason: str) -> str:
+-    import socket
++def _own_row(conn, key: str, legacy: str, own: frozenset):
++    """This host's newest non-archived alarm under ``key``, or under the pre-host ``legacy`` key when
++    this host created it (a streak open across the upgrade keeps its owner; another host's never)."""
++    cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
++    on = "created_on" if "created_on" in cols else "NULL"
++    for row in conn.execute(
++        f"SELECT id, status, idempotency_key, {on} FROM tasks WHERE idempotency_key IN (?, ?) "
++        "AND status != 'archived' ORDER BY created_at DESC, rowid DESC", (key, legacy),
++    ):
++        if row[2] == key or row[3] is None or row[3] in own:
++            return row
++    return None
+ 
++
++def _report(conn, unit: str, count: int, first_at: str, reason: str) -> str:
+     from hermes_cli import kanban_db as kb
++    from hermes_cli import update_pause_siblings as sib
+     from hermes_cli.update_pause_record import install_root
+ 
+     root = install_root()
+-    key = "update-pause-deferred:" + hashlib.sha256(f"{root}\0{unit}".encode()).hexdigest()[:24]
++    host, own = sib.host_identity(conn)
++    # The key names the host: every worker shares the install root and the unit (t_01a1d0a5affda05c).
++    key = sib.alarm_key(host, root, unit)
+     evidence = (f"`{unit}` has deferred {count} `hermes update` runs in a row since {first_at}. "
+                 f"Latest refusal: {reason}")
+     # Serialize lookup + create so overlapping unattended updates cannot create two owners.
+     with kb.write_txn(conn, allow_nested=True):
+-        row = conn.execute(
+-            "SELECT id, status FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+-            "ORDER BY created_at DESC, rowid DESC LIMIT 1", (key,),
+-        ).fetchone()
++        row = _own_row(conn, key, sib.legacy_key(root, unit), own)
+         if row and row[1] not in {"done", "failed", "cancelled"}:
+             if count % REFRESH_EVERY == 0 and not conn.execute(
+                 "SELECT 1 FROM task_comments WHERE task_id = ? AND author = ? AND body = ?",
+                 (row[0], AUTHOR, evidence),
+             ).fetchone():
+                 kb.add_comment(conn, row[0], AUTHOR, evidence)
++            sib.mirror_followers(conn, row[0], unit, own)
+             return row[0]
+         # A finished owner must not swallow a streak that outlived it; release its stable key atomically.
+         if row:
+             conn.execute("UPDATE tasks SET idempotency_key = NULL WHERE id = ?", (row[0],))
+-        return kb.create_task(
+-            conn, title=f"hermes update keeps deferring on gateway {unit}", assignee="default",
++        sibling = sib.find_sibling(conn, unit, reason, own)
++        task_id = kb.create_task(
++            conn, title=f"{sib.TITLE}{unit}", assignee="default",
+             created_by=AUTHOR, idempotency_key=key, workspace_kind="scratch", requires=["terminal", "file"],
+             completion_contract="local-only",
+-            body=f"On `{socket.gethostname()}` (checkout `{root}`) the pre-swap gateway pause refused the "
++            body=f"On `{host}` (checkout `{root}`) the pre-swap gateway pause refused the "
+                  f"update {count} times in a row, each time naming the same gateway. The checkout has not "
+                  f"moved since {first_at} and every later update defers the same way until this is cleared.\n\n"
+                  f"{evidence}\n\n"
++                 + (sib.sibling_section(sibling, host) if sibling else "") +
+                  "Find why that gateway cannot take an idle pause, with evidence (its unit definition and "
+                  "drop-ins, the code root it runs, its `gateway_state.json`, the update log), then remove the "
+                  "cause:\n"
+@@ -207,6 +223,9 @@ def _report(conn, unit: str, count: int, first_at: str, reason: str) -> str:
+                  "`Update deferred` line naming this gateway) and the checkout HEAD moves. Do not stop a "
+                  "gateway that has work in flight.",
+         )
++        if sibling:  # one investigation: the sibling hears of this host, this card parks on its fix
++            sib.notify(conn, sibling, task_id, host, _now().isoformat(timespec="seconds"), reason)
++        return task_id
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/hermes_cli/update_pause_siblings.py b/hermes_cli/update_pause_siblings.py
+new file mode 100644
+index 0000000000..b86f8b6af4
+--- /dev/null
++++ b/hermes_cli/update_pause_siblings.py
+@@ -0,0 +1,166 @@
++"""Name the host in the update-pause alarm and link sibling hosts' alarms for one refusal. [daveey]
++
++The alarm key (:func:`alarm_key`) was ``sha256(install_root + unit)``. Every Board worker has the same
++install root and gateway unit, so every worker produced one key: once a board-wide lookup or a replica
++shows another worker's card, this host's alarm would be folded into that card and its own failure would
++have no owner. The key now names the host as well.
++
++The other half: on 2026-11-12 one fleet-wide cause (the gateway running as a child of a resident quota
++supervisor) made worker-5, worker-1 and worker-6 each file an alarm. None could see the others, so three
++owners investigated from scratch and two opened competing PRs (#1554, #1564). Before filing,
++:func:`find_sibling` now looks board-wide (the live file, then the Board replica) for an open alarm for
++the same unit and refusal class on another host. When one exists the new card names it as the likely
++shared cause (:func:`sibling_section`) and the sibling hears about this host: directly when its card is
++writable here (:func:`notify`), else from its own home on its next deferral (:func:`mirror_followers`),
++because a card another gateway created can only be written there.
++"""
++from __future__ import annotations
++
++import hashlib
++import logging
++import re
++import socket
++import sqlite3
++from contextlib import contextmanager
++from datetime import UTC, datetime
++from typing import Iterator, Optional
++
++log = logging.getLogger(__name__)
++
++AUTHOR = "update-pause"
++TITLE = "hermes update keeps deferring on gateway "
++CLOSED = ("done", "failed", "cancelled", "archived")
++_HOST = re.compile(r"^On `([^`]+)`", re.MULTILINE)
++_REFUSAL = re.compile(r"Latest refusal: (.*)$", re.MULTILINE)
++_SIBLING = re.compile(r"^Sibling alarm: (t_\w+)", re.MULTILINE)
++_NUMBER = re.compile(r"\d+(?:\.\d+)?")
++
++
++def alarm_key(host: str, root, unit: str) -> str:
++    """The idempotency key of ``host``'s alarm for ``unit`` under the checkout ``root``."""
++    return "update-pause-deferred:" + hashlib.sha256(f"{host}\0{root}\0{unit}".encode()).hexdigest()[:24]
++
++
++def legacy_key(root, unit: str) -> str:
++    """The pre-host key: only this host's own open card under it is still adopted."""
++    return "update-pause-deferred:" + hashlib.sha256(f"{root}\0{unit}".encode()).hexdigest()[:24]
++
++
++def host_identity(conn: sqlite3.Connection) -> tuple[str, frozenset]:
++    """``(host, names)``: the Board gateway id this board file leases as (else the hostname), and every
++    name a card filed on this host can carry (its ``created_on`` or the body's ``On `<host>``` line)."""
++    from hermes_cli import kanban_capability_routing as kcr
++    gateway, hostname = kcr._own_gateway(conn), socket.gethostname()
++    return gateway or hostname, frozenset(n for n in (gateway, hostname) if n)
++
++
++def refusal_class(unit: str, reason) -> str:
++    """The refusal without its variable parts: the unit name, numbers (pids, seconds) and the detail
++    after the first ``": "`` (stderr, exception text). Two hosts refused alike when the classes match."""
++    text = str(reason or "")
++    if unit:
++        text = text.replace(unit, "<unit>")
++    text = _NUMBER.sub("N", text.split(": ", 1)[0])
++    return " ".join(text.lower().split())[:200]
++
++
++def _db_path(conn: sqlite3.Connection) -> Optional[str]:
++    row = conn.execute("PRAGMA database_list").fetchone()
++    return row[2] if row and row[2] else None
++
++
++@contextmanager
++def _replica(conn: sqlite3.Connection) -> Iterator[Optional[sqlite3.Connection]]:
++    """The board's Board replica, read-only, or None (seam: tests replace it)."""
++    from hermes_cli import kanban_foreign_card as kfc
++    with kfc.open_replica(_db_path(conn)) as rep:
++        yield rep
++
++
++def _open_alarms(db: sqlite3.Connection, unit: str) -> list[dict]:
++    cols = {r[1] for r in db.execute("PRAGMA table_info(tasks)")}
++    on = "created_on" if "created_on" in cols else "NULL"
++    marks = ",".join("?" * len(CLOSED))
++    rows = db.execute(
++        f"SELECT id, body, created_at, {on} FROM tasks WHERE created_by = ? AND title = ? "
++        f"AND status NOT IN ({marks}) ORDER BY created_at, id", (AUTHOR, TITLE + unit, *CLOSED)).fetchall()
++    out = []
++    for task_id, body, created_at, created_on in rows:
++        body = body or ""
++        host = created_on or (m.group(1) if (m := _HOST.search(body)) else None)
++        refusal = m.group(1).strip() if (m := _REFUSAL.search(body)) else ""
++        sibling = m.group(1) if (m := _SIBLING.search(body)) else None
++        out.append({"id": task_id, "host": host, "created_at": created_at, "refusal": refusal, "sibling": sibling})
++    return out
++
++
++def _board_alarms(conn: sqlite3.Connection, unit: str) -> list[dict]:
++    """Open alarms for ``unit`` on this board: the live file's, then the replica's (the whole board)."""
++    found = {a["id"]: dict(a, local=True) for a in _open_alarms(conn, unit)}
++    try:
++        with _replica(conn) as rep:
++            if rep is not None:
++                for a in _open_alarms(rep, unit):
++                    found.setdefault(a["id"], dict(a, local=False))
++    except sqlite3.Error as exc:  # an unreadable replica only narrows the lookup to the live file
++        log.info("update-pause: replica unreadable for the sibling lookup (%s)", exc)
++    return sorted(found.values(), key=lambda a: (a["created_at"] or 0, a["id"]))
++
++
++def find_sibling(conn: sqlite3.Connection, unit: str, reason, own: frozenset) -> Optional[dict]:
++    """The oldest open alarm another host filed for ``unit`` with this refusal's class, else None.
++    Oldest, so a third host joins the first investigation rather than a follower of it."""
++    want = refusal_class(unit, reason)
++    for alarm in _board_alarms(conn, unit):
++        if alarm["host"] and alarm["host"] not in own and refusal_class(unit, alarm["refusal"]) == want:
++            return alarm
++    return None
++
++
++def sibling_section(sibling: dict, host: str) -> str:
++    """Body text of a card filed while ``sibling`` is open: name it and park on it first."""
++    sid = sibling["id"]
++    return (f"Sibling alarm: {sid} (filed on `{sibling['host']}`) reports the same refusal for this gateway; "
++            "the likely cause is shared, not local to this host.\n\n"
++            f"First step: do not investigate from scratch. Read {sid}, its comments and the PR it opened, and "
++            f"check that fix against this host (same code path, same unit setup). If it covers this host, park "
++            f"this card on it (wake when the fix is in this host's checkout) and make sure {sid}'s rollout "
++            f"includes `{host}`. Investigate here only when its diagnosis does not hold on this host, and say "
++            f"why on both cards. If {sid} has no comment naming `{host}` yet, add one: it lives on another "
++            "gateway, so use kanban_supervisor_request(ops=[{\"op\": \"operator\", \"action\": \"comment\", "
++            f"\"task_id\": \"{sid}\", \"text\": \"...\"}}]).\n\n")
++
++
++def _note(follower: str, host: str, at, refusal: str) -> str:
++    return (f"Same refusal on `{host}` (at {at}): {refusal}\n"
++            f"Its alarm {follower} names this card as the likely shared cause and parks on this fix; include "
++            f"`{host}` in the rollout.")
++
++
++def _noted(conn: sqlite3.Connection, task_id: str, follower: str) -> bool:
++    return conn.execute("SELECT 1 FROM task_comments WHERE task_id = ? AND author = ? AND body LIKE ?",
++                        (task_id, AUTHOR, f"%Its alarm {follower} %")).fetchone() is not None
++
++
++def notify(conn: sqlite3.Connection, sibling: dict, follower: str, host: str, at, refusal: str) -> bool:
++    """Comment on ``sibling`` when this board file holds it; True when written. A card another gateway
++    created is not writable here: its home adds the comment on its next deferral (:func:`mirror_followers`)."""
++    from hermes_cli import kanban_db as kb
++    if not sibling.get("local") or _noted(conn, sibling["id"], follower):
++        return False
++    kb.add_comment(conn, sibling["id"], AUTHOR, _note(follower, host, at, refusal))
++    return True
++
++
++def mirror_followers(conn: sqlite3.Connection, own_id: str, unit: str, own: frozenset) -> list[str]:
++    """Comment on ``own_id`` (this host's open alarm) for every other host's open alarm that names it as
++    its sibling and is not noted yet; the follower ids commented."""
++    from hermes_cli import kanban_db as kb
++    added = []
++    for alarm in _board_alarms(conn, unit):
++        if alarm["sibling"] != own_id or alarm["host"] in own or _noted(conn, own_id, alarm["id"]):
++            continue
++        at = datetime.fromtimestamp(int(alarm["created_at"] or 0), UTC).isoformat(timespec="seconds")
++        kb.add_comment(conn, own_id, AUTHOR, _note(alarm["id"], alarm["host"] or "another host", at, alarm["refusal"]))
++        added.append(alarm["id"])
++    return added
+diff --git a/tests/hermes_cli/test_update_pause_deferrals.py b/tests/hermes_cli/test_update_pause_deferrals.py
+index 730c1aaf40..adcd08c7fe 100644
+--- a/tests/hermes_cli/test_update_pause_deferrals.py
++++ b/tests/hermes_cli/test_update_pause_deferrals.py
+@@ -204,3 +204,183 @@ def test_an_unreadable_first_at_fails_towards_filing(tmp_path, monkeypatch, cloc
+     assert deferrals.note_deferral([UNIT], BUSY) == ["t_fixture_owner"]
+     unit, entry = reported.call_args.args
+     assert unit == UNIT and entry["count"] == 5 and entry["first_at"] == "not-a-time"
++
++
++# --- Sibling hosts (2026-11-12) ---------------------------------------------------------------
++#
++# worker-5, worker-1 and worker-6 share the install root and the unit, so their alarms had ONE key,
++# and each filed its own card for one fleet-wide refusal: three investigations, two competing PRs.
++# The key names the host; an open alarm on another host for the same refusal is linked.
++
++FLEET = "hermes-gateway"
++FLEET_BUSY = "hermes-gateway is busy or cannot acknowledge an idle pause; retry when idle"
++DRAINING = "hermes-gateway still draining after 30s; retry once in-flight turns finish"
++
++
++def _as_host(monkeypatch, host):
++    import socket
++    monkeypatch.setattr(socket, "gethostname", lambda: host)
++
++
++def _file(monkeypatch, host, reason=FLEET_BUSY, count=3):
++    from hermes_cli.kanban_db_connect import connect_closing
++    _as_host(monkeypatch, host)
++    with connect_closing() as conn:
++        return deferrals._report(conn, FLEET, count, "2026-11-12T15:17:00+00:00", reason)
++
++
++def _card(task_id):
++    from hermes_cli.kanban_db_connect import connect_closing
++    with connect_closing() as conn:
++        row = conn.execute("SELECT body, idempotency_key FROM tasks WHERE id = ?", (task_id,)).fetchone()
++        notes = [r[0] for r in conn.execute(
++            "SELECT body FROM task_comments WHERE task_id = ? AND author = 'update-pause' ORDER BY id",
++            (task_id,))]
++    return row[0], row[1], notes
++
++
++def test_a_two_hosts_with_one_install_root_and_unit_get_their_own_cards(tmp_path, monkeypatch):
++    """(a) The key names the host: worker-1's alarm is never folded into worker-5's card."""
++    _board(tmp_path, monkeypatch)
++    w5 = _file(monkeypatch, "worker-5")
++    w1 = _file(monkeypatch, "worker-1")
++    assert w1 != w5, "worker-1's alarm was folded into worker-5's card"
++    assert _card(w1)[1] != _card(w5)[1], "two hosts produced one idempotency key"
++    assert "On `worker-1`" in _card(w1)[0]
++    assert _file(monkeypatch, "worker-1", count=4) == w1, "a host's own open card was not kept"
++
++
++def test_b_second_host_names_the_open_sibling_and_comments_on_it(tmp_path, monkeypatch, clock):
++    """(b) worker-1 hits worker-5's refusal: worker-5's card hears of worker-1 (host, time, refusal), and
++    worker-1's card names worker-5's as the likely shared cause and parks on its fix first."""
++    _board(tmp_path, monkeypatch)
++    w5 = _file(monkeypatch, "worker-5")
++    w1 = _file(monkeypatch, "worker-1")
++    body = _card(w1)[0]
++    assert f"Sibling alarm: {w5}" in body and "do not investigate from scratch" in body
++    assert "park this card on it" in body
++    notes = _card(w5)[2]
++    assert len(notes) == 1 and "`worker-1`" in notes[0] and FLEET_BUSY in notes[0] and w1 in notes[0]
++    assert T0.isoformat(timespec="seconds") in notes[0], "the sighting carries no time"
++    # A third host joins the first investigation, not worker-1's follower card.
++    w6 = _file(monkeypatch, "worker-6")
++    assert f"Sibling alarm: {w5}" in _card(w6)[0]
++    assert len(_card(w5)[2]) == 2 and _card(w1)[2] == []
++    # worker-1's later deferrals keep its card and never re-comment the sibling.
++    assert _file(monkeypatch, "worker-1", count=4) == w1 and len(_card(w5)[2]) == 2
++
++
++def test_b_the_cli_child_entry_links_the_sibling(tmp_path, monkeypatch, capsys):
++    """(b) via ``main`` (the child interpreter ``report`` spawns): same linking."""
++    _board(tmp_path, monkeypatch)
++    w5 = _file(monkeypatch, "worker-5")
++    _as_host(monkeypatch, "worker-1")
++    assert deferrals.main(["--unit", FLEET, "--count", "3", "--first-at", "2026-11-12T15:43:00+00:00",
++                           "--reason", FLEET_BUSY]) == 0
++    w1 = capsys.readouterr().out.strip().rsplit("=", 1)[1]
++    assert w1 != w5 and f"Sibling alarm: {w5}" in _card(w1)[0] and w1 in _card(w5)[2][0]
++
++
++def test_b_note_deferral_end_to_end_links_the_sibling(tmp_path, monkeypatch, clock):
++    """(b) via ``note_deferral`` -> ``report`` -> a real child interpreter, running as this host. (The
++    live-system guard refuses a child whose argv names the bare ``hermes-gateway`` unit: use ``UNIT``.)"""
++    import socket
++
++    from hermes_cli.kanban_db_connect import connect_closing
++    _board(tmp_path, monkeypatch)
++    reason = FLEET_BUSY.replace(FLEET, UNIT)
++    with connect_closing() as conn:
++        w5 = deferrals._report(conn, UNIT, 3, "2026-11-12T15:17:00+00:00", reason)
++    conn_body = _card(w5)[0]
++    assert f"On `{socket.gethostname()}`" in conn_body
++    with connect_closing() as conn:  # the sibling was filed on another host
++        conn.execute("UPDATE tasks SET body = replace(body, ?, ?), idempotency_key = ? WHERE id = ?",
++                     (f"On `{socket.gethostname()}`", "On `elsewhere-host`", "update-pause-deferred:elsewhere", w5))
++        conn.commit()
++    filed = []
++    for at in (0, 600, deferrals.MIN_STREAK_S):
++        clock.at = at
++        filed = deferrals.note_deferral([UNIT], reason)
++    assert len(filed) == 1 and filed[0] != w5
++    assert f"Sibling alarm: {w5}" in _card(filed[0])[0] and filed[0] in _card(w5)[2][0]
++
++
++def test_b_a_foreign_sibling_in_the_board_replica_is_named_and_hears_from_its_home(tmp_path, monkeypatch):
++    """Synced fleet: worker-5's card lives only in worker-1's Board replica (not writable there). worker-1's
++    card names it; worker-5's own next deferral notes the sighting on its card, once."""
++    import contextlib
++    import sqlite3
++
++    from hermes_cli import update_pause_siblings as sib
++    from hermes_cli.kanban_db_connect import connect_closing
++
++    w5_db, w1_db = tmp_path / "w5" / "board.db", tmp_path / "w1" / "board.db"
++    for path in (w5_db, w1_db):
++        path.parent.mkdir()
++
++    def replica_of(path):
++        @contextlib.contextmanager
++        def seam(conn):
++            rep = sqlite3.connect(path)
++            try:
++                yield rep
++            finally:
++                rep.close()
++        return seam
++
++    _board(tmp_path, monkeypatch)
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(w5_db))
++    w5 = _file(monkeypatch, "worker-5")
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(w1_db))
++    monkeypatch.setattr(sib, "_replica", replica_of(w5_db))
++    w1 = _file(monkeypatch, "worker-1")
++    body = _card(w1)[0]
++    assert f"Sibling alarm: {w5}" in body and '"action": "comment"' in body
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(w5_db))
++    assert _card(w5)[2] == [], "worker-1 wrote on a card it holds only as a replica copy"
++    monkeypatch.setattr(sib, "_replica", replica_of(w1_db))
++    assert _file(monkeypatch, "worker-5", count=4) == w5
++    assert _file(monkeypatch, "worker-5", count=5) == w5
++    notes = _card(w5)[2]
++    assert len(notes) == 1 and "`worker-1`" in notes[0] and w1 in notes[0] and FLEET_BUSY in notes[0]
++    with connect_closing() as conn:
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
++
++
++def test_c_without_a_sibling_the_card_is_unchanged(tmp_path, monkeypatch):
++    """(c) No open alarm on another host for this refusal: the ordinary card, no sibling text, no comments.
++    Another host's alarm for a different refusal class, or a closed one, is no sibling."""
++    from hermes_cli.kanban_db_connect import connect_closing
++    _board(tmp_path, monkeypatch)
++    other = _file(monkeypatch, "worker-5", reason=DRAINING)
++    closed = _file(monkeypatch, "worker-6")
++    with connect_closing() as conn:
++        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (closed,))
++        conn.commit()
++    lone = _file(monkeypatch, "worker-1")
++    body = _card(lone)[0]
++    assert "Sibling alarm" not in body and "Find why that gateway cannot take an idle pause" in body
++    assert body.startswith("On `worker-1` (checkout ")
++    assert _card(other)[2] == [] and _card(closed)[2] == []
++
++
++def test_refusal_classes_ignore_pids_seconds_and_detail():
++    from hermes_cli import update_pause_siblings as sib
++    assert sib.refusal_class("gw-a", "gw-a still draining after 30s; retry") == \
++        sib.refusal_class("gw-a", "gw-a still draining after 45s; retry")
++    assert sib.refusal_class("gw-a", "could not inventory gw-a: Access denied") == \
++        sib.refusal_class("gw-a", "could not inventory gw-a: Unit not loaded")
++    assert sib.refusal_class(FLEET, FLEET_BUSY) != sib.refusal_class(FLEET, DRAINING)
++
++
++def test_an_open_pre_host_key_card_of_this_host_is_kept(tmp_path, monkeypatch):
++    """A streak open across the upgrade keeps its owner (legacy key)."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import update_pause_siblings as sib
++    from hermes_cli.kanban_db_connect import connect_closing
++    from hermes_cli.update_pause_record import install_root
++    _board(tmp_path, monkeypatch)
++    with connect_closing() as conn:
++        old = kb.create_task(conn, title=sib.TITLE + FLEET, assignee="default", created_by="update-pause",
++                             idempotency_key=sib.legacy_key(install_root(), FLEET), body="On `worker-1` ...")
++    assert _file(monkeypatch, "worker-1") == old
+-- 
+2.51.0
+

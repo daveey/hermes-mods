@@ -1,0 +1,499 @@
+From af338a3134d6cca2c6663f9cb27d202b49fdcbaa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 00:22:03 +0000
+Subject: [PATCH] fix(kanban-move): unpushed guard scans the move's checkpoint,
+ skips other cards' trees, bounds git time, guards the queue repin [daveey]
+
+Follow-ups to PR #1681 (review t_01a1d113d42a1b13; card t_01a1d1197fa00599):
+- check()/_card_text scan the move's own checkpoint (it is written after check()).
+- a text-named tree whose owner marker names another card is skipped (reviewer naming the implementer's tree).
+- tree_state bounds total git time (STATE_BUDGET_S, shrinking per-call timeouts; past it: unchecked = state).
+- move_queued's worker-first Board repin to the worker queue takes the unpushed_state_here guard.
+- docstring: a move whose matches still include this host is not 'leaving' and is unguarded (intentional).
+---
+ hermes_cli/kanban_move.py                     |  60 +++++---
+ hermes_cli/kanban_move_pool.py                |  85 +++++++++---
+ hermes_cli/kanban_worker_repin.py             |   7 +-
+ hermes_cli/worktree_ops.py                    |   4 +-
+ .../test_kanban_move_unpushed_followups.py    | 130 ++++++++++++++++++
+ 5 files changed, 242 insertions(+), 44 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_move_unpushed_followups.py
+
+diff --git a/hermes_cli/kanban_move.py b/hermes_cli/kanban_move.py
+index 501fb13bc9..16cebc7630 100644
+--- a/hermes_cli/kanban_move.py
++++ b/hermes_cli/kanban_move.py
+@@ -27,9 +27,13 @@ Guards:
+ * a card leaving this host (no match is this host) while a tree of it here is dirty or has commits on no remote is
+   refused ``unpushed_state_here`` unless ``force`` (then the event carries ``left_unpushed_state``). Its trees are
+   :func:`hermes_cli.kanban_move_pool.card_trees`: the workspace, owner-marked linked worktrees (``~/code/_wt/<slug>``)
+-  and linked worktrees named in the body, the newest comment or the newest checkpoint. On 11-11 a hub card whose
+-  ``~/code/_wt`` trees held unpushed commits was moved to worker-2, which could not reach them and moved it back.
+-  Limitation: only the host holding the trees can see them, so a move issued from another host is blind to them.
++  and linked worktrees named in the body, the newest comment, the newest checkpoint or the move's own checkpoint
++  (a text-named tree whose owner marker names another card is that card's work, not this one's). On 11-11 a hub
++  card whose ``~/code/_wt`` trees held unpushed commits was moved to worker-2, which could not reach them and moved
++  it back. A worker-first card's Board repin to the worker queue takes the same guard. Limitations: only the host
++  holding the trees can see them, so a move issued from another host is blind to them; and a move whose matches
++  still include this host (``pool:worker`` issued on a pool worker, ``linux``) is not "leaving" and is not
++  guarded, though another matching host may claim the card (intentional: this host may still run it).
+ 
+ Every move is a ``moved`` event ``{from_machine, runs_on, previous_runs_on, reason, move_no, forced}``: the audit log.
+ """
+@@ -120,10 +124,11 @@ def _requirement_matches(matches, machines, requires, skills, *, me=None, assign
+ def check(conn: sqlite3.Connection, task_id: str, runs_on: Any, *, force: bool = False,
+           machines: Optional[Mapping[str, Mapping[str, Any]]] = None, me: Optional[str] = None,
+           cfg: Optional[dict] = None, host_reason: Optional[str] = None,
+-          reason: Optional[str] = None) -> dict[str, Any]:
++          reason: Optional[str] = None, checkpoint: Optional[str] = None) -> dict[str, Any]:
+     """Validate a move; returns ``{runs_on, previous, matches, move_no, forced, me, host}`` or raises
+     :class:`MoveRefused`. ``host`` holds the event fields of a pin to one pool worker (:mod:`kanban_move_pool`).
+-    A ``reason`` claiming ship custody needs ``host_reason`` (:mod:`kanban_move_ship`)."""
++    A ``reason`` claiming ship custody needs ``host_reason`` (:mod:`kanban_move_ship`). ``checkpoint`` is the
++    move's own, not yet written checkpoint: scanned for tree paths with the card's stored text."""
+     from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_move_ship as kms
+     from hermes_cli import kanban_worker_node as wn
+@@ -191,20 +196,29 @@ def check(conn: sqlite3.Connection, task_id: str, runs_on: Any, *, force: bool =
+     if back and len(back) == len(matches) and not force:
+         raise MoveRefused("ping_pong", f"the card already left {', '.join(back)}; pass force to move it back")
+     if me not in matches:  # git reads: check() runs before every caller's write transaction
+-        _trees, state = kmp.card_trees_state(task_id, row["workspace_path"], _card_text(conn, task_id),
+-                                             linked_text_only=True)
+-        if state and not force:
+-            raise MoveRefused(UNPUSHED_HERE, (
+-                f"{state} on {me}: another machine cannot resume it. Push the branch (or let the card's run publish "
+-                "it) and move again, or pass force to leave it"))
+-        if state:
++        if state := unpushed_here(conn, task_id, row["workspace_path"], me=me, force=force, checkpoint=checkpoint):
+             host = {**host, "left_unpushed_state": state}
+     return {"runs_on": labels, "previous": wn._parse(row["runs_on"]), "matches": matches, "move_no": len(past) + 1,
+             "forced": bool(back and force), "me": me, "host": host}
+ 
+ 
+-def _card_text(conn: sqlite3.Connection, task_id: str) -> str:
+-    """Body, newest comment and newest checkpoint: where a card names its ``~/code/_wt/<slug>`` trees."""
++def unpushed_here(conn: sqlite3.Connection, task_id: str, workspace_path: Optional[str], *, me: str, force: bool,
++                  checkpoint: Optional[str] = None) -> Optional[str]:
++    """The card's unpushed state on this host (to record as ``left_unpushed_state`` under ``force``) or None;
++    without ``force`` a state raises ``unpushed_state_here``. Runs git: call it outside any write transaction."""
++    from hermes_cli import kanban_move_pool as kmp
++    _trees, state = kmp.card_trees_state(task_id, workspace_path, _card_text(conn, task_id, checkpoint),
++                                         linked_text_only=True)
++    if state and not force:
++        raise MoveRefused(UNPUSHED_HERE, (
++            f"{state} on {me}: another machine cannot resume it. Push the branch (or let the card's run publish "
++            "it) and move again, or pass force to leave it"))
++    return state
++
++
++def _card_text(conn: sqlite3.Connection, task_id: str, checkpoint: Optional[str] = None) -> str:
++    """Body, newest comment, newest checkpoint and the move's own ``checkpoint``: where a card names its
++    ``~/code/_wt/<slug>`` trees."""
+     parts = []
+     for sql in ("SELECT body FROM tasks WHERE id = ?",
+                 "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT 1"):
+@@ -224,6 +238,7 @@ def _card_text(conn: sqlite3.Connection, task_id: str) -> str:
+         except ValueError:
+             meta = {}
+         parts.append(str((meta.get("checkpoint") if isinstance(meta, dict) else None) or row[1] or ""))
++    parts.append(checkpoint or "")
+     return "\n".join(parts)
+ 
+ 
+@@ -244,7 +259,7 @@ def move_task(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason: s
+         return refused  # a hub target must convince the admission judge first [daveey]
+     try:
+         plan = check(conn, task_id, runs_on, force=force, machines=machines, me=me, cfg=cfg, host_reason=host_reason,
+-                     reason=reason)
++                     reason=reason, checkpoint=checkpoint)
+     except MoveRefused as exc:
+         return {"ok": False, "reason_code": exc.code, "error": str(exc)}
+ 
+@@ -285,6 +300,7 @@ def move_queued(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason:
+     A worker-first policy card instead takes the explicit Board repin path (``hub`` is for tests).
+     ``event_extra`` is merged into the ``moved`` event (audit provenance, e.g. an operator call's uid)."""
+     from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_worker_node as wn
+     reason = (reason or "").strip()
+     if not reason:
+@@ -300,10 +316,20 @@ def move_queued(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason:
+             labels = wn.normalize_runs_on(runs_on)
+         except ValueError as exc:
+             return {"ok": False, "reason_code": "invalid_runs_on", "error": str(exc)}
+-        return repin.repin_to_origin(conn, task_id, list(labels or []), reason, hub=hub)
++        extra: dict[str, Any] = {}  # operator provenance rides a marker (kanban_operator_call), not this event
++        origin = (sync.sync_state(conn) or {}).get("gateway_id")
++        if origin and list(labels or []) != [f"machine:{origin}"]:  # a repin to the worker queue leaves the origin
++            row = conn.execute("SELECT workspace_path FROM tasks WHERE id = ?", (task_id,)).fetchone()
++            try:
++                if state := unpushed_here(conn, task_id, row["workspace_path"] if row else None, me=str(origin),
++                                          force=force, checkpoint=checkpoint):
++                    extra["event_extra"] = {"left_unpushed_state": state}
++            except MoveRefused as exc:
++                return {"ok": False, "reason_code": exc.code, "error": str(exc)}
++        return repin.repin_to_origin(conn, task_id, list(labels or []), reason, hub=hub, **extra)
+     try:
+         plan = check(conn, task_id, runs_on, force=force, machines=machines, me=me, cfg=cfg, host_reason=host_reason,
+-                     reason=reason)
++                     reason=reason, checkpoint=checkpoint)
+     except MoveRefused as exc:
+         return {"ok": False, "reason_code": exc.code, "error": str(exc)}
+     with kb.write_txn(conn):
+diff --git a/hermes_cli/kanban_move_pool.py b/hermes_cli/kanban_move_pool.py
+index ddd9fd183a..43a0510ae2 100644
+--- a/hermes_cli/kanban_move_pool.py
++++ b/hermes_cli/kanban_move_pool.py
+@@ -14,6 +14,7 @@ import fnmatch
+ import json
+ import re
+ import subprocess
++import time
+ from pathlib import Path
+ from typing import Any, Iterable, Mapping, Optional
+ 
+@@ -87,7 +88,8 @@ def _per_card(path: Path) -> bool:
+ def card_trees(task_id: Optional[str], path: Optional[str], text: Optional[str] = "",
+                extra: Iterable[str] = (), *, linked_text_only: bool = False) -> list[str]:
+     """Git trees on this host that hold the card's work: the workspace and its direct children, linked worktrees
+-    whose worktree-owner marker names the card, trees the park text names (``~/code/_wt/<slug>``), and ``extra``.
++    whose worktree-owner marker names the card, trees the park text names (``~/code/_wt/<slug>``) unless their
++    owner marker names another card, and ``extra``.
+     ``linked_text_only`` keeps, among the text-named trees and ``extra``, only linked worktrees (a ``.git`` file) and
+     clones at a per-card location (``~/code/_wt/<slug>``): a shared main checkout a card body merely mentions
+     (``~/code/myapp``, the gateway's live ``~/.hermes/hermes-agent``) is not the card's work."""
+@@ -103,10 +105,16 @@ def card_trees(task_id: Optional[str], path: Optional[str], text: Optional[str]
+         home = _trees_home()
+         for pattern in _WORKTREE_GLOBS:
+             found += [p for p in sorted(home.glob(pattern)) if p.is_dir() and _owner(p) == task_id]
+-    for raw in [*_PATH.findall(text or ""), *extra]:
++    named = [(raw, True) for raw in _PATH.findall(text or "")] + [(raw, False) for raw in extra]
++    for raw, from_text in named:
+         p = Path(raw.rstrip(".,;:)]'\"")).expanduser()
+-        if p.is_dir() and _is_tree(p) and not (linked_text_only and (p / ".git").is_dir() and not _per_card(p)):
+-            found.append(p)
++        if not (p.is_dir() and _is_tree(p)) or (linked_text_only and (p / ".git").is_dir() and not _per_card(p)):
++            continue
++        # A tree the text only names but whose owner marker names another card is that card's work (a reviewer
++        # card naming the implementer's ~/code/_wt/<slug>): its state is not this card's to carry.
++        if from_text and task_id and (owner := _owner(p)) and owner != task_id:
++            continue
++        found.append(p)
+     out: list[str] = []
+     for p in found:
+         key = str(p.resolve())
+@@ -120,7 +128,7 @@ _MAX_ANCESTRY_CHECKS = 50
+ _MAX_REFRESHES = 5
+ 
+ 
+-def pushed_on_remote(tree: str) -> bool:
++def pushed_on_remote(tree: str, *, deadline: Optional[float] = None) -> bool:
+     """Whether a tree the local refs call unpushed has HEAD on a remote branch after all. Fails toward False.
+ 
+     ``git push https://github.com/<o>/<r>.git HEAD:wt/x`` (a URL, not the remote's name: the HTTPS-credential push
+@@ -128,33 +136,37 @@ def pushed_on_remote(tree: str) -> bool:
+     branch past HEAD again. The local check then reports pushed work as unpushed, and the park pinned a card to
+     its worker (11-12: t_01a1d0a1eaa00371 sat ready on ``machine:worker-2`` while worker-2 was on a Board hold).
+     So ask the remote: HEAD is a remote branch tip, or a stale tracking ref HEAD builds on, once refreshed from
+-    the remote, contains HEAD."""
++    the remote, contains HEAD. Every git call ends by ``deadline`` (:func:`_clock`); past it the answer is False."""
+     from functools import partial
+     from hermes_cli.worktree_ops import _git_out, _worktree_has_unpushed_commits
+     # Keep credential helpers for private remotes, but never consume the caller's stdin.
+     git_out = partial(_git_out, stdin=subprocess.DEVNULL)
++
++    def t(cap: float, calls: int = 1) -> float:
++        return cap if deadline is None else _within(deadline, cap, calls)
+     try:
+-        head = git_out(["rev-parse", "HEAD"], tree)
+-        remotes = (git_out(["remote"], tree) or "").split()
++        head = git_out(["rev-parse", "HEAD"], tree, timeout=t(10))
++        remotes = (git_out(["remote"], tree, timeout=t(10)) or "").split()
+         if not head or not remotes:
+             return False
+-        branch = git_out(["symbolic-ref", "-q", "HEAD"], tree)
++        branch = git_out(["symbolic-ref", "-q", "HEAD"], tree, timeout=t(10))
+         preferred: set[tuple[str, str]] = set()
+         if branch:
+             destinations = git_out(["for-each-ref", "--format=%(upstream:remotename) %(upstream:remoteref)"
+-                                    "%0a%(push:remotename) %(push:remoteref)", branch], tree) or ""
++                                    "%0a%(push:remotename) %(push:remoteref)", branch], tree,
++                                   timeout=t(10)) or ""
+             preferred = {(remote, ref) for line in destinations.splitlines() if " " in line
+                          for remote, ref in [line.split(" ", 1)]}
+         stale: list[tuple[str, str, str]] = []
+         fallback: list[tuple[str, str, str]] = []
+         checks = 0
+         for remote in remotes:
+-            listing = git_out(["ls-remote", "--heads", remote], tree, timeout=_REMOTE_TIMEOUT)
++            listing = git_out(["ls-remote", "--heads", remote], tree, timeout=t(_REMOTE_TIMEOUT))
+             if not listing:
+                 continue
+             tracked = dict(line.split(" ", 1)[::-1] for line in (git_out(
+-                ["for-each-ref", "--format=%(objectname) %(refname)", f"refs/remotes/{remote}"], tree) or ""
+-            ).splitlines() if " " in line)
++                ["for-each-ref", "--format=%(objectname) %(refname)", f"refs/remotes/{remote}"], tree, timeout=t(10))
++                or "").splitlines() if " " in line)
+             for line in listing.splitlines():
+                 sha, _, ref = line.partition("\t")
+                 if sha == head:
+@@ -166,7 +178,7 @@ def pushed_on_remote(tree: str) -> bool:
+                 candidate = (remote, ref, tracking)
+                 if local and checks < _MAX_ANCESTRY_CHECKS:
+                     checks += 1
+-                    if git_out(["merge-base", "--is-ancestor", local, "HEAD"], tree) is not None:
++                    if git_out(["merge-base", "--is-ancestor", local, "HEAD"], tree, timeout=t(10)) is not None:
+                         stale.append(candidate)
+                         continue
+                 # New URL-pushed branches have no tracking ref; rebased URL pushes
+@@ -178,8 +190,8 @@ def pushed_on_remote(tree: str) -> bool:
+             (c[0], c[1]) not in preferred, c[1] != branch,
+         ))[:_MAX_REFRESHES]
+         for remote, ref, tracking in refresh:
+-            git_out(["fetch", "--no-tags", "-q", remote, f"+{ref}:{tracking}"], tree, timeout=_REMOTE_TIMEOUT)
+-        return bool(refresh) and not _worktree_has_unpushed_commits(tree)
++            git_out(["fetch", "--no-tags", "-q", remote, f"+{ref}:{tracking}"], tree, timeout=t(_REMOTE_TIMEOUT))
++        return bool(refresh) and not _worktree_has_unpushed_commits(tree, timeout=t(10, calls=3))
+     except (OSError, subprocess.SubprocessError, ValueError):
+         return False
+ 
+@@ -195,16 +207,45 @@ def state_parts(state: str) -> tuple[str, str]:
+     return "", state
+ 
+ 
+-def tree_state(trees: Iterable[str]) -> Optional[str]:
+-    """``dirty worktree <p>`` / ``unpushed commits in <p>`` for the first tree with state, else None."""
++# Git time for one card's trees. The operator call's scan and the pickup-stall alarm run the move guard inline, and
++# 20+ trees at 10-20 s per git call took minutes; past the budget the rest count as unchecked (fail safe: state).
++STATE_BUDGET_S = 20.0
++
++
++class _BudgetSpent(ValueError):
++    pass
++
++
++def _clock() -> float:
++    """Monotonic seconds (a seam: tests advance a fake clock per git call)."""
++    return time.monotonic()
++
++
++def _within(deadline: float, cap: float, calls: int = 1) -> float:
++    """Per-call timeout so ``calls`` more git calls end by ``deadline``; raises :class:`_BudgetSpent` past it."""
++    left = deadline - _clock()
++    if left <= 0:
++        raise _BudgetSpent("git budget spent")
++    return min(cap, left / calls)
++
++
++def tree_state(trees: Iterable[str], *, budget: float = STATE_BUDGET_S) -> Optional[str]:
++    """``dirty worktree <p>`` / ``unpushed commits in <p>`` for the first tree with state, else None. Git runs at
++    most ``budget`` seconds in all (per-call timeouts shrink to the time left); a tree it could not check reads
++    ``unchecked worktree <p>``, which callers treat as state (git timeouts already fail safe the same way)."""
+     from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
++    deadline = _clock() + budget
+     for tree in trees:
+         if not Path(tree).is_dir():
+             continue
+-        if _worktree_is_dirty(tree, tree):
+-            return f"{_DIRTY}{tree}"
+-        if _worktree_has_unpushed_commits(tree) and not pushed_on_remote(tree):
+-            return f"{_UNPUSHED}{tree}"
++        try:
++            if _worktree_is_dirty(tree, tree, timeout=_within(deadline, 10, calls=2)):
++                return f"{_DIRTY}{tree}"
++            if (_worktree_has_unpushed_commits(tree, timeout=_within(deadline, 10, calls=3))
++                    and not pushed_on_remote(tree, deadline=deadline)):
++                return f"{_UNPUSHED}{tree}"
++        except _BudgetSpent:
++            return f"unchecked worktree {tree} (git checks of the card's trees took over {budget:g}s)"
+     return None
+ 
+ 
+diff --git a/hermes_cli/kanban_worker_repin.py b/hermes_cli/kanban_worker_repin.py
+index 2783c9ae8b..550395afbe 100644
+--- a/hermes_cli/kanban_worker_repin.py
++++ b/hermes_cli/kanban_worker_repin.py
+@@ -152,9 +152,10 @@ def eligibility(conn: sqlite3.Connection, task_id: str, labels: list[str]) -> di
+ 
+ 
+ def repin_to_origin(conn: sqlite3.Connection, task_id: str, labels: list[str], reason: str, *,
+-                    hub: Any = None) -> dict[str, Any]:
++                    hub: Any = None, event_extra: Optional[dict] = None) -> dict[str, Any]:
+     """Board CAS repin + authoritative pull. Result keys match ``move_queued`` plus ``repinned``,
+-    ``board_version`` and ``readback`` (``confirmed`` | ``pending``)."""
++    ``board_version`` and ``readback`` (``confirmed`` | ``pending``). ``event_extra`` joins the ``moved`` event
++    (``left_unpushed_state`` from ``move_queued``'s unpushed-state guard on a forced queue repin)."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_move as km
+     from hermes_cli import kanban_sync_client as client
+@@ -212,7 +213,7 @@ def repin_to_origin(conn: sqlite3.Connection, task_id: str, labels: list[str], r
+                 "from_machine": me, "runs_on": pre["labels"], "previous_runs_on": pre["previous"],
+                 "reason": reason[:500],
+                 "move_no": move_no, "forced": False, "matches": pre["matches"], "queued": True, REPINNED_EVENT_FLAG: True,
+-                "board_version": version})
++                "board_version": version, **(event_extra or {})})
+     except sqlite3.Error:
+         pass  # the Board's own placement_repinned event still records the change
+ 
+diff --git a/hermes_cli/worktree_ops.py b/hermes_cli/worktree_ops.py
+index 5b6dd17042..b270a5e060 100644
+--- a/hermes_cli/worktree_ops.py
++++ b/hermes_cli/worktree_ops.py
+@@ -472,7 +472,7 @@ def _worktree_merge_base_ref(path: str, timeout: float = 5) -> Optional[str]:
+     return None
+ 
+ 
+-def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> bool:
++def _worktree_has_unpushed_commits(worktree_path: str, timeout: float = 10) -> bool:
+     """Whether a worktree has commits unreachable from any remote branch. Fails SAFE toward True.
+ 
+     No remote-tracking refs = nothing was ever pushed, so the tree is compared against the local
+@@ -517,7 +517,7 @@ def _include_symlink_paths(worktree_path: str, repo_root) -> set:
+     return paths
+ 
+ 
+-def _worktree_is_dirty(worktree_path: str, repo_root, timeout: int = 10) -> bool:
++def _worktree_is_dirty(worktree_path: str, repo_root, timeout: float = 10) -> bool:
+     """Whether a worktree has staged/unstaged/untracked changes. Fails SAFE toward True.
+ 
+     Untracked ``.worktreeinclude`` directory symlinks back to the main checkout *repo_root* are
+diff --git a/tests/hermes_cli/test_kanban_move_unpushed_followups.py b/tests/hermes_cli/test_kanban_move_unpushed_followups.py
+new file mode 100644
+index 0000000000..01095e3fb3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_move_unpushed_followups.py
+@@ -0,0 +1,130 @@
++"""Follow-ups to the unpushed-state move guard (PR #1681 review t_01a1d113d42a1b13, card t_01a1d1197fa00599). [daveey]
++
++* the move's own checkpoint is scanned for tree paths (check() runs before it is written);
++* a tree the text names but whose owner marker names another card is that card's work (a reviewer naming the
++  implementer's ``~/code/_wt/<slug>``);
++* git time for one card's trees is bounded (operator call scan, pickup-stall alarm);
++* a worker-first card's Board repin to the worker queue takes the guard too (it skipped ``check()``).
++"""
++from __future__ import annotations
++
++import subprocess
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_move as km
++from hermes_cli import kanban_move_pool as kmp
++from hermes_cli import worktree_ops
++from tests.hermes_cli import test_kanban_worker_policy_db as db_fixtures
++from tests.hermes_cli.test_kanban_move_unpushed import (
++    TARGET, _card, _commit, _git, _moved, _refused, _worktree, hub)
++from tests.hermes_cli.test_kanban_worker_repin import NoCallHub, _acknowledged, _RecordHub
++
++conn = db_fixtures.conn
++__all__ = ["conn", "hub"]
++
++
++# --- 1: the move's own checkpoint ----------------------------------------------------------------------------------
++
++def test_a_tree_named_only_in_the_queued_moves_checkpoint_keeps_the_card_here(hub, tmp_path):
++    tid = _card(hub)
++    tree = _worktree(tmp_path, "ckpt-queued")  # no owner marker, nothing stored names it
++    _commit(tree, "b.txt")
++    res = km.move_queued(hub.conn, tid, runs_on=TARGET, reason="slots", checkpoint=f"WIP in {tree}, not pushed")
++    _refused(res, tree)
++    assert _moved(hub.conn, tid) == []
++
++
++def test_a_tree_named_only_in_the_running_moves_checkpoint_keeps_the_card_here(hub, tmp_path):
++    from tests.hermes_cli.test_kanban_worker_node import HUB
++    tid = _card(hub, runs_on=[f"machine:{HUB}"])
++    hub.round()
++    hub.tick()
++    run_id = hub.conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    tree = _worktree(tmp_path, "ckpt-running")
++    _commit(tree, "b.txt")
++    res = km.move_task(hub.conn, tid, runs_on=TARGET, reason="r", checkpoint=f"Done: commit b in {tree}.",
++                       expected_run_id=run_id)
++    _refused(res, tree)
++    assert kb.get_task(hub.conn, tid).status == "running"
++
++
++# --- 3: another card's text-named tree ----------------------------------------------------------------------------
++
++def test_a_text_named_tree_owned_by_another_card_does_not_keep_this_card(hub, tmp_path):
++    impl = _card(hub, title="implementer")
++    tree = _worktree(tmp_path, "impl-owned", owner=impl)
++    _commit(tree, "b.txt")
++    review = _card(hub, title="reviewer", body=f"Review the implementer's tree at {tree} (head b).")
++    assert km.move_queued(hub.conn, review, runs_on=TARGET, reason="slots")["ok"]
++    _refused(km.move_queued(hub.conn, impl, runs_on=TARGET, reason="slots"), tree)  # still its owner's state
++
++
++def test_a_text_named_tree_owned_by_the_card_itself_still_counts(hub, tmp_path):
++    tid = _card(hub)
++    tree = _worktree(tmp_path, "self-owned", owner=tid)
++    _commit(tree, "b.txt")
++    assert kmp.card_trees(tid, None, f"see {tree}", linked_text_only=True) == [str(tree.resolve())]
++
++
++# --- 4: bounded git time ----------------------------------------------------------------------------------------
++
++def test_git_time_for_many_slow_trees_is_bounded_and_fails_safe(hub, tmp_path, monkeypatch):
++    tid = _card(hub)
++    first = _worktree(tmp_path, "slow-0", owner=tid)
++    main = tmp_path / "slow-0-main"
++    trees = [first]
++    for i in range(1, 20):  # clean trees whose commits are on the remote: each one costs every check
++        tree = tmp_path / "code" / "_wt" / f"slow-{i}"
++        _git(main, "worktree", "add", "-q", "-b", f"wt/slow-{i}", str(tree), "origin/main")
++        trees.append(tree)
++    for tree in trees:
++        _git(tree, "push", "-q", "origin", f"HEAD:refs/heads/{tree.name}")
++    now, calls, real = [0.0], [], worktree_ops._git
++
++    def slow_git(args, cwd, timeout=10, **kwargs):  # every git call takes 4 s of fake time
++        calls.append(timeout)
++        if timeout < 4:
++            now[0] += timeout
++            raise subprocess.TimeoutExpired(["git", *args], timeout)
++        now[0] += 4
++        return real(args, cwd, timeout=timeout, **kwargs)
++
++    monkeypatch.setattr(kmp, "_clock", lambda: now[0], raising=False)  # raising=False: RED on the unbounded scan
++    monkeypatch.setattr(worktree_ops, "_git", slow_git)
++    state = kmp.tree_state([str(t) for t in trees])
++    assert now[0] <= getattr(kmp, "STATE_BUDGET_S", 20.0), (now[0], len(calls))
++    assert state is not None, "a budget-spent scan fails safe (the unchecked trees count as state)"
++    assert all(t <= 10 for t in calls)
++
++
++def test_a_fast_scan_within_the_budget_reads_clean(hub, tmp_path):
++    tid = _card(hub)
++    tree = _worktree(tmp_path, "fast", owner=tid)
++    _git(tree, "push", "-q", "origin", "HEAD:refs/heads/wt/fast")
++    assert kmp.tree_state([str(tree)]) is None
++
++
++# --- 6: the worker-first Board repin to the queue -------------------------------------------------------------------
++
++def test_a_started_worker_first_cards_queue_repin_is_refused_on_unpushed_state(conn, tmp_path, monkeypatch):
++    from pathlib import Path
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    tid = _acknowledged(conn, started_at=1)
++    tree = _worktree(tmp_path, "repin", owner=tid)
++    _commit(tree, "b.txt")
++    res = km.move_queued(conn, tid, runs_on=["pool:worker"], reason="any worker", hub=NoCallHub())
++    assert res["reason_code"] == "unpushed_state_here" and str(tree.resolve()) in res["error"], res
++    hub = _RecordHub()
++    km.move_queued(conn, tid, runs_on=["pool:worker"], reason="abandon it", hub=hub, force=True)
++    assert [c["runs_on"] for c in hub.calls] == [["pool:worker"]]  # force reaches the Board
++
++
++def test_a_clean_worker_first_cards_queue_repin_reaches_the_board(conn, tmp_path, monkeypatch):
++    from pathlib import Path
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    tid = _acknowledged(conn, started_at=1)
++    tree = _worktree(tmp_path, "repin-clean", owner=tid)
++    _git(tree, "push", "-q", "origin", "HEAD:refs/heads/wt/repin-clean")
++    hub = _RecordHub()
++    km.move_queued(conn, tid, runs_on=["pool:worker"], reason="any worker", hub=hub)
++    assert [c["runs_on"] for c in hub.calls] == [["pool:worker"]]
+-- 
+2.51.0
+

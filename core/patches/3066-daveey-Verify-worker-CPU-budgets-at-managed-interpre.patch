@@ -1,0 +1,310 @@
+From 9b4202e32b7589c14f5f6c7422ab152155994ce8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:00:10 +0000
+Subject: [PATCH] [daveey] Verify worker CPU budgets at managed interpreter
+ launch
+
+---
+ gateway/session_kanban_scope.py               |   4 +
+ hermes_cli/worker_compute_capacity.py         |  59 +++++++-
+ .../test_managed_kanban_scope_placement.py    |  44 ++++++
+ .../test_worker_compute_configuration.py      | 126 ++++++++++++++++++
+ 4 files changed, 231 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_worker_compute_configuration.py
+
+diff --git a/gateway/session_kanban_scope.py b/gateway/session_kanban_scope.py
+index 3b587726cf..7304b18fcc 100644
+--- a/gateway/session_kanban_scope.py
++++ b/gateway/session_kanban_scope.py
+@@ -140,6 +140,8 @@ def placing_spawn(spawn, policy):
+         # scope not ready) refuses without burning the run.
+         check_capsule_transport(policy)
+         target = resolve_run_scope(policy)  # validated before anything is spawned or consumed
++        from hermes_cli.worker_compute_capacity import managed_target, lower_priority
++        compute = managed_target(policy, target)
+         rendezvous = attach_capsule_transport(policy)
+         try:
+             process = observing_spawn(spawn, rendezvous)(*args, **kwargs)
+@@ -152,6 +154,8 @@ def placing_spawn(spawn, policy):
+         try:
+             if target is not None:
+                 migrate(process.pid, target)
++            if compute:
++                lower_priority(process.pid)
+             if rendezvous is not None:
+                 _deliver(rendezvous, process)
+         except BaseException:
+diff --git a/hermes_cli/worker_compute_capacity.py b/hermes_cli/worker_compute_capacity.py
+index 871e023fdd..2f6f048d34 100644
+--- a/hermes_cli/worker_compute_capacity.py
++++ b/hermes_cli/worker_compute_capacity.py
+@@ -10,6 +10,59 @@ import json
+ import math
+ from pathlib import Path
+ 
++CGROUP_ROOT = Path('/sys/fs/cgroup')
++
++
++def effective_cores() -> float:
++    """Host cpuset/quota, not the caller's two-core card budget.
++
++    Worker mode requires the host unified hierarchy; enrollment rejects a
++    container-private hierarchy. Re-read on every admission/launch.
++    """
++    import os
++    cpus = set()
++    for span in (CGROUP_ROOT / 'cpuset.cpus.effective').read_text(encoding='utf-8').strip().split(','):
++        bounds = span.split('-')
++        low, high = int(bounds[0]), int(bounds[-1])
++        if len(bounds) > 2 or low < 0 or high < low or high > 1048576:
++            raise ValueError('invalid host cpuset')
++        part = set(range(low, high + 1))
++        if part & cpus:
++            raise ValueError('overlapping host cpuset')
++        cpus.update(part)
++    cores = float(len(cpus & os.sched_getaffinity(0)))
++    quota_file = CGROUP_ROOT / 'cpu.max'
++    # The real cgroup-v2 root has no cpu.max; a delegated mount may have one.
++    if quota_file.exists():
++        raw, period = quota_file.read_text(encoding='utf-8').split()
++        if int(period) <= 0:
++            raise ValueError('invalid host CPU period')
++        if raw != 'max':
++            cores = min(cores, int(raw) / int(period))
++    if cores <= 0:
++        raise ValueError('empty host CPU budget')
++    return cores
++
++
++def managed_target(policy, target: Path | None) -> bool:
++    """Validate the actual owner-launched interpreter's destination before spawn."""
++    if not policy or not getattr(policy, 'kanban_json', None) or not worker_enabled():
++        return False
++    context = json.loads(policy.kanban_json)
++    board, task = context.get('board') or 'default', context.get('task_id')
++    if not isinstance(board, str) or not isinstance(task, str) or not task:
++        raise ValueError('Worker compute scope requires board and task identity')
++    name = configure_card(board, task)
++    if target is None or target.parent.name != name:
++        raise ValueError('Managed worker is outside its card CPU slice')
++    return True
++
++
++def lower_priority(pid: int) -> None:
++    """The managed child is born from the gateway, not the nice'd submitter."""
++    import os
++    os.setpriority(os.PRIO_PROCESS, pid, max(15, os.getpriority(os.PRIO_PROCESS, pid)))
++
+ 
+ def pressure_held(held: bool, load: float, cores: float) -> bool:
+     """Load/core hysteresis; invalid observations must refuse rather than release."""
+@@ -74,8 +127,8 @@ def configure_card(board: str, task: str) -> str:
+     env = systemd_user_bus_env()
+     if env is None:
+         raise RestartSafeScopeUnavailable('Worker compute budget requires the user bus')
+-    cores = len(os.sched_getaffinity(0))
+-    base = Path('/sys/fs/cgroup/user.slice') / f'user-{os.getuid()}.slice'
++    cores = effective_cores()
++    base = CGROUP_ROOT / 'user.slice' / f'user-{os.getuid()}.slice'
+     _verify_quota(base, cores * .875)
+     name = owner_slice(board, task)
+     manager = base / f'user@{os.getuid()}.service'
+@@ -86,6 +139,8 @@ def configure_card(board: str, task: str) -> str:
+             subprocess.run(['systemctl', '--user', *arguments], env=env, check=True,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10)
+         _verify_quota(path, quota)
++        if not 1 <= int((path / 'cpu.weight').read_text(encoding='utf-8')) <= 10:
++            raise ValueError(f'Worker CPU weight is missing or too high: {unit}')
+     directory = Path(get_default_hermes_root()) / 'worker-resources' / 'owners'
+     directory.mkdir(parents=True, exist_ok=True)
+     # Immutable one-file-per-owner: concurrent retries write identical bytes.
+diff --git a/tests/gateway/test_managed_kanban_scope_placement.py b/tests/gateway/test_managed_kanban_scope_placement.py
+index d9dec5ecda..98a7862561 100644
+--- a/tests/gateway/test_managed_kanban_scope_placement.py
++++ b/tests/gateway/test_managed_kanban_scope_placement.py
+@@ -145,6 +145,50 @@ def migration_access(run_scope):
+     _probe_migration(target)
+ 
+ 
++def test_priority_failure_reaps_managed_child(run_scope, migration_access, monkeypatch):
++    from hermes_cli import worker_compute_capacity as capacity
++    monkeypatch.setattr(capacity, 'managed_target', lambda policy, target: True)
++    made = []
++
++    def spawn():
++        process = _spawn()
++        made.append(process)
++        return process
++
++    def denied(pid):
++        raise PermissionError('priority denied')
++
++    monkeypatch.setattr(capacity, 'lower_priority', denied)
++    with pytest.raises(PermissionError, match='priority denied'):
++        scope_mod.placing_spawn(spawn, run_scope.policy)()
++    assert len(made) == 1 and made[0].poll() is not None
++    assert made[0].stdin.closed and made[0].stdout.closed
++
++
++def test_compute_child_and_descendant_are_low_priority(run_scope, migration_access, monkeypatch):
++    from hermes_cli import worker_compute_capacity as capacity
++    observed = []
++
++    def validated(policy, target):
++        assert policy is run_scope.policy
++        assert target.name == run_scope.unit
++        observed.append(target)
++        return True
++
++    monkeypatch.setattr(capacity, 'managed_target', validated)
++    process = scope_mod.placing_spawn(_spawn, run_scope.policy)()
++    try:
++        process.stdin.write(b'go\n')
++        process.stdin.flush()
++        descendant = int(process.stdout.readline())
++        assert len(observed) == 1
++        assert os.getpriority(os.PRIO_PROCESS, process.pid) >= 15
++        assert os.getpriority(os.PRIO_PROCESS, descendant) >= 15
++        assert _cgroup(process.pid) == _cgroup(run_scope.submitter.pid)
++    finally:
++        _reap(process)
++
++
+ def test_child_and_descendant_inherit_run_scope_and_limit(run_scope, migration_access):
+     process = scope_mod.placing_spawn(_spawn, run_scope.policy)()
+     try:
+diff --git a/tests/hermes_cli/test_worker_compute_configuration.py b/tests/hermes_cli/test_worker_compute_configuration.py
+new file mode 100644
+index 0000000000..ec6e8546e7
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_compute_configuration.py
+@@ -0,0 +1,126 @@
++"""CPU containment is verified before admitting a managed interpreter."""
++import json
++import os
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import worker_compute_capacity as capacity
++
++
++def test_effective_cores_uses_host_cpuset_not_per_card_quota(monkeypatch, tmp_path):
++    monkeypatch.setattr(capacity, 'CGROUP_ROOT', tmp_path)
++    monkeypatch.setattr(os, 'sched_getaffinity', lambda _: set(range(16)))
++    (tmp_path / 'cpuset.cpus.effective').write_text('0-7,10,12-13\n')
++    (tmp_path / 'cpu.max').write_text('600000 100000\n')
++    assert capacity.effective_cores() == 6
++    (tmp_path / 'cpu.max').write_text('max 100000\n')
++    assert capacity.effective_cores() == 11
++
++
++@pytest.mark.parametrize('raw', ['', '2-1', 'x', '0-3,2'])
++def test_invalid_cpuset_refuses(monkeypatch, tmp_path, raw):
++    monkeypatch.setattr(capacity, 'CGROUP_ROOT', tmp_path)
++    (tmp_path / 'cpuset.cpus.effective').write_text(raw)
++    (tmp_path / 'cpu.max').write_text('max 100000')
++    with pytest.raises(ValueError):
++        capacity.effective_cores()
++
++
++@pytest.fixture
++def configured(monkeypatch, tmp_path):
++    import hermes_constants
++    import subprocess
++    from tools import process_registry
++    root = tmp_path / 'cgroups'
++    monkeypatch.setattr(capacity, 'CGROUP_ROOT', root)
++    monkeypatch.setattr(capacity, 'effective_cores', lambda: 16)
++    monkeypatch.setattr(hermes_constants, 'get_default_hermes_root', lambda: tmp_path / 'home')
++    monkeypatch.setattr(process_registry, 'systemd_user_bus_env', lambda: {'bus': 'fixture'})
++    base = root / 'user.slice' / f'user-{os.getuid()}.slice'
++    pool = base / f'user@{os.getuid()}.service/hermes.slice/hermes-kanban.slice'
++    card = pool / capacity.owner_slice('board', 'task')
++    card.mkdir(parents=True)
++    for path, quota in [(base, 14), (pool, 12), (card, 2)]:
++        (path / 'cpu.max').write_text(f'{quota * 100000} 100000')
++        (path / 'cpu.weight').write_text('10')
++    calls = []
++    monkeypatch.setattr(subprocess, 'run', lambda *a, **kw: calls.append((a, kw)))
++    return SimpleNamespace(base=base, pool=pool, card=card, home=tmp_path / 'home', calls=calls)
++
++
++def test_configure_verifies_and_publishes_owner(configured):
++    name = capacity.configure_card('board', 'task')
++    assert name == configured.card.name
++    assert json.loads((configured.home / 'worker-resources/owners' / f'{name}.json').read_text()) == ['board', 'task']
++    assert len(configured.calls) == 4
++    assert all(call[1]['env'] == {'bus': 'fixture'} for call in configured.calls)
++    assert 'CPUQuota=1200%' in configured.calls[0][0][0]
++    assert 'CPUQuota=200%' in configured.calls[2][0][0]
++
++
++@pytest.mark.parametrize('part', ['base', 'pool', 'card'])
++def test_unbounded_quota_never_publishes_owner(configured, part):
++    (getattr(configured, part) / 'cpu.max').write_text('max 100000')
++    with pytest.raises(ValueError):
++        capacity.configure_card('board', 'task')
++    assert not (configured.home / 'worker-resources/owners').exists()
++
++
++def test_cpu_weight_readback_required(configured):
++    (configured.card / 'cpu.weight').write_text('100')
++    with pytest.raises(ValueError, match='weight'):
++        capacity.configure_card('board', 'task')
++    assert not (configured.home / 'worker-resources/owners').exists()
++
++
++def test_managed_worker_requires_card_slice_and_sets_priority(monkeypatch, configured):
++    monkeypatch.setattr(capacity, 'worker_enabled', lambda: True)
++    scope = configured.card / 'hermes-worker-kanban-task-run-1.scope'
++    scope.mkdir()
++    policy = SimpleNamespace(kanban_json=json.dumps({'task_id': 'task', 'board': 'board'}))
++    assert capacity.managed_target(policy, scope) is True
++    with pytest.raises(ValueError):
++        capacity.managed_target(policy, configured.pool / scope.name)
++    with pytest.raises(ValueError):
++        capacity.managed_target(policy, None)
++    observed = []
++    monkeypatch.setattr(os, 'getpriority', lambda *a: 19)
++    monkeypatch.setattr(os, 'setpriority', lambda *a: observed.append(a))
++    capacity.lower_priority(123)
++    assert observed == [(os.PRIO_PROCESS, 123, 19)]
++
++
++def test_missing_bus_refuses_before_configuration(configured, monkeypatch):
++    from tools import process_registry
++    monkeypatch.setattr(process_registry, 'systemd_user_bus_env', lambda: None)
++    with pytest.raises(process_registry.RestartSafeScopeUnavailable):
++        capacity.configure_card('board', 'task')
++    assert configured.calls == []
++    assert not (configured.home / 'worker-resources/owners').exists()
++
++
++def test_failed_systemctl_never_publishes_owner(configured, monkeypatch):
++    import subprocess
++
++    def fail(*args, **kwargs):
++        raise subprocess.CalledProcessError(1, 'systemctl')
++
++    monkeypatch.setattr(subprocess, 'run', fail)
++    with pytest.raises(subprocess.CalledProcessError):
++        capacity.configure_card('board', 'task')
++    assert not (configured.home / 'worker-resources/owners').exists()
++
++
++def test_changed_core_budget_revalidates_backstop(configured, monkeypatch):
++    capacity.configure_card('board', 'task')
++    monkeypatch.setattr(capacity, 'effective_cores', lambda: 8)
++    configured.calls.clear()
++    with pytest.raises(ValueError, match='quota'):
++        capacity.configure_card('board', 'task')
++    assert configured.calls == []
++
++
++def test_nonworker_launch_unchanged(monkeypatch):
++    monkeypatch.setattr(capacity, 'worker_enabled', lambda: True)
++    assert capacity.managed_target(None, None) is False
+-- 
+2.51.0
+

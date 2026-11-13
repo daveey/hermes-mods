@@ -1,0 +1,321 @@
+From 23d69df27015448b7810da0e7243c6ea4bd0818f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 05:46:31 +0000
+Subject: [PATCH] [daveey] lifecycle guard: close startup-file and keyword-led
+ subshell fail-opens from review 5882059941
+
+1. Startup files / prompt hooks (review finding 1). A stdin shell whose flags include -i, -l or
+   --login sources $HOME startup files and runs PROMPT_COMMAND/PS1 before each line, and either
+   can rewrite the stdin script (`exec 0< <(sed ...)`). Those flags (and -H, -k) no longer
+   qualify a verbatim stdin shell, alone or combined (`-els`). HOME, ZDOTDIR, PROMPT_COMMAND,
+   PS0-PS9, HISTFILE and INPUTRC are reserved prefix assignments. zsh leaves _STDIN_SHELLS: it
+   sources $ZDOTDIR/.zshenv on every start, even non-interactive.
+
+2. Keyword-led subshells (review finding 2). `function NAME ( ... )` is a keyword-led prefix, so
+   its body is a subshell, not call arguments. Any walked text that may define or enable an alias
+   (`alias`, `BASH_ALIASES`, `expand_aliases`, quote-split `al''ias`, ANSI-C `$'...'`) sets a
+   walk-wide flag; call-argument paths are then judged as executed, so `alias T=' '; T ( bash
+   big.sh )`, also when the alias comes from a sourced script, keeps main's scan-cap refusal.
+
+Tests: 30 new rows (real Bash fake-hermes marker rows for every shape in the review), 28 RED on
+8b2369e950, 224/224 GREEN; 6/6 mutants killed.
+---
+ cron/lifecycle_guard.py                       | 84 ++++++++++++-----
+ .../cron/test_lifecycle_guard_heredoc_walk.py | 91 +++++++++++++++++++
+ tools/shell_heredoc.py                        | 16 +++-
+ 3 files changed, 163 insertions(+), 28 deletions(-)
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 91d2555200..40696f371b 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -478,6 +478,7 @@ class _LifecycleScanBudget:
+     cloud placeholder) so the caller can tell the model the real reason (#113944)."""
+ 
+     __slots__ = (
++        "aliases_possible",
+         "bytes_remaining",
+         "lines_remaining",
+         "overrun",
+@@ -500,6 +501,14 @@ class _LifecycleScanBudget:
+         # Message-only: newlines a caller added when joining the root text (cron's empty-prompt
+         # join). Charged like any line, never reported as the text's own; spent on the first charge.
+         self.separator_lines = separator_lines
++        # Sticky for the whole walk: any walked text (the command, an eval payload, a sourced
++        # script) that may define an alias makes `NAME ( … )` possibly a keyword-led subshell.
++        self.aliases_possible = False
++
++    def note_aliases(self, text: str) -> None:
++        """Record (sticky) that walked *text* may define or enable an alias."""
++        if not self.aliases_possible:
++            self.aliases_possible = _may_define_alias(text)
+ 
+     def charge_text(self, text: str) -> bool:
+         """Charge *text* before tokenization; False when it does not fit (``overrun`` says why)."""
+@@ -730,6 +739,7 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
+ # Words after which `(` still opens a command list (`if (cd x && ./y)`, `! (…)`, `time (…)`).
+ _SUBSHELL_OPENING_WORDS = frozenset({
+     "if", "then", "else", "elif", "do", "while", "until", "!", "time", "coproc", "in", "{",
++    "function",
+ })
+ 
+ 
+@@ -752,14 +762,23 @@ def _opens_call_arguments(segment: list[str]) -> bool:
+                 index += 1
+             if index < len(segment) and segment[index] == "--":
+                 index += 1
+-        elif word == "coproc" and index < len(segment):
+-            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", segment[index]):
++        elif word in ("coproc", "function") and index < len(segment):
++            # `coproc NAME ( … )`; `function NAME ( … )` defines a function whose body is a subshell.
++            if word == "function" or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", segment[index]):
+                 index += 1
+     if index == len(segment):
+         return False
+     return not segment[-1].endswith(("$", "<", ">", "="))
+ 
+ 
++def _may_define_alias(text: str) -> bool:
++    """Whether *text* may define or enable an alias (``alias T=' '``, ``BASH_ALIASES[T]=…``,
++    ``shopt -s expand_aliases``), even quote-split (``al''ias``) or ANSI-C quoted (``$'…'``).
++    An alias can expand to a keyword prefix, so ``T ( bash big.sh )`` may run a subshell."""
++    # Dropping every quote and backslash rejoins quote-split words (`al''ias`, `al\ias`).
++    return "alias" in re.sub(r"[\"'\\\\]", "", text).lower() or "$'" in text
++
++
+ def _iter_positioned_command_segments(command: str) -> Iterator[tuple[list[str], bool]]:
+     """``_iter_command_segments`` plus whether each segment is the argument list of a call
+     (``True``): the segment right after a ``(`` that follows an ordinary word."""
+@@ -1225,6 +1244,40 @@ def _read_script_for_scanning(script_path: str) -> tuple[str, Optional[str]]:
+ 
+ # --- recursive walk ---------------------------------------------------------------------------
+ 
++def _walk_candidates(
++    command: str, walk_command: str, *, cwd: Optional[str], executed: bool,
++    budget: _LifecycleScanBudget,
++) -> Iterator[tuple[Path, bool]]:
++    """``(path, executed)`` for every path *command* references, executed candidates first.
++
++    Paths named only inside a masked body are still READ: an interpreter body that hands
++    `/x/restart.sh` to os.system() executes it. Only the fail-closed verdicts (cloud placeholder,
++    oversized/binary, budget) stay restricted to the executed view — a mere data mention must not
++    trip them. Executed candidates come first so a mention never starves a real script's budget. A
++    path in interpreter call syntax (`expanduser("~/x")`, `connect('/d/x.db')`) is a string
++    literal the shell never runs: a mention too, read and scanned but never a fail-closed verdict,
++    unless an alias may turn its `NAME (` into a subshell (`alias T=' '; T ( bash big.sh )`). That
++    is decided lazily, when the entry is reached: the executed candidates before it (a sourced
++    script may define the alias) have been walked by then.
++    """
++    entries = [
++        (path, executed, False) for path in _iter_referenced_shell_scripts(walk_command, cwd=cwd)
++    ]
++    entries += [
++        (path, executed, True)
++        for path in _iter_referenced_shell_scripts(walk_command, cwd=cwd, call_arguments=True)
++    ]
++    if walk_command != command:
++        entries += [
++            (path, False, False)
++            for call_arguments in (False, True)
++            for path in _iter_referenced_shell_scripts(
++                command, cwd=cwd, call_arguments=call_arguments)
++        ]
++    for path, candidate_executed, call_argument in entries:
++        yield path, candidate_executed and (budget.aliases_possible or not call_argument)
++
++
+ def _contains_unsafe_gateway_action(
+     command: str, *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
+     read_remote_script: Optional[_ReadRemoteScriptFn] = None, executed: bool = True,
+@@ -1239,6 +1292,7 @@ def _contains_unsafe_gateway_action(
+         return _budget_exhausted(budget, "text", depth, source=source) if executed else False
+     if _direct_lifecycle_scan(command):
+         return True
++    budget.note_aliases(command)
+     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
+         return _depth_limit_reached(budget, depth, executed=executed)
+ 
+@@ -1260,26 +1314,8 @@ def _contains_unsafe_gateway_action(
+         if recurse(payload, cwd, executed, source):
+             return True
+ 
+-    # Paths named only inside a masked body are still READ: an interpreter body that hands
+-    # `/x/restart.sh` to os.system() executes it. Only the fail-closed verdicts (cloud placeholder,
+-    # oversized/binary, budget) stay restricted to the executed view — a mere data mention must not
+-    # trip them. Executed candidates come first so a mention never starves a real script's budget. A
+-    # path in interpreter call syntax (`expanduser("~/x")`, `connect('/d/x.db')`) is a string
+-    # literal the shell never runs: a mention too, read and scanned but never a fail-closed verdict.
+-    candidates = [(path, executed) for path in _iter_referenced_shell_scripts(walk_command, cwd=cwd)]
+-    candidates += [
+-        (path, False)
+-        for path in _iter_referenced_shell_scripts(walk_command, cwd=cwd, call_arguments=True)
+-    ]
+-    if walk_command != command:
+-        candidates += [
+-            (path, False)
+-            for call_arguments in (False, True)
+-            for path in _iter_referenced_shell_scripts(
+-                command, cwd=cwd, call_arguments=call_arguments)
+-        ]
+-
+-    for script_path, candidate_executed in candidates:
++    for script_path, candidate_executed in _walk_candidates(
++            command, walk_command, cwd=cwd, executed=executed, budget=budget):
+         # Do not touch a FileProvider path even to discover whether the file is hydrated.
+         if _on_cloud_path(script_path):
+             if candidate_executed:
+@@ -1295,7 +1331,7 @@ def _contains_unsafe_gateway_action(
+         if not budget.charge_path():
+             if candidate_executed:
+                 return _budget_exhausted(budget, "paths", depth)
+-            break  # remaining candidates are all mentions
++            continue  # an alias may make a later call-argument entry executed
+         visited.add(resolved)
+         # Never read more than the walk can still afford to tokenize; a file larger than the
+         # remainder fails closed exactly like an oversized one.
+@@ -1310,7 +1346,7 @@ def _contains_unsafe_gateway_action(
+             if not budget.charge_remote_read():
+                 if candidate_executed:
+                     return _budget_exhausted(budget, "remote reads", depth)
+-                break
++                continue
+             script_text, unsafe = _sanitize_remote_script_text(
+                 read_remote_script(str(script_path)), max_bytes=budget.bytes_remaining
+             )
+diff --git a/tests/cron/test_lifecycle_guard_heredoc_walk.py b/tests/cron/test_lifecycle_guard_heredoc_walk.py
+index 12b09da3ec..16d547ce11 100644
+--- a/tests/cron/test_lifecycle_guard_heredoc_walk.py
++++ b/tests/cron/test_lifecycle_guard_heredoc_walk.py
+@@ -690,3 +690,94 @@ def test_keyword_operands_before_parens_still_execute_scripts(tmp_path, prefix):
+     _assert_bash_marker(tmp_path, command)
+     unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
+     assert unsafe is True and "scan cap" in refusal
++
++
++_REWRITE_STARTUP = "unset BASH_ENV\nexec 0< <(sed s/python3/bash/)\n"
++_WALK_ONLY_BODY = "python3 - <<'PY'\nbash -c 'hermes gateway \"restart\"'\nPY\n"
++
++
++@pytest.mark.parametrize("shape", [
++    "home-login", "home-long-login", "home-interactive", "env-home-login", "separate-line-home",
++    "prompt-command", "combined-flags", "nested", "remote",
++])
++def test_startup_files_and_prompt_hooks_cannot_authorize_nested_masking(tmp_path, shape):
++    """Review 5882059941 #1: login/interactive shells source `$HOME` startup files and run
++    PROMPT_COMMAND before each line; either can rewrite the stdin script (main refuses)."""
++    from tools.shell_heredoc import strip_inert_heredoc_bodies
++
++    home = tmp_path / "home"
++    home.mkdir()
++    for name in (".bash_profile", ".profile", ".bashrc"):
++        (home / name).write_text(_REWRITE_STARTUP)
++    ssh = tmp_path / "ssh"
++    # Local SSH transport control; no network access.
++    ssh.write_text('#!/bin/sh\nshift\nexec /bin/sh -c "$*"\n')
++    ssh.chmod(0o755)
++    opener = {
++        "home-login": f"HOME={home} bash -l -s",
++        "home-long-login": f"HOME={home} bash --login -s",
++        "home-interactive": f"HOME={home} bash -i -s",
++        "env-home-login": f"env HOME={home} bash -l",
++        "separate-line-home": f"HOME={home}\nbash -l -s",
++        "prompt-command": "PROMPT_COMMAND='exec 0< <(sed s/python3/bash/)' bash --norc -i -s",
++        "combined-flags": f"HOME={home} bash -els",
++        "nested": f"HOME={home} bash -l -s",
++        "remote": f"ssh h 'HOME={home} bash -l -s'",
++    }[shape]
++    command = opener + " <<'R'\n" + _WALK_ONLY_BODY + "R\n"
++    if shape == "nested":
++        command = "bash -s <<'OUTER'\n" + command + "OUTER\n"
++    _assert_bash_marker(tmp_path, command)
++    assert strip_inert_heredoc_bodies(command, nested=True) == command
++    assert guard(command, cwd=str(tmp_path)) is True
++
++
++@pytest.mark.parametrize("opener", [
++    "zsh -s", "HOME=/untrusted zsh -s", "ZDOTDIR=/untrusted zsh", "ssh h 'zsh -s'",
++    "bash -i", "bash -l", "bash --login -s", "sh -il", "bash -H -s", "bash -k -s",
++    "HOME=/untrusted bash -s", "PROMPT_COMMAND=x bash -s", "PS1=x bash -s", "env PS0=x bash -s",
++])
++def test_startup_reading_shells_are_not_verbatim_stdin_shells(opener):
++    """zsh sources `$ZDOTDIR/.zshenv` on every start; -i/-l/-H/-k change how lines are read."""
++    from tools.shell_heredoc import strip_inert_heredoc_bodies
++
++    command = opener + " <<'R'\npython3 - <<'PY'\nx\nPY\nR\n"
++    assert strip_inert_heredoc_bodies(command, nested=True) == command
++
++
++@pytest.mark.parametrize("opener", ["bash -s", "bash -e -s", "sh -eu", "bash --norc --noprofile -s"])
++def test_plain_stdin_shells_still_nest_mask(opener):
++    from tools.shell_heredoc import strip_inert_heredoc_bodies
++
++    command = opener + " <<'R'\npython3 - <<'PY'\nx\nPY\nR\n"
++    assert strip_inert_heredoc_bodies(command, nested=True) != command
++
++
++def _keyword_led_subshell_command(tmp_path, shape):
++    big = tmp_path / "big.sh"
++    big.write_text("# padding\n" * 130000 + 'hermes gateway "restart"\n')
++    # No file or directory name may contain "alias": only the command text may enable aliases.
++    prefix = tmp_path / "prefix.sh"
++    prefix.write_text("shopt -s expand_aliases\nalias T=' '\n")
++    return {
++        "function": f"function f ( bash {big} ); f",
++        "alias-blank": f"shopt -s expand_aliases\nalias T=' '\nT ( bash {big} )",
++        "alias-time": f"shopt -s expand_aliases\nalias T=time\nT ( bash {big} )",
++        "alias-quote-split": f"shopt -s expand_al''iases\nal''ias T=' '\nT ( bash {big} )",
++        "alias-sourced": f"source {prefix}\nT ( bash {big} )",
++    }[shape]
++
++
++@pytest.mark.parametrize("shape", [
++    "function", "alias-blank", "alias-time", "alias-quote-split", "alias-sourced",
++])
++def test_keyword_led_subshells_still_execute_scripts(tmp_path, shape):
++    """Review 5882059941 #2: `function f ( … )` and alias-expanded keyword prefixes make `NAME (`
++    a subshell; the oversized-script refusal must survive (main refuses)."""
++    from cron.lifecycle_guard import scan_gateway_lifecycle
++
++    assert "alias" not in str(tmp_path).lower()
++    command = _keyword_led_subshell_command(tmp_path, shape)
++    _assert_bash_marker(tmp_path, command)
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe is True and refusal is not None and "scan cap" in refusal
+diff --git a/tools/shell_heredoc.py b/tools/shell_heredoc.py
+index f369193032..aa06e64372 100644
+--- a/tools/shell_heredoc.py
++++ b/tools/shell_heredoc.py
+@@ -52,8 +52,14 @@ _INERT_HEREDOC_WRAPPERS: dict[str, tuple[frozenset[str], re.Pattern[str], int]]
+ _ASSIGNING_WRAPPERS = frozenset({"env", "sudo"})
+ # Outer owners whose quoted heredoc body a SHELL parses verbatim: only their bodies' nested
+ # heredocs may be judged as shell text. A POSIX shell reading its script from stdin.
+-_STDIN_SHELLS = frozenset({"bash", "sh", "dash", "zsh", "ksh"})
+-_SHELL_FLAG_RE = re.compile(r"[-+][abefhkmnpstuvxBCEHPTil]+|--(?:login|noprofile|norc|posix)")
++# zsh is excluded: it sources ``$ZDOTDIR/.zshenv`` (default ``$HOME``) on every start, even a
++# non-interactive ``zsh -s``, and that file can rewrite the stdin script before zsh reads it.
++_STDIN_SHELLS = frozenset({"bash", "sh", "dash", "ksh"})
++# Flags that keep the shell non-interactive and non-login. ``-i``/``-l``/``--login`` source
++# startup files located by ``$HOME`` and run ``PROMPT_COMMAND``/``PS1`` before each line, which can
++# rewrite the stdin script; ``-H`` (history expansion) and ``-k`` (keyword assignments) change how
++# its lines are read. No word containing them, alone or combined, is a verbatim stdin shell.
++_SHELL_FLAG_RE = re.compile(r"[-+][abefhmnpstuvxBCEPT]+|--(?:noprofile|norc|posix)")
+ _SSH_VALUE_OPTIONS = frozenset("BbcDEeFIiJLlmOoPpQRSWw")
+ _SSH_FLAG_OPTIONS = frozenset("46AaCgKkMnqTtVvXxYy")
+ _PURE_EXPANSION_RE = re.compile(r"^\$(?:\{[A-Za-z_]\w*(?::?[-=+?][^}]*)?\}|[A-Za-z_]\w*)$")
+@@ -133,9 +139,11 @@ def _peeled_command(words: list[str]) -> tuple[int, str] | None:
+ def _reserved_assignment(word: str) -> bool:
+     """Environment words that invalidate interpreter/stream provenance."""
+     name, separator, _value = word.partition("=")
++    # HOME/ZDOTDIR locate startup files; PROMPT_COMMAND/PSn run code before each line.
+     return bool(separator) and (name in {
+-        "PATH", "IFS", "ENV", "CDPATH", "GLOBIGNORE", "SHELLOPTS", "PS4",
+-    } or name.startswith("BASH"))
++        "PATH", "IFS", "ENV", "CDPATH", "GLOBIGNORE", "SHELLOPTS", "HOME", "ZDOTDIR",
++        "PROMPT_COMMAND", "HISTFILE", "INPUTRC",
++    } or name.startswith("BASH") or re.fullmatch(r"PS\d", name) is not None)
+ 
+ 
+ def _is_stdin_shell(words: list[str]) -> bool:
+-- 
+2.51.0
+

@@ -1,0 +1,396 @@
+From 78f3cf981763e9813e50926f4dcc6b1330369a71 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 02:56:49 +0000
+Subject: [PATCH] [daveey] gateway: bound the post-stop tail to a core update
+ checkpoint's exit promise
+
+The checkpoint ack tells the updater to wait drain_timeout (70s) for the gateway
+process to EXIT. stop() was bounded by it, but the tail after stop() (control
+socket wait_closed, cron/housekeeping thread waits up to 65s/35s, MCP) was not:
+hermes-hub 2026-11-13 the tail ran 44.5s and the process exited 2s past the
+updater's wait, deferring the update (t_01a1d2c328159209).
+
+- exit_deadline.set_exit_target: a soft target clamp_wait honours (never os._exit)
+- checkpoint_for_update sets it at accept + CHECKPOINT_DRAIN_S - 8s; _cancel_restart clears it
+- control socket stop takes a bounded close wait (3s, clamped) instead of waiting on every open connection
+- a tail >= 10s logs its phase marks
+---
+ gateway/control_socket.py                     |  13 +-
+ gateway/exit_deadline.py                      |  38 ++++-
+ gateway/run_bootstrap.py                      |  16 +-
+ gateway/run_shutdown_restart_wait.py          |   2 +
+ gateway/update_checkpoint.py                  |   7 +
+ tests/gateway/test_core_update_total_drain.py |  12 ++
+ tests/gateway/test_update_checkpoint.py       |  29 ++++
+ tests/gateway/test_update_exit_target.py      | 137 ++++++++++++++++++
+ 8 files changed, 246 insertions(+), 8 deletions(-)
+ create mode 100644 tests/gateway/test_update_exit_target.py
+
+diff --git a/gateway/control_socket.py b/gateway/control_socket.py
+index e16e3e1528..5f554d5d16 100644
+--- a/gateway/control_socket.py
++++ b/gateway/control_socket.py
+@@ -409,8 +409,12 @@ class GatewayControlServer:
+         self._pipe_server = NativeControlServer(self._home, self.handle_request_line)
+         await asyncio.to_thread(self._pipe_server.start)
+         return True
+-    async def stop(self) -> None:
+-        """Stop serving and remove the socket/pointer files."""
++    async def stop(self, close_wait_s: float | None = None) -> None:
++        """Stop serving and remove the socket/pointer files.
++
++        ``close_wait_s`` bounds the wait for open connections (``Server.wait_closed`` waits for every one
++        since Python 3.12, so a connection held by a slow handler held the gateway's exit with it); the
++        rest of the teardown still runs when it times out. ``None`` waits unbounded (prior behaviour)."""
+         if self._loop_watchdog is not None:
+             self._loop_watchdog.stop()
+             self._loop_watchdog = None
+@@ -419,7 +423,10 @@ class GatewayControlServer:
+         if self._server is not None:
+             self._server.close()
+             with contextlib.suppress(Exception):
+-                await self._server.wait_closed()
++                if close_wait_s is None:
++                    await self._server.wait_closed()
++                else:
++                    await asyncio.wait_for(self._server.wait_closed(), timeout=max(0.0, close_wait_s))
+         if self._pipe_server is not None:
+             with contextlib.suppress(Exception):
+                 await asyncio.to_thread(self._pipe_server.close)
+diff --git a/gateway/exit_deadline.py b/gateway/exit_deadline.py
+index 41055ae837..46194e8f15 100644
+--- a/gateway/exit_deadline.py
++++ b/gateway/exit_deadline.py
+@@ -47,6 +47,7 @@ _state: dict[str, Any] = {}
+ 
+ 
+ def _reset_for_tests() -> None:
++    """Clears the deadline, the exit target and the phase marks."""
+     with _lock:
+         _state.clear()
+         _done.clear()
+@@ -85,11 +86,40 @@ def is_exiting() -> bool:
+ 
+ 
+ def remaining_s() -> Optional[float]:
+-    """Seconds left before the deadline fires; ``None`` when no deadline is set (yet)."""
+-    deadline = _state.get("deadline_mono")
+-    if deadline is None:
++    """Seconds left before the deadline fires, or before an earlier exit target (:func:`set_exit_target`)
++    if one is set; ``None`` when neither is set (yet)."""
++    ends = [end for end in (_state.get("deadline_mono"), _state.get("target_mono")) if end is not None]
++    if not ends:
+         return None
+-    return max(0.0, deadline - time.monotonic())
++    return max(0.0, min(ends) - time.monotonic())
++
++
++# Kept between a core update's checkpoint exit target and the updater's own wait: the exit funnel and the
++# updater's 0.2s poll land inside it.
++UPDATE_EXIT_MARGIN_S = 8.0
++
++
++def set_exit_target(target_mono: Optional[float], reason: str = "") -> None:
++    """A soft exit target (monotonic) the stop tail's waits are clamped to; ``None`` clears it.
++
++    Unlike the deadline it never ``os._exit``s: it only shortens the cooperative waits (cron/housekeeping
++    threads, control socket, MCP) so the process exits by then. A core update's checkpoint sets it at
++    ``accept + drain_timeout - margin``: the updater waits ``drain_timeout`` from the ack for the gateway
++    process to EXIT, and the post-stop tail used to have no bound tied to that promise (hermes-hub
++    2026-11-13 01:58-01:59Z: stop() took 12s, the tail 44.5s, the process exited 2s after the updater's
++    70s wait and the update was deferred). [daveey]"""
++    with _lock:
++        if target_mono is None:
++            _state.pop("target_mono", None)
++            _state.pop("target_reason", None)
++        else:
++            _state.update(target_mono=float(target_mono), target_reason=reason)
++
++
++def phases() -> dict[str, float]:
++    """Phase marks (seconds since the stop began) recorded so far, for the tail's timing log line."""
++    with _lock:
++        return dict(_state.get("phases") or {})
+ 
+ 
+ # Left on the deadline after the cron/housekeeping waits: MCP shutdown (5s) + the exit funnel.
+diff --git a/gateway/run_bootstrap.py b/gateway/run_bootstrap.py
+index beeb40fcf1..9643f6583e 100644
+--- a/gateway/run_bootstrap.py
++++ b/gateway/run_bootstrap.py
+@@ -27,6 +27,12 @@ def _start_deferred_state_db_integrity_check(evidence: dict) -> None:
+ # Log-record parity with the origin module.
+ logger = logging.getLogger("gateway.run")
+ 
++# A shutdown tail at least this long logs where its time went (normally 0.3-3.6s on the hub).
++_SLOW_TAIL_LOG_S = 10.0
++# Control socket stop: open connections each carry one short request (2s client timeout); a connection
++# held longer by a slow handler is dropped with the process instead of holding the exit.
++_CONTROL_STOP_TIMEOUT_S = 3.0
++
+ 
+ def _hand_home_back_to_supervisor(existing_pid: int) -> None:
+     """[daveey] A supervised start refused by a MANUAL owner of this home asks that owner to drain.
+@@ -520,11 +526,13 @@ async def _start_gateway_shutdown_tail(
+     _signal_initiated_shutdown: list) -> bool:
+     """Post-``wait_for_shutdown`` teardown; returns the process exit verdict (True = exit 0)."""
+     from gateway.run import (_CRON_SHUTDOWN_DRAIN_TIMEOUT, _HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT, _await_thread_exit, _best_effort, _resolve_gateway_exit_verdict, _shutdown_mcp_servers_nonblocking, _stop_cron_provider, exit_deadline)
++    tail_started = time.monotonic()
+     # Control socket first: once shutdown begins we are no longer a truthful "serving here" answer and a
+     # successor must be able to bind. Early-exit paths rely on the atexit cleanup_files hook instead.
+     if _control_server is not None:
+         try:
+-            await _control_server.stop()
++            await _control_server.stop(close_wait_s=exit_deadline.clamp_wait(
++                _CONTROL_STOP_TIMEOUT_S, phase="control_stop"))
+         except Exception:
+             logger.debug("Control socket stop failed (non-fatal)", exc_info=True)
+ 
+@@ -563,6 +571,12 @@ async def _start_gateway_shutdown_tail(
+     except Exception:
+         logger.warning("MCP shutdown failed; connections may be left open", exc_info=True)
+ 
++    # One line naming where a slow tail went: the stop's own phases are logged by stop(), and a tail that
++    # outlived a core update's wait was otherwise unattributable (hermes-hub 2026-11-13 01:58:45-01:59:29Z).
++    tail_s = time.monotonic() - tail_started
++    if tail_s >= _SLOW_TAIL_LOG_S:
++        exit_deadline.mark_phase("tail_done")
++        logger.warning("Shutdown tail took %.1fs (phase marks since stop began: %s)", tail_s, exit_deadline.phases())
+     # The failure verdict comes AFTER the cooperative teardown: returning early here leaked the
+     # cron ticker + housekeeping threads (and open MCP connections) for embedded callers (#12175).
+     return _resolve_gateway_exit_verdict(runner, _signal_initiated_shutdown[0])
+diff --git a/gateway/run_shutdown_restart_wait.py b/gateway/run_shutdown_restart_wait.py
+index a9d824ac7a..a715420481 100644
+--- a/gateway/run_shutdown_restart_wait.py
++++ b/gateway/run_shutdown_restart_wait.py
+@@ -227,6 +227,8 @@ class GatewayRestartWaitMixin:
+         self._restart_update_intent = None
+         self._core_update_kanban_cap_spent = False
+         self._stop_kanban_leash_s = None
++        from gateway import exit_deadline
++        exit_deadline.set_exit_target(None)  # the update's exit promise went with it
+         self._draining = False
+         self._restart_task_started = False
+         self._scale_to_zero_status("running", "restart cancel: status mark failed")
+diff --git a/gateway/update_checkpoint.py b/gateway/update_checkpoint.py
+index 327540e7fe..fcb09ebc7a 100644
+--- a/gateway/update_checkpoint.py
++++ b/gateway/update_checkpoint.py
+@@ -191,7 +191,14 @@ def checkpoint_for_update(runner, loop, params):
+                     return
+                 claimed = True
+             # The admitted path, not a fresh lookup: a withdrawal during preserve must still cancel.
++            accepted_at = time.monotonic()
+             accepted = runner.request_restart(detached=False, via_service=True, update_intent=intent_path)
++            if accepted:
++                # The ack promises the updater this process EXITS within CHECKPOINT_DRAIN_S (it waits that long
++                # from the ack, then defers the update): bound the post-stop tail to that promise too.
++                from gateway import exit_deadline
++                exit_deadline.set_exit_target(
++                    accepted_at + CHECKPOINT_DRAIN_S - exit_deadline.UPDATE_EXIT_MARGIN_S, "core-update checkpoint")
+             result.append({"pausing": bool(accepted), "already_stopping": not accepted,
+                            "checkpoint": True, "nonce": intent["nonce"], "pid": pid, "drain_timeout": CHECKPOINT_DRAIN_S})
+         except (OSError, TimeoutError, ValueError, TypeError, KeyError) as exc:
+diff --git a/tests/gateway/test_core_update_total_drain.py b/tests/gateway/test_core_update_total_drain.py
+index afff0974b1..c30b87dba1 100644
+--- a/tests/gateway/test_core_update_total_drain.py
++++ b/tests/gateway/test_core_update_total_drain.py
+@@ -139,3 +139,15 @@ async def test_real_settle_wait_fits_the_short_leash(monkeypatch):
+     except Exception as exc:  # the tail after the wait needs real authorities; only the wait matters
+         waited.setdefault("tail_error", repr(exc))
+     assert waited["timeout"] <= 40.0 - 2.0 - run_runtime.STOP_TAIL_RESERVE_SECONDS
++
++
++def test_cancelled_restart_clears_the_update_exit_target(tmp_path, monkeypatch):
++    from gateway import exit_deadline
++    runner, _ = _runner(tmp_path, monkeypatch)
++    exit_deadline._reset_for_tests()
++    try:
++        exit_deadline.set_exit_target(time.monotonic() + 5.0, "core-update checkpoint")
++        runner._cancel_restart()
++        assert exit_deadline.remaining_s() is None
++    finally:
++        exit_deadline._reset_for_tests()
+diff --git a/tests/gateway/test_update_checkpoint.py b/tests/gateway/test_update_checkpoint.py
+index 983fa08383..e21d296c22 100644
+--- a/tests/gateway/test_update_checkpoint.py
++++ b/tests/gateway/test_update_checkpoint.py
+@@ -248,3 +248,32 @@ def test_live_delegation_refusal_says_so(checkpoint, monkeypatch):
+     monkeypatch.setattr("gateway.run_active_work_verb._delegation_units", lambda now: [{"id": "d1"}])
+     result = invoke(module, runner)
+     assert "1 live async delegation(s)" in result["reason"]
++
++
++def test_accepted_checkpoint_sets_the_exit_target_inside_its_drain_timeout(checkpoint):
++    """The ack's drain_timeout is how long the updater waits for the process to EXIT: the tail is bound to it."""
++    from gateway import exit_deadline
++    module, _home, runner, _intent = checkpoint
++    exit_deadline._reset_for_tests()
++    try:
++        before = time.monotonic()
++        result = invoke(module, runner)
++        left = exit_deadline.remaining_s()
++        assert result["pausing"]
++        assert left is not None
++        assert left <= result["drain_timeout"] - exit_deadline.UPDATE_EXIT_MARGIN_S + (time.monotonic() - before)
++        assert left >= result["drain_timeout"] - exit_deadline.UPDATE_EXIT_MARGIN_S - 5
++    finally:
++        exit_deadline._reset_for_tests()
++
++
++def test_refused_or_unaccepted_checkpoint_sets_no_exit_target(checkpoint):
++    from gateway import exit_deadline
++    module, _home, runner, _intent = checkpoint
++    exit_deadline._reset_for_tests()
++    try:
++        runner.request_restart.return_value = False  # already stopping: not this update's promise
++        invoke(module, runner)
++        assert exit_deadline.remaining_s() is None
++    finally:
++        exit_deadline._reset_for_tests()
+diff --git a/tests/gateway/test_update_exit_target.py b/tests/gateway/test_update_exit_target.py
+new file mode 100644
+index 0000000000..0000dd4854
+--- /dev/null
++++ b/tests/gateway/test_update_exit_target.py
+@@ -0,0 +1,137 @@
++"""A core update's checkpoint promises the updater the gateway process EXITS within its drain timeout.
++
++hermes-hub 2026-11-13 01:58-01:59Z: the checkpoint was acked at 01:58:17 (drain_timeout 70s), stop()
++finished at 01:58:45, but the post-stop tail (control socket, cron/housekeeping thread waits, MCP) ran
++44.5s more: the process exited at 01:59:29, 2s after the updater's 70s wait, so the update was deferred
++and hermes-sync cooled off 60 min. The tail's waits are now clamped to the checkpoint's exit target.
++"""
++from __future__ import annotations
++
++import asyncio
++import threading
++import time
++from unittest.mock import MagicMock
++
++import pytest
++
++from gateway import exit_deadline
++import gateway.run as gateway_run
++
++
++@pytest.fixture(autouse=True)
++def _clean_deadline():
++    exit_deadline._reset_for_tests()
++    yield
++    exit_deadline._reset_for_tests()
++
++
++def test_exit_target_clamps_waits_without_a_deadline():
++    assert exit_deadline.clamp_wait(65.0) == 65.0
++    exit_deadline.set_exit_target(time.monotonic() + 20.0, "test")
++    assert 12.0 <= exit_deadline.clamp_wait(65.0) <= 13.0  # 20 - TAIL_RESERVE_S
++    exit_deadline.set_exit_target(None)
++    assert exit_deadline.clamp_wait(65.0) == 65.0
++
++
++def test_exit_target_and_deadline_take_the_earlier():
++    now = time.monotonic()
++    exit_deadline._state.update(deadline_mono=now + 50.0)
++    exit_deadline.set_exit_target(now + 30.0)
++    assert 29.0 <= exit_deadline.remaining_s() <= 30.0
++    exit_deadline.set_exit_target(now + 80.0)
++    assert 49.0 <= exit_deadline.remaining_s() <= 50.0
++
++
++@pytest.mark.asyncio
++async def test_tail_exits_by_the_update_exit_target(monkeypatch):
++    """A cron ticker blocked past cron_stop held the tail up to its 65s default."""
++    cron_stop = threading.Event()
++    hang = threading.Event()
++    cron = threading.Thread(target=hang.wait, args=(30,), daemon=True)  # ignores cron_stop
++    cron.start()
++    housekeeping = threading.Thread(target=cron_stop.wait, daemon=True)
++    housekeeping.start()
++    watcher_stop = threading.Event()
++    watcher = threading.Thread(target=watcher_stop.wait, daemon=True)
++    watcher.start()
++
++    async def fake_mcp_shutdown(*_args, **_kwargs):
++        return True
++
++    monkeypatch.setattr(gateway_run, "_shutdown_mcp_servers_nonblocking", fake_mcp_shutdown)
++    monkeypatch.setattr(gateway_run, "_stop_cron_provider", lambda provider: None)
++    monkeypatch.setattr("hermes_cli.nous_auth_keepalive.stop_nous_auth_keepalive", lambda: None)
++    runner = MagicMock(should_exit_with_failure=True, exit_reason="test stop", exit_code=None)
++
++    from gateway.run_bootstrap import _start_gateway_shutdown_tail
++    exit_deadline.set_exit_target(time.monotonic() + exit_deadline.TAIL_RESERVE_S + 1.0, "test")
++    started = time.monotonic()
++    await asyncio.wait_for(_start_gateway_shutdown_tail(
++        runner, None, cron_stop, object(), cron, housekeeping, watcher_stop, watcher, [False]), timeout=15)
++    elapsed = time.monotonic() - started
++    hang.set()
++    assert elapsed < 4.0
++
++
++@pytest.mark.asyncio
++async def test_tail_bounds_the_control_socket_stop(monkeypatch):
++    """The control socket stop is given a bounded connection wait (it was unbounded)."""
++    seen = {}
++
++    class Control:
++        async def stop(self, close_wait_s=None):
++            seen["close_wait_s"] = close_wait_s
++
++    cron_stop = threading.Event()
++    threads = [threading.Thread(target=cron_stop.wait, daemon=True) for _ in range(2)]
++    for thread in threads:
++        thread.start()
++    watcher_stop = threading.Event()
++    watcher = threading.Thread(target=watcher_stop.wait, daemon=True)
++    watcher.start()
++
++    async def fake_mcp_shutdown(*_args, **_kwargs):
++        return True
++
++    monkeypatch.setattr(gateway_run, "_shutdown_mcp_servers_nonblocking", fake_mcp_shutdown)
++    monkeypatch.setattr(gateway_run, "_stop_cron_provider", lambda provider: None)
++    monkeypatch.setattr("hermes_cli.nous_auth_keepalive.stop_nous_auth_keepalive", lambda: None)
++    runner = MagicMock(should_exit_with_failure=True, exit_reason="test stop", exit_code=None)
++
++    from gateway.run_bootstrap import _start_gateway_shutdown_tail
++    await _start_gateway_shutdown_tail(
++        runner, Control(), cron_stop, object(), threads[0], threads[1], watcher_stop, watcher, [False])
++    from gateway.run_bootstrap import _CONTROL_STOP_TIMEOUT_S
++    assert seen["close_wait_s"] == _CONTROL_STOP_TIMEOUT_S
++
++
++@pytest.mark.platforms("posix")
++def test_control_socket_stop_does_not_wait_on_a_held_connection(tmp_path):
++    """Server.wait_closed() waits for every open connection; one held by a slow handler held the exit."""
++    from gateway.control_socket import GatewayControlServer, query_gateway_control
++    home = tmp_path / "h"
++    home.mkdir()
++    release = threading.Event()
++    entered = threading.Event()
++
++    def slow():
++        entered.set()
++        release.wait(20)
++        return {"ok": True}
++
++    async def scenario():
++        server = GatewayControlServer(home, verb_handlers={"status": slow})
++        assert await server.start()
++        loop = asyncio.get_running_loop()
++        client = loop.run_in_executor(None, lambda: query_gateway_control(home, "status", timeout=20))
++        assert await asyncio.to_thread(entered.wait, 10)  # the request is in the handler, its connection open
++        started = time.monotonic()
++        try:
++            await server.stop(close_wait_s=0.5)
++            return time.monotonic() - started
++        finally:
++            release.set()
++            await asyncio.gather(client, return_exceptions=True)
++
++    elapsed = asyncio.run(scenario())
++    assert elapsed < 3.0
+-- 
+2.51.0
+

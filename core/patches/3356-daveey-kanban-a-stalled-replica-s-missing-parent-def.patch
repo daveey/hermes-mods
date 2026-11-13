@@ -1,0 +1,249 @@
+From 7774c0de3bf024f29de3af17036e134344151baf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:55:42 +0000
+Subject: [PATCH] [daveey] kanban: a stalled replica's missing-parent deferral
+ is said once per stale stamp at INFO
+
+Review nit on #1931 (5887627668): when the synced replica never reaches the feed head again, children whose
+parent status is unknown waited silently, with only a DEBUG line. The readiness pass now counts its deferrals
+and logs one INFO line per board per replica stamp (kanban_replica_freshness.report_deferred), naming the board,
+the replica's last time at the head (or "no readable replica") and how many children wait; it repeats only when
+the replica's pulled_at changes.
+
+kanban_db.recompute_ready now calls kanban_db_graph.note_missing_parents directly (the one-caller
+_note_missing_parents facade is gone) so the pass-end report fits kanban_db.py's FILE_LINES cap.
+
+No wall-clock escalation in the detector: after a laptop sleeps for hours its stamp is hours old on wake, so a
+bound would fire at once and bring back the false blocks this gate removes. A replica that never catches up is
+alarmed in awake time by the sync-freshness check of t_01a1d3df5e5d0757 (one card per incident).
+
+Test: test_a_stalled_replica_is_reported_once_per_stale_stamp_at_info (RED at 7b0bcbb5e2: no INFO line).
+---
+ hermes_cli/kanban_db.py                       | 16 ++----
+ hermes_cli/kanban_db_graph.py                 | 18 +++++--
+ hermes_cli/kanban_replica_freshness.py        | 49 +++++++++++++++++--
+ .../test_kanban_cross_gateway_parents.py      | 32 ++++++++++++
+ 4 files changed, 94 insertions(+), 21 deletions(-)
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 30478e6a6e..564896cac1 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1927,6 +1927,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None)
+     from hermes_cli.kanban_block_routing import recovery_held
+     from hermes_cli.kanban_wake_check import foreign_ids
+     from hermes_cli import kanban_review_release
++    from hermes_cli import kanban_db_graph as _graph
+     promoted = 0
+     remote = _sync.has_remote_parents(conn)
+     releases = kanban_review_release.prepare(conn, failure_limit)
+@@ -1951,7 +1952,9 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None)
+             if recovery_held(conn, row, failure_limit):
+                 continue
+             states = parent_states(conn, task_id, remote=remote)
+-            if cur_status == "todo" and _note_missing_parents(conn, task_id, states, remote=remote, fresh=fresh):
++            # Inside this txn, for a ``todo`` child: start/close a missing-parent streak (``parent_missing`` /
++            # ``parent_found``) and block after PARENT_MISSING_BLOCK_SECONDS (synced: replica at the feed head only).
++            if cur_status == "todo" and _graph.note_missing_parents(conn, task_id, states, remote=remote, fresh=fresh):
+                 continue
+             if all(st in ("done", "archived") for _pid, st in states):
+                 resume_status = _resume_status_from_events(conn, task_id)
+@@ -1971,6 +1974,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None)
+                     promotion_payload,
+                 )
+                 promoted += 1
++    _graph.report_deferred_pass(conn, fresh)  # one INFO line per board per stale replica stamp
+     return promoted
+ 
+ 
+@@ -2004,16 +2008,6 @@ def parent_states(
+     return [(row["id"], row["status"]) for row in conn.execute(sql, (task_id,)).fetchall()]
+ 
+ 
+-def _note_missing_parents(
+-    conn: sqlite3.Connection, task_id: str, states: list[tuple[str, Optional[str]]], *, remote=False, fresh=None,
+-) -> bool:
+-    """Inside :func:`recompute_ready`'s txn, for a ``todo`` child: record when a parent goes missing
+-    (``parent_missing`` event, once per streak), clear the streak when it comes back (``parent_found``), and block
+-    the child after :data:`PARENT_MISSING_BLOCK_SECONDS` (synced: fresh mirror only). True when blocked here."""
+-    from hermes_cli.kanban_db_graph import note_missing_parents
+-    return note_missing_parents(conn, task_id, states, remote=remote, fresh=fresh)
+-
+-
+ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
+     """Return whether every direct parent is terminal for dependency gating (:func:`parent_states`: a parent
+     another gateway owns counts by its Board status, a missing parent gates)."""
+diff --git a/hermes_cli/kanban_db_graph.py b/hermes_cli/kanban_db_graph.py
+index daef77d9e9..cd727a4749 100644
+--- a/hermes_cli/kanban_db_graph.py
++++ b/hermes_cli/kanban_db_graph.py
+@@ -2,13 +2,10 @@
+ from __future__ import annotations
+ 
+ import json
+-import logging
+ import sqlite3
+ import time
+ from typing import Any, Optional
+ 
+-_log = logging.getLogger(__name__)
+-
+ 
+ def note_missing_parents(
+     conn: sqlite3.Connection, task_id: str, states: list[tuple[str, Optional[str]]], *,
+@@ -19,6 +16,10 @@ def note_missing_parents(
+     On a synced board (``remote``) a parent with no status is unknown, not missing, unless the mirror's replica is
+     at the feed head (``kanban_replica_freshness.replica_at_head``, read once per readiness pass into ``fresh``):
+     otherwise no streak event is recorded and nothing is blocked. The child still waits: an unknown parent gates.
++    Each deferral is counted in ``fresh["deferred"]`` and the pass logs one INFO line per board per stale replica
++    stamp (``kanban_replica_freshness.report_deferred``). A replica that never catches up is alarmed in awake time
++    by the sync-freshness check of t_01a1d3df5e5d0757, not by a wall-clock bound here: a laptop's stamp is hours
++    old on wake from sleep, so such a bound would fire at once and bring back the false blocks.
+     A streak is scoped (``_streak_open``): a parent missing after an unblock or a link, or one the open streak does
+     not name, starts a fresh ``parent_missing`` and waits its own :data:`PARENT_MISSING_BLOCK_SECONDS`."""
+     from hermes_cli import kanban_db as kb
+@@ -31,9 +32,8 @@ def note_missing_parents(
+         cache = {} if fresh is None else fresh
+         if "fresh" not in cache:  # a detached board (sync off) keeps its mirror table but is its own authority
+             cache["fresh"] = replica_at_head(conn) if synced(conn) else True
+-            if not cache["fresh"]:
+-                _log.debug("parent status unknown: replica not at head")
+         if not cache["fresh"]:
++            cache["deferred"] = cache.get("deferred", 0) + 1
+             return False
+     last = conn.execute(
+         "SELECT id, kind, created_at, payload FROM task_events WHERE task_id = ? "
+@@ -64,6 +64,14 @@ def note_missing_parents(
+     return True
+ 
+ 
++def report_deferred_pass(conn: sqlite3.Connection, fresh: dict) -> None:
++    """After a readiness pass: the children :func:`note_missing_parents` deferred because the replica is not at the
++    feed head get one INFO line per board per stale replica stamp (``kanban_replica_freshness.report_deferred``)."""
++    if fresh.get("deferred"):
++        from hermes_cli.kanban_replica_freshness import report_deferred
++        report_deferred(conn, fresh["deferred"])
++
++
+ def _streak_open(conn: sqlite3.Connection, task_id: str, last, missing: list[str]) -> bool:
+     """The newest ``parent_missing`` is this streak only when no ``unblocked`` event, nor a ``linked`` event for a
+     parent missing now (or naming none), follows it, and it names every parent missing now: a later incident must
+diff --git a/hermes_cli/kanban_replica_freshness.py b/hermes_cli/kanban_replica_freshness.py
+index 564559881d..ee5357d09c 100644
+--- a/hermes_cli/kanban_replica_freshness.py
++++ b/hermes_cli/kanban_replica_freshness.py
+@@ -166,23 +166,31 @@ def replica_at_head(conn: sqlite3.Connection) -> bool:
+ 
+ def _replica_at_head(conn: sqlite3.Connection):
+     """True/False as :func:`replica_at_head`; None when there is no readable replica to judge by."""
++    return _replica_state(conn)[0]
++
++
++def _replica_state(conn: sqlite3.Connection) -> tuple:
++    """``(verdict, board_id, pulled_at)``: the :func:`_replica_at_head` verdict, the live board's id (None when
++    unsynced or unreadable) and the replica's numeric ``pulled_at`` stamp (None when it has none)."""
+     from hermes_cli.kanban_db_connect import _main_db_file
+     from hermes_cli.kanban_foreign_card import open_replica
+ 
+     try:
+         local = conn.execute("SELECT board_id FROM kanban_sync_state LIMIT 1").fetchone()
+         if local is None:
+-            return None
++            return None, None, None
+         with open_replica(_main_db_file(conn)) as replica:
+             if replica is None:
+-                return None
++                return None, local["board_id"], None
+             state = replica.execute("SELECT board_id, pulled_at FROM kanban_sync_state LIMIT 1").fetchone()
+     except (sqlite3.Error, OSError, ValueError):
+-        return None
++        return None, None, None
+     if state is None or state["board_id"] != local["board_id"]:
+-        return False
++        return False, local["board_id"], None
+     pulled = state["pulled_at"]
+-    return type(pulled) in (int, float) and 0 <= time.time() - pulled <= FRESH_SECONDS
++    if type(pulled) not in (int, float):
++        return False, local["board_id"], None
++    return 0 <= time.time() - pulled <= FRESH_SECONDS, local["board_id"], pulled
+ 
+ 
+ def synced(conn: sqlite3.Connection) -> bool:
+@@ -202,3 +210,34 @@ def local_copy_stale(conn: sqlite3.Connection, what: str) -> bool:
+         return False
+     _log.debug("%s: local copy not at the feed head; deferring to the next tick", what)
+     return True
++
++
++# Live board file -> the replica stamp its last deferral line named: one INFO line per board per stale stamp.
++_reported: dict[str, object] = {}
++
++
++def report_deferred(conn: sqlite3.Connection, deferred: int) -> None:
++    """One INFO line when a readiness pass deferred ``deferred`` missing-parent judgements because the replica is
++    not at the feed head, repeated only when the replica's ``pulled_at`` changes. It names the board, the replica's
++    last time at the head (or "no readable replica") and the count. There is deliberately no wall-clock escalation
++    here: after a laptop sleeps for hours its stamp is hours old on wake, so a bound would fire at once and bring
++    back the false blocks this gate removes. A replica that never catches up is alarmed in awake time by the
++    sync-freshness check of t_01a1d3df5e5d0757, which files one card per incident."""
++    from datetime import UTC, datetime
++    from hermes_cli.kanban_db_connect import _main_db_file
++
++    verdict, board, pulled = _replica_state(conn)
++    key = str(_main_db_file(conn) or board)
++    stamp = "unreadable" if verdict is None else pulled
++    if key in _reported and _reported[key] == stamp:
++        return
++    _reported[key] = stamp
++    if verdict is None:
++        last = "no readable replica"
++    elif pulled is None:
++        last = "replica not stamped at the feed head"
++    else:
++        last = "replica last at the feed head " + datetime.fromtimestamp(pulled, UTC).isoformat(
++            timespec="seconds")
++    _log.info("missing-parent check deferred on board %s (%s): %s; %d child(ren) wait with parent status unknown",
++              board or "?", key, last, deferred)
+diff --git a/tests/hermes_cli/test_kanban_cross_gateway_parents.py b/tests/hermes_cli/test_kanban_cross_gateway_parents.py
+index 06fdf306ae..b2cbf5646a 100644
+--- a/tests/hermes_cli/test_kanban_cross_gateway_parents.py
++++ b/tests/hermes_cli/test_kanban_cross_gateway_parents.py
+@@ -301,3 +301,35 @@ def test_a_detached_board_keeps_its_mirror_table_but_still_blocks_a_missing_pare
+     assert kb.get_task(live, child).status == "blocked"
+     kb.recompute_ready(live)
+     assert len(_repairs(live, child)) == 1
++
++
++def test_a_stalled_replica_is_reported_once_per_stale_stamp_at_info(live, svc, kanban_home, caplog, monkeypatch):
++    """Review nit on #1931: a stalled sync must not leave the deferral silent (DEBUG only), nor repeat it every
++    tick. One INFO line per board per replica stamp names the board, the last time at the head and the count."""
++    from hermes_cli import kanban_replica_freshness as fr
++    monkeypatch.setattr(fr, "_reported", {}, raising=False)
++    children = [kb.create_task(live, title=f"child {i}", assignee="worker") for i in range(2)]
++    _round(kanban_home, svc)
++    for i, child in enumerate(children):
++        _link_raw(live, f"t_after_offline_{i}", child)
++    stale = int(time.time()) - fr.FRESH_SECONDS - 60
++    _stamp_replica(stale)
++    caplog.set_level("INFO", logger=fr.__name__)
++
++    def lines():
++        return [r.getMessage() for r in caplog.records if r.name == fr.__name__ and r.levelname == "INFO"]
++
++    kb.recompute_ready(live)
++    kb.recompute_ready(live)  # same stale stamp: no second line
++    [first] = lines()
++    assert f"board {BOARD}" in first and "2 child(ren)" in first
++    assert time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(stale)) in first
++    _stamp_replica(stale + 1)  # the replica moved but is still behind: said once more
++    kb.recompute_ready(live)
++    assert len(lines()) == 2
++    for path in ksc.shadow_path(BOARD).parent.glob(f"{BOARD}.db*"):  # no replica at all: said once, as such
++        path.unlink()
++    kb.recompute_ready(live)
++    kb.recompute_ready(live)
++    assert len(lines()) == 3 and "no readable replica" in lines()[-1]
++    assert all(kb.get_task(live, c).status == "todo" and not _events(live, c, "parent_missing") for c in children)
+-- 
+2.51.0
+

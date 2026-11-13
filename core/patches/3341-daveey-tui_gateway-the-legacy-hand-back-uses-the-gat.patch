@@ -1,0 +1,473 @@
+From 7835e1ef98612a57e3bad07a38df77c5a41ab8f9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:24:25 +0000
+Subject: [PATCH] [daveey] tui_gateway: the legacy hand-back uses the gateway
+ claim's own predicate; its owner answer is one state.db open per chat per
+ poll
+
+Review 5887848770 (t_01a1d3ddaceef7fd) on PR #1720, both nits:
+
+1. The legacy poller handed a chat back on ledger/lease alone. The gateway's
+   tui-owner claim (owned_live_session) also needs a live LOCAL adapter and an
+   authority for the row's notifier_profile. With forwardable ledger work on a
+   profile the gateway does not serve, or with no live gateway at all, nobody
+   claimed until the ledger work ended. Now the chat-level half requires the
+   verified live default gateway (pid from gateway.status) and, for the lease,
+   that gateway's pid; the row-level half (claims_row) mirrors
+   _launch_authority (unstamped or the gateway's launch profile, from its
+   served_profiles record) and skips threaded rows. The board poll skips only
+   rows the gateway claims; the buffered hand-back fires only when every claim
+   is one it claims. Each owner change is logged once at INFO (episode start /
+   back with this backend).
+2. _kb_gateway_owns ran on every 5 s poll for every live chat, twice when
+   something was pending, opening state.db once per lineage id. The answer is
+   now memoized per chat for OWNER_TTL_S (5 s, the poll interval) and a fresh
+   one reads the ledger and turn leases over the whole lineage in one open.
+
+Tests (tests/gateway/test_kanban_tui_sibling_custody.py): (a) forwardable
+ledger work on an unserved profile and (b) forwardable ledger work with no
+live gateway / LOCAL adapter both keep the chat with the legacy leg, claimed
+once, never handed back, nothing else delivers it; the INFO episode logs once
+per change; N=24 polls x M=3 chats with 3-id lineages open state.db at most
+once per chat per TTL.
+---
+ .../test_kanban_tui_sibling_custody.py        | 126 +++++++++++++-
+ tui_gateway/kanban_leg_custody.py             | 159 +++++++++++++-----
+ tui_gateway/session_notifications.py          |  12 +-
+ 3 files changed, 244 insertions(+), 53 deletions(-)
+
+diff --git a/tests/gateway/test_kanban_tui_sibling_custody.py b/tests/gateway/test_kanban_tui_sibling_custody.py
+index fd9a6d701d..1c5dddfcbf 100644
+--- a/tests/gateway/test_kanban_tui_sibling_custody.py
++++ b/tests/gateway/test_kanban_tui_sibling_custody.py
+@@ -119,26 +119,41 @@ def env(tmp_path, monkeypatch):
+         return _Refusal(status) if status else None
+ 
+     monkeypatch.setattr(server, "_canonical_ledger_refusal", ledger_refusal)
++
++    from tui_gateway import kanban_leg_custody as custody
++    authority.owner_db, authority.owner_opens = authority.db, {}
++    real_read = custody._ledger_and_leases
++
++    @contextlib.contextmanager
++    def owner_db(session):  # the legacy owner probe reads the same ledger, in one open of the store
++        key = session["session_key"]
++        authority.owner_opens[key] = authority.owner_opens.get(key, 0) + 1
++        yield authority.owner_db
++
++    monkeypatch.setattr(custody, "_ledger_and_leases", lambda session, ids, _db: real_read(session, ids, owner_db))
++    monkeypatch.setattr(custody, "_owners", {})
++    monkeypatch.setattr(custody, "_live_gateway_pid", lambda: 4242)  # a verified live default gateway
++    monkeypatch.setattr(custody, "_gateway_launch_profile", lambda pid: "default")
+     return runner, authority, adapter, admitted
+ 
+ 
+-def _sub(tid, platform, mode, chat=CHAT):
++def _sub(tid, platform, mode, chat=CHAT, profile="default"):
+     conn = kbc.connect()
+     try:
+         kbn.add_notify_sub(conn, task_id=tid, platform=platform, chat_id=chat, chat_type="dm",
+-                           notifier_profile="default", delivery_mode=mode)
++                           notifier_profile=profile, delivery_mode=mode)
+     finally:
+         conn.close()
+ 
+ 
+-def _card(*, tui=True, local=True):
++def _card(*, tui=True, local=True, profile="default"):
+     conn = kbc.connect()
+     try:
+         tid = kb.create_task(conn, title="FIXTURE", assignee="worker")
+     finally:
+         conn.close()
+     if tui:
+-        _sub(tid, "tui", "notify")
++        _sub(tid, "tui", "notify", profile=profile)
+     if local:
+         _sub(tid, "local", "notify+wake")
+     return tid
+@@ -184,6 +199,11 @@ def _session():
+     return {"session_key": CHAT, "history_lock": threading.Lock()}
+ 
+ 
++def _next_poll(session):
++    """A later 5 s poll: the chat's gateway-owner answer is reused only within ``OWNER_TTL_S``."""
++    session.pop("_kb_gateway_owner", None)
++
++
+ def _legacy_collect(session):
+     """The legacy poller's collection into the session buffer (what a busy chat holds until its turn)."""
+     claims = []
+@@ -305,6 +325,7 @@ def test_n4_busy_owned_tui_only_chat_never_holds_a_legacy_claim(env):
+ 
+     authority.sessions[CHAT] = _Live(CHAT)
+     authority.db.work(CHAT)  # the gateway takes the chat and is mid-turn
++    _next_poll(session)
+     server._notif_poll_kanban_scoped("sid", session, prepared=([], []))  # one legacy poll, still busy
+     assert session["_kanban_pending"] == [] and session["_kanban_claims"] == []
+     assert _row(tid)[1] is None  # handed back, not held until the turn ends or the reaper
+@@ -332,6 +353,7 @@ def test_n4_compressed_owned_chat_with_ledger_work_on_the_root_never_holds_a_leg
+     monkeypatch.setattr(authority, "logical_owner", lambda chat: "root")
+     authority.sessions["root"] = _Live(CHAT)
+     authority.db.work("root")  # the gateway's ledger keys the chat by its lineage root
++    _next_poll(session)
+     server._notif_poll_kanban_scoped("sid", session, prepared=([], []))
+     assert session["_kanban_pending"] == [] and session["_kanban_claims"] == []
+     assert _row(tid)[1] is None
+@@ -346,6 +368,7 @@ def test_n4_a_gateway_turn_lease_hands_the_chat_back_like_ledger_work(env, monke
+     """The gateway owner also claims while its process holds the chat's turn lease (``_gateway_holds_work``); the
+     legacy poller must hand back on the same condition, and only for the live gateway's pid."""
+     from tui_gateway import kanban_leg_custody as custody
++    _runner, authority, _adapter, _admitted = env
+     tid = _card(local=False)
+     session = _session()
+     session["running"] = True
+@@ -359,16 +382,14 @@ def test_n4_a_gateway_turn_lease_hands_the_chat_back_like_ledger_work(env, monke
+         def session_turn_lease_owner(self, sid):
+             return {"holder": holder["value"]} if sid == CHAT else None
+ 
+-    @contextlib.contextmanager
+-    def fake_db(_session):
+-        yield _Db()
+-
+-    monkeypatch.setattr(server, "_session_db", fake_db)
++    authority.owner_db = _Db()
+     monkeypatch.setattr(custody, "_live_gateway_pid", lambda: 31337)
++    _next_poll(session)
+     server._notif_poll_kanban_scoped("sid", session, prepared=([], []))
+     assert len(session["_kanban_pending"]) == 1, "a lease held by a non-gateway process is not the gateway's"
+ 
+     monkeypatch.setattr(custody, "_live_gateway_pid", lambda: 424242)
++    _next_poll(session)
+     server._notif_poll_kanban_scoped("sid", session, prepared=([], []))
+     assert session["_kanban_pending"] == [] and session["_kanban_claims"] == []
+     assert _row(tid)[1] is None
+@@ -490,3 +511,90 @@ def test_a_root_wake_floor_reads_the_tip_tui_row(env):
+         assert sibling.tui_sibling_floor(conn, {**local, "tui_chats": (CHAT,)}) == _row(tid)[0]
+     finally:
+         conn.close()
++
++
++def _keeps_the_chat_and_holds_it_once(runner, authority, adapter, admitted, tid, session):
++    """The legacy leg keeps a chat the gateway would not claim: it claims the notice once, never hands it back,
++    and nobody else delivers it, before and after the gateway's ledger work ends (review 5887848770 nit 1)."""
++    assert len(_legacy_collect(session)) == 1 and _row(tid)[1] is not None
++    for _ in range(2):
++        server._notif_poll_kanban_scoped("sid", session, prepared=([], []))  # one legacy poll, still busy
++        assert len(session["_kanban_pending"]) == 1 and _row(tid)[1] is not None, "handed to a leg that never claims"
++        _gateway_tick(runner)
++        assert admitted == [] and adapter.turns == []
++        _next_poll(session)
++    authority.db.conn.execute("UPDATE session_admissions SET status = 'terminal'")  # the gateway's work ends
++    server._notif_poll_kanban_scoped("sid", session, prepared=([], []))
++    assert _legacy_collect(session) == [] and len(session["_kanban_pending"]) == 1
++    _gateway_tick(runner)
++    assert _notices(adapter, admitted, tid) == 0 and f"Kanban {tid}" in session["_kanban_pending"][0]
++
++
++def test_nit1_a_forwardable_ledger_on_a_profile_the_gateway_does_not_serve_keeps_the_chat(env):
++    """(a) The gateway holds forwardable ledger work for the chat, but the row is stamped for a profile its
++    collector does not serve (``_launch_authority`` answers None), so only this backend can deliver it."""
++    runner, authority, adapter, admitted = env
++    tid = _card(local=False, profile="coder")
++    authority.sessions[CHAT] = _Live(CHAT)
++    authority.db.work(CHAT)
++    session = _session()
++    session["running"] = True
++    _complete(tid)
++    _keeps_the_chat_and_holds_it_once(runner, authority, adapter, admitted, tid, session)
++
++
++def test_nit1_forwardable_ledger_work_with_no_local_adapter_keeps_the_chat(env, monkeypatch):
++    """(b) The ledger still holds forwardable work, but no live gateway runs a LOCAL adapter for the chat (none is
++    running: the owner probe finds no verified default gateway), so nothing would claim a handed-back row."""
++    from tui_gateway import kanban_leg_custody as custody
++    runner, authority, adapter, admitted = env
++    runner.adapters = {}  # and the collector, were it running, has no LOCAL adapter either
++    monkeypatch.setattr(custody, "_live_gateway_pid", lambda: None)
++    tid = _card(local=False)
++    authority.db.work(CHAT)
++    session = _session()
++    session["running"] = True
++    _complete(tid)
++    _keeps_the_chat_and_holds_it_once(runner, authority, adapter, admitted, tid, session)
++
++
++def test_nit1_the_hand_back_starts_an_info_episode_once_per_chat(env, monkeypatch, caplog):
++    from tui_gateway import kanban_leg_custody as custody
++    _runner, authority, _adapter, _admitted = env
++    clock = {"t": 1000.0}
++    monkeypatch.setattr(custody, "time", type("T", (), {"monotonic": staticmethod(lambda: clock["t"])}))
++    authority.db.work(CHAT)
++    session = _session()
++    with caplog.at_level("INFO", logger=custody.__name__):
++        for _ in range(4):
++            assert server._kb_gateway_owns(session)
++            clock["t"] += custody.OWNER_TTL_S
++        authority.db.conn.execute("UPDATE session_admissions SET status = 'terminal'")
++        assert not server._kb_gateway_owns(session)
++    lines = [r.getMessage() for r in caplog.records if r.name == custody.__name__]
++    assert len(lines) == 2 and "goes to gateway pid 4242" in lines[0] and "back with this backend" in lines[1]
++
++
++def test_nit2_the_owner_probe_opens_state_db_at_most_once_per_chat_per_ttl(env, monkeypatch):
++    """Every live chat's legacy poller asks whether the gateway owns it on each 5 s poll, and again before running
++    a buffered batch. Over N polls of M chats with compaction parents, state.db is opened at most once per chat per
++    ``OWNER_TTL_S`` (review 5887848770 nit 2; the per-poll cost t_01a1cee98b798343 removed from the lineage read)."""
++    from tui_gateway import kanban_leg_custody as custody
++    _runner, authority, _adapter, _admitted = env
++    assert custody.OWNER_TTL_S <= server._KANBAN_POLL_SECONDS
++    clock = {"t": 1000.0}
++    monkeypatch.setattr(custody, "time", type("T", (), {"monotonic": staticmethod(lambda: clock["t"])}))
++    chats = [f"chat-{i}" for i in range(3)]
++    monkeypatch.setattr(server, "_session_lineage", lambda key, limit=8: (f"{key}-root", f"{key}-older"))
++    authority.db.work("chat-0-root")  # one chat is gateway-owned through its lineage root; the others are not
++    opens = authority.owner_opens  # each open of the session's store by the owner probe
++    sessions = {c: {"session_key": c, "history_lock": threading.Lock()} for c in chats}
++    polls, step = 24, 1.25  # 30 s of polling, each poll asking twice
++    for _ in range(polls):
++        for session in sessions.values():
++            _legacy_collect(session)
++            server._kb_gateway_owns(session)  # the buffered batch's hand-back check
++        clock["t"] += step
++    budget = int(polls * step / custody.OWNER_TTL_S)
++    assert set(opens) == set(chats) and all(n <= budget for n in opens.values()), (opens, budget)
++    assert server._kb_gateway_owns(sessions["chat-0"]) and not server._kb_gateway_owns(sessions["chat-1"])
+diff --git a/tui_gateway/kanban_leg_custody.py b/tui_gateway/kanban_leg_custody.py
+index 9b13246617..54d652fb9f 100644
+--- a/tui_gateway/kanban_leg_custody.py
++++ b/tui_gateway/kanban_leg_custody.py
+@@ -8,42 +8,80 @@ waited 45 min, held in flight by a backend whose turns the gateway-owned chat re
+ import contextlib
+ import logging
+ import os
++import time
++from typing import NamedTuple, Optional
+ 
+ logger = logging.getLogger(__name__)
+ 
++# How long one chat's gateway-owner answer is reused: no longer than the legacy poll (``_KANBAN_POLL_SECONDS``),
++# so a poll sees an answer at most one poll old. Each answer opens state.db once; every live chat's poller asked
++# for it up to twice per 5 s poll, once per lineage id (review 5887848770 nit 2, the cost t_01a1cee98b798343 took
++# out of ``_session_lineage``). No hook tells this process when the gateway's ledger or lease changes.
++OWNER_TTL_S = 5.0
+ 
+-def gateway_owns(session: dict, ledger_refusal, lineage: tuple = (), lease_holder=None) -> bool:
+-    """The canonical gateway runs this chat now: its durable ledger holds work for it that ends on its own
+-    (``owner_forward.FORWARDABLE_LEDGER_STATES``), or the live gateway process holds the chat's turn lease. Those
+-    are the conditions under which ``gateway.kanban_tui_owner`` claims the chat's tui rows and admits them to its
+-    FIFO within one notifier tick (``_gateway_holds_work``), checked over the same ids: the chat and its compaction
+-    parents (``lineage``; admissions and leases are keyed by the lineage root, tui rows by the tip — review
+-    t_01a1d1543b9d13cf). ``ledger_refusal`` is ``session_lifecycle._canonical_ledger_refusal``; ``lease_holder``
+-    maps a session id to its turn-lease holder string (``pid=<pid>:…``) or None. An ``unknown`` admission, no
+-    ledger row, a lease held by this or any non-gateway process, or an unreadable answer: False, and this backend
+-    keeps the rows as before (a legacy-only chat buffers while busy)."""
++_owners: dict = {}  # session key -> the GatewayOwner its last answer named (the per-row check in the board poll)
++
++
++class GatewayOwner(NamedTuple):
++    """The live gateway that will claim this chat's tui rows: its pid, its launch profile, and why."""
++    pid: int
++    profile: str
++    reason: str
++
++
++def gateway_owner(ids: tuple, ledger_status: Optional[str], lease_holders: tuple, gateway_pid=None,
++                  launch_profile=None) -> Optional[GatewayOwner]:
++    """The live gateway whose collector claims this chat's tui rows and admits them to its FIFO within one
++    notifier tick (``gateway.kanban_tui_owner.owned_live_session``), else None.
++
++    The chat-level half of that predicate, as this process can see it: the verified live default gateway
++    (``gateway_pid``) holds work for the chat that ends on its own, i.e. the first ledger row over ``ids`` (the
++    chat and its compaction parents: admissions and leases sit on the lineage root, tui rows on the tip, review
++    t_01a1d1543b9d13cf) is in ``owner_forward.FORWARDABLE_LEDGER_STATES``, or its process holds the chat's turn
++    lease (``_gateway_holds_work``). The row-level half is :func:`claims_row`. No live gateway (its LOCAL
++    adapter is what claims), an ``unknown`` admission, no ledger row, a lease held by any other process, or an
++    unreadable answer: None, and this backend keeps the rows as before (a legacy-only chat buffers while busy)."""
+     from tui_gateway.owner_forward import FORWARDABLE_LEDGER_STATES
+-    key = str(session.get("session_key") or "")
+-    ids = tuple(dict.fromkeys(s for s in (key, *lineage) if s))
+-    for sid in ids:
+-        try:
+-            refusal = ledger_refusal(session if sid == key else {**session, "session_key": sid})
+-        except Exception:  # health: allow BLE001 -- an unprovable owner keeps the legacy path
+-            return False
+-        if refusal is not None:
+-            return getattr(refusal, "ledger_status", None) in FORWARDABLE_LEDGER_STATES
+-    if lease_holder is None:
+-        return False
+-    try:
++    if ledger_status is not None:
++        reason = f"ledger {ledger_status}" if ledger_status in FORWARDABLE_LEDGER_STATES else None
++    else:
+         mine = f"pid={os.getpid()}:"
+-        others = [h for h in (str(lease_holder(sid) or "") for sid in ids) if h.startswith("pid=")
+-                  and not h.startswith(mine)]
+-        if not others:  # the common case: no lease, or this backend's own turn (no gateway probe)
+-            return False
+-        gateway = _live_gateway_pid()
+-        return gateway is not None and any(h.startswith(f"pid={gateway}:") for h in others)
+-    except Exception:  # health: allow BLE001 -- an unprovable owner keeps the legacy path
++        others = [h for h in lease_holders if h.startswith("pid=") and not h.startswith(mine)]
++        reason = "turn lease" if others else None  # the common case: no lease (no gateway probe)
++    if reason is None:
++        return None
++    pid = _live_gateway_pid() if gateway_pid is None else gateway_pid
++    if pid is None or (reason == "turn lease" and not any(h.startswith(f"pid={pid}:") for h in lease_holders)):
++        return None
++    profile = _gateway_launch_profile(pid) if launch_profile is None else launch_profile
++    return GatewayOwner(int(pid), str(profile or ""), reason)
++
++
++def claims_row(owner: Optional[GatewayOwner], sub: dict) -> bool:
++    """Whether ``owner``'s collector claims this tui row: ``_launch_authority`` serves only the gateway's launch
++    profile (an unstamped row goes to it), and ``owned_live_session`` skips threaded rows. A row it would skip
++    stays with this backend, which delivers it once the chat is back here (review 5887848770 nit 1)."""
++    if owner is None or sub.get("thread_id"):
+         return False
++    profile = str(sub.get("notifier_profile") or "")
++    return not profile or profile == owner.profile
++
++
++def gateway_claims(session_key: str, sub: dict) -> bool:
++    """:func:`claims_row` against the chat's last :func:`legacy_gateway_owns` answer (the board poll's check)."""
++    return claims_row(_owners.get(session_key), sub)
++
++
++def _gateway_launch_profile(pid: int) -> str:
++    """The live gateway's launch profile: the first ``served_profiles`` entry its runtime record names
++    (``run_adapters._record_served_profiles``). Unknown: "", which matches only unstamped rows."""
++    from gateway.status import read_runtime_status
++    from hermes_constants import get_default_hermes_root
++    runtime = read_runtime_status(get_default_hermes_root() / "gateway_state.json") or {}
++    served = runtime.get("served_profiles")
++    if runtime.get("pid") not in (None, pid) or not isinstance(served, list) or not served:
++        return ""
++    return str(served[0] or "")
+ 
+ 
+ def _lineage(session: dict, session_lineage) -> tuple:
+@@ -59,15 +97,60 @@ def chat_lineage(session_key: str, session_lineage) -> tuple:
+     return (session_key, *_lineage({"session_key": session_key}, session_lineage))
+ 
+ 
+-def legacy_gateway_owns(session: dict, ledger_refusal, session_lineage, session_db) -> bool:
+-    """:func:`gateway_owns` for a legacy backend's session: its compaction parents (``session_lineage``) and the
+-    turn-lease holder read through the session's own store (``session_db``)."""
+-    def lease_holder(sid: str):
+-        with session_db(session) as db:
+-            owner_of = getattr(db, "session_turn_lease_owner", None)
+-            owner = owner_of(sid) if owner_of is not None else None
+-        return (owner or {}).get("holder")
+-    return gateway_owns(session, ledger_refusal, _lineage(session, session_lineage), lease_holder)
++def legacy_gateway_owns(session: dict, session_lineage, session_db, now: Optional[float] = None) -> bool:
++    """Whether the live gateway claims every tui notice this backend buffers for the chat, so handing them back
++    reaches a leg that delivers them: :func:`gateway_owner` for the chat, :func:`claims_row` for each claim.
++
++    The chat's answer is reused for ``OWNER_TTL_S``. A fresh one reads the ledger and the turn leases over the
++    chat and its compaction parents (``session_lineage``) in ONE open of the session's store (``session_db``).
++    A changed answer starts a new episode, logged once at INFO, so a long hand-back is visible in agent.log."""
++    now = time.monotonic() if now is None else now
++    key = str(session.get("session_key") or "")
++    memo = session.get("_kb_gateway_owner")
++    if memo is not None and now - memo[0] < OWNER_TTL_S:
++        owner = memo[1]
++    else:
++        ids = tuple(dict.fromkeys(s for s in (key, *_lineage(session, session_lineage)) if s))
++        try:
++            owner = gateway_owner(ids, *_ledger_and_leases(session, ids, session_db))
++        except Exception:  # health: allow BLE001 -- an unprovable owner keeps the legacy path
++            owner = None
++        session["_kb_gateway_owner"] = (now, owner)
++        if owner != (memo[1] if memo is not None else None) and owner is not None:
++            logger.info("kanban notices: chat %s goes to gateway pid %s (profile %s, %s); this backend hands it "
++                        "the chat's tui notices for that profile", key, owner.pid, owner.profile or "?", owner.reason)
++        elif owner is None and memo is not None and memo[1] is not None:
++            logger.info("kanban notices: chat %s is back with this backend (gateway pid %s no longer holds it)",
++                        key, memo[1].pid)
++    if owner is None:
++        _owners.pop(key, None)
++        return False
++    _owners[key] = owner
++    claims = session.get("_kanban_claims") or []
++    return all(claims_row(owner, c) for c in claims if not c.get("remote"))
++
++
++def _ledger_and_leases(session: dict, ids: tuple, session_db) -> tuple:
++    """(first ledger status over ``ids``, their turn-lease holders), read in one open of the session's store.
++    The lease is read only when no ledger row answers (the common no-work case reads no lease)."""
++    from tui_gateway.session_lifecycle import _CANONICAL_PENDING_SQL
++    with session_db(session) as db:
++        if db is None:
++            raise RuntimeError("session store unavailable")
++        status = None
++        read_ctx = getattr(db, "_read_ctx", None)
++        if read_ctx is not None:
++            with read_ctx() as conn:
++                for sid in ids:
++                    row = conn.execute(_CANONICAL_PENDING_SQL, (sid, sid)).fetchone()
++                    if row is not None:
++                        status = str(row[0])
++                        break
++        if status is not None:
++            return status, ()
++        owner_of = getattr(db, "session_turn_lease_owner", None)
++        holders = (str((owner_of(sid) or {}).get("holder") or "") for sid in ids) if owner_of else ()
++        return None, tuple(h for h in holders if h)
+ 
+ 
+ def legacy_settle_held(session: dict, session_lineage, log_failure) -> None:
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 25869fd765..bb7da1ea31 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -749,7 +749,7 @@ def _kb_poll_board_now(_kb, _kbc, _kbn, slug: str, session_key: str, claims: lis
+     except Exception:
+         return []
+     texts: list = []
+-    from tui_gateway.kanban_leg_custody import chat_lineage
++    from tui_gateway.kanban_leg_custody import chat_lineage, gateway_claims
+     chats = chat_lineage(session_key, _session_lineage)  # its local rows may sit on the lineage root
+     with contextlib.closing(conn):
+         try:
+@@ -763,7 +763,8 @@ def _kb_poll_board_now(_kb, _kbc, _kbn, slug: str, session_key: str, claims: lis
+         for sub in subs:
+             if (sub.get("platform") or "").lower() != "tui" or sub.get("chat_id") != session_key:
+                 continue
+-            sub = {**sub, "sibling_chats": chats}
++            if gateway_claims(session_key, sub := {**sub, "sibling_chats": chats}):
++                continue  # the live gateway owns the chat and claims this row within one tick (kanban_leg_custody)
+             sub_ident = dict(task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
+                              thread_id=sub.get("thread_id") or "")
+             from gateway.kanban_wake_sibling import tui_defer
+@@ -785,7 +786,7 @@ def _kb_poll_board_now(_kb, _kbc, _kbn, slug: str, session_key: str, claims: lis
+             claim = None
+             if claims is not None:  # so a refused turn can hand the range back (_kb_rewind_refused) [daveey]
+                 claim = {"board": slug, **sub_ident, "old": _old, "new": _new, "texts": [],
+-                         "claimed_mono": time.monotonic()}
++                         "notifier_profile": sub.get("notifier_profile"), "claimed_mono": time.monotonic()}
+                 claims.append(claim)
+             task = _kb.get_task(conn, sub["task_id"])
+             from gateway.kanban_wake_sibling import tui_formatter
+@@ -855,8 +856,7 @@ def _collect_kanban_notifications(session: dict, claims: list | None = None) ->
+         unique.setdefault(resolved, slug)
+     seen = session.setdefault("_kb_board_seen", {})
+     stray, unreclaimed = _kb_stray_delegate_keys(session, session_key), []
+-    if _kb_gateway_owns(session):  # its collector admits these rows to the chat's FIFO in one tick (kanban_leg_custody)
+-        return _collect_remote_kanban_notifications(session_key, claims)
++    _kb_gateway_owns(session)  # the live gateway's collector admits the rows it claims in one tick: skipped below
+     texts = [t for slug in unique.values() for t in _kb_poll_board(
+         _kb, slug, session_key, claims, seen, stray=stray, unreclaimed=unreclaimed)]
+     if stray and not unreclaimed:
+@@ -1243,7 +1243,7 @@ def _notif_collect_kanban(session: dict) -> tuple:
+ 
+ def _kb_gateway_owns(session: dict) -> bool:  # the gateway's collector admits this chat's tui rows [daveey]
+     from tui_gateway.kanban_leg_custody import legacy_gateway_owns
+-    return legacy_gateway_owns(session, _canonical_ledger_refusal, _session_lineage, _session_db)
++    return legacy_gateway_owns(session, _session_lineage, _session_db)
+ 
+ 
+ def _kb_settle_held(session: dict) -> None:  # a buffered claim the chat's wake delivered meanwhile [daveey]
+-- 
+2.51.0
+

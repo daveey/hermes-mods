@@ -1,0 +1,342 @@
+From e4b6c50a0a5511337695951f5828b2c78fc191ec Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:21:42 +0000
+Subject: [PATCH] [daveey] A refused auto-continue kickoff drops its marker
+ inputs and caps its watcher re-arms
+
+Follow-up to #1905 review nits (t_01a1d37aace2c43f):
+
+- The kickoff sets _auto_continue_attempt/_prompt/_pauses/_killed_jobs and _marker_until_tool for the turn to
+  read back; only a started turn pops them. A refused submit (and the dispatch-exception branch) now drops
+  them, so a user turn that starts before the re-armed continuation records its own marker, not the paused
+  prompt, its attempt count or its at-most-once flag. _marker_until_tool is dropped only when the kickoff set
+  it True (the key is shared with user turns).
+- Re-arms of the pause watcher are capped at REFUSED_REARM_MAX (6) per pause (session_key, started_at,
+  pauses): each re-arm was a fresh watcher with a fresh budget, so a refusal that persists looped every
+  ~10-15 s until the marker aged out. An ownership refusal (_turn_owner_refusal, e.g. SESSION_MOVED) never
+  re-arms: no watcher waits another owner out.
+- Docstring, comment and WARNING no longer claim a 30 s retry: nothing re-polls; the next resume, boot sweep
+  or refused-turn timer retries (as after a slot refusal).
+- New kickoff-level test through the real admission refusal: the update hold re-taken during the build makes
+  prepare_work return None; stage/settle release the claim (no token, no reservation), the watcher re-arms and
+  a following user turn's marker is clean.
+
+Proof: the 15 tests in test_update_pause_refused_kickoff{,_admission}.py fail 6 on the tree without the fix
+and pass 15 with it; 51 tui_gateway update-pause/auto-continue/prompt/admission/marker files pass 457; all 10
+mutants (either drop removed, until_tool pop removed, a key kept, owner check removed, cap removed, cap off by
+one, count not per pause, pause id without pauses) are killed.
+---
+ .../test_update_pause_refused_kickoff.py      |  83 ++++++++++++-
+ ..._update_pause_refused_kickoff_admission.py | 112 ++++++++++++++++++
+ tui_gateway/session_auto_continue.py          |  56 +++++++--
+ 3 files changed, 239 insertions(+), 12 deletions(-)
+ create mode 100644 tests/tui_gateway/test_update_pause_refused_kickoff_admission.py
+
+diff --git a/tests/tui_gateway/test_update_pause_refused_kickoff.py b/tests/tui_gateway/test_update_pause_refused_kickoff.py
+index 089acbeb8b..d1fb6bb149 100644
+--- a/tests/tui_gateway/test_update_pause_refused_kickoff.py
++++ b/tests/tui_gateway/test_update_pause_refused_kickoff.py
+@@ -133,8 +133,11 @@ def test_refusal_warning_names_who_retries(env, caplog):
+ 
+     warnings = [r.getMessage() for r in caplog.records if "never started" in r.getMessage()]
+     assert len(warnings) == 2
+-    assert warnings[0].endswith("rescheduling through its pause watcher")
+-    assert warnings[1].endswith("rescheduling after 30s")
++    assert warnings[0].endswith(f"rescheduling through its pause watcher (re-arm 1/{server.REFUSED_REARM_MAX})")
++    # Nothing re-polls a crash continuation: the warning names who does retry, not a timer that does not exist.
++    assert warnings[1].endswith(
++        "not rescheduled here (30s backoff): the next resume, boot sweep or refused-turn timer retries")
++    assert "rescheduling after" not in warnings[1]
+ 
+ 
+ @pytest.mark.parametrize("flag", ["_closing", "_finalized"])
+@@ -224,3 +227,79 @@ def test_watcher_whose_continuation_is_refused_hands_off_to_a_rearmed_watcher(en
+     assert env.ran == [(up.pause_note("fix the flaky test"), 1)]
+     assert rearmed == ["session-key"]
+     assert any("continuation of session-key never started" in r.getMessage() for r in caplog.records)
++
++
++_KICKOFF_KEYS = ("_auto_continue_attempt", "_auto_continue_prompt", "_auto_continue_pauses",
++                 "_auto_continue_killed_jobs", "_marker_until_tool")
++
++
++@pytest.mark.parametrize("result", ["refused", "raises"])
++def test_kickoff_that_never_started_leaves_no_marker_inputs(env, monkeypatch, result):
++    """The kickoff sets the marker inputs a started turn reads back (_record_turn_marker pops them). A submit that
++    was refused, or a dispatch that raised, must drop them: the next turn to record (a user's) would otherwise
++    write its crash marker with the paused prompt, its attempt count and the at-most-once flag."""
++    record_turn_start(env.home, "session-key", "the paused prompt", attempts=1, until_tool=True)
++    mark_turn_paused(env.home, "session-key", up.PAUSE_REASON, killed_jobs=[{"id": "job-1"}])
++    session = _session()
++    seen = {}
++
++    def submit(rid, sid, s, text, **kw):
++        seen.update({k: s.get(k) for k in _KICKOFF_KEYS})
++        if result == "raises":
++            raise RuntimeError("boom")
++        return False
++
++    monkeypatch.setattr(server, "_run_prompt_submit", submit)
++    server._maybe_schedule_auto_continue("sid", session, "session-key")
++
++    assert seen["_auto_continue_prompt"] == "the paused prompt" and seen["_marker_until_tool"] is True  # were set
++    assert [k for k in _KICKOFF_KEYS if k in session] == []
++
++
++def test_persistently_refused_paused_continuation_stops_rearming_at_the_cap(env, caplog):
++    """Each re-arm starts a fresh watcher with a fresh budget, so a refusal that never clears would loop every
++    ~10-15 s until the marker aged out. The re-arms are capped per pause; past the cap the refusal backs off like
++    any other and the next resume, boot sweep or refused-turn timer retries."""
++    import logging
++    caplog.set_level(logging.WARNING)
++    record_turn_start(env.home, "session-key", "the prompt")
++    mark_turn_paused(env.home, "session-key", up.PAUSE_REASON)
++    session = _session()
++
++    for _ in range(server.REFUSED_REARM_MAX + 3):
++        session.pop("_auto_continue_retry_after", None)  # the backoff elapses before the next poll
++        server._maybe_schedule_auto_continue("sid", session, "session-key")
++
++    assert len(env.watchers) == server.REFUSED_REARM_MAX
++    assert session["_auto_continue_retry_after"] > time.monotonic() + 20.0  # the 30 s backoff past the cap
++    assert not session.get("_auto_continue_scheduled")
++    last = [r.getMessage() for r in caplog.records if "never started" in r.getMessage()][-1]
++    assert f"re-arm cap {server.REFUSED_REARM_MAX} reached" in last and "not rescheduled here" in last
++    assert read_turn_marker(env.home, "session-key") is not None
++
++    # A later pause of the turn is a new pause: its continuation gets its own re-arms.
++    mark_turn_paused(env.home, "session-key", up.PAUSE_REASON)
++    session.pop("_auto_continue_retry_after", None)
++    server._maybe_schedule_auto_continue("sid", session, "session-key")
++    assert len(env.watchers) == server.REFUSED_REARM_MAX + 1
++
++
++def test_paused_continuation_refused_for_ownership_does_not_rearm(env, monkeypatch, caplog):
++    """An ownership refusal at _admit_prompt_turn (the chat moved to another gateway) does not lift when a hold
++    does: no watcher waits it out, so the refusal backs off instead of re-arming."""
++    import logging
++    caplog.set_level(logging.WARNING)
++    record_turn_start(env.home, "session-key", "the prompt")
++    mark_turn_paused(env.home, "session-key", up.PAUSE_REASON)
++    session = _session()
++
++    def submit(rid, sid, s, text, **kw):
++        s["_turn_owner_refusal"] = "SESSION_MOVED"  # what _admit_prompt_turn records on its ownership fence
++        return False
++
++    monkeypatch.setattr(server, "_run_prompt_submit", submit)
++    server._maybe_schedule_auto_continue("sid", session, "session-key")
++
++    assert env.watchers == []
++    assert session["_auto_continue_retry_after"] > time.monotonic() + 20.0
++    assert any("owner refusal SESSION_MOVED" in r.getMessage() for r in caplog.records)
+diff --git a/tests/tui_gateway/test_update_pause_refused_kickoff_admission.py b/tests/tui_gateway/test_update_pause_refused_kickoff_admission.py
+new file mode 100644
+index 0000000000..5145bfbc16
+--- /dev/null
++++ b/tests/tui_gateway/test_update_pause_refused_kickoff_admission.py
+@@ -0,0 +1,112 @@
++"""[daveey] A paused continuation refused by the REAL update admission (no stubbed submit).
++
++The hub incident (defect gateway-833d39a686) end to end through ``_run_prompt_submit``: the kickoff waits for its
++agent build, the drain re-takes the update hold meanwhile, so ``prepare_work`` cannot reserve (returns None) and
++the submit's ``stage``/``settle`` give the claim back. The kickoff then logs the refusal, re-arms the pause watcher
++and leaves no marker inputs behind: a user turn that starts before the re-armed continuation records its own
++marker, not the paused prompt's attempt count or at-most-once flag.
++"""
++
++from __future__ import annotations
++
++import logging
++import threading
++import types
++
++import pytest
++
++from hermes_cli import admission_fence as af, backend_retirement
++from tui_gateway import server
++from tui_gateway import update_pause as up
++from tui_gateway.turn_marker import mark_turn_paused, read_turn_marker, record_turn_start
++
++pytestmark = pytest.mark.platforms("posix")
++
++CFG = {"desktop": {"auto_continue": {"enabled": True, "resume_on_startup": True, "freshness_minutes": 240,
++                                     "max_attempts": 2}}}
++
++
++class _InlineThread:
++    def __init__(self, target=None, daemon=None, args=(), kwargs=None, name=None):
++        self._target, self._args, self._kwargs = target, args, kwargs or {}
++
++    def start(self):
++        if self._target is not None:
++            self._target(*self._args, **self._kwargs)
++
++    def is_alive(self):
++        return False
++
++    def join(self, timeout=None):
++        return None
++
++
++@pytest.fixture()
++def env(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr(backend_retirement, "retirement", backend_retirement.RetirementFence())
++    monkeypatch.setattr(server, "_hermes_home", tmp_path)
++    monkeypatch.setattr(server, "_load_cfg", lambda: CFG)
++    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
++    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
++    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda sid, session: None)
++    monkeypatch.setattr(server, "_session_cwd", lambda session: str(tmp_path))
++    monkeypatch.setattr(server, "_register_session_cwd", lambda session: None)
++    monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
++    monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_get_usage", lambda agent: {})
++    monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
++
++    def build_wait(session, rid, timeout=30.0):
++        af.set_hold(tmp_path)  # the drain re-takes the hold while the kickoff waits for its agent build
++
++    monkeypatch.setattr(server, "_wait_agent", build_wait)
++    watchers: list = []
++    monkeypatch.setattr(up, "start_in_place_watcher", lambda sid, session, key: watchers.append(key))
++    yield types.SimpleNamespace(home=tmp_path, watchers=watchers)
++    af.clear_hold(tmp_path)
++
++
++def _session(home, seen):
++    def run_conversation(message, **kw):
++        seen.append(read_turn_marker(home, "session-key"))  # the marker the running turn recorded
++        return {"final_response": "done"}
++
++    agent = types.SimpleNamespace(session_id="session-key", clear_interrupt=lambda: None,
++                                  run_conversation=run_conversation)
++    return {"agent": agent, "session_key": "session-key", "history": [], "history_lock": threading.RLock(),
++            "history_version": 0, "running": False, "attached_images": [], "image_counter": 0, "cols": 80,
++            "slash_worker": None, "show_reasoning": False, "tool_progress_mode": "all", "inflight_turn": None,
++            "profile_home": str(home)}
++
++
++def test_continuation_refused_by_the_real_admission_hold_releases_and_rearms(env, caplog):
++    record_turn_start(env.home, "session-key", "fix the flaky test", attempts=1, until_tool=True)
++    mark_turn_paused(env.home, "session-key", up.PAUSE_REASON)
++    seen: list = []
++    session = _session(env.home, seen)
++    caplog.set_level(logging.INFO)
++
++    assert server._maybe_schedule_auto_continue("sid", session, "session-key") is not None
++
++    msgs = [r.getMessage() for r in caplog.records]
++    assert any(m.startswith("tui prompt refused") and "cause=admission" in m for m in msgs)
++    assert any("continuation of session-key never started" in m for m in msgs)
++    assert not seen  # the continuation never ran
++    assert env.watchers == ["session-key"]
++    # stage/settle gave the claim back: no admission token, no running flag, no reservation left behind.
++    assert "_turn_admission" not in session and not session.get("running")
++    assert not session.get("_auto_continue_scheduled")
++    assert af.state(env.home)["reservations"] == 0
++    assert read_turn_marker(env.home, "session-key")["reason"] == up.PAUSE_REASON  # still the turn's record
++
++    # The hold lifts and the user types before the re-armed continuation: their turn's marker is their own.
++    af.clear_hold(env.home)
++    assert server._run_prompt_submit("rid", "sid", session, "a new question") is True
++    assert len(seen) == 1
++    marker = seen[0]
++    assert marker["prompt"] == "a new question"
++    assert marker["attempts"] == 0, "the user turn inherited the continuation's attempt count"
++    assert not marker.get("until_tool"), "the user turn inherited the continuation's at-most-once flag"
++    assert not marker.get("pauses")
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 4d68b4d674..9d9d613469 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -304,7 +304,8 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+         # Running the continuation anyway would be the double-writer this fence exists to prevent. See
+         # #94778.
+         # A paused continuation takes over only an idle detached sibling: one mid-turn (a notice, another
+-        # reader's continuation) keeps the slot and this retries after the 30 s backoff below.
++        # reader's continuation) keeps the slot; this backs off 30 s below and the next resume, boot sweep or
++        # refused-turn timer retries (nothing re-polls).
+         slot_error = (_ensure_active_session_slot(sid, session, takeover_idle_only=True) if paused
+                       else _ensure_active_session_slot(sid, session))
+         if slot_error is not None:
+@@ -348,10 +349,11 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+         except Exception as exc:
+             _notif_log_failure("auto-continue dispatch failed", exc)
+             _notif_release_turn(session)  # rebound from session_notifications
++            _drop_kickoff_marker_inputs(session, marker)
+             return
+         if accepted is False:
+             _notif_release_turn(session)  # rebound from session_notifications
+-            _auto_continue_refused(sid, session, session_key, paused, "submit refused at admission")
++            _auto_continue_refused(sid, session, session_key, paused, "submit refused at admission", marker)
+     if _start_session_work(kickoff, name=f"auto-continue-{sid}", home=session.get("profile_home")) is None:
+         session["_auto_continue_scheduled"] = False
+         return None
+@@ -361,19 +363,53 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+     return {"attempt": attempt, "interrupted_at": marker["started_at"]}
+ 
+ 
+-def _auto_continue_refused(sid: str, session: dict, session_key: str, paused: bool, cause: str) -> None:
++_KICKOFF_MARKER_INPUTS = ("_auto_continue_attempt", "_auto_continue_prompt", "_auto_continue_pauses",
++                          "_auto_continue_killed_jobs")
++# Re-arms of the pause watcher for one pause whose continuation keeps being refused: each re-arm is a fresh
++# watcher with a fresh budget, so a refusal that persists would otherwise loop every ~10-15 s.
++REFUSED_REARM_MAX = 6
++
++
++def _drop_kickoff_marker_inputs(session: dict, marker: dict) -> None:
++    """[daveey] The kickoff's marker inputs are read back only by a started turn (``_record_turn_marker``). A
++    submit that never started leaves them for whatever turn records next: a user turn would write its crash
++    marker with the paused prompt, its attempt count and the at-most-once flag. ``_marker_until_tool`` is
++    dropped only when the kickoff set it True (False is the default, and the key is shared with user turns)."""
++    with session["history_lock"]:
++        for key in _KICKOFF_MARKER_INPUTS:
++            session.pop(key, None)
++        if marker.get("until_tool") and session.get("_marker_until_tool") is True:
++            session.pop("_marker_until_tool", None)
++
++
++def _auto_continue_refused(sid: str, session: dict, session_key: str, paused: bool, cause: str,
++                           marker: dict) -> None:
+     """[daveey] The kickoff's submit was refused before its turn started (admission re-held during the agent
+-    build): "scheduled" is not "started", so the continuation keeps an owner. The claim is released; a
+-    core-update pause re-arms the in-place watcher (it waits out the hold and schedules again after a short
+-    backoff, no attempt used), anything else retries after the 30 s backoff. The marker is untouched: it is
+-    still the turn's record. The WARNING is the detection signal: no continuation is dropped silently."""
+-    rearm = paused and not (session.get("_closing") or session.get("_finalized"))
++    build): "scheduled" is not "started", so the continuation keeps an owner. The claim and the kickoff's
++    marker inputs are released. A core-update pause re-arms the in-place watcher (it waits out the hold and
++    schedules again after a short backoff, no attempt used), at most REFUSED_REARM_MAX times per pause and
++    never for an ownership refusal (another backend owns the chat: no watcher waits that out). Anything else
++    only backs off 30 s: nothing re-polls, so the next resume, boot sweep or refused-turn timer retries, as
++    after a slot refusal. The marker is untouched: it is still the turn's record. The WARNING is the
++    detection signal: no continuation is dropped silently."""
++    _drop_kickoff_marker_inputs(session, marker)
++    owner_refusal = session.get("_turn_owner_refusal")  # set by _admit_prompt_turn's ownership fence
++    pause_id = (session_key, marker.get("started_at"), marker.get("pauses"))
+     with session["history_lock"]:
+         session["_auto_continue_scheduled"] = False
++        last = session.get("_auto_continue_refusals")
++        count = last[1] + 1 if isinstance(last, tuple) and last[0] == pause_id else 1
++        session["_auto_continue_refusals"] = (pause_id, count)
++        rearm = (paused and not (session.get("_closing") or session.get("_finalized"))
++                 and not owner_refusal and count <= REFUSED_REARM_MAX)
+         # Paused: short, so a hold that lifted is not waited on, yet a refusal that persists cannot spin.
+         session["_auto_continue_retry_after"] = time.monotonic() + (10.0 if rearm else 30.0)
+-    logger.warning("auto-continue: continuation of %s never started (%s); rescheduling %s", session_key, cause,
+-                   "through its pause watcher" if rearm else "after 30s")
++    why = (f"owner refusal {owner_refusal}" if owner_refusal and paused
++           else f"re-arm cap {REFUSED_REARM_MAX} reached" if paused and count > REFUSED_REARM_MAX else "")
++    logger.warning("auto-continue: continuation of %s never started (%s); %s", session_key, cause,
++                   f"rescheduling through its pause watcher (re-arm {count}/{REFUSED_REARM_MAX})" if rearm
++                   else "not rescheduled here (" + (why + "; " if why else "")
++                   + "30s backoff): the next resume, boot sweep or refused-turn timer retries")
+     if rearm:
+         from tui_gateway import update_pause
+         update_pause.start_in_place_watcher(sid, session, session_key)
+-- 
+2.51.0
+

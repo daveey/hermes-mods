@@ -1,0 +1,163 @@
+From 58f90486f9cdbc81e429d1d0b81b20a8fbb6f227 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:42:58 +0000
+Subject: [PATCH] fix(update-pause): keep a carried turn's stamp when a backend
+ exit cuts it short; pin job-stop-raises take_back
+
+PR #2016 review nits (t_01a1d418158fdf8c, t_01a1d42e9d15f339; card t_01a1d420298bdbee):
+
+- pause_stands: a backend exit's own interrupt (no user Stop before it) of a carried turn whose hook paid the
+  pause keeps the pause (unchanged) and now also keeps the write-ahead carried_turn_paused stamp, so the next
+  backend's continuation names the unfinished notification turn (CARRIED_TURN_NOTE) instead of cold-resuming
+  without it. A user Stop before the exit (_user_stop_at_exit) still takes the stamp back.
+- prompt_turn._record_turn_marker: comment why a carried turn that raised after its hook paid keeps the on-disk
+  stamp (it did not finish) while only the in-memory _carried_pause_stamped is dropped.
+- tests: a job stop that raises takes the stamp back (RED without take_back in the except branch); a raise after
+  the hook paid keeps naming the turn; a backend exit keeps naming it (RED before the fix); a user Stop before
+  the exit still clears it.
+---
+ .../test_update_pause_superseded.py           | 83 +++++++++++++++++++
+ tui_gateway/prompt_turn.py                    |  6 +-
+ tui_gateway/update_pause.py                   | 13 ++-
+ 3 files changed, 98 insertions(+), 4 deletions(-)
+
+diff --git a/tests/tui_gateway/test_update_pause_superseded.py b/tests/tui_gateway/test_update_pause_superseded.py
+index 886b56ea63..6b2bf743e2 100644
+--- a/tests/tui_gateway/test_update_pause_superseded.py
++++ b/tests/tui_gateway/test_update_pause_superseded.py
+@@ -527,3 +527,86 @@ def test_a_later_carried_pause_that_does_not_stand_keeps_an_earlier_carried_paus
+     marker, note = _continuation_note(env)
+     assert marker.get("carried_turn_paused") is True, "a failed later pause erased the earlier interrupted turn"
+     assert note.endswith(up.CARRIED_TURN_NOTE)
++
++
++# --- PR #2016 review nits (t_01a1d418158fdf8c, t_01a1d42e9d15f339): a job stop that raises takes the stamp back
++# like one that reports failure; a carried turn its hook paused that then ends without pause_stands deciding it
++# (it raised, or the backend exit interrupted it) keeps the stamp: that notification turn did not finish.
++
++def test_a_carried_pause_whose_job_stop_raises_does_not_name_the_completed_notification_turn(env, monkeypatch):
++    fail = {"on": False}  # only the carried turn's job stop raises; the paused turn's own pause stands
++
++    def _stop(jobs, save):
++        if fail["on"]:
++            raise OSError("kill failed")
++        return True
++
++    monkeypatch.setattr(up, "stop_owned_jobs_for_update_pause", _stop)
++
++    def _turn(agent, seen):
++        fail["on"] = True
++        seen["reason"] = agent.step_boundary_pause()  # stamps write-ahead, then the job stop raises
++        seen["stamped"] = bool((read_turn_marker(env.home, "session-key") or {}).get("carried_turn_paused"))
++        return {"final_response": "noted", "messages": []}  # so the notification turn runs to completion
++
++    session, seen = _carried_turn_with_window(env, _turn)
++
++    assert seen["reason"] is None and seen["stamped"] is False, "a carried pause whose job stop raised kept its stamp"
++    marker, note = _continuation_note(env)
++    assert not marker.get("carried_turn_paused")
++    assert up.CARRIED_TURN_NOTE not in note
++    assert "_carried_pause_stamped" not in session
++
++
++def test_a_carried_turn_that_raises_after_its_hook_paid_keeps_naming_it(env):
++    def _turn(agent, seen):
++        seen["reason"] = agent.step_boundary_pause()
++        raise RuntimeError("boom after the pause was paid")
++
++    _session, seen = _carried_turn_with_window(env, _turn)
++
++    assert seen["reason"] == up.PAUSE_REASON
++    marker, note = _continuation_note(env)
++    assert marker.get("carried_turn_paused") is True, "the unfinished notification turn is no longer named"
++    assert note.endswith(up.CARRIED_TURN_NOTE)
++    assert env.watchers[-1] == ("ui-sid", "session-key")
++
++
++def test_a_backend_exit_interrupting_a_carried_turn_after_its_hook_paid_keeps_naming_it(env):
++    def _turn(agent, seen):
++        seen["reason"] = agent.step_boundary_pause()
++        with session["history_lock"]:  # what _stop_turns_before_exit sets before its own interrupt
++            session["_user_stop_at_exit"] = False
++            session["_exit_keeps_turn_marker"] = True
++        return {"final_response": "", "messages": [], "interrupted": True, "completed": False}  # the exit's
++
++    session = _paused_session(env.home)
++    seen: dict = {}
++    session["agent"].run_conversation = lambda message, **kw: _run_with_window(env, session, _turn, seen)
++    session["running"] = True
++    assert server._notif_run_submit("__notif__1", "ui-sid", session, "[Background process proc_1 finished]")
++
++    assert seen["reason"] == up.PAUSE_REASON
++    marker, note = _continuation_note(env)
++    assert marker.get("carried_turn_paused") is True, "the next backend resumes without naming the interrupted turn"
++    assert note.endswith(up.CARRIED_TURN_NOTE)
++
++
++def test_a_user_stop_before_a_backend_exit_of_a_carried_turn_still_takes_the_stamp_back(env):
++    def _turn(agent, seen):
++        seen["reason"] = agent.step_boundary_pause()
++        with session["history_lock"]:  # the user stopped it, then the exit began
++            session["_user_stop_at_exit"] = True
++            session["_exit_keeps_turn_marker"] = True
++        return {"final_response": "", "messages": [], "interrupted": True, "completed": False}
++
++    session = _paused_session(env.home)
++    seen: dict = {}
++    session["agent"].run_conversation = lambda message, **kw: _run_with_window(env, session, _turn, seen)
++    session["running"] = True
++    assert server._notif_run_submit("__notif__1", "ui-sid", session, "[Background process proc_1 finished]")
++
++    assert seen["reason"] == up.PAUSE_REASON
++    marker, note = _continuation_note(env)
++    assert not marker.get("carried_turn_paused"), "a notification turn the user stopped is named by the continuation"
++    assert up.CARRIED_TURN_NOTE not in note
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index e184948faf..ad4b2c6677 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -273,7 +273,11 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
+     until_tool = bool(session.pop("_marker_until_tool", False))
+     # [daveey] A core-update pause kept the previous turn's marker; this turn owns (and retires) its own.
+     session.pop("_update_pause_marker_key", None)
+-    session.pop("_carried_pause_stamped", None)  # a carried turn that raised before pause_stands left it
++    # A carried turn that raised before pause_stands left this in-memory flag. Its on-disk carried_turn_paused stamp
++    # is kept on purpose: the hook paid the pause and the notification turn then raised, so it did not finish and
++    # the continuation should name it (CARRIED_TURN_NOTE). Only a turn that ran on (job stop failed) or that the user
++    # stopped takes the stamp back (update_pause.boundary_pause_hook / pause_stands).
++    session.pop("_carried_pause_stamped", None)
+     if not synthesized:  # the continuation (or a typed message) started: automatic turns may run again
+         session.pop("_update_pause_due_until", None)
+     if synthesized and not marker_attempt and _carry_paused_marker(session, marker_home, marker_key):
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index 2b0047c048..e9bcb1ceff 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -387,14 +387,21 @@ def pause_stands(session: dict, marker_key: str, result: Any) -> bool:
+     """The turn's end: it ended paused for the update AND the session still keeps this turn's marker (a Stop
+     that won dropped it). A turn whose hook paused it but which did not end paused (the Stop won in the agent
+     loop) drops the session's keep here, before its marker is retired, and a carried turn takes back the
+-    write-ahead ``carried_turn_paused`` stamp its hook added, so the continuation does not name a stopped turn."""
++    write-ahead ``carried_turn_paused`` stamp its hook added, so the continuation does not name a stopped turn.
++
++    A backend exit's own interrupt (no user Stop before it) keeps that stamp: the exit keeps the pause, and the
++    notification turn it cut short after its hook paid did not finish, so the next backend's continuation still
++    names it (``CARRIED_TURN_NOTE``), as it would had the turn ended paused."""
++    from tui_gateway.exit_job_receipts import USER_STOP_AT_EXIT
+     with session["history_lock"]:
+         mine = bool(marker_key) and session.get("_update_pause_marker_key") == marker_key
+         stands = mine and isinstance(result, dict) and bool(result.get("paused_for_update"))
+-        if mine and not stands and not session.get("_exit_keeps_turn_marker"):
++        exiting = bool(session.get("_exit_keeps_turn_marker"))
++        if mine and not stands and not exiting:
+             _drop_pause(session)
+         stamped = session.pop("_carried_pause_stamped", None) == marker_key
+-    if stamped and not stands:  # a carried turn's hook paid the pause but the turn did not end paused
++        cut_short_by_exit = exiting and not session.get(USER_STOP_AT_EXIT)
++    if stamped and not stands and not cut_short_by_exit:  # its hook paid the pause but the turn ended otherwise
+         from tui_gateway.turn_marker import clear_carried_turn_paused
+         clear_carried_turn_paused(_home(session), marker_key)
+     return stands
+-- 
+2.51.0
+

@@ -1,0 +1,363 @@
+From cc9d41d9531c881558870825f96c25c1b0985ad8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 03:43:49 +0000
+Subject: [PATCH] [daveey] fix(hub-admission): one-statement board census so
+ the final hub gate fits its sample; name the refusing stage
+
+The final hub gate runs the whole-host census twice under admission.lock inside a 2.25 s hold. Inside the
+gateway each sqlite call, row step and realpath lstat releases the GIL and waits ~one switch interval to get it
+back from busy threads; the per-board census made ~80 such handoffs, ~4-8 s over the hub's 10 boards, so every
+hub claim since 02:03Z was refused as hub_cpu_unknown before sampling. Read each board's running rows, own-holder
+filter and pool receipts in one statement (legacy schemas keep the old path), connect via absolute() not
+resolve(), and log the refusing stage with hold_ms/budget_ms for every hub_cpu_unknown branch. CPU limit, window
+bounds and cap are unchanged.
+---
+ hermes_cli/kanban_admission.py                | 27 ++++---
+ hermes_cli/kanban_admission_pools.py          | 12 ++-
+ hermes_cli/machine_metrics.py                 | 74 +++++++++++++++----
+ .../test_hub_cpu_gate_contention.py           | 58 ++++++++++-----
+ tests/hermes_cli/test_kanban_hub_admission.py |  9 ++-
+ 5 files changed, 131 insertions(+), 49 deletions(-)
+
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index 0193b1a3a2..231dab2c63 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -134,6 +134,14 @@ def _over_budget(started, needed_s=0.0):
+     return started is not None and time.monotonic() - started + needed_s > _hold_budget_s()
+ 
+ 
++def _unknown(stage, started, **extra):
++    """``hub_cpu_unknown`` with the branch that refused and the hold so far, so the refusal log tells a hold overrun
++    from an invalid sample, an expired lease or an unreadable limit (they all fail closed the same way)."""
++    hold = {"hold_ms": round((time.monotonic() - started) * 1000), "budget_ms": round(_hold_budget_s() * 1000)} \
++        if started is not None else {}
++    return "hub_cpu_unknown", {"stage": stage, **hold, **extra}
++
++
+ def _final_hub_gate(gate, started=None, claimant=None, *, conn=None, task_id=None):
+     """Under admission.lock: ``(reason, evidence)``; reason None admits. Never touches the network.
+ 
+@@ -162,30 +170,30 @@ def _final_hub_gate(gate, started=None, claimant=None, *, conn=None, task_id=Non
+     if state == cpu.OFF:
+         return None, None
+     if state != cpu.ON:
+-        return "hub_cpu_unknown", None
++        return _unknown("limit_unknown", started)
+     if _cap_full(echo, conn=conn, task_id=task_id):
+         return "hub_capacity_full", None
+     selected_limit = getattr(_decision, "pool_limit", None) or limit
+     if _expired(gate):
+-        return "hub_cpu_unknown", None
++        return _unknown("lease_expired_before_sample", started)
+     if _over_budget(started, cpu.WINDOW_S):
+-        return "hub_cpu_unknown", None  # no room left for even a nominal sample inside the designed hold
++        return _unknown("hold_before_sample", started)  # no room left for even a nominal sample inside the hold
+     measured = cpu.sample()
+     if not measured or not all(k in measured for k in cpu.FIELDS):
+-        return "hub_cpu_unknown", None
++        return _unknown("sample_invalid", started)
+     if not cpu.MIN_WINDOW_MS <= measured["cpu_busy_window_ms"] <= cpu.MAX_WINDOW_MS:
+-        return "hub_cpu_unknown", None
++        return _unknown("sample_window", started, window_ms=measured["cpu_busy_window_ms"])
+     if not cpu.below(measured["cpu_busy_pct"], selected_limit):
+         return "hub_cpu_at_or_above_limit", None
+     if _expired(gate):
+-        return "hub_cpu_unknown", None  # the claim/lease deadline passed while sampling: never start
++        return _unknown("lease_expired_after_sample", started)  # the claim/lease deadline passed while sampling
+     if _cap_full(echo, conn=conn, task_id=task_id):  # recount immediately before commit
+         return "hub_capacity_full", None
+     limit = getattr(_decision, "pool_limit", None) or limit
+     if not cpu.below(measured["cpu_busy_pct"], limit):
+         return "hub_cpu_at_or_above_limit", None
+     if _over_budget(started):
+-        return "hub_cpu_unknown", None  # the hold overran its budget: refuse rather than outlast waiting turns
++        return _unknown("hold_after_sample", started)  # the hold overran its budget: refuse, never outlast turns
+     counts = getattr(_decision, "counts", None) or {}
+     admission = {k: counts[k] for k in ("active_before", "active_after", "excluded_run_uid")} \
+         if counts.get("excluded_run_uid") else None
+@@ -403,8 +411,9 @@ def claim_transaction(conn, *, task_id=None, gate=None):
+             finally:
+                 _decision.worker_fenced = previous_fenced
+             if reason is not None:
+-                logging.getLogger(__name__).info("Hub admission refused Kanban claim %s: %s %s", task_id, reason,
+-                                                 getattr(_decision, "counts", None) or {})
++                # ``evidence`` on a refusal names the gate stage and hold (hub_cpu_unknown), never a sample.
++                logging.getLogger(__name__).info("Hub admission refused Kanban claim %s: %s %s %s", task_id, reason,
++                                                 getattr(_decision, "counts", None) or {}, evidence or {})
+                 _defer(task_id, reason)
+                 yield False
+                 return
+diff --git a/hermes_cli/kanban_admission_pools.py b/hermes_cli/kanban_admission_pools.py
+index 580f853f38..03f7592708 100644
+--- a/hermes_cli/kanban_admission_pools.py
++++ b/hermes_cli/kanban_admission_pools.py
+@@ -23,13 +23,19 @@ def board_pools(conn, *, own=None, excluded=(), origins=None):
+     if own is not None:
+         where += " AND (t.claim_lock IS NOT NULL OR t.lease_holder IS NULL OR t.lease_holder=?)"
+         params = (own,)
+-    counts = {"regular": 0, "priority": 0}
+     klass = "r.admission_class" if "admission_class" in cols else "NULL"
+     origin = "r.admission_origin" if "admission_origin" in cols else "NULL"
+-    for run_id, pool, admission_class, origin_key in conn.execute(
++    return count_pools(conn.execute(
+         f"SELECT t.current_run_id, {receipt}, {klass}, {origin} FROM tasks t LEFT JOIN task_runs r "
+         f"ON r.id=t.current_run_id AND r.task_id=t.id WHERE {where}", params,
+-    ):
++    ), excluded=excluded, origins=origins)
++
++
++def count_pools(receipts, *, excluded=(), origins=None):
++    """Pool counts for ``(run_id, pool, admission_class, origin)`` receipts of counted running rows (see
++    :func:`board_pools`); ``origins`` collects capacity receipts per origin."""
++    counts = {"regular": 0, "priority": 0}
++    for run_id, pool, admission_class, origin_key in receipts:
+         if run_id in excluded:
+             continue
+         pool = "regular" if pool is None else pool
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index 608dd38c9e..ef6c899080 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -15,6 +15,7 @@ replayed: each sample is reported at most once, and a failed round drops it.
+ """
+ from __future__ import annotations
+ 
++import json
+ import logging
+ import os
+ import re
+@@ -70,6 +71,36 @@ def _mem_used_pct() -> Optional[float]:
+     return None
+ 
+ 
++# One statement, one result row, whatever the column or running-row count. In the gateway every sqlite3 call and row
++# step releases the GIL and must win it back from busy Python threads (~one 5 ms switch interval each under
++# contention); iterating ``PRAGMA table_info`` and the running rows made ~80 handoffs a board, ~4 s for the hub's
++# 10 boards, so the final hub gate (which runs this census twice under admission.lock) overran its 2.25 s hold.
++_RECEIPTS = ("json_group_array(json_array(t.id, t.current_run_id, r.admission_pool, r.admission_class, "
++             "r.admission_origin)) FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id AND r.task_id = t.id "
++             "WHERE t.status = 'running'")
++_SYNCED_SQL = (f"SELECT (SELECT gateway_id FROM kanban_sync_state LIMIT 1), (SELECT {_RECEIPTS} AND "
++               "(t.claim_lock IS NOT NULL OR t.lease_holder IS NULL "
++               "OR t.lease_holder = (SELECT gateway_id FROM kanban_sync_state LIMIT 1)))")
++_LOCAL_SQL = f"SELECT (SELECT count(*) FROM pragma_table_info('tasks') WHERE name = 'lease_holder'), (SELECT {_RECEIPTS})"
++
++
++def _running_rows(db) -> Optional[tuple[bool, Any, list]]:
++    """``(synced, own gateway id, [(task_id, run_id, pool, class, origin), ...])`` for the running rows this host
++    counts, read in one statement; ``None`` when the board's schema predates claim receipts, or has lease holders
++    without sync state (read it the long way, which decides those exactly as before)."""
++    for synced, sql in ((True, _SYNCED_SQL), (False, _LOCAL_SQL)):
++        try:
++            head, rows = db.execute(sql).fetchone()
++        except sqlite3.OperationalError as exc:
++            if str(exc).startswith("no such "):
++                continue
++            raise
++        if not synced and head:
++            return None
++        return synced, head if synced else None, [tuple(item) for item in json.loads(rows)]
++    return None
++
++
+ def active_card_runs(exclude=None, detail: Optional[dict] = None, *, owner_output=None, extra_paths=()) -> Optional[int]:
+     """All profiles share the kanban root. Count its execution boards, not replicas.
+ 
+@@ -103,13 +134,22 @@ def active_card_runs(exclude=None, detail: Optional[dict] = None, *, owner_outpu
+             if identity in seen:
+                 continue
+             seen.add(identity)
+-            db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
++            # ``absolute()`` not ``resolve()``: realpath lstat()s every path component, each a GIL handoff in the
++            # gateway; sqlite follows a symlinked board file itself, and identity comes from the stat above.
++            db = sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True, timeout=1)
+             try:
+                 # Count, own-grant matching and receipt grouping must see one WAL snapshot.
+                 db.execute("BEGIN")
+-                cols = {row[1] for row in db.execute("PRAGMA table_info(tasks)")}
+-                own, matched = None, []
+-                if "lease_holder" in cols:
++                own, matched, receipts = None, [], None
++                if (fast := _running_rows(db)) is not None:
++                    synced, own_id, rows = fast
++                    if synced and not own_id:
++                        return None
++                    own = (own_id,) if synced else None
++                    ids = {row[0] for row in rows}
++                    total += len(rows)
++                    receipts = [row[1:] for row in rows]
++                elif "lease_holder" in {row[1] for row in db.execute("PRAGMA table_info(tasks)")}:
+                     own = db.execute("SELECT gateway_id FROM kanban_sync_state LIMIT 1").fetchone()
+                     if own is None or not own[0]:
+                         return None
+@@ -118,22 +158,24 @@ def active_card_runs(exclude=None, detail: Optional[dict] = None, *, owner_outpu
+                                         (own[0],)).fetchall()
+                     ids = {row[0] for row in rows}
+                     total += len(rows)
+-                    if exclude is not None and identity == tuple(exclude.db_identity) and own[0] == exclude.gateway_id:
+-                        from hermes_cli.kanban_grant_echo import match_rows
+-                        matched = match_rows(db, exclude)
+-                        if matched and matched != [exclude.run_id]:
+-                            return None  # the proven row moved or duplicated under us: unknown, fail closed
+-                        total -= len(matched)
+-                        excluded += len(matched)
+-                        if matched:
+-                            ids.discard(exclude.task_id)
+                 else:
+                     ids = {row[0] for row in db.execute("SELECT id FROM tasks WHERE status='running'")}
+                     total += len(ids)
++                if own is not None and exclude is not None and identity == tuple(exclude.db_identity) \
++                        and own[0] == exclude.gateway_id:
++                    from hermes_cli.kanban_grant_echo import match_rows
++                    matched = match_rows(db, exclude)
++                    if matched and matched != [exclude.run_id]:
++                        return None  # the proven row moved or duplicated under us: unknown, fail closed
++                    total -= len(matched)
++                    excluded += len(matched)
++                    if matched:
++                        ids.discard(exclude.task_id)
+                 if detail is not None and "pools" in detail:
+-                    from hermes_cli.kanban_admission_pools import board_pools
+-                    counts = board_pools(db, own=own[0] if own else None, excluded=matched,
+-                                         origins=detail.get("capacity_origins"))
++                    from hermes_cli.kanban_admission_pools import board_pools, count_pools
++                    origins = detail.get("capacity_origins")
++                    counts = count_pools(receipts, excluded=matched, origins=origins) if receipts is not None \
++                        else board_pools(db, own=own[0] if own else None, excluded=matched, origins=origins)
+                     for pool, count in counts.items():
+                         detail["pools"][pool] += count
+                 if owner_output is not None:
+diff --git a/tests/hermes_cli/test_hub_cpu_gate_contention.py b/tests/hermes_cli/test_hub_cpu_gate_contention.py
+index 81156cbf19..0b5bc56cc8 100644
+--- a/tests/hermes_cli/test_hub_cpu_gate_contention.py
++++ b/tests/hermes_cli/test_hub_cpu_gate_contention.py
+@@ -3,10 +3,10 @@
+ Inside the gateway every ``sqlite3`` call releases the GIL and has to win it back from busy Python threads (the Kanban
+ sync loop, the event loop); under that contention each handoff costs about one switch interval (5 ms). The final gate
+ runs the whole-host census twice under ``admission.lock`` (cap check before the ~1 s sample, recount after it), inside
+-a 2.25 s hold. A census that iterates ``PRAGMA table_info`` and row-by-row cursors makes ~100 handoffs per board, so on
+-the hub (10 boards) it took ~5 s and every hub claim was refused before sampling as ``hub_cpu_unknown`` from
+-2026-11-13 02:03Z. The model below charges one switch interval per sqlite call/row step on a virtual clock, so the
+-test is deterministic and fast.
++a 2.25 s hold. A census that iterates ``PRAGMA table_info`` and row-by-row cursors makes ~80 handoffs per board, so on
++the hub (10 boards) it took ~4 s (7 s measured with one busy thread) and every hub claim was refused before sampling
++as ``hub_cpu_unknown`` from 2026-11-13 02:03Z. The model below charges one switch interval per sqlite call/row step
++on a virtual clock, so the test is deterministic and fast.
+ """
+ import json
+ import logging
+@@ -91,8 +91,9 @@ def _contended(monkeypatch, handoff_s):
+     return clock
+ 
+ 
+-def _hub_boards(conn, home, *, cap=20):
+-    """The hub's shape: pools on (priority slots), the CPU gate on, one running card on each of 10 boards."""
++def _hub_boards(conn, home, *, cap=20, synced=False):
++    """The hub's shape: pools on (priority slots), the CPU gate on, one running card on each of 10 boards. ``synced``
++    boards carry the sync state and lease holders, plus a running row another gateway holds (never counted here)."""
+     (home / "config.yaml").write_text(f"kanban:\n  max_in_progress: {cap}\n  admission:\n"
+                                       "    cpu_busy_below_pct: 50\n    priority_slots: 3\n")
+     advisory(home)
+@@ -105,8 +106,16 @@ def _hub_boards(conn, home, *, cap=20):
+     for path in paths:
+         with closing(kbc.connect(path)) as other:
+             busy = kb.create_task(other, title="running elsewhere", assignee="default")
++            foreign = kb.create_task(other, title="leased to a peer", assignee="default")
+             with kb.write_txn(other):
+                 other.execute("UPDATE tasks SET status='running', claim_lock='peer' WHERE id=?", (busy,))
++                if synced:
++                    if "lease_holder" not in {r[1] for r in other.execute("PRAGMA table_info(tasks)")}:
++                        other.execute("ALTER TABLE tasks ADD COLUMN lease_holder TEXT")
++                    other.execute("CREATE TABLE IF NOT EXISTS kanban_sync_state (gateway_id TEXT NOT NULL)")
++                    other.execute("INSERT INTO kanban_sync_state VALUES ('hermes-hub')")
++                    other.execute("UPDATE tasks SET lease_holder='hermes-hub' WHERE id=?", (busy,))
++                    other.execute("UPDATE tasks SET status='running', lease_holder='worker-9' WHERE id=?", (foreign,))
+ 
+ 
+ def _sample_taking(clock, window_s=1.0, pct=10.0):
+@@ -117,11 +126,12 @@ def _sample_taking(clock, window_s=1.0, pct=10.0):
+     return sample
+ 
+ 
++@pytest.mark.parametrize("synced", [True, False])
+ @pytest.mark.parametrize("review", [False, True])
+-def test_contended_census_leaves_the_sample_room_inside_the_hold(board, monkeypatch, review):
+-    """RED before the fix: ~100 handoffs per board x 10 boards ~ 5 s refused every claim before sampling."""
++def test_contended_census_leaves_the_sample_room_inside_the_hold(board, monkeypatch, review, synced):
++    """RED before the fix: ~80 handoffs per board x 10 boards ~ 4 s refused every claim before sampling."""
+     conn, home = board
+-    _hub_boards(conn, home)
++    _hub_boards(conn, home, synced=synced)
+     t = task(conn, review)
+     clock = _contended(monkeypatch, sys.getswitchinterval())
+     monkeypatch.setattr(cm, "sample", _sample_taking(clock))
+@@ -134,15 +144,29 @@ def test_contended_census_leaves_the_sample_room_inside_the_hold(board, monkeypa
+     assert payload["hub_admission"]["pools"] == {"regular": HUB_BOARDS, "priority": 0}
+ 
+ 
+-def test_census_counts_are_unchanged_by_the_cheaper_reads(board):
+-    """Control: pool receipts, capacity origins and the own-holder filter read exactly as before."""
++@pytest.mark.parametrize("synced", [True, False])
++def test_one_read_census_matches_the_long_way(board, monkeypatch, synced):
++    """Control: counts, pool receipts, capacity origins, the own-holder filter and owners read exactly as the
++    statement-per-column path (still used for boards whose schema predates receipts)."""
+     conn, home = board
+-    _hub_boards(conn, home)
+-    detail = {"pools": {"regular": 0, "priority": 0}, "capacity_origins": {}}
+-    assert mm.active_card_runs(detail=detail) == HUB_BOARDS
+-    assert detail["pools"] == {"regular": HUB_BOARDS, "priority": 0}
+-    assert detail["capacity_origins"] == {} and detail["excluded"] == 0
+-    assert mm.active_card_runs() == HUB_BOARDS
++    _hub_boards(conn, home, synced=synced)
++    with kb.write_txn(conn):  # a capacity receipt with an origin, on the priority pool
++        marked = kb.create_task(conn, title="marked", assignee="default")
++        conn.execute("UPDATE tasks SET status='running', claim_lock='x' WHERE id=?", (marked,))
++        run = conn.execute("INSERT INTO task_runs (task_id, profile, status, started_at, admission_pool, "
++                           "admission_class, admission_origin) VALUES (?, 'default', 'running', 1, 'priority', "
++                           "'capacity', 'origin-a')", (marked,)).lastrowid
++        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run, marked))
++
++    def census():
++        detail, owners = {"pools": {"regular": 0, "priority": 0}, "capacity_origins": {}}, set()
++        return mm.active_card_runs(detail=detail, owner_output=owners), detail, owners, mm.active_card_runs()
++    fast = census()
++    assert fast[0] == HUB_BOARDS + 1 and fast[3] == HUB_BOARDS + 1
++    assert fast[1] == {"pools": {"regular": HUB_BOARDS, "priority": 1}, "capacity_origins": {"origin-a": 1},
++                       "excluded": 0}
++    monkeypatch.setattr(mm, "_running_rows", lambda db: None)
++    assert census() == fast
+ 
+ 
+ def test_an_overrun_names_its_stage_and_hold_in_the_refusal(board, monkeypatch, caplog):
+diff --git a/tests/hermes_cli/test_kanban_hub_admission.py b/tests/hermes_cli/test_kanban_hub_admission.py
+index 38adcc79be..2a716d5bd3 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission.py
++++ b/tests/hermes_cli/test_kanban_hub_admission.py
+@@ -633,18 +633,19 @@ def test_row_without_admission_column_reads_as_normal():
+ 
+ 
+ def test_pool_census_uses_one_board_snapshot(board, monkeypatch):
++    """A claim landing between the board's running-row read and its pool count is in neither (one snapshot)."""
+     from hermes_cli import kanban_admission_pools as pools
+     conn, home = board
+     tid = task(conn)
+-    original = pools.board_pools
++    original = pools.count_pools
+ 
+-    def concurrent_claim(db, **kwargs):
++    def concurrent_claim(*args, **kwargs):
+         with closing(kbc.connect(home / "kanban.db")) as writer:
+             with kb.write_txn(writer):
+                 writer.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
+-        return original(db, **kwargs)
++        return original(*args, **kwargs)
+ 
+-    monkeypatch.setattr(pools, "board_pools", concurrent_claim)
++    monkeypatch.setattr(pools, "count_pools", concurrent_claim)
+     detail = {"pools": {"regular": 0, "priority": 0}}
+     total = mm.active_card_runs(detail=detail)
+     assert total == 0
+-- 
+2.51.0
+

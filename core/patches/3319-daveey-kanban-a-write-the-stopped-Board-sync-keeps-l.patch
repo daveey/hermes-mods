@@ -1,0 +1,548 @@
+From e0896242d40b084a6c1029902ac3beefd5031046 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:58:13 +0000
+Subject: [PATCH] [daveey] kanban: a write the stopped Board sync keeps local
+ says so, not "the live run gets this note"
+
+Incident (2026-11-13, laptop-1): the gateway gave up the Board sync role (SchemaAhead) at 23:53 PT.
+kanban_comment on t_01a1d3e55460fe21, whose live run was on worker-7, still returned
+`live_run: true` and "the card has a live worker run: it gets this note at its next model call".
+Comments 10761 (23:54), 10772 (00:15) and 10776 (00:22) sat in the local kanban_sync_outbox (pending,
+0 attempts) and never reached the Board or the run; a chat told David a relayed request was delivered.
+
+Five whys
+- Root (happened): a design gap in the write path. The tool's delivery report is built without reading
+  this gateway's sync state (tools/kanban_tools.py set `delivery` whenever `kb.live_run_id` on the local
+  row was not None; hermes_cli/kanban.py printed the same line), so it reported a local write as
+  delivered to a remote run.
+- Root (not caught): no test ran a write tool while the sync role was given up; and the agent-side
+  instructions had no rule to check `comment_delivered` on the Board before telling David a note was
+  delivered (now in kanban-orchestrator references/stuck-card-recovery.md, "A comment or unblock that
+  never arrives").
+- Recurrence: three instances that night: 10761 at 23:54 from another chat (it noticed, nobody filed a
+  fix), then 10772 at 00:15 and 10776 at 00:22 from chat 20261026_235722_bef6c6.
+- Countermeasures: symptom: 10776's content was re-posted from worker-7 on t_01a1d40c10f38195
+  (comment_delivered 00:44:12 PT, run 531). Root: this commit. Instructions: the skill section above.
+
+Fix
+- hermes_cli/kanban_board_delivery.py: `queued_local(conn, task_id)`: on a board that syncs
+  (board_mode != off) while kanban_sync_runstate records the loop down (role given up, refused start,
+  crash, stop), returns `board_delivery: "queued_local"` and `board_sync: "queued locally: this
+  gateway's Board sync has been stopped since <time> (<reason>); other hosts and remote runs won't see
+  this until it recovers"`. When another gateway holds the card's live run (lease_holder != own
+  gateway), adds `live_run_host` and a `route` (`hermes kanban comment <id> "..."` on that host).
+- Tools: the kanban handler wrapper annotates successful results of complete, block, unblock,
+  schedule, continue, request_review, request_changes, comment, attach, attach_url, link, unlink and
+  archive. A comment on a remote run gets that text as `delivery` instead of the live-run promise; a
+  comment on a run on this host keeps the promise (the run reads this file). Healthy sync: unchanged
+  (one config read + one stat, no board connection).
+- CLI: `comment` drops the live-run line for a remote run and prints the notice; `link`, and every
+  `_bulk_apply` caller passing conn (complete, block, schedule, unblock), print it once when anything
+  was written.
+- kanban_create is unchanged: its runs_on/placement paths already read runstate.
+
+Proof
+- tests/tools/test_kanban_board_delivery.py (12): the stopped state is made by the real run_forever
+  (start check passes, first round meets SchemaAhead, records "gave up the sync role"); the remote run
+  is a Board lease mirror applied with apply_remote_changes. RED on 43c2e75af2 (source reverted, tests
+  kept): 6 failed (tool comment/unblock/link, local-run comment, CLI comment, CLI link); the healthy,
+  unsynced and remote_runner cases passed. GREEN: 12 passed.
+- Mutants (sdlc-review mutants.py, 11): 10 killed; survivor M3 (drop the early runstate.down() fast
+  path) is equivalent: _stopped re-reads it; the fast path only avoids a board connection.
+- 90 related files (tests/tools/test_kanban*.py, every test referencing kanban_comment / _bulk_apply /
+  _cmd_comment|link|unblock, sync schema guard, pool-deny): 1730 passed, 3 skipped.
+  scripts/check --base origin/main: 19 checks ok.
+---
+ hermes_cli/kanban.py                      |  19 +-
+ hermes_cli/kanban_board_delivery.py       |  83 ++++++++
+ hermes_cli/kanban_output.py               |  12 +-
+ tests/tools/test_kanban_board_delivery.py | 227 ++++++++++++++++++++++
+ tools/kanban_tools.py                     |   3 +
+ tools/kanban_tools_board_delivery.py      |  40 ++++
+ 6 files changed, 375 insertions(+), 9 deletions(-)
+ create mode 100644 hermes_cli/kanban_board_delivery.py
+ create mode 100644 tests/tools/test_kanban_board_delivery.py
+ create mode 100644 tools/kanban_tools_board_delivery.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 976e2441b8..0a1d934d16 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1003,7 +1003,9 @@ def _cmd_link(args: argparse.Namespace) -> int:
+     with kbc.connect_closing() as conn:
+         gated = kb.link_tasks(conn, args.parent_id, args.child_id,
+                               expected_child_run_id=expected_child_run_id)
+-    print(f"Linked {args.parent_id} -> {args.child_id}")
++        from hermes_cli.kanban_board_delivery import cli_lines
++        queued = cli_lines(conn)  # [daveey] the stopped Board sync keeps it here
++    print(f"Linked {args.parent_id} -> {args.child_id}", *queued, sep="\n")
+     if gated:
+         print(
+             f"Note: {args.child_id} was ready and is now todo — parent "
+@@ -1069,10 +1071,15 @@ def _cmd_comment(args: argparse.Namespace) -> int:
+         except ValueError as exc:
+             return _err(f"kanban comment: {exc}", 2)
+         live = kb.live_run_id(conn, args.task_id)
++        from hermes_cli.kanban_board_delivery import cli_lines, remote_runner
++        queued = cli_lines(conn, args.task_id)  # [daveey] the stopped Board sync keeps it here
++        remote = bool(queued) and remote_runner(conn, args.task_id) is not None
+     print(f"Comment added to {args.task_id}")
+     own_run = os.environ.get("HERMES_KANBAN_TASK") == args.task_id
+-    if live is not None and not own_run:
++    if live is not None and not own_run and not remote:
+         print("The card has a live worker run: it gets this note at its next model call.")
++    for line in queued:
++        print(line)
+     return 0
+ 
+ 
+@@ -1287,7 +1294,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
+                     fail_msg[tid] = _contract_cli.complete_refusal(conn, tid) or fail_msg[tid]
+             return done
+ 
+-        return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
++        return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__, conn=conn)
+ 
+ 
+ _OPERATOR_EDIT_FLAGS = ("max_retries", "goal_mode", "goal_max_turns", "max_runtime_seconds", "session_id", "review_required")
+@@ -1447,7 +1454,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
+                 human_request=request, awaiting=awaiting, comment=comment, actor=cli_actor(),
+                 wake_check=wake[0], check_every=wake[1], clock_only=wake[2])),
+             awaiting=awaiting, reason=reason, kind=kind)
+-        return _bulk_apply(ids, op, ok_msg, lambda tid: refused.get(tid) or f"cannot block {tid}")
++        return _bulk_apply(ids, op, ok_msg, lambda tid: refused.get(tid) or f"cannot block {tid}", conn=conn)
+ 
+ 
+ def _cmd_schedule(args: argparse.Namespace) -> int:
+@@ -1476,7 +1483,7 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
+         from hermes_cli.kanban_reason_comment import human_answer_refusal
+         return _bulk_apply(ids, op, _parked_msg(conn, "Scheduled", suffix),
+                            lambda tid: (refused.get(tid) or human_answer_refusal(conn, tid, "schedule")
+-                                        or f"cannot schedule {tid}"))
++                                        or f"cannot schedule {tid}"), conn=conn)
+ 
+ 
+ def _cmd_unblock(args: argparse.Namespace) -> int:
+@@ -1495,7 +1502,7 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
+             return rc
+         op = _commented(reason, author, "UNBLOCK", lambda tid, comment: kb.unblock_task(conn, tid, comment=comment, event_extra={"actor": cli_actor()}))
+         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
+-                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
++                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)", conn=conn)
+ 
+ 
+ def _cmd_request_review(args: argparse.Namespace) -> int:
+diff --git a/hermes_cli/kanban_board_delivery.py b/hermes_cli/kanban_board_delivery.py
+new file mode 100644
+index 0000000000..c42e45256c
+--- /dev/null
++++ b/hermes_cli/kanban_board_delivery.py
+@@ -0,0 +1,83 @@
++"""What a Kanban write's result says while this gateway's Board sync is stopped. [daveey]
++
++Incident (2026-11-13, laptop-1): the gateway gave up the sync role (``SchemaAhead``) at 23:53 PT. For the next hour
++``kanban_comment`` on a card whose live run was on worker-7 kept returning ``live_run: true`` and "the card has a
++live worker run: it gets this note at its next model call". The comments (10761, 10772, 10776) sat in the local
++``kanban_sync_outbox`` (pending, 0 attempts) and never reached the Board or the run; a chat told David a relayed
++request was delivered. The delivery text read only the local row's live run, never whether this gateway can push.
++
++:func:`queued_local` is the one check: on a board that syncs, while :mod:`kanban_sync_runstate` records the loop as
++down (role given up, refused start, crash, stop), every write stays in this file until the loop recovers. Tool
++results then carry ``board_delivery: "queued_local"`` and ``board_sync`` (the sentence below); a comment on a card
++whose live run another gateway holds drops the live-run promise and names that gateway as the route.
++"""
++from __future__ import annotations
++
++import sqlite3
++from typing import Any, Optional
++
++__all__ = ["QUEUED_LOCAL", "cli_lines", "queued_local", "remote_runner"]
++
++QUEUED_LOCAL = "queued_local"
++
++
++def _stopped(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
++    """The loop's down record when ``conn``'s board syncs to the Board, else None (running, or an unsynced board,
++    where the local file is the whole story)."""
++    from hermes_cli import kanban_sync_runstate as runstate
++    record = runstate.down()
++    if not record:
++        return None
++    from hermes_cli import kanban_db_sync as sync
++    try:
++        if sync.board_mode(conn) == "off":
++            return None
++    except sqlite3.Error:
++        return None
++    return record
++
++
++def remote_runner(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
++    """The gateway holding the card's live run when that is not this gateway (the Board lease mirror), else None."""
++    try:
++        row = conn.execute("SELECT status, current_run_id, lease_holder FROM tasks WHERE id = ?",
++                           (task_id,)).fetchone()
++        own = conn.execute("SELECT gateway_id FROM kanban_sync_state LIMIT 1").fetchone()
++    except sqlite3.Error:
++        return None
++    if not row or row[0] != "running" or row[1] is None or not row[2]:
++        return None
++    holder = str(row[2])
++    return None if own and own[0] == holder else holder
++
++
++def queued_local(conn: sqlite3.Connection, task_id: Optional[str] = None) -> Optional[dict[str, Any]]:
++    """Result fields for a write that stays local because the sync is stopped, else None (sync runs or is off).
++
++    ``task_id``: the comment's card; when another gateway runs it, ``live_run_host`` and ``route`` name the
++    working path (the comment is not delivered to that run until the sync recovers)."""
++    record = _stopped(conn)
++    if not record:
++        return None
++    from hermes_cli import kanban_sync_runstate as runstate
++    out: dict[str, Any] = {
++        "board_delivery": QUEUED_LOCAL,
++        "board_sync": (f"queued locally: this gateway's Board sync has been stopped since "
++                       f"{runstate._when(record.get('since'))} ({record.get('reason') or 'unknown reason'}); "
++                       "other hosts and remote runs won't see this until it recovers"),
++    }
++    runner = remote_runner(conn, task_id) if task_id else None
++    if runner:
++        out["live_run_host"] = runner
++        out["route"] = (f"the card's live run is on {runner} and will not get this note: to reach it now, run "
++                        f"`hermes kanban comment {task_id} \"...\"` on {runner}")
++    return out
++
++
++def cli_lines(conn: sqlite3.Connection, task_id: Optional[str] = None) -> list[str]:
++    """The same notice as CLI output lines (empty while the sync runs)."""
++    note = queued_local(conn, task_id)
++    if not note:
++        return []
++    return [note["board_sync"][0].upper() + note["board_sync"][1:] + "."] + (
++        [note["route"][0].upper() + note["route"][1:] + "."] if note.get("route") else [])
+diff --git a/hermes_cli/kanban_output.py b/hermes_cli/kanban_output.py
+index bfb017a19c..de00d19287 100644
+--- a/hermes_cli/kanban_output.py
++++ b/hermes_cli/kanban_output.py
+@@ -59,15 +59,21 @@ def _err(msg: str, rc: int = 1) -> int:
+ 
+ 
+ def _bulk_apply(ids: Iterable[str], op: Callable[[str], Any],
+-                ok_msg: Callable[[str], str], fail_msg: Callable[[str], str]) -> int:
+-    """Run ``op(tid) -> bool`` per id, print ok/fail lines, exit 1 if any failed."""
+-    failed = False
++                ok_msg: Callable[[str], str], fail_msg: Callable[[str], str], *, conn: Any = None) -> int:
++    """Run ``op(tid) -> bool`` per id, print ok/fail lines, exit 1 if any failed. With ``conn`` (the board the
++    writes went to), a write the stopped Board sync keeps local says so (``kanban_board_delivery``). [daveey]"""
++    failed = wrote = False
+     for tid in ids:
+         if op(tid):
++            wrote = True
+             print(ok_msg(tid))
+         else:
+             failed = True
+             print(fail_msg(tid), file=sys.stderr)
++    if wrote and conn is not None:
++        from hermes_cli.kanban_board_delivery import cli_lines
++        for line in cli_lines(conn):
++            print(line)
+     return 1 if failed else 0
+ 
+ 
+diff --git a/tests/tools/test_kanban_board_delivery.py b/tests/tools/test_kanban_board_delivery.py
+new file mode 100644
+index 0000000000..4544a4f53b
+--- /dev/null
++++ b/tests/tools/test_kanban_board_delivery.py
+@@ -0,0 +1,227 @@
++"""Kanban write results while this gateway's Board sync has given up its role. [daveey]
++
++Incident (2026-11-13, laptop-1): the gateway gave up the sync role (``SchemaAhead``) at 23:53 PT. ``kanban_comment``
++on t_01a1d3e55460fe21, whose live run was on worker-7, still returned "the card has a live worker run: it gets this
++note at its next model call". The comment sat in the local outbox (pending, 0 attempts) and never reached the Board;
++a chat told David a relayed request had been delivered. Same for 10761 and 10772.
++
++The stopped state is produced the real way: ``run_forever`` passes its start check, then a round meets a board a
++newer core migrated (this process declares an older core's columns) and records "gave up the sync role".
++"""
++from __future__ import annotations
++
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_runstate as runstate
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tools import kanban_tools as kt
++
++ME, BOARD, RUNNER = "macbook", "default", "worker-7"
++LIVE_RUN_PROMISE = "gets this note at its next model call"
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    for var in ("HERMES_SESSION_ID", "HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK", "HERMES_KANBAN_RUN_ID",
++                "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_HOME"):
++        monkeypatch.delenv(var, raising=False)
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    monkeypatch.setattr(kt, "_persisted_identity", lambda: "default")
++    previous = sync.set_lease_client(support.FakeLeaseClient())
++    conn = kbc.connect(home / "kanban.db")
++    ksc.ensure_identity(conn, BOARD, ME)
++    sync.set_mode(conn, "primary")
++    try:
++        yield home, conn
++    finally:
++        conn.close()
++        sync.set_lease_client(previous)
++
++
++def _remote_running(conn) -> str:
++    """A card running on worker-7 under its Board lease, as this gateway's mirror holds it."""
++    tid = kb.create_task(conn, title="core update", assignee="default")
++    assert kb.claim_task(conn, tid) is not None
++    far = int((time.time() + 3600) * 1000)
++    sync.apply_remote_changes(conn, [sync.RemoteChange(
++        1, "tasks", tid, "lease", {"lease_holder": RUNNER, "lease_expires": far}, 9, "", RUNNER)], new_cursor=1)
++    conn.execute("UPDATE tasks SET claim_lock = NULL, worker_pid = NULL WHERE id = ?", (tid,))
++    assert kb.live_run_id(conn, tid) is not None
++    return tid
++
++
++def _give_up_the_sync_role(home, monkeypatch) -> None:
++    """``run_forever``: the start check passes, then its first round meets a board a newer core migrated."""
++    from hermes_cli import machine_metrics
++    svc = FakeService()
++    board_hub = svc.hub(ME)
++    monkeypatch.setitem(sync.SYNCED_COLUMNS, "tasks", sync.SYNCED_COLUMNS["tasks"] - {"placement_policy"})
++    monkeypatch.setattr(ksc, "_schema_ahead_boards", lambda boards: [])  # migrated after this loop started
++    monkeypatch.setattr(ksc, "load_identity", lambda: board_hub.ident)
++    monkeypatch.setattr(ksc, "Hub", lambda ident: board_hub)
++    monkeypatch.setattr(ksc.sync, "set_lease_client", lambda value: None)
++    monkeypatch.setattr(ksc, "board_paths", lambda: [(BOARD, home / "kanban.db")])
++    monkeypatch.setattr(ksc, "reconcile_links", lambda *args, **kwargs: None)
++    monkeypatch.setattr(machine_metrics, "Reporter", lambda *args: type(
++        "R", (), {"report_due": lambda self: None, "pending_wake_in": lambda self: None})())
++    monkeypatch.setattr(board_hub, "report_metrics", lambda *args: None, raising=False)
++    monkeypatch.setattr(ksc, "FeedWatcher", type("Feed", (), {"__init__": lambda self, *a, **k: None,
++                                                             "run": lambda self: None}))
++    monkeypatch.setattr(ksc, "wait_for_work", lambda *args: None)
++    ticks = iter(range(3))
++    ksc.run_forever(lambda: next(ticks, None) is not None, interval=1)
++    record = runstate.down()
++    assert record and record["reason"].startswith("gave up the sync role") and "SchemaAhead" in record["reason"]
++
++
++def _pending_comment_ops(conn) -> int:
++    return conn.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE state = 'pending' "
++                        "AND table_name = 'task_comments'").fetchone()[0]
++
++
++def test_comment_on_a_remote_run_while_the_sync_role_is_given_up_says_queued_locally(home, monkeypatch):
++    path, conn = home
++    tid = _remote_running(conn)
++    _give_up_the_sync_role(path, monkeypatch)
++    out = json.loads(kt._handle_comment({"task_id": tid, "body": "please relay this request"}))
++    assert out["ok"] is True and out["board_delivery"] == "queued_local"
++    assert LIVE_RUN_PROMISE not in json.dumps(out)
++    assert out["delivery"].startswith("queued locally: this gateway's Board sync has been stopped since ")
++    assert "gave up the sync role" in out["delivery"] and "won't see this until it recovers" in out["delivery"]
++    assert out["live_run_host"] == RUNNER and f"hermes kanban comment {tid}" in out["route"]
++    assert RUNNER in out["delivery"]
++    assert _pending_comment_ops(conn) >= 1  # the comment is written, just not pushed
++
++
++def test_comment_while_the_sync_runs_is_unchanged(home):
++    _path, conn = home
++    tid = _remote_running(conn)
++    assert runstate.down() is None
++    out = json.loads(kt._handle_comment({"task_id": tid, "body": "hello worker"}))
++    assert set(out) == {"ok", "task_id", "comment_id", "live_run", "delivery"}
++    assert out["live_run"] is True and LIVE_RUN_PROMISE in out["delivery"]
++
++
++def test_comment_on_a_local_run_while_stopped_keeps_the_live_run_promise(home, monkeypatch):
++    """The run reads this file, so it does get the note; only other hosts don't."""
++    path, conn = home
++    tid = kb.create_task(conn, title="runs here", assignee="default")
++    assert kb.claim_task(conn, tid) is not None
++    _give_up_the_sync_role(path, monkeypatch)
++    out = json.loads(kt._handle_comment({"task_id": tid, "body": "hello local worker"}))
++    assert LIVE_RUN_PROMISE in out["delivery"] and out["board_delivery"] == "queued_local"
++    assert "live_run_host" not in out and "route" not in out
++
++
++def test_unblock_while_the_sync_role_is_given_up_says_queued_locally(home, monkeypatch):
++    path, conn = home
++    tid = kb.create_task(conn, title="waits on David", assignee="default")
++    assert kb.block_task(conn, tid, reason="needs a decision")
++    _give_up_the_sync_role(path, monkeypatch)
++    out = json.loads(kt._handle_unblock({"task_id": tid}))
++    assert "ok" in out, out
++    assert out["ok"] is True and out["board_delivery"] == "queued_local"
++    assert "gave up the sync role" in out["board_sync"]
++
++
++def test_link_while_the_sync_role_is_given_up_says_queued_locally(home, monkeypatch):
++    path, conn = home
++    parent = kb.create_task(conn, title="parent", assignee="default")
++    child = kb.create_task(conn, title="child", assignee="default")
++    _give_up_the_sync_role(path, monkeypatch)
++    out = json.loads(kt._handle_link({"parent_id": parent, "child_id": child}))
++    assert out["ok"] is True and out["board_delivery"] == "queued_local"
++    assert out["board_sync"].startswith("queued locally: this gateway's Board sync has been stopped since ")
++
++
++def test_link_while_the_sync_runs_is_unchanged(home):
++    _path, conn = home
++    parent = kb.create_task(conn, title="parent", assignee="default")
++    child = kb.create_task(conn, title="child", assignee="default")
++    out = json.loads(kt._handle_link({"parent_id": parent, "child_id": child}))
++    assert "board_delivery" not in out and "board_sync" not in out
++
++
++def test_unsynced_board_never_reports_queued_locally(tmp_path, monkeypatch):
++    """Sync on for the host, but this board is not selected: the local file is the whole story."""
++    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_HOME"):
++        monkeypatch.delenv(var, raising=False)
++    home = support.kanban_home(tmp_path, monkeypatch)
++    (home / "config.yaml").write_text("kanban:\n  sync:\n    enabled: true\n    boards: [other]\n")
++    monkeypatch.setattr(kt, "_persisted_identity", lambda: "default")
++    runstate.record_down("gave up the sync role: board other: SchemaAhead(test)")
++    assert runstate.down()
++    conn = kbc.connect(home / "kanban.db")
++    try:
++        assert sync.board_mode(conn) == "off"
++        tid = kb.create_task(conn, title="local only", assignee="default")
++    finally:
++        conn.close()
++    out = json.loads(kt._handle_comment({"task_id": tid, "body": "note"}))
++    assert "board_delivery" not in out
++
++
++def test_cli_comment_on_a_remote_run_while_stopped_drops_the_live_run_line(home, monkeypatch, capsys):
++    from hermes_cli import kanban as kcli
++    path, conn = home
++    tid = _remote_running(conn)
++    _give_up_the_sync_role(path, monkeypatch)
++    import argparse
++    rc = kcli._cmd_comment(argparse.Namespace(task_id=tid, text=["relay", "this"], max_len=None, author="me",
++                                              origin_gateway=None, _slash_typed=True))
++    printed = capsys.readouterr().out
++    assert rc == 0 and LIVE_RUN_PROMISE not in printed
++    assert "Queued locally: this gateway's Board sync has been stopped since " in printed
++    assert f"on {RUNNER}" in printed
++
++
++def test_cli_link_while_stopped_prints_the_notice(home, monkeypatch, capsys):
++    from hermes_cli import kanban as kcli
++    path, conn = home
++    parent = kb.create_task(conn, title="parent", assignee="default")
++    child = kb.create_task(conn, title="child", assignee="default")
++    _give_up_the_sync_role(path, monkeypatch)
++    import argparse
++    assert kcli._cmd_link(argparse.Namespace(parent_id=parent, child_id=child)) == 0
++    assert "Queued locally:" in capsys.readouterr().out
++
++
++def test_cli_unblock_while_stopped_prints_the_notice_once(home, monkeypatch, capsys):
++    from hermes_cli import kanban as kcli
++    path, conn = home
++    tids = [kb.create_task(conn, title=f"waits {i}", assignee="default") for i in range(2)]
++    for tid in tids:
++        assert kb.block_task(conn, tid, reason="needs a decision")
++    _give_up_the_sync_role(path, monkeypatch)
++    import argparse
++    assert kcli._cmd_unblock(argparse.Namespace(task_ids=tids, reason=None)) == 0
++    assert capsys.readouterr().out.count("Queued locally:") == 1
++    assert kcli._cmd_unblock(argparse.Namespace(task_ids=tids, reason=None)) == 1  # nothing written this time
++    assert "Queued locally:" not in capsys.readouterr().out
++
++
++def test_reads_and_refusals_while_stopped_are_unchanged(home, monkeypatch):
++    path, conn = home
++    tid = _remote_running(conn)
++    _give_up_the_sync_role(path, monkeypatch)
++    assert "board_delivery" not in json.loads(kt._handle_attachments({"task_id": tid}))  # a read, also ok: true
++    refused = json.loads(kt._handle_attach_url({"task_id": tid, "url": "ftp://example.invalid/x"}))
++    assert "error" in refused and "board_delivery" not in refused
++
++
++def test_a_finished_remote_card_has_no_live_run_host(home):
++    from hermes_cli.kanban_board_delivery import remote_runner
++    _path, conn = home
++    tid = _remote_running(conn)
++    assert remote_runner(conn, tid) == RUNNER
++    conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++    assert remote_runner(conn, tid) is None
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index e035ab8484..2f19d8724a 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -235,6 +235,9 @@ def _kanban_handler(tool_name: str, *, classify_rejections: bool = False) -> Cal
+                 if tool_name in _RUN_LIFECYCLE_TOOLS and isinstance(out, str) and out.startswith('{"ok": true'):
+                     from tools import kanban_tools_run_end as kre
+                     out = kre.annotate_success(_board, args, out)
++                if isinstance(out, str):  # [daveey] a write the stopped Board sync keeps local says so
++                    from tools import kanban_tools_board_delivery as kbd_
++                    out = kbd_.annotate(_board, tool_name, args, out)
+                 if classify_rejections and isinstance(out, str) and out.startswith('{"error"'):
+                     out = _tag_rejection(out, "invalid_args")
+                 return out
+diff --git a/tools/kanban_tools_board_delivery.py b/tools/kanban_tools_board_delivery.py
+new file mode 100644
+index 0000000000..1e91280feb
+--- /dev/null
++++ b/tools/kanban_tools_board_delivery.py
+@@ -0,0 +1,40 @@
++"""Kanban tool results while this gateway's Board sync is stopped (``hermes_cli.kanban_board_delivery``). [daveey]"""
++from __future__ import annotations
++
++import json
++import logging
++from typing import Any, Callable
++
++logger = logging.getLogger(__name__)
++
++# Tools whose success writes a row other hosts must see (pushed through this gateway's Board sync outbox).
++BOARD_WRITE_TOOLS = frozenset({
++    "kanban_complete", "kanban_block", "kanban_unblock", "kanban_schedule", "kanban_continue",
++    "kanban_request_review", "kanban_request_changes", "kanban_comment", "kanban_attach", "kanban_attach_url",
++    "kanban_link", "kanban_unlink", "kanban_archive",
++})
++
++
++def annotate(board: Callable[..., Any], tool_name: str, args: dict, out: str) -> str:
++    """``out`` plus ``board_delivery: queued_local`` when the write stayed local; a comment on a card another
++    gateway runs loses its live-run ``delivery`` promise. Unchanged while the sync runs (or on any read error)."""
++    if tool_name not in BOARD_WRITE_TOOLS or not out.startswith('{"ok": true'):
++        return out
++    from hermes_cli import kanban_sync_runstate as runstate
++    if not runstate.down():  # the common case: one config read and one stat, no board connection
++        return out
++    try:
++        payload = json.loads(out)
++        tid = (payload.get("task_id") or args.get("task_id")) if tool_name == "kanban_comment" else None
++        from hermes_cli.kanban_board_delivery import queued_local
++        with board(args.get("board"), quiet_close=True) as (_kb, conn):
++            note = queued_local(conn, str(tid) if tid else None)
++    except Exception:  # health: allow BLE001 -- a diagnostic must never turn a committed write into an error
++        logger.debug("%s: board delivery check failed", tool_name, exc_info=True)
++        return out
++    if not note:
++        return out
++    if note.get("live_run_host"):
++        payload["delivery"] = f"{note['board_sync']}; {note['route']}"
++    payload.update(note)
++    return json.dumps(payload)
+-- 
+2.51.0
+

@@ -1,0 +1,216 @@
+From 7d3bc9be0baece06b063677e38c7ddc1df78b2ba Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 04:10:01 +0000
+Subject: [PATCH] fix(kanban): worker inventory guards stripped-env pytest
+ children; retire collected records only under the fence [daveey]
+
+Follow-up to #1854 review nits:
+- _refuse_test_registration uses hermes_state_guard._in_test_context (PYTEST_*,
+  HERMES_TEST_ISOLATION marker, pytest ancestry), so a child that rebuilt its env
+  cannot register in the real account inventory.
+- paths() (refusal() and the never-mutating census) now only skips a collected
+  scratch/tmp record; register(), which runs under the account admission fence,
+  unlinks it. An unfenced unlink could drop the record a concurrent register()
+  of the same recreated path had just kept.
+- Module docstring documents the accepted trade-off for a scratch board pruned
+  while its process still has the DB open.
+---
+ hermes_cli/worker_account_boards.py           | 43 +++++++++-
+ .../hermes_cli/test_worker_account_boards.py  | 82 +++++++++++++++++++
+ 2 files changed, 122 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/worker_account_boards.py b/hermes_cli/worker_account_boards.py
+index d3033b8919..ea984c1277 100644
+--- a/hermes_cli/worker_account_boards.py
++++ b/hermes_cli/worker_account_boards.py
+@@ -6,6 +6,18 @@ jobs vanished. Missing registered DBs are unknown, never silently free capacity,
+ except a board whose whole directory was removed from an ephemeral root (system
+ temp, the account scratch dir): that workspace was garbage-collected, so its
+ record retires instead of holding every claim on the host forever.
++
++Reads (``paths()``, called by ``refusal()`` and the never-mutating
++``occupied_count_for_host`` census) only skip a collected record. Its file is
++unlinked by ``register()``, which runs under the account admission fence: an
++unfenced unlink could delete the record a concurrent ``register()`` of the same
++recreated scratch path had just found and kept, losing that board until its next
++claim.
++
++Accepted trade-off: if the pruner deletes a scratch board's directory while its
++process still has the DB open, the record retires and that board's running rows
++stop counting toward host capacity. Its detached jobs still count through their
++cgroups; only the rows of a board whose workspace is already gone are dropped.
+ """
+ from __future__ import annotations
+ 
+@@ -28,8 +40,13 @@ def _refuse_test_registration() -> None:
+     account. Once pytest deleted the board, every worker claim on the host was
+     deferred ``worker_resources_unknown``. Compare paths without I/O: the
+     test-only real-home guard refuses any stat under the real root.
++
++    The test signal is env OR ancestry (``hermes_state_guard``): a child that
++    rebuilt its environment loses ``PYTEST_*`` but keeps our inherited
++    ``HERMES_TEST_ISOLATION`` marker and its pytest ancestor.
+     """
+-    if not os.environ.get('PYTEST_CURRENT_TEST'):
++    import hermes_state_guard
++    if not hermes_state_guard._in_test_context():
+         return
+     from hermes_constants import _account_home
+     real = os.path.normpath(str(_account_home() / '.hermes'))
+@@ -57,7 +74,27 @@ def _collected(path: Path) -> bool:
+     return any(path.is_relative_to(root) for root in _ephemeral_roots())
+ 
+ 
++def _retire_collected(directory: Path) -> None:
++    """Unlink records of garbage-collected boards. Caller holds the account fence.
++
++    Malformed records are left for ``paths()`` to refuse loudly.
++    """
++    for record in directory.iterdir():
++        if record.suffix != '.json':
++            continue
++        try:
++            raw = json.loads(record.read_text(encoding='utf-8-sig'))
++        except (OSError, ValueError):
++            continue
++        if (not isinstance(raw, str) or not Path(raw).is_absolute()
++                or record.stem != hashlib.sha256(raw.encode()).hexdigest()):
++            continue
++        if not Path(raw).exists() and _collected(Path(raw)):
++            record.unlink(missing_ok=True)
++
++
+ def register(conn) -> None:
++    """Record *conn*'s board. Caller holds the account admission fence."""
+     _refuse_test_registration()
+     from hermes_cli.kanban_db_connect import _main_db_file
+     raw = _main_db_file(conn)
+@@ -71,6 +108,7 @@ def register(conn) -> None:
+     discard(intent)
+     directory = capacity.policy_root() / 'worker-resources' / 'boards'
+     directory.mkdir(parents=True, exist_ok=True)
++    _retire_collected(directory)
+     destination = directory / (hashlib.sha256(str(path).encode()).hexdigest() + '.json')
+     if destination.exists():
+         if json.loads(destination.read_text(encoding='utf-8-sig')) != str(path):
+@@ -178,7 +216,6 @@ def paths() -> list[Path]:
+             except FileNotFoundError:
+                 if not _collected(Path(raw)):
+                     raise
+-                record.unlink(missing_ok=True)
+-                continue
++                continue  # read-only: register() retires it under the fence
+             found.append(Path(raw))
+     return found
+diff --git a/tests/hermes_cli/test_worker_account_boards.py b/tests/hermes_cli/test_worker_account_boards.py
+index 7243488061..f7a7d485ee 100644
+--- a/tests/hermes_cli/test_worker_account_boards.py
++++ b/tests/hermes_cli/test_worker_account_boards.py
+@@ -91,7 +91,40 @@ def test_garbage_collected_scratch_board_retires_its_record(monkeypatch, tmp_pat
+     assert len(records) == 1 and inventory.paths() == [(workspace / 'kanban.db').resolve()]
+     shutil.rmtree(tmp_path / 'cache' / 'scratch' / 't_bench-x')
+     assert inventory.paths() == []
++    assert records[0].exists(), 'reads never unlink outside the account fence'
++    other = tmp_path / 'cache' / 'scratch' / 't_other' / 'kanban.db'
++    other.parent.mkdir(parents=True)
++    _registered(other)  # the fenced mutating path retires the collected record
+     assert not records[0].exists()
++    assert inventory.paths() == [other.resolve()]
++
++
++def test_concurrent_register_of_recreated_scratch_board_keeps_its_record(monkeypatch, tmp_path):
++    """paths() saw the board collected; a register() of the recreated path then
++    kept the existing record. The read must not unlink it afterwards."""
++    import shutil
++    monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path)
++    board = tmp_path / 'cache' / 'scratch' / 'run' / 'kanban.db'
++    board.parent.mkdir(parents=True)
++    _registered(board)
++    record, = (tmp_path / 'worker-resources' / 'boards').glob('*.json')
++    shutil.rmtree(board.parent)
++    real_collected = inventory._collected
++
++    def collected_then_concurrent_register(path):
++        verdict = real_collected(path)
++        assert verdict
++        board.parent.mkdir(parents=True)  # the scratch path is recreated ...
++        before = record.stat().st_mtime_ns
++        _registered(board)  # ... and registered: record exists, early return
++        assert record.stat().st_mtime_ns == before
++        return verdict
++
++    monkeypatch.setattr(inventory, '_collected', collected_then_concurrent_register)
++    assert inventory.paths() == []
++    monkeypatch.setattr(inventory, '_collected', real_collected)
++    assert record.exists()
++    assert inventory.paths() == [board.resolve()]
+ 
+ 
+ def test_missing_board_stays_unknown_unless_its_scratch_dir_is_gone(monkeypatch, tmp_path):
+@@ -128,14 +161,63 @@ def test_ephemeral_roots_never_cover_the_account(monkeypatch, tmp_path):
+ def test_pytest_never_registers_in_the_real_account_inventory(monkeypatch, tmp_path):
+     """monkeypatch.undo() drops conftest's policy_root isolation; register must still refuse."""
+     import hermes_constants
++    import hermes_state_guard
+     monkeypatch.setattr(hermes_constants, '_account_home', lambda: tmp_path)
+     monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path / '.hermes')
+     conn = sqlite3.connect(tmp_path / 'board.db')
+     try:
+         with pytest.raises(RuntimeError, match='real account worker inventory'):
+             inventory.register(conn)
++        # A child that stripped PYTEST_* still carries our isolation marker.
+         monkeypatch.delenv('PYTEST_CURRENT_TEST')
++        monkeypatch.delenv('PYTEST_VERSION', raising=False)
++        monkeypatch.setenv('HERMES_TEST_ISOLATION', str(tmp_path))
++        monkeypatch.setattr(hermes_state_guard, '_has_pytest_ancestor', lambda: False)
++        with pytest.raises(RuntimeError, match='real account worker inventory'):
++            inventory.register(conn)
++        # ... or only its pytest ancestor.
++        monkeypatch.delenv('HERMES_TEST_ISOLATION')
++        monkeypatch.setattr(hermes_state_guard, '_has_pytest_ancestor', lambda: True)
++        with pytest.raises(RuntimeError, match='real account worker inventory'):
++            inventory.register(conn)
++        # A production process registers normally.
++        monkeypatch.setattr(hermes_state_guard, '_has_pytest_ancestor', lambda: False)
+         inventory.register(conn)
+     finally:
+         conn.close()
+     assert inventory.paths() == [(tmp_path / 'board.db').resolve()]
++
++
++def test_stripped_env_child_with_isolation_marker_is_refused(tmp_path):
++    """A real child process whose env lost PYTEST_* but kept HERMES_TEST_ISOLATION."""
++    import os
++    import subprocess
++    import sys
++    from pathlib import Path
++    repo = Path(inventory.__file__).resolve().parents[1]
++    env = {k: v for k, v in os.environ.items() if not k.startswith('PYTEST_')}
++    env['HERMES_TEST_ISOLATION'] = str(tmp_path)
++    env['PYTHONPATH'] = str(repo)
++    child = (
++        'import sqlite3, sys\n'
++        'from pathlib import Path\n'
++        'import hermes_constants, hermes_state_guard\n'
++        'from hermes_cli import worker_account_boards as inventory, worker_compute_capacity as capacity\n'
++        'home = Path(sys.argv[1])\n'
++        'hermes_constants._account_home = lambda: home\n'
++        "capacity.policy_root = lambda: home / '.hermes'\n"
++        'hermes_state_guard._has_pytest_ancestor = lambda: False  # marker alone must refuse\n'
++        "conn = sqlite3.connect(home / 'board.db')\n"
++        'try:\n'
++        '    inventory.register(conn)\n'
++        'except RuntimeError as exc:\n'
++        "    print('refused', exc)\n"
++        '    sys.exit(0)\n'
++        "print('registered')\n"
++        'sys.exit(1)\n'
++    )
++    result = subprocess.run([sys.executable, '-c', child, str(tmp_path)], env=env, cwd=repo,
++                            capture_output=True, text=True, timeout=120, check=False)
++    assert result.returncode == 0, result.stdout + result.stderr
++    assert 'real account worker inventory' in result.stdout
++    assert not (tmp_path / '.hermes' / 'worker-resources').exists()
+-- 
+2.51.0
+

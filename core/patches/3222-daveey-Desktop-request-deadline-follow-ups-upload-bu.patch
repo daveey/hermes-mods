@@ -1,0 +1,333 @@
+From d36089459ee566c46c22a9bcc6ed089f1d9a14c0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:30:22 +0000
+Subject: [PATCH] [daveey] Desktop: request deadline follow-ups (upload budget,
+ trial-deadline trade-off, late-answer test)
+
+Follow-ups from the review of PR #1955 (total per-attempt request deadline,
+20 s down-gate trial deadline).
+
+1. Uploads: the total deadline also bounded request bodies at the JSON
+   timeout (30 s, 60 s stretched), so a 25 MB kanban attachment on a ~2 Mbps
+   link (~100 s) that used to finish under the idle timer now failed.
+   `deadline.arm(req, reject, bodyBytes)` grows the total budget by the time
+   the body needs at 1 Mbit/s (requestDeadlineBudgetMs: timeoutMs +
+   bytes / 125 per ms; 25 MB -> +210 s). The idle timer stays at the
+   caller's timeout, so a stalled upload still fails fast, and its error now
+   names the idle timeout instead of the total budget. fetchJson and
+   fetchPublicJson pass `body?.length`.
+2. remote-down-gate.ts: a comment on REMOTE_DOWN_TRIAL_DEADLINE_MS makes the
+   trade-off explicit: 20 s is shorter than a trial request's own budget, so
+   a trial still in flight is rejected to its caller while the server may
+   still apply it (a non-idempotent mutation included); the abandoned
+   request keeps running and a late answer still reopens the gate.
+3. Test: the abandoned trial's late success reopens the gate at once
+   (fresh sentEpoch), without waiting out the escalated backoff.
+
+Tests: an upload whose transfer outlasts the JSON timeout completes within
+its body budget (RED before: timed out at 150 ms); the budget arithmetic for
+a 25 MB attachment; the same transfer without a body allowance still times
+out; a stalled upload is still cut by the idle timer; main.ts arms with the
+body size (RED before).
+
+Card: t_01a1d3cca6f20650 (follow-up to t_01a1d3b1a4a9d420, PR #1955).
+---
+ apps/desktop/electron/api-transport.test.ts   | 119 ++++++++++++++++++
+ apps/desktop/electron/api-transport.ts        |  29 ++++-
+ apps/desktop/electron/main.ts                 |   4 +-
+ .../desktop/electron/remote-down-gate.test.ts |  27 +++-
+ apps/desktop/electron/remote-down-gate.ts     |   7 ++
+ 5 files changed, 178 insertions(+), 8 deletions(-)
+
+diff --git a/apps/desktop/electron/api-transport.test.ts b/apps/desktop/electron/api-transport.test.ts
+index 3e9c3cfe2c..5f74df82dc 100644
+--- a/apps/desktop/electron/api-transport.test.ts
++++ b/apps/desktop/electron/api-transport.test.ts
+@@ -23,6 +23,7 @@ import {
+   isIdempotentMethod,
+   isTransientTransportError,
+   jsonAgentFor,
++  requestDeadlineBudgetMs,
+   shouldRetryRequest,
+   startRequestDeadline,
+   withRetry
+@@ -548,6 +549,124 @@ describe('live: total request deadline (startRequestDeadline)', () => {
+   })
+ })
+ 
++/** One POST shaped exactly like main.ts fetchJson with a body: deadline armed with the body's size. */
++function deadlineJsonPost(url: string, agent: http.Agent, timeoutMs: number, body: Buffer): Promise<any> {
++  return new Promise((resolve, reject) => {
++    const deadline = startRequestDeadline(timeoutMs)
++
++    const req = http.request(
++      new URL(url),
++      { agent, method: 'POST', headers: { 'Content-Length': String(body.length) } },
++      res => {
++        const chunks: Buffer[] = []
++        res.on('error', reject)
++        res.on('data', c => chunks.push(c))
++        res.on('end', () => resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || 'null')))
++      }
++    )
++
++    req.on('error', reject)
++    deadline.arm(req, reject, body?.length)
++    req.write(body)
++    req.end()
++  })
++}
++
++/**
++ * /slow-upload reads the whole body, then keeps the connection busy for `busyMs` (a byte every 20 ms, so the idle
++ * timer never fires) before answering with the byte count: on a loopback socket this stands in for an upload whose
++ * transfer outlasts the JSON deadline. /silent-upload reads the body and then never answers.
++ */
++function uploadServer(busyMs: number) {
++  const server = http.createServer((req, res) => {
++    let bytes = 0
++    req.on('data', chunk => (bytes += chunk.length))
++    req.on('end', () => {
++      if (req.url === '/silent-upload') {
++        return
++      }
++
++      res.writeHead(200, { 'Content-Type': 'application/json' })
++      const tick = setInterval(() => res.write(' '), 20)
++      setTimeout(() => {
++        clearInterval(tick)
++        res.end(JSON.stringify({ bytes }))
++      }, busyMs)
++    })
++  })
++
++  const close = async () => {
++    server.closeAllConnections()
++    await new Promise(resolve => server.close(resolve))
++  }
++
++  return { close, server }
++}
++
++describe('total request deadline: request bodies (uploads)', () => {
++  it('budgets the body at 1 Mbit/s on top of the timeout, so a 25 MB attachment on a 2 Mbps link fits', () => {
++    expect(requestDeadlineBudgetMs(30_000)).toBe(30_000)
++    expect(requestDeadlineBudgetMs(30_000, 0)).toBe(30_000)
++    expect(requestDeadlineBudgetMs(30_000, 1_000)).toBe(30_008)
++
++    const attachment = 25 * 1024 * 1024
++    const secondsAt2Mbps = (attachment * 8) / 2_000_000
++    expect(secondsAt2Mbps).toBeGreaterThan(100)
++    expect(requestDeadlineBudgetMs(30_000, attachment)).toBe(30_000 + Math.ceil(attachment / 125))
++    expect(requestDeadlineBudgetMs(30_000, attachment)).toBeGreaterThan(30_000 + 2 * secondsAt2Mbps * 1_000)
++  })
++
++  it('an upload whose transfer outlasts the JSON timeout completes within its body budget', async () => {
++    const { close, server } = uploadServer(400)
++    const base = await listen(server)
++    const agent = new http.Agent({ keepAlive: true, maxSockets: 4 })
++    const body = Buffer.alloc(256 * 1024, 7) // +2098 ms of budget at 125 bytes/ms
++
++    try {
++      const outcome = await settleWithin(deadlineJsonPost(`${base}/slow-upload`, agent, 150, body), 3_000)
++
++      expect(outcome.error).toBeUndefined()
++      expect(outcome.value).toEqual({ bytes: body.length })
++    } finally {
++      agent.destroy()
++      await close()
++    }
++  })
++
++  it('the same transfer still times out when the request carries no body allowance', async () => {
++    const { close, server } = uploadServer(400)
++    const base = await listen(server)
++    const agent = new http.Agent({ keepAlive: true, maxSockets: 4 })
++
++    try {
++      const outcome = await settleWithin(deadlineJsonPost(`${base}/slow-upload`, agent, 150, Buffer.alloc(0)), 3_000)
++
++      expect(String(outcome.error?.message)).toBe('Timed out connecting to Hermes backend after 150ms')
++    } finally {
++      agent.destroy()
++      await close()
++    }
++  })
++
++  it('a stalled upload is still cut by the idle timer at the caller timeout, not the body budget', async () => {
++    const { close, server } = uploadServer(0)
++    const base = await listen(server)
++    const agent = new http.Agent({ keepAlive: true, maxSockets: 4 })
++    const body = Buffer.alloc(256 * 1024, 7)
++
++    try {
++      const startedAt = performance.now()
++      const outcome = await settleWithin(deadlineJsonPost(`${base}/silent-upload`, agent, 150, body), 3_000)
++
++      expect(String(outcome.error?.message)).toBe('Timed out connecting to Hermes backend after 150ms')
++      expect(performance.now() - startedAt).toBeLessThan(1_500)
++    } finally {
++      agent.destroy()
++      await close()
++    }
++  })
++})
++
+ describe('live: dispatch probe pool', () => {
+   it('the probe answers while the JSON pool is saturated with hung requests to the same tunnel', async () => {
+     const { close, held, server } = hangingServer()
+diff --git a/apps/desktop/electron/api-transport.ts b/apps/desktop/electron/api-transport.ts
+index 639ae26ca1..d0c02457fe 100644
+--- a/apps/desktop/electron/api-transport.ts
++++ b/apps/desktop/electron/api-transport.ts
+@@ -109,6 +109,16 @@ function multipartBody(upload: any) {
+   return { body, contentType: `multipart/form-data; boundary=${boundary}` }
+ }
+ 
++// [daveey] Slowest upload throughput a request body is budgeted for: 1 Mbit/s
++// (125 bytes per ms). The 2026-11-12 guest link ran ~1-2 Mbps, where a 25 MB
++// attachment takes 100-200 s, far past the 30 s JSON deadline.
++const REQUEST_BODY_MIN_BYTES_PER_MS = 125
++
++/** Total deadline for one attempt: the caller's timeout plus the time its body needs at the minimum throughput. */
++function requestDeadlineBudgetMs(timeoutMs: number, bodyBytes = 0): number {
++  return timeoutMs + Math.ceil(Math.max(0, bodyBytes) / REQUEST_BODY_MIN_BYTES_PER_MS)
++}
++
+ /**
+  * [daveey] Bound one JSON request by a TOTAL deadline, not only an idle one.
+  *
+@@ -124,24 +134,32 @@ function multipartBody(upload: any) {
+  * and retry classification are unchanged: a timeout is not a transient
+  * transport error) and only then is the request destroyed, so a socket error
+  * raised by the destroy can't win the race. The idle timeout is kept too.
++ *
++ * Pass the request body's size to `arm`: the total budget grows by the time
++ * that body needs at REQUEST_BODY_MIN_BYTES_PER_MS (requestDeadlineBudgetMs),
++ * so a large upload (kanban attachments, up to 25 MB) on a slow link is not
++ * cut at the JSON budget. The idle timer still catches a stalled upload.
+  */
+ function startRequestDeadline(timeoutMs: number, now: () => number = Date.now) {
+   const startedAt = now()
+ 
+   return {
+-    arm(req: http.ClientRequest, onTimeout: (error: Error) => void): void {
+-      const expire = () => {
+-        const error = requestTimeoutError(timeoutMs)
++    arm(req: http.ClientRequest, onTimeout: (error: Error) => void, bodyBytes = 0): void {
++      const budgetMs = requestDeadlineBudgetMs(timeoutMs, bodyBytes)
++
++      const expire = (afterMs: number) => {
++        const error = requestTimeoutError(afterMs)
+         onTimeout(error)
+         req.destroy(error)
+       }
+ 
+-      const timer = setTimeout(expire, Math.max(0, timeoutMs - (now() - startedAt)))
++      const timer = setTimeout(() => expire(budgetMs), Math.max(0, budgetMs - (now() - startedAt)))
+       const clear = () => clearTimeout(timer)
+ 
+       req.once('close', clear)
+       req.once('response', (res: http.IncomingMessage) => res.once('close', clear))
+-      req.setTimeout(timeoutMs, expire)
++      // The idle timer stays at the caller's timeout whatever the body size: a stalled upload still fails fast.
++      req.setTimeout(timeoutMs, () => expire(timeoutMs))
+     }
+   }
+ }
+@@ -364,6 +382,7 @@ export {
+   multipartBody,
+   readJsonErrorBody,
+   readStatusCode,
++  requestDeadlineBudgetMs,
+   requestTimeoutError,
+   shouldRetryRequest,
+   startRequestDeadline,
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 267c77483c..3186d002fe 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -5326,7 +5326,7 @@ function fetchJson(url, token, options: any = {}) {
+         )
+ 
+         req.on('error', reject)
+-        deadline.arm(req, reject)
++        deadline.arm(req, reject, body?.length)
+ 
+         // From here the request goes on the wire: a later transport error can no
+         // longer prove the server didn't process it, so non-idempotent verbs must
+@@ -5430,7 +5430,7 @@ function fetchPublicJson(url, options: any = {}) {
+         )
+ 
+         req.on('error', reject)
+-        deadline.arm(req, reject)
++        deadline.arm(req, reject, body?.length)
+ 
+         // Past this point the request is on the wire — see fetchJson.
+         requestState.bodySent = true
+diff --git a/apps/desktop/electron/remote-down-gate.test.ts b/apps/desktop/electron/remote-down-gate.test.ts
+index d30ce075b6..33c20cffa4 100644
+--- a/apps/desktop/electron/remote-down-gate.test.ts
++++ b/apps/desktop/electron/remote-down-gate.test.ts
+@@ -393,6 +393,31 @@ describe('remote down gate: trial deadline', () => {
+     ).resolves.toBe('back')
+   })
+ 
++  it('a late success from the abandoned trial still reopens the gate (it was sent in the current epoch)', async () => {
++    const h = downHarness()
++
++    let answerLate: (value: string) => void = () => {}
++
++    const hung = h.runTrial(
++      async () => ({ baseUrl: BASE_URL }),
++      () => new Promise<string>(resolve => (answerLate = resolve))
++    )
++
++    const outcome = await settleWithin(hung, 1_000)
++    expect(String(outcome.error?.message)).toMatch(/down-gate trial deadline/)
++    // The deadline marked the trial failed: still down, and the slot is free but behind the escalated backoff.
++    expect(h.gate.isDown(KEY)).toBe(true)
++    await expect(h.run(async () => 'x')).rejects.toSatisfy(isRemoteBackendDownError)
++
++    // The abandoned request answers after its caller gave up: the remote is back, so the gate reopens at once,
++    // without waiting out the backoff for another trial.
++    answerLate('late')
++    await new Promise(resolve => setTimeout(resolve, 0))
++
++    expect(h.gate.isDown(KEY)).toBe(false)
++    await expect(h.run(async () => 'open')).resolves.toBe('open')
++  })
++
+   it('a non-trial request is not cut by the trial deadline', async () => {
+     const h = harness()
+ 
+@@ -418,7 +443,7 @@ describe('main.ts wiring', () => {
+ 
+       expect(start).toBeGreaterThan(0)
+       expect(start).toBeLessThan(body.indexOf('client.request('))
+-      expect(body).toMatch(/deadline\.arm\(req, reject\)/)
++      expect(body).toMatch(/deadline\.arm\(req, reject, body\?\.length\)/)
+     }
+   })
+ 
+diff --git a/apps/desktop/electron/remote-down-gate.ts b/apps/desktop/electron/remote-down-gate.ts
+index 9c7ec04ef1..83481ba4dd 100644
+--- a/apps/desktop/electron/remote-down-gate.ts
++++ b/apps/desktop/electron/remote-down-gate.ts
+@@ -18,6 +18,13 @@ export const REMOTE_DOWN_MAX_BACKOFF_MS = 30_000
+ // [daveey] A trial (connect, which may redial and probe, plus the request) must settle within this or it is
+ // treated as a failed trial: the slot is freed and the backoff escalates. Without it a trial on a slow link held the
+ // slot for 3.5 min (2026-11-12) while every other request failed fast with "reconnect in progress".
++//
++// Trade-off, chosen on purpose: this is SHORTER than a trial request's own budget (DEFAULT_FETCH_TIMEOUT_MS = 30 s,
++// stretched further on a slow link, plus the body allowance for uploads). A trial whose request is still in flight at
++// 20 s is rejected to its caller, but the request itself is not cancelled: the server may still receive and apply it,
++// including a non-idempotent POST/PUT/DELETE, so a caller that retries can submit twice. We accept that because the
++// trial is one request per backoff window and freeing the slot is what lets the remote recover; the abandoned
++// request keeps running, and if it answers late (sent in the current epoch) that answer still reopens the gate.
+ export const REMOTE_DOWN_TRIAL_DEADLINE_MS = 20_000
+ 
+ export const REMOTE_BACKEND_DOWN_CODE = 'REMOTE_BACKEND_DOWN'
+-- 
+2.51.0
+

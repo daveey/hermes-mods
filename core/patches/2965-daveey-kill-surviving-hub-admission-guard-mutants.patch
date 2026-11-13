@@ -1,0 +1,263 @@
+From 40f9d9ad03d42ba606241906ada09fb9d7a1c112 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:16:52 +0000
+Subject: [PATCH] [daveey] kill surviving hub admission guard mutants
+
+Adds a guard test per surviving mutant of core-mutants-run1 (pool policy validation reasons, unknown census at
+dispatch/candidate/final gate, normal-card advisory ceiling, invalid policy at advisory, pool CPU recheck after a
+concurrent pool change, foreign lockless holder in the pool census, capacity receipt without origin, metrics cap 0).
+Drops the redundant SQL marked-first prefix: the post-donation re-partition is the single marked ordering.
+Makes the concurrent cross-board pool test end with an uncontended pass so busy-lock losers cannot flake it.
+---
+ hermes_cli/kanban_db_dispatch_queries.py      |   3 +-
+ tests/hermes_cli/test_kanban_hub_admission.py |   4 +
+ .../test_kanban_hub_admission_grant_echo.py   |  12 ++
+ .../test_kanban_hub_admission_guards.py       | 167 ++++++++++++++++++
+ .../test_machine_admission_metrics.py         |   2 +-
+ 5 files changed, 185 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_hub_admission_guards.py
+
+diff --git a/hermes_cli/kanban_db_dispatch_queries.py b/hermes_cli/kanban_db_dispatch_queries.py
+index a682d0348e..f37c954d0a 100644
+--- a/hermes_cli/kanban_db_dispatch_queries.py
++++ b/hermes_cli/kanban_db_dispatch_queries.py
+@@ -32,11 +32,10 @@ DISPATCH_ORDER = (
+ 
+ def lane_rows(conn: sqlite3.Connection, status: str, *, marked_first: bool = False) -> list[sqlite3.Row]:
+     """Unclaimed rows of one lane in dispatch order; optional pool ordering keeps priority ties per class."""
+-    prefix = "admission_class IN ('capacity', 'urgent') DESC, " if marked_first else ""
+     rows = conn.execute(
+         "SELECT id, assignee, admission_class FROM tasks "
+         f"WHERE status = '{status}' AND claim_lock IS NULL "
+-        f"ORDER BY {prefix}{DISPATCH_ORDER}"
++        f"ORDER BY {DISPATCH_ORDER}"
+     ).fetchall()
+     from hermes_cli.kanban_dispatch_priority import order_with_remote_waiters
+     rows = order_with_remote_waiters(conn, rows)
+diff --git a/tests/hermes_cli/test_kanban_hub_admission.py b/tests/hermes_cli/test_kanban_hub_admission.py
+index 214f3edd8f..c552ddb9e7 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission.py
++++ b/tests/hermes_cli/test_kanban_hub_admission.py
+@@ -156,6 +156,10 @@ def test_concurrent_cross_board_claims_obey_origin_and_pool_caps(board, monkeypa
+     for _ in range(4):
+         with ThreadPoolExecutor(max_workers=4) as executor:
+             list(executor.map(attempt, candidates))
++    # Concurrent rounds may admit fewer than the free slots (losers of admission.lock defer as busy and retry next
++    # tick); a final uncontended pass admits every remaining admissible card, so only the caps limit the result.
++    for candidate in candidates:
++        attempt(candidate)
+     detail = {"pools": {"regular": 0, "priority": 0}, "capacity_origins": {}}
+     assert mm.active_card_runs(detail=detail) == 7 + expected
+     assert detail["pools"] == {"regular": 7, "priority": expected}
+diff --git a/tests/hermes_cli/test_kanban_hub_admission_grant_echo.py b/tests/hermes_cli/test_kanban_hub_admission_grant_echo.py
+index a166ecd08b..392615c01e 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission_grant_echo.py
++++ b/tests/hermes_cli/test_kanban_hub_admission_grant_echo.py
+@@ -184,6 +184,18 @@ def test_frozen_counter_shape_own_lockless_echo_counts_foreign_does_not(rig):
+     assert mm.active_card_runs() == 6
+ 
+ 
++def test_pool_census_skips_foreign_lockless_holder_like_the_scalar(rig):
++    rig.fill(6)
++    foreign = rig.card(title="foreign")
++    with kb.write_txn(rig.conn):
++        rig.conn.execute("UPDATE kanban_sync_state SET applying = 1")
++        rig.conn.execute("UPDATE tasks SET status='running', lease_holder='worker-2' WHERE id=?", (foreign,))
++        rig.conn.execute("UPDATE kanban_sync_state SET applying = 0")
++    detail = {"pools": {"regular": 0, "priority": 0}}
++    assert mm.active_card_runs(detail=detail) == 6
++    assert detail["pools"] == {"regular": 6, "priority": 0}
++
++
+ @pytest.mark.parametrize("lane", LANES)
+ def test_six_locals_plus_this_claims_own_grant_echo_admits_exactly_one_run(rig, lane):
+     """RED before the fix: refused ``hub_capacity_full`` (the claim's own unused grant read as the 7th run)."""
+diff --git a/tests/hermes_cli/test_kanban_hub_admission_guards.py b/tests/hermes_cli/test_kanban_hub_admission_guards.py
+new file mode 100644
+index 0000000000..d503d24b71
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_hub_admission_guards.py
+@@ -0,0 +1,167 @@
++"""Each fail-closed guard of the two-pool hub admission has a test that fails when the guard is removed."""
++from contextlib import closing
++
++import pytest
++
++from hermes_cli import kanban_admission_pools as pools
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import machine_cpu_metrics as cm
++from hermes_cli import machine_metrics as mm
++from tests.hermes_cli import test_kanban_hub_admission as helpers
++
++pytestmark = pytest.mark.platforms("posix")
++
++board = helpers.board
++configure, advisory, task, fake_sample = helpers.configure, helpers.advisory, helpers.task, helpers.fake_sample
++
++
++def enable(home, extra=""):
++    configure(home, cap=7)
++    with (home / "config.yaml").open("a") as config:
++        config.write("    priority_slots: 3\n" + extra)
++
++
++def no_lease_or_sample(monkeypatch):
++    monkeypatch.setattr(sync, "claim_gate", lambda *a, **k: pytest.fail("advisory refusal must not ask for a lease"))
++    monkeypatch.setattr(cm, "sample", lambda *a, **k: pytest.fail("advisory refusal must not sample"))
++
++
++@pytest.mark.parametrize("key,value,reason", [
++    ("priority_slots", -1, "priority_slots must be a nonnegative integer"),
++    ("priority_slots", "true", "priority_slots must be a nonnegative integer"),
++    ("priority_slots", "'3'", "priority_slots must be a nonnegative integer"),
++    ("priority_cpu_busy_below_pct", 0, "priority CPU ceiling must be in (0,100]"),
++    ("priority_cpu_busy_below_pct", 101, "priority CPU ceiling must be in (0,100]"),
++    ("priority_cpu_busy_below_pct", "'85'", "priority CPU ceiling must be in (0,100]"),
++])
++def test_invalid_pool_setting_refuses_with_its_own_reason(board, key, value, reason):
++    _conn, home = board
++    (home / "config.yaml").write_text(f"kanban:\n  admission:\n    {key}: {value}\n")
++    with pytest.raises(ValueError) as error:
++        pools.root_settings()
++    assert str(error.value) == reason
++
++
++def test_capacity_receipt_without_origin_invalidates_origin_census(board):
++    conn, home = board
++    configure(home, limit=None)
++    tid = task(conn)
++    kb.edit_task(conn, tid, admission_class="capacity", admission_frees="frees: worker slots")
++    assert kb.claim_task(conn, tid)
++    with kb.write_txn(conn):
++        conn.execute("UPDATE task_runs SET admission_origin=NULL WHERE task_id=?", (tid,))
++    assert mm.active_card_runs(detail={"pools": {"regular": 0, "priority": 0}, "capacity_origins": {}}) is None
++    # Callers that do not count origins (dispatch budget, telemetry) still read the census.
++    assert mm.active_card_runs(detail={"pools": {"regular": 0, "priority": 0}}) == 1
++
++
++def test_dispatch_budget_keeps_legacy_scalar_when_cpu_policy_is_off(board):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    conn, home = board
++    configure(home, cap=7, limit=None)
++    for index in range(7):
++        assert kb.claim_task(conn, task(conn, title=f"regular {index}"))
++
++    def budget():
++        return dispatch._tick_spawn_budget(conn, dispatch.DispatchResult(), max_spawn=None,
++                                           max_in_progress=7, board=None)
++
++    legacy = budget()
++    with (home / "config.yaml").open("a") as config:
++        config.write("  admission:\n    priority_slots: 3\n")
++    assert pools.root_settings()[0] == 3
++    assert budget() == legacy
++
++
++def test_dispatch_budget_unknown_census_spawns_nothing(board, monkeypatch):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    conn, home = board
++    enable(home)
++    monkeypatch.setattr(mm, "active_card_runs", lambda **kw: None)
++    assert dispatch._tick_spawn_budget(conn, dispatch.DispatchResult(), max_spawn=None,
++                                       max_in_progress=7, board=None) == (False, None)
++
++
++@pytest.mark.parametrize("review", [False, True])
++def test_normal_card_keeps_regular_advisory_ceiling_on_opted_in_hub(board, monkeypatch, review):
++    conn, home = board
++    enable(home)
++    advisory(home, pct=70)
++    no_lease_or_sample(monkeypatch)
++    t = task(conn, review)
++    assert helpers.claim(conn, t, review) is None
++    helpers.refused(conn, t, review, "hub_cpu_at_or_above_limit")
++
++
++@pytest.mark.parametrize("review", [False, True])
++def test_invalid_pool_policy_defers_at_advisory_before_lease(board, monkeypatch, review):
++    conn, home = board
++    configure(home, cap=7)
++    with (home / "config.yaml").open("a") as config:
++        config.write("    priority_slots: wrong\n")
++    advisory(home)
++    no_lease_or_sample(monkeypatch)
++    t = task(conn, review)
++    assert helpers.claim(conn, t, review) is None
++    helpers.refused(conn, t, review, "hub_cpu_unknown")
++
++
++@pytest.mark.parametrize("review", [False, True])
++def test_pool_census_error_at_final_gate_refuses_instead_of_scalar_admit(board, monkeypatch, review):
++    conn, home = board
++    enable(home)
++    advisory(home)
++    monkeypatch.setattr(cm, "sample", fake_sample(10))
++
++    def broken(*a, **k):
++        raise ValueError("unknown admission pool receipt")
++    monkeypatch.setattr(pools, "candidate_pool", broken)
++    t = task(conn, review)
++    assert helpers.claim(conn, t, review) is None
++    helpers.refused(conn, t, review, "hub_capacity_full")
++
++
++def test_candidate_pool_unknown_census_selects_no_pool(board, monkeypatch):
++    conn, home = board
++    enable(home)
++    tid = task(conn)
++    kb.edit_task(conn, tid, admission_class="urgent")
++    monkeypatch.setattr(mm, "active_card_runs", lambda **kw: None)
++    pool, ceiling, _detail = pools.candidate_pool(conn, tid, 7)
++    assert (pool, ceiling) == (None, 85)
++
++
++def test_pool_change_during_sample_rechecks_cpu_against_new_pool(board, monkeypatch):
++    conn, home = board
++    configure(home, limit=None)
++    for index in range(6):
++        assert kb.claim_task(conn, task(conn, title=f"regular {index}"))
++    folder = kb.boards_root() / "late"
++    folder.mkdir(parents=True)
++    (folder / "board.json").write_text("{}")
++    late = folder / "kanban.db"
++    with closing(kbc.connect(late)) as other:
++        for index in range(3):
++            assert kb.claim_task(other, task(other, title=f"late {index}"))
++        with kb.write_txn(other):
++            other.execute("UPDATE task_runs SET admission_pool='priority', admission_class='urgent'")
++            other.execute("UPDATE tasks SET status='blocked'")
++    enable(home)
++    advisory(home, pct=70)
++    calls = []
++
++    def fill_priority_pool():
++        # Another board's three priority runs become live while this claim samples: the recount moves the
++        # candidate from the priority pool (85%) to the last regular slot (50%), where 70% must refuse.
++        with closing(kbc.connect(late)) as other, kb.write_txn(other):
++            other.execute("UPDATE tasks SET status='running'")
++    monkeypatch.setattr(cm, "sample", fake_sample(70, calls=calls, check=fill_priority_pool))
++    candidate = task(conn, title="incident")
++    kb.edit_task(conn, candidate, admission_class="urgent")
++    assert kb.claim_task(conn, candidate) is None
++    assert len(calls) == 1
++    assert kb.get_task(conn, candidate).status == "ready"
++    assert sync.pop_claim_deferral(candidate) == "hub_cpu_at_or_above_limit"
++    assert conn.execute("SELECT count(*) FROM task_runs WHERE task_id=?", (candidate,)).fetchone()[0] == 0
+diff --git a/tests/hermes_cli/test_machine_admission_metrics.py b/tests/hermes_cli/test_machine_admission_metrics.py
+index cfcddcdf31..9387574db4 100644
+--- a/tests/hermes_cli/test_machine_admission_metrics.py
++++ b/tests/hermes_cli/test_machine_admission_metrics.py
+@@ -72,7 +72,7 @@ def test_reporter_rechecks_policy_after_cpu_sample(monkeypatch, changed):
+ 
+ 
+ @pytest.mark.parametrize("doc", [None, [], {}, {"kanban": []}, {"kanban": {"admission": []}},
+-    *({"kanban": {"max_in_progress": cap, "admission": POLICY["kanban"]["admission"]}} for cap in [True, -1, 257]),
++    *({"kanban": {"max_in_progress": cap, "admission": POLICY["kanban"]["admission"]}} for cap in [True, -1, 0, 257]),
+     *({"kanban": {"max_in_progress": 7, "admission": {**POLICY["kanban"]["admission"], key: value}}}
+       for key, value in [("cpu_busy_below_pct", None), ("priority_slots", 0), ("priority_slots", True),
+                          ("priority_slots", 257), ("priority_cpu_busy_below_pct", 101)])])
+-- 
+2.51.0
+

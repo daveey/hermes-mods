@@ -1,0 +1,323 @@
+From 5e308b9182b0915ad12a6b04374af89726219e84 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:51:57 +0000
+Subject: [PATCH] [daveey] kanban: every CLI write the stopped Board sync keeps
+ local says so; public runstate.when; shared create-note anchors
+
+Follow-up to PR #2033's exact-head review (GitHub review 5888858852, card t_01a1d43d66656ca7): three
+non-blocking nits.
+
+1. CLI parity. While this gateway's Board sync is stopped, `kanban archive`, `reopen`, `reopen-review`,
+   `request-review`, `request-changes` and `unlink` printed no "Queued locally: ..." notice, though the
+   matching tools (kanban_archive, kanban_request_review, ...) return `board_delivery: queued_local`.
+   archive and reopen-review now pass `conn=` to `_bulk_apply`; reopen, request-review and request-changes
+   print `kanban_board_delivery.cli_lines` through a small `_print_queued_local(conn)`; unlink prints it only
+   when a link was actually removed (no write, no notice). `archive --rm` (purge) is left without it.
+2. `kanban_board_delivery.queued_local` called the private `kanban_sync_runstate._when`; it is now the
+   public `kanban_sync_runstate.when` (no other callers of the old name).
+3. `_chat_link_queued` (tools/kanban_tools_board_delivery.py) rewrote the placed kanban_create note with
+   `.replace` on literals tools/kanban_tools.py spelled out separately, so rewording the note there made the
+   rewrite silently do nothing. Both fragments are now `CHAT_TASKS_SHOWS` / `CHAT_TASKS_QUEUED` in
+   kanban_tools_board_delivery, read by kanban_tools at call time when it builds the note.
+
+Proof (tests/tools/test_kanban_board_delivery.py, stopped state from the real SchemaAhead `run_forever`):
+- RED at origin/main source with the new tests: 8 failed, 22 passed
+  (test_cli_write_while_stopped_prints_the_notice_once[archive|reopen|reopen_review|request_review|
+  request_changes|unlink], test_create_note_wording_and_its_stopped_sync_rewrite_share_one_source[created|queued]).
+- GREEN: 30 passed. Controls: the same six CLI writes with the sync running print no notice; an unlink of a
+  missing link while stopped prints none.
+- scripts/check --base origin/main: 19 checks ok.
+---
+ hermes_cli/kanban.py                      |  20 ++++-
+ hermes_cli/kanban_board_delivery.py       |   2 +-
+ hermes_cli/kanban_sync_runstate.py        |   5 +-
+ tests/tools/test_kanban_board_delivery.py | 101 ++++++++++++++++++++++
+ tools/kanban_tools.py                     |   5 +-
+ tools/kanban_tools_board_delivery.py      |   8 +-
+ 6 files changed, 129 insertions(+), 12 deletions(-)
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 0a1d934d16..8967cb1aad 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1023,8 +1023,10 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
+         return _err(f"unlink refused: worker {env_tid} may only unlink its own card's edges; use kanban_supervisor_request")
+     with kbc.connect_closing() as conn:
+         ok = kb.unlink_tasks(conn, args.parent_id, args.child_id)
++        from hermes_cli.kanban_board_delivery import cli_lines
++        queued = cli_lines(conn) if ok else []  # [daveey] the stopped Board sync keeps it here
+     return _ok_or_err(ok, f"No such link: {args.parent_id} -> {args.child_id}",
+-                      f"Unlinked {args.parent_id} -> {args.child_id}")
++                      "\n".join([f"Unlinked {args.parent_id} -> {args.child_id}", *queued]))
+ 
+ 
+ def _cmd_supervisor_requests(args: argparse.Namespace) -> int:
+@@ -1384,7 +1386,8 @@ def _cmd_reopen(args: argparse.Namespace) -> int:
+             current = kb.get_task(conn, args.task_id)
+             what = "unknown id" if current is None else f"status is {current.status!r}, not 'done'"
+             return _err(f"cannot reopen {args.task_id} ({what}); use unblock/reopen-review for other states")
+-    print(f"Reopened {args.task_id} -> {status}")
++        print(f"Reopened {args.task_id} -> {status}")
++        _print_queued_local(conn)
+     return 0
+ 
+ 
+@@ -1526,6 +1529,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
+         persisted_run = kb.latest_run(conn, tid)
+         display_summary = persisted_run.summary if persisted_run else None
+         print(f"Requested review for {tid}" + (f": {display_summary}" if display_summary else ""))
++        _print_queued_local(conn)
+     return 0
+ 
+ 
+@@ -1537,9 +1541,17 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
+         if not ok:
+             return _err(f"cannot request changes for {tid}: {detail or 'invalid review state'}")
+         print(f"Requested changes for {tid}" + (f"; routed to {detail}" if detail else ""))
++        _print_queued_local(conn)
+     return 0
+ 
+ 
++def _print_queued_local(conn) -> None:
++    """[daveey] A write the stopped Board sync keeps local says so (``kanban_board_delivery``)."""
++    from hermes_cli.kanban_board_delivery import cli_lines
++    for line in cli_lines(conn):
++        print(line)
++
++
+ def _cmd_reopen_review(args: argparse.Namespace) -> int:
+     ids, rc = _require_ids(args)
+     if rc:
+@@ -1558,7 +1570,7 @@ def _cmd_reopen_review(args: argparse.Namespace) -> int:
+             return True
+ 
+         return _bulk_apply(ids, op, lambda tid: f"Reopened {tid}{suffix}",
+-                           lambda tid: f"cannot reopen {tid} (not in review?)")
++                           lambda tid: f"cannot reopen {tid} (not in review?)", conn=conn)
+ 
+ 
+ def _cmd_promote(args: argparse.Namespace) -> int:
+@@ -1634,7 +1646,7 @@ def _cmd_archive(args: argparse.Namespace) -> int:
+                         f"was sent and {out['holder']} archives it at its next dispatcher tick")
+             return f"Archived {tid}"
+ 
+-        return _bulk_apply(ids, _one, _ok_line, lambda tid: refusals.get(tid) or f"cannot archive {tid}")
++        return _bulk_apply(ids, _one, _ok_line, lambda tid: refusals.get(tid) or f"cannot archive {tid}", conn=conn)
+ 
+ 
+ def _host_lock_holders() -> dict:
+diff --git a/hermes_cli/kanban_board_delivery.py b/hermes_cli/kanban_board_delivery.py
+index c42e45256c..cb27e3641b 100644
+--- a/hermes_cli/kanban_board_delivery.py
++++ b/hermes_cli/kanban_board_delivery.py
+@@ -63,7 +63,7 @@ def queued_local(conn: sqlite3.Connection, task_id: Optional[str] = None) -> Opt
+     out: dict[str, Any] = {
+         "board_delivery": QUEUED_LOCAL,
+         "board_sync": (f"queued locally: this gateway's Board sync has been stopped since "
+-                       f"{runstate._when(record.get('since'))} ({record.get('reason') or 'unknown reason'}); "
++                       f"{runstate.when(record.get('since'))} ({record.get('reason') or 'unknown reason'}); "
+                        "other hosts and remote runs won't see this until it recovers"),
+     }
+     runner = remote_runner(conn, task_id) if task_id else None
+diff --git a/hermes_cli/kanban_sync_runstate.py b/hermes_cli/kanban_sync_runstate.py
+index 41e691fc2b..6b2fe9831e 100644
+--- a/hermes_cli/kanban_sync_runstate.py
++++ b/hermes_cli/kanban_sync_runstate.py
+@@ -102,7 +102,8 @@ def down() -> Optional[dict[str, Any]]:
+     return record
+ 
+ 
+-def _when(since: Any) -> str:
++def when(since: Any) -> str:
++    """A down record's ``since`` (epoch seconds) as local time, or ``"an unknown time"``. [daveey]"""
+     try:
+         return time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(float(since)))
+     except (TypeError, ValueError, OverflowError):
+@@ -114,7 +115,7 @@ def describe(record: Optional[dict[str, Any]] = None) -> str:
+     record = down() if record is None else record
+     if not record:
+         return ""
+-    return f"kanban sync not running since {_when(record.get('since'))}: {record.get('reason') or 'unknown reason'}"
++    return f"kanban sync not running since {when(record.get('since'))}: {record.get('reason') or 'unknown reason'}"
+ 
+ 
+ def placement_runs_on(conn: Any, placement: Any) -> Optional[list[str]]:
+diff --git a/tests/tools/test_kanban_board_delivery.py b/tests/tools/test_kanban_board_delivery.py
+index eae93bb371..669738d963 100644
+--- a/tests/tools/test_kanban_board_delivery.py
++++ b/tests/tools/test_kanban_board_delivery.py
+@@ -10,6 +10,7 @@ newer core migrated (this process declares an older core's columns) and records
+ """
+ from __future__ import annotations
+ 
++import argparse
+ import json
+ import time
+ 
+@@ -209,6 +210,89 @@ def test_cli_unblock_while_stopped_prints_the_notice_once(home, monkeypatch, cap
+     assert "Queued locally:" not in capsys.readouterr().out
+ 
+ 
++def _in_review(conn) -> str:
++    tid = kb.create_task(conn, title="needs review", assignee="default")
++    assert kb.claim_task(conn, tid) is not None
++    run = kb.latest_run(conn, tid)
++    assert run is not None and kb.request_review(conn, tid, expected_run_id=run.id)
++    return tid
++
++
++def _cli_archive(conn):
++    tid = kb.create_task(conn, title="drop me", assignee="default")
++    return "_cmd_archive", argparse.Namespace(task_ids=[tid], purge_ids=None), f"Archived {tid}"
++
++
++def _cli_reopen(conn):
++    tid = kb.create_task(conn, title="done too soon", assignee="default")
++    assert kb.complete_task(conn, tid, summary="first pass")
++    return "_cmd_reopen", argparse.Namespace(task_id=tid, reason="missed a case"), f"Reopened {tid}"
++
++
++def _cli_reopen_review(conn):
++    tid = _in_review(conn)
++    return "_cmd_reopen_review", argparse.Namespace(task_ids=[tid], reason=None), f"Reopened {tid}"
++
++
++def _cli_request_review(conn):
++    tid = kb.create_task(conn, title="implemented", assignee="default")
++    assert kb.claim_task(conn, tid) is not None
++    return ("_cmd_request_review", argparse.Namespace(task_id=tid, summary="tests pass", metadata=None,
++                                                      reviewer=None, force=True), f"Requested review for {tid}")
++
++
++def _cli_request_changes(conn):
++    tid = _in_review(conn)
++    assert kb.claim_review_task(conn, tid) is not None
++    return ("_cmd_request_changes", argparse.Namespace(task_id=tid, reason=["fix", "the", "nit"]),
++            f"Requested changes for {tid}")
++
++
++def _cli_unlink(conn):
++    parent = kb.create_task(conn, title="parent", assignee="default")
++    child = kb.create_task(conn, title="child", assignee="default")
++    kb.link_tasks(conn, parent, child)
++    return "_cmd_unlink", argparse.Namespace(parent_id=parent, child_id=child), f"Unlinked {parent} -> {child}"
++
++
++CLI_WRITES = [_cli_archive, _cli_reopen, _cli_reopen_review, _cli_request_review, _cli_request_changes, _cli_unlink]
++
++
++@pytest.mark.parametrize("setup", CLI_WRITES, ids=lambda f: f.__name__[5:])
++def test_cli_write_while_stopped_prints_the_notice_once(home, monkeypatch, capsys, setup):
++    """CLI parity with the tools (review 5888858852): every CLI write the stopped sync keeps local says so."""
++    from hermes_cli import kanban as kcli
++    path, conn = home
++    command, args, done = setup(conn)
++    _give_up_the_sync_role(path, monkeypatch)
++    assert getattr(kcli, command)(args) == 0
++    printed = capsys.readouterr().out
++    assert done in printed, printed
++    assert printed.count("Queued locally: this gateway's Board sync has been stopped since ") == 1, printed
++    assert "gave up the sync role" in printed
++
++
++@pytest.mark.parametrize("setup", CLI_WRITES, ids=lambda f: f.__name__[5:])
++def test_cli_write_while_the_sync_runs_prints_no_notice(home, capsys, setup):
++    from hermes_cli import kanban as kcli
++    _path, conn = home
++    command, args, done = setup(conn)
++    assert getattr(kcli, command)(args) == 0
++    printed = capsys.readouterr().out
++    assert done in printed and "Queued locally" not in printed, printed
++
++
++def test_cli_unlink_of_no_link_while_stopped_prints_no_notice(home, monkeypatch, capsys):
++    """Nothing was written, so nothing is queued."""
++    from hermes_cli import kanban as kcli
++    path, conn = home
++    parent = kb.create_task(conn, title="parent", assignee="default")
++    child = kb.create_task(conn, title="child", assignee="default")
++    _give_up_the_sync_role(path, monkeypatch)
++    assert kcli._cmd_unlink(argparse.Namespace(parent_id=parent, child_id=child)) == 1
++    assert "Queued locally" not in capsys.readouterr().out
++
++
+ def test_reads_and_refusals_while_stopped_are_unchanged(home, monkeypatch):
+     path, conn = home
+     tid = _remote_running(conn)
+@@ -263,6 +347,23 @@ def test_create_queued_on_a_target_while_stopped_says_the_chat_link_waits(home,
+     assert "(this chat's tasks once this gateway's Board sync recovers, " in out["note"]
+ 
+ 
++@pytest.mark.parametrize("task_id", ["t_01a1d42acdce8e23", None], ids=["created", "queued"])
++def test_create_note_wording_and_its_stopped_sync_rewrite_share_one_source(home, monkeypatch, task_id):
++    """Review 5888858852: the rewrite anchored on literals kanban_tools also spelled out, so rewording the note
++    there made it silently do nothing. Reworded at the one source, the rewrite still lands."""
++    from tools import kanban_tools_board_delivery as kbd
++    monkeypatch.setattr(kbd, "CHAT_TASKS_SHOWS", " and is listed under this chat")
++    monkeypatch.setattr(kbd, "CHAT_TASKS_QUEUED", "(listed under this chat, ")
++    path, _conn = home
++    _give_up_the_sync_role(path, monkeypatch)
++    out = _place_on_worker(path, monkeypatch, task_id=task_id)
++    assert out["chat_link"] == "queued_local", out
++    later = "once this gateway's Board sync recovers"
++    expected = (f" and is listed under this chat {later}." if task_id else f"(listed under this chat {later}, ")
++    assert expected in out["note"], out["note"]
++    assert "this chat's tasks" not in out["note"]
++
++
+ def test_create_placed_elsewhere_while_the_sync_runs_is_unchanged(home, monkeypatch):
+     path, _conn = home
+     out = _place_on_worker(path, monkeypatch, task_id="t_01a1d42acdce8e23")
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 2f19d8724a..ed7e526ff4 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1516,8 +1516,9 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+                  "the same card. " if placed.get("retry") else "")
+         fields = {"placed": {"gateway": target, "request_id": rid, "task_id": tid, "origin_session": session_id,
+                              "queued_only": bool(placed.get("queued_only")), "retry": bool(placed.get("retry"))}}
++        from tools import kanban_tools_board_delivery as kbd_words  # [daveey] the stopped-sync rewrite's anchors
+         if tid:
+-            shows = " and shows in this chat's tasks" if session_id else ""
++            shows = kbd_words.CHAT_TASKS_SHOWS if session_id else ""
+             note = (f"{retry}Created on {target} as {tid}, not here: {decision['why']} (kanban.placement). It runs "
+                     f"there{shows}. Read it with cross_task @task:default@{target}/{tid} or "
+                     f"`hermes-hub tasks --gw {target}`.")
+@@ -1529,7 +1530,7 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+                 f"card from it (it runs there, not here: {decision['why']}). Do NOT call kanban_create again "
+                 "for this card: an identical call returns this same request. Changed calls with an explicit "
+                 f"creation key are refused; without one they may duplicate. Its task id appears when {target} applies it "
+-                + ("(this chat's tasks, " if session_id else "(")
++                + (kbd_words.CHAT_TASKS_QUEUED if session_id else "(")
+                 + "`hermes-hub requests`).")
+         return _ok(task_id=None, status="queued", **fields, runs_where=target, note=note), None
+     except Exception as exc:
+diff --git a/tools/kanban_tools_board_delivery.py b/tools/kanban_tools_board_delivery.py
+index 3019c58e59..401ece04ab 100644
+--- a/tools/kanban_tools_board_delivery.py
++++ b/tools/kanban_tools_board_delivery.py
+@@ -17,8 +17,9 @@ BOARD_WRITE_TOOLS = frozenset({
+ # A create placed on another gateway for this chat: the card is made there, but this chat's link row reaches the
+ # Board only through this gateway's sync (01:09 PT: four cards placed on workers said "shows in this chat's tasks";
+ # the Board had no task_chat_links row for any of them).
+-_SHOWS = " and shows in this chat's tasks"
+-_SHOWS_QUEUED = "(this chat's tasks, "
++# kanban_tools builds its placed-create notes from these two fragments, so the rewrite below always finds them.
++CHAT_TASKS_SHOWS = " and shows in this chat's tasks"
++CHAT_TASKS_QUEUED = "(this chat's tasks, "
+ _LATER = " once this gateway's Board sync recovers"
+ 
+ 
+@@ -31,7 +32,8 @@ def _chat_link_queued(payload: dict, board_sync: str) -> None:
+     """The placed create's card exists on the target; only its link to this chat waits in the outbox."""
+     from hermes_cli.kanban_board_delivery import QUEUED_LOCAL
+     text = str(payload.get("note") or "")
+-    text = text.replace(_SHOWS, _SHOWS + _LATER, 1).replace(_SHOWS_QUEUED, "(this chat's tasks" + _LATER + ", ", 1)
++    text = text.replace(CHAT_TASKS_SHOWS, CHAT_TASKS_SHOWS + _LATER, 1).replace(
++        CHAT_TASKS_QUEUED, CHAT_TASKS_QUEUED.rstrip(", ") + _LATER + ", ", 1)
+     payload["note"] = f"{text} This chat's link to the card is {board_sync}."
+     payload["chat_link"] = QUEUED_LOCAL
+     payload["board_sync"] = board_sync
+-- 
+2.51.0
+

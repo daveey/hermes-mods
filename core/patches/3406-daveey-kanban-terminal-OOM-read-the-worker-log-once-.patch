@@ -1,0 +1,213 @@
+From afb3c812fe9fc42895e5a88cf7a82ab73dcb0e96 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:44:20 +0000
+Subject: [PATCH] [daveey] kanban/terminal OOM: read the worker log once on
+ reclaim; own-scope note keys firm wording on kill exits
+
+Follow-up to PR #2047's review (5888845043, non-blocking nits; card t_01a1d44191cc3cba).
+
+1. `_classify_dead_worker` already reads the whole worker log, but with no
+   authority rc and a reap-registry miss `_classify_dead_worker_exit` called
+   `_worker_log_exit_code`, which read the whole log a second time inside the
+   reclaim write txn. Both helpers now take an optional `log=` (None keeps the
+   old self-read), and the reclaim passes the log it holds.
+   Test: test_failure_path_reads_the_worker_log_once.
+
+2. `OomWatch._own_scope_note` gave the firm "killed by the OOM killer" wording
+   to every non-zero rc, so `cmd | grep` exiting 1 after a pipeline member was
+   killed read as the command dying. It now splits like the run-scope path:
+   firm wording for SIGKILL (137/-9) and for the SIGTERM (143/-15) systemd sends
+   when the survivable scope's default OOMPolicy=stop stops it (the existing
+   -15 test keeps its wording); any other rc gets "a pipeline may hide its exit
+   status". Tests: test_survivable_non_kill_exit_gets_the_pipeline_wording,
+   test_survivable_kill_exit_keeps_the_firm_wording.
+
+3. Docstrings (OomWatch, _own_scope_note): every survivable foreground command
+   that finishes, rc 0 included, pays one `journalctl -k` read bounded by
+   `since`; a run-scope command reads it only when oom_kill rose.
+
+RED (fix reverted, tests kept): 4 failed (log read twice; rc 1/2/-2 got the
+firm wording). GREEN: 17 test files importing the changed code, 243 passed.
+---
+ hermes_cli/kanban_db_dispatch.py              | 16 ++++++-------
+ .../test_kanban_oom_policy_continue.py        | 17 ++++++++++++++
+ tests/tools/test_terminal_oom.py              | 22 ++++++++++++++++++
+ tools/terminal_oom.py                         | 23 +++++++++++++------
+ 4 files changed, 63 insertions(+), 15 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 0341abadc4..6ab7051e0b 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -330,16 +330,16 @@ _EXIT_TRAILER_RE = re.compile(
+ )
+ 
+ 
+-def _worker_log_exit_code(task_id: str, board: Optional[str] = None, *, run_id=None) -> Optional[int]:
++def _worker_log_exit_code(task_id: str, board: Optional[str] = None, *, run_id=None, log: Optional[str] = None) -> Optional[int]:
+     """Exit code from the trailer the worker CLI wrote to its own log; None when absent.
+ 
+     The durable twin of ``_recent_worker_exits``: written by the worker itself
+     (``hermes_cli.quiet_single_query.exit_single_query``), so it is there whether
+     or not the process running this sweep ever reaped the worker. Last trailer
+-    wins — the log is append-mode across re-runs.
++    wins — the log is append-mode across re-runs. ``log``: the whole log a caller holds (not re-read).
+     """
+     try:
+-        raw = _kb.read_worker_log(task_id, tail_bytes=None if run_id is not None else 4000, board=board)
++        raw = log if log is not None else _kb.read_worker_log(task_id, tail_bytes=None if run_id is not None else 4000, board=board)
+     except Exception:
+         return None
+     # A log with no run marker predates it (worker spawned before the deploy): last trailer wins, as before.
+@@ -1178,8 +1178,8 @@ def _classify_dead_worker(
+     in the event payload, appended to the error text) so the board and the retry
+     worker see WHY instead of a bare label; a rate-limited requeue does not need it.
+     """
+-    log = _kb.read_worker_log(task_id, tail_bytes=None, board=board) if task_id and run_id else ""
+-    exited = _classify_dead_worker_exit(pid, claimer, exit_code, task_id=task_id, board=board, run_id=run_id)
++    log = (_kb.read_worker_log(task_id, tail_bytes=None, board=board) or "") if task_id and run_id else None
++    exited = _classify_dead_worker_exit(pid, claimer, exit_code, task_id=task_id, board=board, run_id=run_id, log=log)
+     failure = _worker_scope.read_failure(task_id, run_id, log or "", pid=pid, started_at=_worker_scope.run_started_at(conn, run_id),
+                                          exit_code=0 if exited.kind == "clean_exit" else None) if task_id else None  # rc 0 skips the kernel log
+     if failure:
+@@ -1206,7 +1206,7 @@ def _classify_dead_worker(
+ 
+ def _classify_dead_worker_exit(
+     pid: int, claimer: Optional[str], exit_code=None, *, task_id: Optional[str] = None,
+-    board: Optional[str] = None, run_id: Optional[int] = None,
++    board: Optional[str] = None, run_id: Optional[int] = None, log: Optional[str] = None,
+ ) -> _DeadWorker:
+     """Exit status -> reclaim bookkeeping, before the worker's own words are folded in.
+ 
+@@ -1215,13 +1215,13 @@ def _classify_dead_worker_exit(
+     registry only knows children of THIS process; a per-tick dispatcher reads the exit trailer
+     the worker left in its log instead, so the same death gets the same booking (protocol
+     violation / rate-limit requeue / crash) as under the gateway-embedded dispatcher. A worker
+-    that never reached its exit epilogue (killed, OOM) leaves no trailer and stays a plain crash.
++    that never reached its exit epilogue (killed, OOM) leaves no trailer and stays a plain crash. ``log``: as held by the caller.
+     """
+     kind, code = _classify_worker_exit(pid)
+     if exit_code is not None:
+         kind, code = _exit_code_kind(int(exit_code))
+     elif kind == "unknown" and task_id:
+-        logged = _worker_log_exit_code(task_id, board=board, run_id=run_id)
++        logged = _worker_log_exit_code(task_id, board=board, run_id=run_id, log=log)
+         if logged is not None:
+             kind, code = _exit_code_kind(logged)
+     if kind == "clean_exit":
+diff --git a/tests/hermes_cli/test_kanban_oom_policy_continue.py b/tests/hermes_cli/test_kanban_oom_policy_continue.py
+index cc83df17d3..4318c57431 100644
+--- a/tests/hermes_cli/test_kanban_oom_policy_continue.py
++++ b/tests/hermes_cli/test_kanban_oom_policy_continue.py
+@@ -254,6 +254,23 @@ def test_classify_dead_worker_passes_the_run_start(monkeypatch):
+     assert seen == {"pid": 4242, "started_at": 1794550650, "exit_code": None}
+ 
+ 
++def test_failure_path_reads_the_worker_log_once(monkeypatch):
++    """No authority rc and a reap-registry miss: the exit trailer comes from the log already read."""
++    from hermes_cli import kanban_db_dispatch as kbd
++    reads = []
++    monkeypatch.setattr(kbd._kb, "read_worker_log", lambda *a, **kw: reads.append(kw) or "no trailer\n")
++    monkeypatch.setattr(kbd, "_recent_worker_exits", {})
++    monkeypatch.setattr(kbd._worker_scope, "read_failure",
++                        lambda *a, **kw: {"systemd_unit": UNIT, "scope_result": "oom-kill",
++                                          "memory_max_bytes": None, "memory_peak_bytes": None})
++    monkeypatch.setattr(kbd._worker_scope, "note_oom_kill", lambda *a, **kw: None)
++    monkeypatch.setattr(kbd, "crash_worker_output", lambda *a, **kw: "")
++    assert kbd._classify_dead_worker(4242, "h:1", task_id="t_x", run_id=5).kind == "oom_killed"
++    assert len(reads) == 1
++    assert kbd._worker_log_exit_code("t_x", run_id=5, log="x\n" + kbd.KANBAN_WORKER_EXIT_TRAILER + "3\n") == 3
++    assert len(reads) == 1  # a caller-held log is never re-read
++
++
+ def test_clean_exit_never_reads_the_kernel_log(monkeypatch):
+     """rc 0: the worker outlived any kill, so no journalctl runs inside the reclaim write txn."""
+     seen = _journal_argv(monkeypatch, props="LoadState=loaded\nResult=success\n")
+diff --git a/tests/tools/test_terminal_oom.py b/tests/tools/test_terminal_oom.py
+index 352cf83407..1431998c97 100644
+--- a/tests/tools/test_terminal_oom.py
++++ b/tests/tools/test_terminal_oom.py
+@@ -105,6 +105,28 @@ def test_survivable_command_masking_its_own_oom_kill_is_still_named(tmp_path, mo
+     assert watch.note(None) is None and len(kernel.calls) == 1  # no exit status: nothing is read
+ 
+ 
++@pytest.mark.parametrize("rc", [1, 2, -2])
++def test_survivable_non_kill_exit_gets_the_pipeline_wording(tmp_path, monkeypatch, kernel, rc):
++    """``cmd | grep`` exiting 1 after the kill is no proof the command died: same split as the run scope."""
++    _scope(tmp_path, monkeypatch)
++    unit = "hermes-worker-proc_ef56.scope"
++    watch = terminal_oom.OomWatch(SimpleNamespace(session=SimpleNamespace(systemd_unit=unit)))
++    kernel.records[unit] = {"pid": 79, "task": "sort", "limit_bytes": 268435456}
++    note = watch.note(rc) or ""
++    assert note.startswith("a process was killed by the OOM killer at its scope's memory cap (256 MiB; ")
++    assert "a pipeline may hide its exit status" in note
++
++
++@pytest.mark.parametrize("rc", [137, -9, 143, -15])
++def test_survivable_kill_exit_keeps_the_firm_wording(tmp_path, monkeypatch, kernel, rc):
++    """SIGKILL, or the SIGTERM systemd sends when OOMPolicy=stop stops the scope."""
++    _scope(tmp_path, monkeypatch)
++    unit = "hermes-worker-proc_ef57.scope"
++    watch = terminal_oom.OomWatch(SimpleNamespace(session=SimpleNamespace(systemd_unit=unit)))
++    kernel.records[unit] = {"pid": 80, "task": "cc1plus", "limit_bytes": 268435456}
++    assert (watch.note(rc) or "").startswith("killed by the OOM killer at its scope's memory cap (256 MiB; ")
++
++
+ def test_sigkill_without_an_oom_kill_keeps_the_generic_note(tmp_path, monkeypatch, kernel):
+     _scope(tmp_path, monkeypatch, oom_kill=2)
+     watch = terminal_oom.OomWatch()
+diff --git a/tools/terminal_oom.py b/tools/terminal_oom.py
+index dbe8d5a806..d458537656 100644
+--- a/tools/terminal_oom.py
++++ b/tools/terminal_oom.py
+@@ -18,6 +18,9 @@ _SCOPE_PREFIX = "hermes-worker-kanban-"
+ _CGROUP_ROOT = Path("/sys/fs/cgroup")
+ _PROC_CGROUP = Path("/proc/self/cgroup")
+ _SIGKILL_EXITS = {137, -9}
++# A survivable command's own scope keeps systemd's default OOMPolicy=stop (process_registry): after
++# an OOM kill there, systemd stops the scope with SIGTERM, so the command exits 143 / -15.
++_SCOPE_STOP_EXITS = {143, -15}
+ 
+ 
+ def run_scope_cgroup() -> Optional[Path]:
+@@ -88,6 +91,9 @@ class OomWatch:
+     command was killed only when the victim is not a process that was already running when
+     the command started; otherwise it names the victim and says no more. A ``survivable``
+     foreground command runs in its own transient scope, where any victim is the command's.
++    Cost: every survivable foreground command that finishes, rc 0 included, pays one
++    ``journalctl -k`` read bounded by ``since``; a run-scope command reads it only when the
++    scope's ``oom_kill`` count rose.
+     Attribution is approximate: membership is judged against the ``cgroup.procs`` snapshot taken
+     at the start, and the kernel lookup returns only the window's last victim, so a pid reused
+     during the command or a second kill in the same window can be misattributed.
+@@ -128,9 +134,12 @@ class OomWatch:
+     def _own_scope_note(self, returncode) -> Optional[str]:
+         """A survivable command's own scope holds only it: any OOM victim there is the command's.
+ 
+-        Its scope is collected on exit, so no ``oom_kill`` count is left to compare: the kernel
+-        log is read for every finished command, rc 0 included, where a pipeline can mask the
+-        kill exactly as in the run scope.
++        Its scope is collected on exit, so no ``oom_kill`` count is left to compare: every
++        survivable foreground command that finishes, rc 0 included, pays one ``journalctl -k``
++        read, bounded by ``since`` (the command's start). As in the run scope, only a kill exit
++        gets the firm wording: SIGKILL, or SIGTERM from systemd stopping the scope under its
++        default ``OOMPolicy=stop``. Any other rc (0, or a ``cmd | grep`` exiting 1) may be a
++        pipeline hiding the victim's exit status.
+         """
+         session = getattr(self.survivable, "session", None)
+         unit = getattr(session, "systemd_unit", None)
+@@ -140,7 +149,7 @@ class OomWatch:
+         if victim is None:
+             return None
+         cap = f"{_size(victim.get('limit_bytes'))}; kernel victim: {victim['task']} pid {victim['pid']}"
+-        if returncode == 0:
+-            return (f"a process was killed by the OOM killer at its scope's memory cap ({cap}) while this "
+-                    f"command ran (a pipeline may hide its exit status); {_ADVICE}")
+-        return f"killed by the OOM killer at its scope's memory cap ({cap}); {_ADVICE}"
++        if returncode in _SIGKILL_EXITS | _SCOPE_STOP_EXITS:
++            return f"killed by the OOM killer at its scope's memory cap ({cap}); {_ADVICE}"
++        return (f"a process was killed by the OOM killer at its scope's memory cap ({cap}) while this "
++                f"command ran (a pipeline may hide its exit status); {_ADVICE}")
+-- 
+2.51.0
+

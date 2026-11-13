@@ -1,0 +1,126 @@
+From 39a584b233518a4191cdefbf5f5d8d93ab1cd2ad Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 17:11:03 +0000
+Subject: [PATCH] fix(kanban-sync): bound the root lease's 2 s claim retry;
+ call sampler.wait_fresh directly [daveey]
+
+PR #1519 review nits (t_01a1d0a70b1ff42d):
+
+- A root lease with its claim posted retried every ROOT_CLAIM_RETRY_SECONDS
+  (2 s) for as long as the lock stayed contended. Against a holder that never
+  yields (another root gateway, a wedged profile gateway) that meant a retry
+  and a root-claim JSON rewrite every 2 s without bound, where the pre-#1519
+  code retried every 30 s. The fast retry now lasts
+  ROOT_CLAIM_FAST_RETRY_WINDOW_SECONDS (30 s) of one contention episode, then
+  falls back to retry_seconds. A profile holder yields within ~5 s
+  (should_yield cache), so the restart case #1519 fixed is unchanged. A new
+  contention episode gets the fast retry again.
+- _run_forever read getattr(sampler, "wait_fresh", None) only for a test
+  stand-in; AdvisorySampler always has wait_fresh. The stand-in now has one
+  and the loop calls sampler.wait_fresh directly.
+
+The `metrics_sender send` line keys are unchanged.
+---
+ gateway/kanban_singleton.py                   | 10 ++++--
+ hermes_cli/kanban_sync_client.py              |  2 +-
+ tests/gateway/test_kanban_singleton_lease.py  | 31 +++++++++++++++++++
+ .../hermes_cli/test_machine_metrics_sender.py |  3 ++
+ 4 files changed, 43 insertions(+), 3 deletions(-)
+
+diff --git a/gateway/kanban_singleton.py b/gateway/kanban_singleton.py
+index f1ee3b7c81..02124405d3 100644
+--- a/gateway/kanban_singleton.py
++++ b/gateway/kanban_singleton.py
+@@ -38,6 +38,9 @@ _YIELD_CACHE_SECONDS = 5.0
+ # A root gateway whose claim is posted retries this often: the profile holder yields within ~_YIELD_CACHE_SECONDS plus
+ # its loop's next check, and every second the lock sits idle is a second without the hub's sync (and CPU reports).
+ ROOT_CLAIM_RETRY_SECONDS = 2.0
++# ...but only this long into one contention episode: a holder that never yields (another root gateway, a wedged
++# profile gateway) would otherwise see a retry and a root-claim rewrite every 2 s forever. After it, retry_seconds.
++ROOT_CLAIM_FAST_RETRY_WINDOW_SECONDS = 30.0
+ 
+ 
+ def _resolve(path: Path) -> str:
+@@ -260,8 +263,11 @@ class SingletonLease:
+ 
+     def retry_interval(self) -> float:
+         """Seconds until the next ``try_acquire``: short while this root gateway's claim asks a holder to yield
+-        (hermes-hub 2026-11-12: the full 30 s retry made every core-update restart cost 30-31 s of contention)."""
+-        if self.root and self.state == "contended":
++        (hermes-hub 2026-11-12: the full 30 s retry made every core-update restart cost 30-31 s of contention), for
++        the first ROOT_CLAIM_FAST_RETRY_WINDOW_SECONDS of the contention; a holder that never yields gets retry_seconds."""
++        if self.root and self.state == "contended" and (
++                self._contended_since is None
++                or self._clock() - self._contended_since < ROOT_CLAIM_FAST_RETRY_WINDOW_SECONDS):
+             return min(self.retry_seconds, ROOT_CLAIM_RETRY_SECONDS)
+         return self.retry_seconds
+ 
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index e828e74129..4ab283bf8a 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1471,7 +1471,7 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+     from hermes_cli.machine_cpu_sampler import AdvisorySampler
+     sampler = AdvisorySampler()
+     metrics.cpu_take_fn = sampler.take
+-    metrics.cpu_wait_fn = getattr(sampler, "wait_fresh", None)  # the sender's bounded wait; never on this thread
++    metrics.cpu_wait_fn = sampler.wait_fresh  # the sender's bounded wait; never on this thread
+     sampler.start()
+     # While the CPU gate is on, reports go out on their own anchored thread, each send bounded to 2 s. [daveey]
+     from hermes_cli.machine_metrics_sender import MetricsSender, board_post
+diff --git a/tests/gateway/test_kanban_singleton_lease.py b/tests/gateway/test_kanban_singleton_lease.py
+index 244ebaf633..e1baf1919e 100644
+--- a/tests/gateway/test_kanban_singleton_lease.py
++++ b/tests/gateway/test_kanban_singleton_lease.py
+@@ -392,3 +392,34 @@ def test_lease_acquire_loop_sleeps_the_leases_retry_interval(root, monkeypatch):
+     monkeypatch.setattr(runner, "_sleep_between_ticks", between)
+     assert asyncio.run(runner._acquire_kanban_lease(Lease())) is True
+     assert sleeps == [2.0, 2.0]
++
++
++def test_root_claim_fast_retry_backs_off_against_a_holder_that_never_yields(root):
++    """PR #1519 review nit: against a holder that never yields (another root gateway, or a wedged profile gateway) the
++    root lease retried, and rewrote its root-claim JSON, every 2 s without bound. The fast retry lasts
++    ROOT_CLAIM_FAST_RETRY_WINDOW_SECONDS (~30 s) of contention; after that it falls back to retry_seconds."""
++    clock = Clock()
++    holder = _lease(root, is_root=False, clock=clock, name="sync", grace=0.0)
++    assert holder.try_acquire()
++    rootl = _lease(root, is_root=True, clock=clock, name="sync")
++    start, intervals = clock.now, []
++    while clock.now - start < 150.0:
++        assert not rootl.try_acquire() and rootl.state == "contended"
++        interval = rootl.retry_interval()
++        intervals.append((clock.now - start, interval))
++        clock.now += interval
++    window = ks.ROOT_CLAIM_FAST_RETRY_WINDOW_SECONDS
++    assert 20.0 <= window <= 40.0
++    fast = [i for t, i in intervals if t < window]
++    slow = [i for t, i in intervals if t >= window]
++    assert fast and set(fast) == {ks.ROOT_CLAIM_RETRY_SECONDS}
++    assert slow and set(slow) == {30.0}  # retry_seconds again; bounded claim rewrites
++    assert len(intervals) <= window / ks.ROOT_CLAIM_RETRY_SECONDS + 1 + 120.0 / 30.0 + 1
++    holder.release()
++    assert rootl.try_acquire() and rootl.retry_interval() == 30.0
++    # A later contention episode gets the fast retry again.
++    rootl.release()
++    holder2 = _lease(root, is_root=False, clock=clock, name="sync", grace=0.0)
++    assert holder2.try_acquire()
++    assert not rootl.try_acquire() and rootl.retry_interval() == ks.ROOT_CLAIM_RETRY_SECONDS
++    holder2.release()
+diff --git a/tests/hermes_cli/test_machine_metrics_sender.py b/tests/hermes_cli/test_machine_metrics_sender.py
+index 67e3d0e057..b19ee8e32a 100644
+--- a/tests/hermes_cli/test_machine_metrics_sender.py
++++ b/tests/hermes_cli/test_machine_metrics_sender.py
+@@ -482,6 +482,9 @@ def test_a_long_blocked_round_still_yields_reports_from_the_sender(tmp_path, mon
+         def take(self, _limit):
+             return {**SAMPLE, "cpu_busy_sample_end_ms": int(time.time() * 1000)}
+ 
++        def wait_fresh(self, _timeout):
++            return True  # a sample is always ready
++
+         def start(self):
+             return None
+ 
+-- 
+2.51.0
+

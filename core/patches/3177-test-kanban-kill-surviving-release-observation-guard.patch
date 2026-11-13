@@ -1,0 +1,304 @@
+From d5ff115c86ee6d70562e1adfa2f4f31607bb8e97 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 23:48:53 +0000
+Subject: [PATCH] test(kanban): kill surviving release/observation guard
+ mutants; drop duplicate producer parent fence [daveey]
+
+---
+ hermes_cli/kanban_review_release.py           |   2 -
+ ...test_kanban_observed_pr_hold_boundaries.py |  12 +-
+ .../test_kanban_operator_resume_observed.py   |  14 ++
+ .../test_kanban_review_release_boundaries.py  |   6 +
+ .../test_kanban_review_release_controls.py    | 171 ++++++++++++++++++
+ 5 files changed, 201 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_review_release_controls.py
+
+diff --git a/hermes_cli/kanban_review_release.py b/hermes_cli/kanban_review_release.py
+index 5cf5ea3651..e2781b77ef 100644
+--- a/hermes_cli/kanban_review_release.py
++++ b/hermes_cli/kanban_review_release.py
+@@ -60,8 +60,6 @@ def _build(conn, task_id):
+         return None
+     urls = {norm_pr(u) for u in captured}
+     parents = kb.parent_ids(conn, task_id)
+-    if kb.unsatisfied_parents(conn, task_id):
+-        return None
+     # Discharge terminal superseded publications at home, not on every executor.
+     discharged = {u for u in urls if pr_state(u) in TERMINAL_STATES}
+     if not review.resumes_review(conn, task_id, urls, discharged=discharged):
+diff --git a/tests/hermes_cli/test_kanban_observed_pr_hold_boundaries.py b/tests/hermes_cli/test_kanban_observed_pr_hold_boundaries.py
+index d5608c7f5c..fa68a4bf34 100644
+--- a/tests/hermes_cli/test_kanban_observed_pr_hold_boundaries.py
++++ b/tests/hermes_cli/test_kanban_observed_pr_hold_boundaries.py
+@@ -21,7 +21,8 @@ def stores():
+         conn.close()
+ 
+ 
+-@pytest.mark.parametrize("case", ["matching", "different", "missing_uid", "no_hold", "consumed", "invalid_clock"])
++@pytest.mark.parametrize("case", ["matching", "different", "missing_uid", "both_missing_uid", "no_hold",
++                                  "consumed", "invalid_clock"])
+ def test_fresh_replica_must_match_home_episode(stores, monkeypatch, case):
+     home, replica = stores
+     if case != "no_hold":
+@@ -30,17 +31,22 @@ def test_fresh_replica_must_match_home_episode(stores, monkeypatch, case):
+     mutations = {
+         "different": (replica, "UPDATE task_events SET uid='other-episode' WHERE id=1"),
+         "missing_uid": (home, "UPDATE task_events SET uid=NULL WHERE id=1"),
++        "both_missing_uid": (home, "UPDATE task_events SET uid=NULL WHERE id=1"),
+         "consumed": (replica, "INSERT INTO task_events VALUES (3,'task','claimed',"
+                      "'2026-01-01T00:00:02Z','{}','claim')"),
+         "invalid_clock": (replica, "UPDATE task_events SET created_at='invalid' WHERE id=2"),
+     }
+     target, sql = mutations.get(case, (replica, "SELECT 1"))
+     target.execute(sql)
++    if case == "both_missing_uid":
++        # Two absent UIDs are not the same ready episode.
++        replica.execute(sql)
+     monkeypatch.setattr(history, "_with_fresh_replica", lambda conn, since, read, fallback: read(replica))
+     assert observed.observed(home, "task") is (case == "matching")
+ 
+ 
+-@pytest.mark.parametrize("case", ["no_boundary", "bad_clock", "diagnostic", "wrong_reason", "before_boundary"])
++@pytest.mark.parametrize("case", ["no_boundary", "bad_clock", "diagnostic", "wrong_reason", "before_boundary",
++                                  "parked"])
+ def test_local_observation_requires_ready_boundary(stores, monkeypatch, case):
+     home, _ = stores
+     home.execute("INSERT INTO task_events VALUES (2,'task','respawn_guarded',"
+@@ -51,6 +57,8 @@ def test_local_observation_requires_ready_boundary(stores, monkeypatch, case):
+         "diagnostic": "UPDATE task_events SET kind='commented' WHERE id=2",
+         "wrong_reason": "UPDATE task_events SET payload='{\"reason\":\"other\"}' WHERE id=2",
+         "before_boundary": "UPDATE task_events SET created_at='2025-01-01T00:00:00Z' WHERE id=2",
++        # The latest lifecycle boundary is a park, not a ready transition.
++        "parked": "INSERT INTO task_events VALUES (3,'task','blocked','2026-01-01T00:00:00Z','{}','park')",
+     }
+     home.execute(mutations[case])
+     monkeypatch.setattr(history, "_with_fresh_replica", lambda *args: False)
+diff --git a/tests/hermes_cli/test_kanban_operator_resume_observed.py b/tests/hermes_cli/test_kanban_operator_resume_observed.py
+index b4e2e5f1b6..7a4f041207 100644
+--- a/tests/hermes_cli/test_kanban_operator_resume_observed.py
++++ b/tests/hermes_cli/test_kanban_operator_resume_observed.py
+@@ -43,3 +43,17 @@ def test_observation_must_be_in_current_ready_episode(kanban_home, clock, monkey
+         monkeypatch.setattr(dispatch, "check_respawn_guard", lambda *_: None)
+         with pytest.raises(resume.ResumeRefused, match="active_pr"):
+             resume.resume(conn, task, reason="no current hold", actor="operator")
++
++
++def test_observation_does_not_override_another_local_guard(kanban_home, clock, monkeypatch):
++    # An imported active_pr observation widens only a local "no hold" verdict:
++    # it never resumes a card this gateway holds for a different reason.
++    with kbc.connect_closing() as conn:
++        task = helpers._held(conn)
++        clock[0] += 10
++        with kb.write_txn(conn):
++            kb._append_event(conn, task, "promoted")
++            kb._append_event(conn, task, "respawn_guarded", {"reason": "active_pr"})
++        monkeypatch.setattr(dispatch, "check_respawn_guard", lambda *_: "shared_blocker")
++        with pytest.raises(resume.ResumeRefused, match="guard: shared_blocker"):
++            resume.resume(conn, task, reason="other hold", actor="operator")
+diff --git a/tests/hermes_cli/test_kanban_review_release_boundaries.py b/tests/hermes_cli/test_kanban_review_release_boundaries.py
+index d68be0c7ea..589404e3da 100644
+--- a/tests/hermes_cli/test_kanban_review_release_boundaries.py
++++ b/tests/hermes_cli/test_kanban_review_release_boundaries.py
+@@ -17,9 +17,14 @@ PR = helpers.PR
+     ("stamp", "merge_authorized", True),
+     ("stamp", "checkpoint", {}),
+     ("stamp", "discharged", {PR: True}),
++    ("stamp", "discharged", {}),
+     ("stamp", "discharged", [123]),
++    ("stamp", "discharged", [[PR]]),
+     ("stamp", "discharged", [PR + "9"]),
++    ("stamp", "discharged", [PR]),
+     ("stamp", "reviews", {}),
++    ("stamp", "reviews", None),
++    ("stamp", "reviews", []),
+     ("stamp", "reviews", [None]),
+     ("proof", "metadata", []),
+     ("proof", "head", 123),
+@@ -27,6 +32,7 @@ PR = helpers.PR
+     ("proof", "parent", "other-parent"),
+     ("proof", "prs", {PR: True}),
+     ("proof", "prs", [123]),
++    ("proof", "prs", [[PR]]),
+     ("proof", "prs", [PR + "9"]),
+     ("proof", "result", {"run_uid": "other-result"}),
+ ])
+diff --git a/tests/hermes_cli/test_kanban_review_release_controls.py b/tests/hermes_cli/test_kanban_review_release_controls.py
+new file mode 100644
+index 0000000000..f7fd519f33
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_review_release_controls.py
+@@ -0,0 +1,171 @@
++"""Producer and consumer controls for the home review-release receipt.
++
++Each case isolates one guard: the home emits a receipt only for evidence it can
++carry, and a replica without the parent's run/result still rejects a receipt
++whose own fields do not prove a continuation. Malformed data never raises.
++"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_review_release as release
++from tests.hermes_cli import test_kanban_dependency_review as helpers
++
++board = helpers.board
++PR = helpers.PR
++OLD = PR + "9"
++
++
++def _waiting(conn, reviews_metadata=None):
++    task, reviews = helpers.parked(conn)
++    if reviews_metadata is None:
++        helpers.finish_reviews(conn, reviews)
++    else:
++        for review, metadata in zip(reviews, reviews_metadata):
++            helpers.finish_reviews(conn, [review], metadata=metadata)
++    conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (task,))
++    conn.commit()
++    return task, reviews
++
++
++def _set_checkpoint_prs(conn, task, value):
++    row = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='dependency_wait' "
++                       "ORDER BY id DESC LIMIT 1", (task,)).fetchone()
++    data = json.loads(row["payload"])
++    data["review_checkpoint"]["prs"] = value
++    conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(data), row["id"]))
++
++
++def _promoted(conn, task):
++    event = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='promoted' "
++                         "ORDER BY id DESC LIMIT 1", (task,)).fetchone()
++    return event["id"], json.loads(event["payload"])
++
++
++def _store(conn, event_id, payload):
++    conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), event_id))
++    conn.commit()
++
++
++def _drop_parent_history(conn, reviews):
++    conn.execute("DELETE FROM task_events WHERE task_id IN (?,?)", reviews)
++    conn.execute("DELETE FROM task_runs WHERE task_id IN (?,?)", reviews)
++    conn.commit()
++
++
++# --- producer: the home stamps only its own release verdict ---------------------------
++
++def test_home_hold_verdict_emits_no_receipt(board, monkeypatch):
++    task, _ = _waiting(board)
++    assert task in release.prepare(board)
++    monkeypatch.setattr(release.review, "resumes_review", lambda *a, **k: False)
++    assert task not in release.prepare(board)
++
++
++def test_release_without_canonical_head_stays_local(board):
++    # Mixed prefix findings release on the home's own evaluator, but carry no
++    # single exact head, so no portable receipt is emitted for replicas.
++    prefix = {"verdicts": {"prefix1": "REQUEST_CHANGES"}, "reviewed_sha_prefix1": "a" * 40, "pr": PR}
++    task, _ = _waiting(board, [prefix, prefix])
++    assert release.review.resumes_review(board, task, {PR})
++    assert task not in release.prepare(board)
++
++
++def test_reviewer_of_another_pr_adds_no_proof(board):
++    other = "https://github.com/example/repo/pull/99"
++    task, reviews = _waiting(board, [None, {"verdict": "changes_required", "pr": other, "reviewed_sha": "a" * 40}])
++    stamp = release.prepare(board)[task][1]
++    assert [p["parent"] for p in stamp["reviews"]] == [reviews[0]]
++
++
++@pytest.mark.parametrize("value", [None, [123], {PR: True}])
++def test_malformed_checkpoint_scope_emits_no_receipt(board, value):
++    task, _ = _waiting(board)
++    _set_checkpoint_prs(board, task, value)
++    board.commit()
++    assert task not in release.prepare(board)
++
++
++def test_parent_without_carryable_result_adds_no_proof(board, monkeypatch):
++    task, reviews = _waiting(board)
++    stamp = release.prepare(board)[task][1]
++    assert sorted(p["parent"] for p in stamp["reviews"]) == sorted(reviews)
++    real = release.review._completed_review_run
++
++    def only_first(conn, parent, *rest):
++        # A parent whose result this store cannot read contributes no proof; the
++        # other reviewer's exact-head proof still covers the captured PR.
++        return real(conn, parent, *rest) if parent == reviews[0] else None
++
++    monkeypatch.setattr(release.review, "_completed_review_run", only_first)
++    stamp = release.prepare(board)[task][1]
++    assert [p["parent"] for p in stamp["reviews"]] == [reviews[0]]
++
++
++# --- consumer: partial replica (no parent run/result) checks the receipt itself -------
++
++@pytest.mark.parametrize("case", ["implicit", "short_head", "extra_pr", "explicit_other"])
++def test_partial_replica_checks_proof_fields(board, case):
++    task, reviews = helpers.parked(board)
++    helpers.finish_reviews(board, reviews)
++    event_id, payload = _promoted(board, task)
++    stamp = payload["review_release"]
++    stamp["reviews"] = stamp["reviews"][:1]
++    proof = stamp["reviews"][0]
++    proof["metadata"].pop("pr", None)
++    proof["metadata"].pop("reviewed_pr", None)
++    if case == "short_head":
++        proof["head"] = proof["metadata"]["reviewed_sha"] = "a" * 12
++    elif case == "extra_pr":
++        proof["prs"] = [PR, OLD]
++    elif case == "explicit_other":
++        proof["metadata"]["pr"] = OLD
++    _store(board, event_id, payload)
++    _drop_parent_history(board, reviews)
++    assert release.released(board, task, {PR}) is (case == "implicit")
++
++
++@pytest.mark.parametrize("case", ["uid", "legacy_park", "no_origin"])
++def test_foreign_copy_needs_home_origin_and_portable_park(board, monkeypatch, case):
++    from hermes_cli import kanban_wake_check
++    task, reviews = helpers.parked(board)
++    helpers.finish_reviews(board, reviews)
++    board.execute("ALTER TABLE tasks ADD COLUMN created_on TEXT")
++    board.execute("UPDATE tasks SET created_on='home' WHERE id=?", (task,))
++    if case != "no_origin":
++        board.execute("UPDATE task_events SET origin_gateway='home' WHERE task_id=? AND kind='promoted'", (task,))
++    event_id, payload = _promoted(board, task)
++    run = board.execute("SELECT id FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (task,)).fetchone()
++    assert payload["review_release"]["park"] == {"run_id": run["id"]}
++    if case != "legacy_park":
++        # A synced copy names the park by its portable UID, never a local integer
++        # (unsynced fixtures lack the synced schema's uid column).
++        board.execute("ALTER TABLE task_runs ADD COLUMN uid TEXT")
++        board.execute("UPDATE task_runs SET uid='owner-park' WHERE id=?", (run["id"],))
++        payload["review_release"]["park"] = {"run_uid": "owner-park"}
++    _store(board, event_id, payload)
++    monkeypatch.setattr(kanban_wake_check, "foreign_copy", lambda conn, tid: True)
++    assert release.released(board, task, {PR}) is (case == "uid")
++
++
++@pytest.mark.parametrize("value", [None, [123], {PR: True}])
++def test_malformed_checkpoint_scope_is_not_released(board, value):
++    task, reviews = helpers.parked(board)
++    helpers.finish_reviews(board, reviews)
++    assert release.released(board, task, {PR})
++    _set_checkpoint_prs(board, task, value)
++    event_id, payload = _promoted(board, task)
++    payload["review_release"]["checkpoint"]["prs"] = value
++    _store(board, event_id, payload)
++    assert release.released(board, task, {PR}) is False
++
++
++@pytest.mark.parametrize("fault", ["crashed", "reclaimed", "timed_out"])
++def test_owner_fault_after_park_revokes_receipt(board, fault):
++    task, reviews = helpers.parked(board)
++    helpers.finish_reviews(board, reviews)
++    assert release.released(board, task, {PR})
++    kb._append_event(board, task, fault, {})
++    board.commit()
++    assert not release.released(board, task, {PR})
+-- 
+2.51.0
+

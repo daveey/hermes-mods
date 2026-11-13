@@ -1,0 +1,419 @@
+From 015f6958f482fb7cc01c0d18b6a4423d5ed4350f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 04:53:23 +0000
+Subject: [PATCH] [daveey] notices: pollers of one replica snapshot share a
+ single _persist pass
+
+observe() publishes its memo only after _persist commits, outside the replica
+lane and the publication lock. Every notice poller that arrived meanwhile found
+no memo for the new signature and re-ran the whole pass over every terminal
+card, queueing on the ledger's BEGIN IMMEDIATE. On hermes-hub (11-13, 5-7
+pollers per backend, 9318 remote task rows, 6286 terminal) remote notice
+collection was 25% of the gateway's and 34% of the Desktop backend's CPU; a
+harness with 7 pollers and a 0.6 s pass ran _persist 79 times for 21 replica
+changes.
+
+A caller whose snapshot has the same signature, replica file and ledger file
+as a pass in flight now waits for that pass and returns its answer, the one a
+memo hit would return. The memo is re-read in the second lock block so a
+caller that missed it in the first look does not re-persist. A leader always
+sets its event in finally; if it failed, each waiter persists once itself
+(no follow on retry). Snapshots without a signature or file identity never
+share. Generation ordering and the out-of-lock ledger write are unchanged.
+
+Tests: one pass for 7 concurrent polls; leader failure with 1 and 3 waiters
+terminates and answers each; a newer snapshot does not wait for an older one;
+_reset_for_tests never strands a waiter; the 12-caller single-flight test now
+also pins one ledger pass.
+
+Card: t_01a1ccca7a1979a7
+---
+ .../test_kanban_observation_singleflight.py   |  23 ++-
+ .../test_kanban_remote_observations_lock.py   | 194 ++++++++++++++++++
+ tui_gateway/kanban_remote_notices.py          |   3 +-
+ tui_gateway/kanban_remote_observations.py     |  66 +++++-
+ 4 files changed, 272 insertions(+), 14 deletions(-)
+
+diff --git a/tests/tui_gateway/test_kanban_observation_singleflight.py b/tests/tui_gateway/test_kanban_observation_singleflight.py
+index 063b198411..0287b9ebd6 100644
+--- a/tests/tui_gateway/test_kanban_observation_singleflight.py
++++ b/tests/tui_gateway/test_kanban_observation_singleflight.py
+@@ -45,8 +45,19 @@ def test_concurrent_snapshot_is_singleflight_outside_publication_lock(tmp_path,
+     snapshots, statements = [], []
+     real_snapshot, real_ro, real_persist = obs._snapshot, krn._ro, obs._persist
+     start = threading.Barrier(CALLERS)
+-    # No memo can be published until every caller has obtained its snapshot.
+-    persist = threading.Barrier(CALLERS)
++    # No memo can be published until every other caller has its snapshot and waits for the one persisting it.
++    waiting, persisted = [], []
++
++    class CountedEvent(threading.Event):
++        def wait(self, timeout=None):
++            waiting.append(threading.get_ident())  # list.append is atomic
++            return super().wait(timeout)
++
++    real_pending_init = obs._Pending.__init__
++
++    def pending_init(self, token):
++        real_pending_init(self, token)
++        self.done = CountedEvent()
+ 
+     def snapshot(*args):
+         snapshots.append(lock.owned())
+@@ -58,13 +69,18 @@ def test_concurrent_snapshot_is_singleflight_outside_publication_lock(tmp_path,
+         return conn
+ 
+     def save(*args):
+-        persist.wait(timeout=20)
++        persisted.append(threading.get_ident())
++        for _ in range(4000):
++            if len(waiting) >= CALLERS - 1:
++                break
++            threading.Event().wait(0.005)
+         return real_persist(*args)
+ 
+     def poll(_):
+         start.wait(timeout=20)
+         return obs.observe(replica, ledger, NOW)
+ 
++    monkeypatch.setattr(obs._Pending, "__init__", pending_init)
+     monkeypatch.setattr(obs, "_snapshot", snapshot)
+     monkeypatch.setattr(krn, "_ro", ro)
+     monkeypatch.setattr(obs, "_persist", save)
+@@ -74,6 +90,7 @@ def test_concurrent_snapshot_is_singleflight_outside_publication_lock(tmp_path,
+     assert statements
+     assert sum(held for _, held in statements) == 0
+     assert snapshots == [False]
++    assert len(persisted) == 1 and len(waiting) == CALLERS - 1  # one ledger pass; the rest took its answer
+ 
+ 
+ def test_shared_snapshot_matches_uncached_path_across_changes(tmp_path, monkeypatch):
+diff --git a/tests/tui_gateway/test_kanban_remote_observations_lock.py b/tests/tui_gateway/test_kanban_remote_observations_lock.py
+index e336a84b19..35cbc99655 100644
+--- a/tests/tui_gateway/test_kanban_remote_observations_lock.py
++++ b/tests/tui_gateway/test_kanban_remote_observations_lock.py
+@@ -9,6 +9,7 @@ import sqlite3
+ import threading
+ 
+ from tests.tui_gateway.test_kanban_remote_arrival import CHAT, _card, _hub
++from tests.waiting import wait_until
+ from tui_gateway import kanban_remote_notices as krn
+ from tui_gateway import kanban_remote_observations as obs
+ 
+@@ -143,3 +144,196 @@ def test_a_busy_wal_switch_is_retried_not_raised(tmp_path, monkeypatch):
+     monkeypatch.setattr(krn.sqlite3, "connect", lambda *a, **kw: real(*a, factory=Racing, **kw))
+     replica, ledger, _cards = _world(tmp_path)
+     assert len(obs.observe(replica, ledger, NOW)) == 20 and len(busy) == 3
++
++
++def _waiters(monkeypatch):
++    """Threads that reached the wait for another poller's in-flight pass (the ``_Pending`` event)."""
++    waiting = []
++    real_init = obs._Pending.__init__
++
++    class Counted(threading.Event):
++        def wait(self, timeout=None):
++            waiting.append(threading.get_ident())  # list.append is atomic
++            return super().wait(timeout)
++
++    def init(self, token):
++        real_init(self, token)
++        self.done = Counted()
++
++    monkeypatch.setattr(obs._Pending, "__init__", init)
++    return waiting
++
++
++def test_concurrent_polls_of_one_snapshot_persist_it_once(tmp_path, monkeypatch):
++    """[daveey] Pollers that arrive while another persists the same snapshot wait for its answer.
++
++    The memo is published only after ``_persist`` commits, outside the lane, so every notice poller that came in
++    meanwhile re-ran the full pass over every terminal card and queued on the ledger's ``BEGIN IMMEDIATE``
++    (hermes-hub 11-13: 7 pollers per process, 21 snapshot changes -> 79 ``_persist`` runs when a pass took 0.6 s).
++    """
++    replica, ledger, _cards = _world(tmp_path, n=50)
++    real = obs._persist
++    calls = []
++    entered = threading.Event()
++    release = threading.Event()
++
++    def slow(source, cards_, ledger_, now):
++        calls.append(now)
++        entered.set()
++        assert release.wait(10)
++        return real(source, cards_, ledger_, now)
++
++    monkeypatch.setattr(obs, "_persist", slow)
++    waiting = _waiters(monkeypatch)
++    results = []
++    leader = threading.Thread(target=lambda: results.append(obs.observe(replica, ledger, NOW)))
++    leader.start()
++    assert entered.wait(10)
++    followers = [threading.Thread(target=lambda: results.append(obs.observe(replica, ledger, NOW + 1)))
++                 for _ in range(6)]
++    for t in followers:
++        t.start()
++    wait_until(lambda: len(waiting) >= 6 or len(calls) > 1, timeout=10)  # all wait, or one re-persisted
++    release.set()
++    for t in (leader, *followers):
++        t.join(10)
++    assert len(calls) == 1
++    assert len(results) == 7 and all(r == results[0] for r in results) and len(results[0]) == 50
++    assert obs._pending == {}
++
++
++def test_a_failed_persist_lets_a_waiting_poll_persist_itself(tmp_path, monkeypatch):
++    replica, ledger, _cards = _world(tmp_path)
++    real = obs._persist
++    calls = []
++    entered = threading.Event()
++    release = threading.Event()
++
++    def flaky(source, cards_, ledger_, now):
++        calls.append(now)
++        if len(calls) == 1:
++            entered.set()
++            assert release.wait(10)
++            raise sqlite3.OperationalError("database is locked")
++        return real(source, cards_, ledger_, now)
++
++    monkeypatch.setattr(obs, "_persist", flaky)
++    waiting = _waiters(monkeypatch)
++    errors, results = [], []
++
++    def first():
++        try:
++            obs.observe(replica, ledger, NOW)
++        except sqlite3.OperationalError as exc:
++            errors.append(exc)
++
++    leader = threading.Thread(target=first)
++    leader.start()
++    assert entered.wait(10)
++    follower = threading.Thread(target=lambda: results.append(obs.observe(replica, ledger, NOW + 1)))
++    follower.start()
++    wait_until(lambda: len(waiting) >= 1, timeout=10)
++    release.set()
++    for t in (leader, follower):
++        t.join(10)
++    assert len(errors) == 1 and len(calls) == 2
++    assert len(results) == 1 and len(results[0]) == 20
++    assert obs._pending == {}
++
++
++def test_a_failed_persist_with_several_waiters_ends_and_answers_each(tmp_path, monkeypatch):
++    replica, ledger, _cards = _world(tmp_path)
++    real = obs._persist
++    calls = []
++    entered = threading.Event()
++    release = threading.Event()
++
++    def flaky(source, cards_, ledger_, now):
++        calls.append(now)
++        if len(calls) == 1:
++            entered.set()
++            assert release.wait(10)
++            raise sqlite3.OperationalError("database is locked")
++        return real(source, cards_, ledger_, now)
++
++    monkeypatch.setattr(obs, "_persist", flaky)
++    waiting = _waiters(monkeypatch)
++    results = []
++
++    def first():
++        try:
++            obs.observe(replica, ledger, NOW)
++        except sqlite3.OperationalError:
++            pass
++
++    leader = threading.Thread(target=first)
++    leader.start()
++    assert entered.wait(10)
++    followers = [threading.Thread(target=lambda: results.append(obs.observe(replica, ledger, NOW + 1)))
++                 for _ in range(3)]
++    for t in followers:
++        t.start()
++    wait_until(lambda: len(waiting) >= 3, timeout=10)
++    release.set()
++    for t in (leader, *followers):
++        t.join(10)
++        assert not t.is_alive()
++    assert 2 <= len(calls) <= 4  # each waiter persists at most once itself; none loops
++    assert len(results) == 3 and all(len(r) == 20 for r in results)
++    assert obs._pending == {}
++
++
++def test_a_newer_snapshot_does_not_wait_for_an_older_one(tmp_path, monkeypatch):
++    replica, ledger, cards = _world(tmp_path)
++    real = obs._persist
++    calls = []
++    entered = threading.Event()
++    release = threading.Event()
++
++    def slow(source, cards_, ledger_, now):
++        calls.append(now)
++        if len(calls) == 1:
++            entered.set()
++            assert release.wait(10)
++        return real(source, cards_, ledger_, now)
++
++    monkeypatch.setattr(obs, "_persist", slow)
++    older = threading.Thread(target=lambda: obs.observe(replica, ledger, NOW))
++    older.start()
++    assert entered.wait(10)
++    _move(replica, cards[2], "blocked", NOW + 5)
++    newer = obs.observe(replica, ledger, NOW + 10)  # answers while the older pass is still blocked
++    assert len(calls) == 2 and older.is_alive()
++    assert any(k[1] == cards[2]["key"] and str(k[2]).startswith("blocked") for k in newer), sorted(newer)[:3]
++    release.set()
++    older.join(10)
++    assert obs._pending == {}
++
++
++def test_reset_clears_pending_and_never_strands_a_waiter(tmp_path, monkeypatch):
++    replica, ledger, _cards = _world(tmp_path)
++    real = obs._persist
++    entered = threading.Event()
++    release = threading.Event()
++
++    def slow(source, cards_, ledger_, now):
++        entered.set()
++        assert release.wait(10)
++        return real(source, cards_, ledger_, now)
++
++    monkeypatch.setattr(obs, "_persist", slow)
++    waiting = _waiters(monkeypatch)
++    results = []
++    leader = threading.Thread(target=lambda: results.append(obs.observe(replica, ledger, NOW)))
++    leader.start()
++    assert entered.wait(10)
++    follower = threading.Thread(target=lambda: results.append(obs.observe(replica, ledger, NOW + 1)))
++    follower.start()
++    wait_until(lambda: len(waiting) >= 1, timeout=10)
++    krn._reset_for_tests()
++    assert obs._pending == {}
++    release.set()
++    for t in (leader, follower):
++        t.join(10)
++        assert not t.is_alive()
++    assert len(results) == 2 and results[0] == results[1]
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index b3df9ed8d7..9581abb1e3 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -760,7 +760,7 @@ def _record_swept(keys: list[tuple], ledger: Optional[Path], *, reason: str) ->
+ 
+ def _reset_for_tests() -> None:
+     """Forget this process's memos, as a restarted backend would (the ledger file stays)."""
+-    from tui_gateway.kanban_remote_observations import _generation, _known, _memo
++    from tui_gateway.kanban_remote_observations import _generation, _known, _memo, _pending
+     from tui_gateway.kanban_remote_observations import _flights, _retained
+     from tui_gateway.kanban_replica_observer import reset as reset_observers
+     from tui_gateway.remote_sweep_projection import reset as reset_projection
+@@ -774,6 +774,7 @@ def _reset_for_tests() -> None:
+     _memo.clear()
+     _known.clear()
+     _generation.clear()
++    _pending.clear()  # never orphans a waiter: its leader sets ``done`` whether or not it is still listed
+     _flights.clear()
+     _retained.clear()
+     _index_memo = None
+diff --git a/tui_gateway/kanban_remote_observations.py b/tui_gateway/kanban_remote_observations.py
+index baadfc70fc..eb5888ed8f 100644
+--- a/tui_gateway/kanban_remote_observations.py
++++ b/tui_gateway/kanban_remote_observations.py
+@@ -244,7 +244,20 @@ def _replica_flight(tag):
+     return flight
+ 
+ 
+-def observe(replica: Path, ledger, now: float) -> dict[tuple, float | None]:
++class _Pending:
++    """One ``_persist`` in flight for an observe key: callers holding the same snapshot wait for its answer."""
++
++    def __init__(self, token: tuple):
++        self.token = token  # (signature, replica file identity, ledger file id), all read before the snapshot
++        self.owner = threading.get_ident()
++        self.done = threading.Event()
++        self.fresh: dict | None = None  # set only when the leader's _persist returned
++
++
++_pending: dict[tuple, _Pending] = {}
++
++
++def observe(replica: Path, ledger, now: float, _follow: bool = True) -> dict[tuple, float | None]:
+     """Only changed replica snapshots decode cards and touch the observation ledger.
+ 
+     An unchanged replica change key (the observer's data_version) skips the replica read entirely; a key is kept
+@@ -252,6 +265,11 @@ def observe(replica: Path, ledger, now: float) -> dict[tuple, float | None]:
+     seqs still gate every re-decode); only a replaced file or an unknown key forgets them.
+     Cache timestamps, not freshness verdicts: a quiet replica must still age out.
+     Ledger replacement invalidates the cache; acknowledgements need not invalidate it.
++
++    [daveey] A caller whose snapshot (same signature, replica file and ledger file) is already being persisted
++    waits for that answer: it is the one a memo hit would return. Each notice poller (5-7 per backend on
++    hermes-hub, 11-13) otherwise re-ran the whole pass over every terminal card while the first one still held
++    the ledger (21 replica changes -> 79 passes). If the leader fails, the waiter persists once itself.
+     """
+     from tui_gateway.kanban_remote_notices import ledger_path
+     from tui_gateway.kanban_replica_observer import file_identity, fingerprint
+@@ -277,20 +295,48 @@ def observe(replica: Path, ledger, now: float) -> dict[tuple, float | None]:
+         if not ready:
+             return {}
+         with _lock:
+-            if cached is not None and signature is not None and signature == cached[0]:
+-                fresh = cached[1]
++            # Re-read: a leader may have published this snapshot's memo since the first look.
++            latest = _memo.get(key)
++            if latest is not None and (latest[2] != ledger_id or latest[4] != ident):
++                latest = None
++            if latest is not None and signature is not None and signature == latest[0]:
++                fresh = latest[1]
+                 _remember(key, (signature, fresh, ledger_id, stamp, ident))
+                 return fresh
+-            _generation[key] = generation = _generation.get(key, 0) + 1
++            token = (signature, ident, ledger_id)
++            waiting = _pending.get(key)
++            leading: _Pending | None = None
++            generation = 0
++            if not (_follow and signature is not None and ident is not None and waiting is not None
++                    and waiting.token == token and waiting.owner != threading.get_ident()):
++                waiting = None
++                _generation[key] = generation = _generation.get(key, 0) + 1
++                leading = _Pending(token) if signature is not None and ident is not None else None
++                if leading is not None:
++                    _pending[key] = leading
++    if waiting is not None:
++        waiting.done.wait()  # holds no lock; the leader sets it in ``finally``
++        if waiting.fresh is not None:
++            return waiting.fresh
++        return observe(replica, ledger, now, _follow=False)  # the leader failed: persist this snapshot here
+     # [daveey] The ledger write runs without ``_lock``: holding it there kept every notice poller waiting on one
+     # poller's transaction. ``cards`` is this call's own snapshot, so the answer is the one it would have had under
+     # the lock; only the newest snapshot started for ``key`` publishes its memo, and only after its commit.
+-    fresh = _persist(key[0], cards or [], ledger, now)
+-    ledger_id = _file_id(ledger)
+-    with _lock:
+-        if _generation.get(key) == generation:
+-            _remember(key, (signature, fresh, ledger_id, stamp, ident))
+-        return fresh
++    try:
++        fresh = _persist(key[0], cards or [], ledger, now)
++        ledger_id = _file_id(ledger)
++        with _lock:
++            if leading is not None:
++                leading.fresh = fresh
++            if _generation.get(key) == generation:
++                _remember(key, (signature, fresh, ledger_id, stamp, ident))
++            return fresh
++    finally:
++        if leading is not None:
++            with _lock:
++                if _pending.get(key) is leading:
++                    del _pending[key]
++            leading.done.set()
+ 
+ 
+ def _remember(key: tuple, entry: tuple) -> None:
+-- 
+2.51.0
+

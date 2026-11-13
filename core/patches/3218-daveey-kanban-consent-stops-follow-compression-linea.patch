@@ -1,0 +1,281 @@
+From 8fad3aff6730587c46ad2a4f04ad18c81e79ce50 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:15:50 +0000
+Subject: [PATCH] [daveey] kanban consent: stops follow compression lineage;
+ fence worker kanban_comment and summary edits
+
+Follow-up to PR #1783 review 5886701099 (points 5-7):
+5. session_stops walks the parent_session_id lineage (bounded, cycle-safe),
+   so a stop recorded before context compression binds cards created after
+   the session id rotates; a later same-target approval still supersedes it.
+6. A worker's kanban_comment tool (HERMES_KANBAN_TASK set) refuses a target
+   its card's creation stops or its run session's stops cover
+   (rejection consent_stop), closing the direct same-board comment path.
+7. kanban edit of a done run's summary refuses a new gated delivery claim
+   unless the prior summary made it or the admitted receipt proves it.
+Remaining known limits are documented in hermes_cli/kanban_consent.py.
+---
+ hermes_cli/kanban_completion_receipt.py       | 26 ++++++++
+ hermes_cli/kanban_consent.py                  | 56 +++++++++++++++--
+ hermes_cli/kanban_db_edit.py                  |  2 +
+ .../test_kanban_consent_provenance.py         | 63 +++++++++++++++++++
+ .../test_kanban_operator_delivery.py          | 23 +++++++
+ tools/kanban_tools.py                         |  4 ++
+ 6 files changed, 170 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_completion_receipt.py b/hermes_cli/kanban_completion_receipt.py
+index 313ff4da58..24d1aaf50b 100644
+--- a/hermes_cli/kanban_completion_receipt.py
++++ b/hermes_cli/kanban_completion_receipt.py
+@@ -203,6 +203,32 @@ class ReceiptEditRefused(ValueError):
+     """``kanban edit`` tried to change a completion receipt; only completion admits one."""
+ 
+ 
++def check_summary_edit(conn, task_id, run_id, summary):
++    """Refuse an edited done-run summary that adds a delivery claim completion would refuse.
++
++    ``complete_task`` gates claims in ``prepare``; ``kanban edit`` rewrites the
++    same summary later. A gated claim is allowed only if the run's prior summary
++    already made it or its admitted receipt proves that target.
++    """
++    import json
++
++    from hermes_cli.kanban_operator_delivery import claimed_targets, gated_claims
++    claims = gated_claims(conn, task_id, summary)
++    if not claims:
++        return
++    row = None if run_id is None else conn.execute(
++        "SELECT summary, metadata FROM task_runs WHERE id = ?", (run_id,)).fetchone()
++    try:
++        receipt = (json.loads(row[1]) if row and row[1] else {}).get("completion_receipt") or {}
++    except (TypeError, ValueError, AttributeError):
++        receipt = {}
++    proved = {e["operator_delivery"].get("target_task_id") for item in receipt.get("items") or []
++              for e in item.get("evidence") or [] if isinstance(e.get("operator_delivery"), dict)}
++    rest = claims - claimed_targets(row[0] if row else "") - proved
++    if rest:
++        raise ReceiptEditRefused(_unproved(rest))
++
++
+ def keep_admitted_receipt(conn, run_id, metadata):
+     """Edited handoff metadata for ``run_id`` with the run's admitted receipt kept verbatim.
+ 
+diff --git a/hermes_cli/kanban_consent.py b/hermes_cli/kanban_consent.py
+index d9c964cc90..47798291d2 100644
+--- a/hermes_cli/kanban_consent.py
++++ b/hermes_cli/kanban_consent.py
+@@ -8,9 +8,17 @@ Where stops are enforced: at submission (the requester card's created snapshot
+ plus the submitting session's own host-local stops) and again at the home
+ executor (the created snapshot, read from the replica; an unsynced created event
+ is retried, then refused). Cards created by a session inherit its stops even when
+-they carry another origin session_id. Known limit: a stop recorded in a session
+-after a card was created does not reach that card, and the home cannot see a
+-submitting session's host-local stops (only the submitting host checks them).
++they carry another origin session_id. A session's stops include its
++``parent_session_id`` ancestors, so context compression (which rotates the
++session id) keeps them. A dispatched worker's ``kanban_comment`` tool checks the
++same stops before a direct same-board comment (``comment_refusal``), and
++``kanban edit`` cannot add a delivery claim the completion gate would refuse.
++
++Known limits: a stop recorded in a session after a card was created does not
++reach that card; the home cannot see a submitting session's host-local stops
++(only the submitting host checks them); a chat's own ``kanban_comment`` calls
++are not fenced (its user is present to approve or stop the turn); a worker's
++terminal ``hermes kanban comment`` goes through command approval, not this check.
+ """
+ from __future__ import annotations
+ 
+@@ -112,12 +120,36 @@ def session_stops(session):
+     try:
+         if not db._read_one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_consent_stops'"):
+             return []
++        lineage = _lineage(db, session)
+         return _active([json.loads(r[0]) for r in db._read_all(
+-            "SELECT payload FROM kanban_consent_stops WHERE origin_session=? ORDER BY id", (session,))])
++            f"SELECT payload FROM kanban_consent_stops WHERE origin_session IN ({','.join('?' * len(lineage))}) "
++            "ORDER BY id", tuple(lineage))])
+     finally:
+         db.close()
+ 
+ 
++_LINEAGE_MAX = 64
++
++
++def _lineage(db, session):
++    """*session* and its ``parent_session_id`` ancestors (compression rotates the id mid-conversation).
++
++    Decisions of the whole lineage replay in record order, so a stop recorded
++    before compression binds the tip and a later same-target approval still
++    supersedes it. Bounded and cycle-safe.
++    """
++    chain = [session]
++    if not db._read_one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'"):
++        return chain
++    while len(chain) < _LINEAGE_MAX:
++        row = db._read_one("SELECT parent_session_id FROM sessions WHERE id=?", (chain[-1],))
++        parent = row[0] if row else None
++        if not parent or parent in chain:
++            break
++        chain.append(parent)
++    return chain
++
++
+ def _created_stops(conn, task_id):
+     """The stops stamped on *task_id*'s created event; None when that event is absent."""
+     if not task_id:
+@@ -153,6 +185,22 @@ def snapshot(conn, task_id, creator_task_id):
+     return list({json.dumps(s, sort_keys=True): s for s in stops}.values())
+ 
+ 
++def comment_refusal(conn, task_id, session, target):
++    """Refusal text when a direct board comment on *target* would bypass a stop, else None.
++
++    The ``kanban_comment`` tool of a dispatched worker checks its own card's
++    creation stops and its run session's stops (lineage included): a same-board
++    target needs no operator call, so this is that path's fence.
++    """
++    from hermes_cli.kanban_supervisor_requests import SupervisorRequestError
++    try:
++        _check(list(creation_stops(conn, task_id)) + session_stops(session),
++               [{"op": "operator", "action": "comment", "task_id": target}])
++    except SupervisorRequestError as exc:
++        return str(exc)
++    return None
++
++
+ def _check(stops, ops):
+     from hermes_cli.kanban_supervisor_requests import SupervisorRequestError
+     for stop in stops:
+diff --git a/hermes_cli/kanban_db_edit.py b/hermes_cli/kanban_db_edit.py
+index f2f4dd3683..a53dae5fb6 100644
+--- a/hermes_cli/kanban_db_edit.py
++++ b/hermes_cli/kanban_db_edit.py
+@@ -106,6 +106,8 @@ def edit_task(
+             """,
+             (task_id,),
+         ).fetchone()
++            from hermes_cli.kanban_completion_receipt import check_summary_edit
++            check_summary_edit(conn, task_id, None if run is None else int(run["id"]), handoff_summary)
+             if metadata is not None:
+                 from hermes_cli.kanban_completion_receipt import keep_admitted_receipt
+                 metadata = keep_admitted_receipt(conn, None if run is None else int(run["id"]), metadata)
+diff --git a/tests/hermes_cli/test_kanban_consent_provenance.py b/tests/hermes_cli/test_kanban_consent_provenance.py
+index 3cd81e5105..3bc78321b4 100644
+--- a/tests/hermes_cli/test_kanban_consent_provenance.py
++++ b/tests/hermes_cli/test_kanban_consent_provenance.py
+@@ -312,3 +312,66 @@ def test_snapshot_uses_request_scoped_session_not_process_env(fleet, monkeypatch
+     consent.enforce(f.w, from_b, op)
+     with pytest.raises(requests.SupervisorRequestError, match="consent_stop"):
+         consent.enforce(f.w, from_a, op)
++
++
++def _sessions(home, *chain):
++    """Compression lineage root -> ... -> tip in the throwaway state.db."""
++    from hermes_state import SessionDB
++    db = SessionDB(home / "state.db")
++    try:
++        parent = None
++        for sid in chain:
++            db.create_session(session_id=sid, source="cli", model="test", parent_session_id=parent)
++            parent = sid
++    finally:
++        db.close()
++
++
++def test_stop_survives_compression_rotation(fleet, monkeypatch, tmp_path):
++    """Compression rebinds the conversation to a child session id; its stops come along."""
++    from hermes_cli import kanban_consent as consent
++    f = fleet
++    home = tmp_path / "compressed-home"
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    _decide(f.target, "timeout", session="pre-compression")
++    _sessions(home, "pre-compression", "after-first", "after-second")
++    assert [s["targets"] for s in consent.session_stops("after-second")] == [[f.target]]
++    card = f.card(f.w, "created after compression", session_id="after-second")
++    with pytest.raises(requests.SupervisorRequestError, match="consent_stop"):
++        consent.enforce(f.w, card, [{"op": "operator", "action": "comment", "task_id": f.target}])
++    # An explicit approval later in the lineage still supersedes the inherited stop.
++    _decide(f.target, "once", session="after-second")
++    assert consent.session_stops("after-second") == []
++    # Control: a sibling lineage is not bound by this conversation's stop.
++    _sessions(home, "unrelated-root", "unrelated-tip")
++    assert consent.session_stops("unrelated-tip") == []
++
++
++def test_worker_kanban_comment_tool_honours_creation_stop(fleet, monkeypatch, tmp_path):
++    """A same-board child cannot comment the stopped target directly through kanban_comment."""
++    import json as _json
++    from hermes_cli import kanban_consent as consent
++    f = fleet
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "local-comment-home"))
++    sibling = f.card(f.w, "stopped same-board target")
++    _decide(sibling, "deny", session="local-chat")
++    child = f.card(f.w, "child of the stopped chat", session_id="local-chat")
++    assert consent.comment_refusal(f.w, child, None, sibling)
++    assert consent.comment_refusal(f.w, child, None, f.target) is None  # other target: no stop
++    assert consent.comment_refusal(f.w, None, "local-chat", sibling)    # the stopped session itself
++
++    import tools.kanban_tools as kt
++    from contextlib import contextmanager
++
++    @contextmanager
++    def board(_slug=None):
++        yield kb, f.w
++    monkeypatch.setattr(kt, "_board", board)
++    monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: True)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", child)
++    out = _json.loads(kt._handle_comment({"task_id": sibling, "body": "must not land"}))
++    assert out.get("ok") is not True and "consent_stop" in _json.dumps(out), out
++    assert not f.w.execute("SELECT 1 FROM task_comments WHERE task_id=?", (sibling,)).fetchone()
++    # Control: the same worker may still comment an unstopped card.
++    other = f.card(f.w, "unstopped sibling")
++    assert _json.loads(kt._handle_comment({"task_id": other, "body": "fine"}))["ok"] is True
+diff --git a/tests/hermes_cli/test_kanban_operator_delivery.py b/tests/hermes_cli/test_kanban_operator_delivery.py
+index 8955de0791..e6271cf609 100644
+--- a/tests/hermes_cli/test_kanban_operator_delivery.py
++++ b/tests/hermes_cli/test_kanban_operator_delivery.py
+@@ -273,3 +273,26 @@ def test_negation_outside_the_claim_verb_still_needs_a_receipt(fleet, summary):
+ def test_claimed_targets_scopes_negation_to_the_verb(text, claimed):
+     from hermes_cli.kanban_operator_delivery import claimed_targets
+     assert claimed_targets(text) == ({"t_0123456789abcdef"} if claimed else set())
++
++
++def test_summary_edit_cannot_add_an_unproved_delivery_claim(fleet):
++    """kanban edit rewrites a done run's summary: a new gated claim needs the same receipt."""
++    from hermes_cli.kanban_completion_receipt import ReceiptEditRefused
++    f = fleet
++    helpers._submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "pending"})
++    assert kb.complete_task(f.w, f.caller, expected_run_id=f.run_id, summary=f"Queued a note for {f.target}.")
++    with pytest.raises(ReceiptEditRefused, match="exact operator delivery receipt"):
++        kb.edit_task(f.w, f.caller, result="r", summary=f"Posted the findings to {f.target}.")
++    run = f.w.execute("SELECT summary FROM task_runs WHERE task_id=? AND outcome='completed'",
++                      (f.caller,)).fetchone()
++    assert run[0] == f"Queued a note for {f.target}."
++    # Controls: non-claim wording still edits.
++    assert kb.edit_task(f.w, f.caller, result="r", summary=f"The note to {f.target} is queued, not yet posted.")
++
++
++def test_summary_edit_keeps_a_claim_the_admitted_receipt_proves(fleet):
++    f = fleet
++    proof = _delivered(f)
++    assert kb.complete_task(f.w, f.caller, expected_run_id=f.run_id,
++                            summary=f"Posted the findings to {f.target}.", metadata=_receipt(proof))
++    assert kb.edit_task(f.w, f.caller, result="r", summary=f"Posted the corrected findings to {f.target}.")
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index b1f799ad44..33b3f94ddf 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1371,6 +1371,10 @@ def _handle_comment(args: dict, **kw) -> str:
+         # [daveey] This tool is always an agent: record it, so no reader guesses (agent-261aa31f49).
+         from gateway.session_context import get_session_env
+         writer_session = get_session_env("HERMES_SESSION_ID", "") or None
++        if own_task := os.environ.get("HERMES_KANBAN_TASK"):  # worker (or its child): honour the card's stops
++            from hermes_cli.kanban_consent import comment_refusal
++            if stopped := comment_refusal(conn, own_task, writer_session, str(tid)):
++                raise _Reject(stopped, "consent_stop")
+         relayed = _krh.from_tool_args(conn, str(tid), args, writer_session, reject=_Reject)  # kanban-d1b921f32e
+         cid = kb.add_comment(conn, tid, author=author, body=str(body), writer_kind="agent",
+                              writer_session=writer_session, relayed_human=relayed)
+-- 
+2.51.0
+

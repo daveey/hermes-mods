@@ -1,0 +1,166 @@
+From 41dc4b294e52fe6bb87a31d3893136d4ec41ba74 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:29:34 +0000
+Subject: [PATCH] fix(hub-admission): a producer's 'Pinned to the gateway that
+ filed it' sentence is never admission evidence; kanban_move routes hub work
+ through hub-admin [daveey]
+
+t_01a1cf7f8f211403 was admitted hub_live_process quoting its producer's own pin sentence. validated() now rejects
+an admit whose quote is a producer's pin sentence (cached verdicts are revalidated, so the escape's cache is denied
+too); the kanban_move description no longer reads as 'move to the hub for its files or logs'.
+Card t_01a1d0e68acaba94.
+---
+ hermes_cli/kanban_hub_admission.py           | 23 ++++++++-
+ tests/test_kanban_hub_admission.py           | 51 ++++++++++++++++++++
+ tests/tools/test_kanban_move_hub_guidance.py | 15 ++++++
+ tools/kanban_tools_schemas.py                |  5 +-
+ 4 files changed, 92 insertions(+), 2 deletions(-)
+ create mode 100644 tests/tools/test_kanban_move_hub_guidance.py
+
+diff --git a/hermes_cli/kanban_hub_admission.py b/hermes_cli/kanban_hub_admission.py
+index 8e5c6295ef..f3bd48e44b 100644
+--- a/hermes_cli/kanban_hub_admission.py
++++ b/hermes_cli/kanban_hub_admission.py
+@@ -49,6 +49,20 @@ def _skill():
+     return body, hashlib.sha256(text.encode()).hexdigest()
+ 
+ 
++# A card producer's own placement sentence ("Pinned to the gateway that filed it: <why>") is that producer's
++# self-assertion about where its card should run, written before any admission. It is never evidence of an
++# allowlisted hub-only need: t_01a1cf7f8f211403 was admitted `hub_live_process` on exactly that sentence, while a
++# capability:hub-write worker could do every step with ssh and hub-admin. [daveey]
++SELF_ASSERTIONS = ("pinned to the gateway that filed it", "pinned to the machine that filed it")
++SELF_ASSERTION_WHY = "the evidence is the producer's own placement sentence, not a hub-only need"
++
++
++def self_assertion(quote):
++    """True when an admission quote leans on a producer's pin sentence (any case, any surrounding text)."""
++    text = " ".join(str(quote or "").split()).lower()
++    return any(marker in text for marker in SELF_ASSERTIONS)
++
++
+ def validated(result, fields, hub_reason, sha):
+     """The Verdict for a well-formed, evidence-checked ``{admit, need, evidence, why}`` dict, else None."""
+     if not isinstance(result, dict) or set(result) != {"admit", "need", "evidence", "why"}:
+@@ -64,6 +78,8 @@ def validated(result, fields, hub_reason, sha):
+         inputs = (fields.get("title") or "", fields.get("body") or "", hub_reason or "")
+         if need is None or not quote.strip() or not any(quote in item for item in inputs):
+             return None
++        if self_assertion(quote):
++            return None  # a producer's self-assertion: invalid as admission evidence (deny), cached copies too
+     return Verdict(**result, skill_sha=sha)
+ 
+ 
+@@ -72,7 +88,12 @@ def _parse(text, fields, hub_reason, sha):
+         result = json.loads(text)
+     except (ValueError, TypeError):
+         result = None
+-    return validated(result, fields, hub_reason, sha) or Verdict(why="invalid admission verdict", skill_sha=sha)
++    verdict = validated(result, fields, hub_reason, sha)
++    if verdict is not None:
++        return verdict
++    if isinstance(result, dict) and result.get("admit") is True and self_assertion(result.get("evidence")):
++        return Verdict(why=f"invalid admission verdict: {SELF_ASSERTION_WHY}", skill_sha=sha)
++    return Verdict(why="invalid admission verdict", skill_sha=sha)
+ 
+ 
+ def _cache(key, verdict=None):
+diff --git a/tests/test_kanban_hub_admission.py b/tests/test_kanban_hub_admission.py
+index 619b7f165c..be35fb700e 100644
+--- a/tests/test_kanban_hub_admission.py
++++ b/tests/test_kanban_hub_admission.py
+@@ -218,3 +218,54 @@ def test_malformed_json(judge, monkeypatch):
+     result = gate.admit({"title": "Use signed-in Chrome"})
+     assert result.admit is False
+     assert result.why == "invalid admission verdict"
++
++
++# t_01a1cf7f8f211403 (self-heal incident 813792703cb1) was admitted `hub_live_process` quoting its producer's own
++# "Pinned to the gateway that filed it: ..." line. A producer's pin sentence is never hub-only evidence.
++ESCAPE_TITLE = "self-heal: incident 813792703cb1"
++ESCAPE_PIN = ("Pinned to the gateway that filed it: it reads this gateway's own logs, state files and coach store, "
++              "which a worker node does not have.")
++ESCAPE_BODY = ("Self-heal investigation for defect `kanban-310ed068f0`. Nothing here needs a human.\n"
++               f"{ESCAPE_PIN}\n\n## Do this\n1. Reproduce or confirm it LIVE, not from the transcript alone.\n"
++               "- `sqlite3 -readonly ~/.hermes/kanban.db`: the card's `tasks` row.")
++
++
++@pytest.mark.parametrize("quote", [
++    ESCAPE_PIN,
++    "Pinned to the gateway that filed it",
++    "pinned to the gateway that filed it: it reads this gateway's own logs",
++])
++def test_producer_pin_sentence_is_not_admission_evidence(judge, quote):
++    gate, _, reply, _ = judge
++    reply.update(admit=True, need="hub_live_process", evidence=quote,
++                 why="The card says the investigation needs this gateway's own state files and coach store.")
++    body = ESCAPE_BODY.replace(ESCAPE_PIN, ESCAPE_PIN.lower()) if quote[0] == "p" else ESCAPE_BODY
++    verdict = gate.admit({"title": ESCAPE_TITLE, "body": body})
++    assert verdict.admit is False and verdict.need is None
++    assert gate.SELF_ASSERTION_WHY in verdict.why
++
++
++def test_machine_variant_and_cached_escape_are_denied(judge):
++    gate, _, reply, _ = judge
++    from dataclasses import asdict
++    import sqlite3
++    from hermes_cli.config import get_hermes_home
++    machine = "Pinned to the machine that filed it: the cron output is on this machine."
++    reply.update(admit=True, need="hub_live_process", evidence=machine, why="Local state.")
++    assert gate.admit({"title": "Bluesky notify: repeated cron failures", "body": machine}).admit is False
++    # A verdict cached before this rule (the real escape's) is revalidated on read and denied.
++    fields = {"title": ESCAPE_TITLE, "body": ESCAPE_BODY}
++    reply.update(admit=True, need="hub_chrome", evidence="Reproduce or confirm it LIVE", why="x")
++    gate.admit(fields)
++    escaped = {**asdict(gate.Verdict(admit=True, need="hub_live_process", evidence=ESCAPE_PIN, why="old")),
++               "skill_sha": ""}
++    with sqlite3.connect(get_hermes_home() / "kanban/hub-admission.sqlite") as conn:
++        conn.execute("UPDATE verdicts SET value=?", (json.dumps(escaped),))
++    assert gate.admit(fields).admit is False
++
++
++def test_other_evidence_on_a_card_with_a_pin_sentence_still_admits(judge):
++    gate, _, reply, _ = judge
++    reply.update(admit=True, need="hub_chrome", evidence="using the hub's signed-in Chrome", why="Browser.")
++    body = f"{ESCAPE_PIN}\nRead the billing page using the hub's signed-in Chrome."
++    assert gate.admit({"title": "billing", "body": body}).admit is True
+diff --git a/tests/tools/test_kanban_move_hub_guidance.py b/tests/tools/test_kanban_move_hub_guidance.py
+new file mode 100644
+index 0000000000..040d7ed46d
+--- /dev/null
++++ b/tests/tools/test_kanban_move_hub_guidance.py
+@@ -0,0 +1,15 @@
++"""kanban_move never steers a worker to move a routine hub job back to the hub (t_01a1d0e68acaba94).
++
++t_01a1ccba2bf93bf1 and t_01a1cad1b3da962a were moved to machine:hub for hub reads and routine hub writes that a
++capability:hub-write worker does with `ssh hermes-hub` and `hub-admin`; the tool description only said to move
++when the work needs "a specific host's files or logs".
++"""
++from tools.kanban_tools_schemas import KANBAN_MOVE_SCHEMA
++
++
++def test_move_description_routes_hub_work_through_hub_admin():
++    description = KANBAN_MOVE_SCHEMA["description"]
++    assert "Never move a card to the hub for hub files, logs, databases, cron" in description
++    assert "`hub-admin '<command>'` (declare hub:write)" in description
++    assert "`ssh hermes-hub`" in description
++    assert "judged by hub admission" in description
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 74c95ddfb8..645e7a4b1e 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -454,7 +454,10 @@ KANBAN_MOVE_SCHEMA = _schema(
+     (
+         "Move your current task to another machine and end this run. Use it when the work needs something "
+         "this machine lacks (a Mac for Xcode/iOS/simulators, a GPU, a specific host's files or logs) or "
+-        "belongs on a less loaded machine. It saves your checkpoint, ends this run as 'continued', sets the "
++        "belongs on a less loaded machine. Never move a card to the hub for hub files, logs, databases, cron, "
++        "config, services, `hermes kanban` or the Board admin key: a worker reads them with `ssh hermes-hub` and "
++        "does every routine hub write with `hub-admin '<command>'` (declare hub:write); a machine:hub move is "
++        "judged by hub admission and denied unless only the hub can do the work. It saves your checkpoint, ends this run as 'continued', sets the "
+         "card's runs_on to the labels you give and re-queues it, so ONLY a machine carrying every label claims "
+         "the next run (the Board enforces it). Refused when no other active machine matches, after "
+         "kanban.move.max_moves moves, when moving back to a machine the card already left (pass force), and "
+-- 
+2.51.0
+

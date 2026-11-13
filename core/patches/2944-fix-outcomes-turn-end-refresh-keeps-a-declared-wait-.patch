@@ -1,0 +1,694 @@
+From e60e7376ee392acbe6d5313edf8bef2ec71e01f2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 11:25:38 -0800
+Subject: [PATCH] fix(outcomes): turn-end refresh keeps a declared wait through
+ its own turn, not a newer one [daveey]
+
+A turn-end refresh that sees the turn's own not-yet-released lease/routing token painted the chat
+running and dropped the stored declaration, so the next refresh judged the reply alone and
+painted done what the agent declared waiting (local-9c06dfbb, 2026-11-11).
+
+- A running outcome carries the stored declaration.
+- The concluding turn captures its own live-turn evidence (TUI marker pid+start, turn-lease
+  holder+acquisition, gateway routing token+start) BEFORE scheduling its turn_end refresh
+  (`capture_turn_identity`) and passes it as `refresh_outcome(concluding_turn=...)`. Only that
+  evidence is discounted; any other live turn derives running. No blanket ignore_live_turn
+  remains on the turn-end paths (gateway thread, TUI turn end, refused-turn auto-continue timer),
+  so a late refresh can no longer overwrite a turn that started after the concluding one
+  (PR1131 review t_01a1ce099f1c7723: stored `unresolved/interrupted` over a running turn).
+- Rebased onto main's three-value `_live_work`; local-id classification is already fixed on main
+  (kanban_session_provenance, PR1032).
+
+Tests: tests/hermes_state/test_outcome_late_turn_end_refresh.py (late gateway refresh x routing/lease/marker,
+own-turn discount, failed capture, TUI refused-turn timer with a newer turn, identity capture).
+---
+ gateway/turn_outcome.py                       |  20 +-
+ hermes_state_outcome.py                       |  79 ++++--
+ tests/gateway/test_turn_outcome_refresh.py    |   2 +-
+ .../test_outcome_late_turn_end_refresh.py     | 226 ++++++++++++++++++
+ .../test_outcome_turn_end_declaration.py      | 118 +++++++++
+ tui_gateway/session_auto_continue.py          |   7 +-
+ tui_gateway/turn_outcome.py                   |  36 ++-
+ 7 files changed, 456 insertions(+), 32 deletions(-)
+ create mode 100644 tests/hermes_state/test_outcome_late_turn_end_refresh.py
+ create mode 100644 tests/hermes_state/test_outcome_turn_end_declaration.py
+
+diff --git a/gateway/turn_outcome.py b/gateway/turn_outcome.py
+index 5a33f5dfe7..4b9dbae57d 100644
+--- a/gateway/turn_outcome.py
++++ b/gateway/turn_outcome.py
+@@ -15,11 +15,24 @@ from typing import Optional
+ logger = logging.getLogger(__name__)
+ 
+ 
+-def _refresh(sid: str, db) -> None:
++def _capture(sid: str, db) -> frozenset:
++    """The concluding turn's own live-turn evidence (routing token, turn lease, marker), taken now, before the
++    refresh is scheduled. The refresh runs later on an unawaited thread: a newer turn may have started by then,
++    and only this turn's evidence may be discounted. Nothing captured = nothing discounted."""
++    try:
++        from hermes_state_outcome import capture_turn_identity
++
++        return capture_turn_identity(sid, db=db)
++    except Exception:  # health: allow BLE001 -- best-effort; an unreadable store discounts nothing
++        logger.warning("gateway turn identity capture failed for %s", sid, exc_info=True)
++        return frozenset()
++
++
++def _refresh(sid: str, db, concluding_turn: frozenset) -> None:
+     try:
+         from hermes_state_outcome import refresh_outcome
+ 
+-        refresh_outcome(sid, "turn_end", db=db)
++        refresh_outcome(sid, "turn_end", db=db, concluding_turn=concluding_turn)
+     except Exception:  # health: allow BLE001 -- the turn already concluded; a failed refresh is logged
+         logger.warning("gateway turn-end outcome refresh failed for %s", sid, exc_info=True)
+ 
+@@ -34,7 +47,8 @@ def refresh_gateway_turn_outcome(runner, session_entry) -> Optional[threading.Th
+     try:
+         from agent.memory_provider import spawn_context_thread
+ 
+-        thread = spawn_context_thread(_refresh, name="gateway-turn-outcome", args=(sid, db))
++        thread = spawn_context_thread(
++            _refresh, name="gateway-turn-outcome", args=(sid, db, _capture(sid, db)))
+         thread.start()
+         return thread
+     except Exception:  # health: allow BLE001 -- a thread that can't start skips one refresh; logged
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index a54c051ea3..be760ae781 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -241,23 +241,31 @@ def _text(content: Any) -> str:
+ # ── Derivation ─────────────────────────────────────────────────────────────
+ 
+ 
+-def _live_turn(db: Any, sid: str) -> bool:
++def _live_turn(db: Any, sid: str, concluding: frozenset[str] = frozenset()) -> bool:
+     """A live turn has a durable writer lease, a live TUI marker, or a gateway active-turn token.
+ 
+     Managed workers and CLI turns need no TUI marker or gateway routing entry. Their shared
+-    turn-facade lease is the cross-process evidence; an idle attached session is not a turn."""
++    turn-facade lease is the cross-process evidence; an idle attached session is not a turn.
++    ``concluding`` [daveey]: tokens of the turn that is concluding (``capture_turn_identity``); evidence
++    carrying one of them is that turn's own, not a live turn."""
++    return any(token not in concluding for token in _live_turn_tokens(db, sid))
++
++
++def _live_turn_tokens(db: Any, sid: str) -> Iterator[str]:
++    """Identity token of each live-turn evidence, lazily (``_live_turn`` stops at the first foreign one)."""
+     from tui_gateway.turn_marker import marker_writer_state, read_turn_marker
+ 
+     home = Path(db.db_path).parent
+     marker = read_turn_marker(home, sid)
+     if marker and marker_writer_state(marker) == "alive":
+-        return True
+-    if _guarded("durable turn", sid, lambda: _durable_turn_live(db, sid), False):
+-        return True
+-    return _guarded("gateway turn", sid, lambda: _gateway_turn_live(db, sid), False)
++        yield f"marker:{marker.get('writer_pid')}:{marker.get('started_at')}"
++    owner = _guarded("durable turn", sid, lambda: _durable_turn_owner(db, sid), None)
++    if owner is not None:
++        yield f"lease:{owner['holder']}:{owner.get('acquired_at')}"
++    yield from _guarded("gateway turn", sid, lambda: list(_gateway_turn_tokens(db, sid)), [])
+ 
+ 
+-def _durable_turn_live(db: Any, sid: str) -> bool:
++def _durable_turn_owner(db: Any, sid: str) -> Optional[dict[str, Any]]:
+     """Read the compression-root writer without reclaiming it; expired authority is not liveness.
+ 
+     The store rejects dead local owners. Expiry also bounds abandoned releases and unknown
+@@ -266,15 +274,17 @@ def _durable_turn_live(db: Any, sid: str) -> bool:
+     from hermes_state_compression import _turn_lease_abandoned
+ 
+     owner = db.session_turn_lease_owner(sid)
+-    return (owner is not None and float(owner["expires_at"]) > time.time()
+-            and not _turn_lease_abandoned(db.db_path, owner["holder"]))
++    if (owner is not None and float(owner["expires_at"]) > time.time()
++            and not _turn_lease_abandoned(db.db_path, owner["holder"])):
++        return owner
++    return None
+ 
+ 
+ # [daveey] A gateway turn token older than this is a leaked marker (its CAS clear failed), not a live turn.
+ _GATEWAY_TURN_MAX_AGE_S = 6 * 3600.0
+ 
+ 
+-def _gateway_turn_live(db: Any, sid: str) -> bool:
++def _gateway_turn_tokens(db: Any, sid: str) -> Iterator[str]:
+     """[daveey] A gateway routing entry for ``sid`` carries ``active_turn_token`` (``mark_turn_active`` at
+     turn start, CAS-cleared at its end) and the gateway owning that routing scope is running. A crashed
+     gateway leaves the token behind until its next start recovers it, so a dead gateway reads not-live."""
+@@ -289,8 +299,11 @@ def _gateway_turn_live(db: Any, sid: str) -> bool:
+         scope = str(routing_scope or "")
+         gateway_home = Path(scope).parent if scope else Path(db.db_path).parent
+         if _gateway_running(gateway_home):
+-            return True
+-    return False
++            yield f"gateway:{scope}:{entry.get('active_turn_token')}:{entry.get('active_turn_started_at')}"
++
++
++def _gateway_turn_live(db: Any, sid: str) -> bool:
++    return next(_gateway_turn_tokens(db, sid), None) is not None
+ 
+ 
+ def _iso_epoch(value: Any) -> Optional[float]:
+@@ -655,9 +668,11 @@ def _lineage_accounted_at(db: Any, ids: list[str]) -> Optional[float]:
+ 
+ 
+ def _derive(db: Any, sid: str, *, ignore_live_turn: bool = False,
+-            pending_reply: Optional[str] = None) -> dict[str, Any]:
++            pending_reply: Optional[str] = None,
++            concluding: frozenset[str] = frozenset()) -> dict[str, Any]:
+     stored = _parse((_row(db, sid) or {}).get("outcome_json"))
+-    current = _derive_kept_receipt(db, sid, stored, ignore_live_turn=ignore_live_turn, pending_reply=pending_reply)
++    current = _derive_kept_receipt(db, sid, stored, ignore_live_turn=ignore_live_turn, pending_reply=pending_reply,
++                                  concluding=concluding)
+     if current.get("source") == "declared":
+         return current
+     accounted = _lineage_accounted_at(db, _lineage_ids(db, sid))
+@@ -669,10 +684,12 @@ def _derive(db: Any, sid: str, *, ignore_live_turn: bool = False,
+ 
+ 
+ def _derive_kept_receipt(db: Any, sid: str, stored: Optional[dict], *, ignore_live_turn: bool,
+-                         pending_reply: Optional[str]) -> dict[str, Any]:
++                         pending_reply: Optional[str],
++                         concluding: frozenset[str] = frozenset()) -> dict[str, Any]:
+     from hermes_completion_receipt import historical_fields
+     historical = historical_fields(stored)
+-    current = _derive_current(db, sid, ignore_live_turn=ignore_live_turn, pending_reply=pending_reply)
++    current = _derive_current(db, sid, ignore_live_turn=ignore_live_turn, pending_reply=pending_reply,
++                              concluding=concluding)
+     if current.get("kind") == "done":
+         # A declared done carries its own receipt (or none: unspecified). A derived
+         # done keeps the last receipt only while no newer user request arrived, i.e.
+@@ -688,14 +705,19 @@ def _derive_kept_receipt(db: Any, sid: str, stored: Optional[dict], *, ignore_li
+ 
+ 
+ def _derive_current(db: Any, sid: str, *, ignore_live_turn: bool = False,
+-                    pending_reply: Optional[str] = None) -> dict[str, Any]:
++                    pending_reply: Optional[str] = None,
++                    concluding: frozenset[str] = frozenset()) -> dict[str, Any]:
+     now = time.time()
+     row = _row(db, sid) or {}
+     stored = _parse(row.get("outcome_json"))
+     if row.get("muted"):
+         return _outcome("muted", now, **({"declared": _declared(stored)} if _declared(stored) else {}))
+-    if not ignore_live_turn and _live_turn(db, sid):
+-        return _outcome("running", now)
++    if not ignore_live_turn and _live_turn(db, sid, concluding):
++        # [daveey] A running turn keeps the declaration it already stored: a refresh that sees a newer turn live
++        # must not erase it, or the next refresh judges the reply alone and paints done what the agent declared
++        # waiting (local-9c06dfbb…, 2026-11-11).
++        declared = _declared(stored)
++        return _outcome("running", now, **({"declared": declared} if declared else {}))
+     ids = _lineage_ids(db, sid)
+     decisions, waits, card_read_failed = _live_work(db, sid, ids)
+     tail = _without_finished_notes(_tail(db, sid))
+@@ -827,14 +849,27 @@ def derive_outcome(sid: str, *, db: Any = None, ignore_live_turn: bool = False,
+         return _derive(handle, _tip(handle, sid), ignore_live_turn=ignore_live_turn, pending_reply=pending_reply)
+ 
+ 
+-def refresh_outcome(sid: str, trigger: str, *, db: Any = None) -> dict[str, Any]:
+-    """Derive, write when it changed, and return the outcome now stored."""
++def capture_turn_identity(sid: str, *, db: Any = None) -> frozenset[str]:
++    """[daveey] The live-turn evidence ``sid`` holds right now, as opaque tokens (TUI marker pid+start, turn-lease
++    holder+acquisition, gateway routing token+start). A turn's conclusion captures this BEFORE it schedules its
++    ``turn_end`` refresh and hands it to ``refresh_outcome(concluding_turn=...)``: the refresh then discounts
++    exactly that turn's not-yet-released evidence, while a turn that started afterwards (different token) is
++    still a live turn. Callers treat a failed capture as nothing to discount."""
++    with _db_scope(db) as handle:
++        return frozenset(_live_turn_tokens(handle, _tip(handle, sid)))
++
++
++def refresh_outcome(sid: str, trigger: str, *, db: Any = None,
++                    concluding_turn: Optional[Iterable[str]] = None) -> dict[str, Any]:
++    """Derive, write when it changed, and return the outcome now stored. ``concluding_turn``: the
++    ``capture_turn_identity`` of the turn whose conclusion is refreshing (``turn_end``): only that turn's own
++    evidence is not a live turn; any other live turn derives ``running``."""
+     if trigger not in TRIGGERS:
+         raise ValueError(f"unknown outcome trigger {trigger!r}")
+     with _db_scope(db) as handle:
+         tip = _tip(handle, sid)
+         row = _row(handle, tip)
+-        derived = _derive(handle, tip)
++        derived = _derive(handle, tip, concluding=frozenset(concluding_turn or ()))
+         if row is None:
+             return derived
+         stored = _parse(row.get("outcome_json"))
+diff --git a/tests/gateway/test_turn_outcome_refresh.py b/tests/gateway/test_turn_outcome_refresh.py
+index 16f21359d9..0e7ff860fc 100644
+--- a/tests/gateway/test_turn_outcome_refresh.py
++++ b/tests/gateway/test_turn_outcome_refresh.py
+@@ -89,7 +89,7 @@ async def test_the_reply_returns_while_a_slow_refresh_is_still_running(tmp_path,
+                          created_at=datetime(2026, 1, 1), updated_at=datetime(2026, 1, 1))
+     started, release, finished = threading.Event(), threading.Event(), threading.Event()
+ 
+-    def slow_refresh(sid, trigger, *, db=None):
++    def slow_refresh(sid, trigger, *, db=None, concluding_turn=None):
+         started.set()
+         release.wait(10)
+         finished.set()
+diff --git a/tests/hermes_state/test_outcome_late_turn_end_refresh.py b/tests/hermes_state/test_outcome_late_turn_end_refresh.py
+new file mode 100644
+index 0000000000..2644bd0691
+--- /dev/null
++++ b/tests/hermes_state/test_outcome_late_turn_end_refresh.py
+@@ -0,0 +1,226 @@
++"""A turn-end refresh that runs late must not paint over a newer turn. [daveey]
++
++PR1131 review (t_01a1ce099f1c7723): the gateway runs its turn-end refresh on an unawaited thread and the TUI's
++refused-turn timer refreshes seconds later. Both used to skip every live turn, so a turn that started in between
++was overwritten with a non-running outcome. The concluding turn now captures its own evidence when it concludes
++(``capture_turn_identity``) and only that evidence is discounted.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import json
++import threading
++import time
++from datetime import UTC, datetime
++from types import SimpleNamespace
++
++import pytest
++
++import hermes_state_outcome as so
++from gateway.turn_outcome import refresh_gateway_turn_outcome
++from tests.hermes_state import test_outcome_turn_end_declaration as helpers
++
++from tests.waiting import wait_until
++from tui_gateway.turn_marker import clear_turn_marker, record_turn_start
++
++
++db = helpers.db
++KINDS = ["routing", "lease", "marker"]
++
++
++class Turns:
++    """Begin/end one kind of live-turn evidence for chat ``chat`` (a gateway routing token, a turn lease, a TUI marker)."""
++
++    def __init__(self, db, kind, monkeypatch):
++        self.db, self.kind = db, kind
++        monkeypatch.setattr(so, "_gateway_running", lambda home: True)
++
++    def begin(self, n):
++        if self.kind == "routing":
++            self.db.save_gateway_routing_entry("route", json.dumps({
++                "session_id": "chat", "active_turn_token": f"tok-{n}",
++                "active_turn_started_at": datetime.now(UTC).isoformat()}))
++        elif self.kind == "lease":
++            assert self.db.try_acquire_session_turn_lease("chat", f"turn-{n}", ttl_seconds=300.0)
++        else:
++            t0 = time.time()  # a new marker carries a new start time
++            wait_until(lambda: time.time() > t0 + 0.02, timeout=2.0)
++            assert record_turn_start(self.db.db_path.parent, "chat", f"prompt {n}")
++
++    def end(self, n):
++        if self.kind == "routing":
++            self.db.replace_gateway_routing_entries({})
++        elif self.kind == "lease":
++            self.db.release_session_turn_lease("chat", f"turn-{n}")
++        else:
++            clear_turn_marker(self.db.db_path.parent, "chat")
++
++
++def _gate_refresh(monkeypatch):
++    entered, release = threading.Event(), threading.Event()
++    real = so.refresh_outcome
++
++    def delayed(*args, **kwargs):
++        entered.set()
++        assert release.wait(10)
++        return real(*args, **kwargs)
++
++    monkeypatch.setattr(so, "refresh_outcome", delayed)
++    return entered, release
++
++
++def _next_turn_starts(db):
++    db.append_message("chat", role="user", content="start the next task", timestamp=time.time() + 1)
++
++
++@pytest.mark.parametrize("kind", KINDS)
++def test_a_late_gateway_refresh_keeps_the_newer_turn_running(db, monkeypatch, kind):
++    turns = Turns(db, kind, monkeypatch)
++    helpers._declare_then_reply(db)
++    turns.begin(1)  # the concluding turn's evidence, not yet released
++    entered, release = _gate_refresh(monkeypatch)
++    thread = refresh_gateway_turn_outcome(SimpleNamespace(_session_db=db), SimpleNamespace(session_id="chat"))
++    assert entered.wait(10)
++    try:
++        turns.end(1)
++        _next_turn_starts(db)
++        turns.begin(2)
++        assert so.derive_outcome("chat", db=db)["kind"] == "running"
++        release.set()
++        thread.join(10)
++        assert not thread.is_alive()
++        stored = so.get_outcome("chat", db=db)
++        assert stored["kind"] == "running", stored
++        assert stored["declared"]["kind"] == "waiting"  # the declared wait rides through the newer turn
++    finally:
++        release.set()
++        thread.join(10)
++        turns.end(2)
++
++
++@pytest.mark.parametrize("kind", KINDS)
++def test_a_gateway_refresh_still_discounts_its_own_unreleased_turn(db, monkeypatch, kind):
++    turns = Turns(db, kind, monkeypatch)
++    helpers._declare_then_reply(db)
++    turns.begin(1)
++    try:
++        thread = refresh_gateway_turn_outcome(SimpleNamespace(_session_db=db), SimpleNamespace(session_id="chat"))
++        thread.join(10)
++        stored = so.get_outcome("chat", db=db)
++        assert (stored["kind"], stored["source"]) == ("waiting", "declared"), stored
++    finally:
++        turns.end(1)
++
++
++@pytest.mark.parametrize("kind", KINDS)
++def test_a_failed_capture_discounts_nothing(db, monkeypatch, kind):
++    """No evidence captured = no bypass: a live turn is running, as before this PR."""
++    turns = Turns(db, kind, monkeypatch)
++    helpers._declare_then_reply(db)
++    turns.begin(1)
++    try:
++        assert so.refresh_outcome("chat", "turn_end", db=db, concluding_turn=frozenset())["kind"] == "running"
++        assert so.refresh_outcome("chat", "turn_end", db=db)["kind"] == "running"
++        assert so.refresh_outcome("chat", "turn_end", db=db, concluding_turn=["marker:1:2"])["kind"] == "running"
++    finally:
++        turns.end(1)
++
++
++def test_capture_turn_identity_names_each_kind_of_evidence(db, monkeypatch):
++    for kind, prefix in (("routing", "gateway:"), ("lease", "lease:"), ("marker", "marker:")):
++        turns = Turns(db, kind, monkeypatch)
++        assert so.capture_turn_identity("chat", db=db) == frozenset()
++        turns.begin(1)
++        first = so.capture_turn_identity("chat", db=db)
++        assert len(first) == 1 and next(iter(first)).startswith(prefix)
++        turns.end(1)
++        turns.begin(2)
++        assert so.capture_turn_identity("chat", db=db).isdisjoint(first)  # a later turn has its own identity
++        turns.end(2)
++
++
++# ── TUI / auto-continue entry path ──────────────────────────────────────────
++
++
++@pytest.fixture
++def timers(monkeypatch):
++    fired = []
++
++    class _Timer:
++        def __init__(self, delay, fn):
++            fired.append(fn)
++
++        daemon = False
++
++        def start(self):
++            pass
++
++    monkeypatch.setattr(threading, "Timer", _Timer)
++    return fired
++
++
++def _arm_refused_retry(db, monkeypatch, timers):
++    from tui_gateway import server
++
++    monkeypatch.setattr(server, "_hermes_home", db.db_path.parent)
++    monkeypatch.setattr(server, "_session_profile_runtime_scope", lambda s: contextlib.nullcontext(), raising=False)
++    monkeypatch.setattr(server, "_session_db", lambda s: contextlib.nullcontext(db), raising=False)
++    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *a: None)
++    monkeypatch.setattr("tui_gateway.update_pause._detect_skew", lambda: None)
++    session = {"session_key": "chat", "agent": None, "_refused_turn_delay": 45.0}
++    server._schedule_refused_turn_retry("chat", session, "retry-marker-key")
++    assert len(timers) == 1
++    return timers[0]
++
++
++@pytest.mark.parametrize("kind", ["routing", "lease"])
++def test_the_refused_turn_timer_keeps_a_newer_turn_running(db, monkeypatch, timers, kind):
++    turns = Turns(db, kind, monkeypatch)
++    helpers._declare_then_reply(db)
++    turns.begin(1)  # the refused turn, concluding
++    fire = _arm_refused_retry(db, monkeypatch, timers)
++    turns.end(1)
++    _next_turn_starts(db)
++    turns.begin(2)  # the user's next turn starts during the retry wait
++    try:
++        fire()
++        stored = so.get_outcome("chat", db=db)
++        assert stored["kind"] == "running", stored
++        assert stored["declared"]["kind"] == "waiting"
++    finally:
++        turns.end(2)
++
++
++@pytest.mark.parametrize("kind", ["routing", "lease"])
++def test_the_refused_turn_timer_discounts_the_refused_turns_own_evidence(db, monkeypatch, timers, kind):
++    turns = Turns(db, kind, monkeypatch)
++    helpers._declare_then_reply(db)
++    turns.begin(1)
++    fire = _arm_refused_retry(db, monkeypatch, timers)
++    try:
++        fire()  # no newer turn: only the refused turn's own, still unreleased, evidence is present
++        stored = so.get_outcome("chat", db=db)
++        assert (stored["kind"], stored["source"]) == ("waiting", "declared"), stored
++    finally:
++        turns.end(1)
++
++
++def test_the_tui_turn_end_captures_its_own_evidence_when_none_is_passed(db, monkeypatch):
++    from tui_gateway import server
++    from tui_gateway import turn_outcome as tui
++
++    turns = Turns(db, "lease", monkeypatch)
++    helpers._declare_then_reply(db)
++    monkeypatch.setattr(server, "_session_profile_runtime_scope", lambda s: contextlib.nullcontext(), raising=False)
++    monkeypatch.setattr(server, "_session_db", lambda s: contextlib.nullcontext(db), raising=False)
++    turns.begin(1)
++    try:
++        tui.refresh_turn_outcome({"session_key": "chat"})
++        stored = so.get_outcome("chat", db=db)
++        assert (stored["kind"], stored["source"]) == ("waiting", "declared"), stored
++        assert tui.capture_concluding_turn({"session_key": "chat"}) == so.capture_turn_identity("chat", db=db)
++    finally:
++        turns.end(1)
++    assert tui.capture_concluding_turn({"session_key": ""}) == frozenset()
++
+diff --git a/tests/hermes_state/test_outcome_turn_end_declaration.py b/tests/hermes_state/test_outcome_turn_end_declaration.py
+new file mode 100644
+index 0000000000..0a9d1590b2
+--- /dev/null
++++ b/tests/hermes_state/test_outcome_turn_end_declaration.py
+@@ -0,0 +1,118 @@
++"""A declared wait survives the turn's own turn-end refresh, and a refresh during a live turn. [daveey]
++
++Desktop chat local-9c06dfbb… (2026-11-10/11): the agent declared ``waiting`` on its open hub card mid-turn; the
++gateway's turn-end refresh ran while the turn's own routing token / lease was still held, derived ``running`` and
++overwrote the declaration (``{"kind":"running"}`` carried nothing). The next refresh judged the reply alone and
++painted the chat done (green) while the suite it promised was unbuilt.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++import hermes_state_outcome as so
++from hermes_state import SessionDB
++from tui_gateway.turn_marker import clear_turn_marker, record_turn_start
++
++WAIT = {"kind": "waiting", "on": [{"kind": "card", "id": "t_suite", "label": "Fleet scheduling regression suite"}]}
++# A reply the heuristic (no judge) reads as a closing summary: without the declaration it derives done.
++REPLY = "The suite is not built yet; the implementation card is queued on the hub and I will report when it lands."
++
++
++@pytest.fixture
++def db(tmp_path, monkeypatch):
++    from hermes_cli import kanban_session_activity as ksa
++    monkeypatch.setattr(ksa, "_board_db_paths", list)
++    monkeypatch.setattr(ksa, "_remote_cards", lambda *a, **k: [])
++    ksa._reset_cache_for_tests()
++    so._reset_hooks_for_tests()
++    handle = SessionDB(db_path=tmp_path / "state.db")
++    handle.create_session("chat", source="desktop")
++    yield handle
++    handle.close()
++    so._reset_hooks_for_tests()
++    ksa._reset_cache_for_tests()
++
++
++def _declare_then_reply(db):
++    db.append_message("chat", role="user", content="is the suite built?")
++    so.declare_outcome("chat", WAIT, db=db)
++    db.append_message("chat", role="assistant", content=REPLY)
++
++
++def test_a_refresh_during_the_live_turn_keeps_the_declaration(db):
++    _declare_then_reply(db)
++    home = db.db_path.parent
++    record_turn_start(home, "chat", "is the suite built?")
++    try:
++        running = so.refresh_outcome("chat", "notice", db=db)
++        assert running["kind"] == "running"
++        assert running["declared"]["kind"] == "waiting"
++    finally:
++        clear_turn_marker(home, "chat")
++    after = so.refresh_outcome("chat", "notice", db=db)
++    assert (after["kind"], after["source"]) == ("waiting", "declared")
++    assert after["on"][0]["id"] == "t_suite"
++
++
++def test_the_turns_own_turn_end_refresh_ignores_its_unreleased_turn(db):
++    _declare_then_reply(db)
++    home = db.db_path.parent
++    record_turn_start(home, "chat", "is the suite built?")  # the lease/token the concluding turn still holds
++    try:
++        own = so.capture_turn_identity("chat", db=db)  # what the turn captures when it concludes
++        assert own
++        out = so.refresh_outcome("chat", "turn_end", db=db, concluding_turn=own)
++    finally:
++        clear_turn_marker(home, "chat")
++    assert (out["kind"], out["source"]) == ("waiting", "declared")
++    assert so.get_outcome("chat", db=db)["kind"] == "waiting"
++
++
++def test_without_a_declaration_running_still_carries_nothing(db):
++    db.append_message("chat", role="user", content="go")
++    home = db.db_path.parent
++    record_turn_start(home, "chat", "go")
++    try:
++        out = so.refresh_outcome("chat", "notice", db=db)
++    finally:
++        clear_turn_marker(home, "chat")
++    assert out["kind"] == "running" and "declared" not in out
++
++
++def test_a_newer_user_row_still_supersedes_a_carried_declaration(db):
++    _declare_then_reply(db)
++    home = db.db_path.parent
++    record_turn_start(home, "chat", "next")
++    try:
++        so.refresh_outcome("chat", "notice", db=db)
++    finally:
++        clear_turn_marker(home, "chat")
++    import time
++    db.append_message("chat", role="user", content="something else", timestamp=time.time() + 5)
++    out = so.refresh_outcome("chat", "notice", db=db)
++    assert out["source"] == "derived" and out["kind"] == "unresolved"
++
++
++def test_both_turn_end_callers_pass_the_concluding_turn_never_a_blanket_bypass(monkeypatch):
++    """Entry paths: the gateway (messaging/local Desktop runtime) and the TUI turn-end refresh."""
++    calls = []
++    monkeypatch.setattr(so, "refresh_outcome", lambda sid, trigger, **kw: calls.append((sid, trigger, kw)) or {})
++    monkeypatch.setattr(so, "capture_turn_identity", lambda sid, db=None: frozenset({"lease:h:1"}))
++    from gateway import turn_outcome as gw
++
++    gw._refresh("chat", object(), gw._capture("chat", object()))
++    assert calls[-1][1] == "turn_end" and calls[-1][2].get("concluding_turn") == frozenset({"lease:h:1"})
++    assert "ignore_live_turn" not in calls[-1][2]
++
++    import contextlib
++    from tui_gateway import server
++    from tui_gateway import turn_outcome as tui
++
++    monkeypatch.setattr(server, "_session_profile_runtime_scope", lambda s: contextlib.nullcontext(), raising=False)
++    monkeypatch.setattr(server, "_session_db", lambda s: contextlib.nullcontext(object()), raising=False)
++    tui.refresh_turn_outcome({"session_key": "chat"})
++    assert calls[-1][1] == "turn_end" and calls[-1][2].get("concluding_turn") == frozenset({"lease:h:1"})
++    assert "ignore_live_turn" not in calls[-1][2]
++    tui.refresh_turn_outcome({"session_key": "chat"}, None, frozenset({"marker:1:2"}))  # a timer's earlier capture
++    assert calls[-1][2].get("concluding_turn") == frozenset({"marker:1:2"})
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 6b2c1ad1a5..503a105dd5 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -123,6 +123,11 @@ def _schedule_refused_turn_retry(sid: str, session: dict, marker_key: str) -> No
+     if delay is None:
+         return
+ 
++    # [daveey] The refused turn's own evidence, taken when it concluded: a turn the user starts during the wait is
++    # a live turn the refresh must not paint over.
++    from tui_gateway.turn_outcome import capture_concluding_turn
++    concluding = capture_concluding_turn(session, session.get("agent"))
++
+     def fire() -> None:
+         from tui_gateway.update_pause import _detect_skew
+         if _detect_skew() is not None:
+@@ -130,7 +135,7 @@ def _schedule_refused_turn_retry(sid: str, session: dict, marker_key: str) -> No
+         if _maybe_schedule_auto_continue(sid, session, marker_key) is None \
+                 and read_turn_marker(_session_home(session), marker_key) is None:
+             from tui_gateway.turn_outcome import refresh_turn_outcome
+-            refresh_turn_outcome(session, session.get("agent"))
++            refresh_turn_outcome(session, session.get("agent"), concluding)
+ 
+     timer = threading.Timer(delay, fire)
+     timer.daemon = True
+diff --git a/tui_gateway/turn_outcome.py b/tui_gateway/turn_outcome.py
+index bfddc9f670..e1ea9a71fc 100644
+--- a/tui_gateway/turn_outcome.py
++++ b/tui_gateway/turn_outcome.py
+@@ -8,17 +8,41 @@ from what the turn left behind rather than from idleness. Best-effort: never rai
+ from __future__ import annotations
+ 
+ import logging
++from typing import Optional
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+-def refresh_turn_outcome(session: dict, agent=None) -> None:
+-    """Refresh the outcome of the row this turn wrote (the agent's compression tip, else the session key)."""
+-    sid = str(getattr(agent, "session_id", "") or session.get("session_key") or "")
++def _turn_sid(session: dict, agent=None) -> str:
++    return str(getattr(agent, "session_id", "") or session.get("session_key") or "")
++
++
++def capture_concluding_turn(session: dict, agent=None) -> frozenset:
++    """The concluding turn's own live-turn evidence (marker, turn lease), taken now. A refresh that runs later
++    (a timer) passes it back so a turn started in between stays a live turn. Failure discounts nothing."""
++    sid = _turn_sid(session, agent)
++    if not sid:
++        return frozenset()
++    try:
++        from hermes_state_outcome import capture_turn_identity
++        from tui_gateway import server  # split helpers only work rebound onto server globals (bind_module)
++
++        with server._session_profile_runtime_scope(session), server._session_db(session) as db:
++            return capture_turn_identity(sid, db=db) if db is not None else frozenset()
++    except Exception:  # health: allow BLE001 -- best-effort; an unreadable store discounts nothing
++        logger.warning("turn identity capture failed for %s", sid, exc_info=True)
++        return frozenset()
++
++
++def refresh_turn_outcome(session: dict, agent=None, concluding_turn: Optional[frozenset] = None) -> None:
++    """Refresh the outcome of the row this turn wrote (the agent's compression tip, else the session key).
++    ``concluding_turn``: evidence captured when the turn concluded (``capture_concluding_turn``); omitted = the
++    turn is concluding right now and its evidence is captured here, in the same store scope."""
++    sid = _turn_sid(session, agent)
+     if not sid:
+         return
+     try:
+-        from hermes_state_outcome import refresh_outcome
++        from hermes_state_outcome import capture_turn_identity, refresh_outcome
+         from tui_gateway import server  # split helpers only work rebound onto server globals (bind_module)
+ 
+         # The turn has already released its secret scope (the home override alone
+@@ -26,6 +50,8 @@ def refresh_turn_outcome(session: dict, agent=None) -> None:
+         # context threads: bind the owning session's full runtime scope again.
+         with server._session_profile_runtime_scope(session), server._session_db(session) as db:
+             if db is not None:
+-                refresh_outcome(sid, "turn_end", db=db)
++                if concluding_turn is None:
++                    concluding_turn = capture_turn_identity(sid, db=db)
++                refresh_outcome(sid, "turn_end", db=db, concluding_turn=concluding_turn)
+     except Exception:  # health: allow BLE001 -- the turn already concluded; a failed refresh is logged
+         logger.warning("turn-end outcome refresh failed for %s", sid, exc_info=True)
+-- 
+2.51.0
+

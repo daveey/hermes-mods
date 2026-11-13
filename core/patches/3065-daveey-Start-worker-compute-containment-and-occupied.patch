@@ -1,0 +1,313 @@
+From 81cece5a2d6e07b720a35aac18f1e7659108cdaf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:00:10 +0000
+Subject: [PATCH] [daveey] Start worker compute containment and occupied-owner
+ accounting
+
+---
+ hermes_cli/kanban_aggregate_scope.py          |  18 ++-
+ hermes_cli/kanban_db_dispatch.py              |   3 +-
+ hermes_cli/worker_compute_capacity.py         | 108 ++++++++++++++++++
+ .../test_worker_compute_capacity.py           |  48 ++++++++
+ .../hermes_cli/test_worker_compute_launch.py  |  51 +++++++++
+ tools/process_registry_persist_scope.py       |   7 ++
+ 6 files changed, 230 insertions(+), 5 deletions(-)
+ create mode 100644 hermes_cli/worker_compute_capacity.py
+ create mode 100644 tests/hermes_cli/test_worker_compute_capacity.py
+ create mode 100644 tests/hermes_cli/test_worker_compute_launch.py
+
+diff --git a/hermes_cli/kanban_aggregate_scope.py b/hermes_cli/kanban_aggregate_scope.py
+index d0d09d0933..8ea6fc09c7 100644
+--- a/hermes_cli/kanban_aggregate_scope.py
++++ b/hermes_cli/kanban_aggregate_scope.py
+@@ -21,10 +21,20 @@ def configure_pool():
+         raise RestartSafeScopeUnavailable(f'Kanban aggregate memory budget unavailable: {exc}') from exc
+ 
+ 
+-def bounded_scope(argv):
+-    """Add the shared bounded slice only to the systemd scope wrapper, never worker args."""
++def bounded_scope(argv, *, task_id=None, board=None):
++    """Add the bounded pool, and the opt-in worker's stable per-card CPU slice."""
++    from hermes_cli.worker_compute_capacity import configure_card, worker_enabled
++
++    enabled = worker_enabled()
+     if not argv or argv[0].rsplit('/', 1)[-1] != 'systemd-run' or '--scope' not in argv:
++        if enabled:
++            raise ValueError('Worker compute policy requires a systemd scope')
+         return argv
+     configure_pool()
+-    at = argv.index('--') if '--' in argv else argv.index('--scope') + 1  # systemd-run option space only
+-    return [*argv[:at], '--slice=hermes-kanban.slice', *argv[at:]]
++    at = argv.index('--') if '--' in argv else argv.index('--scope') + 1
++    if not enabled:
++        return [*argv[:at], '--slice=hermes-kanban.slice', *argv[at:]]
++    if not task_id or not board or '--' not in argv:
++        raise ValueError('Worker compute scope requires board and task identity')
++    name = configure_card(board, task_id)
++    return [*argv[:at], f'--slice={name}', '--', 'nice', '-n', '15', *argv[at + 1:]]
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index e0161fc272..6d26a1ad92 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2707,7 +2707,8 @@ def _restart_safe_worker_argv(task: Task, command: list[str], board: Optional[st
+         outlives_parent=True,
+     ).argv)
+     # OOM recovery raises the cap; bounded_scope adds the shared pool (kanban_aggregate_scope)
+-    return _aggregate_scope.bounded_scope(_worker_scope.apply_oom_recovery(argv, task.id, board))
++    return _aggregate_scope.bounded_scope(
++        _worker_scope.apply_oom_recovery(argv, task.id, board), task_id=task.id, board=board or 'default')
+ 
+ 
+ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None, observation=None) -> Optional[int]:
+diff --git a/hermes_cli/worker_compute_capacity.py b/hermes_cli/worker_compute_capacity.py
+new file mode 100644
+index 0000000000..871e023fdd
+--- /dev/null
++++ b/hermes_cli/worker_compute_capacity.py
+@@ -0,0 +1,108 @@
++"""Host capacity primitives for opt-in, cgroup-contained worker execution.
++
++The caller owns the host admission lock and durable board/task-to-slice map.
++A parked task is still occupied while its slice contains any descendants.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import math
++from pathlib import Path
++
++
++def pressure_held(held: bool, load: float, cores: float) -> bool:
++    """Load/core hysteresis; invalid observations must refuse rather than release."""
++    if not math.isfinite(load) or load < 0 or not math.isfinite(cores) or cores <= 0:
++        raise ValueError('invalid load/core observation')
++    return load / cores > 1.0 if held else load / cores >= 1.5
++
++Owner = tuple[str, str]
++
++
++def owner_slice(board: str, task: str) -> str:
++    """Stable across retries and profiles; hex cannot create systemd nesting."""
++    digest = hashlib.sha256(json.dumps([board, task]).encode()).hexdigest()
++    return f"hermes-kanban-{digest}.slice"
++
++
++def occupied_owners(root: Path, owners: dict[str, Owner], active: set[Owner]) -> set[Owner]:
++    """Union active cards with populated child units, including unknown legacy jobs.
++
++    Read errors propagate: an incomplete inventory cannot prove free capacity.
++    cgroup.events populated includes descendants, unlike cgroup.procs.
++    """
++    occupied = set(active)
++    for child in root.iterdir():
++        if not child.is_dir():
++            continue
++        events = dict(line.split() for line in (child / 'cgroup.events').read_text(encoding='utf-8').splitlines())
++        populated = events.get('populated')
++        if populated not in {'0', '1'}:
++            raise ValueError(f'invalid populated observation for {child.name}')
++        if populated == '1':
++            occupied.add(owners.get(child.name, ('unknown-cgroup', child.name)))
++    return occupied
++
++
++def worker_enabled() -> bool:
++    """Read installation policy, never a card's environment or profile override."""
++    from hermes_constants import get_default_hermes_root
++    from hermes_cli.config_backend import read_config_doc_readonly
++
++    try:
++        doc = read_config_doc_readonly(Path(get_default_hermes_root()) / 'config.yaml')
++    except FileNotFoundError:
++        return False
++    raw = ((doc or {}).get('kanban') or {}).get('worker_resources', {})
++    if not isinstance(raw, dict) or type(raw.get('enabled', False)) is not bool:
++        raise ValueError('invalid worker_resources policy')
++    return raw.get('enabled', False)
++
++
++def configure_card(board: str, task: str) -> str:
++    """Verify the root backstop, configure/read back CPU quotas, retain ownership.
++
++    No success cache: cpuset changes and changed controller settings must be seen.
++    The existing aggregate memory pool is configured by the caller.
++    """
++    import os
++    import subprocess
++    from hermes_constants import get_default_hermes_root
++    from tools.process_registry import RestartSafeScopeUnavailable, systemd_user_bus_env
++
++    env = systemd_user_bus_env()
++    if env is None:
++        raise RestartSafeScopeUnavailable('Worker compute budget requires the user bus')
++    cores = len(os.sched_getaffinity(0))
++    base = Path('/sys/fs/cgroup/user.slice') / f'user-{os.getuid()}.slice'
++    _verify_quota(base, cores * .875)
++    name = owner_slice(board, task)
++    manager = base / f'user@{os.getuid()}.service'
++    pool = manager / 'hermes.slice' / 'hermes-kanban.slice'
++    for unit, quota, path in [('hermes-kanban.slice', cores * .75, pool), (name, 2, pool / name)]:
++        for arguments in [('set-property', '--runtime', unit, f'CPUQuota={quota * 100:g}%', 'CPUWeight=10'),
++                          ('start', unit)]:
++            subprocess.run(['systemctl', '--user', *arguments], env=env, check=True,
++                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10)
++        _verify_quota(path, quota)
++    directory = Path(get_default_hermes_root()) / 'worker-resources' / 'owners'
++    directory.mkdir(parents=True, exist_ok=True)
++    # Immutable one-file-per-owner: concurrent retries write identical bytes.
++    import tempfile
++    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=directory, delete=False) as handle:
++        temporary = Path(handle.name)
++        json.dump([board, task], handle)
++        handle.flush()
++        os.fsync(handle.fileno())
++    try:
++        os.replace(temporary, directory / f'{name}.json')
++    finally:
++        temporary.unlink(missing_ok=True)
++    return name
++
++
++def _verify_quota(path: Path, maximum: float) -> None:
++    raw, period = (path / 'cpu.max').read_text(encoding='utf-8').split()
++    if raw == 'max' or int(period) <= 0 or int(raw) <= 0 or int(raw) / int(period) > maximum:
++        raise ValueError(f'Worker CPU quota is missing or too wide: {path.name}')
+diff --git a/tests/hermes_cli/test_worker_compute_capacity.py b/tests/hermes_cli/test_worker_compute_capacity.py
+new file mode 100644
+index 0000000000..f8027d423b
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_compute_capacity.py
+@@ -0,0 +1,48 @@
++"""Worker capacity follows live cgroups, not just running card rows."""
++import pytest
++
++
++@pytest.mark.parametrize(('held', 'load', 'expected'), [(False, 23.9, False), (False, 24, True),
++                                                      (True, 20, True), (True, 16, False)])
++def test_load_brake_thresholds(held, load, expected):
++    from hermes_cli.worker_compute_capacity import pressure_held
++    assert pressure_held(held, load, 16) is expected
++
++
++@pytest.mark.parametrize(('load', 'cores'), [(float('nan'), 16), (float('inf'), 16), (-1, 16), (1, 0)])
++def test_invalid_pressure_is_not_free_capacity(load, cores):
++    from hermes_cli.worker_compute_capacity import pressure_held
++    with pytest.raises(ValueError):
++        pressure_held(False, load, cores)
++
++
++def test_parked_live_owner_reduces_capacity_and_retries_deduplicate(tmp_path):
++    from hermes_cli.worker_compute_capacity import occupied_owners, owner_slice
++
++    owner = ('board-a', 't_one')
++    name = owner_slice(*owner)
++    tmp_path = tmp_path / 'cgroups'
++    tmp_path.mkdir()
++    group = tmp_path / name
++    group.mkdir()
++    (group / 'cgroup.events').write_text('populated 1\nfrozen 0\n')
++    # No running row: the parked card's descendant still reserves a slot.
++    assert occupied_owners(tmp_path, {name: owner}, set()) == {owner}
++    # A resumed attempt does not reserve twice.
++    assert occupied_owners(tmp_path, {name: owner}, {owner}) == {owner}
++    (group / 'cgroup.events').write_text('populated 0\nfrozen 0\n')
++    assert occupied_owners(tmp_path, {name: owner}, set()) == set()
++
++
++def test_unknown_populated_scope_reserves_and_failed_sample_refuses(tmp_path):
++    from hermes_cli.worker_compute_capacity import occupied_owners
++
++    tmp_path = tmp_path / 'cgroups'
++    tmp_path.mkdir()
++    group = tmp_path / 'legacy.scope'
++    group.mkdir()
++    (group / 'cgroup.events').write_text('populated 1\n')
++    assert occupied_owners(tmp_path, {}, set()) == {('unknown-cgroup', 'legacy.scope')}
++    (group / 'cgroup.events').write_text('frozen 0\n')
++    with pytest.raises(ValueError, match='populated'):
++        occupied_owners(tmp_path, {}, set())
+diff --git a/tests/hermes_cli/test_worker_compute_launch.py b/tests/hermes_cli/test_worker_compute_launch.py
+new file mode 100644
+index 0000000000..f01bf8ecca
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_compute_launch.py
+@@ -0,0 +1,51 @@
++"""The whole worker scope must share its durable per-card CPU slice."""
++from unittest.mock import patch
++from types import SimpleNamespace
++import pytest
++
++
++def test_persisted_worker_job_refuses_unavailable_bus(monkeypatch):
++    from tools import process_registry as pr
++    from tools import process_registry_persist_scope as persist
++    from hermes_cli import worker_compute_capacity as capacity
++
++    monkeypatch.setattr(capacity, 'worker_enabled', lambda: True)
++    monkeypatch.setattr(pr, '_IS_LINUX', True)
++    monkeypatch.setattr(persist, 'kanban_run_scope_cgroup', lambda: None)
++    monkeypatch.setattr(persist, 'user_unit_cgroup', lambda: None)
++    with pytest.raises(pr.RestartSafeScopeUnavailable):
++        persist.persisted_job_scope_argv(SimpleNamespace(persist_on_release=True), ['sleep', '1'], 'job')
++
++
++def test_persisted_job_retains_owning_card_slice(monkeypatch, tmp_path):
++    from tools import process_registry as pr
++    from tools import process_registry_persist_scope as persist
++    from hermes_cli.worker_compute_capacity import owner_slice
++
++    card_slice = owner_slice('board', 'task')
++    unit = tmp_path / card_slice / 'hermes-worker-kanban-task-run-1.scope'
++    unit.mkdir(parents=True)
++    (unit / 'memory.max').write_text(str(4 * 1024 ** 3))
++    monkeypatch.setattr(persist, 'kanban_run_scope_cgroup', lambda: unit)
++    monkeypatch.setattr(persist.shutil, 'which', lambda _: '/usr/bin/systemd-run')
++    monkeypatch.setattr(pr, '_systemd_run_user_scope_available', lambda: True)
++    monkeypatch.setattr(pr, '_IS_LINUX', True)
++    session = SimpleNamespace(persist_on_release=True, systemd_unit=None)
++    got = persist.persisted_job_scope_argv(session, ['sleep', '1'], 'job')
++    assert f'--slice={card_slice}' in got
++
++
++def test_worker_launch_retains_memory_pool_and_uses_card_cpu_slice():
++    from hermes_cli import kanban_aggregate_scope as scope
++    from hermes_cli.worker_compute_capacity import owner_slice
++
++    argv = ['systemd-run', '--user', '--scope', '--', 'python', '-m', 'agent.managed_worker']
++    scope.configure_pool.cache_clear()
++    with patch('hermes_cli.worker_compute_capacity.worker_enabled', return_value=True), \
++         patch('hermes_cli.worker_compute_capacity.configure_card', return_value=owner_slice('board', 'task')) as configure, \
++         patch('subprocess.run'):
++        got = scope.bounded_scope(argv, task_id='task', board='board')
++    configure.assert_called_once_with('board', 'task')
++    assert f'--slice={owner_slice("board", "task")}' in got[:got.index('--')]
++    assert got[got.index('--') + 1:] == ['nice', '-n', '15', 'python', '-m', 'agent.managed_worker']
++    scope.configure_pool.cache_clear()
+diff --git a/tools/process_registry_persist_scope.py b/tools/process_registry_persist_scope.py
+index 96ea617f04..656e8bd373 100644
+--- a/tools/process_registry_persist_scope.py
++++ b/tools/process_registry_persist_scope.py
+@@ -76,12 +76,19 @@ def persisted_job_scope_argv(session, shell_argv: list[str], unit_suffix: str) -
+     unit = run_scope if run_scope is not None else user_unit_cgroup()
+     binary = shutil.which("systemd-run") if unit is not None else None
+     if unit is None or binary is None or not pr._systemd_run_user_scope_available():
++        from hermes_cli.worker_compute_capacity import worker_enabled
++        if worker_enabled():
++            raise pr.RestartSafeScopeUnavailable('Worker persisted compute requires an available user scope')
+         return shell_argv
+     raw = _unit_memory_max(unit)
+     capped = raw.isdigit() and int(raw) >= pr._MIN_WORKER_MEMORY_MAX_BYTES
+     memory_max: int | str
+     if run_scope is not None:
+         memory_max, slice_name = (int(raw) if capped else 0), KANBAN_SLICE
++        # A persistent command outlives its run, not its card's CPU budget.
++        import re
++        if re.fullmatch(r'hermes-kanban-[0-9a-f]{64}\.slice', run_scope.parent.name):
++            slice_name = run_scope.parent.name
+     else:
+         # The spawner's own bound; the 4 GiB worker default would OOM a build its uncapped spawner can run.
+         memory_max, slice_name = (int(raw) if capped else "infinity"), APP_SLICE
+-- 
+2.51.0
+

@@ -1,0 +1,133 @@
+From 76ce83a7a8db36d4ef80b58bd7a2939ad2ea0457 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:32:54 +0000
+Subject: [PATCH] [daveey] fix(kanban): an in-review review_required card is
+ never told it is not in review
+
+Follow-up to PR #1879 review nits (reviews 5886411040, 5886874328; card t_01a1d35224e4091c):
+
+1. require_review: any lane completing a card already in 'review' with an
+   expected_run_id (an operator passing a run id, or a worker holding a
+   stale run id) now gets the pending-review text plus 'Run N is not its
+   current run' instead of 'is not in review' (operator) or 'use
+   kanban_request_review' (worker). Every such call was refused before and
+   still is; no permission changes.
+2. The worker refusal outside review says 'A kanban worker run cannot
+   complete this card outside review' (it also hits dispatched
+   orchestrators), not 'The implementer'.
+3. _handle_complete reads _worker_run_id(tid) once for both the
+   completion_refusal check and the completion fence (pure refactor).
+
+Proof: test_in_review_card_with_stale_run_id_is_named_pending_review
+(operator + both worker identities) and the worker wording assertion fail
+on base e938c6e543 (4 failed) and pass on head;
+test_operator_can_approve_review_but_implementer_cannot now pins the
+pending-review text. 22 review_required files (581) and 53 kanban_tools
+completion files (1704) green.
+---
+ hermes_cli/kanban_review_required.py          |  8 ++++---
+ tests/tools/test_kanban_review_required.py    |  3 ++-
+ .../test_kanban_review_required_wording.py    | 22 +++++++++++++++++++
+ tools/kanban_tools.py                         |  4 ++--
+ 4 files changed, 31 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_review_required.py b/hermes_cli/kanban_review_required.py
+index c4eaf780fa..ed9f759c9e 100644
+--- a/hermes_cli/kanban_review_required.py
++++ b/hermes_cli/kanban_review_required.py
+@@ -39,10 +39,12 @@ def require_review(conn, task_id: str, expected_run_id: int | None, *, placement
+             and (expected_run_id is None or expected_run_id == task.current_run_id)
+             and kb._retry_status_for_run(conn, task_id, task.current_run_id) == "review"):
+         return
+-    if task.status == "review" and expected_run_id is None:
++    if task.status == "review":  # never tell any lane an in-review card "is not in review"
++        stale = ("" if expected_run_id is None else
++                 f" Run {expected_run_id} is not its current run: a card pending review has none.")
+         raise ReviewRequiredError(
+             f"{task_id} is pending review: a reviewer approves it by claiming the review run; only "
+-            f"{OPERATOR} may approve it without claiming it."
++            f"{OPERATOR} may approve it without claiming it.{stale}"
+         )
+     if not worker:
+         raise ReviewRequiredError(
+@@ -52,5 +54,5 @@ def require_review(conn, task_id: str, expected_run_id: int | None, *, placement
+         )
+     raise ReviewRequiredError(
+         f"{task_id} requires review: use kanban_request_review, then a reviewer may complete it. "
+-        "The implementer cannot complete this card, even with --force."
++        "A kanban worker run cannot complete this card outside review, even with --force."
+     )
+diff --git a/tests/tools/test_kanban_review_required.py b/tests/tools/test_kanban_review_required.py
+index 5b5563602d..b87b929274 100644
+--- a/tests/tools/test_kanban_review_required.py
++++ b/tests/tools/test_kanban_review_required.py
+@@ -71,8 +71,9 @@ def test_reviewer_completion_allowed(board, monkeypatch, surface):
+ def test_operator_can_approve_review_but_implementer_cannot(board, monkeypatch):
+     tid, run = claimed(board, monkeypatch)
+     assert kb.request_review(board, tid, summary="implemented", expected_run_id=run)
+-    with pytest.raises(ValueError, match="kanban_request_review"):
++    with pytest.raises(ValueError, match="is pending review"):  # already in review: not "use kanban_request_review"
+         kb.complete_task(board, tid, summary="skip", expected_run_id=run)
++    assert kb.get_task(board, tid).status == "review"
+     monkeypatch.delenv("HERMES_KANBAN_TASK")
+     monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+     assert kb.complete_task(board, tid, summary="operator approved")
+diff --git a/tests/tools/test_kanban_review_required_wording.py b/tests/tools/test_kanban_review_required_wording.py
+index 43dece93a0..1e9f2aea32 100644
+--- a/tests/tools/test_kanban_review_required_wording.py
++++ b/tests/tools/test_kanban_review_required_wording.py
+@@ -67,6 +67,7 @@ def test_worker_approving_pending_review_without_claim_names_operator(board, mon
+         kb.complete_task(board, tid, summary="approve child", force=True)
+     message = str(refused.value)
+     assert OPERATOR in message and "without claiming" in message
++    assert "is not its current run" not in message  # no run id was passed
+     assert "kanban_request_review" not in message  # the card is already in review
+     assert kb.get_task(board, tid).status == "review"
+ 
+@@ -92,6 +93,27 @@ def test_worker_refusal_does_not_offer_operator_escape_hatch(board, monkeypatch)
+         kb.complete_task(board, tid, summary="skip", expected_run_id=run)
+     assert "kanban_request_review" in str(refused.value)
+     assert "--review-required off" not in str(refused.value)
++    assert "A kanban worker run cannot complete" in str(refused.value)  # orchestrators too, not only implementers
++    assert "implementer" not in str(refused.value)
++
++
++# --- PR #1879 review nits: an in-review card is never told it "is not in review" ---
++
++
++@pytest.mark.parametrize("identity", (None, *IDENTITIES))
++def test_in_review_card_with_stale_run_id_is_named_pending_review(board, monkeypatch, identity):
++    tid, run = claimed(board, monkeypatch)
++    assert kb.request_review(board, tid, summary="implemented", expected_run_id=run)
++    as_operator(monkeypatch)
++    if identity:
++        monkeypatch.setenv(identity, "t_orchestrator")
++    with pytest.raises(ValueError) as refused:
++        kb.complete_task(board, tid, summary="approve", expected_run_id=run, force=True)
++    message = str(refused.value)
++    assert "pending review" in message and f"Run {run} is not its current run" in message
++    assert "not in review" not in message
++    assert "kanban_request_review" not in message  # the card is already in review
++    assert kb.get_task(board, tid).status == "review"  # still refused: no permission widened
+ 
+ 
+ def _dashboard(tmp_path):
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 25ab64a7d7..cf580fe07e 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -902,9 +902,9 @@ def _handle_complete(args: dict, **kw) -> str:
+         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
+         task = kb.get_task(conn, tid)
+         from hermes_cli import kanban_review_contract as _krc  # [daveey] a review ship would refuse: refuse it now
+-        if refused := _krc.completion_refusal(getattr(task, "body", None), metadata, _worker_run_id(tid)):
+-            raise _Reject(*refused)
+         run_id = _worker_run_id(tid)
++        if refused := _krc.completion_refusal(getattr(task, "body", None), metadata, run_id):
++            raise _Reject(*refused)
+         if run_id is not None and _kc.parked_by_own_run(conn, tid, run_id):
+             # This worker parked its card with kanban_block, then edited its own edges (kanban_unlink):
+             # its run is over but nothing has claimed the card since, so it may still close its own card.
+-- 
+2.51.0
+

@@ -1,0 +1,515 @@
+From 0dd8724bc3b2b30039f0b99948140a643973d7aa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:09:58 +0000
+Subject: [PATCH] [daveey] Add independent sustained worker-load observer and
+ durable alert outbox
+
+---
+ docs/worker-compute-capacity.md               |  29 ++++
+ hermes_cli/worker_load_observer.py            | 134 ++++++++++++++++
+ hermes_cli/worker_load_snapshot.py            |  89 +++++++++++
+ tests/hermes_cli/test_worker_load_observer.py | 147 ++++++++++++++++++
+ tests/hermes_cli/test_worker_load_snapshot.py |  60 +++++++
+ 5 files changed, 459 insertions(+)
+ create mode 100644 hermes_cli/worker_load_observer.py
+ create mode 100644 hermes_cli/worker_load_snapshot.py
+ create mode 100644 tests/hermes_cli/test_worker_load_observer.py
+ create mode 100644 tests/hermes_cli/test_worker_load_snapshot.py
+
+diff --git a/docs/worker-compute-capacity.md b/docs/worker-compute-capacity.md
+index e8efcad0d9..8a237a0567 100644
+--- a/docs/worker-compute-capacity.md
++++ b/docs/worker-compute-capacity.md
+@@ -30,6 +30,35 @@ A missing database with no proof cannot be recovered by this command. Restore th
+ original database from a trusted backup, verify/drain its work, and use normal
+ board removal. Never delete a registration merely to make admission green.
+ 
++## Independent sustained-load observer
++
++`python -m hermes_cli.worker_load_observer` performs one sample. Enrollment must
++schedule it every 30 seconds in a **system** oneshot service with `User=<worker>`,
++`Slice=system.slice`, and `TimeoutStartSec=20s` (including publication). Do not put
++it in the user manager: the user CPU backstop can starve it. The timer and service
++are still rollout work; this module alone does not install or enable them.
++
++The durable observer outbox fires after load/core is strictly above 2 for 600
++seconds. Gaps over 90 seconds, reversed clocks and unreadable load reset continuity
++as unknown. A pending alert survives load recovery and retries with the same
++idempotency key, including after an uncertain successful create or archived alert.
++A recovered valid load at or below 2 rearms the next incident. Evidence failures
++never suppress load observations. Process evidence reports sanitized comm/PID,
++interval CPU, mapped card, and active uncontained same-UID processes. These are
++**not proven escapes**: gateways and user shells also legitimately live outside
++the compute pool. No argv, environment, execution DB path or cgroup path is sent.
++Corrupt observer state fails loudly; operators must preserve it for diagnosis
++rather than silently declaring a continuous observation window.
++
++## Execution ownership
++
++Worker identities are `(resolved absolute execution database path, task id)`.
++Board labels cannot distinguish two installations and are not ownership proof.
++Admission counts the prospective owner union, allowing a parked owner to resume
++at the cap when its populated slice already reserves that slot. A new owner must
++fit. Load pressure still refuses both kinds of claim. Existing slug-based owner
++maps and legacy flat scopes require explicit rollout migration before enabling.
++
+ ## Pressure contention
+ 
+ Hysteresis writers wait up to 250 ms for the pressure lock, then refuse as unknown.
+diff --git a/hermes_cli/worker_load_observer.py b/hermes_cli/worker_load_observer.py
+new file mode 100644
+index 0000000000..cb0655ae69
+--- /dev/null
++++ b/hermes_cli/worker_load_observer.py
+@@ -0,0 +1,134 @@
++"""Independent 30-second sustained worker-load observer with durable alert outbox.
++
++Run as a system timer outside hermes-kanban.slice, never from admission. No
++process argv, environment, paths or credentials are included in alert evidence.
++"""
++from __future__ import annotations
++
++import json
++from contextlib import closing
++import math
++import os
++from pathlib import Path
++import tempfile
++import uuid
++
++from hermes_cli.worker_board_retirement import sync_directory
++
++
++def _save(directory: Path, state: dict) -> None:
++    temporary = None
++    try:
++        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=directory, delete=False) as stream:
++            temporary = Path(stream.name)
++            json.dump(state, stream, allow_nan=False)
++            stream.flush()
++            os.fsync(stream.fileno())
++        os.replace(temporary, directory / 'observer.json')
++        sync_directory(directory)
++    finally:
++        if temporary is not None:
++            temporary.unlink(missing_ok=True)
++
++
++def tick(directory: Path, *, now: float, load_per_core: float | None, evidence: dict, publish) -> dict:
++    """Persist observation/outbox before publication; retries keep the exact key.
++
++    Gaps >90 seconds, reversed clocks and unreadable samples explicitly break
++    continuity as unknown. They are not observations of recovered load.
++    """
++    import fcntl
++    if not math.isfinite(now):
++        raise ValueError('invalid observer clock')
++    directory.mkdir(parents=True, exist_ok=True)
++    with (directory / 'observer.lock').open('a') as lock:
++        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        try:
++            state = json.loads((directory / 'observer.json').read_text(encoding='utf-8'))
++        except FileNotFoundError:
++            state = dict(version=1, last=None, high_since=None, pending=None, published_id=None, armed=True)
++        if not isinstance(state, dict) or state.get('version') != 1:
++            raise ValueError('invalid observer state')
++        previous = state['last']
++        gap = previous is not None and (now <= previous or now - previous > 90)
++        valid = load_per_core is not None and math.isfinite(load_per_core) and load_per_core >= 0
++        state['coverage'] = 'unknown_sample' if not valid else 'unknown_gap' if gap else 'observed'
++        if gap or not valid:
++            state['high_since'] = None
++            state['last_unknown'] = now
++        if valid:
++            if load_per_core <= 2:
++                state['high_since'] = None
++                state['armed'] = True
++            elif state['high_since'] is None:
++                state['high_since'] = now
++        state.update(last=now, load_per_core=load_per_core if valid else None)
++        since = state['high_since']
++        if (valid and since is not None and now - since >= 600
++                and state['armed'] and state['pending'] is None):
++            state['pending'] = dict(key='worker-load:' + uuid.uuid4().hex,
++                                    since=since, observed_at=now, load_per_core=load_per_core,
++                                    evidence=evidence)
++            state['armed'] = False
++        _save(directory, state)
++        if state['pending'] is not None:
++            try:
++                task = publish(state['pending'])
++                if not isinstance(task, str) or not task:
++                    raise ValueError('publisher returned no card identity')
++            except Exception as exc:  # health: allow BLE001 -- retain durable outbox across publisher failures
++                state['publish_error'] = type(exc).__name__
++            else:
++                state.update(pending=None, published_id=task, publish_error=None)
++            _save(directory, state)
++        return state
++
++
++def publish_alert(alert: dict) -> str:
++    """Create/read back one durable alert card, including after uncertain success."""
++    import socket
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import connect
++    from hermes_cli.worker_compute_capacity import policy_root
++    # This independent service has no worker DB/profile environment. Explicit
++    # file path avoids a current-board symlink changing alert custody.
++    with closing(connect(db_path=policy_root() / 'kanban.db')) as conn:
++        # Include archived cards: a crash after create and operator archive must
++        # not recreate a second card for the same incident on retry.
++        existing = conn.execute('SELECT id FROM tasks WHERE idempotency_key=?', (alert['key'],)).fetchone()
++        if existing:
++            return existing[0]
++        body = ('Measured load/core stayed above 2 for at least 600 seconds with no sampling gap over 90 seconds. '
++                'Investigate owning cards and unexpected scopes; do not kill workloads without authorization.\n\n'
++                + json.dumps(alert, indent=2, sort_keys=True))
++        task = kb.create_task(conn, title=f'Worker sustained load: {socket.gethostname()}', body=body,
++                              assignee='default', created_by='worker-load-observer', requires=['terminal'],
++                              workspace_kind='scratch', idempotency_key=alert['key'], initial_status='running',
++                              completion_contract='local-only')
++        stored = conn.execute('SELECT id, idempotency_key FROM tasks WHERE id=?', (task,)).fetchone()
++        if not stored or stored[1] != alert['key']:
++            raise ValueError('alert readback failed')
++        return task
++
++
++def main() -> None:
++    import time
++    from hermes_cli import worker_compute_capacity as capacity
++    from hermes_cli.worker_load_snapshot import snapshot
++    if not capacity.worker_enabled():
++        return
++    directory = capacity.policy_root() / 'worker-resources' / 'observer'
++    try:
++        cores = capacity.effective_cores()
++        ratio = os.getloadavg()[0] / cores
++    except (OSError, ValueError):
++        ratio = None
++    try:
++        evidence = snapshot()
++    except Exception:  # health: allow BLE001 -- auxiliary evidence must never suppress load observation
++        evidence = {'process_inventory': 'unknown'}
++    tick(directory, now=time.time(), load_per_core=ratio, evidence=evidence, publish=publish_alert)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/hermes_cli/worker_load_snapshot.py b/hermes_cli/worker_load_snapshot.py
+new file mode 100644
+index 0000000000..a09082e556
+--- /dev/null
++++ b/hermes_cli/worker_load_snapshot.py
+@@ -0,0 +1,89 @@
++"""Bounded, sanitized /proc evidence for sustained worker-load alerts."""
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++import re
++import time
++
++from hermes_cli import worker_compute_capacity as capacity
++
++
++def _text(value: str, length=64) -> str:
++    return re.sub(r'[^A-Za-z0-9_.:+-]', '_', value)[:length]
++
++
++def _processes(proc: Path) -> dict:
++    result = {}
++    for path in proc.iterdir():
++        if not path.name.isdecimal():
++            continue
++        try:
++            raw = (path / 'stat').read_text(encoding='utf-8')
++            opening, closing = raw.index('('), raw.rindex(')')
++            fields = raw[closing + 2:].split()
++            # Fields after comm start at stat field 3; starttime is field 22.
++            ticks, birth = int(fields[11]) + int(fields[12]), int(fields[19])
++            cgroup = (path / 'cgroup').read_text(encoding='utf-8')
++            unified = next(line[3:] for line in cgroup.splitlines() if line.startswith('0::'))
++            result[int(path.name)] = dict(birth=birth, ticks=ticks, comm=_text(raw[opening + 1:closing]),
++                                          group=unified, uid=path.stat().st_uid)
++        except (FileNotFoundError, ProcessLookupError):
++            continue  # exited during snapshot, not a living omitted CPU owner
++        except (PermissionError, ValueError, IndexError, StopIteration):
++            result[int(path.name)] = None
++    return result
++
++
++def snapshot(*, proc: Path = Path('/proc'), interval: float = 0.2) -> dict:
++    """Interval CPU (100% = one core); no command lines or environment reads."""
++    if not 0 < interval <= 1:
++        raise ValueError('invalid CPU evidence sampling interval')
++    owners = {}
++    owner_errors = 0
++    directory = capacity.policy_root() / 'worker-resources' / 'owners'
++    if directory.exists():
++        for path in directory.glob('*.json'):
++            try:
++                owner = json.loads(path.read_text(encoding='utf-8'))
++                if (not isinstance(owner, list) or len(owner) != 2
++                        or not all(isinstance(value, str) and value for value in owner)
++                        or capacity.owner_slice(*owner) != path.stem):
++                    raise ValueError('invalid owner evidence')
++                owners[path.stem] = _text(owner[1])
++            except FileNotFoundError:
++                continue
++            except (OSError, ValueError):
++                owner_errors += 1
++    first = _processes(proc)
++    started = time.monotonic()
++    time.sleep(interval)
++    second = _processes(proc)
++    elapsed = time.monotonic() - started
++    if elapsed <= 0:
++        raise ValueError('invalid CPU evidence clock')
++    hz = os.sysconf('SC_CLK_TCK')
++    rows = []
++    unknown = 0
++    for pid, current in second.items():
++        previous = first.get(pid)
++        if current is None or previous is None or current['birth'] != previous['birth']:
++            unknown += 1
++            continue
++        delta = current['ticks'] - previous['ticks']
++        if delta < 0:
++            unknown += 1
++            continue
++        parts = current['group'].split('/')
++        owned = next((owners[part] for part in parts if part in owners), None)
++        contained = 'hermes-kanban.slice' in parts
++        rows.append(dict(pid=pid, comm=current['comm'], cpu_percent=round(100 * delta / hz / elapsed, 2),
++                         card=owned or 'unknown', contained=contained,
++                         uncontained_same_uid=current['uid'] == os.getuid() and not contained))
++    rows.sort(key=lambda row: (-row['cpu_percent'], row['pid']))
++    return dict(cpu_basis='interval; 100% = one core', sample_seconds=round(elapsed, 3),
++                process_inventory='partial' if unknown else 'observed', unknown_processes=unknown,
++                owner_map='partial' if owner_errors else 'observed', owner_errors=owner_errors,
++                processes=rows[:20],
++                uncontained_active=[row for row in rows if row['uncontained_same_uid'] and row['cpu_percent'] > 0][:20])
+diff --git a/tests/hermes_cli/test_worker_load_observer.py b/tests/hermes_cli/test_worker_load_observer.py
+new file mode 100644
+index 0000000000..8526998939
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_load_observer.py
+@@ -0,0 +1,147 @@
++"""The observer remains independent of claim admission and persists its outbox."""
++import json
++from contextlib import closing
++from hermes_cli.kanban_db_connect import connect
++
++from hermes_cli import worker_load_observer as observer
++
++
++def test_threshold_continuity_restart_and_single_alert(tmp_path):
++    path = tmp_path / 'observer'
++    published = []
++    def publish(alert):
++        published.append(alert)
++        return 't_alert'
++    for now in range(0, 600, 30):
++        state = observer.tick(path, now=now, load_per_core=2.1, evidence={'processes': []}, publish=publish)
++        assert not published
++    state = observer.tick(path, now=600, load_per_core=2.1, evidence={'processes': []}, publish=publish)
++    assert len(published) == 1
++    assert state['published_id'] == 't_alert'
++    for now in (630, 660, 690):
++        observer.tick(path, now=now, load_per_core=3, evidence={}, publish=publish)
++    assert len(published) == 1
++    assert json.loads((path / 'observer.json').read_text())['published_id'] == 't_alert'
++
++
++def test_gap_and_unreadable_samples_are_explicit_unknown(tmp_path):
++    sent = []
++    for now in (0, 30, 60, 600):
++        state = observer.tick(tmp_path, now=now, load_per_core=3, evidence={}, publish=lambda a: sent.append(a))
++    assert not sent
++    assert state['coverage'] == 'unknown_gap'
++    assert state['high_since'] == 600
++    state = observer.tick(tmp_path, now=630, load_per_core=None, evidence={}, publish=lambda a: sent.append(a))
++    assert state['coverage'] == 'unknown_sample'
++    assert state['high_since'] is None
++    assert not sent
++
++
++def test_exact_threshold_and_clock_reversal_break_continuity(tmp_path):
++    publish = lambda a: 't_alert'
++    for now in range(0, 601, 30):
++        state = observer.tick(tmp_path, now=now, load_per_core=2, evidence={}, publish=publish)
++    assert state['high_since'] is None
++    observer.tick(tmp_path, now=630, load_per_core=3, evidence={}, publish=publish)
++    state = observer.tick(tmp_path, now=620, load_per_core=3, evidence={}, publish=publish)
++    assert state['coverage'] == 'unknown_gap'
++    assert state['high_since'] == 620
++
++
++def test_failed_publish_retries_same_outbox_even_after_load_recovers(tmp_path):
++    seen = []
++    def unavailable(alert):
++        seen.append(alert['key'])
++        raise OSError('unavailable')
++    for now in range(0, 631, 30):
++        observer.tick(tmp_path, now=now, load_per_core=3, evidence={'processes': []}, publish=unavailable)
++    assert len(seen) == 2 and seen[0] == seen[1]
++    recovered = []
++    state = observer.tick(tmp_path, now=660, load_per_core=0.5, evidence={},
++                          publish=lambda a: recovered.append(a['key']) or 't_delivered')
++    assert recovered == [seen[0]]
++    assert state['pending'] is None
++    observer.tick(tmp_path, now=690, load_per_core=0.5, evidence={}, publish=unavailable)
++    assert len(seen) == 2
++
++
++def test_crash_after_remote_write_retries_same_key(tmp_path):
++    calls = []
++    def crash(alert):
++        calls.append(alert['key'])
++        raise KeyboardInterrupt
++    import pytest
++    with pytest.raises(KeyboardInterrupt):
++        for now in range(0, 601, 30):
++            observer.tick(tmp_path, now=now, load_per_core=3, evidence={}, publish=crash)
++    observer.tick(tmp_path, now=630, load_per_core=3, evidence={}, publish=lambda a: calls.append(a['key']) or 't_one')
++    assert calls[0] == calls[1]
++
++
++def test_real_publisher_deduplicates_including_archived(tmp_path, monkeypatch):
++    from hermes_cli import worker_compute_capacity as capacity
++    from hermes_cli import kanban_db as kb
++    home = tmp_path / 'home'
++    home.mkdir()
++    (home / 'config.yaml').write_text('toolsets: [terminal]\n')
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    monkeypatch.setattr(capacity, 'policy_root', lambda: home)
++    monkeypatch.setattr('socket.gethostname', lambda: 'fixture-worker')
++    alert = dict(key='worker-load:fixture', since=0, observed_at=600, load_per_core=3,
++                 evidence={'processes': [{'pid': 12, 'comm': 'python', 'cpu_percent': 95, 'card': 't_owner'}]})
++    task = observer.publish_alert(alert)
++    assert observer.publish_alert(alert) == task
++    with closing(connect(db_path=home / 'kanban.db')) as conn:
++        stored = kb.get_task(conn, task)
++        assert 't_owner' in stored.body
++        assert 'fixture-worker' in stored.title
++        kb.archive_task(conn, task)
++    assert observer.publish_alert(alert) == task
++    with closing(connect(db_path=home / 'kanban.db')) as conn:
++        assert conn.execute('SELECT count(*) FROM tasks WHERE idempotency_key=?', (alert['key'],)).fetchone()[0] == 1
++
++
++def test_main_records_failed_load_sample_as_unknown(tmp_path, monkeypatch):
++    from hermes_cli import worker_compute_capacity as capacity
++    from hermes_cli import worker_load_snapshot as snapshot
++    monkeypatch.setattr(capacity, 'worker_enabled', lambda: True)
++    monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path)
++    monkeypatch.setattr(capacity, 'effective_cores', lambda: 16)
++    def unavailable():
++        raise OSError('unreadable')
++    monkeypatch.setattr(observer.os, 'getloadavg', unavailable)
++    monkeypatch.setattr(snapshot, 'snapshot', unavailable)
++    observer.main()
++    state = json.loads((tmp_path / 'worker-resources/observer/observer.json').read_text())
++    assert state['coverage'] == 'unknown_sample'
++    assert state['pending'] is None
++
++
++def test_auxiliary_evidence_failure_does_not_suppress_valid_load(tmp_path, monkeypatch):
++    from hermes_cli import worker_compute_capacity as capacity
++    from hermes_cli import worker_load_snapshot as snapshot
++    monkeypatch.setattr(capacity, 'worker_enabled', lambda: True)
++    monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path)
++    monkeypatch.setattr(capacity, 'effective_cores', lambda: 16)
++    monkeypatch.setattr(observer.os, 'getloadavg', lambda: (48, 48, 48))
++    def broken():
++        raise TypeError('malformed process evidence')
++    monkeypatch.setattr(snapshot, 'snapshot', broken)
++    observer.main()
++    state = json.loads((tmp_path / 'worker-resources/observer/observer.json').read_text())
++    assert state['coverage'] == 'observed'
++    assert state['load_per_core'] == 3
++    assert state['high_since'] is not None
++
++
++def test_concurrent_tick_cannot_erase_outbox(tmp_path):
++    import fcntl
++    import pytest
++    observer.tick(tmp_path, now=0, load_per_core=3, evidence={}, publish=lambda a: 't_alert')
++    path = tmp_path / 'observer.json'
++    before = path.read_bytes()
++    with (tmp_path / 'observer.lock').open('a') as lock:
++        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        with pytest.raises(BlockingIOError):
++            observer.tick(tmp_path, now=30, load_per_core=0, evidence={}, publish=lambda a: 't_alert')
++    assert path.read_bytes() == before
+diff --git a/tests/hermes_cli/test_worker_load_snapshot.py b/tests/hermes_cli/test_worker_load_snapshot.py
+new file mode 100644
+index 0000000000..612c3d3cae
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_load_snapshot.py
+@@ -0,0 +1,60 @@
++"""Sanitized, birth-fenced interval CPU evidence and escaped units."""
++import json
++import os
++
++from hermes_cli import worker_load_snapshot as snap
++from hermes_cli import worker_compute_capacity as capacity
++
++
++def _stat(proc, pid, ticks, group, comm='python', birth=99):
++    path = proc / str(pid)
++    path.mkdir(exist_ok=True)
++    fields = ['S'] + ['0'] * 19
++    fields[11], fields[12], fields[19] = str(ticks), '0', str(birth)
++    (path / 'stat').write_text(f'{pid} ({comm}) ' + ' '.join(fields))
++    (path / 'cgroup').write_text('0::' + group + '\n')
++
++
++def test_interval_top_owners_escapes_and_sanitization(tmp_path, monkeypatch):
++    proc = tmp_path / 'proc'
++    proc.mkdir()
++    root = tmp_path / 'home'
++    owners = root / 'worker-resources/owners'
++    owners.mkdir(parents=True)
++    monkeypatch.setattr(capacity, 'policy_root', lambda: root)
++    owner = ['/installation/kanban.db', 't_parked']
++    name = capacity.owner_slice(*owner)
++    (owners / f'{name}.json').write_text(json.dumps(owner))
++    group = '/user.slice/hermes.slice/hermes-kanban.slice/' + name + '/job.scope'
++    _stat(proc, 100, 10, group, comm='py[evil]`')
++    _stat(proc, 101, 10, '/user.slice/app.slice/escape.service')
++    _stat(proc, 102, 10, group)
++    def advance(_):
++        _stat(proc, 100, 210, group, comm='py[evil]`')
++        _stat(proc, 101, 110, '/user.slice/app.slice/escape.service')
++        _stat(proc, 102, 99999, group, birth=100)  # PID reuse cannot claim old CPU
++    monkeypatch.setattr(snap.time, 'sleep', advance)
++    clock = iter([0.0, 1.0])
++    monkeypatch.setattr(snap.time, 'monotonic', lambda: next(clock))
++    monkeypatch.setattr(os, 'sysconf', lambda _: 100)
++    evidence = snap.snapshot(proc=proc)
++    assert evidence['unknown_processes'] == 1
++    assert evidence['processes'][0] == dict(pid=100, comm='py_evil__', cpu_percent=200.0,
++                                            card='t_parked', contained=True, uncontained_same_uid=False)
++    assert evidence['uncontained_active'][0]['pid'] == 101
++    assert evidence['uncontained_active'][0]['card'] == 'unknown'
++    assert '/installation' not in json.dumps(evidence)
++    assert 'app.slice' not in json.dumps(evidence)
++
++
++def test_bad_owner_map_is_unknown_not_misattributed(tmp_path, monkeypatch):
++    monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path)
++    owners = tmp_path / 'worker-resources/owners'
++    owners.mkdir(parents=True)
++    (owners / 'wrong.json').write_text(json.dumps(['/db/kanban.db', 't_other']))
++    malformed = ['/db/kanban.db', 5]
++    (owners / (capacity.owner_slice(*malformed) + '.json')).write_text(json.dumps(malformed))
++    evidence = snap.snapshot(proc=tmp_path)
++    assert evidence['owner_map'] == 'partial'
++    assert evidence['owner_errors'] == 2
++    assert evidence['processes'] == []
+-- 
+2.51.0
+

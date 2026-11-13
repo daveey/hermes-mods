@@ -1,0 +1,122 @@
+From 50e6ed804e1e1f5d5424ff783afd738cc83061ee Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:51:50 +0000
+Subject: [PATCH] [daveey] kanban capabilities: read the assignee policy inside
+ a bound worker scope
+
+A dispatcher-spawned worker runs inside a bound local scope for its own home.
+_profile_policy bound the assignee's policy with the legacy setters, and there:
+
+- set_terminal_scope(terminal) with no profile_home raised ScopeSwitchRefused
+  ("needs a policy owned by that agent, got profile_home=None");
+- an unstamped set_secret_scope moved a foreign assignee's scope back to the
+  worker's own home before that.
+
+validate_assignment's blanket except turned this into
+assignee_capability_mismatch, so every kanban_create(requires=[terminal, git])
+from a pool worker was refused, including the review cards
+`hermes-core-wt ship --request-review` prints.
+
+_profile_policy now binds one scope for the assignee's home with
+agent.runtime_scope.bind_state: home and secrets first (the effective config
+resolves managed values against them), then the built terminal policy.
+The process's own profile stays unstamped, as the legacy setter left it.
+
+Regression test: validate_assignment for "default" and another profile inside
+bind_profile_scope(<worker home>), RED with the production error, GREEN now;
+the worker's scope, home and terminal policy are restored afterwards.
+
+Task: t_01a1d3dfcfabae47
+---
+ hermes_cli/kanban_capabilities.py            | 24 ++++++++++++++------
+ tests/hermes_cli/test_kanban_capabilities.py | 22 ++++++++++++++++++
+ 2 files changed, 39 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_capabilities.py b/hermes_cli/kanban_capabilities.py
+index b2bf73fab3..d34440240a 100644
+--- a/hermes_cli/kanban_capabilities.py
++++ b/hermes_cli/kanban_capabilities.py
+@@ -287,22 +287,32 @@ def _cli_toolsets(config: dict, home: Path, needed: set[str] | None) -> set[str]
+ 
+ @contextmanager
+ def _profile_policy(assignee: str):
+-    """``(home, effective config, terminal scope)`` of ``assignee``, bound to its scopes while open."""
+-    from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
++    """``(home, effective config, terminal scope)`` of ``assignee``, bound to its scopes while open.
++
++    [daveey] Bound as one scope for the assignee's home (``agent.runtime_scope.bind_state``), not
++    with the legacy setters: inside a dispatcher-spawned worker's bound scope a bare
++    ``set_terminal_scope`` raised ``ScopeSwitchRefused`` (profile_home=None) and an unstamped
++    ``set_secret_scope`` moved a foreign assignee's scope back to the worker's own home, so every
++    ``requires`` check from a worker failed as ``assignee_capability_mismatch`` (t_01a1d3dfcfabae47)."""
++    from agent.runtime_scope import bind_state, scope_for_profile
++    from agent.secret_scope import _is_process_home, build_profile_secret_scope
+     from hermes_cli.config_backend import read_config_doc_readonly
+     from hermes_cli.config_effective import load_profile_config_effective
+     from hermes_cli.profiles import resolve_profile_env
+-    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+-    from tools.terminal_scope import build_profile_terminal_scope, reset_terminal_scope, set_terminal_scope
++    from tools.terminal_scope import build_profile_terminal_scope
+ 
+     home = Path(resolve_profile_env(assignee))
+     config_path = home / "config.yaml"
+     # Missing files and malformed roots are otherwise treated as default policy by the
+     # shared loader. That is fine for startup, but cannot establish assignment authority.
+     _check_policy_shape(read_config_doc_readonly(config_path))
++    scope = scope_for_profile(home)
++    secrets = build_profile_secret_scope(home)
++    # Unstamped marks the process's own profile, as the legacy setter left it; any other home is routed.
++    stamp = not _is_process_home(home)
+     with ExitStack() as stack:
+-        stack.callback(reset_hermes_home_override, set_hermes_home_override(str(home)))
+-        stack.callback(reset_secret_scope, set_secret_scope(build_profile_secret_scope(home)))
++        # Home and secrets first: the effective config resolves managed values against them.
++        stack.enter_context(bind_state(scope, secrets=secrets, stamp_home=stamp, terminal=False))
+         config = load_profile_config_effective(config_path, fail_closed=True)
+         _check_policy_shape(config)
+         terminal = build_profile_terminal_scope(home)
+@@ -310,7 +320,7 @@ def _profile_policy(assignee: str):
+         # scope helper also preserves a legacy profile-local .env backend when YAML omits it.
+         if "backend" in config.get("terminal", {}):
+             terminal["TERMINAL_ENV"] = config["terminal"]["backend"]
+-        stack.callback(reset_terminal_scope, set_terminal_scope(terminal))
++        stack.enter_context(bind_state(scope, secrets=secrets, stamp_home=stamp, terminal_policy=terminal))
+         yield home, config, terminal
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_capabilities.py b/tests/hermes_cli/test_kanban_capabilities.py
+index 61da9146d9..16ea21a8a8 100644
+--- a/tests/hermes_cli/test_kanban_capabilities.py
++++ b/tests/hermes_cli/test_kanban_capabilities.py
+@@ -166,6 +166,28 @@ def test_profile_scopes_are_restored_on_success_and_failure(profiles):
+     assert get_terminal_scope() is original_terminal
+ 
+ 
++@pytest.mark.parametrize("assignee", ["default", "coder"])
++def test_profile_policy_resolves_inside_a_bound_worker_scope(profiles, assignee):
++    """A dispatcher-spawned worker runs inside a bound local scope for its own home. The check must
++    read the assignee's policy there, not raise ScopeSwitchRefused (profile_home=None) and turn it
++    into assignee_capability_mismatch (t_01a1d3dfcfabae47). [daveey]"""
++    from agent.runtime_scope import bind_profile_scope
++    from hermes_constants import get_hermes_home
++    from hermes_scope import current_scope
++    from tools.terminal_scope import get_terminal_scope
++
++    home = profiles("default", "terminal: {backend: local}\n")
++    profiles("coder", LOCAL)
++    with bind_profile_scope(home, hydrate_secrets=False) as scope:
++        bound_terminal = get_terminal_scope()
++        assert validate_assignment(assignee, requires=["terminal", "git"]) == ["terminal", "git"]
++        assert validate_assignment(assignee, requires=["host_repo"]) == ["host_repo"]
++        # The worker's own scope is back afterwards: same agent, home and terminal policy.
++        assert current_scope() is scope
++        assert Path(get_hermes_home()) == home
++        assert get_terminal_scope() is bound_terminal
++
++
+ def test_skill_names_are_not_guessed_as_capabilities(profiles):
+     # Skill capability metadata has no established convention; do not infer from names/prose.
+     assert validate_assignment("legacy", skills=["git", "terminal"]) == []
+-- 
+2.51.0
+

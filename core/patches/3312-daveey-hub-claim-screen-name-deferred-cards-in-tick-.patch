@@ -1,0 +1,249 @@
+From 8634ee1d34c690d7aadb603b2ee13af95e865408 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:01:29 +0000
+Subject: [PATCH] [daveey] hub claim screen: name deferred cards in tick
+ diagnostics; re-read each card's row at its turn
+
+Follow-ups from review t_01a1d2b04a906447 of #1811:
+- DispatchResult.admission_deferred carries the ids the claim screen left
+  unclaimed (unjudged) this tick; kanban dispatch --json/text, the stuck
+  warning's held-card list and the screen's log line now name them.
+- screen() re-reads each card's row with its event head when its turn comes,
+  so a write to a later card during an earlier judge call no longer defers it
+  (and wastes its judge call); a card no longer screenable is skipped.
+---
+ hermes_cli/kanban_db_dispatch.py              |  7 +--
+ hermes_cli/kanban_db_dispatch_stuck.py        |  2 +-
+ hermes_cli/kanban_hub_admission_claim.py      | 37 ++++++++---
+ hermes_cli/kanban_ops.py                      |  3 +
+ .../test_kanban_hub_admission_claim.py        | 62 +++++++++++++++++++
+ 5 files changed, 98 insertions(+), 13 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 49f6cd7137..81982c0861 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -148,10 +148,7 @@ def _is_owner_restart_run(run) -> bool:
+ # Within this window a GitHub PR URL in a comment blocks re-spawn.
+ _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
+ 
+-_RESPAWN_GUARD_PR_URL_RE = re.compile(
+-    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
+-    re.IGNORECASE,
+-)
++_RESPAWN_GUARD_PR_URL_RE = re.compile(r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+", re.IGNORECASE)
+ 
+ 
+ @dataclass
+@@ -202,6 +199,7 @@ class DispatchResult:
+     claim_deferred: list[tuple[str, str]] = field(default_factory=list)
+     """``(task_id, reason)`` whose claim the Board lease deferred this tick (``lease_held``, ``labels_mismatch``,
+     ``offline``). The tick moves on to the next candidate; the stuck warning names these. [daveey]"""
++    admission_deferred: list[str] = field(default_factory=list)  # hub claim screen left unclaimed, unjudged [daveey]
+     crashed: list[str] = field(default_factory=list)
+     """Task ids reclaimed because their worker PID disappeared."""
+     capsule_refused: list[tuple[str, str]] = field(default_factory=list)  # (task_id, code): kanban_capsule_admission [daveey]
+@@ -2305,6 +2303,7 @@ def _dispatch_once_locked(
+     # review card pinned to the hub sat first in the MacBook's review lane, took the review reservation every
+     # tick, and the Board refused its lease every tick, so the eligible ready queue never started.
+     all_ready = [row for row in lane_rows(conn, "ready") if row["id"] not in unjudged]  # hub: judged next tick
++    result.admission_deferred = sorted(unjudged)
+     from hermes_cli.kanban_db_dispatch_preclaim import eligible_rows as _eligible_rows
+     ready_rows = _eligible_rows(conn, all_ready, "ready", result)
+     # Review rows are enumerated up front so the budget split can see whether
+diff --git a/hermes_cli/kanban_db_dispatch_stuck.py b/hermes_cli/kanban_db_dispatch_stuck.py
+index 7c359bc4a2..82cc3e04db 100644
+--- a/hermes_cli/kanban_db_dispatch_stuck.py
++++ b/hermes_cli/kanban_db_dispatch_stuck.py
+@@ -112,7 +112,7 @@ def held_cards(results: Iterable[Optional[Any]]) -> str:
+             continue
+         for field in ("respawn_guarded", "claim_deferred", "skipped_ineligible", "capsule_refused"):
+             held.update(f"{tid}={reason}" for tid, reason in getattr(res, field, ()))
+-        for field in ("skipped_unassigned", "skipped_nonspawnable", "rate_limited"):
++        for field in ("skipped_unassigned", "skipped_nonspawnable", "rate_limited", "admission_deferred"):
+             held.update(f"{tid}={field}" for tid in getattr(res, field, ()))
+         held.update(f"{tid}=profile_capacity({profile},{count})"
+                     for tid, profile, count in res.skipped_per_profile_capped)
+diff --git a/hermes_cli/kanban_hub_admission_claim.py b/hermes_cli/kanban_hub_admission_claim.py
+index 32e283a9c3..0bde04bb84 100644
+--- a/hermes_cli/kanban_hub_admission_claim.py
++++ b/hermes_cli/kanban_hub_admission_claim.py
+@@ -23,7 +23,8 @@ every hub run passes, so before the hub claims a ready, label-less card with no
+ * deferred (``Counts.deferred_ids``, left out of this tick's claims and judged next tick): a card edited while the
+   judge ran (its verdict belongs to a stale snapshot, so none is recorded), and every card past
+   :data:`MAX_JUDGED_PER_TICK` judge calls (each may take the judge's 30 s timeout; a ~27-card backlog at rollout
+-  would hold that tick's claims for minutes). Neither is ever claimed unjudged.
++  would hold that tick's claims for minutes). Neither is ever claimed unjudged. The log line and the dispatch
++  result (``DispatchResult.admission_deferred``) name them, so a ready card that keeps not starting is traceable.
+ 
+ A card with any verdict (forced or skipped included) makes no model call. :func:`unjudged_claims` is the
+ detector: this gateway's claims of a card that had no verdict yet (``hermes doctor`` reports it on the hub). Its
+@@ -69,20 +70,33 @@ class Counts:
+         self.deferred_ids = self.deferred_ids | {tid}
+ 
+     def line(self) -> str:
++        ids = f" ({', '.join(sorted(self.deferred_ids))})" if self.deferred_ids else ""
+         return ("hub admission: claim screen judged={judged} denied={denied} moved={moved} kept={kept} "
+-                "home={home} unavailable={unavailable} deferred={deferred} repinned={repinned}").format(**asdict(self))
++                "home={home} unavailable={unavailable} deferred={deferred} repinned={repinned}"
++                ).format(**asdict(self)) + ids
++
++
++_SCREENABLE = ("status = 'ready' AND claim_lock IS NULL AND (runs_on IS NULL OR runs_on IN ('', '[]')) "
++               "AND placement_policy IS NULL")
+ 
+ 
+ def _candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+     """Screenable cards in the claim pass's own dispatch order, so the per-tick judge budget covers the cards the
+     claims reach first and never lets lower-priority work jump a deferred higher-priority card."""
+     from hermes_cli.kanban_db_dispatch_queries import lane_rows
+-    rows = {row["id"]: row for row in conn.execute(
+-        "SELECT * FROM tasks WHERE status = 'ready' AND claim_lock IS NULL "
+-        "AND (runs_on IS NULL OR runs_on IN ('', '[]')) AND placement_policy IS NULL").fetchall()}
++    rows = {row["id"]: row for row in conn.execute(f"SELECT * FROM tasks WHERE {_SCREENABLE}").fetchall()}
+     return [rows[row["id"]] for row in lane_rows(conn, "ready") if row["id"] in rows]
+ 
+ 
++def _current(conn: sqlite3.Connection, tid: str) -> tuple[Optional[sqlite3.Row], int]:
++    """The card's row and event head, read together at the top of each judged card: up to
++    :data:`MAX_JUDGED_PER_TICK` judge calls of 30 s each can run before a later card, so a row snapshot from the
++    start of the tick would make :func:`_apply` defer it for any write in between and waste its judge call.
++    The row is ``None`` when the card stopped being screenable meanwhile (claimed, labelled, no longer ready)."""
++    event_head = _event_head(conn, tid)
++    return conn.execute(f"SELECT * FROM tasks WHERE id = ? AND {_SCREENABLE}", (tid,)).fetchone(), event_head
++
++
+ def _latest_wake_check(conn: sqlite3.Connection, task_id: str) -> str:
+     """The newest wake_check the card's events carry (``scheduled``, ``condition_met``, ``continued``, ...)."""
+     row = conn.execute(
+@@ -148,9 +162,10 @@ def screen(conn: sqlite3.Connection, *, cfg: Optional[dict] = None, budget: int
+     board = sync.board_slug_for_path(sync._db_key(conn) or "")
+     down = False
+     calls = 0
+-    for card in _candidates(conn):
+-        tid = card["id"]
+-        event_head = _event_head(conn, tid)
++    for tid in [row["id"] for row in _candidates(conn)]:
++        card, event_head = _current(conn, tid)
++        if card is None:
++            continue
+         if pickup.verdict(conn, tid) is not None:
+             _self_check(conn, card, own, cfg, board, event_head, counts)
+             continue
+@@ -252,6 +267,12 @@ def _replace(conn: sqlite3.Connection, own: str, tid: str, target: list[str], re
+     return True
+ 
+ 
++def print_deferred(ids: list[str]) -> None:
++    """``hermes kanban dispatch`` text line for ``DispatchResult.admission_deferred``."""
++    if ids:
++        print(f"Deferred by the hub claim screen (unjudged, judged next tick): {', '.join(ids)}")
++
++
+ def safe_screen(conn: sqlite3.Connection) -> frozenset:
+     """Dispatcher seam: the ids this tick must not claim. A failed screen never stops the tick (the cards are
+     claimed as before)."""
+diff --git a/hermes_cli/kanban_ops.py b/hermes_cli/kanban_ops.py
+index 00e917afd3..8681934c83 100644
+--- a/hermes_cli/kanban_ops.py
++++ b/hermes_cli/kanban_ops.py
+@@ -15,6 +15,7 @@ from pathlib import Path
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli.kanban_hub_admission_claim import print_deferred
+ from hermes_cli.kanban_no_progress import held_json, print_held
+ from hermes_cli.kanban_output import _err, _fmt_ts, _print_json
+ 
+@@ -124,6 +125,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
+             # Cards this machine cannot lease (runs_on / placement) and claims the Board deferred. [daveey]
+             "skipped_ineligible": [{"task_id": tid, "reason": reason} for (tid, reason) in res.skipped_ineligible],
+             "claim_deferred": [{"task_id": tid, "reason": reason} for (tid, reason) in res.claim_deferred],
++            "admission_deferred": res.admission_deferred,  # hub claim screen: unjudged, judged next tick
+             "shared_blocker_released": res.shared_blocker_released,
+             "shared_blocker_probed": res.shared_blocker_probed,
+             "skipped_locked": res.skipped_locked,
+@@ -177,6 +179,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
+         print(f"Skipped (this machine cannot lease it: {reason}): {tid}")
+     for tid, reason in res.claim_deferred:
+         print(f"Claim deferred by the Board ({reason}): {tid}")
++    print_deferred(res.admission_deferred)
+     if res.rate_limited:
+         print(f"Rate-limited (released to ready, no failure counted): {', '.join(res.rate_limited)}")
+     if res.shared_blocker_released:
+diff --git a/tests/hermes_cli/test_kanban_hub_admission_claim.py b/tests/hermes_cli/test_kanban_hub_admission_claim.py
+index fb7ce05af5..0ceb9fd0a2 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission_claim.py
++++ b/tests/hermes_cli/test_kanban_hub_admission_claim.py
+@@ -347,6 +347,68 @@ def test_screen_reports_deferred_ids(gws, hub_judge):
+     assert len(hub_judge.calls) == 1 and counts.judged == 1
+     assert counts.deferred == 2 and counts.deferred_ids == frozenset(tids[1:])
+     assert "deferred=2" in counts.line()
++    assert all(tid in counts.line() for tid in tids[1:]) and tids[0] not in counts.line()
++
++
++def test_deferred_ids_appear_in_the_dispatch_result(gws, hub_judge, monkeypatch, caplog):
++    """A card deferred every tick (kept edited, or a long backlog) must be visible in the tick's diagnostics:
++    ``lane_candidates`` leaves it out, so the result and the log line name it (review of #1811)."""
++    from hermes_cli.kanban_db_dispatch_stuck import held_cards
++    hub, _worker, _svc = gws
++    _no_board_promotion(monkeypatch)
++    tids = [_hub_card(hub, title=f"backlog card {i}") for i in range(hac.MAX_JUDGED_PER_TICK + 2)]
++    with caplog.at_level(logging.INFO, logger=hac.__name__):
++        result = _tick(hub)
++    deferred = [tid for tid in tids if not _events(hub.conn, tid, "hub_admission")]
++    assert len(deferred) == 2 and sorted(result.admission_deferred) == sorted(deferred)
++    assert all(f"{tid}=admission_deferred" in held_cards([result]) for tid in deferred)
++    [line] = [r.getMessage() for r in caplog.records if "claim screen" in r.getMessage()]
++    assert "deferred=2" in line and all(tid in line for tid in deferred)
++    assert _tick(hub).admission_deferred == []  # judged on the next tick: nothing left deferred
++
++
++def test_print_deferred_names_the_cards(capsys):
++    hac.print_deferred([])
++    assert capsys.readouterr().out == ""
++    hac.print_deferred(["t_a", "t_b"])
++    assert capsys.readouterr().out == "Deferred by the hub claim screen (unjudged, judged next tick): t_a, t_b\n"
++
++
++def test_a_write_to_a_later_card_during_an_earlier_judge_call_does_not_defer_it(gws, hub_judge, monkeypatch):
++    """Each card's row is read when its turn comes, not once before the first judge call: a write to card 2
++    during card 1's (up to 30 s) call no longer makes ``_apply`` defer card 2 and waste its judge call."""
++    hub, _worker, _svc = gws
++    first, second = _hub_card(hub, title="card 1"), _hub_card(hub, title="card 2")
++    fake = judge.admit
++
++    def write_card_2_during_card_1(card, hub_reason=None):
++        if not hub_judge.calls:
++            hub.conn.execute("UPDATE tasks SET body = 'edited before its turn' WHERE id = ?", (second,))
++            hub.conn.commit()
++        return fake(card, hub_reason=hub_reason)
++    monkeypatch.setattr(judge, "admit", write_card_2_during_card_1)
++    hub.enter()
++    counts = hac.screen(hub.conn)
++    assert counts.deferred == 0 and counts.judged == 2
++    assert [c["card"]["body"] for c in hub_judge.calls] == ["Portable repo work: edit, test, PR.",
++                                                            "edited before its turn"]
++    assert _events(hub.conn, first, "hub_admission") and _events(hub.conn, second, "hub_admission")
++
++
++def test_a_later_card_that_stops_being_screenable_is_not_judged(gws, hub_judge, monkeypatch):
++    hub, _worker, _svc = gws
++    _first, second = _hub_card(hub, title="card 1"), _hub_card(hub, title="card 2")
++    fake = judge.admit
++
++    def label_card_2_during_card_1(card, hub_reason=None):
++        hub.conn.execute("UPDATE tasks SET runs_on = '[\"linux\"]' WHERE id = ?", (second,))
++        hub.conn.commit()
++        return fake(card, hub_reason=hub_reason)
++    monkeypatch.setattr(judge, "admit", label_card_2_during_card_1)
++    hub.enter()
++    counts = hac.screen(hub.conn)
++    assert [c["card"]["title"] for c in hub_judge.calls] == ["card 1"]
++    assert counts.judged == 1 and counts.deferred == 0 and _events(hub.conn, second, "hub_admission") == []
+ 
+ 
+ def test_the_judge_budget_follows_dispatch_priority_not_creation_order(gws, hub_judge):
+-- 
+2.51.0
+

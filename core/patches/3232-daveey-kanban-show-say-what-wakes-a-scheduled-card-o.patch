@@ -1,0 +1,339 @@
+From a0ddcc4e8367c0d134e14df14ea74efb190fb0fa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:14:04 +0000
+Subject: [PATCH] [daveey] kanban show: say what wakes a scheduled card on the
+ status line
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`hermes kanban show` printed `status: scheduled` and the wake check in a separate
+field below Diagnostics, while the run line carried the raw `SCHEDULED_UNTIL=...`.
+An agent that grepped `status:|→` quoted that deadline to David as the wake time
+when it was only the backstop: the card had a wake check that would wake it the
+moment the awaited card landed (defect agent-3a632ca054).
+
+New sibling hermes_cli/kanban_wake_summary.py renders one wake for every
+card-status surface:
+- CLI `status:` line: `scheduled — wakes when `<cmd>` passes (next probe HH:MM),
+  backstop YYYY-MM-DD HH:MM`, or `scheduled — wakes at <time>` with no check.
+  The status word stays the first token (awk '{print $2}' parsers keep working).
+- `--json` and the kanban_show tool: `wakes: {check, next_probe_at, backstop_at}`
+  (null when not scheduled).
+- worker_context: a `Wakes:` header line after Workspace (ctx_workspace_span's
+  offset is unchanged).
+The backstop is `kanban_timed_park.implied_wake` of the latest parking event.
+Display only; scheduling is unchanged.
+
+Test: tests/hermes_cli/test_kanban_show_wake.py (all 6 red on e2d7c95bb9).
+---
+ hermes_cli/kanban.py                      |   6 +-
+ hermes_cli/kanban_db.py                   |   2 +-
+ hermes_cli/kanban_db_context.py           |   6 +-
+ hermes_cli/kanban_wake_summary.py         |  82 +++++++++++++++
+ tests/hermes_cli/test_kanban_show_wake.py | 115 ++++++++++++++++++++++
+ tools/kanban_show.py                      |   2 +
+ 6 files changed, 209 insertions(+), 4 deletions(-)
+ create mode 100644 hermes_cli/kanban_wake_summary.py
+ create mode 100644 tests/hermes_cli/test_kanban_show_wake.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 24f668288f..976e2441b8 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -722,6 +722,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
+         latest_summary = kb.latest_summary(conn, args.task_id)
+         from hermes_cli import kanban_wake_check as kwc
+         wake_check = kwc.get_state(conn, args.task_id)
++        from hermes_cli import kanban_wake_summary as kws  # [daveey] what wakes a scheduled card, at latest when
++        wakes = kws.wakes(conn, task, wake_check=wake_check, check_loaded=True)
+         from hermes_cli import kanban_queue_reason as kqr
+         queue_reason = kqr.latest(conn, args.task_id)
+         # Same ``queue`` as kanban_show and the REST read (kanban-7d720d4ab8): a ready card says where it waits. [daveey]
+@@ -737,7 +739,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
+             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
+             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
+             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
+-            "wake_check": wake_check,
++            "wake_check": wake_check, "wakes": wakes,
+             "queue_reason": queue_reason,
+             **details,
+             **_hub_admission_show.show_json(events),
+@@ -748,7 +750,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
+         print(f"  {label + ':':<11}{value}")
+ 
+     print(f"Task {task.id}: {task.title}")
+-    field("status", task.status)
++    field("status", kws.status_text(task.status, wakes))
+     field("assignee", task.assignee or "-")
+     kqr.print_field(queue_reason, field)
+     field("capacity", details["capacity_note"])
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 738324b72f..6497487959 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3716,7 +3716,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str, *, recovery_tai
+     # One clock reading so every relative age in this rendering agrees.
+     now = int(time.time())
+     lines: list[str] = []
+-    _ctx_header(lines, task)
++    _ctx_header(lines, task, conn=conn)
+     _ctx_standing(lines, task, list_comments(conn, task_id))  # [daveey]
+     from hermes_cli.kanban_continuation import render_checkpoint_context
+     checkpoint = render_checkpoint_context(conn, task_id)
+diff --git a/hermes_cli/kanban_db_context.py b/hermes_cli/kanban_db_context.py
+index 1df0f2be62..ca1f969a7d 100644
+--- a/hermes_cli/kanban_db_context.py
++++ b/hermes_cli/kanban_db_context.py
+@@ -95,7 +95,7 @@ def ctx_workspace_span(task: Task) -> list:
+     return [len("\n".join(lines[:k])) + 1, lines[k]]
+ 
+ 
+-def _ctx_header(lines: list[str], task: Task) -> None:
++def _ctx_header(lines: list[str], task: Task, *, conn: Optional[sqlite3.Connection] = None) -> None:
+     lines.append(f"# Kanban task {task.id}: {task.title}")
+     lines.append("")
+     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
+@@ -113,6 +113,10 @@ def _ctx_header(lines: list[str], task: Task) -> None:
+             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
+     if task.branch_name:
+         lines.append(f"Branch:   {task.branch_name}")
++    if conn is not None:  # after Workspace, so ctx_workspace_span (no conn) keeps the same offset [daveey]
++        from hermes_cli.kanban_wake_summary import context_line
++        if wake := context_line(conn, task):
++            lines.append(wake)
+     lines.append("")
+     if task.body and task.body.strip():
+         lines.append("## Body")
+diff --git a/hermes_cli/kanban_wake_summary.py b/hermes_cli/kanban_wake_summary.py
+new file mode 100644
+index 0000000000..d2466c7b38
+--- /dev/null
++++ b/hermes_cli/kanban_wake_summary.py
+@@ -0,0 +1,82 @@
++"""What wakes a ``scheduled`` card, said in one place. [daveey]
++
++A scheduled card wakes on whichever comes first: its park's wake check passing, or the park's
++deadline (``wake_at``, or the deadline ``kanban_timed_park.implied_wake`` derives for older
++parks). ``kanban show`` used to print ``status: scheduled`` and the check in a separate field
++below Diagnostics, while the raw ``SCHEDULED_UNTIL=…`` sat in the run line; an agent that
++grepped ``status:`` quoted the deadline as the wake time when it was only the backstop
++(defect agent-3a632ca054). Every card-status surface (CLI status line, ``--json`` ``wakes``,
++worker_context ``Wakes:``) renders from :func:`wakes`.
++"""
++from __future__ import annotations
++
++import sqlite3
++import time
++from typing import Any, Optional
++
++
++def _stamp(ts: int, fmt: str = "%Y-%m-%d %H:%M") -> str:
++    return time.strftime(fmt, time.localtime(ts))
++
++
++def wakes(conn: sqlite3.Connection, task: Any, *, wake_check: Optional[dict] = None,
++          check_loaded: bool = False) -> Optional[dict]:
++    """``{"check", "next_probe_at", "backstop_at"}`` for a scheduled card, else None.
++
++    ``check`` is the armed wake-check command (None for a pure clock park); ``backstop_at`` is
++    the park's deadline. Pass ``wake_check`` with ``check_loaded=True`` when the caller already
++    read ``kanban_wake_check.get_state``."""
++    if getattr(task, "status", None) != "scheduled":
++        return None
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_continuation import SCHEDULED_ENTRY_EVENTS
++    from hermes_cli.kanban_timed_park import implied_wake
++
++    if not check_loaded:
++        from hermes_cli import kanban_wake_check as kwc
++        wake_check = kwc.get_state(conn, task.id)
++    if wake_check and wake_check.get("purpose") == "ask_resolved":
++        wake_check = None  # a human ask's resolved_check, not this park's wake
++    marks = ",".join("?" for _ in SCHEDULED_ENTRY_EVENTS)
++    row = conn.execute(
++        f"SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind IN ({marks}) "
++        "ORDER BY id DESC LIMIT 1", (task.id, *SCHEDULED_ENTRY_EVENTS)).fetchone()
++    if row is not None:
++        payload, parked_at = kb._json_dict(row[0]), int(row[1])
++    else:
++        last = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ?", (task.id,)).fetchone()
++        payload, parked_at = {}, int(last[0]) if last and last[0] else int(time.time())
++    return {
++        "check": wake_check.get("cmd") if wake_check else None,
++        "next_probe_at": int(wake_check["next_at"]) if wake_check and wake_check.get("next_at") is not None else None,
++        "backstop_at": implied_wake(payload, parked_at),
++    }
++
++
++def phrase(w: Optional[dict], *, now: Optional[int] = None) -> str:
++    """``wakes when `cmd` passes (next probe HH:MM), backstop YYYY-MM-DD HH:MM`` or ``wakes at …``;
++    empty for None. The deadline is called a backstop only when a check can wake the card first."""
++    if not w:
++        return ""
++    now = int(time.time()) if now is None else int(now)
++    if not w.get("check"):
++        return f"wakes at {_stamp(w['backstop_at'])}"
++    nxt = w.get("next_probe_at")
++    probe = ("next probe due now" if nxt is None or nxt <= now else f"next probe {_stamp(nxt, '%H:%M')}")
++    return f"wakes when `{w['check']}` passes ({probe}), backstop {_stamp(w['backstop_at'])}"
++
++
++def status_text(status: str, w: Optional[dict]) -> str:
++    """The ``status:`` value: the status word first (``awk '{print $2}'`` parsers), then the wake."""
++    text = phrase(w)
++    return f"{status} — {text}" if text else status
++
++
++def context_line(conn: sqlite3.Connection, task: Any) -> Optional[str]:
++    """worker_context's ``Wakes:`` header line; None when the card is not scheduled. Advisory: a
++    read failure leaves the line out rather than breaking context assembly."""
++    try:
++        text = phrase(wakes(conn, task))
++    except (sqlite3.Error, KeyError, TypeError, ValueError):
++        return None
++    return f"Wakes:    {text.removeprefix('wakes ')}" if text else None
+diff --git a/tests/hermes_cli/test_kanban_show_wake.py b/tests/hermes_cli/test_kanban_show_wake.py
+new file mode 100644
+index 0000000000..38b16bc019
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_show_wake.py
+@@ -0,0 +1,115 @@
++"""``kanban show`` says what wakes a scheduled card, on the status line itself.
++
++Regression for defect agent-3a632ca054: an agent read ``hermes kanban show`` through
++``grep "status:|→"`` and ``tail``, which kept ``status: scheduled`` and the run line's raw
++``SCHEDULED_UNTIL=…`` and dropped the separate ``wake check:`` field. It told David the card
++"checks back at 18:05", but 18:05 was only the backstop: the card had a wake check that would
++wake it the moment the awaited card landed. Every card-status surface (CLI text, ``--json``,
++the kanban_show tool's worker_context) now states "wakes when X passes, at latest T". [daveey]
++"""
++from __future__ import annotations
++
++import json
++import time
++from datetime import UTC, datetime
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++
++@pytest.fixture
++def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    return home
++
++
++def _stamp(ts: int) -> str:
++    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
++
++
++def _park(kanban_home: Path, *, with_check: bool) -> tuple[str, int, str]:
++    wake = int(time.time()) + 3 * 3600
++    until = datetime.fromtimestamp(wake, tz=UTC).isoformat().replace("+00:00", "Z")
++    probe = f"test -f {kanban_home}/mirror-landed"  # never written: the park-time dry run must not pass
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="fix card", assignee="alice")
++    flags = f"--wake-check '{probe}'" if with_check else "--clock-only"
++    out = kc.run_slash(f"block {tid} 'SCHEDULED_UNTIL={until} waiting on the mirror card' --kind time {flags}")
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "scheduled", out
++    return tid, wake, probe
++
++
++def _status_lines(out: str) -> list[str]:
++    return [line for line in out.splitlines() if "status:" in line]
++
++
++def test_status_line_names_the_wake_check_and_labels_the_deadline_a_backstop(kanban_home: Path) -> None:
++    tid, wake, probe = _park(kanban_home, with_check=True)
++    status = _status_lines(kc.run_slash(f"show {tid}"))
++    assert len(status) == 1, status
++    line = status[0]
++    assert line.split()[1] == "scheduled"  # `awk '{print $2}'` parsers keep working
++    assert f"wakes when `{probe}` passes" in line
++    assert f"backstop {_stamp(wake)}" in line
++    assert "next probe" in line
++
++
++def test_status_line_without_a_check_says_wakes_at(kanban_home: Path) -> None:
++    tid, wake, _ = _park(kanban_home, with_check=False)
++    (line,) = _status_lines(kc.run_slash(f"show {tid}"))
++    assert f"wakes at {_stamp(wake)}" in line
++    assert "backstop" not in line and "wakes when" not in line
++
++
++def test_json_has_a_wakes_object(kanban_home: Path) -> None:
++    tid, wake, probe = _park(kanban_home, with_check=True)
++    data = json.loads(kc.run_slash(f"show {tid} --json"))
++    wakes = data["wakes"]
++    assert wakes["check"] == probe
++    assert wakes["backstop_at"] == wake
++    assert isinstance(wakes["next_probe_at"], int)
++
++    tid2, wake2, _ = _park(kanban_home, with_check=False)
++    wakes2 = json.loads(kc.run_slash(f"show {tid2} --json"))["wakes"]
++    assert wakes2 == {"check": None, "next_probe_at": None, "backstop_at": wake2}
++
++
++def test_unscheduled_card_has_no_wake(kanban_home: Path) -> None:
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="ready card", assignee="alice")
++    out = kc.run_slash(f"show {tid}")
++    (line,) = _status_lines(out)
++    assert "wakes" not in line
++    assert json.loads(kc.run_slash(f"show {tid} --json"))["wakes"] is None
++
++
++def test_worker_context_states_the_wake_in_one_line(kanban_home: Path) -> None:
++    tid, wake, probe = _park(kanban_home, with_check=True)
++    with kbc.connect_closing() as conn:
++        ctx = kb.build_worker_context(conn, tid)
++    wakes = [line for line in ctx.splitlines() if line.startswith("Wakes:")]
++    assert len(wakes) == 1, ctx
++    assert f"when `{probe}` passes" in wakes[0] and f"backstop {_stamp(wake)}" in wakes[0]
++
++    tid2, wake2, _ = _park(kanban_home, with_check=False)
++    with kbc.connect_closing() as conn:
++        ctx2 = kb.build_worker_context(conn, tid2)
++    assert f"Wakes:    at {_stamp(wake2)}" in ctx2
++
++
++def test_kanban_show_tool_returns_wakes(kanban_home: Path) -> None:
++    from tools.kanban_show import show
++
++    tid, wake, probe = _park(kanban_home, with_check=True)
++    out = json.loads(show({"task_id": tid}))
++    assert out["wakes"]["check"] == probe and out["wakes"]["backstop_at"] == wake
++    assert f"when `{probe}` passes" in out["worker_context"]
+diff --git a/tools/kanban_show.py b/tools/kanban_show.py
+index 7809c78d50..64e7055f6a 100644
+--- a/tools/kanban_show.py
++++ b/tools/kanban_show.py
+@@ -63,6 +63,7 @@ def _detail(kb, conn, task, args, *, replica: bool) -> dict:
+             queue_hint = None
+         details = kqp.detail_fields(conn, task, args.get("board"))
+     from hermes_cli.kanban_hub_admission_placement import describe, latest_verdict
++    from hermes_cli.kanban_wake_summary import wakes
+     verdict = latest_verdict(conn, tid)
+     if verdict and details.get("queue_note"):
+         details["queue_note"] = f"{details['queue_note']} ({describe(verdict)})"
+@@ -71,6 +72,7 @@ def _detail(kb, conn, task, args, *, replica: bool) -> dict:
+         "source": "replica" if replica else "live",
+         **capsule,
+         "queue_reason": kqr.latest(conn, tid),
++        "wakes": wakes(conn, task),  # [daveey] {check, next_probe_at, backstop_at} while scheduled
+         **details,
+         **({"hub_admission": verdict} if verdict else {}),
+         **({"queue_hint": queue_hint} if queue_hint else {}),
+-- 
+2.51.0
+

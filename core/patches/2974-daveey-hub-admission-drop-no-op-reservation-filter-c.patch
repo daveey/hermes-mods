@@ -1,0 +1,122 @@
+From 24ac124a98f1e82babf6cce0a036d449f8f9b768 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 09:17:24 +0000
+Subject: [PATCH] [daveey] hub admission: drop no-op reservation filter, cover
+ pickup() with a pool budget and legacy rows
+
+The review reservation already falls back to ready rows in the same tick, so
+filtering it by pool changed no outcome (no test could kill it): removed.
+pickup() with a PoolBudget is now exercised end to end (a scalar <= check
+raised TypeError), and a replica row without admission_class reads as normal.
+Budget annotations widened to Any; design doc describes the per-pool budget.
+---
+ docs/kanban-hub-admission-v2.md                    |  8 +++++++-
+ hermes_cli/kanban_db_dispatch.py                   |  2 +-
+ hermes_cli/kanban_db_sync.py                       |  2 +-
+ hermes_cli/kanban_worker_node.py                   |  4 ++--
+ tests/hermes_cli/test_kanban_hub_admission.py      | 10 ++++++++++
+ tests/hermes_cli/test_kanban_pickup_local_order.py |  3 +++
+ 6 files changed, 24 insertions(+), 5 deletions(-)
+
+diff --git a/docs/kanban-hub-admission-v2.md b/docs/kanban-hub-admission-v2.md
+index 203095bfd9..baee50bfb6 100644
+--- a/docs/kanban-hub-admission-v2.md
++++ b/docs/kanban-hub-admission-v2.md
+@@ -14,7 +14,13 @@ capacity-origin cap in final admission. Opt-in pre-lease/final CPU gates select
+ separate priority pool. The dispatcher budget can reach the extra pool at regular
+ saturation, preserving the shared critical/elevated memory guard. Opted-in hubs
+ order marked candidates first within each lane, retaining effective priority
+-within each group. Composed ready/review dispatcher tests now reach real final
++within each group. The dispatcher budget is per pool (`PoolBudget`): a normal
++row only fits a regular slot, so once this tick's regular slots are spent no
++normal row is attempted (no CPU advisory, Board claim gate or locked census),
++marked rows charge a priority slot first, and foreign pickup gets the same pool
++budget capped to the tick's total. At regular 7/7 the tick reports
++`at_capacity = "regular pool max_in_progress=7/7 (priority n/3 is marked-only)"`
++and a normal card's queue note says `regular pool full (7/7)`. Composed ready/review dispatcher tests now reach real final
+ claims at 70% CPU with seven regular runs, including an opposite normal lane,
+ critical/elevated memory and a hard per-board `max_spawn` ceiling. Workers retain
+ plain priority. These isolated tests do not establish live acceptance.
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index e3030852a5..344da06540 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2342,7 +2342,7 @@ def _dispatch_once_locked(
+     # one slot back.
+     ready_budget = spawn_budget
+     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(
+-        conn, [row for row in review_rows if pool_admits(result, row)],
++        conn, review_rows,
+         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+     ):
+         ready_budget = max(spawn_budget - 1, 0)
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 4acb33365d..31a2b58901 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1069,7 +1069,7 @@ def set_runs_on(conn: sqlite3.Connection, task_id: str, runs_on: Any) -> None:
+     wn.set_runs_on(conn, task_id, wn.normalize_runs_on(runs_on if isinstance(runs_on, str) else list(runs_on)))
+ 
+ 
+-def worker_pickup(conn: sqlite3.Connection, budget: Optional[int], dry_run: bool, profile_exists_fn: Any) -> None:
++def worker_pickup(conn: sqlite3.Connection, budget: Any, dry_run: bool, profile_exists_fn: Any) -> None:
+     """Dispatcher seam: a worker node copies eligible cards other gateways created (``kanban_worker_node``)."""
+     if dry_run or board_mode(conn) != "primary":
+         return
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index a34d6aefb6..bd58a782b9 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -527,7 +527,7 @@ def _unimported_pinned(conn: sqlite3.Connection, replica: sqlite3.Connection, ow
+         return set()
+ 
+ 
+-def _evaluate(conn: sqlite3.Connection, replica: sqlite3.Connection, own: str, *, mode: str, limit: int,
++def _evaluate(conn: sqlite3.Connection, replica: sqlite3.Connection, own: str, *, mode: str, limit: Any,
+               profile_exists: Optional[Callable[[str], bool]], full_detail: str,
+               held: Optional[dict[str, tuple]] = None,
+               ) -> tuple[list[str], dict[str, tuple[str, Optional[str]]]]:
+@@ -628,7 +628,7 @@ def note_capped(conn: sqlite3.Connection, profile_exists: Optional[Callable[[str
+     _record_skips(conn, skips)
+ 
+ 
+-def pickup(conn: sqlite3.Connection, *, budget: Optional[int],
++def pickup(conn: sqlite3.Connection, *, budget: Any,
+            profile_exists: Optional[Callable[[str], bool]] = None) -> list[str]:
+     """One tick's pickup: evict finished copies, then copy up to ``budget`` eligible foreign cards. Returns the
+     ids copied. A no-op unless the board is primary and ``kanban.sync.pickup`` is on. Each card pinned to this
+diff --git a/tests/hermes_cli/test_kanban_hub_admission.py b/tests/hermes_cli/test_kanban_hub_admission.py
+index 0a45f3c579..06d1c14c3a 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission.py
++++ b/tests/hermes_cli/test_kanban_hub_admission.py
+@@ -622,6 +622,16 @@ def test_pool_budget_charges_marked_to_priority_then_regular():
+     assert not plain.admits("capacity")
+ 
+ 
++def test_row_without_admission_column_reads_as_normal():
++    from hermes_cli.kanban_admission_pools import row_class
++    with closing(sqlite3.connect(":memory:")) as db:
++        db.row_factory = sqlite3.Row
++        legacy = db.execute("SELECT 't_1' AS id").fetchone()
++        marked = db.execute("SELECT 't_2' AS id, 'urgent' AS admission_class").fetchone()
++        unset = db.execute("SELECT 't_3' AS id, NULL AS admission_class").fetchone()
++    assert (row_class(legacy), row_class(marked), row_class(unset)) == ("normal", "urgent", "normal")
++
++
+ def test_pool_census_uses_one_board_snapshot(board, monkeypatch):
+     from hermes_cli import kanban_admission_pools as pools
+     conn, home = board
+diff --git a/tests/hermes_cli/test_kanban_pickup_local_order.py b/tests/hermes_cli/test_kanban_pickup_local_order.py
+index 9bdb8450a9..4f4760af6c 100644
+--- a/tests/hermes_cli/test_kanban_pickup_local_order.py
++++ b/tests/hermes_cli/test_kanban_pickup_local_order.py
+@@ -103,3 +103,6 @@ def test_pickup_pool_budget_imports_only_marked_cards_when_regular_full(gws):
+         assert picked == [normal]
+     finally:
+         replica.close()
++    assert wn.pickup(executor.conn, budget=PoolBudget(0, 0, 3)) == []  # no free slot in any pool
++    assert wn.pickup(executor.conn, budget=PoolBudget(0, 3)) == [marked]
++    assert kb.get_task(executor.conn, normal) is None
+-- 
+2.51.0
+

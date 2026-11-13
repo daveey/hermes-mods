@@ -1,0 +1,127 @@
+From 3d3eeb0b7761eafd5a3714cabd7d2ef128b02f02 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 02:57:17 +0000
+Subject: [PATCH] [daveey] kanban_awaiting: ci/deploy premise includes the head
+ SHAs its park names
+
+A ci/deploy park hashed kind|gateway|ref|why, so parks on a PR URL with no
+per-head why folded every head into one premise: red CI -> fix -> new head ->
+park escalated on the third round although each park waited on a new head
+(PR #1806, t_01a1d19e0179a093). premise_hash now also hashes the sorted set of
+full 40-hex SHAs found in the park's ref and wake_check (gate() passes the
+wake_check through). Same head -> same premise, so a stuck head still
+escalates; parks naming no full SHA keep their old premise. Resource and
+inferred premises are unchanged.
+---
+ hermes_cli/kanban_awaiting.py            | 23 ++++++++++--
+ tests/hermes_cli/test_kanban_awaiting.py | 46 ++++++++++++++++++++++++
+ 2 files changed, 66 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 8bbfcc9755..ae9562ee66 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -174,8 +174,22 @@ def normalize(value: Any) -> Optional[dict]:
+     return out
+ 
+ 
+-def premise_hash(awaiting: dict, reason: Optional[str]) -> str:
+-    """Stable id of what a park waits on: the declared producer (with its why), else the reason."""
++_FULL_SHA = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{40}(?![0-9A-Fa-f])")
++
++
++def run_heads(awaiting: dict, wake_check: Optional[str]) -> list[str]:
++    """Sorted full (40-hex) commit SHAs a ``ci``/``deploy`` park names in its ``ref`` or ``wake_check``."""
++    text = f"{awaiting.get('ref', '')} {wake_check or ''}"
++    return sorted({m.lower() for m in _FULL_SHA.findall(text)})
++
++
++def premise_hash(awaiting: dict, reason: Optional[str], wake_check: Optional[str] = None) -> str:
++    """Stable id of what a park waits on: the declared producer (with its why), else the reason.
++
++    A ``ci``/``deploy`` park also hashes the full commit SHAs its ``ref``/``wake_check`` name: red CI, a fix
++    pushed as a new head and a park on that head is new evidence, not the same premise. A PR-URL ref with
++    no per-head ``why`` folded every head into one premise and escalated the third fix round (PR #1806,
++    t_01a1d19e0179a093). The same head re-parked still counts, so a stuck head escalates. [daveey]"""
+     if awaiting.get("inferred"):
+         basis = " ".join((reason or "").lower().split())[:400]
+     elif awaiting.get("kind") == RESOURCE:
+@@ -183,6 +197,9 @@ def premise_hash(awaiting: dict, reason: Optional[str]) -> str:
+         basis = "|".join(awaiting.get(k, "") for k in ("kind", "gateway", "ref"))
+     else:
+         basis = "|".join(awaiting.get(k, "") for k in ("kind", "gateway", "ref", "why"))
++        heads = run_heads(awaiting, wake_check) if awaiting.get("kind") in ("ci", "deploy") else []
++        if heads:  # SHA-less parks keep their old premise
++            basis += "|heads:" + ",".join(heads)
+     return hashlib.sha256(basis.encode()).hexdigest()[:16]
+ 
+ 
+@@ -766,7 +783,7 @@ def gate(conn: sqlite3.Connection, task_id: str, *, awaiting: Any, reason: Optio
+                      clock_only=clock_only, op=op, wake_in=wake_in)
+     if record["kind"] == "card" or (record["kind"] == "clock" and record.get("inferred")):
+         return record
+-    record["premise"] = premise_hash(record, reason)
++    record["premise"] = premise_hash(record, reason, wake_check)
+     if record["kind"] == RESOURCE:
+         # A governor/pool hold is internal and transient: its probe resumes the card when the reading drops.
+         # Escalating it made "Unstick" cards for a premise nobody can act on (bb t_01a19f5cca30ed12), and on a
+diff --git a/tests/hermes_cli/test_kanban_awaiting.py b/tests/hermes_cli/test_kanban_awaiting.py
+index ab64b58f21..d0fce00943 100644
+--- a/tests/hermes_cli/test_kanban_awaiting.py
++++ b/tests/hermes_cli/test_kanban_awaiting.py
+@@ -415,6 +415,52 @@ def test_escalation_goes_to_a_capable_supervisor(kanban_home, monkeypatch) -> No
+         assert (card.assignee, card.status) == ("boss", "ready")
+ 
+ 
++# PR #1806 (t_01a1d19e0179a093): red CI -> fix -> new head -> park again, three rounds on one PR URL with no
++# per-head ``why``. Each park named its head only in the wake_check, so all three hashed to one premise and
++# the third fix round escalated. The head SHA is part of a ci/deploy premise; a stuck head still escalates.
++CI_PR = "https://github.com/example-org/hermes/pull/1806"
++CI_HEADS = ("b07a0bd43d" + "1" * 30, "efeeea0fe5" + "2" * 30, "06d1730d94" + "3" * 30)
++
++
++def _ci_parks(conn, monkeypatch, heads, kind="ci"):
++    tid = _running(conn)
++    return [_repark(conn, monkeypatch, tid, "schedule", {
++        "reason": f"waiting for required checks, round {n}",
++        "wake_check": f"gh api repos/example-org/hermes/commits/{head}/check-runs | grep -q completed",
++        "awaiting": {"kind": kind, "ref": CI_PR}}) for n, head in enumerate(heads)]
++
++
++@pytest.mark.parametrize("kind", ["ci", "deploy"])
++def test_ci_parks_on_new_heads_are_new_premises(kanban_home, monkeypatch, kind) -> None:
++    with kbc.connect_closing() as conn:
++        outs = _ci_parks(conn, monkeypatch, CI_HEADS, kind)
++        assert [o.get("status") for o in outs] == ["scheduled"] * 3, outs
++
++
++@pytest.mark.parametrize("kind", ["ci", "deploy"])
++def test_ci_parks_on_one_head_still_escalate(kanban_home, monkeypatch, kind) -> None:
++    with kbc.connect_closing() as conn:
++        outs = _ci_parks(conn, monkeypatch, (CI_HEADS[0],) * 2 + (CI_HEADS[0].upper(),), kind)
++        assert [o.get("status") for o in outs[:2]] == ["scheduled", "scheduled"], outs
++        assert outs[2].get("code") == kaw.ESCALATED_EVENT and outs[2].get("status") == "todo", outs[2]
++
++
++def test_ci_premise_hashes_heads_only_for_run_kinds() -> None:
++    head = CI_HEADS[0]
++    probe = f"wait_for_ci.py {head} --once"
++    for kind in ("ci", "deploy"):
++        aw = {"kind": kind, "ref": CI_PR}
++        assert kaw.premise_hash(aw, "r", probe) != kaw.premise_hash(aw, "r", probe.replace(head, CI_HEADS[1]))
++        ref_aw = {"kind": kind, "ref": f"run for {head}"}
++        assert kaw.premise_hash(ref_aw, "r") == kaw.premise_hash(ref_aw, "r", f"probe {head.upper()}")
++        assert kaw.premise_hash(ref_aw, "r") != kaw.premise_hash(ref_aw, "r", f"probe {CI_HEADS[1]}")
++        # No full SHA (short ones are not heads): the premise is unchanged from before.
++        assert kaw.premise_hash(aw, "r", "wait_for_ci.py b07a0bd43d") == kaw.premise_hash(aw, "r")
++    for aw in ({"kind": "external", "ref": CI_PR}, {"kind": kaw.RESOURCE, "ref": "pool"},
++               {"kind": "ci", "ref": CI_PR, "inferred": True}):
++        assert kaw.premise_hash(aw, "r", probe) == kaw.premise_hash(aw, "r", probe.replace(head, CI_HEADS[1]))
++
++
+ def _repark(conn, monkeypatch, tid, name, args):
+     _as_worker(monkeypatch, conn, tid)
+     out = _tool(name, args)
+-- 
+2.51.0
+

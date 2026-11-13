@@ -1,0 +1,627 @@
+From 6c0b3a9dffa168b72e877889d7b55c7c9413e778 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 19:30:30 +0000
+Subject: [PATCH] [daveey] kanban(source): wrap every voluntary ending +
+ escalate in with_source_receipt; AST guard; Q4 multi-field strip +
+ install_triggers ensure_schema
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+workspace_source v1 core PR-1 (t_01a1d0ec4ab93f32), plan v4.1 §A5 + build decisions Q2/Q4.
+Renames the spike test to test_kanban_source_receipt.py; R4c fenced workspace_kind/branch_name
+take the same no-omission strip+resend path.
+---
+ hermes_cli/kanban_awaiting.py                 |   4 +-
+ hermes_cli/kanban_continuation.py             |   5 +-
+ hermes_cli/kanban_db.py                       |   8 +-
+ hermes_cli/kanban_db_sync.py                  |   2 +
+ hermes_cli/kanban_run_finalizer.py            |   5 +-
+ hermes_cli/kanban_sync_compat.py              |  44 +-
+ hermes_cli/kanban_timed_park.py               |   3 +-
+ ...spike.py => test_kanban_source_receipt.py} |   0
+ .../test_kanban_source_receipt_sites.py       | 389 ++++++++++++++++++
+ 9 files changed, 433 insertions(+), 27 deletions(-)
+ rename tests/hermes_cli/{test_kanban_source_receipt_spike.py => test_kanban_source_receipt.py} (100%)
+ create mode 100644 tests/hermes_cli/test_kanban_source_receipt_sites.py
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 842a06abc5..d1f76b6d12 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -870,7 +870,9 @@ def escalate(conn: sqlite3.Connection, task_id: str, *, record: dict, reason: Op
+     if expected_run_id is not None:
+         sql += " AND current_run_id = ?"
+         params = (task_id, int(expected_run_id))
+-    if conn.execute(sql, params).rowcount != 1:
++    # Q2 (t_01a1d0ec4ab93f32): a voluntary ending's escalation; the receipt its enclosing ending staged rides this op.
++    from hermes_cli.kanban_source_receipt import with_source_receipt
++    if with_source_receipt(conn, task_id, lambda: conn.execute(sql, params).rowcount) != 1:
+         return None
+     key = f"{ESCALATION_PREFIX}{task_id}:{record['premise']}"
+     existing = conn.execute("SELECT id, status FROM tasks WHERE idempotency_key = ?", (key,)).fetchone()
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index e9837093c7..19b5eeee47 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -179,13 +179,14 @@ def continue_task(
+         except ValueError as exc:
+             return {"ok": False, "error": str(exc)}
+         # A successful checkpoint supersedes stale auth/quota diagnostics, not counters.
+-        cur = conn.execute(
++        from hermes_cli.kanban_source_receipt import with_source_receipt
++        cur = with_source_receipt(conn, task_id, lambda: conn.execute(
+             "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+             "worker_pid = NULL, worker_started_at = NULL, last_heartbeat_at = NULL, "
+             "last_failure_error = NULL "
+             "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+             (new_status, task_id, int(row["current_run_id"])),
+-        )
++        ))
+         if cur.rowcount != 1:
+             return {"ok": False, "error": "task changed state concurrently"}
+         kpp.apply(conn, task_id, pin)  # unpushed state keeps a pooled card on this worker
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index ac88f292ef..e4d4e7a18a 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3135,7 +3135,7 @@ def request_review(
+                 *(() if reviewer is None else (reviewer,)), task_id,
+                 *(() if expected_run_id is None else (int(expected_run_id),)),
+             )
+-            cur = conn.execute(
++            cur = _sr.with_source_receipt(conn, task_id, lambda: conn.execute(
+                 """
+                 UPDATE tasks
+                    SET status        = 'review',
+@@ -3148,7 +3148,7 @@ def request_review(
+                    AND status IN ('running', 'ready')
+                 """ + run_guard,
+                 params,
+-            )
++            ))
+             if cur.rowcount != 1:
+                 return _ret(
+                     False, "task is not in running/ready (or expected_run_id did not match the current run)",
+@@ -3238,7 +3238,7 @@ def request_changes(
+         new_status = _landing_status_after_parents(conn, task_id)
+         # consecutive_failures deliberately PRESERVED: a review transition is
+         # not evidence the pathology cleared; only complete_task resets it.
+-        cur = conn.execute(
++        cur = _sr.with_source_receipt(conn, task_id, lambda: conn.execute(
+             """
+             UPDATE tasks
+                SET status = ?,
+@@ -3249,7 +3249,7 @@ def request_changes(
+              WHERE id = ? AND status = 'running' AND current_run_id = ?
+             """,
+             (new_status, implementer, task_id, int(current_run_id)),
+-        )
++        ))
+         if cur.rowcount != 1:
+             return False, "task changed during review handoff"
+         run_id = _end_run(
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index fa65a3e61d..30d470f90c 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -622,6 +622,8 @@ def install_triggers(conn: sqlite3.Connection) -> None:
+     """(Re)generate every capture trigger from the live column list. A no-op when the installed set already
+     matches, so ordinary process starts never touch them; callers hold a write transaction so a rebuild has no
+     window in which another process's write goes uncaptured."""
++    from hermes_cli import kanban_source_receipt
++    kanban_source_receipt.ensure_schema(conn)  # the tasks UPDATE trigger reads its pending table
+     wanted = wanted_triggers(conn)
+     have = dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'kanban_sync_%'"))
+     if have == wanted:
+diff --git a/hermes_cli/kanban_run_finalizer.py b/hermes_cli/kanban_run_finalizer.py
+index 2fa7f1ec90..76e138d94f 100644
+--- a/hermes_cli/kanban_run_finalizer.py
++++ b/hermes_cli/kanban_run_finalizer.py
+@@ -24,14 +24,15 @@ def close_dead_run(conn, row, dead):
+     if run is None or run['status'] != 'running' or run['ended_at'] is not None:
+         return None
+     retry_status = kb._retry_status_for_run(conn, row['id'])
+-    cur = conn.execute(
++    from hermes_cli.kanban_source_receipt import with_source_receipt
++    cur = with_source_receipt(conn, row['id'], lambda: conn.execute(
+         'UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, '
+         'worker_pid=NULL, worker_started_at=NULL '
+         "WHERE id=? AND status='running' AND current_run_id=? "
+         'AND worker_pid IS ? AND worker_started_at IS ? AND claim_lock IS ?',
+         (retry_status, row['id'], run_id, row['worker_pid'],
+          row['worker_started_at'], row['claim_lock']),
+-    )
++    ), run_id=run_id)
+     if cur.rowcount != 1:
+         return None
+     dead.event_payload['retry_status'] = retry_status
+diff --git a/hermes_cli/kanban_sync_compat.py b/hermes_cli/kanban_sync_compat.py
+index 51f66ac05e..945aca2042 100644
+--- a/hermes_cli/kanban_sync_compat.py
++++ b/hermes_cli/kanban_sync_compat.py
+@@ -50,20 +50,26 @@ def enqueue_retry(conn: sqlite3.Connection, row: dict, wire: dict, result: dict)
+     """
+     if result.get("reason") != "forbidden_field" or row["op"] not in ("upsert", "import"):
+         return False
+-    match = re.fullmatch(r"not writable on ([a-z_]+): ([a-z_]+)", str(result.get("detail") or ""))
++    match = re.fullmatch(r"not writable on ([a-z_]+): ([a-z_]+(?:, [a-z_]+)*)", str(result.get("detail") or ""))
+     if match is None or match[1] != row["table_name"]:
+         return False
+     fields = wire.get("fields", {})
+-    if match[2] not in fields:
++    named = match[2].split(", ")
++    # A wire-only field (any Board too old to know it), or a source-fenced column (R4c: only a custody/manifest
++    # card's Board refuses ``workspace_kind``/``branch_name``; every Board version accepts them otherwise), is
++    # dropped with no omission, from a multi-field detail too (Q4); the Board's value comes back on the next pull.
++    droppable = sync.VIRTUAL_WIRE_FIELDS.get(row["table_name"], frozenset()) | FENCED_FIELDS.get(row["table_name"], frozenset())
++    if dropped := [f for f in named if f in droppable and f in fields]:
++        return _drop_virtual(conn, row, wire, dropped)
++    if len(named) != 1 or named[0] not in fields:
+         return False
+-    if match[2] in sync.VIRTUAL_WIRE_FIELDS.get(row["table_name"], frozenset()):
+-        return _drop_virtual(conn, row, wire, match[2])
+-    reduced = {k: v for k, v in fields.items() if k != match[2]}
++    field = named[0]
++    reduced = {k: v for k, v in fields.items() if k != field}
+     retry_id = sync.uuid7()
+     inserted = conn.execute(
+         "INSERT OR IGNORE INTO kanban_sync_omissions (original_op_id, table_name, row_uid, field, compat_op_id) "
+         "VALUES (?, ?, ?, ?, ?)",
+-        (row["op_id"], row["table_name"], row["row_uid"], match[2], retry_id)).rowcount
++        (row["op_id"], row["table_name"], row["row_uid"], field, retry_id)).rowcount
+     if not inserted:
+         return False
+     conn.execute(
+@@ -76,20 +82,24 @@ def enqueue_retry(conn: sqlite3.Connection, row: dict, wire: dict, result: dict)
+ 
+ 
+ VIRTUAL_DROPPED = "virtual_dropped"
++# Real columns a new Board fences on custody/manifest cards (workspace_source v1, R4c): refused one per detail.
++FENCED_FIELDS: dict[str, frozenset[str]] = {"tasks": frozenset({"workspace_kind", "branch_name"})}
+ 
+ 
+-def _drop_virtual(conn: sqlite3.Connection, row: dict, wire: dict, field: str) -> str:
+-    """An old Board refused a wire-only field (``sync.VIRTUAL_WIRE_FIELDS``): nothing local holds it, so there is
+-    nothing to restore. Resend the same op without it under a fresh id, keeping the original op kind (a later
+-    refusal of a real column still takes the omission path), and retire the refused original: an omission row
+-    could never be delivered (``_queue_restore`` reads real columns only) and a retained rejected op would hold
++def _drop_virtual(conn: sqlite3.Connection, row: dict, wire: dict, dropped: list[str]) -> str:
++    """The Board refused fields nothing local needs delivered: a wire-only field (``sync.VIRTUAL_WIRE_FIELDS``),
++    or a source-fenced column (``FENCED_FIELDS``) whose Board value wins. Resend the same op without them under a
++    fresh id, keeping the original op kind (a later refusal of another real column still takes the omission
++    path), and retire the refused original: an omission row could never be delivered (``_queue_restore`` reads
++    real columns only, and a fenced column stays fenced while custody exists) and a retained rejected op would hold
+     the card from repair (``repair_holds``) forever."""
+     reduced = {k: v for k, v in (row["fields"] if isinstance(row["fields"], dict)
+-                                 else json.loads(row["fields"])).items() if k != field}
+-    conn.execute(
+-        "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at) "
+-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+-        (sync.uuid7(), row["table_name"], row["row_uid"], row["op"], json.dumps(reduced),
+-         row.get("base_version"), wire["hlc"], row["created_at"]))
++                                 else json.loads(row["fields"])).items() if k not in dropped}
++    if reduced or row["op"] != "upsert":  # an upsert of only refused fields has nothing left to say
++        conn.execute(
++            "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at) "
++            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
++            (sync.uuid7(), row["table_name"], row["row_uid"], row["op"], json.dumps(reduced),
++             row.get("base_version"), wire["hlc"], row["created_at"]))
+     conn.execute("DELETE FROM kanban_sync_outbox WHERE op_id = ?", (row["op_id"],))
+     return VIRTUAL_DROPPED
+diff --git a/hermes_cli/kanban_timed_park.py b/hermes_cli/kanban_timed_park.py
+index a5ea4e546f..3d20ecd972 100644
+--- a/hermes_cli/kanban_timed_park.py
++++ b/hermes_cli/kanban_timed_park.py
+@@ -186,7 +186,8 @@ def park(
+     if expected_run_id is not None:
+         sql += " AND current_run_id = ?"
+         params = (task_id, int(expected_run_id))
+-    if conn.execute(sql, params).rowcount != 1:
++    from hermes_cli.kanban_source_receipt import with_source_receipt
++    if with_source_receipt(conn, task_id, lambda: conn.execute(sql, params).rowcount) != 1:
+         return False
+     from hermes_cli.kanban_blocker_metadata import blocker_metadata, FIELDS
+     meta = blocker_metadata(conn, task_id, reason=reason, metadata=run_metadata,
+diff --git a/tests/hermes_cli/test_kanban_source_receipt_spike.py b/tests/hermes_cli/test_kanban_source_receipt.py
+similarity index 100%
+rename from tests/hermes_cli/test_kanban_source_receipt_spike.py
+rename to tests/hermes_cli/test_kanban_source_receipt.py
+diff --git a/tests/hermes_cli/test_kanban_source_receipt_sites.py b/tests/hermes_cli/test_kanban_source_receipt_sites.py
+new file mode 100644
+index 0000000000..1e740553d1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_source_receipt_sites.py
+@@ -0,0 +1,389 @@
++"""workspace_source v1 core PR-1, plan v4.1 §A5 + build decisions Q2/Q4 (t_01a1d0ec4ab93f32).
++
++Every voluntary ending wraps its one status-leaving UPDATE in ``with_source_receipt`` so a staged receipt rides
++that op (and only that op); ``kanban_awaiting.escalate`` reuses the receipt its enclosing ending staged. The AST
++guard classifies every status-leaving ``UPDATE tasks`` in ``hermes_cli/`` and ``plugins/`` as wrapped or
++involuntary, so a new ending can never ship unclassified.
++"""
++
++from __future__ import annotations
++
++import ast
++import json
++import re
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from tests.hermes_cli import kanban_sync_support as support
++
++REPO = Path(__file__).resolve().parents[2]
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def conn(kanban_home):
++    yield from support.synced_conn(kanban_home)
++
++
++def _ksr():
++    from hermes_cli import kanban_source_receipt as ksr
++    return ksr
++
++
++def _receipt(run_uid: str) -> dict:
++    return {"run_uid": run_uid, "state": "unchanged", "manifest_revision": 1, "commit": "b" * 40}
++
++
++def _applying(conn, sql, params=()):
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE kanban_sync_state SET applying = 1")
++        conn.execute(sql, params)
++        conn.execute("UPDATE kanban_sync_state SET applying = 0")
++
++
++def _run_of(conn, tid):
++    run_id = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    return run_id, conn.execute("SELECT uid FROM task_runs WHERE id = ?", (run_id,)).fetchone()[0]
++
++
++def _clear_outbox(conn):
++    with kbc.write_txn(conn):
++        conn.execute("DELETE FROM kanban_sync_outbox")
++
++
++def _running(conn, title="sites"):
++    tid = kb.create_task(conn, title=title, assignee="worker")
++    assert kb.claim_task(conn, tid, ttl_seconds=900, claimer=f"{kb._host_prefix()}:1")
++    _applying(conn, "UPDATE tasks SET sync_version = 1 WHERE id = ?", (tid,))
++    _clear_outbox(conn)
++    return (tid, *_run_of(conn, tid))
++
++
++def _reviewing(conn):
++    """A card a reviewer claimed from ``review``: its running run is the reviewer's."""
++    tid, run_id, _uid = _running(conn, "review me")
++    assert kb.request_review(conn, tid, summary="ready for review", expected_run_id=run_id)
++    assert kb.claim_review_task(conn, tid, ttl_seconds=900, claimer=f"{kb._host_prefix()}:2")
++    _clear_outbox(conn)
++    return (tid, *_run_of(conn, tid))
++
++
++def _wire(conn, tid):
++    rows = [dict(r) for r in conn.execute(
++        "SELECT * FROM kanban_sync_outbox WHERE table_name = 'tasks' AND row_uid = ? AND state = 'pending' "
++        "ORDER BY created_at, rowid", (tid,))]
++    return [ksc.translate(ksc._full_row_if_unseen(conn, r), "hlc") for r in rows]
++
++
++def _pending(conn) -> int:
++    return conn.execute("SELECT COUNT(*) FROM kanban_source_receipt_pending").fetchone()[0]
++
++
++def _status(conn, tid):
++    return conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++
++
++def _continue(conn, tid, run_id):
++    from hermes_cli.kanban_continuation import continue_task
++    return continue_task(conn, tid, checkpoint="halfway", expected_run_id=run_id)["ok"]
++
++
++def _timed_park(conn, tid, run_id):
++    return kb.block_task(conn, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z", kind="time", clock_only=True,
++                         expected_run_id=run_id)
++
++
++def _request_review(conn, tid, run_id):
++    return kb.request_review(conn, tid, summary="please review", expected_run_id=run_id)
++
++
++def _request_changes(conn, tid, run_id):
++    return kb.request_changes(conn, tid, reason="fix the nit", expected_run_id=run_id)[0]
++
++
++def _escalate_schedule(conn, tid, run_id, monkeypatch):
++    """A third park on one premise: ``schedule_task`` escalates (``kanban_awaiting.escalate``) instead of parking."""
++    from hermes_cli import kanban_awaiting as kaw
++
++    def repeated(*_a, **_k):
++        raise kaw.RepeatedPark({"kind": "clock", "premise": "p1"})
++    monkeypatch.setattr(kaw, "gate", repeated)
++    return kb.schedule_task(conn, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z", clock_only=True,
++                            expected_run_id=run_id)
++
++
++ENDINGS = {
++    "continue_task": (_continue, ("ready", "scheduled", "todo")),
++    "timed_park": (_timed_park, ("scheduled",)),
++    "request_review": (_request_review, ("review",)),
++}
++
++
++def _assert_rides(conn, tid, run_uid, statuses):
++    wire = _wire(conn, tid)
++    leaving = [i for i, op in enumerate(wire) if op["fields"].get("status") in statuses]
++    assert len(leaving) == 1, wire
++    assert wire[leaving[0]]["fields"].get("source_receipt") == _receipt(run_uid), wire
++    assert not any("source_receipt" in o["fields"] for i, o in enumerate(wire) if i != leaving[0]), wire
++    assert _pending(conn) == 0
++
++
++@pytest.mark.parametrize("ending", sorted(ENDINGS))
++def test_receipt_rides_status_leaving_op(conn, ending):
++    end, statuses = ENDINGS[ending]
++    tid, run_id, run_uid = _running(conn)
++    with _ksr().staged(tid, run_id, _receipt(run_uid)):
++        assert end(conn, tid, run_id)
++    _assert_rides(conn, tid, run_uid, statuses)
++
++
++def test_request_changes_receipt_rides_status_leaving_op(conn):
++    tid, run_id, run_uid = _reviewing(conn)
++    with _ksr().staged(tid, run_id, _receipt(run_uid)):
++        assert _request_changes(conn, tid, run_id)
++    _assert_rides(conn, tid, run_uid, ("ready", "todo"))
++
++
++def test_escalate_reuses_enclosing_receipt(conn, monkeypatch):
++    """Q2: the escalation's own ``running -> todo`` UPDATE carries the receipt the wrapped ending staged."""
++    tid, run_id, run_uid = _running(conn)
++    with _ksr().staged(tid, run_id, _receipt(run_uid)):
++        assert _escalate_schedule(conn, tid, run_id, monkeypatch)
++    assert _status(conn, tid) == "todo"
++    _assert_rides(conn, tid, run_uid, ("todo",))
++
++
++def test_close_dead_run_wrapped(conn):
++    """``kanban_run_finalizer.close_dead_run`` (A5): a staged receipt for that run rides its UPDATE."""
++    from types import SimpleNamespace
++    from hermes_cli.kanban_run_finalizer import close_dead_run
++    tid, run_id, run_uid = _running(conn)
++    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
++    dead = SimpleNamespace(event_payload={}, run_outcome="crashed", error_text="gone", event_kind="crashed")
++    with _ksr().staged(tid, run_id, _receipt(run_uid)), kbc.write_txn(conn):
++        assert close_dead_run(conn, row, dead) is not None
++    _assert_rides(conn, tid, run_uid, ("ready", "todo", "blocked"))
++
++
++def _race_status(conn, tid, status):
++    """A concurrent writer moved the card (applied as a feed row: the capture triggers do not see it)."""
++    conn.execute("UPDATE kanban_sync_state SET applying = 1")
++    conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
++    conn.execute("UPDATE kanban_sync_state SET applying = 0")
++
++
++def _refuse_request_changes(conn, tid, run_id, monkeypatch):
++    real = kb._landing_status_after_parents
++
++    def racing(c, task_id):
++        _race_status(c, task_id, "blocked")
++        return real(c, task_id)
++    monkeypatch.setattr(kb, "_landing_status_after_parents", racing)
++    ok = _request_changes(conn, tid, run_id)
++    monkeypatch.setattr(kb, "_landing_status_after_parents", real)
++    return ok
++
++
++def _refuse_continue(conn, tid, run_id, monkeypatch):
++    from hermes_cli import kanban_wake_check as kwc
++    real = kwc.validate_park
++
++    def racing(*a, **k):
++        _race_status(conn, tid, "blocked")
++        return real(*a, **k)
++    monkeypatch.setattr(kwc, "validate_park", racing)
++    ok = _continue(conn, tid, run_id)
++    monkeypatch.setattr(kwc, "validate_park", real)
++    return ok
++
++
++def _refuse_block(conn, tid, run_id, monkeypatch):
++    from hermes_cli import kanban_dependency_validation as kdv
++    real = kdv.validate_dependency_block
++
++    def racing(c, task_id, kind):
++        _race_status(c, task_id, "blocked")
++        return real(c, task_id, kind)
++    monkeypatch.setattr(kdv, "validate_dependency_block", racing)
++    ok = kb.block_task(conn, tid, reason="1) tap Approve", kind="needs_input", expected_run_id=run_id)
++    monkeypatch.setattr(kdv, "validate_dependency_block", real)
++    return ok
++
++
++REFUSALS = {
++    "request_changes_state_changed": (_refuse_request_changes, _reviewing, _request_changes, ("ready", "todo")),
++    "continue_concurrent": (_refuse_continue, _running, _continue, ("ready", "scheduled", "todo")),
++    "block_refused": (_refuse_block, _running,
++                      lambda c, t, r: kb.block_task(c, t, reason="1) tap Approve", kind="needs_input",
++                                                    expected_run_id=r), ("blocked",)),
++}
++
++
++@pytest.mark.parametrize("refusal", sorted(REFUSALS))
++def test_refused_ending_leaves_no_pending_receipt(conn, monkeypatch, refusal):
++    """A refused ending leaves no pending row; the same run's next (accepted) ending still carries its receipt."""
++    refuse, setup, retry, statuses = REFUSALS[refusal]
++    tid, run_id, run_uid = setup(conn)
++    with _ksr().staged(tid, run_id, _receipt(run_uid)):
++        assert not refuse(conn, tid, run_id, monkeypatch)
++        assert _pending(conn) == 0
++        _race_status(conn, tid, "running")  # the racing writer backs out
++        _clear_outbox(conn)
++        assert retry(conn, tid, run_id)
++    _assert_rides(conn, tid, run_uid, statuses)
++
++
++# --- Q4 ---------------------------------------------------------------------------------------------------------
++
++def test_install_triggers_ensures_pending_table(conn):
++    """The tasks UPDATE trigger reads the pending table: (re)installing triggers must create it first."""
++    with kbc.write_txn(conn):
++        conn.execute("DROP TABLE kanban_source_receipt_pending")
++        sync.drop_triggers(conn)
++        sync.install_triggers(conn)
++    tid = kb.create_task(conn, title="after reinstall", assignee="worker")
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET priority = 3 WHERE id = ?", (tid,))  # fires the UPDATE capture trigger
++
++
++def test_old_board_multi_field_refusal_strips_virtual(conn):
++    """A two-field ``forbidden_field`` detail naming ``source_receipt``: the virtual field is dropped (no omission)
++    and the op is resent without it, so the remaining real field takes the ordinary single-field path."""
++    from hermes_cli import kanban_sync_compat as compat
++    tid, run_id, run_uid = _running(conn)
++    with _ksr().staged(tid, run_id, _receipt(run_uid)):
++        assert kb.complete_task(conn, tid, result="ok", summary="done", expected_run_id=run_id)
++    row = dict(conn.execute("SELECT * FROM kanban_sync_outbox WHERE table_name='tasks' AND row_uid=? "
++                            "AND fields LIKE '%source_receipt%'", (tid,)).fetchone())
++    wire = ksc.translate(ksc._full_row_if_unseen(conn, row), "hlc")
++    detail = "not writable on tasks: result, source_receipt"
++    with kbc.write_txn(conn):
++        out = compat.enqueue_retry(conn, row, wire, {"reason": "forbidden_field", "detail": detail})
++    assert out == compat.VIRTUAL_DROPPED
++    assert conn.execute("SELECT COUNT(*) FROM kanban_sync_omissions").fetchone()[0] == 0
++    assert conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE op_id = ?", (row["op_id"],)).fetchone() is None
++    resent = [json.loads(r[0]) for r in conn.execute(
++        "SELECT fields FROM kanban_sync_outbox WHERE table_name='tasks' AND row_uid=? AND op=?", (tid, row["op"]))]
++    assert any(f.get("status") == "done" and "source_receipt" not in f for f in resent), resent
++
++
++# --- AST guard (A5 + Q2) ----------------------------------------------------------------------------------------
++
++_UPDATE = re.compile(r"UPDATE\s+tasks\s+SET\b(?P<set>.*?)(?:\bWHERE\b(?P<where>.*))?$", re.IGNORECASE | re.DOTALL)
++_SETS_STATUS = re.compile(r"(?<![\w.])status\s*=\s*(?P<value>'[^']*'|\?|\{\})", re.IGNORECASE)
++_STATUS_EQ = re.compile(r"(?<![\w.])status\s*=\s*'(\w+)'", re.IGNORECASE)
++_STATUS_IN = re.compile(r"(?<![\w.])status\s+IN\s*\(([^)]*)\)", re.IGNORECASE)
++
++# Every status-leaving ``UPDATE tasks`` that can move a card out of ``running``, by ``path::function``.
++WRAPPED = {
++    "hermes_cli/kanban_db.py::complete_task",
++    "hermes_cli/kanban_dependency_review.py::apply_block_update",  # block_task
++    "hermes_cli/kanban_timed_park.py::park",
++    "hermes_cli/kanban_db.py::request_review",
++    "hermes_cli/kanban_db.py::request_changes",
++    "hermes_cli/kanban_db_schedule.py::schedule_task",
++    "hermes_cli/kanban_continuation.py::continue_task",
++    "hermes_cli/kanban_run_finalizer.py::close_dead_run",
++    "hermes_cli/kanban_awaiting.py::escalate",  # Q2: reuses the enclosing ending's staged receipt
++}
++INVOLUNTARY = {  # no receipt: custody becomes ``retained`` (fail closed)
++    "hermes_cli/kanban_failure_accounting.py::_record_task_failure",
++    "hermes_cli/kanban_db.py::reclaim_task",
++    "hermes_cli/kanban_db.py::release_stale_claims",
++    "hermes_cli/kanban_db.py::invalidate_descendants_for_parent_reopen",
++    "hermes_cli/kanban_db_dispatch.py::enforce_max_runtime",
++    "hermes_cli/kanban_db_dispatch.py::detect_stale_running",
++    "hermes_cli/kanban_db_dispatch.py::reconcile_orphaned_running",
++    "hermes_cli/kanban_db_archive.py::archive_task",
++    "hermes_cli/kanban_sync_divergence.py::_heal_one",
++    "hermes_cli/kanban_transfer.py::_scrub_local_state",
++    "hermes_cli/kanban_transfer.py::_relocate_imported_rows",  # export relocation, same scrub
++    "plugins/kanban/dashboard/plugin_api.py::_set_status_direct",
++}
++# Sites the scan cannot prove off-``running`` from SQL text alone, each checked by hand.
++NOT_FROM_RUNNING = {
++    "hermes_cli/kanban_assignment_routing.py::route": "runs inside block_task after apply_block_update left running",
++    "hermes_cli/kanban_db.py::recompute_ready": "re-promotes todo/blocked/scheduled cards only",
++}
++
++
++def _text(node):
++    if isinstance(node, ast.Constant) and isinstance(node.value, str):
++        return node.value
++    if isinstance(node, ast.JoinedStr):  # f-string SQL: placeholders read as ``{}``
++        return "".join(v.value if isinstance(v, ast.Constant) else "{}" for v in node.values)
++    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
++        return (_text(node.left) or "") + (_text(node.right) or "")
++    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "format":
++        return _text(node.func.value)  # ``"...".format(...)``
++    return None
++
++
++def _leaves_running(sql: str) -> bool:
++    m = _UPDATE.search(sql)
++    if not m or not (setm := _SETS_STATUS.search(m.group("set") or "")):
++        return False
++    if setm.group("value").strip("'").lower() == "running":
++        return False  # enters running (a claim)
++    where = m.group("where") or ""
++    pinned = [s.lower() for s in _STATUS_EQ.findall(where)]
++    for group in _STATUS_IN.findall(where):
++        pinned += [s.strip().strip("'").lower() for s in group.split(",")]
++    return not pinned or "running" in pinned or any(p in ("?", "{}") or not p.isidentifier() for p in pinned)
++
++
++def _sites() -> dict[str, set[int]]:
++    found: dict[str, set[int]] = {}
++    for base in ("hermes_cli", "plugins"):
++        for path in sorted((REPO / base).rglob("*.py")):
++            tree = ast.parse(path.read_text(encoding="utf-8"))
++            rel = path.relative_to(REPO).as_posix()
++            owner: dict[ast.AST, str] = {}  # node -> innermost enclosing function name
++            for fn in ast.walk(tree):
++                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
++                    for node in ast.walk(fn):  # outer functions are walked first; inner ones overwrite
++                        owner[node] = fn.name
++            inner = {c for n in ast.walk(tree) if isinstance(n, ast.BinOp) for c in (n.left, n.right)}
++            for node, name in owner.items():
++                sql = None if node in inner else _text(node)  # a concatenation is read whole, never in parts
++                if sql and _leaves_running(sql):
++                    found.setdefault(f"{rel}::{name}", set()).add(node.lineno)
++    return found
++
++
++def _calls_wrapper(key: str) -> bool:
++    rel, name = key.split("::")
++    tree = ast.parse((REPO / rel).read_text(encoding="utf-8"))
++    fn = next(n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name)
++    return any(isinstance(n, ast.Call) and (getattr(n.func, "attr", None) or getattr(n.func, "id", None))
++               == "with_source_receipt" for n in ast.walk(fn))
++
++
++def test_status_leaving_sites_enumerated():
++    sites = _sites()
++    known = WRAPPED | INVOLUNTARY | set(NOT_FROM_RUNNING)
++    unclassified = sorted(set(sites) - known)
++    assert not unclassified, (
++        f"new status-leaving UPDATE(s) {unclassified}: wrap the ending in kanban_source_receipt.with_source_receipt "
++        "(voluntary) or list it as INVOLUNTARY here (its card's custody then becomes retained)")
++    # Nested functions share a name with their enclosing walk; every listed site must still exist.
++    assert not sorted(known - set(sites)), f"stale entries: {sorted(known - set(sites))}"
++    unwrapped = sorted(k for k in WRAPPED if not _calls_wrapper(k))
++    assert not unwrapped, f"voluntary endings without with_source_receipt: {unwrapped}"
++
++
++def test_guard_reads_format_and_fstring_sql():
++    """The guard must see SQL built with ``.format(...)`` and f-strings (timed_park, apply_block_update)."""
++    tree = ast.parse('def f(x):\n    a = "UPDATE tasks SET status = \'todo\' WHERE id = ?".format(1)\n'
++                     '    b = f"UPDATE tasks SET status = \'{x}\' WHERE id = ?"\n')
++    texts = [_text(n) for n in ast.walk(tree) if isinstance(n, (ast.Call, ast.JoinedStr))]
++    assert sum(1 for t in texts if t and _leaves_running(t)) == 2
+-- 
+2.51.0
+

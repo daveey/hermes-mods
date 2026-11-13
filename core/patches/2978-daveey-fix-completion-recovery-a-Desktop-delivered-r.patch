@@ -1,0 +1,320 @@
+From 11405d8846cc7f55d1ae998f8899f70d916d57d1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:15:33 +0000
+Subject: [PATCH] [daveey] fix(completion-recovery): a Desktop-delivered result
+ is not offered again at the next start
+
+deleg_e757744d (laptop-1, 11-12): the start-up reconcile reopened failed admission ca1d8f79,
+the gateway's recovery note met the chat's turn lease, and the Desktop poller delivered the row
+instead. Its transcript row stamps display_metadata.delegation_id (no admission id) and its content
+lacks the gateway's INTERNAL NOTIFICATION footer, so _noted never matched it: every later start
+would reopen the same result until 8 attempts or the 48 h replay cap.
+
+- A failed admission's delegation counts as delivered when the target session (or its physical
+  target) has an async_delegation_complete row stamped with that delegation id; filtered per id,
+  so a coalesced admission reopens only its undelivered ids.
+- requeue_admitted_completion(recovered_admission_id=...) stores the admission a reconcile reopens
+  the row for (new nullable async_delegations.recovered_admission_id, backfilled by the canonical
+  schema reconcile) in the reopening transaction and skips a pair already marked: "delivered again,
+  once" now holds for consumers that stamp nothing (the batch consumer).
+
+Tests: tests/gateway/test_completion_admission_desktop_delivery.py (a/b/c), RED on 2cc7101849.
+---
+ gateway/completion_admission_recovery.py      |  34 ++++-
+ hermes_state_common.py                        |   5 +-
+ ...t_completion_admission_desktop_delivery.py | 130 ++++++++++++++++++
+ tests/hermes_state/test_hermes_state.py       |   5 +-
+ tools/async_delegation.py                     |  19 ++-
+ 5 files changed, 179 insertions(+), 14 deletions(-)
+ create mode 100644 tests/gateway/test_completion_admission_desktop_delivery.py
+
+diff --git a/gateway/completion_admission_recovery.py b/gateway/completion_admission_recovery.py
+index f5cdeddee9..97a51a49e6 100644
+--- a/gateway/completion_admission_recovery.py
++++ b/gateway/completion_admission_recovery.py
+@@ -10,7 +10,10 @@ Two halves close it:
+ 
+ - ``reconcile_failed_completion_admissions`` (once per gateway start, bounded) finds local completion
+   admissions that settled ``failed`` with no note and no copy of their text in the parent, and reopens
+-  each async delegation they carried through ``requeue_admitted_completion``. The ledger stays the
++  each async delegation they carried through ``requeue_admitted_completion``. A delegation whose
++  Desktop row (``async_delegation_complete`` stamped with its id) is in the parent counts as
++  delivered, and the reopen records the admission it was made for (``recovered_admission_id``), so a
++  (delegation, admission) pair is reopened at most once across starts. The ledger stays the
+   gate: the reopened row is claimed (``claim_completion_delivery``, one attempt each) like any pending
+   result, and a row past its attempts or its replay age is dropped there with a logged reason.
+ - ``deliver_admitted`` is the claimed offer's step when the result already has an admission: a
+@@ -32,6 +35,11 @@ _FAILED_SQL = ("SELECT * FROM session_admissions WHERE status = 'terminal' AND o
+                "ORDER BY seq DESC LIMIT ?")
+ _NOTED_SQL = ("SELECT 1 FROM messages WHERE session_id IN (?, ?) AND "
+               "(json_extract(display_metadata, '$.completion_admission') = ? OR content = ?) LIMIT 1")
++# A Desktop consumer ("tui-poller") writes its own row for the delegation: no admission id, and its
++# content lacks the gateway's INTERNAL NOTIFICATION footer, so only the delegation id names it.
++_DELIVERED_SQL = ("SELECT 1 FROM messages WHERE session_id IN (?, ?) AND "
++                  "display_kind = 'async_delegation_complete' AND "
++                  "json_extract(display_metadata, '$.delegation_id') = ? LIMIT 1")
+ 
+ 
+ def _local_descriptor(row):
+@@ -63,9 +71,17 @@ def _noted(authority, row, target) -> bool:
+                                          str(row['payload'].get('text') or ''))).fetchone() is not None
+ 
+ 
++def _delivered(authority, row, target, delegation_id) -> bool:
++    """The delegation's result reached the session through a consumer that stamps its id."""
++    with authority.db._read_ctx() as conn:
++        return conn.execute(_DELIVERED_SQL, (row['target_session_id'], target,
++                                             delegation_id)).fetchone() is not None
++
++
+ def unnoted_failed_completions(authority, limit: int = RECONCILE_SCAN_LIMIT) -> list[tuple[str, dict]]:
+     """``(delegation_id, admission)`` for each async delegation carried by a local completion admission
+-    that settled ``failed`` and left nothing in its session."""
++    that settled ``failed`` and left nothing in its session (per delegation: a coalesced admission
++    yields only the ids no consumer delivered)."""
+     from hermes_state_runtime import _row
+     with authority.db._read_ctx() as conn:
+         rows = [_row(r) for r in conn.execute(_FAILED_SQL, (limit,)).fetchall()]
+@@ -73,8 +89,13 @@ def unnoted_failed_completions(authority, limit: int = RECONCILE_SCAN_LIMIT) ->
+     for row in rows:
+         descriptor = _local_descriptor(row)
+         ids = _delegation_ids(descriptor) if descriptor else []
+-        if ids and not _noted(authority, row, _target(authority, row)):
+-            found.extend((delegation_id, row) for delegation_id in ids)
++        if not ids:
++            continue
++        target = _target(authority, row)
++        if _noted(authority, row, target):
++            continue
++        found.extend((delegation_id, row) for delegation_id in ids
++                     if not _delivered(authority, row, target, delegation_id))
+     return found
+ 
+ 
+@@ -83,7 +104,10 @@ def reconcile_failed_completion_admissions(authority, target_queue) -> int:
+     from tools.async_delegation import requeue_admitted_completion
+     reopened = 0
+     for delegation_id, row in unnoted_failed_completions(authority):
+-        if requeue_admitted_completion(delegation_id, target_queue):
++        # One reopen per (delegation, failed admission), whichever consumer then delivers it (a
++        # batch row stamps no delegation id, so the transcript alone cannot say it arrived).
++        if requeue_admitted_completion(delegation_id, target_queue,
++                                       recovered_admission_id=row['admission_id']):
+             reopened += 1
+             logger.warning('Async delegation %s: its admission %s on %s failed before delivery; offered again',
+                            delegation_id, row['admission_id'], row['target_session_id'])
+diff --git a/hermes_state_common.py b/hermes_state_common.py
+index 25ce99d959..dda2c48ad2 100644
+--- a/hermes_state_common.py
++++ b/hermes_state_common.py
+@@ -779,7 +779,10 @@ CREATE TABLE IF NOT EXISTS async_delegations (
+     -- async_delegations shapes depending on whether the delegation tool had
+     -- ever run, breaking rebuild/replay pipelines that reconstruct state.db
+     -- from the canonical schema (#94691).
+-    origin_session_id TEXT NOT NULL DEFAULT ''
++    origin_session_id TEXT NOT NULL DEFAULT '',
++    -- The failed completion admission a start-up reconcile last reopened this row for
++    -- (gateway/completion_admission_recovery.py): each (delegation, admission) reopens once.
++    recovered_admission_id TEXT
+ );
+ 
+ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
+diff --git a/tests/gateway/test_completion_admission_desktop_delivery.py b/tests/gateway/test_completion_admission_desktop_delivery.py
+new file mode 100644
+index 0000000000..10d91316dd
+--- /dev/null
++++ b/tests/gateway/test_completion_admission_desktop_delivery.py
+@@ -0,0 +1,130 @@
++"""A recovered completion delivered by a Desktop consumer is not offered again at the next start.
++
++Live (laptop-1, deleg_e757744d, admission ca1d8f79): the start-up reconcile reopened a failed
++admission, the gateway's recovery note met the chat's turn lease, and the Desktop poller delivered the
++row instead. Its transcript row stamps ``display_metadata.delegation_id`` (no admission id) and its
++content lacks the gateway's INTERNAL NOTIFICATION footer, so ``_noted`` never matched it and every
++later start reopened the same result until the attempt budget or the replay cap.
++
++- A delegation with an ``async_delegation_complete`` row stamped with its id counts as delivered (per
++  delegation id, so a coalesced admission reopens only its undelivered ids).
++- A reconcile reopen records the admission it was made for; a (delegation, admission) pair is reopened
++  once, which also covers a batch consumer whose row stamps no delegation id.
++"""
++import queue
++
++import pytest
++
++from gateway.run_notifications import INTERNAL_NOTIFICATION_FOOTER
++from tests.gateway.test_completion_admission import pending
++from tests.gateway.test_completion_admission_reconcile import (
++    _admit, _fail_next_note, _ledger, _offered, _target)
++from tests.gateway.test_session_end_delegations import _admissions, _local
++from tools import async_delegation as delegation
++
++
++@pytest.fixture(autouse=True)
++def _no_delegations():
++    delegation._reset_for_tests()
++    yield
++    delegation._reset_for_tests()
++
++
++def _desktop_row(authority, target, delegation_id, content):
++    """What the "tui-poller" consumer writes: its own content, the delegation id, no admission id."""
++    authority.db.append_message(
++        target, 'user', content=content, display_kind='async_delegation_complete',
++        display_metadata={'display_text': f'{delegation_id} finished', 'delegation_id': delegation_id,
++                          'task_count': 1, 'completed_count': 1, 'failed_count': 0})
++
++
++def _batch_row(authority, target):
++    """What the "tui-completion-batch" consumer writes: process_complete with display_text only."""
++    authority.db.append_message(target, 'user', content='Background work finished (batch).',
++                                display_kind='process_complete',
++                                display_metadata={'display_text': 'Background work finished'})
++
++
++def _deliver_by_batch(events):
++    for evt in events:
++        claim = delegation.claim_event_delivery(evt, 'tui-completion-batch')
++        assert claim
++        delegation.complete_event_delivery(evt, claim)
++
++
++@pytest.mark.asyncio
++async def test_desktop_delivered_failed_admission_is_not_reopened(tmp_path, monkeypatch):
++    """(a) Live shape: payload text ends with the INTERNAL NOTIFICATION footer, the ledger says
++    delivered, and the Desktop row carries the text without it plus the delegation id."""
++    from gateway.completion_admission_recovery import (
++        reconcile_failed_completion_admissions, unnoted_failed_completions)
++    runner, authority, ref, _actor = await _local(tmp_path, monkeypatch)
++    try:
++        target = _target(runner, authority, ref)
++        await _admit(runner, authority, ref, 'deleg_desktop')
++        await _fail_next_note(authority, ref, monkeypatch)
++        [failed] = _admissions(authority, ref)
++        assert failed['outcome'] == 'failed'
++        text = failed['payload']['text']
++        assert text.rstrip().endswith(INTERNAL_NOTIFICATION_FOOTER)
++        _desktop_row(authority, target, 'deleg_desktop', text.replace(INTERNAL_NOTIFICATION_FOOTER, '').rstrip())
++        assert _ledger('deleg_desktop')[0] == 'delivered'
++
++        assert unnoted_failed_completions(authority) == []
++        offers = queue.Queue()
++        assert reconcile_failed_completion_admissions(authority, offers) == 0
++        assert _offered(offers) == []
++        assert _ledger('deleg_desktop')[0] == 'delivered'
++    finally:
++        authority.db.close()
++
++
++@pytest.mark.asyncio
++async def test_reopened_admission_delivered_by_batch_is_reopened_once(tmp_path, monkeypatch):
++    """(b) No transcript row: one reopen. A batch consumer then delivers it (no delegation id, no
++    admission id, different text); the next start reopens nothing."""
++    from gateway.completion_admission_recovery import reconcile_failed_completion_admissions
++    runner, authority, ref, _actor = await _local(tmp_path, monkeypatch)
++    try:
++        target = _target(runner, authority, ref)
++        await _admit(runner, authority, ref, 'deleg_batch')
++        await _fail_next_note(authority, ref, monkeypatch)
++        offers = queue.Queue()
++        assert reconcile_failed_completion_admissions(authority, offers) == 1
++        events = _offered(offers)
++        assert [e['delegation_id'] for e in events] == ['deleg_batch']
++        assert _ledger('deleg_batch')[0] == 'pending'
++
++        _deliver_by_batch(events)
++        _batch_row(authority, target)
++        assert _ledger('deleg_batch')[0] == 'delivered'
++
++        assert reconcile_failed_completion_admissions(authority, offers) == 0
++        assert _offered(offers) == []
++        assert _ledger('deleg_batch')[0] == 'delivered'
++    finally:
++        authority.db.close()
++
++
++@pytest.mark.asyncio
++async def test_coalesced_admission_reopens_only_undelivered_delegation(tmp_path, monkeypatch):
++    """(c) One failed admission carrying two delegations; only one has its Desktop row."""
++    from gateway.completion_admission_recovery import reconcile_failed_completion_admissions
++    runner, authority, ref, _actor = await _local(tmp_path, monkeypatch)
++    try:
++        target = _target(runner, authority, ref)
++        route = authority.sessions[ref.session_id].route
++        evts = [dict(pending(route, name), parent_session_id=target) for name in ('deleg_one', 'deleg_two')]
++        assert await runner._deliver_async_delegation_group(evts) is True
++        await _fail_next_note(authority, ref, monkeypatch)
++        [failed] = _admissions(authority, ref)
++        assert failed['outcome'] == 'failed'
++        assert {_ledger(n)[0] for n in ('deleg_one', 'deleg_two')} == {'delivered'}
++        _desktop_row(authority, target, 'deleg_one', 'deleg_one finished')
++
++        offers = queue.Queue()
++        assert reconcile_failed_completion_admissions(authority, offers) == 1
++        assert [e['delegation_id'] for e in _offered(offers)] == ['deleg_two']
++        assert _ledger('deleg_one')[0] == 'delivered' and _ledger('deleg_two')[0] == 'pending'
++    finally:
++        authority.db.close()
+diff --git a/tests/hermes_state/test_hermes_state.py b/tests/hermes_state/test_hermes_state.py
+index b1fb7ed150..c08443e477 100644
+--- a/tests/hermes_state/test_hermes_state.py
++++ b/tests/hermes_state/test_hermes_state.py
+@@ -2027,10 +2027,7 @@ class TestAsyncDelegationsSchemaAgreement:
+         from hermes_state_common import SCHEMA_SQL
+ 
+         legacy_sql = SCHEMA_SQL.replace(
+-            "    origin_session_id TEXT NOT NULL DEFAULT ''\n", ""
+-        ).replace(
+-            "    delivery_claimed_at REAL,\n",
+-            "    delivery_claimed_at REAL\n",
++            "    origin_session_id TEXT NOT NULL DEFAULT '',\n", ""
+         )
+         conn = sqlite3.connect(db_path)
+         try:
+diff --git a/tools/async_delegation.py b/tools/async_delegation.py
+index f1b971d64e..b8a089a4cc 100644
+--- a/tools/async_delegation.py
++++ b/tools/async_delegation.py
+@@ -802,14 +802,24 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+              AND delivery_claim=?""", (now, now, delegation_id, claim_id))
+ 
+ 
+-def requeue_admitted_completion(delegation_id: str, target_queue) -> bool:
++def requeue_admitted_completion(delegation_id: str, target_queue,
++                                recovered_admission_id: str | None = None) -> bool:
+     """Offer an acknowledged completion again when its receiving turn could not confirm the owner.
+ 
+     The row returns to pending and its event goes back on ``target_queue``, so the next delivery
+     re-runs the pre-flight. A row past the delivery budget converges to ``dropped`` instead, which
+-    bounds the loop; a row without a stored event is left as it is."""
++    bounds the loop; a row without a stored event is left as it is.
++
++    ``recovered_admission_id``: the failed admission a start-up reconcile reopens the row for. It is
++    stored in the reopening transaction, and a row already reopened for that admission is left as it
++    is, so a result delivered by a consumer that leaves no trace the reconcile can read is never
++    offered again at the next start."""
+     now = time.time()
+     with _DB_LOCK, _transaction() as conn:
++        if recovered_admission_id is not None and conn.execute(
++                "SELECT 1 FROM async_delegations WHERE delegation_id=? AND recovered_admission_id=?",
++                (delegation_id, recovered_admission_id)).fetchone() is not None:
++            return False
+         exhausted = conn.execute("""UPDATE async_delegations SET delivery_state='dropped', updated_at=?
+                WHERE delegation_id=? AND delivery_state='delivered' AND delivery_attempts>=?""",
+             (now, delegation_id, _MAX_DELIVERY_ATTEMPTS))
+@@ -829,9 +839,10 @@ def requeue_admitted_completion(delegation_id: str, target_queue) -> bool:
+                            "terminally dropped (result remains queryable).", delegation_id)
+             return False
+         reopened = conn.execute("""UPDATE async_delegations SET delivery_state='pending',
+-                      delivered_at=NULL, updated_at=?
++                      delivered_at=NULL, updated_at=?,
++                      recovered_admission_id=COALESCE(?, recovered_admission_id)
+                WHERE delegation_id=? AND delivery_state='delivered' AND event_json IS NOT NULL""",
+-            (now, delegation_id))
++            (now, recovered_admission_id, delegation_id))
+         if reopened.rowcount != 1:
+             return False
+         rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at
+-- 
+2.51.0
+

@@ -1,0 +1,209 @@
+From 249b47aca73c143c336cd87465a6a753d0cebc98 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:21:41 +0000
+Subject: [PATCH] [daveey] update-pause yield: yield before API-error
+ accounting; pin api-error, crossed-cancel and streamed-bubble paths
+
+PR #1827 review nits (t_01a1d2bfdf5b5260):
+1. Tests for the handle_api_error yield branch (a cancel surfacing as a
+   provider error) and the post-response crossed-cancel branch in
+   perform_api_call; only the non-streaming InterruptedError yield was
+   covered.
+2. handle_api_error checks model_yield_requested first, before the
+   request-error hook, wait_out_offline, recovery/credential rotation,
+   retry counting and log_api_error_attempt, so a pause-induced cancel is
+   not counted or logged as an API failure.
+3. Desktop: pin that the paused_for_update terminal frame replaces the
+   streamed partial of the cancelled request with the pause notice
+   (same bubble and after a sealed interim); no renderer change needed.
+---
+ agent/turn_api_error.py                       | 13 ++--
+ .../paused-for-update-stream.test.tsx         | 49 +++++++++++++
+ .../test_update_pause_model_request.py        | 71 ++++++++++++++++++-
+ 3 files changed, 127 insertions(+), 6 deletions(-)
+ create mode 100644 apps/desktop/src/app/session/hooks/use-message-stream/paused-for-update-stream.test.tsx
+
+diff --git a/agent/turn_api_error.py b/agent/turn_api_error.py
+index 5828490c75..5ad62fd0a0 100644
+--- a/agent/turn_api_error.py
++++ b/agent/turn_api_error.py
+@@ -87,6 +87,14 @@ def handle_api_error(
+     if agent.thinking_callback:
+         agent.thinking_callback("")
+ 
++    if update_pause_cancel.model_yield_requested(agent):
++        # [daveey] t_01a1d293248f5e12: the core-update pause cancelled this boundary request and the cancel
++        # surfaced as a provider error: yield exactly as an InterruptedError would (turn_api_call).
++        # t_01a1d2bfdf5b5260: first, so the cancel is no API failure: no request-error hook, offline wait,
++        # recovery or credential rotation, retry count or error-attempt log.
++        yield_to_update_pause(_retry)
++        return _verdict("break")
++
+     _recovered, active_system_prompt = recover_before_classification(
+         agent, api_error, messages=messages, api_messages=api_messages, api_kwargs=api_kwargs,
+         active_system_prompt=active_system_prompt,
+@@ -207,11 +215,6 @@ def handle_api_error(
+     )
+ 
+     if agent._interrupt_requested:
+-        if update_pause_cancel.model_yield_requested(agent):
+-            # [daveey] t_01a1d293248f5e12: the core-update pause cancelled this boundary request and the
+-            # cancel surfaced as a provider error: yield exactly as an InterruptedError would (turn_api_call).
+-            yield_to_update_pause(_retry)
+-            return _verdict("break")
+         # Preserve a pending redirect: the user is steering, not stopping — rebuild the
+         # turn from the correction instead of aborting.
+         if agent.clear_interrupt(preserve_redirect=True):
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/paused-for-update-stream.test.tsx b/apps/desktop/src/app/session/hooks/use-message-stream/paused-for-update-stream.test.tsx
+new file mode 100644
+index 0000000000..04e9aca978
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/paused-for-update-stream.test.tsx
+@@ -0,0 +1,49 @@
++import { cleanup } from '@testing-library/react'
++import { afterEach, expect, it } from 'vitest'
++
++import { chatMessageText } from '@/lib/chat-messages'
++
++import { type GatewayFrame, playFrames } from './test-harness'
++
++// [daveey] t_01a1d2bfdf5b5260 (PR #1827 review nit 3): a core-update pause cancels a model request issued at a
++// step boundary and the backend drops its output; the resumed turn re-issues the request. A streaming request has
++// already painted deltas by then. The terminal frame (tui_gateway update_pause.announce_pause) carries only the
++// pause notice as `text`, and the settle replaces the current response (after the last tool row) with it, so the
++// dropped partial does not stay on screen beside the transcript that no longer has it.
++
++const SID = 'paused-for-update'
++const PAUSE_TEXT = 'Paused for a Hermes update; continues automatically'
++const DROPPED = 'Half of an answer the update cancel'
++
++afterEach(cleanup)
++
++const toolRound = (id: string): GatewayFrame[] => [
++  ['tool.start', { name: 'terminal', tool_id: id, args: {} }],
++  ['tool.complete', { name: 'terminal', tool_id: id, result: 'ok' }]
++]
++
++const paused: GatewayFrame = ['message.complete', { text: PAUSE_TEXT, status: 'interrupted', paused_for_update: true }]
++
++const texts = async (frames: GatewayFrame[]) =>
++  (await playFrames(SID, [['message.start', {}], ...frames, paused])).map(message => chatMessageText(message).trim())
++
++it.each([
++  ['in the same bubble', [['message.delta', { text: 'Let me look.' }], ...toolRound('t')]],
++  [
++    'after a sealed interim',
++    [
++      ['message.delta', { text: 'Let me look.' }],
++      ['message.interim', { text: 'Let me look.', already_streamed: true }],
++      ...toolRound('t')
++    ]
++  ]
++] as [string, GatewayFrame[]][])(
++  'the cancelled request’s streamed partial %s is replaced by the pause notice',
++  async (_label, before) => {
++    const all = (await texts([...before, ['message.delta', { text: `\n\n${DROPPED}` }]])).join('\n')
++
++    expect(all).not.toContain(DROPPED)
++    expect(all).toContain(PAUSE_TEXT)
++    expect(all).toContain('Let me look.') // the earlier response, before the tool, is kept
++  }
++)
+diff --git a/tests/tui_gateway/test_update_pause_model_request.py b/tests/tui_gateway/test_update_pause_model_request.py
+index 84059b60d8..6f299b465a 100644
+--- a/tests/tui_gateway/test_update_pause_model_request.py
++++ b/tests/tui_gateway/test_update_pause_model_request.py
+@@ -121,13 +121,15 @@ def _pause_when(home, event):
+     threading.Thread(target=_issue, daemon=True).start()
+ 
+ 
+-def _drive(home, tmp_path, monkeypatch, responses, slow):
++def _drive(home, tmp_path, monkeypatch, responses, slow, provider_call=None):
+     record_turn_start(home, "session-key", "run the quick job")
+     agent = _make_agent(tmp_path)
+     session = {"agent": agent, "session_key": "session-key", "profile_home": str(home),
+                "history_lock": threading.RLock()}
+     model = _Model(responses, slow)
+     agent.client.chat.completions.create.side_effect = model
++    if provider_call is not None:  # replaces the interruptible transport: how the cancel reaches the request
++        agent._interruptible_api_call = lambda api_kwargs, *a, **k: provider_call(agent, model)
+     monkeypatch.setattr("model_tools.handle_function_call", lambda name, *a, **k: "quick result")
+     reservation = af.reserve(home)  # the turn's admission reservation, as the Desktop backend takes it
+     assert reservation is not None
+@@ -170,6 +172,73 @@ def test_a_long_model_request_at_a_step_boundary_yields_and_the_turn_pauses(home
+     assert update_pause_cancel.in_flight(agent) == {}
+ 
+ 
++def _wait_for_cancel(agent, model):
++    """The slow request runs until the update's cancel lands on the agent (or ``SLOW_MODEL_S`` passes)."""
++    model.calls += 1
++    if model.calls == model.slow:
++        model.slow_started.set()
++        deadline = time.monotonic() + SLOW_MODEL_S
++        while not agent._interrupt_requested and time.monotonic() < deadline:
++            _TICK.wait(0.02)
++        model.slow_finished = not agent._interrupt_requested
++        return True
++    return False
++
++
++def _assert_paused_at_the_boundary(home, agent, model, result, took):
++    assert model.slow_started.is_set() and not model.slow_finished
++    assert took < SLOW_MODEL_S / 2
++    assert af.state(home)["reservations"] == 0
++    assert result["interrupted"] is True and result["paused_for_update"] == up.PAUSE_REASON
++    assert model.calls == 2  # the yield re-issues nothing: the refunded iteration pauses first
++    assert (read_turn_marker(home, "session-key") or {}).get("reason") == "core_update_pause"
++    assert result["messages"][-1]["role"] == "tool"  # no partial, error or interrupt row after the tool result
++    assert not agent._interrupt_requested
++    assert update_pause_cancel.in_flight(agent) == {}
++
++
++def test_a_cancel_surfacing_as_a_provider_error_yields_without_error_accounting(home, tmp_path, monkeypatch):
++    """[daveey] t_01a1d2bfdf5b5260 (PR #1827 review nits 1+2): a transport that turns the cancel into a provider
++    error (a closed connection, not InterruptedError) reaches handle_api_error. The turn still yields, and the
++    cancel is not an API failure: no request-error hook, offline wait, credential recovery or error-attempt log."""
++    from agent import turn_api_error
++
++    def provider_call(agent, model):
++        if _wait_for_cancel(agent, model):
++            raise ConnectionError("Connection closed by the cancelled request")
++        return model.responses.pop(0)
++
++    accounted = []
++    for name in ("wait_out_offline", "recover_after_classification", "log_api_error_attempt"):
++        real = getattr(turn_api_error, name)
++        monkeypatch.setattr(turn_api_error, name,
++                            lambda *a, _n=name, _real=real, **k: accounted.append(_n) or _real(*a, **k))
++    monkeypatch.setattr(AIAgent, "_invoke_api_request_error_hook",
++                        lambda self, **k: accounted.append("request_error_hook"))
++
++    agent, model, result, took = _drive(home, tmp_path, monkeypatch,
++                                        [_response(_call("call_1")), _response(), _response()], slow=2,
++                                        provider_call=provider_call)
++
++    _assert_paused_at_the_boundary(home, agent, model, result, took)
++    assert accounted == []
++
++
++def test_a_response_that_crosses_the_cancel_is_dropped_and_the_turn_pauses(home, tmp_path, monkeypatch):
++    """[daveey] t_01a1d2bfdf5b5260 (PR #1827 review nit 1): the request answers just as the update's cancel lands
++    (no exception at all). perform_api_call drops the response instead of acting on it with the pause pending."""
++    def provider_call(agent, model):
++        _wait_for_cancel(agent, model)
++        return model.responses.pop(0)  # the slow request's own answer arrives after the cancel
++
++    agent, model, result, took = _drive(home, tmp_path, monkeypatch,
++                                        [_response(_call("call_1")), _response(), _response()], slow=2,
++                                        provider_call=provider_call)
++
++    _assert_paused_at_the_boundary(home, agent, model, result, took)
++    assert len(model.responses) == 1  # the crossed answer was consumed and dropped, not run
++
++
+ def test_the_first_model_request_is_not_a_boundary_and_is_left_alone(home, tmp_path, monkeypatch):
+     _agent, model, result, took = _drive(home, tmp_path, monkeypatch, [_response()], slow=1)
+ 
+-- 
+2.51.0
+

@@ -1,0 +1,657 @@
+From b5715521ecf44e00fd39bf7bf4b064c3f9230b99 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 14:58:36 +0000
+Subject: [PATCH] [daveey] fix(kanban): credit the sync thread's own
+ repair-revision steps; count repair rounds
+
+Hub, 2026-11-12 (t_01a1d02bf3e0d019): after #1461 credited a round's feed applies, the hub sync thread still ran
+the full repair pass on 60 of 62 sampled rounds (~40% of its wall time). A 147 s read-only trace of the live
+kanban_repair_revision (2027 steps, 123 changes) attributed the gaps: 1743 steps from refresh_remote_parents,
+174 from lease_version/sync_version updates on one hub card every ~1.5 s (lease mirrors), 37 from
+push acknowledgements (outbox deletes), all made by the sync thread after it read its repair inputs. Only feed
+applies inside pull() were credited, so every round saw a gap.
+
+kanban_sync_own_writes records, per board file, every revision step the sync thread makes through its live
+connection inside credited(): pull, refresh_remote_parents, push and worker-placement reevaluate. The recorder is
+a TEMP trigger gated by a connection function that answers only for the calling thread, so it never changes the
+schema, commits and rolls back with the write, and ignores every other connection and thread (dispatcher,
+heartbeats, workers, CLI): those writes stay gaps and repair at once. Steps drain to a per-file list when the
+block ends outside a transaction, so a round on another pooled connection still chains them.
+
+The window decision moves to kanban_sync_repair_window.decide, which returns why a pass ran (first, unknown,
+rebuilt, inputs, local_write, window) or deferred. note_round counts unchanged/deferred/full-pass rounds per
+board and logs them at INFO every 10 minutes ("kanban sync: <board> repair rounds in Ns: ..."), so live
+verification no longer needs py-spy --locals.
+
+Tests: the push-ack case now defers (it was pinned as a gap); new unit tests for the recorder (other thread,
+other connection, rollback, mid-transaction, no revision table) and round tests (reservation write credited,
+another thread's write during the round still repairs, counter/log line, decide reasons).
+---
+ hermes_cli/kanban_sync_client.py              |  65 +++----
+ hermes_cli/kanban_sync_own_writes.py          |  96 ++++++++++
+ hermes_cli/kanban_sync_repair_window.py       |  74 +++++++-
+ .../test_kanban_sync_feed_apply_credit.py     |  33 ++--
+ .../hermes_cli/test_kanban_sync_own_writes.py | 173 ++++++++++++++++++
+ .../test_kanban_sync_repair_content.py        |   4 +
+ 6 files changed, 385 insertions(+), 60 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_own_writes.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_own_writes.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 74486ae28e..e828e74129 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -48,8 +48,10 @@ from hermes_cli.kanban_sync_hub_routes import HubRoutesMixin
+ from hermes_cli.kanban_sync_client_attempt import note_attempt, raise_bounded_error, replay_after_timeout
+ from hermes_cli.kanban_sync_bounded_probe import DeadlineRequests as _DeadlineRequests, schedstat, watch_written
+ from hermes_cli.kanban_sync_repair_window import (  # shared per-board repair-window state, re-exported
+-    _REPAIR_CREDIT, _REPAIR_DEFERRED, _REPAIRED, _REPAIRED_AT, applies_chain, deferred_repairs_due, next_deferred_repair,
++    _REPAIR_CREDIT, _REPAIR_DEFERRED, _REPAIRED, _REPAIRED_AT, applies_chain, decide, deferred_repairs_due,
++    next_deferred_repair, note_round, reset as reset_repair_window,
+ )
++from hermes_cli.kanban_sync_own_writes import credited, reset as reset_own_writes, take as take_credited
+ 
+ _log = logging.getLogger(__name__)
+ 
+@@ -830,7 +832,7 @@ def pull(conn: sqlite3.Connection, hub: Hub, board: str, *, observers: bool,
+     """Apply every feed page after this file's cursor. Returns the number of changes read. On a board with an
+     outbox (primary), fields with an unanswered local edit are not overwritten; ``partition`` (a gateway name)
+     keeps only that gateway's cards. ``revisions`` gets each apply's (before, after) repair revision, in order
+-    (``_defer_repair`` credits a live change made only by these applies). [daveey]"""
++    (callers credit a live change made only by these applies). [daveey]"""
+     from hermes_cli.kanban_sync_stop import checkpoint
+     total = 0
+     cursor = int((sync.sync_state(conn) or {}).get("cursor") or 0)
+@@ -905,7 +907,7 @@ class RoundResult:
+     error: Optional[str] = None
+     repaired: dict[str, list[str]] = field(default_factory=dict)  # cards re-pushed by repair_divergence
+     rejection_resolutions: list[dict] = field(default_factory=list)
+-    repair_deferred: bool = False  # a replica-only change waits for the repair window (see ``_defer_repair``)
++    repair_deferred: bool = False  # a replica-only change waits for the repair window (see ``decide``)
+ 
+ 
+ def open_shadow(slug: str, gateway: str) -> sqlite3.Connection:
+@@ -976,10 +978,11 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+         ensure_identity(live, slug, gateway)
+         with _pulled_replica(slug, hub, gateway) as (replica, pulled, rebuilt):
+             result.pulled = pulled
+-            applies: Optional[list] = []  # (before, after) repair revision of each live apply; None = a rebuild
++            applies: Optional[list] = []  # credited revision steps (kanban_sync_own_writes); None = a rebuild
+             if mode == "primary":
+                 try:
+-                    pull(live, hub, slug, observers=True, partition=gateway, revisions=applies)
++                    with credited(live):
++                        pull(live, hub, slug, observers=True, partition=gateway)
+                 except Resync:
+                     _log.warning("kanban sync: %s live cursor below the retention floor; rebuilding from a snapshot", slug)
+                     applies = None
+@@ -987,9 +990,14 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+             from hermes_cli.kanban_sync_repair_revision import ensure_revision
+             ensure_revision(live)
+             inputs = _repair_inputs(path, replica, mode, gateway)
++            # Every step credited since the last round's read: its acks, mirror and reserves, then this pull.
++            steps = take_credited(live)
++            applies = None if applies is None else steps
+             key = str(path)
++            outcome = "unchanged"
+             if inputs is None or _REPAIRED.get(key) != inputs:
+-                deferred = not rebuilt and _defer_repair(key, inputs, applies)
++                outcome = "rebuilt" if rebuilt else decide(key, inputs, applies, _repair_clock(), REPLICA_REPAIR_MIN_S)
++                deferred = outcome == "deferred"
+                 from hermes_cli.kanban_sync_partition_repair import repair_partition_chat_links, repair_partition_links
+                 if not deferred:
+                     from hermes_cli import kanban_sync_partition_content as partition_content
+@@ -998,7 +1006,9 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+                         repair_partition_links(live, replica, gateway)
+                         repair_partition_chat_links(live, replica, gateway)
+                 # The remote-parent mirror is cheap and gates child promotion, so a deferral never delays it.
+-                if mode == "primary" and sync.refresh_remote_parents(live, replica):
++                with credited(live):  # copied from the replica (already an input), not a local edit
++                    moved = mode == "primary" and sync.refresh_remote_parents(live, replica)
++                if moved:
+                     sync.wake_dispatcher()  # a foreign parent moved: re-gate its children now
+                 if deferred:
+                     result.repair_deferred = True
+@@ -1012,18 +1022,21 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+                         _REPAIRED[key] = inputs
+                         _REPAIRED_AT[key] = _repair_clock()
+                     _REPAIR_CREDIT.pop(key, None)
++            note_round(slug, outcome, _repair_clock())
+             if mode == "primary":
+                 heal_clobbered_completions(live)
+                 from hermes_cli.kanban_sync_divergence import heal_running_over_ended_run
+                 heal_running_over_ended_run(live)
+-        result.push = push(live, hub, slug, gateway, primary=mode == "primary")
++        with credited(live):  # acknowledgements and the Board's merged rows: sync bookkeeping, not local edits
++            result.push = push(live, hub, slug, gateway, primary=mode == "primary")
+         from hermes_cli.kanban_sync_attachments import transfer_pending
+         transfer_pending(live, hub, slug)
+         from hermes_cli.kanban_sync_rejections import resolve_rejections
+         result.rejection_resolutions = resolve_rejections(live, hub, slug)
+         if mode == "primary":
+             from hermes_cli.kanban_worker_placement import reevaluate
+-            reevaluate(live, hub, slug, gateway)
++            with credited(live):  # reservation observations and the feed pull after them
++                reevaluate(live, hub, slug, gateway)
+         return result
+ 
+ 
+@@ -1366,41 +1379,11 @@ def reset_board_watch() -> None:
+     reset()
+     kanban_sync_partition_content.reset()
+     _WATCH.reset()
+-    _REPAIRED.clear()
+-    _REPAIRED_AT.clear()
+-    _REPAIR_DEFERRED.clear()
+-    _REPAIR_CREDIT.clear()
++    reset_repair_window()
++    reset_own_writes()
+     _LINKS_DONE.clear()
+ 
+ 
+-def _defer_repair(key: str, inputs: Optional[tuple], applies: Optional[Iterable[tuple]] = ()) -> bool:
+-    """True when the only repair inputs that changed since the last completed pass are the replica's feed cursor
+-    and live revisions made by this round's feed applies (same replica file, schema, mode, gateway and
+-    placement), and that pass finished less than ``REPLICA_REPAIR_MIN_S`` ago; records when the deferred pass is
+-    due so the sync loop runs it then. Unknown inputs (None) or no completed pass never defer.
+-
+-    A primary board's pull applies other gateways' writes to its own cards (heartbeats, claims) into the live
+-    file, which moves the live revision. ``applies`` is each apply's (before, after) revision, read inside its
+-    transaction; they must chain from the credited revision (the last pass's, or the last deferring round's) to
+-    this round's without a gap. Any gap is a local write the scans exist to find, so it repairs at once; so does
+-    a missing pair (None: a rebuild). [daveey]"""
+-    last = _REPAIRED.get(key)
+-    if inputs is None or last is None or applies is None:
+-        return False
+-    (gen, (revision, schema)), (dev, ino, _cursor), *rest = inputs
+-    (last_gen, (last_revision, last_schema)), (last_dev, last_ino, _last_cursor), *last_rest = last
+-    if (gen, schema) != (last_gen, last_schema) or (dev, ino) != (last_dev, last_ino) or rest != last_rest:
+-        return False
+-    if not applies_chain(_REPAIR_CREDIT.get(key, last_revision), applies, revision):
+-        return False
+-    due = _REPAIRED_AT.get(key, float("-inf")) + REPLICA_REPAIR_MIN_S
+-    if _repair_clock() >= due:
+-        return False
+-    _REPAIR_DEFERRED[key] = due
+-    _REPAIR_CREDIT[key] = revision
+-    return True
+-
+-
+ def _repair_inputs(live_path: Path, replica: sqlite3.Connection, mode: str, gateway: str) -> Optional[tuple]:
+     """Everything the pure repair scans (partition links, remote parents, divergence, missing children, lost
+     placeholder links) read: a transactional revision of the live input tables, schema version,
+diff --git a/hermes_cli/kanban_sync_own_writes.py b/hermes_cli/kanban_sync_own_writes.py
+new file mode 100644
+index 0000000000..a8238815e1
+--- /dev/null
++++ b/hermes_cli/kanban_sync_own_writes.py
+@@ -0,0 +1,96 @@
++"""Repair-revision steps the sync thread made itself, collected per board file. [daveey]
++
++Hub, 2026-11-12 (t_01a1d02bf3e0d019): after #1461 credited the round's feed applies, the hub's sync thread still
++ran the full repair pass on almost every sampled round (~40% of its wall time). Nearly every live revision step
++between two rounds was the sync thread's own bookkeeping after it read its inputs: push acknowledgements (outbox
++deletes, ``sync_version``), the remote-parent mirror, and pool reservations with the feed pull that follows them
++(``kanban_worker_placement.reevaluate``). None of these is the uncaptured local write the scans exist to find.
++
++``credited(conn)`` records, for the calling thread only, every ``kanban_repair_revision`` step made through
++``conn`` while the block runs. The recorder is a TEMP trigger: it fires only for statements run on the connection
++that created it, and its rows live in that connection's temp schema, so they commit and roll back with the write
++that made them (a rolled-back step is never credited). When the block ends outside a transaction its rows move to a
++per-file list, so a later round on another connection to the same file still sees them; ``take(path)`` returns
++them in order and clears them, and ``kanban_sync_repair_window.decide`` chains them from the credited revision.
++Anything the recorder misses (another thread or process, a failed install, a block that ends mid-transaction)
++leaves a gap in that chain, which repairs at once.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import sqlite3
++import threading
++from typing import Iterator
++
++_TABLE = "kanban_sync_credited_steps"
++_TRIGGER = "kanban_sync_credited_step"
++_GATE = "hermes_kanban_sync_credit_on"
++_active = threading.local()
++_lock = threading.Lock()
++_STEPS: dict[str, list[tuple[int, int]]] = {}
++
++
++def _installed(conn: sqlite3.Connection) -> bool:
++    return conn.execute("SELECT 1 FROM sqlite_temp_master WHERE type = 'trigger' AND name = ?",
++                        (_TRIGGER,)).fetchone() is not None
++
++
++def _install(conn: sqlite3.Connection) -> None:
++    key = id(conn)  # the gate answers for this connection and the calling thread only
++    conn.create_function(_GATE, 0, lambda: int(key in getattr(_active, "keys", ())))
++    conn.execute(f"CREATE TEMP TABLE IF NOT EXISTS {_TABLE} (before INTEGER NOT NULL, after INTEGER NOT NULL)")
++    conn.execute(f"CREATE TEMP TRIGGER IF NOT EXISTS {_TRIGGER} AFTER UPDATE OF revision ON main.kanban_repair_revision "
++                 f"WHEN {_GATE}() BEGIN INSERT INTO {_TABLE} VALUES (OLD.revision, NEW.revision); END")
++
++
++def _drain(conn: sqlite3.Connection) -> None:
++    """Move ``conn``'s committed recorded steps to its file's list (only outside a transaction)."""
++    if conn.in_transaction:
++        return
++    name = conn.execute("PRAGMA database_list").fetchone()[2]
++    steps = [(int(b), int(a)) for b, a in conn.execute(f"SELECT before, after FROM temp.{_TABLE} ORDER BY rowid")]
++    if not steps:
++        return
++    conn.execute(f"DELETE FROM temp.{_TABLE}")
++    with _lock:
++        _STEPS.setdefault(name, []).extend(steps)
++
++
++@contextlib.contextmanager
++def credited(conn: sqlite3.Connection) -> Iterator[None]:
++    """Credit this thread's repair-revision steps through ``conn`` until the block ends. A board without the
++    revision table yet (or any install error) records nothing, so its steps stay uncredited."""
++    try:
++        if not _installed(conn):
++            _install(conn)
++    except sqlite3.Error:
++        yield
++        return
++    keys = _active.__dict__.setdefault("keys", set())
++    added = id(conn) not in keys
++    keys.add(id(conn))
++    try:
++        yield
++    finally:
++        if added:
++            keys.discard(id(conn))
++            with contextlib.suppress(sqlite3.Error):
++                _drain(conn)
++
++
++def take(conn: sqlite3.Connection) -> list[tuple[int, int]]:
++    """The credited (before, after) steps recorded on ``conn``'s file since the last call, oldest first (any
++    connection to it); forgets them."""
++    try:
++        name = conn.execute("PRAGMA database_list").fetchone()[2]
++    except sqlite3.Error:
++        return []
++    with _lock:
++        return _STEPS.pop(name, [])
++
++
++def reset() -> None:
++    """Tests (``reset_board_watch``): forget every recorded step."""
++    with _lock:
++        _STEPS.clear()
+diff --git a/hermes_cli/kanban_sync_repair_window.py b/hermes_cli/kanban_sync_repair_window.py
+index 491d00adec..44b15ec9e3 100644
+--- a/hermes_cli/kanban_sync_repair_window.py
++++ b/hermes_cli/kanban_sync_repair_window.py
+@@ -1,4 +1,4 @@
+-"""Per-board state of the sync client's repair window (``kanban_sync_client._defer_repair``). [daveey]
++"""Per-board state of the sync client's repair window (``decide``, ``note_round``). [daveey]
+ 
+ Moved out of ``kanban_sync_client`` (at its line cap); the client re-exports every name, and the dicts are shared
+ objects, so ``ksc._REPAIRED`` and friends stay the same state.
+@@ -6,6 +6,7 @@ objects, so ``ksc._REPAIRED`` and friends stay the same state.
+ 
+ from __future__ import annotations
+ 
++import logging
+ from pathlib import Path
+ from typing import Any, Iterable, Optional
+ 
+@@ -14,7 +15,7 @@ _REPAIRED: dict[str, tuple] = {}
+ # Per board file: when that pass finished (``_repair_clock``), and when a deferred pass is due.
+ _REPAIRED_AT: dict[str, float] = {}
+ _REPAIR_DEFERRED: dict[str, float] = {}
+-# Per board file: the live repair revision a deferring round credited to feed applies alone (see ``_defer_repair``).
++# Per board file: the live repair revision a deferring round credited to the sync thread's own steps (see ``decide``).
+ # Cleared by a completed pass and by ``reset_board_watch``.
+ _REPAIR_CREDIT: dict[str, int] = {}
+ 
+@@ -30,6 +31,75 @@ def applies_chain(start: Any, applies: Iterable[tuple], end: Any) -> bool:
+     return at is not None and at == end
+ 
+ 
++def decide(key: str, inputs: Optional[tuple], applies: Optional[Iterable[tuple]], now: float, min_s: float) -> str:
++    """Why this round's changed repair inputs run the full pass now, or ``deferred``.
++
++    ``deferred`` when the only inputs that changed since the last completed pass are the replica's feed cursor and
++    live revision steps the sync thread credited to itself (same replica file, schema, mode, gateway and
++    placement), and that pass finished less than ``min_s`` ago; records when the deferred pass is due so the sync
++    loop runs it then. ``applies`` is the credited steps' (before, after) revisions (``kanban_sync_own_writes``:
++    feed applies, push acknowledgements, the remote-parent mirror, pool reservations); they must chain from the
++    credited revision (the last pass's, or the last deferring round's) to this round's without a gap. Any gap is a
++    write the scans exist to find (another process, or this thread outside those steps), so it repairs at once;
++    so does a missing list (None: a rebuild). Otherwise the reason: ``unknown`` inputs, ``first`` (no completed
++    pass), ``inputs`` (schema, replica file, mode, gateway or placement), ``local_write`` (a gap) or ``window``
++    (the last pass is older than ``min_s``). [daveey]"""
++    last = _REPAIRED.get(key)
++    if inputs is None:
++        return "unknown"
++    if last is None:
++        return "first"
++    if applies is None:
++        return "rebuilt"
++    (gen, (revision, schema)), (dev, ino, _cursor), *rest = inputs
++    (last_gen, (last_revision, last_schema)), (last_dev, last_ino, _last_cursor), *last_rest = last
++    if (gen, schema) != (last_gen, last_schema) or (dev, ino) != (last_dev, last_ino) or rest != last_rest:
++        return "inputs"
++    if not applies_chain(_REPAIR_CREDIT.get(key, last_revision), applies, revision):
++        return "local_write"
++    due = _REPAIRED_AT.get(key, float("-inf")) + min_s
++    if now >= due:
++        return "window"
++    _REPAIR_DEFERRED[key] = due
++    _REPAIR_CREDIT[key] = revision
++    return "deferred"
++
++
++# Per board: how its rounds ended since ``_ROUNDS_SINCE`` (``note_round``): ``unchanged`` (no repair input moved),
++# ``deferred``, or the reason the full pass ran (``decide``, plus ``rebuilt``). Logged at INFO every ROUND_LOG_S.
++ROUND_LOG_S = 600.0
++_ROUNDS: dict[str, dict[str, int]] = {}
++_ROUNDS_SINCE: dict[str, float] = {}
++
++
++def note_round(board: str, outcome: str, now: float) -> None:
++    """Count one round's repair outcome for ``board``; every ``ROUND_LOG_S`` log the counts and start over, so a
++    live check needs only the gateway log (``repair rounds``), not a ``py-spy --locals`` of the sync thread."""
++    counts = _ROUNDS.setdefault(board, {})
++    counts[outcome] = counts.get(outcome, 0) + 1
++    since = _ROUNDS_SINCE.setdefault(board, now)
++    if now - since < ROUND_LOG_S:
++        return
++    full = sum(n for k, n in counts.items() if k not in ("unchanged", "deferred"))
++    reasons = ", ".join(f"{k} {n}" for k, n in sorted(counts.items()) if k not in ("unchanged", "deferred"))
++    logging.getLogger("hermes_cli.kanban_sync_client").info(
++        "kanban sync: %s repair rounds in %ds: %d full pass (%s), %d deferred, %d unchanged", board, int(now - since),
++        full, reasons or "none", counts.get("deferred", 0), counts.get("unchanged", 0))
++    _ROUNDS[board] = {}
++    _ROUNDS_SINCE[board] = now
++
++
++def round_counts(board: str) -> dict[str, int]:
++    """This board's round outcomes since the last ``repair rounds`` log line (a copy)."""
++    return dict(_ROUNDS.get(board, {}))
++
++
++def reset() -> None:
++    """Tests (``reset_board_watch``): forget every pass, deferral, credit and round count."""
++    for state in (_REPAIRED, _REPAIRED_AT, _REPAIR_DEFERRED, _REPAIR_CREDIT, _ROUNDS, _ROUNDS_SINCE):
++        state.clear()
++
++
+ def deferred_repairs_due(boards: list[tuple[str, Path]], now: float) -> list[tuple[str, Path]]:
+     """Boards whose deferred repair pass is due at ``now`` (``_repair_clock`` time)."""
+     return [(slug, path) for slug, path in boards
+diff --git a/tests/hermes_cli/test_kanban_sync_feed_apply_credit.py b/tests/hermes_cli/test_kanban_sync_feed_apply_credit.py
+index b2fbc38def..663ba20082 100644
+--- a/tests/hermes_cli/test_kanban_sync_feed_apply_credit.py
++++ b/tests/hermes_cli/test_kanban_sync_feed_apply_credit.py
+@@ -213,13 +213,14 @@ def test_a_full_pass_clears_the_credit(live, svc, kanban_home, monkeypatch, cloc
+     assert _round(kanban_home, svc).repair_deferred
+     path = str(kanban_home / "kanban.db")
+     assert path in ksc._REPAIR_CREDIT
+-    # A captured local write: the next round runs the pass, and the push after it moves the live file again.
++    # A captured local write: the next round runs the pass and clears the credit.
+     with kbc.write_txn(live):
+         live.execute("UPDATE tasks SET title = 'local' WHERE id = ?", (child,))
+-    for _ in range(3):
+-        clock[0] += 1
+-        _round(kanban_home, svc)
++    clock[0] += 1
++    assert not _round(kanban_home, svc).repair_deferred
+     assert path not in ksc._REPAIR_CREDIT
++    # The push after that pass moved the live file again; its ack is credited, so the chain starts at the
++    # pass's own revision and the next heartbeat round defers.
+     calls = _spy(monkeypatch)
+     clock[0] += 1
+     _heartbeat(svc, parent)
+@@ -227,10 +228,10 @@ def test_a_full_pass_clears_the_credit(live, svc, kanban_home, monkeypatch, cloc
+     assert not any(calls.values()), calls
+ 
+ 
+-def test_a_push_ack_after_the_inputs_read_breaks_the_chain(live, svc, kanban_home, monkeypatch, clock):
+-    """``push`` runs after the inputs read; an acknowledged push deletes outbox rows (a watched table), so the
+-    next round's first apply does not start at the credited revision and the full pass runs. Push acks are
+-    deliberately not credited: only feed applies are."""
++def test_a_push_ack_after_the_inputs_read_is_credited(live, svc, kanban_home, monkeypatch, clock):
++    """``push`` runs after the inputs read; an acknowledged push deletes outbox rows (a watched table). That is
++    the sync thread's own bookkeeping (``kanban_sync_own_writes``), so the next apply-only round still defers;
++    before t_01a1d02bf3e0d019 it broke the chain and re-ran the full pass on the hub almost every round."""
+     parent, child = _settle(live, svc, kanban_home)
+     _heartbeat(svc, parent)
+     assert _round(kanban_home, svc).repair_deferred  # credit held
+@@ -251,16 +252,12 @@ def test_a_push_ack_after_the_inputs_read_breaks_the_chain(live, svc, kanban_hom
+     assert not _round(kanban_home, svc).repair_deferred
+     assert marks[-1][2] >= 1 and marks[-1][1] != marks[-1][0], f"the push must ack and move the revision: {marks}"
+     assert calls["repair_divergence"] == 1, calls
+-    # An apply-only round after the pushing round: the chain breaks at the ack, so the full pass runs.
+-    clock[0] += 1
+-    _heartbeat(svc, parent)
+-    assert not _round(kanban_home, svc).repair_deferred
+-    assert calls["repair_divergence"] == 2, calls
+-    # Steady again: the next apply-only round defers.
++    # An apply-only round after the pushing round: the ack is credited, so it defers.
+     clock[0] += 1
+     _heartbeat(svc, parent)
+     assert _round(kanban_home, svc).repair_deferred
+-    assert calls["repair_divergence"] == 2, calls
++    assert calls["repair_divergence"] == 1, calls
++    assert _board_title(svc, child) == "pushed"
+ 
+ 
+ @pytest.mark.parametrize("heal", ["heal_clobbered_completions", "heal_running_over_ended_run"])
+@@ -359,10 +356,12 @@ def test_an_uncaptured_write_after_the_last_apply_repairs_in_that_round(live, sv
+     assert _board_title(svc, child) == "gap after apply"
+ 
+ 
+-def test_an_unknown_apply_revision_gets_no_credit(live, svc, kanban_home, monkeypatch, clock):
++def test_an_unrecorded_apply_gets_no_credit(live, svc, kanban_home, monkeypatch, clock):
++    """No recorder (``credited`` a no-op, e.g. its TEMP trigger failed to install): the apply's step is a gap."""
++    import contextlib
+     parent, _child = _settle(live, svc, kanban_home)
+     calls = _spy(monkeypatch)
+-    monkeypatch.setattr(sync, "_repair_revision", lambda conn: None, raising=False)
++    monkeypatch.setattr(ksc, "credited", lambda conn: contextlib.nullcontext())
+     _heartbeat(svc, parent)
+     assert not _round(kanban_home, svc).repair_deferred
+     assert calls["repair_divergence"] == 1, calls
+diff --git a/tests/hermes_cli/test_kanban_sync_own_writes.py b/tests/hermes_cli/test_kanban_sync_own_writes.py
+new file mode 100644
+index 0000000000..c0432fb093
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_own_writes.py
+@@ -0,0 +1,173 @@
++"""The sync thread's own repair-revision steps are credited; everyone else's still repair. [daveey]
++
++Hub, 2026-11-12 (t_01a1d02bf3e0d019): with #1461 the hub still ran the full repair pass on almost every round, because
++its own push acknowledgements, remote-parent mirror and pool reservations moved the live repair revision after
++the round's inputs read, and only feed applies were credited. ``kanban_sync_own_writes`` records those steps with a
++connection-local TEMP trigger gated to the sync thread; a write from any other connection or thread is still a gap.
++"""
++
++from __future__ import annotations
++
++import logging
++import sqlite3
++import threading
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_own_writes as own
++from hermes_cli import kanban_sync_repair_window as window
++from tests.hermes_cli import test_kanban_sync_feed_apply_credit as credit
++
++kanban_home = credit.kanban_home
++svc = credit.svc
++clock = credit.clock
++live = credit.live
++
++
++@pytest.fixture
++def db(tmp_path):
++    path = tmp_path / "x.db"
++    a = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
++    a.executescript("""
++        CREATE TABLE tasks(id TEXT PRIMARY KEY, v INT);
++        CREATE TABLE kanban_repair_revision(id INTEGER PRIMARY KEY CHECK (id = 1), revision INTEGER NOT NULL);
++        INSERT INTO kanban_repair_revision VALUES (1, 0);
++        CREATE TRIGGER kanban_repair_tasks_insert AFTER INSERT ON tasks
++            BEGIN UPDATE kanban_repair_revision SET revision = revision + 1 WHERE id = 1; END;
++        CREATE TRIGGER kanban_repair_tasks_update AFTER UPDATE ON tasks
++            BEGIN UPDATE kanban_repair_revision SET revision = revision + 1 WHERE id = 1; END;
++    """)
++    b = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
++    own.reset()
++    yield a, b
++    own.reset()
++    a.close()
++    b.close()
++
++
++def test_only_this_threads_committed_steps_on_this_connection_are_recorded(db):
++    a, b = db
++    schema = a.execute("PRAGMA schema_version").fetchone()[0]
++    with own.credited(a):
++        a.execute("INSERT INTO tasks VALUES ('t1', 1)")                       # 0 -> 1 credited
++        a.execute("BEGIN IMMEDIATE")
++        a.execute("UPDATE tasks SET v = 2")                                    # rolled back: never credited
++        a.execute("ROLLBACK")
++        b.execute("INSERT INTO tasks VALUES ('t2', 1)")                       # 1 -> 2 another connection
++        other = threading.Thread(target=lambda: a.execute("UPDATE tasks SET v = 3"))  # 2 -> 4: other thread
++        other.start()
++        other.join()
++        a.execute("UPDATE tasks SET v = 4")                                    # 4 -> 6 credited
++    a.execute("UPDATE tasks SET v = 5")                                        # 6 -> 8 after the block
++    assert own.take(b) == [(0, 1), (4, 5), (5, 6)], "steps are per file, so any connection to it takes them"
++    assert own.take(a) == []
++    assert a.execute("PRAGMA schema_version").fetchone()[0] == schema, "a TEMP recorder must not move the schema"
++    assert a.execute("SELECT revision FROM kanban_repair_revision").fetchone()[0] == 8
++
++
++def test_a_block_that_ends_inside_a_transaction_keeps_its_steps_until_it_commits(db):
++    a, _b = db
++    a.execute("BEGIN IMMEDIATE")
++    with own.credited(a):
++        a.execute("INSERT INTO tasks VALUES ('t1', 1)")
++    assert own.take(a) == [], "uncommitted: not credited yet"
++    a.execute("COMMIT")
++    with own.credited(a):
++        pass
++    assert own.take(a) == [(0, 1)]
++
++
++def test_a_board_without_the_revision_table_records_nothing(tmp_path):
++    conn = sqlite3.connect(tmp_path / "bare.db", isolation_level=None)
++    conn.execute("CREATE TABLE tasks(id TEXT)")
++    with own.credited(conn):
++        conn.execute("INSERT INTO tasks VALUES ('t')")
++    assert own.take(conn) == []
++    conn.close()
++
++
++# --- the round ---------------------------------------------------------------------------------------------
++
++
++def test_a_reservation_write_by_the_sync_thread_is_credited(live, svc, kanban_home, monkeypatch, clock):
++    """``reevaluate`` runs after the inputs read (pool reservations, the feed pull after them)."""
++    import hermes_cli.kanban_worker_placement as placement
++    parent, child = credit._settle(live, svc, kanban_home)
++    calls = credit._spy(monkeypatch)
++
++    def reserve(conn, *a, **k):
++        with kbc.write_txn(conn):
++            conn.execute("UPDATE tasks SET priority = priority + 1 WHERE id = ?", (child,))
++    monkeypatch.setattr(placement, "reevaluate", reserve)
++    for _ in range(3):
++        clock[0] += 1
++        credit._heartbeat(svc, parent)
++        assert credit._round(kanban_home, svc).repair_deferred
++    assert not any(calls.values()), calls
++
++
++def test_another_threads_write_during_the_round_still_repairs(live, svc, kanban_home, monkeypatch, clock):
++    """A dispatcher/heartbeat write on another connection while the sync thread is inside a credited block is
++    not the sync thread's: a gap, so the next round repairs and finds it."""
++    parent, child = credit._settle(live, svc, kanban_home)
++    calls = credit._spy(monkeypatch)
++    real_push = ksc.push
++    done = []
++
++    def push_and_race(conn, *a, **k):
++        if not done:
++            done.append(1)
++            credit._uncaptured_edit(live, child, "raced")
++        return real_push(conn, *a, **k)
++    monkeypatch.setattr(ksc, "push", push_and_race)
++    credit._heartbeat(svc, parent)
++    credit._round(kanban_home, svc)
++    clock[0] += 1
++    credit._heartbeat(svc, parent)
++    assert not credit._round(kanban_home, svc).repair_deferred
++    assert calls["repair_divergence"] == 1, calls
++    credit._round(kanban_home, svc)
++    assert credit._board_title(svc, child) == "raced"
++
++
++# --- the counter ---------------------------------------------------------------------------------------------
++
++
++def test_round_outcomes_are_counted_and_logged_per_board(live, svc, kanban_home, monkeypatch, clock, caplog):
++    parent, child = credit._settle(live, svc, kanban_home)
++    window._ROUNDS.clear()
++    window._ROUNDS_SINCE.clear()
++    credit._heartbeat(svc, parent)
++    credit._round(kanban_home, svc)                       # deferred
++    credit._round(kanban_home, svc)                       # still deferred (the window's pass is not done yet)
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET title = 'x' WHERE id = ?", (child,))
++    clock[0] += 1
++    credit._round(kanban_home, svc)                       # local_write
++    assert window.round_counts(credit.BOARD) == {"deferred": 2, "local_write": 1}
++    clock[0] += window.ROUND_LOG_S
++    with caplog.at_level(logging.INFO, logger="hermes_cli.kanban_sync_client"):
++        credit._round(kanban_home, svc)
++    lines = [r.getMessage() for r in caplog.records if "repair rounds" in r.getMessage()]
++    assert len(lines) == 1, lines
++    assert lines[0].startswith(f"kanban sync: {credit.BOARD} repair rounds in ")
++    assert "local_write 1" in lines[0] and " deferred" in lines[0], lines[0]
++    assert window.round_counts(credit.BOARD) == {}, "the log line starts a new period"
++
++
++def test_decide_reasons():
++    window.reset()
++    inputs = ((1, (5, 7)), (1, 2, 0), "primary")
++    assert window.decide("k", None, [], 0.0, 30.0) == "unknown"
++    assert window.decide("k", inputs, [], 0.0, 30.0) == "first"
++    window._REPAIRED["k"] = inputs
++    window._REPAIRED_AT["k"] = 0.0
++    moved = ((1, (6, 7)), (1, 2, 1), "primary")
++    assert window.decide("k", moved, None, 1.0, 30.0) == "rebuilt"
++    assert window.decide("k", ((1, (6, 8)), (1, 2, 1), "primary"), [(5, 6)], 1.0, 30.0) == "inputs"
++    assert window.decide("k", moved, [], 1.0, 30.0) == "local_write"
++    assert window.decide("k", moved, [(5, 6)], 31.0, 30.0) == "window"
++    assert window.decide("k", moved, [(5, 6)], 1.0, 30.0) == "deferred"
++    window.reset()
+diff --git a/tests/hermes_cli/test_kanban_sync_repair_content.py b/tests/hermes_cli/test_kanban_sync_repair_content.py
+index cb60e3a4bb..90ca2d5d48 100644
+--- a/tests/hermes_cli/test_kanban_sync_repair_content.py
++++ b/tests/hermes_cli/test_kanban_sync_repair_content.py
+@@ -37,6 +37,10 @@ def test_event_only_feed_skips_content_and_partition_repairs(
+     with connection_scope():
+         parent, _ = window._settle(live, svc, kanban_home, mode)
+         window._round(kanban_home, svc)
++        # The settle push's own acknowledgement is credited (kanban_sync_own_writes), so its round deferred:
++        # let that deferred pass run, so the content stamp is current before the event-only round.
++        clock[0] += ksc.REPLICA_REPAIR_MIN_S + 1
++        window._round(kanban_home, svc)
+         calls = window._spy(monkeypatch, (
+             "repair_divergence", "repair_missing_children", "repair_partition_links",
+             "repair_partition_chat_links", "retire_lost_placeholder_links",
+-- 
+2.51.0
+

@@ -1,0 +1,171 @@
+From c250f8419c78430439c97d8df1dedde0a4df8afa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 03:31:42 +0000
+Subject: [PATCH] [daveey] requeued publisher: a granted continuation's own
+ requeue chain hands the publisher's PR on
+
+Review 5885494823 on PR #1839 (card t_01a1d2e48f1dee75): a requeued publisher's granted
+continuation that restated its PR and was requeued again was held active_pr, while
+origin/main let it continue. The earlier comment sat before the continuation's claim and
+the grant that handed it over records no event, so the handoff requirement refused it.
+
+An earlier holding PR comment now also counts as handed when its writer is a core-update
+requeued run of the same profile and every run from that writer up to the claim is skipped
+(requeue or unused grant). A real run between still consumes it; a crashed publisher's PR
+before the chain still needs a recorded handoff.
+
+Also reword the _HANDOFF_KINDS comment: _is_handoff screens link-only/dispatcher writes,
+it does not repeat the guard's full per-kind predicates (review nit).
+
+Proof: RED at ed5e2bb 3 new tests fail (chain resume, pause between, profile); GREEN 31 test
+files importing the three modules, 640 passed, 1 skipped.
+---
+ hermes_cli/kanban_requeued_publisher.py       | 28 +++++++-
+ ...test_kanban_core_update_requeue_handoff.py | 71 +++++++++++++++++++
+ 2 files changed, 96 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_requeued_publisher.py b/hermes_cli/kanban_requeued_publisher.py
+index 9aa735fec4..0e77e2e529 100644
+--- a/hermes_cli/kanban_requeued_publisher.py
++++ b/hermes_cli/kanban_requeued_publisher.py
+@@ -13,7 +13,9 @@ The pause lets that run's lineage continue exactly once, and only when every fac
+ * that run ended as a core-update requeue (no crash, timeout or other reclaim);
+ * its profile is the card's current assignee;
+ * a holding PR comment from before that claim (and after the card's first run) was handed to
+-  it: a recorded handoff (:data:`_HANDOFF_KINDS`) falls after that comment, after every earlier
++  it: either an earlier requeued publisher of the same profile wrote it and every run from that
++  writer up to the claim is skipped (this grant's own chain: that hand-over records no event),
++  or a recorded handoff (:data:`_HANDOFF_KINDS`) falls after that comment, after every earlier
+   real run ended, and no later than the claim. The claim itself records no proof that the
+   respawn guard let it through, and a direct ``claim_task`` bypasses the guard, so without this
+   an earlier crashed publisher's PR would ride along once the claimed run restated it;
+@@ -30,7 +32,9 @@ import sqlite3
+ from typing import Iterable, Optional
+ 
+ # Events that hand an earlier PR to the next claim (the kinds ``_handed_off_after`` in
+-# :mod:`kanban_db_dispatch_pr_state` honours); each is re-checked by :func:`_is_handoff`.
++# :mod:`kanban_db_dispatch_pr_state` honours). :func:`_is_handoff` screens out link-only and
++# dispatcher writes only; it does not repeat the guard's full per-kind predicates (merge
++# authorization, PR-url scope, park/run match, review checkpoint), so it is the looser test.
+ _HANDOFF_KINDS = ("assigned", "changes_requested", "review_reopened", "unblocked", "continued", "scheduled",
+                   "dependency_wait", "reopened", "hold_released", "operator_resumed")
+ 
+@@ -77,6 +81,23 @@ def _is_handoff(event) -> bool:
+     return is_handoff_event(kind, event["payload"])
+ 
+ 
++def _requeued_chain(conn: sqlite3.Connection, task_id: str, writer, run, requeued: set[int]) -> bool:
++    """``writer`` is an earlier requeued publisher whose one continuation reached ``run``'s claim.
++
++    Same profile, a core-update requeue, and every run from it up to ``run`` skipped: the
++    continuation it was granted is ``run``, and that hand-over records no event of its own.
++    """
++    from hermes_cli.kanban_core_update_requeue import _skipped
++
++    if writer is None or writer["id"] not in requeued or writer["id"] >= run["id"]:
++        return False
++    if writer["profile"] != run["profile"]:
++        return False
++    between = conn.execute("SELECT * FROM task_runs WHERE task_id = ? AND id >= ? AND id < ?",
++                           (task_id, writer["id"], run["id"]))
++    return all(_skipped(conn, r) for r in between)
++
++
+ def _handed_to_claim(conn: sqlite3.Connection, task_id: str, run, started: int, newest_earlier: int) -> bool:
+     """The holding PR comment at ``newest_earlier`` (before ``run``'s claim) was handed to that claim.
+ 
+@@ -151,7 +172,8 @@ def continues(conn: sqlite3.Connection, task_id: str, holding: Iterable[tuple[in
+     earlier: list[int] = []
+     for t, cid in holding:
+         if t < started:
+-            earlier.append(t)
++            if not _requeued_chain(conn, task_id, writer(cid), run, requeued):
++                earlier.append(t)  # not this grant's own chain: it needs a recorded handoff
+             continue
+         other = writer(cid)
+         if other is None or other["id"] != run["id"]:
+diff --git a/tests/hermes_cli/test_kanban_core_update_requeue_handoff.py b/tests/hermes_cli/test_kanban_core_update_requeue_handoff.py
+index 1f5a0276b3..a0159feb1d 100644
+--- a/tests/hermes_cli/test_kanban_core_update_requeue_handoff.py
++++ b/tests/hermes_cli/test_kanban_core_update_requeue_handoff.py
+@@ -417,6 +417,77 @@ def test_earlier_pr_needs_a_handoff_before_the_requeued_claim(board, handoff, co
+     assert dispatch.check_respawn_guard(board, task) == held
+ 
+ 
++def _age(board, task, seconds=60):
++    board.execute("UPDATE task_runs SET started_at = started_at - ?, ended_at = ended_at - ? WHERE task_id = ?",
++                  (seconds, seconds, task))
++    for table in ("task_events", "task_comments"):
++        board.execute(f"UPDATE {table} SET created_at = created_at - ? WHERE task_id = ?", (seconds, task))
++
++
++def _restate_and_requeue(board, task, *, between=None):
++    """Age the card, optionally reclaim a run with ``between``, then a claim restates the PR and is requeued."""
++    from tests.hermes_cli.kanban_guard_helpers import worker_comment
++
++    _age(board, task)
++    if between:
++        _reclaim(board, task, between)
++        _age(board, task, 30)
++    assert kb.claim_task(board, task) is not None
++    runs = board.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (task,)).fetchone()[0]
++    # A distinct length per run: equal (author, len) rows within the event skew are indistinguishable.
++    worker_comment(board, task, "dev", "Still on " + PR + " " + "." * runs)
++    assert kb.reclaim_task(board, task, reason=CORE_UPDATE_REQUEUE_REASON, signal_fn=lambda *_: None)
++
++
++def test_granted_continuation_that_restates_its_pr_and_is_requeued_again_resumes(board):
++    """Review 5885494823 (PR #1839): the grant hands the publisher's PR to its continuation with no event."""
++    task = _publisher(board)
++    _restate_and_requeue(board, task)
++    assert dispatch.check_respawn_guard(board, task) is None
++    _restate_and_requeue(board, task)  # a third run in the same chain: still one grant at a time
++    assert dispatch.check_respawn_guard(board, task) is None
++    assert kb.claim_task(board, task) is not None  # the next real run consumes it
++    assert kb.reclaim_task(board, task, reason=CRASH, signal_fn=lambda *_: None)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++@pytest.mark.parametrize("between", [CRASH, CORE_UPDATE_REQUEUE_REASON], ids=["real_run_between", "pause_between"])
++def test_requeued_chain_breaks_at_a_real_run(board, between):
++    """A real run between the requeued publisher and the claim consumed that grant: held. A pause keeps it."""
++    task = _publisher(board)
++    _restate_and_requeue(board, task, between=between)
++    assert dispatch.check_respawn_guard(board, task) == ("active_pr" if between == CRASH else None)
++
++
++def test_requeued_chain_needs_the_same_profile(board):
++    from hermes_cli import kanban_requeued_publisher as publisher
++
++    task = _publisher(board)
++    _restate_and_requeue(board, task)
++    rows = board.execute("SELECT id, created_at FROM task_comments WHERE task_id = ? ORDER BY id", (task,))
++    holding = [(int(at), row) for row, at in rows]
++    assert publisher.continues(board, task, holding, holding[-1][1])
++    board.execute("UPDATE task_runs SET profile = 'ops' WHERE id = (SELECT MIN(id) FROM task_runs WHERE task_id = ?)",
++                  (task,))
++    assert not publisher.continues(board, task, holding, holding[-1][1])
++
++
++def test_requeued_chain_does_not_carry_an_earlier_crashed_publisher(board):
++    """A crashed run's PR before the chain still needs a recorded handoff, though the chain itself is clean."""
++    from tests.hermes_cli.kanban_guard_helpers import worker_comment
++
++    task = kb.create_task(board, title="implementation", assignee="dev")
++    assert kb.claim_task(board, task) is not None
++    worker_comment(board, task, "dev", "Opened " + PR + "9")
++    assert kb.reclaim_task(board, task, reason=CRASH, signal_fn=lambda *_: None)
++    _age(board, task, 30)
++    assert kb.claim_task(board, task) is not None  # direct claim: the respawn guard never ran
++    worker_comment(board, task, "dev", "Opened " + PR)
++    assert kb.reclaim_task(board, task, reason=CORE_UPDATE_REQUEUE_REASON, signal_fn=lambda *_: None)
++    _restate_and_requeue(board, task)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
+ @pytest.mark.parametrize("handoff,granted", [
+     (("unblocked", {"by": "operator"}, False, -5), False),  # after the claim: it handed nothing to it
+     (("dependency_wait", {"reason": "parent_not_done"}, False, 20), False),  # a bare link
+-- 
+2.51.0
+

@@ -1,0 +1,226 @@
+From f079b6f91f5a137a889b6197f86c73052520918a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:10:15 +0000
+Subject: [PATCH] [daveey] aux: gate the abandoned daemon's client close on the
+ owner's shutdown sweep; document logging.debug_ssl_close
+
+Follow-up to the two non-blocking nits in the exact-head review of #2074
+(https://github.com/example-org/hermes/pull/2074#pullrequestreview-5889730795).
+
+1. Close/shutdown race in aux_provider_handoff.release_client.
+   The owner defers the close to each abandoned provider daemon, then
+   shuts the client's sockets down (force_close_tcp_sockets). A daemon
+   that finished between the defer and the sweep ran its close() while
+   the owner was still in shutdown() on the same socket. sock_shutdown
+   reads sock_fd outside the GIL, so it could shut down a recycled fd
+   (ENOTSOCK on a file is harmless, but a recycled socket would be cut).
+   The daemon-side release now waits on an Event that the owner sets
+   right after its sweep (in a finally, so a sweep that raises still
+   releases the daemons). The owner's own share of the countdown runs
+   after the sweep as well.
+
+2. logging.debug_ssl_close (read by hermes_logging.setup_logging for
+   agent/ssl_close_tripwire.py) is now in DEFAULT_CONFIG's logging block
+   (default false, same behaviour as an absent key), and
+   website/docs/user-guide/configuration.md gains a Logging section that
+   documents it together with level / max_size_mb / backup_count. Those
+   three are dropped from the docs-drift baseline. config_defaults.py
+   is at its FILE_LINES cap: max_size_mb and backup_count now share one
+   line to offset the new key.
+
+Proof:
+- RED (handoff source reverted, new tests kept):
+  test_daemon_finishing_during_the_owner_sweep_closes_only_after_it and
+  test_a_failing_owner_sweep_still_releases_the_gated_daemon fail. The
+  daemon's close lands between sweep-start and sweep-end.
+- Mutant (try/finally around the sweep dropped): only
+  test_a_failing_owner_sweep_still_releases_the_gated_daemon fails, because
+  the daemon stays blocked.
+- GREEN: test_aux_abandoned_provider_tls_fd.py 12/12, plus test_docs_drift
+  and test_config (184 passed). The 40 test files that import
+  aux_provider_handoff / ssl_close_tripwire / hermes_logging pass 422/422.
+  check_docs_drift is ok, and scripts/check --base origin/main passes 19
+  checks.
+
+Card: t_01a1d48c470a534a
+---
+ agent/aux_provider_handoff.py                 | 14 ++++-
+ hermes_cli/config_defaults.py                 |  4 +-
+ scripts/ci/docs_drift_baseline.json           |  3 -
+ .../test_aux_abandoned_provider_tls_fd.py     | 61 +++++++++++++++++++
+ website/docs/user-guide/configuration.md      | 22 +++++++
+ 5 files changed, 97 insertions(+), 7 deletions(-)
+
+diff --git a/agent/aux_provider_handoff.py b/agent/aux_provider_handoff.py
+index 39c5c65f44..5266665c09 100644
+--- a/agent/aux_provider_handoff.py
++++ b/agent/aux_provider_handoff.py
+@@ -87,6 +87,7 @@ def release_client(client: Any, close: Callable[[Any], None], abandoned: list[Pr
+     from agent.agent_runtime_helpers import force_close_tcp_sockets
+     remaining = [len(abandoned)]
+     lock = threading.Lock()
++    swept = threading.Event()
+ 
+     def one_done() -> None:
+         with lock:
+@@ -95,12 +96,21 @@ def release_client(client: Any, close: Callable[[Any], None], abandoned: list[Pr
+         if last:
+             close(client)
+ 
++    def daemon_done() -> None:
++        # A daemon that finishes between the defer and the sweep below must not close while this thread still
++        # shuts the same sockets down: shutdown() reads the fd outside the GIL and could hit a recycled number.
++        swept.wait()
++        one_done()
++
+     # Defer before the shutdown wakes the daemon: shutting down first let a woken daemon finish before the
+     # defer, so the close fell back to this thread (FD-safe then, but no longer the daemon's).
+-    deferred = sum(attempt.defer(one_done) for attempt in abandoned)
++    deferred = sum(attempt.defer(daemon_done) for attempt in abandoned)
++    try:
++        shutdown_count = force_close_tcp_sockets(getattr(client, "_real_client", None) or client) if deferred else 0
++    finally:
++        swept.set()
+     for _ in range(len(abandoned) - deferred):
+         one_done()
+-    shutdown_count = force_close_tcp_sockets(getattr(client, "_real_client", None) or client) if deferred else 0
+     if deferred:
+         logger.info("auxiliary client close handed to %d abandoned provider daemon(s) (tcp_shutdown=%d)",
+                     deferred, shutdown_count)
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index e228382d90..964071df03 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -2089,8 +2089,8 @@ DEFAULT_CONFIG = {
+     },
+     "logging": {  # File logging to ~/.hermes/logs/: agent.log captures INFO+, errors.log WARNING+.
+         "level": "INFO",       # minimum level for agent.log: DEBUG, INFO, WARNING
+-        "max_size_mb": 5,      # max size per log file before rotation
+-        "backup_count": 3,     # rotated backups to keep
++        "max_size_mb": 5, "backup_count": 3,  # rotate each log file at max_size_mb, keeping backup_count backups
++        "debug_ssl_close": False,  # debug: log a stack when a TLS socket is closed under another thread's read
+     },
+     # Remote model-catalog manifest: curated OpenRouter / Nous Portal model lists fetched from this
+     # URL (falls back to the in-repo snapshot on network failure), so picker lists update without a
+diff --git a/scripts/ci/docs_drift_baseline.json b/scripts/ci/docs_drift_baseline.json
+index d4d3edc4d9..d6b698ab82 100644
+--- a/scripts/ci/docs_drift_baseline.json
++++ b/scripts/ci/docs_drift_baseline.json
+@@ -92,9 +92,6 @@
+   "kanban.worker_log_rotate_bytes",
+   "local_runtime.models_max",
+   "local_runtime.port",
+-  "logging.backup_count",
+-  "logging.level",
+-  "logging.max_size_mb",
+   "mattermost.free_response_channels",
+   "mattermost.require_mention",
+   "max_live_sessions",
+diff --git a/tests/agent/test_aux_abandoned_provider_tls_fd.py b/tests/agent/test_aux_abandoned_provider_tls_fd.py
+index e64cc60bdb..35038855bf 100644
+--- a/tests/agent/test_aux_abandoned_provider_tls_fd.py
++++ b/tests/agent/test_aux_abandoned_provider_tls_fd.py
+@@ -221,6 +221,67 @@ def test_release_closes_at_once_when_the_daemon_already_finished():
+     assert closed == ["client"]
+ 
+ 
++def _sweep_finishing_the_daemon(attempt, log, *, raise_after=False):
++    """A ``force_close_tcp_sockets`` stand-in that lets the abandoned daemon finish mid-sweep, the interleaving
++    where the daemon's close and the owner's shutdown() could otherwise hit the same socket at once."""
++    daemon = threading.Thread(target=attempt.finish, name="hermes-protected-aux-provider", daemon=True)
++
++    def sweep(client) -> int:
++        log.append("sweep-start")
++        daemon.start()
++        daemon.join(1.0)  # ungated, the daemon closes within this window; gated, it waits for the sweep
++        log.append("sweep-end")
++        if raise_after:
++            raise RuntimeError("sweep failed")
++        return 1
++    return daemon, sweep
++
++
++def test_daemon_finishing_during_the_owner_sweep_closes_only_after_it(monkeypatch):
++    from agent import agent_runtime_helpers
++    log: list = []
++    attempt = handoff.ProviderAttempt()
++    daemon, sweep = _sweep_finishing_the_daemon(attempt, log)
++    monkeypatch.setattr(agent_runtime_helpers, "force_close_tcp_sockets", sweep)
++    with handoff.client_scope("client", lambda c: log.append(("close", threading.current_thread().name))):
++        handoff.note_abandoned(attempt)
++    daemon.join(5)
++    assert not daemon.is_alive()
++    assert log == ["sweep-start", "sweep-end", ("close", "hermes-protected-aux-provider")]
++
++
++def test_a_failing_owner_sweep_still_releases_the_gated_daemon(monkeypatch):
++    from agent import agent_runtime_helpers
++    log: list = []
++    attempt = handoff.ProviderAttempt()
++    daemon, sweep = _sweep_finishing_the_daemon(attempt, log, raise_after=True)
++    monkeypatch.setattr(agent_runtime_helpers, "force_close_tcp_sockets", sweep)
++    with pytest.raises(RuntimeError, match="sweep failed"):
++        with handoff.client_scope("client", lambda c: log.append("close")):
++            handoff.note_abandoned(attempt)
++    daemon.join(5)
++    assert not daemon.is_alive()
++    assert log == ["sweep-start", "sweep-end", "close"]
++
++
++def test_mixed_finished_and_reading_daemons_close_once_on_the_last_reader(monkeypatch):
++    """One daemon already finished (the owner runs its share), one still reading (deferred): nothing closes on
++    the owner thread; the still-reading daemon, finishing last, closes once."""
++    from agent import agent_runtime_helpers
++    log: list = []
++    finished, reading = handoff.ProviderAttempt(), handoff.ProviderAttempt()
++    finished.finish()
++    monkeypatch.setattr(agent_runtime_helpers, "force_close_tcp_sockets", lambda c: log.append("sweep") or 1)
++    with handoff.client_scope("client", lambda c: log.append("close")):
++        handoff.note_abandoned(finished)
++        handoff.note_abandoned(reading)
++    assert log == ["sweep"]
++    daemon = threading.Thread(target=reading.finish)
++    daemon.start()
++    daemon.join(5)
++    assert log == ["sweep", "close"]
++
++
+ def test_note_abandoned_outside_a_scope_is_a_no_op():
+     handoff.note_abandoned(handoff.ProviderAttempt())
+ 
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index 8ee9b7eb8c..64bb01ba91 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -155,6 +155,28 @@ processes currently holding the database (`<db> is held by PID <n> (<command>)`)
+ so you know what to stop; when the holder scan is partial or unavailable it says
+ `cannot prove the database is quiet` instead of giving an all-clear.
+ 
++## Logging
++
++Hermes writes rotating log files under `~/.hermes/logs/` (`agent.log` at
++`logging.level` and above, `errors.log` at WARNING and above):
++
++```yaml
++logging:
++  level: INFO            # minimum level for agent.log: DEBUG, INFO, WARNING
++  max_size_mb: 5         # rotate a log file once it reaches this size
++  backup_count: 3        # rotated backups to keep per file
++  debug_ssl_close: false # debug tripwire, see below
++```
++
++`logging.debug_ssl_close: true` installs a debug tripwire on `ssl.SSLSocket`:
++when one thread closes a TLS socket while another thread is still reading
++it, Hermes logs a WARNING with the closing thread's stack. Such a close frees
++the file descriptor under the reader's live TLS session; the kernel can then
++hand the number to the next file opened, and the reader's TLS alert lands in
++that file (for example a SQLite header). Leave it off unless you are chasing
++that class of bug: every TLS read pays a small Python-level wrapper while it
++is on. It is read when logging starts, so restart Hermes after changing it.
++
+ ## Environment Variable Substitution
+ 
+ You can reference environment variables in `config.yaml` using `${VAR_NAME}` syntax:
+-- 
+2.51.0
+

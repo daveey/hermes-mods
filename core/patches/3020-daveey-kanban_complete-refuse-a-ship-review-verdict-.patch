@@ -1,0 +1,328 @@
+From 38677ae2788888d0ad0deaf8710eae4afb838a7d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:07:39 +0000
+Subject: [PATCH] [daveey] kanban_complete: refuse a ship review verdict
+ recorded outside the card's dispatched worker run
+
+Defect agent-9eea612942 (recurrence agent-8a7de4b89f). Supervisor chat 20261111_090650_1247e7 completed ship
+review card t_01a1cce808ae7ea0 (PR #1133 @9b3f5ad0) itself with a subagent's verdict: run 29959 started and
+ended in the same second, no worker spawn, no reviewer session. `hermes-core-wt ship --review-task` refused it
+hours later ("its latest run did not complete; no completed review record"), and a fresh worker review had to be
+filed. The review-contract gate checked only the metadata shape, never who was completing.
+
+kanban_review_contract.independence_refusal: on a card whose body names a core-fork pull (states_contract
+implies it), a review result carrying a verdict key, completed by a caller with no dispatched worker run for the
+card (`_worker_run_id(tid)` is None), is refused with the new rejection class `review_independence`. Nothing
+changes on refusal. Wired into:
+- the kanban_complete tool, before the shape check and the parked_by_own_run override;
+- `hermes kanban complete` (it calls complete_task without the tool), --force included;
+- the dashboard "done" status verb (PATCH and bulk), which is never a worker run.
+Left alone: landing handoffs (published_pr), completions with no verdict key, cards naming no core-fork pull.
+No override flag: ship refuses these records regardless.
+
+Proof:
+- RED on 74b9347149f: 35 of the new tests fail (tool/CLI/dashboard outside approvals complete; helper absent).
+- GREEN: tests/tools/test_kanban_review_contract.py 112 passed; 44 kanban complete/review/CLI/dashboard test files,
+  970 passed.
+- Mutants (sdlc-review mutants.py, 13): every condition, the check order and each wiring site killed.
+- Replay (read-only, default-board replica, completed runs of the last 14 days): 6492 completed runs; 899 are
+  verdict-bearing review results on core-pull cards; 894 ran in a dispatched worker run (left alone); 5 were
+  recorded outside any worker run (0-second synthesized runs, no claim/spawn event) and would now be refused:
+  t_01a1a38501440acb, t_01a1a58d572f7641, t_01a1cce808ae7ea0 (the incident), t_01a1cd4cd17cafcb,
+  t_01a1cddfe6588648. All five are review cards.
+---
+ hermes_cli/kanban.py                       |   5 +
+ hermes_cli/kanban_review_contract.py       |  51 ++++++++
+ plugins/kanban/dashboard/plugin_api.py     |   5 +-
+ tests/tools/test_kanban_review_contract.py | 128 +++++++++++++++++++++
+ tools/kanban_tools.py                      |   8 +-
+ 5 files changed, 191 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index a5f6ce64b1..8474a21ad0 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -30,6 +30,7 @@ from hermes_cli import kanban_swarm as ks
+ from hermes_cli import kanban_workflow
+ from hermes_cli import kanban_contract_cli as _contract_cli
+ from hermes_cli import kanban_foreign_card as _foreign_card
++from hermes_cli import kanban_review_contract as _review_contract
+ from hermes_cli.kanban_cli_triage_lines import _decompose_ok_line, _retitled_suffix
+ from hermes_cli.kanban_cli_flags import (parse_branch_flag as _parse_branch_flag,
+                                          parse_workspace_flag as _parse_workspace_flag)
+@@ -1244,10 +1245,14 @@ def _cmd_complete(args: argparse.Namespace) -> int:
+                 fail_msg[tid] = f"cannot complete {tid}: {_foreign_card.REJECTION}: {foreign}"
+                 return False
+             try:
++                _review_contract.refuse_outside(conn, tid, metadata, _worker_run_id_for(tid))  # ship would refuse
+                 done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
+                                         goal_verification=verified[0] if verified else None,
+                                         expected_run_id=_worker_run_id_for(tid),
+                                         force=bool(getattr(args, "force", False)))
++            except _review_contract.IndependenceRefused as outside:  # --force does not override it [daveey]
++                fail_msg[tid] = f"cannot complete {tid}: {outside}"
++                return False
+             except kb.LiveClaimError:
+                 fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
+                                  f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
+diff --git a/hermes_cli/kanban_review_contract.py b/hermes_cli/kanban_review_contract.py
+index a05aa29f45..f92f202e17 100644
+--- a/hermes_cli/kanban_review_contract.py
++++ b/hermes_cli/kanban_review_contract.py
+@@ -19,6 +19,13 @@ This module catches that gap at completion time, while the reviewer can still fi
+   that only discusses the contract) are not review results and are left alone.
+ 
+ Ship itself is unchanged: it accepts no aliases and infers no sha.
++
++``independence_refusal`` closes the other half (defect agent-9eea612942): ship also accepts only a review completed
++by a dispatched reviewer run with its own session. A landing chat that completed the review card itself (with a
++subagent's verdict, from the CLI, or from the dashboard) left a record ship refuses hours later at land time
++("its latest run did not complete; no completed review record"). Such a completion is now refused when it is
++recorded: on a core-pull card, a verdict-bearing review result from a caller that is not the card's own dispatched
++worker run. No override: ship refuses the record regardless, so an override would only bring the defect back.
+ """
+ 
+ from __future__ import annotations
+@@ -29,6 +36,7 @@ from typing import Any, Optional
+ from hermes_cli.kanban_db_dispatch_pr_policy import BUILTIN_GITHUB_REPO_ALIASES
+ 
+ REJECTION = "review_contract"
++INDEPENDENCE_REJECTION = "review_independence"
+ VERDICTS = ("approve", "request_changes")
+ CORE_REPOS = frozenset(r.lower() for pair in BUILTIN_GITHUB_REPO_ALIASES.items() for r in pair)
+ _SHA40 = re.compile(r"[0-9a-f]{40}")
+@@ -115,3 +123,46 @@ def refusal(body: Optional[str], metadata: Any) -> Optional[str]:
+             + "; ".join(found) + ". Nothing changed: retry kanban_complete with the same summary and metadata "
+             "that also carries {\"verdict\": \"approve\" | \"request_changes\", \"reviewed_sha\": \"<40-hex head>\", "
+             "\"reviewed_pr\": \"https://github.com/<owner>/<repo>/pull/<n>\"}.")
++
++
++def independence_refusal(body: Optional[str], metadata: Any, worker_run_id: Optional[int]) -> Optional[str]:
++    """The refusal text for a ship review verdict recorded outside the card's own dispatched worker run, else None.
++
++    ``worker_run_id`` is the caller's dispatcher run id for this card (None for a chat, an orchestrator, the CLI or
++    the dashboard). A ship review card is one whose body names a core-fork pull (``states_contract`` implies it).
++    Landing handoffs (``published_pr``), completions with no verdict key and other cards are left alone.
++    """
++    if worker_run_id is not None:
++        return None
++    if not is_review_result(metadata) or not any(key in metadata for key in _VERDICT_KEYS):
++        return None
++    pull = core_pull(body)
++    if pull is None:
++        return None
++    return (f"this is a ship review card for {pull}; `hermes-core-wt ship` accepts only a review completed by a "
++            "dispatched reviewer run with its own session, so a completion recorded from this chat or the CLI would "
++            "be refused at land time ('no completed review record'). Leave the card for a worker to claim, or post "
++            "your findings as a kanban_comment. Nothing changed.")
++
++
++class IndependenceRefused(ValueError):
++    """``independence_refusal`` raised for the CLI and dashboard completion paths (a ValueError they surface)."""
++
++
++def completion_refusal(body: Optional[str], metadata: Any, worker_run_id: Optional[int]) -> Optional[tuple[str, str]]:
++    """``(message, rejection class)`` for the kanban_complete tool, else None. Independence is checked first: a
++    verdict recorded outside the card's worker run is worthless to ship whatever its shape, so fixing the shape from
++    the same caller must not be the advice."""
++    if outside := independence_refusal(body, metadata, worker_run_id):
++        return f"kanban_complete refused: {outside}", INDEPENDENCE_REJECTION
++    if unreadable := refusal(body, metadata):
++        return unreadable, REJECTION
++    return None
++
++
++def refuse_outside(conn, task_id: str, metadata: Any, worker_run_id: Optional[int]) -> None:
++    """Raise IndependenceRefused when ``independence_refusal`` refuses this completion of ``task_id``."""
++    from hermes_cli import kanban_db as kb
++    msg = independence_refusal(getattr(kb.get_task(conn, task_id), "body", None), metadata, worker_run_id)
++    if msg:
++        raise IndependenceRefused(f"{INDEPENDENCE_REJECTION}: {msg}")
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 6009765bc4..be0c5f0035 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -32,6 +32,7 @@ from fastapi.responses import FileResponse, Response
+ from pydantic import BaseModel, Field
+ 
+ from hermes_cli import kanban_db
++from hermes_cli import kanban_review_contract as _review_contract  # a dashboard "done" is never a worker run
+ from hermes_cli import kanban_workflow
+ from hermes_cli.web_read_coalescing import coalesced_read
+ from hermes_cli import kanban_db_connect as kbc
+@@ -689,8 +690,8 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
+ # payload) -> ok. ``review`` uses request_review (never a block, so it can't trip unblock-loop
+ # detection) and ``done`` pass ``force=True``: a dashboard action is a human override of a live worker claim.
+ _STATUS_HANDLERS: dict[str, Any] = {
+-    "done": lambda conn, tid, p: kanban_db.complete_task(
+-        conn, tid, result=p.result, summary=p.summary, metadata=p.metadata, force=True),
++    "done": lambda conn, tid, p: _review_contract.refuse_outside(conn, tid, p.metadata, None) or (  # [daveey]
++        kanban_db.complete_task(conn, tid, result=p.result, summary=p.summary, metadata=p.metadata, force=True)),
+     "blocked": lambda conn, tid, p: kanban_db.block_task(
+         conn, tid, kind=p.block_kind, human_request=p.human_request,
+         reason=p.block_reason, wake_check=p.wake_check,
+diff --git a/tests/tools/test_kanban_review_contract.py b/tests/tools/test_kanban_review_contract.py
+index c57d29bdcb..1a97610e87 100644
+--- a/tests/tools/test_kanban_review_contract.py
++++ b/tests/tools/test_kanban_review_contract.py
+@@ -289,3 +289,131 @@ def test_tool_leaves_cards_without_contract_alone(board, monkeypatch):
+     out = _complete({"review_verdict": "approve", "reviewed_head": "abc"})
+     assert not out.get("error"), out
+     assert _status(board, tid) == "done"
++
++
++# --- independence: a ship review verdict recorded outside the card's dispatched worker run (agent-9eea612942) ---
++# Chat 20261111_090650_1247e7 completed review card t_01a1cce808ae7ea0 (PR #1133) itself with a subagent's verdict:
++# run 29959 started and ended in the same second, no worker session. Ship refused it hours later ("its latest run
++# did not complete; no completed review record"). The completion is now refused when it is recorded.
++
++@pytest.mark.parametrize("body", [SHIP_BODY, MISNAMED_BODY, HEAD_BODY, PR_KEY_BODY],
++                         ids=["ship", "misnamed", "head", "pr_key"])
++@pytest.mark.parametrize("md", [GOOD, {**GOOD, "verdict": "request_changes"}, dict(PR_KEY_MD),
++                                {"review_verdict": "approve", "reviewed_sha": SHA}, {"approved": True}],
++                         ids=["approve", "request_changes", "pr_key", "review_verdict", "approved"])
++def test_independence_refuses_outside_verdict_on_ship_review(body, md):
++    msg = krc.independence_refusal(body, md, None) or ""
++    assert msg.startswith(f"this is a ship review card for {krc.core_pull(body)}; `hermes-core-wt ship` accepts only")
++    assert "no completed review record" in msg and "kanban_comment" in msg
++    assert krc.independence_refusal(body, md, 7) is None  # the card's own dispatched worker run
++
++
++@pytest.mark.parametrize("body,md", [
++    (SHIP_BODY, {"published_pr": PR, "verdict": "approve", "reviewed_sha": SHA, "reviewed_pr": PR}),  # landing
++    (SHIP_BODY, {"reviewed_sha": SHA, "reviewed_pr": PR, "landed_sha": SHA}),  # no verdict key
++    (PR_KEY_BODY, LANDING_MDS[0]),
++    (SHIP_BODY, {"changed_files": ["a.py"]}), (SHIP_BODY, {}), (SHIP_BODY, None),
++    ("Fix the sidebar scroll.", dict(GOOD)),  # not a ship review card
++    (PR_KEY_BODY.replace(PR_KEY_PULL, "https://github.com/me/myapp/pull/3730"), dict(PR_KEY_MD)),
++    (None, dict(GOOD)),
++], ids=["landing", "no_verdict", "pr_key_landing", "no_review_key", "empty", "none", "not_ship", "myapp", "no_body"])
++def test_independence_leaves_non_reviews_alone(body, md):
++    assert krc.independence_refusal(body, md, None) is None
++
++
++def _outside_card(kb, body):
++    """A ready card nobody claimed: the shape t_01a1cce808ae7ea0 had when the chat completed it."""
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect() as conn:
++        return kb.create_task(conn, title="Independent exact-head review PR1349", body=body, assignee="test-worker")
++
++
++def _runs(kb, tid):
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect() as conn:
++        return conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (tid,)).fetchone()[0]
++
++
++@pytest.mark.parametrize("body", [SHIP_BODY, PR_KEY_BODY], ids=["contract", "core_pull"])
++def test_tool_refuses_outside_approval_on_ship_review(board, body):
++    from tools import kanban_tools as kt
++    tid = _outside_card(board, body)
++    md = {**PR_KEY_MD, "reviewed_pr": PR_KEY_PULL} if body is PR_KEY_BODY else dict(GOOD)
++    out = json.loads(kt._handle_complete({"task_id": tid, "summary": "APPROVE (subagent verdict)", "metadata": md}))
++    assert out.get("error") and out["rejection"] == "review_independence", out
++    assert out["rejection"] in kt.COMPLETE_REJECTION_CLASSES
++    assert "accepts only a review completed by a dispatched reviewer run" in out["error"]
++    assert _status(board, tid) == "ready" and _runs(board, tid) == 0  # nothing changed
++
++
++def test_tool_outside_independence_precedes_shape_refusal(board):
++    from tools import kanban_tools as kt
++    tid = _outside_card(board, MISNAMED_BODY)
++    md = {"review_verdict": "approve", "reviewed_sha": SHA, "reviewed_pr": PR}  # also unreadable by ship
++    out = json.loads(kt._handle_complete({"task_id": tid, "summary": "APPROVE", "metadata": md}))
++    assert out["rejection"] == "review_independence", out
++
++
++def test_tool_dispatched_worker_completes_same_card(board, monkeypatch):
++    tid = _claim(board, monkeypatch, SHIP_BODY)
++    out = _complete(dict(GOOD))
++    assert not out.get("error"), out
++    assert _status(board, tid) == "done"
++
++
++@pytest.mark.parametrize("body,md", [
++    ("Fix the sidebar scroll. Done when its tests pass.", dict(GOOD)),  # not a ship review card
++    (PR_KEY_BODY, dict(LANDING_MDS[0])),  # a verdictless landing handoff on a core-pull card
++    (SHIP_BODY, {"changed_files": ["a.py"]}),  # no review key at all
++], ids=["not_ship", "verdictless_landing", "no_review_key"])
++def test_tool_outside_non_review_completions_still_complete(board, body, md):
++    from tools import kanban_tools as kt
++    tid = _outside_card(board, body)
++    out = json.loads(kt._handle_complete({"task_id": tid, "summary": "Closed from the chat", "metadata": md}))
++    assert not out.get("error"), out
++    assert _status(board, tid) == "done"
++
++
++def _cli_complete(tid, md, force=False):
++    import argparse
++    from hermes_cli import kanban as cli
++    return cli._cmd_complete(argparse.Namespace(task_ids=[tid], summary="APPROVE (subagent verdict)", result=None,
++                                                metadata=json.dumps(md), force=force))
++
++
++@pytest.mark.parametrize("force", [False, True])
++def test_cli_refuses_outside_approval_on_ship_review(board, capsys, force):
++    tid = _outside_card(board, SHIP_BODY)
++    assert _cli_complete(tid, dict(GOOD), force=force) != 0
++    assert "review_independence" in capsys.readouterr().err
++    assert _status(board, tid) == "ready" and _runs(board, tid) == 0
++
++
++def test_cli_outside_non_review_completion_still_completes(board):
++    tid = _outside_card(board, PR_KEY_BODY)
++    assert _cli_complete(tid, dict(LANDING_MDS[0])) == 0
++    assert _status(board, tid) == "done"
++
++
++def test_cli_from_the_cards_dispatched_worker_completes(board, monkeypatch):
++    tid = _claim(board, monkeypatch, SHIP_BODY)  # HERMES_KANBAN_TASK + HERMES_KANBAN_RUN_ID name this card's run
++    assert _cli_complete(tid, dict(GOOD)) == 0
++    assert _status(board, tid) == "done"
++
++
++def test_dashboard_done_refuses_outside_approval_on_ship_review(board):
++    from types import SimpleNamespace
++    from hermes_cli import kanban_db_connect as kbc
++    from plugins.kanban.dashboard import plugin_api
++    done = plugin_api._STATUS_HANDLERS["done"]
++    tid = _outside_card(board, SHIP_BODY)
++    with kbc.connect() as conn:
++        with pytest.raises(ValueError, match="review_independence"):
++            done(conn, tid, SimpleNamespace(result=None, summary="APPROVE", metadata=dict(GOOD)))
++        assert kb_status(board, conn, tid) == "ready"
++        assert done(conn, tid, SimpleNamespace(result="closed", summary="closed", metadata={"note": "x"}))
++        assert kb_status(board, conn, tid) == "done"
++
++
++def kb_status(kb, conn, tid):
++    return kb.get_task(conn, tid).status
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 144f8e3e1f..c966ea6a35 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -165,6 +165,7 @@ COMPLETE_REJECTION_CLASSES = frozenset({
+     "not_running",    # card waits (scheduled/todo/ready) with no run: archive it or re-park it as a watch [daveey]
+     "foreign_card",   # card exists here only as a Board replica copy; its owner gateway must write it [daveey]
+     "review_contract",  # ship review card completed without metadata ship can read [daveey]
++    "review_independence",  # ship review verdict recorded outside the card's dispatched worker run [daveey]
+     "pr_acceptance",  # completion contract's PR CI acceptance refused (pr_acceptance event ok=false)
+     "parents",        # unsatisfied parent dependencies
+     "not_owner",      # delegate child / other task / unbound run id
+@@ -899,10 +900,9 @@ def _handle_complete(args: dict, **kw) -> str:
+         # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
+         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
+         task = kb.get_task(conn, tid)
+-        from hermes_cli import kanban_review_contract as _krc  # [daveey] a review ship cannot read: fix it now
+-        unreadable = _krc.refusal(getattr(task, "body", None), metadata)
+-        if unreadable:
+-            raise _Reject(unreadable, _krc.REJECTION)
++        from hermes_cli import kanban_review_contract as _krc  # [daveey] a review ship would refuse: refuse it now
++        if refused := _krc.completion_refusal(getattr(task, "body", None), metadata, _worker_run_id(tid)):
++            raise _Reject(*refused)
+         goal_verification = _goal_gate("kanban_complete", task, tid, (summary or result or "").strip(), conn=conn)
+         try:
+             run_id = _worker_run_id(tid)
+-- 
+2.51.0
+

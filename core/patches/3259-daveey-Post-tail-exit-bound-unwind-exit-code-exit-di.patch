@@ -1,0 +1,307 @@
+From 83e790022f03fb1e1715f1134e9831e868f92278 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:55:40 +0000
+Subject: [PATCH] [daveey] Post-tail exit bound: unwind exit code, exit-diag
+ record, funnel hand-back
+
+Follow-up to PR #1949's review nits (t_01a1d3dde703d02f):
+
+1. The shutdown tail runs in start_gateway's finally. When runner.stop() or
+   wait_gateway_runtime raised, it still armed the bound with its verdict
+   (maybe 0), while the escaping exception makes the process exit 1 (or the
+   SystemExit's code). The tail now reads the active exception and arms the
+   bound with that code.
+2. A bound exit skips `hermes gateway run`'s asyncio.run.returned /
+   gateway.exit_clean / nonzero_exit_record records. The watcher writes a
+   gateway.post_tail_bound exit-diag record (warning: exit code, seconds
+   over the target, target reason, phase marks) before taking the funnel.
+3. When the bound's funnel raised, it handed the exit back by clearing
+   exit_owner, but a main thread already parked in enter_exit_funnel waited
+   on a private Event forever (only the hard deadline exited). The funnel
+   now parks on a module _handback event that the watcher sets on failure,
+   then retries the disarm.
+
+Tests: tests/gateway/test_update_exit_target.py (unwind code for an
+exception and SystemExit(75), record written before the funnel, parked
+funnel wakes on hand-back) and tests/gateway/test_exit_deadline.py
+(subprocess: a checkpointed stop with a wedged executor exits through the
+bound with a gateway.post_tail_bound record). 5 new tests fail on base,
+pass on head.
+---
+ gateway/exit_deadline.py                 | 23 ++++++--
+ gateway/run_bootstrap.py                 | 16 +++++-
+ hermes_cli/gateway_exit_diag.py          |  3 +-
+ tests/gateway/test_exit_deadline.py      | 27 ++++++++-
+ tests/gateway/test_update_exit_target.py | 70 ++++++++++++++++++++++++
+ 5 files changed, 130 insertions(+), 9 deletions(-)
+
+diff --git a/gateway/exit_deadline.py b/gateway/exit_deadline.py
+index 402bf8d70e..b34f04044c 100644
+--- a/gateway/exit_deadline.py
++++ b/gateway/exit_deadline.py
+@@ -43,6 +43,9 @@ DRAIN_DB_PATIENCE_S = 2.0
+ 
+ _lock = threading.Lock()
+ _done = threading.Event()
++# Set when the post-tail bound's exit funnel failed and it gave the exit back: wakes a main thread
++# already parked in enter_exit_funnel so it runs the funnel itself.
++_handback = threading.Event()
+ _state: dict[str, Any] = {}
+ 
+ 
+@@ -51,6 +54,7 @@ def _reset_for_tests() -> None:
+     with _lock:
+         _state.clear()
+         _done.clear()
++        _handback.clear()
+ 
+ 
+ def margin_for(budget_s: float) -> float:
+@@ -150,16 +154,24 @@ def bound_post_tail(exit_code: int, exit_fn: Callable[[int], None], *,
+                 return
+             _state["exit_owner"] = threading.get_ident()  # the main thread's funnel now parks (disarm)
+         mark_phase("post_tail_bound")
++        over_s = round(time.monotonic() - target, 3)
+         with contextlib.suppress(Exception):
+             logger.warning("Shutdown still running %.1fs after the core update exit target (%s): asyncio.run "
+                            "shutdown / outer finally did not finish; exiting %s now (phase marks: %s)",
+-                           time.monotonic() - target, _state.get("target_reason"), exit_code, phases())
++                           over_s, _state.get("target_reason"), exit_code, phases())
++        # This exit skips the caller's own records (`hermes gateway run`: asyncio.run.returned,
++        # gateway.exit_clean / nonzero_exit_record), so the exit-diag log gets one of its own.
++        with contextlib.suppress(Exception):
++            from hermes_cli.gateway_exit_diag import make_exit_diag
++            make_exit_diag()("gateway.post_tail_bound", exit_code=exit_code, over_target_s=over_s,
++                             target_reason=_state.get("target_reason"), phases=phases())
+         try:
+             exit_fn(exit_code)
+         except Exception:  # health: allow BLE001 -- hand the exit back to the main thread's funnel
+             logger.exception("Post-tail exit bound: the exit funnel failed")
+             with _lock:
+                 _state.pop("exit_owner", None)
++            _handback.set()  # a main thread parked in enter_exit_funnel wakes and runs the funnel
+ 
+     try:
+         threading.Thread(target=_watch, daemon=True, name=POST_TAIL_THREAD_NAME).start()
+@@ -280,11 +292,12 @@ def disarm() -> bool:
+ 
+ def enter_exit_funnel() -> None:
+     """The graceful exit funnel's disarm: marks ``exit_funnel`` and disarms. When the post-tail bound
+-    already took the exit on another thread, the caller parks for good instead: that thread is running
+-    the same funnel and ``os._exit``s."""
++    already took the exit on another thread, the caller parks instead: that thread is running the same
++    funnel and ``os._exit``s. If that funnel fails, the bound gives the exit back and the caller wakes
++    and runs it."""
+     mark_phase("exit_funnel")
+-    if not disarm():
+-        threading.Event().wait()
++    while not disarm():
++        _handback.wait()
+ 
+ 
+ def _exit_diag_record() -> dict[str, Any]:
+diff --git a/gateway/run_bootstrap.py b/gateway/run_bootstrap.py
+index 4e604c1980..ebc9ce660d 100644
+--- a/gateway/run_bootstrap.py
++++ b/gateway/run_bootstrap.py
+@@ -2,6 +2,7 @@
+ from __future__ import annotations
+ 
+ import logging
++import sys
+ import threading
+ import time
+ from pathlib import Path
+@@ -527,6 +528,9 @@ async def _start_gateway_shutdown_tail(
+     """Post-``wait_for_shutdown`` teardown; returns the process exit verdict (True = exit 0)."""
+     from gateway.run import (_CRON_SHUTDOWN_DRAIN_TIMEOUT, _HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT, _await_thread_exit, _best_effort, _resolve_gateway_exit_verdict, _shutdown_mcp_servers_nonblocking, _stop_cron_provider, exit_deadline)
+     tail_started = time.monotonic()
++    # The tail runs in start_gateway's finally: an active exception here means runner.stop() or
++    # wait_gateway_runtime raised, so the process exits with that exception's code, not the verdict.
++    unwinding = sys.exc_info()[1]
+     exit_deadline.mark_phase("tail_start")  # the slow-tail line's phase marks count from the stop's start
+     # Control socket first: once shutdown begins we are no longer a truthful "serving here" answer and a
+     # successor must be able to bind. Early-exit paths rely on the atexit cleanup_files hook instead.
+@@ -590,10 +594,20 @@ async def _start_gateway_shutdown_tail(
+         exit_deadline.bound_post_tail(
+             0 if exc.code is None else exc.code if isinstance(exc.code, int) else 1, _exit_after_graceful_shutdown)
+         raise
+-    exit_deadline.bound_post_tail(0 if verdict else 1, _exit_after_graceful_shutdown)
++    exit_deadline.bound_post_tail(
++        _unwind_exit_code(unwinding) if unwinding is not None else 0 if verdict else 1,
++        _exit_after_graceful_shutdown)
+     return verdict
+ 
+ 
++def _unwind_exit_code(exc: BaseException) -> int:
++    """The code the process exits with once ``exc`` escapes ``asyncio.run``: main() routes a SystemExit's
++    code through the funnel, and any other exception is uncaught (1)."""
++    if isinstance(exc, SystemExit):
++        return 0 if exc.code is None else exc.code if isinstance(exc.code, int) else 1
++    return 1
++
++
+ 
+ def _launch_home_may_multiplex(config=None) -> bool:
+     """A named profile serving ``default`` as a secondary splits default's local sessions between
+diff --git a/hermes_cli/gateway_exit_diag.py b/hermes_cli/gateway_exit_diag.py
+index e266518675..e42551ec61 100644
+--- a/hermes_cli/gateway_exit_diag.py
++++ b/hermes_cli/gateway_exit_diag.py
+@@ -19,8 +19,9 @@ from datetime import UTC, datetime
+ # non-zero return is a warning; only an escaped exception or a failing SystemExit is an error.
+ # [daveey] gateway.launchd_budget_missing: a darwin --external-supervisor gateway could not read launchd's live
+ # ExitTimeOut and assumed the gui clamp (gateway-cc28b19bca); the coach files it as a defect.
++# gateway.post_tail_bound: shutdown ran past a core update's exit target and the bound took the exit.
+ _TAG_LEVELS = {"asyncio.run.exception": "error", "gateway.exit_nonzero": "warning",
+-               "gateway.launchd_budget_missing": "warning"}
++               "gateway.launchd_budget_missing": "warning", "gateway.post_tail_bound": "warning"}
+ 
+ 
+ def _record_level(tag: str, extra: dict[str, object]) -> str:
+diff --git a/tests/gateway/test_exit_deadline.py b/tests/gateway/test_exit_deadline.py
+index 7542ceda2f..dbbcaa9fc1 100644
+--- a/tests/gateway/test_exit_deadline.py
++++ b/tests/gateway/test_exit_deadline.py
+@@ -37,6 +37,7 @@ _CHILD = textwrap.dedent(
+     from gateway.lifecycle_ledger import record_startup
+ 
+     BLOCK_EXECUTOR = {block_executor!r}
++    EXIT_TARGET_S = {exit_target_s!r}  # a core update checkpoint's exit target, set at the stop
+ 
+     class Runner:
+         _signal_initiated_shutdown = False
+@@ -77,6 +78,9 @@ _CHILD = textwrap.dedent(
+             loop.run_in_executor(None, time.sleep, 60)
+         print("READY", flush=True)
+         await runner.wait_for_shutdown()
++        if EXIT_TARGET_S is not None:
++            gr.exit_deadline.POST_TAIL_GRACE_S = 0.5
++            gr.exit_deadline.set_exit_target(time.monotonic() + EXIT_TARGET_S, "test checkpoint")
+         return await gr._start_gateway_shutdown_tail(
+             runner, None, cron_stop, None, cron_thread, housekeeping, pw_stop, pw_thread, sig)
+ 
+@@ -91,11 +95,12 @@ _CHILD = textwrap.dedent(
+ )
+ 
+ 
+-def _spawn(tmp_path: Path, *, block_executor: bool) -> tuple[subprocess.Popen, Path]:
++def _spawn(tmp_path: Path, *, block_executor: bool,
++           exit_target_s: float | None = None) -> tuple[subprocess.Popen, Path]:
+     home = tmp_path / "home"
+     (home / "logs").mkdir(parents=True)
+     script = tmp_path / "child.py"
+-    script.write_text(_CHILD.format(repo=str(REPO), block_executor=block_executor))
++    script.write_text(_CHILD.format(repo=str(REPO), block_executor=block_executor, exit_target_s=exit_target_s))
+     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST")}
+     env.pop("INVOCATION_ID", None)  # never read the real unit's TimeoutStopSec
+     env.update(HERMES_HOME=str(home), HERMES_GATEWAY_EXIT_BUDGET_S=str(_BUDGET_S),
+@@ -169,6 +174,24 @@ def test_slow_cron_wait_is_clamped_and_exit_stays_graceful(tmp_path):
+     assert not [r for r in _exit_diag(home) if r.get("tag") == "gateway.exit_deadline"]
+ 
+ 
++def test_post_tail_bound_exit_leaves_an_exit_diag_record(tmp_path):
++    """A core update's exit target set, then a wedged executor join after the tail: the post-tail bound
++    takes the exit (graceful, before the hard deadline) and, since that exit skips the caller's own
++    asyncio.run.returned / exit_clean records, writes a gateway.post_tail_bound exit-diag record."""
++    proc, home = _spawn(tmp_path, block_executor=True, exit_target_s=0.2)
++    elapsed = _stop_and_time(proc)
++    assert elapsed < _EXIT_WITHIN_S, f"gateway still alive {elapsed:.1f}s after SIGTERM (budget {_BUDGET_S}s)"
++    assert _ledger(home)["exit_reason"] == "graceful_shutdown"
++    records = _exit_diag(home)
++    assert not [r for r in records if r.get("tag") == "gateway.exit_deadline"]
++    bound = [r for r in records if r.get("tag") == "gateway.post_tail_bound"]
++    assert bound, records
++    assert bound[0]["exit_code"] == proc.returncode
++    assert bound[0]["level"] == "warning"
++    assert bound[0]["target_reason"] == "test checkpoint"
++    assert "tail_done" in bound[0]["phases"]
++
++
+ def test_routing_save_uses_short_patience_while_exiting(tmp_path, monkeypatch):
+     """While the gateway is exiting, a routing save blocked by another state.db writer gives up
+     after the short drain patience (not the 20s default) and falls back to sessions.json."""
+diff --git a/tests/gateway/test_update_exit_target.py b/tests/gateway/test_update_exit_target.py
+index 154cd94908..640ce0ecbe 100644
+--- a/tests/gateway/test_update_exit_target.py
++++ b/tests/gateway/test_update_exit_target.py
+@@ -260,6 +260,76 @@ def test_exit_funnel_parks_the_main_thread_once_the_bound_owns_the_exit():
+     assert not exit_deadline._done.is_set()
+ 
+ 
++@pytest.mark.parametrize(("raised", "code"), [
++    (RuntimeError("runner.stop() failed"), 1),  # escapes asyncio.run uncaught: exit 1
++    (SystemExit(75), 75),  # main() routes the SystemExit's code through the funnel
++])
++def test_post_tail_bound_takes_the_unwinding_exception_code(monkeypatch, raised, code):
++    """runner.stop() / wait_gateway_runtime raised: the tail still runs in start_gateway's finally and
++    resolves a clean verdict, but the process exits with the exception's code, so the bound must too."""
++    exits: list = []
++    env = _fake_tail_env(monkeypatch, exits)
++    monkeypatch.setattr(exit_deadline, "POST_TAIL_GRACE_S", 0.2)
++    exit_deadline.set_exit_target(time.monotonic() + 0.3, "test")
++    runner = MagicMock(exit_reason=None, should_exit_with_failure=False, exit_code=None,
++                       _restart_via_service=False)
++
++    from gateway.run_bootstrap import _start_gateway_shutdown_tail
++
++    async def start_gateway_finally():
++        try:
++            raise raised
++        finally:
++            await _start_gateway_shutdown_tail(runner, None, *env, [False])
++
++    with pytest.raises(type(raised)):
++        asyncio.run(start_gateway_finally())
++    wait_until(lambda: exits, timeout=5.0, what="the post-tail bound to take the exit")
++    assert exits[0][0] == code
++
++
++def test_post_tail_bound_writes_an_exit_diag_record_before_the_funnel(monkeypatch, tmp_path):
++    """The bound's exit skips `hermes gateway run`'s asyncio.run.returned / exit_clean records."""
++    import json
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_GATEWAY_EXIT_DIAG", "1")
++    diag = tmp_path / "logs" / "gateway-exit-diag.log"
++    seen: list = []
++    exit_deadline._state.update(started_mono=time.monotonic())
++    exit_deadline.set_exit_target(time.monotonic() + 0.1, "core update checkpoint")
++    assert exit_deadline.bound_post_tail(
++        1, lambda code: seen.append([json.loads(line) for line in diag.read_text().splitlines()]), grace_s=0.1)
++    wait_until(lambda: seen, timeout=5.0, what="the post-tail bound to take the exit")
++    records = [r for r in seen[0] if r["tag"] == "gateway.post_tail_bound"]
++    assert len(records) == 1, seen[0]
++    assert records[0]["exit_code"] == 1 and records[0]["level"] == "warning"
++    assert records[0]["target_reason"] == "core update checkpoint"
++    assert "post_tail_bound" in records[0]["phases"] and records[0]["over_target_s"] >= 0
++
++
++def test_exit_funnel_wakes_when_the_bound_hands_the_exit_back():
++    """The bound took the exit, the main thread parked in the funnel, then the bound's funnel failed:
++    the parked main thread wakes and runs the funnel instead of waiting for the hard deadline."""
++    owned, release = threading.Event(), threading.Event()
++
++    def failing_funnel(_code):
++        owned.set()
++        release.wait(5)
++        raise RuntimeError("funnel failed")
++
++    exit_deadline.set_exit_target(time.monotonic() + 0.05, "test")
++    assert exit_deadline.bound_post_tail(0, failing_funnel, grace_s=0.05)
++    wait_until(owned.is_set, timeout=5.0, what="the post-tail bound to take the exit")
++    funnel = threading.Thread(target=exit_deadline.enter_exit_funnel, daemon=True)
++    funnel.start()
++    funnel.join(0.3)
++    assert funnel.is_alive()  # parked while the bound owns the exit
++    release.set()
++    funnel.join(5)
++    assert not funnel.is_alive()  # handed back: the main thread now owns the exit
++    assert exit_deadline._done.is_set()
++
++
+ def test_exit_funnel_marks_its_phase(monkeypatch):
+     exit_deadline._state.update(started_mono=time.monotonic() - 2.0)
+     monkeypatch.setattr(gateway_run, "_best_effort", lambda step, *a, **k: None)
+-- 
+2.51.0
+
