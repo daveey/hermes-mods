@@ -3525,6 +3525,7 @@ def session_owned_cards(session_id: Optional[str], since: float, home: Optional[
             cols = {c[1] for c in db.execute("PRAGMA table_info(tasks)")}
             body = "substr(body, 1, 4000)" if "body" in cols else "NULL"
             ikey = "idempotency_key" if "idempotency_key" in cols else "NULL"
+            done_at = "completed_at" if "completed_at" in cols else "NULL"
             # Fix metadata (a landed commit or published PR on the card's result or any run): ranks owners
             runs = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'").fetchone()
             fixes = ["result LIKE '%landed_sha%'", "result LIKE '%published_pr%'"] if "result" in cols else []
@@ -3533,12 +3534,13 @@ def session_owned_cards(session_id: Optional[str], since: float, home: Optional[
                              "(r.metadata LIKE '%landed_sha%' OR r.metadata LIKE '%published_pr%'))")
             fix = "(" + " OR ".join(fixes) + ")" if fixes else "0"
             for r in db.execute(
-                    f"SELECT id, title, status, created_at, {body}, {ikey}, {fix} FROM tasks WHERE status IN ({marks}) "
+                    f"SELECT id, title, status, created_at, {body}, {ikey}, {fix}, {done_at} FROM tasks "
+                    f"WHERE status IN ({marks}) "
                     "AND created_at >= ? "
                     "AND (session_id = ? OR id IN (SELECT task_id FROM kanban_notify_subs WHERE chat_id = ?))",
                     (*ADOPT_STATUSES, int(since), session_id, session_id)):
                 rows.append({"id": r[0], "title": r[1], "status": r[2], "created_at": r[3], "board": board,
-                             "body": r[4], "idempotency_key": r[5], "fix_meta": bool(r[6])})
+                             "body": r[4], "idempotency_key": r[5], "fix_meta": bool(r[6]), "completed_at": r[7]})
         except sqlite3.Error:
             pass
         finally:
@@ -3916,6 +3918,52 @@ def _card_names_fingerprint(card: dict, fp: str) -> bool:
     return bool(fp) and fp.lower() in text
 
 
+# The session-owner rule a lane's adoption was judged by (lane field `adopt_rule`). Bump it whenever
+# session_owner_refusal gets stricter: reconcile re-judges every approved session adoption made under an older rule
+# before it waits on, or files a VERIFY for, that owner. f83c4186 tightened the rule but left the lanes it had
+# already approved alone, so six adoptions made before it (agent-9506714e63, cron-c6a6e6bc09, agent-6a8134f494,
+# agent-1a84ca4de2, kanban-625e9af794, agent-4f525369e7) still drew VERIFY cards against unrelated owners on 11-12.
+ADOPT_RULE = 2
+REFUSE_SUBJECT = "the complaint is about this card"
+REFUSE_PROCESS = "another lane's investigation/VERIFY card"
+REFUSE_NO_EVIDENCE = "no subject evidence"
+REFUSE_FINISHED_BEFORE = "finished before the complaint"
+REFUSE_REJECTED = "rejected as this lane's owner before"
+
+
+def _finished_before_complaint(card: dict, d: dict) -> bool:
+    """The card was already done when the complaint was raised: it cannot be the answer to it (agent-6a8134f494,
+    "hub-only placement rationale insufficiently audited" at 18:49Z, took the placement-marker audit that finished
+    at 17:37Z because its title shares "hub-only"/"audit"). A card done after the complaint, or with no completion
+    time, is judged on its words alone."""
+    at = d.get("complaint_at") or d.get("at")
+    try:
+        done = float(card.get("completed_at") or 0)
+        return bool(done) and at is not None and done < float(at)
+    except (TypeError, ValueError):
+        return False
+
+
+def session_owner_refusal(card: dict, d: dict, fp: str, subject: Optional[set] = None, process: Optional[set] = None,
+                          rejected: Optional[set] = None) -> Optional[str]:
+    """Why `card`, which shares the defect's origin session, is NOT its owner (None = it may be). Sharing a long
+    session is never evidence by itself: the card must name the defect (card_names_defect) or answer the complaint
+    (card_answers_complaint), must not be what the complaint is about, another lane's process card, already finished
+    when the complaint came in, or an owner this lane rejected before."""
+    cid = card.get("id")
+    if cid in (rejected or ()):
+        return REFUSE_REJECTED
+    if cid in (subject or ()):
+        return REFUSE_SUBJECT
+    if cid in (process or ()) and not _card_names_fingerprint(card, fp):
+        return REFUSE_PROCESS
+    if _finished_before_complaint(card, d):
+        return REFUSE_FINISHED_BEFORE
+    if not (card_names_defect(card, d, fp) or card_answers_complaint(card, d)):
+        return REFUSE_NO_EVIDENCE
+    return None
+
+
 def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[Callable] = None) -> Optional[dict]:
     """If the defect's origin session created/subscribed an active card after the complaint that names the defect
     (card_names_defect or card_answers_complaint; never the card the complaint is about, never another lane's
@@ -3962,18 +4010,20 @@ def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[
     # that lane's fix and implements nothing: desktop-727bbca8b8).
     subject = _defect_subject_cards(d) | _filer_cards(d)
     process = _lane_process_cards(store, fp)
+    rejected = set(LaneState(store.root).get(fp).get("rejected_owners") or [])
     # A fix card often names the root cause, not the symptom ("state.db ... latch" for "archiving a session
     # repeatedly fails"): its body naming the session the complaint is about counts as subject evidence too.
-    named = [x for x in cards
-             if x["id"] not in subject and (card_names_defect(x, d, fp) or card_answers_complaint(x, d))
-             and (x["id"] not in process or _card_names_fingerprint(x, fp))]
+    verdicts = {x["id"]: session_owner_refusal(x, d, fp, subject, process, rejected) for x in cards}
+    named = [x for x in cards if not verdicts[x["id"]]]
     if not named:
         store.log({"event": "selfheal_adopt_skipped", "why": "no session card names the defect",
                    "fingerprint": fp, "session_id": sid, "source": d.get("source"),
                    "terms": sorted(_subject_words(d.get("symptom")))[:12],
                    "candidates": [x["id"] for x in cards],
                    "subject_cards": [x["id"] for x in cards if x["id"] in subject],
-                   "process_cards": [x["id"] for x in cards if x["id"] in process]})
+                   "process_cards": [x["id"] for x in cards if x["id"] in process],
+                   "finished_before": [x["id"] for x in cards if verdicts[x["id"]] == REFUSE_FINISHED_BEFORE],
+                   "rejected_owners": [x["id"] for x in cards if x["id"] in rejected]})
         return None
     # Most relevant first, never simply the newest: the origin session keeps filing unrelated work after the complaint
     # (desktop-40fef7fbb1 took an instant-update activation card filed 4 h later over the state.db latch fix).
@@ -3983,7 +4033,8 @@ def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[
     st = lane.get(fp)
     lane.update(fp, status="approved", fix_card=c["id"], approved_at=now, component=d.get("component"),
                 symptom=d.get("symptom"), session_id=sid, board=c.get("board"), filed_day=_utc_day(now),
-                cards=sorted(known_cards(st) | {c["id"]}), **_complaint_identity(d))
+                cards=sorted(known_cards(st) | {c["id"]}), adopt_via="session", adopt_card=c["id"],
+                adopt_rule=ADOPT_RULE, **_complaint_identity(d))
     store.log({"event": "selfheal_adopted_owner", "fingerprint": fp, "card": c["id"], "status": c.get("status"),
                "board": c.get("board"), "session_id": sid, "candidates": [x["id"] for x in cards]})
     return {"action": "skip", "why": f"adopted owner card {c['id']} from session {sid}", "card": c["id"],
@@ -5686,11 +5737,131 @@ def reconcile(store=None, runner=None, now: Optional[float] = None) -> list:
     now = now or time.time()
     lane = LaneState(store.root)
     done = []
-    for fp, st in lane.read().items():
-        what = _reconcile_fp(lane, store, fp, st, runner, now)
+    lanes = lane.read()
+    legacy = {fp for fp, st in lanes.items() if _adoption_unmarked(st)}
+    recs = _adoption_log_records(store, legacy) if legacy else {}
+    for fp, st in lanes.items():
+        try:
+            if fp in legacy:
+                rec = recs.get(fp) or {}
+                via = rec.get("via") if rec.get("card") == st.get("fix_card") else None
+                st = lane.update(fp, adopt_card=st.get("fix_card"), adopt_via=via or "unknown",
+                                 adopt_rule=st.get("adopt_rule") or (1 if via == "session" else None))
+            what = _revalidate_adoption(lane, store, fp, st, runner, now, (recs.get(fp) or {}).get("detect"))
+        except Exception as exc:  # health: allow BLE001 -- advisory re-judgement; the receipt path below still runs
+            store.log({"event": "selfheal_adoption_revalidate_error", "fingerprint": fp, "error": str(exc)[:200]})
+            what = None
+        if not what:
+            what = _reconcile_fp(lane, store, fp, lane.get(fp) if fp in legacy else st, runner, now)
         if what:
             done.append((fp, what))
     return done
+
+
+def _adoption_unmarked(st: dict) -> bool:
+    """An approved lane waiting on an owner whose adoption path the lane never recorded (adopted before ADOPT_RULE
+    2): reconcile looks it up in the log once and stores it (adopt_card/adopt_via)."""
+    return bool(st.get("status") == "approved" and st.get("fix_card") and not st.get("verify_card")
+                and st.get("adopt_card") != st.get("fix_card"))
+
+
+def _adoption_log_records(store, fps: set) -> dict:
+    """One pass over log.jsonl for `fps`: fp -> {via, card} of its newest selfheal_adopted_owner row (via "session"
+    when the row has none: _adopt_session_card logs no via) and `detect`, its newest selfheal_detect/filed row."""
+    out: dict = {}
+    try:
+        with (Path(store.root) / "log.jsonl").open(encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                adopted = '"selfheal_adopted_owner"' in ln
+                if not adopted and '"selfheal_detect"' not in ln and '"selfheal_filed"' not in ln:
+                    continue
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    continue
+                fp = r.get("fingerprint")
+                if fp not in fps:
+                    continue
+                e = out.setdefault(fp, {})
+                if r.get("event") == "selfheal_adopted_owner":
+                    e.update(via=r.get("via") or "session", card=r.get("card"))
+                elif r.get("source"):
+                    e["detect"] = {**(e.get("detect") or {}), **{k: v for k, v in r.items() if v not in (None, "")}}
+    except OSError:
+        pass
+    return out
+
+
+ADOPT_RECHECK_S = 3600  # an owner whose text could not be read is re-judged at most hourly, not every 5-min pass
+
+
+def _owner_card_text(card: str, board: Optional[str], runner=None) -> Optional[dict]:
+    """The owner card's title/body/key/created/completed via `hermes kanban show --json`; None when unreadable or
+    when the board's answer carries no title (a reply that cannot be judged is not a refusal)."""
+    argv = ["hermes", "kanban"] + (["--board", board] if board else []) + ["show", card, "--json"]
+    try:
+        rc, out, _ = _run(argv, runner)
+        task = json.loads(out).get("task") if rc == 0 else None
+    except Exception:  # health: allow BLE001 -- unreadable means unknown, judged on a later pass
+        return None
+    if not isinstance(task, dict) or "title" not in task:
+        return None
+    return {"id": card, **{k: task.get(k) for k in ("title", "body", "idempotency_key", "status", "created_at",
+                                                    "completed_at")}}
+
+
+def _revalidate_adoption(lane, store, fp: str, st: dict, runner, now: float,
+                         rec: Optional[dict] = None) -> Optional[str]:
+    """Re-judge an approved SESSION adoption made under an older owner rule (adopt_rule < ADOPT_RULE) before the
+    lane waits on, or files a VERIFY for, that owner. Pass -> the lane is stamped with the current rule. Fail -> the
+    adoption is rejected: the lane goes stale with the card in `rejected_owners` (never adopted again), and the
+    defect is queued in selfheal_pending so the next retry pass files a fresh owner (`selfheal_adoption_rejected`).
+    -> what changed, or None (kept, already current, or the owner unreadable)."""
+    card = st.get("fix_card")
+    if (st.get("status") != "approved" or not card or st.get("verify_card") or st.get("adopt_via") != "session"
+            or st.get("adopt_card") != card or (st.get("adopt_rule") or 0) >= ADOPT_RULE
+            or now - (st.get("adopt_checked_at") or 0) < ADOPT_RECHECK_S):
+        return None
+    text = _owner_card_text(card, st.get("board"), runner)
+    if not text:
+        lane.update(fp, adopt_checked_at=now)
+        store.log({"event": "selfheal_adoption_revalidated", "fingerprint": fp, "card": card, "ok": None,
+                   "why": "owner card unreadable; kept, re-judged within the hour"})
+        return None
+    rec = rec if rec is not None else _detect_record(store, fp)
+    d = {"fingerprint": fp, "component": st.get("component"), "symptom": st.get("symptom"),
+         "session_id": st.get("session_id"), "source": rec.get("source"), "kind": rec.get("kind"),
+         "evidence": rec.get("evidence"), "quote": rec.get("quote") or rec.get("evidence"),
+         "complaint_at": st.get("complaint_at") or rec.get("ts"), "at": rec.get("ts") or st.get("complaint_at")}
+    why = session_owner_refusal(text, d, fp, _defect_subject_cards(d), _lane_process_cards(store, fp))
+    if not why:
+        lane.update(fp, adopt_rule=ADOPT_RULE, adopt_checked_at=now)
+        store.log({"event": "selfheal_adoption_revalidated", "fingerprint": fp, "card": card, "ok": True,
+                   "rule": ADOPT_RULE})
+        return None
+    held = {"status": "approved", "fix_card": card, "verify_card": st.get("verify_card")}
+    if not lane.transition(fp, held, status="stale", fix_card=None, closed_at=now, filed_day=None,
+                           rejected_owners=sorted(set(st.get("rejected_owners") or []) | {card}),
+                           adopt_card=None, adopt_via=None, adopt_checked_at=now):
+        return None  # the lane moved meanwhile (a receipt, a re-approval): that newer state stands
+    requeued = False
+    if rec.get("source") and st.get("symptom"):
+        payload = {k: v for k, v in {**d, "p_defect": rec.get("p"), "host": rec.get("host")}.items()
+                   if v not in (None, "")}
+        db = _pending_db(store)
+        try:
+            with db:
+                db.execute("INSERT INTO pending VALUES (?, ?, ?, ?) ON CONFLICT(fp) DO UPDATE SET "
+                           "payload=excluded.payload, retry=excluded.retry, version=excluded.version",
+                           (fp, json.dumps(payload), now, f"revalidate-{int(now)}"))
+            requeued = True
+        finally:
+            db.close()
+    store.log({"event": "selfheal_adoption_rejected", "fingerprint": fp, "card": card, "was": "approved",
+               "by": "revalidate", "rule": ADOPT_RULE, "why": why, "symptom": st.get("symptom"),
+               "session_id": st.get("session_id"), "requeued": requeued,
+               "title": str(text.get("title") or "")[:120]})
+    return f"adoption of {card} rejected ({why}); " + ("refile queued" if requeued else "no detection to refile")
 
 
 def _reconcile_fp(lane, store, fp: str, st: dict, runner, now: float, via: str = "") -> Optional[str]:
