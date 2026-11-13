@@ -7,15 +7,159 @@ exact blocked ask and block generation under the board write transaction.
 
 import hashlib
 import inspect
+import itertools
 import json
 import logging
+import os
 import re
 import sqlite3
+import threading
+import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 
 MISMATCH = "Request no longer matches its frozen server binding"
+
+# Change-keyed reconcile (design t_01a1d563324d7e8e card L). Desktop polls ``/requests`` per open chat and each
+# poll reconciled every board, every bound card (older owners' too) and the compression tip from scratch: ~0.18 s
+# of CPU and ~100 connection opens per poll on the hub with no blocked ask at all. Now:
+#   * every board / state.db / action-store read goes through a kept read-only connection (``_kept``), and
+#   * a pass first reads the key of its inputs (``Mirror._key``): the board rows it reads (blocked asks, bound
+#     cards, their lifecycle-event id and local subscribers), the action store's commit counter, the sessions
+#     table's shape, the owner, the board set and the fenced-core gate. An unchanged key skips the pass.
+# A pass runs in full anyway when its key cannot be read, after a pass that deferred or rejected anything, when a
+# resolver is injected (no key covers it), and at least every FULL_EVERY_S. That ceiling is the P1 fallback: a
+# change the key does not see (a compression parent ended after its child was created) is picked up that late.
+FULL_EVERY_S = 60.0
+_EVENT_KINDS = ("created", "blocked", "unblocked", "archived", "completed")
+_MEMO: dict = {}  # owner key -> (inputs key, monotonic time of the full pass that produced it)
+_MEMO_LOCK = threading.Lock()
+_MEMO_MAX = 256
+_POOL: dict = {}
+_POOL_LOCK = threading.Lock()
+_POOL_MAX = 64
+_GEN = itertools.count(1)
+_SCHEMA_READY: set = set()  # (store path, dev, ino) whose kanban_projections table exists
+
+
+def _open_ro(path):
+    """``core._ro_connect`` for a connection kept across threads (each use holds the entry's lock)."""
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10, check_same_thread=False)
+        c.execute("select 1 from sqlite_master limit 1")
+    except sqlite3.OperationalError:
+        c = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=10, check_same_thread=False)
+        c.execute("PRAGMA query_only=ON")
+    c.row_factory = sqlite3.Row
+    return c
+
+
+class _Kept:
+    __slots__ = ("conn", "ident", "gen", "lock", "owner", "memo")
+
+    def __init__(self):
+        self.conn: sqlite3.Connection | None = None
+        self.ident = None
+        self.gen = 0  # a fresh connection restarts PRAGMA data_version: keys carry the generation
+        self.lock = threading.Lock()
+        self.owner = None
+        self.memo: dict = {}  # per-connection derived values, valid for one (gen, data_version)
+
+
+def _evict():
+    for key in list(_POOL):
+        stale = _POOL[key]
+        if stale.lock.acquire(blocking=False):
+            try:
+                del _POOL[key]
+                if stale.conn is not None:
+                    stale.conn.close()
+            finally:
+                stale.lock.release()
+
+
+@contextmanager
+def _kept(path, *, entry_out=None):
+    """A kept read-only connection to ``path``, reopened when the file is replaced (dev, ino) or after an
+    error. Autocommit reads only; a nested use on the same thread gets a one-shot connection instead."""
+    st = os.stat(path)  # raises like an open of a missing file would
+    ident = (st.st_dev, st.st_ino)
+    with _POOL_LOCK:
+        entry = _POOL.get(str(path))
+        if entry is None:
+            if len(_POOL) >= _POOL_MAX:
+                _evict()
+            entry = _POOL[str(path)] = _Kept()
+    if entry.owner == threading.get_ident():
+        c = _open_ro(path)
+        try:
+            yield c
+        finally:
+            c.close()
+        return
+    with entry.lock:
+        entry.owner = threading.get_ident()
+        try:
+            if entry.conn is None or entry.ident != ident:
+                if entry.conn is not None:
+                    entry.conn.close()
+                    entry.conn = None
+                entry.conn, entry.ident, entry.gen, entry.memo = _open_ro(path), ident, next(_GEN), {}
+            c = entry.conn
+            if entry_out is not None:
+                entry_out.append(entry)
+            try:
+                yield c
+            except sqlite3.Error:
+                entry.conn = None  # never reuse a connection that failed mid-read
+                c.close()
+                raise
+            finally:
+                if entry.conn is not None and c.in_transaction:
+                    c.rollback()
+        finally:
+            entry.owner = None
+
+
+def _version(c):
+    return c.execute("PRAGMA data_version").fetchone()[0]
+
+
+class _NoAccounting:
+    """Stand-in for core's ``loop_accounting.Pass`` outside a Hermes runtime (or on an older core)."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def skip(self):
+        pass
+
+    def change(self, changed=True):
+        pass
+
+    def fallback(self, fell_back=True):
+        pass
+
+    def rows(self, n):
+        pass
+
+
+def _accounted_pass(name):
+    """One P1 loop-accounting pass (core ``hermes_cli.loop_accounting``), or a no-op without it."""
+    try:
+        from hermes_cli.loop_accounting import pass_
+    except Exception:  # outside a Hermes runtime, or a core without P1
+        return _NoAccounting()
+    return pass_(name)
+
+
+def _digest(value):
+    return hashlib.sha256(repr(value).encode()).hexdigest()
 
 
 def encoded(value):
@@ -40,6 +184,13 @@ class Mirror:
         self.session_exists = session_exists or self._user_session
         self.session_present = session_present or session_exists or self._stored_session
         self.tip = tip or self._tip
+        try:
+            st = os.stat(store.path)
+            ready = (str(store.path), st.st_dev, st.st_ino)
+        except (OSError, AttributeError, TypeError):
+            ready = None
+        if ready is not None and ready in _SCHEMA_READY:
+            return  # a Mirror is built per poll: one write transaction per store file and process is enough
         with store._tx() as c:
             c.execute(
                 "CREATE TABLE IF NOT EXISTS kanban_projections ("
@@ -47,17 +198,16 @@ class Mirror:
                 "board TEXT NOT NULL, task TEXT NOT NULL, snapshot TEXT NOT NULL, request TEXT NOT NULL, "
                 "PRIMARY KEY(namespace,request_id))"
             )
+        if ready is not None:
+            _SCHEMA_READY.add(ready)
 
     def _session_row(self, sid):
         # Read failure is not evidence that a card lost its owner.
-        c = self.core._ro_connect(self.core._state_db())
-        try:
+        with _kept(self.core._state_db()) as c:
             return c.execute(
                 "SELECT id,parent_session_id,end_reason,source FROM sessions WHERE id=?",
                 (sid,),
             ).fetchone()
-        finally:
-            c.close()
 
     def _stored_session(self, sid):
         return bool(self._session_row(sid))
@@ -74,18 +224,13 @@ class Mirror:
                 _CHAIN_STEP_SQL,
                 _walk_compression_chain,
             )
-
-            c = self.core._ro_connect(self.core._state_db())
-            c.row_factory = sqlite3.Row
-            try:
-                chain = _walk_compression_chain(
-                    sid, lambda s: c.execute(_CHAIN_STEP_SQL, (s,)).fetchone()
-                )
-                return chain[-1]
-            finally:
-                c.close()
         except ImportError as exc:
             raise OSError("Core continuation resolver unavailable") from exc
+        with _kept(self.core._state_db()) as c:
+            chain = _walk_compression_chain(
+                sid, lambda s: c.execute(_CHAIN_STEP_SQL, (s,)).fetchone()
+            )
+            return chain[-1]
 
     def _api(self):
         if self.backend is not None:
@@ -161,12 +306,8 @@ class Mirror:
         )
 
     def _read_snapshot(self, board, task, owner, *, presentation=True):
-        c = self.core._ro_connect(self._path(board))
-        c.row_factory = sqlite3.Row
-        try:
+        with _kept(self._path(board)) as c:
             return self._snapshot(c, task, owner, presentation=presentation)
-        finally:
-            c.close()
 
     def _request(self, owner, board, snap, incarnation=0):
         # UUID5 identity includes the exact ask, lifecycle and owner, not a fuzzy title.
@@ -343,7 +484,94 @@ class Mirror:
 
     def reconcile(self, owner):
         self.core.validate_owner(owner)
-        if not self._fenced_core():
+        with _accounted_pass("user_steps.mirror_reconcile") as acct:
+            fenced = self._fenced_core()
+            key = self._key(owner, fenced)
+            okey = encoded(owner)
+            now = time.monotonic()
+            with _MEMO_LOCK:
+                memo = _MEMO.get(okey)
+            if key is not None and memo is not None and memo[0] == key and now - memo[1] < FULL_EVERY_S:
+                acct.skip()
+                return
+            acct.change(memo is None or memo[0] != key)
+            acct.fallback(key is None or (memo is not None and memo[0] == key))  # unkeyable, or the ceiling
+            clean = self._reconcile(owner, fenced)
+            with _MEMO_LOCK:
+                if key is None or not clean:
+                    _MEMO.pop(okey, None)
+                    return
+                if okey not in _MEMO and len(_MEMO) >= _MEMO_MAX:
+                    del _MEMO[min(_MEMO, key=lambda k: _MEMO[k][1])]
+                _MEMO[okey] = (key, now)
+
+    def _key(self, owner, fenced):
+        """Digest of everything a pass reads for ``owner``, or None when a pass must run (see FULL_EVERY_S)."""
+        if (self.session_exists != self._user_session or self.session_present != self._stored_session
+                or self.tip != self._tip):
+            return None  # an injected resolver reads inputs no key covers
+        try:
+            ns = self.store._ns(owner)
+            parts = [encoded(owner), sorted((b, str(p)) for b, p in self.boards.items()), fenced]
+            held = []
+            with _kept(self.store.path, entry_out=held) as c:
+                if not held:
+                    return None  # nested use on this thread: no kept connection, no commit counter
+                entry, version = held[0], _version(c)
+                memo_key = ("bound", entry.gen, version, ns)
+                bound = entry.memo.get(memo_key)
+                if bound is None:
+                    bound = [tuple(r) for r in c.execute(
+                        "SELECT DISTINCT board, task FROM kanban_projections WHERE namespace=? ORDER BY 1, 2", (ns,))]
+                    entry.memo = {k: v for k, v in entry.memo.items() if k[1:3] == (entry.gen, version)}
+                    entry.memo[memo_key] = bound
+                parts.append(("store", entry.gen, version))
+            with _kept(self.core._state_db()) as c:
+                parts.append(tuple(c.execute("SELECT MAX(rowid), COUNT(*) FROM sessions").fetchone()))
+            for board, path in sorted(self.boards.items()):
+                ids = [t for b, t in bound if b == board]
+                held = []
+                with _kept(path, entry_out=held) as c:
+                    if not held:
+                        return None
+                    entry, version = held[0], _version(c)
+                    memo_key = ("board", entry.gen, version, tuple(ids))
+                    digest = entry.memo.get(memo_key)
+                    if digest is None:
+                        digest = self._board_digest(c, ids)
+                        entry.memo = {k: v for k, v in entry.memo.items() if k[1:3] == (entry.gen, version)}
+                        entry.memo[memo_key] = digest
+                parts.append((board, digest))
+            return _digest(parts)
+        except (sqlite3.Error, OSError, ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _board_digest(c, ids):
+        """The board rows ``_snapshot``/``_receipt`` read: blocked asks and bound cards, each with its newest
+        lifecycle event id, and their local subscribers."""
+        have = {r[1] for r in c.execute("PRAGMA table_info(tasks)")}
+        cols = ", ".join(f"t.{x}" for x in ("id", "status", "idempotency_key", "human_request", "session_id", "title")
+                         if x in have)
+        latest = ("(SELECT MAX(e.id) FROM task_events e WHERE e.task_id=t.id AND e.kind IN "
+                  f"({','.join('?' * len(_EVENT_KINDS))}))")
+        rows = [tuple(r) for r in c.execute(
+            f"SELECT {cols}, {latest} FROM tasks t WHERE t.status='blocked' AND t.human_request IS NOT NULL "
+            f"UNION SELECT {cols}, {latest} FROM tasks t WHERE t.id IN (SELECT value FROM json_each(?)) ORDER BY 1",
+            (*_EVENT_KINDS, *_EVENT_KINDS, json.dumps(ids)))]
+        try:
+            subs = [tuple(r) for r in c.execute(
+                "SELECT task_id, chat_id, platform, notifier_profile, created_at FROM kanban_notify_subs "
+                "WHERE task_id IN (SELECT value FROM json_each(?)) ORDER BY 1, 2, 3, 4, 5",
+                (json.dumps([r[0] for r in rows]),))]
+        except sqlite3.OperationalError:
+            subs = None  # _snapshot reads no subscribers then either
+        return _digest([rows, subs])
+
+    def _reconcile(self, owner, fenced):
+        """One full pass. False when anything was deferred (the next pass must not be skipped)."""
+        clean = True
+        if not fenced:
             logging.getLogger("user-steps").warning(
                 "Card projection paused: core lacks fenced unblock/archive (deploy core first)"
             )
@@ -352,16 +580,13 @@ class Mirror:
             boards = self.boards
         for board, path in boards.items():
             try:
-                c = self.core._ro_connect(path)
-                c.row_factory = sqlite3.Row
-                try:
+                with _kept(path) as c:
                     rows = c.execute(
                         "SELECT id FROM tasks WHERE status='blocked' AND human_request IS NOT NULL"
                     ).fetchall()
                     snapshots = [self._snapshot(c, r[0], owner) for r in rows]
-                finally:
-                    c.close()
             except (sqlite3.Error, OSError):
+                clean = False
                 continue  # unavailable is NOT evidence to withdraw
             for snap in filter(None, snapshots):
                 try:
@@ -390,6 +615,7 @@ class Mirror:
             try:
                 self._reconcile_binding(owner, binding)
             except (ValueError, sqlite3.Error, OSError) as exc:
+                clean = False
                 logging.getLogger("user-steps").warning(
                     "Card binding reconciliation deferred request=%s: %s",
                     binding["request_id"],
@@ -410,11 +636,13 @@ class Mirror:
             try:
                 self._reconcile_binding(previous, binding)
             except (ValueError, sqlite3.Error, OSError) as exc:
+                clean = False
                 logging.getLogger("user-steps").warning(
                     "Older card binding reconciliation deferred request=%s: %s",
                     binding["request_id"],
                     exc,
                 )
+        return clean
 
     def _reconcile_binding(self, owner, binding):
         if binding["board"] not in self.boards:
@@ -439,11 +667,8 @@ class Mirror:
             if op["dispatchState"] in ("delivered", "cancelled"):
                 return
             # Preserve a board commit whose outbox acknowledgment is still pending.
-            c = self.core._ro_connect(self._path(binding["board"]))
-            try:
+            with _kept(self._path(binding["board"])) as c:
                 delivered = self._receipt(c, binding, op)
-            finally:
-                c.close()
             if not delivered:
                 try:
                     self.store.retire_operation(
