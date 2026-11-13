@@ -264,6 +264,43 @@ def test_pool_llm_mirror_agrees_on_cost_estimates():
         assert bool(rc.credit_ask(r, [])) == bool(h.credit_ask("kanban_block", {"reason": r})), r
 
 
+# An explicit credit word is strong money wording, so only the CI/infra billing context added for agent-2c90bd7aa7 keeps
+# these from counting as AI credit asks. Each tuple is reached by one regex alone: CI_COST_WORDING only by the
+# NON_LLM_BILLING_RE wording line (Blacksmith, runner minutes, CI time, macOS hours), CI_BILL_TARGETS only by the
+# runner(s) target in _OTHER (followed by a billing word), BUILD_MACHINE_CREDIT by either.
+CI_COST_WORDING = ("Please add $50 of credit so Blacksmith can keep running the macOS jobs.",
+                   "Please add $50 of credit so we can pay for more runner minutes.",
+                   "Please buy $40 of credit for CI time on the nightly build.",
+                   "Please add $30 of credit for macOS hours.")
+CI_BILL_TARGETS = ("Please add $50 of credit for runners billing.",
+                   "Please add $50 of credit to the runner account.")
+BUILD_MACHINE_CREDIT = ("Please add $50 of credit for the build machines.",
+                        "Please add $50 of credit for Blacksmith runner minutes so the macOS jobs can run.")
+AI_CREDIT_NEXT_TO_CI = ("Please add $50 of Anthropic credit for the Blacksmith runner minutes.",
+                        "Please add $50 of OpenAI API credit; the runners billing is separate.",
+                        "Please add $50 of Anthropic credit so the CI time eval can finish.")
+
+
+def test_credit_for_ci_cost_wording_is_not_an_ai_credit_ask():
+    for r in CI_COST_WORDING:
+        assert rc.credit_ask(r, []) is None, r
+
+
+def test_credit_for_runners_billing_is_not_an_ai_credit_ask():
+    for r in CI_BILL_TARGETS:
+        assert rc.credit_ask(r, []) is None, r
+
+
+def test_credit_for_build_machines_is_not_an_ai_credit_ask():
+    for r in BUILD_MACHINE_CREDIT:
+        assert rc.credit_ask(r, []) is None, r
+
+
+def test_ai_credit_next_to_ci_wording_still_fires():
+    for r in AI_CREDIT_NEXT_TO_CI:
+        assert rc.credit_ask(r, []), r
+
+
 CORPUS = json.loads((Path(__file__).parent / "fixtures" / "credit_ask_corpus.json").read_text())["items"]
 
 
