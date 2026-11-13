@@ -132,3 +132,58 @@ def test_production_install_wraps_the_sink_off_loop(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, watch.WEB_MODULE, ws)
     watch._install_reqtrace(tmp_path, 2.0)
     assert made and hasattr(made[0], "_loop_watch_offloop")
+
+
+def _within(fn, timeout_s):
+    """Run fn on a daemon thread; return (finished, result-or-exception)."""
+    box = {}
+
+    def run():
+        try:
+            box["ok"] = fn()
+        except BaseException as exc:  # noqa: BLE001 - reported to the test
+            box["err"] = exc
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    return not t.is_alive(), box
+
+
+def test_durable_default_bound_is_finite_and_above_diag(held_lock):
+    # reqtrace.default_sink writes request_stats with durable=True and the default bound: the stats
+    # thread / shutdown flush must give up on a held lock, but later than a diagnostic would.
+    path, _ = held_lock
+    assert journal.DURABLE_LOCK_TIMEOUT_S >= 2.0 > journal.DIAG_LOCK_TIMEOUT_S
+    t0 = time.monotonic()
+    finished, box = _within(lambda: journal.append(path, {"kind": "request_stats"}, durable=True),
+                            journal.DURABLE_LOCK_TIMEOUT_S + 1.5)
+    took = time.monotonic() - t0
+    assert finished, "durable append waited past its bound on a held lock"
+    assert isinstance(box.get("err"), OSError) and box["err"].errno == errno.ETIMEDOUT
+    assert journal.DURABLE_LOCK_TIMEOUT_S * 0.9 <= took <= journal.DURABLE_LOCK_TIMEOUT_S + 0.5
+    assert not path.exists()
+
+
+def test_writer_survives_a_raising_sink():
+    writer = journal.OffThreadWriter()
+    ran = []
+
+    def bad():
+        raise ValueError("sink bug")
+    assert writer.submit(bad)
+    finished, _ = _within(writer.q.join, 5)
+    assert finished, "q.join hung after a raising sink"
+    assert writer.submit(ran.append, "good")
+    finished, _ = _within(writer.q.join, 5)
+    assert finished, "q.join hung: the writer did not run the next record"
+    assert ran == ["good"]
+    assert writer.failed == 1
+
+
+def test_production_offloop_writer_is_shared_and_bounded(monkeypatch):
+    monkeypatch.setattr(rt, "_WRITER", None)
+    first = rt.offloop_sink(lambda rep: None)._loop_watch_offloop
+    second = rt.offloop_sink(lambda rep: None)._loop_watch_offloop
+    assert isinstance(first, journal.OffThreadWriter)
+    assert first is second
+    assert first.q.maxsize == 64
