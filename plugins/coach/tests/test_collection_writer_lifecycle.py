@@ -154,3 +154,48 @@ def pytest_sessionfinish(session, exitstatus):
     assert receipt.read_text() == 'written before cleanup'
     assert not Path(homefile.read_text()).exists()
 
+
+
+@pytest.mark.skipif(importlib.util.find_spec('hermes_cli.kanban_links_refresh') is None,
+                    reason='needs a Hermes core with the process-lifetime links refresher')
+def test_idle_process_lifetime_links_worker_is_drained_not_joined(tmp_path):
+    # core's ScopeRefresher keeps its `kanban-remote-links` daemon parked on a condition after the last refresh:
+    # it never exits, so joining it fails every session that ever polled stale links. Sessionfinish must instead
+    # wait for its queued refresh (which writes under the collection home) and then accept the idle worker.
+    suite = tmp_path / 'suite'
+    suite.mkdir()
+    for filename in ('conftest.py', 'gateway_reaper.py', 'home_guard.py', 'collection_home.py'):
+        shutil.copyfile(Path(__file__).with_name(filename), suite / filename)
+    receipt = tmp_path / 'receipt'
+    homefile = tmp_path / 'home'
+    (suite / 'lifecycle_probe.py').write_text(f'''
+import os, threading, time
+from pathlib import Path
+import pytest
+from hermes_cli import kanban_session_activity as activity
+from hermes_cli.kanban_links_refresh import ScopeRefresher
+release = threading.Event()
+def pytest_collection_finish(session):
+    home = Path(os.environ['HERMES_HOME'])
+    Path({str(homefile)!r}).write_text(str(home))
+    def refresh(scope):
+        assert release.wait(30)
+        time.sleep(.2)
+        (home / 'origin-work.db').write_text('snapshot')
+        Path({str(receipt)!r}).write_text('written before cleanup')
+    activity._links_refresher = ScopeRefresher(refresh, 4)
+    activity._links_refresher.submit(('A',))
+@pytest.hookimpl(tryfirst=True)
+def pytest_sessionfinish(session, exitstatus):
+    release.set()
+''')
+    (suite / 'test_probe.py').write_text('def test_ok(): pass\n')
+    env = dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD='1')
+    env['PYTHONPATH'] = os.pathsep.join([str(suite), env.get('PYTHONPATH', '')])
+    result = subprocess.run([sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider',
+                             '-p', 'lifecycle_probe', str(suite)],
+                            env=env, cwd=suite, capture_output=True, text=True, timeout=180)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'Traceback' not in result.stderr
+    assert receipt.read_text() == 'written before cleanup'
+    assert not Path(homefile.read_text()).exists()

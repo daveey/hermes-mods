@@ -41,6 +41,31 @@ os.environ['COACH_CLOCK_EPOCH'] = '1794470280'
 
 # Finite core helpers that write under HERMES_HOME (not the infinite idle-reaper/takeover watchers).
 _CORE_WRITER_THREADS = frozenset({'kanban-annotation-refresh', 'kanban-remote-links', 'kanban-annotation-prewarm'})
+# Core workers that never exit (a process-lifetime daemon parked on a condition when idle): joining one always times
+# out, so drain its queue instead. Thread name -> (module, attribute holding an object with a ``busy`` property).
+_CORE_IDLE_WORKERS = {'kanban-remote-links': ('hermes_cli.kanban_session_activity', '_links_refresher')}
+
+
+def _drain_idle_core_workers(timeout):
+    """Wait (bounded) until each live process-lifetime core worker has no queued or running job; return those threads.
+
+    core's ``ScopeRefresher`` (thread ``kanban-remote-links``) stays alive parked on its condition after its last
+    refresh, so it cannot be joined. Idle, it writes nothing. Only the refresher's own worker thread is returned (any
+    other thread with that name is still joined); a still-busy one is left to the join below and reported.
+    """
+    import time
+    idle = set()
+    deadline = time.monotonic() + timeout
+    for module_name, attr in _CORE_IDLE_WORKERS.values():
+        refresher = getattr(sys.modules.get(module_name), attr, None)
+        worker = getattr(refresher, '_worker', None)
+        if refresher is None or worker is None or not hasattr(refresher, 'busy'):
+            continue  # never started, or an older core whose worker was finite: the join handles it
+        while refresher.busy and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if not refresher.busy:
+            idle.add(worker)
+    return idle
 
 
 def pytest_configure(config):
@@ -158,6 +183,8 @@ def pytest_sessionfinish(session, exitstatus):
     # A sibling plugin's waker loop started outside any test (collection imports) is stopped the same way.
     writers = [t for t in threading.enumerate() if t.name in _CORE_WRITER_THREADS or _plugin_loop_stop(t) is not None]
     _stop_plugin_loops(writers)
+    idle_workers = _drain_idle_core_workers(timeout=10)
+    writers = [t for t in writers if t not in idle_workers]
     for thread in writers:
         thread.join(timeout=10)
     remaining = [t.name for t in writers if t.is_alive()]
@@ -213,6 +240,8 @@ def _join_coach_threads(monkeypatch, _live_home_guard):
     monkeypatch.setattr(threading.Thread, 'start', tracked)
     yield
     _stop_plugin_loops(threads)
+    idle_workers = _drain_idle_core_workers(timeout=10)
+    threads = [t for t in threads if t not in idle_workers]
     for thread in threads:
         thread.join(timeout=10)
     assert not [t.name for t in threads if t.is_alive()], 'coach background thread outlived its test'
