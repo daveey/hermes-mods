@@ -1856,10 +1856,88 @@ def command_copy_nudge(evidence: str, user_ask: str = "") -> str:
     return tmpl.format(evidence=evidence[:160])
 
 
+# ---- restart_scope_claim: an install "restarts this chat" / "it's live in the Desktop backend" under code skew -------
+# (self-heal agent-8812b31b28: on 2026-11-11 a MacBook Desktop chat said "It's live in the Desktop backend" and that the
+# install would restart this chat's backend. Core's updater never stops a Desktop-owned serve backend
+# (update_inventory.CLIENT_OWNED_SERVE_SUPERVISORS -> outcome "deferred"); the backend's code-skew watchdog
+# (web_server_skew_exit) retires it only between turns, once every chat on it is idle, and Desktop respawns it on the
+# new code. Until then this chat runs its boot revision.) Deterministic, before the judge, and keyed on that fact: the
+# claim's wording AND this process's gateway.code_skew (boot revision != checkout). No skew = the claim may be true =
+# silent. Only Desktop turns ("" = nudge_outcome's re-check of a Desktop hit). hermes-sync's Mac drain does wait for
+# busy Desktop turns, so "ending this turn so it stops holding up the install" is NOT held: it can be true.
+_RSC_TARGET_RE = re.compile(
+    r"\b(?:this|your|my|the)\s+(?:chat|session)(?:[\u2019']s)?\s+(?:own\s+)?(?:Desktop\s+)?backend\b"
+    r"|\b(?:this|your|my|the)\s+(?:own\s+)?Desktop\s+backend\b|\bDesktop[\u2019']s\s+(?:own\s+)?backend\b"
+    r"|\bthis\s+(?:chat|session|backend)\b", re.I)
+_RSC_RESTART_RE = re.compile(
+    r"\b(?:re-?start|refresh|reload|recycle|respawn|re-?spawn|reboot)(?:s|es|ed|ing)?\b"
+    r"|\bpicks?\s+(?:it|this|that|them|the\s+(?:change|fix|update|new\s+code))\s+up\b|\bon\s+the\s+new\s+code\b", re.I)
+_RSC_INSTALL_RE = re.compile(
+    r"\b(?:install|update|upgrade|deploy|core\s+update|hermes-sync|sync\s+run)(?:s|ed|ing)?\b", re.I)
+# "it's live in the Desktop backend" / "the Desktop backend now runs the fix": live claims about this backend.
+_RSC_LIVE_RE = re.compile(
+    r"\b(?:is|it[\u2019']?s|now|already|are)\s+(?:now\s+|already\s+)?(?:live|active|loaded|running)\s+in\s+"
+    r"(?:the|this|your)\s+(?:chat[\u2019']?s\s+)?(?:Desktop\s+)?backend\b"
+    r"|\b(?:the|this|your)\s+Desktop\s+backend\s+(?:now\s+|already\s+)?(?:has|runs|is\s+running|picked\s+up|loaded)"
+    r"\s+(?:it|the\s+(?:fix|change|new\s+code|update))\b", re.I)
+# The correct rule ("won't refresh until every chat is idle") and refusals.
+_RSC_NEGATED_RE = re.compile(r"\b(?:never|not|doesn[\u2019']t|does\s+not|won[\u2019']t|isn[\u2019']t|until|no\s+longer"
+                             r"|idle)\b|\bn[\u2019']t\b", re.I)
+_RSC_META_RE = re.compile(r"\brestart_scope_claim\b", re.I)
+RSC_PLATFORMS = ("desktop", "")
+RESTART_SCOPE_CLAIM_NUDGE = (
+    "[coach] restart_scope_claim: your reply says \"{evidence}\", but this Desktop backend still runs {boot} while the "
+    "checkout is at {disk}. An install (`hermes update`, the hermes-sync core step) never restarts or refreshes this "
+    "chat's backend: the backend keeps its boot code until every chat on it is idle, then retires itself and Desktop "
+    "respawns it on the new code. Correct the claim in plain words: say where the change is live (the checkout, the "
+    "gateway once it restarted) and that this chat gets it only after its backend goes idle and respawns. Check before "
+    "saying a fix is live here.")
+
+
+def backend_code_skew() -> Optional[tuple]:
+    """(boot_rev, disk_rev) when this process booted on another revision than the checkout (core gateway.code_skew),
+    else None; None when core is not importable or the read fails (fail-open: an unreadable state holds nothing)."""
+    try:
+        from gateway.code_skew import detect_code_skew
+        return detect_code_skew()
+    except Exception:
+        return None
+
+
+def restart_scope_claim(reply: str, skew: Optional[Callable[[], Optional[tuple]]] = None) -> Optional[str]:
+    """The sentence claiming an install restarts/refreshes this chat's backend, or that a change is live in the
+    Desktop backend, when `skew()` (default backend_code_skew) says this backend still runs its boot revision; else
+    None. Code spans, `>` quotes, double-quoted text and sentences naming the rule are ignored. `skew` is read only
+    after a sentence matches, and a raising read counts as no skew."""
+    text = _CODE_QUOTE.sub(" ", reply or "")
+    text = _QUOTED_RE.sub(" ", text)
+    hit = None
+    for s in _SENTENCE_END.split(text):
+        if _RSC_NEGATED_RE.search(s) or _RSC_META_RE.search(s):
+            continue
+        if _RSC_LIVE_RE.search(s) or (_RSC_TARGET_RE.search(s) and _RSC_RESTART_RE.search(s)
+                                     and _RSC_INSTALL_RE.search(s)):
+            hit = s.strip(" -*\t")
+            break
+    if not hit:
+        return None
+    try:
+        sk = (skew or backend_code_skew)()
+    except Exception:
+        return None
+    return hit if sk else None
+
+
+def restart_scope_claim_nudge(evidence: str, skew: Optional[tuple]) -> str:
+    boot, disk = (tuple(skew or ()) + ("unknown", "unknown"))[:2]
+    return RESTART_SCOPE_CLAIM_NUDGE.format(evidence=(evidence or "")[:160], boot=str(boot)[:12], disk=str(disk)[:12])
+
+
 RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
-         "laptop_job", "skipped_live", "merge_forecast", "future_clock", "claimed_mutation")
+         "laptop_job", "skipped_live", "merge_forecast", "future_clock", "claimed_mutation", "restart_scope_claim")
 DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
-                 "laptop_job", "skipped_live", "merge_forecast", "future_clock", "claimed_mutation")
+                 "laptop_job", "skipped_live", "merge_forecast", "future_clock", "claimed_mutation",
+                 "restart_scope_claim")
 # Per-rule judge thresholds (COACH_REPLY_THRESHOLDS overrides; other rules use COACH_REPLY_THRESHOLD).
 # report_only: tuned on the training split of the 2026-10-27 labeled set (README, "report_only").
 # report_only_capped: the screen alone when a second opinion was due but unavailable (daily cap hit, error); confirms
@@ -3443,8 +3521,11 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
           capped_nudge: bool = True,
           report_only_fallback: str = REPORT_ONLY_FALLBACK,
           prev_turn: Optional[dict] = None, deny_quoted: bool = False, platform: str = "",
-          relay_repeat: bool = False, now: Optional[float] = None) -> Optional[dict]:
+          relay_repeat: bool = False, now: Optional[float] = None,
+          code_skew: Optional[Callable[[], Optional[tuple]]] = None) -> Optional[dict]:
     """Return {"rule", "p", "evidence", "nudge"} for the top rule over threshold, else None.
+    `code_skew() -> (boot_rev, disk_rev) | None` (default backend_code_skew: core gateway.code_skew of this process)
+    keys the deterministic restart_scope_claim rule on Desktop turns (agent-8812b31b28).
     `relay_repeat` (relay_repeat.py, agent-1406d53913): this turn's user asked again while the previous reply relayed
     an unfinished owner. report_only joins the candidates (unless scoped), the second opinion always runs whatever the
     screen scored, and report_only_scored records relay_repeat: true.
@@ -3544,6 +3625,18 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
             return {"rule": "claimed_mutation", "p": 1.0, "evidence": cm["evidence"], "reason": "claimed_mutation",
                     "card": cm["card_id"], "verdict": {"claimed_mutation": 1.0, "evidence": cm["evidence"]},
                     "nudge": claimed_mutation_nudge(cm)}
+    if (not only or "restart_scope_claim" in only) and (platform or "") in RSC_PLATFORMS:
+        seen_skew: list = []
+
+        def _skew() -> Optional[tuple]:
+            seen_skew.append((code_skew or backend_code_skew)())
+            return seen_skew[-1]
+        phrase = restart_scope_claim(reply, skew=_skew)
+        if phrase:  # deterministic: install-restarts-this-chat / live-here claim while this backend is skewed
+            return {"rule": "restart_scope_claim", "p": 1.0, "evidence": phrase, "reason": "restart_scope_claim",
+                    "skew": list(seen_skew[-1] or ()),
+                    "verdict": {"restart_scope_claim": 1.0, "evidence": phrase},
+                    "nudge": restart_scope_claim_nudge(phrase, seen_skew[-1])}
     if (not only or "report_only" in only) and not scoped:
         closed = card_closed(tool_log)
         tail = CARD_CLOSED_TAIL if closed else ""
@@ -3804,6 +3897,8 @@ BACKTEST_RULES: dict = {"credit_ask": lambda r: credit_ask(r, []), "laptop_job":
                         "merge_forecast": lambda r: merge_forecast(r, []),
                         "future_clock": lambda r, at=None: future_clock(r, now=at),
                         "claimed_mutation": lambda r: (claimed_mutation(r, []) or {}).get("evidence"),
+                        # wording only (an upper bound): a backtest can't know each reply's backend skew
+                        "restart_scope_claim": lambda r: restart_scope_claim(r, skew=lambda: ("boot", "disk")),
                         "recommend_stall": lambda r: recommend_stall(r)}
 # Rules that compare the reply with the clock: the backtest passes each reply's own timestamp as `at`.
 BACKTEST_AT_RULES = ("future_clock",)

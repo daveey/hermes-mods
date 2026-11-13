@@ -1832,7 +1832,8 @@ def handoff_nudge_counts(root: Optional[Path] = None, now: Optional[float] = Non
 
 # reply_check rules whose nudges get a reply_nudge_outcome (same as signals.OUTCOME_RULES).
 OUTCOME_RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask",
-                 "credit_ask", "laptop_job", "skipped_live", "merge_forecast", "future_clock", "claimed_mutation")
+                 "credit_ask", "laptop_job", "skipped_live", "merge_forecast", "future_clock", "claimed_mutation",
+                 "restart_scope_claim")
 
 
 def _unconfirmed_outcome(o: dict) -> bool:
