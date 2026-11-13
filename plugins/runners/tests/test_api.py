@@ -241,6 +241,41 @@ def test_disk_config_is_cached_and_detached(disk_api):
     assert len(calls) == 1
 
 
+def test_detached_mutated_config_does_not_contaminate_the_inventory_memo(disk_api, monkeypatch):
+    """Real service() factory: a detached caller that mutates its own config copy (a 1 s inventory TTL) must
+    not be keyed by the cached fingerprint of the original config, or its stale result is memoized and served
+    to the next service() on the unmutated config."""
+    from datetime import datetime
+    from plugins.runners.config import ConfigFile
+    module, _, path, _, _, _ = disk_api
+    from copy import deepcopy
+    from plugins.runners.collector import Collector
+    from test_collector import Adapter
+    seed = ConfigFile(path).load()
+    seed['hosts'] = [deepcopy(F['Host'])]
+    with Store(path.parent / 'runners/state.sqlite') as store:
+        Collector(store, seed, Adapter(), clock=lambda: 1000, host_probe=lambda host: {}).tick()
+    now = [1000]
+    class Clocked(Service):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, clock=lambda: now[0], **kw)
+    monkeypatch.setattr(module, '_backend', lambda: (ConfigFile, Clocked))
+    observed = datetime.fromisoformat(module.service().inventory()['meta']['observed_at'].replace('Z', '+00:00')).timestamp()
+    ttl = module.service().config['thresholds']['inventory_stale_seconds']
+    assert ttl > 5
+    now[0] = observed + 2  # inside the real TTL, outside the mutated one
+    a = module.service()
+    a.config['thresholds']['inventory_stale_seconds'] = 1
+    assert a.inventory()['meta']['freshness'] == 'stale'
+    b = module.service()
+    assert b.config['thresholds']['inventory_stale_seconds'] == ttl
+    assert b.inventory()['meta']['freshness'] == 'fresh'
+    assert b.inventory()['meta']['freshness'] == b._inventory(b._owned(b._read().snapshot))['meta']['freshness']
+    # the cached fingerprint is still used when the caller promises not to mutate
+    cached = module._config_cache[next(iter(module._config_cache))]
+    assert module.service(detached=False)._fingerprint is cached[2]
+
+
 def test_other_profile_config_failure_does_not_evict_the_owner_config(disk_api, tmp_path):
     """Every profile's fleet poll calls service(); profiles without runners.yaml raise. That used to
     clear the one shared cache entry, so the owner re-parsed its config on each poll."""

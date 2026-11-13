@@ -90,7 +90,9 @@ def service(*, detached=True):
         except Exception:
             _config_cache.pop(home, None)
             raise
-    return Service(home / 'runners/state.sqlite', config, fingerprint=cached[2])
+    # Only the shared cached config may reuse its precomputed fingerprint. A detached copy is mutable by its
+    # caller, so its memo key must come from the config actually in hand (fingerprint=None: Service computes it).
+    return Service(home / 'runners/state.sqlite', config, fingerprint=None if detached else cached[2])
 
 
 def _origin(value):
