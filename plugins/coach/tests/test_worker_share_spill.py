@@ -133,3 +133,38 @@ def test_timeout_stops_batch(home):
 
     out = go(home, runner, registry(), 0, streak_needed=1)
     assert len(calls) == 1 and len(out['move_errors']) == 1 and not out['moved']
+
+
+class Refuser(Mover):
+    """Core refuses the first card's move (stdout ``--json`` refusal, nothing written); the rest move."""
+
+    def __init__(self, home, refuse, code='unpushed_state_here'):
+        super().__init__(home)
+        self.refuse, self.code = set(refuse), code
+
+    def __call__(self, argv, **kw):
+        if 'move' in argv and argv[argv.index('move') + 1] in self.refuse:
+            self.calls.append(argv)
+            return SimpleNamespace(returncode=1, stderr='', stdout=json.dumps(
+                {'ok': False, 'reason_code': self.code, 'error': 'dirty worktree ~/code/_wt/x on hub'}))
+        return super().__call__(argv, **kw)
+
+
+def test_a_refused_move_skips_that_card_and_spills_the_rest(home):
+    """A card core refuses (unpushed_state_here: its trees are here) must not stop the tick's other spills."""
+    audit(home, 't_a1')
+    audit(home, 't_a2')
+    out = go(home, Refuser(home, {'t_a1'}), registry(), 0, streak_needed=1)
+    assert out['moved'] == [{'task_id': 't_a2', 'machine': 'worker-1'}], out
+    assert [e['task_id'] for e in out['move_errors']] == ['t_a1']
+    assert 'unpushed_state_here' in out['move_errors'][0]['error']
+
+
+def test_an_unknown_outcome_still_stops_the_batch(home):
+    """A Board repin whose outcome is unknown may have reserved the slot: stop, never blind retry."""
+    audit(home, 't_a1')
+    audit(home, 't_a2')
+    runner = Refuser(home, {'t_a1'}, code='outcome_unknown')
+    out = go(home, runner, registry(), 0, streak_needed=1)
+    assert out['moved'] == [] and len(out['move_errors']) == 1
+    assert sum('move' in c for c in runner.calls) == 1

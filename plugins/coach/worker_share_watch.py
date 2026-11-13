@@ -290,6 +290,29 @@ def move_verified(db: Path, task_id: str, machine: str, after_id: int) -> bool:
         con.close()
 
 
+def refusal_code(stdout: Optional[str]) -> Optional[str]:
+    """The ``reason_code`` of a definite ``hermes kanban move --json`` refusal, else None. ``outcome_unknown``
+    (a Board repin with no reply) is not definite: the Board may have committed."""
+    try:
+        res = json.loads(stdout or '')
+    except (ValueError, TypeError):
+        return None
+    code = res.get('reason_code') if isinstance(res, dict) and res.get('ok') is False else None
+    return code if isinstance(code, str) and code and code != 'outcome_unknown' else None
+
+
+def moved_since(db: Path, task_id: str, after_id: int) -> bool:
+    """Whether the card has any ``moved`` event past ``after_id`` (fails toward True: treat as ambiguous)."""
+    con = _ro_connect(db)
+    try:
+        return con.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='moved' AND id>? LIMIT 1",
+                           (task_id, after_id)).fetchone() is not None
+    except sqlite3.Error:
+        return True
+    finally:
+        con.close()
+
+
 def spill(home: Path, s: dict, reason_fn: Callable, runner: Callable, limit: int) -> tuple:
     """Only move explicitly audited, still-portable, never-started cards. Core owns the write/event."""
     moved, errors = [], []
@@ -322,6 +345,12 @@ def spill(home: Path, s: dict, reason_fn: Callable, runner: Callable, limit: int
         try:
             result = runner(argv, capture_output=True, text=True, timeout=120,
                             env={**os.environ, 'HERMES_HOME': str(home), 'HERMES_KANBAN_DB': str(db)})
+            if result.returncode != 0 and (code := refusal_code(result.stdout)) and not moved_since(db, card['id'],
+                                                                                                   after_id):
+                # Core refused this card before writing anything (e.g. unpushed_state_here: its unpushed trees are
+                # on this host): no slot was reserved, so skip it and keep spilling the tick's other cards.
+                errors.append({'task_id': card['id'], 'error': f'move refused: {code}'})
+                continue
             if result.returncode != 0 or not move_verified(db, card['id'], machine, after_id):
                 raise RuntimeError('move refused or readback did not confirm target and moved event')
         except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
