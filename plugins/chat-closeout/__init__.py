@@ -1470,7 +1470,6 @@ def _watch_parked(session_id: str, ids: list[str]) -> dict[str, Any]:
     if not ids:
         return {}
     try:
-        import sqlite3
         from hermes_cli import kanban_session_activity as ksa
         from hermes_cli import kanban_watch as kw
         chats = [c for c in dict.fromkeys(str(s) for s in _lineage(session_id)) if c]
@@ -1481,7 +1480,7 @@ def _watch_parked(session_id: str, ids: list[str]) -> dict[str, Any]:
             todo = [t for t in ids if t not in out]
             if not todo:
                 break
-            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
+            conn = core.ro_connect(path, board=True)
             try:
                 for tid in todo:
                     if kw.is_watch(conn, tid) and _linked_to(conn, tid, chats):
