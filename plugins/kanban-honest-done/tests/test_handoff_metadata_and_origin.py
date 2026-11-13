@@ -311,3 +311,53 @@ def test_same_gateway_origin_refusal_has_no_adopt_hint(tmp_path, monkeypatch):
     monkeypatch.setattr(core, "_gateway_names", lambda: ("macbook", {"hub", "macbook"}))
     why = plugin.classify("kanban_complete", {"summary": "Shipped."}, OWN, make_board(tmp_path, links=()))
     assert why and "adopt-task" not in why
+
+
+# --- D on a Board-synced card executed on another machine (runs_on machine:X) --------------------------------------
+
+def _synced(tmp_path, live_links=(), replica_links=(), created_on="macbook", body=BODY):
+    """Live board of the executing machine (worker-4) holds a copy of the card with no links and no session_id;
+    the owner's links reach it only through the Board replica ``kanban/sync-shadow/default.db``."""
+    paths = make_board(tmp_path, body=body, links=live_links)
+    shadow = tmp_path / "kanban" / "sync-shadow"
+    shadow.mkdir(parents=True)
+    replica = make_board(shadow, body=body, links=replica_links)()[0]
+    replica = replica.rename(shadow / "default.db")
+    for db in (paths()[0], replica):
+        c = sqlite3.connect(db)
+        c.execute("ALTER TABLE tasks ADD COLUMN created_on TEXT")
+        c.execute("UPDATE tasks SET created_on=? WHERE id=?", (created_on, OWN))
+        c.commit()
+        c.close()
+    return paths
+
+
+def test_board_synced_card_executed_on_another_machine_linked_on_owner_allowed(tmp_path, monkeypatch):
+    """t_01a1d48abbb62104: owned by macbook, run on worker-4 via runs_on machine:worker-4, linked to its origin chat
+    on macbook (replica row present on worker-4). Gate D read only worker-4's live board and refused."""
+    monkeypatch.setattr(core, "_gateway_names", lambda: ("worker-4", {"worker-4", "macbook", "hub"}))
+    paths = _synced(tmp_path, replica_links=((ORIGIN, "macbook", 0),))
+    assert plugin.classify("kanban_complete", {"summary": "Shipped and verified."}, OWN, paths) is None
+
+
+def test_board_synced_card_released_replica_link_still_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "_gateway_names", lambda: ("worker-4", {"worker-4", "macbook", "hub"}))
+    paths = _synced(tmp_path, replica_links=((ORIGIN, "macbook", 1),))
+    assert plugin.classify("kanban_complete", {"summary": "Shipped and verified."}, OWN, paths)
+
+
+def test_board_synced_card_adopt_hint_names_owner_not_executing_machine(tmp_path, monkeypatch):
+    """The refusal told the worker-4 run to adopt worker-4/default/<id>, a card worker-4 does not own, so the bind
+    sat at origin_bind_pending and its `links --expect worker-4/...` wake_check could never pass."""
+    monkeypatch.setattr(core, "_gateway_names", lambda: ("worker-4", {"worker-4", "macbook", "hub"}))
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    paths = _synced(tmp_path, created_on="hub")
+    why = plugin.classify("kanban_complete", {"summary": "Shipped."}, OWN, paths)
+    assert why and f"hermes-hub adopt-task hub default/default/{OWN}" in why
+    assert "worker-4" not in why
+
+
+def test_board_synced_card_owned_by_origin_gateway_has_no_wrong_owner_hint(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "_gateway_names", lambda: ("worker-4", {"worker-4", "macbook", "hub"}))
+    why = plugin.classify("kanban_complete", {"summary": "Shipped."}, OWN, _synced(tmp_path))
+    assert why and "worker-4" not in why and "adopt-task" not in why

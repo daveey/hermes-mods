@@ -474,20 +474,8 @@ def check_origin_reached(task_id: str, board: Path, body: str) -> Optional[str]:
         wanted = origin_sessions("\n".join([body] + comments))
         if not wanted:
             return None
-        reached: set[str] = set()
-        try:  # the creating chat: its 'created' chat link is written later by the sync loop's reconcile
-            row = conn.execute("SELECT session_id FROM tasks WHERE id=?", (task_id,)).fetchone()
-            if row and row[0]:
-                reached.add(str(row[0]))
-        except sqlite3.Error:
-            pass
-        if _has_table(conn, "task_chat_links"):
-            reached |= {r[0] for r in conn.execute(
-                "SELECT chat_session FROM task_chat_links WHERE task_id=? AND released=0", (task_id,))}
-        if _has_table(conn, "kanban_notify_subs"):
-            # tui subs store the bare session; cross-gateway ('hub') subs store <gateway>/<profile>/<session>.
-            reached |= {(r[0] or "").rsplit("/", 1)[-1] for r in conn.execute(
-                "SELECT chat_id FROM kanban_notify_subs WHERE task_id=?", (task_id,))}
+        reached = _reached_chats(conn, task_id)
+        owner = _created_on(conn, task_id)
         for c in comments:
             if REPORTED_RE.search(c) and not FAILED_SEND_RE.search(c):
                 reached |= {s for s in wanted if s in c}
@@ -496,9 +484,60 @@ def check_origin_reached(task_id: str, board: Path, body: str) -> Optional[str]:
         return None
     finally:
         conn.close()
+    if missing:
+        # A Board-synced card run on another machine (runs_on machine:X) has a copy of its row on X's live board,
+        # but its chat links are written on the owning gateway and reach X only through the Board replica
+        # (t_01a1d48abbb62104: owned by macbook, run on worker-4, linked on macbook, refused on worker-4).
+        for p in replica_paths([board]):
+            try:
+                rconn = ro_connect(p)
+            except sqlite3.Error:
+                continue
+            try:
+                if not _has_table(rconn, "tasks"):
+                    continue
+                found_here = rconn.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone()
+                if not found_here:
+                    continue
+                hit = _reached_chats(rconn, task_id)
+                missing = [s for s in missing if s not in hit]
+                owner = owner or _created_on(rconn, task_id)
+            except sqlite3.Error:
+                continue
+            finally:
+                rconn.close()
     if not missing:
         return None
-    return origin_refusal(task_id, missing) + remote_origin_hint(task_id, board, body, comments, missing[0])
+    return origin_refusal(task_id, missing) + remote_origin_hint(task_id, board, body, comments, missing[0],
+                                                                  owner=owner)
+
+
+def _reached_chats(conn: sqlite3.Connection, task_id: str) -> set[str]:
+    """Chats one board says will hear ``task_id`` finish: the creating chat, unreleased chat links, notify subs."""
+    reached: set[str] = set()
+    try:  # the creating chat: its 'created' chat link is written later by the sync loop's reconcile
+        row = conn.execute("SELECT session_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if row and row[0]:
+            reached.add(str(row[0]))
+    except sqlite3.Error:
+        pass
+    if _has_table(conn, "task_chat_links"):
+        reached |= {r[0] for r in conn.execute(
+            "SELECT chat_session FROM task_chat_links WHERE task_id=? AND released=0", (task_id,))}
+    if _has_table(conn, "kanban_notify_subs"):
+        # tui subs store the bare session; cross-gateway ('hub') subs store <gateway>/<profile>/<session>.
+        reached |= {(r[0] or "").rsplit("/", 1)[-1] for r in conn.execute(
+            "SELECT chat_id FROM kanban_notify_subs WHERE task_id=?", (task_id,))}
+    return reached
+
+
+def _created_on(conn: sqlite3.Connection, task_id: str) -> str:
+    """Gateway that owns a Board-synced card (``tasks.created_on``); '' when unknown (older schema, local card)."""
+    try:
+        row = conn.execute("SELECT created_on FROM tasks WHERE id=?", (task_id,)).fetchone()
+    except sqlite3.Error:
+        return ""
+    return str(row[0]).strip() if row and row[0] else ""
 
 
 def _board_slug(board: Path) -> str:
@@ -507,12 +546,18 @@ def _board_slug(board: Path) -> str:
     return p.parent.name if p.parent.parent.name == "boards" else "default"
 
 
-def remote_origin_hint(task_id: str, board: Path, body: str, comments: list[str], session: str) -> str:
+def remote_origin_hint(task_id: str, board: Path, body: str, comments: list[str], session: str,
+                       owner: str = "") -> str:
     """For an origin chat on ANOTHER gateway: a worker's cross_session send to a human chat is refused, and
     ``kanban_origin_adopt`` only runs inside a courier-delivered adoption. The link is made from the origin gateway
-    with ``hermes-hub adopt-task``; a worker gets that run there with ``hermes-hub create-task``. '' otherwise."""
+    with ``hermes-hub adopt-task``; a worker gets that run there with ``hermes-hub create-task``. '' otherwise.
+
+    ``owner`` is the card's owning gateway (``tasks.created_on``). A Board-synced card run here via runs_on is still
+    the owner's card: adopt-task must name the owner, never this executing machine, or the bind can never apply
+    and a ``links --expect <this machine>/...`` wait never passes (t_01a1d48abbb62104)."""
     names = _gateway_names()
     me = names[0] if names else ""
+    me = owner or me
     text = _DQUOTED.sub('""', "\n".join([body] + comments))
     gw = next((m["gw"] for m in ORIGIN_REF_RE.finditer(text) if m["sid"] == session), "")
     if not gw or not me or gw == me:
