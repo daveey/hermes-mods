@@ -49,9 +49,27 @@ Invariants (each has a test in `tests_user_terminal.py` or `../session-mentions/
    - A poll for a job the Mac has no record of says `result lost: … The command may have run. Do not resend
      it; verify by its side effect`, never `unknown job_id`.
 
-- Owned-prompt withdrawal is not relayed: `action: withdraw` on a screenless gateway returns an error (never a
-  silent resume). The Mac's job-local watchdog still withdraws a relayed job after `user_terminal.max_wait_minutes`
-  and marks it `abandoned` when its window dies; the remote card's board is not read from the Mac.
+- Withdrawal (`action: withdraw`, job_id = the request id or the Mac's job_id; t_01a1d47bf0506084). Tests:
+  `test_withdraw_unclaimed_relayed_request_and_the_reconnecting_mac_never_opens_it`,
+  `test_hub_claim_and_withdraw_race_exactly_one_wins`, `test_mac_start_and_withdraw_of_one_request_exactly_one_wins`,
+  `test_claimed_then_mac_offline_withdraw_is_queued_and_applied_on_reconnect`,
+  `test_withdraw_claimed_running_job_through_a_live_courier`, `test_withdraw_through_an_old_mac_says_nothing_was_withdrawn`,
+  `../session-mentions/tests/user-terminal.test.mjs` ("withdraw: ..."):
+  - Still in the gateway's outbox (unclaimed): the gateway unlinks it. The courier's claim is `os.replace` of that
+    same file, so exactly one wins; a Mac that reconnects never sees it. Ledger `withdrawn`, result `ok`,
+    `status: withdrawn`; a later poll by that id reads `withdrawn` without a courier.
+  - Already claimed: the withdrawal goes to the Mac as a `user_terminal` request with `args.withdraw_request`;
+    the courier sends it to the Mac's own `POST /start` with `origin.withdraw` (so a backend whose routes were
+    mounted earlier serves it) and an empty command (so an older Mac module refuses it and opens nothing: the
+    gateway then answers `mac_too_old`, nothing withdrawn). On the Mac, `withdraw_relayed` takes the lock
+    `start_relayed` holds while it checks and creates the job: no job yet -> a tombstone per (gateway, request),
+    and a later start of that request is refused before any job or window; a job -> `withdraw_job` (marker,
+    final gate, command group killed). The answer names the job and its Mac job dir.
+  - Courier away or not picking up: the withdrawal is queued in the outbox for 1 h (`WITHDRAW_QUEUE_S`, the
+    outbox sweep's limit), `status: withdraw_queued`. A Desktop that quit while holding a claimed request already
+    dropped it: claimed requests are never delivered again.
+  - Pending-job timeouts are unchanged: the Mac's watchdog still withdraws after `user_terminal.max_wait_minutes`
+    and marks a job whose window died `abandoned`; the remote card's board is not read from the Mac.
 
 ## How it works
 
@@ -133,4 +151,24 @@ Not the cause: the Desktop restart (quit 23:09 local, back 23:45; the job dir an
   survived) or the courier reconnect; the hub never stores job records.
 Countermeasures: invariant 6 above (ledger, request-id lookup, offline = pending, no resend, "result lost");
   core: keep a cancelled call's own result next to the stamp (follow-up card from t_01a1d40fc0dda5c3).
+```
+
+### Why a superseded relayed apply could not be taken back (2026-11-13, t_01a1d47bf0506084)
+
+```
+Problem: hub session 20261111_200009_edbe39 superseded relay request e2aafe9a… (a Terraform plan+apply of the
+  hermes-worker-asg launch template at d517a63aa1) and `action: withdraw` answered "withdraw is not available
+  for a job relayed to the owner's Mac". Running it after the newer cce3417 apply would roll the template back.
+Why 1: the MacBook's courier claimed it at 09:50:45Z (session_mentions/claimed/), the tool call was interrupted
+  at 09:51:13Z, and the Desktop quit at 09:52:26Z before /start created a Mac job; the ledger stayed `sent`.
+Why 2: handle_remote refused every withdraw; the only stop was the Mac's watchdog (max_wait) on a job, and here
+  there was no job and no reachable Mac to ask.
+Why 3: relayed withdrawal had never been designed: the outbox had cancel() (unclaimed only) but no caller, and
+  the Mac had no record of "this request was taken back" for a start arriving later.
+Root (happened): an owner chat can queue a request to a Mac but not take it back.
+Root (not caught): withdraw was tested only for local and claimed jobs; nothing covered "relayed, then
+  superseded, before the Mac reconnects". The new race test also found claim_pending crashing when a request is
+  unlinked between its listing and its sort (relay_files `_mtime`).
+Countermeasures: the Withdrawal invariant above (outbox unlink vs claim, Mac tombstone under the start lock,
+  queued withdrawal for an offline courier) with its tests.
 ```

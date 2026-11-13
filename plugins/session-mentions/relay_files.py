@@ -271,7 +271,14 @@ def claim_pending(base: Path | None = None, home: bool = True, courier: Any = ""
         home_names.discard("")
     out = []
     now = time.time()
-    for path in sorted(pending, key=lambda p: p.stat().st_mtime):
+
+    def _mtime(p: Path) -> float:  # a request withdrawn (unlinked) after the listing sorts first, then is skipped
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    for path in sorted(pending, key=_mtime):
         try:
             peek = json.loads(path.read_text())
         except Exception:

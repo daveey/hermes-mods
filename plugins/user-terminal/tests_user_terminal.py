@@ -377,10 +377,10 @@ class FakeCourier(threading.Thread):
     answer back (a Mac whose answer arrives after the gateway stopped waiting)."""
 
     def __init__(self, base: Path, device: str, gateway_key: str = "nous-1", aliases=(), legacy=False,
-                 start_delay=0.0):
+                 start_delay=0.0, old_withdraw=False):
         super().__init__(daemon=True)
         self.base, self.device, self.gw, self.aliases = base, device, gateway_key, list(aliases) or [device]
-        self.legacy, self.start_delay = legacy, start_delay
+        self.legacy, self.start_delay, self.old_withdraw = legacy, start_delay, old_withdraw
         self.stop, self.claimed = threading.Event(), []
 
     def run(self):
@@ -388,14 +388,18 @@ class FakeCourier(threading.Thread):
             for req in rf.claim_pending(self.base, home=False, courier=self.device, reach=["nous-1"], aliases=self.aliases):
                 self.claimed.append(req)
                 a = req["args"]
-                if a.get("job_id"):
+                if a.get("withdraw_request") and not self.old_withdraw:  # plugin.js: /start with origin.withdraw
+                    res = ut.start_relayed("", "", "", {"gateway": self.gw, "request_id": a["withdraw_request"],
+                                                        "job_id": a.get("withdraw_job") or "",
+                                                        "withdraw": a.get("reason") or "withdrawn by its gateway"})
+                elif a.get("job_id"):
                     res = ut.relayed_status(a["job_id"], self.gw, a.get("wait_s") or 0)
                 else:
                     origin = {"gateway": self.gw, "profile": req["sender"].get("profile"),
                               "session_id": req["sender"].get("session_id"), "title": req["sender"].get("title")}
                     if not self.legacy:
                         origin["request_id"] = req["id"]
-                    res = ut.start_relayed(a["command"], a.get("reason"), a.get("cwd"), origin)
+                    res = ut.start_relayed(a.get("command") or "", a.get("reason"), a.get("cwd"), origin)
                     time.sleep(self.start_delay)
                 rf.write_result(req["id"], {**res, "device": self.device}, self.base)
             time.sleep(0.1)
@@ -658,6 +662,10 @@ def test_dashboard_routes_start_and_status(remote, monkeypatch, tmp_path):
     assert st["status"] == "pending"
     assert c.get(f"/api/plugins/user-terminal/status/{r['job_id']}?gateway=other").json()["ok"] is False
     assert c.post("/api/plugins/user-terminal/start", json={"command": "x"}).json()["ok"] is False  # no origin
+    # withdrawal rides the same route (origin.withdraw), so a backend mounted before it existed serves it
+    w = c.post("/api/plugins/user-terminal/start", json={"command": "", "origin": {
+        "gateway": "nous-1", "request_id": "ab" * 16, "job_id": r["job_id"], "withdraw": "superseded"}}).json()
+    assert w["ok"] and w["status"] == "withdrawn" and w["job_id"] == r["job_id"]
 
 
 @pytest.mark.parametrize("out", [
@@ -1358,10 +1366,220 @@ def test_watchdog_dead_runner_becomes_abandoned_but_not_before_launch(tmp_path, 
     assert st["status"] == "abandoned" and st["ok"] is False
 
 
-def test_remote_withdraw_is_refused_not_resumed(remote, monkeypatch):
+def test_remote_withdraw_of_an_unknown_id_errors_and_never_resumes(remote, monkeypatch):
     monkeypatch.setattr(ut, "owner_refusal", lambda sid: None)
     res = json.loads(ut.handle_remote({"action": "withdraw", "job_id": "x", "reason": "r", "wait_s": 1}))
-    assert res["ok"] is False and "withdraw is not available" in res["error"]
+    assert res["ok"] is False and res["code"] == "unknown_request" and "nothing was withdrawn" in res["error"]
+    assert not _outbox(remote[0])
+
+
+# ---- withdrawing a relayed request (t_01a1d47bf0506084): an owner chat superseded a relayed Terraform apply
+# while the MacBook's Desktop was away and could not take it back.
+
+def _ledger(base: Path, rid: str) -> dict:
+    return json.loads((ut.ledger_dir(base) / f"{rid}.json").read_text())
+
+
+def _sent_unclaimed(base: Path, monkeypatch, tmp_path, command="terraform apply") -> dict:
+    """A start written to the outbox whose tool call was interrupted before any courier claimed it."""
+    monkeypatch.setattr(ut, "_interrupted", lambda: True)
+    first = json.loads(ut.handle_remote({"command": command, "cwd": str(tmp_path), "wait_s": 1}, "s1"))
+    monkeypatch.setattr(ut, "_interrupted", lambda: False)
+    assert first["error"] == "interrupted" and len(_outbox(base)) == 1, first
+    return first
+
+
+def test_withdraw_unclaimed_relayed_request_and_the_reconnecting_mac_never_opens_it(remote, monkeypatch, tmp_path):
+    """Tool call path + the Mac's outbox pickup after reconnect: a withdrawn request never opens a window."""
+    base, mac = remote
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DEVICE", "macbook")
+    opened = []
+    monkeypatch.setattr(ut, "open_window", lambda job: opened.append(job) or "fake")
+    _beat(base, "macbook")
+    first = _sent_unclaimed(base, monkeypatch, tmp_path)
+    rid = first["job_id"]
+    assert _ledger(base, rid)["state"] == "sent"
+    old = time.time() - 120  # the Desktop quits before claiming it
+    os.utime(base / "couriers" / "macbook.json", (old, old))
+    out = json.loads(ut.handle_remote({"action": "withdraw", "job_id": rid, "reason": "superseded by cce3417"}, "s1"))
+    assert out["ok"] is True and out["status"] == "withdrawn" and out["where"] == "gateway outbox", out
+    assert not _outbox(base)  # gone from the hub outbox
+    led = _ledger(base, rid)
+    assert led["state"] == "withdrawn" and led["withdraw_confirmed"] and led["withdraw_reason"] == "superseded by cce3417"
+    back = FakeCourier(base, "macbook")  # the Desktop reconnects and drains the outbox
+    _beat(base, "macbook")
+    back.start()
+    try:
+        time.sleep(1.0)
+        polled = json.loads(ut.handle_remote({"job_id": rid, "wait_s": 1}, "s1"))
+    finally:
+        back.stop.set()
+    assert not back.claimed and not opened and _mac_jobs(mac) == []  # nothing claimed, no window, no job
+    assert polled["ok"] and polled["status"] == "withdrawn", polled
+    again = json.loads(ut.handle_remote({"action": "withdraw", "job_id": rid, "reason": "x"}, "s1"))
+    assert again["ok"] and again["already"]  # idempotent
+
+
+def test_hub_claim_and_withdraw_race_exactly_one_wins(remote, monkeypatch, tmp_path):
+    """The courier's claim (os.replace out of the outbox) and withdraw (unlink) race on the same file."""
+    base, _ = remote
+    monkeypatch.setattr(ut, "PICKUP_S", 0.05)
+    monkeypatch.setattr(ut, "WITHDRAW_RESULT_S", 1.0)  # past pickup, so an unclaimed withdrawal reads not_picked_up
+    claims = withdraws = 0
+    for _ in range(60):
+        rid = ut._queue_request(base, "macbook", {"command": "true", "cwd": str(tmp_path)}, {"platform": "desktop"}, 20)
+        ut.ledger_put(base, {"request_id": rid, "job_id": None, "device": "macbook", "session_id": "s1", "key": "k",
+                             "created": time.time(), "state": "sent"})
+        go, got = threading.Barrier(2), {}
+
+        def claim():
+            go.wait()
+            got["claimed"] = [r["id"] for r in rf.claim_pending(base, home=False, courier="macbook", reach=["nous-1"])]
+
+        def withdraw():
+            go.wait()
+            got["w"] = ut.withdraw_remote(base, rid, "superseded")
+
+        ts = [threading.Thread(target=claim), threading.Thread(target=withdraw)]
+        [t.start() for t in ts]
+        [t.join(10) for t in ts]
+        claimed = rid in got["claimed"]
+        from_outbox = got["w"].get("where") == "gateway outbox"
+        assert claimed != from_outbox, (got, rid)  # exactly one of the two took the request
+        if claimed:  # the loser's withdrawal goes on to the Mac (queued: nobody answers here)
+            assert got["w"].get("status") == "withdraw_queued", got
+        claims += claimed
+        withdraws += from_outbox
+        for p in _outbox(base):
+            p.unlink()
+    assert claims + withdraws == 60
+
+
+def test_mac_start_and_withdraw_of_one_request_exactly_one_wins(remote, monkeypatch, tmp_path):
+    """Mac side: a claimed start racing its withdrawal. Withdraw first -> the start is refused before any job or
+    window; start first -> the job exists and is withdrawn (the error-free result names the Mac job dir)."""
+    _, mac = remote
+    opened = []
+    monkeypatch.setattr(ut, "open_window", lambda job: opened.append(job) or "fake")
+    rid = "e2aafe9a2ec443a3a651405b8f90c8ab"
+    w = ut.withdraw_relayed(rid, "nous-1", "superseded")
+    assert w["ok"] and w["status"] == "withdrawn" and w["job_id"] is None
+    late = ut.start_relayed("terraform apply", "", str(tmp_path), {**ORIGIN, "request_id": rid})
+    assert late["ok"] is False and late["status"] == "withdrawn" and "nothing ran" in late["error"]
+    assert not opened and _mac_jobs(mac) == []
+    assert ut.relayed_status(rid, "nous-1", 0)["status"] == "withdrawn"
+    assert ut.relayed_status(rid, "hermes-hub", 0)["ok"] is False  # another gateway's tombstone is not its own
+    rid2 = "e2aafe9a2ec443a3a651405b8f90c8ac"
+    started = ut.start_relayed("terraform apply", "", str(tmp_path), {**ORIGIN, "request_id": rid2})
+    assert started["ok"] and opened
+    w2 = ut.withdraw_relayed(rid2, "nous-1", "superseded")
+    assert w2["ok"] and w2["status"] == "withdrawn" and w2["job_id"] == started["job_id"]
+    assert w2["job_dir"] == str(mac / started["job_id"]) and ut.read_status(mac / started["job_id"])["status"] == "withdrawn"
+    other = ut.start_relayed("true", "", str(tmp_path), {**ORIGIN, "request_id": "f" * 32})
+    ut.withdraw_relayed("f" * 32, "hermes-hub", "x")  # another gateway never reaches nous-1's job
+    assert ut.read_status(mac / other["job_id"])["status"] != "withdrawn"
+    # concurrent: whichever wins, a job that exists is withdrawn and nothing is left waiting
+    for i in range(20):
+        r = f"{i:032x}"
+        go, got = threading.Barrier(2), {}
+
+        def start():
+            go.wait()
+            got["s"] = ut.start_relayed("true", "", str(tmp_path), {**ORIGIN, "request_id": r})
+
+        def withdraw():
+            go.wait()
+            got["w"] = ut.withdraw_relayed(r, "nous-1", "superseded")
+
+        ts = [threading.Thread(target=start), threading.Thread(target=withdraw)]
+        [t.start() for t in ts]
+        [t.join(10) for t in ts]
+        assert got["w"]["ok"] and got["w"]["status"] == "withdrawn", got
+        job = ut.find_relayed_by_request(r, "nous-1")
+        if got["s"]["ok"]:
+            assert job is not None and ut.read_status(job)["status"] == "withdrawn"
+        else:
+            assert got["s"]["status"] == "withdrawn" and (job is None or ut.read_status(job)["status"] == "withdrawn")
+
+
+def test_claimed_then_mac_offline_withdraw_is_queued_and_applied_on_reconnect(remote, monkeypatch, tmp_path):
+    """The e2aafe9a shape: the MacBook's courier claimed the start, then its Desktop quit. The withdrawal waits in
+    the outbox; the reconnecting Mac applies it, and a late start of the held request never opens a window."""
+    base, mac = remote
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DEVICE", "macbook")
+    monkeypatch.setattr(ut, "POLL_S", 1)
+    opened = []
+    monkeypatch.setattr(ut, "open_window", lambda job: opened.append(job) or "fake")
+    _beat(base, "macbook")
+    first = _sent_unclaimed(base, monkeypatch, tmp_path)
+    rid = first["job_id"]
+    held = rf.claim_pending(base, home=False, courier="macbook", reach=["nous-1"])  # claimed; Desktop then quits
+    assert [r["id"] for r in held] == [rid]
+    old = time.time() - 120
+    os.utime(base / "couriers" / "macbook.json", (old, old))
+    out = json.loads(ut.handle_remote({"action": "withdraw", "job_id": rid, "reason": "superseded"}, "s1"))
+    assert out["ok"] and out["status"] == "withdraw_queued" and "do not resend" in out["note"], out
+    queued = [json.loads(p.read_text()) for p in _outbox(base)]
+    assert len(queued) == 1 and queued[0]["args"]["withdraw_request"] == rid and queued[0]["ttl"] == ut.WITHDRAW_QUEUE_S
+    assert _ledger(base, rid)["state"] == "withdrawn" and not _ledger(base, rid)["withdraw_confirmed"]
+    back = FakeCourier(base, "macbook")
+    _beat(base, "macbook")
+    back.start()
+    try:
+        deadline = time.time() + 5
+        while time.time() < deadline and not back.claimed:
+            time.sleep(0.1)
+        time.sleep(0.3)
+        req = held[0]  # the held start arrives late (a retried /start): refused, nothing opens
+        late = ut.start_relayed(req["args"]["command"], "", req["args"]["cwd"], {**ORIGIN, "request_id": rid})
+        polled = json.loads(ut.handle_remote({"job_id": rid, "wait_s": 1}, "s1"))
+    finally:
+        back.stop.set()
+    assert late["status"] == "withdrawn" and not opened and _mac_jobs(mac) == []
+    assert polled["ok"] and polled["status"] == "withdrawn", polled
+
+
+def test_withdraw_claimed_running_job_through_a_live_courier(remote, monkeypatch, tmp_path):
+    base, mac = remote
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
+    monkeypatch.setattr(ut, "POLL_S", 1)
+    monkeypatch.setattr(ut, "open_window", lambda job: "fake")
+    c = FakeCourier(base, "macbook")
+    _beat(base, "macbook")
+    c.start()
+    try:
+        first = json.loads(ut.handle_remote({"command": "sleep 600", "cwd": str(tmp_path), "wait_s": 1}, "s1"))
+        job = mac / first["job_id"]
+        (job / "status.json").write_text(json.dumps({"status": "running"}))
+        out = json.loads(ut.handle_remote({"action": "withdraw", "job_id": first["job_id"], "reason": "superseded"}, "s1"))
+        polled = json.loads(ut.handle_remote({"job_id": first["job_id"], "wait_s": 1}, "s1"))
+    finally:
+        c.stop.set()
+    assert out["ok"] and out["status"] == "withdrawn" and out["job_id"] == first["job_id"], out
+    assert out["job_dir"] == str(job) and (job / "withdraw").read_text() == "superseded"
+    assert polled["status"] == "withdrawn"
+    rid = next(e["request_id"] for e in ut.ledger_entries(base))
+    assert _ledger(base, rid)["withdraw_confirmed"]
+
+
+def test_withdraw_through_an_old_mac_says_nothing_was_withdrawn(remote, monkeypatch, tmp_path):
+    base, mac = remote
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
+    monkeypatch.setattr(ut, "POLL_S", 1)
+    opened = []
+    monkeypatch.setattr(ut, "open_window", lambda job: opened.append(job) or "fake")
+    c = FakeCourier(base, "macbook", old_withdraw=True)
+    _beat(base, "macbook")
+    c.start()
+    try:
+        first = json.loads(ut.handle_remote({"command": "true", "cwd": str(tmp_path), "wait_s": 1}, "s1"))
+        out = json.loads(ut.handle_remote({"action": "withdraw", "job_id": first["job_id"], "reason": "r"}, "s1"))
+    finally:
+        c.stop.set()
+    assert out["ok"] is False and out["code"] == "mac_too_old" and "nothing was withdrawn" in out["error"], out
+    assert len(opened) == 1 and len(_mac_jobs(mac)) == 1  # the withdrawal itself opened nothing
 
 
 

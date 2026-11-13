@@ -91,7 +91,8 @@ Desktop courier claims it and calls this plugin's own dashboard routes on the Ma
 (``create_job`` + ``open_window`` + ``wait_for``). The window names the originating
 gateway/profile/session. Only the owner's own sessions (desktop/cli/tui/api_server) may call it; a session
 on a messaging platform (e.g. Slack on a shared bot) is refused. No live courier for that Mac -> an
-immediate error, never a silent wait.
+immediate error, never a silent wait. ``action: withdraw`` takes a relayed request back: out of the outbox while
+unclaimed, else through the Mac (``withdraw_relayed``: tombstone or ``withdraw_job``); see REMOTE.md.
 """
 
 from __future__ import annotations
@@ -2617,7 +2618,15 @@ def transform_terminal_output(command: str = "", output: str = "", **_: Any) -> 
 # ---------------------------------------------------------------- relayed jobs (Mac side)
 
 def start_relayed(command: str, reason: str, cwd: str, origin: dict) -> dict:
-    """Open the run window for a job relayed from another gateway (dashboard ``POST /start``)."""
+    """Open the run window for a job relayed from another gateway (dashboard ``POST /start``).
+
+    ``origin.withdraw`` (a reason string) makes it a withdrawal of request ``origin.request_id`` instead (the
+    courier sends it on this same route, so a Mac backend whose routes were mounted before /withdraw existed
+    still serves it; see withdraw_relayed). A Mac module from before that checks ``command`` first and
+    refuses the empty command, so an old Mac never opens a window for a withdrawal."""
+    if isinstance(origin, dict) and origin.get("withdraw") is not None:
+        return withdraw_relayed(str(origin.get("request_id") or ""), str(origin.get("gateway") or ""),
+                                str(origin.get("withdraw") or ""), str(origin.get("job_id") or ""))
     command = str(command or "").strip()
     if not command:
         return {"ok": False, "error": "command is required"}
@@ -2626,16 +2635,25 @@ def start_relayed(command: str, reason: str, cwd: str, origin: dict) -> dict:
     origin = dict(origin)
     rid = _request_id(origin.get("request_id"))
     origin.pop("request_id", None)
-    if rid:
-        origin["request_id"] = rid
-        prior = find_relayed_by_request(rid, str(origin.get("gateway") or ""))
-        if prior is not None:  # the same courier request again (a retried POST): never a second window
-            return {**wait_for(prior, 0), "ok": True, "job_id": prior.name, "duplicate_request": True}
+    gateway = str(origin.get("gateway") or "")
     cwd = os.path.expanduser(str(cwd or "").strip() or "~")
-    if not os.path.isdir(cwd):
-        return {"ok": False, "error": f"cwd does not exist on the Mac: {cwd}"}
-    job = create_job(command, str(reason or ""), cwd, origin,
-                     owner={"kind": "relayed", "gateway": str(origin.get("gateway") or "")})
+    with _relayed_lock():  # one of start / withdraw of the same request wins (withdraw_relayed)
+        if rid:
+            origin["request_id"] = rid
+            tomb = relayed_withdrawn(rid, gateway)
+            if tomb is not None:  # its gateway took it back before it opened here: never a window
+                return {"ok": False, "status": "withdrawn", "code": "withdrawn", "request_id": rid,
+                        "reason": tomb.get("reason") or "",
+                        "error": f"refused: request {rid} was withdrawn by {gateway} before it opened; nothing ran"}
+            prior = find_relayed_by_request(rid, gateway)
+            if prior is not None:  # the same courier request again (a retried POST): never a second window
+                return {**wait_for(prior, 0), "ok": True, "job_id": prior.name, "duplicate_request": True}
+        if not os.path.isdir(cwd):
+            return {"ok": False, "error": f"cwd does not exist on the Mac: {cwd}"}
+        job = create_job(command, str(reason or ""), cwd, origin, owner={"kind": "relayed", "gateway": gateway})
+    if (job / "withdraw").exists():  # withdrawn between create_job and here: no window at all
+        return {**read_status(job), "ok": False, "job_id": job.name, "code": "withdrawn",
+                "error": f"refused: request {rid} was withdrawn by {gateway} before its window opened; nothing ran"}
     spawn_watchdog(job)  # max age + dead runner; the remote card's board is not readable here
     where, failed = _open_or_fail(job, "could not open a terminal window on the Mac")
     if failed:
@@ -2687,9 +2705,101 @@ def relayed_status(job_id: str, gateway: str, wait_s: float) -> dict:
     if not job_id or not job.is_dir() or not gateway or job_origin_gateway(job) != gateway:
         job = find_relayed_by_request(str(job_id or ""), gateway)
     if job is None:
+        tomb = relayed_withdrawn(str(job_id or ""), gateway)
+        if tomb is not None:  # withdrawn before any job existed here: that is its outcome, not "not found"
+            return {"ok": True, "status": "withdrawn", "job_id": str(job_id), "reason": tomb.get("reason") or "",
+                    "note": "withdrawn before a window opened on this Mac; nothing ran"}
         return {"ok": False, "code": "job_not_found",
                 "error": f"no job {job_id} on this Mac for gateway {gateway or '(none)'}"}
     return wait_for(job, max(0.0, min(float(wait_s or 0), 25.0)), reconcile=True)
+
+
+# Withdrawal of a relayed request (t_01a1d47bf0506084). The gateway takes an unclaimed request out of its own
+# outbox; once a courier claimed it, the withdrawal travels to the Mac like any other request and lands here.
+# A tombstone per (gateway, request id) is written under the same lock start_relayed holds while it checks for
+# one and creates the job, so exactly one wins: a start that comes later (a courier retry, a slow /start) is
+# refused before create_job, and a job that already exists is withdrawn with withdraw_job (marker + final gate,
+# its command killed if it runs).
+RELAYED_WITHDRAWN_KEEP_S = 7 * 86400
+
+
+def _relayed_tomb_dir() -> Path:
+    d = jobs_dir().parent / "user-terminal-relayed-withdrawn"  # beside the job dirs, never one of them
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+class _relayed_lock:
+    """Exclusive flock serialising start_relayed's create and withdraw_relayed's check (threads + processes)."""
+
+    def __enter__(self):
+        import fcntl
+
+        self._f = open(_relayed_tomb_dir() / ".lock", "a+")
+        fcntl.flock(self._f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        self._f.close()  # closing the descriptor releases the flock
+        return False
+
+
+def _tomb_path(request_id: str, gateway: str) -> Path | None:
+    rid, gw = _request_id(request_id), _slug(gateway)
+    return _relayed_tomb_dir() / f"{gw}--{rid}.json" if rid and gw else None
+
+
+def relayed_withdrawn(request_id: str, gateway: str) -> dict | None:
+    """The tombstone of a request its gateway withdrew before a job existed here, else None."""
+    path = _tomb_path(request_id, gateway)
+    if path is None or not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        data = {}
+    return data if isinstance(data, dict) else {}
+
+
+def withdraw_relayed(request_id: str, gateway: str, reason: str, job_id: str = "") -> dict:
+    """Withdraw relayed request ``request_id`` (or its job ``job_id``) for origin ``gateway``. No job yet: a
+    tombstone, so it never opens. A job: withdraw_job (its outcome when already final; the legacy error names
+    the job). Only the gateway that sent it may withdraw it."""
+    reason = " ".join(str(reason or "withdrawn by its gateway").split())[:500] or "withdrawn by its gateway"
+    rid = _request_id(request_id)
+    if not gateway or not (rid or job_id):
+        return {"ok": False, "error": "a relayed withdrawal must name its origin gateway and request id"}
+    with _relayed_lock():
+        job = None
+        if job_id:
+            cand = jobs_dir() / Path(job_id).name
+            if cand.is_dir() and job_origin_gateway(cand) == gateway:
+                job = cand
+        if job is None and rid:
+            job = find_relayed_by_request(rid, gateway)
+        if job is None:
+            path = _tomb_path(rid, gateway)
+            if path is None:
+                return {"ok": False, "code": "job_not_found",
+                        "error": f"no job {job_id} on this Mac for gateway {gateway}"}
+            for old in path.parent.glob("*.json"):
+                try:
+                    if time.time() - old.stat().st_mtime > RELAYED_WITHDRAWN_KEEP_S:
+                        old.unlink()
+                except OSError:
+                    pass
+            tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+            tmp.write_text(json.dumps({"request_id": rid, "gateway": gateway, "reason": reason, "at": time.time()}))
+            os.replace(tmp, path)
+            return {"ok": True, "status": "withdrawn", "request_id": rid, "job_id": None, "reason": reason,
+                    "note": "no window had opened for it on this Mac, and none will"}
+    st = withdraw_job(job, reason)
+    out = {**st, "job_id": job.name, "job_dir": str(job), "request_id": rid or None}
+    if st.get("withdraw") == "unsupported":
+        out.update(ok=False, error=f"{st.get('error')} (Mac job dir {job})")
+    else:
+        out["ok"] = True
+    return out
 
 
 # ---------------------------------------------------------------- remote mode (gateway with no screen)
@@ -2963,8 +3073,9 @@ def start_failed(base: Path, entry: dict, res: dict, device: str) -> dict:
     and the answer says how to find its outcome."""
     out = {**res, "ok": False, "device": device}
     error = str(res.get("error") or "")
-    if res.get("code") == "not_picked_up" or res.get("status") == "failed" or _NOT_STARTED.match(error):
-        ledger_close(base, entry, "final", "not_started")
+    if (res.get("code") == "not_picked_up" or res.get("status") in ("failed", "withdrawn")
+            or _NOT_STARTED.match(error)):
+        ledger_close(base, entry, "final", "withdrawn" if res.get("status") == "withdrawn" else "not_started")
         return out
     rid = entry["request_id"]
     out["job_id"] = rid
@@ -3002,20 +3113,130 @@ def duplicate_note(entry: dict, job_id: str) -> str:
             f"state. To run it again after reading this result, call again with the command.")
 
 
+# ---------------------------------------------------------------- withdrawing a relayed request (t_01a1d47bf0506084)
+# Problem: an owner chat superseded a relayed Terraform apply while the MacBook's Desktop was away, and withdraw
+# was refused for every relayed job, so the stale apply stayed armed. Now:
+#  1. still in this gateway's outbox (unclaimed): unlink it. The courier's claim is os.replace of that same file,
+#     so exactly one of the two succeeds; a reconnecting Mac never sees a withdrawn request.
+#  2. already claimed: the withdrawal goes to the Mac as a request of its own (withdraw_relayed there: a
+#     tombstone under the start lock, or withdraw_job on the existing job). Courier away or not picking up:
+#     the withdrawal is queued in the outbox for WITHDRAW_QUEUE_S, the longest any outbox file lives (sweep).
+WITHDRAW_RESULT_S = 30.0
+WITHDRAW_QUEUE_S = 3600.0  # relay_files.STALE_SECONDS: the sweep drops any outbox file older than this
+
+
+def _courier_live(base: Path, device: str) -> bool:
+    return any(device == c.get("device") or device in (c.get("aliases") or []) for c in live_couriers(base))
+
+
+def _queue_request(base: Path, device: str, args: dict, sender: dict, ttl: float) -> str:
+    rid = uuid.uuid4().hex
+    path = base / "outbox" / f"{rid}.json"
+    tmp = path.with_name(f".{rid}.tmp")
+    tmp.write_text(json.dumps({"id": rid, "action": "user_terminal", "route": device, "args": args,
+                               "sender": sender, "created_at": time.time(), "ttl": ttl}))
+    os.replace(tmp, path)
+    return rid
+
+
+def withdraw_remote(base: Path, ident: str, reason: str, session_id: str | None = None) -> dict:
+    """``action: withdraw`` on a screenless gateway: take back a relayed request by its request id or Mac job_id."""
+    reason = " ".join(str(reason or "withdrawn by Hermes").split())[:500] or "withdrawn by Hermes"
+    ident = str(ident or "").strip()
+    if not ident:
+        return {"ok": False, "error": "withdraw needs job_id: the job_id or request id the start returned"}
+    entry = ledger_lookup(base, ident)
+    if entry is None:
+        return {"ok": False, "code": "unknown_request", "job_id": ident,
+                "error": (f"no relayed request {ident} is recorded on this gateway (the ledger keeps "
+                          f"{LEDGER_KEEP_S // 86400} days), so nothing was withdrawn. Use the job_id or request id "
+                          f"the start returned.")}
+    rid = str(entry.get("request_id") or "")
+    device = str(entry.get("device") or configured_device() or "the owner's Mac")
+    out = {"request_id": rid, "job_id": entry.get("job_id") or rid, "device": device, "reason": reason}
+    if entry.get("state") == "withdrawn" and entry.get("withdraw_confirmed"):
+        return {**out, "ok": True, "status": "withdrawn", "already": True,
+                "reason": entry.get("withdraw_reason") or reason, "note": "Already withdrawn; nothing else to do."}
+    if entry.get("state") not in OPEN_STATES + ("withdrawn",):
+        return {**out, "ok": False, "status": entry.get("status") or entry.get("state"),
+                "error": (f"nothing to withdraw: request {rid} already ended ({entry.get('status') or entry.get('state')})"
+                          f" and its outcome was read.")}
+    # 1. unclaimed: the outbox file is the request; whoever moves or removes it first wins.
+    try:
+        (base / "outbox" / f"{rid}.json").unlink()
+        won = True
+    except FileNotFoundError:
+        won = False
+    if won:
+        entry.update(withdraw_reason=reason, withdrawn_where="gateway outbox", withdraw_confirmed=True)
+        ledger_close(base, entry, "withdrawn", "withdrawn")
+        return {**out, "ok": True, "status": "withdrawn", "where": "gateway outbox",
+                "note": (f"Withdrawn: request {rid} was still in this gateway's outbox, unclaimed, and is gone. "
+                         f"`{device}` never received it: no window opens and nothing runs.")}
+    # 2. a courier claimed it: ask the Mac (now, or when its Desktop is back).
+    args = {"withdraw_request": rid, "withdraw_job": str(entry.get("job_id") or ""), "reason": reason}
+    sender = _sender(session_id)
+    res = relay_once(base, device, args, sender, WITHDRAW_RESULT_S) if _courier_live(base, device) else None
+    if res is None or res.get("code") == "not_picked_up":
+        qid = _queue_request(base, device, args, sender, WITHDRAW_QUEUE_S)
+        entry.update(withdraw_reason=reason, withdraw_request_id=qid, withdraw_confirmed=False)
+        ledger_close(base, entry, "withdrawn", "withdraw_queued")
+        return {**out, "ok": True, "status": "withdraw_queued", "withdraw_request_id": qid,
+                "note": (f"`{device}`'s Desktop already claimed request {rid} but is not connected now, so the "
+                         f"withdrawal is queued for it: when that Desktop reconnects within "
+                         f"{int(WITHDRAW_QUEUE_S // 60)} min, a window not yet open never opens and a running "
+                         f"command is stopped. A Desktop that quit while holding the request dropped it (claimed "
+                         f"requests are never delivered again). Call run_in_user_terminal with this job_id later "
+                         f"to read the outcome; do not resend.")}
+    status = res.get("status")
+    if res.get("ok") and status == "withdrawn":
+        entry.update(withdraw_reason=reason, withdrawn_where=device, withdraw_confirmed=True,
+                     **({"job_id": res["job_id"]} if res.get("job_id") else {}))
+        ledger_close(base, entry, "withdrawn", "withdrawn")
+        return {**out, **res, "ok": True, "status": "withdrawn", "request_id": rid,
+                "job_id": res.get("job_id") or out["job_id"], "device": device}
+    if res.get("ok") and status in FINAL:
+        if res.get("job_id"):
+            entry["job_id"] = res["job_id"]
+        ledger_close(base, entry, "final", status)
+        return {**out, **res, "ok": False, "request_id": rid, "device": device,
+                "error": (f"too late to withdraw: job {res.get('job_id')} already ended on `{device}` ({status}); "
+                          f"its outcome is in this result.")}
+    error = str(res.get("error") or "")
+    if res.get("code") == "no_answer":
+        return {**out, **res, "ok": False, "request_id": rid, "device": device,
+                "error": (f"`{device}` claimed the withdrawal of request {rid} but did not answer in time; it may "
+                          f"still apply there. Call withdraw again with this job_id to confirm; do not resend.")}
+    if error.startswith("command is required"):  # a Mac courier/module from before relayed withdrawal
+        return {**out, "ok": False, "code": "mac_too_old",
+                "error": (f"`{device}` runs a session-mentions/user-terminal plugin without relayed withdrawal, so "
+                          f"nothing was withdrawn there (request {rid} was already claimed). Its job, if any, "
+                          f"still ends after user_terminal.max_wait_minutes or when its window closes.")}
+    return {**out, **res, "ok": False, "request_id": rid, "device": device,
+            "error": error or f"`{device}` did not confirm the withdrawal of request {rid}"}
+
+
 def handle_remote(args: dict, session_id: str | None = None, **_kw: Any) -> str:
     try:
         refusal = owner_refusal(session_id)
         if refusal:
             return _err(refusal)
-        if str(args.get("action") or "").strip().lower() == "withdraw":  # not relayed (yet): never a silent resume
-            return _err("withdraw is not available for a job relayed to the owner's Mac; the Mac's watchdog "
-                        "withdraws it after user_terminal.max_wait_minutes or when its window closes")
+        if str(args.get("action") or "").strip().lower() == "withdraw":  # never a silent resume
+            return json.dumps(withdraw_remote(_root(), str(args.get("job_id") or ""),
+                                              str(args.get("reason") or ""), session_id))
         wait_s = max(1.0, min(float(args.get("wait_s") or DEFAULT_WAIT), MAX_WAIT))
         job_id = str(args.get("job_id") or "").strip()
         command = str(args.get("command") or "").strip()
         if not job_id and not command:
             return _err("command is required (or job_id to resume waiting)")
         base = _root()
+        if job_id:  # withdrawn before any Mac had it: that is the outcome, no courier needed
+            known = ledger_lookup(base, job_id)
+            if known and known.get("state") == "withdrawn" and known.get("withdrawn_where") == "gateway outbox":
+                return json.dumps({"ok": True, "status": "withdrawn", "job_id": job_id,
+                                   "request_id": known.get("request_id"), "device": known.get("device"),
+                                   "reason": known.get("withdraw_reason") or "",
+                                   "note": "Withdrawn before any Mac claimed it; nothing ran."})
         device, err = pick_courier(base)
         if err and not job_id:
             return _err(err)
@@ -3070,6 +3291,12 @@ def handle_remote(args: dict, session_id: str | None = None, **_kw: Any) -> str:
         res = {**res, "job_id": res.get("job_id") or job_id, "device": device}
         entry = entry or ledger_lookup(base, res["job_id"])
         if lost_on_mac(res):
+            if entry and entry.get("state") == "withdrawn":  # withdrawn after a claim the Mac never acted on
+                ledger_close(base, entry, "final", "withdrawn")
+                return json.dumps({"ok": True, "status": "withdrawn", "job_id": job_id, "device": device,
+                                   "request_id": entry.get("request_id"),
+                                   "reason": entry.get("withdraw_reason") or "",
+                                   "note": f"Withdrawn; `{device}` has no job for it, so nothing ran there."})
             if entry:
                 ledger_close(base, entry, "lost")
             return json.dumps(result_lost(job_id, device))

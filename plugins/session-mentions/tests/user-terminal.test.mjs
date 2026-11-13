@@ -56,6 +56,35 @@ test('status: resume by job_id reads with the drained gateway name and a bounded
   assert.equal(calls[0].path, '/api/plugins/user-terminal/status/j1?gateway=nous-1&wait_s=25')
 })
 
+// t_01a1d47bf0506084: the gateway takes back a request this Mac's courier already claimed.
+test('withdraw: goes to THIS Mac\'s /start as origin.withdraw (empty command), gateway named by the courier', async () => {
+  const calls = []
+  const m = await load({ state, connections: async () => conns }, async req => {
+    calls.push(req)
+    return { ok: true, status: 'withdrawn', job_id: null }
+  })
+  const res = await m.performRequest(
+    { id: 'ab'.repeat(16), action: 'user_terminal', route: 'macbook', args: { withdraw_request: 'e2aafe9a2ec443a3a651405b8f90c8ac', withdraw_job: '', reason: 'superseded', job_id: undefined }, sender: { ...sender, gateway: 'forged' } },
+    'cloud-1',
+    conns
+  )
+  assert.equal(res.status, 'withdrawn')
+  assert.equal(res.device, 'macbook')
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].connectionId, 'local')
+  assert.equal(calls[0].path, '/api/plugins/user-terminal/start')
+  assert.equal(calls[0].body.command, '') // a Mac module from before withdrawal refuses it: no window
+  assert.deepEqual(calls[0].body.origin, { gateway: 'nous-1', request_id: 'e2aafe9a2ec443a3a651405b8f90c8ac', job_id: '', withdraw: 'superseded' })
+})
+
+test('withdraw: a non-owner session is refused without touching the Mac backend', async () => {
+  const calls = []
+  const m = await load({ state, connections: async () => conns }, async req => calls.push(req))
+  const res = await m.performRequest({ action: 'user_terminal', args: { withdraw_request: 'e2aafe9a2ec443a3a651405b8f90c8ac', reason: 'x' }, sender: { ...sender, platform: 'slack' } }, 'cloud-1', conns)
+  assert.equal(res.ok, false)
+  assert.equal(calls.length, 0)
+})
+
 for (const platform of ['slack', 'desktop,slack', '', 'cron']) {
   test(`refuses a non-owner session (${platform || 'unknown'}) without touching the Mac backend`, async () => {
     const calls = []

@@ -124,3 +124,22 @@ def test_remote_drain_claims_requests_only_it_can_serve_while_home_alive(tmp_pat
     assert sorted(p.stem for p in (base / "outbox").glob("*.json")) == ["tomini", "unrouted"]
     assert sorted(r["id"] for r in rf.claim_pending(base, home=True, courier="mac-mini",
                                                     reach=["mac-mini", "macbook"])) == ["tomini", "unrouted"]
+
+
+def test_a_request_withdrawn_mid_drain_is_skipped_not_a_crash(tmp_path, monkeypatch):
+    """t_01a1d47bf0506084: the gateway withdraws (unlinks) an unclaimed request while a courier drains the outbox.
+    The drain listed it but it is gone by the time it is sorted: the other requests are still claimed."""
+    base = _base(tmp_path)
+    _request(base, "keep")
+    _request(base, "gone")
+    real = rf._list_json
+
+    def listed_then_withdrawn(path):
+        out = real(path)
+        if path.name == "outbox":
+            (path / "gone.json").unlink()
+        return out
+
+    monkeypatch.setattr(rf, "_list_json", listed_then_withdrawn)
+    got = [r["id"] for r in rf.claim_pending(base, home=True)]
+    assert got == ["keep"] and not (base / "claimed" / "gone.json").exists()

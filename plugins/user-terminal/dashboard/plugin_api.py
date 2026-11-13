@@ -4,6 +4,8 @@ POST /api/plugins/user-terminal/start   {command, reason, cwd, origin: {gateway,
                                         -> {ok, job_id, status: "waiting_for_user"|"running"|"ran"|"declined", terminal[, opener_warning]}
                                            | {ok: false, error}
                                            | {ok: false, status: "failed", job_id, error[, diagnosis]} (no window started it; nothing ran)
+                                        With origin.withdraw (reason) + origin.request_id[/job_id]: withdraw that relayed
+                                        request instead -> {ok, status: "withdrawn", job_id|null[, job_dir]} (withdraw_relayed)
 GET  /api/plugins/user-terminal/status/{job_id}?gateway=<origin gateway>&wait_s=<=25
                                         -> the local tool's result shape (status ran|declined|pending|running|failed, ...)
 

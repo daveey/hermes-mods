@@ -1374,6 +1374,22 @@ export async function performUserTerminal(req, origin, conns) {
   const gateway = gw?.key || origin
   const device = conns.find(isHome)?.device || home.key
   try {
+    if (args.withdraw_request) {
+      // Withdrawal of a request this courier (or an earlier Desktop) claimed from that gateway. Sent on /start
+      // with origin.withdraw so a backend whose routes were mounted earlier serves it; a Mac module from before
+      // relayed withdrawal refuses the empty command and opens nothing.
+      const res = await apiPreSendRetry(home.id, `${UT_BASE}/start`, {
+        method: 'POST',
+        body: {
+          command: '',
+          reason: '',
+          cwd: '',
+          origin: { gateway, request_id: String(args.withdraw_request || ''), job_id: String(args.withdraw_job || ''), withdraw: String(args.reason || 'withdrawn by its gateway') }
+        },
+        timeoutMs: 40_000
+      })
+      return { ...res, device }
+    }
     if (args.job_id) {
       const wait = Math.max(0, Math.min(25, Number(args.wait_s) || 0))
       const res = await apiPreSendRetry(home.id, `${UT_BASE}/status/${enc(args.job_id)}?gateway=${enc(gateway)}&wait_s=${wait}`, { timeoutMs: (wait + 20) * 1000 })
