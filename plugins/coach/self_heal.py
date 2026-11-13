@@ -2395,6 +2395,14 @@ def retry_receipt_rule(fp: str, coach: str, how: str = "") -> str:
    {coach}/selfheal_lane.json{how}. Already recorded? Read it back and add evidence; never re-record."""
 
 
+# A worker never files under a lane key: the lane files those itself. VERIFY t_01a1d5f199d422fe hand-filed
+# `selfheal:agent-6ba9ac9880:fix` while that lane's own file_fix was only admission-deferred (retry minutes away); the
+# lane filed a second card 5 min later because its create could not see the worker's board (t_01a1d61d26b87b75).
+SELFHEAL_KEY_RULE = ("Never file a card under a `selfheal:` idempotency key, another lane's fix key included: those "
+                     "keys belong to the self-heal lane. When the fix you need is another lane's pending fix card, "
+                     "`kanban_schedule` and re-check; that lane files it, and a copy you file duplicates its work.")
+
+
 def verify_brief(fp: str, st: dict, fix_card: str, remote: bool = False) -> str:
     """The VERIFY child: host steps, live check, and the lane event, from the fix's handoff. ``remote`` (the hub's
     lane): a pool worker does every gateway step through `hub-admin '<command>'`; else it is machine-pinned here."""
@@ -2408,6 +2416,7 @@ adopted investigation or unrelated session card, not a self-heal fix card. First
 this exact defect. If investigation led to another fix card, follow that handoff and wait for its delivery.
 If no fix exists, repair the actual symptom here, or create/link a scoped repair owner and wait on it before
 recording fixed (do not call a real unresolved defect not_defect). Clear any mistaken adoption in your report.
+{SELFHEAL_KEY_RULE}
 A false detection requires evidence before `event not_defect`.
 You run
 on the host that filed it, because the live check and the lane record need this host's coach store and logs.
@@ -2460,6 +2469,7 @@ adopted investigation or unrelated session card, not a self-heal fix card. First
 this exact defect. If investigation led to another fix card, follow that handoff and wait for its delivery.
 If no fix exists, repair the actual symptom, or create/link a scoped repair owner and wait on it before
 recording fixed (do not call a real unresolved defect not_defect). Clear any mistaken adoption in your report.
+{SELFHEAL_KEY_RULE}
 A false detection requires evidence before `event not_defect`.
 Post nothing to the Inbox. Budget for this card <= ${INVESTIGATION_BUDGET}.
 
@@ -5298,7 +5308,8 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
         return {"action": "error", "why": f"not a fingerprint: {fp!r}"}
     if st.get("fix_card") and st.get("status") in ("approved", "fixed"):
         r = route({"component": st.get("component")})
-        if split_fix(st, r["board"]) and st.get("status") == "approved" and not st.get("verify_card"):
+        if split_fix(st, r["board"]) and st.get("status") == "approved" and not st.get("verify_card") \
+                and st.get("adopt_via") != "fix_key":  # an adopted keyed owner gets its verify from reconcile
             # The verify child failed to file with its fix card: retry it (idempotent key), never a second fix.
             _file_verify(fp, st, st["fix_card"], r, store, runner, now)
         return {"action": "skip", "why": f"fix card exists: {st['fix_card']}", "card": st["fix_card"]}
@@ -5315,6 +5326,9 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
     r = route({"component": st.get("component")})
     split = split_fix(st, r["board"])
     key = fix_key(fp, generation(st) or 1)
+    adopted = _adopt_keyed_fix(fp, st, key, r["board"] or "default", store, runner, now, trigger)
+    if adopted:
+        return adopted
     # Incident text (even the "cron" component) is evidence, not an execution need; titles never carry it raw.
     args = {"title": f"{FIX_TITLE} {'defect ' + fp.rsplit('-', 1)[-1] if split else incident_title(st.get('symptom') or fp)}",
             "body": portable_fix_brief(fp, st) if split else fix_brief(fp, st),
@@ -5362,6 +5376,85 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
                "trigger": trigger, "scheduled": sched, "split": split})
     verify = _file_verify(fp, lane.get(fp), tid, r, store, runner, now) if split else None
     return {"action": "filed", "card": tid, "key": key, "scheduled": sched, "verify_card": verify}
+
+
+def keyed_cards(key: str, runner=None, home: Optional[Path] = None, hub_db: Optional[Path] = None) -> list:
+    """Non-archived cards carrying idempotency ``key`` on every source this host can read: each local board DB and
+    (owner-qualified rows only) the hermes-hub replica of every gateway's boards. `hermes kanban create
+    --idempotency-key` sees only the board it creates on, so a card filed under the same key through another gateway
+    or board is invisible to it (agent-6ba9ac9880: t_01a1d5f7e4ceefd1 on worker-8, then t_01a1d5fbf3f777f2 on the hub).
+    -> [{id, status, board, gateway, authority}], local first; an unreadable source is skipped (the create's own
+    idempotency still covers the lane's board)."""
+    import sqlite3
+    d_home, d_hub = _lookup_sources(runner)
+    home = Path(home or d_home)
+    hub_db = hub_db if hub_db is not None else d_hub
+    out: list = []
+    for board, path in _board_dbs(home):
+        if not path.exists() or _board_in_recovery(path):
+            continue
+        try:
+            con = _ro_state(path)
+            try:
+                if "idempotency_key" not in {c[1] for c in con.execute("PRAGMA table_info(tasks)")}:
+                    continue
+                rows = con.execute("SELECT id, status FROM tasks WHERE idempotency_key = ? AND status != 'archived'",
+                                   (key,)).fetchall()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            continue
+        out += [{"id": i, "status": s, "board": board or "default", "gateway": None, "authority": "local_board"}
+                for i, s in rows]
+    if hub_db is not None and Path(hub_db).exists():
+        try:
+            con = _ro_state(Path(hub_db))
+            try:
+                rows = con.execute("SELECT gw, data FROM replica WHERE coll = 'tasks' AND instr(data, ?) > 0",
+                                   (json.dumps(key),)).fetchall()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            rows = []
+        seen = {c["id"] for c in out}
+        for gw, raw in rows:
+            try:
+                t = json.loads(raw)
+            except ValueError:
+                continue
+            if (not isinstance(t, dict) or t.get("idempotency_key") != key or t.get("gateway") != gw
+                    or not t.get("profile") or t.get("status") == "archived" or t.get("id") in seen):
+                continue
+            seen.add(t.get("id"))
+            out.append({"id": t.get("id"), "status": t.get("status"), "board": t.get("board") or "default",
+                        "gateway": gw, "authority": "replica"})
+    return out
+
+
+def _adopt_keyed_fix(fp: str, st: dict, key: str, board: str, store, runner, now: float,
+                     trigger: str) -> Optional[dict]:
+    """A fix card already filed under the lane's own fix key (by a worker, or through another gateway or board) is
+    the lane's fix_card: adopt it (approved) instead of filing a duplicate. Its VERIFY comes from reconcile's receipt
+    path once the owner completes, since a card elsewhere cannot be this board's parent. A hit on ``board`` here is
+    left to the create, whose own idempotency returns it; a card the lane already knows is the 'key returned an
+    earlier card' error, also left to the create path."""
+    try:
+        found = [c for c in keyed_cards(key, runner) if c["id"] not in known_cards(st)
+                 and (c["gateway"] or c["board"] != board)]
+    except Exception as exc:  # health: allow BLE001 -- a failed lookup must not stop the lane from filing
+        store.log({"event": "selfheal_adopt_error", "fingerprint": fp, "via": "fix_key", "error": str(exc)[:200]})
+        return None
+    if not found:
+        return None
+    c = found[0]
+    lane = LaneState(store.root)
+    lane.update(fp, status="approved", fix_card=c["id"], approved_at=now, verify_card=None,
+                cards=sorted(known_cards(st) | {c["id"]}), adopt_card=c["id"], adopt_via="fix_key",
+                owner_card=c["id"], owner_gateway=c["gateway"], owner_board=c["board"])
+    store.log({"event": "selfheal_fix_adopted_existing", "fingerprint": fp, "card": c["id"], "key": key,
+               "status": c.get("status"), "gateway": c["gateway"], "board": c["board"],
+               "authority": c["authority"], "trigger": trigger, "candidates": [x["id"] for x in found]})
+    return {"action": "adopted", "card": c["id"], "key": key, "scheduled": None, "verify_card": None}
 
 
 def remote_verify() -> bool:
