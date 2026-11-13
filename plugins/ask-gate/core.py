@@ -345,6 +345,23 @@ def _core_projection():
     return fn, tuple(dict.fromkeys(tuple(listed) + ("done", "archived")))  # what `chat-tasks` lists
 
 
+def _watch_sql(c: sqlite3.Connection) -> str:
+    """SQL (alias ``t``) that is 1 for a watch park: a card parked ``scheduled`` with ``kanban_schedule(watch=true)``.
+    Core's own predicate (``hermes_cli.kanban_watch``), which ``session_tasks`` / ``hermes kanban chat-tasks`` and
+    the chat counts use to leave a watch out of the chat's open work. An older core, a failed import or a board the
+    predicate cannot run on: ``0`` (no watches), as ``_core_projection`` degrades to local-only."""
+    try:
+        from hermes_cli.kanban_watch import not_watch_sql
+        expr = not_watch_sql(c, "t")
+        if expr.strip() == "1":  # board without park payloads: no watches
+            return "0"
+        expr = f"(not ({expr}))"
+        c.execute(f"select {expr} from tasks t limit 0").fetchall()
+        return expr
+    except Exception:  # noqa: BLE001 -- the live list never breaks on core's predicate
+        return "0"
+
+
 class _NoProjection(Exception):
     """No core, a broken core, or a core without ``session_tasks``: local-only, not worth a log line."""
 
@@ -473,8 +490,11 @@ def linked_state(session_id: str, limit: int = 15, db_paths: list[Path] | None =
             c = _ro(p)
             cols = _task_cols(c)
             extra = ", " + ", ".join(f"t.{x}" if x in cols else "null" for x in ("block_kind", "human_request"))
+            watch = _watch_sql(c)  # a watch park: listed and marked, never open work or a pinned ask
+            extra += f", {watch}"
             base = f"select t.id, t.title, t.status, t.assignee, t.created_at, t.completed_at{extra} from tasks t "
-            needs = ("t.status not in ('done','archived','cancelled') and (t.status in ('blocked','review')"
+            needs = (f"not {watch} and t.status not in ('done','archived','cancelled') "
+                     "and (t.status in ('blocked','review')"
                      + (" or t.human_request is not null" if "human_request" in cols else "") + ")")
             rows = c.execute(base + "where t.session_id=? order by t.created_at desc limit ?",
                              (session_id, limit)).fetchall()
@@ -516,7 +536,8 @@ def linked_state(session_id: str, limit: int = 15, db_paths: list[Path] | None =
                 out.append({"id": r[0], "title": r[1], "status": r[2], "assignee": r[3],
                             "created": r[4], "completed": r[5], "db": str(p), "block_kind": r[6],
                             "human_request": hr if isinstance(hr, dict) else None, "pinned": r[0] in pin_ids,
-                            "notice_only": r[0] in untracked, "remote": False, "key": None, "stale": False})
+                            "notice_only": r[0] in untracked, "remote": False, "key": None, "stale": False,
+                            "watch": bool(r[8])})
             c.close()
         except sqlite3.Error:
             continue
@@ -537,14 +558,18 @@ def linked_state(session_id: str, limit: int = 15, db_paths: list[Path] | None =
     # Pinned (needs a person) cards are never cut. Then the chat's open cards, newest first, up to LINKED_CAP: they
     # are its live work, so they rank ahead of every done/archived row. Finished rows (and another chat's card that
     # only notifies this one) fill what is left of the ``limit`` recency window. Open cards past the cap are counted
-    # in ``more_open``, which the block prints, so nothing is cut silently.
+    # in ``more_open``, which the block prints, so nothing is cut silently. A watch park is not open work (core's
+    # chat-tasks leaves it out, so ``more_open`` matches it), but it is a pending check the agent must name: it is
+    # always listed, with its mark, outside the cap.
     pins = [x for x in out if x["pinned"]]
+    watches = [x for x in out if not x["pinned"] and x.get("watch")]
     room = max(0, LINKED_CAP - len(pins))
     live = [x for x in out if not x["pinned"] and _is_open(x)]
-    rest = [x for x in out if not x["pinned"] and not _is_open(x)]
+    rest = [x for x in out if not x["pinned"] and not _is_open(x) and not x.get("watch")]
     keep_live = live[:room]
     keep_rest = rest[:max(0, min(limit, room) - len(keep_live))]
-    cards = CardList(sorted(pins + keep_live + keep_rest, key=lambda x: x.get("created") or 0, reverse=True))
+    cards = CardList(sorted(pins + keep_live + watches + keep_rest, key=lambda x: x.get("created") or 0,
+                            reverse=True))
     cards.more_open = len(live) - len(keep_live)
     return cards, complete
 
@@ -558,8 +583,9 @@ class CardList(list):
 
 
 def _is_open(card: dict) -> bool:
-    """The chat's own unfinished work (local or remote); a notice-only card is another chat's work."""
-    return card.get("status") not in _FINAL and not card.get("notice_only")
+    """The chat's own unfinished work (local or remote); a notice-only card is another chat's work, and a watch
+    park (``_watch_sql``) is a later check that does not hold the chat open, as core's ``session_tasks`` counts."""
+    return card.get("status") not in _FINAL and not card.get("notice_only") and not card.get("watch")
 
 
 def waiting_on_david(cards: list[dict]) -> list[dict]:
@@ -704,6 +730,9 @@ def render_cards(cards: list[dict], replica=None) -> str:
             hit = next((t for t in rows or [] if t.get("id") == pc["task_id"]), None)
             live = (hit or {}).get("status") or ("not in replica" if rows is not None else "status unknown")
             line += f" -> {gw}:{pc['task_id']} {live}"
+        if c.get("watch") and c.get("status") not in _FINAL:
+            line += (" (watch: a pending check parked until it wakes; it does not hold this chat open, but asked "
+                     "about the chat's state, name this check and do not say everything is finished)")
         if c.get("notice_only") and c.get("status") not in _FINAL:
             line += " (notices only: another chat's card, not counted in this chat's status; shepherd it to track)"
         lines.append(line)
