@@ -198,6 +198,10 @@ verify that integration before promising autonomous builds.
 
 ## Pitfalls
 
+- "Keep following" applied by hand (e.g. the quiet-end card fell back to Kanban): `resume` + `update` leave the old
+  `warned_quiet` in place, so the day-6 warning never fires again and the engagement silently auto-ends on day 7. Also
+  clear it, as the runner's keep path does: `Engagements(Store(<alpha home>/slack-workspace)).update(id, warned_quiet=0)`
+  (the public `update` op ignores that field). Before `resume`, check for messages after `last_handled_ts`, because resume skips them.
 - `not_in_channel` → join (public) or ask for an `/invite` (private).
 - `missing_scope` → the app lacks that scope; tell an admin which one (the error names it).
 - For a thread in an unknown channel, search the bot's observation index before dumping a guessed channel's history; large unrelated threads obscure the target. Use [thread discovery](references/thread-discovery.md), then verify the full thread live.
