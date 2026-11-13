@@ -286,6 +286,8 @@ REPLY_276 = (
     "Autoscaling is unchanged: PR 1714 (the enrollment fix) is still open, and the build card is parked on its merge. "
     "Your autoscaling chat, which owns that merge, last wrote at 21:57Z and is waiting on your MacBook coming back "
     "online.")
+# CMD_276 is a recorded tool-log command string (never executed here): its read-only sqlite3 URIs open nothing, so
+# they need no query_only fallback (tests/test_sqlite_ro_guard.py reads this file).
 CMD_276 = ("cd ~; D=~/.hermes/kanban.db; date -u +%T; for n in 1779 1714; do echo \"$n $(token-broker exec --scope "
            "user/github --reason 'read PR state for close-out' -- gh pr view $n -R acme/hermes --json state,mergedAt,"
            "headRefOid,title 2>&1 | tail -1 | cut -c1-260)\"; done; for f in $D ~/.hermes/kanban/sync-shadow/default.db;"
