@@ -1,0 +1,93 @@
+"""Replay benchmark for card L (design t_01a1d563324d7e8e §3): the runners inventory budget.
+
+P1 measured the fleet panel's inventory reads at 0.8% of one core in the busiest serve: on main every
+``_ci_section`` call decoded the 2.4 MB snapshot twice (inventory and host load) and deep-copied every runner row.
+This replays the hub's measured change shape (hub 2026-11-13, 1.9k runners: the collector rewrites the snapshot every
+~30 s; between snapshots ``processed_at`` moves on ~95% of runner states, ~5% are re-observed, and the two host
+results move every other snapshot) with a fleet build every FLEET_CACHE_S = 5 s. It measures thread CPU of main's
+per-call work and of the card L path over the same replay, and asserts the P1 share scaled by that ratio is within
+the 0.1% budget."""
+import json
+import os
+import sqlite3
+import time
+from copy import deepcopy
+
+from plugins.runners.collector import Collector
+from plugins.runners.providers.base import ProviderResult
+from plugins.runners.service import Service
+from plugins.runners.store import Store
+from test_collector import F, config
+
+P1_NOW = 0.8  # % of one core, card A's P1 snapshot
+BUDGET = 0.1
+RUNNERS = int(os.environ.get('RUNNERS_BENCH_RUNNERS', '1900'))
+CALL_EVERY, WRITE_EVERY, SPAN, LIVE = 5, 30, 600, 0.05
+
+
+class Fleet:
+    def enumerate(self, scope):
+        rows = tuple(dict(F['Runner'], id=f"{F['Runner']['id'][:-6]}{i:06d}", provider_runner_id=str(i + 1))
+                     for i in range(RUNNERS))
+        return ProviderResult(rows, True, None, 1000.0, 1)
+
+
+def snapshots(path, cfg):
+    """The replay: (time, payload) every WRITE_EVERY s, starting from a real collector snapshot."""
+    with Store(path) as store:
+        snap = Collector(store, cfg, Fleet(), clock=lambda: 1000.0, host_probe=lambda host: {}).tick()
+    snap = json.loads(json.dumps(snap))
+    hid = cfg['hosts'][0]['id']
+    snap.setdefault('host_results', {})[hid] = dict(at=1000.0, management='reachable', facts={}, observation_ids=[])
+    ids = sorted(snap['states'])
+    live = ids[:max(1, int(len(ids) * LIVE))]
+    out = []
+    for n, t in enumerate(range(0, SPAN, WRITE_EVERY)):
+        at = 1000.0 + t
+        snap['at'] = at
+        for rid in ids:
+            snap['states'][rid]['processed_at'] = at
+        for rid in live:
+            snap['states'][rid]['at'] = at
+        if n % 2 == 0:
+            snap['host_results'][hid]['at'] = at
+        out.append((t, json.dumps(snap)))
+    return out
+
+
+def replay(tmp_path, card_l, run=0):
+    cfg = config(); cfg['hosts'] = [deepcopy(F['Host'])]
+    fingerprint = Service.config_fingerprint(cfg)  # the dashboard computes it once per parsed config
+    path = tmp_path / f"{'new' if card_l else 'old'}{run}" / 'state.sqlite'
+    path.parent.mkdir()
+    seq = snapshots(path, cfg)
+    db = sqlite3.connect(path)
+    cpu, i = 0.0, 0
+    for t in range(0, SPAN, CALL_EVERY):
+        while i < len(seq) and seq[i][0] <= t:
+            db.execute("UPDATE collector_cache SET payload=? WHERE key='snapshot'", (seq[i][1],)); db.commit(); i += 1
+        now = 1000.0 + t + 3
+        # The dashboard builds a Service per call; main's per-call config deep copy is left out of both sides.
+        svc = Service(path, cfg, clock=lambda: now, fingerprint=fingerprint if card_l else None)
+        start = time.thread_time()
+        if card_l:
+            inv = svc.inventory(shared=True)
+            svc._snapshot()
+        else:  # main: decode, deep build, decode again for host load
+            payload = db.execute("SELECT payload FROM collector_cache WHERE key='snapshot'").fetchone()[0]
+            inv = svc._inventory(json.loads(payload), None)
+            json.loads(payload)
+        cpu += time.thread_time() - start
+        assert len(inv['data']['runners']) == RUNNERS
+    db.close()
+    return cpu
+
+
+def test_inventory_replay_budget(tmp_path):
+    # Best of two replays each: thread CPU on a shared CI runner carries noise from other jobs.
+    old = min(replay(tmp_path, card_l=False, run=n) for n in range(2))
+    new = min(replay(tmp_path, card_l=True, run=n) for n in range(2))
+    share = P1_NOW * new / old
+    print(f'\nrunners inventory over {SPAN}s: main {old * 1000:.0f} ms, card L {new * 1000:.0f} ms of CPU '
+          f'({new / SPAN * 100:.3f}% of a core here); P1 {P1_NOW}% -> {share:.3f}% (budget {BUDGET}%)')
+    assert share <= BUDGET

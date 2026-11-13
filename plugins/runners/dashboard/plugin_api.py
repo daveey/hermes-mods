@@ -63,7 +63,9 @@ def _home_lock(home):
         return _home_locks.setdefault(home, threading.Lock())
 
 
-def service():
+def service(*, detached=True):
+    """A Service on this profile's cached, validated config. ``detached=False`` hands it the cached config itself
+    (no per-call deep copy): only for callers that never mutate it or anything it returns (see ``_ci_section``)."""
     from hermes_constants import get_hermes_home
     ConfigFile, Service = _backend()
     home = Path(get_hermes_home()).resolve()
@@ -79,14 +81,16 @@ def service():
                 config = ConfigFile(path).load()
                 if _signature(path) != key[2]:
                     raise RuntimeError('configuration_changed')
-                _config_cache[home] = cached = (key, config)
+                # The fingerprint keys the inventory memo (service.py): computed once per parsed config,
+                # not marshalled on every request.
+                _config_cache[home] = cached = (key, config, Service.config_fingerprint(config))
             # Detach mutable structures so responses/services cannot poison the
             # validated cache, including its owner epoch and config revision.
-            config = deepcopy(cached[1])
+            config = deepcopy(cached[1]) if detached else cached[1]
         except Exception:
             _config_cache.pop(home, None)
             raise
-    return Service(home / 'runners/state.sqlite', config)
+    return Service(home / 'runners/state.sqlite', config, fingerprint=cached[2])
 
 
 def _origin(value):
@@ -252,13 +256,15 @@ def _local_cap():
 def _ci_section():
     fleet = _fleet()
     try:
-        backend = service()
+        # Read-only from here on (config, inventory, snapshot): the cached config itself, not a deep copy.
+        backend = service(detached=False)
     except FileNotFoundError:
         return dict(state='not_configured', machines=[])
     if backend.config['owner_profile'] != active_profile():
         return dict(state='unavailable', reason='owner_profile_mismatch', machines=[])
     import time
-    return fleet.ci_workers(backend.inventory(), fleet.host_load(backend._snapshot(), time.time()))
+    # Both reads are read-only: the shared memo, not a per-call copy (service.py, card L).
+    return fleet.ci_workers(backend.inventory(shared=True), fleet.host_load(backend._snapshot(), time.time()))
 
 
 FLEET_CACHE_S = 5
