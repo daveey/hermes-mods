@@ -1,0 +1,110 @@
+From 52dae5a9aa8b59c8e28377fd5eaafb9a74065d51 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:03:05 +0000
+Subject: [PATCH] [daveey] kanban notices: legacy poller skips remote
+ collection on a gateway-owned chat
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Review 5881224107 nit (PR #1720, card t_01a1d1543b9d13cf): on a chat the live
+gateway owns (`_kb_gateway_owns`), `_collect_kanban_notifications` still
+claimed the chat's remote notices through `_collect_remote_kanban_notifications`,
+and `_notif_poll_kanban_scoped` released them at once through
+`_kb_rewind_refused(not_owned=True)`. Every 5 s legacy tick claimed and released
+them: idempotent, but it churned remote-ledger claims.
+
+Who delivers them instead (verified before changing):
+- `gateway/kanban_remote_owner.py` claims and admits remote notices to the
+  gateway FIFO for live LOCAL chats where `_gateway_holds_work` holds (forwardable
+  ledger work or the gateway's turn lease), the same condition
+  `kanban_leg_custody.gateway_owner` uses for `_kb_gateway_owns`.
+- Otherwise (idle chat, restore gap, other profile) the Desktop backend's
+  `kanban_remote_notices.sweep_remote_notices` delivers them, exactly as
+  today: the legacy poller never delivered an owned chat's remote notice,
+  since the hand-back released it the same tick.
+
+Change: reuse the `_kb_gateway_owns(session)` answer the collection already
+computes and skip the remote collection when it is True. Only edge: a tick that
+newly claims a non-gateway local row (threaded / other profile) flips ownership
+to False after collection; its remote notices are then collected on the next
+poll (5 s) instead of this one. Net zero lines (file is at its 2000 cap).
+
+Tests: new test_gateway_owned_chat_skips_the_remote_collection_a_legacy_only_chat_keeps_it
+in tests/gateway/test_kanban_tui_sibling_custody.py. RED on origin/main source
+(`assert ['…bef6c6'] == […]`: the owned poll collected remote notices), GREEN
+with the fix. Targeted suites: test_kanban_tui_sibling_custody,
+test_kanban_notice_at_least_once, test_kanban_remote_notices,
+test_kanban_remote_overlap, test_kanban_remote_late,
+test_kanban_reclaim_error_isolation: 136 passed, 0 failed.
+`scripts/check --base origin/main`: 19 checks ok.
+
+Card: t_01a1d388527d3b41
+---
+ .../test_kanban_tui_sibling_custody.py        | 19 +++++++++++++++++++
+ tui_gateway/session_notifications.py          |  8 ++++----
+ 2 files changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/tests/gateway/test_kanban_tui_sibling_custody.py b/tests/gateway/test_kanban_tui_sibling_custody.py
+index 1d0371e438..920e82a71d 100644
+--- a/tests/gateway/test_kanban_tui_sibling_custody.py
++++ b/tests/gateway/test_kanban_tui_sibling_custody.py
+@@ -401,6 +401,25 @@ def test_n4_a_gateway_turn_lease_hands_the_chat_back_like_ledger_work(env, monke
+     assert _row(tid)[1] is None
+ 
+ 
++def test_gateway_owned_chat_skips_the_remote_collection_a_legacy_only_chat_keeps_it(env, monkeypatch):
++    """Review 5881224107 nit: an owned chat's remote notices were claimed each poll, then released at once by the
++    hand-back (``_kb_rewind_refused(not_owned=True)``). The gateway's ``kanban_remote_owner`` (or the sweep)
++    delivers them, so the legacy poller no longer claims them at all."""
++    _runner, authority, _adapter, _admitted = env
++    asked = []
++    monkeypatch.setattr(server, "_collect_remote_kanban_notifications",
++                        lambda key, claims: asked.append(key) or [])
++    session = _session()
++    _legacy_collect(session)
++    assert asked == [CHAT], "a legacy-only chat still collects its remote notices"
++
++    authority.sessions[CHAT] = _Live(CHAT)
++    authority.db.work(CHAT)  # the gateway owns the chat
++    _next_poll(session)
++    server._notif_poll_kanban_scoped("sid", session)
++    assert asked == [CHAT], "an owned chat's poll claims no remote notice"
++
++
+ def test_legacy_only_idle_chat_still_delivers_once(env):
+     runner, _authority, adapter, admitted = env
+     tid = _card(local=False)
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index bb7da1ea31..71176caed2 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -833,8 +833,8 @@ def _collect_kanban_notifications(session: dict, claims: list | None = None) ->
+     """Claim unseen terminal kanban events for this session's ``platform="tui"`` subscriptions (``kanban_create``
+     auto-subscribes with ``chat_id=HERMES_SESSION_KEY``; no "tui" messaging adapter exists, so this poller is the
+     delivery path). Same atomic cursor-claim as the gateway notifier: exactly-once even if a gateway polls the same DB.
+-
+-    See #59890.
++    See #59890. An owned chat's remote notices: kanban_remote_owner or the sweep (a claim here was handed straight
++    back by ``_kb_rewind_refused(not_owned=True)`` each poll, review 5881224107 nit). [daveey]
+     """
+     session_key = str(session.get("session_key") or "")
+     if not session_key or session.get("_finalized"):
+@@ -856,12 +856,12 @@ def _collect_kanban_notifications(session: dict, claims: list | None = None) ->
+         unique.setdefault(resolved, slug)
+     seen = session.setdefault("_kb_board_seen", {})
+     stray, unreclaimed = _kb_stray_delegate_keys(session, session_key), []
+-    _kb_gateway_owns(session)  # the live gateway's collector admits the rows it claims in one tick: skipped below
++    owned = _kb_gateway_owns(session)  # the gateway's collector admits the rows it claims in one tick: skipped below
+     texts = [t for slug in unique.values() for t in _kb_poll_board(
+         _kb, slug, session_key, claims, seen, stray=stray, unreclaimed=unreclaimed)]
+     if stray and not unreclaimed:
+         session["_kanban_stray_keys"] = ()  # every board is clean; stop probing
+-    return texts + _collect_remote_kanban_notifications(session_key, claims)
++    return texts if owned else texts + _collect_remote_kanban_notifications(session_key, claims)
+ 
+ 
+ _LINEAGE_TTL_S = 30.0
+-- 
+2.51.0
+

@@ -1,0 +1,306 @@
+From 75ceef276e6e8de4018e87d4b202f088a43756a7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:26:13 +0000
+Subject: [PATCH] [daveey] delta responses: flush a held start before pathsend,
+ Vary + no ETag on a delta, one origin per scope
+
+Follow-up to #2024: the three non-blocking nits of its approving review
+(https://github.com/example-org/hermes/pull/2024#pullrequestreview-5889450333).
+
+1. Gateway, `_DeltaSend`: an eligible `http.response.start` is held until the body is complete. Any other message
+   (`http.response.pathsend`, `http.response.zerocopysend`: the server sends the file itself) was forwarded while
+   the start was still held, so the start never went out. Now the held start goes out first, unchanged, followed
+   by any body collected so far, then the message; the rest of that response passes through. Latent today
+   (uvicorn does not advertise pathsend, web_server.py has no FileResponse).
+
+2. Gateway, hashed and delta answers: `Vary: X-Hermes-Delta-Accept, X-Hermes-Delta-Base`, merged into the
+   handler's own Vary as one header (names kept once, `*` left alone). A delta also drops the handler's `ETag`:
+   its bytes are a zstd frame, not the entity that validator names. A whole hashed body keeps its ETag (the bytes
+   are the handler's). A caching proxy in front of the gateway (a Cloudflare-published one) can then not replay a
+   delta to a client that did not ask. Unasked and un-encoded answers keep exactly the handler's headers.
+
+3. Desktop, `DeltaBodyStore.bindRemote`: one origin per scope. Binding a scope to a new origin drops its earlier
+   origin, so a tunnel rebuilt on a new local port without `stopPoolBackend` no longer leaves the old port asked
+   for deltas or able to file answers under the scope. The scope's copies are kept and follow it to the new
+   origin: that is the documented tunnel-rebuild case ("survives a tunnel rebuild" test, unchanged).
+
+Tests (RED without the source change, GREEN with it):
+- tests/hermes_cli/test_web_delta_response.py: start + pathsend / zerocopysend with a delta asked yields start
+  then the file message; body collected before a pathsend goes out after the start; Vary on hashed and delta
+  answers, merged with a handler's two Vary headers; ETag kept on a whole body and absent on a delta; `Vary: *`
+  untouched. 34 passed (28 passed, 6 failed on the old source).
+- apps/desktop/electron/delta-reads.test.ts: a rebind without a teardown stops the old port being asked or
+  filed under the scope, the copy moves to the new origin, other scopes are untouched. 23 passed (1 failed on
+  the old source).
+
+One existing assertion changed on purpose: `test_other_headers_survive_a_delta_duplicates_included` asserted the
+delta kept `etag == "abc"`, which is the behaviour nit 2 removes; it now asserts the whole answer has the ETag
+and the delta does not. Its other assertions (cache-control, both Set-Cookie headers) are unchanged.
+---
+ apps/desktop/electron/delta-reads.test.ts   | 26 ++++++
+ apps/desktop/electron/delta-reads.ts        |  7 +-
+ hermes_cli/web_delta_response.py            | 30 ++++++-
+ tests/hermes_cli/test_web_delta_response.py | 99 ++++++++++++++++++++-
+ 4 files changed, 159 insertions(+), 3 deletions(-)
+
+diff --git a/apps/desktop/electron/delta-reads.test.ts b/apps/desktop/electron/delta-reads.test.ts
+index 0f25d04d8a..6d28ce1645 100644
+--- a/apps/desktop/electron/delta-reads.test.ts
++++ b/apps/desktop/electron/delta-reads.test.ts
+@@ -97,6 +97,32 @@ describe('asking for a delta', () => {
+     expect(deltaRequestHeaders('GET', 'http://127.0.0.1:61511/api/plugins/kanban/board?board=default', store)[DELTA_BASE_HEADER]).toBe(bodyHash(body))
+   })
+ 
++  it('keeps one origin per scope: a rebind without a teardown stops the old port being asked or filed under it', () => {
++    const store = bound()
++    const body = cards(40)
++    const rebuilt = 'http://127.0.0.1:61511/api/plugins/kanban/board?board=default'
++
++    decodeDeltaBody(BOARD, whole(body), body, store)
++    store.bindRemote('http://127.0.0.1:61511', SCOPE) // the tunnel was rebuilt on a new port, no unbindScope
++
++    // The old port: no ask, no key, and a hashed answer from whatever listens there now is not kept.
++    expect(deltaRequestHeaders('GET', BOARD, store)).toEqual({})
++    expect(store.keyFor(BOARD)).toBeNull()
++
++    const stranger = cards(41)
++
++    expect(decodeDeltaBody(BOARD, whole(stranger), stranger, store)).toBe(stranger.toString('utf8'))
++    expect(store.size).toBe(1)
++    // The scope and its copy moved to the new origin.
++    expect(deltaRequestHeaders('GET', rebuilt, store)[DELTA_BASE_HEADER]).toBe(bodyHash(body))
++
++    // Another scope's binding is untouched, and binding the same origin again changes nothing.
++    store.bindRemote('http://127.0.0.1:50999', 'conn:hermes-hub::alpha')
++    store.bindRemote('http://127.0.0.1:61511', SCOPE)
++    expect(store.keyFor('http://127.0.0.1:50999/api/cron/jobs')).toBe('conn:hermes-hub::alpha\u0000/api/cron/jobs')
++    expect(deltaRequestHeaders('GET', rebuilt, store)[DELTA_BASE_HEADER]).toBe(bodyHash(body))
++  })
++
+   it('dropping a pooled backend (slowLinkTracker.forgetScope) unbinds its tunnel in the shared store', () => {
+     const url = 'http://127.0.0.1:50888/api/cron/jobs'
+ 
+diff --git a/apps/desktop/electron/delta-reads.ts b/apps/desktop/electron/delta-reads.ts
+index 894afd275a..50322386f5 100644
+--- a/apps/desktop/electron/delta-reads.ts
++++ b/apps/desktop/electron/delta-reads.ts
+@@ -71,11 +71,16 @@ export class DeltaBodyStore {
+   readonly #scopes = new Map<string, string>()
+   #bytes = 0
+ 
+-  /** A remote (SSH-tunnelled) backend now answers at baseUrl for this pool scope. */
++  /**
++   * A remote (SSH-tunnelled) backend now answers at baseUrl for this pool scope. A scope has one tunnel, so one
++   * origin: a rebuild on a new local port takes the scope (and its copies) with it, and the old port, which may be
++   * handed to something else, is no longer asked for deltas or able to file answers under this scope.
++   */
+   bindRemote(baseUrl: null | string | undefined, scope: string): void {
+     const origin = originOf(baseUrl)
+ 
+     if (origin && scope) {
++      this.unbindScope(scope)
+       this.#scopes.set(origin, scope)
+     }
+   }
+diff --git a/hermes_cli/web_delta_response.py b/hermes_cli/web_delta_response.py
+index 40124320e7..b27ecd0be5 100644
+--- a/hermes_cli/web_delta_response.py
++++ b/hermes_cli/web_delta_response.py
+@@ -17,6 +17,9 @@ apps/desktop/electron/delta-reads.ts).
+   again without a base.
+ - Everything else (no ask, other methods and statuses, streams, small or huge bodies, Python without
+   ``compression.zstd``) passes through untouched.
++- Every hashed or delta answer says ``Vary: X-Hermes-Delta-Accept, X-Hermes-Delta-Base`` (merged into the
++  handler's own Vary), and a delta drops the handler's ``ETag``: its bytes are a frame, not that entity. A caching
++  proxy in front of the gateway then cannot replay a delta to a client that did not ask for one.
+ 
+ Bodies are remembered per credential: the store key is (hash of the request's session-token / Authorization /
+ Cookie headers, hash of the body), so a caller can only name a base that was served to that same credential. A
+@@ -58,6 +61,7 @@ MAX_BYTES = 8 * 1024 * 1024
+ STORE_MAX_BYTES = 64 * 1024 * 1024
+ ZSTD_LEVEL = 3
+ CREDENTIAL_HEADERS = ("x-hermes-session-token", "authorization", "cookie")
++VARY_ON = ("X-Hermes-Delta-Accept", "X-Hermes-Delta-Base")
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -143,6 +147,18 @@ def _encode(body: bytes, base_digest: str, namespace: str, store: BodyStore) ->
+     return digest, frame if len(frame) < len(body) else None
+ 
+ 
++def _merge_vary(headers: MutableHeaders) -> None:
++    """One Vary header: the handler's names, then the two request headers the encoding depends on."""
++    names: list[str] = []
++    for value in headers.getlist("vary"):
++        names.extend(name.strip() for name in value.split(",") if name.strip())
++    if "*" not in names:
++        held = {name.lower() for name in names}
++        names.extend(name for name in VARY_ON if name.lower() not in held)
++    del headers["vary"]
++    headers["vary"] = ", ".join(names)
++
++
+ class DeltaResponseMiddleware:
+     """See the module docstring. Pure ASGI: a response that is not eligible is never buffered."""
+ 
+@@ -177,7 +193,17 @@ class _DeltaSend:
+         if message["type"] == "http.response.start" and _eligible(message):
+             self._start = message
+             return
+-        if self._start is None or message["type"] != "http.response.body":
++        if self._start is None:
++            await self._send(message)
++            return
++        if message["type"] != "http.response.body":
++            # Not a body we can collect (http.response.pathsend / zerocopysend: the server sends the file itself).
++            # The held start goes out first, unchanged, with any body collected so far; the rest passes through.
++            start, chunks = self._start, self._chunks
++            self._start, self._chunks = None, []
++            await self._send(start)
++            if chunks:
++                await self._send({"type": "http.response.body", "body": b"".join(chunks), "more_body": True})
+             await self._send(message)
+             return
+         self._chunks.append(message.get("body", b""))
+@@ -202,7 +228,9 @@ class _DeltaSend:
+             return
+         headers = MutableHeaders(raw=list(start["headers"]))
+         headers[HASH_HEADER] = digest
++        _merge_vary(headers)
+         if frame is not None:
++            del headers["etag"]  # the handler's validator names the whole body, not this frame
+             headers[DELTA_HEADER] = ENCODING
+             headers[BASE_HEADER] = self._base_digest
+             headers["content-type"] = DELTA_MEDIA_TYPE
+diff --git a/tests/hermes_cli/test_web_delta_response.py b/tests/hermes_cli/test_web_delta_response.py
+index a5fa40caf5..b92944fb8e 100644
+--- a/tests/hermes_cli/test_web_delta_response.py
++++ b/tests/hermes_cli/test_web_delta_response.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import gzip
+ import json
+ 
+@@ -75,7 +76,14 @@ def served():
+         response.set_cookie("b", "2")
+         return response
+ 
++    async def varied(request):
++        response = JSONResponse(state["board"], headers={"etag": '"abc"'})
++        response.headers.append("vary", "Accept-Encoding, x-hermes-delta-base")
++        response.headers.append("vary", "Origin")
++        return response
++
+     app = Starlette(routes=[
++        Route("/varied", varied),
+         Route("/board", get_board, methods=["GET", "POST", "HEAD"]),
+         Route("/small", small), Route("/text", text), Route("/missing", missing),
+         Route("/zipped", zipped), Route("/stream", stream), Route("/chunked", chunked), Route("/cookie", cookie),
+@@ -249,7 +257,8 @@ def test_other_headers_survive_a_delta_duplicates_included(served):
+     client.cookies.clear()  # the test client would send them back, which is another credential (see below)
+     second = client.get("/cookie", headers={**ASK, "X-Hermes-Delta-Base": first.headers[wdr.HASH_HEADER]})
+     assert second.headers[wdr.DELTA_HEADER] == "zstd"
+-    assert second.headers["cache-control"] == "no-store" and second.headers["etag"] == '"abc"'
++    assert second.headers["cache-control"] == "no-store"
++    assert first.headers["etag"] == '"abc"' and "etag" not in second.headers  # a frame is not the handler's entity
+     assert sorted(second.headers.get_list("set-cookie"))[0].startswith("a=1")
+     assert len(second.headers.get_list("set-cookie")) == 2
+ 
+@@ -348,3 +357,91 @@ def test_the_middleware_sits_inside_every_auth_gate_of_the_dashboard_app():
+     outer = chain[:at]
+     assert len(outer) >= 5
+     assert web_server.ChatFileUploadLimitMiddleware in chain[at + 1:]
++
++
++def _start(body: bytes) -> dict:
++    return {"type": "http.response.start", "status": 200, "headers": [
++        (b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]}
++
++
++async def _run(app, headers) -> list[dict]:
++    """What the server is sent for one GET through the middleware, on a scope that advertises pathsend."""
++    sent: list[dict] = []
++
++    async def send(message):
++        sent.append(message)
++
++    async def receive():
++        return {"type": "http.request", "body": b"", "more_body": False}
++
++    scope = {"type": "http", "method": "GET", "path": "/file", "extensions": {"http.response.pathsend": {}},
++             "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()]}
++    await wdr.DeltaResponseMiddleware(app, store=wdr.BodyStore())(scope, receive, send)
++    return sent
++
++
++@needs_zstd
++@pytest.mark.parametrize("kind", ["http.response.pathsend", "http.response.zerocopysend"])
++def test_a_file_the_server_sends_itself_still_gets_its_start_first(kind):
++    """An eligible start is held for its body; a pathsend/zerocopysend is not a body, so the start must go first."""
++    body = json.dumps(board(2000)).encode()
++    start = _start(body)
++    file_message = {"type": kind, "path": "/tmp/board.json"}
++
++    async def app(scope, receive, send):
++        await send(start)
++        await send(file_message)
++
++    assert asyncio.run(_run(app, {**ASK, "X-Hermes-Delta-Base": "f" * 32})) == [start, file_message]
++    assert asyncio.run(_run(app, {})) == [start, file_message]  # exactly what an unasked request gets
++
++
++@needs_zstd
++def test_body_collected_before_a_non_body_message_goes_out_after_the_start():
++    body = json.dumps(board(2000)).encode()
++    start = _start(body)
++    head = {"type": "http.response.body", "body": body[:9000], "more_body": True}
++    file_message = {"type": "http.response.pathsend", "path": "/tmp/rest.json"}
++    tail = {"type": "http.response.body", "body": b"", "more_body": False}
++
++    async def app(scope, receive, send):
++        for message in (start, head, file_message, tail):
++            await send(message)
++
++    assert asyncio.run(_run(app, ASK)) == [start, head, file_message, tail]
++
++
++@needs_zstd
++def test_hashed_and_delta_answers_vary_on_the_ask_and_a_delta_drops_the_etag(served):
++    """A caching proxy must not replay a delta (or a hashed answer) to a client that did not ask for one."""
++    client, _, _ = served
++    first = client.get("/board", headers=ASK)
++    assert first.headers.get_list("vary") == ["X-Hermes-Delta-Accept, X-Hermes-Delta-Base"]
++    second = client.get("/board", headers={**ASK, "X-Hermes-Delta-Base": first.headers[wdr.HASH_HEADER]})
++    assert second.headers[wdr.DELTA_HEADER] == "zstd"
++    assert second.headers.get_list("vary") == ["X-Hermes-Delta-Accept, X-Hermes-Delta-Base"]
++
++    # The handler's own Vary names are kept, once each, in one header; a whole body keeps its ETag, a delta does not.
++    merged = ["Accept-Encoding, x-hermes-delta-base, Origin, X-Hermes-Delta-Accept"]
++    whole = client.get("/varied", headers=ASK)
++    assert wdr.DELTA_HEADER not in whole.headers
++    assert whole.headers.get_list("vary") == merged
++    assert whole.headers["etag"] == '"abc"'
++    delta = client.get("/varied", headers={**ASK, "X-Hermes-Delta-Base": whole.headers[wdr.HASH_HEADER]})
++    assert delta.headers[wdr.DELTA_HEADER] == "zstd"
++    assert delta.headers.get_list("vary") == merged
++    assert "etag" not in delta.headers
++
++    # An unasked request, and an asked one that is not encoded, keep exactly the handler's headers.
++    plain = client.get("/varied")
++    assert plain.headers.get_list("vary") == ["Accept-Encoding, x-hermes-delta-base", "Origin"]
++    assert plain.headers["etag"] == '"abc"'
++    assert "vary" not in client.get("/small", headers=ASK).headers
++
++
++def test_vary_star_is_left_alone():
++    from starlette.datastructures import MutableHeaders
++
++    headers = MutableHeaders(raw=[(b"vary", b"*")])
++    wdr._merge_vary(headers)
++    assert headers.getlist("vary") == ["*"]
+-- 
+2.51.0
+

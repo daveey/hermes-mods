@@ -1,0 +1,887 @@
+From cfe3598dc36181bef39ea8a560203235339de03f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:43:56 +0000
+Subject: [PATCH] [daveey] kanban remote notices: publish one host copy of the
+ remote notice index per replica state
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Design t_01a1d45d75851804 §2c (review item R8); card t_01a1d471735508b4.
+
+Why: every backend's 5 s notice poller rebuilt the same remote index for the same replica state.
+In a steady hub serve, `remote_index_projection.snapshot` was 11.5% of samples and
+`kanban_remote_observations.observe` was 2.1%. Each was memoized only per process.
+
+What:
+- New `tui_gateway/kanban_remote_index.py` publishes `<ledger dir>/remote-index.db`:
+  meta (key = replica file identity + max seq, me, ledger file identity, hub_db, built_at),
+  `cards(owner, key, seq, state, task, obs, fresh, first_seen)` and
+  `links(profile, session, owner, key, ord)`. Each publish is one transaction that writes only the
+  rows whose seq/state/observation changed (per-seq delta; a full rewrite only when the replica
+  file changes).
+- `collect` → `_chat_index`: when the published key equals the replica's current key, it reads
+  only its own `(profile, session ∈ lineage)` rows, plus first-seen times from those rows, so it
+  skips both `_index` and `observe`. On a stale key, a missing/corrupt db or a different ledger, it
+  computes locally exactly as before and offers the result for publishing.
+- Publishing never waits. The build lock is a non-blocking flock, sqlite timeout is 0, a busy
+  publish is skipped, and nothing touches the index db while `kanban_remote_notices._lock` is held.
+- Holder: a host loop lease `kanban-remote-index` (gateway > serve) runs a change-driven refresher.
+  It does one `PRAGMA data_version` fingerprint per second and rebuilds only when the replica
+  changes, so readers normally hit. The holder is started from `collect` (serve) and from the
+  gateway's remote owner poll. The holder is optional: with it dead, the first reader after a
+  change computes locally and publishes.
+- Readers reuse parsed task payloads per (replica file, owner, key, seq). A chat with hundreds of
+  linked cards parses only the cards that changed.
+
+Bench (gate: a publish per replica change must cost ≤ today's incremental per-seq snapshot in one
+process). Copy of a live replica (16,410 task rows), 20 one-card changes, median ms:
+
+                              me=macbook (534 chats, 1,684 cards)   me=hub (436 chats, 1,465 cards)
+  today, per process per change:
+    snapshot (incremental)    40.8                                  32.9
+    observe                   55.9                                  43.1
+  published:
+    full publish              117.8  (> snapshot: rejected)          83.3
+    delta publish (shipped)   36.8   (≤ snapshot)                    22.2
+    reader: key + hit         1.6 + 5.0 (biggest chat, 524 cards)   1.5 + 3.0
+    rows written per change   1                                     1
+
+A full publish per change fails the gate (118 > 41 ms), so the module publishes per-seq deltas,
+which pass (37 ≤ 41 ms). Each additional backend's per-change cost drops from snapshot + observe
+(~97 ms) to ~7 ms.
+
+Tests (tests/tui_gateway/test_kanban_remote_index.py, 11): reader hit returns the same notices as
+local compute (with `_index` and `observe` forbidden); stale key → local compute + publish;
+missing / corrupt / other-ledger db → local compute and repair; no index I/O or wait under
+`_lock` while another process holds the build lock and a write transaction; a notice reaches the
+chat within the 5 s poll with the holder dead; the holder republishes on change only while leased
+and never when unchanged; a delta writes only the changed row; only changed payloads are re-parsed;
+a replica without seq never publishes.
+RED: on the base, the file fails at import (module absent). GREEN: 11/11. Mutation check: 8 of 8
+mutants killed (no hits, ignore key, publish under _lock, standby publishes, full rewrite, no corrupt
+recovery, blocking build lock, re-parse all).
+Neighbours: 54 files / 749 tests importing the touched modules pass. `scripts/check --base
+origin/main`: 19 checks ok.
+---
+ gateway/kanban_remote_owner.py                |   2 +
+ tests/tui_gateway/test_kanban_remote_index.py | 268 +++++++++++
+ tui_gateway/kanban_remote_index.py            | 443 ++++++++++++++++++
+ tui_gateway/kanban_remote_notices.py          |  31 +-
+ tui_gateway/remote_index_projection.py        |   6 +
+ 5 files changed, 743 insertions(+), 7 deletions(-)
+ create mode 100644 tests/tui_gateway/test_kanban_remote_index.py
+ create mode 100644 tui_gateway/kanban_remote_index.py
+
+diff --git a/gateway/kanban_remote_owner.py b/gateway/kanban_remote_owner.py
+index c86931003c..5d8738e776 100644
+--- a/gateway/kanban_remote_owner.py
++++ b/gateway/kanban_remote_owner.py
+@@ -173,6 +173,8 @@ def _collect(runner: Any, authority: Any, lives: list) -> list[tuple]:
+     _reconcile(db)
+     if not krn.hub_db_path().is_file():
+         return []
++    from tui_gateway.kanban_remote_index import ensure_holder
++    ensure_holder("gateway")  # the gateway outranks Desktop backends for the remote index refresher lease
+     profile = _profile(runner, authority)
+     out = []
+     for logical, live in lives:
+diff --git a/tests/tui_gateway/test_kanban_remote_index.py b/tests/tui_gateway/test_kanban_remote_index.py
+new file mode 100644
+index 0000000000..be35f6e5c4
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_remote_index.py
+@@ -0,0 +1,268 @@
++"""The host's published remote notice index (``kanban_remote_index``): readers of the replica's current state read
++their own rows instead of rebuilding the index and re-running ``observe``; any miss computes locally. [daveey]"""
++import json
++import os
++import shutil
++import sqlite3
++import threading
++import time
++
++import pytest
++
++from tests.tui_gateway.test_kanban_remote_arrival import _hub
++from tests.tui_gateway.test_kanban_remote_notices import CHAT, OTHER, _card
++from tests.waiting import wait_until
++from tui_gateway import kanban_remote_index as kri
++from tui_gateway import kanban_remote_notices as krn
++from tui_gateway import kanban_remote_observations as obs
++
++NOW = 1_800_000_000.0
++PARENT = "20261020_101010_aaaaaa"
++
++
++@pytest.fixture(autouse=True)
++def _fresh_memos():
++    krn._reset_for_tests()
++    yield
++    krn._reset_for_tests()
++
++
++def _linked(tid, *sessions, status="done", at=NOW - 60):
++    card = _card(tid, sessions[0], status=status, at=at)
++    card["task"]["sessions"] = [{"gw": "macbook", "profile": "default", "session": sid, "rel": "shepherd"}
++                                for sid in sessions]
++    return card
++
++
++def _cards():
++    return [_linked("t_done", CHAT), _linked("t_blocked", CHAT, status="blocked"),
++            _linked("t_old", CHAT, at=NOW - 10 * 3600), _linked("t_shared", CHAT, OTHER),
++            _linked("t_parent", PARENT), _linked("t_other", OTHER)]
++
++
++def _home(tmp_path, cards):
++    tmp_path.mkdir(parents=True, exist_ok=True)
++    replica = _hub(tmp_path, cards)
++    with sqlite3.connect(replica) as conn:
++        conn.execute("PRAGMA journal_mode=wal")
++    return replica, tmp_path / "kanban" / "remote-notices.db"
++
++
++def _add(replica, card, seq):
++    with sqlite3.connect(replica) as conn:
++        conn.execute("INSERT INTO replica VALUES ('hub','tasks',?,?,?)", (card["key"], json.dumps(card["task"]), seq))
++
++
++def _collect(replica, ledger, session=CHAT, lineage=(PARENT,), now=NOW):
++    return krn.collect(session, "default", hub_db=replica, ledger=ledger, now=now, lineage=lineage)
++
++
++def _norm(items):
++    return json.dumps(items, sort_keys=True, default=str)
++
++
++def _forbid_local_build(monkeypatch):
++    def forbidden(*args, **kwargs):
++        pytest.fail("a reader of the published state rebuilt the index or re-ran observe")
++    monkeypatch.setattr(krn, "_index", forbidden)
++    monkeypatch.setattr(obs, "observe", forbidden)
++
++
++def _count_local_builds(monkeypatch):
++    calls, real = [], krn._index
++    monkeypatch.setattr(krn, "_index", lambda path: calls.append(path) or real(path))
++    return calls
++
++
++def test_reader_hit_returns_the_same_notices_as_local_compute(tmp_path, monkeypatch):
++    replica, ledger = _home(tmp_path / "home", _cards())
++    assert _collect(replica, ledger, session=OTHER, lineage=())  # this process builds and publishes
++    assert kri.published_key(ledger) == kri.replica_key(replica)
++    twin = tmp_path / "twin"
++    shutil.copytree(tmp_path / "home", twin)  # same replica and ledger state, computed locally below
++    krn._reset_for_tests()  # another backend process on this host
++
++    with monkeypatch.context() as local:
++        local.setattr(kri, "lookup", lambda *args, **kwargs: None)
++        local.setattr(kri, "publish", lambda *args, **kwargs: False)
++        twin_ledger = twin / "kanban" / "remote-notices.db"
++        expected_index = krn._chat_index(twin / "hub.db", twin_ledger, NOW, "default", (CHAT, PARENT))
++        expected = _collect(twin / "hub.db", twin_ledger)
++    krn._reset_for_tests()
++
++    _forbid_local_build(monkeypatch)
++    me, by_sid, observed = krn._chat_index(replica, ledger, NOW, "default", (CHAT, PARENT))
++    assert (me, by_sid) == expected_index[:2]
++    from tui_gateway.kanban_remote_notice_state import state
++    mine = {(card["gw"], card["key"], state(card["task"])) for cards in by_sid.values() for card in cards}
++    assert len(mine) == 5 and set(observed) == mine
++    assert dict(observed) == {ident: expected_index[2][ident] for ident in mine}
++    assert observed.first_seen == {ident: at for ident, at in expected_index[2].first_seen.items() if ident in mine}
++    got = _collect(replica, ledger)
++    assert len(got) == 4 and _norm(got) == _norm(expected)
++    assert kri.stats["hits"] >= 1
++
++
++def test_stale_key_computes_locally_and_publishes(tmp_path, monkeypatch):
++    replica, ledger = _home(tmp_path, _cards())
++    _collect(replica, ledger)
++    old = kri.published_key(ledger)
++    krn._reset_for_tests()
++    _add(replica, _linked("t_new", CHAT), 50)
++    builds = _count_local_builds(monkeypatch)
++    got = _collect(replica, ledger)
++    assert [item["ref"] for item in got] == ["hub/default/default/t_new"]
++    assert builds, "a stale published copy must not be read"
++    assert kri.published_key(ledger) == kri.replica_key(replica) != old
++
++
++def test_publish_writes_only_the_rows_that_changed(tmp_path):
++    replica, ledger = _home(tmp_path, _cards())
++    _collect(replica, ledger)
++    first = kri.stats["rows_written"]
++    assert first >= len(_cards())
++    _add(replica, _linked("t_new", OTHER), 50)
++    _collect(replica, ledger)
++    assert kri.stats["rows_written"] - first == 1
++
++
++@pytest.mark.parametrize("damage", ["missing", "corrupt", "wrong_ledger"])
++def test_missing_or_corrupt_copy_computes_locally(tmp_path, monkeypatch, damage):
++    replica, ledger = _home(tmp_path, _cards())
++    _collect(replica, ledger, session=OTHER, lineage=())
++    krn._reset_for_tests()
++    db = kri.index_path(ledger)
++    if damage == "missing":
++        for suffix in ("", "-wal", "-shm"):
++            if os.path.exists(f"{db}{suffix}"):
++                os.unlink(f"{db}{suffix}")
++    elif damage == "corrupt":
++        for suffix in ("-wal", "-shm"):
++            if os.path.exists(f"{db}{suffix}"):
++                os.unlink(f"{db}{suffix}")
++        db.write_bytes(b"not a database" * 512)
++    else:
++        with sqlite3.connect(db) as conn:
++            conn.execute("UPDATE meta SET v = '[\"elsewhere\", null]' WHERE k = 'ledger'")
++    builds = _count_local_builds(monkeypatch)
++    got = _collect(replica, ledger)
++    assert len(got) == 4 and builds
++    assert kri.published_key(ledger) == kri.replica_key(replica)  # the reader repaired the copy
++
++
++def test_no_index_io_or_wait_under_the_collect_lock(tmp_path, monkeypatch):
++    replica, ledger = _home(tmp_path, _cards())
++    _collect(replica, ledger, session=OTHER, lineage=())
++    krn._reset_for_tests()
++    _add(replica, _linked("t_new", CHAT), 50)
++    seen = []
++    for name in ("_read", "_build_lock", "_open_rw", "replica_key", "published_key"):
++        real = getattr(kri, name)
++
++        def checked(*args, _real=real, _name=name, **kwargs):
++            seen.append(_name)
++            assert not krn._lock.locked(), f"{_name} ran under kanban_remote_notices._lock"
++            return _real(*args, **kwargs)
++        monkeypatch.setattr(kri, name, checked)
++    db = kri.index_path(ledger)
++    holder = os.open(f"{db}.lock", os.O_RDWR | os.O_CREAT)
++    import fcntl
++    fcntl.flock(holder, fcntl.LOCK_EX)  # another process is publishing right now
++    writer = sqlite3.connect(db, timeout=0)
++    writer.execute("BEGIN EXCLUSIVE")
++    try:
++        started, result = time.monotonic(), []
++        poll = threading.Thread(target=lambda: result.append(_collect(replica, ledger)), daemon=True)
++        poll.start()
++        poll.join(5.0)
++        assert result, "collect waited on the index's build lock or write transaction"
++        assert time.monotonic() - started < 2.0
++        got = result[0]
++        assert {item["ref"] for item in got} >= {"hub/default/default/t_new"}
++        assert {"replica_key", "_build_lock"} <= set(seen)
++        assert kri.stats["busy"] == 1
++    finally:
++        writer.rollback()
++        writer.close()
++        os.close(holder)
++
++
++def test_notice_reaches_the_chat_on_its_next_poll_with_the_holder_dead(tmp_path):
++    replica, ledger = _home(tmp_path, _cards())
++    assert kri.refresh(replica, ledger, now=NOW)  # the holder published, then died: nothing refreshes now
++    krn._reset_for_tests()
++    _add(replica, _linked("t_late", CHAT, at=NOW - 5), 50)
++    started = time.monotonic()
++    got = _collect(replica, ledger, now=NOW)
++    assert "hub/default/default/t_late" in {item["ref"] for item in got}
++    assert time.monotonic() - started < 5.0  # inside the poller's 5 s interval, without any holder
++
++
++class _Lease:
++    def __init__(self, held):
++        self.value, self.asked, self.beats, self.released = held, 0, 0, False
++
++    def held(self):
++        self.asked += 1
++        return self.value
++
++    def beat(self):
++        self.beats += 1
++
++    def release(self):
++        self.released = True
++
++
++def test_holder_republishes_on_replica_change_only_while_leased(tmp_path):
++    replica, ledger = _home(tmp_path, _cards())
++    lease, stop = _Lease(False), threading.Event()
++    thread = threading.Thread(target=kri._hold, args=(lease, replica, ledger, stop, 0.01), daemon=True)
++    thread.start()
++    try:
++        wait_until(lambda: lease.asked > 3, what="standby passes")
++        assert kri.published_key(ledger) is None  # a standby never publishes
++        lease.value = True
++        wait_until(lambda: kri.published_key(ledger) == kri.replica_key(replica), what="holder publish")
++        _add(replica, _linked("t_new", CHAT), 50)
++        wait_until(lambda: kri.published_key(ledger) == kri.replica_key(replica), what="change-driven publish")
++        publishes = kri.stats["publishes"]
++        beats = lease.beats
++        wait_until(lambda: lease.beats > beats + 5, what="idle passes")
++        assert kri.stats["publishes"] == publishes  # an unchanged replica is not rebuilt
++    finally:
++        stop.set()
++        thread.join(5)
++    assert lease.released
++    krn._reset_for_tests()
++    with pytest.MonkeyPatch.context() as mp:
++        _forbid_local_build(mp)
++        assert "hub/default/default/t_new" in {item["ref"] for item in _collect(replica, ledger)}
++
++
++def test_reader_parses_only_the_payloads_that_changed(tmp_path, monkeypatch):
++    cards = [_linked(f"t_{i}", CHAT) for i in range(12)]
++    replica, ledger = _home(tmp_path, cards)
++    assert kri.refresh(replica, ledger, now=NOW)
++    from tui_gateway.kanban_replica_observer import fingerprint
++    assert len(kri.lookup(replica, ledger, fingerprint(replica), "default", (CHAT,))[1][CHAT]) == 12
++    cards[3]["task"]["title"] = "renamed"
++    with sqlite3.connect(replica) as conn:
++        conn.execute("UPDATE replica SET data=?, seq=50 WHERE key=?", (json.dumps(cards[3]["task"]), cards[3]["key"]))
++    assert kri.refresh(replica, ledger, now=NOW)
++    parsed = []
++    real = json.loads
++    monkeypatch.setattr(kri, "json", type("J", (), {"loads": staticmethod(lambda s: parsed.append(s) or real(s)),
++                                                     "dumps": staticmethod(json.dumps)}))
++    hit = kri.lookup(replica, ledger, fingerprint(replica), "default", (CHAT,))
++    titles = {card["task"]["title"] for card in hit[1][CHAT]}
++    assert "renamed" in titles and len(titles) == 12
++    assert len([s for s in parsed if '"title"' in s]) == 1  # one task payload, not twelve
++
++
++def test_replica_without_seq_has_no_key_and_never_publishes(tmp_path):
++    replica, ledger = _home(tmp_path, _cards())
++    with sqlite3.connect(replica) as conn:
++        conn.execute("ALTER TABLE replica DROP COLUMN seq")
++    assert kri.replica_key(replica) is None
++    assert len(_collect(replica, ledger)) == 4
++    assert not kri.index_path(ledger).exists()
+diff --git a/tui_gateway/kanban_remote_index.py b/tui_gateway/kanban_remote_index.py
+new file mode 100644
+index 0000000000..233c851c6c
+--- /dev/null
++++ b/tui_gateway/kanban_remote_index.py
+@@ -0,0 +1,443 @@
++"""One host copy of the remote notice index per replica change (design t_01a1d45d75851804 §2c). [daveey]
++
++Every chat's notice poller (``kanban_remote_notices.collect``) needs the same thing from the hub replica: the
++terminal remote cards linked to each ``(profile, session)``, plus this host's first observation of each state
++(``kanban_remote_observations.observe``). Each backend process rebuilt both for every replica change (memoized
++only per process): in a steady hermes-hub serve ``remote_index_projection.snapshot`` was 11.5% of the samples and
++``observe`` 2.1%, the same answer computed once per process.
++
++Here whoever builds that answer for a replica state publishes it to ``<ledger dir>/remote-index.db``, in one
++transaction:
++
++* ``meta``: ``key`` (the replica state the rows belong to, :func:`replica_key`), ``me`` (this gateway), ``ledger``
++  (identity of the observation ledger the first-seen times came from), ``hub_db``, ``built_at``.
++* ``cards``: ``(owner, key, seq, state, task, obs, fresh, first_seen)``, one per linked terminal remote card, with
++  ``observe``'s answer for its state (``obs`` = the state is in that map).
++* ``links``: ``(profile, session, owner, key, ord)``, the index entries in the order the local build lists them.
++
++A reader (:func:`lookup`) whose current key equals the published one reads only its own ``(profile, session ∈
++lineage)`` rows and skips ``observe`` (the first-seen times are in the rows; the publisher's ``observe`` already
++recorded them in the ledger). Any other answer (no file, a stale key, a corrupt file, a busy file) is a miss: the
++caller computes locally exactly as before and then offers its result (:func:`publish`). Nothing here ever waits:
++reads use a zero busy timeout, and publishing takes a NON-blocking ``flock`` and is skipped when another process
++is publishing. Both run outside ``kanban_remote_notices._lock``.
++
++A publish writes only the rows whose replica ``seq`` or observation changed (per-seq deltas), so its cost follows
++the change, like the incremental in-process build it replaces.
++
++The holder (host loop lease ``kanban-remote-index``, :func:`ensure_holder`) watches the replica's change key once
++a second and republishes as soon as it moves, so the readers' 5 s polls normally hit. With the holder dead every
++reader still computes on a miss, so a notice is never later than the poll that would have found it before.
++Only the root home runs a holder; a profile home's ledger gets its copy from its own readers' misses.
++"""
++from __future__ import annotations
++
++import contextlib
++import json
++import logging
++import os
++import sqlite3
++import threading
++import time
++from pathlib import Path
++from typing import Optional
++
++try:
++    import fcntl
++except ImportError:  # no flock: never publish, every reader computes locally (today's behaviour)
++    fcntl = None  # type: ignore[assignment]
++
++logger = logging.getLogger(__name__)
++
++VERSION = 1
++LEASE = "kanban-remote-index"
++LEASE_INTERVAL_S = 5.0
++REFRESH_POLL_S = 1.0
++_MEMO_MAX = 512
++
++_memo_lock = threading.Lock()  # guards the dicts below only; never held across I/O
++_keys: dict[tuple, tuple] = {}  # (hub, ledger) -> (stamp, replica key or None)
++_answers: dict[tuple, Optional[tuple]] = {}  # (hub, ledger, stamp, profile, sids) -> hit or None (miss)
++_published: dict[tuple, tuple] = {}  # (hub, ledger) -> (key, ledger file id) this process published or found
++_decoded: dict[tuple, tuple] = {}  # (replica base, owner, key) -> (seq, task): payloads this process parsed
++_DECODED_MAX = 20_000
++_holders: dict[tuple, threading.Event] = {}
++stats = {"hits": 0, "misses": 0, "publishes": 0, "busy": 0, "rows_written": 0}
++
++
++def index_path(ledger: Path) -> Path:
++    return Path(ledger).parent / "remote-index.db"
++
++
++def _file_id(path: Path) -> Optional[list]:
++    try:
++        st = os.stat(path)
++    except OSError:
++        return None
++    return [st.st_dev, st.st_ino]
++
++
++def replica_key(hub: Path) -> Optional[str]:
++    """The replica state the index is a function of, comparable across processes; None when unknown.
++
++    The replica's file identity, its gateway, whether it is caught up (``observe`` answers nothing before), and
++    ``COUNT/MAX/TOTAL(seq)`` of the other gateways' task rows (a covering index scan, no payload read). The hub
++    client gives every task write a new, higher ``seq`` (the in-process projection reuses rows on the same
++    assumption), so any task commit moves the key. A replica without ``seq`` has no key: read locally."""
++    from tui_gateway.kanban_remote_notices import _ro
++
++    ident = _file_id(hub)
++    if ident is None:
++        return None
++    try:
++        with contextlib.closing(_ro(hub)) as conn:
++            conn.execute("BEGIN")
++            if "seq" not in {row[1] for row in conn.execute("PRAGMA table_info(replica)")}:
++                return None
++            meta = dict(conn.execute("SELECT k, v FROM meta WHERE k IN ('gateway', 'cursor', 'head')"))
++            me = str(meta.get("gateway") or "")
++            ready = False
++            with contextlib.suppress(TypeError, ValueError):
++                ready = bool(me) and int(str(meta.get("cursor"))) >= int(str(meta.get("head")))
++            sig = conn.execute("SELECT COUNT(*), MAX(seq), TOTAL(seq) FROM replica WHERE coll = 'tasks' AND gw != ?",
++                               (me,)).fetchone()
++    except (OSError, sqlite3.Error):
++        return None
++    if _file_id(hub) != ident:
++        return None
++    return json.dumps([VERSION, os.path.realpath(hub), *ident, me, ready, *sig])
++
++
++def _slot(hub: Path, ledger: Path) -> tuple:
++    return str(hub), str(ledger)
++
++
++def _remember(store: dict, key, value, limit: int = _MEMO_MAX) -> None:
++    """Caller holds ``_memo_lock``."""
++    store.pop(key, None)
++    store[key] = value
++    while len(store) > limit:
++        store.pop(next(iter(store)))
++
++
++def current_key(hub: Path, ledger: Path, stamp) -> Optional[str]:
++    """:func:`replica_key` memoized on the observer's change key (one query per replica change per process)."""
++    if stamp is None:
++        return None
++    slot = _slot(hub, ledger)
++    with _memo_lock:
++        held = _keys.get(slot)
++    if held is not None and held[0] == stamp:
++        return held[1]
++    key = replica_key(hub)
++    with _memo_lock:
++        _remember(_keys, slot, (stamp, key))
++        for old in [k for k in _answers if k[:2] == slot and k[2] != stamp]:
++            del _answers[old]
++    return key
++
++
++def lookup(hub: Path, ledger: Path, stamp, profile: str, sids: tuple) -> Optional[tuple]:
++    """``(me, {sid: [card, ...]}, observed)`` from the published copy, or None (compute locally).
++
++    Answers (hit or miss) are memoized per change key, so an unchanged replica opens nothing here."""
++    from tui_gateway.kanban_remote_observations import Observed
++
++    key = current_key(hub, ledger, stamp)
++    if key is None:
++        return None
++    memo_key = (*_slot(hub, ledger), stamp, profile, sids)
++    with _memo_lock:
++        if memo_key in _answers:
++            return _answers[memo_key]
++    rows = _read(index_path(ledger), key, ledger, profile, sids)
++    answer = None
++    if rows is not None:
++        me, found = rows
++        by_sid: dict[str, list] = {sid: [] for sid in sids}
++        observed = Observed()
++        for sid, owner, card_key, state, task, obs, fresh, first_seen in found:
++            by_sid[sid].append({"gw": owner, "key": card_key, "task": task})
++            if obs:
++                observed[(owner, card_key, state)] = fresh
++                if first_seen is not None:
++                    observed.first_seen[(owner, card_key, state)] = first_seen
++        answer = (me, by_sid, observed)
++    with _memo_lock:
++        stats["hits" if answer is not None else "misses"] += 1
++        _remember(_answers, memo_key, answer)
++    return answer
++
++
++def _read(db: Path, key: str, ledger: Path, profile: str, sids: tuple) -> Optional[tuple]:
++    """This chat's rows when ``meta.key`` is ``key`` and the ledger is the one they were observed in. Never waits.
++
++    A card whose ``seq`` this process already decoded (same replica file) reuses that task: only payloads that
++    changed are fetched and parsed, so a long-lived chat with hundreds of linked cards costs one changed card per
++    replica change, not all of them."""
++    if not sids or not db.is_file():
++        return None
++    base = tuple(json.loads(key)[:4])
++    try:
++        with contextlib.closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=0.0)) as conn:
++            conn.execute("BEGIN")
++            meta = dict(conn.execute("SELECT k, v FROM meta WHERE k IN ('key', 'me', 'ledger')"))
++            if meta.get("key") != key or meta.get("ledger") != json.dumps([str(ledger), _file_id(ledger)]):
++                return None
++            marks = ",".join("?" * len(sids))
++            rows = conn.execute(
++                "SELECT l.session, c.owner, c.key, c.state, c.seq, c.obs, c.fresh, c.first_seen FROM links l "
++                f"JOIN cards c ON c.owner = l.owner AND c.key = l.key WHERE l.profile = ? AND l.session IN ({marks}) "
++                "ORDER BY l.ord", (profile, *sids)).fetchall()
++            found = []
++            for sid, owner, card_key, state, seq, *obs in rows:
++                ident = (base, owner, card_key)
++                with _memo_lock:
++                    hit = _decoded.get(ident)
++                if hit is None or not isinstance(seq, int) or seq <= 0 or hit[0] != seq:
++                    raw = conn.execute("SELECT task FROM cards WHERE owner = ? AND key = ?", (owner, card_key))
++                    hit = (seq, json.loads(raw.fetchone()[0]))
++                    with _memo_lock:
++                        _remember(_decoded, ident, hit, limit=_DECODED_MAX)
++                found.append((sid, owner, card_key, state, hit[1], *obs))
++            return str(meta.get("me") or ""), found
++    except (sqlite3.Error, ValueError, TypeError):  # corrupt, busy, half-created: compute locally
++        logger.debug("remote notice index %s unreadable; computing locally", db, exc_info=True)
++        return None
++
++
++def _build_lock(db: Path) -> Optional[int]:
++    """Non-blocking exclusive lock for publishing ``db``: an fd, or None when another process publishes now."""
++    if fcntl is None:
++        return None
++    try:
++        db.parent.mkdir(parents=True, exist_ok=True)
++        fd = os.open(f"{db}.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
++    except OSError:
++        return None
++    try:
++        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++    except OSError:
++        os.close(fd)
++        return None
++    return fd
++
++
++_SCHEMA = (
++    "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)",
++    "CREATE TABLE IF NOT EXISTS cards (owner TEXT NOT NULL, key TEXT NOT NULL, seq INTEGER, state TEXT NOT NULL, "
++    "task TEXT NOT NULL, obs INTEGER NOT NULL, fresh REAL, first_seen REAL, PRIMARY KEY (owner, key))",
++    "CREATE TABLE IF NOT EXISTS links (profile TEXT NOT NULL, session TEXT NOT NULL, owner TEXT NOT NULL, "
++    "key TEXT NOT NULL, ord INTEGER NOT NULL, PRIMARY KEY (profile, session, owner, key))",
++)
++
++
++def _open_rw(db: Path) -> sqlite3.Connection:
++    """The index, created or (corrupt) recreated. Only the build-lock holder calls this, so nothing waits."""
++    for attempt in (0, 1):
++        conn = sqlite3.connect(str(db), timeout=0.0)
++        try:
++            conn.execute("PRAGMA journal_mode=WAL")
++            conn.execute("PRAGMA synchronous=NORMAL")
++            for sql in _SCHEMA:
++                conn.execute(sql)
++            conn.execute("SELECT COUNT(*) FROM cards").fetchone()
++            return conn
++        except sqlite3.DatabaseError:
++            conn.close()
++            if attempt:
++                raise
++            logger.warning("remote notice index %s unreadable; recreating it", db, exc_info=True)
++            for suffix in ("", "-wal", "-shm"):
++                with contextlib.suppress(FileNotFoundError):
++                    os.unlink(f"{db}{suffix}")
++    raise AssertionError("unreachable")
++
++
++def publish(hub: Path, ledger: Path, key: str, me: str, index: dict, observed: dict, seqs: dict) -> bool:
++    """Write ``index`` (``{(profile, session): [card, ...]}``) and ``observed`` for ``key``; True when the copy now
++    holds ``key``. Skipped (False) while another process publishes. Only changed rows are written."""
++    from tui_gateway.kanban_remote_notice_state import state as notice_state
++    from tui_gateway.kanban_remote_observations import first_seen_of
++
++    slot = _slot(hub, ledger)
++    if _already(hub, ledger, key):
++        return True
++    db = index_path(ledger)
++    fd = _build_lock(db)
++    if fd is None:
++        with _memo_lock:
++            stats["busy"] += 1
++        return False
++    try:
++        with contextlib.closing(_open_rw(db)) as conn:
++            meta = dict(conn.execute("SELECT k, v FROM meta"))
++            ledger_id = json.dumps([str(ledger), _file_id(ledger)])
++            if meta.get("key") == key and meta.get("ledger") == ledger_id:
++                written = 0
++            else:
++                cards, links = {}, set()
++                for (profile, session), entries in index.items():
++                    for ord_, card in enumerate(entries):
++                        owner, card_key, task = card["gw"], card["key"], card["task"]
++                        state = notice_state(task)
++                        ident = (owner, card_key, state)
++                        obs = (int(ident in observed), observed.get(ident), first_seen_of(observed, ident))
++                        cards[(owner, card_key)] = (seqs.get((owner, card_key)), state, task, obs)
++                        links.add((profile, session, owner, card_key, ord_))
++                written = _write(conn, meta, key, me, ledger_id, str(hub), cards, links)
++        with _memo_lock:
++            _remember(_published, slot, (key, _file_id(ledger)))
++            stats["publishes"] += 1
++            stats["rows_written"] += written
++        return True
++    except (OSError, sqlite3.Error):
++        logger.debug("remote notice index %s not published", db, exc_info=True)
++        return False
++    finally:
++        os.close(fd)  # closing the descriptor drops the flock
++
++
++def _write(conn, meta: dict, key: str, me: str, ledger_id: str, hub: str, cards: dict, links: set) -> int:
++    """One transaction: the delta against the copy on disk (all of it when the copy is of another replica file)."""
++    base = json.loads(key)[:4]
++    same_file = meta.get("base") == json.dumps(base)
++    old_cards = {(row[0], row[1]): (row[2], row[3], (row[4], row[5], row[6])) for row in conn.execute(
++        "SELECT owner, key, seq, state, obs, fresh, first_seen FROM cards")} if same_file else {}
++    old_links = set(conn.execute("SELECT profile, session, owner, key, ord FROM links")) if same_file else set()
++    upserts = []
++    for ident, (seq, state, task, obs) in cards.items():
++        old = old_cards.get(ident)
++        if old is not None and isinstance(seq, int) and seq > 0 and old[0] == seq and old[1] == state \
++                and old[2] == obs:
++            continue
++        upserts.append((*ident, seq, state, json.dumps(task), *obs))
++    gone = [ident for ident in old_cards if ident not in cards]
++    with conn:
++        conn.execute("BEGIN IMMEDIATE")
++        if not same_file:
++            conn.execute("DELETE FROM cards")
++            conn.execute("DELETE FROM links")
++        conn.executemany("DELETE FROM cards WHERE owner = ? AND key = ?", gone)
++        conn.executemany("INSERT OR REPLACE INTO cards VALUES (?,?,?,?,?,?,?,?)", upserts)
++        conn.executemany("DELETE FROM links WHERE profile = ? AND session = ? AND owner = ? AND key = ? AND ord = ?",
++                         list(old_links - links))
++        conn.executemany("INSERT OR REPLACE INTO links VALUES (?,?,?,?,?)", list(links - old_links))
++        conn.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)", [
++            ("key", key), ("me", me), ("ledger", ledger_id), ("hub_db", hub), ("base", json.dumps(base)),
++            ("built_at", str(time.time())), ("version", str(VERSION))])
++    return len(upserts) + len(gone)
++
++
++def compute(hub: Path, ledger, ledger_file: Path, now: float, key: Optional[str]) -> tuple:
++    """The local build (exactly what ``collect`` did before), then an offer to publish it.
++
++    ``key`` was read before the build; the copy is published only if the replica still has it after ``observe``,
++    so rows and first-seen times belong to that one state. ``kanban_remote_notices._lock`` is held only for the
++    index build; publishing runs after it is released."""
++    from tui_gateway import kanban_remote_notices as krn
++    from tui_gateway import remote_index_projection
++    from tui_gateway.kanban_remote_observations import observe
++
++    with krn._lock:
++        me, index = krn._index(hub)
++        seqs = remote_index_projection.seqs(index)
++    observed = observe(hub, ledger, now)
++    if key is not None and not _already(hub, ledger_file, key) and replica_key(hub) == key:
++        publish(hub, ledger_file, key, me, index, observed, seqs)
++    return me, index, observed
++
++
++def _already(hub: Path, ledger: Path, key: str) -> bool:
++    """This process already published (or found) ``key`` for this ledger file."""
++    with _memo_lock:
++        return _published.get(_slot(hub, ledger)) == (key, _file_id(ledger))
++
++
++def published_key(ledger: Path) -> Optional[str]:
++    """The key of the copy on disk (None when absent or unreadable)."""
++    db = index_path(ledger)
++    if not db.is_file():
++        return None
++    try:
++        with contextlib.closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=0.0)) as conn:
++            meta = dict(conn.execute("SELECT k, v FROM meta WHERE k IN ('key', 'ledger')"))
++    except sqlite3.Error:
++        return None
++    if meta.get("ledger") != json.dumps([str(ledger), _file_id(ledger)]):
++        return None
++    return meta.get("key")
++
++
++def refresh(hub: Path, ledger: Path, now: Optional[float] = None) -> bool:
++    """Holder pass: republish when the copy is not of the replica's current state. True when it is current."""
++    key = replica_key(hub)
++    if key is None:
++        return False
++    if published_key(ledger) == key:
++        return True
++    compute(hub, ledger, ledger, time.time() if now is None else now, key)
++    return published_key(ledger) == key
++
++
++def _hold(lease, hub: Path, ledger: Path, stop: threading.Event, poll: float = REFRESH_POLL_S) -> None:
++    """Change-driven refresher: one ``PRAGMA data_version`` per ``poll`` while held, a rebuild per replica change."""
++    from tui_gateway.kanban_replica_observer import fingerprint
++
++    last = None
++    try:
++        while not stop.wait(poll):
++            if not lease.held():
++                last = None
++                continue
++            try:
++                stamp = fingerprint(hub) if hub.is_file() else None
++                if stamp is not None and stamp != last and refresh(hub, ledger):
++                    last = stamp
++            except Exception:  # health: allow BLE001 -- the readers compute on a miss; the holder must not die
++                logger.debug("remote notice index refresh failed", exc_info=True)
++            lease.beat()
++    finally:
++        lease.release()
++
++
++def ensure_holder(role: str) -> None:
++    """Start this process's refresher for the root home's ledger once (it runs only while it holds the lease).
++
++    Not under pytest: a refresher left running by one test would rebuild that test's replica through the shared
++    in-process memos while later tests run. Tests drive :func:`refresh` and :func:`_hold` directly."""
++    from hermes_constants import get_default_hermes_root, get_hermes_home
++    from tui_gateway.kanban_remote_notices import hub_db_path, ledger_path
++
++    if os.environ.get("PYTEST_CURRENT_TEST"):
++        return
++    try:
++        if os.path.realpath(get_hermes_home()) != os.path.realpath(get_default_hermes_root()):
++            return
++        hub, ledger = hub_db_path(), ledger_path()
++    except (OSError, ValueError):
++        return
++    slot = _slot(hub, ledger)
++    with _memo_lock:
++        if slot in _holders:
++            return
++        stop = _holders[slot] = threading.Event()
++    from agent.memory_provider import spawn_context_thread
++    from hermes_cli.host_loop_lease import HostLoopLease
++
++    lease = HostLoopLease(LEASE, role, interval=LEASE_INTERVAL_S)
++    spawn_context_thread(_hold, name="kanban-remote-index", args=(lease, hub, ledger, stop)).start()
++
++
++def reset() -> None:
++    """Forget this process's memos and stop its refreshers (tests, a backend forgetting its memos)."""
++    with _memo_lock:
++        _keys.clear()
++        _answers.clear()
++        _published.clear()
++        _decoded.clear()
++        for name in stats:
++            stats[name] = 0
++        for stop in _holders.values():
++            stop.set()
++        _holders.clear()
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index dc66ac15d0..2f2ed2e7de 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -177,6 +177,22 @@ def _index(path: Path) -> tuple[str, dict]:
+     return me, index
+ 
+ 
++def _chat_index(path: Path, ledger, now: float, profile: str, sids: tuple) -> tuple[str, dict[str, Any], dict]:
++    """``(me, {sid: [card, ...]}, observed)`` for one chat: the host's published copy when it is of the replica's
++    current state, else built here (``_index`` + ``observe``, as before) and offered for publishing. [daveey]"""
++    from tui_gateway import kanban_remote_index as published
++    from tui_gateway.kanban_replica_observer import fingerprint
++
++    ledger_file = Path(ledger) if ledger is not None else ledger_path()
++    stamp = fingerprint(path)
++    hit = published.lookup(path, ledger_file, stamp, profile, sids)
++    if hit is not None:
++        return hit
++    me, index, observed = published.compute(path, ledger, ledger_file, now,
++                                            published.current_key(path, ledger_file, stamp))
++    return me, {sid: index.get((profile, sid), ()) for sid in sids}, observed
++
++
+ def _linked_chats(task: dict, me: str) -> list[tuple[str, str]]:
+     """``(profile, session)`` of this gateway's chats a remote card notifies: its unreleased shepherd links, and
+     the origin chat of every origin binding (``kanban_origin_adopt``) naming this gateway. [daveey]
+@@ -600,13 +616,12 @@ def collect(session_key: str, profile: str, *, hub_db: Optional[Path] = None, le
+     now = time.time() if now is None else now
+     profile = profile or "default"
+     try:
+-        with _lock:
+-            me, index = _index(path)
+-        from tui_gateway.kanban_remote_observations import observe
+-        fresh_times = observe(path, ledger, now)
+-        cards = []
+-        for sid in (session_key, *lineage):
+-            cards.extend(dict(c, sid=sid) for c in index.get((profile, sid), ()))
++        sids = (session_key, *lineage)
++        if hub_db is None and ledger is None:  # the host's own replica: keep its published copy current
++            from tui_gateway.kanban_remote_index import ensure_holder
++            ensure_holder("serve")  # once per process; a gateway claimed its own role earlier
++        me, by_sid, fresh_times = _chat_index(path, ledger, now, profile, sids)
++        cards = [dict(c, sid=sid) for sid in sids for c in by_sid.get(sid, ())]
+         if not cards:
+             return []
+         out: list[dict] = []
+@@ -859,6 +874,8 @@ def _reset_for_tests() -> None:
+     from tui_gateway.remote_sweep_projection import reset as reset_projection
+ 
+     from tui_gateway.remote_index_projection import reset as reset_index_projection
++    from tui_gateway.kanban_remote_index import reset as reset_published_index
++    reset_published_index()
+     reset_projection()
+     reset_index_projection()
+     global _index_memo, _sweep_memo
+diff --git a/tui_gateway/remote_index_projection.py b/tui_gateway/remote_index_projection.py
+index bdf15db2a4..56c0cb6d8f 100644
+--- a/tui_gateway/remote_index_projection.py
++++ b/tui_gateway/remote_index_projection.py
+@@ -16,6 +16,12 @@ def reset():
+     _identity, _rows = None, {}
+ 
+ 
++def seqs(index: dict) -> dict:
++    """``{(owner, key): seq}`` of the cards in ``index`` as of the last snapshot. Under the reader lock."""
++    return {(card["gw"], card["key"]): hit[0] for entries in index.values() for card in entries
++            if (hit := _rows.get((card["gw"], card["key"]))) is not None}
++
++
+ def _read_rows(conn, me, previous):
+     """Warm reads fetch only changed payloads, with identities in the same snapshot."""
+     from tui_gateway import kanban_remote_notices as remote
+-- 
+2.51.0
+

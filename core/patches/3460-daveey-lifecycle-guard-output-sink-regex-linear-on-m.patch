@@ -1,0 +1,112 @@
+From 1350441be639d13a4ab5d6c51f790fcaaa0f21a5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:55:06 +0000
+Subject: [PATCH] [daveey] lifecycle guard: output-sink regex linear on masked
+ newline runs (review 5890191993)
+
+_SHELL_SINK_RE's command-word-substitution alternative used \s* after an
+anchor set that includes \n, so on the all-newline bodies that
+strip_inert_heredoc_bodies leaves it backtracked quadratically: every
+no-sink heredoc paid for it (16k lines 1.5s -> 15.4s in the guard; 50k
+newlines 45.5s on the regex alone). Newline is already an anchor, so
+[ \t]* matches the same commands: 0.0s on 50k newlines.
+
+Also pins the review's nits as intended fail-closed behavior: a sink
+producer that only reads a >1 MiB data file refuses on the scan cap
+(test), and the _iter_printed_shell_payloads docstring notes literals
+charge the shared line/byte budget.
+
+Proof: new linear-time test fails on the old regex (45 s) and passes;
+tests/cron + heredoc background guard 2238 passed; corpus report --full
+cases=18586 violations=0; scripts/check ok.
+---
+ cron/lifecycle_guard.py                       |  7 ++++-
+ .../cron/test_lifecycle_guard_output_sink.py  | 31 +++++++++++++++++++
+ tools/shell_heredoc.py                        |  4 ++-
+ 3 files changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 23c7edb6e6..3c6b7f1a70 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -1197,7 +1197,12 @@ def _iter_printed_shell_payloads(command: str) -> Iterator[str]:
+     ``eval "$(…)"``, ``bash <(…)``), yield every quoted string literal in it: the producer may
+     print one as the shell's command (``print('bash /x/big.sh')``), so its paths are executed,
+     not mentions. Single and double quotes are matched independently, so a literal nested in the
+-    other kind (``python3 -c "print('bash x')"``) is yielded too."""
++    other kind (``python3 -c "print('bash x')"``) is yielded too.
++
++    Fails closed by design (review 5890191993 nits): every yielded literal is walked as an
++    executed command, so a producer that merely reads an oversized data file
++    (``sqlite3.connect('/d/big.db')``) refuses on the scan cap, and the literals charge the shared
++    line/byte budget, so a generator of ~16k lines piped to a shell refuses on the line cap."""
+     from tools.shell_heredoc import output_reaches_shell
+ 
+     if not output_reaches_shell(command):
+diff --git a/tests/cron/test_lifecycle_guard_output_sink.py b/tests/cron/test_lifecycle_guard_output_sink.py
+index cba6b5a22a..b23c14e3ab 100644
+--- a/tests/cron/test_lifecycle_guard_output_sink.py
++++ b/tests/cron/test_lifecycle_guard_output_sink.py
+@@ -6,6 +6,8 @@ an interpreter string literal. The shape corpus (``heredoc_shape_corpus``, ``s_p
+ "sink"``) crosses every sink with every wrapper and nesting form under real bash.
+ """
+ 
++import time
++
+ import pytest
+ 
+ from cron.lifecycle_guard import scan_gateway_lifecycle
+@@ -100,6 +102,35 @@ def test_output_does_not_reach_shell(text):
+     assert not output_reaches_shell(text)
+ 
+ 
++def test_sink_regex_is_linear_on_masked_newline_runs():
++    """Review 5890191993: a masked no-sink heredoc body is a run of newlines, and the
++    command-word-substitution alternative was quadratic on it (16k lines: 1.5s -> 15.4s)."""
++    text = "python3 - <<'PY'\n" + "\n" * 50_000 + "PY\n"
++    started = time.monotonic()
++    assert not output_reaches_shell(text)
++    assert time.monotonic() - started < 2.0
++
++
++def test_large_no_sink_heredoc_scan_stays_fast(tmp_path):
++    body = "".join(f"x{i} = {i}\n" for i in range(8000))
++    command = "python3 - <<'PY'\n" + body + "PY\n"
++    started = time.monotonic()
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
++    assert time.monotonic() - started < 5.0
++
++
++def test_producer_reading_an_oversized_data_file_under_a_sink_fails_closed(tmp_path):
++    """Intended (review 5890191993 nit): under a sink every quoted literal is walked as executed,
++    so a >1 MiB file the producer only reads still refuses on the scan cap."""
++    data = tmp_path / "d" / "big.db"
++    data.parent.mkdir()
++    data.write_text("# padding\n" * 130000, encoding="utf-8")
++    command = (f"python3 - <<'PY' | bash\nimport sqlite3\nsqlite3.connect('{data}')\n"
++               "print('echo ok')\nPY\n")
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe is True and refusal is not None and "scan cap" in refusal, refusal
++
++
+ def test_shape_corpus_catches_a_guard_that_keeps_masking_sink_bodies(tmp_path, monkeypatch):
+     """Mutant check for the corpus dimension: with sink detection off (bodies masked and printed
+     literals left as mentions whatever reads the output), every sink nesting yields violations."""
+diff --git a/tools/shell_heredoc.py b/tools/shell_heredoc.py
+index 0abb431a1c..4a8e1adfa8 100644
+--- a/tools/shell_heredoc.py
++++ b/tools/shell_heredoc.py
+@@ -492,7 +492,9 @@ _SHELL_SINK_RE = re.compile(
+     r"|(?:^|[\s;&|({])(?:source|\.)\s+(?:<\s*\(|/dev/(?:stdin|fd/)|/proc/self/fd/)"
+     rf"|{_WORD_START}{_SINK_SHELLS}{_WORD_END}[^|;&\n]*?(?:<\(|<<<)"
+     rf"|{_WORD_START}(?:ba|da|z|k|mk|a)?sh\s+(?:[-+][A-Za-z]+\s+)*-[A-Za-z]*c\s*\"?(?:\$\(|`)"
+-    r"|(?:^|[;&|({\n]|\b(?:then|do|else)\b)\s*\"?(?:\$\((?!\()|`)",
++    # [ \t]* not \s*: newline is already an anchor, and \s* made this alternative quadratic on
++    # the all-newline bodies strip_inert_heredoc_bodies leaves (review 5890191993).
++    r"|(?:^|[;&|({\n]|\b(?:then|do|else)\b)[ \t]*\"?(?:\$\((?!\()|`)",
+     re.MULTILINE)
+ 
+ 
+-- 
+2.51.0
+

@@ -1,0 +1,250 @@
+From f3242f6bc1d5c5a929f34b2d80a51d313b5b061c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:19:09 +0000
+Subject: [PATCH] [daveey] restart-free skew rule: submodule bumps count, git
+ via locate_command, transient git failures not cached, note_import_error
+ follows it
+
+Follow-ups from the independent review of PR #2106 (review 5889735817, card t_01a1d485dbef592e; this card
+t_01a1d49d2f2a8ae2):
+
+1. range_restart_free lists the range with --ignore-submodules=none --submodule=short. With
+   diff.ignoreSubmodules=all a gitlink bump printed no path, so gitlink bump + tests-only read as restart-free.
+2. range_restart_verdict returns None (not False) when git did not answer (not found, OSError, timeout, an exit
+   other than merge-base 0/1 or log 0). code_skew caches only True/False for a (boot, disk) pair; None reads as
+   skew for that poll and is asked again on the next, so one timed-out git no longer pins the pair as skewed for
+   the life of the process. range_restart_free keeps its bool contract (None -> False).
+3. git is resolved through hermes_platform.resolver.locate_command, as gateway.boot_pinned_imports does,
+   instead of a bare "git" from the ambient PATH; no git found = no verdict.
+4. note_import_error applies the same restart-free rule: after a tests/docs/CI-only drift an ImportError is no
+   longer labelled a "code-skew import mix ... restart it".
+
+Proof: one RED->GREEN test per item in tests/hermes_cli/test_restart_ignore_paths.py
+(test_a_gitlink_bump_counts_even_when_config_hides_submodules, test_git_is_resolved_through_locate_command,
+test_a_transient_git_failure_is_not_cached_as_skew, test_import_error_after_a_restart_free_drift_is_no_skew_mix):
+all 4 failed on the PR #2106 head (d89db17a3c), pass with this change; every test file referencing code_skew or
+restart_ignore_paths (17 files, 480 passed, 1 skipped).
+---
+ gateway/code_skew.py                          | 17 ++--
+ hermes_cli/restart_ignore_paths.py            | 35 ++++++--
+ tests/hermes_cli/test_restart_ignore_paths.py | 88 +++++++++++++++++++
+ 3 files changed, 127 insertions(+), 13 deletions(-)
+
+diff --git a/gateway/code_skew.py b/gateway/code_skew.py
+index d43d7deff4..fdebb1d4ed 100644
+--- a/gateway/code_skew.py
++++ b/gateway/code_skew.py
+@@ -111,8 +111,10 @@ def detect_code_skew() -> tuple[str, str] | None:
+     return _short(_boot_fingerprint), _short(current)
+ 
+ 
+-# (boot sha, disk sha) -> range_restart_free verdict. A commit range never changes, so a verdict is final; the
+-# watchdogs poll every few seconds and would otherwise run two git commands per poll for the same pair.
++# (boot sha, disk sha) -> range_restart_verdict. A commit range never changes, so a definite verdict is final; the
++# watchdogs poll every few seconds and would otherwise run two git commands per poll for the same pair. A transient
++# git failure (None: timeout, OSError, git not found) is not cached: it reads as skew now and is asked again on the
++# next poll, so it never pins the pair as skewed for the life of the process (t_01a1d49d2f2a8ae2).
+ _restart_free_verdicts: dict[tuple[str, str], bool] = {}
+ 
+ 
+@@ -122,11 +124,13 @@ def _drift_restart_free(boot_fingerprint: str | None, current: str) -> bool:
+     key = (boot_sha, disk_sha)
+     verdict = _restart_free_verdicts.get(key)
+     if verdict is None:
+-        # range_restart_free never raises: an unprovable drift (git failure, odd revisions) is False = skew, as before
+-        verdict = _restart_ignore_paths.range_restart_free(str(_PROJECT_ROOT), boot_sha, disk_sha)
++        # range_restart_verdict never raises: an unprovable drift is False/None = skew, as before
++        answer = _restart_ignore_paths.range_restart_verdict(str(_PROJECT_ROOT), boot_sha, disk_sha)
++        if answer is None:
++            return False
+         if len(_restart_free_verdicts) > 64:
+             _restart_free_verdicts.clear()
+-        _restart_free_verdicts[key] = verdict
++        _restart_free_verdicts[key] = verdict = answer
+     return verdict
+ 
+ 
+@@ -148,6 +152,9 @@ def note_import_error(exc: BaseException, where: str) -> bool:
+     current = _fingerprint()
+     if not current or current == boot:
+         return False
++    if _drift_restart_free(boot, current):
++        # a tests/docs/CI-only drift: the process runs the code on disk, so this is no mix (t_01a1d49d2f2a8ae2)
++        return False
+     pair = (boot, current)
+     if pair not in _import_mix_noted:
+         _import_mix_noted.add(pair)
+diff --git a/hermes_cli/restart_ignore_paths.py b/hermes_cli/restart_ignore_paths.py
+index e7f998b632..03b312e994 100644
+--- a/hermes_cli/restart_ignore_paths.py
++++ b/hermes_cli/restart_ignore_paths.py
+@@ -23,6 +23,8 @@ import os
+ import subprocess
+ from typing import Iterable, Optional
+ 
++from hermes_platform.resolver import locate_command
++
+ RESTART_IGNORE_GLOBS = (
+     "tests/**",
+     "docs/**",
+@@ -57,28 +59,45 @@ def _is_sha(value: object) -> bool:
+ 
+ 
+ def _git(root: str, *args: str) -> Optional[subprocess.CompletedProcess]:
++    """None when git could not run at all (not found, OSError, timeout): no verdict, as opposed to a git exit."""
++    # Resolved like boot_pinned_imports does (t_01a1d49d2f2a8ae2), not by a bare "git" from the ambient PATH.
++    command = locate_command("git").command
++    if not command:
++        return None
+     env = {k: v for k, v in os.environ.items() if k not in _GIT_ENV_DROP}
+     try:
+-        return subprocess.run(["git", "--no-replace-objects", "-C", root, *args], capture_output=True,
++        return subprocess.run([command[0], "--no-replace-objects", "-C", root, *args], capture_output=True,
+                               timeout=_GIT_TIMEOUT_S, env=env, stdin=subprocess.DEVNULL, check=False)
+     except (OSError, subprocess.SubprocessError):
+         return None
+ 
+ 
+-def range_restart_free(root: str, base: str, head: str, globs: Iterable[str] = RESTART_IGNORE_GLOBS) -> bool:
+-    """True when ``base`` is a strict ancestor of ``head`` and every commit in ``base..head`` (merges against
+-    each parent) touches only ``globs`` paths. Anything unprovable (not full shas, equal, unrelated or reversed
+-    revisions, a git failure) is False: the caller then treats the move as a code change, exactly as before."""
++def range_restart_verdict(root: str, base: str, head: str,
++                          globs: Iterable[str] = RESTART_IGNORE_GLOBS) -> Optional[bool]:
++    """``range_restart_free`` with the transient case kept apart: True/False are final for the pair (a commit
++    range never changes), None means git did not answer (not found, timeout, OSError, an unexpected exit) and
++    the same question may get a definite answer later, so callers must not cache it."""
+     if not (_is_sha(base) and _is_sha(head)) or base == head:
+         return False
+     globs = tuple(globs)
+     ancestor = _git(root, "merge-base", "--is-ancestor", base, head)
+-    if ancestor is None or ancestor.returncode != 0:
++    if ancestor is None or ancestor.returncode not in (0, 1):
++        return None
++    if ancestor.returncode == 1:
+         return False
+-    listed = _git(root, "log", "-m", "--no-renames", "--name-only", "-z", "--format=", f"{base}..{head}")
++    # --ignore-submodules=none: a diff.ignoreSubmodules=all config must not hide a gitlink bump (a code change).
++    listed = _git(root, "log", "-m", "--no-renames", "--ignore-submodules=none", "--submodule=short",
++                  "--name-only", "-z", "--format=", f"{base}..{head}")
+     if listed is None or listed.returncode != 0:
+-        return False
++        return None
+     paths = [p.decode("utf-8", "surrogateescape").strip("\n") for p in listed.stdout.split(b"\0")]
+     paths = [p for p in paths if p]
+     # A range of empty commits only is left to the old rule (a move is a move): nothing proves it needs no restart.
+     return bool(paths) and all(path_restart_ignored(p, globs) for p in paths)
++
++
++def range_restart_free(root: str, base: str, head: str, globs: Iterable[str] = RESTART_IGNORE_GLOBS) -> bool:
++    """True when ``base`` is a strict ancestor of ``head`` and every commit in ``base..head`` (merges against
++    each parent) touches only ``globs`` paths. Anything unprovable (not full shas, equal, unrelated or reversed
++    revisions, a git failure) is False: the caller then treats the move as a code change, exactly as before."""
++    return range_restart_verdict(root, base, head, globs) is True
+diff --git a/tests/hermes_cli/test_restart_ignore_paths.py b/tests/hermes_cli/test_restart_ignore_paths.py
+index ffeb788911..0ac52d3696 100644
+--- a/tests/hermes_cli/test_restart_ignore_paths.py
++++ b/tests/hermes_cli/test_restart_ignore_paths.py
+@@ -1,7 +1,10 @@
+ """[daveey] RESTART_IGNORE_GLOBS and range_restart_free (t_01a1d471b754e5bc): which checkout moves owe no restart."""
+ 
+ import ast
++import logging
++import shutil
+ import subprocess
++import sys
+ from pathlib import Path
+ 
+ import pytest
+@@ -143,3 +146,88 @@ def test_detect_code_skew_fails_closed_when_git_fails(repo, monkeypatch):
+ 
+     monkeypatch.setattr(rip, "_git", lambda *_a, **_k: None)  # git missing / timed out
+     assert code_skew.detect_code_skew() == (base[:10], tests_only[:10])
++
++
++# -- PR #2106 review follow-ups (t_01a1d49d2f2a8ae2) -------------------------------------------------------------
++
++
++def test_a_gitlink_bump_counts_even_when_config_hides_submodules(repo):
++    """``diff.ignoreSubmodules=all`` must not hide a submodule pointer bump from the range listing."""
++    root, base = repo
++    _git(root, "config", "diff.ignoreSubmodules", "all")
++    _git(root, "update-index", "--add", "--cacheinfo", f"160000,{'1' * 40},vendor/sub")
++    _git(root, "commit", "-q", "-m", "add gitlink")
++    _git(root, "update-index", "--cacheinfo", f"160000,{'2' * 40},vendor/sub")
++    _git(root, "commit", "-q", "-m", "bump gitlink")
++    gitlink_only = _git(root, "rev-parse", "HEAD")
++    head = _commit(root, {"tests/test_a.py": "x\n"}, "t1")
++    assert not rip.range_restart_free(str(root), base, head)
++    assert not rip.range_restart_free(str(root), base, gitlink_only)
++
++
++@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell shim")
++def test_git_is_resolved_through_locate_command(repo, monkeypatch, tmp_path_factory):
++    """Like ``boot_pinned_imports``: git comes from ``hermes_platform``'s resolver, not a bare PATH lookup."""
++    from hermes_platform.resolver import Candidate, Resolution
++
++    root, base = repo
++    head = _commit(root, {"tests/test_a.py": "x\n"}, "t1")
++    shim_dir = tmp_path_factory.mktemp("shim")
++    log = shim_dir / "calls.log"
++    shim = shim_dir / "git-shim"
++    shim.write_text(f"#!/bin/sh\necho call >> '{log}'\nexec '{shutil.which('git')}' \"$@\"\n")
++    shim.chmod(0o755)
++    asked = []
++
++    def resolve(name):
++        asked.append(name)
++        return Resolution("known_path", (Candidate(str(shim), "known_dir:x", True),))
++
++    monkeypatch.setattr(rip, "locate_command", resolve, raising=False)
++    assert rip.range_restart_free(str(root), base, head)
++    assert asked and set(asked) == {"git"}
++    assert log.read_text().count("call") == 2  # merge-base + log, both through the resolved binary
++
++    monkeypatch.setattr(rip, "locate_command", lambda name: Resolution("missing"), raising=False)
++    assert not rip.range_restart_free(str(root), base, head)  # no git: unprovable, fail closed
++    assert rip.range_restart_verdict(str(root), base, head) is None
++
++
++def test_a_transient_git_failure_is_not_cached_as_skew(repo, monkeypatch):
++    """A timeout/OSError is no verdict: once git works again the same (boot, disk) pair reads restart-free."""
++    root, base = repo
++    tests_only = _commit(root, {"tests/test_a.py": "x\n"}, "t1")
++    monkeypatch.setattr(code_skew, "_PROJECT_ROOT", root)
++    monkeypatch.setattr(code_skew, "_restart_free_verdicts", {})
++    monkeypatch.setattr(code_skew, "_boot_fingerprint", f"git:refs/heads/main:{base}")
++    monkeypatch.setattr(code_skew, "_fingerprint", lambda: f"git:refs/heads/main:{tests_only}")
++
++    real_git = rip._git
++    monkeypatch.setattr(rip, "_git", lambda *_a, **_k: None)  # timed out / OSError
++    assert code_skew.detect_code_skew() == (base[:10], tests_only[:10])  # fail closed meanwhile
++    monkeypatch.setattr(rip, "_git", real_git)
++    assert code_skew.detect_code_skew() is None
++    assert code_skew._restart_free_verdicts == {(base, tests_only): True}
++
++
++def test_import_error_after_a_restart_free_drift_is_no_skew_mix(repo, monkeypatch, caplog):
++    """``note_import_error`` follows the same rule as ``detect_code_skew``: a tests-only drift is no mix."""
++    root, base = repo
++    tests_only = _commit(root, {"tests/test_a.py": "x\n"}, "t1")
++    code = _commit(root, {"gateway/run.py": "x = 9\n"}, "code")
++    caplog.set_level(logging.WARNING, logger="gateway.code_skew")
++    monkeypatch.setattr(code_skew, "_PROJECT_ROOT", root)
++    monkeypatch.setattr(code_skew, "_restart_free_verdicts", {})
++    monkeypatch.setattr(code_skew, "_import_mix_noted", set())
++    monkeypatch.setattr(code_skew, "_boot_fingerprint", f"git:refs/heads/main:{base}")
++    monkeypatch.setattr(code_skew, "_fingerprint", lambda: f"git:refs/heads/main:{tests_only}")
++
++    def mix_lines():
++        return [r for r in caplog.records if r.getMessage().startswith("code-skew import mix")]
++
++    assert code_skew.note_import_error(ImportError("cannot import name 'x'"), "tool") is False
++    assert mix_lines() == []
++
++    monkeypatch.setattr(code_skew, "_fingerprint", lambda: f"git:refs/heads/main:{code}")
++    assert code_skew.note_import_error(ImportError("cannot import name 'x'"), "tool") is True
++    assert len(mix_lines()) == 1
+-- 
+2.51.0
+

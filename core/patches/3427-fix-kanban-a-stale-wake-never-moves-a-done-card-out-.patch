@@ -1,0 +1,724 @@
+From a63bbee2d010886ee5bcd98792a9571954b8e059 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:14:47 +0000
+Subject: [PATCH] fix(kanban): a stale wake never moves a done card out of done
+
+Invariant: a done or archived card leaves that status only through an explicit reopen. That means reopened,
+unblocked, review_reopened, promoted_manual, or a status edit to a live status, ordered after its latest terminal
+event in origin order (`_event_order`: second, UUIDv7 ms, id). A wake (continuation_woken, condition_met, promoted,
+wake_check_*) is never a reopen, whatever order it was minted or delivered in.
+hermes_cli/kanban_terminal_guard.py holds the rule (`terminal_hold`). It is enforced wherever a status is produced
+or applied:
+
+- Producers re-read the card's events in their write txn and do nothing for a held card, even when the local row
+  still reads `scheduled`. These are `wake_due_continuations` (the parked sweep and the implied wake),
+  `wake_check._wake` (condition_met/broken/lost) and `restore_missing_checks`. Each records one
+  `stale_wake_ignored` per producer and terminal event.
+- Push (`kanban_sync_client.push`): a Board-acked task row whose live `status` is held loses that field. The row's
+  other fields still go.
+- Feed apply (`apply_remote_changes`): at the end of the page, in its transaction, a card the page moved out of
+  done/archived goes back if it is held, unless the Board's row is `running`. A reopen event arriving in a later page
+  gives the held status back.
+- Divergence repair (`_stale_lifecycle`): a run-less live status over the replica's held done card is the stale
+  copy, not a local edit, so it is never pushed.
+Every ignored wake stays in history, with a `stale_wake_ignored` event naming the terminal event it lost to.
+The Board fences the lease too: daveey/hermes-hub#105.
+
+Five whys (Board 11-11/12: 7 done cards re-leased in 36 h, every one with a continuation_woken and no reopen):
+1. Why was t_01a1d1092f3caa2f leased again at 21:33 PST, 5 h after it completed? The Board row read `ready`.
+2. Why `ready`? The MacBook's push carried `status=ready` from its 13:51:58 clock wake (event 716387), drained at
+   21:3x, after worker-1's 16:14:37 completion (694876).
+3. Why did a 13:51 status beat a 16:14 one? `push` stamps each op's HLC at send time (`_next_hlc`), so the drained
+   op was the newest write to `status` in the Board's per-field LWW. The completion's event reached the MacBook's
+   pull, but the row's `status` field was held back as a pending local edit.
+4. Why did the MacBook wake a card that was done? Its pull was hours behind (pending 1733, ~71k feed rows; owner
+   t_01a1d2cc49634a78), so its row still read `scheduled`. Worker-1's six cards (t_01a1c7b27ca3b496 and five more,
+   done 10-30..11-10) had stale `scheduled` rows too. Its continuation sweep and wake_check restore woke them on
+   11-11 14:22, and the Board leased them at 14:23.
+5. Why did nothing stop it? No layer asked whether the card had reached a terminal status since the wake was minted.
+   The producers read only the row. The push sends whatever the row holds. The apply takes the newer LWW field. The
+   lease checks only `status === "ready"`.
+
+Tests: tests/hermes_cli/test_kanban_stale_wake_terminal.py has 11 tests.
+- RED on origin/main 4e3dfef6869 (5 failed): (a) a wake minted before a completion and applied after it leaves the
+  card done; (a) a wake pushed after a remote completion does not reopen the Board card (FakeService pair);
+  (b) a restored wake / due continuation on a stale copy of a completed card does nothing.
+- New guards with no main equivalent: probe condition_met; the implied wake; the divergence repair.
+- Regression guards (d): an explicit reopen still reopens (same page and next page); a legitimate wake of a
+  scheduled card (completed then reopened) still lands ready; terminal_hold orders by origin, not arrival.
+- Mutants: removing each of the 8 guards (apply, push, continuation sweep, implied wake, restore, wake_check wake,
+  divergence) fails its own test.
+- Live: a scratch HERMES_HOME pair against a local `wrangler dev` Board. A stale continuation_woken is fired on the
+  lagging gateway after the worker's completion, then its push drains. The Board stays `done`, the lease is refused,
+  and there are 0 `claimed` events. On origin/main core the same run leaves the Board row `ready`.
+
+Task: t_01a1d3a625e2f2b8
+---
+ hermes_cli/kanban_continuation.py             |   6 +
+ hermes_cli/kanban_db_sync.py                  |  13 +
+ hermes_cli/kanban_sync_client.py              |   4 +-
+ hermes_cli/kanban_sync_divergence.py          |   6 +-
+ hermes_cli/kanban_terminal_guard.py           | 213 ++++++++++++
+ hermes_cli/kanban_wake_check.py               |   6 +
+ .../test_kanban_stale_wake_terminal.py        | 304 ++++++++++++++++++
+ 7 files changed, 550 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/kanban_terminal_guard.py
+ create mode 100644 tests/hermes_cli/test_kanban_stale_wake_terminal.py
+
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index 3f5472fd2a..1dd32723ff 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -310,6 +310,9 @@ def wake_due_continuations(conn: sqlite3.Connection, *, now: Optional[int] = Non
+             continue
+         resume = payload.get("resume_status") if payload.get("resume_status") in ("ready", "review") else "ready"
+         with kb.write_txn(conn):
++            from hermes_cli.kanban_terminal_guard import skip_wake
++            if skip_wake(conn, tid, CONTINUATION_WOKEN_EVENT, wake_at=wake_at):
++                continue  # a stale copy: the card completed after it parked (t_01a1c7b27ca3b496) [daveey]
+             landing = kb._landing_status_after_parents(conn, tid)
+             new_status = "review" if landing == "ready" and resume == "review" else landing
+             cur = conn.execute(
+@@ -374,6 +377,9 @@ def _enforce_wake_invariant(conn, tid: str, block_kind: Optional[str], now: int,
+     if info["wake_at"] > now:
+         return False
+     with kb.write_txn(conn):
++        from hermes_cli.kanban_terminal_guard import skip_wake
++        if skip_wake(conn, tid, CONTINUATION_WOKEN_EVENT, wake_at=info["wake_at"]):
++            return False
+         landing = kb._landing_status_after_parents(conn, tid)
+         cur = conn.execute(
+             "UPDATE tasks SET status = ?, current_run_id = NULL WHERE id = ? AND status = 'scheduled'",
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index c98a14240f..9a4573e276 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1220,6 +1220,10 @@ class ApplyResult:
+     # committed (None: no table or row). The sync client credits a live revision change made only by applies.
+     revision_before: Optional[int] = None
+     revision_after: Optional[int] = None
++    # [daveey] Cards this page moved out of done/archived, and cards it brought a reopen event for
++    # (``kanban_terminal_guard.enforce_after_apply``, run at the end of the page in the same transaction).
++    left_terminal: list[tuple[str, str]] = field(default_factory=list)
++    reopened: set[str] = field(default_factory=set)
+ 
+ 
+ def _repair_revision(conn: sqlite3.Connection) -> Optional[int]:
+@@ -1262,6 +1266,9 @@ def apply_remote_changes(
+             own = _state(conn)["gateway_id"]
+             for change in changes:
+                 _apply_one(conn, change, own, result)
++            if result.left_terminal or result.reopened:  # a wake never reopens a done card [daveey]
++                from hermes_cli.kanban_terminal_guard import enforce_after_apply
++                enforce_after_apply(conn, result.left_terminal, result.reopened)
+         # Cursor-only pages have no capture triggers to suppress. Avoid dirtying
+         # the state row at all when both persisted values already match.
+         conn.execute("UPDATE kanban_sync_state SET cursor = ?, applying = 0 "
+@@ -1352,6 +1359,8 @@ def _upsert_task(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: A
+         note_restored_task(conn, ch.uid, cols.get("created_on"), own)  # our own card back from the Board
+     else:
+         changed = {c for c, v in cols.items() if old[c] != v}
++        if "status" in changed and old["status"] in ("done", "archived") and cols["status"] not in ("done", "archived"):
++            result.left_terminal.append((ch.uid, old["status"]))
+         assignments = ", ".join(f"{c} = ?" for c in cols)
+         conn.execute(f"UPDATE tasks SET {assignments}{', ' if cols else ''}sync_version = ? WHERE id = ?",
+                      (*cols.values(), ch.version, ch.uid))
+@@ -1453,6 +1462,10 @@ def _upsert_row(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: Ap
+     names = ["uid", *cols]
+     conn.execute(f"INSERT INTO {table} ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})",
+                  (ch.uid, *cols.values()))
++    if table == "task_events" and task_id:
++        from hermes_cli.kanban_terminal_guard import is_reopen
++        if is_reopen({"kind": cols.get("kind"), "payload": cols.get("payload")}):
++            result.reopened.add(str(task_id))
+     if table == "task_events" and ch.fields.get("kind") in ("archive_requested", "capability_owner_archive_requested"):
+         result.wake_dispatcher = True  # a stop request (kanban_remote_stop) or forwarded owner archive to apply
+     if table == "task_chat_links":
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index a7e064e8a7..ce29e38d9d 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -676,7 +676,9 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+         if not rows:
+             break
+         with write_txn(conn):
+-            wire = [translate(_full_row_if_unseen(conn, r), _next_hlc(conn, gateway)) for r in rows]
++            from hermes_cli.kanban_terminal_guard import strip_stale_push  # no wake reopens a done card [daveey]
++            wire = [strip_stale_push(conn, translate(_full_row_if_unseen(conn, r), _next_hlc(conn, gateway)))
++                    for r in rows]
+             parents = _unacked_parents(conn, rows, gateway)
+             wire = [op for op, _tid in parents] + wire
+         try:
+diff --git a/hermes_cli/kanban_sync_divergence.py b/hermes_cli/kanban_sync_divergence.py
+index 41b0202c5a..189ea4603c 100644
+--- a/hermes_cli/kanban_sync_divergence.py
++++ b/hermes_cli/kanban_sync_divergence.py
+@@ -165,7 +165,11 @@ def _stale_lifecycle(live: sqlite3.Connection, shadow: sqlite3.Connection, row:
+     alone is guarded by a live ``claim_lock``: a local worker holding the card right now makes it no stale
+     copy. [daveey]"""
+     if not run_uid:
+-        return False
++        # A wake on a stale copy (current run cleared) over the replica's done card: no reopen follows the
++        # completion, so the live status is older, not a local edit (t_01a1d1092f3caa2f). [daveey]
++        from hermes_cli.kanban_terminal_guard import terminal_hold
++        return (theirs["status"] in _TERMINAL and row["status"] not in _TERMINAL and row["status"] != "running"
++                and row["claim_lock"] is None and terminal_hold(shadow, row["id"]) is not None)
+     if row["status"] == "running" and (_run_ended(live, run_uid) or _run_ended(shadow, run_uid)):
+         return True
+     if row["claim_lock"] is not None:
+diff --git a/hermes_cli/kanban_terminal_guard.py b/hermes_cli/kanban_terminal_guard.py
+new file mode 100644
+index 0000000000..46eb4c9c1d
+--- /dev/null
++++ b/hermes_cli/kanban_terminal_guard.py
+@@ -0,0 +1,213 @@
++"""A done or archived card leaves that status only through an explicit reopen.
++
++Invariant: a card whose latest terminal event (``completed``, ``archived``, or a ``status``/``status_healed`` move
++to ``done``/``archived``) has no reopen ordered after it (``reopened``, ``unblocked``, ``review_reopened``,
++``promoted_manual``, or a ``status`` move to a live status), in origin order (``_event_order``: second, UUIDv7 ms,
++then id), stays terminal. A wake (``continuation_woken``, ``condition_met``, ``promoted``, ``wake_check_*``) is
++never a reopen, whatever order it was minted or delivered in.
++
++Why: a wake minted against a stale copy of the card carries ``status=ready``. Two producers made one in Nov 2026:
++a MacBook whose pull was hours behind fired a clock wake for a card a worker had completed meanwhile (pushed 5 h
++later, t_01a1d1092f3caa2f), and worker-1 fired wakes from a local copy that still read ``scheduled`` for six cards
++done for days (t_01a1c7b27ca3b496 and five more). The push stamps its HLC at send time, so that ``status`` won the
++Board's per-field LWW over the completion, and the Board leased the card again.
++
++Enforced where a status is produced or applied: the wake producers (``kanban_continuation``,
++``kanban_wake_check``) skip a held card; the feed apply (``kanban_db_sync.apply_remote_changes``) keeps a held card
++terminal; the push (``kanban_sync_client.push``) strips the stale status; the Board (hermes-hub rows.ts/
++transitions.ts) refuses the lease and puts the card back. Each ignored wake leaves a ``stale_wake_ignored`` event
++naming the terminal event it lost to. [daveey]
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++from typing import Any, Iterable, Optional
++
++TERMINAL_STATUSES = frozenset({"done", "archived"})
++STALE_WAKE_IGNORED = "stale_wake_ignored"
++# The event that made the card terminal -> the status it left the card in.
++_TERMINAL_KINDS = {"completed": "done", "archived": "archived"}
++# Explicit reopens. ``status`` (an operator/orchestrator status edit) counts when it names a live status.
++REOPEN_KINDS = frozenset({"reopened", "unblocked", "review_reopened", "promoted_manual"})
++WAKE_KINDS = frozenset({"continuation_woken", "condition_met", "promoted", "wake_check_restored",
++                        "wake_check_broken", "wake_check_lost"})
++_STATUS_KINDS = ("status", "status_healed")
++
++
++def _payload(raw: Any) -> dict:
++    try:
++        value = json.loads(raw) if isinstance(raw, str) and raw else raw
++    except ValueError:
++        return {}
++    return value if isinstance(value, dict) else {}
++
++
++def _status_named(event: dict) -> Optional[str]:
++    """The status a ``status``/``status_healed`` event moved the card to."""
++    payload = _payload(event.get("payload"))
++    value = payload.get("to") if event["kind"] == "status_healed" else payload.get("status")
++    return value if isinstance(value, str) else None
++
++
++def terminal_status(event: dict) -> Optional[str]:
++    """The terminal status this event put the card in, or None when it is not a terminal move."""
++    if event["kind"] in _TERMINAL_KINDS:
++        return _TERMINAL_KINDS[event["kind"]]
++    if event["kind"] in _STATUS_KINDS:
++        status = _status_named(event)
++        return status if status in TERMINAL_STATUSES else None
++    return None
++
++
++def is_reopen(event: dict) -> bool:
++    if event["kind"] in REOPEN_KINDS:
++        return True
++    if event["kind"] in _STATUS_KINDS:
++        status = _status_named(event)
++        return bool(status) and status not in TERMINAL_STATUSES
++    return False
++
++
++def _events(conn: sqlite3.Connection, task_id: str) -> list[dict]:
++    cols = {r[1] for r in conn.execute("PRAGMA table_info(task_events)")}
++    uid = "uid" if "uid" in cols else "NULL AS uid"
++    kinds = sorted({*_TERMINAL_KINDS, *REOPEN_KINDS, *_STATUS_KINDS})
++    return [dict(r) for r in conn.execute(
++        f"SELECT id, {uid}, kind, payload, created_at FROM task_events WHERE task_id = ? "
++        f"AND kind IN ({','.join('?' * len(kinds))})", (task_id, *kinds))]
++
++
++def terminal_hold(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
++    """The card's latest terminal event when no explicit reopen is ordered after it, else None.
++
++    ``{"id", "uid", "kind", "status", "created_at"}``: the event a wake must lose to."""
++    from hermes_cli.kanban_sync_divergence import _event_order
++    events = _events(conn, task_id)
++    terminals = [e for e in events if terminal_status(e)]
++    if not terminals:
++        return None
++    last = max(terminals, key=_event_order)
++    order = _event_order(last)
++    if any(is_reopen(e) and _event_order(e) > order for e in events):
++        return None
++    return {"id": last["id"], "uid": last["uid"], "kind": last["kind"], "status": terminal_status(last),
++            "created_at": last["created_at"]}
++
++
++def _note(conn: sqlite3.Connection, task_id: str, hold: dict, **extra: Any) -> None:
++    from hermes_cli import kanban_db as kb
++    kb._append_event(conn, task_id, STALE_WAKE_IGNORED, {
++        "terminal_event": hold["uid"] or hold["id"], "terminal_kind": hold["kind"],
++        "terminal_status": hold["status"], **{k: v for k, v in extra.items() if v is not None}})
++
++
++def _noted(conn: sqlite3.Connection, task_id: str, hold: dict, source: str) -> bool:
++    """True when this card already recorded an ignored wake from ``source`` against this terminal event."""
++    ref = hold["uid"] or hold["id"]
++    for (raw,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ? AND id > ?",
++                               (task_id, STALE_WAKE_IGNORED, hold["id"])):
++        payload = _payload(raw)
++        if payload.get("terminal_event") == ref and payload.get("source") == source:
++            return True
++    return False
++
++
++def skip_wake(conn: sqlite3.Connection, task_id: str, wake_kind: str, **extra: Any) -> bool:
++    """Wake producers, inside their write txn: True (do nothing) when the card is held terminal.
++
++    The local row can still read ``scheduled`` (a stale copy: the completion reached the events but not the row,
++    or the row was restored from an older copy), so the event log decides, not the row. Records one
++    ``stale_wake_ignored`` per producer and terminal event, so a due clock does not write one every tick."""
++    hold = terminal_hold(conn, task_id)
++    if hold is None:
++        return False
++    source = f"producer:{wake_kind}"
++    if not _noted(conn, task_id, hold, source):
++        _note(conn, task_id, hold, source=source, wake_kind=wake_kind, **extra)
++    return True
++
++
++def push_status_is_stale(conn: sqlite3.Connection, task_id: str, status: Any) -> Optional[dict]:
++    """The push: the terminal event a task row's live ``status`` must lose to, or None to send it.
++
++    A status a local wake set before the card's completion reached this file has no reopen after that completion,
++    so sending it would reopen the card on the Board (the push stamps its HLC at send time). ``running`` is a claim
++    the Board granted, not a wake: never stripped here."""
++    if not isinstance(status, str) or status in TERMINAL_STATUSES or status == "running":
++        return None
++    return terminal_hold(conn, task_id)
++
++
++def note_push_strip(conn: sqlite3.Connection, task_id: str, hold: dict, status: str) -> None:
++    if not _noted(conn, task_id, hold, "push"):
++        _note(conn, task_id, hold, source="push", ignored_status=status)
++
++
++def strip_stale_push(conn: sqlite3.Connection, op: dict) -> dict:
++    """One wire op of the push, inside its write txn: a task row whose ``status`` a held card must not take loses
++    that field (the rest of the row still goes). A card the Board has not acknowledged (``sync_version`` NULL) keeps
++    it: its create needs a status, and the Board has no terminal copy to reopen."""
++    fields = op.get("fields")
++    if op.get("table") != "tasks" or op.get("op") != "upsert" or not isinstance(fields, dict) \
++            or "status" not in fields:
++        return op
++    row = conn.execute("SELECT sync_version FROM tasks WHERE id = ?", (op.get("uid"),)).fetchone()
++    if row is None or row[0] is None:
++        return op
++    hold = push_status_is_stale(conn, op["uid"], fields["status"])
++    if hold is None:
++        return op
++    note_push_strip(conn, op["uid"], hold, fields["status"])
++    return {**op, "fields": {k: v for k, v in fields.items() if k != "status"}}
++
++
++# --- feed apply ---------------------------------------------------------------------------------------------------
++
++def enforce_after_apply(conn: sqlite3.Connection, left_terminal: Iterable[tuple[str, str]],
++                        reopened: Iterable[str]) -> dict[str, str]:
++    """End of one feed page, inside the apply transaction (capture suppressed): returns {task id: new status}.
++
++    ``left_terminal``: (task id, terminal status it had) for cards this page moved out of done/archived. A card held
++    terminal goes back to that status, unless the Board has a claim on it (``running``: the Board decided, and a
++    stale lease is fenced on the Board itself). The ignored status is kept on the ``stale_wake_ignored`` event.
++    ``reopened``: cards that received a reopen event in this page. A card this guard held while its reopen was
++    still in a later page (a page boundary between the row and its event) gets the held status back."""
++    changed: dict[str, str] = {}
++    for task_id, was in left_terminal:
++        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
++        if row is None or row[0] in TERMINAL_STATUSES or row[0] == "running":
++            continue
++        hold = terminal_hold(conn, task_id)
++        if hold is None:
++            continue
++        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (hold["status"] or was, task_id))
++        _note(conn, task_id, hold, source="apply", held_status=row[0])
++        changed[task_id] = hold["status"] or was
++    for task_id in reopened:
++        if task_id in changed:
++            continue
++        restored = _restore_held(conn, task_id)
++        if restored:
++            changed[task_id] = restored
++    return changed
++
++
++def _restore_held(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
++    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if row is None or row[0] not in TERMINAL_STATUSES or terminal_hold(conn, task_id) is not None:
++        return None
++    last = conn.execute("SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
++                        (task_id, STALE_WAKE_IGNORED)).fetchone()
++    if last is None:
++        return None
++    payload = _payload(last[1])
++    held = payload.get("held_status")
++    if payload.get("source") != "apply" or not isinstance(held, str) or held in TERMINAL_STATUSES:
++        return None
++    # Only a hold newer than every terminal event: an older one belongs to an earlier completion.
++    newest_terminal = max((e["id"] for e in _events(conn, task_id) if terminal_status(e)), default=0)
++    if last[0] < newest_terminal:
++        return None
++    conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (held, task_id))
++    return held
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 0c329741fc..6b71cf628a 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -432,6 +432,9 @@ def restore_missing_checks(conn: sqlite3.Connection, *, now: Optional[int] = Non
+             st = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+             if st is None or st[0] != "scheduled" or get_state(conn, tid) is not None:
+                 continue
++            from hermes_cli.kanban_terminal_guard import skip_wake
++            if skip_wake(conn, tid, RESTORED_EVENT, park_event_id=park_id):
++                continue  # worker-1's six done cards came back through this restore (11-11) [daveey]
+             restored = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ? AND id > ? AND kind = ?",
+                                     (tid, park_id, RESTORED_EVENT)).fetchone()[0]
+             if not restored:
+@@ -942,6 +945,9 @@ def _wake(conn: sqlite3.Connection, task_id: str, kind: str, payload: dict) -> O
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_continuation import pending_wake
+ 
++    from hermes_cli.kanban_terminal_guard import skip_wake
++    if skip_wake(conn, task_id, kind):  # a stale scheduled copy of a done card: no wake [daveey]
++        return None
+     park = pending_wake(conn, task_id) or {}
+     resume = park.get("resume_status") if park.get("resume_status") in ("ready", "review") else "ready"
+     landing = kb._landing_status_after_parents(conn, task_id)
+diff --git a/tests/hermes_cli/test_kanban_stale_wake_terminal.py b/tests/hermes_cli/test_kanban_stale_wake_terminal.py
+new file mode 100644
+index 0000000000..699716bd8d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_stale_wake_terminal.py
+@@ -0,0 +1,304 @@
++"""A done card leaves done only through an explicit reopen: a stale wake never re-leases it. [daveey]
++
++Board incidents 2026-11-11/12 (7 cards in 36 h, every one with a ``continuation_woken`` and no reopen):
++
++* t_01a1d1092f3caa2f: the MacBook's copy of a pool card was ``scheduled``; its clock wake fired there at 13:51 PST
++  (``status=ready``) while worker-1 completed the card at 16:14. The MacBook's push was stalled; when it drained at
++  21:3x the row op carried a send-time HLC, beat the completion in the Board's per-field LWW, and worker-4 leased the
++  done card again.
++* t_01a1c7b27ca3b496 and five more: done for days, but worker-1's local rows still read ``scheduled``; its
++  continuation sweep / wake-check restore woke them (11-11 14:22) and the Board leased them a minute later.
++
++Tests (a)-(d) of the card: (a) a wake minted before a completion and applied/pushed after it leaves the card done,
++(b) a producer (restore or continuation sweep) on a stale scheduled copy of a completed card does nothing, (d) a
++legitimate wake still lands ready and an explicit reopen still reopens. (c), the lease, is hermes-hub's
++``worker/test/stale-wake-terminal.test.ts``.
++"""
++from __future__ import annotations
++
++import json
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_continuation as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_terminal_guard as ktg
++from hermes_cli import kanban_timed_park as ktp
++from hermes_cli import kanban_wake_check as kwc
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++ME, OTHER, BOARD = "macbook", "worker-1", "default"
++
++
++def _kinds(conn, tid):
++    return [e.kind for e in kb.list_events(conn, tid)]
++
++
++def _ignored(conn, tid):
++    return [e.payload for e in kb.list_events(conn, tid) if e.kind == ktg.STALE_WAKE_IGNORED]
++
++
++def _status(conn, tid):
++    task = kb.get_task(conn, tid)
++    return task.status if task else None
++
++
++# --- (a) the feed apply ------------------------------------------------------------------------------------------
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def synced_conn(kanban_home):
++    yield from support.synced_conn(kanban_home)
++
++
++def _ch(seq, table, uid, fields, version=1):
++    return sync.RemoteChange(seq, table, uid, "upsert", fields, version, f"{seq:013d}-0000-{OTHER}", OTHER, None)
++
++
++def _ev(seq, tid, kind, created_at, payload=None, uid=None):
++    return _ch(seq, "task_events", uid or f"01a1d109-{seq:04d}-7000-8000-000000000000",
++               {"task_id": tid, "kind": kind, "payload": json.dumps(payload or {}), "created_at": created_at})
++
++
++def _done_remote_card(conn, tid):
++    sync.apply_remote_changes(conn, [
++        _ch(1, "tasks", tid, {"title": "pool card", "status": "done", "created_at": 1_794_000_000,
++                              "workspace_kind": "scratch", "assignee": "worker", "completed_at": 1_794_520_477}),
++        _ev(2, tid, "completed", 1_794_520_477, {"result_len": 10}),
++    ], new_cursor=2)
++    assert _status(conn, tid) == "done"
++
++
++def test_a_wake_minted_before_the_completion_and_applied_after_it_leaves_the_card_done(synced_conn):
++    """t_01a1d1092f3caa2f: event 716387 (13:51:58, status=ready) arrived after 694876 ``completed`` (16:14:37)."""
++    conn, tid = synced_conn, "t_01a1d1092f3caa2f"
++    _done_remote_card(conn, tid)
++    sync.apply_remote_changes(conn, [
++        _ch(3, "tasks", tid, {"status": "ready", "current_run_uid": None}, version=2),
++        _ev(4, tid, "continuation_woken", 1_794_520_318, {"status": "ready", "wake_at": 1_794_520_160}),
++    ], new_cursor=4)
++    task = kb.get_task(conn, tid)
++    assert task.status == "done"
++    assert "continuation_woken" in _kinds(conn, tid)                # the wake stays in history
++    [note] = _ignored(conn, tid)
++    assert (note["terminal_kind"], note["held_status"], note["source"]) == ("completed", "ready", "apply")
++    assert conn.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE row_uid = ? AND table_name = 'tasks'",
++                        (tid,)).fetchone()[0] == 0                   # an apply, not a local edit to push
++
++
++def test_an_explicit_reopen_after_the_completion_still_reopens(synced_conn):
++    conn, tid = synced_conn, "t_01a1d1092f3caa30"
++    _done_remote_card(conn, tid)
++    sync.apply_remote_changes(conn, [
++        _ch(3, "tasks", tid, {"status": "ready"}, version=2),
++        _ev(4, tid, "reopened", 1_794_520_600, {"reason": "follow-up"}),
++    ], new_cursor=4)
++    assert _status(conn, tid) == "ready"
++    assert _ignored(conn, tid) == []
++
++
++def test_a_reopen_whose_event_is_in_the_next_page_still_reopens(synced_conn):
++    """A page boundary between the row and its reopen event: held done first, then given back."""
++    conn, tid = synced_conn, "t_01a1d1092f3caa31"
++    _done_remote_card(conn, tid)
++    sync.apply_remote_changes(conn, [_ch(3, "tasks", tid, {"status": "ready"}, version=2)], new_cursor=3)
++    assert _status(conn, tid) == "done"
++    sync.apply_remote_changes(conn, [_ev(4, tid, "unblocked", 1_794_520_600)], new_cursor=4)
++    assert _status(conn, tid) == "ready"
++
++
++# --- (a) the push: a wake fired on a stale copy before the completion reached it -----------------------------------
++
++@pytest.fixture
++def svc():
++    return FakeService()
++
++
++@pytest.fixture
++def live(kanban_home):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(conn, BOARD, ME)
++    sync.set_mode(conn, "primary")
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def _round(kanban_home, svc):
++    return ksc.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++
++
++def _hlc(offset_ms: int, gw: str) -> str:
++    return f"{int(time.time() * 1000) + offset_ms:013d}-0000-{gw}"
++
++
++def test_a_wake_pushed_after_a_remote_completion_does_not_reopen_the_board_card(live, kanban_home, svc):
++    """The MacBook fires its clock wake while its pull is behind; the push drains after the completion."""
++    tid = kb.create_task(live, title="pool card", assignee="worker")
++    kb.claim_task(live, tid)
++    kb.schedule_task(live, tid, reason="SCHEDULED_UNTIL=2026-11-12T21:49:20Z ci", clock_only=True)
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)
++    assert svc.board(BOARD)["rows"]["tasks"][tid]["status"] == "scheduled"
++
++    assert kc.wake_due_continuations(live, now=int(time.time()) + 10 ** 7) == [tid]  # the stale local wake
++    svc.hub(OTHER).ops(BOARD, [  # meanwhile worker-1 completed the card on the Board (HLC: after the park)
++        {"client_op_id": "w1-done", "op": "upsert", "table": "tasks", "uid": tid, "hlc": _hlc(-1, OTHER),
++         "fields": {"status": "done", "completed_at": int(time.time()), "current_run_uid": None}},
++        {"client_op_id": "w1-ev", "op": "upsert", "table": "task_events", "uid": kb_uuid(), "hlc": _hlc(0, OTHER),
++         "fields": {"task_id": tid, "kind": "completed", "payload": "{}", "created_at": int(time.time())}},
++    ])
++    assert svc.board(BOARD)["rows"]["tasks"][tid]["status"] == "done"
++    # The drained push's send-time HLC (minted later, in the next round) is newer than the completion's.
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)
++    assert svc.board(BOARD)["rows"]["tasks"][tid]["status"] == "done"
++    assert live.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "done"
++    assert any(n["source"] in ("push", "apply") for n in _ignored(live, tid))
++
++
++def kb_uuid() -> str:
++    return sync.uuid7()
++
++
++def test_divergence_repair_does_not_send_a_stale_wake_over_the_replicas_done_card(live, kanban_home, svc):
++    """The live row missed the completion (a woken ``ready``, no run) while the replica has it: the live copy is the
++    stale one, not an uncaptured local edit, so the repair sends nothing."""
++    tid = kb.create_task(live, title="pool card", assignee="worker")
++    _round(kanban_home, svc)
++    svc.hub(OTHER).ops(BOARD, [
++        {"client_op_id": "w1-done", "op": "upsert", "table": "tasks", "uid": tid, "hlc": _hlc(1_000, OTHER),
++         "fields": {"status": "done", "completed_at": int(time.time()), "current_run_uid": None}},
++        {"client_op_id": "w1-ev", "op": "upsert", "table": "task_events", "uid": kb_uuid(), "hlc": _hlc(1_000, OTHER),
++         "fields": {"task_id": tid, "kind": "completed", "payload": "{}", "created_at": int(time.time())}},
++    ])
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_state SET applying = 1")  # no capture: the row only missed the feed
++        live.execute("UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?", (tid,))
++        live.execute("UPDATE kanban_sync_state SET applying = 0")
++    shadow = kbc.connect(ksc.shadow_path(BOARD))
++    try:
++        assert tid not in ksc.repair_divergence(live, shadow, ME)
++    finally:
++        shadow.close()
++    _round(kanban_home, svc)
++    assert svc.board(BOARD)["rows"]["tasks"][tid]["status"] == "done"
++
++
++# --- (b) the producers ---------------------------------------------------------------------------------------------
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_WAKE_DRYRUN", "0")
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    getattr(kwc, "_RESTORE_SEEN", {}).clear()
++    with kbc.connect_closing() as conn:
++        yield conn
++    kwc._shutdown_for_tests()
++
++
++def _parked(conn, *, wake_check=None):
++    tid = kb.create_task(conn, title="t", assignee="worker")
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    with kb.write_txn(conn):
++        assert ktp.park(conn, tid, reason="SCHEDULED_UNTIL=2026-11-10T17:07:04Z wait", requested_kind="time",
++                        source_status="running", wake_check=wake_check, check_every=300,
++                        awaiting={"kind": "external", "ref": "build 559", "why": "flag file"} if wake_check
++                        else {"kind": "clock", "why": "a soak window"},
++                        clock_only=not wake_check)
++    return tid
++
++
++def _stale_scheduled_copy_of_a_done_card(conn, tid):
++    """The completion's event reached this file, the row did not (worker-1's six cards)."""
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, "completed", {"result_len": 12})
++    assert _status(conn, tid) == "scheduled"
++
++
++def test_a_restored_wake_for_an_already_completed_card_does_nothing(board, tmp_path):
++    tid = _parked(board, wake_check=f"test -f {tmp_path / 'flag'}")
++    _stale_scheduled_copy_of_a_done_card(board, tid)
++    with kb.write_txn(board):
++        board.execute("DELETE FROM task_wake_checks WHERE task_id = ?", (tid,))
++    for _ in range(2):  # a second loss would otherwise wake it
++        assert kwc.restore_missing_checks(board) == {"restored": [], "woken": []}
++    assert _status(board, tid) == "scheduled"
++    assert kwc.RESTORED_EVENT not in _kinds(board, tid)
++    [note] = _ignored(board, tid)                                     # one note, not one per sweep
++    assert (note["terminal_kind"], note["source"]) == ("completed", f"producer:{kwc.RESTORED_EVENT}")
++
++
++def test_a_due_continuation_on_a_stale_copy_of_a_completed_card_does_nothing(board):
++    tid = _parked(board)
++    _stale_scheduled_copy_of_a_done_card(board, tid)
++    for _ in range(2):
++        assert kc.wake_due_continuations(board, now=int(time.time()) + 10 ** 7) == []
++    assert _status(board, tid) == "scheduled"
++    assert kc.CONTINUATION_WOKEN_EVENT not in _kinds(board, tid)
++    assert len(_ignored(board, tid)) == 1
++
++
++def test_a_passing_probe_on_a_stale_copy_of_a_completed_card_does_not_wake_it(board):
++    tid = _parked(board, wake_check="true")
++    _stale_scheduled_copy_of_a_done_card(board, tid)
++    kwc.run_due_wake_checks(board, now=int(time.time()) + 10 ** 6, wait=True)
++    assert _status(board, tid) == "scheduled"
++    assert kwc.CONDITION_MET_EVENT not in _kinds(board, tid)
++    assert [n["wake_kind"] for n in _ignored(board, tid)] == [kwc.CONDITION_MET_EVENT]
++
++
++def test_an_implied_wake_on_a_stale_copy_of_a_completed_card_does_nothing(board):
++    """A ``scheduled`` row with no park event (``_enforce_wake_invariant``'s implied wake)."""
++    tid = kb.create_task(board, title="t", assignee="worker")
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status = 'scheduled' WHERE id = ?", (tid,))
++        kb._append_event(board, tid, "completed", {})
++    assert kc.wake_due_continuations(board, now=int(time.time()) + 10 ** 7) == []
++    assert _status(board, tid) == "scheduled"
++    assert len(_ignored(board, tid)) == 1
++
++
++def test_a_legitimate_wake_of_a_scheduled_card_still_lands_ready(board):
++    """(d): a card completed once, reopened, then parked wakes as before."""
++    tid = _parked(board)
++    with kb.write_txn(board):
++        kb._append_event(board, tid, "completed", {})
++        kb._append_event(board, tid, "reopened", {"reason": "more"})
++    assert kc.wake_due_continuations(board, now=int(time.time()) + 10 ** 7) == [tid]
++    assert _status(board, tid) == "ready"
++    assert _ignored(board, tid) == []
++
++
++def test_terminal_hold_orders_by_origin_not_by_arrival():
++    """The reopen arrived first (lower id) but was minted after the completion: it still counts."""
++    import sqlite3
++    conn = sqlite3.connect(":memory:")
++    conn.row_factory = sqlite3.Row
++    conn.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, uid TEXT, task_id TEXT, kind TEXT, payload TEXT, "
++                 "created_at INTEGER)")
++    conn.execute("INSERT INTO task_events VALUES (1, NULL, 't', 'reopened', '{}', 200)")
++    conn.execute("INSERT INTO task_events VALUES (2, NULL, 't', 'completed', '{}', 100)")
++    assert ktg.terminal_hold(conn, "t") is None
++    conn.execute("INSERT INTO task_events VALUES (3, NULL, 't', 'continuation_woken', '{\"status\":\"ready\"}', 300)")
++    assert ktg.terminal_hold(conn, "t") is None
++    conn.execute("INSERT INTO task_events VALUES (4, NULL, 't', 'completed', '{}', 400)")
++    assert ktg.terminal_hold(conn, "t")["id"] == 4
+-- 
+2.51.0
+

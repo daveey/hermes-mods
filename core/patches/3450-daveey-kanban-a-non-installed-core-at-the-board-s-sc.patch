@@ -1,0 +1,185 @@
+From 0f311d46d1d0a63b6703cdd24c04cecde9286791 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:46:56 +0000
+Subject: [PATCH] [daveey] kanban: a non-installed core at the board's schema
+ keeps its sync mode; a closed SchemaAhead card is not reused
+
+Review t_01a1d40d54340824 (PR #2019 @fcca208959) found that a checkout that is not the home's installed core,
+opening a synced board already at its schema, skipped kanban_db_sync.install_or_remove along with the schema
+pass, so board_mode() read 'off': that process minted classic task ids and claimed without a Board lease.
+
+- kanban_db_sync.register_without_install: register the path when sync is enabled for the board, the installed
+  core attached it (capture triggers present, kanban_sync_state mode not off), writing nothing (no tables,
+  triggers or uid backfill). kanban_db_connect.connect calls it on the at-par branch.
+- kanban_sync_schema_alert: read the hub replica with --all; a card this host filed that the replica shows
+  closed (even inside the 6 h fresh window) gets the next incident as a new card, not a comment.
+
+Tests: test_non_installed_checkout_on_a_synced_board_at_par_keeps_its_sync_mode (shadow kept, Board id minted,
+triggers unchanged) and test_a_card_filed_and_closed_within_the_fresh_window_gets_a_new_card_not_a_comment;
+each fails with its fix removed.
+
+Card: t_01a1d3fb5bab541f
+---
+ hermes_cli/kanban_db_connect.py              |  3 +-
+ hermes_cli/kanban_db_sync.py                 | 16 +++++++
+ hermes_cli/kanban_sync_schema_alert.py       | 21 ++++++----
+ tests/hermes_cli/test_kanban_schema_owner.py | 44 ++++++++++++++++++++
+ 4 files changed, 76 insertions(+), 8 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index d4f9ad480f..3dc60fb353 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -974,7 +974,8 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
+                 refusal = _schema_owner.check(conn, path)
+                 if refusal:
+                     return refusal
+-                if refusal == "":
++                if refusal == "":  # at par: no schema pass, but keep the board's sync mode (ids, Board leases)
++                    _kb._sync.register_without_install(conn, resolved)
+                     _INITIALIZED_PATHS.add(resolved)
+                     return None
+                 conn.executescript(_kb.SCHEMA_SQL)
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 9a4573e276..a3fd618301 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -453,6 +453,22 @@ def install_or_remove(conn: sqlite3.Connection, db_path: str) -> None:
+     _SYNCED_PATHS.add(db_path)
+ 
+ 
++def register_without_install(conn: sqlite3.Connection, db_path: str) -> None:
++    """:func:`install_or_remove` for a core that may not change this board's schema (``kanban_schema_owner``: a
++    non-installed checkout on a board already at its schema). Writes nothing: the installed core owns the sync
++    tables and capture triggers. When it has attached the board (state row not ``off``, capture triggers present),
++    register the path, so :func:`board_mode` reads the real mode and this process mints Board ids and takes Board
++    leases like the installed core. [daveey]"""
++    try:
++        live = (sync_enabled() and board_selected(db_path)
++                and conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
++                                 "AND name LIKE 'kanban_sync_%' LIMIT 1").fetchone() is not None
++                and (conn.execute("SELECT mode FROM kanban_sync_state LIMIT 1").fetchone() or ("off",))[0] != "off")
++    except sqlite3.OperationalError:  # no kanban_sync_state: the installed core never enabled sync here
++        live = False
++    (_SYNCED_PATHS.add if live else _SYNCED_PATHS.discard)(db_path)
++
++
+ def _attached(conn: sqlite3.Connection) -> bool:
+     """The file is bound to a Board-service board (not a ``local:`` id) and not detached to ``off``."""
+     try:
+diff --git a/hermes_cli/kanban_sync_schema_alert.py b/hermes_cli/kanban_sync_schema_alert.py
+index c45e779c44..626bf4678b 100644
+--- a/hermes_cli/kanban_sync_schema_alert.py
++++ b/hermes_cli/kanban_sync_schema_alert.py
+@@ -121,23 +121,26 @@ def _body(host: str, why: str, since: float, info: dict) -> str:
+     ])
+ 
+ 
+-def _replica_open(hub_cli: str, runner) -> list[dict]:
+-    rc, out, _err = runner([hub_cli, "tasks", "--gw", HUB, "--json"])
++def _replica_rows(hub_cli: str, runner) -> list[dict]:
++    """The hub replica's cards, closed ones included (``--all``), so a recently filed card that already closed
++    is not mistaken for one still waiting to appear in the replica."""
++    rc, out, _err = runner([hub_cli, "tasks", "--gw", HUB, "--json", "--all"])
+     if rc != 0:
+         return []
+     try:
+         rows = json.loads(out or "[]")
+     except ValueError:
+         return []
+-    return [r for r in rows if isinstance(r, dict) and str(r.get("status") or "") not in _CLOSED]
++    return [r for r in rows if isinstance(r, dict)]
+ 
+ 
+ def _open_card(host: str, state: dict, hub_cli: str, runner, now: float) -> Optional[str]:
+     """The id of this host's open SchemaAhead card on the hub, or None."""
+     prefix = f"{KEY_PREFIX}:{host}:"
+-    rows = _replica_open(hub_cli, runner)
++    rows = _replica_rows(hub_cli, runner)
+     for row in rows:
+-        if str(row.get("idempotency_key") or "").startswith(prefix):
++        if (str(row.get("idempotency_key") or "").startswith(prefix)
++                and str(row.get("status") or "") not in _CLOSED):
+             return str(row.get("id"))
+     tid = state.get("task_id")
+     if not tid and state.get("request_id"):
+@@ -146,8 +149,12 @@ def _open_card(host: str, state: dict, hub_cli: str, runner, now: float) -> Opti
+             tid = kp.remote_task_id(state["request_id"])
+         except Exception:  # health: allow BLE001 -- a stale courier db only means "not known yet"
+             tid = None
+-    if tid and now - float(state.get("filed_at") or 0) < _FRESH_S and not any(r.get("id") == tid for r in rows):
+-        return str(tid)  # filed recently, not in the replica yet
++    if tid:
++        seen = next((r for r in rows if r.get("id") == tid), None)
++        if seen is not None:  # in the replica: open or closed decides it
++            return str(tid) if str(seen.get("status") or "") not in _CLOSED else None
++        if now - float(state.get("filed_at") or 0) < _FRESH_S:
++            return str(tid)  # filed recently, not in the replica yet
+     return None
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_schema_owner.py b/tests/hermes_cli/test_kanban_schema_owner.py
+index 5eb10e2967..11903ff050 100644
+--- a/tests/hermes_cli/test_kanban_schema_owner.py
++++ b/tests/hermes_cli/test_kanban_schema_owner.py
+@@ -63,6 +63,14 @@ def _columns(db: Path, table: str = "tasks") -> list[str]:
+         raw.close()
+ 
+ 
++def _triggers(db: Path) -> list[tuple]:
++    raw = sqlite3.connect(db)
++    try:
++        return raw.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name").fetchall()
++    finally:
++        raw.close()
++
++
+ def _foreign_install(home: Path) -> Path:
+     """``<home>/hermes-agent``: an installed core that is not the tree these tests run from."""
+     core = home / "hermes-agent"
+@@ -221,6 +229,42 @@ def test_another_hosts_open_card_does_not_absorb_this_hosts_incident(home):
+     assert len(hub.sent("create-task")) == 1 and not hub.sent("request")
+ 
+ 
++def test_a_card_filed_and_closed_within_the_fresh_window_gets_a_new_card_not_a_comment(home):
++    hub = FakeHubCli()
++    alert.report("macbook", WHY, 900.0, runner=hub, hub_cli="hermes-hub", info=INFO, now=1_000.0)
++    state = alert._read_state()
++    alert._write_state({**state, "task_id": "t_first"})
++    hub.open = [{"id": "t_first", "status": "done", "idempotency_key": "kanban-sync-schema-ahead:macbook:900"}]
++    alert.report("macbook", WHY, 1_100.0, runner=hub, hub_cli="hermes-hub", info=INFO, now=1_200.0)
++    assert len(hub.sent("create-task")) == 2 and not hub.sent("request")
++    assert all("--all" in c for c in hub.sent("tasks"))
++
++
++# --- the review finding: a non-installed core at par keeps the board's sync mode ------------------------
++
++def test_non_installed_checkout_on_a_synced_board_at_par_keeps_its_sync_mode(home):
++    from hermes_cli import kanban_db_sync as sync
++    support.write_sync_config(home, True)
++    db = home / "kanban.db"
++    conn = kbc.connect(db)  # "the installed core" (no install yet) creates it and installs sync
++    assert sync.board_mode(conn) == "shadow"
++    conn.close()
++    resolved = str(db.resolve())
++    kbc._INITIALIZED_PATHS.discard(resolved)
++    sync._SYNCED_PATHS.discard(resolved)
++    _foreign_install(home)
++    triggers_before = _triggers(db)
++    assert triggers_before
++    conn = kbc.connect(db)
++    try:
++        assert sync.board_mode(conn) == "shadow"
++        tid = kb.create_task(conn, title="board id, not a classic one", assignee="default")
++        assert not (len(tid) == 10 and tid.startswith("t_"))  # classic ids are t_ + 8 hex
++    finally:
++        conn.close()
++    assert _triggers(db) == triggers_before
++
++
+ def test_run_forever_give_up_opens_the_hub_card(home, monkeypatch):
+     from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_placement as kp
+-- 
+2.51.0
+

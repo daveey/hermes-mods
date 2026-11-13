@@ -1,0 +1,325 @@
+From a63acff5a59f3f67a67b1af2bbe0f3a154c59a7c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:54:33 +0000
+Subject: [PATCH] [daveey] tui_gateway: the lineage ledger read sees every row
+ of every id, and the gateway reads the legacy leg's parents
+
+Follow-up to PR #2084 review 5889497938 (card t_01a1d47424d2e6ca), three non-blocking nits:
+
+1. No masked row. lineage_ledger_status read each id with _CANONICAL_PENDING_SQL (UNION ALL ... LIMIT 1, no
+   ORDER BY), one arbitrary row per id, so a `queued` row inserted before an `unknown` admission on the same id
+   answered `queued` and the gateway owned a chat it must not. It now reads every non-terminal row of each id
+   (_LINEAGE_PENDING_SQL, the same query without LIMIT 1): any status outside FORWARDABLE_LEDGER_STATES answers
+   (sorted, deterministic); else the least forwardable status of the first id in sorted order. The docstring says
+   exactly that. RED on 7cd82b40a1: test_an_unknown_beside_a_queued_row_on_one_id_is_never_masked[queued] read
+   'queued'.
+2. Both directions tested. The tip-queued/root-unknown test is parametrized over the swapped layout (tip
+   `unknown`, root `queued`), and each layout also drives the remote-owner pass (kanban_remote_owner._collect,
+   gated on _gateway_holds_work): it collects nothing for the chat. A control test shows _collect collects for a
+   chat both legs hand to the gateway. These pass on the parent too (both legs already agreed); they pin it.
+3. Intermediate compaction parent: fixed, not accepted. The legacy leg reads the chat plus its parent chain
+   (session_notifications._session_lineage, 8 hops); the gateway read only {tip, root}. Traced on the parent:
+   - `unknown` on the intermediate parent, `queued` on the root: the legacy leg kept the chat and claimed the tui
+     row, while the gateway also owned it. Delivery stayed exactly-once only through the per-row durable claim
+     (claim_unseen_events_for_sub refuses a row a live other holder has in flight), and the remote-owner pass
+     collected for a chat the legacy sweep also served.
+   - `queued` only on the intermediate parent: the legacy leg handed the chat back and the gateway claimed
+     nothing until that work ended (the "only delays" case the old docstring accepted).
+   _gateway_holds_work now expands its ids with kanban_leg_custody.with_parents (the same parent_session_id walk,
+   LINEAGE_LIMIT = _session_lineage's default limit, pinned by a test; a read error keeps the given ids), so both
+   legs read one lineage. RED on 7cd82b40a1: the intermediate-unknown test saw _gateway_holds_work True, the
+   intermediate-queued test admitted nothing.
+
+Tests: tests/gateway/test_kanban_tui_sibling_custody.py (30 passed; 4 fail on the parent),
+test_kanban_tui_owner_delivery.py, test_kanban_remote_owner_delivery.py: 69 passed.
+---
+ gateway/kanban_tui_owner.py                   |  10 +-
+ .../test_kanban_tui_sibling_custody.py        | 137 +++++++++++++++++-
+ tui_gateway/kanban_leg_custody.py             |  51 +++++--
+ 3 files changed, 176 insertions(+), 22 deletions(-)
+
+diff --git a/gateway/kanban_tui_owner.py b/gateway/kanban_tui_owner.py
+index 890d4a2368..15736486d8 100644
+--- a/gateway/kanban_tui_owner.py
++++ b/gateway/kanban_tui_owner.py
+@@ -72,21 +72,23 @@ def _gateway_holds_work(authority: Any, ids: set) -> bool:
+     """Whether the gateway's ledger holds work that ends on its own for ``ids``, or this process holds
+     the turn lease. This is when the legacy backend refuses the chat. A read error answers False and
+     leaves the row to the legacy backend. The ledger is read by the legacy hand-back's own rule
+-    (``kanban_leg_custody.lineage_ledger_status``): an ``unknown`` row on either id owns nothing."""
+-    from tui_gateway.kanban_leg_custody import lineage_ledger_status
++    (``kanban_leg_custody.lineage_ledger_status``) over the same ids, ``ids`` plus their compaction parents
++    (``with_parents``): an ``unknown`` row on any of them owns nothing."""
++    from tui_gateway.kanban_leg_custody import lineage_ledger_status, with_parents
+     db = getattr(authority, "db", None)
+     read_ctx = getattr(db, "_read_ctx", None)
+     if read_ctx is None:
+         return False
+     try:
+         with read_ctx() as conn:
+-            status = lineage_ledger_status(conn, ids)
++            lineage = with_parents(conn, ids)
++            status = lineage_ledger_status(conn, lineage)
+             if status is not None:
+                 return status in _FORWARDABLE_LEDGER_STATES
+         owner_of = getattr(db, "session_turn_lease_owner", None)
+         if owner_of is not None:
+             mine = f"pid={os.getpid()}:"
+-            for sid in sorted(filter(None, ids)):
++            for sid in sorted(lineage):
+                 owner = owner_of(sid)
+                 if owner and str(owner.get("holder") or "").startswith(mine):
+                     return True
+diff --git a/tests/gateway/test_kanban_tui_sibling_custody.py b/tests/gateway/test_kanban_tui_sibling_custody.py
+index ace76d72da..1d0371e438 100644
+--- a/tests/gateway/test_kanban_tui_sibling_custody.py
++++ b/tests/gateway/test_kanban_tui_sibling_custody.py
+@@ -39,6 +39,7 @@ class _Ledger:
+         self.conn = sqlite3.connect(":memory:", check_same_thread=False)
+         self.conn.execute("CREATE TABLE session_admissions (target_session_id TEXT, status TEXT)")
+         self.conn.execute("CREATE TABLE worker_executions (session_id TEXT, status TEXT)")
++        self.conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT)")
+ 
+     @contextlib.contextmanager
+     def _read_ctx(self):
+@@ -47,6 +48,11 @@ class _Ledger:
+     def work(self, session_id, status="started"):
+         self.conn.execute("INSERT INTO session_admissions VALUES (?, ?)", (session_id, status))
+ 
++    def chain(self, *ids):
++        """A compaction chain, tip first: each id's parent is the next (``sessions.parent_session_id``)."""
++        for child, parent in zip(ids, (*ids[1:], None)):
++            self.conn.execute("INSERT INTO sessions VALUES (?, ?)", (child, parent))
++
+     def status(self, session_id):
+         row = self.conn.execute("SELECT status FROM session_admissions WHERE target_session_id = ?",
+                                 (session_id,)).fetchone()
+@@ -607,10 +613,30 @@ def _clock(monkeypatch):
+     return clock
+ 
+ 
+-def test_nit1_tip_queued_and_root_unknown_answer_one_rule_on_both_legs(env, monkeypatch):
+-    """The tip holds ``queued`` work and the lineage root an ``unknown`` admission. Key-first the legacy leg read
+-    ``queued`` and handed the chat back; sorted, the gateway read the older root's ``unknown`` and never claimed
+-    (review 5888998970 nit 1). One rule over the ids: neither owns, so the legacy leg keeps the chat."""
++def _remote_collected(runner, authority, monkeypatch, tmp_path, logical):
++    """The chats the remote-owner pass (``kanban_remote_owner._collect``) collects notices for, with ``logical``'s
++    live session as this gateway's only owned chat: it gates each chat on ``_gateway_holds_work``."""
++    from gateway import kanban_remote_owner as kro
++    from tui_gateway import kanban_remote_notices as krn
++    hub = tmp_path / "hub.db"
++    hub.touch()
++    monkeypatch.setattr(krn, "hub_db_path", lambda: hub)
++    monkeypatch.setattr(kro, "_reconcile", lambda db: None)
++    collected = []
++    monkeypatch.setattr(krn, "collect", lambda chat, profile, **kw: collected.append(chat) or [])
++    assert kro._collect(runner, authority, [(logical, authority.sessions[logical])]) == []
++    return collected
++
++
++@pytest.mark.parametrize("tip_status,root_status", [("queued", "unknown"), ("unknown", "queued")],
++                         ids=["tip_queued_root_unknown", "tip_unknown_root_queued"])
++def test_nit1_one_unknown_on_tip_or_root_answers_one_rule_on_both_legs(env, monkeypatch, tmp_path, tip_status,
++                                                                         root_status):
++    """One id holds ``queued`` work and the other an ``unknown`` admission, in either layout. Key-first the legacy
++    leg read the tip and sorted the gateway read the older root, so one layout handed the chat back to a gateway
++    that never claimed (review 5888998970 nit 1); the swapped layout pins the rule in the other direction (review
++    5889497938 nit 2). One rule over the ids: neither owns, so the legacy leg keeps the chat, and the remote-owner
++    pass collects nothing for it either."""
+     from gateway.kanban_tui_owner import _gateway_holds_work, owned_live_session
+     from tui_gateway import kanban_leg_custody as custody
+     runner, authority, adapter, admitted = env
+@@ -618,13 +644,75 @@ def test_nit1_tip_queued_and_root_unknown_answer_one_rule_on_both_legs(env, monk
+     monkeypatch.setattr(server, "_session_lineage", lambda key, limit=8: (root,) if key == CHAT else ())
+     monkeypatch.setattr(authority, "logical_owner", lambda chat: root)
+     authority.sessions[root] = _Live(CHAT)
+-    authority.db.work(CHAT, "queued")
+-    authority.db.work(root, "unknown")
++    authority.db.work(CHAT, tip_status)
++    authority.db.work(root, root_status)
+     with authority.db._read_ctx() as conn:
+         answers = {custody.lineage_ledger_status(conn, ids) for ids in ((CHAT, root), (root, CHAT), {CHAT, root})}
+     assert answers == {"unknown"}
+     assert not _gateway_holds_work(authority, {CHAT, root})
+     assert not server._kb_gateway_owns(_session())
++    assert _remote_collected(runner, authority, monkeypatch, tmp_path, root) == []
++    tid = _card(local=False)
++    assert owned_live_session(runner, {"chat_id": CHAT, "notifier_profile": "default", "task_id": tid}) is None
++    session = _session()
++    session["running"] = True
++    _complete(tid)
++    _keeps_the_chat_and_holds_it_once(runner, authority, adapter, admitted, tid, session)
++
++
++def test_remote_owner_collects_for_a_chat_both_legs_hand_to_the_gateway(env, monkeypatch, tmp_path):
++    """The remote-owner pass's control: forwardable work on the root alone, so both legs agree the gateway owns
++    the chat, and ``_collect`` collects its remote notices."""
++    from gateway.kanban_tui_owner import _gateway_holds_work
++    runner, authority, _adapter, _admitted = env
++    root = "20261020_101500_a1b2c3"
++    monkeypatch.setattr(server, "_session_lineage", lambda key, limit=8: (root,) if key == CHAT else ())
++    monkeypatch.setattr(authority, "logical_owner", lambda chat: root)
++    authority.sessions[root] = _Live(CHAT)
++    authority.db.work(root, "queued")
++    assert _gateway_holds_work(authority, {CHAT, root}) and server._kb_gateway_owns(_session())
++    assert _remote_collected(runner, authority, monkeypatch, tmp_path, root) == [CHAT]
++
++
++@pytest.mark.parametrize("first", ["queued", "unknown"])
++def test_an_unknown_beside_a_queued_row_on_one_id_is_never_masked(env, first):
++    """One id with a ``queued`` and an ``unknown`` row, in either insertion order: the per-id read is not one
++    arbitrary row (``_CANONICAL_PENDING_SQL``'s ``LIMIT 1``), so the ``unknown`` admission always answers and
++    neither leg owns (review 5889497938 nit 1)."""
++    from gateway.kanban_tui_owner import _gateway_holds_work
++    from tui_gateway import kanban_leg_custody as custody
++    _runner, authority, _adapter, _admitted = env
++    for status in (first, ({"queued", "unknown"} - {first}).pop()):
++        authority.db.work(CHAT, status)
++    with authority.db._read_ctx() as conn:
++        assert custody.lineage_ledger_status(conn, (CHAT,)) == "unknown"
++    assert not _gateway_holds_work(authority, {CHAT})
++    assert not server._kb_gateway_owns(_session())
++
++
++def _three_deep(monkeypatch, authority):
++    """Tip CHAT, an intermediate compaction parent, and the lineage root the authority keys the live session by."""
++    mid, root = "20261023_090000_d4e5f6", "20261020_101500_a1b2c3"
++    authority.db.chain(CHAT, mid, root)
++    monkeypatch.setattr(server, "_session_lineage", lambda key, limit=8: (mid, root) if key == CHAT else ())
++    monkeypatch.setattr(authority, "logical_owner", lambda chat: root)
++    authority.sessions[root] = _Live(CHAT)
++    return mid, root
++
++
++def test_nit3_an_unknown_on_an_intermediate_parent_keeps_the_chat_on_both_legs(env, monkeypatch, tmp_path):
++    """An ``unknown`` admission on a compaction parent between the tip and the root, ``queued`` work on the root.
++    The gateway read only {tip, root} and claimed while the legacy leg (which reads every parent) kept and claimed
++    the chat too (review 5889497938 nit 3). The gateway now reads the same parents: neither owns, the legacy leg
++    delivers the notice once, and the remote-owner pass stands aside."""
++    from gateway.kanban_tui_owner import _gateway_holds_work, owned_live_session
++    runner, authority, adapter, admitted = env
++    mid, root = _three_deep(monkeypatch, authority)
++    authority.db.work(mid, "unknown")
++    authority.db.work(root, "queued")
++    assert not server._kb_gateway_owns(_session())
++    assert not _gateway_holds_work(authority, {CHAT, root})
++    assert _remote_collected(runner, authority, monkeypatch, tmp_path, root) == []
+     tid = _card(local=False)
+     assert owned_live_session(runner, {"chat_id": CHAT, "notifier_profile": "default", "task_id": tid}) is None
+     session = _session()
+@@ -633,6 +721,43 @@ def test_nit1_tip_queued_and_root_unknown_answer_one_rule_on_both_legs(env, monk
+     _keeps_the_chat_and_holds_it_once(runner, authority, adapter, admitted, tid, session)
+ 
+ 
++def test_nit3_forwardable_work_on_an_intermediate_parent_alone_is_claimed_by_the_gateway_once(env, monkeypatch):
++    """The other direction: ``queued`` work only on the intermediate parent. The legacy leg handed the chat back
++    and the gateway, reading {tip, root}, claimed nothing until that work ended. Both legs now read it: the hand-back
++    reaches a gateway that admits the notice within one tick, exactly once."""
++    runner, authority, adapter, admitted = env
++    mid, _root = _three_deep(monkeypatch, authority)
++    authority.db.work(mid, "queued")
++    tid = _card(local=False)
++    session = _session()
++    session["running"] = True
++    _complete(tid)
++    assert server._kb_gateway_owns(session)
++    assert _legacy_collect(session) == []  # handed to the gateway
++    _gateway_tick(runner)
++    assert [a["chat"] for a in admitted] == [CHAT]
++    _gateway_tick(runner)
++    _next_poll(session)
++    assert _legacy_collect(session) == []
++    assert _notices(adapter, admitted, tid) == 1
++
++
++def test_the_gateway_walks_as_many_parents_as_the_legacy_lineage(env):
++    import inspect
++
++    from tui_gateway import kanban_leg_custody as custody
++    from tui_gateway import session_notifications
++    assert inspect.signature(session_notifications._session_lineage).parameters["limit"].default == \
++        custody.LINEAGE_LIMIT
++    _runner, authority, _adapter, _admitted = env
++    authority.db.chain(*(f"s{i}" for i in range(custody.LINEAGE_LIMIT + 3)))
++    with authority.db._read_ctx() as conn:
++        assert custody.with_parents(conn, {"s0"}) == tuple(f"s{i}" for i in range(custody.LINEAGE_LIMIT + 1))
++        assert custody.with_parents(conn, {"unknown-id"}) == ("unknown-id",)
++        conn.execute("ALTER TABLE sessions RENAME TO sessions_gone")
++        assert custody.with_parents(conn, ("s0", "s1")) == ("s0", "s1")  # a read error keeps the ids given
++
++
+ def test_restore_gap_unrestored_gateway_chat_is_back_within_one_ttl_once_its_work_ends(env, monkeypatch):
+     """The gap ``gateway_owner`` names (review 5888998970 nit 2): the gateway holds forwardable ledger work for the
+     chat but has not restored it as a live LOCAL session (just restarted), so nobody claims the tui row while the
+diff --git a/tui_gateway/kanban_leg_custody.py b/tui_gateway/kanban_leg_custody.py
+index 1774ffecf6..d35770c5f2 100644
+--- a/tui_gateway/kanban_leg_custody.py
++++ b/tui_gateway/kanban_leg_custody.py
+@@ -136,25 +136,52 @@ def legacy_gateway_owns(session: dict, session_lineage, session_db, now: Optiona
+     return all(claims_row(owner, c) for c in claims if not c.get("remote"))
+ 
+ 
++# Every non-terminal ledger row of one id: ``session_lifecycle._CANONICAL_PENDING_SQL`` without its ``LIMIT 1``. That
++# answers with one arbitrary row, so a ``queued`` row could mask an ``unknown`` admission on the same id (review
++# 5889497938 nit 1).
++_LINEAGE_PENDING_SQL = """SELECT status FROM session_admissions WHERE target_session_id=? AND status!='terminal'
++    UNION ALL SELECT status FROM worker_executions WHERE session_id=? AND status!='terminal'"""
++
++# Parent hops of a chat's lineage: ``session_notifications._session_lineage``'s default ``limit`` (the legacy ids).
++LINEAGE_LIMIT = 8
++
++
++def with_parents(conn, ids) -> tuple:
++    """``ids`` plus each one's ``sessions.parent_session_id`` chain (up to ``LINEAGE_LIMIT`` hops): the compaction
++    parents the legacy leg reads (``session_notifications._session_lineage``), so the gateway's claim reads the
++    same ids, intermediate parents included (review 5889497938 nit 3). A read error keeps ``ids``."""
++    import sqlite3
++    out = list(dict.fromkeys(str(s) for s in ids if s))
++    try:
++        for sid in list(out):
++            for _ in range(LINEAGE_LIMIT):
++                row = conn.execute("SELECT parent_session_id FROM sessions WHERE id = ?", (sid,)).fetchone()
++                if not row or not row[0] or str(row[0]) in out:
++                    break
++                sid = str(row[0])
++                out.append(sid)
++    except sqlite3.Error:
++        logger.debug("kanban notices: lineage parent read failed; reading the ids given", exc_info=True)
++    return tuple(out)
++
++
+ def lineage_ledger_status(conn, ids) -> Optional[str]:
+     """The gateway ledger's answer for a chat's lineage ``ids``: the one rule this backend's hand-back and the
+     gateway's claim (``gateway.kanban_tui_owner._gateway_holds_work``) both read, so the two cannot disagree on
+     which row counts (review 5888998970 nit 1: the tip ``queued`` and the root ``unknown`` answered ``queued``
+-    key-first here and ``unknown`` sorted there). Order-independent: any non-terminal row outside
+-    ``owner_forward.FORWARDABLE_LEDGER_STATES`` (an ``unknown`` admission) answers with its status, which owns
+-    nothing, so this backend keeps the chat; else the first forwardable status in sorted id order; None when no
+-    id has a non-terminal row. The legacy ids may add compaction parents between the tip and the root the gateway
+-    reads; one of them holding forwardable work alone is rare (admissions sit on the root), and only delays."""
++    key-first here and ``unknown`` sorted there). Order-independent: every non-terminal row of every id is read,
++    and any one outside ``owner_forward.FORWARDABLE_LEDGER_STATES`` (an ``unknown`` admission, even beside a
++    ``queued`` row on the same id) answers with its status, which owns nothing, so this backend keeps the chat;
++    else the least forwardable status of the first id in sorted order that has one; None when no id has a
++    non-terminal row. The gateway passes its ids through :func:`with_parents`, so both legs read the same lineage."""
+     from tui_gateway.owner_forward import FORWARDABLE_LEDGER_STATES
+-    from tui_gateway.session_lifecycle import _CANONICAL_PENDING_SQL
+     first = None
+     for sid in sorted({str(s) for s in ids if s}):
+-        row = conn.execute(_CANONICAL_PENDING_SQL, (sid, sid)).fetchone()
+-        if row is None:
+-            continue
+-        if str(row[0]) not in FORWARDABLE_LEDGER_STATES:
+-            return str(row[0])
+-        first = first or str(row[0])
++        statuses = sorted(str(row[0]) for row in conn.execute(_LINEAGE_PENDING_SQL, (sid, sid)))
++        blocked = [s for s in statuses if s not in FORWARDABLE_LEDGER_STATES]
++        if blocked:
++            return blocked[0]
++        first = first or (statuses[0] if statuses else None)
+     return first
+ 
+ 
+-- 
+2.51.0
+

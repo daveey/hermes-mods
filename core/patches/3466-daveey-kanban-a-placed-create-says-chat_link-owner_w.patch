@@ -1,0 +1,587 @@
+From 96d75170299a927b00782cbc9d73efb96a8ab9cf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:33:57 +0000
+Subject: [PATCH] [daveey] kanban: a placed create says `chat_link:
+ owner_written` only when the owner answers that it wrote the link
+
+PR #2079 review follow-ups (card t_01a1d46503d6ce61):
+
+1. The origin decided `chat_link: owner_written` from the chat id's shape. An owner on core before
+   `_link_origin`, or with its Board sync off or stopped, writes nothing that reaches the Board, so the
+   note was untrue while the fleet is mixed. The owner's courier result now carries
+   `origin_chat_link: "owner_written"` (`kanban_origin_creation.origin_link_fields`) only when it holds
+   the origin chat's unreleased `created` link and its sync is enabled and running. `await_task_id`
+   hands the owner's result back through `result_out=`, `kanban_placement.owner_chat_link` turns it
+   into `placed.chat_link`, and the board-delivery note reads only that. No answer yet (a queued
+   request) or an older owner falls back to `queued_local`.
+2. Same change: the owner's actual decision is returned, so a `local-<sha256>` chat an ancestor's
+   `created` link proves (`proven_foreign_chats`) now gets `owner_written` instead of `queued_local`.
+3. `_link_origin` keeps skipping every chat on the owner's gateway, whatever its profile, now
+   documented with the reason: the owner's reconcile is that chat's gateway and releases on its next
+   pass any `created` row of it that it does not derive itself (a courier card has no
+   `creator_chats_resolved` event). Measured with the (gateway, profile) comparison: the link was
+   written, then `{'released': 1}` on the next reconcile. The hub subscription still reaches that chat.
+   A test pins the skip.
+---
+ hermes_cli/kanban_origin_creation.py          | 30 +++++-
+ hermes_cli/kanban_placement.py                | 64 +++++++++----
+ tests/hermes_cli/test_kanban_origin_notify.py | 39 ++++++++
+ .../test_kanban_placement_owner_link.py       | 48 ++++++++++
+ tests/tools/test_kanban_board_delivery.py     | 92 +++++++++++++------
+ tools/kanban_tools.py                         | 14 +--
+ tools/kanban_tools_board_delivery.py          | 27 +++---
+ 7 files changed, 249 insertions(+), 65 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_placement_owner_link.py
+
+diff --git a/hermes_cli/kanban_origin_creation.py b/hermes_cli/kanban_origin_creation.py
+index 7d9d85c9f8..2d4aad71fe 100644
+--- a/hermes_cli/kanban_origin_creation.py
++++ b/hermes_cli/kanban_origin_creation.py
+@@ -45,8 +45,12 @@ def _link_origin(conn, task_id: str, origin: dict, owner_gateway: str) -> None:
+     saw the cards it placed. The owner's capture triggers push this row through the owner's sync. The uid is the one
+     the origin's ledger reconcile writes (``kanban_chat_links.link_uid``), so when that sync recovers it upserts the
+     same Board row rather than adding one; the owner's reconcile manages only its own chats' rows and never releases
+-    it, and the origin releases it when the card closes (``_owner_written_releases``). A chat on the owner itself
+-    gets none: there the owner's reconcile is the chat's gateway and keeps only links it derives itself.
++    it, and the origin releases it when the card closes (``_owner_written_releases``). A chat on the owner's
++    gateway gets none, whatever its profile: there the owner's reconcile is the chat's gateway, and it releases on
++    its next pass any ``created`` row of that gateway it does not derive itself (a courier card has no
++    ``creator_chats_resolved`` event, so ``_local_links`` does not keep it), so a row for another profile's chat
++    would only be written to be released. Such a chat is reached by its ``hub`` subscription (``_subscribe_origin``);
++    its task-list link is left to its own ledger reconcile, as before this link existed.
+ 
+     A receipt-shaped origin (``local-<sha256>``, ``is_headless_session``) gets none either, unless an ancestor
+     already proves it, as in ``kanban_creator_chats.initialize_ownership``: an unreleased ``created`` link proves a
+@@ -72,6 +76,28 @@ def _link_origin(conn, task_id: str, origin: dict, owner_gateway: str) -> None:
+          origin["gateway"], origin["profile"], origin["session"], int(time.time())))
+ 
+ 
++OWNER_WRITTEN = "owner_written"
++
++
++def origin_link_fields(conn, task_id: str, origin: dict) -> dict:
++    """``{"origin_chat_link": "owner_written"}`` for the courier result when this owner holds the origin chat's
++    unreleased ``created`` link and its Board sync runs, so the link reaches the Board without the origin; ``{}``
++    otherwise. [daveey] The origin reads this answer instead of guessing from the chat id's shape: an owner on older
++    core (no ``_link_origin``) or with its sync off or stopped writes nothing that reaches the Board, and a
++    ``local-<sha256>`` chat an ancestor already proves does get a link. Never raises."""
++    try:
++        from hermes_cli import kanban_db_sync as sync
++        from hermes_cli import kanban_sync_runstate as runstate
++        from hermes_cli.kanban_chat_links import link_uid
++        if not sync.sync_enabled() or runstate.down():
++            return {}
++        uid = link_uid(task_id, origin["gateway"], origin["profile"], origin["session"], "created")
++        row = conn.execute("SELECT 1 FROM task_chat_links WHERE uid = ? AND released = 0", (uid,)).fetchone()
++    except Exception:  # health: allow BLE001 -- an unreadable answer is "not written", never a failed create
++        return {}
++    return {"origin_chat_link": OWNER_WRITTEN} if row else {}
++
++
+ def _insert_intent(conn, row: tuple) -> None:
+     """Store the intent row and its synced copy in one transaction. The row is machine-local and its binding id is a
+     random secret, so only the copy lets an owner restored from the Board rebuild it (``kanban_origin_intent_carry``)."""
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 3c398634fb..84740408c7 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -1259,10 +1259,8 @@ def _task_id_in(res) -> Optional[str]:
+     return m.group(1) if m else None
+ 
+ 
+-def _owner_card(stdout: str) -> tuple[Optional[str], Optional[str]]:
+-    """(task id, status) from ``hermes-hub outcomes --id`` output when the hub already holds the owner's
+-    card: an origin-bound create stays ``waiting`` until this gateway's next full sync accepts the
+-    binding, but the card exists from the moment the owner posts it."""
++def _owner_result(stdout: str) -> tuple[bool, Optional[dict]]:
++    """(the hub holds the owner's card, the owner's result) from ``hermes-hub outcomes --id`` output."""
+     for line in reversed((stdout or "").splitlines()):
+         line = line.strip()
+         if not line.startswith("{"):
+@@ -1273,34 +1271,64 @@ def _owner_card(stdout: str) -> tuple[Optional[str], Optional[str]]:
+             continue
+         if isinstance(out, dict) and out.get("remote_state") in ("waiting", "done"):
+             res = out.get("remote_result")
+-            st = res.get("status") if isinstance(res, dict) else None
+-            return _task_id_in(res), st if isinstance(st, str) else None
++            return True, res if isinstance(res, dict) else None
++        return False, None
++    return False, None
++
++
++def _owner_card(stdout: str) -> tuple[Optional[str], Optional[str]]:
++    """(task id, status) from ``hermes-hub outcomes --id`` output when the hub already holds the owner's
++    card: an origin-bound create stays ``waiting`` until this gateway's next full sync accepts the
++    binding, but the card exists from the moment the owner posts it."""
++    held, res = _owner_result(stdout)
++    if not held:
+         return None, None
+-    return None, None
++    st = res.get("status") if isinstance(res, dict) else None
++    return _task_id_in(res), st if isinstance(st, str) else None
+ 
+ 
+-def remote_status(rid: str) -> Optional[str]:
+-    """The created card's status on the target (``ready``, ``triage``...) when its result names one."""
++def owner_chat_link(result: object) -> dict:
++    """``{"chat_link": "owner_written"}`` when the owner's create result says it wrote the origin chat's
++    ``created`` link and its Board sync runs (``kanban_origin_creation.origin_link_fields``), else ``{}``.
++    [daveey] Only the owner knows: an owner on older core or with its sync off writes none, and it writes one for a
++    ``local-<sha256>`` chat an ancestor already proves, so the chat id's shape cannot tell."""
++    from hermes_cli.kanban_origin_creation import OWNER_WRITTEN
++    written = isinstance(result, dict) and result.get("origin_chat_link") == OWNER_WRITTEN
++    return {"chat_link": OWNER_WRITTEN} if written else {}
++
++
++def _done_result(rid: str) -> Optional[dict]:
+     row = _sent_row(rid)
+     try:
+-        res = json.loads(row[1] or "{}") if row and row[0] == "done" else {}
+-    except Exception:
++        res = json.loads(row[1] or "{}") if row and row[0] == "done" else None
++    except (TypeError, ValueError):  # a non-JSON result is no answer
+         return None
+-    st = res.get("status") if isinstance(res, dict) else None
++    return res if isinstance(res, dict) else None
++
++
++def remote_status(rid: str) -> Optional[str]:
++    """The created card's status on the target (``ready``, ``triage``...) when its result names one."""
++    res = _done_result(rid) or {}
++    st = res.get("status")
+     return st if isinstance(st, str) else None
+ 
+ 
+ def await_task_id(rid: str, *, hub_cli: str, budget: float, clock: Callable[[], float] = time.monotonic,
+-                  sleep: Callable[[float], None] = time.sleep) -> tuple[Optional[str], Optional[str]]:
++                  sleep: Callable[[float], None] = time.sleep,
++                  result_out: Optional[dict] = None) -> tuple[Optional[str], Optional[str]]:
+     """Wait up to ``budget`` seconds for the target to make the card of request ``rid``.
+ 
+-    Returns (task id, status on the target), (None, None) while still pending.
++    Returns (task id, status on the target), (None, None) while still pending. ``result_out``, when given, gets
++    the owner's result dict under ``"result"`` once the id is known (``owner_chat_link`` reads it).
+ 
+     The result only reaches this gateway when its hermes-hub client fetches outcomes. A client with
+     ``hermes-hub outcomes`` is asked about once a second; an older one gets ONE detached ``sync``
+     (it outlives this wait, so a late result is still recorded) while the replica is polled."""
++    out = {} if result_out is None else result_out
+     tid = remote_task_id(rid)
+     if tid or budget <= 0:
++        if tid:
++            out["result"] = _done_result(rid)
+         return tid, remote_status(rid) if tid else None
+     deadline = clock() + budget
+     fast = hub_has_outcomes(hub_cli)
+@@ -1311,13 +1339,15 @@ def await_task_id(rid: str, *, hub_cli: str, budget: float, clock: Callable[[],
+             left = max(1.0, min(5.0, deadline - clock()))
+             argv = [hub_cli, "outcomes", "--id", rid, "--wait", f"{left:.1f}"]
+             # Bound the call itself too (the client's HTTP timeout is 60 s); a test fake takes argv only.
+-            _, out, _ = (hub_runner(argv) if hub_runner is not _default_runner
+-                         else _default_runner(argv, timeout=left + 5))
+-            tid, st = _owner_card(out)
++            _, stdout, _ = (hub_runner(argv) if hub_runner is not _default_runner
++                            else _default_runner(argv, timeout=left + 5))
++            tid, st = _owner_card(stdout)
+             if tid:
++                out["result"] = _owner_result(stdout)[1]
+                 return tid, st
+         tid = remote_task_id(rid)
+         if tid:
++            out["result"] = _done_result(rid)
+             return tid, remote_status(rid)
+         if clock() >= deadline or remote_state(rid) in FAILED_STATES:  # rejected: it will never come
+             return None, None
+diff --git a/tests/hermes_cli/test_kanban_origin_notify.py b/tests/hermes_cli/test_kanban_origin_notify.py
+index 786e6f8857..714dcc5d53 100644
+--- a/tests/hermes_cli/test_kanban_origin_notify.py
++++ b/tests/hermes_cli/test_kanban_origin_notify.py
+@@ -114,6 +114,10 @@ def test_courier_create_writes_the_origin_chats_created_link_once(synced_owner):
+ 
+ @pytest.mark.parametrize("origin", [
+     {"gateway": "hub", "profile": "default", "session": CHAT},  # a chat on the owner: its own reconcile links it
++    # [daveey] PR #2079 review: another profile's chat on the owner's gateway gets none either. The owner's reconcile
++    # is that chat's gateway and releases any created row of it it does not derive (a courier card has no
++    # creator_chats_resolved event), measured: written, then {'released': 1} on the next pass. The hub sub reaches it.
++    {"gateway": "hub", "profile": "other", "session": CHAT},
+     {"gateway": "macbook", "profile": "default", "session": "kanban-placement-macbook"},  # attribution, no chat
+     # a receipt-shaped hash: maybe a worker's own $HERMES_SESSION_ID; only macbook can prove it is a Desktop chat
+     {"gateway": "macbook", "profile": "default", "session": "local-" + "9c" * 32},
+@@ -123,6 +127,41 @@ def test_courier_create_writes_no_link_for_a_chat_on_the_owner_or_a_placeholder(
+     res = json.loads(str(registry.dispatch("kanban_create", args, origin_intent={**synced_owner, "origin": origin})))
+     assert res.get("created") is True, res
+     assert _links(res["task_id"]) == []
++    assert "origin_chat_link" not in res  # the origin is told the link still waits for its own reconcile
++
++
++def test_courier_create_tells_the_origin_it_wrote_the_link(synced_owner):
++    """[daveey] PR #2079 review: the origin's ``chat_link: owner_written`` note read the chat id's shape; the owner's
++    answer now carries what it did, so a mixed fleet (older owner, sync off) never gets that promise wrongly."""
++    args = {"title": "Build", "assignee": "default"}
++    res = json.loads(str(registry.dispatch("kanban_create", args, origin_intent=synced_owner)))
++    assert res.get("created") is True and res.get("origin_chat_link") == "owner_written", res
++    again = json.loads(str(registry.dispatch("kanban_create", args, origin_intent=synced_owner)))
++    assert again["task_id"] == res["task_id"] and again.get("origin_chat_link") == "owner_written"
++
++
++def test_courier_create_on_an_owner_whose_sync_is_stopped_does_not_claim_the_link(synced_owner, monkeypatch):
++    from hermes_cli import kanban_sync_runstate as runstate
++    monkeypatch.setattr(runstate, "down", lambda: {"running": False, "reason": "gave up the sync role"})
++    res = json.loads(str(registry.dispatch("kanban_create", {"title": "Build", "assignee": "default"},
++                                           origin_intent=synced_owner)))
++    assert res.get("created") is True and "origin_chat_link" not in res, res
++
++
++def test_courier_create_on_an_owner_without_board_sync_does_not_claim_the_link(owner):
++    res = json.loads(str(registry.dispatch("kanban_create", {"title": "Build", "assignee": "default"},
++                                           origin_intent=owner)))
++    assert res.get("created") is True and "origin_chat_link" not in res, res
++
++
++def test_courier_adoption_tells_the_origin_it_wrote_the_link(synced_owner):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Existing", assignee="default")
++    intent = {"request_id": "adopt:0123456789", "origin": synced_owner["origin"],
++              "owner": {**synced_owner["owner"], "task_id": tid}}
++    res = json.loads(str(registry.dispatch("kanban_origin_adopt", {"task_id": tid, "board": "default"},
++                                           origin_intent=intent)))
++    assert res.get("adopted") is True and res.get("origin_chat_link") == "owner_written", res
+ 
+ 
+ # --- origin side: kanban_create auto placement and the deferred forward ----------------------------------------
+diff --git a/tests/hermes_cli/test_kanban_placement_owner_link.py b/tests/hermes_cli/test_kanban_placement_owner_link.py
+new file mode 100644
+index 0000000000..863468ef26
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_placement_owner_link.py
+@@ -0,0 +1,48 @@
++"""The origin learns from the owner's own courier answer whether the owner wrote its chat's ``created`` link. [daveey]
++
++PR #2079 review: the origin's ``chat_link: owner_written`` note was decided from the chat id's shape, untrue for an
++owner on older core or with its Board sync off, and too cautious for a ``local-<sha256>`` chat an ancestor proves.
++``await_task_id(result_out=...)`` hands the owner's result to ``owner_chat_link``, which reads only the owner's
++``origin_chat_link`` field.
++"""
++import json
++
++from hermes_cli import kanban_placement as kp
++
++RID = "placement:macbook:1866c148153415f35121c325"
++WRITTEN = {"ok": False, "created": True, "code": "origin_bind_pending", "task_id": "t_01a1d42acdce8e23",
++           "status": "ready", "origin_chat_link": "owner_written"}
++
++
++def _outcomes(result):
++    return json.dumps({"id": RID, "state": "queued", "result": None, "remote_state": "waiting",
++                       "remote_result": result})
++
++
++def test_the_owners_answer_from_hub_outcomes_reaches_the_caller(monkeypatch):
++    monkeypatch.setattr(kp, "remote_task_id", lambda rid: None)
++    monkeypatch.setattr(kp, "hub_has_outcomes", lambda hub_cli: True)
++    monkeypatch.setattr(kp, "hub_runner", lambda argv: (0, _outcomes(WRITTEN), ""))
++    seen: dict = {}
++    assert kp.await_task_id(RID, hub_cli="hermes-hub", budget=5, result_out=seen) == ("t_01a1d42acdce8e23", "ready")
++    assert kp.owner_chat_link(seen["result"]) == {"chat_link": "owner_written"}
++
++
++def test_the_owners_answer_from_the_done_replica_row_reaches_the_caller(monkeypatch):
++    done = {**WRITTEN, "ok": True, "code": "origin_bound", "handoff_complete": True}
++    monkeypatch.setattr(kp, "_sent_row", lambda rid: ("done", json.dumps(done)))
++    seen: dict = {}
++    assert kp.await_task_id(RID, hub_cli="hermes-hub", budget=0, result_out=seen) == ("t_01a1d42acdce8e23", "ready")
++    assert kp.owner_chat_link(seen["result"]) == {"chat_link": "owner_written"}
++
++
++def test_an_owner_answer_without_the_field_claims_nothing():
++    older = {k: v for k, v in WRITTEN.items() if k != "origin_chat_link"}  # core before _link_origin
++    assert kp.owner_chat_link(older) == {}
++    assert kp.owner_chat_link(None) == {}  # no answer yet (a queued request)
++    assert kp.owner_chat_link({"origin_chat_link": "yes"}) == {}
++
++
++def test_await_task_id_without_result_out_is_unchanged(monkeypatch):
++    monkeypatch.setattr(kp, "_sent_row", lambda rid: ("done", json.dumps(WRITTEN)))
++    assert kp.await_task_id(RID, hub_cli="hermes-hub", budget=0) == ("t_01a1d42acdce8e23", "ready")
+diff --git a/tests/tools/test_kanban_board_delivery.py b/tests/tools/test_kanban_board_delivery.py
+index e651214e72..55656ee5ad 100644
+--- a/tests/tools/test_kanban_board_delivery.py
++++ b/tests/tools/test_kanban_board_delivery.py
+@@ -306,9 +306,14 @@ CHAT = "20261026_235722_bef6c6"
+ SHOWS_PROMISE = "shows in this chat's tasks."
+ 
+ 
+-def _place_on_worker(home, monkeypatch, *, task_id, chat=CHAT):
++OWNER_ANSWER = {"ok": False, "created": True, "code": "origin_bind_pending", "status": "ready",
++                "origin_chat_link": "owner_written"}  # the owner wrote this chat's link and its sync runs
++
++
++def _place_on_worker(home, monkeypatch, *, task_id, chat=CHAT, owner_result=OWNER_ANSWER):
+     """kanban_create from a chat, placed on worker-4 (01:09 PT: t_01a1d42acdce8e23 and three more). ``task_id``
+-    None = the target has not answered yet (the queued-request note)."""
++    None = the target has not answered yet (the queued-request note). ``owner_result`` is the owner's courier
++    answer that reaches this gateway with the id (None: an owner on older core, no ``origin_chat_link``)."""
+     from hermes_cli import kanban_capability_registry as reg
+     from hermes_cli import kanban_placement as kp
+     from hermes_state import SessionDB
+@@ -321,19 +326,25 @@ def _place_on_worker(home, monkeypatch, *, task_id, chat=CHAT):
+     monkeypatch.setattr(kp, "decide", lambda *a, **k: {"where": "worker-4", "why": "explicit placement"})
+     monkeypatch.setattr(kp, "create_remote", lambda args, **kw: {
+         "ok": True, "request_id": "placement:macbook:t1", "queued_only": task_id is None})
+-    monkeypatch.setattr(kp, "await_task_id", lambda rid, **kw: (task_id, "running"))
++
++    def await_task_id(rid, result_out=None, **kw):
++        assert task_id is not None, "a queued-only request is not awaited"
++        if result_out is not None:
++            result_out["result"] = {**(owner_result or {}), "task_id": task_id}
++        return task_id, "running"
++    monkeypatch.setattr(kp, "await_task_id", await_task_id)
+     return json.loads(kt._handle_create({"title": "core update", "assignee": "default", "placement": "worker-4",
+                                          "body": "runs on worker-4", "requires": []}))
+ 
+ 
+ def test_create_placed_elsewhere_while_the_sync_role_is_given_up_says_only_this_gateways_copy_lags(home, monkeypatch):
+-    """The owner writes this chat's link to the Board (``_link_origin``), so the link does not wait in this
+-    gateway's outbox; only this gateway's replica, which the chat's task list reads, may lag."""
++    """The owner answered that it wrote this chat's link to the Board (``origin_chat_link``), so the link does not
++    wait in this gateway's outbox; only this gateway's replica, which the chat's task list reads, may lag."""
+     path, _conn = home
+     _give_up_the_sync_role(path, monkeypatch)
+     out = _place_on_worker(path, monkeypatch, task_id="t_01a1d42acdce8e23")
+     assert out["ok"] is True and out["task_id"] == "t_01a1d42acdce8e23" and out["runs_where"] == "worker-4", out
+-    assert out["placed"]["origin_session"] == CHAT
++    assert out["placed"]["origin_session"] == CHAT and out["placed"]["chat_link"] == "owner_written"
+     assert out["chat_link"] == "owner_written" and "board_delivery" not in out  # the card itself is on worker-4
+     assert "queued locally" not in json.dumps(out)
+     assert SHOWS_PROMISE not in out["note"]
+@@ -344,31 +355,49 @@ def test_create_placed_elsewhere_while_the_sync_role_is_given_up_says_only_this_
+     assert "gave up the sync role" in out["board_sync"] and "may not refresh until it recovers" in out["board_sync"]
+ 
+ 
+-def test_create_queued_on_a_target_while_stopped_says_this_gateways_copy_lags(home, monkeypatch):
++@pytest.mark.parametrize("owner_result", [
++    None,  # an owner on core before _link_origin: its answer has no origin_chat_link and it wrote no link
++    {"ok": False, "created": True, "status": "ready"},  # its Board sync off or stopped: nothing reaches the Board
++])
++def test_create_placed_on_an_owner_that_did_not_write_the_link_says_the_link_waits_here(
++        home, monkeypatch, owner_result):
++    """[daveey] PR #2079 review: the note said ``owner_written`` from the chat id's shape alone, untrue for an
++    owner on older core or with its sync off while the fleet is mixed. Only the owner's answer decides it."""
++    path, _conn = home
++    _give_up_the_sync_role(path, monkeypatch)
++    out = _place_on_worker(path, monkeypatch, task_id="t_01a1d42acdce8e23", owner_result=owner_result)
++    assert out["chat_link"] == "queued_local" and "chat_link" not in out["placed"], out
++    assert "shows in this chat's tasks once this gateway's Board sync recovers" in out["note"]
++    assert "queued locally: this gateway's Board sync has been stopped since " in out["note"]
++
++
++def test_create_queued_on_a_target_while_stopped_says_the_link_waits_here(home, monkeypatch):
++    """No owner answer yet: whether it will write the link is unknown, so the note promises only this gateway."""
+     path, _conn = home
+     _give_up_the_sync_role(path, monkeypatch)
+     out = _place_on_worker(path, monkeypatch, task_id=None)
+-    assert out["ok"] is True and out["status"] == "queued" and out["chat_link"] == "owner_written", out
+-    assert "(this chat's tasks once this gateway's copy of the Board refreshes, " in out["note"]
++    assert out["ok"] is True and out["status"] == "queued" and out["chat_link"] == "queued_local", out
++    assert "(this chat's tasks once this gateway's Board sync recovers, " in out["note"]
+ 
+ 
+ def test_create_placed_from_a_desktop_hash_chat_while_stopped_says_the_link_waits_here(home, monkeypatch):
+-    """The owner writes no link for a ``local-<sha256>`` chat (it cannot tell it from a worker's hash), so that
+-    link still waits for this gateway's sync: #2033's ``queued_local`` note stays true for it."""
++    """The owner writes no link for an unproven ``local-<sha256>`` chat (it cannot tell it from a worker's hash) and
++    says so by leaving ``origin_chat_link`` out, so that link still waits for this gateway's sync."""
+     path, _conn = home
+     _give_up_the_sync_role(path, monkeypatch)
+-    out = _place_on_worker(path, monkeypatch, task_id="t_01a1d42acdce8e23", chat="local-" + "9c" * 32)
++    out = _place_on_worker(path, monkeypatch, task_id="t_01a1d42acdce8e23", chat="local-" + "9c" * 32,
++                           owner_result={"ok": False, "created": True, "status": "ready"})
+     assert out["chat_link"] == "queued_local", out
+     assert "shows in this chat's tasks once this gateway's Board sync recovers" in out["note"]
+     assert "queued locally: this gateway's Board sync has been stopped since " in out["note"]
+ 
+ 
+-@pytest.mark.parametrize("task_id", ["t_01a1d42acdce8e23", None], ids=["created", "queued"])
+-@pytest.mark.parametrize(("chat", "chat_link", "later"), [
+-    (CHAT, "owner_written", "once this gateway's copy of the Board refreshes"),
+-    ("local-" + "9c" * 32, "queued_local", "once this gateway's Board sync recovers"),
+-], ids=["owner-written", "hash-chat"])
+-def test_create_note_wording_and_its_stopped_sync_rewrite_share_one_source(home, monkeypatch, task_id, chat,
++@pytest.mark.parametrize(("task_id", "owner_result", "chat_link", "later"), [
++    ("t_01a1d42acdce8e23", OWNER_ANSWER, "owner_written", "once this gateway's copy of the Board refreshes"),
++    ("t_01a1d42acdce8e23", None, "queued_local", "once this gateway's Board sync recovers"),
++    (None, OWNER_ANSWER, "queued_local", "once this gateway's Board sync recovers"),
++], ids=["owner-written", "older-owner", "queued"])
++def test_create_note_wording_and_its_stopped_sync_rewrite_share_one_source(home, monkeypatch, task_id, owner_result,
+                                                                            chat_link, later):
+     """Review 5888858852: the rewrite anchored on literals kanban_tools also spelled out, so rewording the note
+     there made it silently do nothing. Reworded at the one source, both rewrites (owner-written and queued) land."""
+@@ -377,32 +406,39 @@ def test_create_note_wording_and_its_stopped_sync_rewrite_share_one_source(home,
+     monkeypatch.setattr(kbd, "CHAT_TASKS_HEAD", "(listed under this chat")
+     path, _conn = home
+     _give_up_the_sync_role(path, monkeypatch)
+-    out = _place_on_worker(path, monkeypatch, task_id=task_id, chat=chat)
++    out = _place_on_worker(path, monkeypatch, task_id=task_id, owner_result=owner_result)
+     assert out["chat_link"] == chat_link, out
+     expected = (f" and is listed under this chat {later}." if task_id else f"(listed under this chat {later}, ")
+     assert expected in out["note"], out["note"]
+     assert "this chat's tasks" not in out["note"]
+ 
+ 
+-@pytest.mark.parametrize(("chat", "chat_link", "later"), [
+-    (CHAT, "owner_written", "once this gateway's copy of the Board refreshes"),
+-    ("local-" + "9c" * 32, "queued_local", "once this gateway's Board sync recovers"),
+-], ids=["owner-written", "hash-chat"])
+-def test_queued_rewrite_lands_after_the_exact_head_for_any_separator(home, monkeypatch, chat, chat_link, later):
++def test_queued_rewrite_lands_after_the_exact_head_for_any_separator(home, monkeypatch):
+     """Review 5889250891: the anchor was the queued wording .rstrip(", "), a character set, so wording ending in
+-    ": " kept its colon before the inserted text. The rewrite now goes right after the exact head constant (both the
+-    owner-written and the queued rewrite)."""
++    ": " kept its colon before the inserted text. The rewrite now goes right after the exact head constant. A queued
++    request has no owner answer yet, so it is always ``queued_local``."""
+     from tools import kanban_tools_board_delivery as kbd
+     monkeypatch.setattr(kbd, "CHAT_TASKS_HEAD", "(see this chat's tasks")
+     monkeypatch.setattr(kbd, "CHAT_TASKS_SEP", ": ")
+     path, _conn = home
+     _give_up_the_sync_role(path, monkeypatch)
+-    out = _place_on_worker(path, monkeypatch, task_id=None, chat=chat)
+-    assert out["chat_link"] == chat_link, out
++    out = _place_on_worker(path, monkeypatch, task_id=None)
++    assert out["chat_link"] == "queued_local", out
++    later = "once this gateway's Board sync recovers"
+     assert f"(see this chat's tasks {later}: `hermes-hub requests`)" in out["note"], out["note"]
+     assert f": {later}" not in out["note"]
+ 
+ 
++def test_create_placed_from_a_proven_desktop_hash_chat_says_the_owner_wrote_the_link(home, monkeypatch):
++    """[daveey] PR #2079 review: the owner DOES link a ``local-<sha256>`` chat an ancestor's ``created`` link proves
++    (``proven_foreign_chats``); the note read the hash shape and said ``queued_local`` anyway."""
++    path, _conn = home
++    _give_up_the_sync_role(path, monkeypatch)
++    out = _place_on_worker(path, monkeypatch, task_id="t_01a1d42acdce8e23", chat="local-" + "9c" * 32)
++    assert out["chat_link"] == "owner_written", out
++    assert "shows in this chat's tasks once this gateway's copy of the Board refreshes" in out["note"]
++
++
+ def test_create_placed_elsewhere_while_the_sync_runs_is_unchanged(home, monkeypatch):
+     path, _conn = home
+     out = _place_on_worker(path, monkeypatch, task_id="t_01a1d42acdce8e23")
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 87ae9d8645..a442f76200 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -22,7 +22,7 @@ from hermes_cli.goals import handoff_judge_goal, judge_goal
+ from tools.registry import no_cache_check_fn, registry, tool_error
+ from hermes_cli.config import cfg_get, load_config
+ from hermes_cli.kanban_capabilities import check_tool_create, declaration_required
+-from hermes_cli import kanban_contract_cli as _contract_cli, kanban_overlap, kanban_reason_comment as krc
++from hermes_cli import kanban_contract_cli as _contract_cli, kanban_overlap, kanban_reason_comment as krc, kanban_origin_creation
+ from tools.kanban_tools_placement import (_local_placement, _machine_placement, _marker_placement_fields, _persisted_session_id,
+                                           _create_session_id, _placement_origin, _placement_refused, _runs_where,
+                                           _effective_board_args, _origin_enrollment, _landing_placement, _pinned_note,
+@@ -1510,12 +1510,13 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+         # A chat model reads task_id null as "not created" and calls kanban_create again, which made a
+         # duplicate card (10-27 drill). Fetch the target's answer for a bounded wait so the id comes
+         # back like a local create's; otherwise say plainly that the card exists. [daveey]
++        owner: dict = {}  # the owner's courier answer: did it write this chat's link to the Board?
+         tid, remote_status = (None, None) if placed.get("queued_only") else kp.await_task_id(
+-            rid, hub_cli=reg.hub_cli_path(cfg.get("hub_cli")), budget=float(cfg.get("wait_seconds", 10) or 0))
++            rid, hub_cli=reg.hub_cli_path(cfg.get("hub_cli")), budget=float(cfg.get("wait_seconds", 10) or 0), result_out=owner)
+         retry = ("This identical kanban_create call was already made, so no second card was sent; this is "
+                  "the same card. " if placed.get("retry") else "")
+         fields = {"placed": {"gateway": target, "request_id": rid, "task_id": tid, "origin_session": session_id,
+-                             "queued_only": bool(placed.get("queued_only")), "retry": bool(placed.get("retry"))}}
++                             "queued_only": bool(placed.get("queued_only")), "retry": bool(placed.get("retry")), **kp.owner_chat_link(owner.get("result"))}}
+         from tools import kanban_tools_board_delivery as kbd_words  # [daveey] the stopped-sync rewrite's anchors
+         if tid:
+             shows = kbd_words.CHAT_TASKS_SHOWS if session_id else ""
+@@ -1711,7 +1712,7 @@ def _handle_create(args: dict, **kw) -> str:
+                 "request_id": origin_intent["request_id"],
+                 "binding": json.loads(row["binding_json"]),
+                 "child_request_id": row["child_request_id"],
+-            }}
++            }, **kanban_origin_creation.origin_link_fields(conn, new_tid, origin_intent["origin"])}  # chat_link [daveey]
+         if origin is not None:
+             extra["origin_binding"] = kanban_origin.bind(conn, new_tid, origin, board=args.get("board"))
+         extra.update(_marker_placement_fields(conn, new_tid, marker_placement, **place_origin))
+@@ -1935,7 +1936,7 @@ def _handle_origin_adopt(args: dict, **kw) -> str:
+         return tool_error(f"authenticated origin courier context required. {message}".strip().rstrip("."),
+                           code="origin_context_required", handoff_complete=False, **hint)
+     from hermes_cli.kanban_origin import OriginError
+-    from hermes_cli.kanban_origin_creation import adopt_with_origin
++    from hermes_cli.kanban_origin_creation import adopt_with_origin, origin_link_fields
+     if (not isinstance(intent, dict) or not isinstance(intent.get("owner"), dict)
+             or intent["owner"].get("task_id") != args.get("task_id")
+             or intent["owner"].get("board") != args.get("board")):
+@@ -1948,7 +1949,8 @@ def _handle_origin_adopt(args: dict, **kw) -> str:
+                            "code": "origin_bind_pending", "handoff_complete": False,
+                            "origin_creation": {"request_id": intent["request_id"],
+                                                "binding": json.loads(row["binding_json"]),
+-                                               "child_request_id": row["child_request_id"]}})
++                                               "child_request_id": row["child_request_id"]},
++                           **origin_link_fields(conn, tid, intent["origin"])})
+ 
+ 
+ # --- Registration (order preserved: it is the order tools appear in the schema) ---
+diff --git a/tools/kanban_tools_board_delivery.py b/tools/kanban_tools_board_delivery.py
+index 8469b8b1da..e8fdad99e4 100644
+--- a/tools/kanban_tools_board_delivery.py
++++ b/tools/kanban_tools_board_delivery.py
+@@ -14,9 +14,13 @@ BOARD_WRITE_TOOLS = frozenset({
+     "kanban_link", "kanban_unlink", "kanban_archive",
+ })
+ 
+-# A create placed on another gateway for this chat: the card's owner writes this chat's ``created`` link to the Board
+-# (``kanban_origin_creation._link_origin``), so the link no longer waits in this gateway's outbox. What still depends
+-# on this gateway is its replica of the Board, which this chat's task list reads and the stopped sync no longer pulls.
++# A create placed on another gateway for this chat: when the owner answers that it wrote this chat's ``created`` link
++# (``placed.chat_link: owner_written``, from ``kanban_origin_creation.origin_link_fields``), the link no longer waits
++# in this gateway's outbox; what still depends on this gateway is its replica of the Board, which this chat's task
++# list reads and the stopped sync no longer pulls. Only an owner on this core or newer whose Board sync is on (it has
++# a task_chat_links table) and running gives that answer. Without it the link waits here: no answer yet (a queued
++# request, whose owner_written would only be the expected outcome, not a fact, so it is never claimed), an owner on
++# older core (it writes no link), an owner with its sync off, or a ``local-<sha256>`` chat it does not link.
+ # kanban_tools builds its placed-create notes from these fragments, so the rewrites below always find them. The
+ # queued note is CHAT_TASKS_HEAD + CHAT_TASKS_SEP; the rewrites insert after the exact head, whatever the separator.
+ CHAT_TASKS_SHOWS = " and shows in this chat's tasks"
+@@ -33,11 +37,10 @@ def _placed_for_this_chat(payload: dict) -> bool:
+ 
+ 
+ def _owner_links(payload: dict) -> bool:
+-    """False for a receipt-shaped chat id (``local-<sha256>``): the owner cannot tell it from a worker's own hash,
+-    so it writes no link (``_link_origin``) and the link still waits for this gateway's ledger reconcile."""
+-    from hermes_cli.kanban_session_provenance import _HEADLESS_SESSION
+-    session = str(payload["placed"]["origin_session"]).rsplit("/", 1)[-1]
+-    return not _HEADLESS_SESSION.fullmatch(session)
++    """True only when the owner itself said it wrote this chat's link (``placed.chat_link``). The chat id's shape
++    cannot decide it: the owner writes one for a ``local-<sha256>`` chat an ancestor's ``created`` link proves
++    (``proven_foreign_chats``), and none at all on older core or with its Board sync off."""
++    return payload["placed"].get("chat_link") == OWNER_WRITTEN
+ 
+ 
+ def _chat_link_queued(payload: dict, board_sync: str) -> None:
+@@ -70,9 +73,9 @@ def _chat_link_by_owner(payload: dict) -> None:
+ def annotate(board: Callable[..., Any], tool_name: str, args: dict, out: str) -> str:
+     """``out`` plus ``board_delivery: queued_local`` when the write stayed local; a comment on a card another
+     gateway runs loses its live-run ``delivery`` promise, and a create placed elsewhere for this chat says its link
+-    is on the Board but this gateway's copy of it may lag (``chat_link: owner_written``), or, for a ``local-<sha256>``
+-    chat the owner writes no link for, that the link waits here (``chat_link: queued_local``). Unchanged while the
+-    sync runs (or on any read error)."""
++    is on the Board but this gateway's copy of it may lag (``chat_link: owner_written``) when the owner answered that
++    it wrote that link, else that the link waits here (``chat_link: queued_local``). Unchanged while the sync runs
++    (or on any read error)."""
+     if (tool_name not in BOARD_WRITE_TOOLS and tool_name != "kanban_create") or not out.startswith('{"ok": true'):
+         return out
+     from hermes_cli import kanban_sync_runstate as runstate
+@@ -91,7 +94,7 @@ def annotate(board: Callable[..., Any], tool_name: str, args: dict, out: str) ->
+         return out
+     if not note:
+         return out
+-    if tool_name == "kanban_create":  # the card is on the Board; its owner writes this chat's link unless headless
++    if tool_name == "kanban_create":  # the card is on the Board; its link is too only if the owner says it wrote it
+         if _owner_links(payload):
+             _chat_link_by_owner(payload)
+         else:
+-- 
+2.51.0
+

@@ -1,0 +1,300 @@
+From c5ef3852a3e0a83777ddface25b878cb5ea3e0f6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:43:46 +0000
+Subject: [PATCH] [daveey] fix(kanban): scratch archive at gzip level 1; uv's
+ empty .git marker is data
+
+Worker reclaim stalls on two things in hermes_cli/kanban_scratch_archive.py.
+
+1. Codec speed. `_write_payload` used GzipFile's default level 9. Archive time
+   is the reclaim bottleneck (a 347 MB tree ate most of a 240 s pass). The
+   payload now writes at an explicit `_GZIP_LEVEL = 1`. The stream is still
+   gzip, so `verify_complete_archive` ("r:gz") reads new and existing level-9
+   archives through the same path.
+
+2. uv cache `.git` marker. `find_repos` refused ANY non-directory `.git` as a
+   "linked worktree or submodule (left to the worktree GC)". uv writes an EMPTY
+   regular `.git` file (plus `.gitignore`) in each cache dir, e.g.
+   `test-home/.cache/uv/sdists-v10/.git`, and no GC looks inside kanban scratch
+   workspaces, so those trees were never reclaimed. A regular `.git` file whose
+   content (leading whitespace stripped) does not start with `gitdir:` is now
+   plain data, archived in the payload like any other file. A `gitdir:` file
+   and a `.git` symlink are still refused. The file is read through a
+   no-follow descriptor checked against the scanned lstat, and the judged
+   marker's signature must equal the payload snapshot's, so a marker rewritten
+   into a gitlink between the judgement and the payload scan is refused.
+
+Ownership decision (card t_01a1d49d20e38ed9): core's scratch archive owns these
+trees, because nothing else can reclaim them.
+
+Proof (worker-1, warm cache, load 5-17):
+- `_write_payload` on the real 547 MB tree t_01a1cdcb2d5f04cd: level 9 59.8 s /
+  180.2 MB (61.4 s on a rerun), level 6 18.6 s / 181.6 MB, level 3 11.9 s /
+  194.6 MB, level 1 8.3 s / 205.2 MB; verify 3.4-3.6 s at every level. Level 1
+  frees (547-205)/8.3 = 41 MB/s of disk vs 20 MB/s at level 6 and 6 MB/s at 9.
+- End to end `archive_workspace` on the real 613 MB tree t_01a1d43e37a68fc7
+  (done card, uv markers under home/.cache/uv and home/.hermes/cache/uv):
+  origin/main REFUSED in 0.2 s ("linked worktree or submodule at
+  .../uv/sdists-v10/.git"); its level-9 payload alone would take 64.8 s
+  (163.4 MB). This branch archives it in 13.9 s (190.3 MB payload, verified,
+  fsynced).
+- New tests in tests/hermes_cli/test_kanban_scratch_gc_archive.py: RED on
+  origin/main (5 failures), GREEN here (63 passed). Mutants killed: no marker
+  re-check, no fstat identity check, no lstrip, no S_ISREG guard, level 6, no
+  compresslevel argument, every file a gitlink.
+- test_kanban_scratch_{custody,owned_jobs,gc,git_preservation,preservation}.py:
+  191 passed.
+---
+ hermes_cli/kanban_scratch_archive.py          |  68 +++++++++--
+ .../test_kanban_scratch_gc_archive.py         | 111 ++++++++++++++++++
+ 2 files changed, 171 insertions(+), 8 deletions(-)
+
+diff --git a/hermes_cli/kanban_scratch_archive.py b/hermes_cli/kanban_scratch_archive.py
+index f68958eb7d..7d17657650 100644
+--- a/hermes_cli/kanban_scratch_archive.py
++++ b/hermes_cli/kanban_scratch_archive.py
+@@ -24,7 +24,9 @@ alone. That directory name is reserved: a workspace entry with that name is
+ refused so the metadata can never collide with archived content.
+ 
+ Anything it cannot prove safe keeps the workspace: a linked worktree or
+-submodule (a ``.git`` FILE: the worktree GC owns those), a bare repository,
++submodule (a ``.git`` gitlink file or symlink: the worktree GC owns those; a
++regular ``.git`` file with no ``gitdir:`` line, such as uv's empty cache
++marker, is plain data), a bare repository,
+ a special file (fifo/socket/device), any scan error, source mutation during
+ the archive, or any failed archive step. Symlinks are recorded, never
+ followed.
+@@ -58,9 +60,46 @@ def find_repos(root: Path) -> list[Path]:
+ 
+     Raises :class:`ArchiveRefused` for a linked worktree/submodule, a bare
+     repository, a non-directory root, or any scan error. Traverses by directory
+-    descriptor (never follows symlinks, ancestors included).
++    descriptor (never follows symlinks, ancestors included). A regular ``.git``
++    file that is not a ``gitdir:`` pointer (uv writes an empty one in each cache
++    dir) is plain data, archived in the payload like any other file.
++    """
++    return _find_repos(root)[0]
++
++
++_GITLINK_PREFIX = b"gitdir:"
++_GITLINK_PROBE = 4096
++
++
++def _is_gitlink(directory: Path, st: os.stat_result) -> bool:
++    """True unless the regular file ``directory/.git`` (lstat *st*) is provably not a gitlink.
++
++    Opened without following links and checked against the scanned lstat, so
++    the bytes read belong to the entry the scan recorded. Git only accepts a
++    file starting ``gitdir: ``; leading whitespace is tolerated here too, so the
++    rule errs towards keeping the tree.
++    """
++    dfd = _open_root(directory)
++    try:
++        fd = os.open(".git", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
++    finally:
++        os.close(dfd)
++    with os.fdopen(fd, "rb") as fh:
++        fst = os.fstat(fh.fileno())
++        if not stat.S_ISREG(fst.st_mode) or _signature(fst) != _signature(st):
++            raise ArchiveRefused(f"{directory / '.git'} changed during scan")
++        head = fh.read(_GITLINK_PROBE)
++    return head.lstrip().startswith(_GITLINK_PREFIX)
++
++
++def _find_repos(root: Path) -> tuple[list[Path], dict[str, list[int]]]:
++    """``find_repos`` plus the signatures of the ``.git`` data files it judged.
++
++    The caller re-checks those signatures against the payload snapshot, so a
++    marker rewritten into a gitlink after this judgement is refused.
+     """
+     found = _scan(root)
++    markers: dict[str, list[int]] = {}
+     kids: dict[str, set[str]] = {".": set()}
+     for rel, st in found.items():
+         if rel == ".":
+@@ -76,13 +115,20 @@ def find_repos(root: Path) -> list[Path]:
+         directory = root if rel == "." else root / rel
+         if ".git" in names:
+             gitrel = ".git" if rel == "." else f"{rel}/.git"
+-            if stat.S_ISDIR(found[gitrel].st_mode):
++            gst = found[gitrel]
++            if stat.S_ISDIR(gst.st_mode):
+                 repos.append(directory)
+                 continue
+-            raise ArchiveRefused(f"linked worktree or submodule at {directory / '.git'} (left to the worktree GC)")
++            try:
++                gitlink = not stat.S_ISREG(gst.st_mode) or _is_gitlink(directory, gst)
++            except OSError as exc:
++                raise ArchiveRefused(f"scan uncertain: {exc!r}") from exc
++            if gitlink:
++                raise ArchiveRefused(f"linked worktree or submodule at {directory / '.git'} (left to the worktree GC)")
++            markers[gitrel] = _signature(gst)  # plain data (e.g. uv's empty cache marker)
+         if {"HEAD", "objects"} <= names and names & {"refs", "reftable"}:
+             raise ArchiveRefused(f"bare repository at {directory}")
+-    return sorted(repos)
++    return sorted(repos), markers
+ 
+ 
+ def _env(repo: Path) -> dict[str, str]:
+@@ -162,6 +208,7 @@ PAYLOAD_DIR = ".hermes-complete-archive-v1"
+ PAYLOAD_VERSION = 1
+ _TREE = "tree.tar.gz"
+ _MANIFEST = "manifest.json"
++_GZIP_LEVEL = 1
+ 
+ 
+ def _kind(mode: int) -> str:
+@@ -327,8 +374,11 @@ def _write_payload(workspace: Path, dest: Path) -> dict[str, list[int]]:
+     entries: dict[str, dict] = {}
+     tree = dest / _TREE
+     with open(tree, "wb") as raw:
+-        # mtime=0 keeps the gzip header deterministic.
+-        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz:
++        # mtime=0 keeps the gzip header deterministic. Level 1, not the default 9:
++        # archive time bounds reclaim throughput, and on a real 547 MB worker tree
++        # level 9 took 59.8 s (180.2 MB), level 6 18.6 s (181.6 MB), level 1 8.3 s
++        # (205.2 MB). Any level reads back through the same "r:gz" path.
++        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0, compresslevel=_GZIP_LEVEL) as gz:
+             with tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tar:
+                 before = _scan(workspace, tar, entries)
+     manifest = {
+@@ -509,7 +559,7 @@ def archive_workspace(workspace: Path, archive_dir: Path, *, task_id: str,
+     no half archive that looks complete. Raises :class:`ArchiveRefused` (or
+     ``OSError``) on any failure; the caller then keeps the workspace.
+     """
+-    repos = find_repos(workspace)
++    repos, markers = _find_repos(workspace)
+     try:
+         reserved = os.path.lexists(workspace / PAYLOAD_DIR)
+     except OSError as exc:
+@@ -528,6 +578,8 @@ def archive_workspace(workspace: Path, archive_dir: Path, *, task_id: str,
+         payload.mkdir()
+         # Last, so nothing (including git's own index refresh) mutates the tree after the scan.
+         snapshot = _write_payload(workspace, payload)
++        if any(snapshot.get(rel) != sig for rel, sig in markers.items()):
++            raise ArchiveRefused("a .git data file changed after it was judged not a gitlink")
+         verify_complete_archive(partial)
+         _fsync_tree(partial)  # payload, manifest, repo bundles and all directories, before publication
+         final = archive_dir
+diff --git a/tests/hermes_cli/test_kanban_scratch_gc_archive.py b/tests/hermes_cli/test_kanban_scratch_gc_archive.py
+index be72d45f1e..2056078a9b 100644
+--- a/tests/hermes_cli/test_kanban_scratch_gc_archive.py
++++ b/tests/hermes_cli/test_kanban_scratch_gc_archive.py
+@@ -831,3 +831,114 @@ def test_null_or_tilde_row_path_is_archived_and_repeat_gc_is_idempotent(board, m
+     assert [k for k, _ in _events(tid)].count("workspace_archived") == 1
+     assert _gc() == 0
+     assert [k for k, _ in _events(tid)].count("workspace_archived") == 1
++
++
++# ---- reclaim throughput: uv's .git cache marker is data; fast gzip level ---------------------------
++
++
++def _uv_cache(p, marker=b""):
++    cache = p / "test-home" / ".cache" / "uv" / "sdists-v10"
++    cache.mkdir(parents=True)
++    (cache / ".git").write_bytes(marker)
++    (cache / ".gitignore").write_text("*\n")
++    (cache / "pkg.tar.gz").write_bytes(b"\x1f\x8bsdist")
++    return cache
++
++
++@pytest.mark.parametrize("marker", [b"", b"not a pointer\n"], ids=["empty", "no_gitdir_line"])
++def test_uv_git_marker_file_is_archived_as_data_and_round_trips(board, tmp_path, marker):
++    from hermes_cli import kanban_scratch_archive as sa
++
++    tid, path = _plain_task(lambda p: _uv_cache(p, marker))
++    assert sa.find_repos(path) == []
++    assert _gc() == 0
++    assert not path.exists()
++    rel = "test-home/.cache/uv/sdists-v10"
++    m = _members(tid)
++    assert m[f"{rel}/.git"][0].isfile() and m[f"{rel}/.git"][1] == marker
++    sa.verify_complete_archive(_archive(tid))
++    out = tmp_path / "restored"
++    with tarfile.open(_archive(tid) / PAYLOAD / "tree.tar.gz", "r:gz") as tar:
++        tar.extractall(out, filter="tar")
++    assert (out / rel / ".git").read_bytes() == marker
++    assert (out / rel / ".gitignore").read_text() == "*\n"
++    assert (out / rel / "pkg.tar.gz").read_bytes() == b"\x1f\x8bsdist"
++
++
++@pytest.mark.parametrize("pointer", [b"gitdir: /src/repo/.git/worktrees/wt\n", b"  gitdir:/src/repo/.git/modules/m"],
++                         ids=["worktree", "leading_space"])
++def test_gitdir_pointer_file_is_still_refused(board, pointer):
++    from hermes_cli import kanban_scratch_archive as sa
++
++    tid, path = _plain_task(lambda p: _uv_cache(p, pointer))
++    with pytest.raises(sa.ArchiveRefused, match="linked worktree or submodule"):
++        sa.find_repos(path)
++    assert _gc() == 0
++    assert (path / "test-home" / ".cache" / "uv" / "sdists-v10" / ".git").read_bytes() == pointer
++    assert not _archive(tid).exists()
++
++
++def test_git_symlink_is_still_refused_without_reading_its_target(board):
++    from hermes_cli import kanban_scratch_archive as sa
++
++    def build(p):
++        (p / "empty-target").write_bytes(b"")
++        (p / "sub").mkdir()
++        (p / "sub" / ".git").symlink_to("../empty-target")
++
++    _tid, path = _plain_task(build)
++    with pytest.raises(sa.ArchiveRefused, match="linked worktree or submodule"):
++        sa.find_repos(path)
++    assert _gc() == 0 and (path / "sub" / ".git").is_symlink()
++
++
++def test_marker_judged_against_its_scanned_stat(board):
++    from hermes_cli import kanban_scratch_archive as sa
++
++    _tid, path = _plain_task(lambda p: _uv_cache(p))
++    cache = path / "test-home" / ".cache" / "uv" / "sdists-v10"
++    stale = (cache / ".git").lstat()
++    assert sa._is_gitlink(cache, stale) is False
++    (cache / ".git").write_bytes(b"gitdir: /elsewhere\n")
++    with pytest.raises(sa.ArchiveRefused, match="changed during scan"):
++        sa._is_gitlink(cache, stale)
++
++
++def test_marker_rewritten_into_gitlink_after_judgement_keeps_workspace(board, monkeypatch):
++    from hermes_cli import kanban_scratch_archive as sa
++
++    tid, path = _plain_task(lambda p: _uv_cache(p))
++    marker = path / "test-home" / ".cache" / "uv" / "sdists-v10" / ".git"
++    real = sa._write_payload
++
++    def racing(workspace, dest):
++        marker.write_bytes(b"gitdir: /src/repo/.git/worktrees/wt\n")
++        return real(workspace, dest)
++
++    monkeypatch.setattr(sa, "_write_payload", racing)
++    assert _gc() == 0
++    assert marker.read_bytes().startswith(b"gitdir:")
++    parent = _archive(tid).parent
++    assert not parent.exists() or list(parent.iterdir()) == []
++
++
++def test_payload_uses_fast_gzip_level_and_old_level_9_archives_still_verify(board, monkeypatch, tmp_path):
++    from hermes_cli import kanban_scratch_archive as sa
++
++    assert sa._GZIP_LEVEL == 1
++    tid, _path = _plain_task(lambda p: (p / "big.txt").write_text("compressible line\n" * 5000))
++    assert _gc() == 0
++    tree = _archive(tid) / PAYLOAD / "tree.tar.gz"
++    header = tree.read_bytes()[:10]
++    assert header[:2] == b"\x1f\x8b" and header[8] == 4  # XFL 4: fastest compression
++    assert _members(tid)["big.txt"][1] == b"compressible line\n" * 5000
++    sa.verify_complete_archive(_archive(tid))
++
++    # An archive written before this change (default level 9) reads back unchanged.
++    source = tmp_path / "legacy-src"
++    source.mkdir()
++    (source / "f.txt").write_text("legacy\n" * 1000)
++    monkeypatch.setattr(sa, "_GZIP_LEVEL", 9)
++    legacy = sa.archive_workspace(source, tmp_path / "legacy-archive", task_id="t", completed_at=OLD)
++    assert (legacy / PAYLOAD / "tree.tar.gz").read_bytes()[8] == 2  # XFL 2: maximum compression
++    sa.verify_complete_archive(legacy)
+-- 
+2.51.0
+

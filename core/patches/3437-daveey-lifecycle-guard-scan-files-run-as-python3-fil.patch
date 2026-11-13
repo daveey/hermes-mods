@@ -1,0 +1,432 @@
+From aa493de868a4af3c57931ab8fba9145a5667cbb1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:26:19 +0000
+Subject: [PATCH] [daveey] lifecycle guard: scan files run as `python3 <file>`
+
+The referenced-script walk followed `/path/runner` and `bash <path>` but not an
+interpreter run, so a runner with an appended gateway lifecycle line was refused
+as `<path>` and allowed as `python3 <path>` (also `python`, `python3 -u`,
+`/usr/bin/env python3`, and sudo/timeout/env wrappers).
+
+Interpreter-run files are now scanned like a `.py` cron script in
+check_gateway_lifecycle: the lifecycle regex with data-sink masking, never the
+shell reference walk (a false-positive generator on Python sources, #77131).
+CPython argv is read like getopt: -c/-m/- run no file; -W/-X take a value.
+An unreadable or oversized interpreter-run file is not a refusal (it ran before
+this scan existed); only a lifecycle command found in it blocks. The scan is
+charged to the walk budget, and a shell walk of a file subsumes its Python scan.
+
+Proof:
+- RED on origin/main: 25 of the new file's tests fail (every interpreter-run
+  refusal case); GREEN after rebase onto 05a174a360: 14 lifecycle-guard and
+  terminal-guard files, 699 passed.
+- Mutants: 23/24 killed by exact-anchor mutation; the survivor (dropping
+  `if operand is not None`) is equivalent: _expand_candidate_path(None) returns
+  None.
+- Replay (match-more): all terminal commands in the hub's state.db (102,879
+  unique command+workdir pairs, read-only via hub-read), 20,274 with a python
+  interpreter operand; files missing on the worker read from the hub. Old vs new
+  verdicts differ on 2 commands, both `python3 ~/.hermes/bin/gateway-idle-restart
+  ...` (the helper that restarts the gateway), which old and new already refuse
+  when run as `~/.hermes/bin/gateway-idle-restart ...` or `bash <it>`. 0 changed
+  allow->refuse otherwise; 0 refuse->allow.
+---
+ cron/lifecycle_guard.py                       |  97 +++++++-
+ ...test_lifecycle_guard_python_interpreter.py | 220 ++++++++++++++++++
+ 2 files changed, 308 insertions(+), 9 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_python_interpreter.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 35fe507307..5f438e0d98 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -1111,6 +1111,61 @@ def _iter_referenced_shell_scripts(
+             yield from _references_at(segment, peeled, cwd)
+ 
+ 
++# CPython short options that take a value (glued `-Wignore` or the next token), and the ones after
++# which no script FILE runs (`-c` inline code, `-m` module).
++_PYTHON_VALUE_SHORT_OPTIONS = frozenset("WX")
++_PYTHON_NO_SCRIPT_SHORT_OPTIONS = frozenset("cm")
++_PYTHON_VALUE_LONG_OPTIONS = frozenset({"--check-hash-based-pycs"})
++
++
++def _python_script_operand(arguments: list[str]) -> Optional[str]:
++    """The script file a CPython argv tail runs; ``None`` for ``-c``/``-m``/``-`` (stdin) or no
++    operand. Short-option clusters are read like CPython's getopt (`-uc code` is ``-u -c``)."""
++    index = 0
++    while index < len(arguments):
++        argument = arguments[index]
++        if argument == "--":
++            index += 1
++            break
++        if argument == "-" or not argument.startswith("-"):
++            break
++        if argument.startswith("--"):
++            index += 2 if argument in _PYTHON_VALUE_LONG_OPTIONS else 1
++            continue
++        for position, flag in enumerate(argument[1:], start=1):
++            if flag in _PYTHON_NO_SCRIPT_SHORT_OPTIONS:
++                return None
++            if flag in _PYTHON_VALUE_SHORT_OPTIONS:
++                if position == len(argument) - 1:
++                    index += 1  # the value is the next token
++                break
++        index += 1
++    if index < len(arguments) and arguments[index] != "-":
++        return arguments[index]
++    return None
++
++
++def _iter_python_interpreter_scripts(command: str, *, cwd: Optional[str] = None) -> Iterator[Path]:
++    """Yield files a segment runs as ``python3 [options] <file>`` (also behind wrappers:
++    ``/usr/bin/env python3 <file>``). An interpreter is never itself a wrapper, so only the
++    executed command is read."""
++    for segment in _iter_command_segments(command):
++        index = _executed_command_index(segment)
++        if index is None or not _INTERPRETER_IMAGE_RE.match(_executable_name(segment[index]).lower()):
++            continue
++        operand = _python_script_operand(segment[index + 1 :])
++        if operand is not None:
++            yield from _resolved_or_nothing(operand, cwd)
++
++
++def _python_source_is_unsafe(text: str, budget: _LifecycleScanBudget) -> bool:
++    """Scan an interpreter-run Python file the way ``check_gateway_lifecycle`` scans a ``.py`` cron
++    script: the lifecycle regex with data-sink masking, never the shell reference walk (a
++    false-positive generator on Python sources, #77131). The masker tokenizes, so charge first;
++    text over the budget is not scanned and not refused (see ``_walk_candidates``)."""
++    return budget.charge_text(text) and _lifecycle_command_scan_with_data_exemption(text)
++
++
+ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
+     """Yield code passed through ``sh|bash|... -c`` (and ``su -c`` / ``env -S``) for recursive
+     scanning."""
+@@ -1272,8 +1327,9 @@ def _read_script_for_scanning(script_path: str) -> tuple[str, Optional[str]]:
+ def _walk_candidates(
+     command: str, walk_command: str, *, cwd: Optional[str], executed: bool,
+     budget: _LifecycleScanBudget,
+-) -> Iterator[tuple[Path, bool]]:
+-    """``(path, executed)`` for every path *command* references, executed candidates first.
++) -> Iterator[tuple[Path, bool, bool]]:
++    """``(path, executed, python_source)`` for every path *command* references, executed
++    candidates first.
+ 
+     Paths named only inside a masked body are still READ: an interpreter body that hands
+     `/x/restart.sh` to os.system() executes it. Only the fail-closed verdicts (cloud placeholder,
+@@ -1284,6 +1340,11 @@ def _walk_candidates(
+     unless an alias may turn its `NAME (` into a subshell (`alias T=' '; T ( bash big.sh )`). That
+     is decided lazily, when the entry is reached: the executed candidates before it (a sourced
+     script may define the alias) have been walked by then.
++
++    A file run as ``python3 <file>`` (masked or not) comes last, as ``python_source``: regex-scanned
++    only, never walked as shell, and never failed closed. A file the scan cannot read (oversized, a
++    stream such as ``/dev/stdin``, a device) ran before this scan existed, so only a lifecycle
++    command actually found in it blocks.
+     """
+     entries = [
+         (path, executed, False) for path in _iter_referenced_shell_scripts(walk_command, cwd=cwd)
+@@ -1300,11 +1361,25 @@ def _walk_candidates(
+                 command, cwd=cwd, call_arguments=call_arguments)
+         ]
+     for path, candidate_executed, call_argument in entries:
+-        yield path, candidate_executed and (budget.aliases_possible or not call_argument)
++        yield path, candidate_executed and (budget.aliases_possible or not call_argument), False
++    # Python candidates are never executed (fail-closed) entries, so the unmasked text, a superset
++    # of the masked view, finds them all.
++    for path in _iter_python_interpreter_scripts(command, cwd=cwd):
++        yield path, False, True
++
++
++def _visit_key(resolved: Path, *, python_source: bool) -> object:
++    """A shell walk of a file subsumes its Python regex scan, never the reverse, so the two are
++    keyed apart in ``visited``."""
++    return (resolved, "python") if python_source else resolved
++
++
++def _already_visited(visited: set[object], resolved: Path, *, python_source: bool) -> bool:
++    return resolved in visited or _visit_key(resolved, python_source=python_source) in visited
+ 
+ 
+ def _contains_unsafe_gateway_action(
+-    command: str, *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
++    command: str, *, cwd: Optional[str], depth: int, visited: set[object], budget: _LifecycleScanBudget,
+     read_remote_script: Optional[_ReadRemoteScriptFn] = None, executed: bool = True,
+     source: Optional[str] = None,
+ ) -> bool:
+@@ -1321,7 +1396,11 @@ def _contains_unsafe_gateway_action(
+     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
+         return _depth_limit_reached(budget, depth, executed=executed)
+ 
+-    def recurse(text: str, cwd: Optional[str], executed: bool, source: Optional[str]) -> bool:
++    def recurse(
++        text: str, cwd: Optional[str], executed: bool, source: Optional[str], python_source: bool = False,
++    ) -> bool:
++        if python_source:
++            return _python_source_is_unsafe(text, budget)
+         return _contains_unsafe_gateway_action(
+             text, cwd=cwd, depth=depth + 1, visited=visited, budget=budget,
+             read_remote_script=read_remote_script, executed=executed, source=source,
+@@ -1340,7 +1419,7 @@ def _contains_unsafe_gateway_action(
+         if recurse(payload, cwd, executed, source):
+             return True
+ 
+-    for script_path, candidate_executed in _walk_candidates(
++    for script_path, candidate_executed, python_source in _walk_candidates(
+             command, walk_command, cwd=cwd, executed=executed, budget=budget):
+         # Do not touch a FileProvider path even to discover whether the file is hydrated.
+         if _on_cloud_path(script_path):
+@@ -1352,13 +1431,13 @@ def _contains_unsafe_gateway_action(
+                 )
+             continue
+         resolved = _resolve_lenient(script_path)
+-        if resolved in visited:
++        if _already_visited(visited, resolved, python_source=python_source):
+             continue
+         if not budget.charge_path():
+             if candidate_executed:
+                 return _budget_exhausted(budget, "paths", depth)
+             continue  # an alias may make a later call-argument entry executed
+-        visited.add(resolved)
++        visited.add(_visit_key(resolved, python_source=python_source))
+         # Never read more than the walk can still afford to tokenize; a file larger than the
+         # remainder fails closed exactly like an oversized one.
+         script_text, unsafe = _read_referenced_script(script_path, max_bytes=budget.bytes_remaining)
+@@ -1389,7 +1468,7 @@ def _contains_unsafe_gateway_action(
+         # Relative references inside a script resolve against that script's directory, not the cwd.
+         if recurse(
+             script_text, _resolve_script_directory(str(resolved)) or cwd, candidate_executed,
+-            f"`{script_path}`",
++            f"`{script_path}`", python_source,
+         ):
+             return True
+     return False
+diff --git a/tests/cron/test_lifecycle_guard_python_interpreter.py b/tests/cron/test_lifecycle_guard_python_interpreter.py
+new file mode 100644
+index 0000000000..586fa2330c
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_python_interpreter.py
+@@ -0,0 +1,220 @@
++"""``python3 <file>`` runs the file, so the guard scans it (regex + data masking, no shell walk).
++
++The referenced-script walk followed ``<file>`` and ``bash <file>`` but not an interpreter run, so a
++runner with an appended lifecycle line was refused as ``/path/runner`` and allowed as
++``python3 /path/runner``. Interpreter-run files are scanned like a ``.py`` cron script in
++``check_gateway_lifecycle``: the regex with data-sink masking, never the shell reference walk,
++which is a false-positive generator on Python sources (#77131).
++"""
++
++from __future__ import annotations
++
++import os
++import shlex
++from pathlib import Path
++
++import pytest
++
++from cron import lifecycle_guard
++from cron.lifecycle_guard import scan_gateway_lifecycle
++
++# Assembled so this file's own text never carries the literal command.
++LIFECYCLE = " ".join(["hermes", "gateway", "re" + "start"])
++
++
++def _write(path: Path, text: str) -> Path:
++    path.write_text(text, encoding="utf-8")
++    return path
++
++
++@pytest.fixture
++def runner(tmp_path) -> str:
++    """A Python runner with an appended lifecycle line (shell-quoted path)."""
++    path = _write(tmp_path / "runner.py", f"import os\nprint(1)\nos.system({LIFECYCLE!r})\n")
++    return shlex.quote(str(path))
++
++
++@pytest.mark.parametrize(
++    "template",
++    [
++        "python3 {p}",
++        "python {p}",
++        "python3.12 {p} --flag value",
++        "Python3 {p}",
++        "/usr/bin/python3 {p}",
++        "python3 -u {p}",
++        "python3 -uB {p}",
++        "python3 -W ignore {p}",
++        "python3 -Wignore {p}",
++        "python3 -X dev {p}",
++        "python3 -uX dev {p}",
++        "python3 -Ximportprofile {p}",
++        "python3 --check-hash-based-pycs never {p}",
++        "python3 -I --verbose {p}",
++        "python3 -- {p}",
++        "/usr/bin/env python3 {p}",
++        "env FOO=1 python3 {p}",
++        "sudo -u root python3 -u {p}",
++        "timeout 60 python3 {p}",
++        "cd /tmp && python3 {p} arg",
++    ],
++)
++def test_interpreter_run_file_with_lifecycle_command_is_refused(runner, template):
++    assert scan_gateway_lifecycle(template.format(p=runner)) == (True, None)
++
++
++@pytest.mark.parametrize(
++    "template",
++    [
++        "python3 -c 'print(1)' {p}",
++        "python3 -uc 'print(1)' {p}",
++        "python3 -cprint {p}",
++        "python3 -m http.server {p}",
++        "python3 -mhttp.server {p}",
++        "python3 - {p}",
++        "python3 -- - {p}",
++        "pythonista {p}",
++        "echo python3 {p}",
++    ],
++)
++def test_non_file_interpreter_runs_do_not_read_the_operand(runner, template):
++    """``-c``/``-m``/stdin run no file: the trailing operand is an argument, not code."""
++    assert scan_gateway_lifecycle(template.format(p=runner)) == (False, None)
++
++
++def test_bare_wrapper_has_no_interpreter_operand():
++    assert list(lifecycle_guard._iter_python_interpreter_scripts("env")) == []
++    assert list(lifecycle_guard._iter_python_interpreter_scripts("python3")) == []
++    assert list(lifecycle_guard._iter_python_interpreter_scripts("python3 -u")) == []
++
++
++def test_operand_after_double_dash_is_the_script_even_if_dashed(tmp_path):
++    _write(tmp_path / "-r.py", f"import os\nos.system({LIFECYCLE!r})\n")
++    assert scan_gateway_lifecycle("python3 -- -r.py", cwd=str(tmp_path)) == (True, None)
++
++
++def test_dash_operand_is_stdin_not_a_file_named_dash(tmp_path):
++    _write(tmp_path / "-", f"{LIFECYCLE}\n")
++    assert scan_gateway_lifecycle("python3 - < /dev/null", cwd=str(tmp_path)) == (False, None)
++    assert scan_gateway_lifecycle("python3 -- - < /dev/null", cwd=str(tmp_path)) == (False, None)
++
++
++@pytest.mark.parametrize(
++    "command",
++    [
++        "python3 /dev/stdin <<'EOF'\nprint(1)\nEOF",
++        "token-broker scopes | python3 /dev/stdin",
++        "PYTHONPATH=/x python3 /dev/null",
++    ],
++)
++def test_stream_operand_is_not_a_script_file(command):
++    """Seen in replayed hub commands: a stream is not a file to scan, and must not fail closed."""
++    assert scan_gateway_lifecycle(command) == (False, None)
++
++
++def test_fifo_operand_is_skipped_without_opening(tmp_path):
++    fifo = tmp_path / "pipe"
++    os.mkfifo(fifo)  # opening it would block until a writer appears
++    assert scan_gateway_lifecycle(f"python3 {shlex.quote(str(fifo))}") == (False, None)
++
++
++def test_shell_run_of_a_device_still_fails_closed():
++    """Only the interpreter-run branch treats a stream as nothing to scan."""
++    unsafe, refusal = scan_gateway_lifecycle("bash /dev/null")
++    assert unsafe is True and refusal is not None
++
++
++def test_python_source_is_not_shell_walked(tmp_path):
++    """A path named in Python source is not a shell invocation (#77131): no walk into it."""
++    helper = _write(tmp_path / "restart.sh", f"#!/bin/sh\n{LIFECYCLE}\n")
++    source = _write(
++        tmp_path / "job.py",
++        f"from pathlib import Path\nroot = Path('/') / 'tmp'\n'{helper}'\n",
++    )
++    assert scan_gateway_lifecycle(f"python3 {shlex.quote(str(source))}") == (False, None)
++    # The same file run as a shell script is walked into the helper.
++    assert scan_gateway_lifecycle(f"bash {shlex.quote(str(source))}")[0] is True
++
++
++def test_python_source_data_sink_mention_is_masked(tmp_path):
++    source = _write(
++        tmp_path / "audit.py",
++        f'"""Usage notes:\n    grep -c \'{LIFECYCLE}\' gateway.log\n"""\nprint(1)\n',
++    )
++    assert scan_gateway_lifecycle(f"python3 {shlex.quote(str(source))}") == (False, None)
++
++
++def test_unscannable_python_runner_is_allowed_not_refused(monkeypatch, tmp_path):
++    """Replayed hub commands ran `python3 ~/.hermes/sync-runner/hermes-sync` (17,882 lines, over the
++    walk caps). It ran before this scan existed: an unscannable file is nothing to scan, never a
++    refusal; only a lifecycle command actually found blocks."""
++    monkeypatch.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_LINES", 50)
++    source = _write(tmp_path / "big.py", "print(1)\n" * 60 + f"# {LIFECYCLE}\n")
++    assert scan_gateway_lifecycle(f"python3 {shlex.quote(str(source))}") == (False, None)
++    # The same file run directly is still walked and still fails closed.
++    unsafe, refusal = scan_gateway_lifecycle(f"bash {shlex.quote(str(source))}")
++    assert unsafe is True and refusal is not None and str(source) in refusal
++
++
++def test_python_scan_is_charged_against_the_walk_budget(monkeypatch, tmp_path):
++    """The masker tokenizes: a fitting Python file spends budget like any scanned text."""
++    monkeypatch.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_LINES", 30)
++    source = shlex.quote(str(_write(tmp_path / "mid.py", "print(1)\n" * 20)))
++    script = shlex.quote(str(_write(tmp_path / "s.sh", "echo ok\n" * 15)))
++    unsafe, refusal = scan_gateway_lifecycle(f"bash {script}; python3 {source}; bash {script}")
++    assert (unsafe, refusal) == (False, None)
++    nested = shlex.quote(str(_write(tmp_path / "n.sh", f"python3 {source}\n")))
++    unsafe, refusal = scan_gateway_lifecycle(f"bash {nested}; bash {script}")
++    assert unsafe is True and refusal is not None and "s.sh" in refusal
++
++
++def test_oversized_python_file_only_mentioned_in_inert_heredoc_is_allowed(monkeypatch, tmp_path):
++    monkeypatch.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_LINES", 50)
++    source = _write(tmp_path / "big.py", "print(1)\n" * 60)
++    command = f"python3 - <<'PY'\npython3 {source}\nPY"
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
++
++
++def test_python_file_only_mentioned_in_inert_heredoc_is_still_scanned(runner, tmp_path):
++    command = f"python3 - <<'PY'\npython3 {runner}\nPY"
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path))[0] is True
++
++
++def test_python_scan_does_not_hide_a_later_shell_walk_of_the_same_file(tmp_path):
++    """A Python regex scan finds nothing in the file itself; ``bash`` of it must still walk on."""
++    inner = _write(tmp_path / "inner.sh", f"#!/bin/sh\n{LIFECYCLE}\n")
++    outer = _write(tmp_path / "outer", f"#!/bin/sh\nbash {shlex.quote(str(inner))}\n")
++    quoted = shlex.quote(str(outer))
++    # The nested `python3 outer` is scanned (depth 1) before the top-level `bash outer` is walked.
++    first = _write(tmp_path / "first.sh", f"#!/bin/sh\npython3 {quoted}\n")
++    command = f"bash {shlex.quote(str(first))}; bash {quoted}"
++    assert scan_gateway_lifecycle(command)[0] is True
++
++
++def test_shell_walked_file_is_not_rescanned_as_python(tmp_path):
++    """A shell walk subsumes the Python scan of the same file: shell text read as Python would
++    lose the shell walk's data exemptions (a quoted heredoc fed to `cat` is printed, not run)."""
++    body = f"#!/bin/sh\ncat <<'EOF'\n{LIFECYCLE}\nEOF\n"
++    script = shlex.quote(str(_write(tmp_path / "ok.sh", body)))
++    assert scan_gateway_lifecycle(f"bash {script}") == (False, None)
++    assert scan_gateway_lifecycle(f"bash {script}; python3 {script}") == (False, None)
++
++
++def test_shell_walked_file_is_not_charged_again_as_python(monkeypatch, tmp_path):
++    """The Python rescan of an already-walked file would spend budget a later script needs."""
++    monkeypatch.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_LINES", 50)
++    script = shlex.quote(str(_write(tmp_path / "a.sh", "echo ok\n" * 20)))
++    outer = shlex.quote(str(_write(tmp_path / "outer.sh", f"bash {script}; python3 {script}\n")))
++    later = shlex.quote(str(_write(tmp_path / "later.sh", "echo ok\n" * 15)))
++    assert scan_gateway_lifecycle(f"bash {outer}; bash {later}") == (False, None)
++
++
++def test_remote_backend_python_file_is_scanned(tmp_path):
++    missing = tmp_path / "remote_only.py"
++
++    def read_remote(path: str):
++        return f"import os\nos.system({LIFECYCLE!r})\n" if path == str(missing) else None
++
++    assert scan_gateway_lifecycle(
++        f"python3 {shlex.quote(str(missing))}", read_remote_script=read_remote,
++    )[0] is True
+-- 
+2.51.0
+

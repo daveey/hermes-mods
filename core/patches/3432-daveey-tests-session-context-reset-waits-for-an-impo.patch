@@ -1,0 +1,193 @@
+From d4272c39801167d2b63a2d770bfaaf2aae9428df Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:44:10 +0000
+Subject: [PATCH] [daveey] tests: session-context reset waits for an import in
+ flight on another thread
+
+tests/hermes_state/test_storage_health_latch.py::test_readiness_probe_latches_a_file_that_is_not_a_database
+errored at setup on CI (run 43407551871, passed on retry):
+
+  AttributeError: partially initialized module 'gateway.session_context' has no
+  attribute 'reset_session_vars' (most likely due to a circular import)
+
+Not CPU starvation. Why:
+1. The autouse _reset_session_context_vars fixture read sys.modules directly and
+   called reset_session_vars() on whatever module object it found.
+2. sys.modules holds a module before its body has run while another thread is
+   importing it.
+3. Another thread was: the previous test latched the canonical state.db, and
+   note_storage_error -> schedule_incident starts a daemon "state-db-incident"
+   thread that imports gateway.status / hermes_cli.kanban_db (transitively
+   gateway.session_context) to file a Kanban incident card.
+4. That thread outlives the test, so the next test's setup races its imports.
+
+Fix:
+- tests/_fixtures/session_context_reset.py: when the module is in sys.modules,
+  get it via importlib.import_module, which waits on the module's import lock
+  until an in-flight import finishes. Covers any leaked thread, not just this one.
+- test_storage_health_latch.py: stub schedule_incident in the autouse fixture
+  (as test_storage_corruption_incident.py does), so these latch tests no longer
+  leak incident-reporter threads writing cards into a torn-down HERMES_HOME.
+
+Proof:
+- Deterministic repro: a meta_path loader holding gateway.session_context
+  mid-exec in the incident thread reproduced the exact CI error on main
+  (6 passed, 2 errors); with the fixture fix 8 passed.
+- New tests/test_conftest_session_context_reset.py holds a probe module's import
+  open on one thread and resets from another: red on the old fixture (the same
+  "partially initialized module" AttributeError), green with the fix.
+- Thread probe: after the fix no state-db-incident thread is alive at any setup
+  in test_storage_health_latch.py (before: 1, then 2).
+- scripts/run_tests.sh on the new test, test_storage_health_latch,
+  test_storage_corruption_incident, test_conftest_state_monkeypatch: 24 passed.
+---
+ tests/_fixtures/session_context_reset.py      | 17 +++-
+ .../hermes_state/test_storage_health_latch.py |  8 +-
+ tests/test_conftest_session_context_reset.py  | 80 +++++++++++++++++++
+ 3 files changed, 100 insertions(+), 5 deletions(-)
+ create mode 100644 tests/test_conftest_session_context_reset.py
+
+diff --git a/tests/_fixtures/session_context_reset.py b/tests/_fixtures/session_context_reset.py
+index 9401416f47..902b4f162c 100644
+--- a/tests/_fixtures/session_context_reset.py
++++ b/tests/_fixtures/session_context_reset.py
+@@ -11,7 +11,12 @@ that bound and cleared a session therefore made later files ignore their monkeyp
+ HERMES_SESSION_ID / HERMES_CRON_SESSION (test_kanban_provenance before test_cronjob_tools,
+ test_kanban_tools and test_completed_process_results). Resetting to "never bound here" makes any
+ file combination behave like a fresh process. A near no-op while the module is not imported.
++
++A daemon thread an earlier test left running (the state.db incident reporter, for one) can be
++importing the module right now: ``sys.modules`` then holds it before its body has run.
++``import_module`` waits on the module's import lock until that import finishes.
+ """
++import importlib
+ import sys
+ from typing import Any
+ 
+@@ -20,10 +25,14 @@ import pytest
+ _SESSION_CONTEXT_MODULE = "gateway.session_context"
+ 
+ 
+-@pytest.fixture(autouse=True)
+-def _reset_session_context_vars():
+-    mod: Any = sys.modules.get(_SESSION_CONTEXT_MODULE)
+-    if mod is not None:
++def reset_session_context(module_name: str = _SESSION_CONTEXT_MODULE) -> None:
++    if module_name in sys.modules:
++        mod: Any = importlib.import_module(module_name)
+         mod.reset_session_vars()
+         mod._session_context_engaged = False
++
++
++@pytest.fixture(autouse=True)
++def _reset_session_context_vars():
++    reset_session_context()
+     yield
+diff --git a/tests/hermes_state/test_storage_health_latch.py b/tests/hermes_state/test_storage_health_latch.py
+index e7d9f3c928..a8b813df40 100644
+--- a/tests/hermes_state/test_storage_health_latch.py
++++ b/tests/hermes_state/test_storage_health_latch.py
+@@ -22,7 +22,13 @@ from hermes_state_health import (
+ 
+ 
+ @pytest.fixture(autouse=True)
+-def _fresh_latch():
++def _fresh_latch(monkeypatch):
++    # Latching the canonical state.db starts a daemon thread that files a Kanban incident card
++    # (tests/hermes_state/test_storage_corruption_incident.py covers it). Here it would outlive
++    # the test and still be importing gateway/kanban modules during the next test's setup.
++    import hermes_state_corruption_incident
++
++    monkeypatch.setattr(hermes_state_corruption_incident, "schedule_incident", lambda *args: None)
+     reset_storage_state()
+     yield
+     reset_storage_state()
+diff --git a/tests/test_conftest_session_context_reset.py b/tests/test_conftest_session_context_reset.py
+new file mode 100644
+index 0000000000..043da42c82
+--- /dev/null
++++ b/tests/test_conftest_session_context_reset.py
+@@ -0,0 +1,80 @@
++"""The autouse session-context reset waits for an import another thread has in flight.
++
++A daemon thread a previous test started (the state.db incident reporter that a corruption latch
++schedules) can be importing ``gateway.session_context`` when the next test's setup runs. The
++reset read ``sys.modules`` directly, got the module before its body had run and failed setup with
++"partially initialized module ... has no attribute 'reset_session_vars'" (flaky
++tests/hermes_state/test_storage_health_latch.py on CI).
++"""
++if not __name__.startswith("tests."): raise ImportError("Use scripts/run_tests.sh; unittest discovery bypasses test isolation")  # unittest-discovery guard
++
++import importlib
++import sys
++import threading
++import types
++
++from tests._fixtures.session_context_reset import reset_session_context
++from tests.waiting import wait_until
++
++_PROBE = "_session_context_reset_probe"
++_GATE = "_session_context_reset_gate"
++
++_PROBE_SOURCE = f"""
++import {_GATE} as gate
++
++gate.entered.set()
++gate.release.wait(60)
++
++_session_context_engaged = True
++reset_calls = 0
++
++
++def reset_session_vars():
++    global reset_calls
++    reset_calls += 1
++"""
++
++
++def _inside_import_machinery(thread: threading.Thread) -> bool:
++    if thread.ident is None:
++        return False
++    frame = sys._current_frames().get(thread.ident)
++    while frame is not None:
++        if frame.f_code.co_filename.startswith("<frozen importlib._bootstrap"):
++            return True
++        frame = frame.f_back
++    return False
++
++
++def test_reset_waits_for_an_import_in_flight_on_another_thread(tmp_path, monkeypatch):
++    gate = types.SimpleNamespace(entered=threading.Event(), release=threading.Event())
++    monkeypatch.setitem(sys.modules, _GATE, gate)
++    monkeypatch.delitem(sys.modules, _PROBE, raising=False)
++    (tmp_path / f"{_PROBE}.py").write_text(_PROBE_SOURCE, encoding="utf-8")
++    monkeypatch.syspath_prepend(str(tmp_path))
++
++    errors: list[Exception] = []
++
++    def reset() -> None:
++        try:
++            reset_session_context(_PROBE)
++        except Exception as exc:  # health: allow BLE001 -- surfaced by the assertion below
++            errors.append(exc)
++
++    importer = threading.Thread(target=importlib.import_module, args=(_PROBE,), daemon=True)
++    resetter = threading.Thread(target=reset, daemon=True)
++    importer.start()
++    try:
++        assert gate.entered.wait(30), "probe import never started"
++        resetter.start()
++        wait_until(lambda: not resetter.is_alive() or _inside_import_machinery(resetter),
++                   timeout=30, what="reset to finish or wait on the in-flight import")
++    finally:
++        gate.release.set()
++    importer.join(30)
++    resetter.join(30)
++
++    assert errors == []
++    probe = sys.modules[_PROBE]
++    assert probe.reset_calls == 1
++    assert probe._session_context_engaged is False
+-- 
+2.51.0
+

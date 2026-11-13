@@ -1,0 +1,1337 @@
+From 24b6d105cee175fcc40d6a5cf7130621a84a7840 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:31:02 +0000
+Subject: [PATCH] [daveey] unloaded sweeper + producer admission: host pass
+ under host_loop_lease, per-process residual for live chats
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Design t_01a1d45d75851804 §2b (R1-R4), card t_01a1d471722af0cf. kanban_unloaded._loop was 14.9% of a steady hub
+serve's samples (10.1% of the gateway's) and producer_admission._loop 3.9%: every gateway, Desktop serve and
+dashboard process ran both host-wide sweeps.
+
+- kanban_unloaded: the loop holds lease 'kanban-unloaded' (role gateway > serve > dashboard from the process
+  kind). The holder runs the host pass (remote + local sweeps, delegation and guarantee for every chat,
+  notice_fanout.card_change_pass, killed-subagent retry over every profile store) and beat()s; every other
+  process runs a residual pass, delegation_unloaded.sweep_once(only=live) and guarantee_pass(only=live), for the
+  chats it holds itself (those return skipped:held from any other process).
+- Wake capacity: the holder gets 8 slots per pass kind (HERMES_KANBAN_HOLDER_WAKE_SLOTS); a standby or the
+  kill switch keeps 2. Out of slots, the local sweep rewinds the claim and the remote sweep releases its ledger
+  claim (deferred:slots), retried next pass instead of a passive row, until OVERDUE_S (then the row, as before).
+  The per-chat wake budget is counted by the holder, so it is now in effect host-wide.
+- notice_fanout: cursors and the remote snapshot live in <kanban home>/kanban/notice-fanout.db, so a lease
+  hand-off resumes the interval instead of re-seeding (memory fallback when the file can't open).
+- producer_admission: sweep_once only in the 'producer-admission' lease holder; deliver_pending unchanged.
+- HERMES_HOST_LOOP_LEASE=0 restores per-process passes.
+
+Tests: tests/tui_gateway/test_kanban_unloaded_host_lease.py (RED on the base: routing, residual, exactly-once,
+hand-off, slots, every-store retry, producer gate, roles).
+---
+ hermes_cli/host_loop_lease.py                 |  22 ++
+ .../test_kanban_unloaded_host_lease.py        | 344 ++++++++++++++++++
+ .../tui_gateway/test_kanban_unloaded_wake.py  |   3 +-
+ tui_gateway/delegation_unloaded.py            |  25 +-
+ tui_gateway/kanban_remote_late.py             |   5 +-
+ tui_gateway/kanban_remote_notices.py          |   4 +-
+ tui_gateway/kanban_unloaded.py                | 163 +++++++--
+ tui_gateway/notice_fanout.py                  |  40 +-
+ tui_gateway/notice_fanout_state.py            | 190 ++++++++++
+ tui_gateway/notice_guarantee.py               |  33 +-
+ tui_gateway/producer_admission.py             |  33 +-
+ tui_gateway/reap_notices.py                   |  18 +-
+ tui_gateway/wake_slots.py                     |  66 ++++
+ 13 files changed, 874 insertions(+), 72 deletions(-)
+ create mode 100644 tests/tui_gateway/test_kanban_unloaded_host_lease.py
+ create mode 100644 tui_gateway/notice_fanout_state.py
+ create mode 100644 tui_gateway/wake_slots.py
+
+diff --git a/hermes_cli/host_loop_lease.py b/hermes_cli/host_loop_lease.py
+index 568c918316..51b90ed622 100644
+--- a/hermes_cli/host_loop_lease.py
++++ b/hermes_cli/host_loop_lease.py
+@@ -87,6 +87,28 @@ def lease_dir(home: str | Path | None = None) -> Path:
+     return Path(os.path.realpath(get_default_hermes_root(home=home))) / "run" / "host-loops"
+ 
+ 
++def process_role() -> str:
++    """This process's lease priority role: ``gateway`` (the messaging gateway, which mounts the web app too),
++    ``serve`` (a Desktop backend, local or over SSH, and the stdio TUI gateway), else ``dashboard`` (an
++    always-on ``hermes dashboard``). Read when a loop creates its lease, after the process marked its kind."""
++    try:
++        from hermes_cli.observability.shared_metrics_process import current_process_kind
++        kind = current_process_kind()
++    except ImportError:
++        kind = "other"
++    if kind == "gateway":
++        return "gateway"
++    if kind in ("serve", "tui"):
++        return "serve"
++    try:
++        from hermes_cli.process_identity import is_desktop_owned_backend
++        if is_desktop_owned_backend():
++            return "serve"
++    except ImportError:
++        pass
++    return "dashboard"
++
++
+ def _start_of(pid: int):
+     try:
+         from gateway.status import _get_process_start_time
+diff --git a/tests/tui_gateway/test_kanban_unloaded_host_lease.py b/tests/tui_gateway/test_kanban_unloaded_host_lease.py
+new file mode 100644
+index 0000000000..ad24e59624
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_unloaded_host_lease.py
+@@ -0,0 +1,344 @@
++"""Unloaded sweeper + producer admission under the host loop lease (design t_01a1d45d75851804 §2b). [daveey]
++
++Every gateway, Desktop serve and dashboard process ran the whole unloaded sweep and the cold-chat admission sweep
++(``kanban_unloaded._loop`` = 14.9% of a steady hub serve's samples, ``producer_admission._loop`` 3.9%). Now one
++lease holder runs the host pass; every other process runs a residual pass for the chats it holds itself, because the
++delegation and guarantee passes skip a chat held by another backend (``skipped:held``).
++"""
++
++from __future__ import annotations
++
++import contextlib
++import importlib
++import time
++
++import pytest
++
++from hermes_cli import host_loop_lease as hll
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.tui_gateway import test_delegation_unloaded_wake as dw
++from tests.tui_gateway import test_kanban_unloaded_wake as kw
++from tests.tui_gateway import test_notice_guarantee as gw
++from tests.tui_gateway import test_session_outcome_notices as so_helpers
++from tui_gateway import delegation_unloaded as du
++from tui_gateway import kanban_unloaded as ku
++from tui_gateway import notice_fanout as nf
++from tui_gateway import notice_guarantee as ng
++from tui_gateway import producer_admission as pa
++from tui_gateway import reap_notices as rn
++from tui_gateway import wake_slots
++
++db = so_helpers.db  # session-outcome fixture (card_change_pass)
++_clean_state = dw._clean_state  # autouse: delegation ledger reset and dead-owner liveness, as in its home module
++
++
++@pytest.fixture(autouse=True)
++def _lease_on(monkeypatch):
++    monkeypatch.delenv(hll.KILL_SWITCH_ENV, raising=False)
++    monkeypatch.delenv(wake_slots.HOLDER_SLOTS_ENV, raising=False)
++    yield
++    wake_slots.set_holder(False)
++
++
++class _Lease:
++    def __init__(self, held: bool):
++        self._held, self.beats = held, 0
++
++    def held(self) -> bool:
++        return self._held
++
++    def beat(self) -> None:
++        self.beats += 1
++
++
++def _record_passes(monkeypatch, live: frozenset[str] | set[str] = frozenset()):
++    """Stub every pass of the loop; return the list of (pass, kwargs) calls."""
++    ran = []
++    monkeypatch.setattr(ku, "live_session_ids", lambda: set(live))
++    monkeypatch.setattr(ku, "sweep_remote_once", lambda ids, **k: ran.append(("remote", None)) or [])
++    monkeypatch.setattr(ku, "sweep_once", lambda ids, **k: ran.append(("local", None)) or [])
++    monkeypatch.setattr(du, "sweep_once", lambda **k: ran.append(("delegation", k.get("only"))) or [])
++    monkeypatch.setattr(nf, "card_change_pass", lambda **k: ran.append(("card_change", None)) or [])
++    monkeypatch.setattr(rn, "retry_pending_killed_notices_all", lambda **k: ran.append(("killed", None)) or [])
++    monkeypatch.setattr(ng, "guarantee_pass", lambda **k: ran.append(("guarantee", k.get("only"))) or [])
++    return ran
++
++
++# -- routing -----------------------------------------------------------------------------------------------------
++
++
++def test_the_holder_runs_the_host_pass_and_beats(monkeypatch):
++    ran = _record_passes(monkeypatch, live={"chat-here"})
++    lease = _Lease(True)
++
++    assert ku.run_pass(lease) == "host"
++
++    assert [name for name, _ in ran] == ["remote", "local", "delegation", "card_change", "killed", "guarantee"]
++    assert ("delegation", None) in ran and ("guarantee", None) in ran  # every chat, not only live ones
++    assert lease.beats == 1
++
++
++def test_a_standby_runs_only_the_residual_pass_for_its_live_chats(monkeypatch):
++    ran = _record_passes(monkeypatch, live={"chat-here"})
++    lease = _Lease(False)
++
++    assert ku.run_pass(lease) == "residual"
++
++    assert ran == [("delegation", {"chat-here"}), ("guarantee", {"chat-here"})]
++    assert lease.beats == 0
++
++
++def test_a_standby_with_no_live_chat_does_nothing(monkeypatch):
++    ran = _record_passes(monkeypatch)
++    assert ku.run_pass(_Lease(False)) == "residual" and ran == []
++
++
++def test_kill_switch_runs_the_host_pass_in_every_process(monkeypatch, tmp_path):
++    monkeypatch.setenv(hll.KILL_SWITCH_ENV, "0")
++    ran = _record_passes(monkeypatch)
++    a = hll.HostLoopLease(ku.LEASE_NAME, "serve", interval=30, home=tmp_path)
++    b = hll.HostLoopLease(ku.LEASE_NAME, "dashboard", interval=30, home=tmp_path)
++
++    assert ku.run_pass(a) == "host" and ku.run_pass(b) == "host"
++    assert [name for name, _ in ran].count("local") == 2
++    assert ku._wake_slots.limit == ku.MAX_PARALLEL_WAKES  # today's per-process capacity
++
++
++def test_the_loop_releases_its_lease_when_stopped(monkeypatch, tmp_path):
++    import threading
++    _record_passes(monkeypatch)
++    stop = threading.Event()
++    lease = hll.HostLoopLease(ku.LEASE_NAME, "serve", interval=30, home=tmp_path)
++    monkeypatch.setenv("HERMES_KANBAN_UNLOADED_FIRST_S", "0")
++    monkeypatch.setattr(ku, "make_lease", lambda: lease)
++    monkeypatch.setattr(ku, "run_pass", lambda lease_, grace=0: stop.set() or "host")
++    ku._loop(stop)
++    other = hll.HostLoopLease(ku.LEASE_NAME, "dashboard", interval=30, home=tmp_path)
++    try:
++        assert other.held()
++    finally:
++        other.release()
++
++
++# -- exactly once ------------------------------------------------------------------------------------------------
++
++
++def test_an_unloaded_chat_is_delivered_exactly_once_by_the_holder(monkeypatch, tmp_path):
++    """Two processes' loops (two leases on one home): only the holder sweeps, so the chat gets one turn."""
++    from hermes_state import SessionDB
++    sdb = SessionDB(tmp_path / "state.db")
++    sdb.create_session(kw.CHAT, "desktop")
++    sdb.append_message(kw.CHAT, "user", "start the cards")
++    ku._reset_wake_budget_for_tests()
++    wake = kw._Wake("started")
++    real_sweep = ku.sweep_once
++    ran = _record_passes(monkeypatch)
++    monkeypatch.setattr(ku, "sweep_once", lambda ids, **k: real_sweep(
++        ids, now=kw.LATER, session_db=kw._opener(sdb), wake=wake, spawn=kw._inline, holders=list))
++    kw._card()
++    gateway = hll.HostLoopLease(ku.LEASE_NAME, "gateway", interval=30, home=tmp_path / "home")
++    serve = hll.HostLoopLease(ku.LEASE_NAME, "serve", interval=30, home=tmp_path / "home")
++    try:
++        verdicts = [ku.run_pass(gateway), ku.run_pass(serve), ku.run_pass(gateway), ku.run_pass(serve)]
++    finally:
++        gateway.release()
++        serve.release()
++        sdb.close()
++    assert verdicts == ["host", "residual", "host", "residual"]
++    assert len(wake.calls) == 1 and wake.calls[0][0] == kw.CHAT
++    assert [name for name, _ in ran].count("card_change") == 2  # host work once per tick, in one process
++
++
++# -- residual deliveries for chats live in a non-holder ----------------------------------------------------------
++
++
++def test_a_live_chat_in_a_standby_gets_its_delegation_from_its_own_residual_pass(tmp_path):
++    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++    from hermes_state import SessionDB
++    token = set_hermes_home_override(str(tmp_path))
++    try:
++        sdb = SessionDB(tmp_path / "state.db")
++        sdb.create_session(dw.CHAT, "desktop")
++        sdb.append_message(dw.CHAT, "user", "review the fix in the background")
++        sdb.close()
++        dw._completion()
++        wake = dw._Waker()
++
++        def residual(only):
++            return du.sweep_once(homes=lambda: [None], opener=dw._opener(tmp_path), holders=list,
++                                 busy=lambda ids: False, wake=wake, spawn=lambda job: job(), only=only)
++
++        assert [d["verdict"] for d in residual({"another-chat"})] == ["skipped:not-live-here"]
++        assert wake.calls == [] and dw._row(tmp_path)["delivery_state"] == "pending"
++        assert [d["verdict"] for d in residual({dw.CHAT})] == ["started"]
++        assert len(wake.calls) == 1 and dw._row(tmp_path)["delivery_state"] == "delivered"
++    finally:
++        reset_hermes_home_override(token)
++
++
++def test_a_live_chat_in_a_standby_gets_its_closeout_from_its_own_residual_pass(tmp_path):
++    from hermes_state import SessionDB
++    getattr(ng, "_reset_refreshed_for_tests", lambda: None)()
++    sdb = SessionDB(tmp_path / "state.db")
++    try:
++        for chat in (gw.CHAT, "20261029_130000_other"):
++            sdb.create_session(chat, "desktop")
++            sdb.append_message(chat, "user", "run the deploy card")
++            row = sdb.append_kanban_notice(chat, "✔ Kanban t_aaa done — deploy card",
++                                           {"notice_id": f"n:{chat}", "display_text": "done"})
++            sdb._write_rowcount("UPDATE messages SET timestamp = ? WHERE id = ?", (time.time() - 600, row))
++        calls = []
++
++        @contextlib.contextmanager
++        def opener(chat_id):
++            yield sdb, sdb.get_compression_tip(chat_id) or chat_id
++
++        out = ng.guarantee_pass(stores=lambda: iter([sdb]), holders=list, session_db=opener,
++                                wake=lambda sid, msg: calls.append(sid) or "started", spawn=lambda job: job(),
++                                only={gw.CHAT})
++    finally:
++        sdb.close()
++    assert calls == [gw.CHAT] and [o["session_id"] for o in out] == [gw.CHAT]
++
++
++# -- killed-notice retry covers every store ------------------------------------------------------------------------
++
++
++def test_the_host_pass_retries_killed_notices_in_every_profile_store(monkeypatch):
++    seen = []
++    monkeypatch.setattr(ku, "live_session_ids", set)
++    monkeypatch.setattr(ku, "sweep_remote_once", lambda ids, **k: [])
++    monkeypatch.setattr(ku, "sweep_once", lambda ids, **k: [])
++    monkeypatch.setattr(du, "sweep_once", lambda **k: [])
++    monkeypatch.setattr(nf, "card_change_pass", lambda **k: [])
++    monkeypatch.setattr(ng, "guarantee_pass", lambda **k: [])
++    monkeypatch.setattr(ng, "_stores", lambda: iter(["default-store", "work-store"]))
++    monkeypatch.setattr(rn, "retry_pending_killed_notices", lambda store, **k: seen.append(store) or [])
++
++    ku.host_pass()
++
++    assert seen == ["default-store", "work-store"]
++
++
++# -- wake slots ----------------------------------------------------------------------------------------------------
++
++
++def test_the_holder_gets_eight_wake_slots_and_a_standby_its_base(monkeypatch):
++    _record_passes(monkeypatch)
++    ku.run_pass(_Lease(True))
++    assert ku._wake_slots.limit == ng._wake_slots.limit == du._wake_slots.limit == wake_slots.HOLDER_SLOTS == 8
++    monkeypatch.setenv(wake_slots.HOLDER_SLOTS_ENV, "3")
++    ku.run_pass(_Lease(True))
++    assert ku._wake_slots.limit == 3
++    ku.run_pass(_Lease(False))
++    assert ku._wake_slots.limit == ku.MAX_PARALLEL_WAKES and ng._wake_slots.limit == ng.MAX_PARALLEL_WAKES
++
++
++def test_slot_exhaustion_rewinds_the_claim_and_retries_instead_of_a_passive_row(tmp_path, monkeypatch):
++    from hermes_state import SessionDB
++    sdb = SessionDB(tmp_path / "state.db")
++    sdb.create_session(kw.CHAT, "desktop")
++    sdb.append_message(kw.CHAT, "user", "start the cards")
++    ku._reset_wake_budget_for_tests()
++    monkeypatch.setattr(ku, "_wake_slots", wake_slots.WakeSlots(1))
++    assert ku._wake_slots.acquire()  # another chat's wake holds the only slot
++    tid = kw._card()
++    wake = kw._Wake("started")
++    soon = time.time() + 60  # past the 30 s grace, far from OVERDUE_S
++    try:
++        out = ku.sweep_once(set(), now=soon, session_db=kw._opener(sdb), wake=wake, spawn=kw._inline, holders=list)
++        assert out == [] and wake.calls == [] and kw._notices(sdb) == []  # no passive row
++        ku._wake_slots.release()
++        out = ku.sweep_once(set(), now=soon + 30, session_db=kw._opener(sdb), wake=wake, spawn=kw._inline,
++                            holders=list)
++    finally:
++        sdb.close()
++        ku._reset_wake_budget_for_tests()
++    assert [o["wake_result"] for o in out] == ["started"] and len(wake.calls) == 1 and tid in wake.calls[0][1]
++
++
++def test_a_remote_notice_with_no_free_slot_is_handed_back_until_overdue(monkeypatch):
++    monkeypatch.setattr(ku, "_wake_slots", wake_slots.WakeSlots(0))
++    monkeypatch.setattr(ku, "_slot_waits", {})
++    ku._reset_wake_budget_for_tests()
++    waker = ku._RemoteWaker(lambda *a: "started", lambda job: job(), 30.0)
++    persisted, deferred = [], []
++    task = {"id": "t_remote", "status": "done"}
++
++    def deliver(now):
++        return waker.deliver("chat", "✔ Kanban t_remote done", {"notice_id": "n1"}, task, now,
++                             persist=lambda: persisted.append(now) or True, started=lambda: None,
++                             defer=lambda: deferred.append(now))
++
++    t0 = time.time()
++    assert deliver(t0) == ku.SLOTS_DEFERRED and deliver(t0 + 60) == ku.SLOTS_DEFERRED
++    assert persisted == [] and deferred == [t0, t0 + 60]
++    assert deliver(t0 + ku.OVERDUE_S + 1) == "skipped:slots" and persisted == [t0 + ku.OVERDUE_S + 1]
++
++
++# -- notice_fanout hand-off ------------------------------------------------------------------------------------------
++
++
++def _new_process():
++    """What a lease hand-off to another process looks like to notice_fanout: none of the old process's memory."""
++    from tui_gateway import notice_fanout_state
++    notice_fanout_state.forget_memory_for_tests()
++    importlib.reload(nf)
++
++
++def test_a_lease_hand_off_keeps_the_card_change_interval(db, monkeypatch):
++    from hermes_cli import kanban_db_notify as kbn
++    from hermes_cli import kanban_session_activity as ksa
++    with contextlib.closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="deploy card", assignee="worker", session_id=so_helpers.CHAT)
++        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=so_helpers.CHAT)
++    assert nf.card_change_pass(session_db=so_helpers._opener(db)) == []  # the old holder's pass seeds the cursor
++    with contextlib.closing(kbc.connect()) as conn:
++        kb.complete_task(conn, tid, summary="deployed")  # changes while the lease moves
++    _new_process()
++    ksa._reset_cache_for_tests()
++
++    changed = nf.card_change_pass(session_db=so_helpers._opener(db))
++
++    assert [(c["task_id"], c["status"]) for c in changed] == [(tid, "done")]
++
++
++def test_a_lease_hand_off_keeps_the_remote_snapshot(db, monkeypatch):
++    from hermes_cli import kanban_session_activity as ksa
++    rows = [{"key": "worker/default/t_remote", "id": "t_remote", "board": "default", "gateway": "worker",
++             "session": so_helpers.CHAT, "status": "running", "title": "remote work"}]
++    monkeypatch.setattr(ksa, "_remote_cards", lambda ids, statuses, stale_ok: list(rows))
++    assert nf.card_change_pass(session_db=so_helpers._opener(db), slugs=[]) == []  # seeds
++    rows[0]["status"] = "done"
++    _new_process()
++
++    changed = nf.card_change_pass(session_db=so_helpers._opener(db), slugs=[])
++
++    assert [(c["chat_id"], c["source"]) for c in changed] == [(so_helpers.CHAT, "remote")]
++
++
++# -- producer admission ----------------------------------------------------------------------------------------------
++
++
++def test_producer_admission_sweeps_only_in_the_lease_holder(monkeypatch):
++    swept = []
++    monkeypatch.setattr(pa, "sweep_once", lambda: swept.append(1) or [])
++    standby, holder = _Lease(False), _Lease(True)
++
++    assert pa.run_pass(standby) is False and swept == [] and standby.beats == 0
++    assert pa.run_pass(holder) is True and swept == [1] and holder.beats == 1
++
++
++# -- roles -----------------------------------------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("kind, desktop, role", [("gateway", False, "gateway"), ("serve", False, "serve"),
++                                                  ("tui", False, "serve"), ("other", True, "serve"),
++                                                  ("other", False, "dashboard"), ("cli", False, "dashboard")])
++def test_process_role(monkeypatch, kind, desktop, role):
++    from hermes_cli import process_identity
++    from hermes_cli.observability import shared_metrics_process as smp
++    monkeypatch.setattr(smp, "current_process_kind", lambda: kind)
++    monkeypatch.setattr(process_identity, "is_desktop_owned_backend", lambda argv=None: desktop)
++    assert hll.process_role() == role
+diff --git a/tests/tui_gateway/test_kanban_unloaded_wake.py b/tests/tui_gateway/test_kanban_unloaded_wake.py
+index 75d4759b5a..853e83996c 100644
+--- a/tests/tui_gateway/test_kanban_unloaded_wake.py
++++ b/tests/tui_gateway/test_kanban_unloaded_wake.py
+@@ -251,7 +251,8 @@ def test_wake_runs_off_the_sweeper_thread_and_a_failed_one_writes_the_row_there(
+     assert seen == [CHAT] and len(_notices(db)) == 1 and tid in _notices(db)[0]["content"]
+ 
+ 
+-def test_no_free_wake_slot_writes_the_row_now(db, monkeypatch):
++def test_an_overdue_notice_with_no_free_wake_slot_writes_the_row_now(db, monkeypatch):
++    # LATER is an hour after the event, past OVERDUE_S: a younger one waits for a slot (test_kanban_unloaded_host_lease)
+     monkeypatch.setattr(ku, "_wake_slots", ku.threading.BoundedSemaphore(1))
+     assert ku._wake_slots.acquire(blocking=False)  # another chat's wake holds the only slot
+     try:
+diff --git a/tui_gateway/delegation_unloaded.py b/tui_gateway/delegation_unloaded.py
+index a6a1ed5e1d..dfa7badffe 100644
+--- a/tui_gateway/delegation_unloaded.py
++++ b/tui_gateway/delegation_unloaded.py
+@@ -31,6 +31,11 @@ chat is in this host's stores, it:
+ A started wake spends the chat's budget (``WAKES_PER_HOUR``; a woken turn may dispatch work whose result wakes it
+ again). A chat past budget keeps its result pending: its next poller, or the next hour's pass, delivers it. The pass
+ runs (and is disabled) with the kanban unloaded-session sweeper's loop.
++
++Under the host loop lease (``kanban_unloaded``, design t_01a1d45d75851804 §2b) only the lease holder runs the full
++pass; it skips a chat another backend holds (``skipped:held``) as before. Every other backend runs the pass with
++``only=`` its own live session ids, so a chat live in a backend that is not the holder still gets its result from
++that backend. The budget is per process, so with one holder it is in effect host-wide for unloaded chats.
+ """
+ 
+ from __future__ import annotations
+@@ -45,6 +50,8 @@ import uuid
+ from pathlib import Path
+ from typing import Any, Callable, Iterator, Optional
+ 
++from tui_gateway.wake_slots import WakeSlots
++
+ logger = logging.getLogger(__name__)
+ 
+ LABEL = "deleg-sweep-wake"
+@@ -59,7 +66,7 @@ _lock = threading.Lock()
+ _recovered_at: dict[str, float] = {}  # ledger home -> last recover_abandoned_delegations run (this process)
+ _wake_times: dict[str, list[float]] = {}  # chat -> started wakes (this process)
+ _retry: dict[str, tuple[float, float]] = {}  # delegation id -> (not before, last delay)
+-_wake_slots = threading.BoundedSemaphore(MAX_PARALLEL_WAKES)
++_wake_slots = WakeSlots(MAX_PARALLEL_WAKES)
+ 
+ 
+ def _reset_for_tests() -> None:
+@@ -68,7 +75,7 @@ def _reset_for_tests() -> None:
+         _wake_times.clear()
+         _retry.clear()
+         _recovered_at.clear()
+-    _wake_slots = threading.BoundedSemaphore(MAX_PARALLEL_WAKES)
++    _wake_slots = WakeSlots(MAX_PARALLEL_WAKES)
+ 
+ 
+ def ledger_homes() -> list[Optional[Path]]:
+@@ -202,8 +209,11 @@ def sweep_once(*, now: Optional[float] = None, grace_s: float = GRACE_S,
+                homes: Callable[[], list] = ledger_homes, opener=None,
+                holders: Optional[Callable[[], list[dict]]] = None,
+                busy: Callable[[set], bool] = busy_here, wake: Callable[..., str] = wake_turn,
+-               spawn: Callable[[Callable[[], Any]], Any] = _spawn_thread) -> list[dict]:
+-    """One pass over every ledger this backend serves; one decision dict per candidate row (for logs and tests)."""
++               spawn: Callable[[Callable[[], Any]], Any] = _spawn_thread,
++               only: Optional[set[str]] = None) -> list[dict]:
++    """One pass over every ledger this backend serves; one decision dict per candidate row (for logs and tests).
++    ``only`` (a non-holder's residual pass): act only on rows whose chat or its tip is one of these live ids, and
++    leave the ledger's dead-owner recovery to the holder."""
+     from tools import async_delegation as ad
+     from tools.process_registry_notifications import format_process_notification
+     from tui_gateway import kanban_unloaded as ku
+@@ -216,7 +226,7 @@ def sweep_once(*, now: Optional[float] = None, grace_s: float = GRACE_S,
+         with _home_scope(home):
+             with _lock:
+                 key = str(home or "")
+-                recover = now - _recovered_at.get(key, float("-inf")) >= RECOVER_EVERY_S
++                recover = only is None and now - _recovered_at.get(key, float("-inf")) >= RECOVER_EVERY_S
+                 if recover:
+                     _recovered_at[key] = now
+             try:
+@@ -240,13 +250,16 @@ def sweep_once(*, now: Optional[float] = None, grace_s: float = GRACE_S,
+                 if found is None:
+                     decision["verdict"] = "skipped:no-store"
+                     continue
++                ids = {chat, tip or chat}
++                if only is not None and not ids & only:
++                    decision["verdict"] = "skipped:not-live-here"  # the lease holder's pass owns it
++                    continue
+                 if skip is not None:
+                     # Left pending and unclaimed: an unarchived chat's poller can still take it, else the ledger's
+                     # expiry ends it. Back off so the pass does not re-read the chat every tick.
+                     _back_off(did, now)
+                     decision["verdict"] = f"skipped:{skip}"
+                     continue
+-                ids = {chat, tip or chat}
+                 if (holder := held_elsewhere(holders, ids)) is not None:
+                     decision["verdict"] = f"skipped:held:{holder}"
+                     continue
+diff --git a/tui_gateway/kanban_remote_late.py b/tui_gateway/kanban_remote_late.py
+index 450d673a68..e722b4643b 100644
+--- a/tui_gateway/kanban_remote_late.py
++++ b/tui_gateway/kanban_remote_late.py
+@@ -163,5 +163,8 @@ class SweepBatches:
+         if self.waker is None:
+             result = "persisted" if persist() else "deferred"
+         else:
+-            result = self.waker.deliver(tip, text, metadata, rep[3], self.now, persist=persist, started=started)
++            extra = ({"defer": partial(release_undelivered, [e[0] for e in entries], self.ledger)}
++                     if getattr(self.waker, "supports_defer", False) else {})
++            result = self.waker.deliver(tip, text, metadata, rep[3], self.now, persist=persist, started=started,
++                                        **extra)
+         return {"task_id": rep[3]["id"], "session_id": tip, "wake": result}
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 2f2ed2e7de..b27be479fb 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -1227,10 +1227,12 @@ def _deliver_link(owner, key, task, link, *, me, ref, state, path, live, session
+             if waiting:  # another consumer holds it in flight: name it, once
+                 _note_wait(sid, ref, state, waiting)
+             return
++        extra = {"defer": lambda: release(claim, ledger=ledger)} if getattr(waker, "supports_defer", False) else {}
+         result = waker.deliver(
+             tip, text, metadata, task, now or time.time(),
+             persist=lambda: _persist_claimed(session_db, profile, sid, text, metadata, claim, memo_key, ledger),
+-            started=lambda: _settle_started(session_db, profile, sid, event_key, claim, memo_key, ledger))
++            started=lambda: _settle_started(session_db, profile, sid, event_key, claim, memo_key, ledger),
++            **extra)
+         delivered.append({"task_id": task["id"], "session_id": tip, "wake": result})
+     except Exception:
+         logger.debug("remote Kanban notice deferred for %s/%s", owner, key, exc_info=True)
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 81952c3ae8..19a76c5e34 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -29,6 +29,19 @@ Protected background work keeps its poller but releases the idle writer lease. R
+ A chat mid-turn refuses the row (``SessionTurnLeaseLostError``): that is "busy, try later", so the claim is rewound
+ with one INFO line and the next pass retries; a notice still stalled after ``OVERDUE_S`` logs one WARNING per card
+ and chat with the reason (kanban-e5babca565).
++
++Host loop lease (design t_01a1d45d75851804 §2b). Every gateway, Desktop ``serve`` and dashboard process starts this
++loop, and the sweeps are host-wide work (the cursor CAS made N racers exactly-once, at N times the CPU). The loop now
++runs its HOST pass (remote and local sweeps, delegation and guarantee for every chat, the card-change fan-out, the
++killed-subagent retry over every profile store) only while it holds the ``kanban-unloaded`` lease
++(``hermes_cli.host_loop_lease``: gateway > serve > dashboard, ``lease.beat()`` after each pass). Every other process
++runs a RESIDUAL pass for the chats it holds itself (``live_session_ids()``): the delegation and guarantee passes
++skip a chat another backend holds (``skipped:held``), so those deliveries must come from the holding process. The
++holder starts up to ``wake_slots.HOLDER_SLOTS`` (8) wakes per pass kind instead of 2; when they are all busy, the
++claim is rewound and the next pass retries (``deferred:slots``) instead of writing a passive row, until the notice
++is ``OVERDUE_S`` old (then the row is written, as before). The per-chat wake budget
++(``HERMES_KANBAN_UNLOADED_WAKES_PER_HOUR``) is counted by the holder, so it is now in effect host-wide; a hand-off
++starts it afresh. ``HERMES_HOST_LOOP_LEASE=0`` restores the per-process passes (every process its own host pass).
+ [daveey]
+ """
+ 
+@@ -43,20 +56,25 @@ import time
+ from pathlib import Path
+ from typing import Any, Callable, Iterator, Optional
+ 
++from tui_gateway import wake_slots
++
+ logger = logging.getLogger(__name__)
+ 
+ GRACE_S = 30.0
+ INTERVAL_S = 30.0
+ FIRST_RUN_DELAY_S = 20.0
++LEASE_NAME = "kanban-unloaded"
+ 
+ WAKES_PER_HOUR = 4
+ MAX_PARALLEL_WAKES = 2
++SLOTS_DEFERRED = "deferred:slots"
+ 
+ _sweeper_started = False
+ _sweeper_lock = threading.Lock()
+ _wake_lock = threading.Lock()
+ _wake_times: dict[str, list[float]] = {}  # chat -> recent started wakes (this process)
+-_wake_slots = threading.BoundedSemaphore(MAX_PARALLEL_WAKES)
++_wake_slots = wake_slots.WakeSlots(MAX_PARALLEL_WAKES)
++_slot_waits: dict[tuple, float] = {}  # remote notice -> when slots first refused it (this process)
+ 
+ # A chat mid-turn refuses notice rows (SessionTurnLeaseLostError): a normal "busy, try later", not a failure.
+ # Each claim that had to be rewound records why; a notice still waiting OVERDUE_S after its event logs ONE warning
+@@ -437,6 +455,15 @@ def _deliver_sub(conn, slug, sub, ident, grace_s, now, session_db, _kb, _kbn, ki
+                 # event-id identity shared with the live poller: a notice it already wrote is not written twice
+                 "kanban_event_keys": [f"{slug}:{int(e.id)}" for e in claimed if fmt(sub, task, e, slug)]}
+     held_by, verdict = _route_notice(holders, ident, tip, slug, task, texts, now, grace_s)
++    if verdict == "skipped:slots" and _slots_may_wait(claimed, now):
++        # Every wake slot is busy: hand the range back so the next pass wakes the chat, instead of a passive row
++        # that no turn reads (design t_01a1d45d75851804 R4). An OVERDUE_S-old notice gets its row as before.
++        with contextlib.suppress(Exception):
++            _kbn.rewind_notify_cursor(conn, claimed_cursor=new, old_cursor=old, **ident)
++        if _note_stall(_stall_key(slug, ident), "every wake slot is busy"):
++            logger.info("kanban notice for %s/%s to chat %s deferred: every wake slot is busy; retrying next pass",
++                        slug, ident["task_id"], tip)
++        return None
+     persisted = True
+     if verdict is None:  # a worker slot is ours: the job wakes, or writes the row itself
+         try:
+@@ -461,6 +488,27 @@ def _deliver_sub(conn, slug, sub, ident, grace_s, now, session_db, _kb, _kbn, ki
+             "texts": texts, "woken": verdict == "started", "wake_result": verdict, "held_by": held_by}
+ 
+ 
++def _slots_may_wait(events: list, now: float) -> bool:
++    """A notice refused a wake slot waits for the next pass unless its oldest event is ``OVERDUE_S`` old."""
++    try:
++        oldest = min(float(getattr(e, "created_at", 0) or 0) for e in events)
++    except ValueError:
++        return False
++    return now - oldest < OVERDUE_S
++
++
++def _slot_wait_ok(key: tuple, now: float) -> bool:
++    """A remote notice refused a wake slot may wait for the next pass until ``OVERDUE_S`` after its first refusal."""
++    with _wake_lock:
++        if len(_slot_waits) > 5000:
++            _slot_waits.clear()
++        first = _slot_waits.setdefault(key, now)
++        if now - first < OVERDUE_S:
++            return True
++        _slot_waits.pop(key, None)
++        return False
++
++
+ def _undelivered(db, tip, slug, claimed: list) -> list:
+     """``claimed`` minus the events whose ``"<board>:<event id>"`` key a notice row in ``tip``'s lineage already
+     holds (a live poller wrote it, then died before its ack). The writer refuses a range that only partly overlaps
+@@ -553,13 +601,18 @@ class _RemoteWaker:
+     Before, the remote sweep only wrote the row: on 2026-10-29 two hub cards' notices sat as rows in an idle
+     laptop-1 chat for 2 h and 3.5 h, until a local card's wake ran a turn that finally read them."""
+ 
++    supports_defer = True  # callers pass ``defer=`` (test fakes without it keep the two-callback shape)
++
+     def __init__(self, wake: Callable[[str, str, dict], str], spawn: Callable[[Callable[[], str]], str],
+                  grace_s: float) -> None:
+         self.wake, self.spawn, self.grace_s = wake, spawn, grace_s
+ 
+     def deliver(self, tip: str, text: str, metadata: dict, task: dict, now: float, *,
+-                persist: Callable[[], bool], started: Callable[[], None]) -> str:
+-        """Start one turn with ``text`` in ``tip``, else ``persist()`` the row. Returns the verdict. Never raises."""
++                persist: Callable[[], bool], started: Callable[[], None],
++                defer: Optional[Callable[[], Any]] = None) -> str:
++        """Start one turn with ``text`` in ``tip``, else ``persist()`` the row. Returns the verdict. Never raises.
++        With every wake slot busy, ``defer()`` hands the claim back for the next pass instead of the row, until the
++        notice has waited ``OVERDUE_S`` for a slot (design t_01a1d45d75851804 R4)."""
+         try:
+             from types import SimpleNamespace
+             view = SimpleNamespace(status=task.get("status"), human_request=task.get("human_request"),
+@@ -572,8 +625,13 @@ class _RemoteWaker:
+             persist()
+             return skip
+         if not _wake_slots.acquire(blocking=False):
++            if defer is not None and _slot_wait_ok((tip, metadata.get("notice_id") or text), now):
++                with contextlib.suppress(Exception):
++                    defer()
++                return SLOTS_DEFERRED
+             persist()
+             return "skipped:slots"
++        _slot_waits.pop((tip, metadata.get("notice_id") or text), None)
+ 
+         def job() -> str:
+             try:
+@@ -612,34 +670,85 @@ def sweep_remote_once(live_ids: set[str], *, grace_s: float = GRACE_S, **kwargs)
+     return sweep_remote_notices(live_ids=live_ids, waker=_RemoteWaker(wake_turn, _spawn_thread, grace_s), **kwargs)
+ 
+ 
++def host_pass(grace: float = GRACE_S) -> None:
++    """Everything this loop does for the whole install; run by the ``kanban-unloaded`` lease holder only."""
++    try:
++        sweep_remote_once(live_session_ids(), grace_s=grace)
++        sweep_once(live_session_ids(), grace_s=grace)
++    except Exception:
++        logger.warning("kanban unloaded sweep failed", exc_info=True)
++    # [daveey] Async-delegation results no live poller delivers (parent unloaded, loaded headless, or held by
++    # another backend than the copy's): one turn in the parent, ledger-claimed (delegation_unloaded).
++    try:
++        from tui_gateway.delegation_unloaded import sweep_once as delegation_sweep_once
++        delegation_sweep_once()
++    except Exception:
++        logger.warning("async delegation unloaded sweep failed", exc_info=True)
++    # [daveey] Session outcome: refresh chats whose cards moved, then make sure no notice ends a chat unanswered.
++    from tui_gateway.notice_fanout import card_change_pass
++    from tui_gateway.notice_guarantee import guarantee_pass
++    card_change_pass()
++    # [daveey] A parent that was mid-turn when the orphan reap killed its subagent refused that notice: re-offer
++    # it before the guarantee pass, so the same tick can wake the parent on it (desktop-ac1b365935). Every
++    # profile store, since one holder now retries for the whole install.
++    from tui_gateway.reap_notices import retry_pending_killed_notices_all
++    retry_pending_killed_notices_all()
++    guarantee_pass()
++
++
++def residual_pass() -> None:
++    """A standby's pass for the chats it holds itself: the delegation and guarantee passes skip a chat another
++    backend holds (``skipped:held``), so the holder never delivers those. Nothing to do without live chats."""
++    live = live_session_ids()
++    if not live:
++        return
++    try:
++        from tui_gateway.delegation_unloaded import sweep_once as delegation_sweep_once
++        delegation_sweep_once(only=live)
++    except Exception:
++        logger.warning("async delegation residual sweep failed", exc_info=True)
++    from tui_gateway.notice_guarantee import guarantee_pass
++    guarantee_pass(only=live)
++
++
++def make_lease():
++    """This process's ``kanban-unloaded`` lease (role from its process kind)."""
++    from hermes_cli.host_loop_lease import HostLoopLease, process_role
++    interval = max(1.0, _env_float("HERMES_KANBAN_UNLOADED_SWEEP_S", INTERVAL_S))
++    return HostLoopLease(LEASE_NAME, process_role(), interval=interval)
++
++
++def run_pass(lease, grace: float = GRACE_S) -> str:
++    """One tick: the host pass while ``lease`` is held (then ``beat()``), else the residual pass. Returns which."""
++    holder = lease.held()
++    wake_slots.set_holder(holder and _lease_on())
++    if holder:
++        host_pass(grace)
++        lease.beat()
++        return "host"
++    residual_pass()
++    return "residual"
++
++
++def _lease_on() -> bool:
++    from hermes_cli.host_loop_lease import enabled
++    return enabled()
++
++
+ def _loop(stop: threading.Event) -> None:
+     interval = max(1.0, _env_float("HERMES_KANBAN_UNLOADED_SWEEP_S", INTERVAL_S))
+     grace = _env_float("HERMES_KANBAN_UNLOADED_GRACE_S", GRACE_S)
++    lease = make_lease()
+     stop.wait(_env_float("HERMES_KANBAN_UNLOADED_FIRST_S", FIRST_RUN_DELAY_S))
+-    while not stop.is_set():
+-        try:
+-            sweep_remote_once(live_session_ids(), grace_s=grace)
+-            sweep_once(live_session_ids(), grace_s=grace)
+-        except Exception:
+-            logger.warning("kanban unloaded sweep failed", exc_info=True)
+-        # [daveey] Async-delegation results no live poller delivers (parent unloaded, loaded headless, or held by
+-        # another backend than the copy's): one turn in the parent, ledger-claimed (delegation_unloaded).
+-        try:
+-            from tui_gateway.delegation_unloaded import sweep_once as delegation_sweep_once
+-            delegation_sweep_once()
+-        except Exception:
+-            logger.warning("async delegation unloaded sweep failed", exc_info=True)
+-        # [daveey] Session outcome: refresh chats whose cards moved, then make sure no notice ends a chat unanswered.
+-        from tui_gateway.notice_fanout import card_change_pass
+-        from tui_gateway.notice_guarantee import guarantee_pass
+-        card_change_pass()
+-        # [daveey] A parent that was mid-turn when the orphan reap killed its subagent refused that notice: re-offer
+-        # it before the guarantee pass, so the same tick can wake the parent on it (desktop-ac1b365935).
+-        from tui_gateway import server
+-        from tui_gateway.reap_notices import retry_pending_killed_notices
+-        retry_pending_killed_notices(server._get_db())
+-        guarantee_pass()
+-        stop.wait(interval)
++    try:
++        while not stop.is_set():
++            try:
++                run_pass(lease, grace)
++            except Exception:
++                logger.warning("kanban unloaded pass failed", exc_info=True)
++            stop.wait(interval)
++    finally:
++        lease.release()
+ 
+ 
+ def start_kanban_unloaded_sweeper() -> Optional[threading.Event]:
+diff --git a/tui_gateway/notice_fanout.py b/tui_gateway/notice_fanout.py
+index f4c68d3844..93f7baa493 100644
+--- a/tui_gateway/notice_fanout.py
++++ b/tui_gateway/notice_fanout.py
+@@ -11,13 +11,15 @@ Session-outcome contract, "Fan-out" and "Stale notices":
+   card's id joins ``display_metadata.stale_tasks``; a row about several cards is stale once all of them moved on.
+ - :func:`card_change_pass` (run from the unloaded sweeper's loop, every backend) reads each board's new status
+   events since the last pass and, for every chat linked to a changed card, marks those notices and refreshes the
+-  chat's stored outcome (trigger ``card_change``). The first pass of a process only seeds its cursor; the other
+-  refresh points (turn end, notice write, reap) cover what changed while no backend ran. Every step is
+-  idempotent, so two backends running the pass at once write the same result.
++  chat's stored outcome (trigger ``card_change``). The cursors are host-durable (``notice_fanout_state``), so the
++  pass resumes where the last process stopped when the host loop lease moves it (design t_01a1d45d75851804 R3);
++  only the install's very first pass seeds them. Every step is idempotent, so two backends running the pass at
++  once (lease off) write the same result.
+ - Remote links have no local events. Each pass also snapshots the shared remote-card projection by chat and
+-  (owner-qualified key, status). The first successful read seeds it; additions, removals and status changes
+-  refresh the affected chats once each. A failed read preserves the previous snapshot. This refresh does not
+-  synthesize notices or change their stale metadata; normal remote notice delivery owns those rows.
++  (owner-qualified key, status), durably like the cursors. The first successful read ever seeds it; additions,
++  removals and status changes refresh the affected chats once each. A failed read preserves the previous
++  snapshot. This refresh does not synthesize notices or change their stale metadata; normal remote notice
++  delivery owns those rows.
+ """
+ 
+ from __future__ import annotations
+@@ -43,14 +45,11 @@ STATUS_EVENT_KINDS = (
+ MAX_EVENTS_PER_PASS = 2000
+ _BLOCKED_LINE = re.compile(r"Kanban (t_[0-9A-Za-z_]+) blocked")
+ _TASK_ID = re.compile(r"Kanban (t_[0-9A-Za-z_]+)")
+-_cursors: dict[str, int] = {}
+-_remote_snapshot: Optional[dict[str, frozenset[tuple[str, str]]]] = None
+ 
+ 
+ def _reset_for_tests() -> None:
+-    global _remote_snapshot
+-    _cursors.clear()
+-    _remote_snapshot = None
++    from tui_gateway import notice_fanout_state
++    notice_fanout_state.reset_for_tests()
+ 
+ 
+ def chat_skip_reason(db: Any, chat_id: str) -> Optional[str]:
+@@ -157,9 +156,11 @@ def _linked_chats(conn: sqlite3.Connection, task_id: str, created_by: Optional[s
+ 
+ 
+ def _changed_tasks(conn: sqlite3.Connection, ident: str) -> list[str]:
++    from tui_gateway import notice_fanout_state as state
+     top = int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0])
+-    since = _cursors.get(ident)
+-    _cursors[ident] = top
++    since = state.get_cursor(ident)
++    if since != top:
++        state.set_cursor(ident, top)
+     if since is None or top <= since:
+         return []
+     kinds = ",".join("?" * len(STATUS_EVENT_KINDS))
+@@ -199,7 +200,7 @@ def _remote_change_pass(session_db: Callable) -> list[dict]:
+     """Observe the same remote projection as outcomes; failed reads never mean cards finished."""
+     from hermes_cli import kanban_session_activity as activity
+     from hermes_state_outcome import refresh_outcomes_quietly
+-    global _remote_snapshot
++    from tui_gateway import notice_fanout_state as state
+     current: dict[str, set[tuple[str, str]]] = {}
+     for card in activity._remote_cards(None, activity.LISTED_STATUSES, stale_ok=True):
+         status = card.get("status")
+@@ -208,11 +209,12 @@ def _remote_change_pass(session_db: Callable) -> list[dict]:
+         for chat in {card.get("session"), card.get("origin_session")} - {None, ""}:
+             current.setdefault(chat, set()).add((card["key"], status))
+     snapshot = {chat: frozenset(cards) for chat, cards in current.items()}
+-    previous = _remote_snapshot
++    previous = state.load_remote()
+     if previous is None:
+-        _remote_snapshot = snapshot
++        state.seed_remote(snapshot)
+         return []
+     out = []
++    acked: dict[str, Optional[frozenset[tuple[str, str]]]] = {}
+     for chat in sorted(previous.keys() | snapshot.keys()):
+         if previous.get(chat) == snapshot.get(chat):
+             continue
+@@ -227,12 +229,10 @@ def _remote_change_pass(session_db: Callable) -> list[dict]:
+             logger.warning("remote card-change outcome failed for chat %s", chat, exc_info=True)
+             continue
+         # Acknowledge only a successful refresh or an intentionally skipped chat.
+-        if chat in snapshot:
+-            previous[chat] = snapshot[chat]
+-        else:
+-            previous.pop(chat, None)
++        acked[chat] = snapshot.get(chat)
+         out.append({"board": None, "task_id": None, "chat_id": chat, "session_id": tip,
+                     "status": None, "skipped": skipped, "source": "remote"})
++    state.ack_remote(acked)
+     return out
+ 
+ 
+diff --git a/tui_gateway/notice_fanout_state.py b/tui_gateway/notice_fanout_state.py
+new file mode 100644
+index 0000000000..b940582398
+--- /dev/null
++++ b/tui_gateway/notice_fanout_state.py
+@@ -0,0 +1,190 @@
++"""Host-durable cursors of ``notice_fanout.card_change_pass``. [daveey]
++
++The card-change pass keeps, per board, the last ``task_events`` id it read and, for remote cards, the last
++``chat -> {(owner-qualified key, status)}`` snapshot. In memory, a new process's first pass could only seed them, so
++the changes of one interval were never fanned out. Under the host loop lease (design t_01a1d45d75851804 §2b, R3) the
++pass moves between processes on every hand-off (gateway restart, a Desktop backend taking over), so each hand-off
++would drop an interval. Both now live in ``<kanban home>/kanban/notice-fanout.db``, shared by every process of the
++install; the next holder resumes where the last one stopped.
++
++Writes are last-writer-wins: with the lease off every process runs the pass, and two passes over the same
++interval write the same (idempotent) refreshes. A store that cannot be opened (read-only home, disk error) falls
++back to this process's memory, which is the behaviour before this file existed. Never raises.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import json
++import logging
++import sqlite3
++import threading
++from pathlib import Path
++from typing import Iterator, Optional
++
++logger = logging.getLogger(__name__)
++
++FILENAME = "notice-fanout.db"
++_SCHEMA = """
++CREATE TABLE IF NOT EXISTS cursors (ident TEXT PRIMARY KEY, cursor INTEGER NOT NULL);
++CREATE TABLE IF NOT EXISTS remote_snapshot (chat TEXT PRIMARY KEY, cards TEXT NOT NULL);
++CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
++"""
++_SEEDED = "remote_seeded"
++
++_mu = threading.Lock()
++# Fallback when the durable store is unavailable (per path, so a test home or HERMES_KANBAN_HOME switch is apart).
++_memory: dict[str, dict] = {}
++_warned: set[str] = set()
++
++Snapshot = dict[str, frozenset[tuple[str, str]]]
++
++
++def path() -> Path:
++    from hermes_cli.kanban_db import kanban_home
++    return kanban_home() / "kanban" / FILENAME
++
++
++def _mem(where: Path) -> dict:
++    return _memory.setdefault(str(where), {"cursors": {}, "remote": None})
++
++
++@contextlib.contextmanager
++def _open() -> Iterator[Optional[sqlite3.Connection]]:
++    where = path()
++    conn: Optional[sqlite3.Connection] = None
++    try:
++        where.parent.mkdir(parents=True, exist_ok=True)
++        conn = sqlite3.connect(str(where), timeout=5.0, isolation_level=None)
++        conn.execute("PRAGMA journal_mode=WAL")
++        conn.executescript(_SCHEMA)
++    except (OSError, sqlite3.Error) as exc:
++        if conn is not None:
++            conn.close()
++            conn = None
++        _warn_once(where, exc)
++    try:
++        yield conn
++    finally:
++        if conn is not None:
++            conn.close()
++
++
++def _warn_once(where: Path, exc: BaseException) -> None:
++    if str(where) not in _warned:
++        _warned.add(str(where))
++        logger.warning("notice fan-out: %s unavailable (%s); keeping its cursors in this process's memory",
++                       where, exc)
++
++
++def get_cursor(ident: str) -> Optional[int]:
++    with _mu, _open() as conn:
++        if conn is None:
++            return _mem(path())["cursors"].get(ident)
++        try:
++            row = conn.execute("SELECT cursor FROM cursors WHERE ident = ?", (ident,)).fetchone()
++        except sqlite3.Error as exc:
++            _warn_once(path(), exc)
++            return _mem(path())["cursors"].get(ident)
++        return int(row[0]) if row else None
++
++
++def set_cursor(ident: str, cursor: int) -> None:
++    with _mu, _open() as conn:
++        _mem(path())["cursors"][ident] = int(cursor)
++        if conn is None:
++            return
++        try:
++            conn.execute("INSERT INTO cursors (ident, cursor) VALUES (?, ?) "
++                         "ON CONFLICT(ident) DO UPDATE SET cursor = excluded.cursor", (ident, int(cursor)))
++        except sqlite3.Error as exc:
++            _warn_once(path(), exc)
++
++
++def _decode(raw: str) -> frozenset[tuple[str, str]]:
++    try:
++        return frozenset((str(k), str(s)) for k, s in json.loads(raw))
++    except (TypeError, ValueError):
++        return frozenset()
++
++
++def _encode(cards: frozenset[tuple[str, str]]) -> str:
++    return json.dumps(sorted(cards))
++
++
++def load_remote() -> Optional[Snapshot]:
++    """The last remote snapshot, or None when no pass has seeded one yet."""
++    with _mu, _open() as conn:
++        if conn is None:
++            return _mem(path())["remote"]
++        try:
++            if conn.execute("SELECT 1 FROM meta WHERE k = ?", (_SEEDED,)).fetchone() is None:
++                return None
++            return {str(chat): _decode(cards) for chat, cards in conn.execute("SELECT chat, cards FROM remote_snapshot")}
++        except sqlite3.Error as exc:
++            _warn_once(path(), exc)
++            return _mem(path())["remote"]
++
++
++def seed_remote(snapshot: Snapshot) -> None:
++    """Replace the whole snapshot (first pass)."""
++    with _mu, _open() as conn:
++        _mem(path())["remote"] = dict(snapshot)
++        if conn is None:
++            return
++        try:
++            conn.execute("BEGIN IMMEDIATE")
++            conn.execute("DELETE FROM remote_snapshot")
++            conn.executemany("INSERT INTO remote_snapshot (chat, cards) VALUES (?, ?)",
++                             [(chat, _encode(cards)) for chat, cards in snapshot.items()])
++            conn.execute("INSERT OR REPLACE INTO meta (k, v) VALUES (?, '1')", (_SEEDED,))
++            conn.execute("COMMIT")
++        except sqlite3.Error as exc:
++            with contextlib.suppress(sqlite3.Error):
++                conn.execute("ROLLBACK")
++            _warn_once(path(), exc)
++
++
++def ack_remote(acked: dict[str, Optional[frozenset[tuple[str, str]]]]) -> None:
++    """Record the chats a pass refreshed (or skipped on purpose): their new cards, or None when they have none."""
++    if not acked:
++        return
++    with _mu, _open() as conn:
++        mem = _mem(path())
++        if mem["remote"] is not None:
++            for chat, cards in acked.items():
++                if cards is None:
++                    mem["remote"].pop(chat, None)
++                else:
++                    mem["remote"][chat] = cards
++        if conn is None:
++            return
++        try:
++            conn.execute("BEGIN IMMEDIATE")
++            for chat, cards in acked.items():
++                if cards is None:
++                    conn.execute("DELETE FROM remote_snapshot WHERE chat = ?", (chat,))
++                else:
++                    conn.execute("INSERT OR REPLACE INTO remote_snapshot (chat, cards) VALUES (?, ?)",
++                                 (chat, _encode(cards)))
++            conn.execute("COMMIT")
++        except sqlite3.Error as exc:
++            with contextlib.suppress(sqlite3.Error):
++                conn.execute("ROLLBACK")
++            _warn_once(path(), exc)
++
++
++def forget_memory_for_tests() -> None:
++    """Drop this process's memory only (a hand-off to a fresh process keeps the durable state)."""
++    with _mu:
++        _memory.clear()
++
++
++def reset_for_tests() -> None:
++    """Drop both this process's memory and the durable state at the current path."""
++    with _mu:
++        _memory.clear()
++        _warned.clear()
++        with contextlib.suppress(OSError):
++            for suffix in ("", "-wal", "-shm"):
++                Path(str(path()) + suffix).unlink(missing_ok=True)
+diff --git a/tui_gateway/notice_guarantee.py b/tui_gateway/notice_guarantee.py
+index 000607c3e1..e199f92a85 100644
+--- a/tui_gateway/notice_guarantee.py
++++ b/tui_gateway/notice_guarantee.py
+@@ -32,7 +32,9 @@ unloaded sweeper's loop therefore looks, in every profile store, for chats whose
+ 
+ Ownership follows the unloaded sweeper's: a chat another live backend holds is that backend's (its own pass
+ handles it); a chat with a live turn is skipped. The close-out prompt row is itself a notice, stamped as claimed,
+-so a close-out never wakes another one.
++so a close-out never wakes another one. Under the host loop lease (``kanban_unloaded``, design t_01a1d45d75851804
++§2b) the full pass runs in the lease holder only; every other backend runs it with ``only=`` its own live session
++ids (an indexed lookup of those chats, not a scan), so a chat live there is still closed out by it.
+ 
+ A notice about a card on another gateway (``gateway`` in its metadata, or only ``remote:`` event keys) is judged
+ by the ``blocked_on_human`` flag its writer stored, never by a local board lookup: its ``board`` is the owner's.
+@@ -55,6 +57,8 @@ import threading
+ import time
+ from typing import Any, Callable, Iterator, Optional
+ 
++from tui_gateway.wake_slots import WakeSlots
++
+ logger = logging.getLogger(__name__)
+ 
+ GRACE_S = 300.0
+@@ -74,7 +78,7 @@ CLOSEOUT_TEXT = (
+     "what the card delivered or why it stopped, fix or follow up on anything an agent can, then end with a short "
+     "summary for the user, the decision you need from them, or what you are still waiting on.")
+ CLOSEOUT_DISPLAY = "Close-out turn for the Kanban notice above"
+-_wake_slots = threading.BoundedSemaphore(MAX_PARALLEL_WAKES)
++_wake_slots = WakeSlots(MAX_PARALLEL_WAKES)
+ # (store path, session id, notice row id, branch) this backend already refreshed. Pruned to the current
+ # candidates after every pass, so it holds at most one pass's candidates.
+ _refreshed: set[tuple[str, str, int, str]] = set()
+@@ -101,12 +105,20 @@ SELECT COUNT(*) FROM messages WHERE session_id IN (SELECT id FROM lineage) AND d
+ """
+ 
+ 
+-def candidates(db: Any, now: float) -> list[dict]:
+-    """Chats in ``db`` whose last active message is a kanban notice older than ``GRACE_S`` and not yet claimed."""
++def candidates(db: Any, now: float, only: Optional[set[str]] = None) -> list[dict]:
++    """Chats in ``db`` whose last active message is a kanban notice older than ``GRACE_S`` and not yet claimed;
++    with ``only``, just those session ids (a non-holder's residual pass)."""
+     from hermes_state_common import _sql_session_last_active
+     from tui_gateway.notice_candidates import rows as candidate_rows
+     from tui_gateway.notice_fanout import _decode
+-    rows = candidate_rows(db, _CANDIDATES_SQL.format(last_active=_sql_session_last_active("s")))
++    sql = _CANDIDATES_SQL.format(last_active=_sql_session_last_active("s"))
++    if only is not None:
++        ids = sorted(only)
++        if not ids:
++            return []
++        rows = db._read_all(sql + f" AND s.id IN ({','.join('?' * len(ids))})", tuple(ids))
++    else:
++        rows = candidate_rows(db, sql)
+     out = []
+     for row in rows:
+         # Cache structure, not age: a notice can become due (or expire) without a commit.
+@@ -426,8 +438,10 @@ def _stores() -> Iterator[Any]:
+ 
+ def guarantee_pass(*, now: Optional[float] = None, stores: Callable[[], Iterator[Any]] = _stores,
+                    holders: Optional[Callable[[], list]] = None, session_db: Optional[Callable] = None,
+-                   wake: Callable[[str, int], str] = _wake, spawn: Callable[[Callable], Any] = _spawn) -> list[dict]:
+-    """One pass over every store (see module doc). Returns ``[{session_id, msg_id, result}]``. Never raises."""
++                   wake: Callable[[str, int], str] = _wake, spawn: Callable[[Callable], Any] = _spawn,
++                   only: Optional[set[str]] = None) -> list[dict]:
++    """One pass over every store (see module doc). Returns ``[{session_id, msg_id, result}]``. Never raises.
++    ``only``: just these live session ids (a non-holder's residual pass; the refresh memo is left alone)."""
+     from tui_gateway import kanban_unloaded as ku
+     now = time.time() if now is None else now
+     holders = holders or ku.registry_holders
+@@ -436,7 +450,7 @@ def guarantee_pass(*, now: Optional[float] = None, stores: Callable[[], Iterator
+     seen: set = set()
+     try:
+         for db in stores():
+-            for cand in candidates(db, now):
++            for cand in candidates(db, now, only):
+                 try:
+                     result = _handle(db, cand, now, holders=holders, session_db=session_db, wake=wake, spawn=spawn,
+                                      seen=seen)
+@@ -447,5 +461,6 @@ def guarantee_pass(*, now: Optional[float] = None, stores: Callable[[], Iterator
+     except Exception:
+         logger.warning("notice guarantee pass failed", exc_info=True)
+         return out  # an incomplete pass keeps every memo entry
+-    _refreshed.intersection_update(seen)
++    if only is None:
++        _refreshed.intersection_update(seen)
+     return out
+diff --git a/tui_gateway/producer_admission.py b/tui_gateway/producer_admission.py
+index 24ca4c67a8..23bd4f5874 100644
+--- a/tui_gateway/producer_admission.py
++++ b/tui_gateway/producer_admission.py
+@@ -218,14 +218,35 @@ def _sweep_owner(server, db, profile: Optional[str], owner: str) -> dict:
+     return {**record, "verdict": deliver_pending(sid, session)}
+ 
+ 
++LEASE_NAME = "producer-admission"
++
++
++def run_pass(lease) -> bool:
++    """One tick: the cold-chat sweep only while this process holds the ``producer-admission`` host loop lease
++    (design t_01a1d45d75851804 §2b; ``HERMES_HOST_LOOP_LEASE=0`` = every process). The per-chat poller's
++    ``deliver_pending`` is unchanged. True when the sweep ran."""
++    if not lease.held():
++        return False
++    try:
++        sweep_once()
++    finally:
++        lease.beat()
++    return True
++
++
+ def _loop(stop: threading.Event) -> None:
++    from hermes_cli.host_loop_lease import HostLoopLease, process_role
++    lease = HostLoopLease(LEASE_NAME, process_role(), interval=INTERVAL_S)
+     stop.wait(INTERVAL_S)
+-    while not stop.is_set():
+-        try:
+-            sweep_once()
+-        except Exception:
+-            logger.warning("producer admission sweep failed", exc_info=True)
+-        stop.wait(INTERVAL_S)
++    try:
++        while not stop.is_set():
++            try:
++                run_pass(lease)
++            except Exception:
++                logger.warning("producer admission sweep failed", exc_info=True)
++            stop.wait(INTERVAL_S)
++    finally:
++        lease.release()
+ 
+ 
+ def start_producer_admission_sweeper() -> Optional[threading.Event]:
+diff --git a/tui_gateway/reap_notices.py b/tui_gateway/reap_notices.py
+index 71899bbd05..95675f1170 100644
+--- a/tui_gateway/reap_notices.py
++++ b/tui_gateway/reap_notices.py
+@@ -19,7 +19,7 @@ from __future__ import annotations
+ import logging
+ import threading
+ import time
+-from typing import Any, Iterable, Optional
++from typing import Any, Callable, Iterable, Optional
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -105,6 +105,22 @@ def notify_parents_of_killed_subagents(db: Any, swept: Iterable[str]) -> list[st
+     return notified
+ 
+ 
++def retry_pending_killed_notices_all(stores: Optional[Callable[[], Any]] = None, *,
++                                    now: Optional[float] = None) -> list[str]:
++    """:func:`retry_pending_killed_notices` over every profile store this host serves (``notice_guarantee._stores``),
++    not only this process's own one: under the host loop lease one process retries for the whole install (design
++    t_01a1d45d75851804 §2b). Never raises."""
++    if stores is None:
++        from tui_gateway.notice_guarantee import _stores as stores
++    notified: list[str] = []
++    try:
++        for db in stores():
++            notified.extend(retry_pending_killed_notices(db, now=now))
++    except Exception:
++        logger.warning("killed-subagent notice retry: store iteration failed", exc_info=True)
++    return notified
++
++
+ def retry_pending_killed_notices(db: Any, *, now: Optional[float] = None) -> list[str]:
+     """Re-offer the notice for every child the orphan reap closed in the last ``RETRY_WINDOW_S`` whose parent
+     lineage does not have it yet (the inline write found the parent busy). Returns the parents newly told. A
+diff --git a/tui_gateway/wake_slots.py b/tui_gateway/wake_slots.py
+new file mode 100644
+index 0000000000..277168bae7
+--- /dev/null
++++ b/tui_gateway/wake_slots.py
+@@ -0,0 +1,66 @@
++"""Parallel wake slots of the unloaded sweeper's passes, sized by the host loop lease. [daveey]
++
++The unloaded sweeper (``kanban_unloaded``), the notice guarantee and the delegation pass each start at most a few
++wake turns at once (an agent build may take minutes; the pass must not stall on it). Under the host loop lease
++(``hermes_cli.host_loop_lease``, design t_01a1d45d75851804 §2b) ONE process per home runs the host pass for every
++unloaded chat, where before every gateway/serve/dashboard process ran it with 2 slots each. The holder therefore
++gets ``HOLDER_SLOTS`` (default 8, ``HERMES_KANBAN_HOLDER_WAKE_SLOTS``); a standby's residual pass, for chats live in
++it, keeps the per-module base. With the lease off (``HERMES_HOST_LOOP_LEASE=0``) every process keeps its base, as
++before.
++
++``WakeSlots`` keeps ``threading.BoundedSemaphore``'s non-blocking ``acquire``/``release`` shape (tests swap one in);
++lowering the limit never revokes a slot already taken, it only refuses new ones until enough are released.
++"""
++
++from __future__ import annotations
++
++import os
++import threading
++import weakref
++
++HOLDER_SLOTS_ENV = "HERMES_KANBAN_HOLDER_WAKE_SLOTS"  # health: allow HX002 -- the card's holder wake-capacity knob
++HOLDER_SLOTS = 8
++
++_ALL: weakref.WeakSet = weakref.WeakSet()
++
++
++def holder_capacity() -> int:
++    try:
++        return max(1, int(os.environ.get(HOLDER_SLOTS_ENV, HOLDER_SLOTS)))
++    except (TypeError, ValueError):
++        return HOLDER_SLOTS
++
++
++class WakeSlots:
++    """A resizable non-blocking counter: ``acquire()`` takes one slot if fewer than ``limit`` are taken."""
++
++    def __init__(self, base: int) -> None:
++        self.base = int(base)
++        self.limit = self.base
++        self._used = 0
++        self._mu = threading.Lock()
++        _ALL.add(self)
++
++    def acquire(self, blocking: bool = False) -> bool:  # ``blocking`` kept for the BoundedSemaphore call shape
++        with self._mu:
++            if self._used >= self.limit:
++                return False
++            self._used += 1
++            return True
++
++    def release(self) -> None:
++        with self._mu:
++            if self._used <= 0:
++                raise ValueError("WakeSlots released too many times")
++            self._used -= 1
++
++    @property
++    def used(self) -> int:
++        return self._used
++
++
++def set_holder(holder: bool) -> None:
++    """Size every pass's slots for this process: the holder's capacity, else each one's own base."""
++    capacity = holder_capacity()
++    for slots in list(_ALL):
++        slots.limit = capacity if holder else slots.base
+-- 
+2.51.0
+

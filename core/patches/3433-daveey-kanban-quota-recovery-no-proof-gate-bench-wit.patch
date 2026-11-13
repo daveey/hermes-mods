@@ -1,0 +1,200 @@
+From b3269af2110e01b2c710f83ea287425939a9b4d5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:15:01 +0000
+Subject: [PATCH] [daveey] kanban quota recovery: no proof-gate bench without a
+ failed proof; test the SubprocessError catch
+
+Follow-up to the two non-blocking nits in review 5889821623 on PR #2101.
+
+1. recover() reserved the 10-min proof-gate row (quota_proof_gate.db, per
+   provider/model/account) for every eligible account before its deadline
+   early return, and a proof that succeeded after the deadline (loop break or
+   as_completed timeout) kept its row. Either way the account stayed benched
+   600 s with no failed proof behind it.
+   Fix: check the deadline before reserving; if it passes during the
+   reservation, release every reserved row; and settle each proof future with a
+   done callback that releases the row when the proof succeeded (late included)
+   or was cancelled unstarted. Only a proof that ran and did not succeed keeps
+   its row; a late success still never clears the bench.
+
+2. completion_succeeds' SubprocessError catch had no test of its own. New test
+   raises subprocess.SubprocessError from the resolver spawn (the probe path's
+   Popen) and asserts the proof reads False.
+
+Proof (hermes-core-wt test, worker-5):
+- RED on origin/main sources (SubprocessError clause dropped for nit 2):
+  test_expired_deadline_reserves_no_proof,
+  test_deadline_lost_during_reservation_releases_rows,
+  test_successful_late_proof_releases_its_row,
+  test_completion_returns_false_when_resolver_spawn_raises_subprocess_error
+  all FAIL.
+- GREEN: 17 quota files, 293 passed. scripts/check --base origin/main: 19 checks ok.
+---
+ hermes_cli/kanban_quota_recovery.py           | 23 +++++-
+ .../test_kanban_quota_dns_deadline.py         | 14 ++++
+ .../hermes_cli/test_kanban_quota_recovery.py  | 75 +++++++++++++++++++
+ 3 files changed, 108 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_quota_recovery.py b/hermes_cli/kanban_quota_recovery.py
+index 3bedd95a77..a91d355a1e 100644
+--- a/hermes_cli/kanban_quota_recovery.py
++++ b/hermes_cli/kanban_quota_recovery.py
+@@ -264,8 +264,9 @@ def recover(provider, model, *, seconds=None):
+     Futures hold detached observations, never the pool. Timed-out futures can finish but cannot
+     clear anything. Usage endpoints are intentionally not prerequisites: unknown usage is common.
+     Each (provider, model, account) proof is reserved for FAILED_PROOF_COOLDOWN_SECONDS across
+-    processes (released only by a completed proof), so a real wall costs one completion per
+-    account per window, not one per Kanban start.
++    processes, so a real wall costs one completion per account per window, not one per Kanban
++    start. Only a proof that ran and did not succeed keeps its row: nothing is reserved past the
++    deadline, and unprobed or successful (even late) proofs release theirs.
+     """
+     from copy import deepcopy
+     from agent.credential_pool import load_pool
+@@ -282,16 +283,30 @@ def recover(provider, model, *, seconds=None):
+     pool = load_pool(provider, allowed_auth_types={'oauth'})
+     disabled = disabled_keys(provider)
+     entries = [deepcopy(e) for e in pool.entries() if _eligible(e, provider, model, time.time(), disabled)]
+-    if entries:
+-        entries = _reserve_proofs(provider, model, entries, time.time())
++    # A reservation stands only for a proof that ran and did not succeed: never reserve past the
++    # deadline, and release rows that will not be probed or whose proof succeeded (even late).
+     if not entries or time.monotonic() >= deadline:
+         return False
++    entries = _reserve_proofs(provider, model, entries, time.time())
++    if not entries:
++        return False
++    if time.monotonic() >= deadline:
++        for entry in entries:
++            _release_proof(provider, model, entry)
++        return False
++
++    def settle(future, entry):
++        if future.cancelled() or (future.exception() is None and future.result()):
++            _release_proof(provider, model, entry)
++
+     executor = ThreadPoolExecutor(max_workers=len(entries), thread_name_prefix='quota-proof')
+     cleared = False
+     verified = []
+     try:
+         futures = {executor.submit(copy_context().run, completion_succeeds, provider, model, e, deadline): e
+                    for e in entries}
++        for future, entry in futures.items():
++            future.add_done_callback(lambda f, entry=entry: settle(f, entry))
+         try:
+             for future in as_completed(futures, timeout=max(0, deadline - time.monotonic())):
+                 if time.monotonic() >= deadline:
+diff --git a/tests/hermes_cli/test_kanban_quota_dns_deadline.py b/tests/hermes_cli/test_kanban_quota_dns_deadline.py
+index fb0767081b..93075d71a6 100644
+--- a/tests/hermes_cli/test_kanban_quota_dns_deadline.py
++++ b/tests/hermes_cli/test_kanban_quota_dns_deadline.py
+@@ -132,6 +132,20 @@ def test_unreaped_resolver_timeout_never_escapes(monkeypatch, child_ok):
+     process.kill.assert_called_once_with()
+ 
+ 
++def test_completion_returns_false_when_resolver_spawn_raises_subprocess_error(monkeypatch):
++    """A SubprocessError from the resolver spawn (not an OSError) still reads as a failed proof."""
++    import httpx
++    import types
++
++    def spawn(*args, **kwargs):
++        raise subprocess.SubprocessError('resolver spawn failed')
++
++    monkeypatch.setattr(subprocess, 'Popen', spawn)
++    monkeypatch.setattr(recovery, '_client', lambda timeout: httpx.AsyncClient(timeout=timeout, trust_env=False))
++    entry = types.SimpleNamespace(runtime_api_key='synthetic')
++    assert recovery.completion_succeeds('anthropic', 'm', entry, time.monotonic() + 5) is False
++
++
+ def test_completion_returns_false_when_resolver_cannot_be_reaped(monkeypatch):
+     import httpx
+     import io
+diff --git a/tests/hermes_cli/test_kanban_quota_recovery.py b/tests/hermes_cli/test_kanban_quota_recovery.py
+index 926bf36edf..ec394c027a 100644
+--- a/tests/hermes_cli/test_kanban_quota_recovery.py
++++ b/tests/hermes_cli/test_kanban_quota_recovery.py
+@@ -114,6 +114,81 @@ def test_verified_proof_releases_its_cooldown(monkeypatch, tmp_path):
+     assert sorted(c.args[2].id for c in complete.call_args_list) == ['acct1', 'acct1', 'acct2']
+ 
+ 
++def _gate_rows(path):
++    import sqlite3
++    from contextlib import closing
++    if not path.exists():
++        return []
++    with closing(sqlite3.connect(path)) as conn:
++        return [row[0] for row in conn.execute('SELECT key FROM proofs')]
++
++
++def test_expired_deadline_reserves_no_proof(monkeypatch, tmp_path):
++    """A deadline already spent before the gate leaves no 600 s bench without a failed proof."""
++    from hermes_cli import kanban_quota_recovery as recovery
++    gate = tmp_path / 'gate.db'
++    monkeypatch.setattr(recovery, '_proof_gate_path', lambda: str(gate))
++    _, pool = _gated_entries('acct1')
++    monkeypatch.setattr('agent.credential_pool.load_pool', lambda *a, **k: pool)
++    complete = Mock(return_value=True)
++    monkeypatch.setattr(recovery, 'completion_succeeds', complete)
++    assert not recovery.recover('anthropic', 'model', seconds=0)
++    assert _gate_rows(gate) == []
++    complete.assert_not_called()
++
++
++def test_deadline_lost_during_reservation_releases_rows(monkeypatch, tmp_path):
++    """The deadline passing while the gate is reserved releases every unprobed reservation."""
++    from hermes_cli import kanban_quota_recovery as recovery
++    gate = tmp_path / 'gate.db'
++    monkeypatch.setattr(recovery, '_proof_gate_path', lambda: str(gate))
++    _, pool = _gated_entries('acct1', 'acct2')
++    monkeypatch.setattr('agent.credential_pool.load_pool', lambda *a, **k: pool)
++    complete = Mock(return_value=True)
++    monkeypatch.setattr(recovery, 'completion_succeeds', complete)
++    real_reserve = recovery._reserve_proofs
++
++    def slow_reserve(*args, **kwargs):
++        allowed = real_reserve(*args, **kwargs)
++        assert len(_gate_rows(gate)) == 2
++        late = time.monotonic() + 1000
++        monkeypatch.setattr(recovery, 'time', SimpleNamespace(time=time.time, monotonic=lambda: late))
++        return allowed
++
++    monkeypatch.setattr(recovery, '_reserve_proofs', slow_reserve)
++    assert not recovery.recover('anthropic', 'model', seconds=30)
++    assert _gate_rows(gate) == []
++    complete.assert_not_called()
++
++
++def test_successful_late_proof_releases_its_row(monkeypatch, tmp_path):
++    """A proof that succeeds after the deadline cannot clear the bench but must drop its reservation."""
++    from hermes_cli import kanban_quota_recovery as recovery
++    from tests.waiting import wait_until
++    gate = tmp_path / 'gate.db'
++    monkeypatch.setattr(recovery, '_proof_gate_path', lambda: str(gate))
++    _, pool = _gated_entries('ok', 'walled')
++    monkeypatch.setattr('agent.credential_pool.load_pool', lambda *a, **k: pool)
++    release = threading.Event()
++    returned = []
++
++    def complete(provider, model, entry, deadline):
++        release.wait(5)
++        returned.append(entry.id)
++        return entry.id == 'ok'
++
++    monkeypatch.setattr(recovery, 'completion_succeeds', complete)
++    try:
++        assert not recovery.recover('anthropic', 'model', seconds=0.5)
++        assert len(_gate_rows(gate)) == 2  # both proofs still in flight
++    finally:
++        release.set()
++    wait_until(lambda: len(returned) == 2, what='late proofs to finish')
++    wait_until(lambda: _gate_rows(gate) == [recovery._proof_key('anthropic', 'model', SimpleNamespace(id='walled'))],
++               what='successful late proof to release its row')
++    pool.clear_verified_model_cooldown.assert_not_called()
++
++
+ def test_broken_proof_gate_fails_open(monkeypatch, tmp_path):
+     from hermes_cli import kanban_quota_recovery as recovery
+     monkeypatch.setattr(recovery, '_proof_gate_path', lambda: str(tmp_path / 'missing-dir' / 'gate.db'))
+-- 
+2.51.0
+

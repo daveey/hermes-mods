@@ -1,0 +1,153 @@
+From 27740f5def685fc88bac676ec7a7aed38f6c5529 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:47:21 +0000
+Subject: [PATCH] [daveey] fix(agent): one-shot runs get an iteration-budget
+ checkpoint at 80% and cap hits log iteration_cap_exhausted
+
+Headless chat -q --max-turns N runs got no warning before the cap, then lost
+their tools and could not write their deliverable (defect 4a4dc075ad). With no
+budget_warning_ratio configured, one-shots now default to 0.8 (Kanban workers
+keep 0.9); the notice names the remaining iterations and says tools are
+removed at the cap. turn_finalizer logs one countable line per cap hit:
+iteration_cap_exhausted source=<src> oneshot=<bool> warned=<bool> used=N/M.
+---
+ agent/turn_finalizer.py                      | 13 +++++
+ agent/turn_iteration_prep.py                 | 14 ++++-
+ tests/agent/test_iteration_budget_warning.py | 61 ++++++++++++++++++++
+ 3 files changed, 86 insertions(+), 2 deletions(-)
+
+diff --git a/agent/turn_finalizer.py b/agent/turn_finalizer.py
+index a6228ecd03..a46bb2b57c 100644
+--- a/agent/turn_finalizer.py
++++ b/agent/turn_finalizer.py
+@@ -137,6 +137,18 @@ def _guarded_cleanup(
+         logger.error("finalize_turn: _%s failed: %s", label, err, exc_info=True)
+ 
+ 
++def _log_iteration_cap_exhausted(agent, api_call_count, logger) -> None:
++    """One greppable line per cap hit so cap exhaustion is countable per source, and whether the
++    run saw a checkpoint notice first (defect 4a4dc075ad: one-shots lost deliverables unwarned)."""
++    from agent.oneshot_footprint import agent_is_oneshot
++    logger.warning(
++        "iteration_cap_exhausted source=%s oneshot=%s warned=%s used=%s/%s",
++        getattr(agent, "platform", None) or "cli", agent_is_oneshot(agent),
++        bool(getattr(agent, "_iteration_budget_warning_injected", False)),
++        api_call_count, agent.max_iterations,
++    )
++
++
+ def _resolve_budget_fallback(
+     agent, *, final_response, api_call_count, interrupted, failed, messages, _turn_exit_reason,
+     _pending_verification_response, _pending_verification_response_previewed, logger,
+@@ -152,6 +164,7 @@ def _resolve_budget_fallback(
+         and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}
+     ):
+         _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
++        _log_iteration_cap_exhausted(agent, api_call_count, logger)
+         from agent.pre_final_gate import eligible_callbacks, needs_buffer, turn_messages
+         _gate_budget_output = bool(eligible_callbacks(agent))
+         _budget_context = turn_messages(messages)
+diff --git a/agent/turn_iteration_prep.py b/agent/turn_iteration_prep.py
+index 4b4dfbe7f0..c1de618b2c 100644
+--- a/agent/turn_iteration_prep.py
++++ b/agent/turn_iteration_prep.py
+@@ -61,8 +61,12 @@ def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any) -> bool:
+         and is_dispatcher_owned_worker_context()
+         and "kanban_complete" in getattr(agent, "valid_tool_names", ())
+     )
+-    if ratio is None and kanban_worker:
+-        ratio = 0.9
++    from agent.oneshot_footprint import agent_is_oneshot
++    # A headless ``chat -q --max-turns N`` run loses its tools at the cap, so an unwarned
++    # one-shot cannot write its deliverable afterwards (defect 4a4dc075ad).
++    oneshot = not kanban_worker and agent_is_oneshot(agent)
++    if ratio is None and (kanban_worker or oneshot):
++        ratio = 0.9 if kanban_worker else 0.8
+     budget = getattr(agent, "iteration_budget", None)
+     if (
+         ratio is None
+@@ -83,6 +87,12 @@ def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any) -> bool:
+             "review; otherwise persist a kanban_comment handoff and "
+             "continue. A diff or commit alone is not completion evidence."
+         )
++    elif oneshot:
++        notice += (
++            f" {budget.max_total - budget.used} iterations remain; when they run out, tools are "
++            "removed and only a text reply is possible, so write any files or other "
++            "deliverables now."
++        )
+     # Only the current tool-result tail is mutable; an older turn may already be cached.
+     from agent.context_compressor import _DB_PERSISTED_MARKER
+     if (not messages or messages[-1].get("role") != "tool"
+diff --git a/tests/agent/test_iteration_budget_warning.py b/tests/agent/test_iteration_budget_warning.py
+index a1fdce440b..48834dc64a 100644
+--- a/tests/agent/test_iteration_budget_warning.py
++++ b/tests/agent/test_iteration_budget_warning.py
+@@ -58,3 +58,64 @@ def test_checkpoint_rearms_per_turn_without_changing_budget_or_durable_rows(
+             assert not agent.iteration_budget.consume()
+     finally:
+         agent._session_db.close()
++
++
++def _fake_agent(*, oneshot, max_total=60, ratio=None):
++    from types import SimpleNamespace
++    from agent.iteration_budget import IterationBudget
++
++    return SimpleNamespace(
++        budget_warning_ratio=ratio, iteration_budget=IterationBudget(max_total),
++        _oneshot_session=oneshot, valid_tool_names={"terminal", "write_file"},
++        _interrupt_requested=False,
++    )
++
++
++def _run_to_cap(agent):
++    """Simulate one tool result per iteration; return the iteration of the first notice."""
++    from agent.turn_iteration_prep import _maybe_inject_iteration_budget_warning
++
++    hits = []
++    for i in range(1, agent.iteration_budget.max_total + 1):
++        agent.iteration_budget.consume()
++        msgs = [{"role": "tool", "tool_call_id": f"t{i}", "content": "ok"}]
++        if _maybe_inject_iteration_budget_warning(agent, msgs):
++            hits.append((i, msgs[-1]["content"]))
++    return hits
++
++
++def test_oneshot_without_ratio_gets_one_notice_by_80_percent(monkeypatch):
++    """Regression (defect 4a4dc075ad): a ``chat -q --max-turns 60`` reviewer used all 60
++    iterations with no warning, then lost its VERDICT.md write when tools were removed."""
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    hits = _run_to_cap(_fake_agent(oneshot=True))
++    assert len(hits) == 1, hits
++    at, text = hits[0]
++    assert at <= 48
++    assert f"{60 - at} iterations remain" in text
++    assert "tools are removed" in text
++
++
++def test_interactive_without_ratio_still_gets_no_notice(monkeypatch):
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    assert _run_to_cap(_fake_agent(oneshot=False)) == []
++
++
++def test_configured_ratio_wins_for_oneshot(monkeypatch):
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    hits = _run_to_cap(_fake_agent(oneshot=True, ratio=0.5))
++    assert [h[0] for h in hits] == [30]
++
++
++def test_cap_exhaustion_logs_one_countable_line(caplog):
++    import logging
++    from agent.turn_finalizer import _log_iteration_cap_exhausted
++
++    agent = _fake_agent(oneshot=True, max_total=6)
++    agent.platform, agent.max_iterations = "cli", 6
++    agent._iteration_budget_warning_injected = True
++    log = logging.getLogger("agent.conversation_loop")
++    with caplog.at_level(logging.WARNING, logger=log.name):
++        _log_iteration_cap_exhausted(agent, 6, log)
++    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("iteration_cap_exhausted")]
++    assert lines == ["iteration_cap_exhausted source=cli oneshot=True warned=True used=6/6"]
+-- 
+2.51.0
+

@@ -1,0 +1,942 @@
+From 75fce4be0b395f75f2db4975e1c6430ba4a845ac Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:35:06 +0000
+Subject: [PATCH] [daveey] kanban: only the installed core migrates a home's
+ board; a SchemaAhead give-up opens a hub card
+
+On 2026-11-12 a checkout of origin/main (95fed77843) launched against laptop-1's live ~/.hermes at 23:53:41 PST
+(daveey-mini: 23:58:38) while the installed core was 2cc7101849. Its board connect added tasks.review_required,
+task_events.origin_gateway and the admission_* columns to the live kanban.db; three seconds later the gateway's
+own core found columns it does not declare (SchemaAhead) and gave up the Board sync role until each host's core
+update, hours later. Nothing turned that into a card.
+
+1. hermes_cli/kanban_schema_owner.py: one predicate (decide) for every board migration entry point. The home's
+   installed core (<home>/hermes-agent, the checkout the launcher and hermes-core-python resolve), or a tree at
+   its commit, migrates as before; a home with no install migrates as before. Any other checkout (worktree,
+   scratch clone, prebuilt env at another HEAD) opening a board whose schema it would change opens it read-only
+   (mode=ro): reads work, writes raise BoardSchemaNotOwned with one line naming the installed core and its
+   commit, the missing columns, and `HERMES_HOME=$(mktemp -d)` for a scratch home. A board already at this
+   core's schema opens normally. kanban_db_connect.connect (which init_db and every board open use) asks it
+   before SCHEMA_SQL / the column pass.
+2. post_update: a kanban_board_schema home step. Boot home maintenance from a non-installed checkout logs
+   "skipping board migrations" and records the skip; the installed core leaves it to its first board connect.
+3. hermes_cli/kanban_sync_schema_alert.py: when run_forever gives the sync role up over SchemaAhead (at start or
+   mid-run), file one hub card per host incident (key kanban-sync-schema-ahead:<host>:<since>) through the
+   hermes-hub courier, since this host's Board sync is down. While that host's card is open, a new incident
+   comments on it instead. The card names the columns, the installed core and the newest core agent.log saw
+   launching against the home. A give-up during the host's own core update (installed HEAD moved past the
+   one this gateway loaded) files nothing. No Inbox.
+
+hermes-core-wt land/ship write to the board through the installed `hermes` CLI (shutil.which("hermes")), not
+the worktree's core, so they need no change.
+
+Tests: tests/hermes_cli/test_kanban_schema_owner.py (a) non-installed checkout leaves PRAGMA table_info
+unchanged and refuses writes with the line, (b) installed core / same-commit tree / no-install home migrate,
+(c) boot home maintenance from a non-installed checkout skips board migration, (d) one hub card per incident,
+a comment while open, a new card after it closes, and run_forever's give-up files it. Red on main, green here;
+one mutant per case killed.
+
+Card: t_01a1d3fb5bab541f
+---
+ hermes_cli/kanban_db_connect.py              |  20 +-
+ hermes_cli/kanban_schema_owner.py            | 245 ++++++++++++++++++
+ hermes_cli/kanban_sync_client.py             |  12 +-
+ hermes_cli/kanban_sync_schema_alert.py       | 254 +++++++++++++++++++
+ hermes_cli/post_update.py                    |  22 ++
+ tests/hermes_cli/test_kanban_schema_owner.py | 243 ++++++++++++++++++
+ 6 files changed, 792 insertions(+), 4 deletions(-)
+ create mode 100644 hermes_cli/kanban_schema_owner.py
+ create mode 100644 hermes_cli/kanban_sync_schema_alert.py
+ create mode 100644 tests/hermes_cli/test_kanban_schema_owner.py
+
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 63471574d6..d4f9ad480f 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -9,6 +9,7 @@ from __future__ import annotations
+ 
+ from hermes_cli import kanban_lockguard as _kanban_lockguard
+ from hermes_cli import kanban_run_end_lease as _run_end_lease
++from hermes_cli import kanban_schema_owner as _schema_owner
+ import contextlib
+ import json
+ import os
+@@ -931,6 +932,9 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
+     # the gateway dispatcher's next-tick connect() forever, and steady-state has
+     # nothing for it to protect (no schema/migration writes).
+     resolved = str(path.resolve())
++    if resolved in _schema_owner.READ_ONLY:  # a non-installed core found this board's schema not its own
++        return _schema_owner.open_read_only(path, _schema_owner.READ_ONLY[resolved],
++                                            timeout_s=_resolve_busy_timeout_ms() / 1000.0, text_factory=_kb._lossy_text)
+     if resolved in _INITIALIZED_PATHS:
+         conn, schema_present = _open_configured(path, _schema_is_present)
+         if schema_present:
+@@ -962,10 +966,17 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
+         _guard_existing_db_is_healthy(path)
+         resolved = str(path.resolve())
+ 
+-        def _init_if_needed(conn: sqlite3.Connection) -> None:
++        def _init_if_needed(conn: sqlite3.Connection) -> Optional[str]:
+             # Idempotent; runs under _INIT_LOCK so same-process dispatcher
+             # threads can't race the ALTER TABLE pass with stale PRAGMA snapshots.
+             if resolved not in _INITIALIZED_PATHS:
++                # Only the home's installed core changes its board's schema (kanban_schema_owner). [daveey]
++                refusal = _schema_owner.check(conn, path)
++                if refusal:
++                    return refusal
++                if refusal == "":
++                    _INITIALIZED_PATHS.add(resolved)
++                    return None
+                 conn.executescript(_kb.SCHEMA_SQL)
+                 _migrate_add_optional_columns(conn)
+                 from hermes_cli.kanban_wake_episode import ensure_schema
+@@ -975,8 +986,13 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
+                 _kb._sync.install_or_remove(conn, resolved)
+                 _ensure_activity_revision(conn, resolved)
+                 _INITIALIZED_PATHS.add(resolved)
++            return None
+ 
+-        conn, _ = _open_configured(path, _init_if_needed)
++        conn, refusal = _open_configured(path, _init_if_needed)
++    if refusal:
++        conn.close()
++        return _schema_owner.open_read_only(path, refusal, timeout_s=_resolve_busy_timeout_ms() / 1000.0,
++                                            text_factory=_kb._lossy_text)
+     return conn
+ 
+ 
+diff --git a/hermes_cli/kanban_schema_owner.py b/hermes_cli/kanban_schema_owner.py
+new file mode 100644
+index 0000000000..2c0181e3e2
+--- /dev/null
++++ b/hermes_cli/kanban_schema_owner.py
+@@ -0,0 +1,245 @@
++"""Only a home's installed core may change the schema of that home's Kanban boards. [daveey]
++
++Incident (2026-11-12, laptop-1 23:53:41 PST, daveey-mini 23:58:38 PST): a checkout of origin/main
++(95fed77843) launched against the live ``~/.hermes`` while the installed core was 2cc7101849. Its first
++board connect added ``tasks.review_required``, ``task_events.origin_gateway`` and the ``admission_*``
++columns to the live ``kanban.db``. Three seconds later each host's gateway found columns its core does not
++declare (``kanban_sync_client.SchemaAhead``) and gave up the Board sync role until that host's own core
++updated, which took hours.
++
++The installed core of a home is the checkout its launcher runs: ``<home>/hermes-agent`` (where
++``hermes-core-python`` and the ``hermes`` launcher resolve it). :func:`decide` is the one predicate every
++migration entry point asks (``kanban_db_connect.connect``/``init_db``, boot home maintenance):
++
++* the installed core itself, or any tree at the same commit (a prebuilt env of that HEAD), migrates as before;
++* any other checkout (a worktree, a scratch clone, a stage/prebuild tree, an env at another HEAD) never runs
++  the board's schema pass. When the board already has every table and column that checkout declares, it opens
++  normally. When the board lacks some, the connection opens read-only and every write fails with
++  :class:`BoardSchemaNotOwned`, whose one-line message names the installed core and suggests a scratch home.
++* a home with no recognizable installed core (temporary test homes, pip/Docker layouts) keeps today's
++  behaviour: nothing here can say which core owns it.
++"""
++from __future__ import annotations
++
++import logging
++import sqlite3
++import threading
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Optional
++
++log = logging.getLogger(__name__)
++
++__all__ = [
++    "BoardSchemaNotOwned", "Owner", "decide", "home_of_board", "installed_core", "missing_schema",
++    "open_read_only", "refusal_line", "running_core",
++]
++
++
++class BoardSchemaNotOwned(sqlite3.OperationalError):
++    """A write to a board whose schema this (non-installed) core would have to change first."""
++
++
++@dataclass(frozen=True)
++class Owner:
++    """Whether the running core may change the schema of ``home``'s boards, and why."""
++    allowed: bool
++    home: Path
++    installed: Optional[Path]
++    running: Path
++    installed_id: Optional[str] = None
++    running_id: Optional[str] = None
++    why: str = ""
++
++
++def home_of_board(db_path: Any) -> Path:
++    """The Hermes home a board file belongs to: ``<home>/kanban.db`` or ``<home>/kanban/boards/<slug>/kanban.db``."""
++    path = Path(db_path).expanduser().absolute()
++    parent = path.parent
++    if parent.parent.name == "boards" and parent.parent.parent.name == "kanban":
++        return parent.parent.parent.parent
++    return parent
++
++
++def installed_core(home: Path) -> Optional[Path]:
++    """The checkout ``home``'s launcher runs, or None when the home has none (a test or package layout)."""
++    candidate = Path(home) / "hermes-agent"
++    try:
++        if not ((candidate / ".git").exists() or (candidate / "install-stamp.json").exists()):
++            return None
++        if not (candidate / "hermes_cli").is_dir():
++            return None
++        return candidate.resolve()
++    except OSError:
++        return None
++
++
++def running_core() -> Path:
++    """The tree this process's code runs from."""
++    from pm.paths import repo_root
++    return repo_root().resolve()
++
++
++def _identity(root: Path) -> Optional[str]:
++    try:
++        from hermes_cli.boot_bootstrap import current_install_identity
++        return current_install_identity(root)
++    except Exception:  # health: allow BLE001 -- identity is a best-effort tiebreak; unknown never matches
++        return None
++
++
++_DECISIONS: dict[tuple[str, str], Owner] = {}
++_DECISIONS_LOCK = threading.Lock()
++
++
++def decide(db_path: Any, *, running: Optional[Path] = None) -> Owner:
++    """THE predicate: may the running core change the schema of the home that holds ``db_path``?
++
++    Cached per (home, running tree) for the process: an install moves only through ``hermes update``, which
++    restarts the processes that run it. The git identity is read only when the two trees differ.
++    """
++    home = home_of_board(db_path)
++    run = Path(running).resolve() if running is not None else running_core()
++    key = (str(home), str(run))
++    with _DECISIONS_LOCK:
++        hit = _DECISIONS.get(key)
++    if hit is not None:
++        return hit
++    installed = installed_core(home)
++    if installed is None:
++        # Not cached: a few stats, and a home can gain its install later in a long process (an installer).
++        return Owner(True, home, None, run, why="this home has no installed core to defer to")
++    if installed == run:
++        owner = Owner(True, home, installed, run, why="the installed core")
++    else:
++        iid, rid = _identity(installed), _identity(run)
++        if iid and rid and iid == rid:
++            owner = Owner(True, home, installed, run, iid, rid, why="the installed core's commit")
++        else:
++            owner = Owner(False, home, installed, run, iid, rid, why="not this home's installed core")
++    with _DECISIONS_LOCK:
++        _DECISIONS[key] = owner
++    return owner
++
++
++# --- what this core's schema pass would add ---------------------------------------------------------------
++
++_REFERENCE: Optional[dict[str, frozenset[str]]] = None
++_REFERENCE_LOCK = threading.Lock()
++
++
++def _reference_schema() -> dict[str, frozenset[str]]:
++    """Every table and column this core's board init declares, from one in-memory init (once per process)."""
++    global _REFERENCE
++    with _REFERENCE_LOCK:
++        if _REFERENCE is None:
++            from hermes_cli import kanban_db as kb
++            from hermes_cli import kanban_db_connect as kbc
++            from hermes_cli.kanban_wake_episode import ensure_schema
++            mem = sqlite3.connect(":memory:", isolation_level=None)
++            try:
++                mem.row_factory = sqlite3.Row
++                mem.executescript(kb.SCHEMA_SQL)
++                kbc._migrate_add_optional_columns(mem)
++                ensure_schema(mem)
++                _REFERENCE = _tables(mem)
++            finally:
++                mem.close()
++        return _REFERENCE
++
++
++def _tables(conn: sqlite3.Connection) -> dict[str, frozenset[str]]:
++    names = [r[0] for r in conn.execute(
++        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
++    return {n: frozenset(r[1] for r in conn.execute(f'PRAGMA table_info("{n}")')) for n in names}
++
++
++def missing_schema(conn: sqlite3.Connection) -> dict[str, set[str]]:
++    """Per table, what this core's schema pass would add to ``conn``'s board (``{"<table>": {"*"}}`` for a
++    missing table). Empty: the board already holds everything this core declares."""
++    live = _tables(conn)
++    out: dict[str, set[str]] = {}
++    for table, cols in _reference_schema().items():
++        have = live.get(table)
++        if have is None:
++            out[table] = {"*"}
++        elif cols - have:
++            out[table] = set(cols - have)
++    return out
++
++
++def _short(sha: Optional[str]) -> str:
++    return (sha or "unknown")[:12]
++
++
++def refusal_line(db_path: Any, owner: Owner, missing: dict[str, set[str]]) -> str:
++    """The one line a refused write (and the log) shows."""
++    named = "; ".join(f"{t}: {', '.join(sorted(c))}" for t, c in sorted(missing.items())) or "a new board"
++    return (f"kanban: {db_path} is read-only here: only this home's installed core {owner.installed} "
++            f"({_short(owner.installed_id)}) may change its schema, and this process runs {owner.running} "
++            f"({_short(owner.running_id)}), which would add ({named}). Test this checkout against a scratch "
++            "home instead: HERMES_HOME=$(mktemp -d) ...")
++
++
++# --- the read-only connection -----------------------------------------------------------------------------
++
++class _ReadOnlyBoard(sqlite3.Connection):
++    """A board opened ``mode=ro`` for a non-installed core: SQLite's bare "attempt to write a readonly
++    database" (or a statement that needs a table/column this core would have added) becomes
++    :class:`BoardSchemaNotOwned` with the refusal line."""
++
++    hermes_schema_refusal = ""
++    _SIGNS = ("readonly", "read-only", "has no column named", "no such column", "no such table")
++
++    def _translate(self, call, *args):
++        try:
++            return call(*args)
++        except BoardSchemaNotOwned:
++            raise
++        except sqlite3.OperationalError as exc:
++            if any(sign in str(exc) for sign in self._SIGNS):
++                raise BoardSchemaNotOwned(f"{self.hermes_schema_refusal} [sqlite: {exc}]") from exc
++            raise
++
++    def execute(self, *args):  # type: ignore[override]
++        return self._translate(super().execute, *args)
++
++    def executemany(self, *args):  # type: ignore[override]
++        return self._translate(super().executemany, *args)
++
++    def executescript(self, *args):  # type: ignore[override]
++        return self._translate(super().executescript, *args)
++
++
++_WARNED: set[str] = set()
++# resolved board path -> refusal line: this process opens it read-only from now on (connect's fast path).
++READ_ONLY: dict[str, str] = {}
++
++
++def open_read_only(path: Path, line: str, *, timeout_s: float, text_factory: Any) -> sqlite3.Connection:
++    """``path`` opened read-only; writes raise :class:`BoardSchemaNotOwned` (logged once per board)."""
++    from hermes_cli import kanban_lockguard
++    resolved = str(Path(path).resolve())
++    READ_ONLY[resolved] = line
++    if resolved not in _WARNED:
++        _WARNED.add(resolved)
++        log.warning("%s", line)
++    conn = kanban_lockguard.connect(Path(resolved).as_uri() + "?mode=ro", uri=True, isolation_level=None,
++                                    timeout=timeout_s, factory=_ReadOnlyBoard)
++    conn.hermes_schema_refusal = line
++    conn.row_factory = sqlite3.Row
++    conn.text_factory = text_factory
++    return conn
++
++
++def check(conn: sqlite3.Connection, path: Path) -> Optional[str]:
++    """For :func:`kanban_db_connect.connect`'s first open of ``path`` in this process: ``None`` when this core
++    may run the schema pass, ``""`` when it must skip it but the board already holds its schema, else the
++    refusal line (open read-only)."""
++    owner = decide(path)
++    if owner.allowed:
++        return None
++    missing = missing_schema(conn)
++    if not missing:
++        return ""
++    return refusal_line(path, owner, missing)
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index e257069dff..f2430d8927 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1474,9 +1474,14 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+         _log.warning("%s; kanban sync not started", exc)
+         runstate.record_down(f"not starting: {exc}")
+         return
++    from hermes_cli.kanban_sync_schema_alert import note_start
++    note_start()
+     ahead = _schema_ahead_boards(board_paths())
+     if ahead:
+-        runstate.record_down("not starting: " + "; ".join(f"board {slug}: {why}" for slug, why in ahead))
++        why = "; ".join(f"board {slug}: {refusal}" for slug, refusal in ahead)
++        runstate.record_down("not starting: " + why)
++        from hermes_cli.kanban_sync_schema_alert import on_give_up
++        on_give_up(ident.gateway, why)  # one hub card per host incident [daveey]
+         return  # give the host sync role up: a current core's gateway can take it [daveey]
+     hub = Hub(ident)
+     sync.set_lease_client(HubLeaseClient(hub))
+@@ -1518,7 +1523,10 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+             ahead = [r for r in results if (r.error or "").startswith("SchemaAhead")]
+             if ahead:
+                 _log.error("kanban sync: a newer core migrated this host's board; giving up the sync role")
+-                runstate.record_down("gave up the sync role: " + "; ".join(f"board {r.board}: {r.error}" for r in ahead))
++                why = "; ".join(f"board {r.board}: {r.error}" for r in ahead)
++                runstate.record_down("gave up the sync role: " + why)
++                from hermes_cli.kanban_sync_schema_alert import on_give_up
++                on_give_up(ident.gateway, why)  # one hub card per host incident [daveey]
+                 return
+             runstate.clear()  # a completed round: the loop runs
+             for r in results:
+diff --git a/hermes_cli/kanban_sync_schema_alert.py b/hermes_cli/kanban_sync_schema_alert.py
+new file mode 100644
+index 0000000000..c45e779c44
+--- /dev/null
++++ b/hermes_cli/kanban_sync_schema_alert.py
+@@ -0,0 +1,254 @@
++"""One hub Kanban card per host incident when a gateway gives up its Board sync role over SchemaAhead. [daveey]
++
++Incident (2026-11-12): laptop-1's gateway gave up the sync role at 23:53:44 PST and daveey-mini's at 23:58:38 PST
++(``kanban_sync_client.SchemaAhead``: a newer core had migrated the live board). Nothing turned that into a card:
++a chat found it 12 min later through a refused ``kanban_create``. Each host stayed off the Board until its own core
++update.
++
++:func:`report` runs where the loop gives the role up (``run_forever``: at start, and mid-run). The host's Board
++sync is down then, so the card goes to the hub through the ``hermes-hub`` courier (``create-task hub``), the same
++route a placement relay takes. One incident (host + the sync-state ``since``) files once; while that card is open,
++a later incident comments on it instead of opening another. The card names the columns, the installed core and the
++newest core seen launching against this home. No Inbox.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import re
++import time
++from pathlib import Path
++from typing import Callable, Optional
++
++log = logging.getLogger(__name__)
++
++HUB = "hub"
++KEY_PREFIX = "kanban-sync-schema-ahead"
++_FILE = ".sync-schema-alert.json"
++_CLOSED = ("done", "archived", "failed", "cancelled")
++# A card filed this recently but not yet in the replica (the hub client syncs it in a minute or so) still counts
++# as open, so a quick second incident comments instead of opening a duplicate.
++_FRESH_S = 6 * 3600
++_LAUNCH_RE = re.compile(r"Checkout changed since last launch \([^)]*-> git:HEAD:([0-9a-f]{7,40})\)")
++
++
++def _state_path() -> Path:
++    from hermes_cli import kanban_db as kb
++    return kb.kanban_home() / "kanban" / _FILE
++
++
++def _read_state() -> dict:
++    try:
++        data = json.loads(_state_path().read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        return {}
++    return data if isinstance(data, dict) else {}
++
++
++def _write_state(state: dict) -> None:
++    target = _state_path()
++    try:
++        target.parent.mkdir(parents=True, exist_ok=True)
++        tmp = target.with_name(f"{_FILE}.tmp")
++        tmp.write_text(json.dumps(state), encoding="utf-8")
++        tmp.replace(target)
++    except OSError:
++        log.warning("kanban sync: cannot record the SchemaAhead alert state at %s", target, exc_info=True)
++
++
++def incident_key(host: str, since: float) -> str:
++    return f"{KEY_PREFIX}:{host}:{int(since)}"
++
++
++def cores(home: Optional[Path] = None) -> dict[str, Optional[str]]:
++    """``{installed, installed_sha, newest_sha, origin_main_sha}`` for this home, each best effort.
++
++    ``newest_sha`` is the last checkout other than the installed one that agent.log says launched against this
++    home ("Checkout changed since last launch (... -> git:HEAD:<sha>)"): usually the core that migrated the board.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.boot_bootstrap import read_git_head
++    from hermes_cli.kanban_schema_owner import installed_core
++    home = home or kb.kanban_home()
++    installed = installed_core(home)
++    installed_sha = read_git_head(installed) if installed else None
++    newest = None
++    try:
++        with open(home / "logs" / "agent.log", "rb") as fh:
++            fh.seek(0, 2)
++            fh.seek(max(0, fh.tell() - 4_000_000))
++            tail = fh.read().decode("utf-8", "replace")
++        for sha in _LAUNCH_RE.findall(tail):
++            if not (installed_sha and installed_sha.startswith(sha)):
++                newest = sha
++    except OSError:
++        pass
++    origin_main = None
++    if installed:
++        from hermes_cli.boot_bootstrap import _git_binary
++        import subprocess
++        git = _git_binary()
++        if git:
++            try:
++                out = subprocess.run([git, "-C", str(installed), "rev-parse", "origin/main"], capture_output=True,
++                                     text=True, timeout=10, check=False)
++                origin_main = out.stdout.strip() if out.returncode == 0 else None
++            except (OSError, subprocess.SubprocessError):
++                origin_main = None
++    return {"installed": str(installed) if installed else None, "installed_sha": installed_sha,
++            "newest_sha": newest, "origin_main_sha": origin_main}
++
++
++def _body(host: str, why: str, since: float, info: dict) -> str:
++    when = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(since))
++    return "\n".join([
++        f"The Kanban gateway on **{host}** gave up its Board sync role at {when}: its board holds columns its "
++        "core does not declare (SchemaAhead), so this host neither pushes nor pulls cards until it runs a core "
++        "that declares them. Cards on its board with another machine's `runs_on` cannot dispatch, and "
++        "`kanban_create` with a pool `runs_on` there is refused (`sync_not_running`).",
++        "",
++        f"- Refusal: {why}",
++        f"- Installed core: `{info.get('installed') or 'unknown'}` at `{info.get('installed_sha') or 'unknown'}`",
++        f"- Newest core seen launching against this home (agent.log): `{info.get('newest_sha') or 'none logged'}`",
++        f"- origin/main in the installed checkout: `{info.get('origin_main_sha') or 'unknown'}`",
++        "",
++        "Do: 1) on that host, find what launched the newer core against the live home (agent.log \"Checkout "
++        "changed since last launch\" and \"home maintenance: code changed\" lines, hermes-sync.log, "
++        "`cache/core-update/build.log`); since core main has `kanban_schema_owner`, a non-installed checkout opens "
++        "the board read-only instead of migrating it, so name the core that did; 2) recovery is that host's core "
++        "update past the newest core (`hermes-core-wt eta`/`deliver`, or `hermes-sync core-expedite <sha>`); "
++        "3) done when `hermes kanban sync status` on that host shows `running: yes`. Never drop the columns.",
++    ])
++
++
++def _replica_open(hub_cli: str, runner) -> list[dict]:
++    rc, out, _err = runner([hub_cli, "tasks", "--gw", HUB, "--json"])
++    if rc != 0:
++        return []
++    try:
++        rows = json.loads(out or "[]")
++    except ValueError:
++        return []
++    return [r for r in rows if isinstance(r, dict) and str(r.get("status") or "") not in _CLOSED]
++
++
++def _open_card(host: str, state: dict, hub_cli: str, runner, now: float) -> Optional[str]:
++    """The id of this host's open SchemaAhead card on the hub, or None."""
++    prefix = f"{KEY_PREFIX}:{host}:"
++    rows = _replica_open(hub_cli, runner)
++    for row in rows:
++        if str(row.get("idempotency_key") or "").startswith(prefix):
++            return str(row.get("id"))
++    tid = state.get("task_id")
++    if not tid and state.get("request_id"):
++        try:
++            from hermes_cli import kanban_placement as kp
++            tid = kp.remote_task_id(state["request_id"])
++        except Exception:  # health: allow BLE001 -- a stale courier db only means "not known yet"
++            tid = None
++    if tid and now - float(state.get("filed_at") or 0) < _FRESH_S and not any(r.get("id") == tid for r in rows):
++        return str(tid)  # filed recently, not in the replica yet
++    return None
++
++
++def report(host: str, why: str, since: float, *, runner: Optional[Callable[[list[str]], tuple[int, str, str]]] = None,
++           hub_cli: Optional[str] = None, info: Optional[dict] = None, now: Optional[float] = None) -> Optional[str]:
++    """Open (or comment) this host's SchemaAhead card on the hub. Returns the request id sent, else None.
++
++    Never raises: the sync loop is already stopping when this runs."""
++    try:
++        return _report(host, why, since, runner, hub_cli, info, time.time() if now is None else now)
++    except Exception:  # health: allow BLE001 -- an alert must never break the sync loop's shutdown
++        log.warning("kanban sync: could not open the SchemaAhead card on the hub", exc_info=True)
++        return None
++
++
++def _report(host, why, since, runner, hub_cli, info, now) -> Optional[str]:
++    from hermes_cli import kanban_capability_registry as reg
++    from hermes_cli import kanban_placement as kp
++    runner = runner or kp.hub_runner
++    if runner is kp._default_runner:
++        from hermes_state_guard import _in_test_context
++        if _in_test_context():  # never file a real hub card from a test process
++            log.warning("kanban sync: SchemaAhead hub card not filed from a test process")
++            return None
++    hub_cli = hub_cli or reg.hub_cli_path(kp.config().get("hub_cli"))
++    key = incident_key(host, since)
++    state = _read_state()
++    if state.get("key") == key:
++        return None  # this incident is already on the hub
++    info = info if info is not None else cores()
++    open_tid = _open_card(host, state, hub_cli, runner, now)
++    if open_tid:
++        rid = f"{key}:comment"
++        text = (f"Again on {host} at {time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime(since))}: {why} "
++                f"(installed core {info.get('installed_sha') or 'unknown'}, newest seen "
++                f"{info.get('newest_sha') or 'none logged'})")
++        argv = [hub_cli, "request", HUB, "tasks", f"default/default/{open_tid}", "comment", "--arg",
++                f"text={text[:7900]}", "--id", rid]
++        rc, out, err = runner(argv)
++        if rc not in (0, 3):
++            log.warning("kanban sync: could not comment the SchemaAhead card %s on the hub (exit %s): %s",
++                        open_tid, rc, (err or out)[-300:])
++            return None
++        _write_state({**state, "key": key, "task_id": open_tid, "commented_at": now})
++        log.error("kanban sync: SchemaAhead again; commented hub card %s (%s)", open_tid, rid)
++        return rid
++    rid = key
++    title = f"Kanban sync gave up on {host}: a newer core migrated its board (SchemaAhead)"
++    argv = [hub_cli, "create-task", HUB, title, "--body", _body(host, why, since, info), "--assignee", "default",
++            "--origin-session", "", "--id", rid, "--option", f"idempotency_key={json.dumps(key)}",
++            "--option", "priority=900"]
++    rc, out, err = runner(argv)
++    if rc not in (0, 3):
++        log.warning("kanban sync: could not open the SchemaAhead card on the hub (exit %s): %s", rc,
++                    (err or out)[-300:])
++        return None
++    _write_state({"key": key, "request_id": rid, "task_id": None, "filed_at": now})
++    log.error("kanban sync: opened a hub card for this SchemaAhead give-up (request %s)", rid)
++    return rid
++
++
++def on_give_up(gateway: str, why: str) -> None:
++    """``run_forever``'s hook, right after it recorded the stop: the incident is that record's ``since``.
++
++    A give-up while this host's own core update is under way (the installed checkout moved past the commit this
++    process started on, and this process runs that checkout) is the update's transition, not an incident: the
++    update restarts this gateway on the new core."""
++    from hermes_cli import kanban_sync_runstate as runstate
++    if _updating():
++        log.warning("kanban sync: gave up the sync role while this host's core update is under way (%s -> %s); "
++                    "no hub card", (_START_HEAD or "")[:12], (_installed_head() or "")[:12])
++        return
++    record = runstate._read(runstate.path()) or {}
++    report(gateway, why, float(record.get("since") or time.time()))
++
++
++_START_HEAD: Optional[str] = None
++
++
++def _installed_head() -> Optional[str]:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.boot_bootstrap import read_git_head
++    from hermes_cli.kanban_schema_owner import installed_core
++    installed = installed_core(kb.kanban_home())
++    return read_git_head(installed) if installed else None
++
++
++def note_start() -> None:
++    """``run_forever`` calls this as it starts: the installed commit this gateway's code was loaded from."""
++    global _START_HEAD
++    try:
++        from hermes_cli import kanban_db as kb
++        from hermes_cli.kanban_schema_owner import installed_core, running_core
++        if installed_core(kb.kanban_home()) == running_core():
++            _START_HEAD = _installed_head()
++    except Exception:  # health: allow BLE001 -- best effort; unknown means "not updating"
++        _START_HEAD = None
++
++
++def _updating() -> bool:
++    if not _START_HEAD:
++        return False
++    now = _installed_head()
++    return bool(now) and now != _START_HEAD
+diff --git a/hermes_cli/post_update.py b/hermes_cli/post_update.py
+index c4d6f35fb1..d72070708e 100644
+--- a/hermes_cli/post_update.py
++++ b/hermes_cli/post_update.py
+@@ -301,6 +301,27 @@ def step_provision_runtimes() -> dict:
+     return {"ok": True, "refreshed": refreshed}
+ 
+ 
++def step_kanban_board_schema(project_root: Path | None = None) -> dict:
++    """Board migrations belong to the home's installed core only (``kanban_schema_owner``). [daveey]
++
++    A checkout that is not this home's installed core (a worktree, scratch clone, prebuild stage, or env at
++    another HEAD) skips them here, and its board connects open read-only rather than migrate. The installed
++    core migrates on its first board connect, as before.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_schema_owner as owner
++
++    board = kb.kanban_home() / "kanban.db"
++    running = None if project_root is None else Path(project_root)
++    decision = owner.decide(board, running=running)
++    if decision.allowed:
++        return {"ok": True, "skipped": "first-connect", "why": decision.why}
++    logger.info("home maintenance: skipping board migrations: %s is %s (%s)", decision.running, decision.why,
++                decision.installed)
++    return {"ok": True, "skipped": "not-installed-core", "installed": str(decision.installed),
++            "running": str(decision.running)}
++
++
+ # ---------------------------------------------------------------------------
+ # step registries — boot_bootstrap gates each list with the matching record
+ # ---------------------------------------------------------------------------
+@@ -310,6 +331,7 @@ HOME_STEPS: tuple = (
+     ("migrate_config", step_migrate_config),
+     ("sync_skills", step_sync_skills),
+     ("state_db_guard", step_state_db_guard),
++    ("kanban_board_schema", step_kanban_board_schema),
+     ("drop_live_plugin_catalog", step_drop_live_plugin_catalog),
+     ("expose_cli", expose_cli),
+ )
+diff --git a/tests/hermes_cli/test_kanban_schema_owner.py b/tests/hermes_cli/test_kanban_schema_owner.py
+new file mode 100644
+index 0000000000..5eb10e2967
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_schema_owner.py
+@@ -0,0 +1,243 @@
++"""Only a home's installed core changes its boards' schema; a SchemaAhead give-up opens one hub card. [daveey]
++
++Incident (2026-11-12): a checkout of origin/main (95fed77843) launched against laptop-1's live ``~/.hermes`` at
++23:53:41 PST (daveey-mini: 23:58:38) while the installed core was older. Its board connect added
++``tasks.review_required``, ``task_events.origin_gateway`` and the ``admission_*`` columns; three seconds later
++the gateway found columns its core does not declare (``SchemaAhead``) and gave up the Board sync role for hours.
++Nothing opened a card. Cases (card t_01a1d3fb5bab541f):
++
++(a) a non-installed checkout leaves an older board's ``PRAGMA table_info`` unchanged and refuses writes with a
++    line naming the installed core and a scratch home;
++(b) the installed core (or a tree at its commit) migrates as before;
++(c) boot home maintenance from a non-installed checkout skips board migrations;
++(d) a SchemaAhead give-up opens one hub card per host incident and comments on it while it is open.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_schema_owner as owner
++from hermes_cli import kanban_sync_schema_alert as alert
++from hermes_cli import post_update
++from tests.hermes_cli import kanban_sync_support as support
++
++DROPPED = ("tasks", "review_required")
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_SESSION_ID", "HERMES_KANBAN_TASK"):
++        monkeypatch.delenv(var, raising=False)
++    h = support.kanban_home(tmp_path, monkeypatch)
++    monkeypatch.setattr(owner, "_DECISIONS", {})
++    monkeypatch.setattr(owner, "READ_ONLY", {})
++    yield h
++    for path in (h / "kanban.db",):
++        kbc._INITIALIZED_PATHS.discard(str(path.resolve()))
++
++
++def _older_board(home: Path) -> Path:
++    """A board made by an older core: the current schema minus ``tasks.review_required``."""
++    db = home / "kanban.db"
++    conn = kbc.connect(db)
++    kb.create_task(conn, title="older card", assignee="default")
++    for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'").fetchall():
++        conn.execute(f'DROP TRIGGER "{name}"')  # the older core's own init recreates its triggers
++    conn.execute(f"ALTER TABLE {DROPPED[0]} DROP COLUMN {DROPPED[1]}")
++    conn.close()
++    kbc._INITIALIZED_PATHS.discard(str(db.resolve()))
++    return db
++
++
++def _columns(db: Path, table: str = "tasks") -> list[str]:
++    raw = sqlite3.connect(db)
++    try:
++        return [r[1] for r in raw.execute(f"PRAGMA table_info({table})")]
++    finally:
++        raw.close()
++
++
++def _foreign_install(home: Path) -> Path:
++    """``<home>/hermes-agent``: an installed core that is not the tree these tests run from."""
++    core = home / "hermes-agent"
++    (core / "hermes_cli").mkdir(parents=True)
++    (core / "install-stamp.json").write_text(json.dumps({"commit": "2cc7101849" + "0" * 30}))
++    return core
++
++
++# --- (a) a non-installed checkout ---------------------------------------------------------------------------
++
++def test_non_installed_checkout_leaves_the_schema_and_refuses_writes(home):
++    db = _older_board(home)
++    before = _columns(db)
++    core = _foreign_install(home)
++
++    conn = kbc.connect(db)
++    try:
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1  # reads work
++        with pytest.raises(owner.BoardSchemaNotOwned) as err:
++            kb.create_task(conn, title="from a worktree", assignee="default")
++    finally:
++        conn.close()
++    assert _columns(db) == before
++    assert DROPPED[1] not in _columns(db)
++    line = str(err.value)
++    assert str(core.resolve()) in line and "2cc7101849" in line
++    assert "HERMES_HOME=$(mktemp -d)" in line and "review_required" in line
++    assert "\n" not in line
++    # The same process keeps the board read-only on later connects.
++    again = kbc.connect(db)
++    try:
++        with pytest.raises(owner.BoardSchemaNotOwned):
++            again.execute("UPDATE tasks SET title = 'x'")
++    finally:
++        again.close()
++    assert _columns(db) == before
++
++
++def test_non_installed_checkout_opens_a_current_board_normally(home):
++    db = home / "kanban.db"
++    kbc.connect(db).close()  # created by "the installed core" (no install yet)
++    kbc._INITIALIZED_PATHS.discard(str(db.resolve()))
++    _foreign_install(home)
++    conn = kbc.connect(db)
++    try:
++        tid = kb.create_task(conn, title="compatible board", assignee="default")
++        assert conn.execute("SELECT id FROM tasks WHERE id = ?", (tid,)).fetchone()
++    finally:
++        conn.close()
++
++
++# --- (b) the installed core ---------------------------------------------------------------------------------
++
++def test_installed_core_migrates_as_before(home):
++    db = _older_board(home)
++    (home / "hermes-agent").symlink_to(owner.running_core(), target_is_directory=True)
++    conn = kbc.connect(db)
++    try:
++        kb.create_task(conn, title="installed core writes", assignee="default")
++    finally:
++        conn.close()
++    assert DROPPED[1] in _columns(db)
++
++
++def test_a_tree_at_the_installed_commit_migrates(home, monkeypatch):
++    db = _older_board(home)
++    _foreign_install(home)
++    monkeypatch.setattr(owner, "_identity", lambda root: "a" * 40)
++    kbc.connect(db).close()
++    assert DROPPED[1] in _columns(db)
++
++
++def test_home_without_an_installed_core_migrates(home):
++    db = _older_board(home)
++    kbc.connect(db).close()
++    assert DROPPED[1] in _columns(db)
++
++
++# --- (c) boot home maintenance ------------------------------------------------------------------------------
++
++def test_boot_home_maintenance_from_a_non_installed_checkout_skips_board_migration(home, caplog):
++    db = _older_board(home)
++    before = _columns(db)
++    _foreign_install(home)
++    steps = [step for step in post_update.BOOT_HOME_STEPS if step[0] == "kanban_board_schema"]
++    assert steps, "boot home maintenance has no board-schema step"
++    with caplog.at_level("INFO", logger=post_update.logger.name):
++        results = post_update.run_steps(steps)
++    assert results["kanban_board_schema"]["skipped"] == "not-installed-core"
++    assert results["kanban_board_schema"]["installed"] == str((home / "hermes-agent").resolve())
++    assert any("skipping board migrations" in r.getMessage() for r in caplog.records)
++    assert _columns(db) == before
++
++
++def test_boot_home_maintenance_of_the_installed_core_leaves_migration_to_first_connect(home):
++    (home / "hermes-agent").symlink_to(owner.running_core(), target_is_directory=True)
++    assert post_update.step_kanban_board_schema()["skipped"] == "first-connect"
++
++
++# --- (d) the hub card ---------------------------------------------------------------------------------------
++
++class FakeHubCli:
++    def __init__(self) -> None:
++        self.calls: list[list[str]] = []
++        self.open: list[dict] = []
++
++    def __call__(self, argv: list[str]):
++        self.calls.append(argv)
++        if argv[1] == "tasks":
++            return 0, json.dumps(self.open), ""
++        return 0, "queued", ""
++
++    def sent(self, verb: str) -> list[list[str]]:
++        return [c for c in self.calls if c[1] == verb]
++
++
++INFO = {"installed": "/Users/me/.hermes/hermes-agent", "installed_sha": "2cc7101849", "newest_sha": "95fed77843",
++        "origin_main_sha": "95fed77843"}
++WHY = "board default: SchemaAhead: this core does not declare columns a newer core added (tasks: review_required)"
++
++
++def test_schema_ahead_give_up_opens_one_card_per_incident_and_comments_while_open(home):
++    hub = FakeHubCli()
++
++    rid = alert.report("macbook", WHY, 900.0, runner=hub, hub_cli="hermes-hub", info=INFO, now=1_000.0)
++    creates = hub.sent("create-task")
++    assert len(creates) == 1 and rid == "kanban-sync-schema-ahead:macbook:900"
++    argv = creates[0]
++    assert argv[2] == "hub" and "macbook" in argv[3]
++    body = argv[argv.index("--body") + 1]
++    assert "review_required" in body and "2cc7101849" in body and "95fed77843" in body
++    assert 'idempotency_key="kanban-sync-schema-ahead:macbook:900"' in argv
++
++    # The same incident again (a respun refusal): nothing new.
++    assert alert.report("macbook", WHY, 900.0, runner=hub, hub_cli="hermes-hub", info=INFO, now=1_000.0) is None
++    assert len(hub.sent("create-task")) == 1 and not hub.sent("request")
++
++    # A new incident while the card is open: a comment on it, not a second card.
++    hub.open = [{"id": "t_open", "status": "ready", "idempotency_key": "kanban-sync-schema-ahead:macbook:900"}]
++    assert alert.report("macbook", WHY, 2_000.0, runner=hub, hub_cli="hermes-hub", info=INFO, now=1_000.0) == "kanban-sync-schema-ahead:macbook:2000:comment"
++    assert len(hub.sent("create-task")) == 1
++    (comment,) = hub.sent("request")
++    assert comment[2:6] == ["hub", "tasks", "default/default/t_open", "comment"]
++    assert "review_required" in comment[comment.index("--arg") + 1]
++
++    # Once that card is done, the next incident opens a new card.
++    hub.open = []
++    alert.report("macbook", WHY, 3_000.0, runner=hub, hub_cli="hermes-hub", info=INFO, now=1_000.0 + 7 * 3600)
++    assert len(hub.sent("create-task")) == 2
++
++
++def test_another_hosts_open_card_does_not_absorb_this_hosts_incident(home):
++    hub = FakeHubCli()
++    hub.open = [{"id": "t_mini", "status": "ready", "idempotency_key": "kanban-sync-schema-ahead:mini:5"}]
++    alert.report("macbook", WHY, 900.0, runner=hub, hub_cli="hermes-hub", info=INFO, now=1_000.0)
++    assert len(hub.sent("create-task")) == 1 and not hub.sent("request")
++
++
++def test_run_forever_give_up_opens_the_hub_card(home, monkeypatch):
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_placement as kp
++    from hermes_cli import kanban_sync_client as ksc
++    from tests.hermes_cli.kanban_sync_fake_board import FakeService
++    support.write_sync_config(home, True)
++    conn = kbc.connect(home / "kanban.db")
++    ksc.ensure_identity(conn, "default", "macbook")
++    conn.close()
++    monkeypatch.setitem(sync.SYNCED_COLUMNS, "tasks", sync.SYNCED_COLUMNS["tasks"] - {"review_required"})
++    hub_cli = FakeHubCli()
++    monkeypatch.setattr(kp, "hub_runner", hub_cli)
++    svc_hub = FakeService().hub("macbook")
++    monkeypatch.setattr(ksc, "load_identity", lambda: svc_hub.ident)
++    monkeypatch.setattr(ksc, "Hub", lambda ident: svc_hub)
++    monkeypatch.setattr(ksc, "board_paths", lambda: [("default", home / "kanban.db")])
++    ticks = iter(range(3))
++    ksc.run_forever(lambda: next(ticks, None) is not None, sleep=lambda _s: None)
++    (create,) = hub_cli.sent("create-task")
++    assert "review_required" in create[create.index("--body") + 1]
+-- 
+2.51.0
+

@@ -1,0 +1,403 @@
+From ac80b99f0c7789c33a7a45605d6b446fdb5f639e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:24:39 +0000
+Subject: [PATCH] [daveey] host_loop_lease: republish and expire .want,
+ release() during a hand-off wait, fixed-length metadata
+
+Follow-up to PR #2119 review 5889959799 (card t_01a1d49d43e5e19e):
+
+1. `.want` is one slot. A waiter now rewrites its `.want` once per interval from `held()`
+   while it waits: it refreshes `at`, or republishes the record when another wanter's
+   (dead, expired or lower-priority) record replaced it. A replaced record no longer
+   lets a lower-priority LOCK_NB poller keep the lease while the waiter waits silently.
+2. `.want` now carries the wanter's `interval`, and a record whose `at` is older than
+   3 x interval is ignored by holder and standbys (one WARNING per wanter). A live but
+   wedged wanter (SIGSTOPped) no longer stalls the pass. A failed `_spawn` of the
+   hand-off thread clears `_waiting` and the `.want` instead of raising out of `held()`.
+3. `release()` during a pending hand-off wait clears `_waiting` and leaves the blocked
+   fd to its thread, which unlocks and closes it on wake-up. A later `held()` on the same
+   object competes again, as the docstring says (it was False until the old thread woke).
+   The thread also closes a left-over fd on a flock error.
+4. Holder metadata is space-padded to a 1024-byte block, so a shorter rewrite never leaves
+   the old record's tail; lock-free readers retry a read that does not parse once.
+
+Proof: 6 new tests in tests/hermes_cli/test_host_loop_lease.py (republish after an
+overwritten .want, multi-process; stale .want expiry with one warning; fresh .want still
+defers; spawn failure; release() during a pending wait, multi-process with a SIGSTOPped
+holder; fixed-length metadata; torn read retried). RED: all 6 fail on bea26cbf11's module;
+GREEN: 22/22 three runs, doctor suites + lease 236 passed.
+---
+ hermes_cli/host_loop_lease.py            | 103 ++++++++++++----
+ tests/hermes_cli/test_host_loop_lease.py | 146 ++++++++++++++++++++++-
+ 2 files changed, 225 insertions(+), 24 deletions(-)
+
+diff --git a/hermes_cli/host_loop_lease.py b/hermes_cli/host_loop_lease.py
+index dec3d29bb6..568c918316 100644
+--- a/hermes_cli/host_loop_lease.py
++++ b/hermes_cli/host_loop_lease.py
+@@ -31,7 +31,14 @@ home, so profile processes of one install share one owner.
+   ``<name>.want`` (pid + start time, verified alive) and blocks on ``LOCK_EX`` in a daemon thread, so it
+   gets the lock the moment it is released (no polling gap). The holder reads ``.want`` in ``beat()`` at
+   the end of each pass and releases. Any other standby that wins the lock in that release window drops
+-  it again while a live ``.want`` of priority >= its own exists.
++  it again while a live ``.want`` of priority >= its own exists. ``.want`` is one slot: while it waits,
++  the wanter rewrites it once per interval from ``held()`` (refreshing ``at``, or republishing it when
++  another wanter's record replaced it), so a replaced record cannot starve it. A ``.want`` whose ``at``
++  is older than ``3 × interval`` is expired (one WARNING per wanter): a wanter that is alive but never
++  takes the lock (SIGSTOPped, its waiting thread failed to start) cannot make every process defer.
++* **Torn metadata.** The holder rewrites the record in place (``pwrite``), padded with spaces to a
++  fixed block so a shorter record never leaves the old one's tail; lock-free readers (standby probe,
++  :func:`holders`) still retry a read once when it does not parse.
+ * **Kill switch** ``HERMES_HOST_LOOP_LEASE=0``: ``held()`` is always True (every process runs its own
+   pass, the behaviour before this lease).
+ * **Unavailable lock** (no ``fcntl``, a directory nobody can create the file in, a filesystem without
+@@ -64,6 +71,7 @@ logger = logging.getLogger(__name__)
+ 
+ KILL_SWITCH_ENV = "HERMES_HOST_LOOP_LEASE"  # health: allow HX002 -- the card's required kill switch
+ WATCHDOG_FACTOR = 3
++META_BLOCK = 1024  # metadata is space-padded to a multiple of this, so rewrites keep the file length
+ ROLE_PRIORITY = {"gateway": 3, "serve": 2, "dashboard": 1}
+ _NAME_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
+ _LEASES: weakref.WeakSet = weakref.WeakSet()
+@@ -115,12 +123,19 @@ def _alive(pid, start) -> bool:
+         return False
+ 
+ 
+-def _read_json(path: Path) -> dict | None:
+-    try:
+-        raw = json.loads(path.read_bytes() or b"null")
+-    except (OSError, ValueError):
+-        return None
+-    return raw if isinstance(raw, dict) else None
++def _read_json(path: Path, *, retries: int = 1) -> dict | None:
++    """The JSON object in ``path``; a read that does not parse (caught mid-write) is retried once."""
++    for attempt in range(retries + 1):
++        try:
++            raw = json.loads(path.read_bytes() or b"null")
++        except OSError:
++            return None
++        except ValueError:
++            if attempt < retries:
++                continue
++            return None
++        return raw if isinstance(raw, dict) else None
++    return None
+ 
+ 
+ _ME: tuple | None = None
+@@ -170,8 +185,7 @@ class HostLoopLease:
+         self._fd: int | None = None
+         self._writable = False
+         self._held = False
+-        self._waiting = False        # a daemon thread blocks on LOCK_EX for a .want hand-off
+-        self._cancel_wait = False    # release() while waiting: drop the lock when the thread gets it
++        self._waiting = False        # a daemon thread blocks on LOCK_EX on self._fd for a .want hand-off
+         self._stop: threading.Event | None = None  # the current holding's watchdog stop flag
+         self._last_beat = 0.0
+         self._acquired_at = 0.0
+@@ -179,6 +193,7 @@ class HostLoopLease:
+         self._next_open = 0.0
+         self._unavailable_logged = False
+         self._stale_warned: tuple | None = None
++        self._stale_want_warned: tuple | None = None
+         _LEASES.add(self)
+ 
+     # -- public API ----------------------------------------------------------------------------
+@@ -188,6 +203,10 @@ class HostLoopLease:
+         if not enabled() or self._held:
+             return True
+         if self._waiting:
++            if time.monotonic() >= self._next_probe:
++                with self._mu:
++                    if self._waiting:
++                        self._keep_want()
+             return False
+         with self._mu:
+             if self._held:
+@@ -234,7 +253,10 @@ class HostLoopLease:
+                 self._drop()
+             self._clear_own_want()
+             if self._waiting:
+-                self._cancel_wait = True  # the blocked thread drops the lock and closes the fd
++                # The hand-off thread is blocked in flock() on self._fd and cannot be interrupted: leave
++                # that fd to it (it unlocks and closes it on wake-up) and start this object afresh.
++                self._waiting = False
++                self._fd = None
+                 return
+             if self._fd is not None:
+                 os.close(self._fd)
+@@ -313,6 +335,7 @@ class HostLoopLease:
+         if not held:
+             meta["released_at"] = now
+         data = json.dumps(meta).encode()
++        data += b" " * (-len(data) % META_BLOCK)  # fixed length: a shorter record leaves no old tail
+         try:
+             os.pwrite(self._fd, data, 0)
+             os.ftruncate(self._fd, len(data))
+@@ -320,9 +343,23 @@ class HostLoopLease:
+             logger.debug("host loop %s: metadata write failed: %s", self.name, exc)
+ 
+     def _live_want(self) -> dict | None:
++        """The ``.want`` record, unless its wanter is gone or it is older than 3 of its intervals."""
+         want = _read_json(self.want_path)
+         if want is None or not _alive(want.get("pid"), want.get("start")):
+             return None
++        try:
++            age = time.time() - float(want["at"])
++            limit = WATCHDOG_FACTOR * float(want.get("interval") or self.interval)
++        except (KeyError, TypeError, ValueError):
++            age, limit = float("inf"), 0.0
++        if age > limit:
++            wanter = (want.get("pid"), want.get("start"))
++            if self._stale_want_warned != wanter:
++                self._stale_want_warned = wanter
++                logger.warning("host loop %s: ignoring stale %s.want of %s pid %s (last refreshed %.0fs ago, "
++                               "> %d x interval): the wanter is alive but not taking the lease", self.name,
++                               self.name, want.get("role"), wanter[0], age, WATCHDOG_FACTOR)
++            return None
+         return want
+ 
+     def _clear_own_want(self) -> None:
+@@ -356,23 +393,43 @@ class HostLoopLease:
+             return  # another process of at least our priority is already next
+         self._want()
+ 
+-    def _want(self) -> None:
+-        """Publish ``.want`` and block on LOCK_EX in a daemon thread (caller holds ``_mu``)."""
+-        if not self._writable or self._fd is None:
+-            return
+-        record = {"pid": _me()[0], "start": _me()[1], "role": self.role,
+-                  "priority": self.priority, "at": time.time()}
++    def _publish_want(self) -> bool:
++        """Write (or refresh) this process's ``.want`` atomically."""
++        record = {"pid": _me()[0], "start": _me()[1], "role": self.role, "priority": self.priority,
++                  "interval": self.interval, "at": time.time()}
+         tmp = self.want_path.with_name(f".{self.want_path.name}.{os.getpid()}")
+         try:
+             tmp.write_text(json.dumps(record), encoding="utf-8")
+             os.replace(tmp, self.want_path)
+         except OSError as exc:
+             logger.debug("host loop %s: cannot write %s: %s", self.name, self.want_path, exc)
++            return False
++        return True
++
++    def _want(self) -> None:
++        """Publish ``.want`` and block on LOCK_EX in a daemon thread (caller holds ``_mu``)."""
++        if not self._writable or self._fd is None or not self._publish_want():
+             return
+-        self._waiting, self._cancel_wait = True, False
++        self._waiting = True
+         fd = self._fd
+         logger.info("host loop %s: %s outranks the holder; waiting for its hand-off", self.name, self.role)
+-        _spawn(lambda: self._wait_for_lock(fd), f"host-loop-want-{self.name}")
++        try:
++            _spawn(lambda: self._wait_for_lock(fd), f"host-loop-want-{self.name}")
++        except RuntimeError as exc:  # can't start new thread: a .want nobody waits on would stall the pass
++            logger.warning("host loop %s: cannot start the hand-off thread (%s); not waiting", self.name, exc)
++            self._waiting = False
++            self._clear_own_want()
++
++    def _keep_want(self) -> None:
++        """While waiting, once per interval (caller holds ``_mu``): refresh our ``.want``, or publish it
++        again when another record replaced it, unless a live wanter of at least our priority is next."""
++        self._next_probe = time.monotonic() + self.interval
++        want = self._live_want()
++        if want is not None and want.get("pid") != os.getpid() and want.get("priority", 0) >= self.priority:
++            return
++        if want is None or want.get("pid") != os.getpid():
++            logger.info("host loop %s: republishing this %s process's .want", self.name, self.role)
++        self._publish_want()
+ 
+     def _wait_for_lock(self, fd: int) -> None:
+         try:
+@@ -380,18 +437,18 @@ class HostLoopLease:
+         except OSError as exc:
+             logger.debug("host loop %s: blocking acquire failed: %s", self.name, exc)
+             with self._mu:
++                if self._fd != fd:  # release() left this fd to us
++                    os.close(fd)
++                    return
+                 self._waiting = False
+                 self._clear_own_want()  # a live .want nobody waits on would hold every standby off
+             return
+         with self._mu:
+-            self._waiting = False
+-            if self._fd != fd:  # forked child state reset or fd replaced: not ours any more
+-                return
+-            if self._cancel_wait:
++            if self._fd != fd:  # release() while we waited: the fd is ours alone to drop and close
+                 fcntl.flock(fd, fcntl.LOCK_UN)
+                 os.close(fd)
+-                self._fd = None
+                 return
++            self._waiting = False
+             self._become_holder()
+             self._clear_own_want()
+ 
+diff --git a/tests/hermes_cli/test_host_loop_lease.py b/tests/hermes_cli/test_host_loop_lease.py
+index f2861c4bde..e8b83538dd 100644
+--- a/tests/hermes_cli/test_host_loop_lease.py
++++ b/tests/hermes_cli/test_host_loop_lease.py
+@@ -275,7 +275,8 @@ def test_release_window_standby_defers_to_live_want(home):
+     directory.mkdir(parents=True)
+     waiter = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE)
+     try:
+-        want = {"pid": waiter.pid, "start": hll._start_of(waiter.pid), "priority": 3, "role": "gateway"}
++        want = {"pid": waiter.pid, "start": hll._start_of(waiter.pid), "priority": 3, "role": "gateway",
++                "at": time.time()}
+         (directory / "win.want").write_text(json.dumps(want))
+         thief = hll.HostLoopLease("win", "dashboard", interval=1, home=home)
+         assert thief.held() is False
+@@ -302,6 +303,149 @@ def test_dead_want_is_ignored(home):
+     lease.release()
+ 
+ 
++@pytest.fixture
++def sleeper():
++    """A live process that is not waiting on any lock (a wedged or phantom wanter)."""
++    proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE)
++    yield proc
++    proc.communicate(b"")
++
++
++def _want_of(home, name):
++    path = hll.lease_dir(home) / f"{name}.want"
++    return json.loads(path.read_text()) if path.exists() else None
++
++
++def test_overwritten_want_is_republished_by_its_waiter(spawn, home):
++    """Nit 1: ``.want`` is one slot. A waiter whose ``.want`` was replaced (here by a wanter that then
++    died) must publish it again, or the holder never hands off and the waiter is starved."""
++    dash = spawn("dashboard", interval=1.0)
++    wait_until(lambda: dash.state() == "HELD", timeout=20, what="dashboard holds")
++    gateway = hll.HostLoopLease("test-loop", "gateway", interval=INTERVAL, home=home)
++    try:
++        assert gateway.held() is False  # publishes .want and waits for the hand-off
++        dead = subprocess.Popen([sys.executable, "-c", "pass"])
++        dead.wait()
++        (hll.lease_dir(home) / "test-loop.want").write_text(json.dumps(
++            {"pid": dead.pid, "start": 1, "priority": 3, "role": "gateway", "at": time.time()}))
++        wait_until(gateway.held, timeout=10, what="waiter republishes its .want and gets the hand-off")
++        # (the test never beat()s, so the gateway's watchdog later gives the lease back: read the log)
++        wait_until(lambda: any("handing the lease to gateway" in line for line in dash.stderr), timeout=5,
++                   what="dashboard handed off")
++    finally:
++        gateway.release()
++
++
++def test_stale_want_expires_with_one_warning(home, sleeper, caplog):
++    """Nit 2: a live wanter that never takes the lock (SIGSTOPped, its thread never started) must
++    not make holder and standbys defer forever: a ``.want`` older than 3 intervals is ignored."""
++    directory = hll.lease_dir(home)
++    directory.mkdir(parents=True)
++    old = time.time() - 10 * INTERVAL
++    (directory / "sw.want").write_text(json.dumps({"pid": sleeper.pid, "start": hll._start_of(sleeper.pid),
++                                                   "priority": 3, "role": "gateway", "at": old,
++                                                   "interval": INTERVAL}))
++    lease = hll.HostLoopLease("sw", "dashboard", interval=INTERVAL, home=home)
++    with caplog.at_level(logging.WARNING, logger=hll.__name__):
++        assert lease.held() is True
++        lease.beat()  # the holder does not hand off to the stale wanter either
++        assert lease.held() is True
++        lease.beat()
++    warnings = [r for r in caplog.records if "stale" in r.getMessage() and ".want" in r.getMessage()]
++    assert len(warnings) == 1, [r.getMessage() for r in caplog.records]
++    lease.release()
++
++
++def test_fresh_want_from_a_live_wanter_still_defers(home, sleeper):
++    directory = hll.lease_dir(home)
++    directory.mkdir(parents=True)
++    (directory / "fw.want").write_text(json.dumps({"pid": sleeper.pid, "start": hll._start_of(sleeper.pid),
++                                                   "priority": 3, "role": "gateway", "at": time.time(),
++                                                   "interval": 60}))
++    lease = hll.HostLoopLease("fw", "dashboard", interval=INTERVAL, home=home)
++    assert lease.held() is False
++    lease.release()
++
++
++def test_want_spawn_failure_clears_waiting(home, monkeypatch):
++    """Nit 2: a ``.want`` published by a process whose waiting thread never started would hold
++    every other process off; a failed spawn clears ``_waiting`` and the ``.want``."""
++    dash = hll.HostLoopLease("sf", "dashboard", interval=60, home=home)
++    assert dash.held() is True
++    gateway = hll.HostLoopLease("sf", "gateway", interval=60, home=home)
++
++    def no_threads(target, name):
++        raise RuntimeError("can't start new thread")
++
++    monkeypatch.setattr(hll, "_spawn", no_threads)
++    assert gateway.held() is False
++    assert gateway._waiting is False
++    assert _want_of(home, "sf") is None
++    gateway._next_probe = 0.0
++    assert gateway.held() is False  # competes again (and fails again) instead of sitting in _waiting
++    monkeypatch.undo()
++    gateway.release()
++    dash.release()
++
++
++def test_release_during_pending_handoff_lets_held_compete_again(spawn, home):
++    """Nit 3: ``release()`` while the hand-off thread is still blocked must not leave ``_waiting``
++    set: a later ``held()`` on the same object asks for the lease again and gets it."""
++    dash = spawn("dashboard")
++    wait_until(lambda: dash.state() == "HELD", timeout=20, what="dashboard holds")
++    gateway = hll.HostLoopLease("test-loop", "gateway", interval=60, home=home)
++    try:
++        dash_pid = dash.proc.pid
++        dash.proc.send_signal(signal.SIGSTOP)  # no beat(), so no hand-off while we release
++        try:
++            assert gateway.held() is False
++            assert (_want_of(home, "test-loop") or {}).get("pid") == os.getpid()
++            gateway.release()
++            assert _want_of(home, "test-loop") is None
++            assert gateway._waiting is False
++            gateway._next_probe = 0.0
++            assert gateway.held() is False  # the holder is still there, but this call competed
++            assert (_want_of(home, "test-loop") or {}).get("pid") == os.getpid()
++        finally:
++            os.kill(dash_pid, signal.SIGCONT)
++        wait_until(gateway.held, timeout=10, what="gateway gets the lease after the re-ask")
++        wait_until(lambda: dash.state() == "STANDBY", timeout=5, what="dashboard handed off")
++    finally:
++        gateway.release()
++
++
++def test_meta_is_fixed_length_so_rewrites_never_leave_a_tail(home):
++    """Nit 4: a lock-free reader must never see the old record's tail after a shorter rewrite."""
++    lease = hll.HostLoopLease("fl", "serve", interval=1, home=home)
++    assert lease.held()
++    path = hll.lease_dir(home) / "fl.lock"
++    held_size = path.stat().st_size
++    lease.release()  # adds released_at
++    assert path.stat().st_size == held_size
++    assert json.loads(path.read_bytes())["held"] is False
++
++
++def test_torn_meta_read_is_retried(home, monkeypatch):
++    """Nit 4: a reader that catches the writer mid-write retries once instead of showing no holder."""
++    lease = hll.HostLoopLease("tr", "serve", interval=60, home=home)
++    assert lease.held()
++    real = Path.read_bytes
++    torn = {"left": 1}
++
++    def read_bytes(self):
++        data = real(self)
++        if self.name == "tr.lock" and torn["left"]:
++            torn["left"] -= 1
++            return data[: len(data) // 3]
++        return data
++
++    monkeypatch.setattr(Path, "read_bytes", read_bytes)
++    rows = {m["name"]: m for m in hll.holders(home)}
++    assert rows["tr"]["live"] is True and torn["left"] == 0
++    monkeypatch.undo()
++    lease.release()
++
++
+ def test_doctor_lists_holders(home, monkeypatch, capsys):
+     monkeypatch.setenv("HERMES_HOME", str(home))
+     lease = hll.HostLoopLease("doc-loop", "gateway", interval=30)
+-- 
+2.51.0
+

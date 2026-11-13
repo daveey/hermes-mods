@@ -1,0 +1,120 @@
+From eb2b2a5cae07a57c44e5ff7dfe11621569779707 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:51:25 +0000
+Subject: [PATCH] [daveey] kanban: wake-check tick logs any raising pool
+ future; CI sweep close failure keeps its result (PR #2086 review nits)
+
+Review 5889670294 on PR #2086 raised two non-blocking points:
+
+1. run_due_wake_checks(wait=True) caught only FutureTimeout/CancelledError
+   around fut.result, so the tick relied on every pool callable never
+   raising. A trailing `except Exception` now logs any pool future's
+   exception (WARNING with traceback) and the tick still returns its dict.
+2. kanban_ci_progress._sweep_db's guard also covered conn.close() in the
+   finally, so a close failure after a successful sweep was logged as
+   "sweep ... failed" and dropped the woken ids. The close is now guarded
+   on its own: logged as "closing <db> ... failed after the sweep" and the
+   sweep's result is returned.
+
+RED -> GREEN (tests/hermes_cli/test_kanban_ci_progress.py):
+- test_a_raising_pool_callable_does_not_escape_the_wake_check_tick:
+  base raises RuntimeError out of run_due_wake_checks; fixed returns.
+- test_close_failure_after_a_sweep_keeps_the_result_and_says_close:
+  base returns [] with the "sweep of ... failed" warning; fixed returns
+  ["t_woken"] with the close wording.
+
+Suites: test_kanban_ci_progress, test_kanban_wake_check_home,
+test_kanban_wake_episode, test_kanban_pr_wake, test_kanban_awaiting:
+163 passed. scripts/check --base origin/main: ok.
+---
+ hermes_cli/kanban_ci_progress.py            | 11 +++++--
+ hermes_cli/kanban_wake_check.py             |  2 ++
+ tests/hermes_cli/test_kanban_ci_progress.py | 33 +++++++++++++++++++++
+ 3 files changed, 43 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_ci_progress.py b/hermes_cli/kanban_ci_progress.py
+index 0e9dfca069..b55bf50a5c 100644
+--- a/hermes_cli/kanban_ci_progress.py
++++ b/hermes_cli/kanban_ci_progress.py
+@@ -292,8 +292,9 @@ def sweep(conn: sqlite3.Connection, *, fetch: Optional[Fetch] = None) -> list[st
+ def _sweep_db(db_path: str, home: str) -> list[str]:
+     """:func:`sweep` on a pool thread with the dispatching ``home`` bound: a pool thread does not inherit the
+     caller's context-local home, so ``dispatcher_gh_argv`` would read the launch home's gh_command_prefix.
+-    Never raises: a refused bind (``ScopeSwitchRefused``) or connect error would land in the future, and the
+-    wake-check tick's ``fut.result`` loop only catches timeouts, so it would escape the tick."""
++    Never raises: a refused bind (``ScopeSwitchRefused``) or connect error is logged here, with this sweep's
++    wording, rather than as a generic pool failure in the wake-check tick. A close failure after a finished sweep
++    is logged as a close failure and keeps the sweep's result."""
+     from pathlib import Path
+ 
+     from agent.runtime_scope import bind_profile_scope
+@@ -304,7 +305,11 @@ def _sweep_db(db_path: str, home: str) -> list[str]:
+             try:
+                 return sweep(conn)
+             finally:
+-                conn.close()
++                try:
++                    conn.close()
++                except Exception:  # keep the sweep's result: only the close failed
++                    logger.warning("kanban ci run progress: closing %s for home %s failed after the sweep",
++                                   db_path, home, exc_info=True)
+     except Exception:
+         logger.warning("kanban ci run progress: sweep of %s for home %s failed", db_path, home, exc_info=True)
+         return []
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 6b71cf628a..fe7abbef5d 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -1042,6 +1042,8 @@ def run_due_wake_checks(conn: sqlite3.Connection, *, now: Optional[int] = None,
+                 fut.result(timeout=max(0.0, deadline - time.monotonic()))
+             except (FutureTimeout, CancelledError):
+                 logger.debug("kanban wake check still running after the wait budget")
++            except Exception:  # [daveey] any pool callable's exception, not only those that never raise
++                logger.warning("kanban wake checks: a pool task raised", exc_info=True)
+     return {"submitted": submitted, "in_flight": len(in_flight())}
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_ci_progress.py b/tests/hermes_cli/test_kanban_ci_progress.py
+index 50615194b3..3b32427e17 100644
+--- a/tests/hermes_cli/test_kanban_ci_progress.py
++++ b/tests/hermes_cli/test_kanban_ci_progress.py
+@@ -398,3 +398,36 @@ def test_refused_scope_bind_does_not_escape_the_wake_check_tick(kanban_home, fak
+         assert isinstance(out, dict), out
+         assert kb.get_task(conn, tid).status == "scheduled"
+         assert any("ci run progress" in r.getMessage() and r.exc_info for r in caplog.records), caplog.text
++
++
++def test_a_raising_pool_callable_does_not_escape_the_wake_check_tick(kanban_home, monkeypatch, caplog) -> None:
++    """PR #2086 review: ``run_due_wake_checks(wait=True)`` caught only timeouts around ``fut.result``, so it
++    relied on every pool callable never raising. Any exception a pool future carries is logged, not raised."""
++    from hermes_cli import kanban_ci_progress as kcp
++
++    def boom() -> list[str]:
++        raise RuntimeError("pool callable blew up")
++
++    monkeypatch.setattr(kcp, "submit_sweep", lambda conn, pool: pool.submit(boom))
++    with kbc.connect_closing() as conn, caplog.at_level("WARNING", logger=kwc.logger.name):
++        out = kwc.run_due_wake_checks(conn, wait=True)
++    assert out == {"submitted": [], "in_flight": 0}, out
++    assert any("pool callable blew up" in str(r.exc_info[1]) for r in caplog.records if r.exc_info), caplog.text
++
++
++def test_close_failure_after_a_sweep_keeps_the_result_and_says_close(kanban_home, monkeypatch, caplog) -> None:
++    """PR #2086 review: ``_sweep_db``'s guard also covered ``conn.close()``, so a close failure after a
++    successful sweep was logged as "sweep ... failed" and dropped the woken ids."""
++    from hermes_cli import kanban_ci_progress as kcp
++
++    class Conn:
++        def close(self) -> None:
++            raise sqlite3.OperationalError("disk I/O error on close")
++
++    monkeypatch.setattr(kbc, "connect", lambda *_a, **_k: Conn())
++    monkeypatch.setattr(kcp, "sweep", lambda conn: ["t_woken"])
++    with caplog.at_level("WARNING", logger=kcp.logger.name):
++        assert kcp._sweep_db(str(kanban_home / "kanban.db"), str(kanban_home)) == ["t_woken"]
++    msgs = [r.getMessage() for r in caplog.records]
++    assert any("closing" in m and "after the sweep" in m for m in msgs), msgs
++    assert not any("failed" in m and "sweep of" in m for m in msgs), msgs
+-- 
+2.51.0
+

@@ -1,0 +1,264 @@
+From 844f323569e87d61ce7ab8ab1a35c27b5fc43469 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:40:19 +0000
+Subject: [PATCH] [daveey] kanban sync fake: validate release
+ failure_limit/block_kind/run_uid as releaseTask
+
+FakeService.release_inputs now models releaseTask's post-fence policy checks
+(transitions.ts releaseTask): failure_limit, when present, must be
+Number(value) a positive safe integer (explicit null is 0 and refused), and
+block_kind (op.block_kind ?? "transient") must be transient | assignment |
+capability. Both run after fence() and before the extra/diagnostic checks, so
+a spawn_failed release with a bad policy is `invalid` instead of the fake's
+NotImplementedError. The "not modelled" caveat is gone.
+
+release_op and the FakeHub leases route also model releaseTask's run_uid
+presence check, which runs before fence(): a missing or null run_uid is
+`invalid` (release_op raised KeyError before).
+
+Tests (tests/hermes_cli/test_kanban_sync_rejections.py):
+- bad failure_limit / block_kind -> invalid, no state change, for every
+  outcome incl. spawn_failed, on both release routes;
+- accepted policy values (JS coercion of "3", true, null block_kind);
+- missing/null run_uid -> invalid, no state change, incl. spawn_failed;
+- spawn_failed fence arms: missing lease, other holder, stale run_uid ->
+  lease_lost before any input check, on both routes (review 5890134554).
+
+Follow-up of PR #2078 reviews 5889317079 and 5890134554 (test-only).
+Card: t_01a1d4688e5d9b20
+---
+ tests/hermes_cli/kanban_sync_fake_board.py    | 75 ++++++++++++++-----
+ .../hermes_cli/test_kanban_sync_rejections.py | 69 +++++++++++++++--
+ 2 files changed, 122 insertions(+), 22 deletions(-)
+
+diff --git a/tests/hermes_cli/kanban_sync_fake_board.py b/tests/hermes_cli/kanban_sync_fake_board.py
+index 604eb50bd2..4dae804fbf 100644
+--- a/tests/hermes_cli/kanban_sync_fake_board.py
++++ b/tests/hermes_cli/kanban_sync_fake_board.py
+@@ -10,6 +10,7 @@ from __future__ import annotations
+ import copy
+ import json
+ import math
++import re
+ import time
+ from decimal import Decimal
+ from typing import Any, Optional
+@@ -59,6 +60,29 @@ def _js_stringify(value: object) -> str:
+     return json.dumps(value, ensure_ascii=False)
+ 
+ 
++_JS_DECIMAL = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?|[+-]?Infinity")
++
++
++def _js_to_number(value: object) -> float:
++    """ECMAScript ``Number(value)`` for a wire JSON value: null -> 0, booleans -> 0/1, numbers as themselves (an
++    int past the double range -> Infinity), a string trimmed (empty -> 0) and read as a decimal literal or
++    ``Infinity``, anything else NaN. Out of scope: hex/octal/binary strings and arrays (JS coerces ``[]`` to 0 and
++    ``[x]`` through ``String(x)``)."""
++    if value is None:
++        return 0.0
++    if isinstance(value, (bool, int, float)):
++        try:
++            return float(value)
++        except OverflowError:
++            return math.inf if value > 0 else -math.inf
++    if isinstance(value, str):
++        text = value.strip()
++        if not text:
++            return 0.0
++        return float(text.replace("Infinity", "inf")) if _JS_DECIMAL.fullmatch(text) else math.nan
++    return math.nan
++
++
+ class FakeService:
+     def __init__(self, *, lease_runs: bool = False, machines: Optional[dict] = None, recover: bool = False) -> None:
+         # Serve ``FakeHub.recover`` (placement recovery assigns the card); off = a Board without the route (404).
+@@ -178,6 +202,9 @@ class FakeService:
+     # transitions.ts MAX_DIAGNOSTIC_CHARS: a larger holder diagnostic is replaced by ``{diagnostic_truncated: true}``.
+     MAX_DIAGNOSTIC_CHARS = 8000
+     CANONICAL = frozenset({"crashed", "timed_out", "terminal_provider"})
++    # releaseTask's policy checks: ``block_kind`` values and Number.MAX_SAFE_INTEGER for ``failure_limit``.
++    BLOCK_KINDS = frozenset({"transient", "assignment", "capability"})
++    MAX_SAFE_INTEGER = 2**53 - 1
+ 
+     @classmethod
+     def release_diagnostic(cls, value: object) -> Optional[dict]:
+@@ -195,12 +222,20 @@ class FakeService:
+ 
+     @classmethod
+     def release_inputs(cls, op: dict) -> Optional[dict]:
+-        """Part of releaseTask's post-fence validation, before any write. The real order is ``failure_limit``
+-        (a positive safe integer when present), ``block_kind`` (transient | assignment | capability), ``op.extra ??
+-        {}``, then releaseDiagnostic. The fake models neither ``failure_limit`` nor ``block_kind`` validation (a bad
+-        value is not refused here); of the rest, in that order: an ``extra`` that is not an object is ``invalid``
+-        ("failure extra must be an object"), then :meth:`release_diagnostic`. Returns the diagnostic, or None when
+-        the caller refuses the release ``invalid``."""
++        """releaseTask's post-fence validation, before any write. releaseTask's full order is the outcome
++        (RELEASE_OUTCOMES), ``run_uid`` presence (``invalid`` when absent or null), fence(), then these, each
++        ``invalid`` on failure: ``failure_limit`` when present (``Number(op.failure_limit)`` a positive safe
++        integer, so an explicit null is 0 and refused: :func:`_js_to_number`), ``block_kind`` (``op.block_kind ??
++        "transient"`` one of BLOCK_KINDS), ``op.extra ?? {}`` an object ("failure extra must be an object"), then
++        :meth:`release_diagnostic`. The callers check the outcome, ``run_uid`` and the fence. Returns the
++        diagnostic, or None when the caller refuses the release ``invalid``."""
++        if "failure_limit" in op:
++            limit = _js_to_number(op["failure_limit"])
++            if not (math.isfinite(limit) and limit.is_integer() and 1 <= limit <= cls.MAX_SAFE_INTEGER):
++                return None
++        if op.get("block_kind") is not None and not (isinstance(op["block_kind"], str)
++                                                     and op["block_kind"] in cls.BLOCK_KINDS):
++            return None
+         extra = op.get("extra")
+         if extra is not None and not isinstance(extra, dict):
+             return None
+@@ -223,17 +258,19 @@ class FakeService:
+         """As transitions.ts releaseTask: only the lease holder's run is released; the Board ends that run, emits
+         its one outcome event (carrying :meth:`release_evidence`) and books a charged outcome exactly once.
+         Not modelled: the protocol-violation streak (a ``protocol_violation`` crash is charged like any crash), and
+-        ``spawn_failed`` (endCustody + recordTaskFailure(releaseClaim, endRun)). As in releaseTask, a spawn_failed
+-        release is fenced and its inputs validated first (a stale lease is ``lease_lost``, a non-object extra or
+-        diagnostic ``invalid``, nothing changed); one that passes both raises NotImplementedError, as on the leases
++        ``spawn_failed`` (endCustody + recordTaskFailure(releaseClaim, endRun)). As in releaseTask, every release is
++        checked first in releaseTask's order: the outcome and ``run_uid`` presence (``invalid``), fence() (a
++        missing, other-holder or stale lease is ``lease_lost``), then :meth:`release_inputs` (``invalid``), all
++        before any write; a spawn_failed release that passes them raises NotImplementedError, as on the leases
+         route."""
+-        task, run = op["task"], op["run_uid"]
+-        if op.get("outcome", "released") not in self.RELEASE_OUTCOMES:
++        task, run = op["task"], op.get("run_uid")
++        if op.get("outcome", "released") not in self.RELEASE_OUTCOMES or run is None:
+             return {"status": "rejected", "reason": "invalid"}
+         lease = b["leases"].get(task)
+         if not lease or lease["holder"] != gw or lease["run_uid"] != run:
+             return {"status": "rejected", "reason": "lease_lost"}
+-        # releaseTask's extra check and releaseDiagnostic run after fence(), before any write, for every outcome.
++        # releaseTask's policy, extra and releaseDiagnostic checks run after fence(), before any write, for every
++        # outcome.
+         diagnostic = self.release_inputs(op)
+         if diagnostic is None:
+             return {"status": "rejected", "reason": "invalid"}
+@@ -361,7 +398,9 @@ class FakeHub:
+     def leases(self, board: str, body: dict) -> dict:
+         self._check()
+         b = self.svc.board(board)
+-        task, run = body["task"], body["run_uid"]
++        task, release = body["task"], body["action"] == "release"
++        # releaseTask refuses a release with no run_uid ``invalid`` (below); grant and renew need one.
++        run: Any = body.get("run_uid") if release else body["run_uid"]
+         cur = b["leases"].get(task)
+         op_id, hlc, gw = body.get("client_op_id"), f"{9_999_999_999_998:013d}-0000-board", self.gateway
+         version = None
+@@ -394,15 +433,17 @@ class FakeHub:
+             if not cur or cur["holder"] != self.gateway or cur["run_uid"] != run:
+                 return {"status": "rejected", "reason": "lease_lost", "lease": cur}
+         else:
+-            if str(body.get("outcome") or "released") not in self.svc.RELEASE_OUTCOMES:
+-                # releaseTask checks the outcome before its fence: an unknown one (a test typo) is ``invalid``.
++            if str(body.get("outcome") or "released") not in self.svc.RELEASE_OUTCOMES or run is None:
++                # releaseTask checks the outcome, then run_uid presence, before its fence: an unknown outcome (a
++                # test typo) or a missing/null run_uid is ``invalid``.
+                 return {"status": "rejected", "reason": "invalid", "lease": cur}
+             if self.svc.lease_runs and (not cur or cur["holder"] != gw or cur["run_uid"] != run):
+                 # releaseTask's fence(): a release that does not name this gateway's live lease run is refused and
+                 # changes nothing (the card keeps its lease and mirror).
+                 return {"status": "rejected", "reason": "lease_lost", "lease": cur}
+-            # releaseTask's extra check and releaseDiagnostic run after fence(), before any write: a non-object
+-            # extra or diagnostic is ``invalid`` for every outcome and changes nothing.
++            # releaseTask's policy, extra and releaseDiagnostic checks run after fence(), before any write: a bad
++            # failure_limit or block_kind, or a non-object extra or diagnostic, is ``invalid`` for every outcome
++            # and changes nothing.
+             diagnostic = self.svc.release_inputs(body)
+             if diagnostic is None:
+                 return {"status": "rejected", "reason": "invalid", "lease": cur}
+diff --git a/tests/hermes_cli/test_kanban_sync_rejections.py b/tests/hermes_cli/test_kanban_sync_rejections.py
+index 2bd47efa78..30a1b42540 100644
+--- a/tests/hermes_cli/test_kanban_sync_rejections.py
++++ b/tests/hermes_cli/test_kanban_sync_rejections.py
+@@ -566,14 +566,22 @@ def test_fake_release_spawn_failed_is_not_modelled(live, kanban_home, route, lea
+ 
+ 
+ @pytest.mark.parametrize("route", ["leases", "ops"])
+-def test_fake_release_spawn_failed_is_fenced_first(live, kanban_home, route):
+-    """releaseTask runs fence() before the spawn_failed branch: a stale-lease spawn_failed is ``lease_lost``
+-    (not the fake's NotImplementedError) and changes nothing."""
++@pytest.mark.parametrize("fence_arm", ["missing", "other_holder", "stale"])
++@pytest.mark.parametrize("bad", [{}, {"failure_limit": 0}, {"block_kind": "blocked"}, {"extra": "host"}],
++                         ids=["valid", "failure_limit", "block_kind", "extra"])
++def test_fake_release_spawn_failed_is_fenced_first(live, kanban_home, route, fence_arm, bad):
++    """releaseTask runs fence() before its input checks and the spawn_failed branch: with no lease
++    (``not lease``), another gateway's lease (``holder != gw``) or a newer run's lease, a spawn_failed release is
++    ``lease_lost`` (not ``invalid`` for a bad input, nor the fake's NotImplementedError) and changes nothing."""
+     svc = FakeService(lease_runs=True)
+     hub, tid = _leased(live, svc)
+-    svc.board(BOARD)["leases"][tid]["run_uid"] = "run-newer"
++    leases = svc.board(BOARD)["leases"]
++    if fence_arm == "missing":
++        del leases[tid]
++    else:
++        leases[tid].update({"holder": OTHER} if fence_arm == "other_holder" else {"run_uid": "run-newer"})
+     before = copy.deepcopy(svc.board(BOARD))
+-    res = _release(route, svc, hub, tid, outcome="spawn_failed")
++    res = _release(route, svc, hub, tid, outcome="spawn_failed", **bad)
+     assert (res["status"], res["reason"]) == ("rejected", "lease_lost")
+     assert svc.board(BOARD) == before
+ 
+@@ -591,6 +599,57 @@ def test_fake_release_spawn_failed_validates_inputs_first(live, kanban_home, rou
+     assert svc.board(BOARD) == before
+ 
+ 
++@pytest.mark.parametrize("route,lease_runs", [("leases", True), ("leases", False), ("ops", True)])
++@pytest.mark.parametrize("outcome", ["released", "crashed", "timed_out", "owner_down", "spawn_failed"])
++@pytest.mark.parametrize("bad", [
++    # failure_limit: Number(value) must be a positive safe integer when present (an explicit null is 0).
++    {"failure_limit": 0}, {"failure_limit": -1}, {"failure_limit": 1.5}, {"failure_limit": None},
++    {"failure_limit": "abc"}, {"failure_limit": 2**53}, {"failure_limit": float("nan")},
++    {"failure_limit": float("inf")}, {"failure_limit": {}},
++    # block_kind: String(op.block_kind ?? "transient") must be transient | assignment | capability.
++    {"block_kind": "blocked"}, {"block_kind": ""}, {"block_kind": "Transient"}, {"block_kind": 0},
++    {"block_kind": False},
++], ids=lambda v: repr(v)[:32])
++def test_fake_release_rejects_bad_failure_policy(live, kanban_home, route, lease_runs, outcome, bad):
++    """As releaseTask's post-fence policy checks (before extra and the diagnostic): a bad ``failure_limit`` or
++    ``block_kind`` is ``invalid`` for every outcome, spawn_failed included (not the fake's NotImplementedError),
++    and changes nothing."""
++    svc = FakeService(lease_runs=lease_runs)
++    hub, tid = _leased(live, svc)
++    before = copy.deepcopy(svc.board(BOARD))
++    res = _release(route, svc, hub, tid, outcome=outcome, **bad)
++    assert (res["status"], res["reason"]) == ("rejected", "invalid")
++    assert svc.board(BOARD) == before
++
++
++@pytest.mark.parametrize("policy", [
++    {}, {"failure_limit": 1}, {"failure_limit": 3.0}, {"failure_limit": "3"}, {"failure_limit": " 2 "},
++    {"failure_limit": True}, {"failure_limit": 2**53 - 1}, {"block_kind": None}, {"block_kind": "transient"},
++    {"block_kind": "assignment"}, {"block_kind": "capability"},
++], ids=lambda v: repr(v)[:32])
++def test_fake_release_accepts_valid_failure_policy(policy):
++    """What releaseTask accepts: ``Number(failure_limit)`` a positive safe integer (JS coerces ``"3"`` and
++    ``true``), ``block_kind`` absent, null (``?? "transient"``) or one of the three kinds."""
++    assert FakeService.release_inputs(policy) == {}
++
++
++@pytest.mark.parametrize("route,lease_runs", [("leases", True), ("leases", False), ("ops", True)])
++@pytest.mark.parametrize("outcome", ["released", "crashed", "owner_down", "spawn_failed"])
++@pytest.mark.parametrize("run_uid", ["absent", None])
++def test_fake_release_without_run_uid_is_invalid(live, kanban_home, route, lease_runs, outcome, run_uid):
++    """releaseTask refuses a release with no (or a null) ``run_uid`` ``invalid`` before its fence (so not
++    ``lease_lost``, nor a KeyError or NotImplementedError in the fake), and nothing changes."""
++    svc = FakeService(lease_runs=lease_runs)
++    hub, tid = _leased(live, svc)
++    before = copy.deepcopy(svc.board(BOARD))
++    body = {"task": tid, "client_op_id": "r", "outcome": outcome,
++            **({} if run_uid == "absent" else {"run_uid": run_uid})}
++    res = (hub.leases(BOARD, {"action": "release", **body}) if route == "leases"
++           else svc.release_op(svc.board(BOARD), {"op": "release", **body}, ME))
++    assert (res["status"], res["reason"]) == ("rejected", "invalid")
++    assert svc.board(BOARD) == before
++
++
+ def test_release_local_change_during_read_vetoes(live, svc, monkeypatch):
+     lost_release(live, svc)
+     hub = svc.hub(ME)
+-- 
+2.51.0
+

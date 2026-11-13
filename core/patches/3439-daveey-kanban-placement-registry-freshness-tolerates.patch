@@ -1,0 +1,307 @@
+From 8bd0764c020435cf431550f5921edda36684b807 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:23:21 +0000
+Subject: [PATCH] [daveey] kanban placement: registry freshness tolerates 5 s
+ Board clock skew; named machines use the same window
+
+Closes the non-blocking nits of the independent exact-head review of PR #2100 (t_01a1d48b563e779b,
+GitHub review 5889847287).
+
+1. kanban_placement_coordination._fresh rejected any negative age (`0 <= age`). last_seen is stamped by the
+   Board's clock and a just-refreshed entry's margin is sub-second (worker-7: 0.06 s), so a host whose clock
+   lags the Board by ~0.1 s read a fresh machine as "from the future", i.e. stale. Since #2100 that check gates
+   queue liveness (label_machines, so pool_route and queue_decision) as well as attestation (eligible). It now
+   allows SKEW_S = 5 s of future skew; a stamp further ahead stays stale.
+2. Docstrings (label_machines, pool_route, queue_decision) record the Board-outage behavior: wn.registry() keeps
+   the last good snapshot, every entry is stale FRESH_S later, so deny-route cards go worker-first (a denied
+   mandatory pin is refused) and portable cards stay local instead of queueing on pool:worker (fails closed).
+3. _machine_picks_up for a named machine (heavy_route: worker-1) ignored last_seen while pool and label-set
+   liveness required it. Decision: apply the same window. A machine silent past FRESH_S leases nothing (the
+   Board's selection skips it), so a machine:<name> pin to it strands the card; with the window, legacy
+   routing stands instead. The named branch now goes through label_machines with the empty label set, so all
+   three liveness checks share one rule.
+
+Tests: new tests/hermes_cli/test_kanban_placement_freshness.py (skew rows for _fresh, label_machines,
+_machine_picks_up and eligible; named-machine freshness rows; a stale heavy_route worker is not pinned).
+Registry fixtures that feed named-machine heavy routing now stamp last_seen (seen_now / _machine).
+
+Proof: RED on 45a4b03cbc (origin/main + #2100): 11 of the new tests fail (skew -0.1/-4.9 s stale, SKEW_S
+missing, stale/missing last_seen named machine still picks up, stale heavy_route still pinned). GREEN on head:
+the 140 test files importing the placement modules or the Board registry (3424 passed, 2 skipped).
+---
+ hermes_cli/kanban_hub_admission_placement.py  |  4 +
+ hermes_cli/kanban_placement.py                | 18 +++--
+ hermes_cli/kanban_placement_coordination.py   |  6 +-
+ hermes_cli/kanban_worker_placement.py         |  4 +-
+ tests/hermes_cli/test_kanban_placement.py     |  3 +-
+ .../test_kanban_placement_freshness.py        | 73 +++++++++++++++++++
+ .../test_kanban_pool_carried_inputs.py        |  4 +-
+ .../test_kanban_sync_schema_guard.py          |  5 +-
+ tests/hermes_cli/test_kanban_worker_node.py   |  7 +-
+ 9 files changed, 109 insertions(+), 15 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_placement_freshness.py
+
+diff --git a/hermes_cli/kanban_hub_admission_placement.py b/hermes_cli/kanban_hub_admission_placement.py
+index 682882beb0..27be68be66 100644
+--- a/hermes_cli/kanban_hub_admission_placement.py
++++ b/hermes_cli/kanban_hub_admission_placement.py
+@@ -531,6 +531,10 @@ def pool_route(args, cfg, gateway, audit, requires, *, queue=True, machine_ok=No
+ 
+     Never a ``machine:worker-N`` pin. The queue's coordination labels include ``requires``'
+     (``hub:write`` -> ``capability:hub-write``), so only a hub-write worker claims it.
++
++    Live means fresh in the Board registry (:func:`kanban_placement.label_machines`). During a Board outage the
++    last good registry snapshot goes stale after ``FRESH_S``, so a denied card goes worker-first (or a denied
++    mandatory pin is refused) rather than queueing on a label no machine is known to lease: fails closed.
+     """
+     from hermes_cli import kanban_placement as kp
+     from hermes_cli import kanban_placement_coordination as coordination
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index a5db821ea4..3c398634fb 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -277,7 +277,13 @@ def route_labels(dest: str) -> list[str]:
+ def label_machines(label: str | Iterable[str], machines: Optional[dict] = None) -> list[str]:
+     """Active, unheld, fresh registry machines that carry ``label`` (or every label of a list/set) and pick up
+     other gateways' cards (sorted). Fresh is coordination attestation's window (``last_seen`` within
+-    ``FRESH_S``): a stale entry holding the whole set leases nothing, so it must not make a queue look live."""
++    ``FRESH_S``, up to ``SKEW_S`` ahead of this clock): a stale entry holding the whole set leases nothing, so it
++    must not make a queue look live.
++
++    Board outage: ``wn.registry()`` keeps the last good snapshot, so ``FRESH_S`` after the last successful fetch
++    every entry is stale and this returns []. Callers then fail closed: hub-admission deny-route cards go
++    worker-first (:func:`kanban_hub_admission_placement.pool_route`) and portable cards keep their local placement
++    (:func:`kanban_worker_placement.queue_decision`) instead of queueing on a pool label nobody may lease."""
+     from hermes_cli import kanban_worker_node as wn
+     from hermes_cli.kanban_placement_coordination import _fresh
+     if machines is None:
+@@ -668,19 +674,19 @@ def _routeless_heavy(args: dict, c: _Cfg, self_gw: Optional[str],
+ 
+ 
+ def _machine_picks_up(name: str | Iterable[str]) -> bool:
+-    """``name`` is an active machine in the Board registry that is not held (draining) and has not turned
++    """``name`` is an active, fresh machine in the Board registry that is not held (draining) and has not turned
+     pickup off. The Board registry does not publish ``pickup`` today (10-28: every entry lacked it, the hub
+     and worker-1 included, though both claim ``runs_on`` cards), so a missing field counts as on:
+     ``heavy_route`` naming the worker is the operator saying it picks up. A pool label (:func:`is_pool_label`) is
+     live when some fresh such machine carries it; a label collection (queue label + coordination labels) when one
+-    carries all (:func:`label_machines`)."""
++    carries all (:func:`label_machines`). A named machine uses the same window: one silent past ``FRESH_S`` leases
++    nothing (the Board's selection skips it), so a ``machine:<name>`` pin to it would strand the card."""
+     from hermes_cli import kanban_worker_node as wn
+     if not isinstance(name, str) or is_pool_label(name):
+         return bool(label_machines(name))
+     entry = ((wn.registry() or {}).get("machines") or {}).get(name)
+-    if not entry or entry.get("state", "active") != "active" or entry.get("hold"):
+-        return False
+-    return "pickup" not in entry or wn.advertises_pickup(entry)
++    # The empty label set: every other rule (active, unheld, pickup, fresh) is label_machines'.
++    return bool(label_machines((), {name: entry}))
+ 
+ 
+ def target_live(target: str, *, now: float, live_seconds: int,
+diff --git a/hermes_cli/kanban_placement_coordination.py b/hermes_cli/kanban_placement_coordination.py
+index f1a6094731..ca177e461c 100644
+--- a/hermes_cli/kanban_placement_coordination.py
++++ b/hermes_cli/kanban_placement_coordination.py
+@@ -150,6 +150,10 @@ def destinations(cfg, target=None):
+ 
+ 
+ FRESH_S = 300
++# ``last_seen`` is stamped by the Board's clock, and a just-refreshed entry's margin is sub-second (worker-7: 0.06 s),
++# so a host whose clock lags the Board by ~0.1 s reads it as from the future. A few seconds of future skew is lag,
++# not a bad stamp; further ahead stays stale. Queue liveness (label_machines) and attestation (eligible) share it.
++SKEW_S = 5
+ 
+ 
+ def _machines():
+@@ -164,7 +168,7 @@ def _fresh(entry, now):
+         age = now - float(entry.get("last_seen")) / 1000
+     except (TypeError, ValueError, OverflowError):
+         return False
+-    return math.isfinite(age) and 0 <= age <= FRESH_S
++    return math.isfinite(age) and -SKEW_S <= age <= FRESH_S
+ 
+ 
+ def eligible(names, machines, *, now=None):
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 5c3dffb93d..85d3834173 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -110,7 +110,9 @@ def queue_decision(args, cfg, gateway, pin, machine_ok=None):
+     too: chat ownership pins storage, not execution (t_01a1d0571c2f07d6). On a pool worker a built-in local-marker
+     hit queues too, with its group's labels and a ``note`` (:func:`unmet_markers`). Either way the card queues only
+     when one active, unheld machine holds the whole label set (queue, group and coordination labels), judged by
+-    ``machine_ok`` (given the label tuple) or the registry; else the local keep stands. [daveey]
++    ``machine_ok`` (given the label tuple) or the registry; else the local keep stands. The registry counts only
++    machines seen within ``FRESH_S`` (:func:`kanban_placement.label_machines`), so during a Board outage the card
++    stays local once the last good snapshot ages out, instead of queueing on ``pool:worker``. [daveey]
+     """
+     from hermes_cli import kanban_placement as placement
+     from hermes_cli import kanban_placement_coordination as coordination
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index 524cf5d690..ace6ea1562 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -1430,7 +1430,8 @@ def test_configured_heavy_markers_replace_the_builtin_list():
+ ])
+ def test_heavy_route_machine_check_reads_the_board_registry(monkeypatch, entry, ok):
+     from hermes_cli import kanban_worker_node as wn
+-    machines = {"worker-1": entry} if entry else {}
++    # Seen just now: a named machine is held to the same FRESH_S window (test_kanban_placement_freshness).
++    machines = {"worker-1": {**entry, "last_seen": time.time() * 1000}} if entry else {}
+     monkeypatch.setattr(wn, "registry", lambda: {"me": "macbook", "machines": machines})
+     assert kp._machine_picks_up("worker-1") is ok
+ 
+diff --git a/tests/hermes_cli/test_kanban_placement_freshness.py b/tests/hermes_cli/test_kanban_placement_freshness.py
+new file mode 100644
+index 0000000000..531e0db129
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_placement_freshness.py
+@@ -0,0 +1,73 @@
++"""Registry freshness for Kanban placement liveness: clock skew and named machines. [daveey]
++
++PR #2100 review nits (t_01a1d48b563e779b, GitHub review 5889847287):
++
++1. ``kanban_placement_coordination._fresh`` rejected any negative age. ``last_seen`` is stamped by the Board's
++   clock, and observed margins are sub-second (worker-7: 0.06 s), so a host whose clock lags the Board by ~0.1 s saw
++   a just-refreshed machine as "from the future", i.e. stale. It now gates queue liveness (``label_machines``) as
++   well as attestation (``eligible``), so a small future skew (``SKEW_S``) counts as fresh; a far-future stamp does not.
++3. ``_machine_picks_up`` for a named machine (``heavy_route: worker-1``) ignored ``last_seen`` while pool and
++   label-set liveness required it. A machine silent past ``FRESH_S`` leases nothing either way (the Board's
++   ``available`` skips it), so it now uses the same window.
++"""
++from __future__ import annotations
++
++import time
++
++import pytest
++
++from hermes_cli import kanban_placement as kp
++from hermes_cli import kanban_placement_coordination as coord
++from hermes_cli import kanban_worker_node as wn
++
++
++def _entry(age_s, **extra):
++    """An active pool:worker entry last seen ``age_s`` seconds ago (negative = ahead of this host's clock)."""
++    entry = {"state": "active", "labels": ["pool:worker", "capability:hub-write"], **extra}
++    if age_s is not None:
++        entry["last_seen"] = (time.time() - age_s) * 1000
++    return entry
++
++
++@pytest.mark.parametrize("age_s,fresh", [
++    (-0.1, True),    # the Board's clock 0.1 s ahead of this host: a just-refreshed machine
++    (-4.9, True),
++    (-6, False),     # past the skew allowance: a bad stamp, not lag
++    (-120, False),
++    (0, True), (299, True), (301, False), (None, False),
++])
++def test_fresh_allows_small_future_skew(age_s, fresh):
++    assert coord._fresh(_entry(age_s), time.time()) is fresh
++
++
++def test_skew_allowance_is_small_next_to_the_window():
++    assert getattr(coord, "SKEW_S", None) == 5 and coord.FRESH_S == 300
++
++
++@pytest.mark.parametrize("age_s,live", [(-0.1, True), (-4.9, True), (-6, False)])
++def test_queue_liveness_and_attestation_share_the_skew_allowance(monkeypatch, age_s, live):
++    entry = _entry(age_s)
++    monkeypatch.setattr(wn, "registry", lambda: {"me": "hub", "machines": {"worker-7": entry}})
++    want = ["worker-7"] if live else []
++    assert kp.label_machines(("pool:worker", "capability:hub-write")) == want
++    assert kp._machine_picks_up(("pool:worker", "capability:hub-write")) is live
++    assert coord.eligible(["worker-7"], {"worker-7": {**entry, "pickup": "explicit"}}) == want
++
++
++@pytest.mark.parametrize("age_s,ok", [(0, True), (60, True), (-0.1, True), (None, False), (301, False),
++                                      (3600, False), (-120, False)])
++def test_named_machine_uses_the_same_freshness_window(monkeypatch, age_s, ok):
++    entry = _entry(age_s)
++    monkeypatch.setattr(wn, "registry", lambda: {"me": "hub", "machines": {"worker-1": entry}})
++    assert kp._machine_picks_up("worker-1") is ok
++
++
++def test_stale_named_heavy_route_keeps_legacy_routing(monkeypatch):
++    """A heavy card bound for a named worker silent past FRESH_S is not pinned to it (nobody would claim it)."""
++    cfg = {"heavy_route": {"hub": "worker-1"}}
++    args = {"title": "Run the full test suite"}
++    for age_s, pinned in ((5, True), (600, False)):
++        entry = _entry(age_s)
++        monkeypatch.setattr(wn, "registry", lambda: {"me": "hub", "machines": {"worker-1": entry}})
++        d = kp.decide(args, cfg=cfg, self_gw="hub")
++        assert (d.get("runs_on") == ["machine:worker-1"]) is pinned, (age_s, d)
+diff --git a/tests/hermes_cli/test_kanban_pool_carried_inputs.py b/tests/hermes_cli/test_kanban_pool_carried_inputs.py
+index 0f9ce56a2a..06cab32b40 100644
+--- a/tests/hermes_cli/test_kanban_pool_carried_inputs.py
++++ b/tests/hermes_cli/test_kanban_pool_carried_inputs.py
+@@ -25,7 +25,9 @@ NAME = "/home/example/.hermes/kanban/evidence/token-broker-audit/BRIEF.md"
+ 
+ 
+ def _machine(name, labels, **extra):
+-    return {"name": name, "state": "active", "labels": labels, "hold": False, **extra}
++    # Seen now: named-machine and pool liveness both count only members seen within coordination.FRESH_S.
++    return {"name": name, "state": "active", "labels": labels, "hold": False, "last_seen": time.time() * 1000,
++            **extra}
+ 
+ 
+ @pytest.fixture
+diff --git a/tests/hermes_cli/test_kanban_sync_schema_guard.py b/tests/hermes_cli/test_kanban_sync_schema_guard.py
+index 950ecc4261..499d114980 100644
+--- a/tests/hermes_cli/test_kanban_sync_schema_guard.py
++++ b/tests/hermes_cli/test_kanban_sync_schema_guard.py
+@@ -23,6 +23,7 @@ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import kanban_sync_client as ksc
+ from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli._placement_helpers import seen_now
+ from tests.hermes_cli.kanban_sync_fake_board import FakeService
+ 
+ ME, BOARD = "hub", "default"
+@@ -340,8 +341,8 @@ def machine_pin_create(kanban_home, pre_rename_live, monkeypatch):
+     from hermes_cli import kanban_capability_registry as reg
+     from hermes_cli import kanban_worker_node as wn
+     monkeypatch.setattr(reg, "self_gateway", lambda: ME)
+-    wn.set_registry_fetch(lambda: {"me": ME, "machines": [
+-        {"name": "worker-1", "state": "active", "labels": ["linux"], "pickup": "all"}]})
++    wn.set_registry_fetch(lambda: {"me": ME, "machines": seen_now([
++        {"name": "worker-1", "state": "active", "labels": ["linux"], "pickup": "all"}])})
+     monkeypatch.setenv("HERMES_KANBAN_DB", str(kanban_home / "kanban.db"))
+     monkeypatch.setenv("HERMES_KANBAN_BOARD", BOARD)
+     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+diff --git a/tests/hermes_cli/test_kanban_worker_node.py b/tests/hermes_cli/test_kanban_worker_node.py
+index 3def8abbd5..01e68a7941 100644
+--- a/tests/hermes_cli/test_kanban_worker_node.py
++++ b/tests/hermes_cli/test_kanban_worker_node.py
+@@ -18,6 +18,7 @@ from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import kanban_sync_client as ksc
+ from hermes_cli import kanban_worker_node as wn
+ from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli._placement_helpers import seen_now
+ from tests.hermes_cli.kanban_sync_fake_board import FakeService
+ 
+ HUB, WORKER, BOARD = "hub", "worker-1", "default"
+@@ -48,7 +49,7 @@ class Gateway:
+     def enter(self):
+         self.mp.setenv("HERMES_HOME", str(self.home))
+         sync.set_lease_client(ksc.HubLeaseClient(self.svc.hub(self.name)))
+-        wn.set_registry_fetch(lambda: {"me": self.name, "machines": list(MACHINES.values())})
++        wn.set_registry_fetch(lambda: {"me": self.name, "machines": seen_now(MACHINES.values())})
+         return self.conn if hasattr(self, "conn") else None
+ 
+     def round(self):
+@@ -415,8 +416,8 @@ def test_tool_create_heavy_route_works_when_the_registry_has_no_pickup_field(gws
+     hub, _ = gws
+     hub.enter()
+     from hermes_cli import kanban_placement as kp
+-    wn.set_registry_fetch(lambda: {"me": HUB, "machines": [
+-        {k: v for k, v in MACHINES[m].items() if k != "pickup"} for m in (HUB, WORKER, "macbook")]})
++    wn.set_registry_fetch(lambda: {"me": HUB, "machines": seen_now([
++        {k: v for k, v in MACHINES[m].items() if k != "pickup"} for m in (HUB, WORKER, "macbook")])})
+     monkeypatch.setattr("hermes_cli.kanban_capability_registry.self_gateway", lambda: HUB)
+     monkeypatch.setattr(kp, "config", lambda: {"route": {HUB: "elsewhere"}, "heavy_route": {HUB: WORKER}})
+     monkeypatch.setattr(kp, "target_live", lambda *a, **k: None)
+-- 
+2.51.0
+

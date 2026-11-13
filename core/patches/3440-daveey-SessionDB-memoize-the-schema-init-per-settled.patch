@@ -1,0 +1,492 @@
+From 8ecf7ef242bae8e5ee61de7acf88932a035624bb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:30:11 +0000
+Subject: [PATCH] [daveey] SessionDB: memoize the schema init per settled
+ store; delegate-marker heal off the per-open path
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Design t_01a1d45d75851804 §2d (card t_01a1d47170ff4fc5). Hub py-spy: `SessionDB.__init__` ->
+`_open_writer` -> `_init_schema` was 6.9% of a steady serve's samples (heal 4.6%) and 3.9% of the
+gateway's. Every short-lived writable handle reran SCHEMA_SQL, the column reconcile, the PK heals and
+`_heal_reset_rows_carrying_a_delegate_marker`, a full scan of ~23k `sessions` rows (~14 ms).
+
+What changes (new `hermes_state_schema_memo.py`; `_init_schema` wraps the old body, now
+`_init_schema_full`):
+
+- Process-level memo keyed (realpath, st_dev, st_ino stat'd after connect, PRAGMA schema_version, the
+  `schema_version` table value, store_instance_id, a digest of SCHEMA_SQL/FTS DDL/SCHEMA_VERSION and the
+  migration module source, the connection class). A full init is recorded only when it left the store
+  settled: no `fts_stale`, schema at this build's SCHEMA_VERSION, message_uid backfill and legacy-refusal
+  repair done, no open transaction, and every attribute it set on `self` a plain scalar.
+- A hit restores the attributes the first init set (`_fts_enabled`, `_trigram_available`, `_fts_stale`
+  plus any other changed scalar, found by diffing `vars(self)` around the full init) after re-probing
+  both FTS tables with `LIMIT 0` reads; disagreement, any probe error or lock falls back to the full init
+  (whose lock patience owns the wait).
+- `fts_stale` is read from `state_meta` on every open; set by another handle, the open takes the full
+  init and its stale-FTS recovery.
+- A replaced/quarantined file (new inode), DDL by another process (PRAGMA schema_version) or a moved
+  data-migration level (schema_version table) reruns the full init.
+- The delegate-marker heal runs with the full init (the first open per key per process), otherwise from
+  the memo-hit open at most once per HEAL_INTERVAL_S = 600 s per store (claimed under a lock before it
+  runs; a sqlite error is logged and retried next interval, never fails the open).
+
+Tests (tests/hermes_state/test_schema_init_memo.py), RED on origin/main -> GREEN:
+second open skips init (spy on `_reconcile_columns`), cached flags restored (and search works on the
+restored handle), `fts_stale` set by another handle seen on the next open, heal throttled to one per
+interval and the throttled heal still repairs a polluted row. Guards that also hold on main: inode swap
+reruns, external ALTER TABLE reruns, downgraded schema_version table reruns migrations, a runtime whose
+trigram probe fails does not inherit the flag. test_reset_row_delegate_marker's two reopen-after-surgery
+tests now clear the memo first (the heal runs on a process's first open, as there).
+tests/hermes_state/ full run: green apart from 3 failures fixed by the probe check / connection-class key
+(test_write_lock_patience writer race, TestFtsRebuildFinishWithoutTrigram x2), then those 4 files
+319 passed. scripts/check --base origin/main: ok.
+
+Micro-bench (hermes-worker-5, 23,000-row `sessions`, N=200 sequential `SessionDB(path).close()` after
+one warm open; same interpreter):
+  origin/main: 4.263 s total, 21.32 ms/open
+  this change: 2.772 s total, 13.86 ms/open
+cProfile, 100 opens: `_init_schema` cumulative 8.2 ms/open (heal 5.4 ms) -> 0.49 ms/open. Most of
+what remains per open is `refuse_deleted_wal_generation`'s system-wide /proc holder scan (~19 ms/open
+under the profiler), outside this card's scope.
+---
+ hermes_state_schema.py                        |  10 +
+ hermes_state_schema_memo.py                   | 170 ++++++++++++++++
+ .../test_reset_row_delegate_marker.py         |  10 +
+ tests/hermes_state/test_schema_init_memo.py   | 190 ++++++++++++++++++
+ 4 files changed, 380 insertions(+)
+ create mode 100644 hermes_state_schema_memo.py
+ create mode 100644 tests/hermes_state/test_schema_init_memo.py
+
+diff --git a/hermes_state_schema.py b/hermes_state_schema.py
+index d77b74793c..434e37daee 100644
+--- a/hermes_state_schema.py
++++ b/hermes_state_schema.py
+@@ -976,6 +976,16 @@ class SessionSchemaMixin:
+     # ── _init_schema ───────────────────────────────────────────────────────
+ 
+     def _init_schema(self):
++        """Full init once per settled store and schema per process; later opens restore its flags
++        (hermes_state_schema_memo, design t_01a1d45d75851804 §2d)."""
++        import hermes_state_schema_memo as memo  # lazy: the memo module imports this one
++        if memo.try_restore(self):
++            return
++        before = memo.snapshot(self)
++        self._init_schema_full()
++        memo.record(self, before)
++
++    def _init_schema_full(self):
+         """Create tables and FTS if missing, reconcile columns, run data migrations. Column
+         additions are declarative via _reconcile_columns(), so reordered migrations can
+         never skip a column; schema_version remains for data migrations only."""
+diff --git a/hermes_state_schema_memo.py b/hermes_state_schema_memo.py
+new file mode 100644
+index 0000000000..b4b75c7a32
+--- /dev/null
++++ b/hermes_state_schema_memo.py
+@@ -0,0 +1,170 @@
++"""[daveey] Process-level memo of a settled ``SessionDB._init_schema`` (design t_01a1d45d75851804 §2d).
++
++Every short-lived writable ``SessionDB`` used to rerun the whole schema init: ``SCHEMA_SQL``, the column
++reconcile, the PK heals and a full ``sessions`` scan for stray delegate markers (~6.9% of a steady serve's
++samples on the hub). Once one open in this process has run the full init on a store and left it settled,
++later opens of the SAME file at the SAME schema only restore the per-instance flags that init set.
++
++The memo key is the file identity stat'd after connecting (realpath, st_dev, st_ino), SQLite's
++``PRAGMA schema_version`` (bumped by every DDL, from any process), the ``schema_version`` table value
++(data-migration level), ``store_instance_id`` and a digest of this build's schema code. A hit also
++re-probes the two FTS tables (``LIMIT 0``) and must agree with the memoized flags. Any change, a
++replaced or quarantined file, or a store not yet settled (stale FTS, an unfinished budgeted backfill or
++repair) reruns the full init. ``fts_stale`` is read on every open; set by another handle, it forces the
++full init, whose stale-FTS path is the one that must run.
++
++The delegate-marker heal is data repair, not schema: it runs with the full init (the first open per key
++per process) and otherwise at most once per ``HEAL_INTERVAL_S`` per store, from the memo-hit open.
++"""
++from __future__ import annotations
++
++import hashlib
++import logging
++import os
++import sqlite3
++import threading
++import time
++from typing import Any, Optional
++
++logger = logging.getLogger("hermes_state")
++
++HEAL_INTERVAL_S = 600.0
++# Always restored on a hit, whatever the first init left them at; other changed scalars are found by diff.
++_ALWAYS_RESTORED = ("_fts_enabled", "_trigram_available", "_fts_stale")
++_SIMPLE = (bool, int, float, str, bytes, type(None))
++
++_lock = threading.Lock()
++_memo: dict[tuple, dict[str, Any]] = {}  # key -> attributes the full init set on self
++_last_heal: dict[str, float] = {}  # realpath -> monotonic time of the last delegate-marker heal
++_code_digest: Optional[str] = None
++
++
++def clear() -> None:
++    """Forget every memoized store (tests; a deliberate in-process reinit)."""
++    global _code_digest
++    with _lock:
++        _memo.clear()
++        _last_heal.clear()
++        _code_digest = None
++
++
++def _schema_code_digest() -> str:
++    global _code_digest
++    if _code_digest is None:
++        import hermes_state_common as common
++        import hermes_state_schema as schema
++
++        h = hashlib.sha256()
++        for part in (common.SCHEMA_SQL, common.DEFERRED_INDEX_SQL, common.FTS_SQL, common.FTS_TRIGRAM_SQL,
++                     str(common.SCHEMA_VERSION), str(common.FTS_STORAGE_VERSION)):
++            h.update(part.encode("utf-8", "surrogatepass"))
++            h.update(b"\0")
++        try:
++            with open(schema.__file__, "rb") as f:  # the migration code itself
++                h.update(f.read())
++        except OSError:
++            pass
++        _code_digest = h.hexdigest()
++    return _code_digest
++
++
++def _settled_meta_keys() -> tuple[str, ...]:
++    from hermes_state_common import FTS_STALE_KEY
++    from hermes_state_legacy_refusal import LEGACY_REFUSAL_REPAIR_DONE
++    from hermes_state_schema import _MESSAGE_UID_BACKFILL_DONE
++    return (FTS_STALE_KEY, "store_instance_id", LEGACY_REFUSAL_REPAIR_DONE, _MESSAGE_UID_BACKFILL_DONE)
++
++
++def _probe(db_path, conn: sqlite3.Connection) -> Optional[tuple[tuple, dict[str, Any]]]:
++    """``(key, state_meta subset)`` for the open file, or None when it cannot be read cheaply."""
++    try:
++        real = os.path.realpath(db_path)
++        st = os.stat(real)
++        pragma_version = conn.execute("PRAGMA schema_version").fetchone()[0]
++        row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
++        keys = _settled_meta_keys()
++        marks = ", ".join("?" for _ in keys)
++        meta = {r[0]: r[1] for r in conn.execute(
++            f"SELECT key, value FROM state_meta WHERE key IN ({marks})", keys).fetchall()}
++    except (OSError, sqlite3.Error):
++        return None
++    key = (real, st.st_dev, st.st_ino, pragma_version, None if row is None else row[0],
++           meta.get("store_instance_id"), _schema_code_digest(),
++           type(conn))  # the connection class decides what this runtime's SQLite can do (tests swap it)
++    return key, meta
++
++
++def _settled(meta: dict[str, Any]) -> bool:
++    from hermes_state_common import FTS_STALE_KEY
++    # store_instance_id is part of the key, not required: stores created before #97568 lack it.
++    return FTS_STALE_KEY not in meta and all(k in meta for k in _settled_meta_keys()[2:])
++
++
++def snapshot(db) -> dict[str, Any]:
++    """Instance attributes before the full init, to diff against afterwards."""
++    return dict(vars(db))
++
++
++def record(db, before: dict[str, Any]) -> None:
++    """Remember a successful full init when it left the store settled at this build's schema."""
++    probed = _probe(db.db_path, db._conn)
++    if probed is None:
++        return
++    key, meta = probed
++    from hermes_state_common import SCHEMA_VERSION
++    if not _settled(meta) or key[4] != SCHEMA_VERSION or db._conn.in_transaction:
++        return
++    after = vars(db)
++    changed = {name: value for name, value in after.items()
++               if name in _ALWAYS_RESTORED or before.get(name, _MISSING) is not value}
++    if not all(isinstance(v, _SIMPLE) for v in changed.values()):
++        return  # an init that set a mutable object on self is not safely replayable
++    with _lock:
++        _memo[key] = changed
++        _last_heal[key[0]] = time.monotonic()  # the full init just ran the heal
++
++
++_MISSING = object()
++
++
++def try_restore(db) -> bool:
++    """On a settled, unchanged store already initialized in this process, restore its flags and
++    return True (the caller skips the full init); otherwise False."""
++    probed = _probe(db.db_path, db._conn)
++    if probed is None:
++        return False
++    key, meta = probed
++    if not _settled(meta):
++        return False
++    with _lock:
++        cached = _memo.get(key)
++    if cached is None:
++        return False
++    # Re-probe the FTS tables (LIMIT 0 reads): a runtime without the trigram tokenizer or FTS5, or an
++    # index dropped without DDL visible here, must not inherit another open's flags. A lock or any
++    # other error falls back to the full init, whose lock patience owns the wait.
++    cursor = db._conn.cursor()
++    try:
++        fts = db._fts_table_probe(cursor, "messages_fts") is True
++        trigram = fts and db._fts_table_probe(cursor, "messages_fts_trigram") is True
++    except (sqlite3.Error, UnicodeDecodeError):
++        return False
++    if fts != cached.get("_fts_enabled") or trigram != cached.get("_trigram_available"):
++        return False
++    for name, value in cached.items():
++        setattr(db, name, value)
++    _maybe_heal(db, key[0])
++    return True
++
++
++def _maybe_heal(db, real: str) -> None:
++    now = time.monotonic()
++    with _lock:
++        last = _last_heal.get(real)
++        if last is not None and now - last < HEAL_INTERVAL_S:
++            return
++        _last_heal[real] = now  # claimed before running: concurrent openers never double-scan
++    try:
++        db._heal_reset_rows_carrying_a_delegate_marker(db._conn.cursor())
++    except sqlite3.Error as exc:  # a data repair must never fail an open; the next interval retries
++        logger.debug("throttled delegate-marker heal skipped: %s", exc)
+diff --git a/tests/hermes_state/test_reset_row_delegate_marker.py b/tests/hermes_state/test_reset_row_delegate_marker.py
+index 52eff03390..adb1b8ef0d 100644
+--- a/tests/hermes_state/test_reset_row_delegate_marker.py
++++ b/tests/hermes_state/test_reset_row_delegate_marker.py
+@@ -30,6 +30,14 @@ def _reset_chat(db: SessionDB) -> None:
+     db.append_message(LIVE, "user", "the live chat")
+ 
+ 
++def _as_a_later_process() -> None:
++    """The heal runs on a store's first open per process (then at most every 10 min): forget this
++    process's schema memo so the reopen below behaves like the next process's first open."""
++    import hermes_state_schema_memo
++
++    hermes_state_schema_memo.clear()
++
++
+ def test_a_polluted_reset_row_is_listed_again_after_the_store_opens(tmp_path):
+     path = tmp_path / "state.db"
+     db = SessionDB(db_path=path)
+@@ -41,6 +49,7 @@ def test_a_polluted_reset_row_is_listed_again_after_the_store_opens(tmp_path):
+     con.commit()
+     con.close()
+ 
++    _as_a_later_process()
+     db = SessionDB(db_path=path)
+     try:
+         assert _config(db, LIVE) == {"_reset_from": OLD}
+@@ -112,6 +121,7 @@ def test_a_healed_reset_row_is_indexed_for_substring_search(tmp_path):
+     con.commit()
+     con.close()
+ 
++    _as_a_later_process()
+     db = SessionDB(db_path=path)
+     try:
+         hits = db._conn.execute(
+diff --git a/tests/hermes_state/test_schema_init_memo.py b/tests/hermes_state/test_schema_init_memo.py
+new file mode 100644
+index 0000000000..fd88108530
+--- /dev/null
++++ b/tests/hermes_state/test_schema_init_memo.py
+@@ -0,0 +1,190 @@
++"""[daveey] A settled store's schema init runs once per process; later opens restore its flags
++(design t_01a1d45d75851804 §2d: ``_init_schema`` was 6.9% of a steady serve's samples)."""
++
++from __future__ import annotations
++
++import os
++import shutil
++import sqlite3
++
++import pytest
++
++import hermes_state_schema
++from hermes_state import SessionDB
++
++
++@pytest.fixture(autouse=True)
++def fresh_memo():
++    try:
++        import hermes_state_schema_memo
++    except ImportError:  # the pre-memo build: every open runs the full init
++        yield
++        return
++    hermes_state_schema_memo.clear()
++    yield
++    hermes_state_schema_memo.clear()
++
++
++@pytest.fixture
++def counts(monkeypatch):
++    """Calls of the column reconcile (a full-init step) and of the delegate-marker heal."""
++    seen = {"reconcile": 0, "heal": 0}
++    reconcile = hermes_state_schema.SessionSchemaMixin._reconcile_columns
++    heal = hermes_state_schema.SessionSchemaMixin._heal_reset_rows_carrying_a_delegate_marker
++
++    def spy_reconcile(self, cursor):
++        seen["reconcile"] += 1
++        return reconcile(self, cursor)
++
++    def spy_heal(self, cursor):
++        seen["heal"] += 1
++        return heal(self, cursor)
++
++    monkeypatch.setattr(hermes_state_schema.SessionSchemaMixin, "_reconcile_columns", spy_reconcile)
++    monkeypatch.setattr(hermes_state_schema.SessionSchemaMixin,
++                        "_heal_reset_rows_carrying_a_delegate_marker", spy_heal)
++    return seen
++
++
++def _open_close(path):
++    db = SessionDB(db_path=path)
++    flags = (db._fts_enabled, db._trigram_available, db._fts_stale)
++    db.close()
++    return flags
++
++
++def test_a_second_open_of_a_settled_store_skips_the_schema_init(tmp_path, counts):
++    path = tmp_path / "state.db"
++    _open_close(path)
++    _open_close(path)
++    _open_close(path)
++    assert counts["reconcile"] == 1
++
++
++def test_a_skipped_init_restores_the_flags_the_first_init_set(tmp_path, counts):
++    path = tmp_path / "state.db"
++    first = _open_close(path)
++    db = SessionDB(db_path=path)
++    try:
++        assert counts["reconcile"] == 1
++        assert (db._fts_enabled, db._trigram_available, db._fts_stale) == first
++        assert db._fts_enabled is True  # restored, not the constructor default
++        db.create_session("s1", "cli")
++        db.append_message("s1", "user", "needle in the haystack")
++        assert [r["session_id"] for r in db.search_messages("needle")] == ["s1"]
++    finally:
++        db.close()
++
++
++def test_a_runtime_without_the_trigram_index_does_not_inherit_the_flag(tmp_path, counts, monkeypatch):
++    path = tmp_path / "state.db"
++    assert _open_close(path)[1] is True
++    real_probe = hermes_state_schema.SessionSchemaMixin._fts_table_probe
++
++    def no_trigram(self, cursor, table_name):
++        return None if table_name == "messages_fts_trigram" else real_probe(self, cursor, table_name)
++
++    monkeypatch.setattr(hermes_state_schema.SessionSchemaMixin, "_fts_table_probe", no_trigram)
++    db = SessionDB(db_path=path)
++    try:
++        assert counts["reconcile"] == 2  # the probe disagreed with the memo: full init
++    finally:
++        db.close()
++
++
++def test_a_replaced_file_reruns_the_init(tmp_path, counts):
++    path = tmp_path / "state.db"
++    _open_close(path)
++    copy = tmp_path / "state.db.new"
++    shutil.copy2(path, copy)
++    old_inode = os.stat(path).st_ino
++    os.replace(copy, path)
++    assert os.stat(path).st_ino != old_inode
++    _open_close(path)
++    assert counts["reconcile"] == 2
++
++
++def test_ddl_by_another_process_reruns_the_init(tmp_path, counts):
++    path = tmp_path / "state.db"
++    _open_close(path)
++    con = sqlite3.connect(path)  # e.g. an older or newer build's migration
++    con.execute("ALTER TABLE sessions ADD COLUMN external_note TEXT")
++    con.commit()
++    con.close()
++    _open_close(path)
++    assert counts["reconcile"] == 2
++
++
++def test_a_downgraded_data_version_reruns_the_migrations(tmp_path, counts):
++    path = tmp_path / "state.db"
++    _open_close(path)
++    con = sqlite3.connect(path)  # schema_version (the table) is data, not DDL
++    con.execute("UPDATE schema_version SET version = version - 1")
++    con.commit()
++    con.close()
++    _open_close(path)
++    assert counts["reconcile"] == 2
++    con = sqlite3.connect(path)
++    try:
++        assert con.execute("SELECT version FROM schema_version").fetchone()[0] == hermes_state_schema.SCHEMA_VERSION
++    finally:
++        con.close()
++
++
++def test_fts_stale_set_by_another_handle_is_seen_on_the_next_open(tmp_path, counts):
++    path = tmp_path / "state.db"
++    _open_close(path)
++    other = SessionDB(db_path=path)
++    try:
++        other.set_meta(hermes_state_schema.FTS_STALE_KEY, "1")
++    finally:
++        other.close()
++    db = SessionDB(db_path=path)
++    try:
++        # Seen: the open took the full init, whose stale-FTS recovery rebuilt the index and cleared the mark.
++        assert counts["reconcile"] == 2
++        assert db._fts_stale is False and db._fts_enabled is True
++        assert db.get_meta(hermes_state_schema.FTS_STALE_KEY) is None
++    finally:
++        db.close()
++
++
++def test_the_delegate_marker_heal_runs_at_most_once_per_interval(tmp_path, counts, monkeypatch):
++    import hermes_state_schema_memo as memo
++
++    path = tmp_path / "state.db"
++    for _ in range(4):
++        _open_close(path)
++    assert counts["heal"] == 1
++    now = memo.time.monotonic()
++    monkeypatch.setattr(memo.time, "monotonic", lambda: now + memo.HEAL_INTERVAL_S + 1)
++    _open_close(path)
++    _open_close(path)
++    assert counts["heal"] == 2
++    assert counts["reconcile"] == 1
++
++
++def test_the_throttled_heal_repairs_a_polluted_row(tmp_path, monkeypatch):
++    import hermes_state_schema_memo as memo
++
++    path = tmp_path / "state.db"
++    db = SessionDB(db_path=path)
++    db.create_session("old", "telegram", session_key="k", chat_id="c", chat_type="dm", user_id="u")
++    db.create_session("live", "telegram", parent_session_id="old", model_config={"_reset_from": "old"},
++                      session_key="k", chat_id="c", chat_type="dm", user_id="u")
++    db.close()
++    con = sqlite3.connect(path)
++    con.execute("UPDATE sessions SET model_config = json_set(model_config, '$._delegate_from', 'old') "
++                "WHERE id = 'live'")
++    con.commit()
++    con.close()
++    now = memo.time.monotonic()
++    monkeypatch.setattr(memo.time, "monotonic", lambda: now + memo.HEAL_INTERVAL_S + 1)
++    con = sqlite3.connect(path)
++    try:
++        db = SessionDB(db_path=path)
++        db.close()
++        cfg = con.execute("SELECT json_extract(model_config, '$._delegate_from') FROM sessions WHERE id='live'")
++        assert cfg.fetchone()[0] is None
++    finally:
++        con.close()
+-- 
+2.51.0
+

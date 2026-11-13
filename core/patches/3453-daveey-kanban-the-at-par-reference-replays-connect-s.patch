@@ -1,0 +1,131 @@
+From 3c68a220fba23ec1d68321fefee496991a6d7501 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:24:51 +0000
+Subject: [PATCH] [daveey] kanban: the at-par reference replays connect()'s own
+ schema steps (apply_schema_steps), so a table main adds is never judged at
+ par
+
+---
+ hermes_cli/kanban_db_connect.py              | 21 ++++++----
+ hermes_cli/kanban_schema_owner.py            |  6 +--
+ tests/hermes_cli/test_kanban_schema_owner.py | 41 ++++++++++++++++++++
+ 3 files changed, 56 insertions(+), 12 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 3dc60fb353..8a13eefb07 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -974,16 +974,12 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
+                 refusal = _schema_owner.check(conn, path)
+                 if refusal:
+                     return refusal
+-                if refusal == "":  # at par: no schema pass, but keep the board's sync mode (ids, Board leases)
++                if refusal == "":  # at par: no schema pass, but keep the board's sync mode (ids, Board leases);
++                    # the display-only activity revision is skipped too (its readers fall back to stat keys)
+                     _kb._sync.register_without_install(conn, resolved)
+                     _INITIALIZED_PATHS.add(resolved)
+                     return None
+-                conn.executescript(_kb.SCHEMA_SQL)
+-                _migrate_add_optional_columns(conn)
+-                from hermes_cli.kanban_wake_episode import ensure_schema
+-                ensure_schema(conn)
+-                from hermes_cli import kanban_source_receipt
+-                kanban_source_receipt.ensure_schema(conn)  # before the capture triggers that read it
++                apply_schema_steps(conn)
+                 _kb._sync.install_or_remove(conn, resolved)
+                 _ensure_activity_revision(conn, resolved)
+                 _INITIALIZED_PATHS.add(resolved)
+@@ -997,6 +993,17 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
+     return conn
+ 
+ 
++def apply_schema_steps(conn: sqlite3.Connection) -> None:
++    """Every table/column step of connect()'s schema pass. kanban_schema_owner replays this same function on an
++    in-memory DB to judge "at par", so a step added here is never missed there. [daveey]"""
++    conn.executescript(_kb.SCHEMA_SQL)
++    _migrate_add_optional_columns(conn)
++    from hermes_cli.kanban_wake_episode import ensure_schema
++    ensure_schema(conn)
++    from hermes_cli import kanban_source_receipt
++    kanban_source_receipt.ensure_schema(conn)  # before the capture triggers that read it
++
++
+ @contextlib.contextmanager
+ def connect_closing(db_path: Optional[Path] = None, *, board: Optional[str] = None):
+     """Open a kanban DB connection and guarantee it is closed on exit. Use
+diff --git a/hermes_cli/kanban_schema_owner.py b/hermes_cli/kanban_schema_owner.py
+index 2a3d8931be..2abb18b578 100644
+--- a/hermes_cli/kanban_schema_owner.py
++++ b/hermes_cli/kanban_schema_owner.py
+@@ -133,15 +133,11 @@ def _reference_schema() -> dict[str, frozenset[str]]:
+     global _REFERENCE
+     with _REFERENCE_LOCK:
+         if _REFERENCE is None:
+-            from hermes_cli import kanban_db as kb
+             from hermes_cli import kanban_db_connect as kbc
+-            from hermes_cli.kanban_wake_episode import ensure_schema
+             mem = sqlite3.connect(":memory:", isolation_level=None)  # noqa: kanban-lockguard (in-memory reference schema, not a board)
+             try:
+                 mem.row_factory = sqlite3.Row
+-                mem.executescript(kb.SCHEMA_SQL)
+-                kbc._migrate_add_optional_columns(mem)
+-                ensure_schema(mem)
++                kbc.apply_schema_steps(mem)  # the same steps connect()'s schema pass runs
+                 _REFERENCE = _tables(mem)
+             finally:
+                 mem.close()
+diff --git a/tests/hermes_cli/test_kanban_schema_owner.py b/tests/hermes_cli/test_kanban_schema_owner.py
+index 11903ff050..0c054bdf2b 100644
+--- a/tests/hermes_cli/test_kanban_schema_owner.py
++++ b/tests/hermes_cli/test_kanban_schema_owner.py
+@@ -122,6 +122,47 @@ def test_non_installed_checkout_opens_a_current_board_normally(home):
+         conn.close()
+ 
+ 
++def test_reference_schema_matches_what_connect_creates(home):
++    """The "at par" reference is every table/column connect()'s schema pass creates: no step is left out.
++    Only ``kanban_activity_revision`` is outside it: display-only, its absence leaves readers on a stat fallback."""
++    from hermes_cli.kanban_activity_revision import REVISION_TABLE
++    db = home / "kanban.db"
++    kbc.connect(db).close()
++    raw = sqlite3.connect(db)
++    try:
++        created = {t: c for t, c in owner._tables(raw).items() if t != REVISION_TABLE}
++        assert created == owner._reference_schema()
++    finally:
++        raw.close()
++
++
++def test_board_missing_a_table_the_installed_core_predates_is_not_at_par(home):
++    """A board without ``kanban_source_receipt_pending`` (installed core predates it) stays read-only here
++    with the clear refusal, not a read-write open that fails later with a raw "no such table"."""
++    from hermes_cli import kanban_source_receipt
++    db = _older_board(home)
++    raw = sqlite3.connect(db)
++    raw.execute(f'DROP TABLE "{kanban_source_receipt.TABLE}"')
++    raw.execute("ALTER TABLE tasks ADD COLUMN review_required INTEGER NOT NULL DEFAULT 0")  # other columns at par
++    raw.commit()
++    raw.close()
++    before = _triggers(db), _columns(db)
++    _foreign_install(home)
++    probe = sqlite3.connect(db)
++    try:
++        assert kanban_source_receipt.TABLE in owner.missing_schema(probe)
++    finally:
++        probe.close()
++    conn = kbc.connect(db)
++    try:
++        with pytest.raises(owner.BoardSchemaNotOwned) as err:
++            kb.create_task(conn, title="from a worktree", assignee="default")
++    finally:
++        conn.close()
++    assert kanban_source_receipt.TABLE in str(err.value)
++    assert (_triggers(db), _columns(db)) == before
++
++
+ # --- (b) the installed core ---------------------------------------------------------------------------------
+ 
+ def test_installed_core_migrates_as_before(home):
+-- 
+2.51.0
+

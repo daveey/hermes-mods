@@ -1,0 +1,237 @@
+From 2b80c7272d530728f6ecca3ed575a25cca449480 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:39:44 +0000
+Subject: [PATCH] [daveey] kanban: a parent_missing block clears itself once
+ the parent is back
+
+The missing-parent detector blocks a todo child (transient, source=parent_missing) and files a
+repair card. Nothing ever undid that block: recompute_ready treats every newest `blocked` event
+as sticky (has_sticky_block), so a child whose parent later synced in, or whose remote-parent
+mirror later said done, stayed blocked with nothing unsatisfied.
+
+2026-11-13, laptop-1: t_01a1d0ea6db6c158 was blocked at 00:47 PST while Board sync was down
+(SchemaAhead 23:53-02:24). At 02:24 the mirror showed its parent done and unsatisfied_parents
+was empty, but the child stayed blocked, and its repair card had no grant to unblock it.
+
+The readiness pass now runs kanban_db_graph.clear_found_parents on each blocked row first.
+When the child's newest lifecycle event is the detector's own block (source=parent_missing),
+the card has no human_request, and parent_states shows every parent again, it moves the child
+back to todo with an `unblocked` event naming the cleared block (cleared_block, blocked_event_id,
+parents, repair_task_id). The same pass then runs the todo path: parent_found, and promotion to
+ready when every parent is done/archived. The repair card is left to finish normally.
+
+Blocks from any other source, a later hand block over the detector's, a human_request, and a
+parent still missing all stay blocked (one test each). kanban_db.py stays at its line cap.
+
+Card t_01a1d4765254ee52.
+---
+ hermes_cli/kanban_db.py                       |   4 +-
+ hermes_cli/kanban_db_graph.py                 |  43 ++++++
+ .../test_kanban_parent_missing_self_clear.py  | 126 ++++++++++++++++++
+ 3 files changed, 171 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_parent_missing_self_clear.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 564896cac1..78a8e378d2 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1948,8 +1948,8 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None)
+             # publish a second promotion or expire the owner's missing streak.
+             if task_id in copies:
+                 continue
+-            cur_status = row["status"]
+-            if recovery_held(conn, row, failure_limit):
++            cur_status = _graph.clear_found_parents(conn, row, remote=remote)  # parent_missing block, parents back: todo
++            if cur_status == row["status"] and recovery_held(conn, row, failure_limit):
+                 continue
+             states = parent_states(conn, task_id, remote=remote)
+             # Inside this txn, for a ``todo`` child: start/close a missing-parent streak (``parent_missing`` /
+diff --git a/hermes_cli/kanban_db_graph.py b/hermes_cli/kanban_db_graph.py
+index 471167aeaf..ebc67fe1bd 100644
+--- a/hermes_cli/kanban_db_graph.py
++++ b/hermes_cli/kanban_db_graph.py
+@@ -65,6 +65,49 @@ def note_missing_parents(
+     return True
+ 
+ 
++# The newest of these on a blocked child must be the detector's own block for it to be cleared automatically.
++_LIFECYCLE_EVENTS = ("blocked", "unblocked", "gave_up", "block_loop_detected", "dependency_wait", "status",
++                     "supervisor_escalated", "changes_requested", "review_reopened")
++
++
++def clear_found_parents(conn: sqlite3.Connection, row, *, remote: bool) -> str:
++    """Inside the readiness transaction: return a child the detector blocked (:func:`note_missing_parents`) to
++    ``todo`` once :func:`kanban_db.parent_states` shows every parent again (the local row synced in, or the
++    remote-parent mirror now has it). Returns the readiness ``row``'s status after the call (``todo`` when it
++    cleared the block); the caller then runs its ``todo`` path, which writes ``parent_found`` and promotes the
++    child when every parent is done.
++
++    Only the detector's own block is cleared: the child's newest lifecycle event must be the ``blocked`` with
++    ``source`` 'parent_missing', with no human request on the card. A later hand, policy or
++    breaker block, or a block from any other source, stays for its owner. The repair card is left to finish.
++    2026-11-13, laptop-1: t_01a1d0ea6db6c158 stayed blocked hours after its parent was mirrored done. [daveey]"""
++    from hermes_cli import kanban_db as kb
++
++    task_id, status = row["id"], row["status"]
++    if status != "blocked":
++        return status
++    last = conn.execute(
++        f"SELECT id, payload FROM task_events WHERE task_id = ? AND kind IN "
++        f"({', '.join('?' * len(_LIFECYCLE_EVENTS))}) ORDER BY id DESC LIMIT 1", (task_id, *_LIFECYCLE_EVENTS),
++    ).fetchone()
++    if last is None or _event_field(last["payload"], "source") != "parent_missing":  # only the detector's block
++        return status
++    states = kb.parent_states(conn, task_id, remote=remote)
++    if not states or any(st is None for _pid, st in states):
++        return status
++    cur = conn.execute(
++        "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'blocked' AND human_request IS NULL", (task_id,),
++    )
++    if cur.rowcount != 1:
++        return status
++    kb._append_event(conn, task_id, "unblocked", {
++        "status": "todo", "source": "parent_found", "cleared_block": "parent_missing",
++        "blocked_event_id": last["id"], "parents": _event_field(last["payload"], "parents"),
++        "repair_task_id": _event_field(last["payload"], "repair_task_id"),
++    })
++    return "todo"
++
++
+ def report_deferred_pass(conn: sqlite3.Connection, fresh: dict) -> None:
+     """After a readiness pass: the children :func:`note_missing_parents` deferred because the replica is not at the
+     feed head get one INFO line per board per stale replica stamp (``kanban_replica_freshness.report_deferred``)."""
+diff --git a/tests/hermes_cli/test_kanban_parent_missing_self_clear.py b/tests/hermes_cli/test_kanban_parent_missing_self_clear.py
+new file mode 100644
+index 0000000000..59d548a69a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_parent_missing_self_clear.py
+@@ -0,0 +1,126 @@
++"""A parent_missing block clears itself once the parent is back (2026-11-13, laptop-1).
++
++t_01a1d0ea6db6c158 was blocked "parent t_01a1d40d52e1672b missing from this board" while the MacBook's Board sync
++was down. When sync came back the remote-parent mirror said the parent was done and ``unsatisfied_parents`` was
++empty, but the child stayed blocked: the readiness pass treats every ``blocked`` event as sticky, and the repair card
++had no grant to unblock it. The readiness pass now returns the detector's own block to the todo path. [daveey]"""
++from __future__ import annotations
++
++import json
++import time
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_cross_gateway_parents as support
++
++local, kanban_home, svc, live = support.local, support.kanban_home, support.svc, support.live
++
++
++def _blocked_on_missing(conn, parent: str) -> str:
++    child = kb.create_task(conn, title="dependent", assignee="worker")
++    support._link_raw(conn, parent, child)
++    kb.recompute_ready(conn)
++    support._age_streak(conn, child)
++    kb.recompute_ready(conn)
++    t = kb.get_task(conn, child)
++    assert (t.status, t.block_kind) == ("blocked", "transient")
++    return child
++
++
++def _repair(conn, child) -> str:
++    [(rid,)] = support._repairs(conn, child)
++    return rid
++
++
++def test_the_parent_row_appearing_done_returns_the_child_to_ready(local):
++    child = _blocked_on_missing(local, "t_late")
++    repair = _repair(local, child)
++    kb.recompute_ready(local)
++    assert kb.get_task(local, child).status == "blocked"  # still missing: the block holds
++    with kbc.write_txn(local):  # the parent's row syncs in, already done
++        local.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('t_late', 'late', 'done', ?)",
++                      (int(time.time()),))
++    kb.recompute_ready(local)
++    assert kb.get_task(local, child).status == "ready"  # before the fix: blocked forever
++    [unblocked] = support._events(local, child, "unblocked")
++    payload = json.loads(unblocked["payload"])
++    assert payload["cleared_block"] == "parent_missing" and payload["repair_task_id"] == repair
++    assert payload["parents"] == ["t_late"]
++    assert len(support._events(local, child, "parent_found")) == 1
++    assert kb.get_task(local, repair).status == "ready"  # the repair card is left to finish on its own
++    assert kb.claim_task(local, child) is not None
++
++
++def test_an_open_parent_coming_back_returns_the_child_to_todo(local):
++    child = _blocked_on_missing(local, "t_late")
++    with kbc.write_txn(local):
++        local.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('t_late', 'late', 'running', 0)")
++    kb.recompute_ready(local)
++    assert kb.get_task(local, child).status == "todo"  # unblocked, but still gated on the open parent
++    with kbc.write_txn(local):
++        local.execute("UPDATE tasks SET status = 'done' WHERE id = 't_late'")
++    kb.recompute_ready(local)
++    assert kb.get_task(local, child).status == "ready"
++
++
++def test_the_remote_parent_mirror_saying_done_returns_the_child_to_ready(live, svc, kanban_home):
++    child = kb.create_task(live, title="child", assignee="worker")
++    support._round(kanban_home, svc)
++    support._link_raw(live, "t_foreign", child)
++    support._stamp_replica(time.time())  # at the feed head: the Board really lacks t_foreign for now
++    kb.recompute_ready(live)
++    support._age_streak(live, child)
++    kb.recompute_ready(live)
++    assert kb.get_task(live, child).status == "blocked"
++    # The owning gateway's card reaches the Board, done; the next round mirrors it (kanban_sync_remote_parents).
++    support._other(svc, "p", "tasks", "t_foreign", {"title": "foreign parent", "status": "done", "created_at": 1})
++    support._round(kanban_home, svc)
++    assert kb.get_task(live, "t_foreign") is None and kb.parent_states(live, child) == [("t_foreign", "done")]
++    assert kb.unsatisfied_parents(live, child) == []
++    kb.recompute_ready(live)
++    assert kb.get_task(live, child).status == "ready"  # before the fix: blocked, with nothing unsatisfied
++    assert json.loads(support._events(live, child, "unblocked")[-1]["payload"])["cleared_block"] == "parent_missing"
++
++
++def test_a_transient_block_from_another_source_stays_blocked(local):
++    with kbc.write_txn(local):
++        local.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('t_p', 'p', 'done', 0)")
++    child = kb.create_task(local, title="dependent", assignee="worker", parents=["t_p"])
++    with kbc.write_txn(local):
++        local.execute("UPDATE tasks SET status = 'blocked', block_kind = 'transient' WHERE id = ?", (child,))
++        kb._append_event(local, child, "blocked", {"kind": "transient", "source": "breaker", "reason": "x"})
++    kb.recompute_ready(local)
++    assert kb.get_task(local, child).status == "blocked"
++    assert not support._events(local, child, "unblocked")
++
++
++def test_a_later_hand_block_over_a_parent_missing_block_stays_blocked(local):
++    child = _blocked_on_missing(local, "t_late")
++    with kbc.write_txn(local):  # someone blocks it again by hand while it is still blocked
++        kb._append_event(local, child, "blocked", {"kind": "needs_input", "reason": "hold this"})
++        local.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('t_late', 'late', 'done', 0)")
++    kb.recompute_ready(local)
++    assert kb.get_task(local, child).status == "blocked"
++
++
++def test_a_parent_missing_block_with_a_human_request_stays_blocked(local):
++    child = _blocked_on_missing(local, "t_late")
++    with kbc.write_txn(local):
++        local.execute("UPDATE tasks SET human_request = ? WHERE id = ?", (json.dumps({"action": "x"}), child))
++        local.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('t_late', 'late', 'done', 0)")
++    kb.recompute_ready(local)
++    assert kb.get_task(local, child).status == "blocked"
++
++
++def test_a_parent_missing_block_with_one_parent_still_missing_stays_blocked(local):
++    child = kb.create_task(local, title="dependent", assignee="worker")
++    support._link_raw(local, "t_a", child)
++    support._link_raw(local, "t_b", child)
++    kb.recompute_ready(local)
++    support._age_streak(local, child)
++    kb.recompute_ready(local)
++    assert kb.get_task(local, child).status == "blocked"
++    with kbc.write_txn(local):
++        local.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('t_a', 'a', 'done', 0)")
++    kb.recompute_ready(local)
++    assert kb.get_task(local, child).status == "blocked"  # t_b is still missing
+-- 
+2.51.0
+

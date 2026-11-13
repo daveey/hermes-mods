@@ -1,0 +1,722 @@
+From e9d537b75ab6bd34c189e2e3d5dd005717c2711f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:02:11 +0000
+Subject: [PATCH] [daveey] move guard: one git deadline per tree scan;
+ 'unchecked' cause and state_parts case (PR #1792 review nits)
+
+Follow-up t_01a1d427faa4ce9b to PR #1792 (reviews t_01a1d41a33521f17 / 5888531766 and
+t_01a1d2a839617871 / 5885034090). Rebased onto e370f8ee4b (card t_01a1d2add77deeff), which
+landed items 3-5 first: its shared repin leaving rule (kanban_move.leaves_here/_repin_leaves)
+and park-path test are kept as they are; its _BudgetSpent/_within/found() cause handling in
+tree_state is replaced by the GitBudget below, which covers every git call, not only the
+three top-level checks. Its tests (test_kanban_move_guard_review_nits.py) pass unchanged.
+
+1. STATE_BUDGET_S was approximate: tree_state handed out per-helper timeouts, but the
+   no-remote-refs path of _worktree_has_unpushed_commits made up to 5 calls on one timeout,
+   and _worktree_is_dirty's noninteractive_repo_git_env probes (2 s each, up to 18) and
+   hidden_index_edits (120 s ls-files, 60 s hash-object) ran outside the deadline. New
+   hermes_cli/git_budget.py: a GitBudget callable (cap -> timeout drawn from one deadline,
+   raises GitUnchecked once spent). _worktree_is_dirty, _worktree_has_unpushed_commits,
+   _worktree_local_trunk, noninteractive_repo_git_env, worktree_archive._env and
+   hidden_index_edits take an optional keyword `budget`; tree_state and pushed_on_remote
+   thread one budget through every git call. Without a budget nothing changes for the
+   other callers.
+2. state_parts() recognises 'unchecked worktree <p> (<cause>)' -> ('unchecked', <p>), so a
+   budget-spent park pin records check/tree.
+3. GitUnchecked is not a ValueError/SubprocessError: budget exhaustion inside
+   pushed_on_remote reads 'unchecked worktree <p>' instead of 'unpushed commits in <p>', and
+   a git timeout (or a hardening probe with no answer) in a budgeted dirty check reads
+   'unchecked worktree <p> (git timed out)' instead of 'dirty worktree'. Still state (fail
+   safe). An unreachable remote within budget still reads 'unpushed'.
+4. On main already (e370f8ee4b unified the repin with check()'s leaving rule); this
+   commit's earlier docstring/test for the old exact-label rule were dropped in the rebase.
+5. Park-path test for the kanban_continue path (main's covers kanban_block): a park naming
+   another card's owner-marked tree with unpushed commits does not pin; the owner's own
+   park still does.
+
+RED (fix reverted, new tests kept, pre-rebase): 7 of the new tests failed (hung ls-files
+ran to fake t=32 s > 20 s; 12 trees of slow probes overran a 5 s budget; the no-remote path
+read 'unpushed'; a status timeout read 'dirty'; state_parts and the park pin returned
+check='').
+GREEN after the rebase: test_kanban_move_guard_budget.py (13) + test_kanban_move_guard_review_nits.py
+(9) pass, and all 77 test files importing the changed helpers: 2177 passed, 0 failed, 159 skipped.
+---
+ hermes_cli/_subprocess_compat.py              |  15 +-
+ hermes_cli/git_budget.py                      |  58 ++++++
+ hermes_cli/kanban_move_pool.py                |  77 +++-----
+ hermes_cli/worktree_archive.py                |   8 +-
+ hermes_cli/worktree_ops.py                    |  51 +++--
+ hermes_cli/worktree_retention.py              |  21 +-
+ .../test_kanban_move_guard_budget.py          | 184 ++++++++++++++++++
+ 7 files changed, 340 insertions(+), 74 deletions(-)
+ create mode 100644 hermes_cli/git_budget.py
+ create mode 100644 tests/hermes_cli/test_kanban_move_guard_budget.py
+
+diff --git a/hermes_cli/_subprocess_compat.py b/hermes_cli/_subprocess_compat.py
+index a2f985af61..d39ecad76a 100644
+--- a/hermes_cli/_subprocess_compat.py
++++ b/hermes_cli/_subprocess_compat.py
+@@ -14,7 +14,7 @@ import shutil
+ import subprocess
+ import sys
+ from pathlib import Path
+-from typing import Mapping, NoReturn, Sequence
++from typing import Callable, Mapping, NoReturn, Sequence
+ 
+ __all__ = [
+     "FILTER_DISCOVERY_FAILED",
+@@ -514,6 +514,8 @@ FILTER_DISCOVERY_FAILED = "git filter discovery failed"
+ def noninteractive_repo_git_env(
+     cwd: str | os.PathLike[str],
+     base: Mapping[str, str] | None = None,
++    *,
++    budget: Callable[[float], float] | None = None,
+ ) -> dict[str, str] | None:
+     """Harden internal git for one repository, including named clean/smudge/process filters.
+ 
+@@ -522,8 +524,11 @@ def noninteractive_repo_git_env(
+     Discover the effective filter command keys for this checkout and append empty command
+     overrides plus required=false to the already-isolated config block. Discovery is
+     bounded and fail-closed: if filter discovery cannot be trusted, callers skip the
+-    automatic git operation instead of running with only partial hardening.
++    automatic git operation instead of running with only partial hardening. With ``budget``
++    (:mod:`hermes_cli.git_budget`) each probe draws its timeout from it (a spent budget raises).
+     """
++    def probe_timeout() -> float:
++        return 2 if budget is None else budget(2)
+     env = noninteractive_git_env(base)
+     # bounded_probe_run, not subprocess.run: Windows' post-timeout communicate() can deadlock and
+     # a bare spawn flashes a console. (Not bounded_git_probe: rc 1 = "no filters" is a verdict.)
+@@ -532,7 +537,7 @@ def noninteractive_repo_git_env(
+     proc = bounded_probe_run(
+         ["git", "-C", str(cwd), "config", "--includes", "--show-origin", "-z", "--get-regexp",
+          _DISCOVERY_KEYS_REGEXP],
+-        timeout=2, env=env,
++        timeout=probe_timeout(), env=env,
+     )
+     if proc is None or proc.returncode not in (0, 1):
+         return None
+@@ -555,7 +560,7 @@ def noninteractive_repo_git_env(
+                 return None
+             if toplevel is None:
+                 top = bounded_probe_run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+-                                        timeout=2, env=env)
++                                        timeout=probe_timeout(), env=env)
+                 if top is None or top.returncode != 0:
+                     return None
+                 toplevel = Path(top.stdout.rstrip("\r\n"))  # a checkout path may end in a space
+@@ -569,7 +574,7 @@ def noninteractive_repo_git_env(
+         targets.add(target)
+         probe = bounded_probe_run(
+             ["git", "config", "--file", str(target), "--name-only", "-z", "--get-regexp", _DISCOVERY_KEYS_REGEXP],
+-            timeout=2, env=env,
++            timeout=probe_timeout(), env=env,
+         )
+         if probe is None or probe.returncode not in (0, 1):
+             return None
+diff --git a/hermes_cli/git_budget.py b/hermes_cli/git_budget.py
+new file mode 100644
+index 0000000000..2c68a05ffc
+--- /dev/null
++++ b/hermes_cli/git_budget.py
+@@ -0,0 +1,58 @@
++"""One time budget shared by every git call of a scan. [daveey]
++
++A scan that runs many git calls (the move guard's :func:`hermes_cli.kanban_move_pool.tree_state` over a card's
++trees) bounds its total time by handing each helper a :data:`GitBudget`: called with a call's own timeout cap, it
++returns the timeout that call may use (the cap, or less when the deadline is nearer) and raises
++:class:`GitUnchecked` once the deadline has passed. Sequential calls that each take at most the time left end by
++the deadline, whatever their number.
++
++With a budget, a helper reports a check it could not finish (time spent, git timed out, a hardening probe that
++gave no answer) by raising :class:`GitUnchecked` instead of turning it into a verdict ("dirty", "unpushed"): the
++caller then says the tree is unchecked, which it still treats as state (fail safe). Without one, helpers keep
++their own fail-safe verdicts.
++"""
++from __future__ import annotations
++
++import time
++from typing import Callable, Optional
++
++GitBudget = Callable[[float], float]
++
++BUDGET_SPENT = "git budget spent"
++GIT_TIMED_OUT = "git timed out"
++
++
++class GitUnchecked(Exception):
++    """A budgeted git check reached no verdict. Not a ``ValueError``/``OSError``/``SubprocessError``: the fail-soft
++    handlers that turn those into a verdict (False / "unpushed" / "dirty") must let it through."""
++
++
++def deadline_budget(seconds: float, clock: Callable[[], float] = time.monotonic) -> GitBudget:
++    """A budget that ends ``seconds`` after now on ``clock``."""
++    deadline = clock() + seconds
++
++    def timeout(cap: float) -> float:
++        left = deadline - clock()
++        if left <= 0:
++            raise GitUnchecked(BUDGET_SPENT)
++        return min(cap, left)
++    return timeout
++
++
++def timeout_for(budget: Optional[GitBudget], cap: float) -> float:
++    """``cap`` drawn from ``budget`` (raises :class:`GitUnchecked` once it is spent), or ``cap`` with no budget."""
++    return cap if budget is None else budget(cap)
++
++
++def ensure_left(budget: Optional[GitBudget]) -> None:
++    """Raise :class:`GitUnchecked` when ``budget`` is spent: a git timeout the deadline cut short is no verdict."""
++    timeout_for(budget, 0.0)
++
++
++def timed_out(budget: Optional[GitBudget]) -> GitUnchecked:
++    """The :class:`GitUnchecked` for a git timeout under ``budget``: the budget's end, or git's own slowness."""
++    try:
++        ensure_left(budget)
++    except GitUnchecked as spent:
++        return spent
++    return GitUnchecked(GIT_TIMED_OUT)
+diff --git a/hermes_cli/kanban_move_pool.py b/hermes_cli/kanban_move_pool.py
+index 7aae8cb998..911b4955b9 100644
+--- a/hermes_cli/kanban_move_pool.py
++++ b/hermes_cli/kanban_move_pool.py
+@@ -16,7 +16,7 @@ import re
+ import subprocess
+ import time
+ from pathlib import Path
+-from typing import Any, Iterable, Mapping, Optional
++from typing import Any, Callable, Iterable, Mapping, Optional
+ 
+ HOST_REASON_REQUIRED = "host_reason_required"
+ POOL_KEEPS_PUSHED = "pool_keeps_pushed"
+@@ -128,7 +128,7 @@ _MAX_ANCESTRY_CHECKS = 50
+ _MAX_REFRESHES = 5
+ 
+ 
+-def pushed_on_remote(tree: str, *, deadline: Optional[float] = None) -> bool:
++def pushed_on_remote(tree: str, *, budget: Optional[Callable[[float], float]] = None) -> bool:
+     """Whether a tree the local refs call unpushed has HEAD on a remote branch after all. Fails toward False.
+ 
+     ``git push https://github.com/<o>/<r>.git HEAD:wt/x`` (a URL, not the remote's name: the HTTPS-credential push
+@@ -136,15 +136,16 @@ def pushed_on_remote(tree: str, *, deadline: Optional[float] = None) -> bool:
+     branch past HEAD again. The local check then reports pushed work as unpushed, and the park pinned a card to
+     its worker (11-12: t_01a1d0a1eaa00371 sat ready on ``machine:worker-2`` while worker-2 was on a Board hold).
+     So ask the remote: HEAD is a remote branch tip, or a stale tracking ref HEAD builds on, once refreshed from
+-    the remote, contains HEAD. Every git call ends by ``deadline`` (:func:`_clock`); past it :class:`_BudgetSpent`
+-    propagates, so :func:`tree_state` reports the tree as unchecked rather than unpushed."""
++    the remote, contains HEAD. Every git call draws its timeout from ``budget`` (:mod:`hermes_cli.git_budget`); a
++    spent budget raises ``GitUnchecked`` (no verdict) rather than answering False ("unpushed")."""
+     from functools import partial
++    from hermes_cli.git_budget import GitUnchecked, ensure_left, timeout_for
+     from hermes_cli.worktree_ops import _git_out, _worktree_has_unpushed_commits
+     # Keep credential helpers for private remotes, but never consume the caller's stdin.
+     git_out = partial(_git_out, stdin=subprocess.DEVNULL)
+ 
+-    def t(cap: float, calls: int = 1) -> float:
+-        return cap if deadline is None else _within(deadline, cap, calls)
++    def t(cap: float) -> float:
++        return timeout_for(budget, cap)
+     try:
+         head = git_out(["rev-parse", "HEAD"], tree, timeout=t(10))
+         remotes = (git_out(["remote"], tree, timeout=t(10)) or "").split()
+@@ -192,76 +193,60 @@ def pushed_on_remote(tree: str, *, deadline: Optional[float] = None) -> bool:
+         ))[:_MAX_REFRESHES]
+         for remote, ref, tracking in refresh:
+             git_out(["fetch", "--no-tags", "-q", remote, f"+{ref}:{tracking}"], tree, timeout=t(_REMOTE_TIMEOUT))
+-        return bool(refresh) and not _worktree_has_unpushed_commits(tree, timeout=t(10, calls=3))
++        return bool(refresh) and not _worktree_has_unpushed_commits(tree, timeout=10, budget=budget)
++    except GitUnchecked:
++        raise
++    except subprocess.TimeoutExpired:
++        ensure_left(budget)  # cut short by the deadline: no verdict; else an unreachable remote proves nothing
++        return False
+     except (OSError, subprocess.SubprocessError, ValueError):
+         return False
+ 
+ 
+-_DIRTY, _UNPUSHED = "dirty worktree ", "unpushed commits in "
++_DIRTY, _UNPUSHED, _UNCHECKED = "dirty worktree ", "unpushed commits in ", "unchecked worktree "
+ 
+ 
+ def state_parts(state: str) -> tuple[str, str]:
+-    """``(check, tree)`` of a :func:`tree_state` string: ``("dirty", <p>)`` or ``("unpushed", <p>)``."""
+-    for check, prefix in (("dirty", _DIRTY), ("unpushed", _UNPUSHED)):
++    """``(check, tree)`` of a :func:`tree_state` string: ``("dirty", <p>)``, ``("unpushed", <p>)`` or
++    ``("unchecked", <p>)`` (its `` (<cause>)`` suffix dropped)."""
++    for check, prefix in (("dirty", _DIRTY), ("unpushed", _UNPUSHED), ("unchecked", _UNCHECKED)):
+         if state.startswith(prefix):
+-            return check, state[len(prefix):]
++            rest = state[len(prefix):]
++            return check, (rest.rsplit(" (", 1)[0] if check == "unchecked" and rest.endswith(")") else rest)
+     return "", state
+ 
+ 
+ # Git time for one card's trees. The operator call's scan and the pickup-stall alarm run the move guard inline, and
+ # 20+ trees at 10-20 s per git call took minutes; past the budget the rest count as unchecked (fail safe: state).
++# Every git call of the scan (the hardening probes and the hidden-edit scan of the dirty check, every call of the
++# unpushed check and the remote refresh) draws its timeout from this one budget (:mod:`hermes_cli.git_budget`).
+ STATE_BUDGET_S = 20.0
+ 
+ 
+-class _BudgetSpent(Exception):
+-    """Git ran out of time for a tree. Not a ValueError: :func:`pushed_on_remote` swallows those (failing toward
+-    False), which turned a spent budget into ``unpushed commits`` instead of ``unchecked worktree``."""
+-
+-
+ def _clock() -> float:
+     """Monotonic seconds (a seam: tests advance a fake clock per git call)."""
+     return time.monotonic()
+ 
+ 
+-def _within(deadline: float, cap: float, calls: int = 1) -> float:
+-    """Per-call timeout so ``calls`` more git calls end by ``deadline``; raises :class:`_BudgetSpent` past it."""
+-    left = deadline - _clock()
+-    if left <= 0:
+-        raise _BudgetSpent("git budget spent")
+-    return min(cap, left / calls)
+-
+-
+ def tree_state(trees: Iterable[str], *, budget: float = STATE_BUDGET_S) -> Optional[str]:
+     """``dirty worktree <p>`` / ``unpushed commits in <p>`` for the first tree with state, else None. Git runs at
+-    most ``budget`` seconds in all (per-call timeouts shrink to the time left); a tree it could not check reads
+-    ``unchecked worktree <p>``, which callers treat as state. So does a check whose git timed out (the
+-    ``worktree_ops`` checks fail toward True on a timeout, which is no evidence of dirty or unpushed work)."""
++    most ``budget`` seconds in all (per-call timeouts shrink to the time left); a tree it could not check (budget
++    spent, git timed out) reads ``unchecked worktree <p> (<cause>)``, which callers treat as state (fail safe)."""
++    from hermes_cli.git_budget import BUDGET_SPENT, GitUnchecked, deadline_budget
+     from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
+-    deadline = _clock() + budget
+-
+-    def found(check, calls: int) -> bool:
+-        # The worktree_ops checks fail safe toward True on a git timeout: a True that took its whole timeout (or
+-        # ran past the budget) is a timeout, not seen state, so it reads ``unchecked``, not ``dirty``/``unpushed``.
+-        timeout, start = _within(deadline, 10, calls), _clock()
+-        if not check(timeout):
+-            return False
+-        if _clock() - start >= timeout or _clock() >= deadline:
+-            raise _BudgetSpent("git timed out")
+-        return True
+-
++    timeouts = deadline_budget(budget, clock=lambda: _clock())
+     for tree in trees:
+         if not Path(tree).is_dir():
+             continue
+         try:
+-            if found(lambda t: _worktree_is_dirty(tree, tree, timeout=t), 2):
++            if _worktree_is_dirty(tree, tree, timeout=10, budget=timeouts):
+                 return f"{_DIRTY}{tree}"
+-            if (found(lambda t: _worktree_has_unpushed_commits(tree, timeout=t), 3)
+-                    and not pushed_on_remote(tree, deadline=deadline)):
+-                if _clock() >= deadline:  # its git calls failed toward False as the budget ran out
+-                    raise _BudgetSpent("git budget spent")
++            if (_worktree_has_unpushed_commits(tree, timeout=10, budget=timeouts)
++                    and not pushed_on_remote(tree, budget=timeouts)):
+                 return f"{_UNPUSHED}{tree}"
+-        except _BudgetSpent as exc:
+-            return f"unchecked worktree {tree} ({exc}; git checks of the card's trees get {budget:g}s)"
++        except GitUnchecked as exc:
++            cause = f"git checks of the card's trees took over {budget:g}s" if str(exc) == BUDGET_SPENT else str(exc)
++            return f"{_UNCHECKED}{tree} ({cause})"
+     return None
+ 
+ 
+diff --git a/hermes_cli/worktree_archive.py b/hermes_cli/worktree_archive.py
+index 3bbd00c0f2..c8f2e1f13d 100644
+--- a/hermes_cli/worktree_archive.py
++++ b/hermes_cli/worktree_archive.py
+@@ -57,10 +57,14 @@ class Archive:
+     staged: str = ""  # staged_state() of exactly the index this archive captured
+ 
+ 
+-def _env(cwd, index: Optional[str] = None) -> dict:
++def _env(cwd, index: Optional[str] = None, *, budget=None) -> dict:
+     from hermes_cli._subprocess_compat import noninteractive_repo_git_env
+-    env = noninteractive_repo_git_env(cwd)
++    env = noninteractive_repo_git_env(cwd, budget=budget)
+     if env is None:
++        if budget is not None:  # a budgeted scan reports the tree unchecked (hermes_cli.git_budget)
++            from hermes_cli.git_budget import GitUnchecked, ensure_left
++            ensure_left(budget)
++            raise GitUnchecked("git config probe gave no answer")
+         raise ArchiveError("git filter discovery failed")
+     env.update(_IDENTITY)
+     start = int(env["GIT_CONFIG_COUNT"])
+diff --git a/hermes_cli/worktree_ops.py b/hermes_cli/worktree_ops.py
+index b270a5e060..d2e9818f95 100644
+--- a/hermes_cli/worktree_ops.py
++++ b/hermes_cli/worktree_ops.py
+@@ -442,17 +442,20 @@ _REMOTE_TRUNK_CANDIDATES = ("origin/HEAD", "origin/main", "origin/master")
+ _LOCAL_TRUNK_CANDIDATES = ("main", "master")
+ 
+ 
+-def _worktree_local_trunk(path: str, timeout: float = 5) -> Optional[str]:
++def _worktree_local_trunk(path: str, timeout: float = 5, *, budget=None) -> Optional[str]:
+     """Local trunk of a repo with NO remote-tracking refs: ``main``/``master``, else the branch
+     checked out in the main worktree. None = no baseline at all; callers must preserve.
+ 
+     Nothing in such a repo was ever pushed, so "merged into the local trunk" is the only fact
+-    that can tell redundant scratch work from unique commits. May raise like ``_git``.
++    that can tell redundant scratch work from unique commits. May raise like ``_git``; each call
++    draws its timeout from ``budget`` (:mod:`hermes_cli.git_budget`) when one is given.
+     """
++    from hermes_cli.git_budget import timeout_for
+     for name in _LOCAL_TRUNK_CANDIDATES:
+-        if _git_out(["rev-parse", "--verify", "--quiet", f"refs/heads/{name}"], path, timeout=timeout):
++        if _git_out(["rev-parse", "--verify", "--quiet", f"refs/heads/{name}"], path,
++                    timeout=timeout_for(budget, timeout)):
+             return name
+-    porcelain = _git_out(["worktree", "list", "--porcelain"], path, timeout=timeout) or ""
++    porcelain = _git_out(["worktree", "list", "--porcelain"], path, timeout=timeout_for(budget, timeout)) or ""
+     for line in porcelain.split("\n\n", 1)[0].splitlines():  # first block = the main worktree
+         if line.startswith("branch refs/heads/"):
+             return line[len("branch refs/heads/"):].strip() or None
+@@ -472,28 +475,38 @@ def _worktree_merge_base_ref(path: str, timeout: float = 5) -> Optional[str]:
+     return None
+ 
+ 
+-def _worktree_has_unpushed_commits(worktree_path: str, timeout: float = 10) -> bool:
++def _worktree_has_unpushed_commits(worktree_path: str, timeout: float = 10, *, budget=None) -> bool:
+     """Whether a worktree has commits unreachable from any remote branch. Fails SAFE toward True.
+ 
+     No remote-tracking refs = nothing was ever pushed, so the tree is compared against the local
+     trunk instead (``_worktree_local_trunk``); no trunk either -> True. A shallow boundary can
+     disconnect an older HEAD from origin/* so public commits look unpushed;
+     ``_deepen_shallow_repo`` first if affordable.
++
++    With ``budget`` (:mod:`hermes_cli.git_budget`) every git call draws its timeout from it, and a
++    spent budget or a git timeout raises ``GitUnchecked`` instead of reading as unpushed.
+     """
++    from hermes_cli.git_budget import GitUnchecked, timed_out, timeout_for
+     try:
+         remote_refs = _git_out(["for-each-ref", "--format=%(refname)", "refs/remotes"], worktree_path,
+-                               timeout=timeout)
++                               timeout=timeout_for(budget, timeout))
+         if remote_refs is None:
+             return True
+         baseline = ["--remotes"]
+         if not remote_refs:
+-            trunk = _worktree_local_trunk(worktree_path, timeout=timeout)
++            trunk = _worktree_local_trunk(worktree_path, timeout=timeout, budget=budget)
+             if trunk is None:
+                 return True
+             baseline = [trunk]
+         unpushed = _git_out(["log", "--oneline", "HEAD", "--not", *baseline], worktree_path,
+-                            timeout=timeout)
++                            timeout=timeout_for(budget, timeout))
+         return unpushed is None or bool(unpushed)
++    except GitUnchecked:
++        raise
++    except subprocess.TimeoutExpired:
++        if budget is not None:
++            raise timed_out(budget) from None
++        return True
+     except Exception:
+         return True
+ 
+@@ -517,7 +530,7 @@ def _include_symlink_paths(worktree_path: str, repo_root) -> set:
+     return paths
+ 
+ 
+-def _worktree_is_dirty(worktree_path: str, repo_root, timeout: float = 10) -> bool:
++def _worktree_is_dirty(worktree_path: str, repo_root, timeout: float = 10, *, budget=None) -> bool:
+     """Whether a worktree has staged/unstaged/untracked changes. Fails SAFE toward True.
+ 
+     Untracked ``.worktreeinclude`` directory symlinks back to the main checkout *repo_root* are
+@@ -525,25 +538,39 @@ def _worktree_is_dirty(worktree_path: str, repo_root, timeout: float = 10) -> bo
+     repo forever. ``status.showUntrackedFiles=no`` is overridden (it would hide new files), and
+     skip-worktree / assume-unchanged files whose bytes differ from the index count as changes
+     (``git status`` trusts both flags).
++
++    With ``budget`` (:mod:`hermes_cli.git_budget`) every git call, the hardening probes and the
++    hidden-edit scan included, draws its timeout from it; a spent budget, a git timeout or a probe
++    with no answer raises ``GitUnchecked`` instead of reading as dirty.
+     """
+     from hermes_cli._subprocess_compat import noninteractive_repo_git_env
++    from hermes_cli.git_budget import GitUnchecked, ensure_left, timed_out, timeout_for
+     try:
+         # Reclaimers run this unattended; status reads the index (core.fsmonitor, clean filters).
+-        env = noninteractive_repo_git_env(worktree_path)
++        env = noninteractive_repo_git_env(worktree_path, budget=budget)
+         if env is None:
++            if budget is not None:
++                ensure_left(budget)
++                raise GitUnchecked("git config probe gave no answer")
+             return True
+         result = _git(["status", "--porcelain", "-z", "--untracked-files=normal"], worktree_path,
+-                      timeout=timeout, stdin=subprocess.DEVNULL, env=env)
++                      timeout=timeout_for(budget, timeout), stdin=subprocess.DEVNULL, env=env)
+         if result.returncode != 0:
+             return True
+         entries = [e for e in result.stdout.split("\0") if e]
+         if not entries:
+             from hermes_cli.worktree_retention import hidden_index_edits
+-            return bool(hidden_index_edits(worktree_path))
++            return bool(hidden_index_edits(worktree_path, budget=budget))
+         if any(not e.startswith("?? ") for e in entries):
+             return True
+         include_links = _include_symlink_paths(worktree_path, repo_root)
+         return any(e[3:].rstrip("/") not in include_links for e in entries)
++    except GitUnchecked:
++        raise
++    except subprocess.TimeoutExpired:
++        if budget is not None:
++            raise timed_out(budget) from None
++        return True
+     except Exception:
+         return True
+ 
+diff --git a/hermes_cli/worktree_retention.py b/hermes_cli/worktree_retention.py
+index 079232e451..29ac55302e 100644
+--- a/hermes_cli/worktree_retention.py
++++ b/hermes_cli/worktree_retention.py
+@@ -42,9 +42,9 @@ KEEP_LARGE_UNTRACKED = "keep-large-untracked"
+ KEEP_SUBMODULE_WORK = "keep-submodule-work"
+ 
+ 
+-def _env(wt: Path) -> dict:
++def _env(wt: Path, budget=None) -> dict:
+     from hermes_cli.worktree_archive import _env as archive_env
+-    return {**archive_env(wt), "GIT_OPTIONAL_LOCKS": "0"}
++    return {**archive_env(wt, budget=budget), "GIT_OPTIONAL_LOCKS": "0"}
+ 
+ 
+ def _git(args, wt: Path, env, timeout: float = 120) -> str:
+@@ -123,17 +123,19 @@ def scan_tree(wt_path) -> _Scan:
+     return scan
+ 
+ 
+-def hidden_index_edits(wt_path, env=None) -> list[str]:
++def hidden_index_edits(wt_path, env=None, *, budget=None) -> list[str]:
+     """Skip-worktree / assume-unchanged paths whose disk state differs from the index.
+ 
+     ``git status`` trusts both flags and reports nothing. A skip-worktree file missing from disk
+     is a sparse checkout, not an edit; a missing assume-unchanged file is a deletion. Raises
+-    ``ArchiveError`` when git fails.
++    ``ArchiveError`` when git fails. With ``budget`` (:mod:`hermes_cli.git_budget`) every git call
++    draws its timeout from it.
+     """
++    from hermes_cli.git_budget import timeout_for
+     wt = Path(wt_path)
+-    env = env or _env(wt)
++    env = env or _env(wt, budget)
+     flagged = []
+-    for record in _git(["ls-files", "-v", "-s", "-z"], wt, env).split("\0"):
++    for record in _git(["ls-files", "-v", "-s", "-z"], wt, env, timeout=timeout_for(budget, 120)).split("\0"):
+         meta, _, rel = record.partition("\t")
+         parts = meta.split()
+         if not rel or len(parts) != 4 or not (parts[0] == "S" or parts[0].islower()):
+@@ -154,15 +156,16 @@ def hidden_index_edits(wt_path, env=None) -> list[str]:
+         if data is None:
+             edits.append(rel)  # type changed
+             continue
+-        if _hash(wt, env, data, rel, raw=True) != sha and _hash(wt, env, data, rel, raw=False) != sha:
++        if (_hash(wt, env, data, rel, raw=True, timeout=timeout_for(budget, 60)) != sha
++                and _hash(wt, env, data, rel, raw=False, timeout=timeout_for(budget, 60)) != sha):
+             edits.append(rel)
+     return edits
+ 
+ 
+-def _hash(wt: Path, env, data: bytes, rel: str, *, raw: bool) -> str:
++def _hash(wt: Path, env, data: bytes, rel: str, *, raw: bool, timeout: float = 60) -> str:
+     args = ["hash-object", "--stdin"] + (["--no-filters"] if raw else [f"--path={rel}"])
+     result = subprocess.run(["git", *args], cwd=str(wt), env=env, input=data, capture_output=True,
+-                            timeout=60, check=False)
++                            timeout=timeout, check=False)
+     return result.stdout.decode("ascii", "replace").strip() if result.returncode == 0 else ""
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_move_guard_budget.py b/tests/hermes_cli/test_kanban_move_guard_budget.py
+new file mode 100644
+index 0000000000..ffe6e3d2bb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_move_guard_budget.py
+@@ -0,0 +1,184 @@
++"""Move-guard follow-ups (PR #1792 reviews t_01a1d41a33521f17 / t_01a1d2a839617871, card t_01a1d427faa4ce9b). [daveey]
++
++1. every git call of a ``tree_state`` scan draws from its one deadline: the dirty check's hardening probes and
++   hidden-edit scan, and every call of the unpushed check (the no-remote-refs trunk path) and the remote refresh;
++2. ``state_parts`` knows the ``unchecked worktree`` prefix, so a budget-spent park pin records ``check``/``tree``;
++3. a check git could not finish reads ``unchecked worktree <p> (<cause>)``, never ``dirty`` or ``unpushed``;
++5. ``card_trees``' other-card owner filter on the ``kanban_continue`` park path (:mod:`hermes_cli.kanban_park_pin`).
++
++Item 4 (the queue repin shares ``check()``'s leaving rule) and the ``kanban_block`` park path are covered by
++``test_kanban_move_guard_review_nits``.
++"""
++from __future__ import annotations
++
++import json
++import subprocess
++
++import pytest
++
++from hermes_cli import _subprocess_compat, worktree_archive, worktree_ops
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_move_pool as kmp
++from tests.hermes_cli.test_kanban_move_unpushed import _commit, _git, _worktree
++from tests.hermes_cli.test_kanban_pool_queue import (
++    POOL, _owned_worktree, _placement_events, _pushed_clone, _run, _runs_on, svc, w2)
++
++__all__ = ["svc", "w2"]
++
++
++class _SlowGit:
++    """A fake clock and slow git at every spawn site a ``tree_state`` scan reaches. A call costs ``cost(args)``
++    seconds of fake time: with a smaller timeout it spends the timeout and times out, else it runs for real."""
++
++    def __init__(self, monkeypatch, cost):
++        self.now, self.cost, self.timeouts = 0.0, cost, []
++        monkeypatch.setattr(kmp, "_clock", lambda: self.now)
++        real_git, real_run, real_probe = worktree_ops._git, worktree_archive._run, _subprocess_compat.bounded_probe_run
++
++        def git(args, cwd, timeout=10, **kw):
++            self._spend(list(args), timeout)
++            return real_git(args, cwd, timeout=timeout, **kw)
++
++        def run(args, cwd, env, timeout=300, **kw):  # hidden_index_edits -> worktree_archive._ok
++            self._spend(list(args), timeout)
++            return real_run(args, cwd, env, timeout=timeout, **kw)
++
++        def probe(argv, *, timeout, **kw):  # noninteractive_repo_git_env's config probes
++            try:
++                self._spend(list(argv)[1:], timeout)
++            except subprocess.TimeoutExpired:
++                return None  # bounded_probe_run's answer to a timeout
++            return real_probe(argv, timeout=timeout, **kw)
++
++        monkeypatch.setattr(worktree_ops, "_git", git)
++        monkeypatch.setattr(worktree_archive, "_run", run)
++        monkeypatch.setattr(_subprocess_compat, "bounded_probe_run", probe)
++
++    def _spend(self, args, timeout):
++        self.timeouts.append((args[:2], timeout))
++        cost = self.cost(args)
++        if timeout < cost:
++            self.now += timeout
++            raise subprocess.TimeoutExpired(["git", *args], timeout)
++        self.now += cost
++
++
++def _clean_pushed_tree(tmp_path, slug):
++    tree = _worktree(tmp_path, slug)
++    _git(tree, "push", "-q", "origin", f"HEAD:refs/heads/wt/{slug}")
++    return tree
++
++
++# --- 1 + 3: one deadline for every call, and an accurate cause ------------------------------------------------------
++
++def test_a_hung_hidden_edit_scan_spends_the_budget_and_reads_unchecked_not_dirty(tmp_path, monkeypatch):
++    """The dirty check's ``ls-files`` (hidden_index_edits, default timeout 120 s) ran outside the deadline."""
++    tree = _clean_pushed_tree(tmp_path, "hung-ls-files")
++    slow = _SlowGit(monkeypatch, lambda args: 300.0 if args[:1] == ["ls-files"] else 0.5)
++    state = kmp.tree_state([str(tree)])
++    assert slow.now <= kmp.STATE_BUDGET_S, (slow.now, slow.timeouts)
++    assert state == f"unchecked worktree {tree} (git checks of the card's trees took over 20s)", state
++    assert kmp.state_parts(state) == ("unchecked", str(tree))
++
++
++def test_slow_hardening_probes_draw_from_the_deadline(tmp_path, monkeypatch):
++    """``noninteractive_repo_git_env`` probed with a fixed 2 s timeout per call, outside the deadline."""
++    trees = [_clean_pushed_tree(tmp_path, f"probe-{i}") for i in range(12)]
++    slow = _SlowGit(monkeypatch, lambda args: 1.9 if args[:1] in (["-C"], ["config"]) else 0.0)
++    state = kmp.tree_state([str(t) for t in trees], budget=5)
++    assert slow.now <= 5, (slow.now, slow.timeouts)
++    assert state is not None and state.startswith("unchecked worktree "), state
++
++
++def test_the_no_remote_trunk_path_draws_from_the_deadline_and_a_spent_refresh_reads_unchecked(tmp_path, monkeypatch):
++    """No remote-tracking refs: the unpushed check compares with the local trunk (up to 5 git calls), then the
++    remote refresh runs out of budget. That used to read ``unpushed commits`` (False from pushed_on_remote)."""
++    tree = tmp_path / "code" / "_wt" / "local-only"
++    tree.mkdir(parents=True)
++    _git(tree, "init", "-q", "-b", "main")
++    _commit(tree, "a.txt")
++    _git(tree, "checkout", "-q", "-b", "wt/local-only")
++    _commit(tree, "b.txt")  # on no remote and not on the local trunk
++    _git(tree, "remote", "add", "origin", str(tmp_path / "none.git"))
++    slow = _SlowGit(monkeypatch, lambda args: 0.1 if args[:1] in (["-C"], ["config"]) else 3.0)
++    state = kmp.tree_state([str(tree)])
++    assert slow.now <= kmp.STATE_BUDGET_S, (slow.now, slow.timeouts)
++    assert state == f"unchecked worktree {tree} (git checks of the card's trees took over 20s)", state
++    assert ["rev-parse", "--verify"] in [a for a, _ in slow.timeouts]  # the trunk path ran under the deadline
++
++
++def test_a_git_status_timeout_reads_unchecked_not_dirty(tmp_path, monkeypatch):
++    tree = _clean_pushed_tree(tmp_path, "status-timeout")
++    real = worktree_ops._git
++
++    def git(args, cwd, timeout=10, **kw):
++        if args[:1] == ["status"]:
++            raise subprocess.TimeoutExpired(["git", *args], timeout)
++        return real(args, cwd, timeout=timeout, **kw)
++
++    monkeypatch.setattr(worktree_ops, "_git", git)
++    assert kmp.tree_state([str(tree)]) == f"unchecked worktree {tree} (git timed out)"
++    assert worktree_ops._worktree_is_dirty(str(tree), str(tree)) is True  # unbudgeted callers keep failing safe
++
++
++def test_unbudgeted_unpushed_check_still_fails_safe_on_a_timeout(tmp_path, monkeypatch):
++    tree = _clean_pushed_tree(tmp_path, "unbudgeted")
++
++    def git(args, cwd, timeout=10, **kw):
++        raise subprocess.TimeoutExpired(["git", *args], timeout)
++
++    monkeypatch.setattr(worktree_ops, "_git", git)
++    assert worktree_ops._worktree_has_unpushed_commits(str(tree)) is True
++
++
++def test_an_unreachable_remote_within_budget_still_reads_unpushed(tmp_path):
++    tree = _pushed_clone(tmp_path, tmp_path / "gone-remote")
++    _commit(tree, "b.txt")
++    _git(tree, "remote", "set-url", "origin", str(tmp_path / "gone.git"))
++    assert kmp.tree_state([str(tree)]) == f"unpushed commits in {tree}"
++
++
++# --- 2: state_parts ------------------------------------------------------------------------------------------------
++
++@pytest.mark.parametrize("state,parts", [
++    ("dirty worktree /w/a", ("dirty", "/w/a")),
++    ("unpushed commits in /w/a", ("unpushed", "/w/a")),
++    ("unchecked worktree /w/a (git checks of the card's trees took over 20s)", ("unchecked", "/w/a")),
++    ("unchecked worktree /w/a (git timed out)", ("unchecked", "/w/a")),
++    ("something else", ("", "something else")),
++])
++def test_state_parts_names_every_check(state, parts):
++    assert kmp.state_parts(state) == parts
++
++
++def test_a_budget_spent_park_pin_records_the_unchecked_check_and_tree(w2, tmp_path, monkeypatch):
++    from tools import kanban_tools as kt
++    conn_ = w2.conn
++    tid = kb.create_task(conn_, title="pool card", assignee="default", runs_on=[POOL])
++    tree = _pushed_clone(tmp_path, tmp_path / "code" / "_wt" / "slow-park")
++    monkeypatch.setattr(kmp, "tree_state", lambda trees, **kw: (
++        f"unchecked worktree {trees[0]} (git checks of the card's trees took over 20s)"))
++    _run(w2, monkeypatch, tid)
++    assert json.loads(kt._handle_continue({"checkpoint": f"WIP in {tree}"})).get("ok")
++    assert _runs_on(conn_, tid) == ["machine:worker-2"]
++    ev = _placement_events(conn_, tid)[-1][1]
++    assert (ev["check"], ev["tree"]) == ("unchecked", str(tree.resolve())), ev
++
++
++# --- 5: the other-card owner filter on the park path ----------------------------------------------------------------
++
++def test_a_park_ignores_unpushed_state_in_another_cards_text_named_tree(w2, tmp_path, monkeypatch):
++    from tools import kanban_tools as kt
++    conn_ = w2.conn
++    impl = kb.create_task(conn_, title="implementer", assignee="default", runs_on=[POOL])
++    review = kb.create_task(conn_, title="reviewer", assignee="default", runs_on=[POOL])
++    main = _pushed_clone(tmp_path, tmp_path / "impl-main")
++    tree = _owned_worktree(main, tmp_path / "code" / "_wt" / "impl-tree", impl, "wt/impl-tree")
++    _commit(tree, "unpushed.txt")
++    _run(w2, monkeypatch, review)  # (UNPUBLISHED_WORK_REASON answers the separate publication guard)
++    assert json.loads(kt._handle_continue({"checkpoint": (
++        f"Reviewed the implementer's tree {tree}\nUNPUBLISHED_WORK_REASON=the implementer's tree")})).get("ok")
++    assert _runs_on(conn_, review) == [POOL] and _placement_events(conn_, review) == []
++    _run(w2, monkeypatch, impl)  # the owner's own park still pins on the same tree
++    assert json.loads(kt._handle_continue({"checkpoint": f"WIP in {tree}\nUNPUBLISHED_WORK_REASON=wip"})).get("ok")
++    assert _runs_on(conn_, impl) == ["machine:worker-2"]
+-- 
+2.51.0
+

@@ -1,0 +1,1091 @@
+From 3517fbe8d61bdeb488c75a33b84980c72ccff15c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:03:02 +0000
+Subject: [PATCH] [daveey] lifecycle guard: a consumer heredoc whose output a
+ shell runs is not data (review 5888336995 nit 3)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`python3 - <<'PY' | bash` printing `bash /x/huge.sh` runs that script, but the
+guard treated the printed path as a mention: either the consumer body was masked
+(`f() { python3 - <<'PY' … }; f | bash` under nested=True, `( … ) | bash`,
+`{ cat <<'PY' … } | bash`, `o=$( … ); eval "$o"`), or the path sat inside an
+interpreter string literal the walk never reads as a command. An oversized
+script named there was allowed instead of failing closed. Same on main before
+and after #1671 (pre-existing gap).
+
+Fix:
+- tools/shell_heredoc.py: `output_reaches_shell()` recognises shapes that run
+  some command's output as shell code (`| [wrappers] bash|sh|sudo bash|ssh h`,
+  `eval`, `. <(…)`/`source /dev/stdin`, `bash <(…)`/`<<<`, `sh -c "$(…)"`,
+  `$(…)` as a command word). `strip_inert_heredoc_bodies` masks nothing when one
+  is present (both views), so the direct text scan sees a printed restart too.
+- cron/lifecycle_guard.py: with such a sink, every quoted string literal in the
+  walked text is recursed as an executed command (`print('bash /x/huge.sh')`
+  -> fail closed on the scan cap). Without a sink nothing changes: data mentions
+  (`connect('/d/big.db')`, `| grep`, `|| true`, `o=$(…); echo`) stay allowed.
+
+Corpus: new generator family `s_position == "sink"` in
+tests/cron/heredoc_shape_corpus.py: 7 sinks (`| bash`, `| sh -s`, `| sudo bash`,
+`| ssh h bash`, `eval "$(…)"`, `bash <(…)`, `. <(…)`) x 7 stdin wrappers x 6
+nestings (plain, function, subshell, group, outer bash -s, ssh 'bash -s') x 2
+consumers (python3 print, cat) x 2 printed lines (`bash ./big.sh` over the scan
+cap, the restart) = 1176 cases, real bash runs each (fake sudo added). Property
+for the family: bash ran it => tree refuses (main allows most). The sample
+covers every sink x nesting x consumer x line and every wrapper per sink and
+nesting. main_verdicts.json regenerated with the CLI against the same pre-#1671
+baseline da52aff8f4 (18586 cases; the 18 old allows kept, 626 sink allows added).
+
+Proof:
+- `heredoc_shape_corpus.py report --full`: cases=18586 bash_ran=3428 violations=0
+- sink family alone: 1176 ran, 1176 refused; mutant keeping consumer bodies
+  masked under a sink: 546 violations; mutant with sink detection off: 854
+- tests/cron/test_lifecycle_guard_output_sink.py pins both reviewer repros
+  (unsafe True, refusal names the scan cap), the other sinks, allowed controls,
+  and a corpus mutant check
+- tests/cron + every tests/tools, tests/hermes_cli file importing the guard or
+  shell_heredoc: 2702 passed, 0 failed
+---
+ cron/lifecycle_guard.py                       |  30 +-
+ .../main_verdicts.json                        | 632 +++++++++++++++++-
+ tests/cron/heredoc_shape_corpus.py            |  71 +-
+ .../cron/test_lifecycle_guard_heredoc_walk.py |   8 +
+ .../cron/test_lifecycle_guard_output_sink.py  | 116 ++++
+ tools/shell_heredoc.py                        |  26 +
+ 6 files changed, 873 insertions(+), 10 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_output_sink.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 5f438e0d98..23c7edb6e6 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -9,6 +9,7 @@ anchored on concrete command identifiers — so they cannot fire on prose. Defen
+ 
+ from __future__ import annotations
+ 
++import itertools
+ import logging
+ import os
+ import re
+@@ -1186,6 +1187,29 @@ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
+                 break
+ 
+ 
++# Quoted string literals (shell or interpreter quoting alike), each kind on its own; a literal may
++# span lines (`eval "$( cat <<'PY'` … `)"`).
++_QUOTED_LITERAL_RES = (re.compile(r"'([^']+)'"), re.compile(r"\"([^\"]+)\""))
++
++
++def _iter_printed_shell_payloads(command: str) -> Iterator[str]:
++    """When some output in *command* is run as shell code (``python3 - <<'PY' | bash``,
++    ``eval "$(…)"``, ``bash <(…)``), yield every quoted string literal in it: the producer may
++    print one as the shell's command (``print('bash /x/big.sh')``), so its paths are executed,
++    not mentions. Single and double quotes are matched independently, so a literal nested in the
++    other kind (``python3 -c "print('bash x')"``) is yielded too."""
++    from tools.shell_heredoc import output_reaches_shell
++
++    if not output_reaches_shell(command):
++        return
++    seen: set[str] = set()
++    for pattern in _QUOTED_LITERAL_RES:
++        for match in pattern.finditer(command):
++            if match[1] not in seen:
++                seen.add(match[1])
++                yield match[1]
++
++
+ # --- referenced-script reading ----------------------------------------------------------------
+ 
+ def _has_binary_magic(data: bytes) -> bool:
+@@ -1414,8 +1438,10 @@ def _contains_unsafe_gateway_action(
+     walk_command = (strip_inert_heredoc_bodies(command, nested=True) if budget.mask_heredocs
+                     else command)
+ 
+-    for payload in _iter_shell_command_payloads(walk_command):
+-        # An `sh -c` payload is text of the same file (or command) it appears in.
++    for payload in itertools.chain(_iter_shell_command_payloads(walk_command),
++                                   _iter_printed_shell_payloads(walk_command)):
++        # An `sh -c` payload is text of the same file (or command) it appears in; so is a string
++        # an interpreter prints when its output is fed to a shell.
+         if recurse(payload, cwd, executed, source):
+             return True
+ 
+diff --git a/tests/cron/fixtures/lifecycle_guard_heredoc/main_verdicts.json b/tests/cron/fixtures/lifecycle_guard_heredoc/main_verdicts.json
+index cbfd57a997..6de0690442 100644
+--- a/tests/cron/fixtures/lifecycle_guard_heredoc/main_verdicts.json
++++ b/tests/cron/fixtures/lifecycle_guard_heredoc/main_verdicts.json
+@@ -1,25 +1,651 @@
+ {
+- "cases": 17410,
+- "corpus_digest": "4d46887a400878c76be79a4a39b232edda25eef34b501acd2d6070fe2644b236",
++ "cases": 18586,
++ "corpus_digest": "e319d0a84e01a00da055b5ad62888f2832db8831841078581040296e4a0763f3",
+  "main_allows": [
++  "0000c5b53f59fed9",
++  "001b6375098f3ac6",
++  "005f818cf042cb6c",
++  "01e968b5152ba16e",
++  "01f327cbbb7b1435",
++  "021f86297d02b571",
++  "02831d25e880a599",
++  "02a95130a28358f9",
++  "0391496a6892378c",
++  "03a1c3310f833d13",
++  "045de84a579d9e9b",
++  "046b9d71761aef37",
++  "060c58e362ceda91",
+   "068f6b9fccb98384",
++  "07e120d9e64cd6e3",
++  "080085cbe015c8a7",
++  "08276c9f7507ef47",
++  "08836eacc5a59925",
++  "08b2dd65cca375fb",
++  "08ffe129ba00f5c1",
++  "09645feae859dd47",
++  "0974ebcc8a3beaab",
+   "099666096503950b",
++  "0a9292605af8dcdc",
++  "0b373cecf7b56b51",
++  "0b5b581c4d519a64",
++  "0c0b33ce1e413da4",
++  "0c93fe61c0d2b01e",
++  "0d879de5acb612bc",
++  "0db2c24556a3fc04",
++  "0dc546e414c36a17",
++  "0deaf08805424260",
++  "0e046d06b1bf303b",
++  "0e35bb1d2a5f6469",
++  "0ed51de61b12cd83",
++  "0f01154275f8ee75",
++  "0f43400867ddf3f7",
++  "0ff8269dbe3cd6c4",
++  "100f44ad21336a93",
++  "10614f061a99a1c0",
+   "1063caa4d3aa4022",
++  "10a3bf87c1d78f68",
++  "10ad963c32c2eb18",
++  "11022b29e5aa42ba",
++  "115d6122297577b4",
++  "11b2f0b57d96bc08",
++  "11bcd15bfc6023ac",
++  "12163e3e6a90e17a",
++  "124cb52b7c91354b",
++  "13e8d85434cb305b",
++  "13fb1e1c1f291d51",
++  "146359c00b12bcd5",
++  "15bd2cd7d010b697",
++  "15de022655ea9a37",
++  "15f0e148962d853c",
++  "16bdad85897cc39d",
++  "16cca58af40cf1ec",
++  "171b7775aeb79536",
++  "176d1ee98dbdbf56",
++  "182aa7886c89f69b",
++  "1845c297c488d4f9",
++  "186bc88c7acd251e",
++  "18fc60a888b6de6f",
++  "194eacfb0c72968e",
++  "1959631397e7a02b",
++  "1960863b28251ebd",
++  "1990abdcafb40985",
++  "19d0adfca2ab51cd",
++  "1a1cdc56b6040860",
++  "1ab1541466d8c3fa",
++  "1c362686b93e43d3",
++  "1c9c0cb3e23cc3b9",
++  "1ea2e40125b373b5",
++  "1ec5cff538ca805c",
++  "1ed04964947f1a0a",
++  "1f82a2256e13c943",
++  "1fa099ac75d7a501",
++  "200d5042fb2831d5",
++  "20674682afa26995",
++  "20d51655060a41b6",
++  "21337f1477402c17",
++  "21be17e19c01c421",
++  "2319ec26f88adf35",
++  "2376349988eb2a0b",
++  "23ebe7440c9061ff",
++  "249d5c8973ac0cf2",
++  "24e7526e779a6012",
++  "2565aacaa563cde6",
++  "2648ef070af3c08c",
++  "26ba5851da8bbc98",
++  "279ca42dc7b08428",
++  "27e53f37c8b1047a",
++  "29acbd629abb1671",
++  "29c3147081ccc966",
++  "29c48217c7371f59",
++  "29cdfa0815921847",
++  "29f4a8fa5160bdff",
++  "2a5296efc2e6170e",
++  "2aa561eaf24d5b87",
++  "2ae138f37c330df4",
++  "2b268a3896f39d20",
++  "2b495c5ca548b2f3",
++  "2bbd197e25dfb7f3",
++  "2c19afe8bcdf2d28",
++  "2c29d824bbfe9d41",
++  "2c48688992b21c82",
++  "2c48e6875f83a69d",
++  "2c9a255f5f062e89",
++  "2caece7827663033",
++  "2cf548f347d71070",
++  "2d14fbc6544ab38d",
++  "2dcbf9f7d1fcbe68",
++  "2e16068270833f32",
++  "2e6151b72978ecd8",
++  "2eec4149c8644525",
++  "2fd9c59bef793cf6",
++  "2ff02ddfcf203e88",
++  "2ffd9b9a793a473a",
++  "3013c50c8dd20e16",
++  "30310e269ff4e1e1",
++  "308ad8bc207f0502",
++  "30dc194975a77f55",
++  "316a46dea093b35e",
++  "317135aa35a321b8",
++  "3181a3122f5748e0",
++  "318b3fd65019dd57",
++  "31d0a3f5e3ca6a6c",
++  "31e7d52df81b5b8c",
++  "31f122900bffd6d8",
++  "32a2795e963344ef",
++  "32d7ff64f7f5d130",
++  "3336b6f769230f25",
++  "3408f4e29ad79939",
++  "341ad00086cf7de4",
++  "3492224e8d348778",
++  "34db69d8f5f74978",
++  "34dfd39316016cba",
++  "34ea9a0d4ed1c3b6",
++  "357522867d9d7e08",
++  "35e368d34b3578e6",
++  "360492ca6eef91db",
++  "362f0ec7dffdd5cc",
++  "3659969f7a4c71c3",
++  "369ae2fb4409f2e9",
++  "36bfaad4b6ae0d74",
++  "3790dfd60cb6c298",
++  "37edc9940f5a00ca",
++  "39048159c9c10e16",
++  "390be50862e7b18f",
++  "3912d2ee2e2ebfc6",
++  "3956e6e2f7d59485",
++  "39ed7aae3bdf6acb",
++  "3a9ec120210dc63d",
++  "3b3c1021df94f213",
++  "3d1301a9af59dd94",
++  "3d234d9b34f61367",
++  "3d733b387df46580",
++  "3d83d27711df91f1",
++  "3d92e484c8cb3750",
++  "3db5dbf82f228ea2",
++  "3ee1d4c3c8a50b24",
++  "3f5ff82a1a47a0f4",
++  "3f71f38f679ac5d6",
++  "3ffb6dc10834c9d7",
++  "4040b01e64fb087e",
++  "40cbb189025cd45a",
++  "40d8effbd15271e3",
++  "40e23e7abd1cde24",
++  "410461aa08b36f44",
++  "414c46c95b90510b",
++  "416b9524c0ee9772",
++  "4197fc8157385a65",
++  "420627f7b04c91cb",
++  "4236f1e077b54530",
++  "4291ffdbf87390f1",
++  "42ea779fabd8131a",
++  "4361be98cd63aba9",
+   "44ae2c7fd84f309e",
++  "45d16ff1e5d5b7bc",
++  "45e9b325f6be59cf",
++  "463675883b287c43",
++  "4639e2ac801f80a8",
++  "467adf51459a1503",
++  "46b8906c47ffbac0",
++  "471d642be318f7c5",
++  "47459e449d3a2836",
++  "476be2576180e9b2",
++  "47a8ff77b07df350",
++  "47df6e6836196f6e",
++  "48760d8685a825b2",
++  "4916f9e7539ddb84",
++  "493b92992811b1b1",
++  "499c541b2a123ec2",
++  "4abc79ddeca26f09",
++  "4b6cf1732d35cea2",
++  "4bb741ac572b8654",
++  "4c10f8ac558ceff1",
+   "4c3995bbbbabae1e",
++  "4cd4d019f62478dc",
++  "4e0100dcafba8844",
++  "4e0d32c9761d28a4",
++  "4f72624fb9aad16d",
++  "4fcb9731baf8133d",
++  "505b6213795bf42e",
++  "50977616e00d1b9c",
++  "50b287aec025753f",
++  "517da2edbccc2887",
++  "518d187d68e50713",
++  "51e958e0a2011d26",
++  "51f93eb84993f76b",
++  "52bb0fca26530617",
++  "52ced868f1d351c9",
++  "52f7805c33d4dedc",
++  "53d53c1c14c786ed",
++  "542e82d87ebb5cea",
++  "5453772c31f8ebbc",
++  "5472901bfa339ed4",
++  "5593bfe726c48c24",
++  "55c25f04151bb07f",
++  "56fa1443bcc94fb5",
++  "57a816b3b49fba11",
++  "58696b0afa3db9d0",
++  "58c804fffb3073f7",
++  "58f37a43267d7597",
++  "59449f89cfb0af83",
++  "5b724c1e08a6c93c",
++  "5bec53b71d505dac",
++  "5c66fa9a5b8d2b5d",
++  "5c7968fda0d049e0",
++  "5c7f4bb6a683c5ae",
++  "5c820dea94a99b8e",
++  "5cb9ee9dde677852",
++  "5cd7cfa774a105a0",
++  "5dc5cf27eeebb56f",
++  "5e3def0d3270ed40",
++  "5e978e82a1cd697b",
++  "5f9abce069cb8e24",
+   "60354970c31e1649",
++  "60a1f4da4455cd14",
++  "60f5e2d93ae34d08",
++  "61430babb119ff92",
++  "61bf7e0df298d783",
++  "61d8ab96e1f69b98",
++  "620d500ed2ed10fb",
++  "621f85632628cf41",
++  "622f591e7618e700",
++  "6232a50f0157872e",
++  "623e1e3c38e90172",
++  "628d5983b8522165",
++  "62c714292f0d8b94",
++  "62d92ed8b5a4bc8e",
++  "62ecdabea05440ea",
++  "6305595960ae481a",
++  "635406d8a780651e",
++  "638ddaa069940db4",
++  "639f1ac97255b24b",
++  "65ed959021cc7e60",
++  "6618f76ed49857a3",
++  "6637cbc365b6fedf",
++  "663de773993283ab",
++  "665f66e41be02de4",
++  "667c1ac135af254a",
++  "66815246a939180f",
++  "66c92d42f8ae8c35",
++  "670ff72cec503793",
++  "6797c06fa0a907f8",
++  "68dd286544c7100a",
++  "68f6d267c304f508",
++  "6904936cd4c43c54",
++  "697d0c16cd18ef28",
++  "6988b5e133451357",
++  "6a0ac191b691b634",
++  "6a37159d2e81b625",
++  "6a3b0229ab1d874c",
++  "6a4b050ec53f9c93",
++  "6a4f8421d8fe445c",
++  "6a929dbacccbc9d0",
++  "6bfe789fd1b3ef82",
++  "6c0c407858a46459",
+   "6c3a8ff7c8e34c09",
++  "6c4933ad660cf857",
++  "6c76894976c6c637",
++  "6d37151d65d83563",
++  "6d478878458d11f3",
++  "6daf7a43e146f98c",
++  "6e5ce982d2d017a4",
++  "6ea277a846407ee5",
++  "6f06e704a91037bb",
++  "6fe3f9d1c8b37f29",
++  "70a5f4526c84778e",
++  "70d57966460375dc",
+   "71a3fc0272b4b1d8",
++  "71fbe3c5f8993894",
++  "722212d33ac0fd9c",
++  "7236305f9116aee7",
++  "7263994445e84d9e",
++  "72830ddbbe9be938",
++  "72aad5c6e8acc62c",
++  "72b8af12bb5e9645",
++  "72eac2f1ff611e0c",
++  "731387eca141f9e0",
++  "732c6dce6befca38",
++  "73d0c88d7db3d4db",
++  "73eda7e3d3883b9a",
++  "744229e27c89987d",
++  "75b09f5e6660f147",
++  "763790e4fca0aeba",
++  "765c78ae37afbf4f",
++  "76651c9d8e356d5c",
++  "77136483865eb5f2",
++  "77d3bc22acc2a805",
++  "784e3144fac60722",
++  "7885997a3d04febd",
++  "788c61b4b4bdb366",
++  "78d3344e8409cb63",
++  "790a36587fe6e523",
++  "79d56f061f6ee232",
++  "7a8357326a0da00c",
++  "7a97155615e46e8c",
++  "7ab9f2eade75deab",
++  "7afdecfbe67fc059",
++  "7b229111e7168c05",
++  "7b29c2cdc988b85a",
++  "7c082e8f441e8699",
++  "7ca50edff8d8f210",
++  "7d6e708791d7291b",
++  "7df1bc89daa0004e",
++  "7e1c6359a1f0e265",
++  "7e29738cc45c3c00",
++  "7eea0adcbbdb77f0",
++  "7f5a1e3f5da9e5b4",
++  "7f753d82dd37bf68",
++  "8014ef6b096ac502",
++  "80a8460c9ae69046",
++  "816f11b14cba0ca3",
++  "822949c18fac180a",
++  "8366f5a14bf6b4d1",
++  "83a411c9d0d7e160",
++  "83e6aeecb197b080",
+   "84d0254ec159ae1f",
++  "85782b9b334b4c2a",
++  "85e66583d71e4173",
++  "863d90a97a3861c0",
++  "868120fc22b4e652",
++  "86fd38bc86bb7c0c",
++  "8770fadc508552a6",
++  "878c88377bb76da3",
++  "87a9b357af6dde85",
++  "87eeab01393e1b92",
++  "890429218887ba7e",
++  "899ae3c4b014acc0",
++  "8b103ac1c54a2bd6",
++  "8b259d2f58ef8465",
++  "8b7cd9754952144e",
++  "8bd093a932f81f63",
++  "8bd6c9e98ee97c91",
++  "8c0378c6d2d90a0e",
++  "8c62973a44655a8d",
++  "8ca6e412782c9e3c",
++  "8ca870d33208c83e",
++  "8ce1144ab4674466",
+   "8d2972b7beaeb77e",
++  "8e4e0d0d507a7d41",
++  "8e521c3d45f9accb",
++  "8e5b79199324141a",
++  "8e7a64169989c3b9",
++  "8ee6df3eef53ca4f",
++  "8fac97760d1cab2c",
++  "8fda8e6593a76dd6",
++  "8ff20c36d997c320",
++  "8ffe3e97840d6a93",
++  "9047b7c0fdde1f6e",
++  "90ac4c8730151fdf",
++  "90c9a289cb9489be",
++  "914192e4a326c322",
++  "92439fb2df256c09",
++  "92583195e9ccbe8f",
++  "92de8a16c6055c8f",
++  "92f80f5cd50d538b",
++  "9322c92401fc6a15",
++  "93cba79e5078dc10",
++  "93fd3fd503f2a70c",
++  "94b8d6d18b678df7",
++  "950c5e148e3c0ad8",
++  "9544a9dcd228a29e",
++  "95606baa049238fd",
++  "9574610509ad5900",
++  "95d00787bb379375",
++  "95ed4fb5f951f556",
++  "964e7e79d4a5a128",
++  "967f1b3a1b645b2b",
+   "970a83dacb6fd831",
++  "970e3fb8cab106aa",
++  "97987ad8e7457ccf",
++  "97e37ab5921dd217",
++  "9833fad371cfef27",
++  "9834012a3bdcf557",
++  "9940cc898a0489cf",
++  "99e264013e83a504",
++  "9a4845792b6f6130",
++  "9a94ffe32428e8a9",
++  "9b5bfbbcefda783d",
++  "9b80ae997b18f266",
++  "9bcd2843b44723d4",
++  "9c67e8708f086fd6",
++  "9e34457f180129f9",
++  "9ec40ac527d16744",
++  "9f09794ceb54c99f",
++  "9f416d580d6d062a",
+   "9f6aa6102575c155",
++  "9f867c7345e6d264",
++  "9fa179505a6ee4ba",
++  "a082b525f536bab0",
++  "a1d4dfdc2abfece2",
++  "a332bd4e242beb1f",
++  "a3e838bf5eaaee2f",
++  "a4754dbe66df8bf5",
++  "a4efb3ce6d78aaee",
++  "a4f74eca2fbcec50",
++  "a582e880f02c4985",
++  "a6500d24ec0fc10f",
++  "a6542e9f2b029920",
++  "a7c2fe875e63d77f",
++  "a827def49b27cacf",
++  "a83fa31e761c8837",
++  "a885d4e1f22d6037",
++  "a8d9362e7406bcc0",
++  "a99a89d1fa5fcb6e",
++  "aa521f19e15e6b64",
++  "aae5389b9e4a21a5",
++  "aaf1a93f076a1974",
++  "ab27f80f20142823",
++  "ab2b2e34047bd068",
++  "ab33b31798e495bb",
++  "ace548120d86c55c",
+   "ad4bbe0033fb340c",
++  "adbad43d381726a8",
++  "adc3c2edbec9ed57",
++  "ae0c628be0f379ed",
++  "ae45e32ec2e4fafc",
++  "afe00d894ab58cab",
++  "b00aa5374c46811d",
++  "b0ab1e30f43088a8",
++  "b135963b565f687c",
++  "b216d8e3840ee063",
++  "b244e83f2ec42ae8",
++  "b266fb9d7ac9e33d",
++  "b2a5501e559a9f5c",
++  "b2baa6d207336a78",
++  "b3336bd63beeeb61",
++  "b3ce7e84f04c2619",
++  "b42654963dd09adb",
++  "b5048b7f53cdf446",
++  "b525128150ce2145",
++  "b59e1642394d4308",
++  "b5a2af35d931b366",
+   "b5c6fa2207de29c9",
++  "b5fa0d84af72a55a",
++  "b5ff95e50e2363e1",
++  "b6517796dd4bdb2d",
++  "b676da897b022825",
++  "b6fe7ca98c30f4d8",
++  "b721e2c297473203",
++  "b7a4e0d36fb454dc",
++  "b7f4f6817c177e6c",
++  "b827dc31df0f6cf0",
++  "b86bd8b286d04f0b",
++  "b86cf5ffff20b13b",
++  "b8eaa30ff47d45d4",
++  "b92ea46a7ff64882",
++  "b9a7a84a91dbc679",
++  "b9f7d463e0853685",
+   "badf6317e898705f",
++  "bb4095a2564d89ec",
++  "bb69d98b7d44389e",
++  "bb99f0d8c20ceedc",
++  "bbbf582c03a0f469",
++  "bcc05a1e900b149d",
++  "bce40eb7e4cddd62",
++  "bd2b714f7d28c8df",
++  "bd6fac6f5fecaf7a",
+   "bd7354ede9c73648",
++  "bd9ee839a021a372",
++  "bdcbc453d63ebc24",
++  "bdf0ba708a459a4d",
++  "bdfc9c57fb9fff88",
++  "bef5c57967f09a67",
++  "bf2216418acec2fa",
++  "bf8f52d7af469d1d",
++  "bfc21a6ae8a6eb01",
++  "c0878e92e685e45a",
++  "c23eab45363d8506",
++  "c28304842c324db4",
++  "c2d03e8a98cecd61",
++  "c30d9a9594a2a2cc",
++  "c3866e262e511b3c",
++  "c4828ba5f7ef5796",
++  "c4c7c6b9c8d9597d",
++  "c4db27812455aad8",
++  "c4e6251e643bba10",
++  "c554c68a6041be3a",
++  "c5b29c86485b3bb7",
++  "c6105c19c7450719",
++  "c634dc17a8445080",
++  "c6b2446a3bb6cec8",
++  "c76b92f953d086ba",
++  "c7c38340d7269814",
++  "c85cb222b3e5adb6",
++  "c86befc1f2c92b05",
++  "c8c0ff92ef764054",
++  "c8e67a760cfc4e34",
++  "c97a70f866f773b4",
++  "c9ba4c71b12b894d",
++  "ca41992b5dd1dc96",
++  "cafa96de78c04c10",
++  "cb3e0c71ac6f2185",
++  "cb646e9cadeaa21f",
++  "cc41b96f7c25b4ec",
++  "cc58917ddf218ffc",
++  "cca47b2a61dd4a68",
++  "ccd4268ab6e6f037",
++  "cd0d046b3c82bb62",
++  "cd80e11451e996da",
++  "cdd697159c03bc22",
++  "ce3901912d4ec09d",
++  "ce3d86ccd3f56e45",
++  "cf6db5fd23748c71",
++  "cfaaf4365a839b90",
++  "cfce20a7c99e7b0f",
++  "d014c773cc652897",
++  "d02de7e3332b9e8f",
++  "d032b07078fb5b7d",
++  "d08c74025526e0d3",
++  "d0a68023255c4c09",
++  "d17c2246626a9350",
++  "d19a6218d3adeeab",
++  "d1ab10c6043d0307",
++  "d1ab51ede07b2124",
++  "d25ec41aa6371878",
++  "d26b17e2ee9e2c4d",
++  "d3df78b8ace3bf60",
++  "d43c7e3af54a2f8c",
++  "d4615677ad50c047",
++  "d56718968c11edc0",
++  "d613053b1a043de9",
++  "d69decc6cbdcdbaf",
++  "d6c25a3512a7fa23",
++  "d76f0a5907fc4f40",
++  "d7f15d1aedf044d6",
++  "d81acde8d0b59b22",
++  "d8993068cde93e78",
++  "d8f0eff48ef59ea4",
++  "da22b7309fca6b29",
++  "da38fa2a37610037",
++  "da3ddee8a2892c71",
++  "da7acd12f55d1c81",
++  "dae3ea44ed72d2c6",
++  "db2d28b8b157bfac",
++  "db4c867c94a938cd",
++  "dbbcced597672368",
++  "dc3754181d117c3e",
++  "dcc3b0908c0f5682",
++  "dd871bdfb9e8a694",
+   "de1e4f64a3081e38",
+-  "e367d5b9efcddc00"
++  "de26cefffa419914",
++  "dee7fc0ece933d87",
++  "df209598734ba512",
++  "df4ac7866aa715a8",
++  "df4e283cc0433a9f",
++  "df6103a964f39844",
++  "dfa17e1c9db015e3",
++  "dfc25e74274af90f",
++  "dffe78a12d7de66a",
++  "e0360747f81001a0",
++  "e07b0bf0014706a1",
++  "e0e75381828198e4",
++  "e0ed006d656c48a3",
++  "e15c5cc77ab714dd",
++  "e2035db23be30e2a",
++  "e220d96004a55360",
++  "e23d2316231a1899",
++  "e245b6bb74a6992c",
++  "e34fc4b777083f56",
++  "e367d5b9efcddc00",
++  "e3e2a1197aacede4",
++  "e5d79a1d17cc7a5b",
++  "e79a3d9e643f4801",
++  "e7d24f0b67579773",
++  "e834cfa31f8b2065",
++  "e84222157e2a8fb0",
++  "e880d293c2d002e2",
++  "e993a8252279e526",
++  "e9c3ff6c6853bb55",
++  "eb53cdef2ec9a370",
++  "ec29c2ce0bfde014",
++  "ecec2cc675be9389",
++  "ecf89b6729e874f2",
++  "ed7e4a6b896fa5b2",
++  "ee2a8bd1677ceccd",
++  "ee93c329bd720d36",
++  "ef6d88e6d95bfa2e",
++  "ef84ad3d81585039",
++  "efee802da4e34564",
++  "f025ba83bb5c246b",
++  "f1740c4677e711f7",
++  "f212a6cbc076c74c",
++  "f24c1bba1d068ac8",
++  "f282f6853ce65958",
++  "f2e37ec4463a7099",
++  "f34b70acc788fd22",
++  "f3cf30c72965dae9",
++  "f43ef7a016bb343d",
++  "f47da223a772c198",
++  "f4e12546ceed1107",
++  "f528a4d4be180f70",
++  "f5768c190c0610c0",
++  "f587f56fc3ab57aa",
++  "f600f6dbac6c95f4",
++  "f64a41cd4ef0125a",
++  "f6528ad9030f9f9b",
++  "f6ab02672bc7e83e",
++  "f79f92934f5facc0",
++  "f8c4555a017076e6",
++  "f9498862bd56466d",
++  "f983d45be64ec1f5",
++  "f9d97d1ebeea54bd",
++  "fa111e827d928466",
++  "fb3f621b44248c2e",
++  "fb474078aed33387",
++  "fba14b81811be58f",
++  "fbf58e57fa2619c6",
++  "fc762304be50741f",
++  "fc916ed56f5ae3a6",
++  "fd1f832408d6187c",
++  "fd998219444c4340",
++  "fdd92530a1b3c1b9",
++  "fe11461903b1a94e",
++  "fe27573ed10e00eb",
++  "fe3b92851675d374",
++  "fe5cb2249d6d0a24",
++  "fec461243e27502c",
++  "ff084e9a6caa7791",
++  "ffafe0828378b0f4",
++  "ffdc5565864f483f"
+  ],
+  "main_sha": "da52aff8f4c0177a1786c3db09431fafaf8d267f",
+  "seed": 20261113
+diff --git a/tests/cron/heredoc_shape_corpus.py b/tests/cron/heredoc_shape_corpus.py
+index e122bc97c2..d18cb3f8d3 100644
+--- a/tests/cron/heredoc_shape_corpus.py
++++ b/tests/cron/heredoc_shape_corpus.py
+@@ -18,9 +18,14 @@ keyword-prefix aliases (``alias t='time '``) turn ``t ( bash ./big.sh )`` into a
+ runs an unscannable script, and ``alias python3=bash`` runs a "Python" heredoc body as shell. The
+ guard is told the session's alias names (``scan_gateway_lifecycle(session_aliases=…)``).
+ 
++A third family (``s_position == "sink"``) hands a data consumer's OUTPUT to a shell (``python3 -
++<<'PY' | bash``, ``f | sudo bash``, ``eval "$(…)"``, ``. <(…)``, …) under every stdin wrapper and
++nesting form: the printed ``bash ./big.sh`` (over the scan cap) or restart is shell code there.
++
+ Real bash runs every case with a fake ``hermes`` that writes a marker. The property the test
+ asserts: when bash ran the payload and origin/main refuses the command, the tree under test
+-refuses it too. origin/main's verdicts are checked in (``main_verdicts.json``) with its sha.
++refuses it too; a sink case must be refused whenever bash ran it. origin/main's verdicts are
++checked in (``main_verdicts.json``) with its sha.
+ 
+ Startup-file payloads need bash to source the test's ``$HOME`` files; ``startup_shell_prefix``
+ finds an argv prefix that makes it do so on this host (none, or bubblewrap masking the system
+@@ -99,6 +104,25 @@ SESSION_PAYLOADS = {
+     "consumer-wrapped": "timeout 5 env A=1 " + _INNER,
+ }
+ SESSION_FORMS = ("plain", "function", "subshell")
++# Third family (``s_position == "sink"``, review 5888336995 nit 3): a data consumer's OUTPUT is
++# handed to a shell, so the line it prints is shell code. Consumers print one line; sinks pipe,
++# ``eval``, process-substitute or source that output; nestings wrap the consumer. ``big`` prints
++# ``bash ./big.sh`` (over the scan cap: the walk must fail closed); ``direct`` prints the restart.
++SINK_CONSUMERS = {
++    "python": ("python3 - <<'PY'", "print('{line}')\n"),
++    "cat": ("cat <<'PY'", "{line}\n"),
++}
++SINK_LINES = {"big": "bash ./big.sh", "direct": 'hermes gateway "restart"'}
++SINKS = {
++    "| bash": ("pipe", "bash"),
++    "| sh -s": ("pipe", "sh -s"),
++    "| sudo bash": ("pipe", "sudo bash"),
++    "| ssh h bash": ("pipe", "ssh h bash"),
++    'eval "$(…)"': ("wrap", 'eval "$( ', ' )"'),
++    "bash <(…)": ("wrap", "bash <( ", " )"),
++    ". <(…)": ("wrap", ". <( ", " )"),
++}
++SINK_NESTINGS = ("plain", "function", "subshell", "group", "outer", "ssh")
+ # Over the 1 MiB scan cap, so a walk that executes it fails closed; bash runs it to the end.
+ BIG_SCRIPT = "# padding\n" * 130000 + 'hermes gateway "restart"\n'
+ # Startup file: record that it ran, keep the fake bin on PATH, then rewrite the rest of stdin.
+@@ -126,6 +150,30 @@ class Case:
+     nesting: str
+     payload: str
+     session: str = ""  # a SESSIONS key (session cases only): aliases the shell already holds
++    sink: str = ""  # a SINKS key (sink cases only): what runs the consumer's output
++
++
++def build_sink_command(sink: str, wrapper: str, nesting: str, consumer: str, line: str) -> str:
++    """A consumer heredoc (behind *wrapper*) printing *line*, nested per *nesting*, whose output
++    *sink* hands to a shell."""
++    if nesting in ("outer", "ssh"):
++        inner = build_sink_command(sink, wrapper, "plain", consumer, line)
++        opener = "bash -s <<'OUTER'" if nesting == "outer" else "ssh h 'bash -s' <<'OUTER'"
++        return f"{opener}\n{inner}OUTER\n"
++    opener, body = SINK_CONSUMERS[consumer]
++    opener, body = wrapper + opener, body.format(line=SINK_LINES[line]) + "PY\n"
++    prelude = ""
++    if nesting == "function":
++        prelude, head, tail = f"f() {{\n{opener}\n{body}}}\n", "f", "\n"
++    elif nesting in ("subshell", "group"):
++        start, end = ("(", ")") if nesting == "subshell" else ("{", "}")
++        head, tail = f"{start}\n{opener}\n{body}{end}", "\n"
++    else:
++        head, tail = opener, "\n" + body
++    kind, *parts = SINKS[sink]
++    if kind == "pipe":
++        return f"{prelude}{head} | {parts[0]}{tail}"
++    return f"{prelude}{parts[0]}{head}{tail}{parts[1]}\n"
+ 
+ 
+ def session_alias_names(session: str) -> frozenset[str]:
+@@ -193,11 +241,21 @@ def generate_full_corpus() -> list[Case]:
+         # Old keys stay command-only; a session case's key also names its session.
+         key = hashlib.sha1(f"session {session}\n{command}".encode()).hexdigest()[:16]
+         cases.setdefault(key, Case(key, command, "bash", (), "session", "", form, payload, session))
++    for sink, wrapper, nesting, consumer, line in itertools.product(
++            SINKS, WRAPPERS, SINK_NESTINGS, SINK_CONSUMERS, SINK_LINES):
++        command = build_sink_command(sink, wrapper, nesting, consumer, line)
++        key = hashlib.sha1(command.encode()).hexdigest()[:16]
++        cases.setdefault(key, Case(key, command, "bash", (), "sink", wrapper, nesting,
++                                   f"{consumer}-{line}", sink=sink))
+     return list(cases.values())
+ 
+ 
+ def _cover_keys(case: Case) -> set[tuple]:
+-    """Dimension values a case exercises, each with its ``-s`` placement and nesting form."""
++    """Dimension values a case exercises, each with its ``-s`` placement and nesting form (a sink
++    case: every sink x nesting x consumer x line, and every wrapper under each sink and nesting)."""
++    if case.s_position == "sink":
++        return {("sink", case.sink, case.nesting, case.payload),
++                ("sink-wrapper", case.sink, case.wrapper, case.nesting)}
+     where = (case.s_position, case.nesting)
+     words = [word for word in case.words if word != "-s"]
+     return ({("option", word, *where) for word in words} | {("wrapper", case.wrapper, *where)}
+@@ -245,7 +303,9 @@ def prepare(root: Path) -> dict[str, str]:
+     ssh = root / "ssh"
+     # Local SSH transport control; no network access.
+     ssh.write_text('#!/bin/sh\nshift\nexec /bin/sh -c "$*"\n')
+-    for tool in (hermes, ssh, evil_python):
++    sudo = root / "sudo"
++    sudo.write_text('#!/bin/sh\nexec "$@"\n')  # no privilege change: runs its operand
++    for tool in (hermes, ssh, sudo, evil_python):
+         tool.chmod(0o755)
+     return {"PATH": f"{root}:/usr/bin:/bin", "FAKE_BIN": str(root), "HOME": str(home),
+             "BASH_ENV": "", "ENV": str(home / ".profile"), "LANG": "C.UTF-8"}
+@@ -353,9 +413,10 @@ def evaluate(root: Path, cases: list[Case]) -> list[tuple[Case, bool, bool]]:
+ 
+ 
+ def violations(results, main_refuses) -> list[Case]:
+-    """Cases bash ran, main refuses, and the guard under test allows."""
++    """Cases bash ran, main refuses, and the guard under test allows. A sink case must be refused
++    whenever bash ran it, whatever main says: main allows most of them (the nit-3 gap)."""
+     return [case for case, executed, refused in results
+-            if executed and main_refuses(case) and not refused]
++            if executed and (case.s_position == "sink" or main_refuses(case)) and not refused]
+ 
+ 
+ def corpus_digest(cases: list[Case]) -> str:
+diff --git a/tests/cron/test_lifecycle_guard_heredoc_walk.py b/tests/cron/test_lifecycle_guard_heredoc_walk.py
+index c77452acbc..67af3b4dce 100644
+--- a/tests/cron/test_lifecycle_guard_heredoc_walk.py
++++ b/tests/cron/test_lifecycle_guard_heredoc_walk.py
+@@ -892,6 +892,13 @@ def test_generated_shape_corpus_never_allows_what_bash_runs_and_main_refuses(tmp
+     session = [case for case in cases if case.s_position == "session"]
+     assert len(session) == (len(corpus.SESSIONS) * len(corpus.SESSION_FORMS)
+                             * len(corpus.SESSION_PAYLOADS))
++    # Nit 3: every sink x nesting x consumer x printed line, and every wrapper under each.
++    sink = [case for case in cases if case.s_position == "sink"]
++    assert {(case.sink, case.nesting, case.payload) for case in sink} == {
++        (s, n, f"{c}-{line}") for s in corpus.SINKS for n in corpus.SINK_NESTINGS
++        for c in corpus.SINK_CONSUMERS for line in corpus.SINK_LINES}
++    assert {(case.sink, case.wrapper, case.nesting) for case in sink} == {
++        (s, w, n) for s in corpus.SINKS for w in corpus.WRAPPERS for n in corpus.SINK_NESTINGS}
+ 
+     started = time.monotonic()
+     results = corpus.evaluate(tmp_path, cases)
+@@ -905,6 +912,7 @@ def test_generated_shape_corpus_never_allows_what_bash_runs_and_main_refuses(tmp
+     assert all(case.key in ran for case in review if case.payload == "history")
+     assert all(case.key in ran for case in session
+                if case.session == "time" and case.payload == "alias-subshell")
++    assert all(case.key in ran for case in sink)  # bash runs every printed line
+     # Startup-file rows need a shell that sources the test's `$HOME` files (see
+     # corpus.startup_shell_prefix): every one of them must run when there is one.
+     prefix, how = corpus.startup_shell_prefix()
+diff --git a/tests/cron/test_lifecycle_guard_output_sink.py b/tests/cron/test_lifecycle_guard_output_sink.py
+new file mode 100644
+index 0000000000..cba6b5a22a
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_output_sink.py
+@@ -0,0 +1,116 @@
++"""A data consumer whose OUTPUT a shell runs is not data (review 5888336995 nit 3, PR #1671).
++
++``python3 - <<'PY' | bash`` printing ``bash /x/huge.sh`` runs that script, so the walk must treat
++the path as executed (an oversized script fails closed) instead of a mention in a masked body or
++an interpreter string literal. The shape corpus (``heredoc_shape_corpus``, ``s_position ==
++"sink"``) crosses every sink with every wrapper and nesting form under real bash.
++"""
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from tools.shell_heredoc import output_reaches_shell, strip_inert_heredoc_bodies
++
++_PRINT = "print('bash {big}')\n"
++# The reviewer's two repros verbatim (paths moved under tmp_path), then the other sinks the card
++# names.
++_SINK_SHAPES = {
++    "review-pipe": "python3 - <<'PY' | bash\n" + _PRINT + "PY\n",
++    "review-function": "f() { python3 - <<'PY'\n" + _PRINT + "PY\n}; f | bash\n",
++    "function-newline": "f() { python3 - <<'PY'\n" + _PRINT + "PY\n}\nf | bash\n",
++    "pipe-sh-s": "python3 - <<'PY' | sh -s\n" + _PRINT + "PY\n",
++    "pipe-sudo": "python3 - <<'PY' | sudo bash\n" + _PRINT + "PY\n",
++    "pipe-ssh": "python3 - <<'PY' | ssh h bash\n" + _PRINT + "PY\n",
++    "eval": "eval \"$(python3 - <<'PY'\n" + _PRINT + "PY\n)\"\n",
++    "eval-cat": "eval \"$( cat <<'PY'\nbash {big}\nPY\n )\"\n",
++    "procsub": "bash <(python3 - <<'PY'\n" + _PRINT + "PY\n)\n",
++    "dot-procsub": ". <(python3 - <<'PY'\n" + _PRINT + "PY\n)\n",
++    "subshell": "(\npython3 - <<'PY'\n" + _PRINT + "PY\n) | bash\n",
++    "group-cat": "{\ncat <<'PY'\nbash {big}\nPY\n} | bash\n",
++    "variable-eval": "o=$(\npython3 - <<'PY'\n" + _PRINT + "PY\n)\neval \"$o\"\n",
++    "python-c": "python3 -c \"print('bash {big}')\" | bash\n",
++    "outer-shell": "bash -s <<'R'\npython3 - <<'PY' | bash\n" + _PRINT + "PY\nR\n",
++}
++
++
++def _big(tmp_path):
++    big = tmp_path / "x" / "huge.sh"
++    big.parent.mkdir()
++    big.write_text("# padding\n" * 130000, encoding="utf-8")  # over the 1 MiB scan cap
++    return big
++
++
++@pytest.mark.parametrize("shape", sorted(_SINK_SHAPES))
++def test_consumer_output_fed_to_a_shell_fails_closed(tmp_path, shape):
++    command = _SINK_SHAPES[shape].replace("{big}", str(_big(tmp_path)))
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe is True and refusal is not None and "scan cap" in refusal, refusal
++
++
++def test_review_function_repro_is_not_masked_for_the_walk(tmp_path):
++    command = _SINK_SHAPES["review-function"].replace("{big}", str(_big(tmp_path)))
++    assert strip_inert_heredoc_bodies(command, nested=True) == command
++
++
++@pytest.mark.parametrize("command", [
++    "(\npython3 - <<'PY'\nprint(1)\nPY\n) | bash",
++    "{\ncat <<'PY'\nx\nPY\n} | sudo bash",
++    "o=$(\npython3 - <<'PY'\nprint(1)\nPY\n)\neval \"$o\"",
++    "bash <(\npython3 - <<'PY'\nprint(1)\nPY\n)",
++])
++def test_multiline_consumers_feeding_a_shell_mask_nothing(command):
++    assert strip_inert_heredoc_bodies(command) == command
++    assert strip_inert_heredoc_bodies(command, nested=True) == command
++
++
++# The consumer's output goes nowhere a shell runs it: the path stays a mention (allowed).
++_NO_SINK_SHAPES = {
++    "plain": "python3 - <<'PY'\n" + _PRINT + "PY\n",
++    "pipe-grep": "python3 - <<'PY' | grep x\n" + _PRINT + "PY\n",
++    "or-list": "python3 - <<'PY' || true\n" + _PRINT + "PY\n",
++    "assign-echo": "o=$(python3 - <<'PY'\n" + _PRINT + "PY\n)\necho \"$o\"\n",
++    "function-no-sink": "f() { python3 - <<'PY'\n" + _PRINT + "PY\n}; f\n",
++    "subst-argument": "hermes kanban comment t_x \"$(cat /tmp/f.md)\"\npython3 - <<'PY'\n"
++                      + _PRINT + "PY\n",
++}
++
++
++@pytest.mark.parametrize("shape", sorted(_NO_SINK_SHAPES))
++def test_consumer_output_not_fed_to_a_shell_stays_a_mention(tmp_path, shape):
++    command = _NO_SINK_SHAPES[shape].replace("{big}", str(_big(tmp_path)))
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
++
++
++@pytest.mark.parametrize("text", [
++    "x | bash", "x |& sh -s", "x | sudo bash", "x | ssh h", "x | env A=1 /bin/sh",
++    "x | timeout 5 bash -s", "eval \"$o\"", ". <(x)", "source /dev/stdin", "bash <(x)",
++    "sh -c \"$(x)\"", "bash <<< \"$o\"", "$(x)", "a; `x`", "if true; then $(x); fi",
++    "x | sudo -s", "x | zsh",
++])
++def test_output_reaches_shell(text):
++    assert output_reaches_shell(text)
++
++
++@pytest.mark.parametrize("text", [
++    "x | grep bash.sh", "x || bash y.sh", "X=$(x)", "cd \"$(dirname \"$0\")\"",
++    "ssh h \"python3 -c '$(printf x)'\"", ". ./venv/bin/activate", "diff <(x) y",
++    "x | sed 's/^/h /'", "bash -s \"$1\" <<'R'", "echo $((1 + 2))",
++])
++def test_output_does_not_reach_shell(text):
++    assert not output_reaches_shell(text)
++
++
++def test_shape_corpus_catches_a_guard_that_keeps_masking_sink_bodies(tmp_path, monkeypatch):
++    """Mutant check for the corpus dimension: with sink detection off (bodies masked and printed
++    literals left as mentions whatever reads the output), every sink nesting yields violations."""
++    from tools import shell_heredoc
++    from tests.cron import heredoc_shape_corpus as corpus
++
++    cases = [case for case in corpus.generate_full_corpus()
++             if case.s_position == "sink" and case.wrapper == "" and case.payload == "python-big"
++             and case.sink in ("| bash", 'eval "$(…)"')]
++    assert {case.nesting for case in cases} == set(corpus.SINK_NESTINGS)
++    assert not corpus.violations(corpus.evaluate(tmp_path / "good", cases), lambda case: True)
++    monkeypatch.setattr(shell_heredoc, "output_reaches_shell", lambda command: False)
++    bad = corpus.violations(corpus.evaluate(tmp_path / "mutant", cases), lambda case: True)
++    assert {case.nesting for case in bad} == set(corpus.SINK_NESTINGS)
+diff --git a/tools/shell_heredoc.py b/tools/shell_heredoc.py
+index f23fee287c..0abb431a1c 100644
+--- a/tools/shell_heredoc.py
++++ b/tools/shell_heredoc.py
+@@ -480,6 +480,28 @@ def _owner_runs_inert_consumer(
+ 
+ # Anything that could hand a function's OUTPUT to a shell (`f | bash`, `eval "$(f)"`, `. <(f)`).
+ _OUTPUT_EXECUTOR_RE = re.compile(r"\||\$\(|`|<\(|>\(|\beval\b|\bsource\b|(?:^|[\s;&(])\.\s")
++# Programs that run text they receive as shell code (a remote login shell for bare `ssh h`).
++_SINK_SHELLS = r"(?:(?:ba|da|z|k|mk|tc|c|fi|a)?sh|busybox|ssh|su|sudo\s+-[A-Za-z]*[si])"
++_WORD_START, _WORD_END = r"(?<![\w.-])", r"(?![\w.-])"
++# Shapes that hand some command's OUTPUT to a shell as code, so a data consumer's body (or a
++# string its interpreter prints) may be shell text after all: `… | [wrappers] bash`, `| ssh h`,
++# `eval`, `. <(…)`/`source /dev/stdin`, `bash <(…)`/`<<<`, `sh -c "$(…)"`, `$(…)` as a command.
++_SHELL_SINK_RE = re.compile(
++    rf"(?<!\|)\|&?(?!\|)[^|;&\n]*?{_WORD_START}(?:{_SINK_SHELLS}|eval){_WORD_END}"
++    rf"|{_WORD_START}eval{_WORD_END}"
++    r"|(?:^|[\s;&|({])(?:source|\.)\s+(?:<\s*\(|/dev/(?:stdin|fd/)|/proc/self/fd/)"
++    rf"|{_WORD_START}{_SINK_SHELLS}{_WORD_END}[^|;&\n]*?(?:<\(|<<<)"
++    rf"|{_WORD_START}(?:ba|da|z|k|mk|a)?sh\s+(?:[-+][A-Za-z]+\s+)*-[A-Za-z]*c\s*\"?(?:\$\(|`)"
++    r"|(?:^|[;&|({\n]|\b(?:then|do|else)\b)\s*\"?(?:\$\((?!\()|`)",
++    re.MULTILINE)
++
++
++def output_reaches_shell(command: str) -> bool:
++    """Whether some command's output in *command* may be run as shell code (see
++    ``_SHELL_SINK_RE``). Deliberately broad: a match only stops treating consumer heredoc bodies
++    and printed string literals as data (the lifecycle walk then scans them as commands); it never
++    refuses on its own."""
++    return _SHELL_SINK_RE.search(command) is not None
+ 
+ 
+ def _nonreading_shell_unit(unit: str, functions: set[str]) -> bool:
+@@ -643,6 +665,10 @@ def strip_inert_heredoc_bodies(command: str, *, nested: bool = False, _depth: in
+             stdin.intact = False
+         command_start = body_cursor
+     result = _apply_replacements(command, replacements)
++    if replacements and output_reaches_shell(result):
++        # Some output here may be run as shell code (`( python3 - <<'PY' … ) | bash`, `f | bash`,
++        # `eval "$(…)"`): a consumer's body may be the shell's program, so mask nothing.
++        return command
+     if function_masks and not nested and _OUTPUT_EXECUTOR_RE.search(_mask_simple_quotes(result)):
+         # A function's output may reach a shell here: its consumer bodies stay visible to text scans.
+         result = _apply_replacements(
+-- 
+2.51.0
+

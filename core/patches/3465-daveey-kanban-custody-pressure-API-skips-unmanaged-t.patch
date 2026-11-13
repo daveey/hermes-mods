@@ -1,0 +1,94 @@
+From 9b9a74df0eabcd0c1e54025287deea2772ee3566 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:06:57 +0000
+Subject: [PATCH] [daveey] kanban custody: pressure API skips unmanaged trees;
+ malformed receipt is no owner
+
+Follow-up nits from the exact-head review of PR #2131 (card t_01a1d4a576c8a659).
+
+1. terminal_owner() documented that only transport errors propagate, but a
+   malformed receipt raised ValueError/KeyError/TypeError from _runs_ended.
+   It now returns None for those, before any Board read, matching
+   _pressure_candidate. Board transport errors still propagate.
+2. _pressure_candidate() did not check ws._is_managed_scratch_path, so
+   pressure_candidates() could list a tree removal_guard (_safe) always
+   refuses, and the disk-pressure adapter (worker_disk_reclaim) would build a
+   full archive before finding out. It now skips such trees locally.
+
+Proof: RED on main (5 new tests fail: 4 malformed-receipt params raise,
+the unmanaged path is listed); GREEN with the fix. Custody + scratch gc
+archive suites: 187 passed.
+---
+ hermes_cli/kanban_scratch_custody.py          | 12 +++++++---
+ .../hermes_cli/test_kanban_scratch_custody.py | 23 +++++++++++++++++++
+ 2 files changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_scratch_custody.py b/hermes_cli/kanban_scratch_custody.py
+index 11109c0428..a2d65be52a 100644
+--- a/hermes_cli/kanban_scratch_custody.py
++++ b/hermes_cli/kanban_scratch_custody.py
+@@ -219,8 +219,10 @@ def _pressure_candidate(receipt):
+             return None
+         ended = max(r["ended_at"] for r in json.loads(receipt["evidence"])["runs"])
+         path = Path(receipt["workspace_path"])
++        # removal_guard (_safe) always refuses a tree outside managed scratch storage: never list one,
++        # or a pressure reclaimer builds a full archive before finding out.
+         if (type(ended) not in (int, float) or ended <= 0 or not path.is_absolute()
+-                or path.is_symlink() or not path.is_dir()):
++                or path.is_symlink() or not path.is_dir() or not ws._is_managed_scratch_path(path)):
+             return None
+     except (OSError, ValueError, KeyError, TypeError):
+         return None
+@@ -253,9 +255,13 @@ def pressure_candidate(conn, task_id):
+ def terminal_owner(hub, board, receipt):
+     """Fresh Board terminal evidence for an evicted owner, or None; gc_custody's own rule (runs ended, _terminal).
+ 
+-    Network: never call inside a DB transaction. Transport errors propagate (the caller keeps the tree).
++    Network: never call inside a DB transaction. A malformed receipt (unreadable evidence or runs) is None,
++    checked before any Board read; Board transport errors propagate (the caller keeps the tree either way).
+     """
+-    if not _runs_ended(receipt):
++    try:
++        if not _runs_ended(receipt):
++            return None
++    except (ValueError, KeyError, TypeError):
+         return None
+     return _terminal(hub, board, receipt["task_id"])
+ 
+diff --git a/tests/hermes_cli/test_kanban_scratch_custody.py b/tests/hermes_cli/test_kanban_scratch_custody.py
+index 47184dee7b..e1c37920d1 100644
+--- a/tests/hermes_cli/test_kanban_scratch_custody.py
++++ b/tests/hermes_cli/test_kanban_scratch_custody.py
+@@ -1058,6 +1058,29 @@ def test_pressure_terminal_owner_refuses_unverified_owner(env, control):
+     assert custody.terminal_owner(_hub(), "default", dict(_receipt(env, tid))) is None
+ 
+ 
++@pytest.mark.parametrize("evidence", ["not json", "{}", '{"runs": [{"id": 1}]}', '{"runs": 3}'])
++def test_pressure_terminal_owner_malformed_receipt_is_none_before_board(env, evidence):
++    tid, path, _ = evicted(env)
++    receipt = dict(_receipt(env, tid), evidence=evidence)
++    assert custody.terminal_owner(_hub(), "default", receipt) is None
++    assert env.calls == 0 and (path / "notes").read_text() == "keep me"
++
++
++def test_pressure_candidates_skip_tree_outside_managed_scratch(env):
++    kept, kept_path, _ = evicted(env)
++    tid, _path, _ = evicted(env)
++    outside = env.home / "source"
++    outside.mkdir()
++    (outside / "user").write_text("data")
++    with kb.write_txn(env.conn):
++        env.conn.execute("UPDATE kanban_scratch_custody SET workspace_path=? WHERE task_id=?", (str(outside), tid))
++    # removal_guard always refuses it, so it is never offered for archiving.
++    assert custody.removal_guard(env.conn, dict(_receipt(env, tid)))(outside) is False
++    assert [c["task_id"] for c in custody.pressure_candidates(env.conn)] == [kept]
++    assert custody.pressure_candidate(env.conn, tid) is None
++    assert (outside / "user").exists() and kept_path.exists()
++
++
+ def test_pressure_terminal_owner_requires_ended_runs_before_board(env):
+     tid, _path, _ = evicted(env, ended=None)
+     assert custody.terminal_owner(_hub(), "default", dict(_receipt(env, tid))) is None
+-- 
+2.51.0
+

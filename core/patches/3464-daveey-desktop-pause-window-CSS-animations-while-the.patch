@@ -1,0 +1,488 @@
+From b25a804f506eb6be29caf67a2d20b671bb884521 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:52:10 +0000
+Subject: [PATCH] [daveey] desktop: pause window CSS animations while the
+ system is idle
+
+An unwatched Desktop window kept WindowServer, the GPU helper and the
+renderer recompositing at the display refresh rate all night for one
+spinner.
+
+Measured on daveey-mini 2026-11-13 03:36-03:47 PST (card
+t_01a1d4b6c5c7d552): HID idle ~5000 s, display set to never sleep,
+Desktop window visible but unfocused. 60 s CPU-time deltas: WindowServer
+44.7%, Desktop GPU helper 9.6%, renderer 12.9%, main 3.8% of a core. The
+host's CPU governor was holding work for being >90% busy at the time.
+
+Five whys:
+1. Why is WindowServer at ~45% with nobody there? The Desktop window
+   commits a new frame every refresh, and WindowServer recomposites it.
+2. Why does the window commit frames? A 15 s V8 CPU profile of the
+   renderer was 96.1% (idle): JS is not the source. document.getAnimations()
+   listed one running animation: the 22 px `codicon-modifier-spin`
+   spinner of the status-bar core-update chip ("Building update...").
+3. Why is it running for so long? A core-update prebuild takes ~40 min
+   (build_seconds 2316) and repeats after failures, and busy-session
+   spinners do the same overnight; an infinite CSS animation asks for a
+   frame every refresh regardless of whether anyone is looking.
+4. Why does nothing stop it? Chromium only throttles hidden or occluded
+   windows; a visible window on a display that never sleeps is neither.
+5. Why no idle gate? Nothing in Desktop considered user presence for
+   rendering.
+
+Fix: electron/idle-motion-pause.ts polls powerMonitor.getSystemIdleTime()
+(every 30 s while active, every 1 s while paused). After 300 s with no
+keyboard/mouse input it insertCSS()es
+`*, *::before, *::after { animation-play-state: paused !important; }` into
+every window; any input removes it again within a second. Windows that load
+or reload while paused get it re-applied (did-finish-load). Paused
+animations need no frames, so the window stops repainting. Transitions and
+JS-driven updates (streamed text) are untouched; an unreadable idle time
+never pauses.
+
+main.ts stays under its FILE_LINES cap: the wiring is one line, and its
+private one-use `sleep()` helper is replaced by node:timers/promises'
+setTimeout (same behaviour: resolve after ms).
+
+Tests: electron/idle-motion-pause.test.ts (6 cases: active, pause/resume,
+no stacking, reload/new window re-apply, destroyed/failed insertCSS,
+unreadable idle time, timer cadence through attachIdleMotionPause).
+RED: module missing; GREEN: 6/6. tsc -p tsconfig.electron.json clean.
+---
+ .../electron/idle-motion-pause.test.ts        | 208 ++++++++++++++++++
+ apps/desktop/electron/idle-motion-pause.ts    | 168 ++++++++++++++
+ apps/desktop/electron/main.ts                 |   7 +-
+ 3 files changed, 379 insertions(+), 4 deletions(-)
+ create mode 100644 apps/desktop/electron/idle-motion-pause.test.ts
+ create mode 100644 apps/desktop/electron/idle-motion-pause.ts
+
+diff --git a/apps/desktop/electron/idle-motion-pause.test.ts b/apps/desktop/electron/idle-motion-pause.test.ts
+new file mode 100644
+index 0000000000..abc9fc252a
+--- /dev/null
++++ b/apps/desktop/electron/idle-motion-pause.test.ts
+@@ -0,0 +1,208 @@
++import { describe, expect, it } from 'vitest'
++
++import {
++  attachIdleMotionPause,
++  IDLE_MOTION_ACTIVE_POLL_MS,
++  IDLE_MOTION_PAUSE_AFTER_SECONDS,
++  IDLE_MOTION_PAUSE_CSS,
++  IDLE_MOTION_PAUSED_POLL_MS,
++  IdleMotionPause,
++  type IdleMotionTarget
++} from './idle-motion-pause'
++
++class FakeContents implements IdleMotionTarget {
++  destroyed = false
++  inserted = new Map<string, string>()
++  removed: string[] = []
++  #next = 0
++  listeners: Record<string, Array<() => void>> = {}
++
++  constructor(readonly id: number) {}
++
++  isDestroyed() {
++    return this.destroyed
++  }
++
++  insertCSS(css: string) {
++    const key = `k${this.id}-${++this.#next}`
++    this.inserted.set(key, css)
++
++    return Promise.resolve(key)
++  }
++
++  removeInsertedCSS(key: string) {
++    this.removed.push(key)
++    this.inserted.delete(key)
++
++    return Promise.resolve()
++  }
++
++  on(event: string, listener: () => void) {
++    ;(this.listeners[event] ??= []).push(listener)
++
++    return this
++  }
++
++  /** CSS currently applied to the live page. */
++  get live() {
++    return [...this.inserted.values()]
++  }
++}
++
++const flush = () => new Promise(resolve => setTimeout(resolve, 0))
++
++function harness(windows: FakeContents[]) {
++  let idle = 0
++  const logs: string[] = []
++
++  const pause = new IdleMotionPause({
++    idleSeconds: () => idle,
++    targets: () => windows,
++    log: line => logs.push(line)
++  })
++
++  return { pause, logs, setIdle: (s: number) => (idle = s) }
++}
++
++describe('IdleMotionPause', () => {
++  it('leaves animations alone while the user is active', async () => {
++    const win = new FakeContents(1)
++    const h = harness([win])
++
++    h.setIdle(IDLE_MOTION_PAUSE_AFTER_SECONDS - 1)
++
++    expect(h.pause.check()).toBe(IDLE_MOTION_ACTIVE_POLL_MS)
++    await flush()
++    expect(win.live).toEqual([])
++    expect(h.pause.paused).toBe(false)
++  })
++
++  it('pauses every window once the system is idle, and resumes on input', async () => {
++    const a = new FakeContents(1)
++    const b = new FakeContents(2)
++    const h = harness([a, b])
++
++    h.setIdle(IDLE_MOTION_PAUSE_AFTER_SECONDS)
++    expect(h.pause.check()).toBe(IDLE_MOTION_PAUSED_POLL_MS)
++    await flush()
++    expect(a.live).toEqual([IDLE_MOTION_PAUSE_CSS])
++    expect(b.live).toEqual([IDLE_MOTION_PAUSE_CSS])
++
++    // Staying idle does not stack a second copy.
++    h.setIdle(IDLE_MOTION_PAUSE_AFTER_SECONDS + 60)
++    h.pause.check()
++    await flush()
++    expect(a.live).toHaveLength(1)
++
++    h.setIdle(0)
++    expect(h.pause.check()).toBe(IDLE_MOTION_ACTIVE_POLL_MS)
++    await flush()
++    expect(a.live).toEqual([])
++    expect(b.live).toEqual([])
++    expect(h.logs).toEqual([
++      `[idle-motion] no input for ${IDLE_MOTION_PAUSE_AFTER_SECONDS}s: pausing window animations`,
++      '[idle-motion] input resumed: resuming window animations'
++    ])
++  })
++
++  it('re-applies to a window that reloads or opens while paused', async () => {
++    const a = new FakeContents(1)
++    const windows = [a]
++    const h = harness(windows)
++
++    h.setIdle(IDLE_MOTION_PAUSE_AFTER_SECONDS)
++    h.pause.check()
++    await flush()
++
++    // A reload drops the page's inserted stylesheets.
++    a.inserted.clear()
++    h.pause.noteLoaded(a)
++    await flush()
++    expect(a.live).toEqual([IDLE_MOTION_PAUSE_CSS])
++
++    const b = new FakeContents(2)
++    windows.push(b)
++    h.pause.check()
++    await flush()
++    expect(b.live).toEqual([IDLE_MOTION_PAUSE_CSS])
++  })
++
++  it('skips destroyed windows and survives insertCSS failures', async () => {
++    const gone = new FakeContents(1)
++    gone.destroyed = true
++    const broken = new FakeContents(2)
++    broken.insertCSS = () => Promise.reject(new Error('render frame disposed'))
++    const h = harness([gone, broken])
++
++    h.setIdle(IDLE_MOTION_PAUSE_AFTER_SECONDS)
++    h.pause.check()
++    await flush()
++    expect(gone.live).toEqual([])
++
++    h.setIdle(0)
++    h.pause.check()
++    await flush()
++    expect(broken.removed).toEqual([])
++  })
++
++  it('never pauses when the idle time cannot be read', () => {
++    const win = new FakeContents(1)
++
++    const pause = new IdleMotionPause({
++      idleSeconds: () => {
++        throw new Error('unsupported')
++      },
++      targets: () => [win]
++    })
++
++    expect(pause.check()).toBe(IDLE_MOTION_ACTIVE_POLL_MS)
++    expect(pause.paused).toBe(false)
++  })
++})
++
++describe('attachIdleMotionPause', () => {
++  it('polls slowly while active, every second while paused, and re-applies on did-finish-load', async () => {
++    const win = new FakeContents(7)
++    let idle = 0
++    const scheduled: Array<{ fn: () => void; ms: number }> = []
++    let createdListener: ((event: unknown, contents: FakeContents) => void) | undefined
++
++    const pause = attachIdleMotionPause({
++      app: {
++        on: (_event, listener) => {
++          createdListener = listener as typeof createdListener
++        }
++      },
++      powerMonitor: { getSystemIdleTime: () => idle },
++      BrowserWindow: { getAllWindows: () => [{ webContents: win }] },
++      timers: {
++        setTimeout: (fn, ms) => {
++          scheduled.push({ fn, ms })
++
++          return {}
++        }
++      }
++    })
++
++    createdListener?.({}, win)
++    expect(scheduled.map(s => s.ms)).toEqual([IDLE_MOTION_ACTIVE_POLL_MS])
++
++    idle = IDLE_MOTION_PAUSE_AFTER_SECONDS + 1
++    scheduled.shift()!.fn()
++    expect(scheduled.map(s => s.ms)).toEqual([IDLE_MOTION_PAUSED_POLL_MS])
++    await flush()
++    expect(win.live).toEqual([IDLE_MOTION_PAUSE_CSS])
++
++    win.inserted.clear()
++    win.listeners['did-finish-load']!.forEach(listener => listener())
++    await flush()
++    expect(win.live).toEqual([IDLE_MOTION_PAUSE_CSS])
++
++    idle = 2
++    scheduled.shift()!.fn()
++    expect(scheduled.map(s => s.ms)).toEqual([IDLE_MOTION_ACTIVE_POLL_MS])
++    await flush()
++    expect(win.live).toEqual([])
++    expect(pause.paused).toBe(false)
++  })
++})
+diff --git a/apps/desktop/electron/idle-motion-pause.ts b/apps/desktop/electron/idle-motion-pause.ts
+new file mode 100644
+index 0000000000..b5ca70b57a
+--- /dev/null
++++ b/apps/desktop/electron/idle-motion-pause.ts
+@@ -0,0 +1,168 @@
++// [daveey] Pause the windows' CSS animations while nobody is at the machine.
++//
++// 2026-11-13 03:36-03:47 PST on daveey-mini (David away ~85 min, HID idle 5000 s, display never sleeps): an idle,
++// unfocused Desktop window cost WindowServer 44.7% + GPU helper 9.6% + renderer 12.9% of a core, on a host whose
++// CPU governor was then holding work for being >90% busy. The renderer's JS was 96% idle in a 15 s V8 profile; the
++// only running animation in the window was one 22 px `codicon-modifier-spin` spinner (the core-update status-bar chip,
++// shown for the whole ~40 min "Building update…" phase). An infinite CSS animation asks Chromium for a new frame every
++// display refresh, so the renderer compositor, the GPU process and WindowServer all recomposite at 60 Hz for a spinner
++// no one is watching. Busy-session spinners do the same overnight.
++//
++// While the system has seen no keyboard/mouse input for `pauseAfterSeconds`, this injects one stylesheet into every
++// window that sets `animation-play-state: paused` on everything; a paused animation needs no frames, so the window
++// stops repainting. Any input (polled every second while paused) removes it again. Windows that load or reload while
++// paused get it re-applied. Transitions and JS-driven updates (streamed text) are untouched.
++
++export const IDLE_MOTION_PAUSE_AFTER_SECONDS = 300
++export const IDLE_MOTION_ACTIVE_POLL_MS = 30_000
++export const IDLE_MOTION_PAUSED_POLL_MS = 1_000
++
++export const IDLE_MOTION_PAUSE_CSS = '*, *::before, *::after { animation-play-state: paused !important; }'
++
++/** The slice of Electron's WebContents this needs. */
++export interface IdleMotionTarget {
++  readonly id: number
++  isDestroyed(): boolean
++  insertCSS(css: string): Promise<string>
++  removeInsertedCSS(key: string): Promise<void>
++}
++
++export interface IdleMotionPauseOptions {
++  /** Seconds since the last system-wide keyboard/mouse input (powerMonitor.getSystemIdleTime). */
++  idleSeconds: () => number
++  /** Every window's webContents right now. */
++  targets: () => IdleMotionTarget[]
++  pauseAfterSeconds?: number
++  log?: (line: string) => void
++}
++
++export class IdleMotionPause {
++  readonly #idleSeconds: () => number
++  readonly #targets: () => IdleMotionTarget[]
++  readonly #pauseAfterSeconds: number
++  readonly #log?: (line: string) => void
++  #paused = false
++  // webContents id -> its inserted-CSS key (a promise until insertCSS settles; null when it failed).
++  readonly #keys = new Map<number, { target: IdleMotionTarget; key: Promise<string | null> }>()
++
++  constructor(options: IdleMotionPauseOptions) {
++    this.#idleSeconds = options.idleSeconds
++    this.#targets = options.targets
++    this.#pauseAfterSeconds = options.pauseAfterSeconds ?? IDLE_MOTION_PAUSE_AFTER_SECONDS
++    this.#log = options.log
++  }
++
++  get paused(): boolean {
++    return this.#paused
++  }
++
++  /** Read the system idle time, pause or resume accordingly, and return the delay until the next check. */
++  check(): number {
++    let idle = 0
++
++    try {
++      idle = Number(this.#idleSeconds()) || 0
++    } catch {
++      idle = 0 // unknown idle time: never pause on a guess
++    }
++
++    if (idle >= this.#pauseAfterSeconds) {
++      if (!this.#paused) {
++        this.#paused = true
++        this.#log?.(`[idle-motion] no input for ${Math.round(idle)}s: pausing window animations`)
++      }
++
++      this.#applyMissing()
++
++      return IDLE_MOTION_PAUSED_POLL_MS
++    }
++
++    if (this.#paused) {
++      this.#paused = false
++      this.#log?.('[idle-motion] input resumed: resuming window animations')
++      this.#removeAll()
++    }
++
++    return IDLE_MOTION_ACTIVE_POLL_MS
++  }
++
++  /** A window (re)loaded: its old stylesheet is gone with the page, so re-apply while paused. */
++  noteLoaded(target: IdleMotionTarget): void {
++    this.#keys.delete(target.id)
++
++    if (this.#paused) {
++      this.#applyMissing()
++    }
++  }
++
++  #applyMissing(): void {
++    for (const target of this.#targets()) {
++      if (target.isDestroyed() || this.#keys.has(target.id)) {
++        continue
++      }
++
++      let key: Promise<string | null>
++
++      try {
++        key = Promise.resolve(target.insertCSS(IDLE_MOTION_PAUSE_CSS)).catch(() => null)
++      } catch {
++        key = Promise.resolve(null)
++      }
++
++      this.#keys.set(target.id, { target, key })
++    }
++  }
++
++  #removeAll(): void {
++    const entries = [...this.#keys.values()]
++    this.#keys.clear()
++
++    for (const { target, key } of entries) {
++      void key.then(value => {
++        if (value === null || target.isDestroyed()) {
++          return
++        }
++
++        return Promise.resolve(target.removeInsertedCSS(value)).catch(() => undefined)
++      })
++    }
++  }
++}
++
++export interface IdleMotionPauseHost {
++  app: { on(event: 'web-contents-created', listener: (event: unknown, contents: IdleMotionLoadable) => void): unknown }
++  powerMonitor: { getSystemIdleTime(): number }
++  BrowserWindow: { getAllWindows(): Array<{ webContents: IdleMotionTarget }> }
++  log?: (line: string) => void
++  timers?: { setTimeout(fn: () => void, ms: number): { unref?: () => unknown } }
++}
++
++export interface IdleMotionLoadable extends IdleMotionTarget {
++  on(event: 'did-finish-load', listener: () => void): unknown
++}
++
++/** Wire the pause to Electron: poll the system idle time and re-apply after window loads. */
++export function attachIdleMotionPause(host: IdleMotionPauseHost): IdleMotionPause {
++  const timers: NonNullable<IdleMotionPauseHost['timers']> = host.timers ?? {
++    setTimeout: (fn, ms) => setTimeout(fn, ms) as unknown as { unref?: () => unknown }
++  }
++
++  const pause = new IdleMotionPause({
++    idleSeconds: () => host.powerMonitor.getSystemIdleTime(),
++    targets: () => host.BrowserWindow.getAllWindows().map(win => win.webContents),
++    log: host.log
++  })
++
++  host.app.on('web-contents-created', (_event, contents) => {
++    contents.on('did-finish-load', () => pause.noteLoaded(contents))
++  })
++
++  const tick = () => {
++    const delay = pause.check()
++    timers.setTimeout(tick, delay).unref?.()
++  }
++
++  timers.setTimeout(tick, IDLE_MOTION_ACTIVE_POLL_MS).unref?.()
++
++  return pause
++}
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index e14396b691..5de0cf151b 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -13,6 +13,7 @@ import http from 'node:http'
+ import https from 'node:https'
+ import os from 'node:os'
+ import path from 'node:path'
++import { setTimeout as sleep } from 'node:timers/promises'
+ import tls from 'node:tls'
+ import { pathToFileURL } from 'node:url'
+ 
+@@ -324,6 +325,7 @@ import { snapHudBounds } from './hud-snap'
+ import { createHudSnapShortcut } from './hud-snap-shortcut'
+ import { buildHudWindowUrl } from './hud-url'
+ import { linuxOzoneBackend, resolveHudWindowing } from './hud-windowing'
++import { attachIdleMotionPause } from './idle-motion-pause'
+ import { INSTALL_STAMP, installShape } from './install-stamp'
+ import type { InstallStamp } from './install-stamp'
+ import { fetchJsonWith, fetchPublicJsonWith, type JsonFetchDeps } from './json-fetch'
+@@ -2427,10 +2429,6 @@ function ensureWslWindowsFonts() {
+   }
+ }
+ 
+-function sleep(ms) {
+-  return new Promise(resolve => setTimeout(resolve, ms))
+-}
+-
+ function clampBootProgress(value) {
+   const numeric = Number(value)
+ 
+@@ -17568,6 +17566,7 @@ app.whenReady().then(() => {
+   keepAwake.restore()
+   void minimizeToTray.start()
+   mainProcessLagWatchdog.start()
++  attachIdleMotionPause({ app, BrowserWindow, powerMonitor, log: rememberLog }) // [daveey] no 60 Hz spinners when away
+   f12Blocked = readPersistedDisableF12()
+ 
+   // [daveey] Sidebar boot snapshot (cold start): hub.db sessions + the last projects tree,
+-- 
+2.51.0
+

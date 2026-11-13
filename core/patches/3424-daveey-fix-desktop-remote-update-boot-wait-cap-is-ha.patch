@@ -1,0 +1,338 @@
+From 9e536fd04e06cebed77bff82625e0c7f8a85af8a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 03:21:36 -0800
+Subject: [PATCH] [daveey] fix(desktop): remote-update boot wait cap is hard;
+ refusal phrase is one shared constant
+
+Follow-up to the non-blocking nits of review 5889912621 on PR #2112.
+
+1. Hard 30 min cap. At the cap use-gateway-boot reset the RemoteUpdateWait before the
+   bounded-retry branch, so a bounded retry (stage 'dialing' or a retryable:true boot
+   snapshot) that met the same refusal opened a fresh 30 min wait, and the overlay could be
+   postponed indefinitely. The wait now resets only on a successful boot, a non-update
+   failure, or a connection switch. New test: past the cap with a retryable snapshot, the
+   bounded branch retries its 5 attempts and the overlay shows within cap + 5 s poll + 44 s
+   bounded budget (fails on 8af368b973: no overlay; passes here).
+2. Drop the test-only RemoteUpdateWait.waiting getter; the unit test asserts the spent-cap
+   behaviour through next() instead.
+3. electron/remote-update-refusal.ts exports REMOTE_UPDATE_PAUSED_PHRASE. The three
+   producers (remote-lifecycle, windows-remote-lifecycle, remote-update-pause) build their
+   refusal from it and the renderer matcher imports it, replacing the test that regex-read
+   electron/*.ts source.
+
+Tests: vitest remote-update-wait.test.ts + use-gateway-boot-remote-update.test.tsx (7 pass),
+electron remote-update-pause/remote-dial-backoff/remote-lifecycle* (176 pass); tsc (renderer,
+electron) clean for desktop files; eslint clean.
+---
+ apps/desktop/electron/remote-lifecycle.ts     | 16 ++++----
+ apps/desktop/electron/remote-update-pause.ts  |  7 +++-
+ .../desktop/electron/remote-update-refusal.ts |  4 ++
+ .../electron/windows-remote-lifecycle.ts      |  5 ++-
+ .../use-gateway-boot-remote-update.test.tsx   | 41 +++++++++++++++++++
+ .../src/app/gateway/hooks/use-gateway-boot.ts |  9 +++-
+ .../app/gateway/remote-update-wait.test.ts    | 30 ++++----------
+ .../src/app/gateway/remote-update-wait.ts     | 14 +++----
+ 8 files changed, 83 insertions(+), 43 deletions(-)
+ create mode 100644 apps/desktop/electron/remote-update-refusal.ts
+
+diff --git a/apps/desktop/electron/remote-lifecycle.ts b/apps/desktop/electron/remote-lifecycle.ts
+index c37e4c9ab6..0b88fa0f2e 100644
+--- a/apps/desktop/electron/remote-lifecycle.ts
++++ b/apps/desktop/electron/remote-lifecycle.ts
+@@ -33,6 +33,7 @@ import { parseRemoteProfileListing } from './connection-registry'
+ import { backendProfileArg } from './profile-id-guard'
+ import { fingerprintToken, logReuseMiss } from './remote-lifecycle-reuse-miss'
+ import { REMOTE_MARKER_GATE_PY } from './remote-update-marker-programs'
++import { REMOTE_UPDATE_PAUSED_PHRASE } from './remote-update-refusal'
+ import { assertBootstrapNotSuperseded, withRemoteTimeout } from './ssh-connection'
+ 
+ const LOCKFILE_SCHEMA_VERSION = 2
+@@ -317,12 +318,11 @@ async function probeRemoteHermesHome(ssh) {
+  *
+  * The probe uses only the host's system Python and the shared marker judge
+  * (remote-update-marker-programs.ts); it never imports the changing checkout.
+- * Absence or a confirmed-dead claim (owner and delegate) is clear, and a dead
+- * claim is unlinked under `<marker>.lock` unless the checkout lock is still
+- * held (HELD: a killed updater's child is still running). `hermesPath`, once
+- * located, adds its checkout to the probed ones. Every parse, read, lock, or
+- * transport uncertainty fails closed so a Desktop relaunch cannot start
+- * `serve` beside an updater that survived the old app process.
++ * Absence or a confirmed-dead claim (owner and delegate) is clear, and a dead claim is unlinked under
++ * `<marker>.lock` unless the checkout lock is still held (HELD: a killed updater's child is still running).
++ * `hermesPath`, once located, adds its checkout to the probed ones. Every parse, read, lock, or transport
++ * uncertainty fails closed so a Desktop relaunch cannot start `serve` beside an updater that survived the old
++ * app process.
+  *
+  * The program travels on stdin (`python3 -`), not in argv. `ssh.exec` rides the
+  * POSIX ControlMaster mux socket, where ssh writes the session request and only
+@@ -361,9 +361,9 @@ async function assertRemoteInstallUpdateClear(ssh, hermesHome, hermesPath = '')
+ 
+   const error: any = new Error(
+     live
+-      ? `Remote Hermes update process ${live[1]} is still running; SSH startup is paused.`
++      ? `Remote Hermes update process ${live[1]} is still running; ${REMOTE_UPDATE_PAUSED_PHRASE}.`
+       : observation === 'HELD'
+-        ? 'A process the remote Hermes update started still holds the install; SSH startup is paused.'
++        ? `A process the remote Hermes update started still holds the install; ${REMOTE_UPDATE_PAUSED_PHRASE}.`
+         : 'The remote Hermes update marker is unreadable, malformed, or locked; refusing SSH startup.'
+   )
+ 
+diff --git a/apps/desktop/electron/remote-update-pause.ts b/apps/desktop/electron/remote-update-pause.ts
+index 7d2c100eca..ed5c4af255 100644
+--- a/apps/desktop/electron/remote-update-pause.ts
++++ b/apps/desktop/electron/remote-update-pause.ts
+@@ -12,6 +12,8 @@
+ //
+ // Electron-free: main.ts wraps bootstrapSshConnection() (the one chokepoint every SSH dial goes through) in run().
+ 
++import { REMOTE_UPDATE_PAUSED_PHRASE } from './remote-update-refusal'
++
+ export const UPDATE_PAUSE_BACKOFF_MS = [2_000, 5_000, 10_000, 20_000, 30_000]
+ // Same steps as remote-prewarm's own backoff for a down host, so prewarm's schedule is unchanged by the gate.
+ export const UNREACHABLE_BACKOFF_MS = [2_000, 5_000, 15_000, 30_000, 60_000]
+@@ -189,7 +191,10 @@ export class RemoteUpdatePause {
+       return error
+     }
+ 
+-    const error: any = new Error(state.error?.message || 'Remote Hermes update in progress; SSH startup is paused.')
++    const error: any = new Error(
++      state.error?.message || `Remote Hermes update in progress; ${REMOTE_UPDATE_PAUSED_PHRASE}.`
++    )
++
+     error.kind = 'update-in-progress'
+     error.code = 'remote-update-paused'
+     error.retryAt = state.retryAt
+diff --git a/apps/desktop/electron/remote-update-refusal.ts b/apps/desktop/electron/remote-update-refusal.ts
+new file mode 100644
+index 0000000000..71d9cf8735
+--- /dev/null
++++ b/apps/desktop/electron/remote-update-refusal.ts
+@@ -0,0 +1,4 @@
++// [daveey] The phrase every "remote update pauses SSH startup" refusal carries. The renderer only sees the refusal
++// as text after IPC (src/app/gateway/remote-update-wait.ts matches it), so producers and the matcher share this
++// one constant instead of each spelling it. Dependency-free: the renderer bundle imports it.
++export const REMOTE_UPDATE_PAUSED_PHRASE = 'SSH startup is paused'
+diff --git a/apps/desktop/electron/windows-remote-lifecycle.ts b/apps/desktop/electron/windows-remote-lifecycle.ts
+index 3c984a46f5..df4b24deca 100644
+--- a/apps/desktop/electron/windows-remote-lifecycle.ts
++++ b/apps/desktop/electron/windows-remote-lifecycle.ts
+@@ -3,6 +3,7 @@ import zlib from 'node:zlib'
+ 
+ import { lockServesConnect, resolveReadyTimeoutMs } from './remote-lifecycle'
+ import { WINDOWS_CHECKOUT_LOCK_PS, WINDOWS_MARKER_JUDGE_PS } from './remote-update-marker-programs'
++import { REMOTE_UPDATE_PAUSED_PHRASE } from './remote-update-refusal'
+ import { assertBootstrapNotSuperseded, redactSecrets, SSH_ERROR } from './ssh-connection'
+ import { WINDOWS_NO_REPARSE_PS, windowsHelperArgv } from './windows-runtime-command'
+ 
+@@ -331,9 +332,9 @@ async function assertWindowsRemoteInstallUpdateClear(ssh, hermesHome, python = '
+ 
+   const error: any = new Error(
+     live
+-      ? `Remote Hermes update process ${live[1]} is still running; SSH startup is paused.`
++      ? `Remote Hermes update process ${live[1]} is still running; ${REMOTE_UPDATE_PAUSED_PHRASE}.`
+       : observation === 'HELD'
+-        ? 'A process the remote Hermes update started still holds the install; SSH startup is paused.'
++        ? `A process the remote Hermes update started still holds the install; ${REMOTE_UPDATE_PAUSED_PHRASE}.`
+         : 'The remote Hermes update marker is unreadable or malformed; refusing SSH startup.'
+   )
+ 
+diff --git a/apps/desktop/src/app/gateway/hooks/use-gateway-boot-remote-update.test.tsx b/apps/desktop/src/app/gateway/hooks/use-gateway-boot-remote-update.test.tsx
+index 6c3e0ec477..ff00e6d166 100644
+--- a/apps/desktop/src/app/gateway/hooks/use-gateway-boot-remote-update.test.tsx
++++ b/apps/desktop/src/app/gateway/hooks/use-gateway-boot-remote-update.test.tsx
+@@ -201,3 +201,44 @@ it('a remote update that pauses SSH startup past the wait cap still ends in the
+   expect($desktopBoot.get().error).toMatch(/SSH startup is paused/)
+   expect($desktopBoot.get().running).toBe(false)
+ })
++
++// PR #2112 review: the cap is hard. A bounded retry after the cap (main's snapshot says retryable, or the stage is
++// 'dialing') that meets the same refusal must not open a fresh 30 min wait: the overlay shows within the cap plus
++// the bounded retry budget (5 attempts, at most 2 + 4 + 8 + 15 + 15 s of backoff).
++it('a retryable boot snapshot past the wait cap spends only the bounded retry budget, then shows the overlay', async () => {
++  const desktop = fakeDesktop()
++  desktop.getConnection = vi.fn(async () => {
++    throw remoteUpdatePaused()
++  })
++  desktop.getBootProgress = vi.fn(async () => ({
++    error: null,
++    fakeMode: false,
++    message: '',
++    phase: 'init',
++    progress: 0,
++    retryable: true,
++    running: true,
++    timestamp: Date.now()
++  }))
++  ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
++
++  render(<Harness />)
++  await flushAsync()
++
++  await act(async () => {
++    await vi.advanceTimersByTimeAsync(REMOTE_UPDATE_WAIT_MAX_MS)
++  })
++  expect($desktopBoot.get().error).toBeNull()
++
++  const callsAtCap = desktop.getConnection.mock.calls.length
++
++  await act(async () => {
++    await vi.advanceTimersByTimeAsync(5_000 + 44_000 + 1_000)
++  })
++
++  // The bounded branch did retry after the cap (its 5 attempts), and then boot failed instead of waiting again.
++  expect(desktop.getConnection.mock.calls.length - callsAtCap).toBeGreaterThanOrEqual(5)
++  expect(desktop.getBootProgress).toHaveBeenCalled()
++  expect($desktopBoot.get().error).toMatch(/SSH startup is paused/)
++  expect($desktopBoot.get().running).toBe(false)
++})
+diff --git a/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts b/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts
+index 25435e0c9a..07ab8ec9f3 100644
+--- a/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts
++++ b/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts
+@@ -896,6 +896,7 @@ export function useGatewayBoot({
+         clearLivenessReprobeTimer()
+         livenessProbeFailures = 0
+         bootRetryAttempt = 0
++        remoteUpdateWait.reset()
+         resetReconnectBackoff()
+         reauthNotified = false
+         primaryReauthError = null
+@@ -1768,7 +1769,8 @@ export function useGatewayBoot({
+         if (!cancelled) {
+           const message = err instanceof Error ? err.message : String(err)
+           // [daveey] A remote's own update pauses SSH startup: poll past the bounded budget until it exits.
+-          const updateDelay = isRemoteUpdatePausedBootError(err) ? remoteUpdateWait.next() : null
++          const updatePaused = isRemoteUpdatePausedBootError(err)
++          const updateDelay = updatePaused ? remoteUpdateWait.next() : null
+ 
+           if (updateDelay !== null) {
+             bootFailed = false
+@@ -1782,7 +1784,10 @@ export function useGatewayBoot({
+             return
+           }
+ 
+-          remoteUpdateWait.reset()
++          // Past the cap the wait stays spent, so the bounded retries below cannot restart a 30 min wait.
++          if (!updatePaused) {
++            remoteUpdateWait.reset()
++          }
+ 
+           // Main's classification (#82679) still decides every failure it can
+           // see. The one it cannot see is the renderer-owned WebSocket dial:
+diff --git a/apps/desktop/src/app/gateway/remote-update-wait.test.ts b/apps/desktop/src/app/gateway/remote-update-wait.test.ts
+index 6df7ab3bf5..a48d0556b9 100644
+--- a/apps/desktop/src/app/gateway/remote-update-wait.test.ts
++++ b/apps/desktop/src/app/gateway/remote-update-wait.test.ts
+@@ -1,8 +1,7 @@
+-import { readFileSync } from 'node:fs'
+-import { join } from 'node:path'
+-
+ import { describe, expect, it } from 'vitest'
+ 
++import { REMOTE_UPDATE_PAUSED_PHRASE } from '../../../electron/remote-update-refusal'
++
+ import {
+   isRemoteUpdatePausedBootError,
+   REMOTE_UPDATE_POLL_MS,
+@@ -10,8 +9,6 @@ import {
+   RemoteUpdateWait
+ } from './remote-update-wait'
+ 
+-const electronSource = (name: string) => readFileSync(join(process.cwd(), 'electron', name), 'utf8')
+-
+ describe('isRemoteUpdatePausedBootError', () => {
+   it("recognises the refusal as it crosses IPC, and the gate's cached form", () => {
+     expect(
+@@ -31,35 +28,24 @@ describe('isRemoteUpdatePausedBootError', () => {
+     expect(isRemoteUpdatePausedBootError(undefined)).toBe(false)
+   })
+ 
+-  // The renderer only sees text, so every producer of the refusal must keep the shared phrase.
+-  it.each(['remote-lifecycle.ts', 'windows-remote-lifecycle.ts', 'remote-update-pause.ts'])(
+-    '%s still words its update refusal with the phrase the renderer matches',
+-    name => {
+-      const messages = electronSource(name).match(/['`][^'`]*SSH startup is paused[^'`]*['`]/g) ?? []
+-
+-      expect(messages.length).toBeGreaterThan(0)
+-
+-      for (const message of messages) {
+-        expect(isRemoteUpdatePausedBootError(message)).toBe(true)
+-      }
+-    }
+-  )
++  it('matches the shared phrase the electron producers word their refusal with', () => {
++    expect(isRemoteUpdatePausedBootError(new Error(`Remote update; ${REMOTE_UPDATE_PAUSED_PHRASE}.`))).toBe(true)
++  })
+ })
+ 
+ describe('RemoteUpdateWait', () => {
+-  it('polls until the cap, then gives up; reset starts a fresh wait', () => {
++  it('polls until the cap, stays spent after it, and only reset starts a fresh wait', () => {
+     let now = 1_000
+     const wait = new RemoteUpdateWait(() => now)
+ 
+-    expect(wait.waiting).toBe(false)
+     expect(wait.next()).toBe(REMOTE_UPDATE_POLL_MS)
+-    expect(wait.waiting).toBe(true)
+     now += REMOTE_UPDATE_WAIT_MAX_MS - 1
+     expect(wait.next()).toBe(REMOTE_UPDATE_POLL_MS)
+     now += 1
+     expect(wait.next()).toBeNull()
++    now += 60_000
++    expect(wait.next()).toBeNull()
+     wait.reset()
+-    expect(wait.waiting).toBe(false)
+     expect(wait.next()).toBe(REMOTE_UPDATE_POLL_MS)
+   })
+ })
+diff --git a/apps/desktop/src/app/gateway/remote-update-wait.ts b/apps/desktop/src/app/gateway/remote-update-wait.ts
+index bc8c56a36d..50163d277b 100644
+--- a/apps/desktop/src/app/gateway/remote-update-wait.ts
++++ b/apps/desktop/src/app/gateway/remote-update-wait.ts
+@@ -4,14 +4,14 @@
+ // That refusal crosses IPC as plain text, e.g.
+ //   "Error invoking remote method 'hermes:connection:for': Error: Remote Hermes update process 1779396 is still
+ //    running; SSH startup is paused."
+-// so the renderer recognises it by the phrase every producer shares.
++// so the renderer recognises it by the phrase every producer shares (electron/remote-update-refusal.ts).
+ //
+ // A remote update routinely outlasts the bounded boot retry (5 attempts, about a minute), and the
+ // hermes:connection:for path does not mark main's boot snapshot retryable at all, so boot used to land on the
+ // "Hermes couldn't start" overlay and stay there after the update finished until the user pressed Retry. The boot
+ // loop instead keeps polling on this schedule, outside the bounded budget, until the update ends or the wait cap.
+ 
+-const REMOTE_UPDATE_PAUSED_RE = /SSH startup is paused/i
++import { REMOTE_UPDATE_PAUSED_PHRASE } from '../../../electron/remote-update-refusal'
+ 
+ // Poll interval. Main's gate fails fast (no SSH dial) until its own backoff window opens (2 s → 30 s), so a short
+ // renderer poll costs one IPC round-trip, and recovery lands within one gate step of the update exiting.
+@@ -23,11 +23,13 @@ export const REMOTE_UPDATE_WAIT_MAX_MS = 30 * 60_000
+ export function isRemoteUpdatePausedBootError(error: unknown): boolean {
+   const message = error instanceof Error ? error.message : String(error ?? '')
+ 
+-  return REMOTE_UPDATE_PAUSED_RE.test(message)
++  return message.includes(REMOTE_UPDATE_PAUSED_PHRASE)
+ }
+ 
+ // Tracks one continuous remote-update wait for the boot loop. `next()` returns the delay before the next poll, or
+-// null once the wait has run past the cap (the caller then fails boot as usual).
++// null once the wait has run past the cap (the caller then fails boot as usual). The cap is hard: the wait stays
++// spent until `reset()`, which the caller makes only on a successful boot or a failure that is not this refusal,
++// so a bounded retry after the cap that meets the same refusal never starts a fresh 30 min wait.
+ export class RemoteUpdateWait {
+   #startedAt: null | number = null
+   readonly #now: () => number
+@@ -36,10 +38,6 @@ export class RemoteUpdateWait {
+     this.#now = now
+   }
+ 
+-  get waiting(): boolean {
+-    return this.#startedAt !== null
+-  }
+-
+   next(): null | number {
+     const now = this.#now()
+ 
+-- 
+2.51.0
+
