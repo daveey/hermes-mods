@@ -47,6 +47,19 @@ ALLOWED = [
     "echo 'gh run cancel 9'",
     "rg 'actions/runs/9/cancel' logs/",
     "python3 scripts/ci_latch_sweep.py o/r",
+    # A `|` inside quotes is a regex alternation, not a pipe (live false positive on the fix card's own grep).
+    "git show o:SKILL.md | grep -nE 'ci_run_cancel|merged_since|gh run cancel|--state merged' | head",
+    "git log --oneline --grep 'cancel|gh run cancel 9'",
+    "rg \"a|gh run cancel 9 -R o/r\" logs/",
+]
+
+REFUSED += [
+    # quote-aware splitting still sees real separators around quoted text
+    "echo 'a|b' | gh run cancel 9",
+    "grep -q 'x;y' f && gh run cancel 9 -R o/r",
+    "echo \"a|b\"; gh run cancel 9",
+    # an unbalanced quote falls back to plain splitting rather than hiding the cancel
+    "echo it's; gh run cancel 9",
 ]
 
 
@@ -75,6 +88,7 @@ def test_execute_code_cancels_are_refused():
         assert got and got["action"] == "block", code
     assert block("execute_code", {"code": 'print("gh run cancel 9")'}) is None
     assert block("execute_code", {"code": 'terminal("grep -n \'gh run cancel\' SKILL.md")'}) is None
+    assert block("execute_code", {"code": 'terminal("git show x | grep -nE \'a|gh run cancel\'")'}) is None
     assert block("execute_code", {"code": 'terminal("python3 scripts/ci_run_cancel.py --run-id 9 '
                                           '--gh-repo o/r --expect-attempt 1")'}) is None
 

@@ -111,9 +111,10 @@ def _remote_matches(url: str, remote: str) -> bool:
     return bool(url) and _slug(url) == _slug(remote)
 
 
-def _commands(cmd: str, cwd: str):
-    """Yield (cwd, words) per simple command, following `cd` and stripping env/sudo/token-broker wrappers."""
-    for seg in SEPARATORS.split(cmd or ""):
+def _commands(cmd: str, cwd: str, segments: Optional[list] = None):
+    """Yield (cwd, words) per simple command, following `cd` and stripping env/sudo/token-broker wrappers.
+    `segments` overrides the plain separator split (the cancel guard passes a quote-aware one)."""
+    for seg in (SEPARATORS.split(cmd or "") if segments is None else segments):
         try:
             words = shlex.split(seg, comments=True)
         except ValueError:
@@ -685,12 +686,45 @@ def _gh_cancel_at(words: list[str], i: int) -> Optional[str]:
     return None
 
 
+def _split_unquoted(cmd: str) -> Optional[list]:
+    """Split on && || ; | and newlines outside quotes, so a quoted `a|gh run cancel` grep pattern stays one word.
+    None when a quote never closes (the caller then falls back to plain splitting, which can only refuse more)."""
+    segs, cur, quote, i = [], [], None, 0
+    while i < len(cmd):
+        c = cmd[i]
+        if quote:
+            if c == "\\" and quote == '"' and i + 1 < len(cmd):
+                cur.append(cmd[i:i + 2])
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+        elif c == "\\" and i + 1 < len(cmd):
+            cur.append(cmd[i:i + 2])
+            i += 2
+            continue
+        elif c in "'\"":
+            quote = c
+        elif c in ";|\n" or cmd.startswith("&&", i):
+            segs.append("".join(cur))
+            cur = []
+            i += 2 if cmd.startswith(("&&", "||"), i) else 1
+            continue
+        cur.append(c)
+        i += 1
+    if quote:
+        return None
+    segs.append("".join(cur))
+    return segs
+
+
 def check_run_cancel(cmd: str, depth: int = 0) -> Optional[str]:
     """Refuse `gh run cancel`, `gh api ... /actions/runs/<id>/(force-)cancel` and curl to that endpoint."""
     cmd = cmd or ""
     if depth > 4 or CANCEL_OVERRIDE in cmd or "cancel" not in cmd:
         return None
-    for _, words in _commands(cmd, "/"):
+    segs = _split_unquoted(cmd)
+    for _, words in _commands(cmd, "/", segs):
         tool = os.path.basename(words[0])
         for i, w in enumerate(words):
             if os.path.basename(w) == "gh":
