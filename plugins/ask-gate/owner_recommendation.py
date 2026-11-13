@@ -11,11 +11,15 @@ The kanban-worker skill already said "apply your recommendation" (references/own
 the ask surface checked it, and the structured judge passes every "choice between options" as ok.
 
 Deterministic, no model call. A human_request is held when it is a pick (two or more choices, or "reply yes or no /
-A or B / pick / choose / decide" wording), its interaction is reply/approval, and its action, why_human and scope
-name none of the limits only David can change: real money (a $ amount, budget/cap, paid plan, cloud spend),
+A or B / pick / choose / decide" wording), its interaction is reply/approval, and its action, why_human, scope
+and visible choices[].label name none of the limits only David can change: real money (a $ amount, budget/cap, paid plan, cloud spend),
 an acceptance threshold or required gate, credentials or a write/admin permission (a read-only grant is not one),
 other people, safety/consent/hard-to-reverse effects, a step only a human can do, or a rule David stated (quoted).
-Evidence is not read: it cites tool output ("read-only installation token") that must not release the hold.
+Evidence and choice values are not read: tool output ("read-only installation token") and opaque IDs must not
+release the hold. The only negation recognized is a whole unquoted sentence "No credentials [are] involved."
+or "No other people [are] involved.", or the two nouns joined by and/or in either order. It affects only
+credential/other_people matches in that sentence, never a positive risk elsewhere. Unknown/qualified negations
+stay literal. Labels inherit main-prose read-only context but never a sibling label's read-only status.
 Holds are counted per (session, tool, blocked card), not per ask text, so rewording does not restart the bound: at
 most MAX_HOLDS holds, then the ask passes (logged owner_recommendation_released).
 """
@@ -101,14 +105,33 @@ HOLD_MESSAGE = (
     "access\", \"affects Rose\", \"David said: ask me before X\").")
 
 
+# Deliberately narrow negative declarations, not general natural-language negation.
+# Require a whole unquoted sentence in ONE field; qualified/contrast clauses stay literal.
+_NO_RISK = re.compile(
+    r"(?:^|(?<=[.!?]))\s+no\s+"  # start handled separately below via leading space
+    r"(?:credentials(?:\s+(?:or|and)\s+other\s+people)?"
+    r"|other\s+people(?:\s+(?:or|and)\s+credentials)?)"
+    r"\s+(?:are\s+)?involved\.(?=\s|$)", re.I)
+
+
 def limit_named(request: dict) -> str | None:
-    """The first David-only limit the request names in action/why_human/scope, else None."""
-    text = "\n".join(str(request.get(k) or "") for k in ("action", "why_human", "scope"))
+    """First named limit in ask prose/visible labels, excluding narrowly defined risk denials."""
+    fields = [str(request.get(k) or "") for k in ("action", "why_human", "scope")]
+    text = "\n".join(fields)
+    choices = request.get("choices")
+    labels = [c["label"] for c in choices
+              if isinstance(c, dict) and isinstance(c.get("label"), str)] if isinstance(choices, list) else []
+    risk_text = "\n".join(_NO_RISK.sub(" ", " " + part) for part in [*fields, *labels])
     for name, rx in _LIMITS:
-        if rx.search(text):
+        parts = [risk_text] if name in {"credential", "other_people"} else [text, *labels]
+        if any(rx.search(part) for part in parts):
             return name
-    if _PERMISSION.search(text) and (_ELEVATED.search(text) or not _READ_ONLY.search(text)):
-        return "permission"
+    # Main prose can supply read-only context for an anaphoric "Grant it" label.
+    # A sibling choice cannot: "Read-only access" must not hide "Grant Issues permission".
+    for part in [text, *labels]:
+        if _PERMISSION.search(part) and (_ELEVATED.search(part) or not (
+                _READ_ONLY.search(part) or _READ_ONLY.search(text))):
+            return "permission"
     return None
 
 
