@@ -4415,11 +4415,13 @@ def recovery_holder_card(db: str, home: Path, dbs: list) -> Optional[dict]:
 
 def _investigation_owner(lanes: dict, card: Optional[str], fp: str) -> Optional[str]:
     """The other lane whose investigation card (`card`, never its `fix_card`) is ``card``, else None. Adopting such
-    a card must wait for that lane's fix card: an investigation's completion is a proposal, nothing to verify."""
+    a card must wait for that lane's fix card: an investigation's completion is a proposal, nothing to verify.
+    A complaint alias (`complaint_owner`) never matches: it always holds card=None (set when it is aliased, and
+    filing its own card clears `complaint_owner`), so it needs no clause here."""
     if not card:
         return None
     for ofp, e in sorted(lanes.items()):
-        if ofp != fp and e.get("card") == card and e.get("fix_card") != card and not e.get("complaint_owner"):
+        if ofp != fp and e.get("card") == card and e.get("fix_card") != card:
             return ofp
     return None
 
