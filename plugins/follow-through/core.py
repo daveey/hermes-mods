@@ -169,6 +169,49 @@ def _completion_notices(tid: str) -> tuple[str, str]:
     return f"Kanban {tid} done", f"[kanban] Task {tid} completed"
 
 
+def _automation_descriptor(payload: dict) -> dict:
+    """The automation descriptor of an admission payload (gateway/kanban_wake_fold.py ``_descriptor``)."""
+    desc = payload.get("local_automation_v1") or (payload.get("native_text_v1") or {}).get("automation") or {}
+    return desc if isinstance(desc, dict) else {}
+
+
+def _queued_admission(state_db: Optional[Path], keys: Iterable[str], tid: str) -> Optional[int]:
+    """The seq of a still-queued admission for this chat that carries ``tid``'s completion: a Kanban wake (often a
+    batch that later wakes folded into, gateway/kanban_wake_fold.py) waiting behind the running turn. Such a notice
+    is in flight, not missed. A cancelled ``[folded into a later completion batch]`` row does not count by itself;
+    the queued batch it folded into does. Fails open: no table (an older state.db) or an unreadable one returns
+    None, i.e. no suppression."""
+    keys = [k for k in keys if k]
+    if not state_db or not state_db.is_file() or not keys:
+        return None
+    needles = _completion_notices(tid)
+    try:
+        with _ro(state_db) as conn:
+            rows = conn.execute(
+                "SELECT seq, payload_json FROM session_admissions WHERE status='queued' AND target_session_id IN (%s) "
+                "ORDER BY seq" % ",".join("?" * len(keys)), keys).fetchall()
+    except sqlite3.Error:
+        return None
+    for row in rows:
+        raw = row["payload_json"] or ""
+        if any(text in raw for text in needles):
+            return row["seq"]
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        desc = _automation_descriptor(payload)
+        if any(text in str(desc.get("display_text") or "") for text in needles):
+            return row["seq"]
+        cards = desc.get("kanban_cards")
+        for card in cards if isinstance(cards, list) else []:
+            if isinstance(card, dict) and card.get("task_id") == tid and "completed" in (card.get("kinds") or []):
+                return row["seq"]
+    return None
+
+
 def _tui_subs(conn: sqlite3.Connection, keys: Iterable[str]) -> list:
     """This chat's TUI notice subscriptions, with the in-flight claim columns (NULL on a board from before them)."""
     keys = tuple(keys)
@@ -261,12 +304,17 @@ def open_followups(home: Path, state_db: Optional[Path], session_id: str, now: O
                 # chat's current turn ends. It counts as missed only once that claim is stale.
                 missed = owed_notice and not _in_flight(sub, ev, now) and \
                     not any(_seen_in_chat(state_db, keys, text) for text in _completion_notices(tid))
+                # A notice delivered over the wake leg waits in the chat's FIFO as a queued admission (often a
+                # batch later wakes folded into) until the running turn ends: in flight too, not missed.
+                queued = _queued_admission(state_db, keys, tid) if missed else None
+                if queued is not None:
+                    missed = False
                 if resolved or followup or not (undelivered or missed or unresolved_successor):
                     continue
                 authority = [s.strip() for s in [task["body"] or "", *comments] if kept_obligation(s or "")]
                 found.append(dict(task_id=tid, title=task["title"], completed_at=ev["created_at"], event_id=ev["id"],
                                   summary=summary, undelivered=undelivered, missed_notice=missed,
-                                  unresolved_successor=unresolved_successor,
+                                  unresolved_successor=unresolved_successor, queued_admission=queued,
                                   authority=[_excerpt(a) for a in authority[-2:]], db=str(db)))
     found.sort(key=lambda r: -(r["completed_at"] or 0))
     return found
@@ -311,6 +359,8 @@ def render_followups(items: list[dict]) -> str:
             why.append("its named successor owner could not be found; verify the ownership handoff")
         if it["missed_notice"]:
             why.append("its completion notice never reached this chat")
+        elif it.get("queued_admission") is not None:
+            why.append(f"its completion notice is queued behind the running turn (admission {it['queued_admission']})")
         if it["undelivered"]:
             why.append("its handoff is explicitly NOT delivered yet")
         lines.append(f"- {it['task_id']} ({it['title'][:90]}) completed: " + "; ".join(why) + ".")

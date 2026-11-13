@@ -312,6 +312,108 @@ def test_notice_claim_stuck_past_the_stale_bound_is_missed(home):
     assert item["missed_notice"] and not item["undelivered"]
 
 
+# A completion delivered over the wake leg of a notify+wake subscription waits in the chat's FIFO as a queued
+# admission until the running turn ends; later wakes fold into that row (gateway/kanban_wake_fold.py) and the rows
+# they folded are cancelled. Shapes from the live MacBook rows of 2026-11-13 (chat 20261026_235722_bef6c6).
+_ADMISSIONS = """CREATE TABLE session_admissions (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT, admission_id TEXT NOT NULL UNIQUE, request_id TEXT NOT NULL,
+    principal_id TEXT NOT NULL, target_session_id TEXT NOT NULL, lineage_json TEXT NOT NULL,
+    payload_json TEXT NOT NULL, payload_digest TEXT NOT NULL, intent TEXT NOT NULL, status TEXT NOT NULL,
+    outcome TEXT, owner_epoch INTEGER, generation INTEGER)"""
+OTHER = "t_1111bbbb"
+
+
+def _batch_text(*tids):
+    head = (f"[IMPORTANT: {len(tids)} Kanban task updates arrived while this session was busy. Each card below shows "
+            "its state when this batch was built; an earlier premise that no longer holds is relabelled. Treat them "
+            "as one batch and give one consolidated response.]\n\n")
+    return head + "\n\n".join(_wake_leg(t) for t in tids)
+
+
+def _admit(home, status, *, display_text="", cards=(), text="", outcome=None, session=CHAT):
+    payload = {"text": text, "local_automation_v1": {"display_text": display_text, "kanban_cards": list(cards)}}
+    with sqlite3.connect(home / "state.db") as st:
+        st.execute(_ADMISSIONS.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS"))
+        n = st.execute("SELECT count(*) FROM session_admissions").fetchone()[0]
+        st.execute("INSERT INTO session_admissions(admission_id,request_id,principal_id,target_session_id,lineage_json,"
+                   "payload_json,payload_digest,intent,status,outcome) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                   (f"adm-{n}", json.dumps(["kanban-wake", n]), "automation:local", session, "{}",
+                    json.dumps(payload), "x", "queue", status, outcome))
+
+
+def _card(tid, kinds=("completed",)):
+    return {"task_id": tid, "board": "default", "kinds": list(kinds), "text": f"[kanban] Task {tid} {kinds[0]}."}
+
+
+def _plain_child(home):
+    return _child(home, summary="Shipped the naming fix; deployed.", body="Rename devices.", comments=())
+
+
+def test_completion_queued_in_a_folded_wake_batch_is_not_missed(home):
+    _plain_child(home)
+    for _ in range(2):
+        _admit(home, "terminal", text="[folded into a later completion batch]", outcome="cancelled")
+    _admit(home, "queued", display_text=_batch_text(OTHER, CHILD))
+    assert _followups(home) == []
+
+
+@pytest.mark.parametrize("how", ["notice_line", "kanban_cards"])
+def test_queued_admission_counts_by_notice_line_or_cards(home, how):
+    _plain_child(home)
+    if how == "notice_line":
+        _admit(home, "queued", display_text=f"✔ [default] @default Kanban {CHILD} done — Mac person invite")
+    else:
+        _admit(home, "queued", cards=[_card(OTHER), _card(CHILD)])
+    assert _followups(home) == []
+
+
+def test_only_cancelled_folded_rows_still_report_missed(home):
+    _plain_child(home)
+    for _ in range(2):
+        _admit(home, "terminal", text="[folded into a later completion batch]", outcome="cancelled",
+               display_text=_batch_text(CHILD), cards=[_card(CHILD)])
+    [item] = _followups(home)
+    assert item["missed_notice"] and "never reached this chat" in core.render_followups([item])
+
+
+@pytest.mark.parametrize("variant", ["other_card", "other_kind", "other_chat", "started"])
+def test_queued_admission_for_something_else_does_not_hide_a_missed_notice(home, variant):
+    _plain_child(home)
+    if variant == "other_card":
+        _admit(home, "queued", display_text=_batch_text(OTHER), cards=[_card(OTHER)])
+    elif variant == "other_kind":
+        _admit(home, "queued", cards=[_card(CHILD, kinds=("review_requested",))])
+    elif variant == "other_chat":
+        _admit(home, "queued", display_text=_batch_text(CHILD), cards=[_card(CHILD)], session="some_other_chat")
+    else:  # the row that started the running turn is no longer waiting
+        _admit(home, "started", display_text=_batch_text(CHILD), cards=[_card(CHILD)])
+    [item] = _followups(home)
+    assert item["missed_notice"]
+
+
+@pytest.mark.parametrize("broken", ["no_table", "unreadable_payload"])
+def test_admissions_unavailable_keep_todays_behaviour(home, broken):
+    _plain_child(home)
+    if broken == "unreadable_payload":
+        with sqlite3.connect(home / "state.db") as st:
+            st.execute(_ADMISSIONS)
+            st.execute("INSERT INTO session_admissions(admission_id,request_id,principal_id,target_session_id,"
+                       "lineage_json,payload_json,payload_digest,intent,status) VALUES "
+                       "('a','r','p',?,'{}','not json','x','queue','queued')", (CHAT,))
+    [item] = _followups(home)
+    assert item["missed_notice"]
+    assert core._queued_admission(home / "state.db", {CHAT}, CHILD) is None
+
+
+def test_queued_notice_of_an_undelivered_handoff_says_queued_not_never_reached(home):
+    _child(home)
+    _admit(home, "queued", display_text=_batch_text(CHILD), cards=[_card(CHILD)])
+    [item] = _followups(home)
+    assert item["undelivered"] and not item["missed_notice"] and item["queued_admission"] == 1
+    note = core.render_followups([item])
+    assert "queued behind the running turn (admission 1)" in note and "never reached" not in note
+
+
 def test_running_child_and_other_chats_subscriptions_are_ignored(home):
     _child(home, done=False)
     _child(home, tid="t_2222cccc", sub_chat="some_other_chat")
