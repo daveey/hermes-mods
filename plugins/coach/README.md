@@ -572,6 +572,18 @@ Its OK line takes the record's single `run`, the newest created/started/complete
 Tests: `tests/test_report_only_cross_gateway_owner.py`. Replay of the real turn (hub state.db msgs 969739–969847)
 through the second opinion: 0.9 → 0.1.
 
+Resumed turns (self-heal agent-521fd3b5d4): the coach keeps a turn's tool log in memory, and core continues a turn the
+backend cut (update pause, crash) with a user-role resume note in a process that never saw its calls, so "the review
+card" (no id) found no touched card and report_only scored `owner_source: none`. `turn_start` now rebuilds the cut
+turn's `turn_log`/`turn_rich` from `<HERMES_HOME>/state.db` when the message is the resume note
+(`agent_rules.is_resume_note`, pinned to `self_heal.is_resume_note`): the assistant tool calls and results since the
+last non-note user row, through observe()'s own `_log_call` formatting, no hints or signals, capped at 60 lines,
+fail-open; it logs `turn_log_rehydrated {session_id, lines, calls, cards}`. `report_only_scored` and
+`reply_nudge_outcome` carry `resumed_turn` / `rehydrated`, and a failing report_only outcome with `resumed_turn` and
+`rehydrated: 0` files one coach defect (`signals.resume_lost_outcome`, symptom "coach judged a resumed turn with no
+rebuilt tool log", event `nudge_outcome_resume_lost`) instead of an agent one. The report_only nudge asks for the
+owner's card id. Tests: `tests/test_resume_turn_log.py`.
+
 **Board list reads show the open cards (agent-5f2ca3a822).** After an "M3 done" notice the agent ran
 `kanban_list(board=…)`, saw M4 running with its review and deploy cards queued, and said so; the outcome judge held the
 rewrite at 0.88 ("kanban_list has no result"): list reads wrote no `<- OK` line. A successful list read

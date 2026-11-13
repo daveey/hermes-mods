@@ -1593,6 +1593,30 @@ def unjudged_signal(n: dict, r: dict, cls: str, at: float) -> dict:
             "comment_open_card": True}
 
 
+def resume_lost_outcome(o: dict) -> bool:
+    """agent-521fd3b5d4: a failing report_only reply_nudge_outcome judged on a turn core resumed after a backend cut
+    (update pause, crash) while the coach rebuilt none of the cut turn's tool calls (`resumed_turn` true, `rehydrated`
+    0). The judge saw an empty log, so an unnamed owner ("the review card") read as dropped work: the coach's defect,
+    not the agent's."""
+    return ((o.get("rule") or "") == "report_only" and o.get("resolved") is False and bool(o.get("resumed_turn"))
+            and not int(o.get("rehydrated") or 0))
+
+
+def resume_lost_signal(n: dict, r: dict, at: float) -> dict:
+    """One coach defect for every such outcome (repeats across sessions comment on the open card)."""
+    return {"kind": "coach", "component": "coach", "at": at, "session_id": n.get("session_id") or "",
+            "symptom": "coach judged a resumed turn with no rebuilt tool log (report_only, rehydrated=0)",
+            "details": (f"coach reply_check report_only nudge {n.get('nudge_id') or '?'} in session "
+                        f"{n.get('session_id') or '?'}: its reply_nudge_outcome failed (p={r.get('p')}) on a turn "
+                        f"core resumed after a backend cut, and AgentCoach._rehydrate_resumed_turn rebuilt 0 tool-log "
+                        f"lines from state.db, so the judge saw none of the calls made before the cut. Not filed under "
+                        f"the agent; check agent_rules.resumed_turn_calls against this session's state.db rows (and the "
+                        f"`turn_log_rehydrated` log lines). Outcome evidence: {str(r.get('evidence') or '')[:300]}; "
+                        f"nudged on: {str(n.get('evidence') or '')[:300]}")[:1500],
+            "fp": fp("coach", "outcome_resume_lost", "report_only"),
+            "comment_open_card": True}
+
+
 def unconfirmed_outcome(o: dict) -> bool:
     """A report_only reply_nudge_outcome whose failing verdict came from the screen alone (agent-e5b6dcf428): the
     second opinion was due but unavailable (`unconfirmed`), the record names a screen source, or it is an older
@@ -2153,6 +2177,12 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
                                   "p": r.get("p"), "judged": r.get("judged"), "class": cls,
                                   "evidence": str(r.get("evidence") or "")[:200], **_nid(n)})
                 out.append(unjudged_signal(n, r, cls, at))
+                _mark(opened, n, "o")
+            elif resume_lost_outcome(r):  # agent-521fd3b5d4: judged with no pre-cut calls: the coach's gap
+                _coach_log(home, {"ts": now, "event": "nudge_outcome_resume_lost", "session_id": n.get("session_id") or "",
+                                  "rule": rule, "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id"),
+                                  "p": r.get("p"), "evidence": str(r.get("evidence") or "")[:200], **_nid(n)})
+                out.append(resume_lost_signal(n, r, at))
                 _mark(opened, n, "o")
             elif r.get("resolved") is not True:  # only an explicit "resolved" clears it
                 still = "still handed off" if rule == "handoff" else f"still failed {rule}"

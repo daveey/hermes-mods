@@ -2522,6 +2522,82 @@ PR_READ_HELP_RE = re.compile(r"(?:^|\s)(?:--help|-h)(?:\s|\)|$)")
 TURN_LOG_ARG_CAP = 140
 PR_READ_LINES_MAX = 3
 
+# agent-521fd3b5d4: core resumes a turn the backend cut (planned update pause, crash) with a user-role note, so the
+# coach starts a new turn and, in a gateway that booted after the cut, has none of its calls in memory. turn_start then
+# rebuilds the cut turn's log from state.db (AgentCoach._rehydrate_resumed_turn). Same prefix and wrapper handling as
+# self_heal.RESUME_NOTE_PREFIX / is_resume_note (a test pins the match).
+RESUME_NOTE_PREFIX = "[System note: Your previous turn was interrupted mid-run"
+_RESUME_OOB_RE = re.compile(r"^\s*\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*(.*?)\s*\[/OUT-OF-BAND USER MESSAGE\]", re.S)
+REHYDRATE_MAX_LINES = 60   # same as the live turn_log deque
+REHYDRATE_MAX_ROWS = 400   # state.db rows read back (newest first) to find the cut turn's start
+
+
+def _note_text(message: Any) -> str:
+    if isinstance(message, list):
+        message = " ".join(str(p.get("text")) for p in message if isinstance(p, dict) and p.get("text"))
+    t = str(message or "")
+    m = _RESUME_OOB_RE.match(t)
+    return (m.group(1) if m else t).strip()
+
+
+def is_resume_note(message: Any) -> bool:
+    """Core's resume note (crash recovery or update pause): a machine-written turn continuing a cut one."""
+    return _note_text(message).startswith(RESUME_NOTE_PREFIX)
+
+
+def resumed_turn_calls(db_path: Path, sid: str) -> list[tuple[str, dict, Any]]:
+    """(tool, args, result) of the assistant tool calls since `sid`'s last real user message, oldest first, read-only
+    from state.db. Resume-note user rows are skipped (a turn resumed twice is one turn); any other user row ends the
+    span. [] when the db, table or session is missing."""
+    import sqlite3
+    p = Path(db_path)
+    if not p.exists():
+        return []
+    uri = p.resolve().as_uri()
+    try:
+        con = sqlite3.connect(uri + "?mode=ro", uri=True, timeout=1)
+        con.execute("select 1 from sqlite_master limit 1")
+    except sqlite3.OperationalError:
+        # mode=ro fails on a WAL db whose -wal/-shm were deleted: rw + query_only never writes
+        con = sqlite3.connect(uri + "?mode=rw", uri=True, timeout=1)
+        con.execute("PRAGMA query_only=ON")
+    try:
+        cols = {r[1] for r in con.execute("pragma table_info(messages)")}
+        active = " and active=1" if "active" in cols else ""
+        rows = con.execute(f"select role, content, tool_call_id, tool_calls from messages where session_id=?{active} "
+                           f"order by id desc limit {REHYDRATE_MAX_ROWS}", (sid,)).fetchall()
+    finally:
+        con.close()
+    span = []
+    for role, content, _tcid, _tcs in rows:
+        if role == "user":
+            if is_resume_note(content):
+                continue
+            break
+        span.append((role, content, _tcid, _tcs))
+    span.reverse()
+    results = {tcid: content for role, content, tcid, _ in span if role == "tool" and tcid}
+    out: list[tuple[str, dict, Any]] = []
+    for role, _content, _tcid, tcs in span:
+        if role != "assistant" or not tcs:
+            continue
+        try:
+            calls = json.loads(tcs)
+        except (TypeError, ValueError):
+            continue
+        for c in calls if isinstance(calls, list) else []:
+            fn = (c or {}).get("function") or {} if isinstance(c, dict) else {}
+            name = str(fn.get("name") or (c.get("name") if isinstance(c, dict) else "") or "")
+            if not name:
+                continue
+            raw = fn.get("arguments")
+            try:
+                args = json.loads(raw) if isinstance(raw, str) else (raw if isinstance(raw, dict) else {})
+            except ValueError:
+                args = {}
+            out.append((name, args if isinstance(args, dict) else {}, results.get(c.get("id"))))
+    return out
+
 
 def strip_injected_preamble(command: str) -> str:
     """The command as the agent wrote it: host middleware's injected prefix (kanban-worker-nice) removed."""
@@ -3699,6 +3775,7 @@ class AgentCoach:
         self.signals = signals  # SignalStore-like: subagents(sid, n), long_job(sid, reason), bug(sid, sig, sample)
         self.clock = clock
         self.sessions: dict[str, dict] = {}
+        self.state_db: Optional[Path] = None  # None = <HERMES_HOME>/state.db (resume rehydration, agent-521fd3b5d4)
         self.hint_lock = threading.RLock()  # shared across reloads; interim hooks run asynchronously
 
     def _hint_state(self, sid):
@@ -3843,11 +3920,67 @@ class AgentCoach:
         s.pop("turn_commits", None)
         s.pop("turn_linked", None)
         s["turn_t0"] = time.time()  # wall clock: the diff review asks git for commits made since the turn began
+        s.pop("resume", None)
+        if is_resume_note(user_message):
+            # core's resume note continues a turn the backend cut (update pause, crash): its calls ran in a turn
+            # this process may never have seen, so the judged log would be empty (agent-521fd3b5d4)
+            s["resume"] = {"resumed_turn": True, "rehydrated": self._rehydrate_resumed_turn(sid, s)}
         if isinstance(user_message, str) and user_message.strip():
             # the user's own request (preloaded-skill blocks dropped), capped: "Diagnosis only." can end a Kanban body
             # past char 2000 (self-heal agent-668442d68f). Prompt builders clip it (reply_check.request_excerpt).
             s["ask"] = request_text(user_message)[:ASK_CAP]
         return self.take(sid)
+
+    def _state_db_path(self) -> Path:
+        p = getattr(self, "state_db", None)  # an instance built by an older module (kept across reloads) lacks it
+        return Path(p) if p else (
+            Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes") / "state.db")
+
+    def _rehydrate_resumed_turn(self, sid: str, s: dict) -> int:
+        """Rebuild the cut turn's turn_log/turn_rich from state.db: the assistant tool calls and their tool results
+        since the session's last real user message (resume notes are skipped, so a turn resumed twice is read whole),
+        formatted by observe()'s own _log_call, capped at REHYDRATE_MAX_LINES, newest kept. Fires no hint or signal.
+        Logs `turn_log_rehydrated {session_id, lines, cards}`. Returns the line count; 0 on any failure (fail-open)."""
+        try:
+            calls = resumed_turn_calls(self._state_db_path(), sid)
+        except Exception:
+            calls = []
+        if not calls:
+            return 0
+        log = deque(maxlen=REHYDRATE_MAX_LINES)
+        rich = deque(maxlen=REHYDRATE_MAX_LINES)
+        tmp = {"turn_log": log, "turn_rich": rich}
+        if s.get("owner_read_files"):
+            tmp["owner_read_files"] = s["owner_read_files"]
+        for name, args, result in calls:
+            try:
+                if isinstance(args.get("command"), str) and INJECTED_PREAMBLE_RE.match(args["command"]):
+                    args = dict(args, command=strip_injected_preamble(args["command"]))
+                self._log_call(tmp, name, args, result, None)
+            except Exception:
+                continue
+        s["turn_log"].extend(log)
+        s["turn_rich"].extend(rich)
+        for k in ("turn_commits", "turn_linked"):
+            if tmp.get(k):
+                s[k] = tmp[k]
+        if tmp.get("owner_read_files"):
+            s["owner_read_files"] = tmp["owner_read_files"]
+        n = len(s["turn_log"])
+        if self.signals and n:
+            try:
+                cards = list(dict.fromkeys(_CARD_ID_RE.findall(" ".join(s["turn_log"]))))[:10]
+                self.signals.log({"event": "turn_log_rehydrated", "session_id": sid, "lines": n, "calls": len(calls),
+                                  "cards": cards})
+            except Exception:
+                pass
+        return n
+
+    def resume_info(self, sid: str) -> dict:
+        """{"resumed_turn": True, "rehydrated": <lines>} when this turn is core's resume note, else {} (telemetry for
+        report_only_scored and reply_nudge_outcome; signals.resume_lost_outcome files a coach defect on rehydrated 0)."""
+        r = self._s(sid).get("resume")
+        return dict(r) if isinstance(r, dict) else {}
 
     def queue_hint(self, sid: str, text: str) -> None:
         """A hint from a background judge: delivered with the next tool result or the next turn's context."""
@@ -4046,6 +4179,24 @@ class AgentCoach:
         s = self._s(sid)
         s["turn_tools"] += 1
         now = self.clock()
+        self._log_call(s, tool, args, result, status)
+
+        # repeat_failure
+        key = command_key(tool, args)
+        if failed(tool, result, status):
+            n = s["fails"].get(key, 0) + 1
+            s["fails"][key] = n
+            if n >= REPEAT_FAILS:
+                shown = key.split(":", 1)[1][:120] if tool == "terminal" else tool
+                self._fire(s, sid, "repeat_failure", key, n=n, cmd=shown)
+        else:
+            s["fails"].pop(key, None)
+        self._observe_rules(s, sid, tool, args, result, status, now, duration_ms, error_type, error_message)
+
+    def _log_call(self, s: dict, tool: str, args: dict, result: Any = None, status: Optional[str] = None) -> None:
+        """Append one call's lines to the session's turn logs (turn_log, turn_rich and the per-turn facts the reply
+        check reads). Shared by observe() and the resume rehydration (agent-521fd3b5d4), which replays a cut turn's
+        calls from state.db through exactly this formatting, without firing any hint or signal."""
         try:
             arg = next((str(args[k]) for k in ("command", "code", "path", "url", "query", "goal", "name")
                         if args.get(k)), json.dumps(args, default=str))
@@ -4102,17 +4253,10 @@ class AgentCoach:
         if is_kanban_call(tool, args):  # sticky across turns until the next Kanban call answers
             s["kanban_db_down"] = bool(failed(tool, result, status) and KANBAN_DB_DOWN.search(str(result)))
 
-        # repeat_failure
-        key = command_key(tool, args)
-        if failed(tool, result, status):
-            n = s["fails"].get(key, 0) + 1
-            s["fails"][key] = n
-            if n >= REPEAT_FAILS:
-                shown = key.split(":", 1)[1][:120] if tool == "terminal" else tool
-                self._fire(s, sid, "repeat_failure", key, n=n, cmd=shown)
-        else:
-            s["fails"].pop(key, None)
-
+    def _observe_rules(self, s: dict, sid: str, tool: str, args: dict, result: Any, status: Optional[str],
+                       now: float, duration_ms: int = 0, error_type: Optional[str] = None,
+                       error_message: Optional[str] = None) -> None:
+        """observe()'s hint rules and user-channel signals for one live call (never run on a replayed call)."""
         # poll_loop
         poll = is_poll(tool, args)
         s["recent"].append(poll)

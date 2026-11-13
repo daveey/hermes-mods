@@ -3316,7 +3316,8 @@ NUDGES = {
     "report_only": ("[coach] Your message ends on a problem you could fix ({evidence}) without fixing it, starting a "
                     "fix or proposing one. The user wants problems fixed, not reported, and standing approval covers "
                     "fixes. Fix it now if it's small or reversible. Otherwise start it (kanban_create with acceptance "
-                    "criteria, linked to this chat) and name the card. " + STALLED_OWNER + " If it really is the "
+                    "criteria, linked to this chat) and name the card by its id (t_…), so the re-check can verify "
+                    "it. " + STALLED_OWNER + " If it really is the "
                     "user's call, propose the exact fix. Don't end on the diagnosis."),
 }
 # The session's Kanban tools can't read the board (core's "corrupt" refusal or PR #125's unreliable-view error), so
@@ -3676,7 +3677,7 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
           capped_nudge: bool = True,
           report_only_fallback: str = REPORT_ONLY_FALLBACK,
           prev_turn: Optional[dict] = None, deny_quoted: bool = False, platform: str = "",
-          relay_repeat: bool = False, now: Optional[float] = None,
+          relay_repeat: bool = False, now: Optional[float] = None, resume: Optional[dict] = None,
           code_skew: Optional[Callable[[], Optional[tuple]]] = None) -> Optional[dict]:
     """Return {"rule", "p", "evidence", "nudge"} for the top rule over threshold, else None.
     `code_skew() -> (boot_rev, disk_rev) | None` (default backend_code_skew: core gateway.code_skew of this process)
@@ -3941,6 +3942,10 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
                    **stall_telemetry(reply, tool_log, now=now),
                    **({"forced": forced_by} if forced and confirm_attempted else {}),
                    **({"relay_repeat": True} if relay_repeat else {}),
+                   # agent-521fd3b5d4: a turn resumed after a backend cut, and how many tool-log lines the coach
+                   # rebuilt for it from state.db (0 = the judge saw no calls from before the cut)
+                   **({"resumed_turn": bool(resume.get("resumed_turn")),
+                       "rehydrated": int(resume.get("rehydrated") or 0)} if resume else {}),
                    **({"elapsed_s": budget_elapsed()} if budget_elapsed() is not None else {}),
                    **({"suppressed": "unconfirmed"} if suppressed else {})})
         except Exception:

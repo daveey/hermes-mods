@@ -1102,6 +1102,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                            # report_only second opinion on this reply (relay_repeat.py, agent-1406d53913)
                            relay_repeat=(coach.loop_state(session_id).get("relay_repeat_turn")
                                          == coach.turn_number(session_id)),
+                           resume=coach.resume_info(session_id),
                            **({"thresholds": thresholds} if thresholds else {}))
             if hit and hit["rule"] == "unverified" and repos:
                 msg = _diff_review(session_id, so, hit, ask, log_lines, changed_paths, final_response, repos)
@@ -1243,6 +1244,9 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                          **({"asks": res["asks"]} if "asks" in res else {}),
                          **({"src": res["src"]} if "src" in res else {}),
                          **({"unconfirmed": True} if res.get("unconfirmed") else {}),
+                         # agent-521fd3b5d4: signals.resume_lost_outcome files a failure judged on a resumed turn
+                         # with no rehydrated tool log as a coach defect, not the agent's
+                         **coach.resume_info(session_id),
                          **({} if attempt else {"via": "recheck"}))
             if n.get("lead") and rc.answer_dropped(n["lead"], final_response):
                 # agent-e868df5c84: the nudge took the draft's direct answer out of the reply the user sees
