@@ -6,6 +6,7 @@ Pure functions plus small read-only board queries, so tests can drive them with 
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 import shlex
@@ -230,7 +231,61 @@ def valid_followups(task_id: str, text: str, paths: list[Path],
         found = find_task(n, paths)
         if found and found[1].get("status") in statuses:
             ok.append(n)
+    rest = [n for n in named if n not in ok]
+    if rest:  # a follow-up placed on another gateway shows up only in this host's Board replica
+        ok += [n for n in rest if _replica_followup(task_id, n, paths, statuses)]
     return ok
+
+
+def replica_paths(paths: Iterable[Path]) -> list[Path]:
+    """Board replicas (``<kanban home>/kanban/sync-shadow/*.db``) next to the given live boards."""
+    dirs: list[Path] = []
+    for p in paths:
+        p = Path(p)
+        # <home>/kanban.db -> <home>/kanban/sync-shadow; <home>/kanban/boards/<slug>/kanban.db -> same dir
+        dirs += [p.parent / "kanban" / "sync-shadow", p.parent.parent.parent / "sync-shadow"]
+    out: list[Path] = []
+    for d in dict.fromkeys(dirs):
+        if d.is_dir():
+            out.extend(sorted(d.glob("*.db")))
+    return out
+
+
+def _replica_followup(task_id: str, n: str, paths: list[Path], statuses: tuple[str, ...]) -> bool:
+    """``n`` is in ``statuses`` on a Board replica and was created by / links to ``task_id`` there.
+
+    Indexed lookups only (replicas are hundreds of MB): ``n``'s own row, its links and its ``created`` event. A
+    pool worker's live board holds only the cards created or claimed there, so without this a follow-up the worker
+    placed on another gateway reads as missing and gate B refuses an honest handoff."""
+    for p in replica_paths(paths):
+        try:
+            conn = ro_connect(p)
+        except sqlite3.Error:
+            continue
+        try:
+            if not _has_table(conn, "tasks"):
+                continue
+            row = conn.execute("SELECT status FROM tasks WHERE id=?", (n,)).fetchone()
+            if not row or row[0] not in statuses:
+                continue
+            linked = _has_table(conn, "task_links") and conn.execute(
+                "SELECT 1 FROM task_links WHERE (parent_id=? AND child_id=?) OR (parent_id=? AND child_id=?)",
+                (task_id, n, n, task_id)).fetchone()
+            created = False
+            if not linked and _has_table(conn, "task_events"):
+                for (payload,) in conn.execute(
+                        "SELECT payload FROM task_events WHERE task_id=? AND kind='created'", (n,)):
+                    try:
+                        created = created or (json.loads(payload or "{}") or {}).get("creator_task_id") == task_id
+                    except (ValueError, AttributeError):
+                        pass
+            if linked or created:
+                return True
+        except sqlite3.Error:
+            continue
+        finally:
+            conn.close()
+    return False
 
 
 # --- gate messages ------------------------------------------------------------------------------------------------

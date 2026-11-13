@@ -165,6 +165,35 @@ def test_complete_refused_when_named_card_does_not_exist(board):
     assert plugin.classify("kanban_complete", {"summary": "Split to follow-up t_eeeeeeee."}, OWN, paths)
 
 
+def _replica(tmp_path, **kw):
+    shadow = tmp_path / "kanban" / "sync-shadow"
+    shadow.mkdir(parents=True)
+    return make_board(shadow, **kw)
+
+
+@pytest.mark.parametrize("rel", ["created", "linked", "linked_reverse"])
+def test_complete_allowed_with_followup_only_on_board_replica(tmp_path, rel):
+    """A pool worker's live kanban.db holds only cards created or claimed there; a follow-up the worker placed on
+    another gateway is visible only in kanban/sync-shadow (t_01a1d3e973ea8f0f)."""
+    live = make_board(tmp_path, tasks=[(OWN, "x", "running")])
+    fu = "t_01a1d3e973ea8fff"
+    _replica(tmp_path, tasks=[(OWN, "x", "running"), (fu, "imac run", "ready")],
+             created_by=[(fu, OWN)] if rel == "created" else (),
+             links=[(OWN, fu)] if rel == "linked" else [(fu, OWN)] if rel == "linked_reverse" else ())
+    summary = f"I could not run it on the iMac; follow-up card {fu} runs it."
+    assert plugin.classify("kanban_complete", {"summary": summary}, OWN, lambda: [live]) is None
+
+
+@pytest.mark.parametrize("status,related", [("archived", True), ("ready", False)])
+def test_complete_refused_when_replica_followup_archived_or_unrelated(tmp_path, status, related):
+    live = make_board(tmp_path, tasks=[(OWN, "x", "running")])
+    fu = "t_01a1d3e973ea8fff"
+    _replica(tmp_path, tasks=[(OWN, "x", "running"), (fu, "imac run", status)],
+             created_by=[(fu, OWN)] if related else [(fu, "t_0000000000000000")])
+    why = plugin.classify("kanban_complete", {"summary": f"I could not run it; see {fu}."}, OWN, lambda: [live])
+    assert why and fu in why
+
+
 def test_clean_complete_allowed(board):
     paths = board(tasks=[(OWN, "Mac pod restart", "running")])
     assert plugin.classify("kanban_complete", {"summary": "Shipped; verified live on both Macs."}, OWN, paths) is None
