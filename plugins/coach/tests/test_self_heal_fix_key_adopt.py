@@ -60,17 +60,19 @@ class Board:
         return [a for a in self.calls if "create" in a]
 
 
-def hub_db(path, tasks):
-    """A hermes-hub replica: tasks = [(gw, board, id, status, idempotency_key)], owner-qualified rows."""
+def hub_db(path, tasks, **override):
+    """A hermes-hub replica: tasks = [(gw, board, id, status, idempotency_key)], owner-qualified rows unless
+    ``override`` replaces fields of every row's data (e.g. gateway=, profile=)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path)
     db.execute("create table replica (gw text, coll text, key text, version integer, seq integer, data text, "
                "updated_at integer, primary key (gw, coll, key))")
     for gw, board, tid, status, key in tasks:
+        data = {"id": tid, "status": status, "board": board, "gateway": gw, "profile": "default",
+                "idempotency_key": key, "title": "self-heal fix: incident 0a89a428ad05"}
+        data.update(override)
         db.execute("insert into replica values(?,?,?,?,?,?,?)",
-                   (gw, "tasks", f"default/{board}/{tid}", 1, 1, json.dumps(
-                       {"id": tid, "status": status, "board": board, "gateway": gw, "profile": "default",
-                        "idempotency_key": key, "title": "self-heal fix: incident 0a89a428ad05"}), 1))
+                   (gw, "tasks", f"default/{board}/{tid}", 1, 1, json.dumps(data), 1))
     db.commit()
     db.close()
     return path
@@ -148,6 +150,42 @@ def test_archived_or_other_generation_cards_do_not_block_the_lane_fix(store, tmp
     assert out["action"] == "filed" and len([a for a in b.creates() if "--idempotency-key" in a
                                              and a[a.index("--idempotency-key") + 1] == KEY]) == 1
     assert not ev(store, "selfheal_fix_adopted_existing")
+
+
+def lane_files_fresh(store, b, out):
+    assert out["action"] == "filed" and not ev(store, "selfheal_fix_adopted_existing")
+    assert [a[a.index("--idempotency-key") + 1] for a in b.creates() if "--idempotency-key" in a].count(KEY) == 1
+
+
+@pytest.mark.parametrize("override", [{"gateway": "worker-9"}, {"profile": None}, {"profile": ""}],
+                         ids=["copy_of_another_gateways_card", "no_profile", "empty_profile"])
+def test_replica_rows_that_are_not_owner_qualified_are_not_adopted(store, tmp_path, monkeypatch, override):
+    """Only the owner's own replica row counts: a row whose task gateway differs from the replica gw is a copy held by
+    another gateway, and a row with no profile is not owner-qualified. Neither is the lane's fix card."""
+    hdb = hub_db(tmp_path / "hub" / "hub.db", [("worker-8", "default", REMOTE, "running", KEY)], **override)
+    monkeypatch.setattr(sh, "_lookup_sources", lambda runner=None: (tmp_path / "home", hdb))
+    b = Board()
+    lane_files_fresh(store, b, sh.file_fix(FP, store=store, runner=b, now=NOW, budget_fn=OPEN))
+    assert sh.LaneState(store.root).get(FP).get("fix_card") != REMOTE
+
+
+def test_archived_card_on_another_local_board_is_not_adopted(store, tmp_path, monkeypatch):
+    board_db(tmp_path / "home" / "kanban" / "boards" / "hermes" / "kanban.db", [("t_onhermes01", "archived", KEY)])
+    monkeypatch.setattr(sh, "_lookup_sources", lambda runner=None: (tmp_path / "home", None))
+    b = Board()
+    lane_files_fresh(store, b, sh.file_fix(FP, store=store, runner=b, now=NOW, budget_fn=OPEN))
+    assert sh.LaneState(store.root).get(FP).get("fix_card") != "t_onhermes01"
+
+
+def test_card_on_the_creates_own_board_is_left_to_the_create(store, tmp_path, monkeypatch):
+    """A keyed card on the lane's own board (`default` here) is the create's own idempotency hit: the adopt path stays
+    out of it and the create runs (the real `hermes kanban create` hands that card back)."""
+    (tmp_path / "home" / "kanban.db").unlink()
+    board_db(tmp_path / "home" / "kanban.db", [("t_ondefault1", "ready", KEY)])
+    monkeypatch.setattr(sh, "_lookup_sources", lambda runner=None: (tmp_path / "home", None))
+    assert [c["id"] for c in sh.keyed_cards(KEY)] == ["t_ondefault1"]  # visible: the own-board filter is the guard
+    b = Board()
+    lane_files_fresh(store, b, sh.file_fix(FP, store=store, runner=b, now=NOW, budget_fn=OPEN))
 
 
 def test_an_earlier_card_of_this_lane_is_not_adopted(store, tmp_path, monkeypatch):
