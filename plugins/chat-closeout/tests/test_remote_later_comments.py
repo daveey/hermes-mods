@@ -128,6 +128,58 @@ def test_no_summary_remote_card_keeps_the_latest_comment_fill(tmp_path, monkeypa
     assert 'latest comment [' in prompt and DECISION in prompt
 
 
+# ---- exact anchor and per-record skip (survivors A1, A6, B5, B6 of 94ee35ff; t_01a1d6ebfdc9fe63) -------------------
+def test_remote_anchor_ignores_run_end_when_the_run_has_no_summary(tmp_path, monkeypatch):
+    # The run ended at RUN_END but carries no summary, so the handoff is the completion: anchor = completed_at, and a
+    # comment between the run end and completed_at predates the handoff.
+    data = _record([{'author': 'default', 'body': OLD, 'at': RUN_END + 60}])
+    data['run'] = {'status': 'done', 'outcome': 'completed', 'started_at': RUN_END - 300, 'ended_at': RUN_END,
+                   'summary': '  '}
+    monkeypatch.setattr(plugin, 'hub_db_path', lambda: _replica(tmp_path / 'hub.db', data))
+    assert core.replica_later_comments(data) == []
+    assert _later(_fill_prompt()) == []
+
+
+def test_remote_comment_stamped_at_the_anchor_is_not_later():
+    # Parity with the local SQL read (`c.created_at > a.anchor`): a comment stamped exactly at the anchor is not later.
+    at_run_end = _record([{'author': 'a', 'body': OLD, 'at': RUN_END},
+                          {'author': 'hub:gw:macbook', 'body': DECISION, 'at': RUN_END + 1}])
+    assert [c['body'] for c in core.replica_later_comments(at_run_end)] == [DECISION]
+    at_completed = _record([{'author': 'a', 'body': OLD, 'at': COMPLETED},
+                            {'author': 'hub:gw:macbook', 'body': DECISION, 'at': COMPLETED + 1}], run=False)
+    assert [c['body'] for c in core.replica_later_comments(at_completed)] == [DECISION]
+
+
+def _rows(path, rows):
+    with sqlite3.connect(path) as db:
+        db.execute('CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, data TEXT)')
+        db.executemany("INSERT INTO replica VALUES ('hub', 'tasks', ?, ?)", rows)
+    return path
+
+
+def test_one_unreadable_replica_record_does_not_hide_the_others(tmp_path, monkeypatch):
+    # The bad card is read FIRST: a whole-batch failure would return before the good card was read.
+    bad_key = 'hub/default/default/t_0bad0bad'
+    good = json.dumps(_record([{'author': 'hub:gw:macbook', 'body': DECISION, 'at': COMPLETED + 10}]))
+    hub = _rows(tmp_path / 'hub.db', [('default/default/t_0bad0bad', '{not json'),
+                                       ('default/default/t_9a1c0ffe', good)])
+    monkeypatch.setattr(plugin, 'hub_db_path', lambda: hub)
+    cards = {bad_key: _remote(id='t_0bad0bad', key=bad_key, title='Bad record'), KEY: _remote()}
+    out = plugin._with_latest_comments({'batch': [bad_key, KEY]}, cards)
+    assert 'later_comments' not in out[bad_key]
+    prompt = core.closeout_prompt({'batch': [bad_key, KEY]}, out, now=1_794_500_000)
+    lines = _later(prompt)
+    assert len(lines) == 1 and DECISION in lines[0], prompt
+
+
+def test_replica_record_with_a_different_id_is_not_used(tmp_path, monkeypatch):
+    other = _record([{'author': 'hub:gw:macbook', 'body': DECISION, 'at': COMPLETED + 10}])
+    other['id'] = 't_0the40the4'
+    hub = _rows(tmp_path / 'hub.db', [('default/default/t_9a1c0ffe', json.dumps(other))])
+    monkeypatch.setattr(plugin, 'hub_db_path', lambda: hub)
+    assert _later(_fill_prompt()) == []
+
+
 # ---- the real prompts: pre_llm_call and the wake tick --------------------------------------------------------------
 def _ledger(tmp_path, monkeypatch):
     led = core.Ledger(tmp_path / 'ledger.db')
