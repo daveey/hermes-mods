@@ -1,0 +1,188 @@
+From 346c4cb64d235254a9163491a0d09ba3904e9425 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:19:39 +0000
+Subject: [PATCH] [daveey] kanban parent_missing self-clear: parents_unlinked
+ timeline source; repair note is a system comment
+
+Follow-up to PR #2192 review (GitHub review 5891026555, card t_01a1d4df1d71df8b).
+
+1. Parentless timeline. When every parent link is removed while the
+   detector's block holds, note_missing_parents returns early on empty
+   states, so no parent_found is ever written. The unblocked payload and
+   the repair-card note still said "cleared via parent_found". The unblock
+   now records source=parents_unlinked in that case (parent_found only
+   when parents exist and are all present again); `parents` keeps naming
+   the ids the block was about.
+2. Repair-comment provenance. add_comment stamps writer_run_id/uid from
+   HERMES_KANBAN_TASK/RUN_ID. When recompute_ready runs inside the repair
+   card's own worker, the note was recorded as that run's own comment and
+   the live comment bridge skipped it for exactly that worker. add_comment
+   gains `system=True` (no writer provenance); _tell_repair_card uses it.
+3. The repair note says which case cleared the block ("every parent came
+   back (parent_found)" vs "every parent link was removed ...
+   (parents_unlinked); no parent came back").
+
+RED on main (tests/hermes_cli/test_kanban_parent_missing_self_clear.py):
+- test_every_parent_unlinked_...: source 'parent_found' != 'parents_unlinked'
+- test_clearing_the_block_comments_on_the_open_repair_card: no "came back"
+- test_the_repair_note_is_not_the_repair_workers_own_comment: payload had
+  writer_run_id 1
+GREEN with this change.
+---
+ hermes_cli/kanban_db_comment_ids.py           | 12 ++++++--
+ hermes_cli/kanban_db_graph.py                 | 28 +++++++++++--------
+ .../test_kanban_parent_missing_self_clear.py  | 24 ++++++++++++++++
+ 3 files changed, 50 insertions(+), 14 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_comment_ids.py b/hermes_cli/kanban_db_comment_ids.py
+index e0ea5e79c0..f8ea791543 100644
+--- a/hermes_cli/kanban_db_comment_ids.py
++++ b/hermes_cli/kanban_db_comment_ids.py
+@@ -96,7 +96,8 @@ def agent_comment_ids(conn: sqlite3.Connection, task_id: str, comment_ids: list[
+ 
+ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str, *,
+                 origin_gateway: Optional[str] = None, writer_kind: Optional[str] = None,
+-                writer_session: Optional[str] = None, relayed_human: Optional[dict] = None) -> int:
++                writer_session: Optional[str] = None, relayed_human: Optional[dict] = None,
++                system: bool = False) -> int:
+     """Append a comment (moved from ``kanban_db``; re-exported there). ``origin_gateway``: the gateway it came from (the hermes-hub relay passes the
+     sender); default: the gateway the author spelling names, else this gateway (kanban_comment_origin). [daveey]
+ 
+@@ -106,7 +107,11 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str,
+ 
+     ``relayed_human`` (``{session, message_id, at}``, verified by ``kanban_relayed_human``) marks an agent
+     comment that carries the user's reply from a chat: the no-progress budget counts it as a human answer,
+-    while ``writer_kind`` stays ``agent`` so it gains no operator authority (kanban-d1b921f32e). [daveey]"""
++    while ``writer_kind`` stays ``agent`` so it gains no operator authority (kanban-d1b921f32e). [daveey]
++
++    ``system``: a kernel note written for the card's worker, not by it (the readiness pass telling a repair card its
++    child cleared). It carries no :func:`writer_provenance`, even when that pass runs inside the card's own worker,
++    so the live comment bridge still delivers it to that run. [daveey]"""
+     if relayed_human is not None and writer_kind != "agent":
+         raise ValueError("relayed_human marks an agent's relay of the user's message; it needs writer_kind='agent'")
+     if not body or not body.strip():
+@@ -134,7 +139,8 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str,
+         )
+         cid = int(cur.lastrowid or 0)
+         payload: dict = {"author": author, "len": len(body), "comment_id": cid}
+-        payload.update(writer_provenance(conn, task_id))  # writer_run_id + portable writer_run_uid
++        if not system:
++            payload.update(writer_provenance(conn, task_id))  # writer_run_id + portable writer_run_uid
+         if writer_kind:
+             payload["writer_kind"] = writer_kind
+             if writer_session:
+diff --git a/hermes_cli/kanban_db_graph.py b/hermes_cli/kanban_db_graph.py
+index d2faabc773..e56a158982 100644
+--- a/hermes_cli/kanban_db_graph.py
++++ b/hermes_cli/kanban_db_graph.py
+@@ -80,8 +80,9 @@ def clear_found_parents(conn: sqlite3.Connection, row, *, remote: bool) -> str:
+     Only the detector's own block is cleared: the child's newest lifecycle event must be the ``blocked`` with
+     ``source`` 'parent_missing', with no human request on the card. A later hand, policy or
+     breaker block, or a block from any other source, stays for its owner. A child left with no parent link at all
+-    also clears (nothing is missing). The repair card is left to finish, with a comment (while still open) saying
+-    the block cleared via parent_found.
++    also clears (nothing is missing): that unblock's ``source`` is ``parents_unlinked``, since no parent came back
++    and no ``parent_found`` follows. The repair card is left to finish, with a system comment (while still open)
++    saying which of the two cleared the block.
+     2026-11-13, laptop-1: t_01a1d0ea6db6c158 stayed blocked hours after its parent was mirrored done. [daveey]"""
+     from hermes_cli import kanban_db as kb
+ 
+@@ -95,7 +96,8 @@ def clear_found_parents(conn: sqlite3.Connection, row, *, remote: bool) -> str:
+     if last is None or _event_field(last["payload"], "source") != "parent_missing":  # only the detector's block
+         return status
+     # No parent left (every link removed while blocked) counts as resolved: nothing is missing any more.
+-    if any(st is None for _pid, st in kb.parent_states(conn, task_id, remote=remote)):
++    states = kb.parent_states(conn, task_id, remote=remote)
++    if any(st is None for _pid, st in states):
+         return status
+     cur = conn.execute(
+         "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'blocked' AND human_request IS NULL", (task_id,),
+@@ -103,27 +105,31 @@ def clear_found_parents(conn: sqlite3.Connection, row, *, remote: bool) -> str:
+     if cur.rowcount != 1:
+         return status
+     repair_id = _event_field(last["payload"], "repair_task_id")
++    # PR #2192 review: with no link left note_missing_parents writes no parent_found, so say what really happened.
++    source = "parent_found" if states else "parents_unlinked"
+     kb._append_event(conn, task_id, "unblocked", {
+-        "status": "todo", "source": "parent_found", "cleared_block": "parent_missing",
++        "status": "todo", "source": source, "cleared_block": "parent_missing",
+         "blocked_event_id": last["id"], "parents": _event_field(last["payload"], "parents"),
+         "repair_task_id": repair_id,
+     })
+-    _tell_repair_card(conn, repair_id, task_id, last["id"])
++    _tell_repair_card(conn, repair_id, task_id, last["id"], source)
+     return "todo"
+ 
+ 
+-def _tell_repair_card(conn: sqlite3.Connection, repair_id, task_id: str, blocked_event_id: int) -> None:
++def _tell_repair_card(conn: sqlite3.Connection, repair_id, task_id: str, blocked_event_id: int, source: str) -> None:
+     """In the caller's txn: note on the still-open repair card that its child's block cleared, so its worker does
+-    not investigate a parent that is back. A finished or absent repair card gets nothing. [daveey]"""
++    not investigate a parent that is back. A finished or absent repair card gets nothing. The note is a system
++    comment (no writer run), so the repair card's own worker receives it even when this pass ran inside it. [daveey]"""
+     from hermes_cli import kanban_db as kb
+ 
+     if not isinstance(repair_id, str) or kb._task_status(conn, repair_id) in (None, "done", "archived"):
+         return
++    why = ("every parent came back (parent_found)" if source == "parent_found"
++           else "every parent link was removed while it was blocked (parents_unlinked); no parent came back")
+     kb.add_comment(conn, repair_id, "kanban-dispatcher", (
+-        f"The parent_missing block on {task_id} cleared via parent_found (blocked_event_id {blocked_event_id}): "
+-        "every parent is present again (or no parent link remains), so the child is back in todo. "
+-        "Nothing is left to recover for that block; confirm and close this card."
+-    ))
++        f"The parent_missing block on {task_id} (blocked_event_id {blocked_event_id}) cleared: {why}, "
++        "so the child is back in todo. Nothing is left to recover for that block; confirm and close this card."
++    ), system=True)
+ 
+ 
+ def report_deferred_pass(conn: sqlite3.Connection, fresh: dict) -> None:
+diff --git a/tests/hermes_cli/test_kanban_parent_missing_self_clear.py b/tests/hermes_cli/test_kanban_parent_missing_self_clear.py
+index f8af8113bd..d8a687fc77 100644
+--- a/tests/hermes_cli/test_kanban_parent_missing_self_clear.py
++++ b/tests/hermes_cli/test_kanban_parent_missing_self_clear.py
+@@ -135,6 +135,11 @@ def test_every_parent_unlinked_returns_the_detector_blocked_child_to_ready(local
+     assert kb.get_task(local, child).status == "ready"  # before the fix: blocked with nothing to wait on
+     payload = json.loads(support._events(local, child, "unblocked")[-1]["payload"])
+     assert payload["cleared_block"] == "parent_missing" and payload["parents"] == ["t_late"]
++    # PR #2192 review: no parent came back, so the timeline must not claim parent_found (none is ever written).
++    assert payload["source"] == "parents_unlinked"
++    assert not support._events(local, child, "parent_found")
++    [body] = _repair_comments(local, payload["repair_task_id"])
++    assert child in body and "every parent link was removed" in body and "parent_found" not in body
+ 
+ 
+ def test_a_hand_block_with_no_parents_stays_blocked(local):
+@@ -163,10 +168,29 @@ def test_clearing_the_block_comments_on_the_open_repair_card(local):
+     assert kb.get_task(local, child).status == "ready"
+     [body] = _repair_comments(local, repair)  # before the fix: no comment, the repair card reads as live work
+     assert child in body and "parent_found" in body and str(blocked_id) in body
++    assert "came back" in body and "link was removed" not in body
+     kb.recompute_ready(local)
+     assert len(_repair_comments(local, repair)) == 1  # once per cleared block
+ 
+ 
++def test_the_repair_note_is_not_the_repair_workers_own_comment(local, monkeypatch):
++    """PR #2192 review: readiness can run inside the repair card's own worker. The note must not be stamped as that
++    run's comment, or the live comment bridge skips it for exactly the worker it is meant for."""
++    child = _blocked_on_missing(local, "t_late")
++    repair = _repair(local, child)
++    assert kb.claim_task(local, repair) is not None
++    run_id = kb.get_task(local, repair).current_run_id
++    monkeypatch.setenv("HERMES_KANBAN_TASK", repair)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    with kbc.write_txn(local):
++        local.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('t_late', 'late', 'done', 0)")
++    kb.recompute_ready(local)
++    assert kb.get_task(local, child).status == "ready"
++    [payload] = [json.loads(e["payload"]) for e in support._events(local, repair, "commented")]
++    assert "writer_run_id" not in payload and "writer_run_uid" not in payload
++    assert kb.own_comment_ids(local, repair, run_id) == set()  # before the fix: {the note's id}
++
++
+ def test_a_finished_repair_card_gets_no_comment(local):
+     child = _blocked_on_missing(local, "t_late")
+     repair = _repair(local, child)
+-- 
+2.43.0
+

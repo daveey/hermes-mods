@@ -1,0 +1,188 @@
+From c51659551c1ef14a09a03eebe0ba45acdf6d88a7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:28:10 +0000
+Subject: [PATCH] [daveey] kanban capability owner: generation-aware rejection
+ wake text; overlap docstring/comments (PR #2231 review nits)
+
+Follow-up to #2231 (review 5891577400, card t_01a1d50b5110a4b1).
+
+1. wait_check's rejection text (_rejected) always promised "Blocking again with the same needs routes one
+   fresh request (a new generation)", but _route_generations grants a fresh generation only to a
+   generation-1 request that was rejected or expired. A generation-2 refusal or any failed request is
+   refused capability_route_exhausted, so a woken card followed the text into a dead end. The text now reads
+   the generation from the request id (::g<N>) and the state: it promises generation 2 only where routing
+   grants it, and otherwise says the route is exhausted and what to do instead (continue/link the card that
+   owns the work, fix the named cause, or a needs_input human_request when only David can clear it). The
+   "was expired/failed by <gw>" wording is now "expired before <gw> answered it" / "failed on <gw>", and a
+   refusal ending in "." no longer prints "..".
+   Test: test_wake_text_promises_a_fresh_request_only_when_routing_grants_one checks gen-1 rejected,
+   gen-1 expired, gen-2 rejected and failed against what _route_generations actually does next
+   (RED on main: the gen-2/failed text promises a fresh request).
+2. kanban_overlap module docstring: singletons also honour the _bound_to exemption, not only the waiting card.
+3. Comments: _bound_to / bound_cards match awaiting.ref by bare id, ignoring awaiting.gateway (relies on
+   globally unique task ids); _PLACED_FROM trusts any body line in the forward-footer shape, acceptable for a
+   heuristic overlap exemption limited to the card's own capability-owner create.
+
+Proof: hermes-core-wt test over the 14 files importing kanban_capability_routing / kanban_overlap:
+620 passed, 0 failed. scripts/check --base origin/main: 19 checks ok.
+---
+ hermes_cli/kanban_capability_routing.py       | 37 +++++++++++++----
+ hermes_cli/kanban_overlap.py                  |  9 ++--
+ ...t_kanban_capability_owner_origin_mirror.py | 41 +++++++++++++++++--
+ 3 files changed, 73 insertions(+), 14 deletions(-)
+
+diff --git a/hermes_cli/kanban_capability_routing.py b/hermes_cli/kanban_capability_routing.py
+index 0f70e6dbc5..931fcc8bc3 100644
+--- a/hermes_cli/kanban_capability_routing.py
++++ b/hermes_cli/kanban_capability_routing.py
+@@ -24,8 +24,8 @@ Refusals are typed (:class:`CapabilityRouteError`), and nothing is written:
+ * ``capability_held_locally`` -- this gateway holds it: the wall is the worker's profile
+   (kind='assignment') or a real failure, not a missing capability.
+ * ``capability_route_exhausted`` -- this card already routed that need once; the existing owner
+-  card must finish or report why. A REJECTED owner request may be re-routed once more (a new
+-  generation of the request id).
++  card must finish or report why. A REJECTED or EXPIRED owner request may be re-routed once more
++  (generation 2 of the request id); a FAILED one, or a second-generation refusal, is exhausted.
+ 
+ Relay (gateways without a hermes-hub replica, and a holder that is briefly not live-checked):
+ 
+@@ -163,7 +163,9 @@ def overlap_exclusions(conn, task_id: str) -> list[str]:
+     return seen + [b for b in bound_cards(conn, task_id) if b not in seen]
+ 
+ 
+-# The footer kanban_placement_forward.remote_args writes on a card it places on another gateway.
++# The footer kanban_placement_forward.remote_args writes on a card it places on another gateway. Any body
++# line in this shape is trusted, author-written or not: acceptable because it only adds a heuristic
++# create_overlap exemption (distinct_from) to this card's own capability-owner create, never a permission.
+ _PLACED_FROM = re.compile(r"^This card was \S+ card (t_[0-9a-f]{8,32}); it completes there when this one is done\.$",
+                           re.MULTILINE)
+ 
+@@ -181,6 +183,8 @@ def bound_cards(conn, task_id: str) -> list[str]:
+     for tid in _PLACED_FROM.findall((row[0] if row else "") or ""):
+         if tid != task_id and tid not in out:
+             out.append(tid)
++    # Matched by bare awaiting.ref, ignoring awaiting.gateway: task ids are globally unique, so the ref names
++    # this card whichever gateway the park recorded.
+     rows = conn.execute(
+         "SELECT t.id FROM tasks t WHERE t.status = 'scheduled' AND t.id != ? AND (SELECT json_extract(e.payload, "
+         "'$.awaiting.ref') FROM task_events e WHERE e.kind IN ('scheduled', 'continued') AND e.task_id = t.id "
+@@ -964,11 +968,28 @@ def _rejected(rid: str) -> Optional[str]:
+     matches = ", ".join(f"{m.get('id')} on {m.get('gateway') or '?'} ({m.get('status') or '?'})"
+                         for m in (why.get("matches") or [])[:3])
+     gw = ((_sent(rid) or {}).get("body") or {}).get("to_gw") or "the holder"
+-    return (f"capability owner request {rid} was {why['state']} by {gw} ({why.get('code') or why['state']}"
+-            + (f": matches {matches}" if matches else "") + f"): {str(why.get('error') or '')[:400]}. "
+-            "No owner card exists, so this card was woken to re-plan. Blocking again with the same needs routes "
+-            "one fresh request (a new generation); if the refusal names a card that really owns this work, "
+-            "continue that card instead.")
++    state = why["state"]
++    outcome = {"rejected": f"was rejected by {gw}", "expired": f"expired before {gw} answered it"}.get(
++        state, f"failed on {gw}")
++    head = (f"capability owner request {rid} {outcome} ({why.get('code') or state}"
++            + (f": matches {matches}" if matches else "") + f"): {str(why.get('error') or '')[:400].rstrip('.')}. "
++            "No owner card exists, so this card was woken to re-plan. ")
++    gen = _rid_generation(rid)
++    if state in ("rejected", "expired") and gen < 2:
++        # Mirrors _route_generations: only a first-generation rejected/expired request earns a fresh one.
++        return head + (f"Blocking again with the same needs routes one fresh request (generation {gen + 1}); "
++                       "if the refusal names a card that really owns this work, continue that card instead.")
++    return head + ("This need's route is exhausted: blocking again with the same needs is refused as "
++                   "capability_route_exhausted" + (f" (generation {gen} was the retry)" if gen >= 2 else "")
++                   + ". If the refusal names a card that really owns this work, continue that card or link it "
++                   "as a parent; otherwise fix the cause the refusal names (comment it on this card), or, if "
++                   "only David can clear it, block kind='needs_input' with a human_request.")
++
++
++def _rid_generation(rid: str) -> int:
++    """The generation :func:`request_id` encoded in ``rid`` (its ``::g<N>`` suffix; 1 without one)."""
++    m = re.search(r"::g(\d+)$", rid or "")
++    return int(m.group(1)) if m else 1
+ 
+ 
+ def wait_check(target: str) -> tuple[int, str]:
+diff --git a/hermes_cli/kanban_overlap.py b/hermes_cli/kanban_overlap.py
+index e0a6d3b47c..fd94fd51b7 100644
+--- a/hermes_cli/kanban_overlap.py
++++ b/hermes_cli/kanban_overlap.py
+@@ -28,9 +28,10 @@ or the slug itself in the title still names it (``Metta-AI/unconventional-collab
+ equals a board slug does not count.
+ 
+ Closed cards never match (a replica's stale legacy ``<board>/<id>`` row never outvotes its qualified
+-``<profile>/<board>/<id>`` twin). Heuristic exemptions (singletons ignore these except the capability
+-waiting card): the creator's own card, the new card's parents, cards the same chat or the same
+-worker created (fan-out), the waiting card a capability-owner create quotes, a local card bound to that
++``<profile>/<board>/<id>`` twin). Heuristic exemptions (singletons ignore these, except the waiting card a
++capability-owner create quotes and a card bound to it, :func:`_bound_to`): the creator's own card, the new
++card's parents, cards the same chat or the same worker created (fan-out), the waiting card a capability-owner
++create quotes, a local card bound to that
+ waiting card (its deferred-placement origin, or a card parked on it: :func:`_bound_to`), and another capability-owner
+ card for that same waiting card, a card the new one parks/waits/depends on (:func:`waits_on`), a card whose failed
+ execution the new one recovers (:func:`recovers`: ``self-heal: kanban card t_X ... failed 2x``), and a card that
+@@ -676,6 +677,8 @@ def _bound_to(card: dict, waiting_id: str) -> bool:
+     action: counting it as an owner refused every owner create a placed card asked its origin gateway for
+     (hub t_01a1d49003c65ca4, macbook placeholder t_01a1d48f676074bc).
+     """
++    # ``awaits`` is the park's bare awaiting.ref; awaiting.gateway is ignored. This relies on task ids being
++    # globally unique: a card on another gateway with this id is the same card, not a namesake.
+     return waiting_id in (card.get("placed_as"), card.get("awaits"))
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_capability_owner_origin_mirror.py b/tests/hermes_cli/test_kanban_capability_owner_origin_mirror.py
+index 54335bdd9f..78a9836a06 100644
+--- a/tests/hermes_cli/test_kanban_capability_owner_origin_mirror.py
++++ b/tests/hermes_cli/test_kanban_capability_owner_origin_mirror.py
+@@ -152,9 +152,9 @@ REFUSAL = json.dumps({"ok": False, "created": False, "code": "create_overlap", "
+     "total_matches": 1, "note": "No card was created: 1 open card(s) already look like this work."})
+ 
+ 
+-def _rejected_request(env, rid: str) -> None:
+-    env["hub"].execute("INSERT INTO sent VALUES (?, ?, 'rejected', ?, 0, 0, 1)",
+-                       (rid, json.dumps({"to_gw": "macbook", "key": "default/default/new"}),
++def _rejected_request(env, rid: str, state: str = "rejected") -> None:
++    env["hub"].execute("INSERT INTO sent VALUES (?, ?, ?, ?, 0, 0, 1)",
++                       (rid, json.dumps({"to_gw": "macbook", "key": "default/default/new"}), state,
+                         json.dumps({"error": REFUSAL})))
+     env["hub"].commit()
+ 
+@@ -181,3 +181,38 @@ def test_one_rejected_request_wakes_even_while_another_is_pending(env):
+     _rejected_request(env, rejected)
+     rc, msg = kcr.wait_check(f"{pending},{rejected}")
+     assert rc == 0 and rejected in msg, msg
++
++
++def _next_route(task_id: str, rid: str, generation: int):
++    """What blocking again with the same need does after ``rid``: the next generation, or the typed refusal."""
++    with kbc.connect_closing() as conn:
++        with kb.write_txn(conn):
++            kb._append_event(conn, task_id, kcr.ROUTED_EVENT, {"routes": [
++                {"need": NEED, "gateway": "macbook", "request_id": rid, "generation": generation}]})
++        try:
++            return kcr._route_generations(conn, task_id, [NEED])[NEED]
++        except kcr.CapabilityRouteError as exc:
++            return exc.code
++
++
++def test_wake_text_promises_a_fresh_request_only_when_routing_grants_one(env):
++    """The wake text must match what _route_generations does next: a gen-1 rejected (or expired) request earns
++    generation 2; a gen-2 rejection or any failed request is capability_route_exhausted (PR #2231 review)."""
++    cases = [("rejected", 1, "was rejected by macbook", 2), ("expired", 1, "expired before macbook answered it", 2),
++             ("rejected", 2, "was rejected by macbook", "capability_route_exhausted"),
++             ("failed", 1, "failed on macbook", "capability_route_exhausted")]
++    for state, gen, outcome, nxt in cases:
++        with kbc.connect_closing() as conn:
++            card = kb.create_task(conn, title=f"{TITLE} {state} {gen}", body="spec", assignee="default")
++        rid = kcr.request_id(card, NEED, gen)
++        _rejected_request(env, rid, state)
++        rc, msg = kcr.wait_check(rid)
++        assert rc == 0 and f"{rid} {outcome} (create_overlap" in msg, msg
++        assert state == "rejected" or f"was {state} by" not in msg, msg
++        assert ".. " not in msg, msg
++        assert _next_route(card, rid, gen) == nxt, (state, gen)
++        if nxt == 2:
++            assert "routes one fresh request (generation 2)" in msg and "exhausted" not in msg, msg
++        else:
++            assert "fresh request" not in msg and "refused as capability_route_exhausted" in msg, msg
++            assert "continue that card or link it as a parent" in msg, msg
+-- 
+2.43.0
+

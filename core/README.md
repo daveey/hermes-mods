@@ -17,10 +17,10 @@ The last public/private series reconciliation (what was already equivalent, what
 [Hostname normalization](hostname-normalization.md) documents the subsequent privacy
 repair, regex policy rules, fingerprint re-pins and successful 1923-entry replay.
 The [2253 regex escape repair](hostname-escape-repair.md) is a **mandatory post-replay
-overlay** in the Applying recipe below, re-bound to snapshot 3529 by `repair_hostname_escapes_3529.py` (snapshot 3501: `repair_hostname_escapes_3501.py`; snapshot 3491: `repair_hostname_escapes_3491.py`; snapshot 3473: `repair_hostname_escapes_3473.py`; snapshot 3423: `repair_hostname_escapes_3423.py`; snapshot 2926: `repair_hostname_escapes_2926.py`; snapshot 2678: `repair_hostname_escapes_2678.py`; snapshot 2563: `repair_hostname_escapes_2563.py`; snapshot 2491: `repair_hostname_escapes_2491.py`; snapshot 2409: `repair_hostname_escapes_2409.py`). The immutable mails alone retain two invalid
+overlay** in the Applying recipe below, re-bound to snapshot 3555 by `repair_hostname_escapes_3555.py` (snapshot 3529: `repair_hostname_escapes_3529.py`; snapshot 3501: `repair_hostname_escapes_3501.py`; snapshot 3491: `repair_hostname_escapes_3491.py`; snapshot 3473: `repair_hostname_escapes_3473.py`; snapshot 3423: `repair_hostname_escapes_3423.py`; snapshot 2926: `repair_hostname_escapes_2926.py`; snapshot 2678: `repair_hostname_escapes_2678.py`; snapshot 2563: `repair_hostname_escapes_2563.py`; snapshot 2491: `repair_hostname_escapes_2491.py`; snapshot 2409: `repair_hostname_escapes_2409.py`). The immutable mails alone retain two invalid
 placement regexes; the original verifier proves historical fidelity, not regex validity.
 
-3529 patches, one entry per non-merge source commit through `43899644c6f537c4c0d33f3091604d75e3848094`.
+3555 patches, one entry per non-merge source commit through `da34cee8c4f4a701390698287c9d0ae5bdba63ae`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -29,11 +29,44 @@ follows 1281 although it sorts at position 1259 by date. Each patch is identifie
 position in the log. `core/verify_mirror.py` checks exactly this: contiguous ordinals, unique headers, header set equal
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
 Upstream exclusion tip: `d01ed2bfac3469fa582b9aaeec746f3e123bd78a`; current merge-base: `d01ed2bfac3469fa582b9aaeec746f3e123bd78a`.
-Replay starts at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. All forty-one published bridges remain unchanged; three source-derived integration bridges precede entries 2254, 2255 and 2256, and one more (upstream `d01ed2bfac` via fork merge `91c2b94744`) precedes entry 3185 (45 total). The bridge before 2087 excludes the six byte-identical path deltas carried by patch 2087. Entries 1626, 1649 and 1656 are applied and tree-verified at their source parents, then represented by ancestry-only merge markers in the main replay. Entries 2410–2491, 2492–2563, 2564–2678 and 2679–2726 and 2727–2926 and 3424–3473 and 3474–3491 and 3492–3501 and 3502–3529 contain no merges and need no new bridge. Current snapshot: [mirror-replay-3529.json](mirror-replay-3529.json), [mirror-policy-3529.json](mirror-policy-3529.json), and [executed proof](mirror-3529-verification.md). Previous snapshots: [mirror-3501-verification.md](mirror-3501-verification.md), [mirror-3491-verification.md](mirror-3491-verification.md), [mirror-3473-verification.md](mirror-3473-verification.md), [mirror-3423-verification.md](mirror-3423-verification.md), [mirror-2926-verification.md](mirror-2926-verification.md), [mirror-2678-verification.md](mirror-2678-verification.md), [mirror-2563-verification.md](mirror-2563-verification.md), [mirror-2491-verification.md](mirror-2491-verification.md), [mirror-2409-verification.md](mirror-2409-verification.md), [mirror-2253-verification.md](mirror-2253-verification.md). The following links retain historical verification:
+Replay starts at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. All forty-one published bridges remain unchanged; three source-derived integration bridges precede entries 2254, 2255 and 2256, and one more (upstream `d01ed2bfac` via fork merge `91c2b94744`) precedes entry 3185 (45 total). The bridge before 2087 excludes the six byte-identical path deltas carried by patch 2087. Entries 1626, 1649 and 1656 are applied and tree-verified at their source parents, then represented by ancestry-only merge markers in the main replay. Entries 2410–2491, 2492–2563, 2564–2678 and 2679–2726 and 2727–2926 and 3424–3473 and 3474–3491 and 3492–3501 and 3502–3529 and 3530–3555 contain no merges and need no new bridge. Current snapshot: [mirror-replay-3555.json](mirror-replay-3555.json), [mirror-policy-3555.json](mirror-policy-3555.json), and [executed proof](mirror-3555-verification.md). Previous snapshots: [mirror-3529-verification.md](mirror-3529-verification.md), [mirror-3501-verification.md](mirror-3501-verification.md), [mirror-3491-verification.md](mirror-3491-verification.md), [mirror-3473-verification.md](mirror-3473-verification.md), [mirror-3423-verification.md](mirror-3423-verification.md), [mirror-2926-verification.md](mirror-2926-verification.md), [mirror-2678-verification.md](mirror-2678-verification.md), [mirror-2563-verification.md](mirror-2563-verification.md), [mirror-2491-verification.md](mirror-2491-verification.md), [mirror-2409-verification.md](mirror-2409-verification.md), [mirror-2253-verification.md](mirror-2253-verification.md). The following links retain historical verification:
 Previous replay: [mirror-replay-2018.json](mirror-replay-2018.json) (twenty-four hash-pinned bridges and three source-checked ancestry-only entries) and [mirror-policy-2018.json](mirror-policy-2018.json). Executed checks: [mirror-2018-verification.md](mirror-2018-verification.md); previous snapshots: [mirror-2909-verification.md](mirror-2909-verification.md), [mirror-2726-verification.md](mirror-2726-verification.md), [mirror-2017-verification.md](mirror-2017-verification.md), [mirror-2016-verification.md](mirror-2016-verification.md), [mirror-2015-verification.md](mirror-2015-verification.md), [mirror-2010-verification.md](mirror-2010-verification.md), [mirror-2005-verification.md](mirror-2005-verification.md), [mirror-2004-verification.md](mirror-2004-verification.md), [mirror-1988-verification.md](mirror-1988-verification.md), [mirror-1979-verification.md](mirror-1979-verification.md), [mirror-1932-verification.md](mirror-1932-verification.md), [mirror-1923-verification.md](mirror-1923-verification.md), [mirror-1918-verification.md](mirror-1918-verification.md), [mirror-1821-verification.md](mirror-1821-verification.md), [mirror-1702-verification.md](mirror-1702-verification.md), [mirror-1625-verification.md](mirror-1625-verification.md).
 The preceding snapshot's executed checks are in [mirror-1427-verification.md](mirror-1427-verification.md), with its policy [mirror-policy-1427.json](mirror-policy-1427.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror 3530–3555
+
+Patches through `da34cee8c4`; verification in [mirror-3555-verification.md](mirror-3555-verification.md).
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Kanban CLI refuses lifecycle writes under another machine's live lease](mirror-3555-a-kanban-remote-lease-cli-refusal.md) | 3530 | Refuses every CLI lifecycle verb on a card under another machine's live Board lease before any write, sharing the tool-side message. |
+| [Lifecycle guard: output-sink quote pairing and echo/printf producers](mirror-3555-a-lifecycle-guard-output-sink.md) | 3531 | Fixes quote pairing, adds echo/printf producers and treats a piped grep for bash as a sink in the guard's output-sink walk. |
+| [Desktop completion obligations and lineage walk follow-ups](mirror-3555-a-tui-completion-and-lineage-nits.md) | 3532 | Adds an in-memory owed-obligation set so Desktop notice-turn start skips receipt reads, and updates docstrings. |
+| [Desktop remote-notice sweep stands aside while the gateway's turn holds a chat](mirror-3555-a-kanban-remote-sweep-stand-aside.md) | 3533 | Makes the Desktop remote-notice sweep stand aside while the gateway's unexpired turn lease holds the chat. |
+| [Kanban pickup-stall alarm for a held machine's default-placement cards](mirror-3555-a-kanban-pickup-stall-held.md) | 3534 | Files one alarm for a held machine's default-placement cards no other machine can copy, and lets the re-place scope accept them. |
+| [Desktop completion obligations and lineage walk follow-ups](mirror-3555-a-tui-completion-and-lineage-nits.md) | 3535 | Defaults the session lineage walk to the shared lineage limit and corrects lineage docstrings with no behavior change. |
+| [Kanban follow-ups: review-reopen pin, capability wake text, parent-missing clear](mirror-3555-a-kanban-lifecycle-followups.md) | 3536 | Adds tests pinning review_reopened as a reopen in the terminal guard. |
+| [Kanban follow-ups: review-reopen pin, capability wake text, parent-missing clear](mirror-3555-a-kanban-lifecycle-followups.md) | 3537 | Makes capability-owner rejection wake text generation-aware and fixes overlap docs and comments. |
+| [Kanban follow-ups: review-reopen pin, capability wake text, parent-missing clear](mirror-3555-a-kanban-lifecycle-followups.md) | 3538 | Records parents_unlinked as the self-clear source and posts the repair note as a system comment. |
+| [Kanban repair-unblock audit and CI-run progress refinements](mirror-3555-b-kanban-repair-audit-and-ci-progress.md) | 3539 | Writes the missing-parent requeue audit row when the home applies a forwarded repair unblock. |
+| [Update-pause cancelled-JSON handling and multiplex test diagnostics](mirror-3555-b-cancel-json-and-multiplex-test-diagnostics.md) | 3540 | Test-only: names the boot-time park when the multiplex downtime-ensure precondition fails. |
+| [Desktop Kanban current-board alias cached for 30 s](mirror-3555-b-desktop-board-alias-cache.md) | 3541 | Caches the current-board alias for 30 s so board reads stop triggering a boards read each. |
+| [Kanban host lease and remote notice index hardening](mirror-3555-b-kanban-host-lease-and-remote-index.md) | 3542 | Restarts remote index holder backoff on re-acquire or new stamp and pins the same-process lease hand-off. |
+| [Kanban repair-unblock audit and CI-run progress refinements](mirror-3555-b-kanban-repair-audit-and-ci-progress.md) | 3543 | Refines CI-run progress wording, idle/busy runner handling, busy cap, sweep race and stranded-release guard. |
+| [Kanban host lease and remote notice index hardening](mirror-3555-b-kanban-host-lease-and-remote-index.md) | 3544 | Beats the host lease after a raising pass, sizes wake slots by real lease ownership and reuses one fanout connection. |
+| [Update-pause cancelled-JSON handling and multiplex test diagnostics](mirror-3555-b-cancel-json-and-multiplex-test-diagnostics.md) | 3545 | Treats the executor's cancelled JSON as no own result for the update-pause stamp. |
+| [Session create/resume reply bounded on the banner inventory](mirror-3555-b-session-create-inventory-budget.md) | 3546 | Bounds the session create/resume reply to 2 s of inventory wait and publishes full info later. |
+| [Relay managed stream: no stranger-thread close of a provider stream](mirror-3555-c-relay-stream-close.md) | 3547 | Defers closing a provider stream to its reading thread (shutdown only from other threads) and makes managed-stream close wait for abandoned reads. |
+| [Update-pause wake re-queue and managed-worker teardown hardening](mirror-3555-c-update-pause-teardown-hardening.md) | 3548 | Gates unsupported-scope notifier wakes at turn start under the update hold and re-queues steering transfers together with the wake. |
+| [Update-pause wake re-queue and managed-worker teardown hardening](mirror-3555-c-update-pause-teardown-hardening.md) | 3549 | Suppresses teardown BrokenPipeError in the managed worker and routes owner teardown through close_quietly so a finished turn keeps its answer. |
+| [Scratch archive: .git marker judging through the scan directory fd](mirror-3555-c-scratch-archive-git-markers.md) | 3550 | Judges .git markers via the scan's own directory fd, adds an on_git_file callback, and documents the gzip level 1 size cost. |
+| [Scratch archive: .git marker judging through the scan directory fd](mirror-3555-c-scratch-archive-git-markers.md) | 3551 | Treats an unjudged .git marker as a gitlink so the workspace is kept instead of raising KeyError. |
+| [CI diff-read failures and lifecycle guard interpreter coverage](mirror-3555-c-ci-and-lifecycle-guards.md) | 3552 | Makes the supply-chain scans and base-snapshot extraction fail when git cannot read the PR diff or base tree. |
+| [CI diff-read failures and lifecycle guard interpreter coverage](mirror-3555-c-ci-and-lifecycle-guards.md) | 3553 | Extends the lifecycle guard to scan uv run, py/pypy runners and programs fed on stdin. |
+| [Kanban remote stand-aside lease matching and held-card wake recovery test](mirror-3555-c-kanban-remote-wake-followups.md) | 3554 | Matches the lease holder against both verified gateway pids in the remote stand-aside and tests the compacted-chat case. |
+| [Kanban remote stand-aside lease matching and held-card wake recovery test](mirror-3555-c-kanban-remote-wake-followups.md) | 3555 | Documents that the held-card skip in _wake covers every producer and pins probe recovery after the hold lifts. |
 
 ## Mirror 3502–3529
 
@@ -2316,16 +2349,16 @@ not something the public fixture CI can perform without the source repository.
 
 ## Applying
 
-For the current **3529-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply forty-five bridges and three ancestry-only markers from `mirror-replay-3529.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
+For the current **3555-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply forty-five bridges and three ancestry-only markers from `mirror-replay-3555.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
 
 ```bash
 set -e
 SOURCE=$(pwd)
 python3 -B "$MODS/core/verify_mirror.py" --source-repo "$SOURCE" \
-  --source-tip 43899644c6f537c4c0d33f3091604d75e3848094 \
+  --source-tip da34cee8c4f4a701390698287c9d0ae5bdba63ae \
   --base d01ed2bfac3469fa582b9aaeec746f3e123bd78a \
-  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-3529.json" \
-  --replay-plan "$MODS/core/mirror-replay-3529.json"
+  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-3555.json" \
+  --replay-plan "$MODS/core/mirror-replay-3555.json"
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1
 cd ../hermes-mods-test
 patches=("$MODS"/core/patches/*.patch)
@@ -2469,12 +2502,12 @@ git commit -m 'Explicit upstream integration bridge before 2256'
 git am -3 --empty=keep "${patches[@]:2255:929}"
 git apply --index --3way "$MODS/core/bridges/upstream-d01ed2bfac-via-91c2b94744.diff"
 git commit -m 'Explicit upstream integration bridge before 3185'
-git am -3 --empty=keep "${patches[@]:3184:345}"
+git am -3 --empty=keep "${patches[@]:3184:371}"
 # Mandatory additive repair: historical mails intentionally remain immutable.
-python3 -B "$MODS/core/repair_hostname_escapes_3529.py" --tree "$PWD"
+python3 -B "$MODS/core/repair_hostname_escapes_3555.py" --tree "$PWD"
 git add hermes_cli/kanban_placement.py
 git commit -m 'Repair historical hostname regex word boundaries'
-python3 -B "$MODS/core/repair_hostname_escapes_3529.py" --source-repo "$SOURCE" --applied "$(git rev-parse HEAD)"
+python3 -B "$MODS/core/repair_hostname_escapes_3555.py" --source-repo "$SOURCE" --applied "$(git rev-parse HEAD)"
 ```
 
 The source object store must contain historical patch-index blobs (see verification prerequisites above). Use Git 2.51 or newer for the replay: Git 2.43's three-way merge conflicts on patch 0032 (`apps/shared/src/gateway-contract.openrpc.json`), which later Git versions merge cleanly. Run the full verifier with its policy and replay plan to check final source equivalence; successful application alone is insufficient. Intermediate trees and standalone feature-patch application are not certified. Remove the throwaway worktree when finished.

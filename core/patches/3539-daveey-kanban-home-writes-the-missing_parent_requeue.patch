@@ -1,0 +1,131 @@
+From 274f6b0a545e4427c59a73bb9515097a3a00893a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:07:11 +0000
+Subject: [PATCH] [daveey] kanban: home writes the missing_parent_requeue audit
+ row on forwarded repair unblocks
+
+Follow-up to the two non-blocking nits in review 5891061855 on PR #2190.
+
+1. The `missing_parent_requeue` audit row ({by, repair_card, target}) was written only on the
+   same-gateway `kanban_unblock` path (`kanban_tools_self_heal._log_requeue`). When the child's home
+   applies a forwarded operator call from the repair card (via=missing-parent-repair), it recorded
+   repair_task_id/operator_caller on the `unblocked` event but wrote no audit row. `_apply` now
+   appends the same row after a successful missing-parent release, plus the operator_request_uid
+   that links it to the call. Ordinary operator unblocks (an own-agent block) write no row.
+2. Reword the `BLOCK_RELEASE_EVENTS` comment: the tuple is the fallback set for re-hold paths that
+   skip the `blocked` event, not every way a card leaves `blocked` (reclaimed, kanban_awaiting
+   blocked->todo, kanban_timed_park blocked->scheduled and block_policy escalation blocked->triage
+   are other exits, safe under the invariant).
+
+Tests: tests/hermes_cli/test_kanban_operator_call_missing_parent.py asserts the row on the home in
+both the direct operator-call test and the fleet end-to-end
+`test_worker_kanban_unblock_tool_forwards_to_the_home_end_to_end` (RED without the fix: those 2
+fail), no row for a refused caller, and no row for an ordinary own-agent-block operator unblock.
+All 11 test files importing kanban_operator_call/kanban_requeue: 505 passed. scripts/check ok.
+---
+ hermes_cli/kanban_operator_call.py            |  6 ++++
+ hermes_cli/kanban_requeue.py                  | 11 ++++---
+ ...est_kanban_operator_call_missing_parent.py | 29 +++++++++++++++++++
+ 3 files changed, 42 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_operator_call.py b/hermes_cli/kanban_operator_call.py
+index dc73635853..2cd3971bd6 100644
+--- a/hermes_cli/kanban_operator_call.py
++++ b/hermes_cli/kanban_operator_call.py
+@@ -678,6 +678,12 @@ def _apply(conn: sqlite3.Connection, payload: dict, own: str) -> tuple[str, Opti
+             return refusal
+         ok = kb.unblock_task(conn, target, comment=(author, f"Unblocked through an operator call: {reason}"),
+                              event_extra=extra, precondition=precondition)
++        if ok and extra.get("via") == MISSING_PARENT_VIA:
++            # The same audit row the same-gateway grant writes (``kanban_tools_self_heal._log_requeue``). [daveey]
++            with kb.write_txn(conn):
++                kb._append_event(conn, target, "missing_parent_requeue", {
++                    "by": extra["repair_task_id"], "repair_card": extra["repair_task_id"], "target": target,
++                    "operator_request_uid": uid})
+         return ("applied", None) if ok else ("refused", f"cannot unblock {target} (state changed)")
+     if action == "move":
+         if _marker(conn, target, km.MOVED_EVENT, uid) or _marker(conn, target, MOVE_MARK, uid):
+diff --git a/hermes_cli/kanban_requeue.py b/hermes_cli/kanban_requeue.py
+index 7a4a21f65f..3c8fc6481d 100644
+--- a/hermes_cli/kanban_requeue.py
++++ b/hermes_cli/kanban_requeue.py
+@@ -117,10 +117,13 @@ def missing_parent_repair_grant(conn, worker_task_id: Optional[str], target_id:
+ # INVARIANT (this grant and ``kanban_operator_call._agent_block`` rely on it): every write that puts a card into
+ # ``blocked`` appends a ``blocked`` event (``kanban_db.block_task``, the missing-parent detector,
+ # ``kanban_continuation._enforce_wake_invariant``, ``kanban_source_refusal_block``). While it holds, the newest
+-# ``blocked`` event of a blocked card describes its current hold. These events are the fallback for a write that
+-# breaks it: a ``blocked`` event older than any of them is over, so ``current_block_payload`` returns ``{}`` and
+-# every grant refuses. A new path that re-holds a card WITHOUT a ``blocked`` event must append one; if it cannot,
+-# the event kind the card left ``blocked`` with must be listed here, or the stale payload (its actor, its
++# ``blocked`` event of a blocked card describes its current hold. This tuple is NOT every way a card leaves
++# ``blocked`` (``reclaimed``, ``kanban_awaiting`` blocked->todo, ``kanban_timed_park`` blocked->scheduled and the
++# ``block_policy`` escalation blocked->triage are other exits, safe while the invariant holds, since any later hold
++# appends a fresh ``blocked`` event). It is the fallback set for a re-hold path that skips the ``blocked`` event: a
++# ``blocked`` event older than any of these is over, so ``current_block_payload`` returns ``{}`` and every grant
++# refuses. A new path that re-holds a card WITHOUT a ``blocked`` event must append one; if it cannot, the event kind
++# the card left ``blocked`` with before that re-hold must be listed here, or the stale payload (its actor, its
+ # ``repair_task_id``) grants a release of the new hold. Listed kinds: ``unblocked`` (every unblock path),
+ # ``promoted`` (the readiness pass leaves ``blocked`` with no ``unblocked``; ``recovery_held`` keeps it off a card
+ # whose newest ``blocked`` event is unreleased today, so this arm only keeps the helper true to its contract),
+diff --git a/tests/hermes_cli/test_kanban_operator_call_missing_parent.py b/tests/hermes_cli/test_kanban_operator_call_missing_parent.py
+index cb49415d36..9157616fb5 100644
+--- a/tests/hermes_cli/test_kanban_operator_call_missing_parent.py
++++ b/tests/hermes_cli/test_kanban_operator_call_missing_parent.py
+@@ -56,6 +56,11 @@ def _execute_row(f, target):
+     return next(r for r in _log(f.h, "execute") if r["target_task_id"] == target)
+ 
+ 
++def _requeue_audit(f, target):
++    return [json.loads(p or "null") for (p,) in f.h.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'missing_parent_requeue' ORDER BY id", (target,))]
++
++
+ def _unblocked(f, target):
+     return [json.loads(p or "null") for (p,) in f.h.execute(
+         "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'unblocked' ORDER BY id", (target,))]
+@@ -73,6 +78,9 @@ def test_repair_card_unblocks_its_child_through_an_operator_call(fleet):
+     assert payload["operator_caller"]["task_id"] == repair
+     assert payload["operator_caller"]["gateway"] == "worker-5"
+     assert payload["repair_task_id"] == repair
++    # Review 5891061855 nit 1: the home writes the same audit row as the same-gateway grant.
++    assert _requeue_audit(f, child) == [{"by": repair, "repair_card": repair, "target": child,
++                                         "operator_request_uid": payload["operator_request_uid"]}]
+     assert ksr.get_request(f.w, out["request_id"])["status"] == "done"
+ 
+ 
+@@ -85,6 +93,24 @@ def test_another_caller_still_cannot_release_the_parent_missing_block(fleet):
+     assert row["outcome"] == "refused" and "not blocked by its own agent run" in row["detail"]
+     assert kb.get_task(f.h, child).status == "blocked"
+     assert not _unblocked(f, child)
++    assert not _requeue_audit(f, child)
++
++
++def test_own_agent_block_released_by_operator_call_writes_no_repair_audit(fleet):
++    """Only a missing-parent repair release writes ``missing_parent_requeue``; an ordinary operator unblock does not."""
++    f = fleet
++    held = f.card(f.h, "own agent block")
++    with kb.write_txn(f.h):
++        f.h.execute("UPDATE tasks SET status = 'blocked', block_kind = 'transient' WHERE id = ?", (held,))
++        kb._append_event(f.h, held, "blocked", {"reason": "waiting", "kind": "transient",
++                                                "actor": f"agent (task {held})"})
++    f.board()
++    _submit_as(f, f.caller, f.run_id, held)
++    _round(f)
++    assert _execute_row(f, held)["outcome"] == "applied", _execute_row(f, held)
++    [payload] = _unblocked(f, held)
++    assert "via" not in payload and "repair_task_id" not in payload
++    assert not _requeue_audit(f, held)
+ 
+ 
+ def test_repair_card_cannot_unblock_another_hub_card(fleet):
+@@ -224,4 +250,7 @@ def test_worker_kanban_unblock_tool_forwards_to_the_home_end_to_end(fleet, monke
+     [payload] = _unblocked(f, child)
+     assert payload["operator_caller"] == {**payload["operator_caller"], "task_id": repair, "gateway": "worker-5"}
+     assert payload["repair_task_id"] == repair
++    # Review 5891061855 nit 1: the home writes the same audit row as the same-gateway grant.
++    assert _requeue_audit(f, child) == [{"by": repair, "repair_card": repair, "target": child,
++                                         "operator_request_uid": payload["operator_request_uid"]}]
+     assert ksr.get_request(f.w, out["request_id"])["status"] == "done"
+-- 
+2.43.0
+

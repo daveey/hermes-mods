@@ -1,0 +1,252 @@
+From dee44de0738df3982f020e8c6b153bba01d0413b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:50:42 +0000
+Subject: [PATCH] [daveey] kanban remote stand-aside: match the lease holder
+ against both verified gateway pids; compacted-chat test (PR #2208 nits 1 & 3)
+
+Follow-up t_01a1d527c5b43192 of review t_01a1d4ff020fea32 on PR #2208.
+
+Nit 1 (behaviour): `canonical_gateway_pid` yielded one candidate: the profile home's gateway, else the
+multiplexed default gateway. When both are live and the DEFAULT gateway runs the chat's turn, its lease
+was not matched, so the Desktop sweep fell back to the claim/refuse/release loop ("deferred: a turn is
+running" every pass). Safe (no loss, no dup) but noisy, and it holds the claim the gateway's owner pass
+needs. `verified_gateway_pids(profile)` now lists both verified pids (profile
+`live_gateway_pid_for_home(get_profile_dir(profile))`, then `live_default_gateway_pid()`), deduplicated;
+a failed lookup drops only its own candidate. `gateway_lease_pid` matches the unexpired lease holder
+against each via `gateway_owner`. Still lease-only, still `expires_at > now`, still pid-verified.
+
+Nit 3 (test): new test with the lease on the compression lineage root and the link on the tip: three
+sweeps stand aside (no claim under tip or root, no wake, no "deferred"), one "left to gateway pid" note,
+and after release exactly one lineage row with the tip's ledger row DELIVERED.
+
+Nit 2 (cosmetic, declined): reading the lease once per lineage id is kept; `session_turn_lease_owner`
+maps each id to its root, and `lineage_ids` can in principle span ids with distinct roots, so a single
+read would need to prove a shared root first for no behaviour gain.
+
+Proof (hermes-core-wt test on worker-5):
+- GREEN: test_kanban_remote_lease_stand_aside.py + test_kanban_remote_owner_delivery.py: 34 passed.
+- RED on PR #2208 head 0421ba2884 (fifo reverted, new tests): ..._either_verified_gateway_..[default]
+  fails (the gap); the profile-held control passes.
+- RED on origin/main (fifo + notices at main): the [default] case, the compacted-chat test and the
+  verified_gateway_pids unit test fail, along with #2208's own stand-aside tests.
+- scripts/check --base origin/main: 19 checks ok.
+---
+ .../test_kanban_remote_lease_stand_aside.py   | 98 +++++++++++++++++--
+ tui_gateway/kanban_remote_fifo.py             | 64 +++++++-----
+ 2 files changed, 129 insertions(+), 33 deletions(-)
+
+diff --git a/tests/gateway/test_kanban_remote_lease_stand_aside.py b/tests/gateway/test_kanban_remote_lease_stand_aside.py
+index 286ca26b83..3192b79779 100644
+--- a/tests/gateway/test_kanban_remote_lease_stand_aside.py
++++ b/tests/gateway/test_kanban_remote_lease_stand_aside.py
+@@ -7,7 +7,9 @@ lease, released it and logged "deferred: a turn is running" up to 6 times in a r
+ holds an unexpired lease the sweep can deliver nothing (row and wake are both refused), so it now leaves such a chat
+ alone without a claim; an expired lease, a dead holder or a holder that is not the gateway keep today's path.
+ """
++import contextlib
+ import logging
++import sqlite3
+ import subprocess
+ import sys
+ import time
+@@ -16,6 +18,7 @@ import pytest
+ 
+ from hermes_state_pidns import holder_namespace_token
+ from tui_gateway import kanban_remote_fifo as fifo_mod
++from tui_gateway import kanban_remote_notices as krn
+ from tests.gateway import test_kanban_remote_owner_delivery as owner_tests
+ from tests.gateway.test_kanban_remote_owner_delivery import (
+     CHAT, _dead_pid, _done, _key, _ledger, _publish, _rows, _sweep, _sweep_writes_row)
+@@ -45,7 +48,7 @@ def _holder(pid):
+ 
+ 
+ def _gateway(monkeypatch, pid):
+-    monkeypatch.setattr(fifo_mod, "canonical_gateway_pid", lambda profile: pid, raising=False)
++    monkeypatch.setattr(fifo_mod, "verified_gateway_pids", lambda profile: (pid,), raising=False)
+ 
+ 
+ def _messages(caplog, text):
+@@ -132,13 +135,90 @@ def test_a_live_holder_that_is_not_the_gateway_keeps_todays_path(env, live_pids,
+     db.release_session_turn_lease(CHAT, _holder(other))
+ 
+ 
+-def test_canonical_gateway_pid_falls_back_to_the_multiplexed_default_gateway(monkeypatch):
++def _pid_lookups(monkeypatch, *, profile, default):
++    """The two verified-pid lookups at their boundary: the profile home's gateway and the default root's."""
+     from gateway import status
+     import hermes_cli.gateway_multiplex_served as served
+-    monkeypatch.setattr(status, "live_gateway_pid_for_home", lambda home: None)
+-    monkeypatch.setattr(served, "live_default_gateway_pid", lambda: 4242)
+-    assert fifo_mod.canonical_gateway_pid("household") == 4242
+-    monkeypatch.setattr(status, "live_gateway_pid_for_home", lambda home: 77)
+-    assert fifo_mod.canonical_gateway_pid("household") == 77
+-    monkeypatch.setattr(status, "live_gateway_pid_for_home", lambda home: (_ for _ in ()).throw(OSError("x")))
+-    assert fifo_mod.canonical_gateway_pid("household") is None
++    monkeypatch.setattr(status, "live_gateway_pid_for_home", profile)
++    monkeypatch.setattr(served, "live_default_gateway_pid", default)
++
++
++@pytest.mark.parametrize("holds", ["profile", "default"])
++def test_a_lease_held_by_either_verified_gateway_stands_the_sweep_aside(env, live_pids, monkeypatch, caplog, holds):
++    """PR #2208 review nit 1: a profile gateway and a multiplexed default gateway can both be live. Only the
++    profile's was matched, so a chat whose turn the default gateway ran fell back to claim/defer every pass."""
++    hub, _runner, _authority, _fifo, db = env
++    profile_gw, default_gw = live_pids(), live_pids()
++    _pid_lookups(monkeypatch, profile=lambda home: profile_gw, default=lambda: default_gw)
++    holder = profile_gw if holds == "profile" else default_gw
++    assert db.try_acquire_session_turn_lease(CHAT, _holder(holder))
++    _publish(hub, [_card()])
++    wakes = []
++    with caplog.at_level(logging.INFO):
++        for _ in range(3):
++            _sweep(wakes)
++    assert wakes == [] and _rows(KEY) == []
++    assert _ledger(TID, gw="worker-3") is None
++    assert _messages(caplog, "deferred") == []
++    assert len(_messages(caplog, f"left to gateway pid {holder}")) == 1
++    db.release_session_turn_lease(CHAT, _holder(holder))
++
++
++def test_a_lease_on_the_compression_root_stands_aside_for_a_link_on_the_tip_then_delivers_once(
++        env, live_pids, monkeypatch, caplog):
++    """PR #2208 review nit 3: the turn lease sits on the lineage root while the link names the compression tip.
++    The sweep must still see the gateway's lease (no claim, no wake), and deliver exactly once after release."""
++    hub, _runner, _authority, _fifo, db = env
++    db.end_session(CHAT, "compression")
++    db.create_session(owner_tests.TIP, "desktop", parent_session_id=CHAT)
++    gw = live_pids()
++    _gateway(monkeypatch, gw)
++    assert db.try_acquire_session_turn_lease(CHAT, _holder(gw))  # keyed on the root
++    _publish(hub, [_done(TID, gw="worker-3", chat=owner_tests.TIP)])
++    wakes = []
++    with caplog.at_level(logging.INFO):
++        for _ in range(3):
++            _sweep(wakes)
++    assert wakes == [] and owner_tests._lineage_rows(KEY) == []
++    assert _tip_ledger() == []  # no claim under the tip (nor the root)
++    assert _messages(caplog, "deferred") == []
++    assert len(_messages(caplog, f"left to gateway pid {gw}")) == 1
++    db.release_session_turn_lease(CHAT, _holder(gw))
++    _sweep_writes_row(db)
++    _sweep_writes_row(db)
++    assert len(owner_tests._lineage_rows(KEY)) == 1
++    assert _tip_ledger() == [(owner_tests.TIP, krn.DELIVERED)]
++
++
++def _tip_ledger():
++    with contextlib.closing(sqlite3.connect(krn.ledger_path())) as conn:
++        return conn.execute("SELECT session, delivered FROM notices WHERE ref=?",
++                            (f"worker-3/default/default/{TID}",)).fetchall()
++
++
++def test_verified_gateway_pids_lists_the_profile_and_the_multiplexed_default_gateway(monkeypatch):
++    _pid_lookups(monkeypatch, profile=lambda home: None, default=lambda: 4242)
++    assert fifo_mod.verified_gateway_pids("household") == (4242,)
++    _pid_lookups(monkeypatch, profile=lambda home: 77, default=lambda: 4242)
++    assert fifo_mod.verified_gateway_pids("household") == (77, 4242)
++    _pid_lookups(monkeypatch, profile=lambda home: 4242, default=lambda: 4242)
++    assert fifo_mod.verified_gateway_pids("default") == (4242,)  # one gateway, listed once
++    _pid_lookups(monkeypatch, profile=lambda home: (_ for _ in ()).throw(OSError("x")), default=lambda: 4242)
++    assert fifo_mod.verified_gateway_pids("household") == (4242,)  # a failed lookup drops only its candidate
++    _pid_lookups(monkeypatch, profile=lambda home: 77, default=lambda: (_ for _ in ()).throw(OSError("x")))
++    assert fifo_mod.verified_gateway_pids("household") == (77,)
++    _pid_lookups(monkeypatch, profile=lambda home: None, default=lambda: None)
++    assert fifo_mod.verified_gateway_pids("household") == ()
++
++
++def test_no_verified_gateway_means_no_stand_aside(env, live_pids, monkeypatch, caplog):
++    hub, _runner, _authority, _fifo, db = env
++    holder = live_pids()
++    _pid_lookups(monkeypatch, profile=lambda home: None, default=lambda: None)
++    assert db.try_acquire_session_turn_lease(CHAT, _holder(holder))
++    _publish(hub, [_card()])
++    with caplog.at_level(logging.INFO):
++        _sweep([])
++    assert _messages(caplog, "left to gateway pid") == []
++    assert len(_messages(caplog, "deferred: a turn is running")) == 1
++    db.release_session_turn_lease(CHAT, _holder(holder))
+diff --git a/tui_gateway/kanban_remote_fifo.py b/tui_gateway/kanban_remote_fifo.py
+index ddc97e8b44..f447595d26 100644
+--- a/tui_gateway/kanban_remote_fifo.py
++++ b/tui_gateway/kanban_remote_fifo.py
+@@ -75,28 +75,42 @@ def gateway_holds(db: Any, ids: Iterable[str], event_key: str) -> bool:
+     return bool(event_key) and event_key in pending_keys(db, ids)
+ 
+ 
+-def canonical_gateway_pid(profile: Optional[str]) -> Optional[int]:
+-    """The verified live gateway that runs ``profile``'s chats: the gateway of that profile's own home, else
+-    the default root's (a multiplexed gateway serves the profile from there). Identity is the start-time and
+-    command-line proven pid of ``gateway.status.live_gateway_pid_for_home``, never the control socket's identify
+-    call (``discover_owner`` drops the pid and times out under exactly the load this guards). None when unproven."""
+-    try:
+-        from gateway.status import live_gateway_pid_for_home
+-        from hermes_cli.profiles import get_profile_dir
+-        pid = live_gateway_pid_for_home(get_profile_dir(profile or "default"))
+-        if pid is None:
+-            from hermes_cli.gateway_multiplex_served import live_default_gateway_pid
+-            pid = live_default_gateway_pid()
+-        return int(pid) if pid is not None else None
+-    except Exception:  # health: allow BLE001 -- an unproven gateway keeps the sweep's own path
+-        logger.debug("remote kanban fifo: gateway pid lookup failed", exc_info=True)
+-        return None
++def _profile_gateway_pid(profile: Optional[str]) -> Optional[int]:
++    from gateway.status import live_gateway_pid_for_home
++    from hermes_cli.profiles import get_profile_dir
++    return live_gateway_pid_for_home(get_profile_dir(profile or "default"))
++
++
++def _default_gateway_pid(_profile: Optional[str]) -> Optional[int]:
++    from hermes_cli.gateway_multiplex_served import live_default_gateway_pid
++    return live_default_gateway_pid()
++
++
++def verified_gateway_pids(profile: Optional[str]) -> tuple[int, ...]:
++    """Every verified live gateway that may run ``profile``'s chats, deduplicated, in order: the gateway of that
++    profile's own home, then the default root's (a multiplexed gateway serves the profile from there). Both are
++    candidates because both can be live at once and either may hold the chat's turn (PR #2208 review nit 1:
++    matching only the first left the other's leased chats on the claim/defer loop). Identity is the start-time
++    and command-line proven pid of ``gateway.status.live_gateway_pid_for_home``, never the control socket's
++    identify call (``discover_owner`` drops the pid and times out under exactly the load this guards). A failed
++    lookup drops only its own candidate; empty when none is proven."""
++    pids = []
++    for lookup in (_profile_gateway_pid, _default_gateway_pid):
++        try:
++            pid = lookup(profile)
++        except Exception:  # health: allow BLE001 -- an unproven gateway keeps the sweep's own path
++            logger.debug("remote kanban fifo: gateway pid lookup failed", exc_info=True)
++            continue
++        if pid is not None:
++            pids.append(int(pid))
++    return tuple(dict.fromkeys(pids))
+ 
+ 
+ def gateway_lease_pid(db: Any, ids: Iterable[str], profile: Optional[str], now: Optional[float] = None,
+-                      gateway_pid=None) -> Optional[int]:
+-    """The canonical gateway's pid when it holds an UNEXPIRED turn lease on the chat (``ids``: its lineage), else
+-    None. The Desktop backend's sweep then leaves the notice alone: no claim, no wake, no passive row.
++                      gateway_pids: Optional[Iterable[int]] = None) -> Optional[int]:
++    """The pid of a verified gateway (:func:`verified_gateway_pids`) that holds an UNEXPIRED turn lease on the
++    chat (``ids``: its lineage), else None. The Desktop backend's sweep then leaves the notice alone: no claim,
++    no wake, no passive row.
+ 
+     Why standing aside gives up nothing (t_01a1cff0541bf30c G3, review t_01a1d4c44f637fff): while another live
+     process holds an unexpired lease, the sweep can deliver nothing. Its passive row is refused
+@@ -125,8 +139,10 @@ def gateway_lease_pid(db: Any, ids: Iterable[str], profile: Optional[str], now:
+     if not holders:
+         return None  # the common case: no running turn, no gateway probe
+     from tui_gateway.kanban_leg_custody import gateway_owner
+-    pid = canonical_gateway_pid(profile) if gateway_pid is None else gateway_pid
+-    if pid is None:
+-        return None
+-    owner = gateway_owner(tuple(ids), None, tuple(dict.fromkeys(holders)), gateway_pid=pid, launch_profile="")
+-    return owner.pid if owner is not None else None
++    pids = verified_gateway_pids(profile) if gateway_pids is None else tuple(gateway_pids)
++    holders = tuple(dict.fromkeys(holders))
++    for pid in pids:
++        owner = gateway_owner(tuple(ids), None, holders, gateway_pid=pid, launch_profile="")
++        if owner is not None:
++            return owner.pid
++    return None
+-- 
+2.43.0
+

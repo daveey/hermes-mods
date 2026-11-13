@@ -1,0 +1,173 @@
+From e43a9e016a2dfb26999ceb43c158db52c2913560 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:17:30 +0000
+Subject: [PATCH] [daveey] remote notice index: holder backoff restarts on
+ re-acquire and new stamp; pin the same-process serve->gateway hand-off
+
+Follow-up to PR #2204 (review 5891416377, non-blocking nits; card t_01a1d4fe6a38bbc2).
+
+1. `_hold` reset `last` when the lease was lost but kept `retry_at`/`delay`,
+   so a refresher that re-acquired after a failing streak, or saw a new
+   replica stamp, could wait up to BACKOFF_MAX_S (60 s) before rebuilding.
+   The backoff now belongs to one holding and one replica state: a
+   (re-)acquired lease or a stamp not tried yet resets it and rebuilds at
+   once. A repeated failure on the same stamp still backs off (doubling).
+
+2. The serve->gateway role upgrade in `ensure_holder` relies on
+   HostLoopLease's same-process hand-off (serve's release() unlocks; the
+   gateway lease's blocked LOCK_EX waiter takes over). The existing
+   upgrade test stubs `spawn_context_thread`, so nothing covered it. New
+   test drives `ensure_holder` with real threads and two real leases in
+   one process: serve holds and publishes, the gateway claim stops it,
+   the gateway lease becomes holder (lock meta role=gateway, pid=self, no
+   longer waiting) and publishes the next replica state.
+
+Tests (tests/tui_gateway/test_kanban_remote_index.py):
+- test_holder_backoff_restarts_when_the_lease_is_re_acquired
+- test_holder_backoff_restarts_on_a_new_replica_stamp
+- test_serve_holder_hands_the_lease_to_a_gateway_claim_in_the_same_process
+
+RED (tests only, fix removed): both backoff tests fail ("timed out ...
+rebuild on re-acquire / of the new stamp, clock still frozen"); the
+hand-off test passes, as it pins existing behaviour; a mutant that drops
+`lease.release()` from `_hold` fails it. GREEN: 18/18 in the file plus
+test_host_loop_lease.py (40 total); hand-off test 3/3 repeated runs; 547
+tests in the 36 files importing kanban_remote_{index,notices} pass;
+scripts/check --base origin/main ok.
+---
+ tests/tui_gateway/test_kanban_remote_index.py | 86 +++++++++++++++++++
+ tui_gateway/kanban_remote_index.py            | 15 +++-
+ 2 files changed, 97 insertions(+), 4 deletions(-)
+
+diff --git a/tests/tui_gateway/test_kanban_remote_index.py b/tests/tui_gateway/test_kanban_remote_index.py
+index 55894d6787..a4a523b8d4 100644
+--- a/tests/tui_gateway/test_kanban_remote_index.py
++++ b/tests/tui_gateway/test_kanban_remote_index.py
+@@ -364,3 +364,89 @@ def test_gateway_claim_upgrades_a_serve_holder(monkeypatch):
+     kri.ensure_holder("serve")
+     kri.ensure_holder("gateway")
+     assert len(spawned) == 2
++
++
++def _failing_holder(monkeypatch, replica, ledger):
++    """A held ``_hold`` whose every refresh fails, on a frozen clock (the backoff never expires by itself)."""
++    clock, calls = [1000.0], []
++    monkeypatch.setattr(kri, "_clock", lambda: clock[0])
++    monkeypatch.setattr(kri, "refresh", lambda hub, led: calls.append(1) and False)
++    lease, stop = _Lease(True), threading.Event()
++    thread = threading.Thread(target=kri._hold, args=(lease, replica, ledger, stop, 0.01), daemon=True)
++    thread.start()
++    wait_until(lambda: lease.beats > 20, what="failing passes")
++    assert len(calls) == 1  # backing off
++    return lease, stop, thread, calls
++
++
++def test_holder_backoff_restarts_when_the_lease_is_re_acquired(tmp_path, monkeypatch):
++    """A lost lease ends the holding's failing streak: the next holding rebuilds at once, not after it."""
++    replica, ledger = _home(tmp_path, _cards())
++    lease, stop, thread, calls = _failing_holder(monkeypatch, replica, ledger)
++    try:
++        asked = lease.asked
++        lease.value = False
++        wait_until(lambda: lease.asked > asked + 3, what="standby passes")
++        lease.value = True
++        wait_until(lambda: len(calls) == 2, what="rebuild on re-acquire, clock still frozen")
++    finally:
++        stop.set()
++        thread.join(5)
++
++
++def test_holder_backoff_restarts_on_a_new_replica_stamp(tmp_path, monkeypatch):
++    """The backoff is per replica state: a new stamp is tried at once, whatever the last state's streak."""
++    replica, ledger = _home(tmp_path, _cards())
++    lease, stop, thread, calls = _failing_holder(monkeypatch, replica, ledger)
++    try:
++        _add(replica, _linked("t_new", CHAT), 50)
++        wait_until(lambda: len(calls) == 2, what="rebuild of the new stamp, clock still frozen")
++        beats = lease.beats
++        wait_until(lambda: lease.beats > beats + 20, what="passes on the same failing stamp")
++        assert len(calls) == 2  # that stamp backs off again
++    finally:
++        stop.set()
++        thread.join(5)
++
++
++def test_serve_holder_hands_the_lease_to_a_gateway_claim_in_the_same_process(tmp_path, monkeypatch):
++    """Two real ``HostLoopLease`` objects in one process: the serve refresher holds, a gateway claim stops it, its
++    ``release()`` unlocks, and the gateway lease's blocked ``LOCK_EX`` waiter becomes the holder and publishes."""
++    import agent.memory_provider as mp
++    from hermes_cli import host_loop_lease as hll
++
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path))
++    replica, _ = _home(tmp_path, _cards())
++    ledger = krn.ledger_path()
++    assert krn.hub_db_path() == replica
++    real, spawned = mp.spawn_context_thread, []
++
++    def spawn(target, name, args):
++        thread = real(target, name=name, args=args)
++        spawned.append((thread, args[0]))
++        return thread
++    monkeypatch.setattr(mp, "spawn_context_thread", spawn)
++    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
++    try:
++        kri.ensure_holder("serve")
++        (serve_thread, serve), = spawned
++        assert isinstance(serve, hll.HostLoopLease) and serve.role == "serve"
++        wait_until(lambda: serve._held, timeout=15, what="the serve refresher holds the lease")
++        wait_until(lambda: kri.published_key(ledger) == kri.replica_key(replica), timeout=15, what="serve publish")
++        kri.ensure_holder("gateway")
++        gateway_thread, gateway = spawned[1]
++        assert gateway is not serve and gateway.role == "gateway" and gateway.path == serve.path
++        serve_thread.join(15)
++        assert not serve_thread.is_alive() and not serve._held  # the serve refresher stopped and released
++        wait_until(lambda: gateway._held, timeout=15, what="the gateway lease takes over the released lock")
++        meta = json.loads(gateway.path.read_text())
++        assert meta["held"] is True and meta["role"] == "gateway" and meta["pid"] == os.getpid()
++        assert not gateway._waiting
++        _add(replica, _linked("t_new", CHAT), 50)  # the gateway refresher publishes the next state
++        wait_until(lambda: kri.published_key(ledger) == kri.replica_key(replica), timeout=15,
++                   what="gateway publish")
++    finally:
++        kri.reset()
++        for thread, _lease in spawned:
++            thread.join(15)
++    assert not gateway_thread.is_alive() and not any(lease._held for _thread, lease in spawned)
+diff --git a/tui_gateway/kanban_remote_index.py b/tui_gateway/kanban_remote_index.py
+index 504c47524c..962c8ab0e0 100644
+--- a/tui_gateway/kanban_remote_index.py
++++ b/tui_gateway/kanban_remote_index.py
+@@ -420,19 +420,26 @@ def _hold(lease, hub: Path, ledger: Path, stop: threading.Event, poll: float = R
+     """Change-driven refresher: one ``PRAGMA data_version`` per ``poll`` while held, a rebuild per replica change.
+ 
+     A refresh that does not leave the copy current (publishing fails, the replica has no key) is retried after a
+-    backoff that doubles up to :data:`BACKOFF_MAX_S`, whatever the stamp, not on every poll: readers compute
+-    locally on a miss meanwhile. A success resets it and remembers the stamp, so that state is not rebuilt."""
++    backoff that doubles up to :data:`BACKOFF_MAX_S`, not on every poll: readers compute locally on a miss
++    meanwhile. A success resets it and remembers the stamp, so that state is not rebuilt. The backoff belongs to
++    one holding and one replica state: re-acquiring the lease or a new stamp starts it over (an immediate
++    rebuild), so a failing streak never delays the next state's copy by up to :data:`BACKOFF_MAX_S`."""
+     from tui_gateway.kanban_replica_observer import fingerprint
+ 
+-    last, retry_at, delay = None, 0.0, poll
++    last, tried, holding, retry_at, delay = None, None, False, 0.0, poll
+     try:
+         while not stop.wait(poll):
+             if not lease.held():
+-                last = None
++                last, holding = None, False
+                 continue
++            if not holding:  # (re-)acquired: the last holding's failing streak says nothing about this one
++                holding, retry_at, delay = True, 0.0, poll
+             try:
+                 stamp = fingerprint(hub) if hub.is_file() else None
++                if stamp is not None and stamp != tried:  # a replica state not tried yet: no inherited wait
++                    retry_at, delay = 0.0, poll
+                 if stamp is not None and stamp != last and _clock() >= retry_at:
++                    tried = stamp
+                     if refresh(hub, ledger):
+                         last, retry_at, delay = stamp, 0.0, poll
+                     else:
+-- 
+2.43.0
+

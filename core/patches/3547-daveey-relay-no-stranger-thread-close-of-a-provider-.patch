@@ -1,0 +1,419 @@
+From 6a871e154ffe4438b03b0eaf66f8fdf130d68506 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:04:09 +0000
+Subject: [PATCH] [daveey] relay: no stranger-thread close of a provider stream
+ its chunk reader still reads
+
+ManagedLlmStream pulls each provider chunk on an asyncio.to_thread worker, and
+Relay pulls chunk N+1 before it hands over chunk N, so a live managed stream
+almost always has a worker blocked in SSL_read. Closing the managed stream (a
+/stop, a stream retry, a consumer that stops early) runs Relay's aclose on the
+"relay-llm-stream-aclose" daemon; that cancelled the read and the provider
+generator's finally closed the raw provider stream there, i.e. httpx closed the
+socket from a stranger thread while the worker still read it. Same class as the
+hub SQLite-header incidents (PR #2074, #2148): the fd number is recycled by the
+next open() and the reader's SSL_read reads from / writes a TLS alert into it.
+This path covers the main agent's chat/anthropic/codex streams whenever Relay
+managed execution is on, not only aux calls.
+
+Five whys:
+1. Why was the TLS fd released under a reader? The provider generator's finally
+   closed raw_stream on the loop thread after its to_thread read was cancelled.
+2. Why was a read in flight at close? Relay prefetches the next provider chunk
+   before yielding the current one, so a reader is parked on the socket between
+   chunks.
+3. Why did cancel not stop the reader? asyncio.to_thread cannot interrupt a
+   blocking read; cancelling only detaches the awaiting coroutine.
+4. Why close instead of shutdown? The relay stream path predates
+   aux_provider_handoff (#2074/#2148), which established "shutdown from the
+   stranger thread, close on the reading thread" for the aux siblings.
+5. Why was it not caught? No test closed a managed stream while a real TLS read
+   was parked; the fake streams finish their reads instantly.
+
+Fix:
+- The chunk read runs through aux_provider_handoff.run_in_thread inside a new
+  collect_abandoned() block, so a read cancelled mid-flight is recorded.
+- With an abandoned read, the generator's finally only shuts the stream's
+  socket down (via its .response, FD-safe from any thread) and defers
+  raw_stream.close() to the reading worker (release_client with a new
+  shutdown= hook). No abandoned read: closed in place as before.
+- ManagedLlmStream._close waits (bounded, 2 s) for abandoned reads to unwind,
+  so close() returns only once the worker closed its stream and a caller's own
+  later client close (close_once after a /stop) meets a quiet socket.
+- ProviderAttempt gains wait(); client_scope now uses collect_abandoned.
+
+Proof (real loopback TLS 1.3 server, tests/agent/test_relay_stream_stranger_close.py):
+- RED on base: the provider stream is closed on relay-llm-stream-aclose while
+  worker asyncio_0 sits in SSLSocket.read, and the fd is immediately reused
+  (an eventpoll/anon-inode fd): "the reader's fd was released while it still
+  read it".
+- GREEN: header intact, close ran on the reader thread, tcp_shutdown=1,
+  close() returns after the reader unwound; 3/3 runs with the #2074/#2148
+  suites (18 passed each).
+- 28 consumer files of relay_llm / aux_provider_handoff / class routing:
+  756 passed, 0 failed.
+---
+ agent/aux_provider_handoff.py                 |  45 ++++--
+ agent/relay_llm.py                            |  44 +++++-
+ .../agent/test_relay_stream_stranger_close.py | 148 ++++++++++++++++++
+ 3 files changed, 224 insertions(+), 13 deletions(-)
+ create mode 100644 tests/agent/test_relay_stream_stranger_close.py
+
+diff --git a/agent/aux_provider_handoff.py b/agent/aux_provider_handoff.py
+index f86a275055..8ff71b8309 100644
+--- a/agent/aux_provider_handoff.py
++++ b/agent/aux_provider_handoff.py
+@@ -40,17 +40,25 @@ class ProviderAttempt:
+         self._lock = threading.Lock()
+         self._finished = False
+         self._on_finish: list[Callable[[], None]] = []
++        self._released = threading.Event()
+ 
+     def finish(self) -> None:
+         """Daemon side, after the provider callback returned or raised: run the deferred releases here."""
+         with self._lock:
+             self._finished = True
+             pending, self._on_finish = self._on_finish, []
+-        for release in pending:
+-            try:
+-                release()
+-            except Exception:
+-                logger.debug("deferred aux client release failed", exc_info=True)
++        try:
++            for release in pending:
++                try:
++                    release()
++                except Exception:
++                    logger.debug("deferred aux client release failed", exc_info=True)
++        finally:
++            self._released.set()
++
++    def wait(self, timeout: float) -> bool:
++        """Owner side: block until the daemon returned and ran its deferred releases (False on timeout)."""
++        return self._released.wait(timeout)
+ 
+     def defer(self, release: Callable[[], None]) -> bool:
+         """Queue ``release`` for the daemon; False when the daemon already finished (the caller runs it)."""
+@@ -105,6 +113,17 @@ async def run_in_thread(fn: Callable[..., _T], /, *args: Any, **kwargs: Any) ->
+         raise
+ 
+ 
++@contextlib.contextmanager
++def collect_abandoned(abandoned: list[ProviderAttempt]) -> Iterator[list[ProviderAttempt]]:
++    """Record into ``abandoned`` each ``run_in_thread`` call cancelled mid-run inside this block. In an async
++    generator the block must not span a ``yield``: it has to open and close within one step of the task."""
++    token = _ABANDONED.set(abandoned)
++    try:
++        yield abandoned
++    finally:
++        _ABANDONED.reset(token)
++
++
+ @contextlib.contextmanager
+ def client_scope(client: Any, close: Callable[[Any], None]) -> Iterator[None]:
+     """Own ``client`` for one provider call and ``close`` it on exit, on a thread allowed to.
+@@ -112,19 +131,23 @@ def client_scope(client: Any, close: Callable[[Any], None]) -> Iterator[None]:
+     No abandoned daemon: closed here, as before. Otherwise the sockets are shut down from here and the
+     close runs on the last abandoned daemon when its callback returns."""
+     abandoned: list[ProviderAttempt] = []
+-    token = _ABANDONED.set(abandoned)
+     try:
+-        yield
++        with collect_abandoned(abandoned):
++            yield
+     finally:
+-        _ABANDONED.reset(token)
+         release_client(client, close, abandoned)
+ 
+ 
+-def release_client(client: Any, close: Callable[[Any], None], abandoned: list[ProviderAttempt]) -> None:
++def release_client(client: Any, close: Callable[[Any], None], abandoned: list[ProviderAttempt],
++                   *, shutdown: Callable[[Any], int] | None = None) -> None:
++    """Close ``client`` here, or (abandoned daemons) shut its sockets down and defer the close to them.
++    ``shutdown`` (default: the client's pool sweep) returns how many sockets it shut down."""
+     if not abandoned:
+         close(client)
+         return
+-    from agent.agent_runtime_helpers import force_close_tcp_sockets
++    if shutdown is None:
++        from agent.agent_runtime_helpers import force_close_tcp_sockets
++        shutdown = lambda owned: force_close_tcp_sockets(getattr(owned, "_real_client", None) or owned)
+     remaining = [len(abandoned)]
+     lock = threading.Lock()
+     swept = threading.Event()
+@@ -151,7 +174,7 @@ def release_client(client: Any, close: Callable[[Any], None], abandoned: list[Pr
+     try:
+         for attempt in abandoned:
+             deferred += bool(attempt.defer(daemon_done))
+-        shutdown_count = force_close_tcp_sockets(getattr(client, "_real_client", None) or client) if deferred else 0
++        shutdown_count = shutdown(client) if deferred else 0
+     finally:
+         swept.set()
+         for _ in range(len(abandoned) - deferred):
+diff --git a/agent/relay_llm.py b/agent/relay_llm.py
+index e52f0b8917..6a8be9e339 100644
+--- a/agent/relay_llm.py
++++ b/agent/relay_llm.py
+@@ -13,6 +13,7 @@ from functools import partial
+ from types import SimpleNamespace
+ from typing import Any
+ 
++from agent import aux_provider_handoff as handoff
+ from agent import relay_runtime
+ 
+ logger = logging.getLogger(__name__)
+@@ -25,6 +26,9 @@ _LogicalCall = tuple[relay_runtime.RelayTurnContext, Any, str]
+ # Bound for awaiting a Relay stream's aclose() on the private loop: a wedged
+ # close must not hang the worker thread or hold the runtime lease forever.
+ _ACLOSE_TIMEOUT = 10.0
++# Bound for a cancelled chunk read to return after its socket was shut down (normally milliseconds; a
++# stream with no reachable socket reads on until its own timeout and is left to close itself).
++_ABANDONED_READ_TIMEOUT = 2.0
+ 
+ 
+ # api_mode -> (Relay operation name, codec class name on ``relay.codecs``)
+@@ -289,6 +293,20 @@ def _aclose_on_loop(loop: asyncio.AbstractEventLoop, stream: Any) -> bool:
+     return True
+ 
+ 
++def _shutdown_provider_stream(raw_stream: Any) -> int:
++    """Shut down (never close) the socket behind an SDK stream's ``.response``; FD-safe from any thread."""
++    from agent.agent_runtime_helpers import _shutdown_socket, _socket_from_response
++    try:
++        sock = _socket_from_response(getattr(raw_stream, "response", None))
++        if sock is None:
++            return 0
++        _shutdown_socket(sock)
++    except Exception:
++        logger.debug("Provider stream socket shutdown failed", exc_info=True)
++        return 0
++    return 1
++
++
+ def _next_provider_chunk(callback: Callable[..., Any], raw_iterator: Any) -> tuple[Any, bool]:
+     """Read one synchronous provider chunk without leaking StopIteration through a Future."""
+     try:
+@@ -326,6 +344,7 @@ class ManagedLlmStream(Iterator[Any]):
+         self._completed_response_predicate = completed_response_predicate
+         self._raw_chunks: list[tuple[Any, Any]] = []
+         self._prefetched_chunks: list[Any] = []
++        self._abandoned_reads: list[handoff.ProviderAttempt] = []
+         attempt = _ManagedAttempt.resolve(session_id, request, metadata, name=name, model_name=model_name)
+         if attempt is None:
+             self._start_unmanaged(request)
+@@ -349,6 +368,7 @@ class ManagedLlmStream(Iterator[Any]):
+         """Relay's provider callback: run the factory and yield JSON-encoded chunks."""
+         run_callback = attempt.run_callback
+         raw_stream = None
++        abandoned: list[handoff.ProviderAttempt] = []
+         try:
+             raw_stream = run_callback(self._stream_factory, attempt.provider_request(next_request))
+             predicate = self._completed_response_predicate
+@@ -363,7 +383,9 @@ class ManagedLlmStream(Iterator[Any]):
+                 # Off the loop: Relay pulls the next provider chunk before it hands over the
+                 # current one, so a blocking read here withholds each chunk until the provider
+                 # sends the next. Text vanishes for every provider pause and a steer aborts it.
+-                chunk, exhausted = await asyncio.to_thread(_next_provider_chunk, run_callback, raw_iterator)
++                # A cancelled read leaves its worker in SSL_read: recorded, so the close below waits for it.
++                with handoff.collect_abandoned(abandoned):
++                    chunk, exhausted = await handoff.run_in_thread(_next_provider_chunk, run_callback, raw_iterator)
+                 if exhausted:
+                     break
+                 if self._accept_chunk is not None and not run_callback(self._accept_chunk, chunk):
+@@ -377,7 +399,15 @@ class ManagedLlmStream(Iterator[Any]):
+             raise
+         finally:
+             close = getattr(raw_stream, "close", None)
+-            if callable(close):
++            if abandoned:
++                # Never close the socket under the worker still reading it (a recycled fd once took a
++                # TLS alert into a SQLite header): shut it down from here, the worker closes the stream.
++                self._abandoned_reads.extend(abandoned)
++                handoff.release_client(
++                    raw_stream, lambda _stream: run_callback(close) if callable(close) else None,
++                    abandoned, shutdown=_shutdown_provider_stream,
++                )
++            elif callable(close):
+                 try:
+                     run_callback(close)
+                 except BaseException as exc:
+@@ -582,12 +612,22 @@ class ManagedLlmStream(Iterator[Any]):
+                     close_loop = _aclose_on_loop(loop, self._stream)
+                 except Exception as exc:
+                     self._keep_first_close_error(exc)
++                self._await_abandoned_reads()
+             self._finish_logical(logical_outcome, error)
+             if close_loop:
+                 loop.close()
+         finally:
+             self._release_runtime_lease()
+ 
++    def _await_abandoned_reads(self) -> None:
++        """Return only once each cancelled chunk read unwound and closed its stream, so a caller's own client
++        close (``close_once`` after a /stop) never lands on a socket a worker still reads."""
++        attempts, self._abandoned_reads = getattr(self, "_abandoned_reads", None) or [], []
++        for attempt in attempts:
++            if not attempt.wait(_ABANDONED_READ_TIMEOUT):
++                logger.warning("Provider chunk read still running %ss after its stream was abandoned; "
++                               "it closes the stream itself when it returns", _ABANDONED_READ_TIMEOUT)
++
+     def _release_runtime_lease(self) -> None:
+         lease, self._runtime_lease = self._runtime_lease, None
+         if lease is not None:
+diff --git a/tests/agent/test_relay_stream_stranger_close.py b/tests/agent/test_relay_stream_stranger_close.py
+new file mode 100644
+index 0000000000..1c50d7a731
+--- /dev/null
++++ b/tests/agent/test_relay_stream_stranger_close.py
+@@ -0,0 +1,148 @@
++"""[daveey] Relay-managed streams must not close a provider stream its chunk reader is still reading.
++
++Sibling of test_aux_abandoned_provider_tls_fd.py / test_aux_stranger_close_siblings.py. ``ManagedLlmStream``
++pulls each provider chunk on an ``asyncio.to_thread`` worker, and Relay pulls chunk N+1 before it hands over
++chunk N, so a live stream nearly always has a worker blocked in ``SSL_read``. Closing the managed stream
++(a /stop, a retry, a consumer that stops early) cancels that read, and the provider generator's ``finally``
++closed the raw provider stream from the loop thread while the worker still read it. httpx then closed the
++socket from a stranger thread: the fd number went to the next ``open()`` (a SQLite file) and the worker's
++``SSL_read`` wrote a TLS alert into its header.
++"""
++from __future__ import annotations
++
++import os
++import threading
++
++import httpx
++import pytest
++
++pytest.importorskip("nemo_relay")
++
++from agent import relay_llm, relay_runtime
++from tests.agent.test_aux_abandoned_provider_tls_fd import SQLITE_MAGIC, stalling_stream
++from tests.agent.test_aux_stranger_close_siblings import _header_after_fd_reuse
++
++
++@pytest.fixture
++def tls_stream(request):
++    """The stalling loopback TLS server (by name: a same-named parameter would shadow the fixture)."""
++    assert stalling_stream
++    return request.getfixturevalue("stalling_stream")
++
++
++@pytest.fixture
++def relay_session(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
++    relay_runtime._reset_for_tests()
++    lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
++        profile_key=relay_runtime.current_profile_key(), session_id="session-1", platform="cli")
++    turn = relay_runtime.SESSION_COORDINATOR.begin_turn(lease, turn_id="turn-1", task_id="task-1")
++    lease.host.retain_managed_execution("test.relay_stream_stranger_close")
++    try:
++        yield
++    finally:
++        lease.host.release_managed_execution("test.relay_stream_stranger_close")
++        relay_runtime.SESSION_COORDINATOR.end_turn(turn, outcome="success")
++        relay_runtime.SESSION_COORDINATOR.release_conversation(lease)
++        relay_runtime._reset_for_tests()
++
++
++def _fd_identity(fd: int) -> tuple[int, int] | None:
++    try:
++        st = os.fstat(fd)
++    except OSError:
++        return None
++    return st.st_dev, st.st_ino
++
++
++class _ProviderStream:
++    """An SDK ``Stream``-shaped provider stream: iterates the HTTP body, ``.response``, ``close()``."""
++
++    def __init__(self, http: httpx.Client, url: str, seen: dict) -> None:
++        self._seen = seen
++        self.response = http.send(http.build_request("POST", url, content=b"{}"), stream=True)
++        seen["fd"] = self.response.extensions["network_stream"].get_extra_info("socket").fileno()
++        seen["fd_identity"] = _fd_identity(seen["fd"])
++        self._body = self.response.iter_raw()
++        self.closed_on: list[str] = []
++
++    def __iter__(self):
++        return self
++
++    def __next__(self):
++        self._seen["reader"] = threading.current_thread().name
++        self._seen["reads"] += 1
++        self._seen["reading"].set()
++        try:
++            return {"delta": next(self._body).decode()}
++        finally:
++            self._seen["returned"].set()
++
++    def close(self) -> None:
++        self.closed_on.append(threading.current_thread().name)
++        self.response.close()
++
++
++def test_closing_a_live_managed_stream_never_hands_the_readers_tls_fd_to_sqlite(
++        relay_session, tls_stream, tmp_path, caplog):
++    caplog.set_level("INFO", logger="agent.aux_provider_handoff")
++    http = httpx.Client(verify=tls_stream.ssl_context, timeout=httpx.Timeout(20.0))
++    seen: dict = {"reads": 0, "reading": threading.Event(), "returned": threading.Event()}
++    provider: list[_ProviderStream] = []
++
++    def open_stream(_request):
++        provider.append(_ProviderStream(http, tls_stream.url, seen))
++        return provider[0]
++
++    stream = relay_llm.stream(
++        {"model": "m", "messages": []}, open_stream, session_id="session-1", name="custom",
++        model_name="m", finalizer=lambda: {"content": "first"},
++        metadata={"api_mode": "custom", "api_request_id": "stranger-close"},
++    )
++    try:
++        assert next(stream) == {"delta": "first"}
++        # Relay pulled ahead: a worker is now blocked reading the stalled body.
++        seen["reading"].clear()
++        seen["returned"].clear()
++        assert seen["reads"] >= 2 or seen["reading"].wait(15), "no worker read the next chunk"
++        assert not seen["returned"].is_set(), "the reader should be blocked on the stalled body"
++        stream.close()  # a /stop or retry abandoning the stream mid-read
++        # Before the fix the loop thread closed the socket under the reader, and the next open() in this
++        # process (an event loop's epoll fd in practice) already owned the reader's fd number.
++        assert seen["returned"].is_set() or _fd_identity(seen["fd"]) == seen["fd_identity"], (
++            "the reader's fd was released while it still read it")
++        # close() returns once the reader unwound, so a caller's later client close meets a quiet socket.
++        assert seen["returned"].is_set(), "close() returned while a worker still read the provider stream"
++        header = _header_after_fd_reuse(tmp_path, seen["fd"], tls_stream, seen["returned"])
++    finally:
++        tls_stream.resume.set()
++    assert header[:16] == SQLITE_MAGIC, f"TLS bytes landed in the SQLite header: {header!r}"
++    # The loop thread only shut the socket down; the worker that read it closed the provider stream.
++    assert provider[0].closed_on == [seen["reader"]]
++    assert "tcp_shutdown=1" in caplog.text
++    http.close()
++
++
++def test_a_finished_managed_stream_still_closes_its_provider_stream(relay_session):
++    closed: list[str] = []
++
++    class _Done:
++        def __init__(self) -> None:
++            self._chunks = iter([{"delta": "a"}, {"delta": "b"}])
++
++        def __iter__(self):
++            return self
++
++        def __next__(self):
++            return next(self._chunks)
++
++        def close(self) -> None:
++            closed.append(threading.current_thread().name)
++
++    stream = relay_llm.stream(
++        {"model": "m", "messages": []}, lambda _r: _Done(), session_id="session-1", name="custom",
++        model_name="m", finalizer=lambda: {"content": "ab"},
++        metadata={"api_mode": "custom", "api_request_id": "finished-stream"},
++    )
++    assert list(stream) == [{"delta": "a"}, {"delta": "b"}]
++    assert len(closed) == 1
+-- 
+2.43.0
+

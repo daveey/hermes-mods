@@ -1,0 +1,522 @@
+From 1da19f14e094874ae9e3d758c2ba99b83c2ea5ae Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:12:15 +0000
+Subject: [PATCH] [daveey] kanban: CI-run progress follow-ups from PR #2040
+ reviews (runner wording, idle/busy runners, busy cap, sweep race, stranded
+ release)
+
+Non-blocking points from the PR #2040 reviews 5889677459, 5890809735 and 5891212407
+(card t_01a1d487dbf081d6):
+
+1. Runner wording when a list is unreadable: _fetch_runners returns None when the repo
+   or org actions/runners read fails and no online runner matched, so runners_readable is
+   only set when both lists were read (or one matched). A repo served only by org runners,
+   read with a token without org admin, showed a readable but empty repo list and the
+   message said "no online runner has them" though the org list was never read; it now
+   falls back to "runner list unreadable, so they may be offline or saturated". The wake
+   and the park refusal are unchanged (still not_starting).
+2. shared_blocker_guard / _released_as_probe: a release without after_run
+   (probe_stranded_blockers, older rows) now also needs no re-assertion of the blocker
+   after it. Before #2040 the guard ignored releases, so a card that re-asserted the
+   blocker after the stranded release held the released card for another interval;
+   honouring the release regardless allowed a second probe in one interval. The docstring
+   records the difference from pre-#2040 main and the one case left (another card's probe
+   run after the release that ended without settling the wall).
+3+5. Busy vs idle runners: only an online runner whose busy flag is not false counts as
+   saturated (a runner without the flag keeps the old reading). When every matching
+   online runner is idle while the job waits 15 min (a stuck runner, or one in a runner
+   group the repo cannot use) the run is not_starting and the comment names the idle
+   runner; one busy runner among idle ones stays saturated (a runner between jobs is
+   briefly idle). Busy holds a wake back for at most BUSY_LIMIT_SECONDS (2 h of queueing):
+   past it the run is not_starting and the comment names the cap, so a false busy from an
+   org runner in another group cannot keep the card asleep forever.
+4. submit_sweep re-checks the running sweep and SWEEP_EVERY_SECONDS under _LOCK after
+   _has_ci_wait (_sweep_due), so two racing ticks on one board start one sweep.
+6. kanban_shared_blockers.task_applies is public; the guard, probe_stranded_blockers and
+   the CI sweep's _others_behind use it.
+
+Proof: tests/hermes_cli/test_kanban_ci_progress.py adds a test per item (org or repo list
+unreadable -> wording fallback with the wake kept; idle runner -> wake; busy among idle and
+no busy flag -> busy; busy under/past the cap; two racing submits -> one sweep; stranded
+release + later re-assertion -> held, control without it -> released). Every added
+condition has a killing mutant: 14/14 killed (sdlc-review mutants.py over
+test_kanban_ci_progress.py + test_kanban_shared_blockers.py, baseline 110 passed).
+Replay of the guard change over worker-7's kanban DBs (read-only): 0 release events,
+1 card behind a blocker, 0 verdicts changed; the change only holds more, restoring
+pre-#2040 behaviour for that case.
+
+Rebased over caf4d5dad4 (unreadable runner list + a job running on the labels = busy): a partial read (org list
+unreadable, no online repo match) now returns None from _fetch_runners, so caf4d5dad4's recent-job fallback applies
+there as well as when both lists 403; new test test_org_list_unreadable_without_a_repo_match_falls_back_to_recent_jobs
+(killed by reverting the None return). The recent-job fallback is not capped by BUSY_LIMIT_SECONDS: its evidence is
+this repo's own jobs, so the runner-group false-busy case the cap exists for cannot arise there.
+---
+ hermes_cli/kanban_ci_progress.py            | 124 ++++++++++++------
+ hermes_cli/kanban_shared_blockers.py        |  27 ++--
+ tests/hermes_cli/test_kanban_ci_progress.py | 135 ++++++++++++++++++++
+ 3 files changed, 241 insertions(+), 45 deletions(-)
+
+diff --git a/hermes_cli/kanban_ci_progress.py b/hermes_cli/kanban_ci_progress.py
+index 5cf579c571..39e304e613 100644
+--- a/hermes_cli/kanban_ci_progress.py
++++ b/hermes_cli/kanban_ci_progress.py
+@@ -10,16 +10,21 @@ morning, and nothing raised it again.
+ longer than ``QUEUED_LIMIT_SECONDS`` with no runner assigned.
+ 
+ A job nobody picked up can also mean the runners are online but saturated. When the repo's or org's self-hosted
+-runner list is readable (``actions/runners``) and a runner that is ``online`` carries every label the job asks for,
+-the run is ``busy`` instead: a park on it is allowed and nothing is woken. When neither list is readable (the token
+-lacks admin scope) a self-hosted job is still ``busy`` when a job asking for the same labels is running or a runner
+-took it within ``QUEUED_LIMIT_SECONDS`` (this run's jobs, then recent runs of the repo): 2026-11-13, run
+-43423320884 waited 15 min behind ~10 min jobs on the one-runner ``hermes-state`` pool, which was online and busy,
+-and the card owning an approved PR was woken behind ``runners-offline.hermes-state``. With no such job the run
+-stays ``not_starting`` and every message says only that no runner picked it up. The org
+-list can include runners in groups this repo may not use, so such a runner online for the labels reads as ``busy``
+-and nothing is woken (a false negative, never a false wake); the repo list is read first and decides alone when it
+-has an online match.
++runner list is readable (``actions/runners``) and a runner that is ``online`` and ``busy`` carries every label the
++job asks for, the run is ``busy`` instead: a park on it is allowed and nothing is woken, for up to
++``BUSY_LIMIT_SECONDS`` of queueing. Past that cap the run is ``not_starting`` anyway: the org list can include
++runners in groups this repo may not use, and such a runner busy with other repos' jobs would otherwise suppress the
++wake forever. When every matching online runner is idle (``busy`` false) the job should have been taken long ago (a
++stuck runner, or one in a group this repo cannot use), so the run is ``not_starting`` and the message names the idle
++runner; one busy runner among idle ones reads as saturated, since a runner between two jobs is briefly idle. The repo
++list is read first and decides alone when it has an online match. The lists count as unreadable when either read
++fails (listing runners needs admin scope; a repo served only by org runners and a token without org admin show a
++readable but empty repo list) and no online runner matched. A self-hosted job is then still ``busy`` when a job
++asking for the same labels is running or a runner took it within ``QUEUED_LIMIT_SECONDS`` (this run's jobs, then
++recent runs of the repo): 2026-11-13, run 43423320884 waited 15 min behind ~10 min jobs on the one-runner
++``hermes-state`` pool, which was online and busy, and the card owning an approved PR was woken behind
++``runners-offline.hermes-state``. With no such job the run stays ``not_starting`` and every message says only that
++no runner picked it up; a message says no online runner has the labels only when both lists were read.
+ 
+ * Park time (:func:`confirm`, called by ``kanban_awaiting.confirm_remote`` before the write txn): a ``kind=ci``
+   park on such a run is refused with ``ci_run_unstartable`` naming the labels.
+@@ -66,6 +71,7 @@ CI_RUN_UNSTARTABLE = "ci_run_unstartable"
+ NOT_STARTING = "not_starting"
+ BUSY = "busy"
+ QUEUED_LIMIT_SECONDS = 15 * 60
++BUSY_LIMIT_SECONDS = 8 * QUEUED_LIMIT_SECONDS  # how long busy runners may hold back a wake
+ RECHECK_SECONDS = 5 * 60
+ FETCH_TIMEOUT_SECONDS = 20
+ NO_CREDENTIAL_WARN_SECONDS = 60 * 60
+@@ -109,7 +115,9 @@ class Progress:
+     no_credential: bool = False
+     gh_missing: bool = False
+     deferred: bool = False  # unknown: the sweep budget ran out before the runner list was read
+-    runners_readable: bool = False  # not_starting: the runner list was read and no online runner matched
++    runners_readable: bool = False  # not_starting: both runner lists were read (or one had an online match)
++    idle_runner: str = ""  # not_starting: an online runner for the labels is idle, yet took no job
++    busy_runner: str = ""  # not_starting: an online runner for the labels is busy, past BUSY_LIMIT_SECONDS
+ 
+ 
+ def run_target(ref: str, hint: str = "") -> Optional[tuple[str, str]]:
+@@ -155,16 +163,18 @@ def _fetch_jobs(repo: str, run_id: str) -> dict:
+     return _gh_api(f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100")
+ 
+ 
+-def _fetch_runners(repo: str, labels: Optional[list[str]] = None, *,
+-                   deadline: Optional[float] = None) -> Optional[list]:
+-    """Self-hosted runners the repo can use (repo-level, then its owner's org-level). None when neither list is
+-    readable: listing runners needs admin scope, which a worker's token often lacks. When the repo list already has
+-    an online runner for ``labels`` the org list is not read. The org list may hold runners in groups this repo
+-    cannot use (a false ``busy``). Raises :class:`OverBudget` when ``deadline`` (monotonic) passed before a read."""
+-    found: Optional[list] = None
++def _fetch_runners(repo: str, labels: list[str], *, deadline: Optional[float] = None) -> Optional[list]:
++    """Self-hosted runners the repo can use (repo-level, then its owner's org-level). When the repo list already has
++    an online runner for ``labels`` the org list is not read. None when a list was unreadable and the lists read
++    hold no online runner for ``labels``: listing runners needs admin scope, which a worker's token often lacks, and
++    a repo served only by org runners then shows a readable but empty repo list, which says nothing about the
++    runners. The org list may hold runners in groups this repo cannot use (a false ``busy``, capped by
++    ``BUSY_LIMIT_SECONDS``). Raises :class:`OverBudget` when ``deadline`` (monotonic) passed before a read."""
++    found: list = []
++    unread = False
+     for path in (f"repos/{repo}/actions/runners?per_page=100",
+                  f"orgs/{repo.split('/', 1)[0]}/actions/runners?per_page=100"):
+-        if found and labels is not None and _online_runner(found, labels) is not None:
++        if _online_runner(found, labels) is not None:
+             break
+         if deadline is not None and time.monotonic() >= deadline:
+             raise OverBudget(f"sweep budget spent before {path.split('?', 1)[0]} was read")
+@@ -172,21 +182,41 @@ def _fetch_runners(repo: str, labels: Optional[list[str]] = None, *,
+             data = _gh_api(path)
+         except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+             logger.debug("ci run progress: %s unreadable: %s", path, exc)
++            unread = True
+             continue
+-        found = (found or []) + list((data or {}).get("runners") or [])
++        found += list((data or {}).get("runners") or [])
++    if unread and _online_runner(found, labels) is None:
++        return None
+     return found
+ 
+ 
+-def _online_runner(runners: list, labels: list[str]) -> Optional[str]:
+-    """Name of an ``online`` runner carrying every label in ``labels`` (case-insensitive), else None."""
++def _online_runners(runners: list, labels: list[str]) -> list[dict]:
++    """The ``online`` runners carrying every label in ``labels`` (case-insensitive)."""
+     want = {x.lower() for x in labels}
++    found = []
+     for runner in runners:
+         if not isinstance(runner, dict) or runner.get("status") != "online":
+             continue
+         have = {str(x.get("name") or "").lower() for x in runner.get("labels") or [] if isinstance(x, dict)}
+         if want <= have:
+-            return str(runner.get("name") or "(unnamed)")
+-    return None
++            found.append(runner)
++    return found
++
++
++def _name(runner: dict) -> str:
++    return str(runner.get("name") or "(unnamed)")
++
++
++def _online_runner(runners: list, labels: list[str]) -> Optional[str]:
++    """Name of an ``online`` runner carrying every label in ``labels`` (case-insensitive), else None."""
++    found = _online_runners(runners, labels)
++    return _name(found[0]) if found else None
++
++
++def _busy_runner(runners: list, labels: list[str]) -> Optional[str]:
++    """Name of an online runner for ``labels`` that is running a job, else None. Only an explicit ``busy: false``
++    says a runner is free: one without the flag counts as busy (saturated, the pre-flag reading)."""
++    return next((_name(r) for r in _online_runners(runners, labels) if r.get("busy") is not False), None)
+ 
+ 
+ def _epoch(value) -> Optional[int]:
+@@ -238,12 +268,17 @@ def ci_run_progress(ref: str, *, hint: str = "", fetch: Optional[Fetch] = None,
+     except OverBudget as exc:
+         return Progress("unknown", repo, run_id, labels, age, detail=str(exc), deferred=True)
+     if runners is not None:
+-        name = _online_runner(runners, labels)
+-        if name is not None:
+-            logger.info("ci run %s/%s queued %ss: runner %s is online for %s, so the runners are saturated",
+-                        repo, run_id, age, name, ",".join(labels))
++        busy = _busy_runner(runners, labels)
++        if busy is not None and age <= BUSY_LIMIT_SECONDS:
++            logger.info("ci run %s/%s queued %ss: runner %s is online and busy for %s, so the runners are saturated",
++                        repo, run_id, age, busy, ",".join(labels))
+             return Progress(BUSY, repo, run_id, labels, age,
+-                            detail=f"runner {name} is online for those labels; the runners are saturated")
++                            detail=f"runner {busy} is online and busy for those labels; the runners are saturated")
++        if busy is not None:
++            return Progress(NOT_STARTING, repo, run_id, labels, age, runners_readable=True, busy_runner=busy)
++        idle = _online_runner(runners, labels)
++        if idle is not None:
++            return Progress(NOT_STARTING, repo, run_id, labels, age, runners_readable=True, idle_runner=idle)
+     elif "self-hosted" in {x.lower() for x in labels}:
+         try:
+             took = _recent_job_on(repo, labels, (data or {}).get("jobs") or [], now, deadline)
+@@ -303,8 +338,16 @@ def _recent_job_on(repo: str, labels: list[str], jobs: list, now: float, deadlin
+ 
+ def describe(p: Progress) -> str:
+     labels = ",".join(p.labels) or "(none)"
+-    seen = ("no online runner has them" if p.runners_readable
+-            else "runner list unreadable, so they may be offline or saturated")
++    if p.idle_runner:
++        seen = (f"runner {p.idle_runner} is online and idle for them yet took no job: a stuck runner, or one in a "
++                "runner group this repo cannot use")
++    elif p.busy_runner:
++        seen = (f"runner {p.busy_runner} is online and busy for them, but the job waited past the "
++                f"{BUSY_LIMIT_SECONDS // 60} min busy cap: that runner may be in a group this repo cannot use")
++    elif p.runners_readable:
++        seen = "no online runner has them"
++    else:
++        seen = "runner list unreadable, so they may be offline or saturated"
+     return (f"CI run {p.run_id} queued {p.queued_seconds // 60} min: no runner picked it up in "
+             f"{QUEUED_LIMIT_SECONDS // 60} min (labels {labels}, {p.repo}; {seen}), so it may never start")
+ 
+@@ -389,7 +432,7 @@ def _others_behind(conn: sqlite3.Connection, task_id: str, bid: str) -> list[str
+     st = ksb.blocker_states(conn).get(bid)
+     if st is None or not st.is_open:
+         return []
+-    return sorted(t for t in st.behind if t != task_id and ksb._task_applies(conn, st, t))
++    return sorted(t for t in st.behind if t != task_id and ksb.task_applies(conn, st, t))
+ 
+ 
+ def apply(conn: sqlite3.Connection, task_id: str, ref: str, p: Progress) -> Optional[str]:
+@@ -521,6 +564,15 @@ def running_sweeps() -> int:
+         return sum(1 for fut in _SWEEPS.values() if not fut.done())
+ 
+ 
++def _sweep_due(db: str) -> bool:
++    """No sweep of ``db`` is running and ``SWEEP_EVERY_SECONDS`` passed since its last one. Call under ``_LOCK``."""
++    running = _SWEEPS.get(db)
++    if running is not None and not running.done():
++        return False
++    last = _LAST_SWEEP.get(db)
++    return last is None or time.monotonic() - last >= SWEEP_EVERY_SECONDS
++
++
+ def submit_sweep(conn: sqlite3.Connection, pool, *, slots_free: int = 1) -> Optional[Future]:
+     """Start one :func:`sweep` of this board on ``pool`` when the pool's probe budget has ``slots_free``, no sweep
+     of the board is running, ``SWEEP_EVERY_SECONDS`` passed since its last one and some scheduled card's latest park
+@@ -535,15 +587,13 @@ def submit_sweep(conn: sqlite3.Connection, pool, *, slots_free: int = 1) -> Opti
+             return None
+         home = str(get_hermes_home())
+         with _LOCK:
+-            running = _SWEEPS.get(db)
+-            if running is not None and not running.done():
+-                return None
+-            last = _LAST_SWEEP.get(db)
+-            if last is not None and time.monotonic() - last < SWEEP_EVERY_SECONDS:
++            if not _sweep_due(db):
+                 return None
+         if not _has_ci_wait(conn):
+             return None
+         with _LOCK:
++            if not _sweep_due(db):  # another tick on this board started one while _LOCK was released
++                return None
+             _LAST_SWEEP[db] = time.monotonic()
+             fut = pool.submit(_sweep_db, db, home)
+             _SWEEPS[db] = fut
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index c60a156d88..02718a758f 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -249,8 +249,10 @@ def task_route(conn, task_id) -> tuple[Optional[str], Optional[str], str]:
+         return None, None, lane
+ 
+ 
+-def _task_applies(conn, st: BlockerState, task_id: str) -> bool:
+-    """Whether the blocker holds this card's next/current step: unknown routing is conservative."""
++def task_applies(conn, st: BlockerState, task_id: str) -> bool:
++    """Whether the blocker holds this card's next/current step: unknown routing is conservative. The one rule for
++    which cards behind ``st`` count, shared by :func:`shared_blocker_guard`, :func:`probe_stranded_blockers` and the
++    CI sweep (``kanban_ci_progress``)."""
+     return not st.blocker_provider or _applies(st, task_route(conn, task_id)[1])
+ 
+ 
+@@ -446,9 +448,9 @@ def shared_blocker_guard(
+     now = int(time.time()) if now is None else int(now)
+     states = blocker_states(conn, now=now)
+     st = blocker_for_task(states, task_id)
+-    if st is None or not st.is_open or not _task_applies(conn, st, task_id):
++    if st is None or not st.is_open or not task_applies(conn, st, task_id):
+         return None
+-    others = [t for t in st.behind if t != task_id and _task_applies(conn, st, t)]
++    others = [t for t in st.behind if t != task_id and task_applies(conn, st, t)]
+     if others:
+         marks = ",".join("?" * len(others))
+         if conn.execute(
+@@ -477,13 +479,21 @@ def _released_as_probe(conn: sqlite3.Connection, st: BlockerState, task_id: str)
+     The newest release for ``st`` decides. One that names its asserting run (``after_run``) is spent only by a
+     later run of the card: ``probe_starts`` also holds runs from before a re-assertion (a card the sweep wakes a
+     second time for the same blocker ran in between, and the wake's own synthesized run is recorded too), so it
+-    cannot tell a fresh release from a spent one. A release without ``after_run`` falls back to ``probe_starts``.
++    cannot tell a fresh release from a spent one. A release without ``after_run`` (:func:`probe_stranded_blockers`,
++    older rows) falls back to ``probe_starts`` and also needs no re-assertion of ``st`` after it.
++
++    Before PR #2040 the guard ignored releases: a card :func:`probe_stranded_blockers` unblocked spawned only through
++    the probe interval below, so another card re-asserting ``st`` meanwhile (one that hit the wall after the
++    release) held it for another interval. Honouring a stranded release regardless would let it spawn right
++    behind that fresh evidence, a second probe in one interval; the re-assertion check keeps main's behaviour
++    there. With no re-assertion since, the release differs from the interval rule only when another card's probe
++    run started after it and ended without settling the wall (a crash): the released card may then run at once.
+     [daveey]"""
+     from hermes_cli import kanban_db as kb
+ 
+     asserted = st.behind[task_id]  # the guard only asks about a card behind st
+     for row in conn.execute(
+-        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? AND created_at >= ? "
++        "SELECT created_at, payload FROM task_events WHERE task_id = ? AND kind = ? AND created_at >= ? "
+         "ORDER BY id DESC LIMIT 20", (task_id, PROBE_RELEASED_EVENT, asserted),
+     ):
+         payload = kb._json_dict(row["payload"])
+@@ -493,7 +503,8 @@ def _released_as_probe(conn: sqlite3.Connection, st: BlockerState, task_id: str)
+         if type(after) is int:
+             return conn.execute("SELECT 1 FROM task_runs WHERE task_id = ? AND id > ? LIMIT 1",
+                                 (task_id, after)).fetchone() is None
+-        return task_id not in st.probe_starts
++        released = kb._to_epoch(row["created_at"]) or 0
++        return task_id not in st.probe_starts and st.asserted_at <= released
+     return False
+ 
+ 
+@@ -568,7 +579,7 @@ def probe_stranded_blockers(conn: sqlite3.Connection, *, now: Optional[int] = No
+     for st in blocker_states(conn, now=now).values():
+         if not st.is_open or not st.behind:
+             continue
+-        ids = sorted(t for t in st.behind if _task_applies(conn, st, t))
++        ids = sorted(t for t in st.behind if task_applies(conn, st, t))
+         if not ids:
+             continue
+         marks = ",".join("?" * len(ids))
+diff --git a/tests/hermes_cli/test_kanban_ci_progress.py b/tests/hermes_cli/test_kanban_ci_progress.py
+index a126e13729..f8eb4c6bf2 100644
+--- a/tests/hermes_cli/test_kanban_ci_progress.py
++++ b/tests/hermes_cli/test_kanban_ci_progress.py
+@@ -233,6 +233,7 @@ def test_readable_runner_list_without_a_matching_online_runner_refuses(kanban_ho
+                                                                        runner) -> None:
+     fake_gh.serve(age=20 * 60)
+     fake_gh.runners(runner)
++    fake_gh.runners(org=True)
+     with kbc.connect_closing() as conn:
+         tid = _running(conn)
+         _as_worker(monkeypatch, conn, tid)
+@@ -241,6 +242,70 @@ def test_readable_runner_list_without_a_matching_online_runner_refuses(kanban_ho
+         assert "no online runner has them" in out["error"], out
+ 
+ 
++@pytest.mark.parametrize("unread", ["org", "repo"])
++def test_one_unreadable_runner_list_never_claims_no_online_runner(kanban_home, fake_gh, monkeypatch,
++                                                                  unread) -> None:
++    """PR #2040 reviews 5889677459/5890809735: a repo served only by org runners, read with a token lacking org admin,
++    shows a readable but empty repo list. Nothing says its runners are offline, so the wording falls back; the wake
++    (and the park refusal) stay as they were."""
++    fake_gh.serve(age=2 * 60)
++    if unread == "org":
++        fake_gh.runners(_runner(status="offline"))       # repo list readable, no online match; org list 403
++    else:
++        fake_gh.runners(_runner(status="offline"), org=True)
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch)
++        fake_gh.serve(age=20 * 60)
++        p = kcp.ci_run_progress(RUN_URL)
++        assert p.state == kcp.NOT_STARTING and not p.runners_readable, p
++        assert fake_gh.calls("orgs/") >= 1
++        assert kcp.sweep(conn) == [tid]
++        notes = [c.body for c in kb.list_comments(conn, tid)]
++        assert "runner list unreadable, so they may be offline or saturated" in notes[-1], notes
++        assert "no online runner has them" not in notes[-1], notes
++
++
++def test_idle_online_runner_that_takes_no_job_wakes_the_card(kanban_home, fake_gh, monkeypatch) -> None:
++    """PR #2040 review 5891212407: only an online runner that is busy means saturated. One that sits idle while the
++    job waits 15 min is stuck, or in a runner group this repo cannot use."""
++    fake_gh.serve(age=2 * 60)
++    fake_gh.runners(_runner(busy=False))
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch)
++        fake_gh.serve(age=20 * 60)
++        assert kcp.sweep(conn) == [tid]
++        notes = [c.body for c in kb.list_comments(conn, tid)]
++        assert "runner ci-fast-3 is online and idle for them yet took no job" in notes[-1], notes
++
++
++@pytest.mark.parametrize("runners", [[_runner(busy=False), {**_runner(), "name": "ci-fast-4"}],
++                                     [{k: v for k, v in _runner().items() if k != "busy"}]],
++                         ids=["one-busy-among-idle", "no-busy-flag"])
++def test_any_busy_runner_reads_as_saturated(kanban_home, fake_gh, runners) -> None:
++    """Control: a runner between two jobs is briefly idle; a runner list without the flag keeps the old reading."""
++    fake_gh.serve(age=20 * 60)
++    fake_gh.runners(*runners)
++    assert kcp.ci_run_progress(RUN_URL).state == kcp.BUSY
++
++
++@pytest.mark.parametrize("age,state", [(kcp.BUSY_LIMIT_SECONDS - 60, kcp.BUSY),
++                                       (kcp.BUSY_LIMIT_SECONDS + 60, kcp.NOT_STARTING)],
++                         ids=["under-cap", "past-cap"])
++def test_busy_runners_hold_a_wake_back_only_up_to_the_cap(kanban_home, fake_gh, monkeypatch, age, state) -> None:
++    """PR #2040 review 5890809735: a busy org runner in a group this repo cannot use would hold the wake forever."""
++    fake_gh.serve(age=2 * 60)
++    fake_gh.runners(_runner(), org=True)
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch)
++        fake_gh.serve(age=age)
++        assert kcp.ci_run_progress(RUN_URL).state == state
++        assert kcp.sweep(conn) == ([tid] if state == kcp.NOT_STARTING else [])
++        if state == kcp.NOT_STARTING:
++            notes = [c.body for c in kb.list_comments(conn, tid)]
++            assert (f"runner ci-fast-3 is online and busy for them, but the job waited past the "
++                    f"{kcp.BUSY_LIMIT_SECONDS // 60} min busy cap") in notes[-1], notes
++
++
+ # --- while parked ---------------------------------------------------------------------------------------------
+ 
+ def test_parked_card_wakes_when_its_run_stops_starting(kanban_home, fake_gh, monkeypatch) -> None:
+@@ -352,6 +417,30 @@ def test_release_without_a_run_id_is_spent_by_any_probe_start(kanban_home) -> No
+         assert ksb.shared_blocker_guard(conn, tid) == ksb.GUARD_REASON
+ 
+ 
++def test_release_without_a_run_id_needs_no_re_assertion_after_it(kanban_home) -> None:
++    """PR #2040 review 5889677459: before #2040 the guard ignored ``probe_stranded_blockers`` releases, so another
++    card re-asserting the blocker after one held the released card for an interval. It still does."""
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="t", assignee="worker")
++        other = kb.create_task(conn, title="other", assignee="worker")
++        now = int(time.time())
++        with kb.write_txn(conn):
++            kb._synthesize_ended_run(conn, tid, outcome=kcp.CI_RUN_UNSTARTABLE, summary="no runner",
++                                     metadata={"blocker_id": BLOCKER})
++            conn.execute("UPDATE task_runs SET started_at = ?, ended_at = ? WHERE task_id = ?",
++                         (now - 300, now - 300, tid))
++            kb._append_event(conn, tid, ksb.PROBE_RELEASED_EVENT, {"blocker_id": BLOCKER})
++            conn.execute("UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = ?",
++                         (now - 200, tid, ksb.PROBE_RELEASED_EVENT))
++            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++        assert ksb.shared_blocker_guard(conn, tid, now=now) is None   # control: nothing re-asserted it since
++        with kb.write_txn(conn):  # another card hits the wall after the release
++            kb._synthesize_ended_run(conn, other, outcome=kcp.CI_RUN_UNSTARTABLE, summary="no runner",
++                                     metadata={"blocker_id": BLOCKER})
++        assert ksb.blocker_states(conn, now=now)[BLOCKER].asserted_at > now - 200
++        assert ksb.shared_blocker_guard(conn, tid, now=now) == ksb.GUARD_REASON
++
++
+ def test_scoped_blocker_card_on_another_provider_does_not_hold_the_woken_card(kanban_home, fake_gh,
+                                                                               monkeypatch) -> None:
+     """``_others_behind`` counts only the cards ``shared_blocker_guard`` counts (PR #2040 review)."""
+@@ -870,6 +959,42 @@ def test_no_second_sweep_of_a_board_while_one_runs(kanban_home, fake_gh, monkeyp
+         assert kcp.submit_sweep(conn, Pool()) is pending
+ 
+ 
++def test_two_racing_ticks_on_one_board_start_one_sweep(kanban_home, fake_gh, monkeypatch) -> None:
++    """PR #2040 review 5891212407: ``submit_sweep`` releases ``_LOCK`` around ``_has_ci_wait``; both ticks pass the
++    first check there, so the second locked block must check again."""
++    both_in = threading.Barrier(2, timeout=10)
++    real = kcp._has_ci_wait
++
++    def has_ci_wait(conn):
++        both_in.wait()
++        return real(conn)
++
++    class Pool:
++        submitted = 0
++
++        def submit(self, *_a):
++            Pool.submitted += 1
++            return Future()
++
++    fake_gh.serve(age=2 * 60)
++    with kbc.connect_closing() as conn:
++        _parked(conn, monkeypatch)
++    monkeypatch.setattr(kcp, "_has_ci_wait", has_ci_wait)
++    results: list = []
++
++    def tick() -> None:
++        with kbc.connect_closing() as conn:
++            results.append(kcp.submit_sweep(conn, Pool()))
++
++    threads = [threading.Thread(target=tick) for _ in range(2)]
++    for t in threads:
++        t.start()
++    for t in threads:
++        t.join(30)
++    assert len(results) == 2 and Pool.submitted == 1, results
++    assert sum(r is not None for r in results) == 1, results
++
++
+ def test_no_sweep_without_a_free_pool_slot(kanban_home, fake_gh, monkeypatch) -> None:
+     fake_gh.serve(age=2 * 60)
+     with kbc.connect_closing() as conn:
+@@ -962,6 +1087,16 @@ def test_unreadable_runners_and_no_recent_job_on_the_labels_is_not_starting(kanb
+     assert p.state == kcp.NOT_STARTING and not p.runners_readable, p
+ 
+ 
++def test_org_list_unreadable_without_a_repo_match_falls_back_to_recent_jobs(kanban_home, fake_gh) -> None:
++    """A readable repo list with no online match plus a 403 org list counts as unreadable, so the recent-jobs
++    evidence applies there too (not only when both lists 403)."""
++    fake_gh.serve(age=20 * 60)
++    fake_gh.runners(_runner(status="offline"))
++    fake_gh.recent("completed", 558, updated_age=60, jobs=[_taken(run_id=558, started_age=5 * 60)])
++    p = kcp.ci_run_progress(RUN_URL)
++    assert p.state == kcp.BUSY and "ci-fast-1 took job 5580" in p.detail, p
++
++
+ def test_github_hosted_labels_read_no_recent_runs(kanban_home, fake_gh) -> None:
+     queued = {"jobs": [{"id": 1, "status": "queued", "created_at": _iso(20 * 60), "labels": ["ubuntu-latest"],
+                         "runner_name": None}]}
+-- 
+2.43.0
+

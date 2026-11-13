@@ -1,0 +1,156 @@
+From f968ba533345a8f1c4f0583b6bc23002e24b644b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 05:42:55 -0800
+Subject: [PATCH] fix(desktop): kanban: resolve the '' board alias once per 30
+ s, not with a /boards read before every board read [daveey]
+
+Problem: laptop-1 Desktop logged 297 `/api/plugins/kanban/boards` timeouts
+in 30 min on 2026-11-13 (13:09-13:34Z), all on remote conns (hermes-hub
+20/30 s, mac-mini 6 s). They were paired 1:1 with `/board` reads, about 4
+pairs a second (desktop.log 05:26:47-05:26:50 PST).
+
+Why 1: the link was saturated. Hub loopback /api/health took 2 ms, but the
+  same call through the Desktop ssh tunnel took 4.4-6.5 s. The MBP downlink
+  measured 418 KB/s against Cloudflare, and the hub ssh `nc` had pulled
+  1.0 GB in 56 min.
+Why 2: each board refetch sent two hub reads. fetchBoard() awaits
+  resolvedSlug(), and with $boardSlug '' (the server-current alias) that
+  issued a full `/boards` read (per-board counts on every board) just to
+  learn `current`, serially before the `/board` read.
+Why 3: board refetches run on every events-socket frame, every poll and
+  every React Query retry, and resolvedSlug had no cache or in-flight
+  dedupe. N concurrent refetches meant N `/boards` reads.
+Root (happened): the server-current alias was resolved per call instead of
+  being cached like every other board-list read (boardsKey has a 30 s
+  staleTime).
+Root (not caught): the gateway tests asserted only which slug the remote
+  read used, never how many routed `/boards` reads a run of refetches
+  costs.
+
+Fix: resolvedSlug() goes through queryClient.fetchQuery under
+['kanban', 'current-board', <routed scope>] with a 30 s staleTime and
+retry false. Concurrent callers share one read. A failed read returns the
+last known slug, so the remote gateways keep showing the same board.
+
+Tests (api.gateways.test.ts):
+- three concurrent fetchBoard calls plus one more make exactly 1 `/boards`
+  read, and the next read comes after 30 s. RED before: 4 reads.
+- a failed `/boards` read keeps `board=work` on the remote read. RED
+  before: unscoped `/board`.
+
+Link saturation from `/board` payload volume is owned by sibling card
+t_01a1d51dd4d1f0d9.
+---
+ .../src/plugins/kanban/api.gateways.test.ts   | 50 +++++++++++++++++++
+ apps/desktop/src/plugins/kanban/api.ts        | 25 ++++++++--
+ 2 files changed, 71 insertions(+), 4 deletions(-)
+
+diff --git a/apps/desktop/src/plugins/kanban/api.gateways.test.ts b/apps/desktop/src/plugins/kanban/api.gateways.test.ts
+index 5aa5a93705..41f68c1728 100644
+--- a/apps/desktop/src/plugins/kanban/api.gateways.test.ts
++++ b/apps/desktop/src/plugins/kanban/api.gateways.test.ts
+@@ -390,6 +390,56 @@ describe('gateway routing', () => {
+     ])
+   })
+ 
++  // [daveey] Every board refetch (socket frame, poll, retry) used to read the
++  // routed gateway's full `/boards` list (per-board counts) first, only to learn
++  // `current`. On a slow link that doubled the hub reads: 297 `/boards`
++  // timeouts in 30 min on 2026-11-13, paired 1:1 with `/board` reads.
++  it("reads the routed gateway's /boards once for the '' alias, not before every board read", async () => {
++    registry('local', 'mini')
++    await bind(call =>
++      call.path === '/boards' ? { boards: [{ slug: 'work' }], current: 'work' } : board({ ready: [] })
++    )
++
++    vi.useFakeTimers()
++    await Promise.all([fetchBoard(false), fetchBoard(false), fetchBoard(true)])
++    await fetchBoard(false)
++
++    expect(calls.filter(c => c.path === '/boards')).toHaveLength(1)
++    // Every remote read still names the routed gateway's current board.
++    expect(
++      calls.filter(c => c.opts?.connectionId === 'mini' && c.path.startsWith('/board?')).every(c =>
++        c.path.includes('board=work')
++      )
++    ).toBe(true)
++
++    // Past the boards list's own freshness window it is read again.
++    await vi.advanceTimersByTimeAsync(31_000)
++    await fetchBoard(false)
++    expect(calls.filter(c => c.path === '/boards')).toHaveLength(2)
++  })
++
++  it("keeps the last known current board when the routed /boards read fails, and retries it next time", async () => {
++    registry('local', 'mini')
++    let down = false
++    await bind(call => {
++      if (call.path === '/boards') {
++        return down ? new Error('Timed out connecting to Hermes backend after 20000ms') : { boards: [], current: 'work' }
++      }
++
++      return board({ ready: [] })
++    })
++
++    vi.useFakeTimers()
++    await fetchBoard(false)
++    await vi.advanceTimersByTimeAsync(31_000)
++    down = true
++    calls = []
++    await fetchBoard(false)
++
++    expect(calls.filter(c => c.path === '/boards')).toHaveLength(1)
++    expect(calls).toContainEqual(expect.objectContaining({ path: '/board?board=work', opts: expect.objectContaining({ connectionId: 'mini' }) }))
++  })
++
+   it('does not let a hung gateway stall the board, and cools it down', async () => {
+     registry('local', 'cloud')
+     await bind(call =>
+diff --git a/apps/desktop/src/plugins/kanban/api.ts b/apps/desktop/src/plugins/kanban/api.ts
+index d38a0bfe74..49a1540e7f 100644
+--- a/apps/desktop/src/plugins/kanban/api.ts
++++ b/apps/desktop/src/plugins/kanban/api.ts
+@@ -441,6 +441,9 @@ export const logKey = (scope: string, slug: string, id: string, owner?: TaskOwne
+   owner ? ['kanban', 'log', owner.gateway, owner.board, id, owner.profile] as const
+     : ['kanban', 'log', scope, slug, id] as const
+ export const boardsKey = (scope: string) => ['kanban', 'boards', scope] as const
++/** [daveey] The routed gateway's server-current board slug (the '' alias), see resolvedSlug. */
++const currentBoardKey = (scope: string) => ['kanban', 'current-board', scope] as const
++const CURRENT_BOARD_STALE_MS = 30_000
+ export const profilesKey = (scope: string, owner?: TaskOwner) =>
+   owner ? ['kanban', 'profiles', owner.gateway, owner.profile] as const : ['kanban', 'profiles', scope] as const
+ export const projectsKey = (scope: string) => ['kanban', 'projects', scope] as const
+@@ -612,12 +615,26 @@ async function resolvedSlug(): Promise<string> {
+     return slug
+   }
+ 
+-  try {
+-    const boards = await call<BoardsResponse>('/boards')
++  // [daveey] Every board refetch (socket frame, poll, retry) lands here, so the
++  // answer is cached per routed scope for CURRENT_BOARD_STALE_MS and concurrent
++  // callers share one in-flight read. Re-reading the full `/boards` list (per-board
++  // counts) before each board read doubled the routed gateway's traffic: 297 `/boards`
++  // timeouts in 30 min on a slow link, 2026-11-13. A failed read keeps the last answer.
++  const queryKey = currentBoardKey(routedScope())
+ 
+-    return typeof boards.current === 'string' ? boards.current : ''
++  try {
++    return await queryClient.fetchQuery({
++      queryFn: async () => {
++        const boards = await call<BoardsResponse>('/boards')
++
++        return typeof boards.current === 'string' ? boards.current : ''
++      },
++      queryKey,
++      retry: false,
++      staleTime: CURRENT_BOARD_STALE_MS
++    })
+   } catch {
+-    return ''
++    return queryClient.getQueryData<string>(queryKey) ?? ''
+   }
+ }
+ 
+-- 
+2.43.0
+

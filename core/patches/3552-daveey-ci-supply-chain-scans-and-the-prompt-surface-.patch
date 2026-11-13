@@ -1,0 +1,207 @@
+From 23dc82432d121d750f02215526969a81f78ce198 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:53:16 +0000
+Subject: [PATCH] [daveey] ci: supply-chain scans and the prompt-surface base
+ snapshot fail when git cannot read the PR
+
+scan_supply_chain.pr_diff ran `git diff --no-renames <base>...<head>` with
+check=False and returned its stdout even when git failed. In a missing-object
+state (a partial clone whose promisor config was dropped, a fetch race, a bad
+SHA) git dies with `fatal: unable to read tree ...` (rc 128) and prints
+nothing, so "Scan diff for critical supply-chain patterns" and "Check for
+unbounded PyPI deps", both blocking guards in repo-guards.yml, scanned an
+empty diff and passed.
+
+pr_diff now raises DiffUnavailable on a non-zero git exit, carrying git's
+stderr. Each subcommand turns that into an `::error::` and exit 2 and writes
+no `found=`, so the step fails and no verdict is published for a diff that was
+never read. An empty diff (the PR changes nothing under the pathspec) still
+passes with found=false.
+
+pr_diff_report.extract_base_snapshot had the same shape: a failing
+`git cat-file -e <base>:<snapshot>` read as "the base has no snapshot", and git
+fails that way for a missing tree too ("exists on disk, but not in <base>",
+rc 128 in both cases). `git rev-parse --verify <base>^{tree}` does not help: it
+succeeds while a subtree is missing. It now runs `git ls-tree --full-tree
+<base> -- <snapshot>` with check=True: empty output with rc 0 means the base
+has no snapshot; an unreadable tree or a bad SHA exits non-zero and fails the
+step (main() already returns the CalledProcessError's code).
+
+Tests (tests/ci/test_repo_guard_checks.py), red on main (5 failed) and green
+here (25 passed):
+- both scans exit 2 with the git error and write no found= for a nonexistent
+  base SHA and for a base whose root tree object was deleted;
+- both scans still pass a PR that changes nothing (found=false);
+- extract_base_snapshot leaves a base without the snapshot absent, extracts a
+  present one, and raises for a base whose `tests` tree is unreadable and for
+  a nonexistent SHA.
+
+Found reviewing PR #2268 (pullrequestreview-5892080085). Kanban t_01a1d52974b1fa20.
+---
+ scripts/ci/pr_diff_report.py       | 15 +++++---
+ scripts/ci/scan_supply_chain.py    | 35 +++++++++++++-----
+ tests/ci/test_repo_guard_checks.py | 58 ++++++++++++++++++++++++++++++
+ 3 files changed, 95 insertions(+), 13 deletions(-)
+
+diff --git a/scripts/ci/pr_diff_report.py b/scripts/ci/pr_diff_report.py
+index e6ce77b46d..c1435f2484 100755
+--- a/scripts/ci/pr_diff_report.py
++++ b/scripts/ci/pr_diff_report.py
+@@ -36,12 +36,17 @@ def merge_base() -> str:
+ 
+ 
+ def extract_base_snapshot(base_sha: str, destination: Path) -> None:
+-    """Extract the snapshot as committed at the merge base; a base without one leaves it absent."""
++    """Extract the snapshot as committed at the merge base; a base without one leaves it absent.
++
++    ``git ls-tree`` prints nothing and exits 0 for a path the base lacks, but exits non-zero when
++    it cannot read the base's trees (a missing object, a bad SHA). ``cat-file -e <base>:<path>``
++    fails the same way in both cases, so it would read a missing object as "no snapshot".
++    """
+     destination.mkdir(parents=True, exist_ok=True)
+-    present = subprocess.run(("git", "cat-file", "-e", f"{base_sha}:{PROMPT_SURFACE_SNAPSHOT}"),
+-                             stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+-                             timeout=GIT_TIMEOUT, check=False)
+-    if present.returncode != 0:
++    listing = subprocess.run(("git", "ls-tree", "--full-tree", base_sha, "--", PROMPT_SURFACE_SNAPSHOT),
++                             stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
++                             timeout=GIT_TIMEOUT, check=True).stdout
++    if not listing.strip():
+         return
+     archive = subprocess.run(("git", "archive", base_sha, PROMPT_SURFACE_SNAPSHOT),
+                              stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
+diff --git a/scripts/ci/scan_supply_chain.py b/scripts/ci/scan_supply_chain.py
+index 30c1f1bc1e..66cfc0cf65 100755
+--- a/scripts/ci/scan_supply_chain.py
++++ b/scripts/ci/scan_supply_chain.py
+@@ -15,6 +15,8 @@ on nearly every PR and trained reviewers to ignore the scanner; keep it ruthless
+ Both diff base...head, from the merge base, so only changes this PR introduces are judged, not
+ changes that landed on main after the PR branched off. An added line that the same diff also
+ removes from a file of the same name is a moved line and is not judged; see ``numbered_added_lines``.
++When git cannot produce the diff, the subcommand exits 2 with an ``::error::`` and writes no
++``found=``: an unread diff never passes as a clean one.
+ """
+ 
+ from __future__ import annotations
+@@ -64,11 +66,23 @@ INDICATORS = (
+ UNBOUNDED_DEP = re.compile(r'"[a-zA-Z0-9_-]+(?:\[[^\\]\]*\])?>=[ 0-9.]+"')
+ 
+ 
++class DiffUnavailable(Exception):
++    """git could not produce the PR's diff, which is not the same as an empty diff."""
++
++
+ def pr_diff(*pathspec: str) -> str:
+-    """Three-dot diff of the PR; a git failure yields an empty diff, as ``|| true`` did."""
++    """Three-dot diff of the PR; raises ``DiffUnavailable`` when git exits non-zero.
++
++    An empty string means the PR changes nothing under ``pathspec``. A git failure (a bad SHA, a
++    tree missing from a partial clone) prints nothing on stdout too, so treating it as empty would
++    let the blocking guards pass on a diff that was never read.
++    """
+     commits = f"{os.environ['_HERMES_PR_BASE_SHA']}...{os.environ['_HERMES_PR_HEAD_SHA']}"
+-    result = subprocess.run(("git", "diff", "--no-renames", commits, "--", *pathspec), stdout=subprocess.PIPE,
++    result = subprocess.run(("git", "diff", "--no-renames", commits, "--", *pathspec), capture_output=True,
+                             stdin=subprocess.DEVNULL, timeout=300, check=False)
++    if result.returncode != 0:
++        stderr = result.stderr.decode("utf-8", "replace").strip()
++        raise DiffUnavailable(f"git diff {commits} exited {result.returncode}: {stderr or '(no stderr)'}")
+     return result.stdout.decode("utf-8", "surrogateescape")
+ 
+ 
+@@ -130,12 +144,17 @@ def main(argv: list[str] | None = None) -> int:
+     parser = argparse.ArgumentParser(description="Scan a PR diff for supply-chain risks.")
+     parser.add_argument("scan", choices=("patterns", "dependency-bounds"))
+     args = parser.parse_args(argv)
+-    if args.scan == "patterns":
+-        report = critical_findings(pr_diff(".", *LOCKFILE_EXCLUDES))
+-        report_name = "supply-chain-findings.md"
+-    else:
+-        report = "\n".join(unbounded_dependencies(pr_diff("pyproject.toml")))
+-        report_name = "supply-chain-unbounded.txt"
++    try:
++        if args.scan == "patterns":
++            report = critical_findings(pr_diff(".", *LOCKFILE_EXCLUDES))
++            report_name = "supply-chain-findings.md"
++        else:
++            report = "\n".join(unbounded_dependencies(pr_diff("pyproject.toml")))
++            report_name = "supply-chain-unbounded.txt"
++    except DiffUnavailable as exc:
++        # No found= output: the step fails, and a scan that never read the diff publishes no verdict.
++        print(f"::error::Could not diff this PR, so the {args.scan} scan did not run: {exc}", flush=True)
++        return 2
+     _set_found(bool(report))
+     if report:
+         _write_report(report_name, report)
+diff --git a/tests/ci/test_repo_guard_checks.py b/tests/ci/test_repo_guard_checks.py
+index 07b8d6b642..b797757ef8 100644
+--- a/tests/ci/test_repo_guard_checks.py
++++ b/tests/ci/test_repo_guard_checks.py
+@@ -214,6 +214,64 @@ def test_dependency_bounds_report_lists_only_floor_only_specs(repo, step):
+     assert report == '"loose>=2.1"\n'
+ 
+ 
++def _drop_object(repo: Path, rev: str) -> None:
++    """Delete ``rev``'s loose object, as a partial clone that lost its promisor would lack it."""
++    sha = git(repo, "rev-parse", rev).strip()
++    (repo / ".git" / "objects" / sha[:2] / sha[2:]).unlink()
++
++
++@pytest.mark.parametrize("scan", ["patterns", "dependency-bounds"])
++@pytest.mark.parametrize("broken", ["nonexistent base", "unreadable base tree"])
++def test_supply_chain_scans_fail_when_git_cannot_diff_the_pr(repo, step, scan, broken):
++    base = commit(repo, {"pyproject.toml": 'deps = ["old>=1,<2"]\n', "pkg/a.py": "x = 1\n"})
++    head = commit(repo, {"pyproject.toml": 'deps = ["loose>=2"]\n', "pkg/a.py": "x = 2\n"})
++    if broken == "nonexistent base":
++        base = "0" * 40
++    else:
++        _drop_object(repo, f"{base}^{{tree}}")
++    failed = step.run(repo, "scan_supply_chain.py", scan, _HERMES_PR_BASE_SHA=base,
++                      _HERMES_PR_HEAD_SHA=head)
++    assert failed.returncode == 2, failed.stdout + failed.stderr
++    assert f"::error::Could not diff this PR, so the {scan} scan did not run: git diff {base}...{head} exited 128" \
++        in failed.stdout
++    assert "fatal:" in failed.stdout
++    assert "found" not in step.outputs()
++
++
++@pytest.mark.parametrize("scan", ["patterns", "dependency-bounds"])
++def test_supply_chain_scans_pass_a_pr_that_changes_nothing(repo, step, scan):
++    head = git(repo, "rev-parse", "HEAD").strip()
++    passed = step.run(repo, "scan_supply_chain.py", scan, _HERMES_PR_BASE_SHA=head, _HERMES_PR_HEAD_SHA=head)
++    assert passed.returncode == 0, passed.stdout + passed.stderr
++    assert step.outputs()["found"] == "false"
++
++
++def _pr_diff_report(monkeypatch, repo: Path):
++    monkeypatch.chdir(repo)
++    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
++    monkeypatch.syspath_prepend(str(SCRIPTS))
++    import pr_diff_report
++    return pr_diff_report
++
++
++def test_base_snapshot_extraction_tells_a_missing_snapshot_from_an_unreadable_base(repo, tmp_path, monkeypatch):
++    report = _pr_diff_report(monkeypatch, repo)
++    snapshot = report.PROMPT_SURFACE_SNAPSHOT
++    without = git(repo, "rev-parse", "HEAD").strip()
++    report.extract_base_snapshot(without, tmp_path / "none")
++    assert not (tmp_path / "none" / snapshot).exists()
++
++    with_snapshot = commit(repo, {f"{snapshot}/tool.json": "{}\n"})
++    report.extract_base_snapshot(with_snapshot, tmp_path / "some")
++    assert (tmp_path / "some" / snapshot / "tool.json").read_text(encoding="utf-8") == "{}\n"
++
++    _drop_object(repo, f"{with_snapshot}:tests")
++    with pytest.raises(subprocess.CalledProcessError):
++        report.extract_base_snapshot(with_snapshot, tmp_path / "unreadable")
++    with pytest.raises(subprocess.CalledProcessError):
++        report.extract_base_snapshot("0" * 40, tmp_path / "bad-sha")
++
++
+ def test_emit_publishes_the_report_only_when_the_flag_is_true(repo, step):
+     (step.runner_temp / "supply-chain-unbounded.txt").write_text('"loose>=2.1"\n', encoding="utf-8")
+     step.run(repo, "review_status.py", "emit", "dependency-bounds", FOUND="false")
+-- 
+2.43.0
+

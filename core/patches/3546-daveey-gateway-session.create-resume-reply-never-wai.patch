@@ -1,0 +1,494 @@
+From e44fffc1b31f07dcefdd2177c7b3e12578ae0df6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:12:32 +0000
+Subject: [PATCH] [daveey] gateway: session.create/resume reply never waits on
+ the banner inventory past 2 s
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Why: on the mini (Nov 13 02:44 PST) one canonical session.create took 84 s from ws accept to
+reply against the client's 30 s RPC budget (hermes_cli/gateway_client.py DEFAULT_RPC_TIMEOUT).
+AuthorityConnection.resume awaited snapshot_info -> session_inventory (every tool check_fn, the
+xai credential pool ~7 s alone, the skills walk, MCP status, git, update check) under GIL load
+before answering, so the client gave up and every retry paid the full cost again. The legacy
+tui_gateway create already replied lazily; the authority path did not.
+
+Fix (gateway/session_local_inventory.reply_info, used by resume and thus create):
+- The reply waits at most REPLY_INVENTORY_BUDGET_S (2 s) for the inventory. Past it, the reply
+  carries the lazy shape (tools {}, skills {}, mcp_servers [], inventory_pending: true) and the
+  build keeps running; when it finishes the session publishes the full info as a session.info
+  event (inventory_pending: false), merged with a fresh local_session_info so a turn started
+  meanwhile is not reported idle.
+- --oneshot / --source tool sessions (no banner, no status bar) skip the inventory entirely.
+- Concurrent opens of one session (a second viewer, a client retry) share one in-flight build.
+- session.info RPC (explicit ask) still returns the full inventory, unbounded.
+- Contract: SessionInventoryFields.inventory_pending (regenerated TS/OpenRPC).
+- Classic CLI: banner_inventory() returns None while inventory_pending, so it shows the compact
+  banner instead of a full banner listing zero tools. Ink already renders "…" for lazy+empty and
+  replaces info on session.info.
+
+Proof:
+- RED on base bc4eee92f1: test_create_reply_does_not_wait_on_a_60s_inventory_and_info_follows
+  fails "session.create reply took 60.2s behind the inventory".
+- GREEN: tests/gateway/test_session_create_inventory_budget.py (5 tests: 60 s inventory -> reply
+  < 3 s and one late session.info; oneshot/tool never build; fast inventory rides the reply with no
+  event; concurrent opens share one build) plus 53 files / 530 tests importing the touched modules
+  and tests/hermes_cli/test_gateway_session_store.py (57) pass; scripts/check --base origin/main ok.
+---
+ apps/shared/src/gateway-contract.generated.ts |   2 +
+ apps/shared/src/gateway-contract.openrpc.json |  24 +++
+ gateway/session_controls.py                   |   5 +-
+ gateway/session_local_inventory.py            |  97 +++++++++++-
+ hermes_cli/gateway_session_store.py           |   4 +-
+ .../test_canonical_session_inventory.py       |   6 +
+ .../test_session_create_inventory_budget.py   | 142 ++++++++++++++++++
+ .../hermes_cli/test_gateway_session_store.py  |  11 ++
+ tui_gateway/contracts/canonical.py            |   4 +
+ 9 files changed, 285 insertions(+), 10 deletions(-)
+ create mode 100644 tests/gateway/test_session_create_inventory_budget.py
+
+diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
+index 349dfeae5a..7cedd60bc6 100644
+--- a/apps/shared/src/gateway-contract.generated.ts
++++ b/apps/shared/src/gateway-contract.generated.ts
+@@ -4986,6 +4986,7 @@ export interface CanonicalSessionInfo {
+   tool_availability_warnings?: string[] | null
+   unknown_toolsets?: string[] | null
+   usage?: Usage | null
++  inventory_pending?: boolean | null
+   source: string
+   model?: string | null
+   lazy: boolean
+@@ -5358,6 +5359,7 @@ export interface CanonicalSnapshotInfo {
+   tool_availability_warnings?: string[] | null
+   unknown_toolsets?: string[] | null
+   usage?: Usage | null
++  inventory_pending?: boolean | null
+   desktop_protocol: 'hermes-gateway-v1'
+   source?: string | null
+   model?: string | null
+diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
+index 447eadd8c6..3ca451885c 100644
+--- a/apps/shared/src/gateway-contract.openrpc.json
++++ b/apps/shared/src/gateway-contract.openrpc.json
+@@ -10623,6 +10623,18 @@
+             ],
+             "default": null
+           },
++          "inventory_pending": {
++            "anyOf": [
++              {
++                "type": "boolean"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Inventory Pending"
++          },
+           "source": {
+             "title": "Source",
+             "type": "string"
+@@ -11507,6 +11519,18 @@
+             ],
+             "default": null
+           },
++          "inventory_pending": {
++            "anyOf": [
++              {
++                "type": "boolean"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Inventory Pending"
++          },
+           "desktop_protocol": {
+             "const": "hermes-gateway-v1",
+             "title": "Desktop Protocol",
+diff --git a/gateway/session_controls.py b/gateway/session_controls.py
+index 211a2292de..59212ebbd9 100644
+--- a/gateway/session_controls.py
++++ b/gateway/session_controls.py
+@@ -638,7 +638,7 @@ class AuthorityConnection:
+                 'scope': 'live'}
+ 
+     async def resume(self, ref, params):
+-        from gateway.session_local_inventory import snapshot_info
++        from gateway.session_local_inventory import reply_info
+         replay_from = self.replay_cursors.pop(ref.session_id, None)
+         reconnect = ref.session_id in self.reconnects
+         self.reconnects.discard(ref.session_id)
+@@ -724,7 +724,8 @@ class AuthorityConnection:
+                 await asyncio.to_thread(refresh_profile_hooks, policy)
+                 if opening is not None:
+                     opening.fire(policy, live.route)
+-                info = await snapshot_info(self.authority, snapshot.handle.ref)
++                # Bounded: a slow inventory follows as a ``session.info`` event, never delays the reply.
++                info = await reply_info(self.authority, snapshot.handle.ref)
+         finally:
+             if opening is not None:  # not fired (a refusal, a messaging lane, a history mount): nothing waits
+                 opening.release()
+diff --git a/gateway/session_local_inventory.py b/gateway/session_local_inventory.py
+index b1e8f66e35..72a9d30ce3 100644
+--- a/gateway/session_local_inventory.py
++++ b/gateway/session_local_inventory.py
+@@ -14,6 +14,7 @@ from __future__ import annotations
+ import asyncio
+ import contextlib
+ import logging
++from types import SimpleNamespace
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -189,23 +190,105 @@ def session_inventory(authority, policy, agent, cwd):
+     return info
+ 
+ 
+-async def snapshot_info(authority, ref):
+-    """``local_session_info`` plus main's inventory, the builders run off the owner loop."""
+-    from gateway.session_local import local_session_info
++async def _inventory_parts(authority, ref, cwd):
++    """The slow half of :func:`snapshot_info`: the inventory and usage, both off the owner loop."""
+     from gateway.session_policy import policy_for_source
+-    info = local_session_info(authority, ref)
++    from gateway.session_usage import snapshot_usage
+     policy = policy_for_source(authority.runner, authority.sessions[ref.session_id].source)
+     agent = authority.agent(ref)
+-    inventory = await asyncio.to_thread(session_inventory, authority, policy, agent, info.get("cwd"))
++    inventory = await asyncio.to_thread(session_inventory, authority, policy, agent, cwd)
++    usage = await asyncio.to_thread(snapshot_usage, authority, ref, agent)
++    return inventory, usage
++
++
++def _compose(info, inventory, usage):
+     if info.get('tool_count') is None:
+         # A lazy session: the tools its first turn loads (the banner's own count).
+         info['tool_count'] = sum(len(names) for names in (inventory.get('tools') or {}).values())
+-    from gateway.session_usage import snapshot_usage
+-    if (usage := await asyncio.to_thread(snapshot_usage, authority, ref, agent)) is not None:
++    if usage is not None:
+         info['usage'] = usage
+     return {**inventory, **info}
+ 
+ 
++async def snapshot_info(authority, ref):
++    """``local_session_info`` plus main's inventory, the builders run off the owner loop."""
++    from gateway.session_local import local_session_info
++    info = local_session_info(authority, ref)
++    inventory, usage = await _inventory_parts(authority, ref, info.get("cwd"))
++    return _compose(info, inventory, usage)
++
++
++# How long a create/resume reply waits for the inventory. Its builders probe every tool's
++# ``check_fn``, walk the skills tree and run git; under GIL load that took 50-84 s on the mini, past
++# the client's 30 s RPC budget, and every retry paid it again. Past this budget the reply carries
++# the lazy shape and the full inventory follows as a ``session.info`` event.
++REPLY_INVENTORY_BUDGET_S = 2.0
++# Creation labels whose clients never render a banner or status bar (``--oneshot``, ``--source
++# tool``): their reply skips the inventory outright, so a loaded gateway spends nothing on it.
++NO_BANNER_SOURCES = frozenset({'oneshot', 'tool'})
++_pending: dict = {}  # (authority id, session id) -> in-flight inventory task, shared by concurrent opens
++
++
++def _pending_shape(info):
++    """The reply before the inventory is known: main's lazy create shape (``tools: {}``)."""
++    return {'tools': {}, 'skills': {}, 'mcp_servers': [], **info, 'inventory_pending': True}
++
++
++async def reply_info(authority, ref, *, budget=None):
++    """``snapshot_info`` for a create / resume reply, bounded by *budget* seconds.
++
++    A no-banner source gets the pending shape at once and nothing is computed. Otherwise, when the
++    inventory is not ready within the budget, the reply gets the pending shape and the inventory
++    keeps building; when it finishes, the session publishes the full info as ``session.info``
++    (fresh ``local_session_info`` merged at publish time, so a turn started meanwhile is not
++    reported idle). Concurrent opens of one session share one build."""
++    from gateway.session_local import local_session_info
++    from gateway.session_policy import policy_for_source
++    info = local_session_info(authority, ref)
++    policy = policy_for_source(authority.runner, authority.sessions[ref.session_id].source)
++    if policy is not None and policy.source in NO_BANNER_SOURCES and authority.agent(ref) is None:
++        return _pending_shape(info)
++    key = (id(authority), ref.session_id)
++    entry = _pending.get(key)
++    if entry is None:
++        entry = _pending[key] = SimpleNamespace(
++            task=asyncio.ensure_future(_inventory_parts(authority, ref, info.get("cwd"))), deferred=False)
++        entry.task.add_done_callback(lambda task: _settle(authority, ref, key, entry))
++    task, carried = entry.task, False
++    try:
++        await asyncio.wait({task}, timeout=REPLY_INVENTORY_BUDGET_S if budget is None else budget)
++        # ``done()``, not the wait's done set: a build that finished in the timeout's own loop pass
++        # has not run ``_settle`` yet (done callbacks run on a later pass), so this reply carries it.
++        if task.done() and not task.cancelled() and task.exception() is None:
++            carried = True
++            return _compose(info, *task.result())
++    finally:
++        if not carried and not task.done():
++            entry.deferred = True  # some viewer got the pending shape: publish when it finishes
++    if task.done() and not task.cancelled():
++        logger.warning("session inventory failed for %s", ref.session_id, exc_info=task.exception())
++    return _pending_shape(info)
++
++
++def _settle(authority, ref, key, entry):
++    """Publish a late inventory to the session's viewers when some reply went out without it."""
++    if _pending.get(key) is entry:
++        del _pending[key]
++    task = entry.task
++    if task.cancelled() or not entry.deferred:
++        return
++    if (error := task.exception()) is not None:
++        logger.warning("session inventory failed for %s", ref.session_id, exc_info=error)
++        return
++    try:
++        from gateway.session_local import local_session_info
++        live = authority.sessions[ref.session_id]
++        payload = {**_compose(local_session_info(authority, ref), *task.result()), 'inventory_pending': False}
++        live.event_stream.publish(ref.session_id, payload, event_type='session.info')
++    except Exception:  # health: allow BLE001 -- a closed session or a failed publish leaves the lazy banner
++        logger.debug("late session inventory publish failed for %s", ref.session_id, exc_info=True)
++
++
+ def agent_inventory(agent) -> dict:
+     """The banner fields only a built agent knows (main's ``_session_info`` read them off it): the
+     tools it loaded, its cached system prompt (the ``▸ System Prompt`` row), provider and context
+diff --git a/hermes_cli/gateway_session_store.py b/hermes_cli/gateway_session_store.py
+index 05dad142c9..d3f51d875e 100644
+--- a/hermes_cli/gateway_session_store.py
++++ b/hermes_cli/gateway_session_store.py
+@@ -381,7 +381,9 @@ class GatewaySessionStore:
+         """The current session snapshot's banner fields (``gateway/session_local_inventory``), as
+         ``build_welcome_banner`` kwargs; None until a session is open."""
+         info = (self.current or {}).get("info") or {}
+-        if "tools" not in info:
++        # ``inventory_pending``: a loaded gateway answered before its inventory was built; a banner of
++        # empty tools would misreport the session, so the compact banner shows instead.
++        if "tools" not in info or info.get("inventory_pending"):
+             return None
+         grouped = info.get("tools") or {}
+         toolset_of = {name: toolset for toolset, names in grouped.items() for name in names or []}
+diff --git a/tests/gateway/test_canonical_session_inventory.py b/tests/gateway/test_canonical_session_inventory.py
+index 9cb148d525..ee8ae056a9 100644
+--- a/tests/gateway/test_canonical_session_inventory.py
++++ b/tests/gateway/test_canonical_session_inventory.py
+@@ -39,6 +39,8 @@ async def test_created_session_snapshot_carries_inventory_for_frozen_toolsets(tm
+     monkeypatch.setenv('HERMES_HOME', str(home))
+     monkeypatch.setattr(run, '_hermes_home', home)
+     monkeypatch.setattr(banner, '_available_skills_cache', None)
++    # These assert the reply's inventory itself; a cold-import CI runner must not race the reply budget.
++    monkeypatch.setattr('gateway.session_local_inventory.REPLY_INVENTORY_BUDGET_S', 120.0)
+     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
+     runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False,
+                              _cached_agent_for=lambda route: None)
+@@ -95,6 +97,8 @@ async def test_cli_surface_snapshot_carries_main_cli_toolsets_and_startup_warnin
+     monkeypatch.setenv('HERMES_HOME', str(home))
+     monkeypatch.setattr(run, '_hermes_home', home)
+     monkeypatch.setattr(banner, '_available_skills_cache', None)
++    # These assert the reply's inventory itself; a cold-import CI runner must not race the reply budget.
++    monkeypatch.setattr('gateway.session_local_inventory.REPLY_INVENTORY_BUDGET_S', 120.0)
+     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
+     runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False,
+                              _cached_agent_for=lambda route: None)
+@@ -141,6 +145,8 @@ async def test_cli_surface_counts_kanban_skills_like_main_cli_without_leaking(tm
+     monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
+     monkeypatch.setattr(run, '_hermes_home', home)
+     monkeypatch.setattr(banner, '_available_skills_cache', None)
++    # These assert the reply's inventory itself; a cold-import CI runner must not race the reply budget.
++    monkeypatch.setattr('gateway.session_local_inventory.REPLY_INVENTORY_BUDGET_S', 120.0)
+     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
+     runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False,
+                              _cached_agent_for=lambda route: None)
+diff --git a/tests/gateway/test_session_create_inventory_budget.py b/tests/gateway/test_session_create_inventory_budget.py
+new file mode 100644
+index 0000000000..0bdf40d4bf
+--- /dev/null
++++ b/tests/gateway/test_session_create_inventory_budget.py
+@@ -0,0 +1,142 @@
++"""A ``session.create`` reply never waits on the banner inventory past its budget.
++
++On the mini (Nov 13) one canonical ``session.create`` took 84 s from ws accept to reply: the
++authority's resume awaited ``session_inventory`` (every tool ``check_fn``, the skills walk, MCP
++status, git) under GIL load, past the client's 30 s RPC budget, and every retry paid it again. The
++reply now carries the lazy shape once the budget passes, and the full inventory follows as a
++``session.info`` event; ``--oneshot`` / ``--source tool`` replies never build it at all."""
++import asyncio
++import threading
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from tests.waiting import async_wait_until
++
++
++async def _gateway(tmp_path, monkeypatch):
++    from gateway import run
++    from gateway.config import GatewayConfig
++    from gateway.session import SessionStore
++    from gateway.session_authority import initialize_session_authority
++    from gateway.session_controls import AuthorityConnection
++
++    home = tmp_path / 'home'
++    home.mkdir()
++    (home / 'config.yaml').write_text(
++        'model: {default: gpt-5.4, provider: custom, base_url: "http://127.0.0.1:9/v1"}\n')
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    monkeypatch.setattr(run, '_hermes_home', home)
++    store = SessionStore(tmp_path / 'sessions', GatewayConfig())
++    runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False,
++                             _cached_agent_for=lambda route: None)
++    runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
++    authority = await initialize_session_authority(runner, profile_id=str(home), instance_id='first')
++    connection = AuthorityConnection(authority, object(), {'user_id': 'human'})
++
++    async def call(method, **params):
++        reply = await connection.dispatch({'id': 1, 'method': method, 'params': params})
++        assert 'result' in reply, reply
++        return reply['result']
++
++    return SimpleNamespace(authority=authority, call=call, cwd=str(tmp_path))
++
++
++def _slow_inventory(monkeypatch, *, hold_s):
++    """``session_inventory`` that takes *hold_s* (60 s: the mini's order) unless released first."""
++    from gateway import session_local_inventory
++    release, calls = threading.Event(), []
++
++    def slow(authority, policy, agent, cwd):
++        calls.append(policy.source if policy is not None else None)
++        release.wait(hold_s)
++        return {'tools': {'terminal': ['terminal']}, 'skills': {'research': ['arxiv']}, 'mcp_servers': []}
++
++    monkeypatch.setattr(session_local_inventory, 'session_inventory', slow)
++    return release, calls
++
++
++def _info_frames(authority, sid):
++    frames = []
++    authority.sessions[sid].event_stream.observers.add(
++        lambda frame: frames.append(frame['params']['payload']) if frame['params']['type'] == 'session.info' else None)
++    return frames
++
++
++@pytest.mark.asyncio
++async def test_create_reply_does_not_wait_on_a_60s_inventory_and_info_follows(tmp_path, monkeypatch):
++    gateway = await _gateway(tmp_path, monkeypatch)
++    from tui_gateway.contracts.registry import CANONICAL_METHODS
++    release, calls = _slow_inventory(monkeypatch, hold_s=60)
++    try:
++        started = time.monotonic()
++        created = await gateway.call('session.create', request_id='slow', source='tui', cwd=gateway.cwd)
++        elapsed = time.monotonic() - started
++        assert elapsed < 3, f'session.create reply took {elapsed:.1f}s behind the inventory'
++        CANONICAL_METHODS['session.create'].result.model_validate(created)
++        info = created['info']
++        assert info['inventory_pending'] is True and info['tools'] == {} and info['skills'] == {}, info
++        assert info['lazy'] is True and info['source'] == 'tui'
++        assert calls == ['tui']
++        frames = _info_frames(gateway.authority, created['session_id'])
++        assert frames == []  # nothing published before the build finishes
++    finally:
++        release.set()
++    await async_wait_until(lambda: frames, what='late session.info published')
++    assert len(frames) == 1, frames
++    late = frames[0]
++    assert late['inventory_pending'] is False
++    assert late['tools'] == {'terminal': ['terminal']} and late['skills'] == {'research': ['arxiv']}
++    assert late['tool_count'] == 1 and late['source'] == 'tui' and late['lazy'] is True
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('source', ['oneshot', 'tool'])
++async def test_non_interactive_sources_never_build_the_inventory(tmp_path, monkeypatch, source):
++    gateway = await _gateway(tmp_path, monkeypatch)
++    release, calls = _slow_inventory(monkeypatch, hold_s=60)
++    try:
++        started = time.monotonic()
++        created = await gateway.call('session.create', request_id=source, source=source, cwd=gateway.cwd)
++        assert time.monotonic() - started < 3
++    finally:
++        release.set()
++    assert calls == []
++    assert created['info']['inventory_pending'] is True and created['info']['tools'] == {}
++
++
++@pytest.mark.asyncio
++async def test_inventory_ready_within_budget_rides_the_reply_without_an_event(tmp_path, monkeypatch):
++    gateway = await _gateway(tmp_path, monkeypatch)
++    release, calls = _slow_inventory(monkeypatch, hold_s=60)
++    release.set()  # an unloaded gateway: the inventory is ready at once
++    created = await gateway.call('session.create', request_id='fast', source='tui', cwd=gateway.cwd)
++    info = created['info']
++    assert 'inventory_pending' not in info and info['tools'] == {'terminal': ['terminal']}, info
++    frames = _info_frames(gateway.authority, created['session_id'])
++    resumed = await gateway.call('session.resume', session_id=created['session_id'])
++    assert resumed['info']['tools'] == {'terminal': ['terminal']}
++    await asyncio.sleep(0)
++    assert frames == [] and calls == ['tui', 'tui']
++
++
++@pytest.mark.asyncio
++async def test_concurrent_opens_of_one_session_share_one_build(tmp_path, monkeypatch):
++    gateway = await _gateway(tmp_path, monkeypatch)
++    from gateway import session_local_inventory
++    release, calls = _slow_inventory(monkeypatch, hold_s=60)
++    monkeypatch.setattr(session_local_inventory, 'REPLY_INVENTORY_BUDGET_S', 0.05)
++    try:
++        created = await gateway.call('session.create', request_id='share', source='tui', cwd=gateway.cwd)
++        sid = created['session_id']
++        frames = _info_frames(gateway.authority, sid)
++        # A second open (another viewer, or the client's retry) while the first build still runs.
++        again = await gateway.call('session.resume', session_id=sid)
++        assert again['info']['inventory_pending'] is True
++        assert calls == ['tui']
++    finally:
++        release.set()
++    await async_wait_until(lambda: frames, what='late session.info published')
++    assert len(frames) == 1 and frames[0]['tools'] == {'terminal': ['terminal']}
++    assert session_local_inventory._pending == {}
+diff --git a/tests/hermes_cli/test_gateway_session_store.py b/tests/hermes_cli/test_gateway_session_store.py
+index 13435dc03a..a4487deead 100644
+--- a/tests/hermes_cli/test_gateway_session_store.py
++++ b/tests/hermes_cli/test_gateway_session_store.py
+@@ -215,6 +215,17 @@ def test_banner_inventory_comes_from_the_session_snapshot(store):
+     assert inv["context_length"] == 128000 and inv["cwd"] == "/w"
+ 
+ 
++def test_banner_inventory_is_none_while_the_gateway_still_builds_it(store):
++    """A loaded gateway answers create/resume before its inventory is built (``inventory_pending``):
++    the classic CLI shows its compact banner, never a full banner listing no tools."""
++    db, _ = store
++    db.open_session(cli("local-old", resumed=True))
++    db.current["info"] = {**db.current["info"], "tools": {}, "skills": {}, "inventory_pending": True}
++    assert db.banner_inventory() is None
++    db.current["info"]["inventory_pending"] = False
++    assert db.banner_inventory() is not None
++
++
+ def test_store_is_falsy_once_the_gateway_connection_closed(store):
+     db, _ = store
+     assert db
+diff --git a/tui_gateway/contracts/canonical.py b/tui_gateway/contracts/canonical.py
+index 90295a8a14..f606f0c8d0 100644
+--- a/tui_gateway/contracts/canonical.py
++++ b/tui_gateway/contracts/canonical.py
+@@ -176,6 +176,10 @@ class SessionInventoryFields(Result):
+     unknown_toolsets: list[str] | None = None  # main's "Unknown toolsets" warning, judged by the gateway
+     # The resident agent's status-bar usage (``gateway/session_usage.py::snapshot_usage``); absent agentless.
+     usage: Usage | None = None
++    # A create / resume reply that went out before its inventory was built (a loaded gateway, or a
++    # ``oneshot`` / ``tool`` client that renders no banner): the inventory fields above are empty.
++    # A later ``session.info`` event carries the built inventory with ``inventory_pending: false``.
++    inventory_pending: bool | None = None
+ 
+ 
+ class CanonicalClientLabel(Result):
+-- 
+2.43.0
+

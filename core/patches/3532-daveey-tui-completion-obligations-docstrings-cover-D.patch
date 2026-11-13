@@ -1,0 +1,202 @@
+From 86ca80ca45e3786c2c333c6482082398d9900793 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:03:47 +0000
+Subject: [PATCH] [daveey] tui completion obligations: docstrings cover
+ Desktop, never-reopened-chat note, settle_started in-memory precheck
+
+Follow-up of PR #2159 (review 5890472426, non-blocking nits), card t_01a1d4c0fc17d36d.
+
+1. ProcessObligationMixin and the ProcessCheckpointMixin._recover_owed_completions_locked stub
+   documented gateway completions only; they now cover Desktop (owner: tui) obligations too.
+2. Module docstrings (process_registry_obligations.py, tui_gateway/completion_obligation.py) state that a
+   tui obligation for a chat never reopened (deleted/archived) is re-armed and wakes that chat on each
+   Desktop start until OBLIGATION_MAX_RECOVERIES / OBLIGATION_MAX_AGE_SECONDS drops it (bounded by design).
+3. settle_started read the receipt file under the registry lock for every offered pid on every notice-turn
+   start, even for jobs that never carried an obligation. The registry now keeps `_tui_owed`, the ids this
+   process wrote (receipt writer, `_completion_obligation`) or re-armed (`_recover_owed_completions_locked`)
+   a tui obligation for, and `settle_tui_completion` answers any other id from memory. An id leaves the set
+   once its receipt no longer owes it, so a failed settle write is still retried.
+
+Proof: tests/tui_gateway/test_tui_completion_obligation.py::
+test_notice_turn_start_reads_only_receipts_this_backend_owes spies on receipt_path: RED on the old code
+("a pid with no owed tui obligation must not touch its receipt"), GREEN with the fix; it also proves a
+re-armed obligation in a fresh backend is still settled. test_tui_completion_obligation.py and
+test_process_completion_receipt_nits.py: 29 passed.
+---
+ .../test_tui_completion_obligation.py         | 25 ++++++++++++++
+ tools/process_registry_checkpoint.py          |  3 +-
+ tools/process_registry_obligations.py         | 33 ++++++++++++++++---
+ tui_gateway/completion_obligation.py          | 13 +++++---
+ 4 files changed, 65 insertions(+), 9 deletions(-)
+
+diff --git a/tests/tui_gateway/test_tui_completion_obligation.py b/tests/tui_gateway/test_tui_completion_obligation.py
+index 3159f14234..f6289f47f0 100644
+--- a/tests/tui_gateway/test_tui_completion_obligation.py
++++ b/tests/tui_gateway/test_tui_completion_obligation.py
+@@ -254,6 +254,31 @@ def test_consumed_or_quiet_completion_is_not_redelivered(home, registry, backend
+     assert (armed, wakes, reg.has_parked_events()) == (0, [], False)
+ 
+ 
++def test_notice_turn_start_reads_only_receipts_this_backend_owes(home, registry, monkeypatch):
++    """``settle_started`` runs on every notice-turn start: a job that never carried an obligation costs no receipt
++    read; an owed one (written here, or re-armed by the next backend) is still settled."""
++    from tui_gateway.completion_obligation import settle_started
++    _as_dead_writer(monkeypatch)
++    _finish(registry, _job(registry, "proc_quiet0001", notify=False))
++    _finish(registry, _job(registry, "proc_desk0001"))
++    assert OBLIGATION_KEY not in _receipt(home, "proc_quiet0001") and OBLIGATION_KEY in _receipt(home)
++    reads: list = []
++    real_path = obligations.receipt_path
++    monkeypatch.setattr(obligations, "receipt_path", lambda sid: reads.append(sid) or real_path(sid))
++
++    settle_started(["proc_quiet0001", "proc_never0001"])
++    assert reads == [], "a pid with no owed tui obligation must not touch its receipt"
++
++    _reg, armed, _ = _next_backend(monkeypatch)  # the owed one, re-armed by a fresh backend
++    assert armed == 1
++    reads.clear()
++    settle_started(["proc_desk0001", "proc_quiet0001"])
++    assert set(reads) == {"proc_desk0001"} and OBLIGATION_KEY not in _receipt(home)
++    reads.clear()
++    settle_started(["proc_desk0001"])  # settled: dropped from memory, no further reads
++    assert reads == []
++
++
+ @pytest.mark.parametrize("when", ["finished", "running"])
+ def test_orderly_exit_journal_takes_custody_and_delivers_once(home, registry, backend, monkeypatch, when):
+     """A finished notice the chat had not run yet, or a running job the exit stops: the turn marker reports it."""
+diff --git a/tools/process_registry_checkpoint.py b/tools/process_registry_checkpoint.py
+index 56704d00e1..88831c7c24 100644
+--- a/tools/process_registry_checkpoint.py
++++ b/tools/process_registry_checkpoint.py
+@@ -38,7 +38,8 @@ class ProcessCheckpointMixin:
+         raise NotImplementedError
+ 
+     def _recover_owed_completions_locked(self, owner: Optional[str]) -> int:
+-        """ProcessObligationMixin re-arms owed gateway completions; a bare checkpoint owes none."""
++        """ProcessObligationMixin re-arms owed completions, a gateway's and a Desktop chat's (``owner: tui``); a bare
++        checkpoint owes none."""
+         return 0
+ 
+     # ----- Checkpoint (crash recovery) -----
+diff --git a/tools/process_registry_obligations.py b/tools/process_registry_obligations.py
+index 7d132198c2..0935be2ea1 100644
+--- a/tools/process_registry_obligations.py
++++ b/tools/process_registry_obligations.py
+@@ -32,7 +32,9 @@ block. Its delivery is in that backend's memory until the notice turn starts; a
+ (no orderly exit journal) lost it. ``tui_gateway/completion_obligation.py`` settles it (turn start, intended
+ suppression, the exit journal's custody transfer), and Desktop recovery (``recover_from_checkpoint(owner="tui")``)
+ re-arms an owed one whose writer is gone, once per start, through the re-adopt sink. Each owner adopts only its
+-own (``owner``; a block without one is the gateway's).
++own (``owner``; a block without one is the gateway's). A tui obligation whose chat is never reopened (deleted or
++archived) is re-armed and wakes that chat on each Desktop start until ``OBLIGATION_MAX_RECOVERIES`` or
++``OBLIGATION_MAX_AGE_SECONDS`` drops it: bounded by design, like the gateway's.
+ """
+ 
+ from __future__ import annotations
+@@ -52,7 +54,7 @@ logger = logging.getLogger("tools.process_registry")
+ OBLIGATION_KEY = "delivery_obligation"
+ # Like the async-delegation replay cap: an owed notice older than this is dropped with a logged reason.
+ OBLIGATION_MAX_AGE_SECONDS = 48 * 3600
+-# Gateway starts that may re-arm one obligation (a notice refused at every start must not loop forever).
++# Gateway or Desktop starts that may re-arm one obligation (a notice refused at every start must not loop forever).
+ OBLIGATION_MAX_RECOVERIES = 8
+ _ROUTE_FIELDS = ("watcher_platform", "watcher_chat_id", "watcher_user_id", "watcher_user_name",
+                  "watcher_thread_id", "watcher_message_id", "watcher_interval", "parent_session_id",
+@@ -166,7 +168,9 @@ def settle_quietly(session_id: str, how: str) -> bool:
+ 
+ 
+ class ProcessObligationMixin:
+-    """Registry side: decide, settle and re-arm owed gateway completions."""
++    """Registry side: decide, settle and re-arm owed completions, a messaging gateway's (``owner: gateway``) and a
++    Desktop chat's (``owner: tui``). ``_tui_owed`` holds the ids this process wrote or re-armed a tui obligation for,
++    so a Desktop notice turn settles only those and never reads the receipt of a job that owes nothing."""
+ 
+     # Supplied by ProcessRegistry / ProcessCheckpointMixin / ProcessReadoptMixin.
+     _lock: Any
+@@ -186,7 +190,13 @@ class ProcessObligationMixin:
+             return None
+         if owes_gateway_delivery(session):
+             return {**obligation_for(session), "owner": OWNER_GATEWAY}
+-        return {**obligation_for(session), "owner": OWNER_TUI} if owes_tui_delivery(session) else None
++        if not owes_tui_delivery(session):
++            return None
++        self._tui_owed_ids().add(session.id)
++        return {**obligation_for(session), "owner": OWNER_TUI}
++
++    def _tui_owed_ids(self) -> set:
++        return vars(self).setdefault("_tui_owed", set())
+ 
+     def _consume_completion(self, session_id: str) -> None:
+         """The agent has the output (wait/log/kill): suppress the autonomous notice, here and across a restart.
+@@ -201,6 +211,19 @@ class ProcessObligationMixin:
+         with self._lock:
+             return settle_quietly(session_id, how)
+ 
++    def settle_tui_completion(self, session_id: str, how: str) -> bool:
++        """``settle_completion`` for a Desktop notice: only an id in ``_tui_owed`` (this process wrote or re-armed
++        its obligation) can owe one here, so any other id is answered from memory, with no receipt read. The id
++        stays while the receipt still owes it, so a failed write is retried by the next settle."""
++        with self._lock:
++            owed = self._tui_owed_ids()
++            if session_id not in owed:
++                return False
++            settled = settle_quietly(session_id, how)
++            if settled or owed_still(session_id) is None:
++                owed.discard(session_id)
++            return settled
++
+     def _rewrite_killed_receipt(self, session, consume_output: bool) -> None:
+         """A kill that lost the finish race rewrites the reader's receipt as killed. An explicit kill
+         (``consume_output``) hands the output to its caller, so it settles the obligation; any other kill
+@@ -272,6 +295,8 @@ class ProcessObligationMixin:
+                 continue
+             with self._lock:
+                 self._finished[sid] = session
++                if owner == OWNER_TUI:
++                    self._tui_owed_ids().add(sid)
+             if owner == OWNER_TUI:  # parks for the chat (woken when it is not loaded here)
+                 from tools.process_registry_awaiting import completion_event, publishable
+                 self._deliver_readopted_event({**publishable(completion_event(session)), "park_if_unowned": True})
+diff --git a/tui_gateway/completion_obligation.py b/tui_gateway/completion_obligation.py
+index 7b319e35ac..e9e6504436 100644
+--- a/tui_gateway/completion_obligation.py
++++ b/tui_gateway/completion_obligation.py
+@@ -12,6 +12,9 @@ This backend removes the block once the notice no longer needs it:
+ - custody transfer: the orderly-exit journal wrote it into the session's turn marker
+   (``exit_job_receipts.journal_session_jobs``), so the next backend reports it from there, not twice.
+ 
++A tui obligation whose chat is never reopened (deleted or archived) is re-armed and wakes that chat on each
++Desktop start until ``OBLIGATION_MAX_RECOVERIES`` / ``OBLIGATION_MAX_AGE_SECONDS`` drops it (bounded by design).
++
+ Every call is best effort: a failed settle keeps the obligation, and the worst case is one more delivery after
+ a crash, never a lost notice.
+ """
+@@ -24,18 +27,20 @@ from typing import Iterable
+ logger = logging.getLogger(__name__)
+ 
+ 
+-def _settle(pids: Iterable, how: str) -> None:
++def _settle(pids: Iterable, how: str, *, owed_here_only: bool = False) -> None:
+     try:
+         from tools.process_registry import process_registry
++        settle = process_registry.settle_tui_completion if owed_here_only else process_registry.settle_completion
+         for pid in {p for p in pids if isinstance(p, str) and p}:
+-            process_registry.settle_completion(pid, how)
++            settle(pid, how)
+     except Exception:  # health: allow BLE001 -- a failed settle keeps the obligation (at least once)
+         logger.warning("settling owed Desktop completions failed (%s)", how, exc_info=True)
+ 
+ 
+ def settle_started(offered: Iterable) -> None:
+-    """The notice turn carrying these completions (process ids) started: delivered into the session."""
+-    _settle(offered, "delivered: Desktop notice turn started")
++    """The notice turn carrying these completions (process ids) started: delivered into the session. Runs on every
++    notice-turn start, so a job this backend never owed a notice (``_tui_owed``) costs no receipt read."""
++    _settle(offered, "delivered: Desktop notice turn started", owed_here_only=True)
+ 
+ 
+ def settle_suppressed(evt: dict, how: str) -> bool:
+-- 
+2.43.0
+

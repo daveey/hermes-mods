@@ -1,0 +1,499 @@
+From 2e73a605a866e3e10cee2d53d7ce46513ff57e5b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:31:39 +0000
+Subject: [PATCH] [daveey] lifecycle guard: scan uv run, py/pypy and programs
+ fed on stdin
+
+`python3 f.py` (f.py runs `hermes gateway restart`) was refused, but the same file ran unread
+as `uv run f.py`, `uv run python f.py`, `py f.py`, `pypy3 f.py`, `python3 < f.py`,
+`cat f.py | python3`, `bash < f.sh` and `cat f.sh | bash`. Found in the exact-head review of
+PR #2165 (review 5890466338). The reserved-word half of that finding (`do`/`then`/`!`/`{`)
+landed separately in 12cca5b455; this change covers the runners and stdin feeds it does not.
+
+Why: the interpreter scan matched only `python[w][N]` at the executed command, `uv` was not a
+wrapper, `_python_script_operand` treated "no operand" as nothing to read, and the shell walk
+read a shell's script operand but never the file redirected or piped into its stdin.
+
+Fix (additive; no existing reference is removed):
+- `uv [opts] run [opts] <cmd>` peels like a transparent wrapper (`_peel_uv_run`); `uv pip`,
+  `uv tool run` and `uvx` do not. A `.py` reached through `uv run` is read by the interpreter
+  scan as Python, and skipped by the shell walk (Python sources are never shell-walked, #77131).
+- `_PYTHON_RUNNER_RE` adds `py` and `pypy[N]` to the interpreter scan.
+- `_split_redirections` strips redirections from the argv tail and returns `<`/`<>` stdin files;
+  `_iter_segment_contexts` carries the operands of a `cat` piped into the segment. A Python or a
+  shell with no program operand (or `-s`) scans those files as its program.
+- `_PIPE_TO_INTERPRETER` also matches a pipe into python/pypy/py/uv, so a data sink feeding one
+  is not masked.
+
+Tests: tests/cron/test_lifecycle_guard_interpreter_runners.py, 58 cases (runner spellings,
+stdin and pipe feeds, combined with reserved words), plus mention/data guards (`uv pip`,
+`uvx`, `python3 clean.py < f.py`, `cat f | grep`, `while read; done < f`) and the #77131
+not-shell-walked rule. RED on base e770862093: 38 failed, 20 passed. GREEN: all pass.
+---
+ cron/lifecycle_guard.py                       | 170 ++++++++++++++---
+ ...est_lifecycle_guard_interpreter_runners.py | 176 ++++++++++++++++++
+ 2 files changed, 317 insertions(+), 29 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_interpreter_runners.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 224f844da5..ea5baa5eb9 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -296,7 +296,8 @@ _UNSAFE_DATA_ARG_MARKERS = ("`", "$(", "<(", ">(", "\\!")
+ _DOT_COMMAND_ARGUMENT = re.compile(r"^\.[A-Za-z]")
+ # A data sink piped into a shell/interpreter can feed matched lines to execution; never mask it.
+ _PIPE_TO_INTERPRETER = re.compile(
+-    r"\|\s*&?\s*(?:sudo\s+)?(?:sh|bash|dash|ksh|zsh|xargs|eval|source)\b"
++    r"\|\s*&?\s*(?:sudo\s+)?(?:(?:sh|bash|dash|ksh|zsh|xargs|eval|source)\b"
++    r"|(?:python[\d.]*|pypy[\d.]*|py|uv)(?![\w.-]))"
+ )
+ 
+ # Bytes sniffed before reading a referenced file in full (see _BINARY_MAGICS).
+@@ -353,6 +354,23 @@ _TRANSPARENT_PREFIX_OPERANDS = {"timeout": 1}
+ 
+ _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+ 
++# `uv [global options] run [options] <command>` runs <command> (a `.py` file through Python).
++_UV_VALUE_OPTIONS = frozenset({
++    "--directory", "--project", "--config-file", "--cache-dir", "--color", "-p", "--python",
++    "--with", "--with-editable", "--with-requirements", "--env-file", "--package", "--extra",
++    "--group", "--no-group", "--only-group", "--index", "--default-index", "-i", "--index-url",
++    "--extra-index-url", "-f", "--find-links", "--index-strategy", "--keyring-provider",
++    "--resolution", "--prerelease", "--fork-strategy", "--exclude-newer", "-C",
++    "--config-setting", "--link-mode", "-P", "--upgrade-package", "--reinstall-package",
++    "--refresh-package", "--no-binary-package", "--no-build-package", "--python-platform",
++    "--allow-insecure-host", "--no-extra",
++})
++# Python program runners whose file operand (or stdin) is scanned as Python source.
++_PYTHON_RUNNER_RE = re.compile(r"^(?:pythonw?|pypy)(?:\d+(?:\.\d+)*)?(?:\.exe)?$|^py(?:\.exe)?$")
++_PYTHON_SOURCE_SUFFIXES = (".py", ".pyw")
++# A redirection word: optional fd, operator, optional glued target (`<f`, `0<f`, `2>>log`).
++_REDIRECTION = re.compile(r"^(\d*)(<<<|<<-|<<|<>|<&|>&|>>|>\||<|>)(.*)$", re.DOTALL)
++
+ # Bound the walk: a pathological token run must not spin here.
+ _MAX_PREFIX_PEELS = 8
+ 
+@@ -807,23 +825,34 @@ def _session_aliases_shadow_consumers(session_aliases: Optional[frozenset[str]])
+                for name in session_aliases)
+ 
+ 
+-def _iter_positioned_command_segments(command: str) -> Iterator[tuple[list[str], bool]]:
+-    """``_iter_command_segments`` plus whether each segment is the argument list of a call
+-    (``True``): the segment right after a ``(`` that follows an ordinary word."""
++def _iter_segment_contexts(command: str) -> Iterator[tuple[list[str], bool, list[str]]]:
++    """``(segment, call_argument, piped_files)``: whether the segment is the argument list of a
++    call (the segment right after a ``(`` that follows an ordinary word), and the files a ``cat``
++    pipes into its stdin (``cat f.sh | bash``)."""
+     for tokens in _iter_command_token_lists(command):
+         segment: list[str] = []
+         call_argument = False
++        previous: Optional[list[str]] = None
++        piped = False
+         for token in tokens:
+             if token and set(token) <= _CONTROL_CHARS:
+                 next_is_call = token == "(" and bool(segment) and _opens_call_arguments(segment)
+                 if segment:
+-                    yield segment, call_argument
++                    yield segment, call_argument, _cat_operands(previous) if piped else []
++                    previous = segment
+                     segment = []
++                piped = token in ("|", "|&")
+                 call_argument = next_is_call
+                 continue
+             segment.append(token)
+         if segment:
+-            yield segment, call_argument
++            yield segment, call_argument, _cat_operands(previous) if piped else []
++
++
++def _iter_positioned_command_segments(command: str) -> Iterator[tuple[list[str], bool]]:
++    """``_iter_command_segments`` plus whether each segment is the argument list of a call."""
++    for segment, call_argument, _ in _iter_segment_contexts(command):
++        yield segment, call_argument
+ 
+ 
+ def _executable_name(token: str) -> str:
+@@ -840,6 +869,12 @@ def _peel_transparent_prefixes(segment: list[str], index: int) -> int:
+         if index >= len(segment):
+             return index
+         name = _executable_name(segment[index])
++        if name == "uv":
++            uv_command = _peel_uv_run(segment, index)
++            if uv_command is None:
++                return index
++            index = uv_command
++            continue
+         if name not in _TRANSPARENT_COMMAND_PREFIXES:
+             return index
+         value_options = _TRANSPARENT_PREFIX_VALUE_OPTIONS.get(name, frozenset())
+@@ -877,6 +912,62 @@ def _executed_command_index(segment: list[str]) -> Optional[int]:
+     return index if index < len(segment) else None
+ 
+ 
++def _peel_uv_run(segment: list[str], index: int) -> Optional[int]:
++    """Index of the command ``uv [opts] run [opts] <command>`` runs (may be ``len(segment)``);
++    ``None`` when *index* is not such a ``uv`` (``uv pip ...``, ``uv tool run``)."""
++    index += 1
++    seen_run = False
++    while index < len(segment):
++        token = segment[index]
++        if token.startswith("-"):
++            index += 2 if token in _UV_VALUE_OPTIONS else 1
++        elif seen_run:
++            return index
++        elif token == "run":
++            seen_run = True
++            index += 1
++        else:
++            return None
++    return index if seen_run else None
++
++
++def _runs_under_uv(segment: list[str], index: int) -> bool:
++    """Whether a wrapper chain reached ``segment[index]`` through ``uv run``."""
++    return any(_executable_name(token) == "uv" and _peel_uv_run(segment, position) is not None
++               for position, token in enumerate(segment[:index]))
++
++
++def _split_redirections(arguments: list[str]) -> tuple[list[str], list[str]]:
++    """``(arguments without redirections, files redirected to stdin)``. A heredoc, here-string or
++    descriptor duplication is stripped but feeds no file; ``<`` and ``<>`` on fd 0 do."""
++    kept: list[str] = []
++    stdin: list[str] = []
++    index = 0
++    while index < len(arguments):
++        match = _REDIRECTION.match(arguments[index])
++        index += 1
++        if match is None:
++            kept.append(arguments[index - 1])
++            continue
++        fd, operator, target = match.groups()
++        if not target and index < len(arguments):
++            target = arguments[index]
++            index += 1
++        if operator in ("<", "<>") and fd in ("", "0") and target:
++            stdin.append(target)
++    return kept, stdin
++
++
++def _cat_operands(segment: Optional[list[str]]) -> list[str]:
++    """Files a ``cat`` segment writes to its stdout (its stdout piped on to a program reader)."""
++    for view in _command_segment_views(segment) if segment else []:
++        index = _executed_command_index(view)
++        if index is not None and _executable_name(view[index]) == "cat":
++            arguments, _ = _split_redirections(view[index + 1 :])
++            return [argument for argument in arguments if not argument.startswith("-")]
++    return []
++
++
+ def contains_launchctl_submit_command(command: str) -> bool:
+     """Detect an executed ``launchctl submit``/``bootstrap``, not quoted text.
+ 
+@@ -1148,8 +1239,11 @@ def _iter_option_values(segment: list[str], start: int, option: str) -> Iterator
+             yield token[len(prefix):]
+ 
+ 
+-def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterator[Path]:
+-    """Yield the scripts the token at *index* executes, if any."""
++def _references_at(
++    segment: list[str], index: int, cwd: Optional[str], piped: Optional[list[str]] = None,
++) -> Iterator[Path]:
++    """Yield the scripts the token at *index* executes, if any; *piped* are files a pipe feeds to
++    its stdin, run by a shell given no script operand (or ``-s``)."""
+     if index >= len(segment):
+         return
+     executable = segment[index]
+@@ -1161,7 +1255,8 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
+         return
+ 
+     if executable_name in _SHELL_EXECUTABLES:
+-        arguments = segment[index + 1 :]
++        arguments, stdin = _split_redirections(segment[index + 1 :])
++        reads_stdin = False
+         arg_index = 0
+         while arg_index < len(arguments):
+             argument = arguments[arg_index]
+@@ -1174,11 +1269,18 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
+                 arg_index += 2
+                 continue
+             if argument.startswith("-"):
++                reads_stdin = reads_stdin or (not argument.startswith("--") and "s" in argument)
+                 arg_index += 1
+                 continue
+             break
+-        if arg_index < len(arguments) and arguments[arg_index] not in _SHELL_COMMAND_FLAGS:
++        command_string = arg_index < len(arguments) and arguments[arg_index] in _SHELL_COMMAND_FLAGS
++        if arg_index < len(arguments) and not command_string:
+             yield from _resolved_or_nothing(arguments[arg_index], cwd)
++        elif not command_string:
++            reads_stdin = True
++        if reads_stdin:
++            for source in stdin or piped or []:
++                yield from _resolved_or_nothing(source, cwd)
+         return
+ 
+     # A bare "/" is pathlib's division operator in Python sources, not an executable; resolving it
+@@ -1196,17 +1298,20 @@ def _iter_referenced_shell_scripts(
+     a reference (a local ``./timeout`` is a script, not the coreutils wrapper). With
+     *call_arguments* the same discovery runs over call-argument segments instead
+     (``expanduser("~/x")``): paths there are interpreter string literals, i.e. mentions."""
+-    for segment, is_call_argument in _iter_positioned_command_segments(command):
++    for segment, is_call_argument, piped in _iter_segment_contexts(command):
+         if is_call_argument != call_arguments:
+             continue
+         for view in _command_segment_views(segment):
+             index = _command_token_index(view)
+             if index is None:
+                 continue
+-            yield from _references_at(view, index, cwd)
++            yield from _references_at(view, index, cwd, piped)
+             peeled = _peel_transparent_prefixes(view, index)
+-            if peeled != index:
+-                yield from _references_at(view, peeled, cwd)
++            # `uv run x.py` runs Python: the interpreter scan reads it, never the shell walk (#77131).
++            if peeled != index and not (
++                    peeled < len(view) and view[peeled].endswith(_PYTHON_SOURCE_SUFFIXES)
++                    and _runs_under_uv(view, peeled)):
++                yield from _references_at(view, peeled, cwd, piped)
+ 
+ 
+ # CPython short options that take a value (glued `-Wignore` or the next token), and the ones after
+@@ -1217,8 +1322,9 @@ _PYTHON_VALUE_LONG_OPTIONS = frozenset({"--check-hash-based-pycs"})
+ 
+ 
+ def _python_script_operand(arguments: list[str]) -> Optional[str]:
+-    """The script file a CPython argv tail runs; ``None`` for ``-c``/``-m``/``-`` (stdin) or no
+-    operand. Short-option clusters are read like CPython's getopt (`-uc code` is ``-u -c``)."""
++    """The script file a CPython argv tail runs: ``-`` when the program is read from stdin (a
++    ``-`` operand or none), ``None`` for ``-c``/``-m``. Short-option clusters are read like
++    CPython's getopt (`-uc code` is ``-u -c``)."""
+     index = 0
+     while index < len(arguments):
+         argument = arguments[index]
+@@ -1238,22 +1344,28 @@ def _python_script_operand(arguments: list[str]) -> Optional[str]:
+                     index += 1  # the value is the next token
+                 break
+         index += 1
+-    if index < len(arguments) and arguments[index] != "-":
+-        return arguments[index]
+-    return None
++    return arguments[index] if index < len(arguments) else "-"
+ 
+ 
+ def _iter_python_interpreter_scripts(command: str, *, cwd: Optional[str] = None) -> Iterator[Path]:
+-    """Yield files a segment runs as ``python3 [options] <file>`` (also behind wrappers:
+-    ``/usr/bin/env python3 <file>``). An interpreter is never itself a wrapper, so only the
+-    executed command is read."""
+-    for segment in _iter_command_segment_views(command):
+-        index = _executed_command_index(segment)
+-        if index is None or not _INTERPRETER_IMAGE_RE.match(_executable_name(segment[index]).lower()):
+-            continue
+-        operand = _python_script_operand(segment[index + 1 :])
+-        if operand is not None:
+-            yield from _resolved_or_nothing(operand, cwd)
++    """Yield files a segment runs as ``python3 [options] <file>`` (also ``py``/``pypy3``, behind
++    wrappers and reserved words: ``do /usr/bin/env python3 <file>``, ``uv run [python] <file>``),
++    or feeds a Python reading its program from stdin (``python3 < f``, ``cat f | python3``). An
++    interpreter is never itself a wrapper, so only the executed command is read."""
++    for raw_segment, _, piped in _iter_segment_contexts(command):
++        for segment in _command_segment_views(raw_segment):
++            index = _executed_command_index(segment)
++            if index is None:
++                continue
++            if segment[index].endswith(_PYTHON_SOURCE_SUFFIXES) and _runs_under_uv(segment, index):
++                yield from _resolved_or_nothing(segment[index], cwd)
++                continue
++            if not _PYTHON_RUNNER_RE.match(_executable_name(segment[index]).lower()):
++                continue
++            arguments, stdin = _split_redirections(segment[index + 1 :])
++            operand = _python_script_operand(arguments)
++            for source in (stdin or piped) if operand == "-" else [operand] if operand else []:
++                yield from _resolved_or_nothing(source, cwd)
+ 
+ 
+ def _python_source_is_unsafe(text: str, budget: _LifecycleScanBudget) -> bool:
+diff --git a/tests/cron/test_lifecycle_guard_interpreter_runners.py b/tests/cron/test_lifecycle_guard_interpreter_runners.py
+new file mode 100644
+index 0000000000..6cb7853af2
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_interpreter_runners.py
+@@ -0,0 +1,176 @@
++"""Interpreter runs the scan did not read: ``uv run``, ``py``/``pypy3`` and programs fed on stdin.
++
++``python3 f.py`` was scanned, but ``uv run f.py``, ``uv run python f.py``, ``py f.py``,
++``pypy3 f.py``, ``python3 < f.py``, ``cat f.py | python3``, ``bash < f.sh`` and
++``cat f.sh | bash`` ran the same file unread. Python sources stay regex-scanned only, never
++shell-walked (#77131). Reserved words (``do``, ``then``, ``!``, ``{``) are covered by
++test_lifecycle_guard_reserved_words.py; the cases here combine them with the new runners.
++"""
++
++from __future__ import annotations
++
++import shlex
++
++import pytest
++
++from cron import lifecycle_guard
++from cron.lifecycle_guard import scan_gateway_lifecycle
++
++# Assembled so this file's own text never carries the literal command.
++LIFECYCLE = " ".join(["hermes", "gateway", "re" + "start"])
++
++
++@pytest.fixture
++def files(tmp_path) -> dict[str, str]:
++    """Shell-quoted paths: a shell script and a Python runner that each restart the gateway, and
++    clean Python and shell scripts."""
++    sh = tmp_path / "restart.sh"
++    sh.write_text(f"#!/bin/sh\necho hi\n{LIFECYCLE}\n", encoding="utf-8")
++    sh.chmod(0o755)
++    py = tmp_path / "runner.py"
++    py.write_text(f"import os\nprint(1)\nos.system({LIFECYCLE!r})\n", encoding="utf-8")
++    clean = tmp_path / "clean.py"
++    clean.write_text("import sys\nprint(sys.stdin.read())\n", encoding="utf-8")
++    clean_sh = tmp_path / "clean.sh"
++    clean_sh.write_text("echo ok\n", encoding="utf-8")
++    return {name: shlex.quote(str(path)) for name, path in
++            {"sh": sh, "py": py, "clean": clean, "clean_sh": clean_sh, "dir": tmp_path}.items()}
++
++
++@pytest.mark.parametrize(
++    "template",
++    [
++        "py {py}",
++        "py -3 {py}",
++        "pypy3 {py}",
++        "pypy {py}",
++        "uv run {py}",
++        "uv run python {py}",
++        "uv run python3 -u {py}",
++        "uv run --with requests {py}",
++        "uv run --python 3.12 python {py}",
++        "uv run -p 3.12 --no-project -- python {py}",
++        "uv run --script {py}",
++        "uv --directory {dir} run {py}",
++        "uv run bash {sh}",
++        "uv run {sh}",
++        "sudo uv run {py}",
++        "if true; then uv run {py}; fi",
++        "for i in 1; do pypy3 {py}; done",
++    ],
++)
++def test_other_interpreter_spellings_are_scanned(files, template):
++    assert scan_gateway_lifecycle(template.format(**files)) == (True, None)
++
++
++@pytest.mark.parametrize(
++    "template",
++    [
++        "python3 < {py}",
++        "python3 <{py}",
++        "python3 0< {py}",
++        "python3 -u - < {py}",
++        "python3 -- - < {py}",
++        "python3 > /dev/null < {py}",
++        "cat {py} | python3",
++        "cat -- {py} | python3 -",
++        "cat {py} |& sudo python3",
++        "bash < {sh}",
++        "bash <{sh}",
++        "bash -s < {sh}",
++        "bash -s arg < {sh}",
++        "cat {sh} | bash",
++        "cat {sh} | sudo bash -s",
++        "while true; do bash < {sh}; done",
++        "! cat {sh} | bash",
++        "bash <> {sh}",
++    ],
++)
++def test_program_fed_on_stdin_is_scanned(files, template):
++    assert scan_gateway_lifecycle(template.format(**files)) == (True, None)
++
++
++@pytest.mark.parametrize(
++    "template",
++    [
++        # Mentions, data and non-program stdin: no runner or stdin reading turns these into runs.
++        "for f in {sh} {py}; do echo $f; done",
++        "while read l; do echo \"$l\"; done < {sh}",
++        "python3 {clean} < {py}",
++        "python3 -c 'print(1)' < {py}",
++        "python3 -m json.tool < {py}",
++        "cat {py} | python3 {clean}",
++        "cat {sh} | grep restart",
++        "cat {sh} || bash",
++        "bash -c 'echo hi' < {sh}",
++        "bash --posix {clean_sh} < {sh}",
++        "ls {py} | python3",
++        "cat {py} > /dev/null; python3 {clean}",
++        "uv pip install -r {py}",
++        "uv tool run ruff check {py}",
++        "uvx ruff check {py}",
++        "py_compile {py}",
++        "pyright {py}",
++    ],
++)
++def test_mentions_and_data_stay_allowed(files, template):
++    assert scan_gateway_lifecycle(template.format(**files)) == (False, None)
++
++
++def test_python_source_run_under_uv_is_not_shell_walked(tmp_path, files):
++    """A Python file is regex-scanned only (#77131): shell-looking lines in it are not walked, even
++    when they name a script that would be refused, or a device that would fail closed."""
++    source = tmp_path / "doc.py"
++    source.write_text(f"x = 1 / 2\nthen bash {files['sh']}\ndo /dev/zero\n", encoding="utf-8")
++    quoted = shlex.quote(str(source))
++    assert scan_gateway_lifecycle(f"uv run {quoted}") == (False, None)
++    assert scan_gateway_lifecycle(f"uv run --with x {quoted}") == (False, None)
++    assert scan_gateway_lifecycle(f"python3 < {quoted}") == (False, None)
++    # Run directly, it is a script like any other: shell-walked, so both lines count.
++    assert scan_gateway_lifecycle(quoted)[0]
++    # A `uv` word that is not `uv run` (here a user name) does not make it Python.
++    assert scan_gateway_lifecycle(f"sudo -u uv {quoted}")[0]
++
++
++def test_shell_command_string_flag_is_not_a_script_path(tmp_path):
++    (tmp_path / "-c").write_text(f"{LIFECYCLE}\n", encoding="utf-8")
++    assert scan_gateway_lifecycle("bash -c 'echo hi'", cwd=str(tmp_path)) == (False, None)
++
++
++def test_cat_options_are_not_piped_files(tmp_path, files):
++    (tmp_path / "-n").write_text(f"import os\nos.system({LIFECYCLE!r})\n", encoding="utf-8")
++    assert scan_gateway_lifecycle(f"cat -n {files['clean']} | python3", cwd=str(tmp_path)) == (
++        False, None)
++
++
++def test_uv_run_peel_bounds():
++    index = lifecycle_guard._executed_command_index
++    assert index(["uv", "run"]) is None
++    assert index(["uv", "run", "--with", "x"]) is None
++    assert index(["uv", "run", "x"]) == 2
++    assert index(["uv", "-q", "run", "--python", "3.12", "python", "f"]) == 5
++    assert index(["uv", "pip", "install"]) == 0
++    assert index(["uv", "--version"]) == 0
++    # `uv tool run` runs a package's tool (uvx), not a local command.
++    assert index(["uv", "tool", "run", "x"]) == 0
++
++
++def test_stdin_redirect_parsing():
++    split = lifecycle_guard._split_redirections
++    assert split(["<", "a", "-u"]) == (["-u"], ["a"])
++    assert split(["0<a", ">", "out", "2>>", "err", "x"]) == (["x"], ["a"])
++    assert split(["1<", "a"]) == ([], [])
++    # Heredocs, here-strings and duplications are stripped but are not file feeds; `<>` is one.
++    assert split(["<<EOF", "<<", "X", "<<<", "w", "<&3", "<>", "f"]) == ([], ["f"])
++    assert split(["<"]) == ([], [])
++
++
++def test_data_sink_piped_into_python_is_not_masked(files):
++    """A grep match piped into an interpreter is code, so its pattern is not masked as data (the
++    same rule as a pipe into a shell)."""
++    assert scan_gateway_lifecycle(f"grep -h '{LIFECYCLE}' {files['py']} | bash") == (True, None)
++    assert scan_gateway_lifecycle(f"grep -h '{LIFECYCLE}' {files['py']} | python3") == (True, None)
++    assert scan_gateway_lifecycle(f"grep -h '{LIFECYCLE}' {files['py']} | uv run python") == (
++        True, None)
++    assert scan_gateway_lifecycle(f"grep -h '{LIFECYCLE}' {files['py']} | wc -l") == (False, None)
++    assert scan_gateway_lifecycle(f"grep -h '{LIFECYCLE}' {files['py']} | pyright") == (False, None)
+-- 
+2.43.0
+

@@ -1,0 +1,395 @@
+From 2b892420706ab3c34d6b5139984ac9479da3c29d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:13:21 +0000
+Subject: [PATCH] [daveey] kanban: every lifecycle write on a card under
+ another machine's live Board lease is refused before it writes
+
+At 2026-11-13 04:18:25 PST on laptop-1, `hermes kanban complete t_01a1ccfeab615947 --summary ...` printed
+`Completed` and exited 0 while worker-6 held the card under its Board lease. The local DB wrote `done`, closed the
+run mirror and appended `completed`; the Board then rejected the status (`sync_rejected` live_claim) and the card
+read back `running` until worker-6 completed it itself.
+
+Five whys:
+1. Why "Completed"? `_cmd_complete` refuses only replica copies (`_foreign_card`) and local live claims
+   (`kb.LiveClaimError`).
+2. Why no live claim? A remote Board lease is only mirrored (`tasks.lease_holder`/`lease_expires`, `claim_lock`
+   NULL), so the local guard never fires.
+3. Why did the damage outlast the rejection? The Board fences only the tasks lifecycle columns (status,
+   current_run_uid, result, started_at, completed_at). The run update and the `completed` event are unfenced, so
+   they were accepted: subscribers got a "done" notice for the rejected write, and the holder's run on the Board
+   still carries the rejected summary, metadata and ended_at (run uid 01a1d4d6-c423-..., also two older cards).
+4. Why only the CLI? The kanban_* tools already had `_remote_lease_refusal`; the CLI never called
+   `kanban_remote_stop.remote_holder()` (only archive did).
+5. Fix: check `remote_holder()` before any CLI lifecycle verb runs.
+
+Change:
+- `kanban_remote_stop.cli_refusal(action, args)`, called from `kanban_command` before the handler, for complete,
+  block, schedule, unblock, request-review, request-changes, reopen-review, reclaim, move, reassign, promote,
+  reopen, and edit with --result. A bulk command with one remote-leased id writes nothing. `--force` does not
+  bypass it (the Board rejects the write anyway).
+- One message for CLI and tools (`kanban_remote_stop.refusal`): `cannot <verb> <id>: it is running under
+  <holder>'s live lease. Nothing changed. Let <holder>'s run finish, or archive it to stop it.` Tool errors keep
+  `rejection: live_claim`, `code: remote_live_lease`, `holder`.
+- kanban_move joins the fenced tools (its creator repin path writes a card it does not run).
+- Archive's stop-request route is unchanged.
+
+Proof (tests/hermes_cli/test_kanban_remote_lease_status_writes.py, two-gateway fake Board):
+- RED on base: `complete <id> --summary x` exits 0 and prints `Completed <id>` (assert rc != 0 fails).
+- GREEN: every CLI verb above (13) and every lifecycle tool (8) exits non-zero / returns the typed error naming
+  the holder, with a byte-for-byte unchanged DB snapshot (tasks, task_runs, task_events, kanban_sync_outbox,
+  notify state), no `completed` event, no unseen completion notice for a subscriber, current run's
+  status/outcome/summary/metadata/ended_at unchanged, and no `sync_rejected` after a sync round.
+- Regressions: expired lease and own-gateway lease still complete; a title edit under a remote lease still works.
+- 116 related test files (every test importing the kanban CLI + remote archive/relay suites): 2898 passed.
+
+Follow-ups: dashboard status writes t_01a1d4fa7525888e; one-time Board run-row repair t_01a1d4faf1ecda4b.
+Card: t_01a1d4df5b551228.
+---
+ hermes_cli/kanban.py                          |   3 +
+ hermes_cli/kanban_remote_stop.py              |  43 ++++
+ .../test_kanban_remote_lease_status_writes.py | 213 ++++++++++++++++++
+ tools/kanban_tools.py                         |  12 +-
+ 4 files changed, 264 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_remote_lease_status_writes.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index d9aa9abb64..c4c9440611 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -30,6 +30,7 @@ from hermes_cli import kanban_swarm as ks
+ from hermes_cli import kanban_workflow
+ from hermes_cli import kanban_contract_cli as _contract_cli
+ from hermes_cli import kanban_foreign_card as _foreign_card
++from hermes_cli import kanban_remote_stop as _remote_stop
+ from hermes_cli import kanban_review_contract as _review_contract
+ from hermes_cli import kanban_worker_shell as _worker_shell
+ from hermes_cli.kanban_cli_triage_lines import _decompose_ok_line, _retitled_suffix
+@@ -212,6 +213,8 @@ def kanban_command(args: argparse.Namespace) -> int:
+         handler = _HANDLERS.get(action)
+         if not handler:
+             return _err(f"kanban: unknown action {action!r}", 2)
++        if refused := _remote_stop.cli_refusal(action, args):  # [daveey] another machine's live Board lease
++            return _err(refused)
+         try:
+             return int(handler(args) or 0)
+         except BoardSchemaNotOwned as exc:  # a write a non-installed core may not make here, not a traceback [daveey]
+diff --git a/hermes_cli/kanban_remote_stop.py b/hermes_cli/kanban_remote_stop.py
+index fc3bc7b2a1..05591bfa58 100644
+--- a/hermes_cli/kanban_remote_stop.py
++++ b/hermes_cli/kanban_remote_stop.py
+@@ -9,6 +9,12 @@ Now the requester does not write the status at all. It appends an ``archive_requ
+ fenced, so the Board accepts it from any gateway) and reports ``archive_pending``. The holder pulls the event into its
+ copy of the card, which wakes its dispatcher; that tick (:func:`apply_stop_requests`) archives the card there,
+ terminating its host-local worker, and the holder's status write (it owns the lease) reaches every gateway.
++
++Every other lifecycle write (complete, block, schedule, unblock, review, reclaim, move, ...) on such a card is refused
++before it writes, through :func:`remote_holder` with the one :func:`refusal` message: the CLI via
++:func:`cli_refusal`, the kanban_* tools in ``tools/kanban_tools._remote_lease_refusal``. Before that, ``hermes kanban
++complete`` printed ``Completed``, closed the run mirror (task_runs is not fenced, so that handoff stuck) and notified
++subscribers, and only then did the Board reject the status (t_01a1ccfeab615947, 2026-11-13).
+ """
+ from __future__ import annotations
+ 
+@@ -55,6 +61,43 @@ def remote_holder(conn: sqlite3.Connection, task_id: str, now_ms: Optional[int]
+     return str(row["lease_holder"])
+ 
+ 
++def refusal(verb: str, task_id: str, holder: str) -> str:
++    """The one message every refused lifecycle write (CLI verb or kanban_* tool) prints under a remote lease."""
++    return (f"cannot {verb} {task_id}: it is running under {holder}'s live lease. Nothing changed. "
++            f"Let {holder}'s run finish, or archive it to stop it.")
++
++
++# CLI verbs whose write moves a lifecycle column the Board fences to the lease holder (status, current_run_uid,
++# result, started_at, completed_at). ``edit`` only with --result. ``archive`` is not here: it sends a stop request.
++CLI_FENCED_VERBS = frozenset({
++    "complete", "block", "schedule", "unblock", "request-review", "request-changes", "reopen-review", "reclaim",
++    "move", "reassign", "promote", "reopen",
++})
++
++
++def cli_refusal(action: str, args: Any) -> Optional[str]:
++    """For ``hermes kanban <action>``: the refusal for the first target card under another machine's live lease,
++    else None. Checked before the handler runs, so a refused (bulk) command writes nothing; ``--force`` does not
++    bypass it, because the Board rejects the write (``live_claim``) after the CLI would have printed success."""
++    if action not in CLI_FENCED_VERBS and not (action == "edit" and getattr(args, "result", None) is not None):
++        return None
++    ids = list(getattr(args, "task_ids", None) or []) or [getattr(args, "task_id", None),
++                                                          *(getattr(args, "ids", None) or [])]
++    ids = [str(i) for i in ids if i]
++    if not ids:
++        return None
++    try:
++        from hermes_cli import kanban_db_connect as kbc
++        with kbc.connect_closing() as conn:
++            for tid in ids:
++                holder = remote_holder(conn, tid)
++                if holder is not None:
++                    return refusal(action.replace("-", " "), tid, holder)
++    except Exception:  # health: allow BLE001 -- the handler reports its own board errors
++        _log.debug("kanban %s: remote lease check failed", action, exc_info=True)
++    return None
++
++
+ def _run_uid(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+     row = conn.execute("SELECT r.uid FROM tasks t JOIN task_runs r ON r.id = t.current_run_id WHERE t.id = ?",
+                        (task_id,)).fetchone()
+diff --git a/tests/hermes_cli/test_kanban_remote_lease_status_writes.py b/tests/hermes_cli/test_kanban_remote_lease_status_writes.py
+new file mode 100644
+index 0000000000..76ce7b75f4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_remote_lease_status_writes.py
+@@ -0,0 +1,213 @@
++"""Status writes on a card another machine runs under its live Board lease are refused up front. [daveey]
++
++Before: ``hermes kanban complete <id>`` on the creator (no local claim; the lease is only mirrored as
++``lease_holder``/``lease_expires``) wrote ``done`` locally, closed the run mirror, queued a completion notice and
++printed ``Completed``; then the Board rejected the push (``live_claim``) and the card read back ``running``
++(laptop-1, t_01a1ccfeab615947, 2026-11-13). The run mirror is not fenced, so its rejected handoff stuck.
++
++Now every CLI verb and kanban_* tool that writes a lifecycle column refuses before writing, names the holder and
++leaves the database byte-for-byte as it was. ``--force`` does not bypass it: the Board rejects the write anyway.
++"""
++
++from __future__ import annotations
++
++import argparse
++import contextlib
++import io
++import json
++import shlex
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_notify as kbn
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_remote_archive import _running_on_worker
++from tests.hermes_cli.test_kanban_worker_node import HUB, WORKER, Gateway
++
++
++# The two-gateway fixtures of test_kanban_remote_archive: hub creates the card, worker-1 runs it under its lease.
++@pytest.fixture
++def svc():
++    return FakeService(lease_runs=True)
++
++
++@pytest.fixture
++def gws(tmp_path, monkeypatch, svc):
++    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK", "HERMES_KANBAN_BOARD",
++                "HERMES_KANBAN_DB"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    sync.consume_dispatcher_wake()
++    hub = Gateway(tmp_path, HUB, svc, monkeypatch, pickup=False)
++    worker = Gateway(tmp_path, WORKER, svc, monkeypatch, pickup="true")
++    yield hub, worker
++    for g in (hub, worker):
++        g.conn.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++@pytest.fixture
++def kills(monkeypatch):
++    sent: list[tuple[int, int]] = []
++    monkeypatch.setattr(kbd, "_kill_fn", lambda signal_fn: (lambda pid, sig: sent.append((pid, sig))))
++    monkeypatch.setattr(kbd, "_poll_worker_exit", lambda pid, started_at=None: True)
++    return sent
++
++
++def _cli(line: str) -> tuple[int, str]:
++    """Run ``hermes kanban <line>`` in-process; return (exit code, stdout+stderr)."""
++    from hermes_cli import kanban as kcli
++    from hermes_cli.kanban_parser import build_parser
++    parser = build_parser(argparse.ArgumentParser(add_help=False).add_subparsers(dest="_top"))
++    args = parser.parse_args(shlex.split(line))
++    out, err = io.StringIO(), io.StringIO()
++    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
++        rc = kcli.kanban_command(args)
++    return int(rc or 0), out.getvalue() + err.getvalue()
++
++
++def _snapshot(conn) -> dict:
++    """Every row of every table: the refusal must leave all of them unchanged."""
++    tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' "
++                                         "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
++    return {t: [tuple(r) for r in conn.execute(f'SELECT * FROM "{t}" ORDER BY rowid')] for t in tables}
++
++
++def _run_row(conn, tid):
++    return tuple(conn.execute("SELECT r.status, r.outcome, r.summary, r.metadata, r.ended_at FROM tasks t "
++                              "JOIN task_runs r ON r.id = t.current_run_id WHERE t.id = ?", (tid,)).fetchone())
++
++
++def _assert_refused(conn, tid, before, run_before, rc, out, verb):
++    assert rc != 0, out
++    assert f"cannot {verb} {tid}: it is running under {WORKER}'s live lease. Nothing changed." in out, out
++    assert f"Let {WORKER}'s run finish, or archive it to stop it." in out, out
++    assert _snapshot(conn) == before  # tasks, task_runs, task_events, kanban_sync_outbox, notify state: untouched
++    assert kb.get_task(conn, tid).status == "running"
++    assert _run_row(conn, tid) == run_before
++    assert "completed" not in [r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id = ?", (tid,))]
++
++
++def test_cli_complete_under_a_remote_lease_is_refused_and_writes_nothing(gws, svc, kills):
++    """The incident: before the fix this exited 0, printed ``Completed`` and wrote ``done``."""
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    hub.enter()
++    kbn.add_notify_sub(hub.conn, task_id=tid, platform="desktop", chat_id="chat-1")  # a subscriber to notify
++    before, run_before = _snapshot(hub.conn), _run_row(hub.conn, tid)
++    rc, out = _cli(f"complete {tid} --summary x")
++    _assert_refused(hub.conn, tid, before, run_before, rc, out, "complete")
++    assert "Completed" not in out
++    # The subscriber has no completion notice to deliver.
++    _cursor, unseen = kbn.unseen_events_for_sub(hub.conn, task_id=tid, platform="desktop", chat_id="chat-1",
++                                                kinds=["completed"])
++    assert unseen == []
++    hub.round()  # nothing reaches the Board to be rejected
++    assert not hub.conn.execute("SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'sync_rejected'",
++                                (tid,)).fetchone()
++
++
++# Every CLI verb that writes a lifecycle column (status, current_run_uid, result, started_at, completed_at).
++_CLI_LINES = [
++    ("complete", "complete {tid} --summary x --force"),
++    ("block", "block {tid} stop now --kind needs_input"),
++    ("schedule", "schedule {tid} later"),
++    ("unblock", "unblock {tid}"),
++    ("request review", "request-review {tid} --summary x --force"),
++    ("request changes", "request-changes {tid} redo it"),
++    ("reopen review", "reopen-review {tid}"),
++    ("reclaim", "reclaim {tid}"),
++    ("move", "move {tid} --pool --reason x --reclaim"),
++    ("reassign", "reassign {tid} other --reclaim"),
++    ("promote", "promote {tid}"),
++    ("reopen", "reopen {tid} --reason x"),
++    ("edit", "edit {tid} --result x"),
++]
++
++
++@pytest.mark.parametrize("verb,line", _CLI_LINES, ids=[v for v, _ in _CLI_LINES])
++def test_every_cli_status_verb_under_a_remote_lease_is_refused(gws, svc, kills, verb, line):
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    hub.enter()
++    before, run_before = _snapshot(hub.conn), _run_row(hub.conn, tid)
++    rc, out = _cli(line.format(tid=tid))
++    _assert_refused(hub.conn, tid, before, run_before, rc, out, verb)
++
++
++def test_cli_edit_of_title_under_a_remote_lease_still_works(gws, svc, kills):
++    """Only status-moving edits are fenced; a title edit is not a lifecycle write."""
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    hub.enter()
++    rc, out = _cli(f"edit {tid} --title renamed")
++    assert rc == 0, out
++    assert kb.get_task(hub.conn, tid).title == "renamed"
++
++
++def test_a_bulk_cli_write_with_one_remote_leased_card_writes_none(gws, svc, kills):
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    hub.enter()
++    other = kb.create_task(hub.conn, title="queued here", assignee="default", runs_on=["machine:hub"])
++    before = _snapshot(hub.conn)
++    rc, out = _cli(f"complete {other} {tid}")
++    assert rc != 0 and WORKER in out, out
++    assert _snapshot(hub.conn) == before
++
++
++# Every kanban_* tool that writes a lifecycle column, called outside the card's own run.
++_TOOL_CALLS = [
++    ("complete", "_handle_complete", {"summary": "done elsewhere"}),
++    ("block", "_handle_block", {"reason": "stop"}),
++    ("unblock", "_handle_unblock", {}),
++    ("schedule", "_handle_schedule", {"reason": "later"}),
++    ("continue", "_handle_continue", {"checkpoint": "half"}),
++    ("request review", "_handle_request_review", {"summary": "x"}),
++    ("request changes", "_handle_request_changes", {"reason": "redo"}),
++    ("move", "_handle_move", {"runs_on": ["pool:worker"], "reason": "x", "checkpoint": "y"}),
++]
++
++
++@pytest.mark.parametrize("verb,handler,extra", _TOOL_CALLS, ids=[h for _, h, _ in _TOOL_CALLS])
++def test_every_lifecycle_tool_under_a_remote_lease_is_refused(gws, svc, kills, verb, handler, extra):
++    from tools import kanban_tools
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    hub.enter()
++    before, run_before = _snapshot(hub.conn), _run_row(hub.conn, tid)
++    out = json.loads(getattr(kanban_tools, handler)({"task_id": tid, **extra}))
++    assert out.get("rejection") == "live_claim" and out.get("holder") == WORKER, out
++    assert out.get("code") == "remote_live_lease", out
++    _assert_refused(hub.conn, tid, before, run_before, 1, out["error"], verb)
++
++
++# --- regressions: no live remote lease, no refusal -------------------------------------------------------------
++
++def test_cli_complete_after_the_remote_lease_expired_completes_as_before(gws, svc, kills):
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    hub.enter()
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET lease_expires = ? WHERE id = ?", (int(time.time() * 1000) - 1000, tid))
++    rc, out = _cli(f"complete {tid} --summary x")
++    assert rc == 0 and f"Completed {tid}" in out, out
++    assert kb.get_task(hub.conn, tid).status == "done"
++
++
++def test_cli_complete_when_this_gateway_holds_the_lease_completes_as_before(gws, svc, kills):
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    hub.enter()
++    own = str(sync._state(hub.conn)["gateway_id"])
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET lease_holder = ? WHERE id = ?", (own, tid))
++    rc, out = _cli(f"complete {tid} --summary x")
++    assert rc == 0 and f"Completed {tid}" in out, out
++    assert kb.get_task(hub.conn, tid).status == "done"
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 7d0ae67326..a44b8488aa 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -279,7 +279,7 @@ def _kanban_handler(tool_name: str, *, classify_rejections: bool = False) -> Cal
+ # kanban_archive is not here: it sends the holder a stop request instead (kanban_remote_stop). [daveey]
+ _LEASE_FENCED_TOOLS = frozenset({
+     "kanban_complete", "kanban_block", "kanban_unblock", "kanban_schedule", "kanban_continue",
+-    "kanban_request_review", "kanban_request_changes",
++    "kanban_request_review", "kanban_request_changes", "kanban_move",
+ })
+ 
+ 
+@@ -294,7 +294,7 @@ def _remote_lease_refusal(tool_name: str, args: dict) -> Optional[str]:
+     if not tid:
+         return None
+     try:
+-        from hermes_cli.kanban_remote_stop import remote_holder
++        from hermes_cli.kanban_remote_stop import refusal, remote_holder
+         with _board(args.get("board"), quiet_close=True) as (_kb, conn):
+             holder = remote_holder(conn, str(tid))
+     except Exception:
+@@ -302,11 +302,9 @@ def _remote_lease_refusal(tool_name: str, args: dict) -> Optional[str]:
+         return None  # the handler reports its own board errors
+     if holder is None:
+         return None
+-    return tool_error(
+-        f"{tool_name} refused: {tid} is running under {holder}'s live lease on the Board, which accepts "
+-        f"lifecycle writes only from the lease holder. Nothing changed. Act on {holder}, use kanban_archive "
+-        f"(it sends {holder} a stop request), or wait for the run to end.",
+-        rejection="live_claim", code="remote_live_lease", holder=holder)
++    verb = tool_name.removeprefix("kanban_").replace("_", " ")
++    return tool_error(refusal(verb, str(tid), holder), rejection="live_claim", code="remote_live_lease",
++                      holder=holder)
+ 
+ 
+ # The delegate-child / worker-subprocess write fence lives in a sibling (line cap); re-exported here. [daveey]
+-- 
+2.43.0
+

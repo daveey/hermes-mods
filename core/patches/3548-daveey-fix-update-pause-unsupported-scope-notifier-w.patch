@@ -1,0 +1,488 @@
+From d495dccb3fea492c44181f588420f4db69f3972c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:41:47 +0000
+Subject: [PATCH] [daveey] fix(update-pause): unsupported-scope notifier wakes
+ and lease-wait steers still re-queue under the hold
+
+Follow-up to ea4f9dc74e5 (PR #2168), the three non-blocking points of review 5890674054.
+
+1. Turn-start gate for unsupported-scope wakes. The gate (claim_held) was installed only for a scope
+   `supported()` accepts. A notifier wake it refuses (a detached route's local_automation_v1 Kanban wake) could
+   still start inside the hold window. That turn is not exempt from the drain. `active_work` lists it as a chat
+   unit with update_pausable=False. hermes-sync `_parkable_gateway_chat` never waits that unit out, and
+   `core_update_worker_candidates` refuses it as "unmatched gateway work": the same lease loss as incident 31763,
+   with no pause option. The re-queue path (`requeue_unstarted_input`) writes no checkpoint, so it does not need
+   a checkpoint-capable scope. Decision: `installed()` now sets ONLY the turn-start gate for a held-class claim
+   whose scope is ineligible (no boundary hook, never update_pausable), and removes it after the run.
+   `noted_completion` rows are not notifier wakes (their producers are never `kanban-wake`). A managed-worker
+   session never binds a scope (`admit_managed` runs before `pause_scope`), so it stays out of scope; this is
+   documented on `claim_hold_gate`.
+
+2. Steering transfer while the turn waited on the lease. A queued prompt steered into the claim after its
+   turn-start check made `requeue_unstarted_input` refuse ("steering transfer exists"), then the checkpoint
+   refused too, and the wake settled interrupted: the wake was lost. `requeue_unstarted` now reads the owner's
+   `steer_transfers` after execution returned (the executing stamp is already cleared, so no steer can be
+   delivered any more; undelivered tickets are withdrawn from the agent). It passes them to the store, which
+   requeues every transfer the turn never took with `_requeue_transfer` in the same write, each in its own FIFO
+   place. It still refuses, now with the distinct detail "steering transfer delivered", when a transfer reached
+   the turn, and the warning logs that detail. Without `transfers` the old refusal stands.
+
+3. End-to-end test through the real TurnRunner -> AIAgent.run_conversation -> pause_before_turn ->
+   project_paused_result -> retain_pause/pending_results -> park_or_interrupt wiring. Only agent allocation
+   and the provider are controlled.
+
+Tests (tests/gateway/test_update_hold_claimed_wake.py, tests/hermes_state/test_requeue_unstarted_input.py):
+- composed wake re-queue, parametrized [unsupported-scope] (supported() False): RED on origin/main ("the wake
+  began its turn inside the update hold"), GREEN here.
+- the real `supported` refuses a detached-route kanban wake, which gets only the gate (no hook, not
+  pausable): RED (KeyError update_yield_before_turn), GREEN.
+- composed steer committed after the turn-start check: RED (wake ('terminal','interrupted')), GREEN (wake
+  re-queued, the steered prompt runs once as its own turn, then the wake after the lift, both completed).
+- store: an undelivered transfer goes back with the wake in one write (both queued, FIFO order); a delivered
+  one refuses "steering transfer delivered"; no transfer read still refuses "steering transfer exists". RED
+  (TypeError transfers), GREEN.
+- real TurnRunner/AIAgent e2e: no provider request and no transcript row inside the hold, re-queued, then
+  one run of the same admission after the lift.
+Wider: 28 files importing the changed modules (242 tests) and 23 update-pause/queued-steer files (179) pass;
+scripts/check --base origin/main ok.
+---
+ gateway/session_update_pause.py               |  17 +-
+ gateway/session_update_pause_hook.py          |  11 +-
+ gateway/session_update_pause_ingress.py       |  10 +-
+ hermes_state_update_pause.py                  |  22 +-
+ .../gateway/test_update_hold_claimed_wake.py  | 208 +++++++++++++++++-
+ .../test_requeue_unstarted_input.py           |  40 ++++
+ 6 files changed, 294 insertions(+), 14 deletions(-)
+
+diff --git a/gateway/session_update_pause.py b/gateway/session_update_pause.py
+index c74d995d64..6ec29e848b 100644
+--- a/gateway/session_update_pause.py
++++ b/gateway/session_update_pause.py
+@@ -166,12 +166,19 @@ async def requeue_unstarted(authority, live, ref, row):
+     from gateway.session_runtime_workers import tracked_write, persist_work_count
+     from hermes_state_runtime import RuntimeStoreError
+     from hermes_state_update_pause import requeue_unstarted_input
++    from gateway.session_settlement_recovery import _transfers
++    # [daveey] t_01a1d4d4c30c7e43: read after execution returned (no steer can reach the turn now); each
++    # undelivered transfer goes back to its own FIFO place in the same write, behind the wake.
++    transfers = _transfers(authority, live, row) or {}
+     try:
+         await tracked_write(authority, partial(requeue_unstarted_input, authority.db, epoch=authority.epoch,
+-            admission_id=row['admission_id'], generation=row['generation'], transcript_mark=row['transcript_mark']))
++            admission_id=row['admission_id'], generation=row['generation'], transcript_mark=row['transcript_mark'],
++            transfers=transfers))
+     except RuntimeStoreError as exc:
++        detail = getattr(exc, 'detail', None)
+         logging.getLogger(__name__).warning('Unstarted gateway turn could not be re-queued for update: session=%s '
+-                                            'admission=%s (%s)', ref.session_id, row['admission_id'], exc)
++                                            'admission=%s (%s%s)', ref.session_id, row['admission_id'], exc,
++                                            f': {detail}' if detail else '')
+         return None
+     authority.pending_results.pop(row['admission_id'], None)
+     previous = authority.update_claims.pop(ref.session_id, None)
+@@ -180,8 +187,12 @@ async def requeue_unstarted(authority, live, ref, row):
+     with live.event_stream.lock:
+         live.event_stream.execution = {}
+         authority.adopted.pop(ref.session_id, None)
++        entry = authority.steer_transfers.get(ref.session_id)
++        if entry is not None and entry[0] == row['generation']:
++            authority.steer_transfers.pop(ref.session_id, None)
+     logging.getLogger(__name__).info('Re-queued unstarted gateway turn for update hold: session=%s admission=%s '
+-                                     'generation=%s', ref.session_id, row['admission_id'], row['generation'])
++                                     'generation=%s%s', ref.session_id, row['admission_id'], row['generation'],
++                                     f' (with {len(transfers)} steer transfer(s))' if transfers else '')
+     authority._publish_pending(ref)
+     persist_work_count(authority)
+     return True
+diff --git a/gateway/session_update_pause_hook.py b/gateway/session_update_pause_hook.py
+index 716388c3d9..e95fd52112 100644
+--- a/gateway/session_update_pause_hook.py
++++ b/gateway/session_update_pause_hook.py
+@@ -160,10 +160,19 @@ def installed(agent: Any, scope: UpdatePauseScope | None = None, *,
+     if scope is not None and scope.message_id is not _MISSING:
+         if message_id is _MISSING or message_id is None or message_id != scope.message_id:
+             scope = None
++    from agent.update_pause_cancel import BEFORE_TURN_ATTR
++    if scope is not None and not scope.eligible and scope.claim_held is not None:
++        # [daveey] t_01a1d4d4c30c7e43: a held-class claim whose scope cannot checkpoint (a detached route's wake)
++        # still yields before it starts: the unstarted re-queue needs no boundary. No hook, never update_pausable.
++        vars(agent)[BEFORE_TURN_ATTR] = before_turn_gate(agent, scope.claim_held)
++        try:
++            yield False
++        finally:
++            vars(agent).pop(BEFORE_TURN_ATTR, None)
++        return
+     if scope is None or not scope.eligible:
+         yield False
+         return
+-    from agent.update_pause_cancel import BEFORE_TURN_ATTR
+     prior = vars(agent).get(_HOOK_ATTR, _MISSING)
+     root = fence_root(scope.home)
+     setattr(agent, _HOOK_ATTR, boundary_hook(agent, root))
+diff --git a/gateway/session_update_pause_ingress.py b/gateway/session_update_pause_ingress.py
+index 4692902823..e9ed7fa9d8 100644
+--- a/gateway/session_update_pause_ingress.py
++++ b/gateway/session_update_pause_ingress.py
+@@ -59,7 +59,15 @@ def claim_hold_gate(row):
+     """[daveey] t_01a1d49d50e4c656: the claim's own hold test for this row's class, re-asked at turn start (None:
+     the claim never holds the row). A notifier wake waits queued under a core-update claim hold
+     (``session_notifier_drain.eligible``); one claimed before the hold may start long after it (a session turn
+-    lease wait), so its turn re-asks and, held, the admission goes back to its FIFO place (``requeue_unstarted``)."""
++    lease wait), so its turn re-asks and, held, the admission goes back to its FIFO place (``requeue_unstarted``).
++
++    [daveey] t_01a1d4d4c30c7e43: installed whether or not the scope is ``supported`` (``installed`` then sets only
++    this gate). An unsupported notifier wake (a detached route's ``local_automation_v1`` wake) is not exempt from
++    the drain: ``active_work`` lists its turn as a chat unit with ``update_pausable`` False, which the reclaim
++    preflight never waits out (hermes-sync ``_parkable_gateway_chat``) and refuses as ``unmatched gateway work``.
++    The re-queue writes no checkpoint, so it needs no checkpoint-capable scope. ``noted_completion`` rows are no
++    notifier wakes (their producers are never ``kanban-wake``). A managed-worker session never binds a scope
++    (``admit_managed`` runs before ``pause_scope``): out of scope here."""
+     from gateway import session_notifier_drain
+     if row.get('update_resume') or not session_notifier_drain.notifier_wake(row):
+         return None
+diff --git a/hermes_state_update_pause.py b/hermes_state_update_pause.py
+index 4317dc42dd..6f3a847ac6 100644
+--- a/hermes_state_update_pause.py
++++ b/hermes_state_update_pause.py
+@@ -178,14 +178,20 @@ def resume_session_checkpoint(db, *, epoch, admission_id, _guard=None):
+     return db._execute_write(write)
+ 
+ 
+-def requeue_unstarted_input(db, *, epoch, admission_id, generation, transcript_mark):
++def requeue_unstarted_input(db, *, epoch, admission_id, generation, transcript_mark, transfers=None):
+     """[daveey] t_01a1d49d50e4c656: hand an exact started generation that never began its turn back to its FIFO place.
+ 
+     The claim held no proof of a boundary because the turn wrote nothing: refused (``invalid_checkpoint``) once any
+     transcript row of the conversation's chain postdates the claim's ``transcript_mark``, or once a worker, a
+     steering transfer or a checkpoint exists for it. ``seq`` is untouched, so the row is the FIFO head again and
+     the next claim re-validates it (a held notifier wake then waits queued). The old generation is fenced: its
+-    status is no longer started, so its settlement and checkpoint writes refuse."""
++    status is no longer started, so its settlement and checkpoint writes refuse.
++
++    [daveey] t_01a1d4d4c30c7e43: ``transfers`` (``{admission_id: delivered}``, the owner's ``steer_transfers`` read
++    after the execution returned) hands back, in this write, every steering transfer bound to the generation that
++    no drain of the turn took (``_requeue_transfer``, its own FIFO place): a steer committed while the turn waited
++    on the session turn lease must not cost the wake its re-queue. Refused (``steering transfer delivered``) when
++    one reached the turn; without ``transfers`` any transfer refuses, as before."""
+     _text(admission_id)
+     def write(conn):
+         _epoch(conn, epoch)
+@@ -199,10 +205,13 @@ def requeue_unstarted_input(db, *, epoch, admission_id, generation, transcript_m
+         from hermes_state_runtime_workers import worker_states
+         if worker_states(conn, logical):
+             _refuse('worker execution is live or uncertain')
+-        if conn.execute("SELECT 1 FROM session_admissions WHERE target_session_id=? AND status='terminal' "
+-                        "AND outcome='steering' AND owner_epoch=? AND generation=? LIMIT 1",
+-                        (logical, epoch, generation)).fetchone():
++        steering = [r[0] for r in conn.execute(
++            "SELECT admission_id FROM session_admissions WHERE target_session_id=? AND status='terminal' "
++            "AND outcome='steering' AND owner_epoch=? AND generation=? ORDER BY seq", (logical, epoch, generation))]
++        if steering and transfers is None:
+             _refuse('steering transfer exists')
++        if any((transfers or {}).get(steer) for steer in steering):
++            _refuse('steering transfer delivered')
+         if conn.execute('SELECT 1 FROM state_meta WHERE key=?', (CHECKPOINT_PREFIX + admission_id,)).fetchone():
+             _refuse('checkpoint exists')
+         from hermes_state_local_lineage import local_physical_target
+@@ -213,6 +222,9 @@ def requeue_unstarted_input(db, *, epoch, admission_id, generation, transcript_m
+             _refuse('turn wrote its transcript')
+         conn.execute("UPDATE session_admissions SET status='queued',generation=NULL WHERE admission_id=? "
+                      "AND status='started'", (admission_id,))
++        from hermes_state_runtime import _requeue_transfer
++        for steer in steering:
++            _requeue_transfer(conn, admission_id=steer, epoch=epoch, generation=generation)
+         conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (logical,))
+         return _row(_admission(conn, admission_id))
+     return db._execute_write(write)
+diff --git a/tests/gateway/test_update_hold_claimed_wake.py b/tests/gateway/test_update_hold_claimed_wake.py
+index b6234f1424..5f17f1ef32 100644
+--- a/tests/gateway/test_update_hold_claimed_wake.py
++++ b/tests/gateway/test_update_hold_claimed_wake.py
+@@ -18,21 +18,26 @@ import pytest
+ from gateway.session_results import execution_result
+ 
+ 
+-def _turn_start(agent_history, event):
++def _turn_start(agent_history, event, agent=None):
+     """What TurnRunner does for the agent run: install the hook for the bound scope, then the agent's own
+     turn-start check (``conversation_loop`` runs it after acquiring the session turn lease)."""
+     from agent.update_pause_cancel import pause_before_turn
+     from gateway.run_turn_runner import project_paused_result
+     from gateway.session_update_pause_hook import installed
+-    agent = SimpleNamespace()
++    agent = SimpleNamespace() if agent is None else agent
+     with installed(agent, message_id=event.message_id):
+         paused = pause_before_turn(agent, agent_history)
+     return None if paused is None else project_paused_result(paused, {})
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_wake_claimed_before_the_hold_goes_back_to_its_fifo_until_the_hold_lifts(tmp_path, monkeypatch):
+-    from gateway import session_notifier_drain, session_update_pause
++@pytest.mark.parametrize('checkpointable', [True, False], ids=['supported-scope', 'unsupported-scope'])
++async def test_wake_claimed_before_the_hold_goes_back_to_its_fifo_until_the_hold_lifts(tmp_path, monkeypatch,
++                                                                                         checkpointable):
++    """[daveey] t_01a1d4d4c30c7e43 (unsupported-scope): a wake whose scope cannot checkpoint (``supported`` False:
++    a detached route's wake) re-queues the same way. Its turn would otherwise run unpausable inside the window,
++    and the reclaim preflight refuses such a chat unit as ``unmatched gateway work``."""
++    from gateway import session_notifier_drain, session_update_pause, session_update_pause_ingress
+     from gateway.config import GatewayConfig
+     from gateway.run import GatewayRunner
+     from gateway.session_authority import initialize_session_authority
+@@ -53,6 +58,8 @@ async def test_wake_claimed_before_the_hold_goes_back_to_its_fifo_until_the_hold
+     monkeypatch.setattr(session_notifier_drain, 'held', lambda: asked.append(1) or held[0])
+     monkeypatch.setattr(session_update_pause, 'update_held', lambda authority: held[0])
+     monkeypatch.setattr(admission_fence, 'pause_requested', lambda root: held[0])
++    if not checkpointable:
++        monkeypatch.setattr(session_update_pause_ingress, 'supported', lambda *a, **k: False)
+     started, ran = [], []
+ 
+     async def turn(event, source, quick_key, run_generation):
+@@ -140,3 +147,196 @@ async def test_human_turn_claimed_before_the_hold_still_runs(tmp_path, monkeypat
+         with installed(agent, message_id='m1') as hooked:
+             assert hooked
+             assert BEFORE_TURN_ATTR not in vars(agent)
++
++
++def test_detached_route_wake_gets_only_the_turn_start_gate(tmp_path, monkeypatch):
++    """[daveey] t_01a1d4d4c30c7e43: the real ``supported`` refuses a detached route's ``local_automation_v1`` wake (its
++    resume is not covered), so no boundary hook is installed and it never reads ``update_pausable``; its turn
++    still yields before it starts while the claim would hold it."""
++    import json
++    from agent.update_pause_cancel import BEFORE_TURN_ATTR
++    from gateway import session_notifier_drain
++    from gateway.session_update_pause_hook import _HOOK_ATTR, installed, update_pausable
++    from gateway.session_update_pause_ingress import pause_scope, supported
++    from tui_gateway.update_pause import PAUSE_REASON
++    held = [True]
++    monkeypatch.setattr(session_notifier_drain, 'held', lambda: held[0])
++    monkeypatch.setattr('gateway.session_tui_ops._profile_home', lambda authority: tmp_path)
++    identity = json.dumps(['kanban-wake', 'route', 'x'], separators=(',', ':'))
++    wake = {'payload': {'text': 'wake', 'local_automation_v1': {'identity': identity, 'owner': 's'}},
++            'request_id': identity, 'principal_id': 'automation:route'}
++    live = SimpleNamespace(source=SimpleNamespace(platform=SimpleNamespace(value='telegram')))
++    assert supported(None, wake, None, live, is_api=False) is False
++    with pause_scope(SimpleNamespace(), wake, SimpleNamespace(message_id='m1'), live, is_api=False):
++        agent = SimpleNamespace()
++        with installed(agent, message_id='m1') as hooked:
++            assert hooked is False and not update_pausable(agent) and _HOOK_ATTR not in vars(agent)
++            gate = vars(agent)[BEFORE_TURN_ATTR]
++            assert gate() == PAUSE_REASON
++            held[0] = False
++            assert gate() is None
++        assert BEFORE_TURN_ATTR not in vars(agent)  # removed after the run (the agent is cached)
++
++
++async def _wake_session(tmp_path, monkeypatch, instance_id):
++    """A composed local Desktop-style chat (interactive ``tui`` source) whose Kanban wake the test admits; the
++    notifier hold is ``held[0]``."""
++    from gateway import session_notifier_drain, session_update_pause
++    from gateway.config import GatewayConfig
++    from gateway.run import GatewayRunner
++    from gateway.session_authority import initialize_session_authority
++    from gateway.session_controls import AuthorityConnection
++    from gateway.session_local import create_local_session
++    from hermes_cli import admission_fence
++    from hermes_state import SessionDB
++
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / 'sessions'))
++    db = SessionDB(tmp_path / 'state.db')
++    runner.session_store._db = runner._session_db = db
++    authority = await initialize_session_authority(runner, profile_id='default', instance_id=instance_id, db=db)
++    held = [False]
++    monkeypatch.setattr(session_notifier_drain, 'held', lambda: held[0])
++    monkeypatch.setattr(session_update_pause, 'update_held', lambda authority: held[0])
++    monkeypatch.setattr(admission_fence, 'pause_requested', lambda root: held[0])
++    connection = AuthorityConnection(authority, object(), {'user_id': 'owner'})
++    ref = create_local_session(authority, connection.actor, dict(request_id='cli', source='tui', model='fixture',
++                                                                 cwd=str(tmp_path), toolsets=[]))
++    await authority.attach(connection.actor, ref, history=False)
++    connection.subscriptions[ref.session_id] = 'attached'
++    return runner, db, authority, ref, connection, held
++
++
++async def _close(authority, db, held, connection):
++    held[0] = False
++    await connection.close()
++    tasks = [live.task for live in authority.sessions.values() if live.task]
++    for task in tasks:
++        if not task.done():
++            task.cancel()
++    await asyncio.gather(*tasks, return_exceptions=True)
++    db.close()
++
++
++@pytest.mark.asyncio
++async def test_a_steer_committed_while_the_wake_waited_on_the_lease_goes_back_with_it(tmp_path, monkeypatch):
++    """[daveey] t_01a1d4d4c30c7e43: a queued prompt steered into the claimed wake after its turn-start check (the turn
++    was still waiting on the session turn lease) used to make ``requeue_unstarted_input`` refuse ("steering
++    transfer exists"), then the checkpoint refused too and the wake settled interrupted: lost. Now the transfer the
++    turn never took goes back to its own FIFO place in the requeue's write, and both still run once."""
++    from gateway.session_contract import Submission
++    from gateway.session_automation import admit_route_wake
++    from hermes_state_runtime import list_session_admissions
++    from tests.gateway.test_prompt_queued_transfer import BufferedAgent
++    from tests.waiting import async_wait_until
++
++    runner, db, authority, ref, connection, held = await _wake_session(tmp_path, monkeypatch, 'wake-steer')
++    sid = ref.session_id
++    wake, ran, steer_replies = '[IMPORTANT: Kanban task updates arrived]', [], []
++    agent = BufferedAgent()
++
++    async def turn(event, source, quick_key, run_generation):
++        if event.text != wake or steer_replies:
++            assert event.text != wake or not held[0], 'a held wake was claimed again inside the hold'
++            ran.append(event.text)
++            execution_result.get()['result'] = {'final_response': 'done', 'messages': []}
++            return 'done'
++        authority.adopt_agent(sid, authority.executing[sid], agent)
++        held[0] = True  # the hold came on while the turn waited on the session turn lease
++        projected = _turn_start([], event, agent)
++        assert projected is not None, 'the wake must yield at turn start'
++        # The user steers the prompt queued behind the wake into it before the yielded turn returned.
++        follow = await authority.submit(connection.actor, Submission('follow-up', ref, {'text': 'follow-up'}, 'queue'))
++        steer_replies.append((follow.admission_id, await connection.dispatch({
++            'id': 1, 'method': 'prompt.steer_queued',
++            'params': {'session_id': sid, 'admission_id': follow.admission_id}})))
++        execution_result.get()['result'] = projected
++        return None
++
++    monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
++    try:
++        live = authority.sessions[sid]
++        adapter = runner._adapter_for_source(live.source)
++        assert await admit_route_wake(runner, adapter, live.source, wake, 'kanban-wake') is True
++        await async_wait_until(lambda: ran == ['follow-up'], timeout=10, what='the handed-back prompt ran')
++        follow_id, reply = steer_replies[0]
++        assert 'error' not in reply, reply  # the steer itself was accepted into the claim
++        rows = {r['admission_id']: r for r in list_session_admissions(db, session_id=sid, pending_only=False)}
++        wake_row = next(r for r in rows.values() if r['admission_id'] != follow_id)
++        assert (wake_row['status'], wake_row['outcome']) == ('queued', None), 'the wake was lost'
++        assert agent._pending_steer is None  # withdrawn: never left buffered for a later turn
++        held[0] = False
++        authority._schedule(ref)
++        await async_wait_until(lambda: ran == ['follow-up', wake], timeout=10, what='the wake ran after the lift')
++        await asyncio.wait_for(authority.sessions[sid].task, 10)
++        rows = list_session_admissions(db, session_id=sid, pending_only=False)
++        assert sorted((r['admission_id'] == follow_id, r['status'], r['outcome']) for r in rows) == [
++            (False, 'terminal', 'completed'), (True, 'terminal', 'completed')]
++    finally:
++        await _close(authority, db, held, connection)
++
++
++@pytest.mark.asyncio
++async def test_real_turn_runner_and_agent_requeue_the_unstarted_wake_then_run_it_once(tmp_path, monkeypatch):
++    """[daveey] t_01a1d4d4c30c7e43: end to end through the real TurnRunner -> AIAgent.run_conversation ->
++    pause_before_turn -> project_paused_result -> retain_pause (pending_results) -> park_or_interrupt wiring. Only
++    agent allocation and the provider are controlled; the hold comes on after the claim, before the turn starts."""
++    import copy
++    from gateway.run_turn_runner import TurnRunner
++    from gateway.session_automation import admit_route_wake
++    from hermes_state_runtime import list_session_admissions
++    from tests.agent.test_step_boundary_pause import _final_response, _make_agent
++    from tests.waiting import async_wait_until
++
++    runner, db, authority, ref, connection, held = await _wake_session(tmp_path, monkeypatch, 'wake-e2e')
++    physical = authority.physical_target(ref)
++    agent = _make_agent([])
++    del agent._execute_tool_calls
++    agent.session_id, agent._session_db = physical, db
++    agent._save_trajectory = lambda *a, **k: None
++    agent._cleanup_task_resources = lambda *a, **k: None
++    provider_inputs, allocations = [], []
++
++    def provider(**kwargs):
++        provider_inputs.append(copy.deepcopy(kwargs['messages']))
++        return _final_response()
++
++    agent.client.chat.completions.create.side_effect = provider
++
++    def allocate(turn, *a, **k):
++        allocations.append(turn._ctx.message)
++        if len(allocations) == 1:
++            held[0] = True  # the hold came on between the claim and the turn's start (the lease wait)
++        turn._ctx.agent_holder[0] = agent
++        return agent, len(allocations) > 1
++
++    monkeypatch.setattr(TurnRunner, '_resolve_turn_agent', allocate)
++    monkeypatch.setattr(runner, '_resolve_session_agent_runtime', lambda **k: ('test/model', {}))
++    wake = '[IMPORTANT: 28 Kanban task updates arrived while this session was busy]'
++    try:
++        live = authority.sessions[ref.session_id]
++        adapter = runner._adapter_for_source(live.source)
++        assert await admit_route_wake(runner, adapter, live.source, wake, 'kanban-wake') is True
++
++        def requeued():
++            rows = list_session_admissions(db, session_id=ref.session_id)
++            return ([(r['status'], r['outcome']) for r in rows] == [('queued', None)] and not authority.pending_results
++                    and authority.sessions[ref.session_id].event_stream.execution == {})
++        await async_wait_until(lambda: len(allocations) == 1 and requeued(), timeout=15,
++                               what='the unstarted wake went back to its FIFO place')
++        assert provider_inputs == [], 'the wake sent a model request inside the update hold'
++        assert db.get_messages(physical) == [], 'the unstarted wake wrote its transcript'
++        assert not authority.update_parked and not authority.executing
++        first_id = list_session_admissions(db, session_id=ref.session_id)[0]['admission_id']
++
++        held[0] = False
++        authority._schedule(ref)
++        await async_wait_until(lambda: len(provider_inputs) == 1, timeout=15, what='the wake ran after the lift')
++        await asyncio.wait_for(authority.sessions[ref.session_id].task, 15)
++        rows = list_session_admissions(db, session_id=ref.session_id, pending_only=False)
++        assert [(r['admission_id'], r['status'], r['outcome']) for r in rows] == [(first_id, 'terminal', 'completed')]
++        assert len(allocations) == 2 and provider_inputs[0][-1]['content'] == wake
++        stored = db.get_messages(physical)
++        assert [m['role'] for m in stored] == ['user', 'assistant'] and stored[-1]['content'] == 'done'
++    finally:
++        await _close(authority, db, held, connection)
+diff --git a/tests/hermes_state/test_requeue_unstarted_input.py b/tests/hermes_state/test_requeue_unstarted_input.py
+index 694989fc27..282b95a8bc 100644
+--- a/tests/hermes_state/test_requeue_unstarted_input.py
++++ b/tests/hermes_state/test_requeue_unstarted_input.py
+@@ -76,3 +76,43 @@ def test_refused_after_settlement(claimed):
+     with pytest.raises(rt.RuntimeStoreError) as exc:
+         _requeue(db, epoch, row)
+     assert exc.value.reason == 'stale_generation'
++
++
++def _steered(db, epoch, row):
++    """[daveey] t_01a1d4d4c30c7e43: the human row queued behind the wake, transferred to its claim (a steer committed
++    while the claimed turn waited on the session turn lease)."""
++    later = next(r for r in rt.list_session_admissions(db, session_id='s') if r['request_id'] == 'later')
++    transfer, fresh = rt.steer_session_input(db, epoch=epoch, admission_id=later['admission_id'],
++                                             generation=row['generation'])
++    assert fresh and (transfer['status'], transfer['outcome']) == ('terminal', rt.STEERING)
++    return later['admission_id']
++
++
++def test_an_undelivered_steer_transfer_goes_back_with_the_wake_in_the_same_write(claimed):
++    db, epoch, row = claimed
++    steer = _steered(db, epoch, row)
++    queued = _requeue(db, epoch, row, transfers={steer: False})
++    assert (queued['status'], queued['generation']) == ('queued', None)
++    pending = rt.list_session_admissions(db, session_id='s')
++    assert [(r['admission_id'], r['status'], r['outcome'], r['generation']) for r in pending] == [
++        (row['admission_id'], 'queued', None, None), (steer, 'queued', None, None)]  # each in its own FIFO place
++    again = rt.claim_session_input(db, epoch=epoch, session_id='s')
++    assert again['admission_id'] == row['admission_id']
++
++
++def test_a_steer_transfer_the_turn_took_refuses_the_requeue(claimed):
++    db, epoch, row = claimed
++    steer = _steered(db, epoch, row)
++    with pytest.raises(rt.RuntimeStoreError) as exc:
++        _requeue(db, epoch, row, transfers={steer: True})
++    assert (exc.value.reason, exc.value.detail) == ('invalid_checkpoint', 'steering transfer delivered')
++    assert rt.get_session_admission(db, admission_id=row['admission_id'])['status'] == 'started'
++    assert rt.get_session_admission(db, admission_id=steer)['outcome'] == rt.STEERING
++
++
++def test_a_steer_transfer_with_no_transfer_read_still_refuses(claimed):
++    db, epoch, row = claimed
++    _steered(db, epoch, row)
++    with pytest.raises(rt.RuntimeStoreError) as exc:
++        _requeue(db, epoch, row)
++    assert exc.value.detail == 'steering transfer exists'
+-- 
+2.43.0
+

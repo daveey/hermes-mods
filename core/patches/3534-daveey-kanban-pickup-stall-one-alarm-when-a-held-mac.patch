@@ -1,0 +1,477 @@
+From 653f131f9153be0e8769fb93763194f3448e6e5f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:13:17 +0000
+Subject: [PATCH] [daveey] kanban pickup-stall: one alarm when a held machine's
+ own default-placement cards wait and no other machine copies them
+
+Problem (t_01a1d4f2f591d595, 2026-11-13): t_01a1d49d50e4c656, the PR #2168
+land-lane owner, woke ready at 12:32Z. It was default placement (runs_on NULL)
+and created on worker-6, which was on a hub-worker-core-rollout hold (drain
+only). Every pool worker picks up `explicit`, and kanban_worker_node._skip_reason
+skips default-placement cards there. So no machine claimed it for 14 min, and
+#2173 waited in the lane behind it. The pickup-stall detector filed nothing,
+because it watched only foreign cards pinned machine:<host>.
+
+Why-chain:
+1. No machine took the Board lease: only worker-6 was eligible, and it was held.
+2. Default placement means "its creator", and explicit pickup keeps every other
+   worker off the card.
+3. The rollout hold stops claims but does not re-place the cards only that
+   worker may run.
+Root (not caught): the stall detector skipped default-placement cards whose
+only eligible machine is held.
+
+Fix (core half; the state half moves such cards when the rollout holds a worker):
+- kanban_pickup_stall_held.sweep runs on every dispatcher sweep of a held
+  machine M. It looks for cards on M's board that are ready, unclaimed, default
+  placement, created on M and use a scratch workspace, and that no other
+  active, unheld, non-explicit pickup machine would copy (kanban_worker_node.
+  eligible). If any has waited longer than kanban.sync.pickup_stall_seconds
+  (600 s by default) since both its ready_since and the hold's start, it files
+  ONE host-wide agent-owned alarm, keyed pickup-stall:<M>:held-default:. The
+  alarm lists every such card and is placed off M (alarm_placement). Cards
+  that a respawn guard holds are not listed.
+- kanban_pickup_stall_repin: the alarm's re-place scope accepts a listed card
+  that is still default placement and created on M (held_default_howto names
+  the operator move to pool:worker).
+- _create/_tail take an optional howto, so this alarm's body names the right
+  move.
+
+Tests: tests/hermes_cli/test_kanban_pickup_stall_held.py
+- T1 core half: the rollout's exact `move <id> --pool --reason "<w> on rollout
+  hold"` sets runs_on [pool:worker] and writes a moved event, and
+  worker-1's explicit pickup, which skipped the card before, then copies it.
+- T3: one alarm after the threshold, reused on the next sweep and placed on
+  worker-1. Nothing is filed under the threshold, when another machine can
+  claim the card, after the hold ends, after the move, or for a
+  dir-workspace card.
+RED on base: the T3 alarm test fails. GREEN: 5/5. The neighbouring suites
+(pickup_held_budget/copy, pickup_stall, _repin, _reservation, worker_node) pass:
+217 passed.
+---
+ hermes_cli/kanban_pickup_stall.py             |  21 ++-
+ hermes_cli/kanban_pickup_stall_held.py        | 124 +++++++++++++
+ hermes_cli/kanban_pickup_stall_repin.py       |  25 ++-
+ .../test_kanban_pickup_stall_held.py          | 170 ++++++++++++++++++
+ 4 files changed, 329 insertions(+), 11 deletions(-)
+ create mode 100644 hermes_cli/kanban_pickup_stall_held.py
+ create mode 100644 tests/hermes_cli/test_kanban_pickup_stall_held.py
+
+diff --git a/hermes_cli/kanban_pickup_stall.py b/hermes_cli/kanban_pickup_stall.py
+index 167fbe88f1..ee98787686 100644
+--- a/hermes_cli/kanban_pickup_stall.py
++++ b/hermes_cli/kanban_pickup_stall.py
+@@ -232,7 +232,7 @@ def _minutes(since_ms: int, now_ms: int) -> int:
+     return max(0, (now_ms - since_ms) // 60000)
+ 
+ 
+-def _tail(conn, own: str) -> str:
++def _tail(conn, own: str, howto: Optional[str] = None) -> str:
+     """The repair runs on another machine (:func:`alarm_placement`), so name where ``own``'s machine-local
+     evidence lives instead of saying "on this host"."""
+     from hermes_cli import kanban_pickup_stall_repin as repin
+@@ -247,9 +247,9 @@ def _tail(conn, own: str) -> str:
+             "Board row from any machine: `Hub(load_identity()).row_evidence(<board>, 'tasks', <card>)`. Check "
+             "`kanban.sync.pickup`, the machine registry entry (labels, hold, pickup), profiles, capabilities and "
+             "dispatcher capacity, fix the cause (or re-place the card on a machine that can run it), and verify the "
+-            "card is imported and claimed. " + repin.howto(own) + " Do not claim a cause the recorded evidence "
+-            "does not show, and never lift or shorten a registry hold you did not set. This is agent-owned repair, "
+-            "not a human decision.")
++            "card is imported and claimed. " + (howto or repin.howto(own)) + " Do not claim a cause the recorded "
++            "evidence does not show, and never lift or shorten a registry hold you did not set. This is agent-owned "
++            "repair, not a human decision.")
+ 
+ 
+ # --- where the alarm runs ------------------------------------------------------------------------------------
+@@ -371,7 +371,7 @@ def _replace_stranded(conn, task_id: str, own: str, machines, runs_on: list[str]
+ 
+ 
+ def _create(conn, *, key: str, title: str, body: str, tenant: Optional[str], own: str, now_ms: int,
+-            priority: int = 0) -> str:
++            priority: int = 0, howto: Optional[str] = None) -> str:
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_worker_node as wn
+     from hermes_cli.kanban_triage_sweep import _supervisor_profile
+@@ -386,7 +386,8 @@ def _create(conn, *, key: str, title: str, body: str, tenant: Optional[str], own
+     # A repair closed long ago is replaced, so the key carries the creation time (create_task returns any
+     # non-archived task with an equal key, done ones included).
+     return kb.create_task(conn, title=title, body=body + f"\n\nPlaced with runs_on {runs_on}: {why}."
+-                          + _tail(conn, own), assignee=assignee, created_by=DETECTOR, workspace_kind="scratch",
++                          + _tail(conn, own, howto), assignee=assignee, created_by=DETECTOR,
++                          workspace_kind="scratch",
+                           tenant=tenant, requires=list(_REQUIRES), idempotency_key=f"{key}{_now_ms()}",
+                           runs_on=runs_on, priority=priority)
+ 
+@@ -623,15 +624,17 @@ def sweep(conn, *, now: Optional[float] = None) -> list[str]:
+     if dispatch_paused():
+         return []  # a draining gateway runs no pickup, so it writes no fresh evidence to judge a stall by
+     _prune(conn, _now_ms(now))
++    own = wn._own(conn)
++    from hermes_cli import kanban_pickup_stall_held as held  # own default-placement cards on a held machine
++    stranded = held.sweep(conn, own, now_ms=_now_ms(now))
+     replica = wn.open_replica(conn)
+     if replica is None:
+-        return []
++        return stranded
+     try:
+-        own = wn._own(conn)
+         cards = stalled(conn, replica, own, now=now)
+     finally:
+         replica.close()
+-    return file_repairs(conn, own, cards, now=now) if cards else []
++    return stranded + (file_repairs(conn, own, cards, now=now) if cards else [])
+ 
+ 
+ def safe_sweep(conn) -> list[str]:
+diff --git a/hermes_cli/kanban_pickup_stall_held.py b/hermes_cli/kanban_pickup_stall_held.py
+new file mode 100644
+index 0000000000..aabf5639d1
+--- /dev/null
++++ b/hermes_cli/kanban_pickup_stall_held.py
+@@ -0,0 +1,124 @@
++"""Default-placement cards stranded on their held creator: one pickup-stall alarm per incident. [daveey]
++
++t_01a1d4f2f591d595 (2026-11-13): t_01a1d49d50e4c656 (the PR #2168 land-lane owner) woke ``ready`` on worker-6 at
++12:32Z with ``runs_on`` NULL (default placement: "its creator"). worker-6 was on a hub-worker-core-rollout hold (drain
++only, up to its 90 min hard max). Every other pool worker runs ``kanban.sync.pickup: explicit``, which copies only
++cards with ``runs_on`` (``kanban_worker_node._skip_reason``), so no machine could claim it. It sat 14 min with a
++land-lane ticket held behind it, until an operator moved it to the pool by hand. The pickup-stall detector
++(:mod:`hermes_cli.kanban_pickup_stall`) watched only foreign cards pinned ``machine:<this host>``, so nothing alerted.
++
++This covers the creator's side. On every dispatcher sweep of a held machine M, a card on M's own board that is
++``ready``, unclaimed, default placement (``runs_on`` NULL), created on M, with a ``scratch`` workspace, is stranded when
++no other machine would copy it: no active, unheld machine with non-explicit pickup passes
++:func:`hermes_cli.kanban_worker_node.eligible` for it. A card held by a dispatcher respawn guard does not count (it
++would wait anyway). When such a card has waited past ``kanban.sync.pickup_stall_seconds`` (default 600 s) since both
++its ``ready_since`` and the hold's start, ONE host-wide alarm (key ``pickup-stall:<M>:held-default:``) lists every such
++card, placed on another machine by :func:`hermes_cli.kanban_pickup_stall.alarm_placement`. Its run may re-place exactly
++the listed cards to the pool queue (:mod:`hermes_cli.kanban_pickup_stall_repin`). A rollout-hold card should already
++have been moved by hub-worker-core-rollout within one 5-minute pass, so the alarm is the backstop when that move did
++not happen. A ``dir``/``worktree`` card runs only where its workspace is, so it is never listed: no move can help it.
++"""
++from __future__ import annotations
++
++import logging
++from typing import Any, Mapping, Optional
++
++_log = logging.getLogger(__name__)
++
++SLUG = "held-default"
++_BOUND = ("dir", "worktree")
++
++
++def others_take_default(card: Mapping[str, Any], own: str, machines: Mapping[str, Mapping[str, Any]]) -> list[str]:
++    """Machines other than ``own`` whose pickup would copy default-placement ``card`` now: active, pickup on and
++    not ``explicit`` (explicit copies only cards with ``runs_on``), and :func:`kanban_worker_node.eligible`."""
++    from hermes_cli import kanban_worker_node as wn
++    out = []
++    for name, entry in machines.items():
++        if name == own or not entry or entry.get("state", "active") != "active" or not wn.advertises_pickup(entry):
++            continue
++        if str(entry.get("pickup")).strip().lower() == "explicit":
++            continue
++        if wn.eligible(card, name, machines) is None:
++            out.append(name)
++    return sorted(out)
++
++
++def _hold_ms(entry: Mapping[str, Any]) -> int:
++    at = entry.get("hold_at")
++    if isinstance(at, bool) or not isinstance(at, (int, float)) or at <= 0:
++        return 0  # unknown start: the card's own ready clock decides
++    return int(at if at > 1e11 else at * 1000)
++
++
++def stranded(conn, own: str, machines: Optional[Mapping[str, Mapping[str, Any]]], *,
++             now_ms: int, stall_s: int) -> list[dict[str, Any]]:
++    """Cards on ``own``'s board that only ``own`` may run while ``own`` is held, waiting past ``stall_s``; oldest
++    first. Empty when ``own`` is not held or the registry is unreadable."""
++    from hermes_cli import kanban_pickup_held as kph
++    from hermes_cli import kanban_pickup_stall as kps
++    entry = (machines or {}).get(own)
++    if machines is None or not entry or entry.get("hold") is not True:
++        return []
++    held_ms = _hold_ms(entry)
++    out = []
++    rows = conn.execute("SELECT * FROM tasks WHERE status = 'ready' AND runs_on IS NULL AND claim_lock IS NULL "
++                        "AND (created_on IS NULL OR created_on = ?)", (own,)).fetchall()
++    for row in rows:
++        if row["workspace_kind"] in _BOUND:
++            continue
++        keys = row.keys()
++        ready = row["ready_since"] if "ready_since" in keys and row["ready_since"] is not None \
++            else int(row["created_at"] or 0) * 1000
++        since = max(int(ready), held_ms)
++        if now_ms - since <= stall_s * 1000:
++            continue
++        card = {**dict(row), "created_on": row["created_on"] or own}
++        if others_take_default(card, own, machines):
++            continue
++        if kph.board_hold(conn, row) is not None:
++            continue  # a respawn guard holds it: it would wait on any machine
++        out.append({"id": row["id"], "title": row["title"], "tenant": row["tenant"], "since_ms": since,
++                    "skip": kps.latest(conn, row["id"])})
++    out.sort(key=lambda c: (c["since_ms"], c["id"]))
++    return out
++
++
++def file_alarm(conn, own: str, cards: list[dict[str, Any]], *, now_ms: int, stall_s: int,
++               entry: Mapping[str, Any]) -> str:
++    """ONE alarm per held machine listing ``cards`` (an open one is reused and gets new targets appended)."""
++    from hermes_cli import kanban_pickup_stall as kps
++    from hermes_cli import kanban_pickup_stall_repin as repin
++    oldest = cards[0]
++    listed = "\n".join(f"- {c['id']} ({c['title']}), ready {kps._minutes(c['since_ms'], now_ms)} min, default "
++                       "placement, created here" for c in cards[:20])
++    who = entry.get("hold_owner") or entry.get("hold_by") or "?"
++    body = (f"{len(cards)} default-placement card(s) created on {own} have been ready past {stall_s} s while {own} "
++            f"is held in the machine registry (by {who}: {entry.get('hold_reason')!r}). Default placement means "
++            f"\"its creator\", and no other machine copies them: every other pickup machine is held, `explicit` "
++            "(copies only cards with runs_on) or lacks the creator's labels. Nothing claims them until the hold "
++            f"ends. Re-place each listed card to the pool queue; do not lift or shorten the hold.\n\n"
++            f"Oldest: {oldest['id']} ({oldest['title']}).\n\n"
++            f"{kps._registry_line(own)}\n\nStranded cards on {own}:\n\n{listed}")
++    tid = kps._create(conn, key=f"{kps.KEY_PREFIX}{own}:{SLUG}:", tenant=oldest["tenant"], own=own, now_ms=now_ms,
++                      title=(f"Pickup stranded on held {own}: oldest {oldest['id']} ready "
++                             f"{kps._minutes(oldest['since_ms'], now_ms)} min ({len(cards)} default-placement "
++                             "card(s) only it may run)"),
++                      body=body, howto=repin.held_default_howto(own))
++    kps._refresh_targets(conn, tid, cards, now_ms)
++    return tid
++
++
++def sweep(conn, own: str, *, now_ms: int) -> list[str]:
++    """The held-creator pass of :func:`kanban_pickup_stall.sweep`: the alarm id, or nothing."""
++    from hermes_cli import kanban_pickup_stall as kps
++    from hermes_cli import kanban_worker_node as wn
++    reg = wn.registry()
++    machines = None if reg is None else (reg.get("machines") or {})
++    stall_s = kps.stall_seconds()
++    cards = stranded(conn, own, machines, now_ms=now_ms, stall_s=stall_s)
++    if not cards:
++        return []
++    _log.info("pickup-stall: %d default-placement card(s) stranded on held %s: %s", len(cards), own,
++              [c["id"] for c in cards])
++    return [file_alarm(conn, own, cards, now_ms=now_ms, stall_s=stall_s, entry=(machines or {})[own])]
+diff --git a/hermes_cli/kanban_pickup_stall_repin.py b/hermes_cli/kanban_pickup_stall_repin.py
+index c09b4579bd..ee0ee79a63 100644
+--- a/hermes_cli/kanban_pickup_stall_repin.py
++++ b/hermes_cli/kanban_pickup_stall_repin.py
+@@ -53,6 +53,24 @@ def howto(own: str) -> str:
+             f"this alarm lists, only while they are ready and pinned to {own}, and never back to {own}.")
+ 
+ 
++def held_default_howto(own: str) -> str:
++    """:func:`howto` for a ``held-default`` alarm (:mod:`hermes_cli.kanban_pickup_stall_held`): its targets are
++    default-placement cards created on ``own``, not pins."""
++    pool = pool_label()
++    return (f"To re-place a listed card off {own}: the cards were created on {own}, so send "
++            "kanban_supervisor_request(ops=[{\"op\": \"operator\", \"action\": \"move\", \"task_id\": \"<listed card>\", "
++            f"\"runs_on\": [\"{pool}\"], \"reason\": \"{own} held; default placement stranded\"}}]); {own}'s "
++            "dispatcher applies it (a hold stops claims, not operator calls). Only the cards this alarm lists, only "
++            f"while they are ready, unclaimed and still default placement (runs_on unset), and never back to {own}.")
++
++
++def is_held_default(alarm: Any, own: str) -> bool:
++    """``alarm`` is the host-wide held-creator alarm about ``own`` (key ``pickup-stall:<own>:held-default:``)."""
++    from hermes_cli import kanban_pickup_stall as kps
++    from hermes_cli.kanban_pickup_stall_held import SLUG
++    return (alarm["idempotency_key"] or "").startswith(f"{kps.KEY_PREFIX}{own}:{SLUG}:")
++
++
+ def _cols(row: Any) -> set:
+     return set(row.keys()) if row is not None else set()
+ 
+@@ -181,8 +199,11 @@ def scope_refusal(conn: sqlite3.Connection, alarm: Any, target: Any, runs_on: An
+     if target["status"] != "ready" or any(target[c] for c in ("claim_lock", "lease_holder", "current_run_id")
+                                           if c in cols):
+         return f"{target['id']} is {target['status']} or claimed; only a ready, unclaimed card is re-placed"
+-    if f"machine:{own}" not in (wn._parse(target["runs_on"]) or []):
+-        return f"{target['id']} is no longer pinned to machine:{own}"
++    pins = wn._parse(target["runs_on"])
++    if f"machine:{own}" not in (pins or []):
++        # A held-default alarm lists default-placement cards created on its machine (kanban_pickup_stall_held).
++        if not (is_held_default(alarm, own) and pins is None and _stored(target, "created_on") == own):
++            return f"{target['id']} is no longer pinned to machine:{own}"
+     try:
+         labels = list(wn.normalize_runs_on(runs_on) or [])
+     except ValueError as exc:
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall_held.py b/tests/hermes_cli/test_kanban_pickup_stall_held.py
+new file mode 100644
+index 0000000000..d959d9406f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pickup_stall_held.py
+@@ -0,0 +1,170 @@
++"""A held creator strands its own default-placement cards when every other worker picks up ``explicit``.
++
++t_01a1d4f2f591d595 (2026-11-13): t_01a1d49d50e4c656, default placement (``runs_on`` NULL) and created on worker-6,
++woke ready while hub-worker-core-rollout held worker-6. Every pool worker runs ``kanban.sync.pickup: explicit``, which
++copies only cards with ``runs_on``, so nothing claimed it for 14 min and no pickup-stall card was filed: the detector
++watched only foreign cards pinned ``machine:<host>``. The rollout now moves such cards to the pool queue (state
++``hub-worker-core-rollout``, which runs ``hermes kanban move <id> --pool --reason "<w> on rollout hold"`` on the held
++worker); the detector files one alarm when they still wait past the stall threshold. Same fake-Board harness as
++``test_kanban_worker_node``.
++"""
++from __future__ import annotations
++
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import test_kanban_worker_node as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++HELD, FREE = "worker-6", "worker-1"
++DETECTOR = "pickup-stall-detector"
++POOL = "pool:worker"
++LABELS = ["linux", "profile:default", "capability:terminal", "capability:file", "capability:kanban", POOL]
++
++
++def _machines(t0: float, *, free_pickup="explicit", held=True) -> dict:
++    hold = {"hold": True, "hold_owner": "rollout:worker-core-rollout@hub", "hold_at": int(t0 * 1000),
++            "hold_reason": "worker-core-rollout: aaaaaaaaaaaa -> bbbbbbbbbbbb; drain only; release by 23:59Z"} \
++        if held else {"hold": False}
++    return {
++        "hub": {"name": "hub", "state": "active", "labels": ["linux"], "pinned_only": False, "max_card_runs": None,
++                "hold": False},
++        HELD: {"name": HELD, "state": "active", "labels": LABELS, "pinned_only": False, "max_card_runs": 10,
++               "pickup": "explicit", **hold},
++        FREE: {"name": FREE, "state": "active", "labels": LABELS, "pinned_only": False, "max_card_runs": 10,
++               "pickup": free_pickup, "hold": False, "metrics": {"active_card_runs": 3}},
++    }
++
++
++@pytest.fixture
++def pair(tmp_path, monkeypatch):
++    """worker-6 (held) and worker-1, both ``pickup: explicit``, on one fake Board."""
++    svc = FakeService(lease_runs=True)
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    t0 = time.time()
++    state = {"machines": _machines(t0)}
++    monkeypatch.setattr(support, "MACHINES", state["machines"])
++    sync.consume_dispatcher_wake()
++    held = support.Gateway(tmp_path, HELD, svc, monkeypatch, pickup="explicit")
++    free = support.Gateway(tmp_path, FREE, svc, monkeypatch, pickup="explicit")
++
++    def registry(machines):
++        monkeypatch.setattr(support, "MACHINES", machines)
++        wn.set_registry_fetch(lambda: {"me": None, "machines": support.seen_now(machines.values())})
++
++    yield held, free, t0, registry
++    for g in (held, free):
++        g.conn.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++def _own_card(gw, title="lane owner"):
++    gw.enter()
++    tid = kb.create_task(gw.conn, title=title, assignee="default")
++    gw.round()
++    return tid
++
++
++def _repairs(conn):
++    return conn.execute("SELECT * FROM tasks WHERE created_by = ? ORDER BY created_at, id", (DETECTOR,)).fetchall()
++
++
++def test_t1_a_pool_move_of_the_held_creators_default_card_lets_an_explicit_worker_take_it(pair):
++    """T1, core half: the exact command hub-worker-core-rollout runs on the held worker
++    (``hermes kanban move <id> --pool --reason "<w> on rollout hold"``) leaves runs_on [pool:worker] and a
++    ``moved`` event, and the other explicit-pickup worker's pickup then copies the card (it skipped it before)."""
++    held, free, _t0, _reg = pair
++    tid = _own_card(held)
++    free.round()
++    free.enter()
++    assert wn.pickup(free.conn, budget=4) == []  # explicit pickup skips a default-placement card: stranded
++    held.enter()
++    from hermes_cli import kanban as kcli
++    out = json.loads(kcli.run_slash(f'move {tid} --pool --reason "{HELD} on rollout hold" --json'))
++    assert out["ok"], out
++    row = held.conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()
++    assert json.loads(row["runs_on"]) == [POOL]
++    [moved] = [e for e in kb.list_events(held.conn, tid) if e.kind == "moved"]
++    assert moved.payload["reason"] == f"{HELD} on rollout hold" and moved.payload["runs_on"] == [POOL]
++    assert FREE in moved.payload["matches"] and HELD not in moved.payload["matches"]
++    held.round()
++    free.round()
++    free.enter()
++    assert wn.pickup(free.conn, budget=4) == [tid]
++
++
++def test_t3_one_alarm_after_the_threshold_for_a_default_card_only_the_held_creator_may_run(pair):
++    held, _free, t0, _reg = pair
++    tid = _own_card(held)
++    held.enter()
++    from hermes_cli import kanban_pickup_stall as kps
++    assert kps.sweep(held.conn, now=t0 + kps.stall_seconds() - 30) == []  # held under the threshold: nothing yet
++    assert not _repairs(held.conn)
++    later = t0 + kps.stall_seconds() + 60
++    [first] = kps.sweep(held.conn, now=later)
++    assert kps.sweep(held.conn, now=later + 60) == [first]  # one alarm per incident: reused
++    [alarm] = _repairs(held.conn)
++    assert f"held {HELD}" in alarm["title"] and tid in alarm["title"]
++    assert f"- {tid} (" in alarm["body"] and "default placement" in alarm["body"]
++    assert alarm["human_request"] is None
++    assert json.loads(alarm["runs_on"]) == [f"machine:{FREE}"]  # never on the held machine
++    assert alarm["idempotency_key"].startswith(f"pickup-stall:{HELD}:held-default:")
++    from hermes_cli import kanban_pickup_stall_repin as repin
++    held.round()  # the alarm runs elsewhere: it and the target are read from the Board replica, as there
++    held.round()  # push, then pull the Board's copy back into the replica
++    rep = wn.open_replica(held.conn)
++    assert rep is not None
++    try:
++        alarm = rep.execute("SELECT * FROM tasks WHERE id = ?", (first,)).fetchone()
++        target = rep.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
++        machines = {n: {**m, "last_seen": int(time.time() * 1000)} for n, m in support.MACHINES.items()}
++        assert alarm["created_on"] == HELD and target["created_on"] == HELD
++        assert repin.scope_refusal(rep, alarm, target, [POOL], machines=machines,
++                                   now_ms=int(time.time() * 1000)) is None
++        # A foreign default card (created elsewhere) is not in a held-default alarm's scope.
++        other = {**dict(target), "created_on": FREE}
++        assert "no longer pinned" in str(repin.scope_refusal(rep, alarm, other, [POOL], machines=machines,
++                                                             now_ms=int(time.time() * 1000)))
++    finally:
++        rep.close()
++
++
++def test_t3_no_alarm_when_another_machine_can_claim_the_card(pair):
++    held, _free, t0, registry = pair
++    registry(_machines(t0, free_pickup="all"))  # worker-1 copies default-placement cards: not stranded
++    _own_card(held)
++    held.enter()
++    registry(_machines(t0, free_pickup="all"))
++    from hermes_cli import kanban_pickup_stall as kps
++    assert kps.sweep(held.conn, now=t0 + kps.stall_seconds() + 60) == []
++    assert not _repairs(held.conn)
++
++
++def test_no_alarm_once_the_card_left_default_placement_or_the_hold_ended(pair):
++    held, _free, t0, registry = pair
++    tid = _own_card(held)
++    held.enter()
++    from hermes_cli import kanban_pickup_stall as kps
++    later = t0 + kps.stall_seconds() + 60
++    registry(_machines(t0, held=False))
++    assert kps.sweep(held.conn, now=later) == []
++    registry(_machines(t0))
++    from hermes_cli import kanban as kcli
++    assert json.loads(kcli.run_slash(f'move {tid} --pool --reason "{HELD} on rollout hold" --json'))["ok"]
++    assert kps.sweep(held.conn, now=later) == []
++    assert not _repairs(held.conn)
++
++
++def test_a_worktree_card_is_never_listed(pair):
++    held, _free, t0, _reg = pair
++    held.enter()
++    kb.create_task(held.conn, title="bound", assignee="default", workspace_kind="dir", workspace_path=str(held.home / "ws"))
++    from hermes_cli import kanban_pickup_stall as kps
++    assert kps.sweep(held.conn, now=t0 + kps.stall_seconds() + 60) == []
+-- 
+2.43.0
+

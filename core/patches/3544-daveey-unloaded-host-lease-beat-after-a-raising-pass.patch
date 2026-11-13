@@ -1,0 +1,442 @@
+From b7344025e05ca465be7c28d4d3b8e2de67473179 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:53:40 +0000
+Subject: [PATCH] [daveey] unloaded host lease: beat after a raising pass,
+ holder capacity only for a real lease, one notice-fanout connection
+
+Follow-up to PR #2169 (review 5891002989 nits, card t_01a1d4e38cf61e24).
+
+1. kanban_unloaded.run_pass beats in a finally, as producer_admission.run_pass does. A host pass that raised
+   (card_change_pass, guarantee_pass) skipped beat(), so the watchdog dropped the lease after 3x interval and a
+   live .want hand-off waited for that drop instead of the next pass end.
+2. HostLoopLease.exclusive(): True only while this process really holds the flock (False under the kill switch
+   and when the lease failed open). run_pass sizes wake slots on it instead of held() and the env switch alone:
+   a failed-open lease (no fcntl, no usable lock) made held() True in every process, so each got the holder's
+   8 wake slots instead of the pre-lease 2.
+3. notice_fanout_state keeps one connection per (path, pid), opened (PRAGMA journal_mode + schema) once; a
+   failed statement drops it so the next call reopens. Before, every get/set opened a connection and reran both:
+   12 connects for one 3-board pass in the new test, now 1.
+4. Without a real lease (HERMES_HOST_LOOP_LEASE=0, or failed open) host_pass retries killed-subagent notices in
+   this process's own store (server._get_db(), as before #2169) instead of every profile store, so the kill
+   switch is an exact rollback. The real holder still retries every store.
+
+Tests (tests/tui_gateway/test_kanban_unloaded_host_lease.py), RED on origin/main 1b889c6115 (6 failed: kill-switch
+and fail-open own-store retry, beat on raise, fail-open base slots, real-holder exclusive(), connection count
+12 != 1), GREEN here. All 31 test files importing kanban_unloaded / notice_fanout / host_loop_lease /
+wake_slots / reap_notices / producer_admission: 422 passed. scripts/check --base origin/main: ok.
+---
+ hermes_cli/host_loop_lease.py                 |   8 +-
+ .../test_kanban_unloaded_host_lease.py        | 117 ++++++++++++++++++
+ tui_gateway/kanban_unloaded.py                |  43 ++++---
+ tui_gateway/notice_fanout_state.py            |  69 +++++++----
+ 4 files changed, 199 insertions(+), 38 deletions(-)
+
+diff --git a/hermes_cli/host_loop_lease.py b/hermes_cli/host_loop_lease.py
+index 2df69bc2cc..b8469f773e 100644
+--- a/hermes_cli/host_loop_lease.py
++++ b/hermes_cli/host_loop_lease.py
+@@ -42,7 +42,8 @@ home, so profile processes of one install share one owner.
+   fixed block so a shorter record never leaves the old one's tail; lock-free readers (standby probe,
+   :func:`holders`) still retry a read once when it does not parse.
+ * **Kill switch** ``HERMES_HOST_LOOP_LEASE=0``: ``held()`` is always True (every process runs its own
+-  pass, the behaviour before this lease).
++  pass, the behaviour before this lease). ``exclusive()`` is False then and when the lease fails open:
++  a loop that gives its holder more (wake slots, every profile store) gates that on ``exclusive()``.
+ * **Unavailable lock** (no ``fcntl``, a directory nobody can create the file in, a filesystem without
+   flock): the lease fails OPEN, ``held()`` True, logged once. Duplicated passes are today's safe
+   behaviour; failing closed would stop the host loops on every process of that home. An existing lock
+@@ -256,6 +257,11 @@ class HostLoopLease:
+             self._become_holder()
+             return True
+ 
++    def exclusive(self) -> bool:
++        """True only while this process really holds the lock: False under the kill switch and when the lease
++        failed open, where ``held()`` is True in every process. Size per-holder capacity on this, not ``held()``."""
++        return enabled() and self._held
++
+     def beat(self) -> None:
+         """End of a pass: refresh the heartbeat, then hand off to a live higher-priority ``.want``."""
+         if not enabled() or not self._held:
+diff --git a/tests/tui_gateway/test_kanban_unloaded_host_lease.py b/tests/tui_gateway/test_kanban_unloaded_host_lease.py
+index ad24e59624..92d490c4fd 100644
+--- a/tests/tui_gateway/test_kanban_unloaded_host_lease.py
++++ b/tests/tui_gateway/test_kanban_unloaded_host_lease.py
+@@ -51,6 +51,9 @@ class _Lease:
+     def beat(self) -> None:
+         self.beats += 1
+ 
++    def exclusive(self) -> bool:
++        return self._held
++
+ 
+ def _record_passes(monkeypatch, live: frozenset[str] | set[str] = frozenset()):
+     """Stub every pass of the loop; return the list of (pass, kwargs) calls."""
+@@ -221,6 +224,67 @@ def test_the_host_pass_retries_killed_notices_in_every_profile_store(monkeypatch
+     assert seen == ["default-store", "work-store"]
+ 
+ 
++def _killed_notice_stores(monkeypatch) -> list:
++    """Stub every pass but the killed-notice retry; return the stores it retries in."""
++    from tui_gateway import server
++    seen = []
++    monkeypatch.setattr(ku, "live_session_ids", set)
++    monkeypatch.setattr(ku, "sweep_remote_once", lambda ids, **k: [])
++    monkeypatch.setattr(ku, "sweep_once", lambda ids, **k: [])
++    monkeypatch.setattr(du, "sweep_once", lambda **k: [])
++    monkeypatch.setattr(nf, "card_change_pass", lambda **k: [])
++    monkeypatch.setattr(ng, "guarantee_pass", lambda **k: [])
++    monkeypatch.setattr(ng, "_stores", lambda: iter(["default-store", "work-store"]))
++    monkeypatch.setattr(server, "_get_db", lambda: "own-store")
++    monkeypatch.setattr(rn, "retry_pending_killed_notices", lambda store, **k: seen.append(store) or [])
++    return seen
++
++
++def test_the_lease_holder_retries_killed_notices_in_every_store(monkeypatch):
++    seen = _killed_notice_stores(monkeypatch)
++    assert ku.run_pass(_Lease(True)) == "host"
++    assert seen == ["default-store", "work-store"]
++
++
++def test_kill_switch_retries_killed_notices_only_in_its_own_store(monkeypatch, tmp_path):
++    """HERMES_HOST_LOOP_LEASE=0 is an exact rollback: every process retries its own store, as before the lease."""
++    monkeypatch.setenv(hll.KILL_SWITCH_ENV, "0")
++    seen = _killed_notice_stores(monkeypatch)
++    lease = hll.HostLoopLease(ku.LEASE_NAME, "serve", interval=30, home=tmp_path)
++
++    assert ku.run_pass(lease) == "host"
++
++    assert seen == ["own-store"]
++
++
++def test_a_fail_open_lease_retries_killed_notices_only_in_its_own_store(monkeypatch, tmp_path):
++    monkeypatch.setattr(hll, "fcntl", None)
++    seen = _killed_notice_stores(monkeypatch)
++    lease = hll.HostLoopLease(ku.LEASE_NAME, "serve", interval=30, home=tmp_path)
++
++    assert ku.run_pass(lease) == "host"
++
++    assert seen == ["own-store"]
++
++
++# -- a host pass that raises still beats ---------------------------------------------------------------------------
++
++
++def test_a_host_pass_that_raises_still_beats(monkeypatch):
++    """Without the beat the watchdog drops the lease after 3x interval and the .want hand-off is skipped."""
++    _record_passes(monkeypatch)
++
++    def boom(**_k):
++        raise RuntimeError("card change pass failed")
++    monkeypatch.setattr(nf, "card_change_pass", boom)
++    lease = _Lease(True)
++
++    with pytest.raises(RuntimeError):
++        ku.run_pass(lease)
++
++    assert lease.beats == 1
++
++
+ # -- wake slots ----------------------------------------------------------------------------------------------------
+ 
+ 
+@@ -235,6 +299,30 @@ def test_the_holder_gets_eight_wake_slots_and_a_standby_its_base(monkeypatch):
+     assert ku._wake_slots.limit == ku.MAX_PARALLEL_WAKES and ng._wake_slots.limit == ng.MAX_PARALLEL_WAKES
+ 
+ 
++def test_a_fail_open_lease_keeps_the_base_wake_slots(monkeypatch, tmp_path):
++    """No usable lock: held() is True in every process, so none of them may take the holder's 8 slots."""
++    _record_passes(monkeypatch)
++    monkeypatch.setattr(hll, "fcntl", None)
++    a = hll.HostLoopLease(ku.LEASE_NAME, "serve", interval=30, home=tmp_path)
++    b = hll.HostLoopLease(ku.LEASE_NAME, "dashboard", interval=30, home=tmp_path)
++
++    assert ku.run_pass(a) == "host" and ku.run_pass(b) == "host"
++
++    assert ku._wake_slots.limit == ku.MAX_PARALLEL_WAKES and ng._wake_slots.limit == ng.MAX_PARALLEL_WAKES
++    assert not a.exclusive() and not b.exclusive()
++
++
++def test_a_real_lease_holder_gets_the_holder_wake_slots(monkeypatch, tmp_path):
++    _record_passes(monkeypatch)
++    lease = hll.HostLoopLease(ku.LEASE_NAME, "serve", interval=30, home=tmp_path)
++    try:
++        assert ku.run_pass(lease) == "host"
++        assert lease.exclusive() and ku._wake_slots.limit == wake_slots.HOLDER_SLOTS
++    finally:
++        lease.release()
++    assert not lease.exclusive()
++
++
+ def test_slot_exhaustion_rewinds_the_claim_and_retries_instead_of_a_passive_row(tmp_path, monkeypatch):
+     from hermes_state import SessionDB
+     sdb = SessionDB(tmp_path / "state.db")
+@@ -342,3 +430,32 @@ def test_process_role(monkeypatch, kind, desktop, role):
+     monkeypatch.setattr(smp, "current_process_kind", lambda: kind)
+     monkeypatch.setattr(process_identity, "is_desktop_owned_backend", lambda argv=None: desktop)
+     assert hll.process_role() == role
++
++
++# -- notice_fanout_state: one connection per process ---------------------------------------------------------------
++
++
++def test_notice_fanout_state_opens_its_store_once_per_process(monkeypatch, tmp_path):
++    """Every get/set used to open a connection and rerun PRAGMA journal_mode + the schema script."""
++    import sqlite3
++
++    from tui_gateway import notice_fanout_state as nfs
++    monkeypatch.setattr(nfs, "path", lambda: tmp_path / "kanban" / nfs.FILENAME)
++    nfs.reset_for_tests()
++    opened = []
++    real_connect = sqlite3.connect
++    monkeypatch.setattr(nfs.sqlite3, "connect", lambda *a, **k: opened.append(a) or real_connect(*a, **k))
++    try:
++        for board in ("default", "work", "household"):
++            nfs.set_cursor(board, (nfs.get_cursor(board) or 0) + 1)
++        nfs.seed_remote({"chat": frozenset({("k", "running")})})
++        nfs.ack_remote({"chat": frozenset({("k", "done")})})
++        assert nfs.load_remote() == {"chat": frozenset({("k", "done")})}
++        assert [nfs.get_cursor(b) for b in ("default", "work", "household")] == [1, 1, 1]
++
++        assert len(opened) == 1
++
++        nfs.forget_memory_for_tests()  # a fresh process opens it again and reads the durable state
++        assert nfs.get_cursor("work") == 1 and len(opened) == 2
++    finally:
++        nfs.reset_for_tests()
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 19a76c5e34..8ab6fe323a 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -41,7 +41,9 @@ holder starts up to ``wake_slots.HOLDER_SLOTS`` (8) wakes per pass kind instead
+ claim is rewound and the next pass retries (``deferred:slots``) instead of writing a passive row, until the notice
+ is ``OVERDUE_S`` old (then the row is written, as before). The per-chat wake budget
+ (``HERMES_KANBAN_UNLOADED_WAKES_PER_HOUR``) is counted by the holder, so it is now in effect host-wide; a hand-off
+-starts it afresh. ``HERMES_HOST_LOOP_LEASE=0`` restores the per-process passes (every process its own host pass).
++starts it afresh. ``HERMES_HOST_LOOP_LEASE=0`` restores the per-process passes (every process its own host pass,
++with its base wake slots and the killed-subagent retry over its own store only); a lease that failed open does the
++same, since ``held()`` is then True in every process (``lease.exclusive()`` is False).
+ [daveey]
+ """
+ 
+@@ -670,8 +672,10 @@ def sweep_remote_once(live_ids: set[str], *, grace_s: float = GRACE_S, **kwargs)
+     return sweep_remote_notices(live_ids=live_ids, waker=_RemoteWaker(wake_turn, _spawn_thread, grace_s), **kwargs)
+ 
+ 
+-def host_pass(grace: float = GRACE_S) -> None:
+-    """Everything this loop does for the whole install; run by the ``kanban-unloaded`` lease holder only."""
++def host_pass(grace: float = GRACE_S, *, every_store: bool = True) -> None:
++    """Everything this loop does for the whole install; run by the ``kanban-unloaded`` lease holder only.
++    ``every_store=False`` (kill switch, lease failed open: every process runs this) retries killed-subagent
++    notices in this process's own store only."""
+     try:
+         sweep_remote_once(live_session_ids(), grace_s=grace)
+         sweep_once(live_session_ids(), grace_s=grace)
+@@ -690,9 +694,15 @@ def host_pass(grace: float = GRACE_S) -> None:
+     card_change_pass()
+     # [daveey] A parent that was mid-turn when the orphan reap killed its subagent refused that notice: re-offer
+     # it before the guarantee pass, so the same tick can wake the parent on it (desktop-ac1b365935). Every
+-    # profile store, since one holder now retries for the whole install.
+-    from tui_gateway.reap_notices import retry_pending_killed_notices_all
+-    retry_pending_killed_notices_all()
++    # profile store, since one holder now retries for the whole install; without a real lease each process
++    # retries its own store, as before the lease.
++    if every_store:
++        from tui_gateway.reap_notices import retry_pending_killed_notices_all
++        retry_pending_killed_notices_all()
++    else:
++        from tui_gateway import server
++        from tui_gateway.reap_notices import retry_pending_killed_notices
++        retry_pending_killed_notices(server._get_db())
+     guarantee_pass()
+ 
+ 
+@@ -719,22 +729,25 @@ def make_lease():
+ 
+ 
+ def run_pass(lease, grace: float = GRACE_S) -> str:
+-    """One tick: the host pass while ``lease`` is held (then ``beat()``), else the residual pass. Returns which."""
++    """One tick: the host pass while ``lease`` is held (then ``beat()``, also when the pass raises, so the
++    watchdog keeps the lease and a ``.want`` hand-off still happens), else the residual pass. Returns which.
++
++    Only a lease really held (``exclusive()``: not the kill switch, not failed open) gets the holder's wake
++    slots and retries killed-subagent notices in every profile store; a process that runs the host pass only
++    because every process does keeps its base slots and its own store, as before the lease."""
+     holder = lease.held()
+-    wake_slots.set_holder(holder and _lease_on())
++    exclusive = holder and lease.exclusive()
++    wake_slots.set_holder(exclusive)
+     if holder:
+-        host_pass(grace)
+-        lease.beat()
++        try:
++            host_pass(grace, every_store=exclusive)
++        finally:
++            lease.beat()
+         return "host"
+     residual_pass()
+     return "residual"
+ 
+ 
+-def _lease_on() -> bool:
+-    from hermes_cli.host_loop_lease import enabled
+-    return enabled()
+-
+-
+ def _loop(stop: threading.Event) -> None:
+     interval = max(1.0, _env_float("HERMES_KANBAN_UNLOADED_SWEEP_S", INTERVAL_S))
+     grace = _env_float("HERMES_KANBAN_UNLOADED_GRACE_S", GRACE_S)
+diff --git a/tui_gateway/notice_fanout_state.py b/tui_gateway/notice_fanout_state.py
+index b940582398..964ce8c264 100644
+--- a/tui_gateway/notice_fanout_state.py
++++ b/tui_gateway/notice_fanout_state.py
+@@ -5,7 +5,8 @@ The card-change pass keeps, per board, the last ``task_events`` id it read and,
+ the changes of one interval were never fanned out. Under the host loop lease (design t_01a1d45d75851804 §2b, R3) the
+ pass moves between processes on every hand-off (gateway restart, a Desktop backend taking over), so each hand-off
+ would drop an interval. Both now live in ``<kanban home>/kanban/notice-fanout.db``, shared by every process of the
+-install; the next holder resumes where the last one stopped.
++install; the next holder resumes where the last one stopped. Each process opens the store once (one connection per
++path and pid, PRAGMA + schema at open) and reuses it; a failed statement drops it so the next call reopens.
+ 
+ Writes are last-writer-wins: with the lease off every process runs the pass, and two passes over the same
+ interval write the same (idempotent) refreshes. A store that cannot be opened (read-only home, disk error) falls
+@@ -17,6 +18,7 @@ from __future__ import annotations
+ import contextlib
+ import json
+ import logging
++import os
+ import sqlite3
+ import threading
+ from pathlib import Path
+@@ -36,6 +38,9 @@ _mu = threading.Lock()
+ # Fallback when the durable store is unavailable (per path, so a test home or HERMES_KANBAN_HOME switch is apart).
+ _memory: dict[str, dict] = {}
+ _warned: set[str] = set()
++# One connection per (path, pid), opened (PRAGMA + schema) once: the pass reads and writes a cursor per board per
++# tick. Keyed by pid so a forked child never shares its parent's connection; used only under ``_mu``.
++_conns: dict[tuple[str, int], sqlite3.Connection] = {}
+ 
+ Snapshot = dict[str, frozenset[tuple[str, str]]]
+ 
+@@ -51,25 +56,43 @@ def _mem(where: Path) -> dict:
+ 
+ @contextlib.contextmanager
+ def _open() -> Iterator[Optional[sqlite3.Connection]]:
++    """This process's connection to the store (caller holds ``_mu``), or None when it cannot be opened."""
+     where = path()
+-    conn: Optional[sqlite3.Connection] = None
+-    try:
+-        where.parent.mkdir(parents=True, exist_ok=True)
+-        conn = sqlite3.connect(str(where), timeout=5.0, isolation_level=None)
+-        conn.execute("PRAGMA journal_mode=WAL")
+-        conn.executescript(_SCHEMA)
+-    except (OSError, sqlite3.Error) as exc:
+-        if conn is not None:
+-            conn.close()
+-            conn = None
+-        _warn_once(where, exc)
+-    try:
+-        yield conn
+-    finally:
+-        if conn is not None:
++    key = (str(where), os.getpid())
++    conn = _conns.get(key)
++    if conn is None:
++        try:
++            where.parent.mkdir(parents=True, exist_ok=True)
++            conn = sqlite3.connect(str(where), timeout=5.0, isolation_level=None, check_same_thread=False)
++            conn.execute("PRAGMA journal_mode=WAL")
++            conn.executescript(_SCHEMA)
++        except (OSError, sqlite3.Error) as exc:
++            if conn is not None:
++                conn.close()
++                conn = None
++            _warn_once(where, exc)
++        else:
++            _conns[key] = conn
++    yield conn
++
++
++def _failed(exc: BaseException) -> None:
++    """A statement failed: warn once and drop the cached connection, so the next call opens a fresh one."""
++    where = path()
++    _warn_once(where, exc)
++    conn = _conns.pop((str(where), os.getpid()), None)
++    if conn is not None:
++        with contextlib.suppress(sqlite3.Error):
+             conn.close()
+ 
+ 
++def _close_all() -> None:
++    for key in [k for k in _conns if k[1] == os.getpid()]:
++        with contextlib.suppress(sqlite3.Error):
++            _conns.pop(key).close()
++    _conns.clear()
++
++
+ def _warn_once(where: Path, exc: BaseException) -> None:
+     if str(where) not in _warned:
+         _warned.add(str(where))
+@@ -84,7 +107,7 @@ def get_cursor(ident: str) -> Optional[int]:
+         try:
+             row = conn.execute("SELECT cursor FROM cursors WHERE ident = ?", (ident,)).fetchone()
+         except sqlite3.Error as exc:
+-            _warn_once(path(), exc)
++            _failed(exc)
+             return _mem(path())["cursors"].get(ident)
+         return int(row[0]) if row else None
+ 
+@@ -98,7 +121,7 @@ def set_cursor(ident: str, cursor: int) -> None:
+             conn.execute("INSERT INTO cursors (ident, cursor) VALUES (?, ?) "
+                          "ON CONFLICT(ident) DO UPDATE SET cursor = excluded.cursor", (ident, int(cursor)))
+         except sqlite3.Error as exc:
+-            _warn_once(path(), exc)
++            _failed(exc)
+ 
+ 
+ def _decode(raw: str) -> frozenset[tuple[str, str]]:
+@@ -122,7 +145,7 @@ def load_remote() -> Optional[Snapshot]:
+                 return None
+             return {str(chat): _decode(cards) for chat, cards in conn.execute("SELECT chat, cards FROM remote_snapshot")}
+         except sqlite3.Error as exc:
+-            _warn_once(path(), exc)
++            _failed(exc)
+             return _mem(path())["remote"]
+ 
+ 
+@@ -142,7 +165,7 @@ def seed_remote(snapshot: Snapshot) -> None:
+         except sqlite3.Error as exc:
+             with contextlib.suppress(sqlite3.Error):
+                 conn.execute("ROLLBACK")
+-            _warn_once(path(), exc)
++            _failed(exc)
+ 
+ 
+ def ack_remote(acked: dict[str, Optional[frozenset[tuple[str, str]]]]) -> None:
+@@ -171,13 +194,14 @@ def ack_remote(acked: dict[str, Optional[frozenset[tuple[str, str]]]]) -> None:
+         except sqlite3.Error as exc:
+             with contextlib.suppress(sqlite3.Error):
+                 conn.execute("ROLLBACK")
+-            _warn_once(path(), exc)
++            _failed(exc)
+ 
+ 
+ def forget_memory_for_tests() -> None:
+-    """Drop this process's memory only (a hand-off to a fresh process keeps the durable state)."""
++    """Drop this process's memory and connection only (a hand-off to a fresh process keeps the durable state)."""
+     with _mu:
+         _memory.clear()
++        _close_all()
+ 
+ 
+ def reset_for_tests() -> None:
+@@ -185,6 +209,7 @@ def reset_for_tests() -> None:
+     with _mu:
+         _memory.clear()
+         _warned.clear()
++        _close_all()
+         with contextlib.suppress(OSError):
+             for suffix in ("", "-wal", "-shm"):
+                 Path(str(path()) + suffix).unlink(missing_ok=True)
+-- 
+2.43.0
+

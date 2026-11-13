@@ -1,0 +1,294 @@
+From 6c8f33e7d79048387631a5caf473f8d9c3258996 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 04:13:42 -0800
+Subject: [PATCH] [daveey] kanban remote: Desktop sweep stands aside while the
+ gateway's turn holds a chat (t_01a1cff0541bf30c G3)
+
+Live G3 failure after PR #1486 (MacBook, Nov 13 02:24-03:51 PST): the tui backend's remote sweep
+(every 15-25 s) reached busy gateway-owned chat f07c32 before the gateway's owner pass. It claimed
+each remote notice, failed the passive row on the turn lease, released it and logged
+"deferred: a turn is running" up to 6 times in a row per notice (t_01a1d46fe87dff26: 6,
+03:36:31-03:37:58).
+
+Five whys:
+1. Deferred lines: the sweep claimed while a turn ran and append_kanban_notice raised
+   SessionTurnLeaseLostError (kanban_remote_notices._persist_claimed).
+2. It claimed because it stands aside only once a gateway admission holds the key
+   (kanban_remote_fifo.gateway_holds); before the gateway's next pass it keeps trying.
+3. The gateway pass came 13-88 s later (it runs inside the notifier loop), and a sweep claim held
+   through a wake makes the owner's collect skip the notice.
+Root (happened): custody hand-off keyed on "an admission exists", not "the live gateway's turn
+holds the chat". Root (not caught): N1/N2 drove tick(force=True) alone, never with the sweep.
+
+Fix (review t_01a1d4c44f637fff, approve-with-changes): _deliver_link stands aside, with no claim,
+no wake and one wait line per episode, while an UNEXPIRED turn lease on the chat's lineage is held
+by the canonical gateway's verified pid (live_gateway_pid_for_home for the link profile, else the
+multiplexed default gateway; never discover_owner). While that lease is held neither the passive
+row nor a desktop wake can land, so nothing deliverable is given up. An expired lease (the passive
+row guard reclaims it even from a live pid), a dead holder or a non-gateway holder keep today's
+path. Lease-only on purpose: no ledger arm. The owner pass's own cadence (review item B) is split
+to its own latency card.
+
+Tests: tests/gateway/test_kanban_remote_lease_stand_aside.py (stand-aside with no claim/no
+deferred, no owner pass -> exactly one delivery after release, dead holder, expired lease,
+non-gateway holder, pid lookup fallback).
+---
+ .../test_kanban_remote_lease_stand_aside.py   | 144 ++++++++++++++++++
+ tui_gateway/kanban_remote_fifo.py             |  60 +++++++-
+ tui_gateway/kanban_remote_notices.py          |  10 +-
+ 3 files changed, 211 insertions(+), 3 deletions(-)
+ create mode 100644 tests/gateway/test_kanban_remote_lease_stand_aside.py
+
+diff --git a/tests/gateway/test_kanban_remote_lease_stand_aside.py b/tests/gateway/test_kanban_remote_lease_stand_aside.py
+new file mode 100644
+index 0000000000..286ca26b83
+--- /dev/null
++++ b/tests/gateway/test_kanban_remote_lease_stand_aside.py
+@@ -0,0 +1,144 @@
++"""The Desktop backend's remote sweep stands aside while the canonical gateway's turn holds a chat (t_01a1cff0541bf30c
++G3). [daveey]
++
++Live on the MacBook after PR #1486 (Nov 13, 02:24-03:51 PST): the sweep (every 15-25 s) reached busy gateway-owned
++chat f07c32 before the gateway's owner pass did, claimed each remote notice, failed the passive row on the turn
++lease, released it and logged "deferred: a turn is running" up to 6 times in a row per notice. While a live process
++holds an unexpired lease the sweep can deliver nothing (row and wake are both refused), so it now leaves such a chat
++alone without a claim; an expired lease, a dead holder or a holder that is not the gateway keep today's path.
++"""
++import logging
++import subprocess
++import sys
++import time
++
++import pytest
++
++from hermes_state_pidns import holder_namespace_token
++from tui_gateway import kanban_remote_fifo as fifo_mod
++from tests.gateway import test_kanban_remote_owner_delivery as owner_tests
++from tests.gateway.test_kanban_remote_owner_delivery import (
++    CHAT, _dead_pid, _done, _key, _ledger, _publish, _rows, _sweep, _sweep_writes_row)
++
++env = owner_tests.env  # the shared hub/board/state.db fixture
++
++TID = "t_01a1d46fe87dff26"
++KEY = _key(TID, gw="worker-3")
++
++
++@pytest.fixture
++def live_pids():
++    procs = []
++
++    def spawn():
++        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
++        procs.append(proc)
++        return proc.pid
++    yield spawn
++    for proc in procs:
++        proc.kill()
++        proc.wait()
++
++
++def _holder(pid):
++    return f"pid={pid}{holder_namespace_token()}:turn={CHAT}:x:platform=local"
++
++
++def _gateway(monkeypatch, pid):
++    monkeypatch.setattr(fifo_mod, "canonical_gateway_pid", lambda profile: pid, raising=False)
++
++
++def _messages(caplog, text):
++    return [r.getMessage() for r in caplog.records if text in r.getMessage()]
++
++
++def _card():
++    return _done(TID, gw="worker-3")
++
++
++def test_sweep_leaves_a_gateway_leased_busy_chat_alone_no_claim_no_deferred(env, live_pids, monkeypatch, caplog):
++    hub, _runner, _authority, _fifo, db = env
++    gw = live_pids()
++    _gateway(monkeypatch, gw)
++    assert db.try_acquire_session_turn_lease(CHAT, _holder(gw))
++    _publish(hub, [_card()])
++    wakes = []
++    with caplog.at_level(logging.INFO):
++        for _ in range(3):
++            _sweep(wakes)
++    assert wakes == [] and _rows(KEY) == []
++    assert _ledger(TID, gw="worker-3") is None  # no claim taken, so none can race the gateway's owner pass
++    assert _messages(caplog, "deferred") == []
++    assert len(_messages(caplog, f"left to gateway pid {gw}")) == 1  # once per episode, not per pass
++    db.release_session_turn_lease(CHAT, _holder(gw))
++
++
++def test_gateway_lease_with_no_owner_pass_delivers_exactly_once_after_release(env, live_pids, monkeypatch):
++    """notify_in_gateway=false (or a non-launch profile): nobody admits during the turn; the sweep takes over once
++    the lease is released, and delivers once."""
++    hub, _runner, _authority, _fifo, db = env
++    gw = live_pids()
++    _gateway(monkeypatch, gw)
++    assert db.try_acquire_session_turn_lease(CHAT, _holder(gw))
++    _publish(hub, [_card()])
++    for _ in range(3):
++        _sweep_writes_row(db)
++    assert _rows(KEY) == [] and _ledger(TID, gw="worker-3") is None
++    db.release_session_turn_lease(CHAT, _holder(gw))
++    _sweep_writes_row(db)
++    _sweep_writes_row(db)
++    assert len(_rows(KEY)) == 1
++    assert _ledger(TID, gw="worker-3")["delivered"] != 0
++
++
++def test_a_dead_gateway_holder_keeps_the_sweeps_path(env, monkeypatch, caplog):
++    hub, _runner, _authority, _fifo, db = env
++    dead = _dead_pid()  # reaped: provably dead
++    _gateway(monkeypatch, dead)
++    assert db.try_acquire_session_turn_lease(CHAT, _holder(dead))
++    _publish(hub, [_card()])
++    with caplog.at_level(logging.INFO):
++        _sweep([])
++    assert len(_rows(KEY)) == 1  # the passive row reclaims the dead holder's lease
++    assert _messages(caplog, "left to gateway pid") == []
++
++
++def test_an_expired_lease_of_the_live_gateway_keeps_the_sweeps_path(env, live_pids, monkeypatch, caplog):
++    """The passive-row guard treats an expired lease as stale even while its pid lives (a Mac that slept through
++    the gateway's lease refresh), so the sweep must not stand aside then."""
++    hub, _runner, _authority, fifo, db = env
++    gw = live_pids()
++    _gateway(monkeypatch, gw)
++    assert db.try_acquire_session_turn_lease(CHAT, _holder(gw))
++    fifo._write("UPDATE session_turn_leases SET expires_at = ?", (time.time() - 1,))
++    _publish(hub, [_card()])
++    with caplog.at_level(logging.INFO):
++        _sweep([])
++    assert len(_rows(KEY)) == 1
++    assert _messages(caplog, "left to gateway pid") == []
++
++
++def test_a_live_holder_that_is_not_the_gateway_keeps_todays_path(env, live_pids, monkeypatch, caplog):
++    hub, _runner, _authority, _fifo, db = env
++    gw, other = live_pids(), live_pids()
++    _gateway(monkeypatch, gw)
++    assert db.try_acquire_session_turn_lease(CHAT, _holder(other))
++    _publish(hub, [_card()])
++    with caplog.at_level(logging.INFO):
++        _sweep([])
++    assert _rows(KEY) == []
++    assert _messages(caplog, "left to gateway pid") == []
++    assert len(_messages(caplog, "deferred: a turn is running")) == 1  # unchanged: claimed, refused, released
++    db.release_session_turn_lease(CHAT, _holder(other))
++
++
++def test_canonical_gateway_pid_falls_back_to_the_multiplexed_default_gateway(monkeypatch):
++    from gateway import status
++    import hermes_cli.gateway_multiplex_served as served
++    monkeypatch.setattr(status, "live_gateway_pid_for_home", lambda home: None)
++    monkeypatch.setattr(served, "live_default_gateway_pid", lambda: 4242)
++    assert fifo_mod.canonical_gateway_pid("household") == 4242
++    monkeypatch.setattr(status, "live_gateway_pid_for_home", lambda home: 77)
++    assert fifo_mod.canonical_gateway_pid("household") == 77
++    monkeypatch.setattr(status, "live_gateway_pid_for_home", lambda home: (_ for _ in ()).throw(OSError("x")))
++    assert fifo_mod.canonical_gateway_pid("household") is None
+diff --git a/tui_gateway/kanban_remote_fifo.py b/tui_gateway/kanban_remote_fifo.py
+index 00aee85408..ddc97e8b44 100644
+--- a/tui_gateway/kanban_remote_fifo.py
++++ b/tui_gateway/kanban_remote_fifo.py
+@@ -12,7 +12,8 @@ from __future__ import annotations
+ import json
+ import logging
+ import sqlite3
+-from typing import Any, Iterable
++import time
++from typing import Any, Iterable, Optional
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -72,3 +73,60 @@ def gateway_holds(db: Any, ids: Iterable[str], event_key: str) -> bool:
+     its key. Only then: a dropped admission hands the notice back to this sweep (t_01a1cff0541bf30c
+     amendment), and a busy chat's claim here is released within the same pass."""
+     return bool(event_key) and event_key in pending_keys(db, ids)
++
++
++def canonical_gateway_pid(profile: Optional[str]) -> Optional[int]:
++    """The verified live gateway that runs ``profile``'s chats: the gateway of that profile's own home, else
++    the default root's (a multiplexed gateway serves the profile from there). Identity is the start-time and
++    command-line proven pid of ``gateway.status.live_gateway_pid_for_home``, never the control socket's identify
++    call (``discover_owner`` drops the pid and times out under exactly the load this guards). None when unproven."""
++    try:
++        from gateway.status import live_gateway_pid_for_home
++        from hermes_cli.profiles import get_profile_dir
++        pid = live_gateway_pid_for_home(get_profile_dir(profile or "default"))
++        if pid is None:
++            from hermes_cli.gateway_multiplex_served import live_default_gateway_pid
++            pid = live_default_gateway_pid()
++        return int(pid) if pid is not None else None
++    except Exception:  # health: allow BLE001 -- an unproven gateway keeps the sweep's own path
++        logger.debug("remote kanban fifo: gateway pid lookup failed", exc_info=True)
++        return None
++
++
++def gateway_lease_pid(db: Any, ids: Iterable[str], profile: Optional[str], now: Optional[float] = None,
++                      gateway_pid=None) -> Optional[int]:
++    """The canonical gateway's pid when it holds an UNEXPIRED turn lease on the chat (``ids``: its lineage), else
++    None. The Desktop backend's sweep then leaves the notice alone: no claim, no wake, no passive row.
++
++    Why standing aside gives up nothing (t_01a1cff0541bf30c G3, review t_01a1d4c44f637fff): while another live
++    process holds an unexpired lease, the sweep can deliver nothing. Its passive row is refused
++    (``record_kanban_notice``'s ``reject_active_turn_lease`` guard raises ``SessionTurnLeaseLostError``) and its
++    wake is refused (``refuses_held_lease_at_once`` for a desktop/tui turn). Claiming anyway only logged
++    "deferred: a turn is running" every pass and held the claim the gateway's own pass needs. Once the lease is
++    released, expires (the passive-row guard reclaims an expired lease even from a live pid, so this answers None
++    then) or its holder dies, the sweep runs as before; the gateway's owner pass meanwhile admits the notice to
++    the chat's FIFO. Lease-only on purpose: a ledger arm (``queued``/``started`` admissions) would also hold the
++    notice between turns, when the passive row could land and the owner pass may not run (notify_in_gateway off,
++    a non-launch profile, the restore gap)."""
++    owner_of = getattr(db, "session_turn_lease_owner", None)
++    if owner_of is None:
++        return None
++    now = time.time() if now is None else now
++    holders = []
++    try:
++        for sid in sorted({str(i) for i in ids if i}):
++            row = owner_of(sid) or {}
++            holder = str(row.get("holder") or "")
++            if holder and float(row.get("expires_at") or 0) > now:
++                holders.append(holder)
++    except (sqlite3.Error, TypeError, ValueError):
++        logger.debug("remote kanban fifo: lease read failed", exc_info=True)
++        return None
++    if not holders:
++        return None  # the common case: no running turn, no gateway probe
++    from tui_gateway.kanban_leg_custody import gateway_owner
++    pid = canonical_gateway_pid(profile) if gateway_pid is None else gateway_pid
++    if pid is None:
++        return None
++    owner = gateway_owner(tuple(ids), None, tuple(dict.fromkeys(holders)), gateway_pid=pid, launch_profile="")
++    return owner.pid if owner is not None else None
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 6905b1dd65..7de96c5900 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -1247,12 +1247,18 @@ def _deliver_link(owner, key, task, link, *, me, ref, state, path, live, session
+             if settled((sid, tip), ref, state):
+                 _remember_delivered(memo_key)
+                 return
+-            from tui_gateway.kanban_remote_fifo import gateway_holds, lineage_ids
+-            if gateway_holds(db, lineage_ids(db, sid, tip), event_key):
++            from tui_gateway.kanban_remote_fifo import gateway_holds, gateway_lease_pid, lineage_ids
++            ids = lineage_ids(db, sid, tip)
++            if gateway_holds(db, ids, event_key):
+                 # [daveey] The gateway runs this chat's turns and admits the notice to its FIFO
+                 # (gateway.kanban_remote_owner); a claim here would only race it (t_01a1cff0541bf30c).
+                 _note_wait(sid, ref, state, "left to the gateway's FIFO (the gateway runs this chat's turns)")
+                 return
++            if (gw_pid := gateway_lease_pid(db, ids, profile)) is not None:
++                # [daveey] A gateway turn holds the chat: no row or wake can land here until it ends, and the
++                # gateway's owner pass admits the notice meanwhile. No claim, so nothing races it (G3).
++                _note_wait(sid, ref, state, f"left to gateway pid {gw_pid}: its turn holds the chat's lease")
++                return
+             if waker is None:
+                 row_id = db.append_kanban_notice(tip, text, metadata)
+                 from hermes_state_outcome import refresh_outcomes_quietly
+-- 
+2.43.0
+
