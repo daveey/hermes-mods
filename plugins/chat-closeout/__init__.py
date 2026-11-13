@@ -2370,10 +2370,16 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
     # unknown/stale remote row): no close-out can ever run for it. One card per row episode (key = the persisted
     # first-seen time). Wall age >= STUCK_S plus STALE_S of this process's monotonic observation, so a lid sleep
     # alone never files it; a full day of uptime is not required (a backend restart would never let it fire).
+    # An entry whose unlink clock (``core.track_unlinked``) is still advancing is owned by the automatic unlink: that
+    # clock counts only healthy observed time, so on a sleeping laptop wall time passes STUCK_S first, and filing
+    # then would report a row the unlink resolves on its own. A clock that stopped advancing (unhealthy inventory,
+    # an uncertain entry, or none at all) still counts.
     stuck: dict[str, list[str]] = {}
     for row in pending:
         cards = read(row["batch"])
-        unknown = [t for t in row["batch"] if core.is_unresolved(cards.get(t))]
+        clocks = row.get("unlinked") or {}
+        unknown = [t for t in row["batch"] if core.is_unresolved(cards.get(t))
+                   and not core.unlink_clock_active(clocks.get(t), now)]
         working = [t for t in row["batch"] if core.is_working(cards.get(t))]
         if unknown and not working:
             stuck[row["session_id"]] = unknown

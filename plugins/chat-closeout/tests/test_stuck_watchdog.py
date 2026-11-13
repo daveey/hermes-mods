@@ -123,3 +123,55 @@ def test_real_board_files_and_closes_one_card(real_board):
     with connect() as conn:
         assert kb.get_task(conn, rows[0]['id']).status == 'done'
     assert not led.has_flag(key)
+
+
+# ---- wall 24 h vs observed 24 h: an advancing unlink clock owns its entry ----------------------------------------
+STRANDED = ['hub/default/runners/t_arch1', 'hub/default/runners/t_arch2']
+
+
+def _archived(key):
+    gw, profile, board, tid = key.split('/')
+    return {'id': tid, 'key': key, 'gateway': gw, 'profile': profile, 'board': board, 'remote': True,
+            'status': 'archived', 'stale': False, 'unfinished': False, 'via': 'origin', 'binding_id': None,
+            'released': True}
+
+
+def _clock(now, at, observed):
+    return {'since': now - 30 * H, 'observed': observed, 'at': at, 'mono': 0.0, 'pid': 1, 'found': True}
+
+
+@pytest.mark.parametrize('stale', [False, True])
+def test_stuck_waits_while_the_unlink_clock_advances(wd, stale):
+    """A sleeping laptop: 30 h of wall time past stuck_since, but only 18 h of healthy observation on the stranded
+    entries' unlink clock. While that clock advances (last observation within 2 x UNLINK_MAX_GAP_S) the automatic
+    unlink owns the entries and no 'nothing can find' card is filed; a clock that stopped advancing still files."""
+    led, posts, _ = wd
+    start = 1000.0
+    now = start + 30 * H
+    at = now - (core.STALE_S + 2 * core.UNLINK_MAX_GAP_S + 60 if stale else 30)   # stale on both ticks below
+    cards = {k: _archived(k) for k in STRANDED}
+    assert all(core.is_unresolved(c) and core.is_stranded(c) for c in cards.values())
+    led.write('chat', batch=list(STRANDED), open=[],
+              unlinked={k: _clock(now, at, 18 * H) for k in STRANDED})
+    led.stuck_since({'chat'}, start)                  # stuck since 30 h ago (persisted first-seen time)
+    keys = []
+    for t, m in ((now - core.STALE_S, 0), (now, core.STALE_S)):
+        if not stale:                                 # the unlink pass keeps observing the entries every 30 s
+            led.write('chat', unlinked={k: _clock(now, t - 30, 18 * H) for k in STRANDED})
+        keys = run(cards, t, m, posts)
+    if stale:
+        assert keys == ['chat-closeout:stuck:chat:1000'] and len(posts) == 1
+    else:
+        assert keys == [] and posts == []
+
+
+def test_only_entries_without_an_advancing_clock_are_named(wd):
+    led, posts, _ = wd
+    now = 1000.0 + 30 * H
+    cards = {k: _archived(k) for k in STRANDED}
+    led.write('chat', batch=[*STRANDED, 'default/t_gone'], open=[],
+              unlinked={k: _clock(now, now - 30, 18 * H) for k in STRANDED})
+    run(cards, 1000.0, 0, posts)
+    keys = run(cards, now, core.STALE_S, posts)
+    assert keys == ['chat-closeout:stuck:chat:1000']
+    assert 'default/t_gone' in posts[0][1] and not any(k in posts[0][1] for k in STRANDED)

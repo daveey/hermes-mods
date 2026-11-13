@@ -822,6 +822,16 @@ def track_unlinked(row: dict[str, Any], cards: dict[str, dict[str, Any]], *, hea
     return out
 
 
+def unlink_clock_active(entry: Any, now: float) -> bool:
+    """``track_unlinked`` is still aging this entry: not removed, and observed within 2 x ``UNLINK_MAX_GAP_S``."""
+    if not isinstance(entry, dict) or "removed" in entry or entry.get("at") is None:
+        return False
+    try:
+        return now - float(entry["at"]) <= 2 * UNLINK_MAX_GAP_S
+    except (TypeError, ValueError):
+        return False
+
+
 def unlinked_removed(row: dict[str, Any]) -> list[str]:
     """Entries unlinked since the last close-out, which the next close-out names once."""
     return sorted(k for k, v in (row.get("unlinked") or {}).items() if isinstance(v, dict) and "removed" in v)
