@@ -1,0 +1,196 @@
+From 4e3a6ab837c6e9eacce922f2f417c0a394bb6f5d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:26:24 +0000
+Subject: [PATCH] [daveey] host_loop_lease: refresh a hand-off waiter's .want
+ on its own timer
+
+PR #2161 review nit 1 (review t_01a1d4bc67257c47, GitHub review 5890499145).
+
+While a higher-priority standby waits on LOCK_EX for a hand-off, its .want
+was refreshed only from held() once _next_probe passed. The refresh cadence
+therefore depended on the caller's loop: a caller that calls held() less
+than once per interval let its own .want pass the 3 x interval expiry in
+_live_want, and the holder/standbys stopped deferring to it (it still got
+the lock on release, but lost hand-off priority).
+
+Fix: _want() starts a second daemon thread for the wait,
+_refresh_want_while_waiting, which calls _keep_want() once per interval
+under _mu for as long as that wait lasts (stops when the wait thread wins or
+fails, on release(), or when the fd changed; reset after fork). held() keeps
+its refresh as the fallback when the refresher thread cannot start (logged
+as a WARNING; the wait itself continues). Module docstring updated.
+
+Tests (tests/hermes_cli/test_host_loop_lease.py):
+- test_waiter_keeps_its_want_live_without_held_calls: holder SIGSTOPped,
+  waiter calls held() once, then waits (no held()) for a refresh made past the first record's 3 x interval expiry;
+  a lower-priority lease object's _live_want() still returns the waiter's record.
+  RED on origin/main (record expired, "ignoring stale test-loop.want"),
+  GREEN with this change.
+- test_refresher_spawn_failure_keeps_waiting_and_held_refreshes: only the
+  refresher fails to start; the waiter stays waiting, held() refreshes .want
+  and the waiter gets the lock on release.
+
+Ran: test_host_loop_lease.py 24 passed (3 runs), tests/hermes_cli/test_doctor*.py
+214 passed / 8 skipped, scripts/check --base origin/main.
+---
+ hermes_cli/host_loop_lease.py            | 34 ++++++++++++--
+ tests/hermes_cli/test_host_loop_lease.py | 56 ++++++++++++++++++++++++
+ 2 files changed, 87 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/host_loop_lease.py b/hermes_cli/host_loop_lease.py
+index 51b90ed622..2df69bc2cc 100644
+--- a/hermes_cli/host_loop_lease.py
++++ b/hermes_cli/host_loop_lease.py
+@@ -32,8 +32,10 @@ home, so profile processes of one install share one owner.
+   gets the lock the moment it is released (no polling gap). The holder reads ``.want`` in ``beat()`` at
+   the end of each pass and releases. Any other standby that wins the lock in that release window drops
+   it again while a live ``.want`` of priority >= its own exists. ``.want`` is one slot: while it waits,
+-  the wanter rewrites it once per interval from ``held()`` (refreshing ``at``, or republishing it when
+-  another wanter's record replaced it), so a replaced record cannot starve it. A ``.want`` whose ``at``
++  a second daemon thread of the wanter rewrites it once per interval (refreshing ``at``, or republishing
++  it when another wanter's record replaced it), so a replaced record cannot starve it and the refresh
++  does not depend on how often the caller calls ``held()`` (``held()`` refreshes it too, the fallback
++  when that thread could not start). A ``.want`` whose ``at``
+   is older than ``3 × interval`` is expired (one WARNING per wanter): a wanter that is alive but never
+   takes the lock (SIGSTOPped, its waiting thread failed to start) cannot make every process defer.
+ * **Torn metadata.** The holder rewrites the record in place (``pwrite``), padded with spaces to a
+@@ -208,6 +210,7 @@ class HostLoopLease:
+         self._writable = False
+         self._held = False
+         self._waiting = False        # a daemon thread blocks on LOCK_EX on self._fd for a .want hand-off
++        self._want_stop: threading.Event | None = None  # stops the current wait's .want refresher
+         self._stop: threading.Event | None = None  # the current holding's watchdog stop flag
+         self._last_beat = 0.0
+         self._acquired_at = 0.0
+@@ -274,6 +277,7 @@ class HostLoopLease:
+             if self._held:
+                 self._drop()
+             self._clear_own_want()
++            self._stop_want_refresher()
+             if self._waiting:
+                 # The hand-off thread is blocked in flock() on self._fd and cannot be interrupted: leave
+                 # that fd to it (it unlocks and closes it on wake-up) and start this object afresh.
+@@ -441,6 +445,28 @@ class HostLoopLease:
+             logger.warning("host loop %s: cannot start the hand-off thread (%s); not waiting", self.name, exc)
+             self._waiting = False
+             self._clear_own_want()
++            return
++        stop = self._want_stop = threading.Event()
++        try:
++            _spawn(lambda: self._refresh_want_while_waiting(fd, stop), f"host-loop-want-refresh-{self.name}")
++        except RuntimeError as exc:  # held() still refreshes .want once per interval
++            logger.warning("host loop %s: cannot start the .want refresher (%s); held() refreshes it", self.name,
++                           exc)
++            self._want_stop = None
++
++    def _stop_want_refresher(self) -> None:
++        if self._want_stop is not None:
++            self._want_stop.set()
++            self._want_stop = None
++
++    def _refresh_want_while_waiting(self, fd: int, stop: threading.Event) -> None:
++        """Refresh ``.want`` once per interval for as long as this hand-off wait lasts, whatever the
++        caller's ``held()`` cadence (``_live_want`` expires a record older than ``3 × interval``)."""
++        while not stop.wait(self.interval):
++            with self._mu:
++                if stop.is_set() or not self._waiting or self._fd != fd:
++                    return
++                self._keep_want()
+ 
+     def _keep_want(self) -> None:
+         """While waiting, once per interval (caller holds ``_mu``): refresh our ``.want``, or publish it
+@@ -463,6 +489,7 @@ class HostLoopLease:
+                     os.close(fd)
+                     return
+                 self._waiting = False
++                self._stop_want_refresher()
+                 self._clear_own_want()  # a live .want nobody waits on would hold every standby off
+             return
+         with self._mu:
+@@ -471,6 +498,7 @@ class HostLoopLease:
+                 os.close(fd)
+                 return
+             self._waiting = False
++            self._stop_want_refresher()
+             self._become_holder()
+             self._clear_own_want()
+ 
+@@ -499,7 +527,7 @@ def _after_fork_child() -> None:
+                 os.close(lease._fd)
+             except OSError:
+                 pass
+-        lease._fd, lease._held, lease._waiting, lease._stop = None, False, False, None
++        lease._fd, lease._held, lease._waiting, lease._stop, lease._want_stop = None, False, False, None, None
+         lease._mu = threading.RLock()
+ 
+ 
+diff --git a/tests/hermes_cli/test_host_loop_lease.py b/tests/hermes_cli/test_host_loop_lease.py
+index e8b83538dd..df96df7282 100644
+--- a/tests/hermes_cli/test_host_loop_lease.py
++++ b/tests/hermes_cli/test_host_loop_lease.py
+@@ -414,6 +414,62 @@ def test_release_during_pending_handoff_lets_held_compete_again(spawn, home):
+         gateway.release()
+ 
+ 
++def test_waiter_keeps_its_want_live_without_held_calls(spawn, home):
++    """PR #2161 review nit 1: a waiter whose caller never calls ``held()`` again must keep its
++    ``.want`` live past ``3 × interval``: the hand-off waiter refreshes it on its own timer."""
++    dash = spawn("dashboard")
++    wait_until(lambda: dash.state() == "HELD", timeout=20, what="dashboard holds")
++    gateway = hll.HostLoopLease("test-loop", "gateway", interval=INTERVAL, home=home)
++    observer = hll.HostLoopLease("test-loop", "serve", interval=INTERVAL, home=home)
++    try:
++        dash_pid = dash.proc.pid
++        dash.proc.send_signal(signal.SIGSTOP)  # no beat(), so no hand-off: the gateway keeps waiting
++        try:
++            assert gateway.held() is False  # publishes .want and waits; held() is never called again
++            assert (_want_of(home, "test-loop") or {}).get("pid") == os.getpid()
++            first = (_want_of(home, "test-loop") or {}).get("at", 0.0)
++            # the first record expires 3 intervals in: wait for a refresh made past that point
++            wait_until(lambda: (_want_of(home, "test-loop") or {}).get("at", 0.0)
++                       > first + hll.WATCHDOG_FACTOR * INTERVAL, timeout=10,
++                       what="the waiter refreshes its .want with no held() call")
++            assert gateway._waiting is True
++            want = observer._live_want()
++            assert want is not None and want.get("pid") == os.getpid(), _want_of(home, "test-loop")
++        finally:
++            os.kill(dash_pid, signal.SIGCONT)
++        wait_until(lambda: gateway._held, timeout=10, what="gateway gets the hand-off")
++    finally:
++        gateway.release()
++
++
++def test_refresher_spawn_failure_keeps_waiting_and_held_refreshes(home, monkeypatch, caplog):
++    """The hand-off wait does not depend on the refresher: when only that thread fails to start, the
++    waiter keeps waiting and ``held()`` refreshes ``.want`` as before."""
++    dash = hll.HostLoopLease("rf", "dashboard", interval=60, home=home)
++    assert dash.held() is True
++    gateway = hll.HostLoopLease("rf", "gateway", interval=60, home=home)
++    real = hll._spawn
++
++    def no_refresher(target, name):
++        if name.startswith("host-loop-want-refresh-"):
++            raise RuntimeError("can't start new thread")
++        real(target, name)
++
++    monkeypatch.setattr(hll, "_spawn", no_refresher)
++    with caplog.at_level(logging.WARNING, logger=hll.__name__):
++        assert gateway.held() is False
++    assert gateway._waiting is True and gateway._want_stop is None
++    assert any("cannot start the .want refresher" in r.getMessage() for r in caplog.records)
++    before = (_want_of(home, "rf") or {})["at"]
++    gateway._next_probe = 0.0
++    assert gateway.held() is False
++    assert (_want_of(home, "rf") or {})["at"] > before
++    monkeypatch.undo()
++    dash.release()  # (same pid, so beat() would not hand off) the waiting gateway gets the lock
++    wait_until(lambda: gateway._held, timeout=10, what="gateway gets the lock")
++    gateway.release()
++
++
+ def test_meta_is_fixed_length_so_rewrites_never_leave_a_tail(home):
+     """Nit 4: a lock-free reader must never see the old record's tail after a shorter rewrite."""
+     lease = hll.HostLoopLease("fl", "serve", interval=1, home=home)
+-- 
+2.43.0
+

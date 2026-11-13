@@ -1,0 +1,123 @@
+From f2478929099828a21eaa6eec1de417d5e961878a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:17:06 +0000
+Subject: [PATCH] [daveey] kanban placement: malformed registry labels fail
+ closed in label_machines
+
+PR #2171 review nit (t_01a1d4be7c79b6e4, GitHub review 5890499417; card t_01a1d4c327277a9d).
+
+label_machines evaluated `wanted <= set(entry.get("labels") or [])`. A registry entry whose
+`labels` was a non-iterable truthy value (an int) raised TypeError instead of being skipped, and
+a str matched its characters (`labels: "x"` carried label `x`). Since #2171 the named-machine
+branch of _machine_picks_up also goes through label_machines (empty label set), so one malformed
+entry would crash named heavy_route routing as well as pool/label-set liveness.
+
+Fix: judge labels with kanban_placement_coordination._carries (a list of str, else the entry
+does not qualify: fail closed). A missing or null `labels` stays an empty set, as before, so a
+named machine without labels still picks up.
+
+Proof (tests/hermes_cli/test_kanban_placement_labels_shape.py):
+- RED on origin/main 99c1a5d454: 6 failed (`labels: 5` -> TypeError: 'int' object is not
+  iterable; "x"/"pool:worker"/dict/tuple/[str, int] matched), 4 controls passed.
+- GREEN: 3 files (labels_shape, placement, freshness) 280 passed; the 73 test files importing
+  kanban_placement / kanban_placement_coordination: 2139 passed, 0 failed.
+- scripts/check --base origin/main: 19 checks ok.
+---
+ hermes_cli/kanban_placement.py                | 12 +++--
+ .../test_kanban_placement_labels_shape.py     | 48 +++++++++++++++++++
+ 2 files changed, 57 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_placement_labels_shape.py
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 84740408c7..d2ec8e3c5f 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -278,22 +278,28 @@ def label_machines(label: str | Iterable[str], machines: Optional[dict] = None)
+     """Active, unheld, fresh registry machines that carry ``label`` (or every label of a list/set) and pick up
+     other gateways' cards (sorted). Fresh is coordination attestation's window (``last_seen`` within
+     ``FRESH_S``, up to ``SKEW_S`` ahead of this clock): a stale entry holding the whole set leases nothing, so it
+-    must not make a queue look live.
++    must not make a queue look live. ``labels`` must be a list of str, as coordination's ``_carries`` requires (a
++    missing or null one is empty); any other shape fails closed, so a malformed entry is skipped rather than raising
++    TypeError or matching a str's characters.
+ 
+     Board outage: ``wn.registry()`` keeps the last good snapshot, so ``FRESH_S`` after the last successful fetch
+     every entry is stale and this returns []. Callers then fail closed: hub-admission deny-route cards go
+     worker-first (:func:`kanban_hub_admission_placement.pool_route`) and portable cards keep their local placement
+     (:func:`kanban_worker_placement.queue_decision`) instead of queueing on a pool label nobody may lease."""
+     from hermes_cli import kanban_worker_node as wn
+-    from hermes_cli.kanban_placement_coordination import _fresh
++    from hermes_cli.kanban_placement_coordination import _carries, _fresh
+     if machines is None:
+         machines = (wn.registry() or {}).get("machines") or {}
+     wanted = {label} if isinstance(label, str) else set(label)
++
++    def carries(entry):
++        labels = entry.get("labels")
++        return _carries({"labels": [] if labels is None else labels}, wanted)
+     now = time.time()
+     return sorted(name for name, entry in machines.items()
+                   if isinstance(entry, dict) and entry.get("state", "active") == "active" and not entry.get("hold")
+                   and ("pickup" not in entry or wn.advertises_pickup(entry)) and _fresh(entry, now)
+-                  and wanted <= set(entry.get("labels") or []))
++                  and carries(entry))
+ 
+ 
+ class _Cfg:
+diff --git a/tests/hermes_cli/test_kanban_placement_labels_shape.py b/tests/hermes_cli/test_kanban_placement_labels_shape.py
+new file mode 100644
+index 0000000000..ab120ff479
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_placement_labels_shape.py
+@@ -0,0 +1,48 @@
++"""Malformed Board registry ``labels`` fail closed in Kanban placement liveness. [daveey]
++
++PR #2171 review nit (t_01a1d4be7c79b6e4, GitHub review 5890499417; fixed in t_01a1d4c327277a9d):
++``label_machines`` evaluated ``wanted <= set(entry.get("labels") or [])``. A non-iterable ``labels`` (an int) raised
++TypeError and a str matched its characters (``"x"`` carried label ``x``). Since #2171 the named-machine branch of
++``_machine_picks_up`` also goes through ``label_machines`` (empty label set), so one malformed entry crashed named
++routing too. Like ``kanban_placement_coordination._carries``, labels must be a list of str; a missing or null list is
++empty; any other shape does not qualify.
++"""
++from __future__ import annotations
++
++import time
++
++import pytest
++
++from hermes_cli import kanban_placement as kp
++from hermes_cli import kanban_worker_node as wn
++
++
++def _registry(monkeypatch, entry):
++    entry = {"state": "active", "last_seen": time.time() * 1000, **entry}
++    monkeypatch.setattr(wn, "registry", lambda: {"me": "hub", "machines": {"worker-1": entry}})
++
++
++@pytest.mark.parametrize("labels", [5, "x", "pool:worker", {"pool:worker": 1}, ("pool:worker",), ["pool:worker", 5]])
++def test_malformed_registry_labels_fail_closed(monkeypatch, labels):
++    _registry(monkeypatch, {"labels": labels})
++    assert kp.label_machines("x") == []
++    assert kp.label_machines("pool:worker") == []
++    assert kp.label_machines(()) == []
++    assert kp._machine_picks_up("pool:worker") is False
++    assert kp._machine_picks_up(("pool:worker",)) is False
++    assert kp._machine_picks_up("worker-1") is False
++
++
++@pytest.mark.parametrize("entry", [{}, {"labels": None}, {"labels": []}])
++def test_missing_or_empty_labels_are_an_empty_set(monkeypatch, entry):
++    _registry(monkeypatch, entry)
++    assert kp.label_machines(()) == ["worker-1"]
++    assert kp._machine_picks_up("worker-1") is True
++    assert kp.label_machines("pool:worker") == []
++
++
++def test_well_formed_labels_still_qualify(monkeypatch):
++    _registry(monkeypatch, {"labels": ["pool:worker", "capability:hub-write"]})
++    assert kp.label_machines(("pool:worker", "capability:hub-write")) == ["worker-1"]
++    assert kp._machine_picks_up("pool:worker") is True
++    assert kp._machine_picks_up("worker-1") is True
+-- 
+2.43.0
+

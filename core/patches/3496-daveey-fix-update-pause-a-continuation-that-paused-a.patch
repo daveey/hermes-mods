@@ -1,0 +1,115 @@
+From 2a6ebfb000e3af88dbd2dc7075d9f16c63f27838 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:39:41 +0000
+Subject: [PATCH] [daveey] fix(update-pause): a continuation that paused again
+ names its chain, not the root prompt as new
+
+laptop-1 03:07-03:29 PST (t_01a1d4920ce3cbf4 recurrence on fedc433cef): the 02:24 continuation of the
+00:55 pause paused again (pauses 2, marker prompt = the 00:33 root notice); the ledger refused it while
+the gateway continued its own pause record, and at 03:29 it was replayed in place as a fresh request.
+The stale/queued note now says the request already ran as a continuation after N earlier pauses.
+Regression: test_continuation_that_paused_again_is_forwarded_once_and_named_as_a_chain.
+---
+ .../test_update_pause_ledger_owner.py         | 28 +++++++++++++++++++
+ tui_gateway/session_auto_continue.py          |  4 +--
+ tui_gateway/update_pause.py                   | 11 ++++++--
+ 3 files changed, 38 insertions(+), 5 deletions(-)
+
+diff --git a/tests/tui_gateway/test_update_pause_ledger_owner.py b/tests/tui_gateway/test_update_pause_ledger_owner.py
+index aa37b25342..69ec6f428d 100644
+--- a/tests/tui_gateway/test_update_pause_ledger_owner.py
++++ b/tests/tui_gateway/test_update_pause_ledger_owner.py
+@@ -231,6 +231,34 @@ def test_continuation_right_after_the_pause_keeps_the_previous_turn_note(env, mo
+     assert env.ran == [up.pause_note(PROMPT)]
+ 
+ 
++def test_continuation_that_paused_again_is_forwarded_once_and_named_as_a_chain(env, monkeypatch):
++    """laptop-1 03:07-03:29 PST: the 02:24 continuation of the 00:55 pause paused again (``pauses: 2``, the marker
++    keeping the chain's root prompt, the 00:33 notice). The ledger refused it while the gateway continued its own
++    second pause record of the chat (admission fba3e145…), and at 03:29 it was replayed in place as if new."""
++    from tui_gateway.turn_marker import clear_turn_marker
++    clear_turn_marker(env.home, "chat")
++    record_turn_start(env.home, "chat", PROMPT, pauses=1)  # the continuation keeps the root prompt
++    mark_turn_paused(env.home, "chat", up.PAUSE_REASON)  # its own pause: pauses 2, paused_at = the 03:07 stamp
++    marker = read_turn_marker(env.home, "chat")
++    assert marker["pauses"] == 2
++    env.ledger["status"] = "started"  # the gateway is running its own continuation of the chat's other pause
++    env.db.append_message("chat", "user", "[IMPORTANT: 28 Kanban task updates arrived]")  # the gateway's turn
++    env.db.append_message("chat", "assistant", "handled")
++    session = _session(env.home)
++
++    _watch(monkeypatch, session)
++    server._maybe_schedule_auto_continue("sid", session, "chat")  # a later resume: nothing left to continue
++
++    assert env.ran == [] and len(env.forwarded) == 1
++    note = env.forwarded[0]
++    assert note.startswith(up.PAUSE_REPLAY_NOTE_PREFIX) and "interrupted" not in note.split("]")[0]
++    assert up._clock_label(marker["paused_at"]) in note
++    assert "1 later turn ran in this chat since" in note
++    assert "This request is not new: it already ran as a continuation after 1 earlier pause" in note
++    assert note.endswith(PROMPT)
++    assert read_turn_marker(env.home, "chat") is None
++
++
+ def test_old_pause_whose_later_turns_cannot_be_counted_is_worded_as_stale(monkeypatch):
+     monkeypatch.setattr(up, "_now", lambda: 10_000.0)
+     note = up.pause_note(PROMPT, paused_at=10_000.0 - 2 * 3600, later_turns=None)
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 5e3926133e..c7eb06457f 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -268,7 +268,7 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+         from tui_gateway.update_pause import later_turns_since, pause_note
+         attempt, text = marker["attempts"], pause_note(
+             marker["prompt"], marker.get("killed_jobs"), carried=bool(marker.get("carried_turn_paused")),
+-            paused_at=marker.get("paused_at"),
++            paused_at=marker.get("paused_at"), pauses=int(marker.get("pauses") or 0),
+             later_turns=later_turns_since(session, session_key, marker.get("paused_at")))
+     elif receipt:
+         attempt, text = marker["attempts"], jobs_stopped_note(marker.get("killed_jobs"))
+@@ -399,7 +399,7 @@ def _paused_turn_to_ledger_owner(sid: str, session: dict, session_key: str, mark
+         return True
+     # It runs after the owner's queued turns, so it is never worded as the chat's previous turn.
+     text = pause_note(marker["prompt"], marker.get("killed_jobs"), carried=bool(marker.get("carried_turn_paused")),
+-                      paused_at=marker.get("paused_at"), queued=True,
++                      paused_at=marker.get("paused_at"), queued=True, pauses=int(marker.get("pauses") or 0),
+                       later_turns=later_turns_since(session, session_key, marker.get("paused_at")))
+     try:
+         receipt = owner_forward.forward_prompt(sid, session, text)
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index f6b847f32e..38fc3825b0 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -524,12 +524,14 @@ CARRIED_TURN_NOTE = ("[A notification turn that ran after this pause was itself
+ 
+ 
+ def pause_note(prompt: str, killed_jobs: list | None = None, *, carried: bool = False,
+-               paused_at: float | None = None, later_turns: int | None = 0, queued: bool = False) -> str:
++               paused_at: float | None = None, later_turns: int | None = 0, queued: bool = False,
++               pauses: int = 0) -> str:
+     """The continuation's note. Right after the pause it is the chat's previous turn; once later turns ran over the
+     pause (``later_turns``; None = unknown and the pause is older than ``STALE_NOTE_AFTER_S``), or it is
+     ``queued`` behind the owner's other turns, it says when the request was paused and that other turns ran (or may
+     run) since, so the model checks before redoing anything (t_01a1d4920ce3cbf4: a 2 h old, already handled notice
+-    was replayed as "your previous turn was interrupted")."""
++    was replayed as "your previous turn was interrupted"). ``pauses`` >= 2: the marker keeps the chain's root
++    prompt, which earlier continuations already worked on, so the note says so instead of presenting it as new."""
+     stale = paused_at is not None and (queued or bool(later_turns) or (
+         later_turns is None and _now() - float(paused_at) > STALE_NOTE_AFTER_S))
+     if stale and paused_at is not None:
+@@ -537,8 +539,11 @@ def pause_note(prompt: str, killed_jobs: list | None = None, *, carried: bool =
+         since = (f"{later_turns} later turn{'s' if later_turns != 1 else ''} ran in this chat since" if later_turns
+                  else "it was queued behind other turns in this chat, which may have run first" if queued
+                  else "other turns may have run in this chat since")
++        earlier = pauses - 1
++        chain = (f" This request is not new: it already ran as a continuation after {earlier} earlier "
++                 f"pause{'s' if earlier != 1 else ''}, and that work is above." if earlier >= 1 else "")
+         note = (f"{PAUSE_REPLAY_NOTE_PREFIX} at {_clock_label(at)} ({_age_label(at)} "
+-                f"ago) and only continues now; {since}. Every tool result from the paused turn is complete. "
++                f"ago) and only continues now; {since}.{chain} Every tool result from the paused turn is complete. "
+                 "Before doing anything, check the transcript and re-read any PR, CI or card state: a later turn may "
+                 "already have handled this request, so don't redo finished work. The paused request was:]"
+                 f"\n\n{prompt}")
+-- 
+2.43.0
+

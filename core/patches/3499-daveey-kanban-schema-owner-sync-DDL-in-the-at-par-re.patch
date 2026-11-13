@@ -1,0 +1,348 @@
+From 7d6586c04b33457be1acd8189e57f08e5d8a8479 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:24:41 +0000
+Subject: [PATCH] [daveey] kanban schema owner: sync DDL in the at-par
+ reference; never create a missing board; CLI one-line refusal
+
+Follow-ups to PR #2019 (only a home's installed core migrates its board) from exact-head review 5889519484
+(card t_01a1d473f87f6999), card t_01a1d47a6e38a25b.
+
+1. The at-par reference missed the sync schema. `_reference_schema` replayed only
+   `kanban_db_connect.apply_schema_steps`, while `register_without_install` marks an attached board synced.
+   If main adds a sync table/column the installed core lacks, a non-installed checkout opened read-write
+   with sync live and could fail later with a raw "no such column". Now `kanban_db_sync.apply_sync_schema_steps`
+   is the one list of sync DDL steps (`install_or_remove` runs it), and when the board would be registered
+   synced (`live_without_install`, the predicate `register_without_install` already used) the reference
+   includes it. A synced board lacking a sync column this core declares opens read-only and refuses writes
+   with BoardSchemaNotOwned naming the column.
+2. A non-installed checkout connecting to a board file that does not exist yet left a 4096-byte empty
+   kanban.db (plus sidecars). `connect`/`init_db` now call `refuse_missing_board` before mkdir/open: in a
+   home with an installed core that is not this one, a missing board raises BoardSchemaNotOwned and
+   nothing is created.
+3. `hermes kanban` printed BoardSchemaNotOwned as a full traceback (live check on worker-4, evidence
+   t_01a1d3fb5bab541f/run9). `kanban_command` now prints its one-line message to stderr and exits 1, for
+   both init_db and the action handler.
+
+Tests (tests/hermes_cli/test_kanban_schema_owner.py, 19 pass): 4 new cases fail on origin/main
+(sync reference == synced connect; fake sync column -> BoardSchemaNotOwned with triggers/columns unchanged;
+missing board not created; CLI one line, rc 1); a sync-off guard case shows the sync DDL is not required
+there. Neighbouring suites (13 files touching the schema owner / sync install, 450 tests; 8 files with an
+installed-core home layout, 904 tests) pass. scripts/check --base origin/main ok.
+---
+ hermes_cli/kanban.py                         |  5 ++
+ hermes_cli/kanban_db_connect.py              |  2 +
+ hermes_cli/kanban_db_sync.py                 | 42 +++++----
+ hermes_cli/kanban_schema_owner.py            | 42 ++++++---
+ tests/hermes_cli/test_kanban_schema_owner.py | 95 ++++++++++++++++++++
+ 5 files changed, 159 insertions(+), 27 deletions(-)
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 8967cb1aad..d9aa9abb64 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -41,6 +41,7 @@ from hermes_cli.kanban_output import (
+     _task_to_dict,
+ )
+ from hermes_cli.kanban_boards import _dispatch_boards
++from hermes_cli.kanban_schema_owner import BoardSchemaNotOwned
+ from hermes_cli.kanban_notify_identity import _caller_identity_for_target
+ from hermes_cli.kanban_cli_metadata import ReceiptEditRefused, parse_metadata_flag as _parse_metadata_flag, receipt_refusal
+ from hermes_cli.kanban_cli_park import (
+@@ -203,6 +204,8 @@ def kanban_command(args: argparse.Namespace) -> int:
+         # "no such table: tasks" on first use from a fresh HERMES_HOME.
+         try:
+             kb.init_db()
++        except BoardSchemaNotOwned as exc:  # one line, its own "kanban:" prefix
++            return _err(str(exc))
+         except Exception as exc:
+             return _err(f"kanban: could not initialize database: {exc}")
+ 
+@@ -211,6 +214,8 @@ def kanban_command(args: argparse.Namespace) -> int:
+             return _err(f"kanban: unknown action {action!r}", 2)
+         try:
+             return int(handler(args) or 0)
++        except BoardSchemaNotOwned as exc:  # a write a non-installed core may not make here, not a traceback [daveey]
++            return _err(str(exc))
+         except (ValueError, RuntimeError, PermissionError) as exc:
+             return _err(f"kanban: {exc}")
+ 
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 8a13eefb07..74bea69d1e 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -924,6 +924,7 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
+             raise PermissionError("Kanban descendants require an initialized board; ask its owner to initialize it")
+         return conn
+     _refuse_dead_board_resurrection(path, board)
++    _schema_owner.refuse_missing_board(path)  # a non-installed core never creates a home's board file [daveey]
+     path.parent.mkdir(parents=True, exist_ok=True)
+ 
+     # Fast path: once THIS process has initialized this path, skip the
+@@ -1029,6 +1030,7 @@ def init_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> P
+     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
+     ensure_kanban_test_isolation(path)
+     _refuse_dead_board_resurrection(path, board)
++    _schema_owner.refuse_missing_board(path)
+     path.parent.mkdir(parents=True, exist_ok=True)
+     # Clear the cache entry so connect() re-runs schema + migrations.
+     with _INIT_LOCK:
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 675ebdbbfd..f617855d18 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -419,11 +419,7 @@ def install_or_remove(conn: sqlite3.Connection, db_path: str) -> None:
+                 return
+             drop_triggers(conn)
+         return
+-    conn.executescript(SYNC_SCHEMA_SQL)
+-    for table, column, ddl in _SYNC_COLUMN_DDL:
+-        _add_column_if_missing(conn, table, column, ddl)
+-    for table in _UID_TABLES:
+-        conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_uid ON {table}(uid)")
++    apply_sync_schema_steps(conn)
+     from hermes_cli.kanban_db_connect import write_txn
+     with write_txn(conn):  # one transaction: no other writer can land between dropping and recreating a trigger
+         enabled_now = conn.execute(
+@@ -458,19 +454,35 @@ def install_or_remove(conn: sqlite3.Connection, db_path: str) -> None:
+     _SYNCED_PATHS.add(db_path)
+ 
+ 
++def apply_sync_schema_steps(conn: sqlite3.Connection) -> None:
++    """Every sync table/column/index step of :func:`install_or_remove`. ``kanban_schema_owner`` replays it on an
++    in-memory DB to judge a synced board "at par", so a sync column added here is never missed there. [daveey]"""
++    conn.executescript(SYNC_SCHEMA_SQL)
++    for table, column, ddl in _SYNC_COLUMN_DDL:
++        _add_column_if_missing(conn, table, column, ddl)
++    for table in _UID_TABLES:
++        conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_uid ON {table}(uid)")
++
++
++def live_without_install(conn: sqlite3.Connection, db_path: str) -> bool:
++    """Whether :func:`register_without_install` registers ``db_path`` as synced: sync is on for the board and the
++    installed core attached it (state row not ``off``, capture triggers present). [daveey]"""
++    try:
++        return bool(sync_enabled() and board_selected(db_path)
++                    and conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
++                                     "AND name LIKE 'kanban_sync_%' LIMIT 1").fetchone() is not None
++                    and (conn.execute("SELECT mode FROM kanban_sync_state LIMIT 1").fetchone() or ("off",))[0] != "off")
++    except sqlite3.OperationalError:  # no kanban_sync_state: the installed core never enabled sync here
++        return False
++
++
+ def register_without_install(conn: sqlite3.Connection, db_path: str) -> None:
+     """:func:`install_or_remove` for a core that may not change this board's schema (``kanban_schema_owner``: a
+     non-installed checkout on a board already at its schema). Writes nothing: the installed core owns the sync
+-    tables and capture triggers. When it has attached the board (state row not ``off``, capture triggers present),
+-    register the path, so :func:`board_mode` reads the real mode and this process mints Board ids and takes Board
+-    leases like the installed core. [daveey]"""
+-    try:
+-        live = (sync_enabled() and board_selected(db_path)
+-                and conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+-                                 "AND name LIKE 'kanban_sync_%' LIMIT 1").fetchone() is not None
+-                and (conn.execute("SELECT mode FROM kanban_sync_state LIMIT 1").fetchone() or ("off",))[0] != "off")
+-    except sqlite3.OperationalError:  # no kanban_sync_state: the installed core never enabled sync here
+-        live = False
++    tables and capture triggers. When it has attached the board (:func:`live_without_install`), register the path,
++    so :func:`board_mode` reads the real mode and this process mints Board ids and takes Board leases like the
++    installed core. [daveey]"""
++    live = live_without_install(conn, db_path)
+     (_SYNCED_PATHS.add if live else _SYNCED_PATHS.discard)(db_path)
+ 
+ 
+diff --git a/hermes_cli/kanban_schema_owner.py b/hermes_cli/kanban_schema_owner.py
+index 2abb18b578..b64c05ac7a 100644
+--- a/hermes_cli/kanban_schema_owner.py
++++ b/hermes_cli/kanban_schema_owner.py
+@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
+ 
+ __all__ = [
+     "BoardSchemaNotOwned", "Owner", "decide", "home_of_board", "installed_core", "missing_schema",
+-    "open_read_only", "refusal_line", "running_core",
++    "open_read_only", "refusal_line", "refuse_missing_board", "running_core",
+ ]
+ 
+ 
+@@ -124,24 +124,30 @@ def decide(db_path: Any, *, running: Optional[Path] = None) -> Owner:
+ 
+ # --- what this core's schema pass would add ---------------------------------------------------------------
+ 
+-_REFERENCE: Optional[dict[str, frozenset[str]]] = None
++# sync live for the board? -> every table and column this core's board init declares (once per process each)
++_REFERENCE: dict[bool, dict[str, frozenset[str]]] = {}
+ _REFERENCE_LOCK = threading.Lock()
+ 
+ 
+-def _reference_schema() -> dict[str, frozenset[str]]:
+-    """Every table and column this core's board init declares, from one in-memory init (once per process)."""
+-    global _REFERENCE
++def _reference_schema(sync: bool = False) -> dict[str, frozenset[str]]:
++    """Every table and column this core's board init declares, from one in-memory init. ``sync``: the board is
++    synced here (``kanban_db_sync.live_without_install``), so the sync tables/columns ``install_or_remove`` adds
++    belong to it too: a sync column this core declares and the board lacks is not "at par"."""
+     with _REFERENCE_LOCK:
+-        if _REFERENCE is None:
++        ref = _REFERENCE.get(sync)
++        if ref is None:
+             from hermes_cli import kanban_db_connect as kbc
+             mem = sqlite3.connect(":memory:", isolation_level=None)  # noqa: kanban-lockguard (in-memory reference schema, not a board)
+             try:
+                 mem.row_factory = sqlite3.Row
+                 kbc.apply_schema_steps(mem)  # the same steps connect()'s schema pass runs
+-                _REFERENCE = _tables(mem)
++                if sync:
++                    from hermes_cli import kanban_db_sync
++                    kanban_db_sync.apply_sync_schema_steps(mem)  # the same steps install_or_remove runs
++                ref = _REFERENCE[sync] = _tables(mem)
+             finally:
+                 mem.close()
+-        return _REFERENCE
++        return ref
+ 
+ 
+ def _tables(conn: sqlite3.Connection) -> dict[str, frozenset[str]]:
+@@ -150,12 +156,13 @@ def _tables(conn: sqlite3.Connection) -> dict[str, frozenset[str]]:
+     return {n: frozenset(r[1] for r in conn.execute(f'PRAGMA table_info("{n}")')) for n in names}
+ 
+ 
+-def missing_schema(conn: sqlite3.Connection) -> dict[str, set[str]]:
++def missing_schema(conn: sqlite3.Connection, *, sync: bool = False) -> dict[str, set[str]]:
+     """Per table, what this core's schema pass would add to ``conn``'s board (``{"<table>": {"*"}}`` for a
+-    missing table). Empty: the board already holds everything this core declares."""
++    missing table). Empty: the board already holds everything this core declares. ``sync``: include the sync
++    schema (:func:`_reference_schema`)."""
+     live = _tables(conn)
+     out: dict[str, set[str]] = {}
+-    for table, cols in _reference_schema().items():
++    for table, cols in _reference_schema(sync).items():
+         have = live.get(table)
+         if have is None:
+             out[table] = {"*"}
+@@ -235,7 +242,18 @@ def check(conn: sqlite3.Connection, path: Path) -> Optional[str]:
+     owner = decide(path)
+     if owner.allowed:
+         return None
+-    missing = missing_schema(conn)
++    from hermes_cli import kanban_db_sync
++    missing = missing_schema(conn, sync=kanban_db_sync.live_without_install(conn, str(Path(path).resolve())))
+     if not missing:
+         return ""
+     return refusal_line(path, owner, missing)
++
++
++def refuse_missing_board(path: Path) -> None:
++    """Before ``connect``/``init_db`` creates ``path``: a non-installed core never creates a board file in a home
++    that has an installed core (it would leave an empty ``kanban.db`` behind). Raises :class:`BoardSchemaNotOwned`."""
++    if Path(path).exists():
++        return
++    owner = decide(path)
++    if not owner.allowed:
++        raise BoardSchemaNotOwned(refusal_line(path, owner, {}))
+diff --git a/tests/hermes_cli/test_kanban_schema_owner.py b/tests/hermes_cli/test_kanban_schema_owner.py
+index 0c054bdf2b..efb2eb3424 100644
+--- a/tests/hermes_cli/test_kanban_schema_owner.py
++++ b/tests/hermes_cli/test_kanban_schema_owner.py
+@@ -306,6 +306,101 @@ def test_non_installed_checkout_on_a_synced_board_at_par_keeps_its_sync_mode(hom
+     assert _triggers(db) == triggers_before
+ 
+ 
++# --- follow-ups from review 5889519484 (card t_01a1d47a6e38a25b) -------------------------------------------
++
++def _synced_board(home: Path) -> Path:
++    """A board the installed core created with sync on (capture triggers, ``shadow`` mode)."""
++    support.write_sync_config(home, True)
++    db = home / "kanban.db"
++    kbc.connect(db).close()
++    resolved = str(db.resolve())
++    kbc._INITIALIZED_PATHS.discard(resolved)
++    from hermes_cli import kanban_db_sync as sync
++    sync._SYNCED_PATHS.discard(resolved)
++    return db
++
++
++def test_reference_schema_with_sync_matches_what_a_synced_connect_creates(home, monkeypatch):
++    """With sync live, the at-par reference also holds every sync table/column connect() installs."""
++    from hermes_cli.kanban_activity_revision import REVISION_TABLE
++    monkeypatch.setattr(owner, "_REFERENCE", {})
++    db = _synced_board(home)
++    raw = sqlite3.connect(db)
++    try:
++        created = {t: c for t, c in owner._tables(raw).items() if t != REVISION_TABLE}
++        assert "kanban_sync_state" in created
++        assert created == owner._reference_schema(sync=True)
++    finally:
++        raw.close()
++
++
++def test_synced_board_missing_a_sync_column_this_core_declares_is_not_at_par(home, monkeypatch):
++    """Main adds a sync column the installed core lacks: a non-installed checkout must refuse with
++    BoardSchemaNotOwned, not open read-write with sync live and fail later on a raw "no such column"."""
++    from hermes_cli import kanban_db_sync as sync
++    db = _synced_board(home)
++    before = _triggers(db), _columns(db)
++    monkeypatch.setattr(owner, "_REFERENCE", {})
++    monkeypatch.setattr(sync, "_SYNC_COLUMN_DDL", (*sync._SYNC_COLUMN_DDL, ("tasks", "fake_sync_col", "fake_sync_col TEXT")))
++    _foreign_install(home)
++    conn = kbc.connect(db)
++    try:
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0  # reads still work
++        with pytest.raises(owner.BoardSchemaNotOwned) as err:
++            kb.create_task(conn, title="from a worktree", assignee="default")
++    finally:
++        conn.close()
++    assert "fake_sync_col" in str(err.value)
++    assert (_triggers(db), _columns(db)) == before
++
++
++def test_unsynced_board_ignores_sync_ddl(home, monkeypatch):
++    """Sync off for the board: the sync DDL is not part of "at par" (nothing would touch those columns)."""
++    from hermes_cli import kanban_db_sync as sync
++    db = home / "kanban.db"
++    kbc.connect(db).close()
++    kbc._INITIALIZED_PATHS.discard(str(db.resolve()))
++    monkeypatch.setattr(owner, "_REFERENCE", {})
++    monkeypatch.setattr(sync, "_SYNC_COLUMN_DDL", (*sync._SYNC_COLUMN_DDL, ("tasks", "fake_sync_col", "fake_sync_col TEXT")))
++    _foreign_install(home)
++    conn = kbc.connect(db)
++    try:
++        kb.create_task(conn, title="sync off, at par", assignee="default")
++    finally:
++        conn.close()
++
++
++def test_non_installed_checkout_does_not_create_a_missing_board(home):
++    """A board file that does not exist yet stays absent: no 4096-byte empty kanban.db, no sidecars."""
++    db = home / "kanban.db"
++    assert not db.exists()
++    core = _foreign_install(home)
++    with pytest.raises(owner.BoardSchemaNotOwned) as err:
++        kbc.connect(db)
++    assert not db.exists()
++    assert not any(p.name.startswith("kanban.db") for p in home.iterdir()), sorted(p.name for p in home.iterdir())
++    line = str(err.value)
++    assert str(core.resolve()) in line and "a new board" in line and "\n" not in line
++
++
++def test_cli_prints_the_refusal_line_not_a_traceback(home, capsys):
++    import argparse
++    from hermes_cli import kanban as kcli
++    from hermes_cli.kanban_parser import build_parser
++    db = _older_board(home)
++    _foreign_install(home)
++    parser = argparse.ArgumentParser()
++    build_parser(parser.add_subparsers())
++    rc = kcli.kanban_command(parser.parse_args(["kanban", "create", "from a worktree", "--assignee", "default"]))
++    err = capsys.readouterr().err
++    assert rc == 1
++    assert "Traceback" not in err
++    lines = [line for line in err.splitlines() if line.strip()]
++    assert len(lines) == 1 and lines[0].startswith("kanban: ") and "only this home's installed core" in lines[0]
++    assert not lines[0].startswith("kanban: kanban:")
++    assert DROPPED[1] not in _columns(db)
++
++
+ def test_run_forever_give_up_opens_the_hub_card(home, monkeypatch):
+     from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_placement as kp
+-- 
+2.43.0
+

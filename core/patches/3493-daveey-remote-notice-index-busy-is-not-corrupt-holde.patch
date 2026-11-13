@@ -1,0 +1,357 @@
+From b7f2cf8cd1641a8cede22673ebcc51a600117e15 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:19:25 +0000
+Subject: [PATCH] [daveey] remote notice index: busy is not corrupt, holder
+ backoff, gateway role upgrade
+
+Follow-ups to PR #2177 (review 5890676663 nits; card t_01a1d4ceafdeb67c).
+
+1. `_open_rw` caught every `sqlite3.DatabaseError`, which includes
+   OperationalError 'database is locked', and unlinked the copy as corrupt.
+   A mode=ro reader holding a read transaction on a not-yet-WAL index makes
+   `PRAGMA journal_mode=WAL` raise locked, so a healthy copy was deleted and
+   recreated. Now only SQLITE_CORRUPT / SQLITE_NOTADB (message fallback:
+   'file is not a database', 'malformed') recreate it; busy/locked raises,
+   `publish` counts it in `stats["busy"]` and returns False (readers compute
+   locally, as on any miss).
+2. `_hold` set `last` only when refresh returned True, so with no flock or a
+   publish that keeps failing every process reran replica_key + compute +
+   published_key every second. A failed (or raising) refresh now backs off,
+   doubling from the poll interval to BACKOFF_MAX_S (60 s); success resets
+   it and remembers the stamp. `ensure_holder` starts nothing when fcntl is
+   None (publishing needs flock, so such a holder could never succeed).
+3. The lease role was whichever `ensure_holder` call came first, so a
+   gateway whose collect() ran before kanban_remote_owner._collect held the
+   lease as 'serve'. `_holders` now records the role priority; a later
+   higher-role claim stops the lower refresher and starts one under the new
+   role. Call-site comments fixed.
+
+Tests (tests/tui_gateway/test_kanban_remote_index.py):
+- test_busy_index_is_skipped_not_deleted_as_corrupt (the repro above)
+- test_holder_backs_off_while_publishing_fails (frozen injectable clock)
+- test_no_holder_without_flock
+- test_gateway_claim_upgrades_a_serve_holder
+
+RED on the pre-fix base e9d537b75a (tests only): all 4 fail (publish returned
+True after deleting the copy; no `_clock`; a holder spawned without fcntl;
+the gateway claim spawned nothing). GREEN: 15/15 in the file; 535 tests in
+the 36 files importing kanban_remote_{index,owner,notices} pass;
+scripts/check --base origin/main ok.
+---
+ gateway/kanban_remote_owner.py                |  2 +-
+ tests/tui_gateway/test_kanban_remote_index.py | 94 +++++++++++++++++++
+ tui_gateway/kanban_remote_index.py            | 86 +++++++++++++----
+ tui_gateway/kanban_remote_notices.py          |  2 +-
+ 4 files changed, 166 insertions(+), 18 deletions(-)
+
+diff --git a/gateway/kanban_remote_owner.py b/gateway/kanban_remote_owner.py
+index 5d8738e776..c44c98dd20 100644
+--- a/gateway/kanban_remote_owner.py
++++ b/gateway/kanban_remote_owner.py
+@@ -174,7 +174,7 @@ def _collect(runner: Any, authority: Any, lives: list) -> list[tuple]:
+     if not krn.hub_db_path().is_file():
+         return []
+     from tui_gateway.kanban_remote_index import ensure_holder
+-    ensure_holder("gateway")  # the gateway outranks Desktop backends for the remote index refresher lease
++    ensure_holder("gateway")  # outranks Desktop backends; upgrades a 'serve' refresher collect started here first
+     profile = _profile(runner, authority)
+     out = []
+     for logical, live in lives:
+diff --git a/tests/tui_gateway/test_kanban_remote_index.py b/tests/tui_gateway/test_kanban_remote_index.py
+index be35f6e5c4..b5e3342d18 100644
+--- a/tests/tui_gateway/test_kanban_remote_index.py
++++ b/tests/tui_gateway/test_kanban_remote_index.py
+@@ -266,3 +266,97 @@ def test_replica_without_seq_has_no_key_and_never_publishes(tmp_path):
+     assert kri.replica_key(replica) is None
+     assert len(_collect(replica, ledger)) == 4
+     assert not kri.index_path(ledger).exists()
++
++
++def test_busy_index_is_skipped_not_deleted_as_corrupt(tmp_path):
++    """A mode=ro reader's read transaction on a not-yet-WAL copy makes ``journal_mode=WAL`` raise 'database is
++    locked': that is busy (skip, the reader computes locally), not corruption, so the healthy copy survives."""
++    replica, ledger = _home(tmp_path, _cards())
++    db = kri.index_path(ledger)
++    db.parent.mkdir(parents=True, exist_ok=True)
++    with sqlite3.connect(db) as conn:  # rollback-journal copy, e.g. written by an older build
++        conn.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
++        conn.execute("INSERT INTO meta VALUES ('marker', 'kept')")
++    ident = os.stat(db).st_ino
++    key = kri.replica_key(replica)
++    assert key is not None
++    reader = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=0.0)
++    try:
++        reader.execute("BEGIN")
++        assert reader.execute("SELECT v FROM meta WHERE k = 'marker'").fetchone() == ("kept",)
++        assert kri.publish(replica, ledger, key, "macbook", {}, {}, {}) is False
++        assert kri.stats["busy"] == 1
++    finally:
++        reader.close()
++    assert os.stat(db).st_ino == ident
++    with sqlite3.connect(db) as conn:
++        assert conn.execute("SELECT v FROM meta WHERE k = 'marker'").fetchone() == ("kept",)
++    assert kri.publish(replica, ledger, key, "macbook", {}, {}, {})  # the reader gone, the same file is upgraded
++    assert os.stat(db).st_ino == ident and kri.published_key(ledger) == key
++
++
++def test_holder_backs_off_while_publishing_fails(tmp_path, monkeypatch):
++    """A refresh that never succeeds (an unwritable index, a replica with no key) is not rerun every poll: the
++    holder retries after a doubling backoff, and once current it does not rebuild the same stamp again."""
++    replica, ledger = _home(tmp_path, _cards())
++    clock, calls, result = [1000.0], [], [False]
++    monkeypatch.setattr(kri, "_clock", lambda: clock[0])
++    monkeypatch.setattr(kri, "refresh", lambda hub, led: calls.append(1) or result[0])
++    lease, stop = _Lease(True), threading.Event()
++    thread = threading.Thread(target=kri._hold, args=(lease, replica, ledger, stop, 0.01), daemon=True)
++    thread.start()
++    try:
++        wait_until(lambda: lease.beats > 30, what="failing passes")
++        assert len(calls) == 1  # frozen clock: still backing off
++        clock[0] += 0.015
++        wait_until(lambda: len(calls) == 2, what="retry after the first backoff")
++        beats = lease.beats
++        clock[0] += 0.015  # the backoff doubled: not due yet
++        wait_until(lambda: lease.beats > beats + 10, what="passes inside the doubled backoff")
++        assert len(calls) == 2
++        result[0] = True
++        clock[0] += 0.03
++        wait_until(lambda: len(calls) == 3, what="retry after the doubled backoff")
++        beats = lease.beats
++        wait_until(lambda: lease.beats > beats + 10, what="passes on a current copy")
++        assert len(calls) == 3  # the stamp it published is not refreshed again
++    finally:
++        stop.set()
++        thread.join(5)
++
++
++def _spawns(monkeypatch):
++    import agent.memory_provider as mp
++    spawned = []
++
++    class _Thread:
++        def __init__(self, args):
++            self.args = args
++
++        def start(self):
++            spawned.append(self.args)
++
++    monkeypatch.setattr(mp, "spawn_context_thread", lambda target, name, args: _Thread(args))
++    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
++    return spawned
++
++
++def test_no_holder_without_flock(monkeypatch):
++    spawned = _spawns(monkeypatch)
++    monkeypatch.setattr(kri, "fcntl", None)
++    kri.ensure_holder("serve")
++    assert spawned == [] and not kri._holders
++
++
++def test_gateway_claim_upgrades_a_serve_holder(monkeypatch):
++    """The role is not whichever call came first: a gateway's later claim replaces a 'serve' refresher."""
++    spawned = _spawns(monkeypatch)
++    kri.ensure_holder("serve")
++    kri.ensure_holder("serve")
++    assert [args[0].role for args in spawned] == ["serve"]
++    kri.ensure_holder("gateway")
++    assert [args[0].role for args in spawned] == ["serve", "gateway"]
++    assert spawned[0][3].is_set() and not spawned[1][3].is_set()  # the serve refresher stops
++    kri.ensure_holder("serve")
++    kri.ensure_holder("gateway")
++    assert len(spawned) == 2
+diff --git a/tui_gateway/kanban_remote_index.py b/tui_gateway/kanban_remote_index.py
+index 233c851c6c..504c47524c 100644
+--- a/tui_gateway/kanban_remote_index.py
++++ b/tui_gateway/kanban_remote_index.py
+@@ -20,7 +20,8 @@ lineage)`` rows and skips ``observe`` (the first-seen times are in the rows; the
+ recorded them in the ledger). Any other answer (no file, a stale key, a corrupt file, a busy file) is a miss: the
+ caller computes locally exactly as before and then offers its result (:func:`publish`). Nothing here ever waits:
+ reads use a zero busy timeout, and publishing takes a NON-blocking ``flock`` and is skipped when another process
+-is publishing. Both run outside ``kanban_remote_notices._lock``.
++is publishing or a reader keeps the file busy (only a corrupt file is recreated). Both run outside
++``kanban_remote_notices._lock``.
+ 
+ A publish writes only the rows whose replica ``seq`` or observation changed (per-seq deltas), so its cost follows
+ the change, like the incremental in-process build it replaces.
+@@ -53,7 +54,9 @@ VERSION = 1
+ LEASE = "kanban-remote-index"
+ LEASE_INTERVAL_S = 5.0
+ REFRESH_POLL_S = 1.0
++BACKOFF_MAX_S = 60.0  # longest wait between holder retries while its refreshes keep failing
+ _MEMO_MAX = 512
++_clock = time.monotonic
+ 
+ _memo_lock = threading.Lock()  # guards the dicts below only; never held across I/O
+ _keys: dict[tuple, tuple] = {}  # (hub, ledger) -> (stamp, replica key or None)
+@@ -61,7 +64,7 @@ _answers: dict[tuple, Optional[tuple]] = {}  # (hub, ledger, stamp, profile, sid
+ _published: dict[tuple, tuple] = {}  # (hub, ledger) -> (key, ledger file id) this process published or found
+ _decoded: dict[tuple, tuple] = {}  # (replica base, owner, key) -> (seq, task): payloads this process parsed
+ _DECODED_MAX = 20_000
+-_holders: dict[tuple, threading.Event] = {}
++_holders: dict[tuple, tuple] = {}  # (hub, ledger) -> (stop event, role priority) of this process's refresher
+ stats = {"hits": 0, "misses": 0, "publishes": 0, "busy": 0, "rows_written": 0}
+ 
+ 
+@@ -232,8 +235,38 @@ _SCHEMA = (
+ )
+ 
+ 
++_CORRUPT_CODES = (11, 26)  # SQLITE_CORRUPT, SQLITE_NOTADB (primary result codes)
++_BUSY_CODES = (5, 6)  # SQLITE_BUSY, SQLITE_LOCKED
++
++
++def _primary(exc: sqlite3.Error) -> Optional[int]:
++    code = getattr(exc, "sqlite_errorcode", None)
++    return code & 0xFF if isinstance(code, int) else None
++
++
++def _busy(exc: sqlite3.Error) -> bool:
++    code = _primary(exc)
++    if code is not None:
++        return code in _BUSY_CODES
++    text = str(exc).lower()
++    return "locked" in text or "busy" in text
++
++
++def _corrupt(exc: sqlite3.Error) -> bool:
++    """True only for a damaged file. 'database is locked' / busy (a reader's transaction blocking the switch to
++    WAL, say) is an ``OperationalError`` too, and recreating then would delete a healthy copy."""
++    code = _primary(exc)
++    if code is not None:
++        return code in _CORRUPT_CODES
++    text = str(exc).lower()
++    return "file is not a database" in text or "malformed" in text
++
++
+ def _open_rw(db: Path) -> sqlite3.Connection:
+-    """The index, created or (corrupt) recreated. Only the build-lock holder calls this, so nothing waits."""
++    """The index, created or (corrupt) recreated. Only the build-lock holder calls this, so nothing waits.
++
++    A busy or locked file raises (the publish is skipped and readers compute locally); only real corruption
++    unlinks and recreates it."""
+     for attempt in (0, 1):
+         conn = sqlite3.connect(str(db), timeout=0.0)
+         try:
+@@ -243,9 +276,9 @@ def _open_rw(db: Path) -> sqlite3.Connection:
+                 conn.execute(sql)
+             conn.execute("SELECT COUNT(*) FROM cards").fetchone()
+             return conn
+-        except sqlite3.DatabaseError:
++        except sqlite3.DatabaseError as exc:
+             conn.close()
+-            if attempt:
++            if attempt or not _corrupt(exc):
+                 raise
+             logger.warning("remote notice index %s unreadable; recreating it", db, exc_info=True)
+             for suffix in ("", "-wal", "-shm"):
+@@ -291,7 +324,10 @@ def publish(hub: Path, ledger: Path, key: str, me: str, index: dict, observed: d
+             stats["publishes"] += 1
+             stats["rows_written"] += written
+         return True
+-    except (OSError, sqlite3.Error):
++    except (OSError, sqlite3.Error) as exc:
++        if isinstance(exc, sqlite3.Error) and _busy(exc):
++            with _memo_lock:
++                stats["busy"] += 1
+         logger.debug("remote notice index %s not published", db, exc_info=True)
+         return False
+     finally:
+@@ -381,10 +417,14 @@ def refresh(hub: Path, ledger: Path, now: Optional[float] = None) -> bool:
+ 
+ 
+ def _hold(lease, hub: Path, ledger: Path, stop: threading.Event, poll: float = REFRESH_POLL_S) -> None:
+-    """Change-driven refresher: one ``PRAGMA data_version`` per ``poll`` while held, a rebuild per replica change."""
++    """Change-driven refresher: one ``PRAGMA data_version`` per ``poll`` while held, a rebuild per replica change.
++
++    A refresh that does not leave the copy current (publishing fails, the replica has no key) is retried after a
++    backoff that doubles up to :data:`BACKOFF_MAX_S`, whatever the stamp, not on every poll: readers compute
++    locally on a miss meanwhile. A success resets it and remembers the stamp, so that state is not rebuilt."""
+     from tui_gateway.kanban_replica_observer import fingerprint
+ 
+-    last = None
++    last, retry_at, delay = None, 0.0, poll
+     try:
+         while not stop.wait(poll):
+             if not lease.held():
+@@ -392,24 +432,34 @@ def _hold(lease, hub: Path, ledger: Path, stop: threading.Event, poll: float = R
+                 continue
+             try:
+                 stamp = fingerprint(hub) if hub.is_file() else None
+-                if stamp is not None and stamp != last and refresh(hub, ledger):
+-                    last = stamp
++                if stamp is not None and stamp != last and _clock() >= retry_at:
++                    if refresh(hub, ledger):
++                        last, retry_at, delay = stamp, 0.0, poll
++                    else:
++                        retry_at, delay = _clock() + delay, min(delay * 2, BACKOFF_MAX_S)
+             except Exception:  # health: allow BLE001 -- the readers compute on a miss; the holder must not die
+                 logger.debug("remote notice index refresh failed", exc_info=True)
++                retry_at, delay = _clock() + delay, min(delay * 2, BACKOFF_MAX_S)
+             lease.beat()
+     finally:
+         lease.release()
+ 
+ 
+ def ensure_holder(role: str) -> None:
+-    """Start this process's refresher for the root home's ledger once (it runs only while it holds the lease).
++    """Start this process's refresher for the root home's ledger (it runs only while it holds the lease).
++
++    One refresher per process and ledger, under the highest role any caller claimed: a gateway's claim after a
++    'serve' one (``collect`` ran first in the gateway process) stops the 'serve' refresher and starts a 'gateway'
++    one, so the gateway outranks Desktop backends however its calls are ordered. Without ``fcntl`` nothing
++    starts: publishing needs ``flock``, so a holder could never publish and would rebuild every poll.
+ 
+     Not under pytest: a refresher left running by one test would rebuild that test's replica through the shared
+     in-process memos while later tests run. Tests drive :func:`refresh` and :func:`_hold` directly."""
++    from hermes_cli.host_loop_lease import ROLE_PRIORITY
+     from hermes_constants import get_default_hermes_root, get_hermes_home
+     from tui_gateway.kanban_remote_notices import hub_db_path, ledger_path
+ 
+-    if os.environ.get("PYTEST_CURRENT_TEST"):
++    if os.environ.get("PYTEST_CURRENT_TEST") or fcntl is None:
+         return
+     try:
+         if os.path.realpath(get_hermes_home()) != os.path.realpath(get_default_hermes_root()):
+@@ -417,11 +467,15 @@ def ensure_holder(role: str) -> None:
+         hub, ledger = hub_db_path(), ledger_path()
+     except (OSError, ValueError):
+         return
+-    slot = _slot(hub, ledger)
++    slot, rank = _slot(hub, ledger), ROLE_PRIORITY.get(role, 0)
+     with _memo_lock:
+-        if slot in _holders:
++        held = _holders.get(slot)
++        if held is not None and held[1] >= rank:
+             return
+-        stop = _holders[slot] = threading.Event()
++        if held is not None:
++            held[0].set()  # the lower-role refresher stops after its current pass and releases its lease
++        stop = threading.Event()
++        _holders[slot] = (stop, rank)
+     from agent.memory_provider import spawn_context_thread
+     from hermes_cli.host_loop_lease import HostLoopLease
+ 
+@@ -438,6 +492,6 @@ def reset() -> None:
+         _decoded.clear()
+         for name in stats:
+             stats[name] = 0
+-        for stop in _holders.values():
++        for stop, _rank in _holders.values():
+             stop.set()
+         _holders.clear()
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index b27be479fb..c169e07ac2 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -619,7 +619,7 @@ def collect(session_key: str, profile: str, *, hub_db: Optional[Path] = None, le
+         sids = (session_key, *lineage)
+         if hub_db is None and ledger is None:  # the host's own replica: keep its published copy current
+             from tui_gateway.kanban_remote_index import ensure_holder
+-            ensure_holder("serve")  # once per process; a gateway claimed its own role earlier
++            ensure_holder("serve")  # once per process; a gateway's own later claim upgrades the role
+         me, by_sid, fresh_times = _chat_index(path, ledger, now, profile, sids)
+         cards = [dict(c, sid=sid) for sid in sids for c in by_sid.get(sid, ())]
+         if not cards:
+-- 
+2.43.0
+

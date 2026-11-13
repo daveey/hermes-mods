@@ -1,0 +1,165 @@
+From 5b7202e08e6a563d6cb21a2f478660969413a120 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:20:46 +0000
+Subject: [PATCH] [daveey] Kanban restart continuation keeps a stopped call's
+ own result below the interrupted stamp
+
+The restart continuation of a Kanban run (session_kanban_continue
+._answer_interrupted_calls) rewrote each stopped tool row with the bare
+interrupted stamp (INTERRUPTED_RESULT), so a killed command's own
+"[Command interrupted]" output (a Terraform apply log, a job_id) was dropped:
+the same loss PR #2062 fixed for the Desktop update-pause cancel.
+
+_stop_result_rows now returns (row id, content), and each rewritten row gets
+agent.update_pause_cancel.with_own_result(stamp, own): the call's own text
+result (head 1536 + tail 512 chars) below the stamp, closed by the end line so
+replay cleanup and a retried prepare no longer read it as interrupted. The
+executor's cancel/skip text and appended rows for unanswered calls keep the
+bare stamp.
+
+Kanban: t_01a1d462ff5c8698
+---
+ gateway/session_kanban_continue.py            | 16 +++--
+ .../test_kanban_restart_continuation.py       | 62 ++++++++++++++++++-
+ 2 files changed, 71 insertions(+), 7 deletions(-)
+
+diff --git a/gateway/session_kanban_continue.py b/gateway/session_kanban_continue.py
+index 50e4134592..7b043b7538 100644
+--- a/gateway/session_kanban_continue.py
++++ b/gateway/session_kanban_continue.py
+@@ -11,6 +11,8 @@ continued turn's outcome is the attempt's outcome: same run id, claim, submitter
+ 
+ Before the continuation, each tool call the stop left without a result gets
+ ``[interrupted by Hermes update at <UTC>: check its outcome before re-running]`` (the Desktop update pause's text).
++A stopped call whose own result the stopping agent wrote (a killed command's ``[Command interrupted]`` output)
++keeps it below that text (``agent.update_pause_cancel.with_own_result``), as the Desktop pause does.
+ 
+ Continuation is refused (``kanban_continuation_unsafe``; the submitter then exits with the uncounted
+ owner-restart booking, and the next run copies this transcript, ``gateway.session_kanban_resume``)
+@@ -122,8 +124,8 @@ _STOP_RESULT_PREFIXES = ('[Tool execution cancelled \u2014 ', '[Tool execution s
+ 
+ 
+ def _stop_result_rows(session_db, session_id) -> list:
+-    """Row ids of the stopped turn's cancelled, skipped or interrupted tool results: the tool rows right
+-    after the transcript's last assistant tool-call message, past the closing assistant rows the
++    """``(row id, content)`` of the stopped turn's cancelled, skipped or interrupted tool results: the tool
++    rows right after the transcript's last assistant tool-call message, past the closing assistant rows the
+     stopped turn wrote (its empty final reply, the interrupted-delivery note) and nothing else."""
+     from agent.replay_cleanup import is_interrupted_tool_result
+     found = []
+@@ -140,14 +142,17 @@ def _stop_result_rows(session_db, session_id) -> list:
+         content = row.get('content')
+         if isinstance(content, str) and (content.startswith(_STOP_RESULT_PREFIXES)
+                                          or is_interrupted_tool_result(content)):
+-            found.append(int(row['id']))
++            found.append((int(row['id']), content))
+     return []
+ 
+ 
+ def _answer_interrupted_calls(session_db, session_id, at) -> int:
+     """Give each tool call the restart Stop cut off the interrupted-by-update result: rewrite the
+     cancel/skip/interrupted result the stopping agent wrote for it, and append one for a trailing call
+-    left with none."""
++    left with none. A rewritten row that held the call's own result (a killed command's partial output, a
++    job_id), not the executor's cancel/skip text, keeps it below the stamp (t_01a1d462ff5c8698): the bare
++    stamp dropped the resume handles the continued turn needs to check the call's outcome."""
++    from agent.update_pause_cancel import with_own_result
+     stopped = _stop_result_rows(session_db, session_id)
+     history = session_db.get_messages_as_conversation(session_id)
+     calls = _unanswered(history)
+@@ -169,7 +174,8 @@ def _answer_interrupted_calls(session_db, session_id, at) -> int:
+         # In place (a tool result must stay right after its call), like set_user_message_content.
+         rewritten = conn.executemany(
+             "UPDATE messages SET content = ?, api_content = NULL WHERE id = ? AND session_id = ? AND role = 'tool' "
+-            'AND active = 1', [(session_db._encode_content(text), row_id, session_id) for row_id in stopped]).rowcount
++            'AND active = 1', [(session_db._encode_content(with_own_result(text, own)), row_id, session_id)
++                               for row_id, own in stopped]).rowcount
+         added, _ = session_db._insert_message_rows(conn, session_id, rows) if rows else (0, None)
+         conn.execute('UPDATE sessions SET message_count=message_count+? WHERE id=?', (added, session_id))
+         return max(rewritten, 0) + added
+diff --git a/tests/gateway/test_kanban_restart_continuation.py b/tests/gateway/test_kanban_restart_continuation.py
+index f60c382c4c..0230c056d2 100644
+--- a/tests/gateway/test_kanban_restart_continuation.py
++++ b/tests/gateway/test_kanban_restart_continuation.py
+@@ -59,11 +59,15 @@ def test_a_real_owner_restart_mid_turn_continues_the_same_run(tmp_path, mid_tool
+     assert receipt['admissions'][1][1].startswith(receipt['admissions'][0][1] + '#continue:')
+     assert receipt['continued_in_history'], 'the continued turn did not carry the first turn as history'
+     if mid_tool:
+-        # The tool call the Stop cut off reaches the continued turn with exactly the update-pause result.
++        # The tool call the Stop cut off reaches the continued turn with the update-pause result first; a killed
++        # command's own output (here only its "[Command interrupted]" envelope) stays below it.
+         import re
++        from agent.update_pause_cancel import OWN_RESULT_END, OWN_RESULT_INTRO
+         assert len(receipt['mid_tool_results']) == 1, receipt['mid_tool_results']
++        first, *own = receipt['mid_tool_results'][0].split('\n')
+         assert re.fullmatch(r'\[interrupted by Hermes update at \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ: check its outcome before re-running\]',
+-                            receipt['mid_tool_results'][0]), receipt['mid_tool_results']
++                            first), receipt['mid_tool_results']
++        assert not own or (own[0] == OWN_RESULT_INTRO and own[-1] == OWN_RESULT_END), receipt['mid_tool_results']
+ 
+ 
+ # --- the worker: a fake owner that restarts mid-turn -------------------------------------------
+@@ -430,6 +434,60 @@ def test_the_stopping_agents_tool_result_becomes_the_update_text(board, tmp_path
+     tools = [m for m in db.get_messages_as_conversation('s1') if m['role'] == 'tool']
+     assert len(tools) == 1 and tools[0]['tool_call_id'] == 'call-1'  # rewritten in place, never a second row
+     assert tools[0]['content'].startswith('[interrupted by Hermes update at ') is rewritten
++    if rewritten:
++        from agent.update_pause_cancel import OWN_RESULT_END
++        # The executor's cancel/skip text is no result of the call: the bare stamp. A killed command's own
++        # output stays below it (t_01a1d462ff5c8698).
++        own = not stopped.startswith('[Tool execution ')
++        assert (tools[0]['content'].count('\n') == 0) is not own, tools[0]['content']
++        assert (stopped in tools[0]['content'] and tools[0]['content'].endswith(OWN_RESULT_END)) is own
++
++
++def _stopped_session(board, tmp_path, stopped_results):
++    from gateway.session_kanban_restart import record_restart_interruption
++    from gateway.session_kanban_continue import pending_admission
++    record_restart_interruption(_policy(board), checkpoint={'session_id': 's1', 'request_id': board.request,
++                                                            'admission_id': 'a1', 'cause': 'restart'})
++    _target, checkpoint = pending_admission(board.db, board.params, board.request)
++    assert checkpoint is not None
++    calls = [{'id': call_id, 'type': 'function', 'function': {'name': 'terminal', 'arguments': '{}'}}
++             for call_id, _content in stopped_results]
++    db = _session_db(tmp_path, [{'role': 'user', 'content': 'work kanban task'},
++                                {'role': 'assistant', 'content': None, 'tool_calls': calls},
++                                *[{'role': 'tool', 'content': content, 'tool_call_id': call_id}
++                                  for call_id, content in stopped_results],
++                                {'role': 'assistant', 'content': ''}])
++    return db, checkpoint
++
++
++def test_a_killed_commands_own_output_survives_below_the_update_text(board, tmp_path, monkeypatch):
++    # t_01a1d462ff5c8698 (sibling of PR #2062): the restart continuation overwrote a killed command's own
++    # "[Command interrupted]" result with the bare stamp, so a Terraform apply log and its job_id were lost.
++    import re
++    from agent.update_pause_cancel import OWN_RESULT_END, OWN_RESULT_INTRO
++    log = 'job_id=20261112-230727-c18e35\n' + ''.join(f'aws_instance.w[{i}]: Still creating...\n' for i in range(200))
++    killed = json.dumps({'output': log + 'Apply complete! Resources: 3 added.\n[Command interrupted]',
++                         'exit_code': 130, 'error': None})
++    cancelled = '[Tool execution cancelled \u2014 terminal was abandoned: interrupt requested]'
++    db, checkpoint = _stopped_session(board, tmp_path, [('call-1', killed), ('call-2', cancelled)])
++    assert _prepare(board, db, checkpoint, monkeypatch)['answered'] == 2
++    tools = {m['tool_call_id']: m['content'] for m in db.get_messages_as_conversation('s1') if m['role'] == 'tool'}
++    stamp = r'\[interrupted by Hermes update at \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ: check its outcome before re-running\]'
++    first, intro, *kept = tools['call-1'].split('\n')
++    assert re.fullmatch(stamp, first) and intro == OWN_RESULT_INTRO and kept[-1] == OWN_RESULT_END, tools['call-1']
++    body = '\n'.join(kept[:-1])
++    # Head and tail of the call's own result: the job_id at the start and the outcome at the end.
++    assert body.startswith(killed[:200]) and body.endswith(killed[-200:]) and '[... ' in body, body
++    assert len(tools['call-1']) < 2600 < len(killed), len(tools['call-1'])
++    # The executor's cancel text keeps the bare stamp (an appended row for an unanswered call does too:
++    # test_the_new_owner_answers_the_interrupted_tool_call_and_records_the_continuation).
++    assert re.fullmatch(stamp, tools['call-2']), tools
++    # The kept "[Command interrupted]" no longer reads as an interrupted result, so a retried prepare
++    # (or replay cleanup) does not rewrite it away again.
++    from agent.replay_cleanup import is_interrupted_tool_result
++    assert not is_interrupted_tool_result(tools['call-1'])
++    from gateway.session_kanban_continue import _stop_result_rows
++    assert _stop_result_rows(db, 's1') == []
+ 
+ 
+ def test_a_tool_result_before_a_later_user_turn_is_never_rewritten(board, tmp_path, monkeypatch):
+-- 
+2.43.0
+
