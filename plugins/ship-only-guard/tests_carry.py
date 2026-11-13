@@ -2,7 +2,7 @@
 
 #1812 (bc33e1eb82 -> 21cbd60ac5), #1837 (20bf041a47 -> d49e9bcfa5) and #2438 (1fd079c68f -> b1e5d5ef46) were
 approved, then `update-branch` merged state into the head without changing the PR's own patch; the exact-head
-gate refused all three. gh reads are faked here; `git patch-id --stable` runs for real on the faked diffs.
+gate refused all three. gh reads are faked here; `git patch-id --verbatim` runs for real on the faked diffs.
 """
 import importlib.util
 import json
@@ -75,7 +75,9 @@ IDENTICAL = {"status": "identical", "ahead_by": 0, "behind_by": 0, "total_commit
 
 def fake(monkeypatch, data=None, answers=None):
     """gh pr view answers `data`; `gh api <path>` answers answers[path] (dict -> JSON, str -> text, int -> that
-    exit code, missing -> exit 1); the base-drift compare answers IDENTICAL. Real `git patch-id` runs."""
+    exit code, (code, answer) -> that answer with that exit code, missing -> exit 1); the base-drift compare
+    answers IDENTICAL. Like GitHub, `compare/state...X` without the diff Accept header answers the compare
+    JSON, not the diff. Real `git patch-id` runs."""
     answers = {f"repos/{R}/compare/{H0}...{H}": UPDATE, f"repos/{R}/compare/{BASE_TIP}...state": ON_STATE,
                f"repos/{R}/compare/state...{H0}": OLD_DIFF, f"repos/{R}/compare/state...{H}": NEW_DIFF,
                **(answers or {})}
@@ -90,14 +92,21 @@ def fake(monkeypatch, data=None, answers=None):
             return SimpleNamespace(returncode=0, stdout=json.dumps(data or payload()))
         assert argv[:2] == ["gh", "api"] and "-X" not in argv and "--method" not in argv, argv   # reads only
         path = argv[-1]
-        if argv[2:4] == ["-H", "Accept: application/vnd.github.diff"]:
+        as_diff = argv[2:4] == ["-H", "Accept: application/vnd.github.diff"]
+        if as_diff:
             assert path.startswith(f"repos/{R}/compare/state...")
         answer = answers.get(path)
         if path.endswith("...state") and path not in answers:
             answer = IDENTICAL   # the base-drift compare of baseRefOid...state
+        code = 0
+        if isinstance(answer, tuple):
+            code, answer = answer
         if answer is None or isinstance(answer, int):
             return SimpleNamespace(returncode=answer or 1, stdout="", stderr="HTTP 502")
-        return SimpleNamespace(returncode=0, stdout=answer if isinstance(answer, str) else json.dumps(answer))
+        if isinstance(answer, str) and path.startswith(f"repos/{R}/compare/state...") and not as_diff:
+            answer = {"status": "ahead", "ahead_by": 1, "behind_by": 0, "commits": [], "files": []}
+        return SimpleNamespace(returncode=code, stdout=answer if isinstance(answer, str) else json.dumps(answer),
+                               stderr="HTTP 502" if code else "")
     monkeypatch.setattr(g.subprocess, "run", run)
     return calls
 
@@ -267,3 +276,137 @@ def test_exact_head_block_is_not_overridden_by_a_carry(monkeypatch):
 def test_empty_pr_diff_refused_by_name(monkeypatch):
     fake(monkeypatch, answers={f"repos/{R}/compare/state...{H}": "\n"})
     assert "a PR diff is empty" in check()
+
+
+# Whitespace-only merge edits (t_01a1d6b8642d50ff). A merge whose conflict resolution touches only whitespace in
+# the PR's own lines kept the same `git patch-id --stable` and carried the approval to an unreviewed head:
+# a2 re-indents `audit(cmd)` into the `if force:` block (a Python semantic change), a3 turns "/tmp/build" into
+# "/ tmp/build" inside a string literal. The diffs come from a real repository (merge-base..sha, as
+# `compare/state...X` returns them) and real `git patch-id` compares them.
+BUILD_STATE = "def run(cmd, force=False):\n    prepare(cmd)\n    return execute(cmd)\n"
+BUILD_PR = ("def run(cmd, force=False):\n    prepare(cmd)\n    if force:\n        wipe(\"/tmp/build\")\n"
+            "    audit(cmd)\n    return execute(cmd)\n")
+MERGE_EDITS = {
+    "ctrl": BUILD_PR,                                                       # a clean update-branch merge
+    "a2": BUILD_PR.replace("    audit(cmd)", "        audit(cmd)"),
+    "a3": BUILD_PR.replace('"/tmp/build"', '"/ tmp/build"'),
+}
+
+
+@pytest.fixture(scope="module")
+def merge_diffs(tmp_path_factory):
+    """{name: PR diff} for the approved head 'h0' and one update-branch merge per MERGE_EDITS entry."""
+    repo = tmp_path_factory.mktemp("carry-ws")
+    env = {"PATH": __import__("os").environ.get("PATH", "/usr/bin:/bin"), "HOME": str(repo),
+           "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_AUTHOR_DATE": "2026-11-13T17:00:00Z",
+           "GIT_COMMITTER_DATE": "2026-11-13T17:00:00Z"}
+
+    def git(*args):
+        return REAL_RUN(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "core.hooksPath=/dev/null",
+                         *args], cwd=repo, env=env, capture_output=True, text=True, check=True).stdout.strip()
+
+    def commit(path, text, msg):
+        (repo / path).write_text(text)
+        git("add", path)
+        git("commit", "-q", "-m", msg)
+        return git("rev-parse", "HEAD")
+
+    git("init", "-q", "-b", "state")
+    (repo / "notes.txt").write_text("one\n")
+    git("add", "notes.txt")
+    commit("build.py", BUILD_STATE, "base")
+    git("checkout", "-q", "-b", "pr")
+    h0 = commit("build.py", BUILD_PR, "pr: force wipe + audit")
+    git("checkout", "-q", "state")
+    commit("notes.txt", "one\ntwo\n", "state moves on")
+
+    def pr_diff(sha):
+        return git("diff", git("merge-base", "state", sha), sha) + "\n"
+
+    out = {"h0": pr_diff(h0)}
+    for name, text in MERGE_EDITS.items():
+        git("checkout", "-q", "--detach", h0)
+        git("merge", "-q", "--no-ff", "--no-commit", "state")
+        (repo / "build.py").write_text(text)
+        git("add", "build.py")
+        git("commit", "-q", "-m", f"Merge state ({name})")
+        out[name] = pr_diff(git("rev-parse", "HEAD"))
+    return out
+
+
+def test_real_patch_id_sees_whitespace(merge_diffs):
+    h0 = g._patch_id(merge_diffs["h0"], None)
+    assert g._patch_id(merge_diffs["ctrl"], None) == h0
+    assert g._patch_id(merge_diffs["a2"], None) != h0 != g._patch_id(merge_diffs["a3"], None)
+
+
+def test_clean_update_branch_merge_from_a_real_repo_carries(monkeypatch, merge_diffs):
+    fake(monkeypatch, answers={f"repos/{R}/compare/state...{H0}": merge_diffs["h0"],
+                               f"repos/{R}/compare/state...{H}": merge_diffs["ctrl"]})
+    assert check() is None
+
+
+@pytest.mark.parametrize("name", ["a2", "a3"])
+def test_whitespace_only_merge_edit_refused(monkeypatch, merge_diffs, name):
+    assert merge_diffs[name] != merge_diffs["h0"]
+    fake(monkeypatch, answers={f"repos/{R}/compare/state...{H0}": merge_diffs["h0"],
+                               f"repos/{R}/compare/state...{H}": merge_diffs[name]})
+    why = check()
+    assert why and f"approval of earlier head {H0[:10]} does not carry" in why and "patch changed" in why
+
+
+# Pins for carry mutants the suite let survive (t_01a1d6b8642d50ff).
+def test_block_in_the_same_second_as_the_approval_stops_the_carry(monkeypatch):
+    same = review("Request changes: B1.", commit="e" * 40, at=APPROVAL["submittedAt"])
+    calls = fake(monkeypatch, payload([APPROVAL, same]))
+    assert "blocking verdict came at or after" in check() and len(calls) == 1
+
+
+def test_untimed_comment_approval_of_another_head_stops_the_carry(monkeypatch):
+    # A comment approval with no readable time cannot be ordered against the H0 approval: refuse.
+    untimed = comment(f"VERDICT: APPROVE at {'e' * 40}", at=None)
+    calls = fake(monkeypatch, payload([APPROVAL], [untimed]))
+    assert "blocking verdict came at or after" in check() and len(calls) == 1
+
+
+def test_diff_reads_ask_for_the_diff_media_type(monkeypatch):
+    calls = fake(monkeypatch)
+    assert check() is None
+    diffs = [c for c in calls if c[-1].startswith(f"repos/{R}/compare/state...")]
+    assert len(diffs) == 2 and all(c[2:4] == ["-H", "Accept: application/vnd.github.diff"] for c in diffs)
+
+
+def test_octopus_merge_after_the_approved_head_refused(monkeypatch):
+    # Even when the first two parents look like a base merge and the patch-id matches, a third parent is
+    # something the review never saw.
+    third = "f" * 40
+    cmp = {"status": "ahead", "behind_by": 0, "commits": [node(H, H0, BASE_TIP, third)]}
+    calls = fake(monkeypatch, answers={f"repos/{R}/compare/{H0}...{H}": cmp})
+    why = check()
+    assert why and f"{H[:10]} after it is not a merge of the base" in why
+    assert not any(c[-1].startswith(f"repos/{R}/compare/state...") for c in calls)
+
+
+@pytest.mark.parametrize("path,answer", [
+    (f"repos/{R}/compare/{H0}...{H}", UPDATE),
+    (f"repos/{R}/compare/{BASE_TIP}...state", ON_STATE),
+    (f"repos/{R}/compare/state...{H}", NEW_DIFF),
+])
+def test_failed_gh_read_refuses_even_with_a_plausible_answer(monkeypatch, path, answer):
+    fake(monkeypatch, answers={path: (1, answer)})
+    why = check()
+    assert why and f"`gh api {path}` exited 1" in why and "cannot be shown" in why
+
+
+@pytest.mark.parametrize("parents", [[H0, BASE_TIP[:12]], [H0[:12], BASE_TIP], [H0, BASE_TIP.upper()]])
+def test_malformed_merge_parents_refused(monkeypatch, parents):
+    cmp = {"status": "ahead", "behind_by": 0, "commits": [node(H, *parents)]}
+    fake(monkeypatch, answers={f"repos/{R}/compare/{H0}...{H}": cmp})
+    assert f"the parents of {H[:10]} are unreadable" in check()
+
+
+@pytest.mark.parametrize("head", [H[:12], H.upper(), H + "0"])
+def test_malformed_head_sha_refused_before_any_read(monkeypatch, head):
+    calls = fake(monkeypatch)
+    ok, why = g._carried_approval(head, payload(), R, None, {})
+    assert not ok and why.endswith(": the head sha is unreadable") and calls == []

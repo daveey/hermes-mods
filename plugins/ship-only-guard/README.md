@@ -106,9 +106,11 @@ shas are tried) counts for the head H when all hold, read through gh only:
 every commit on H's first-parent line back to H0 (at most 3; parents from that
 compare, else `gh api repos/OWNER/REPO/git/commits/<sha>`) is a merge whose
 second parent is on `state` (`compare/<parent>...state` ahead or identical);
-(b) `git patch-id --stable` of the PR diffs `compare/state...H0` and
+(b) `git patch-id --verbatim` of the PR diffs `compare/state...H0` and
 `compare/state...H` (diff media type, each merge-base..sha) is the same single
-id; (c) no non-bot blocking verdict on any head (or a verdict with no readable
+id (whitespace-sensitive: under `--stable` a merge that only re-indented a PR
+line or put a space inside a string literal kept its id and carried); (c) no
+non-bot blocking verdict on any head (or a verdict with no readable
 time) came at or after that approval. Any failed or odd read refuses with the
 reason; a blocking verdict on H itself is never overridden. Base drift is
 checked separately and still applies. Why: #1812, #1837 and #2438 were refused

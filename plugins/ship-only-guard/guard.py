@@ -309,7 +309,7 @@ def _approval_refusal(number, data, repo=None, cwd=None, env=None):
 
 # Patch-identical update-branch carry (t_01a1d666f7d34164). `gh pr update-branch` (or `git merge origin/state`)
 # moves the head without changing the PR's own patch: #1812 (bc33e1eb82 -> 21cbd60ac5), #1837
-# (20bf041a47 -> d49e9bcfa5) and #2438 (1fd079c68f -> b1e5d5ef46) kept their stable patch-id, yet the
+# (20bf041a47 -> d49e9bcfa5) and #2438 (1fd079c68f -> b1e5d5ef46) kept their verbatim patch-id, yet the
 # exact-head gate refused all three. The base-drift gate (`_base_drift_refusal`) still applies separately.
 _CARRY_MERGES = 3            # base merges on the PR's first-parent line between the approved head and the head
 _CARRY_CANDIDATES = 2        # distinct earlier approved heads tried, newest approval first
@@ -396,17 +396,20 @@ def _gh_json(path, cwd, env) -> dict:
 
 
 def _patch_id(diff, cwd):
-    """`git patch-id --stable` of a diff text (no repository needed); _Unreadable when empty or ambiguous."""
+    """`git patch-id --verbatim` of a diff text (no repository needed); _Unreadable when empty or ambiguous.
+    Verbatim, not --stable: --stable drops whitespace, so a merge that only re-indented a PR line (a Python
+    semantic change) or put a space inside a string literal kept its id and carried (t_01a1d6b8642d50ff).
+    --verbatim still ignores line numbers and blob ids, so a clean update-branch merge keeps its id."""
     if not diff.strip():
         raise _Unreadable("a PR diff is empty")
     try:
-        p = subprocess.run(["git", "patch-id", "--stable"], input=diff, cwd=_probe_cwd(cwd),
+        p = subprocess.run(["git", "patch-id", "--verbatim"], input=diff, cwd=_probe_cwd(cwd),
                            capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.SubprocessError) as e:
         raise _Unreadable(f"`git patch-id` could not run ({type(e).__name__})")
     lines = [line.split() for line in str(p.stdout or "").splitlines() if line.strip()]
     if p.returncode != 0 or len(lines) != 1 or not _SHA.fullmatch(lines[0][0]):
-        raise _Unreadable("`git patch-id --stable` gave no single id")
+        raise _Unreadable("`git patch-id --verbatim` gave no single id")
     return lines[0][0]
 
 
@@ -417,8 +420,8 @@ def _carried_approval(head, data, repo, cwd, env):
     (a) H0 is an ancestor of the head (`compare/H0...head` is ahead, behind 0) and every commit on the head's
         first-parent line back to H0 is a merge (at most _CARRY_MERGES) whose second parent is on `state`
         (`compare/<parent>...state` ahead or identical): the head only merged the base in;
-    (b) `git patch-id --stable` of the PR diff `compare/state...H0` equals the one of `compare/state...head`
-        (each is merge-base..sha, the PR's own patch);
+    (b) `git patch-id --verbatim` (whitespace-sensitive) of the PR diff `compare/state...H0` equals the one of
+        `compare/state...head` (each is merge-base..sha, the PR's own patch);
     (c) no non-bot blocking verdict, on any head, at or after that approval.
     The newest _CARRY_CANDIDATES distinct approved heads are tried in turn (a comment naming the head and a
     base sha yields both); the first one's refusal reason is reported."""
@@ -650,7 +653,7 @@ def _base_drift_refusal(number, repo, data, cwd, env):
             f"Run `gh api -X PUT repos/{repo}/pulls/{number}/update-branch -f expected_head_sha={head}`, wait "
             "for green CI on the new head, then rerun the merge with --match-head-commit <new head>. The guard "
             "re-checks exact-head approval on the new head; an approval of the old head carries when the new "
-            "head only merged state and the PR's `git patch-id --stable` is unchanged.")
+            "head only merged state and the PR's `git patch-id --verbatim` is unchanged.")
 
 
 def _attribute_hits(repo, names, window, subject, cwd, env):
