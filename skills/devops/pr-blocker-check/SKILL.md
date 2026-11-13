@@ -73,10 +73,11 @@ approval) and put the proof in the ask. Do not repeat an ask a restart already m
 Never tell the user when a PR will merge, land or deploy from a card's plan or an earlier reply. Check that PR in
 the same turn (this checker, or `gh pr view N --json state,mergeStateStatus,reviewDecision` plus `gh pr checks N`)
 and list every open step: failing or pending checks and whether main fails the same ones, whether the approval
-still holds after a rebase, the merge queue or slot position, and the owner card's real state (claimed and moving,
-or just ready). Give no clock time and no "merges once X" unless X is the only open step. CI is rarely the only one:
-a PR forecast as "merges once CI is green" was still open 7 hours after CI went green, held by a hub merge slot. The
-coach's `merge_forecast` reply rule nudges a forecast made with no PR check that turn.
+still holds after a rebase (no review at the new head doesn't settle it: `hermes-core-wt ship`'s own clean rebase
+carries the approval when the range-diff from the approved head is all `=`, and the owner card's ship result says
+which; read that before reporting a re-review), the merge queue or slot position, and the owner card's real state
+(claimed and moving, or just ready). Give no clock time and no "merges once X" unless X is the only open step. CI is
+rarely the only one: a hub merge slot can hold a green PR for hours. The coach's `merge_forecast` reply rule nudges a forecast made with no PR check that turn.
 
 Admin override: only with explicit per-PR user authorization. Before offering it, read
 `gh api repos/O/R/rulesets/<id> --jq .current_user_can_bypass`: `pull_requests_only` cannot skip a required
