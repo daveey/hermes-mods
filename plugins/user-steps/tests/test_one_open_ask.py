@@ -737,3 +737,90 @@ def test_a_gate_held_draft_publishes_no_tile(plugin, monkeypatch):
     assert out and out.get('hold') is True
     assert plugin.core.ActionStore().requests(OWNER) == []
     assert plugin._ledger().read('session-a').get('steps', []) == []
+
+
+# ---- false merges the two rules must never make (independent review of PR #93, card t_01a1d695aceb1bb1) --------
+# A false merge is worse than a duplicate: the answer to one ask would be recorded on the other.
+
+def test_a_boilerplate_scope_sentence_is_not_the_open_ask(tmp_path):
+    store, ledger = env(tmp_path)
+    reply(store, ledger, NEEDS_YOU_1108, [{'text': 'Pick macOS CI option A, B, or C', 'kind': 'choose',
+                                          'verbatim_span': "It's also in your For-you list.",
+                                          'options': ['A: lane plus jobs', 'B: sub-minute jobs only', 'C: no spend']}])
+    assert len(live(store)) == 1
+    text = ("New one: where should nightly backups go? S3 or GCS, or skip them.\n"
+            "   - **If you pick C, or don't answer,** nothing changes.")
+    reply(store, ledger, text, [{'text': 'Pick the backup store', 'kind': 'choose',
+                                 'verbatim_span': "**If you pick C, or don't answer,** nothing changes.",
+                                 'options': ['S3 bucket', 'GCS bucket', 'skip backups']}])
+    assert len(live(store)) == 2
+
+
+def test_generic_yes_no_menus_are_not_the_same_decision(tmp_path):
+    store, ledger = env(tmp_path)
+    t1 = 'Should I deploy build 9 to the hub tonight? A: yes, B: no.'
+    reply(store, ledger, t1, [{'text': 'Deploy build 9 tonight?', 'kind': 'choose', 'verbatim_span': t1,
+                               'options': ['A: yes', 'B: no']}])
+    t2 = 'Separate question: should I rotate the GitHub deploy key now? A: yes, B: no.'
+    reply(store, ledger, t2, [{'text': 'Rotate the deploy key now?', 'kind': 'choose', 'verbatim_span': t2,
+                               'options': ['A: yes', 'B: no']}])
+    assert len(live(store)) == 2
+
+
+def test_generic_keep_or_change_menus_are_not_the_same_decision(tmp_path):
+    store, ledger = env(tmp_path)
+    t1 = 'Should the release notes template stay as it is? A: keep it as is, B: change it now.'
+    reply(store, ledger, t1, [{'text': 'Keep the release notes template?', 'kind': 'choose', 'verbatim_span': t1,
+                               'options': ['A: keep it as is', 'B: change it now']}])
+    t2 = 'And the PR template, a separate file? A: keep it as is, B: change it now.'
+    reply(store, ledger, t2, [{'text': 'Keep the PR template?', 'kind': 'choose', 'verbatim_span': t2,
+                               'options': ['A: keep it as is', 'B: change it now']}])
+    assert len(live(store)) == 2
+
+
+def test_menus_differing_only_in_the_target_are_not_the_same_decision(tmp_path):
+    store, ledger = env(tmp_path)
+    t1 = 'Where should the Linux PR lane run? A: PR lane on the mini, B: PR lane on the hub.'
+    reply(store, ledger, t1, [{'text': 'Pick where the Linux lane runs', 'kind': 'choose', 'verbatim_span': t1,
+                               'options': ['A: PR lane on the mini', 'B: PR lane on the hub']}])
+    t2 = 'And the Windows lane, which is a separate card? A: PR lane on worker-6, B: PR lane on worker-7.'
+    reply(store, ledger, t2, [{'text': 'Pick where the Windows lane runs', 'kind': 'choose', 'verbatim_span': t2,
+                               'options': ['A: PR lane on worker-6', 'B: PR lane on worker-7']}])
+    assert len(live(store)) == 2
+
+
+def test_a_lettered_menu_matching_two_open_choices_maps_onto_neither():
+    # Menu identity needs exactly one open choice: with two equal open menus the step is its own ask.
+    asks = [{'id': rid, 'kind': 'choice', 'title': 'Pick macOS CI option', 'labels': [], 'scope': '',
+             'step': {'id': 'us_' + rid, 'options': list(STEP_852F['options']), 'verbatim_span': 'x'}}
+            for rid in ('r1', 'r2')]
+    assert core.same_open_ask(dict(STEP_64AE), asks[:1], reply=STATUS_1154)['id'] == 'r1'
+    assert core.same_open_ask(dict(STEP_64AE), asks, reply=STATUS_1154) is None
+
+
+_DEPLOY_SCOPE = 'Deploy build 9 to the hub and restart its gateway.\n\nIf you decline, nothing changes and the card stays blocked.'
+_RUNNER_REPLY = ('Different thing: want me to delete the stale runner images on worker-3?\n\n'
+                 'If you decline, nothing changes and the card stays blocked.')
+_RUNNER_STEP = {'text': 'Approve deleting stale runner images on worker-3', 'kind': 'approve',
+                'verbatim_span': 'If you decline, nothing changes and the card stays blocked.', 'options': []}
+
+
+def test_a_producer_approvals_boilerplate_line_does_not_absorb_a_new_approval(tmp_path):
+    store, ledger = env(tmp_path)
+    store.create(dict(OWNER), approval('Deploy build 9 to the hub', markdown=_DEPLOY_SCOPE))
+    n0 = len(live(store))
+    reply(store, ledger, _RUNNER_REPLY, [dict(_RUNNER_STEP)])
+    assert len(live(store)) == n0 + 1
+
+
+def test_the_publication_gate_holds_a_new_approval_beside_an_unrelated_ready_one(plugin, monkeypatch):
+    store = plugin.core.ActionStore()
+    store.create(dict(OWNER), approval('Deploy build 9 to the hub', markdown=_DEPLOY_SCOPE))
+    monkeypatch.setattr(plugin, 'aux_llm', lambda *a: json.dumps({'steps': [dict(_RUNNER_STEP)], 'resolved': []}))
+    out = plugin.publication_buffer(session_id='session-a', platform='cli', final_response=_RUNNER_REPLY)
+    assert out and out.get('hold') is True, out
+
+
+def test_hyphenated_words_are_not_menu_letters():
+    assert core._lettered_menu(['B-tree index on users', 'E-mail the owner']) is None
+    assert core._lettered_menu(['A - lane plus jobs', 'B - sub-minute jobs only']) is not None

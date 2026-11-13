@@ -1847,12 +1847,19 @@ def split_repeats(repeats, tiles: dict, reply: str) -> tuple[list, list]:
 # Live MacBook chat ..f07c32: request 2948b7f0 held both macOS CI picks. A later reply minted one tile from a bare
 # reminder sentence ("Two macOS CI choices still need you.") read with the same A/B/C menu reworded, and one from
 # the restated second question, whose card ask the open request's scope already quoted. Both rules are LATER-reply
-# only (an ask minted in this reply is never their target) and need the step's own menu or sentence, never a title.
+# only (an ask minted in this reply is never their target) and need the step's own specific menu or a quoted card
+# ask, never a title, a generic menu (yes/no) or a bare scope sentence (independent review of PR #93).
 
-_LETTERED = re.compile(r"^\s*\(?([a-h])\s*[):.=\u2013\u2014-]\s*(\S.*)$", re.I)
-_LABEL_STOP = frozenset({"a", "an", "the", "to", "on", "of", "in", "at", "for", "with", "and", "or", "mo", "day"})
+_LETTERED = re.compile(r"^\s*\(?([a-h])\s*(?:[):.=\u2013\u2014]|-(?=\s))\s*(\S.*)$", re.I)
+# Words that say nothing about WHICH decision a label belongs to: function words, units and generic answers
+# ("A: yes / B: no", "keep as is / change it", "approve / decline"). A menu is identity only through the rest.
+_LABEL_STOP = frozenset("""a an the to on of in at for with and or but by from as is it its this that these those
+    be do does me my your you i we us our them they now then just only also all any some per mo month day week hr
+    yes no ok okay sure not none either neither other else approve approved decline declined accept reject skip
+    go ahead stop wait later continue proceed keep change leave""".split())
 _QUOTED = re.compile(r'"([^"\n]{40,})"')
 _LABEL_MATCH = 0.6
+_LABEL_SHARED_MIN = 2   # specific words a matched pair of labels must share
 
 
 def _label_words(label: str) -> list[str]:
@@ -1861,27 +1868,37 @@ def _label_words(label: str) -> list[str]:
 
 
 def _lettered_menu(options) -> Optional[dict]:
-    """{letter: label words} when every option is lettered ("B: sub-minute jobs only"), at least two, letters
-    distinct and every label has words; else None."""
-    out: dict = {}
+    """{letter: words specific to that label} when every option is lettered ("B: sub-minute jobs only"), at least
+    two, letters distinct. Words another label of the same menu also has are dropped ("PR lane on the mini / PR lane
+    on the hub" is {a: {mini}, b: {hub}}). None when any label is left with no specific word."""
+    raw: dict = {}
     for o in options or ():
         m = _LETTERED.match(str(o or ""))
-        words = _label_words(m.group(2)) if m else []
-        if not m or not words or m.group(1).lower() in out:
+        if not m or m.group(1).lower() in raw:
             return None
-        out[m.group(1).lower()] = words
-    return out if len(out) >= 2 else None
+        raw[m.group(1).lower()] = set(_label_words(m.group(2)))
+    if len(raw) < 2:
+        return None
+    out: dict = {}
+    for k, ws in raw.items():
+        own = ws - set().union(*(v for j, v in raw.items() if j != k))
+        if not own:
+            return None
+        out[k] = own
+    return out
 
 
-def _same_label(a: list[str], b: list[str]) -> bool:
-    """The label's leading word is the same and most of the shorter label's words are in the other."""
-    sa, sb = set(a), set(b)
-    return a[0] == b[0] and len(sa & sb) / min(len(sa), len(sb)) >= _LABEL_MATCH
+def _same_label(a: set, b: set) -> bool:
+    """Two labels' specific words: at least two shared, and most of the smaller label's."""
+    shared = a & b
+    return len(shared) >= _LABEL_SHARED_MIN and len(shared) / min(len(a), len(b)) >= _LABEL_MATCH
 
 
 def same_lettered_menu(candidate: dict, ask: dict) -> bool:
-    """(i) A choose step whose lettered menu is the open choice's own: the same letters, each with the same
-    label (``_same_label``). The open side is its extracted step's options, else the request's choice labels."""
+    """(i) A choose step whose lettered menu is the open choice's own: the same letters, each label sharing at least
+    two of its specific words (``_lettered_menu`` / ``_same_label``). Generic menus (yes/no, approve/decline, labels
+    that differ only in a one-word target) never match. The open side is its extracted step's options, else the
+    request's choice labels. ``same_open_ask`` also requires that exactly one open choice matches."""
     if candidate.get('kind') != 'choose' or ask.get('kind') != 'choice':
         return False
     mine = _lettered_menu(candidate.get('options'))
@@ -1892,17 +1909,13 @@ def same_lettered_menu(candidate: dict, ask: dict) -> bool:
 
 
 def inside_open_scope(candidate: dict, ask: dict, reply: str = "") -> bool:
-    """(ii) The step's own ask already sits in the open request's frozen scope markdown: its specific evidence
-    sentence is in that scope, or its paragraph quotes a card ask (``"..."``, 40+ chars) that the scope quotes too
-    and that quote IS this step's ask (the sentence contains it, or it carries every label of the step's menu)."""
+    """(ii) The step's own ask already sits in the open request's frozen scope markdown: its paragraph quotes a
+    card ask (``"..."``, 40+ chars) that the scope quotes too, and that quote IS this step's ask (the evidence
+    sentence contains it, or it carries every label of the step's menu). A bare scope sentence is never enough:
+    scopes carry boilerplate ("If you pick C, or don't answer, nothing changes.") that another ask can repeat."""
     scope = _norm(str(ask.get('scope') or "")).replace('"', "")
-    span = ask_key(candidate.get('verbatim_span')).replace('"', "")
     if not scope or _EXTRACTED_KIND.get(candidate.get('kind'), 'input') != ask.get('kind'):
         return False
-    # A sentence that IS the whole scope or the title is only an equal title: no identity (README).
-    whole = {ask_key(ask.get('scope')).replace('"', ""), ask_key(ask.get('title')).replace('"', "")}
-    if len(span) >= _SPAN_KEY_MIN and len(span.split()) >= 5 and span in scope and span not in whole:
-        return True
     block = locate(reply, str(candidate.get('verbatim_span') or "")) if reply else None
     if block is None:
         return False
@@ -1957,7 +1970,8 @@ def same_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optiona
         return hit
     # Same decision in a LATER reply: the open tile's own lettered menu, or an ask its frozen scope already carries.
     earlier = [a for a in asks if not a.get('fresh')]
-    hit = pick([a for a in earlier if same_lettered_menu(candidate, a)]) or \
+    menus = [a for a in earlier if same_lettered_menu(candidate, a)]
+    hit = (menus[0] if len(menus) == 1 else None) or \
         pick([a for a in earlier if inside_open_scope(candidate, a, reply)])
     if hit:
         return hit
