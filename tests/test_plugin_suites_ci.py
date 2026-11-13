@@ -166,7 +166,10 @@ class SuiteSelection(unittest.TestCase):
         self.assertNotIn("tests", picked)  # repo-guards.yml runs tests/ on every push
 
     def test_skill_and_desktop_paths_map_to_their_suites(self):
-        self.assertEqual(self.pick("skills/devops/github-ci-wait/SKILL.md"), ["skills/devops/github-ci-wait"])
+        # push-guard's test_run_cancel.py names skills/devops/github-ci-wait/scripts/ci_run_cancel.py, so it is
+        # selected as a dependent (c89ec6c6).
+        self.assertEqual(self.pick("skills/devops/github-ci-wait/SKILL.md"),
+                         ["plugins/push-guard", "skills/devops/github-ci-wait"])
         self.assertIn("plugins/inbox", self.pick("desktop-plugins/inbox/plugin.js"))
 
 
