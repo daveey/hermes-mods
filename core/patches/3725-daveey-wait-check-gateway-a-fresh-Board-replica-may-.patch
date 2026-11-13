@@ -1,0 +1,384 @@
+From 5ecbb476e206b676c7bb89bc7f0e81a5ef0a73fb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 17:57:23 +0000
+Subject: [PATCH] [daveey] wait-check --gateway: a fresh Board replica may turn
+ an unreachable-owner answer into met
+
+Post-merge check t_01a1d5c30d953d84 of #2370 found 0 of 2 expedited cross-gateway parks woke on the
+change (t_01a1d5ead059278d). Both parks probed `hermes kanban wait-check task X --gateway G`. From pool
+workers ssh to G fails (name not resolved / Permission denied, rc 255), so check_remote fell back to the
+hermes-hub registry replica only (collector-refreshed). The expedite is triggered by this gateway's Board
+sync replica (sync-shadow), which runs minutes ahead: the expedited probe read the old `running`, went
+back to cadence, and both parks slept the full 900 s check_every (condition_met 914 s / 915 s after the
+expedite). The #2370 test parked on `wait-check task X` without `--gateway`, so it never hit this path.
+
+Fix (option 1 of the card): when the owner gateway cannot be asked (OSError/timeout, rc 255, or the
+forced-command refusal) a task check reads the registry replica exactly as before, and when that answer
+is not met (rc 1, 2 or 3) and was not a live owner read, it also reads this gateway's Board replica row
+(the same Board row G's own wait-check falls back to). Only a Board answer of met (rc 0) is taken, and only
+when that replica was pulled to the feed head within kanban_replica_freshness.FRESH_SECONDS (600 s) with no
+future stamp, judged by the same verdict as check_local (--from/--until/parked-agent).
+
+The Board replica only moves the answer toward met (review t_01a1d603304c96f3 of the first head
+001fdb313b, which weighed observed_at against pulled_at and regressed two cases):
+- it never downgrades the registry's met: pulled_at is this gateway's pull time, not when the owner wrote
+  the row, so a row pulled seconds ago can still lag the owner's push;
+- it never replaces the registry's rc 3 (stale or unknown scope) with not-yet: an offline owner's Board row
+  is frozen however recently we pulled it, and rc 3 is what wakes the park as gateway_offline at
+  STALE_WAKE_AFTER.
+No cross-host clock comparison remains, so kanban_wait_replica is unchanged. A Board met over a newer
+registry not-yet is what the no-`--gateway` probe of that same row already reports.
+
+Why not option 2 (re-arm the expedite once more): it only shortens the lag to the registry's next
+collector refresh (minutes) and adds a probe per change; reading the copy that triggered the expedite
+answers on the first probe. No new polling: the extra read happens only inside a probe that already ran
+and did not answer met.
+
+Tests:
+- test_kanban_awaited_card_wake.py::test_gateway_probe_wakes_on_the_board_change_while_ssh_fails_and_the_registry_lags
+  (the live shape: `--gateway`, ssh rc 255, registry fresh but lagging) RED on main (park still
+  scheduled), GREEN here; plus a not-fresh Board replica keeps the registry's not-yet and the cadence.
+- test_kanban_wait_check_board_replica.py: fresh Board met wins over a lagging registry (any scope age),
+  never downgrades a registry met, stale registry + fresh Board not-yet stays rc 3, stale/future/unreadable
+  Board replica adds nothing, --from on the Board view, live owner read stands. The 3 regression tests for
+  the review's findings are RED on 001fdb313b, GREEN here.
+- All 25 test files referencing wait-check / kanban_wait_check / kanban_wait_replica: 848 passed, 1 skipped.
+---
+ hermes_cli/kanban_wait_check.py               |  71 +++++++--
+ .../test_kanban_awaited_card_wake.py          |  67 +++++++++
+ .../test_kanban_wait_check_board_replica.py   | 142 ++++++++++++++++++
+ 3 files changed, 265 insertions(+), 15 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_wait_check_board_replica.py
+
+diff --git a/hermes_cli/kanban_wait_check.py b/hermes_cli/kanban_wait_check.py
+index 815999e88a..efc425fc8e 100644
+--- a/hermes_cli/kanban_wait_check.py
++++ b/hermes_cli/kanban_wait_check.py
+@@ -88,15 +88,7 @@ def check_local(kind: str, target: str, *, board: Optional[str] = None, until=DE
+             source, rows = _task_source(board, target)
+             if not rows:
+                 return 2, f"error: {target} not found"
+-            status = rows[0][0]
+-            if status in set(since or ()):
+-                return 1, f"{target} {status} (unchanged since park)"
+-            suffix = _producer_suffix(board, target, source=source) if status in ("scheduled", "blocked") else ""
+-            if status in set(until):
+-                return 0, f"{target} {status}{suffix}"
+-            if PARKED_AGENT in set(until) and status in ("scheduled", "blocked") and _agent_owned_park(board, target, source=source):
+-                return 0, f"{target} {status} (agent-owned park: nothing else will produce what it waits for)"
+-            return 1, f"{target} {status}{suffix}"
++            return _verdict(board, target, rows[0][0], source=source, until=until, since=since)
+         if kind == "board-empty":
+             n = _query(_db(target), "select count(*) from tasks where status not in ('done','archived')")[0][0]
+             return (0 if n == 0 else 1), f"{target} open={n}"
+@@ -105,6 +97,57 @@ def check_local(kind: str, target: str, *, board: Optional[str] = None, until=DE
+     return 2, f"error: unknown check {kind!r}"
+ 
+ 
++def _verdict(board, target, status, *, source, until, since, note="") -> tuple[int, str]:
++    """``check_local``'s judgement of one observed ``status`` (``note``: a source tag after the status)."""
++    if status in set(since or ()):
++        return 1, f"{target} {status} (unchanged since park){note}"
++    suffix = _producer_suffix(board, target, source=source) if status in ("scheduled", "blocked") else ""
++    if status in set(until):
++        return 0, f"{target} {status}{suffix}{note}"
++    if PARKED_AGENT in set(until) and status in ("scheduled", "blocked") and _agent_owned_park(board, target, source=source):
++        return 0, f"{target} {status} (agent-owned park: nothing else will produce what it waits for){note}"
++    return 1, f"{target} {status}{suffix}{note}"
++
++
++def _board_replica_task(board, target, *, until, since):
++    """``(rc, message)`` for ``target`` as this gateway's Board sync replica (``sync-shadow``) holds it,
++    or None when that replica cannot vouch for it: no replica or row, unreadable, or not pulled to the feed head
++    within ``kanban_replica_freshness.FRESH_SECONDS`` (sync stopped or detached). Never raises."""
++    from hermes_cli.kanban_replica_freshness import FRESH_SECONDS
++    from hermes_cli.kanban_sync_client import shadow_path
++    try:
++        path = shadow_path(board or "default")
++        if not path.exists():
++            return None
++        state = _query(path, "select pulled_at from kanban_sync_state limit 1")
++        rows = _query(path, "select status from tasks where id=?", (target,))
++        pulled = state[0][0] if state else None
++        if not rows or not isinstance(pulled, (int, float)) or not 0 <= time.time() - pulled <= FRESH_SECONDS:
++            return None
++        return _verdict(board, target, rows[0][0], source=path, until=until, since=since, note=" (board replica)")
++    except Exception:  # health: allow BLE001 -- an unreadable Board replica is no evidence; the registry answer stands
++        return None
++
++
++def _unreachable_task(gateway, target, *, board, until, since, live_timeout) -> tuple[int, str]:
++    """The owner gateway cannot be asked (no route, or a forced-command key). Two local copies may answer: the
++    hermes-hub registry replica (collector-refreshed, owner-qualified) and this gateway's Board sync replica (the
++    same Board row the owner's own ``wait-check`` falls back to, applied each sync round). The Board replica runs
++    minutes ahead, and it is the one whose apply expedites the park (``kanban_awaited_card_wake``): reading only
++    the registry, the expedited probe saw the old status and slept a full ``check_every`` (t_01a1d5ead059278d,
++    0 of 2 live parks woke). So a fresh Board replica may only move the answer to met (rc 0): it never downgrades
++    the registry's met, nor replaces its rc 3 (stale or unknown scope: the owner may be offline, and its frozen
++    Board row would hide the gateway_offline escalation) with a not-yet. Its ``pulled_at`` is this gateway's pull
++    time, not when the owner wrote the row, so it is not weighed against the registry's ``observed_at``. A live
++    owner read stands; a Board replica that is not fresh adds nothing."""
++    from hermes_cli.kanban_wait_replica import check
++    rc, msg = check(gateway, target, board=board, until=until, since=since, live_timeout=live_timeout)
++    if rc == 0 or "(live owner" in msg:
++        return rc, msg
++    board_view = _board_replica_task(board, target, until=until, since=since)
++    return board_view if board_view is not None and board_view[0] == 0 else (rc, msg)
++
++
+ def _producer_suffix(board, target, *, source=None):
+     from hermes_cli.kanban_session_activity import _open_ro
+     from hermes_cli.kanban_awaiting import card_orphan_reason
+@@ -142,9 +185,8 @@ def check_remote(gateway: str, kind: str, target: str, *, board: Optional[str] =
+                            timeout=15 if kind == "task" else SSH_TIMEOUT + 15, check=False)
+     except (OSError, subprocess.TimeoutExpired) as exc:
+         if kind == "task":
+-            from hermes_cli.kanban_wait_replica import check
+-            return check(gateway, target, board=board, until=until, since=since,
+-                         live_timeout=25 - (time.monotonic() - started))
++            return _unreachable_task(gateway, target, board=board, until=until, since=since,
++                                     live_timeout=25 - (time.monotonic() - started))
+         return 2, f"error: ssh {host}: {exc}"
+     # A forced-command key can reach SSH but cannot execute the owner CLI.
+     # Treat only its explicit refusal as unavailable transport, not arbitrary
+@@ -153,9 +195,8 @@ def check_remote(gateway: str, kind: str, target: str, *, board: Optional[str] =
+     # never upgrades a cached observation to a live authoritative read.
+     restricted = p.returncode == 2 and p.stderr.strip().startswith("hub-read: refused:")
+     if (p.returncode == 255 or restricted) and kind == "task":
+-        from hermes_cli.kanban_wait_replica import check
+-        return check(gateway, target, board=board, until=until, since=since,
+-                         live_timeout=25 - (time.monotonic() - started))
++        return _unreachable_task(gateway, target, board=board, until=until, since=since,
++                                 live_timeout=25 - (time.monotonic() - started))
+     out = (p.stdout + p.stderr).strip()
+     if p.returncode == 0 and since and kind == "task":
+         words = (p.stdout or "").split()
+diff --git a/tests/hermes_cli/test_kanban_awaited_card_wake.py b/tests/hermes_cli/test_kanban_awaited_card_wake.py
+index 44796a08ac..bac5fa38a0 100644
+--- a/tests/hermes_cli/test_kanban_awaited_card_wake.py
++++ b/tests/hermes_cli/test_kanban_awaited_card_wake.py
+@@ -169,6 +169,73 @@ def test_review_done_on_another_gateway_wakes_the_owner_within_a_minute(live, sv
+     assert met and f"{REVIEW} done" in met[-1].payload["output"]
+ 
+ 
++@pytest.fixture
++def lagging_registry(tmp_path, monkeypatch):
++    """worker-1 is unreachable over ssh from here (rc 255, as from every pool worker: name not resolved or
++    permission denied), so ``--gateway`` probes fall back to the hermes-hub registry replica. That replica is
++    collector-refreshed: fresh (observed 30 s ago) but it still holds the review as ``running`` after the Board
++    sync replica already applied ``done`` (t_01a1d5ead059278d: sources disagreed for minutes)."""
++    import json
++    import sqlite3
++    import subprocess
++    from hermes_cli import kanban_wait_check as kwait
++
++    state = tmp_path / "hub-state"
++    state.mkdir()
++    monkeypatch.setenv("HERMES_HUB_STATE", str(state))
++    db = sqlite3.connect(state / "hub.db")
++    db.execute("CREATE TABLE replica(gw TEXT, coll TEXT, key TEXT, data TEXT, updated_at INTEGER)")
++    scope = {"task_scopes": [{"board": BOARD, "profile": "default", "state": "ok", "observed_at": time.time() - 30}]}
++    db.execute("INSERT INTO replica VALUES(?,?,?,?,?)", (OTHER, "gateway", OTHER, json.dumps(scope), 1))
++    row = dict(id=REVIEW, board=BOARD, status="running", gateway=OTHER, profile="default", owner_profile="default",
++               wait_observation={"parked_agent": False, "orphan_reason": None})
++    db.execute("INSERT INTO replica VALUES(?,?,?,?,?)", (OTHER, "tasks", f"default/{BOARD}/{REVIEW}",
++                                                         json.dumps(row), 1))
++    db.commit()
++    db.close()
++    ssh = []
++
++    def unreachable(argv, **kwargs):
++        ssh.append(argv)
++        return subprocess.CompletedProcess(argv, 255, "", f"ssh: Could not resolve hostname {OTHER}")
++
++    monkeypatch.setattr(kwait.subprocess, "run", unreachable)
++    return ssh
++
++
++def test_gateway_probe_wakes_on_the_board_change_while_ssh_fails_and_the_registry_lags(
++        live, svc, kanban_home, probes, lagging_registry, monkeypatch):
++    """The live #2370 gap: both production parks used ``--gateway`` and slept the full ``check_every``."""
++    from hermes_cli import kanban_awaiting as ka
++    monkeypatch.setitem(ka._REMOTE_CONFIRMED, (OTHER, REVIEW), (time.monotonic(), f"{REVIEW} running"))
++    owner, t0 = _setup(live, svc, kanban_home, probes, f"hermes kanban wait-check task {REVIEW} --gateway {OTHER}")
++    assert lagging_registry  # the probe tried the owner first
++    _other(svc, REVIEW, {"status": "done"})
++    _round(kanban_home, svc)  # this gateway's Board replica applies done; the registry replica still says running
++    assert sync.consume_dispatcher_wake()
++    assert _next_at(live, owner) <= t0 + 60
++    kwc.run_due_wake_checks(live, now=t0 + 60, wait=True)
++    assert _status(live, owner) == "ready"  # before the fix: scheduled until t0 + 900
++    met = [e for e in kb.list_events(live, owner) if e.kind == "condition_met"]
++    assert met and f"{REVIEW} done" in met[-1].payload["output"]
++
++
++def test_gateway_probe_keeps_the_registry_answer_when_the_board_replica_is_not_fresh(
++        live, svc, kanban_home, probes, lagging_registry, monkeypatch):
++    """A Board replica whose last pull is old vouches for nothing: the registry's (newer) not-yet stands."""
++    from hermes_cli import kanban_awaiting as ka
++    monkeypatch.setitem(ka._REMOTE_CONFIRMED, (OTHER, REVIEW), (time.monotonic(), f"{REVIEW} running"))
++    owner, t0 = _setup(live, svc, kanban_home, probes, f"hermes kanban wait-check task {REVIEW} --gateway {OTHER}")
++    _other(svc, REVIEW, {"status": "done"})
++    _round(kanban_home, svc)
++    import sqlite3
++    with sqlite3.connect(ksc.shadow_path(BOARD)) as shadow:
++        shadow.execute("UPDATE kanban_sync_state SET pulled_at = ?", (time.time() - 3600,))
++    kwc.run_due_wake_checks(live, now=t0 + 60, wait=True)
++    assert _status(live, owner) == "scheduled"
++    assert _next_at(live, owner) == t0 + 60 + EVERY
++
++
+ def test_awaiting_card_ref_alone_names_the_card(live, kanban_home):
+     """A park whose own probe does not name the card still counts its ``awaiting`` card ref."""
+     owner = kb.create_task(live, title="owner", assignee="worker")
+diff --git a/tests/hermes_cli/test_kanban_wait_check_board_replica.py b/tests/hermes_cli/test_kanban_wait_check_board_replica.py
+new file mode 100644
+index 0000000000..62d1b5e24d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wait_check_board_replica.py
+@@ -0,0 +1,142 @@
++"""``wait-check task X --gateway G`` with no route to G: the registry replica and this gateway's Board replica
++both answer; a fresh Board replica may only move the answer to met (t_01a1d5ead059278d). [daveey]"""
++import json
++import sqlite3
++import subprocess
++import time
++
++import pytest
++
++from hermes_cli import kanban_wait_check as wait
++
++TID = "t_123456789abcdef0"
++GW = "worker-7"
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    with sqlite3.connect(tmp_path / "hub.db") as db:
++        db.execute("CREATE TABLE replica(gw TEXT, coll TEXT, key TEXT, data TEXT, updated_at INTEGER)")
++    shadow = tmp_path / "kanban/sync-shadow/default.db"
++    shadow.parent.mkdir(parents=True)
++    with sqlite3.connect(shadow) as db:
++        db.execute("CREATE TABLE tasks(id TEXT PRIMARY KEY, status TEXT)")
++        db.execute("CREATE TABLE kanban_sync_state(board_id TEXT, pulled_at REAL)")
++        db.execute("INSERT INTO kanban_sync_state VALUES ('default', NULL)")
++    calls = []
++
++    def ssh(argv, **kwargs):
++        calls.append(argv)
++        return subprocess.CompletedProcess(argv, 255, "", "Permission denied (publickey).")
++
++    monkeypatch.setattr(wait.subprocess, "run", ssh)
++    return tmp_path
++
++
++def registry(home, status, *, age):
++    """The hermes-hub registry replica holds the card as ``status``, observed ``age`` seconds ago."""
++    scope = {"task_scopes": [{"board": "default", "profile": "default", "state": "ok", "observed_at": time.time() - age}]}
++    row = dict(id=TID, board="default", status=status, gateway=GW, profile="default", owner_profile="default",
++               wait_observation={"parked_agent": False, "orphan_reason": None})
++    with sqlite3.connect(home / "hub.db") as db:
++        db.execute("DELETE FROM replica")
++        db.execute("INSERT INTO replica VALUES(?,?,?,?,?)", (GW, "gateway", GW, json.dumps(scope), 1))
++        db.execute("INSERT INTO replica VALUES(?,?,?,?,?)", (GW, "tasks", f"default/default/{TID}", json.dumps(row), 1))
++
++
++def board(home, status, *, age):
++    """This gateway's Board replica holds the card as ``status``, last pulled to the head ``age`` seconds ago."""
++    with sqlite3.connect(home / "kanban/sync-shadow/default.db") as db:
++        db.execute("INSERT OR REPLACE INTO tasks VALUES (?, ?)", (TID, status))
++        db.execute("UPDATE kanban_sync_state SET pulled_at = ?", (time.time() - age,))
++
++
++def probe(**kw):
++    return wait.check_remote(GW, "task", TID, until=("done",), **kw)
++
++
++def test_a_fresh_board_met_wins_over_a_lagging_registry(home):
++    registry(home, "running", age=120)
++    board(home, "done", age=5)
++    rc, text = probe()
++    assert rc == 0 and text.split()[:2] == [TID, "done"] and "(board replica)" in text, text
++
++
++def test_a_board_replica_never_downgrades_the_registry_met(home):
++    """pulled_at is this gateway's pull time: a row pulled 5 s ago can still lag the owner's push."""
++    registry(home, "done", age=300)
++    board(home, "running", age=5)
++    rc, text = probe()
++    assert rc == 0 and "(replica)" in text and "(board replica)" not in text, text
++
++
++def test_a_fresh_board_met_wins_whatever_the_registry_scope_age(home):
++    """Only met moves, so the two hosts' clocks are never compared: a registry not-yet observed after the
++    Board pull does not hold back the Board's done (what the no-``--gateway`` probe of that row reports)."""
++    registry(home, "running", age=5)
++    board(home, "done", age=120)
++    rc, text = probe()
++    assert rc == 0 and "(board replica)" in text, text
++
++
++@pytest.mark.parametrize("age", [601, 3600])
++def test_a_board_replica_not_pulled_recently_adds_nothing(home, age):
++    registry(home, "running", age=30)
++    board(home, "done", age=age)
++    rc, text = probe()
++    assert rc == 1 and "(replica)" in text, text
++
++
++def test_a_board_replica_with_a_future_stamp_adds_nothing(home):
++    registry(home, "running", age=30)
++    board(home, "done", age=-120)
++    assert probe()[0] == 1
++
++
++def test_stale_registry_and_no_board_row_stays_unknown(home):
++    registry(home, "running", age=5000)
++    rc, text = probe()
++    assert rc == 3 and "stale_age=" in text, text
++
++
++def test_stale_registry_with_a_fresh_board_met_reads_the_board(home):
++    registry(home, "running", age=5000)
++    board(home, "done", age=5)
++    rc, text = probe()
++    assert rc == 0 and "(board replica)" in text, text
++
++
++def test_stale_registry_with_a_fresh_board_not_yet_stays_unknown(home):
++    """The owner is offline: its frozen Board row still says running, however recently this gateway pulled it.
++    rc 3 must stand, or the park never wakes as gateway_offline at STALE_WAKE_AFTER."""
++    registry(home, "running", age=5000)
++    board(home, "running", age=5)
++    rc, text = probe()
++    assert rc == 3 and "stale_age=" in text, text
++
++
++def test_from_applies_to_the_board_replica(home):
++    registry(home, "running", age=120)
++    board(home, "done", age=5)
++    rc, text = probe(since=("done",))
++    assert rc == 1, text  # the Board's done is the status the waiter already handled: not yet
++
++
++def test_unreadable_board_replica_keeps_the_registry_answer(home):
++    registry(home, "running", age=30)
++    (home / "kanban/sync-shadow/default.db").write_text("not sqlite")
++    rc, text = probe()
++    assert rc == 1 and "(replica)" in text, text
++
++
++def test_a_live_owner_read_stands(home, monkeypatch):
++    """No registry record: the replica reader asks the owner live; that answer is current, not weighed."""
++    from hermes_cli import kanban_wait_live
++    board(home, "done", age=5)
++    monkeypatch.setattr(kanban_wait_live, "read_task", lambda *a, **k: {"status": "running"})
++    rc, text = probe()
++    assert rc == 1 and "(live owner)" in text, text
+-- 
+2.43.0
+

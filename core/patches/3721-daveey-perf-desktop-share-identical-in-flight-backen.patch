@@ -1,0 +1,423 @@
+From 9deeb8c84eaa2351083afe9cbf165f96c3b8d434 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:56:23 -0800
+Subject: [PATCH] [daveey] perf(desktop): share identical in-flight backend
+ reads instead of resending them
+
+The Desktop on laptop-1 logged 83 "Timed out connecting to Hermes backend" in 30 min (card
+t_01a1d5fd92ac3a4d), 72 on conn=hermes-hub, 40 of those in 8 shared 2-second bursts across 21 paths.
+
+Five whys
+1. Why did requests time out? They queued past their 8-15 s deadline on the SSH tunnel to the hub, in
+   bursts that hit every path at once (the paths that time out are victims, not the cause).
+2. Why did the tunnel queue? A 30 s loopback pcap of the hub's backend port (tcpdump -i lo port 9147,
+   2026-11-13 17:45 UTC) shows 101 requests returning 9.5 MB to this one Desktop, ~320 KB/s, on a link
+   with 20% ICMP loss: each burst is MBs of session lists queued ahead of small reads.
+3. Why so many bytes? 44% of them (4.1 MB) were repeats of a GET still in flight: the same
+   /api/profiles/sessions?...profile=all list up to 6 times within 1.5 s (121-273 KB each), the
+   unfiltered /api/sessions list 3x, the 508 KB project tree 2x.
+4. Why repeats? Each caller (sidebar slices, cron list, per-profile merges, each window) goes through
+   fetchJsonForBackend on its own; the delta-read layer only shrinks a repeat against a base it already
+   holds, and no layer shares a read that has not answered yet.
+5. Why wasn't it caught? Nothing measured wire duplicates; the timeout detector counts victim paths,
+   and earlier fixes thinned single pollers rather than the shared sink.
+
+Fix: fetchJsonForBackend (the single sink for renderer-routed and main-process backend REST calls) now
+goes through read-coalescing.ts. A bodyless GET identical to one in flight (same backend origin,
+credential, headers, gateway mode, path, deadline, pool, profile scope) waits for that one's answer;
+each caller gets its own structuredClone copy, so one caller's edits (tagRemoteSessionRows) cannot leak
+into another's. Any write to a backend bumps its generation, so a read issued after a write never joins
+a read sent before it. Errors are shared once and the next read asks again.
+
+Tests: electron/read-coalescing.test.ts (behaviour: one wire request for 10 identical concurrent reads
+with distinct copies; settled reads ask again; every key part separates; writes never coalesce and
+read-after-write sees the write; shared failure then retry; GET-only), plus a main.ts wiring check that
+the uncoalesced transport has no other caller. Mutant (coalescing disabled) fails 2 of 6. Wiring tests in
+local-gateway/remote-down-gate/slow-link now slice the renamed transport body fetchJsonForBackendOnce.
+---
+ apps/desktop/electron/local-gateway.test.ts   |   2 +-
+ apps/desktop/electron/main.ts                 |  20 +--
+ apps/desktop/electron/read-coalescing.test.ts | 153 ++++++++++++++++++
+ apps/desktop/electron/read-coalescing.ts      | 131 +++++++++++++++
+ .../desktop/electron/remote-down-gate.test.ts |   2 +-
+ apps/desktop/electron/slow-link.test.ts       |   2 +-
+ 6 files changed, 294 insertions(+), 16 deletions(-)
+ create mode 100644 apps/desktop/electron/read-coalescing.test.ts
+ create mode 100644 apps/desktop/electron/read-coalescing.ts
+
+diff --git a/apps/desktop/electron/local-gateway.test.ts b/apps/desktop/electron/local-gateway.test.ts
+index c95b9dc39a..a42cdf1011 100644
+--- a/apps/desktop/electron/local-gateway.test.ts
++++ b/apps/desktop/electron/local-gateway.test.ts
+@@ -564,7 +564,7 @@ test('a sidebar read mints for the profile its recents_profile names', () => {
+ test('main issues native-gateway REST calls only through the shared descriptor transport', async () => {
+   const fs = await import('node:fs/promises')
+   const source = await fs.readFile(new URL('./main.ts', import.meta.url), 'utf8')
+-  const transport = source.indexOf('async function fetchJsonForBackend(')
++  const transport = source.indexOf('async function fetchJsonForBackendOnce(')
+   const transportEnd = source.indexOf('\n}\n', transport)
+   const outside = source.slice(0, transport) + source.slice(transportEnd)
+ 
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 89339b04c4..45c6363662 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -515,6 +515,7 @@ import {
+   createQuitTeardownCoordinator,
+   type QuitTeardownTask
+ } from './quit-teardown'
++import { backendReadCoalescer, type BackendReadOpts, coalescedBackendRead } from './read-coalescing'
+ import {
+   boundedInstallId,
+   createPrimaryInstallIdResolver,
+@@ -14816,19 +14817,12 @@ async function getJsonForBackend(descriptor, path, opts: any = {}) {
+ // Any-method REST call against a resolved backend descriptor, the one sink for renderer-routed paths (so the
+ // join refuses any path that would move the credentials off the backend origin). OAuth backends prefer a native
+ // bearer (cookieless RFC 8252) and fall back to the cookie partition; token/local use the session-token header.
+-async function fetchJsonForBackend(
+-  descriptor,
+-  path,
+-  opts: {
+-    method?: string
+-    body?: unknown
+-    upload?: unknown
+-    timeoutMs?: number
+-    profileScoped?: boolean
+-    // 'probe' = the dispatch health probe's dedicated socket pool (api-transport.ts).
+-    pool?: 'json' | 'probe'
+-  } = {}
+-) {
++// [daveey] read-coalescing.ts: an identical read already in flight is shared, not sent again.
++function fetchJsonForBackend(descriptor: any, path: string, opts: BackendReadOpts = {}): Promise<any> {
++  return coalescedBackendRead(backendReadCoalescer, descriptor, path, opts, fetchJsonForBackendOnce)
++}
++
++async function fetchJsonForBackendOnce(descriptor: any, path: string, opts: BackendReadOpts = {}): Promise<any> {
+   const url = joinBackendApiUrl(descriptor.baseUrl, path)
+ 
+   // A native grant names one profile and the gateway refuses `all`: assemble the unified
+diff --git a/apps/desktop/electron/read-coalescing.test.ts b/apps/desktop/electron/read-coalescing.test.ts
+new file mode 100644
+index 0000000000..5ce0c52883
+--- /dev/null
++++ b/apps/desktop/electron/read-coalescing.test.ts
+@@ -0,0 +1,153 @@
++import { readFileSync } from 'node:fs'
++import { join } from 'node:path'
++
++import { describe, expect, it, vi } from 'vitest'
++
++import { coalescedBackendRead, ReadCoalescer } from './read-coalescing'
++
++const deferred = <T>() => {
++  let resolve!: (value: T) => void
++  let reject!: (error: unknown) => void
++
++  const promise = new Promise<T>((res, rej) => {
++    resolve = res
++    reject = rej
++  })
++
++  return { promise, reject, resolve }
++}
++
++const hub = { baseUrl: 'http://127.0.0.1:59853', authMode: 'token', token: 'tok-a', headers: { 'X-A': '1' } }
++const LIST = '/api/profiles/sessions?limit=50&profile=all&source=cron'
++
++describe('coalescedBackendRead', () => {
++  it('sends one request for identical concurrent reads and gives each caller its own copy', async () => {
++    const coalescer = new ReadCoalescer()
++    const answer = deferred<{ sessions: { id: string }[] }>()
++    const once = vi.fn(() => answer.promise)
++
++    const reads = Array.from({ length: 10 }, () =>
++      coalescedBackendRead(coalescer, hub, LIST, { timeoutMs: 15_000 }, once)
++    )
++
++    answer.resolve({ sessions: [{ id: 'a' }] })
++    const results = await Promise.all(reads)
++
++    expect(once).toHaveBeenCalledTimes(1)
++    expect(results.every(result => result.sessions[0].id === 'a')).toBe(true)
++
++    // A caller that edits its answer (tagRemoteSessionRows does) cannot change another caller's.
++    results[0].sessions[0].id = 'edited'
++    expect(results.slice(1).every(result => result.sessions[0].id === 'a')).toBe(true)
++    expect(new Set(results).size).toBe(10)
++  })
++
++  it('asks again once the shared read has settled', async () => {
++    const coalescer = new ReadCoalescer()
++    const once = vi.fn(async () => ({ n: once.mock.calls.length }))
++
++    const first = await coalescedBackendRead(coalescer, hub, LIST, {}, once)
++    const second = await coalescedBackendRead(coalescer, hub, LIST, {}, once)
++
++    expect(once).toHaveBeenCalledTimes(2)
++    expect([first.n, second.n]).toEqual([1, 2])
++    expect(coalescer.inflight).toBe(0)
++  })
++
++  it('keeps reads apart when anything on the wire or the deadline differs', async () => {
++    const coalescer = new ReadCoalescer()
++    const gate = deferred<unknown>()
++    const once = vi.fn(() => gate.promise)
++
++    const variants = [
++      coalescedBackendRead(coalescer, hub, LIST, {}, once),
++      coalescedBackendRead(coalescer, hub, `${LIST}&offset=50`, {}, once),
++      coalescedBackendRead(coalescer, { ...hub, token: 'tok-b' }, LIST, {}, once),
++      coalescedBackendRead(coalescer, { ...hub, baseUrl: 'http://127.0.0.1:60000' }, LIST, {}, once),
++      coalescedBackendRead(coalescer, { ...hub, headers: { 'X-A': '2' } }, LIST, {}, once),
++      coalescedBackendRead(coalescer, hub, LIST, { timeoutMs: 4_000 }, once),
++      coalescedBackendRead(coalescer, hub, LIST, { pool: 'probe' }, once),
++      coalescedBackendRead(coalescer, hub, LIST, { profileScoped: true }, once)
++    ]
++
++    gate.resolve({})
++    await Promise.all(variants)
++    expect(once).toHaveBeenCalledTimes(variants.length)
++  })
++
++  it('never coalesces writes, and a read after a write does not join a read sent before it', async () => {
++    const coalescer = new ReadCoalescer()
++    const before = deferred<string>()
++    const after = deferred<string>()
++    const reads = [before, after]
++
++    const once = vi.fn((_d: unknown, _p: string, opts: { method?: string; body?: unknown }) =>
++      opts.method === 'POST' ? Promise.resolve('wrote') : (reads.shift() as ReturnType<typeof deferred<string>>).promise
++    )
++
++    const stale = coalescedBackendRead(coalescer, hub, LIST, {}, once)
++
++    const writes = [
++      coalescedBackendRead(coalescer, hub, '/api/sessions/x/archive', { method: 'POST', body: {} }, once),
++      coalescedBackendRead(coalescer, hub, '/api/sessions/x/archive', { method: 'POST', body: {} }, once)
++    ]
++
++    const fresh = coalescedBackendRead(coalescer, hub, LIST, {}, once)
++
++    before.resolve('before the write')
++    after.resolve('after the write')
++
++    expect(await Promise.all(writes)).toEqual(['wrote', 'wrote'])
++    expect(await stale).toBe('before the write')
++    expect(await fresh).toBe('after the write')
++    expect(once).toHaveBeenCalledTimes(4)
++  })
++
++  it('shares a failure with every caller and then lets the next read try again', async () => {
++    const coalescer = new ReadCoalescer()
++    const answer = deferred<unknown>()
++    const once = vi.fn(() => answer.promise)
++
++    const reads = [1, 2, 3].map(() => coalescedBackendRead(coalescer, hub, LIST, {}, once))
++    answer.reject(new Error('Timed out connecting to Hermes backend after 15000ms'))
++
++    for (const read of reads) {
++      await expect(read).rejects.toThrow('Timed out')
++    }
++
++    expect(once).toHaveBeenCalledTimes(1)
++    await coalescedBackendRead(
++      coalescer,
++      hub,
++      LIST,
++      {},
++      vi.fn(async () => 'ok')
++    )
++    expect(coalescer.inflight).toBe(0)
++  })
++
++  it('treats only bodyless GETs as reads', () => {
++    expect(ReadCoalescer.isRead({})).toBe(true)
++    expect(ReadCoalescer.isRead({ method: 'get' })).toBe(true)
++    expect(ReadCoalescer.isRead({ method: 'GET', body: {} })).toBe(false)
++    expect(ReadCoalescer.isRead({ method: 'GET', upload: { path: '/x' } })).toBe(false)
++    expect(ReadCoalescer.isRead({ method: 'DELETE' })).toBe(false)
++  })
++})
++
++describe('main.ts wiring', () => {
++  const main = readFileSync(join(__dirname, 'main.ts'), 'utf8')
++
++  it('sends every backend REST call through the coalescer, and the coalescer only to the real transport', () => {
++    const front = main.slice(
++      main.indexOf('function fetchJsonForBackend('),
++      main.indexOf('async function fetchJsonForBackendOnce(')
++    )
++
++    expect(front).toContain(
++      'coalescedBackendRead(backendReadCoalescer, descriptor, path, opts, fetchJsonForBackendOnce)'
++    )
++    // Nothing else calls the uncoalesced transport, so no read can bypass the sharing.
++    expect(main.match(/\bfetchJsonForBackendOnce\b/g)).toHaveLength(2)
++  })
++})
+diff --git a/apps/desktop/electron/read-coalescing.ts b/apps/desktop/electron/read-coalescing.ts
+new file mode 100644
+index 0000000000..a88a1a757d
+--- /dev/null
++++ b/apps/desktop/electron/read-coalescing.ts
+@@ -0,0 +1,131 @@
++// [daveey] One wire request for identical concurrent reads of a backend.
++//
++// Measured 2026-11-13 on the hub's loopback port (30 s pcap of the Desktop's SSH tunnel): the same session-list
++// GET left this Desktop up to 6 times within 1.5 s (sidebar slices, cron list, per-profile merges and windows each
++// asking for profile=all), each answered with the same 120-273 KB body. Repeats of a read still in flight were 44%
++// of every byte the hub sent (4.1 of 9.5 MB in 101 requests); on a lossy remote link those bursts queued the other
++// requests past their deadline ("Timed out connecting to Hermes backend", 72 on conn=hermes-hub in 30 min).
++//
++// A GET that is identical to one still in flight (same backend, credential, headers, path, deadline, pool) now
++// waits for that one's answer instead of sending its own. Each caller gets its own copy of the answer, so a caller
++// that edits its result cannot change another's. A write to a backend starts a new generation: a read issued after
++// it never joins a read that left before it, so read-after-write still sees the write.
++
++export interface CoalescibleRead {
++  method?: string
++  body?: unknown
++  upload?: unknown
++}
++
++const copyOf = <T>(value: T): T => {
++  try {
++    return structuredClone(value)
++  } catch {
++    return value // not cloneable (never true for parsed JSON): hand out the shared value rather than fail the read
++  }
++}
++
++export class ReadCoalescer {
++  readonly #inflight = new Map<string, { joined: number; promise: Promise<unknown> }>()
++  readonly #generations = new Map<string, number>()
++
++  /** True for a plain read: a GET (or no method) with no body and no upload. */
++  static isRead(opts: CoalescibleRead = {}): boolean {
++    return String(opts.method || 'GET').toUpperCase() === 'GET' && opts.body === undefined && !opts.upload
++  }
++
++  /** A write to `origin` is starting: reads issued from now on never join one that left before it. */
++  noteWrite(origin: string): void {
++    this.#generations.set(origin, (this.#generations.get(origin) ?? 0) + 1)
++  }
++
++  /** The key identical reads share; `parts` must already name the credential, headers, path and deadline. */
++  keyFor(origin: string, parts: unknown[]): string {
++    return JSON.stringify([origin, this.#generations.get(origin) ?? 0, ...parts])
++  }
++
++  /** Run `start` unless a read with this key is in flight; then share its answer (each caller gets a copy). */
++  run<T>(key: null | string, start: () => Promise<T>): Promise<T> {
++    if (!key) {
++      return start()
++    }
++
++    const existing = this.#inflight.get(key)
++
++    if (existing) {
++      existing.joined += 1
++
++      return existing.promise.then(value => copyOf(value as T))
++    }
++
++    const entry = { joined: 0, promise: Promise.resolve() as Promise<unknown> }
++
++    // Settled reads leave the map before any caller sees the answer, so a later read always asks again.
++    entry.promise = Promise.resolve()
++      .then(start)
++      .finally(() => {
++        if (this.#inflight.get(key) === entry) {
++          this.#inflight.delete(key)
++        }
++      })
++    this.#inflight.set(key, entry)
++
++    // The first caller keeps the original only when nobody joined; otherwise everyone works on a copy.
++    return entry.promise.then(value => (entry.joined > 0 ? copyOf(value as T) : (value as T)))
++  }
++
++  get inflight(): number {
++    return this.#inflight.size
++  }
++}
++
++export const backendReadCoalescer = new ReadCoalescer()
++
++export interface BackendReadDescriptor {
++  baseUrl?: null | string
++  authMode?: null | string
++  token?: null | string
++  headers?: unknown
++  gatewayEndpoint?: unknown
++}
++
++export interface BackendReadOpts extends CoalescibleRead {
++  timeoutMs?: number
++  // 'probe' = the dispatch health probe's dedicated socket pool (api-transport.ts).
++  pool?: 'json' | 'probe'
++  profileScoped?: boolean
++}
++
++/**
++ * fetchJsonForBackend's front door (main.ts): a write goes straight out and starts a new generation for its
++ * backend; a read shares an identical read still in flight. Everything that changes what goes on the wire, or what
++ * the caller is willing to wait, is in the key, so only truly identical requests share one answer.
++ */
++export function coalescedBackendRead<D extends BackendReadDescriptor, O extends BackendReadOpts, T>(
++  coalescer: ReadCoalescer,
++  descriptor: D,
++  path: string,
++  opts: O,
++  once: (descriptor: D, path: string, opts: O) => Promise<T>
++): Promise<T> {
++  const origin = String(descriptor?.baseUrl ?? '')
++
++  if (!ReadCoalescer.isRead(opts)) {
++    coalescer.noteWrite(origin)
++
++    return once(descriptor, path, opts)
++  }
++
++  const key = coalescer.keyFor(origin, [
++    descriptor?.authMode ?? '',
++    descriptor?.token ?? '',
++    descriptor?.headers ?? null,
++    Boolean(descriptor?.gatewayEndpoint),
++    path,
++    opts.timeoutMs ?? null,
++    opts.pool ?? '',
++    Boolean(opts.profileScoped)
++  ])
++
++  return coalescer.run(key, () => once(descriptor, path, opts))
++}
+diff --git a/apps/desktop/electron/remote-down-gate.test.ts b/apps/desktop/electron/remote-down-gate.test.ts
+index bda2babfe1..c83001199b 100644
+--- a/apps/desktop/electron/remote-down-gate.test.ts
++++ b/apps/desktop/electron/remote-down-gate.test.ts
+@@ -438,7 +438,7 @@ describe('main.ts wiring', () => {
+ 
+   // fetchJson's own pool choice is proven by behaviour in json-fetch.test.ts.
+   it('fetchJsonForBackend forwards the pool option', () => {
+-    const body = main.slice(main.indexOf('async function fetchJsonForBackend('))
++    const body = main.slice(main.indexOf('async function fetchJsonForBackendOnce('))
+     expect(body.slice(0, 4000)).toMatch(/pool: opts\.pool/)
+   })
+ 
+diff --git a/apps/desktop/electron/slow-link.test.ts b/apps/desktop/electron/slow-link.test.ts
+index 333e0e805d..189dd42f3a 100644
+--- a/apps/desktop/electron/slow-link.test.ts
++++ b/apps/desktop/electron/slow-link.test.ts
+@@ -432,7 +432,7 @@ describe('main.ts wiring', () => {
+   })
+ 
+   it('stretches every backend request timeout and times every answer in fetchJsonForBackend', () => {
+-    const fetcher = main.slice(main.indexOf('async function fetchJsonForBackend('))
++    const fetcher = main.slice(main.indexOf('async function fetchJsonForBackendOnce('))
+     const body = fetcher.slice(0, fetcher.indexOf('\nipcMain.handle('))
+ 
+     expect(body).toContain('slowLinkTracker.scaleTimeout(')
+-- 
+2.43.0
+

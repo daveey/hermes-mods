@@ -1,0 +1,436 @@
+From fbccdbd0e84054e3b598452ef1153efb3c4ca26d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 17:16:57 +0000
+Subject: [PATCH] [daveey] kanban: a park awaiting a card re-probes when that
+ card's status changes on the same gateway
+
+Incident (2026-11-13, t_01a1d5def756990d): PR #2351's owner t_01a1d4bde1a32381 parked on worker-5 at
+16:34:42 with wake_check `hermes kanban wait-check task t_01a1d5c2abb6dcee` (awaiting kind=card,
+check_every 900). The review card was created, claimed and completed on worker-5 itself at 16:43:01; the
+owner got condition_met only on its regular probe at 16:50:05 (7 min 04 s idle).
+
+Five whys: the owner slept because its probe was not due -> nothing moved next_at earlier -> PR #2370's
+expedite has one call site, the sync client's replica pull -> a status change written on this gateway's own
+board never goes through a replica pull -> status writes are spread over ~40 `UPDATE tasks SET status`
+sites with no single transition helper, so nothing hooked them.
+
+Fix: every outer kanban `write_txn` arms a per-connection TEMP trigger (as kanban_sync_own_writes does)
+that records `UPDATE OF status ON tasks` changes in a temp table; they commit and roll back with the write.
+After COMMIT, `kanban_local_status_wake.flush` hands this commit's {card: new status} to the same
+`kanban_awaited_card_wake.expedite`: next_at earlier only, park re-checked as scheduled inside expedite's
+write txn, wake_dispatcher(). One indexed prefilter query (does any scheduled park's probe or park event
+mention a changed card?) runs first, so a commit no park cares about never reads every park. Best-effort:
+any failure is logged and the transition stands; the park keeps its check_every cadence. No polling.
+
+Proof (tests/hermes_cli/test_kanban_local_status_wake.py, 18 tests):
+- a. complete / block / request_review / archive of the awaited card on this gateway, with the plain
+  `wait-check task X` park and with awaiting kind=card ref X: next_at <= t0+60 and the owner is ready on the
+  next tick; a file-probe park with only an awaiting card ref also moves.
+- b. 30 simulated minutes with other cards changing status and the awaited card getting title edits: 3
+  probes (t0, +900, +1800), the same as main.
+- c. `--from blocked|review|triage`: an unmet intermediate change costs one probe, then check_every again.
+- guards: rolled-back transition, a commit no park mentions (expedite never called), a raising expedite,
+  the prefilter cap, a db without tasks.
+RED on origin/main 9bd665a43a: 14 failed / 4 passed (b and the no-op guards pass on main, as intended).
+GREEN: 18 passed, plus test_kanban_awaited_card_wake.py 14 passed.
+---
+ hermes_cli/kanban_db_connect.py               |   3 +
+ hermes_cli/kanban_local_status_wake.py        |  85 ++++++
+ .../test_kanban_local_status_wake.py          | 265 ++++++++++++++++++
+ 3 files changed, 353 insertions(+)
+ create mode 100644 hermes_cli/kanban_local_status_wake.py
+ create mode 100644 tests/hermes_cli/test_kanban_local_status_wake.py
+
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 74bea69d1e..8b1bce874e 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
+ from __future__ import annotations
+ 
+ from hermes_cli import kanban_lockguard as _kanban_lockguard
++from hermes_cli import kanban_local_status_wake as _local_status_wake
+ from hermes_cli import kanban_run_end_lease as _run_end_lease
+ from hermes_cli import kanban_schema_owner as _schema_owner
+ import contextlib
+@@ -1551,6 +1552,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
+ 
+     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+     try:
++        _local_status_wake.arm(conn)  # [daveey] record this txn's status changes for the awaited-card wake
+         yield conn
+     except Exception:
+         # SQLite may already have auto-rolled-back (EIO, contention, corruption);
+@@ -1572,6 +1574,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
+         _run_end_lease.flush(conn, committed=True)  # [daveey] Board lease of a run this txn ended
+         # Post-commit torn-extend check — raise now rather than silently corrupt.
+         _check_file_length_invariant(conn)
++        _local_status_wake.flush(conn)  # [daveey] a park awaiting a card this commit moved re-probes now
+ 
+ 
+ # Late-bound origin namespace (see module docstring); imported LAST so this
+diff --git a/hermes_cli/kanban_local_status_wake.py b/hermes_cli/kanban_local_status_wake.py
+new file mode 100644
+index 0000000000..a458fbb135
+--- /dev/null
++++ b/hermes_cli/kanban_local_status_wake.py
+@@ -0,0 +1,85 @@
++"""A park waiting on a card re-probes when that card's status changes on this same gateway. [daveey]
++
++Incident (2026-11-13, t_01a1d5def756990d): PR #2351's owner t_01a1d4bde1a32381 parked on worker-5 with
++``hermes kanban wait-check task t_01a1d5c2abb6dcee`` (``awaiting`` kind=card, check_every 900). The review card was
++created on worker-5, claimed there, and completed there at 16:43:01; the owner woke on its regular probe at 16:50:05.
++PR #2370 (``kanban_awaited_card_wake.expedite``) re-probes such a park only when the card's status change arrives
++by a replica pull; a change written on this gateway's own board never reached it.
++
++Now every ``write_txn`` records the status changes it commits, and after COMMIT hands them to the same
++``expedite``: a scheduled park whose ``wait-check task <id>`` probe or ``awaiting`` card ref names a changed card
++gets its probe due now (next_at earlier only, re-checked inside expedite's own write txn) and the dispatcher is
++woken (in the gateway process; another process's park is picked up on the dispatcher's next tick). The probe stays
++the judge, so an unmet change costs one probe and the park goes back to its cadence. Nothing polls.
++
++The recorder is a TEMP trigger (as in ``kanban_sync_own_writes``): it fires only for statements run on the
++connection that created it, and its rows live in that connection's temp schema, so they commit and roll back with
++the write that made them (a rolled-back transition never expedites). ``arm`` clears them at each outer BEGIN, so a
++commit hands over only its own changes. Before calling ``expedite`` (which reads every scheduled park's latest park
++event), one indexed query asks whether any scheduled park mentions a changed card at all; the common commit costs
++that one read. Every failure is swallowed: the park keeps its ``check_every`` cadence and the transition stands.
++"""
++from __future__ import annotations
++
++import logging
++import sqlite3
++import threading
++
++logger = logging.getLogger(__name__)
++
++_TABLE = "kanban_local_status_changed"
++_TRIGGER = "kanban_local_status_changed_trg"
++_PREFILTER_MAX = 32  # more changed cards than this in one commit (a sweep): let expedite read the parks once
++_active = threading.local()
++
++_MENTIONS = (
++    "SELECT 1 FROM task_wake_checks w JOIN tasks t ON t.id = w.task_id "
++    "WHERE t.status = 'scheduled' AND w.purpose IS NOT 'ask_resolved' AND w.task_id != ?1 "
++    "AND (instr(w.cmd, ?1) > 0 OR EXISTS (SELECT 1 FROM task_events e WHERE e.kind IN ('scheduled', 'continued') "
++    "AND e.task_id = w.task_id AND instr(e.payload, ?1) > 0)) LIMIT 1")
++
++
++def arm(conn: sqlite3.Connection) -> None:
++    """``write_txn`` right after its outer BEGIN: install the recorder on ``conn`` once, forget older rows."""
++    try:
++        conn.execute(f"CREATE TEMP TABLE IF NOT EXISTS {_TABLE} (task_id TEXT PRIMARY KEY, status TEXT)")
++        conn.execute(f"CREATE TEMP TRIGGER IF NOT EXISTS {_TRIGGER} AFTER UPDATE OF status ON main.tasks "
++                     f"WHEN OLD.status IS NOT NEW.status BEGIN "
++                     f"INSERT OR REPLACE INTO {_TABLE} (task_id, status) VALUES (NEW.id, NEW.status); END")
++        conn.execute(f"DELETE FROM temp.{_TABLE}")
++    except sqlite3.Error:  # a board without ``tasks`` yet: nothing to record
++        pass
++
++
++def flush(conn: sqlite3.Connection) -> list[str]:
++    """``write_txn`` after COMMIT: expedite the parks naming a card whose status this commit changed.
++    Returns the waiting cards whose probe moved earlier. Never raises."""
++    if getattr(_active, "busy", False):  # expedite's own write txn commits here too
++        return []
++    try:
++        changed = dict(conn.execute(f"SELECT task_id, status FROM temp.{_TABLE}").fetchall())
++    except sqlite3.Error:  # recorder not installed on this connection
++        return []
++    if not changed:
++        return []
++    _active.busy = True
++    try:
++        if not _mentioned(conn, changed):
++            return []
++        from hermes_cli.kanban_awaited_card_wake import expedite
++        return expedite(conn, changed)
++    except Exception:  # health: allow BLE001 -- best-effort: the park keeps its check_every cadence
++        logger.warning("kanban local status wake: could not expedite parks for %d changed card(s)", len(changed),
++                       exc_info=True)
++        return []
++    finally:
++        _active.busy = False
++
++
++def _mentioned(conn: sqlite3.Connection, changed: dict) -> bool:
++    if len(changed) > _PREFILTER_MAX:
++        return True
++    try:
++        return any(conn.execute(_MENTIONS, (tid,)).fetchone() for tid in changed)
++    except sqlite3.OperationalError:  # a board without the probe table: nothing parks on probes
++        return False
+diff --git a/tests/hermes_cli/test_kanban_local_status_wake.py b/tests/hermes_cli/test_kanban_local_status_wake.py
+new file mode 100644
+index 0000000000..f299d1ccb1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_local_status_wake.py
+@@ -0,0 +1,265 @@
++"""A park waiting on a card re-probes when that card's status changes on this SAME gateway, not up to
++``check_every`` later (t_01a1d5def756990d). [daveey]
++
++PR #2351's owner (worker-5) parked on ``hermes kanban wait-check task <review>`` (awaiting kind=card, check_every
++900). The review card was created, claimed and completed on worker-5 itself at 16:43:01; the owner woke on its
++regular probe at 16:50:05. PR #2370 expedited only status changes that arrive by a replica pull.
++"""
++from __future__ import annotations
++
++import argparse
++import contextlib
++import io
++import os
++import shlex
++import threading
++import time
++
++import pytest
++
++from hermes_cli import kanban_awaited_card_wake as acw
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_local_status_wake as lsw
++from hermes_cli import kanban_wake_check as kwc
++from tests.hermes_cli import kanban_sync_support as support
++
++EVERY = 900
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    monkeypatch.setenv("HERMES_KANBAN_WAKE_DRYRUN", "0")
++    acw._reset_for_tests()
++    yield home
++    kwc._shutdown_for_tests()
++    acw._reset_for_tests()
++
++
++@pytest.fixture
++def live(kanban_home):
++    conn = kbc.connect(kanban_home / "kanban.db")
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++@pytest.fixture
++def probes(monkeypatch):
++    """Run each ``hermes kanban wait-check`` probe in-process (the real ``kanban_wait_check.run`` with the probe
++    env the dispatcher builds) and count runs per waiting card."""
++    from hermes_cli import kanban_wait_check as kwait
++
++    runs: dict[str, int] = {}
++    lock = threading.Lock()
++    parser = argparse.ArgumentParser()
++    parser.add_argument("check")
++    parser.add_argument("target")
++    for flag in ("--gateway", "--board", "--until"):
++        parser.add_argument(flag, default=None)
++    parser.add_argument("--from", dest="since", default=None)
++
++    def run_probe(key, cmd, cwd, env):
++        argv = shlex.split(cmd)
++        assert argv[:3] == ["hermes", "kanban", "wait-check"], cmd
++        with lock:
++            runs[env["HERMES_KANBAN_TASK"]] = runs.get(env["HERMES_KANBAN_TASK"], 0) + 1
++            saved = {k: os.environ.get(k) for k in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_DB",
++                                                    "HERMES_KANBAN_WAKE_PROBE")}
++            os.environ.update({k: env[k] for k in saved})
++            out = io.StringIO()
++            try:
++                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
++                    rc = kwait.run(parser.parse_args(argv[3:]))
++            finally:
++                for k, v in saved.items():
++                    if v is None:
++                        os.environ.pop(k, None)
++                    else:
++                        os.environ[k] = v
++        return rc, out.getvalue()
++
++    monkeypatch.setattr(kwc, "_run_probe", run_probe)
++    return runs
++
++
++def _running(live, title):
++    tid = kb.create_task(live, title=title, assignee="worker")
++    with kb.write_txn(live):
++        live.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++    assert kb.claim_task(live, tid, claimer="worker") is not None
++    return tid
++
++
++def _set_status(live, tid, status):
++    with kb.write_txn(live):
++        live.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
++
++
++def _status(live, tid):
++    return kb.get_task(live, tid).status
++
++
++def _next_at(live, tid):
++    state = kwc.get_state(live, tid)
++    assert state is not None
++    return state["next_at"]
++
++
++def _setup(live, probes, cmd_for, *, review_status="running", awaiting_card=False):
++    """The review card runs on this gateway; the owner parks on it here and runs its first probe."""
++    review = _running(live, "exact-head review of PR #2351")
++    if review_status != "running":
++        _set_status(live, review, review_status)
++    owner = _running(live, "PR #2351 landing owner")
++    awaiting = {"kind": "card", "ref": review, "why": "exact-head review of PR #2351"} if awaiting_card else None
++    assert kb.schedule_task(live, owner, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting on the review",
++                            wake_check=cmd_for(review), check_every=EVERY, awaiting=awaiting)
++    t0 = int(time.time())
++    kwc.run_due_wake_checks(live, now=t0, wait=True)
++    assert _status(live, owner) == "scheduled" and probes[owner] == 1
++    assert _next_at(live, owner) == t0 + EVERY
++    sync.consume_dispatcher_wake()
++    return review, owner, t0
++
++
++def _wait_check(review):
++    return f"hermes kanban wait-check task {review}"
++
++
++# --- a. the review's local completion wakes the owner without check_every elapsing --------------------------
++
++def _complete(live, tid):
++    assert kb.complete_task(live, tid, summary="approve", metadata={"verdict": "approve"})
++
++
++def _block(live, tid):
++    assert kb.block_task(live, tid, reason="needs a decision")
++
++
++def _review(live, tid):
++    assert kb.request_review(live, tid, summary="ready for review")
++
++
++def _archive(live, tid):
++    from hermes_cli.kanban_db_archive import archive_task
++    assert archive_task(live, tid)
++
++
++@pytest.mark.parametrize("awaiting_card", [False, True], ids=["wait-check", "wait-check+awaiting-card"])
++@pytest.mark.parametrize("transition, shown", [(_complete, "done"), (_block, "blocked"), (_review, "review"),
++                                               (_archive, "archived")],
++                         ids=["complete", "block", "request_review", "archive"])
++def test_awaited_card_moving_on_this_gateway_wakes_the_owner_within_a_minute(live, probes, awaiting_card,
++                                                                             transition, shown):
++    review, owner, t0 = _setup(live, probes, _wait_check, awaiting_card=awaiting_card)
++    transition(live, review)  # 16:43:01: the review finishes on worker-5 itself
++    assert sync.consume_dispatcher_wake()  # an in-process dispatcher ticks now, not at its next interval
++    assert _next_at(live, owner) <= t0 + 60  # before the fix: t0 + 900 (owner woke 16:50:05)
++    kwc.run_due_wake_checks(live, now=t0 + 60, wait=True)
++    assert _status(live, owner) == "ready" and probes[owner] == 3  # park probe, then the met run + its confirm
++    met = [e for e in kb.list_events(live, owner) if e.kind == "condition_met"]
++    assert met and f"{review} {shown}" in met[-1].payload["output"]
++
++
++def test_awaiting_card_ref_alone_wakes_the_owner(live, probes):
++    """A park whose probe does not name the card (a file probe) still re-probes on its ``awaiting`` card ref."""
++    review = _running(live, "review")
++    owner = _running(live, "owner")
++    flag = os.path.join(os.path.dirname(str(kbc._main_db_file(live))), "never-written")
++    assert kb.schedule_task(live, owner, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting",
++                            wake_check=f"test -f {flag}", check_every=EVERY,
++                            awaiting={"kind": "card", "ref": review, "why": "review"})
++    with kb.write_txn(live):
++        live.execute("UPDATE task_wake_checks SET next_at = ? WHERE task_id = ?", (int(time.time()) + EVERY, owner))
++    before = _next_at(live, owner)
++    _complete(live, review)
++    assert _next_at(live, owner) < before
++
++
++# --- b. no status change of the awaited card: exactly the probes of today ------------------------------------
++
++def test_no_change_of_the_awaited_card_adds_no_probe_over_30_minutes(live, probes):
++    review, owner, t0 = _setup(live, probes, _wait_check)
++    other = _running(live, "unrelated card")
++    for minute in range(1, 31):
++        # Other cards keep moving on this board, and the awaited card gets non-status edits.
++        _set_status(live, other, ("ready", "running", "review", "done")[minute % 4])
++        with kb.write_txn(live):
++            live.execute("UPDATE tasks SET title = ? WHERE id = ?", (f"review, edit {minute}", review))
++        kwc.run_due_wake_checks(live, now=t0 + 60 * minute, wait=True)
++        assert _status(live, owner) == "scheduled"
++    assert probes[owner] == 3  # t0, t0+900, t0+1800: the check_every cadence alone, as on main
++    assert not sync.consume_dispatcher_wake()
++
++
++# --- c. --from and unmet changes ------------------------------------------------------------------------------
++
++@pytest.mark.parametrize("since", ["blocked", "review", "triage"])
++def test_from_status_still_reads_not_yet_and_an_unmet_change_probes_at_most_once(live, probes, since):
++    review, owner, t0 = _setup(live, probes, lambda r: f"{_wait_check(r)} --from {since}", review_status=since)
++    _set_status(live, review, "running")  # an intermediate change that is not met
++    with kb.write_txn(live):  # a later commit with no status change of the review
++        live.execute("UPDATE tasks SET title = 'edited' WHERE id = ?", (review,))
++    kwc.run_due_wake_checks(live, now=t0 + 30, wait=True)
++    kwc.run_due_wake_checks(live, now=t0 + 90, wait=True)
++    assert _status(live, owner) == "scheduled" and probes[owner] == 2  # one extra probe, then back on cadence
++    assert _next_at(live, owner) == t0 + 30 + EVERY
++    _set_status(live, review, since)  # back in the --from status: still "unchanged since park"
++    kwc.run_due_wake_checks(live, now=t0 + 120, wait=True)
++    assert _status(live, owner) == "scheduled" and probes[owner] == 3
++    _set_status(live, review, "done")  # (complete_task refuses a triage card; a plain local status write)
++    kwc.run_due_wake_checks(live, now=t0 + 150, wait=True)
++    assert _status(live, owner) == "ready"
++
++
++# --- guards ---------------------------------------------------------------------------------------------------
++
++def test_a_rolled_back_transition_expedites_nothing(live, probes):
++    review, owner, t0 = _setup(live, probes, _wait_check)
++    with pytest.raises(RuntimeError), kb.write_txn(live):
++        live.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (review,))
++        raise RuntimeError("boom")
++    assert _status(live, review) == "running" and _next_at(live, owner) == t0 + EVERY
++    assert not sync.consume_dispatcher_wake()
++
++
++def test_a_commit_no_park_mentions_never_reads_the_parks(live, probes, monkeypatch):
++    _review_id, owner, t0 = _setup(live, probes, _wait_check)
++    calls = []
++    monkeypatch.setattr(acw, "expedite", lambda conn, changed, **kw: calls.append(changed) or [])
++    other = _running(live, "unrelated")
++    _complete(live, other)
++    assert calls == [] and _next_at(live, owner) == t0 + EVERY
++
++
++def test_a_failing_expedite_never_fails_the_transition(live, probes, monkeypatch, caplog):
++    review, owner, t0 = _setup(live, probes, _wait_check)
++
++    def boom(conn, changed, **kw):
++        raise RuntimeError("expedite broke")
++
++    monkeypatch.setattr(acw, "expedite", boom)
++    _complete(live, review)
++    assert _status(live, review) == "done" and _next_at(live, owner) == t0 + EVERY
++    assert "could not expedite" in caplog.text
++
++
++def test_a_sweep_past_the_prefilter_cap_still_expedites(live, probes, monkeypatch):
++    review, owner, _t0 = _setup(live, probes, _wait_check)
++    monkeypatch.setattr(lsw, "_PREFILTER_MAX", 0)
++    _complete(live, review)
++    assert _next_at(live, owner) <= int(time.time())
++
++
++def test_a_board_without_tasks_records_nothing(tmp_path):
++    import sqlite3
++    conn = sqlite3.connect(tmp_path / "bare.db", isolation_level=None)
++    try:
++        lsw.arm(conn)  # no ``tasks`` table: the install fails quietly
++        assert lsw.flush(conn) == []
++    finally:
++        conn.close()
+-- 
+2.43.0
+
