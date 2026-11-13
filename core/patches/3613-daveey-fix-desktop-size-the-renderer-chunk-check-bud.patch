@@ -1,0 +1,147 @@
+From 4b0a4b6f86ee932beb23a0053c6de666da6fc647 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:18:31 -0800
+Subject: [PATCH] [daveey] fix(desktop): size the renderer chunk check budget
+ for a throttled background build
+
+The renderer chunk syntax check had a fixed 300 s spawnSync budget. On daveey-mini
+the unattended Desktop prebuild of 764f1731c5 (2026-11-13 02:22-03:11) overran it:
+`could not run node to syntax-check the renderer chunks: spawnSync .../node ETIMEDOUT`,
+failing a bundle vite had built cleanly and putting the target on a 2 h cooldown.
+
+Problem: prebuild 764f1731c5 failed at the chunk check after vite finished (build.log:191335).
+Why 1: the one-process checker did not finish in 300 s, so spawnSync killed it (ETIMEDOUT).
+Why 2: that build ran under heavy contention: its tailwind transform alone took 619 s
+  in that attempt, against ~7 s in a quiet build (560c849c28, 06:01).
+Why 3: hermes-sync starts the prebuild at macOS background QoS (`taskpolicy -b`,
+  `_spawn_detached(background=True)`), so its CPU and I/O yield to all other work, and the
+  check inherits that. Measured on the same 986-chunk dist: 8.5 s once, then 36-40 s while
+  the mini sat at load 13-54 (0.6 s CPU, the rest waiting).
+Why 4: the 300 s budget was sized on an idle box (the checker's own note: ~80 s for the
+  old per-chunk spawns, idle) and treats a slow check as a stalled one.
+Root (happened): a fixed wall-clock budget that a working-but-throttled check can overrun.
+  A false harness failure costs a full rebuild plus a 2 h cooldown; a real stall only
+  costs the wait.
+Root (not caught): no test exercises a slow-but-working node; the existing renderer
+  syntax tests use an idle node only.
+Recurrence: same failure class as 2026-09-27 (Windows per-chunk spawn ETIMEDOUT), whose
+  fix (one process, 94c15c7b70) kept a fixed budget. Why the unwanted pack ran at all is
+  fixed separately in hermes-sync (peer_prebuild_superseded, state branch).
+
+Countermeasures:
+- root: the default budget is 30 min (DEFAULT_CHUNK_CHECK_TIMEOUT_MS), overridable with
+  HERMES_CHUNK_CHECK_TIMEOUT_MS; an overrun names the budget it hit.
+- detection: tests-js/renderer-syntax-timeout.test.mjs runs the check through a node that
+  starts 1.5 s late: it passes within its budget and is a `harness` failure (never
+  `bundle`) only when it overruns. Both tests failed before this change and pass after.
+
+Card: t_01a1d49b645d7969
+---
+ apps/desktop/scripts/assert-dist-built.mjs | 21 +++++++++-
+ tests-js/renderer-syntax-timeout.test.mjs  | 47 ++++++++++++++++++++++
+ 2 files changed, 66 insertions(+), 2 deletions(-)
+ create mode 100644 tests-js/renderer-syntax-timeout.test.mjs
+
+diff --git a/apps/desktop/scripts/assert-dist-built.mjs b/apps/desktop/scripts/assert-dist-built.mjs
+index 746e03ca27..cc75795d73 100644
+--- a/apps/desktop/scripts/assert-dist-built.mjs
++++ b/apps/desktop/scripts/assert-dist-built.mjs
+@@ -95,6 +95,19 @@ export function checkDistBuilt(distDir) {
+   return { ok: true }
+ }
+ 
++// How long the one-process chunk check may run before it counts as stalled. The budget is for a
++// throttled box, not an idle one: the unattended Desktop prebuild runs at macOS background QoS
++// (taskpolicy -b), where CPU and I/O yield to everything else. A check that takes 8 s idle took
++// 35-40 s on a loaded mini and overran the old fixed 300 s during a contended build (daveey-mini
++// 2026-11-13, 764f1731c5: ETIMEDOUT failed a bundle vite had built cleanly, then a 2 h cooldown).
++// A false failure costs a whole rebuild; a real stall only costs this wait, so err long.
++export const DEFAULT_CHUNK_CHECK_TIMEOUT_MS = 30 * 60_000
++
++export function chunkCheckTimeoutMs(env = process.env) {
++  const raw = Number(env.HERMES_CHUNK_CHECK_TIMEOUT_MS)
++  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_CHUNK_CHECK_TIMEOUT_MS
++}
++
+ // Renderer chunks are emitted as ESM (`<script type="module">` in index.html).
+ // A silent bundler failure can emit syntactically invalid chunks that parse fine
+ // as CJS-ish text but throw on module evaluation in Electron — the app then
+@@ -111,16 +124,20 @@ export function checkDistBuilt(distDir) {
+ function verifyChunksParse(assetsDir) {
+   const nodeBin = process.env.NODE || process.execPath || "node"
+   const checker = join(import.meta.dirname, "check-chunks-parse.mjs")
++  const timeoutMs = chunkCheckTimeoutMs()
+   const probe = spawnSync(nodeBin, ["--experimental-vm-modules", checker, assetsDir], {
+     encoding: "utf8",
+     maxBuffer: 64 * 1024 * 1024,
+-    timeout: 300_000,
++    timeout: timeoutMs,
+   })
+   if (probe.error) {
++    const overran = probe.error.code === "ETIMEDOUT"
++      ? ` (did not finish within ${timeoutMs / 1000} s; HERMES_CHUNK_CHECK_TIMEOUT_MS sets the budget)`
++      : ""
+     return {
+       ok: false,
+       kind: "harness",
+-      error: `could not run node to syntax-check the renderer chunks: ${probe.error.message}`,
++      error: `could not run node to syntax-check the renderer chunks: ${probe.error.message}${overran}`,
+     }
+   }
+ 
+diff --git a/tests-js/renderer-syntax-timeout.test.mjs b/tests-js/renderer-syntax-timeout.test.mjs
+new file mode 100644
+index 0000000000..64c2c5fa5c
+--- /dev/null
++++ b/tests-js/renderer-syntax-timeout.test.mjs
+@@ -0,0 +1,47 @@
++// The renderer chunk check must tolerate a slow-but-working node: the unattended Desktop prebuild runs
++// at macOS background QoS (taskpolicy -b), and on a contended host a check that takes 8 s idle took
++// longer than its old fixed 300 s budget (daveey-mini 2026-11-13, prebuild 764f1731c5: spawnSync
++// ETIMEDOUT failed a bundle vite had built cleanly). Only a stalled check may fail it.
++import { execFileSync } from 'node:child_process'
++import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { describe, expect, test } from 'vitest'
++
++const checker = new URL('../apps/desktop/scripts/assert-dist-built.mjs', import.meta.url).href
++
++describe('renderer chunk check budget', () => {
++  test('defaults to a budget sized for a throttled background build, not an idle box', async () => {
++    const { chunkCheckTimeoutMs } = await import(checker)
++    expect(chunkCheckTimeoutMs({})).toBeGreaterThanOrEqual(20 * 60_000)
++    expect(chunkCheckTimeoutMs({ HERMES_CHUNK_CHECK_TIMEOUT_MS: '5000' })).toBe(5000)
++    for (const bad of ['', '0', '-1', 'soon', 'NaN']) {
++      expect(chunkCheckTimeoutMs({ HERMES_CHUNK_CHECK_TIMEOUT_MS: bad })).toBe(chunkCheckTimeoutMs({}))
++    }
++  })
++
++  test.skipIf(process.platform === 'win32')('a slow node passes within the budget; only overrunning it is a harness failure', () => {
++    const root = mkdtempSync(join(tmpdir(), 'renderer-check-budget-'))
++    try {
++      mkdirSync(join(root, 'assets'))
++      writeFileSync(join(root, 'index.html'), '<!doctype html>')
++      writeFileSync(join(root, 'assets', 'index-fixture.js'), 'export const value = 1')
++      // A node that takes ~1.5 s to start, like one starved of CPU and I/O.
++      const slowNode = join(root, 'slow-node')
++      writeFileSync(slowNode, `#!/bin/sh\nsleep 1.5\nexec ${JSON.stringify(process.execPath)} "$@"\n`)
++      chmodSync(slowNode, 0o755)
++      const check = (budgetMs) => JSON.parse(execFileSync(process.execPath, [
++        '--input-type=module', '-e',
++        `import { checkDistBuilt } from ${JSON.stringify(checker)}; console.log(JSON.stringify(checkDistBuilt(process.argv[1])))`,
++        root,
++      ], { env: { ...process.env, NODE: slowNode, HERMES_CHUNK_CHECK_TIMEOUT_MS: String(budgetMs) }, encoding: 'utf8' }))
++
++      expect(check(30_000)).toEqual({ ok: true })
++      const overrun = check(300)
++      expect(overrun).toMatchObject({ ok: false, kind: 'harness' })
++      expect(overrun.error).toContain('did not finish within 0.3 s')
++    } finally {
++      rmSync(root, { recursive: true, force: true })
++    }
++  }, 120_000)
++})
+-- 
+2.43.0
+

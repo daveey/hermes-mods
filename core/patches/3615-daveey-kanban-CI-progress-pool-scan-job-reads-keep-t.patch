@@ -1,0 +1,107 @@
+From 03fab0b2f88a15392e2a24266d21fd2407d839e0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 15:00:02 +0000
+Subject: [PATCH] [daveey] kanban CI progress: pool-scan job reads keep the
+ bound home on their reader threads (#2321 review)
+
+The parallel batch() submitted _gh_api to fresh ThreadPoolExecutor threads, which do not inherit the
+caller's context-local home, so dispatcher_gh_argv read the launch home's gh_command_prefix (another
+home's credential; if unreadable the scan returned '' and the card woke not_starting). Each read now runs
+in contextvars.copy_context(). The 60 s scan cache is keyed by home too, so one home's answer never
+serves another's cards.
+
+Test: test_pool_scan_reads_use_the_bound_home_on_its_reader_threads binds another home and records
+get_hermes_home() inside every job read: red on ff087d1622 (reads saw the launch home), green here;
+tests/hermes_cli/test_kanban_ci_progress.py 70 passed, 0 skipped.
+---
+ hermes_cli/kanban_ci_progress.py            | 12 ++++++---
+ tests/hermes_cli/test_kanban_ci_progress.py | 28 +++++++++++++++++++++
+ 2 files changed, 36 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_ci_progress.py b/hermes_cli/kanban_ci_progress.py
+index b79a56ed63..f543b98fbf 100644
+--- a/hermes_cli/kanban_ci_progress.py
++++ b/hermes_cli/kanban_ci_progress.py
+@@ -54,6 +54,7 @@ on a pool thread with the dispatching home rebound, so each board reads its own
+ from __future__ import annotations
+ 
+ import calendar
++import contextvars
+ import json
+ import logging
+ import re
+@@ -332,8 +333,10 @@ def _recent_job_on(repo: str, labels: list[str], jobs: list, now: float, deadlin
+         run order; when none matched, the first read's error is raised."""
+         if deadline is not None and time.monotonic() >= deadline:
+             raise OverBudget(f"sweep budget spent before {paths[0].split('?', 1)[0]} was read")
++        # Each read runs in a copy of this thread's context: a fresh pool thread would lose the bound home, and
++        # ``dispatcher_gh_argv`` would read the launch home's gh_command_prefix (another home's credential).
+         with ThreadPoolExecutor(max_workers=len(paths), thread_name_prefix="ci-pool-scan") as ex:
+-            futures = [ex.submit(_gh_api, p) for p in paths]
++            futures = [ex.submit(contextvars.copy_context().run, _gh_api, p) for p in paths]
+         error: Optional[BaseException] = None
+         for fut in futures:
+             exc = fut.exception()
+@@ -348,7 +351,8 @@ def _recent_job_on(repo: str, labels: list[str], jobs: list, now: float, deadlin
+     found = took(jobs)
+     if found:
+         return found
+-    key = (repo.lower(), frozenset(want))
++    from hermes_constants import get_hermes_home
++    key = (str(get_hermes_home()), repo.lower(), frozenset(want))  # by home too: its credential did the reads
+     seen = _POOL_SCANS.get(key)
+     if seen is not None and time.monotonic() - seen[0] < POOL_SCAN_TTL_SECONDS:
+         return seen[1]
+@@ -424,8 +428,8 @@ _LOCK = threading.Lock()
+ _LAST_CHECK: dict[tuple[str, str], float] = {}   # (db, task id) -> monotonic time of its last read; live waits only
+ _LAST_SWEEP: dict[str, float] = {}               # db -> monotonic time its last sweep started
+ _SWEEPS: dict[str, Future] = {}
+-# (repo, labels) -> (monotonic time, answer) of the last repo-wide scan for a job on those labels
+-_POOL_SCANS: dict[tuple[str, frozenset], tuple[float, str]] = {}
++# (home, repo, labels) -> (monotonic time, answer) of the last repo-wide scan for a job on those labels
++_POOL_SCANS: dict[tuple[str, str, frozenset], tuple[float, str]] = {}
+ # (home, board db) -> monotonic time of the last disabled-check WARNING. Keyed like ``_LAST_CHECK`` (and by home,
+ # whose gh_command_prefix the read used) so one home's warning never hides another's in a multi-home process.
+ _WARNED_AT: dict[tuple[str, str], float] = {}
+diff --git a/tests/hermes_cli/test_kanban_ci_progress.py b/tests/hermes_cli/test_kanban_ci_progress.py
+index 9b015b750f..abbac45975 100644
+--- a/tests/hermes_cli/test_kanban_ci_progress.py
++++ b/tests/hermes_cli/test_kanban_ci_progress.py
+@@ -1130,6 +1130,34 @@ def test_unreadable_runners_find_the_pools_running_job_past_the_first_runs(kanba
+     assert fake_gh.calls("status=completed") == 0
+ 
+ 
++def test_pool_scan_reads_use_the_bound_home_on_its_reader_threads(kanban_home, fake_gh, tmp_path,
++                                                                   monkeypatch) -> None:
++    """PR #2321 review: the parallel job reads ran on fresh pool threads that lost the bound board home, so
++    ``dispatcher_gh_argv`` read the launch home's gh_command_prefix. Every read must see the bound home, and the
++    scan's answer is kept per home."""
++    from agent.runtime_scope import bind_profile_scope
++    from hermes_constants import get_hermes_home
++
++    other = tmp_path / "other-home"
++    other.mkdir()
++    fake_gh.serve(age=20 * 60)
++    fake_gh.runs("in_progress", *[(700 + i, 30, []) for i in range(3)])
++    seen: list[tuple[str, str]] = []
++    real = kcp._gh_api
++
++    def recording(path: str) -> dict:
++        seen.append((path.split("?", 1)[0], str(get_hermes_home())))
++        return real(path)
++
++    monkeypatch.setattr(kcp, "_gh_api", recording)
++    with bind_profile_scope(other, hydrate_secrets=False):
++        p = kcp.ci_run_progress(RUN_URL, fetch_runners=lambda *_a, **_k: None)
++    assert p.state == kcp.NOT_STARTING, p
++    job_reads = [home for path, home in seen if "/runs/70" in path and path.endswith("/jobs")]
++    assert len(job_reads) == 3 and set(job_reads) == {str(other)}, seen
++    assert {key[0] for key in kcp._POOL_SCANS} == {str(other)}, kcp._POOL_SCANS
++
++
+ def test_unreadable_runners_with_a_long_running_job_on_the_labels_is_busy(kanban_home, fake_gh) -> None:
+     """A job the pool's runner started 40 min ago and is still running: the pool is alive, just slow."""
+     fake_gh.serve(age=20 * 60)
+-- 
+2.43.0
+

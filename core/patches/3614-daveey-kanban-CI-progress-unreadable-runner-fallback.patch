@@ -1,0 +1,365 @@
+From 84f8cd9d250645b60e94afc89baf92d2678b5631 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 14:22:53 +0000
+Subject: [PATCH] [daveey] kanban CI progress: unreadable-runner fallback scans
+ every in-progress run for the pool's job (#2235 post-merge)
+
+Found by post-merge check t_01a1d525bf173713 of PR #2235 (card t_01a1d52e85d1d757).
+
+Defect: with both runner lists unreadable, `_recent_job_on` read the jobs of only
+the first RECENT_RUNS_MAX=4 runs of `actions/runs?status=in_progress&per_page=10`.
+On 2026-11-13 ~13:50 example-org/hermes had 23 in-progress runs, and
+the one whose job held the only hermes-state runner (run 43436108829, `CI`, job on
+mini-hermes-state-1) was 21st. Queued run 43434396722 (`hermes-sync macOS (real
+codesign)`, labels self-hosted,macOS,hermes-state, queued 1035 s) read
+`not_starting` with `fetch_runners=lambda _r: None`: the wake + runners-offline
+assertion #2235 exists to prevent.
+
+Why a deeper scan, not a filter: GitHub has no jobs-by-label query, the run list
+order says nothing about which run holds a runner, and the holding run was of
+another workflow than the queued one, so a same-workflow filter would also have
+missed it. So:
+
+- every in-progress run (one list call, per_page=100, up to IN_PROGRESS_RUNS_MAX=40)
+  has its jobs read, then up to RECENT_RUNS_MAX=4 recently completed runs as before;
+  the queued run itself is skipped (its jobs were already checked);
+- the job lists are read POOL_SCAN_READERS=6 at a time: each read is a broker vend
+  plus a gh call (~3 s measured on a worker), so 23 sequential reads would eat most
+  of the 90 s sweep budget; the deadline is checked before every list read and every
+  batch, so OverBudget/deferred behaviour is unchanged;
+- one scan's answer is kept POOL_SCAN_TTL_SECONDS (60 s) per (repo, labels), so
+  cards waiting on the same pool share it; an unreadable list or job read is not
+  remembered (no evidence either way), and a read error in one run does not hide a
+  match in another.
+
+Live (read-only, same worker, same minute): base `_recent_job_on` for
+self-hosted,macOS,hermes-state -> '' (10 calls, 29 s); fixed -> 'runner
+mini-hermes-state-1 took job 131929660032' (23 calls, 19 s). Full no-match scan for
+self-hosted,ci-fast: 24 calls, 23 s.
+
+Tests (tests/hermes_cli/test_kanban_ci_progress.py), each proven red on its mutant:
+- pool's running job in the 21st of 26 in-progress runs -> busy (red on base and
+  with IN_PROGRESS_RUNS_MAX=4);
+- M1 (`elif` -> `if` on the fallback): both runner lists read, only runner offline,
+  a running job on the labels -> still not_starting, no run list read;
+- M4 (drop `in_progress or`): an in-progress job started 40 min ago -> busy;
+- the shared scan: second card reads no run list; expiry rescans; the queued run is
+  not read twice;
+- budget cut mid-scan -> deferred, nothing remembered; unreadable run list not
+  remembered; one 502 job list with/without a match elsewhere; the six reads of a
+  batch are in flight together (barrier; red with POOL_SCAN_READERS=1).
+---
+ hermes_cli/kanban_ci_progress.py            |  76 +++++++---
+ tests/hermes_cli/test_kanban_ci_progress.py | 145 +++++++++++++++++++-
+ 2 files changed, 199 insertions(+), 22 deletions(-)
+
+diff --git a/hermes_cli/kanban_ci_progress.py b/hermes_cli/kanban_ci_progress.py
+index 39e304e613..b79a56ed63 100644
+--- a/hermes_cli/kanban_ci_progress.py
++++ b/hermes_cli/kanban_ci_progress.py
+@@ -21,10 +21,10 @@ list is read first and decides alone when it has an online match. The lists coun
+ fails (listing runners needs admin scope; a repo served only by org runners and a token without org admin show a
+ readable but empty repo list) and no online runner matched. A self-hosted job is then still ``busy`` when a job
+ asking for the same labels is running or a runner took it within ``QUEUED_LIMIT_SECONDS`` (this run's jobs, then
+-recent runs of the repo): 2026-11-13, run 43423320884 waited 15 min behind ~10 min jobs on the one-runner
+-``hermes-state`` pool, which was online and busy, and the card owning an approved PR was woken behind
+-``runners-offline.hermes-state``. With no such job the run stays ``not_starting`` and every message says only that
+-no runner picked it up; a message says no online runner has the labels only when both lists were read.
++every in-progress run and the recently completed runs of the repo): 2026-11-13, run 43423320884 waited 15 min behind
++~10 min jobs on the one-runner ``hermes-state`` pool, which was online and busy, and the card owning an approved PR
++was woken behind ``runners-offline.hermes-state``. With no such job the run stays ``not_starting`` and every message
++says only that no runner picked it up; a message says no online runner has the labels only when both lists were read.
+ 
+ * Park time (:func:`confirm`, called by ``kanban_awaiting.confirm_remote`` before the write txn): a ``kind=ci``
+   park on such a run is refused with ``ci_run_unstartable`` naming the labels.
+@@ -61,7 +61,7 @@ import sqlite3
+ import subprocess
+ import threading
+ import time
+-from concurrent.futures import Future
++from concurrent.futures import Future, ThreadPoolExecutor
+ from dataclasses import dataclass, field
+ from typing import Callable, Optional
+ 
+@@ -78,7 +78,10 @@ NO_CREDENTIAL_WARN_SECONDS = 60 * 60
+ SWEEP_EVERY_SECONDS = 60
+ MAX_CARDS_PER_SWEEP = 6
+ SWEEP_BUDGET_SECONDS = 90
+-RECENT_RUNS_MAX = 4  # runs per status whose jobs the unreadable-runner-list fallback reads
++RECENT_RUNS_MAX = 4  # completed runs whose jobs the unreadable-runner-list fallback reads
++IN_PROGRESS_RUNS_MAX = 40  # in-progress runs whose jobs it reads (all of them on a normal day: 23 on 2026-11-13)
++POOL_SCAN_READERS = 6  # those job lists read at once: each read is a broker vend + gh call, ~3 s on the hub
++POOL_SCAN_TTL_SECONDS = SWEEP_EVERY_SECONDS  # how long one repo-wide scan answers for the same repo and labels
+ BLOCKER_PREFIX = "runners-offline"
+ AUTHOR = "kanban-dispatcher"
+ 
+@@ -281,7 +284,7 @@ def ci_run_progress(ref: str, *, hint: str = "", fetch: Optional[Fetch] = None,
+             return Progress(NOT_STARTING, repo, run_id, labels, age, runners_readable=True, idle_runner=idle)
+     elif "self-hosted" in {x.lower() for x in labels}:
+         try:
+-            took = _recent_job_on(repo, labels, (data or {}).get("jobs") or [], now, deadline)
++            took = _recent_job_on(repo, labels, (data or {}).get("jobs") or [], now, deadline, run_id=run_id)
+         except OverBudget as exc:
+             return Progress("unknown", repo, run_id, labels, age, detail=str(exc), deferred=True)
+         if took:
+@@ -292,11 +295,19 @@ def ci_run_progress(ref: str, *, hint: str = "", fetch: Optional[Fetch] = None,
+     return Progress(NOT_STARTING, repo, run_id, labels, age, runners_readable=runners is not None)
+ 
+ 
+-def _recent_job_on(repo: str, labels: list[str], jobs: list, now: float, deadline: Optional[float]) -> str:
++def _recent_job_on(repo: str, labels: list[str], jobs: list, now: float, deadline: Optional[float], *,
++                   run_id: str = "") -> str:
+     """With the runner lists unreadable: a job asking for exactly ``labels`` that a runner is running, or took
+-    within ``QUEUED_LIMIT_SECONDS``, shows the pool alive. This run's jobs first, then the jobs of up to
+-    ``RECENT_RUNS_MAX`` in-progress or recently updated runs of the repo. "" when none or unreadable; raises
+-    :class:`OverBudget` when ``deadline`` passed before a read."""
++    within ``QUEUED_LIMIT_SECONDS``, shows the pool alive. This run's jobs first, then the jobs of every
++    in-progress run of the repo (up to ``IN_PROGRESS_RUNS_MAX``), then of up to ``RECENT_RUNS_MAX`` recently
++    completed runs. "" when none or unreadable; raises :class:`OverBudget` when ``deadline`` passed before a read.
++
++    GitHub has no jobs-by-label query, and the run list's order says nothing about which run holds the pool's
++    runner: on 2026-11-13 the run holding the one ``hermes-state`` runner was 21st of 23 in-progress runs (and of
++    another workflow than the queued run), so a 4-run window answered ``not_starting`` for a busy pool. Every
++    in-progress run is read instead (``POOL_SCAN_READERS`` at a time), stopping at the first batch with a match. The
++    answer for a repo and label set is kept ``POOL_SCAN_TTL_SECONDS``, so cards waiting on the same pool in one sweep
++    share one scan."""
+     want = {x.lower() for x in labels}
+     cutoff = now - QUEUED_LIMIT_SECONDS
+ 
+@@ -316,23 +327,50 @@ def _recent_job_on(repo: str, labels: list[str], jobs: list, now: float, deadlin
+             raise OverBudget(f"sweep budget spent before {path.split('?', 1)[0]} was read")
+         return _gh_api(path) or {}
+ 
++    def batch(paths: list[str]) -> str:
++        """Jobs of several runs at once (each read is a broker vend plus a GitHub call, ~3 s): the first match in
++        run order; when none matched, the first read's error is raised."""
++        if deadline is not None and time.monotonic() >= deadline:
++            raise OverBudget(f"sweep budget spent before {paths[0].split('?', 1)[0]} was read")
++        with ThreadPoolExecutor(max_workers=len(paths), thread_name_prefix="ci-pool-scan") as ex:
++            futures = [ex.submit(_gh_api, p) for p in paths]
++        error: Optional[BaseException] = None
++        for fut in futures:
++            exc = fut.exception()
++            if exc is not None:
++                error = error or exc
++            elif hit := took((fut.result() or {}).get("jobs") or []):
++                return hit
++        if error is not None:
++            raise error
++        return ""
++
+     found = took(jobs)
++    if found:
++        return found
++    key = (repo.lower(), frozenset(want))
++    seen = _POOL_SCANS.get(key)
++    if seen is not None and time.monotonic() - seen[0] < POOL_SCAN_TTL_SECONDS:
++        return seen[1]
++    lists = (("in_progress", 100, IN_PROGRESS_RUNS_MAX), ("completed", 10, RECENT_RUNS_MAX))
+     try:
+-        runs: list = []
+-        for status in ("in_progress", "completed"):
++        for status, per_page, limit in lists:
+             if found:
+                 break
+-            runs = [r for r in read(f"repos/{repo}/actions/runs?status={status}&per_page=10").get("workflow_runs")
+-                    or [] if isinstance(r, dict) and r.get("id")
+-                    and (status == "in_progress" or (_epoch(r.get("updated_at")) or 0) >= cutoff)]
+-            for run in runs[:RECENT_RUNS_MAX]:
+-                found = took(read(f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100").get("jobs") or [])
++            listed = read(f"repos/{repo}/actions/runs?status={status}&per_page={per_page}").get("workflow_runs")
++            runs = [r for r in listed or [] if isinstance(r, dict) and r.get("id") and str(r["id"]) != str(run_id)
++                    and (status == "in_progress" or (_epoch(r.get("updated_at")) or 0) >= cutoff)][:limit]
++            paths = [f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100" for run in runs]
++            for i in range(0, len(paths), POOL_SCAN_READERS):
++                found = batch(paths[i:i + POOL_SCAN_READERS])
+                 if found:
+                     break
+     except OverBudget:
+         raise
+     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+         logger.debug("ci run progress: recent runs of %s unreadable: %s", repo, exc)
++        return found  # an unread list is no evidence either way: not remembered
++    _POOL_SCANS[key] = (time.monotonic(), found)
+     return found
+ 
+ 
+@@ -386,6 +424,8 @@ _LOCK = threading.Lock()
+ _LAST_CHECK: dict[tuple[str, str], float] = {}   # (db, task id) -> monotonic time of its last read; live waits only
+ _LAST_SWEEP: dict[str, float] = {}               # db -> monotonic time its last sweep started
+ _SWEEPS: dict[str, Future] = {}
++# (repo, labels) -> (monotonic time, answer) of the last repo-wide scan for a job on those labels
++_POOL_SCANS: dict[tuple[str, frozenset], tuple[float, str]] = {}
+ # (home, board db) -> monotonic time of the last disabled-check WARNING. Keyed like ``_LAST_CHECK`` (and by home,
+ # whose gh_command_prefix the read used) so one home's warning never hides another's in a multi-home process.
+ _WARNED_AT: dict[tuple[str, str], float] = {}
+diff --git a/tests/hermes_cli/test_kanban_ci_progress.py b/tests/hermes_cli/test_kanban_ci_progress.py
+index f8eb4c6bf2..9b015b750f 100644
+--- a/tests/hermes_cli/test_kanban_ci_progress.py
++++ b/tests/hermes_cli/test_kanban_ci_progress.py
+@@ -47,7 +47,7 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+     kb.init_db()
+     yield home
+     kwc._shutdown_for_tests()
+-    for state in (kcp._LAST_CHECK, kcp._LAST_SWEEP, kcp._SWEEPS):
++    for state in (kcp._LAST_CHECK, kcp._LAST_SWEEP, kcp._SWEEPS, kcp._POOL_SCANS):
+         state.clear()
+ 
+ 
+@@ -104,9 +104,17 @@ def fake_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+ 
+         def recent(self, status: str, run_id: int, *, updated_age: int, jobs: list[dict]) -> None:
+             """One recent run of the repo with ``status`` (as the run list shows it) and its jobs."""
+-            (tmp_path / f"runs-{status}.json").write_text(json.dumps({"total_count": 1, "workflow_runs": [{
+-                "id": run_id, "status": status, "updated_at": _iso(updated_age)}]}))
+-            (tmp_path / f"jobs-{run_id}.json").write_text(json.dumps({"total_count": len(jobs), "jobs": jobs}))
++            self.runs(status, (run_id, updated_age, jobs))
++
++        def runs(self, status: str, *runs: tuple[int, int, list[dict] | None]) -> None:
++            """The repo's run list for ``status``, newest first: ``(run id, updated age, jobs)`` each."""
++            (tmp_path / f"runs-{status}.json").write_text(json.dumps({"total_count": len(runs), "workflow_runs": [
++                {"id": run_id, "status": status, "updated_at": _iso(age)} for run_id, age, _jobs in runs]}))
++            for run_id, _age, run_jobs in runs:
++                if run_jobs is None:  # served from jobs.json (the queued run itself)
++                    continue
++                (tmp_path / f"jobs-{run_id}.json").write_text(json.dumps({"total_count": len(run_jobs),
++                                                                          "jobs": run_jobs}))
+ 
+         def calls(self, what: str = "") -> int:
+             lines = calls.read_text().splitlines() if calls.exists() else []
+@@ -1103,3 +1111,132 @@ def test_github_hosted_labels_read_no_recent_runs(kanban_home, fake_gh) -> None:
+     p = kcp.ci_run_progress(RUN_URL, fetch=lambda _repo, _run: queued)
+     assert p.state == kcp.NOT_STARTING, p
+     assert fake_gh.calls("actions/runs?") == 0
++
++
++def test_unreadable_runners_find_the_pools_running_job_past_the_first_runs(kanban_home, fake_gh) -> None:
++    """2026-11-13 ~13:50: 23 in-progress runs, and the one holding the only ``hermes-state`` runner was 21st (of
++    another workflow than the queued run). A 4-run window answered ``not_starting`` for a busy pool."""
++    fake_gh.serve(age=20 * 60)
++    busy_elsewhere = [_taken(run_id=600 + i, started_age=3 * 60, status="in_progress", labels=("self-hosted", "x"))
++                      for i in range(20)]
++    fake_gh.runs("in_progress", *[(600 + i, 30, [job]) for i, job in enumerate(busy_elsewhere)],
++                 (620, 30, [_taken(run_id=620, started_age=3 * 60, status="in_progress")]),
++                 *[(621 + i, 30, []) for i in range(4)])
++    p = kcp.ci_run_progress(RUN_URL)
++    assert p.state == kcp.BUSY and "took job 6200" in p.detail, p
++    assert fake_gh.calls("actions/runs?status=in_progress") == 1
++    assert fake_gh.calls("/runs/623/jobs") == 1  # read with the match, in its batch of POOL_SCAN_READERS
++    assert fake_gh.calls("/runs/624/jobs") == 0  # stops after the batch with the match
++    assert fake_gh.calls("status=completed") == 0
++
++
++def test_unreadable_runners_with_a_long_running_job_on_the_labels_is_busy(kanban_home, fake_gh) -> None:
++    """A job the pool's runner started 40 min ago and is still running: the pool is alive, just slow."""
++    fake_gh.serve(age=20 * 60)
++    fake_gh.recent("in_progress", 558, updated_age=60, jobs=[_taken(run_id=558, started_age=40 * 60,
++                                                                     status="in_progress")])
++    p = kcp.ci_run_progress(RUN_URL)
++    assert p.state == kcp.BUSY and "took job 5580" in p.detail, p
++
++
++def test_readable_runner_list_with_only_an_offline_runner_ignores_recent_jobs(kanban_home, fake_gh) -> None:
++    """Readable runner lists decide alone: the only runner for the labels is offline, so a job it ran minutes ago (or
++    is said to be running) does not make the pool ``busy``."""
++    fake_gh.serve(age=20 * 60)
++    fake_gh.runners(_runner(status="offline"))
++    fake_gh.runners(org=True)  # both lists read: they decide alone
++    fake_gh.recent("in_progress", 559, updated_age=60, jobs=[_taken(run_id=559, started_age=3 * 60,
++                                                                     status="in_progress")])
++    p = kcp.ci_run_progress(RUN_URL)
++    assert p.state == kcp.NOT_STARTING and p.runners_readable, p
++    assert fake_gh.calls("actions/runs?") == 0
++
++
++def test_one_repo_scan_answers_every_card_on_the_same_pool_for_a_minute(kanban_home, fake_gh, monkeypatch) -> None:
++    fake_gh.serve(age=20 * 60)
++    fake_gh.runs("in_progress", (int(RUN), 30, None), (701, 30, []), (702, 30, []))
++    first = kcp.ci_run_progress(RUN_URL)
++    assert first.state == kcp.NOT_STARTING, first
++    assert fake_gh.calls(f"/runs/{RUN}/jobs") == 1  # the queued run itself is not read twice
++    assert fake_gh.calls("/runs/701/jobs") == 1 and fake_gh.calls("status=completed") == 1
++    assert kcp.ci_run_progress(RUN_URL).state == kcp.NOT_STARTING
++    assert fake_gh.calls("actions/runs?") == 2 and fake_gh.calls("/runs/701/jobs") == 1  # remembered
++    fake_gh.runs("in_progress", (701, 30, [_taken(run_id=701, started_age=60, status="in_progress")]))
++    monkeypatch.setattr(kcp, "POOL_SCAN_TTL_SECONDS", 0)
++    assert kcp.ci_run_progress(RUN_URL).state == kcp.BUSY  # expired: scanned again
++
++
++def test_repo_scan_cut_by_the_budget_is_deferred_and_not_remembered(kanban_home, monkeypatch) -> None:
++    clock = _Clock(60)
++    queued = {"jobs": [{"id": 1, "status": "queued", "runner_name": None, "created_at": _iso(20 * 60),
++                        "labels": LABELS}]}
++
++    def api(path: str) -> dict:
++        clock.now += clock.step
++        if "actions/runs?" in path:
++            return {"workflow_runs": [{"id": 800 + i, "status": "in_progress"} for i in range(5)]}
++        return {"jobs": []}
++
++    monkeypatch.setattr(kcp, "time", clock)
++    monkeypatch.setattr(kcp, "_gh_api", api)
++    p = kcp.ci_run_progress(RUN_URL, fetch=lambda *_: queued, fetch_runners=lambda _r: None,
++                            deadline=clock.now + 150)
++    assert p.state == "unknown" and p.deferred, p
++    assert kcp._POOL_SCANS == {}
++
++
++def test_unreadable_run_list_is_not_remembered(kanban_home, monkeypatch) -> None:
++    """A 502 on the run list is no evidence the pool is idle: the next card on the pool reads it again."""
++    queued = {"jobs": [{"id": 1, "status": "queued", "runner_name": None, "created_at": _iso(20 * 60),
++                        "labels": LABELS}]}
++
++    def api(path: str) -> dict:
++        raise RuntimeError("gh api exit 1: HTTP 502")
++
++    monkeypatch.setattr(kcp, "_gh_api", api)
++    p = kcp.ci_run_progress(RUN_URL, fetch=lambda *_: queued, fetch_runners=lambda _r: None)
++    assert p.state == kcp.NOT_STARTING, p
++    assert kcp._POOL_SCANS == {}
++
++
++def _scan_api(monkeypatch, runs: int, jobs_for) -> None:
++    """Fake ``_gh_api`` for a repo scan: ``runs`` in-progress runs (ids 900..), each run's jobs from ``jobs_for``."""
++    def api(path: str) -> dict:
++        if "actions/runs?" in path:
++            if "status=completed" in path:
++                return {"workflow_runs": []}
++            return {"workflow_runs": [{"id": 900 + i, "status": "in_progress"} for i in range(runs)]}
++        return {"jobs": jobs_for(int(path.split("/runs/", 1)[1].split("/", 1)[0]))}
++
++    monkeypatch.setattr(kcp, "_gh_api", api)
++
++
++_QUEUED = {"jobs": [{"id": 1, "status": "queued", "runner_name": None, "created_at": _iso(20 * 60), "labels": LABELS}]}
++
++
++def test_job_lists_of_a_scan_are_read_concurrently(kanban_home, monkeypatch) -> None:
++    """Each read is a broker vend plus a GitHub call (~3 s on the hub): 23 runs one by one ate most of the 90 s
++    sweep budget. The six reads of a batch must all be in flight together to pass the barrier."""
++    barrier = threading.Barrier(kcp.POOL_SCAN_READERS, timeout=10)
++
++    def jobs_for(run_id: int) -> list:
++        barrier.wait()
++        return [_taken(run_id=run_id, started_age=60, status="in_progress")] if run_id == 905 else []
++
++    _scan_api(monkeypatch, kcp.POOL_SCAN_READERS, jobs_for)
++    p = kcp.ci_run_progress(RUN_URL, fetch=lambda *_: _QUEUED, fetch_runners=lambda _r: None)
++    assert p.state == kcp.BUSY and "took job 9050" in p.detail, p
++
++
++@pytest.mark.parametrize("match,state", [(True, kcp.BUSY), (False, kcp.NOT_STARTING)], ids=["match", "no-match"])
++def test_one_unreadable_job_list_in_a_scan(kanban_home, monkeypatch, match, state) -> None:
++    """A 502 on one run's jobs does not hide a match in another; with no match the scan is not remembered."""
++    def jobs_for(run_id: int) -> list:
++        if run_id == 901:
++            raise RuntimeError("gh api exit 1: HTTP 502")
++        return [_taken(run_id=run_id, started_age=60, status="in_progress")] if match and run_id == 903 else []
++
++    _scan_api(monkeypatch, 4, jobs_for)
++    p = kcp.ci_run_progress(RUN_URL, fetch=lambda *_: _QUEUED, fetch_runners=lambda _r: None)
++    assert p.state == state, p
++    assert bool(kcp._POOL_SCANS) is match
+-- 
+2.43.0
+

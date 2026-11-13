@@ -1,0 +1,342 @@
+From 6b5f425f43009f91eabd7d24511c8fffa535753a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:27:31 +0000
+Subject: [PATCH] [daveey] workspace_source PR-2 (wip): publish tests; secret
+ scan forces redaction
+
+---
+ hermes_cli/kanban_source_publish.py           |   3 +-
+ .../hermes_cli/test_kanban_source_publish.py  | 307 ++++++++++++++++++
+ 2 files changed, 309 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_kanban_source_publish.py
+
+diff --git a/hermes_cli/kanban_source_publish.py b/hermes_cli/kanban_source_publish.py
+index 3333af214c..27f8c63406 100644
+--- a/hermes_cli/kanban_source_publish.py
++++ b/hermes_cli/kanban_source_publish.py
+@@ -153,7 +153,8 @@ def prove_origin(path: str, cfg: Settings, *, lookup: Optional[Callable[[str], d
+ 
+ def _secret_in(text: str) -> bool:
+     from agent.redact import redact_sensitive_text
+-    return bool(text.strip()) and redact_sensitive_text(text) != text
++    # force: the publish gate never honours ``security.redact_secrets: false`` (that only governs display).
++    return bool(text.strip()) and redact_sensitive_text(text, force=True) != text
+ 
+ 
+ def secret_scan(deadline: _Deadline, path: str, base: str, head: str) -> None:
+diff --git a/tests/hermes_cli/test_kanban_source_publish.py b/tests/hermes_cli/test_kanban_source_publish.py
+new file mode 100644
+index 0000000000..65f3057239
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_source_publish.py
+@@ -0,0 +1,307 @@
++"""workspace_source core PR-2: the ending preflight and publish (plan v2 §4 steps 1-8, v3 §2/§9, v4 S3/S6) with real
++git: a bare origin standing in for GitHub ``acme/widget`` and per-home registered clones (fixtures shared with the
++PR-1 resolver tests). The Board is :class:`FakeSourceBoard`; the GitHub identity lookup is the resolver tests' double.
++"""
++
++from __future__ import annotations
++
++import json
++import shutil
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_source_board as kbs
++from hermes_cli import kanban_source_preflight as pre
++from hermes_cli import kanban_source_publish as pub
++from hermes_cli import kanban_workspace_source as kws
++from tests.hermes_cli import kanban_source_support as fake
++from tests.hermes_cli.test_kanban_source_resolver import commit, git, use_home, world  # noqa: F401  (fixture)
++
++SECRET = "sk-" + "A1b2C3d4E5f6G7h8J9k0"
++
++
++class Card:
++    """A running, attached card on one home: its worktree ``wt/<id>`` in the home's registered clone."""
++
++    def __init__(self, world, home: str, board: fake.FakeSourceBoard, *, branch: str | None = None):
++        self.world, self.board = world, board
++        self.conn, self.cfg = use_home(world, home)
++        fake.install(board)
++        sync.set_mode(self.conn, "primary")
++        self.id = kb.create_task(self.conn, title="src card", assignee="worker")
++        with kbc.write_txn(self.conn):
++            self.conn.execute("UPDATE tasks SET workspace_kind='worktree' WHERE id=?", (self.id,))
++        clone = world.homes[home].clone
++        self.branch = branch or f"wt/{self.id}"
++        self.path = clone / ".worktrees" / self.id
++        git(clone, "fetch", "-q", "origin")
++        git(clone, "worktree", "add", "-q", "-b", self.branch, str(self.path), "origin/main")
++        assert kb.claim_task(self.conn, self.id, ttl_seconds=900, claimer=f"{kb._host_prefix()}:1")
++        self.run_id = kb.get_task(self.conn, self.id).current_run_id
++        self.run_uid = sync.run_uid(self.conn, self.run_id)
++        kbs.record_run(self.conn, kbs.AttachedRun(
++            run_id=self.run_id, task_id=self.id, run_uid=self.run_uid, mode="legacy_adopt", manifest_revision=0,
++            branch=self.branch, path=str(self.path), pre_head=git(self.path, "rev-parse", "HEAD"), manifest=None,
++            state="attached"))
++
++    def run(self):
++        return kbs.attached_run(self.conn, self.run_id)
++
++    def receipt(self, **kw) -> dict:
++        return pre.compute_receipt(self.conn, self.id, self.run(), **kw)
++
++    def remote(self) -> str | None:
++        out = git(self.world.origin, "for-each-ref", "--format=%(objectname)", f"refs/heads/{self.branch}")
++        return out or None
++
++
++@pytest.fixture
++def board():
++    b = fake.FakeSourceBoard()
++    yield b
++    kbs.reset_board_lacks_source()
++
++
++@pytest.fixture
++def card(world, board):
++    return Card(world, "hub", board)
++
++
++# --- happy path + S3 -----------------------------------------------------------------------------------------------
++
++def test_publish_pushes_and_records_manifest(card, board):
++    head = commit(card.path, "feature.txt", "work")
++    receipt = card.receipt()
++    assert (receipt["state"], receipt["commit"], receipt["manifest_revision"]) == ("published", head, 1)
++    assert card.remote() == head
++    sent = board.body("publish_source")
++    assert sent["expected_revision"] == 0 and sent["run_uid"] == card.run_uid
++    m = sent["manifest"]
++    assert (m["branch"], m["commit"], m["repository"]["id"], m["manifest_revision"]) == (
++        f"refs/heads/{card.branch}", head, 42, 1)
++    assert m["published_by"] == {"run_uid": card.run_uid, "machine": sync._state(card.conn)["gateway_id"]}
++    kws.parse_manifest(json.dumps(m))  # the Board would accept its shape
++    assert "renew" in board.actions()  # the lease fence ran before the push
++
++
++def test_unchanged_sends_no_publish(card, board):
++    commit(card.path, "feature.txt", "work")
++    first = card.receipt()
++    board.calls.clear()
++    again = card.receipt()
++    assert again == {"run_uid": card.run_uid, "state": "unchanged", "manifest_revision": 1, "commit": first["commit"]}
++    assert "publish_source" not in board.actions() and "renew" not in board.actions()
++
++
++def test_publish_disabled_on_park_is_retained(card, board, monkeypatch):
++    commit(card.path, "feature.txt", "work")
++    assert card.receipt(publish=False)["reason"] == "publish_disabled"
++    assert card.remote() is None
++
++
++# --- refusals: retained, nothing pushed --------------------------------------------------------------------------
++
++def _refused(card, code):
++    receipt = card.receipt()
++    assert receipt["state"] == "retained", receipt
++    assert receipt["reason"] == f"publish_error={code}", receipt
++    assert card.remote() is None
++    assert "publish_source" not in card.board.actions()
++    ev = card.conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='workspace_source_publish_refused'",
++                           (card.id,)).fetchone()
++    assert json.loads(ev[0])["code"] == code
++
++
++def test_dirty_worktree_refused(card):
++    commit(card.path, "feature.txt", "work")
++    (card.path / "scratch.txt").write_text("untracked")
++    _refused(card, "dirty_source")
++
++
++def test_ignored_private_file_refused(card):
++    (card.path / ".gitignore").write_text("secrets/\n__pycache__/\n")
++    commit(card.path, ".gitignore", "secrets/\n__pycache__/\n")
++    (card.path / "__pycache__").mkdir()
++    (card.path / "__pycache__" / "x.pyc").write_text("cache")  # allowlisted cache: fine
++    (card.path / "secrets").mkdir()
++    (card.path / "secrets" / "token").write_text("private")
++    _refused(card, "ignored_private_files")
++
++
++def test_secret_added_then_removed_across_two_commits_refused(card):
++    commit(card.path, "config.py", f"KEY = '{SECRET}'\n")
++    commit(card.path, "config.py", "KEY = None\n")
++    _refused(card, "secret_scan_refused")
++
++
++def test_secret_in_commit_message_refused(card):
++    (card.path / "a.txt").write_text("a")
++    git(card.path, "add", "a.txt")
++    git(card.path, "commit", "-q", "-m", f"oops {SECRET}")
++    _refused(card, "secret_scan_refused")
++
++
++def test_denylisted_rename_refused(card):
++    commit(card.path, "notes.txt", "plain")
++    git(card.path, "mv", "notes.txt", ".env.production")
++    git(card.path, "commit", "-q", "-m", "rename")
++    _refused(card, "secret_scan_refused")
++
++
++def test_secret_scan_ignores_display_redaction_setting(card, monkeypatch):
++    """``security.redact_secrets: false`` disables display masking, never the publish gate."""
++    import agent.redact as redact
++    real = redact.redact_sensitive_text
++    monkeypatch.setattr(redact, "redact_sensitive_text",
++                        lambda text, *, force=False, **kw: real(text, force=force, **kw) if force else text)
++    commit(card.path, "config.py", f"KEY = '{SECRET}'\n")
++    _refused(card, "secret_scan_refused")
++
++
++def test_lfs_and_submodules_refused(card):
++    commit(card.path, ".gitattributes", "*.bin filter=lfs diff=lfs merge=lfs -text\n")
++    _refused(card, "source_lfs_unsupported")
++
++
++def test_foreign_branch_refused(world, board):
++    c = Card(world, "hub", board, branch="feature/shared")
++    commit(c.path, "x.txt")
++    _refused(c, "source_branch_foreign")
++
++
++def test_protected_branch_refused(world, board):
++    c = Card(world, "hub", board, branch="release/1.0")
++    commit(c.path, "x.txt")
++    _refused(c, "source_branch_protected")
++
++
++def test_remote_diverged_refused(card, world):
++    commit(card.path, "mine.txt")
++    other = world.tmp / "other"
++    subprocess.run(["git", "clone", "-q", str(world.origin), str(other)], check=True, capture_output=True)
++    git(other, "checkout", "-q", "-b", card.branch)
++    commit(other, "theirs.txt")
++    git(other, "push", "-q", "origin", card.branch)
++    receipt = card.receipt()
++    assert receipt["reason"] == "publish_error=remote_diverged"
++    assert "publish_source" not in card.board.actions()
++
++
++def test_lease_lost_before_push_refused(card, board):
++    commit(card.path, "x.txt")
++    board.renew_mode = "deny"
++    _refused(card, "publish_lease_lost")
++
++
++def test_publish_source_refused_is_retained_after_push(card, board):
++    """Lease lost between push and publish_source: the branch moved by a fenced ff push, the receipt is retained."""
++    head = commit(card.path, "x.txt")
++    board.refuse["publish_source"] = "lease_lost"
++    receipt = card.receipt()
++    assert receipt["state"] == "retained" and receipt["reason"] == "publish_error=publish_source:lease_lost"
++    assert card.remote() == head
++
++
++def test_preflight_own_timeout_is_retained(card, monkeypatch):
++    commit(card.path, "x.txt")
++    card.cfg.__class__  # frozen dataclass: build a copy with a zero budget
++    cfg = kws.Settings(**{**card.cfg.__dict__, "preflight_timeout_s": 0.0})
++    monkeypatch.setattr(kws, "settings", lambda config=None: cfg)
++    receipt = card.receipt()
++    assert receipt["state"] == "retained" and receipt["reason"] == "publish_error=preflight_timeout"
++    assert card.remote() is None
++
++
++def test_preflight_never_raises(card, monkeypatch):
++    monkeypatch.setattr(pub, "publish", lambda *a, **kw: 1 / 0)
++    commit(card.path, "x.txt")
++    assert card.receipt()["reason"] == "preflight_error=ZeroDivisionError"
++
++
++def test_rejected_push_classified(card, monkeypatch):
++    commit(card.path, "x.txt")
++    hook = card.world.origin / "hooks" / "pre-receive"
++    hook.write_text("#!/bin/sh\necho 'rejected by policy' >&2\nexit 1\n")
++    hook.chmod(0o755)
++    receipt = card.receipt()
++    assert receipt["reason"].startswith("publish_error=push_failed:")
++    assert card.remote() is None
++
++
++# --- endings carry the receipt; the ending always proceeds (S6) ------------------------------------------------------
++
++def _leaving_op(conn, tid, status):
++    from hermes_cli import kanban_sync_client as ksc
++    rows = [dict(r) for r in conn.execute(
++        "SELECT * FROM kanban_sync_outbox WHERE table_name='tasks' AND row_uid=? AND state='pending' ORDER BY rowid",
++        (tid,))]
++    ops = [ksc.translate(ksc._full_row_if_unseen(conn, r), "hlc") for r in rows]
++    return [o for o in ops if o["fields"].get("status") == status]
++
++
++def test_complete_task_publishes_and_carries_published_receipt(card):
++    head = commit(card.path, "x.txt")
++    assert kb.complete_task(card.conn, card.id, result="ok", summary="done", expected_run_id=card.run_id)
++    (op,) = _leaving_op(card.conn, card.id, "done")
++    assert op["fields"]["source_receipt"]["state"] == "published"
++    assert op["fields"]["source_receipt"]["commit"] == head == card.remote()
++
++
++def test_publish_refusal_never_blocks_the_ending(card):
++    commit(card.path, "x.txt")
++    (card.path / "dirty.txt").write_text("x")
++    assert kb.block_task(card.conn, card.id, reason="1) look at it", kind="needs_input", expected_run_id=card.run_id)
++    (op,) = _leaving_op(card.conn, card.id, "blocked")
++    assert op["fields"]["source_receipt"]["state"] == "retained"
++
++
++def test_scheduled_continue_carries_receipt(card):
++    commit(card.path, "x.txt")
++    assert kb.schedule_task(card.conn, card.id, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z", clock_only=True,
++                            expected_run_id=card.run_id)
++    (op,) = _leaving_op(card.conn, card.id, "scheduled")
++    assert op["fields"]["source_receipt"]["state"] == "published"
++
++
++def test_review_handoff_carries_receipt(card):
++    commit(card.path, "x.txt")
++    assert kb.request_review(card.conn, card.id, summary="ready")
++    (op,) = _leaving_op(card.conn, card.id, "review")
++    assert op["fields"]["source_receipt"]["state"] == "published"
++
++
++def test_involuntary_timeout_sends_no_receipt(card):
++    """A reclaim (timeout/crash) cannot publish: no receipt rides it, so custody stays retained with this holder."""
++    commit(card.path, "x.txt")
++    assert kb.reclaim_task(card.conn, card.id, reason="timed out")
++    rows = [json.loads(r[0]) for r in card.conn.execute(
++        "SELECT fields FROM kanban_sync_outbox WHERE table_name='tasks' AND row_uid=?", (card.id,))]
++    assert not any("source_receipt" in r for r in rows)
++    assert card.remote() is None
++
++
++# --- two clones: resume the exact branch + SHA after the original worktree is gone ----------------------------------
++
++def test_two_clone_resume_exact_branch_and_sha_after_worktree_deleted(world, board):
++    from hermes_cli import kanban_source_clones as kcl
++    from hermes_cli import kanban_source_resolver as ksr
++    a = Card(world, "hub", board)
++    head = commit(a.path, "feature.txt", "from hub")
++    assert kb.complete_task(a.conn, a.id, result="ok", summary="done", expected_run_id=a.run_id) is not None
++    published = board.manifest[a.id]
++    git(world.homes["hub"].clone, "worktree", "remove", "--force", str(a.path))
++    assert not a.path.exists()
++    conn_b, cfg_b = use_home(world, "worker-2")
++    snapshot = kws.SourceSnapshot(json.dumps(published), kws.Custody("hub", "published", published["manifest_revision"]))
++    task = type("T", (), {"id": a.id, "workspace_path": None, "branch_name": None})()
++    out = ksr.resolve_source_workspace(conn_b, task, snapshot, me="worker-2", cfg=cfg_b, lookup=kcl.github_repo)
++    assert (out.branch, out.commit) == (a.branch, head)
++    assert git(out.path, "rev-parse", "HEAD") == head
++    assert git(out.path, "symbolic-ref", "--short", "HEAD") == a.branch
++    assert Path(out.path).joinpath("feature.txt").read_text() == "from hub"
++    shutil.rmtree(world.tmp / "other", ignore_errors=True)
+-- 
+2.43.0
+

@@ -1,0 +1,176 @@
+From 0083577434e0356a54d26c924ac860fa47b19372 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 14:54:46 +0000
+Subject: [PATCH] [daveey] fix(desktop): idle-motion-pause re-inserts only
+ after the stale sheet's removal finishes
+
+Follow-up to #2323 (review t_01a1d561494d3af6 non-blocking behaviour nit, card t_01a1d5643fe372b9).
+
+Bug: Blink insertCSS keys come from a per-renderer-process counter (GenerateStyleSheetKey), and the
+idle-motion sheet is the only insertCSS caller on main windows. After a reload into a new renderer
+process while paused (a crash reload) the fresh sheet's key can equal the stale one ("1"). noteLoaded
+sent the new insertCSS before the stale removeInsertedCSS, so the stale removal deleted the fresh sheet
+and that window kept animating for the rest of the idle period (fails safe: never frozen).
+
+Fix: #remove returns a promise that settles when the removal is done; noteLoaded claims the window's
+slot with a key that inserts only after that removal settles, so the 1 s paused tick does not stack a
+second copy meanwhile and the stale key can no longer hit the fresh sheet. Insertion is factored into
+#insert, shared with #applyMissing.
+
+Tests (electron/idle-motion-pause.test.ts): FakeContents.restartRenderer() clears the sheets and restarts
+the key counter. "a reload into a new renderer process while paused keeps the fresh sheet when its key
+repeats the stale one" fails on the #2323 module (expected ['k1-1'], got []) and passes with this fix;
+a second case checks a resume arriving while the re-apply waits still leaves the window unfrozen.
+10/10 pass; tsc (electron project), eslint and prettier clean on both files.
+---
+ .../electron/idle-motion-pause.test.ts        | 50 +++++++++++++++++++
+ apps/desktop/electron/idle-motion-pause.ts    | 40 +++++++++------
+ 2 files changed, 76 insertions(+), 14 deletions(-)
+
+diff --git a/apps/desktop/electron/idle-motion-pause.test.ts b/apps/desktop/electron/idle-motion-pause.test.ts
+index fa8e16d560..9edba30030 100644
+--- a/apps/desktop/electron/idle-motion-pause.test.ts
++++ b/apps/desktop/electron/idle-motion-pause.test.ts
+@@ -37,6 +37,12 @@ class FakeContents implements IdleMotionTarget {
+     return Promise.resolve()
+   }
+ 
++  /** A reload into a new renderer process: its sheets are gone and Blink's per-process key counter starts over. */
++  restartRenderer() {
++    this.inserted.clear()
++    this.#next = 0
++  }
++
+   on(event: string, listener: () => void) {
+     ;(this.listeners[event] ??= []).push(listener)
+ 
+@@ -168,6 +174,50 @@ describe('IdleMotionPause', () => {
+     expect(win.live).toEqual([])
+   })
+ 
++  it('a reload into a new renderer process while paused keeps the fresh sheet when its key repeats the stale one', async () => {
++    // insertCSS keys come from a per-renderer-process counter, so after a crash reload the new sheet's key can equal
++    // the old one; removing the stale key after re-inserting would delete the fresh sheet.
++    const win = new FakeContents(1)
++    const h = harness([win])
++
++    h.setIdle(IDLE_MOTION_PAUSE_AFTER_SECONDS)
++    h.pause.check()
++    await flush()
++    expect([...win.inserted.keys()]).toEqual(['k1-1'])
++
++    win.restartRenderer()
++    h.pause.noteLoaded(win)
++    await flush()
++    expect([...win.inserted.keys()]).toEqual(['k1-1'])
++    expect(win.live).toEqual([IDLE_MOTION_PAUSE_CSS])
++
++    // The 1 s paused tick does not stack a second copy while the re-apply is in flight or after it.
++    h.pause.check()
++    await flush()
++    expect(win.live).toEqual([IDLE_MOTION_PAUSE_CSS])
++
++    h.setIdle(0)
++    h.pause.check()
++    await flush()
++    expect(win.live).toEqual([])
++  })
++
++  it('a resume while a reload re-apply waits on the stale removal still leaves the window unfrozen', async () => {
++    const win = new FakeContents(1)
++    const h = harness([win])
++
++    h.setIdle(IDLE_MOTION_PAUSE_AFTER_SECONDS)
++    h.pause.check()
++    await flush()
++
++    win.restartRenderer()
++    h.pause.noteLoaded(win)
++    h.setIdle(0)
++    h.pause.check() // input arrives before the stale removal and the re-insert settle
++    await flush()
++    expect(win.live).toEqual([])
++  })
++
+   it('skips destroyed windows and survives insertCSS failures', async () => {
+     const gone = new FakeContents(1)
+     gone.destroyed = true
+diff --git a/apps/desktop/electron/idle-motion-pause.ts b/apps/desktop/electron/idle-motion-pause.ts
+index be6acb5301..9cfcd39c4c 100644
+--- a/apps/desktop/electron/idle-motion-pause.ts
++++ b/apps/desktop/electron/idle-motion-pause.ts
+@@ -98,16 +98,23 @@ export class IdleMotionPause {
+     // The old sheet is usually gone with the old page, but the 1 s paused tick can insert into a new window after its
+     // document commits and before did-finish-load; that sheet survives the load. Remove the old key (a no-op when the
+     // page already dropped it) before re-applying, or resume removes only the second copy and the window stays frozen.
++    // Re-insert only once that removal has finished: insertCSS keys come from a per-renderer-process counter, so after
++    // a reload into a new renderer process (a crash reload) the fresh sheet's key can equal the stale one, and a stale
++    // removal landing after the re-insert would delete the fresh sheet.
+     const previous = this.#keys.get(target.id)
+     this.#keys.delete(target.id)
++    const removed = previous ? this.#remove(previous) : undefined
+ 
+-    if (previous) {
+-      this.#remove(previous)
++    if (!this.#paused) {
++      return
+     }
+ 
+-    if (this.#paused) {
+-      this.#applyMissing()
++    if (removed && !target.isDestroyed()) {
++      // Claim the slot now so the 1 s paused tick does not insert a second copy meanwhile.
++      this.#keys.set(target.id, { target, key: removed.then(() => this.#insert(target)) })
+     }
++
++    this.#applyMissing()
+   }
+ 
+   #applyMissing(): void {
+@@ -116,15 +123,19 @@ export class IdleMotionPause {
+         continue
+       }
+ 
+-      let key: Promise<string | null>
++      this.#keys.set(target.id, { target, key: this.#insert(target) })
++    }
++  }
+ 
+-      try {
+-        key = Promise.resolve(target.insertCSS(IDLE_MOTION_PAUSE_CSS)).catch(() => null)
+-      } catch {
+-        key = Promise.resolve(null)
+-      }
++  #insert(target: IdleMotionTarget): Promise<string | null> {
++    if (target.isDestroyed()) {
++      return Promise.resolve(null)
++    }
+ 
+-      this.#keys.set(target.id, { target, key })
++    try {
++      return Promise.resolve(target.insertCSS(IDLE_MOTION_PAUSE_CSS)).catch(() => null)
++    } catch {
++      return Promise.resolve(null)
+     }
+   }
+ 
+@@ -133,12 +144,13 @@ export class IdleMotionPause {
+     this.#keys.clear()
+ 
+     for (const entry of entries) {
+-      this.#remove(entry)
++      void this.#remove(entry)
+     }
+   }
+ 
+-  #remove({ target, key }: { target: IdleMotionTarget; key: Promise<string | null> }): void {
+-    void key.then(value => {
++  /** Remove a sheet once its insertCSS settles; the promise settles (never rejects) when the removal is done. */
++  #remove({ target, key }: { target: IdleMotionTarget; key: Promise<string | null> }): Promise<void> {
++    return key.then(value => {
+       if (value === null || target.isDestroyed()) {
+         return
+       }
+-- 
+2.43.0
+

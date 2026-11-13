@@ -1,0 +1,271 @@
+From 678c9129bb8aa725f7f753ffdfdf38661f1ceb1b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:30:44 +0000
+Subject: [PATCH] [daveey] workspace_source PR-2 (wip): move/CLI tests; push
+ never sets an empty remote refspec
+
+---
+ hermes_cli/kanban_source_publish.py           |   3 +-
+ tests/hermes_cli/test_kanban_source_move.py   | 219 ++++++++++++++++++
+ .../hermes_cli/test_kanban_source_publish.py  |   5 +
+ 3 files changed, 226 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_kanban_source_move.py
+
+diff --git a/hermes_cli/kanban_source_publish.py b/hermes_cli/kanban_source_publish.py
+index 27f8c63406..e6e51dd5d2 100644
+--- a/hermes_cli/kanban_source_publish.py
++++ b/hermes_cli/kanban_source_publish.py
+@@ -233,7 +233,8 @@ def _fetch(deadline: _Deadline, path: str, task_id: str, what: str) -> None:
+ 
+ def _push(deadline: _Deadline, path: str, cfg: Settings, branch: str, head: str, lease: Optional[str]) -> None:
+     url = _git(deadline, path, "ls-remote", "--get-url", "origin").strip()
+-    args = ["-c", "core.hooksPath=/dev/null", "-c", "push.default=nothing", "-c", "remote.origin.push=",
++    # Pushing to the URL (not the remote name) never reads remote.origin.push/pushurl config.
++    args = ["-c", "core.hooksPath=/dev/null", "-c", "push.default=nothing",
+             "push", "--no-verify", "--porcelain", f"--force-with-lease=refs/heads/{branch}:{lease or ''}",
+             url, f"{head}:refs/heads/{branch}"]
+     try:
+diff --git a/tests/hermes_cli/test_kanban_source_move.py b/tests/hermes_cli/test_kanban_source_move.py
+new file mode 100644
+index 0000000000..8bdc9a74f3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_source_move.py
+@@ -0,0 +1,219 @@
++"""workspace_source core PR-2: move / reservation (plan v2 §7), ``--reclaim``, portable capabilities, the CLI claim
++refusal and ``hermes kanban source-release`` (v4.1 R3-a)."""
++
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_source_cli as cli
++from hermes_cli import kanban_source_move as ksm
++from hermes_cli import kanban_workspace_source as kws
++from tests.hermes_cli import kanban_sync_support as support
++
++C1 = "e" * 40
++
++
++def manifest(**over) -> dict:
++    m = {"version": 1, "repository": {"id": 42, "full_name": "acme/widget", "url": "https://github.com/acme/widget"},
++         "branch": "refs/heads/wt/t_m", "commit": C1, "base_commit": None, "published_at": 1,
++         "manifest_revision": 2, "published_by": {"run_uid": "r1", "machine": "hub"}, "source_kind": "task_worktree",
++         "artifacts": []}
++    m.update(over)
++    return m
++
++
++def custody(**over) -> dict:
++    return {"source_holder": "hub", "state": "published", "manifest_revision": 2, **over}
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def conn(kanban_home, monkeypatch):
++    gen = support.synced_conn(kanban_home)
++    c = next(gen)
++    monkeypatch.setattr(kws, "settings", lambda config=None: kws.Settings(
++        enabled=True, requested=True, clones={}, publish_on_park=True, push_timeout_s=30, preflight_timeout_s=60,
++        materialize_timeout_s=None))
++    yield c
++    gen.close()
++
++
++def card(conn, kind="worktree", source=None, cust=None) -> str:
++    tid = kb.create_task(conn, title="m", assignee="worker")
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE kanban_sync_state SET applying=1")
++        conn.execute("UPDATE tasks SET workspace_kind=?, workspace_path='/nowhere', workspace_source=?, "
++                     "workspace_custody=? WHERE id=?", (kind, json.dumps(source) if source else None,
++                                                       json.dumps(cust) if cust else None, tid))
++        conn.execute("UPDATE kanban_sync_state SET applying=0")
++    return tid
++
++
++# --- parked move ------------------------------------------------------------------------------------------------
++
++def test_workspace_bound_cards_never_move(conn):
++    """Re-pinned (v2 §7): dir never moves; a worktree without portable custody does not move either."""
++    assert ksm.parked_refusal(conn, card(conn, "dir"), me="hub")[0] == "workspace_bound"
++    assert ksm.parked_refusal(conn, card(conn, "dir", manifest(), custody()), me="hub")[0] == "workspace_bound"
++    assert ksm.parked_refusal(conn, card(conn), me="hub")[0] == "workspace_source_unpublished"
++
++
++@pytest.mark.parametrize("cust,code", [
++    (None, "workspace_source_not_on_board"),
++    (custody(state="retained"), "custody_retained"),
++    (custody(state="attached"), "custody_retained"),
++    (custody(manifest_revision=1), "custody_retained"),
++])
++def test_parked_move_needs_portable_custody(conn, cust, code):
++    assert ksm.parked_refusal(conn, card(conn, source=manifest(), cust=cust), me="worker-9")[0] == code
++
++
++def test_parked_move_with_portable_custody_allowed_elsewhere(conn):
++    for state in ("published", "unchanged"):
++        assert ksm.parked_refusal(conn, card(conn, source=manifest(), cust=custody(state=state)), me="worker-9") is None
++
++
++def test_parked_move_holder_needs_clean_local_source_at_commit(conn, monkeypatch):
++    tid = card(conn, source=manifest(), cust=custody(source_holder="hub"))
++    monkeypatch.setattr(ksm, "_local_matches", lambda path, commit: False)
++    assert ksm.parked_refusal(conn, tid, me="hub")[0] == "workspace_source_unpublished"
++    monkeypatch.setattr(ksm, "_local_matches", lambda path, commit: commit == C1)
++    assert ksm.parked_refusal(conn, tid, me="hub") is None
++
++
++def test_disabled_host_keeps_worktree_bound(conn, monkeypatch):
++    tid = card(conn, source=manifest(), cust=custody())
++    monkeypatch.setattr(kws, "settings", lambda config=None: kws.Settings(
++        enabled=False, requested=False, clones={}, publish_on_park=True, push_timeout_s=30, preflight_timeout_s=60,
++        materialize_timeout_s=None))
++    assert ksm.parked_refusal(conn, tid, me="hub")[0] == "workspace_bound"
++
++
++def test_move_check_uses_source_gate(conn):
++    from hermes_cli import kanban_move as km
++    sync.set_mode(conn, "primary")
++    tid = card(conn)
++    with pytest.raises(km.MoveRefused) as err:
++        km.check(conn, tid, ["machine:worker-1"], machines={}, me="hub")
++    assert err.value.code == "workspace_source_unpublished"
++
++
++# --- running move: publish, then check --------------------------------------------------------------------------
++
++def test_running_move_publishes_then_checks_fresh_result(conn, monkeypatch):
++    from hermes_cli import kanban_move as km
++    tid = card(conn)  # replica has no manifest yet: only the fresh publish makes it portable
++    seen = {}
++
++    def publish(conn_, task_id):
++        return ({"run_uid": "u", "state": "published", "manifest_revision": 2, "commit": C1},
++                (json.dumps(manifest()), kws.Custody(None, "published", 2)), "")
++
++    def check(conn_, task_id, runs_on, **kw):
++        seen["fresh"] = kw.get("fresh")
++        assert ksm.parked_refusal(conn_, task_id, me="hub", fresh=kw["fresh"]) is None
++        raise km.MoveRefused("stop_here", "checked")
++    monkeypatch.setattr(ksm, "publish_for_move", publish)
++    monkeypatch.setattr(km, "check", check)
++    monkeypatch.setattr("hermes_cli.kanban_hub_admission_placement.gate_move", lambda *a, **kw: None)
++    res = km.move_task(conn, tid, runs_on=["machine:worker-1"], reason="r", checkpoint="c")
++    assert res["reason_code"] == "stop_here" and seen["fresh"][1].state == "published"
++
++
++def test_running_move_publish_failure_keeps_run(conn, monkeypatch):
++    from hermes_cli import kanban_move as km
++    tid = card(conn)
++    monkeypatch.setattr(ksm, "publish_for_move", lambda c, t: (None, None, "dirty_source"))
++    monkeypatch.setattr(km, "check", lambda *a, **kw: pytest.fail("checked without a publish"))
++    monkeypatch.setattr("hermes_cli.kanban_hub_admission_placement.gate_move", lambda *a, **kw: None)
++    assert km.move_task(conn, tid, runs_on=["machine:worker-1"], reason="r", checkpoint="c")["reason_code"] == \
++        "dirty_source"
++
++
++@pytest.mark.parametrize("kind,source", [("worktree", None), ("scratch", manifest())])
++def test_reclaim_refuses_source_cards(conn, monkeypatch, kind, source):
++    from hermes_cli import kanban_move as km
++    monkeypatch.setattr("hermes_cli.kanban_hub_admission_placement.gate_move", lambda *a, **kw: None)
++    tid = card(conn, kind, source)
++    res = km.move_reclaim(conn, tid, runs_on=["machine:worker-1"], reason="r")
++    assert res["reason_code"] == "reclaim_source_unsupported"
++
++
++# --- capabilities -----------------------------------------------------------------------------------------------
++
++def test_portable_worktree_is_not_host_only(conn):
++    from hermes_cli.kanban_capabilities import _required_capabilities
++    portable = {"workspace_kind": "worktree", "workspace_source": json.dumps(manifest()),
++                "workspace_custody": json.dumps(custody())}
++    assert ksm.capability_kind(portable) == "worktree_source"
++    assert "host_repo" not in _required_capabilities([], ksm.capability_kind(portable))
++    assert "host_repo" in _required_capabilities(["host_repo"], ksm.capability_kind(portable))  # explicit stays
++    assert ksm.capability_kind({**portable, "workspace_custody": json.dumps(custody(state="retained"))}) == "worktree"
++    assert ksm.capability_kind({"workspace_kind": "dir"}) == "dir"
++
++
++# --- CLI --------------------------------------------------------------------------------------------------------
++
++def test_cli_claim_custody_card_refused(conn):
++    tid = card(conn, source=manifest(), cust=custody())
++    assert cli.claim_refusal(conn, tid).startswith(cli.CLAIM_REFUSED)
++    assert cli.claim_refusal(conn, card(conn)) is None
++
++
++def test_cli_claim_command_refuses(conn, kanban_home, capsys):
++    from hermes_cli import kanban as kcli
++    tid = card(conn, source=manifest(), cust=custody())
++    assert kcli._cmd_claim(SimpleNamespace(task_id=tid, ttl=60)) != 0
++    assert cli.CLAIM_REFUSED in capsys.readouterr().err
++    assert kb.get_task(conn, tid).status != "running"
++
++
++class _Hub:
++    def __init__(self):
++        self.calls = []
++
++    def leases(self, board, body):
++        self.calls.append(body)
++        return {"status": "applied"}
++
++
++def test_source_release_verifies_remote_head_first(conn):
++    tid = card(conn, source=manifest(), cust=custody(state="retained"))
++    hub = _Hub()
++    res = cli.source_release(conn, tid, "published", by="op", head=lambda url, ref: "f" * 40, hub=hub)
++    assert res["reason_code"] == "remote_drift" and hub.calls == []
++    res = cli.source_release(conn, tid, "published", by="op", head=lambda url, ref: None, hub=hub)
++    assert res["reason_code"] == "remote_branch_missing" and hub.calls == []
++    res = cli.source_release(conn, tid, "published", by="op",
++                             head=lambda url, ref: C1 if ref == "refs/heads/wt/t_m" else None, hub=hub)
++    assert res["ok"]
++    (body,) = hub.calls
++    assert (body["action"], body["task"], body["to_state"], body["expected_revision"], body["by"]) == (
++        "source_release", tid, "published", 2, "op")
++
++
++def test_source_release_refusals(conn):
++    hub = _Hub()
++    assert cli.source_release(conn, card(conn), "published", by="op", hub=hub)["reason_code"] == \
++        "workspace_source_unavailable"
++    assert cli.source_release(conn, "nope", "published", by="op", hub=hub)["reason_code"] == "not_found"
++    assert cli.source_release(conn, "nope", "attached", by="op", hub=hub)["reason_code"] == "invalid"
++
++
++def test_source_release_parser():
++    from hermes_cli.kanban_parser import build_parser
++    import argparse
++    p = argparse.ArgumentParser()
++    build_parser(p.add_subparsers(dest="cmd"))
++    args = p.parse_args(["kanban", "source-release", "t_1", "--to", "unchanged"])
++    assert (args.task_id, args.to) == ("t_1", "unchanged")
+diff --git a/tests/hermes_cli/test_kanban_source_publish.py b/tests/hermes_cli/test_kanban_source_publish.py
+index 65f3057239..71c516fc2c 100644
+--- a/tests/hermes_cli/test_kanban_source_publish.py
++++ b/tests/hermes_cli/test_kanban_source_publish.py
+@@ -42,6 +42,11 @@ class Card:
+         git(clone, "fetch", "-q", "origin")
+         git(clone, "worktree", "add", "-q", "-b", self.branch, str(self.path), "origin/main")
+         assert kb.claim_task(self.conn, self.id, ttl_seconds=900, claimer=f"{kb._host_prefix()}:1")
++        with kbc.write_txn(self.conn):  # the Board has acknowledged the card (the ordinary custody case)
++            self.conn.execute("UPDATE kanban_sync_state SET applying = 1")
++            self.conn.execute("UPDATE tasks SET sync_version = 1 WHERE id = ?", (self.id,))
++            self.conn.execute("UPDATE kanban_sync_state SET applying = 0")
++            self.conn.execute("DELETE FROM kanban_sync_outbox")
+         self.run_id = kb.get_task(self.conn, self.id).current_run_id
+         self.run_uid = sync.run_uid(self.conn, self.run_id)
+         kbs.record_run(self.conn, kbs.AttachedRun(
+-- 
+2.43.0
+

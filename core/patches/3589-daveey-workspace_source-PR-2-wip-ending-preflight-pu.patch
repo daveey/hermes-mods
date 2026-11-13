@@ -1,0 +1,530 @@
+From 64fc2ae9df1a58f266535df320a6895c66e5eb63 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:12:46 +0000
+Subject: [PATCH] =?UTF-8?q?[daveey]=20workspace=5Fsource=20PR-2=20(wip):?=
+ =?UTF-8?q?=20ending=20preflight=20+=20publish=20(v2=20=C2=A74=20steps=201?=
+ =?UTF-8?q?-8,=20S3=20unchanged,=20S6=20retained)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ hermes_cli/kanban_db.py                    |  19 +-
+ hermes_cli/kanban_source_preflight.py      | 118 ++++++++
+ hermes_cli/kanban_source_publish.py        | 311 +++++++++++++++++++++
+ hermes_cli/kanban_workspace_publication.py |  10 +-
+ 4 files changed, 445 insertions(+), 13 deletions(-)
+ create mode 100644 hermes_cli/kanban_source_preflight.py
+ create mode 100644 hermes_cli/kanban_source_publish.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 16241941dc..85b68fc9dd 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -18,7 +18,7 @@ import contextlib
+ import json
+ 
+ from hermes_cli.kanban_published_worktree import publication_scope
+-from hermes_cli.kanban_workspace_publication import publication_guard
++from hermes_cli.kanban_workspace_publication import publication_guard, source_receipt_preflight
+ import os
+ import re
+ import secrets
+@@ -2450,19 +2450,13 @@ class LiveClaimError(ValueError):
+ 
+ 
+ def _claim_is_live(trow) -> bool:
+-    """True when a ``running`` task's claim still protects a run: the worker process
+-    it spawned exists (PID + start-time fingerprint). A claim whose worker is gone,
+-    or a library/CLI claim that never spawned one, has no run to protect. TTL expiry
+-    is deliberately not consulted: ``reclaim_stale_tasks`` extends, not reclaims, the
+-    claim of a live worker, so the process is the liveness authority here too."""
+-    return bool(
+-        trow["status"] == "running"
+-        and trow["claim_lock"] is not None
+-        and trow["worker_pid"]
+-        and _worker_alive(trow["worker_pid"], trow["worker_started_at"])
+-    )
++    """True when a ``running`` task's claim still protects a run: its spawned worker exists (PID + start-time
++    fingerprint). TTL is not consulted: the process is the liveness authority (``reclaim_stale_tasks`` extends it)."""
++    return bool(trow["status"] == "running" and trow["claim_lock"] is not None
++                and trow["worker_pid"] and _worker_alive(trow["worker_pid"], trow["worker_started_at"]))
+ 
+ 
++@source_receipt_preflight  # workspace_source: the ending's receipt (published/unchanged/retained), S6
+ def complete_task(
+     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
+     summary: Optional[str] = None, metadata: Optional[dict] = None,
+@@ -3193,6 +3187,7 @@ def _nonblank_str(value: Any) -> Optional[str]:
+     return value if isinstance(value, str) and value.strip() else None
+ 
+ 
++@source_receipt_preflight
+ def request_changes(
+     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
+ ) -> tuple[bool, Optional[str]]:
+diff --git a/hermes_cli/kanban_source_preflight.py b/hermes_cli/kanban_source_preflight.py
+new file mode 100644
+index 0000000000..838259ef5a
+--- /dev/null
++++ b/hermes_cli/kanban_source_preflight.py
+@@ -0,0 +1,118 @@
++"""workspace_source v1 ending preflight (core PR-2; v3 §2 "Core side", v4 S3/S6, v4.1 A7): compute the
++``source_receipt`` of a voluntary ending BEFORE its write transaction and stage it for ``with_source_receipt``.
++
++``source_receipt_preflight`` wraps ``complete_task``, ``request_changes`` and (through ``publication_guard``)
++``block_task``, ``schedule_task``, ``request_review`` and ``continue_task``. For a run that attached (local
++``kanban_source_runs``):
++
++* clean tree, ``HEAD == manifest.commit`` and ``ls-remote`` agreeing: ``unchanged``, no publish (S3);
++* otherwise publish (v2 §4 steps 1-8) and return ``published`` with the Board's new revision;
++* any refusal, the preflight's own timeout (``preflight_timeout_s``), a disabled feature or anything unreadable:
++  ``retained`` with a reason. The ending always proceeds (S6): only PR1133's ``unpublished_workspace`` refuses one.
++
++Involuntary endings (crash, timeout, kernel goal parks) are not wrapped: they stage nothing, so they send no receipt
++and custody stays with this host (``retained``). The receipt is computed with no SQLite transaction open; in the
++ending's transaction ``with_source_receipt`` only reads it.
++"""
++
++from __future__ import annotations
++
++import logging
++import sqlite3
++from functools import wraps
++from typing import Any, Callable, Optional
++
++from hermes_cli import kanban_source_board as board_calls
++from hermes_cli import kanban_source_receipt as carrier
++
++_log = logging.getLogger(__name__)
++
++
++def _retained(run: board_calls.AttachedRun, reason: str) -> dict:
++    return {"run_uid": run.run_uid, "state": "retained", "manifest_revision": run.manifest_revision,
++            "commit": None, "reason": reason[:200]}
++
++
++def _task(conn: sqlite3.Connection, task_id: str) -> Any:
++    from hermes_cli import kanban_db as kb
++    return kb.get_task(conn, task_id)
++
++
++def compute_receipt(conn: sqlite3.Connection, task_id: str, run: board_calls.AttachedRun, *,
++                    publish: Optional[bool] = None) -> dict:
++    """The receipt for ``run`` ending now. Never raises (anything unexpected is ``retained``)."""
++    from hermes_cli import kanban_source_publish as pub
++    from hermes_cli.kanban_workspace_source import settings
++    cfg = settings()
++    if not cfg.enabled:
++        return _retained(run, "source_disabled")
++    if conn.in_transaction:
++        return _retained(run, "preflight_in_transaction")
++    deadline = pub._Deadline(cfg.preflight_timeout_s)
++    try:
++        manifest = run.manifest
++        seen = pub.observe(deadline, str(run.path or ""), remote=False)
++        if manifest and seen.clean and seen.head == manifest["commit"] and seen.branch and \
++                f"refs/heads/{seen.branch}" == manifest["branch"] and \
++                pub.ls_remote(deadline, str(run.path), seen.branch) == manifest["commit"]:
++            return {"run_uid": run.run_uid, "state": "unchanged", "manifest_revision": int(manifest["manifest_revision"]),
++                    "commit": manifest["commit"]}
++        if not (cfg.publish_on_park if publish is None else publish):
++            return _retained(run, "publish_disabled")
++        from hermes_cli import kanban_db_sync as sync
++        machine = sync._state(conn)["gateway_id"]
++        done = pub.publish(conn, _task(conn, task_id), run, cfg, deadline, machine=machine)
++        board_calls.update_run(conn, run.run_id, manifest=done.manifest, manifest_revision=done.revision)
++        if done.manifest.get("published_by", {}).get("run_uid") != run.run_uid:
++            return {"run_uid": run.run_uid, "state": "unchanged", "manifest_revision": done.revision,
++                    "commit": done.commit}
++        return {"run_uid": run.run_uid, "state": "published", "manifest_revision": done.revision,
++                "commit": done.commit}
++    except pub.PublishRefused as exc:
++        _log.warning("workspace_source: %s not published (%s); custody stays here", task_id, exc)
++        _event(conn, task_id, run, exc.code, exc.detail)
++        return _retained(run, f"publish_error={exc.code}")
++    except Exception as exc:  # health: allow BLE001 -- a preflight must never refuse an ending; fail closed (retained)
++        _log.warning("workspace_source: preflight of %s failed", task_id, exc_info=True)
++        return _retained(run, f"preflight_error={type(exc).__name__}")
++
++
++def _event(conn: sqlite3.Connection, task_id: str, run: board_calls.AttachedRun, code: str, detail: str) -> None:
++    from hermes_cli import kanban_db as kb
++    try:
++        with kb.write_txn(conn):
++            kb._append_event(conn, task_id, "workspace_source_publish_refused",
++                             {"code": code, "detail": detail[:300], "run_uid": run.run_uid}, run_id=run.run_id)
++    except sqlite3.Error:
++        _log.info("workspace_source: could not record the publish refusal of %s", task_id, exc_info=True)
++
++
++def receipt_for_current_run(conn: sqlite3.Connection, task_id: str, *,
++                            publish: Optional[bool] = None) -> tuple[Optional[int], Optional[dict]]:
++    """``(run_id, receipt)`` for the card's running, attached run; ``(run_id, None)`` when it did not attach."""
++    row = conn.execute("SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if row is None or row[0] != "running" or row[1] is None:
++        return None, None
++    run = board_calls.attached_run(conn, row[1])
++    if run is None or run.state != "attached" or board_calls.board_lacks_source():
++        return row[1], None
++    return row[1], compute_receipt(conn, task_id, run, publish=publish)
++
++
++def source_receipt_preflight(fn: Callable) -> Callable:
++    """Stage the ending's receipt for its one status-leaving UPDATE (``with_source_receipt``). Nested endings of the
++    same run (an ending that calls another) reuse the outer receipt; a kernel park stages nothing (involuntary)."""
++    @wraps(fn)
++    def wrapped(conn, task_id, *args, **kwargs):
++        from hermes_cli.kanban_workspace_publication import _kernel_park
++        if _kernel_park.get() == task_id:
++            return fn(conn, task_id, *args, **kwargs)
++        row = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
++        if row is None or row[0] is None or carrier.staged_receipt(task_id, row[0]) is not None:
++            return fn(conn, task_id, *args, **kwargs)
++        _run_id, receipt = receipt_for_current_run(conn, task_id)
++        if receipt is None:
++            return fn(conn, task_id, *args, **kwargs)
++        with carrier.staged(task_id, int(row[0]), receipt):
++            return fn(conn, task_id, *args, **kwargs)
++    return wrapped
+diff --git a/hermes_cli/kanban_source_publish.py b/hermes_cli/kanban_source_publish.py
+new file mode 100644
+index 0000000000..3333af214c
+--- /dev/null
++++ b/hermes_cli/kanban_source_publish.py
+@@ -0,0 +1,311 @@
++"""workspace_source v1 publish (core PR-2; plan v2 §4 steps 1-8, v3 §2, v4 S3/S6): make a task-owned branch on
++GitHub match the card's worktree, then record it on the Board (``/leases publish_source``).
++
++Never stages, commits, resets or forces anything: the push is a hook-free fast-forward guarded by
++``--force-with-lease`` to the URL re-verified right before it. Every refusal raises :class:`PublishRefused` with a
++named code; the caller turns it into a ``retained`` receipt (the ending still proceeds, S6). No secret value is ever
++put into a refusal: a secret-scan hit names the commit, path and line only.
++"""
++
++from __future__ import annotations
++
++import fnmatch
++import re
++import sqlite3
++import subprocess
++import time
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Callable, Optional
++
++from hermes_cli import kanban_source_board as board_calls
++from hermes_cli import kanban_source_clones as clones
++from hermes_cli.kanban_workspace_source import Settings
++
++MAX_SCAN_COMMITS = 500
++MAX_SCAN_BYTES = 20 * 1024 * 1024
++DENYLIST = (".env*", "*.pem", "id_rsa*", "*.p12", "*.key", "credentials*.json")
++# Ignored paths that are build/tool caches, never private data (v2 §4 step 2).
++IGNORED_ALLOWLIST = ("__pycache__", "*.pyc", "*.pyo", ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules",
++                     ".venv", "venv", ".tox", "dist", "build", "*.egg-info", ".DS_Store", ".coverage", "htmlcov",
++                     ".cache", ".next", ".turbo", "target", ".gradle", ".worktrees")
++_PROTECTED = re.compile(r"(main|master|release/.*)")
++
++
++class PublishRefused(Exception):
++    def __init__(self, code: str, detail: str = ""):
++        self.code, self.detail = code, detail
++        super().__init__(f"{code}: {detail}" if detail else code)
++
++
++class _Deadline:
++    """The preflight's own budget (S6): every git call is capped by what is left of it."""
++
++    def __init__(self, seconds: float, clock: Callable[[], float] = time.monotonic):
++        self.clock, self.at = clock, clock() + seconds
++
++    def left(self, cap: float = 60.0) -> float:
++        remaining = self.at - self.clock()
++        if remaining <= 0:
++            raise PublishRefused("preflight_timeout", "the source preflight ran out of time")
++        return min(remaining, cap)
++
++
++def _git(deadline: _Deadline, path: str, *args: str, check: bool = True, cap: float = 60.0) -> str:
++    try:
++        return clones.git(path, *args, timeout=deadline.left(cap), check=check).stdout
++    except TimeoutError as exc:
++        raise PublishRefused("preflight_timeout", str(exc)) from exc
++    except subprocess.CalledProcessError as exc:
++        raise PublishRefused("git_failed", f"git {' '.join(args[:3])}: {(exc.stderr or '').strip()[-200:]}") from exc
++
++
++@dataclass(frozen=True)
++class Observation:
++    head: Optional[str]
++    branch: Optional[str]  # short name of the checked-out branch
++    clean: bool
++    remote: Optional[str]  # ls-remote origin refs/heads/<branch>
++
++
++def ls_remote(deadline: _Deadline, path: str, branch: str) -> Optional[str]:
++    out = _git(deadline, path, "ls-remote", "origin", f"refs/heads/{branch}", cap=clones.LS_REMOTE_TIMEOUT_S * 3)
++    for line in out.splitlines():
++        sha, _, ref = line.partition("\t")
++        if ref == f"refs/heads/{branch}":
++            return sha
++    return None
++
++
++def observe(deadline: _Deadline, path: str, *, remote: bool = True) -> Observation:
++    if not Path(path).is_dir():
++        return Observation(None, None, False, None)
++    head = _git(deadline, path, "rev-parse", "--verify", "-q", "HEAD", check=False).strip() or None
++    branch = _git(deadline, path, "symbolic-ref", "-q", "--short", "HEAD", check=False).strip() or None
++    clean = _git(deadline, path, "status", "--porcelain", "--untracked-files=all") == ""
++    return Observation(head, branch, clean, ls_remote(deadline, path, branch) if remote and branch else None)
++
++
++# --- step 1: branch scope ----------------------------------------------------------------------------------------
++
++def check_branch(task_id: str, branch: Optional[str], *, manifest_branch: Optional[str], branch_name: Optional[str],
++                 default_branch: Optional[str], remote_exists: bool) -> None:
++    if not branch:
++        raise PublishRefused("source_branch_changed", "HEAD is detached; it must be on the task branch")
++    if branch == default_branch or _PROTECTED.fullmatch(branch):
++        raise PublishRefused("source_branch_protected", f"{branch} is a protected branch")
++    if manifest_branch is not None:
++        if f"refs/heads/{branch}" != manifest_branch or (branch_name and branch_name != branch):
++            raise PublishRefused("source_branch_changed",
++                                 f"HEAD is on {branch}; the manifest pins {manifest_branch} (branch_name {branch_name})")
++        return
++    owned = branch == f"wt/{task_id}" or (branch.count("/") == 1 and branch.endswith(f"/{task_id}"))
++    if not owned and (branch_name != branch or remote_exists):
++        raise PublishRefused("source_branch_foreign", f"{branch} is not task-owned (wt/{task_id} or <slug>/{task_id}, "
++                                                      "or the card's own branch_name absent remotely at first publish)")
++
++
++# --- step 2: local state ----------------------------------------------------------------------------------------
++
++def _allowlisted(rel: str) -> bool:
++    parts = rel.rstrip("/").split("/")
++    return any(fnmatch.fnmatch(part, pat) for part in parts for pat in IGNORED_ALLOWLIST)
++
++
++def check_local(deadline: _Deadline, path: str) -> None:
++    if _git(deadline, path, "status", "--porcelain", "--untracked-files=all") != "":
++        raise PublishRefused("dirty_source", "the worktree has uncommitted or untracked files")
++    ignored = [line[3:] for line in _git(deadline, path, "status", "--porcelain", "--ignored=matching",
++                                         "--untracked-files=all").splitlines() if line.startswith("!! ")]
++    private = [rel for rel in ignored if not _allowlisted(rel)]
++    if private:
++        raise PublishRefused("ignored_private_files", f"ignored files outside the cache allowlist: {private[:5]}")
++    if (Path(path) / ".gitmodules").exists():
++        raise PublishRefused("source_submodules_unsupported", ".gitmodules present")
++    for rel in _git(deadline, path, "ls-files", "--", ".gitattributes", "*/.gitattributes").splitlines():
++        try:
++            text = (Path(path) / rel).read_text(encoding="utf-8", errors="replace")
++        except OSError:
++            continue
++        if "filter=lfs" in text:
++            raise PublishRefused("source_lfs_unsupported", f"{rel} routes files through git-lfs")
++
++
++def prove_origin(path: str, cfg: Settings, *, lookup: Optional[Callable[[str], dict]] = None) -> clones.ProvenClone:
++    """The registered clone this worktree belongs to, proven now (§3: GitHub, no rewrites, repository id)."""
++    try:
++        common = Path(clones.git(path, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip())
++    except (subprocess.CalledProcessError, TimeoutError) as exc:
++        raise PublishRefused("source_clone_unregistered", f"{path} is not a git worktree ({exc})") from exc
++    for key, clone_path in sorted(cfg.clones.items()):
++        root = Path(clone_path).expanduser()
++        if (root / ".git").resolve() != common.resolve():
++            continue
++        try:
++            return clones.prove_clone(key, str(root), lookup=lookup)
++        except clones.ProofFailed as exc:
++            code = {"wrong_repo": "source_remote_unsupported"}.get(exc.code, exc.code)
++            raise PublishRefused(code, exc.detail) from exc
++    raise PublishRefused("source_clone_unregistered", f"{path} is not a worktree of a registered clone")
++
++
++# --- step 4: secret scan ----------------------------------------------------------------------------------------
++
++def _secret_in(text: str) -> bool:
++    from agent.redact import redact_sensitive_text
++    return bool(text.strip()) and redact_sensitive_text(text) != text
++
++
++def secret_scan(deadline: _Deadline, path: str, base: str, head: str) -> None:
++    commits = _git(deadline, path, "rev-list", head, f"^{base}").split()
++    if len(commits) > MAX_SCAN_COMMITS:
++        raise PublishRefused("scan_range_too_large", f"{len(commits)} commits > {MAX_SCAN_COMMITS}")
++    total = 0
++    for commit in commits:
++        names = _git(deadline, path, "show", "--format=", "--name-status", "--find-renames", commit)
++        for line in names.splitlines():
++            status, *paths = line.split("\t")
++            if status[:1] in ("A", "R", "C", "M") and paths:
++                target = paths[-1]
++                if any(fnmatch.fnmatch(Path(target).name, pat) for pat in DENYLIST):
++                    raise PublishRefused("secret_scan_refused", f"commit {commit[:12]} adds denylisted path {target}")
++        message = _git(deadline, path, "show", "-s", "--format=%B", commit)
++        if _secret_in(message):
++            raise PublishRefused("secret_scan_refused", f"commit {commit[:12]} message holds a credential")
++        patch = _git(deadline, path, "show", "--format=", "--patch", "--find-renames", "--binary", commit)
++        total += len(patch.encode("utf-8", "replace"))
++        if total > MAX_SCAN_BYTES:
++            raise PublishRefused("scan_range_too_large", f"patches exceed {MAX_SCAN_BYTES} bytes")
++        _scan_patch(commit, patch)
++
++
++def _scan_patch(commit: str, patch: str) -> None:
++    current, line_no = None, 0
++    for raw in patch.splitlines():
++        if raw.startswith("+++ "):
++            current = raw[6:] if raw.startswith("+++ b/") else raw[4:]
++            continue
++        if raw.startswith("@@"):
++            m = re.search(r"\+(\d+)", raw)
++            line_no = int(m.group(1)) - 1 if m else 0
++            continue
++        if raw.startswith("GIT binary patch") and current and any(
++                fnmatch.fnmatch(Path(current).name, pat) for pat in DENYLIST):
++            raise PublishRefused("secret_scan_refused", f"commit {commit[:12]} adds denylisted binary {current}")
++        if raw.startswith("+") and not raw.startswith("+++"):
++            line_no += 1
++            if _secret_in(raw[1:]):
++                raise PublishRefused("secret_scan_refused",
++                                     f"commit {commit[:12]} {current}:{line_no} adds a credential")
++        elif not raw.startswith("-"):
++            line_no += 1
++
++
++# --- the publish --------------------------------------------------------------------------------------------------
++
++@dataclass(frozen=True)
++class Published:
++    manifest: dict
++    commit: str
++    revision: int
++    pushed: bool
++
++
++def _default_branch(deadline: _Deadline, path: str) -> tuple[Optional[str], Optional[str]]:
++    out = _git(deadline, path, "ls-remote", "--symref", "origin", "HEAD", cap=clones.LS_REMOTE_TIMEOUT_S * 3)
++    name = sha = None
++    for line in out.splitlines():
++        if line.startswith("ref: ") and line.endswith("\tHEAD"):
++            name = line[5:-5].removeprefix("refs/heads/")
++        elif line.endswith("\tHEAD"):
++            sha = line.split("\t")[0]
++    return name, sha
++
++
++def _has_commit(deadline: _Deadline, path: str, sha: str) -> bool:
++    return clones.git(path, "cat-file", "-e", f"{sha}^{{commit}}", timeout=deadline.left(), check=False).returncode == 0
++
++
++def _fetch(deadline: _Deadline, path: str, task_id: str, what: str) -> None:
++    _git(deadline, path, "fetch", "--no-tags", "origin", f"+{what}:refs/hermes/source/{task_id}", check=False)
++
++
++def _push(deadline: _Deadline, path: str, cfg: Settings, branch: str, head: str, lease: Optional[str]) -> None:
++    url = _git(deadline, path, "ls-remote", "--get-url", "origin").strip()
++    args = ["-c", "core.hooksPath=/dev/null", "-c", "push.default=nothing", "-c", "remote.origin.push=",
++            "push", "--no-verify", "--porcelain", f"--force-with-lease=refs/heads/{branch}:{lease or ''}",
++            url, f"{head}:refs/heads/{branch}"]
++    try:
++        clones.git(path, *args, timeout=min(cfg.push_timeout_s, deadline.left(cfg.push_timeout_s)))
++    except TimeoutError as exc:
++        raise PublishRefused("push_failed:timeout", str(exc)) from exc
++    except subprocess.CalledProcessError as exc:
++        text = f"{exc.stdout or ''}{exc.stderr or ''}".lower()
++        klass = ("rejected" if "rejected" in text or "stale info" in text else
++                 "auth" if any(w in text for w in ("authentication", "permission", "denied", "403", "401")) else
++                 "other")
++        raise PublishRefused(f"push_failed:{klass}", text.strip()[-200:]) from exc
++
++
++def publish(conn: sqlite3.Connection, task: Any, run: board_calls.AttachedRun, cfg: Settings, deadline: _Deadline,
++            *, lookup: Optional[Callable[[str], dict]] = None, machine: str) -> Published:
++    """Steps 1-8 for an attached run's worktree. Returns the Board's new manifest; raises :class:`PublishRefused`."""
++    path, prior = str(run.path or ""), run.manifest
++    seen = observe(deadline, path, remote=False)
++    if not seen.head or not seen.branch:
++        raise PublishRefused("source_lost", f"{path} is gone or has no branch checked out")
++    clone = prove_origin(path, cfg, lookup=lookup)
++    default_name, default_sha = _default_branch(deadline, path)
++    remote = ls_remote(deadline, path, seen.branch)
++    check_branch(task.id, seen.branch, manifest_branch=(prior or {}).get("branch"),
++                 branch_name=(getattr(task, "branch_name", None) or None), default_branch=default_name,
++                 remote_exists=remote is not None)
++    check_local(deadline, path)
++    if remote is not None and remote != seen.head:
++        if not _has_commit(deadline, path, remote):
++            _fetch(deadline, path, task.id, f"refs/heads/{seen.branch}")
++        merge_base = clones.git(path, "merge-base", "--is-ancestor", remote, seen.head, timeout=deadline.left(),
++                                check=False)
++        if merge_base.returncode != 0:
++            raise PublishRefused("remote_diverged", f"origin {seen.branch} {remote[:12]} is not an ancestor of HEAD")
++    pushed = False
++    if remote != seen.head:
++        base = remote or default_sha
++        if not base:
++            raise PublishRefused("scan_base_missing", "origin has neither the branch nor a default branch")
++        if not _has_commit(deadline, path, base):
++            _fetch(deadline, path, task.id, base if remote is None else f"refs/heads/{seen.branch}")
++            if not _has_commit(deadline, path, base):
++                raise PublishRefused("scan_base_missing", f"scan base {base[:12]} is not available locally")
++        secret_scan(deadline, path, base, seen.head)
++        ttl = max(int(cfg.push_timeout_s + 120), 300)
++        try:
++            left = board_calls.renew_remaining(conn, task.id, run.run_uid, ttl)
++        except board_calls.SourceCallRefused as exc:
++            raise PublishRefused("publish_lease_lost", exc.detail) from exc
++        if left < cfg.push_timeout_s + 60:
++            raise PublishRefused("publish_lease_lost", f"only {left:.0f}s left on the lease")
++        _push(deadline, path, cfg, seen.branch, seen.head, remote)
++        pushed = True
++    after = observe(deadline, path)
++    if after.remote != seen.head or after.head != seen.head or not after.clean or after.branch != seen.branch:
++        raise PublishRefused("publish_reobserve_failed", "the worktree or the remote branch moved during publish")
++    expected = int(prior["manifest_revision"]) if prior else int(run.manifest_revision or 0)
++    if prior and prior.get("commit") == seen.head:
++        return Published(prior, seen.head, expected, pushed)
++    manifest = {
++        "version": 1, "repository": {"id": clone.repository_id, "full_name": clone.full_name,
++                                     "url": f"https://github.com/{clone.full_name}"},
++        "branch": f"refs/heads/{seen.branch}", "commit": seen.head,
++        "base_commit": (prior or {}).get("base_commit") or default_sha, "published_at": int(time.time() * 1000),
++        "manifest_revision": expected + 1, "published_by": {"run_uid": run.run_uid, "machine": machine},
++        "source_kind": "task_worktree", "artifacts": [],
++    }
++    try:
++        board_calls.publish(conn, task.id, run.run_uid, expected_revision=expected, manifest=manifest)
++    except board_calls.SourceCallRefused as exc:
++        raise PublishRefused(exc.code if exc.code == "source_revision_conflict" else f"publish_source:{exc.code}",
++                             exc.detail) from exc
++    except Exception as exc:  # health: allow BLE001 -- an unanswered publish is fail-closed (retained), never retried
++        raise PublishRefused("publish_source:unanswered", str(exc)[:200]) from exc
++    return Published(manifest, seen.head, expected + 1, pushed)
+diff --git a/hermes_cli/kanban_workspace_publication.py b/hermes_cli/kanban_workspace_publication.py
+index f53e8f92a9..e2ae0cb223 100644
+--- a/hermes_cli/kanban_workspace_publication.py
++++ b/hermes_cli/kanban_workspace_publication.py
+@@ -160,7 +160,15 @@ def publication_guard(fn):
+             return fn(conn, task_id, *args, **kwargs)
+         finally:
+             _receipt.reset(token)
+-    return wrapped
++    from hermes_cli.kanban_source_preflight import source_receipt_preflight as preflight
++    return preflight(wrapped)  # workspace_source: stacked outside the guard (v3 §2)
++
++
++def source_receipt_preflight(fn):
++    """The workspace_source ending preflight alone (``complete_task``/``request_changes``, which PR1133 does not
++    guard): see :mod:`hermes_cli.kanban_source_preflight`."""
++    from hermes_cli.kanban_source_preflight import source_receipt_preflight as preflight
++    return preflight(fn)
+ 
+ 
+ def closed_metadata(conn, task_id, run_id, metadata):
+-- 
+2.43.0
+

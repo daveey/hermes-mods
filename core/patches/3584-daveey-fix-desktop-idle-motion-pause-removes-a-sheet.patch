@@ -1,0 +1,169 @@
+From 45a2c7eb6c4f6e3e3d4b3b3dc95628c3d38872d1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 14:34:57 +0000
+Subject: [PATCH] [daveey] fix(desktop): idle-motion-pause removes a sheet that
+ survives did-finish-load
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Follow-up to #2184 (review 5890880028 non-blocking nits, card t_01a1d4dd54b0a3df).
+
+Bug: while the system is idle, check() polls every 1 s and can insertCSS the
+pause sheet into a new window after its document commits but before
+did-finish-load. noteLoaded then dropped that key without removeInsertedCSS
+and inserted a second copy; resume removed only the second, so the window's
+animations stayed frozen until the next reload.
+
+Fix: noteLoaded removes the previous key (once its insertCSS settles; a no-op
+when the reload already dropped the sheet) before re-applying. Removal is
+factored into #remove, shared with #removeAll, and a synchronous throw from
+removeInsertedCSS is swallowed like a rejection.
+
+Docs: the header now says only BrowserWindow top-level webContents are covered
+(preview-pane <webview> guests keep animating), and that an exit animation
+started during idle without input (a timer-driven toast ending on
+animationend) stays frozen until the next input.
+
+Tests (electron/idle-motion-pause.test.ts, +2):
+- a sheet that survives did-finish-load while paused is gone after resume
+- a reload whose first insertCSS is still pending ends with one sheet that
+  resume removes
+RED on main 5ec31da64b: both fail with `expected [ …(2) ] to deeply equal
+[ Array(1) ]`; GREEN with the fix: 8/8 (vitest 4.1.12, node from
+hermes-core-wt env). prettier --check and tsc --strict clean on both files.
+---
+ .../electron/idle-motion-pause.test.ts        | 41 +++++++++++++++++
+ apps/desktop/electron/idle-motion-pause.ts    | 45 ++++++++++++++-----
+ 2 files changed, 75 insertions(+), 11 deletions(-)
+
+diff --git a/apps/desktop/electron/idle-motion-pause.test.ts b/apps/desktop/electron/idle-motion-pause.test.ts
+index abc9fc252a..fa8e16d560 100644
+--- a/apps/desktop/electron/idle-motion-pause.test.ts
++++ b/apps/desktop/electron/idle-motion-pause.test.ts
+@@ -127,6 +127,47 @@ describe('IdleMotionPause', () => {
+     expect(b.live).toEqual([IDLE_MOTION_PAUSE_CSS])
+   })
+ 
++  it('a window whose sheet survives did-finish-load while paused is unfrozen on resume', async () => {
++    // The 1 s paused tick can insert into a new window after its document commits but before did-finish-load,
++    // so that sheet is still live when noteLoaded re-applies.
++    const win = new FakeContents(1)
++    const h = harness([win])
++
++    h.setIdle(IDLE_MOTION_PAUSE_AFTER_SECONDS)
++    h.pause.check()
++    await flush()
++    h.pause.noteLoaded(win)
++    await flush()
++    expect(win.live).toEqual([IDLE_MOTION_PAUSE_CSS])
++
++    h.setIdle(0)
++    h.pause.check()
++    await flush()
++    expect(win.live).toEqual([])
++  })
++
++  it('a reload while paused whose insertCSS is still pending ends with one sheet that resume removes', async () => {
++    const win = new FakeContents(1)
++    let release: (() => void) | undefined
++    const realInsert = win.insertCSS.bind(win)
++    win.insertCSS = css => new Promise(resolve => (release = () => resolve(realInsert(css))))
++    const h = harness([win])
++
++    h.setIdle(IDLE_MOTION_PAUSE_AFTER_SECONDS)
++    h.pause.check()
++    const firstRelease = release!
++    win.insertCSS = realInsert
++    h.pause.noteLoaded(win) // did-finish-load before the first insertCSS settled
++    firstRelease()
++    await flush()
++    expect(win.live).toEqual([IDLE_MOTION_PAUSE_CSS])
++
++    h.setIdle(0)
++    h.pause.check()
++    await flush()
++    expect(win.live).toEqual([])
++  })
++
+   it('skips destroyed windows and survives insertCSS failures', async () => {
+     const gone = new FakeContents(1)
+     gone.destroyed = true
+diff --git a/apps/desktop/electron/idle-motion-pause.ts b/apps/desktop/electron/idle-motion-pause.ts
+index b5ca70b57a..be6acb5301 100644
+--- a/apps/desktop/electron/idle-motion-pause.ts
++++ b/apps/desktop/electron/idle-motion-pause.ts
+@@ -9,9 +9,16 @@
+ // no one is watching. Busy-session spinners do the same overnight.
+ //
+ // While the system has seen no keyboard/mouse input for `pauseAfterSeconds`, this injects one stylesheet into every
+-// window that sets `animation-play-state: paused` on everything; a paused animation needs no frames, so the window
+-// stops repainting. Any input (polled every second while paused) removes it again. Windows that load or reload while
+-// paused get it re-applied. Transitions and JS-driven updates (streamed text) are untouched.
++// BrowserWindow's top-level webContents that sets `animation-play-state: paused` on everything; a paused animation
++// needs no frames, so the window stops repainting. Any input (polled every second while paused) removes it again.
++// Windows that load or reload while paused get it re-applied. Transitions and JS-driven updates (streamed text) are
++// untouched.
++//
++// Limits:
++// - Only BrowserWindow top-level webContents are covered. `<webview>` guests (the preview pane) are separate
++//   webContents that getAllWindows() does not list, so they keep animating.
++// - An exit animation that starts while idle with no input (a timer-driven toast that unmounts on `animationend`)
++//   is paused mid-way and stays on screen, frozen, until the next input resumes it.
+ 
+ export const IDLE_MOTION_PAUSE_AFTER_SECONDS = 300
+ export const IDLE_MOTION_ACTIVE_POLL_MS = 30_000
+@@ -86,10 +93,18 @@ export class IdleMotionPause {
+     return IDLE_MOTION_ACTIVE_POLL_MS
+   }
+ 
+-  /** A window (re)loaded: its old stylesheet is gone with the page, so re-apply while paused. */
++  /** A window (re)loaded: re-apply while paused. */
+   noteLoaded(target: IdleMotionTarget): void {
++    // The old sheet is usually gone with the old page, but the 1 s paused tick can insert into a new window after its
++    // document commits and before did-finish-load; that sheet survives the load. Remove the old key (a no-op when the
++    // page already dropped it) before re-applying, or resume removes only the second copy and the window stays frozen.
++    const previous = this.#keys.get(target.id)
+     this.#keys.delete(target.id)
+ 
++    if (previous) {
++      this.#remove(previous)
++    }
++
+     if (this.#paused) {
+       this.#applyMissing()
+     }
+@@ -117,15 +132,23 @@ export class IdleMotionPause {
+     const entries = [...this.#keys.values()]
+     this.#keys.clear()
+ 
+-    for (const { target, key } of entries) {
+-      void key.then(value => {
+-        if (value === null || target.isDestroyed()) {
+-          return
+-        }
++    for (const entry of entries) {
++      this.#remove(entry)
++    }
++  }
+ 
++  #remove({ target, key }: { target: IdleMotionTarget; key: Promise<string | null> }): void {
++    void key.then(value => {
++      if (value === null || target.isDestroyed()) {
++        return
++      }
++
++      try {
+         return Promise.resolve(target.removeInsertedCSS(value)).catch(() => undefined)
+-      })
+-    }
++      } catch {
++        return undefined
++      }
++    })
+   }
+ }
+ 
+-- 
+2.43.0
+

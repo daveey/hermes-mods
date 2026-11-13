@@ -1,0 +1,110 @@
+From 53579f7eb091429bf065d1d9d16304b149a5bcc8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:38:05 +0000
+Subject: [PATCH] [daveey] kanban: a held card's silent remote probe writes no
+ barrier per sweep
+
+Follow-up to review 5890904892 nit 2 on #2187.
+
+restore_missing_checks' remote-silent branch (probe_host is another
+gateway and has not reported) went straight to _lost_wake -> _wake. For a
+card held terminal by its event log (a stale scheduled row of a done
+card), _wake's skip_wake branch then ran episode.reset, which advances the
+wake-episode barrier (an upsert), so every sweep did one local write until
+the Board feed healed the row. Before #2187 that path only logged the skip
+once.
+
+Fix: call skip_wake(conn, tid, LOST_EVENT, park_event_id=park_id) before
+_lost_wake in that branch, as the local restore branch already does. A held
+card now gets one stale_wake_ignored note and no further writes; a live
+card's silent remote probe still wakes it (test_kanban_wake_check_home).
+The skip_wake import is hoisted to the function top for both branches.
+
+RED->GREEN: tests/hermes_cli/test_kanban_stale_wake_terminal.py::
+test_a_held_card_whose_remote_probe_went_silent_writes_no_barrier_per_sweep
+(held done card, stale scheduled row, park probe_host on another gateway,
+5 sweeps past the silence window). RED on e770862093b: barrier sequence
+5 == 1 fails. GREEN: sequence stays 0, one note, no lost-wake event.
+Suites importing restore_missing_checks plus test_kanban_wake_check:
+99 passed.
+---
+ hermes_cli/kanban_wake_check.py               |  4 ++-
+ .../test_kanban_stale_wake_terminal.py        | 33 +++++++++++++++++++
+ 2 files changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 915675fc55..abdf5f69ff 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -375,6 +375,7 @@ def restore_missing_checks(conn: sqlite3.Connection, *, now: Optional[int] = Non
+     from hermes_cli import kanban_continuation as kc
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli.kanban_terminal_guard import skip_wake
+ 
+     out: dict = {"restored": [], "woken": []}
+     now = int(time.time()) if now is None else int(now)
+@@ -420,6 +421,8 @@ def restore_missing_checks(conn: sqlite3.Connection, *, now: Optional[int] = Non
+             if silent <= ALIVE_EVERY + 2 * every + SILENT_GRACE:
+                 continue
+             with kb.write_txn(conn):
++                if skip_wake(conn, tid, LOST_EVENT, park_event_id=park_id):
++                    continue  # held: _wake's skip would reset the episode barrier on every sweep [daveey]
+                 if _lost_wake(conn, tid, {**base, "reason": "remote_probe_silent", "silent_seconds": silent},
+                               f"Woken: this card's wake_check runs on {host}, the gateway that parked it, and "
+                               f"{host} has not reported that probe for {silent // 60} min, so nothing is watching "
+@@ -432,7 +435,6 @@ def restore_missing_checks(conn: sqlite3.Connection, *, now: Optional[int] = Non
+             st = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+             if st is None or st[0] != "scheduled" or get_state(conn, tid) is not None:
+                 continue
+-            from hermes_cli.kanban_terminal_guard import skip_wake
+             if skip_wake(conn, tid, RESTORED_EVENT, park_event_id=park_id):
+                 continue  # worker-1's six done cards came back through this restore (11-11) [daveey]
+             restored = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ? AND id > ? AND kind = ?",
+diff --git a/tests/hermes_cli/test_kanban_stale_wake_terminal.py b/tests/hermes_cli/test_kanban_stale_wake_terminal.py
+index 261513bb33..9afbe6e295 100644
+--- a/tests/hermes_cli/test_kanban_stale_wake_terminal.py
++++ b/tests/hermes_cli/test_kanban_stale_wake_terminal.py
+@@ -368,6 +368,39 @@ def test_a_probe_dropped_for_a_held_card_comes_back_when_the_hold_lifts(board, r
+         assert _status(board, tid) == "scheduled"
+ 
+ 
++def test_a_held_card_whose_remote_probe_went_silent_writes_no_barrier_per_sweep(board, monkeypatch, tmp_path):
++    """Review of #2187 (nit 2): the remote-silent restore branch reached ``_lost_wake -> _wake`` before any held
++    check, and ``_wake``'s skip branch advances the episode barrier, so every sweep wrote one barrier upsert for a
++    done card whose probe runs on another gateway until the feed healed the row."""
++    tid = _parked(board, wake_check=f"test -f {tmp_path / 'flag'}")
++    _stale_scheduled_copy_of_a_done_card(board, tid)
++    monkeypatch.setattr(kwc, "own_gateway", lambda conn: ME)
++    with kb.write_txn(board):
++        board.execute("DELETE FROM task_wake_checks WHERE task_id = ?", (tid,))
++        marks = ",".join("?" for _ in kc.SCHEDULED_ENTRY_EVENTS)
++        park_id, payload, parked_at = board.execute(
++            f"SELECT id, payload, created_at FROM task_events WHERE task_id = ? AND kind IN ({marks}) "
++            "ORDER BY id DESC LIMIT 1", (tid, *kc.SCHEDULED_ENTRY_EVENTS)).fetchone()
++        board.execute("UPDATE task_events SET payload = ? WHERE id = ?",
++                      (json.dumps({**json.loads(payload), "probe_host": OTHER}), park_id))
++    silent = int(parked_at) + kwc.ALIVE_EVERY + 2 * 300 + kwc.SILENT_GRACE + 5
++
++    def barrier_seq():
++        row = board.execute("SELECT MAX(sequence) FROM task_wake_episode_barriers WHERE task_id = ?",
++                            (tid,)).fetchone()
++        return row[0] or 0
++
++    assert kwc.restore_missing_checks(board, now=silent) == {"restored": [], "woken": []}
++    first = barrier_seq()
++    assert first == 0
++    for i in range(1, 5):
++        assert kwc.restore_missing_checks(board, now=silent + i * 60) == {"restored": [], "woken": []}
++    assert barrier_seq() == first                                      # no barrier write beyond the first sweep
++    assert _status(board, tid) == "scheduled"
++    assert kwc.LOST_EVENT not in _kinds(board, tid)
++    assert len(_ignored(board, tid)) == 1                              # one note, not one per sweep
++
++
+ def test_an_implied_wake_on_a_stale_copy_of_a_completed_card_does_nothing(board):
+     """A ``scheduled`` row with no park event (``_enforce_wake_invariant``'s implied wake)."""
+     tid = kb.create_task(board, title="t", assignee="worker")
+-- 
+2.43.0
+

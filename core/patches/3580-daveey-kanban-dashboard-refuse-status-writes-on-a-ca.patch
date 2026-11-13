@@ -1,0 +1,369 @@
+From 91f57cc77526ccc16e3cadd9eaef27dfddf5a43a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 14:14:31 +0000
+Subject: [PATCH] [daveey] kanban dashboard: refuse status writes on a card
+ under another machine's live Board lease
+
+The dashboard plugin still wrote lifecycle columns on a card another machine runs under its live Board
+lease: PATCH /tasks/{id} status (drag to done/blocked/scheduled/review/ready/todo/triage), POST /tasks/bulk
+status (and assignee with reclaim_first), POST /tasks/{id}/reclaim, POST /runs/{id}/terminate and
+POST /tasks/{id}/reassign. Each committed locally and answered 200; the Board then rejected the status write
+(live_claim) while the unfenced task_runs/task_events rows leaked to it, as the CLI did in t_01a1ccfeab615947.
+
+Now each checks kanban_remote_stop.remote_holder() before any write. With a holder it writes nothing and
+answers 409 with detail {message: kanban_remote_stop.refusal(<verb>, id, holder), holder, rejection:
+live_claim, code: remote_live_lease} (the UI already renders detail.message). Bulk records a per-id
+{ok: false, holder, error} and skips every op for that id; siblings still apply. Archive keeps its
+stop-request route. An expired lease or this gateway's own lease behaves as before.
+
+The helpers live in plugins/kanban/dashboard/plugin_api_remote_lease.py (plugin_api.py sits at its
+2000-line cap); the dashboard _archive helper moved there too. boundary_lint baseline: the four
+kanban_remote_stop imports move from plugin_api.py (2 before) to the new sibling (4): the dashboard must
+call the same core guard the CLI and kanban_* tools use, there is no published plugin API for it.
+
+Proof: tests/hermes_cli/test_kanban_remote_lease_dashboard.py on the two-gateway fixture
+(_running_on_worker) with the whole-DB _snapshot. RED before the fix: 16 failed (every PATCH status,
+bulk status, reclaim/terminate/reassign answered 200 and moved the card); GREEN after: 22 passed, plus the
+56 dashboard/remote-lease test files (957 passed) and scripts/check --base origin/main ok.
+
+Card: t_01a1d4fa7525888e (follow-up of t_01a1d4df5b551228).
+---
+ plugins/kanban/dashboard/plugin_api.py        |  18 +-
+ .../dashboard/plugin_api_remote_lease.py      |  55 ++++++
+ scripts/boundary_lint_baseline.json           |   6 +-
+ .../test_kanban_remote_lease_dashboard.py     | 166 ++++++++++++++++++
+ 4 files changed, 232 insertions(+), 13 deletions(-)
+ create mode 100644 plugins/kanban/dashboard/plugin_api_remote_lease.py
+ create mode 100644 tests/hermes_cli/test_kanban_remote_lease_dashboard.py
+
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index be0c5f0035..da9bb7ecd1 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -46,6 +46,7 @@ from plugins.kanban.dashboard.board_read import (  # BOARD_COLUMNS: the document
+     BOARD_COLUMNS, diagnostic_inputs as _diagnostic_inputs, diagnostics_from_inputs as _diagnostics_from_inputs)
+ from plugins.kanban.dashboard.plugin_api_human_request import ask_filing_refusal, classify_request
+ from plugins.kanban.dashboard.plugin_api_comment_actor import CommentBody, admitted_relay, comment_relay, comment_writer
++from plugins.kanban.dashboard.plugin_api_remote_lease import archive as _archive, lease_refusal, patch_verb, refuse_live_lease
+ from hermes_cli.kanban_db_attachment_names import _collision_free_path, _safe_attachment_name
+ 
+ log = logging.getLogger(__name__)
+@@ -738,17 +739,6 @@ _OVERRIDE_OPS = (
+ )
+ 
+ 
+-def _archive(conn, task_id: str) -> tuple[bool, Optional[str]]:
+-    """Archive, or send a stop request when another machine runs the card under its live Board lease
+-    (``kanban_remote_stop``): ``(ok, holder)``, holder set when the archive is pending there. [daveey]"""
+-    from hermes_cli.kanban_remote_stop import RemoteArchiveRefused, archive
+-    try:
+-        out = archive(conn, task_id)
+-    except RemoteArchiveRefused as exc:
+-        raise _conflict(str(exc)) from exc
+-    return bool(out), (out or {}).get("holder") if (out or {}).get("status") == "archive_pending" else None
+-
+-
+ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_deferred: bool) -> Optional[str]:
+     """PATCH status phase: 400 on a rejected verb, 409 when the transition is refused
+     (naming the blocking parent(s) for ``ready``/``done``/``review`` so the UI renders an actionable toast).
+@@ -814,6 +804,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
+     with _board_conn(board) as (board, conn):
+         _foreign_card_409(conn, task_id)
+         _require_task(conn, task_id)
++        refuse_live_lease(conn, task_id, patch_verb(payload))  # [daveey] another machine's live Board lease
+         if (refusal := ask_filing_refusal(conn, task_id, payload)):
+             raise _conflict(refusal)
+         if payload.metadata_only:
+@@ -961,6 +952,8 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
+     if (refusal := ask_filing_refusal(conn, tid, payload)):
+         entry.update(ok=False, error=refusal)
+         return
++    if (lease := lease_refusal(conn, tid, patch_verb(payload))):  # [daveey] write nothing on this card
++        return entry.update(ok=False, holder=lease["holder"], error=lease["message"])
+     if payload.metadata_only:
+         if not classify_request(conn, tid, payload, actor):
+             entry.update(ok=False, error="classification requires parked card without a current run")
+@@ -1142,6 +1135,7 @@ def terminate_run_endpoint(run_id: int, payload: TerminateRunBody, board: Option
+         r = _require_run(conn, run_id)
+         if r.ended_at is not None:
+             raise _conflict(f"run {run_id} already ended")
++        refuse_live_lease(conn, r.task_id, "reclaim")
+         if not kanban_db.reclaim_task(conn, r.task_id, reason=payload.reason):
+             raise _conflict(f"cannot terminate run {run_id}: task {r.task_id} is no longer in a reclaimable state")
+         return {"ok": True, "run_id": run_id, "task_id": r.task_id}
+@@ -1158,6 +1152,7 @@ def reclaim_task_endpoint(task_id: str, payload: ReclaimBody, board: Optional[st
+     """Release an active worker claim without waiting for the claim TTL
+     (``hermes kanban reclaim <task_id> --reason ...``)."""
+     with _board_conn(board) as (board, conn):
++        refuse_live_lease(conn, task_id, "reclaim")
+         if not kanban_db.reclaim_task(conn, task_id, reason=payload.reason):
+             raise _conflict(f"cannot reclaim {task_id}: not in a claimable state (not running, or unknown id)")
+         return {"ok": True, "task_id": task_id}
+@@ -1189,6 +1184,7 @@ def reassign_task_endpoint(task_id: str, payload: ReassignBody, board: Optional[
+     """Reassign to another profile, optionally reclaiming first
+     (``hermes kanban reassign <task_id> <profile> [--reclaim]``)."""
+     with _board_conn(board) as (board, conn):
++        refuse_live_lease(conn, task_id, "reassign")
+         ok = kanban_db.reassign_task(
+             conn, task_id, payload.profile or None, reclaim_first=bool(payload.reclaim_first), reason=payload.reason)
+         if not ok:
+diff --git a/plugins/kanban/dashboard/plugin_api_remote_lease.py b/plugins/kanban/dashboard/plugin_api_remote_lease.py
+new file mode 100644
+index 0000000000..e0146e19f7
+--- /dev/null
++++ b/plugins/kanban/dashboard/plugin_api_remote_lease.py
+@@ -0,0 +1,55 @@
++"""Dashboard lifecycle writes on a card another machine runs under its live Board lease. [daveey]
++
++The Board fences every lifecycle column of such a card to the lease holder (``live_claim``). A drag to
++done/blocked/ready, a bulk status change or a reclaim from this dashboard used to commit locally and answer 200; the
++Board then rejected the status write while the unfenced task_runs/task_events rows leaked to it. Each is now refused
++before it writes, with the one ``kanban_remote_stop.refusal`` message the CLI verbs and kanban_* tools print.
++Archive is the exception: it sends the holder a stop request (:func:`archive`).
++"""
++from __future__ import annotations
++
++import sqlite3
++from typing import Any, Optional
++
++from fastapi import HTTPException
++
++from hermes_cli.kanban_remote_stop import RemoteArchiveRefused, refusal, remote_holder
++from hermes_cli.kanban_remote_stop import archive as _remote_archive
++
++# Dashboard status -> the verb named in the refusal. ready/todo/triage from ``running`` close the run as reclaimed.
++_STATUS_VERBS = {"done": "complete", "blocked": "block", "scheduled": "schedule", "review": "request review",
++                 "ready": "reclaim", "todo": "reclaim", "triage": "reclaim"}
++
++
++def patch_verb(payload: Any) -> Optional[str]:
++    """The fenced verb a PATCH /tasks/{id} or bulk body asks for, else None (archive, rejected or no status)."""
++    if payload.status is not None and not getattr(payload, "archive", False):
++        return _STATUS_VERBS.get(payload.status)
++    if getattr(payload, "reclaim_first", False) and payload.assignee is not None:
++        return "reassign"
++    return None
++
++
++def lease_refusal(conn: sqlite3.Connection, task_id: str, verb: Optional[str]) -> Optional[dict]:
++    """``{message, holder, rejection, code}`` when ``verb`` would write a card under another machine's live lease."""
++    holder = remote_holder(conn, task_id) if verb else None
++    if holder is None or verb is None:
++        return None
++    return {"message": refusal(verb, task_id, holder), "holder": holder, "rejection": "live_claim",
++            "code": "remote_live_lease"}
++
++
++def refuse_live_lease(conn: sqlite3.Connection, task_id: str, verb: Optional[str]) -> None:
++    """409 before any write when ``verb`` targets a card another machine runs under its live Board lease."""
++    if (detail := lease_refusal(conn, task_id, verb)) is not None:
++        raise HTTPException(status_code=409, detail=detail)
++
++
++def archive(conn: sqlite3.Connection, task_id: str) -> tuple[bool, Optional[str]]:
++    """Archive, or send a stop request when another machine runs the card under its live Board lease
++    (``kanban_remote_stop``): ``(ok, holder)``, holder set when the archive is pending there."""
++    try:
++        out = _remote_archive(conn, task_id)
++    except RemoteArchiveRefused as exc:
++        raise HTTPException(status_code=409, detail=str(exc)) from exc
++    return bool(out), (out or {}).get("holder") if (out or {}).get("status") == "archive_pending" else None
+diff --git a/scripts/boundary_lint_baseline.json b/scripts/boundary_lint_baseline.json
+index 14fd47d3e4..d0432b7412 100644
+--- a/scripts/boundary_lint_baseline.json
++++ b/scripts/boundary_lint_baseline.json
+@@ -206,8 +206,6 @@
+     "plugins/kanban/dashboard/plugin_api.py hermes_cli.kanban_human_request.validate_human_request": 1,
+     "plugins/kanban/dashboard/plugin_api.py hermes_cli.kanban_overlap": 1,
+     "plugins/kanban/dashboard/plugin_api.py hermes_cli.kanban_queue_position": 1,
+-    "plugins/kanban/dashboard/plugin_api.py hermes_cli.kanban_remote_stop.RemoteArchiveRefused": 1,
+-    "plugins/kanban/dashboard/plugin_api.py hermes_cli.kanban_remote_stop.archive": 1,
+     "plugins/kanban/dashboard/plugin_api.py hermes_cli.kanban_review_contract": 1,
+     "plugins/kanban/dashboard/plugin_api.py hermes_cli.kanban_transfer": 2,
+     "plugins/kanban/dashboard/plugin_api.py hermes_cli.kanban_wait_live.owner_proof": 1,
+@@ -232,6 +230,10 @@
+     "plugins/kanban/dashboard/plugin_api_human_request.py hermes_cli.kanban_ask_resolved.idempotent_hit": 1,
+     "plugins/kanban/dashboard/plugin_api_human_request.py hermes_cli.kanban_human_request_migration.classify_parked_request": 1,
+     "plugins/kanban/dashboard/plugin_api_human_request.py hermes_cli.web_server._require_token": 1,
++    "plugins/kanban/dashboard/plugin_api_remote_lease.py hermes_cli.kanban_remote_stop.RemoteArchiveRefused": 1,
++    "plugins/kanban/dashboard/plugin_api_remote_lease.py hermes_cli.kanban_remote_stop.archive": 1,
++    "plugins/kanban/dashboard/plugin_api_remote_lease.py hermes_cli.kanban_remote_stop.refusal": 1,
++    "plugins/kanban/dashboard/plugin_api_remote_lease.py hermes_cli.kanban_remote_stop.remote_holder": 1,
+     "plugins/memory/byterover/__init__.py tools.environments.local.build_subprocess_env": 1,
+     "plugins/memory/byterover/__init__.py tools.environments.local.strip_launch_profile_env": 1,
+     "plugins/model-providers/actual/__init__.py agent.reasoning_effort.ACTUAL_RELAY_EFFORTS": 1,
+diff --git a/tests/hermes_cli/test_kanban_remote_lease_dashboard.py b/tests/hermes_cli/test_kanban_remote_lease_dashboard.py
+new file mode 100644
+index 0000000000..71f42a6e58
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_remote_lease_dashboard.py
+@@ -0,0 +1,166 @@
++"""Dashboard lifecycle writes on a card another machine runs under its live Board lease are refused up front. [daveey]
++
++Before: on the creator (no local claim; the lease is only mirrored as ``lease_holder``/``lease_expires``) a drag to
++done/blocked/ready, a bulk status change or a reclaim committed locally and answered 200; then the Board rejected the
++status write (``live_claim``) while the unfenced task_runs/task_events rows leaked to it, exactly as the CLI did in
++t_01a1ccfeab615947. Now each answers 409 with ``kanban_remote_stop.refusal`` naming the holder and writes nothing,
++like the CLI verbs and kanban_* tools. Archive keeps its stop-request route (test_kanban_remote_archive).
++"""
++
++from __future__ import annotations
++
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli.kanban_remote_stop import refusal
++from tests.hermes_cli.test_kanban_remote_archive import _running_on_worker
++from tests.hermes_cli import test_kanban_remote_lease_status_writes as _sw
++from tests.hermes_cli.test_kanban_worker_node import WORKER
++
++# The two-gateway fixtures: hub creates the card, worker-1 runs it under its Board lease.
++svc, gws, kills, _snapshot, _run_row = _sw.svc, _sw.gws, _sw.kills, _sw._snapshot, _sw._run_row
++API = "/api/plugins/kanban"
++
++
++def _client():
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++    from tests.plugins.test_kanban_dashboard_plugin import _load_plugin_router
++    app = FastAPI()
++    app.include_router(_load_plugin_router(), prefix=API)
++    return TestClient(app)
++
++
++def _remote(gws, svc):
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    hub.enter()
++    return hub, tid
++
++
++def _assert_refused_409(r, conn, tid, before, run_before, verb):
++    assert r.status_code == 409, r.text
++    detail = r.json()["detail"]
++    assert detail["message"] == refusal(verb, tid, WORKER), detail
++    assert detail["holder"] == WORKER and detail["rejection"] == "live_claim", detail
++    assert _snapshot(conn) == before  # tasks, task_runs, task_events, kanban_sync_outbox: untouched
++    assert kb.get_task(conn, tid).status == "running"
++    assert _run_row(conn, tid) == run_before
++
++
++_PATCHES = [
++    ("complete", {"status": "done", "summary": "done elsewhere"}),
++    ("block", {"status": "blocked", "block_reason": "stop", "wake_check": "true", "check_every": 300}),
++    ("schedule", {"status": "scheduled", "block_reason": "later", "clock_only": True}),
++    ("request review", {"status": "review", "summary": "x"}),
++    ("reclaim", {"status": "ready"}),
++    ("reclaim", {"status": "todo"}),
++    ("reclaim", {"status": "triage"}),
++]
++
++
++@pytest.mark.parametrize("verb,body", _PATCHES, ids=[b["status"] for _, b in _PATCHES])
++def test_patch_status_under_a_remote_lease_is_refused_and_writes_nothing(gws, svc, kills, verb, body):
++    hub, tid = _remote(gws, svc)
++    before, run_before = _snapshot(hub.conn), _run_row(hub.conn, tid)
++    r = _client().patch(f"{API}/tasks/{tid}", json=body)
++    _assert_refused_409(r, hub.conn, tid, before, run_before, verb)
++    assert kills == []
++
++
++def test_patch_status_with_an_assignee_writes_neither(gws, svc, kills):
++    hub, tid = _remote(gws, svc)
++    before, run_before = _snapshot(hub.conn), _run_row(hub.conn, tid)
++    r = _client().patch(f"{API}/tasks/{tid}", json={"status": "done", "assignee": "other", "priority": 5})
++    _assert_refused_409(r, hub.conn, tid, before, run_before, "complete")
++    assert kb.get_task(hub.conn, tid).assignee == "default"
++
++
++@pytest.mark.parametrize("body", [{"status": "done"}, {"status": "blocked", "block_reason": "stop",
++                                                       "wake_check": "true", "check_every": 300},
++                                  {"status": "ready"}, {"assignee": "other", "reclaim_first": True}],
++                         ids=["done", "blocked", "ready", "reassign-reclaim"])
++def test_bulk_status_under_a_remote_lease_is_refused_per_id_and_writes_nothing(gws, svc, kills, body):
++    hub, tid = _remote(gws, svc)
++    before, run_before = _snapshot(hub.conn), _run_row(hub.conn, tid)
++    r = _client().post(f"{API}/tasks/bulk", json={"ids": [tid], "priority": 7, **body})
++    assert r.status_code == 200, r.text
++    verb = {"done": "complete", "blocked": "block", "ready": "reclaim"}.get(body.get("status"), "reassign")
++    assert r.json()["results"] == [{"id": tid, "ok": False, "holder": WORKER, "error": refusal(verb, tid, WORKER)}]
++    assert _snapshot(hub.conn) == before
++    assert _run_row(hub.conn, tid) == run_before
++
++
++def test_bulk_refusal_of_one_card_does_not_stop_its_siblings(gws, svc, kills):
++    hub, tid = _remote(gws, svc)
++    other = kb.create_task(hub.conn, title="queued here", assignee="default", runs_on=["machine:hub"])
++    r = _client().post(f"{API}/tasks/bulk", json={"ids": [other, tid], "status": "done", "summary": "x"})
++    assert r.status_code == 200, r.text
++    res = {e["id"]: e for e in r.json()["results"]}
++    assert res[other] == {"id": other, "ok": True}
++    assert res[tid]["ok"] is False and res[tid]["holder"] == WORKER
++    assert kb.get_task(hub.conn, other).status == "done"
++    assert kb.get_task(hub.conn, tid).status == "running"
++
++
++@pytest.mark.parametrize("endpoint", ["reclaim", "terminate", "reassign"])
++def test_reclaim_endpoints_under_a_remote_lease_are_refused(gws, svc, kills, endpoint):
++    hub, tid = _remote(gws, svc)
++    before, run_before = _snapshot(hub.conn), _run_row(hub.conn, tid)
++    client = _client()
++    if endpoint == "reclaim":
++        r = client.post(f"{API}/tasks/{tid}/reclaim", json={"reason": "stuck"})
++    elif endpoint == "terminate":
++        run_id = hub.conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++        r = client.post(f"{API}/runs/{run_id}/terminate", json={"reason": "stuck"})
++    else:
++        r = client.post(f"{API}/tasks/{tid}/reassign", json={"profile": "other", "reclaim_first": True})
++    _assert_refused_409(r, hub.conn, tid, before, run_before, "reassign" if endpoint == "reassign" else "reclaim")
++    assert kills == []
++
++
++def test_patch_title_under_a_remote_lease_still_works(gws, svc, kills):
++    """Only lifecycle writes are fenced; a title edit is not one."""
++    hub, tid = _remote(gws, svc)
++    r = _client().patch(f"{API}/tasks/{tid}", json={"title": "renamed"})
++    assert r.status_code == 200, r.text
++    assert kb.get_task(hub.conn, tid).title == "renamed"
++
++
++def test_unknown_status_under_a_remote_lease_is_still_a_400(gws, svc, kills):
++    _hub, tid = _remote(gws, svc)
++    assert _client().patch(f"{API}/tasks/{tid}", json={"status": "running"}).status_code == 400
++
++
++# --- regressions: no live remote lease, no refusal -------------------------------------------------------------
++
++def _expire(hub, tid):
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET lease_expires = ? WHERE id = ?", (int(time.time() * 1000) - 1000, tid))
++
++
++def _own(hub, tid):
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET lease_holder = ? WHERE id = ?", (str(sync._state(hub.conn)["gateway_id"]), tid))
++
++
++@pytest.mark.parametrize("lease", [_expire, _own], ids=["expired", "own-gateway"])
++def test_patch_done_without_a_live_remote_lease_completes_as_before(gws, svc, kills, lease):
++    hub, tid = _remote(gws, svc)
++    lease(hub, tid)
++    r = _client().patch(f"{API}/tasks/{tid}", json={"status": "done", "summary": "x"})
++    assert r.status_code == 200, r.text
++    assert kb.get_task(hub.conn, tid).status == "done"
++
++
++@pytest.mark.parametrize("lease", [_expire, _own], ids=["expired", "own-gateway"])
++def test_bulk_ready_without_a_live_remote_lease_moves_as_before(gws, svc, kills, lease):
++    hub, tid = _remote(gws, svc)
++    lease(hub, tid)
++    r = _client().post(f"{API}/tasks/bulk", json={"ids": [tid], "status": "ready"})
++    assert r.status_code == 200, r.text
++    assert r.json()["results"] == [{"id": tid, "ok": True}]
++    assert kb.get_task(hub.conn, tid).status == "ready"
+-- 
+2.43.0
+

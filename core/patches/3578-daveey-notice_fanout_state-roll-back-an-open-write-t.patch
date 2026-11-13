@@ -1,0 +1,88 @@
+From 7c16f596ed470e3a9bb7bd563a6a9fbded1e241f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 14:08:59 +0000
+Subject: [PATCH] [daveey] notice_fanout_state: roll back an open write txn on
+ any exception (cached connection)
+
+PR #2227 review nit (review 5891871431, card t_01a1d51dc864a50a). The store now caches one connection per
+(path, pid), so close() no longer rolls back a half-finished transaction. A non-sqlite exception between
+BEGIN IMMEDIATE and COMMIT in seed_remote/ack_remote (a TypeError from _encode's sorted() on mixed-type
+cards) left the cached connection inside an open write transaction: the process kept the RESERVED lock and
+the next set_cursor joined that uncommitted txn, lost on the next ack's ROLLBACK.
+
+Fix: _open() rolls back on exit whenever the cached connection is still in_transaction (and drops it via
+_failed() if the ROLLBACK itself fails). The original exception still propagates.
+
+RED->GREEN: test_notice_fanout_state_a_non_sqlite_error_mid_transaction_leaves_no_open_write[seed|ack]
+injects mixed-type cards, then asserts a later set_cursor is visible to another connection, that connection
+can take BEGIN IMMEDIATE, and the cursor survives a later ack + fresh process. Both failed before the fix.
+Every test file importing notice_fanout + test_kanban_unloaded_wake.py: 7 files, 111 passed.
+---
+ .../test_kanban_unloaded_host_lease.py        | 31 +++++++++++++++++++
+ tui_gateway/notice_fanout_state.py            | 11 ++++++-
+ 2 files changed, 41 insertions(+), 1 deletion(-)
+
+diff --git a/tests/tui_gateway/test_kanban_unloaded_host_lease.py b/tests/tui_gateway/test_kanban_unloaded_host_lease.py
+index 92d490c4fd..bd17eb2eba 100644
+--- a/tests/tui_gateway/test_kanban_unloaded_host_lease.py
++++ b/tests/tui_gateway/test_kanban_unloaded_host_lease.py
+@@ -459,3 +459,34 @@ def test_notice_fanout_state_opens_its_store_once_per_process(monkeypatch, tmp_p
+         assert nfs.get_cursor("work") == 1 and len(opened) == 2
+     finally:
+         nfs.reset_for_tests()
++
++
++@pytest.mark.parametrize("write", ["seed", "ack"])
++def test_notice_fanout_state_a_non_sqlite_error_mid_transaction_leaves_no_open_write(monkeypatch, tmp_path, write):
++    """PR #2227 review: the cached connection outlives the call, so a TypeError between BEGIN IMMEDIATE and COMMIT
++    (``_encode``'s ``sorted()`` on mixed-type cards) kept the write lock, and the next set_cursor landed inside that
++    uncommitted transaction and was lost on the next ack's ROLLBACK."""
++    import sqlite3
++
++    from tui_gateway import notice_fanout_state as nfs
++    where = tmp_path / "kanban" / nfs.FILENAME
++    monkeypatch.setattr(nfs, "path", lambda: where)
++    nfs.reset_for_tests()
++    try:
++        nfs.seed_remote({"chat": frozenset({("k", "running")})})
++        mixed = frozenset({("k", "done"), (1, "done")})
++        with pytest.raises(TypeError):
++            nfs.seed_remote({"chat": mixed}) if write == "seed" else nfs.ack_remote({"chat": mixed})
++
++        nfs.set_cursor("default", 7)
++
++        with contextlib.closing(sqlite3.connect(str(where), timeout=0, isolation_level=None)) as other:
++            assert other.execute("SELECT cursor FROM cursors WHERE ident = 'default'").fetchone() == (7,)
++            other.execute("BEGIN IMMEDIATE")  # no write lock is left behind in this process
++            other.execute("ROLLBACK")
++        nfs.ack_remote({"chat": frozenset({("k", "done")})})
++        nfs.forget_memory_for_tests()
++        assert nfs.get_cursor("default") == 7
++        assert nfs.load_remote() == {"chat": frozenset({("k", "done")})}
++    finally:
++        nfs.reset_for_tests()
+diff --git a/tui_gateway/notice_fanout_state.py b/tui_gateway/notice_fanout_state.py
+index 964ce8c264..ca388cdf0b 100644
+--- a/tui_gateway/notice_fanout_state.py
++++ b/tui_gateway/notice_fanout_state.py
+@@ -73,7 +73,16 @@ def _open() -> Iterator[Optional[sqlite3.Connection]]:
+             _warn_once(where, exc)
+         else:
+             _conns[key] = conn
+-    yield conn
++    try:
++        yield conn
++    finally:
++        # The connection outlives the call, so a non-sqlite error between BEGIN IMMEDIATE and COMMIT (a TypeError
++        # from ``_encode``) would keep the write lock, and the next write would join that transaction and be lost.
++        if conn is not None and _conns.get(key) is conn and conn.in_transaction:
++            try:
++                conn.execute("ROLLBACK")
++            except sqlite3.Error as exc:
++                _failed(exc)
+ 
+ 
+ def _failed(exc: BaseException) -> None:
+-- 
+2.43.0
+

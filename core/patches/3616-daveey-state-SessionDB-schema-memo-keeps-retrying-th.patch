@@ -1,0 +1,540 @@
+From e3c453f2afef8951812dd9794e0b228c0900c88f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:29:58 +0000
+Subject: [PATCH] [daveey] state: SessionDB schema memo keeps retrying the
+ repairs it used to run on every open
+
+Follow-up to PR #2164 (per-process `_init_schema` memo), review t_01a1d4bb379f4384 nits,
+card t_01a1d4c34f905bf3.
+
+1. Repairs the memo froze. The NULL-`active` heal (#51646; an older-build writer on the
+   same store can still write NULL) ran only with the full init, so once per process per
+   memo key. It is now `_heal_null_active_rows`, run by the full init and by the throttled
+   per-store heal (`_run_throttled_heals`, HEAL_INTERVAL_S) on memo hits. A guarded
+   duplicate-title repair that failed left the unique title index missing yet the store was
+   memoized, so no open retried it until DDL or a new process; `record()` now refuses to
+   memoize a store without `idx_sessions_title_unique`, so the next open reruns the init.
+2. The memo key dropped `_schema_code_digest`: it was a per-process constant (hashed once
+   from on-disk `hermes_state_schema.py`, possibly newer than the loaded code, skipping
+   sibling migration modules) in a per-process memo, so it never distinguished anything.
+   The module docstring says why no code digest is needed.
+3. A heal that fails no longer waits a full interval or loses rows. The delegate-marker
+   UPDATE and its trigram backfill now share a SAVEPOINT: on the autocommit writer a lock
+   in `_index_healed_rows_for_trigram` after the UPDATE left healed rows out of the
+   trigram index, and the next scan could not find them again. `_maybe_heal` logs an
+   incomplete heal at warning and rewinds its interval claim, and a full init whose heal
+   failed does not claim the interval, so the next open retries.
+
+Tests: tests/hermes_state/test_schema_init_memo_heals.py (3 tests). RED on origin/main:
+NULL-active row stays NULL on a memo hit, title index still missing after the failed
+repair, failed heal leaves the marker stripped but unindexed and logs no warning. GREEN:
+tests/hermes_state/ + tests/hermes_cli/test_session_recovery_lost_and_found.py,
+2506 passed, 0 failed.
+---
+ hermes_state_schema.py                        |  86 +++++---
+ hermes_state_schema_memo.py                   |  89 +++++----
+ .../test_schema_init_memo_heals.py            | 188 ++++++++++++++++++
+ 3 files changed, 292 insertions(+), 71 deletions(-)
+ create mode 100644 tests/hermes_state/test_schema_init_memo_heals.py
+
+diff --git a/hermes_state_schema.py b/hermes_state_schema.py
+index 434e37daee..3575d3a379 100644
+--- a/hermes_state_schema.py
++++ b/hermes_state_schema.py
+@@ -869,13 +869,18 @@ class SessionSchemaMixin:
+             "FROM gateway_routing_legacy_pk ORDER BY updated_at ASC",
+         )
+ 
+-    def _heal_reset_rows_carrying_a_delegate_marker(self, cursor: sqlite3.Cursor) -> None:
++    def _heal_reset_rows_carrying_a_delegate_marker(self, cursor: sqlite3.Cursor) -> bool:
+         """Strip ``_delegate_from`` from a chat's /new continuation (``session_key`` set, ``_reset_from``
+         set) that picked it up: the marker hides the row from every session list while the gateway keeps
+         routing the chat into it (#109073). ``_reset_from`` already says what the row is, so the pair is
+         contradictory and the delegate marker is the stray. A keyed row WITHOUT ``_reset_from`` is a real
+         delegate child that captured a route (#138210) and keeps its marker: routing moves the chat off
+-        it instead. Idempotent; probes first so a clean store takes no write lock on open."""
++        it instead. Idempotent; probes first so a clean store takes no write lock on open.
++
++        The UPDATE and the trigram backfill share one savepoint: on the autocommit writer a failure
++        between them would leave healed rows out of the trigram index, and the next scan could no longer
++        find them. Returns False when a lock or damage stopped it (nothing changed, so a retry finds the
++        same rows), True when the store is clean or healed."""
+         polluted = (
+             "session_key IS NOT NULL AND session_key != '' AND json_valid(model_config) "
+             f"AND {_sql_json_extract('model_config', '$._delegate_from')} IS NOT NULL "
+@@ -884,17 +889,51 @@ class SessionSchemaMixin:
+         try:
+             ids = [row[0] for row in cursor.execute(f"SELECT id FROM sessions WHERE {polluted}").fetchall()]
+             if not ids:
+-                return
+-            healed = cursor.execute(
+-                f"UPDATE sessions SET model_config = json_remove(model_config, '$._delegate_from') WHERE {polluted}"
+-            ).rowcount
++                return True
++            cursor.execute("SAVEPOINT delegate_marker_heal")
+         except sqlite3.DatabaseError as exc:
+             # OperationalError (locked/missing column) or a damaged sessions b-tree: the open-time scan
+             # must not turn page damage into an open failure; the first write confirms and latches it.
+             logger.debug("reset-row delegate-marker heal skipped: %s", exc)
+-            return
+-        self._index_healed_rows_for_trigram(cursor, ids)
++            return False
++        try:
++            healed = cursor.execute(
++                f"UPDATE sessions SET model_config = json_remove(model_config, '$._delegate_from') WHERE {polluted}"
++            ).rowcount
++            self._index_healed_rows_for_trigram(cursor, ids)
++            cursor.execute("RELEASE delegate_marker_heal")
++        except sqlite3.DatabaseError as exc:
++            with contextlib.suppress(sqlite3.Error):
++                cursor.execute("ROLLBACK TO delegate_marker_heal")
++                cursor.execute("RELEASE delegate_marker_heal")
++            logger.debug("reset-row delegate-marker heal rolled back: %s", exc)
++            return False
+         logger.warning("Healed %d chat session(s) hidden by a stray _delegate_from marker (#109073)", healed)
++        return True
++
++    def _heal_null_active_rows(self, cursor: sqlite3.Cursor) -> bool:
++        """Un-hide ``active IS NULL`` messages. Older reconciler builds added ``active`` without NOT NULL
++        DEFAULT 1 (#51646), so INSERTs that omitted it wrote NULL and the ``WHERE active = 1`` loaders hid
++        whole histories; an older-build writer on the same store still can. A ``current_version < 12``
++        gate never re-ran for already-v12+ databases, so this runs with every full init and from the
++        throttled per-store heal (hermes_state_schema_memo). Reads before writing: an UPDATE takes the
++        write lock even when it matches no rows, which blocked opens behind a sibling's write. The probe
++        is short-circuited on the modern NOT NULL column and index-served on legacy ones; deliberately
++        not INDEXED BY (raises "no query solution" on NOT NULL columns). Returns False when a lock
++        stopped it."""
++        try:
++            if cursor.execute("SELECT 1 FROM messages WHERE active IS NULL LIMIT 1").fetchone() is not None:
++                cursor.execute("UPDATE messages SET active = 1 WHERE active IS NULL")
++        except sqlite3.OperationalError as exc:
++            logger.debug("NULL-active heal skipped: %s", exc)
++            return False
++        return True
++
++    def _run_throttled_heals(self, cursor: sqlite3.Cursor) -> bool:
++        """The data repairs a memoized open still owes the store, at most once per interval per store
++        (hermes_state_schema_memo._maybe_heal). True when both completed."""
++        delegate_ok = self._heal_reset_rows_carrying_a_delegate_marker(cursor)
++        return self._heal_null_active_rows(cursor) and delegate_ok
+ 
+     def _index_healed_rows_for_trigram(self, cursor: sqlite3.Cursor, session_ids: list[str]) -> None:
+         """The marker kept these sessions' messages out of the external-content trigram index (the triggers
+@@ -982,13 +1021,14 @@ class SessionSchemaMixin:
+         if memo.try_restore(self):
+             return
+         before = memo.snapshot(self)
+-        self._init_schema_full()
+-        memo.record(self, before)
++        healed = self._init_schema_full()
++        memo.record(self, before, healed=healed)
+ 
+-    def _init_schema_full(self):
++    def _init_schema_full(self) -> bool:
+         """Create tables and FTS if missing, reconcile columns, run data migrations. Column
+         additions are declarative via _reconcile_columns(), so reordered migrations can
+-        never skip a column; schema_version remains for data migrations only."""
++        never skip a column; schema_version remains for data migrations only. Returns whether
++        the data heals completed; False lets the next memoized open retry them."""
+         # Startup-watchdog lease: on multi-GB files this is I/O-bound (near-zero CPU), which
+         # the watchdog's CPU fallback would misread as a parked deadlock.
+         # Declare a startup-watchdog progress lease before potentially long synchronous work: on multi-GB
+@@ -1018,17 +1058,10 @@ class SessionSchemaMixin:
+         # already at v22+ when the column landed — the version-gated rebuild is unreachable there, #73823).
+         # Same PK-rebuild constraint as gateway_routing above.
+         self._heal_session_model_usage_pk(cursor)
+-        self._heal_reset_rows_carrying_a_delegate_marker(cursor)
++        healed = self._heal_reset_rows_carrying_a_delegate_marker(cursor)
+ 
+         # Indexes referencing reconciler-added columns must be created AFTER _reconcile_columns
+         # (in SCHEMA_SQL the executescript would fail on legacy DBs).
+-        # Heal NULL ``active`` rows unconditionally on every startup. On real-world DBs the reconciler-added
+-        # ``active`` column can lack its NOT NULL DEFAULT 1 (older reconciler builds reconstructed the type
+-        # without the default — see #51646: PRAGMA shows (17,'active','INTEGER',0,None,0) in the wild), so
+-        # INSERTs that omitted the column wrote NULL and the ``WHERE active = 1`` transcript loaders hid the
+-        # whole history. The INSERTs now set active=1 explicitly; this idempotent repair un-hides rows
+-        # written before the fix. It was previously gated at ``current_version < 12`` which never re-ran for
+-        # already-v12+ databases.
+         try:
+             cursor.execute(
+                 "CREATE INDEX IF NOT EXISTS idx_messages_platform_msg_id "
+@@ -1039,16 +1072,8 @@ class SessionSchemaMixin:
+         self._execute_ddl_skipping_settled_triggers(cursor, DEFERRED_INDEX_SQL)  # same ordering constraint (``active``)
+         self._ensure_session_projection(cursor)
+ 
+-        # Heal NULL ``active`` rows on every startup: older reconciler builds added ``active``
+-        # without NOT NULL DEFAULT 1, so ``WHERE active = 1`` loaders hid whole histories. A
+-        # ``current_version < 12`` gate never re-ran for already-v12+ databases.
+-        # Read before writing: an UPDATE takes the write lock even when it matches no rows, so
+-        # the unconditional form blocked every open behind a sibling's write transaction. The
+-        # probe is short-circuited on the modern NOT NULL column and index-served on legacy
+-        # ones. Deliberately not INDEXED BY (raises "no query solution" on NOT NULL columns).
+-        with contextlib.suppress(sqlite3.OperationalError):
+-            if cursor.execute("SELECT 1 FROM messages WHERE active IS NULL LIMIT 1").fetchone() is not None:
+-                cursor.execute("UPDATE messages SET active = 1 WHERE active IS NULL")
++        # After DEFERRED_INDEX_SQL: its partial index on ``active IS NULL`` serves the probe.
++        healed = self._heal_null_active_rows(cursor) and healed
+ 
+         fts5_available = self._sqlite_supports_fts5(cursor)
+         stale_row = cursor.execute("SELECT 1 FROM state_meta WHERE key = ? LIMIT 1", (FTS_STALE_KEY,)).fetchone()
+@@ -1083,6 +1108,7 @@ class SessionSchemaMixin:
+         self._conn.commit()
+         # After the commit: the repair takes its own write transaction, and only once per store.
+         advance_legacy_refusal_repair(self, self._conn)
++        return healed
+ 
+     def _stamp_settled_fts_layout(self, cursor: sqlite3.Cursor) -> None:
+         """Write ``fts_storage_version`` once the stored layout is exactly current and nothing is in flight.
+diff --git a/hermes_state_schema_memo.py b/hermes_state_schema_memo.py
+index b4b75c7a32..5cdfbecb14 100644
+--- a/hermes_state_schema_memo.py
++++ b/hermes_state_schema_memo.py
+@@ -7,18 +7,23 @@ later opens of the SAME file at the SAME schema only restore the per-instance fl
+ 
+ The memo key is the file identity stat'd after connecting (realpath, st_dev, st_ino), SQLite's
+ ``PRAGMA schema_version`` (bumped by every DDL, from any process), the ``schema_version`` table value
+-(data-migration level), ``store_instance_id`` and a digest of this build's schema code. A hit also
+-re-probes the two FTS tables (``LIMIT 0``) and must agree with the memoized flags. Any change, a
+-replaced or quarantined file, or a store not yet settled (stale FTS, an unfinished budgeted backfill or
+-repair) reruns the full init. ``fts_stale`` is read on every open; set by another handle, it forces the
+-full init, whose stale-FTS path is the one that must run.
+-
+-The delegate-marker heal is data repair, not schema: it runs with the full init (the first open per key
+-per process) and otherwise at most once per ``HEAL_INTERVAL_S`` per store, from the memo-hit open.
++(data-migration level) and ``store_instance_id``. It carries no digest of the schema code: the memo lives
++in one process, whose loaded schema code cannot change, and a different build is a different process with
++an empty memo. A hit also re-probes the two FTS tables (``LIMIT 0``) and must agree with the memoized
++flags. Any change, a replaced or quarantined file, or a store not yet settled (stale FTS, an unfinished
++budgeted backfill or repair, a missing unique title index) reruns the full init. ``fts_stale`` is read on
++every open; set by another handle, it forces the full init, whose stale-FTS path is the one that must run.
++A guarded duplicate-title repair that failed leaves the unique title index missing, so the store is not
++memoized and the next open retries the repair, as every open did before the memo.
++
++The data heals (stray delegate markers, and NULL ``active`` rows an older-build writer on the same store
++can still produce) are repair, not schema: they run with the full init (the first open per key per
++process) and otherwise at most once per ``HEAL_INTERVAL_S`` per store, from a memo-hit open. A heal that
++does not complete (a lock, page damage) is logged at warning and releases its interval claim, so the next
++open retries it.
+ """
+ from __future__ import annotations
+ 
+-import hashlib
+ import logging
+ import os
+ import sqlite3
+@@ -32,40 +37,18 @@ HEAL_INTERVAL_S = 600.0
+ # Always restored on a hit, whatever the first init left them at; other changed scalars are found by diff.
+ _ALWAYS_RESTORED = ("_fts_enabled", "_trigram_available", "_fts_stale")
+ _SIMPLE = (bool, int, float, str, bytes, type(None))
++_TITLE_INDEX = "idx_sessions_title_unique"
+ 
+ _lock = threading.Lock()
+ _memo: dict[tuple, dict[str, Any]] = {}  # key -> attributes the full init set on self
+-_last_heal: dict[str, float] = {}  # realpath -> monotonic time of the last delegate-marker heal
+-_code_digest: Optional[str] = None
++_last_heal: dict[str, float] = {}  # realpath -> monotonic start of the last completed (or running) data heal
+ 
+ 
+ def clear() -> None:
+     """Forget every memoized store (tests; a deliberate in-process reinit)."""
+-    global _code_digest
+     with _lock:
+         _memo.clear()
+         _last_heal.clear()
+-        _code_digest = None
+-
+-
+-def _schema_code_digest() -> str:
+-    global _code_digest
+-    if _code_digest is None:
+-        import hermes_state_common as common
+-        import hermes_state_schema as schema
+-
+-        h = hashlib.sha256()
+-        for part in (common.SCHEMA_SQL, common.DEFERRED_INDEX_SQL, common.FTS_SQL, common.FTS_TRIGRAM_SQL,
+-                     str(common.SCHEMA_VERSION), str(common.FTS_STORAGE_VERSION)):
+-            h.update(part.encode("utf-8", "surrogatepass"))
+-            h.update(b"\0")
+-        try:
+-            with open(schema.__file__, "rb") as f:  # the migration code itself
+-                h.update(f.read())
+-        except OSError:
+-            pass
+-        _code_digest = h.hexdigest()
+-    return _code_digest
+ 
+ 
+ def _settled_meta_keys() -> tuple[str, ...]:
+@@ -89,7 +72,7 @@ def _probe(db_path, conn: sqlite3.Connection) -> Optional[tuple[tuple, dict[str,
+     except (OSError, sqlite3.Error):
+         return None
+     key = (real, st.st_dev, st.st_ino, pragma_version, None if row is None else row[0],
+-           meta.get("store_instance_id"), _schema_code_digest(),
++           meta.get("store_instance_id"),
+            type(conn))  # the connection class decides what this runtime's SQLite can do (tests swap it)
+     return key, meta
+ 
+@@ -100,19 +83,31 @@ def _settled(meta: dict[str, Any]) -> bool:
+     return FTS_STALE_KEY not in meta and all(k in meta for k in _settled_meta_keys()[2:])
+ 
+ 
++def _title_index_present(conn: sqlite3.Connection) -> bool:
++    """The full init's guarded duplicate-title repair either created the index or failed. Only the first
++    may be memoized: a memoized failure would not be retried until DDL or a new process."""
++    try:
++        return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
++                            (_TITLE_INDEX,)).fetchone() is not None
++    except sqlite3.Error:
++        return False
++
++
+ def snapshot(db) -> dict[str, Any]:
+     """Instance attributes before the full init, to diff against afterwards."""
+     return dict(vars(db))
+ 
+ 
+-def record(db, before: dict[str, Any]) -> None:
+-    """Remember a successful full init when it left the store settled at this build's schema."""
++def record(db, before: dict[str, Any], *, healed: bool = True) -> None:
++    """Remember a successful full init when it left the store settled at this build's schema. With
++    *healed* False (a data heal did not complete) the heal interval stays unclaimed: the next open retries."""
+     probed = _probe(db.db_path, db._conn)
+     if probed is None:
+         return
+     key, meta = probed
+     from hermes_state_common import SCHEMA_VERSION
+-    if not _settled(meta) or key[4] != SCHEMA_VERSION or db._conn.in_transaction:
++    if (not _settled(meta) or key[4] != SCHEMA_VERSION or db._conn.in_transaction
++            or not _title_index_present(db._conn)):
+         return
+     after = vars(db)
+     changed = {name: value for name, value in after.items()
+@@ -121,7 +116,8 @@ def record(db, before: dict[str, Any]) -> None:
+         return  # an init that set a mutable object on self is not safely replayable
+     with _lock:
+         _memo[key] = changed
+-        _last_heal[key[0]] = time.monotonic()  # the full init just ran the heal
++        if healed:
++            _last_heal[key[0]] = time.monotonic()  # the full init just ran the heals
+ 
+ 
+ _MISSING = object()
+@@ -164,7 +160,18 @@ def _maybe_heal(db, real: str) -> None:
+         if last is not None and now - last < HEAL_INTERVAL_S:
+             return
+         _last_heal[real] = now  # claimed before running: concurrent openers never double-scan
++    error: Optional[sqlite3.Error] = None
+     try:
+-        db._heal_reset_rows_carrying_a_delegate_marker(db._conn.cursor())
+-    except sqlite3.Error as exc:  # a data repair must never fail an open; the next interval retries
+-        logger.debug("throttled delegate-marker heal skipped: %s", exc)
++        ok = db._run_throttled_heals(db._conn.cursor())
++    except sqlite3.Error as exc:  # a data repair must never fail an open
++        ok, error = False, exc
++    if ok:
++        return
++    with _lock:  # release the claim (unless a later heal took it) so the next open retries
++        if _last_heal.get(real) == now:
++            if last is None:
++                _last_heal.pop(real, None)
++            else:
++                _last_heal[real] = last
++    logger.warning("state.db data heal did not complete on %s (%s); the next open retries it",
++                   real, error if error is not None else "locked or damaged, rolled back")
+diff --git a/tests/hermes_state/test_schema_init_memo_heals.py b/tests/hermes_state/test_schema_init_memo_heals.py
+new file mode 100644
+index 0000000000..c122d50378
+--- /dev/null
++++ b/tests/hermes_state/test_schema_init_memo_heals.py
+@@ -0,0 +1,188 @@
++"""[daveey] Repairs the schema-init memo must not freeze (PR #2164 review, t_01a1d4c34f905bf3).
++
++Before the memo every open ran the NULL-``active`` heal and retried a failed unique-title repair. With the
++memo, a settled store's later opens skip the full init, so: the NULL-active heal runs from the throttled
++per-store heal, a failed title repair is not memoized, and a heal that fails rolls back whole and leaves
++the interval unclaimed so the next open retries it.
++"""
++
++from __future__ import annotations
++
++import logging
++import sqlite3
++
++import pytest
++
++import hermes_state_schema
++from hermes_state import SessionDB
++
++
++@pytest.fixture(autouse=True)
++def fresh_memo():
++    import hermes_state_schema_memo
++
++    hermes_state_schema_memo.clear()
++    yield
++    hermes_state_schema_memo.clear()
++
++
++@pytest.fixture
++def reconciles(monkeypatch):
++    seen = {"n": 0}
++    real = hermes_state_schema.SessionSchemaMixin._reconcile_columns
++
++    def spy(self, cursor):
++        seen["n"] += 1
++        return real(self, cursor)
++
++    monkeypatch.setattr(hermes_state_schema.SessionSchemaMixin, "_reconcile_columns", spy)
++    return seen
++
++
++def _after_interval(monkeypatch):
++    import hermes_state_schema_memo as memo
++
++    now = memo.time.monotonic()
++    monkeypatch.setattr(memo.time, "monotonic", lambda: now + memo.HEAL_INTERVAL_S + 1)
++
++
++def _legacy_nullable_active_store(path):
++    """A v12 store whose ``active`` column lacks NOT NULL DEFAULT 1 (#51646), as an older build left it."""
++    conn = sqlite3.connect(path)
++    conn.executescript(
++        """
++        CREATE TABLE schema_version (version INTEGER);
++        INSERT INTO schema_version VALUES (12);
++        CREATE TABLE sessions (
++            id TEXT PRIMARY KEY, source TEXT, started_at REAL, ended_at REAL,
++            message_count INTEGER DEFAULT 0, tool_call_count INTEGER DEFAULT 0,
++            title TEXT, parent_session_id TEXT, model_config TEXT
++        );
++        CREATE TABLE messages (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT,
++            tool_call_id TEXT, tool_calls TEXT, tool_name TEXT,
++            timestamp REAL NOT NULL, token_count INTEGER, finish_reason TEXT,
++            reasoning TEXT, reasoning_content TEXT, reasoning_details TEXT,
++            codex_reasoning_items TEXT, codex_message_items TEXT,
++            platform_message_id TEXT, observed INTEGER DEFAULT 0
++        );
++        CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT);
++        """
++    )
++    conn.execute("ALTER TABLE messages ADD COLUMN active INTEGER")
++    conn.execute("ALTER TABLE messages ADD COLUMN compacted INTEGER DEFAULT 0")
++    conn.execute("INSERT INTO sessions (id, source, started_at) VALUES ('s1', 'discord', 1.0)")
++    conn.commit()
++    conn.close()
++
++
++def test_a_null_active_row_written_after_the_first_init_is_healed_by_the_throttled_heal(
++        tmp_path, reconciles, monkeypatch):
++    path = tmp_path / "state.db"
++    _legacy_nullable_active_store(path)
++    SessionDB(db_path=path).close()  # full init: migrates and memoizes the store
++    assert reconciles["n"] == 1
++    con = sqlite3.connect(path)  # an older-build writer on the same store omits ``active``
++    con.execute("INSERT INTO messages (session_id, role, content, timestamp, active) "
++                "VALUES ('s1', 'user', 'late hidden turn', 2.0, NULL)")
++    con.commit()
++    con.close()
++    _after_interval(monkeypatch)
++    db = SessionDB(db_path=path)
++    try:
++        assert reconciles["n"] == 1  # a memo hit, not a full init
++        active = db._conn.execute("SELECT active FROM messages WHERE content = 'late hidden turn'").fetchone()[0]
++        assert active == 1
++    finally:
++        db.close()
++
++
++def test_a_failed_unique_title_repair_is_retried_on_the_next_open(tmp_path, reconciles, monkeypatch):
++    path = tmp_path / "state.db"
++    db = SessionDB(db_path=path)
++    db.create_session("a", "cli")
++    db.create_session("b", "cli")
++    db.close()
++    con = sqlite3.connect(path)  # duplicates from before the constraint
++    con.execute("DROP INDEX idx_sessions_title_unique")
++    con.execute("UPDATE sessions SET title = 'dup', title_source = 'user'")
++    con.commit()
++    con.close()
++
++    def locked(*_a, **_k):
++        raise sqlite3.OperationalError("database is locked")
++
++    real_next = hermes_state_schema.next_title_in_lineage
++    monkeypatch.setattr(hermes_state_schema, "next_title_in_lineage", locked)
++    SessionDB(db_path=path).close()  # the repair fails: no index
++    monkeypatch.setattr(hermes_state_schema, "next_title_in_lineage", real_next)
++    db = SessionDB(db_path=path)
++    try:
++        index = db._conn.execute(
++            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_sessions_title_unique'").fetchone()
++        assert index is not None
++        assert sorted(r[0] for r in db._conn.execute("SELECT title FROM sessions")) == ["dup", "dup #2"]
++    finally:
++        db.close()
++
++
++def _polluted_store_with_an_unindexed_message(path):
++    db = SessionDB(db_path=path)
++    db.create_session("old", "telegram", session_key="k", chat_id="c", chat_type="dm", user_id="u")
++    db.create_session("live", "telegram", parent_session_id="old", model_config={"_reset_from": "old"},
++                      session_key="k", chat_id="c", chat_type="dm", user_id="u")
++    db.close()  # settled and memoized
++    con = sqlite3.connect(path)
++    con.execute("UPDATE sessions SET model_config = json_set(model_config, '$._delegate_from', 'old') "
++                "WHERE id = 'live'")
++    # Written while the marker hid the session: the trigram trigger skips it.
++    con.execute("INSERT INTO messages (session_id, role, content, timestamp) "
++                "VALUES ('live', 'user', 'zebracorn sighting', 3.0)")
++    con.commit()
++    con.close()
++
++
++def _marker(con):
++    return con.execute(
++        "SELECT json_extract(model_config, '$._delegate_from') FROM sessions WHERE id = 'live'").fetchone()[0]
++
++
++def _trigram_indexed(con):
++    return con.execute(
++        "SELECT COUNT(*) FROM messages_fts_trigram_docsize d JOIN messages m ON m.id = d.id "
++        "WHERE m.content = 'zebracorn sighting'").fetchone()[0]
++
++
++def test_a_heal_that_fails_mid_way_rolls_back_and_is_retried_by_the_next_open(
++        tmp_path, reconciles, monkeypatch, caplog):
++    path = tmp_path / "state.db"
++    _polluted_store_with_an_unindexed_message(path)
++    _after_interval(monkeypatch)
++    real_index = hermes_state_schema.SessionSchemaMixin._index_healed_rows_for_trigram
++
++    def locked(self, cursor, ids):
++        raise sqlite3.OperationalError("database is locked")
++
++    monkeypatch.setattr(hermes_state_schema.SessionSchemaMixin, "_index_healed_rows_for_trigram", locked)
++    with caplog.at_level(logging.WARNING, logger="hermes_state"):
++        SessionDB(db_path=path).close()
++    assert reconciles["n"] == 1
++    assert any(r.levelno == logging.WARNING and "heal" in r.getMessage() for r in caplog.records)
++    con = sqlite3.connect(path)
++    try:
++        # Rolled back whole: the marker is still there, so the retry finds the row again.
++        assert _marker(con) == "old"
++        assert _trigram_indexed(con) == 0
++    finally:
++        con.close()
++
++    monkeypatch.setattr(hermes_state_schema.SessionSchemaMixin, "_index_healed_rows_for_trigram", real_index)
++    SessionDB(db_path=path).close()  # same clock: the failed claim was released
++    assert reconciles["n"] == 1
++    con = sqlite3.connect(path)
++    try:
++        assert _marker(con) is None
++        assert _trigram_indexed(con) == 1
++    finally:
++        con.close()
+-- 
+2.43.0
+

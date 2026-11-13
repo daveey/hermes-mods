@@ -1,0 +1,135 @@
+From a3d2eed676fc40f1b34741b20585e49a44df41a6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:43:03 +0000
+Subject: [PATCH] [daveey] tui obligation: settle a pause's killed receipts
+ only once the pause stands
+
+Review 5891840491 on PR #2248 (card t_01a1d51456179c29), blocking: boundary_pause_hook settled the
+killed jobs' owner:"tui" obligation as soon as the hook returned PAUSE_REASON. A user Stop that lands
+after that (methods_session_interrupt -> user_stop_wins) drops the pause, pause_stands returns False
+and the stopped turn's marker retires with its killed_jobs, so the notice then lived only in the
+in-memory completion queue: an unclean death lost it.
+
+Fix: the hook records the killed ids on the session (`_update_pause_settle`, dropped with the pause by
+`_drop_pause`), and `pause_stands` settles them only when this turn's pause stands (or a backend
+exit keeps the paused marker). A death between the hook and the turn's end can still re-arm a
+duplicate beside the marker report, never lose the notice.
+
+Proof:
+- New test_update_pause_a_later_stop_beats_keeps_the_obligation: hook pauses -> user_stop_wins ->
+  pause_stands False -> unclean death -> next backend re-arms the notice once (armed=1). RED at
+  9d86019111 (KeyError: 'delivery_obligation'), GREEN with the fix; 19/19 in the file.
+- `_pause` now ends the turn through pause_stands like prompt_turn does; mutant dropping the new
+  settle fails test_update_pause_kill_is_reported_once_from_the_marker[unclean].
+- 127 test files referencing update_pause/completion_obligation/process_registry_obligations/
+  exit_job_receipts/prompt_turn/methods_session_interrupt: 2464 passed, 25 skipped.
+  scripts/check --base origin/main: ok.
+---
+ .../test_tui_completion_obligation.py         | 28 +++++++++++++++++--
+ tui_gateway/update_pause.py                   | 16 ++++++++---
+ 2 files changed, 38 insertions(+), 6 deletions(-)
+
+diff --git a/tests/tui_gateway/test_tui_completion_obligation.py b/tests/tui_gateway/test_tui_completion_obligation.py
+index 65e35f23e2..96e4b6151a 100644
+--- a/tests/tui_gateway/test_tui_completion_obligation.py
++++ b/tests/tui_gateway/test_tui_completion_obligation.py
+@@ -396,8 +396,9 @@ def test_update_pause_kill_is_reported_once_from_the_marker(home, registry, back
+     assert (armed, wakes, reg.has_parked_events()) == (0, [], False)
+ 
+ 
+-def _pause(home, backend, stands=True):
+-    """A chat's turn reaches a step boundary while a core update asks for the pause."""
++def _pause(home, backend, stands=True, *, end_turn=True):
++    """A chat's turn reaches a step boundary while a core update asks for the pause, then (``end_turn``) ends
++    paused the way ``prompt_turn`` ends it (``pause_stands``)."""
+     import time
+ 
+     from hermes_cli import admission_fence as af
+@@ -407,9 +408,32 @@ def _pause(home, backend, stands=True):
+     af.request_pause(home, expires_at=time.time() + 120)
+     session = backend.sessions["sid"] = _session(home, _notif_held=[])
+     assert up.boundary_pause_hook(session, "session-key")() == (up.PAUSE_REASON if stands else None)
++    if stands and end_turn:
++        assert up.pause_stands(session, "session-key", {"paused_for_update": True}) is True
+     return session
+ 
+ 
++def test_update_pause_a_later_stop_beats_keeps_the_obligation(home, registry, backend, monkeypatch):
++    """The hook paid the pause (jobs killed, marker stamped), but the user's Stop lands before the turn ends
++    (``user_stop_wins``): the pause never stands and the stopped turn's marker retires with its killed_jobs. The
++    receipt's obligation is then the notice's only durable custody, so it must survive until the turn's end and
++    an unclean death after it re-arms the notice once, never loses it."""
++    from tui_gateway import update_pause as up
++    _as_dead_writer(monkeypatch)
++    job = _job(registry)
++    session = _pause(home, backend, end_turn=False)
++    assert job.exited and job.termination_source == up.PAUSE_REASON
++    assert _receipt(home)[OBLIGATION_KEY]["owner"] == "tui", "settled before the pause stood"
++    session.update(running=True, _active_turn_marker_key="session-key")
++    assert up.user_stop_wins(session) is True
++    assert up.pause_stands(session, "session-key", {"interrupted": True}) is False
++    assert _receipt(home)[OBLIGATION_KEY]["owner"] == "tui", "a pause a later Stop beat settled the notice"
++
++    registry.completion_queue.queue.clear()  # unclean death: the in-memory completion goes with the backend
++    reg, armed, _wakes = _next_backend(monkeypatch)
++    assert armed == 1 and reg.has_parked_events(), "the killed job's notice was lost"
++
++
+ @pytest.mark.parametrize("race", ["exited_before_kill", "user_stop_won"])
+ def test_update_pause_keeps_the_obligation_the_marker_does_not_carry(home, registry, backend, monkeypatch, race):
+     """Controls. A job that finished on its own just before the pause's kill (``already_exited``) is in the marker
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index a8c7567388..e38d1b76d6 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -320,14 +320,13 @@ def boundary_pause_hook(session: dict, marker_key: str, *, carried: bool = False
+                 session.pop("_update_pause_parked_stamp", None)  # a new pause starts unparked
+                 if stamps:  # pause_stands takes it back if the turn does not end paused (a later Stop won)
+                     session["_carried_pause_stamped"] = marker_key
++                # Settled by pause_stands once the pause has finally stood: a later Stop still beats it.
++                session["_update_pause_settle"] = (marker_key, [
++                    job["session_id"] for job in killed if job.get("kill_state") == "killed"])
+         if stopped:
+             logger.info("core-update pause: session %s was stopped by the user; not pausing it", marker_key)
+             take_back()
+             return None
+-        # Custody transfer, as at backend exit: the marker now reports each kill, so the killed receipt's owed
+-        # notice must not be re-armed beside it after an unclean death of this backend.
+-        from tui_gateway.completion_obligation import settle_journaled
+-        settle_journaled(job["session_id"] for job in killed if job.get("kill_state") == "killed")
+         logger.info("core-update pause: session %s paused at a step boundary for a Hermes update", marker_key)
+         return PAUSE_REASON
+ 
+@@ -344,6 +343,7 @@ def _drop_pause(session: dict) -> None:
+     """Under ``history_lock``: the session no longer keeps its turn's marker for a continuation."""
+     session.pop("_update_pause_marker_key", None)
+     session.pop("_update_pause_drainer_lock", None)
++    session.pop("_update_pause_settle", None)
+ 
+ 
+ def publication_lock(session: dict):
+@@ -404,6 +404,7 @@ def pause_stands(session: dict, marker_key: str, result: Any) -> bool:
+         exiting = bool(session.get("_exit_keeps_turn_marker"))
+         if mine and not stands and not exiting:
+             _drop_pause(session)
++        settle = session.pop("_update_pause_settle", None) if mine and (stands or exiting) else None
+         stamped = session.pop("_carried_pause_stamped", None) == marker_key
+         # Only a turn the exit's interrupt actually landed on was cut short: one that completed normally after
+         # the exit began (before its interrupt) ran to completion, so it takes the stamp back like any other.
+@@ -412,6 +413,13 @@ def pause_stands(session: dict, marker_key: str, result: Any) -> bool:
+     if stamped and not stands and not cut_short_by_exit:  # its hook paid the pause but the turn ended otherwise
+         from tui_gateway.turn_marker import clear_carried_turn_paused
+         clear_carried_turn_paused(_home(session), marker_key)
++    if settle and settle[0] == marker_key:
++        # Custody transfer, as at backend exit: the kept marker now reports each kill, so a killed receipt's owed
++        # notice must not be re-armed beside it after an unclean death. Only once the pause has stood: a Stop that
++        # beat it (user_stop_wins) retires the marker, leaving the obligation the notice's only durable custody.
++        # A death between the hook and here can still re-arm a duplicate, never lose the notice.
++        from tui_gateway.completion_obligation import settle_journaled
++        settle_journaled(settle[1])
+     return stands
+ 
+ 
+-- 
+2.43.0
+

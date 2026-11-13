@@ -1,0 +1,181 @@
+From 38a80f02762b290cc0bf6084bb5c338f026a59fa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:10:50 +0000
+Subject: [PATCH] [daveey] workspace_source PR-2: review test gaps (real
+ admitted_claim protocol path, post-attach admission refusal, old-Board attach
+ 400) + nits (shared failure-command DDL, ls-remote batch env, S6 budget after
+ origin proof)
+
+---
+ hermes_cli/kanban_failure_release.py          | 16 +++++-
+ hermes_cli/kanban_source_cli.py               |  6 +-
+ hermes_cli/kanban_source_launch.py            |  4 +-
+ hermes_cli/kanban_source_publish.py           |  1 +
+ tests/hermes_cli/test_kanban_source_launch.py | 57 +++++++++++++++++++
+ 5 files changed, 76 insertions(+), 8 deletions(-)
+
+diff --git a/hermes_cli/kanban_failure_release.py b/hermes_cli/kanban_failure_release.py
+index c41ef88c02..38d53bc053 100644
+--- a/hermes_cli/kanban_failure_release.py
++++ b/hermes_cli/kanban_failure_release.py
+@@ -53,6 +53,18 @@ def queued(conn: sqlite3.Connection, run_id: int | None) -> bool:
+                         (sync.run_uid(conn, run_id),)).fetchone() is not None
+ 
+ 
++def _ensure_commands(conn: sqlite3.Connection) -> None:
++    conn.execute("CREATE TABLE IF NOT EXISTS kanban_failure_commands ("
++                 "run_uid TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, "
++                 "op_id TEXT NOT NULL)")
++
++
++def mark_sent(conn: sqlite3.Connection, run_uid: str, task_id: str) -> None:
++    """Record that ``run_uid``'s release went to the Board synchronously (first wins: no later outbox release)."""
++    _ensure_commands(conn)
++    conn.execute("INSERT OR IGNORE INTO kanban_failure_commands VALUES (?, ?, ?)", (run_uid, task_id, "sync"))
++
++
+ def queue(conn: sqlite3.Connection, task_id: str, run_id: int | None, *,
+           outcome: str, error: str, **policy) -> bool:
+     """True means Board authority owns this failure (including an already queued run).
+@@ -70,9 +82,7 @@ def queue(conn: sqlite3.Connection, task_id: str, run_id: int | None, *,
+         raise ValueError("failure release run belongs to another task")
+     if not conn.in_transaction:
+         raise ValueError("failure release requires a write transaction")
+-    conn.execute("CREATE TABLE IF NOT EXISTS kanban_failure_commands ("
+-                 "run_uid TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, "
+-                 "op_id TEXT NOT NULL)")
++    _ensure_commands(conn)
+     op_id = sync.uuid7()
+     inserted = conn.execute("INSERT OR IGNORE INTO kanban_failure_commands VALUES (?, ?, ?)",
+                             (uid, task_id, op_id)).rowcount
+diff --git a/hermes_cli/kanban_source_cli.py b/hermes_cli/kanban_source_cli.py
+index 515194cfb7..4229a7d903 100644
+--- a/hermes_cli/kanban_source_cli.py
++++ b/hermes_cli/kanban_source_cli.py
+@@ -11,6 +11,7 @@
+ from __future__ import annotations
+ 
+ import argparse
++import os
+ import sqlite3
+ import subprocess
+ import sys
+@@ -34,10 +35,11 @@ def claim_refusal(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+ 
+ 
+ def remote_head(url: str, branch: str, *, timeout: float = 30.0) -> Optional[str]:
+-    """``git ls-remote <url> <branch>`` (the manifest's branch ref), None when absent."""
++    """``git ls-remote <url> <branch>`` (the manifest's branch ref), None when absent. Never prompts (batch env)."""
++    from hermes_cli.kanban_source_clones import _BATCH_ENV
+     out = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "ls-remote", url, branch], capture_output=True,
+                          text=True, encoding="utf-8", errors="replace", timeout=timeout, stdin=subprocess.DEVNULL,
+-                         check=False)
++                         check=False, env={**os.environ, **_BATCH_ENV})
+     if out.returncode != 0:
+         raise RuntimeError(f"git ls-remote {url} failed: {out.stderr.strip()[-200:]}")
+     for line in out.stdout.splitlines():
+diff --git a/hermes_cli/kanban_source_launch.py b/hermes_cli/kanban_source_launch.py
+index 1d37051702..3b55b4c1aa 100644
+--- a/hermes_cli/kanban_source_launch.py
++++ b/hermes_cli/kanban_source_launch.py
+@@ -196,9 +196,7 @@ def release_with_receipt(conn: sqlite3.Connection, task_id: str, run_id: int, re
+                           error=error)
+         return "outbox"
+     with write_txn(conn):
+-        conn.execute("CREATE TABLE IF NOT EXISTS kanban_failure_commands (run_uid TEXT PRIMARY KEY, task_id TEXT NOT "
+-                     "NULL REFERENCES tasks(id) ON DELETE CASCADE, op_id TEXT NOT NULL)")
+-        conn.execute("INSERT OR IGNORE INTO kanban_failure_commands VALUES (?, ?, ?)", (uid, task_id, "sync"))
++        release.mark_sent(conn, uid, task_id)
+     return "sync"
+ 
+ 
+diff --git a/hermes_cli/kanban_source_publish.py b/hermes_cli/kanban_source_publish.py
+index 9bb690ac37..e7d59b1e5c 100644
+--- a/hermes_cli/kanban_source_publish.py
++++ b/hermes_cli/kanban_source_publish.py
+@@ -295,6 +295,7 @@ def publish(conn: sqlite3.Connection, task: Any, run: board_calls.AttachedRun, c
+     if not seen.head or not seen.branch:
+         raise PublishRefused("source_lost", f"{path} is gone or has no branch checked out")
+     clone = prove_origin(path, cfg, lookup=lookup)
++    deadline.left()  # the proof (GitHub API + ls-remote, each with its own cap) counts against the S6 budget
+     default_name, default_sha = _default_branch(deadline, path)
+     remote = ls_remote(deadline, path, seen.branch)
+     check_branch(task.id, seen.branch, manifest_branch=(prior or {}).get("branch"),
+diff --git a/tests/hermes_cli/test_kanban_source_launch.py b/tests/hermes_cli/test_kanban_source_launch.py
+index 60e341f4ec..e7bb43b387 100644
+--- a/tests/hermes_cli/test_kanban_source_launch.py
++++ b/tests/hermes_cli/test_kanban_source_launch.py
+@@ -147,6 +147,20 @@ def test_grant_carries_source_protocol_only_from_dispatcher(conn, board):
+     assert kbs.grant_protocol() is None
+ 
+ 
++def test_dispatcher_admitted_claim_acquires_with_source_protocol(conn, board, monkeypatch):
++    """The real admitted_claim -> claim gate -> lease acquire path carries ``source_protocol: 1``."""
++    from hermes_cli import kanban_db_dispatch as d
++    from hermes_cli import kanban_db_dispatch_admission as admission
++    monkeypatch.setattr("hermes_cli.kanban_capsule_admission.claim_refusal", lambda *a, **kw: None)
++    tid = kb.create_task(conn, title="dispatched", assignee="worker")
++    claimed = admission.admitted_claim(conn, tid, "worker", "ready", 900, lambda task, path: None,
++                                       d.DispatchResult())
++    assert claimed is not None and claimed.id == tid
++    acquires = [b for k, b in board.calls if k == "acquire"]
++    assert acquires and acquires[-1].get("source_protocol") == 1
++    assert kbs.grant_protocol() is None  # the protocol never leaks past that one call
++
++
+ def test_attach_refused_releases_unused_grant_and_never_spawns(conn, board, dispatcher):
+     dispatcher.snapshot = _source_snapshot()
+     board.refuse["source_attach"] = "custody_attached"
+@@ -240,6 +254,49 @@ def test_post_pid_failure_kills_worker_and_sends_retained(conn, board, dispatche
+     assert receipt["state"] == "retained" and receipt["reason"] == "post_spawn_failure"
+ 
+ 
++def _git_source(dispatcher):
++    """Make the resolver's directory a real worktree on ``wt/exact``; returns its HEAD."""
++    from tests.hermes_cli.test_kanban_source_resolver import git as _git
++    path = dispatcher.path
++    _git(path.parent, "init", "-q", str(path))
++    _git(path, "-c", "user.name=t", "-c", "user.email=t@x", "commit", "-q", "--allow-empty", "-m", "x")
++    _git(path, "checkout", "-q", "-b", "wt/exact")
++    return _git(path, "rev-parse", "HEAD")
++
++
++def test_admission_refusal_after_attach_is_a_pre_spawn_abort(conn, board, dispatcher, monkeypatch):
++    """A model/admission refusal raised after attach but before spawn (stage pre_spawn) never started a process:
++    one receipt-carrying release (unchanged + abort pre_spawn), nothing spawned, no second release."""
++    head = _git_source(dispatcher)
++    dispatcher.snapshot = kws.SourceSnapshot(json.dumps(manifest(commit=head)), kws.Custody("hub", "published", 3))
++
++    def refuse(*a, **kw):
++        raise RuntimeError("no independent reviewer model is available")
++    monkeypatch.setattr("hermes_cli.kanban_model_tier.apply_model_tier", refuse)
++    spawned = []
++    tid, _, used = dispatcher.run(lambda task, path: spawned.append(task.id))
++    assert not used and spawned == []
++    assert "source_attach" in board.actions()
++    releases = [b for k, b in board.calls if k == "release"]
++    assert len(releases) == 1
++    receipt = releases[0]["source_receipt"]
++    assert (receipt["state"], receipt["abort"], receipt["commit"]) == ("unchanged", "pre_spawn", head)
++    assert _outbox_releases(conn, tid) == []
++
++
++def test_old_board_attach_400_on_source_card_never_spawns(conn, board, dispatcher):
++    """A source card whose grant carried a snapshot but whose attach meets an old Board (400 action list) must not
++    run outside custody: the grant is released unused and nothing spawns."""
++    dispatcher.snapshot = _source_snapshot()
++    board.old = True
++    spawned = []
++    _, result, used = dispatcher.run(lambda task, path: spawned.append(task.id))
++    assert not used and spawned == []
++    assert any(code.startswith("workspace_source_attach_refused:board_lacks_source")
++               for _, code in result.respawn_guarded)
++    assert kbs.board_lacks_source()
++
++
+ def test_spawn_error_of_unknown_kind_is_not_trusted_as_not_started(conn, board, dispatcher):
+     dispatcher.snapshot = _source_snapshot()
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,207 @@
+From 129a8e34216cd993ef2e14f5e64c7aed1be077a9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:39:09 +0000
+Subject: [PATCH] [daveey] update pause requeue: a Stop latched during the
+ write cancels the head instead of running it after the hold
+
+t_01a1d4a0ecd9bd54. ea4f9dc74e5 (t_01a1d49d50e4c656) makes a started notifier wake that gets the session lease
+under a pending core-update pause yield before its turn and go back to its FIFO place (requeue_unstarted). That
+closed the core ask of this card (laptop-1 2026-11-13 03:07:12 PST, chat 20261026_235722_bef6c6). One custody gap
+from review 5890417193 of PR #2173 was still open on main:
+
+A Stop (interrupt_update) that latches while the requeue write runs finds the claim still started and tells its
+caller the turn stops. Main then discarded the latch with the claim, so the row stayed queued and the notice ran
+after the hold. requeue_unstarted now reads stopped() before it clears the claim. If a Stop latched,
+_stopped_after_requeue cancels the re-queued row (cancel_session_input, _settle_cancelled, media released),
+answers the waiter and clears update_stops/pending_stops. A cancel failure logs loudly and leaves the row queued
+(it then runs once after the hold, as before).
+
+The bound-steer gap from the same review landed separately on main in d495dccb3fe, so this commit keeps main's
+steer handling unchanged.
+
+Tests: tests/gateway/test_update_requeue_stop_race.py is RED on origin/main (row stays queued) and GREEN here;
+29 update-pause/requeue/notifier-drain files: 231 passed.
+---
+ gateway/session_update_pause.py               | 45 +++++++++-
+ .../gateway/test_update_requeue_stop_race.py  | 89 +++++++++++++++++++
+ 2 files changed, 132 insertions(+), 2 deletions(-)
+ create mode 100644 tests/gateway/test_update_requeue_stop_race.py
+
+diff --git a/gateway/session_update_pause.py b/gateway/session_update_pause.py
+index 6ec29e848b..4f65624c85 100644
+--- a/gateway/session_update_pause.py
++++ b/gateway/session_update_pause.py
+@@ -162,11 +162,15 @@ def unstarted_result(authority, row):
+ async def requeue_unstarted(authority, live, ref, row):
+     """Hand an unstarted claim back to its FIFO place (caller holds the claim gate and mutation lock); the
+     waiter and media stay with the queued row. None when the store refuses: the caller's checkpoint path
+-    then decides (and settles it interrupted, as any unparkable pause)."""
++    then decides (and settles it interrupted, as any unparkable pause).
++
++    [daveey] t_01a1d4a0ecd9bd54: a Stop that ``interrupt_update`` latched while the write ran (it found the claim
++    still started and told its caller the turn stops) cancels the re-queued row instead of letting the notice run
++    after the hold (``_stopped_after_requeue``)."""
+     from gateway.session_runtime_workers import tracked_write, persist_work_count
++    from gateway.session_settlement_recovery import _transfers
+     from hermes_state_runtime import RuntimeStoreError
+     from hermes_state_update_pause import requeue_unstarted_input
+-    from gateway.session_settlement_recovery import _transfers
+     # [daveey] t_01a1d4d4c30c7e43: read after execution returned (no steer can reach the turn now); each
+     # undelivered transfer goes back to its own FIFO place in the same write, behind the wake.
+     transfers = _transfers(authority, live, row) or {}
+@@ -180,6 +184,7 @@ async def requeue_unstarted(authority, live, ref, row):
+                                             'admission=%s (%s%s)', ref.session_id, row['admission_id'], exc,
+                                             f': {detail}' if detail else '')
+         return None
++    stopped_meanwhile = stopped(authority, row)  # read before the claim's latch is cleared below
+     authority.pending_results.pop(row['admission_id'], None)
+     previous = authority.update_claims.pop(ref.session_id, None)
+     if previous is not None:
+@@ -190,6 +195,8 @@ async def requeue_unstarted(authority, live, ref, row):
+         entry = authority.steer_transfers.get(ref.session_id)
+         if entry is not None and entry[0] == row['generation']:
+             authority.steer_transfers.pop(ref.session_id, None)
++    if stopped_meanwhile:
++        return await _stopped_after_requeue(authority, ref, row)
+     logging.getLogger(__name__).info('Re-queued unstarted gateway turn for update hold: session=%s admission=%s '
+                                      'generation=%s%s', ref.session_id, row['admission_id'], row['generation'],
+                                      f' (with {len(transfers)} steer transfer(s))' if transfers else '')
+@@ -198,6 +205,40 @@ async def requeue_unstarted(authority, live, ref, row):
+     return True
+ 
+ 
++async def _stopped_after_requeue(authority, ref, row):
++    """[daveey] t_01a1d4a0ecd9bd54: a Stop latched while the requeue write ran. ``interrupt_update`` found the claim
++    still started and told its caller the turn stops; its own settlement (``finish``) waits on the claim gate the
++    caller holds and would then find the row queued. Honour it here: cancel the re-queued row (it never ran, so
++    ``cancelled`` is its exact outcome), answer its waiter and clear the latch, so the notice never runs after the
++    hold and a later claim of the session inherits no Stop. A Stop that lands after this function returns finds the
++    row queued (not started) and is refused, as for any queued row."""
++    from gateway.session_ingress_media import release_admission_media
++    from gateway.session_runtime_workers import tracked_write, persist_work_count
++    from hermes_state_runtime import cancel_session_input
++    admission_id, sid = row['admission_id'], ref.session_id
++    authority.update_stops.discard(admission_id)
++    if authority.pending_stops.get(sid) == row['generation']:
++        authority.pending_stops.pop(sid, None)
++        authority.pending_stop_causes.pop(sid, None)
++    try:
++        cancelled = await tracked_write(authority, partial(cancel_session_input, authority.db,
++                                                           epoch=authority.epoch, admission_id=admission_id))
++    except Exception:
++        # Nothing retries this: the row stays queued and runs once after the hold. Fail loud, never silent.
++        logging.getLogger(__name__).exception('Update requeue: cancelling stopped %s failed; it stays queued and '
++                                              'runs after the hold', admission_id)
++        cancelled = None
++    if cancelled is not None and (cancelled['status'], cancelled['outcome']) == ('terminal', 'cancelled'):
++        authority._settle_cancelled(ref, admission_id)
++        await asyncio.to_thread(release_admission_media, authority.db, admission_id)
++        logging.getLogger(__name__).info('Re-queued gateway turn was stopped during the requeue; cancelled: '
++                                         'session=%s admission=%s generation=%s', sid, admission_id,
++                                         row['generation'])
++    authority._publish_pending(ref)
++    persist_work_count(authority)
++    return True
++
++
+ def stopped(authority, row):
+     return (row['admission_id'] in authority.update_stops
+             or authority.pending_stops.get(row['target_session_id']) == row['generation']
+diff --git a/tests/gateway/test_update_requeue_stop_race.py b/tests/gateway/test_update_requeue_stop_race.py
+new file mode 100644
+index 0000000000..d5e3eba1b7
+--- /dev/null
++++ b/tests/gateway/test_update_requeue_stop_race.py
+@@ -0,0 +1,89 @@
++"""[daveey] t_01a1d4a0ecd9bd54: custody of an unstarted notifier wake that ``requeue_unstarted`` hands back.
++
++t_01a1d49d50e4c656 (ea4f9dc74e5) makes a notifier wake that was claimed before a core-update hold, and whose turn
++got the session's lease only after the drain asked turns to pause (laptop-1 2026-11-13 03:07:12 PST, chat
++20261026_235722_bef6c6), yield before its turn and go back to its FIFO place. One custody gap remained in that
++requeue, found in review of PR #2173 (review 5890417193): a Stop (``interrupt_update``) that latches while the
++requeue write runs finds the claim still started and tells its caller the turn stops, but the row ends up queued
++and the notice runs after the hold. (The bound-steer gap from the same review landed on main in d495dccb3fe.)
++"""
++import asyncio
++import json
++import time
++
++import pytest
++
++from agent.update_pause_cancel import UNSTARTED_KEY
++from tests.gateway.test_session_authority_cancel_settlement import REF, _authority
++from tests.hermes_state.test_notifier_claim_eligibility import wake_payload
++
++
++async def _until(predicate):
++    from tests.waiting import async_wait_until
++    await async_wait_until(predicate, timeout=5)
++
++
++def _yielded(owner, row):
++    owner.pending_results[row['admission_id']] = {
++        'result': {'paused_for_update': True, UNSTARTED_KEY: True}, 'usage': {}}
++
++
++async def _stop_session(authority):
++    task = authority.sessions['s'].task
++    if task is not None and not task.done():
++        task.cancel()
++        await asyncio.gather(task, return_exceptions=True)
++
++
++@pytest.mark.asyncio
++async def test_stop_latched_during_the_requeue_write_cancels_the_head_and_clears_the_latch(tmp_path, monkeypatch):
++    """A Stop that ``interrupt_update`` accepts while the requeue write runs must not leave the notice to run after
++    the hold, nor a stale latch behind."""
++    import hermes_state_update_pause
++    from gateway import session_finite, session_notifier_drain
++    from gateway.session_update_pause import interrupt_update
++    from hermes_state_runtime import admit_session_input, get_session_admission
++    db, authority = _authority(tmp_path, monkeypatch)
++    held, calls, stops = [False], [], []
++    monkeypatch.setattr(session_notifier_drain, 'held', lambda: held[0])
++    loop = asyncio.get_running_loop()
++    original = hermes_state_update_pause.requeue_unstarted_input
++
++    def racing_write(*args, **kwargs):
++        # Stop lands while the write is in flight: it latches, then waits on the claim gate the requeue holds.
++        stops.append(asyncio.run_coroutine_threadsafe(interrupt_update(authority, REF, kwargs['generation']), loop))
++        deadline = time.monotonic() + 5
++        while kwargs['admission_id'] not in authority.update_stops and time.monotonic() < deadline:
++            time.sleep(0.01)
++        assert kwargs['admission_id'] in authority.update_stops, 'the Stop never latched'
++        return original(*args, **kwargs)
++    monkeypatch.setattr(hermes_state_update_pause, 'requeue_unstarted_input', racing_write)
++
++    async def execute(owner, ref, row):
++        calls.append(row)
++        held[0] = True
++        _yielded(owner, row)
++        return 'answered'
++    monkeypatch.setattr(session_finite, 'execute_finite_admission', execute)
++    identity = json.dumps(['kanban-wake', 'route', 'race'])
++    with db:
++        head = admit_session_input(db, epoch=authority.epoch, session_id='s', principal_id='automation:route',
++                                   request_id=identity, payload=wake_payload(identity, local=True))
++        waiter = authority.waiters.setdefault(head['admission_id'], loop.create_future())
++        authority._schedule(REF)
++        try:
++            await _until(lambda: stops and stops[0].done())
++            assert stops[0].result() is True  # the caller was told the turn stops ...
++            from gateway.session_runtime_workers import mutation_tasks
++            await _until(lambda: not mutation_tasks(authority))
++            row = get_session_admission(db, admission_id=head['admission_id'])
++            assert (row['status'], row['outcome']) == ('terminal', 'cancelled'), row  # ... and it does
++            assert await asyncio.wait_for(waiter, 5) is None
++            assert head['admission_id'] not in authority.update_stops and not authority.pending_stops
++            held[0] = False
++            authority.sessions['s'].claim_changed.set()
++            await _until(lambda: not mutation_tasks(authority))
++            assert len(calls) == 1, 'the stopped notice ran after the hold'
++        finally:
++            held[0] = False
++            await _stop_session(authority)
+-- 
+2.43.0
+

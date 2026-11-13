@@ -1,0 +1,791 @@
+From cfba10d8b45ff232838d040647193cf1e762c637 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:06:50 +0000
+Subject: [PATCH] [daveey] workspace_source PR-2 (wip): source_attach +
+ pre-spawn abort launch, per-call source_protocol, S2 old-Board fallback,
+ source env
+
+---
+ hermes_cli/kanban_db_dispatch.py              |  44 +--
+ hermes_cli/kanban_db_dispatch_admission.py    |   4 +-
+ hermes_cli/kanban_db_sync.py                  |   7 +-
+ hermes_cli/kanban_source_board.py             | 193 +++++++++++
+ hermes_cli/kanban_source_dispatch.py          |  33 +-
+ hermes_cli/kanban_source_launch.py            | 315 ++++++++++++++++++
+ hermes_cli/kanban_sync_client.py              |   6 +-
+ hermes_cli/kanban_workspace_source.py         |  16 +-
+ .../test_kanban_workspace_source.py           |   5 +-
+ 9 files changed, 572 insertions(+), 51 deletions(-)
+ create mode 100644 hermes_cli/kanban_source_board.py
+ create mode 100644 hermes_cli/kanban_source_launch.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 6ab7051e0b..df87b06dbf 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1983,43 +1983,9 @@ def _dispatch_lane_task(
+         ):
+             result.auto_blocked.append(claimed.id)
+         return False
+-    _kbw.set_workspace_path(conn, claimed.id, str(workspace))
+-    if claimed.workspace_kind == "worktree" and source is None:  # a source card's branch is the manifest's (fenced)
+-        _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+-    _kbw._maybe_emit_scratch_tip(conn, claimed.id, "worktree" if source is not None else claimed.workspace_kind)
+-    if lane == "review":
+-        # Force-load sdlc-review; the kanban lifecycle is already in every
+-        # worker's system prompt via KANBAN_GUIDANCE.
+-        claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+-    # Apply inside spawn accounting: an unavailable independent reviewer fails closed.
+-    from hermes_cli.kanban_model_tier import apply_model_tier
+-    try:
+-        apply_model_tier(conn, claimed, lane=lane)
+-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
+-        if pid:
+-            _set_worker_pid(conn, claimed.id, int(pid), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
+-        # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
+-        _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
+-        # consecutive_failures is deliberately NOT reset here: resetting on
+-        # spawn would let a task that keeps timing out loop forever. Cleared
+-        # only on successful completion (complete_task).
+-        result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
+-        _count_spawn(claimed.assignee)
+-        return True
+-    except Exception as exc:
+-        from hermes_cli.kanban_review_model import admission_refusal
+-
+-        # Admission failed before any worker ran; preserve its retry budget (a repeated review refusal: visible block).
+-        infrastructure, exhausted, extra = admission_refusal(conn, claimed.id, exc)
+-        if infrastructure:
+-            _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
+-        if _record_task_failure(
+-            conn, claimed.id, str(exc),
+-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+-            infrastructure=infrastructure, force_trip=exhausted, event_payload_extra=extra,
+-        ):
+-            result.auto_blocked.append(claimed.id)
+-        return False
++    from hermes_cli.kanban_source_launch import launch  # record, attach (source cards), spawn, pre-spawn abort
++    return launch(conn, claimed, workspace, resolved_branch_name, source, lane=lane, board=board, failure_limit=failure_limit,
++                  spawn_fn=spawn_fn if spawn_fn is not None else _default_spawn, result=result, count_spawn=_count_spawn)
+ 
+ 
+ def _apply_default_assignee(
+@@ -2760,8 +2726,8 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None, o
+     # actually happens.
+     if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
+         env["TERMINAL_CWD"] = workspace
+-    if task.branch_name:
+-        env["HERMES_KANBAN_BRANCH"] = task.branch_name
++    env.update({"HERMES_KANBAN_BRANCH": task.branch_name} if task.branch_name else {},
++               **(getattr(task, "source_env", None) or {}))  # workspace_source: HERMES_KANBAN_SOURCE_{COMMIT,PATH,BRANCH}
+     if task.current_run_id is not None:
+         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+     if task.claim_lock:
+diff --git a/hermes_cli/kanban_db_dispatch_admission.py b/hermes_cli/kanban_db_dispatch_admission.py
+index 8b7653bea9..95184fe7ef 100644
+--- a/hermes_cli/kanban_db_dispatch_admission.py
++++ b/hermes_cli/kanban_db_dispatch_admission.py
+@@ -68,8 +68,10 @@ def admitted_claim(conn: sqlite3.Connection, task_id: str, assignee: str, lane,
+     claim; it leaves no claim deferral, so the caller's deferral pop finds none."""
+     from hermes_cli.kanban_gateway_drain import claim_if_admitting
+ 
++    from hermes_cli.kanban_source_board import protocol_call
+     recheck, refusals = capsule_claim_check(conn, task_id, assignee, spawn_fn)
+-    claimed = claim_if_admitting(conn, task_id, assignee, lane, ttl_seconds, admission_check=recheck)
++    with protocol_call():  # workspace_source R3-a: only the dispatcher's own grant may carry source_protocol
++        claimed = claim_if_admitting(conn, task_id, assignee, lane, ttl_seconds, admission_check=recheck)
+     if claimed is None and refusals:
+         record_claim_refusal(conn, task_id, assignee, refusals[-1], result)
+     return claimed
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index f617855d18..b458993a2d 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -790,7 +790,7 @@ class Lease:
+ 
+ class LeaseClient(Protocol):
+     def acquire(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str, ttl_s: int,
+-                lane: str = "ready") -> Lease: ...
++                lane: str = "ready", source_protocol: Optional[int] = None) -> Lease: ...
+ 
+     def renew(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str, ttl_s: int) -> Lease: ...
+ 
+@@ -911,8 +911,11 @@ def claim_gate(conn: sqlite3.Connection, task_id: str, expires: int, lane: str =
+     ids = (state["board_id"], state["gateway_id"], task_id)
+     run_uid = uuid7()
+     try:
++        from hermes_cli.kanban_source_board import grant_protocol
++        protocol = grant_protocol()  # workspace_source: only the dispatcher's claim, only when enabled (R3-a)
+         lease = _client().acquire(board_id=ids[0], task_uid=task_id, run_uid=run_uid, gateway_id=ids[1],
+-                                  ttl_s=max(expires - int(time.time()), 1), lane=lane)
++                                  ttl_s=max(expires - int(time.time()), 1), lane=lane,
++                                  **({"source_protocol": protocol} if protocol else {}))
+     except _CLIENT_ERRORS as exc:  # fail closed: an unreachable service defers the claim
+         _log.info("claim_deferred: offline task=%s (%s: %s)", task_id, type(exc).__name__, exc)
+         defer_claim(task_id, "offline", ORIGIN_BOARD)
+diff --git a/hermes_cli/kanban_source_board.py b/hermes_cli/kanban_source_board.py
+new file mode 100644
+index 0000000000..df0f0f3fdb
+--- /dev/null
++++ b/hermes_cli/kanban_source_board.py
+@@ -0,0 +1,193 @@
++"""workspace_source v1 (core PR-2): the synchronous Board side of a source card's run.
++
++* ``source_protocol: 1`` rides ONE grant request: the dispatcher's own claim (:func:`protocol_call` around it), never
++  the CLI ``hermes kanban claim`` or any other caller (v4.1 R3-a: per call, not process-global).
++* ``/leases source_attach`` / ``publish_source`` / ``release`` (with a receipt) are synchronous ``/leases`` actions
++  (v3 S2), never outbox ops. A ``400`` naming the action list is an old Board (``board_lacks_source``, v4 S2): this
++  process stops sending the protocol and receipts.
++* ``kanban_source_runs`` (local, never synced) records which local runs attached and from what observation, so the
++  ending preflight (worker process) and the pre-spawn abort (dispatcher) agree on what this run joined.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import contextvars
++import json
++import logging
++import sqlite3
++import time
++from dataclasses import dataclass
++from typing import Any, Iterator, Optional
++
++from hermes_cli import kanban_db_sync as sync
++
++_log = logging.getLogger(__name__)
++
++SOURCE_PROTOCOL = 1
++_PROTOCOL_CALL: contextvars.ContextVar[bool] = contextvars.ContextVar("source_protocol_call", default=False)
++_BOARD_LACKS_SOURCE = {"flag": False}
++
++
++class SourceCallRefused(Exception):
++    """The Board rejected a source action (``reason`` is its code: ``lease_lost``, ``custody_attached``, ...)."""
++
++    def __init__(self, code: str, detail: str = ""):
++        self.code, self.detail = code or "rejected", detail or ""
++        super().__init__(f"{self.code}: {self.detail}" if self.detail else self.code)
++
++
++class BoardLacksSource(SourceCallRefused):
++    """An old Board: it does not know the source actions (``400 action must be one of ...``)."""
++
++    def __init__(self, detail: str = ""):
++        super().__init__("board_lacks_source", detail)
++
++
++# --- source_protocol: per dispatcher call ----------------------------------------------------------------------------
++
++@contextlib.contextmanager
++def protocol_call() -> Iterator[None]:
++    """Mark the dispatcher's own claim: only grants made inside it may carry ``source_protocol``."""
++    token = _PROTOCOL_CALL.set(True)
++    try:
++        yield
++    finally:
++        _PROTOCOL_CALL.reset(token)
++
++
++def grant_protocol() -> Optional[int]:
++    """``source_protocol`` for this grant: only inside :func:`protocol_call`, only when enabled (which implies the
++    protocol is complete), and never once this process learned the Board lacks the source actions."""
++    if not _PROTOCOL_CALL.get() or _BOARD_LACKS_SOURCE["flag"]:
++        return None
++    from hermes_cli.kanban_workspace_source import settings
++    return SOURCE_PROTOCOL if settings().enabled else None
++
++
++def board_lacks_source() -> bool:
++    return _BOARD_LACKS_SOURCE["flag"]
++
++
++def mark_board_lacks_source(why: str) -> None:
++    if not _BOARD_LACKS_SOURCE["flag"]:
++        _log.warning("workspace_source: the Board lacks the source protocol (%s); this process stops sending "
++                     "source_protocol and receipts (legacy behaviour)", why)
++    _BOARD_LACKS_SOURCE["flag"] = True
++
++
++def reset_board_lacks_source() -> None:  # tests
++    _BOARD_LACKS_SOURCE["flag"] = False
++
++
++# --- /leases calls ------------------------------------------------------------------------------------------------
++
++def call(conn: sqlite3.Connection, action: str, task_id: str, run_uid: Optional[str], **body: Any) -> dict:
++    """One synchronous ``/leases`` source action. Raises :class:`SourceCallRefused` (Board said no),
++    :class:`BoardLacksSource` (old Board) or ``sync.LeaseUnavailable`` (no answer: the outcome is unknown)."""
++    from hermes_cli.kanban_sync_client import HubError
++    state = sync._state(conn)
++    hub = getattr(sync._client(), "hub", None)
++    if hub is None:
++        raise sync.LeaseUnavailable("the lease client has no Board route for source actions")
++    payload = {"action": action, "task": task_id, **({"run_uid": run_uid} if run_uid else {}), **body,
++               "client_op_id": sync.uuid7()}
++    try:
++        res = hub.leases(state["board_id"], payload)
++    except HubError as exc:
++        detail = str(getattr(exc, "detail", "") or exc)
++        if getattr(exc, "status", None) == 400 and "action must be one of" in detail:
++            mark_board_lacks_source(f"{action}: {detail[:120]}")
++            raise BoardLacksSource(detail[:300]) from exc
++        raise sync.LeaseUnavailable(f"{action}: {exc}") from exc
++    except OSError as exc:
++        raise sync.LeaseUnavailable(f"{action}: {exc}") from exc
++    if not isinstance(res, dict) or res.get("status") != "applied":
++        res = res if isinstance(res, dict) else {}
++        raise SourceCallRefused(str(res.get("reason") or "rejected"), str(res.get("detail") or "")[:300])
++    return res
++
++
++def attach(conn: sqlite3.Connection, task_id: str, run_uid: str, *, mode: str, manifest_revision: int) -> dict:
++    return call(conn, "source_attach", task_id, run_uid, mode=mode, manifest_revision=int(manifest_revision))
++
++
++def publish(conn: sqlite3.Connection, task_id: str, run_uid: str, *, expected_revision: int, manifest: dict) -> dict:
++    return call(conn, "publish_source", task_id, run_uid, expected_revision=int(expected_revision), manifest=manifest)
++
++
++def release(conn: sqlite3.Connection, task_id: str, run_uid: str, **fields: Any) -> dict:
++    """The sync ``/leases release`` with the outbox release's own fields (policy + ``source_receipt``)."""
++    return call(conn, "release", task_id, run_uid, **fields)
++
++
++def renew_remaining(conn: sqlite3.Connection, task_id: str, run_uid: str, ttl_s: int) -> float:
++    """The publish lease fence (v2 §4 step 5): renew synchronously and return the seconds left on the lease.
++    Raises :class:`SourceCallRefused` ``lease_lost`` when the Board did not renew it."""
++    state = sync._state(conn)
++    try:
++        lease = sync._client().renew(board_id=state["board_id"], task_uid=task_id, run_uid=run_uid,
++                                     gateway_id=state["gateway_id"], ttl_s=max(int(ttl_s), 1))
++    except sync._CLIENT_ERRORS as exc:
++        raise SourceCallRefused("lease_lost", f"no Board: {exc}") from exc
++    if not lease.granted or not lease.expires_ms:
++        raise SourceCallRefused("lease_lost", f"renewal refused ({lease.reason or 'not granted'})")
++    from hermes_cli.kanban_db_connect import write_txn
++    with write_txn(conn):
++        conn.execute("UPDATE tasks SET lease_expires = ?, lease_version = COALESCE(?, lease_version) WHERE id = ?",
++                     (lease.expires_ms, lease.version, task_id))
++    return lease.expires_ms / 1000 - time.time()
++
++
++# --- attached runs (local, never synced) --------------------------------------------------------------------------
++
++_RUNS_DDL = ("CREATE TABLE IF NOT EXISTS kanban_source_runs (run_id INTEGER PRIMARY KEY, task_id TEXT NOT NULL, "
++             "run_uid TEXT NOT NULL, mode TEXT NOT NULL, manifest_revision INTEGER NOT NULL, branch TEXT, "
++             "path TEXT, pre_head TEXT, manifest TEXT, state TEXT NOT NULL, at INTEGER NOT NULL)")
++
++
++@dataclass(frozen=True)
++class AttachedRun:
++    run_id: int
++    task_id: str
++    run_uid: str
++    mode: str
++    manifest_revision: int
++    branch: Optional[str]
++    path: Optional[str]
++    pre_head: Optional[str]
++    manifest: Optional[dict]
++    state: str  # pending (asked, answer unknown) | attached
++
++
++def record_run(conn: sqlite3.Connection, run: AttachedRun) -> None:
++    from hermes_cli.kanban_db_connect import write_txn
++    with write_txn(conn):
++        conn.execute(_RUNS_DDL)
++        conn.execute("INSERT OR REPLACE INTO kanban_source_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
++                     (run.run_id, run.task_id, run.run_uid, run.mode, int(run.manifest_revision), run.branch,
++                      run.path, run.pre_head, json.dumps(run.manifest) if run.manifest is not None else None,
++                      run.state, int(time.time())))
++
++
++def attached_run(conn: sqlite3.Connection, run_id: Optional[int]) -> Optional[AttachedRun]:
++    if run_id is None:
++        return None
++    try:
++        row = conn.execute("SELECT run_id, task_id, run_uid, mode, manifest_revision, branch, path, pre_head, "
++                           "manifest, state FROM kanban_source_runs WHERE run_id = ?", (int(run_id),)).fetchone()
++    except sqlite3.OperationalError:
++        return None
++    if row is None:
++        return None
++    return AttachedRun(int(row[0]), row[1], row[2], row[3], int(row[4]), row[5], row[6], row[7],
++                       json.loads(row[8]) if row[8] else None, row[9])
++
++
++def update_run(conn: sqlite3.Connection, run_id: int, **changes: Any) -> None:
++    from hermes_cli.kanban_db_connect import write_txn
++    sets = ", ".join(f"{k} = ?" for k in changes)
++    values = [json.dumps(v) if k == "manifest" and v is not None else v for k, v in changes.items()]
++    with write_txn(conn):
++        conn.execute(_RUNS_DDL)
++        conn.execute(f"UPDATE kanban_source_runs SET {sets} WHERE run_id = ?", (*values, int(run_id)))
+diff --git a/hermes_cli/kanban_source_dispatch.py b/hermes_cli/kanban_source_dispatch.py
+index 1a3bd0118b..e84f10976e 100644
+--- a/hermes_cli/kanban_source_dispatch.py
++++ b/hermes_cli/kanban_source_dispatch.py
+@@ -27,8 +27,19 @@ def _me(conn: sqlite3.Connection) -> Optional[str]:
+ def resolve(conn: sqlite3.Connection, claimed: Any, *, board: Optional[str], kbw: Any):
+     """``(workspace, branch_name, source)``: a card whose grant snapshot carries custody or a manifest goes to the
+     source resolver whatever its ``workspace_kind`` (the legacy HEAD-create, ``default_workdir`` anchor and other-task
+-    branch reuse are unreachable for it); every other card takes the legacy path unchanged."""
++    branch reuse are unreachable for it); every other card takes the legacy path unchanged.
++
++    S2 (v4, v4.1 §B): a primary grant made with ``source_protocol`` whose response has no snapshot keys is an old
++    Board. This process then stops sending the protocol, and a card whose REPLICA already carries custody or a
++    manifest is refused here (released, host-scope memo) instead of falling back to the legacy path."""
+     snapshot = ws.pop_grant_snapshot(claimed.id)
++    from hermes_cli import kanban_source_launch as launch
++    launch.note_grant(claimed.id, snapshot)
++    if snapshot is None and launch.old_board_grant(conn, claimed):
++        replica = _replica(conn, claimed.id)
++        if replica is not None and replica.has_source:
++            raise WorkspaceSourceRefusal("board_lacks_source", "the Board answered without a source snapshot",
++                                         evidence={"manifest_revision": _replica_revision(replica)})
+     if snapshot is not None and snapshot.has_source:
+         from hermes_cli.kanban_source_resolver import resolve_source_workspace
+         ttl = (claimed.claim_expires - time.time()) if getattr(claimed, "claim_expires", None) else None
+@@ -46,7 +57,6 @@ def resolve(conn: sqlite3.Connection, claimed: Any, *, board: Optional[str], kbw
+                 revision = snapshot.custody.manifest_revision if snapshot.custody else None
+             exc.evidence["manifest_revision"] = revision
+             raise
+-        _materialized_event(conn, claimed, snapshot, source)
+         return Path(source.path), source.branch, source
+     if claimed.workspace_kind == "worktree":
+         workspace, branch = kbw.resolve_worktree_for_dispatch(conn, claimed, board=board)
+@@ -54,8 +64,23 @@ def resolve(conn: sqlite3.Connection, claimed: Any, *, board: Optional[str], kbw
+     return kbw.resolve_workspace(claimed, board=board), None, None
+ 
+ 
+-def _materialized_event(conn: sqlite3.Connection, claimed: Any, snapshot: Any, source: Any) -> None:
+-    """``workspace_source_materialized`` (v2 §6 step 5). PR-2 moves it after ``source_attach``."""
++def _replica(conn: sqlite3.Connection, task_id: str) -> Optional[ws.SourceSnapshot]:
++    try:
++        row = conn.execute("SELECT workspace_source, workspace_custody FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    except sqlite3.OperationalError:
++        return None
++    return ws.replica_snapshot(row) if row is not None else None
++
++
++def _replica_revision(snapshot: ws.SourceSnapshot) -> Optional[int]:
++    try:
++        return snapshot.manifest().manifest_revision
++    except ws.ManifestInvalid:
++        return snapshot.custody.manifest_revision if snapshot.custody else None
++
++
++def materialized_event(conn: sqlite3.Connection, claimed: Any, snapshot: Any, source: Any) -> None:
++    """``workspace_source_materialized`` (v2 §6 step 5), emitted once the run attached (v3 §6)."""
+     from hermes_cli import kanban_db as kb
+     run_id = getattr(claimed, "current_run_id", None)
+     row = conn.execute("SELECT uid FROM task_runs WHERE id = ?", (run_id,)).fetchone() if run_id else None
+diff --git a/hermes_cli/kanban_source_launch.py b/hermes_cli/kanban_source_launch.py
+new file mode 100644
+index 0000000000..25ab11d8ef
+--- /dev/null
++++ b/hermes_cli/kanban_source_launch.py
+@@ -0,0 +1,315 @@
++"""workspace_source v1 (core PR-2): from a resolved workspace to a started worker, for every dispatched card.
++
++Moved out of ``kanban_db_dispatch._dispatch_lane_task`` (file-size ratchet) and extended with the source steps:
++
++1. ``source_attach`` after the resolver and BEFORE spawn (v3 §6): a source card's run joins custody; a legacy worktree
++   card's creator adopts it (``legacy_adopt``, v4 S4). A refused attach releases the grant unused and spawns nothing.
++2. Nothing renews the lease between attach and spawn (v4.1 R2-a; pinned by a spy test).
++3. Any abort between attach and the worker start (admission refusal, model tier, spawn raising a typed not-started
++   error) PRE-EMPTS ``_record_task_failure``: it releases first with ``source_receipt{state: unchanged, abort:
++   pre_spawn}`` (sync ``/leases release``, then the outbox release as fallback; first wins per run_uid), so the Board
++   can restore custody and still counts the failure. A failure once a process may exist kills the worker and sends
++   ``retained`` (R2-a post-pid).
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import sqlite3
++import subprocess
++from typing import Any, Callable, Optional
++
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_source_board as board_calls
++from hermes_cli import kanban_workspace_source as ws
++
++_log = logging.getLogger(__name__)
++
++_NO_SNAPSHOT = object()
++_GRANTS: dict[str, Any] = {}
++
++
++class SpawnNotStarted(RuntimeError):
++    """A ``spawn_fn`` refusal raised before any process existed (the only spawn error a pre-spawn restore trusts)."""
++
++
++def _not_started_types() -> tuple[type, ...]:
++    from tools.process_registry import RestartSafeScopeUnavailable
++    return (SpawnNotStarted, RestartSafeScopeUnavailable)
++
++
++# --- grant bookkeeping ---------------------------------------------------------------------------------------------
++
++def note_grant(task_id: str, snapshot: Optional[ws.SourceSnapshot]) -> None:
++    _GRANTS[task_id] = _NO_SNAPSHOT if snapshot is None else snapshot
++
++
++def _pop_grant(task_id: str) -> Any:
++    return _GRANTS.pop(task_id, _NO_SNAPSHOT)
++
++
++def old_board_grant(conn: sqlite3.Connection, claimed: Any) -> bool:
++    """A primary grant asked with ``source_protocol`` came back with no snapshot keys: an old Board (v4 S2)."""
++    if sync.board_mode(conn) != "primary" or board_calls.board_lacks_source() or not ws.settings().enabled:
++        return False
++    board_calls.mark_board_lacks_source(f"grant of {claimed.id} carried no source snapshot")
++    return True
++
++
++# --- observation ---------------------------------------------------------------------------------------------------
++
++def _git(path: str, *args: str) -> Optional[str]:
++    try:
++        out = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, timeout=30,
++                             stdin=subprocess.DEVNULL, check=False)
++    except (OSError, subprocess.TimeoutExpired):
++        return None
++    return out.stdout.strip() if out.returncode == 0 else None
++
++
++def observe(path: Optional[str], branch: Optional[str]) -> dict:
++    """``{head, branch, clean}`` of a worktree (all None/False when it cannot be read)."""
++    if not path:
++        return {"head": None, "branch": None, "clean": False}
++    status = _git(path, "status", "--porcelain", "--untracked-files=all")
++    return {"head": _git(path, "rev-parse", "--verify", "-q", "HEAD"),
++            "branch": _git(path, "symbolic-ref", "-q", "--short", "HEAD"), "clean": status == ""}
++
++
++# --- attach --------------------------------------------------------------------------------------------------------
++
++class AttachRefused(Exception):
++    def __init__(self, code: str, detail: str, *, uncertain: bool = False):
++        self.code, self.detail, self.uncertain = code, detail, uncertain
++        super().__init__(f"{code}: {detail}")
++
++
++def _me(conn: sqlite3.Connection) -> Optional[str]:
++    from hermes_cli.kanban_source_dispatch import _me as me
++    return me(conn)
++
++
++def _attach_plan(conn: sqlite3.Connection, claimed: Any, source: Any, grant: Any) -> Optional[tuple[str, int, Any]]:
++    """``(mode, manifest_revision, manifest)`` this run attaches with, or None (a plain card: no custody)."""
++    if source is not None:
++        manifest = grant.manifest().raw if isinstance(grant, ws.SourceSnapshot) and grant.manifest_value else None
++        return source.mode, int(source.manifest_revision or 0), manifest
++    if (grant is _NO_SNAPSHOT or not isinstance(grant, ws.SourceSnapshot) or grant.has_source
++            or claimed.workspace_kind != "worktree" or not ws.settings().enabled):
++        return None
++    created_on = getattr(claimed, "created_on", None)
++    if not created_on or created_on != _me(conn):
++        return None
++    return "legacy_adopt", 0, None
++
++
++def attach(conn: sqlite3.Connection, claimed: Any, workspace: str, source: Any,
++           grant: Any) -> Optional[board_calls.AttachedRun]:
++    """Join custody (v3 §6). None: nothing to attach (plain card, legacy fallback). Raises :class:`AttachRefused`
++    when the run must not spawn (the grant is then released unused)."""
++    if sync.board_mode(conn) != "primary" or board_calls.board_lacks_source():
++        return None
++    plan = _attach_plan(conn, claimed, source, grant)
++    if plan is None:
++        return None
++    mode, revision, manifest = plan
++    run_uid = sync.run_uid(conn, claimed.current_run_id)
++    if not run_uid:
++        raise AttachRefused("no_run_uid", "the run has no portable identity")
++    seen = observe(str(workspace), None)
++    run = board_calls.AttachedRun(
++        run_id=int(claimed.current_run_id), task_id=claimed.id, run_uid=run_uid, mode=mode,
++        manifest_revision=revision, branch=(source.branch if source is not None else seen["branch"]),
++        path=str(workspace), pre_head=seen["head"], manifest=manifest, state="pending")
++    board_calls.record_run(conn, run)  # before the call: an unanswered attach may have applied
++    try:
++        board_calls.attach(conn, claimed.id, run_uid, mode=mode, manifest_revision=revision)
++    except board_calls.BoardLacksSource as exc:
++        _forget(conn, run.run_id)
++        if source is not None:
++            raise AttachRefused("board_lacks_source", exc.detail) from exc
++        return None  # a legacy card on an old Board runs exactly as before, with no custody
++    except board_calls.SourceCallRefused as exc:
++        _forget(conn, run.run_id)
++        if mode == "legacy_adopt" and exc.code == "legacy_adopt_refused":
++            _log.info("workspace_source: %s not adopted (%s); it runs without custody", claimed.id, exc)
++            return None
++        raise AttachRefused(exc.code, exc.detail) from exc
++    except sync.LeaseUnavailable as exc:
++        raise AttachRefused("attach_unanswered", str(exc), uncertain=True) from exc
++    board_calls.update_run(conn, run.run_id, state="attached")
++    return board_calls.attached_run(conn, run.run_id)
++
++
++def _forget(conn: sqlite3.Connection, run_id: int) -> None:
++    from hermes_cli.kanban_db_connect import write_txn
++    with write_txn(conn):
++        conn.execute("DELETE FROM kanban_source_runs WHERE run_id = ?", (int(run_id),))
++
++
++# --- release with a receipt (pre-empts _record_task_failure) ---------------------------------------------------------
++
++def abort_receipt(run: board_calls.AttachedRun, *, not_started: bool) -> dict:
++    """``unchanged`` + ``abort: pre_spawn`` when no process ever started and the worktree is exactly what attached
++    (clean, on B, HEAD == manifest.commit, or == the pre-attach HEAD with no manifest); ``retained`` otherwise."""
++    commit = (run.manifest or {}).get("commit") if run.manifest else None
++    seen = observe(run.path, run.branch)
++    expected = commit or run.pre_head
++    same = (seen["clean"] and seen["head"] is not None and seen["head"] == expected
++            and (run.branch is None or seen["branch"] == run.branch))
++    if not_started and same:
++        return {"run_uid": run.run_uid, "state": "unchanged", "abort": "pre_spawn",
++                "manifest_revision": run.manifest_revision, "commit": commit}
++    reason = "post_spawn_failure" if not not_started else "pre_spawn_worktree_changed"
++    return {"run_uid": run.run_uid, "state": "retained", "manifest_revision": run.manifest_revision,
++            "commit": None, "reason": reason}
++
++
++def release_with_receipt(conn: sqlite3.Connection, task_id: str, run_id: int, receipt: dict, *, outcome: str,
++                         error: str, **policy: Any) -> str:
++    """Release this run carrying ``receipt``: sync ``/leases release`` first, the outbox release as fallback. Either
++    way a ``kanban_failure_commands`` row claims the run_uid FIRST, so a later ``_record_task_failure`` (whose
++    ``queue`` is first-wins) adds no second release. Returns ``sync`` / ``outbox`` / ``taken`` (already queued)."""
++    from hermes_cli import kanban_failure_release as release
++    from hermes_cli.kanban_db_connect import write_txn
++    uid = sync.run_uid(conn, run_id)
++    if not uid:
++        raise ValueError("a source release needs the run's portable identity")
++    if release.queued(conn, run_id):
++        return "taken"
++    fields = {**policy, "outcome": outcome, "error": error[:500], "source_receipt": receipt}
++    try:
++        board_calls.release(conn, task_id, uid, **fields)
++    except (board_calls.SourceCallRefused, sync.LeaseUnavailable) as exc:
++        _log.info("workspace_source: sync release of %s failed (%s); queueing it", task_id, exc)
++        with write_txn(conn):
++            release.queue(conn, task_id, run_id, **{k: v for k, v in fields.items() if k != "error"},
++                          error=error)
++        return "outbox"
++    with write_txn(conn):
++        conn.execute("CREATE TABLE IF NOT EXISTS kanban_failure_commands (run_uid TEXT PRIMARY KEY, task_id TEXT NOT "
++                     "NULL REFERENCES tasks(id) ON DELETE CASCADE, op_id TEXT NOT NULL)")
++        conn.execute("INSERT OR IGNORE INTO kanban_failure_commands VALUES (?, ?, ?)", (uid, task_id, "sync"))
++    return "sync"
++
++
++def abort_attached(conn: sqlite3.Connection, claimed: Any, run: board_calls.AttachedRun, *, not_started: bool,
++                   pid: Optional[int], outcome: str, error: str, **policy: Any) -> dict:
++    """The pre-spawn abort helper (v4 §2.2, v4.1 R2-a). Kills a worker that may exist, then releases with the
++    receipt BEFORE the caller's ``_record_task_failure``."""
++    if pid:
++        from hermes_cli import kanban_db_dispatch as dispatch
++        dispatch._terminate_reclaimed_worker(int(pid), claimed.claim_lock)
++    receipt = abort_receipt(run, not_started=not_started and not pid)
++    how = release_with_receipt(conn, claimed.id, run.run_id, receipt, outcome=outcome, error=error, **policy)
++    board_calls.update_run(conn, run.run_id, state="aborted")
++    _log.info("workspace_source: %s aborted before its worker ran (%s, %s release)", claimed.id, receipt["state"], how)
++    return receipt
++
++
++# --- the launch ----------------------------------------------------------------------------------------------------
++
++def _source_env(source: Any) -> dict:
++    return {k: v for k, v in (("HERMES_KANBAN_SOURCE_COMMIT", source.commit), ("HERMES_KANBAN_SOURCE_PATH", source.path),
++                              ("HERMES_KANBAN_SOURCE_BRANCH", source.branch)) if v}
++
++
++def _prepare(conn: sqlite3.Connection, claimed: Any, workspace: Any, branch: Optional[str], source: Any) -> None:
++    from hermes_cli import kanban_db_dispatch as dispatch
++    kbw = dispatch._kbw
++    kbw.set_workspace_path(conn, claimed.id, str(workspace))
++    if source is not None:  # the source branch is the manifest's (fenced): record it only on a card without one
++        if not (claimed.branch_name or "").strip():
++            kbw.set_branch_name(conn, claimed.id, source.branch)
++            claimed.branch_name = source.branch
++        kbw._maybe_emit_scratch_tip(conn, claimed.id, "worktree")
++        claimed.source_env = _source_env(source)
++        return
++    if claimed.workspace_kind == "worktree":
++        kbw.set_branch_name(conn, claimed.id, branch or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
++    kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
++
++
++def _attach_or_release(conn: sqlite3.Connection, claimed: Any, workspace: Any, source: Any, grant: Any,
++                       result: Any) -> tuple[bool, Optional[board_calls.AttachedRun]]:
++    try:
++        run = attach(conn, claimed, str(workspace), source, grant)
++    except AttachRefused as exc:
++        from hermes_cli import kanban_db_dispatch as dispatch
++        _log.info("workspace_source: %s not attached (%s); releasing the grant unused", claimed.id, exc)
++        error = f"workspace_source: attach refused ({exc})"
++        run = board_calls.attached_run(conn, claimed.current_run_id)
++        if run is not None:  # the attach may have applied: the receipt lets the Board put custody back
++            abort_attached(conn, claimed, run, not_started=True, pid=None, outcome="released", error=error,
++                           unused_grant=True)
++        else:
++            from hermes_cli import kanban_failure_release as release
++            from hermes_cli.kanban_db_connect import write_txn
++            with write_txn(conn):
++                release.queue(conn, claimed.id, claimed.current_run_id, outcome="released", unused_grant=True,
++                              error=error)
++        dispatch._record_task_failure(conn, claimed.id, error, outcome="released", release_claim=True,
++                                      end_run=True, infrastructure=True)
++        result.respawn_guarded.append((claimed.id, f"workspace_source_attach_refused:{exc.code}"))
++        return False, None
++    if source is not None:
++        from hermes_cli.kanban_source_dispatch import materialized_event
++        materialized_event(conn, claimed, grant if isinstance(grant, ws.SourceSnapshot) else None, source)
++    return True, run
++
++
++def launch(conn: sqlite3.Connection, claimed: Any, workspace: Any, branch: Optional[str], source: Any, *,
++           lane: str, board: Optional[str], spawn_fn: Callable, failure_limit: int, result: Any,
++           count_spawn: Callable[[str], None]) -> bool:
++    """Record the workspace, attach (source/legacy-adopt cards), then spawn. True when a spawn slot was used."""
++    from hermes_cli import kanban_db_dispatch as dispatch
++    grant = _pop_grant(claimed.id)
++    _prepare(conn, claimed, workspace, branch, source)
++    ok, run = _attach_or_release(conn, claimed, workspace, source, grant, result)
++    if not ok:
++        return False
++    if lane == "review":
++        # Force-load sdlc-review; the kanban lifecycle is already in every
++        # worker's system prompt via KANBAN_GUIDANCE.
++        claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
++    from hermes_cli.kanban_model_tier import apply_model_tier
++    stage, pid = "pre_spawn", None
++    try:  # Apply inside spawn accounting: an unavailable independent reviewer fails closed.
++        apply_model_tier(conn, claimed, lane=lane)
++        stage = "spawning"
++        pid = dispatch._call_spawn_fn(spawn_fn, claimed, str(workspace), board)
++        stage = "spawned"
++        if pid:
++            dispatch._set_worker_pid(conn, claimed.id, int(pid), run_id=claimed.current_run_id,
++                                     claim_lock=claimed.claim_lock)
++        # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
++        dispatch._kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
++        # consecutive_failures is deliberately NOT reset here: resetting on spawn would let a task that keeps
++        # timing out loop forever. Cleared only on successful completion (complete_task).
++        result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
++        count_spawn(claimed.assignee)
++        return True
++    except Exception as exc:
++        from hermes_cli.kanban_review_model import admission_refusal
++        # Admission failed before any worker ran; preserve its retry budget (a repeated review refusal: visible block).
++        infrastructure, exhausted, extra = admission_refusal(conn, claimed.id, exc)
++        if infrastructure:
++            dispatch._kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s",
++                                      claimed.id, exc)
++        if run is not None:
++            not_started = stage == "pre_spawn" or (stage == "spawning" and isinstance(exc, _not_started_types()))
++            abort_attached(conn, claimed, run, not_started=not_started, pid=pid, outcome="spawn_failed",
++                           error=str(exc), failure_limit=failure_limit, force_trip=exhausted,
++                           infrastructure=infrastructure, block_kind="transient", extra=extra or {})
++        if dispatch._record_task_failure(
++            conn, claimed.id, str(exc),
++            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
++            infrastructure=infrastructure, force_trip=exhausted, event_payload_extra=extra,
++        ):
++            result.auto_blocked.append(claimed.id)
++        return False
++
++
++def receipt_json(receipt: dict) -> str:
++    return json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index b8772a2486..f086670ead 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1966,9 +1966,9 @@ class HubLeaseClient:
+                           version=res.get("version"), source_snapshot=snapshot_from_row(res.get("row")))
+ 
+     def acquire(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str, ttl_s: int,
+-                lane: str = "ready") -> sync.Lease:
+-        return self._lease(board_id, {"action": "grant", "task": task_uid, "run_uid": run_uid, "ttl_s": ttl_s,
+-                                      "lane": lane}, run_uid)
++                lane: str = "ready", source_protocol: Optional[int] = None) -> sync.Lease:
++        return self._lease(board_id, {"action": "grant", "task": task_uid, "run_uid": run_uid, "ttl_s": ttl_s, "lane": lane,
++                                      **({"source_protocol": source_protocol} if source_protocol else {})}, run_uid)
+ 
+     def renew(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str, ttl_s: int) -> sync.Lease:
+         return self._lease(board_id, {"action": "renew", "task": task_uid, "run_uid": run_uid, "ttl_s": ttl_s}, run_uid)
+diff --git a/hermes_cli/kanban_workspace_source.py b/hermes_cli/kanban_workspace_source.py
+index 68926ff9f4..0e43c433f9 100644
+--- a/hermes_cli/kanban_workspace_source.py
++++ b/hermes_cli/kanban_workspace_source.py
+@@ -42,7 +42,7 @@ SOURCE_KINDS = frozenset({"task_worktree", "scratch_external"})
+ # v3 §6b: host scope releases the grant and memoizes ``(task, manifest_revision)``; card scope releases and blocks.
+ HOST_SCOPE = frozenset({"wrong_repo", "origin_rewritten", "origin_unreachable", "occupied_path", "dirty_destination",
+                         "diverged_local_branch", "clone_missing", "materialize_timeout", "custody_not_portable",
+-                        "source_disabled"})
++                        "source_disabled", "board_lacks_source"})
+ CARD_SCOPE = frozenset({"remote_drift", "remote_branch_missing", "manifest_invalid", "custody_source_missing"})
+ FENCED_COLUMNS = frozenset({"workspace_kind", "branch_name"})
+ SKIP_MEMO_SECONDS = 6 * 3600
+@@ -337,8 +337,13 @@ def pickup_skip(conn: sqlite3.Connection, card: Any, own: str, *, cfg: Optional[
+         else:
+             cfg = settings()
+     snap = replica_snapshot(card)
++    if cfg.enabled and snap is not None and not snap.has_source and _legacy_foreign_worktree(card, own):
++        return "workspace_source: a legacy worktree card is adopted only by its creator"
+     if not cfg.enabled or snap is None or not snap.has_source:
+         return None
++    from hermes_cli.kanban_source_board import board_lacks_source
++    if board_lacks_source():  # S2: an old Board never gets a source card through the legacy path
++        return "workspace_source: the Board lacks the source protocol"
+     if snap.custody is not None and snap.custody.source_holder == own:
+         return None
+     try:
+@@ -366,6 +371,15 @@ def pickup_skip(conn: sqlite3.Connection, card: Any, own: str, *, cfg: Optional[
+ 
+ # --- R4c fence -------------------------------------------------------------------------------------------------------
+ 
++def _legacy_foreign_worktree(card: Any, own: str) -> bool:
++    """v4 S4: a worktree card with no custody and no manifest whose creator is another gateway (only the creator may
++    ``legacy_adopt`` it; its worktree lives there)."""
++    keys = card.keys() if hasattr(card, "keys") else ()
++    if "workspace_kind" not in keys or "created_on" not in keys:
++        return False
++    return card["workspace_kind"] == "worktree" and bool(card["created_on"]) and card["created_on"] != own
++
++
+ def fence(conn: sqlite3.Connection, task_id: str, column: str, value: Any) -> None:
+     """Refuse a CHANGED ``workspace_kind``/``branch_name`` on a card whose replica carries custody or a manifest
+     (the Board fences the same fields; refusing here first keeps the op out of the outbox)."""
+diff --git a/tests/hermes_cli/test_kanban_workspace_source.py b/tests/hermes_cli/test_kanban_workspace_source.py
+index 4c7a93fd23..c59f2e57a1 100644
+--- a/tests/hermes_cli/test_kanban_workspace_source.py
++++ b/tests/hermes_cli/test_kanban_workspace_source.py
+@@ -274,8 +274,10 @@ def test_dispatch_routes_before_kind_branch(conn, monkeypatch, kind):
+         kws.stash_grant_snapshot(task_id, snapshot)
+         return kb.get_task(conn_, task_id)
+     monkeypatch.setattr(admission, "admitted_claim", claim)
+-    for name in ("resolve_workspace", "resolve_worktree_for_dispatch", "_ensure_git_worktree", "set_branch_name"):
++    for name in ("resolve_workspace", "resolve_worktree_for_dispatch", "_ensure_git_worktree"):
+         monkeypatch.setattr(d._kbw, name, lambda *a, **kw: pytest.fail("legacy kind resolver/writer reached"))
++    branches = []
++    monkeypatch.setattr(d._kbw, "set_branch_name", lambda conn_, task_id, b: branches.append(b))
+     seen = []
+ 
+     def source(conn_, task_, snap, **kw):
+@@ -293,6 +295,7 @@ def test_dispatch_routes_before_kind_branch(conn, monkeypatch, kind):
+     assert seen == [tid] and spawned == [(tid, "/source/exact")]
+     assert result.spawned == [(tid, "worker", "/source/exact")]
+     assert kb.get_task(conn, tid).workspace_path == "/source/exact"
++    assert branches == ["wt/exact"]  # the branch comes from the manifest (source branch), never the legacy default
+ 
+ 
+ # --- pickup skip + skip memo ----------------------------------------------------------------------------------------
+-- 
+2.43.0
+

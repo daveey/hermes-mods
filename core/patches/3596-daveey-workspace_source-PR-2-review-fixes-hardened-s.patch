@@ -1,0 +1,284 @@
+From f54d0fbd74ee1b324b77e12f27557274e1098782 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:08:26 +0000
+Subject: [PATCH] =?UTF-8?q?[daveey]=20workspace=5Fsource=20PR-2:=20review?=
+ =?UTF-8?q?=20fixes=20=E2=80=94=20hardened=20secret=20scan=20(forced=20git?=
+ =?UTF-8?q?=20config,=20--text,=20-z=20names,=20multi-line=20keys),=20S2?=
+ =?UTF-8?q?=20refuses=20every=20later=20custody=20card,=20no=20grant=20lea?=
+ =?UTF-8?q?k=20on=20resolve=20raise?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ hermes_cli/kanban_source_dispatch.py          |  8 +++
+ hermes_cli/kanban_source_launch.py            | 13 +++-
+ hermes_cli/kanban_source_publish.py           | 72 ++++++++++++++-----
+ tests/hermes_cli/test_kanban_source_launch.py | 32 +++++++++
+ .../hermes_cli/test_kanban_source_publish.py  | 32 +++++++++
+ .../hermes_cli/test_kanban_source_resolver.py |  1 +
+ 6 files changed, 138 insertions(+), 20 deletions(-)
+
+diff --git a/hermes_cli/kanban_source_dispatch.py b/hermes_cli/kanban_source_dispatch.py
+index e84f10976e..12a75f6cee 100644
+--- a/hermes_cli/kanban_source_dispatch.py
++++ b/hermes_cli/kanban_source_dispatch.py
+@@ -35,6 +35,14 @@ def resolve(conn: sqlite3.Connection, claimed: Any, *, board: Optional[str], kbw
+     snapshot = ws.pop_grant_snapshot(claimed.id)
+     from hermes_cli import kanban_source_launch as launch
+     launch.note_grant(claimed.id, snapshot)
++    try:
++        return _resolve(conn, claimed, snapshot, launch, board=board, kbw=kbw)
++    except BaseException:
++        launch.drop_grant(claimed.id)  # launch() never runs for this claim: do not keep its grant
++        raise
++
++
++def _resolve(conn: sqlite3.Connection, claimed: Any, snapshot: Any, launch: Any, *, board: Optional[str], kbw: Any):
+     if snapshot is None and launch.old_board_grant(conn, claimed):
+         replica = _replica(conn, claimed.id)
+         if replica is not None and replica.has_source:
+diff --git a/hermes_cli/kanban_source_launch.py b/hermes_cli/kanban_source_launch.py
+index c96c5e7d79..1d37051702 100644
+--- a/hermes_cli/kanban_source_launch.py
++++ b/hermes_cli/kanban_source_launch.py
+@@ -49,11 +49,18 @@ def _pop_grant(task_id: str) -> Any:
+     return _GRANTS.pop(task_id, _NO_SNAPSHOT)
+ 
+ 
++def drop_grant(task_id: str) -> None:
++    _GRANTS.pop(task_id, None)
++
++
+ def old_board_grant(conn: sqlite3.Connection, claimed: Any) -> bool:
+-    """A primary grant asked with ``source_protocol`` came back with no snapshot keys: an old Board (v4 S2)."""
+-    if sync.board_mode(conn) != "primary" or board_calls.board_lacks_source() or not ws.settings().enabled:
++    """This grant came from an old Board (v4 S2): a primary grant asked with ``source_protocol`` came back with no
++    snapshot keys (detected now), or an earlier grant already showed it (this process then stops sending the
++    protocol, so every later grant lacks the keys too and its card must still never take the legacy path)."""
++    if sync.board_mode(conn) != "primary" or not ws.settings().enabled:
+         return False
+-    board_calls.mark_board_lacks_source(f"grant of {claimed.id} carried no source snapshot")
++    if not board_calls.board_lacks_source():
++        board_calls.mark_board_lacks_source(f"grant of {claimed.id} carried no source snapshot")
+     return True
+ 
+ 
+diff --git a/hermes_cli/kanban_source_publish.py b/hermes_cli/kanban_source_publish.py
+index 2a1c588271..9bb690ac37 100644
+--- a/hermes_cli/kanban_source_publish.py
++++ b/hermes_cli/kanban_source_publish.py
+@@ -24,7 +24,13 @@ from hermes_cli.kanban_workspace_source import Settings
+ 
+ MAX_SCAN_COMMITS = 500
+ MAX_SCAN_BYTES = 20 * 1024 * 1024
+-DENYLIST = (".env*", "*.pem", "id_rsa*", "*.p12", "*.key", "credentials*.json")
++DENYLIST = (".env*", "*.pem", "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*", "*.p12", "*.pfx", "*.ppk", "*.key",
++            "*.jks", "*.keystore", ".netrc", ".pgpass", "credentials*.json")
++# Config the clone may carry that would blind or reshape ``git show`` output (colour codes, prefixes, quoting,
++# signatures); forced off for every scan call. ``--no-ext-diff``/``--no-textconv``/``--text`` sit on the commands.
++_SCAN_CONFIG = ("-c", "color.ui=never", "-c", "color.diff=never", "-c", "core.quotePath=false",
++                "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "log.showSignature=false")
++_KEY_MARKER = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----")
+ # Ignored paths that are build/tool caches, never private data (v2 §4 step 2).
+ IGNORED_ALLOWLIST = ("__pycache__", "*.pyc", "*.pyo", ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules",
+                      ".venv", "venv", ".tox", "dist", "build", "*.egg-info", ".DS_Store", ".coverage", "htmlcov",
+@@ -157,23 +163,46 @@ def _secret_in(text: str) -> bool:
+     return bool(text.strip()) and redact_sensitive_text(text, force=True) != text
+ 
+ 
++def _denylisted(rel: str) -> bool:
++    return any(fnmatch.fnmatch(Path(rel).name, pat) for pat in DENYLIST)
++
++
++def _show(deadline: _Deadline, path: str, *args: str) -> str:
++    return _git(deadline, path, *_SCAN_CONFIG, "show", "--no-color", "--no-ext-diff", "--no-textconv", *args)
++
++
++def _changed_paths(names: str) -> list[str]:
++    """Target paths of added/renamed/copied/modified entries in ``--name-status -z`` output (never quoted)."""
++    fields, out, i = names.split("\0"), [], 0
++    while i < len(fields):
++        status = fields[i]
++        if not status:
++            i += 1
++            continue
++        width = 2 if status[:1] in ("R", "C") else 1
++        paths = fields[i + 1:i + 1 + width]
++        if status[:1] in ("A", "R", "C", "M", "T") and paths:
++            out.append(paths[-1])
++        i += 1 + width
++    return out
++
++
+ def secret_scan(deadline: _Deadline, path: str, base: str, head: str) -> None:
+     commits = _git(deadline, path, "rev-list", head, f"^{base}").split()
+     if len(commits) > MAX_SCAN_COMMITS:
+         raise PublishRefused("scan_range_too_large", f"{len(commits)} commits > {MAX_SCAN_COMMITS}")
+     total = 0
+     for commit in commits:
+-        names = _git(deadline, path, "show", "--format=", "--name-status", "--find-renames", commit)
+-        for line in names.splitlines():
+-            status, *paths = line.split("\t")
+-            if status[:1] in ("A", "R", "C", "M") and paths:
+-                target = paths[-1]
+-                if any(fnmatch.fnmatch(Path(target).name, pat) for pat in DENYLIST):
+-                    raise PublishRefused("secret_scan_refused", f"commit {commit[:12]} adds denylisted path {target}")
+-        message = _git(deadline, path, "show", "-s", "--format=%B", commit)
+-        if _secret_in(message):
++        for target in _changed_paths(_show(deadline, path, "--format=", "--name-status", "-z", "--find-renames",
++                                           commit)):
++            if _denylisted(target):
++                raise PublishRefused("secret_scan_refused", f"commit {commit[:12]} adds denylisted path {target}")
++        message = _show(deadline, path, "-s", "--format=%B", commit)
++        if _secret_in(message) or _KEY_MARKER.search(message):
+             raise PublishRefused("secret_scan_refused", f"commit {commit[:12]} message holds a credential")
+-        patch = _git(deadline, path, "show", "--format=", "--patch", "--find-renames", "--binary", commit)
++        # --text: ``-diff``/``binary`` attributes must not hide content; explicit prefixes whatever the config says.
++        patch = _show(deadline, path, "--format=", "--patch", "--text", "--find-renames", "--src-prefix=a/",
++                      "--dst-prefix=b/", commit)
+         total += len(patch.encode("utf-8", "replace"))
+         if total > MAX_SCAN_BYTES:
+             raise PublishRefused("scan_range_too_large", f"patches exceed {MAX_SCAN_BYTES} bytes")
+@@ -181,8 +210,18 @@ def secret_scan(deadline: _Deadline, path: str, base: str, head: str) -> None:
+ 
+ 
+ def _scan_patch(commit: str, patch: str) -> None:
+-    current, line_no = None, 0
++    """Each added line, then each file's added lines joined (multi-line credentials such as PEM blocks)."""
++    current, line_no, added = None, 0, []
++
++    def flush() -> None:
++        if added and _secret_in("\n".join(added)):
++            raise PublishRefused("secret_scan_refused", f"commit {commit[:12]} {current} adds a credential")
++        added.clear()
++
+     for raw in patch.splitlines():
++        if raw.startswith("diff --git "):
++            flush()
++            continue
+         if raw.startswith("+++ "):
+             current = raw[6:] if raw.startswith("+++ b/") else raw[4:]
+             continue
+@@ -190,16 +229,15 @@ def _scan_patch(commit: str, patch: str) -> None:
+             m = re.search(r"\+(\d+)", raw)
+             line_no = int(m.group(1)) - 1 if m else 0
+             continue
+-        if raw.startswith("GIT binary patch") and current and any(
+-                fnmatch.fnmatch(Path(current).name, pat) for pat in DENYLIST):
+-            raise PublishRefused("secret_scan_refused", f"commit {commit[:12]} adds denylisted binary {current}")
+-        if raw.startswith("+") and not raw.startswith("+++"):
++        if raw.startswith("+"):
+             line_no += 1
+-            if _secret_in(raw[1:]):
++            added.append(raw[1:])
++            if _secret_in(raw[1:]) or _KEY_MARKER.search(raw):
+                 raise PublishRefused("secret_scan_refused",
+                                      f"commit {commit[:12]} {current}:{line_no} adds a credential")
+         elif not raw.startswith("-"):
+             line_no += 1
++    flush()
+ 
+ 
+ # --- the publish --------------------------------------------------------------------------------------------------
+diff --git a/tests/hermes_cli/test_kanban_source_launch.py b/tests/hermes_cli/test_kanban_source_launch.py
+index 1c676c2bb8..60e341f4ec 100644
+--- a/tests/hermes_cli/test_kanban_source_launch.py
++++ b/tests/hermes_cli/test_kanban_source_launch.py
+@@ -271,6 +271,38 @@ def test_old_board_skips_card_with_replica_custody(conn, board, dispatcher):
+     assert spawned == [] and kbs.board_lacks_source()
+ 
+ 
++def _custody_card(conn, title):
++    tid = kb.create_task(conn, title=title, assignee="worker")
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE kanban_sync_state SET applying=1")
++        conn.execute("UPDATE tasks SET workspace_kind='worktree', workspace_source=?, workspace_custody=? WHERE id=?",
++                     (json.dumps(manifest()), json.dumps({"source_holder": "hub", "state": "published",
++                                                          "manifest_revision": 3}), tid))
++        conn.execute("UPDATE kanban_sync_state SET applying=0")
++    return tid
++
++
++def test_old_board_skips_every_later_card_with_replica_custody(conn, board, dispatcher, monkeypatch):
++    """Once this process knows the Board is old, EVERY later custody card is refused too (not only the first one
++    that tripped the detection), and none reaches the legacy resolver."""
++    from hermes_cli import kanban_db_dispatch as d
++    dispatcher.snapshot = None
++    legacy, spawned = [], []
++    monkeypatch.setattr(d._kbw, "resolve_worktree_for_dispatch",
++                        lambda *a, **kw: legacy.append(a[1].id) or (dispatcher.path, "wt/legacy"))
++    for title in ("first", "second", "third"):
++        tid = _custody_card(conn, title)
++        row = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
++        d._dispatch_lane_task(conn, row, "worker", d.DispatchResult(), lane="ready", dry_run=False, ttl_seconds=900,
++                              board=None, failure_limit=3, spawn_fn=lambda task, path: spawned.append(task.id),
++                              per_profile_cap=None, per_profile_running={})
++        refused = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='workspace_source_refused'",
++                               (tid,)).fetchone()
++        assert refused is not None and json.loads(refused[0])["code"] == "board_lacks_source", title
++    assert spawned == [] and legacy == [] and kbs.board_lacks_source()
++    assert launch._GRANTS == {}
++
++
+ def test_snapshot_present_null_is_no_custody():
+     snap = kws.snapshot_from_row({"workspace_source": None, "workspace_custody": None})
+     assert snap is not None and not snap.has_source
+diff --git a/tests/hermes_cli/test_kanban_source_publish.py b/tests/hermes_cli/test_kanban_source_publish.py
+index 5ce10c19de..1ae13329fa 100644
+--- a/tests/hermes_cli/test_kanban_source_publish.py
++++ b/tests/hermes_cli/test_kanban_source_publish.py
+@@ -173,6 +173,38 @@ def test_secret_scan_ignores_display_redaction_setting(card, monkeypatch):
+     _refused(card, "secret_scan_refused")
+ 
+ 
++def test_secret_scan_survives_hostile_diff_config(card):
++    """The clone's own config must not blind the scan: colour codes, missing a/ b/ prefixes, external diff drivers."""
++    for key, value in (("color.ui", "always"), ("color.diff", "always"), ("diff.noprefix", "true"),
++                       ("diff.mnemonicPrefix", "true"), ("diff.external", "/bin/true"), ("core.quotePath", "true")):
++        git(card.path, "config", key, value)
++    commit(card.path, "config.py", f"KEY = '{SECRET}'\n")
++    _refused(card, "secret_scan_refused")
++
++
++def test_secret_in_nondiff_attribute_file_refused(card):
++    """``-diff`` / ``binary`` attributes hide content from a plain patch; the scan reads it as text anyway."""
++    commit(card.path, ".gitattributes", "*.cfg -diff\n*.dat binary\n")
++    commit(card.path, "app.cfg", f"token = {SECRET}\n")
++    _refused(card, "secret_scan_refused")
++
++
++def _pem(kind: str) -> str:
++    body = "\n".join(["b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW"] * 5)
++    return f"-----BEGIN {kind}PRIVATE KEY-----\n{body}\n-----END {kind}PRIVATE KEY-----\n"
++
++
++@pytest.mark.parametrize("name", ["deploy/id_ed25519", "deploy/notes.txt", "deploy/server.cert"])
++def test_multiline_private_key_refused(card, name):
++    commit(card.path, name, _pem("OPENSSH "))
++    _refused(card, "secret_scan_refused")
++
++
++def test_denylisted_non_ascii_path_refused(card):
++    commit(card.path, "dé/server.pem", "not even a key\n")
++    _refused(card, "secret_scan_refused")
++
++
+ def test_lfs_and_submodules_refused(card):
+     commit(card.path, ".gitattributes", "*.bin filter=lfs diff=lfs merge=lfs -text\n")
+     _refused(card, "source_lfs_unsupported")
+diff --git a/tests/hermes_cli/test_kanban_source_resolver.py b/tests/hermes_cli/test_kanban_source_resolver.py
+index d49272453d..08095a3854 100644
+--- a/tests/hermes_cli/test_kanban_source_resolver.py
++++ b/tests/hermes_cli/test_kanban_source_resolver.py
+@@ -30,6 +30,7 @@ def git(cwd, *args) -> str:
+ 
+ 
+ def commit(cwd, name, text="x") -> str:
++    (Path(cwd) / name).parent.mkdir(parents=True, exist_ok=True)
+     (Path(cwd) / name).write_text(text)
+     git(cwd, "add", name)
+     git(cwd, "commit", "-q", "-m", name)
+-- 
+2.43.0
+

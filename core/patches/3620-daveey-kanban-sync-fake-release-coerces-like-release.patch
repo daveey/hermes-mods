@@ -1,0 +1,340 @@
+From b3763477b2298b337c8921db80cd87e66ccc35bf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 14:31:35 +0000
+Subject: [PATCH] [daveey] kanban sync fake: release coerces like releaseTask
+ (JS Number()/String(), ?? defaults) (PR #2199 review nits)
+
+Follow-up to exact-head review 5891002346 on PR #2199. FakeService/FakeHub release now
+reads its inputs the way hermes-hub worker/src/transitions.ts releaseTask does:
+
+1. _js_to_number is ECMAScript Number(): ASCII digits only (\d took U+0663, which
+   the Board reads as NaN; float() also took "1_000"), trimmed of StrWhiteSpaceChar
+   (TAB VT FF ZWNBSP, Zs, LF CR LS PS) instead of str.strip() (which strips
+   U+001C-U+001F/U+0085 and keeps U+FEFF), unsigned 0x/0o/0b literals, and arrays
+   through String() ([] -> 0, ["3"] -> 3). The old out-of-scope caveat is gone.
+2. block_kind is checked as String(op.block_kind ?? "transient"), so ["transient"]
+   is accepted as on the Board (new _js_string: JS String() of a JSON value).
+3. Both routes read the outcome as String(op.outcome ?? "released") and the error
+   as String(op.error ?? outcome): an explicit null outcome is a plain release
+   (release_op refused it), "" / 0 / false stay themselves and are invalid
+   (FakeHub.leases defaulted them to released), an explicit "" error is kept.
+   release_op's breaker limit is row.max_retries ?? (Number(failure_limit) ?? 2)
+   as recordTaskFailure (max_retries 0 fell through `or` to 2).
+
+Ground truth: node evaluated every expected value in the new tests
+(Number(...), String(...), String(x ?? "released")); the Board's '' / null outcome
+behaviour is read off releaseTask line 1172 (`String(op.outcome ?? "released")`).
+
+Tests: tests/hermes_cli/test_kanban_sync_rejections.py gains Number()/String()
+tables, block_kind coercion, outcome/error nullish cases on both routes and the
+recordTaskFailure limit; RED on the old fake, GREEN on the new.
+---
+ tests/hermes_cli/kanban_sync_fake_board.py    |  90 ++++++++++++----
+ .../hermes_cli/test_kanban_sync_rejections.py | 100 ++++++++++++++++++
+ 2 files changed, 172 insertions(+), 18 deletions(-)
+
+diff --git a/tests/hermes_cli/kanban_sync_fake_board.py b/tests/hermes_cli/kanban_sync_fake_board.py
+index 47e9d21fc0..db65e33175 100644
+--- a/tests/hermes_cli/kanban_sync_fake_board.py
++++ b/tests/hermes_cli/kanban_sync_fake_board.py
+@@ -60,14 +60,45 @@ def _js_stringify(value: object) -> str:
+     return json.dumps(value, ensure_ascii=False)
+ 
+ 
+-_JS_DECIMAL = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?|[+-]?Infinity")
++def _js_string(value: object) -> str:
++    """ECMAScript ``String(value)`` for a wire JSON value: null -> ``null``, booleans -> ``true``/``false``, numbers
++    as Number::toString (NaN, +-Infinity spelled out), an array as ``Array.prototype.join`` (``,``; null elements
++    are empty), an object -> ``[object Object]``."""
++    if value is None:
++        return "null"
++    if isinstance(value, bool):
++        return "true" if value else "false"
++    if isinstance(value, (int, float)):
++        try:
++            x = float(value)
++        except OverflowError:
++            return "Infinity" if value > 0 else "-Infinity"
++        if x != x:
++            return "NaN"
++        return {math.inf: "Infinity", -math.inf: "-Infinity"}.get(x) or _js_number(x)
++    if isinstance(value, str):
++        return value
++    if isinstance(value, (list, tuple)):
++        return ",".join("" if v is None else _js_string(v) for v in value)
++    return "[object Object]"
++
++
++# StrWhiteSpaceChar (what ``Number()`` trims): TAB VT FF ZWNBSP, every Zs (SP NBSP U+1680 U+2000-U+200A U+202F
++# U+205F U+3000) and LineTerminator (LF CR LS PS). Not Python's str.strip(): that also strips U+001C-U+001F and
++# U+0085 (NaN in JS) and keeps U+FEFF (trimmed in JS).
++_JS_WHITESPACE = "\t\v\f\ufeff \u00a0\u1680" + "".join(map(chr, range(0x2000, 0x200B))) + "\u202f\u205f\u3000" \
++    + "\n\r\u2028\u2029"
++# StrNumericLiteral with ASCII digits only (``\d`` would take U+0663, NaN in JS) and no ``_`` separators (float()
++# reads "1_000"; JS: NaN).
++_JS_DECIMAL = re.compile(r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|[+-]?Infinity")
++_JS_NON_DECIMAL = re.compile(r"0(?:[xX](?P<x>[0-9a-fA-F]+)|[oO](?P<o>[0-7]+)|[bB](?P<b>[01]+))")
+ 
+ 
+ def _js_to_number(value: object) -> float:
+     """ECMAScript ``Number(value)`` for a wire JSON value: null -> 0, booleans -> 0/1, numbers as themselves (an
+-    int past the double range -> Infinity), a string trimmed (empty -> 0) and read as a decimal literal or
+-    ``Infinity``, anything else NaN. Out of scope: hex/octal/binary strings and arrays (JS coerces ``[]`` to 0 and
+-    ``[x]`` through ``String(x)``)."""
++    int past the double range -> Infinity), a string trimmed of StrWhiteSpaceChar (empty -> 0) and read as an
++    unsigned 0x/0o/0b literal, a decimal literal or ``Infinity`` (ASCII digits only), an array through
++    :func:`_js_string` (``[]`` -> 0, ``[x]`` -> ``Number(String(x))``), anything else NaN."""
+     if value is None:
+         return 0.0
+     if isinstance(value, (bool, int, float)):
+@@ -75,14 +106,33 @@ def _js_to_number(value: object) -> float:
+             return float(value)
+         except OverflowError:
+             return math.inf if value > 0 else -math.inf
++    if isinstance(value, (list, tuple)):
++        return _js_to_number(_js_string(value))
+     if isinstance(value, str):
+-        text = value.strip()
++        text = value.strip(_JS_WHITESPACE)
+         if not text:
+             return 0.0
++        if m := _JS_NON_DECIMAL.fullmatch(text):
++            digits, base = next((d, {"x": 16, "o": 8, "b": 2}[k]) for k, d in m.groupdict().items() if d)
++            try:
++                return float(int(digits, base))
++            except OverflowError:
++                return math.inf
+         return float(text.replace("Infinity", "inf")) if _JS_DECIMAL.fullmatch(text) else math.nan
+     return math.nan
+ 
+ 
++def _js_default_string(value: object, default: str) -> str:
++    """``String(value ?? default)``: only a missing/null value takes ``default`` (``""``, 0 and false do not)."""
++    return _js_string(default if value is None else value)
++
++
++def release_outcome(op: dict) -> str:
++    """releaseTask's ``String(op.outcome ?? "released")``: an explicit null is ``released``; ``""`` stays ``""``
++    (refused ``invalid``) and ``["crashed"]`` is ``crashed``."""
++    return _js_default_string(op.get("outcome"), "released")
++
++
+ class FakeService:
+     def __init__(self, *, lease_runs: bool = False, machines: Optional[dict] = None, recover: bool = False) -> None:
+         # Serve ``FakeHub.recover`` (placement recovery assigns the card); off = a Board without the route (404).
+@@ -225,16 +275,16 @@ class FakeService:
+         """releaseTask's post-fence validation, before any write. releaseTask's full order is the outcome
+         (RELEASE_OUTCOMES), ``run_uid`` presence (``invalid`` when absent or null), fence(), then these, each
+         ``invalid`` on failure: ``failure_limit`` when present (``Number(op.failure_limit)`` a positive safe
+-        integer, so an explicit null is 0 and refused: :func:`_js_to_number`), ``block_kind`` (``op.block_kind ??
+-        "transient"`` one of BLOCK_KINDS), ``op.extra ?? {}`` an object ("failure extra must be an object"), then
++        integer, so an explicit null is 0 and refused: :func:`_js_to_number`), ``block_kind`` (``String(op.block_kind
++        ?? "transient")`` one of BLOCK_KINDS, so ``["transient"]`` passes: :func:`_js_string`), ``op.extra ?? {}`` an
++        object ("failure extra must be an object"), then
+         :meth:`release_diagnostic`. The callers check the outcome, ``run_uid`` and the fence. Returns the
+         diagnostic, or None when the caller refuses the release ``invalid``."""
+         if "failure_limit" in op:
+             limit = _js_to_number(op["failure_limit"])
+             if not (math.isfinite(limit) and limit.is_integer() and 1 <= limit <= cls.MAX_SAFE_INTEGER):
+                 return None
+-        if op.get("block_kind") is not None and not (isinstance(op["block_kind"], str)
+-                                                     and op["block_kind"] in cls.BLOCK_KINDS):
++        if _js_default_string(op.get("block_kind"), "transient") not in cls.BLOCK_KINDS:
+             return None
+         extra = op.get("extra")
+         if extra is not None and not isinstance(extra, dict):
+@@ -264,7 +314,8 @@ class FakeService:
+         before any write; a spawn_failed release that passes them raises NotImplementedError, as on the leases
+         route."""
+         task, run = op["task"], op.get("run_uid")
+-        if op.get("outcome", "released") not in self.RELEASE_OUTCOMES or run is None:
++        outcome = release_outcome(op)
++        if outcome not in self.RELEASE_OUTCOMES or run is None:
+             return {"status": "rejected", "reason": "invalid"}
+         lease = b["leases"].get(task)
+         if not lease or lease["holder"] != gw or lease["run_uid"] != run:
+@@ -274,12 +325,12 @@ class FakeService:
+         diagnostic = self.release_inputs(op)
+         if diagnostic is None:
+             return {"status": "rejected", "reason": "invalid"}
+-        if op.get("outcome") == "spawn_failed":
++        if outcome == "spawn_failed":
+             raise NotImplementedError("FakeService.release_op: spawn_failed release (endCustody + "
+                                       "recordTaskFailure) is not modelled")
+-        outcome, op_id = op.get("outcome", "released"), op["client_op_id"]
++        op_id = op["client_op_id"]
+         clock = f"{9_999_999_999_999:013d}-0002-board"
+-        error = str(op.get("error") or outcome)[:500]
++        error = _js_default_string(op.get("error"), outcome)[:500]
+         card = b["rows"]["tasks"][task]
+         b["leases"].pop(task, None)
+         ended, kind = self.NEUTRAL.get(outcome, ("crashed" if outcome == "terminal_provider" else outcome,) * 2)
+@@ -297,7 +348,10 @@ class FakeService:
+                         "lease_expires": None}
+         if canonical:
+             failures = int(card.get("consecutive_failures") or 0) + 1
+-            limit = card.get("max_retries") or op.get("failure_limit") or 2
++            # recordTaskFailure: ``row.max_retries ?? (Number(op.failure_limit) ?? DEFAULT_FAILURE_LIMIT)``, so a card
++            # max_retries of 0 trips at once.
++            override, policy = card.get("max_retries"), op["failure_limit"] if "failure_limit" in op else 2
++            limit = _js_to_number(override) if override is not None else _js_to_number(policy)
+             tripped = bool(op.get("force_trip")) or outcome == "terminal_provider" or failures >= int(limit)
+             fields.update(consecutive_failures=failures, last_failure_error=error,
+                           **({"status": "triage"} if tripped else {}))
+@@ -446,7 +500,7 @@ class FakeHub:
+             if not cur or cur["holder"] != self.gateway or cur["run_uid"] != run:
+                 return {"status": "rejected", "reason": "lease_lost", "lease": cur}
+         else:
+-            if str(body.get("outcome") or "released") not in self.svc.RELEASE_OUTCOMES or run is None:
++            if release_outcome(body) not in self.svc.RELEASE_OUTCOMES or run is None:
+                 # releaseTask checks the outcome, then run_uid presence, before its fence: an unknown outcome (a
+                 # test typo) or a missing/null run_uid is ``invalid``.
+                 return {"status": "rejected", "reason": "invalid", "lease": cur}
+@@ -460,7 +514,7 @@ class FakeHub:
+             diagnostic = self.svc.release_inputs(body)
+             if diagnostic is None:
+                 return {"status": "rejected", "reason": "invalid", "lease": cur}
+-            if body.get("outcome") == "spawn_failed":
++            if release_outcome(body) == "spawn_failed":
+                 # As release_op: fenced and validated first (releaseTask's order), then refused loudly whatever
+                 # lease_runs says, before any write.
+                 raise NotImplementedError("FakeHub.leases: spawn_failed release (endCustody + recordTaskFailure) is "
+@@ -503,8 +557,8 @@ class FakeHub:
+         as releaseTask orders them: the real releaseTask hands it to endCustody + recordTaskFailure(releaseClaim,
+         endRun), whose run/event shape is that accounting."""
+         gw, svc = self.gateway, self.svc
+-        outcome = str(body.get("outcome") or "released")
+-        error = str(body.get("error") or outcome)[:500]
++        outcome = release_outcome(body)
++        error = _js_default_string(body.get("error"), outcome)[:500]
+         card = b["rows"]["tasks"][task]
+         running = card.get("status") == "running"
+         neutral = svc.NEUTRAL.get(outcome)
+diff --git a/tests/hermes_cli/test_kanban_sync_rejections.py b/tests/hermes_cli/test_kanban_sync_rejections.py
+index c671573d80..e025014df3 100644
+--- a/tests/hermes_cli/test_kanban_sync_rejections.py
++++ b/tests/hermes_cli/test_kanban_sync_rejections.py
+@@ -1,6 +1,7 @@
+ """Selective rejection retirement uses authoritative evidence, never replica absence."""
+ import copy
+ import json
++import math
+ 
+ import pytest
+ 
+@@ -8,6 +9,7 @@ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import kanban_sync_fake_board as fake_board
+ from tests.hermes_cli import kanban_sync_support as support
+ from tests.hermes_cli.kanban_sync_fake_board import FakeService
+ 
+@@ -654,6 +656,104 @@ def test_fake_release_without_run_uid_is_invalid(live, kanban_home, route, lease
+     assert svc.board(BOARD) == before
+ 
+ 
++# Each expected value is what node prints for ``Number(value)`` (checked on node 22; the review checked node 26).
++@pytest.mark.parametrize("value,expected", [
++    # ASCII digits only: U+0663 (ARABIC-INDIC DIGIT THREE) is a Unicode \d and float() reads it; JS: NaN.
++    ("\u0663", math.nan), ("\u06632", math.nan), ("1_000", math.nan),
++    # StrWhiteSpaceChar, not str.strip(): U+001C-U+001F and U+0085 are not trimmed, U+FEFF is; Zs, LS and PS are.
++    ("\x1c3\x1c", math.nan), ("\x1f3", math.nan), ("\x853", math.nan), ("\u180e3", math.nan), ("3\u200b", math.nan),
++    ("\ufeff3\ufeff", 3.0), ("\u00a03\u3000", 3.0), ("\u20283\u2029", 3.0), (" \t\n\v\f\r3 ", 3.0),
++    ("\u16803", 3.0), ("\u202f3\u205f", 3.0),
++    # Unsigned non-decimal literals.
++    ("0x10", 16.0), ("0X1f", 31.0), ("0o7", 7.0), ("0b11", 3.0), ("-0x10", math.nan), ("0x", math.nan),
++    ("0xg", math.nan), ("0x" + "f" * 300, math.inf),
++    ("1e3", 1000.0), (".5e1", 5.0), ("5.", 5.0), ("+Infinity", math.inf), ("-Infinity", -math.inf),
++    ("infinity", math.nan), ("inf", math.nan), ("nan", math.nan), ("", 0.0), ("  ", 0.0),
++    # Arrays go through String(): [] -> "" -> 0, [x] -> Number(String(x)), [x, y] -> "x,y" -> NaN.
++    ([], 0.0), ([3], 3.0), (["3"], 3.0), ([None], 0.0), ([[2]], 2.0), ([3, 4], math.nan), ([True], math.nan),
++    ({}, math.nan), (None, 0.0), (True, 1.0), (2.5, 2.5),
++], ids=lambda v: repr(v)[:24])
++def test_fake_js_to_number_matches_js_number(value, expected):
++    """``_js_to_number`` is ECMAScript ``Number()`` for a wire value (releaseTask's ``Number(op.failure_limit)``)."""
++    got = fake_board._js_to_number(value)
++    assert (math.isnan(got) and math.isnan(expected)) or got == expected
++
++
++@pytest.mark.parametrize("limit,ok", [("\u0663", False), ("\x1c3", False), ("\ufeff3", True), ("0x3", True),
++                                      (["3"], True), ([], False), ([2, 3], False)], ids=lambda v: repr(v)[:16])
++def test_fake_release_failure_limit_uses_js_number(limit, ok):
++    """The release's ``failure_limit`` check reads the value as releaseTask's ``Number()`` does."""
++    assert (FakeService.release_inputs({"failure_limit": limit}) == {}) is ok
++
++
++@pytest.mark.parametrize("value,expected", [
++    (None, "null"), (True, "true"), (False, "false"), (0, "0"), (1.5, "1.5"), (1e21, "1e+21"),
++    (float("nan"), "NaN"), (float("inf"), "Infinity"), (-10**400, "-Infinity"), ("x", "x"), ([], ""),
++    (["transient"], "transient"), ([["transient"]], "transient"), (["transient", "x"], "transient,x"),
++    ([None, 1, [2, None]], ",1,2,"), ({}, "[object Object]"), ([{}], "[object Object]"),
++], ids=lambda v: repr(v)[:24])
++def test_fake_js_string_matches_js_string(value, expected):
++    """``_js_string`` is ECMAScript ``String()`` for a wire value (node: ``String([null, 1, [2, null]])`` is
++    ``",1,2,"``)."""
++    assert fake_board._js_string(value) == expected
++
++
++@pytest.mark.parametrize("block_kind,ok", [
++    (["transient"], True), ([["assignment"]], True), (["capability"], True), (["transient", "x"], False),
++    ([], False), ([None], False), ({}, False), (True, False), ("transient,", False),
++], ids=lambda v: repr(v)[:24])
++def test_fake_release_block_kind_coerced_like_js_string(block_kind, ok):
++    """releaseTask checks ``String(op.block_kind ?? "transient")``, so the Board accepts ``["transient"]`` (an
++    array String()s to its comma join) and refuses ``[]``, ``{}`` and ``true``."""
++    assert (FakeService.release_inputs({"block_kind": block_kind}) == {}) is ok
++
++
++@pytest.mark.parametrize("route,lease_runs", [("leases", True), ("leases", False), ("ops", True)])
++@pytest.mark.parametrize("outcome", ["", 0, False, [], ["crashed", "x"], {}], ids=lambda v: repr(v)[:16])
++def test_fake_release_outcome_without_nullish_default_is_invalid(live, kanban_home, route, lease_runs, outcome):
++    """``String(op.outcome ?? "released")``: only a missing or null outcome defaults, so ``""``, 0 and false stay
++    themselves (``""``, ``"0"``, ``"false"``) and are refused ``invalid``, on both routes, changing nothing."""
++    svc = FakeService(lease_runs=lease_runs)
++    hub, tid = _leased(live, svc)
++    before = copy.deepcopy(svc.board(BOARD))
++    res = _release(route, svc, hub, tid, outcome=outcome)
++    assert (res["status"], res["reason"]) == ("rejected", "invalid")
++    assert svc.board(BOARD) == before
++
++
++@pytest.mark.parametrize("route", ["leases", "ops"])
++@pytest.mark.parametrize("fields,run_outcome,error", [
++    ({"outcome": None}, "released", None),  # null ?? "released"
++    ({}, "released", None),
++    ({"outcome": ["crashed"]}, "crashed", "crashed"),  # String(["crashed"]) is "crashed"
++    ({"outcome": "crashed", "error": None}, "crashed", "crashed"),  # String(op.error ?? outcome)
++    ({"outcome": "crashed", "error": ""}, "crashed", ""),  # "" is not nullish: the run's error is ""
++    ({"outcome": "timed_out", "error": False}, "timed_out", "false"),
++], ids=["null", "absent", "array", "null-error", "empty-error", "false-error"])
++def test_fake_release_outcome_and_error_use_nullish_default(live, kanban_home, route, fields, run_outcome, error):
++    """Both routes read the outcome as ``String(op.outcome ?? "released")`` and the error as ``String(op.error ??
++    outcome)``: a null outcome is a plain release, an explicit ``""`` error is kept."""
++    svc = FakeService(lease_runs=True)
++    hub, tid = _leased(live, svc)
++    assert _release(route, svc, hub, tid, **fields)["status"] == "applied"
++    run = svc.board(BOARD)["rows"]["task_runs"][RUN]
++    assert (run["outcome"], run["error"]) == (run_outcome, error)
++
++
++@pytest.mark.parametrize("max_retries,failure_limit,status", [
++    (0, None, "triage"), (None, "1", "triage"), (None, "0x2", "ready"), (None, None, "ready"), (1, 5, "triage"),
++], ids=["max-retries-0", "limit-1", "limit-hex-2", "default-2", "max-retries-wins"])
++def test_fake_release_op_failure_limit_nullish(live, kanban_home, max_retries, failure_limit, status):
++    """recordTaskFailure's limit is ``row.max_retries ?? (Number(op.failure_limit) ?? 2)``: a card max_retries of 0
++    trips the first crash (not the ``or`` fallback to 2), and the op's limit is read with ``Number()``."""
++    svc = FakeService(lease_runs=True)
++    hub, tid = _leased(live, svc)
++    svc.board(BOARD)["rows"]["tasks"][tid]["max_retries"] = max_retries
++    fields = {} if failure_limit is None else {"failure_limit": failure_limit}
++    assert _release("ops", svc, hub, tid, outcome="crashed", **fields)["status"] == "applied"
++    assert svc.board(BOARD)["rows"]["tasks"][tid]["status"] == status
++
++
+ def test_release_local_change_during_read_vetoes(live, svc, monkeypatch):
+     lost_release(live, svc)
+     hub = svc.hub(ME)
+-- 
+2.43.0
+

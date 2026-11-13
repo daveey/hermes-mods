@@ -1,0 +1,191 @@
+From b8ac0e5e3ffa700b62dccae56007a39ec305ecdf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 14:17:42 +0000
+Subject: [PATCH] [daveey] kanban events: a board refresh that finds a read in
+ flight re-reads after it settles
+
+Follow-up to PR #2289 (review nit on card t_01a1d5358f0d74b1).
+
+refreshBoardReads invalidated the board-wide reads with cancelRefetch:
+false. When the trailing refresh (2 s after the leading one) fired while
+the leading board read was still in flight (a hub tunnel slower than
+2 s), TanStack joined that promise and its success cleared isInvalidated
+(@tanstack/query-core 5.104 query.js). Events newer than the in-flight
+read's server snapshot then waited for the next frame or the board poll
+(15 s across gateways, 60 s otherwise).
+
+Fix: invalidateAfterInFlight() invalidates a key at once when nothing is
+fetching on it; otherwise it waits (one query-cache subscription per key)
+for the in-flight read to settle, then invalidates it. It never cancels
+the read and never joins it. The settle restarts the coalescing interval,
+so a steady stream over a slow tunnel still re-reads at most about once
+per interval, one read at a time. resetBoardRefresh drops pending waits.
+
+Proof (apps/desktop vitest, forks, 1 worker):
+- new test "re-reads the board once after a read that a trailing refresh
+  found still in flight" holds a board read pending past
+  EVENTS_BOARD_REFRESH_MIN_MS, sends a trailing frame, resolves the read
+  and asserts exactly one more read follows (and the first is not
+  aborted). RED on the #2289 head 56074bd66b (expected 2 reads, got 1);
+  GREEN with the fix.
+- the burst test still sees 1 immediate + 1 trailing invalidation.
+- src/plugins/kanban: 18 files, 152 tests pass. tsc --noEmit: no errors
+  in the touched files; eslint 0 errors; prettier clean.
+---
+ .../plugins/kanban/api.events-cursor.test.ts  | 63 +++++++++++++++++++
+ apps/desktop/src/plugins/kanban/api.ts        | 50 ++++++++++++---
+ 2 files changed, 106 insertions(+), 7 deletions(-)
+
+diff --git a/apps/desktop/src/plugins/kanban/api.events-cursor.test.ts b/apps/desktop/src/plugins/kanban/api.events-cursor.test.ts
+index eb867ba562..5a3b7c1476 100644
+--- a/apps/desktop/src/plugins/kanban/api.events-cursor.test.ts
++++ b/apps/desktop/src/plugins/kanban/api.events-cursor.test.ts
+@@ -1,4 +1,5 @@
+ import { type PluginRestOptions, type PluginStorage, queryClient } from '@hermes/plugin-sdk'
++import { QueryObserver } from '@tanstack/react-query'
+ import { afterEach, describe, expect, it, vi } from 'vitest'
+ 
+ // Opening /events with no since replayed the board's whole task_events history.
+@@ -227,4 +228,66 @@ describe('kanban event cursor', () => {
+       vi.useRealTimers()
+     }
+   })
++
++  // [daveey] A read slower than EVENTS_BOARD_REFRESH_MIN_MS (hub tunnel) used to absorb the trailing
++  // refresh: cancelRefetch: false joined the in-flight promise and its success cleared isInvalidated,
++  // so the frames after its server snapshot waited for the 15 s/60 s poll.
++  it('re-reads the board once after a read that a trailing refresh found still in flight', async () => {
++    vi.useFakeTimers()
++
++    try {
++      queryClient.setQueryData(boardKey('local', 'ops', false), BOARD(10))
++      const frames: Array<(data: unknown) => void> = []
++
++      const dispose = bindApi(
++        async () => {
++          throw new Error('cached snapshot must not refetch')
++        },
++        storage('ops'),
++        vi.fn((_path: string, onMessage: (data: unknown) => void) => {
++          frames.push(onMessage)
++
++          return vi.fn()
++        })
++      )
++
++      const reads: Array<{ resolve: (board: ReturnType<typeof BOARD>) => void; signal: AbortSignal }> = []
++
++      const observer = new QueryObserver(queryClient, {
++        queryFn: ({ signal }) =>
++          new Promise<ReturnType<typeof BOARD>>(resolve => {
++            reads.push({ resolve, signal })
++          }),
++        queryKey: boardKey('local', 'ops', false),
++        staleTime: Infinity
++      })
++
++      const unsubscribe = observer.subscribe(() => undefined)
++      const frame = (id: number) => frames.at(-1)!({ cursor: id, events: [{ id, kind: 'heartbeat', task_id: 't_1' }] })
++
++      frame(11)
++      await vi.advanceTimersByTimeAsync(0)
++      expect(reads).toHaveLength(1)
++
++      await vi.advanceTimersByTimeAsync(EVENTS_BOARD_REFRESH_MIN_MS / 2)
++      frame(12)
++      // The trailing refresh fires while the first read is still on the wire: it neither cancels nor duplicates it.
++      await vi.advanceTimersByTimeAsync(EVENTS_BOARD_REFRESH_MIN_MS)
++      expect(reads).toHaveLength(1)
++      expect(reads[0].signal.aborted).toBe(false)
++
++      reads[0].resolve(BOARD(11))
++      await vi.advanceTimersByTimeAsync(EVENTS_BOARD_REFRESH_MIN_MS)
++      expect(reads).toHaveLength(2)
++
++      reads[1].resolve(BOARD(12))
++      await vi.advanceTimersByTimeAsync(10 * EVENTS_BOARD_REFRESH_MIN_MS)
++      expect(reads).toHaveLength(2)
++
++      unsubscribe()
++      dispose()
++    } finally {
++      vi.useRealTimers()
++    }
++  })
+ })
+diff --git a/apps/desktop/src/plugins/kanban/api.ts b/apps/desktop/src/plugins/kanban/api.ts
+index 7471a460c1..1a1f6833d0 100644
+--- a/apps/desktop/src/plugins/kanban/api.ts
++++ b/apps/desktop/src/plugins/kanban/api.ts
+@@ -221,18 +221,52 @@ export const EVENTS_BOARD_REFRESH_MIN_MS = 2000
+ 
+ const boardRefreshAt = new Map<string, number>()
+ const boardRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>()
++/** Board-wide refreshes waiting for a read already in flight to settle, by query key. */
++const boardRefreshWaits = new Map<string, () => void>()
++
++/** [daveey] Invalidate `queryKey` now, or right after the read in flight on it settles.
++ *  Never cancel that read (its HTTP request would stay on the wire) and never join it
++ *  either: with cancelRefetch: false an invalidation of a fetching query reuses its
++ *  promise, and that read's success clears isInvalidated, so events newer than its
++ *  server snapshot would wait for the next frame or the 15 s/60 s board poll. At most
++ *  one wait per key; a refresh requested meanwhile is already covered by it. */
++function invalidateAfterInFlight(scope: string, queryKey: readonly unknown[]): void {
++  if (queryClient.isFetching({ queryKey }) === 0) {
++    void queryClient.invalidateQueries({ queryKey }, { cancelRefetch: false })
++
++    return
++  }
++
++  const id = JSON.stringify(queryKey)
++
++  if (boardRefreshWaits.has(id)) {
++    return
++  }
++
++  const unsubscribe = queryClient.getQueryCache().subscribe(() => {
++    if (queryClient.isFetching({ queryKey }) > 0) {
++      return
++    }
++
++    unsubscribe()
++    boardRefreshWaits.delete(id)
++    // The deferred re-read starts the coalescing interval over, so a steady stream
++    // of frames over a slow tunnel still re-reads at most once per interval.
++    boardRefreshAt.set(scope, Date.now())
++    // Out of the settling query's dispatch; a read that started in between is waited on again.
++    void Promise.resolve().then(() => invalidateAfterInFlight(scope, queryKey))
++  })
++
++  boardRefreshWaits.set(id, unsubscribe)
++}
+ 
+ function refreshBoardReads(scope: string): void {
+   boardRefreshAt.set(scope, Date.now())
+-  // cancelRefetch: false — a read already in flight answers this frame too
+-  // instead of being orphaned (still on the wire) by a duplicate.
+-  const keep = { cancelRefetch: false }
+-
+-  void queryClient.invalidateQueries({ queryKey: boardKeyPrefix(scope) }, keep)
++  invalidateAfterInFlight(scope, boardKeyPrefix(scope))
+   // Any event can change a board's card count — keep the switcher badge honest.
+-  void queryClient.invalidateQueries({ queryKey: boardsKey(scope) }, keep)
++  invalidateAfterInFlight(scope, boardsKey(scope))
+   // [daveey] The sidebar's Blocked section spans every board.
+-  void queryClient.invalidateQueries({ queryKey: blockedKey(scope) }, keep)
++  invalidateAfterInFlight(scope, blockedKey(scope))
+ }
+ 
+ function scheduleBoardRefresh(scope: string): void {
+@@ -260,6 +294,8 @@ function scheduleBoardRefresh(scope: string): void {
+ function resetBoardRefresh(): void {
+   boardRefreshTimers.forEach(timer => clearTimeout(timer))
+   boardRefreshTimers.clear()
++  boardRefreshWaits.forEach(unsubscribe => unsubscribe())
++  boardRefreshWaits.clear()
+   boardRefreshAt.clear()
+ }
+ 
+-- 
+2.43.0
+

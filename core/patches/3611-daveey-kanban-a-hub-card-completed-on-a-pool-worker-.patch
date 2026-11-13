@@ -1,0 +1,567 @@
+From 6db912bb4b4b3b8d9706a7750602c7202128d796 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 14:17:50 +0000
+Subject: [PATCH] [daveey] kanban: a hub card completed on a pool worker is
+ verified on the hub; chat-tasks keeps released closed cards
+
+A completion binds its receipts (pr_acceptance, goal_verified) by task_events.id, which is local to one
+board file. A hub-homed card run on a pool worker completes on the worker's board; the Board feed replays
+its events onto the hub with new ids and remaps run_id, but not the JSON payload. On the hub the payload id
+named another card's event or none, so completion_verdict never verified it, the origin ledger never
+released it, and the MacBook chat listed done hub cards t_01a1d41478234144, t_01a1d44d87ea4bef and
+t_01a1d4eead55e393 as `unknown` for hours (2026-11-13). On the live hub all four cards' payload ids
+(1392472, 486557, 179773, 181582) resolve to nothing, while each card's receipt sits one id before its
+completion in the same run (1185670 before 1185671, ...).
+
+- complete_task now also records each receipt's stable uid (`*_event_uid`), which the feed carries
+  unchanged. kanban_completion_refs binds by uid when present (no integer fallback). For a pre-uid
+  completion replayed from another gateway whose integer does not name this card's receipt here, it binds
+  the latest receipt of that kind the same gateway wrote in the same run before the completion. On its own
+  board that is the one complete_task bound, because it writes receipt and completion in one transaction.
+  A completion that names no receipt never borrows one, and a local completion with a wrong id stays
+  unverified. Both readers use it: observe_owner_task (row-by-row) and read_completions (batch).
+- replica_cards: a reader that asks for closed cards (`hermes kanban chat-tasks` passes done/archived) now
+  keeps a chat's released link to a closed remote card. It shows as an explicit row with status done or
+  archived, released=True, unfinished=False and release_reason=link_released, instead of vanishing.
+  Worker-homed done cards (t_01a1d4e38cf61e24, PR #2227) were released by _owner_written_releases and
+  dropped from chat-tasks within minutes; t_01a1d4f2f591d595 was linked with `chat-tasks --expect` rc=0 and
+  then disappeared. The sidebar counts and handover read open statuses only, so they are unchanged.
+
+Tests: tests/hermes_cli/test_kanban_completion_refs_sync.py (a worker completion replayed through the Board
+feed onto a hub with a longer history, verified by both readers; pre-uid fallback; guards) and
+test_kanban_chat_links.py::test_a_released_link_to_a_closed_card_stays_listed_as_done_for_a_reader_of_closed_cards.
+On origin/main e3334630da three of these fail, the guards pass; with the change, 159 tests across chat_links,
+chat_links_parity, completion_refs_sync, pr_acceptance, goal_receipt, execution_receipt and origin_ledger pass.
+
+Kanban: t_01a1d5319dcf3c16
+---
+ hermes_cli/kanban_chat_links.py               |  23 +++
+ hermes_cli/kanban_chat_links_released.py      |  54 ++++++++
+ hermes_cli/kanban_completion_inputs.py        |  35 ++---
+ hermes_cli/kanban_completion_refs.py          |  89 ++++++++++++
+ hermes_cli/kanban_db.py                       |   7 +-
+ hermes_cli/kanban_origin_ledger.py            |  16 ++-
+ tests/hermes_cli/test_kanban_chat_links.py    |  30 ++++
+ .../test_kanban_completion_refs_sync.py       | 131 ++++++++++++++++++
+ 8 files changed, 353 insertions(+), 32 deletions(-)
+ create mode 100644 hermes_cli/kanban_chat_links_released.py
+ create mode 100644 hermes_cli/kanban_completion_refs.py
+ create mode 100644 tests/hermes_cli/test_kanban_completion_refs_sync.py
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index 8d3d9672da..7a8a512e6d 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -27,6 +27,7 @@ import time
+ from pathlib import Path
+ from typing import Any, Iterable, Optional
+ 
++from hermes_cli import kanban_chat_links_released as _released
+ from hermes_cli.kanban_replica_execution import read_runs, run_evidence
+ from hermes_cli.kanban_run_machine import placement_select, run_machine
+ 
+@@ -713,9 +714,31 @@ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses:
+             if named and owner is not None and not unknown and (run := run_evidence(
+                     {"status": status, **runs.get(tid, {})})) is not None:
+                 out[pair]["_replica_run"] = run
++        # [daveey] A reader that lists closed cards keeps a released link's card as an explicit released row.
++        for r in _released_links(path, board, gateway, profile, ids, statuses):
++            tid = str(r["id"])
++            if owners is None:
++                owners = _ledger_owners(stale_ok)
++            owner, owner_profile, _named = _owner_of(owners.get((board, tid), []), r["created_on"], r["chat_session"])
++            key = f"{owner or '?'}/{owner_profile}/{board}/{tid}"
++            out.setdefault((r["chat_session"], key), _released.row(
++                r, board=board, gateway=gateway, key=key, owner=owner, owner_profile=owner_profile, pulled=pulled,
++                stale=stale))
+     return list(out.values())
+ 
+ 
++def _released_links(path: Path, board: str, gateway: str, profile: str, ids: Optional[set[str]],
++                    statuses: tuple[str, ...]) -> list[dict[str, Any]]:
++    """``kanban_chat_links_released.read`` for one lineage; an unreadable replica adds nothing (logged)."""
++    if not ids or not set(statuses) & set(TERMINAL_STATUSES):
++        return []
++    try:
++        return _released.read(path, gateway, profile, ids, statuses)
++    except sqlite3.Error as exc:
++        _log.info("kanban chat links: released links of %s unreadable (%s)", path, exc)
++        return []
++
++
+ def _decoded_request(value: Any) -> Any:
+     """[daveey] The replica stores ``human_request`` as JSON text; the ledger rows (and ``needs_human``) carry the dict.
+     Undecoded, a card blocked on the user read as open work and its chat painted waiting instead of red. Malformed
+diff --git a/hermes_cli/kanban_chat_links_released.py b/hermes_cli/kanban_chat_links_released.py
+new file mode 100644
+index 0000000000..4986e61242
+--- /dev/null
++++ b/hermes_cli/kanban_chat_links_released.py
+@@ -0,0 +1,54 @@
++"""Released chat links to closed cards, for readers that list closed cards too. [daveey]
++
++``replica_cards`` lists a chat's unreleased links: open work, and closed cards whose release is not yet verified
++(``unknown``). A link is released once the card closed with a verified release, so a reader that asks for closed
++cards (``hermes kanban chat-tasks``, statuses including ``done``/``archived``) lost the card entirely the moment it
++was released: the chat's done hub cards were absent rather than ``done`` (hub t_01a1d4f2f591d595 et al.,
++2026-11-13). This reads those links back as explicit released rows, with the reason, for those readers only; the
++sidebar counts never ask for closed cards and are unchanged.
++"""
++from __future__ import annotations
++
++import sqlite3
++from pathlib import Path
++from typing import Any, Iterable
++
++TERMINAL_STATUSES = ("done", "archived")
++REASON = "link_released"  # the chat's link was released: the card closed with a verified release
++
++
++def read(path: Path, gateway: str, profile: str, sessions: Iterable[str],
++         statuses: Iterable[str]) -> list[dict[str, Any]]:
++    """Released links of these chats (this gateway+profile) to cards another gateway created, closed in one of
++    ``statuses``. Raises ``sqlite3.Error`` when unreadable."""
++    from hermes_cli.kanban_session_activity import cached_ro  # lazy: that module imports kanban_chat_links
++    wanted = [s for s in TERMINAL_STATUSES if s in set(statuses)]
++    chats = sorted({str(s) for s in sessions if s})
++    if not wanted or not chats:
++        return []
++    with cached_ro(path) as conn:
++        conn.row_factory = sqlite3.Row
++        return [dict(r) for r in conn.execute(
++            "SELECT l.task_id AS id, t.title, t.status, t.assignee, t.created_at, t.started_at, t.priority, "
++            "t.created_on, l.chat_session, l.chat_profile, l.kind "
++            "FROM task_chat_links l JOIN tasks t ON t.id = l.task_id "
++            "WHERE l.chat_gateway = ? AND l.chat_profile = ? AND l.released = 1 "
++            f"AND l.chat_session IN ({','.join('?' * len(chats))}) "
++            f"AND t.status IN ({','.join('?' * len(wanted))}) "
++            "AND t.created_on IS NOT NULL AND t.created_on != ? ORDER BY l.kind",
++            (gateway, profile, *chats, *wanted, gateway)).fetchall()]
++
++
++def row(r: dict[str, Any], *, board: str, gateway: str, key: str, owner: str | None, owner_profile: str,
++        pulled: float | None, stale: bool) -> dict[str, Any]:
++    """The listed shape of one released link (``replica_cards``' row, closed and released)."""
++    return {
++        "title": r["title"], "status": r["status"], "assignee": r["assignee"], "created_at": r["created_at"],
++        "started_at": r["started_at"], "priority": r["priority"], "block_kind": None, "human_request": None,
++        "id": str(r["id"]), "board": board, "gateway": owner, "key": key, "session": r["chat_session"],
++        "session_id": r["chat_session"], "via": "origin" if r["kind"] == "created" else "shepherd", "remote": True,
++        "profile": owner_profile, "owner_profile": owner_profile, "origin_gateway": gateway,
++        "origin_profile": r["chat_profile"], "ownership_state": "qualified" if owner is not None else "unknown",
++        "unfinished": False, "released": True, "release_reason": REASON, "reported_status": r["status"],
++        "synced_at": pulled, "stale": stale, "source": "replica",
++    }
+diff --git a/hermes_cli/kanban_completion_inputs.py b/hermes_cli/kanban_completion_inputs.py
+index 93219f6aeb..a8826cdda2 100644
+--- a/hermes_cli/kanban_completion_inputs.py
++++ b/hermes_cli/kanban_completion_inputs.py
+@@ -12,6 +12,7 @@ import logging
+ import sqlite3
+ from typing import NamedTuple
+ 
++from hermes_cli.kanban_completion_refs import pick, read_candidates
+ from hermes_cli.kanban_origin_ledger import _receipt_epoch, completion_verdict
+ 
+ logger = logging.getLogger(__name__)
+@@ -57,7 +58,8 @@ def read_completions(conn, ids) -> dict[str, Completion]:
+                                             "completion_contract", "title", "body", "assignee", "session_id"))
+     run_fields = _select(run_cols, "r.", ("id", "task_id", "uid", "status", "outcome", "ended_at", "summary"))
+     event_fields = ",".join(("e.id", "e.task_id", "e.run_id", "e.kind", "e.created_at",
+-                             "e.payload"))
++                             "e.payload", "e.origin_gateway" if "origin_gateway" in event_cols
++                             else "NULL AS origin_gateway"))
+     epoch = []
+     for start in range(0, len(ids), CHUNK):
+         chunk = ids[start:start + CHUNK]
+@@ -78,23 +80,12 @@ def read_completions(conn, ids) -> dict[str, Completion]:
+                 conn, f"SELECT * FROM (SELECT {event_fields}, ROW_NUMBER() OVER (PARTITION BY e.task_id "
+                       f"ORDER BY e.id DESC) AS _rank FROM task_events e WHERE e.task_id IN ({amarks}) "
+                       "AND e.kind='archived') WHERE _rank=1", archived_ids)}
+-        refs = set()
+-        for row in completed.values():
+-            try:
+-                payload = _payload(row["payload"])
+-            except ValueError:
+-                continue  # that card's verdict fails closed in _completion
+-            for key in ("pr_acceptance_event_id", "goal_verified_event_id"):
+-                if type(payload.get(key)) is int:
+-                    refs.add(payload[key])
+-        bound = {}
+-        if refs:
+-            rmarks = ",".join("?" for _ in refs)
+-            bound = {r["id"]: r for r in _rows(
+-                conn, f"SELECT {event_fields} FROM task_events e WHERE e.id IN ({rmarks}) "
+-                      "AND e.kind IN ('pr_acceptance','goal_verified')", sorted(refs))}
++        refs = read_candidates(conn, list(completed))
++        imported = {tid: row["origin_gateway"] if isinstance(row["origin_gateway"], str) and row["origin_gateway"]
++                    else None for tid, row in completed.items()}
+         for tid, task in tasks.items():
+-            out[tid] = _completion(conn, tid, task, completed.get(tid), runs.get(tid), archived.get(tid), bound, epoch)
++            out[tid] = _completion(conn, tid, task, completed.get(tid), runs.get(tid), archived.get(tid),
++                                   refs.get(tid, []), imported.get(tid), epoch)
+     return out
+ 
+ 
+@@ -110,18 +101,16 @@ def _payload(raw):
+     return value
+ 
+ 
+-def _completion(conn, tid, task, event, run, archived, bound, epoch):
++def _completion(conn, tid, task, event, run, archived, receipts, imported_from, epoch):
+     row = (task["status"], task["completed_at"], task["current_run_id"], task["goal_mode"],
+            task["completion_contract"])
+     event_t = None if event is None else (event["id"], event["run_id"], event["created_at"], event["payload"])
+     run_t = None if run is None else (run["id"], run["status"], run["outcome"], run["ended_at"], run["summary"])
+     archived_t = None if archived is None else (archived["id"], archived["payload"])
+ 
+-    def bound_event(kind, event_id, before):
+-        found = bound.get(event_id)
+-        if found is None or found["task_id"] != tid or found["kind"] != kind or not event_id < before:
+-            return None
+-        return found["payload"], found["run_id"]
++    def bound_event(kind, event_id, before, uid=None):
++        return pick(receipts, task_id=tid, kind=kind, event_id=event_id, uid=uid, before=before,
++                    run_id=None if event is None else event["run_id"], imported_from=imported_from)
+ 
+     def receipt_epoch():
+         if not epoch:
+diff --git a/hermes_cli/kanban_completion_refs.py b/hermes_cli/kanban_completion_refs.py
+new file mode 100644
+index 0000000000..9071aa9168
+--- /dev/null
++++ b/hermes_cli/kanban_completion_refs.py
+@@ -0,0 +1,89 @@
++"""Which receipt event a ``completed`` event names, on the board that reads it. [daveey]
++
++A completion binds its receipts (``pr_acceptance``, ``goal_verified``) by ``task_events.id``. That integer is
++local to one board file. A card homed on the hub but run on a pool worker completes on the worker's board; the
++Board feed replays its events onto the hub with new ids (``task_events.run_id`` is remapped through ``run_uid``,
++the JSON payload is not), so on the hub the payload's id names another card's event or none. The hub's
++``completion_verdict`` then never verified the completion, the origin ledger never released it, and the origin
++chat listed the done card as ``unknown`` for hours (hub t_01a1d41478234144 et al., 2026-11-13; the same class as
++``writer_run_uid`` in ``kanban_db_dispatch_pr_state``).
++
++The completion now also records each receipt's stable ``uid`` (``*_event_uid``), which the feed carries
++unchanged; when present it decides, with no integer fallback. A completion written before that, replayed from
++another gateway (``origin_gateway`` set), whose integer does not name the same card's receipt here, binds the
++latest receipt of that kind the same gateway wrote in the same run before the completion: on its own board that
++run's latest receipt is the one ``complete_task`` bound (it writes the receipt and the completion in one
++transaction). A completion that names no receipt never borrows one.
++"""
++from __future__ import annotations
++
++import sqlite3
++from typing import Any, Iterable
++
++RECEIPT_KINDS = ("pr_acceptance", "goal_verified")
++UID_KEYS = {"pr_acceptance": "pr_acceptance_event_uid", "goal_verified": "goal_verified_event_uid"}
++ID_KEYS = {"pr_acceptance": "pr_acceptance_event_id", "goal_verified": "goal_verified_event_id"}
++_FIELDS = ("id", "uid", "task_id", "kind", "run_id", "origin_gateway", "payload")
++
++
++def stamp_uids(conn: sqlite3.Connection, payload: dict[str, Any]) -> None:
++    """Add ``*_event_uid`` beside each receipt id in a completion payload, when this board stamps uids."""
++    for kind, id_key in ID_KEYS.items():
++        event_id = payload.get(id_key)
++        if type(event_id) is not int:
++            continue
++        try:
++            row = conn.execute("SELECT uid FROM task_events WHERE id = ?", (event_id,)).fetchone()
++        except sqlite3.OperationalError:  # an unsynced board has no uid column: the id is the only name
++            return
++        if row is not None and isinstance(row[0], str) and row[0]:
++            payload[UID_KEYS[kind]] = row[0]
++
++
++def _columns(conn: sqlite3.Connection) -> set[str]:
++    return {r[1] for r in conn.execute("PRAGMA table_info(task_events)")}
++
++
++def read_candidates(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, list[dict[str, Any]]]:
++    """``{task_id: [receipt event rows]}``: every ``pr_acceptance``/``goal_verified`` event of these cards."""
++    ids = list(dict.fromkeys(str(t) for t in task_ids))
++    out: dict[str, list[dict[str, Any]]] = {t: [] for t in ids}
++    if not ids:
++        return out
++    cols = _columns(conn)
++    select = ",".join(f"e.{c}" if c in cols else f"NULL AS {c}" for c in _FIELDS)
++    marks = ",".join("?" for _ in ids)
++    for row in conn.execute(f"SELECT {select} FROM task_events e WHERE e.task_id IN ({marks}) "
++                            "AND e.kind IN ('pr_acceptance','goal_verified')", ids):
++        out[str(row[2])].append(dict(zip(_FIELDS, tuple(row))))
++    return out
++
++
++def origin_of(conn: sqlite3.Connection, event_id: int) -> str | None:
++    """The gateway a replayed event came from (``task_events.origin_gateway``), else None (written here)."""
++    if "origin_gateway" not in _columns(conn):
++        return None
++    row = conn.execute("SELECT origin_gateway FROM task_events WHERE id = ?", (event_id,)).fetchone()
++    return row[0] if row is not None and isinstance(row[0], str) and row[0] else None
++
++
++def pick(rows: Iterable[dict[str, Any]], *, task_id: str, kind: str, event_id: Any, uid: Any, before: int,
++         run_id: Any, imported_from: str | None) -> tuple[Any, Any] | None:
++    """``(payload, run_id)`` of the receipt a completion names, or None. See the module docstring."""
++    mine = [r for r in rows if r["task_id"] == task_id and r["kind"] == kind and type(r["id"]) is int
++            and r["id"] < before]
++    if isinstance(uid, str) and uid:
++        hit = next((r for r in mine if r["uid"] == uid), None)
++        return None if hit is None else (hit["payload"], hit["run_id"])
++    if type(event_id) is not int:
++        return None
++    hit = next((r for r in mine if r["id"] == event_id), None)
++    if hit is not None and (imported_from is None or hit["origin_gateway"] == imported_from):
++        return hit["payload"], hit["run_id"]
++    if imported_from is None or run_id is None:
++        return None
++    same_run = [r for r in mine if r["run_id"] == run_id and r["origin_gateway"] == imported_from]
++    if not same_run:
++        return None
++    best = max(same_run, key=lambda r: r["id"])
++    return best["payload"], best["run_id"]
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 85b68fc9dd..c8cc310c95 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2574,10 +2574,9 @@ def complete_task(
+             conn.execute("UPDATE task_events SET run_id=? WHERE id=? AND task_id=?",
+                          (run_id, acceptance_event_id, task_id))
+             completion_payload["pr_acceptance_event_id"] = acceptance_event_id
+-        _append_event(
+-            conn, task_id, "completed", completion_payload,
+-            run_id=run_id,
+-        )
++        from hermes_cli.kanban_completion_refs import stamp_uids
++        stamp_uids(conn, completion_payload)  # [daveey] ids are per board file; the uid survives the Board feed
++        _append_event(conn, task_id, "completed", completion_payload, run_id=run_id)
+         _placement_fwd.record_cancel_intent(conn, task_id, "completed", settled=placement_settled)  # [daveey]
+     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
+     _placement_fwd.forward_completion(conn, task_id, settled=placement_settled)
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 9bc4994f6b..a2d0169292 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -19,6 +19,7 @@ from contextlib import closing, contextmanager
+ from pathlib import Path
+ from typing import Callable
+ 
++from hermes_cli import kanban_completion_refs as _refs
+ from hermes_cli.kanban_scope_heartbeat import SCOPE_HEARTBEAT_FLOOR_S, scope_window
+ 
+ 
+@@ -132,7 +133,9 @@ def completion_verdict(task_id, row, event, run, archived, *, bound_event, curre
+     if event and not contract_verified:
+         completed = json.loads(event[3] or '{}')
+         acceptance_id = completed.get('pr_acceptance_event_id') if isinstance(completed, dict) else None
+-        acceptance = bound_event('pr_acceptance', acceptance_id, event[0]) if type(acceptance_id) is int else None
++        acceptance_uid = completed.get('pr_acceptance_event_uid') if isinstance(completed, dict) else None
++        acceptance = (bound_event('pr_acceptance', acceptance_id, event[0], acceptance_uid)
++                      if type(acceptance_id) is int or isinstance(acceptance_uid, str) else None)
+         if acceptance and acceptance[1] is not None and acceptance[1] == event[1]:
+             receipt = json.loads(acceptance[0] or '{}')
+             # [daveey] A contract_waiver is accepted only on a no_required_checks receipt (kanban_pr_acceptance_store).
+@@ -150,7 +153,9 @@ def completion_verdict(task_id, row, event, run, archived, *, bound_event, curre
+     if row[3] and event:
+         completed = json.loads(event[3] or '{}')
+         receipt_id = completed.get('goal_verified_event_id') if isinstance(completed, dict) else None
+-        receipt = bound_event('goal_verified', receipt_id, event[0]) if type(receipt_id) is int else None
++        receipt_uid = completed.get('goal_verified_event_uid') if isinstance(completed, dict) else None
++        receipt = (bound_event('goal_verified', receipt_id, event[0], receipt_uid)
++                   if type(receipt_id) is int or isinstance(receipt_uid, str) else None)
+         if receipt and receipt[1] is not None and receipt[1] == event[1]:
+             from hermes_cli.kanban_db import _first_line
+             from hermes_cli.kanban_goal_receipt import digest
+@@ -233,9 +238,10 @@ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> d
+         (task['id'],)).fetchone() if row[0] == 'archived' and event else None
+     verified, legacy, terminal = completion_verdict(
+         task['id'], row, event, run, archived,
+-        bound_event=lambda kind, event_id, before: conn.execute(
+-            "SELECT payload,run_id FROM task_events WHERE id=? AND task_id=? AND kind=? AND id<?",
+-            (event_id, task['id'], kind, before)).fetchone(),
++        # [daveey] By uid, else id; a replayed legacy completion binds its run's receipt (kanban_completion_refs).
++        bound_event=lambda kind, event_id, before, uid=None: _refs.pick(
++            _refs.read_candidates(conn, [task['id']])[task['id']], task_id=task['id'], kind=kind, event_id=event_id,
++            uid=uid, before=before, run_id=event[1], imported_from=_refs.origin_of(conn, event[0])),
+         current_task=lambda: conn.execute('SELECT title,body FROM tasks WHERE id=?', (task['id'],)).fetchone(),
+         receipt_epoch=lambda: _receipt_epoch(conn))
+     payload = {k: v for k, v in task.items()
+diff --git a/tests/hermes_cli/test_kanban_chat_links.py b/tests/hermes_cli/test_kanban_chat_links.py
+index eeceb2e13f..8659af9f64 100644
+--- a/tests/hermes_cli/test_kanban_chat_links.py
++++ b/tests/hermes_cli/test_kanban_chat_links.py
+@@ -423,3 +423,33 @@ def test_tui_legacy_subs_on_done_local_cards_count_nothing(live, kanban_home, mo
+     ksa._reset_cache_for_tests()
+     assert ksa.active_task_counts() == {"s_legacy": 1, "s_junk": 1}
+     assert ksa.waiting_on_task_ids() == {"s_legacy": frozenset({still}), "s_junk": frozenset({still})}
++
++
++def test_a_released_link_to_a_closed_card_stays_listed_as_done_for_a_reader_of_closed_cards(live, kanban_home,
++                                                                                           monkeypatch, tmp_path):
++    """[daveey] ``hermes kanban chat-tasks`` asks for done/archived cards too, yet a link released after its card
++    closed made the card vanish from that list: worker-homed t_01a1d4e38cf61e24 (PR #2227) was ``[unknown]`` in the
++    MacBook chat at 06:02 and gone by 06:06, and hub t_01a1d4f2f591d595, linked with ``chat-tasks --expect`` rc=0,
++    dropped out (2026-11-13). The card stays as a ``done`` row with ``released`` and its ``release_reason``; the
++    sidebar's open-status read, which never asks for closed cards, is unchanged."""
++    rep = tmp_path / "default.db"
++    _replica(rep, [("t_worker", "worker card", "done", "worker-2"), ("t_hub", "hub card", "done", OTHER),
++                   ("t_arch", "archived", "archived", OTHER), ("t_open", "open", "running", OTHER),
++                   ("t_elsewhere", "another chat's", "done", OTHER), ("t_mine", "local", "done", ME)],
++             [("t_worker", ME, "s1", "created", 1), ("t_worker", ME, "s1", "shepherd", 1),
++              ("t_hub", ME, "s1", "created", 0), ("t_hub", ME, "s1", "shepherd", 1),
++              ("t_arch", ME, "s1", "shepherd", 1), ("t_open", ME, "s1", "shepherd", 0),
++              ("t_elsewhere", ME, "s9", "created", 1), ("t_mine", ME, "s1", "created", 1)])
++    closed = ksa.LISTED_STATUSES + ("done", "archived")
++    got = {c["id"]: c for c in links.replica_cards(["s1"], ME, closed, replicas=[("default", rep)])}
++    assert sorted((tid, c["status"], c["released"], c.get("release_reason")) for tid, c in got.items()) == [
++        ("t_arch", "archived", True, "link_released"), ("t_hub", "unknown", False, None),
++        ("t_open", "running", False, None), ("t_worker", "done", True, "link_released")]
++    assert got["t_worker"]["unfinished"] is False and got["t_worker"]["via"] == "origin"
++    assert got["t_worker"]["session_id"] == "s1" and got["t_worker"]["source"] == "replica"
++    # The open-status readers (sidebar counts, handover) still drop released links.
++    assert sorted(c["id"] for c in links.replica_cards(["s1"], ME, replicas=[("default", rep)])) == ["t_hub", "t_open"]
++    _switch_to_replica(kanban_home, monkeypatch, rep)
++    assert ksa.active_task_counts() == {"s1": 2}  # t_hub (unknown) and t_open
++    rows = {r["id"]: r["status"] for r in ksa.session_tasks(["s1"], closed)}
++    assert rows == {"t_arch": "archived", "t_hub": "unknown", "t_open": "running", "t_worker": "done"}
+diff --git a/tests/hermes_cli/test_kanban_completion_refs_sync.py b/tests/hermes_cli/test_kanban_completion_refs_sync.py
+new file mode 100644
+index 0000000000..5566b91486
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_completion_refs_sync.py
+@@ -0,0 +1,131 @@
++"""A hub-homed card completed on a pool worker is verified on the hub after the Board feed replays it. [daveey]
++
++Hub cards t_01a1d41478234144, t_01a1d44d87ea4bef, t_01a1d4eead55e393 and t_01a1d4f2f591d595 (2026-11-13) ran on
++worker-3/4/5, completed there with a green PR acceptance, and replayed onto the hub board with new event ids. The
++``completed`` payload kept the worker's ``pr_acceptance_event_id`` (1392472, 486557, 179773, 181582), which on the
++hub names another card's event or none, while the receipt itself sat right before the completion (1185670 ...).
++The hub's ``completion_verdict`` published ``verified: false``, the origin ledger never released the cards, and
++the MacBook chat listed all four as ``unknown`` for hours. ``kanban_completion_refs`` binds by the receipt's
++stable uid, and a pre-uid replayed completion by its run's receipt.
++"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_pr_acceptance as kpa
++from hermes_cli.kanban_completion_inputs import read_completions
++from hermes_cli.kanban_origin_ledger import observe_owner_task
++from tests.hermes_cli import kanban_sync_support as support
++
++PR = "https://github.com/acme/repo/pull/7"
++
++
++@pytest.fixture
++def boards(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    monkeypatch.setattr(kpa, "collect_acceptance", lambda contract, published, assignee=None: {
++        "ok": True, "classification": "success", "head_sha": "a" * 40, "pr_url": PR, "pr_state": "MERGED",
++        "checks": [], "recovery": "", "required": []})
++    with kbc.connect(home / "worker.db") as worker, kbc.connect(home / "hub.db") as hub:
++        # The hub's own history: its event and run ids run ahead of the worker's, as on the real hub.
++        for _ in range(4):
++            tid = kb.create_task(hub, title="hub history", assignee="dev")
++            kb.claim_task(hub, tid)
++            kb.complete_task(hub, tid, summary="local work")
++        yield worker, hub
++
++
++def replay(source, target, origin="worker-3"):
++    """The Board feed: the worker's outbox applied on the hub (new local ids, same uids)."""
++    changes = [sync.RemoteChange(i, op["table_name"], op["row_uid"], op["op"], op["fields"], i, op["hlc"], origin)
++               for i, op in enumerate(sync.outbox(source), 1)]
++    sync.apply_remote_changes(target, changes, new_cursor=len(changes), observers=False)
++
++
++def completed_on_worker(worker):
++    tid = kb.create_task(worker, title="Ship it", assignee="dev", completion_contract="acme/repo")
++    run = kb.claim_task(worker, tid).current_run_id
++    assert kb.complete_task(worker, tid, summary="landed", expected_run_id=run, metadata={"published_pr": PR})
++    return tid
++
++
++def payload_of(conn, tid):
++    row = conn.execute("SELECT id, payload FROM task_events WHERE task_id=? AND kind='completed'", (tid,)).fetchone()
++    return row["id"], json.loads(row["payload"])
++
++
++def verified(conn, tid):
++    conn.execute("BEGIN")
++    try:
++        one = observe_owner_task(conn, {"id": tid, "status": "done"}, now=123)["origin_observation"]["verified"]
++    finally:
++        conn.execute("ROLLBACK")
++    return one, read_completions(conn, [tid])[tid].verified
++
++
++def rewrite(conn, event_id, mutate):
++    row = conn.execute("SELECT payload FROM task_events WHERE id=?", (event_id,)).fetchone()
++    payload = json.loads(row["payload"])
++    mutate(payload)
++    with kb.write_txn(conn):
++        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), event_id))
++
++
++def test_a_worker_completion_replayed_on_the_hub_is_verified_there(boards):
++    worker, hub = boards
++    tid = completed_on_worker(worker)
++    assert verified(worker, tid) == (True, True)
++    replay(worker, hub)
++    _event_id, payload = payload_of(hub, tid)
++    receipt = hub.execute("SELECT id, uid FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()
++    # Precondition, the incident's shape: on the hub the payload integer is not this card's receipt.
++    assert payload["pr_acceptance_event_id"] != receipt["id"]
++    assert kb.get_task(hub, tid).status == "done"
++    assert verified(hub, tid) == (True, True)
++    assert payload["pr_acceptance_event_uid"] == receipt["uid"]
++
++
++def test_a_pre_uid_completion_replayed_from_a_worker_binds_its_runs_receipt(boards):
++    """The four live cards completed before the uid existed: their payload carries only the worker's integer."""
++    worker, hub = boards
++    tid = completed_on_worker(worker)
++    replay(worker, hub)
++    event_id, _ = payload_of(hub, tid)
++    rewrite(hub, event_id, lambda p: p.pop("pr_acceptance_event_uid", None))
++    assert verified(hub, tid) == (True, True)
++    # A receipt of another run is not the one this completion bound.
++    receipt = hub.execute("SELECT id FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()
++    hub.execute("UPDATE task_events SET run_id=NULL WHERE id=?", (receipt["id"],))
++    assert verified(hub, tid) == (False, False)
++
++
++def test_a_completion_that_names_no_receipt_never_borrows_one(boards):
++    worker, hub = boards
++    tid = completed_on_worker(worker)
++    replay(worker, hub)
++    event_id, _ = payload_of(hub, tid)
++    rewrite(hub, event_id, lambda p: (p.pop("pr_acceptance_event_uid", None), p.pop("pr_acceptance_event_id")))
++    assert verified(hub, tid) == (False, False)
++
++
++def test_a_uid_that_names_no_receipt_of_this_card_does_not_fall_back(boards):
++    worker, hub = boards
++    tid = completed_on_worker(worker)
++    replay(worker, hub)
++    event_id, _ = payload_of(hub, tid)
++    rewrite(hub, event_id, lambda p: p.update(pr_acceptance_event_uid="01a1d000-0000-7000-8000-000000000000"))
++    assert verified(hub, tid) == (False, False)
++
++
++def test_a_local_completion_with_a_wrong_id_stays_unverified(boards):
++    """Only a replayed completion (``origin_gateway`` set) may fall back: on its own board the id is exact."""
++    worker, _hub = boards
++    tid = completed_on_worker(worker)
++    event_id, _payload = payload_of(worker, tid)
++    rewrite(worker, event_id, lambda p: (p.pop("pr_acceptance_event_uid", None),
++                                         p.update(pr_acceptance_event_id=p["pr_acceptance_event_id"] + 1000)))
++    assert verified(worker, tid) == (False, False)
+-- 
+2.43.0
+

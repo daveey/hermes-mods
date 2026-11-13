@@ -1,0 +1,399 @@
+From cd5505534bc9a91345259afb68a2e3d4aac17153 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 05:47:54 -0800
+Subject: [PATCH] [daveey] kanban events: never resume at since=0; coalesce
+ frame-driven board re-reads
+
+Problem: on 2026-11-13 05:09-05:40 PST the MacBook Desktop logged 1.5k+
+"Timed out connecting to Hermes backend" on GET /api/plugins/kanban/board per
+30 min (hub 30 s, mini 6 s), plus /boards, hub-sync/status and session-labels
+behind them. Card t_01a1d51dd4d1f0d9.
+
+Why 1: the renderer re-read the board ~3-4x/s. The query
+["kanban","board","hermes-hub","default",false] had dataUpdateCount 4350 after
+55 min against a 60 s refetchInterval. A queryCache subscription showed every
+fetch stack running p.onmessage -> onEventsFrame -> invalidateQueries.
+Why 2: one /events socket was replaying the hub's whole task_events history.
+CDP Network frames showed 200 events per frame (ids 56,799 -> 333,155 in about
+90 s; the hub max is 1,193,569). Each frame invalidated board+boards+blocked,
+and fetchBoard fans out to 3 gateways (+ /boards + hub-sync/tasks).
+Why 3: the socket was opened with since=0. When the routed gateway's own
+/board read fails, mergeBoards writes latest_event_id: 0. snapshotCursor() and
+the post-fetch tail took any number as a cursor, and the server replays from 0
+for an explicit since=0 (plugin_api._since_param).
+Why 4: the hub /board read was already timing out because the link was
+saturated (1.1 GB sent on the hub ssh master in 55 min), so 0 kept getting
+cached. Superseded reads were never aborted, because fetchBoard ignores the
+query signal and invalidateQueries' default cancelRefetch only orphans the
+promise. Every frame therefore added more HTTP requests to the 50-socket pool,
+past the request deadline. This is a feedback loop.
+Root (happened): the snapshot cursor contract had no "unknown" value. 0 meant
+both "board has no events" and "routed gateway did not answer", and the
+socket treated it as a resume point. Event-frame invalidation was also
+unbounded per frame.
+Root (not caught): api.events-cursor tests covered only positive snapshot
+cursors and one frame at a time. No test fed a merged board whose primary
+failed, or a burst of frames.
+Recurrence: an earlier fix made a missing since start at the tail
+(_since_param docstring: "replaying every task_events row ... turned each open
+into a refetch storm"). It covered the absent cursor but not a cursor of 0
+fabricated by mergeBoards.
+
+Countermeasures:
+- symptom/root: knownCursor() accepts only positive cursors, so an unknown
+  snapshot opens at the server tail (snapshotCursor + post-fetch tail).
+  mergeBoards documents 0 = unknown.
+- root: event frames refresh board/boards/blocked at most once per 2 s per
+  connection (leading + one trailing), with cancelRefetch: false so an
+  in-flight read is reused, not orphaned. Per-task detail invalidation stays
+  immediate.
+- detection: 3 new tests in api.events-cursor.test.ts. All 3 fail on base and
+  pass with the fix. The whole plugins/kanban vitest suite passes (149).
+- deferred: pluginSocket reconnects reuse the dial-time since, which replays
+  everything since the first dial after a tunnel drop. The coalescing bounds
+  its cost. Noted on the card.
+---
+ .../plugins/kanban/api.events-cursor.test.ts  |  80 ++++++++++-
+ apps/desktop/src/plugins/kanban/api.ts        | 136 ++++++++++++++----
+ 2 files changed, 191 insertions(+), 25 deletions(-)
+
+diff --git a/apps/desktop/src/plugins/kanban/api.events-cursor.test.ts b/apps/desktop/src/plugins/kanban/api.events-cursor.test.ts
+index 520ed894c4..eb867ba562 100644
+--- a/apps/desktop/src/plugins/kanban/api.events-cursor.test.ts
++++ b/apps/desktop/src/plugins/kanban/api.events-cursor.test.ts
+@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
+ // The socket must start at the snapshot's tail, and a late snapshot must not
+ // reopen a board the user already left. The cursor is per connection.
+ 
+-const { $boardSlug, bindApi, boardKey } = await import('./api')
++const { $boardSlug, bindApi, boardKey, EVENTS_BOARD_REFRESH_MIN_MS } = await import('./api')
+ const { setConnection } = await import('@/store/session')
+ 
+ const BOARD = (latest_event_id: number) => ({
+@@ -149,4 +149,82 @@ describe('kanban event cursor', () => {
+ 
+     dispose()
+   })
++
++  // [daveey] 2026-11-13: the hub's own /board read timed out, mergeBoards stamped the cached board
++  // latest_event_id 0, and the socket opened at since=0: a full history replay, 200 events a frame.
++  it('never opens at since=0 from a snapshot whose routed gateway did not answer', async () => {
++    queryClient.setQueryData(boardKey('local', 'ops', false), BOARD(0))
++
++    const socket = vi.fn(() => vi.fn())
++
++    const dispose = bindApi(
++      async () => {
++        throw new Error('hub /board timed out again')
++      },
++      storage('ops'),
++      socket
++    )
++
++    await vi.waitFor(() => {
++      expect(socket).toHaveBeenCalledWith('/events?board=ops', expect.any(Function))
++    })
++    expect(socket.mock.calls.flat().some(arg => String(arg).includes('since=0'))).toBe(false)
++    dispose()
++  })
++
++  it('opens at the server tail when the fetched snapshot carries no positive cursor', async () => {
++    const socket = vi.fn(() => vi.fn())
++    const dispose = bindApi(async <T>() => BOARD(0) as T, storage('ops'), socket)
++
++    await vi.waitFor(() => {
++      expect(socket).toHaveBeenCalledWith('/events?board=ops', expect.any(Function))
++    })
++
++    dispose()
++  })
++
++  it('coalesces a burst of frames into one immediate and one trailing board re-read', async () => {
++    vi.useFakeTimers()
++
++    try {
++      queryClient.setQueryData(boardKey('local', 'ops', false), BOARD(10))
++      const frames: Array<(data: unknown) => void> = []
++
++      const dispose = bindApi(
++        async () => {
++          throw new Error('cached snapshot must not refetch')
++        },
++        storage('ops'),
++        vi.fn((_path: string, onMessage: (data: unknown) => void) => {
++          frames.push(onMessage)
++
++          return vi.fn()
++        })
++      )
++
++      const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
++      const boardReads = () => invalidate.mock.calls.filter(([filters]) => filters?.queryKey?.[1] === 'board').length
++
++      for (let id = 11; id <= 60; id++) {
++        frames.at(-1)!({ cursor: id, events: [{ id, kind: 'heartbeat', task_id: `t_${id}` }] })
++      }
++
++      expect(boardReads()).toBe(1)
++      // A read in flight answers the next frame too: no orphaned duplicate request.
++      expect(invalidate.mock.calls.find(([filters]) => filters?.queryKey?.[1] === 'board')?.[1]).toEqual({
++        cancelRefetch: false
++      })
++
++      vi.advanceTimersByTime(EVENTS_BOARD_REFRESH_MIN_MS)
++      expect(boardReads()).toBe(2)
++
++      vi.advanceTimersByTime(10 * EVENTS_BOARD_REFRESH_MIN_MS)
++      expect(boardReads()).toBe(2)
++
++      invalidate.mockRestore()
++      dispose()
++    } finally {
++      vi.useRealTimers()
++    }
++  })
+ })
+diff --git a/apps/desktop/src/plugins/kanban/api.ts b/apps/desktop/src/plugins/kanban/api.ts
+index 49a1540e7f..7471a460c1 100644
+--- a/apps/desktop/src/plugins/kanban/api.ts
++++ b/apps/desktop/src/plugins/kanban/api.ts
+@@ -124,12 +124,25 @@ function cursorKey(scope: string, slug: string): string {
+   return `${scope}\0${slug}`
+ }
+ 
++/** [daveey] A snapshot's tail is a usable `since` only when positive. A merged
++ *  board whose routed gateway did not answer carries `latest_event_id: 0`
++ *  (mergeBoards), and `since=0` makes the server replay that board's whole
++ *  task_events history, 200 rows per frame. On 2026-11-13 the hub's own /board
++ *  read timed out, the cached merge said 0, and the reopened socket replayed
++ *  ~360k hub events: every frame invalidated the board, which re-read three
++ *  gateways ~4x/s and timed out ~1.5k reads per 30 min. Unknown opens at the
++ *  server's tail instead (an empty board's tail is 0 anyway). */
++function knownCursor(value: unknown): number | undefined {
++  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
++}
++
+ function snapshotCursor(scope: string, slug: string): number | undefined {
+   for (const archived of [false, true]) {
+     const board = queryClient.getQueryData<KanbanBoard>(boardKey(scope, slug, archived))
++    const cursor = knownCursor(board?.latest_event_id)
+ 
+-    if (typeof board?.latest_event_id === 'number') {
+-      return board.latest_event_id
++    if (cursor !== undefined) {
++      return cursor
+     }
+   }
+ 
+@@ -196,9 +209,64 @@ const routedScope = (): string => host.activeConnectionId() ?? LOCAL_SCOPE
+  *  `bindApi`; sites with their own `enabled` compose it. */
+ export const routedToScope = (query: { queryKey: readonly unknown[] }): boolean => query.queryKey[2] === routedScope()
+ 
+-/** One live `task_events` frame → precise cache invalidation: the board, plus
+- *  each touched task's detail. The polls (8s board / 4s drawer) stay as the
+- *  fallback — the socket just makes the board feel instant. */
++/** [daveey] Board-wide reads (merged board, switcher counts, Blocked section)
++ *  fan out to every gateway and can take seconds over an SSH tunnel, so event
++ *  frames refresh them at most once per this interval per connection: the first
++ *  frame immediately, any later ones as one trailing refresh. A busy or
++ *  catching-up stream (200 events per 300 ms frame) used to invalidate them on
++ *  every frame; the reads' queryFns ignore the abort signal, so each superseded
++ *  read kept its HTTP request running and they queued past the request
++ *  deadline (2026-11-13: ~4 board re-reads/s, ~1.5k timeouts per 30 min). */
++export const EVENTS_BOARD_REFRESH_MIN_MS = 2000
++
++const boardRefreshAt = new Map<string, number>()
++const boardRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>()
++
++function refreshBoardReads(scope: string): void {
++  boardRefreshAt.set(scope, Date.now())
++  // cancelRefetch: false — a read already in flight answers this frame too
++  // instead of being orphaned (still on the wire) by a duplicate.
++  const keep = { cancelRefetch: false }
++
++  void queryClient.invalidateQueries({ queryKey: boardKeyPrefix(scope) }, keep)
++  // Any event can change a board's card count — keep the switcher badge honest.
++  void queryClient.invalidateQueries({ queryKey: boardsKey(scope) }, keep)
++  // [daveey] The sidebar's Blocked section spans every board.
++  void queryClient.invalidateQueries({ queryKey: blockedKey(scope) }, keep)
++}
++
++function scheduleBoardRefresh(scope: string): void {
++  if (boardRefreshTimers.has(scope)) {
++    return
++  }
++
++  const waitMs = (boardRefreshAt.get(scope) ?? -Infinity) + EVENTS_BOARD_REFRESH_MIN_MS - Date.now()
++
++  if (waitMs <= 0) {
++    refreshBoardReads(scope)
++
++    return
++  }
++
++  boardRefreshTimers.set(
++    scope,
++    setTimeout(() => {
++      boardRefreshTimers.delete(scope)
++      refreshBoardReads(scope)
++    }, waitMs)
++  )
++}
++
++function resetBoardRefresh(): void {
++  boardRefreshTimers.forEach(timer => clearTimeout(timer))
++  boardRefreshTimers.clear()
++  boardRefreshAt.clear()
++}
++
++/** One live `task_events` frame → precise cache invalidation: the board
++ *  (coalesced, see EVENTS_BOARD_REFRESH_MIN_MS), plus each touched task's
++ *  detail. The polls (8s board / 4s drawer) stay as the fallback — the socket
++ *  just makes the board feel instant. */
+ function onEventsFrame(scope: string, slug: string, data: unknown, selectedSlug = slug): void {
+   const frame = data as { cursor?: unknown; events?: CompletionEvent[] }
+ 
+@@ -212,11 +280,7 @@ function onEventsFrame(scope: string, slug: string, data: unknown, selectedSlug
+     return
+   }
+ 
+-  void queryClient.invalidateQueries({ queryKey: boardKeyPrefix(scope) })
+-  // Any event can change a board's card count — keep the switcher badge honest.
+-  void queryClient.invalidateQueries({ queryKey: boardsKey(scope) })
+-  // [daveey] The sidebar's Blocked section spans every board.
+-  void queryClient.invalidateQueries({ queryKey: blockedKey(scope) })
++  scheduleBoardRefresh(scope)
+ 
+   for (const taskId of new Set(events.map(event => event.task_id).filter(Boolean))) {
+     void queryClient.invalidateQueries({ queryKey: taskKey(scope, slug, taskId!) })
+@@ -269,6 +333,7 @@ export function bindApi(
+   persist($gatewayFilter, GATEWAY_FILTER_KEY, '')
+ 
+   eventCursorByBoard.clear()
++  resetBoardRefresh()
+ 
+   let close: (() => void) | null = null
+   let socketGeneration = 0
+@@ -321,7 +386,7 @@ export function bindApi(
+             return
+           }
+ 
+-          const tail = typeof board?.latest_event_id === 'number' ? board.latest_event_id : undefined
++          const tail = knownCursor(board?.latest_event_id)
+ 
+           close = dial(scope, slug, tail)
+         })
+@@ -398,6 +463,7 @@ export function bindApi(
+   return () => {
+     socketGeneration += 1
+     eventCursorByBoard.clear()
++    resetBoardRefresh()
+     unsubs.forEach(unsub => unsub())
+     close?.()
+     rest = null
+@@ -435,17 +501,19 @@ export const boardKeyPrefix = (scope: string) => ['kanban', 'board', scope] as c
+ export const boardKey = (scope: string, slug: string, archived: boolean) =>
+   [...boardKeyPrefix(scope), slug, archived] as const
+ export const taskKey = (scope: string, slug: string, id: string, owner?: TaskOwner) =>
+-  owner ? ['kanban', 'task', owner.gateway, owner.board, id, owner.profile] as const
+-    : ['kanban', 'task', scope, slug, id] as const
++  owner
++    ? (['kanban', 'task', owner.gateway, owner.board, id, owner.profile] as const)
++    : (['kanban', 'task', scope, slug, id] as const)
+ export const logKey = (scope: string, slug: string, id: string, owner?: TaskOwner) =>
+-  owner ? ['kanban', 'log', owner.gateway, owner.board, id, owner.profile] as const
+-    : ['kanban', 'log', scope, slug, id] as const
++  owner
++    ? (['kanban', 'log', owner.gateway, owner.board, id, owner.profile] as const)
++    : (['kanban', 'log', scope, slug, id] as const)
+ export const boardsKey = (scope: string) => ['kanban', 'boards', scope] as const
+ /** [daveey] The routed gateway's server-current board slug (the '' alias), see resolvedSlug. */
+ const currentBoardKey = (scope: string) => ['kanban', 'current-board', scope] as const
+ const CURRENT_BOARD_STALE_MS = 30_000
+ export const profilesKey = (scope: string, owner?: TaskOwner) =>
+-  owner ? ['kanban', 'profiles', owner.gateway, owner.profile] as const : ['kanban', 'profiles', scope] as const
++  owner ? (['kanban', 'profiles', owner.gateway, owner.profile] as const) : (['kanban', 'profiles', scope] as const)
+ export const projectsKey = (scope: string) => ['kanban', 'projects', scope] as const
+ export const orchestrationKey = (scope: string) => ['kanban', 'orchestration', scope] as const
+ /** [daveey] Blocked cards across every board and gateway (sidebar section). */
+@@ -594,7 +662,12 @@ function withSlug(path: string, slug: string, params: Record<string, string> = {
+ }
+ 
+ /** `withBoard` for a task: its own board slug on its own gateway. */
+-function forTask(id: string, path: string, params: Record<string, string> = {}, explicitOwner?: TaskOwner): [string, PluginRestOptions] {
++function forTask(
++  id: string,
++  path: string,
++  params: Record<string, string> = {},
++  explicitOwner?: TaskOwner
++): [string, PluginRestOptions] {
+   const owner = explicitOwner ?? rememberedOwner(id)
+ 
+   return owner
+@@ -659,7 +732,8 @@ const TERMINAL_ORDER = new Set(['done', 'archived'])
+  *  tagged with its `gateway`, queue lanes re-sorted by the backend's dispatch
+  *  key (priority DESC, created_at ASC) and history lanes newest-first. The
+  *  FIRST part is the routed gateway: its `latest_event_id`/`now` drive the
+- *  events socket. A gateway that lacks the board contributes nothing; any
++ *  events socket; when it did not answer, `latest_event_id` is 0 = unknown
++ *  (never a cursor: see knownCursor). A gateway that lacks the board contributes nothing; any
+  *  other failure is reported in `gateway_errors`. Throws only when no
+  *  gateway answered. */
+ export function mergeBoards(parts: GatewayBoardPart[]): KanbanBoard {
+@@ -741,7 +815,10 @@ function rememberOwners(board: KanbanBoard, slug: string): KanbanBoard {
+         const hubGateway = hubGatewayForConnection(task.gateway)
+ 
+         if (hubGateway) {
+-          hubTaskRefs.set(ownerKey(task.id, { board: slug, gateway: task.gateway }), { board: slug || 'default', hubGateway })
++          hubTaskRefs.set(ownerKey(task.id, { board: slug, gateway: task.gateway }), {
++            board: slug || 'default',
++            hubGateway
++          })
+         }
+       } else {
+         hubTaskRefs.delete(ownerKey(task.id, { board: slug, gateway: task.gateway ?? routedScope() }))
+@@ -931,7 +1008,9 @@ export const retryingFetch = ({ client, queryKey }: ReadFetchContext) =>
+   (client.getQueryState(queryKey)?.fetchFailureCount ?? 0) > 0
+ 
+ export const fetchTask = async (id: string, owner?: TaskOwner, read: PluginRestOptions = {}) => {
+-  const downloadAttachment = captureGatewayFileDownload(owner ? { connectionId: owner.gateway, profile: owner.profile } : undefined)
++  const downloadAttachment = captureGatewayFileDownload(
++    owner ? { connectionId: owner.gateway, profile: owner.profile } : undefined
++  )
+   const [path, opts] = forTask(id, `/tasks/${id}`, {}, owner)
+   const detail = await call<KanbanTaskDetail>(path, { ...opts, ...read })
+ 
+@@ -1128,9 +1207,15 @@ function autoNudge(gateway: string | TaskOwner = routedScope()): void {
+     setTimeout(() => {
+       nudgeTimers.delete(key)
+ 
+-      const request = typeof gateway === 'string'
+-        ? nudgeDispatcher(gateway)
+-        : call(withSlug('/dispatch', gateway.board), { connectionId: gateway.gateway, profile: gateway.profile, method: 'POST', body: {} })
++      const request =
++        typeof gateway === 'string'
++          ? nudgeDispatcher(gateway)
++          : call(withSlug('/dispatch', gateway.board), {
++              connectionId: gateway.gateway,
++              profile: gateway.profile,
++              method: 'POST',
++              body: {}
++            })
+ 
+       request.catch(() => undefined)
+     }, 400)
+@@ -1256,7 +1341,10 @@ export const addComment = (id: string, body: string, owner?: TaskOwner) => {
+ export const reassignTask = (id: string, profile: string, owner?: TaskOwner) => {
+   const [path, opts] = forTask(id, `/tasks/${id}/reassign`, {}, owner)
+ 
+-  return nudged(call(path, { ...opts, method: 'POST', body: { profile, reclaim_first: true } }), owner ?? taskGateway(id))
++  return nudged(
++    call(path, { ...opts, method: 'POST', body: { profile, reclaim_first: true } }),
++    owner ?? taskGateway(id)
++  )
+ }
+ 
+ export const reclaimTask = (id: string, owner?: TaskOwner) => {
+-- 
+2.43.0
+

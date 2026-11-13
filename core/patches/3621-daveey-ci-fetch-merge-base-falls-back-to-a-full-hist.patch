@@ -1,0 +1,409 @@
+From d5c84b2590e296f58c69fee7c6c9d3ccf126db82 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:14:30 +0000
+Subject: [PATCH] [daveey] ci: fetch-merge-base falls back to a full-history
+ fetch when git 2.55 dies in the filtered fetch
+
+Problem: the required 'Repository guards' job failed with exit 128 in the
+fetch-merge-base step on 2 PR runs on 2026-11-13: run 43383623029 (07:09Z,
+wt/pause-first-request-docs) and run 43427608141 (12:44Z, PR #2208 head
+ff4d18dfa8, which turned 'All required checks pass (v2)' red at 12:53:48Z).
+
+Five whys:
+1. The step exited 128 ('##[error]Process completed with exit code 128'
+   right after 'fetch-merge-base.sh main <head>').
+2. git fetch aborted because index-pack's 'repack local links' pass hit a git
+   BUG: 'BUG: builtin/pack-objects.c:5004: should_include_obj should only be
+   called on existing objects' / 'fatal: could not finish pack-objects to
+   repack local links' / 'fatal: index-pack failed' (runner git 2.55.0).
+3. That pass runs because the fetch is from a promisor remote, so index-pack
+   runs in promisor mode. In job 131747088989 the BUG hit the SECOND call
+   ('Fetch PR merge base'): the first call ('Fetch main history') had already
+   unshallowed the checkout into a partial clone with --filter=tree:0
+   (introduced by #832, e0970e3d00).
+4. The script made one fetch attempt with no fallback (set -euo pipefail),
+   so a git failure on that path failed a required check.
+Root (happened): the merge-base action relied on git's promisor repack path
+with no fallback. (Hypothesis, unverified: a runner git upgrade to 2.55.0
+exposed it.) Root (not caught): #832 added no failure-injection test for the
+fetch. Not deterministic per head: rerunning the failed job of 43427608141 on
+a fresh runner passed (Repository guards 59 s).
+
+Fix: before the filtered fetch, fetch-merge-base.sh records the values of
+remote.origin.promisor, remote.origin.partialclonefilter and
+extensions.partialclone. When the filtered fetch exits non-zero it keeps its
+stderr, prints
+  fetch-merge-base: filtered fetch failed (rc=N): <last stderr line>; full-history fallback
+unsets those three keys and fetches the same 'origin <head> <base_spec>' once
+without --filter (--unshallow if still shallow), so index-pack does not run
+in promisor mode. It then restores the keys to their recorded values: in a
+repo that already was a partial clone (the incident's second call) the base
+history has commits only, its trees live on the promisor remote, and the
+unfiltered fetch does not send them (origin/main is a have). Without the
+restore, lazy fetch is off and 'git diff origin/main...<head>' fails with
+rc 128 and no output, which scan_supply_chain.pr_diff reads as an empty diff
+(review 5892080085). A fresh checkout still ends with none of the keys.
+After a fallback the merge base's tree must read (ls-tree, lazily if need
+be) or the step fails, so a fallback never leaves an unreadable base. Only a
+failure of the fallback fetch or of that check fails the step. The success
+path still runs the same --filter=tree:0 fetch with the same argv and output.
+
+Tests (tests/ci/test_fetch_merge_base.py), with a git shim on PATH against a
+local fixture origin:
+- T1 test_git_255_pack_objects_bug_falls_back_to_a_full_history_fetch: the
+  shim fails the filtered fetch with rc 128 and the BUG text (after
+  registering the partial clone, as the real fetch does). RED on main (the
+  script exits 128); GREEN: right merge base, the fallback line, fallback argv
+  without --filter, the three keys absent.
+- test_second_call_fallback_keeps_the_partial_clone_readable: repo-guards'
+  two calls (depth-2 checkout, call 1 real, call 2's filtered fetch fails).
+  GREEN: right merge base, keys equal to their values after call 1, the merge
+  base's ls-tree and 'git diff origin/main...<head>' read. RED on the first
+  version of this fix (keys dropped).
+- test_fallback_fails_when_the_merge_base_tree_cannot_be_read: same two calls
+  with lazy fetch disabled: the step fails with 'cannot be read' instead of
+  passing. RED on the first version (rc 0).
+- test_a_failing_fallback_still_fails: a failing fallback is still an error.
+- T2 test_a_healthy_filtered_fetch_has_no_fallback: no injected failure:
+  one fetch with the unchanged argv, no fallback line (passes before and
+  after).
+Detection: every hit now leaves the fallback line in guard logs.
+---
+ .github/actions/fetch-merge-base/action.yml   |  10 +-
+ .../fetch-merge-base/fetch-merge-base.sh      |  74 ++++++-
+ tests/ci/test_fetch_merge_base.py             | 189 +++++++++++++++++-
+ 3 files changed, 262 insertions(+), 11 deletions(-)
+
+diff --git a/.github/actions/fetch-merge-base/action.yml b/.github/actions/fetch-merge-base/action.yml
+index 8abe4084bf..dbc0e8cbfd 100644
+--- a/.github/actions/fetch-merge-base/action.yml
++++ b/.github/actions/fetch-merge-base/action.yml
+@@ -7,7 +7,15 @@ description: >-
+   required aggregate. The history is complete, so merge-base, `base..HEAD` ranges and
+   `git log --author` answer exactly as on a full clone. Trees and blobs of other commits are fetched
+   lazily on first use (git diff / archive / worktree), which needs credentials: keep the
+-  checkout's default persist-credentials, or pass a token to those commands yourself. Use it
++  checkout's default persist-credentials, or pass a token to those commands yourself. If the
++  filtered fetch fails (git 2.55.0 on the runners can abort it with "BUG: builtin/pack-objects.c:
++  should_include_obj ..." / "fatal: index-pack failed", exit 128, in index-pack's promisor-mode
++  "repack local links"; seen on the second call of a job, in an existing partial clone), the
++  script logs "fetch-merge-base: filtered fetch failed (rc=N): ...; full-history fallback",
++  drops the partial-clone config for one unfiltered fetch of the same two refs, then restores
++  that config as it was before the attempt, so a repo that already was a partial clone can still
++  lazy-fetch its base trees. The step fails only if that fetch fails, or if the merge base's tree
++  cannot be read afterwards. Use it
+   right after actions/checkout (default fetch-depth) with `base` set to the PR's base branch;
+   the merge base is in `steps.<id>.outputs.sha`.
+ 
+diff --git a/.github/actions/fetch-merge-base/fetch-merge-base.sh b/.github/actions/fetch-merge-base/fetch-merge-base.sh
+index 354d4e5232..10ad6aa652 100755
+--- a/.github/actions/fetch-merge-base/fetch-merge-base.sh
++++ b/.github/actions/fetch-merge-base/fetch-merge-base.sh
+@@ -7,7 +7,10 @@
+ #     head  a revision already in the repo, or a 40-hex commit to fetch; default HEAD
+ #
+ # FETCH_TOKEN (optional) authenticates https://github.com remotes when the checkout did not
+-# persist credentials. Exit status is non-zero only when the fetch itself fails.
++# persist credentials. If the commits-only (--filter=tree:0) fetch fails, it is retried once as a
++# plain full-history fetch and the partial-clone config is put back as it was (see "Fallback"
++# below). Exit status is non-zero only when that fallback fetch fails too, or when the merge
++# base's tree still cannot be read after it.
+ set -euo pipefail
+ 
+ base=${1:?usage: fetch-merge-base.sh <base> [<head>]}
+@@ -40,19 +43,74 @@ fi
+ # full-history checkout it replaces pulled every head, tag, tree and blob of the repo. The repo
+ # becomes a partial clone, so a later diff/archive/worktree of the merge base lazily fetches that
+ # commit's trees and blobs (credentials must reach those commands too).
+-depth_args=()
+-if [[ $(git rev-parse --is-shallow-repository) == true ]]; then
+-  depth_args=(--unshallow)
+-fi
++#
++# Fallback: git 2.55.0 on the Blacksmith runners intermittently dies in that filtered fetch
++# ("BUG: builtin/pack-objects.c:5004: should_include_obj should only be called on existing
++# objects" ... "fatal: index-pack failed", exit 128). A fetch from a promisor remote runs
++# index-pack in promisor mode, which "repacks local links" (local objects the new promisor pack
++# references), and pack-objects aborts there. It hit the second call of a job (repo-guards' "Fetch
++# PR merge base"), on a checkout the first call had already unshallowed into a partial clone.
++# When the filtered fetch fails for any reason, the script prints one
++# "filtered fetch failed (rc=N): <last stderr line>; full-history fallback" line, removes the
++# partial-clone registration (remote.origin.promisor, remote.origin.partialclonefilter,
++# extensions.partialclone) so index-pack does not run in promisor mode, and fetches the same refs
++# once without --filter. It then restores those keys to their values from before the attempt: in
++# a repo that already was a partial clone the base history's trees exist only on the promisor
++# remote, and later diffs must still lazy-fetch them. A fresh checkout ends with none of the keys.
++# After a fallback the merge base's tree must read (lazily if need be), or the step fails: a merge
++# base whose trees cannot be read makes a later three-dot diff fail with no output. Only a failure
++# of the fallback fetch or of that check fails the step.
++shallow_args() {
++  if [[ $(git rev-parse --is-shallow-repository) == true ]]; then
++    printf '%s\n' --unshallow
++  fi
++}
++fetch_args=(--quiet --no-tags --no-recurse-submodules)
++mapfile -t depth_args < <(shallow_args)
+ start=$SECONDS
+-git "${git_auth[@]}" fetch --quiet --no-tags --no-recurse-submodules --filter=tree:0 \
+-  "${depth_args[@]}" origin "$head_sha" "$base_spec"
++err=$(mktemp)
++trap 'rm -f "$err"' EXIT
++partial_keys=(remote.origin.promisor remote.origin.partialclonefilter extensions.partialclone)
++declare -A saved=()
++for key in "${partial_keys[@]}"; do
++  if value=$(git config --get "$key"); then
++    saved[$key]=$value
++  fi
++done
++rc=0
++git "${git_auth[@]}" fetch "${fetch_args[@]}" --filter=tree:0 \
++  "${depth_args[@]}" origin "$head_sha" "$base_spec" 2>"$err" || rc=$?
++cat "$err" >&2
++fell_back=0
++if (( rc != 0 )); then
++  fell_back=1
++  last=$(grep -v '^[[:space:]]*$' "$err" | tail -n 1 || true)
++  echo "fetch-merge-base: filtered fetch failed (rc=${rc}): ${last:-<no stderr>}; full-history fallback" >&2
++  for key in "${partial_keys[@]}"; do
++    git config --unset-all "$key" 2>/dev/null || true
++  done
++  mapfile -t depth_args < <(shallow_args)
++  git "${git_auth[@]}" fetch "${fetch_args[@]}" "${depth_args[@]}" origin "$head_sha" "$base_spec"
++  for key in "${partial_keys[@]}"; do
++    if [[ -v saved[$key] ]]; then
++      git config "$key" "${saved[$key]}"
++    fi
++  done
++fi
+ echo "fetch-merge-base: fetched ${base_rev} and ${head_sha} history in $((SECONDS - start))s" >&2
+ 
+ # Exit 1 with no output is "no common ancestor"; anything else (a missing object) is an error,
+ # never a silent "unrelated".
+ rc=0
+-git merge-base "$base_rev" "$head_sha" || rc=$?
++merge_base=$(git merge-base "$base_rev" "$head_sha") || rc=$?
+ if (( rc > 1 )); then
+   exit "$rc"
+ fi
++if (( fell_back )) && [[ -n $merge_base ]] \
++   && ! git "${git_auth[@]}" ls-tree "$merge_base" >/dev/null; then
++  echo "fetch-merge-base: after the fallback the tree of merge base ${merge_base} cannot be read" >&2
++  exit 1
++fi
++if [[ -n $merge_base ]]; then
++  printf '%s\n' "$merge_base"
++fi
+diff --git a/tests/ci/test_fetch_merge_base.py b/tests/ci/test_fetch_merge_base.py
+index f2b8346b1a..775fb19bf8 100644
+--- a/tests/ci/test_fetch_merge_base.py
++++ b/tests/ci/test_fetch_merge_base.py
+@@ -9,6 +9,7 @@ fork pulled every head, tag and blob and ran past the ci-fast timeouts. They now
+ from __future__ import annotations
+ 
+ import os
++import shutil
+ import subprocess
+ from pathlib import Path
+ 
+@@ -41,8 +42,11 @@ def commit(repo: Path, name: str, email: str = "a@example.com") -> str:
+     return git(repo, "rev-parse", "HEAD")
+ 
+ 
+-def run_script(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+-    env = {**os.environ, **GIT_ENV}
++def run_script(cwd: Path, *args: str, path_prefix: Path | None = None,
++               extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
++    env = {**os.environ, **GIT_ENV, **(extra_env or {})}
++    if path_prefix is not None:
++        env["PATH"] = f"{path_prefix}{os.pathsep}{env.get('PATH', '')}"
+     return subprocess.run(["bash", str(SCRIPT), *args], cwd=cwd, env=env, capture_output=True,
+                           encoding="utf-8", timeout=120, check=False)
+ 
+@@ -144,3 +148,184 @@ def test_a_fetch_failure_fails_rather_than_reading_as_unrelated(origin, tmp_path
+ 
+     assert result.returncode != 0
+     assert result.stdout == ""
++
++
++# git 2.55.0 on the Blacksmith runner, 2026-11-13 (runs 43383623029 and 43427608141): the filtered
++# --unshallow fetch made index-pack "repack local links" in promisor mode, and pack-objects died.
++GIT_255_BUG = """\
++BUG: builtin/pack-objects.c:5004: should_include_obj should only be called on existing objects
++error: pack-objects died of signal 6
++fatal: could not finish pack-objects to repack local links
++fatal: index-pack failed
++"""
++
++PARTIAL_CLONE_KEYS = ("remote.origin.promisor", "remote.origin.partialclonefilter",
++                      "extensions.partialclone")
++
++SHIM = """\
++#!/usr/bin/env bash
++printf '%s\\x1f' "$@" >> "$FMB_ARGV_LOG"
++printf '\\n' >> "$FMB_ARGV_LOG"
++is_fetch=0; filtered=0
++for a in "$@"; do
++  [[ $a == fetch ]] && is_fetch=1
++  [[ $a == --filter=tree:0 ]] && filtered=1
++done
++if [[ ${FMB_FAIL_FILTERED:-} == 1 && $is_fetch == 1 && $filtered == 1 ]]; then
++  # What the real filtered fetch registers before index-pack dies.
++  "$FMB_REAL_GIT" config core.repositoryformatversion 1
++  "$FMB_REAL_GIT" config remote.origin.promisor true
++  "$FMB_REAL_GIT" config remote.origin.partialclonefilter tree:0
++  "$FMB_REAL_GIT" config extensions.partialclone origin
++  cat "$FMB_BUG_TEXT" >&2
++  exit 128
++fi
++exec "$FMB_REAL_GIT" "$@"
++"""
++
++
++def git_shim(tmp_path: Path, fail_filtered: bool) -> tuple[Path, Path, dict[str, str]]:
++    """A `git` on PATH that logs every argv and passes it to the real git.
++
++    With fail_filtered, a `fetch ... --filter=tree:0 ...` instead registers the partial clone,
++    prints the git 2.55 BUG text and exits 128, as on the runner.
++    """
++    real_git = shutil.which("git")
++    assert real_git
++    shim_dir = tmp_path / "shim"
++    shim_dir.mkdir()
++    (shim_dir / "git").write_text(SHIM, encoding="utf-8")
++    (shim_dir / "git").chmod(0o755)
++    log = tmp_path / "git-argv.log"
++    bug = tmp_path / "bug.txt"
++    bug.write_text(GIT_255_BUG, encoding="utf-8")
++    env = {"FMB_ARGV_LOG": str(log), "FMB_REAL_GIT": real_git, "FMB_BUG_TEXT": str(bug),
++           "FMB_FAIL_FILTERED": "1" if fail_filtered else ""}
++    return shim_dir, log, env
++
++
++def fetch_calls(log: Path) -> list[list[str]]:
++    calls = [line.split("\x1f")[:-1] for line in log.read_text(encoding="utf-8").splitlines()]
++    return [c for c in calls if "fetch" in c]
++
++
++def config_get(work: Path, key: str) -> int:
++    return subprocess.run(["git", "config", "--get", key], cwd=work,
++                          env={**os.environ, **GIT_ENV}, capture_output=True,
++                          check=False).returncode
++
++
++def test_git_255_pack_objects_bug_falls_back_to_a_full_history_fetch(origin, tmp_path):
++    """T1: the filtered fetch dies with the git 2.55 BUG; one unfiltered fetch answers instead."""
++    work = checkout(origin, tmp_path, "feature")
++    head = git(work, "rev-parse", "HEAD")
++    shim_dir, log, env = git_shim(tmp_path, fail_filtered=True)
++
++    result = run_script(work, "main", path_prefix=shim_dir, extra_env=env)
++
++    assert result.returncode == 0, result.stderr
++    assert result.stdout.strip() == git(origin, "merge-base", "main", "feature")
++    assert ("fetch-merge-base: filtered fetch failed (rc=128): fatal: index-pack failed; "
++            "full-history fallback") in result.stderr.splitlines()
++    filtered, fallback = fetch_calls(log)
++    assert "--filter=tree:0" in filtered
++    assert not any(a.startswith("--filter") for a in fallback)
++    assert fallback == ["fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "--unshallow",
++                        "origin", head, "+refs/heads/main:refs/remotes/origin/main"]
++    for key in PARTIAL_CLONE_KEYS:
++        assert config_get(work, key) == 1, key
++    assert git(work, "rev-parse", "--is-shallow-repository") == "false"
++    assert git(work, "show", "refs/remotes/origin/main:m6.txt") == "m6"
++
++
++def config_values(work: Path) -> dict[str, str | None]:
++    out = {}
++    for key in PARTIAL_CLONE_KEYS:
++        got = subprocess.run(["git", "config", "--get", key], cwd=work,
++                             env={**os.environ, **GIT_ENV}, capture_output=True,
++                             encoding="utf-8", check=False)
++        out[key] = got.stdout.strip() if got.returncode == 0 else None
++    return out
++
++
++def guards_checkout(origin: Path, tmp_path: Path) -> tuple[Path, str]:
++    """repo-guards: depth-2 checkout, then call 1 (`main`) with the real git. Returns the PR head."""
++    work = tmp_path / "work-guards"
++    git(tmp_path, "clone", "-q", "--depth=2", "--no-tags", "--single-branch", "-b", "main",
++        origin.as_uri(), str(work))
++    first = run_script(work, "main")
++    assert first.returncode == 0, first.stderr
++    assert config_values(work)["remote.origin.promisor"] == "true"
++    return work, git(origin, "rev-parse", "feature")
++
++
++def test_second_call_fallback_keeps_the_partial_clone_readable(origin, tmp_path):
++    """The incident path: call 1 made a partial clone; call 2's filtered fetch dies.
++
++    The fallback must restore the promisor config, or the base history's trees (fetched commits
++    only by call 1) can never be read and `git diff base...head` fails with no output.
++    """
++    work, head = guards_checkout(origin, tmp_path)
++    before = config_values(work)
++    shim_dir, log, env = git_shim(tmp_path, fail_filtered=True)
++
++    result = run_script(work, "main", head, path_prefix=shim_dir, extra_env=env)
++
++    assert result.returncode == 0, result.stderr
++    merge_base = git(origin, "merge-base", "main", "feature")
++    assert result.stdout.strip() == merge_base
++    assert "full-history fallback" in result.stderr
++    filtered, fallback = fetch_calls(log)
++    assert "--filter=tree:0" in filtered
++    assert not any(a.startswith("--filter") for a in fallback)
++    assert config_values(work) == before
++    assert git(work, "ls-tree", "--name-only", merge_base).splitlines() == [
++        "m1.txt", "m2.txt", "m3.txt", "m4.txt"]
++    diff = ["diff", "--no-renames", "--name-only", f"origin/main...{head}"]
++    assert git(work, *diff).splitlines() == ["f1.txt", "f2.txt", "f3.txt"]
++
++
++def test_fallback_fails_when_the_merge_base_tree_cannot_be_read(origin, tmp_path):
++    """Fail closed: a fallback that leaves an unreadable merge base must not pass the step."""
++    work, head = guards_checkout(origin, tmp_path)
++    for key in PARTIAL_CLONE_KEYS:  # lazy fetch impossible: call 1's base trees are unreachable
++        subprocess.run(["git", "config", "--unset-all", key], cwd=work,
++                       env={**os.environ, **GIT_ENV}, capture_output=True, check=False)
++    shim_dir, _, env = git_shim(tmp_path, fail_filtered=True)
++
++    result = run_script(work, "main", head, path_prefix=shim_dir, extra_env=env)
++
++    assert result.returncode != 0
++    assert result.stdout == ""
++    assert "cannot be read" in result.stderr
++
++
++def test_a_failing_fallback_still_fails(origin, tmp_path):
++    work = checkout(origin, tmp_path, "feature")
++    shim_dir, log, env = git_shim(tmp_path, fail_filtered=True)
++
++    result = run_script(work, "no-such-branch", path_prefix=shim_dir, extra_env=env)
++
++    assert result.returncode != 0
++    assert result.stdout == ""
++    assert "full-history fallback" in result.stderr
++    assert len(fetch_calls(log)) == 2
++
++
++def test_a_healthy_filtered_fetch_has_no_fallback(origin, tmp_path):
++    """T2: no injected failure: one filtered fetch with the original argv, no fallback line."""
++    work = checkout(origin, tmp_path, "feature")
++    head = git(work, "rev-parse", "HEAD")
++    shim_dir, log, env = git_shim(tmp_path, fail_filtered=False)
++
++    result = run_script(work, "main", path_prefix=shim_dir, extra_env=env)
++
++    assert result.returncode == 0, result.stderr
++    assert result.stdout.strip() == git(origin, "merge-base", "main", "feature")
++    assert fetch_calls(log) == [[
++        "fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "--filter=tree:0",
++        "--unshallow", "origin", head, "+refs/heads/main:refs/remotes/origin/main"]]
++    lines = [line for line in result.stderr.splitlines() if line]
++    assert len(lines) == 1
++    assert lines[0].startswith("fetch-merge-base: fetched refs/remotes/origin/main and ")
++    assert config_get(work, "remote.origin.promisor") == 0
+-- 
+2.43.0
+

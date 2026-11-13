@@ -1,0 +1,219 @@
+From d5ace70eab07b9045abf8a0018c013b6cb4ad30c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:34:15 +0000
+Subject: [PATCH] [daveey] state: a failing schema-memo data heal backs off 30
+ s, warns once, overrides another key's claim
+
+Answers PR #2214 review 5891531303 (t_01a1d4fed0067627) nits 1-3.
+
+1. A full init whose heal failed now makes the store's heal due again
+   HEAL_RETRY_S from now even when an earlier memo key on the same file had
+   claimed the interval (before: record(healed=False) only skipped writing, so
+   the retry waited up to HEAL_INTERVAL_S), and warns like the memo-hit path.
+   Covered by test_a_full_init_heal_failure_overrides_an_earlier_keys_interval_claim.
+2. A heal that keeps failing is retried after a 30 s backoff instead of on
+   every memo-hit open, and warns once per failure streak (debug after).
+   Covered by test_a_persistently_failing_heal_backs_off_and_warns_once.
+3. The fallback message no longer says "rolled back" (a failed NULL-active
+   heal has nothing to roll back).
+
+RED: both new tests fail with the head-631e3417e3 memo module (scans 2 == 1;
+0 warnings == 1). GREEN: tests/hermes_state/ +
+tests/hermes_cli/test_session_recovery_lost_and_found.py: 2508 passed, 0 failed.
+---
+ hermes_state_schema_memo.py                   | 41 +++++++---
+ .../test_schema_init_memo_heals.py            | 75 ++++++++++++++++++-
+ 2 files changed, 103 insertions(+), 13 deletions(-)
+
+diff --git a/hermes_state_schema_memo.py b/hermes_state_schema_memo.py
+index 5cdfbecb14..7da1679be8 100644
+--- a/hermes_state_schema_memo.py
++++ b/hermes_state_schema_memo.py
+@@ -19,8 +19,9 @@ memoized and the next open retries the repair, as every open did before the memo
+ The data heals (stray delegate markers, and NULL ``active`` rows an older-build writer on the same store
+ can still produce) are repair, not schema: they run with the full init (the first open per key per
+ process) and otherwise at most once per ``HEAL_INTERVAL_S`` per store, from a memo-hit open. A heal that
+-does not complete (a lock, page damage) is logged at warning and releases its interval claim, so the next
+-open retries it.
++does not complete (a lock, page damage) is retried after ``HEAL_RETRY_S`` rather than a full interval,
++whichever open (full init or memo hit) it failed in. It is logged at warning on the first failure per
++store and at debug while it keeps failing, so persistent damage costs one scan per backoff, not per open.
+ """
+ from __future__ import annotations
+ 
+@@ -34,6 +35,7 @@ from typing import Any, Optional
+ logger = logging.getLogger("hermes_state")
+ 
+ HEAL_INTERVAL_S = 600.0
++HEAL_RETRY_S = 30.0  # backoff after a heal that did not complete
+ # Always restored on a hit, whatever the first init left them at; other changed scalars are found by diff.
+ _ALWAYS_RESTORED = ("_fts_enabled", "_trigram_available", "_fts_stale")
+ _SIMPLE = (bool, int, float, str, bytes, type(None))
+@@ -42,6 +44,7 @@ _TITLE_INDEX = "idx_sessions_title_unique"
+ _lock = threading.Lock()
+ _memo: dict[tuple, dict[str, Any]] = {}  # key -> attributes the full init set on self
+ _last_heal: dict[str, float] = {}  # realpath -> monotonic start of the last completed (or running) data heal
++_heal_failing: set[str] = set()  # realpaths whose last heal did not complete (already warned once)
+ 
+ 
+ def clear() -> None:
+@@ -49,6 +52,7 @@ def clear() -> None:
+     with _lock:
+         _memo.clear()
+         _last_heal.clear()
++        _heal_failing.clear()
+ 
+ 
+ def _settled_meta_keys() -> tuple[str, ...]:
+@@ -100,7 +104,8 @@ def snapshot(db) -> dict[str, Any]:
+ 
+ def record(db, before: dict[str, Any], *, healed: bool = True) -> None:
+     """Remember a successful full init when it left the store settled at this build's schema. With
+-    *healed* False (a data heal did not complete) the heal interval stays unclaimed: the next open retries."""
++    *healed* False (a data heal did not complete) the store's heal is due again ``HEAL_RETRY_S`` from now,
++    also when an earlier open (another memo key on the same file) had claimed the interval."""
+     probed = _probe(db.db_path, db._conn)
+     if probed is None:
+         return
+@@ -118,6 +123,9 @@ def record(db, before: dict[str, Any], *, healed: bool = True) -> None:
+         _memo[key] = changed
+         if healed:
+             _last_heal[key[0]] = time.monotonic()  # the full init just ran the heals
++            _heal_failing.discard(key[0])
++            return
++    _heal_failed(key[0], None, None)
+ 
+ 
+ _MISSING = object()
+@@ -166,12 +174,23 @@ def _maybe_heal(db, real: str) -> None:
+     except sqlite3.Error as exc:  # a data repair must never fail an open
+         ok, error = False, exc
+     if ok:
++        with _lock:
++            _heal_failing.discard(real)
+         return
+-    with _lock:  # release the claim (unless a later heal took it) so the next open retries
+-        if _last_heal.get(real) == now:
+-            if last is None:
+-                _last_heal.pop(real, None)
+-            else:
+-                _last_heal[real] = last
+-    logger.warning("state.db data heal did not complete on %s (%s); the next open retries it",
+-                   real, error if error is not None else "locked or damaged, rolled back")
++    _heal_failed(real, now, error)
++
++
++def _heal_failed(real: str, claim: Optional[float], error: Optional[sqlite3.Error]) -> None:
++    """Make the store's heal due again ``HEAL_RETRY_S`` from now. *claim* is the interval claim the
++    failed heal took (left alone if a later heal replaced it); None (the full init) overrides any claim,
++    such as one an earlier open of another memo key on the same file took. Warns on the first failure
++    after a success; later failures in the same streak log at debug."""
++    now = time.monotonic()
++    with _lock:
++        if claim is None or _last_heal.get(real) == claim:
++            _last_heal[real] = now - HEAL_INTERVAL_S + HEAL_RETRY_S
++        repeated = real in _heal_failing
++        _heal_failing.add(real)
++    (logger.debug if repeated else logger.warning)(
++        "state.db data heal did not complete on %s (%s); retrying in %.0fs",
++        real, error if error is not None else "locked or damaged", HEAL_RETRY_S)
+diff --git a/tests/hermes_state/test_schema_init_memo_heals.py b/tests/hermes_state/test_schema_init_memo_heals.py
+index c122d50378..de7858524b 100644
+--- a/tests/hermes_state/test_schema_init_memo_heals.py
++++ b/tests/hermes_state/test_schema_init_memo_heals.py
+@@ -3,7 +3,7 @@
+ Before the memo every open ran the NULL-``active`` heal and retried a failed unique-title repair. With the
+ memo, a settled store's later opens skip the full init, so: the NULL-active heal runs from the throttled
+ per-store heal, a failed title repair is not memoized, and a heal that fails rolls back whole and leaves
+-the interval unclaimed so the next open retries it.
++the interval due again after a short backoff (warning once per failure streak) so a later open retries it.
+ """
+ 
+ from __future__ import annotations
+@@ -178,7 +178,8 @@ def test_a_heal_that_fails_mid_way_rolls_back_and_is_retried_by_the_next_open(
+         con.close()
+ 
+     monkeypatch.setattr(hermes_state_schema.SessionSchemaMixin, "_index_healed_rows_for_trigram", real_index)
+-    SessionDB(db_path=path).close()  # same clock: the failed claim was released
++    _advance(monkeypatch, _memo().HEAL_RETRY_S + 1)  # the failed claim was rewound to the short backoff
++    SessionDB(db_path=path).close()
+     assert reconciles["n"] == 1
+     con = sqlite3.connect(path)
+     try:
+@@ -186,3 +187,73 @@ def test_a_heal_that_fails_mid_way_rolls_back_and_is_retried_by_the_next_open(
+         assert _trigram_indexed(con) == 1
+     finally:
+         con.close()
++
++
++def _memo():
++    import hermes_state_schema_memo
++
++    return hermes_state_schema_memo
++
++
++def _advance(monkeypatch, seconds):
++    """Move the memo's monotonic clock *seconds* past wherever it reads now."""
++    memo = _memo()
++    now = memo.time.monotonic()
++    monkeypatch.setattr(memo.time, "monotonic", lambda: now + seconds)
++
++
++def _heal_warnings(caplog):
++    return [r for r in caplog.records if r.levelno == logging.WARNING and "heal did not complete" in r.getMessage()]
++
++
++def test_a_persistently_failing_heal_backs_off_and_warns_once(tmp_path, reconciles, monkeypatch, caplog):
++    path = tmp_path / "state.db"
++    _polluted_store_with_an_unindexed_message(path)
++    _after_interval(monkeypatch)
++    scans = {"n": 0}
++
++    def locked(self, cursor, ids):
++        scans["n"] += 1
++        raise sqlite3.OperationalError("database is locked")
++
++    monkeypatch.setattr(hermes_state_schema.SessionSchemaMixin, "_index_healed_rows_for_trigram", locked)
++    with caplog.at_level(logging.DEBUG, logger="hermes_state"):
++        SessionDB(db_path=path).close()
++        SessionDB(db_path=path).close()  # inside the backoff: no rescan, no log line
++        assert scans["n"] == 1
++        assert len(_heal_warnings(caplog)) == 1
++        _advance(monkeypatch, _memo().HEAL_RETRY_S + 1)
++        SessionDB(db_path=path).close()  # retried, still failing: debug, not a second warning
++    assert reconciles["n"] == 1
++    assert scans["n"] == 2
++    assert len(_heal_warnings(caplog)) == 1
++    assert any(r.levelno == logging.DEBUG and "heal did not complete" in r.getMessage() for r in caplog.records)
++
++
++def test_a_full_init_heal_failure_overrides_an_earlier_keys_interval_claim(tmp_path, reconciles, monkeypatch, caplog):
++    path = tmp_path / "state.db"
++    _polluted_store_with_an_unindexed_message(path)  # its last open claimed the store's heal interval
++    con = sqlite3.connect(path)
++    con.execute("CREATE TABLE unrelated_ddl (x)")  # a new PRAGMA schema_version: a new memo key, a full init
++    con.commit()
++    con.close()
++    real_index = hermes_state_schema.SessionSchemaMixin._index_healed_rows_for_trigram
++
++    def locked(self, cursor, ids):
++        raise sqlite3.OperationalError("database is locked")
++
++    monkeypatch.setattr(hermes_state_schema.SessionSchemaMixin, "_index_healed_rows_for_trigram", locked)
++    with caplog.at_level(logging.WARNING, logger="hermes_state"):
++        SessionDB(db_path=path).close()
++    assert reconciles["n"] == 2  # the full init ran and its heal failed
++    assert len(_heal_warnings(caplog)) == 1
++    monkeypatch.setattr(hermes_state_schema.SessionSchemaMixin, "_index_healed_rows_for_trigram", real_index)
++    _advance(monkeypatch, _memo().HEAL_RETRY_S + 1)  # far inside the earlier key's interval
++    SessionDB(db_path=path).close()
++    assert reconciles["n"] == 2  # a memo hit
++    con = sqlite3.connect(path)
++    try:
++        assert _marker(con) is None
++        assert _trigram_indexed(con) == 1
++    finally:
++        con.close()
+-- 
+2.43.0
+

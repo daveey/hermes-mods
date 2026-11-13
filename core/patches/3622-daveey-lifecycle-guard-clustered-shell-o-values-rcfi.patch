@@ -1,0 +1,411 @@
+From 2a35439ef19f65919a00f8582e646342b75a4421 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:08:57 +0000
+Subject: [PATCH] [daveey] lifecycle guard: clustered shell -o values,
+ --rcfile, external time; one keyword walk
+
+PR #2191 review nits (review 5891136534), both non-blocking.
+
+1) `_shell_script_operand` skipped `-o`/`-O`/`+o`/`+O` values only as standalone tokens, so
+   `bash -euo pipefail /x/hermes-sync`, `bash -eo pipefail ...` and `bash --rcfile FILE ...`
+   took the option value as the script and dropped the hermes-sync hint. Each `o`/`O` in a
+   short-option cluster now consumes the next token, `--rcfile`/`--init-file` consume their
+   value, other `--long` options are skipped, and a lone `-` ends options like `--`.
+   The referenced-script walk (refusal path) had its own copy of the same loop; it now uses the
+   helper too, so `bash -euo pipefail ~/deploy.sh` is scanned instead of resolving `pipefail`.
+   To keep that walk fail closed, a `--rcfile`/`--init-file` value is still scanned as a file
+   the shell may source (`bash --rcfile x.sh -i`).
+
+2) `_COMMAND_PREFIX_KEYWORDS`/`_peel_command_keywords` duplicated the `_SUBSHELL_OPENING_WORDS`
+   walk in `_opens_call_arguments` and differed (no `coproc`; `time` options peeled in any
+   order). Both now use one `_peel_reserved_words` over `_RESERVED_PREFIX_WORDS`, with bash's
+   order `time [-p] [--]`, `function NAME`, and `coproc NAME` only before a compound command
+   (`coproc cmd args` runs cmd). External time(1) after an assignment or wrapper
+   (`x=1 time hermes-sync`, `env time -f %e hermes-sync`) is peeled in `executes_command_named`
+   by `_peel_external_time` (its `-f`/`-o` values consumed, wrappers after it re-peeled).
+   `_TRANSPARENT_COMMAND_PREFIXES` is unchanged, so refusal paths and shell_heredoc are not
+   widened by this.
+
+Tests: tests/tools/test_lifecycle_guard_hermes_sync_hint.py gains end-to-end refusal hint
+cases (clustered -o, +eo, --rcfile, --init-file), _refusal_hint cases (x=1 time, env time -f,
+coproc), executes_command_named cases (including `time -- -p hermes-sync` -> False, which the
+old any-order peel answered True) and a fail-closed check that `bash -euo pipefail deploy.sh`
+and `bash --rcfile deploy.sh -i` stay refused without the hint.
+RED on main's lifecycle_guard.py: 21 of the new cases fail; GREEN: 58/58.
+All 22 test files importing lifecycle_guard / terminal_tool_guards / shell_heredoc: 1461 passed.
+scripts/check --base origin/main: 19 checks ok.
+
+Rebased over 8ccca2606f (output-sink echo/printf walk) and 2e73a605a8
+(programs fed on stdin): the echo/printf segment walk peels via the shared
+`_peel_reserved_words`; the shell branch of `_references_at` keeps
+2e73a605a8's stdin handling (`-s`, no operand, `< f`, `cat f |`) but reads
+the option walk from one `_shell_options_end` helper (also behind
+`_shell_script_operand`), so `bash -euo pipefail < f.sh`,
+`bash -euo pipefail -s < f.sh` and `cat f.sh | bash -eo pipefail` now scan
+f.sh (pinned in test_lifecycle_guard_interpreter_runners.py: RED on main 3
+failed, GREEN 61 passed).
+---
+ cron/lifecycle_guard.py                       | 179 ++++++++++--------
+ ...est_lifecycle_guard_interpreter_runners.py |   4 +
+ .../test_lifecycle_guard_hermes_sync_hint.py  |  39 ++++
+ 3 files changed, 146 insertions(+), 76 deletions(-)
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 0705698350..cea23e5685 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -271,7 +271,8 @@ _LAUNCHCTL_LIFECYCLE_VERBS_RE = re.compile(
+ _HERMES_GATEWAY_LABEL_RE = re.compile(r"(?i)\bhermes[.\-]?gateway\b")
+ 
+ _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
+-_SHELL_OPTIONS_WITH_VALUES = frozenset({"-O", "+O", "-o", "+o"})
++# bash long options that consume the NEXT token (`bash --rcfile FILE script`).
++_SHELL_LONG_OPTIONS_WITH_VALUES = frozenset({"--rcfile", "--init-file"})
+ _SHELL_COMMAND_FLAGS = {"-c", "--command"}
+ _MAX_REFERENCED_SCRIPT_BYTES = 1024 * 1024
+ _MAX_REFERENCED_SCRIPT_DEPTH = 8
+@@ -766,37 +767,54 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
+         yield from _split_segments(tokens)
+ 
+ 
+-# Words after which `(` still opens a command list (`if (cd x && ./y)`, `! (…)`, `time (…)`).
+-_SUBSHELL_OPENING_WORDS = frozenset({
++# Reserved words that may lead a segment before the command it runs or the `(` that opens a
++# command list: `if (cd x && ./y)`, `then x`, `! x`, `time -p x`, `{ x; }`, `coproc NAME { x; }`,
++# `function NAME ( … )`. `fi`/`done`/`}` close a list and run nothing.
++_RESERVED_PREFIX_WORDS = frozenset({
+     "if", "then", "else", "elif", "do", "while", "until", "!", "time", "coproc", "in", "{",
+     "function",
+ })
++_SHELL_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+ 
+ 
+-def _opens_call_arguments(segment: list[str]) -> bool:
+-    """Whether ``(`` follows an interpreter call, not a shell command prefix.
++def _peel_reserved_words(segment: list[str]) -> int:
++    """Index of the first word of *segment* past its leading reserved words and their operands
++    (bash's ``time [-p] [--]``, ``coproc NAME`` before a compound command, ``function NAME``).
+ 
+-    Keywords are recognized in command position, including operands such as
+-    ``time -p`` and ``coproc name``. Merely inspecting the adjacent word mistakes
+-    these executable subshells for inert interpreter arguments. Conversely an
+-    ordinary command's argument named ``time`` is not a shell keyword.
+-    """
++    The one keyword walk shared by the ``(`` classifier and the executed-command scan, so the two
++    cannot disagree about what a leading keyword hides. An ordinary command's argument named
++    ``time`` is not a keyword: only words before the first non-keyword are peeled."""
+     index = 0
+-    while index < len(segment):
++    while index < len(segment) and segment[index] in _RESERVED_PREFIX_WORDS:
+         word = segment[index]
+-        if word not in _SUBSHELL_OPENING_WORDS:
+-            break
+         index += 1
++        if index >= len(segment):
++            break
+         if word == "time":
+-            if index < len(segment) and segment[index] == "-p":
++            if segment[index] == "-p":
+                 index += 1
+             if index < len(segment) and segment[index] == "--":
+                 index += 1
+-        elif word in ("coproc", "function") and index < len(segment):
+-            # `coproc NAME ( … )`; `function NAME ( … )` defines a function whose body is a subshell.
+-            if word == "function" or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", segment[index]):
+-                index += 1
+-    if index == len(segment):
++        elif word == "function":
++            # `function NAME ( … )` defines (does not run) NAME; its body is a command list.
++            index += 1
++        elif word == "coproc" and _SHELL_NAME.fullmatch(segment[index]) and (
++            index + 1 == len(segment) or segment[index + 1] == "{"
++        ):
++            # `coproc NAME ( … )` / `coproc NAME { …; }`; `coproc cmd args` runs cmd itself.
++            index += 1
++    return index
++
++
++def _opens_call_arguments(segment: list[str]) -> bool:
++    """Whether ``(`` follows an interpreter call, not a shell command prefix.
++
++    Keywords are recognized in command position, including operands such as
++    ``time -p`` and ``coproc name``. Merely inspecting the adjacent word mistakes
++    these executable subshells for inert interpreter arguments. Conversely an
++    ordinary command's argument named ``time`` is not a shell keyword.
++    """
++    if _peel_reserved_words(segment) == len(segment):
+         return False
+     return not segment[-1].endswith(("$", "<", ">", "="))
+ 
+@@ -985,34 +1003,35 @@ def contains_launchctl_submit_command(command: str) -> bool:
+     return False
+ 
+ 
+-# Reserved words that may precede a simple command in the same segment (`if hermes-sync`,
+-# `then x`, `! x`, `time -p x`, `{ x; }`, `coproc x`, `function f { x; }`); `fi`/`done`/`}` close
+-# a list and run nothing.
+-_COMMAND_PREFIX_KEYWORDS = frozenset({
+-    "if", "then", "elif", "else", "while", "until", "do", "!", "time", "{", "coproc", "function",
+-})
+ _MAX_EXECUTES_NAMED_DEPTH = 4
+-_SHELL_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+ 
++# External time(1) options that consume the NEXT token (`env time -o log -f %e cmd`).
++_EXTERNAL_TIME_VALUE_OPTIONS = frozenset({"-f", "--format", "-o", "--output"})
+ 
+-def _peel_command_keywords(segment: list[str]) -> list[str]:
+-    """*segment* without its leading reserved words (and ``time``'s ``-p``/``--``, and the NAME of
+-    ``coproc NAME { … }`` and ``function NAME { … }``)."""
+-    index = 0
+-    while index < len(segment) and segment[index] in _COMMAND_PREFIX_KEYWORDS:
+-        word = segment[index]
++
++def _peel_external_time(segment: list[str], index: int) -> int:
++    """Index of the command an external ``time`` runs. After an assignment or a wrapper
++    (``x=1 time cmd``, ``env time cmd``) ``time`` is not the keyword but /usr/bin/time, which
++    the reserved-word walk cannot see; unchanged when *segment[index]* is not ``time``. May be
++    ``len(segment)`` — callers must bounds-check."""
++    for _ in range(_MAX_PREFIX_PEELS):
++        if index >= len(segment) or _executable_name(segment[index]) != "time":
++            return index
+         index += 1
+-        if word == "time":
+-            while index < len(segment) and segment[index] in ("-p", "--"):
++        while index < len(segment):
++            token = segment[index]
++            if token == "--":
+                 index += 1
+-        elif (word == "coproc" and index + 1 < len(segment) and segment[index + 1] == "{"
+-              and _SHELL_NAME.fullmatch(segment[index])):
+-            index += 1
+-        elif word == "function" and index < len(segment):
+-            # The NAME after `function` is never a command, and bash accepts names `_SHELL_NAME`
+-            # rejects (`function f-x.y { … }`), so skip any word. `function f() {` splits at `(`.
+-            index += 1
+-    return segment[index:]
++                break
++            if token in _EXTERNAL_TIME_VALUE_OPTIONS:
++                index += 2
++                continue
++            if token.startswith("-"):
++                index += 1
++                continue
++            break
++        index = _peel_transparent_prefixes(segment, index)
++    return index
+ 
+ 
+ def _command_segment_views(segment: list[str]) -> list[list[str]]:
+@@ -1020,7 +1039,7 @@ def _command_segment_views(segment: list[str]) -> list[list[str]]:
+     read every view, so peeling only ever ADDS a reference. Without the peeled view `time ./x.sh`,
+     `if true; then ./x.sh; fi` and `{ ./x.sh; }` read the keyword as the command and never open
+     ``./x.sh``."""
+-    peeled = _peel_command_keywords(segment)
++    peeled = segment[_peel_reserved_words(segment):]
+     return [segment, peeled] if peeled and len(peeled) != len(segment) else [segment]
+ 
+ 
+@@ -1030,25 +1049,40 @@ def _iter_command_segment_views(command: str) -> Iterator[list[str]]:
+         yield from _command_segment_views(segment)
+ 
+ 
+-def _shell_script_operand(arguments: list[str]) -> Optional[str]:
+-    """The script a POSIX shell runs from *arguments*, skipping options and the values of
+-    ``-o``/``-O``/``+o``/``+O``; ``None`` for ``-c`` (inline source) or no operand."""
++def _shell_options_end(arguments: list[str]) -> tuple[int, bool, bool]:
++    """``(operand_index, command_string, reads_stdin)`` for a POSIX shell's *arguments*: the index
++    of the first operand past the options, whether a ``-c``/``--command`` flag ends them (inline
++    source follows), and whether a short-option cluster holds ``s`` (commands come from stdin).
++    Each ``o``/``O`` in a short-option cluster (``-o x``, ``-euo pipefail``, ``+O extglob``)
++    consumes the next token, as do ``--rcfile`` and ``--init-file``; a lone ``-`` ends the
++    options like ``--``."""
+     index = 0
++    reads_stdin = False
+     while index < len(arguments):
+         argument = arguments[index]
+-        if argument == "--":
+-            index += 1
+-            break
++        if argument in ("--", "-"):
++            return index + 1, False, reads_stdin
+         if argument in _SHELL_COMMAND_FLAGS:
+-            return None
+-        if argument in _SHELL_OPTIONS_WITH_VALUES:
++            return index, True, reads_stdin
++        if argument in _SHELL_LONG_OPTIONS_WITH_VALUES:
+             index += 2
+             continue
+-        if argument.startswith(("-", "+")):
++        if argument.startswith("--"):
+             index += 1
+             continue
++        if argument.startswith(("-", "+")):
++            reads_stdin = reads_stdin or (argument[0] == "-" and "s" in argument[1:])
++            index += 1 + sum(letter in "oO" for letter in argument[1:])
++            continue
+         break
+-    return arguments[index] if index < len(arguments) else None
++    return index, False, reads_stdin
++
++
++def _shell_script_operand(arguments: list[str]) -> Optional[str]:
++    """The script a POSIX shell runs from *arguments*; ``None`` for ``-c`` (inline source) or no
++    operand. Options and their values are skipped as ``_shell_options_end`` describes."""
++    index, command_string, _ = _shell_options_end(arguments)
++    return arguments[index] if not command_string and index < len(arguments) else None
+ 
+ 
+ def executes_command_named(command: str, name: str, *, _depth: int = 0) -> bool:
+@@ -1060,10 +1094,13 @@ def executes_command_named(command: str, name: str, *, _depth: int = 0) -> bool:
+     if name not in command or not lifecycle_scan_root_within_budget(command):
+         return False
+     for raw_segment in _iter_command_segments(command):
+-        segment = _peel_command_keywords(raw_segment)
++        segment = raw_segment[_peel_reserved_words(raw_segment):]
+         index = _executed_command_index(segment)
+         if index is None:
+             continue
++        index = _peel_external_time(segment, index)
++        if index >= len(segment):
++            continue
+         executable = _executable_name(segment[index])
+         if executable == name:
+             return True
+@@ -1261,27 +1298,18 @@ def _references_at(
+ 
+     if executable_name in _SHELL_EXECUTABLES:
+         arguments, stdin = _split_redirections(segment[index + 1 :])
+-        reads_stdin = False
+-        arg_index = 0
+-        while arg_index < len(arguments):
+-            argument = arguments[arg_index]
+-            if argument == "--":
+-                arg_index += 1
+-                break
+-            if argument in _SHELL_COMMAND_FLAGS:
++        # An rc file a shell may source (`bash --rcfile x.sh -i`) is scanned like its script.
++        for arg_index, argument in enumerate(arguments[:-1]):
++            if argument in _SHELL_COMMAND_FLAGS or argument == "--":
+                 break
+-            if argument in _SHELL_OPTIONS_WITH_VALUES:
+-                arg_index += 2
+-                continue
+-            if argument.startswith("-"):
+-                reads_stdin = reads_stdin or (not argument.startswith("--") and "s" in argument)
+-                arg_index += 1
+-                continue
+-            break
+-        command_string = arg_index < len(arguments) and arguments[arg_index] in _SHELL_COMMAND_FLAGS
+-        if arg_index < len(arguments) and not command_string:
+-            yield from _resolved_or_nothing(arguments[arg_index], cwd)
+-        elif not command_string:
++            if argument in _SHELL_LONG_OPTIONS_WITH_VALUES:
++                yield from _resolved_or_nothing(arguments[arg_index + 1], cwd)
++        operand_index, command_string, reads_stdin = _shell_options_end(arguments)
++        if command_string:
++            return
++        if operand_index < len(arguments):
++            yield from _resolved_or_nothing(arguments[operand_index], cwd)
++        else:
+             reads_stdin = True
+         if reads_stdin:
+             for source in stdin or piped or []:
+@@ -1471,8 +1499,7 @@ def _iter_printed_shell_payloads(command: str) -> Iterator[str]:
+     if not any(name in command for name in _ARGUMENT_PRINTERS):
+         return  # skip a second tokenization of a large generator that never echoes
+     for segment in _iter_command_segments(command):
+-        while segment and segment[0] in _SUBSHELL_OPENING_WORDS:  # `{ echo …; }`, `then echo …`
+-            segment = segment[1:]
++        segment = segment[_peel_reserved_words(segment):]  # `{ echo …; }`, `then echo …`
+         index = _executed_command_index(segment)
+         if index is None:
+             continue
+diff --git a/tests/cron/test_lifecycle_guard_interpreter_runners.py b/tests/cron/test_lifecycle_guard_interpreter_runners.py
+index 6cb7853af2..a0fa23e592 100644
+--- a/tests/cron/test_lifecycle_guard_interpreter_runners.py
++++ b/tests/cron/test_lifecycle_guard_interpreter_runners.py
+@@ -84,6 +84,10 @@ def test_other_interpreter_spellings_are_scanned(files, template):
+         "while true; do bash < {sh}; done",
+         "! cat {sh} | bash",
+         "bash <> {sh}",
++        # Clustered `-o` values are option values, not the script operand (stdin still read).
++        "bash -euo pipefail < {sh}",
++        "bash -euo pipefail -s < {sh}",
++        "cat {sh} | bash -eo pipefail",
+     ],
+ )
+ def test_program_fed_on_stdin_is_scanned(files, template):
+diff --git a/tests/tools/test_lifecycle_guard_hermes_sync_hint.py b/tests/tools/test_lifecycle_guard_hermes_sync_hint.py
+index 86ed3dae88..3d622be134 100644
+--- a/tests/tools/test_lifecycle_guard_hermes_sync_hint.py
++++ b/tests/tools/test_lifecycle_guard_hermes_sync_hint.py
+@@ -113,6 +113,12 @@ def test_hint_names_the_root_sync_log_from_a_profile_gateway(tmp_path, monkeypat
+     "bash -o pipefail {script} mods-pull",
+     "sh +o errexit -- {script} mods-pull",
+     "bash -O extglob {script} mods-pull",
++    # PR #2191 review nits: a clustered `o`/`O` and --rcfile/--init-file also take a value.
++    "bash -euo pipefail {script} mods-pull",
++    "bash -eo pipefail {script} mods-pull",
++    "sh +eo errexit {script} mods-pull",
++    "bash --rcfile /dev/null {script} mods-pull",
++    "bash --init-file /dev/null {script} mods-pull",
+ ])
+ def test_hint_survives_shell_options_with_values(tmp_path, monkeypatch, template):
+     script = _script(tmp_path, "hermes-sync", _RESTART)
+@@ -130,6 +136,9 @@ def test_hint_survives_shell_options_with_values(tmp_path, monkeypatch, template
+     "if {script} mods-pull; then echo ok; fi",
+     "while false; do {script} mods-pull; done",
+     "{{ {script} mods-pull; }}",
++    # PR #2191 review nits: external time(1) after an assignment or wrapper, and `coproc`.
++    "x=1 time {script} mods-pull",
++    "env time -f %e {script} mods-pull",
+     "coproc {script} mods-pull",
+ ])
+ def test_hint_survives_reserved_words(tmp_path, monkeypatch, template):
+@@ -150,6 +159,20 @@ def test_a_shell_option_value_is_not_the_script(tmp_path, monkeypatch):
+     assert _ROUTE not in error
+ 
+ 
++@pytest.mark.parametrize("template", [
++    "bash -euo pipefail {deploy} hermes-sync",
++    "bash --rcfile {deploy} -i",
++])
++def test_clustered_option_value_and_rcfile_stay_refused(tmp_path, monkeypatch, template):
++    # The clustered `-o` value is not the script, and an rc file the shell sources is still scanned.
++    deploy = _script(tmp_path, "deploy.sh", _RESTART)
++
++    error = _refuse(tmp_path, monkeypatch, template.format(deploy=deploy))
++
++    assert "hermes gateway restart" in error
++    assert _ROUTE not in error
++
++
+ @pytest.mark.parametrize(("command", "expected"), [
+     ("hermes-sync mods-pull", True),
+     ("bash -O extglob /x/hermes-sync", True),
+@@ -164,6 +187,22 @@ def test_a_shell_option_value_is_not_the_script(tmp_path, monkeypatch):
+     ("grep hermes-sync log", False),
+     ("echo time hermes-sync", False),
+     ("fi hermes-sync", False),
++    # PR #2191 review nits: clustered `o`/`O` and --rcfile/--init-file consume a value; external
++    # time(1) after an assignment or wrapper; the shared keyword walk peels `coproc`.
++    ("bash -euo pipefail /x/hermes-sync", True),
++    ("bash -eo pipefail -- /x/hermes-sync", True),
++    ("sh +eo errexit /x/hermes-sync", True),
++    ("bash -oO pipefail extglob /x/hermes-sync", True),
++    ("bash --rcfile /etc/rc /x/hermes-sync", True),
++    ("bash --init-file /etc/rc /x/hermes-sync", True),
++    ("bash -euo pipefail /x/deploy.sh hermes-sync", False),
++    ("x=1 time hermes-sync", True),
++    ("env time -f %e hermes-sync", True),
++    ("sudo -u ubuntu time -o /tmp/t -- nohup hermes-sync", True),
++    ("coproc hermes-sync mods-pull", True),
++    ("coproc SYNC { hermes-sync; }", True),
++    ("time -- -p hermes-sync", False),
++    ("function hermes-sync { true; }", False),
+ ])
+ def test_executes_command_named(command, expected):
+     from cron.lifecycle_guard import executes_command_named
+-- 
+2.43.0
+
