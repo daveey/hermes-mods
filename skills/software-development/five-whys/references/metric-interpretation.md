@@ -9,6 +9,9 @@ For Hermes transcript-row counts in `state.db` ("notice stored twice", "duplicat
 to `active=0, compacted=0` and re-inserts it as a new active row with the same `message_uid` and timestamp
 (`_archive_and_compact_on_conn` in `hermes_state_messages.py`). Count visible rows (`active=1` or
 `compacted=1`) per session; two visible rows are a real double insert, one visible plus superseded copies is not.
+Compaction can itself be the second writer: it has re-appended an already-answered request as the live ask, a new
+user row placed after the assistant reply that answered it and carrying an earlier turn's timestamp. Find that
+reply before counting the row as a redelivery.
 Row counts can't show a notice repeated inside one row: a user row that merges several queued notices can carry
 one twice, so before calling delivery exactly-once, compare each merged row with its source notices joined in order.
 Count delivery records, never subscription state, and count only after the redelivery window has closed:
