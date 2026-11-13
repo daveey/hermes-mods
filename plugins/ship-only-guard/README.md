@@ -24,7 +24,8 @@ The `pre_tool_call` hook checks `terminal`, `execute_code`, and nested `tool_cal
 (including qualified tool names). On a configured repository it refuses:
 
 - `gh pr merge`, regardless of merge/admin/auto flags, with URL, `-R`, `--repo`,
-  `GH_REPO`, or current repository selection, except the exact state route below.
+  `GH_REPO`, or current repository selection, except the exact state and
+  upstream-sync routes below.
 - `gh api repos/OWNER/REPO/pulls/N/merge` and `repos/OWNER/REPO/merges`, including
   full API URLs and leading slashes. These merge endpoints are refused regardless
   of HTTP method, so omitting an explicit write method cannot bypass the guard.
@@ -86,6 +87,31 @@ and verify postmerge CI and deployment separately.
 `tests_state.py` covers allowed and refused preflights, malformed/unreadable
 responses, transport failures, head/base changes, CI states, bounded rollups,
 strict flags and terminal/Python/tool entry points. No test merges a live PR.
+
+## Upstream-sync landing (main, merge commit)
+
+An upstream-sync gate lands a fully tested sync PR into `main` as a true merge
+commit, so the upstream SHA becomes an ancestor of main; the rebase-only ship path
+cannot land it. The guard admits exactly:
+
+```sh
+gh pr merge 12 -R example/protected --merge --match-head-commit FULL_40_HEX_SHA \
+  [--subject TEXT] [--body TEXT]
+```
+
+Numeric PR, explicit `--repo`/`-R`, `--merge`, and a lowercase full SHA are
+required; `--subject`/`--body` (commit message only) are optional, each at most
+once. Any other flag (`--admin`, `--auto`, `--squash`, `--rebase`, `--body-file`,
+`--delete-branch`...), duplicate, URL selector or implicit PR/repo is refused
+without a probe. A fixed-argv `gh pr view` (15 s, no shell) must then show the same
+PR URL/number, OPEN, base exactly `main`, a same-repository head branch named exactly
+`sync/upstream-<FULL_SHA>`, head SHA equal to the pin, and every rollup entry named
+`All required checks pass (v2)` green (at least one present). Other checks are
+deliberately not required: optional checks may be red on a sync, and branch
+protection remains the real enforcement. Probe errors and malformed responses fail
+closed. `tests_upstream_sync.py` covers the admitted form, refused flags, wrong
+branch/base/head/repository, missing/red/pending required checks, transport failure,
+terminal/Python/tool entry points and the real standalone CLI.
 
 ## Trusted land child and private gh shims
 

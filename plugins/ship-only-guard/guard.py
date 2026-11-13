@@ -147,6 +147,80 @@ def _state_merge(words, repo, cwd, env):
         return False
 
 
+SYNC_REQUIRED_CHECK = "All required checks pass (v2)"
+SYNC_BRANCH_PREFIX = "sync/upstream-"
+
+
+def _upstream_sync_merge(words, repo, cwd, env):
+    """Narrow exception for an upstream-sync gate landing a tested sync PR into main.
+
+    A sync PR must keep its merge commit (the upstream SHA becomes an ancestor of
+    main), so the rebase-only ship path cannot land it. Admit only the exact form
+    `pr merge N --repo R --merge --match-head-commit SHA [--subject S] [--body B]`
+    whose live PR targets main from same-repo branch `sync/upstream-<SHA>` with the
+    required aggregate check green on that head. Other checks may be red: branch
+    protection stays the real enforcement. Any probe error fails closed.
+    """
+    if words[:2] != ["pr", "merge"]:
+        return False
+    args, options = [], {}
+    i = 2
+    while i < len(words):
+        word = words[i]
+        if word in {"--repo", "-R", "--match-head-commit", "--subject", "--body"}:
+            key = "--repo" if word == "-R" else word
+            if key in options or i + 1 >= len(words):
+                return False
+            options[key] = words[i + 1]
+            i += 2
+        elif word == "--merge" and word not in options:
+            options[word] = True
+            i += 1
+        elif not word.startswith("-"):
+            args.append(word)
+            i += 1
+        else:
+            return False
+    sha = options.get("--match-head-commit", "")
+    if (len(args) != 1 or not re.fullmatch(r"[1-9][0-9]*", args[0])
+            or options.get("--repo", "").lower() != repo
+            or not options.get("--merge")
+            or not re.fullmatch(r"[0-9a-f]{40}", sha)):
+        return False
+    fields = "number,url,state,baseRefName,headRefName,headRefOid,isCrossRepository,statusCheckRollup"
+    probe_env = dict(env)
+    probe_env["GH_PROMPT_DISABLED"] = "1"
+    try:
+        p = subprocess.run(["gh", "pr", "view", args[0], "--repo", repo, "--json", fields],
+                           cwd=cwd, env=probe_env, capture_output=True, text=True, timeout=15)
+        if p.returncode != 0:
+            return False
+        data = json.loads(p.stdout)
+        if not isinstance(data, dict):
+            return False
+        if (data.get("number") != int(args[0]) or data.get("state") != "OPEN"
+                or data.get("baseRefName") != "main"
+                or data.get("headRefOid") != sha
+                or data.get("headRefName") != SYNC_BRANCH_PREFIX + sha
+                or data.get("isCrossRepository") is not False
+                or not isinstance(data.get("url"), str)
+                or data["url"].lower() != f"https://github.com/{repo}/pull/{args[0]}"):
+            return False
+        checks = data.get("statusCheckRollup")
+        if not isinstance(checks, list) or not all(isinstance(c, dict) for c in checks):
+            return False
+        # Every entry naming the required check must be green; at least one must exist.
+        named = [c for c in checks if (c.get("name") if c.get("__typename") == "CheckRun"
+                                       else c.get("context")) == SYNC_REQUIRED_CHECK]
+        return bool(named) and all(
+            c.get("__typename") == "CheckRun" and c.get("status") == "COMPLETED"
+            and c.get("conclusion") == "SUCCESS" or
+            c.get("__typename") == "StatusContext" and c.get("state") == "SUCCESS"
+            for c in named)
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        return False
+
+
 def _gh(words, cwd, env, repos):
     # gh's repository flag may occur before, between, or after command words.
     rest, selected, i = [], None, 0
@@ -168,10 +242,13 @@ def _gh(words, cwd, env, repos):
         url = next((re.fullmatch(r"https?://[^/]+/([^/]+/[^/]+)/pull/\d+/?", w) for w in rest[2:]
                     if re.fullmatch(r"https?://[^/]+/([^/]+/[^/]+)/pull/\d+/?", w)), None)
         repo = _slug(url[1]) if url else selected if selected is not None else _context(cwd, env)
-        if repo in repos and _state_merge(words, repo, cwd, env):
+        if repo in repos and (_state_merge(words, repo, cwd, env)
+                              or _upstream_sync_merge(words, repo, cwd, env)):
             return None
         return _deny(repo, "gh pr merge (state requires explicit repo, numeric PR, --rebase, "
-                     "--match-head-commit FULL_SHA and readable green exact-head state preflight)", repos)
+                     "--match-head-commit FULL_SHA and readable green exact-head state preflight; "
+                     f"an upstream sync PR requires --merge, head branch {SYNC_BRANCH_PREFIX}FULL_SHA "
+                     f"into main and a green \"{SYNC_REQUIRED_CHECK}\")", repos)
     if rest and rest[0] == "api":
         for w in rest[1:]:
             match = re.fullmatch(r"(?:https?://[^/]+/)?/?repos/([^/]+/[^/]+)/(?:pulls/\d+/merge|merges)/?(?:\?.*)?", w)
