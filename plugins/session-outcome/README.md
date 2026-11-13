@@ -48,6 +48,12 @@ not claimed by this plugin section.
     question; without it, narrowing scope does not imply start-now. Omitted flags use user-steps'
     clear go/approve-label fallback. Tests: `test_decide_preserves_explicit_authorization_through_real_migration`
     and `test_decide_invalid_authorizes_writes_nothing` in `tests/test_session_outcome.py`.
+    An item whose choices hold two or more go labels (user-steps `go_option()`: "Go now: X" / "Go now: Y") is
+    refused and nothing is written: the run is settled and only a detail is open, so the hint tells the agent to
+    pick the default, note it and how to undo it, and proceed. A real toss-up passes with the item's
+    `why_not_default` (one sentence on a money, permission, other-person or can't-undo difference). Each refusal
+    or override logs one `decide_go_variants action=refused|override` line (agent-f0722b8b79; tests
+    `test_decide_*go*` in `tests/test_session_outcome.py`).
     After declaring, the result's `requests` lists each step's qualified `sourceRef`
     (`{gatewayId, profile, type: "user_step", id}`) and the canonical `requestId`/`revision` it created now
     (idempotent with the next turn's migration), plus an `upgrade` instruction: to ask approval of exact

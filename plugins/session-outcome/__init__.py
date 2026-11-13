@@ -198,6 +198,8 @@ SCHEMA = {
         '{"kind": "done", "summary": "..."} when the work is finished (one or two sentences: what was done and '
         'the result). {"kind": "decide", "items": [{"question": "...", "choices": [{"label", "value"}, ...]}]} '
         "when the user must choose: each question becomes a decision tile with buttons (at least 2 choices). "
+        "Two or more go choices (\"Go now: X\" / \"Go now: Y\") mean the run is settled: pick the default and "
+        "proceed instead (such an item is refused unless it sets why_not_default). "
         "The result's `requests` gives each tile's `sourceRef` and requestId: a choice authorizes nothing, so to "
         "get approval of exact text/plan for that same decision, cite the sourceRef in action_request "
         "scope.sourceRefs (it upgrades that tile in place); never publish a second ask for it. "
@@ -243,6 +245,11 @@ SCHEMA = {
                       "items": {"type": "object", "additionalProperties": False, "required": ["question", "choices"],
                                 "properties": {"question": {"type": "string"},
                                                "choices": {"type": "array", "minItems": 2, "items": _CHOICE},
+                                               "why_not_default": {"type": "string", "description": (
+                                                   "Only when 2+ choices are go options (\"Go now: X\" / \"Go now: Y\"): "
+                                                   "one sentence on the money, permission, other-person or "
+                                                   "can't-undo difference that leaves no default. Without it such an "
+                                                   "item is refused: pick the default yourself and proceed.")},
                                                "card_id": {"type": "string"}}}},
             "on": {"type": "array", "minItems": 1, "description": "wait: what the chat waits on.",
                    "items": {"type": "object", "required": ["kind", "id"],
@@ -281,6 +288,44 @@ def _note_call(session_id: str, tool_call_id: str) -> None:
 
 def _err(msg: str) -> str:
     return json.dumps({"ok": False, "error": msg})
+
+
+# agent-f0722b8b79: after David approved a transfer and named the renamed org, the agent filed "which name?" with the
+# choices "Go now: <a>" / "Go now: <b>" / "Hold", recommended <a> in its own reply, and nothing ran for 2 hours. Two or
+# more go choices mean the run is already settled and only a detail is open: the agent picks, it does not ask. A real
+# toss-up (money, permissions, another person, can't undo) passes with a one-sentence `why_not_default`.
+GO_VARIANTS_HINT = (
+    "items[{i}] offers {n} go choices ({labels}): the run is settled and only a detail is open, so no tile was "
+    "written. Pick the option the user's words or your own recommendation name, note the pick and how to undo it on "
+    "the card, proceed, and mention the alternative in one line. If the go choices really differ in money, "
+    "permissions, another person or something that can't be undone, call decide again with that item's "
+    "\"why_not_default\" set to one sentence saying which.")
+
+
+def _go_option() -> Optional[Callable[..., Any]]:
+    us = _user_steps()
+    fn = getattr(us, "go_option", None) if us is not None else None
+    return fn if callable(fn) else None
+
+
+def _check_go_variants(i: int, question: str, choices: list[dict], why_not_default: Any) -> None:
+    """Refuse (ValueError) a decide item with two or more go choices unless it names why there is no default.
+    Each refusal or override logs one ``decide_go_variants`` line."""
+    is_go = _go_option()
+    if is_go is None:
+        return
+    go = [c["label"] for c in choices if is_go(c["label"])]
+    if len(go) < 2:
+        return
+    why = _text(why_not_default)
+    labels = " | ".join(json.dumps(g) for g in go)
+    if why:
+        log.warning("decide_go_variants action=override item=%d go=%d labels=%s question=%s why=%s",
+                    i, len(go), labels, json.dumps(question[:200]), json.dumps(why[:300]))
+        return
+    log.warning("decide_go_variants action=refused item=%d go=%d labels=%s question=%s",
+                i, len(go), labels, json.dumps(question[:200]))
+    raise ValueError(GO_VARIANTS_HINT.format(i=i, n=len(go), labels=labels))
 
 
 def _text(value: Any) -> str:
@@ -329,6 +374,7 @@ def _validate(args: dict) -> dict:
                 raise ValueError(f"items[{i}] needs a question")
             if len(choices) < 2:
                 raise ValueError(f"items[{i}] needs at least 2 choices, each {{label, value}}")
+            _check_go_variants(i, q, choices, it.get("why_not_default"))
             item = {"question": q, "choices": choices}
             if isinstance(it.get("card_id"), str) and it["card_id"].strip():
                 item["card_id"] = it["card_id"].strip()

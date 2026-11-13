@@ -775,3 +775,61 @@ def test_no_core_is_a_noop(home, monkeypatch):
     assert gate(mod) is None
     out = json.loads(mod.handle({"kind": "done", "summary": "x"}, session_id="S1"))
     assert out["ok"] and out["declared"] is False
+
+
+# ---- go variants (agent-f0722b8b79) -------------------------------------------------------------------
+# After David approved a repo transfer and named the renamed org, the agent filed a "which name?" tile whose choices
+# were all "Go now" variants (plus Hold) and recommended the first in its own reply. Nothing ran for 2 hours. Two or
+# more go choices mean the run is settled and only a detail is open: decide refuses that tile and writes nothing.
+GO_TILE = {"question": "Which name should the transferred repo get?", "choices": [
+    {"label": "Go now: example-org/example-repo", "value": "a"},
+    {"label": "Go now: example-org/repo", "value": "b"},
+    {"label": "Hold", "value": "hold"}]}
+
+
+def test_decide_refuses_a_tile_of_go_variants_and_writes_nothing(plugin, fake, home, caplog):
+    caplog.set_level("INFO", logger="session-outcome")
+    out = call(plugin, {"kind": "decide", "items": [GO_TILE]})
+    assert not out["ok"]
+    assert "run is settled" in out["error"] and "why_not_default" in out["error"]
+    assert "Go now: example-org/example-repo" in out["error"]
+    assert fake.declared == [] and not (home / "user-steps" / "S1.json").exists()
+    assert any("decide_go_variants" in r.getMessage() and "refused" in r.getMessage() for r in caplog.records)
+
+
+def test_decide_go_variants_refusal_covers_every_item_before_writing(plugin, fake, home):
+    fine = {"question": "Which region?", "choices": [{"label": "us-east-1", "value": "e"},
+                                                      {"label": "eu-west-1", "value": "w"}]}
+    out = call(plugin, {"kind": "decide", "items": [fine, GO_TILE]})
+    assert not out["ok"] and "items[1]" in out["error"]
+    assert fake.declared == [] and not (home / "user-steps" / "S1.json").exists()
+
+
+def test_decide_go_variants_with_why_not_default_is_accepted_and_logged(plugin, fake, home, caplog):
+    caplog.set_level("INFO", logger="session-outcome")
+    item = {**GO_TILE, "why_not_default": "The second name moves billing to another person's account."}
+    out = call(plugin, {"kind": "decide", "items": [item]})
+    assert out["ok"] and out["declared"] and len(out["steps"]) == 1
+    step = json.loads((home / "user-steps" / "S1.json").read_text())["steps"][0]
+    assert step["options"] == [c["label"] for c in GO_TILE["choices"]]
+    assert any("decide_go_variants" in r.getMessage() and "override" in r.getMessage() for r in caplog.records)
+    props = plugin.SCHEMA["parameters"]["properties"]["items"]["items"]["properties"]
+    assert props["why_not_default"]["type"] == "string"
+
+
+@pytest.mark.parametrize("labels", [
+    ["Approve: run it now", "Hold"],
+    ["Go now", "Wait for review"],
+    ["us-east-1", "eu-west-1"],
+    ["Yes", "No"],
+    ["Go now: example-org/example-repo", "Don't go: keep example-org/repo"],
+])
+def test_decide_with_at_most_one_go_choice_is_unchanged(plugin, fake, home, labels):
+    choices = [{"label": l, "value": str(i)} for i, l in enumerate(labels)]
+    out = call(plugin, {"kind": "decide", "items": [{"question": "Run the example transfer now?", "choices": choices}]})
+    assert out["ok"] and out["declared"] and len(out["steps"]) == 1
+
+
+def test_decide_blank_why_not_default_does_not_override(plugin, fake, home):
+    out = call(plugin, {"kind": "decide", "items": [{**GO_TILE, "why_not_default": "   "}]})
+    assert not out["ok"] and "run is settled" in out["error"]
