@@ -192,3 +192,83 @@ def test_real_core_card_not_linked_to_desktop_chat_is_held(real_board):
 def test_real_core_card_linked_to_chat_passes(real_board):
     tid = _real_create(real_board, CHAT)
     assert _run(_create_turn({'ok': True, 'task_id': tid, 'status': 'ready'})) is None
+
+
+# ---- watch parks: hidden from the task list by design (kanban_watch), not missing ------------------------------
+# Hub 2026-11-13 00:12Z: t_01a1d222d1dac200 was created by desktop chat 20261112_040336_f74a3e, then parked
+# ``scheduled`` as a watch. ``session_tasks`` leaves watch parks out on purpose, so the gate held the reply four
+# times and appended "isn't shown in this chat's task list yet" although the card was linked to the chat.
+def _watch_park(kb, tid):
+    from hermes_cli.kanban_db_connect import connect_closing
+    with connect_closing() as conn:
+        assert kb.schedule_task(conn, tid, reason='SCHEDULED_UNTIL=2100-01-01T00:00:00Z recheck later',
+                                clock_only=True, watch=True)
+        conn.commit()
+    from hermes_cli import kanban_session_activity as ksa
+    ksa._reset_cache_for_tests()
+
+
+def _add_chat_link(tid, chat):
+    """A ``created`` task_chat_links row for ``chat`` (the hub card's shape), on the real board db."""
+    from hermes_cli.kanban_db_connect import connect_closing
+    with connect_closing() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS task_chat_links (id INTEGER PRIMARY KEY, uid TEXT, task_id TEXT "
+                     "NOT NULL, chat_gateway TEXT NOT NULL, chat_profile TEXT, chat_session TEXT NOT NULL, kind TEXT "
+                     "NOT NULL, released INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)")
+        conn.execute("INSERT INTO task_chat_links (task_id, chat_gateway, chat_profile, chat_session, kind, "
+                     "released, created_at) VALUES (?, 'hermes-hub', 'default', ?, 'created', 0, 1)", (tid, chat))
+        conn.commit()
+
+
+def test_real_core_linked_watch_park_is_not_held(real_board, caplog):
+    tid = _real_create(real_board, CHAT)
+    _watch_park(real_board, tid)
+    from hermes_cli import kanban_session_activity as ksa
+    assert tid not in {r['id'] for r in ksa.session_tasks([CHAT], ksa.LISTED_STATUSES + ('done', 'archived'))}
+    caplog.set_level(logging.INFO)
+    for attempt in (0, 1):
+        assert _run(_create_turn({'ok': True, 'task_id': tid, 'status': 'ready'}), attempt=attempt) is None
+    assert f'chat-closeout: turn-end visibility ok card={tid} watch=1' in caplog.text
+    assert 'held' not in caplog.text
+
+
+def test_real_core_watch_park_linked_only_by_chat_link_is_not_held(real_board):
+    """The card's session_id names another session, but a task_chat_links row ties it to this chat."""
+    tid = _real_create(real_board, 'some-machine-session')
+    _add_chat_link(tid, CHAT)
+    _watch_park(real_board, tid)
+    assert _run(_create_turn({'ok': True, 'task_id': tid, 'status': 'ready'})) is None
+
+
+def test_real_core_unlinked_watch_park_is_still_held(real_board):
+    tid = _real_create(real_board, 'some-machine-session')
+    _watch_park(real_board, tid)
+    out = _run(_create_turn({'ok': True, 'task_id': tid, 'status': 'ready'}))
+    assert out and out.get('hold') is True and tid in out['nudge']
+    assert _run(_create_turn({'ok': True, 'task_id': tid, 'status': 'ready'}), attempt=1) == {
+        'append': f"⚠ {tid} isn't shown in this chat's task list yet."}
+
+
+def test_real_core_released_chat_link_does_not_excuse_a_watch_park(real_board):
+    tid = _real_create(real_board, 'some-machine-session')
+    _add_chat_link(tid, CHAT)
+    from hermes_cli.kanban_db_connect import connect_closing
+    with connect_closing() as conn:
+        conn.execute("UPDATE task_chat_links SET released = 1 WHERE task_id = ?", (tid,))
+        conn.commit()
+    _watch_park(real_board, tid)
+    out = _run(_create_turn({'ok': True, 'task_id': tid, 'status': 'ready'}))
+    assert out and out.get('hold') is True
+
+
+def test_real_core_linked_non_watch_park_still_listed(real_board):
+    """A plain (non-watch) scheduled park is in the task list already: no watch exemption needed or logged."""
+    tid = _real_create(real_board, CHAT)
+    from hermes_cli.kanban_db_connect import connect_closing
+    with connect_closing() as conn:
+        assert real_board.schedule_task(conn, tid, reason='SCHEDULED_UNTIL=2100-01-01T00:00:00Z later',
+                                        clock_only=True)
+        conn.commit()
+    from hermes_cli import kanban_session_activity as ksa
+    ksa._reset_cache_for_tests()
+    assert _run(_create_turn({'ok': True, 'task_id': tid, 'status': 'ready'})) is None

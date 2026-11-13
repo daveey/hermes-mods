@@ -1446,14 +1446,65 @@ def _shown_ids(session_id: str) -> set[str]:
     return shown
 
 
+def _linked_to(conn: Any, tid: str, chats: list[str]) -> bool:
+    """The card belongs to one of ``chats``: it carries the chat as ``session_id``, an unreleased
+    ``task_chat_links`` row names it, or the chat is a ``tui`` subscriber. Tables a board lacks are skipped."""
+    import sqlite3
+    ph = ",".join("?" for _ in chats)
+    probes = (f"SELECT 1 FROM tasks WHERE id = ? AND session_id IN ({ph})",
+              f"SELECT 1 FROM task_chat_links WHERE task_id = ? AND released = 0 AND chat_session IN ({ph})",
+              f"SELECT 1 FROM kanban_notify_subs WHERE task_id = ? AND platform = 'tui' AND chat_id IN ({ph})")
+    for sql in probes:
+        try:
+            if conn.execute(sql, (tid, *chats)).fetchone():
+                return True
+        except sqlite3.Error:  # board predates that table
+            continue
+    return False
+
+
+def _watch_parked(session_id: str, ids: list[str]) -> dict[str, Any]:
+    """``{card: wake_at}`` for cards in ``ids`` that a local board holds as a watch park (``kanban_watch``) linked
+    to this chat's lineage. ``session_tasks`` leaves those out of the task list on purpose (kanban-85e428ecb2), so
+    they are hidden by design, not missing. Any read error answers ``{}``: the card is then treated as before."""
+    if not ids:
+        return {}
+    try:
+        import sqlite3
+        from hermes_cli import kanban_session_activity as ksa
+        from hermes_cli import kanban_watch as kw
+        chats = [c for c in dict.fromkeys(str(s) for s in _lineage(session_id)) if c]
+        if not chats:
+            return {}
+        out: dict[str, Any] = {}
+        for path in ksa._board_db_paths():
+            todo = [t for t in ids if t not in out]
+            if not todo:
+                break
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
+            try:
+                for tid in todo:
+                    if kw.is_watch(conn, tid) and _linked_to(conn, tid, chats):
+                        out[tid] = (kw._last_scheduled(conn, tid) or {}).get("wake_at")
+            finally:
+                conn.close()
+        return out
+    except Exception:
+        logger.debug("chat-closeout: watch-park read failed; treating the cards as missing", exc_info=True)
+        return {}
+
+
 def _visibility_gate(session_id: str, turn_messages: Any, attempt: int) -> Optional[dict]:
     """Hold once (private nudge), then append a visible warning, when a card created this turn is missing from the
-    chat's task list after one re-read ``VISIBILITY_RECHECK_S`` later (replica lag). Fails open on any error."""
+    chat's task list after one re-read ``VISIBILITY_RECHECK_S`` later (replica lag). A card linked to the chat but
+    parked as a watch is hidden from the list by design and counts as shown. Fails open on any error."""
     created = created_this_turn(turn_messages)
     if not created:
         return None
     try:
         missing = [t for t in created if t not in _shown_ids(session_id)]
+        watches = _watch_parked(session_id, missing)
+        missing = [t for t in missing if t not in watches]
         if missing:
             _visibility_sleep(VISIBILITY_RECHECK_S)
             shown = _shown_ids(session_id)
@@ -1462,6 +1513,10 @@ def _visibility_gate(session_id: str, turn_messages: Any, attempt: int) -> Optio
         logger.debug("chat-closeout: task-list read failed; letting the reply through", exc_info=True)
         return None
     for tid in created:
+        if tid in watches:
+            logger.info("chat-closeout: turn-end visibility ok card=%s watch=1 wake_at=%s session=%s attempt=%d",
+                        tid, watches[tid], session_id, attempt)
+            continue
         logger.info("chat-closeout: turn-end visibility %s card=%s session=%s attempt=%d",
                     "held" if tid in missing else "ok", tid, session_id, attempt)
     if not missing:
