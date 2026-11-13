@@ -2901,7 +2901,15 @@ CROSS_SESSION_RE = re.escape(CROSS_SESSION_HEADER) + r"(?:\s|\])"
 # skill-preload preamble before David's own words must stay human. The id part is optional so the coach's 40-char
 # template head classifies like the whole ask (agent-ef895c63a9: status_only read the batch notice's fixed clause
 # "If you are still waiting on siblings" as David asking for status).
+#
+# Core's busy-session fold headers (gateway/kanban_wake_fold.py and gateway/session_automation.py _FOLD_HEADER:
+# "[IMPORTANT: N Kanban task updates arrived …" / "… background process results arrived …"). The tail may be cut at
+# the 40-char template head ("…updates arrive", "…results"), so only "arrived" or a truncation of it at the very end
+# counts (agent-93c4a84a5c: report_only holds on a folded Kanban wake were filed as a template misfire).
+# test_every_core_envelope_constant_is_classified scans core for every such module-level envelope constant.
 CORE_JOB_RE = (r"\[ASYNC DELEGATION (?:BATCH COMPLETE|COMPLETE|TASK FAILED) — "
+               r"|\[IMPORTANT: \d+ (?:Kanban task updates|background process results)"
+               r"(?: arrived\b|\s?(?:a|ar|arr|arri|arriv|arrive)?$)"
                r"|\[IMPORTANT: Background process \S+(?:\s|$)"
                r"|\[Background process \S+ heartbeat\b"
                r"|\[System note: background job results")

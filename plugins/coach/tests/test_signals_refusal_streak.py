@@ -152,3 +152,14 @@ def test_the_refused_original_delivery_then_its_retry_is_automated(tmp_path):
     # A human ask anywhere in the run, even one quoting a notice, keeps the user wording.
     for sid in ("human", "quoted"):
         assert "the user re-asked" in sigs[sid]["symptom"], sid
+
+
+def test_core_fold_headers_are_automated_deliveries():
+    """agent-93c4a84a5c: core folds busy-session wakes under "[IMPORTANT: N Kanban task updates arrived …" (and the
+    background-results twin); a refused fold is an automated delivery, not the user re-asking."""
+    spec = importlib.util.spec_from_file_location("coach_refusal_streak_fold_test", ROOT / "refusal_streak.py")
+    rs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rs)
+    assert rs.automated("[IMPORTANT: 3 Kanban task updates arrived while this session was busy. Each card …]")
+    assert rs.automated("[IMPORTANT: 2 background process results arrived while this session was busy. Treat …]")
+    assert not rs.automated('[IMPORTANT: The user launched this CLI session with the "x" skill preloaded.] why?')

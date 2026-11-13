@@ -230,6 +230,12 @@ CORE_ENVELOPES = {
                  'output; you will also be told when it exits).\nCommand: make\nOutput since last heartbeat:\nx]',
     'jobs_stopped': '[System note: background job results from this chat were pending when the Hermes backend shut '
                     'down. This stands in for their completion notices.]',
+    # core gateway/kanban_wake_fold.py and gateway/session_automation.py _FOLD_HEADER (agent-93c4a84a5c)
+    'kanban_fold': '[IMPORTANT: 3 Kanban task updates arrived while this session was busy. Each card below shows its '
+                   'state when this batch was built; an earlier premise that no longer holds is relabelled. Treat '
+                   'them as one batch and give one consolidated response.]\n\n✔ [default] @default Kanban t_example',
+    'process_fold': '[IMPORTANT: 2 background process results arrived while this session was busy. Treat them as one '
+                    'batch and give one consolidated response; preserve failures and actionable results.]\n\nx',
 }
 HUMAN_LOOKALIKES = (
     '[IMPORTANT: The user launched this CLI session with the "five-whys" skill preloaded.]\n\nwhat is the status?',
@@ -326,6 +332,72 @@ def test_every_core_synthetic_user_prefix_is_classified():
         else:
             unclassified.append(p)
     assert not unclassified, f'classify in reply_check.NOTICE_RE (+ a sample) or NOT_NOTICES: {unclassified}'
+
+
+ENVELOPE_OPENINGS = ('[IMPORTANT:', '[ASYNC')
+ENVELOPE_DIRS = ('gateway', 'tools', 'tui_gateway')
+
+
+def _core_envelope_constants():
+    """Every module-level string constant under core's gateway/, tools/, tui_gateway/ that opens like a user-role
+    envelope, rendered with its {fields} filled (count=3 etc.): {'<path>:<NAME>': text}."""
+    import ast
+    import string
+    root = _core_root()
+    out = {}
+    for d in ENVELOPE_DIRS:
+        for path in sorted((root / d).rglob('*.py')):
+            try:
+                tree = ast.parse(path.read_text())
+            except (SyntaxError, UnicodeDecodeError):
+                continue
+            for node in tree.body:
+                targets = node.targets if isinstance(node, ast.Assign) else \
+                    [node.target] if isinstance(node, ast.AnnAssign) else []
+                value = getattr(node, 'value', None)
+                if not (isinstance(value, ast.Constant) and isinstance(value.value, str)):
+                    continue
+                text = value.value
+                if not text.lstrip().startswith(ENVELOPE_OPENINGS):
+                    continue
+                fields = {f for _, f, _, _ in string.Formatter().parse(text) if f}
+                text = text.format(**{f: '3' for f in fields})
+                for t in targets:
+                    out[f'{path.relative_to(root)}:{getattr(t, "id", "?")}'] = text
+    return out
+
+
+def test_core_fold_headers_are_notices_at_full_length_and_template_head():
+    """agent-93c4a84a5c: core's folded Kanban wake ("[IMPORTANT: 3 Kanban task updates arrived …") was read as David
+    asking live; report_only's holds on it were filed as a template misfire."""
+    consts = _core_envelope_constants()
+    folds = {k: v for k, v in consts.items() if k.endswith(':_FOLD_HEADER')}
+    assert 'gateway/kanban_wake_fold.py:_FOLD_HEADER' in folds, sorted(consts)
+    for name, text in folds.items():
+        assert rc.notice_turn(text) and rc.automation_prompt(text), name
+        assert rc.notice_turn(' '.join(text.split())[:40]), f'{name}: 40-char template head must classify too'
+    assert rc.notice_turn('[IMPORTANT: 3 Kanban task updates arrive')
+    assert not rc.notice_turn('[IMPORTANT: The user launched this CLI session with the "five-whys" skill')
+    assert not rc.notice_turn('[IMPORTANT: 3 Kanban task updates? why so many')
+
+
+def test_status_only_skips_a_folded_kanban_wake():
+    """The folded wake carries card texts ("still waiting on …"); it is not David asking for status."""
+    log = ["-> kanban_show({'task_id': 't_example'})"]
+    ask = CORE_ENVELOPES['kanban_fold'] + ' — still waiting on review'
+    assert rc.PROGRESS_ASK_RE.search(ask)
+    assert rc.status_only(ask, 'Waiting on the other cards.', log) is None
+
+
+def test_every_core_envelope_constant_is_classified():
+    """Detection guard: a module-level "[IMPORTANT:"/"[ASYNC" constant in core's gateway/, tools/ or tui_gateway/ is
+    a user-role envelope. It must be a notice or listed in reply_check.NOT_NOTICES, so a new gateway envelope fails
+    CI instead of causing live holds (agent-93c4a84a5c: the Kanban wake fold header was registered nowhere)."""
+    consts = _core_envelope_constants()
+    assert consts, 'scan found no envelope constants: the scan or core layout broke'
+    unclassified = [k for k, text in consts.items()
+                    if not rc.notice_turn(text) and not any(text.startswith(p) for p in rc.NOT_NOTICES)]
+    assert not unclassified, f'classify in reply_check.CORE_JOB_RE or NOT_NOTICES: {unclassified}'
 
 
 # ── resume preambles (agent-6b76c58161) ──────────────────────────────────────────────────────────────────────

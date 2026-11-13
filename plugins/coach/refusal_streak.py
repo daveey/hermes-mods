@@ -27,7 +27,8 @@ AUTO_RETRY_PREFIX = "[Hermes: automatic retry of"
 AUTOMATED_RE = re.compile(
     r"^\s*(?:[ℹ✔✓⏸✖⏱🔄⏳⚠]\ufe0f?\s*(?:\[[^\]\n]+\]\s*)?(?:@\S+\s+)?Kanban\s+t_\w+"
     r"|(?i:\[(?:chat-closeout|kanban close-out|owner-wake|false-stop recovery|goal continuation|babysitter)\b)"
-    r"|\[System note:|\[Message from another Hermes session|\[ASYNC DELEGATION |\[IMPORTANT: Background process )")
+    r"|\[System note:|\[Message from another Hermes session|\[ASYNC DELEGATION |\[IMPORTANT: Background process "
+    r"|\[IMPORTANT: \d+ (?:Kanban task updates|background process results) arrived\b)")
 STREAK_MIN = 2
 MAX_FILED = 500  # remembered sessions per db; older ones age out (their fingerprint still dedups on the lane)
 
