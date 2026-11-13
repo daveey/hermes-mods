@@ -2277,6 +2277,14 @@ the evidence you get (it describes where it happened, not where you work).
 """
 
 
+# cron-0d63c0cf26: a VERIFY recorded fixed while the live check's natural event (a dirty drift pair) had not happened,
+# from a replay that stubbed the create path the hub's admission judge refused. Both VERIFY variants carry this rule.
+NATURAL_EVENT_RULE = """   `live_check` needs a natural event (the real failing input: a dirty sample, a real create, a failing run) that
+   has not happened yet? A clean or idle run is NO_PROOF: kanban_schedule a re-check with a wake_check on that
+   event, never record fixed. A replay counts only if it exercises the real path; one that stubs the layer that
+   failed (a fake create, a mocked judge) proves nothing about this defect."""
+
+
 def verify_brief(fp: str, st: dict, fix_card: str, remote: bool = False) -> str:
     """The VERIFY child: host steps, live check, and the lane event, from the fix's handoff. ``remote`` (the hub's
     lane): a pool worker does every gateway step through `hub-admin '<command>'`; else it is machine-pinned here."""
@@ -2313,6 +2321,7 @@ Post nothing to the Inbox. Budget for this card <= ${INVESTIGATION_BUDGET}.
    its first prompt with `[selfheal-probe]` (e.g. `hermes chat -q '[selfheal-probe] ...'`): the lane then logs
    `selfheal_skip why=probe` and files nothing. Check that log line; never delete selfheal_pending rows by hand.
    The live check fails? Comment the evidence, then kanban_block naming what still fails; do not record fixed.
+{NATURAL_EVENT_RULE}
 6. Record the result QUIETLY. The Inbox is for decisions only: do NOT run `hermes inbox post`. Write `result.md`
    (what changed with commits, the red/green test output from the handoff, your live proof, the undo command) and
    run `{SELF_EVENT} fixed {fp} --card {fix_card} --note "<every fix sha, space-separated>" --result result.md`.
@@ -2362,6 +2371,7 @@ Post nothing to the Inbox. Budget for this card <= ${INVESTIGATION_BUDGET}.
    files nothing. Check that line with `hub-admin 'grep selfheal_skip {coach}/log.jsonl | tail -n 3'`; never
    delete selfheal_pending rows by hand. The live check fails? Comment the evidence, then kanban_block naming what
    still fails; do not record fixed.
+{NATURAL_EVENT_RULE}
 6. Record the result QUIETLY. The Inbox is for decisions only: do NOT run `hermes inbox post`. Write `result.md`
    here (what changed with commits, the red/green test output from the handoff, your live proof, the undo
    command), stage it on the gateway and record it there:

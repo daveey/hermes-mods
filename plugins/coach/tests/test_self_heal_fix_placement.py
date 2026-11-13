@@ -383,3 +383,15 @@ def test_unresolved_identity_never_files_a_portable_verify(store, board_identity
     # the FIX is portable repo work and files; the VERIFY fails closed (home pin unresolved), never pool-labelled
     assert r["action"] == "filed" and r["verify_card"] is None
     assert all("--runs-on" not in a or "capability:hub-write" not in a for a in b.creates())
+
+
+# cron-0d63c0cf26 (second occurrence): a VERIFY recorded fixed with natural_dirty_filing_observed=false, from a replay
+# that stubbed the very create path the hub's admission judge refused. Both VERIFY variants must make an unobserved
+# natural event NO_PROOF (schedule, never record fixed) and reject a replay that stubs the failing layer.
+@pytest.mark.parametrize("remote", [False, True], ids=["machine-pinned", "pool"])
+def test_verify_never_records_fixed_without_the_natural_event(remote):
+    body = sh.verify_brief(FP, {"symptom": "cron job failed"}, "t_fix", remote=remote)
+    live = " ".join(body.split("\n5. ", 1)[1].split("\n6. ", 1)[0].split())
+    assert "NO_PROOF" in live and "natural event" in live
+    assert "kanban_schedule" in live and "wake_check" in live
+    assert "stubs the layer that failed" in live
