@@ -1,0 +1,242 @@
+From 3b8c9b072cda664f7aedea5300ac34ce9c22d086 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:04:15 +0000
+Subject: [PATCH] [daveey] lifecycle guard: public executes_command_named();
+ hermes-sync hint peels shell keywords and -o values
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Follow-up to PR #2128 review 5890084677 (two non-blocking nits):
+
+1) `_runs_hermes_sync` lost the hint for `bash -o pipefail /x/hermes-sync` (the -o value was
+   taken as the script), `time hermes-sync`, `! hermes-sync` and `if …; then hermes-sync; fi`
+   (reserved words were not stripped before argv0). The shell script operand now skips the
+   values of -o/-O/+o/+O and stops at -c; leading if/then/elif/else/while/until/do/!/time/{
+   (and `time -p`/`--`) are peeled before env assignments and wrappers.
+2) tools/terminal_tool_guards.py imported six private cron.lifecycle_guard helpers. The walk now
+   lives in cron/lifecycle_guard.py as public `executes_command_named(command, name)`, next to
+   contains_launchctl_submit_command; `_runs_hermes_sync` just calls it.
+
+Finding while proving it: the card assumed the guard still refuses the keyword forms. It does
+not: `time ./x.sh`, `! ./x.sh`, `if …; then ./x.sh; fi`, `{ ./x.sh; }` and `while …; do ./x.sh;
+done` are allowed inside the supervised gateway when x.sh contains a gateway restart (the
+referenced-script walk does not peel reserved words), while `./x.sh` and `bash -o pipefail
+./x.sh` are refused. That fail-open is filed as its own card; the keyword hint cases are
+therefore tested through `_refusal_hint` directly, the -o/-O/+o cases through a full refusal.
+
+Proof: tests/tools/test_lifecycle_guard_hermes_sync_hint.py: 20 new cases fail on the old code
+(10 hint cases, 10 executes_command_named cases incl. mention negatives) and pass here; all 19
+test files importing lifecycle_guard/terminal_tool_guards: 1212 passed; scripts/check
+--base origin/main: 19 checks ok.
+---
+ cron/lifecycle_guard.py                       | 72 +++++++++++++++++++
+ .../test_lifecycle_guard_hermes_sync_hint.py  | 62 ++++++++++++++++
+ tools/terminal_tool_guards.py                 | 35 ++-------
+ 3 files changed, 139 insertions(+), 30 deletions(-)
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 3c6b7f1a70..25b8b50222 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -891,6 +891,78 @@ def contains_launchctl_submit_command(command: str) -> bool:
+     return False
+ 
+ 
++# Reserved words that may precede a simple command in the same segment (`if hermes-sync`,
++# `then x`, `! x`, `time -p x`, `{ x; }`); `fi`/`done`/`}` close a list and run nothing.
++_COMMAND_PREFIX_KEYWORDS = frozenset({
++    "if", "then", "elif", "else", "while", "until", "do", "!", "time", "{",
++})
++_MAX_EXECUTES_NAMED_DEPTH = 4
++
++
++def _peel_command_keywords(segment: list[str]) -> list[str]:
++    """*segment* without its leading reserved words (and ``time``'s ``-p``/``--``)."""
++    index = 0
++    while index < len(segment) and segment[index] in _COMMAND_PREFIX_KEYWORDS:
++        word = segment[index]
++        index += 1
++        if word == "time":
++            while index < len(segment) and segment[index] in ("-p", "--"):
++                index += 1
++    return segment[index:]
++
++
++def _shell_script_operand(arguments: list[str]) -> Optional[str]:
++    """The script a POSIX shell runs from *arguments*, skipping options and the values of
++    ``-o``/``-O``/``+o``/``+O``; ``None`` for ``-c`` (inline source) or no operand."""
++    index = 0
++    while index < len(arguments):
++        argument = arguments[index]
++        if argument == "--":
++            index += 1
++            break
++        if argument in _SHELL_COMMAND_FLAGS:
++            return None
++        if argument in _SHELL_OPTIONS_WITH_VALUES:
++            index += 2
++            continue
++        if argument.startswith(("-", "+")):
++            index += 1
++            continue
++        break
++    return arguments[index] if index < len(arguments) else None
++
++
++def executes_command_named(command: str, name: str, *, _depth: int = 0) -> bool:
++    """Whether *command* EXECUTES a program whose basename is *name*: as a segment's command word
++    (shell keywords such as ``if``/``then``/``time``/``!``, env assignments and wrappers such as
++    sudo/nohup/systemd-run peeled), as the script a shell or Python interpreter runs, or inside an
++    ``sh -c`` payload. A mere mention (``grep x name``) does not count. A command over the scan
++    budget answers False, so callers must not use this as a refusal gate (it serves hints)."""
++    if name not in command or not lifecycle_scan_root_within_budget(command):
++        return False
++    for raw_segment in _iter_command_segments(command):
++        segment = _peel_command_keywords(raw_segment)
++        index = _executed_command_index(segment)
++        if index is None:
++            continue
++        executable = _executable_name(segment[index])
++        if executable == name:
++            return True
++        arguments = segment[index + 1 :]
++        if executable in _SHELL_EXECUTABLES:
++            script = _shell_script_operand(arguments)
++        elif _is_interpreter_image(executable):
++            script = next((t for t in arguments if not t.startswith("-")), None)
++        else:
++            continue
++        if script is not None and _executable_name(script) == name:
++            return True
++    if _depth >= _MAX_EXECUTES_NAMED_DEPTH:
++        return False
++    return any(executes_command_named(payload, name, _depth=_depth + 1)
++               for payload in _iter_shell_command_payloads(command))
++
++
+ def _mask_data_sink_arguments(text: str) -> str:
+     """Replace data-sink executables' arguments with a neutral placeholder.
+ 
+diff --git a/tests/tools/test_lifecycle_guard_hermes_sync_hint.py b/tests/tools/test_lifecycle_guard_hermes_sync_hint.py
+index 5225146036..d8cdf388e2 100644
+--- a/tests/tools/test_lifecycle_guard_hermes_sync_hint.py
++++ b/tests/tools/test_lifecycle_guard_hermes_sync_hint.py
+@@ -105,3 +105,65 @@ def test_hint_names_the_root_sync_log_from_a_profile_gateway(tmp_path, monkeypat
+ 
+     assert "~/.hermes/logs/hermes-sync.log" in error
+     assert "profiles" not in error
++
++
++# PR #2128 review nits: the hint must survive shell options that take a value and the reserved
++# words that may precede a command (each case dropped the hint before executes_command_named).
++@pytest.mark.parametrize("template", [
++    "bash -o pipefail {script} mods-pull",
++    "sh +o errexit -- {script} mods-pull",
++    "bash -O extglob {script} mods-pull",
++])
++def test_hint_survives_shell_options_with_values(tmp_path, monkeypatch, template):
++    script = _script(tmp_path, "hermes-sync", _RESTART)
++
++    error = _refuse(tmp_path, monkeypatch, template.format(script=script))
++
++    assert _ROUTE in error
++
++
++# The referenced-script walk does not yet peel reserved words, so these are not refused today
++# (follow-up card); the hint itself must already name the route once they are.
++@pytest.mark.parametrize("template", [
++    "time {script} mods-pull",
++    "time -p {script} mods-pull",
++    "! {script} mods-pull",
++    "if true; then {script} mods-pull; fi",
++    "if {script} mods-pull; then echo ok; fi",
++    "while false; do {script} mods-pull; done",
++    "{{ {script} mods-pull; }}",
++])
++def test_hint_survives_reserved_words(tmp_path, template):
++    from tools.terminal_tool_guards import _refusal_hint
++
++    script = _script(tmp_path, "hermes-sync", _RESTART)
++
++    assert _ROUTE in _refusal_hint(template.format(script=script))
++
++
++def test_a_shell_option_value_is_not_the_script(tmp_path, monkeypatch):
++    # `-o` consumes `pipefail`; deploy.sh is the script and hermes-sync only its argument.
++    deploy = _script(tmp_path, "deploy.sh", _RESTART)
++
++    error = _refuse(tmp_path, monkeypatch, f"bash -o pipefail {deploy} hermes-sync")
++
++    assert "hermes gateway restart" in error
++    assert _ROUTE not in error
++
++
++@pytest.mark.parametrize(("command", "expected"), [
++    ("hermes-sync mods-pull", True),
++    ("bash -O extglob /x/hermes-sync", True),
++    ("time -p -- hermes-sync", True),
++    ("then sudo -u ubuntu hermes-sync", True),
++    ("bash -c 'if true; then hermes-sync; fi'", True),
++    ("python3 /x/hermes-sync", True),
++    ("bash -c 'echo hermes-sync'", False),
++    ("grep hermes-sync log", False),
++    ("echo time hermes-sync", False),
++    ("fi hermes-sync", False),
++])
++def test_executes_command_named(command, expected):
++    from cron.lifecycle_guard import executes_command_named
++
++    assert executes_command_named(command, "hermes-sync") is expected
+diff --git a/tools/terminal_tool_guards.py b/tools/terminal_tool_guards.py
+index 54f2222ba7..5fa6a38cd3 100644
+--- a/tools/terminal_tool_guards.py
++++ b/tools/terminal_tool_guards.py
+@@ -582,39 +582,14 @@ def _session_aliases_for_guard(env: Any) -> Optional[frozenset[str]]:
+ # gateway (by lifecycle content, or because the script is over the scan budget). The generic
+ # "separate shell" advice made agents wrap it in systemd-run/nohup; name the sanctioned route.
+ _HERMES_SYNC = "hermes-sync"
+-_HERMES_SYNC_PAYLOAD_DEPTH = 4
+ 
+ 
+-def _runs_hermes_sync(command: str, depth: int = 0) -> bool:
+-    """Whether *command* EXECUTES hermes-sync: as a segment's command word (env assignments and
+-    wrappers such as sudo/nohup/systemd-run peeled), as the script a shell or Python interpreter
+-    runs, or inside an ``sh -c`` payload. A mere mention (``grep x hermes-sync``) does not count."""
+-    from cron.lifecycle_guard import (
+-        _SHELL_EXECUTABLES,
+-        _executable_name,
+-        _executed_command_index,
+-        _is_interpreter_image,
+-        _iter_command_segments,
+-        _iter_shell_command_payloads,
+-        lifecycle_scan_root_within_budget,
+-    )
++def _runs_hermes_sync(command: str) -> bool:
++    """Whether *command* EXECUTES hermes-sync (a mere mention such as ``grep x hermes-sync`` does
++    not count); see ``cron.lifecycle_guard.executes_command_named``."""
++    from cron.lifecycle_guard import executes_command_named
+ 
+-    if _HERMES_SYNC not in command or not lifecycle_scan_root_within_budget(command):
+-        return False
+-    for segment in _iter_command_segments(command):
+-        index = _executed_command_index(segment)
+-        if index is None:
+-            continue
+-        name = _executable_name(segment[index])
+-        if name == _HERMES_SYNC:
+-            return True
+-        if name in _SHELL_EXECUTABLES or _is_interpreter_image(name):
+-            script = next((t for t in segment[index + 1:] if not t.startswith("-")), None)
+-            if script is not None and _executable_name(script) == _HERMES_SYNC:
+-                return True
+-    if depth >= _HERMES_SYNC_PAYLOAD_DEPTH:
+-        return False
+-    return any(_runs_hermes_sync(p, depth + 1) for p in _iter_shell_command_payloads(command))
++    return executes_command_named(command, _HERMES_SYNC)
+ 
+ 
+ def _refusal_hint(command: str) -> str:
+-- 
+2.43.0
+

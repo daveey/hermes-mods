@@ -1,0 +1,310 @@
+From a0307c048cc5ca6a6dfbd36dc0d12064883b2930 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:41:21 +0000
+Subject: [PATCH] [daveey] kanban: unblock_task refuses a stale copy of a done
+ card; terminal-guard review nits
+
+PR #1958 review 5889419180. 'unblocked' is an explicit reopen in kanban_terminal_guard and on the
+Board (hermes-hub#105), but unblock_task's automated callers (shared-blocker clear and probe
+election, quota release, resolved_check) act on the local row and never consulted terminal_hold:
+on a stale blocked/scheduled copy of a done card they wrote 'unblocked', set the row ready, and
+the push carried that to the Board as a reopen.
+
+- unblock_task: kanban_terminal_guard.unblock_held refuses a held card inside the write txn,
+  before precondition and the reason comment's savepoint, leaving one stale_wake_ignored note
+  (producer:unblocked). Live cards (never completed, or completed then reopened) unblock as before.
+- nit 2: comment why _restore_held compares local ids (arrival order).
+- nit 3: enforce_after_apply drops the dead 'or was' fallback.
+- reopen_review_task moves to kanban_db_review_reopen (re-exported) to keep kanban_db under its
+  FILE_LINES cap.
+
+Proof: the 4 new tests in test_kanban_stale_wake_terminal.py fail 3 on the PR head (unblock
+returns True, row ready, precondition ran) and pass with the fix; mutants (status filter dropped,
+check moved inside the comment savepoint) are killed.
+---
+ hermes_cli/kanban_db.py                       | 55 +++--------------
+ hermes_cli/kanban_db_review_reopen.py         | 55 +++++++++++++++++
+ hermes_cli/kanban_terminal_guard.py           | 26 ++++++--
+ .../test_kanban_stale_wake_terminal.py        | 60 +++++++++++++++++++
+ 4 files changed, 144 insertions(+), 52 deletions(-)
+ create mode 100644 hermes_cli/kanban_db_review_reopen.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 78a8e378d2..16241941dc 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3356,11 +3356,15 @@ def unblock_task(conn: sqlite3.Connection, task_id: str, *, comment: Optional[tu
+     loop escalated can go back to work without the specifier/decomposer rewriting it. ``comment`` is
+     written in the same txn and only when the unblock lands (``kanban_reason_comment``); ``event_extra``
+     is merged into the ``unblocked`` event (audit provenance). ``precondition`` runs first inside the
+-    write txn; a returned refusal aborts with ``False`` and no change. [daveey]"""
++    write txn; a returned refusal aborts with ``False`` and no change. A card held terminal is refused before both
++    (``kanban_terminal_guard.unblock_held``: ``unblocked`` is a reopen). [daveey]"""
+     from hermes_cli.kanban_reason_comment import reason_comment
++    from hermes_cli.kanban_terminal_guard import unblock_held
+     now = int(time.time())
+-    with write_txn(conn), reason_comment(conn, task_id, comment) as noted:
+-        if precondition is not None and precondition(conn):
++    # ``held`` is decided before the comment's savepoint opens: a rollback to it would drop the note.
++    with write_txn(conn), reason_comment(conn, task_id, None if (held := unblock_held(conn, task_id)) else comment) \
++            as noted:
++        if held or precondition is not None and precondition(conn):
+             return False
+         resume_status = (_resume_status_from_events(conn, task_id)
+                          if _task_status(conn, task_id) in ("blocked", "triage") else "ready")
+@@ -3394,50 +3398,6 @@ def unblock_task(conn: sqlite3.Connection, task_id: str, *, comment: Optional[tu
+         return noted.keep(True)
+ 
+ 
+-def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
+-    """``review`` -> ``ready``/``todo`` so the implementer re-runs on the new
+-    comments; restores the implementer from the ``review_requested`` event.
+-    Preserves ``consecutive_failures`` and the block loop counter (review is
+-    not a block; only :func:`complete_task` clears them)."""
+-    now = int(time.time())
+-    with write_txn(conn):
+-        task = get_task(conn, task_id)
+-        if task is None or task.status != "review":
+-            return False
+-        review_event = _latest_event(conn, task_id, "review_requested")
+-        handoff = _json_dict(_row_get(review_event, "payload"))
+-        implementer = _nonblank_str(handoff.get("implementer"))
+-        if implementer:
+-            from hermes_cli.kanban_capabilities import validate_assignment
+-
+-            validate_assignment(implementer, requires=task.requires,
+-                                workspace_kind=task.workspace_kind, workspace_path=task.workspace_path, skills=task.skills)
+-        _reclaim_dangling_run(
+-            conn, task_id, statuses=("review",), now=now,
+-            note="invariant recovery on review reopen",
+-        )
+-        new_status = _landing_status_after_parents(conn, task_id)
+-        params: tuple[Any, ...] = (new_status, *((implementer,) if implementer else ()), task_id)
+-        cur = conn.execute(
+-            # consecutive_failures deliberately PRESERVED: review reopen is not
+-            # a success signal; only complete_task resets the breaker (#35072).
+-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+-            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
+-            + (", assignee = ?" if implementer else "")
+-            + " WHERE id = ? AND status = 'review'",
+-            params,
+-        )
+-        if cur.rowcount != 1:
+-            return False
+-        payload: dict[str, Any] = {"status": new_status}
+-        if implementer:
+-            payload["implementer"] = implementer
+-        _append_event(
+-            conn, task_id, "review_reopened", payload if payload != {"status": "ready"} else None,
+-        )
+-        return True
+-
+-
+ def invalidate_descendants_for_parent_reopen(
+     conn: sqlite3.Connection, task_id: str, *, author: str,
+ ) -> dict[str, Any]:
+@@ -4007,6 +3967,7 @@ from hermes_cli.kanban_db_comment_ids import (
+ from hermes_cli.kanban_db_archive import archive_task
+ from hermes_cli.kanban_db_list import list_task_rows, list_tasks
+ from hermes_cli.kanban_db_schedule import schedule_task
++from hermes_cli.kanban_db_review_reopen import reopen_review_task
+ from hermes_cli.kanban_db_edit import PriorityLowerRefused, edit_task
+ from hermes_cli.kanban_reason_comment import _awaiting_human_answer
+ from hermes_cli.kanban_db_notify import _inherit_notify_subs, _owning_sub_clause
+diff --git a/hermes_cli/kanban_db_review_reopen.py b/hermes_cli/kanban_db_review_reopen.py
+new file mode 100644
+index 0000000000..5dd7b83f57
+--- /dev/null
++++ b/hermes_cli/kanban_db_review_reopen.py
+@@ -0,0 +1,55 @@
++"""``reopen_review_task``: ``review`` -> ``ready``/``todo`` (split out of ``kanban_db``). [daveey]
++
++Late-bound via ``_kb`` (import-cycle breaking) so monkeypatching ``kanban_db`` helpers in
++tests still reaches this code. Re-exported from ``kanban_db``.
++"""
++from __future__ import annotations
++
++import sqlite3
++import time
++from typing import Any
++
++
++def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
++    """``review`` -> ``ready``/``todo`` so the implementer re-runs on the new
++    comments; restores the implementer from the ``review_requested`` event.
++    Preserves ``consecutive_failures`` and the block loop counter (review is
++    not a block; only :func:`complete_task` clears them)."""
++    from hermes_cli import kanban_db as _kb
++    now = int(time.time())
++    with _kb.write_txn(conn):
++        task = _kb.get_task(conn, task_id)
++        if task is None or task.status != "review":
++            return False
++        review_event = _kb._latest_event(conn, task_id, "review_requested")
++        handoff = _kb._json_dict(_kb._row_get(review_event, "payload"))
++        implementer = _kb._nonblank_str(handoff.get("implementer"))
++        if implementer:
++            from hermes_cli.kanban_capabilities import validate_assignment
++
++            validate_assignment(implementer, requires=task.requires,
++                                workspace_kind=task.workspace_kind, workspace_path=task.workspace_path, skills=task.skills)
++        _kb._reclaim_dangling_run(
++            conn, task_id, statuses=("review",), now=now,
++            note="invariant recovery on review reopen",
++        )
++        new_status = _kb._landing_status_after_parents(conn, task_id)
++        params: tuple[Any, ...] = (new_status, *((implementer,) if implementer else ()), task_id)
++        cur = conn.execute(
++            # consecutive_failures deliberately PRESERVED: review reopen is not
++            # a success signal; only complete_task resets the breaker (#35072).
++            "UPDATE tasks SET status = ?, current_run_id = NULL, "
++            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
++            + (", assignee = ?" if implementer else "")
++            + " WHERE id = ? AND status = 'review'",
++            params,
++        )
++        if cur.rowcount != 1:
++            return False
++        payload: dict[str, Any] = {"status": new_status}
++        if implementer:
++            payload["implementer"] = implementer
++        _kb._append_event(
++            conn, task_id, "review_reopened", payload if payload != {"status": "ready"} else None,
++        )
++        return True
+diff --git a/hermes_cli/kanban_terminal_guard.py b/hermes_cli/kanban_terminal_guard.py
+index e9281e693c..53d7ea1d84 100644
+--- a/hermes_cli/kanban_terminal_guard.py
++++ b/hermes_cli/kanban_terminal_guard.py
+@@ -13,7 +13,8 @@ done for days (t_01a1c7b27ca3b496 and five more). The push stamps its HLC at sen
+ Board's per-field LWW over the completion, and the Board leased the card again.
+ 
+ Enforced where a status is produced or applied: the wake producers (``kanban_continuation``,
+-``kanban_wake_check``) skip a held card; the feed apply (``kanban_db_sync.apply_remote_changes``) keeps a held card
++``kanban_wake_check``) skip a held card; ``kanban_db.unblock_task`` refuses one (``unblocked`` is a reopen, and its
++automated callers act on the local row); the feed apply (``kanban_db_sync.apply_remote_changes``) keeps a held card
+ terminal; the push (``kanban_sync_client.push``) strips the stale status; the Board (hermes-hub rows.ts/
+ transitions.ts) refuses the lease and puts the card back. Each ignored wake leaves a ``stale_wake_ignored`` event
+ naming the terminal event it lost to. [daveey]
+@@ -136,6 +137,18 @@ def skip_wake(conn: sqlite3.Connection, task_id: str, wake_kind: str, **extra: A
+     return True
+ 
+ 
++_UNBLOCKABLE = ("blocked", "scheduled", "triage")
++
++
++def unblock_held(conn: sqlite3.Connection, task_id: str) -> bool:
++    """``kanban_db.unblock_task``, first inside its write txn: True (refuse) when the row reads blocked/scheduled/
++    triage but the card is held terminal. ``unblocked`` is an explicit reopen (``REOPEN_KINDS``, and on the Board),
++    so an automated caller acting on a stale copy (shared-blocker clear/probe, quota release, ``resolved_check``)
++    would otherwise reopen a done card. A card that is not unblockable anyway leaves no note."""
++    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    return row is not None and row[0] in _UNBLOCKABLE and skip_wake(conn, task_id, "unblocked")
++
++
+ def push_status_is_stale(conn: sqlite3.Connection, task_id: str, status: Any) -> Optional[dict]:
+     """The push: the terminal event a task row's live ``status`` must lose to, or None to send it.
+ 
+@@ -182,16 +195,17 @@ def enforce_after_apply(conn: sqlite3.Connection, left_terminal: Iterable[tuple[
+     ``reopened``: cards that received a reopen event in this page. A card this guard held while its reopen was
+     still in a later page (a page boundary between the row and its event) gets the held status back."""
+     changed: dict[str, str] = {}
+-    for task_id, was in left_terminal:
++    for task_id, _was in left_terminal:
+         row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+         if row is None or row[0] in TERMINAL_STATUSES or row[0] == "running":
+             continue
+         hold = terminal_hold(conn, task_id)
+         if hold is None:
+             continue
+-        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (hold["status"] or was, task_id))
++        # The hold's own status, not ``_was``: ``terminal_hold`` only returns an event with a terminal status.
++        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (hold["status"], task_id))
+         _note(conn, task_id, hold, source="apply", held_status=row[0])
+-        changed[task_id] = hold["status"] or was
++        changed[task_id] = hold["status"]
+     for task_id in reopened:
+         if task_id in changed:
+             continue
+@@ -215,7 +229,9 @@ def _restore_held(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+     held = _payload(last[1]).get("held_status")
+     if not isinstance(held, str) or held in TERMINAL_STATUSES:
+         return None
+-    # Only a hold newer than every terminal event: an older one belongs to an earlier completion.
++    # Only a hold newer than every terminal event: an older one belongs to an earlier completion. Local ids
++    # (arrival order) on purpose, unlike ``terminal_hold``'s origin order: the question is whether this apply note
++    # was written after the terminal event reached this file, which only arrival order answers.
+     newest_terminal = max((e["id"] for e in _events(conn, task_id) if terminal_status(e)), default=0)
+     if last[0] < newest_terminal:
+         return None
+diff --git a/tests/hermes_cli/test_kanban_stale_wake_terminal.py b/tests/hermes_cli/test_kanban_stale_wake_terminal.py
+index f6ba00aff4..b135e3a3d9 100644
+--- a/tests/hermes_cli/test_kanban_stale_wake_terminal.py
++++ b/tests/hermes_cli/test_kanban_stale_wake_terminal.py
+@@ -345,3 +345,63 @@ def test_terminal_hold_orders_by_origin_not_by_arrival():
+     assert ktg.terminal_hold(conn, "t") is None
+     conn.execute("INSERT INTO task_events VALUES (4, NULL, 't', 'completed', '{}', 400)")
+     assert ktg.terminal_hold(conn, "t")["id"] == 4
++
++
++# --- unblock_task: ``unblocked`` is a reopen, and its automated callers act on the local row -----------------------
++# PR #1958 review 5889419180 nit 1: a stale copy of a done card, auto-unblocked by the shared-blocker clear/probe,
++# the quota release or a ``resolved_check``, went ``ready`` and wrote ``unblocked``, which both guards (here and
++# hermes-hub#105) accept as an explicit reopen.
++
++@pytest.mark.parametrize("stale", ["scheduled", "blocked"])
++def test_unblock_of_a_stale_copy_of_a_done_card_does_not_reopen_it(board, stale):
++    tid = _parked(board)
++    _stale_scheduled_copy_of_a_done_card(board, tid)
++    if stale == "blocked":
++        with kb.write_txn(board):
++            board.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
++    for _ in range(2):  # the shared-blocker probe and the quota release retry every tick
++        assert kb.unblock_task(board, tid) is False
++    assert _status(board, tid) == stale
++    assert "unblocked" not in _kinds(board, tid)
++    assert ktg.terminal_hold(board, tid) is not None                    # the push still strips the stale status
++    [note] = _ignored(board, tid)                                     # one note, not one per tick
++    assert (note["terminal_kind"], note["source"], note["wake_kind"]) == ("completed", "producer:unblocked",
++                                                                           "unblocked")
++
++
++def test_a_refused_unblock_runs_no_precondition_and_keeps_no_comment(board):
++    """``kanban_ask_resolved`` passes both: its precondition writes ``ask_resolved`` and drops the wake check, so it
++    must not run for a card the guard refuses; the note survives the comment's savepoint rollback."""
++    tid = _parked(board)
++    _stale_scheduled_copy_of_a_done_card(board, tid)
++    ran = []
++    assert kb.unblock_task(board, tid, comment=("dispatcher", "resolved_check exited 0"),
++                           precondition=lambda c: ran.append(1)) is False
++    assert ran == []
++    assert [c for c in kb.list_comments(board, tid) if "resolved_check" in c.body] == []
++    assert len(_ignored(board, tid)) == 1
++
++
++def test_unblock_of_a_live_card_still_lands(board):
++    """A card never completed, and one completed then explicitly reopened, unblock as before and leave no note."""
++    fresh = _parked(board)
++    again = _parked(board)
++    with kb.write_txn(board):
++        kb._append_event(board, again, "completed", {})
++        kb._append_event(board, again, "reopened", {"reason": "more"})
++    for tid in (fresh, again):
++        assert kb.unblock_task(board, tid, comment=("david", "go")) is True
++        assert _status(board, tid) == "ready"
++        assert "unblocked" in _kinds(board, tid)
++        assert _ignored(board, tid) == []
++
++
++def test_unblock_of_a_done_row_is_refused_without_a_note(board):
++    """Not unblockable anyway: the row is already terminal, so there is no stale wake to record."""
++    tid = kb.create_task(board, title="t", assignee="worker")
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (tid,))
++        kb._append_event(board, tid, "completed", {})
++    assert kb.unblock_task(board, tid) is False
++    assert _status(board, tid) == "done"
++    assert _ignored(board, tid) == []
+-- 
+2.43.0
+

@@ -1,0 +1,420 @@
+From 1b889c6115bac4c6d9c5003dfde9e7be6714098f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:07:40 +0000
+Subject: [PATCH] [daveey] aux: no stranger-thread close in
+ class_routed_async's to_thread worker or a replaced cache entry
+
+Siblings of the abandoned-provider TLS fd close (hub inbox.db / actions.sqlite3 headers):
+
+1. class_routed_async: adapter clients (Anthropic, Codex, Bedrock, native Gemini) run the sync SDK call on an
+   asyncio.to_thread worker. A cancelled await left that worker in SSL_read while the finally closed the
+   per-call client from the loop thread; the fd went to the next open() and the worker wrote a TLS alert
+   into it. The adapters now use aux_provider_handoff.run_in_thread, which records a still-running worker
+   as abandoned in the enclosing client_scope: the loop thread only shuts the sockets down and the worker
+   closes both clients after its call returns. A worker cancelled before it started is not recorded.
+2. _store_cached_client (Nous 401 refresh) closed the replaced shared entry although another caller can be
+   mid-request on it. It now drops it like the FIFO overflow path and _evict_cached_clients.
+
+Repros on a real loopback TLS 1.3 server (tests/agent/test_aux_stranger_close_siblings.py) fail before the
+fix with the incident's header b'SQLit\x17\x03\x03\x00\x13...' and pass after.
+---
+ agent/aux_provider_handoff.py                 |  37 +++-
+ agent/auxiliary_class_routing.py              |  29 +--
+ agent/auxiliary_client.py                     |  14 +-
+ agent/gemini_native_adapter.py                |   6 +-
+ .../agent/test_aux_stranger_close_siblings.py | 203 ++++++++++++++++++
+ 5 files changed, 266 insertions(+), 23 deletions(-)
+ create mode 100644 tests/agent/test_aux_stranger_close_siblings.py
+
+diff --git a/agent/aux_provider_handoff.py b/agent/aux_provider_handoff.py
+index 5266665c09..9ff704390d 100644
+--- a/agent/aux_provider_handoff.py
++++ b/agent/aux_provider_handoff.py
+@@ -17,11 +17,14 @@ which runs it right after its callback returns, on the thread that owns the sock
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import contextlib
+ import contextvars
+ import logging
+ import threading
+-from typing import Any, Callable, Iterator
++from typing import Any, Callable, Iterator, TypeVar
++
++_T = TypeVar("_T")
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -65,6 +68,38 @@ def note_abandoned(attempt: ProviderAttempt) -> None:
+         abandoned.append(attempt)
+ 
+ 
++async def run_in_thread(fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
++    """``asyncio.to_thread`` for a provider call that reads a client's socket.
++
++    A cancelled await does not stop the worker: it keeps reading while the awaiting task unwinds through its
++    ``client_scope`` on the loop thread. The worker is then recorded as abandoned there, so the scope only
++    shuts the sockets down and the worker closes the client once ``fn`` returns. A worker cancelled before
++    it started never touches the socket and is not recorded.
++    """
++    attempt, lock, state = ProviderAttempt(), threading.Lock(), ["pending"]
++
++    def worker() -> _T:
++        with lock:
++            if state[0] == "dropped":
++                return None  # type: ignore[return-value]  # nobody awaits it
++            state[0] = "running"
++        try:
++            return fn(*args, **kwargs)
++        finally:
++            attempt.finish()
++
++    try:
++        return await asyncio.to_thread(worker)
++    except asyncio.CancelledError:
++        with lock:
++            started = state[0] == "running"
++            if not started:
++                state[0] = "dropped"
++        if started:
++            note_abandoned(attempt)
++        raise
++
++
+ @contextlib.contextmanager
+ def client_scope(client: Any, close: Callable[[Any], None]) -> Iterator[None]:
+     """Own ``client`` for one provider call and ``close`` it on exit, on a thread allowed to.
+diff --git a/agent/auxiliary_class_routing.py b/agent/auxiliary_class_routing.py
+index 1df28fb61a..8d708e6978 100644
+--- a/agent/auxiliary_class_routing.py
++++ b/agent/auxiliary_class_routing.py
+@@ -339,18 +339,23 @@ def class_routed_async(callback):
+             client, _ = aux._to_async_client(sync_client, runtime["model"])
+             client._managed_subscription_runtime = runtime
+             terminal = None
+-            try:
+-                async def create(request_kwargs):
+-                    return await aux._acreate_with_progress(
+-                        client, request_kwargs, task, force_stream=aux._provider_requires_stream(
+-                            runtime["provider"], runtime["base_url"]), provider=runtime["provider"])
+-                return aux._validate_llm_response(await aux._relay_async_completion(
+-                    client, kwargs, provider=runtime["provider"], api_mode=runtime["api_mode"], create=create), task)
+-            except Exception as exc:  # health: allow BLE001 -- classified once, then recovered or re-raised below
+-                terminal = _recover(runtime, sync_client, exc, attempted, failed)
+-            finally:
+-                aux._close_cached_client(client, close_async=True)
+-                aux._close_cached_client(sync_client, close_async=True)
++            # Adapter clients read on a to_thread worker that outlives a cancelled await: the scope then shuts
++            # the sockets down and that worker closes both clients, never this loop thread (as the sync twin).
++            with client_scope(sync_client, lambda _, pair=(client, sync_client): _close_pair(aux, *pair)):
++                try:
++                    async def create(request_kwargs):
++                        return await aux._acreate_with_progress(
++                            client, request_kwargs, task, force_stream=aux._provider_requires_stream(
++                                runtime["provider"], runtime["base_url"]), provider=runtime["provider"])
++                    return aux._validate_llm_response(await aux._relay_async_completion(
++                        client, kwargs, provider=runtime["provider"], api_mode=runtime["api_mode"], create=create), task)
++                except Exception as exc:  # health: allow BLE001 -- classified once, then recovered or re-raised below
++                    terminal = _recover(runtime, sync_client, exc, attempted, failed)
+             if terminal is not None:
+                 raise terminal
+     return wrapped
++
++
++def _close_pair(aux, client, sync_client) -> None:
++    aux._close_cached_client(client, close_async=True)
++    aux._close_cached_client(sync_client, close_async=True)
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 83b04ce94a..3098ce9ed4 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -36,7 +36,7 @@ from agent.error_classifier import (
+ from agent.errors import InvalidProviderResponseError
+ from agent.auxiliary_fallback_recovery import reapply_repairs
+ from agent.auxiliary_managed_local import _is_managed_local_endpoint
+-from agent.aux_provider_handoff import ProviderAttempt, note_abandoned as note_abandoned_provider_call
++from agent.aux_provider_handoff import ProviderAttempt, note_abandoned as note_abandoned_provider_call, run_in_thread
+ from agent.auxiliary_reasoning_floor import remember_reasoning_floor, with_reasoning_floor
+ from agent.auxiliary_profile_gates import (
+     PROFILE_REASONING_KEYS, contains_profile_reasoning_fields, profile_forwards_max_tokens,
+@@ -1630,14 +1630,13 @@ class _ChatShim:
+ 
+ 
+ class _AsyncCompletionsAdapter:
+-    """Async adapter: runs the sync adapter's ``create`` via asyncio.to_thread()."""
++    """Async adapter: the sync ``create`` on a worker that, if the await is cancelled, closes the client itself."""
+ 
+     def __init__(self, sync_adapter: Any):
+         self._sync = sync_adapter
+ 
+     async def create(self, **kwargs) -> Any:
+-        import asyncio
+-        return await asyncio.to_thread(self._sync.create, **kwargs)
++        return await run_in_thread(self._sync.create, **kwargs)
+ 
+ 
+ class _AsyncAuxiliaryClientBase:
+@@ -5628,7 +5627,7 @@ def _client_cache_key(
+     task_key = (task or "", _task_prefers_fast_model(task)) if provider == "auto" else ""
+     pool_hint = _pool_cache_hint(provider, main_runtime=main_runtime)
+     # Model MUST be in the key: concurrent calls to the same endpoint with different models would
+-    # share an entry, and the second builder's _store_cached_client would close the first's client.
++    # share an entry, and the second builder's _store_cached_client would replace the first's client.
+     model_key = model or runtime.get("model", "")
+     api_key_key = _runtime_cache_discriminator("api_key", api_key or "")
+     # Profile home leads the key: callers that omit api_key (pool / Nous auth.json paths) would
+@@ -5665,12 +5664,11 @@ def _current_event_loop() -> Any:
+ 
+ 
+ def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[str], *, bound_loop: Any = None) -> None:
++    """Install ``client`` under ``cache_key``. A replaced entry is dropped, never closed here: another caller may be
++    mid-request on it, and closing it released the fd under that caller's TLS read (``aux_provider_handoff``)."""
+     if isinstance(client, _AuxProbeClientStub):
+         return  # probe stubs must never be cached — the next hit would get a dud client
+     with _client_cache_lock:
+-        old_entry = _client_cache.get(cache_key)
+-        if old_entry is not None and old_entry[0] is not client:
+-            _close_cached_client(old_entry[0])
+         _client_cache[cache_key] = (client, default_model, bound_loop)
+ 
+ 
+diff --git a/agent/gemini_native_adapter.py b/agent/gemini_native_adapter.py
+index 115412f2f6..b0a99cf9c0 100644
+--- a/agent/gemini_native_adapter.py
++++ b/agent/gemini_native_adapter.py
+@@ -19,6 +19,7 @@ from typing import Any, Dict, Iterator, List, Optional
+ 
+ import httpx
+ 
++from agent.aux_provider_handoff import run_in_thread
+ from agent.bounded_response import read_streaming_error_body
+ from agent.gemini_long_decode import continuation_token, long_decode_hops, merge_hop_responses, merge_hop_usage, split_stream_continuation
+ from agent.retry_utils import parse_retry_after_seconds
+@@ -1034,11 +1035,12 @@ class AsyncGeminiNativeClient:
+     # GeminiNativeClient is itself the leaf (no OpenAI client beneath it), so we point at the sync_client
+     # directly.
+     async def _create_chat_completion(self, **kwargs: Any) -> Any:
+-        result = await asyncio.to_thread(self._sync.chat.completions.create, **kwargs)
++        # run_in_thread: a cancelled await leaves the client's close to the worker still reading its socket.
++        result = await run_in_thread(self._sync.chat.completions.create, **kwargs)
+         return self._async_stream(result) if kwargs.get("stream") else result
+ 
+     async def _async_stream(self, iterator: Iterator[_GeminiStreamChunk]) -> Any:
+-        while not (step := await asyncio.to_thread(self._sync._advance_stream_iterator, iterator))[0]:
++        while not (step := await run_in_thread(self._sync._advance_stream_iterator, iterator))[0]:
+             yield step[1]
+ 
+     async def close(self) -> None:
+diff --git a/tests/agent/test_aux_stranger_close_siblings.py b/tests/agent/test_aux_stranger_close_siblings.py
+new file mode 100644
+index 0000000000..4ed23ba3e2
+--- /dev/null
++++ b/tests/agent/test_aux_stranger_close_siblings.py
+@@ -0,0 +1,203 @@
++"""[daveey] Siblings of the abandoned-provider TLS fd close (test_aux_abandoned_provider_tls_fd.py).
++
++The hub incident (a TLS alert written into ``inbox.db``'s header) came from one thread closing a client
++whose socket another thread was still reading: the fd number went to a SQLite file and the reader's next
++``SSL_read`` took ``SQLit`` from it. Two more paths had the same shape:
++
++1. ``class_routed_async``: adapter clients (Anthropic, Codex, Bedrock) run the sync SDK call on an
++   ``asyncio.to_thread`` worker; a cancelled await leaves that worker reading while the ``finally`` closed
++   the per-call client from the loop thread.
++2. ``_store_cached_client`` (Nous 401 refresh): replacing a shared cache entry closed the old client
++   although another caller can be mid-request on it.
++"""
++from __future__ import annotations
++
++import asyncio
++import os
++import sqlite3
++import threading
++
++import httpx
++import pytest
++from openai import OpenAI
++
++from agent import auxiliary_class_routing as routing
++from agent import auxiliary_client as aux
++from tests.agent.test_aux_abandoned_provider_tls_fd import (  # stalling_stream: fixture, resolved by name below
++    SQLITE_MAGIC, _fd_is_open, stalling_stream,
++)
++
++
++@pytest.fixture
++def tls_stream(request):
++    """The stalling loopback TLS server of the sibling suite (by name: a same-named parameter would shadow it)."""
++    assert stalling_stream  # imported so pytest registers it in this module
++    return request.getfixturevalue("stalling_stream")
++
++
++def _stream_until_stalled(http: httpx.Client, url: str, seen: dict, reading: threading.Event) -> str:
++    """A streamed provider read: records the socket fd and its thread, then blocks on the stalled body."""
++    seen["thread"] = threading.current_thread()
++    try:
++        with http.stream("POST", url, content=b"{}") as response:
++            seen["fd"] = response.extensions["network_stream"].get_extra_info("socket").fileno()
++            for _chunk in response.iter_raw():
++                reading.set()
++        return "summary"
++    finally:
++        seen["returned"].set()
++
++
++def _header_after_fd_reuse(tmp_path, fd: int, tls_stream, returned: threading.Event) -> bytes:
++    """Open a SQLite database on ``fd`` if (and only if) it was released, let the reader wake, return the header."""
++    database = tmp_path / "inbox.db"
++    sqlite3.connect(database).executescript("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
++    db_fd = os.open(database, os.O_RDWR)
++    reused = not _fd_is_open(fd)
++    if reused:
++        os.dup2(db_fd, fd)  # the kernel's lowest-free-fd choice, made deterministic
++    try:
++        tls_stream.resume.set()  # data arrives: the reader's poll wakes and it reads the fd again
++        assert returned.wait(15), "the reader never returned"
++        with open(database, "rb") as fh:
++            return fh.read(32)
++    finally:
++        os.close(db_fd)
++        if reused:
++            os.close(fd)
++
++
++class _AdapterSyncClient:
++    """Stands in for ``AnthropicAuxiliaryClient``: OpenAI-shaped sync wrapper over a per-call httpx pool."""
++
++    api_key = "test"
++
++    def __init__(self, http: httpx.Client, url: str, seen: dict, reading: threading.Event) -> None:
++        self._client = http
++        self.base_url = url
++        self.closed_on: list[str] = []
++        create = lambda **_kwargs: _stream_until_stalled(http, url, seen, reading)
++        self.chat = aux._ChatShim(type("_Completions", (), {"create": staticmethod(create)})())
++
++    def close(self) -> None:
++        self.closed_on.append(threading.current_thread().name)
++        self._client.close()
++
++
++def test_cancelled_async_class_call_never_hands_the_to_thread_workers_tls_fd_to_sqlite(
++        tls_stream, tmp_path, monkeypatch, caplog):
++    caplog.set_level("INFO", logger="agent.aux_provider_handoff")
++    http = httpx.Client(verify=tls_stream.ssl_context, timeout=httpx.Timeout(20.0))
++    seen: dict = {"returned": threading.Event()}
++    reading = threading.Event()
++    sync_client = _AdapterSyncClient(http, tls_stream.url, seen, reading)
++
++    monkeypatch.setattr(routing, "_class_request", lambda *args: ("class:deep", "owner", {}, None, "class:deep"))
++    monkeypatch.setattr(routing, "_prepare", lambda *args: (
++        {"provider": "anthropic", "model": "deep", "api_mode": "anthropic_messages", "base_url": ""}, sync_client, {}))
++    # The real async wrapper and its to_thread adapter; only the relay/progress plumbing is reduced to the call.
++    monkeypatch.setattr(aux, "_to_async_client", lambda client, model, **_: (
++        aux.AsyncAnthropicAuxiliaryClient(client), model))
++
++    async def relay(client, kwargs, *, create, **_):
++        return await create(kwargs)
++
++    async def acreate(client, kwargs, task=None, **_):
++        return await client.chat.completions.create(**kwargs)
++
++    monkeypatch.setattr(aux, "_relay_async_completion", relay)
++    monkeypatch.setattr(aux, "_acreate_with_progress", acreate)
++
++    async def owner() -> bool:
++        call = asyncio.ensure_future(routing.class_routed_async(lambda *a, **k: None)(task="compression", messages=[]))
++        assert await asyncio.to_thread(reading.wait, 15), "the to_thread worker never started streaming"
++        call.cancel()  # a gateway turn / wait_for timeout cancelling the aux await
++        try:
++            await call
++        except asyncio.CancelledError:
++            return True
++        return False
++
++    loop = asyncio.new_event_loop()  # not asyncio.run: its executor shutdown would wait for the stalled worker
++    try:
++        assert loop.run_until_complete(owner())
++        header = _header_after_fd_reuse(tmp_path, seen["fd"], tls_stream, seen["returned"])
++    finally:
++        tls_stream.resume.set()
++        loop.run_until_complete(loop.shutdown_default_executor())
++        loop.close()
++    assert header[:16] == SQLITE_MAGIC, f"TLS bytes landed in the SQLite header: {header!r}"
++    # The loop thread only shut the socket down; the worker that read it closed the client.
++    assert sync_client.closed_on == [seen["thread"].name]
++    assert "tcp_shutdown=1" in caplog.text
++    assert http.is_closed
++
++
++def test_replacing_a_cached_client_never_closes_it_under_a_live_tls_read(tls_stream, tmp_path, monkeypatch):
++    monkeypatch.setattr(aux, "_client_cache", {})
++    http = httpx.Client(verify=tls_stream.ssl_context, timeout=httpx.Timeout(20.0))
++    stale = OpenAI(api_key="stale", base_url=tls_stream.url, http_client=http, max_retries=0)
++    key = ("home", "nous", False, "", "", "", (), False, "", "", "m", ())
++    aux._store_cached_client(key, stale, "m")
++    seen: dict = {"returned": threading.Event()}
++    reading = threading.Event()
++
++    def caller_b() -> None:
++        try:
++            _stream_until_stalled(http, tls_stream.url, seen, reading)
++        except httpx.HTTPError:
++            pass  # the server ends the stream without a terminating chunk
++
++    reader = threading.Thread(target=caller_b, name="aux-caller-b", daemon=True)
++    reader.start()  # another aux caller mid-request on the shared cached client
++    assert reading.wait(15), "the reader never started streaming"
++
++    fresh = object()
++    aux._store_cached_client(key, fresh, "m")  # the Nous 401 refresh replacing the entry
++    assert aux._client_cache[key][0] is fresh
++
++    header = _header_after_fd_reuse(tmp_path, seen["fd"], tls_stream, seen["returned"])
++    reader.join(15)
++    assert header[:16] == SQLITE_MAGIC, f"TLS bytes landed in the SQLite header: {header!r}"
++    # Dropped, not closed (like the FIFO overflow and _evict_cached_clients): its last user retires it.
++    assert not http.is_closed
++    stale.close()
++
++
++def test_run_in_thread_returns_the_result_and_closes_on_the_caller():
++    from agent import aux_provider_handoff as handoff
++    closed = []
++
++    async def call() -> int:
++        with handoff.client_scope("client", closed.append):
++            return await handoff.run_in_thread(lambda x: x + 1, 41)
++
++    assert asyncio.run(call()) == 42
++    assert closed == ["client"]
++
++
++def test_run_in_thread_cancelled_before_the_worker_starts_neither_runs_nor_defers():
++    from concurrent.futures import ThreadPoolExecutor
++
++    from agent import aux_provider_handoff as handoff
++    closed, ran = [], []
++    gate = threading.Event()
++
++    async def call() -> None:
++        loop = asyncio.get_running_loop()
++        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
++        blocker = loop.run_in_executor(None, gate.wait, 15)  # the only worker is busy: ours stays queued
++        with handoff.client_scope("client", closed.append):
++            pending = asyncio.ensure_future(handoff.run_in_thread(ran.append, "ran"))
++            await asyncio.sleep(0)
++            pending.cancel()
++            try:
++                await pending
++            except asyncio.CancelledError:
++                pass
++        gate.set()
++        await blocker
++
++    asyncio.run(call())
++    assert closed == ["client"]  # nothing abandoned: closed at once on the caller
++    assert ran == []
+-- 
+2.43.0
+

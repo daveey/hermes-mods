@@ -1,0 +1,294 @@
+From 2aa64ef15e709b6d7ecaf15f3ca678c28456ce7a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:13:53 +0000
+Subject: [PATCH] [daveey] kanban chat links: release a compressed chat's
+ owner-written ancestor row; owner skips cron_ chats; task_id index
+
+Follow-up to PR #2095 (review comment 5889574415, three non-blocking findings).
+
+1. Compressed chat during the outage. The owner publishes a chat's link from the card's `platform='hub'`
+   subscription, which names the session that placed the card (S0). A chat that compressed before its gateway's
+   accept_binding (Board sync down) has its ledger resolve the tip S1, so the card had two unreleased rows: S0 from
+   the owner, S1 from the chat gateway. session_tasks deduped them, but links_diff listed S0 only_in_replica until
+   the card closed. The chat gateway's reconcile now releases an owner-written row on an open card whose chat
+   session is a compression ancestor of a session it already links, unreleased, to the same card and chat profile
+   (`_compressed_away`, walking `_CHAIN_STEP_SQL` in that profile's state.db; an unreadable state.db releases
+   nothing). The owner never writes S0 back: a released row is still a row (insert-only rule from #2095).
+2. cron_ sessions. `_owner_hub_links` filtered only headless worker hashes; it now uses `machine_sessions`, the
+   verdict the chat gateway releases by, so a `cron_` chat's sub no longer gets a row that gateway would release on
+   its next pass. A foreign ref is never looked up locally, so no state.db read is added.
+3. Index. `task_chat_links(task_id)` index in SYNC_SCHEMA_SQL (board files, link-only files and replicas all run it
+   through `install_or_remove`; IF NOT EXISTS on first open is the migration). An index is no column, so it does not
+   touch `SchemaAhead`/wire versioning. On worker-4's replica copy (17k links) the owner's 265-id IN lookup went from
+   2.81 ms (SCAN) to 0.38 ms (SEARCH USING INDEX); the other task_chat_links plans are unchanged except the
+   released-sibling EXISTS of `_read_replica_links`, which now searches by task_id.
+
+Tests (tests/hermes_cli/test_kanban_chat_links_owner_hub_subs.py), each failing on main:
+- test_a_chat_compressed_during_the_outage_keeps_one_unreleased_row_and_a_clean_diff: two gateways on the fake Board,
+  sync given up the real way, chat compresses S0->S1 before recovery; after reconcile exactly one unreleased row (S1),
+  S0 released, links_diff clean, the owner adds nothing.
+- test_owner_skips_a_cron_session_the_chat_gateway_would_release.
+- test_task_chat_links_has_a_task_id_index_in_board_files_and_replicas_and_migrates_old_files (query plan, migration
+  of a file without the index, schema_ahead still empty).
+Guard: test_an_uncompressed_second_chat_on_the_same_card_keeps_its_owner_row (passes before and after).
+168 related test files (chat links, sync, schema guard, board delivery): 3712 passed, 1 failed (a bulk-provenance
+fixture passing `want` entries without keys; `_compressed_away` now reads them with .get), that file then green.
+
+Card: t_01a1d480e6d8fd12
+---
+ hermes_cli/kanban_chat_links.py               |  68 ++++++++++-
+ hermes_cli/kanban_db_sync.py                  |   5 +
+ .../test_kanban_chat_links_owner_hub_subs.py  | 114 ++++++++++++++++++
+ 3 files changed, 183 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index b66960664b..c6766d6523 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -171,7 +171,8 @@ def _owner_written_releases(board: str, gateway: str, want: dict[str, dict[str,
+     stayed an ``unknown`` obligation in ``replica_cards`` forever (4 hub cards on macbook chat
+     20261027_134353_5ab65c, 2026-11-01). The chat's gateway releases them by writing the same uid (the same row on
+     the Board) with ``released = 1``, as it already does for a ledger ``origin`` row. Open cards and missing card
+-    rows are left alone; links ``want`` already carries keep the ledger's answer. A card reopened after the release
++    rows are left alone, except a row whose chat session compressed into one this gateway links to the same card
++    (``_compressed_away``); links ``want`` already carries keep the ledger's answer. A card reopened after the release
+     stays released for that chat: the uid is one row, so the owner's original intent is not recoverable here.
+ 
+     A link to a machine session of this gateway (``is_machine_session``) is released whatever the card's status:
+@@ -204,17 +205,71 @@ def _owner_written_releases(board: str, gateway: str, want: dict[str, dict[str,
+     # lookup was 60% of a 60 s profile of the hub's sync thread (t_01a1d2cc49634a78). [daveey]
+     machine = _machine_by_profile(gateway, ((r["chat_profile"], r["chat_session"]) for r in rows
+                                             if r["status"] not in TERMINAL_STATUSES))
++    superseded = _compressed_away(rows, want, gateway)
+     for r in rows:
+         # [daveey] A worker's ``local-<sha256>`` is released like any machine session, not skipped as a shepherd:
+         # another gateway proves a foreign hash chat by an unreleased ``created`` link (``proven_foreign_chats``),
+         # and only this gateway can say the hash is a worker (review t_01a1cf9aab0349a9).
+         if r.pop("status") not in TERMINAL_STATUSES and str(r["chat_session"] or "") not in machine[
+-                (type(r["chat_profile"]), r["chat_profile"])]:
++                (type(r["chat_profile"]), r["chat_profile"])] and r["uid"] not in superseded:
+             continue
+         out[r["uid"]] = {**r, "released": 1, "created_at": int(r["created_at"] or time.time())}
+     return out
+ 
+ 
++def _compressed_away(rows: list[dict[str, Any]], want: dict[str, dict[str, Any]], gateway: str) -> set[str]:
++    """Uids of owner-written rows on OPEN cards whose chat session is a compression ancestor of a session this
++    gateway already links, unreleased, to the same card and chat profile. [daveey]
++
++    The owner writes its link from the card's ``platform='hub'`` subscription (``_owner_hub_links``), which names
++    the session that placed the card. A chat that compressed before its gateway's ``accept_binding`` (its Board
++    sync down) has its ledger resolve the tip instead, so the card had two unreleased rows, the ancestor's from the
++    owner and the tip's from here: ``session_tasks`` deduped them but ``links_diff`` listed the ancestor
++    ``only_in_replica`` until the card closed (review of PR #2095). The descendant's row is the chat's link; the
++    ancestor's is released, as a closed card's is. Only this gateway's ``state.db`` (the chat profile's home) knows
++    the lineage; an unreadable one releases nothing this pass."""
++    from hermes_cli.kanban_origin import _ro
++    from hermes_cli.kanban_session_provenance import _local_homes
++    from hermes_state_compression import _CHAIN_CAP, _CHAIN_STEP_SQL
++    linked: dict[tuple[str, Any], set[str]] = {}
++    for link in want.values():
++        if link.get("task_id") and not link.get("released") and link.get("chat_gateway") == gateway:
++            linked.setdefault((link["task_id"], link.get("chat_profile")), set()).add(str(link.get("chat_session")))
++    candidates: dict[Any, list[dict[str, Any]]] = {}
++    for r in rows:
++        sessions = linked.get((r["task_id"], r["chat_profile"]))
++        if r["status"] not in TERMINAL_STATUSES and sessions and str(r["chat_session"]) not in sessions:
++            candidates.setdefault(r["chat_profile"], []).append(r)
++    out: set[str] = set()
++    for profile, group in candidates.items():
++        for home in _local_homes(profile):
++            path = home / "state.db"
++            if not path.exists():
++                continue
++            try:
++                db = _ro(path)
++            except sqlite3.Error as exc:
++                _log.info("kanban chat links: %s unreadable for compression lineage (%s)", path, exc)
++                continue
++            try:
++                for r in group:
++                    sid, seen = str(r["chat_session"]), {str(r["chat_session"])}
++                    for _ in range(_CHAIN_CAP):
++                        step = db.execute(_CHAIN_STEP_SQL, (sid,)).fetchone()
++                        if step is None or step[0] in seen:
++                            break
++                        sid = str(step[0])
++                        seen.add(sid)
++                        if sid in linked[(r["task_id"], r["chat_profile"])]:
++                            out.add(r["uid"])
++                            break
++            except sqlite3.Error as exc:
++                _log.info("kanban chat links: compression lineage unreadable in %s (%s)", path, exc)
++            finally:
++                db.close()
++    return out
++
++
+ def _owner_hub_links(conn: sqlite3.Connection, board: str, gateway: str) -> list[dict[str, Any]]:
+     """Links this gateway (the card's owner) publishes for chats on OTHER gateways: one per counted ``platform='hub'``
+     subscription ``<gw>/<profile>/<session>`` on an open card it owns, the same subscriptions the hermes-hub collector
+@@ -231,6 +286,7 @@ def _owner_hub_links(conn: sqlite3.Connection, board: str, gateway: str) -> list
+     exists in this file or the replica, released included, so a release the chat's gateway already made is never
+     reopened; an unreadable replica writes nothing this pass."""
+     from hermes_cli import kanban_sync_client as ksc
++    from hermes_cli.kanban_db_notify import machine_sessions
+     from hermes_cli.kanban_lockguard import connect
+     from hermes_cli.kanban_origin import OriginError, parse_origin
+     from hermes_cli.kanban_origin_intent_carry import EVENT_KIND
+@@ -261,8 +317,12 @@ def _owner_hub_links(conn: sqlite3.Connection, board: str, gateway: str) -> list
+     groups: dict[tuple[str, str], list[str]] = {}
+     for _tid, gw, profile, session in wanted:
+         groups.setdefault((gw, profile), []).append(session)
+-    headless = {(gw, profile): _worker_shepherds(sessions, gw, profile) for (gw, profile), sessions in groups.items()}
+-    wanted = {k: v for k, v in wanted.items() if k[3] not in headless[(k[1], k[2])]}
++    # [daveey] The chat gateway's own verdict (``machine_sessions``, as its ``_owner_written_releases`` releases by):
++    # worker hashes AND ``cron_`` sessions. With only the headless filter a cron chat's sub got a row that gateway
++    # released on its next pass. A foreign ref is never looked up locally, so this reads no state.db.
++    machine = {(gw, profile): machine_sessions(gw, sessions, local_gateway=gateway, profile=profile)
++               for (gw, profile), sessions in groups.items()}
++    wanted = {k: v for k, v in wanted.items() if k[3] not in machine[(k[1], k[2])]}
+     task_ids = sorted({k[0] for k in wanted})
+     have: set[tuple] = set()
+     bound: set[tuple] = set()
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index a3fd618301..675ebdbbfd 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -228,6 +228,11 @@ CREATE TABLE IF NOT EXISTS task_chat_links (
+     created_at   INTEGER NOT NULL
+ );
+ CREATE INDEX IF NOT EXISTS idx_task_chat_links_chat ON task_chat_links(chat_gateway, chat_session);
++-- [daveey] Per-card lookups (the owner's ``_owner_hub_links``, ``proven_foreign_chats``, the released-sibling
++-- EXISTS of ``_read_replica_links``) scanned every link without it. An index is no column: ``SchemaAhead`` and the
++-- wire format only compare columns, so an older core syncs a file that has it. A process's first open of each board
++-- file and replica runs this script (``install_or_remove``), so it is also the migration of existing files.
++CREATE INDEX IF NOT EXISTS idx_task_chat_links_task ON task_chat_links(task_id);
+ CREATE TABLE IF NOT EXISTS kanban_sync_state (
+     board_id        TEXT PRIMARY KEY,
+     cursor          INTEGER NOT NULL DEFAULT 0,
+diff --git a/tests/hermes_cli/test_kanban_chat_links_owner_hub_subs.py b/tests/hermes_cli/test_kanban_chat_links_owner_hub_subs.py
+index e33432c728..3fb63049c9 100644
+--- a/tests/hermes_cli/test_kanban_chat_links_owner_hub_subs.py
++++ b/tests/hermes_cli/test_kanban_chat_links_owner_hub_subs.py
+@@ -261,3 +261,117 @@ def test_owner_never_reopens_or_doubles_a_link_the_chat_gateway_already_wrote(gw
+     rep.write_bytes(b"not a database")
+     links.reconcile(conn, BOARD, OWNER)
+     assert _owner_links(conn, tid) == []
++
++
++# --- PR #2095 review follow-ups (t_01a1d480e6d8fd12) -------------------------------------------------------------
++
++TIP = "20261027_081500_c0ffee"
++
++
++def _compress(gws: Gateways, old: str, new: str) -> None:
++    """The chat compresses on its own gateway: ``old`` ends ``compression`` and ``new`` continues it."""
++    from hermes_state import SessionDB
++    home = gws.at(ME)
++    state = SessionDB(db_path=home / "state.db")
++    try:
++        if state.get_session(old) is None:
++            state.create_session(old, "cli")
++        state.end_session(old, "compression")
++        state.create_session(new, "cli", parent_session_id=old)
++    finally:
++        state.close()
++
++
++def test_a_chat_compressed_during_the_outage_keeps_one_unreleased_row_and_a_clean_diff(gws):
++    """The hub sub names the session that placed the card (S0); the chat compressed before its gateway accepted the
++    binding, so that gateway's ledger resolves the tip (S1). Before the fix both rows stayed unreleased and
++    links_diff listed S0 only_in_replica until the card closed."""
++    _give_up(gws)
++    tid = _placed(gws)
++    _compress(gws, CHAT, TIP)
++    gws.ledger[0]["session"] = TIP  # the recovered gateway's ledger resolves the chat's tip
++    gws.round(OWNER)  # the owner publishes S0's link from its hub sub
++    gws.pull_replica(ME)
++    runstate.clear()
++    gws.round(ME)  # the chat gateway writes S1's link and releases the owner's S0 row
++    gws.round(OWNER)
++    gws.round(ME)
++    rows = gws.replica_rows(ME, tid)
++    assert [r for r in rows if r[5] == 0] == [
++        (links.link_uid(tid, ME, "default", TIP, "created"), ME, "default", TIP, "created", 0)]
++    assert (links.link_uid(tid, ME, "default", CHAT, "created"), ME, "default", CHAT, "created", 1) in rows
++    gws.at(ME)
++    diff = links.links_diff(ME)
++    assert diff["clean"], diff
++    assert [t["id"] for t in ksa.session_tasks([TIP])] == [tid]
++    # The owner never writes S0's link back: a released row for that card and chat is still a row.
++    gws.at(OWNER)
++    assert links.reconcile(gws.conns[OWNER], BOARD, OWNER)["added"] == 0
++
++
++def test_an_uncompressed_second_chat_on_the_same_card_keeps_its_owner_row(gws):
++    """Only a compression ancestor is released: another chat's (or a sibling branch's) owner-written link stays."""
++    _give_up(gws)
++    tid = _placed(gws)
++    other = "20261027_090000_beef00"
++    from hermes_state import SessionDB
++    state = SessionDB(db_path=gws.at(ME) / "state.db")
++    try:
++        state.create_session(other, "cli")
++    finally:
++        state.close()
++    gws.at(OWNER)
++    _sub(gws.conns[OWNER], tid, f"{ME}/default/{other}", "shepherd")
++    gws.round(OWNER)
++    gws.pull_replica(ME)
++    runstate.clear()
++    gws.round(ME)
++    gws.round(ME)
++    unreleased = sorted(r[3] for r in gws.replica_rows(ME, tid) if r[5] == 0)
++    assert unreleased == sorted([CHAT, other])
++
++
++def test_owner_skips_a_cron_session_the_chat_gateway_would_release(gws):
++    """The owner filtered worker hashes but not ``cron_`` sessions, so a cron chat's hub sub got a row the chat
++    gateway (``machine_sessions``) released on its next pass."""
++    from hermes_cli.kanban_db_notify import machine_sessions
++    cron = "cron_3f2a1b_20261113_101500"
++    assert machine_sessions("mini", [cron], local_gateway="mini") == {cron}  # the chat gateway's own verdict
++    gws.at(OWNER)
++    conn = gws.conns[OWNER]
++    tid = kb.create_task(conn, title="watched by a cron chat", assignee="default")
++    _sub(conn, tid, f"mini/default/{cron}", "shepherd")
++    _sub(conn, tid, "mini/default/chat-human", "shepherd")
++    links.reconcile(conn, BOARD, OWNER)
++    assert _owner_links(conn, tid) == [("mini", "default", "chat-human", "shepherd", 0)]
++
++
++def _plan_detail(conn, sql, args):
++    return " ".join(str(r[-1]) for r in conn.execute("EXPLAIN QUERY PLAN " + sql, args))
++
++
++def test_task_chat_links_has_a_task_id_index_in_board_files_and_replicas_and_migrates_old_files(gws, tmp_path):
++    owner_lookup = ("SELECT task_id, chat_gateway, COALESCE(chat_profile, 'default'), chat_session "
++                    "FROM task_chat_links WHERE task_id IN (?, ?)")
++    gws.at(OWNER)
++    board = gws.conns[OWNER]
++    replica = ksc.open_shadow(BOARD, OWNER)
++    try:
++        for conn in (board, replica):
++            assert "USING INDEX idx_task_chat_links_task" in _plan_detail(conn, owner_lookup, ("a", "b"))
++    finally:
++        replica.close()
++    # A board file synced by a core that predates the index gets it on the next process's first open.
++    path = gws.homes[OWNER] / "kanban.db"
++    with kbc.write_txn(board):
++        board.execute("DROP INDEX idx_task_chat_links_task")
++    kbc._INITIALIZED_PATHS.clear()
++    reopened = kbc.connect(path)
++    try:
++        names = {r[0] for r in reopened.execute(
++            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'task_chat_links'")}
++        assert "idx_task_chat_links_task" in names
++        # An index is not a column: the schema guard still finds nothing this core does not declare.
++        assert not ksc.schema_ahead(reopened)
++    finally:
++        reopened.close()
+-- 
+2.43.0
+

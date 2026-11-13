@@ -1,0 +1,267 @@
+From e5505a6128dea142a965afdfdee3163af93a745e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:10:35 +0000
+Subject: [PATCH] [daveey] kanban GC: optional sub-day
+ kanban.worktree_retention_hours
+
+hermes-worker-2 keeps 110-165 GiB of terminal scratch trees under
+kanban.worktree_retention_days: 1, because the days key accepts whole
+days only and the pool runs ~250-300 card runs/day at ~0.4 GiB each.
+The pool acceptance (t_01a1c82e4f774d5f) is < 15 GiB.
+
+Add an optional kanban.worktree_retention_hours (a non-negative number).
+When set, retention_days() returns hours / 24 and it takes precedence
+over worktree_retention_days; when unset (or null) behaviour is exactly
+as before, including the int return. An invalid hours value (negative,
+bool, string, NaN/inf, list/map) disables age-based GC with the same
+warning as an invalid days key; it never falls back to days. 0 disables.
+An explicit `kanban gc --worktree-retention-days N` still wins.
+
+Only the window changes. Every guard is untouched: terminal-owner
+recheck, owner_unverified / eviction custody fail-closed, live
+owner-tagged job protection, archive-before-remove. The callers
+(gc_task_scratch, gc_custody, gc_task_worktrees, _sweep_repo) already
+use the value only as `days * 86400` and `days <= 0`, so their
+annotations widen from int to float.
+
+Reverse: remove the hours key, which falls back to days.
+
+Proof:
+- tests/hermes_cli/test_kanban_gc_retention_hours.py: 21 tests
+  (precedence, null = unset, zero, 9 invalid values, a 3 h cut-off that
+  archives a 4 h-old clone tree and keeps a 2 h-old one, the pending
+  eligible_at log, days-only cut-off unchanged, invalid hours keeps a
+  10-day-old tree, explicit CLI days wins). RED on base: 16 failed /
+  5 passed (the 5 are the unchanged-behaviour controls). GREEN: 21/21.
+- Every test file importing the GC/custody module or retention_days:
+  20 files, 442 passed.
+- scripts/check --base origin/main: 19 checks ok.
+---
+ hermes_cli/config_defaults.py                 |   2 +-
+ hermes_cli/kanban_worktree_gc.py              |  31 +++--
+ .../test_kanban_gc_retention_hours.py         | 114 ++++++++++++++++++
+ 3 files changed, 139 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_gc_retention_hours.py
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 964071df03..3262ef4a43 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1893,7 +1893,7 @@ DEFAULT_CONFIG = {
+         "recovery_card_assignee": "default",  # assignee of the card an automatic recovery files [daveey]
+         # Opt-in per-profile broker argv before gh (empty = ordinary login); never include tokens.
+         "pr_acceptance": {"gh_command_prefix": []},
+-        # Terminal worktrees: archive recovery refs before reaping; 0 disables age-based archival/sweeps.
++        # Terminal worktrees: archive before reaping; 0 disables age GC; worktree_retention_hours wins if set.
+         "worktree_retention_days": 7,
+         # Auto-subscribe the originating gateway/TUI session to completion + block events when
+         # kanban_create is called from a session with a persistent delivery channel. Disable for
+diff --git a/hermes_cli/kanban_worktree_gc.py b/hermes_cli/kanban_worktree_gc.py
+index 1d514f849d..76cca03b29 100644
+--- a/hermes_cli/kanban_worktree_gc.py
++++ b/hermes_cli/kanban_worktree_gc.py
+@@ -10,6 +10,7 @@ import contextlib
+ import hashlib
+ import json
+ import logging
++import math
+ import os
+ import re
+ import sqlite3
+@@ -24,10 +25,25 @@ from hermes_cli.kanban_workspace_jobs import defer_owned_job_cleanup
+ log = logging.getLogger(__name__)
+ 
+ 
+-def retention_days() -> int:
++def retention_days() -> float:
++    """Age-based GC window in days; 0 disables it.
++
++    ``kanban.worktree_retention_hours`` (a non-negative number), when set,
++    takes precedence over the whole-day ``kanban.worktree_retention_days`` and
++    is returned as a fraction of a day. An invalid value of the key in effect
++    disables age-based GC and logs a warning; it never falls back to the other
++    key. [daveey]
++    """
+     from hermes_cli.config import load_config
+     try:
+-        value = load_config().get("kanban", {}).get("worktree_retention_days", 7)
++        kanban = load_config().get("kanban", {})
++        hours = kanban.get("worktree_retention_hours")
++        if hours is not None:
++            if (isinstance(hours, bool) or not isinstance(hours, (int, float))
++                    or not math.isfinite(hours) or hours < 0):
++                raise ValueError("invalid worktree_retention_hours")
++            return hours / 24
++        value = kanban.get("worktree_retention_days", 7)
+         if isinstance(value, bool) or int(value) != value or value < 0:
+             raise ValueError("invalid worktree retention")
+         return int(value)
+@@ -36,7 +52,7 @@ def retention_days() -> int:
+         return 0
+ 
+ 
+-def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: int | None = None) -> int:
++def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: float | None = None) -> int:
+     """Retry terminal scratch cleanup, failing closed on any unreadable board.
+ 
+     Only task records establish ownership; never infer it from directory names.
+@@ -47,7 +63,8 @@ def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: int | None = N
+ 
+     A tree that is kept only because it holds standalone git clones is archived
+     and then removed once its card finished more than *older_than_days* ago
+-    (default ``kanban.worktree_retention_days``; 0 disables). [daveey]
++    (default ``retention_days()``: ``kanban.worktree_retention_hours`` / 24 when
++    set, else ``kanban.worktree_retention_days``; 0 disables). [daveey]
+     """
+     import shutil
+ 
+@@ -210,7 +227,7 @@ def _report_unowned_scratch(root: Path, known_paths: set[Path]) -> None:
+                         "no deletion deadline", path)
+ 
+ 
+-def _report_scratch_retention(row: sqlite3.Row, path: Path, days: int) -> None:
++def _report_scratch_retention(row: sqlite3.Row, path: Path, days: float) -> None:
+     # Logs, not task events: observing retention must never extend its age.
+     since = row["completed_at"] or row["last_event"] or row["created_at"]
+     reason = "retention_disabled" if days <= 0 else "retention_pending"
+@@ -220,7 +237,7 @@ def _report_scratch_retention(row: sqlite3.Row, path: Path, days: int) -> None:
+                 reason, path, row["id"], eligible_at)
+ 
+ 
+-def _finished_before(row: sqlite3.Row, days: int) -> bool:
++def _finished_before(row: sqlite3.Row, days: float) -> bool:
+     if days <= 0:
+         return False
+     since = row["completed_at"] or row["last_event"] or row["created_at"]
+@@ -283,7 +300,7 @@ def _archive_and_remove_scratch(conn: sqlite3.Connection, task_id: str, path: Pa
+         return 0
+ 
+ 
+-def gc_task_worktrees(conn: sqlite3.Connection, *, older_than_days: int = 7,
++def gc_task_worktrees(conn: sqlite3.Connection, *, older_than_days: float = 7,
+                      repo_root: str | None = None) -> int:
+     """Reap terminal rows only, retaining active children and cross-board sharers.
+ 
+diff --git a/tests/hermes_cli/test_kanban_gc_retention_hours.py b/tests/hermes_cli/test_kanban_gc_retention_hours.py
+new file mode 100644
+index 0000000000..f289c313a4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_gc_retention_hours.py
+@@ -0,0 +1,114 @@
++"""``kanban.worktree_retention_hours``: an optional sub-day GC window that
++overrides ``worktree_retention_days`` when set and leaves it alone when unset.
++An invalid hours value disables age-based GC (it never falls back to days)."""
++import argparse
++import logging
++import math
++import time
++
++import pytest
++
++from hermes_cli import kanban_ops
++from hermes_cli import kanban_worktree_gc as gc
++from tests.hermes_cli import test_kanban_scratch_gc_archive as helpers
++
++board = helpers.board
++remote = helpers.remote
++
++
++def _config(text: str) -> None:
++    from hermes_constants import get_hermes_home
++    path = get_hermes_home() / "config.yaml"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(text)
++
++
++def _gc_from_config():
++    # worktree_retention_days=None: the window comes from retention_days(), as on the hourly worker pass.
++    return kanban_ops._cmd_gc(argparse.Namespace(
++        event_retention_days=0, log_retention_days=0, worktree_retention_days=None,
++    ))
++
++
++@pytest.mark.parametrize(("text", "expected"), [
++    pytest.param("kanban:\n  worktree_retention_days: 2\n  worktree_retention_hours: 3\n", 3 / 24,
++                 id="hours-override-days"),
++    pytest.param("kanban:\n  worktree_retention_days: 0\n  worktree_retention_hours: 6\n", 6 / 24,
++                 id="hours-override-disabled-days"),
++    pytest.param("kanban:\n  worktree_retention_days: 2\n  worktree_retention_hours: 1.5\n", 1.5 / 24,
++                 id="fractional-hours"),
++    pytest.param("kanban:\n  worktree_retention_days: 2\n  worktree_retention_hours: 0\n", 0,
++                 id="zero-hours-disables"),
++    pytest.param("kanban:\n  worktree_retention_days: 2\n", 2, id="unset-keeps-days"),
++    pytest.param("kanban:\n  worktree_retention_days: 2\n  worktree_retention_hours:\n", 2,
++                 id="null-is-unset"),
++])
++def test_hours_precedence(board, text, expected):
++    _config(text)
++    assert gc.retention_days() == expected
++
++
++def test_unset_hours_keeps_days_type_exactly(board):
++    _config("kanban:\n  worktree_retention_days: 1\n")
++    value = gc.retention_days()
++    assert value == 1 and type(value) is int
++
++
++@pytest.mark.parametrize("raw", ["-1", "-0.5", "'3'", "true", "false", ".nan", ".inf", "[3]", "{h: 3}"])
++def test_invalid_hours_disables_and_warns(board, caplog, raw):
++    # A valid days key must not mask a bad hours key: the operator asked for hours.
++    _config(f"kanban:\n  worktree_retention_days: 2\n  worktree_retention_hours: {raw}\n")
++    caplog.set_level(logging.WARNING, logger=gc.log.name)
++    assert gc.retention_days() == 0
++    assert "age-based GC disabled" in caplog.text
++
++
++def test_hours_cutoff_archives_old_tree_and_keeps_young_one(board, remote):
++    _config("kanban:\n  worktree_retention_days: 7\n  worktree_retention_hours: 3\n")
++    now = int(time.time())
++    old_tid, old_path = helpers._task(remote=remote, completed_at=now - 4 * 3600)
++    young_tid, young_path = helpers._task(remote=remote, completed_at=now - 2 * 3600)
++    assert _gc_from_config() == 0
++    # Past 3 h: archived first, then removed (the 7-day key alone would have kept it).
++    assert not old_path.exists()
++    assert (helpers._archive(old_tid) / "repo" / "meta.json").is_file()
++    assert any(kind == "workspace_archived" for kind, _ in helpers._events(old_tid))
++    # Inside 3 h: untouched.
++    assert (young_path / "repo" / ".git").is_dir()
++    assert not helpers._archive(young_tid).exists()
++
++
++def test_hours_cutoff_reports_pending_deadline(board, remote, caplog):
++    _config("kanban:\n  worktree_retention_hours: 3\n")
++    finished = int(time.time()) - 3600
++    _, path = helpers._task(remote=remote, completed_at=finished)
++    caplog.set_level(logging.WARNING)
++    assert _gc_from_config() == 0
++    assert path.exists()
++    line = next(r for r in caplog.text.splitlines() if f"path={path}" in r and "retention_pending" in r)
++    eligible = float(line.split("eligible_at=")[1].split(";")[0])
++    assert math.isclose(eligible, finished + 3 * 3600)
++
++
++def test_unset_hours_keeps_day_cutoff(board, remote):
++    _config("kanban:\n  worktree_retention_days: 1\n")
++    tid, path = helpers._task(remote=remote, completed_at=int(time.time()) - 4 * 3600)
++    assert _gc_from_config() == 0
++    assert (path / "repo" / ".git").is_dir()
++    assert not helpers._archive(tid).exists()
++
++
++def test_invalid_hours_keeps_everything(board, remote):
++    _config("kanban:\n  worktree_retention_days: 1\n  worktree_retention_hours: -3\n")
++    tid, path = helpers._task(remote=remote)  # finished 10 days ago: due under the days key
++    assert _gc_from_config() == 0
++    assert (path / "repo" / ".git").is_dir()
++    assert not helpers._archive(tid).exists()
++
++
++def test_explicit_cli_days_still_wins(board, remote):
++    _config("kanban:\n  worktree_retention_hours: 3\n")
++    tid, path = helpers._task(remote=remote, completed_at=int(time.time()) - 4 * 3600)
++    assert helpers._gc(days=1) == 0
++    assert (path / "repo" / ".git").is_dir()
++    assert not helpers._archive(tid).exists()
+-- 
+2.43.0
+

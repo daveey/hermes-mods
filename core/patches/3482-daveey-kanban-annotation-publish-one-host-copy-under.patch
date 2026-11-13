@@ -1,0 +1,950 @@
+From fbdd9098843bde4e15055befab0780b4798340ea Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:05:04 +0000
+Subject: [PATCH] [daveey] kanban annotation: publish one host copy under its
+ full inputs; other processes adopt it
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Design t_01a1d45d75851804 §2c (review item R9), card t_01a1d471746deeb8. On hermes-hub every web-server
+process and the gateway computed the same session-list annotation for the same scope:
+`_refresh_annotation_locked` was 13.3% of a steady serve's samples, 10.8% of the gateway's and 12.2% of a
+fresh serve's.
+
+- Publish: a refresh takes its inputs before it reads (pinned, so the read keys on exactly them) and writes
+  `(scope, fingerprint, read_at, parts)` to `<home>/cache/kanban-annotation/<scope>.host.json` when the read
+  answered exactly those inputs (counts cached under that fingerprint and revalidatable). `read_at` is when
+  the counts were really read.
+- Fingerprint: scope; the boards', hub replica's and sync shadows' content keys (the inputs
+  `unchanged_inputs` compares), made portable (a stat key drops its process-local connection; an unreadable
+  board or a connection-keyed hub signature means no fingerprint) and required `revalidatable`; the core sha;
+  each done check's and waiting source's code identity (core, or its plugin package's file stats when this
+  process first saw them); and each waiting source's declared inputs.
+- `register_waiting_source(name, fn, inputs=None)`: a source may declare a JSON key that moves whenever it
+  could answer differently (e.g. the chat-closeout ledger's revision). When any source declares none, the
+  adopter takes the copy's counts but re-runs every waiting source itself, so a source the fingerprint can't
+  see is never served from another process.
+- Adopt: cold and warm polls that would refresh adopt the copy only on an exact fingerprint and read age
+  < `_COUNTS_MAX_AGE_S` (30 s), dated by the copy's own read. Otherwise refresh as before and publish.
+- Holder: lease `kanban-annotation` (host_loop_lease); one web-server process per home refreshes every scope
+  it can reproduce that any process polled (`<scope>.demand`) in the last 60 s, when the copy is another
+  input's or 20 s old. Started next to the annotation prewarm (role serve/dashboard).
+- Kill switch `HERMES_ANNOTATION_HOST_COPY=0`.
+- The disk copy's encoding now keeps lists and nested dicts (execution evidence), so a decoded copy equals
+  the read exactly; older copies still decode.
+- `_read_annotation_parts` moves to kanban_annotation_host (kanban_session_activity is at its line cap); the
+  name stays bound in kanban_session_activity, so monkeypatches still apply.
+
+Tests (tests/hermes_cli/test_kanban_annotation_host.py, 13): adopt on exact fingerprint (no recompute, dated
+by the copy); adopted rows == a local refresh (waiting source + done check); declared waiting-source change
+defeats adopt; undeclared source re-run by the adopter; stale (>30 s) copy ignored; core sha change and plugin
+code change defeat adopt; board write defeats adopt; kill switch; unportable inputs; nested evidence round
+trip; holder refreshes a demanded scope once per change.
+RED: on the base the new test file fails (module missing). GREEN: the 120 test files importing
+kanban_session_activity / kanban_annotation*, 2124 passed.
+
+Follow-up: chat-closeout declares its waiting-source inputs (hermes-mods) so its part is adopted too.
+---
+ hermes_cli/kanban_annotation_disk.py          |  85 +++-
+ hermes_cli/kanban_annotation_host.py          | 398 ++++++++++++++++++
+ hermes_cli/kanban_session_activity.py         |  64 ++-
+ hermes_cli/web_server_app.py                  |   8 +
+ .../hermes_cli/test_kanban_annotation_host.py | 212 ++++++++++
+ 5 files changed, 729 insertions(+), 38 deletions(-)
+ create mode 100644 hermes_cli/kanban_annotation_host.py
+ create mode 100644 tests/hermes_cli/test_kanban_annotation_host.py
+
+diff --git a/hermes_cli/kanban_annotation_disk.py b/hermes_cli/kanban_annotation_disk.py
+index 551224cdbe..84897fe640 100644
+--- a/hermes_cli/kanban_annotation_disk.py
++++ b/hermes_cli/kanban_annotation_disk.py
+@@ -18,6 +18,7 @@ import hashlib
+ import json
+ import logging
+ import os
++import threading
+ import time
+ from pathlib import Path
+ from typing import Any, Callable
+@@ -88,11 +89,18 @@ def _path(scope: tuple[str, ...]) -> Path:
+ 
+ 
+ def _encode(value: Any) -> Any:
++    # [daveey] Lists, tuples and nested dicts keep their own type, so a decoded copy equals the read exactly (the
++    # execution part's evidence dicts hold lists); a copy written before kept lists as "t" and still decodes.
+     if isinstance(value, (set, frozenset, tuple, list)):
+         items = [_encode(v) for v in value]
+         if isinstance(value, (set, frozenset)):
+             items.sort(key=lambda v: json.dumps(v, sort_keys=True))
+-        return {"s": items} if isinstance(value, (set, frozenset)) else {"t": items}
++            return {"s": items}
++        return {"l": items} if isinstance(value, list) else {"t": items}
++    if isinstance(value, dict):
++        if not all(isinstance(k, str) for k in value):
++            raise TypeError("annotation copy: non-string dict key")
++        return {"d": {k: _encode(v) for k, v in value.items()}}
+     return value
+ 
+ 
+@@ -102,6 +110,11 @@ def _decode(value: Any) -> Any:
+             return frozenset(_decode(v) for v in value["s"])
+         if set(value) == {"t"}:
+             return tuple(_decode(v) for v in value["t"])
++        if set(value) == {"l"}:
++            return [_decode(v) for v in value["l"]]
++        if set(value) == {"d"} and isinstance(value["d"], dict):
++            return {k: _decode(v) for k, v in value["d"].items()}
++        return {k: _decode(v) for k, v in value.items()}
+     return value
+ 
+ 
+@@ -129,6 +142,76 @@ def save(scope: tuple[str, ...], parts: tuple) -> bool:
+         return False
+ 
+ 
++def _write_json(path: Path, body: dict) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
++    tmp.write_text(json.dumps(body, separators=(",", ":")), encoding="utf-8")
++    os.replace(tmp, path)
++
++
++def _decode_parts(raw: Any) -> tuple | None:
++    if not isinstance(raw, list) or len(raw) not in (_PARTS, _PARTS + 1) or not all(isinstance(p, dict) for p in raw):
++        return None
++    return tuple({k: _decode(v) for k, v in part.items()} for part in raw)
++
++
++def save_host(scope: tuple[str, ...], fingerprint: str, read_at: float, parts: tuple) -> bool:
++    """[daveey] The host copy other processes adopt (``kanban_annotation_host``): ``parts`` answered exactly the
++    inputs ``fingerprint`` names, read at ``read_at``. Never raises."""
++    if not enabled() or len(parts) not in (_PARTS, _PARTS + 1):
++        return False
++    try:
++        body = {"version": _VERSION, "scope": list(scope), "fingerprint": fingerprint, "read_at": float(read_at),
++                "parts": [{str(k): _encode(v) for k, v in part.items()} for part in parts]}
++        _write_json(_path(scope).with_suffix(".host.json"), body)
++        return True
++    except Exception:  # health: allow BLE001 -- best-effort; other processes then read for themselves
++        log.debug("kanban annotation host copy not saved", exc_info=True)
++        return False
++
++
++def load_host(scope: tuple[str, ...]) -> tuple[str, float, tuple] | None:
++    """``(fingerprint, read_at, parts)`` of the host copy for ``scope``, else None. Never raises."""
++    if not enabled():
++        return None
++    try:
++        body = json.loads(_path(scope).with_suffix(".host.json").read_text(encoding="utf-8-sig"))
++        if body.get("version") != _VERSION or body.get("scope") != list(scope):
++            return None
++        fingerprint, read_at = body["fingerprint"], float(body["read_at"])
++        parts = _decode_parts(body["parts"])
++        if not isinstance(fingerprint, str) or parts is None or not read_at <= time.time():
++            return None
++        return fingerprint, read_at, parts
++    except FileNotFoundError:
++        return None
++    except Exception:  # health: allow BLE001 -- a bad copy is no copy
++        log.debug("kanban annotation host copy unreadable", exc_info=True)
++        return None
++
++
++def touch_demand(scope: tuple[str, ...]) -> None:
++    """Mark ``scope`` as polled now (the host refresher keeps such scopes' copies current). Never raises."""
++    if not enabled():
++        return
++    try:
++        path = _path(scope).with_suffix(".demand")
++        try:
++            os.utime(path)
++        except FileNotFoundError:
++            _write_json(path, {"scope": list(scope)})
++    except Exception:  # health: allow BLE001 -- demand only steers the refresher
++        log.debug("kanban annotation demand not recorded", exc_info=True)
++
++
++def demand_age(scope: tuple[str, ...]) -> float | None:
++    """Seconds since any process last polled ``scope`` (None: never, or unreadable)."""
++    try:
++        return time.time() - _path(scope).with_suffix(".demand").stat().st_mtime
++    except OSError:
++        return None
++
++
+ def load(scope: tuple[str, ...], *, max_age_s: float = MAX_AGE_S) -> tuple[tuple, float] | None:
+     """``(parts, saved_at)`` for ``scope`` when a copy at most ``max_age_s`` old exists, else None. Never raises."""
+     if not enabled():
+diff --git a/hermes_cli/kanban_annotation_host.py b/hermes_cli/kanban_annotation_host.py
+new file mode 100644
+index 0000000000..eecff2ee80
+--- /dev/null
++++ b/hermes_cli/kanban_annotation_host.py
+@@ -0,0 +1,398 @@
++"""One session-list annotation read per host: publish it under its full inputs, adopt it elsewhere. [daveey]
++
++Every web-server process (each Desktop ``serve``, the dashboard) and the gateway computed the same annotation parts
++for the same scope: ``kanban_session_activity._refresh_annotation_locked`` was 13.3% of a steady hub serve's samples,
++10.8% of the gateway's and 12.2% of a fresh serve's (design t_01a1d45d75851804 §2c, review item R9).
++
++* **Publish.** A refresh takes the host fingerprint of its inputs BEFORE it reads (:func:`prepare`) and, when the read
++  answered exactly those inputs, writes ``(scope, fingerprint, read_at, parts)`` beside the restart copy
++  (``kanban_annotation_disk.save_host``). ``read_at`` is when the counts were really read, never later.
++* **Fingerprint** (:func:`fingerprint`): the scope; the boards', hub replica's and sync shadows' content keys
++  (``_activity_fingerprint``, the same inputs ``kanban_session_activity_revalidate.unchanged_inputs`` compares),
++  portable across processes (a stat key keeps the stat, drops its process-local connection) and ``revalidatable``
++  (no unsettled stat, no unreadable board); the core sha; each registered done check's and waiting source's code
++  identity (its source files' stats when first seen in this process, so a process still running older plugin code
++  never matches a newer one); and each waiting source's declared inputs (``register_waiting_source(..., inputs=)``,
++  e.g. the chat-closeout ledger's committed revision). Anything it cannot vouch for makes it None: never adopted.
++* **Adopt** (:func:`adopt`): before refreshing, a process adopts the copy only on an exact fingerprint match and
++  ``read_at`` younger than ``_COUNTS_MAX_AGE_S`` (the bound a process's own unchanged-inputs reuse already has).
++  When any waiting source declares no inputs, the copy's counts are adopted but every waiting source is re-run here,
++  so a source the fingerprint cannot see is never served from another process.
++* **Holder** (lease ``kanban-annotation``, ``host_loop_lease``): one process per home runs a demand-driven refresher
++  for every scope it can reproduce that any process polled (``<scope>.demand`` touched) in the last
++  ``DEMAND_WINDOW_S``, so the copy is current when the others poll. A miss anywhere still refreshes locally as before:
++  no added latency, and ``HERMES_ANNOTATION_HOST_COPY=0`` turns publishing and adopting off.
++"""
++
++from __future__ import annotations
++
++import contextvars
++import hashlib
++import json
++import logging
++import os
++import threading
++import time
++import weakref
++from pathlib import Path
++from typing import Any
++
++from hermes_cli import kanban_annotation_disk as _disk
++
++log = logging.getLogger("hermes_cli.kanban_session_activity")
++
++KILL_SWITCH_ENV = "HERMES_ANNOTATION_HOST_COPY"  # health: allow HX002 -- the design's kill switch (§2c)
++LEASE_NAME = "kanban-annotation"
++DEMAND_WINDOW_S = 60.0
++DEMAND_TOUCH_S = 10.0  # a poller re-touches its scope's demand file at most this often
++HOLDER_INTERVAL_S = 2.0
++HOLDER_REFRESH_AGE_S = 20.0  # the holder re-reads an unchanged scope this long after its copy's read
++_VERSION = 1
++_UNDECLARED = "undeclared"
++
++
++class _Unportable(Exception):
++    """A fingerprint input that means nothing in another process (a connection, an unreadable board)."""
++
++
++def enabled() -> bool:
++    return _disk.enabled() and os.environ.get(KILL_SWITCH_ENV, "").strip() != "0"
++
++
++# -- waiting-source inputs ---------------------------------------------------------------------------------------
++
++# name -> (fn, inputs): ``inputs()`` returns a JSON-able key that changes whenever ``fn()`` could answer differently.
++_declared: dict[str, tuple[Any, Any]] = {}
++
++
++def declare_inputs(name: str, fn, inputs) -> None:
++    """Called by ``register_waiting_source``: ``inputs`` belongs to exactly this ``fn`` (a replacement undeclares)."""
++    if fn is None or inputs is None:
++        _declared.pop(name, None)
++    else:
++        _declared[name] = (fn, inputs)
++
++
++def _waiting_inputs(sources: dict[str, Any]) -> tuple[list, bool]:
++    """``([(name, code id, inputs or "undeclared")...], all declared)`` for the registered waiting sources."""
++    out, complete = [], True
++    for name in sorted(sources):
++        fn = sources[name]
++        declared = _declared.get(name)
++        if declared is not None and declared[0] is fn:
++            out.append([name, _code_id(fn), _portable(declared[1]())])
++        else:
++            out.append([name, _code_id(fn), _UNDECLARED])
++            complete = False
++    return out, complete
++
++
++# -- code identity ------------------------------------------------------------------------------------------------
++
++_code_ids: weakref.WeakKeyDictionary[Any, Any] = weakref.WeakKeyDictionary()
++_core: list = []
++
++
++def core_sha() -> str:
++    """The core code this process runs (read once). Raises when unknown: no identity, no adoption."""
++    if not _core:
++        from hermes_cli.version_info import get_code_identity
++
++        sha = get_code_identity().get("sha")
++        _core.append(sha if isinstance(sha, str) and sha else None)
++    if _core[0] is None:
++        raise _Unportable("core code identity unknown")
++    return _core[0]
++
++
++def _core_root() -> str:
++    from hermes_cli._startup_fast import project_root_str
++
++    return os.path.realpath(project_root_str()) + os.sep
++
++
++def _package_root(path: Path) -> Path:
++    """The outermost package directory holding ``path`` (a plugin's own tree), else the file itself."""
++    root, parent = path, path.parent
++    while (parent / "__init__.py").is_file() and parent.parent != parent:
++        root, parent = parent, parent.parent
++    return root
++
++
++def _code_id(fn) -> Any:
++    """``"core"`` for core code (the core sha covers it), else the stats of its package's source files as this
++    process first saw them. Raises for a callable whose source cannot be located."""
++    try:
++        cached = _code_ids.get(fn)
++    except TypeError:  # not weak-referenceable
++        cached = None
++    if cached is not None:
++        return cached
++    filename = getattr(getattr(fn, "__code__", None), "co_filename", None)
++    if not filename or not os.path.isfile(filename):
++        raise _Unportable(f"no source file for {fn!r}")
++    real = os.path.realpath(filename)
++    if real.startswith(_core_root()):  # core and its bundled plugins: the core sha covers them
++        ident: Any = "core"
++    else:
++        root = _package_root(Path(real))
++        files = sorted(root.rglob("*.py")) if root.is_dir() else [root]
++        ident = [str(root)]
++        for f in files[:500]:
++            st = f.stat()
++            ident.append([str(f.relative_to(root)) if root.is_dir() else f.name, st.st_size, st.st_mtime_ns])
++    try:
++        _code_ids[fn] = ident
++    except TypeError:
++        pass
++    return ident
++
++
++# -- fingerprint --------------------------------------------------------------------------------------------------
++
++def _portable(value: Any) -> Any:
++    """``value`` as plain JSON data comparable across processes. A board stat key keeps its stat and drops the
++    connection/version only this process can read; any other non-plain value raises ``_Unportable``."""
++    if value is None or isinstance(value, (str, bool, int, float)):
++        return value
++    if isinstance(value, (tuple, list)):
++        if value[:1] == ("stat",) or (isinstance(value, list) and value[:1] == ["stat"]):
++            if len(value) != 4:  # ("stat", stat, object()): an unreadable board is unknown, never unchanged
++                raise _Unportable("unreadable board")
++            return ["stat", _portable(value[1])]
++        return [_portable(v) for v in value]
++    if isinstance(value, dict):
++        return {str(k): _portable(v) for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))}
++    raise _Unportable(type(value).__name__)
++
++
++def fingerprint(scope: tuple[str, ...], full: tuple, wall: float) -> tuple[str, bool] | None:
++    """``(digest, every waiting source declared)`` of everything ``scope``'s annotation reads, with ``full`` the
++    activity fingerprint taken at ``wall``; None when any input can't be vouched for across processes."""
++    from hermes_cli import kanban_session_activity as _ksa
++
++    try:
++        if not _ksa._revalidate.revalidatable(full, wall):
++            return None
++        waiting, complete = _waiting_inputs(dict(_ksa._waiting_sources))
++        body = [_VERSION, list(scope), core_sha(), _portable(full),
++                [[name, _code_id(fn)] for name, fn in sorted(_ksa._done_checks.items())], waiting]
++        digest = hashlib.sha256(json.dumps(body, separators=(",", ":"), sort_keys=True).encode()).hexdigest()
++        return digest, complete
++    except Exception:  # health: allow BLE001 -- an unknown input is no fingerprint; the caller reads locally
++        log.debug("kanban annotation host fingerprint unavailable", exc_info=True)
++        return None
++
++
++def _inputs_now(scope: tuple[str, ...]) -> tuple[tuple, tuple, float, tuple[str, bool] | None]:
++    """``(local, full, wall, fingerprint)`` read now (or the pinned pair a revalidation already took)."""
++    from hermes_cli import kanban_session_activity as _ksa
++
++    wall = time.time()
++    local = _ksa._activity_fingerprint(include_shadows=False)
++    pinned = getattr(_ksa._revalidate.inputs_pin, "fingerprints", None)
++    full = pinned[1] if pinned is not None and pinned[1] is not None else local + _ksa._shadow_fingerprint()
++    return local, full, wall, fingerprint(scope, full, wall)
++
++
++# -- the read -----------------------------------------------------------------------------------------------------
++
++# Per origin scope, the last frozen annotation parts (``read_annotation_parts``).
++frozen_parts: dict[tuple[str, ...], tuple] = {}
++
++
++def read_annotation_parts() -> tuple:
++    """``kanban_session_activity._read_annotation_parts``: one read of the scope's counts, waiting sources and
++    attention, frozen. Every helper is looked up on that module (tests replace them there)."""
++    from hermes_cli import kanban_session_activity as _ksa
++
++    snapshot = _ksa._all_counts(include_snapshot=True)
++    active, blocked, unseen, remote_stale, waiting, parked, held, stalled, remote_keys = snapshot[:9]
++    execution = getattr(snapshot, "execution", {})
++    extra = _ksa._extra_waiting()
++    try:
++        attention = _ksa.attention_task_counts()
++    except Exception:
++        log.debug("kanban attention unavailable", exc_info=True)
++        attention = {}
++    raw = (active, blocked, unseen, remote_stale, waiting, parked, held, stalled, remote_keys, extra, attention, execution)
++    # Nothing moved since the last read of this scope: return that read's frozen copy instead of freezing an equal
++    # one. Safe: frozen parts are never mutated (every poll already shares one), and ``==`` per part (sets and
++    # frozensets compare by members) proves the copy is exactly what freezing ``raw`` would build. The same object
++    # also lets ``_annotation_copy.published`` skip its deep comparison.
++    scope = _ksa._origin_scope()
++    previous = frozen_parts.get(scope)
++    if previous is not None and len(previous) == len(raw) and all(old is new or old == new for old, new in zip(previous, raw)):
++        return previous
++    frozen = _ksa._identity.freeze_annotation(raw)
++    frozen_parts[scope] = frozen
++    return frozen
++
++
++# -- adopt --------------------------------------------------------------------------------------------------------
++
++def adopt(scope: tuple[str, ...]) -> tuple | None:
++    """Caller holds the annotation refresh lock. The published parts for ``scope`` when its fingerprint is exactly
++    this process's and its read is younger than ``_COUNTS_MAX_AGE_S``; recorded as this process's last read (dated
++    by the copy's own ``read_at``). None otherwise: the caller refreshes as before."""
++    from hermes_cli import kanban_session_activity as _ksa
++
++    if not enabled():
++        return None
++    try:
++        copy = _disk.load_host(scope)
++        if copy is None or time.time() - copy[1] >= _ksa._COUNTS_MAX_AGE_S:
++            return None
++        _local, _full, _wall, fp = _inputs_now(scope)
++        if fp is None or fp[0] != copy[0]:
++            return None
++        parts = copy[2]
++    except Exception:  # health: allow BLE001 -- adoption is only a shortcut; the refresh reports a real read error
++        log.debug("kanban annotation host copy not adopted", exc_info=True)
++        return None
++    if not fp[1]:  # a waiting source the fingerprint cannot see: run them all here (raises like a refresh would)
++        extra = {sid: frozenset(ids) for sid, ids in _ksa._extra_waiting().items()}
++        parts = parts[:9] + (extra,) + parts[10:]
++    _ksa._bounded.record(scope, parts, copy[1])
++    _ksa._last_annotation[scope] = parts
++    return parts
++
++
++# -- publish ------------------------------------------------------------------------------------------------------
++
++_pin_set = threading.local()
++
++
++def prepare(scope: tuple[str, ...]) -> tuple | None:
++    """Before a refresh reads: the inputs it is about to read, pinned so the read keys on exactly them (the read
++    would take the same pair microseconds later). Pass the result to :func:`publish` after the read."""
++    from hermes_cli import kanban_session_activity as _ksa
++
++    if not enabled():
++        return None
++    try:
++        local, full, wall, fp = _inputs_now(scope)
++    except Exception:  # health: allow BLE001 -- the read itself reports a board error
++        log.debug("kanban annotation host inputs unavailable", exc_info=True)
++        return None
++    if getattr(_ksa._revalidate.inputs_pin, "fingerprints", None) is None:
++        _ksa._revalidate.inputs_pin.fingerprints = (local, full)
++        _pin_set.scope = scope
++    return (full, wall, fp)
++
++
++def finish(scope: tuple[str, ...]) -> None:
++    """Drop the pin :func:`prepare` set (never one a caller up the stack owns)."""
++    from hermes_cli import kanban_session_activity as _ksa
++
++    if getattr(_pin_set, "scope", None) == scope:
++        _ksa._revalidate.inputs_pin.fingerprints = None
++        _pin_set.scope = None
++
++
++def publish(scope: tuple[str, ...], prepared: tuple | None, parts: tuple) -> bool:
++    """Write the host copy when the read answered exactly ``prepared``'s inputs: its counts are cached under that
++    fingerprint and revalidatable. ``read_at`` = when those counts were read (never the later wall time)."""
++    from hermes_cli import kanban_session_activity as _ksa
++
++    if prepared is None or prepared[2] is None:
++        return False
++    full, wall, (digest, _complete) = prepared
++    with _ksa._cache_lock:
++        if (_ksa._cache is None or _ksa._cache_scope != scope or _ksa._cache_fingerprint != full
++                or not _ksa._cache_revalidatable):
++            return False
++        counts_at = time.time() - max(0.0, time.monotonic() - _ksa._cache_read_at)
++    return _disk.save_host(scope, digest, min(wall, counts_at), parts)
++
++
++# -- holder -------------------------------------------------------------------------------------------------------
++
++_known: dict[tuple[str, ...], contextvars.Context] = {}
++_touched: dict[tuple[str, ...], float] = {}
++_holder: list = []
++
++
++def demand(scope: tuple[str, ...]) -> None:
++    """A poll of ``scope``: remember how to reproduce it here and touch its demand file (throttled)."""
++    if not enabled():
++        return
++    now = time.monotonic()
++    if now - _touched.get(scope, -1e9) < DEMAND_TOUCH_S:
++        return
++    _touched[scope] = now
++    _known[scope] = contextvars.copy_context()
++    _disk.touch_demand(scope)
++
++
++def _holder_pass() -> int:
++    """Refresh every scope this process can reproduce that someone polled lately and whose copy is missing,
++    another input's, or aging. Returns how many it refreshed."""
++    refreshed = 0
++    for scope, ctx in list(_known.items()):
++        age = _disk.demand_age(scope)
++        if age is None or age > DEMAND_WINDOW_S:
++            continue
++        try:
++            refreshed += bool(ctx.run(_holder_refresh, scope))
++        except Exception:  # health: allow BLE001 -- one scope's failed read must not stop the others
++            log.debug("kanban annotation holder refresh failed", exc_info=True)
++    return refreshed
++
++
++def _holder_refresh(scope: tuple[str, ...]) -> bool:
++    from hermes_cli import kanban_session_activity as _ksa
++
++    if _ksa._origin_scope() != scope:
++        return False  # this context no longer reproduces the scope
++    copy = _disk.load_host(scope)
++    if copy is not None and time.time() - copy[1] < HOLDER_REFRESH_AGE_S:
++        _local, _full, _wall, fp = _inputs_now(scope)
++        if fp is not None and fp[0] == copy[0]:
++            return False
++    if not _ksa._annotate_refresh_lock.acquire(blocking=False):
++        return False  # a poll here is already reading (it publishes)
++    try:
++        _ksa._refresh_annotation_locked(scope)
++    finally:
++        _ksa._annotate_refresh_lock.release()
++    return True
++
++
++def start_holder(role: str) -> threading.Thread | None:
++    """Run the demand-driven refresher under the ``kanban-annotation`` host lease (once per process; never under
++    the test harness)."""
++    if _holder or os.environ.get("HERMES_TEST_ISOLATION") or not enabled():
++        return None
++    from agent.memory_provider import spawn_context_thread
++    from hermes_cli import kanban_session_activity as _ksa
++    from hermes_cli.host_loop_lease import HostLoopLease
++
++    lease = HostLoopLease(LEASE_NAME, role, interval=HOLDER_INTERVAL_S)
++    stop = threading.Event()
++    try:  # this process's own scope, even before a poll reaches it here
++        _known.setdefault(_ksa._origin_scope(), contextvars.copy_context())
++    except Exception:  # health: allow BLE001 -- a scope polls register themselves too
++        log.debug("kanban annotation holder: own scope unavailable", exc_info=True)
++
++    def loop() -> None:
++        while not stop.wait(HOLDER_INTERVAL_S):
++            try:
++                if lease.held():
++                    _holder_pass()
++                    lease.beat()
++            except Exception:  # health: allow BLE001 -- the refresher must outlive one bad pass
++                log.warning("kanban annotation holder pass failed", exc_info=True)
++
++    thread = spawn_context_thread(loop, name="kanban-annotation-holder")
++    thread.start()
++    _holder.append((thread, stop, lease))
++    return thread
++
++
++def reset() -> None:
++    _known.clear()
++    _touched.clear()
++    _code_ids.clear()
++    _core.clear()
++    _pin_set.scope = None
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index b6f432a348..a8517c4e2d 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -17,6 +17,7 @@ from __future__ import annotations
+ from hermes_cli import kanban_lockguard as _kanban_lockguard
+ from hermes_cli import kanban_activity_identity as _identity
+ from hermes_cli import kanban_annotation_disk as _annotation_copy
++from hermes_cli import kanban_annotation_host as _host_copy
+ from hermes_cli import kanban_annotation_refresh as _bounded
+ from hermes_cli import kanban_activity_revision as _revision
+ from hermes_cli import kanban_session_activity_busy as _busy
+@@ -1418,8 +1419,11 @@ def _read_local_boards(active: dict[str, int], blocked: dict[str, int], unseen:
+ _waiting_sources: dict[str, Any] = {}
+ 
+ 
+-def register_waiting_source(name: str, fn) -> None:
+-    """Register (or replace, ``fn=None`` removes) a plugin source of waiting card ids per session. [daveey]"""
++def register_waiting_source(name: str, fn, inputs=None) -> None:
++    """Register (or replace, ``fn=None`` removes) a plugin source of waiting card ids per session. [daveey] ``inputs()``
++    (optional) returns a JSON key that moves whenever ``fn`` could answer differently: other processes may then adopt
++    this host's annotation instead of re-running ``fn`` (``kanban_annotation_host``)."""
++    _host_copy.declare_inputs(name, fn, inputs)
+     if fn is None:
+         _waiting_sources.pop(name, None)
+     else:
+@@ -1728,32 +1732,10 @@ def attention_task_counts(now: float | None = None) -> dict[str, int]:
+     return counts
+ 
+ 
+-def _read_annotation_parts() -> tuple:
+-    snapshot = _all_counts(include_snapshot=True)
+-    active, blocked, unseen, remote_stale, waiting, parked, held, stalled, remote_keys = snapshot[:9]
+-    execution = getattr(snapshot, "execution", {})
+-    extra = _extra_waiting()
+-    try:
+-        attention = attention_task_counts()
+-    except Exception:
+-        _log.debug("kanban attention unavailable", exc_info=True)
+-        attention = {}
+-    raw = (active, blocked, unseen, remote_stale, waiting, parked, held, stalled, remote_keys, extra, attention, execution)
+-    # [daveey] Nothing moved since the last read of this scope: return that read's frozen copy instead of freezing an
+-    # equal one. Safe: frozen parts are never mutated (every poll already shares one), and ``==`` per part (sets and
+-    # frozensets compare by members) proves the copy is exactly what freezing ``raw`` would build. The same object
+-    # also lets ``_annotation_copy.published`` skip its deep comparison.
+-    scope = _origin_scope()
+-    previous = _frozen_parts.get(scope)
+-    if previous is not None and len(previous) == len(raw) and all(old is new or old == new for old, new in zip(previous, raw)):
+-        return previous
+-    frozen = _identity.freeze_annotation(raw)
+-    _frozen_parts[scope] = frozen
+-    return frozen
+-
+-
+-# [daveey] Per origin scope, the last frozen annotation parts (``_read_annotation_parts``).
+-_frozen_parts: dict[tuple[str, ...], tuple] = {}
++# [daveey] The read itself lives with the host copy that publishes it (kanban_annotation_host); monkeypatching
++# ``_read_annotation_parts`` here still replaces it for ``_refresh_annotation_locked``.
++_read_annotation_parts = _host_copy.read_annotation_parts
++_frozen_parts = _host_copy.frozen_parts
+ 
+ 
+ def _refresh_annotation_locked(scope: tuple[str, ...], read_at: float | None = None) -> tuple:
+@@ -1762,11 +1744,16 @@ def _refresh_annotation_locked(scope: tuple[str, ...], read_at: float | None = N
+     _annotate_flight_scope = scope
+     _annotate_flight_result = None
+     read_at = time.time() if read_at is None else read_at
+-    parts = _read_annotation_parts()
++    prepared = _host_copy.prepare(scope)  # [daveey] the inputs this read answers, for the host copy
++    try:
++        parts = _read_annotation_parts()
++    finally:
++        _host_copy.finish(scope)
+     _bounded.record(scope, parts, read_at)
+     _last_annotation[scope] = parts
+     _annotate_flight_result = parts
+     _annotation_copy.published(scope, parts)  # [daveey] a restart serves it while its first read runs
++    _host_copy.publish(scope, prepared, parts)  # other processes adopt it instead of reading again
+     return parts
+ 
+ 
+@@ -1785,6 +1772,7 @@ def _annotation_snapshot() -> tuple | None:
+     """
+     global _annotate_waiters
+     scope = _origin_scope()
++    _host_copy.demand(scope)
+     deadline = time.monotonic() + _REFRESH_WAIT_S
+     if not _annotate_refresh_lock.acquire(blocking=False):
+         _annotate_waiters += 1
+@@ -1807,6 +1795,15 @@ def _annotation_snapshot() -> tuple | None:
+         return _bounded.refresh_bounded(lambda: _refresh_annotation_locked(scope), _annotate_refresh_lock,
+                                         None, max(0.0, deadline - time.monotonic()))
+     previous = _last_annotation.get(scope)
++    try:  # [daveey] unchanged inputs: re-read inline; else adopt another process's read of exactly these inputs
++        parts = previous is not None and _revalidate.refresh_if_unchanged(scope, _refresh_annotation_locked)
++        parts = parts or _host_copy.adopt(scope)
++    except BaseException:
++        _annotate_refresh_lock.release()
++        raise
++    if parts is not None:
++        _annotate_refresh_lock.release()
++        return parts
+     if previous is None:
+         # [daveey] An uncontended cold read (a fresh process such as the session-idle-check collector, or a
+         # restarted backend before any poll overlapped) passed no fallback, so one read slower than the budget
+@@ -1815,14 +1812,6 @@ def _annotation_snapshot() -> tuple | None:
+         fallback = _annotation_copy.seed(scope, _last_annotation, _identity.freeze_annotation)
+         return _bounded.refresh_bounded(lambda: _refresh_annotation_locked(scope), _annotate_refresh_lock,
+                                         fallback, max(0.0, deadline - time.monotonic()))
+-    try:
+-        parts = _revalidate.refresh_if_unchanged(scope, _refresh_annotation_locked)
+-    except BaseException:
+-        _annotate_refresh_lock.release()
+-        raise
+-    if parts is not None:
+-        _annotate_refresh_lock.release()
+-        return parts
+     return _bounded.refresh_bounded(lambda: _refresh_annotation_locked(scope), _annotate_refresh_lock, previous,
+                                     _REFRESH_WAIT_S)
+ 
+@@ -1973,6 +1962,7 @@ def _reset_cache_for_tests(keep_remote: bool = False) -> None:
+     _bounded.reset()
+     _recent_done.reset()
+     _annotation_copy.reset()
++    _host_copy.reset()
+     with _pairs_lock:
+         _board_memo.clear()
+     _busy.reset()
+diff --git a/hermes_cli/web_server_app.py b/hermes_cli/web_server_app.py
+index 3aa65f3483..9f2605ecd4 100644
+--- a/hermes_cli/web_server_app.py
++++ b/hermes_cli/web_server_app.py
+@@ -138,6 +138,14 @@ async def standalone_lifespan(app: "FastAPI"):
+         start_annotation_prewarm()
+     except Exception:
+         logger.warning("kanban annotation prewarm did not start", exc_info=True)
++    # One process per home keeps the published annotation current for the others (kanban_annotation_host). [daveey]
++    try:
++        from hermes_cli.kanban_annotation_host import start_holder
++        from hermes_cli.process_identity import is_desktop_owned_backend as _desktop_owned
++
++        start_holder("serve" if _desktop_owned() else "dashboard")
++    except Exception:
++        logger.warning("kanban annotation holder did not start", exc_info=True)
+ 
+     # Re-adopt background jobs a previous backend's chats left running (orphans of a Desktop
+     # restart) and wake each chat when its job exits (tools/process_registry_readopt.py). [daveey]
+diff --git a/tests/hermes_cli/test_kanban_annotation_host.py b/tests/hermes_cli/test_kanban_annotation_host.py
+new file mode 100644
+index 0000000000..225e253412
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_annotation_host.py
+@@ -0,0 +1,212 @@
++"""The session-list annotation is read once per host: other processes adopt the published copy. [daveey]
++
++Design t_01a1d45d75851804 §2c (review item R9): every web-server process and the gateway computed the same parts for
++the same scope (``_refresh_annotation_locked`` = 13.3% of a steady hub serve's samples, 10.8% of the gateway's). A
++refresh now publishes ``(scope, fingerprint, read_at, parts)``; another process adopts it only on an exact fingerprint
++and while it is younger than ``_COUNTS_MAX_AGE_S``. "Another process" is simulated by dropping every in-memory cache
++(``_reset_cache_for_tests``): only the files under the test's Hermes home survive, as across processes.
++"""
++
++from __future__ import annotations
++
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_activity_revision as revision
++from hermes_cli import kanban_annotation_disk as disk
++from hermes_cli import kanban_annotation_host as host
++from hermes_cli import kanban_session_activity as ksa
++
++SCOPE = ("annotation-host-test", "default")
++
++
++@pytest.fixture
++def world(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub-state"))
++    monkeypatch.delenv(host.KILL_SWITCH_ENV, raising=False)
++    monkeypatch.setattr(disk, "FORCE", True)
++    monkeypatch.setattr(ksa, "_origin_scope", lambda: SCOPE)
++    monkeypatch.setattr(ksa, "_remote_cards", lambda *a, **k: [])
++    monkeypatch.setattr(ksa, "_waiting_sources", {})
++    monkeypatch.setattr(host, "_declared", {})
++    sha = ["a" * 40]
++    monkeypatch.setattr(host, "core_sha", lambda: sha[0])
++    now = {"mono": 1000.0, "wall": 5000.0, "sha": sha}
++    monkeypatch.setattr(ksa.time, "monotonic", lambda: now["mono"])
++    monkeypatch.setattr(ksa.time, "time", lambda: now["wall"])
++    calls = {"recompute": 0}
++    recompute = ksa._recompute_all_counts
++
++    def counting(*a, **k):
++        calls["recompute"] += 1
++        return recompute(*a, **k)
++
++    monkeypatch.setattr(ksa, "_recompute_all_counts", counting)
++    now["calls"] = calls
++    conn = _board(tmp_path / "kanban.db", [("t1", "running", "s1"), ("t2", "blocked", "s1"), ("t3", "ready", "s2")])
++    now["conn"] = conn
++    ksa._reset_cache_for_tests()
++    yield now
++    conn.close()
++    ksa._reset_cache_for_tests()
++
++
++def _board(path: Path, rows) -> sqlite3.Connection:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    conn = sqlite3.connect(path, isolation_level=None)
++    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT NOT NULL, session_id TEXT)")
++    revision.ensure_revision(conn, revision.LOCAL_TABLES)
++    conn.executemany("INSERT INTO tasks VALUES (?, ?, ?)", rows)
++    return conn
++
++
++def _advance(world, seconds):
++    world["mono"] += seconds
++    world["wall"] += seconds
++
++
++def _poll():
++    rows = ksa.annotate_kanban_activity([{"id": "s1"}, {"id": "s2"}, {"id": "s3"}])
++    return [{k: v for k, v in row.items() if k != "kanban_observed_at"} for row in rows], rows
++
++
++def _other_process():
++    ksa._reset_cache_for_tests()
++
++
++def test_another_process_adopts_the_copy_on_an_exact_fingerprint(world):
++    first, _ = _poll()
++    assert world["calls"]["recompute"] == 1
++    assert disk.load_host(SCOPE) is not None
++    _other_process()
++    _advance(world, 2)
++    adopted, raw = _poll()
++    assert world["calls"]["recompute"] == 1  # no read of its own
++    assert adopted == first
++    # Dated by the copy's own read, never by the adopting poll.
++    assert all(row["kanban_observed_at"] <= world["wall"] - 2 for row in raw)
++
++
++def test_adopted_rows_equal_a_local_refresh(world, monkeypatch):
++    ksa.register_waiting_source("closeout", lambda: {"s3": ["t9"]}, inputs=lambda: ["ledger", 1])
++    dispose = ksa.register_done_check("test", lambda card: True)
++    try:
++        _poll()
++        _other_process()
++        adopted, _ = _poll()
++        assert world["calls"]["recompute"] == 1
++        _other_process()
++        monkeypatch.setenv(host.KILL_SWITCH_ENV, "0")  # this process reads for itself
++        local, _ = _poll()
++        assert world["calls"]["recompute"] == 2
++        assert adopted == local
++        assert local[2]["kanban_waiting_on"] == ["t9"] and local[0]["kanban_active"] >= 1
++    finally:
++        dispose()
++
++
++def test_a_waiting_source_change_defeats_adopt(world):
++    """A chat-closeout ledger write moves its declared inputs: the copy's waiting part is another input's."""
++    ledger = {"version": 1, "pending": ["t9"]}
++    ksa.register_waiting_source("closeout", lambda: {"s3": list(ledger["pending"])},
++                                inputs=lambda: ["ledger", ledger["version"]])
++    first, _ = _poll()
++    assert first[2]["kanban_waiting_on"] == ["t9"]
++    ledger.update(version=2, pending=["t10"])
++    _other_process()
++    after, _ = _poll()
++    assert world["calls"]["recompute"] == 2
++    assert after[2]["kanban_waiting_on"] == ["t10"]
++
++
++def test_an_undeclared_waiting_source_is_rerun_by_the_adopter(world):
++    pending = ["t9"]
++    ksa.register_waiting_source("closeout", lambda: {"s3": list(pending)})
++    _poll()
++    pending[:] = ["t10"]
++    _other_process()
++    after, _ = _poll()
++    assert world["calls"]["recompute"] == 1  # counts adopted
++    assert after[2]["kanban_waiting_on"] == ["t10"]  # the source the fingerprint can't see ran here
++
++
++def test_a_stale_copy_is_ignored(world):
++    _poll()
++    _advance(world, ksa._COUNTS_MAX_AGE_S + 1)
++    _other_process()
++    _poll()
++    assert world["calls"]["recompute"] == 2
++
++
++def test_a_code_sha_change_defeats_adopt(world):
++    _poll()
++    world["sha"][0] = "b" * 40
++    _other_process()
++    _poll()
++    assert world["calls"]["recompute"] == 2
++
++
++def test_a_board_write_defeats_adopt(world):
++    first, _ = _poll()
++    world["conn"].execute("INSERT INTO tasks VALUES ('t4', 'ready', 's1')")
++    _other_process()
++    after, _ = _poll()
++    assert world["calls"]["recompute"] == 2
++    assert after[0]["kanban_active"] == first[0]["kanban_active"] + 1
++
++
++def test_another_plugins_code_defeats_adopt(world, tmp_path, monkeypatch):
++    """A process still running an older plugin build never adopts a newer build's read (or the reverse)."""
++    plugin = tmp_path / "plugins" / "closeout"
++    plugin.mkdir(parents=True)
++    (plugin / "__init__.py").write_text("def waiting():\n    return {}\n")
++    (plugin / "core.py").write_text("X = 1\n")
++    code = compile((plugin / "__init__.py").read_text(), str(plugin / "__init__.py"), "exec")
++    scope: dict = {}
++    exec(code, scope)
++    ksa.register_waiting_source("closeout", scope["waiting"], inputs=lambda: 1)
++    _poll()
++    _other_process()
++    (plugin / "core.py").write_text("X = 22\n")  # this "process" loads the updated plugin
++    _poll()
++    assert world["calls"]["recompute"] == 2
++
++
++def test_kill_switch_turns_publishing_and_adopting_off(world, monkeypatch):
++    monkeypatch.setenv(host.KILL_SWITCH_ENV, "0")
++    _poll()
++    assert disk.load_host(SCOPE) is None
++
++
++def test_unportable_inputs_publish_no_fingerprint(world):
++    assert host.fingerprint(SCOPE, (("x", ("stat", ((1, 2, 3, 4), None), object())),), 1e9) is None
++    full = (("b", ("stat", ((1, 2, 3, int(4000 * 1e9)), None), object(), 7)),)
++    assert host.fingerprint(SCOPE, full, 5000.0) is not None  # a settled stat key drops its connection
++    assert host.fingerprint(SCOPE, (("hub", sqlite3.connect(":memory:")),), 5000.0) is None
++
++
++def test_host_copy_round_trips_nested_evidence(world):
++    parts = ksa._identity.freeze_annotation((
++        {"s1": 2}, {}, {}, {}, {"s1": frozenset({"t1"})}, {}, {}, {},
++        {"s1": frozenset({("gw/default/default/t_x", "blocked", False)})}, {}, {},
++        {"s1": {"k": {"version": 1, "evidence_refs": ["r1"], "identity": {"run_id": 3}, "pair": (1, 2)}}}))
++    assert disk.save_host(SCOPE, "f" * 64, 4990.0, parts)
++    assert disk.load_host(SCOPE) == ("f" * 64, 4990.0, parts)
++
++
++def test_holder_refreshes_a_demanded_scope_once_per_change(world):
++    import contextvars
++
++    host._known[SCOPE] = contextvars.copy_context()
++    disk.touch_demand(SCOPE)
++    assert host._holder_pass() == 1
++    assert world["calls"]["recompute"] == 1 and disk.load_host(SCOPE) is not None
++    assert host._holder_pass() == 0  # the copy answers the current inputs
++    world["conn"].execute("INSERT INTO tasks VALUES ('t4', 'ready', 's1')")
++    assert host._holder_pass() == 1
++    _other_process()
++    after, _ = _poll()
++    assert after[0]["kanban_active"] == 3 and world["calls"]["recompute"] == 2  # adopted the holder's read
+-- 
+2.43.0
+

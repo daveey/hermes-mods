@@ -1,0 +1,168 @@
+From 6b152b94d22626c529490e55ef44944ea0422e2d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:08:01 +0000
+Subject: [PATCH] [daveey] code_skew: cache a missing-commit drift verdict;
+ note_import_error cost; locate_command patch fails loudly
+
+Follow-up to the non-blocking points of review 5890300865 on PR #2151 (card t_01a1d4b53a4860a6).
+
+1. `git merge-base --is-ancestor` exits 128 when the boot sha was gc'd after a force-push (or the disk sha is
+   absent). `range_restart_verdict` read that as transient None, so `_drift_restart_free` never cached it and
+   every watchdog poll ran git for that pair for the life of the process. On a 128 it now asks
+   `git rev-parse --verify --quiet --end-of-options <sha>^{commit}` for each sha: exit 1 (git read the repo and
+   says it is no commit) is a definite False, cached as skew. An unreadable repo (exit 128), a timeout, an
+   OSError or no git stays None and uncached, as before.
+2. `note_import_error` docstring: no longer claims "the rest is string work"; it names the git subprocesses
+   (15 s timeout each) the first ImportError for an uncached pair can run.
+3. `test_git_is_resolved_through_locate_command` patches `rip.locate_command` without `raising=False`, so a
+   rename fails the test loudly.
+
+RED (before the fix): test_a_missing_commit_is_a_definite_verdict_cached_as_skew[boot|disk] and
+test_a_non_commit_object_is_a_definite_verdict failed (verdict None, nothing cached).
+GREEN: 168 passed across every test file importing code_skew / restart_ignore_paths; scripts/check
+--base origin/main: 19 checks ok.
+---
+ gateway/code_skew.py                          |  7 ++-
+ hermes_cli/restart_ignore_paths.py            | 17 +++++-
+ tests/hermes_cli/test_restart_ignore_paths.py | 53 ++++++++++++++++++-
+ 3 files changed, 72 insertions(+), 5 deletions(-)
+
+diff --git a/gateway/code_skew.py b/gateway/code_skew.py
+index fdebb1d4ed..792459b9fc 100644
+--- a/gateway/code_skew.py
++++ b/gateway/code_skew.py
+@@ -114,7 +114,8 @@ def detect_code_skew() -> tuple[str, str] | None:
+ # (boot sha, disk sha) -> range_restart_verdict. A commit range never changes, so a definite verdict is final; the
+ # watchdogs poll every few seconds and would otherwise run two git commands per poll for the same pair. A transient
+ # git failure (None: timeout, OSError, git not found) is not cached: it reads as skew now and is asked again on the
+-# next poll, so it never pins the pair as skewed for the life of the process (t_01a1d49d2f2a8ae2).
++# next poll, so it never pins the pair as skewed for the life of the process (t_01a1d49d2f2a8ae2). A sha git says
++# is no commit (boot commit gc'd after a force-push) is a definite False and is cached (PR #2151 review).
+ _restart_free_verdicts: dict[tuple[str, str], bool] = {}
+ 
+ 
+@@ -143,7 +144,9 @@ def note_import_error(exc: BaseException, where: str) -> bool:
+     One ``code-skew import mix`` WARNING per (boot, disk) pair, so the error signal shows the cause
+     (a process running two revisions; restart it) instead of a bare ``cannot import name``
+     (agent-529f2244ac). Returns True when the error happened under skew. Never raises: the
+-    fingerprint readers swallow their own failures and the rest is string work."""
++    fingerprint readers and ``range_restart_verdict`` swallow their own failures. Not free: the first
++    ImportError for an uncached (boot, disk) pair runs a few git subprocesses (``_drift_restart_free``,
++    15 s timeout each); later ones hit the verdict cache unless git failed transiently."""
+     if not isinstance(exc, ImportError):
+         return False
+     boot = _boot_fingerprint or _process_boot_fingerprint()
+diff --git a/hermes_cli/restart_ignore_paths.py b/hermes_cli/restart_ignore_paths.py
+index 03b312e994..69c77b7891 100644
+--- a/hermes_cli/restart_ignore_paths.py
++++ b/hermes_cli/restart_ignore_paths.py
+@@ -72,15 +72,30 @@ def _git(root: str, *args: str) -> Optional[subprocess.CompletedProcess]:
+         return None
+ 
+ 
++def _names_no_commit(root: str, *shas: str) -> bool:
++    """True when git, reading the repo fine, says one of ``shas`` is no commit there (exit 1 of
++    ``rev-parse --verify --quiet``). An unreadable repo (exit 128), a timeout or no git is not that statement."""
++    for sha in shas:
++        found = _git(root, "rev-parse", "--verify", "--quiet", "--end-of-options", f"{sha}^{{commit}}")
++        if found is None or found.returncode not in (0, 1):
++            return False
++        if found.returncode == 1:
++            return True
++    return False
++
++
+ def range_restart_verdict(root: str, base: str, head: str,
+                           globs: Iterable[str] = RESTART_IGNORE_GLOBS) -> Optional[bool]:
+     """``range_restart_free`` with the transient case kept apart: True/False are final for the pair (a commit
+     range never changes), None means git did not answer (not found, timeout, OSError, an unexpected exit) and
+-    the same question may get a definite answer later, so callers must not cache it."""
++    the same question may get a definite answer later, so callers must not cache it. A sha that names no commit
++    in the repo (a boot commit gc'd after a force-push) is a definite False: it never comes back."""
+     if not (_is_sha(base) and _is_sha(head)) or base == head:
+         return False
+     globs = tuple(globs)
+     ancestor = _git(root, "merge-base", "--is-ancestor", base, head)
++    if ancestor is not None and ancestor.returncode == 128 and _names_no_commit(root, base, head):
++        return False
+     if ancestor is None or ancestor.returncode not in (0, 1):
+         return None
+     if ancestor.returncode == 1:
+diff --git a/tests/hermes_cli/test_restart_ignore_paths.py b/tests/hermes_cli/test_restart_ignore_paths.py
+index 0ac52d3696..b0bf4be262 100644
+--- a/tests/hermes_cli/test_restart_ignore_paths.py
++++ b/tests/hermes_cli/test_restart_ignore_paths.py
+@@ -183,12 +183,12 @@ def test_git_is_resolved_through_locate_command(repo, monkeypatch, tmp_path_fact
+         asked.append(name)
+         return Resolution("known_path", (Candidate(str(shim), "known_dir:x", True),))
+ 
+-    monkeypatch.setattr(rip, "locate_command", resolve, raising=False)
++    monkeypatch.setattr(rip, "locate_command", resolve)
+     assert rip.range_restart_free(str(root), base, head)
+     assert asked and set(asked) == {"git"}
+     assert log.read_text().count("call") == 2  # merge-base + log, both through the resolved binary
+ 
+-    monkeypatch.setattr(rip, "locate_command", lambda name: Resolution("missing"), raising=False)
++    monkeypatch.setattr(rip, "locate_command", lambda name: Resolution("missing"))
+     assert not rip.range_restart_free(str(root), base, head)  # no git: unprovable, fail closed
+     assert rip.range_restart_verdict(str(root), base, head) is None
+ 
+@@ -210,6 +210,55 @@ def test_a_transient_git_failure_is_not_cached_as_skew(repo, monkeypatch):
+     assert code_skew._restart_free_verdicts == {(base, tests_only): True}
+ 
+ 
++def _counting_git(monkeypatch):
++    calls = []
++    real_git = rip._git
++
++    def counted(root, *args):
++        calls.append(args[0])
++        return real_git(root, *args)
++
++    monkeypatch.setattr(rip, "_git", counted)
++    return calls
++
++
++@pytest.mark.parametrize("missing", ["boot", "disk"])
++def test_a_missing_commit_is_a_definite_verdict_cached_as_skew(repo, monkeypatch, missing):
++    """A boot sha gc'd after a force-push (or an absent disk sha) never comes back: merge-base exits 128 for it,
++    which is a definite False, cached so the watchdog polls stop running git for that pair (PR #2151 review)."""
++    root, base = repo
++    head = _commit(root, {"tests/test_a.py": "x\n"}, "t1")
++    gone = "f" * 40
++    boot, disk = (gone, head) if missing == "boot" else (base, gone)
++    assert rip.range_restart_verdict(str(root), boot, disk) is False
++
++    monkeypatch.setattr(code_skew, "_PROJECT_ROOT", root)
++    monkeypatch.setattr(code_skew, "_restart_free_verdicts", {})
++    monkeypatch.setattr(code_skew, "_boot_fingerprint", f"git:refs/heads/main:{boot}")
++    monkeypatch.setattr(code_skew, "_fingerprint", lambda: f"git:refs/heads/main:{disk}")
++    calls = _counting_git(monkeypatch)
++    assert code_skew.detect_code_skew() == (boot[:10], disk[:10])
++    first = len(calls)
++    assert first >= 1
++    assert code_skew._restart_free_verdicts == {(boot, disk): False}
++    assert code_skew.detect_code_skew() == (boot[:10], disk[:10])
++    assert len(calls) == first  # cached: the next poll runs no git
++
++
++def test_a_non_commit_object_is_a_definite_verdict(repo):
++    root, _base = repo
++    head = _commit(root, {"tests/test_a.py": "x\n"}, "t1")
++    tree = _git(root, "rev-parse", "HEAD^{tree}")
++    assert rip.range_restart_verdict(str(root), tree, head) is False
++
++
++def test_a_git_that_cannot_read_the_repo_stays_uncached(repo, tmp_path):
++    """Exit 128 because the checkout is unreadable (not a repo) is no statement about the commits: None."""
++    root, base = repo
++    head = _commit(root, {"tests/test_a.py": "x\n"}, "t1")
++    assert rip.range_restart_verdict(str(tmp_path / "nope"), base, head) is None
++
++
+ def test_import_error_after_a_restart_free_drift_is_no_skew_mix(repo, monkeypatch, caplog):
+     """``note_import_error`` follows the same rule as ``detect_code_skew``: a tests-only drift is no mix."""
+     root, base = repo
+-- 
+2.43.0
+

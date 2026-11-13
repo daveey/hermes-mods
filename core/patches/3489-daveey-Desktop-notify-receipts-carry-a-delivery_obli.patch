@@ -1,0 +1,616 @@
+From e8ab66d4d7d67fda7cc094e7c1e1c6e1687d783b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:10:09 +0000
+Subject: [PATCH] [daveey] Desktop notify receipts carry a delivery_obligation
+ that survives a backend crash
+
+A Desktop chat's terminal(background=true, notify=true) job finishes in the Desktop backend that hosts
+the chat. _move_to_finished records the result receipt and drops the job's checkpoint entry before
+the chat's poller turns the completion into a notice turn. If that backend then dies uncleanly
+(SIGKILL, OOM: no orderly exit journal), the in-memory completion went with it and nothing re-delivered
+it: recovery reads a receipt as "observed" (result_recorded), and the receipt was retrieval-only for a
+tui-owned job (process_registry_obligations.owes_gateway_delivery covers the messaging gateway only).
+No incident has been shown to hit this window; this is the defense-in-depth follow-up of
+t_01a1d42977b9b3ef (PR #2054, which fixed the proc_70810e2dae05 root cause).
+
+Reuses the PR #1675 obligation/receipt machinery, no second ledger:
+
+- tools/process_registry_obligations.py: a Desktop-owned backend (is_desktop_owned_backend) writes
+  the delivery_obligation for a bare-session-key notify job in the same atomic receipt write, before
+  the checkpoint entry goes. Every new block carries an owner marker ("gateway" | "tui"; a block
+  without one is a gateway's, as before). Recovery re-arms only its own owner's obligations, so a
+  Desktop backend never adopts a gateway obligation and a gateway start never adopts a Desktop one.
+  recover_from_checkpoint(owner="tui") (startup recovery and the 30 s checkpoint keeper) re-arms an
+  owed tui receipt of its own profile whose writer is gone, once, through the re-adopt sink: it parks
+  for the chat and wakes the chat when it is not loaded. A tui obligation this process wrote is never
+  re-armed by itself (it still holds it in memory). Bounded by OBLIGATION_MAX_AGE_SECONDS /
+  OBLIGATION_MAX_RECOVERIES like the gateway's. Gateway behaviour is unchanged.
+- tui_gateway/completion_obligation.py (new topical sibling; session_notifications.py stays at its
+  2000-line cap): settles the obligation on durable delivery into the session (the notice turn's
+  start commit in start_synthesized_turn), on intended suppression (background notifications off, no
+  notice text; wait/log/kill already settle in the registry), and when the orderly-exit journal hands
+  the notice to the turn marker (exit_job_receipts.journal_session_jobs: a custody transfer, so an
+  orderly restart does not deliver it twice).
+
+Tests (tests/tui_gateway/test_tui_completion_obligation.py, real registry, receipts, checkpoint,
+re-adopt sink, poller dispatch and start commit; only the worker start is stubbed):
+1. a Desktop notify job exits and settles, the backend dies without the journal, the next Desktop
+   backend delivers the notice once with exit code 3 and the output;
+2. two more restarts after the ack: no duplicate;
+3. non-notify, CLI/worker-process, other-profile and gateway-owned jobs do not wake, and a gateway
+   start does not adopt a Desktop obligation; a live writer backend keeps its own;
+4. wait / read_log / kill / notifications-off settle it, so nothing is re-delivered;
+5. an orderly restart through the existing journal (finished notice, or a running job the exit stops)
+   delivers exactly once: the journal settles the obligation.
+
+RED on origin/main 91ff285c0a: 9 of 12 failed (no obligation on a tui receipt); the negative
+controls not_notify / cli_process / kill passed there by construction. GREEN: 13/13 (the kill case
+now settles a just-exited job's owed receipt). Mutant: dropping settle_journaled fails both orderly
+exit cases.
+---
+ .../test_tui_completion_obligation.py         | 280 ++++++++++++++++++
+ tools/process_registry_obligations.py         |  58 +++-
+ tui_gateway/completion_obligation.py          |  50 ++++
+ tui_gateway/exit_job_receipts.py              |   3 +
+ tui_gateway/session_notifications.py          |  28 +-
+ 5 files changed, 392 insertions(+), 27 deletions(-)
+ create mode 100644 tests/tui_gateway/test_tui_completion_obligation.py
+ create mode 100644 tui_gateway/completion_obligation.py
+
+diff --git a/tests/tui_gateway/test_tui_completion_obligation.py b/tests/tui_gateway/test_tui_completion_obligation.py
+new file mode 100644
+index 0000000000..3159f14234
+--- /dev/null
++++ b/tests/tui_gateway/test_tui_completion_obligation.py
+@@ -0,0 +1,280 @@
++"""A Desktop chat's finished notify job survives an unclean death of the Desktop backend that held its notice.
++
++``_move_to_finished`` records the job's receipt and drops its checkpoint entry before the chat's poller turns
++the completion into a notice turn. A SIGKILL/OOM of the backend in that gap (no orderly exit journal) used to
++lose the notice: nothing was left running to re-adopt, and recovery reads a receipt as "observed".
++
++The receipt now carries the owed delivery for a Desktop-owned (``owner: tui``) notify job too
++(``tools/process_registry_obligations.py``). It is settled when the notice turn starts, on an intended
++suppression (wait/log/kill, notifications off) or when the orderly-exit journal takes custody
++(``tui_gateway/completion_obligation.py``). The next Desktop backend re-arms an owed receipt whose writer is
++gone, once, through the re-adopt sink, which parks it for the chat and wakes the chat when it is not loaded.
++
++These tests use the real registry, real receipts and checkpoint files in the test home, the real re-adopt
++sink, the real poller dispatch and the real start commit. Only the worker start is stubbed (no model runs).
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import sys
++import types
++
++import pytest
++
++from tests.tui_gateway import test_shutdown_job_receipts as sjr
++from tools import process_registry as pr_mod
++from tools import process_registry_obligations as obligations
++from tools.process_registry import ProcessRegistry, ProcessSession
++from tools.process_registry_obligations import OBLIGATION_KEY
++from tools.process_registry_readopt import recover_tui_orphaned_processes
++from tui_gateway import server
++from tui_gateway.turn_marker import read_turn_marker
++
++STARTED = 1_794_505_311.25
++OUTPUT = "build ok\nCI passed: release verified (RESULT_proc_desk0001)\n"
++_LiveProc, _resume_text, _session = sjr._LiveProc, sjr._resume_text, sjr._session
++_slow_notice_turn = sjr._slow_notice_turn
++
++
++@pytest.fixture()
++def home(monkeypatch, tmp_path):
++    """One home for the turn markers and the process receipts/checkpoint (as in a Desktop backend)."""
++    monkeypatch.setattr(server, "_hermes_home", tmp_path)
++    monkeypatch.setattr(server, "_load_cfg", lambda: sjr.CFG)
++    monkeypatch.setattr(server, "_auto_continue_config", lambda: (True, 15 * 60.0, 2), raising=False)
++    monkeypatch.setattr("hermes_cli.update_lock.update_in_progress", lambda *a, **k: False)
++    monkeypatch.setattr(sjr.up, "_detect_skew", lambda: None)
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    return tmp_path
++
++
++@pytest.fixture()
++def backend(monkeypatch, registry):
++    """The exit path with the real agent-close kill (``test_shutdown_job_receipts.backend``)."""
++    from agent.client_lifecycle import ClientLifecycleMixin
++    import run_agent as ra
++    import tools.computer_use.tool as cu
++
++    monkeypatch.setattr(ra, "cleanup_vm", lambda *a, **k: None)
++    monkeypatch.setattr(ra, "cleanup_browser", lambda *a, **k: None)
++    monkeypatch.setattr(cu, "release_computer_use_session", lambda *a, **k: None)
++    sessions: dict = {}
++
++    def close(sid, *, end_reason="tui_close", predicate=None):
++        session = sessions.pop(sid, None)
++        for owner in (session["agent"]._process_owner_task_ids if session else ()):
++            ClientLifecycleMixin._close_task_resources(session["agent"], owner)
++        return session is not None
++
++    monkeypatch.setattr(server, "_sessions", sessions)
++    monkeypatch.setattr(server, "_close_session_by_id", close)
++    for name in ("_flush_sessions_before_exit", "_release_gateway_wake_owner", "_stop_turns_before_exit"):
++        monkeypatch.setattr(server, name, lambda *a, **k: None)
++    return types.SimpleNamespace(sessions=sessions)
++
++
++@pytest.fixture()
++def registry(monkeypatch, home):
++    """Backend A: a Desktop-owned backend whose receipts and checkpoint live in the test home."""
++    monkeypatch.setattr("hermes_cli.process_identity.is_desktop_owned_backend", lambda argv=None: True)
++    reg = ProcessRegistry()
++
++    def _stop(pid, expected_start=None):
++        for job in (*reg._running.values(), *reg._finished.values()):
++            if job.process is not None and getattr(job.process, "pid", None) == pid:
++                job.process._alive = False
++
++    monkeypatch.setattr(reg, "_terminate_host_pid", _stop)
++    monkeypatch.setattr(pr_mod, "process_registry", reg)
++    return reg
++
++
++def _dead_pid() -> int:
++    child = subprocess.Popen([sys.executable, "-c", "pass"])
++    child.wait()
++    return child.pid
++
++
++def _as_dead_writer(monkeypatch):
++    """The receipt's writer stamp names a backend that is gone (the test itself stands in for both backends)."""
++    dead = _dead_pid()
++    monkeypatch.setattr(obligations, "_writer", lambda: {"writer_pid": dead, "writer_start_time": None})
++
++
++def _job(reg, sid="proc_desk0001", *, notify=True, key="session-key", platform="", interval=0):
++    job = ProcessSession(id=sid, command="gh run watch 77 && ./deploy.sh", task_id="turn-1", owner_task_id="turn-1",
++                         session_key=key, started_at=STARTED, notify_on_complete=notify,
++                         watcher_platform=platform, watcher_chat_id="1" if platform else "",
++                         watcher_interval=interval)
++    job.process = _LiveProc(4242)
++    with reg._lock:
++        reg._running[sid] = job
++    job.append_output(OUTPUT)
++    return job
++
++
++def _finish(reg, job, exit_code=3):
++    assert reg._finish_exited(job, exit_code) is True
++
++
++def _receipt(home, sid="proc_desk0001") -> dict:
++    return json.loads((home / "logs" / "process-results" / f"{sid}.json").read_text())
++
++
++def _next_backend(monkeypatch, owner="tui"):
++    """A fresh backend process: new registry, the Desktop re-adopt sink wired, startup recovery as it runs."""
++    reg = ProcessRegistry()
++    monkeypatch.setattr(pr_mod, "process_registry", reg)
++    monkeypatch.setattr(reg, "start_detached_sweep", lambda *a, **k: False)
++    wakes, threads = [], []
++    monkeypatch.setattr(server, "_wake_chat_for_readopted_exit", wakes.append)
++    reg.on_unknown_exit = lambda evt: threads.append(server._readopted_exit_deliver(evt, registry=reg))
++    if owner == "tui":
++        armed = recover_tui_orphaned_processes(reg)
++    else:
++        armed = reg.recover_from_checkpoint(owner=owner)
++    for thread in threads:
++        if thread is not None:
++            thread.join(5)
++    return reg, armed, wakes
++
++
++def _open_chat_and_poll(reg, session):
++    """The chat's poller: take the parked events it owns and route them (status row, notice turn)."""
++    from tools.process_registry_notifications import format_process_notification
++    emitted: set = set()
++    return server._notif_take_parked("sid", session, reg, lambda events, deferred: server._notif_handle_ready(
++        "sid", session, events, emitted, reg, format_process_notification, deferred))
++
++
++def test_unclean_backend_death_after_settle_delivers_the_notice_once(home, registry, backend, monkeypatch):
++    _as_dead_writer(monkeypatch)
++    job = _job(registry)
++    _finish(registry, job, 3)
++    receipt = _receipt(home)
++    assert receipt["exit_code"] == 3
++    assert receipt.get(OBLIGATION_KEY, {}).get("owner") == "tui", "the owed notice must ride the receipt write"
++    assert "proc_desk0001" not in (home / "processes.json").read_text(), "the checkpoint entry is gone"
++
++    # SIGKILL: no journal, no poller, the in-memory completion is gone with the process.
++    reg, armed, wakes = _next_backend(monkeypatch)
++    assert armed == 1, "the next Desktop backend lost custody of the owed completion"
++    assert wakes == ["session-key"], "an unloaded chat is woken for its owed notice"
++    assert reg.has_parked_events()
++
++    session = backend.sessions["sid"] = _session(home, _notif_held=[])
++    turn = _slow_notice_turn(monkeypatch, block_in=None)
++    assert _open_chat_and_poll(reg, session) == 1
++    assert turn.outcomes == [True] and len(turn.starts) == 1
++    (text,) = turn.texts
++    assert text.count("CI passed: release verified (RESULT_proc_desk0001)") == 1
++    assert "proc_desk0001" in text and "3" in text
++    assert OBLIGATION_KEY not in _receipt(home), "the started notice turn settles the obligation"
++
++    # Acknowledged: later Desktop starts never offer it again.
++    for _ in range(2):
++        reg, armed, wakes = _next_backend(monkeypatch)
++        assert (armed, wakes, reg.has_parked_events()) == (0, [], False)
++    assert _open_chat_and_poll(reg, session) == 0 and len(turn.starts) == 1
++
++
++def test_owed_notice_parks_while_the_writer_backend_lives(home, registry, monkeypatch):
++    """Blue/green: the old backend still runs (it holds the completion in memory), so the new one leaves it."""
++    job = _job(registry)
++    _finish(registry, job, 0)
++    assert _receipt(home)[OBLIGATION_KEY]["writer_pid"] == os.getpid()
++    reg, armed, wakes = _next_backend(monkeypatch)
++    assert (armed, wakes, reg.has_parked_events()) == (0, [], False)
++    assert OBLIGATION_KEY in _receipt(home)
++
++
++def _other_profile(registry, home, monkeypatch):
++    receipt_home = home / "profiles" / "other"
++    receipt_home.mkdir(parents=True)
++    monkeypatch.setenv("HERMES_HOME", str(receipt_home))
++    _finish(registry, _job(registry))
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    return receipt_home
++
++
++def _cli_process(registry, home, monkeypatch):
++    """A CLI/worker process delivers in-process: it never leaves a Desktop obligation."""
++    monkeypatch.setattr("hermes_cli.process_identity.is_desktop_owned_backend", lambda argv=None: False)
++    _finish(registry, _job(registry))
++    return home
++
++
++# case -> (backend A's job, owed owner on its receipt, recovering owner)
++_FOREIGN_CASES = {
++    "not_notify": (lambda reg, home, mp: _finish(reg, _job(reg, notify=False)) or home, None, "tui"),
++    "cli_process": (_cli_process, None, "tui"),
++    "other_profile": (_other_profile, "tui", "tui"),
++    "gateway_owned": (lambda reg, home, mp: _finish(reg, _job(
++        reg, key="agent:main:telegram:dm:1", platform="telegram", interval=5)) or home, "gateway", "tui"),
++    # A Desktop-owned obligation is never adopted by a messaging gateway start.
++    "gateway_start": (lambda reg, home, mp: _finish(reg, _job(reg)) or home, "tui", "gateway"),
++}
++
++
++@pytest.mark.parametrize("case", sorted(_FOREIGN_CASES))
++def test_only_this_profiles_desktop_owed_notices_wake(home, registry, monkeypatch, case):
++    _as_dead_writer(monkeypatch)
++    finish, owner, recovering = _FOREIGN_CASES[case]
++    receipt_home = finish(registry, home, monkeypatch)
++    owed = _receipt(receipt_home).get(OBLIGATION_KEY)
++    assert (owed or {}).get("owner") == owner
++    reg, armed, wakes = _next_backend(monkeypatch, owner=recovering)
++    assert (armed, wakes, reg.has_parked_events(), reg.pending_watchers) == (0, [], False, [])
++    assert _receipt(receipt_home).get(OBLIGATION_KEY) == owed, "another owner's obligation was touched"
++
++
++@pytest.mark.parametrize("consume", ["wait", "log", "kill", "quiet"])
++def test_consumed_or_quiet_completion_is_not_redelivered(home, registry, backend, monkeypatch, consume):
++    _as_dead_writer(monkeypatch)
++    job = _job(registry)
++    _finish(registry, job, 0)
++    assert OBLIGATION_KEY in _receipt(home)
++    if consume == "kill":  # the explicit tool kill of a just-exited job hands the output to its caller
++        registry.kill_process(job.id)
++    elif consume == "wait":
++        registry.wait(job.id, timeout=1)
++    elif consume == "log":
++        registry.read_log(job.id)
++    else:  # the chat's profile has background notifications off: the status row is the whole delivery
++        monkeypatch.setattr(server, "_load_cfg", lambda: {"display": {"background_process_notifications": "off"}})
++        session = backend.sessions["sid"] = _session(home, _notif_held=[])
++        turn = _slow_notice_turn(monkeypatch, block_in=None)
++        registry.park_unowned_event(registry.completion_queue.get_nowait())
++        assert _open_chat_and_poll(registry, session) == 1 and turn.starts == []
++    assert OBLIGATION_KEY not in _receipt(home), f"{consume} must settle the owed notice"
++    reg, armed, wakes = _next_backend(monkeypatch)
++    assert (armed, wakes, reg.has_parked_events()) == (0, [], False)
++
++
++@pytest.mark.parametrize("when", ["finished", "running"])
++def test_orderly_exit_journal_takes_custody_and_delivers_once(home, registry, backend, monkeypatch, when):
++    """A finished notice the chat had not run yet, or a running job the exit stops: the turn marker reports it."""
++    from tui_gateway.exit_job_receipts import journal_background_jobs_before_exit
++    _as_dead_writer(monkeypatch)
++    job = _job(registry)
++    backend.sessions["sid"] = _session(home, _notif_held=[])
++    if when == "finished":
++        _finish(registry, job, 0)
++        assert _receipt(home)[OBLIGATION_KEY]["owner"] == "tui"
++    journal_background_jobs_before_exit()
++    server._shutdown_sessions()
++    marker = read_turn_marker(home, "session-key")
++    assert [(j["session_id"], j["kill_state"]) for j in marker["killed_jobs"]] == [
++        ("proc_desk0001", "completed" if when == "finished" else "killed")]
++    assert OBLIGATION_KEY not in _receipt(home), "the journal took custody: the receipt must not deliver it again"
++
++    registry.completion_queue.queue.clear()  # the next backend has no in-memory queue
++    reg, armed, wakes = _next_backend(monkeypatch)
++    assert (armed, wakes, reg.has_parked_events()) == (0, [], False)
++    text = _resume_text(monkeypatch, home)
++    assert text.count("proc_desk0001") >= 1
++    if when == "finished":
++        assert text.count("CI passed: release verified") == 1
+diff --git a/tools/process_registry_obligations.py b/tools/process_registry_obligations.py
+index 70f5436cbc..7d132198c2 100644
+--- a/tools/process_registry_obligations.py
++++ b/tools/process_registry_obligations.py
+@@ -26,6 +26,13 @@ Recovery is bounded by ``OBLIGATION_MAX_AGE_SECONDS`` and ``OBLIGATION_MAX_RECOV
+ 
+ ``python -m tools.process_registry_obligations reopen proc_<id> ...`` marks the obligation on one
+ existing receipt by exact id. It refuses when a completion admission for that identity already exists.
++
++A Desktop chat's notify job (``owner: tui``) finished in the Desktop backend that hosts the chat carries the same
++block. Its delivery is in that backend's memory until the notice turn starts; a SIGKILL/OOM of the backend
++(no orderly exit journal) lost it. ``tui_gateway/completion_obligation.py`` settles it (turn start, intended
++suppression, the exit journal's custody transfer), and Desktop recovery (``recover_from_checkpoint(owner="tui")``)
++re-arms an owed one whose writer is gone, once per start, through the re-adopt sink. Each owner adopts only its
++own (``owner``; a block without one is the gateway's).
+ """
+ 
+ from __future__ import annotations
+@@ -97,6 +104,22 @@ def owes_gateway_delivery(session) -> bool:
+                                             "watcher_platform": session.watcher_platform}) == OWNER_GATEWAY)
+ 
+ 
++def owes_tui_delivery(session) -> bool:
++    """Whether a finished session's completion is owed to a Desktop chat this Desktop backend hosts (a CLI or
++    worker process delivers in-process and never leaves one behind)."""
++    from tools.process_registry_readopt import OWNER_TUI, checkpoint_entry_owner
++    if not session.notify_on_complete or checkpoint_entry_owner(
++            {"session_key": session.session_key, "watcher_platform": session.watcher_platform}) != OWNER_TUI:
++        return False
++    from hermes_cli.process_identity import is_desktop_owned_backend
++    return is_desktop_owned_backend()
++
++
++def obligation_owner(owed: dict) -> str:
++    from tools.process_registry_readopt import OWNER_GATEWAY
++    return str(owed.get("owner") or OWNER_GATEWAY)
++
++
+ def obligation_for(session, *, owed_since: Optional[float] = None) -> dict:
+     from agent.redact import redact_sensitive_text
+     owed = {f: getattr(session, f) for f in _ROUTE_FIELDS}
+@@ -154,12 +177,16 @@ class ProcessObligationMixin:
+     _owned_here: Any
+     _writer_alive: Any
+     _recovered_watcher: Any
++    _deliver_readopted_event: Any
+ 
+     def _completion_obligation(self, session) -> Optional[dict]:
+         """Called under ``self._lock`` by the receipt writer: the owed-delivery block, or None."""
+-        if session.id in self._completion_consumed or not owes_gateway_delivery(session):
++        from tools.process_registry_readopt import OWNER_GATEWAY, OWNER_TUI
++        if session.id in self._completion_consumed:
+             return None
+-        return obligation_for(session)
++        if owes_gateway_delivery(session):
++            return {**obligation_for(session), "owner": OWNER_GATEWAY}
++        return {**obligation_for(session), "owner": OWNER_TUI} if owes_tui_delivery(session) else None
+ 
+     def _consume_completion(self, session_id: str) -> None:
+         """The agent has the output (wait/log/kill): suppress the autonomous notice, here and across a restart.
+@@ -185,11 +212,12 @@ class ProcessObligationMixin:
+             registry_module.save_completed_result(session, None if consume_output else owed_still(session.id))
+ 
+     def _recover_owed_completions_locked(self, owner: Optional[str]) -> int:
+-        """Under the checkpoint file lock: re-arm a watcher for each owed receipt of this profile."""
+-        from tools.process_registry_readopt import OWNER_GATEWAY, owner_accepts
++        """Under the checkpoint file lock: re-arm each owed receipt of this profile that *owner* holds (a gateway's
++        through a recovered watcher, a Desktop chat's through the re-adopt sink)."""
++        from tools.process_registry_readopt import OWNER_GATEWAY, OWNER_TUI, owner_accepts
+         from tools.process_registry_profiles import scope_profile
+-        if owner != OWNER_GATEWAY:
+-            return 0  # only a messaging gateway runs process watchers
++        if owner not in (OWNER_GATEWAY, OWNER_TUI):
++            return 0  # a managed worker or CLI holds no other process's owed completion
+         from hermes_constants import get_hermes_home
+         directory = get_hermes_home() / "logs" / "process-results"
+         try:
+@@ -200,7 +228,7 @@ class ProcessObligationMixin:
+         for path in paths:
+             record = _read(path) or {}
+             owed = record.get(OBLIGATION_KEY)
+-            if not isinstance(owed, dict):
++            if not isinstance(owed, dict) or obligation_owner(owed) != owner:
+                 continue
+             sid = record["id"]
+             entry = {"session_key": record.get("session_key"), "watcher_platform": owed.get("watcher_platform")}
+@@ -208,8 +236,8 @@ class ProcessObligationMixin:
+                 continue
+             with self._lock:
+                 tracked = sid in self._running or sid in self._finished
+-            if tracked:
+-                continue
++            if tracked or (owner == OWNER_TUI and owed.get("writer_pid") == os.getpid()):
++                continue  # this process still holds it (a Desktop backend parks it in memory for the chat)
+             if owed.get("writer_pid") != os.getpid() and self._writer_alive(owed):
+                 continue  # a live gateway still has this watcher
+             reason, tries = "", 0
+@@ -218,7 +246,7 @@ class ProcessObligationMixin:
+                 if not math.isfinite(age) or tries < 0:
+                     raise ValueError("invalid recovery budget")
+                 if tries >= OBLIGATION_MAX_RECOVERIES:
+-                    reason = f"{tries} gateway starts did not admit it"
++                    reason = f"{tries} {owner} starts did not deliver it"
+                 elif age > OBLIGATION_MAX_AGE_SECONDS:
+                     reason = f"owed for {int(age)}s"
+             except (TypeError, ValueError, OverflowError):
+@@ -244,10 +272,14 @@ class ProcessObligationMixin:
+                 continue
+             with self._lock:
+                 self._finished[sid] = session
+-            self.pending_watchers.append(self._recovered_watcher(session))
++            if owner == OWNER_TUI:  # parks for the chat (woken when it is not loaded here)
++                from tools.process_registry_awaiting import completion_event, publishable
++                self._deliver_readopted_event({**publishable(completion_event(session)), "park_if_unowned": True})
++            else:
++                self.pending_watchers.append(self._recovered_watcher(session))
+             armed += 1
+-            logger.info("Re-armed the watcher for %s (session %s): its completion was owed when the last "
+-                        "gateway stopped (exit %s)", sid, session.session_key or "-", session.exit_code)
++            logger.info("Re-armed the owed completion of %s (session %s): it was owed when the last %s stopped "
++                        "(exit %s)", sid, session.session_key or "-", owner, session.exit_code)
+         return armed
+ 
+     @staticmethod
+diff --git a/tui_gateway/completion_obligation.py b/tui_gateway/completion_obligation.py
+new file mode 100644
+index 0000000000..7b319e35ac
+--- /dev/null
++++ b/tui_gateway/completion_obligation.py
+@@ -0,0 +1,50 @@
++"""[daveey] Settling a Desktop chat's owed completion (``delivery_obligation`` with ``owner: tui``).
++
++A Desktop-owned notify job's result receipt carries the owed notice (``tools/process_registry_obligations.py``)
++from the moment its exit is recorded, so a Desktop backend that dies uncleanly (SIGKILL, OOM: no orderly exit
++journal) does not take the only copy with it; the next Desktop backend re-arms it through the re-adopt sink.
++This backend removes the block once the notice no longer needs it:
++
++- delivered: the notice turn carrying it started (``start_synthesized_turn``'s commit; its crash marker then
++  carries the prompt);
++- intended suppression: the agent consumed the output (wait/log/kill; the registry settles those itself),
++  background notifications are ``off`` for the chat, or the event formats to no text;
++- custody transfer: the orderly-exit journal wrote it into the session's turn marker
++  (``exit_job_receipts.journal_session_jobs``), so the next backend reports it from there, not twice.
++
++Every call is best effort: a failed settle keeps the obligation, and the worst case is one more delivery after
++a crash, never a lost notice.
++"""
++
++from __future__ import annotations
++
++import logging
++from typing import Iterable
++
++logger = logging.getLogger(__name__)
++
++
++def _settle(pids: Iterable, how: str) -> None:
++    try:
++        from tools.process_registry import process_registry
++        for pid in {p for p in pids if isinstance(p, str) and p}:
++            process_registry.settle_completion(pid, how)
++    except Exception:  # health: allow BLE001 -- a failed settle keeps the obligation (at least once)
++        logger.warning("settling owed Desktop completions failed (%s)", how, exc_info=True)
++
++
++def settle_started(offered: Iterable) -> None:
++    """The notice turn carrying these completions (process ids) started: delivered into the session."""
++    _settle(offered, "delivered: Desktop notice turn started")
++
++
++def settle_suppressed(evt: dict, how: str) -> bool:
++    """A completion this chat deliberately does not turn into a notice. Returns True (the routing result)."""
++    if isinstance(evt, dict) and evt.get("type", "completion") == "completion":
++        _settle([evt.get("session_id")], how)
++    return True
++
++
++def settle_journaled(pids: Iterable) -> None:
++    """The orderly-exit journal wrote these jobs into the turn marker: the marker now holds the notice."""
++    _settle(pids, "journaled into the turn marker at backend exit")
+diff --git a/tui_gateway/exit_job_receipts.py b/tui_gateway/exit_job_receipts.py
+index 2331101d0c..d0fedc11f3 100644
+--- a/tui_gateway/exit_job_receipts.py
++++ b/tui_gateway/exit_job_receipts.py
+@@ -197,6 +197,9 @@ def journal_session_jobs(session: dict, reason: str, *, sid: str = "") -> int:
+         else:
+             logger.warning("backend exit: could not journal pending completions of session %s", key)
+     if journaled:
++        # Custody transfer: the marker now carries these notices, so an owed receipt must not deliver them again.
++        from tui_gateway.completion_obligation import settle_journaled
++        settle_journaled(journaled)
+         logger.info("backend exit: session %s journaled %d background job(s) (%s)", key, len(journaled), reason)
+     return len(journaled)
+ 
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 71176caed2..20d34a4c39 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -13,6 +13,7 @@ from .kanban_notice_text import chat_wait_suffix as _kb_chat_wait, failure_suffi
+ from .kanban_notice_text import parent_unclaimed_suffix as _kb_parent_unclaimed, quota_episode_suffix as _kb_quota_episode
+ from .kanban_notice_text import repin_suffix as _kb_repin_notice, timed_out_suffix as _kb_timed_out
+ from .kanban_notice_text import left_open_suffix as _kb_left_open
++from .completion_obligation import settle_started as _settle_started, settle_suppressed as _settle_suppressed
+ 
+ 
+ def _notif_locked_sessions(fn, default):
+@@ -180,9 +181,8 @@ _KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out
+ _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = 5.0
+ 
+ 
+-# [daveey] Completion events (process id → event) a claimed notice turn is about to carry. The turn's start
+-# (``start_synthesized_turn``) moves them to ``_completion_delivered`` + ``COMPLETION_UNSECURED``; until then
+-# they stay in the poller's in-flight custody (backend-exit journal: exit_job_receipts).
++# [daveey] Completion events (pid → event) a claimed notice turn will carry; its start (start_synthesized_turn)
++# moves them to ``_completion_delivered`` + ``COMPLETION_UNSECURED``; until then, poller in-flight custody.
+ NOTIF_OFFERED_COMPLETIONS = "_notif_offered_completions"
+ # Delivered to a started turn whose crash marker is not written yet: the exit journal still reports these.
+ # ``_record_turn_marker`` drops them once the marker (whose prompt carries the notice) is on disk.
+@@ -201,14 +201,12 @@ def start_synthesized_turn(session: dict):
+     ``_sessions_lock`` (it takes ``history_lock``; lock order is ``history_lock`` -> ``_sessions_lock``, since
+     session.resume holds history_lock while it takes _sessions_lock). It yields ``commit(start)``; call that under
+     ``_sessions_lock``, under which alone ``fence_exit_notices`` raises the exit fence, so the fence check and the
+-    worker start are one step with respect to the exit journal (which fences first): fenced → refused (the events
+-    are still in custody and get journaled); started → delivered, and unsecured until the turn's crash marker is
+-    on disk. ``commit`` returns ``start()``'s result (None = not started).
+-
+-    The delivered mark is taken on entry, before the start: a marked completion is also unsecured, and the exit
+-    journal reports unsecured ones, so a fence landing between mark and commit still journals it. A commit that did
+-    not start (fenced, refused, raised or never called) rolls the mark back on exit, after the caller released
+-    ``_sessions_lock``."""
++    worker start are one step for the exit journal (which fences first): fenced → refused (still in custody, so
++    journaled); started → delivered (owed receipts settled), unsecured until the turn's crash marker is on disk.
++    ``commit`` returns ``start()``'s result (None = not started). The delivered mark is taken on entry, before the
++    start: a marked completion is also unsecured and the journal reports those, so a fence landing between mark and
++    commit still journals it. A commit that did not start (fenced, refused, raised or never called) rolls the mark
++    back on exit, after the caller released ``_sessions_lock``."""
+     with session["history_lock"]:
+         synthesized = bool(session.get("_synthesized_turn"))
+         fenced = synthesized and bool(session.get("_exit_notices_pending"))
+@@ -229,7 +227,9 @@ def start_synthesized_turn(session: dict):
+     try:
+         yield commit
+     finally:
+-        if offered and started is None:
++        if offered and started is not None:  # delivered into the session: settle its owed receipt
++            _settle_started(offered)
++        elif offered:
+             with session["history_lock"]:
+                 session.get("_completion_delivered", set()).difference_update(offered)
+                 unsecured = session.get(COMPLETION_UNSECURED) or {}
+@@ -1471,7 +1471,7 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
+         return True
+     text = fmt(evt)
+     if not text:
+-        return True
++        return _settle_suppressed(evt, "no notice text")
+     # Emit once per dedup key: a re-queued completion would otherwise re-emit every 0.5s while the session is busy,
+     # while distinct watch_match events from one process must stay visible.
+     dedup_key = _notification_event_dedup_key(evt)
+@@ -1487,7 +1487,7 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
+     if evt_type != "async_delegation" and _background_notifications_off(session):
+         # The user opted out of process-driven agent wakes: the status row above is the whole
+         # delivery. Subagent results are not process notifications and still land.
+-        return True
++        return _settle_suppressed(evt, "background notifications off")
+     if evt_type == "completion" and completions is not None:
+         completions.append((evt, text))
+         return True
+-- 
+2.43.0
+

@@ -1,0 +1,1133 @@
+From 7d78374d70c11effe454669e7cce672bcee74415 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:16:06 +0000
+Subject: [PATCH] [daveey] kanban: CI-run progress sweep follow-ups (woken card
+ probes now, saturated runners, off-thread bounded sweep)
+
+PR #1956 review nits (card t_01a1d3f39c27f68b), plus the PR #2040 review answers:
+
+1. A card the sweep wakes is the immediate probe for runners-offline.<labels>:
+   apply() appends PROBE_RELEASED_EVENT naming its asserting run (after_run), and
+   shared_blocker_guard lets it spawn (_released_as_probe) until a later run of the
+   card starts. probe_starts alone cannot tell a fresh release from a spent one: a
+   card woken a second time for the same blocker already has its earlier runs (and
+   the wake's synthesized run) there, so it was told it could run now but held for
+   shared_blocker_probe_seconds (review 5889139629). Releases without after_run
+   (probe_stranded_blockers, older rows) keep the probe_starts rule. A card woken
+   while others already wait behind the blocker (filtered with _task_applies, as the
+   guard does) is held with them, and its comment says for how long.
+2. Saturated vs offline runners: when the repo (then org) actions/runners list is
+   readable and an online runner carries the job's labels, the run is busy (park
+   allowed, nothing woken). The org list is read only without an online repo match;
+   its possible false busy (runner groups the repo cannot use) is documented.
+   Otherwise every message says "no runner picked it up in 15 min".
+3. The card scan runs in the sweep on the wake-check pool; submit_sweep does one
+   indexed query on the dispatcher thread and starts a sweep only when a scheduled
+   card's latest park is kind=ci (the sweep's own connection briefly takes the
+   dispatch tick lock; a sweep every minute on every board made a concurrent
+   dispatch_once skip). _LAST_CHECK is pruned to live CI waits per board.
+4. A running sweep counts against the wake-check pool's MAX_CONCURRENT. One sweep
+   reads at most MAX_CARDS_PER_SWEEP runs, least recently checked first, and starts
+   no gh call after SWEEP_BUDGET_SECONDS, the runner-list reads included (a run cut
+   off before its runner list is re-read first next sweep). confirm() documents its
+   up-to-three 20 s gh calls on the park path.
+
+Proof: tests/hermes_cli/test_kanban_ci_progress.py covers each item; every added
+condition has a killing mutant (27/27 + 5/5 earlier, 15/15 for the review answers;
+the old spent rule fails the reviewer's repro test).
+---
+ hermes_cli/kanban_ci_progress.py            | 233 ++++++++--
+ hermes_cli/kanban_shared_blockers.py        |  31 ++
+ hermes_cli/kanban_wake_check.py             |   9 +-
+ tests/hermes_cli/test_kanban_ci_progress.py | 491 +++++++++++++++++++-
+ 4 files changed, 708 insertions(+), 56 deletions(-)
+
+diff --git a/hermes_cli/kanban_ci_progress.py b/hermes_cli/kanban_ci_progress.py
+index b55bf50a5c..bfacfe724e 100644
+--- a/hermes_cli/kanban_ci_progress.py
++++ b/hermes_cli/kanban_ci_progress.py
+@@ -9,12 +9,27 @@ morning, and nothing raised it again.
+ :func:`ci_run_progress` reads a GitHub Actions run's jobs and reports ``not_starting`` when one has been queued
+ longer than ``QUEUED_LIMIT_SECONDS`` with no runner assigned.
+ 
++A job nobody picked up can also mean the runners are online but saturated. When the repo's or org's self-hosted
++runner list is readable (``actions/runners``) and a runner that is ``online`` carries every label the job asks for,
++the run is ``busy`` instead: a park on it is allowed and nothing is woken. When the list is unreadable (the token
++lacks admin scope) the run stays ``not_starting`` and every message says only that no runner picked it up. The org
++list can include runners in groups this repo may not use, so such a runner online for the labels reads as ``busy``
++and nothing is woken (a false negative, never a false wake); the repo list is read first and decides alone when it
++has an online match.
++
+ * Park time (:func:`confirm`, called by ``kanban_awaiting.confirm_remote`` before the write txn): a ``kind=ci``
+   park on such a run is refused with ``ci_run_unstartable`` naming the labels.
+ * While parked (:func:`sweep`, from the dispatcher's wake-check tick): each card whose latest park waits on a
+   GitHub run is re-read at most every ``RECHECK_SECONDS``. On ``not_starting`` the card is woken with a comment and
+   the shared blocker ``runners-offline.<labels>`` is asserted on it, so further cards that hit the same labels
+-  queue behind one probe instead of each sleeping.
++  queue behind one probe instead of each sleeping. The first card woken for a blocker is its probe and may run at
++  once (``kanban_shared_blockers.PROBE_RELEASED_EVENT``); a card woken while others already wait behind it is held
++  with them, and its comment says for how long.
++* Cost: :func:`submit_sweep` does one indexed query on the dispatcher thread and starts a sweep at most every
++  ``SWEEP_EVERY_SECONDS`` per board; the card scan runs in the sweep, on the wake-check pool, and counts against
++  that pool's ``MAX_CONCURRENT`` budget. One sweep reads at most ``MAX_CARDS_PER_SWEEP`` runs (least recently
++  checked first) and starts no ``gh`` call after ``SWEEP_BUDGET_SECONDS``, so it ends at most
++  ``FETCH_TIMEOUT_SECONDS`` past it. A run whose runner list the budget cut off is read again first next sweep.
+ 
+ A ref is checked when it is (or contains) ``<owner>/<repo>/actions/runs/<id>``, or is a bare run id whose wake
+ check names the repo (``gh run view <id> -R owner/repo``). Anything else (a PR, a release, an unknown repo) is
+@@ -45,10 +60,14 @@ logger = logging.getLogger(__name__)
+ 
+ CI_RUN_UNSTARTABLE = "ci_run_unstartable"
+ NOT_STARTING = "not_starting"
++BUSY = "busy"
+ QUEUED_LIMIT_SECONDS = 15 * 60
+ RECHECK_SECONDS = 5 * 60
+ FETCH_TIMEOUT_SECONDS = 20
+ NO_CREDENTIAL_WARN_SECONDS = 60 * 60
++SWEEP_EVERY_SECONDS = 60
++MAX_CARDS_PER_SWEEP = 6
++SWEEP_BUDGET_SECONDS = 90
+ BLOCKER_PREFIX = "runners-offline"
+ AUTHOR = "kanban-dispatcher"
+ 
+@@ -59,6 +78,7 @@ _REPO_FLAG = re.compile(rf"(?:^|\s)(?:-R|--repo)(?:=|\s+)['\"]?({_SLUG})")
+ _GENERIC_LABELS = frozenset({"self-hosted", "linux", "macos", "windows", "x64", "arm64"})
+ 
+ Fetch = Callable[[str, str], dict]
++FetchRunners = Callable[[str], Optional[list]]
+ 
+ 
+ class NoCredential(RuntimeError):
+@@ -69,9 +89,13 @@ class GhMissing(RuntimeError):
+     """No ``gh`` executable: the fix is installing it, not a credential."""
+ 
+ 
++class OverBudget(RuntimeError):
++    """A sweep's ``SWEEP_BUDGET_SECONDS`` ran out before the next ``gh`` call; the run is read again next sweep."""
++
++
+ @dataclass
+ class Progress:
+-    state: str  # "untracked" | "unknown" | "ok" | "not_starting"
++    state: str  # "untracked" | "unknown" | "ok" | "busy" | "not_starting"
+     repo: str = ""
+     run_id: str = ""
+     labels: list[str] = field(default_factory=list)
+@@ -79,6 +103,8 @@ class Progress:
+     detail: str = ""
+     no_credential: bool = False
+     gh_missing: bool = False
++    deferred: bool = False  # unknown: the sweep budget ran out before the runner list was read
++    runners_readable: bool = False  # not_starting: the runner list was read and no online runner matched
+ 
+ 
+ def run_target(ref: str, hint: str = "") -> Optional[tuple[str, str]]:
+@@ -95,8 +121,8 @@ def run_target(ref: str, hint: str = "") -> Optional[tuple[str, str]]:
+     return None
+ 
+ 
+-def _fetch_jobs(repo: str, run_id: str) -> dict:
+-    """The run's jobs from the GitHub API through the home's broker prefix + ``gh``. Raises on any failure:
++def _gh_api(path: str) -> dict:
++    """``gh api <path>`` as JSON through the home's broker prefix + ``gh``. Raises on any failure:
+     :class:`GhMissing` with no gh; :class:`NoCredential` when gh has no usable login or the prefix is unusable
+     (config text never included)."""
+     from hermes_cli.kanban_gh_argv import GhArgvUnavailable, GhNotInstalled, dispatcher_gh_argv
+@@ -106,7 +132,7 @@ def _fetch_jobs(repo: str, run_id: str) -> dict:
+         raise GhMissing(str(exc)) from None
+     except GhArgvUnavailable as exc:
+         raise NoCredential(f"gh unavailable: {exc}") from None
+-    p = subprocess.run([*gh, "api", f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"],
++    p = subprocess.run([*gh, "api", path],
+                        capture_output=True, text=True, timeout=FETCH_TIMEOUT_SECONDS, check=False,
+                        stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace")
+     if p.returncode != 0:
+@@ -119,6 +145,45 @@ def _fetch_jobs(repo: str, run_id: str) -> dict:
+     return json.loads(p.stdout or "{}")
+ 
+ 
++def _fetch_jobs(repo: str, run_id: str) -> dict:
++    """The run's jobs from the GitHub API through ``gh``. Raises on any failure."""
++    return _gh_api(f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100")
++
++
++def _fetch_runners(repo: str, labels: Optional[list[str]] = None, *,
++                   deadline: Optional[float] = None) -> Optional[list]:
++    """Self-hosted runners the repo can use (repo-level, then its owner's org-level). None when neither list is
++    readable: listing runners needs admin scope, which a worker's token often lacks. When the repo list already has
++    an online runner for ``labels`` the org list is not read. The org list may hold runners in groups this repo
++    cannot use (a false ``busy``). Raises :class:`OverBudget` when ``deadline`` (monotonic) passed before a read."""
++    found: Optional[list] = None
++    for path in (f"repos/{repo}/actions/runners?per_page=100",
++                 f"orgs/{repo.split('/', 1)[0]}/actions/runners?per_page=100"):
++        if found and labels is not None and _online_runner(found, labels) is not None:
++            break
++        if deadline is not None and time.monotonic() >= deadline:
++            raise OverBudget(f"sweep budget spent before {path.split('?', 1)[0]} was read")
++        try:
++            data = _gh_api(path)
++        except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
++            logger.debug("ci run progress: %s unreadable: %s", path, exc)
++            continue
++        found = (found or []) + list((data or {}).get("runners") or [])
++    return found
++
++
++def _online_runner(runners: list, labels: list[str]) -> Optional[str]:
++    """Name of an ``online`` runner carrying every label in ``labels`` (case-insensitive), else None."""
++    want = {x.lower() for x in labels}
++    for runner in runners:
++        if not isinstance(runner, dict) or runner.get("status") != "online":
++            continue
++        have = {str(x.get("name") or "").lower() for x in runner.get("labels") or [] if isinstance(x, dict)}
++        if want <= have:
++            return str(runner.get("name") or "(unnamed)")
++    return None
++
++
+ def _epoch(value) -> Optional[int]:
+     if not isinstance(value, str) or not value:
+         return None
+@@ -129,8 +194,12 @@ def _epoch(value) -> Optional[int]:
+ 
+ 
+ def ci_run_progress(ref: str, *, hint: str = "", fetch: Optional[Fetch] = None,
+-                    now: Optional[float] = None) -> Progress:
+-    """Whether a CI run can still start. Never raises: an unreadable run is ``unknown``."""
++                    fetch_runners: Optional[FetchRunners] = None, now: Optional[float] = None,
++                    deadline: Optional[float] = None) -> Progress:
++    """Whether a CI run can still start. Never raises: an unreadable run is ``unknown``; a stuck job whose labels
++    an online runner carries is ``busy`` (saturated runners, not missing ones). A stuck run costs up to three
++    ``gh`` calls (jobs, repo and org runner lists), each bounded by ``FETCH_TIMEOUT_SECONDS``. With ``deadline``
++    (monotonic) no runner-list call starts after it: the run is ``unknown`` with ``deferred`` set."""
+     target = run_target(ref, hint)
+     if target is None:
+         return Progress("untracked")
+@@ -157,13 +226,28 @@ def ci_run_progress(ref: str, *, hint: str = "", fetch: Optional[Fetch] = None,
+     if not stuck:
+         return Progress("ok", repo, run_id)
+     age, labels = max(stuck)
+-    return Progress(NOT_STARTING, repo, run_id, labels, age)
++    try:
++        if deadline is not None and time.monotonic() >= deadline:
++            raise OverBudget("sweep budget spent before the runner list was read")
++        runners = fetch_runners(repo) if fetch_runners else _fetch_runners(repo, labels, deadline=deadline)
++    except OverBudget as exc:
++        return Progress("unknown", repo, run_id, labels, age, detail=str(exc), deferred=True)
++    if runners is not None:
++        name = _online_runner(runners, labels)
++        if name is not None:
++            logger.info("ci run %s/%s queued %ss: runner %s is online for %s, so the runners are saturated",
++                        repo, run_id, age, name, ",".join(labels))
++            return Progress(BUSY, repo, run_id, labels, age,
++                            detail=f"runner {name} is online for those labels; the runners are saturated")
++    return Progress(NOT_STARTING, repo, run_id, labels, age, runners_readable=runners is not None)
+ 
+ 
+ def describe(p: Progress) -> str:
+     labels = ",".join(p.labels) or "(none)"
+-    return (f"CI run {p.run_id} queued {p.queued_seconds // 60} min, no runner for labels {labels} ({p.repo}): no "
+-            "machine is picking it up, so it may never start")
++    seen = ("no online runner has them" if p.runners_readable
++            else "runner list unreadable, so they may be offline or saturated")
++    return (f"CI run {p.run_id} queued {p.queued_seconds // 60} min: no runner picked it up in "
++            f"{QUEUED_LIMIT_SECONDS // 60} min (labels {labels}, {p.repo}; {seen}), so it may never start")
+ 
+ 
+ def blocker_id(labels: list[str]) -> str:
+@@ -173,11 +257,15 @@ def blocker_id(labels: list[str]) -> str:
+     return normalize_blocker_id(".".join([BLOCKER_PREFIX, *specific])) or BLOCKER_PREFIX
+ 
+ 
+-def confirm(awaiting: Optional[dict], *, hint: str = "", fetch: Optional[Fetch] = None) -> None:
+-    """Refuse a ``kind=ci`` park on a run that is not starting. Network: call before the park's write txn."""
++def confirm(awaiting: Optional[dict], *, hint: str = "", fetch: Optional[Fetch] = None,
++            fetch_runners: Optional[FetchRunners] = None) -> None:
++    """Refuse a ``kind=ci`` park on a run that is not starting. Network: call before the park's write txn. A run
++    with a job queued past ``QUEUED_LIMIT_SECONDS`` makes up to three ``gh`` calls here (jobs, then the repo and org
++    runner lists), each up to ``FETCH_TIMEOUT_SECONDS``, so such a park can take about a minute when GitHub hangs;
++    a started or freshly queued run makes one."""
+     if not awaiting or awaiting.get("kind") != "ci":
+         return
+-    p = ci_run_progress(str(awaiting.get("ref") or ""), hint=hint, fetch=fetch)
++    p = ci_run_progress(str(awaiting.get("ref") or ""), hint=hint, fetch=fetch, fetch_runners=fetch_runners)
+     if p.state == "unknown":
+         logger.warning("ci run progress for %s/%s unreadable, allowing the park: %s", p.repo, p.run_id, p.detail)
+         return
+@@ -185,15 +273,16 @@ def confirm(awaiting: Optional[dict], *, hint: str = "", fetch: Optional[Fetch]
+         return
+     from hermes_cli.kanban_awaiting import AwaitingError
+     raise AwaitingError(CI_RUN_UNSTARTABLE, (
+-        f"{describe(p)}. A wait on it would sleep until someone notices. Bring a runner with labels "
+-        f"{','.join(p.labels)} online, or re-run the job on runners that exist (fix the workflow's runs-on), or park "
+-        f"behind the shared blocker: kanban_block(kind='time', blocker_id='{blocker_id(p.labels)}', ...)."))
++        f"{describe(p)}. A wait on it would sleep until someone notices. Get a runner with labels "
++        f"{','.join(p.labels)} taking jobs, or re-run the job on runners that exist (fix the workflow's runs-on), or "
++        f"park behind the shared blocker: kanban_block(kind='time', blocker_id='{blocker_id(p.labels)}', ...)."))
+ 
+ 
+ # --- while parked --------------------------------------------------------------------------------------------
+ 
+ _LOCK = threading.Lock()
+-_LAST_CHECK: dict[tuple[str, str], float] = {}
++_LAST_CHECK: dict[tuple[str, str], float] = {}   # (db, task id) -> monotonic time of its last read; live waits only
++_LAST_SWEEP: dict[str, float] = {}               # db -> monotonic time its last sweep started
+ _SWEEPS: dict[str, Future] = {}
+ # (home, board db) -> monotonic time of the last disabled-check WARNING. Keyed like ``_LAST_CHECK`` (and by home,
+ # whose gh_command_prefix the read used) so one home's warning never hides another's in a multi-home process.
+@@ -234,35 +323,62 @@ def _ci_waits(conn: sqlite3.Connection) -> list[tuple[str, str, str]]:
+     return found
+ 
+ 
++def _others_behind(conn: sqlite3.Connection, task_id: str, bid: str) -> list[str]:
++    """Other live cards already waiting behind the open shared blocker ``bid`` that ``shared_blocker_guard``
++    counts (a provider-scoped blocker ignores cards routed to another provider)."""
++    from hermes_cli import kanban_shared_blockers as ksb
++    st = ksb.blocker_states(conn).get(bid)
++    if st is None or not st.is_open:
++        return []
++    return sorted(t for t in st.behind if t != task_id and ksb._task_applies(conn, st, t))
++
++
+ def apply(conn: sqlite3.Connection, task_id: str, ref: str, p: Progress) -> Optional[str]:
+-    """Wake a card parked on a run that is not starting, comment why, and assert the shared blocker on it."""
++    """Wake a card parked on a run that is not starting, comment why, and assert the shared blocker on it. The
++    first card behind the blocker is released as its probe and may run at once; a later one is held with the
++    others (``shared_blocker_guard``), and the comment says so."""
+     from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_shared_blockers as ksb
+     from hermes_cli.kanban_awaiting import _latest_park
+     from hermes_cli.kanban_wake_check import _wake
+ 
+-    note = (f"Woken: {describe(p)}. Re-parking on this run will be refused ({CI_RUN_UNSTARTABLE}). Bring a runner "
+-            f"for those labels online or re-run on runners that exist; other cards that hit it wait behind the "
+-            f"shared blocker {blocker_id(p.labels)}.")
++    bid = blocker_id(p.labels)
+     with kb.write_txn(conn):
+         awaiting, _reason = _latest_park(conn, task_id)
+         if not isinstance(awaiting, dict) or awaiting.get("kind") != "ci" or str(awaiting.get("ref") or "") != ref:
+             return None  # re-parked on something else since the read
++        others = _others_behind(conn, task_id, bid)
++        if others:
++            minutes = max(1, ksb.probe_interval_seconds() // 60)
++            hold = (f"{len(others)} other card(s) ({', '.join(others[:3])}) already wait behind shared blocker "
++                    f"{bid}, so this card is held with them: one card probes it at a time, at most every {minutes} "
++                    "min, and every held card is woken when it clears.")
++        else:
++            hold = (f"This card is the probe for shared blocker {bid} and can run now; other cards that hit it "
++                    "wait behind it.")
++        note = (f"Woken: {describe(p)}. Re-parking on this run will be refused ({CI_RUN_UNSTARTABLE}). Get a runner "
++                f"for those labels taking jobs or re-run on runners that exist. {hold}")
+         woke = _wake(conn, task_id, CI_RUN_UNSTARTABLE, {
+             "ref": ref, "repo": p.repo, "run_id": p.run_id, "labels": p.labels, "queued_seconds": p.queued_seconds,
+             "note": note})
+         if not woke:
+             return None
+         kb.add_comment(conn, task_id, AUTHOR, note)
+-        bid = blocker_id(p.labels)
+-        kb._synthesize_ended_run(conn, task_id, outcome=CI_RUN_UNSTARTABLE, summary=describe(p),
+-                                 metadata={"blocker_id": bid, "ci_run": ref, "labels": p.labels})
++        run_id = kb._synthesize_ended_run(conn, task_id, outcome=CI_RUN_UNSTARTABLE, summary=describe(p),
++                                          metadata={"blocker_id": bid, "ci_run": ref, "labels": p.labels})
++        if not others:  # spent by the card's next run, not by runs before this one (_released_as_probe)
++            kb._append_event(conn, task_id, ksb.PROBE_RELEASED_EVENT,
++                             {"blocker_id": bid, "via": CI_RUN_UNSTARTABLE, "after_run": run_id})
+     logger.info("kanban: woke %s, %s", task_id, describe(p))
+     return woke
+ 
+ 
+-def sweep(conn: sqlite3.Connection, *, fetch: Optional[Fetch] = None) -> list[str]:
+-    """Re-read every CI-waiting card's run (at most once per ``RECHECK_SECONDS`` per card) and wake the cards
+-    whose run is not starting. Network: run it off the dispatcher thread (``submit_sweep``). Never raises."""
++def sweep(conn: sqlite3.Connection, *, fetch: Optional[Fetch] = None,
++          fetch_runners: Optional[FetchRunners] = None) -> list[str]:
++    """Re-read CI-waiting cards' runs and wake the cards whose run is not starting: each card at most once per
++    ``RECHECK_SECONDS``, at most ``MAX_CARDS_PER_SWEEP`` per sweep (least recently checked first), and no ``gh``
++    call started after ``SWEEP_BUDGET_SECONDS`` (a run cut off before its runner list goes first next sweep).
++    Network: run it off the dispatcher thread (``submit_sweep``). Never raises."""
+     from hermes_cli import kanban_db_connect as kbc
+     from hermes_constants import get_hermes_home
+ 
+@@ -270,14 +386,26 @@ def sweep(conn: sqlite3.Connection, *, fetch: Optional[Fetch] = None) -> list[st
+     try:
+         db = str(kbc._main_db_file(conn) or "")
+         warn_key = (str(get_hermes_home()), db)
+-        for task_id, ref, hint in _ci_waits(conn):
+-            key = (db, task_id)
++        deadline = time.monotonic() + SWEEP_BUDGET_SECONDS
++        waits = _ci_waits(conn)
++        live = {(db, task_id) for task_id, _ref, _hint in waits}
++        now = time.monotonic()
++        with _LOCK:
++            for key in [k for k in _LAST_CHECK if k[0] == db and k not in live]:
++                del _LAST_CHECK[key]  # re-parked on something else, woken or gone
++            due = sorted((_LAST_CHECK.get((db, task_id), float("-inf")), task_id, ref, hint)
++                         for task_id, ref, hint in waits
++                         if now - _LAST_CHECK.get((db, task_id), float("-inf")) >= RECHECK_SECONDS)
++        for checked, (_last, task_id, ref, hint) in enumerate(due):
++            if checked >= MAX_CARDS_PER_SWEEP or time.monotonic() >= deadline:
++                break  # the rest are the least recently checked ones next sweep
+             with _LOCK:
+-                last = _LAST_CHECK.get(key)
+-                if last is not None and time.monotonic() - last < RECHECK_SECONDS:
+-                    continue
+-                _LAST_CHECK[key] = time.monotonic()
+-            p = ci_run_progress(ref, hint=hint, fetch=fetch)
++                _LAST_CHECK[(db, task_id)] = time.monotonic()
++            p = ci_run_progress(ref, hint=hint, fetch=fetch, fetch_runners=fetch_runners, deadline=deadline)
++            if p.deferred:
++                with _LOCK:
++                    _LAST_CHECK.pop((db, task_id), None)  # least recently checked: first next sweep
++                continue
+             if p.no_credential or p.gh_missing:
+                 _warn_disabled(p, warn_key)
+             elif p.state == "unknown":
+@@ -315,20 +443,49 @@ def _sweep_db(db_path: str, home: str) -> list[str]:
+         return []
+ 
+ 
+-def submit_sweep(conn: sqlite3.Connection, pool) -> Optional[Future]:
+-    """Start one :func:`sweep` of this board on ``pool`` unless one is already running. Never raises. The home
+-    is resolved here, on the dispatcher thread that has the board's home bound, and rebound on the pool thread."""
++_CI_WAIT_SQL = (
++    "SELECT 1 FROM tasks t WHERE t.status = 'scheduled' AND (SELECT CASE WHEN json_valid(e.payload) "
++    "THEN json_extract(e.payload, '$.awaiting.kind') END FROM task_events e WHERE e.task_id = t.id "
++    "AND e.kind IN ('scheduled', 'continued') ORDER BY e.id DESC LIMIT 1) = 'ci' LIMIT 1")
++
++
++def _has_ci_wait(conn: sqlite3.Connection) -> bool:
++    """Whether some scheduled card's latest park is ``kind=ci`` (a superset of :func:`_ci_waits`), in one indexed
++    query. A sweep opens its own connection, which briefly takes the board's dispatch tick lock, so it starts only
++    when it has a CI wait to read, not on every board with a scheduled card. [daveey]"""
++    return conn.execute(_CI_WAIT_SQL).fetchone() is not None
++
++
++def running_sweeps() -> int:
++    """Sweeps in flight on any board: each holds a wake-check pool worker, as a probe does."""
++    with _LOCK:
++        return sum(1 for fut in _SWEEPS.values() if not fut.done())
++
++
++def submit_sweep(conn: sqlite3.Connection, pool, *, slots_free: int = 1) -> Optional[Future]:
++    """Start one :func:`sweep` of this board on ``pool`` when the pool's probe budget has ``slots_free``, no sweep
++    of the board is running, ``SWEEP_EVERY_SECONDS`` passed since its last one and some scheduled card's latest park
++    is ``kind=ci`` (:func:`_has_ci_wait`). Runs on the dispatcher thread, so it does only that one indexed query; the
++    card scan is the sweep's. The home is resolved here, on the dispatcher thread that has the board's home bound,
++    and rebound on the pool thread. Never raises."""
+     from hermes_cli import kanban_db_connect as kbc
+     from hermes_constants import get_hermes_home
+     try:
+         db = str(kbc._main_db_file(conn) or "")
+-        if not db or not _ci_waits(conn):
++        if not db or slots_free <= 0:
+             return None
+         home = str(get_hermes_home())
+         with _LOCK:
+             running = _SWEEPS.get(db)
+             if running is not None and not running.done():
+                 return None
++            last = _LAST_SWEEP.get(db)
++            if last is not None and time.monotonic() - last < SWEEP_EVERY_SECONDS:
++                return None
++        if not _has_ci_wait(conn):
++            return None
++        with _LOCK:
++            _LAST_SWEEP[db] = time.monotonic()
+             fut = pool.submit(_sweep_db, db, home)
+             _SWEEPS[db] = fut
+         return fut
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index ee63854cf2..c60a156d88 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -455,6 +455,8 @@ def shared_blocker_guard(
+             f"SELECT 1 FROM tasks WHERE id IN ({marks}) AND status = 'running' LIMIT 1", others,
+         ).fetchone():
+             return GUARD_REASON   # a probe is already in flight
++    if _released_as_probe(conn, st, task_id):
++        return None
+     if interval is None:
+         interval = probe_interval_seconds()
+     last = max([st.asserted_at, *st.probe_starts.values()])
+@@ -466,6 +468,35 @@ def shared_blocker_guard(
+     return GUARD_REASON
+ 
+ 
++def _released_as_probe(conn: sqlite3.Connection, st: BlockerState, task_id: str) -> bool:
++    """True when ``task_id`` was named the probe for ``st`` (a :data:`PROBE_RELEASED_EVENT` for it) at or after
++    the run that put it behind ``st``, and has not started a run since: the release is spent by one run. The CI
++    sweep (``kanban_ci_progress.apply``) names the first card it wakes for a runner blocker this way, since that
++    card discovered the wall and holding it ``shared_blocker_probe_seconds`` would only delay the fix.
++
++    The newest release for ``st`` decides. One that names its asserting run (``after_run``) is spent only by a
++    later run of the card: ``probe_starts`` also holds runs from before a re-assertion (a card the sweep wakes a
++    second time for the same blocker ran in between, and the wake's own synthesized run is recorded too), so it
++    cannot tell a fresh release from a spent one. A release without ``after_run`` falls back to ``probe_starts``.
++    [daveey]"""
++    from hermes_cli import kanban_db as kb
++
++    asserted = st.behind[task_id]  # the guard only asks about a card behind st
++    for row in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? AND created_at >= ? "
++        "ORDER BY id DESC LIMIT 20", (task_id, PROBE_RELEASED_EVENT, asserted),
++    ):
++        payload = kb._json_dict(row["payload"])
++        if normalize_blocker_id(payload.get("blocker_id")) != st.blocker_id:
++            continue
++        after = payload.get("after_run")
++        if type(after) is int:
++            return conn.execute("SELECT 1 FROM task_runs WHERE task_id = ? AND id > ? LIMIT 1",
++                                (task_id, after)).fetchone() is None
++        return task_id not in st.probe_starts
++    return False
++
++
+ def release_cleared_blockers(conn: sqlite3.Connection, *, now: Optional[int] = None) -> list[str]:
+     """Wake parked cards and retire ready/review hold evidence after a clear.
+     Returns only task ids whose lane changed (ready/review cards remain queued)."""
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index fe7abbef5d..4823fb8cdc 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -966,6 +966,7 @@ def run_due_wake_checks(conn: sqlite3.Connection, *, now: Optional[int] = None,
+     """Start every due probe (at most ``MAX_CONCURRENT`` in flight) and return at once;
+     ``wait=True`` (tests, one-shot callers) also waits up to ``TICK_BUDGET_SECONDS`` for them.
+     Returns ``{"submitted": [task ids], "in_flight": n}``. Never raises."""
++    from hermes_cli import kanban_ci_progress  # [daveey] a card parked on a CI run that never starts
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_db_connect as kbc
+ 
+@@ -998,8 +999,9 @@ def run_due_wake_checks(conn: sqlite3.Connection, *, now: Optional[int] = None,
+             (ts,)).fetchall()
+         for task_id, cmd, every, generation, purpose in due:
+             key = (db_path, task_id)
++            sweeping = kanban_ci_progress.running_sweeps()  # [daveey] a CI sweep holds a pool worker too
+             with _LOCK:
+-                busy = sum(1 for f in _IN_FLIGHT.values() if not f.done())
++                busy = sum(1 for f in _IN_FLIGHT.values() if not f.done()) + sweeping
+                 running = key in _IN_FLIGHT and not _IN_FLIGHT[key].done()
+             if running:
+                 continue
+@@ -1029,8 +1031,9 @@ def run_due_wake_checks(conn: sqlite3.Connection, *, now: Optional[int] = None,
+         with _LOCK:
+             for k in [k for k, f in _IN_FLIGHT.items() if f.done()]:
+                 _IN_FLIGHT.pop(k, None)
+-        from hermes_cli import kanban_ci_progress  # [daveey] a card parked on a CI run that never starts
+-        sweep = kanban_ci_progress.submit_sweep(conn, _pool())
++            busy = len(_IN_FLIGHT)
++        sweep = kanban_ci_progress.submit_sweep(
++            conn, _pool(), slots_free=MAX_CONCURRENT - busy - kanban_ci_progress.running_sweeps())
+         if sweep is not None:
+             futures.append(sweep)
+     except Exception:
+diff --git a/tests/hermes_cli/test_kanban_ci_progress.py b/tests/hermes_cli/test_kanban_ci_progress.py
+index 3b32427e17..a0829c9725 100644
+--- a/tests/hermes_cli/test_kanban_ci_progress.py
++++ b/tests/hermes_cli/test_kanban_ci_progress.py
+@@ -2,7 +2,8 @@
+ 
+ Replays the 2026-11-11 hub incident: t_01a1c8d66aa29009 parked (awaiting kind=ci) on GitHub Actions run
+ 42993449998, whose jobs asked for ``self-hosted,ci-fast`` runners that no longer took jobs. The park was accepted
+-and the card slept until David asked. The fake ``gh`` on PATH serves the run's jobs as GitHub returns them.
++and the card slept until David asked. The fake ``gh`` on PATH serves the run's jobs as GitHub returns them, and the
++repo/org runner lists when a test provides them (403 otherwise, as for a token without admin scope).
+ """
+ from __future__ import annotations
+ 
+@@ -10,19 +11,25 @@ import json
+ import os
+ import stat
+ import sqlite3
++import threading
+ import time
++from concurrent.futures import Future
+ from pathlib import Path
+ 
+ import pytest
+ 
++from hermes_cli import kanban_ci_progress as kcp
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_shared_blockers as ksb
+ from hermes_cli import kanban_wake_check as kwc
+ 
+ REPO = "example-org/hermes"
+ RUN = "42993449998"
+ RUN_URL = f"https://github.com/{REPO}/actions/runs/{RUN}"
+ LABELS = ["self-hosted", "ci-fast"]
++BLOCKER = "runners-offline.ci-fast"
+ 
+ 
+ @pytest.fixture
+@@ -36,14 +43,19 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+     kb.init_db()
+     yield home
+     kwc._shutdown_for_tests()
++    for state in (kcp._LAST_CHECK, kcp._LAST_SWEEP, kcp._SWEEPS):
++        state.clear()
+ 
+ 
+ @pytest.fixture
+ def fake_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+-    """A ``gh`` executable that answers ``gh api repos/<repo>/actions/runs/<id>/jobs`` from a JSON file."""
++    """A ``gh`` executable that answers ``gh api repos/<repo>/actions/runs/<id>/jobs`` from a JSON file, and the
++    repo/org ``actions/runners`` lists from their files when present (HTTP 403 when absent)."""
+     bindir = tmp_path / "bin"
+     bindir.mkdir()
+     jobs = tmp_path / "jobs.json"
++    repo_runners = tmp_path / "runners-repo.json"
++    org_runners = tmp_path / "runners-org.json"
+     calls = tmp_path / "gh-calls.log"
+     script = bindir / "gh"
+     script.write_text(
+@@ -56,6 +68,12 @@ def fake_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+         "    sys.stderr.write('HTTP 401: Bad credentials (https://api.github.com/)\\n'); sys.exit(1)\n"
+         "if os.environ.get('FAKE_GH_FAIL'):\n"
+         "    sys.stderr.write('HTTP 502: Bad Gateway (https://api.github.com/)\\n'); sys.exit(1)\n"
++        "path = sys.argv[-1]\n"
++        "if '/actions/runners' in path:\n"
++        f"    src = {str(org_runners)!r} if path.startswith('orgs/') else {str(repo_runners)!r}\n"
++        "    if not os.path.exists(src):\n"
++        "        sys.stderr.write('HTTP 403: Resource not accessible by integration\\n'); sys.exit(1)\n"
++        "    sys.stdout.write(open(src).read()); sys.exit(0)\n"
+         f"sys.stdout.write(open({str(jobs)!r}).read())\n")
+     script.chmod(script.stat().st_mode | stat.S_IEXEC)
+     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
+@@ -69,12 +87,22 @@ def fake_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+                 "created_at": created, "started_at": started, "labels": LABELS, "runner_name": runner,
+                 "runner_id": 7 if runner else None}]}))
+ 
+-        def calls(self) -> int:
+-            return len(calls.read_text().splitlines()) if calls.exists() else 0
++        def runners(self, *runners: dict, org: bool = False) -> None:
++            (org_runners if org else repo_runners).write_text(json.dumps({"total_count": len(runners),
++                                                                          "runners": list(runners)}))
++
++        def calls(self, what: str = "") -> int:
++            lines = calls.read_text().splitlines() if calls.exists() else []
++            return sum(1 for line in lines if what in line)
+ 
+     return Gh()
+ 
+ 
++def _runner(status: str = "online", labels=("self-hosted", "Linux", "X64", "ci-fast"), busy: bool = True) -> dict:
++    return {"id": 3, "name": "ci-fast-3", "os": "Linux", "status": status, "busy": busy,
++            "labels": [{"id": i, "name": n, "type": "custom"} for i, n in enumerate(labels)]}
++
++
+ def _running(conn) -> str:
+     tid = kb.create_task(conn, title="t", assignee="worker")
+     with kb.write_txn(conn):
+@@ -100,6 +128,21 @@ def _park_on_run(ref: str = RUN_URL, **extra):
+                               "awaiting": {"kind": "ci", "ref": ref, "why": "state CI on the fix"}, **extra})
+ 
+ 
++def _parked(conn, monkeypatch) -> str:
++    """A card parked on the run while it was freshly queued (accepted), as the dispatcher sees it afterwards."""
++    tid = _running(conn)
++    _as_worker(monkeypatch, conn, tid)
++    assert _park_on_run().get("status") == "scheduled"
++    monkeypatch.delenv("HERMES_KANBAN_TASK")
++    return tid
++
++
++def _key(conn, tid) -> tuple[str, str]:
++    return (str(kbc._main_db_file(conn)), tid)
++
++
++# --- park time ------------------------------------------------------------------------------------------------
++
+ def test_park_on_a_run_with_no_runner_for_15_min_is_refused(kanban_home, fake_gh, monkeypatch) -> None:
+     fake_gh.serve(age=20 * 60)
+     with kbc.connect_closing() as conn:
+@@ -108,6 +151,8 @@ def test_park_on_a_run_with_no_runner_for_15_min_is_refused(kanban_home, fake_gh
+         out = _park_on_run()
+         assert "ci_run_unstartable" in (out.get("error") or ""), out
+         assert "ci-fast" in out["error"], out
++        assert "no runner picked it up in 15 min" in out["error"], out
++        assert "runner list unreadable, so they may be offline or saturated" in out["error"], out
+         assert kb.get_task(conn, tid).status == "running"
+ 
+ 
+@@ -143,15 +188,48 @@ def test_github_error_fails_open(kanban_home, fake_gh, monkeypatch, caplog) -> N
+         assert any("ci run progress" in r.getMessage() for r in caplog.records), caplog.text
+ 
+ 
+-def test_parked_card_wakes_when_its_run_stops_starting(kanban_home, fake_gh, monkeypatch) -> None:
+-    from hermes_cli import kanban_shared_blockers as ksb
++# --- saturated vs offline runners -----------------------------------------------------------------------------
+ 
+-    fake_gh.serve(age=2 * 60)
++@pytest.mark.parametrize("org", [False, True], ids=["repo-runners", "org-runners"])
++def test_saturated_online_runners_are_not_offline(kanban_home, fake_gh, monkeypatch, org) -> None:
++    """Control: every matching runner is online and busy, so the job is only waiting its turn."""
++    fake_gh.serve(age=20 * 60)
++    junk_labels = _runner()
++    junk_labels["labels"].insert(1, "junk")
++    fake_gh.runners("junk", junk_labels, org=org)
+     with kbc.connect_closing() as conn:
+         tid = _running(conn)
+         _as_worker(monkeypatch, conn, tid)
+-        assert _park_on_run().get("status") == "scheduled"
++        out = _park_on_run()
++        assert out.get("status") == "scheduled", out
+         monkeypatch.delenv("HERMES_KANBAN_TASK")
++        assert kcp.sweep(conn) == []
++        assert kb.get_task(conn, tid).status == "scheduled"
++        assert BLOCKER not in ksb.blocker_states(conn)
++    p = kcp.ci_run_progress(RUN_URL)
++    assert p.state == kcp.BUSY and "ci-fast-3" in p.detail, p
++
++
++@pytest.mark.parametrize("runner", [_runner(status="offline"), _runner(labels=("self-hosted", "Linux", "ci-slow"))],
++                         ids=["offline", "other-labels"])
++def test_readable_runner_list_without_a_matching_online_runner_refuses(kanban_home, fake_gh, monkeypatch,
++                                                                       runner) -> None:
++    fake_gh.serve(age=20 * 60)
++    fake_gh.runners(runner)
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _park_on_run()
++        assert "ci_run_unstartable" in (out.get("error") or ""), out
++        assert "no online runner has them" in out["error"], out
++
++
++# --- while parked ---------------------------------------------------------------------------------------------
++
++def test_parked_card_wakes_when_its_run_stops_starting(kanban_home, fake_gh, monkeypatch) -> None:
++    fake_gh.serve(age=2 * 60)
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch)
+         # Its own probe says "not yet" (the run never completes); hours pass with no runner.
+         fake_gh.serve(age=20 * 60)
+         with kb.write_txn(conn):
+@@ -163,22 +241,142 @@ def test_parked_card_wakes_when_its_run_stops_starting(kanban_home, fake_gh, mon
+         kinds = [e.kind for e in kb.list_events(conn, tid)]
+         assert "ci_run_unstartable" in kinds, kinds
+         notes = [c.body for c in kb.list_comments(conn, tid)]
+-        assert any(f"run {RUN} queued" in n and "no runner for labels self-hosted,ci-fast" in n for n in notes), notes
++        assert any(f"run {RUN} queued" in n and "no runner picked it up in 15 min (labels self-hosted,ci-fast" in n
++                   for n in notes), notes
+         states = ksb.blocker_states(conn)
+-        assert "runners-offline.ci-fast" in states, states
+-        assert tid in states["runners-offline.ci-fast"].behind
++        assert BLOCKER in states, states
++        assert tid in states[BLOCKER].behind
++        # The card that found the wall is its probe: it runs now, not after shared_blocker_probe_seconds.
++        assert ksb.PROBE_RELEASED_EVENT in kinds, kinds
++        assert any(f"is the probe for shared blocker {BLOCKER} and can run now" in n for n in notes), notes
++        assert kbd.check_respawn_guard(conn, tid) is None
+ 
+ 
+-def test_ci_sweep_reads_github_at_most_every_5_min_per_card(kanban_home, fake_gh, monkeypatch) -> None:
++def test_second_card_woken_behind_the_same_blocker_is_held_and_told_why(kanban_home, fake_gh, monkeypatch) -> None:
+     fake_gh.serve(age=2 * 60)
+     with kbc.connect_closing() as conn:
+-        tid = _running(conn)
++        first, second = sorted([_parked(conn, monkeypatch), _parked(conn, monkeypatch)])
++        fake_gh.serve(age=20 * 60)
++        assert kcp.sweep(conn) == [first, second]
++        assert kbd.check_respawn_guard(conn, first) is None
++        assert kbd.check_respawn_guard(conn, second) == ksb.GUARD_REASON
++        assert ksb.PROBE_RELEASED_EVENT not in [e.kind for e in kb.list_events(conn, second)]
++        notes = [c.body for c in kb.list_comments(conn, second)]
++        assert any(f"1 other card(s) ({first}) already wait behind shared blocker {BLOCKER}" in n
++                   and "at most every 30 min" in n for n in notes), notes
++
++
++def test_probe_release_is_spent_by_one_run(kanban_home, fake_gh, monkeypatch) -> None:
++    fake_gh.serve(age=2 * 60)
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch)
++        fake_gh.serve(age=20 * 60)
++        assert kcp.sweep(conn) == [tid]
++        assert kbd.check_respawn_guard(conn, tid) is None
++        # It ran as the probe and crashed (says nothing about the wall): now it waits the interval like any card.
++        with kb.write_txn(conn):
++            kb._synthesize_ended_run(conn, tid, outcome="crashed", summary="probe crashed")
++        assert kbd.check_respawn_guard(conn, tid) == ksb.GUARD_REASON
++
++
++@pytest.mark.parametrize("stale", ["other-blocker", "before-assertion"])
++def test_probe_release_must_name_this_blocker_after_the_card_asserted_it(kanban_home, stale) -> None:
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="t", assignee="worker")
++        with kb.write_txn(conn):
++            kb._synthesize_ended_run(conn, tid, outcome=kcp.CI_RUN_UNSTARTABLE, summary="no runner",
++                                     metadata={"blocker_id": BLOCKER})
++            kb._append_event(conn, tid, ksb.PROBE_RELEASED_EVENT,
++                             {"blocker_id": "runners-offline.ci-slow" if stale == "other-blocker" else BLOCKER})
++            if stale == "before-assertion":
++                conn.execute("UPDATE task_events SET created_at = created_at - 60 WHERE task_id = ? AND kind = ?",
++                             (tid, ksb.PROBE_RELEASED_EVENT))
++            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++        assert ksb.shared_blocker_guard(conn, tid) == ksb.GUARD_REASON
++
++
++def test_card_woken_again_for_the_same_blocker_is_the_probe_again(kanban_home, fake_gh, monkeypatch) -> None:
++    """PR #2040 review: the card ran as the probe, re-parked on a freshly queued re-run, and that run stalled too.
++    Its earlier runs (and the wake's synthesized one) are in ``probe_starts``; the new release must still hold."""
++    fake_gh.serve(age=2 * 60)
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch)
++        fake_gh.serve(age=20 * 60)
++        assert kcp.sweep(conn) == [tid]
++        assert kb.claim_task(conn, tid, claimer="worker") is not None
+         _as_worker(monkeypatch, conn, tid)
++        fake_gh.serve(age=2 * 60)
+         assert _park_on_run().get("status") == "scheduled"
+         monkeypatch.delenv("HERMES_KANBAN_TASK")
++        kcp._LAST_CHECK.clear()
++        fake_gh.serve(age=20 * 60)
++        assert kcp.sweep(conn) == [tid]
++        assert tid in ksb.blocker_states(conn)[BLOCKER].probe_starts
++        notes = [c.body for c in kb.list_comments(conn, tid)]
++        assert f"is the probe for shared blocker {BLOCKER} and can run now" in notes[-1], notes
++        assert kbd.check_respawn_guard(conn, tid) is None
++        with kb.write_txn(conn):  # its next run spends this release too
++            kb._synthesize_ended_run(conn, tid, outcome="crashed", summary="probe crashed")
++        assert kbd.check_respawn_guard(conn, tid) == ksb.GUARD_REASON
++
++
++def test_release_without_a_run_id_is_spent_by_any_probe_start(kanban_home) -> None:
++    """A release that names no asserting run (``probe_stranded_blockers``, or written before ``after_run``)."""
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="t", assignee="worker")
++        with kb.write_txn(conn):
++            kb._synthesize_ended_run(conn, tid, outcome=kcp.CI_RUN_UNSTARTABLE, summary="no runner",
++                                     metadata={"blocker_id": BLOCKER})
++            kb._append_event(conn, tid, ksb.PROBE_RELEASED_EVENT, {"blocker_id": BLOCKER})
++            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++        assert ksb.shared_blocker_guard(conn, tid) is None
++        with kb.write_txn(conn):
++            kb._synthesize_ended_run(conn, tid, outcome="crashed", summary="probe crashed")
++        assert ksb.shared_blocker_guard(conn, tid) == ksb.GUARD_REASON
++
++
++def test_scoped_blocker_card_on_another_provider_does_not_hold_the_woken_card(kanban_home, fake_gh,
++                                                                              monkeypatch) -> None:
++    """``_others_behind`` counts only the cards ``shared_blocker_guard`` counts (PR #2040 review)."""
++    fake_gh.serve(age=2 * 60)
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch)
++        other = kb.create_task(conn, title="other", assignee="worker")
++        with kb.write_txn(conn):
++            kb._synthesize_ended_run(conn, other, outcome=kcp.CI_RUN_UNSTARTABLE, summary="no runner",
++                                     metadata={"blocker_id": BLOCKER, "blocker_provider": "anthropic"})
++        routes = {other: "openai"}
++        monkeypatch.setattr(ksb, "task_route", lambda _c, t: (None, routes.get(t), "ready"))
++        fake_gh.serve(age=20 * 60)
++        assert kcp.sweep(conn) == [tid]
++        notes = [c.body for c in kb.list_comments(conn, tid)]
++        assert f"is the probe for shared blocker {BLOCKER} and can run now" in notes[-1], notes
++        assert ksb.PROBE_RELEASED_EVENT in [e.kind for e in kb.list_events(conn, tid)]
++
++
++def test_scoped_blocker_card_on_the_same_provider_holds_the_woken_card(kanban_home, fake_gh, monkeypatch) -> None:
++    """Control for the test above: the other card's route matches the blocker's provider."""
++    fake_gh.serve(age=2 * 60)
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch)
++        other = kb.create_task(conn, title="other", assignee="worker")
++        with kb.write_txn(conn):
++            kb._synthesize_ended_run(conn, other, outcome=kcp.CI_RUN_UNSTARTABLE, summary="no runner",
++                                     metadata={"blocker_id": BLOCKER, "blocker_provider": "anthropic"})
++        monkeypatch.setattr(ksb, "task_route", lambda _c, t: (None, "anthropic", "ready"))
++        fake_gh.serve(age=20 * 60)
++        assert kcp.sweep(conn) == [tid]
++        notes = [c.body for c in kb.list_comments(conn, tid)]
++        assert f"1 other card(s) ({other}) already wait behind shared blocker {BLOCKER}" in notes[-1], notes
++
++
++def test_ci_sweep_reads_github_at_most_every_5_min_per_card(kanban_home, fake_gh, monkeypatch) -> None:
++    fake_gh.serve(age=2 * 60)
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch)
+         parked = fake_gh.calls()
+         for _ in range(3):
+-            kwc.run_due_wake_checks(conn, wait=True)
++            kcp.sweep(conn)
+         assert fake_gh.calls() == parked + 1
+         assert kb.get_task(conn, tid).status == "scheduled", [(e.kind, e.payload) for e in kb.list_events(conn, tid)][-3:]
+ 
+@@ -408,7 +606,7 @@ def test_a_raising_pool_callable_does_not_escape_the_wake_check_tick(kanban_home
+     def boom() -> list[str]:
+         raise RuntimeError("pool callable blew up")
+ 
+-    monkeypatch.setattr(kcp, "submit_sweep", lambda conn, pool: pool.submit(boom))
++    monkeypatch.setattr(kcp, "submit_sweep", lambda conn, pool, **_kw: pool.submit(boom))
+     with kbc.connect_closing() as conn, caplog.at_level("WARNING", logger=kwc.logger.name):
+         out = kwc.run_due_wake_checks(conn, wait=True)
+     assert out == {"submitted": [], "in_flight": 0}, out
+@@ -431,3 +629,266 @@ def test_close_failure_after_a_sweep_keeps_the_result_and_says_close(kanban_home
+     msgs = [r.getMessage() for r in caplog.records]
+     assert any("closing" in m and "after the sweep" in m for m in msgs), msgs
+     assert not any("failed" in m and "sweep of" in m for m in msgs), msgs
++
++
++def test_sweep_forgets_cards_that_stopped_waiting_on_ci(kanban_home, fake_gh, monkeypatch) -> None:
++    fake_gh.serve(age=2 * 60)
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch)
++        kcp.sweep(conn)
++        assert _key(conn, tid) in kcp._LAST_CHECK
++        other_board = ("/elsewhere/kanban.db", tid)
++        kcp._LAST_CHECK[other_board] = time.monotonic()
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++        kcp.sweep(conn)
++        assert _key(conn, tid) not in kcp._LAST_CHECK
++        assert other_board in kcp._LAST_CHECK  # another board's sweep owns its own entries
++
++
++def test_card_woken_after_the_blocker_cleared_is_the_new_probe(kanban_home, fake_gh, monkeypatch) -> None:
++    """A card still listed behind a CLEARED blocker is not a probe in flight: the next woken card probes at once."""
++    fake_gh.serve(age=2 * 60)
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch)
++        stale, done = kb.create_task(conn, title="stale", assignee="worker"), kb.create_task(conn, title="d",
++                                                                                           assignee="worker")
++        with kb.write_txn(conn):
++            for card in (stale, done):
++                kb._synthesize_ended_run(conn, card, outcome=kcp.CI_RUN_UNSTARTABLE, summary="no runner",
++                                         metadata={"blocker_id": BLOCKER})
++            kb._synthesize_ended_run(conn, done, outcome="completed", summary="ran on the runner")
++            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (stale,))
++        st = ksb.blocker_states(conn)[BLOCKER]
++        assert stale in st.behind and not st.is_open
++        fake_gh.serve(age=20 * 60)
++        assert kcp.sweep(conn) == [tid]
++        assert ksb.PROBE_RELEASED_EVENT in [e.kind for e in kb.list_events(conn, tid)]
++
++
++def test_sweep_reads_at_most_max_cards_least_recently_checked_first(kanban_home, fake_gh, monkeypatch) -> None:
++    fake_gh.serve(age=2 * 60)
++    monkeypatch.setattr(kcp, "MAX_CARDS_PER_SWEEP", 1)
++    with kbc.connect_closing() as conn:
++        first, second = sorted([_parked(conn, monkeypatch), _parked(conn, monkeypatch)])
++        jobs = fake_gh.calls("/jobs")
++        kcp.sweep(conn)
++        assert fake_gh.calls("/jobs") == jobs + 1
++        assert _key(conn, first) in kcp._LAST_CHECK and _key(conn, second) not in kcp._LAST_CHECK
++        monkeypatch.setattr(kcp, "RECHECK_SECONDS", 0)  # both due again: the never-checked one goes first
++        kcp.sweep(conn)
++        assert _key(conn, second) in kcp._LAST_CHECK
++
++
++def test_sweep_starts_no_read_past_its_time_budget(kanban_home, fake_gh, monkeypatch) -> None:
++    fake_gh.serve(age=2 * 60)
++    monkeypatch.setattr(kcp, "SWEEP_BUDGET_SECONDS", 0)
++    with kbc.connect_closing() as conn:
++        _parked(conn, monkeypatch)
++        jobs = fake_gh.calls("/jobs")
++        kcp.sweep(conn)
++        assert fake_gh.calls("/jobs") == jobs
++
++
++class _Clock:
++    """``kcp.time`` with a monotonic clock that each fake ``gh api`` call advances by ``step`` seconds."""
++
++    def __init__(self, step: float) -> None:
++        self.now, self.step = 1000.0, step
++
++    def monotonic(self) -> float:
++        return self.now
++
++    def __getattr__(self, name):
++        return getattr(time, name)
++
++
++def _slow_gh(monkeypatch, clock: _Clock, repo_runners: list) -> list[str]:
++    """Fake ``_gh_api``: a stuck job, ``repo_runners`` for the repo list; records every path read."""
++    created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 20 * 60))
++    paths: list[str] = []
++
++    def api(path: str) -> dict:
++        paths.append(path.split("?", 1)[0])
++        clock.now += clock.step
++        if path.startswith("orgs/"):
++            return {"runners": [_runner()]}
++        if "/actions/runners" in path:
++            return {"runners": repo_runners}
++        return {"jobs": [{"status": "queued", "runner_name": None, "created_at": created, "labels": LABELS}]}
++
++    monkeypatch.setattr(kcp, "time", clock)
++    monkeypatch.setattr(kcp, "_gh_api", api)
++    return paths
++
++
++@pytest.mark.parametrize("step,reads", [(120, 1), (60, 2)], ids=["before-repo-list", "before-org-list"])
++def test_sweep_starts_no_gh_call_past_its_budget_and_rereads_that_run_first(kanban_home, fake_gh, monkeypatch,
++                                                                            step, reads) -> None:
++    """PR #2040 review: a stuck run makes up to three 20 s calls; the budget must stop the runner-list ones too."""
++    monkeypatch.setattr(kcp, "SWEEP_BUDGET_SECONDS", 100)
++    fake_gh.serve(age=2 * 60)
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch)
++        paths = _slow_gh(monkeypatch, _Clock(step), [_runner(status="offline")])
++        assert kcp.sweep(conn) == []
++        assert len(paths) == reads, paths
++        assert kb.get_task(conn, tid).status == "scheduled"
++        assert _key(conn, tid) not in kcp._LAST_CHECK  # first in line next sweep, not 5 min later
++        assert kcp.sweep(conn) == [] and len(paths) == 2 * reads, paths  # re-read at once
++
++
++def test_runner_list_read_needs_budget_left(kanban_home) -> None:
++    def runners(_repo):
++        raise AssertionError("runner list read after the deadline")
++
++    p = kcp.ci_run_progress(RUN_URL, fetch=lambda *_: {"jobs": [{
++        "status": "queued", "runner_name": None, "labels": LABELS,
++        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 20 * 60))}]},
++        fetch_runners=runners, deadline=time.monotonic() - 1)
++    assert p.state == "unknown" and p.deferred and p.labels == LABELS, p
++
++
++@pytest.mark.parametrize("repo_runners,org_read", [([_runner()], False), ([_runner(status="offline")], True)],
++                         ids=["repo-online-match", "repo-offline-only"])
++def test_org_runner_list_is_read_only_without_an_online_repo_match(kanban_home, monkeypatch, repo_runners,
++                                                                   org_read) -> None:
++    paths = _slow_gh(monkeypatch, _Clock(0), repo_runners)
++    p = kcp.ci_run_progress(RUN_URL)
++    assert p.state == kcp.BUSY, p
++    assert any(x.startswith("orgs/") for x in paths) is org_read, paths
++
++
++# --- dispatcher tick cost and pool budget ---------------------------------------------------------------------
++
++def _record_scans(monkeypatch) -> list[threading.Thread]:
++    seen: list[threading.Thread] = []
++    real = kcp._ci_waits
++
++    def scan(conn):
++        seen.append(threading.current_thread())
++        return real(conn)
++
++    monkeypatch.setattr(kcp, "_ci_waits", scan)
++    return seen
++
++
++def test_dispatcher_tick_scans_off_thread_and_at_most_once_a_minute(kanban_home, fake_gh, monkeypatch) -> None:
++    fake_gh.serve(age=2 * 60)
++    with kbc.connect_closing() as conn:
++        _parked(conn, monkeypatch)
++        seen = _record_scans(monkeypatch)
++        kwc.run_due_wake_checks(conn, wait=True)
++        kwc.run_due_wake_checks(conn, wait=True)
++        assert len(seen) == 1 and seen[0] is not threading.current_thread(), seen
++        monkeypatch.setattr(kcp, "SWEEP_EVERY_SECONDS", 0)
++        kwc.run_due_wake_checks(conn, wait=True)
++        assert len(seen) == 2, seen
++
++
++def test_no_sweep_when_no_card_is_scheduled(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        seen = _record_scans(monkeypatch)
++        kwc.run_due_wake_checks(conn, wait=True)
++        assert seen == []
++
++
++def test_sweep_starts_only_for_a_scheduled_card_whose_latest_park_is_ci(kanban_home, fake_gh, monkeypatch) -> None:
++    """A sweep opens its own connection, which briefly takes the board's dispatch tick lock (a concurrent
++    ``dispatch_once`` then returns ``skipped_locked``), so a board whose scheduled cards wait on anything but a CI
++    run never starts one. [daveey]"""
++    monkeypatch.setattr(kcp, "SWEEP_EVERY_SECONDS", 0)
++    started: Future = Future()
++    started.set_result([])  # done at once, so the next call is not refused as "a sweep is running"
++
++    class Pool:
++        def submit(self, *_a):
++            return started
++
++    def latest(conn, tid, payload) -> None:
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "scheduled", payload)
++
++    fake_gh.serve(age=2 * 60)
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch)
++        assert kcp.submit_sweep(conn, Pool()) is started
++        latest(conn, tid, {"reason": "SCHEDULED_UNTIL=later", "awaiting": {"kind": "clock"}})
++        assert kcp.submit_sweep(conn, Pool()) is None          # re-parked on a clock: its CI park is history
++        latest(conn, tid, {"reason": "back on CI", "awaiting": {"kind": "ci", "ref": RUN_URL}})
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "commented", {"author": "someone"})   # not a park: the CI park stands
++        assert kcp.submit_sweep(conn, Pool()) is started
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++        assert kcp.submit_sweep(conn, Pool()) is None          # not parked any more
++        other = _running(conn)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status = 'scheduled' WHERE id = ?", (other,))
++            conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'scheduled', "
++                         "'{not json', ?)", (other, int(time.time())))
++        assert kcp.submit_sweep(conn, Pool()) is None
++        _parked(conn, monkeypatch)                             # scanned after the malformed one
++        assert kcp.submit_sweep(conn, Pool()) is started       # one malformed park does not hide the CI wait
++
++
++def test_no_second_sweep_of_a_board_while_one_runs(kanban_home, fake_gh, monkeypatch) -> None:
++    monkeypatch.setattr(kcp, "SWEEP_EVERY_SECONDS", 0)
++    pending: Future = Future()
++
++    class Pool:
++        submitted = 0
++
++        def submit(self, *_a):
++            Pool.submitted += 1
++            return pending
++
++    fake_gh.serve(age=2 * 60)
++    with kbc.connect_closing() as conn:
++        _parked(conn, monkeypatch)
++        assert kcp.submit_sweep(conn, Pool()) is pending
++        assert kcp.submit_sweep(conn, Pool()) is None
++        assert Pool.submitted == 1
++        pending.set_result([])
++        assert kcp.submit_sweep(conn, Pool()) is pending
++
++
++def test_no_sweep_without_a_free_pool_slot(kanban_home, fake_gh, monkeypatch) -> None:
++    fake_gh.serve(age=2 * 60)
++    with kbc.connect_closing() as conn:
++        _parked(conn, monkeypatch)
++        seen = _record_scans(monkeypatch)
++        assert kcp.submit_sweep(conn, kwc._pool(), slots_free=0) is None
++        # Another board's sweep fills the only slot: this board's waits for it.
++        monkeypatch.setattr(kwc, "MAX_CONCURRENT", 1)
++        monkeypatch.setitem(kcp._SWEEPS, "/elsewhere/kanban.db", Future())
++        kwc.run_due_wake_checks(conn, wait=True)
++        assert seen == []
++
++
++def test_a_running_sweep_counts_against_the_probe_budget(kanban_home, fake_gh, monkeypatch) -> None:
++    monkeypatch.setattr(kwc, "MAX_CONCURRENT", 1)
++    release = threading.Event()
++    started = threading.Event()
++
++    def slow_sweep(_db, _home):
++        started.set()
++        release.wait(30)
++        return []
++
++    monkeypatch.setattr(kcp, "_sweep_db", slow_sweep)
++    fake_gh.serve(age=2 * 60)
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch)
++        with kb.write_txn(conn):  # its own probe is not due yet: this tick only starts the sweep
++            conn.execute("UPDATE task_wake_checks SET next_at = ? WHERE task_id = ?", (int(time.time()) + 3600, tid))
++        kwc.run_due_wake_checks(conn)
++        assert started.wait(10)
++        try:
++            with kb.write_txn(conn):
++                conn.execute("UPDATE task_wake_checks SET next_at = 0 WHERE task_id = ?", (tid,))
++            assert kwc.run_due_wake_checks(conn)["submitted"] == []
++        finally:
++            release.set()
++        kcp._SWEEPS.clear()
++        assert kwc.run_due_wake_checks(conn, wait=True)["submitted"] == [tid]
+-- 
+2.43.0
+

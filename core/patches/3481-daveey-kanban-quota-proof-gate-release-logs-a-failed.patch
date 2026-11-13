@@ -1,0 +1,108 @@
+From 8e9f90576d962a3e55da6ea0d4a62c2745eb3330 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:15:53 +0000
+Subject: [PATCH] [daveey] kanban: quota proof gate release logs a failed
+ DELETE at debug; docstring covers every release (PR #2145 review nits)
+
+Review 5890358616 on PR #2145 left three non-blocking nits on
+hermes_cli/kanban_quota_recovery.py:
+
+1. `_release_proof`'s docstring said only "a verified proof clears its
+   reservation". It now also names the unprobed (deadline passed after
+   reserve), cancelled and successful-late releases, idempotence, and
+   the best-effort failure mode.
+2. `_release_proof` swallowed every gate error via
+   `contextlib.suppress(Exception)`. Called from `settle`, a proof
+   thread's done-callback, with the gate's 0.25 s sqlite timeout, a
+   locked gate silently left the 600 s row. It now logs the exception at
+   DEBUG with exc_info and still never raises.
+3. The in-loop `_release_proof` before the CAS in `recover()` is kept,
+   with a comment: CPython invokes done-callbacks after as_completed's
+   waiter is woken, so settle()'s release can still be pending when
+   recover() returns; the synchronous release is what lets an immediate
+   second recover() probe the account again
+   (test_verified_proof_releases_its_cooldown relies on it). DELETE is
+   idempotent, so the double release is harmless.
+
+Proof:
+- RED: new test_failed_gate_release_logs_debug_and_never_raises fails on
+  origin/main's source (no DEBUG record), passes with this change.
+- GREEN: test_kanban_quota_recovery.py, test_kanban_quota_completion_mutations.py,
+  test_kanban_quota_dns_deadline.py (every test importing the module):
+  84 passed.
+---
+ hermes_cli/kanban_quota_recovery.py            | 18 +++++++++++++++---
+ tests/hermes_cli/test_kanban_quota_recovery.py | 17 +++++++++++++++++
+ 2 files changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_quota_recovery.py b/hermes_cli/kanban_quota_recovery.py
+index a91d355a1e..35b9ec5855 100644
+--- a/hermes_cli/kanban_quota_recovery.py
++++ b/hermes_cli/kanban_quota_recovery.py
+@@ -235,13 +235,23 @@ def _reserve_proofs(provider, model, entries, now, *, path=None):
+ 
+ 
+ def _release_proof(provider, model, entry, *, path=None):
+-    """A verified proof clears its reservation so the next bench of this account probes at once."""
++    """Drop an account's reservation so its next bench probes at once.
++
++    Called for every reservation that must not stand for the cooldown window: a successful proof
++    (before or after the deadline), a cancelled proof, and an entry left unprobed because the
++    deadline passed after the reserve. Idempotent (a DELETE). Best effort: a locked or broken gate
++    (0.25 s sqlite timeout) is logged at debug and swallowed, leaving the row to expire.
++    """
+     from contextlib import closing
+     key = _proof_key(provider, model, entry)
+     if key is None:
+         return
+-    with contextlib.suppress(Exception), closing(_gate_connect(path or _proof_gate_path())) as conn, conn:
+-        conn.execute('DELETE FROM proofs WHERE key=?', (key,))
++    try:
++        with closing(_gate_connect(path or _proof_gate_path())) as conn, conn:
++            conn.execute('DELETE FROM proofs WHERE key=?', (key,))
++    except Exception:  # health: allow BLE001 -- runs in a proof thread's done-callback; never raise
++        import logging
++        logging.getLogger(__name__).debug('quota proof gate release failed; row expires', exc_info=True)
+ 
+ 
+ def _eligible(entry, provider, model, now, disabled):
+@@ -313,6 +323,8 @@ def recover(provider, model, *, seconds=None):
+                     break
+                 if not future.exception() and future.result() and time.monotonic() < deadline:
+                     observed = futures[future]
++                    # Intentional, though settle() also releases: done-callbacks run after
++                    # as_completed's waiter wakes, so only this release is done before we return.
+                     _release_proof(provider, model, observed)
+                     if pool.clear_verified_model_cooldown(observed, model):
+                         cleared = True
+diff --git a/tests/hermes_cli/test_kanban_quota_recovery.py b/tests/hermes_cli/test_kanban_quota_recovery.py
+index ec394c027a..7732d9886c 100644
+--- a/tests/hermes_cli/test_kanban_quota_recovery.py
++++ b/tests/hermes_cli/test_kanban_quota_recovery.py
+@@ -201,6 +201,23 @@ def test_broken_proof_gate_fails_open(monkeypatch, tmp_path):
+     assert complete.call_count == 2
+ 
+ 
++def test_failed_gate_release_logs_debug_and_never_raises(monkeypatch, caplog):
++    """A locked gate in a proof thread's done-callback leaves its row, logged at DEBUG, not raised."""
++    import logging
++    import sqlite3
++    from hermes_cli import kanban_quota_recovery as recovery
++
++    def locked(path):
++        raise sqlite3.OperationalError('database is locked')
++
++    monkeypatch.setattr(recovery, '_gate_connect', locked)
++    with caplog.at_level(logging.DEBUG, logger=recovery.__name__):
++        recovery._release_proof('anthropic', 'model', _entry(id='acct1'), path='unused.db')
++    [record] = [r for r in caplog.records if r.name == recovery.__name__]
++    assert record.levelno == logging.DEBUG and 'release failed' in record.getMessage()
++    assert record.exc_info and isinstance(record.exc_info[1], sqlite3.OperationalError)
++
++
+ @pytest.mark.parametrize('data,ok', [
+     ('data: {"type":"response.created"}\n\n', False),
+     ('data: {"type":"response.failed"}\n\n', False),
+-- 
+2.43.0
+

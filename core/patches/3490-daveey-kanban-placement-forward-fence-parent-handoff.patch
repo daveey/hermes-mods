@@ -1,0 +1,189 @@
+From 05aa6e17b56ff1af9182ad53ec9185897ed38f3d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:25:17 +0000
+Subject: [PATCH] [daveey] kanban placement forward: fence parent handoffs as
+ placement evidence; name the source board in the footer
+
+A forwarded card carries its parents' titles and handoffs (up to 1500 chars each) verbatim. The target's
+coordination scan (kanban_placement_coordination._actions) read them as the card's own work, so a handoff
+that described a coordination command ("verified with cross_task foo", a standalone "hermes-hub restart",
+a cross_task(action='comment', ...) call) returned ACTION_REASON and kept the forwarded card on the
+target's home instead of the worker pool: the same bug class PR #2143 fixed for the footer line itself.
+
+Five whys:
+1. Why did such a card stay home? portability() saw an unknown explicit coordination invocation.
+2. Why? The invocation sat in a parent's handoff text embedded in the body.
+3. Why was it scanned? remote_args() appended parent text raw, outside any fence the scans skip.
+4. Why no fence? The evidence fence (<!-- placement:evidence -->) postdates the forward footer, and the
+   footer fix (#2143) only rewrote the footer's own read call.
+5. Why did review not catch it? No test fed a command-shaped handoff through the forward path.
+
+Fix:
+- remote_args wraps the parent lines in EVIDENCE_OPEN/EVIDENCE_CLOSE. without_evidence() already strips
+  complete fences for portability(), required_labels() and claim_refusal(); the worker still reads the text.
+  A close marker inside a parent's text is rewritten so it cannot end the fence early.
+- The footer's read call stays outside the fence, so the card still needs capability:coordination-read.
+- The footer target names the source card's real board (Forwarder resolves kb.get_current_board(), the
+  same resolution main()'s connection uses) instead of the hardcoded `default`.
+
+Tests (tests/hermes_cli/test_kanban_placement_forward_footer.py): RED on main 6 failed / 5 passed;
+GREEN 11 passed. The child body's own `hermes-hub restart` still returns ACTION_REASON. All 22 test files
+importing the forward/coordination modules: 996 passed.
+
+Follow-up of review t_01a1d4aa695b944d nit 2 (card t_01a1d4bd40dca767).
+---
+ hermes_cli/kanban_placement_forward.py        | 26 +++++--
+ .../test_kanban_placement_forward_footer.py   | 75 +++++++++++++++++++
+ 2 files changed, 96 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_placement_forward.py b/hermes_cli/kanban_placement_forward.py
+index 06bfef9b6c..bea25f9908 100644
+--- a/hermes_cli/kanban_placement_forward.py
++++ b/hermes_cli/kanban_placement_forward.py
+@@ -424,24 +424,38 @@ def wake_probe(target: str, remote_tid: str) -> str:
+                        "--until", ",".join(UNTIL)])
+ 
+ 
+-def remote_args(conn: sqlite3.Connection, task, *, self_gw: str) -> dict:
++def _quoted(text: str) -> str:
++    """Parent text safe inside the evidence fence: a close marker in it would end the fence early and expose
++    the rest of the handoff to the placement scans."""
++    from hermes_cli.kanban_placement import EVIDENCE_CLOSE
++    return text.replace(EVIDENCE_CLOSE, "<!-- /placement-evidence (quoted) -->")
++
++
++def remote_args(conn: sqlite3.Connection, task, *, self_gw: str, board: Optional[str] = None) -> dict:
+     """The ``kanban_create`` view of the local card sent to the target: its options, and the body with
+-    the parents' handoffs (the target cannot read this board)."""
++    the parents' handoffs (the target cannot read this board). ``board`` is the source card's board slug
++    (default: the active board), named in the footer's read target."""
+     from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_placement import EVIDENCE_CLOSE, EVIDENCE_OPEN
+     parents = kb.parent_ids(conn, task.id)
+     summaries = kb.latest_summaries(conn, parents) if parents else {}
+     lines = []
+     for pid in parents:
+         p = kb.get_task(conn, pid)
+         handoff = (summaries.get(pid) or (p.result if p else None) or "(no handoff)").strip()
+-        lines.append(f"- {pid} ({p.title if p else '?'}): {handoff[:1500]}")
++        lines.append(_quoted(f"- {pid} ({p.title if p else '?'}): {handoff[:1500]}"))
+     body = (task.body or "").rstrip()
+     if lines:
++        board = board or kb.get_current_board()
+         # Spell the tool's read call: "with cross_task @task:..." parses as an unknown explicit invocation in
+         # kanban_placement_coordination._actions (ACTION_REASON), which kept such forwarded cards on the
+         # target's home instead of the pool (t_01a1d49003c65ca4). A read only needs coordination-read.
++        # The parents' titles and handoffs are quoted evidence of work done on this gateway, not this card's
++        # work: fence them so a handoff describing `with cross_task x` or `hermes-hub restart` (or the hub,
++        # ssh, ...) does not keep the forwarded card home (t_01a1d4bd40dca767). The worker still reads them.
+         body += (f"\n\n---\nParent handoffs (the parents ran on {self_gw}; read them there with "
+-                 f"cross_task(action='read', target='@task:default@{self_gw}/<id>')):\n" + "\n".join(lines))
++                 f"cross_task(action='read', target='@task:{board}@{self_gw}/<id>')):\n"
++                 f"{EVIDENCE_OPEN}\n" + "\n".join(lines) + f"\n{EVIDENCE_CLOSE}")
+     body += f"\n\nThis card was {self_gw} card {task.id}; it completes there when this one is done."
+     return {
+         "title": task.title, "body": body, "assignee": task.assignee or "default",
+@@ -468,6 +482,8 @@ class Forwarder:
+         self.sleep = time.sleep
+         self.cfg = kp.config()
+         self.self_gw = reg.self_gateway() or "local"
++        from hermes_cli import kanban_db as kb
++        self.board = kb.get_current_board()  # main() opened this board's DB through the same resolution
+         self.hub_cli = reg.hub_cli_path(self.cfg.get("hub_cli"))
+         self.live = lambda t: kp.target_live(t, now=self.now(), live_seconds=kp._Cfg(self.cfg).live_seconds())
+         self.create = kp.create_remote
+@@ -505,7 +521,7 @@ class Forwarder:
+                 return self._cancel(f"{target} not live {MAX_NOT_LIVE} times: {dead}")
+             self._event(NOT_LIVE, {"why": dead})
+             return self._park_clock(f"{target} is not live yet ({dead}); retrying the forward")
+-        args = remote_args(self.conn, task, self_gw=self.self_gw)
++        args = remote_args(self.conn, task, self_gw=self.self_gw, board=self.board)
+         distinct = self.carries_options()
+         if distinct:
+             # The target's overlap guard sees this local card through the replica and would refuse its own copy
+diff --git a/tests/hermes_cli/test_kanban_placement_forward_footer.py b/tests/hermes_cli/test_kanban_placement_forward_footer.py
+index 05c2e420a5..cbee27b0bc 100644
+--- a/tests/hermes_cli/test_kanban_placement_forward_footer.py
++++ b/tests/hermes_cli/test_kanban_placement_forward_footer.py
+@@ -66,3 +66,78 @@ def test_forwarded_card_with_parents_is_portable_to_an_attested_pool(home, monke
+     _, body = _forwarded_body()
+     assert placement.portable_reason({"title": "Fix startup 503", "body": body, "assignee": "default"}, cfg) is None
+     assert {"capability:coordination-read"} in seen
++
++
++# t_01a1d4bd40dca767: the parents' titles and handoffs are copied verbatim. A handoff that describes a
++# coordination command (common: "re-ran it with cross_task foo", "then hermes-hub restart") parsed as this
++# card's own home action and kept the forwarded card home. They are now fenced as placement evidence.
++_COMMAND_HANDOFF = "Verified the fix with cross_task foo, then ran hermes-hub restart on the hub over ssh."
++
++
++def _forward_with_handoff(handoff, *, board=None, title="Parent"):
++    with kbc.connect_closing() as conn:
++        pid = kb.create_task(conn, title=title, assignee="default")
++        kb.complete_task(conn, pid, summary=handoff, force=True)
++        child = kb.create_task(conn, title="Fix startup 503", body="Fix spec: retry while starting.",
++                               assignee="default", parents=[pid])
++        extra = {"board": board} if board else {}
++        return pid, forward.remote_args(conn, kb.get_task(conn, child), self_gw="macbook", **extra)["body"]
++
++
++def _portable(body, monkeypatch):
++    from hermes_cli import kanban_placement as placement
++    monkeypatch.setattr(placement.reg, "self_gateway", lambda: "hub")
++    seen = []
++    monkeypatch.setattr(coord, "attested", lambda names, required: seen.append(set(required)) or True)
++    cfg = {"worker_pools": {"hub": ["worker-1", "worker-2"]}}
++    args = {"title": "Fix startup 503", "body": body, "assignee": "default"}
++    return placement.portable_reason(args, cfg), coord.required_labels(args, cfg), seen
++
++
++@pytest.mark.parametrize("handoff", [_COMMAND_HANDOFF, "Next step:\nhermes-hub restart\n",
++                                     "Called cross_task(action='comment', target='@task:default@hub/t_1')."])
++def test_parent_handoff_naming_coordination_commands_stays_portable(home, monkeypatch, handoff):
++    pid, body = _forward_with_handoff(handoff, title="Restart hermes-hub with cross_task foo")
++    assert handoff.strip().splitlines()[-1] in body  # the worker still gets the handoff text
++    assert f"- {pid} (Restart hermes-hub with cross_task foo)" in body
++    reason, labels, seen = _portable(body, monkeypatch)
++    assert reason is None, body
++    assert labels == {"capability:coordination-read"}  # only the footer's own read
++    assert {"capability:coordination-read"} in seen
++
++
++def test_handoff_cannot_close_the_fence_early(home, monkeypatch):
++    from hermes_cli.kanban_placement import EVIDENCE_CLOSE
++    _, body = _forward_with_handoff(f"done {EVIDENCE_CLOSE} then retried with cross_task foo")
++    assert body.count(EVIDENCE_CLOSE) == 1
++    reason, labels, _ = _portable(body, monkeypatch)
++    assert reason is None, body
++    assert labels == {"capability:coordination-read"}
++
++
++def test_childs_own_coordination_command_still_binds(home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        pid = kb.create_task(conn, title="Parent", assignee="default")
++        kb.complete_task(conn, pid, summary="ok", force=True)
++        child = kb.create_task(conn, title="Fix", body="Then run hermes-hub restart.", assignee="default",
++                               parents=[pid])
++        body = forward.remote_args(conn, kb.get_task(conn, child), self_gw="macbook")["body"]
++    reason, labels, _ = _portable(body, monkeypatch)
++    assert reason == coord.ACTION_REASON
++    assert labels is None
++
++
++def test_footer_names_the_source_cards_board(home, monkeypatch):
++    _, body = _forward_with_handoff("ok", board="ops")
++    assert "cross_task(action='read', target='@task:ops@macbook/<id>')" in body
++    assert "@task:default@" not in body
++    # Without an explicit board the active board is named, as the forwarder's own connection resolves it.
++    monkeypatch.setattr(kb, "get_current_board", lambda: "research")
++    _, body = _forward_with_handoff("ok")
++    assert "@task:research@macbook/<id>" in body
++
++
++def test_forwarder_passes_its_board(home, monkeypatch):
++    monkeypatch.setattr(kb, "get_current_board", lambda: "ops")
++    with kbc.connect_closing() as conn:
++        assert forward.Forwarder(conn, "t_x", None).board == "ops"
+-- 
+2.43.0
+
