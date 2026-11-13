@@ -305,6 +305,24 @@ test('discovery sweeps every profile again after DISCOVERY_MS', async () => {
   assert.equal(counts.at(-1), 10, 'the poll at DISCOVERY_MS sweeps all profiles')
 })
 
+test('a remounted chip keeps the transport: no new discovery sweep per mount', async () => {
+  // The desktop status bar remounts contributions whenever its contribution list changes.
+  const ctx = fleetCtx()
+  const saved = host.profileRoutes
+  host.profileRoutes = async () => profileRoutes('mini')
+  try {
+    let ui = await mount(React.createElement(P.Runners, { ctx }))
+    await ui.close()
+    assert.equal(ctx.calls.length, 10, 'first mount sweeps every profile')
+    ui = await mount(React.createElement(P.Runners, { ctx }))
+    await ui.close()
+    assert.deepEqual(calledSince(ctx, 10), ['mini/owner'], 'remount asks the lead only')
+    assert.equal(P.transportFor(ctx), P.transportFor(ctx))
+  } finally {
+    host.profileRoutes = saved
+  }
+})
+
 test('polls every 15s open or closed, updates the open panel in place, stops while hidden', async () => {
   const later = fleet()
   later.gateways.machines[1].running = [{ board: 'default', task: 't_bbbb2222', title: 'New card', started_at: NOW / 1000 }]

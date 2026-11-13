@@ -68,7 +68,8 @@ Each poll sends one request per connection, not one per profile: the gateway sec
 the CI owner profile serves CI (the others answer `ci.state: unavailable`). The lead route is the CI owner, else
 `default`, else the first. Every profile of a connection is fetched (a discovery sweep) until the owner is known,
 every 5 min after that, and on the poll after the lead fails; while the lead backs off, one healthy profile
-keeps the gateway section fresh.
+keeps the gateway section fresh. The transport lives per plugin ctx, not per mount: the status bar remounts
+its contributions whenever the contribution list changes, and a per-mount transport re-swept on every remount.
 
 ## Tests
 
@@ -94,6 +95,7 @@ python -m pytest plugins/runners/tests/test_fleet.py plugins/runners/tests/test_
 - open panel updates in place, one request per poll, no polling while hidden: "open panel updates in place"
 - one request per connection, owner lead, sweep after a lead failure and every 5 min: "one request per
   connection", "the CI owner route leads", "when the lead fails", "discovery sweeps"
+- a remount keeps the transport (no sweep per mount): "a remounted chip keeps the transport"
 
 - CI groups: categories + counts + health, collapsed by default, expand/remember/collapse: `groups.test.mjs`,
   `test_fleet.py` `test_ci_machine_categories_for_the_panel_groups`

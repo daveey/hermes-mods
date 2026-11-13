@@ -113,6 +113,16 @@ export function createTransport(ctx, hostRef = host, clock = () => Date.now()) {
   return { poll, routes }
 }
 
+// One transport per plugin ctx, not per mount. The status bar wraps each contribution in a
+// fresh component type whenever its contribution list changes, so the chip remounts often;
+// a per-mount transport forgot the CI owner and swept every profile on each remount.
+const transports = new WeakMap()
+export function transportFor(ctx) {
+  let t = transports.get(ctx)
+  if (!t) transports.set(ctx, (t = createTransport(ctx)))
+  return t
+}
+
 const ID_PATTERN = /^[a-z]{2,12}_[0-9a-f]{16,64}$/
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const repairSafeError = (message) => Object.assign(new Error(message), { safe: true })
@@ -742,7 +752,7 @@ function Meter({ name, m }) {
 export function Runners({ ctx }) {
   const [open, setOpen] = useState(false)
   const visible = useVisible()
-  const transport = useMemo(() => createTransport(ctx), [ctx])
+  const transport = useMemo(() => transportFor(ctx), [ctx])
   const repairClient = useMemo(() => createRepairClient(ctx), [ctx])
   const query = useQuery({
     queryKey: ['runners', 'fleet'],
