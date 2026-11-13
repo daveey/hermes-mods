@@ -561,10 +561,112 @@ def turn_card_ids(tool_log: Optional[list]) -> list[str]:
     return list(reversed(out))
 
 
+# agent-b9a5074a0c: a close-out said "Two items are still in progress, and both have a worker on them now" about
+# PR #2220 and PR #1934, naming no card id (the turn had read both running cards with raw sqlite, which wrote no
+# `<- OK` line). Every owner lookup above keys on a `t_…` id, so the judges got owner_source=none and held a true
+# reply twice at p 0.9. A reply ending that names PRs and no card id now resolves them to cards (last fallback).
+PR_REF_RE = re.compile(r"(?:\bPRs?\s*#?\s*|(?<![\w#/&])#|/pull/)(\d{2,6})\b", re.I)
+_BOARD_READ_RE = re.compile(r"kanban\.db\b|sync-shadow/")
+
+
+def _pr_text_re(n: str):
+    return re.compile(r"(?:\bPRs?\s*#?\s*|(?<![\w#/&])#|/pull/)" + re.escape(n) + r"\b", re.I)
+
+
+def _pr_call_re(n: str):
+    """The PR as a tool call names it: the reply forms plus `gh pr <verb> [flags] N` and `/pulls/N` (API paths)."""
+    return re.compile(r"(?:\bPRs?\s*#?\s*|(?<![\w#/&])#|/pulls?/|\bpr\s+[a-z-]+\s+(?:-\S+\s+)*)" + re.escape(n)
+                      + r"\b", re.I)
+
+
+def tail_pr_ids(reply: str) -> list[str]:
+    """PR numbers (`#NNNN`, `PR NNNN`, `/pull/NNNN`) the reply's ending names unquoted, in order."""
+    tail = (reply or "")[-1500:]
+    out: list[str] = []
+    for m in PR_REF_RE.finditer(tail):
+        if m.group(1) not in out and not _in_dquotes(tail, m.start()):
+            out.append(m.group(1))
+    return out
+
+
+def _open_board_status(cid: str, ar) -> Optional[str]:
+    """The card's status on this host's boards, then its replicas (agent_rules.board_dbs / shadow_dbs); None if absent."""
+    for path in list(ar.board_dbs()) + list(ar.shadow_dbs()):
+        try:
+            conn = ar._board_connect(path)
+            try:
+                row = conn.execute("select status from tasks where id=?", (cid,)).fetchone()
+            finally:
+                conn.close()
+        except Exception:
+            continue
+        if row:
+            return str(row[0])
+    return None
+
+
+def pr_owner_card_ids(reply_tail: str, tool_log: Optional[list] = None) -> list[str]:
+    """Open cards (not done/archived) standing for the PRs a reply ending names when it names no card id, at most
+    NAMED_CARD_MAX: (a) card ids in this turn's calls that name one of the PRs, or (no such call) that read a board db
+    (kanban.db, sync-shadow/*.db); (b) open cards on this host's boards and replicas whose title or body names the PR.
+    [] when the ending names a card id or no PR, and on any read failure (fail-open)."""
+    try:
+        tail = reply_tail or ""
+        if NAMED_CARD_RE.search(tail):
+            return []
+        prs = tail_pr_ids(tail)
+        if not prs:
+            return []
+        ar = _cache.load_sibling(_HERE, "agent_rules")
+        pats = [_pr_text_re(n) for n in prs]
+        lines = [l or "" for l in (tool_log or [])]
+        cand: list[str] = []
+        cpats = [_pr_call_re(n) for n in prs]
+        named = [l for l in lines if l.lstrip().startswith("->") and any(p.search(l) for p in cpats)]
+        reads = named or [l for l in lines if l.lstrip().startswith("->") and _BOARD_READ_RE.search(l)]
+        for l in reads:
+            for cid in NAMED_CARD_RE.findall(l):
+                if cid not in cand:
+                    cand.append(cid)
+        out = [c for c in cand if (_open_board_status(c, ar) or "").lower() not in ("", *CLOSED_CARD_STATUSES)]
+        for path in list(ar.board_dbs()) + list(ar.shadow_dbs()):
+            if len(out) >= NAMED_CARD_MAX:
+                break
+            try:
+                conn = ar._board_connect(path)
+                try:
+                    for n, p in zip(prs, pats):
+                        rows = conn.execute(
+                            "select id, coalesce(title,''), coalesce(body,'') from tasks where status not in "
+                            "('done','archived') and (title like ? or body like ?) order by created_at desc limit 50",
+                            (f"%{n}%", f"%{n}%")).fetchall()
+                        for cid, title, body in rows:
+                            if cid not in out and p.search(f"{title}\n{body}"):
+                                out.append(str(cid))
+                finally:
+                    conn.close()
+            except Exception:
+                continue
+        return out[:NAMED_CARD_MAX]
+    except Exception:
+        return []
+
+
+def owner_pr_telemetry(reply: str, tool_log: Optional[list] = None) -> dict:
+    """report_only_scored fields for a reply ending naming PRs and no card id: the PRs and how many owner cards the
+    coach resolved them to ({} otherwise), so "PRs named, no owner found" shows up in log.jsonl."""
+    tail = (reply or "")[-1500:]
+    prs = [] if NAMED_CARD_RE.search(tail) else tail_pr_ids(tail)
+    if not prs:
+        return {}
+    return {"owner_pr_ids": prs, "owner_pr_resolved": len(pr_owner_card_ids(tail, tool_log))}
+
+
 def tail_card_ids(reply: str, tool_log: Optional[list] = None, user_ask: str = "") -> tuple[list[str], bool]:
     """(ids, fallback): the unquoted card ids the reply's ending names, in order (callers cap at NAMED_CARD_MAX).
     When it names none: the cards `user_ask` names (agent-b22d5f6bb5), else, when it refers to "the card", the cards
-    this turn's tool calls touched (agent-8381864e1e); fallback=True for either."""
+    this turn's tool calls touched (agent-8381864e1e), else the open cards for the PRs it names (agent-b9a5074a0c);
+    fallback=True for each."""
     tail = _named_or_ask_text(reply, user_ask)
     ids: list[str] = []
     for m in NAMED_CARD_RE.finditer(tail):
@@ -576,9 +678,14 @@ def tail_card_ids(reply: str, tool_log: Optional[list] = None, user_ask: str = "
         return ids, False
     if ids:
         return ids, True
-    if NAMED_CARD_RE.search(tail) or not CARD_REF_RE.search(reply_tail):
+    if NAMED_CARD_RE.search(tail):
         return [], False
-    return turn_card_ids(tool_log), True
+    ref = bool(CARD_REF_RE.search(reply_tail))
+    touched = turn_card_ids(tool_log) if ref else []
+    if touched:
+        return touched, True
+    prs = pr_owner_card_ids(reply_tail, tool_log)
+    return (prs, True) if prs else ([], ref)
 
 
 def named_card_facts(reply: str, tool_log: Optional[list] = None, now: Optional[float] = None,
@@ -3939,6 +4046,7 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
                    "owner_probe_live": bool(owner_probe_live(reply, list(tool_log or []) + list(
                        named_board), user_ask)),
                    "owner_source": owner_source(reply, tool_log, board=named_board, user_ask=user_ask),
+                   **owner_pr_telemetry(reply, tool_log),
                    **stall_telemetry(reply, tool_log, now=now),
                    **({"forced": forced_by} if forced and confirm_attempted else {}),
                    **({"relay_repeat": True} if relay_repeat else {}),
