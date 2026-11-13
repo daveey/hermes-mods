@@ -461,21 +461,40 @@ open, undecided request of the same session only with exact provenance:
   label sharing at least two specific words, `same_lettered_menu`: "A: lane + jobs to
   Blacksmith (~$770/mo)" is "A: lane plus jobs (~$770/mo)"; yes/no, approve/decline,
   keep/change and words shared with another label of the same menu never count).
-  Pointing, not asking (`_presents_no_ask`): the sentence's paragraph has no `?`, no
-  "please"/"can you"/"let me know" and no imperative "Pick …/Choose …" (reminder
-  phrasings such as "still need you" or "waiting on you" are allowed), and no paragraph
-  of the reply presents a lettered menu, apart from card asks the open request's frozen
-  scope already quotes. Any re-asked question, however worded ("Next up is babybear.
-  Which macOS CI runner do you want? A: …, B: …"), is its own tile. Last, every
+  Pointing, not asking (`_presents_no_ask` / `_reply_asks`): the WHOLE reply presents no
+  new ask, because the extractor can read a new ask presented anywhere in the reply
+  with the reminder sentence as its evidence. Read as prose: quotes, block quotes, code
+  and the agent's own `::user-step` directives (unwrapped). Skipped only: card asks the
+  open request's frozen scope quotes, and whole sentences (20+ characters) the scope
+  carries verbatim that hold no `?` and no menu ("If you pick A or B, an agent builds
+  that lane."). Everything else counts as an ask, deliberately broadly: a `?`; a
+  request ("please", "can you", "let me know", "give me", "need you to", "need a
+  decision", "your call/pick", "needs your OK"); a sentence opening with should/is/can/
+  do/…; a choice verb (choose, decide, select, approve, confirm, reply, answer; "pick
+  one/the/A"; "go with"); an alternative ("or", "which", "whether", "either"); or a
+  menu, lettered or not (`_presents_menu`: two option markers on a line such as `A)`,
+  `A.`, `A:`, `A =`, `A -`, `1)`, `1.`; two adjacent lettered lines; or two or more
+  bullet/numbered lines after a line ending in `:` or reading as options). The agent's
+  own recommendation ("I'd pick B") is not an ask. Reminder phrasings ("still need
+  you", "waiting on you", "the macOS CI pick") are allowed. Any re-asked question,
+  however worded ("Next up is babybear. Which macOS CI runner do you want? A: …, B:
+  …"), and any reminder beside another ask, is its own tile. A reply that asks nothing
+  at all lands on the open tile even when its lead names another subject ("Next up is
+  babybear. The macOS CI runner pick still needs you."): nothing was presented to
+  answer, so a minted tile could only carry the open tile's own title and menu, and
+  that subject's decision gets its own tile in the reply that presents it. Last, every
   naming word of the sentence (no reminder words such as "two", "still", "need"; digits
-  and words like "other", "left", "three" do count) must be in the open ask's own title
+  and words like "other", "left", "three" do count; the open menu's label words are not
+  discounted) must be in the open ask's own title
   or step text, never only in its evidence or scope, where another subject can sit as
   context; a sentence that names nothing ("That one still needs you.") is read with
   the paragraph text before it, else the paragraph before (`_evidence_names_only_open`).
   So "The babybear macOS CI pick still needs you." is not the hermes-mods tile, and a
   reminder that adds any word the title lacks ("the mini queue is at 16 minutes") stays
   its own tile: a duplicate shows twice and can be withdrawn, a false merge loses an
-  ask. Live chat ..f07c32: "Two macOS CI choices still need you." (11:54) and "The only
+  ask. Known duplicates (accepted): a reminder worded as a request ("reply with a
+  letter", "is still your call") or beside any other question or menu in the reply.
+  Live chat ..f07c32: "Two macOS CI choices still need you." (11:54) and "The only
   thing waiting on you is the macOS CI pick." (13:17) each minted a tile with the open
   request's own title;
 - in a LATER reply, the step's paragraph quotes (`"…"`, 40+ characters) a card ask that

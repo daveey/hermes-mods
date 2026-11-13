@@ -1936,12 +1936,12 @@ def same_reminder(candidate: dict, ask: dict, reply: str = "") -> bool:
     choices still need you." (11:54) and "The only thing waiting on you is the macOS CI pick." (13:17), each read
     by the extractor with the open tile's own title.
 
-    Asking nothing (``_presents_no_ask``): the sentence's paragraph has no question mark, no direct request and no
-    lettered menu, and no paragraph of the reply presents a lettered menu, except card asks the open request's
-    frozen scope already quotes. A re-asked question ("For babybear, which runner? A: ..., B: ...") never lands
-    here, whatever its wording: a false merge loses an ask, a duplicate tile only shows twice. The sentence must
-    also name nothing the open ask's own title, text, evidence or labels never say (``_evidence_names_only_open``):
-    "The babybear macOS CI pick still needs you." is not the hermes-mods tile."""
+    Asking nothing (``_presents_no_ask``): the WHOLE reply presents no new ask (``_reply_asks``: no question,
+    request, choice verb, alternative or menu, lettered or not, outside text the open request's frozen scope already
+    carries). A re-asked question ("For babybear, which runner? A: ..., B: ...") or a reminder beside any other ask
+    never lands here, whatever its wording: a false merge loses an ask, a duplicate tile only shows twice. The
+    sentence must also name nothing the open ask's own title or step text never says
+    (``_evidence_names_only_open``): "The babybear macOS CI pick still needs you." is not the hermes-mods tile."""
     if _EXTRACTED_KIND.get(candidate.get('kind'), 'input') != ask.get('kind'):
         return False
     if not (_same_text(candidate, ask) or same_lettered_menu(candidate, ask)):
@@ -1950,43 +1950,112 @@ def same_reminder(candidate: dict, ask: dict, reply: str = "") -> bool:
 
 
 def _presents_no_ask(candidate: dict, ask: dict, reply: str) -> bool:
-    if not reply:
+    """The WHOLE reply asks nothing new (``_reply_asks``), not just the sentence: the extractor can read an ask
+    presented elsewhere in the reply with the reminder sentence as its evidence (review 5898461042 F14: the 13:17
+    headline beside a bulleted babybear budget menu). Text the open request's frozen scope already carries is not
+    new: the card asks it quotes, and its own sentences that present no question or menu (the live 11:54 reply
+    repeats "If you pick A or B, an agent builds that lane.")."""
+    if not reply or locate(reply, str(candidate.get('verbatim_span') or "")) is None:
         return False
-    block = locate(reply, str(candidate.get('verbatim_span') or ""))
-    if block is None:
-        return False
-    scope = _norm(str(ask.get('scope') or "")).replace('"', "")
-
-    def own(text: str) -> str:  # the text minus card asks the open scope already quotes
-        return _QUOTED_ASK.sub(lambda m: " " if m.group(1).strip() in scope else m.group(0), _norm(text))
-
-    if _asks_anew(own(block["text"])):
-        return False
-    return not any(_presents_menu(own(para)) for para in re.split(r"\n\s*\n", reply))
+    return not _reply_asks(reply, str(ask.get('scope') or ""))
 
 
-# ``_DIRECT_REQUEST`` minus its reminder phrasings ("still need you", "waiting on you", "needs your", "until you"):
-# a sentence that says an ask is still pending points at it; a question, a "please"/"can you"/"let me know" or an
-# imperative "Pick ..." asks (again).
+# Anything that could present a decision: a question, a request, a choice verb, an alternative ("or", "which",
+# "either"), "pick one/the/A". Deliberately broad (review 5898461042 B3): a missed ask is a false merge, an extra
+# hit only a duplicate tile. Reminder phrasings stay out ("still need(s) you", "waiting on you", "the macOS CI pick").
 _ASKS_ANEW = re.compile(
     r"\?"
     r"|\b(?:please|kindly)\b"
     r"|\b(?:can|could|would|will) you\b"
     r"|\byou(?:'ll| will)? (?:need to|must|have to|should)\b"
-    r"|\b(?:let me know|tell me|your call|up to you)\b"
-    r"|(?:^|[.!:;,\u2014\u2013]\s*|\n\s*(?:[-*\u2022]|\d+[.)])\s*)(?:please\s+)?"
-    r"(?:approve|confirm|decide|choose|pick|select|reply|answer|say)\b(?!\s+of\b)",
-    re.I)
+    r"|\b(?:let me know|tell me|give me|send me|send (?:a|the|your|one) letter|up to you|if you (?:want|prefer|like))\b"
+    r"|\byour (?:call|pick|choice|decision|answer|input|approval|go-ahead|sign-?off)\b"
+    r"|\bneeds? (?:you to|a (?:decision|answer|pick|choice|call|letter|reply)|an answer)\b"
+    r"|\b(?:choose|decide|select|approve|confirm|reply|answer|respond)\b"
+    r"|\b(?:want me to|should (?:i|we)|shall (?:i|we)|ok to|okay to)\b"
+    r"|(?:^\s*(?:[-+\u2022]|\d{1,2}[.)])?\s*|[.!:;\"(\u2014\u2013]\s*)(?:should|shall|do|does|is|are|can|could|would|will|may|want)\s"
+    r"|\b(?:decision|approval|ok|okay|go-ahead|sign-?off|verdict)\b"
+    r"|\bpick(?:s|ing)? (?:one|a|an|the|between|from|either|[a-h]\b|which|up|it|this|that|your|for)\b"
+    r"|\bgo (?:with|for)\b"
+    r"|\b(?:which|whether|either|prefer|or)\b",
+    re.I | re.M)
+# "I'd pick B", "I recommend B": the agent's own recommendation, not a question to the user.
+_RECOMMENDS = re.compile(r"\bi(?:'d| would)? (?:pick|choose|go with|go for|recommend|suggest)\b|\brecommended\b", re.I)
+# One option marker: "A)", "(a)", "A.", "A:", "A =", "A -", "1)", "1.". A menu is two of them (a+b or 1+2) on a line.
+_OPTION_MARK = re.compile(r"(?:^|[\s;,(:])\(?([a-h]|[1-9])\s*(?:[).:=]|\s[-\u2013\u2014])(?=\s)", re.I)
+_LIST_LINE = re.compile(r"^\s*(?:(?P<bullet>[-*+\u2022])|(?P<num>\d{1,2}[.)])|(?P<letter>\(?[a-h][).:]|[a-h]\s[-\u2013\u2014]))"
+                        r"\s+(?P<body>.*)$", re.I)
+_SENT_END = re.compile(r"(?<=[.!?])\s+")
 
 
-def _asks_anew(text: str) -> bool:
-    """A question mark, a direct request or an imperative choice verb outside quotes."""
-    return bool(_ASKS_ANEW.search(re.sub(r'"[^"]*"', '""', _plain(text or ""))))
+def _asks_anew(text: str, blank_quotes: bool = True) -> bool:
+    """A question mark, a request, a choice verb or an alternative outside the agent's recommendation (and, by
+    default, outside quotes)."""
+    t = _plain(text or "")
+    if blank_quotes:
+        t = re.sub(r'"[^"]*"', '""', t)
+    return bool(_ASKS_ANEW.search(_RECOMMENDS.sub(" ", t)))
+
+
+def _inline_menu(line: str) -> bool:
+    marks = {m.group(1).lower() for m in _OPTION_MARK.finditer(line)}
+    return {"a", "b"} <= marks or {"1", "2"} <= marks
 
 
 def _presents_menu(text: str) -> bool:
-    """Some line of ``text`` (or the text run together) carries a specific lettered menu."""
-    return any(_quoted_menu_ask(chunk) for chunk in [text, *text.split("\n")] if chunk.strip())
+    """``text`` (line structure kept) presents options, lettered or not (review 5898461042 B1): an inline menu on one
+    line (``A)``/``A.``/``A:``/``A =``/``A -`` or ``1)``/``1.``), two adjacent lettered list lines, or a run of two or
+    more bullet/numbered lines that follows a line ending in ``:`` or whose items read as options (no sentence
+    break, at most 12 words)."""
+    lines = [ln for ln in _plain(text or "").split("\n") if ln.strip()]
+    if any(_inline_menu(ln) or _quoted_menu_ask(_norm(ln)) for ln in lines):
+        return True
+    run: list = []
+    kind = None
+    for i, ln in enumerate(lines + [""]):
+        m = _LIST_LINE.match(ln) if ln else None
+        k = next((g for g in ("bullet", "num", "letter") if m and m.group(g)), None)
+        body = m.group("body") if m else ""
+        if k and k == kind:
+            run.append(body)
+            continue
+        if len(run) >= 2:
+            j = i - len(run) - 1
+            lead = lines[j].rstrip() if j >= 0 else ""
+            option_like = all(not _SENT_END.search(b.strip()) and not b.rstrip().endswith((".", "!"))
+                              and len(b.split()) <= 12 for b in run)
+            if kind == "letter" or lead.endswith(":") or option_like:
+                return True
+        run, kind = ([body], k) if k else ([], None)
+    return False
+
+
+def _reply_asks(reply: str, scope: str = "") -> bool:
+    """Some text of ``reply`` that the open request's frozen ``scope`` does not already carry presents an ask
+    (``_asks_anew``) or a menu (``_presents_menu``). Removed first: card asks the scope quotes (40+ chars), and whole
+    sentences found verbatim in the scope that present no question or menu themselves. Nothing else is skipped:
+    directives the agent wrote are unwrapped to their text, and quotes, code and block quotes are read like prose
+    (a new card ask can arrive quoted)."""
+    nscope = _norm(scope).replace('"', "")
+    reply = re.sub(r'::' + DIRECTIVE + r'\{[^{}]*?\bt="((?:[^"\\]|\\.)*)"\}', lambda m: dec(m.group(1)), reply or "")
+    reply = re.sub(r"(?m)^\s*>\s?", "", reply.replace("`", ""))
+
+    def in_scope(part: str) -> bool:  # a whole sentence (20+ chars, full stop) the scope carries, asking nothing
+        n = _norm(part).replace('"', "")
+        return (bool(nscope) and len(n) >= 20 and n.endswith((".", "!")) and n in nscope and "?" not in part
+                and not _inline_menu(part))
+
+    kept = []
+    for raw in _plain(reply).split("\n"):
+        line = _QUOTED_ASK.sub(lambda m: " " if nscope and _norm(m.group(1)).strip() in nscope else m.group(0), raw)
+        m = _LIST_LINE.match(line)
+        head, body = (line[:m.start("body")], m.group("body")) if m else ("", line)
+        # A line carrying an inline menu is kept whole: "A. x, B. y" must not be cut at its option dots.
+        parts = [body] if _inline_menu(body) else [p for p in _SENT_END.split(body) if not in_scope(p)]
+        if " ".join(parts).strip(" -:;,."):
+            kept.append(head + " ".join(parts))
+    text = "\n".join(kept)
+    return _asks_anew(text, blank_quotes=False) or _presents_menu(text)
 
 
 # Reminder words that name no subject ("Two macOS CI choices still need you." -> {macos, ci}). Words that can tell
@@ -2006,20 +2075,19 @@ def _naming_words(text, drop: set) -> set:
 
 
 def _fold(w: str) -> str:
-    return w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith(("ss", "us", "is", "ws")) else w
+    return w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith(("ss", "us", "is", "ws", "os")) else w
 
 
 def _evidence_names_only_open(candidate: dict, ask: dict, reply: str = "") -> bool:
     """Every naming word of the step's evidence sentence is one of the open ask's OWN words: its title and its
     extracted step's text, never its evidence sentence or frozen scope (another subject can sit there as context:
-    "For hermes-mods (babybear stays on GitHub runners), which ..."). Only the open side's label words are
-    discounted, never the candidate's: a subject named inside the candidate's labels still counts. A sentence that
+    "For hermes-mods (babybear stays on GitHub runners), which ..."). No label word is discounted, the open menu's
+    included (review 5898461042 B4: "B: share babybear's mini runner" must not hide babybear). A sentence that
     names nothing of its own ("That one still needs you.") is read with the text before it in its paragraph, else
     with the paragraph before it. A reminder that adds any other word (a subject the title lacks, "queue",
     "free") stays its own tile: a duplicate is the lesser harm."""
     step = ask.get('step') if isinstance(ask.get('step'), dict) else {}
-    labels = [str(o or "") for o in list(step.get('options') or ()) + list(ask.get('labels') or ())]
-    drop = {_fold(w) for o in labels for w in _label_words(_LETTERED.sub(r"\2", o))}
+    drop: set = set()  # no label discount: a subject the open menu mentions still names it (5898461042 B4)
     known = _naming_words(" ".join(str(x or "") for x in (ask.get('title'), step.get('text'))), set())
     span = str(candidate.get('verbatim_span') or "")
     names = _naming_words(span, drop)
