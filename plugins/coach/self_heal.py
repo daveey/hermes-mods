@@ -4054,6 +4054,27 @@ def session_owner_refusal(card: dict, d: dict, fp: str, subject: Optional[set] =
     return None
 
 
+def _close_by_session_commit(d: dict, fp: str, store, now: float, since: float) -> Optional[dict]:
+    """The session (or, sessionless, a matching traceback) already fixed the defect with a defect-bound commit
+    (session_commit_fix): record `fixed` citing it and log `selfheal_adopted_owner` -> skip result, else None."""
+    sid = d.get("session_id")
+    try:
+        fix = session_commit_fix(d, d.get("complaint_at") or d.get("at") or since, now=now)
+    except Exception as exc:
+        store.log({"event": "selfheal_adopt_error", "fingerprint": fp, "error": str(exc)[:200]})
+        return None
+    if not fix:
+        return None
+    origin = "matching traceback" if fix["via"] == "commit_no_session" else f"origin session {sid}"
+    record_event("fixed", fp, note=f"fixed by {origin} in commit {fix['sha'][:12]}: {fix['subject']}"[:300],
+                 store=store, now=now)
+    store.log({"event": "selfheal_adopted_owner",
+               "via": "commit_no_session" if fix["via"] == "commit_no_session" else "session_commit",
+               "fingerprint": fp, "commit": fix["sha"], "match": fix["via"], "session_id": sid})
+    return {"action": "skip", "why": f"{origin} already fixed it in commit {fix['sha'][:12]}",
+            "commit": fix["sha"], "adopted": True}
+
+
 def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[Callable] = None) -> Optional[dict]:
     """If the defect's origin session created/subscribed an active card after the complaint that names the defect
     (card_names_defect or card_answers_complaint; never the card the complaint is about, never another lane's
@@ -4073,20 +4094,7 @@ def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[
         store.log({"event": "selfheal_adopt_error", "fingerprint": fp, "error": str(exc)[:200]})
         return None
     if not cards and owner_fn is None:  # no card: the session may have fixed it with a bare commit
-        try:
-            fix = session_commit_fix(d, d.get("complaint_at") or d.get("at") or since, now=now)
-        except Exception as exc:
-            store.log({"event": "selfheal_adopt_error", "fingerprint": fp, "error": str(exc)[:200]})
-            fix = None
-        if fix:
-            origin = "matching traceback" if fix["via"] == "commit_no_session" else f"origin session {sid}"
-            record_event("fixed", fp, note=f"fixed by {origin} in commit {fix['sha'][:12]}: {fix['subject']}"[:300],
-                         store=store, now=now)
-            store.log({"event": "selfheal_adopted_owner",
-                       "via": "commit_no_session" if fix["via"] == "commit_no_session" else "session_commit",
-                       "fingerprint": fp, "commit": fix["sha"], "match": fix["via"], "session_id": sid})
-            return {"action": "skip", "why": f"{origin} already fixed it in commit {fix['sha'][:12]}",
-                    "commit": fix["sha"], "adopted": True}
+        return _close_by_session_commit(d, fp, store, now, since)
     if not cards:
         return None
     # Sharing the session is not owning the defect, whatever the source: its next cards are just its next work (an
@@ -4114,7 +4122,10 @@ def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[
                    "process_cards": [x["id"] for x in cards if x["id"] in process],
                    "finished_before": [x["id"] for x in cards if verdicts[x["id"]] == REFUSE_FINISHED_BEFORE],
                    "rejected_owners": [x["id"] for x in cards if x["id"] in rejected]})
-        return None
+        # No card owns it, but the session may still have fixed it with a commit: its only card is often that fix's
+        # own CI-gate or follow-up card (desktop-d2cbfde516: the gate card for 2718b729 was refused, so the commit
+        # check never ran and an already-fixed defect got an investigation card).
+        return _close_by_session_commit(d, fp, store, now, since) if owner_fn is None else None
     # Most relevant first, never simply the newest: the origin session keeps filing unrelated work after the complaint
     # (desktop-40fef7fbb1 took an instant-update activation card filed 4 h later over the state.db latch fix).
     cards = sorted(named, key=lambda x: owner_relevance(x, d, fp), reverse=True)
@@ -6077,11 +6088,17 @@ def _revalidate_adoption(lane, store, fp: str, st: dict, runner, now: float,
                            rejected_owners=sorted(set(st.get("rejected_owners") or []) | {card}),
                            adopt_card=None, adopt_via=None, adopt_checked_at=now):
         return None  # the lane moved meanwhile (a receipt, a re-approval): that newer state stands
-    requeued = _requeue_detection(store, fp, st, d, rec, now, "revalidate")
+    # The rejected card is often the session's own fix's CI-gate card: before queueing a fresh owner, check whether
+    # the session already fixed it with a commit (desktop-d2cbfde516 was requeued and investigated though fixed).
+    fixed = _close_by_session_commit(d, fp, store, now, d.get("complaint_at") or now) if d.get("session_id") else None
+    requeued = False if fixed else _requeue_detection(store, fp, st, d, rec, now, "revalidate")
     store.log({"event": "selfheal_adoption_rejected", "fingerprint": fp, "card": card, "was": "approved",
                "by": "revalidate", "rule": ADOPT_RULE, "why": why, "symptom": st.get("symptom"),
                "session_id": d.get("session_id"), "requeued": requeued,
+               **({"fixed_by": fixed["commit"]} if fixed else {}),
                "title": str(text.get("title") or "")[:120]})
+    if fixed:
+        return f"adoption of {card} rejected ({why}); {fixed['why']}"
     return f"adoption of {card} rejected ({why}); " + ("refile queued" if requeued else "no detection to refile")
 
 
