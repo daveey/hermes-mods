@@ -44,6 +44,12 @@ An unanswered `hermes-ci-review-bot` "⚠️ Warnings" section on the PR's head 
 every merge path, including a bare `gh pr merge`: fix it or refute it in a PR comment first (`hermes-core-wt ship`
 enforces this; `--bot-reply "<why>"` posts the refutation).
 
+Red required CI caused by main (the same tests fail at main without the PR) clears only on a new head. Once the
+fix is on main, `hermes-core-wt ship` will NOT rebase by itself while origin `wt/<slug>` still equals the published
+head ("resuming: ... not rebasing or re-gating", then review refused on the old red head). Run `git fetch origin
+main && git rebase origin/main` in the worktree first, then rerun ship: it re-gates, pushes the new head and
+reruns CI.
+
 `checks_pending` with the new head's run stuck `pending` (no jobs) usually means an older run is holding the
 workflow's concurrency group. Cancelled runs do this when an `if: always()` gate or report job
 ("All required checks pass", timing report, aggregate) still waits for a busy runner, and a main group
