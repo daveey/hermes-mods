@@ -329,6 +329,46 @@ def test_stopped_waker_thread_releases_its_modules_lease(tmp_path, monkeypatch):
                 m._state['lease'].release()
 
 
+def test_unload_between_host_lease_and_held_does_not_orphan_a_reacquired_lease(tmp_path, monkeypatch):
+    """Review 5891095798: ``_unload`` lands after ``run_pass``'s ``_host_lease()`` but before its ``held()``. That
+    ``held()`` re-opens and re-acquires the released lease; it must be given straight back (no host pass, fd
+    closed), not left held until core's 3x-interval watchdog with the reloaded module locked out."""
+    _real_lease(tmp_path, monkeypatch)
+    monkeypatch.setenv('HERMES_KANBAN_TASK', 't_fixture')  # no waker thread
+    old, new = _fresh_module('closeout_race_old'), _fresh_module('closeout_race_new')
+    passes = []
+    monkeypatch.setattr(old, '_host_pass', lambda *a, **k: passes.append(a))
+    monkeypatch.setattr(old, '_live_ids', lambda: set())
+    ctx = FakeCtx()
+    old.register(ctx)
+    real = old._host_lease
+    grabbed = []
+
+    def host_lease_then_unload():
+        lease = real()
+        grabbed.append(lease)
+        for cb in ctx.unloads:  # the reload's unload, interleaved before run_pass calls held()
+            cb()
+        return lease
+
+    monkeypatch.setattr(old, '_host_lease', host_lease_then_unload)
+    try:
+        ran = old.run_pass()
+        old._release_lease()  # the stopped loop's finally
+        lease = grabbed[0]
+        assert not lease._held  # given back, not orphaned until core's watchdog
+        assert lease._fd is None  # no leaked fd
+        assert (ran, passes) == ('stopped', [])  # an unloaded module runs no host pass
+        assert new._host_lease().held()  # the reloaded module takes it at once
+        assert old.run_pass() == 'stopped' and len(grabbed) == 1  # later passes build no fresh lease
+    finally:
+        for m in (old, new):
+            if m._state.get('lease') is not None:
+                m._state['lease'].release()
+        for lease in grabbed:
+            lease.release()
+
+
 # ---- wiring -----------------------------------------------------------------------------------------------------
 def test_lease_role_from_the_hermes_subcommand(monkeypatch):
     for argv, role in ((['hermes', 'gateway', 'run'], 'gateway'), (['hermes', '--profile', 'x', 'serve'], 'serve'),

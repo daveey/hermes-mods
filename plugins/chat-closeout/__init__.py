@@ -2517,12 +2517,21 @@ def run_pass() -> str:
     Desktop serve > dashboard) runs the host pass: the full ledger scan with reconcile and wakes, owner wake, the
     watchdog's candidate scan. Every other process runs only a residual pass for the chats live in it (only it can
     start their turns): their ledger rows by primary key, and the owner-wake relays the host pass posted for them.
-    An older core (no lease) or unreadable live ids: the full pass, as before. Returns which pass ran."""
+    An older core (no lease) or unreadable live ids: the full pass, as before. Returns which pass ran (``stopped``:
+    none, this module's lease was released by ``_unload`` or its stopped waker)."""
+    if _state.get("lease_closed"):
+        return "stopped"
     lease = _host_lease()
     if lease is None:
         _host_pass(False)
         return "full"
     if lease.held():
+        if _state.get("lease_closed"):
+            # ``_unload`` released the lease between ``_host_lease()`` and ``held()``: that ``held()`` re-acquired
+            # it. Give it straight back, or it stays orphaned (and its fd open) until core's watchdog. The flag is
+            # set before the release, so a re-acquire that follows the release always sees it here.
+            _release_lease()
+            return "stopped"
         try:
             _host_pass(_lease_relays(), _live_ids())
         finally:
@@ -2559,7 +2568,11 @@ def _loop(stop: threading.Event) -> None:
 
 
 def _release_lease() -> None:
-    lease = _state.pop("lease", None)
+    """Give this module's host lease up for good (unload, or its stopped waker). The lease stays in ``_state`` and
+    ``lease_closed`` is set first: a ``run_pass`` already past ``_host_lease()`` then drops what its ``held()``
+    re-acquires, and no later pass builds a fresh lease. Idempotent."""
+    _state["lease_closed"] = True
+    lease = _state.get("lease")
     if lease is not None:
         try:
             lease.release()
