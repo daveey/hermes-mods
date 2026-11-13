@@ -180,9 +180,10 @@ def test_cold_first_read_without_warmup_times_out(tmp_path, gate, monkeypatch):
 
 
 def test_register_warms_projection_so_first_turn_is_complete(tmp_path, gate, monkeypatch):
-    """register() pays the cold read on a daemon thread; the first turn, arriving while it is still in flight,
-    waits it out within its own 2 s budget and then reads warm."""
+    """With the register-time join off, the warm-up runs in the background; a turn arriving while it is still in
+    flight waits it out within its own 2 s budget and then reads warm."""
     monkeypatch.delenv("ASK_GATE_NO_PREWARM", raising=False)
+    monkeypatch.setenv("ASK_GATE_WARM_JOIN_S", "0")
     _boards(gate, monkeypatch, _local_db(tmp_path))
     calls = _slow_first_core(monkeypatch, [_remote_row()])
     gate.register(_Ctx())
@@ -195,6 +196,36 @@ def test_register_warms_projection_so_first_turn_is_complete(tmp_path, gate, mon
         assert complete is True and REMOTE in [x["id"] for x in cards]
         assert took <= gate.core.REMOTE_TIMEOUT_S + 0.25  # the turn bound holds
         assert calls[1][0] == "chat"
+    finally:
+        _wait_idle(gate)
+
+
+def test_turn_right_after_register_is_complete(tmp_path, gate, monkeypatch):
+    """Live on the MacBook (9d087d01): a fresh process whose first turn came right after register still timed out,
+    because the 2.5 s cold read outlived the 2 s turn budget. register now pays it at load (bounded join)."""
+    monkeypatch.delenv("ASK_GATE_NO_PREWARM", raising=False)
+    monkeypatch.delenv("ASK_GATE_WARM_JOIN_S", raising=False)
+    _boards(gate, monkeypatch, _local_db(tmp_path))
+    calls = _slow_first_core(monkeypatch, [_remote_row()])
+    try:
+        gate.register(_Ctx())
+        t0 = time.monotonic()
+        cards, complete = gate.core.linked_state("chat", limit=50)
+        assert complete is True and REMOTE in [x["id"] for x in cards]
+        assert time.monotonic() - t0 < 0.5 and calls[0] == [gate.core.WARM_SESSION]
+    finally:
+        _wait_idle(gate)
+
+
+def test_register_join_is_bounded_when_warmup_hangs(tmp_path, gate, monkeypatch):
+    monkeypatch.delenv("ASK_GATE_NO_PREWARM", raising=False)
+    monkeypatch.setenv("ASK_GATE_WARM_JOIN_S", "0.3")
+    _boards(gate, monkeypatch, _local_db(tmp_path))
+    _slow_first_core(monkeypatch, [_remote_row()], first_s=1.5)
+    try:
+        t0 = time.monotonic()
+        gate.register(_Ctx())
+        assert time.monotonic() - t0 < 1.0 and gate.core._remote_busy.locked()
     finally:
         _wait_idle(gate)
 

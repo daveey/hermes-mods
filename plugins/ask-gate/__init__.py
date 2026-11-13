@@ -1409,16 +1409,30 @@ def _prewarm() -> None:
     threading.Thread(target=ctx.run, args=(go,), name="ask-gate-prewarm", daemon=True).start()
 
 
-def _warm_projection() -> None:
-    """Start core's chat-projection warm-up off-turn (core.warm_projection): a fresh process's first read took 2.5 s,
-    over the turn's 2 s bound, so the first turn after every gateway restart listed local cards only."""
+WARM_JOIN_S = 4.0  # register waits this long for the warm-up (startup, never a turn); ASK_GATE_WARM_JOIN_S overrides
+
+
+def _warm_join_s() -> float:
+    try:
+        return max(0.0, float(os.environ.get("ASK_GATE_WARM_JOIN_S", WARM_JOIN_S)))
+    except ValueError:
+        return WARM_JOIN_S
+
+
+def _warm_projection(join: float = 0.0) -> None:
+    """Run core's chat-projection warm-up (core.warm_projection) on a daemon thread and wait up to ``join`` seconds
+    for it. A fresh process's first read takes 2.4-2.6 s live on the MacBook, over the turn's 2 s bound: a turn
+    arriving right after a bare background start still timed out (complete=False), so register pays the cold read
+    at load, bounded so a hung read never stalls startup (the daemon thread keeps the single-flight lock)."""
     if _off() or _is_worker() or os.environ.get("ASK_GATE_NO_PREWARM"):
         return
     import contextvars
     import threading
     ctx = contextvars.copy_context()  # profile-scoped home resolution is context-bound, as in _prewarm
-    threading.Thread(target=ctx.run, args=(core.warm_projection,), name="ask-gate-projection-warm",
-                     daemon=True).start()
+    t = threading.Thread(target=ctx.run, args=(core.warm_projection,), name="ask-gate-projection-warm", daemon=True)
+    t.start()
+    if join > 0:
+        t.join(join)
 
 
 def register(ctx) -> None:
@@ -1428,4 +1442,4 @@ def register(ctx) -> None:
     ctx.register_hook("post_tool_call", post_tool_call)
     ctx.register_hook("pre_tool_call", pre_tool_call)
     ctx.register_hook("pre_final_gate", pre_final_gate)
-    _warm_projection()
+    _warm_projection(join=_warm_join_s())
