@@ -125,7 +125,16 @@ def test_missing_board_is_not_created(tmp_path):
     assert not missing.exists()
 
 
+def audit(home, task_id, portable_reason):
+    con = sqlite3.connect(home / "kanban.db")
+    con.execute("INSERT INTO task_events(task_id,kind,payload) VALUES (?,'created',?)",
+                (task_id, json.dumps({"portable_reason": portable_reason})))
+    con.commit()
+    con.close()
+
+
 def test_three_starved_samples_file_one_card_with_top_reasons(home):
+    audit(home, "t_a1", "uncarried requirement")  # an audited card has a producer to fix
     r = Runner()
     outs = [go(home, r, registry(), i) for i in range(5)]
     assert [o["streak"] for o in outs] == [1, 2, 3, 4, 5]
@@ -210,6 +219,43 @@ def test_replay_preserves_uncarried_options(home):
     con.commit()
     con.close()
     assert w.waiting_unmarked(home / 'kanban.db')[0]['tenant'] == 'tenant-a'
+
+
+def test_only_legacy_cards_with_host_needs_file_nothing(home):
+    """No created audit and every replay is a real host need: no producer is left to fix, so no daily card."""
+    r = Runner()
+    outs = [go(home, r, registry(), i) for i in range(5)]
+    assert [o["streak"] for o in outs] == [1, 2, 3, 4, 5]
+    assert [o["filed"] for o in outs] == [None] * 5 and r.calls == []
+    assert outs[2]["skipped"] == "legacy rows replay to host needs" and outs[0]["skipped"] is None
+    assert "filed_day" not in w.load_state(home)
+
+
+def test_one_audited_card_among_legacy_rows_still_files(home):
+    audit(home, "t_b1", "assignee not allowed")
+    r = Runner()
+    outs = [go(home, r, registry(), i) for i in range(3)]
+    assert outs[2]["filed"] == "t_0000beef" and outs[2]["skipped"] is None and len(r.calls) == 1
+
+
+def test_a_legacy_card_replaying_portable_still_files(home):
+    r = Runner()
+    reg = registry()
+    out = w.run(home, registry_fn=lambda: reg, reason_fn=lambda c: None if c["id"] == "t_b1" else reason(c),
+                now_ms=NOW_MS, streak_needed=1, runner=r)
+    assert out["filed"] == "t_0000beef" and len(r.calls) == 1
+
+
+def test_a_legacy_card_whose_check_fails_still_files(home):
+    def flaky(card):
+        if card["id"] == "t_b1":
+            raise ValueError("odd row")
+        return reason(card)
+
+    r = Runner()
+    reg = registry()
+    out = w.run(home, registry_fn=lambda: reg, reason_fn=flaky, now_ms=NOW_MS, streak_needed=1, runner=r)
+    assert out["filed"] == "t_0000beef" and len(r.calls) == 1
 
 
 def test_a_failing_reason_check_is_counted_not_fatal(home):
