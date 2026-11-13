@@ -19,6 +19,10 @@ Above the threshold (default 30 in 30 min; config.yaml `coach.backend_timeouts.t
 COACH_BACKEND_TIMEOUTS_THRESHOLD, or --threshold) it runs `hermes kanban create --idempotency-key
 backend-timeouts:<host>:<date>`; later firings comment only while that card remains open (at most once an hour).
 Closed or unreadable cards start a recurrence with a :2, :3, ... key suffix.
+Each awake path with >= 20% of the awake count (or >= the threshold) also needs an owner: the incident card while it
+is active and names the path, or, while it waits in todo/scheduled, an open parent that names it. A path with neither
+gets its own card, key `backend-timeouts:<host>:<path>` (commented hourly while open; :2, ... once closed), so a
+catch-all parked behind a fleet-only parent no longer hides an unowned hub-sync/status burst (agent-23f6a4d787).
 --dry-run prints the report and files nothing. --hours prints a per-hour histogram of every timeout still in the
 logs (for checking past bursts). No Inbox items. Exit 2 with count:null when
 clock/coverage evidence is unresolved; this is not a healthy raw-zero receipt.
@@ -61,6 +65,11 @@ DEFAULT_THRESHOLD = 30
 DEFAULT_WINDOW_MIN = 30
 COMMENT_EVERY_S = 3600
 TOP_PATHS = 8
+# A path with this share of the awake count (or >= the threshold) needs its own owner card (agent-23f6a4d787).
+PATH_SHARE = 0.2
+PATHS_KEY = "paths"
+CLOSED = {"done", "archived"}
+ACTIVE = {"triage", "ready", "running", "review", "blocked"}  # works the card's own text (blocked: David acts)
 
 
 def hermes_home(home: Optional[str] = None) -> Path:
@@ -384,23 +393,33 @@ def load_state(home: Path) -> dict:
 def save_state(home: Path, st: dict) -> None:
     p = state_path(home)
     p.parent.mkdir(parents=True, exist_ok=True)
-    keep = dict(sorted(st.items())[-14:])  # two weeks of daily keys
+    daily = {k: v for k, v in st.items() if k != PATHS_KEY}
+    keep = dict(sorted(daily.items())[-14:])  # two weeks of daily keys
+    paths = st.get(PATHS_KEY) or {}
+    if paths:  # per-path owner cards: the 50 most recently created
+        keep[PATHS_KEY] = dict(sorted(paths.items(), key=lambda kv: -float((kv[1] or {}).get("created") or 0))[:50])
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(keep, indent=1))
     os.replace(tmp, p)
 
 
-def _card_status(runner: Callable, tid: str) -> Optional[str]:
-    """A failed or malformed read must not hide a recurrence behind a stale ID."""
+def _show(runner: Callable, tid: str) -> Optional[dict]:
+    """`hermes kanban show --json` with a non-empty task status, else None (failed, malformed, unknown id)."""
     try:
         r = _run(runner, ["hermes", "kanban", "show", tid, "--json"])
         if r.returncode != 0:
             return None
         data = json.loads(r.stdout)
         status = data["task"]["status"]
-        return status if isinstance(status, str) and status else None
+        return data if isinstance(status, str) and status else None
     except (OSError, subprocess.SubprocessError, ValueError, TypeError, KeyError):
         return None
+
+
+def _card_status(runner: Callable, tid: str) -> Optional[str]:
+    """A failed or malformed read must not hide a recurrence behind a stale ID."""
+    data = _show(runner, tid)
+    return data["task"]["status"] if data else None
 
 
 def _open_earlier_card(st: dict, host: str, daily_key: str, runner: Callable) -> Optional[tuple[str, dict]]:
@@ -467,6 +486,7 @@ def file_card(home: Path, host: str, now: datetime, rep: dict, probe: dict, thre
                "created": now_s if not existed else created, "last_comment": 0}
         if not existed:
             ent["last_comment"] = now_s
+            ent["paths"] = list(rep["by_path"])[:TOP_PATHS]  # the paths its body names: it owns them
             st[daily_key] = ent
             save_state(home, st)
             return {"key": key, "action": "created", "task_id": tid}
@@ -483,6 +503,124 @@ def file_card(home: Path, host: str, now: datetime, rep: dict, probe: dict, thre
     save_state(home, st)
     return {"key": key, "action": "commented" if r.returncode == 0 else "comment_failed", "task_id": tid,
             "existed": existed}
+
+
+def significant_paths(rep: dict, threshold: int) -> list:
+    """Awake paths big enough to need their own owner: >= PATH_SHARE of the awake count, or >= the threshold."""
+    total = rep.get("awake_count") or 0
+    return [p for p, n in (rep.get("awake_by_path") or {}).items()
+            if total and (n >= threshold or n >= PATH_SHARE * total)]
+
+
+def path_token(path: str) -> str:
+    """`/api/plugins/hub-sync/status` -> `hub-sync/status`: how cards and people name a route."""
+    tok = path
+    for prefix in ("/api/", "plugins/"):
+        tok = tok[len(prefix):] if tok.startswith(prefix) else tok
+    tok = tok.split("/<id>", 1)[0].strip("/")
+    return tok or path
+
+
+def _names(data: dict, path: str) -> bool:
+    t = data.get("task") or {}
+    text = f"{t.get('title') or ''}\n{t.get('body') or ''}"
+    return path in text or path_token(path) in text
+
+
+def path_owner(runner: Callable, host_ent: dict, path: str) -> Optional[str]:
+    """The open card that owns `path`: the host incident card when it is active and names the path (its recorded
+    top paths or its text), else, while it waits (todo/scheduled), an open parent that names it. A catch-all
+    waiting behind a parent about another path owns nothing for this one (agent-23f6a4d787)."""
+    tid = host_ent.get("task_id")
+    data = _show(runner, tid) if tid else None
+    if data is None:
+        return None
+    t = data["task"]
+    status = t["status"]
+    if status in CLOSED:
+        return None
+    if status in ACTIVE:
+        recorded = host_ent.get("paths")
+        if path in (recorded or ()) or _names(data, path):
+            return tid
+        if recorded is None and "body" not in t and "title" not in t:
+            return tid  # a legacy card with no naming evidence at all: keep the old per-host behaviour
+        return None
+    for pid in data.get("parents") or []:
+        if not isinstance(pid, str):
+            continue
+        p = _show(runner, pid)
+        if p is not None and p["task"]["status"] not in CLOSED and _names(p, path):
+            return pid
+    return None
+
+
+def path_card_title(path: str, n: int, window_min: int) -> str:
+    return f"Desktop backend timeouts on {path_token(path)}: {n} in {window_min} min (no owner card)"
+
+
+def file_path_cards(home: Path, host: str, now: datetime, rep: dict, probe: dict, threshold: int,
+                    window_min: int, runner: Callable, host_result: dict) -> dict:
+    """Every significant path gets an owner: reuse our open per-path card (comment hourly), accept an owning
+    host/parent card, else file `backend-timeouts:<host>:<path>` (:2, :3, ... once the earlier one closed)."""
+    if host_result.get("action") not in {"commented", "comment_failed", "throttled"}:
+        return {}  # a fresh host card lists every top path; a failed create means the board is unusable now
+    st = load_state(home)
+    host_ent = next((v for k, v in st.items() if k != PATHS_KEY and isinstance(v, dict)
+                     and v.get("task_id") == host_result.get("task_id")), {"task_id": host_result.get("task_id")})
+    paths_st = st.setdefault(PATHS_KEY, {})
+    now_s = now.timestamp()
+    n_by = rep.get("awake_by_path") or {}
+    out = {}
+    for path in significant_paths(rep, threshold):
+        skey = f"{host}:{path}"
+        ent = paths_st.get(skey) or {}
+        tid = ent.get("task_id")
+        previous = ""
+        if tid:
+            status = _card_status(runner, tid)
+            if status is not None and status not in CLOSED:
+                if now_s - float(ent.get("last_comment") or 0) < COMMENT_EVERY_S:
+                    out[path] = {"owner": tid, "action": "throttled"}
+                    continue
+                text = (f"Still firing at {now.isoformat()} on {host}: {path} {n_by.get(path)} of "
+                        f"{rep.get('awake_count')} awake timeouts in {window_min} min.")
+                r = _run(runner, ["hermes", "kanban", "comment", tid, "--author", "backend-timeouts-watch", text])
+                ent["last_comment"] = now_s
+                save_state(home, st)
+                out[path] = {"owner": tid, "action": "commented" if r.returncode == 0 else "comment_failed"}
+                continue
+            previous = (f"\nEarlier card for this path `{tid}` closed ({status}).\n" if status else
+                        f"\nEarlier card for this path `{tid}` has unreadable status; treating it as closed.\n")
+        owner = path_owner(runner, host_ent, path)
+        if owner is not None:
+            out[path] = {"owner": owner, "action": "owned"}
+            continue
+        sequence = int(ent.get("sequence") or 0) + 1 if tid else 1
+        base = f"backend-timeouts:{host}:{path}"
+        key = base if sequence == 1 else f"{base}:{sequence}"
+        why = (f"No open card names `{path}`: the incident card `{host_result.get('task_id')}` is not working on it "
+               f"(it is closed, or waits behind parents about other paths). This card owns `{path_token(path)}` "
+               f"({n_by.get(path)} of {rep.get('awake_count')} awake timeouts).\n{previous}\n")
+        try:
+            pin, body = home_route(why + card_body(host, rep, probe, threshold, window_min))
+        except HomePinUnresolved as exc:
+            out[path] = {"action": "create_failed", "out": str(exc)[-300:]}
+            continue
+        r = _run(runner, ["hermes", "kanban", "create", "--assignee", "default", "--idempotency-key", key,
+                          "--created-by", "backend-timeouts-watch", "--body-file", "-", "--json",
+                          *pin, path_card_title(path, n_by.get(path) or 0, window_min)], body)
+        try:
+            new_tid = json.loads(r.stdout).get("id") if r.returncode == 0 else None
+        except (ValueError, TypeError, AttributeError):
+            new_tid = None
+        if not isinstance(new_tid, str) or not new_tid:
+            out[path] = {"action": "create_failed", "key": key, "rc": r.returncode}
+            continue
+        paths_st[skey] = {"task_id": new_tid, "sequence": sequence, "created": now_s, "last_comment": now_s}
+        save_state(home, st)
+        out[path] = {"owner": new_tid, "action": "created", "key": key}
+    return out
 
 
 def main(argv=None, runner: Optional[Callable] = None, now: Optional[datetime] = None,
@@ -536,8 +674,12 @@ def main(argv=None, runner: Optional[Callable] = None, now: Optional[datetime] =
     if res["over_threshold"]:
         res["host_probe"] = (probe or probe_host)()
         if not a.dry_run:
-            res["cards"].append(file_card(home, host, now, rep, res["host_probe"], threshold, window,
-                                          runner or subprocess.run))
+            runner = runner or subprocess.run
+            host_card = file_card(home, host, now, rep, res["host_probe"], threshold, window, runner)
+            owners = file_path_cards(home, host, now, rep, res["host_probe"], threshold, window, runner, host_card)
+            if owners:
+                host_card["path_owners"] = owners
+            res["cards"].append(host_card)
     if a.json or a.dry_run:
         print(json.dumps(res))
     elif res["over_threshold"]:  # cron no-agent: stdout is delivered, so stay silent when healthy
