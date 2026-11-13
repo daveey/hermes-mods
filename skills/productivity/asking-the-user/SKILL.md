@@ -71,11 +71,7 @@ ask only once its prerequisite is verifiably in place. If an early one is alread
   Return verified results to the existing card rather than asking the user to relay them. When a card blocks on
   "from your own Hermes chat open the owner-terminal flow" and this chat IS the user's Desktop chat, the launch is
   yours: run the reviewed recipe through `run_in_user_terminal`, comment the job id and log path, and unblock the
-  card; don't relay the ask. Re-read the job's log tail, then post both in one command (`test -s <note> &&
-  hermes kanban comment <id> "$(cat <note>)" && hermes kanban unblock <id>`): a worker picks the unblocked card
-  up within a minute, so an unblock that outlives a failed comment starts it without the job id, and a note
-  drafted before a failed post can call a check running after it passed.
-  "Approved, unblock" on such a card means run it, then unblock: unblocking alone runs
+  card; don't relay the ask. "Approved, unblock" on such a card means run it, then unblock: unblocking alone runs
   nothing (no worker can), and the user-terminal plugin adds `next_step` to that `kanban_unblock` result until a
   ran job or a job-id comment exists after the block. Before extending a bounded service hold, exercise the current updater's read-only
   readiness predicate against the proposed stopped state: a longer hold cannot fix a guard that rejects deliberately
@@ -102,9 +98,9 @@ ask only once its prerequisite is verifiably in place. If an early one is alread
   job_id (a courier request id from `session_mentions/claimed/` works too); calling again with the identical
   command from the same session is safe, because the gateway polls the earlier start (`not_resent: true`)
   instead of sending it; on `result lost:` verify by the command's side effect (the Terraform state, the merged
-  PR, the file) and report that. Only after verifying it did not run, send it again. Why: an update pause can
-  stamp over the real result, and a poll by request id then reads "unknown job_id", which looks like "never ran"
-  while the command is still finishing.
+  PR, the file) and report that. Only after verifying it did not run, send it again. Why: on 2026-11-13 a
+  Terraform apply's real result was stamped over by an update pause and the poll by request id read
+  "unknown job_id", which looked like "never ran" while the apply was finishing (t_01a1d40fc0dda5c3).
 - `run_in_user_terminal` refusing with "`<mac>` has no Hermes Desktop connected to this gateway right now (live
   Desktops: ...)" means that Mac is asleep or offline (confirm: `tailnet_exec` to it times out). Don't re-call it
   each turn: file one blocked `physical` card ("wake the Mac with Hermes Desktop running") whose `resolved_check`
