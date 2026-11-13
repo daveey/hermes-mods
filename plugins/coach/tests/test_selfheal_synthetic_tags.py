@@ -124,6 +124,7 @@ NOTICE_LIT = re.compile(r"""(?<![\w\\])[fF]?["']\[([a-z][a-z0-9]+(?:-[a-z0-9]{2,
 # Bracket literals in plugin source that are not user-role notices (log prefixes, placeholders, markers).
 NOT_NOTICES = {
     "pid": "coach/signals.py: crash-log line prefix, never a user turn",
+    "bot": "ship-only-guard/guard.py: GitHub login suffix (\"name[bot]\") in a reviewer-author check, never a user turn",
     "older": "coach/reply_check.py: '[older tool calls omitted]' placeholder inside a tool log",
     "redacted": "tailnet/runner.py: redaction placeholder in command output",
     "hermes": "coach/backend_timeouts.py: parses a '[hermes] ' log prefix",
