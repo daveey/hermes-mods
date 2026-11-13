@@ -813,7 +813,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 pass
 
     def _selfheal_admission(session_id, reply, platform="", parent_session_id="", tool_log=None, ask="",
-                            input_origin=""):
+                            input_origin="", failure_reason=""):
         try:
             sh = _load("self_heal")
             if not sh.user_facing(platform, parent_session_id,
@@ -823,7 +823,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 return
             hit = sh.detect_admission(reply, llm=selfheal_llm, threshold=sh.audit_threshold(), tool_log=tool_log,
                                       ask=ask,
-                                      confirm=_confirm(sh))
+                                      confirm=_confirm(sh),
+                                      **({"failure_reason": failure_reason} if failure_reason else {}))
             # A machine signal carries what failed (tool, error line, count): lead with it, then the reply tail.
             evidence = (f"{hit['evidence'][:300]} | reply: {reply[-180:]}" if hit and hit.get("evidence")
                         else reply[-300:])
@@ -877,7 +878,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 ask, log_lines = coach.turn_context(session_id)
                 log_lines = list(log_lines or [])[-30:]
                 _selfheal_run(_selfheal_admission, session_id, assistant_response, platform, parent_session_id,
-                              log_lines, ask, str(_.get("input_origin") or ""))
+                              log_lines, ask, str(_.get("input_origin") or ""), str(_.get("failure_reason") or ""))
                 coach.turn_end(session_id, assistant_response)
                 coach.loop_state(session_id)["last_ask"] = coach.turn_context(session_id)[0][:1500]
                 loop = {k: v for k, v in coach.loop_state(session_id).items() if k not in ("diff_reviewed", "outcome_nudge")}

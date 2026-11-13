@@ -137,6 +137,41 @@ def test_machine_signals_need_no_judge():
     assert sh.detect_admission("Sorry, not processed.", llm)["source"] == "signal" and not calls
 
 
+# gateway-a8b8d01aa4: a turn whose tool result could not be saved (session_persistence_failed) ended on core's
+# pending-tool placeholder and was filed as "turn interrupted", so every storage failure looked like that defect coming
+# back. The verbatim placeholder David saw, then core's persistence explainer (locales/en.yaml explainer.persistence).
+PENDING_PLACEHOLDER = ("⚠️ No reply: the turn stopped while a tool result was still pending and the model produced no "
+                       "follow-up text. Send `continue` to let it summarize.")
+INTERRUPT_FP = "gateway-a8b8d01aa4"
+
+
+def test_storage_failure_is_not_filed_as_the_interrupt_defect():
+    assert sh.fingerprint("gateway", "turn interrupted before finishing") == INTERRUPT_FP
+    # The turn-end hook knows the failure_reason: it outranks the reply text.
+    hit = sh.machine_signal(PENDING_PLACEHOLDER, failure_reason="session_persistence_failed:corrupt")
+    assert hit["kind"] == "storage_failed" and hit["fingerprint"] != INTERRUPT_FP
+    assert "session_persistence_failed:corrupt" in hit["evidence"]
+    # Core's own storage explainers (no failure_reason passed) are the same defect, never the interrupt one.
+    for reply in (
+        "⚠️ No reply: the turn was stopped because the state database reported structural corruption (the "
+        "transcript would have been lost on restart).",
+        "⚠️ No reply: the turn was stopped because session storage was busy (another Hermes process was writing to "
+        "the state database). Your message should already be saved — please send it again in a moment.",
+        "⚠️ No reply: Hermes couldn't save this conversation to disk, so it stopped rather than lose your messages.",
+    ):
+        got = sh.machine_signal(reply)
+        assert got["kind"] == "storage_failed" and got["fingerprint"] == hit["fingerprint"], reply[:60]
+    llm, calls = judge(0.0)
+    assert sh.detect_admission(PENDING_PLACEHOLDER, llm, failure_reason="session_persistence_failed:locked")[
+        "kind"] == "storage_failed" and not calls
+    # A real silent stop (no failure behind it) is still the interrupt defect.
+    assert sh.machine_signal(PENDING_PLACEHOLDER)["fingerprint"] == INTERRUPT_FP
+    assert sh.machine_signal(PENDING_PLACEHOLDER, failure_reason="loop_error")["fingerprint"] == INTERRUPT_FP
+    # A finished reply that merely quotes the storage explainer is not a failure.
+    assert sh.machine_signal("Fixed: the chat no longer says 'the turn was stopped because session storage was "
+                             "busy' when the lock clears.") is None
+
+
 def test_machine_signal_flags_core_failed_turn_notices():
     """agent-c46bf512ae: 15 turns ended on core's failed-turn boundary and no turn-end signal fired."""
     partial = ("This turn did not complete. Some actions may already have run; verify their effects "
@@ -722,6 +757,17 @@ def test_post_llm_call_admission_path(tmp_path, on):
     hooks["post_llm_call"](session_id="s1", assistant_response="Done, deployed and verified.")
     ev = events(tmp_path)
     assert len(ev) == 1 and ev[0]["source"] == "admission" and ev[0]["component"] == "agent"
+
+
+def test_post_llm_call_failure_reason_reaches_the_machine_signal(tmp_path, on):
+    """gateway-a8b8d01aa4: the hook's failure_reason files a storage failure under its own id, not the interrupt one."""
+    llm, calls = judge(0.0)
+    _, hooks = plugin.build(store=core.Store(tmp_path / "coach"), checkout=None, selfheal_sync=True, selfheal_llm=llm)
+    hooks["post_llm_call"](session_id="s1", assistant_response=PENDING_PLACEHOLDER,
+                           failure_reason="session_persistence_failed:corrupt")
+    ev = events(tmp_path)
+    assert len(ev) == 1 and ev[0]["fingerprint"] != INTERRUPT_FP and not calls
+    assert "session_persistence_failed:corrupt" in json.dumps(ev[0])
 
 
 def test_live_mode_enqueues_once_per_fingerprint(tmp_path, on, monkeypatch):

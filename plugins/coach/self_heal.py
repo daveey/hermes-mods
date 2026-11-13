@@ -272,6 +272,18 @@ def provider_error_span(reply: str) -> Optional[str]:
 # read only for a turn that produced no reply and ended on a cancelled tool (gateway-a8b8d01aa4).
 INTERRUPT_RE = re.compile(r"^[\W_]{0,8}(?:No reply:\s*)?(?:Operation interrupted|(?:Session )?turn lease lost|"
                           r"Turn stopped by|the turn stopped while a tool result was still pending)", re.I)
+# A turn stopped because session storage could not be written (core exit reason session_persistence_failed). Core's
+# persistence explainers (agent/turn_explainers.py, locales/en.yaml explainer.persistence), anchored at the reply start
+# like INTERRUPT_RE. gateway-a8b8d01aa4: such a turn ended on the pending-tool placeholder and filed as "turn
+# interrupted", so every storage failure looked like that defect coming back; the turn's failure_reason, when the hook
+# passes it, outranks the reply text.
+STORAGE_FAILURE_RE = re.compile(
+    r"^[\W_]{0,8}(?:No reply:\s*)?(?:the turn was stopped because (?:session storage|the state database|"
+    r"the session search index|another process was compressing|this session was rotated|"
+    r"another Hermes process took over)|Hermes couldn't save this conversation|"
+    r"the session database file was replaced|another Hermes process still holds an old copy|"
+    r"this session was deleted from storage)", re.I)
+STORAGE_FAILURE_PREFIX = "session_persistence_failed"
 CANCEL_LINE_RE = re.compile(r"^\s*<-\s*ERROR\b.*(?:Tool execution cancelled|Operation interrupted|turn lease lost)",
                             re.I)
 # Core's crash-recovery note (tui_gateway/session_history.py _AUTO_CONTINUE_NOTE_PREFIX): the next user turn after a
@@ -485,11 +497,17 @@ def admission_prefilter(reply: str, tool_log=None) -> bool:
                 or (not r.strip() and tool_log))
 
 
-def machine_signal(final_reply: str, tool_log=None) -> Optional[dict]:
-    """Turn-end telemetry, no judge: a provider-error reply, an interrupted turn, or one tool error repeated 3x."""
+def machine_signal(final_reply: str, tool_log=None, failure_reason: str = "") -> Optional[dict]:
+    """Turn-end telemetry, no judge: a provider-error reply, a session-storage failure, an interrupted turn, or one
+    tool error repeated 3x. `failure_reason` is the turn's machine-readable cause when the hook has it."""
     r = (final_reply or "")[:400]
     log = [str(x) for x in (tool_log or [])]
-    if (final_reply or "").strip() in FAILED_TURN_NOTICES:
+    fr = str(failure_reason or "")
+    if fr.startswith(STORAGE_FAILURE_PREFIX) or STORAGE_FAILURE_RE.search(r):
+        v = {"p_defect": 0.9, "kind": "storage_failed", "component": "gateway",
+             "symptom": "turn failed: session storage could not be written",
+             "evidence": (fr + " | " if fr else "") + r[:160]}
+    elif (final_reply or "").strip() in FAILED_TURN_NOTICES:
         v = {"p_defect": 0.9, "kind": "failed_turn", "component": "gateway",
              "symptom": "turn ended on a failed-turn notice (no reply)"}
     elif (span := provider_error_span(final_reply)):
@@ -1455,7 +1473,7 @@ def audit_verdict(final_reply: str, llm: Callable[[str, str], str], tool_log=Non
 
 def detect_admission(final_reply: str, llm: Optional[Callable[[str, str], str]] = None,
                      threshold: float = AUDIT_THRESHOLD, tool_log=None, ask="",
-                     confirm: Optional[Callable[[str, str], str]] = None) -> Optional[dict]:
+                     confirm: Optional[Callable[[str, str], str]] = None, failure_reason: str = "") -> Optional[dict]:
     """post_llm_call path: machine signals first (no judge), then a turn-end audit when the reply admits a mistake or
     hands the user a step, or the turn's tool log shows errors. Only self-admissions count from the audit: the other
     audit kinds (unhandled failure, handoff, contradiction) cost more false alarms than they catch on the replay set.
@@ -1463,7 +1481,7 @@ def detect_admission(final_reply: str, llm: Optional[Callable[[str, str], str]] 
     try:
         if not isinstance(final_reply, str):
             return None
-        sig = machine_signal(final_reply, tool_log)
+        sig = machine_signal(final_reply, tool_log, failure_reason)
         if sig:
             return sig
         if not admission_prefilter(final_reply, tool_log):
