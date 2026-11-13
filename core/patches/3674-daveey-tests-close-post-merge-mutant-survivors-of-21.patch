@@ -1,0 +1,394 @@
+From 991f858fcd76687a289bc327bc1edc471ea78126 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 16:22:29 +0000
+Subject: [PATCH] [daveey] tests: close post-merge mutant survivors of #2173
+ and #2214
+
+Test-only. Post-merge check t_01a1d59498c0a89a found clauses that survived
+exact-anchor mutants. Production behaviour is unchanged; these tests pin it.
+Card t_01a1d5ada30e3458.
+
+tests/gateway/test_update_requeue_stop_latches.py (#2173,
+gateway/session_update_pause.py `_stopped_after_requeue`):
+- A shutdown Stop (`stop_authority_turns`) that arrives while the requeue
+  write runs finds the turn returned with no adopted agent and latches the
+  generation in `pending_stops`. The head is cancelled and the latch must go
+  with it. Kills A4 (drop the pending_stops / pending_stop_causes pops).
+- A Stop latched during the requeue write cancels a head carrying retained
+  native media; the media must be released with it. Kills A7 (drop
+  `release_admission_media`).
+- A3 alone (drop `update_stops.discard(admission_id)` in
+  `_stopped_after_requeue`) is equivalent on every reachable path, so no test
+  targets it. `park_or_interrupt` records the claim in `update_claims`
+  (`remember_claim`) under the claim gate and mutation lock it holds through
+  the requeue. So `requeue_unstarted`'s `update_claims.pop` always returns
+  this admission and discards its latch, with no await before
+  `_stopped_after_requeue`. The execution-stamp lookup in `interrupt_update`
+  (claim missing from `update_claims`) never latches a Stop in that window.
+
+tests/hermes_state/test_schema_init_memo_heal_retry.py (#2214):
+- A memo-hit heal whose NULL-active UPDATE meets a lock is retried after
+  HEAL_RETRY_S (30 s), not HEAL_INTERVAL_S. Kills B12
+  (`_heal_null_active_rows` returns True on OperationalError).
+- The full init keeps the delegate-marker heal's failure when the
+  NULL-active heal after it succeeds, with no earlier interval claim. Kills
+  B13 (`healed = self._heal_null_active_rows(cursor)`). (B13 was already
+  killed on main by
+  test_a_full_init_heal_failure_overrides_an_earlier_keys_interval_claim;
+  this covers it without the earlier claim.)
+- fail -> succeed -> fail warns twice. Kills B14 (a success not clearing
+  `_heal_failing`).
+
+Proof (sdlc-review scripts/mutants.py, scripts/run_tests.sh per file, base
+b3745e62d5). Predictions were written before the runs and matched:
+- new gateway file: A4 killed, A7 killed, A3-alone SURVIVED (equivalent)
+- old test_update_requeue_stop_race.py: A4, A7, A3 SURVIVED
+- new hermes_state file: B12 killed (2 tests), B13 killed, B14 killed
+- old test_schema_init_memo_heals.py: B12 SURVIVED, B13 killed, B14 SURVIVED
+- GREEN: 4 files, 13 tests passed, 0 failed (3 runs);
+  scripts/check --base origin/main: 19 checks ok
+---
+ .../test_update_requeue_stop_latches.py       | 128 ++++++++++++
+ .../test_schema_init_memo_heal_retry.py       | 195 ++++++++++++++++++
+ 2 files changed, 323 insertions(+)
+ create mode 100644 tests/gateway/test_update_requeue_stop_latches.py
+ create mode 100644 tests/hermes_state/test_schema_init_memo_heal_retry.py
+
+diff --git a/tests/gateway/test_update_requeue_stop_latches.py b/tests/gateway/test_update_requeue_stop_latches.py
+new file mode 100644
+index 0000000000..26b8a80d91
+--- /dev/null
++++ b/tests/gateway/test_update_requeue_stop_latches.py
+@@ -0,0 +1,128 @@
++"""[daveey] t_01a1d5ada30e3458: clauses of ``_stopped_after_requeue`` (PR #2173) that no test reached.
++
++Post-merge mutants of #2173 (check t_01a1d59498c0a89a) survived on two clauses of the Stop-during-requeue
++settlement: clearing a ``pending_stops`` latch (a shutdown Stop, ``stop_authority_turns``, latches the
++generation there while the requeue write runs, since the turn has returned and adopted no agent), and
++releasing the cancelled head's retained media.
++
++A third survivor, ``update_stops.discard(admission_id)`` in ``_stopped_after_requeue`` alone, is redundant on
++every reachable path, so no test here targets it: ``park_or_interrupt`` records the claim in ``update_claims``
++(``remember_claim``) under the claim gate and mutation lock it holds through the whole requeue, so
++``requeue_unstarted``'s ``update_claims.pop`` always returns this admission and discards its latch, with no
++await between that discard and ``_stopped_after_requeue``. The execution-stamp lookup in ``interrupt_update``
++(the claim missing from ``update_claims``) is never what latches a Stop during that window.
++"""
++import asyncio
++import json
++
++import pytest
++
++from tests.gateway.test_session_authority_cancel_settlement import REF, _authority
++from tests.gateway.test_update_requeue_stop_race import _stop_session, _until, _yielded
++
++
++async def _requeue_racing(tmp_path, monkeypatch, *, during_write, payload_extra=None):
++    """Admit one notifier wake that yields unstarted as the hold starts, run ``during_write(kwargs)`` on the
++    requeue write's thread before the write itself, and return what the test needs to check the outcome."""
++    import hermes_state_update_pause
++    from gateway import session_finite, session_notifier_drain
++    from hermes_state_runtime import admit_session_input
++    from tests.hermes_state.test_notifier_claim_eligibility import wake_payload
++    db, authority = _authority(tmp_path, monkeypatch)
++    held, calls = [False], []
++    monkeypatch.setattr(session_notifier_drain, 'held', lambda: held[0])
++    original = hermes_state_update_pause.requeue_unstarted_input
++
++    def racing_write(*args, **kwargs):
++        during_write(authority, kwargs)
++        return original(*args, **kwargs)
++    monkeypatch.setattr(hermes_state_update_pause, 'requeue_unstarted_input', racing_write)
++
++    async def execute(owner, ref, row):
++        calls.append(row)
++        held[0] = True
++        _yielded(owner, row)
++        return 'answered'
++    monkeypatch.setattr(session_finite, 'execute_finite_admission', execute)
++    identity = json.dumps(['kanban-wake', 'route', 'latch'])
++    payload = {**wake_payload(identity, local=True), **(payload_extra or {})}
++    head = admit_session_input(db, epoch=authority.epoch, session_id='s', principal_id='automation:route',
++                               request_id=identity, payload=payload)
++    waiter = authority.waiters.setdefault(head['admission_id'], asyncio.get_running_loop().create_future())
++    return db, authority, head, waiter, held, calls
++
++
++async def _cancelled_and_not_rerun(db, authority, head, waiter, held, calls):
++    from gateway.session_runtime_workers import mutation_tasks
++    from hermes_state_runtime import get_session_admission
++    await _until(lambda: calls and not mutation_tasks(authority))
++    row = get_session_admission(db, admission_id=head['admission_id'])
++    assert (row['status'], row['outcome']) == ('terminal', 'cancelled'), row
++    assert await asyncio.wait_for(waiter, 5) is None
++    held[0] = False
++    authority.sessions['s'].claim_changed.set()
++    await _until(lambda: not mutation_tasks(authority))
++    assert len(calls) == 1, 'the stopped notice ran after the hold'
++
++
++@pytest.mark.asyncio
++async def test_a_shutdown_stop_latched_during_the_requeue_write_is_consumed_with_the_head(tmp_path, monkeypatch):
++    """A shutdown Stop arriving while the requeue write runs finds the turn returned with no adopted agent and
++    latches its generation in ``pending_stops``. The head is cancelled, and that latch must go with it: left
++    behind, it names a settled generation and the session's next adoption of it would be stopped."""
++    from gateway.run_runtime import stop_authority_turns
++    signalled = []
++
++    def shutdown_stop(authority, kwargs):
++        signalled.append(stop_authority_turns(authority, in_process=True, reason='gateway shutdown'))
++        assert authority.pending_stops.get('s') == kwargs['generation'], 'the shutdown Stop never latched'
++
++    db, authority, head, waiter, held, calls = await _requeue_racing(tmp_path, monkeypatch,
++                                                                    during_write=shutdown_stop)
++    with db:
++        authority._schedule(REF)
++        try:
++            await _cancelled_and_not_rerun(db, authority, head, waiter, held, calls)
++            assert signalled == [1]
++            assert 's' not in authority.pending_stops, authority.pending_stops
++            assert 's' not in authority.pending_stop_causes
++            assert head['admission_id'] not in authority.update_stops
++        finally:
++            held[0] = False
++            await _stop_session(authority)
++
++
++@pytest.mark.asyncio
++async def test_the_stopped_heads_retained_media_is_released_when_it_is_cancelled(tmp_path, monkeypatch):
++    """A Stop latched during the requeue write cancels the head; its retained native media has no other owner
++    and must be released with it, not left on disk until the 24 h settled-media sweep."""
++    from pathlib import Path
++
++    from gateway.session_ingress_media import capture_native_media
++    from gateway.session_update_pause import interrupt_update
++    from tests.gateway.test_native_media_ownership import _staged
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))  # media store under tmp_path before capture
++    media = capture_native_media([_staged('photo.png', 64)])
++    retained = Path(media[0]['path'])
++    assert retained.exists()
++    loop = asyncio.get_running_loop()
++    stops = []
++
++    def user_stop(authority, kwargs):
++        stops.append(asyncio.run_coroutine_threadsafe(interrupt_update(authority, REF, kwargs['generation']), loop))
++        from tests.waiting import wait_until
++        wait_until(lambda: kwargs['admission_id'] in authority.update_stops, timeout=5)
++
++    db, authority, head, waiter, held, calls = await _requeue_racing(
++        tmp_path, monkeypatch, during_write=user_stop,
++        payload_extra={'attachments_v1': {'media': media, 'media_types': ['image/png']}})
++    with db:
++        authority._schedule(REF)
++        try:
++            await _until(lambda: stops and stops[0].done())
++            assert stops[0].result() is True
++            await _cancelled_and_not_rerun(db, authority, head, waiter, held, calls)
++            assert not retained.exists(), 'the cancelled head kept its media'
++        finally:
++            held[0] = False
++            await _stop_session(authority)
+diff --git a/tests/hermes_state/test_schema_init_memo_heal_retry.py b/tests/hermes_state/test_schema_init_memo_heal_retry.py
+new file mode 100644
+index 0000000000..c793775e7e
+--- /dev/null
++++ b/tests/hermes_state/test_schema_init_memo_heal_retry.py
+@@ -0,0 +1,195 @@
++"""[daveey] t_01a1d5ada30e3458: retry clauses of the schema-memo data heals that no test reached (PR #2214).
++
++Post-merge mutants of #2214 (check t_01a1d59498c0a89a) survived on three clauses: a NULL-``active`` heal
++stopped by a lock must report False (or it waits a full ``HEAL_INTERVAL_S``, not ``HEAL_RETRY_S``); the full
++init must keep the delegate-marker heal's failure when the NULL-``active`` heal after it succeeds; and a heal
++that succeeds must end the failure streak, so the next failure warns again.
++"""
++
++from __future__ import annotations
++
++import logging
++import sqlite3
++
++import pytest
++
++import hermes_state_schema
++from hermes_state import SessionDB
++from tests.hermes_state.test_schema_init_memo_heals import (
++    _legacy_nullable_active_store,
++    _marker,
++    _polluted_store_with_an_unindexed_message,
++)
++
++
++@pytest.fixture(autouse=True)
++def fresh_memo():
++    import hermes_state_schema_memo
++
++    hermes_state_schema_memo.clear()
++    yield
++    hermes_state_schema_memo.clear()
++
++
++@pytest.fixture
++def reconciles(monkeypatch):
++    seen = {"n": 0}
++    real = hermes_state_schema.SessionSchemaMixin._reconcile_columns
++
++    def spy(self, cursor):
++        seen["n"] += 1
++        return real(self, cursor)
++
++    monkeypatch.setattr(hermes_state_schema.SessionSchemaMixin, "_reconcile_columns", spy)
++    return seen
++
++
++def _memo():
++    import hermes_state_schema_memo
++
++    return hermes_state_schema_memo
++
++
++def _advance(monkeypatch, seconds):
++    """Move the memo's monotonic clock *seconds* past wherever it reads now."""
++    memo = _memo()
++    now = memo.time.monotonic()
++    monkeypatch.setattr(memo.time, "monotonic", lambda: now + seconds)
++
++
++def _heal_warnings(caplog):
++    return [r for r in caplog.records if r.levelno == logging.WARNING and "heal did not complete" in r.getMessage()]
++
++
++class _LockedNullActiveUpdate:
++    """The heal's own cursor, except that its UPDATE meets a lock (as a sibling writer's would)."""
++
++    def __init__(self, cursor):
++        self._cursor = cursor
++
++    def execute(self, sql, *args):
++        if sql.lstrip().startswith("UPDATE messages SET active = 1"):
++            raise sqlite3.OperationalError("database is locked")
++        return self._cursor.execute(sql, *args)
++
++
++def _lock_null_active_update(monkeypatch):
++    """Run the real ``_heal_null_active_rows`` (its except clause is what is under test) with its UPDATE
++    locked while the returned ``{"on": ...}`` switch is on."""
++    real = hermes_state_schema.SessionSchemaMixin._heal_null_active_rows
++    locked = {"on": True}
++
++    def maybe_locked(self, cursor):
++        return real(self, _LockedNullActiveUpdate(cursor) if locked["on"] else cursor)
++
++    monkeypatch.setattr(hermes_state_schema.SessionSchemaMixin, "_heal_null_active_rows", maybe_locked)
++    return locked
++
++
++def _hide_a_turn(path, content):
++    con = sqlite3.connect(path)  # an older-build writer on the same store omits ``active``
++    con.execute("INSERT INTO messages (session_id, role, content, timestamp, active) "
++                "VALUES ('s1', 'user', ?, 2.0, NULL)", (content,))
++    con.commit()
++    con.close()
++
++
++def _active(path, content):
++    con = sqlite3.connect(path)
++    try:
++        return con.execute("SELECT active FROM messages WHERE content = ?", (content,)).fetchone()[0]
++    finally:
++        con.close()
++
++
++def test_a_locked_null_active_heal_is_retried_after_the_short_backoff(tmp_path, reconciles, monkeypatch, caplog):
++    """A memo-hit heal whose NULL-``active`` UPDATE meets a lock did not complete: the next open after
++    ``HEAL_RETRY_S`` (far inside ``HEAL_INTERVAL_S``) must retry it and un-hide the turn."""
++    path = tmp_path / "state.db"
++    _legacy_nullable_active_store(path)
++    SessionDB(db_path=path).close()  # full init: migrates and memoizes the store
++    _hide_a_turn(path, "hidden while locked")
++    locked = _lock_null_active_update(monkeypatch)
++    _advance(monkeypatch, _memo().HEAL_INTERVAL_S + 1)
++    with caplog.at_level(logging.WARNING, logger="hermes_state"):
++        SessionDB(db_path=path).close()  # memo hit: the throttled heal runs and meets the lock
++    assert reconciles["n"] == 1
++    assert _active(path, "hidden while locked") is None
++    assert len(_heal_warnings(caplog)) == 1, "a locked NULL-active heal was taken as complete"
++    locked["on"] = False  # the sibling's write lock is gone
++    _advance(monkeypatch, _memo().HEAL_RETRY_S + 1)  # far inside a full interval
++    SessionDB(db_path=path).close()
++    assert reconciles["n"] == 1  # still a memo hit: the retry comes from the throttled heal
++    assert _active(path, "hidden while locked") == 1
++
++
++def test_a_full_init_keeps_the_delegate_heal_failure_when_the_null_active_heal_succeeds(
++        tmp_path, reconciles, monkeypatch, caplog):
++    """In the full init the NULL-``active`` heal runs after the delegate-marker heal: its success must not
++    overwrite that heal's failure, or the store is recorded healed and the marker waits a full interval."""
++    path = tmp_path / "state.db"
++    _polluted_store_with_an_unindexed_message(path)
++    con = sqlite3.connect(path)
++    con.execute("CREATE TABLE unrelated_ddl (x)")  # a new PRAGMA schema_version: the next open is a full init
++    con.commit()
++    con.close()
++    real_index = hermes_state_schema.SessionSchemaMixin._index_healed_rows_for_trigram
++    null_active = {"n": 0, "ok": []}
++    real_null = hermes_state_schema.SessionSchemaMixin._heal_null_active_rows
++
++    def counted(self, cursor):
++        null_active["n"] += 1
++        ok = real_null(self, cursor)
++        null_active["ok"].append(ok)
++        return ok
++
++    def locked(self, cursor, ids):
++        raise sqlite3.OperationalError("database is locked")
++
++    monkeypatch.setattr(hermes_state_schema.SessionSchemaMixin, "_heal_null_active_rows", counted)
++    monkeypatch.setattr(hermes_state_schema.SessionSchemaMixin, "_index_healed_rows_for_trigram", locked)
++    # Fresh process: no earlier open claimed the interval, so only the full init's own result decides it.
++    _memo().clear()
++    with caplog.at_level(logging.WARNING, logger="hermes_state"):
++        SessionDB(db_path=path).close()
++    assert reconciles["n"] == 2  # the fixture's open, then this full init
++    assert null_active["ok"][-1] is True  # the NULL-active heal after it did succeed
++    assert len(_heal_warnings(caplog)) == 1, "the delegate heal's failure was dropped by the full init"
++    monkeypatch.setattr(hermes_state_schema.SessionSchemaMixin, "_index_healed_rows_for_trigram", real_index)
++    _advance(monkeypatch, _memo().HEAL_RETRY_S + 1)  # far inside a full interval
++    SessionDB(db_path=path).close()
++    assert reconciles["n"] == 2  # a memo hit
++    con = sqlite3.connect(path)
++    try:
++        assert _marker(con) is None
++    finally:
++        con.close()
++
++
++def test_a_heal_that_succeeds_ends_the_failure_streak_so_the_next_failure_warns_again(
++        tmp_path, reconciles, monkeypatch, caplog):
++    """fail (warning) -> succeed -> fail must warn twice: a success between two failures starts a new streak."""
++    path = tmp_path / "state.db"
++    _legacy_nullable_active_store(path)
++    SessionDB(db_path=path).close()  # full init: memoized and healed
++    memo = _memo()
++    start = memo.time.monotonic()
++    clock = {"t": start}
++    monkeypatch.setattr(memo.time, "monotonic", lambda: clock["t"])
++    locked = _lock_null_active_update(monkeypatch)
++    with caplog.at_level(logging.DEBUG, logger="hermes_state"):
++        _hide_a_turn(path, "first streak")
++        clock["t"] = start + memo.HEAL_INTERVAL_S + 1
++        SessionDB(db_path=path).close()  # fails: warning
++        assert len(_heal_warnings(caplog)) == 1
++        locked["on"] = False
++        clock["t"] += memo.HEAL_RETRY_S + 1
++        SessionDB(db_path=path).close()  # the retry succeeds
++        assert _active(path, "first streak") == 1
++        locked["on"] = True
++        _hide_a_turn(path, "second streak")
++        clock["t"] += memo.HEAL_INTERVAL_S + 1
++        SessionDB(db_path=path).close()  # a new failure after a success: warning again, not debug
++    assert reconciles["n"] == 1
++    assert _active(path, "second streak") is None
++    assert len(_heal_warnings(caplog)) == 2, "a success did not end the failure streak"
+-- 
+2.43.0
+

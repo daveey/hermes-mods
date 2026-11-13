@@ -1,0 +1,177 @@
+From 523ecc3ac9b6f391050dc24cbf9e01730250072e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 15:59:39 +0000
+Subject: [PATCH] [daveey] lifecycle guard: zsh's clustered -O takes no value;
+ scan --rcfile only before the script operand
+
+Follow-up to PR #2249 review 5893708963 (two non-blocking behaviour nits).
+
+1) Fail-open: `_shell_options_end` counted every clustered `O` as value-taking for every
+   shell. zsh's `-O`/`+O` is the valueless CORRECT flag, so `zsh -eO restart.sh` consumed
+   restart.sh as the "value" and never scanned it (base True, #2249 head False). The helper now
+   takes the shell name: under zsh only `o` (`-o NAME`) consumes a token; every other shell
+   keeps `O` value-taking. That is wider than "bash only" on purpose: `sh` is bash on macOS
+   (where `sh -O extglob x.sh` takes a value) and dash/ksh reject an unknown `-O`, so reading a
+   value there only skips a command that never runs, while treating it as valueless would fail
+   open on bash-as-sh.
+2) Over-refusal: the --rcfile/--init-file loop in `_references_at` walked every argument, so
+   `bash clean.sh --rcfile /dev/null` failed closed on /dev/null (base allowed). The loop now
+   runs only over the option region before `operand_index` (which also ends it at `-c`/`--`, so
+   the explicit break is gone); past the script operand those tokens are the script's own
+   arguments.
+
+Tests (RED on origin/main e60925770c, GREEN here):
+- tests/cron/test_lifecycle_guard_interpreter_runners.py:
+  test_shell_specific_option_values_find_the_script (zsh -eO / -O / +O RED; zsh -o, zsh -eo,
+  bash -eO controls) and test_rcfile_after_the_script_operand_is_not_sourced
+  (`bash clean.sh --rcfile /dev/null`, `--rcfile restart.sh`, `-c ... --rcfile` RED;
+  trailing `bash --rcfile` control).
+- tests/tools/test_lifecycle_guard_hermes_sync_hint.py: executes_command_named
+  `zsh -eO /x/hermes-sync` RED, plus zsh -eo / bash -eO controls.
+RED: 7 failed / 127 passed. GREEN: all 16 test files importing lifecycle_guard, 980 passed.
+---
+ cron/lifecycle_guard.py                       | 39 ++++++++++---------
+ ...est_lifecycle_guard_interpreter_runners.py | 33 ++++++++++++++++
+ .../test_lifecycle_guard_hermes_sync_hint.py  |  4 ++
+ 3 files changed, 58 insertions(+), 18 deletions(-)
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 2c031a8710..f0c21d30f0 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -1080,13 +1080,16 @@ def _iter_command_segment_views(command: str) -> Iterator[list[str]]:
+         yield from _command_segment_views(segment)
+ 
+ 
+-def _shell_options_end(arguments: list[str]) -> tuple[int, bool, bool]:
+-    """``(operand_index, command_string, reads_stdin)`` for a POSIX shell's *arguments*: the index
+-    of the first operand past the options, whether a ``-c``/``--command`` flag ends them (inline
+-    source follows), and whether a short-option cluster holds ``s`` (commands come from stdin).
+-    Each ``o``/``O`` in a short-option cluster (``-o x``, ``-euo pipefail``, ``+O extglob``)
+-    consumes the next token, as do ``--rcfile`` and ``--init-file``; a lone ``-`` ends the
+-    options like ``--``."""
++def _shell_options_end(arguments: list[str], shell: str) -> tuple[int, bool, bool]:
++    """``(operand_index, command_string, reads_stdin)`` for a POSIX *shell*'s *arguments*: the
++    index of the first operand past the options, whether a ``-c``/``--command`` flag ends them
++    (inline source follows), and whether a short-option cluster holds ``s`` (commands come from
++    stdin). Each ``o`` in a short-option cluster (``-o x``, ``-euo pipefail``) consumes the next
++    token, as does each ``O`` (``+O extglob``) except under zsh, whose ``-O`` is the valueless
++    CORRECT flag; ``--rcfile`` and ``--init-file`` consume one too; a lone ``-`` ends the options
++    like ``--``. Shells without a ``-O`` (dash) reject it, so reading its value there only skips
++    a command that never runs."""
++    value_letters = "o" if shell == "zsh" else "oO"
+     index = 0
+     reads_stdin = False
+     while index < len(arguments):
+@@ -1103,16 +1106,16 @@ def _shell_options_end(arguments: list[str]) -> tuple[int, bool, bool]:
+             continue
+         if argument.startswith(("-", "+")):
+             reads_stdin = reads_stdin or (argument[0] == "-" and "s" in argument[1:])
+-            index += 1 + sum(letter in "oO" for letter in argument[1:])
++            index += 1 + sum(letter in value_letters for letter in argument[1:])
+             continue
+         break
+     return index, False, reads_stdin
+ 
+ 
+-def _shell_script_operand(arguments: list[str]) -> Optional[str]:
+-    """The script a POSIX shell runs from *arguments*; ``None`` for ``-c`` (inline source) or no
++def _shell_script_operand(arguments: list[str], shell: str) -> Optional[str]:
++    """The script a POSIX *shell* runs from *arguments*; ``None`` for ``-c`` (inline source) or no
+     operand. Options and their values are skipped as ``_shell_options_end`` describes."""
+-    index, command_string, _ = _shell_options_end(arguments)
++    index, command_string, _ = _shell_options_end(arguments, shell)
+     return arguments[index] if not command_string and index < len(arguments) else None
+ 
+ 
+@@ -1137,7 +1140,7 @@ def executes_command_named(command: str, name: str, *, _depth: int = 0) -> bool:
+             return True
+         arguments = segment[index + 1 :]
+         if executable in _SHELL_EXECUTABLES:
+-            script = _shell_script_operand(arguments)
++            script = _shell_script_operand(arguments, executable)
+         elif _is_interpreter_image(executable):
+             script = next((t for t in arguments if not t.startswith("-")), None)
+         else:
+@@ -1329,13 +1332,13 @@ def _references_at(
+ 
+     if executable_name in _SHELL_EXECUTABLES:
+         arguments, stdin = _split_redirections(segment[index + 1 :])
+-        # An rc file a shell may source (`bash --rcfile x.sh -i`) is scanned like its script.
+-        for arg_index, argument in enumerate(arguments[:-1]):
+-            if argument in _SHELL_COMMAND_FLAGS or argument == "--":
+-                break
+-            if argument in _SHELL_LONG_OPTIONS_WITH_VALUES:
++        operand_index, command_string, reads_stdin = _shell_options_end(
++            arguments, executable_name)
++        # An rc file a shell may source (`bash --rcfile x.sh -i`) is scanned like its script; past
++        # the options (`bash clean.sh --rcfile x`) it is only the script's argument.
++        for arg_index in range(min(operand_index, len(arguments)) - 1):
++            if arguments[arg_index] in _SHELL_LONG_OPTIONS_WITH_VALUES:
+                 yield from _resolved_or_nothing(arguments[arg_index + 1], cwd)
+-        operand_index, command_string, reads_stdin = _shell_options_end(arguments)
+         if command_string:
+             return
+         if operand_index < len(arguments):
+diff --git a/tests/cron/test_lifecycle_guard_interpreter_runners.py b/tests/cron/test_lifecycle_guard_interpreter_runners.py
+index a0fa23e592..b36a21ba06 100644
+--- a/tests/cron/test_lifecycle_guard_interpreter_runners.py
++++ b/tests/cron/test_lifecycle_guard_interpreter_runners.py
+@@ -121,6 +121,39 @@ def test_mentions_and_data_stay_allowed(files, template):
+     assert scan_gateway_lifecycle(template.format(**files)) == (False, None)
+ 
+ 
++@pytest.mark.parametrize(
++    "template",
++    [
++        # zsh's `-O` is the valueless CORRECT flag, so the next token is the script (PR #2249 nit).
++        "zsh -eO {sh}",
++        "zsh -O {sh}",
++        "zsh +O {sh}",
++        # zsh's `-o NAME` and bash's `-O NAME` still consume their value.
++        "zsh -o errexit {sh}",
++        "zsh -eo errexit {sh}",
++        "bash -eO extglob {sh}",
++    ],
++)
++def test_shell_specific_option_values_find_the_script(files, template):
++    assert scan_gateway_lifecycle(template.format(**files)) == (True, None)
++
++
++@pytest.mark.parametrize(
++    "template",
++    [
++        # Past the script operand `--rcfile` is the script's own argument, never sourced by the
++        # shell (PR #2249 nit).
++        "bash {clean_sh} --rcfile /dev/null",
++        "bash {clean_sh} --rcfile {sh}",
++        "bash -e {clean_sh} --init-file {sh}",
++        "bash -c 'echo hi' --rcfile {sh}",
++        "bash --rcfile",
++    ],
++)
++def test_rcfile_after_the_script_operand_is_not_sourced(files, template):
++    assert scan_gateway_lifecycle(template.format(**files)) == (False, None)
++
++
+ def test_python_source_run_under_uv_is_not_shell_walked(tmp_path, files):
+     """A Python file is regex-scanned only (#77131): shell-looking lines in it are not walked, even
+     when they name a script that would be refused, or a device that would fail closed."""
+diff --git a/tests/tools/test_lifecycle_guard_hermes_sync_hint.py b/tests/tools/test_lifecycle_guard_hermes_sync_hint.py
+index 3d622be134..39f277c9f4 100644
+--- a/tests/tools/test_lifecycle_guard_hermes_sync_hint.py
++++ b/tests/tools/test_lifecycle_guard_hermes_sync_hint.py
+@@ -196,6 +196,10 @@ def test_clustered_option_value_and_rcfile_stay_refused(tmp_path, monkeypatch, t
+     ("bash --rcfile /etc/rc /x/hermes-sync", True),
+     ("bash --init-file /etc/rc /x/hermes-sync", True),
+     ("bash -euo pipefail /x/deploy.sh hermes-sync", False),
++    # PR #2249 review nit: zsh's clustered `-O` (CORRECT) takes no value; its `-o NAME` does.
++    ("zsh -eO /x/hermes-sync", True),
++    ("zsh -eo errexit /x/hermes-sync", True),
++    ("bash -eO extglob /x/hermes-sync", True),
+     ("x=1 time hermes-sync", True),
+     ("env time -f %e hermes-sync", True),
+     ("sudo -u ubuntu time -o /tmp/t -- nohup hermes-sync", True),
+-- 
+2.43.0
+

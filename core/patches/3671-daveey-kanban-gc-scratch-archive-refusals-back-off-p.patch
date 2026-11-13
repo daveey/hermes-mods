@@ -1,0 +1,600 @@
+From 09776968f925a452c5c668d70c03b52b17c1aab3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 16:24:50 +0000
+Subject: [PATCH] [daveey] kanban gc: scratch archive refusals back off per
+ tree; a pass budget keeps gc inside its cap
+
+worker-2's hourly workspace GC failed two passes in a row on 2026-11-13
+(`SCRATCH kanban gc board=default failed: timed out after 1800s`, receipt
+ok=false, unit exit 1). Profile of the 15:02 pass (agent.log, pid 3276828):
+
+- 15:03-15:23 aged-scratch loop: 19 trees archived and removed (~14 min),
+  31 refusals (~5-6 min): partial clones whose `git bundle create` needs
+  the promisor remote cost ~78 s each, other bundle failures 7-10 s,
+  linked worktrees / bare repo / fifo are instant.
+- 15:23-kill: gc_custody loop, ~30 removals plus more refusals (one 81 s).
+- The same trees are refused on every pass (9x each in two days of logs).
+- Removals are committed per tree, so the kill lost no reclaim, but it
+  lost the `GC complete: N` line, so the wrapper reported the pass failed.
+
+Five whys: the pass failed -> killed at 1800 s -> it re-pays every refusal
+each hour and has no stop rule -> nothing remembers a refusal and nothing
+bounds a pass -> both added here.
+
+- New hermes_cli/kanban_scratch_backoff.py:
+  * Refusals: per-tree archive refusals in
+    <kanban home>/kanban/scratch-gc/refusals-<board>.json (host-local),
+    backoff 2 h doubling to 24 h, forgotten after 14 days; a tree is retried
+    at once when its fingerprint (path, completed_at, root inode/mtime)
+    changes; a successful archive clears it; an unreadable file is empty.
+  * Budget: once spent, no new archive (aged loop) or custody Board read
+    starts; the rest are logged as deferred and wait for the next pass.
+- gc_task_scratch archives aged trees oldest first and threads both into
+  gc_custody; `hermes kanban gc --scratch-budget-seconds N` (default 1200,
+  0 = no limit) leaves 600 s below the wrappers' 1800 s kill for the
+  longest in-flight tree (276 s observed).
+
+Both bounds only keep a tree for later: every ownership, custody,
+owner_unverified, live-job and snapshot guard still runs for every tree
+that is attempted. kanban_scratch_archive.py is untouched (PR #2354).
+
+Tests: test_kanban_scratch_gc_backoff.py, test_kanban_scratch_custody_backoff.py
+(RED without the wiring: 7 of 9 fail; GREEN 9/9), plus the 32 test files
+importing the touched modules (642 passed; the two 300 s-timeout files
+pass alone, 161/161).
+
+Card: t_01a1d59a3d672afd
+---
+ hermes_cli/kanban_ops.py                      |   6 +-
+ hermes_cli/kanban_parser.py                   |   3 +
+ hermes_cli/kanban_scratch_backoff.py          | 130 +++++++++++++++
+ hermes_cli/kanban_scratch_custody.py          |  30 +++-
+ hermes_cli/kanban_worktree_gc.py              |  35 +++-
+ .../test_kanban_scratch_custody_backoff.py    |  50 ++++++
+ .../test_kanban_scratch_gc_backoff.py         | 155 ++++++++++++++++++
+ 7 files changed, 396 insertions(+), 13 deletions(-)
+ create mode 100644 hermes_cli/kanban_scratch_backoff.py
+ create mode 100644 tests/hermes_cli/test_kanban_scratch_custody_backoff.py
+ create mode 100644 tests/hermes_cli/test_kanban_scratch_gc_backoff.py
+
+diff --git a/hermes_cli/kanban_ops.py b/hermes_cli/kanban_ops.py
+index 8681934c83..fdde911e4d 100644
+--- a/hermes_cli/kanban_ops.py
++++ b/hermes_cli/kanban_ops.py
+@@ -348,10 +348,14 @@ def _cmd_gc(args: argparse.Namespace) -> int:
+     wt_days = retention_days() if wt_days is None else wt_days
+     if wt_days < 0:
+         return _err("kanban gc: worktree retention days must be >= 0", 2)
++    from hermes_cli.kanban_scratch_backoff import DEFAULT_BUDGET_S, Budget
++    budget_s = getattr(args, "scratch_budget_seconds", None)
++    # One budget for the whole workspace pass: the wrapper's kill covers it all.
++    budget = Budget(DEFAULT_BUDGET_S if budget_s is None else budget_s)
+     with kbc.connect_closing() as conn:
+         removed_ws = gc_task_worktrees(conn, older_than_days=wt_days)
+     with kbc.connect_closing() as conn:
+-        removed_ws += gc_task_scratch(conn, older_than_days=wt_days)
++        removed_ws += gc_task_scratch(conn, older_than_days=wt_days, budget=budget)
+ 
+     removed_events = 0
+     if event_days:
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 153aa76c48..c6a63a0150 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -693,6 +693,9 @@ _SPECS = [
+              help="Delete task_events older than N days for terminal tasks (default: 30; 0 disables)"),
+         _arg("--log-retention-days", type=_nonnegative_int, default=30,
+              help="Delete worker log files older than N days (default: 30; 0 disables)"),
++        _arg("--scratch-budget-seconds", type=_nonnegative_int, default=None,
++             help="Start no new scratch archive after N seconds; the rest wait for the next pass "
++                  "(default: 1200; 0 = no limit)"),
+     ], help="Garbage-collect archived-task workspaces, old events, and old logs"),
+     _cmd("sync", children=("sync_action", [
+         _cmd("status", [_json_flag()], help="Mode, service board, cursor, outbox depth and last error"),
+diff --git a/hermes_cli/kanban_scratch_backoff.py b/hermes_cli/kanban_scratch_backoff.py
+new file mode 100644
+index 0000000000..565d78561a
+--- /dev/null
++++ b/hermes_cli/kanban_scratch_backoff.py
+@@ -0,0 +1,130 @@
++"""Bound one scheduled scratch GC pass: archive-refusal backoff and a time budget. [daveey]
++
++``hermes kanban gc`` archives every aged scratch tree holding git clones before
++removing it. A tree the archiver refuses (a linked worktree, a bare repo, a
++partial clone whose bundle needs the promisor remote, ...) used to be re-scanned
++on every hourly pass, and some refusals cost over a minute each. On a busy
++worker the pass then ran past the scheduler's 1800 s kill, so its ``GC complete``
++line was never printed and the pass counted as failed (worker-2, 2026-11-13).
++
++Two bounds, both fail-safe (each one only *keeps* a tree for later):
++
++* :class:`Refusals` remembers each refused tree with exponential backoff
++  (``BASE_S`` doubling to ``CAP_S``). A tree is retried at once when its
++  fingerprint (path, ``completed_at``, root inode and mtime) changes.
++* :class:`Budget` stops starting new archives once the pass's deadline has
++  passed; the remaining candidates wait for the next pass.
++
++Every guard in the removal path still runs for every tree that is attempted.
++State lives at ``<kanban home>/kanban/scratch-gc/refusals-<board>.json``, host
++local and never synced; an unreadable file is treated as empty.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import os
++import time
++from pathlib import Path
++from typing import Optional
++
++log = logging.getLogger(__name__)
++
++BASE_S = 2 * 3600
++CAP_S = 24 * 3600
++FORGET_S = 14 * 86400
++DEFAULT_BUDGET_S = 1200  # the worker/Mac GC wrappers kill a board's pass at 1800 s
++
++
++class Budget:
++    """Monotonic deadline for one pass; ``None`` seconds (or <= 0) means unlimited."""
++
++    def __init__(self, seconds: Optional[float] = None, *, clock=time.monotonic):
++        self._clock = clock
++        self.started = clock()
++        self.deadline = self.started + seconds if seconds and seconds > 0 else None
++        self.deferred = 0
++
++    def exhausted(self) -> bool:
++        return self.deadline is not None and self._clock() >= self.deadline
++
++    def defer(self) -> None:
++        self.deferred += 1
++
++    def report(self, what: str) -> None:
++        if self.deferred:
++            log.warning("Scratch GC budget reached after %ds: deferred %d %s to the next pass; "
++                        "kept, all safety guards apply when retried",
++                        int(self._clock() - self.started), self.deferred, what)
++
++
++def _path(board: str) -> Path:
++    from hermes_cli import kanban_db as kb
++    return kb.kanban_home() / "kanban" / "scratch-gc" / f"refusals-{board}.json"
++
++
++def fingerprint(path: Path, completed_at) -> Optional[list]:
++    try:
++        st = os.lstat(path)
++    except OSError:
++        return None
++    return [str(path), completed_at, st.st_ino, st.st_dev, st.st_mtime_ns]
++
++
++class Refusals:
++    """Per-tree archive refusals of one board, with exponential retry backoff."""
++
++    def __init__(self, board: str, *, now=time.time):
++        self._now = now
++        self.file = _path(board)
++        self.entries: dict[str, dict] = {}
++        try:
++            data = json.loads(self.file.read_text(encoding="utf-8-sig"))
++            if isinstance(data, dict) and isinstance(data.get("entries"), dict):
++                cutoff = now() - FORGET_S
++                self.entries = {k: v for k, v in data["entries"].items()
++                                if isinstance(v, dict) and float(v.get("last_at") or 0) >= cutoff}
++        except (OSError, ValueError, TypeError):
++            self.entries = {}
++
++    def backing_off(self, key: str, path: Path, completed_at) -> Optional[dict]:
++        """The entry when *key* was refused and its retry time is still ahead for the same tree."""
++        entry = self.entries.get(key)
++        if not entry or entry.get("fingerprint") != fingerprint(path, completed_at):
++            return None
++        return entry if float(entry.get("retry_at") or 0) > self._now() else None
++
++    def record(self, key: str, path: Path, completed_at, reason: str) -> None:
++        prior = self.entries.get(key) or {}
++        fp = fingerprint(path, completed_at)
++        count = int(prior.get("count") or 0) + 1 if prior.get("fingerprint") == fp else 1
++        now = self._now()
++        self.entries[key] = {"fingerprint": fp, "count": count, "last_at": now,
++                             "retry_at": now + min(CAP_S, BASE_S * 2 ** (count - 1)),
++                             "reason": str(reason)[:300]}
++        self._save()
++
++    def clear(self, key: str) -> None:
++        if self.entries.pop(key, None) is not None:
++            self._save()
++
++    def _save(self) -> None:
++        try:
++            self.file.parent.mkdir(parents=True, exist_ok=True)
++            tmp = self.file.with_name(f".{self.file.name}.{os.getpid()}.tmp")
++            tmp.write_text(json.dumps({"version": 1, "entries": self.entries}, sort_keys=True), encoding="utf-8")
++            os.replace(tmp, self.file)
++        except OSError:
++            log.warning("Scratch GC refusal backoff not saved (%s); refused trees retry next pass",
++                        self.file, exc_info=True)
++
++
++def skip_logged(refusals: Refusals, key: str, path: Path, completed_at, task_id: str) -> bool:
++    """True (and one INFO line) when *key* is inside its backoff window: the tree is kept untouched."""
++    entry = refusals.backing_off(key, path, completed_at)
++    if entry is None:
++        return False
++    log.info("Keeping aged scratch workspace for task %s: %s (archive refused %d time(s), "
++             "next retry after %s; last: %s)", task_id, path, entry["count"],
++             time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(entry["retry_at"])), entry.get("reason"))
++    return True
+diff --git a/hermes_cli/kanban_scratch_custody.py b/hermes_cli/kanban_scratch_custody.py
+index a2d65be52a..6973ca03e9 100644
+--- a/hermes_cli/kanban_scratch_custody.py
++++ b/hermes_cli/kanban_scratch_custody.py
+@@ -305,7 +305,7 @@ def _restore_detached(conn, tid, path, trash, exc):
+               tid, path, receipt, exc)
+ 
+ 
+-def _remove(conn, receipt, owner, days, board):
++def _remove(conn, receipt, owner, days, board, refusals=None):
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_scratch_archive as sa
+     tid, path = receipt["task_id"], Path(receipt["workspace_path"])
+@@ -317,8 +317,20 @@ def _remove(conn, receipt, owner, days, board):
+     before = path.stat()
+     archive = None
+     if not ws._scratch_tree_removable(path):
+-        archive = sa.archive_workspace(path, kb.kanban_home() / "archive" / "scratch" / board / tid,
+-                                       task_id=tid, completed_at=owner["completed_at"])
++        key = f"custody:{tid}"
++        if refusals is not None:
++            from hermes_cli.kanban_scratch_backoff import skip_logged
++            if skip_logged(refusals, key, path, owner["completed_at"], tid):
++                return 0
++        try:
++            archive = sa.archive_workspace(path, kb.kanban_home() / "archive" / "scratch" / board / tid,
++                                           task_id=tid, completed_at=owner["completed_at"])
++        except (OSError, ValueError, sa.ArchiveRefused, subprocess.SubprocessError) as exc:
++            if refusals is not None:
++                refusals.record(key, path, owner["completed_at"], str(exc))
++            raise
++        if refusals is not None:
++            refusals.clear(key)
+     if archive is not None:
+         ws.release_lsp_clients(str(path))
+ 
+@@ -356,8 +368,11 @@ def _remove(conn, receipt, owner, days, board):
+     return 1
+ 
+ 
+-def gc_custody(conn, days):
+-    """Scheduled scratch GC backstop; authority reads never run in a write transaction."""
++def gc_custody(conn, days, *, budget=None, refusals=None):
++    """Scheduled scratch GC backstop; authority reads never run in a write transaction.
++
++    *budget* / *refusals* (``kanban_scratch_backoff``) bound the pass: once the budget
++    is spent the remaining receipts wait for the next pass, untouched."""
+     from hermes_cli import kanban_sync_client as client
+     from hermes_cli.kanban_worktree_gc import _board_slug
+     from hermes_cli.kanban_scratch_archive import ArchiveRefused
+@@ -382,6 +397,9 @@ def gc_custody(conn, days):
+                     log.warning("Scratch custody preserved: task=%s path=%s reason=run_unverified "
+                                 "eligible_at=None", receipt["task_id"], receipt["workspace_path"])
+                     continue
++                if budget is not None and budget.exhausted():
++                    budget.defer()
++                    continue
+                 try:
+                     owner = _terminal(hub, board, receipt["task_id"])
+                 except (OSError, client.SyncUnavailable, client.Resync) as exc:
+@@ -391,7 +409,7 @@ def gc_custody(conn, days):
+                                 receipt["workspace_path"], exc)
+                     break
+                 if owner:
+-                    removed += _remove(conn, receipt, owner, days, board)
++                    removed += _remove(conn, receipt, owner, days, board, refusals)
+                 else:
+                     log.warning("Scratch custody preserved: task=%s path=%s reason=terminal_unverified "
+                                 "eligible_at=None", receipt["task_id"], receipt["workspace_path"])
+diff --git a/hermes_cli/kanban_worktree_gc.py b/hermes_cli/kanban_worktree_gc.py
+index 76cca03b29..5edc25f23c 100644
+--- a/hermes_cli/kanban_worktree_gc.py
++++ b/hermes_cli/kanban_worktree_gc.py
+@@ -52,7 +52,8 @@ def retention_days() -> float:
+         return 0
+ 
+ 
+-def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: float | None = None) -> int:
++def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: float | None = None,
++                    budget=None) -> int:
+     """Retry terminal scratch cleanup, failing closed on any unreadable board.
+ 
+     Only task records establish ownership; never infer it from directory names.
+@@ -65,6 +66,9 @@ def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: float | None =
+     and then removed once its card finished more than *older_than_days* ago
+     (default ``retention_days()``: ``kanban.worktree_retention_hours`` / 24 when
+     set, else ``kanban.worktree_retention_days``; 0 disables). [daveey]
++
++    *budget* (a ``kanban_scratch_backoff.Budget``; default unlimited) stops starting
++    new archives once spent; archive refusals back off per tree across passes.
+     """
+     import shutil
+ 
+@@ -133,10 +137,19 @@ def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: float | None =
+         if os.path.lexists(trash):
+             log.warning("Scratch GC left detached tree %s (from %s) after a partial removal", trash, path)
+     # Archiving runs git for minutes on big clones: never hold the board's write lock for it.
+-    for task_id, path, completed_at in aged:
+-        removed += _archive_and_remove_scratch(conn, task_id, path, completed_at)
++    # Oldest first; a tree refused recently waits out its backoff, and once the pass budget is
++    # spent the rest wait for the next pass (kanban_scratch_backoff), so the pass ends in time.
++    from hermes_cli.kanban_scratch_backoff import Budget, Refusals
++    budget = budget if budget is not None else Budget()
++    refusals = Refusals(_board_slug(conn))
++    for task_id, path, completed_at in sorted(aged, key=lambda a: (a[2] or 0, a[0])):
++        if budget.exhausted():
++            budget.defer()
++            continue
++        removed += _archive_and_remove_scratch(conn, task_id, path, completed_at, refusals)
+     from hermes_cli.kanban_scratch_custody import gc_custody
+-    removed += gc_custody(conn, days)
++    removed += gc_custody(conn, days, budget=budget, refusals=refusals)
++    budget.report("aged scratch tree(s) or custody receipt(s)")
+     return removed
+ 
+ 
+@@ -252,10 +265,12 @@ def _board_slug(conn: sqlite3.Connection) -> str:
+ 
+ 
+ def _archive_and_remove_scratch(conn: sqlite3.Connection, task_id: str, path: Path,
+-                                completed_at: int | None) -> int:
++                                completed_at: int | None, refusals=None) -> int:
+     """Archive every git repo in an aged scratch tree, then remove it; 1 when removed.
+ 
+-    Any refusal or failure keeps the workspace and logs why. The owner is
++    Any refusal or failure keeps the workspace and logs why; with *refusals*
++    (``kanban_scratch_backoff.Refusals``) an archive refusal is remembered and the
++    tree is not re-archived until its backoff passes or it changes. The owner is
+     re-checked under the write lock after archiving, and the tree is renamed
+     away inside that lock so a resumed card can never see it half-deleted.
+     """
+@@ -267,11 +282,19 @@ def _archive_and_remove_scratch(conn: sqlite3.Connection, task_id: str, path: Pa
+     owner = conn.execute("SELECT workspace_kind, workspace_path, completed_at FROM tasks WHERE id=?",
+                          (task_id,)).fetchone()
+     archive_dir = kb.kanban_home() / "archive" / "scratch" / _board_slug(conn) / task_id
++    if refusals is not None:
++        from hermes_cli.kanban_scratch_backoff import skip_logged
++        if skip_logged(refusals, task_id, path, completed_at, task_id):
++            return 0
+     try:
+         final = sa.archive_workspace(path, archive_dir, task_id=task_id, completed_at=completed_at)
+     except (sa.ArchiveRefused, OSError, subprocess.SubprocessError, ValueError) as exc:
+         log.info("Keeping aged scratch workspace for task %s: %s (%s)", task_id, path, exc)
++        if refusals is not None:
++            refusals.record(task_id, path, completed_at, str(exc))
+         return 0
++    if refusals is not None:
++        refusals.clear(task_id)
+     ws.release_lsp_clients(str(path))
+ 
+     def _row_path(row):
+diff --git a/tests/hermes_cli/test_kanban_scratch_custody_backoff.py b/tests/hermes_cli/test_kanban_scratch_custody_backoff.py
+new file mode 100644
+index 0000000000..d31db79395
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scratch_custody_backoff.py
+@@ -0,0 +1,50 @@
++"""Custody scratch GC shares the pass budget and the archive-refusal backoff. [daveey]"""
++import pytest
++
++from hermes_cli import kanban_scratch_archive as archive
++from hermes_cli import kanban_scratch_backoff as bo
++from hermes_cli import kanban_worktree_gc as gc
++from tests.hermes_cli import test_kanban_scratch_gc_archive as helpers
++from tests.hermes_cli import test_kanban_scratch_custody as custody_tests
++
++env = custody_tests.env
++evicted = custody_tests.evicted
++remote = custody_tests.remote
++
++
++@pytest.fixture
++def archives(monkeypatch):
++    calls = []
++    real = archive.archive_workspace
++
++    def spy(workspace, *args, **kwargs):
++        calls.append(workspace)
++        return real(workspace, *args, **kwargs)
++
++    monkeypatch.setattr(archive, "archive_workspace", spy)
++    return calls
++
++
++def test_custody_refusal_backs_off_then_retries_a_changed_tree(env, remote, archives):
++    tid, path, _ = evicted(env)
++    helpers._run("clone", "-q", "--bare", str(remote), str(path / "bare"))
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert archives == [path], "refused custody tree re-archived inside its backoff"
++    assert bo.Refusals("default").entries[f"custody:{tid}"]["count"] == 1
++    import shutil
++    shutil.rmtree(path / "bare")
++    helpers._run("clone", "-q", str(remote), str(path / "repo"))
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 1
++    assert archives == [path, path] and not path.exists()
++    assert f"custody:{tid}" not in bo.Refusals("default").entries
++
++
++def test_spent_budget_skips_custody_before_any_board_read(env, caplog):
++    _tid, path, _ = evicted(env)
++    budget = bo.Budget(1, clock=iter([0.0, 5.0, 5.0]).__next__)
++    assert gc.gc_task_scratch(env.conn, older_than_days=7, budget=budget) == 0
++    assert env.calls == 0 and path.exists()
++    assert budget.deferred == 1 and "deferred 1" in caplog.text
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 1
++    assert not path.exists()
+diff --git a/tests/hermes_cli/test_kanban_scratch_gc_backoff.py b/tests/hermes_cli/test_kanban_scratch_gc_backoff.py
+new file mode 100644
+index 0000000000..663bd8676e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scratch_gc_backoff.py
+@@ -0,0 +1,155 @@
++"""Scheduled scratch GC finishes inside its cap: refusal backoff and a pass budget. [daveey]
++
++worker-2 (2026-11-13): the default board's ``hermes kanban gc`` re-archived the same
++refused trees every hour (one partial clone cost ~78 s per pass) and ran past the
++1800 s wrapper kill, so its ``GC complete`` line never printed and the pass failed.
++"""
++import argparse
++import json
++import logging
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_ops
++from hermes_cli import kanban_scratch_archive as sa
++from hermes_cli import kanban_scratch_backoff as bo
++from hermes_cli import kanban_worktree_gc as gc
++from tests.hermes_cli import test_kanban_scratch_gc_archive as helpers
++from tests.hermes_cli.test_kanban_scratch_gc_archive import OLD, _run, _task
++
++board = helpers.board
++remote = helpers.remote
++
++pytestmark = pytest.mark.usefixtures("board")
++
++
++@pytest.fixture
++def archives(monkeypatch):
++    """Record every archive attempt (path) while running the real archiver."""
++    calls = []
++    real = sa.archive_workspace
++
++    def spy(workspace, *args, **kwargs):
++        calls.append(workspace)
++        return real(workspace, *args, **kwargs)
++
++    monkeypatch.setattr(sa, "archive_workspace", spy)
++    return calls
++
++
++def _bare_refused(remote):
++    tid, path = _task(remote=remote)
++    _run("clone", "-q", "--bare", str(remote), str(path / "mirror.git"))
++    return tid, path
++
++
++def _state():
++    return json.loads(bo._path("default").read_text())["entries"]
++
++
++def _expire(key):
++    data = json.loads(bo._path("default").read_text())
++    data["entries"][key]["retry_at"] = 0
++    bo._path("default").write_text(json.dumps(data))
++
++
++def test_refused_tree_is_not_rearchived_until_backoff_passes(remote, archives, caplog):
++    tid, path = _bare_refused(remote)
++    assert helpers._gc() == 0
++    assert archives == [path]
++    entry = _state()[tid]
++    assert entry["count"] == 1 and "bare repository" in entry["reason"]
++    assert entry["retry_at"] - entry["last_at"] == bo.BASE_S
++
++    caplog.set_level(logging.INFO, logger="hermes_cli.kanban_scratch_backoff")
++    assert helpers._gc() == 0
++    assert archives == [path], "a refusal inside its backoff window must not be re-archived"
++    assert path.exists() and "archive refused 1 time(s)" in caplog.text
++
++    _expire(tid)
++    assert helpers._gc() == 0
++    assert archives == [path, path]
++    entry = _state()[tid]
++    assert entry["count"] == 2 and entry["retry_at"] - entry["last_at"] == 2 * bo.BASE_S
++    assert path.exists()
++
++
++def test_changed_tree_is_retried_at_once_and_success_clears_the_entry(remote, archives):
++    tid, path = _bare_refused(remote)
++    assert helpers._gc() == 0
++    import shutil
++    shutil.rmtree(path / "mirror.git")  # the root's mtime moves: a new fingerprint
++    assert helpers._gc() == 0
++    assert archives == [path, path]
++    assert not path.exists()
++    assert tid not in _state()
++
++
++def test_backoff_doubles_to_a_cap(tmp_path):
++    clock = [1_000_000.0]
++    refusals = bo.Refusals("default", now=lambda: clock[0])
++    tree = tmp_path / "tree"
++    tree.mkdir()
++    waits = []
++    for _ in range(7):
++        refusals.record("t", tree, 5, "refused")
++        entry = refusals.entries["t"]
++        waits.append(entry["retry_at"] - entry["last_at"])
++        assert refusals.backing_off("t", tree, 5) is not None
++        assert refusals.backing_off("t", tree, 6) is None, "a new completed_at is a new tree"
++        clock[0] = entry["retry_at"]
++        assert refusals.backing_off("t", tree, 5) is None
++    assert waits == [bo.BASE_S * 2 ** i for i in range(4)] + [bo.CAP_S] * 3
++    clock[0] += bo.FORGET_S + 1
++    assert bo.Refusals("default", now=lambda: clock[0]).entries == {}
++
++
++def test_unreadable_state_is_empty_and_never_blocks(remote, archives):
++    bo._path("default").parent.mkdir(parents=True, exist_ok=True)
++    bo._path("default").write_text("{not json")
++    tid, path = _bare_refused(remote)
++    assert helpers._gc() == 0
++    assert archives == [path] and _state()[tid]["count"] == 1
++
++
++def test_budget_defers_the_rest_oldest_first_and_pass_completes(remote, archives, caplog, capsys):
++    _newer, newer_path = _task(remote=remote)
++    _older, older_path = _task(remote=remote, completed_at=OLD - 3600)
++    ticks = iter([0.0, 0.0, 5.0])  # started, first check (in budget), second check (spent)
++    budget = bo.Budget(1, clock=lambda: next(ticks, 9.0))
++    with kbc.connect_closing() as conn:
++        assert gc.gc_task_scratch(conn, older_than_days=7, budget=budget) == 1
++    assert archives == [older_path]
++    assert not older_path.exists() and newer_path.exists()
++    assert budget.deferred == 1 and "deferred 1 aged scratch tree(s)" in caplog.text
++    # Next pass (fresh budget) picks the deferred tree up.
++    assert helpers._gc() == 0
++    assert not newer_path.exists()
++    assert "GC complete: 1 workspace(s)" in capsys.readouterr().out
++
++
++def _cli(*argv):
++    from hermes_cli.kanban_parser import build_parser
++    root = argparse.ArgumentParser()
++    build_parser(root.add_subparsers(dest="command"))
++    return root.parse_args(["kanban", "gc", *argv])
++
++
++def test_cli_budget_flag_and_default(monkeypatch):
++    assert _cli().scratch_budget_seconds is None
++    assert _cli("--scratch-budget-seconds", "0").scratch_budget_seconds == 0
++    seen = []
++    monkeypatch.setattr(gc, "gc_task_scratch", lambda conn, **kw: seen.append(kw["budget"]) or 0)
++    for value in (None, 0, 30):
++        kanban_ops._cmd_gc(argparse.Namespace(event_retention_days=0, log_retention_days=0,
++                                              worktree_retention_days=7, scratch_budget_seconds=value))
++    default, unlimited, short = seen
++    assert default.deadline - default.started == bo.DEFAULT_BUDGET_S
++    assert unlimited.deadline is None and not unlimited.exhausted()
++    assert short.deadline - short.started == 30
++
++
++def test_default_budget_leaves_headroom_below_the_wrapper_kill():
++    assert bo.DEFAULT_BUDGET_S <= 1800 - 600
+-- 
+2.43.0
+

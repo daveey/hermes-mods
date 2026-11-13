@@ -1,0 +1,480 @@
+From dfab8ca8ceddb16dce1fc609ef4c693aed18d8e0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 17:01:41 +0000
+Subject: [PATCH] [daveey] kanban pickup-stall: no hold repair once the live
+ hold lifted; close host-wide repairs with nothing left
+
+Problem: on 11-13 at 15:45:09Z worker-6 filed t_01a1d59589cb8efc "Pickup held on worker-6: oldest
+t_01a1d58ace44b467 waiting 11 min". The registry entry quoted in its own body already read state='active',
+hold=False, hold_owner=None; the card's last `hold` skip was 15:43:45Z. That card ran at 15:55Z, and the alarm
+sat `ready` until it was archived by hand at 16:18Z. Same shape on 11-12 07:18Z (t_01a1d3c595358fa2, closed
+"No move needed").
+
+Why 1: file_repairs groups a stalled card by its newest recorded skip reason (_group -> `hold`), a historical
+  record. Evidence: alarm body "last skip hold (held), first 15:34:36Z, last 15:43:45Z, 8 pass(es)".
+Why 2: the hold had ended before the filing pass. Evidence: same body, registry at 15:45:09Z hold=False.
+  (hypothesis, timing only: worker-6's core-rollout hold around its 15:39Z gateway restart.)
+Why 3: the only live-registry gate on the hold group was _hold_expected -> expected_hold(), which returns None
+  for `hold is not True` (kanban_pickup_stall.py expected_hold), and None means "alert as usual". A lifted
+  hold took the same path as a hold with no stated release.
+Root (happened): the host-wide `hold` repair was filed from skip records without requiring the hold to still
+  be present in the live registry entry the pass reads.
+Root (not caught): no test covered "hold lifted between the last hold skip and the filing pass"; the existing
+  burst test even fed `hold` skips against an unheld registry. The 11-12 false alarm was closed "No move
+  needed" with no route back to the producer.
+Second gap: nothing closed an open host-wide repair. Searched hermes_cli for pickup-stall-detector /
+  KEY_PREFIX / archive/complete callers: none; sweep() only filed (and only when cards were stalled).
+Recurrence: t_01a1cec7cd7fe7ce (rollout hold -> expected_hold), t_01a1d3c595358fa2, t_01a1d59589cb8efc.
+
+Countermeasures:
+- symptom/root: file_repairs skips the `hold` group when the live registry entry is readable and not held
+  (_hold_lifted). An unreadable registry still alerts. The card's next pickup skip classifies it on a later
+  pass (e.g. profile_ineligible gets its own card, budget_exhausted the queue card).
+- second gap: new kanban_pickup_stall_resolve.sweep runs every detector pass, before filing. It archives an
+  open, unclaimed host-wide repair about this host when every card it names has left ready here (done /
+  archived / blocked on the Board, gone, re-pinned, leased, or imported), or when it is a `hold` repair and
+  the live hold lifted. The closing comment names each card's state. A pickup_stall_resolved event marks the
+  close, so _covering_repair opens a fresh card for a later stall instead of reusing it for an hour.
+  Claimed, running, blocked, in-review or Board-leased repairs are left to their run.
+- detection: tests/hermes_cli/test_kanban_pickup_stall_lifted.py (RED on 93e9a44e67: 3 of 5 fail, namely
+  lifted-hold filing, close-when-left-ready, close-when-hold-lifted; GREEN after). A real operator hold
+  (hold=True, no stated release, not the rollout's) still files exactly one card per host
+  (test_a_real_operator_hold_still_files_exactly_one_card_per_host and the existing
+  test_an_operator_hold_with_no_stated_release_still_files_a_card / test_a_held_machine_files_one_hold_card).
+  test_same_cause_burst_...[hold] now holds the registry, as a real hold burst does.
+
+Card: t_01a1d5b42df173d3
+---
+ hermes_cli/kanban_pickup_stall.py             |  52 ++++--
+ hermes_cli/kanban_pickup_stall_resolve.py     | 137 ++++++++++++++++
+ tests/hermes_cli/test_kanban_pickup_stall.py  |   4 +
+ .../test_kanban_pickup_stall_lifted.py        | 153 ++++++++++++++++++
+ 4 files changed, 332 insertions(+), 14 deletions(-)
+ create mode 100644 hermes_cli/kanban_pickup_stall_resolve.py
+ create mode 100644 tests/hermes_cli/test_kanban_pickup_stall_lifted.py
+
+diff --git a/hermes_cli/kanban_pickup_stall.py b/hermes_cli/kanban_pickup_stall.py
+index d3ab73a53d..f88b2adf9a 100644
+--- a/hermes_cli/kanban_pickup_stall.py
++++ b/hermes_cli/kanban_pickup_stall.py
+@@ -19,7 +19,11 @@ read back: pickup kept no record of why a pass skipped a candidate.
+   whose pin is stranded is re-pinned. Its body carries this host's machine-local evidence (pickup skips, registry
+   entry, replica path). Host-wide causes share
+   ONE card per host naming the oldest card: ``budget_exhausted`` (the queue is simply full), ``hold`` and an
+-  unreadable machine registry. A ``hold`` that states ``release by HH:MMZ`` (or is the core rollout's own,
++  unreadable machine registry. A ``hold`` repair needs the hold in the live registry entry the pass reads (a
++  lifted hold files nothing; the card's next pickup skip classifies it), and every pass closes an open host-wide
++  repair whose cards have all left ``ready`` (or, for ``hold``, whose hold lifted):
++  :mod:`hermes_cli.kanban_pickup_stall_resolve`. A ``hold`` that states ``release by HH:MMZ`` (or is the core
++  rollout's own,
+   :func:`expected_hold`) files nothing until that release plus the stall threshold has passed; nor does a card's own
+   ``quota_hold`` (local dispatch would hold it on its quota wall) before its stated deadline. Missing evidence gets
+   one additional stall interval of durable grace, then one
+@@ -225,6 +229,9 @@ def _covering_repair(conn, key: str, now_ms: int) -> Optional[str]:
+         return None
+     if row["status"] not in ("done", "archived"):
+         return row["id"]
++    from hermes_cli import kanban_pickup_stall_resolve as resolve
++    if resolve.resolved_by_detector(conn, row["id"]):
++        return None  # this detector closed it once its cards left ready: a later stall is a new incident
+     return row["id"] if now_ms - int(row["closed"] or 0) * 1000 < REPLACE_AFTER_SECONDS * 1000 else None
+ 
+ 
+@@ -488,6 +495,20 @@ def _hold_expected(own: str, now_ms: int) -> bool:
+     return True
+ 
+ 
++def _hold_lifted(own: str) -> bool:
++    """``own``'s live registry entry is readable and holds nothing: a ``hold`` skip predates the pass, so it files no
++    hold repair (the card's next pickup skip classifies it). An unreadable registry fails toward alerting.
++
++    t_01a1d5b42df173d3 (2026-11-13): worker-6 filed "Pickup held on worker-6" at 15:45:09Z from hold skips last
++    recorded at 15:43:45Z while the entry quoted in its own body read hold=False; :func:`expected_hold` returns
++    None for a lifted hold, which read as "alert as usual"."""
++    from hermes_cli import kanban_pickup_stall_resolve as resolve
++    lifted = resolve._hold_lifted(own)
++    if lifted:
++        _log.debug("pickup-stall: %s hold has lifted (%s); no hold repair", own, lifted)
++    return lifted is not None
++
++
+ _QUOTA_UNTIL = re.compile(r" until (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)Z")
+ 
+ 
+@@ -535,19 +556,10 @@ def _open_coverage(conn, own: str) -> dict[str, str]:
+ 
+     t_01a1cfdfb6f3f7ea (2026-11-12): worker-2 filed "Pickup evidence missing" for t_01a1cfa91548dad7 at 12:50:44Z;
+     pickup recorded budget_exhausted 0.3 s later, and the next tick filed "Pickup queue full" for the same card."""
+-    prefix = f"{KEY_PREFIX}{own}:"
+-    slugs = {spec[0] for spec in _HOST_GROUPS.values()}
++    from hermes_cli import kanban_pickup_stall_resolve as resolve
+     out: dict[str, str] = {}
+-    for row in conn.execute("SELECT id, body, idempotency_key FROM tasks WHERE idempotency_key >= ? "
+-                            "AND idempotency_key < ? AND status NOT IN ('done', 'archived')",
+-                            (prefix, prefix + "\U0010ffff")).fetchall():
+-        slug = row["idempotency_key"][len(prefix):].split(":", 1)[0]
+-        if slug not in slugs:
+-            continue
+-        text = (row["body"] or "") + "\n" + "\n".join(
+-            r[0] for r in conn.execute("SELECT body FROM task_comments WHERE task_id = ? AND author = ?",
+-                                       (row["id"], DETECTOR)))
+-        for tid in re.findall(r"^- (\S+) \(", text, re.MULTILINE):
++    for _, slug, targets in resolve.open_host_repairs(conn, own):
++        for tid in targets:
+             out.setdefault(tid, slug)
+     return out
+ 
+@@ -601,7 +613,7 @@ def file_repairs(conn, own: str, cards: list[dict[str, Any]], *, now: Optional[f
+                   f"it.\n\nLast pickup skip recorded on {own}: {describe(card['skip'])}.")))
+     for group, members in groups.items():
+         slug, title, why = _HOST_GROUPS[group]
+-        if group == "hold" and _hold_expected(own, now_ms):
++        if group == "hold" and (_hold_expected(own, now_ms) or _hold_lifted(own)):
+             continue
+         oldest = members[0]
+         listed = "\n".join(f"- {c['id']} ({c['title']}), ready {_minutes(c['since_ms'], now_ms)} min, "
+@@ -637,12 +649,24 @@ def sweep(conn, *, now: Optional[float] = None) -> list[str]:
+     if replica is None:
+         return stranded
+     try:
++        resolve_sweep(conn, replica, own, now_ms=_now_ms(now))
+         cards = stalled(conn, replica, own, now=now)
+     finally:
+         replica.close()
+     return stranded + (file_repairs(conn, own, cards, now=now) if cards else [])
+ 
+ 
++def resolve_sweep(conn, replica, own: str, *, now_ms: int) -> list[str]:
++    """:func:`hermes_cli.kanban_pickup_stall_resolve.sweep`: close host-wide repairs with nothing left to repair,
++    every pass and before filing, so a closed hold repair never hides the next reason's alarm."""
++    from hermes_cli import kanban_pickup_stall_resolve as resolve
++    try:
++        return resolve.sweep(conn, replica, own, now_ms=now_ms)
++    except Exception:  # health: allow BLE001 -- closing a moot alarm must never stop the detector
++        _log.warning("kanban dispatcher: pickup-stall resolve failed", exc_info=True)
++        return []
++
++
+ def safe_sweep(conn) -> list[str]:
+     try:
+         return sweep(conn)
+diff --git a/hermes_cli/kanban_pickup_stall_resolve.py b/hermes_cli/kanban_pickup_stall_resolve.py
+new file mode 100644
+index 0000000000..369a908d08
+--- /dev/null
++++ b/hermes_cli/kanban_pickup_stall_resolve.py
+@@ -0,0 +1,137 @@
++"""Close a host-wide pickup repair the detector filed once it has nothing left to repair. [daveey]
++
++t_01a1d5b42df173d3 (2026-11-13): worker-6's "Pickup held on worker-6" repair t_01a1d59589cb8efc named one card,
++which ran at 15:55Z; nothing closed the repair, so it sat ``ready`` for a pool run until it was archived by hand at
++16:18Z. Every detector pass (:func:`hermes_cli.kanban_pickup_stall.sweep`, stalled cards or not) now archives an
++open, unclaimed host-wide repair about this machine (:data:`~hermes_cli.kanban_pickup_stall._HOST_GROUPS`) when
++
++* every card it names (body and the detector's target comments) has left ``ready`` here: done, archived or blocked
++  on the Board, gone from the replica, re-pinned elsewhere, leased, or imported into this host's board; or
++* it is a ``hold`` repair and this machine's live registry entry no longer holds it: a card still waiting is judged
++  on its next pickup skip, not under a hold that ended.
++
++The closing comment names each card's state. The ``pickup_stall_resolved`` event marks the close as the
++detector's, so a later stall opens a fresh card instead of reusing this one (``_covering_repair``).
++A claimed, running, blocked or in-review repair, or one leased on the Board, is left to its run.
++"""
++from __future__ import annotations
++
++import logging
++import re
++from typing import Any, Optional
++
++_log = logging.getLogger(__name__)
++
++EVENT = "pickup_stall_resolved"
++_LEAVE = ("running", "review", "blocked")  # an agent has it: its run decides
++
++
++def open_host_repairs(conn, own: str) -> list[tuple[str, str, list[str]]]:
++    """``[(repair id, slug, [target ids in listed order])]`` for every open host-wide repair about ``own``."""
++    from hermes_cli import kanban_pickup_stall as kps
++    prefix = f"{kps.KEY_PREFIX}{own}:"
++    slugs = {spec[0] for spec in kps._HOST_GROUPS.values()}
++    out = []
++    for row in conn.execute("SELECT id, body, idempotency_key FROM tasks WHERE idempotency_key >= ? "
++                            "AND idempotency_key < ? AND status NOT IN ('done', 'archived') ORDER BY created_at, id",
++                            (prefix, prefix + "\U0010ffff")).fetchall():
++        slug = row["idempotency_key"][len(prefix):].split(":", 1)[0]
++        if slug not in slugs:
++            continue
++        text = (row["body"] or "") + "\n" + "\n".join(
++            r[0] for r in conn.execute("SELECT body FROM task_comments WHERE task_id = ? AND author = ? "
++                                       "ORDER BY id", (row["id"], kps.DETECTOR)))
++        targets = list(dict.fromkeys(re.findall(r"^- (\S+) \(", text, re.MULTILINE)))
++        out.append((row["id"], slug, targets))
++    return out
++
++
++def resolved_by_detector(conn, task_id: str) -> bool:
++    return conn.execute("SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? LIMIT 1",
++                        (task_id, EVENT)).fetchone() is not None
++
++
++def _leased(row, now_ms: int) -> Optional[str]:
++    keys = row.keys()
++    holder = row["lease_holder"] if "lease_holder" in keys else None
++    expires = row["lease_expires"] if "lease_expires" in keys else None
++    return holder if holder and int(expires or 0) >= now_ms else None
++
++
++def target_state(conn, replica, own: str, tid: str, now_ms: int) -> tuple[bool, str]:
++    """``(still waiting here, state text)`` for one card a repair names."""
++    from hermes_cli import kanban_pickup_stall as kps
++    from hermes_cli import kanban_worker_node as wn
++    local = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
++    if local is not None:
++        return False, f"imported here ({local['status']})"
++    row = replica.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
++    if row is None:
++        return False, "not in this host's Board replica"
++    if row["status"] != "ready":
++        return False, f"{row['status']} on the Board"
++    holder = _leased(row, now_ms)
++    if holder:
++        return False, f"ready on the Board, leased by {holder}"
++    if f"machine:{own}" not in (wn._parse(row["runs_on"]) or []):
++        return False, f"ready on the Board, re-pinned to {row['runs_on']}"
++    skip = kps.latest(conn, tid)
++    return True, f"ready, pinned to machine:{own}, not imported (last skip {(skip or {}).get('reason', 'none')})"
++
++
++def _hold_lifted(own: str) -> Optional[str]:
++    """When ``own``'s registry entry is readable and holds nothing, the hold fields as read; else None (held, or
++    unreadable: fail toward keeping the alarm)."""
++    from hermes_cli import kanban_worker_node as wn
++    entry = ((wn.registry() or {}).get("machines") or {}).get(own)
++    if not entry or entry.get("hold") is True:
++        return None
++    return f"state={entry.get('state')!r}, hold={entry.get('hold')!r}, hold_owner={entry.get('hold_owner')!r}"
++
++
++def _archive(conn, task_id: str, note: str, payload: dict[str, Any]) -> bool:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_archive import archive_task
++    from hermes_cli import kanban_pickup_stall as kps
++
++    def precondition(c) -> Optional[str]:
++        row = c.execute("SELECT status, claim_lock FROM tasks WHERE id = ?", (task_id,)).fetchone()
++        if row is None or row["status"] in ("done", "archived", *_LEAVE) or row["claim_lock"]:
++            return "claimed or closed"
++        kb._append_event(c, task_id, EVENT, payload)
++        return None
++
++    return archive_task(conn, task_id, via=kps.DETECTOR, comment=(kps.DETECTOR, note), precondition=precondition)
++
++
++def sweep(conn, replica, own: str, *, now_ms: int) -> list[str]:
++    """Archive every open host-wide repair about ``own`` that has nothing left to repair; returns their ids."""
++    closed = []
++    for rid, slug, targets in open_host_repairs(conn, own):
++        row = conn.execute("SELECT status, claim_lock FROM tasks WHERE id = ?", (rid,)).fetchone()
++        if row is None or row["claim_lock"] or row["status"] in _LEAVE:
++            continue
++        mine = replica.execute("SELECT * FROM tasks WHERE id = ?", (rid,)).fetchone()
++        if mine is not None and _leased(mine, now_ms):
++            continue  # a pool run holds it on the Board
++        states = [(tid, *target_state(conn, replica, own, tid, now_ms)) for tid in targets]
++        if not states:
++            continue  # names nothing readable: leave it to its run rather than guess
++        lines = "\n".join(f"- {tid}: {text}" for tid, _, text in states)
++        lifted = _hold_lifted(own) if slug == "hold" else None
++        if not any(waiting for _, waiting, _ in states):
++            note = (f"Closed by the {own} pickup-stall detector: every card this repair names has left ready on "
++                    f"{own}, so there is nothing left to repair.\n\n{lines}\n\nA later stall opens a fresh card.")
++            why = "targets_left_ready"
++        elif lifted:
++            note = (f"Closed by the {own} pickup-stall detector: {own}'s registry hold has lifted ({lifted}), so "
++                    f"this hold repair has nothing left to judge. A card still waiting is judged on its next pickup "
++                    f"skip, under that reason's own alarm.\n\n{lines}")
++            why = "hold_lifted"
++        else:
++            continue
++        payload = {"why": why, "targets": {tid: text for tid, _, text in states}}
++        if _archive(conn, rid, note, payload):
++            closed.append(rid)
++            _log.info("pickup-stall closed card=%s why=%s targets=%d", rid, why, len(states))
++    return closed
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall.py b/tests/hermes_cli/test_kanban_pickup_stall.py
+index e1bdb9bcfa..cc2b63157d 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall.py
+@@ -318,6 +318,10 @@ def test_same_cause_burst_refreshes_all_targets_without_comment_churn(gws, reaso
+     from hermes_cli import kanban_pickup_stall as kps
+     _, worker = gws
+     worker.enter()
++    if reason == "hold":  # a hold repair needs the hold in the live registry entry (t_01a1d5b42df173d3)
++        machines = {**support.MACHINES, WORKER: {**support.MACHINES[WORKER], "hold": True}}
++        wn.set_registry_fetch(lambda: {"me": WORKER, "machines": support.seen_now(machines.values())})
++        wn._REGISTRY.update(at=None, value=None, retry=False)
+     cards = [{"id": f"target-{i:03}", "title": "waiting", "tenant": None, "since_ms": 1,
+               "skip": {"reason": reason, "first_at": 1, "last_at": 1, "passes": 1,
+                        "detail": "machine registry unavailable" if reason == "other" else None}}
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall_lifted.py b/tests/hermes_cli/test_kanban_pickup_stall_lifted.py
+new file mode 100644
+index 0000000000..917cbf32a4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pickup_stall_lifted.py
+@@ -0,0 +1,153 @@
++"""A ``hold`` repair needs the hold to still be in the live registry, and the producer closes a host-wide repair
++whose cards have all left ``ready``. [daveey]
++
++t_01a1d5b42df173d3 (2026-11-13): worker-6 filed t_01a1d59589cb8efc "Pickup held on worker-6" at 15:45:09Z from
++``hold`` skips last recorded at 15:43:45Z, while the registry entry its own body quoted already read
++``hold=False``. The card it named ran at 15:55Z; the alarm stayed ``ready`` until it was archived by hand at 16:18Z.
++The same shape was filed at 07:18Z on 11-12 (t_01a1d3c595358fa2) and closed "No move needed".
++Same fake-Board two-gateway harness as ``test_kanban_pickup_stall``.
++"""
++from __future__ import annotations
++
++import time
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import test_kanban_pickup_stall as base
++from tests.hermes_cli import test_kanban_worker_node as support
++
++WORKER = support.WORKER
++svc = support.svc
++gws = support.gws
++
++
++def _registry(**fields):
++    machines = {**support.MACHINES, WORKER: {**support.MACHINES[WORKER], **fields}}
++    wn.set_registry_fetch(lambda: {"me": WORKER, "machines": support.seen_now(machines.values())})
++    wn._REGISTRY.update(at=None, value=None, retry=False)
++
++
++def _held_cards(gws, **hold):
++    """Two cards pinned to the worker, skipped as ``hold`` by a pickup pass while the registry holds it, and aged
++    past the stall threshold. Returns (hub, worker, [older, newer])."""
++    hub, worker = gws
++    a = base._pinned(hub, title="a")
++    b = base._pinned(hub, title="b")
++    worker.round()
++    worker.enter()
++    _registry(hold=True, **hold)
++    wn.pickup(worker.conn, budget=4)
++    base._age(worker, a, 900)
++    base._age(worker, b, 700)
++    return hub, worker, [a, b]
++
++
++def _lift(worker):
++    """The hold ends: the registry entry is active, unheld and advertises pickup again."""
++    worker.enter()
++    _registry(hold=False, hold_owner=None, hold_reason=None, hold_at=None)
++    entry = wn.registry()["machines"][WORKER]
++    assert entry["state"] == "active" and entry["hold"] is False and wn.advertises_pickup(entry)
++
++
++def test_hold_skips_from_a_lifted_hold_file_no_hold_repair(gws, monkeypatch):
++    from hermes_cli import kanban_pickup_stall as kps
++    _, worker, cards = _held_cards(gws, hold_owner="ops@hub", hold_at=int(time.time() * 1000),
++                                   hold_reason="disk migration")
++    assert all(kps.latest(worker.conn, t)["reason"] == "hold" for t in cards)
++    _lift(worker)
++    assert kps.sweep(worker.conn) == []  # the newest skip still says hold, the live registry does not
++    assert not base._repairs(worker.conn)
++    # Still unpicked after the lift: the next pass records why, and the alarm is about that reason.
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: (lambda name: name != "default"))
++    worker.tick()
++    worker.tick()
++    assert all(kps.latest(worker.conn, t)["reason"] == "profile_ineligible" for t in cards)
++    repairs = base._repairs(worker.conn)
++    assert repairs and not any("held" in r["title"].lower() for r in repairs)
++    assert {t for t in cards if any(t in r["title"] and "profile_ineligible" in r["title"] for r in repairs)} \
++        == set(cards)
++
++
++def test_a_real_operator_hold_still_files_exactly_one_card_per_host(gws):
++    from hermes_cli import kanban_pickup_stall as kps
++    _, worker, cards = _held_cards(gws, hold_owner="ops@hub", hold_at=int(time.time() * 1000),
++                                   hold_reason="disk migration")
++    kps.sweep(worker.conn)
++    kps.sweep(worker.conn)
++    [card] = base._repairs(worker.conn)
++    assert "held" in card["title"].lower() and cards[0] in card["title"] and cards[1] in card["body"]
++
++
++def _states(worker, tid):
++    return [c.body for c in kb.list_comments(worker.conn, tid) if c.author == base.DETECTOR]
++
++
++def test_an_open_hold_repair_is_closed_once_every_card_it_names_left_ready(gws):
++    from hermes_cli import kanban_pickup_stall as kps
++    hub, worker, (a, b) = _held_cards(gws, hold_owner="ops@hub", hold_at=int(time.time() * 1000),
++                                      hold_reason="disk migration")
++    kps.sweep(worker.conn)
++    [repair] = base._repairs(worker.conn)
++    # Only one card leaves ready: the repair still has work.
++    hub.enter()
++    kb.complete_task(hub.conn, a, summary="ran elsewhere")
++    hub.round()
++    worker.round()
++    worker.enter()
++    _registry(hold=True, hold_owner="ops@hub", hold_at=int(time.time() * 1000), hold_reason="disk migration")
++    kps.sweep(worker.conn)
++    assert kb.get_task(worker.conn, repair["id"]).status == "ready"
++    # The other card is withdrawn on the Board while the hold still stands: nothing is left for the repair.
++    hub.enter()
++    kb.archive_task(hub.conn, b)
++    hub.round()
++    worker.round()
++    worker.enter()
++    _registry(hold=True, hold_owner="ops@hub", hold_at=int(time.time() * 1000), hold_reason="disk migration")
++    kps.sweep(worker.conn)
++    assert kb.get_task(worker.conn, repair["id"]).status == "archived"
++    [note] = [c for c in _states(worker, repair["id"]) if "left ready" in c]
++    assert f"{a}: done on the Board" in note and f"{b}: archived on the Board" in note
++    # A later stall is a new incident: a fresh card, not the closed one reused.
++    c = base._pinned(hub, title="c")
++    worker.round()
++    worker.enter()
++    _registry(hold=True, hold_owner="ops@hub", hold_at=int(time.time() * 1000), hold_reason="disk migration")
++    wn.pickup(worker.conn, budget=4)
++    base._age(worker, c, 900)
++    kps.sweep(worker.conn)
++    fresh = [r for r in base._repairs(worker.conn) if r["id"] != repair["id"]]
++    assert len(fresh) == 1 and c in fresh[0]["title"] and fresh[0]["status"] == "ready"
++
++
++def test_an_open_hold_repair_is_closed_when_the_hold_lifted_and_its_cards_still_wait(gws, monkeypatch):
++    from hermes_cli import kanban_pickup_stall as kps
++    _, worker, (a, b) = _held_cards(gws, hold_owner="ops@hub", hold_at=int(time.time() * 1000),
++                                    hold_reason="disk migration")
++    kps.sweep(worker.conn)
++    [repair] = base._repairs(worker.conn)
++    _lift(worker)
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: (lambda name: name != "default"))
++    worker.tick()  # closes the hold repair; pickup records the next reason
++    assert kb.get_task(worker.conn, repair["id"]).status == "archived"
++    [note] = [c for c in _states(worker, repair["id"]) if "hold" in c and "lifted" in c]
++    assert f"{a}: ready" in note and f"{b}: ready" in note
++    worker.tick()  # the cards are now judged by that reason, not hidden behind the closed hold card
++    fresh = [r for r in base._repairs(worker.conn) if r["id"] != repair["id"]]
++    assert {t for t in (a, b) if any(t in r["title"] and "profile_ineligible" in r["title"] for r in fresh)} \
++        == {a, b}
++
++
++def test_a_claimed_repair_is_left_to_its_run(gws):
++    from hermes_cli import kanban_pickup_stall as kps
++    _, worker, _cards = _held_cards(gws, hold_owner="ops@hub", hold_at=int(time.time() * 1000),
++                                    hold_reason="disk migration")
++    kps.sweep(worker.conn)
++    [repair] = base._repairs(worker.conn)
++    with kb.write_txn(worker.conn):
++        worker.conn.execute("UPDATE tasks SET status = 'running', claim_lock = 'x' WHERE id = ?", (repair["id"],))
++    _lift(worker)
++    kps.sweep(worker.conn)  # (no dispatcher tick: it would reclaim this fake claim)
++    assert kb.get_task(worker.conn, repair["id"]).status == "running"
+-- 
+2.43.0
+

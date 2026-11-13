@@ -1,0 +1,105 @@
+From 5cc0d3e9cb9559d8d51973aee53051728c657686 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 16:20:04 +0000
+Subject: [PATCH] [daveey] kanban_completion_refs.pick: a pre-uid replayed id
+ naming another run's receipt falls back to its own run
+
+A completion written before `stamp_uids` and replayed from a worker carries only the worker's integer
+`*_event_id`. On the hub that integer can, by chance, name a receipt of the same card and the same origin
+gateway written in a different run. `pick` returned that hit and skipped the same-run fallback, so
+`completion_verdict` rejected it on run_id: the card stayed unverified (fail-closed) and its origin chat showed
+`unknown`.
+
+Fix: for an imported completion, an id hit binds only when its run matches the completion's run; otherwise
+`pick` falls through to the same-run fallback (latest receipt of that kind the same gateway wrote in the same
+run before the completion). Local completions and uid-bound completions are unchanged.
+
+Follow-up to PR #2312 (review t_01a1d5492e88b736, Nit 1 and Nit 2; card t_01a1d559440d3304).
+
+Tests (tests/hermes_cli/test_kanban_completion_refs_sync.py):
+- test_a_pre_uid_replayed_id_naming_another_runs_receipt_still_binds_its_own_run: RED on main
+  (verified == (False, False)), GREEN after.
+- test_a_goal_mode_completion_replayed_from_a_worker_is_verified_there: goal_verified replay by uid and
+  pre-uid (coverage, passes on main and after).
+- 180 passed across the completion-refs, origin-legacy-release, goal-receipt, execution-receipt,
+  terminal-carry and origin-ledger suites; scripts/check --base origin/main ok.
+---
+ hermes_cli/kanban_completion_refs.py          |  6 ++-
+ .../test_kanban_completion_refs_sync.py       | 37 +++++++++++++++++++
+ 2 files changed, 41 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_completion_refs.py b/hermes_cli/kanban_completion_refs.py
+index 0d9cde65e7..d8929d7192 100644
+--- a/hermes_cli/kanban_completion_refs.py
++++ b/hermes_cli/kanban_completion_refs.py
+@@ -10,7 +10,8 @@ chat listed the done card as ``unknown`` for hours (hub t_01a1d41478234144 et al
+ 
+ The completion now also records each receipt's stable ``uid`` (``*_event_uid``), which the feed carries
+ unchanged; when present it decides, with no integer fallback. A completion written before that, replayed from
+-another gateway (``origin_gateway`` set), whose integer does not name the same card's receipt here, binds the
++another gateway (``origin_gateway`` set), whose integer does not name the same card's receipt here from the same
++gateway and run (on the hub that integer is the worker's, so it can name another run's receipt), binds the
+ latest receipt of that kind the same gateway wrote in the same run before the completion: on its own board that
+ run's latest receipt is the one ``complete_task`` bound (it writes the receipt and the completion in one
+ transaction). A completion that names no receipt never borrows one.
+@@ -131,7 +132,8 @@ def pick(rows: Iterable[dict[str, Any]], *, task_id: str, kind: str, event_id: A
+         return None
+     origin = None if legacy else imported_from
+     hit = next((r for r in mine if r["id"] == event_id), None)
+-    if hit is not None and (imported_from is None or hit["origin_gateway"] == origin):
++    if hit is not None and (imported_from is None or (hit["origin_gateway"] == origin
++                                                      and (run_id is None or hit["run_id"] == run_id))):
+         return hit["payload"], hit["run_id"]
+     if imported_from is None or run_id is None:
+         return None
+diff --git a/tests/hermes_cli/test_kanban_completion_refs_sync.py b/tests/hermes_cli/test_kanban_completion_refs_sync.py
+index 53d97223f4..e38c7877dd 100644
+--- a/tests/hermes_cli/test_kanban_completion_refs_sync.py
++++ b/tests/hermes_cli/test_kanban_completion_refs_sync.py
+@@ -103,6 +103,43 @@ def test_a_pre_uid_completion_replayed_from_a_worker_binds_its_runs_receipt(boar
+     assert verified(hub, tid) == (False, False)
+ 
+ 
++def test_a_pre_uid_replayed_id_naming_another_runs_receipt_still_binds_its_own_run(boards):
++    """The worker's integer can, by chance, name a receipt of this card and gateway written in another run."""
++    worker, hub = boards
++    tid = completed_on_worker(worker)
++    replay(worker, hub)
++    event_id, _payload = payload_of(hub, tid)
++    # An earlier replayed event of this card (same origin gateway), relabelled as a receipt of another run.
++    other = hub.execute("SELECT id FROM task_events WHERE task_id=? AND kind='created'", (tid,)).fetchone()["id"]
++    other_run = hub.execute("SELECT id FROM task_runs WHERE task_id != ? ORDER BY id LIMIT 1", (tid,)).fetchone()["id"]
++    assert other_run != hub.execute("SELECT run_id FROM task_events WHERE id=?", (event_id,)).fetchone()["run_id"]
++    with kb.write_txn(hub):
++        hub.execute("UPDATE task_events SET kind='pr_acceptance', run_id=?, payload=? WHERE id=?",
++                    (other_run, json.dumps({"ok": False}), other))
++    assert hub.execute("SELECT origin_gateway FROM task_events WHERE id=?", (other,)).fetchone()[0] == "worker-3"
++    rewrite(hub, event_id, lambda p: (p.pop("pr_acceptance_event_uid", None), p.update(pr_acceptance_event_id=other)))
++    assert verified(hub, tid) == (True, True)
++
++
++def test_a_goal_mode_completion_replayed_from_a_worker_is_verified_there(boards):
++    """The ``goal_verified`` receipt binds across the replay like ``pr_acceptance``, by uid and pre-uid alike."""
++    from hermes_cli.kanban_goal_receipt import GoalVerification
++    worker, hub = boards
++    tid = kb.create_task(worker, title="Build", assignee="dev", goal_mode=True, completion_contract="local-only")
++    run = kb.claim_task(worker, tid).current_run_id
++    proof = GoalVerification.for_handoff(kb.get_task(worker, tid), "Tested")
++    assert kb.complete_task(worker, tid, summary="Tested", expected_run_id=run, goal_verification=proof)
++    assert verified(worker, tid) == (True, True)
++    replay(worker, hub)
++    event_id, payload = payload_of(hub, tid)
++    receipt = hub.execute("SELECT id, uid FROM task_events WHERE task_id=? AND kind='goal_verified'", (tid,)).fetchone()
++    assert payload["goal_verified_event_id"] != receipt["id"]
++    assert payload["goal_verified_event_uid"] == receipt["uid"]
++    assert verified(hub, tid) == (True, True)
++    rewrite(hub, event_id, lambda p: p.pop("goal_verified_event_uid"))
++    assert verified(hub, tid) == (True, True)
++
++
+ def test_a_completion_that_names_no_receipt_never_borrows_one(boards):
+     worker, hub = boards
+     tid = completed_on_worker(worker)
+-- 
+2.43.0
+

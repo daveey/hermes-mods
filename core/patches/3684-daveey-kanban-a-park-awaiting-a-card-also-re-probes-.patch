@@ -1,0 +1,470 @@
+From fb2398dd9bf8f95707979dc4587a6de930696cd0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 16:43:43 +0000
+Subject: [PATCH] [daveey] kanban: a park awaiting a card also re-probes when
+ its status arrives by a replica rebuild or `kanban sync reconcile`
+
+PR #2370 handed only the sync round's feed pull (`Pulled.status_changed`) to
+kanban_awaited_card_wake.expedite (review 5894353204, t_01a1d5aec0e3a0c5). Two other replica
+apply paths carried no status changes, so a park awaiting a card whose done status arrived on
+them slept until its check_every (fail-safe, but up to 15 min), and the
+awaited_card_done_park_lag warning was blind to it:
+
+1. the snapshot rebuild on Resync (`Pulled(resync(...))` in `_pulled_replica`);
+2. `kanban sync reconcile`: `backlog.replica_at_head -> _pull_replica` dropped
+   `pulled.status_changed`.
+
+Now:
+- Rebuild: the old replica's card statuses are read before the file is dropped
+  (`acw.statuses`) and diffed against the rebuilt replica (`acw.rebuilt`); the pages the failed
+  pull applied before its Resync ride on the Resync (`acw.changes_page`) and count at their
+  rebuilt status. The rebuilt Pulled carries the diff, so the round's existing expedite (and any
+  standalone caller) sees it.
+- Reconcile: `replica_at_head` forwards each chunk's `pulled.status_changed` to `expedite` on
+  the live board.
+- `report_lag` reads the awaited cards' status from the replica itself (throttled to once per
+  60 s per board, nothing without a replica), so a status that arrived by any path is seen; a
+  warned park is marked until it leaves scheduled, so it warns once, not once per scan.
+
+No new probing: expedite still only moves an existing probe earlier on a status change, and the
+30-minute quiet-window test still counts exactly the check_every probes.
+
+Tests (tests/hermes_cli/test_kanban_awaited_card_wake.py): a park awaiting X wakes within 60 s
+when X->done arrives via a snapshot rebuild, and via `kanban sync reconcile` (plain and
+compacted); the lag warning fires once for a status only the replica saw (`sync diff`'s
+diagnostic pull); throttle, diff and Resync-carry units. RED on main: 7 failed (the 3 wake tests
+fail on the wake assertion); GREEN: 21 passed.
+---
+ hermes_cli/kanban_awaited_card_wake.py        | 146 ++++++++++++++++--
+ hermes_cli/kanban_sync_backlog.py             |  18 +++
+ hermes_cli/kanban_sync_client.py              |  11 +-
+ .../test_kanban_awaited_card_wake.py          |  99 ++++++++++++
+ 4 files changed, 256 insertions(+), 18 deletions(-)
+
+diff --git a/hermes_cli/kanban_awaited_card_wake.py b/hermes_cli/kanban_awaited_card_wake.py
+index 3f3bf27d0a..f9a864a947 100644
+--- a/hermes_cli/kanban_awaited_card_wake.py
++++ b/hermes_cli/kanban_awaited_card_wake.py
+@@ -13,8 +13,15 @@ to ``check_every`` later. The probe stays the judge: an unmet change (``--from``
+ reads "not yet" and the probe goes back to its cadence, so each status change costs at most one probe per park.
+ Nothing here polls: no status change, no work (hub-load design t_01a1d563324d7e8e).
+ 
++Every replica apply path reports its changes (review 5894353204 on #2370, t_01a1d5aec0e3a0c5): the feed pull, a
++snapshot rebuild on Resync (:func:`statuses` before the file is dropped, :func:`rebuilt` diffs it against the
++rebuilt replica, with the pages a pull applied before its Resync, :func:`changes_page`), and ``kanban sync
++reconcile``'s standalone pull (``kanban_sync_backlog.replica_at_head``).
++
+ Detection: when an awaited card reached done/archived and its park is still ``scheduled`` more than
+ ``LAG_WARN_SECONDS`` later, the wake-check tick logs one ``awaited_card_done_park_lag`` WARNING (``report_lag``).
++It reads the awaited cards' status from the replica itself (at most once per ``_SCAN_SECONDS`` per board), so a
++status that arrived by any path is seen, not only one ``expedite`` was handed.
+ """
+ from __future__ import annotations
+ 
+@@ -23,17 +30,20 @@ import re
+ import sqlite3
+ import threading
+ import time
+-from typing import Mapping, Optional
++from typing import Any, Mapping, Optional
+ 
+ logger = logging.getLogger(__name__)
+ 
+ LAG_WARN_SECONDS = 120
++_SCAN_SECONDS = 60  # report_lag's replica read, per board: a lag is first seen at most this late
+ _MAX_WATCHED = 1000  # in-memory lag records; the oldest are dropped past this
+ _WAIT_CHECK_TASK = re.compile(r"\bwait-check\b[^;&|\n]*?\btask\s+(t_[0-9a-f]{8,16})\b")
+ _FINISHED = ("done", "archived")
+ _LOCK = threading.Lock()
+ # (board db path, waiting card) -> (awaited card, its status, when this gateway applied it)
+ _WATCH: dict[tuple[str, str], tuple[str, str, float]] = {}
++_WARNED: dict[tuple[str, str], str] = {}  # parks already warned for (-> awaited card), until they leave scheduled
++_SCANNED: dict[str, float] = {}  # board db path -> when report_lag last read the replica
+ 
+ 
+ def named_cards(conn: sqlite3.Connection, task_id: str, cmd: Optional[str]) -> set[str]:
+@@ -69,19 +79,29 @@ def expedite(live: sqlite3.Connection, changed: Mapping[str, str], *, now: Optio
+         return []
+ 
+ 
+-def _expedite(live: sqlite3.Connection, changed: Mapping[str, str], now: float) -> list[str]:
+-    from hermes_cli import kanban_db_sync as sync
+-    from hermes_cli.kanban_db_connect import write_txn
+-
++def _parks(conn: sqlite3.Connection) -> list[tuple[str, str, set[str]]]:
++    """``(waiting card, probe cmd, cards it names)`` for every scheduled park's probe that names a card."""
+     try:
+-        rows = live.execute(
++        rows = conn.execute(
+             "SELECT w.task_id, w.cmd FROM task_wake_checks w JOIN tasks t ON t.id = w.task_id "
+             "WHERE t.status = 'scheduled' AND w.purpose IS NOT 'ask_resolved'").fetchall()
+     except sqlite3.OperationalError:  # a board without the probe table (older schema): nothing parks on probes
+         return []
+-    hits = []
++    out = []
+     for task_id, cmd in rows:
+-        refs = sorted(named_cards(live, task_id, cmd) & set(changed))
++        refs = named_cards(conn, task_id, cmd)
++        if refs:
++            out.append((task_id, cmd, refs))
++    return out
++
++
++def _expedite(live: sqlite3.Connection, changed: Mapping[str, str], now: float) -> list[str]:
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_db_connect import write_txn
++
++    names, hits = set(changed), []
++    for task_id, cmd, named in _parks(live):
++        refs = sorted(named & names)
+         if refs:
+             hits.append((task_id, cmd, refs[0]))
+     if not hits:
+@@ -107,19 +127,75 @@ def _remember(key: str, hits: list, changed: Mapping[str, str], now: float) -> N
+     with _LOCK:
+         for task_id, _cmd, ref in hits:
+             if changed[ref] in _FINISHED:
+-                _WATCH.setdefault((key, task_id), (ref, changed[ref], now))
++                if (key, task_id) not in _WARNED:
++                    _WATCH.setdefault((key, task_id), (ref, changed[ref], now))
+             else:
+                 _WATCH.pop((key, task_id), None)
+-        while len(_WATCH) > _MAX_WATCHED:
+-            _WATCH.pop(next(iter(_WATCH)))
++        _bound()
++
++
++def _bound() -> None:
++    for table in (_WATCH, _WARNED):
++        while len(table) > _MAX_WATCHED:
++            table.pop(next(iter(table)))
++
++
++def _replica_finished(conn: sqlite3.Connection) -> Optional[dict[str, tuple[str, str]]]:
++    """``{waiting card: (awaited card, its replica status)}`` for each scheduled park naming a card the replica has
++    done/archived; None when there is no readable replica (nothing to judge by)."""
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli.kanban_foreign_card import open_replica
++
++    with open_replica(kbc._main_db_file(conn)) as replica:
++        if replica is None:
++            return None
++        parks = _parks(conn)
++        refs = sorted({ref for _tid, _cmd, named in parks for ref in named})
++        if not refs:
++            return {}
++        marks = ",".join("?" * len(refs))
++        status = {r[0]: r[1] for r in replica.execute(
++            f"SELECT id, status FROM tasks WHERE id IN ({marks})", refs).fetchall()}
++    out: dict[str, tuple[str, str]] = {}
++    for task_id, _cmd, named in parks:
++        done = sorted(ref for ref in named if status.get(ref) in _FINISHED)
++        if done and task_id not in out:
++            out[task_id] = (done[0], status[done[0]])
++    return out
++
++
++def _scan(conn: sqlite3.Connection, key: str, now: float) -> None:
++    """Record the parks whose awaited card the replica shows finished, whatever path applied it, and forget the
++    warned mark of a park that no longer waits on a finished card. At most once per ``_SCAN_SECONDS`` per board."""
++    with _LOCK:
++        last = _SCANNED.get(key)
++        if last is not None and 0 <= now - last < _SCAN_SECONDS:
++            return
++        _SCANNED[key] = now
++    try:
++        found = _replica_finished(conn)
++    except (sqlite3.Error, OSError, ValueError):
++        logger.debug("kanban awaited-card wake: replica scan failed", exc_info=True)
++        return
++    if found is None:
++        return
++    with _LOCK:
++        for task_id, (ref, status) in found.items():
++            if (key, task_id) not in _WARNED:
++                _WATCH.setdefault((key, task_id), (ref, status, now))
++        for k in [k for k in _WARNED if k[0] == key and k[1] not in found]:
++            del _WARNED[k]
++        _bound()
+ 
+ 
+ def report_lag(conn: sqlite3.Connection, *, now: Optional[float] = None) -> list[str]:
+     """Log one WARNING per park still ``scheduled`` ``LAG_WARN_SECONDS`` after its awaited card finished (seen by
+-    ``expedite``), then forget it; a park that left ``scheduled`` is forgotten silently. Returns the warned cards.
+-    Reads only the parks ``expedite`` recorded, so it costs nothing while no awaited card finishes."""
++    ``expedite`` when it applied, or by the replica scan at most ``_SCAN_SECONDS`` later), then mark it warned
++    until it leaves ``scheduled``; a park that left ``scheduled`` is forgotten silently. Returns the warned cards.
++    Beyond the throttled replica read it reads only the recorded parks."""
+     key = _db_key(conn)
+     now = time.time() if now is None else float(now)
++    _scan(conn, key, now)
+     with _LOCK:
+         mine = [(tid, v) for (k, tid), v in _WATCH.items() if k == key]
+     warned = []
+@@ -132,6 +208,9 @@ def report_lag(conn: sqlite3.Connection, *, now: Optional[float] = None) -> list
+             continue
+         with _LOCK:
+             _WATCH.pop((key, task_id), None)
++            if row is not None and row[0] == "scheduled":
++                _WARNED[(key, task_id)] = ref
++                _bound()
+         if row is not None and row[0] == "scheduled":
+             warned.append(task_id)
+             logger.warning("awaited_card_done_park_lag task=%s awaited=%s lag_s=%d (awaited card %s, park still "
+@@ -139,6 +218,47 @@ def report_lag(conn: sqlite3.Connection, *, now: Optional[float] = None) -> list
+     return warned
+ 
+ 
++# --- a snapshot rebuild's status changes ------------------------------------------------------------------------
++
++def changes_page(hub: Any, board: str, cursor: int, applied: Mapping[str, str]) -> dict:
++    """``hub.changes(board, cursor)``; a Resync it raises carries ``status_changed``, the status changes the pull
++    already applied from earlier pages (the rebuild's pre-read sees them as the old state, so its diff would not)."""
++    from hermes_cli.kanban_sync_client import Resync
++    try:
++        return hub.changes(board, cursor)
++    except Resync as exc:
++        exc.status_changed = dict(applied)  # type: ignore[attr-defined]
++        raise
++
++
++def _statuses(conn: sqlite3.Connection) -> Optional[dict[str, str]]:
++    try:
++        return {r[0]: r[1] for r in conn.execute("SELECT id, status FROM tasks").fetchall()}
++    except sqlite3.Error:
++        logger.warning("kanban awaited-card wake: replica statuses unreadable around a rebuild", exc_info=True)
++        return None
++
++
++def statuses(replica: sqlite3.Connection, applied: Optional[Mapping[str, str]] = None) -> tuple:
++    """The replica's card statuses read before a rebuild drops it (None when unreadable: then every rebuilt card
++    counts as changed), with the status changes the failed pull had already applied (``changes_page``)."""
++    return _statuses(replica), dict(applied or {})
++
++
++def rebuilt(before: tuple, replica: sqlite3.Connection) -> dict[str, str]:
++    """``{card id: status}`` for every card whose status the rebuild changed (or brought in), plus those the failed
++    pull had changed, at their rebuilt status: what ``expedite`` gets for the round. Never raises."""
++    old, applied = before
++    new = _statuses(replica)
++    if new is None:
++        return {}
++    out = {tid: s for tid, s in new.items() if old is None or old.get(tid) != s}
++    out.update({tid: new[tid] for tid in applied if tid in new})
++    return out
++
++
+ def _reset_for_tests() -> None:
+     with _LOCK:
+         _WATCH.clear()
++        _WARNED.clear()
++        _SCANNED.clear()
+diff --git a/hermes_cli/kanban_sync_backlog.py b/hermes_cli/kanban_sync_backlog.py
+index b54277b230..d70d5128dd 100644
+--- a/hermes_cli/kanban_sync_backlog.py
++++ b/hermes_cli/kanban_sync_backlog.py
+@@ -11,11 +11,14 @@ that board at once, without the poll wait: the backlog drains over consecutive r
+ """
+ from __future__ import annotations
+ 
++import logging
++import sqlite3
+ import threading
+ import time
+ from pathlib import Path
+ from typing import Any, Iterable
+ 
++_log = logging.getLogger(__name__)
+ PULL_PAGE_BUDGET = 20  # 20 pages x 500 changes = 10k changes per database per round
+ BUSY_RETRY_S = 0.5  # a round skipped because a dispatcher tick held the board (wait_for_work's tick)
+ RECONCILE_BUSY_WAIT_S = 600.0  # a reconcile waits this long in all for rounds holding the board between its chunks
+@@ -112,6 +115,8 @@ def replica_at_head(slug: str, hub: Any, gateway: str, live_path: Path) -> None:
+     waited = 0.0
+     while True:
+         pulled = ksc._pull_replica(slug, hub, gateway, live_path)
++        if pulled.status_changed:  # a park naming a card this pull moved re-probes now, as after a round [daveey]
++            _expedite(live_path, pulled.status_changed)
+         if not pulled.busy and not pulled.more:
+             return
+         if pulled.busy:
+@@ -121,6 +126,19 @@ def replica_at_head(slug: str, hub: Any, gateway: str, live_path: Path) -> None:
+             waited += BUSY_RETRY_S
+ 
+ 
++def _expedite(live_path: Path, changed: dict) -> None:
++    """``kanban_awaited_card_wake.expedite`` on the live board for a standalone replica pull (``reconcile``): the
++    sync round's own call never sees these changes, since the replica cursor has moved past them. Never raises."""
++    from hermes_cli import kanban_sync_client as ksc
++    from hermes_cli.kanban_awaited_card_wake import expedite
++    path = Path(live_path)
++    try:
++        with ksc.connection(path, lambda: ksc._connect(path)) as live:
++            expedite(live, changed)
++    except (sqlite3.Error, OSError) as exc:
++        _log.warning("kanban sync: %s: parks naming %d moved card(s) not re-probed (%s)", path, len(changed), exc)
++
++
+ def reset() -> None:
+     """Tests: forget every board."""
+     with _LOCK:
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 8d9e048823..aec5507fe8 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -40,6 +40,7 @@ from dataclasses import astuple, dataclass, field
+ from pathlib import Path
+ from typing import Any, Callable, Iterable, Mapping, Optional
+ 
++from hermes_cli import kanban_awaited_card_wake as acw  # parks naming a card a pull or rebuild moved re-probe now
+ from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import kanban_replica_lag as lag  # pushed rows the replica holds only after its next pull
+ from hermes_cli import kanban_sync_backlog as backlog  # page budget per pull; boards the loop reruns at once
+@@ -863,7 +864,7 @@ def pull(conn: sqlite3.Connection, hub: Hub, board: str, *, observers: bool,
+             return Pulled(total, more=True, status_changed=changed)  # unbounded, a backlog starved the round's push for hours
+         pages += 1
+         checkpoint()
+-        page = hub.changes(board, cursor)
++        page = acw.changes_page(hub, board, cursor, changed)  # a Resync carries the pages applied before it
+         checkpoint()
+         changes = [c for c in (adapt(ch) for ch in page.get("changes", [])) if c is not None]
+         if partition is not None:
+@@ -956,16 +957,17 @@ def _pulled_replica(slug: str, hub: Hub, gateway: str, max_pages: Optional[int]
+         generation = lag.pull_started(path)  # done only below: a failed pull leaves this gateway's pushes lagging
+         try:
+             pulled = pull(replica, hub, slug, observers=False, max_pages=max_pages)
+-        except Resync:
++        except Resync as exc:
+             if diagnostic:
+                 raise
++            before = acw.statuses(replica, getattr(exc, "status_changed", None))  # read before the file goes
+             _log.warning("kanban sync: %s replica cursor below the retention floor; rebuilding from a snapshot", slug)
+             stack.close()
+             invalidate(path)  # must close the pooled descriptor BEFORE unlinking its database
+             path.unlink(missing_ok=True)
+             replica = stack.enter_context(connection(path, lambda: open_shadow(slug, gateway)))
+             rebuilt = True
+-            pulled = Pulled(resync(replica, hub, slug, observers=False))
++            pulled = Pulled(resync(replica, hub, slug, observers=False), status_changed=acw.rebuilt(before, replica))
+         if not pulled.more:  # both mean "holds everything up to the feed head", not "a page was read"
+             lag.pull_done(path, generation)
+             try:  # readers derive the replica's staleness from this (kanban_chat_links); a failed stamp only ages it
+@@ -1033,8 +1035,7 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+         with _pulled_replica(slug, hub, gateway) as (replica, pulled, rebuilt):
+             result.pulled = pulled
+             result.behind = pulled.more
+-            from hermes_cli.kanban_awaited_card_wake import expedite
+-            expedite(live, pulled.status_changed)  # a park naming a card the pull moved re-probes now [daveey]
++            acw.expedite(live, pulled.status_changed)  # a park naming a card the pull moved re-probes now [daveey]
+             applies: Optional[list] = []  # credited revision steps (kanban_sync_own_writes); None = a rebuild
+             if mode == "primary":
+                 try:
+diff --git a/tests/hermes_cli/test_kanban_awaited_card_wake.py b/tests/hermes_cli/test_kanban_awaited_card_wake.py
+index 33d424e0e3..001f247bb6 100644
+--- a/tests/hermes_cli/test_kanban_awaited_card_wake.py
++++ b/tests/hermes_cli/test_kanban_awaited_card_wake.py
+@@ -313,3 +313,102 @@ def test_lag_records_are_bounded(live, monkeypatch):
+     acw._WATCH[("elsewhere", "t_0000000000000001")] = (REVIEW, "done", 0.0)
+     acw.expedite(live, {REVIEW: "done"}, now=time.time())
+     assert list(acw._WATCH) == [(acw._db_key(live), owner)]
++
++
++# --- f. every replica apply path: a snapshot rebuild and `kanban sync reconcile` (review 5894353204) ----------
++
++def _confirmed(monkeypatch):
++    from hermes_cli import kanban_awaiting as ka
++    monkeypatch.setitem(ka._REMOTE_CONFIRMED, (OTHER, REVIEW), (time.monotonic(), f"{REVIEW} running"))
++
++
++def _woke_within_a_minute(live, owner, t0):
++    assert sync.consume_dispatcher_wake()
++    assert _next_at(live, owner) <= t0 + 60  # before the fix: t0 + 900 (only the check_every cadence)
++    kwc.run_due_wake_checks(live, now=t0 + 60, wait=True)
++    assert _status(live, owner) == "ready"
++    met = [e for e in kb.list_events(live, owner) if e.kind == "condition_met"]
++    assert met and f"{REVIEW} done" in met[-1].payload["output"]
++
++
++def test_review_done_arriving_by_a_snapshot_rebuild_wakes_the_owner_within_a_minute(
++        live, svc, kanban_home, probes, monkeypatch):
++    _confirmed(monkeypatch)
++    owner, t0 = _setup(live, svc, kanban_home, probes, f"hermes kanban wait-check task {REVIEW}")
++    rebuilds = []
++    real = ksc.resync
++    monkeypatch.setattr(ksc, "resync", lambda conn, *a, **kw: rebuilds.append(kw) or real(conn, *a, **kw))
++    _other(svc, REVIEW, {"status": "done"})
++    svc.compact(BOARD)  # the retention floor passes the replica's cursor: the round rebuilds from the snapshot
++    _round(kanban_home, svc)
++    assert rebuilds and rebuilds[0].get("partition") is None  # the replica was rebuilt, not pulled
++    _woke_within_a_minute(live, owner, t0)
++
++
++@pytest.mark.parametrize("compacted", [False, True])
++def test_review_done_arriving_by_sync_reconcile_wakes_the_owner_within_a_minute(
++        live, svc, kanban_home, probes, monkeypatch, compacted):
++    _confirmed(monkeypatch)
++    owner, t0 = _setup(live, svc, kanban_home, probes, f"hermes kanban wait-check task {REVIEW}")
++    _other(svc, REVIEW, {"status": "done"})
++    if compacted:  # reconcile's own replica pull meets the retention floor and rebuilds
++        svc.compact(BOARD)
++    ksc.reconcile(BOARD, kanban_home / "kanban.db", svc.hub(ME))  # no sync round runs
++    _woke_within_a_minute(live, owner, t0)
++
++
++def test_lag_warning_reads_the_replica_for_a_status_no_expedite_was_handed(
++        live, svc, kanban_home, probes, caplog):
++    """A replica apply that never reaches ``expedite`` (here ``sync diff``'s diagnostic pull) is still seen."""
++    caplog.set_level("WARNING", logger=acw.__name__)
++    owner, t0 = _setup(live, svc, kanban_home, probes, f"hermes kanban wait-check task {REVIEW} --until review")
++    _other(svc, REVIEW, {"status": "done"})
++    ksc._pull_replica(BOARD, svc.hub(ME), ME, kanban_home / "kanban.db", diagnostic=True)
++    assert not acw._WATCH  # nothing was handed the change
++
++    def lags():
++        return [r.getMessage() for r in caplog.records if "awaited_card_done_park_lag" in r.getMessage()]
++
++    scanned = t0 + acw._SCAN_SECONDS
++    assert acw.report_lag(live, now=scanned) == []  # the replica read records it
++    assert acw.report_lag(live, now=scanned + acw.LAG_WARN_SECONDS - 5) == [] and not lags()
++    assert acw.report_lag(live, now=scanned + acw.LAG_WARN_SECONDS + 1) == [owner]
++    [line] = lags()
++    assert f"task={owner} awaited={REVIEW} lag_s=" in line
++    for later in range(2, 12):  # later scans still see it done: warned once, not once per scan
++        acw.report_lag(live, now=scanned + acw.LAG_WARN_SECONDS + 60 * later)
++    assert len(lags()) == 1
++
++
++def test_the_replica_read_is_throttled_and_skipped_without_a_replica(live, monkeypatch):
++    calls = []
++    monkeypatch.setattr(acw, "_replica_finished", lambda conn: calls.append(1) or None)
++    now = time.time()
++    for dt in (0, 10, 30, 59):
++        acw.report_lag(live, now=now + dt)
++    assert len(calls) == 1
++    acw.report_lag(live, now=now + 60)
++    assert len(calls) == 2
++
++
++def test_rebuilt_diffs_the_replica_and_keeps_the_pages_applied_before_the_resync(live):
++    a = kb.create_task(live, title="a")
++    b = kb.create_task(live, title="b")
++    before = acw.statuses(live, {b: "review"})
++    with kb.write_txn(live):
++        live.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (a,))
++    c = kb.create_task(live, title="c")
++    got = acw.rebuilt(before, live)
++    assert got[a] == "done" and c in got and b in got  # changed, new, and changed by a page before the Resync
++    assert got[b] == kb.get_task(live, b).status  # at its rebuilt status
++    assert set(acw.rebuilt((None, {}), live)) == {a, b, c}  # an unreadable pre-read: every card counts
++
++
++def test_changes_page_attaches_the_pull_s_applied_changes_to_a_resync():
++    class Hub:
++        def changes(self, board, cursor):
++            raise ksc.Resync("below the floor")
++
++    with pytest.raises(ksc.Resync) as info:
++        acw.changes_page(Hub(), BOARD, 7, {REVIEW: "done"})
++    assert info.value.status_changed == {REVIEW: "done"}
+-- 
+2.43.0
+

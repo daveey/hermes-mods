@@ -1,0 +1,955 @@
+From a52d5633c1e9eb3f3b47a3d51340090bc40913b6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 15:20:38 +0000
+Subject: [PATCH] [daveey] scratch archive: leave out git objects the remote
+ already holds (core clone archive 57-80 % -> 0.7 %)
+
+Why: on worker-3 (t_01a1d52568eb39ad, 13:34Z pass) 12 reclaimed trees (5.4 GB)
+wrote ~3.6 GB of complete archives to the same root disk, because the payload
+tarred every .git/objects pack the remote already has. Net gain was ~1.8 GB until
+off-box upload + expiry (t_01a1d52db38e56aa).
+
+What: when a standalone repo has remote-tracking refs of a remote with a network
+URL (a local path is another tree that may itself be reclaimed), the complete
+payload now leaves out
+- every regular file under .git/objects/ (except info/alternates). In their place
+  the payload carries objects/<n>.pack holding every *local* object the recorded
+  tips do not reach: unpushed commits, staged-only blobs, stash, reflog-only and
+  dangling objects. The set is local objects (loose + local .idx, alternates
+  excluded) minus `rev-list --objects <tips>`; a partial clone's .promisor-pack
+  objects count as promised (git's own rule) and its walk skips blobs
+  (--filter=blob:none: 21 s -> 4 s on a blobless core clone). index-pack proves
+  the pack holds exactly that set before use.
+- clean tracked files: a regular, single-link file whose bytes hash to the blob
+  that HEAD's nearest pushed commit(s) (rev-list --boundary HEAD ^tips) hold.
+  The manifest keeps path, mode, size, mtime, sha256 and blob id.
+Anything else (no network remote ref, shallow, sha256 repo, objects not a plain
+dir, any plan error) keeps every object in the payload exactly as before.
+
+Custody: the manifest becomes version 2 (omitted, omitted_repos with remotes,
+recorded tip oids, pack sha256/size); verify_complete_archive checks those
+records and pack hashes, and an older core refuses v2 instead of calling it
+complete. The object files the plan was built from are re-checked against the
+payload snapshot (a late object refuses the archive and keeps the tree), and an
+omitted file rewritten after hashing is caught by the existing post-scan. Each
+repo's meta.json says objects_omitted: "remote" with the restore steps; layout
+v1 files (commits.bundle, tracked.diff, untracked.tar) are unchanged.
+worker_archive_custody uploads every file of the archive dir, so the new pack
+rides the same verified upload.
+
+Restore: kanban_scratch_archive_omit.restore(archive, target, url_map=None)
+extracts the tree (archived modes kept), clones each remote bare (partial
+filter kept), fetches the recorded tips, moves those objects in, index-packs
+the supplement, writes omitted files from their blobs (sha256-checked), then
+checks every ref resolves and (non-partial) fsck --connectivity-only.
+
+Bench (worker-4, daveey/hermes with one unpushed commit, one edit, one
+untracked file):
+- full clone: 1,348,263,296 -> 9,927,998 bytes (0.74 %), 10.7 s; restore from
+  GitHub 135 s, `diff -r -x objects` identical, HEAD/status unchanged
+- blobless + --reference clone: 281,901,596 -> 9,924,841 bytes (3.5 %), 6.4 s;
+  restore 164 s, identical
+
+Tests (tests/hermes_cli/test_kanban_scratch_gc_archive.py): omitted archive
+round-trips through _gc + restore (unpushed commit, staged blob, stash,
+dangling object, modes, status); fixture under 10 % of source; local-path
+remote keeps every object (v1); a late object or a rewritten omitted file keeps
+the workspace; tampered pack/records refuse verify; a remote lacking the
+objects fails restore loudly; blobless clone restores with lazy blobs; an
+unpushed HEAD still omits files unchanged from its pushed parent. 336 tests
+across the scratch/worktree-gc suites pass.
+---
+ hermes_cli/kanban_scratch_archive.py          |  89 +++-
+ hermes_cli/kanban_scratch_archive_omit.py     | 435 ++++++++++++++++++
+ .../test_kanban_scratch_gc_archive.py         | 241 ++++++++++
+ 3 files changed, 753 insertions(+), 12 deletions(-)
+ create mode 100644 hermes_cli/kanban_scratch_archive_omit.py
+
+diff --git a/hermes_cli/kanban_scratch_archive.py b/hermes_cli/kanban_scratch_archive.py
+index 1dc6055355..a8aff9141a 100644
+--- a/hermes_cli/kanban_scratch_archive.py
++++ b/hermes_cli/kanban_scratch_archive.py
+@@ -34,6 +34,14 @@ refused so the metadata can never collide with archived content.
+ about 14% more archive bytes for ~7x faster reclaim (see the constant for the
+ measurements and how to reverse it).
+ 
++When a repo's remote-tracking refs (of a remote with a network URL) cover its
++history, the payload leaves out what that remote already holds: the files under
++``.git/objects/`` (replaced by one pack of the local-only objects) and clean
++tracked files (recorded by blob id and hash). The manifest is then version 2,
++the repo's meta.json says ``objects_omitted: "remote"`` with the restore steps,
++and ``kanban_scratch_archive_omit.restore`` rebuilds the tree from the remote.
++A full core clone archived to 0.7 % of its bytes this way (was 57-80 %).
++
+ Anything it cannot prove safe keeps the workspace: a linked worktree or
+ submodule (a ``.git`` gitlink file or symlink: the worktree GC owns those; a
+ regular ``.git`` file with no ``gitdir:`` line, such as uv's empty cache
+@@ -253,8 +261,14 @@ def _write_remote_base(repo: Path, dest: Path, entries: list[dict]) -> list[str]
+     return ["remote_base.json", "remote_base.tar"]
+ 
+ 
+-def archive_repo(repo: Path, dest: Path, *, task_id: str, completed_at: Optional[int]) -> dict:
+-    """Write one repo's archive into *dest* (created). Raises on any failure."""
++def archive_repo(repo: Path, dest: Path, *, task_id: str, completed_at: Optional[int],
++                 omitted: Optional[dict] = None) -> dict:
++    """Write one repo's archive into *dest* (created). Raises on any failure.
++
++    *omitted* is this repo's ``kanban_scratch_archive_omit`` record when the
++    payload leaves out objects the remote holds; meta.json then says so and
++    lists the restore steps.
++    """
+     env = _env(repo)
+     dest.mkdir(parents=True, exist_ok=True)  # the root repo archives into the fresh partial dir
+     head = _text(_git(repo, env, "rev-parse", "--verify", "-q", "HEAD^{commit}", ok=(0, 1))) or None
+@@ -297,6 +311,10 @@ def archive_repo(repo: Path, dest: Path, *, task_id: str, completed_at: Optional
+         (dest / "tracked.diff").write_bytes(diff)
+         files.append("tracked.diff")
+     extra: dict = {}
++    if omitted is not None:
++        from hermes_cli.kanban_scratch_archive_omit import RESTORE_STEPS
++        extra.update(objects_omitted=omitted["reason"], objects_restore=RESTORE_STEPS,
++                     omitted_remote_refs=omitted["remote_refs"], supplement_pack=omitted["pack"])
+     if remote_base:
+         files.extend(_write_remote_base(repo, dest, remote_base))
+         extra["remote_base_count"] = len(remote_base)
+@@ -321,6 +339,9 @@ def archive_repo(repo: Path, dest: Path, *, task_id: str, completed_at: Optional
+ 
+ PAYLOAD_DIR = ".hermes-complete-archive-v1"
+ PAYLOAD_VERSION = 1
++# Version 2: objects the remote holds are left out (kanban_scratch_archive_omit). An older
++# verify_complete_archive refuses it rather than calling a payload with omissions complete.
++PAYLOAD_VERSION_OMITTED = 2
+ _TREE = "tree.tar.gz"
+ _MANIFEST = "manifest.json"
+ # Level 1 trades size for reclaim speed: archives are ~14% larger than at level 9
+@@ -379,6 +400,7 @@ class _HashingReader:
+ def _scan(root: Path, tar: Optional[tarfile.TarFile] = None,
+           entries: Optional[dict] = None, *,
+           on_git_file: Optional[Callable[[int, str, os.stat_result], None]] = None,
++          omit: Optional[Callable[[int, str, str, os.stat_result], bool]] = None,
+           ) -> dict[str, os.stat_result]:
+     """lstat of every entry below *root* (``"."`` is the root), by directory descriptor.
+ 
+@@ -387,7 +409,9 @@ def _scan(root: Path, tar: Optional[tarfile.TarFile] = None,
+     symlink swapped in for any ancestor is refused rather than followed. With
+     *tar*/*entries* the content is archived during the same traversal.
+     *on_git_file(dfd, rel, lstat)* is called for each regular ``.git`` file
+-    while its directory's descriptor *dfd* is still open.
++    while its directory's descriptor *dfd* is still open. *omit(dfd, name, rel,
++    lstat)* returning True leaves that regular file out of *tar* (it records the
++    file itself; see ``kanban_scratch_archive_omit.Omitter``).
+     """
+     found: dict[str, os.stat_result] = {}
+     seen_inodes: dict[tuple[int, int], str] = {}
+@@ -426,6 +450,8 @@ def _scan(root: Path, tar: Optional[tarfile.TarFile] = None,
+                     rec["link"] = info.linkname
+                     entries[erel] = rec
+             elif info is not None:
++                if omit is not None and omit(dfd, name, erel, st):
++                    continue
+                 key = (st.st_dev, st.st_ino)
+                 if st.st_nlink > 1 and key in seen_inodes:
+                     info.type, info.linkname = tarfile.LNKTYPE, seen_inodes[key]
+@@ -494,8 +520,14 @@ def check_snapshot(workspace: Path, snapshot: dict[str, list[int]], *, renamed:
+         raise ArchiveRefused("workspace changed after it was archived")
+ 
+ 
+-def _write_payload(workspace: Path, dest: Path) -> dict[str, list[int]]:
+-    """Write ``tree.tar.gz`` + ``manifest.json`` into *dest*; return the source signatures."""
++def _write_payload(workspace: Path, dest: Path, omitter=None,
++                   omitted_repos: Optional[list[dict]] = None) -> dict[str, list[int]]:
++    """Write ``tree.tar.gz`` + ``manifest.json`` into *dest*; return the source signatures.
++
++    With *omitter* (``kanban_scratch_archive_omit.Omitter``) the files it drops
++    are listed under ``omitted`` and *omitted_repos* records how to get them
++    back; that manifest is version 2.
++    """
+     entries: dict[str, dict] = {}
+     tree = dest / _TREE
+     with open(tree, "wb") as raw:
+@@ -504,11 +536,13 @@ def _write_payload(workspace: Path, dest: Path) -> dict[str, list[int]]:
+         # Any level reads back through the same "r:gz" path.
+         with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0, compresslevel=_GZIP_LEVEL) as gz:
+             with tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tar:
+-                before = _scan(workspace, tar, entries)
++                before = _scan(workspace, tar, entries, omit=omitter)
+     manifest = {
+         "version": PAYLOAD_VERSION, "tree": _TREE, "tree_sha256": _sha256_file(tree),
+         "entries": entries,
+     }
++    if omitted_repos and omitter is not None:
++        manifest.update(version=PAYLOAD_VERSION_OMITTED, omitted=omitter.omitted, omitted_repos=omitted_repos)
+     (dest / _MANIFEST).write_text(json.dumps(manifest, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+     snapshot = _signatures(before)
+     if _signatures(_scan(workspace)) != snapshot:
+@@ -529,8 +563,11 @@ def verify_complete_archive(archive: Path) -> dict:
+     base = Path(archive) / PAYLOAD_DIR
+     try:
+         manifest = json.loads((base / _MANIFEST).read_text(encoding="utf-8-sig"))
+-        if manifest.get("version") != PAYLOAD_VERSION:
++        if manifest.get("version") not in (PAYLOAD_VERSION, PAYLOAD_VERSION_OMITTED):
+             raise ArchiveRefused(f"unsupported payload version {manifest.get('version')!r}")
++        if manifest["version"] == PAYLOAD_VERSION_OMITTED:
++            from hermes_cli.kanban_scratch_archive_omit import verify_omissions
++            verify_omissions(base, manifest)
+         if _sha256_file(base / _TREE) != manifest["tree_sha256"]:
+             raise ArchiveRefused("payload hash mismatch")
+         want, seen = manifest["entries"], set()
+@@ -555,7 +592,7 @@ def verify_complete_archive(archive: Path) -> dict:
+                         raise ArchiveRefused(f"payload content mismatch for {m.name!r}")
+         if seen != set(want):
+             raise ArchiveRefused("payload is missing members")
+-    except (OSError, ValueError, KeyError, tarfile.TarError, EOFError) as exc:
++    except (OSError, ValueError, KeyError, TypeError, tarfile.TarError, EOFError) as exc:
+         raise ArchiveRefused(f"payload unreadable: {exc!r}") from exc
+     return manifest
+ 
+@@ -674,6 +711,25 @@ class ArchivedPath(type(Path())):
+     snapshot: dict
+ 
+ 
++def _omission_plans(workspace: Path, repos: list[Path], payload: Path) -> tuple[list[dict], dict]:
++    """Per repo, what the payload may leave out because the remote holds it (see kanban_scratch_archive_omit).
++
++    Returns (plans, {repo: manifest record}) in *repos* order; a plan's index is
++    its record's index in the manifest's ``omitted_repos``. Supplement packs are
++    written into *payload* here, before the payload scan.
++    """
++    from hermes_cli import kanban_scratch_archive_omit as om
++    plans, records = [], {}
++    for repo in repos:
++        env = _env(repo)
++        plan = om.plan_repo(repo, workspace, env, _git, partial=_is_partial_clone(repo, env))
++        if plan is None:
++            continue
++        records[repo] = om.write_supplement(repo, env, plan, payload, len(plans))
++        plans.append(plan)
++    return plans, records
++
++
+ def archive_workspace(workspace: Path, archive_dir: Path, *, task_id: str,
+                       completed_at: Optional[int]) -> ArchivedPath:
+     """Archive every standalone repo in *workspace* to *archive_dir*; return the final dir (an :class:`ArchivedPath`
+@@ -694,16 +750,25 @@ def archive_workspace(workspace: Path, archive_dir: Path, *, task_id: str,
+     shutil.rmtree(partial, ignore_errors=True)
+     try:
+         partial.mkdir(parents=True)
++        payload = partial / PAYLOAD_DIR
++        payload.mkdir()
++        plans, records = _omission_plans(workspace, repos, payload)
+         for repo in repos:
+             rel = repo.relative_to(workspace)
+             archive_repo(repo, partial / rel if rel.parts else partial,
+-                         task_id=task_id, completed_at=completed_at)
+-        payload = partial / PAYLOAD_DIR
+-        payload.mkdir()
++                         task_id=task_id, completed_at=completed_at, omitted=records.get(repo))
++        omitter = None
++        if plans:
++            from hermes_cli.kanban_scratch_archive_omit import Omitter
++            omitter = Omitter(plans)
+         # Last, so nothing (including git's own index refresh) mutates the tree after the scan.
+-        snapshot = _write_payload(workspace, payload)
++        snapshot = (_write_payload(workspace, payload, omitter, [records[r] for r in repos if r in records])
++                    if plans else _write_payload(workspace, payload))
+         if any(snapshot.get(rel) != sig for rel, sig in markers.items()):
+             raise ArchiveRefused("a .git data file changed after it was judged not a gitlink")
++        if plans:
++            from hermes_cli.kanban_scratch_archive_omit import check_files_unchanged
++            check_files_unchanged(plans, snapshot)
+         verify_complete_archive(partial)
+         _fsync_tree(partial)  # payload, manifest, repo bundles and all directories, before publication
+         final = archive_dir
+diff --git a/hermes_cli/kanban_scratch_archive_omit.py b/hermes_cli/kanban_scratch_archive_omit.py
+new file mode 100644
+index 0000000000..d987c42384
+--- /dev/null
++++ b/hermes_cli/kanban_scratch_archive_omit.py
+@@ -0,0 +1,435 @@
++"""Leave git objects the remote already holds out of a complete scratch archive. [daveey]
++
++A full clone's ``.git/objects`` is most of a scratch tree, and it was most of
++its archive too (57-80 % of the source on worker-3, written to the same disk
++the reclaim was freeing). The remote already holds those objects, so
++:func:`plan_repo` decides, per standalone repo, what the archive can leave out:
++
++* every regular file under ``.git/objects/`` (packs, loose objects,
++  commit-graph, ...) except ``info/alternates``; in their place the payload
++  carries one pack, ``objects/<n>.pack``, of every *local* object that the
++  recorded remote-tracking tips do not reach (unpushed commits, the index's
++  staged blobs, stash, reflog-only and dangling objects alike), checked with
++  ``git index-pack`` before use;
++* worktree files whose bytes are exactly a HEAD blob those tips reach (clean
++  tracked files): the manifest keeps their path, mode, size, mtime, sha256 and
++  blob id, and :func:`restore` writes them back from that blob.
++
++Only remotes with a network URL count (a local path is another tree that may
++itself be reclaimed), and only ``refs/remotes/<remote>/*`` of a configured
++remote. A repo with no such ref, a shallow repo, a non-sha1 repo, or an
++``objects`` that is not a plain directory keeps its objects in the payload
++(nothing omitted). In a partial clone, objects in its own ``.promisor`` packs
++are promised by the remote (git's own rule) and are not copied either.
++
++The omission is recorded in the manifest (payload version 2, which an older
++``verify_complete_archive`` refuses rather than misreads) and as
++``objects_omitted: "remote"`` plus the restore steps in the repo's meta.json.
++Restore needs the remote: :func:`restore` clones it bare, fetches the recorded
++tips, moves those packs in, indexes the supplement pack, writes the omitted
++worktree files from their blobs and checks every ref resolves.
++"""
++from __future__ import annotations
++
++import hashlib
++import os
++import re
++import shutil
++import stat
++import subprocess
++import tarfile
++import tempfile
++from pathlib import Path
++from typing import Optional
++
++OMITTED_REASON = "remote"
++_HEX40 = re.compile(rb"[0-9a-f]{40}")
++_KEEP_OBJECT_FILES = ("info/alternates", "info/http-alternates")
++RESTORE_STEPS = [
++    "git clone --bare <remote url> <tmp> (with the repo's partial-clone filter, if any); "
++    "git -C <tmp> fetch <remote url> <each recorded remote_refs oid>",
++    "extract tree.tar.gz, then move <tmp>/objects/pack/* into <repo>/.git/objects/pack/",
++    "git -C <repo> index-pack --stdin < objects/<n>.pack (the payload's local-only objects; "
++    "commits.bundle is a subset)",
++    "write each manifest 'omitted' file from `git cat-file blob <git_oid>`, checking sha256, "
++    "then its mode and mtime",
++    "(kanban_scratch_archive_omit.restore does all of this)",
++]
++
++
++class _Refused(Exception):
++    """Internal: this repo keeps its objects (the plan is None)."""
++
++
++def _network_url(url: str) -> bool:
++    """A URL another host serves: scheme://host (not file://) or scp-like ``host:path``."""
++    if "://" in url:
++        return not url.lower().startswith("file://")
++    head, sep, _ = url.partition(":")
++    return bool(sep) and len(head) > 1 and "/" not in head and not url.startswith(("/", "."))
++
++
++def _config(repo: Path, env: dict, git, key_regex: str) -> list[tuple[str, str]]:
++    out = git(repo, env, "config", "--get-regexp", key_regex, ok=(0, 1)).stdout
++    pairs = []
++    for line in out.decode("utf-8", "replace").splitlines():
++        key, _, value = line.partition(" ")
++        pairs.append((key, value))
++    return pairs
++
++
++def _remote_tips(repo: Path, env: dict, git) -> tuple[dict[str, str], dict[str, str]]:
++    """({remote name: url} with a network URL, {refs/remotes/<name>/...: oid}) for those remotes."""
++    urls: dict[str, str] = {}
++    for key, value in _config(repo, env, git, r"^remote\..*\.url$"):
++        name = key[len("remote."):-len(".url")]
++        urls.setdefault(name, value)
++    remotes = {n: u for n, u in urls.items() if _network_url(u)}
++    out = git(repo, env, "for-each-ref", "--format=%(objectname) %(refname)", "refs/remotes/").stdout
++    tips = {}
++    for line in out.decode("utf-8", "replace").splitlines():
++        oid, _, ref = line.partition(" ")
++        if any(ref.startswith(f"refs/remotes/{n}/") for n in remotes):
++            tips[ref] = oid
++    used = {n: u for n, u in remotes.items() if any(r.startswith(f"refs/remotes/{n}/") for r in tips)}
++    return used, tips
++
++
++def _object_files(objects: Path, rel: str) -> dict[str, list[int]]:
++    """{workspace rel: signature} of every regular file the payload leaves out of ``objects/``."""
++    from hermes_cli.kanban_scratch_archive import _signature
++    found = {}
++    for current, dirs, files in os.walk(objects, followlinks=False):
++        for name in files + dirs:
++            full = Path(current) / name
++            st = full.lstat()
++            sub = full.relative_to(objects).as_posix()
++            if stat.S_ISLNK(st.st_mode):
++                raise _Refused(f"symlink in objects: {sub}")
++            if stat.S_ISREG(st.st_mode) and sub not in _KEEP_OBJECT_FILES:
++                found[f"{rel}/objects/{sub}"] = _signature(st)
++    return found
++
++
++def _local_objects(repo: Path, env: dict, git, objects: Path, partial: bool) -> tuple[set, set]:
++    """(local object ids, ids in this repo's own .promisor packs); alternates are not local."""
++    local, promised = set(), set()
++    for sub in objects.iterdir():
++        if len(sub.name) == 2 and sub.is_dir() and not sub.is_symlink():
++            names = ((sub.name + n).encode() for n in os.listdir(sub))
++            local.update(oid for oid in names if _HEX40.fullmatch(oid))
++    pack = objects / "pack"
++    for idx in sorted(pack.glob("*.idx")) if pack.is_dir() else ():
++        with open(idx, "rb") as fh:
++            out = subprocess.run(["git", "-C", str(repo), "show-index"], stdin=fh, capture_output=True,
++                                 env=env, timeout=600, check=False)
++        if out.returncode:
++            raise _Refused(f"show-index failed for {idx.name}")
++        ids = {line.split()[1] for line in out.stdout.splitlines() if line.strip()}
++        local |= ids
++        if partial and idx.with_suffix(".promisor").exists():
++            promised |= ids
++    return local, promised
++
++
++def _reachable(repo: Path, env: dict, tips: dict[str, str], *, partial: bool) -> set:
++    """Every object the recorded tips reach (offline; a partial clone's missing ones are skipped).
++
++    In a partial clone blobs are not walked (``--filter=blob:none``): checking each
++    of history's blobs for presence was ~80 % of the walk on a blobless core clone
++    (21 s vs 4 s). Its local blobs then count as unique unless a promisor pack
++    holds them; HEAD's clean files use :func:`_pushed_blobs` instead.
++    """
++    proc = subprocess.run(
++        ["git", "-C", str(repo), "rev-list", "--objects", "--missing=allow-any",
++         *(["--filter=blob:none"] if partial else []), "--stdin"],
++        input="".join(f"{oid}\n" for oid in sorted(set(tips.values()))).encode(),
++        capture_output=True, env=env, timeout=1800, check=False)
++    if proc.returncode:
++        raise _Refused(f"rev-list of remote tips failed: {proc.stderr[:300]!r}")
++    return {line[:40] for line in proc.stdout.splitlines() if _HEX40.match(line[:40])}
++
++
++_MAX_BOUNDARY = 16
++
++
++def _pushed_blobs(repo: Path, env: dict, git, tips: dict[str, str]) -> set:
++    """Blob ids in the trees of HEAD's nearest pushed commits (HEAD itself when the tips reach it).
++
++    ``rev-list --boundary HEAD --not <tips>`` walks commits only, so this stays
++    cheap however long the history is. More than _MAX_BOUNDARY boundary commits
++    are cut (fewer files omitted, never a wrong omission).
++    """
++    proc = subprocess.run(
++        ["git", "-C", str(repo), "rev-list", "--boundary", "HEAD", "--stdin"],
++        input="".join(f"^{oid}\n" for oid in sorted(set(tips.values()))).encode(),
++        capture_output=True, env=env, timeout=600, check=False)
++    if proc.returncode:
++        raise _Refused("rev-list --boundary HEAD failed")
++    lines = proc.stdout.split()
++    bases = [line[1:] for line in lines if line.startswith(b"-")][:_MAX_BOUNDARY] if lines else [b"HEAD"]
++    blobs = set()
++    for base in bases:
++        out = git(repo, env, "ls-tree", "-r", "-z", "--full-tree", base.decode(), ok=(0, 128))
++        for record in out.stdout.split(b"\0") if not out.returncode else ():
++            parts = record.partition(b"\t")[0].split()
++            if len(parts) == 3 and parts[1] == b"blob":
++                blobs.add(parts[2])
++    return blobs
++
++
++def _head_blobs(repo: Path, env: dict, git, prefix: str, reachable: set) -> dict[str, str]:
++    """{workspace rel: blob id} for HEAD's regular files whose blob the remote tips reach."""
++    proc = git(repo, env, "ls-tree", "-r", "-z", "--full-tree", "HEAD", ok=(0, 128))
++    if proc.returncode:
++        return {}
++    blobs = {}
++    for record in proc.stdout.split(b"\0"):
++        info, _, path = record.partition(b"\t")
++        parts = info.split()
++        if len(parts) == 3 and parts[0] in (b"100644", b"100755") and parts[2] in reachable:
++            rel = os.fsdecode(path)
++            blobs[f"{prefix}{rel}"] = parts[2].decode()
++    return blobs
++
++
++def plan_repo(repo: Path, workspace: Path, env: dict, git, *, partial: bool) -> Optional[dict]:
++    """What the payload may leave out of *repo*, or None (keep everything).
++
++    Returns ``{"git_dir", "remotes", "remote_refs", "unique", "files", "blobs"}``:
++    *unique* the local-only object ids for the supplement pack, *files* the
++    omitted object files' signatures (re-checked against the payload
++    snapshot), *blobs* the omittable clean worktree files.
++    """
++    from hermes_cli.kanban_scratch_archive import ArchiveRefused
++    rel = repo.relative_to(workspace).as_posix()
++    git_rel = ".git" if rel == "." else f"{rel}/.git"
++    objects = repo / ".git" / "objects"
++    try:
++        fmt = git(repo, env, "config", "--get", "extensions.objectformat", ok=(0, 1)).stdout.strip()
++        if fmt not in (b"", b"sha1") or os.path.lexists(repo / ".git" / "shallow"):
++            return None
++        if not stat.S_ISDIR(objects.lstat().st_mode):
++            return None
++        remotes, tips = _remote_tips(repo, env, git)
++        if not tips:
++            return None
++        files = _object_files(objects, git_rel)
++        local, promised = _local_objects(repo, env, git, objects, partial)
++        reachable = _reachable(repo, env, tips, partial=partial)
++        unique = sorted(local - reachable - promised)
++        pushed = _pushed_blobs(repo, env, git, tips)
++        blobs = _head_blobs(repo, env, git, "" if rel == "." else f"{rel}/", pushed)
++    except (_Refused, ArchiveRefused, OSError, subprocess.SubprocessError):
++        return None  # any doubt: keep this repo's objects in the payload
++    return {"git_dir": git_rel, "remotes": remotes, "remote_refs": tips,
++            "unique": [u.decode() for u in unique], "files": files, "blobs": blobs}
++
++
++def write_supplement(repo: Path, env: dict, plan: dict, payload: Path, index: int) -> dict:
++    """Write the local-only objects as ``objects/<index>.pack`` under *payload*; prove it with index-pack."""
++    from hermes_cli.kanban_scratch_archive import ArchiveRefused, _sha256_file
++    record = {"git_dir": plan["git_dir"], "reason": OMITTED_REASON, "remotes": plan["remotes"],
++              "remote_refs": plan["remote_refs"], "object_count": len(plan["unique"]), "pack": None,
++              "omitted_object_files": len(plan["files"])}
++    if not plan["unique"]:
++        return record
++    out_dir = payload / "objects"
++    out_dir.mkdir(exist_ok=True)
++    pack = out_dir / f"{index}.pack"
++    with open(pack, "wb") as fh:
++        proc = subprocess.run(["git", "-C", str(repo), "pack-objects", "--stdout", "-q"],
++                              input="".join(f"{o}\n" for o in plan["unique"]).encode(),
++                              stdout=fh, stderr=subprocess.PIPE, env=env, timeout=1800, check=False)
++    if proc.returncode:
++        raise ArchiveRefused(f"pack-objects failed in {repo}: {proc.stderr[:300]!r}")
++    with tempfile.TemporaryDirectory(dir=payload) as tmp:
++        idx = Path(tmp) / "check.idx"
++        _run_git(repo, env, "index-pack", "-o", str(idx), str(pack))
++        with open(idx, "rb") as fh:
++            shown = subprocess.run(["git", "-C", str(repo), "show-index"], stdin=fh, capture_output=True,
++                                   env=env, timeout=600, check=False)
++    got = sorted(line.split()[1].decode() for line in shown.stdout.splitlines() if line.strip())
++    if shown.returncode or got != plan["unique"]:
++        raise ArchiveRefused(f"supplement pack for {repo} does not hold exactly the local-only objects")
++    record.update(pack=f"objects/{index}.pack", pack_sha256=_sha256_file(pack), pack_size=pack.stat().st_size)
++    return record
++
++
++def _run_git(repo: Path, env: Optional[dict], *args: str) -> bytes:
++    from hermes_cli.kanban_scratch_archive import ArchiveRefused
++    proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, env=env, timeout=1800,
++                          check=False, stdin=subprocess.DEVNULL)
++    if proc.returncode:
++        raise ArchiveRefused(f"git {' '.join(args[:2])} failed in {repo}: "
++                             f"{proc.stderr.decode('utf-8', 'replace')[:400]}")
++    return proc.stdout
++
++
++class Omitter:
++    """``_scan`` hook: drops object files and clean tracked files from the tarball, recording the latter."""
++
++    def __init__(self, plans: list[dict]):
++        self.skip = {rel for p in plans for rel in p["files"]}
++        self.blobs = {rel: (i, oid) for i, p in enumerate(plans) for rel, oid in p["blobs"].items()}
++        self.omitted: dict[str, dict] = {}
++
++    def __call__(self, dfd: int, name: str, rel: str, st: os.stat_result) -> bool:
++        from hermes_cli.kanban_scratch_archive import ArchiveRefused, _signature
++        if rel in self.skip:
++            return True
++        want = self.blobs.get(rel)
++        if want is None or st.st_nlink != 1:
++            return False
++        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
++        with os.fdopen(fd, "rb") as fh:
++            fst = os.fstat(fh.fileno())
++            if not stat.S_ISREG(fst.st_mode) or _signature(fst) != _signature(st):
++                raise ArchiveRefused(f"{rel} changed during archive")
++            blob, digest, size = hashlib.sha1(b"blob %d\0" % fst.st_size), hashlib.sha256(), 0
++            for block in iter(lambda: fh.read(1 << 20), b""):
++                blob.update(block)
++                digest.update(block)
++                size += len(block)
++        if size != fst.st_size or blob.hexdigest() != want[1]:
++            return False  # differs from HEAD: archived as bytes
++        self.omitted[rel] = {"type": "file", "mode": stat.S_IMODE(st.st_mode), "size": size,
++                             "sha256": digest.hexdigest(), "mtime": int(st.st_mtime),
++                             "git_oid": want[1], "repo": want[0]}
++        return True
++
++
++def check_files_unchanged(plans: list[dict], snapshot: dict[str, list[int]]) -> None:
++    """Raise unless the payload snapshot's object files are exactly those the plans were built from."""
++    from hermes_cli.kanban_scratch_archive import ArchiveRefused
++    for plan in plans:
++        prefix = f"{plan['git_dir']}/objects/"
++        now = {rel: sig for rel, sig in snapshot.items()
++               if rel.startswith(prefix) and stat.S_ISREG(sig[0])
++               and rel[len(prefix):] not in _KEEP_OBJECT_FILES}
++        if now != plan["files"]:
++            raise ArchiveRefused(f"{plan['git_dir']} objects changed while the archive was built")
++
++
++def verify_omissions(base: Path, manifest: dict) -> None:
++    """Check the omission records of a version-2 manifest (pack hashes, record shape)."""
++    from hermes_cli.kanban_scratch_archive import ArchiveRefused, _sha256_file
++    repos = manifest["omitted_repos"]
++    for record in repos:
++        if record.get("reason") != OMITTED_REASON or not record.get("remote_refs"):
++            raise ArchiveRefused("malformed omitted-objects record")
++        if record["pack"] is not None:
++            pack = base / record["pack"]
++            if not re.fullmatch(r"objects/\d+\.pack", record["pack"]) or pack.is_symlink():
++                raise ArchiveRefused("malformed supplement pack name")
++            if pack.stat().st_size != record["pack_size"] or _sha256_file(pack) != record["pack_sha256"]:
++                raise ArchiveRefused(f"supplement pack {record['pack']} hash mismatch")
++    for rel, rec in manifest["omitted"].items():
++        if (rel in manifest["entries"] or rec.get("type") != "file" or not 0 <= rec["repo"] < len(repos)
++                or not re.fullmatch(r"[0-9a-f]{40}", rec["git_oid"])):
++            raise ArchiveRefused(f"malformed omitted entry {rel!r}")
++
++
++# --- restore ---------------------------------------------------------------------------------
++
++def _restore_env(url_map: dict[str, str]) -> dict:
++    """Network allowed (restore fetches); *url_map* applies to every git child, lazy fetches included."""
++    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
++    env.pop("GIT_NO_LAZY_FETCH", None)
++    count = int(env.get("GIT_CONFIG_COUNT") or 0)
++    for old, new in sorted(url_map.items()):
++        env[f"GIT_CONFIG_KEY_{count}"], env[f"GIT_CONFIG_VALUE_{count}"] = f"url.{new}.insteadOf", old
++        count += 1
++    env["GIT_CONFIG_COUNT"] = str(count)
++    return env
++
++
++def _fetch_remote_objects(repo: Path, record: dict, env: dict) -> None:
++    """Clone each recorded remote bare into a temp dir, fetch the recorded tips, move its objects into *repo*."""
++    for name, url in sorted(record["remotes"].items()):
++        oids = sorted({o for r, o in record["remote_refs"].items() if r.startswith(f"refs/remotes/{name}/")})
++        filt = _run_git(repo, env, "config", "--default", "", "--get", f"remote.{name}.partialclonefilter")
++        filt = filt.decode().strip()
++        with tempfile.TemporaryDirectory(dir=repo / ".git") as tmp:
++            bare = Path(tmp) / "remote.git"
++            args = ["clone", "--bare", "-q", "--no-local", "--no-tags",
++                    *([f"--filter={filt}"] if filt else []), url, str(bare)]
++            _run_git(repo.parent, env, *args)
++            _run_git(bare, env, "-c", "fetch.unpackLimit=1", "fetch", "-q", "--no-tags",
++                     "--no-write-fetch-head", "origin", *oids)
++            _move_objects(bare / "objects", repo / ".git" / "objects")
++
++
++def _move_objects(src: Path, dest: Path) -> None:
++    """Move every pack and loose object of *src* into the object store *dest* (never overwriting)."""
++    for sub in src.iterdir():
++        if sub.name == "pack" or (len(sub.name) == 2 and sub.is_dir()):
++            (dest / sub.name).mkdir(exist_ok=True)
++            for item in sub.iterdir():
++                if not (dest / sub.name / item.name).exists():
++                    shutil.move(str(item), str(dest / sub.name / item.name))
++
++
++def _write_omitted(target: Path, manifest: dict, env: dict) -> None:
++    from hermes_cli.kanban_scratch_archive import ArchiveRefused
++    repos = manifest["omitted_repos"]
++    for rel, rec in sorted(manifest["omitted"].items()):
++        git_dir = repos[rec["repo"]]["git_dir"]
++        repo = target / git_dir[: -len("/.git")] if git_dir != ".git" else target
++        data = _run_git(repo, env, "cat-file", "blob", rec["git_oid"])
++        if len(data) != rec["size"] or hashlib.sha256(data).hexdigest() != rec["sha256"]:
++            raise ArchiveRefused(f"restored {rel!r} does not match its recorded hash")
++        path = target / rel
++        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
++        with os.fdopen(fd, "wb") as fh:
++            fh.write(data)
++        os.chmod(path, rec["mode"])
++        os.utime(path, (rec["mtime"], rec["mtime"]))
++
++
++def restore(archive: Path, target: Path, *, url_map: Optional[dict[str, str]] = None) -> dict:
++    """Rebuild the archived workspace at *target* (must not exist); returns the manifest.
++
++    *url_map* rewrites a recorded remote URL (e.g. to a mirror). Needs the
++    network for archives with omitted objects; refs are checked to resolve
++    and, outside partial clones, ``git fsck --connectivity-only`` must pass.
++    """
++    from hermes_cli.kanban_scratch_archive import PAYLOAD_DIR, _TREE, verify_complete_archive
++    manifest = verify_complete_archive(archive)
++    base = Path(archive) / PAYLOAD_DIR
++    target = Path(target)
++    target.mkdir(parents=True)
++    with tarfile.open(base / _TREE, "r:gz") as tar:
++        # tar_filter's path rules, but the archived mode (it would clear group/other write bits).
++        tar.extractall(target, filter=lambda m, dest: tarfile.tar_filter(m, dest).replace(mode=m.mode, deep=False))
++    env = _restore_env(url_map or {})
++    for record in manifest.get("omitted_repos", []):
++        git_dir = record["git_dir"]
++        repo = target / git_dir[: -len("/.git")] if git_dir != ".git" else target
++        _fetch_remote_objects(repo, record, env)
++        if record["pack"] is not None:
++            with open(base / record["pack"], "rb") as fh:
++                proc = subprocess.run(["git", "-C", str(repo), "index-pack", "--stdin"], stdin=fh,
++                                      capture_output=True, env=env, timeout=1800, check=False)
++            if proc.returncode:
++                raise RuntimeError(f"index-pack of {record['pack']} failed: {proc.stderr[:300]!r}")
++    _write_omitted(target, manifest, env)
++    for record in manifest.get("omitted_repos", []):
++        git_dir = record["git_dir"]
++        repo = target / git_dir[: -len("/.git")] if git_dir != ".git" else target
++        _check_refs(repo, env)
++    return manifest
++
++
++def _check_refs(repo: Path, env: dict) -> None:
++    from hermes_cli.kanban_scratch_archive import ArchiveRefused
++    refs = _run_git(repo, env, "for-each-ref", "--format=%(objectname)").split()
++    if not refs:
++        return
++    proc = subprocess.run(["git", "-C", str(repo), "cat-file", "--batch-check"], input=b"\n".join(refs) + b"\n",
++                          capture_output=True, env=dict(env, GIT_NO_LAZY_FETCH="1"), timeout=600, check=False)
++    if proc.returncode or b" missing" in proc.stdout:
++        raise ArchiveRefused(f"restored refs in {repo} do not all resolve")
++    partial = _run_git(repo, env, "config", "--default", "", "--get", "extensions.partialclone").strip()
++    if not partial:
++        _run_git(repo, env, "fsck", "--connectivity-only", "--no-dangling", "--no-progress")
+diff --git a/tests/hermes_cli/test_kanban_scratch_gc_archive.py b/tests/hermes_cli/test_kanban_scratch_gc_archive.py
+index 3affda0702..8bb651f8bc 100644
+--- a/tests/hermes_cli/test_kanban_scratch_gc_archive.py
++++ b/tests/hermes_cli/test_kanban_scratch_gc_archive.py
+@@ -1035,3 +1035,244 @@ def test_payload_uses_fast_gzip_level_and_old_level_9_archives_still_verify(boar
+     legacy = sa.archive_workspace(source, tmp_path / "legacy-archive", task_id="t", completed_at=OLD)
+     assert (legacy / PAYLOAD / "tree.tar.gz").read_bytes()[8] == 2  # XFL 2: maximum compression
+     sa.verify_complete_archive(legacy)
++
++
++# --- objects the remote already holds are left out, and restored from it ----------------
++
++FAKE_URL = "https://example.invalid/hermes-fixture.git"
++
++
++def _network_clone_task(tmp_path):
++    """A done card whose clone's origin is a network URL (served at restore from the local bare repo)."""
++    src = tmp_path / "netseed"
++    src.mkdir()
++    _run("init", "-q", cwd=src)
++    (src / "tracked.txt").write_text("one\n")
++    (src / "big.txt").write_text("remote-held line\n" * 20000)
++    (src / "bin").mkdir()
++    (src / "bin" / "run.sh").write_text("#!/bin/sh\necho hi\n")
++    (src / "bin" / "run.sh").chmod(0o755)
++    _run("add", ".", cwd=src)
++    _run("commit", "-q", "-m", "seed", cwd=src)
++    (src / "tracked.txt").write_text("one\ntwo\n")
++    _run("commit", "-q", "-am", "second", cwd=src)
++    bare = tmp_path / "netremote.git"
++    _run("clone", "-q", "--bare", str(src), str(bare))
++    tid, path = _task(remote=bare)
++    repo = path / "repo"
++    _run("remote", "set-url", "origin", FAKE_URL, cwd=repo)
++    return tid, path, repo, bare
++
++
++def _local_work(repo):
++    """Unpushed commit, staged-only blob, unstaged edit, untracked file, stash and a dangling object."""
++    (repo / "tracked.txt").write_text("one\ntwo\nunpushed\n")
++    _run("commit", "-q", "-am", "unpushed work", cwd=repo)
++    (repo / "stashed.txt").write_text("stash me\n")
++    _run("add", "stashed.txt", cwd=repo)
++    _run("stash", "-q", cwd=repo)
++    (repo / "staged.txt").write_text("staged only\n")
++    _run("add", "staged.txt", cwd=repo)
++    (repo / "staged.txt").write_text("staged then edited\n")
++    (repo / "bin" / "run.sh").write_text("#!/bin/sh\necho edited\n")
++    (repo / "new.txt").write_text("untracked\n")
++    proc = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=repo, input=b"dangling blob\n",
++                          capture_output=True, check=True)
++    return proc.stdout.decode().strip()
++
++
++def _tree_state(root):
++    """{rel: (kind, mode, bytes-or-link)} of every entry outside .git/objects (git rewrites those on restore)."""
++    out = {}
++    for cur, dirs, files in os.walk(root):
++        for name in dirs + files:
++            full = Path(cur) / name
++            rel = full.relative_to(root).as_posix()
++            if "/.git/objects/" in f"/{rel}/" and not rel.endswith(".git/objects"):
++                continue
++            st = full.lstat()
++            if full.is_symlink():
++                out[rel] = ("link", os.readlink(full))
++            elif full.is_dir():
++                out[rel] = ("dir", st.st_mode & 0o7777)
++            else:
++                out[rel] = ("file", st.st_mode & 0o7777, full.read_bytes())
++    return out
++
++
++def test_remote_held_objects_are_omitted_and_restore_round_trips(board, tmp_path):
++    from hermes_cli import kanban_scratch_archive as sa
++    from hermes_cli import kanban_scratch_archive_omit as om
++
++    tid, path, repo, bare = _network_clone_task(tmp_path)
++    dangling = _local_work(repo)
++    head = _run("rev-parse", "HEAD", cwd=repo)
++    stash = _run("rev-parse", "refs/stash", cwd=repo)
++    before = _tree_state(path)
++    assert _gc() == 0
++    assert not path.exists()
++
++    archive = _archive(tid)
++    manifest = sa.verify_complete_archive(archive)
++    assert manifest["version"] == 2
++    [record] = manifest["omitted_repos"]
++    assert record["git_dir"] == "repo/.git" and record["reason"] == "remote"
++    assert record["remotes"] == {"origin": FAKE_URL} and record["pack"] == "objects/0.pack"
++    names = set(_members(tid))
++    assert not [n for n in names if n.startswith("repo/.git/objects/") and _members(tid)[n][0].isfile()]
++    assert "repo/.git/index" in names and "repo/.git/HEAD" in names
++    # Clean tracked files are omitted (their blob is on the remote); edited/untracked ones are stored.
++    assert set(manifest["omitted"]) == {"repo/big.txt"}
++    assert {"repo/tracked.txt", "repo/bin/run.sh", "repo/staged.txt", "repo/new.txt"} <= names
++    meta = json.loads((archive / "repo" / "meta.json").read_text())
++    assert meta["objects_omitted"] == "remote" and meta["objects_restore"] == om.RESTORE_STEPS
++    assert "commits.bundle" in meta["files"]
++
++    target = tmp_path / "restored"
++    om.restore(archive, target, url_map={FAKE_URL: str(bare)})
++    assert _tree_state(target) == before
++    restored = target / "repo"
++    assert _run("rev-parse", "HEAD", cwd=restored) == head
++    assert _run("rev-parse", "refs/stash", cwd=restored) == stash
++    assert _run("cat-file", "-p", dangling, cwd=restored) == "dangling blob"
++    assert _run("show", ":staged.txt", cwd=restored) == "staged only"
++    assert _run("show", "stash@{0}:stashed.txt", cwd=restored) == "stash me"
++    _run("fsck", "--connectivity-only", "--no-dangling", cwd=restored)
++    status = {line.strip() for line in _run("status", "--porcelain", cwd=restored).splitlines()}
++    assert status == {"AM staged.txt", "M bin/run.sh", "?? new.txt"}
++
++
++def test_omitted_archive_is_under_a_tenth_of_a_full_clone(board, tmp_path):
++    tid, path, _repo, _bare = _network_clone_task(tmp_path)
++    source = sum(p.lstat().st_size for p in path.rglob("*") if p.is_file())
++    assert _gc() == 0
++    stored = sum(p.stat().st_size for p in _archive(tid).rglob("*") if p.is_file())
++    assert stored < source / 10, (stored, source)
++
++
++def test_local_path_remote_keeps_every_object(board, remote):
++    from hermes_cli import kanban_scratch_archive as sa
++    tid, _path = _task(remote=remote)
++    assert _gc() == 0
++    manifest = sa.verify_complete_archive(_archive(tid))
++    assert manifest["version"] == 1 and "omitted" not in manifest
++    objects = [n for n, (m, _) in _members(tid).items() if n.startswith("repo/.git/objects/") and m.isfile()]
++    assert objects
++    assert "objects_omitted" not in json.loads((_archive(tid) / "repo" / "meta.json").read_text())
++
++
++def test_object_written_after_the_plan_keeps_workspace(board, tmp_path, monkeypatch):
++    from hermes_cli import kanban_scratch_archive_omit as om
++    tid, _path, repo, _bare = _network_clone_task(tmp_path)
++    real = om.write_supplement
++
++    def racing(*args, **kwargs):
++        out = real(*args, **kwargs)
++        subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=repo, input=b"late object\n", check=True,
++                       capture_output=True)
++        return out
++
++    monkeypatch.setattr(om, "write_supplement", racing)
++    assert _gc() == 0
++    assert (repo / ".git").is_dir()
++    parent = _archive(tid).parent
++    assert not parent.exists() or list(parent.iterdir()) == []
++
++
++def test_clean_file_rewritten_after_hashing_keeps_workspace(board, tmp_path, monkeypatch):
++    from hermes_cli import kanban_scratch_archive_omit as om
++    tid, _path, repo, _bare = _network_clone_task(tmp_path)
++    real = om.Omitter.__call__
++
++    def racing(self, dfd, name, rel, st):
++        out = real(self, dfd, name, rel, st)
++        if rel == "repo/big.txt":
++            (repo / "big.txt").write_text("local rewrite\n")
++        return out
++
++    monkeypatch.setattr(om.Omitter, "__call__", racing)
++    assert _gc() == 0
++    assert (repo / "big.txt").read_text() == "local rewrite\n"
++    assert not _archive(tid).exists()
++
++
++@pytest.mark.parametrize("tamper", ["pack_bytes", "omitted_oid", "no_remote_refs"])
++def test_verify_rejects_tampered_omission_records(board, tmp_path, tamper):
++    from hermes_cli import kanban_scratch_archive as sa
++    tid, _path, repo, _bare = _network_clone_task(tmp_path)
++    _local_work(repo)
++    assert _gc() == 0
++    base = _archive(tid) / PAYLOAD
++    manifest = json.loads((base / "manifest.json").read_text())
++    if tamper == "pack_bytes":
++        pack = base / "objects" / "0.pack"
++        pack.write_bytes(pack.read_bytes()[:-4] + b"XXXX")
++    elif tamper == "omitted_oid":
++        manifest["omitted"]["repo/big.txt"]["git_oid"] = "nothex"
++    else:
++        manifest["omitted_repos"][0]["remote_refs"] = {}
++    (base / "manifest.json").write_text(json.dumps(manifest))
++    with pytest.raises(sa.ArchiveRefused):
++        sa.verify_complete_archive(_archive(tid))
++
++
++def test_restore_fails_loudly_when_the_remote_lacks_the_objects(board, tmp_path):
++    from hermes_cli import kanban_scratch_archive_omit as om
++    tid, _path, _repo, _bare = _network_clone_task(tmp_path)
++    assert _gc() == 0
++    empty = tmp_path / "empty.git"
++    _run("init", "-q", "--bare", str(empty))
++    with pytest.raises(Exception):
++        om.restore(_archive(tid), tmp_path / "restored", url_map={FAKE_URL: str(empty)})
++
++
++@pytest.mark.parametrize("url,network", [
++    ("https://github.com/o/r.git", True), ("ssh://git@host/r", True), ("git@github.com:o/r.git", True),
++    ("/srv/repo.git", False), ("../repo", False), ("file:///srv/r.git", False), ("C:/r", False), ("repo", False),
++])
++def test_only_network_remotes_count_as_holding_objects(url, network):
++    from hermes_cli import kanban_scratch_archive_omit as om
++    assert om._network_url(url) is network
++
++
++def test_blobless_clone_omits_promised_objects_and_restores_lazily(board, tmp_path):
++    from hermes_cli import kanban_scratch_archive as sa
++    from hermes_cli import kanban_scratch_archive_omit as om
++
++    _tid0, _p0, _r0, bare = _network_clone_task(tmp_path)  # builds the fixture remote
++    _run("config", "uploadpack.allowFilter", "true", cwd=bare)
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="blobless clone")
++        path = kb.workspaces_root() / tid
++        path.mkdir(parents=True)
++        _run("clone", "-q", "--filter=blob:none", f"file://{bare}", str(path / "repo"))
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='done', workspace_kind='scratch', workspace_path=?, "
++                         "completed_at=?, created_at=? WHERE id=?", (str(path), OLD, OLD, tid))
++    repo = path / "repo"
++    _run("remote", "set-url", "origin", FAKE_URL, cwd=repo)
++    dangling = _local_work(repo)
++    before = _tree_state(path)
++    head = _run("rev-parse", "HEAD", cwd=repo)
++    assert _gc() == 0
++    assert not path.exists()
++    manifest = sa.verify_complete_archive(_archive(tid))
++    assert manifest["version"] == 2 and "repo/big.txt" in manifest["omitted"]
++    target = tmp_path / "restored-blobless"
++    om.restore(_archive(tid), target, url_map={FAKE_URL: f"file://{bare}"})
++    assert _tree_state(target) == before
++    restored = target / "repo"
++    assert _run("rev-parse", "HEAD", cwd=restored) == head
++    assert _run("cat-file", "-p", dangling, cwd=restored) == "dangling blob"
++    assert _run("config", "remote.origin.promisor", cwd=restored) == "true"
++
++
++def test_boundary_blobs_cover_unpushed_head(board, tmp_path):
++    # HEAD is an unpushed commit: its unchanged files still match the pushed parent's blobs.
++    tid, _path, repo, _bare = _network_clone_task(tmp_path)
++    (repo / "tracked.txt").write_text("changed\n")
++    _run("commit", "-q", "-am", "unpushed", cwd=repo)
++    assert _gc() == 0
++    from hermes_cli import kanban_scratch_archive as sa
++    manifest = sa.verify_complete_archive(_archive(tid))
++    assert set(manifest["omitted"]) == {"repo/big.txt", "repo/bin/run.sh"}
+-- 
+2.43.0
+

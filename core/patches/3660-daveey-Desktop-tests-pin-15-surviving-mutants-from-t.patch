@@ -1,0 +1,548 @@
+From 1fe0ae9540944f13b6bb16aa968daec777c22087 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 16:13:29 +0000
+Subject: [PATCH] [daveey] Desktop tests: pin 15 surviving mutants from the
+ #2287/#2289/#2323/#2336/#2337 post-merge checks
+
+Test-only, plus one stale comment. Post-merge checks t_01a1d585805480d4 and
+t_01a1d59498376333 found mutants of merged code that every existing test
+survived. Each new test fails on its mutant alone and passes on main
+(sdlc-review mutants.py over idle-motion-pause, session-status-dot,
+session-dot-state and api.events-cursor: baseline 125 passed, 15/15 killed).
+
+#2287 rowExecutionStores() (session-status-dot.test.tsx):
+- M3h/M3i: an existing tile that gains its owner, or an owner tile rebound to
+  the row, repaints at once (the $tileOwnerBindings key covers owner and ids).
+- M3b: a primary re-home publishes its new profile after the epoch bump, so
+  only $activeGatewayRoute sees the new roster source.
+- M3c: a same-profile re-activation notifies only $gatewayActivationEpoch; an
+  owner hint (module state) is picked up there.
+- M3d-M3g: a running process counts toward a row only once a cron / messaging
+  / project-tree / unlisted-stub row (a lineage tip of the session) names its
+  owner. Rendered through useSessionDotState, because the dot itself also
+  subscribes $sessionColorById, which repaints on any project-tree change and
+  masked M3f.
+
+#2323/#2337 IdleMotionPause (idle-motion-pause.test.ts):
+- M1d: a stale-sheet removal that throws synchronously no longer stops the
+  reload's re-apply.
+- M2337d: a window that loads after resume gets no sheet.
+
+#2289/#2336 kanban events coalescing (api.events-cursor.test.ts):
+- M5e: dispose drops a pending trailing refresh.
+- M5d: a new binding's first frame re-reads at once even inside the last
+  binding's interval (a binding the host never disposed).
+- M2336d: one in-flight wait per key, however many trailing refreshes land.
+- M2336e: a deferred re-read starts the interval over.
+- M2336h: the Blocked section read is neither cancelled nor duplicated.
+
+api.ts: the onEventsFrame docstring named 8 s / 4 s polls; the fallbacks are
+board 15 s across gateways else 60 s, drawer task 30 s, log 3 s running else
+15 s (promised in the #2289 thread, comment 6856061185).
+---
+ .../electron/idle-motion-pause.test.ts        |  56 ++++++
+ .../src/app/chat/session-status-dot.test.tsx  | 171 +++++++++++++++-
+ .../plugins/kanban/api.events-cursor.test.ts  | 187 +++++++++++++++++-
+ apps/desktop/src/plugins/kanban/api.ts        |   4 +-
+ 4 files changed, 411 insertions(+), 7 deletions(-)
+
+diff --git a/apps/desktop/electron/idle-motion-pause.test.ts b/apps/desktop/electron/idle-motion-pause.test.ts
+index 9edba30030..2f63a4381c 100644
+--- a/apps/desktop/electron/idle-motion-pause.test.ts
++++ b/apps/desktop/electron/idle-motion-pause.test.ts
+@@ -55,6 +55,19 @@ class FakeContents implements IdleMotionTarget {
+   }
+ }
+ 
++/** `removeInsertedCSS` that throws synchronously instead of rejecting (a webContents torn down mid-call). */
++class ThrowingRemoveContents extends FakeContents {
++  throwOnRemove = false
++
++  override removeInsertedCSS(key: string) {
++    if (this.throwOnRemove) {
++      throw new Error('removeInsertedCSS threw synchronously')
++    }
++
++    return super.removeInsertedCSS(key)
++  }
++}
++
+ const flush = () => new Promise(resolve => setTimeout(resolve, 0))
+ 
+ function harness(windows: FakeContents[]) {
+@@ -218,6 +231,49 @@ describe('IdleMotionPause', () => {
+     expect(win.live).toEqual([])
+   })
+ 
++  // [daveey] #2323 follow-up (t_01a1d595575df431): a stale-key removal that throws synchronously is swallowed like a
++  // rejection, so the reload's re-apply still runs instead of rejecting the chain and leaving the page unpaused.
++  it('re-applies after a reload whose stale-sheet removal throws synchronously', async () => {
++    const win = new ThrowingRemoveContents(1)
++    const h = harness([win])
++
++    h.setIdle(IDLE_MOTION_PAUSE_AFTER_SECONDS)
++    h.pause.check()
++    await flush()
++
++    win.restartRenderer()
++    win.throwOnRemove = true
++    h.pause.noteLoaded(win)
++    await flush()
++    await flush()
++    expect(win.live).toEqual([IDLE_MOTION_PAUSE_CSS])
++
++    win.throwOnRemove = false
++    h.setIdle(0)
++    h.pause.check()
++    await flush()
++    expect(win.live).toEqual([])
++  })
++
++  // [daveey] #2337 follow-up (t_01a1d595575df431, from t_01a1d59498376333): a window that loads while the user is
++  // active gets no sheet, even after an earlier pause.
++  it('a window that loads after resume stays unpaused', async () => {
++    const win = new FakeContents(1)
++    const h = harness([win])
++
++    h.setIdle(IDLE_MOTION_PAUSE_AFTER_SECONDS)
++    h.pause.check()
++    await flush()
++    h.setIdle(0)
++    h.pause.check()
++    await flush()
++
++    h.pause.noteLoaded(win)
++    await flush()
++    await flush()
++    expect(win.live).toEqual([])
++  })
++
+   it('skips destroyed windows and survives insertCSS failures', async () => {
+     const gone = new FakeContents(1)
+     gone.destroyed = true
+diff --git a/apps/desktop/src/app/chat/session-status-dot.test.tsx b/apps/desktop/src/app/chat/session-status-dot.test.tsx
+index e296bdc477..21627d6b1c 100644
+--- a/apps/desktop/src/app/chat/session-status-dot.test.tsx
++++ b/apps/desktop/src/app/chat/session-status-dot.test.tsx
+@@ -1,11 +1,28 @@
+-import { act, cleanup, render } from '@testing-library/react'
++import { act, cleanup, render, renderHook } from '@testing-library/react'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
++import type { SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
++import { useSessionDotState } from '@/lib/use-session-dot-state'
++import { $backgroundStatusBySession } from '@/store/composer-status'
+ import { rowExecution } from '@/store/execution-observation-row'
+-import { activeGatewayProfileKey, gatewayRouteState, isActivePrimary } from '@/store/gateway'
++import {
++  activeGatewayProfileKey,
++  ensureGatewayForProfile,
++  gatewayRouteState,
++  isActivePrimary,
++  setPrimaryGateway
++} from '@/store/gateway'
+ import { $kanbanObservationTick } from '@/store/kanban-observation'
+ import { $liveWorkRoster, setLiveWorkRosterSource } from '@/store/live-work-roster'
+-import { $sessions } from '@/store/session'
++import { $projectTree } from '@/store/project-tree'
++import {
++  $cronSessions,
++  $messagingSessions,
++  $sessions,
++  $unlistedSessionOwnerRows,
++  _resetSessionOwnerHintsForTests,
++  setSessionOwnerHint
++} from '@/store/session'
+ import { $sessionTiles } from '@/store/session-states'
+ import type { SessionInfo } from '@/types/hermes'
+ 
+@@ -54,7 +71,9 @@ const ownSource = () => (isActivePrimary() ? gatewayRouteState(null, activeGatew
+ 
+ /** A remote roster read reporting a running card (no process/subagent count, so no other store claims the row). */
+ const rosterRunningCard = (sessionId: string) =>
+-  setLiveWorkRosterSource(ownSource(), [{ background: 0, execution_observations: [fixture.base], session_id: sessionId, subagents: 0 }])
++  setLiveWorkRosterSource(ownSource(), [
++    { background: 0, execution_observations: [fixture.base], session_id: sessionId, subagents: 0 }
++  ])
+ 
+ const dot = (session: null | Partial<SessionInfo>, id = session?.id ?? null) =>
+   render(<SessionStatusDot session={session as null | SessionInfo} storedSessionId={id} />).container
+@@ -70,6 +89,12 @@ afterEach(() => {
+   $liveWorkRoster.set({})
+   $sessions.set([])
+   $sessionTiles.set([])
++  $backgroundStatusBySession.set({})
++  $cronSessions.set([])
++  $messagingSessions.set([])
++  $projectTree.set([])
++  $unlistedSessionOwnerRows.set([])
++  _resetSessionOwnerHintsForTests({ storage: true })
+ })
+ 
+ // [daveey] PR #2154 review follow-ups: the dot evaluates every store its row verdict reads, falls back to the
+@@ -138,6 +163,144 @@ describe('SessionStatusDot live inputs (no tick lag)', () => {
+   })
+ })
+ 
++// [daveey] #2287 follow-up (t_01a1d595575df431): each input in `rowExecutionStores()` repaints the dot on its own.
++describe('SessionStatusDot owner-route inputs (no tick lag)', () => {
++  const unknownRow = (id: string) => ({
++    execution_observations: [unknownObs],
++    id,
++    kanban_active: 1,
++    kanban_observed_at: NOW,
++    kanban_parked: 1,
++    message_count: 4
++  })
++
++  const runningCardAt = (source: string, sessionId: string) =>
++    setLiveWorkRosterSource(source, [
++      { background: 0, execution_observations: [fixture.base], session_id: sessionId, subagents: 0 }
++    ])
++
++  // `$tileOwnerBindings` keys on the tile's owner, not only on how many tiles there are.
++  it('relabels as soon as an existing tile gains the owner whose roster reports a running card', () => {
++    const tick = $kanbanObservationTick.get()
++
++    runningCardAt(gatewayRouteState(null, 'owner-elsewhere').key, 'owned2')
++    $sessionTiles.set([{ storedSessionId: 'owned2' }])
++
++    const c = dot(unknownRow('owned2'))
++
++    expect(c.querySelector(UNKNOWN)).not.toBeNull()
++
++    act(() => $sessionTiles.set([{ ownerProfile: 'owner-elsewhere', storedSessionId: 'owned2' }]))
++
++    expect($kanbanObservationTick.get()).toBe(tick)
++    expect(c.querySelector(RUNNING)).not.toBeNull()
++  })
++
++  // ...and on which stored session the tile holds.
++  it('relabels as soon as an owner tile is rebound to the row', () => {
++    const tick = $kanbanObservationTick.get()
++
++    runningCardAt(gatewayRouteState(null, 'owner-elsewhere').key, 'owned3')
++    $sessionTiles.set([{ ownerProfile: 'owner-elsewhere', storedSessionId: 'someone-else' }])
++
++    const c = dot(unknownRow('owned3'))
++
++    expect(c.querySelector(UNKNOWN)).not.toBeNull()
++
++    act(() => $sessionTiles.set([{ ownerProfile: 'owner-elsewhere', storedSessionId: 'owned3' }]))
++
++    expect($kanbanObservationTick.get()).toBe(tick)
++    expect(c.querySelector(RUNNING)).not.toBeNull()
++  })
++
++  // `$activeGatewayRoute`: a primary re-home moves the registry first (no store notifies), then its activation
++  // publishes the new profile after the epoch bump, so only the route atom's notification sees the new source.
++  it('relabels when the active route moves to a profile whose roster reports a running card', () => {
++    const tick = $kanbanObservationTick.get()
++    const before = activeGatewayProfileKey()
++    const c = dot(unknownRow('routed'))
++
++    try {
++      setPrimaryGateway(null, 'rehomed-primary')
++      const next = gatewayRouteState(null, 'rehomed-primary').key
++
++      expect(next).not.toBe(ownSource())
++      act(() => runningCardAt(next, 'routed'))
++      expect(c.querySelector(UNKNOWN)).not.toBeNull()
++
++      act(() => void ensureGatewayForProfile('rehomed-primary'))
++
++      expect(activeGatewayProfileKey()).toBe('rehomed-primary')
++      expect($kanbanObservationTick.get()).toBe(tick)
++      expect(c.querySelector(RUNNING)).not.toBeNull()
++    } finally {
++      setPrimaryGateway(null, before)
++      void ensureGatewayForProfile(before)
++    }
++  })
++
++  // `$gatewayActivationEpoch`: a same-profile re-activation publishes no new profile, so the epoch is the only store
++  // that notifies. An owner hint is module state (no store), so a route activation is where the dot picks it up.
++  it('re-evaluates the row on a same-profile route activation', () => {
++    const tick = $kanbanObservationTick.get()
++    const route = { connectionId: 'local', profile: 'owner-hinted' }
++    const c = dot(unknownRow('hinted'))
++
++    act(() => runningCardAt(gatewayRouteState(route.connectionId, route.profile).key, 'hinted'))
++    setSessionOwnerHint('hinted', route)
++    expect(c.querySelector(UNKNOWN)).not.toBeNull()
++
++    act(() => void ensureGatewayForProfile(activeGatewayProfileKey()))
++
++    expect($kanbanObservationTick.get()).toBe(tick)
++    expect(c.querySelector(RUNNING)).not.toBeNull()
++  })
++
++  // The owner-lookup rows a runtime's owner falls back to. A running process with no execution evidence counts toward
++  // the row only when its runtime resolves to the row's owner source, and that owner is named only by the new row: a
++  // later lineage tip (`_lineage_root_id`) whose own id no dot-state store claims. Rendered through the hook alone,
++  // because the dot also subscribes `$sessionColorById`, which repaints it on any project-tree change.
++  const ownerRowStores: Array<[string, (row: SessionInfo) => void]> = [
++    ['$cronSessions', row => $cronSessions.set([row])],
++    ['$messagingSessions', row => $messagingSessions.set([row])],
++    [
++      '$projectTree',
++      row =>
++        $projectTree.set([
++          { id: 'p', label: 'p', path: null, previewSessions: [row], repos: [], sessionCount: 1 } as SidebarProjectTree
++        ])
++    ],
++    ['$unlistedSessionOwnerRows', row => $unlistedSessionOwnerRows.set([row])]
++  ]
++
++  for (const [name, publish] of ownerRowStores) {
++    it(`re-evaluates the row when ${name} names the owner of a running process on it`, () => {
++      const tick = $kanbanObservationTick.get()
++      const id = `proc-${name.slice(1)}`
++      const owned = { id, kanban_observed_at: NOW, message_count: 4, profile: 'owner-elsewhere' } as SessionInfo
++
++      $backgroundStatusBySession.set({ [id]: [{ id: 'job', state: 'running', title: 'job', type: 'background' }] })
++
++      const { result } = renderHook(() => useSessionDotState(id, owned))
++
++      expect(result.current).toBe('idle')
++
++      act(() =>
++        publish({
++          _lineage_root_id: id,
++          id: `${id}-tip`,
++          kanban_observed_at: NOW,
++          message_count: 4,
++          profile: 'owner-elsewhere'
++        } as SessionInfo)
++      )
++
++      expect($kanbanObservationTick.get()).toBe(tick)
++      expect(result.current).toBe('background')
++    })
++  }
++})
++
+ describe('SessionStatusDot with no session row', () => {
+   for (const stamp of [{ background_active: 1 }, { goal_active: true }]) {
+     it(`reads the listed row for a store-claimed ${Object.keys(stamp)[0]} instead of saying unknown`, () => {
+diff --git a/apps/desktop/src/plugins/kanban/api.events-cursor.test.ts b/apps/desktop/src/plugins/kanban/api.events-cursor.test.ts
+index 5a3b7c1476..dfbdc94638 100644
+--- a/apps/desktop/src/plugins/kanban/api.events-cursor.test.ts
++++ b/apps/desktop/src/plugins/kanban/api.events-cursor.test.ts
+@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
+ // The socket must start at the snapshot's tail, and a late snapshot must not
+ // reopen a board the user already left. The cursor is per connection.
+ 
+-const { $boardSlug, bindApi, boardKey, EVENTS_BOARD_REFRESH_MIN_MS } = await import('./api')
++const { $boardSlug, bindApi, blockedKey, boardKey, EVENTS_BOARD_REFRESH_MIN_MS } = await import('./api')
+ const { setConnection } = await import('@/store/session')
+ 
+ const BOARD = (latest_event_id: number) => ({
+@@ -290,4 +290,189 @@ describe('kanban event cursor', () => {
+       vi.useRealTimers()
+     }
+   })
++
++  // [daveey] #2289 follow-up (t_01a1d595575df431): the coalescing state is per binding. A disposed binding's trailing
++  // refresh must not fire into the next one, and a fresh binding's first frame re-reads at once.
++  const bindWithFrames = () => {
++    const frames: Array<(data: unknown) => void> = []
++
++    const dispose = bindApi(
++      async () => {
++        throw new Error('cached snapshot must not refetch')
++      },
++      storage('ops'),
++      vi.fn((_path: string, onMessage: (data: unknown) => void) => {
++        frames.push(onMessage)
++
++        return vi.fn()
++      })
++    )
++
++    const frame = (id: number) =>
++      frames.at(-1)!({ cursor: id, events: [{ id, kind: 'heartbeat', task_id: `t_${id}` }] })
++
++    return { dispose, frame }
++  }
++
++  const spyInvalidate = () => vi.spyOn(queryClient, 'invalidateQueries')
++
++  const boardInvalidations = (spy: ReturnType<typeof spyInvalidate>) =>
++    spy.mock.calls.filter(([filters]) => filters?.queryKey?.[1] === 'board').length
++
++  it('drops a pending trailing board refresh when the binding is disposed', () => {
++    vi.useFakeTimers()
++
++    try {
++      queryClient.setQueryData(boardKey('local', 'ops', false), BOARD(10))
++      const binding = bindWithFrames()
++      const invalidate = spyInvalidate()
++
++      binding.frame(11)
++      binding.frame(12) // inside the interval: one trailing refresh is now pending
++      expect(boardInvalidations(invalidate)).toBe(1)
++
++      binding.dispose()
++      vi.advanceTimersByTime(10 * EVENTS_BOARD_REFRESH_MIN_MS)
++      expect(boardInvalidations(invalidate)).toBe(1)
++
++      invalidate.mockRestore()
++    } finally {
++      vi.useRealTimers()
++    }
++  })
++
++  it('re-reads the board on the first frame of a new binding even inside the last binding interval', () => {
++    vi.useFakeTimers()
++
++    try {
++      queryClient.setQueryData(boardKey('local', 'ops', false), BOARD(10))
++      // A binding the host never disposed (a re-register over a live one) must not hand its interval on either.
++      const first = bindWithFrames()
++      const invalidate = spyInvalidate()
++
++      first.frame(11)
++      expect(boardInvalidations(invalidate)).toBe(1)
++
++      const second = bindWithFrames()
++
++      second.frame(12)
++      expect(boardInvalidations(invalidate)).toBe(2)
++
++      invalidate.mockRestore()
++      second.dispose()
++      first.dispose()
++    } finally {
++      vi.useRealTimers()
++    }
++  })
++
++  // [daveey] #2336 follow-ups (t_01a1d595575df431, from t_01a1d59498376333): the in-flight wait is one per key, it
++  // restarts the interval, and the Blocked section read is never cancelled either.
++  const slowReads = (queryKey: readonly unknown[]) => {
++    const reads: Array<{ resolve: (value: unknown) => void; signal: AbortSignal }> = []
++
++    const observer = new QueryObserver(queryClient, {
++      queryFn: ({ signal }) =>
++        new Promise<unknown>(resolve => {
++          reads.push({ resolve, signal })
++        }),
++      queryKey,
++      staleTime: Infinity
++    })
++
++    return { reads, unsubscribe: observer.subscribe(() => undefined) }
++  }
++
++  it('waits on a slow board read once however many trailing refreshes land during it', async () => {
++    vi.useFakeTimers()
++
++    try {
++      queryClient.setQueryData(boardKey('local', 'ops', false), BOARD(10))
++      const binding = bindWithFrames()
++      const { reads, unsubscribe } = slowReads(boardKey('local', 'ops', false))
++
++      binding.frame(11)
++      await vi.advanceTimersByTimeAsync(1000)
++      binding.frame(12)
++      await vi.advanceTimersByTimeAsync(2000)
++      binding.frame(13)
++      await vi.advanceTimersByTimeAsync(4000)
++      expect(reads).toHaveLength(1)
++
++      reads[0].resolve(BOARD(11))
++      await vi.advanceTimersByTimeAsync(10 * EVENTS_BOARD_REFRESH_MIN_MS)
++      expect(reads).toHaveLength(2)
++
++      reads[1].resolve(BOARD(13))
++      await vi.advanceTimersByTimeAsync(10 * EVENTS_BOARD_REFRESH_MIN_MS)
++      expect(reads).toHaveLength(2)
++
++      unsubscribe()
++      binding.dispose()
++    } finally {
++      vi.useRealTimers()
++    }
++  })
++
++  it('starts the interval over when a deferred re-read begins', async () => {
++    vi.useFakeTimers()
++
++    try {
++      queryClient.setQueryData(boardKey('local', 'ops', false), BOARD(10))
++      const binding = bindWithFrames()
++      const { reads, unsubscribe } = slowReads(boardKey('local', 'ops', false))
++
++      binding.frame(11)
++      await vi.advanceTimersByTimeAsync(EVENTS_BOARD_REFRESH_MIN_MS / 2)
++      binding.frame(12)
++      // The trailing refresh fires at MIN_MS and waits; the slow read outlives the whole interval.
++      await vi.advanceTimersByTimeAsync(2 * EVENTS_BOARD_REFRESH_MIN_MS)
++      reads[0].resolve(BOARD(11))
++      await vi.advanceTimersByTimeAsync(0)
++      expect(reads).toHaveLength(2)
++      reads[1].resolve(BOARD(12))
++      await vi.advanceTimersByTimeAsync(0)
++
++      binding.frame(13)
++      await vi.advanceTimersByTimeAsync(0)
++      expect(reads).toHaveLength(2)
++
++      await vi.advanceTimersByTimeAsync(EVENTS_BOARD_REFRESH_MIN_MS)
++      expect(reads).toHaveLength(3)
++
++      unsubscribe()
++      binding.dispose()
++    } finally {
++      vi.useRealTimers()
++    }
++  })
++
++  it('neither cancels nor duplicates a Blocked section read still in flight', async () => {
++    vi.useFakeTimers()
++
++    try {
++      queryClient.setQueryData(boardKey('local', 'ops', false), BOARD(10))
++      const binding = bindWithFrames()
++      const { reads, unsubscribe } = slowReads(blockedKey('local'))
++
++      binding.frame(11)
++      await vi.advanceTimersByTimeAsync(0)
++      expect(reads).toHaveLength(1)
++
++      await vi.advanceTimersByTimeAsync(EVENTS_BOARD_REFRESH_MIN_MS / 2)
++      binding.frame(12)
++      await vi.advanceTimersByTimeAsync(EVENTS_BOARD_REFRESH_MIN_MS)
++      expect(reads).toHaveLength(1)
++      expect(reads[0].signal.aborted).toBe(false)
++
++      reads[0].resolve({ tasks: [] })
++      await vi.advanceTimersByTimeAsync(EVENTS_BOARD_REFRESH_MIN_MS)
++      expect(reads).toHaveLength(2)
++
++      unsubscribe()
++      binding.dispose()
++    } finally {
++      vi.useRealTimers()
++    }
++  })
+ })
+diff --git a/apps/desktop/src/plugins/kanban/api.ts b/apps/desktop/src/plugins/kanban/api.ts
+index 1a1f6833d0..f9186533fe 100644
+--- a/apps/desktop/src/plugins/kanban/api.ts
++++ b/apps/desktop/src/plugins/kanban/api.ts
+@@ -301,8 +301,8 @@ function resetBoardRefresh(): void {
+ 
+ /** One live `task_events` frame → precise cache invalidation: the board
+  *  (coalesced, see EVENTS_BOARD_REFRESH_MIN_MS), plus each touched task's
+- *  detail. The polls (8s board / 4s drawer) stay as the fallback — the socket
+- *  just makes the board feel instant. */
++ *  detail. The polls stay as the fallback (board 15 s when it spans gateways, else 60 s; drawer task 30 s, its log
++ *  3 s while running, else 15 s); the socket just makes the board feel instant. */
+ function onEventsFrame(scope: string, slug: string, data: unknown, selectedSlug = slug): void {
+   const frame = data as { cursor?: unknown; events?: CompletionEvent[] }
+ 
+-- 
+2.43.0
+

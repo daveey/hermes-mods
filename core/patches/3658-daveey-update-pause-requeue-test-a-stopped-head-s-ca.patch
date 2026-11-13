@@ -1,0 +1,96 @@
+From 3c4b080c317a985d2359965d1d6000bbea935e8e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 16:24:11 +0000
+Subject: [PATCH] [daveey] update-pause requeue test: a stopped head's
+ cancelled completion is published exactly once
+
+Post-merge mutation check t_01a1d5aa7a87705c of #2360 (f8d5675fb0): duplicating
+`authority._settle_cancelled(ref, admission_id)` in
+`gateway/session_update_pause.py::_stopped_after_requeue` left
+tests/gateway/test_update_requeue_stop_race.py green. A double settle is
+observable: `_settle_cancelled` publishes the `outcome='cancelled'`
+message.complete on the session event stream again (and calls
+`busy_row_settled` again); only the waiter is idempotent, and the tests
+asserted only the waiter.
+
+Test-only. Both tests that reach `_stopped_after_requeue`'s settle now
+observe the real event stream (an observer on the live session's
+event_stream, as test_session_authority_cancel_settlement does) and assert:
+- #2173 Stop-during-requeue-write: exactly one cancelled completion for the head.
+- #2360 failed-cancel, commit-then-raise: exactly one, before and after the
+  hold; before-commit: none (the row stays queued and runs once).
+
+Proof (scripts/run_tests.sh tests/gateway/test_update_requeue_stop_race.py):
+- mutant (settle twice): 2 failed, 1 passed, both `assert 2 == 1`
+- without the mutant: 3 passed (plus test_session_authority_cancel_settlement.py, 11 total)
+
+Card: t_01a1d5b4b54f8c44
+---
+ tests/gateway/test_update_requeue_stop_race.py | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/tests/gateway/test_update_requeue_stop_race.py b/tests/gateway/test_update_requeue_stop_race.py
+index 8e3db3659c..565a443554 100644
+--- a/tests/gateway/test_update_requeue_stop_race.py
++++ b/tests/gateway/test_update_requeue_stop_race.py
+@@ -28,6 +28,12 @@ def _yielded(owner, row):
+         'result': {'paused_for_update': True, UNSTARTED_KEY: True}, 'usage': {}}
+ 
+ 
++def _cancelled_completions(frames, admission_id):
++    """The ``outcome='cancelled'`` completions the session's event stream published for ``admission_id``."""
++    return [f for f in frames if f['params']['type'] == 'message.complete'
++            and f['params']['admission_id'] == admission_id and f['params']['payload'].get('outcome') == 'cancelled']
++
++
+ async def _stop_session(authority):
+     task = authority.sessions['s'].task
+     if task is not None and not task.done():
+@@ -44,7 +50,8 @@ async def test_stop_latched_during_the_requeue_write_cancels_the_head_and_clears
+     from gateway.session_update_pause import interrupt_update
+     from hermes_state_runtime import admit_session_input, get_session_admission
+     db, authority = _authority(tmp_path, monkeypatch)
+-    held, calls, stops = [False], [], []
++    held, calls, stops, frames = [False], [], [], []
++    authority.sessions['s'].event_stream.observers.add(frames.append)
+     monkeypatch.setattr(session_notifier_drain, 'held', lambda: held[0])
+     loop = asyncio.get_running_loop()
+     original = hermes_state_update_pause.requeue_unstarted_input
+@@ -79,6 +86,7 @@ async def test_stop_latched_during_the_requeue_write_cancels_the_head_and_clears
+             row = get_session_admission(db, admission_id=head['admission_id'])
+             assert (row['status'], row['outcome']) == ('terminal', 'cancelled'), row  # ... and it does
+             assert await asyncio.wait_for(waiter, 5) is None
++            assert len(_cancelled_completions(frames, head['admission_id'])) == 1  # published once, not per settle
+             assert head['admission_id'] not in authority.update_stops and not authority.pending_stops
+             held[0] = False
+             authority.sessions['s'].claim_changed.set()
+@@ -104,7 +112,8 @@ async def test_a_failed_cancel_of_the_stopped_head_runs_it_once_after_the_hold_o
+     from gateway.session_update_pause import interrupt_update
+     from hermes_state_runtime import admit_session_input, get_session_admission
+     db, authority = _authority(tmp_path, monkeypatch)
+-    held, calls, stops, attempts = [False], [], [], []
++    held, calls, stops, attempts, frames = [False], [], [], [], []
++    authority.sessions['s'].event_stream.observers.add(frames.append)
+     monkeypatch.setattr(session_notifier_drain, 'held', lambda: held[0])
+     loop = asyncio.get_running_loop()
+     original = hermes_state_update_pause.requeue_unstarted_input
+@@ -152,11 +161,16 @@ async def test_a_failed_cancel_of_the_stopped_head_runs_it_once_after_the_hold_o
+             else:
+                 assert (row['status'], row['outcome']) == ('queued', None), row
+                 assert not waiter.done(), 'the waiter stays with the queued row'
++            # A committed cancel publishes its completion exactly once (only the waiter is idempotent); an
++            # uncommitted one publishes none.
++            expected_cancelled = 1 if failure == 'commit-then-raise' else 0
++            assert len(_cancelled_completions(frames, head['admission_id'])) == expected_cancelled
+             held[0] = False
+             authority.sessions['s'].claim_changed.set()
+             expected = 1 if failure == 'commit-then-raise' else 2  # yielded once, then (if still queued) ran once
+             await _until(lambda: len(calls) >= expected and not mutation_tasks(authority))
+             assert [c['admission_id'] for c in calls] == [head['admission_id']] * expected
++            assert len(_cancelled_completions(frames, head['admission_id'])) == expected_cancelled
+             assert not authority.update_stops and not authority.pending_stops
+         finally:
+             held[0] = False
+-- 
+2.43.0
+

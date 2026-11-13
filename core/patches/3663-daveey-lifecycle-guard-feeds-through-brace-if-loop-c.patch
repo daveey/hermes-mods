@@ -1,0 +1,475 @@
+From 2f6410bf37cb0633f0eb8f113f18b1202d47bd06 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 16:06:49 +0000
+Subject: [PATCH] [daveey] lifecycle guard: feeds through brace/if/loop/case
+ groups, glued `<` on arguments, process substitution
+
+Closes the four stdin-feed fail-opens left after PR #2316 (review 5893771725).
+Each ran a lifecycle .py/.sh the guard never opened:
+
+1. `{ cat f.py; } | python3`: at the `|` the previous segment was `}`, no cat.
+   A closed group now writes on what its commands wrote (unless piped
+   elsewhere inside it: `{ cat f | grep x; } | python3` stays allowed).
+2. `python3 -<f.py`: an unquoted, unescaped `<`/`>` glued to a word that is
+   not a bare fd number now starts its own word before shlex runs
+   (`split_glued_redirections`). A quoted `<` (a quoted shell payload such
+   as 'python3<f.py') stays one word and is re-scanned whole as before.
+3. `cat f.py | if true; then python3; fi`: if/while/until/for/select/case
+   open a group like `(`/`{`, closed by fi/done/esac in command position, so
+   the pipe feeds the whole body.
+4. `python3 <(cat f.py)`, `bash < <(cat f.sh)`, `source <(cat f.sh)`: a
+   process substitution suspends the command it stands in; on `)` it is
+   read once per file the substitution writes, in its place (a NUL
+   placeholder when it writes none, so it never names a path).
+
+The group walk moved to cron/lifecycle_guard_groups.py (lifecycle_guard.py
+sits at its 2000-line cap); it takes cat_operands/opens_call_arguments/
+peel_reserved_words as callables so it never imports the guard.
+
+Tests: tests/cron/test_lifecycle_guard_compound_feeds.py. On the base
+(#2316, landed as 6bc34a231f) 30 scan cases + the splitter unit test fail, covering all four
+cases; `cat f.py | python3 <(echo hi)` was a base false positive (the program
+is the substitution, not stdin). At head: tests/cron + the 5 other files
+importing the guard, 2937 passed.
+---
+ cron/lifecycle_guard.py                       |  52 +----
+ cron/lifecycle_guard_groups.py                | 195 ++++++++++++++++++
+ .../test_lifecycle_guard_compound_feeds.py    | 131 ++++++++++++
+ 3 files changed, 337 insertions(+), 41 deletions(-)
+ create mode 100644 cron/lifecycle_guard_groups.py
+ create mode 100644 tests/cron/test_lifecycle_guard_compound_feeds.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index f49dfd1777..2c031a8710 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -19,6 +19,8 @@ import sys
+ from pathlib import Path
+ from typing import Callable, Iterator, Optional
+ 
++from cron.lifecycle_guard_groups import CONTROL_CHARS as _CONTROL_CHARS
++from cron.lifecycle_guard_groups import iter_line_segment_contexts, split_glued_redirections
+ # How `uv [global options] run [options] <command>` reads its argv.
+ from cron.lifecycle_guard_uv import _uv_run_command_indices
+ 
+@@ -279,7 +281,6 @@ _SHELL_LONG_OPTIONS_WITH_VALUES = frozenset({"--rcfile", "--init-file"})
+ _SHELL_COMMAND_FLAGS = {"-c", "--command"}
+ _MAX_REFERENCED_SCRIPT_BYTES = 1024 * 1024
+ _MAX_REFERENCED_SCRIPT_DEPTH = 8
+-_CONTROL_CHARS = frozenset(";&|()")
+ 
+ # Directory names directly under `Library` that mark a FileProvider-backed subtree: `Mobile
+ # Documents` is iCloud Drive; `CloudStorage` hosts third-party providers (Dropbox, OneDrive, Google
+@@ -739,14 +740,15 @@ def _split_segments(tokens: list[str], *, keep_controls: bool = False) -> Iterat
+ 
+ def _iter_command_token_lists(command: str) -> Iterator[list[str]]:
+     """Yield the shell tokens of each logical line; a line shlex rejects (unbalanced quotes) falls
+-    back to per-physical-line tokenization."""
++    back to per-physical-line tokenization. An unquoted ``<``/``>`` glued to a word starts a word
++    of its own (``python3 -<f.py``), as in the shell."""
+     for line in _split_logical_lines(command.replace("\\\n", "")):
+         try:
+-            tokens = _shlex_tokens(line)
++            tokens = _shlex_tokens(split_glued_redirections(line))
+         except ValueError:
+             for physical_line in line.splitlines():
+                 try:
+-                    yield _shlex_tokens(physical_line)
++                    yield _shlex_tokens(split_glued_redirections(physical_line))
+                 except ValueError:
+                     continue
+             continue
+@@ -835,47 +837,15 @@ def _session_aliases_shadow_consumers(session_aliases: Optional[frozenset[str]])
+                for name in session_aliases)
+ 
+ 
+-_CONTROL_OPERATOR = re.compile(r"\|\||&&|\|&|;;|[;&|()]")
+-
+-
+ def _iter_segment_contexts(command: str) -> Iterator[tuple[list[str], bool, list[str]]]:
+     """``(segment, call_argument, piped_files)``: whether the segment is the argument list of a
+     call (the segment right after a ``(`` that follows an ordinary word), and the files a ``cat``
+-    pipes into its stdin (``cat f.sh | bash``). A group a pipe feeds (``cat f | (true; bash)``,
+-    ``| { …; }``) passes the feed to every command in it, as the shell does."""
++    pipes into its stdin (``cat f.sh | bash``), through groups, compound commands and process
++    substitution too (``{ cat f; } | bash``, ``cat f | if …; fi``, ``bash <(cat f)``)."""
+     for tokens in _iter_command_token_lists(command):
+-        segment: list[str] = []
+-        call_argument = False
+-        previous: Optional[list[str]] = None
+-        feed: list[str] = []
+-        # The feed each open `(`/`{` group inherited: every command in it reads that stdin.
+-        groups: list[list[str]] = []
+-        for token in tokens:
+-            if token and set(token) <= _CONTROL_CHARS:
+-                next_is_call = token == "(" and bool(segment) and _opens_call_arguments(segment)
+-                if segment:
+-                    yield segment, call_argument, feed
+-                    if segment[0] == "{":
+-                        groups.append(feed)
+-                    previous = segment
+-                    segment = []
+-                for operator in _CONTROL_OPERATOR.findall(token):
+-                    if operator in ("|", "|&"):
+-                        feed = _cat_operands(previous)
+-                    elif operator == "(":
+-                        groups.append(feed)
+-                    else:
+-                        if operator == ")" and groups:
+-                            groups.pop()
+-                        feed = groups[-1] if groups else []
+-                call_argument = next_is_call
+-                continue
+-            if not segment and token == "}" and groups:
+-                groups.pop()
+-                feed = groups[-1] if groups else []
+-            segment.append(token)
+-        if segment:
+-            yield segment, call_argument, feed
++        yield from iter_line_segment_contexts(
++            tokens, cat_operands=_cat_operands, opens_call_arguments=_opens_call_arguments,
++            peel_reserved_words=_peel_reserved_words)
+ 
+ 
+ def _iter_positioned_command_segments(command: str) -> Iterator[tuple[list[str], bool]]:
+diff --git a/cron/lifecycle_guard_groups.py b/cron/lifecycle_guard_groups.py
+new file mode 100644
+index 0000000000..c8a8385bba
+--- /dev/null
++++ b/cron/lifecycle_guard_groups.py
+@@ -0,0 +1,195 @@
++"""Which files reach a command's stdin through shell grouping, for the lifecycle guard.
++
++A pipe into a compound command (``cat f | (…)``, ``| { …; }``, ``| if …; fi``, ``| while …;
++done``, ``| case … esac``) feeds every command in it, and a group writes on what each of its
++commands writes (``{ cat f.py; } | python3``) unless that output is piped elsewhere inside it.
++A process substitution (``python3 <(cat f.py)``, ``bash < <(cat f.sh)``) puts what it writes
++where the ``<(…)`` stands. Shell words come from the caller's tokenizer; this module only walks
++them, so it never imports ``cron.lifecycle_guard``.
++"""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass, field
++from typing import Callable, Iterator, Optional
++
++CONTROL_CHARS = frozenset(";&|()")
++_CONTROL_OPERATOR = re.compile(r"\|\||&&|\|&|;;|[;&|()]")
++# Compound commands a pipe feeds as a whole: the word that opens one -> the word that closes it.
++_LEADING_OPENERS = {"{": "}", "if": "fi", "while": "done", "until": "done"}
++# Openers the reserved-word peel stops at (they are commands' first words, not prefixes).
++_COMMAND_OPENERS = {"for": "done", "select": "done", "case": "esac"}
++_CLOSERS = frozenset({"}", "fi", "done", "esac"})
++# Stands where a `<(…)` that writes no known file was: NUL keeps it from ever naming a path.
++PROCESS_SUBSTITUTION = "\x00<(…)"
++
++Context = tuple[list[str], bool, list[str]]
++
++
++def split_glued_redirections(line: str) -> str:
++    """*line* with a space before each unquoted, unescaped ``<``/``>`` glued to a word that is
++    not a bare descriptor number (``python3 -<f.py`` is ``python3 - <f.py``; ``2>x`` stays). A
++    quoted ``<`` is text (``bash -c 'python3<f.py'`` keeps one word), and the operator's own
++    second character (``<<``, ``>>``, ``<>``) is never split off."""
++    out: list[str] = []
++    word = ""
++    in_single = in_double = escape = False
++    for ch in line:
++        if escape:
++            escape = False
++        elif ch == "\\" and not in_single:
++            escape = True
++        elif ch == "'" and not in_double:
++            in_single = not in_single
++        elif ch == '"' and not in_single:
++            in_double = not in_double
++        elif not in_single and not in_double:
++            if ch.isspace() or ch in CONTROL_CHARS:
++                out.append(ch)
++                word = ""
++                continue
++            if ch in "<>" and word and not word.isdigit() and word[-1] not in "<>":
++                out.append(" ")
++                word = ""
++        out.append(ch)
++        word += ch
++    return "".join(out)
++
++
++@dataclass
++class _Group:
++    closer: str
++    feed: list[str]
++    output: list[str] = field(default_factory=list)
++    # A process substitution suspends the command it stands in: (words, call_argument, subs).
++    outer: Optional[tuple[list[str], bool, list[tuple[int, list[str]]]]] = None
++
++
++def _opened_groups(segment: list[str], peel_reserved_words: Callable[[list[str]], int]) -> list[str]:
++    """Closers of the compound commands *segment* opens (``while { if`` opens three)."""
++    index = peel_reserved_words(segment)
++    closers = [_LEADING_OPENERS[word] for word in segment[:index] if word in _LEADING_OPENERS]
++    if index < len(segment) and segment[index] in _COMMAND_OPENERS:
++        closers.append(_COMMAND_OPENERS[segment[index]])
++    return closers
++
++
++def _substituted_variants(segment: list[str], subs: list[tuple[int, list[str]]]) -> list[list[str]]:
++    """One reading of *segment* per file a process substitution writes, each in its place (the
++    others left as ``PROCESS_SUBSTITUTION``); *segment* itself when none writes a file."""
++    variants = [segment[:position] + [name] + segment[position + 1:]
++                for position, files in subs for name in files]
++    return variants or [segment]
++
++
++class _LineWalk:
++    """State of one line's walk; ``contexts`` yields ``(segment, call_argument, piped_files)``."""
++
++    def __init__(self, cat_operands, opens_call_arguments, peel_reserved_words) -> None:
++        self.cat_operands = cat_operands
++        self.opens_call_arguments = opens_call_arguments
++        self.peel_reserved_words = peel_reserved_words
++        self.segment: list[str] = []
++        self.subs: list[tuple[int, list[str]]] = []
++        self.call_argument = False
++        self.feed: list[str] = []
++        # What the last finished command (or closed group) wrote, until an operator routes it:
++        # into the next command's stdin on `|`, else into the enclosing group's output.
++        self.pending: list[str] = []
++        self.closed: Optional[list[str]] = None
++        self.groups: list[_Group] = []
++
++    def flush(self) -> Iterator[Context]:
++        written: list[str] = []
++        for variant in _substituted_variants(self.segment, self.subs):
++            yield variant, self.call_argument, self.feed
++            written += self.cat_operands(variant)
++        self.pending = self.closed if self.closed is not None else written
++        self.closed = None
++        self.groups.extend(_Group(closer, self.feed)
++                           for closer in _opened_groups(self.segment, self.peel_reserved_words))
++        self.segment, self.subs = [], []
++
++    def route(self) -> None:
++        if self.groups:
++            self.groups[-1].output.extend(self.pending)
++        self.pending = []
++
++    def enclosing_feed(self) -> list[str]:
++        return self.groups[-1].feed if self.groups else []
++
++    def resume(self, group: _Group) -> None:
++        """Back in the command a closed ``<(…)`` stands in."""
++        if group.outer is None:
++            return
++        self.segment, self.call_argument, self.subs = group.outer
++        self.subs.append((len(self.segment), group.output))
++        self.segment.append(PROCESS_SUBSTITUTION)
++        self.feed = group.feed
++
++    def word(self, token: str) -> None:
++        if not self.segment and token in _CLOSERS and self.groups \
++                and self.groups[-1].closer == token:
++            self.route()
++            self.closed = self.groups.pop().output
++            self.feed = self.enclosing_feed()
++        self.segment.append(token)
++
++    def operator(self, operator: str) -> Iterator[Context]:
++        if operator == "(" and self.segment and self.segment[-1] == "<":
++            self.segment.pop()
++            self.groups.append(_Group(")", self.feed, outer=(
++                self.segment, self.call_argument, self.subs)))
++            self.segment, self.subs, self.call_argument = [], [], False
++            return
++        next_is_call = operator == "(" and bool(self.segment) \
++            and self.opens_call_arguments(self.segment)
++        if self.segment:
++            yield from self.flush()
++        if operator in ("|", "|&"):
++            self.feed, self.pending = self.pending, []
++        elif operator == "(":
++            self.groups.append(_Group(")", self.feed))
++        else:
++            self.route()
++            if operator == ")" and self.groups and self.groups[-1].closer == ")":
++                group = self.groups.pop()
++                if group.outer is not None:
++                    self.resume(group)
++                    return
++                self.pending = group.output
++            self.feed = self.enclosing_feed()
++        self.call_argument = next_is_call
++
++    def finish(self) -> Iterator[Context]:
++        while True:
++            if self.segment:
++                yield from self.flush()
++            # An unclosed `<(` still runs the command it stands in.
++            index = next((i for i in range(len(self.groups) - 1, -1, -1)
++                          if self.groups[i].outer is not None), None)
++            if index is None:
++                return
++            group = self.groups[index]
++            del self.groups[index:]
++            self.resume(group)
++
++
++def iter_line_segment_contexts(
++    tokens: list[str], *,
++    cat_operands: Callable[[Optional[list[str]]], list[str]],
++    opens_call_arguments: Callable[[list[str]], bool],
++    peel_reserved_words: Callable[[list[str]], int],
++) -> Iterator[Context]:
++    """``(segment, call_argument, piped_files)`` for one line's shell *tokens* (see
++    ``cron.lifecycle_guard._iter_segment_contexts``). *cat_operands* names the files a segment
++    writes to its stdout."""
++    walk = _LineWalk(cat_operands, opens_call_arguments, peel_reserved_words)
++    for token in tokens:
++        if token and set(token) <= CONTROL_CHARS:
++            for operator in _CONTROL_OPERATOR.findall(token):
++                yield from walk.operator(operator)
++        else:
++            walk.word(token)
++    yield from walk.finish()
+diff --git a/tests/cron/test_lifecycle_guard_compound_feeds.py b/tests/cron/test_lifecycle_guard_compound_feeds.py
+new file mode 100644
+index 0000000000..c7a739b0ca
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_compound_feeds.py
+@@ -0,0 +1,131 @@
++"""Stdin feeds through shell compound commands (PR #2316 review 5893771725).
++
++Each case below ran a lifecycle ``.py``/``.sh`` the guard never opened:
++
++1. A brace group's output piped on (``{ cat f.py; } | python3``): at the ``|`` the previous
++   segment is ``}``, which is no ``cat``. A group writes what each of its commands writes, unless
++   that command's output is itself piped elsewhere inside the group.
++2. An unquoted ``<`` glued to an argument (``python3 -<f.py``) redirects stdin. Quoted text
++   (``bash -c 'python3<f.py'``) is still one word, re-scanned whole as a payload.
++3. A pipe into ``if``/``while``/``until``/``for``/``case`` feeds every command in the body.
++4. Process substitution as the program file or stdin (``python3 <(cat f.py)``,
++   ``bash < <(cat f.sh)``).
++"""
++
++from __future__ import annotations
++
++import shlex
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++
++# Assembled so this file's own text never carries the literal command.
++LIFECYCLE = " ".join(["hermes", "gateway", "re" + "start"])
++
++
++@pytest.fixture
++def files(tmp_path) -> dict[str, str]:
++    sh = tmp_path / "restart.sh"
++    sh.write_text(f"#!/bin/sh\necho hi\n{LIFECYCLE}\n", encoding="utf-8")
++    py = tmp_path / "f.py"
++    py.write_text(f"import os\nos.system({LIFECYCLE!r})\n", encoding="utf-8")
++    clean = tmp_path / "clean.py"
++    clean.write_text("import sys\nprint(sys.stdin.read())\n", encoding="utf-8")
++    clean_sh = tmp_path / "clean.sh"
++    clean_sh.write_text("echo ok\n", encoding="utf-8")
++    return {name: shlex.quote(str(path)) for name, path in
++            {"sh": sh, "py": py, "clean": clean, "clean_sh": clean_sh}.items()}
++
++
++@pytest.mark.parametrize(
++    "template",
++    [
++        # 1. A group's output piped on.
++        "{{ cat {py}; }} | python3",
++        "{{ cat {py}; true; }} | python3",
++        "{{ true; cat {py}; }} | python3",
++        "(cat {py}; true) | python3",
++        "{{ {{ cat {py}; }}; }} | python3",
++        "{{ cat {sh}; }} | bash",
++        "if true; then cat {py}; fi | python3",
++        # 2. An unquoted `<` glued to an argument.
++        "python3 -<{py}",
++        "python3 -u<{py}",
++        "bash -s<{sh}",
++        "bash -<{sh}",
++        'python3 "-"<{py}',
++        # 3. A pipe into a compound command feeds its whole body.
++        "cat {py} | if true; then python3; fi",
++        "cat {py} | if false; then :; else python3; fi",
++        "cat {py} | if python3; then :; fi",
++        "cat {py} | while true; do python3; done",
++        "cat {py} | until false; do python3; done",
++        "cat {py} | for x in 1; do python3; done",
++        "cat {sh} | if true; then bash; fi",
++        "cat {py} | case x in *) python3;; esac",
++        "cat {py} | (if true; then python3; fi)",
++        "cat {py} | while true; do if true; then python3; fi; done",
++        # 4. Process substitution as the program file or stdin.
++        "python3 <(cat {py})",
++        "python3<(cat {py})",
++        "python3 -u <(cat {py})",
++        "python3 < <(cat {py})",
++        "bash <(cat {sh})",
++        "bash < <(cat {sh})",
++        "source <(cat {sh})",
++        "python3 <(cat {py}) <(cat {clean})",
++        "python3 <({{ cat {py}; }})",
++    ],
++)
++def test_compound_stdin_feeds_are_scanned(files, template):
++    assert scan_gateway_lifecycle(template.format(**files)) == (True, None)
++
++
++@pytest.mark.parametrize(
++    "template",
++    [
++        # A command whose output is piped elsewhere inside the group writes nothing out of it.
++        "{{ cat {py} | grep x; }} | python3",
++        "(cat {py} | grep x) | python3",
++        "{{ cat {py}; }}; python3",
++        "{{ cat {py}; }} > /dev/null; python3 {clean}",
++        # Quoted `<` is data; a fd number before `>` is part of the redirection.
++        "echo 'python3 -<{py}'",
++        'echo "a<{py}"',
++        "echo a\\<{py}",
++        "python3 {clean} 2>{py}",
++        "grep -c '<' {py}",
++        "bash -c 'cat<{sh}'",
++        # The pipe's feed ends with the compound command.
++        "cat {py} | if true; then :; fi; python3",
++        "cat {py} | while false; do :; done; python3 {clean}",
++        "cat {py} | if true; then python3 {clean}; fi",
++        "cat {sh} | case x in *) grep x;; esac; bash {clean_sh}",
++        # `fi`/`done` are words, not closers, outside command position.
++        "cat {py} | if true; then echo fi; python3 {clean}; fi",
++        # A process substitution that writes no file runs nothing the scan can open.
++        "python3 <(echo hi)",
++        "diff <(cat {py}) <(cat {clean})",
++        "python3 {clean} <(cat {py})",
++        "python3 <(cat {clean}) <(cat {py})",
++        "cat {py} | python3 <(echo hi)",
++    ],
++)
++def test_compound_mentions_and_data_stay_allowed(files, template):
++    assert scan_gateway_lifecycle(template.format(**files)) == (False, None)
++
++
++def test_split_glued_redirections_is_quote_aware():
++    from cron.lifecycle_guard_groups import split_glued_redirections as split
++
++    assert split("python3 -<f.py") == "python3 - <f.py"
++    assert split("python3<(cat f.py)") == "python3 <(cat f.py)"
++    assert split("cat a<b<c") == "cat a <b <c"
++    # Descriptor numbers and the operator's own second character stay glued.
++    assert split("x 2>err 0<in") == "x 2>err 0<in"
++    assert split("cat<<EOF a>>log b<>rw") == "cat <<EOF a >>log b <>rw"
++    # Quoted or escaped `<` is text.
++    assert split("bash -c 'python3<f.py'") == "bash -c 'python3<f.py'"
++    assert split('echo "a<b" a\\<b') == 'echo "a<b" a\\<b'
++    assert split("x 'q'<f") == "x 'q' <f"
+-- 
+2.43.0
+

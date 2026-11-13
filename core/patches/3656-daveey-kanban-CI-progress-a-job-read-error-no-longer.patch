@@ -1,0 +1,165 @@
+From 27028e5733fa6b6342ebb627a13be5974d9040bb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 15:57:05 +0000
+Subject: [PATCH] [daveey] kanban CI progress: a job-read error no longer ends
+ the pool scan before a later batch's match (#2321 review)
+
+With the runner lists unreadable, `_recent_job_on` scans every in-progress
+run's jobs (POOL_SCAN_READERS at a time), then recently completed runs, for a
+job a runner took on the queued run's labels. `batch()` raised its first
+job-read error when its own batch had no match, and the outer `except`
+returned "". So one 502 on one run's jobs in an early batch stopped the whole
+scan: a matching job in a later batch (or in the completed-runs list) was
+never read, and the card read `not_starting` -- the false runners-offline wake
+#2235/#2321 exist to prevent.
+
+Fix: a failed job read (or run-list read) is noted and the scan goes on
+through the remaining batches and the completed-runs list. The first match
+wins and is remembered as before. Only when nothing matched and some read
+failed is "" returned without caching it, so an unreadable scan is still not
+remembered. OverBudget/deadline handling is unchanged; an unexpected
+(non-I/O) exception still propagates.
+
+Proof: tests/hermes_cli/test_kanban_ci_progress.py
+- test_unreadable_job_list_in_an_earlier_batch_does_not_end_the_scan[match]:
+  10 runs, 502 on run 901 (batch 1), running job on LABELS in run 908
+  (batch 2) -> BUSY and remembered. RED before (not_starting).
+- ...[no-match]: same error, no match -> NOT_STARTING, run 908 still read,
+  not remembered. RED before (908 never read).
+- test_unreadable_job_list_does_not_skip_the_completed_runs: 502 on the only
+  in-progress run, match in a recent completed run -> BUSY. RED before.
+Full file: 73 passed. scripts/check --base origin/main: ok.
+
+Follow-up of review 5893630788 on #2321 (card t_01a1d580f60a9779).
+---
+ hermes_cli/kanban_ci_progress.py            | 46 ++++++++++++---------
+ tests/hermes_cli/test_kanban_ci_progress.py | 37 +++++++++++++++++
+ 2 files changed, 63 insertions(+), 20 deletions(-)
+
+diff --git a/hermes_cli/kanban_ci_progress.py b/hermes_cli/kanban_ci_progress.py
+index f543b98fbf..d99c50d6b5 100644
+--- a/hermes_cli/kanban_ci_progress.py
++++ b/hermes_cli/kanban_ci_progress.py
+@@ -328,24 +328,27 @@ def _recent_job_on(repo: str, labels: list[str], jobs: list, now: float, deadlin
+             raise OverBudget(f"sweep budget spent before {path.split('?', 1)[0]} was read")
+         return _gh_api(path) or {}
+ 
++    unreadable = (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired)
++    errors: list[BaseException] = []  # failed reads, so the scan goes on but an answer with one is not remembered
++
+     def batch(paths: list[str]) -> str:
+         """Jobs of several runs at once (each read is a broker vend plus a GitHub call, ~3 s): the first match in
+-        run order; when none matched, the first read's error is raised."""
++        run order. A failed read is noted in ``errors`` and the rest of the scan goes on, since a later batch
++        can still hold the pool's runner."""
+         if deadline is not None and time.monotonic() >= deadline:
+             raise OverBudget(f"sweep budget spent before {paths[0].split('?', 1)[0]} was read")
+         # Each read runs in a copy of this thread's context: a fresh pool thread would lose the bound home, and
+         # ``dispatcher_gh_argv`` would read the launch home's gh_command_prefix (another home's credential).
+         with ThreadPoolExecutor(max_workers=len(paths), thread_name_prefix="ci-pool-scan") as ex:
+             futures = [ex.submit(contextvars.copy_context().run, _gh_api, p) for p in paths]
+-        error: Optional[BaseException] = None
+         for fut in futures:
+             exc = fut.exception()
+             if exc is not None:
+-                error = error or exc
++                if not isinstance(exc, unreadable):
++                    raise exc
++                errors.append(exc)
+             elif hit := took((fut.result() or {}).get("jobs") or []):
+                 return hit
+-        if error is not None:
+-            raise error
+         return ""
+ 
+     found = took(jobs)
+@@ -357,23 +360,26 @@ def _recent_job_on(repo: str, labels: list[str], jobs: list, now: float, deadlin
+     if seen is not None and time.monotonic() - seen[0] < POOL_SCAN_TTL_SECONDS:
+         return seen[1]
+     lists = (("in_progress", 100, IN_PROGRESS_RUNS_MAX), ("completed", 10, RECENT_RUNS_MAX))
+-    try:
+-        for status, per_page, limit in lists:
++    for status, per_page, limit in lists:
++        if found:
++            break
++        try:
++            listed = read(f"repos/{repo}/actions/runs?status={status}&per_page={per_page}").get("workflow_runs")
++        except OverBudget:
++            raise
++        except unreadable as exc:
++            errors.append(exc)  # the other list may still show the pool alive
++            continue
++        runs = [r for r in listed or [] if isinstance(r, dict) and r.get("id") and str(r["id"]) != str(run_id)
++                and (status == "in_progress" or (_epoch(r.get("updated_at")) or 0) >= cutoff)][:limit]
++        paths = [f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100" for run in runs]
++        for i in range(0, len(paths), POOL_SCAN_READERS):
++            found = batch(paths[i:i + POOL_SCAN_READERS])
+             if found:
+                 break
+-            listed = read(f"repos/{repo}/actions/runs?status={status}&per_page={per_page}").get("workflow_runs")
+-            runs = [r for r in listed or [] if isinstance(r, dict) and r.get("id") and str(r["id"]) != str(run_id)
+-                    and (status == "in_progress" or (_epoch(r.get("updated_at")) or 0) >= cutoff)][:limit]
+-            paths = [f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100" for run in runs]
+-            for i in range(0, len(paths), POOL_SCAN_READERS):
+-                found = batch(paths[i:i + POOL_SCAN_READERS])
+-                if found:
+-                    break
+-    except OverBudget:
+-        raise
+-    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+-        logger.debug("ci run progress: recent runs of %s unreadable: %s", repo, exc)
+-        return found  # an unread list is no evidence either way: not remembered
++    if not found and errors:
++        logger.debug("ci run progress: recent runs of %s unreadable: %s", repo, errors[0])
++        return ""  # an unread list is no evidence either way: not remembered
+     _POOL_SCANS[key] = (time.monotonic(), found)
+     return found
+ 
+diff --git a/tests/hermes_cli/test_kanban_ci_progress.py b/tests/hermes_cli/test_kanban_ci_progress.py
+index abbac45975..97bee81a13 100644
+--- a/tests/hermes_cli/test_kanban_ci_progress.py
++++ b/tests/hermes_cli/test_kanban_ci_progress.py
+@@ -1268,3 +1268,40 @@ def test_one_unreadable_job_list_in_a_scan(kanban_home, monkeypatch, match, stat
+     p = kcp.ci_run_progress(RUN_URL, fetch=lambda *_: _QUEUED, fetch_runners=lambda _r: None)
+     assert p.state == state, p
+     assert bool(kcp._POOL_SCANS) is match
++
++
++@pytest.mark.parametrize("match,state", [(True, kcp.BUSY), (False, kcp.NOT_STARTING)], ids=["match", "no-match"])
++def test_unreadable_job_list_in_an_earlier_batch_does_not_end_the_scan(kanban_home, monkeypatch, match,
++                                                                        state) -> None:
++    """A 502 on one run's jobs in the first batch, with no match there, must not stop the scan before a later
++    batch's match is read (that read ``not_starting``, the false runners-offline wake); with no match anywhere the
++    scan is still not remembered."""
++    reads: list[int] = []
++
++    def jobs_for(run_id: int) -> list:
++        reads.append(run_id)
++        if run_id == 901:
++            raise RuntimeError("gh api exit 1: HTTP 502")
++        return [_taken(run_id=run_id, started_age=60, status="in_progress")] if match and run_id == 908 else []
++
++    _scan_api(monkeypatch, 10, jobs_for)
++    p = kcp.ci_run_progress(RUN_URL, fetch=lambda *_: _QUEUED, fetch_runners=lambda _r: None)
++    assert p.state == state, p
++    assert 908 in reads
++    assert bool(kcp._POOL_SCANS) is match
++
++
++def test_unreadable_job_list_does_not_skip_the_completed_runs(kanban_home, monkeypatch) -> None:
++    """An error reading an in-progress run's jobs still lets a recently completed run's job show the pool alive."""
++    def api(path: str) -> dict:
++        if "actions/runs?" in path:
++            if "status=completed" in path:
++                return {"workflow_runs": [{"id": 950, "status": "completed", "updated_at": _iso(60)}]}
++            return {"workflow_runs": [{"id": 901, "status": "in_progress"}]}
++        if "/runs/901/" in path:
++            raise RuntimeError("gh api exit 1: HTTP 502")
++        return {"jobs": [_taken(run_id=950, started_age=60, status="completed")]}
++
++    monkeypatch.setattr(kcp, "_gh_api", api)
++    p = kcp.ci_run_progress(RUN_URL, fetch=lambda *_: _QUEUED, fetch_runners=lambda _r: None)
++    assert p.state == kcp.BUSY and "took job 9500" in p.detail, p
+-- 
+2.43.0
+

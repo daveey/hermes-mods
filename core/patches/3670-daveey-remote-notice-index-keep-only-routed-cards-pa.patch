@@ -1,0 +1,202 @@
+From fadb71d0820bae0aa70b190bc9eea54695e1cef9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:11:35 -0800
+Subject: [PATCH] [daveey] remote notice index: keep only routed cards, page
+ cold payload reads
+
+On the mini the default gateway reached ~1.1 GB phys_footprint within 3 minutes of every start (t_01a1cf67a93c05b6).
+In-process tracemalloc against the live hub replica (17k task rows, 79 MB of JSON, 21 chats routed here):
+
+- remote_index_projection.snapshot kept every decoded task in module `_rows`, though `seqs()` reads only the seq
+  and the index only uses cards routed to a chat: 169 MB and 1.47M GC-tracked objects retained per process.
+- kanban_remote_notices._task_rows packed every payload into one json_group_array string (UCS-4 once any row
+  holds an emoji) before decoding it: a 448 MB peak for the index's cold read, 621 MB for the sweep's.
+
+Now a row keeps its card only when it routes to a chat, and `_task_rows` reads identities in one query (same
+planner order) and payloads in rowid pages of about 4 MB of text, inside one read snapshot (the caller's, else its
+own), so fetches stay bounded (test_replica_bounded_reads) without one string of every payload.
+
+Live hub.db, same probe: index retained 169 -> 6 MB, index cold peak 448 -> 144 MB, sweep cold peak 621 -> 153 MB.
+Test: tests/tui_gateway/test_remote_index_projection_memory.py (3 tests; 2,000 cards, 20 routed).
+---
+ .../test_remote_index_projection_memory.py    | 94 +++++++++++++++++++
+ tui_gateway/kanban_remote_notices.py          | 42 ++++++++-
+ tui_gateway/remote_index_projection.py        |  4 +-
+ 3 files changed, 134 insertions(+), 6 deletions(-)
+ create mode 100644 tests/tui_gateway/test_remote_index_projection_memory.py
+
+diff --git a/tests/tui_gateway/test_remote_index_projection_memory.py b/tests/tui_gateway/test_remote_index_projection_memory.py
+new file mode 100644
+index 0000000000..cf975c1701
+--- /dev/null
++++ b/tests/tui_gateway/test_remote_index_projection_memory.py
+@@ -0,0 +1,94 @@
++"""The notice index keeps only cards routed to a chat, and a cold read never holds every payload as one string.
++
++On the mini (17k replica rows, 79 MB of JSON, 21 routed chats) ``remote_index_projection._rows`` kept every
++decoded task: 169 MB and 1.5M GC-tracked objects retained per gateway, behind a 448 MB cold-read peak. [daveey]
++"""
++import gc
++import json
++import sqlite3
++import tracemalloc
++
++from tests.tui_gateway.test_kanban_remote_notices import CHAT, _card, _hub
++from tui_gateway import kanban_remote_notices as remote
++from tui_gateway import remote_index_projection
++
++CARDS = 2000
++LINKED = 20
++BODY = 10_000
++
++
++def _fleet(tmp_path):
++    cards = []
++    for i in range(CARDS):
++        card = _card(f"t_{i}", CHAT if i < LINKED else f"other_{i}", status="done", at=1_800_000_000.0)
++        if i >= LINKED:
++            card["task"]["sessions"][0]["gw"] = "elsewhere"  # not routed to this gateway's chats
++        card["task"]["body"] = f"{i:06d} " + "ü€ body text 🙂 " * (BODY // 16)  # non-ASCII: UCS-4 strings
++        cards.append(card)
++    path = _hub(tmp_path, cards)
++    with sqlite3.connect(path) as conn:
++        conn.execute("CREATE INDEX replica_poll_metadata ON replica(coll, gw, seq)")
++        text = conn.execute("SELECT total(octet_length(data)) FROM replica").fetchone()[0]
++    return path, text
++
++
++def _index(path):
++    with remote._lock:
++        return remote._index(path)
++
++
++def test_cold_index_retains_only_routed_cards_and_bounded_peak(tmp_path):
++    path, text = _fleet(tmp_path)
++    remote._reset_for_tests()
++    remote_index_projection.reset()
++    gc.collect()
++    tracemalloc.start()
++    try:
++        before = tracemalloc.get_traced_memory()[0]
++        me, index = _index(path)
++        gc.collect()
++        retained, peak = tracemalloc.get_traced_memory()
++    finally:
++        tracemalloc.stop()
++    assert me == "macbook"
++    assert sorted(card["key"] for card in index[("default", CHAT)]) == sorted(
++        f"default/default/t_{i}" for i in range(LINKED))
++    rows = remote_index_projection._rows
++    assert len(rows) == CARDS
++    assert sum(hit[2] is not None for hit in rows.values()) == LINKED
++    # main: retained ~2.6x and peak ~6x of the row text; here ~0.01x and ~1.6x.
++    assert retained - before < 0.1 * text, f"retained {(retained - before) / text:.2f}x of {text:.0f} bytes"
++    assert peak - before < 3.0 * text, f"peak {(peak - before) / text:.2f}x of {text:.0f} bytes"
++
++
++def test_warm_index_keeps_routed_cards_and_routes_a_newly_linked_one(tmp_path):
++    path, _ = _fleet(tmp_path)
++    remote._reset_for_tests()
++    remote_index_projection.reset()
++    assert len(_index(path)[1][("default", CHAT)]) == LINKED
++    with sqlite3.connect(path) as conn:
++        key = f"default/default/t_{CARDS - 1}"
++        task = json.loads(conn.execute("SELECT data FROM replica WHERE key=?", (key,)).fetchone()[0])
++        task["sessions"][0].update(gw="macbook", session=CHAT)
++        conn.execute("UPDATE replica SET data=?, seq=? WHERE key=?", (json.dumps(task), CARDS + 10, key))
++    cards = _index(path)[1][("default", CHAT)]
++    assert len(cards) == LINKED + 1
++    assert any(card["key"] == key and card["task"]["sessions"][0]["session"] == CHAT for card in cards)
++    assert sum(hit[2] is not None for hit in remote_index_projection._rows.values()) == LINKED + 1
++
++
++def test_task_rows_pages_payloads_in_one_snapshot_and_keeps_the_planner_order(tmp_path, monkeypatch):
++    path, text = _fleet(tmp_path)
++    monkeypatch.setattr(remote, "_ROW_PAGE_BYTES", 4 << 20)
++    with sqlite3.connect(path) as conn:
++        sql = "SELECT gw, key, seq, data FROM replica WHERE coll = 'tasks' AND gw != ?"
++        expected = conn.execute(sql, ("macbook",)).fetchall()
++        traced = []
++        conn.set_trace_callback(traced.append)
++        actual = remote._task_rows(conn, "macbook")
++        assert not conn.in_transaction  # the snapshot it opened is closed
++    assert actual == expected
++    pages = [q for q in traced if "max(rowid) FROM (SELECT rowid, data" in q]
++    per_page = (4 << 20) // (text / CARDS)  # ~180 rows of ~23 KB: about 4 MB of text per page
++    assert len(pages) == -(-CARDS // per_page)  # paged by size (no trailing empty page), not one string of all
++    assert traced[0].startswith("PRAGMA") and traced[1] == "BEGIN"
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 31b34d59f4..6d7b857a68 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -126,15 +126,47 @@ def _fresh_at(task: dict) -> Optional[float]:
+     return None
+ 
+ 
++# Payload pages of ``_task_rows``: at most ``_ROW_PAGE_MAX`` rows and about ``_ROW_PAGE_BYTES`` of row text at the
++# replica's mean row size. One ``json_group_array`` over every payload was a 256 MB string (UCS-4 once any row holds
++# an emoji) plus its decode: a ~450 MB peak per cold read on the mini's 17k-row replica. [daveey]
++_ROW_PAGE_MAX = 4000
++_ROW_PAGE_BYTES = 4 << 20
++
++
+ def _task_rows(conn: sqlite3.Connection, me: Optional[str] = None) -> list[tuple]:
+-    """``(gw, key, seq, data)`` task rows of the replica, other gateways only when ``me`` is given."""
++    """``(gw, key, seq, data)`` task rows of the replica, other gateways only when ``me`` is given.
++
++    Identities come from one query in the planner's order (as before); payloads from rowid pages, all in one read
++    snapshot (the caller's transaction, else one opened here), so neither crosses the SQLite/Python boundary per
++    task (GIL reacquisition) nor builds one string of every payload. [daveey]"""
+     cols = {row[1] for row in conn.execute("PRAGMA table_info(replica)")}
+     seq = "seq" if "seq" in cols else "0"
+     # Keep data as text: json(data) would let one malformed task poison the entire read.
+-    # A single result avoids one GIL reacquisition per task in sqlite3_step.
+-    sql = f"SELECT json_group_array(json_array(gw, key, {seq}, data)) FROM replica WHERE coll = 'tasks'"
+-    row = conn.execute(sql + " AND gw != ?", (me,)).fetchone() if me else conn.execute(sql).fetchone()
+-    return [tuple(values) for values in json.loads(row[0])]
++    where, args = ("coll = 'tasks' AND gw != ?", (me,)) if me else ("coll = 'tasks'", ())
++    own = not conn.in_transaction
++    if own:
++        conn.execute("BEGIN")
++    try:
++        packed, count, octets = conn.execute(
++            f"SELECT json_group_array(json_array(rowid, gw, key, {seq})), count(*), total(octet_length(data)) "
++            f"FROM replica WHERE {where}", args).fetchone()
++        ids = json.loads(packed)
++        size = max(50, min(_ROW_PAGE_MAX, int(_ROW_PAGE_BYTES // max(float(octets or 0) / max(count, 1), 1.0))))
++        data: dict = {}
++        after = -1 << 63
++        while len(data) < count:
++            page, last = conn.execute(
++                "SELECT json_group_array(json_array(rowid, data)), max(rowid) FROM (SELECT rowid, data FROM replica"
++                f" WHERE {where} AND rowid > ? ORDER BY rowid LIMIT ?)", (*args, after, size)).fetchone()
++            if last is None:
++                break
++            data.update(json.loads(page))
++            del page
++            after = last
++    finally:
++        if own:
++            conn.rollback()
++    return [(gw, key, s, data.get(rowid)) for rowid, gw, key, s in ids]
+ 
+ 
+ def _canonical(rows: list[tuple]) -> list[tuple]:
+diff --git a/tui_gateway/remote_index_projection.py b/tui_gateway/remote_index_projection.py
+index 56c0cb6d8f..1c37b8e45e 100644
+--- a/tui_gateway/remote_index_projection.py
++++ b/tui_gateway/remote_index_projection.py
+@@ -75,7 +75,9 @@ def snapshot(conn, identity, me):
+             if (isinstance(task, dict) and task.get("id")
+                     and (task.get("status") in remote._TERMINAL or remote._withdrawal(task) is not None)):
+                 chats = remote._linked_chats(task, me)
+-            hit = (seq, chats, {"gw": str(owner), "key": str(key), "task": task})
++            # Only a row routed to a chat keeps its card: the rest (all but a few dozen of ~17k on the mini) kept
++            # every decoded task here, ~155 MB and 1.5M GC-tracked objects per gateway. [daveey]
++            hit = (seq, chats or (), {"gw": str(owner), "key": str(key), "task": task} if chats else None)
+         updated[(owner, key)] = hit
+         for chat in hit[1]:
+             index.setdefault(chat, []).append(hit[2])
+-- 
+2.43.0
+

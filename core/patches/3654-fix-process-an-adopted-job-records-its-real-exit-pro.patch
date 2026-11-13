@@ -1,0 +1,685 @@
+From 9a1d8aa193c3912ac72eccd22fcbd2c6c50833e9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 15:54:25 +0000
+Subject: [PATCH] fix(process): an adopted job records its real exit;
+ process_manage reaches a job another process adopted
+
+## Problem
+On hermes-hub (owner chat 20261111_200009_edbe39), proc_1372c59c5218 was started
+persist_on_release and ran `chmod +x w.sh && exec w.sh`. hermes-gateway restarted at 14:24:44Z
+(a core deploy) and the job was re-adopted at 14:28:09Z. Then:
+- process_manage poll at 14:38:52Z and kill at 14:39:38Z, both from the owner chat, returned
+  `not_found` while `ps` showed pid 414173 alive.
+- The job printed its last line and ran `exit 0`. It settled at 14:47:16Z as `lost`, exit -1,
+  `backend_lost`, and the chat was told "the process backend disappeared".
+- proc_9e65b24c4777 used the same `exec` pattern and exited before any restart. It was reported as
+  exit 0.
+
+## Whys
+
+Branch A (wrong status)
+1. The log-backed adopter found no recorded exit status, and
+   `process_registry_output_log._finish_from_log` maps None to lost / -1 / backend_lost.
+2. `record_exit_command` put `trap '... $?' EXIT` into the same shell that ran the user command.
+   `exec` replaced that shell, so the trap never ran. Verified with a probe: `exec sh -c 'exit 3'`
+   gave rc 3 and no exit file. A user `trap ... EXIT` overwrites the recorder the same way. A
+   SIGTERM to the job ran the trap with `$?` = 0, which is a false success.
+3. Without a restart, the spawner's Popen supplies the code, so the gap appears only after
+   adoption. The hub restarts on every core deploy (14:24:44Z, 14:57:19Z and 15:04:11Z on 13 Nov).
+
+Branch B (not_found for a live job)
+1. The chat's process_manage ran in the gateway: the journal shows
+   `hermes[434368] agent.tool_executor ... not_found`. It consults only that interpreter's
+   in-memory registry.
+2. The gateway did not adopt the job. Its own recovery, at 14:25:00Z, logged
+   "Recovered 2 background process(es) from previous run" for pids 2575386 and 3952556. The
+   14:28:09Z "Re-adopted 2 orphaned background process(es) after restart" line for pid 414173 is
+   `recover_tui_orphaned_processes`. That function runs only in the Desktop-owned backend
+   (`hermes_cli/web_server_app.py`), because a bare-chat-id checkpoint key routes to that owner. The
+   notice was then "delivered: Desktop notice turn started".
+3. On the hub, the gateway hosts the Desktop chats' turns. The owner of the job (the Desktop
+   backend) and the process serving the owner chat's tools (the gateway) are therefore two
+   processes. Nothing looked past the local registry. The live entry, with `writer_pid` set to the
+   adopter, was in the shared processes.json the whole time.
+
+## Roots
+- Root (happened), A: the exit recorder lived inside the user's own shell, where the command
+  could remove it or corrupt it. The unrecorded case was then labelled "backend disappeared".
+- Root (happened), B: process_manage assumed the interpreter serving a chat supervises that chat's
+  jobs. Restart re-adoption breaks that assumption whenever the chat is hosted by a different
+  process from the one its key routes to.
+- Root (not caught): no test spawned a job from a real interpreter that then exited and settled it
+  through adoption, and none called process_manage from a process other than the adopter. This is
+  the third restart-adoption gap in two weeks: t_01a18c8a6410cffe (watcher dropped on restart) and
+  t_01a1a060400f7450 (persist_on_release died on restart).
+
+## Countermeasures (with proof)
+1. `record_exit_command` runs the command in a `( ... )` child of a recording shell. That shell
+   writes the child's `$?` and exits with it. `exec`, a user EXIT trap and heredocs are all now
+   confined to the child. A shell killed by a signal records nothing, which is not a false 0.
+2. An adopted job with no recorded status settles as `unknown` / `exit_not_recorded` ("exited
+   (status unknown ...)"), not lost. Such a session is no longer pruned from its own chat's poll as
+   an uncollected detach.
+3. New `tools/process_registry_foreign.py`: when the local registry says not_found, poll, log, wait
+   and kill are served from the shared checkpoint entry. This applies only to a host-PID job that a
+   different live Hermes process supervises (`writer_pid` alive, not ours), that is
+   sandbox-visible, and whose owner is the calling chat (the same compression-lineage rule as
+   retained results). It never takes the job over: the supervisor keeps reading the log, records
+   the exit and sends the one notice. kill signals the start-time-verified tree and stops its scope.
+   wait returns the supervisor's settled result once it lands.
+4. New `tests/tools/test_process_restart_adoption_matrix.py` (12 cases). Each one spawns from a real
+   interpreter that exits, then:
+   - checks exec / plain / heredoc / own-EXIT-trap commands, each exiting during adoption and before
+     adoption;
+   - checks SIGTERM on plain and exec jobs, giving status unknown, never lost or 0;
+   - checks that the owner chat's poll / prefix / log / wait / kill reach a job held by a second
+     live adopter interpreter, another chat gets not_found, and the adopter still delivers exactly
+     one completion.
+   On origin/main: 8 failed / 4 passed. The passes are the plain and heredoc controls, which the old
+   trap already handled. With this change: 12 passed (3 runs). The 76 related process-registry
+   suites pass: 1381 passed, 4 skipped.
+
+`_list_processes` moved to `tools/process_registry_listing.py` to keep process_registry.py within
+its size budget.
+---
+ .../test_process_restart_adoption_matrix.py   | 259 ++++++++++++++++++
+ tools/process_registry.py                     |  22 +-
+ tools/process_registry_foreign.py             | 206 ++++++++++++++
+ tools/process_registry_listing.py             |  18 ++
+ tools/process_registry_output_log.py          |  19 +-
+ 5 files changed, 506 insertions(+), 18 deletions(-)
+ create mode 100644 tests/tools/test_process_restart_adoption_matrix.py
+ create mode 100644 tools/process_registry_foreign.py
+ create mode 100644 tools/process_registry_listing.py
+
+diff --git a/tests/tools/test_process_restart_adoption_matrix.py b/tests/tools/test_process_restart_adoption_matrix.py
+new file mode 100644
+index 0000000000..261739af1c
+--- /dev/null
++++ b/tests/tools/test_process_restart_adoption_matrix.py
+@@ -0,0 +1,259 @@
++"""Restart-adoption matrix for persisted background jobs. [daveey]
++
++A ``persist_on_release`` job outlives the interpreter that spawned it (a gateway or Desktop backend
++restarted by every core deploy). Every case below uses a REAL spawner interpreter that exits right
++after the spawn, so the job is settled through adoption only (no Popen): what the adopter reads is
++exactly what the job's recording shell left behind.
++
++A. Exit status: whatever the command does to its own shell (``exec``, its own EXIT trap, a heredoc),
++   the adopter reports the command's real exit code; a job killed by a signal is reported as
++   "status unknown", never as lost (-1, "the process backend disappeared") and never as a false 0.
++B. Reachability: the owning chat's ``process_manage`` poll/log/wait/kill find the live job while a
++   DIFFERENT live Hermes process supervises it (on the hub the gateway hosts the chat while the
++   Desktop-owned backend re-adopts its jobs: proc_1372c59c5218 answered not_found while alive).
++"""
++import json
++import os
++from pathlib import Path
++import shlex
++import signal
++import subprocess
++import sys
++import threading
++import time
++
++import pytest
++
++from tools.process_registry import ProcessRegistry, _handle_process
++from tools.process_registry_notifications import format_process_notification
++from tests.tools import test_process_orphan_readopt_tui as helpers
++
++TUI_KEY = helpers.TUI_KEY
++checkpoint = helpers.checkpoint
++ROOT = Path(__file__).resolve().parents[2]
++
++pytestmark = [
++    pytest.mark.skipif(os.name != "posix", reason="the persisted exit recorder is POSIX-only"),
++    # The orphaned job is reparented away from the test's subtree (its spawner exited, as after a
++    # restart); signalling it is the point of these tests and it never leaves this test's own job.
++    pytest.mark.live_system_guard_bypass,
++]
++
++_SPAWNER = '''
++import json, os, sys
++from pathlib import Path
++os.environ["HERMES_SESSION_ID"] = sys.argv[4]
++import tools.process_registry as pr
++from tools import process_registry_output_log as logs
++pr.CHECKPOINT_PATH = Path(sys.argv[1])
++logs.output_dir = lambda: Path(sys.argv[2])
++registry = pr.ProcessRegistry()
++session = registry.spawn_local(sys.argv[3], cwd=sys.argv[2], session_key=sys.argv[4],
++                              owner_task_id=sys.argv[4], persist_on_release=True)
++session.notify_on_complete = True
++registry._write_checkpoint()
++print(json.dumps(dict(id=session.id, pid=session.pid, log=session.output_log)), flush=True)
++os._exit(0)
++'''
++
++# A second live Hermes process that re-adopts the orphan and keeps supervising it until told to stop.
++_ADOPTER = '''
++import json, sys
++from pathlib import Path
++import tools.process_registry as pr
++from tools import process_registry_output_log as logs
++pr.CHECKPOINT_PATH = Path(sys.argv[1])
++logs.output_dir = lambda: Path(sys.argv[2])
++registry = pr.ProcessRegistry()
++events = []
++registry.on_unknown_exit = events.append
++print(json.dumps({"adopted": registry.recover_from_checkpoint(owner="tui")}), flush=True)
++sys.stdin.readline()
++session = registry.get(sys.argv[3])
++done = session is not None and session._completion_event.wait(20)
++print(json.dumps({"done": bool(done), "events": [
++    {k: e.get(k) for k in ("session_id", "exit_code", "completion_reason")} for e in events]}), flush=True)
++'''
++
++
++def _gated(gate: Path, body: str) -> str:
++    """Wait (bounded) for *gate*, then run *body*: the job is still running when the adopter attaches."""
++    return (f'printf "started\\n"; n=0; while [ ! -f {shlex.quote(str(gate))} ]; do '
++            'n=$((n+1)); [ "$n" -lt 1500 ] || exit 124; sleep 0.02; done\n' + body)
++
++
++def _spawn_orphan(checkpoint_path: Path, tmp_path: Path, command: str) -> dict:
++    from tools.environments.local import build_subprocess_env
++    producer = subprocess.run(
++        [sys.executable, "-c", _SPAWNER, str(checkpoint_path), str(tmp_path), command, TUI_KEY],
++        cwd=str(ROOT), env=build_subprocess_env(), capture_output=True, text=True, encoding="utf-8",
++        timeout=20, check=True)
++    job = json.loads(producer.stdout.strip().splitlines()[-1])
++    job["entry"] = json.loads(checkpoint_path.read_text())[0]
++    return job
++
++
++def _wait_gone(registry: ProcessRegistry, job: dict, seconds: float = 10.0) -> None:
++    deadline = time.monotonic() + seconds
++    while registry._detached_host_fate(job["pid"], job["entry"]["host_start_time"]) == "running":
++        assert time.monotonic() < deadline, "job never exited"
++        threading.Event().wait(0.02)
++
++
++def _reap(registry: ProcessRegistry, job: dict) -> None:
++    if registry._detached_host_fate(job["pid"], job["entry"]["host_start_time"]) == "running":
++        os.killpg(job["pid"], signal.SIGKILL)
++
++
++# ----- A. exit status after adoption -----
++
++_CASES = {
++    # The hub's watcher did ``chmod +x w.sh && exec w.sh``: the exec replaced the shell that held the
++    # recorder, so its exit 0 settled as lost (-1).
++    "exec": ("exec sh -c 'exit 3'", 3),
++    "plain": ("printf 'plain\\n'; exit 4", 4),
++    "heredoc": ("sh <<'EOF'\nprintf 'heredoc\\n'\nexit 5\nEOF", 5),
++    # A command's own EXIT trap replaced the recorder's.
++    "own_exit_trap": ("trap 'echo bye' EXIT; exit 6", 6),
++}
++
++
++@pytest.mark.parametrize("exit_while_down", [False, True])
++@pytest.mark.parametrize("case", sorted(_CASES))
++def test_adopted_job_reports_its_real_exit_code(checkpoint, tmp_path, monkeypatch, case, exit_while_down):
++    body, expected = _CASES[case]
++    gate = tmp_path / "release"
++    monkeypatch.setattr("tools.process_registry_output_log.output_dir", lambda: tmp_path)
++    job = _spawn_orphan(checkpoint, tmp_path, _gated(gate, body))
++    registry = ProcessRegistry()
++    delivered = []
++    registry.on_unknown_exit = delivered.append
++    session = None
++    try:
++        assert not registry._writer_alive(job["entry"]), "the spawner must really be gone"
++        if exit_while_down:
++            gate.touch()
++            _wait_gone(registry, job)
++        assert registry.recover_from_checkpoint(owner="tui") == 1
++        session = registry.get(job["id"])
++        gate.touch()
++        assert session._completion_event.wait(10)
++        assert (session.exit_code, session.completion_reason) == (expected, "exited")
++        assert [(e["exit_code"], e["completion_reason"]) for e in delivered] == [(expected, "exited")]
++    finally:
++        gate.touch()
++        if session and session._reader_thread:
++            session._reader_thread.join(5)
++        _reap(registry, job)
++
++
++@pytest.mark.parametrize("body", ["sleep 30", "exec sleep 30"])
++def test_signalled_job_reports_status_unknown_not_lost_or_zero(checkpoint, tmp_path, monkeypatch, body):
++    """A SIGTERM to the job records no status: the notice says unknown. Before, the shared-shell EXIT
++    trap wrote ``$?`` = 0 for a plain command (false success) and nothing for an exec (lost, -1)."""
++    gate = tmp_path / "release"
++    gate.touch()
++    monkeypatch.setattr("tools.process_registry_output_log.output_dir", lambda: tmp_path)
++    job = _spawn_orphan(checkpoint, tmp_path, _gated(gate, body))
++    registry = ProcessRegistry()
++    delivered = []
++    registry.on_unknown_exit = delivered.append
++    session = None
++    try:
++        assert registry.recover_from_checkpoint(owner="tui") == 1
++        session = registry.get(job["id"])
++        # Signal only once the command runs: the ``bash -lic`` launcher is interactive and ignores SIGTERM.
++        deadline = time.monotonic() + 10
++        while "started" not in Path(job["log"]).read_text():
++            assert time.monotonic() < deadline, "job never started"
++            threading.Event().wait(0.02)
++        os.killpg(job["pid"], signal.SIGTERM)
++        assert session._completion_event.wait(10)
++        assert session.exit_code is None and session.completion_reason == "unknown"
++        assert len(delivered) == 1
++        text = format_process_notification(delivered[0])
++        assert "status unknown" in text
++        assert "backend disappeared" not in text and "exit code 0" not in text
++        # The settled job stays visible to its own chat's poll (not pruned as an uncollected detach).
++        monkeypatch.setenv("HERMES_SESSION_ID", TUI_KEY)
++        assert registry.poll(job["id"])["status"] == "exited"
++    finally:
++        if session and session._reader_thread:
++            session._reader_thread.join(5)
++        _reap(registry, job)
++
++
++# ----- B. the owner chat reaches a job another live process supervises -----
++
++@pytest.fixture()
++def adopted_elsewhere(checkpoint, tmp_path, monkeypatch):
++    """An orphan re-adopted by a separate live interpreter; yields (job, adopter, gate, registry)."""
++    from tools.environments.local import build_subprocess_env
++    import tools.process_registry as pr
++    gate = tmp_path / "release"
++    monkeypatch.setattr("tools.process_registry_output_log.output_dir", lambda: tmp_path)
++    job = _spawn_orphan(checkpoint, tmp_path, _gated(gate, "printf 'finishing\\n'; exit 7"))
++    adopter = subprocess.Popen(
++        [sys.executable, "-c", _ADOPTER, str(checkpoint), str(tmp_path), job["id"]],
++        cwd=str(ROOT), env=build_subprocess_env(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++        text=True, encoding="utf-8")
++    # This test process plays the host serving the owner chat (the hub gateway): a fresh registry
++    # that never adopted the job.
++    registry = ProcessRegistry()
++    monkeypatch.setattr(pr, "process_registry", registry)
++    monkeypatch.setenv("HERMES_SESSION_ID", TUI_KEY)
++    try:
++        assert json.loads(adopter.stdout.readline()) == {"adopted": 1}
++        entry = next(e for e in json.loads(checkpoint.read_text()) if e["session_id"] == job["id"])
++        assert entry["writer_pid"] == adopter.pid
++        yield job, adopter, gate, registry
++    finally:
++        gate.touch()
++        _reap(registry, job)
++        if adopter.poll() is None:
++            adopter.kill()
++        adopter.wait(10)
++
++
++def _call(action: str, session_id: str, **args) -> dict:
++    return json.loads(_handle_process({"action": action, "session_id": session_id, **args}))
++
++
++def _adopter_report(adopter) -> dict:
++    out, _ = adopter.communicate("\n", timeout=30)
++    return json.loads(out.strip().splitlines()[-1])
++
++
++def test_owner_chat_polls_logs_and_waits_on_a_job_another_process_adopted(adopted_elsewhere, monkeypatch):
++    job, adopter, gate, _registry = adopted_elsewhere
++    deadline = time.monotonic() + 10
++    while "started" not in (polled := _call("poll", job["id"])).get("output_preview", ""):
++        assert time.monotonic() < deadline, polled
++        threading.Event().wait(0.05)
++    assert polled["status"] == "running"
++    assert polled["supervised_by_pid"] == adopter.pid
++    assert _call("poll", job["id"][:9])["status"] == "running"  # a unique prefix resolves too
++    assert "started" in _call("log", job["id"])["output"]
++    waited = _call("wait", job["id"], timeout=1)
++    assert waited["status"] == "timeout" and waited["process_running"] is True
++    # Another chat sees nothing: the fallback serves the owning chat only.
++    monkeypatch.setenv("HERMES_SESSION_ID", "20261113_000000_other")
++    assert _call("poll", job["id"])["status"] == "not_found"
++    monkeypatch.setenv("HERMES_SESSION_ID", TUI_KEY)
++    gate.touch()
++    waited = _call("wait", job["id"], timeout=20)
++    assert waited["status"] == "exited" and waited["exit_code"] == 7, waited
++    report = _adopter_report(adopter)
++    # The supervisor still sends the one completion notice; the owner chat's calls took nothing over.
++    assert report["done"] and report["events"] == [
++        {"session_id": job["id"], "exit_code": 7, "completion_reason": "exited"}]
++
++
++def test_owner_chat_kills_a_job_another_process_adopted(adopted_elsewhere):
++    job, adopter, _gate, registry = adopted_elsewhere
++    killed = _call("kill", job["id"])
++    assert killed["status"] == "killed", killed
++    assert registry._detached_host_fate(job["pid"], job["entry"]["host_start_time"]) != "running"
++    report = _adopter_report(adopter)
++    assert report["done"] and len(report["events"]) == 1
++    assert report["events"][0]["completion_reason"] == "unknown"
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index f3999194e2..e7da07369c 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -1061,10 +1061,11 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+ 
+     def _uncollected_gone(self, session: Optional[ProcessSession]) -> bool:
+         """True when a detached entry was closed without a collected exit status
+-        and the PID is no longer alive. List/poll must not report that as exited."""
++        and the PID is no longer alive. List/poll must not report that as exited. A log-backed
++        adoption's reader settles its own exit (status unknown included), so it stays visible."""
+         return bool(
+             session is not None and session.exited and session.exit_code is None
+-            and session.detached and session.pid_scope == "host"
++            and session.detached and session.pid_scope == "host" and not session.output_log
+             and not self._is_host_pid_alive(session.pid))
+ 
+     @staticmethod
+@@ -2605,17 +2606,8 @@ def _redact_process_result(result: dict) -> dict:
+ 
+ 
+ def _list_processes(task_id) -> dict:
+-    # Also surface session-scoped background processes (e.g. a forgotten preview
+-    # server): they share the gateway session_key and can block session reset.
+-    session_key = ""
+-    with suppress(Exception):
+-        # See #29177.
+-        from tools.approval_context import get_current_session_key
+-        session_key = get_current_session_key(default="") or ""
+-    return {"processes": [
+-        _redact_process_result(p)
+-        for p in process_registry.list_sessions(
+-            task_id=task_id, session_key=session_key or None, include_retained=True)]}
++    from tools.process_registry_listing import list_processes
++    return list_processes(task_id)
+ 
+ 
+ # action -> (handler(session_id, args) -> dict, redact output?). Output-bearing
+@@ -2648,6 +2640,10 @@ def _handle_process(args, **kw):
+         handler, redact = _SESSION_ACTIONS[action]
+         from tools.process_registry_wait_policy import apply_wait_poll_policy, with_masked_success_hint
+         result = with_masked_success_hint(apply_wait_poll_policy(action, session_id, handler(session_id, args)))
++        if result.get("status") == "not_found":
++            # A live job another Hermes process re-adopted after a restart (process_registry_foreign).
++            from tools.process_registry_foreign import foreign_action
++            result = foreign_action(process_registry, action, session_id, args) or result
+         return json.dumps(_redact_process_result(result) if redact else result, ensure_ascii=False)
+     return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close, handoff")
+ 
+diff --git a/tools/process_registry_foreign.py b/tools/process_registry_foreign.py
+new file mode 100644
+index 0000000000..39e912892d
+--- /dev/null
++++ b/tools/process_registry_foreign.py
+@@ -0,0 +1,206 @@
++"""process_manage for a job another live Hermes process on this host supervises. [daveey]
++
++Re-adoption after a restart is routed by the checkpoint entry's session-key shape: a bare chat id
++goes to the Desktop-owned backend (``process_registry_readopt``). On a host whose gateway hosts the
++Desktop chats (hermes-hub), the chat's turns run in the gateway while a separate Desktop-owned backend
++re-adopts the chat's job, so the chat's ``poll``/``wait``/``kill`` looked only in the gateway's
++registry and got ``not_found`` for a live job (proc_1372c59c5218, 2026-11-13). The live entry is in
++the host's shared ``processes.json`` either way: this serves those actions from it, for the owning
++chat only, without taking the job over. The supervising process keeps reading the job's log and
++still records the exit and sends the one completion notice.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import threading
++import time
++from pathlib import Path
++from typing import Any, Optional
++
++# Process-manage actions a foreign-supervised job answers; stdin needs the supervisor's pipe.
++FOREIGN_ACTIONS = frozenset({"poll", "log", "wait", "kill"})
++_WAIT_STEP_SECONDS = 1.0
++# How long a wait keeps reading after the PID went for the supervisor's receipt to land.
++_SETTLE_GRACE_SECONDS = 10.0
++
++
++def _caller_owns(entry: dict[str, Any]) -> bool:
++    """The calling chat owns *entry* (same rule, compression lineage included, as retained results)."""
++    from gateway.session_context import get_session_env
++    from tools.process_registry_results import _owns_result
++    owner = get_session_env("HERMES_SESSION_ID", "")
++    try:
++        return bool(owner) and _owns_result(owner, entry.get("parent_session_id"))
++    except Exception:  # health: allow BLE001 -- an unreadable lineage (state.db) never grants access
++        return False
++
++
++def foreign_entry(registry, session_id: str) -> Optional[dict[str, Any]]:
++    """The live checkpoint entry for *session_id* (exact id, or a unique ``proc_`` prefix) that
++    another live Hermes process supervises and the calling chat owns; None otherwise."""
++    from tools.environments.sandbox_scope import sandbox_visible
++    from tools.process_registry import _checkpoint_path
++    query = str(session_id or "").strip()
++    if not query:
++        return None
++    try:
++        entries = json.loads(_checkpoint_path().read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        return None
++    if not isinstance(entries, list):
++        return None
++    entries = [e for e in entries if isinstance(e, dict) and isinstance(e.get("session_id"), str)]
++    exact = [e for e in entries if e["session_id"] == query]
++    if not exact:
++        prefix = query if query.startswith("proc_") else f"proc_{query}"
++        if len(prefix) - len("proc_") < registry._MIN_PREFIX_CHARS:
++            return None
++        exact = [e for e in entries if e["session_id"].startswith(prefix)]
++    if len(exact) != 1:
++        return None
++    entry = exact[0]
++    pid = entry.get("pid")
++    if (not isinstance(pid, int) or pid <= 0 or entry.get("pid_scope", "host") != "host"
++            or not sandbox_visible(entry.get("sandbox_key", ""))):
++        return None
++    # Ours to answer only while another live process supervises it: an orphan is recovery's job.
++    if entry.get("writer_pid") == os.getpid() or not registry._writer_alive(entry):
++        return None
++    if not _caller_owns(entry):
++        return None
++    return entry
++
++
++def _log_text(entry: dict[str, Any]) -> str:
++    from tools.ansi_strip import strip_ansi
++    from tools.process_registry_output_log import adoptable_log
++    log = adoptable_log(entry.get("output_log"))
++    if not log:
++        return ""
++    try:
++        return strip_ansi(Path(log).read_bytes().decode("utf-8", errors="replace"))
++    except OSError:
++        return ""
++
++
++def _head(registry, entry: dict[str, Any], running: bool) -> dict[str, Any]:
++    writer = entry.get("writer_pid")
++    return {
++        "session_id": entry["session_id"], "command": entry.get("command", ""),
++        "status": "running" if running else "exited", "pid": entry.get("pid"),
++        "supervised_by_pid": writer,
++        "note": (f"Supervised by another Hermes process on this host (pid {writer}) since a restart; "
++                 "it records the exit and sends the completion notice. poll/log/wait/kill work from here."),
++    }
++
++
++def _running(registry, entry: dict[str, Any]) -> bool:
++    return registry._detached_host_fate(entry.get("pid"), entry.get("host_start_time")) == "running"
++
++
++def _exit_fields(entry: dict[str, Any]) -> dict[str, Any]:
++    from tools.process_registry_output_log import adoptable_log, recorded_exit_code
++    log = adoptable_log(entry.get("output_log"))
++    code = recorded_exit_code(log) if log else None
++    if code is None:
++        return {"exit_code": None, "completion_reason": "unknown",
++                "exit_note": "exited; exit status not recorded yet (the supervising process settles it)"}
++    return {"exit_code": code, "completion_reason": "exited"}
++
++
++def _settled(registry, session_id: str) -> Optional[dict[str, Any]]:
++    """The supervisor's recorded result, read through this registry (disk receipt), if it landed."""
++    from tools.process_registry_results import load_completed_results
++    if session_id not in load_completed_results(session_id):
++        return None
++    return registry.wait(session_id, timeout=1)
++
++
++def foreign_poll(registry, entry: dict[str, Any]) -> dict[str, Any]:
++    running = _running(registry, entry)
++    if not running and (settled := _settled(registry, entry["session_id"])) is not None:
++        return settled
++    result = {**_head(registry, entry, running), "output_preview": _log_text(entry)[-1000:]}
++    if isinstance(entry.get("started_at"), (int, float)):
++        result["uptime_seconds"] = int(time.time() - entry["started_at"])
++    if not running:
++        result.update(_exit_fields(entry))
++    return result
++
++
++def foreign_log(registry, entry: dict[str, Any], offset: Optional[int], limit: int) -> dict[str, Any]:
++    lines = _log_text(entry).splitlines()
++    selected = lines[-limit:] if offset is None and limit > 0 else lines[(offset or 0):(offset or 0) + limit]
++    running = _running(registry, entry)
++    return {**_head(registry, entry, running), **({} if running else _exit_fields(entry)),
++            "output": "\n".join(selected), "total_lines": len(lines), "showing": f"{len(selected)} lines"}
++
++
++def foreign_wait(registry, entry: dict[str, Any], timeout: Optional[int]) -> dict[str, Any]:
++    from tools.interrupt import consume_yield, is_interrupted
++    try:
++        max_timeout = int(os.getenv("TERMINAL_TIMEOUT", "180"))
++    except (TypeError, ValueError):
++        max_timeout = 180
++    if timeout is not None and timeout <= 0:
++        return {"status": "error", "error": f"timeout must be positive (got {timeout})"}
++    effective = min(timeout or max_timeout, max_timeout)
++    deadline = time.monotonic() + effective
++    gone_at = None
++    pause = threading.Event()
++    while True:
++        if (settled := _settled(registry, entry["session_id"])) is not None:
++            return settled
++        if not _running(registry, entry):
++            gone_at = gone_at or time.monotonic()
++            if time.monotonic() - gone_at >= _SETTLE_GRACE_SECONDS or time.monotonic() >= deadline:
++                return {**_head(registry, entry, False), **_exit_fields(entry),
++                        "output": _log_text(entry)[-1000:]}
++        elif is_interrupted() or consume_yield(threading.current_thread().ident):
++            return {"status": "interrupted", "command": entry.get("command", ""), "process_running": True,
++                    "output": _log_text(entry)[-1000:],
++                    "note": "User sent a new message -- wait released; the process is still running."}
++        elif time.monotonic() >= deadline:
++            return {"status": "timeout", "command": entry.get("command", ""), "process_running": True,
++                    "output": _log_text(entry)[-1000:],
++                    "timeout_note": (f"Wait window of {effective}s elapsed — the process is still running. "
++                                     "This is not an error. The supervising process sends the completion notice.")}
++        pause.wait(min(_WAIT_STEP_SECONDS, max(0.0, deadline - time.monotonic())) or 0.05)
++
++
++def foreign_kill(registry, entry: dict[str, Any]) -> dict[str, Any]:
++    """Signal the job's tree (and stop its scope) without taking it over: the supervisor's reader
++    sees the exit and records it. A recycled or gone PID is never signalled."""
++    from tools.process_registry import _stop_systemd_unit
++    if not _running(registry, entry):
++        return {**_head(registry, entry, False), **_exit_fields(entry), "status": "already_exited"}
++    registry._terminate_host_pid(entry["pid"], entry.get("host_start_time"))
++    unit = entry.get("systemd_unit") or ""
++    if unit and not _stop_systemd_unit(unit):
++        return {"status": "error", "error": f"Kill incomplete: systemd scope {unit} did not stop",
++                "session_id": entry["session_id"], "scope_stop_failed": unit, "process_running": _running(registry, entry)}
++    survivors = registry._post_kill_survivors(registry._session_from_entry(entry))
++    if survivors:
++        alive = ", ".join(map(str, survivors))
++        return {"status": "error", "error": f"Kill incomplete: {len(survivors)} process(es) still alive ({alive})",
++                "session_id": entry["session_id"], "survivors": survivors, "process_running": True}
++    return {**_head(registry, entry, False), "status": "killed", "completion_reason": "killed",
++            "termination_source": "process.kill", "output": _log_text(entry)[-1000:]}
++
++
++def foreign_action(registry, action: str, session_id: str, args: dict[str, Any]) -> Optional[dict[str, Any]]:
++    """The answer for *action* on a job another live process supervises, or None (stay not_found)."""
++    if action not in FOREIGN_ACTIONS:
++        return None
++    entry = foreign_entry(registry, session_id)
++    if entry is None:
++        return None
++    if action == "poll":
++        return foreign_poll(registry, entry)
++    if action == "log":
++        return foreign_log(registry, entry, args.get("offset"), int(args.get("limit", 200) or 200))
++    if action == "wait":
++        return foreign_wait(registry, entry, args.get("timeout"))
++    return foreign_kill(registry, entry)
+diff --git a/tools/process_registry_listing.py b/tools/process_registry_listing.py
+new file mode 100644
+index 0000000000..9d99268d16
+--- /dev/null
++++ b/tools/process_registry_listing.py
+@@ -0,0 +1,18 @@
++"""``process_manage(action="list")``: this chat's background processes. [daveey]"""
++
++from contextlib import suppress
++
++
++def list_processes(task_id) -> dict:
++    """Processes of *task_id*, plus session-scoped ones (e.g. a forgotten preview server): they share
++    the gateway session_key and can block session reset."""
++    from tools.process_registry import _redact_process_result, process_registry
++    session_key = ""
++    with suppress(Exception):
++        # See #29177.
++        from tools.approval_context import get_current_session_key
++        session_key = get_current_session_key(default="") or ""
++    return {"processes": [
++        _redact_process_result(p)
++        for p in process_registry.list_sessions(
++            task_id=task_id, session_key=session_key or None, include_retained=True)]}
+diff --git a/tools/process_registry_output_log.py b/tools/process_registry_output_log.py
+index 0d06ab3000..922ed64c4e 100644
+--- a/tools/process_registry_output_log.py
++++ b/tools/process_registry_output_log.py
+@@ -80,11 +80,18 @@ def _exit_path(log) -> Path:
+ 
+ 
+ def record_exit_command(log: Path, command: str) -> str:
+-    """Prefix ``command`` so the shell writes its exit status beside the log: an interpreter
+-    that adopts the process after the spawner exited has no Popen to wait on."""
++    """Wrap ``command`` so a shell writes its exit status beside the log: an interpreter that
++    adopts the process after the spawner exited has no Popen to wait on.
++
++    The command runs in a ``( ... )`` child of the recording shell. An EXIT trap in the command's
++    own shell was removable by the command: ``exec`` replaced that shell and a user ``trap ... EXIT``
++    overwrote it (both then settled as lost, -1), and a SIGTERM to the job ran it with ``$?`` 0
++    (a false success). A shell killed by a signal records nothing, so the adopter reports the
++    status as unknown. [daveey]"""
+     import shlex
+     target = shlex.quote(_exit_path(log).as_posix())
+-    return f"__hermes_exit_file={target}; trap 'printf \"%s\\n\" \"$?\" > \"$__hermes_exit_file\"' EXIT\n{command}"
++    return (f"__hermes_exit_file={target}\n(\n{command}\n)\n__hermes_rc=$?\n"
++            "printf '%s\\n' \"$__hermes_rc\" > \"$__hermes_exit_file\"\nexit \"$__hermes_rc\"")
+ 
+ 
+ def strip_shell_markers(text: str, markers) -> str:
+@@ -166,7 +173,9 @@ class ProcessOutputLogMixin:
+             return
+         code = recorded_exit_code(session.output_log)
+         if code is None:
+-            # SIGKILL / exec past the trap: the spawner is gone and no status was recorded.
+-            self._finish_exited(session, -1, reason="lost", source="backend_lost")
++            # Killed by a signal (or a job spawned before the recorder ran it as a child): it exited,
++            # and no status was recorded. Not "lost": nothing about its backend disappeared. [daveey]
++            from tools.process_registry_readopt import UNKNOWN_EXIT_REASON
++            self._finish_exited(session, None, reason=UNKNOWN_EXIT_REASON, source="exit_not_recorded")
+         else:
+             self._finish_exited(session, code)
+-- 
+2.43.0
+

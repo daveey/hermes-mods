@@ -1,0 +1,112 @@
+From 9bd665a43ae8e2a23e279c0a91e5a480d733cd11 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 16:23:56 +0000
+Subject: [PATCH] [daveey] hub-read root paths: keep every path when a '..' is
+ hidden by quoting, expansion or a cd
+
+Follow-up t_01a1d586942e454b to the nit in review 5893721470 on PR #1536 (head dbfac2fcac). A declared,
+attested hub:read card still cleared its ~/.hermes root paths when the traversal was written without a
+literal '..', so placement failed open (misplacement only: a pool worker reaches the hub solely through
+the restricted hub-read, which enforces its own READ_ROOTS).
+
+Repros (attested fixture in tests/hermes_cli/test_kanban_hub_read_roots.py; declared=None, undeclared
+'home gateway marker'):
+- cat --file="/home/ubuntu/.hermes/logs/a b/$(printf "\56\56")/auth.json": the quote follows '=', not
+  whitespace, so _ends_word dropped it and accepted the space inside the still-open quote.
+- cd ~/.hermes/logs && cd .\. && cat auth.json
+- cd ~/.hermes/logs && cd "$(dirname "$PWD")" && cat .env
+
+Five whys: per-token stripping judges each path alone (1); a path is safe only if nothing else in the
+text can move or compute it (2); #1536 guarded only the literal '..' and quotes opened after whitespace
+(3); shell joins dots across quotes/backslashes, expansion computes paths, and cd/pushd/popd move the cwd
+(4); so the guard has to look at the whole text for those constructs, failing closed (5).
+
+Fix (hermes_cli/kanban_placement_coordination.py):
+- _ends_word: a quote right before the prefix that is glued to a non-space ('--file="', "x''") cannot be
+  shown to be a closing one, so the path is kept (not cleared).
+- _strip_read_paths keeps every path when the text also has: a '..' once quotes and backslashes are
+  removed (.\. and .''.), a $( / ${ / $' / $" expansion, or a cd/pushd/popd other than into a plain
+  absolute or ~ path outside ~/.hermes ("cd /tmp" still clears).
+
+Tests: 11 new rows in test_controls_still_pin (10 fail on the base afa1a1ff19 / main 806283b0b6, among
+them all three repros; the "x''" row is a regression guard), 2 new portable rows (unquoted --file=, cd
+/tmp). tests/hermes_cli/test_kanban_hub_read_roots.py 84/0; hub_read_roots + coordination_placement +
+placement_diagnostics 268/0; test_kanban_placement 250/0; state kanban-hub-pin-audit replay unchanged vs base (same 1 pre-existing
+fail on both).
+---
+ hermes_cli/kanban_placement_coordination.py    | 13 +++++++++++--
+ tests/hermes_cli/test_kanban_hub_read_roots.py | 17 +++++++++++++++++
+ 2 files changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_placement_coordination.py b/hermes_cli/kanban_placement_coordination.py
+index 70de987c33..49d07fe621 100644
+--- a/hermes_cli/kanban_placement_coordination.py
++++ b/hermes_cli/kanban_placement_coordination.py
+@@ -119,7 +119,9 @@ def _ends_word(text, start, end) -> bool:
+     (both resolve to ``~/.hermes``) keep pinning."""
+     q = text[start - 1] if start and text[start - 1] in _QUOTES else ""
+     if q and start >= 2 and not text[start - 2].isspace():
+-        q = ""
++        # A quote glued to something else (``--file="``, ``x''``) cannot be shown to be a closing one, and as an
++        # opening one its word runs on past whitespace (review 5893721470 nit): keep the path.
++        return False
+     i = end
+     if q:
+         # An opening quote must close right here: whitespace inside the quoted word (``"~/.hermes/logs/a b/../.env"``)
+@@ -174,10 +176,17 @@ def without_read_paths(text, cfg, *, target=None, requires=None):
+ # A standalone ``..`` path segment anywhere (``cd ~/.hermes/logs && cat ../.env``) can walk out of a root that
+ # per-token stripping already cleared, so such text keeps every path (review 5892779312).
+ _DOTDOT = re.compile(r"(?<![\w.~-])\.\.(?![\w.~-])")
++# A ``..`` need not be literal (review 5893721470 nit): quotes and backslashes join dots (``.\.``, ``.''.``), and
++# command or parameter expansion computes one (``$(dirname "$PWD")``, ``$(printf "\56\56")``, ``${D%logs/}``). So
++# text with any of these keeps every path, as does a directory change other than into a plain absolute path outside
++# ``~/.hermes`` (``cd ~/.hermes/logs`` then ``cd -``, ``popd`` or a relative path walks out of a root).
++_SPLIT = re.compile(r"[\\'\"`]")
++_EXPANSION = re.compile(r"\$[({'\"]")
++_CHDIR = re.compile(r"(?<![\w.-])(?:cd|pushd|popd)(?![\w.-])(?![ \t]+(?:~|/)(?![^\s;&|]*\.hermes)[\w./-]*(?=$|[\s;&|)]))")
+ 
+ 
+ def _strip_read_paths(text, roots):
+-    if _DOTDOT.search(text):
++    if _DOTDOT.search(text) or _DOTDOT.search(_SPLIT.sub("", text)) or _EXPANSION.search(text) or _CHDIR.search(text):
+         return text
+     # Keep a separator so surrounding backtick runs cannot merge and hide later markers.
+     return _STATE_PATH.sub(
+diff --git a/tests/hermes_cli/test_kanban_hub_read_roots.py b/tests/hermes_cli/test_kanban_hub_read_roots.py
+index 03d06d62dd..0271d32464 100644
+--- a/tests/hermes_cli/test_kanban_hub_read_roots.py
++++ b/tests/hermes_cli/test_kanban_hub_read_roots.py
+@@ -45,6 +45,9 @@ def test_declared_read_step_is_portable(attested):
+     'ssh hermes-hub cat "~/.hermes/logs/x.log"',
+     "ssh hermes-hub tail '~/.hermes/logs/x.log'.",
+     "(evidence: ssh hermes-hub cat ~/.hermes/logs/x.log)",
++    # Guards for review 5893721470 leave plain reads alone: an unquoted option value, a cd outside ~/.hermes.
++    "ssh hermes-hub grep --file=~/.hermes/logs/pat.txt ~/.hermes/logs/x.log",
++    "ssh hermes-hub cat ~/.hermes/logs/x.log, then cd /tmp && ls",
+ ])
+ def test_other_hub_read_shapes_are_portable(attested, body):
+     cfg, _, _ = attested
+@@ -131,6 +134,20 @@ def test_malformed_roots_clear_nothing(attested, roots):
+     # A relative ``..`` after a cd into a root walks out of it (review 5892779312 nit).
+     "cd ~/.hermes/logs && cat ../.env",
+     "cd ~/.hermes/logs; chmod -R 777 ../state",
++    # A traversal written without a literal ``..`` (review 5893721470 nit): a quote glued to a non-space before the
++    # prefix may be the opening one, quote/backslash-split dots are still ``..``, and a cd into a root lets any
++    # relative or computed path walk out of it.
++    'cat --file="/home/ubuntu/.hermes/logs/a b/$(printf "\\56\\56")/auth.json"',
++    'cat --file="~/.hermes/logs/a b/$(printf "\\56\\56")/auth.json"',
++    "cat x''/home/ubuntu/.hermes/logs/' b/'.''.'/'.''.'/state.db'",
++    "cd ~/.hermes/logs && cd .\\. && cat auth.json",
++    "cd ~/.hermes/logs && cd .''. && cat auth.json",
++    'cd ~/.hermes/logs && cd "$(dirname "$PWD")" && cat .env',
++    "cd ~/.hermes/logs && cd - && cat .env",
++    "pushd ~/.hermes/logs && popd && cat .env",
++    "echo 'a '/home/ubuntu/.hermes/logs/' b/'.''.'/'.''.'/state.db'",
++    "cat ~/.hermes/logs/x; D=~/.hermes/logs/; cat ${D%logs/}.env",
++    "D=$(dirname ~/.hermes/logs/x); cat $(dirname $D)/.env",
+ ])
+ def test_controls_still_pin(attested, body):
+     cfg, _, _ = attested
+-- 
+2.43.0
+

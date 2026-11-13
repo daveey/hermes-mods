@@ -1,0 +1,651 @@
+From a4d31b46514e5ace1b2e5e1de5da5a3b43469b02 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 15:08:47 +0000
+Subject: [PATCH] [daveey] fix(cron): re-arm a restart rerun the host slept
+ through; hold reruns out of DarkWakes
+
+cron-7dfb141525: a MacBook asleep on battery woke only in DarkWakes; a restart cut
+x-daily-post-and-engage, the immediate rerun was cut by the same sleep, and rerun-once
+dropped the work although the host was then awake for hours.
+
+- the owner stamps each cut attempt's awake (time.monotonic) and wall seconds
+  (_run_clock beside _restart_cut, gateway/session_cron.py)
+- a cut rerun with < 10 awake minutes (or asleep >= 10 min and most of the attempt) is
+  re-armed, at most 3 reruns per original cut; unmeasured attempts keep rerun-once
+- the due scan holds a pending restart rerun while macOS is not fully awake
+  (pmset UserIsActive, or lid open on AC); the next scheduled slot settles a held rerun
+- a held one-shot rerun is exempt from the one-shot grace gate: a DarkWake longer than
+  ONESHOT_GRACE_SECONDS no longer retires the redone work as missed (review 5894188903)
+---
+ cron/jobs.py                     |   7 +-
+ cron/restart_cut.py              |  22 +++-
+ cron/restart_rerun.py            | 183 ++++++++++++++++++++++++++++---
+ gateway/session_cron.py          |   8 +-
+ tests/cron/test_restart_cut.py   |  42 +++++++
+ tests/cron/test_restart_rerun.py | 154 ++++++++++++++++++++++++++
+ 6 files changed, 392 insertions(+), 24 deletions(-)
+
+diff --git a/cron/jobs.py b/cron/jobs.py
+index 73b2c3397c..0088c2ea60 100644
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -3321,7 +3321,10 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
+     d.next_run_dt = _rearm_stale_error_recurring(d)
+     if _instant_after(d.next_run_dt, now):
+         return False
+-
++    from cron.restart_rerun import hold_for_wake, pending_rerun
++    if hold_for_wake(job, scan):  # [daveey] a restart rerun never fires into a DarkWake
++        return False
++    rerun = pending_rerun(job)  # [daveey] a held one-shot rerun is redone work, never "missed"
+     # Only the dispatch snapshot carries this field; never infer it from a later stamp.
+     job["_scheduled_instant"] = None if manual_run else scheduled_instant(job.get("next_run_at"))
+ 
+@@ -3334,7 +3337,7 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
+         return False
+     if kind == "once":
+         from cron.planned_pause import covers
+-        if (not covers(job) and retire_expired_oneshot(d)) or _oneshot_dispatch_limit_reached(job, scan):
++        if (not covers(job) and not rerun and retire_expired_oneshot(d)) or _oneshot_dispatch_limit_reached(job, scan):
+             return False
+         # Durably claim the one-shot for the DURATION of its run: a second scheduler process on the
+         # same HERMES_HOME must not re-dispatch it while in flight, and advancing next_run_at by a
+diff --git a/cron/restart_cut.py b/cron/restart_cut.py
+index bdd3dc3ede..d3f9128b5a 100644
+--- a/cron/restart_cut.py
++++ b/cron/restart_cut.py
+@@ -7,7 +7,9 @@ books that result settles it here: the attempt's firer (its run tail) or, when t
+ the admission journal's recovery in the new gateway (``scheduler_authority.reconcile_pending``).
+ The job keeps its failure streak, no failure notice is sent, and the job runs again once
+ (``cron/restart_rerun.py``: an extra fire that keeps the next slot, a one-shot re-armed with its
+-repeat budget given back). A rerun cut again is not rerun a second time.
++repeat budget given back). A rerun cut again is not rerun a second time, unless the owner's clock
++(``AWAKE_FLAG``) shows it was awake under ten minutes or the host slept through most of it: then
++it is re-armed, up to three reruns.
+ 
+ A fire the owner refused because it was draining for a restart was never admitted: it is deferred
+ to the next gateway (``defer_unadmitted``), not failed.
+@@ -20,6 +22,10 @@ from typing import Any, Optional
+ logger = logging.getLogger("cron.jobs")
+ 
+ RESTART_CUT_FLAG = "_restart_cut"
++# [daveey] The owner's clock of a cut attempt, riding the canonical result beside RESTART_CUT_FLAG:
++# ``{"awake": <time.monotonic delta>, "wall": <time.time delta>}`` in seconds. The monotonic clock
++# stops while the host sleeps, so a rerun the host slept through is re-armed (restart_rerun.py).
++AWAKE_FLAG = "_run_clock"
+ RESTART_CUT_REASON = "Interrupted by a gateway restart before the run finished"
+ # Owner refusals that mean "not ready yet, retry on the next gateway", never "this job is refused".
+ NOT_READY_REFUSALS = frozenset({"runtime_draining"})
+@@ -37,15 +43,18 @@ def _detail(error: Any) -> str:
+     return RESTART_CUT_REASON if not error or error == RESTART_CUT_REASON else f"{RESTART_CUT_REASON} ({error})"
+ 
+ 
+-def _reschedule(job_id: str, execution_id: str, *, deferred: bool = False) -> bool:
++def _reschedule(job_id: str, execution_id: str, *, deferred: bool = False,
++                clock: Optional[dict[str, Any]] = None) -> bool:
+     from cron.executions import get_execution
+     from cron.restart_rerun import reschedule_interrupted
+ 
+     record = get_execution(execution_id)
+     if record is None or record.get("job_id") != job_id:
+         return False
++    clock = clock if isinstance(clock, dict) else {}
+     try:
+-        return reschedule_interrupted(record, restart_cut=True, deferred=deferred)
++        return reschedule_interrupted(record, restart_cut=True, deferred=deferred,
++                                      awake_seconds=clock.get("awake"), wall_seconds=clock.get("wall"))
+     except Exception:  # health: allow BLE001 -- the attempt is already booked; a missed rerun is logged
+         logger.warning("cron: rescheduling %s after its restart cut failed", job_id, exc_info=True)
+         return False
+@@ -74,6 +83,11 @@ def settle_restart_cut(job: dict[str, Any], execution_id: str, error: Any, fire_
+ 
+     job_id = job["id"]
+     detail = _detail(error)
++    clock = job.pop(AWAKE_FLAG, None)
++    if isinstance(clock, dict) and isinstance(clock.get("awake"), (int, float)):
++        # Recorded per attempt so a slept-through cut is visible in errors.log without the ledger.
++        logger.info("Job '%s': cut attempt %s was awake %.0fs of %.0fs", job_id, execution_id,
++                    clock["awake"], clock.get("wall") or 0)
+     mark_kwargs: dict[str, Any] = {"shutdown_interrupted": True}
+     if not job.get("no_agent"):
+         mark_kwargs["execution_id"] = execution_id
+@@ -86,7 +100,7 @@ def settle_restart_cut(job: dict[str, Any], execution_id: str, error: Any, fire_
+     else:
+         scheduler.finish_execution(execution_id, success=False, error=detail, delivery_outcome="suppressed")
+     _retire_journal(job_id, execution_id)
+-    rerun = _reschedule(job_id, execution_id)
++    rerun = _reschedule(job_id, execution_id, clock=clock)
+     logger.warning("Job '%s': %s; %s", job_id, detail,
+                    "rerunning it once on the current gateway" if rerun else "not rerun")
+     return rerun
+diff --git a/cron/restart_rerun.py b/cron/restart_rerun.py
+index c292eea683..bd0a0e39ca 100644
+--- a/cron/restart_rerun.py
++++ b/cron/restart_rerun.py
+@@ -16,11 +16,23 @@ was stopped, not restarted (the job's missed-run policy applies). A job deleted,
+ (``edited_at``) since the attempt was claimed, or one that has a newer attempt, is left alone.
+ ``restart_rerun`` on the job
+ guards loops: the same execution is never rescheduled twice, and an attempt claimed after a
+-reschedule that no run has settled yet (the rerun itself, interrupted again) is not rescheduled.
++reschedule that no run has settled yet (the rerun itself, interrupted again) is not rescheduled,
++unless the host slept through it (below).
++
++[daveey] Sleep (cron-7dfb141525): a MacBook asleep on battery wakes only in short DarkWakes, so a
++restart there cuts the run and the immediate rerun is cut by the same sleep; rerun-once then
++dropped the work although the host was fully awake for hours before the next slot. The owner
++measures each attempt's awake time (``time.monotonic``, which stops in sleep) and wall time
++(``cron/restart_cut.py`` ``AWAKE_FLAG``). A cut rerun that had less than ``SLEPT_AWAKE_SECONDS``
++awake, or slept through most of a long attempt, is re-armed again, at most ``MAX_RERUNS`` times per
++original cut; an attempt with no measurement keeps rerun-once. Every restart rerun is held while
++the host is not fully awake (``host_fully_awake``: never in a DarkWake), and the job's next
++scheduled slot settles a rerun still held (``hold_for_wake``).
+ """
+ from __future__ import annotations
+ 
+ import logging
++import subprocess
+ from datetime import datetime
+ from typing import Any, Optional
+ 
+@@ -30,6 +42,70 @@ MARKER_KEY = "restart_rerun"
+ # A core update's drain + restart takes minutes; a scheduler silent for longer than this was
+ # stopped, not restarted, and the job's own missed-run policy (grace, catch_up) applies instead.
+ RESTART_WINDOW_SECONDS = 30 * 60
++# A cut rerun with less awake time than this never really ran: the host slept through it.
++SLEPT_AWAKE_SECONDS = 10 * 60
++# Reruns per original cut (the first rerun included) a sleeping host may spend.
++MAX_RERUNS = 3
++ITSELF_A_RERUN = "the interrupted attempt was itself a restart rerun"
++
++
++def _number(value: Any) -> Optional[float]:
++    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
++
++
++def slept_through(awake_seconds: Any, wall_seconds: Any = None) -> bool:
++    """Whether a cut attempt with this measured awake/wall time gets a further rerun: under
++    ``SLEPT_AWAKE_SECONDS`` awake (too short to have done its work, whether the host slept or was
++    restarted again at once; ``MAX_RERUNS`` bounds it), or asleep for at least that long and for
++    most of the attempt. An unmeasured attempt (no owner measurement) is not: rerun-once applies."""
++    awake, wall = _number(awake_seconds), _number(wall_seconds)
++    if awake is None or awake < 0:
++        return False
++    if awake < SLEPT_AWAKE_SECONDS:
++        return True
++    asleep = (wall - awake) if wall is not None else 0.0
++    return asleep >= SLEPT_AWAKE_SECONDS and asleep > awake
++
++
++def _reruns(marker: Any) -> int:
++    return int(marker.get("reruns") or 1) if isinstance(marker, dict) else 0
++
++
++def _pmset(*args: str) -> str:
++    return subprocess.run(["pmset", "-g", *args], capture_output=True, text=True, encoding="utf-8",
++                          errors="replace", timeout=5, check=True).stdout
++
++
++def _lid_closed() -> bool:
++    out = subprocess.run(["ioreg", "-r", "-k", "AppleClamshellState", "-d", "1"],
++                         capture_output=True, text=True, encoding="utf-8", errors="replace",
++                         timeout=5, check=False).stdout
++    return '"AppleClamshellState" = Yes' in out
++
++
++def _on_macos() -> bool:
++    from hermes_platform.host.facts import os_family
++
++    return os_family() == "darwin"
++
++
++def host_fully_awake() -> bool:
++    """False only on macOS when the host is provably not fully awake (a DarkWake or Power Nap):
++    no ``UserIsActive`` assertion and not lid-open on AC. Any other platform, and any probe
++    failure, reads awake: a held rerun must never wait on a broken probe (the next slot settles
++    it anyway)."""
++    if not _on_macos():
++        return True
++    try:
++        for line in _pmset("assertions").splitlines():
++            parts = line.split()
++            if len(parts) == 2 and parts[0] == "UserIsActive":
++                if parts[1] == "1":
++                    return True
++                break
++        return "AC Power" in _pmset("batt") and not _lid_closed()
++    except (OSError, subprocess.SubprocessError, ValueError):
++        return True
+ 
+ 
+ def _parse(value: Any) -> Optional[datetime]:
+@@ -45,7 +121,7 @@ def _at_or_after(value: Any, claimed: datetime) -> bool:
+ 
+ def _skip_reason(
+     job: dict[str, Any], record: dict[str, Any], claimed: datetime, now: datetime,
+-    restart_cut: bool = False, deferred: bool = False,
++    restart_cut: bool = False, deferred: bool = False, slept: bool = False,
+ ) -> Optional[str]:
+     from cron.jobs import _is_recoverable_error_job, is_job_runnable, is_terminal_job
+     from cron.scheduler_ownership import _claim_owner_is_dead
+@@ -59,8 +135,12 @@ def _skip_reason(
+         # the attempt a deferral leads to nor a deferred rerun (re-armed, still the rerun) is skipped.
+         if (not deferred and not marker.get("deferred") and not marker.get("settled")
+                 and rescheduled_at is not None and claimed >= rescheduled_at):
+-            # Claimed after a reschedule that no real outcome has settled: the rerun itself.
+-            return "the interrupted attempt was itself a restart rerun"
++            # Claimed after a reschedule that no real outcome has settled: the rerun itself. One the
++            # host slept through never really ran, so it is re-armed up to MAX_RERUNS times.
++            if not slept:
++                return ITSELF_A_RERUN
++            if _reruns(marker) >= MAX_RERUNS:
++                return f"{ITSELF_A_RERUN}, and its {MAX_RERUNS} reruns are spent"
+     # A verified restart cut (the owner's own verdict) is settled by its firer or journal recovery,
+     # whose uncertainty pause/resume stamps ``edited_at`` and whose claim may still be its own:
+     # neither says an operator changed the job or another process will settle it.
+@@ -95,19 +175,28 @@ def _future_slot_pending(job: dict[str, Any], now: str) -> bool:
+     return not is_terminal_job(job) and slot is not None and slot > datetime.fromisoformat(now)
+ 
+ 
+-def _marker(job: dict[str, Any], record: dict[str, Any], now: str, deferred: bool) -> dict[str, Any]:
++def _marker(job: dict[str, Any], record: dict[str, Any], now: str, deferred: bool,
++            reruns: int = 1) -> dict[str, Any]:
+     """The loop guard written with a reschedule. A deferral marks itself ``deferred`` so it spends no
+-    rerun, except when it defers a pending rerun: that keeps the rerun's time, still unsettled."""
++    rerun, except when it defers a pending rerun: that keeps the rerun's time, still unsettled.
++    ``reruns`` counts the reruns this original cut has spent (written only past the first)."""
+     if not deferred:
+-        return {"execution_id": record["id"], "at": now}
++        marker: dict[str, Any] = {"execution_id": record["id"], "at": now}
++        if reruns > 1:
++            marker["reruns"] = reruns
++        return marker
+     prior = job.get(MARKER_KEY)
+     if (isinstance(prior, dict) and not prior.get("deferred") and not prior.get("settled")
+             and _parse(prior.get("at")) is not None):
+-        return {"execution_id": record["id"], "at": prior["at"]}
++        kept = {"execution_id": record["id"], "at": prior["at"]}
++        if prior.get("reruns"):
++            kept["reruns"] = prior["reruns"]
++        return kept
+     return {"execution_id": record["id"], "at": now, "deferred": True}
+ 
+ 
+-def _apply(job: dict[str, Any], record: dict[str, Any], now: str, deferred: bool = False) -> None:
++def _apply(job: dict[str, Any], record: dict[str, Any], now: str, deferred: bool = False,
++           reruns: int = 1) -> None:
+     from cron import extra_fire
+     from cron.jobs import _activate_job_record
+ 
+@@ -128,7 +217,53 @@ def _apply(job: dict[str, Any], record: dict[str, Any], now: str, deferred: bool
+         job["next_run_at"] = now
+     # A fire/run claim left by the dead scheduler needs no clearing: its owner is provably dead
+     # (checked above), so the next tick's claim reclaims it at once (_claim_owner_is_dead).
+-    job[MARKER_KEY] = _marker(job, record, now, deferred)
++    job[MARKER_KEY] = _marker(job, record, now, deferred, reruns)
++
++
++def pending_rerun(job: dict[str, Any]) -> bool:
++    """Whether the job's queued fire is a restart rerun no run has claimed yet."""
++    from cron import extra_fire
++
++    marker = job.get(MARKER_KEY)
++    if not isinstance(marker, dict) or marker.get("settled") or marker.get("deferred"):
++        return False
++    at = marker.get("at")
++    if not at or job.get("next_run_at") != at:
++        return False
++    if (job.get("schedule") or {}).get("kind") == "once":
++        return True
++    return job.get("manual_run_at") == at and extra_fire.RESTORE_KEY in job
++
++
++def hold_for_wake(job: dict[str, Any], scan: Any) -> bool:
++    """[daveey] The due scan's hold on a restart rerun while the host is not fully awake (a
++    DarkWake): firing it there lets the same sleep cut it again. True holds it this tick.
++
++    A recurring job's held rerun is settled by its next scheduled slot: once that slot is due the
++    extra fire is dropped and the slot fires as itself (no double run). A one-shot waits for the
++    full wake."""
++    from cron import extra_fire
++
++    if not pending_rerun(job) or host_fully_awake():
++        return False
++    restore = _parse(job.get(extra_fire.RESTORE_KEY))
++    if (job.get("schedule") or {}).get("kind") != "once" and restore is not None and restore <= scan.now:
++        slot = job[extra_fire.RESTORE_KEY]
++        settled = dict(job[MARKER_KEY], settled=True, superseded_by=slot)
++        for target in (job, scan.find(job["id"])):
++            if target is None:
++                continue
++            target.pop("manual_run_at", None)
++            target.pop(extra_fire.RESTORE_KEY, None)
++            target["next_run_at"] = slot
++            target[MARKER_KEY] = dict(settled)
++        scan.needs_save = True
++        logger.warning("cron: pending restart rerun of %s settled by its next slot %s (the host "
++                       "never fully woke)", job.get("id"), slot)
++        return True  # this tick re-reads nothing stale; the next one fires the slot as itself
++    logger.debug("cron: holding restart rerun of %s until the host is fully awake (not in a DarkWake)",
++                 job.get("id"))
++    return True
+ 
+ 
+ def _newest_attempt_id(job_id: str) -> Optional[str]:
+@@ -141,13 +276,16 @@ def _newest_attempt_id(job_id: str) -> Optional[str]:
+ 
+ 
+ def reschedule_interrupted(record: dict[str, Any], *, restart_cut: bool = False,
+-                           deferred: bool = False) -> bool:
++                           deferred: bool = False, awake_seconds: Any = None,
++                           wall_seconds: Any = None) -> bool:
+     """Put ``record``'s job back on the schedule for now; True when it was rescheduled.
+ 
+     ``restart_cut``: the owner itself reported that its restart cut this attempt (``RESTART_CUT_FLAG``
+     on the canonical result), and the caller (the attempt's firer or its journal recovery) is the
+     one settling it, so the journal and a live claim are no reason to defer. ``deferred``: the
+-    attempt never ran (refused while draining), so its re-arm spends no rerun (``_marker``)."""
++    attempt never ran (refused while draining), so its re-arm spends no rerun (``_marker``).
++    ``awake_seconds``/``wall_seconds``: the owner's measurement of the cut attempt; a rerun the host
++    slept through (``slept_through``) is re-armed again instead of dropped."""
+     from cron.jobs import _MISSING, _hermes_now, _under_fire_fence, _with_job, save_jobs
+ 
+     job_id = str(record.get("job_id") or "")
+@@ -169,13 +307,15 @@ def reschedule_interrupted(record: dict[str, Any], *, restart_cut: bool = False,
+         return False
+ 
+     _fence_reported = [False]  # apply() logged its own skip; a bare False is a fence timeout
++    slept = slept_through(awake_seconds, wall_seconds)
++    rerun_count = [1]
+ 
+     def apply(jobs, _i, job):
+         _fence_reported[0] = True
+         now = _hermes_now()
+-        reason = _skip_reason(job, record, claimed, now, restart_cut, deferred)
++        reason = _skip_reason(job, record, claimed, now, restart_cut, deferred, slept)
+         if reason is not None:
+-            if reason == "the interrupted attempt was itself a restart rerun":
++            if reason.startswith(ITSELF_A_RERUN):
+                 # Expire the pending-rerun guard, not the replay guard. Popping it would let a
+                 # repeated settlement of this same cut attempt schedule a second rerun.
+                 job[MARKER_KEY] = {"execution_id": record["id"], "at": now.isoformat(), "settled": True}
+@@ -183,7 +323,12 @@ def reschedule_interrupted(record: dict[str, Any], *, restart_cut: bool = False,
+             logger.info("cron: not rescheduling %s (execution %s) after restart interruption: %s",
+                         job_id, record["id"], reason)
+             return False
+-        _apply(job, record, now.isoformat(), deferred)
++        marker = job.get(MARKER_KEY)
++        rescheduled_at = _parse(marker.get("at")) if isinstance(marker, dict) else None
++        if (slept and not deferred and isinstance(marker, dict) and not marker.get("settled")
++                and not marker.get("deferred") and rescheduled_at is not None and claimed >= rescheduled_at):
++            rerun_count[0] = _reruns(marker) + 1  # a rerun the host slept through, re-armed again
++        _apply(job, record, now.isoformat(), deferred, rerun_count[0])
+         save_jobs(jobs)
+         return True
+ 
+@@ -196,8 +341,12 @@ def reschedule_interrupted(record: dict[str, Any], *, restart_cut: bool = False,
+         logger.info("cron: not rescheduling %s (execution %s): its fire fence was busy",
+                     job_id, record["id"])
+     if result is True:
+-        logger.warning("cron: rescheduled %s (execution %s) after restart interruption",
+-                       job_id, record["id"])
++        detail = ""
++        if rerun_count[0] > 1:
++            detail = (f" (deferred rerun {rerun_count[0]}/{MAX_RERUNS}: the host slept through the cut "
++                      f"rerun, awake {_number(awake_seconds) or 0:.0f}s of {_number(wall_seconds) or 0:.0f}s)")
++        logger.warning("cron: rescheduled %s (execution %s) after restart interruption%s",
++                       job_id, record["id"], detail)
+     return result is True
+ 
+ 
+diff --git a/gateway/session_cron.py b/gateway/session_cron.py
+index a90be1099a..b83f366b90 100644
+--- a/gateway/session_cron.py
++++ b/gateway/session_cron.py
+@@ -10,6 +10,7 @@ import json
+ import os
+ from pathlib import Path
+ import threading
++import time
+ 
+ from gateway.session_contract import SessionActor, SessionRef
+ from hermes_state_keys import CRON_PRINCIPAL_ID, cron_request_id
+@@ -381,6 +382,8 @@ async def execute(authority, ref, row, policy):
+             stop = _CombinedCancelEvent(
+                 CancelRequest(execution_id),
+                 ShutdownAwareCancel(cancel, _stopped_by_own_shutdown))
++            # [daveey] The attempt's clock: monotonic stops in host sleep, wall time does not.
++            started_awake, started_wall = time.monotonic(), time.time()
+             try:
+                 result = await asyncio.to_thread(_run_identified, run_job, job, execution_id,
+                                                  extra_prompt=data['extra_prompt'], cancel_event=stop)
+@@ -395,8 +398,11 @@ async def execute(authority, ref, row, policy):
+             # [daveey] This owner's restart stopped the run (killed its tools, interrupted its agent,
+             # or cleared its claim): whatever it returned is not the job's verdict. The firer books
+             # an interruption and reruns it once (cron/restart_cut.py), never a failure.
+-            from cron.restart_cut import RESTART_CUT_FLAG, RESTART_CUT_REASON
++            from cron.restart_cut import AWAKE_FLAG, RESTART_CUT_FLAG, RESTART_CUT_REASON
+             flags[RESTART_CUT_FLAG] = True
++            # How long the host was awake for it: a rerun the host slept through is re-armed.
++            flags[AWAKE_FLAG] = {'awake': round(time.monotonic() - started_awake, 1),
++                                 'wall': round(max(0.0, time.time() - started_wall), 1)}
+             result = (False, result[1], '', result[3] or RESTART_CUT_REASON)
+         authority.pending_results[row['admission_id']] = {
+             'result': {'final_response': result[2], 'cron_result': list(result), 'cron_job_flags': flags,
+diff --git a/tests/cron/test_restart_cut.py b/tests/cron/test_restart_cut.py
+index edda27bb9e..649605f30a 100644
+--- a/tests/cron/test_restart_cut.py
++++ b/tests/cron/test_restart_cut.py
+@@ -107,6 +107,48 @@ def test_rerun_cut_again_is_not_rerun_a_second_time(home, monkeypatch):
+     assert int(saved.get("failure_streak") or 0) == 0
+ 
+ 
++def _cut_with_clock(awake, wall):
++    def run_job(job, **_kwargs):
++        # The owner's drain stopped the run and measured it (gateway/session_cron.py).
++        job["_restart_cut"] = True
++        job["_run_clock"] = {"awake": awake, "wall": wall}
++        return (False, "", "", "interrupted")
++    return run_job
++
++
++def test_owner_cut_of_a_rerun_the_host_slept_through_is_rerun_again(home, monkeypatch):
++    """cron-7dfb141525: a MacBook asleep on battery; the restart cut the run and the immediate
++    rerun was cut by the same sleep after ~30 awake seconds in an hour. That rerun never ran, so it
++    is re-armed (rerun 2 of 3), not dropped."""
++    job = jobs.create_job(prompt="probe", schedule=FAR_FUTURE, name="probe", deliver="local")
++    monkeypatch.setattr("cron.restart_rerun.host_fully_awake", lambda: True, raising=False)
++    monkeypatch.setattr(scheduler, "run_job", _cut_with_clock(900, 900))
++    first = jobs.claim_job_for_fire(job["id"], force=True, return_job=True)
++    assert scheduler.run_one_job(first) is True
++    assert _due(job["id"])
++    monkeypatch.setattr(scheduler, "run_job", _cut_with_clock(30, 3600))
++    rerun = jobs.claim_job_for_fire(job["id"], return_job=True)
++    assert isinstance(rerun, dict)
++    assert scheduler.run_one_job(rerun) is True
++    marker = jobs.get_job(job["id"])["restart_rerun"]
++    assert not marker.get("settled"), f"the slept-through rerun was dropped: {marker}"
++    assert marker["execution_id"] == rerun["execution_id"] and marker["reruns"] == 2
++    assert _due(job["id"])
++    assert int(jobs.get_job(job["id"]).get("failure_streak") or 0) == 0
++
++
++def test_owner_cut_of_a_rerun_that_was_awake_ten_minutes_stops(home, monkeypatch):
++    job = jobs.create_job(prompt="probe", schedule=FAR_FUTURE, name="probe", deliver="local")
++    monkeypatch.setattr(scheduler, "run_job", _cut_with_clock(900, 900))
++    first = jobs.claim_job_for_fire(job["id"], force=True, return_job=True)
++    assert scheduler.run_one_job(first) is True
++    rerun = jobs.claim_job_for_fire(job["id"], return_job=True)
++    monkeypatch.setattr(scheduler, "run_job", _cut_with_clock(601, 700))
++    assert scheduler.run_one_job(rerun) is True
++    assert jobs.get_job(job["id"])["restart_rerun"]["settled"] is True
++    assert not _due(job["id"]), "a rerun that really ran keeps rerun-once"
++
++
+ def test_an_ordinary_failure_still_counts(home, monkeypatch):
+     job = jobs.create_job(prompt="probe", schedule=FAR_FUTURE, name="probe", deliver="local")
+     monkeypatch.setattr(scheduler, "run_job", lambda job, **_k: (False, "", "", "agent broke"))
+diff --git a/tests/cron/test_restart_rerun.py b/tests/cron/test_restart_rerun.py
+index 810ba6112a..7e653867f1 100644
+--- a/tests/cron/test_restart_rerun.py
++++ b/tests/cron/test_restart_rerun.py
+@@ -688,3 +688,157 @@ def test_chronos_fallback_ticker_does_not_rerun(clock, monkeypatch, tmp_path):
+     after = get_job(job["id"])
+     assert executions.latest_execution(job["id"])["status"] == "unknown"
+     assert after["next_run_at"] == natural_next and after.get("restart_rerun") is None
++
++
++# --- [daveey] a host asleep through the rerun (cron-7dfb141525) ------------------------------
++
++def _owner_cut(job_id, clock, *, awake=None, wall=None, minutes=1):
++    """Claim the job's due fire, then the owner reports its restart cut it with this clock."""
++    from cron.restart_rerun import reschedule_interrupted
++
++    claimed, record = _start(job_id)
++    clock["now"] += timedelta(minutes=minutes)
++    # What settle_restart_cut books before it reschedules (the restart-window clock included).
++    assert mark_job_run(job_id, False, "cut", shutdown_interrupted=True, execution_id=record["id"],
++                        expected_fire_owner=claimed["fire_claim"]["by"])
++    executions.finish_execution(record["id"], success=False, error="cut")
++    return record, reschedule_interrupted(executions.get_execution(record["id"]), restart_cut=True,
++                                          awake_seconds=awake, wall_seconds=wall)
++
++
++@pytest.fixture()
++def awake_host(monkeypatch):
++    state = {"awake": True}
++    monkeypatch.setattr("cron.restart_rerun.host_fully_awake", lambda: state["awake"], raising=False)
++    return state
++
++
++def test_rerun_cut_while_the_host_slept_is_rearmed(clock, awake_host, caplog):
++    job = create_job("post", "every 120m", name="post")
++    clock["now"] += timedelta(minutes=121)
++    natural_next = None
++    _first, rerun_armed = _owner_cut(job["id"], clock, awake=900, wall=900)
++    assert rerun_armed
++    natural_next = get_job(job["id"])[extra_fire_key()]
++    with caplog.at_level(logging.INFO, logger="cron.jobs"):
++        rerun, again = _owner_cut(job["id"], clock, awake=30, wall=3 * 3600, minutes=50)
++    assert again, caplog.text
++    assert f"cron: rescheduled {job['id']} (execution {rerun['id']}) {RESCHEDULED} (deferred rerun 2/3" in caplog.text
++    after = get_job(job["id"])
++    assert after["restart_rerun"]["reruns"] == 2 and not after["restart_rerun"].get("settled")
++    assert after[extra_fire_key()] == natural_next, "the natural slot is kept"
++    assert _due_ids() == [job["id"]]
++
++
++def extra_fire_key():
++    from cron import extra_fire
++
++    return extra_fire.RESTORE_KEY
++
++
++def test_rerun_cut_after_ten_awake_minutes_is_not_rearmed(clock, awake_host):
++    job = create_job("post", "every 120m", name="post")
++    clock["now"] += timedelta(minutes=121)
++    _owner_cut(job["id"], clock, awake=900, wall=900)
++    _rerun, again = _owner_cut(job["id"], clock, awake=600, wall=700)
++    assert not again
++    assert get_job(job["id"])["restart_rerun"]["settled"] is True
++    assert _due_ids() == []
++
++
++def test_unmeasured_rerun_keeps_rerun_once(clock, awake_host):
++    job = create_job("post", "every 120m", name="post")
++    clock["now"] += timedelta(minutes=121)
++    _owner_cut(job["id"], clock)
++    _rerun, again = _owner_cut(job["id"], clock)
++    assert not again and _due_ids() == []
++
++
++def test_slept_rerun_cap_is_three_per_original_cut(clock, awake_host):
++    job = create_job("post", "every 600m", name="post")
++    clock["now"] += timedelta(minutes=601)
++    assert _owner_cut(job["id"], clock, awake=5, wall=5)[1]  # the original cut: rerun 1
++    for expected in (2, 3):
++        assert _owner_cut(job["id"], clock, awake=5, wall=1800)[1]
++        assert get_job(job["id"])["restart_rerun"]["reruns"] == expected
++    _rerun, again = _owner_cut(job["id"], clock, awake=5, wall=1800)
++    assert not again, "three reruns per original cut, then the schedule"
++    assert get_job(job["id"])["restart_rerun"]["settled"] is True
++    assert _due_ids() == []
++
++
++@pytest.mark.parametrize("awake,wall,slept", [
++    (None, None, False), (599, 599, True), (600, 600, False),
++    (700, 3 * 3600, True),  # ~10 awake minutes in 3 h 17 m: the incident's rerun
++    (1200, 1700, False), (True, 10, False), (-1, 10, False)])
++def test_slept_through_reads_the_owner_clock(awake, wall, slept):
++    from cron.restart_rerun import slept_through
++
++    assert slept_through(awake, wall) is slept
++
++
++def test_pending_rerun_waits_for_full_wake_until_the_next_slot(clock, awake_host, caplog):
++    job = create_job("post", "every 120m", name="post")
++    clock["now"] += timedelta(minutes=121)
++    awake_host["awake"] = False
++    assert _owner_cut(job["id"], clock, awake=900, wall=900)[1]
++    assert _due_ids() == [], "a restart rerun never fires into a DarkWake"
++    awake_host["awake"] = True
++    assert _due_ids() == [job["id"]], "it fires on the first fully awake tick"
++
++    # Held all the way to the natural slot: that slot settles it (no double run).
++    awake_host["awake"] = False
++    slot = get_job(job["id"])[extra_fire_key()]
++    clock["now"] = datetime.fromisoformat(slot) + timedelta(seconds=1)
++    with caplog.at_level(logging.WARNING, logger="cron.jobs"):
++        assert _due_ids() == []
++    assert f"pending restart rerun of {job['id']} settled by its next slot" in caplog.text
++    after = get_job(job["id"])
++    assert after["next_run_at"] == slot and after.get("manual_run_at") is None
++    assert extra_fire_key() not in after and after["restart_rerun"]["settled"] is True
++    assert _due_ids() == [job["id"]], "the slot fires as itself"
++    claimed = claim_job_for_fire(job["id"], return_job=True)
++    assert isinstance(claimed, dict) and not claimed["fire_claim"].get("extra_slot")
++
++
++def test_oneshot_rerun_held_past_grace_fires_on_full_wake(clock, awake_host):
++    # A one-shot rerun held through a DarkWake longer than the one-shot grace window is the cut
++    # work redone, not a missed one-shot: the grace gate must not retire it.
++    job = create_job("remind me", "in 30m", name="reminder")
++    clock["now"] += timedelta(minutes=31)
++    awake_host["awake"] = False
++    assert _owner_cut(job["id"], clock, awake=900, wall=900)[1]
++    assert _due_ids() == []
++    clock["now"] += timedelta(minutes=10)
++    assert _due_ids() == [], "still held in the DarkWake"
++    awake_host["awake"] = True
++    assert _due_ids() == [job["id"]], "it fires on the first fully awake tick"
++    assert get_job(job["id"]) is not None
++
++
++def test_full_wake_probe_reads_pmset_assertions(monkeypatch):
++    from cron import restart_rerun
++
++    # The probe's parsing, host-independent: _on_macos is the seam, never the interpreter's platform.
++    monkeypatch.setattr(restart_rerun, "_on_macos", lambda: True)
++    outputs = {}
++    monkeypatch.setattr(restart_rerun, "_pmset", lambda what: outputs[what])
++    monkeypatch.setattr(restart_rerun, "_lid_closed", lambda: outputs["lid"])
++    outputs.update(assertions="Assertion status system-wide:\n   UserIsActive                   1\n",
++                   batt="Now drawing from 'Battery Power'", lid=True)
++    assert restart_rerun.host_fully_awake()
++    outputs["assertions"] = "Assertion status system-wide:\n   UserIsActive                   0\n"
++    assert not restart_rerun.host_fully_awake(), "a DarkWake on battery"
++    outputs.update(batt="Now drawing from 'AC Power'", lid=False)
++    assert restart_rerun.host_fully_awake(), "lid open on AC"
++    outputs["lid"] = True
++    assert not restart_rerun.host_fully_awake(), "clamshell on AC with no user is a DarkWake"
++
++    def broken(_what):
++        raise OSError("no pmset")
++
++    monkeypatch.setattr(restart_rerun, "_pmset", broken)
++    assert restart_rerun.host_fully_awake(), "a broken probe never holds a rerun"
++    monkeypatch.setattr(restart_rerun, "_on_macos", lambda: False)
++    monkeypatch.setattr(restart_rerun, "_pmset", lambda _w: pytest.fail("probed off macOS"))
++    assert restart_rerun.host_fully_awake()
+-- 
+2.43.0
+

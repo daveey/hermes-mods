@@ -1,0 +1,231 @@
+From 87b5ef9c12c1ab51c46818016da4bd912a382aaa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 16:39:47 +0000
+Subject: [PATCH] [daveey] kanban queue reason: volatile flaps still refresh
+ the pickup-stall sighting
+
+#2359 (b3745e62d5) throttled volatile-only worker_queue_reason observations
+(load_threshold, max_card_runs_reached, ...) to one event + comment per
+REFRESH_MS (600 s). kanban_pickup_stall._seen_unpinned_here_ms restarts a
+worker's stall clock at the origin's newest such event whose lifecycle is not
+pinned to that worker, and DEFAULT_STALL_SECONDS is also 600 s. So a card the
+Board keeps re-reserving to the same worker for seconds at a time, with only
+volatile reasons flipping, let the sighting age past the threshold between
+refreshes, and the reserved worker filed "waiting 10 min" for a card it had
+held for seconds (the t_01a1cfdfb6f3f7ea false-alarm class). Before #2359
+every flip wrote an event, so the sighting stayed <= ~10 s old.
+
+Fix (kanban_queue_reason._write / _record):
+- a different volatile-only picture SIGHTING_MS (REFRESH_MS / 2 = 300 s) after
+  the last event writes an event WITHOUT a comment;
+- an event written without a comment carries commented_at_ms (when the thread
+  last got one; excluded from _signature), and the REFRESH_MS comment clock
+  runs from it, so sightings never delay or add comments.
+Identical replies still write nothing, as on base.
+
+Proof (tests/hermes_cli/test_kanban_queue_reason_sighting.py): an unpinned
+origin card reserved to worker-2 every 10 s with volatile flaps for 11 min,
+its events replayed into worker-2's replica while the Board pins it there,
+and kanban_pickup_stall.stalled(..., own=worker-2) at every reply interval.
+- pre-#2359 (b3745e62d5^): oldest sighting 9 s, stalled() flags nothing
+  (121 comments / 20 min: the noise #2359 fixed).
+- origin/main: oldest sighting 609 s > 600 s; stalled() flags the card at
+  t=609 s.
+- this change: oldest sighting <= 330 s; stalled() flags nothing; 20 min of
+  flaps -> 3 comments, 5 events (#2359's <= 3 comments kept; its events <= 3
+  assertion becomes <= 5 for the uncommented sightings).
+
+Card: t_01a1d5a79bd2a70d (follow-up to review t_01a1d59c4fd3f659 nit 1 on #2359)
+---
+ hermes_cli/kanban_queue_reason.py             | 31 +++++--
+ .../test_kanban_queue_reason_flaps.py         |  4 +-
+ .../test_kanban_queue_reason_sighting.py      | 93 +++++++++++++++++++
+ 3 files changed, 120 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_queue_reason_sighting.py
+
+diff --git a/hermes_cli/kanban_queue_reason.py b/hermes_cli/kanban_queue_reason.py
+index 98f5db98ed..add3983243 100644
+--- a/hermes_cli/kanban_queue_reason.py
++++ b/hermes_cli/kanban_queue_reason.py
+@@ -160,7 +160,8 @@ def _same_lifecycle(conn, task_id, row, value):
+ def _signature(value):
+     # stage/transport/timing are provenance only: they never make an otherwise-identical observation a new event.
+     signature = {k: v for k, v in value.items()
+-                 if k not in ("observed_at_ms", "recorded_at_ms", "current", "stage", "transport", *TIMING_KEYS)}
++                 if k not in ("observed_at_ms", "recorded_at_ms", "current", "stage", "transport", COMMENTED_KEY,
++                              *TIMING_KEYS)}
+     if value.get("state") == "assigned" and value.get("machine") and "lifecycle" in value:
+         # Reading back the assignment promised by this reply is not a transition.
+         signature["lifecycle"] = {**value["lifecycle"], "runs_on": value["machine"]}
+@@ -175,8 +176,17 @@ def _signature(value):
+ # unknown reason) is structural and still a transition.
+ VOLATILE_REASONS = frozenset({"load_threshold", "memory_threshold", "max_card_runs_reached",
+                               "reserved_capacity_held", "last_seen_invalid"})
+-# At most one volatile-only event + comment per card per this window, and only for a different picture.
++# At most one volatile-only comment per card per this window (since the last comment), and only for a different
++# picture.
+ REFRESH_MS = 600_000
++# A different volatile-only picture this long after the last event is an event without a comment. pickup-stall
++# restarts a worker's clock at the newest event whose lifecycle is not pinned there
++# (``kanban_pickup_stall._seen_unpinned_here_ms``): a card the Board re-reserves to one worker for seconds at a time
++# must be seen unpinned well inside that worker's threshold (default 600 s), or it files "waiting 10 min" for a
++# card it held for seconds (t_01a1d5a79bd2a70d; the t_01a1cfdfb6f3f7ea false-alarm class).
++SIGHTING_MS = REFRESH_MS // 2
++# Carried on an event written without a comment: when the thread last got one, so sightings never delay a refresh.
++COMMENTED_KEY = "commented_at_ms"
+ 
+ 
+ def _meaning(value):
+@@ -205,14 +215,19 @@ def _write(previous, value, now_ms):
+ 
+     A reservation handed to another worker is an event without a comment: pickup-stall reads the events as "seen
+     not pinned here" sightings (``kanban_pickup_stall._seen_unpinned_here_ms``), and the thread text would only
+-    repeat the last comment."""
++    repeat the last comment. For the same reason a different volatile-only picture ``SIGHTING_MS`` after the last
++    event is an event without a comment; the ``REFRESH_MS`` comment clock runs from the last comment
++    (``COMMENTED_KEY``)."""
+     if previous is None or _meaning(previous) != _meaning(value):
+         return True, True
+     if _reserved(previous) != _reserved(value):
+         return True, False
+-    if now_ms - _ms_of(previous) >= REFRESH_MS and _signature(previous) != _signature(value):
++    if _signature(previous) == _signature(value):
++        return False, False
++    commented = previous.get(COMMENTED_KEY)
++    if now_ms - (float(commented) if _number(commented) else _ms_of(previous)) >= REFRESH_MS:
+         return True, True
+-    return False, False
++    return now_ms - _ms_of(previous) >= SIGHTING_MS, False
+ 
+ 
+ def _stamp(ms):
+@@ -311,7 +326,11 @@ def _record(conn, task_id, gateway, value, *, fence=None, comment=True):
+         previous_ms = (newest or {}).get("recorded_at_ms", 0)
+         recorded_ms = max(int(time.time() * 1000), int(previous_ms) + 1 if _number(previous_ms) else 0)
+         value = {**value, "recorded_at_ms": recorded_ms}
+-        event, commented = _write(_stored(conn, task_id), value, recorded_ms)
++        previous = _stored(conn, task_id)
++        event, commented = _write(previous, value, recorded_ms)
++        if event and not commented and previous is not None:
++            carried = previous.get(COMMENTED_KEY)
++            value = {**value, COMMENTED_KEY: carried if _number(carried) else _ms_of(previous)}
+         if not event:
+             conn.execute(f"CREATE TABLE IF NOT EXISTS {LATEST_TABLE} (task_id TEXT PRIMARY KEY "
+                          "REFERENCES tasks(id) ON DELETE CASCADE, payload TEXT NOT NULL)")
+diff --git a/tests/hermes_cli/test_kanban_queue_reason_flaps.py b/tests/hermes_cli/test_kanban_queue_reason_flaps.py
+index fbbbb86d54..e4e6c40521 100644
+--- a/tests/hermes_cli/test_kanban_queue_reason_flaps.py
++++ b/tests/hermes_cli/test_kanban_queue_reason_flaps.py
+@@ -63,8 +63,8 @@ def test_volatile_flaps_every_10s_for_20_min_write_at_most_one_per_10_min(conn,
+         qr.record_reply(conn, tid, "hub", last)
+     comments, events = counts(conn, tid)
+     print(f"20 min of 10 s volatile flaps: {comments} comments, {events} events")
+-    assert comments <= 3 and events <= 3
+-    assert comments == events  # every written event has its comment
++    assert comments <= 3
++    assert events <= 5  # plus at most one uncommented pickup-stall sighting per SIGHTING_MS (t_01a1d5a79bd2a70d)
+     newest = qr.latest(conn, tid)
+     assert newest["observed_at_ms"] == last["observation"]["observed_at_ms"]
+     assert newest["candidates"] == qr.normalize(last)["candidates"]
+diff --git a/tests/hermes_cli/test_kanban_queue_reason_sighting.py b/tests/hermes_cli/test_kanban_queue_reason_sighting.py
+new file mode 100644
+index 0000000000..1f3340d215
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_queue_reason_sighting.py
+@@ -0,0 +1,93 @@
++"""Volatile-only flaps keep the origin's "seen not pinned here" sighting fresh enough for pickup-stall.
++
++``kanban_pickup_stall._seen_unpinned_here_ms`` restarts a worker's stall clock at the origin's newest
++``worker_queue_reason`` event whose ``lifecycle.runs_on`` does not name that worker. A card the Board keeps
++re-reserving to the same worker for seconds at a time, with only volatile candidate reasons flipping, wrote such an
++event on every flip before t_01a1d54acc8c8e54 throttled them to one per ``REFRESH_MS`` (600 s, the default stall
++threshold). Then the sighting aged past the threshold between refreshes, and the reserved worker filed "waiting
++10 min" for a card it had held for seconds (the t_01a1cfdfb6f3f7ea false-alarm class).
++"""
++import itertools
++import json
++import sqlite3
++
++from hermes_cli import kanban_pickup_stall as kps
++from hermes_cli import kanban_queue_reason as qr
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import test_kanban_pickup_stall as base
++from tests.hermes_cli import test_kanban_queue_reason_flaps as flaps
++from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
++
++conn = fixtures.conn
++clock = flaps.clock
++gws = base.gws
++svc = base.svc
++WORKER = "worker-2"
++
++
++def _simulate(conn, clock, seconds):
++    """The Board reserves the unpinned origin card to worker-2 every 10 s for ``seconds``, with only volatile
++    reasons flipping. Returns ``(reply times, worker_queue_reason event (created_at s, payload) rows)``."""
++    tid = fixtures.acknowledged(conn)
++    t0 = clock[0]
++    ticks = []
++    for i in range(seconds // 10 + 1):
++        clock[0] = t0 + 10 * i
++        qr.record_reply(conn, tid, "hub", flaps.assigned(int(clock[0] * 1000), flaps.flap(i), machine=WORKER))
++        ticks.append(int(clock[0]))
++    rows = conn.execute("SELECT created_at, payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id",
++                        (tid, qr.EVENT)).fetchall()
++    return tid, ticks, [(int(r[0]), r[1]) for r in rows]
++
++
++def test_the_sighting_never_ages_past_the_stall_threshold_while_flaps_continue(conn, clock):
++    tid, ticks, _ = _simulate(conn, clock, 11 * 60)
++    oldest = 0
++    for at, following in itertools.pairwise(ticks):
++        # The event log as of this reply holds until the next one; a replica sees the same rows (later).
++        seen = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id=? AND kind=? AND created_at<=?",
++                            (tid, qr.EVENT, at)).fetchone()[0]
++        oldest = max(oldest, following - 1 - seen)
++    print(f"11 min of 10 s same-worker volatile flaps: oldest sighting {oldest} s "
++          f"(stall threshold {kps.DEFAULT_STALL_SECONDS} s)")
++    # Within half the threshold plus a few replies: room for replica sync lag and a sparse reply cadence.
++    assert oldest <= kps.DEFAULT_STALL_SECONDS // 2 + 30
++    comments, _ = flaps.counts(conn, tid)
++    assert comments <= 2  # sightings are events without comments (#2359's comment budget unchanged)
++
++
++def test_twenty_minutes_of_flaps_still_post_at_most_three_comments(conn, clock):
++    tid, _, _ = _simulate(conn, clock, 20 * 60)
++    comments, events = flaps.counts(conn, tid)
++    print(f"20 min of same-worker volatile flaps: {comments} comments, {events} events")
++    assert comments <= 3 and events <= 5
++    assert comments >= 2  # sightings do not hold back the REFRESH_MS comment: its clock runs from the last comment
++
++
++def test_the_reserved_worker_raises_no_alarm_at_any_tick(conn, clock, gws):
++    """The origin's events, synced into worker-2's replica while the Board briefly pins the card there."""
++    _, ticks, rows = _simulate(conn, clock, 11 * 60)
++    hub, worker = gws
++    tid = base._pinned(hub, title="re-reserved to worker-2", to=base.WORKER)
++    worker.round()
++    base._age(worker, tid, 2400)  # ready on the Board for 40 min, unpinned except for each brief reservation
++    now = kps._now_ms() // 1000
++    alarms = []
++    for at, following in itertools.pairwise(ticks[59:]):  # from 10 min in: the log as of each reply, until the next
++        with sqlite3.connect(wn._replica_path(worker.conn)) as rw:
++            rw.execute("DELETE FROM task_events WHERE task_id=? AND kind=?", (tid, qr.EVENT))
++            for created, payload in rows:
++                if created <= at:
++                    body = json.loads(payload)
++                    body["machine"] = base.WORKER
++                    rw.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
++                               (tid, qr.EVENT, json.dumps(body), now - (following - 1 - created)))
++        replica = wn.open_replica(worker.conn)
++        assert replica is not None
++        try:
++            if kps.stalled(worker.conn, replica, base.WORKER):
++                alarms.append(following - 1 - ticks[0])
++        finally:
++            replica.close()
++    print(f"stalled() on the reserved worker flagged the card at t={alarms} s")
++    assert not alarms
+-- 
+2.43.0
+

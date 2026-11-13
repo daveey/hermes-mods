@@ -1,0 +1,538 @@
+From 522e5b454de677db2bbbb599f5adb5d1fc866403 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 16:49:10 +0000
+Subject: [PATCH] [daveey] kanban comment writer: automation runners, systemd
+ services and agent handles record agent
+
+Three hub-chat agent notes posted through hub-worker-exec (SSM SendCommand) recorded
+writer_kind=human (comments 41678, 562861, 16922), as did 14 systemd-timer automation comments
+and 15 cron job-state comments. A `human` note is read as David's words.
+
+Five whys:
+1. The CLI writer records human only after a complete ancestor walk to init finds no marker.
+2. Under SSM the comment process descends bash <- runuser <- ssm-document-worker <-
+   ssm-agent-worker <- amazon-ssm-agent <- init; the root-owned ancestors are skipped as
+   foreign, and the script's environment is the agent's plus HOME/USER/PATH: no markers.
+3. Every relay had to forward the caller's markers itself (ssh AcceptEnv, the courier fix);
+   hub-worker-exec is the third relay and forwarded none.
+Root: provenance depended on each relay; the writer had no rule for commands started by a
+non-interactive automation runner, so every new relay (and every timer/cron producer)
+defaulted to human, the direction that grants more authority. Not caught: each earlier fix
+tested only its own relay; no test modelled a tree rooted at a root-owned runner.
+
+Fix (hermes_cli/kanban_comment_writer.py). Each rule only ever lowers a note's authority:
+- Runner rule: an ancestor named amazon-ssm-agent, ssm-document-worker, cron, crond or atd
+  (also the 15-char comm prefix) ends the walk as agent, `<pid>:runner:<name>`, even when
+  root-owned. An interactive ssm-session-worker below it disables the rule, so
+  `aws ssm start-session` shells stay human. Names are read only with the real reader: a
+  substituted ProcReader models its own pids, and real names for those could be anything.
+- systemd rule: a clean walk from a process whose cgroup v2 leaf is a `.service` under
+  /system.slice/ or /user.slice/.../user@<uid>.service/ records agent, `runner:systemd:<unit>`.
+  session-*.scope (ssh/login), other .scope leaves, delegated subtrees and v1-only hosts keep
+  the walk. The real /proc/self/cgroup is read only with the real reader.
+- Handle rule: an --author of the form `<gateway>/t_<16 hex>` or `hub-chat-<6+ hex>` turns a
+  clean walk into agent (`author_handle`) and logs
+  `comment_writer: author handle overrides human walk`.
+Unchanged: an agent walk keeps its own evidence; the typed `/kanban` slash path still passes
+human explicitly; an `env -i` comment from a human login shell is still human. ProcReader and
+agent_ancestor keep their contracts (the HTTP writer and existing fakes are untouched).
+Out of scope: hub-worker-exec marker forwarding (state repo, t_01a1d577aa7c07d5); macOS
+launchd (t_01a1d59a6e097257).
+
+Proof:
+- RED: tests/hermes_cli/test_kanban_cli_comment_writer.py with production reverted:
+  runner+handle slice 28 failed / 42 passed (the SSM end-to-end comment recorded
+  'human'); cgroup slice 22 failed / 72 passed. GREEN: 95 passed.
+- 8 provenance suites (cli/http writers, user manager, dashboard actor, real client, writer
+  kind, open-url): 173 passed, 1 skipped.
+- Service-runner simulation (`_self_cgroup` forced to a system.slice .service, as on a
+  systemd CI runner) over all 57 test files that mention writer_kind/kanban comment/run_slash:
+  2043 passed, 0 failed, so no existing human expectation depends on the real cgroup.
+- Mutations (sdlc-review mutants.py, 24 mutants of every new condition): 23 killed. The one
+  survivor, `fullmatch(str(author))`, is equivalent: "None" never matches a handle.
+---
+ hermes_cli/kanban.py                          |   2 +-
+ hermes_cli/kanban_comment_writer.py           | 112 ++++++-
+ .../test_kanban_cli_comment_writer.py         | 279 ++++++++++++++++++
+ 3 files changed, 383 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 88189efa45..97728049e2 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1050,7 +1050,7 @@ def _cmd_comment(args: argparse.Namespace) -> int:
+         writer_kind, writer_session = "human", None
+     else:
+         from hermes_cli.kanban_comment_writer import cli_comment_writer
+-        writer_kind, writer_session, _evidence = cli_comment_writer()
++        writer_kind, writer_session, _evidence = cli_comment_writer(author=author)
+     with kbc.connect_closing() as conn:
+         try:
+             kb.add_comment(conn, args.task_id, author, body,
+diff --git a/hermes_cli/kanban_comment_writer.py b/hermes_cli/kanban_comment_writer.py
+index 1555affaa0..914306246f 100644
+--- a/hermes_cli/kanban_comment_writer.py
++++ b/hermes_cli/kanban_comment_writer.py
+@@ -21,7 +21,10 @@ process ANCESTRY's start-time environments, not from this process's mutable ``os
+ 
+ No input asserts ``human``: no flag, no variable. Human is only a COMPLETE walk to init that found
+ no marker; an inconclusive walk (psutil unusable, an ancestor vanishing mid-walk, a same-user
+-process whose environment can't be read, the depth cap) records ``agent``. ROOT's unreadable
++process whose environment can't be read, the depth cap) records ``agent``, and so does a walk that
++meets a non-interactive automation runner (:data:`AUTOMATION_RUNNERS`: SSM SendCommand, cron, atd)
++or a comment whose ``--author`` is an agent handle; relays need not forward markers for those.
++ROOT's unreadable
+ process is skipped (``login``/``sshd``, launchd, a setuid ``login`` whose effective uid is root, a
+ non-dumpable ``sshd-session`` whose environ is root's). Linux also skips a same-uid
+ ``systemd --user`` with permitted capabilities beyond ours when environment access is denied:
+@@ -34,7 +37,7 @@ terminal app started from an agent, the TUI's ``!`` shell) labels a person's not
+ only withholds operator authority; so does Windows, where an unreadable or exited ancestor (the
+ parent of ``explorer.exe``) leaves every walk inconclusive. Out of reach: a same-user process that
+ deliberately destroys its marked ancestry (``exec env -i`` replacing the tool shell, double-fork
+-daemonizing) or hands its command to a process outside its ancestry (``tmux send-keys``, ``at``,
++daemonizing) or hands its command to a process outside its ancestry (``tmux send-keys``,
+ ``ssh <host> hermes kanban comment``, whose remote sshd session starts clean) — evasion or a
+ handoff, not provenance, which needs real authentication. The dashboard API uses this ancestry
+ reader for resolved raw loopback TCP peers (``kanban_http_comment_writer``); remote/unresolvable
+@@ -42,7 +45,9 @@ HTTP peers retain the legacy human default, not a claim of authenticated human i
+ """
+ from __future__ import annotations
+ 
++import logging
+ import os
++import re
+ from pathlib import Path
+ from typing import Callable, Mapping, Optional
+ 
+@@ -65,6 +70,24 @@ AGENT_ENV_MARKERS: tuple[str, ...] = (
+ 
+ MAX_ANCESTRY = 64
+ 
++# [daveey] Non-interactive automation runners: a command they started is a scheduled job or a
++# remote automation (hub-worker-exec's SSM SendCommand), never a person typing, even when the runner
++# is root's and its environment unreadable. Relays (ssh, the courier, SSM) each had to forward the
++# caller's markers, and each new relay defaulted to ``human``; this rule lives in the writer. Keyed
++# by the 15-char ``comm`` prefix too: Linux truncates it when psutil can't widen it from cmdline.
++AUTOMATION_RUNNERS: tuple[str, ...] = ("amazon-ssm-agent", "ssm-document-worker", "cron", "crond", "atd")
++RUNNER_FOR_NAME: dict[str, str] = {**{r[:15]: r for r in AUTOMATION_RUNNERS},
++                                   **{r: r for r in AUTOMATION_RUNNERS}}
++# An interactive SSM session (``aws ssm start-session``) is a person's shell; its ancestors are the
++# same ssm-agent-worker/amazon-ssm-agent that start SendCommand documents, so no runner above it
++# counts and the walk goes on to init exactly as before.
++INTERACTIVE_SSM = "ssm-session-worker"
++
++# Agent comment handles: ``<gateway>/t_<16 hex>`` (a worker run's note) and ``hub-chat-<hex>``.
++_AGENT_HANDLE = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9._-]*/t_[0-9a-f]{16}|hub-chat-[0-9a-f]{6,})")
++
++logger = logging.getLogger(__name__)
++
+ 
+ class Inconclusive(Exception):
+     """The ancestry could not be read far enough to rule an agent out."""
+@@ -157,13 +180,33 @@ def _foreign(proc, pid: int) -> bool:
+         return False
+ 
+ 
++def _proc_name(pid: int) -> Optional[str]:
++    """The process name (psutil widens Linux's 15-char ``comm`` from cmdline), None if unreadable:
++    an unknown name only means the runner rule doesn't apply, never a less conclusive walk."""
++    try:
++        import psutil
++    except ImportError:
++        return None
++    try:
++        return str(psutil.Process(pid).name() or "") or None
++    except (psutil.Error, OSError, AttributeError):
++        return None
++
++
++_REAL_READ = _read_proc
++
++
+ def agent_ancestor(pid: Optional[int] = None, *, read: Optional[ProcReader] = None) -> Optional[str]:
+     """``"<pid>:<MARKER>"`` for the nearest process from ``pid`` (default: this one) up to init
+-    whose start-time environment carries an agent marker; None after a complete clean walk.
+-    Raises :class:`Inconclusive` when the walk can't be completed."""
++    whose start-time environment carries an agent marker, or ``"<pid>:runner:<name>"`` for a
++    non-interactive automation runner (:data:`AUTOMATION_RUNNERS`); None after a complete clean
++    walk. Raises :class:`Inconclusive` when the walk can't be completed. Process names are read only
++    with the real reader: a substituted reader models its own pids, which real names don't match."""
+     read = read or _read_proc
++    name_of = _proc_name if read is _REAL_READ else None
+     current = os.getpid() if pid is None else int(pid)
+     seen: set[int] = set()
++    interactive = False
+     for _ in range(MAX_ANCESTRY):
+         if current in seen:
+             raise Inconclusive(f"ancestry loop at pid {current}")
+@@ -172,24 +215,75 @@ def agent_ancestor(pid: Optional[int] = None, *, read: Optional[ProcReader] = No
+         marker = env_agent_marker(environ)
+         if marker:
+             return f"{current}:{marker}"
++        name = name_of(current) if name_of else None
++        if name == INTERACTIVE_SSM:
++            interactive = True
++        runner = RUNNER_FOR_NAME.get(name or "")
++        if runner and not interactive:
++            return f"{current}:runner:{runner}"
+         if current == 1 or ppid <= 0:
+             return None  # reached init (or a root with no parent): complete
+         current = ppid
+     raise Inconclusive(f"ancestry deeper than {MAX_ANCESTRY}")
+ 
+ 
+-def cli_comment_writer(*, read: Optional[ProcReader] = None,
+-                       env: Optional[Mapping[str, str]] = None) -> tuple[str, Optional[str], str]:
++def is_agent_handle(author: Optional[str]) -> bool:
++    """True for an agent comment handle: ``<gateway>/t_<16 hex>`` or ``hub-chat-<6+ hex>``."""
++    return _AGENT_HANDLE.fullmatch(author or "") is not None
++
++
++# [daveey] A systemd service (a timer's job, the gateway and its plugins) is started by the service
++# manager, never typed by a person inside it; a login/ssh shell lives in ``session-N.scope`` and a
++# terminal app in its own ``.scope``, which keep the walk. Linux cgroup v2 only.
++_SYSTEMD_SERVICE = re.compile(r"/(?:system\.slice|user\.slice/(?:[^/]+/)*user@\d+\.service)/(?:[^/]+/)*"
++                              r"(?P<unit>[^/]+\.service)")
++
++
++def cgroup_v2_path(text: str) -> Optional[str]:
++    """The unified (``0::``) hierarchy path from ``/proc/<pid>/cgroup`` text, else None."""
++    for line in text.splitlines():
++        if line.startswith("0::"):
++            return line[3:].strip() or None
++    return None
++
++
++def _self_cgroup() -> Optional[str]:
++    try:
++        return cgroup_v2_path(Path("/proc/self/cgroup").read_text(encoding="utf-8", errors="replace"))
++    except OSError:
++        return None
++
++
++def systemd_service_unit(path: Optional[str]) -> Optional[str]:
++    """The ``.service`` unit whose cgroup leaf ``path`` is (under system.slice or a user manager)."""
++    match = _SYSTEMD_SERVICE.fullmatch(path or "")
++    return match.group("unit") if match else None
++
++
++def cli_comment_writer(*, read: Optional[ProcReader] = None, env: Optional[Mapping[str, str]] = None,
++                       author: Optional[str] = None,
++                       cgroup: Optional[Callable[[], Optional[str]]] = None) -> tuple[str, Optional[str], str]:
+     """``(writer_kind, writer_session, evidence)`` for a comment written by this CLI process.
+ 
+-    ``agent`` when this process or any ancestor started with an agent marker, or when that can't
+-    be ruled out; ``human`` only after a complete walk found none. ``writer_session`` is the agent's
+-    inherited ``HERMES_SESSION_ID`` when it has one."""
++    ``agent`` when this process or any ancestor started with an agent marker or under an
++    automation runner, when this process runs in a systemd ``.service`` (``cgroup``: its cgroup v2
++    path; the real one only with the real reader), or when that can't be ruled out, or when
++    ``author`` is an agent handle (:func:`is_agent_handle`); each only ever lowers authority.
++    ``human`` only after a complete walk found none. ``writer_session`` is the agent's inherited
++    ``HERMES_SESSION_ID`` when it has one."""
+     env = os.environ if env is None else env
++    if cgroup is None and (read or _read_proc) is _REAL_READ:
++        cgroup = _self_cgroup
+     try:
+         found = agent_ancestor(read=read)
+     except Inconclusive as exc:
+         found = f"inconclusive:{exc}"
++    unit = systemd_service_unit(cgroup()) if found is None and cgroup else None
++    if unit:
++        found = f"runner:systemd:{unit}"
++    if found is None and is_agent_handle(author):
++        logger.info("comment_writer: author handle overrides human walk")
++        found = "author_handle"
+     if found is None:
+         return "human", None, "clean-ancestry"
+     session = str(env.get("HERMES_SESSION_ID") or "").strip()[:200] or None
+diff --git a/tests/hermes_cli/test_kanban_cli_comment_writer.py b/tests/hermes_cli/test_kanban_cli_comment_writer.py
+index 9ce559cbf0..a5092b785e 100644
+--- a/tests/hermes_cli/test_kanban_cli_comment_writer.py
++++ b/tests/hermes_cli/test_kanban_cli_comment_writer.py
+@@ -400,3 +400,282 @@ def test_real_cli_subprocess_in_terminal_tool_shell_records_agent(worker_home):
+                           capture_output=True, text=True, timeout=180, check=False, cwd=root)
+     assert "Comment added" in proc.stdout, proc.stdout + proc.stderr
+     assert _payload(tid, _last_comment(tid))["writer_kind"] == "agent"
++
++
++# --- automation runners and agent handles (third relay: hub-worker-exec over SSM) ---------------
++# hub-worker-exec runs `runuser -u ubuntu -- bash -c ...` from ssm-document-worker, whose environment
++# is amazon-ssm-agent's: no relay forwarded the caller's markers, and the root-owned runners were
++# skipped as foreign, so the walk reached init clean and recorded `human`. A command started by a
++# non-interactive automation runner is never a person typing; an interactive SSM session still is.
++
++class _FakeProc:
++    """psutil.Process for a modelled tree: (ppid, uids, environ or None=unreadable, name)."""
++    table: dict = {}
++
++    def __init__(self, pid):
++        self.pid = pid
++        self._ppid, self._uids, self._env, self._name = self.table[pid]
++
++    def ppid(self):
++        return self._ppid
++
++    def uids(self):
++        return self._uids
++
++    def name(self):
++        return self._name
++
++    def environ(self):
++        import psutil
++        if self._env is None:
++            raise psutil.AccessDenied(self.pid)
++        return self._env
++
++
++def _fake_psutil_tree(monkeypatch, rows: dict):
++    """Model a process tree for the REAL reader (``_read_proc`` + names): root rows are unreadable."""
++    import psutil
++    uid = os.getuid()  # windows-footgun: ok (POSIX-only tests, skipped elsewhere)
++    if uid == 0:
++        pytest.skip("root reads every environ")
++    table = {}
++    for pid, (ppid, owner, env, name) in rows.items():
++        uids = (0, 0, 0) if owner == "root" else (uid, uid, uid)
++        table[pid] = (ppid, uids, None if owner == "root" else env, name)
++    real_process, real_stat = psutil.Process, os.stat
++    monkeypatch.setattr(_FakeProc, "table", table)
++    # Only modelled pids are fake (the CLI's own DB code may consult psutil/os.stat for others).
++    monkeypatch.setattr(psutil, "Process", lambda pid=None: _FakeProc(pid) if pid in table else real_process(pid))
++    monkeypatch.setattr(kcw.os, "stat", lambda path, *a, **k: SimpleNamespace(st_uid=uid)
++                        if str(path).startswith("/proc/") else real_stat(path, *a, **k))
++
++
++CLEAN = {"HOME": "/home/ubuntu", "PATH": "/usr/bin"}
++INIT = {1: (0, "root", None, "systemd")}
++# The hub-worker-exec tree observed on worker-5 (comment 16922).
++SSM_SEND_COMMAND = {
++    900: (901, "ubuntu", CLEAN, "python3"), 901: (902, "ubuntu", CLEAN, "bash"),
++    902: (903, "root", None, "runuser"), 903: (904, "root", None, "ssm-document-worker"),
++    904: (905, "root", None, "ssm-agent-worker"), 905: (1, "root", None, "amazon-ssm-agent"), **INIT}
++
++
++posix_only = pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX uids")
++
++
++@posix_only
++def test_ssm_send_command_tree_is_an_agent_at_ssm_document_worker(monkeypatch):
++    _fake_psutil_tree(monkeypatch, SSM_SEND_COMMAND)
++    assert kcw.agent_ancestor(900) == "903:runner:ssm-document-worker"
++
++
++@posix_only
++@pytest.mark.parametrize("runner", ["amazon-ssm-agent", "amazon-ssm-agen", "ssm-document-worker",
++                                    "cron", "crond", "atd"],
++                         ids=["ssm-agent", "ssm-agent-comm-truncated", "ssm-document-worker", "cron",
++                              "crond", "atd"])
++def test_tree_rooted_at_an_automation_runner_is_an_agent(monkeypatch, runner):
++    _fake_psutil_tree(monkeypatch, {900: (901, "ubuntu", CLEAN, "python3"),
++                                    901: (910, "ubuntu", CLEAN, "sh"),
++                                    910: (1, "root", None, runner), **INIT})
++    assert kcw.agent_ancestor(900) == f"910:runner:{kcw.RUNNER_FOR_NAME[runner[:15]]}"
++
++
++@posix_only
++def test_interactive_ssm_session_stays_human(monkeypatch):
++    """``aws ssm start-session``: a person's shell under ssm-session-worker, whose own ancestors are
++    the same ssm-agent-worker/amazon-ssm-agent that start SendCommand documents."""
++    _fake_psutil_tree(monkeypatch, {900: (901, "ubuntu", CLEAN, "python3"),
++                                    901: (920, "ubuntu", CLEAN, "bash"),
++                                    920: (904, "root", None, "ssm-session-worker"),
++                                    904: (905, "root", None, "ssm-agent-worker"),
++                                    905: (1, "root", None, "amazon-ssm-agent"), **INIT})
++    assert kcw.agent_ancestor(900) is None
++
++
++@posix_only
++def test_human_login_shell_under_real_reader_stays_human(monkeypatch):
++    _fake_psutil_tree(monkeypatch, {900: (901, "ubuntu", CLEAN, "python3"),
++                                    901: (930, "ubuntu", CLEAN, "bash"),
++                                    930: (931, "root", None, "sshd-session"),
++                                    931: (1, "root", None, "sshd"), **INIT})
++    assert kcw.agent_ancestor(900) is None
++
++
++@posix_only
++def test_cli_writer_records_runner_evidence(monkeypatch):
++    me = os.getpid()
++    _fake_psutil_tree(monkeypatch, {me: (901, "ubuntu", CLEAN, "python3"),
++                                    **{k: v for k, v in SSM_SEND_COMMAND.items() if k != 900}})
++    assert kcw.cli_comment_writer(env={}) == ("agent", None, "903:runner:ssm-document-worker")
++
++
++@posix_only
++def test_cli_comment_over_ssm_send_command_records_agent(worker_home, monkeypatch):
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
++    me = os.getpid()
++    tid = _task()
++    _fake_psutil_tree(monkeypatch, {me: (901, "ubuntu", CLEAN, "python3"),
++                                    **{k: v for k, v in SSM_SEND_COMMAND.items() if k != 900}})
++    p = _payload(tid, _cli_comment(tid, "relayed agent note"))
++    assert p["writer_kind"] == "agent"
++
++
++AGENT_HANDLES = ["worker-5/t_01a1d55f5bbdae39", "hermes-hub/t_0123456789abcdef", "laptop-1/t_01a1d4faf1ecda4b",
++                 "hub-chat-a1b2c3", "hub-chat-0123456789abcdef"]
++NOT_HANDLES = ["default", "david", "worker-5/t_01a1d55f", "worker-5/t_01A1D55F5BBDAE39", "hub-chat-a1b2c",
++               "hub-chat-zzzzzz", "x/t_01a1d55f5bbdae39/extra", "/t_01a1d55f5bbdae39", "t_01a1d55f5bbdae39",
++               "hub-chat-a1b2c3 ", "my hub-chat-a1b2c3"]
++
++
++@pytest.mark.parametrize("author", AGENT_HANDLES)
++def test_agent_handle_author_records_agent_over_a_clean_walk(author, caplog):
++    import logging
++    with caplog.at_level(logging.INFO, logger=kcw.__name__):
++        assert kcw.cli_comment_writer(read=_me({}, 500, HUMAN_SHELL), env={}, author=author) == (
++            "agent", None, "author_handle")
++    assert [r.getMessage() for r in caplog.records if "author handle" in r.getMessage()] == [
++        "comment_writer: author handle overrides human walk"]
++
++
++@pytest.mark.parametrize("author", NOT_HANDLES)
++def test_other_authors_with_a_clean_walk_stay_human(author, caplog):
++    import logging
++    with caplog.at_level(logging.INFO, logger=kcw.__name__):
++        assert kcw.cli_comment_writer(read=_me({}, 500, HUMAN_SHELL), env={}, author=author) == (
++            "human", None, "clean-ancestry")
++    assert not [r for r in caplog.records if "author handle" in r.getMessage()]
++
++
++def test_handle_author_does_not_relabel_an_agent_walk(caplog):
++    import logging
++    with caplog.at_level(logging.INFO, logger=kcw.__name__):
++        kind, _s, evidence = kcw.cli_comment_writer(read=_me({}, 600, AGENT_TERMINAL), env={},
++                                                    author="hub-chat-a1b2c3")
++    assert (kind, evidence) == ("agent", "600:HERMES_SESSION_ID")
++    assert not [r for r in caplog.records if "author handle" in r.getMessage()]
++
++
++def test_cli_comment_with_handle_author_from_clean_shell_records_agent(worker_home, monkeypatch):
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.setattr(kcw, "_read_proc", _me({"HOME": "/h"}, 500, HUMAN_SHELL))
++    tid = _task()
++    parser = argparse.ArgumentParser(prog="hermes")
++    kanban.build_parser(parser.add_subparsers(dest="command"))
++    args = parser.parse_args(["kanban", "comment", tid, "relayed", "--author", "worker-5/t_01a1d55f5bbdae39"])
++    assert kanban.kanban_command(args) == 0
++    p = _payload(tid, _last_comment(tid))
++    assert p["writer_kind"] == "agent"
++
++
++@posix_only
++def test_unreadable_process_name_only_skips_the_runner_rule(monkeypatch):
++    """A name psutil can't read is no runner, and no reason to call the walk inconclusive."""
++    import psutil
++    _fake_psutil_tree(monkeypatch, {900: (901, "ubuntu", CLEAN, "python3"),
++                                    901: (1, "ubuntu", CLEAN, "bash"), **INIT})
++
++    def denied(self):
++        raise psutil.AccessDenied(self.pid)
++    monkeypatch.setattr(_FakeProc, "name", denied)
++    assert kcw.agent_ancestor(900) is None
++
++
++def test_none_author_is_not_a_handle():
++    assert kcw.is_agent_handle(None) is False
++
++
++def test_monkeypatched_reader_reads_no_real_names(monkeypatch):
++    """A fake ``_read_proc`` (fixed pids) must not be paired with REAL process names: pid 400 on a
++    CI host may well be cron."""
++    monkeypatch.setattr(kcw, "_read_proc", _me({"HOME": "/h"}, 500, HUMAN_SHELL))
++    monkeypatch.setattr(kcw, "_proc_name", lambda pid: pytest.fail(f"real name read for fake pid {pid}"))
++    assert kcw.agent_ancestor() is None
++
++
++# --- systemd units (hub timers, gateway plugins): the comment process's own cgroup v2 leaf -------
++# 14 hub automation comments from systemd timers and the gateway's own services recorded human: a
++# `.service` unit is started by the service manager, never typed by a person in it; a login/ssh
++# session lives in a `session-N.scope`, and other `.scope`s (terminal apps) keep the walk.
++
++SYSTEM_SERVICE = "/system.slice/hermes-hub-sync.service"
++USER_SERVICE = "/user.slice/user-1000.slice/user@1000.service/app.slice/hermes-gateway.service"
++SSH_SESSION = "/user.slice/user-1000.slice/session-3.scope"
++APP_SCOPE = "/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal-1234.scope"
++
++
++@pytest.mark.parametrize("path,unit", [(SYSTEM_SERVICE, "hermes-hub-sync.service"),
++                                       (USER_SERVICE, "hermes-gateway.service"),
++                                       ("/user.slice/user-1000.slice/user@1000.service/hermes-hub-watch.service",
++                                        "hermes-hub-watch.service")],
++                         ids=["system-slice", "user-app-slice", "user-manager-direct"])
++def test_systemd_service_cgroup_records_agent_over_a_clean_walk(path, unit):
++    assert kcw.cli_comment_writer(read=_me({}, 500, HUMAN_SHELL), env={}, cgroup=lambda: path) == (
++        "agent", None, f"runner:systemd:{unit}")
++
++
++@pytest.mark.parametrize("path", [SSH_SESSION, APP_SCOPE, None, "/", "",
++                                  "/system.slice/session-9.scope",          # a scope, even under system.slice
++                                  "/machine.slice/libvirtd-x.service",       # neither system.slice nor user@
++                                  "/user.slice/user-1000.slice/user@1000.service",  # the manager's own node
++                                  "/user.slice/user-1000.slice/user@1000.service/app.slice",
++                                  "/system.slice/docker.service/sub"],     # inside a delegated subtree
++                         ids=["session-scope", "app-scope", "no-v2-line", "root", "empty", "system-scope",
++                              "machine-slice", "user-manager-node", "app-slice-node", "delegated-subtree"])
++def test_other_cgroups_keep_the_human_walk(path):
++    assert kcw.cli_comment_writer(read=_me({}, 500, HUMAN_SHELL), env={}, cgroup=lambda: path) == (
++        "human", None, "clean-ancestry")
++
++
++def test_app_scope_keeps_an_agent_walk_unchanged():
++    assert kcw.cli_comment_writer(read=_me({}, 600, AGENT_TERMINAL), env={}, cgroup=lambda: APP_SCOPE) == (
++        "agent", None, "600:HERMES_SESSION_ID")
++
++
++def test_service_cgroup_does_not_relabel_an_agent_walk():
++    kind, _s, evidence = kcw.cli_comment_writer(read=_me({}, 600, AGENT_TERMINAL), env={},
++                                                cgroup=lambda: SYSTEM_SERVICE)
++    assert (kind, evidence) == ("agent", "600:HERMES_SESSION_ID")
++
++
++@pytest.mark.parametrize("text,path", [
++    ("0::/system.slice/cron.service\n", "/system.slice/cron.service"),
++    ("12:pids:/user.slice\n1:name=systemd:/x.service\n0::" + USER_SERVICE + "\n", USER_SERVICE),
++    ("12:pids:/system.slice/x.service\n", None),   # cgroup v1 only: no unified line
++    ("", None)], ids=["v2", "hybrid", "v1-only", "empty"])
++def test_cgroup_v2_path_parses_the_unified_line(text, path):
++    assert kcw.cgroup_v2_path(text) == path
++
++
++def test_monkeypatched_reader_reads_no_real_cgroup(monkeypatch):
++    """With a substituted reader the real process's cgroup (a test run inside a systemd service) is
++    not consulted, like process names."""
++    monkeypatch.setattr(kcw, "_read_proc", _me({"HOME": "/h"}, 500, HUMAN_SHELL))
++    monkeypatch.setattr(kcw, "_self_cgroup", lambda: pytest.fail("real cgroup read"))
++    assert kcw.cli_comment_writer(env={}) == ("human", None, "clean-ancestry")
++
++
++def test_real_reader_consults_the_real_cgroup(monkeypatch):
++    calls = []
++    monkeypatch.setattr(kcw, "agent_ancestor", lambda **kw: None)
++    monkeypatch.setattr(kcw, "_self_cgroup", lambda: calls.append(1) or SYSTEM_SERVICE)
++    assert kcw.cli_comment_writer(env={}) == ("agent", None, "runner:systemd:hermes-hub-sync.service")
++    assert calls == [1]
++
++
++def test_cli_comment_from_a_systemd_service_records_agent(worker_home, monkeypatch):
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.setattr(kcw, "agent_ancestor", lambda **kw: None)
++    monkeypatch.setattr(kcw, "_self_cgroup", lambda: USER_SERVICE)
++    tid = _task()
++    assert _payload(tid, _cli_comment(tid, "timer note"))["writer_kind"] == "agent"
++
++
++def test_typed_slash_command_inside_a_service_stays_human(worker_home, monkeypatch):
++    """The gateway is a systemd service; ``/kanban comment`` a person typed into it is still theirs."""
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.setattr(kcw, "agent_ancestor", lambda **kw: None)
++    monkeypatch.setattr(kcw, "_self_cgroup", lambda: USER_SERVICE)
++    tid = _task()
++    assert "Comment added" in kanban.run_slash(f"comment {tid} typed by me", human_typed=True)
++    assert _payload(tid, _last_comment(tid))["writer_kind"] == "human"
+-- 
+2.43.0
+

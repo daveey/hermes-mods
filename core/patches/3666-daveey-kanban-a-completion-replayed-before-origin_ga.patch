@@ -1,0 +1,339 @@
+From ac63bfc196e5deed9ac0329460caf370da1ecbbb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 16:26:59 +0000
+Subject: [PATCH] [daveey] kanban: a completion replayed before origin_gateway
+ was recorded binds its leased run's receipt
+
+Hub cards t_01a1ca1975471ed4, t_01a1cda0087499e3, t_01a1ce14309bff2c, t_01a1cf477dece56b, t_01a1cf6b6dd5feb4,
+t_01a1cf7adf592a71, t_01a1d0622df6ea87 and t_01a1d087f0697ede ran on worker-2..6 on 2026-11-12. All are done
+on the hub. On the hub, though, `read_completions(...).verified` is False for each, and chat
+20261026_170127_f07c32 on laptop-1 lists them `unknown` (released=False). This is the same class as #2312: the
+replayed `completed` payload carries the worker's local `pr_acceptance_event_id`. On the hub that id names
+another card's event (3 of 8) or no event (5 of 8). These rows were replayed before the hub recorded
+`task_events.origin_gateway`, which starts at event 1180961, so the completion and its receipts all have NULL
+there. `pick` only takes #2312's same-run fallback when `imported_from` is set, so they stayed fail-closed.
+
+Five whys:
+1. Why `unknown`? The hub publishes verified=false, so the origin ledger never releases the card.
+2. Why unverified? `pick` finds no receipt: the payload integer is worker-local.
+3. Why no same-run fallback? It runs only for a completion with `origin_gateway` set.
+4. Why is it NULL? The hub recorded replayed origins only from event 1180961; these were replayed earlier.
+5. Why can't that be inferred? Nothing read the other proof the hub already holds: the Board's lease of the
+   completing run (`claimed {holder: worker-N, run_uid}`, run_uid == task_runs.uid), which names the gateway
+   that ran it.
+
+Fix: `kanban_completion_refs.leased_elsewhere` (one SELECT per batch) returns, for each NULL-origin
+completion, the single gateway other than this board's own (`kanban_sync_state.gateway_id`) that the Board
+leased the completing run to. Such a completion is passed to `pick` as `imported_from=<holder>, legacy=True`.
+Its receipts were replayed in the same pre-origin era, so they are matched on NULL origin in the same run. Both
+`read_completions` (batch) and `observe_owner_task` (via `import_kwargs`) use it. The completion stays exact,
+with no fallback, when:
+- the run was held by this gateway;
+- the run has no Board lease (an unsynced board, or a worker-local run);
+- the lease names another run's uid, or is a lease of another run;
+- the holder is not a string;
+- two gateways leased the same run;
+- the board cannot name itself.
+`test_a_local_completion_with_a_wrong_id_stays_unverified` stays green.
+
+Proof:
+- tests/hermes_cli/test_kanban_completion_refs_sync.py adds a plain case and a contract_waived case
+  (t_01a1ca1975471ed4's shape: a refused no_required_checks try, then a waiver, in one run). Both FAIL on main
+  d8727a4b282 and pass here. Six exact-stays-exact cases and the ambiguity case pass on both.
+- Twelve exact-anchor mutants over every new condition, run with sdlc-review mutants.py: all killed
+  (run_id match, run_uid match, run uid present, str holder, single holder, holder != own, own known,
+  legacy origin both ways, batch flag, batch lookup, single-card lookup). The run-uid-present mutant
+  survived the first round and is killed by the added no-run-uid test.
+- Every test file that imports the changed modules (20 files, 482 tests) passes.
+- Replay over the hub's real rows, read-only (`mode=ro`), old vs new `read_completions` over every done or
+  archived card:
+  - kanban.db: 215 of 5745 flip unverified -> verified, 0 flip down, all 8 incident cards included.
+    For all 215, the worker-written `claimed {lock: hermes-<host>:pid}` of the completing run matches the
+    Board lease holder. All are PR-contract completions with no goal_mode, and the bound receipt is success
+    (165), no_required_checks + waiver (48) or closed (2).
+  - boards/hermes: 4 up. boards/runners: 2 up. sync-shadow default/bb/hermes: 616/167/7 up. All boards: 0 down.
+---
+ hermes_cli/kanban_completion_inputs.py        |  19 ++--
+ hermes_cli/kanban_completion_refs.py          |  61 ++++++++++-
+ hermes_cli/kanban_origin_ledger.py            |   2 +-
+ .../test_kanban_completion_refs_sync.py       | 100 ++++++++++++++++++
+ 4 files changed, 170 insertions(+), 12 deletions(-)
+
+diff --git a/hermes_cli/kanban_completion_inputs.py b/hermes_cli/kanban_completion_inputs.py
+index a8826cdda2..deaedc5b3c 100644
+--- a/hermes_cli/kanban_completion_inputs.py
++++ b/hermes_cli/kanban_completion_inputs.py
+@@ -1,9 +1,10 @@
+ """Batched, read-only inputs of the owner's completion verdict.
+ 
+ ``kanban_origin_ledger.completion_verdict`` is the single verdict. This module only reads the rows it
+-needs for many cards at once inside the caller's transaction: at most five SELECTs per 500 cards (tasks,
+-latest completion, latest run, id-bound judge/acceptance events, and archive events only when an
+-archived card is present), plus the board's cached receipt epoch. It adds no store and never writes.
++needs for many cards at once inside the caller's transaction: at most six SELECTs per 500 cards (tasks,
++latest completion, latest run, id-bound judge/acceptance events, the Board leases of runs whose completion
++records no origin, and archive events only when an archived card is present), plus the board's cached
++receipt epoch. It adds no store and never writes.
+ """
+ from __future__ import annotations
+ 
+@@ -12,7 +13,7 @@ import logging
+ import sqlite3
+ from typing import NamedTuple
+ 
+-from hermes_cli.kanban_completion_refs import pick, read_candidates
++from hermes_cli.kanban_completion_refs import leased_elsewhere, pick, read_candidates
+ from hermes_cli.kanban_origin_ledger import _receipt_epoch, completion_verdict
+ 
+ logger = logging.getLogger(__name__)
+@@ -83,9 +84,12 @@ def read_completions(conn, ids) -> dict[str, Completion]:
+         refs = read_candidates(conn, list(completed))
+         imported = {tid: row["origin_gateway"] if isinstance(row["origin_gateway"], str) and row["origin_gateway"]
+                     else None for tid, row in completed.items()}
++        # [daveey] Replayed before origins were recorded: the run's Board lease names the gateway.
++        legacy = leased_elsewhere(conn, {t: completed[t]["run_id"] for t, src in imported.items() if src is None})
++        imported.update(legacy)
+         for tid, task in tasks.items():
+             out[tid] = _completion(conn, tid, task, completed.get(tid), runs.get(tid), archived.get(tid),
+-                                   refs.get(tid, []), imported.get(tid), epoch)
++                                   refs.get(tid, []), imported.get(tid), tid in legacy, epoch)
+     return out
+ 
+ 
+@@ -101,7 +105,7 @@ def _payload(raw):
+     return value
+ 
+ 
+-def _completion(conn, tid, task, event, run, archived, receipts, imported_from, epoch):
++def _completion(conn, tid, task, event, run, archived, receipts, imported_from, legacy_import, epoch):
+     row = (task["status"], task["completed_at"], task["current_run_id"], task["goal_mode"],
+            task["completion_contract"])
+     event_t = None if event is None else (event["id"], event["run_id"], event["created_at"], event["payload"])
+@@ -110,7 +114,8 @@ def _completion(conn, tid, task, event, run, archived, receipts, imported_from,
+ 
+     def bound_event(kind, event_id, before, uid=None):
+         return pick(receipts, task_id=tid, kind=kind, event_id=event_id, uid=uid, before=before,
+-                    run_id=None if event is None else event["run_id"], imported_from=imported_from)
++                    run_id=None if event is None else event["run_id"], imported_from=imported_from,
++                    legacy=legacy_import)
+ 
+     def receipt_epoch():
+         if not epoch:
+diff --git a/hermes_cli/kanban_completion_refs.py b/hermes_cli/kanban_completion_refs.py
+index 9071aa9168..0d9cde65e7 100644
+--- a/hermes_cli/kanban_completion_refs.py
++++ b/hermes_cli/kanban_completion_refs.py
+@@ -14,9 +14,17 @@ another gateway (``origin_gateway`` set), whose integer does not name the same c
+ latest receipt of that kind the same gateway wrote in the same run before the completion: on its own board that
+ run's latest receipt is the one ``complete_task`` bound (it writes the receipt and the completion in one
+ transaction). A completion that names no receipt never borrows one.
++
++The hub recorded ``origin_gateway`` only from event 1180961 (2026-11-13); every event replayed before that,
++completions and receipts alike, has NULL there, so eight worker-run hub cards (t_01a1ca1975471ed4 et al.) stayed
++unverified and their origin chat listed them ``unknown``. A NULL-origin completion counts as replayed (``legacy``)
++only when its own run carries the Board's lease (``claimed`` with ``holder`` and that run's ``run_uid``) to a
++gateway other than this board's own; it then binds a NULL-origin receipt of the same run. A run this gateway
++held, or one with no Board lease (an unsynced board), stays exact.
+ """
+ from __future__ import annotations
+ 
++import json
+ import sqlite3
+ from typing import Any, Iterable
+ 
+@@ -67,9 +75,53 @@ def origin_of(conn: sqlite3.Connection, event_id: int) -> str | None:
+     return row[0] if row is not None and isinstance(row[0], str) and row[0] else None
+ 
+ 
++def leased_elsewhere(conn: sqlite3.Connection, runs: dict[str, Any]) -> dict[str, str]:
++    """``{task_id: holder}`` for each ``{task_id: run_id}`` whose run the Board leased to exactly one gateway
++    other than this board's own (``claimed`` with ``holder`` and that run's ``run_uid``). One SELECT."""
++    runs = {t: r for t, r in runs.items() if type(r) is int}
++    if not runs or "uid" not in {r[1] for r in conn.execute("PRAGMA table_info(task_runs)")}:
++        return {}
++    try:
++        own = conn.execute("SELECT gateway_id FROM kanban_sync_state LIMIT 1").fetchone()
++    except sqlite3.OperationalError:  # an unsynced board: no Board lease, nothing was replayed
++        return {}
++    own = own[0] if own is not None and isinstance(own[0], str) and own[0] else None
++    if own is None:
++        return {}
++    holders: dict[str, set[Any]] = {}
++    marks = ",".join("?" for _ in runs)
++    for tid, run_id, uid, raw in conn.execute(
++            f"SELECT e.task_id, e.run_id, r.uid, e.payload FROM task_events e JOIN task_runs r ON r.id = e.run_id "
++            f"WHERE e.task_id IN ({marks}) AND e.kind = 'claimed'", list(runs)):
++        try:
++            claim = json.loads(raw or "{}")
++        except ValueError:
++            continue
++        if (run_id == runs.get(tid) and isinstance(uid, str) and uid and isinstance(claim, dict)
++                and claim.get("run_uid") == uid and isinstance(claim.get("holder"), str) and claim["holder"]):
++            holders.setdefault(tid, set()).add(claim["holder"])
++    out: dict[str, str] = {}
++    for tid, found in holders.items():
++        holder = next(iter(found)) if len(found) == 1 else None  # two holders for one run: ambiguous, exact
++        if holder is not None and holder != own:
++            out[tid] = holder
++    return out
++
++
++def import_kwargs(conn: sqlite3.Connection, event_id: int, task_id: str, run_id: Any) -> dict[str, Any]:
++    """``pick``'s ``imported_from``/``legacy`` for a completion event: its ``origin_gateway``, else its run's
++    foreign Board lease."""
++    origin = origin_of(conn, event_id)
++    if origin is not None:
++        return {"imported_from": origin, "legacy": False}
++    holder = leased_elsewhere(conn, {task_id: run_id}).get(task_id)
++    return {"imported_from": holder, "legacy": holder is not None}
++
++
+ def pick(rows: Iterable[dict[str, Any]], *, task_id: str, kind: str, event_id: Any, uid: Any, before: int,
+-         run_id: Any, imported_from: str | None) -> tuple[Any, Any] | None:
+-    """``(payload, run_id)`` of the receipt a completion names, or None. See the module docstring."""
++         run_id: Any, imported_from: str | None, legacy: bool = False) -> tuple[Any, Any] | None:
++    """``(payload, run_id)`` of the receipt a completion names, or None. See the module docstring.
++    ``legacy``: replayed from ``imported_from`` before origins were recorded, so its receipts carry none."""
+     mine = [r for r in rows if r["task_id"] == task_id and r["kind"] == kind and type(r["id"]) is int
+             and r["id"] < before]
+     if isinstance(uid, str) and uid:
+@@ -77,12 +129,13 @@ def pick(rows: Iterable[dict[str, Any]], *, task_id: str, kind: str, event_id: A
+         return None if hit is None else (hit["payload"], hit["run_id"])
+     if type(event_id) is not int:
+         return None
++    origin = None if legacy else imported_from
+     hit = next((r for r in mine if r["id"] == event_id), None)
+-    if hit is not None and (imported_from is None or hit["origin_gateway"] == imported_from):
++    if hit is not None and (imported_from is None or hit["origin_gateway"] == origin):
+         return hit["payload"], hit["run_id"]
+     if imported_from is None or run_id is None:
+         return None
+-    same_run = [r for r in mine if r["run_id"] == run_id and r["origin_gateway"] == imported_from]
++    same_run = [r for r in mine if r["run_id"] == run_id and r["origin_gateway"] == origin]
+     if not same_run:
+         return None
+     best = max(same_run, key=lambda r: r["id"])
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index a2d0169292..124bac1e28 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -241,7 +241,7 @@ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> d
+         # [daveey] By uid, else id; a replayed legacy completion binds its run's receipt (kanban_completion_refs).
+         bound_event=lambda kind, event_id, before, uid=None: _refs.pick(
+             _refs.read_candidates(conn, [task['id']])[task['id']], task_id=task['id'], kind=kind, event_id=event_id,
+-            uid=uid, before=before, run_id=event[1], imported_from=_refs.origin_of(conn, event[0])),
++            uid=uid, before=before, run_id=event[1], **_refs.import_kwargs(conn, event[0], task['id'], event[1])),
+         current_task=lambda: conn.execute('SELECT title,body FROM tasks WHERE id=?', (task['id'],)).fetchone(),
+         receipt_epoch=lambda: _receipt_epoch(conn))
+     payload = {k: v for k, v in task.items()
+diff --git a/tests/hermes_cli/test_kanban_completion_refs_sync.py b/tests/hermes_cli/test_kanban_completion_refs_sync.py
+index 5566b91486..53d97223f4 100644
+--- a/tests/hermes_cli/test_kanban_completion_refs_sync.py
++++ b/tests/hermes_cli/test_kanban_completion_refs_sync.py
+@@ -129,3 +129,103 @@ def test_a_local_completion_with_a_wrong_id_stays_unverified(boards):
+     rewrite(worker, event_id, lambda p: (p.pop("pr_acceptance_event_uid", None),
+                                          p.update(pr_acceptance_event_id=p["pr_acceptance_event_id"] + 1000)))
+     assert verified(worker, tid) == (False, False)
++
++
++# Hub t_01a1ca1975471ed4, t_01a1cda0087499e3, t_01a1ce14309bff2c, t_01a1cf477dece56b, t_01a1cf6b6dd5feb4,
++# t_01a1cf7adf592a71, t_01a1d0622df6ea87, t_01a1d087f0697ede (2026-11-12): run on worker-2..6 and replayed before
++# the hub recorded ``origin_gateway`` (from event 1180961), so the completion AND its receipts carry NULL there.
++# Each payload id named another card's event or none. The run's Board lease (``claimed`` with ``holder`` and the
++# run's ``run_uid``) is what proves the completion was written elsewhere.
++
++def own_gateway(conn):
++    return conn.execute("SELECT gateway_id FROM kanban_sync_state").fetchone()[0]
++
++
++def as_pre_origin_replay(hub, tid, holder="worker-3", run_uid=None, claim_run_id=None):
++    """The hub before origins were recorded: no origin on the card's events, no uid in the completion, plus the
++    Board's lease of the completing run (or ``claim_run_id``) to ``holder``."""
++    event_id, _ = payload_of(hub, tid)
++    rewrite(hub, event_id, lambda p: (p.pop("pr_acceptance_event_uid", None),
++                                      p.update(pr_acceptance_event_id=p["pr_acceptance_event_id"] + 100000)))
++    run_id, uid = hub.execute("SELECT r.id, r.uid FROM task_runs r WHERE r.id = ?",
++                              (claim_run_id or hub.execute("SELECT run_id FROM task_events WHERE id = ?",
++                                                           (event_id,)).fetchone()[0],)).fetchone()
++    with kb.write_txn(hub):
++        hub.execute("UPDATE task_events SET origin_gateway = NULL WHERE task_id = ?", (tid,))
++        if holder is not None:
++            hub.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
++                        "VALUES (?, ?, 'claimed', ?, 1)",
++                        (tid, run_id, json.dumps({"holder": holder, "run_uid": run_uid or uid, "expires": 1})))
++    assert all(r[0] is None for r in hub.execute("SELECT origin_gateway FROM task_events WHERE task_id = ?", (tid,)))
++
++
++def test_a_completion_replayed_before_origins_were_recorded_binds_its_leased_runs_receipt(boards):
++    worker, hub = boards
++    tid = completed_on_worker(worker)
++    replay(worker, hub)
++    assert own_gateway(hub) != "worker-3"
++    as_pre_origin_replay(hub, tid)
++    assert verified(hub, tid) == (True, True)
++
++
++def test_a_waived_completion_replayed_before_origins_were_recorded_is_verified(boards, monkeypatch):
++    """t_01a1ca1975471ed4's shape: a refused try, then a contract_waiver, both no_required_checks, one run."""
++    worker, hub = boards
++    monkeypatch.setattr(kpa, "collect_acceptance", lambda contract, published, assignee=None: {
++        "ok": False, "classification": "no_required_checks", "head_sha": "b" * 40, "pr_url": PR,
++        "pr_state": "MERGED", "checks": [], "recovery": "", "required": [], "detail": "use contract_waiver"})
++    tid = kb.create_task(worker, title="Ship it", assignee="dev", completion_contract="acme/repo")
++    run = kb.claim_task(worker, tid).current_run_id
++    assert not kb.complete_task(worker, tid, summary="landed", expected_run_id=run, metadata={"published_pr": PR})
++    assert kb.complete_task(worker, tid, summary="landed", expected_run_id=run,
++                            metadata={"published_pr": PR, "contract_waiver": {"reason": "no required checks"}})
++    replay(worker, hub)
++    as_pre_origin_replay(hub, tid)
++    assert verified(hub, tid) == (True, True)
++
++
++@pytest.mark.parametrize("lease", ["own", "none", "other_run_uid", "another_run", "non_str_holder", "unknown_own"])
++def test_a_null_origin_completion_without_a_foreign_lease_of_its_run_stays_exact(boards, lease):
++    """A run this gateway held, no Board lease, a lease naming another run, a lease of another run, a malformed
++    holder, or a board that cannot name itself: the wrong id stays wrong."""
++    worker, hub = boards
++    tid = completed_on_worker(worker)
++    replay(worker, hub)
++    holder = {"own": own_gateway(hub), "none": None, "non_str_holder": 7}.get(lease, "worker-3")
++    other = hub.execute("SELECT id FROM task_runs WHERE task_id != ? ORDER BY id LIMIT 1", (tid,)).fetchone()[0]
++    as_pre_origin_replay(hub, tid, holder=holder,
++                         run_uid="01a1d000-0000-7000-8000-000000000001" if lease == "other_run_uid" else None,
++                         claim_run_id=other if lease == "another_run" else None)
++    if lease == "unknown_own":
++        with kb.write_txn(hub):
++            hub.execute("UPDATE kanban_sync_state SET gateway_id = ''")
++    assert verified(hub, tid) == (False, False)
++
++
++def test_a_lease_naming_no_run_uid_of_a_run_without_one_stays_exact(boards):
++    worker, hub = boards
++    tid = completed_on_worker(worker)
++    replay(worker, hub)
++    as_pre_origin_replay(hub, tid, holder=None)
++    event_id, _ = payload_of(hub, tid)
++    run_id = hub.execute("SELECT run_id FROM task_events WHERE id = ?", (event_id,)).fetchone()[0]
++    with kb.write_txn(hub):
++        hub.execute("UPDATE task_runs SET uid = NULL WHERE id = ?", (run_id,))
++        hub.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'claimed', ?, 1)",
++                    (tid, run_id, json.dumps({"holder": "worker-3"})))
++    assert hub.execute("SELECT uid FROM task_runs WHERE id = ?", (run_id,)).fetchone()[0] is None
++    assert verified(hub, tid) == (False, False)
++
++
++def test_two_gateways_leasing_one_run_is_ambiguous(boards):
++    worker, hub = boards
++    tid = completed_on_worker(worker)
++    replay(worker, hub)
++    as_pre_origin_replay(hub, tid)
++    event_id, _ = payload_of(hub, tid)
++    run_id, uid = hub.execute("SELECT r.id, r.uid FROM task_events e JOIN task_runs r ON r.id = e.run_id "
++                              "WHERE e.id = ?", (event_id,)).fetchone()
++    with kb.write_txn(hub):
++        hub.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'claimed', ?, 1)",
++                    (tid, run_id, json.dumps({"holder": "worker-4", "run_uid": uid})))
++    assert verified(hub, tid) == (False, False)
+-- 
+2.43.0
+

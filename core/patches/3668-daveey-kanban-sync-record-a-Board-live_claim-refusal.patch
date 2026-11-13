@@ -1,0 +1,383 @@
+From 172edcf8c36be40c58d4746e59c886bab0ce24b2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 15:46:14 +0000
+Subject: [PATCH] [daveey] kanban sync: record a Board live_claim refusal of a
+ run handoff / lifecycle event and restore the local row
+
+The Board (hermes-hub #111, deployed 3b0a4fe6ac) now refuses a non-holder's run handoff (task_runs
+status/outcome/ended_at/summary/metadata, a synthesized run included) and lifecycle events (completed,
+blocked, ...) with `live_claim`, by the same live-lease rule as the task row. Before it the Board stored
+them and the completion landed half applied (t_01a1d5386cb55abf; repair t_01a1d4faf1ecda4b).
+
+push() recorded `live_claim` only for `tasks` rows. Now (kanban_sync_live_claim.py):
+- a `task_runs`/`task_events` live_claim is recorded on the card as `sync_rejected`, naming the table
+  and row uid (record_rejection also resolves the task of a delta op that omits task_id);
+- on a primary board the local row is put back to the Board's: the returned row is applied (the run's
+  sync_version cleared so _local_row_is_newer does not skip it), and a row the Board never stored (a
+  phantom synthesized run, a `completed` event) is deleted, tombstoned, so reconcile never re-uploads it;
+- a shadow board records the refusal and leaves its live rows, as for the task row.
+
+The fake Board mirrors rows.ts rowFence. No wire change: an older client sees only extra final
+rejections (test pushes the old shape with task-only handling: nothing applies, nothing stays pending).
+
+Tests: tests/hermes_cli/test_kanban_live_claim_child_rows.py (4: primary restore + holder completes
+after, phantom run removed and never re-uploaded, shadow path, old wire shape). Sweep of
+test_kanban_sync*/test_kanban_remote*/the new file: 63 files, 1460 passed; the one failure
+(forbidden_field payload shape) is fixed by keeping the extra keys to live_claim refusals, 29/29 rerun.
+---
+ hermes_cli/kanban_sync_client.py              |  11 +-
+ hermes_cli/kanban_sync_compat.py              |   9 +-
+ hermes_cli/kanban_sync_live_claim.py          |  61 +++++++
+ tests/hermes_cli/kanban_sync_fake_board.py    |  31 ++++
+ .../test_kanban_live_claim_child_rows.py      | 154 ++++++++++++++++++
+ 5 files changed, 257 insertions(+), 9 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_live_claim.py
+ create mode 100644 tests/hermes_cli/test_kanban_live_claim_child_rows.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index b1ff683724..8d9e048823 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -653,11 +653,6 @@ def _unacked_parents(conn: sqlite3.Connection, rows: list[dict], gateway: str) -
+     return out
+ 
+ 
+-def _record_live_claim_rejection(conn: sqlite3.Connection, row: dict, reason: str) -> None:
+-    from hermes_cli.kanban_sync_compat import record_rejection
+-    record_rejection(conn, row, reason)
+-
+-
+ @dataclass
+ class PushResult:
+     sent: int = 0
+@@ -679,6 +674,7 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+     it once the completion is pulled). See ``kanban_sync_backlog.sendable_before_head``; ``seen`` is its Board-read
+     cache (one per round, shared by both sends)."""
+     from hermes_cli.kanban_db_connect import write_txn
++    from hermes_cli import kanban_sync_live_claim as _live_claim
+     refuse_if_schema_ahead(conn)  # an older core would strip the newer columns; the ops stay pending [daveey]
+     out, seen = PushResult(), {} if seen is None else seen
+     for _ in range(max_batches):
+@@ -754,8 +750,9 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+                         sent_op = next(op for op in wire if op["client_op_id"] == op_id)
+                         if enqueue_retry(conn, row, sent_op, res) != VIRTUAL_DROPPED:
+                             record_rejection(conn, row, reason)
+-                    elif row["table_name"] == "tasks" and res.get("reason") == "live_claim":
+-                        _record_live_claim_rejection(conn, row, reason)
++                    elif _live_claim.is_live_claim(row, res):  # task row, run handoff, lifecycle event (hub #111)
++                        if _live_claim.refused(conn, row, res, reason, primary, authoritative):
++                            continue
+                     if primary and res.get("row"):
+                         authoritative.append(_row_change(row["table_name"], res["row"]))
+         if authoritative:
+diff --git a/hermes_cli/kanban_sync_compat.py b/hermes_cli/kanban_sync_compat.py
+index 945aca2042..5ccc33bc0f 100644
+--- a/hermes_cli/kanban_sync_compat.py
++++ b/hermes_cli/kanban_sync_compat.py
+@@ -32,13 +32,18 @@ def record_rejection(conn: sqlite3.Connection, row: dict, reason: str) -> None:
+     from hermes_cli import kanban_db as kb
+     fields = row["fields"] if isinstance(row["fields"], dict) else json.loads(row["fields"] or "{}")
+     tid = row["row_uid"] if row["table_name"] == "tasks" else fields.get("task_id")
++    if tid is None and row["table_name"] in ("task_runs", "task_events"):  # a delta op names only what changed
++        hit = conn.execute(f"SELECT task_id FROM {row['table_name']} WHERE uid = ?", (row["row_uid"],)).fetchone()
++        tid = hit[0] if hit else None
+     if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (tid,)).fetchone() is None:
+         return
+     # A diagnostic event must not recursively generate diagnostic events on an older Board.
+     if row["table_name"] == "task_events" and fields.get("kind") == "sync_rejected":
+         return
+-    kb._append_event(conn, tid, "sync_rejected",
+-                     {"reason": reason[:300], "fields": sorted(fields), "op_id": row["op_id"]})
++    payload = {"reason": reason[:300], "fields": sorted(fields), "op_id": row["op_id"]}
++    if row["table_name"] != "tasks" and reason.startswith("live_claim"):  # refused handoff/event (hub #111) [daveey]
++        payload.update(table=row["table_name"], uid=str(row["row_uid"]))
++    kb._append_event(conn, tid, "sync_rejected", payload)
+ 
+ 
+ def enqueue_retry(conn: sqlite3.Connection, row: dict, wire: dict, result: dict) -> bool | str:
+diff --git a/hermes_cli/kanban_sync_live_claim.py b/hermes_cli/kanban_sync_live_claim.py
+new file mode 100644
+index 0000000000..ea8e36f324
+--- /dev/null
++++ b/hermes_cli/kanban_sync_live_claim.py
+@@ -0,0 +1,61 @@
++"""A Board ``live_claim`` refusal of a run or lifecycle-event row: record it and restore the local row. [daveey]
++
++The Board (hermes-hub #111, ``rows.ts`` ``rowFence``) refuses ``live_claim`` not only a non-holder's task lifecycle
++columns but also its run handoff (``task_runs`` status/outcome/ended_at/summary/metadata, a synthesized run
++included) and its lifecycle events (``completed``, ``blocked``, ...) while another gateway holds the card's live
++lease. Before that fence the run and event reached the Board and the completion landed half applied
++(t_01a1d5386cb55abf). Here the client keeps that refusal visible on the card (a ``sync_rejected`` event, as for the
++task row) and, on a primary board, puts the local row back to what the Board kept, so this mirror never holds a
++handoff the Board refused:
++
++- the Board returned its row: apply it over the local one, even though this gateway already holds that version
++  (``_local_row_is_newer`` would otherwise skip a copy at or below the run's ``sync_version``);
++- the Board has no such row (a phantom synthesized run, a ``completed`` event): delete the local one, tombstoned,
++  so ``reconcile`` never re-uploads it after the lease ends.
++
++A shadow (non-primary) board leaves its live rows alone, as for the task row: the live file is still the local
++authority there and the shadow copy follows the feed.
++"""
++
++from __future__ import annotations
++
++import sqlite3
++
++from hermes_cli import kanban_db_sync as sync
++
++# Tables whose live_claim refusal is recorded on the card. The task row was the only one before #111.
++RECORDED_TABLES = frozenset({"tasks", "task_runs", "task_events"})
++CHILD_TABLES = frozenset({"task_runs", "task_events"})
++
++
++def is_live_claim(row: dict, res: dict) -> bool:
++    return row["table_name"] in RECORDED_TABLES and res.get("reason") == "live_claim"
++
++
++def refused(conn: sqlite3.Connection, row: dict, res: dict, reason: str, primary: bool,
++            authoritative: list) -> bool:
++    """Record a live_claim refusal on the card; for a child row on a primary board queue its restore into
++    ``authoritative`` and return True (the caller then skips the generic returned-row apply)."""
++    from hermes_cli.kanban_sync_compat import record_rejection
++    record_rejection(conn, row, reason)
++    if not primary or row["table_name"] not in CHILD_TABLES:
++        return False
++    authoritative.extend(restore_child(conn, row, res))
++    return True
++
++
++def restore_child(conn: sqlite3.Connection, row: dict, res: dict) -> list[sync.RemoteChange]:
++    """The changes that make a refused child row match the Board (primary boards; the caller applies them in the
++    push's authoritative batch). Prepares the local run so the Board's copy is not skipped as already seen."""
++    table, uid = row["table_name"], str(row["row_uid"])
++    if table not in CHILD_TABLES or row["op"] != "upsert":
++        return []
++    board_row = res.get("row")
++    if board_row:
++        if table == "task_runs":
++            conn.execute("UPDATE task_runs SET sync_version = NULL WHERE uid = ?", (uid,))
++        return [sync.RemoteChange(seq=0, table=table, uid=str(board_row["uid"]), op="upsert", fields=board_row,
++                                  version=int(board_row.get("version") or 0), hlc=str(board_row.get("hlc") or ""),
++                                  origin_gateway=str(board_row.get("origin_gateway") or ""))]
++    return [sync.RemoteChange(seq=0, table=table, uid=uid, op="delete", fields={}, version=0, hlc="",
++                              origin_gateway="")]
+diff --git a/tests/hermes_cli/kanban_sync_fake_board.py b/tests/hermes_cli/kanban_sync_fake_board.py
+index db65e33175..76463879d4 100644
+--- a/tests/hermes_cli/kanban_sync_fake_board.py
++++ b/tests/hermes_cli/kanban_sync_fake_board.py
+@@ -18,6 +18,10 @@ from typing import Any, Optional
+ from hermes_cli import kanban_sync_client as ksc
+ 
+ FENCED = {"status", "current_run_uid", "result", "started_at", "completed_at"}
++# rows.ts RUN_FENCED / FENCED_EVENT_KINDS (hermes-hub #111): a non-holder's run handoff and lifecycle events.
++RUN_FENCED = ("status", "outcome", "ended_at", "summary", "metadata")
++FENCED_EVENT_KINDS = frozenset({"completed", "blocked", "unblocked", "scheduled", "review_requested",
++                                "changes_requested", "reclaimed", "archived", "status"})
+ 
+ 
+ def _js_number(x: float) -> str:
+@@ -178,6 +182,30 @@ class FakeService:
+         b["changes"][-1]["fields"] = copy.deepcopy(cur)
+         return cur
+ 
++    @staticmethod
++    def child_fence(b: dict, table: str, uid: str, f: dict, gw: str) -> Optional[dict]:
++        """As rows.ts rowFence for child rows: while another gateway holds the card's lease, a run upsert that changes
++        a RUN_FENCED column (or creates the run) and a FENCED_EVENT_KINDS event are rejected ``live_claim`` with the
++        Board's row (None for a row it never stored)."""
++        if table not in ("task_runs", "task_events"):
++            return None
++        cur = b["rows"].get(table, {}).get(uid)
++        if cur is not None and cur.get("deleted_at"):
++            return None
++        lease = b["leases"].get(f.get("task_id") or (cur or {}).get("task_id"))
++        if not lease or lease["holder"] == gw:
++            return None
++        same = lambda a, z: (None if a is None else str(a)) == (None if z is None else str(z))
++        if table == "task_runs":
++            hit = any(k in f and (cur is None or not same(f[k], cur.get(k))) for k in RUN_FENCED)
++        else:
++            kind = f.get("kind", (cur or {}).get("kind"))
++            hit = kind in FENCED_EVENT_KINDS and (cur is None or not same(kind, cur.get("kind")))
++        if not hit:
++            return None
++        return {"status": "rejected", "reason": "live_claim",
++                "detail": f"task is running under {lease['holder']}'s live lease", "row": cur}
++
+     def row_op(self, b: dict, op: dict, gw: str) -> dict:
+         table, uid, kind = op["table"], op["uid"], op["op"]
+         rows = b["rows"].setdefault(table, {})
+@@ -188,6 +216,9 @@ class FakeService:
+             self._emit(b, table, uid, "delete", None, gw, op["client_op_id"])
+             return {"status": "applied"}
+         f = dict(op["fields"])
++        fenced = self.child_fence(b, table, uid, f, gw)
++        if fenced is not None:
++            return fenced
+         if table == "tasks":
+             cur = rows.get(uid)
+             if cur is None:
+diff --git a/tests/hermes_cli/test_kanban_live_claim_child_rows.py b/tests/hermes_cli/test_kanban_live_claim_child_rows.py
+new file mode 100644
+index 0000000000..f518734ca7
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_live_claim_child_rows.py
+@@ -0,0 +1,154 @@
++"""A Board ``live_claim`` refusal of a run handoff or lifecycle event is recorded and undone locally. [daveey]
++
++The Board (hermes-hub #111) refuses a non-holder's run handoff and lifecycle events by the same live-lease rule as
++the task row. Before it, core <= e43a9e016a (still on the MacBook) completed a card another machine ran: the task
++row came back ``live_claim`` but the run end and the ``completed`` event reached the Board (t_01a1d5386cb55abf).
++Here the hub writes that completion the way an older core did (raw rows, past the up-front guards of PR #2254) and
++pushes it to a Board that fences them: every refusal is recorded on the card and, on a primary board, the local
++run is restored from the Board's row and a phantom run or event the Board never stored is removed.
++"""
++
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_remote_archive import _running_on_worker
++from tests.hermes_cli.test_kanban_worker_node import BOARD, HUB, WORKER, Gateway
++
++
++@pytest.fixture
++def svc():
++    return FakeService(lease_runs=True)
++
++
++@pytest.fixture
++def gws(tmp_path, monkeypatch, svc):
++    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK", "HERMES_KANBAN_BOARD",
++                "HERMES_KANBAN_DB"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    sync.consume_dispatcher_wake()
++    hub = Gateway(tmp_path, HUB, svc, monkeypatch, pickup=False)
++    worker = Gateway(tmp_path, WORKER, svc, monkeypatch, pickup="true")
++    yield hub, worker
++    for g in (hub, worker):
++        g.conn.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++def _old_core_complete(conn, tid, *, phantom=False):
++    """What core's complete_task wrote before the up-front guards: the task row, the run end (or, with no local
++    run, a synthesized one) and a ``completed`` event. The capture triggers queue all three."""
++    with conn:
++        conn.execute("UPDATE tasks SET status = 'done', result = 'X', completed_at = 2000 WHERE id = ?", (tid,))
++        if phantom:
++            cur = conn.execute("INSERT INTO task_runs (task_id, profile, status, outcome, started_at, ended_at, summary)"
++                               " VALUES (?, 'default', 'done', 'completed', 2000, 2000, 'X')", (tid,))
++            run_id = cur.lastrowid
++        else:
++            run_id = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++            run_id = run_id or conn.execute("SELECT MAX(id) FROM task_runs WHERE task_id = ?", (tid,)).fetchone()[0]
++            conn.execute("UPDATE task_runs SET status = 'done', outcome = 'completed', ended_at = 2000,"
++                         " summary = 'X', metadata = '{\"by\": \"hub\"}' WHERE id = ?", (run_id,))
++        conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at)"
++                     " VALUES (?, ?, 'completed', '{\"summary\": \"X\"}', 2000)", (tid, run_id))
++    return run_id
++
++
++def _rejections(conn, tid):
++    return [json.loads(p) for (p,) in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'sync_rejected' ORDER BY id", (tid,))]
++
++
++def _board_runs(svc, tid):
++    return {u: r for u, r in svc.board(BOARD)["rows"].get("task_runs", {}).items() if r.get("task_id") == tid}
++
++
++def _board_kinds(svc, tid):
++    return [e["kind"] for e in svc.board(BOARD)["rows"].get("task_events", {}).values() if e.get("task_id") == tid]
++
++
++def test_refused_run_handoff_is_recorded_and_the_local_run_restored(gws, svc):
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    run_id = _old_core_complete(hub.conn, tid)
++    uid = hub.conn.execute("SELECT uid FROM task_runs WHERE id = ?", (run_id,)).fetchone()[0]
++    hub.round()
++    # Board: nothing of the completion landed.
++    assert _board_runs(svc, tid)[uid]["status"] == "running" and _board_runs(svc, tid)[uid]["summary"] is None
++    assert "completed" not in _board_kinds(svc, tid)
++    # Hub: each refused row is recorded on the card, naming the table ...
++    rej = _rejections(hub.conn, tid)
++    assert {(r.get("table", "tasks"), r["reason"].split(":")[0]) for r in rej} >= {
++        ("tasks", "live_claim"), ("task_runs", "live_claim"), ("task_events", "live_claim")}, rej
++    # ... the run mirror is the Board's again, and the refused `completed` event is gone.
++    run = hub.conn.execute("SELECT status, outcome, ended_at, summary, metadata FROM task_runs WHERE uid = ?",
++                           (uid,)).fetchone()
++    assert tuple(run) == ("running", None, None, None, None)
++    assert hub.conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'completed'",
++                            (tid,)).fetchone()[0] == 0
++    # The next rounds re-upload none of it, and the holder's own completion then applies normally.
++    hub.round()
++    assert _board_runs(svc, tid)[uid]["summary"] is None
++    worker.enter()
++    wrid = worker.conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    assert kb.complete_task(worker.conn, tid, summary="worker's handoff", expected_run_id=wrid)
++    worker.round()
++    hub.round()
++    assert _board_runs(svc, tid)[uid]["summary"] == "worker's handoff"
++    assert hub.conn.execute("SELECT summary FROM task_runs WHERE uid = ?", (uid,)).fetchone()[0] == "worker's handoff"
++
++
++def test_refused_phantom_run_is_removed_and_never_reuploaded(gws, svc):
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    before = set(_board_runs(svc, tid))
++    run_id = _old_core_complete(hub.conn, tid, phantom=True)
++    hub.round()
++    hub.round()
++    assert set(_board_runs(svc, tid)) == before
++    assert hub.conn.execute("SELECT COUNT(*) FROM task_runs WHERE id = ?", (run_id,)).fetchone()[0] == 0
++    assert ("task_runs", "live_claim") in {(r.get("table", "tasks"), r["reason"].split(":")[0]) for r in _rejections(hub.conn, tid)}
++
++
++def test_shadow_board_records_the_refusal_and_leaves_its_rows(gws, svc):
++    """Non-primary: the refusal is still recorded; the live rows stay (the shadow follows the feed, as for tasks)."""
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    run_id = _old_core_complete(hub.conn, tid)
++    sync.set_mode(hub.conn, "shadow")
++    hub.round()
++    assert ("task_runs", "live_claim") in {(r.get("table", "tasks"), r["reason"].split(":")[0]) for r in _rejections(hub.conn, tid)}
++    assert hub.conn.execute("SELECT summary FROM task_runs WHERE id = ?", (run_id,)).fetchone()[0] == "X"
++    assert "completed" not in _board_kinds(svc, tid)
++
++
++def test_old_wire_shape_task_only_handling_sees_extra_final_rejections(gws, svc, monkeypatch):
++    """An older client (task-row-only live_claim handling) sends the same wire shape; the extra rejections are
++    final, so its push ends after one round with nothing applied and nothing left to retry."""
++    from hermes_cli import kanban_sync_live_claim as lc
++    monkeypatch.setattr(lc, "RECORDED_TABLES", frozenset({"tasks"}))
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    _old_core_complete(hub.conn, tid)
++    sends = []
++    monkeypatch.setattr(svc, "calls", sends)
++    hub.round()
++    pushed = [ops for kind, _b, ops in sends if kind == "ops"]
++    assert pushed, sends
++    assert set(pushed[0][0]) >= {"client_op_id", "op", "table", "uid", "fields", "hlc"}
++    assert "completed" not in _board_kinds(svc, tid)
++    hub.round()
++    assert "completed" not in _board_kinds(svc, tid)
++    # Final, not transient: nothing of the refused completion is left pending for a later retry.
++    assert hub.conn.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE state = 'pending'").fetchone()[0] == 0
++    # The older client recorded only the task row; the extra refusals changed nothing else for it.
++    assert {r.get("table", "tasks") for r in _rejections(hub.conn, tid)} == {"tasks"}
+-- 
+2.43.0
+

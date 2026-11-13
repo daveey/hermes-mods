@@ -1,0 +1,118 @@
+From 70e5e59fb7c9121388120ecf22e98da031ccf2f3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 15:58:52 +0000
+Subject: [PATCH] [daveey] kanban: reopen of a stale copy reclaims its dangling
+ run; reopen of an archived copy says nothing revives it
+
+PR #2271 review 5893184151 follow-ups (card t_01a1d569389677d7):
+
+1. reopen_done_task's stale-copy branch flipped a blocked/scheduled/triage row
+   to ready and nulled current_run_id without closing the run it pointed at,
+   leaking an open task_runs row. It now calls _reclaim_dangling_run on the
+   same statuses unblock_task does, inside the txn, before the UPDATE.
+2. `hermes kanban reopen` of an archived stale copy printed "status is
+   'scheduled', not 'done'; use unblock/reopen-review", while unblock says
+   nothing revives it. unblock_refusal takes verb="reopen" (archived holds
+   only; reopen accepts a done hold) and _cmd_reopen prints it.
+
+Tests: RED-then-GREEN in tests/hermes_cli/test_kanban_stale_wake_terminal.py
+(run ended after reopen; CLI archived-copy message).
+---
+ hermes_cli/kanban.py                          |  3 ++
+ hermes_cli/kanban_db_operator.py              |  3 ++
+ hermes_cli/kanban_terminal_guard.py           |  9 +++---
+ .../test_kanban_stale_wake_terminal.py        | 29 +++++++++++++++++++
+ 4 files changed, 40 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 821f1f6fd0..88189efa45 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1369,6 +1369,9 @@ def _cmd_reopen(args: argparse.Namespace) -> int:
+         except kbo.KanbanEditRefused as exc:
+             return _err(f"kanban reopen: {exc}", 2)
+         if status is None:
++            held = kb.unblock_refusal(conn, args.task_id, verb="reopen")  # an archived stale copy: nothing revives it
++            if held:
++                return _err(held)
+             current = kb.get_task(conn, args.task_id)
+             what = "unknown id" if current is None else f"status is {current.status!r}, not 'done'"
+             return _err(f"cannot reopen {args.task_id} ({what}); use unblock/reopen-review for other states")
+diff --git a/hermes_cli/kanban_db_operator.py b/hermes_cli/kanban_db_operator.py
+index c9f8c36823..56f178d33e 100644
+--- a/hermes_cli/kanban_db_operator.py
++++ b/hermes_cli/kanban_db_operator.py
+@@ -146,6 +146,9 @@ def reopen_done_task(
+         if previous != "done" and (stale_hold(conn, task_id) or {}).get("status") != "done":
+             return None
+         new_status = _kb._landing_status_after_parents(conn, task_id)
++        # The UPDATE nulls ``current_run_id``: close the run it points at first, as ``unblock_task`` does.
++        _kb._reclaim_dangling_run(conn, task_id, statuses=("blocked", "scheduled", "triage"), now=int(time.time()),
++                                  note="invariant recovery on reopen")
+         cur = conn.execute(
+             "UPDATE tasks SET status = ?, completed_at = NULL, current_run_id = NULL, "
+             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+diff --git a/hermes_cli/kanban_terminal_guard.py b/hermes_cli/kanban_terminal_guard.py
+index 57a913f6e0..e8298fa988 100644
+--- a/hermes_cli/kanban_terminal_guard.py
++++ b/hermes_cli/kanban_terminal_guard.py
+@@ -155,14 +155,15 @@ def stale_hold(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+     return terminal_hold(conn, task_id) if row is not None and row[0] in _UNBLOCKABLE else None
+ 
+ 
+-def unblock_refusal(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
++def unblock_refusal(conn: sqlite3.Connection, task_id: str, *, verb: str = "unblock") -> Optional[str]:
+     """The user-facing text for an unblock ``unblock_held`` refused (CLI, dashboard, operator call), else None:
+     the row does read blocked/scheduled, so a bare "not blocked/scheduled?" would mislead. A held-done copy is
+-    revived by ``reopen`` (``kanban_db_operator.reopen_done_task`` accepts it); nothing revives an archived card."""
++    revived by ``reopen`` (``kanban_db_operator.reopen_done_task`` accepts it); nothing revives an archived card.
++    ``verb="reopen"``: the CLI reopen's refusal, which names only the archived hold (reopen accepts a done one)."""
+     hold = stale_hold(conn, task_id)
+-    if hold is None:
++    if hold is None or (verb == "reopen" and hold["status"] == "done"):
+         return None
+-    head = f"cannot unblock {task_id}: its {hold['kind']} event holds it {hold['status']} (this row is a stale copy)"
++    head = f"cannot {verb} {task_id}: its {hold['kind']} event holds it {hold['status']} (this row is a stale copy)"
+     if hold["status"] == "done":
+         return f"{head}; use `hermes kanban reopen {task_id} --reason <why>` to revive it"
+     return f"{head}; an archived card is not revived by unblock or reopen"
+diff --git a/tests/hermes_cli/test_kanban_stale_wake_terminal.py b/tests/hermes_cli/test_kanban_stale_wake_terminal.py
+index 90cf8e36be..36f03d3943 100644
+--- a/tests/hermes_cli/test_kanban_stale_wake_terminal.py
++++ b/tests/hermes_cli/test_kanban_stale_wake_terminal.py
+@@ -616,3 +616,32 @@ def test_unblock_refusal_of_an_archived_copy_names_no_reopen_and_the_dashboard_e
+     assert text.startswith(f"cannot unblock {tid}: its archived event holds it archived")
+     assert "reopen `" not in text and "not revived" in text
+     assert plugin_api._refusal_detail(board, tid, "ready") == text
++
++
++# PR #2271 review 5893184151: reopen's stale-copy branch nulled ``current_run_id`` without closing the run it pointed
++# at (``unblock_task`` reclaims it on the same statuses), and the CLI's archived-copy refusal still named unblock.
++
++def test_reopen_of_a_stale_copy_with_a_live_run_pointer_ends_that_run(board):
++    from hermes_cli.kanban_db_operator import reopen_done_task
++    tid = _parked(board)
++    _stale_scheduled_copy_of_a_done_card(board, tid)
++    with kb.write_txn(board):
++        run_id = board.execute("INSERT INTO task_runs (task_id, profile, status, started_at) "
++                               "VALUES (?, 'worker', 'running', ?)", (tid, int(time.time()))).lastrowid
++        board.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, tid))
++    assert reopen_done_task(board, tid, reason="more work", actor="david") == "ready"
++    run = board.execute("SELECT status, ended_at FROM task_runs WHERE id = ?", (run_id,)).fetchone()
++    assert run["ended_at"] is not None and run["status"] == "reclaimed"
++    assert board.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0] is None
++
++
++def test_cli_reopen_of_an_archived_stale_copy_says_nothing_revives_it(board, human, capsys):
++    tid = _parked(board)
++    with kb.write_txn(board):
++        kb._append_event(board, tid, "archived", {})
++    assert _cli("reopen", tid, "--reason", "more work") == 1
++    err = capsys.readouterr().err
++    assert f"cannot reopen {tid}: its archived event holds it archived (this row is a stale copy)" in err
++    assert "not revived by unblock or reopen" in err
++    assert "use unblock/reopen-review" not in err
++    assert _status(board, tid) == "scheduled"
+-- 
+2.43.0
+

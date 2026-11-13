@@ -1,0 +1,303 @@
+From b4e84e04ce0fc992805f14ca2d09c043777fe598 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 16:53:33 +0000
+Subject: [PATCH] [daveey] kanban overlap same-creator guard: a denial is not a
+ duplicate; an added round/sha is not an enumeration
+
+Follow-ups from independent exact-head review 5893203646 of PR #2329 (card t_01a1d56ea127e910).
+
+1. hermes_cli/kanban_dup_detector.py: `_DUP` matched denials ("Not a duplicate of t_X",
+   "No duplicates found; parent t_X"), so a completion that says it is NOT a duplicate could open or
+   comment the same-creator-duplicate detector card. `sibling_named` now scans each duplicate/supersede
+   keyword and skips it when a negation (not/no/never/non-/...n't) sits up to two words before it in the
+   same clause. A negation in an earlier clause ("No code changes; duplicate of t_X") still counts, and a
+   denied keyword no longer swallows a later "superseded by t_Y".
+
+2. hermes_cli/kanban_overlap_own.py: any digit-bearing token anywhere counted as an enumeration marker,
+   so a re-issue whose title only adds "(round 2)" or a sha was admitted as fan-out whenever both titles
+   carried any number (e.g. "PR #2329"). `enumerated()` now aligns the two titles' tokens
+   (difflib opcodes) and counts markers only in a replaced span with a marker on both sides
+   (w1-01/w1-02, worker-2/worker-3, 1/3 vs 3/3, fixture A/B, head sha vs head sha). An inserted marker is
+   a re-issue and goes through the normal refusal.
+
+Tests (RED on 8b0b242940d, GREEN here):
+- tests/hermes_cli/test_kanban_dup_detector.py: 4 denial phrasings open nothing; earlier-clause negation
+  and a later supersede still detected (5 failed before).
+- tests/tools/test_kanban_create_overlap_same_creator.py + fixture: two `reissue` replay cases (round 2,
+  appended sha) are refused; added-number vs same-place-index unit cases (5 failed before). All 14
+  recorded legitimate fan-outs and the 3 recorded duplicates are unchanged; the 3-completion detector
+  replay still opens exactly one card.
+- All 15 test files importing kanban_overlap / kanban_dup_detector / create_overlap: 435 passed, 1 skipped.
+---
+ hermes_cli/kanban_dup_detector.py             | 28 +++++++++--
+ hermes_cli/kanban_overlap_own.py              | 38 +++++++++++---
+ tests/hermes_cli/test_kanban_dup_detector.py  | 21 ++++++++
+ .../kanban_overlap_same_creator_replay.json   | 50 +++++++++++++++++++
+ ...test_kanban_create_overlap_same_creator.py | 31 ++++++++++++
+ 5 files changed, 158 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/kanban_dup_detector.py b/hermes_cli/kanban_dup_detector.py
+index 0536a1a147..6c5913911b 100644
+--- a/hermes_cli/kanban_dup_detector.py
++++ b/hermes_cli/kanban_dup_detector.py
+@@ -8,7 +8,7 @@ still passes it. This detector is the net behind it.
+ 
+ When a card completes with a summary or result that says it duplicates, or was superseded by, a card id
+ (``duplicate of t_X``, ``duplicates t_X``, ``Superseded ... card t_X``), and ``t_X`` has the same creator task,
+-one open card on that board collects the pattern:
++one open card on that board collects the pattern (a denial such as ``Not a duplicate of t_X`` does not count):
+ - no open detector card: one is created (``ready``, assignee ``default``) naming this pair;
+ - an open one exists: this pair is added to it as a comment.
+ After that card is done or archived, the next occurrence opens a new one. Never raises.
+@@ -27,12 +27,32 @@ KEY_PREFIX = "detector:same-creator-duplicate:"
+ TITLE = "Same-creator duplicate cards: create_overlap let a creator file the same work twice"
+ _CARD = r"t_[0-9a-f]{8,16}"
+ # "duplicate of t_X", "duplicates t_X", "DUPLICATE of t_X", "superseded by ... t_X", "Superseded: ... card t_X".
+-_DUP = re.compile(rf"\b(?:duplicat\w*|supersed\w*)\b[^.\n]{{0,120}}?\b({_CARD})\b", re.IGNORECASE)
++_KEYWORD = re.compile(r"\b(?:duplicat\w*|supersed\w*)\b", re.IGNORECASE)
++_AFTER = re.compile(rf"[^.\n]{{0,120}}?\b({_CARD})\b")
++# A denial in the keyword's own clause, up to two words before it: "Not a duplicate of t_X", "No duplicates
++# found; parent t_X", "isn't a duplicate", "non-duplicate" (PR #2329 review). An earlier clause ("No code
++# changes; duplicate of t_X") does not deny it.
++_NEGATED = re.compile(r"\b(?:not|no|never|non|\w+n['\u2019]t)[\s-]+(?:[\w'\u2019]+\s+){0,2}$", re.IGNORECASE)
++_CLAUSE_END = re.compile(r"[.;:!?,\n]")
++
++
++def _negated(text: str, start: int) -> bool:
++    before = text[max(0, start - 80):start]
++    ends = [m.end() for m in _CLAUSE_END.finditer(before)]
++    return bool(_NEGATED.search(before[ends[-1] if ends else 0:]))
+ 
+ 
+ def sibling_named(text: str) -> list[str]:
+-    """Card ids the text says this card duplicates or was superseded by, in order."""
+-    return list(dict.fromkeys(m.group(1) for m in _DUP.finditer(text or "")))
++    """Card ids the text says this card duplicates or was superseded by, in order; a denied one is skipped."""
++    text = text or ""
++    found = []
++    for kw in _KEYWORD.finditer(text):
++        if _negated(text, kw.start()):
++            continue
++        card = _AFTER.match(text, kw.end())
++        if card:
++            found.append(card.group(1))
++    return list(dict.fromkeys(found))
+ 
+ 
+ def _creator(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+diff --git a/hermes_cli/kanban_overlap_own.py b/hermes_cli/kanban_overlap_own.py
+index a35c550ae7..3b72e1053b 100644
+--- a/hermes_cli/kanban_overlap_own.py
++++ b/hermes_cli/kanban_overlap_own.py
+@@ -13,8 +13,10 @@ the cards are different work (:func:`own_distinct`):
+ - another assignee;
+ - one title is a review and the other is not;
+ - different leading component tags (``[core]`` vs ``[mods]``, ``Board:`` vs ``Core:``);
+-- the titles are an enumeration: both carry index markers (a digit token or a lone capital letter) and the
+-  markers differ (``w1-01``/``w1-02``, ``worker-2``/``worker-3``, ``1/3``/``3/3``, fixture A/B, two shas).
++- the titles are an enumeration (:func:`enumerated`): in the same place of both titles each carries an index
++  marker (a digit token or a lone capital letter) and the markers differ (``w1-01``/``w1-02``,
++  ``worker-2``/``worker-3``, ``1/3``/``3/3``, fixture A/B, two shas). A marker only one title has (an added
++  ``round 2`` or sha) is a re-issue, not a leg.
+ 
+ Two cards from one owner that name the same rare code identifiers share a fix site even when their titles are
+ worded apart, as the PR #2062 pair did (title ratio 0.41). That is :func:`shared_code_reason`: at least
+@@ -37,6 +39,7 @@ tree inherits that session, and the 10-11 race of two creators is another cause.
+ from __future__ import annotations
+ 
+ import re
++from difflib import SequenceMatcher
+ from functools import lru_cache
+ from typing import Iterable, Optional
+ 
+@@ -52,6 +55,7 @@ _REVIEW = re.compile(r"\b(?:re-?review|review)\b(?!\s+(?:nits?|follow-?ups?|find
+ _COMPONENT = re.compile(r"^\s*(?:\[([a-z0-9_-]+)\]|([a-z0-9_-]+):\s)", re.IGNORECASE)
+ _DIGIT_TOKEN = re.compile(r"[a-z0-9]*\d[a-z0-9]*")
+ _LETTER_MARK = re.compile(r"(?<![\w'\u2019])([A-Z])(?![\w'\u2019])")
++_TOKEN = re.compile(r"[A-Za-z0-9]+(?:[-/.'\u2019][A-Za-z0-9]+)*")
+ 
+ 
+ @lru_cache(maxsize=8192)
+@@ -94,6 +98,28 @@ def markers(title: str) -> frozenset[str]:
+         f"letter:{m}" for m in _LETTER_MARK.findall(plain))
+ 
+ 
++def _title_tokens(title: str) -> list[str]:
++    plain = _CARD_ID.sub(" ", title or "")
++    return [m.group(0) for m in _TOKEN.finditer(plain)]
++
++
++def enumerated(title: str, theirs: str) -> Optional[tuple[frozenset[str], frozenset[str]]]:
++    """``(mine, theirs)`` index markers that differ in the same place of both titles, else None.
++
++    Only a replaced span counts, with a marker on both sides (``w1-01``/``w1-02``, ``1/3``/``3/3``, fixture
++    ``A``/``B``, head ``5d2e512cbb``/``9baf8d8abc``). A marker only one title has (an added ``round 2``, an
++    appended sha, ``attempt 3``) is a re-issue of the same work, not a leg (PR #2329 review)."""
++    a, b = _title_tokens(title), _title_tokens(theirs)
++    ops = SequenceMatcher(None, [t.lower() for t in a], [t.lower() for t in b], autojunk=False).get_opcodes()
++    for tag, i1, i2, j1, j2 in ops:
++        if tag != "replace":
++            continue
++        mine_m, their_m = markers(" ".join(a[i1:i2])), markers(" ".join(b[j1:j2]))
++        if mine_m and their_m and mine_m != their_m:
++            return mine_m - their_m, their_m - mine_m
++    return None
++
++
+ def _component(title: str) -> Optional[str]:
+     m = _COMPONENT.match(title or "")
+     return (m.group(1) or m.group(2)).lower() if m else None
+@@ -109,10 +135,10 @@ def own_distinct(title: str, assignee: Optional[str], card: dict) -> Optional[st
+     mine_c, their_c = _component(title), _component(theirs)
+     if mine_c and their_c and mine_c != their_c:
+         return f"component {mine_c} != {their_c}"
+-    mine_m, their_m = markers(title), markers(theirs)
+-    if mine_m and their_m and mine_m != their_m:
+-        return f"enumerated ({', '.join(sorted(mine_m - their_m)[:3]) or '-'} vs " \
+-               f"{', '.join(sorted(their_m - mine_m)[:3]) or '-'})"
++    diff = enumerated(title, theirs)
++    if diff:
++        mine_m, their_m = diff
++        return f"enumerated ({', '.join(sorted(mine_m)[:3]) or '-'} vs {', '.join(sorted(their_m)[:3]) or '-'})"
+     return None
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_dup_detector.py b/tests/hermes_cli/test_kanban_dup_detector.py
+index 921cfc153a..7e1df326c1 100644
+--- a/tests/hermes_cli/test_kanban_dup_detector.py
++++ b/tests/hermes_cli/test_kanban_dup_detector.py
+@@ -74,6 +74,27 @@ def test_other_creator_and_plain_completions_open_nothing(conn):
+     assert dd.describe(conn) == []
+ 
+ 
++@pytest.mark.parametrize("summary", [
++    "Not a duplicate of {first}: this card fixes the Mac path, that one the hub path.",
++    "No duplicates found; parent {first} owns only the design.",
++    "This isn't a duplicate of {first}, which covers the other module.",
++    "Checked for a non-duplicate scope against {first}.",
++])
++def test_a_completion_that_denies_duplication_opens_nothing(conn, summary):
++    creator = kb.create_task(conn, title="creator", assignee="default")
++    first, second = _pair(conn, creator)
++    assert dd.sibling_named(summary.format(first=first)) == []
++    assert kb.complete_task(conn, second, summary=summary.format(first=first))
++    assert dd.describe(conn) == []
++
++
++def test_a_negation_in_an_earlier_clause_does_not_hide_a_duplicate():
++    assert dd.sibling_named("No code changes; duplicate of t_0123456789abcdef.") == ["t_0123456789abcdef"]
++    assert dd.sibling_named("Not a duplicate of t_0123456789abcdef; superseded by t_fedcba9876543210.") == [
++        "t_fedcba9876543210"]
++    assert dd.sibling_named("No duplicates elsewhere, superseded by t_fedcba9876543210.") == ["t_fedcba9876543210"]
++
++
+ def test_a_closed_detector_card_lets_the_next_occurrence_open_a_new_one(conn):
+     creator = kb.create_task(conn, title="creator", assignee="default")
+     first, second = _pair(conn, creator)
+diff --git a/tests/tools/fixtures/kanban_overlap_same_creator_replay.json b/tests/tools/fixtures/kanban_overlap_same_creator_replay.json
+index 9ce885bbf8..1a1e28e85b 100644
+--- a/tests/tools/fixtures/kanban_overlap_same_creator_replay.json
++++ b/tests/tools/fixtures/kanban_overlap_same_creator_replay.json
+@@ -897,6 +897,56 @@
+     "hermes_cli request_changes reviewed_pr reviewed_sha",
+     "request_changes reviewed_pr reviewed_sha"
+    ]
++  },
++  {
++   "kind": "reissue",
++   "note": "PR #2329 review 5893203646: the hub card t_01a1d56ea127e910 re-issued in a later run with \"(round 2)\" appended; only the title suffix and ids are synthetic",
++   "creator": "t_01a1d522bfce4cbc",
++   "a": {
++    "id": "t_01a1d56ea127e910",
++    "title": "Core overlap same-creator guard follow-ups (PR #2329 review nits): detector regex matches negations; any digit token counts as an enumeration marker",
++    "body": "From independent exact-head review 5893203646 of PR #2329 (example-org/hermes, card t_01a1d562472349a2). Fix both in core via `hermes-core-wt ship` with its own exact-head review.\n\n1. Detector false positive. `hermes_cli/kanban_dup_detector.py` `_DUP` regex matches negations such as \"Not a duplicate of t_X\" or \"No duplicates found; parent t_X\". Add a negation guard with tests for both phrasings.\n2. Enumeration fail-open. In `hermes_cli/kanban_overlap_own.py`, any digit-bearing token counts as an enumeration marker, so a re-issue whose title adds \"round 2\" or a sha is admitted as enumerated fan-out.",
++    "assignee": "default",
++    "created_at": 1794582159,
++    "has_key": false
++   },
++   "b": {
++    "id": "t_01a1d5f0c0ffee02",
++    "title": "Core overlap same-creator guard follow-ups (PR #2329 review nits): detector regex matches negations; any digit token counts as an enumeration marker (round 2)",
++    "body": "From independent exact-head review 5893203646 of PR #2329 (example-org/hermes, card t_01a1d562472349a2). Fix both in core via `hermes-core-wt ship` with its own exact-head review.\n\n1. Detector false positive. `hermes_cli/kanban_dup_detector.py` `_DUP` regex matches negations such as \"Not a duplicate of t_X\" or \"No duplicates found; parent t_X\". Add a negation guard with tests for both phrasings.\n2. Enumeration fail-open. In `hermes_cli/kanban_overlap_own.py`, any digit-bearing token counts as an enumeration marker, so a re-issue whose title adds \"round 2\" or a sha is admitted as enumerated fan-out.",
++    "assignee": "default",
++    "created_at": 1794590000,
++    "has_key": true
++   },
++   "b_key": "followup:pr2329:review-nits-r2",
++   "b_parents": [],
++   "run_started": 1794589900,
++   "background": []
++  },
++  {
++   "kind": "reissue",
++   "note": "the same re-issue with the reviewed head sha appended instead of a round number (synthetic suffix and ids)",
++   "creator": "t_01a1d522bfce4cbc",
++   "a": {
++    "id": "t_01a1d56ea127e910",
++    "title": "Core overlap same-creator guard follow-ups (PR #2329 review nits): detector regex matches negations; any digit token counts as an enumeration marker",
++    "body": "From independent exact-head review 5893203646 of PR #2329 (example-org/hermes, card t_01a1d562472349a2). Fix both in core via `hermes-core-wt ship` with its own exact-head review.",
++    "assignee": "default",
++    "created_at": 1794582159,
++    "has_key": false
++   },
++   "b": {
++    "id": "t_01a1d5f0c0ffee03",
++    "title": "Core overlap same-creator guard follow-ups (PR #2329 review nits @ 9baf8d8abc): detector regex matches negations; any digit token counts as an enumeration marker",
++    "body": "From independent exact-head review 5893203646 of PR #2329 (example-org/hermes, card t_01a1d562472349a2). Fix both in core via `hermes-core-wt ship` with its own exact-head review.",
++    "assignee": "default",
++    "created_at": 1794590000,
++    "has_key": true
++   },
++   "b_key": "followup:pr2329:review-nits-9baf8d8abc",
++   "b_parents": [],
++   "run_started": 1794589900,
++   "background": []
+   }
+  ]
+ }
+\ No newline at end of file
+diff --git a/tests/tools/test_kanban_create_overlap_same_creator.py b/tests/tools/test_kanban_create_overlap_same_creator.py
+index f50eb814f5..0be49b7e32 100644
+--- a/tests/tools/test_kanban_create_overlap_same_creator.py
++++ b/tests/tools/test_kanban_create_overlap_same_creator.py
+@@ -82,6 +82,37 @@ def test_recorded_legitimate_fan_out_is_admitted(case):
+     assert _replay(case) is None
+ 
+ 
++@pytest.mark.parametrize("case", [c for c in CASES if c["kind"] == "reissue"], ids=_cid)
++def test_reissue_that_only_adds_a_round_or_sha_is_refused(case):
++    """PR #2329 review: a title that only adds "(round 2)" or a sha is the same work, not an enumerated leg."""
++    match = _replay(case)
++    assert match is not None, "an added round number or sha must not read as an enumeration marker"
++
++
++@pytest.mark.parametrize("mine, theirs", [
++    ("Fix the overlap guard (PR #2329 review nits)", "Fix the overlap guard (PR #2329 review nits) round 2"),
++    ("Fix the overlap guard (PR #2329 review nits)", "Fix the overlap guard (PR #2329 review nits) at 9baf8d8abc"),
++    ("Fix the overlap guard for PR #2329", "Fix the overlap guard for PR #2329, attempt 3 after 2 crashes"),
++])
++def test_an_added_number_is_not_an_enumeration(mine, theirs):
++    from hermes_cli import kanban_overlap_own as own
++    card = {"title": theirs, "assignee": "default"}
++    assert own.own_distinct(mine, "default", card) is None
++
++
++@pytest.mark.parametrize("mine, theirs", [
++    ("Sleep probe w1-01 (holds one slot)", "Sleep probe w1-02 (holds one slot)"),
++    ("Victim scan on worker-2: live probes", "Victim scan on worker-3: live probes"),
++    ("Energy filter 1/3, write the tool", "Energy filter 3/3, read the results"),
++    ("Two-worker fixture A (idle hold)", "Two-worker fixture B (hostname only)"),
++    ("Review PR #2110 at head 5d2e512cbb", "Review PR #2110 at head 9baf8d8abc"),
++])
++def test_an_index_in_the_same_place_is_an_enumeration(mine, theirs):
++    from hermes_cli import kanban_overlap_own as own
++    card = {"title": theirs, "assignee": "default"}
++    assert (own.own_distinct(mine, "default", card) or "").startswith("enumerated")
++
++
+ def test_distinct_from_still_admits_an_own_duplicate():
+     case = next(c for c in CASES if c["b"]["id"] == "t_01a1d4e145f389a5")
+     match = _replay(case)
+-- 
+2.43.0
+

@@ -1,0 +1,1883 @@
+From fee90fc237796237a578150abb482a5e952e84bd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 14:27:20 +0000
+Subject: [PATCH] [daveey] kanban create overlap: compare a creator's own open
+ cards; dedup same-run re-issues; count same-creator duplicates
+
+Problem: on 13 Nov (hub default board), three times a dispatcher card created a second card for work its
+own earlier card already covered, and each duplicate ran a worker until it noticed:
+
+| First card | Duplicate | Creator | Gap | First key | Duplicate key |
+|---|---|---|---|---|---|
+| t_01a1d44c7b488318 09:45:44Z | t_01a1d44d9e68cca4 09:46:59Z | t_01a1d43457d48e65 | 75 s | none | followup:pr2058:review-nits |
+| t_01a1d4914914925a 11:00:53Z | t_01a1d4917584d038 11:01:05Z | t_01a1d46d21ec8bd3 | 12 s | none | followup:pr2110:review-nits |
+| t_01a1d462ff5c8698 10:10:20Z | t_01a1d4e145f389a5 12:28:15Z | t_01a1d41fd158579d | 2 h 18 m | none | pr2062-nit-session-kanban-continue-own-result |
+
+The last duplicate ran 12:28-13:05Z, opened PR #2237 and closed it as superseded by 5b7202e08e.
+
+Why 1: no guard stopped the second create. `_find` skipped every open card "the same chat or the same
+worker created (fan-out)" (hermes_cli/kanban_overlap.py module docstring and the `creator_task_id == self_tid`
+skip in `_find`). The idempotency key could not match either: each first create had no key.
+Why 2 (checked against each creator's worker_result last_output and card comments; the transcripts are on
+worker-6/7, unreachable from here):
+- 12 s and 75 s pairs: the creator followed the placement remedy for a card kept local by a marker
+  ("kanban_archive the unclaimed card ... and re-create it"). The archive was refused because a worker had
+  already claimed the first card, and the creator re-created anyway, adding a key. Evidence: the 12 s
+  creator's comment ("my archive+recreate to drop a placement marker failed because both were claimed
+  instantly"); the 75 s creator's last output ("A worker had already claimed that follow-up card before I
+  tried to recreate it, so I created duplicate card t_01a1d44d9e68cca4"). A core_update_pause restart in
+  the 75 s run came after both creates (1794563501 vs 144/219), so it is not the cause.
+- 2 h pair: the creator, in a later run, filed a review nit on `_answer_interrupted_calls` /
+  `with_own_result` while its round-1 child t_01a1d462ff5c8698 (same fix site) was open and claimed; the new
+  body names neither that child nor any check of open children.
+Why 3 (instructions): the worker protocol's remedy (agent/prompt_builder.py "Created cards") said to archive
+and re-create, with no condition that the archive succeeded.
+Root (happened): the fan-out exemption treated every card from the same creator as deliberate fan-out, so
+the overlap guard never saw a creator's own duplicate, whatever its title or gap.
+Root (not caught):
+- Each duplicate was caught only by the duplicate's own worker, after it had already built the same change.
+  t_01a1d4e145f389a5 ran for 37 min and opened PR #2237 before it noticed.
+- Nothing at create time compared a new card with its creator's open cards, because of the fan-out
+  exemption.
+- Nothing afterwards counted cards closed as a duplicate of a sibling from the same creator, so 3 in one day
+  went unnoticed until an owner chat looked.
+- (hypothesis, checked: confirmed) The overlap tests had no same-creator duplicate case.
+  `test_same_chat_fan_out_and_parents_are_not_matches` covers only `parents`, and the singleton "self" case
+  is the creator's own card, not a card it created.
+Recurrence: a repeat, 3 times on 13 Nov (table above). No earlier fix targeted this exemption;
+t_01a1d4dc5eb85b00 fixed the opposite case (a false refusal against an origin mirror). The 10 Nov pair
+t_01a1c78af452ff15 / t_01a1c78addfc72e4 was two different creators racing, another cause.
+
+Countermeasures:
+- root: a card the same creator task made is no longer exempt (hermes_cli/kanban_overlap_own.py). It meets
+  the normal match (titles, files, failures) and the existing admits (waits on, recovers, cites, distinct
+  target), then four same-creator admits: another assignee; review vs non-review title; different leading
+  component tags ([core]/[mods], Board:/Core:); enumerated titles (index markers that differ: w1-01/w1-02,
+  worker-2/3, 1/3 vs 3/3, fixture A/B). A new match form, same creator only, catches a duplicate worded
+  apart: at least 3 shared snake_case identifiers, each named by at most 2 other open cards, and title word
+  ratio at least 0.3. `distinct_from` still overrides. The same-chat (session) exemption stays for cards
+  another creator made. proof: tests/tools/test_kanban_create_overlap_same_creator.py replays the 3 pairs and
+  14 real legitimate same-creator fan-outs from the same 7 days (fixture from the hub sync-shadow board,
+  including the background cards that name the same identifiers). All 3 are refused and all 14 admitted; on
+  the old code the 3 duplicate cases fail (match is None) and the fan-outs pass.
+  Replay of all 1654 same-creator pairs of the 7 days (first card open when the second was created) through
+  the real `_find`: 11 refused (2 of them deduplicated). They are the 3 above, 7 real or partial duplicates
+  (one exact-head review of PR1160 at bcbc371e20 filed twice; the 894ddbe34 ancestor readback filed twice;
+  the PR1111 natural-polling verification filed twice, 3 h apart; failed-result observer restarts twice;
+  two review-nit rounds on #1792; hub claim-screen follow-ups that #1810/#1811 split; the state-suite pair)
+  and 1 false refusal (two "Fixture: ... pickup independent verification" cards, which `distinct_from`
+  passes). Removing the exemption outright would refuse 517.
+- symptom (Do 4): a same-run re-issue returns the first card. When the match is a title match, the first
+  card was created by the same creator during its current run (task_runs.started_at), has no idempotency
+  key, and the title ratio is at least 0.8, kanban_create returns {ok: true, created: false, deduplicated:
+  true, task_id: <first>} and records a `create_overlap` event with outcome `deduplicated`; the CLI prints the
+  first id with exit 0. The 12 s and 75 s pairs dedup; the 2 h pair (another run) is refused with the usual
+  note. proof: test_same_run_reissues_deduplicate_and_the_later_round_is_refused and
+  test_worker_reissue_in_the_same_run_returns_the_first_card (through the real kanban_create tool).
+- instructions: the worker protocol now says to re-create only once the archive succeeds; a refused archive
+  means a worker claimed the card, so keep it.
+- detection: hermes_cli/kanban_dup_detector.py, called after each completion commits. When a completion's
+  summary or result says it duplicates or was superseded by a card id, and that card has the same creator,
+  one open card collects the pattern: created when none is open, a comment on it otherwise, a new card once
+  it is done or archived. The guard alone does not make this redundant: it is a heuristic (shared title
+  words or 3 rare identifiers), and a duplicate worded apart with no shared identifier still passes it.
+  proof: tests/hermes_cli/test_kanban_dup_detector.py replays the 3 recorded completion summaries and opens
+  exactly one card (two comments); another creator's duplicate and a plain completion open nothing.
+---
+ agent/prompt_builder.py                       |   4 +-
+ hermes_cli/kanban.py                          |  14 +-
+ hermes_cli/kanban_db.py                       |   6 +-
+ hermes_cli/kanban_dup_detector.py             | 104 ++
+ hermes_cli/kanban_overlap.py                  | 127 ++-
+ hermes_cli/kanban_overlap_own.py              | 148 +++
+ tests/hermes_cli/test_kanban_dup_detector.py  |  85 ++
+ .../kanban_overlap_same_creator_replay.json   | 902 ++++++++++++++++++
+ ...test_kanban_create_overlap_same_creator.py | 152 +++
+ tools/kanban_tools.py                         |   3 +-
+ 10 files changed, 1508 insertions(+), 37 deletions(-)
+ create mode 100644 hermes_cli/kanban_dup_detector.py
+ create mode 100644 hermes_cli/kanban_overlap_own.py
+ create mode 100644 tests/hermes_cli/test_kanban_dup_detector.py
+ create mode 100644 tests/tools/fixtures/kanban_overlap_same_creator_replay.json
+ create mode 100644 tests/tools/test_kanban_create_overlap_same_creator.py
+
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 883335ea35..ffacd1e711 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -364,8 +364,8 @@ KANBAN_GUIDANCE = (
+     "- **Created cards.** List ids in `kanban_complete(created_cards=[...])` ONLY when captured from a successful "
+     "`kanban_create` return — never invent or paste ids; the kernel rejects the completion on any phantom id. "
+     "If that result has `placement.where` `local` because of a local marker and the work does not need this "
+-    "machine, `kanban_archive` the unclaimed card (only one your task created) and re-create it as its "
+-    "`placement.remedy` says (`placement='auto'` for a context skill such as myapp-*).\n"
++    "machine, `kanban_archive` the unclaimed card (only one your task created); once it is archived (refused = claimed: "
++    "keep it) re-create it as its `placement.remedy` says (`placement='auto'` for a context skill such as myapp-*).\n"
+     "- **Orchestrating: discover profiles first.** The dispatcher SILENTLY drops a card with an unknown assignee (it "
+     "sits in `ready` forever). Ground every assignee in a real profile (`hermes profile list`, or ask the user), and "
+     "express dependencies via `parents=[...]` on `kanban_create`, not prose.\n"
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 164d4c459f..821f1f6fd0 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -23,6 +23,7 @@ from typing import Optional
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_overlap
+ from hermes_cli import kanban_db_notify as kbn
+ from hermes_cli import kanban_db_operator as kbo
+ from hermes_cli import kanban_swarm as ks
+@@ -372,16 +373,7 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
+ 
+ 
+ def _print_overlap_refusal(args: argparse.Namespace, refused: str) -> int:
+-    """Print a ``create_overlap`` refusal (JSON with ``--json``, else a summary on stderr); exit code 2."""
+-    if getattr(args, "json", False):
+-        print(refused)
+-    else:
+-        ref = json.loads(refused)
+-        print(f"kanban: {ref['code']}: {ref['note']}", file=sys.stderr)
+-        for m in ref["matches"]:
+-            print(f"  {m['id']}  {m['gateway']}/{m['board']}  ({m['status']})  {m['title']}  — {m['why']}",
+-                  file=sys.stderr)
+-    return 2
++    return kanban_overlap.print_cli(refused, as_json=bool(getattr(args, "json", False)))
+ 
+ 
+ @publication_scope
+@@ -447,7 +439,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+         from hermes_cli import kanban_overlap
+         board = getattr(args, "board", None) or kb.get_current_board()
+         refused, after_create = kanban_overlap.check(
+-            conn, {"body": body, "idempotency_key": idem_key,
++            conn, {"body": body, "idempotency_key": idem_key, "assignee": getattr(args, "assignee", None),
+                    "board": None if board == kb.DEFAULT_BOARD else board,
+                    "distinct_from": getattr(args, "distinct_from", None) or [],
+                    "distinct_reason": getattr(args, "distinct_reason", None)},
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 323922327e..3f508cc29f 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -36,7 +36,7 @@ from hermes_cli import kanban_db_sync as _sync, kanban_park_pin as _park_pin, ka
+ from hermes_cli.kanban_db_values import _first_line, _opt_int, _json_or_null
+ from hermes_cli.kanban_db_event import Event  # public kb.Event; helpers import lazily: no cycle
+ from hermes_cli.kanban_worker_placement import resolved_db_placement, validate_creation
+-from hermes_cli import kanban_placement_forward as _placement_fwd  # stdlib-only at import: no cycle
++from hermes_cli import kanban_dup_detector as _dup_detector, kanban_placement_forward as _placement_fwd  # no cycle
+ from hermes_cli import kanban_run_end_lease as _run_end_lease  # stdlib-only at import: no cycle
+ from hermes_cli.kanban_host_identity import is_local_claim as _claim_is_local
+ from hermes_cli.kanban_db_dispatch_queries import DISPATCH_ORDER  # stdlib-only at import: no cycle
+@@ -2580,9 +2580,9 @@ def complete_task(
+         _append_event(conn, task_id, "completed", completion_payload, run_id=run_id)
+         _placement_fwd.record_cancel_intent(conn, task_id, "completed", settled=placement_settled)  # [daveey]
+     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
++    _dup_detector.note_completion(conn, task_id, summary, result)  # [daveey] counts same-creator duplicates
+     _placement_fwd.forward_completion(conn, task_id, settled=placement_settled)
+-    # Success wipes the breaker counter (history stays on the event log).
+-    _clear_failure_counter(conn, task_id)
++    _clear_failure_counter(conn, task_id)  # success wipes the breaker counter (history stays on the event log)
+     recompute_ready(conn)  # separate txn so children see ``done``
+     _cleanup_workspace(conn, task_id)
+     _done_task = get_task(conn, task_id)
+diff --git a/hermes_cli/kanban_dup_detector.py b/hermes_cli/kanban_dup_detector.py
+new file mode 100644
+index 0000000000..0536a1a147
+--- /dev/null
++++ b/hermes_cli/kanban_dup_detector.py
+@@ -0,0 +1,104 @@
++"""Count cards closed as a duplicate of a sibling from the same creator, and open one card for the pattern. [daveey]
++
++On 11-13 three cards closed as duplicates of cards their own creator had filed earlier (t_01a1d44d9e68cca4,
++t_01a1d4917584d038, t_01a1d4e145f389a5), and no one noticed until an owner chat looked: nothing counted them.
++The create-time check (:mod:`hermes_cli.kanban_overlap_own`) now refuses those three, but it is a heuristic
++(shared title words, or at least 3 rare code identifiers): a duplicate worded apart with no shared identifier
++still passes it. This detector is the net behind it.
++
++When a card completes with a summary or result that says it duplicates, or was superseded by, a card id
++(``duplicate of t_X``, ``duplicates t_X``, ``Superseded ... card t_X``), and ``t_X`` has the same creator task,
++one open card on that board collects the pattern:
++- no open detector card: one is created (``ready``, assignee ``default``) naming this pair;
++- an open one exists: this pair is added to it as a comment.
++After that card is done or archived, the next occurrence opens a new one. Never raises.
++"""
++
++from __future__ import annotations
++
++import logging
++import re
++import sqlite3
++from typing import Optional
++
++_log = logging.getLogger(__name__)
++
++KEY_PREFIX = "detector:same-creator-duplicate:"
++TITLE = "Same-creator duplicate cards: create_overlap let a creator file the same work twice"
++_CARD = r"t_[0-9a-f]{8,16}"
++# "duplicate of t_X", "duplicates t_X", "DUPLICATE of t_X", "superseded by ... t_X", "Superseded: ... card t_X".
++_DUP = re.compile(rf"\b(?:duplicat\w*|supersed\w*)\b[^.\n]{{0,120}}?\b({_CARD})\b", re.IGNORECASE)
++
++
++def sibling_named(text: str) -> list[str]:
++    """Card ids the text says this card duplicates or was superseded by, in order."""
++    return list(dict.fromkeys(m.group(1) for m in _DUP.finditer(text or "")))
++
++
++def _creator(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
++    row = conn.execute("SELECT json_extract(payload, '$.creator_task_id') FROM task_events "
++                       "WHERE task_id = ? AND kind = 'created' ORDER BY id LIMIT 1", (task_id,)).fetchone()
++    return row[0] if row and isinstance(row[0], str) and row[0] else None
++
++
++def same_creator_sibling(conn: sqlite3.Connection, task_id: str, text: str) -> Optional[tuple[str, str]]:
++    """``(sibling, creator)`` when ``text`` names a card from this card's own creator, else None."""
++    creator = _creator(conn, task_id)
++    if not creator:
++        return None
++    for sibling in sibling_named(text):
++        if sibling != task_id and _creator(conn, sibling) == creator:
++            return sibling, creator
++    return None
++
++
++def _occurrence(task_id: str, sibling: str, creator: str, text: str) -> str:
++    quote = " ".join((text or "").split())[:300]
++    return f"- {task_id} closed as a duplicate of {sibling}; both created by {creator}. Its handoff: \"{quote}\""
++
++
++def _body(line: str) -> str:
++    return ("A card completed as a duplicate of, or superseded by, a card its own creator had filed earlier, so "
++            "a worker ran on work that was already owned. `kanban_create`'s overlap check compares a creator's "
++            "own open cards (hermes_cli/kanban_overlap.py, hermes_cli/kanban_overlap_own.py) and missed this "
++            "pair.\n\n"
++            "Do: for each pair below, replay the second create through `kanban_overlap._find` and name the rule "
++            "that admitted it. Then either narrow that rule with a replay test (same fixture as "
++            "tests/tools/test_kanban_create_overlap_same_creator.py: every legitimate fan-out still admitted) or "
++            "record why the pair cannot be told apart from fan-out at create time.\n\n"
++            "Later occurrences are added here as comments while this card is open.\n\n"
++            f"Occurrences:\n{line}\n")
++
++
++def note_completion(conn: sqlite3.Connection, task_id: str, *texts: Optional[str]) -> Optional[str]:
++    """Record a same-creator duplicate completion; returns the detector card id it opened or commented on."""
++    from hermes_cli import kanban_db as kb
++    try:
++        text = "\n".join(t for t in texts if t)
++        hit = same_creator_sibling(conn, task_id, text) if text else None
++        if hit is None:
++            return None
++        sibling, creator = hit
++        line = _occurrence(task_id, sibling, creator, text)
++        row = conn.execute("SELECT id FROM tasks WHERE idempotency_key LIKE ? AND status NOT IN ('done', "
++                           "'archived') ORDER BY created_at LIMIT 1", (KEY_PREFIX + "%",)).fetchone()
++        if row:
++            seen = conn.execute("SELECT 1 FROM task_comments WHERE task_id = ? AND body LIKE ?",
++                                (row[0], f"- {task_id} %")).fetchone()
++            if not seen:
++                kb.add_comment(conn, row[0], "dup-detector", line)
++            return row[0]
++        return kb.create_task(conn, title=TITLE, body=_body(line), assignee="default", created_by="dup-detector",
++                              idempotency_key=KEY_PREFIX + task_id)
++    except Exception:  # health: allow BLE001 -- an observer must never break a completion
++        _log.warning("same-creator duplicate detector failed for %s", task_id, exc_info=True)
++        return None
++
++
++def describe(conn: sqlite3.Connection) -> list[dict]:
++    """Open detector cards (for tests and audits)."""
++    return [{"id": r[0], "status": r[1], "key": r[2]} for r in conn.execute(
++        "SELECT id, status, idempotency_key FROM tasks WHERE idempotency_key LIKE ?", (KEY_PREFIX + "%",))]
++
++
++__all__ = ["KEY_PREFIX", "TITLE", "describe", "note_completion", "same_creator_sibling", "sibling_named"]
+diff --git a/hermes_cli/kanban_overlap.py b/hermes_cli/kanban_overlap.py
+index fd94fd51b7..e25f6799b7 100644
+--- a/hermes_cli/kanban_overlap.py
++++ b/hermes_cli/kanban_overlap.py
+@@ -30,14 +30,17 @@ equals a board slug does not count.
+ Closed cards never match (a replica's stale legacy ``<board>/<id>`` row never outvotes its qualified
+ ``<profile>/<board>/<id>`` twin). Heuristic exemptions (singletons ignore these, except the waiting card a
+ capability-owner create quotes and a card bound to it, :func:`_bound_to`): the creator's own card, the new
+-card's parents, cards the same chat or the same worker created (fan-out), the waiting card a capability-owner
++card's parents, cards the same chat created (fan-out), the waiting card a capability-owner
+ create quotes, a local card bound to that
+ waiting card (its deferred-placement origin, or a card parked on it: :func:`_bound_to`), and another capability-owner
+ card for that same waiting card, a card the new one parks/waits/depends on (:func:`waits_on`), a card whose failed
+ execution the new one recovers (:func:`recovers`: ``self-heal: kanban card t_X ... failed 2x``), and a card that
+ names a different target (:func:`distinct_target`: another repo, host or process, an inverted check at another
+ revision, or another work role, :func:`work_role`: implement vs measure vs deliver; a newer sha or another
+-ticket number alone is not a different target). Admitted look-alikes
++ticket number alone is not a different target). A card the same worker created is NOT exempt: it meets
++the same match, then the same-creator admits and the shared-fix-site match in
++:mod:`hermes_cli.kanban_overlap_own`; a near-identical re-issue in the same run returns the first card
++(``deduplicated``) instead of creating a second. Admitted look-alikes
+ are logged. Each card counts once per gateway. A missing or unreadable replica is skipped and logged, never a block.
+ ``kanban.create_overlap_check: false`` turns the check off.
+ 
+@@ -56,6 +59,8 @@ import sqlite3
+ from pathlib import Path
+ from typing import Callable, Iterable, NamedTuple, Optional
+ 
++from hermes_cli import kanban_overlap_own as _own
++
+ _log = logging.getLogger(__name__)
+ 
+ EVENT = "create_overlap"
+@@ -557,7 +562,8 @@ def _board_cards(c: sqlite3.Connection, slug: str, self_gw: Optional[str], *,
+     # ``placed_as``: the card on another gateway this one was forwarded to (deferred placement); ``awaits``: the
+     # card its latest park waits on. Either binds this card's completion to that card (:func:`_bound_to`).
+     rows = c.execute(
+-        "SELECT t.id, t.title, t.body, t.status, t.session_id, (SELECT json_extract(e.payload, "
++        "SELECT t.id, t.title, t.body, t.status, t.assignee, t.created_at, t.session_id, "
++        "(SELECT json_extract(e.payload, "
+         "'$.creator_task_id') FROM task_events e WHERE e.task_id = t.id AND e.kind = 'created' "
+         "LIMIT 1), t.idempotency_key, (SELECT json_extract(e.payload, '$.remote_task_id') FROM task_events e "
+         "WHERE e.kind = 'placement_forwarded' AND e.task_id = t.id AND json_extract(e.payload, "
+@@ -575,12 +581,13 @@ def _board_cards(c: sqlite3.Connection, slug: str, self_gw: Optional[str], *,
+     for tid, sess in links:
+         chats.setdefault(tid, set()).add(sess)
+     return [{"id": tid, "board": slug, "gateway": self_gw or "local", "status": status, "title": title,
+-             "body": body or "",
++             "body": body or "", "assignee": assignee, "created_at": created_at,
+              "session_id": sess, "creator_task_id": creator, "local": True, "key_family": key_family(key),
++             "has_key": bool(key),
+              "placed_as": placed if isinstance(placed, str) else None,
+              "awaits": awaits if isinstance(awaits, str) and status == "scheduled" else None,
+              "chats": sorted(chats.get(tid, set()) | ({sess} if sess else set()))}
+-            for tid, title, body, status, sess, creator, key, placed, awaits in rows]
++            for tid, title, body, status, assignee, created_at, sess, creator, key, placed, awaits in rows]
+ 
+ 
+ def _local_cards(self_gw: Optional[str]) -> Iterable[dict]:
+@@ -633,6 +640,7 @@ def _replica_cards(self_gw: Optional[str]) -> Iterable[dict]:
+         sessions = [s for s in (t.get("sessions") or []) if isinstance(s, dict)]
+         yield {"id": t["id"], "board": t.get("board") or "default", "gateway": t.get("gateway") or gw,
+                "status": t.get("status"), "title": t.get("title") or "", "body": t.get("body") or "",
++               "assignee": t.get("assignee") if isinstance(t.get("assignee"), str) else None,
+                "local": False,
+                "session_id": next((s.get("session") for s in sessions if s.get("rel") == "created"), None),
+                # hermes-hub client >= 1.9.27 publishes the key; per-host automation keyed by one creator on two
+@@ -702,16 +710,22 @@ def find(*, title: str, body: str, target_board: str, session_id: Optional[str],
+ 
+ def _find(*, title: str, body: str, target_board: str, session_id: Optional[str], self_tid: Optional[str],
+           parents: Iterable[str], family: Optional[str] = None, self_gw: Optional[str] = None,
+-          cards: Optional[list[dict]] = None, gateways: Optional[set[str]] = None) -> tuple[list[dict], set[str]]:
++          cards: Optional[list[dict]] = None, gateways: Optional[set[str]] = None,
++          assignee: Optional[str] = None, run_started: Optional[int] = None,
++          shared_code: bool = True) -> tuple[list[dict], set[str]]:
+     """:func:`find` over ``cards`` (default: every local board and the replica) -> ``(matches, gateways)``.
+     ``gateways`` (default: those the cards name) feeds the board-reference and host rules; the in-transaction
+-    re-check passes the first check's set so both reads judge a card the same way. Raises on a broken read."""
++    re-check passes the first check's set so both reads judge a card the same way. Raises on a broken read.
++    A card ``self_tid`` created is compared too (:mod:`hermes_cli.kanban_overlap_own`): ``assignee`` feeds its
++    admits, ``run_started`` (the creator's current run) its same-run re-issue, and ``shared_code`` its shared
++    fix-site match (off for the in-transaction re-check, which reads too few cards to tell a rare identifier)."""
+     skip = set(parents) | ({self_tid} if self_tid else set())
+     waiting = capability_owner_waiting_id(title, body)
+     new_words = words(title)
+     job = singleton_job(title)
+     failure = failure_identity(title, body)
+     out, seen, mine = [], set(), None
++    common: Optional[frozenset[str]] = None
+     if cards is None:
+         cards = [*_local_cards(self_gw), *_replica_cards(self_gw)]
+     if gateways is None:
+@@ -726,14 +740,20 @@ def _find(*, title: str, body: str, target_board: str, session_id: Optional[str]
+         # Keep other mirror owners visible; do not exempt a whole family or envelope.
+         if waiting and (card["id"] == waiting or _bound_to(card, waiting)):
+             continue
++        own = bool(self_tid and card.get("creator_task_id") == self_tid)
+         if not singleton and (card["id"] in skip
+                 or (waiting and _sibling_owner(card.get("title") or "", waiting))
+-                or (session_id and card["session_id"] == session_id)
+-                or (self_tid and card["creator_task_id"] == self_tid)
++                or (session_id and card["session_id"] == session_id and not own)
+                 or (family and card.get("key_family") == family)):
+             continue
+         seen.add((card["gateway"], card["id"]))
+         reasons, score = _reasons(card, new_words, title, body, target_board, gateways, failure)
++        if not reasons and own and shared_code:
++            score = _own.title_score(new_words, words(card.get("title") or ""))
++            if common is None:
++                common = _own.common_ids(_own.code_ids(title, body), cards)
++            why = _own.shared_code_reason(title, body, card, common, score)
++            reasons = [why] if why else []
+         if not reasons:
+             continue
+         if mine is None:
+@@ -741,16 +761,21 @@ def _find(*, title: str, body: str, target_board: str, session_id: Optional[str]
+         admit = (f"waits on {card['id']}" if waits_on(card["id"], title, body)
+                  else f"recovers {card['id']}" if recovers(card["id"], title, card.get("title") or "")
+                  # A failure- or file-only match the new card cites by id was written knowing that owner.
+-                 else f"cites {card['id']}" if (all(_failure_reason(r) or _file_reason(r) for r in reasons)
++                 else f"cites {card['id']}" if (all(_failure_reason(r) or _file_reason(r) or _own.is_reason(r)
++                                                    for r in reasons)
+                                                 and cites(card["id"], title, body))
+                  else _distinct(mine, _identity(card.get("title") or "", card.get("body") or "", gateways)))
++        if own and not admit:
++            admit = _own.own_distinct(title, assignee, card)
+         if admit and not singleton:
+             # Logged so an audit can tell an admitted look-alike from a missed one.
+             _log.info("kanban create overlap: admitted %r despite %s/%s/%s (%s): %s", title, card["gateway"],
+                       card["board"], card["id"], "; ".join(reasons), admit)
+         else:
+             out.append({**{k: card[k] for k in ("id", "board", "gateway", "status", "title", "chats")},
+-                        "why": "; ".join(reasons), "_score": score, "_local": card["local"]})
++                        "why": "; ".join(reasons), "_score": score, "_local": card["local"],
++                        "_reissue": own and not any(_own.is_reason(r) for r in reasons)
++                        and _own.reissue(card, self_tid, run_started, score)})
+     out.sort(key=lambda m: (-m["_score"], m["status"] not in ("running", "ready", "scheduled"), m["id"]))
+     return out, gateways
+ 
+@@ -786,6 +811,48 @@ def covered(matches: list[dict], distinct_from: list[str], reason: str) -> bool:
+     return bool(reason.strip()) and all(m["id"] in distinct_from for m in matches[:MAX_SHOWN])
+ 
+ 
++DEDUP_CODE = "create_deduplicated"
++
++
++def reissued(matches: list[dict]) -> Optional[dict]:
++    """The creator's own keyless card from this same run that the new create re-issues, if one matched."""
++    return min((m for m in matches if m.get("_reissue")), key=lambda m: m["id"], default=None)
++
++
++def deduplicated(card: dict) -> dict:
++    """The answer to a same-run re-issue: the first card, nothing created (:func:`kanban_overlap_own.reissue`)."""
++    return {"ok": True, "created": False, "deduplicated": True, "code": DEDUP_CODE, "task_id": card["id"],
++            "note": f"No card was created: you already created {card['id']} ({card['status']}) for this in this "
++                    "run. Use that card. If this really is separate work, call kanban_create again with "
++                    f"distinct_from=['{card['id']}'] and distinct_reason='<why it is separate>'."}
++
++
++def verdict(matches: list[dict], distinct_from: list[str], reason: str, entry: str = "tool") -> dict:
++    """Refusal JSON for uncovered ``matches``, or the dedup answer when one is a same-run re-issue."""
++    first = reissued(matches)
++    return deduplicated(first) if first else refusal(matches, distinct_from, reason, entry)
++
++
++def print_cli(refused: str, *, as_json: bool) -> int:
++    """``hermes kanban create``'s answer to :func:`check`'s JSON: a refusal prints JSON (``--json``) or a summary on
++    stderr, exit code 2; a same-run re-issue (``deduplicated``) prints the first card's id, exit code 0."""
++    import sys
++    ref = json.loads(refused)
++    if ref.get("deduplicated"):
++        print(refused if as_json else ref["task_id"])
++        if not as_json:
++            print(f"kanban: {ref['note']}", file=sys.stderr)
++        return 0
++    if as_json:
++        print(refused)
++        return 2
++    print(f"kanban: {ref['code']}: {ref['note']}", file=sys.stderr)
++    for m in ref["matches"]:
++        print(f"  {m['id']}  {m['gateway']}/{m['board']}  ({m['status']})  {m['title']}  — {m['why']}",
++              file=sys.stderr)
++    return 2
++
++
+ def log_path():
+     from hermes_cli import kanban_db as kb
+     return kb.kanban_home() / "logs" / LOG_NAME
+@@ -857,10 +924,12 @@ class AfterCreate:
+                  session_id: Optional[str] = None,
+                  self_tid: Optional[str] = None, parents: Iterable[str] = (), family: Optional[str] = None,
+                  self_gw: Optional[str] = None, gateways: Optional[set[str]] = None, matches: Iterable[dict] = (),
+-                 distinct: Iterable[str] = (), reason: str = "", own: bool = False, entry: str = "tool"):
++                 distinct: Iterable[str] = (), reason: str = "", own: bool = False, entry: str = "tool",
++                 assignee: Optional[str] = None, run_started: Optional[int] = None):
+         self._conn, self._since, self._board, self._title, self._body = conn, since, board, title, body
+         self._find_kw = {"title": title, "body": body, "target_board": target_board, "session_id": session_id,
+-                         "self_tid": self_tid, "parents": list(parents), "family": family, "self_gw": self_gw}
++                         "self_tid": self_tid, "parents": list(parents), "family": family, "self_gw": self_gw,
++                         "assignee": assignee, "run_started": run_started}
+         self._gateways, self._matches = gateways, list(matches)
+         self._distinct, self._reason, self._own, self._entry = list(distinct), reason, own, entry
+         self._session_id, self._self_tid = session_id, self_tid
+@@ -877,7 +946,8 @@ class AfterCreate:
+     def _recheck(self, conn: sqlite3.Connection) -> None:
+         try:
+             cards = _board_cards(conn, self._board, self._find_kw["self_gw"], since=self._since)
+-            matches = _find(**self._find_kw, cards=cards, gateways=self._gateways)[0] if cards else []
++            matches = (_find(**self._find_kw, cards=cards, gateways=self._gateways, shared_code=False)[0]
++                       if cards else [])
+         except Exception:  # health: allow BLE001 -- a broken re-check must never block creating a card
+             _log.warning("kanban create overlap: in-transaction re-check failed; creating without it", exc_info=True)
+             return
+@@ -892,9 +962,11 @@ class AfterCreate:
+                   self._title, ", ".join(m["id"] for m in fresh))
+ 
+         def settle() -> str:
+-            record(self._conn if self._own else None, self._self_tid, outcome="refused", title=self._title,
++            out = verdict(fresh, self._distinct, self._reason, self._entry)
++            record(self._conn if self._own else None, self._self_tid,
++                   outcome="deduplicated" if out.get("deduplicated") else "refused", title=self._title,
+                    matches=fresh, session_id=self._session_id)
+-            return json.dumps(refusal(fresh, self._distinct, self._reason, self._entry))
++            return json.dumps(out)
+ 
+         raise OverlapRefused(settle)
+ 
+@@ -927,8 +999,10 @@ def check(conn: sqlite3.Connection, args: dict, *, courier: bool, title: str, se
+     body = str(args.get("body") or "")
+     target_board = args.get("board") or kb.DEFAULT_BOARD
+     own = bool(self_tid) and not args.get("board")  # the creator's card is on the board this call opened
++    assignee = args.get("assignee") if isinstance(args.get("assignee"), str) else None
+     find_kw = {"title": title, "body": body, "target_board": target_board, "session_id": session_id,
+-               "self_tid": self_tid, "parents": parents, "family": key_family(key)}
++               "self_tid": self_tid, "parents": parents, "family": key_family(key),
++               "assignee": assignee, "run_started": _run_started(conn, self_tid)}
+     try:
+         self_gw = reg.self_gateway()
+         matches, gateways = _find(**find_kw, self_gw=self_gw)
+@@ -945,6 +1019,19 @@ def check(conn: sqlite3.Connection, args: dict, *, courier: bool, title: str, se
+     if covered(matches, distinct, reason):
+         pending._matches = list(matches)
+         return None, pending
+-    record(conn if own else None, self_tid, outcome="refused", title=title, matches=matches,
+-           session_id=session_id)
+-    return json.dumps(refusal(matches, distinct, reason, entry)), _no_override
++    out = verdict(matches, distinct, reason, entry)
++    record(conn if own else None, self_tid, outcome="deduplicated" if out.get("deduplicated") else "refused",
++           title=title, matches=matches, session_id=session_id)
++    return json.dumps(out), _no_override
++
++
++def _run_started(conn: sqlite3.Connection, self_tid: Optional[str]) -> Optional[int]:
++    """When the creator's current run began (None outside a worker, or when the read fails)."""
++    if not self_tid:
++        return None
++    try:
++        row = conn.execute("SELECT r.started_at FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
++                           "WHERE t.id = ?", (self_tid,)).fetchone()
++    except sqlite3.Error:
++        return None
++    return _own._epoch(row[0]) if row else None
+diff --git a/hermes_cli/kanban_overlap_own.py b/hermes_cli/kanban_overlap_own.py
+new file mode 100644
+index 0000000000..a35c550ae7
+--- /dev/null
++++ b/hermes_cli/kanban_overlap_own.py
+@@ -0,0 +1,148 @@
++"""Same-creator duplicates for the create-overlap check (:mod:`hermes_cli.kanban_overlap`). [daveey]
++
++Until 11-13, ``_find`` skipped every open card the creating worker had made itself ("fan-out"). So an owner
++could file the same fix twice, and three times on 11-13 a second worker built a change its sibling already had:
++- t_01a1d44c7b488318 / t_01a1d44d9e68cca4, 75 s apart, and t_01a1d4914914925a / t_01a1d4917584d038, 12 s apart.
++  The creator archive-and-recreated a card to drop a placement marker, the archive was refused because the
++  first card was already claimed, and the recreate went ahead anyway.
++- t_01a1d462ff5c8698 / t_01a1d4e145f389a5, 2 h 18 m apart: a round-3 review nit filed without checking the
++  open round-1 child that already owned ``_answer_interrupted_calls``.
++
++A card from the same creator task now goes through the normal match. It is admitted when one of these says
++the cards are different work (:func:`own_distinct`):
++- another assignee;
++- one title is a review and the other is not;
++- different leading component tags (``[core]`` vs ``[mods]``, ``Board:`` vs ``Core:``);
++- the titles are an enumeration: both carry index markers (a digit token or a lone capital letter) and the
++  markers differ (``w1-01``/``w1-02``, ``worker-2``/``worker-3``, ``1/3``/``3/3``, fixture A/B, two shas).
++
++Two cards from one owner that name the same rare code identifiers share a fix site even when their titles are
++worded apart, as the PR #2062 pair did (title ratio 0.41). That is :func:`shared_code_reason`: at least
++``MIN_IDS`` snake_case identifiers in both cards, each named by at most ``RARE_MAX`` open cards (``reviewed_sha``,
++``kanban_complete`` and other template words are in hundreds), and titles sharing ``IDS_SCORE`` of their words.
++
++The replay of 7 days of hub cards had 1654 same-creator pairs where the first card was open when the second was
++created. Through this code the rule refuses 11 of them:
++- the 3 duplicates above;
++- 7 real or partial duplicates (one exact-head review filed twice, two readbacks each filed twice, two
++  review-nit rounds that overlapped, ...);
++- 1 false refusal (two "Fixture: ... pickup" cards), which ``distinct_from`` overrides.
++
++Removing the exemption outright would have refused 517 pairs.
++
++A card from the same chat but another creator (the session match) keeps the old exemption. Every card in a chat's
++tree inherits that session, and the 10-11 race of two creators is another cause.
++"""
++
++from __future__ import annotations
++
++import re
++from functools import lru_cache
++from typing import Iterable, Optional
++
++MIN_IDS = 3
++RARE_MAX = 2  # open cards (besides the new one) that may name an identifier for it to still mark a fix site
++IDS_SCORE = 0.3
++REISSUE_SCORE = 0.8  # a same-run re-issue this close returns the first card instead of creating a second
++
++_CODE = re.compile(r"(?<![\w/.-])((?:[a-z_][a-z0-9_]*\.)*_?[a-z][a-z0-9]*(?:_[a-z0-9]+)+)(?![\w-])")
++_CARD_ID = re.compile(r"\bt_[0-9a-f]{8,16}\b")
++_SCAN = 20000
++_REVIEW = re.compile(r"\b(?:re-?review|review)\b(?!\s+(?:nits?|follow-?ups?|findings?|comments?)\b)", re.IGNORECASE)
++_COMPONENT = re.compile(r"^\s*(?:\[([a-z0-9_-]+)\]|([a-z0-9_-]+):\s)", re.IGNORECASE)
++_DIGIT_TOKEN = re.compile(r"[a-z0-9]*\d[a-z0-9]*")
++_LETTER_MARK = re.compile(r"(?<![\w'\u2019])([A-Z])(?![\w'\u2019])")
++
++
++@lru_cache(maxsize=8192)
++def code_ids(title: str, body: str = "") -> frozenset[str]:
++    """snake_case code identifiers a card names (``_answer_interrupted_calls``, ``update_pause_cancel``), each
++    part of a dotted name on its own, at least 8 characters; card ids are not identifiers."""
++    text = _CARD_ID.sub(" ", f"{title or ''}\n{(body or '')[:_SCAN]}".lower())
++    return frozenset(part for name in _CODE.findall(text) for part in name.split(".")
++                     if "_" in part.strip("_") and len(part) >= 8)
++
++
++def common_ids(names: Iterable[str], cards: Iterable[dict]) -> frozenset[str]:
++    """Those of ``names`` (the new card's identifiers) that more than ``RARE_MAX`` of ``cards`` mention: template
++    words, not a fix site. A substring test, so it counts high, never low (``kanban_complete`` in
++    ``kanban_complete_task`` counts)."""
++    names = set(names)
++    if len(names) < MIN_IDS:
++        return frozenset(names)
++    seen = dict.fromkeys(names, 0)
++    for card in cards:
++        text = f"{card.get('title') or ''}\n{(card.get('body') or '')[:_SCAN]}".lower()
++        for name in names:
++            if name in text:
++                seen[name] += 1
++    return frozenset(name for name, n in seen.items() if n > RARE_MAX)
++
++
++_REASON_PREFIX = "same creator; both name "
++
++
++def is_reason(why: str) -> bool:
++    return why.startswith(_REASON_PREFIX)
++
++
++def markers(title: str) -> frozenset[str]:
++    """Index markers in a title: digit-bearing tokens (``w1-01``, ``2``, a sha) and lone capitals (fixture
++    ``A``), never a possessive's ``s``. Card ids are not markers."""
++    plain = _CARD_ID.sub(" ", title or "")
++    return frozenset(_DIGIT_TOKEN.findall(plain.lower())) | frozenset(
++        f"letter:{m}" for m in _LETTER_MARK.findall(plain))
++
++
++def _component(title: str) -> Optional[str]:
++    m = _COMPONENT.match(title or "")
++    return (m.group(1) or m.group(2)).lower() if m else None
++
++
++def own_distinct(title: str, assignee: Optional[str], card: dict) -> Optional[str]:
++    """Why a card from the same creator is a different job (module docstring), else None."""
++    theirs = card.get("title") or ""
++    if assignee and card.get("assignee") and assignee != card["assignee"]:
++        return f"assignee {assignee} != {card['assignee']}"
++    if bool(_REVIEW.search(title or "")) != bool(_REVIEW.search(theirs)):
++        return "a review and a non-review card"
++    mine_c, their_c = _component(title), _component(theirs)
++    if mine_c and their_c and mine_c != their_c:
++        return f"component {mine_c} != {their_c}"
++    mine_m, their_m = markers(title), markers(theirs)
++    if mine_m and their_m and mine_m != their_m:
++        return f"enumerated ({', '.join(sorted(mine_m - their_m)[:3]) or '-'} vs " \
++               f"{', '.join(sorted(their_m - mine_m)[:3]) or '-'})"
++    return None
++
++
++def title_score(new_words: set[str], card_words: set[str]) -> float:
++    return len(new_words & card_words) / max(len(new_words), len(card_words), 1)
++
++
++def shared_code_reason(title: str, body: str, card: dict, common: frozenset[str], score: float) -> Optional[str]:
++    """``same creator; both name <ids>`` when the cards share a rare fix site (module docstring), else None."""
++    if score < IDS_SCORE:
++        return None
++    shared = (code_ids(title or "", body or "")
++              & code_ids(card.get("title") or "", card.get("body") or "")) - common
++    if len(shared) < MIN_IDS:
++        return None
++    return f"{_REASON_PREFIX}{', '.join(sorted(shared)[:6])}"
++
++
++def reissue(card: dict, self_tid: Optional[str], run_started: Optional[int], score: float) -> bool:
++    """The creator made ``card`` earlier in this same run, with no idempotency key, and the new title is
++    nearly the same: a re-issue (the 11-13 archive-and-recreate after a refused archive). The create returns
++    ``card`` instead of a second owner."""
++    started = _epoch(run_started)
++    return bool(self_tid and card.get("creator_task_id") == self_tid and card.get("local")
++                and not card.get("has_key") and started is not None
++                and (_epoch(card.get("created_at")) or 0) >= started and score >= REISSUE_SCORE)
++
++
++def _epoch(value) -> Optional[int]:
++    try:
++        return int(value) if value is not None else None
++    except (TypeError, ValueError):  # a legacy ISO timestamp: not comparable, so never a re-issue
++        return None
+diff --git a/tests/hermes_cli/test_kanban_dup_detector.py b/tests/hermes_cli/test_kanban_dup_detector.py
+new file mode 100644
+index 0000000000..921cfc153a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dup_detector.py
+@@ -0,0 +1,85 @@
++"""Cards closed as a duplicate of their own creator's earlier card open one detector card. [daveey]
++
++The three 11-13 completions (hub default board) are replayed with their recorded handoff summaries; only the
++sibling ids are rewritten to the cards this test creates. The pattern opens exactly one card; the later two
++occurrences become comments on it.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_dup_detector as dd
++
++RECORDED = [
++    ("t_01a1d44c7b488318", "duplicate of t_01a1d44c7b488318"),
++    ("t_01a1d4914914925a", "Closed as a duplicate of t_01a1d4914914925a, which delivered this exact scope in PR "
++                           "#2140. That PR was merged into state as c01fa92d0a (I re-checked it this run). No code "
++                           "changes were made on this card."),
++    ("t_01a1d462ff5c8698", "Superseded: the same fix landed on main as 5b7202e08e from sibling card "
++                           "t_01a1d462ff5c8698. It applies with_own_result in session_kanban_continue."
++                           "_answer_interrupted_calls, and its test is stronger than mine. My equivalent PR #2237 "
++                           "(RED on base / GREEN locally, check gate ok) hit a conflict on rebase against that commit, "
++                           "so I closed it with a pointer and removed its branch and worktree."),
++]
++
++
++@pytest.fixture
++def conn(tmp_path, monkeypatch):
++    h = tmp_path / ".hermes"
++    h.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(h))
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub-state"))
++    for var in ("HERMES_SESSION_ID", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
++        monkeypatch.delenv(var, raising=False)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    with kbc.connect_closing() as c:
++        yield c
++
++
++def _pair(conn, creator):
++    first = kb.create_task(conn, title="first", assignee="default", creator_task_id=creator)
++    second = kb.create_task(conn, title="second", assignee="default", creator_task_id=creator)
++    return first, second
++
++
++def test_three_recorded_duplicate_completions_open_exactly_one_card(conn):
++    opened = []
++    for i, (recorded_sibling, summary) in enumerate(RECORDED):
++        creator = kb.create_task(conn, title=f"creator {i}", assignee="default")
++        first, second = _pair(conn, creator)
++        assert kb.complete_task(conn, second, summary=summary.replace(recorded_sibling, first))
++        opened.append(first)
++    cards = dd.describe(conn)
++    assert len(cards) == 1 and cards[0]["status"] in ("ready", "todo")
++    card = kb.get_task(conn, cards[0]["id"])
++    assert card is not None and card.title == dd.TITLE and "both created by" in (card.body or "")
++    comments = [c.body for c in kb.list_comments(conn, card.id)]
++    assert len(comments) == 2 and all("closed as a duplicate of" in c for c in comments)
++    record = "\n".join([card.body or "", *comments])
++    assert all(f"a duplicate of {first};" in record for first in opened)
++
++
++def test_other_creator_and_plain_completions_open_nothing(conn):
++    a = kb.create_task(conn, title="creator a", assignee="default")
++    b = kb.create_task(conn, title="creator b", assignee="default")
++    theirs = kb.create_task(conn, title="theirs", assignee="default", creator_task_id=a)
++    mine = kb.create_task(conn, title="mine", assignee="default", creator_task_id=b)
++    plain = kb.create_task(conn, title="plain", assignee="default", creator_task_id=b)
++    assert kb.complete_task(conn, mine, summary=f"duplicate of {theirs}")  # another creator: the race, not this
++    assert kb.complete_task(conn, plain, summary=f"Landed; reviewed by {theirs}.")
++    assert dd.describe(conn) == []
++
++
++def test_a_closed_detector_card_lets_the_next_occurrence_open_a_new_one(conn):
++    creator = kb.create_task(conn, title="creator", assignee="default")
++    first, second = _pair(conn, creator)
++    assert kb.complete_task(conn, second, summary=f"duplicate of {first}")
++    [card] = dd.describe(conn)
++    assert kb.complete_task(conn, card["id"], summary="tuned the guard")
++    third = kb.create_task(conn, title="third", assignee="default", creator_task_id=creator)
++    assert kb.complete_task(conn, third, summary=f"Superseded by {first}.")
++    assert len(dd.describe(conn)) == 2
+diff --git a/tests/tools/fixtures/kanban_overlap_same_creator_replay.json b/tests/tools/fixtures/kanban_overlap_same_creator_replay.json
+new file mode 100644
+index 0000000000..9ce885bbf8
+--- /dev/null
++++ b/tests/tools/fixtures/kanban_overlap_same_creator_replay.json
+@@ -0,0 +1,902 @@
++{
++ "source": "hub sync-shadow default board, 2026-11-06..13; see test_kanban_create_overlap_same_creator.py",
++ "cases": [
++  {
++   "kind": "duplicate",
++   "creator": "t_01a1d43457d48e65",
++   "a": {
++    "id": "t_01a1d44c7b488318",
++    "title": "hermes-sync peer-partial: classify missing install-stamp and transient codesign -dv failures correctly (PR #2058 review nits)",
++    "body": "Follow-up from exact-head review 5888975887 on PR #2058 (https://github.com/example-org/hermes/pull/2058#pullrequestreview-5888975887), example-org/hermes, base `state`, file `hermes-sync`. PR #2058 merged as eb032c4aed.\n\nNon-blocking nits to address:\n1. A missing install-stamp.json raises FileNotFoundError, which fetch_peer_partial treats as transient, so it recopies on every pass. Decide: a complete copy with no stamp is a verify-class failure (memoize), or skip the peer cheaply before copying.\n2. Stamp JSON that is not a dict raises AttributeError and escapes (pre-existing). Treat it as a verify failure.\n3. The codesign calls in verify_prebuilt_app have no timeout. Add them so the 2 h .peer-partial-tmp keep window bounds verify.\n4. A transient `codesign -dv` failure reads as ad-hoc and is memoized (pre-existing). Distinguish a nonzero exit or timeout (transient, do not memoize) from a real ad-hoc signature.\n\nAdd a test for each. Open one PR against `state`, get an independent exact-head review, and merge on green CI.",
++    "assignee": "default",
++    "created_at": 1794563144,
++    "has_key": false
++   },
++   "b": {
++    "id": "t_01a1d44d9e68cca4",
++    "title": "hermes-sync peer-partial: classify missing install-stamp and transient signature-check failures correctly (PR #2058 review nits)",
++    "body": "Follow-up from exact-head review 5888975887 on PR #2058 (https://github.com/example-org/hermes/pull/2058#pullrequestreview-5888975887), example-org/hermes, base `state`, file `hermes-sync`. PR #2058 merged as eb032c4aed.\n\nNon-blocking nits to address:\n1. A missing install-stamp.json raises FileNotFoundError, which fetch_peer_partial treats as transient, so it recopies on every pass. Decide: a complete copy with no stamp is a verify-class failure (memoize), or skip the peer cheaply before copying.\n2. Stamp JSON that is not a dict raises AttributeError and escapes (pre-existing). Treat it as a verify failure.\n3. The signature-check subprocess calls in verify_prebuilt_app have no timeout. Add them so the 2 h .peer-partial-tmp keep window bounds verify.\n4. A transient failure of the signature-detail call (`-dv`) reads as ad-hoc and is memoized (pre-existing). Distinguish a nonzero exit or timeout (transient, do not memoize) from a real ad-hoc signature.\n\nAdd a test for each, with subprocess calls stubbed so they run on Linux CI. Open one PR against `state`, get an independent exact-head review, and merge on green CI.",
++    "assignee": "default",
++    "created_at": 1794563219,
++    "has_key": true
++   },
++   "b_key": "followup:pr2058:review-nits",
++   "b_parents": [],
++   "run_started": 1794563092,
++   "background": [
++    "fetch_peer_partial"
++   ]
++  },
++  {
++   "kind": "duplicate",
++   "creator": "t_01a1d46d21ec8bd3",
++   "a": {
++    "id": "t_01a1d4914914925a",
++    "title": "hermes-sync: quit-waiter apply must not block on an in-flight detached peer-partial copy; close served_partial_target\u2192pin_build race (PR #2110 review nits)",
++    "body": "Follow-up from exact-head review 5889811976 of PR #2110 (https://github.com/example-org/hermes/pull/2110#pullrequestreview-5889811976), card t_01a1d46d21ec8bd3. Repo example-org/hermes, base branch `state`, file hermes-sync.\n\n1. Waiter path can still wait on a copy: if Desktop quits while the detached peer-partial copier (spawned under `taskpolicy -b`) is in flight, the waiter's apply blocks under apply.lock in `fetch_peer_partial(wait=True)` until the copy finishes (bounded only by PEER_COPY_TIMEOUT_S + verify, ~1 h). Fix: run the copier at normal QoS, and/or have the waiter apply with wait=False when a local ready/last_ready build already serves something, deferring otherwise. Test: Desktop-quit apply with a live in-flight copier marker does not block on it.\n2. Pin race: a detached copier finishing between `served_partial_target()` (which runs verify_prebuilt_app/codesign) and `pin_build()` can clear last_ready and `_prune_after_peer_partial` the chosen build. Fix: pin rec[\"sha\"] inside served_partial_target before the verify. Add a test.\nOptional: `_fetch_peer_partial_locked` state.json read-modify-write without build.lock (cosmetic).\n\nKeep #2043/#2058/#2110 semantics (build.lock/apply.lock, peer-partial.lock, PEER_PARTIAL_FAILED memo, .peer-partial-tmp prune exemption). Acceptance: RED-on-base unit tests in tests/test_core_bootstrap_up_to.py or sibling, 3 acceptance modules (test_core_bootstrap_up_to, test_core_partial_apply, test_core_reclaim_lease_extension) pass with HERMES_TEST_CORE set and skipped=0, mutant killed, exact-head independent review, merge on green CI.",
++    "assignee": "default",
++    "created_at": 1794567653,
++    "has_key": false
++   },
++   "b": {
++    "id": "t_01a1d4917584d038",
++    "title": "hermes-sync: quit-waiter apply must not block on an in-flight detached peer-partial copy; close served_partial_target\u2192pin_build race (PR #2110 review nits)",
++    "body": "Follow-up from exact-head review 5889811976 of PR #2110 (https://github.com/example-org/hermes/pull/2110#pullrequestreview-5889811976), card t_01a1d46d21ec8bd3. Repo example-org/hermes, base branch `state`, file hermes-sync.\n\nWhat to build:\n1. Waiter path can still wait on a copy: if Desktop quits while the detached peer-partial copier (spawned under `taskpolicy -b`) is in flight, the waiter's apply blocks under apply.lock in `fetch_peer_partial(wait=True)` until the copy finishes (bounded only by PEER_COPY_TIMEOUT_S + verify, ~1 h). Fix: run the copier at normal QoS, and/or have the waiter apply with wait=False when a local ready/last_ready build already serves something, deferring otherwise. Test: a Desktop-quit apply with a live in-flight copier marker does not block on it.\n2. Pin race: a detached copier finishing between `served_partial_target()` (which runs verify_prebuilt_app) and `pin_build()` can clear last_ready and `_prune_after_peer_partial` the chosen build. Fix: pin rec[\"sha\"] inside served_partial_target before the verify. Add a test.\nOptional: `_fetch_peer_partial_locked` state.json read-modify-write without build.lock (cosmetic).\n\nKeep #2043/#2058/#2110 semantics (build.lock/apply.lock, peer-partial.lock, PEER_PARTIAL_FAILED memo, .peer-partial-tmp prune exemption).\n\nDone when: RED-on-base unit tests in tests/test_core_bootstrap_up_to.py or a sibling; `python3.14 -B -m unittest tests.test_core_bootstrap_up_to tests.test_core_partial_apply tests.test_core_reclaim_lease_extension` passes with HERMES_TEST_CORE set and skipped=0 (python with pyyaml+psutil); a mutant dropping each fix is killed; exact-head independent review; merge on green CI.",
++    "assignee": "default",
++    "created_at": 1794567665,
++    "has_key": true
++   },
++   "b_key": "followup:pr2110:review-nits",
++   "b_parents": [],
++   "run_started": 1794567621,
++   "background": [
++    "last_ready served_partial_target",
++    "fetch_peer_partial hermes_test_core last_ready test_core_bootstrap_up_to test_core_partial_apply test_core_reclaim_lease_extension",
++    "fetch_peer_partial served_partial_target test_core_bootstrap_up_to test_core_partial_apply verify_prebuilt_app",
++    "hermes_test_core test_core_bootstrap_up_to test_core_partial_apply"
++   ]
++  },
++  {
++   "kind": "duplicate",
++   "creator": "t_01a1d41fd158579d",
++   "a": {
++    "id": "t_01a1d462ff5c8698",
++    "title": "core: Kanban restart-continuation should keep a stopped call's own result below the interrupted stamp (sibling of PR #2062)",
++    "body": "Follow-up from review 5889241381 on example-org/hermes PR #2062 (t_01a1d41fd158579d).\n\nPR #2062 made `agent/update_pause_cancel.committed` keep a cancelled tool call's own result below the update stamp (`with_own_result`: head 1536 + tail 512 chars, closing `[end of the cancelled call's own result]` line). The sibling path `gateway/session_kanban_continue._answer_interrupted_calls` (restart continuation of a Kanban run) still overwrites each stopped tool row (`_stop_result_rows`) with the bare `interrupted_result(at)` text, so a killed command's own `[Command interrupted]` partial output (e.g. a Terraform apply log, a job_id) is still dropped there.\n\nFix: in `_answer_interrupted_calls`, for each stopped row being rewritten, read its current content and, when it is the tool's own text result (not the executor's cancel/skip text), write `with_own_result(stamp, own)` instead of the bare stamp (reuse the helper from agent/update_pause_cancel.py). Appended rows for unanswered calls keep the bare stamp. Add a test in tests/ next to test_kanban_restart_continuation. Land via `hermes-core-wt ship`.",
++    "assignee": "default",
++    "created_at": 1794564620,
++    "has_key": false
++   },
++   "b": {
++    "id": "t_01a1d4e145f389a5",
++    "title": "core: session_kanban_continue restart path should keep a killed command's partial output (reuse update_pause_cancel.with_own_result)",
++    "body": "Review nit on PR #2062 (review 5890810566, example-org/hermes): `gateway/session_kanban_continue._answer_interrupted_calls` still rewrites a killed command's own interrupted output (the `is_interrupted_tool_result` shape) to the bare `INTERRUPTED_RESULT`, dropping its partial output after a restart Stop. Same bug class as t_01a1d41fd158579d (which fixed the update-pause path in agent/update_pause_cancel.py via `with_own_result`: head 1536 + tail 512 chars plus a closing `[end of the cancelled call's own result]` line).\n\nFix: reuse `with_own_result` (after PR #2062 is merged on main) in `_answer_interrupted_calls` so the partial output and any resume handles (job_id/session_id) stay below the stamp. Add a test next to the existing session_kanban_continue tests. Land via `hermes-core-wt ship`.",
++    "assignee": "default",
++    "created_at": 1794572895,
++    "has_key": true
++   },
++   "b_key": "pr2062-nit-session-kanban-continue-own-result",
++   "b_parents": [],
++   "run_started": 1794572866,
++   "background": [
++    "update_pause_cancel",
++    "update_pause_cancel",
++    "update_pause_cancel with_own_result"
++   ]
++  },
++  {
++   "kind": "fan-out",
++   "creator": "t_01a1a0299f33da86",
++   "a": {
++    "id": "t_01a1d49a2373b4b9",
++    "title": "Autoscaling L1 sleep probe w1-01 (harmless; holds one pool slot 75 min)",
++    "body": "Load probe for the worker autoscaling live acceptance (delivery owner t_01a1a0299f33da86, plan gate L1 / L-N1). It only has to hold one pool-worker slot for 75 minutes and report where it ran. Do nothing else: no repo work, no cards, no fixes.\n\nSteps (terminal, in this order):\n1. `hostname; date -u +%FT%TZ; curl -s -m 3 -H \"X-aws-ec2-metadata-token: $(curl -s -m 3 -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')\" http://169.254.169.254/latest/meta-data/instance-id; echo`\n2. `sleep 4500` in the foreground with the terminal timeout set to 5000. If the call returns early, run `sleep` again for the remaining time until 75 minutes have passed since step 1.\n3. `date -u +%FT%TZ`\n4. `kanban_complete` with summary exactly of the form `SLEEP-PROBE w1-01 host=<hostname> iid=<instance id> start=<step 1 time> end=<step 3 time>`.\n\nDone when: the summary line above is recorded. If the run is interrupted, a retry starts again from step 1 (that is fine).",
++    "assignee": "default",
++    "created_at": 1794568233,
++    "has_key": true
++   },
++   "b": {
++    "id": "t_01a1d49a65e217c3",
++    "title": "Autoscaling L1 sleep probe w1-02 (harmless; holds one pool slot 75 min)",
++    "body": "Load probe for the worker autoscaling live acceptance (delivery owner t_01a1a0299f33da86, plan gate L1 / L-N1). It only has to hold one pool-worker slot for 75 minutes and report where it ran. Do nothing else: no repo work, no cards, no fixes.\n\nSteps (terminal, in this order):\n1. `hostname; date -u +%FT%TZ; curl -s -m 3 -H \"X-aws-ec2-metadata-token: $(curl -s -m 3 -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')\" http://169.254.169.254/latest/meta-data/instance-id; echo`\n2. `sleep 4500` in the foreground with the terminal timeout set to 5000. If the call returns early, run `sleep` again for the remaining time until 75 minutes have passed since step 1.\n3. `date -u +%FT%TZ`\n4. `kanban_complete` with summary exactly of the form `SLEEP-PROBE w1-02 host=<hostname> iid=<instance id> start=<step 1 time> end=<step 3 time>`.\n\nDone when: the summary line above is recorded. If the run is interrupted, a retry starts again from step 1 (that is fine).",
++    "assignee": "default",
++    "created_at": 1794568250,
++    "has_key": true
++   },
++   "b_key": "autoscale-l1-sleep:w1-02",
++   "b_parents": [],
++   "run_started": 1794567869,
++   "background": [
++    "kanban_complete",
++    "kanban_complete",
++    "kanban_complete",
++    "kanban_complete",
++    "kanban_complete",
++    "kanban_complete",
++    "kanban_complete",
++    "kanban_complete",
++    "kanban_complete",
++    "kanban_complete",
++    "kanban_complete",
++    "kanban_complete",
++    "kanban_complete",
++    "kanban_complete",
++    "kanban_complete",
++    "kanban_complete"
++   ]
++  },
++  {
++   "kind": "fan-out",
++   "creator": "t_01a1cf477dece56b",
++   "a": {
++    "id": "t_01a1cf572ea72ae5",
++    "title": "Victim scan on worker-2: live wake_checks with redactor-masked values (t_01a1cf477dece56b f)",
++    "body": "Read-only victim scan for t_01a1cf477dece56b (acceptance f). Run it on **this machine** (worker-2) and report the counts.\n\nBackground: kanban park probes (`wake_check`) used to go through the display secret redactor before they were stored. A probe containing `idempotency_key='\u2026'`, `*_token=\u2026` or a similar name could be stored masked (`\u2026`, `***`, `\u00abredacted`), and then it never matches. The fix is in PR #1354. This scan finds live probes that are already damaged.\n\nRun this exactly, read-only (`mode=ro`). Never edit `task_wake_checks` rows.\n```\npython3 - <<'EOF'\nimport glob, os, re, sqlite3, socket\npat = re.compile(r\"(?i)[a-z0-9_]*(?:key|token|secret|password|passwd|credential|auth)[a-z0-9_]*\\s*[=:]\\s*['\\\"]?[^\\s'\\\"]*?(?:\\.\\.\\.|\\*\\*\\*|\u00abredacted)\")\ndbs = glob.glob(os.path.expanduser(\"~/.hermes/kanban.db\")) + glob.glob(os.path.expanduser(\"~/.hermes/kanban/boards/*/kanban.db\")) + glob.glob(os.path.expanduser(\"~/.hermes/profiles/*/kanban.db\"))\nlive = victims = 0\nfor db in dbs:\n    try:\n        rows = sqlite3.connect(f\"file:{db}?mode=ro\", uri=True).execute(\"select task_id, cmd from task_wake_checks\").fetchall()\n    except sqlite3.Error as e:\n        print(db, \"ERR\", e); continue\n    live += len(rows)\n    for tid, cmd in rows:\n        if cmd and pat.search(cmd):\n            victims += 1; print(\"VICTIM\", db, tid, pat.search(cmd).group(0)[:60])\nprint(socket.gethostname(), \"dbs\", len(dbs), \"live_wake_checks\", live, \"victims\", victims)\nEOF\n```\nFor each VICTIM line, comment on t_01a1cf477dece56b (or ask an operator to) with the task id and the masked fragment, and do NOT print the full command. A victim's owner must re-park with a correct probe; do not rewrite the row.\n\nComplete with metadata `{\"host\": \"<hostname>\", \"dbs\": N, \"live_wake_checks\": N, \"victims\": N, \"victim_task_ids\": [...]}`, and put the printed final line in the summary.",
++    "assignee": "default",
++    "created_at": 1794479959,
++    "has_key": true
++   },
++   "b": {
++    "id": "t_01a1cf578c357c25",
++    "title": "Victim scan on worker-3: live wake_checks with redactor-masked values (t_01a1cf477dece56b f)",
++    "body": "Read-only victim scan for t_01a1cf477dece56b (acceptance f). Run it on **this machine** (worker-3) and report the counts.\n\nBackground: kanban park probes (`wake_check`) used to go through the display secret redactor before they were stored. A probe containing `idempotency_key='\u2026'`, `*_token=\u2026` or a similar name could be stored masked (`\u2026`, `***`, `\u00abredacted`), and then it never matches. The fix is in PR #1354. This scan finds live probes that are already damaged.\n\nRun this exactly, read-only (`mode=ro`). Never edit `task_wake_checks` rows.\n```\npython3 - <<'EOF'\nimport glob, os, re, sqlite3, socket\npat = re.compile(r\"(?i)[a-z0-9_]*(?:key|token|secret|password|passwd|credential|auth)[a-z0-9_]*\\s*[=:]\\s*['\\\"]?[^\\s'\\\"]*?(?:\\.\\.\\.|\\*\\*\\*|\u00abredacted)\")\ndbs = glob.glob(os.path.expanduser(\"~/.hermes/kanban.db\")) + glob.glob(os.path.expanduser(\"~/.hermes/kanban/boards/*/kanban.db\")) + glob.glob(os.path.expanduser(\"~/.hermes/profiles/*/kanban.db\"))\nlive = victims = 0\nfor db in dbs:\n    try:\n        rows = sqlite3.connect(f\"file:{db}?mode=ro\", uri=True).execute(\"select task_id, cmd from task_wake_checks\").fetchall()\n    except sqlite3.Error as e:\n        print(db, \"ERR\", e); continue\n    live += len(rows)\n    for tid, cmd in rows:\n        if cmd and pat.search(cmd):\n            victims += 1; print(\"VICTIM\", db, tid, pat.search(cmd).group(0)[:60])\nprint(socket.gethostname(), \"dbs\", len(dbs), \"live_wake_checks\", live, \"victims\", victims)\nEOF\n```\nFor each VICTIM line, comment on t_01a1cf477dece56b (or ask an operator to) with the task id and the masked fragment, and do NOT print the full command. A victim's owner must re-park with a correct probe; do not rewrite the row.\n\nComplete with metadata `{\"host\": \"<hostname>\", \"dbs\": N, \"live_wake_checks\": N, \"victims\": N, \"victim_task_ids\": [...]}`, and put the printed final line in the summary.",
++    "assignee": "default",
++    "created_at": 1794479983,
++    "has_key": true
++   },
++   "b_key": "scan:redacted-wake-checks:worker-3:t_01a1cf477dece56b",
++   "b_parents": [],
++   "run_started": 1794478987,
++   "background": [
++    "wake_check",
++    "wake_check",
++    "wake_check",
++    "wake_check",
++    "task_wake_checks wake_check wake_checks",
++    "idempotency_key",
++    "idempotency_key wake_check",
++    "idempotency_key",
++    "wake_check",
++    "idempotency_key",
++    "idempotency_key",
++    "wake_check",
++    "wake_check",
++    "wake_check",
++    "idempotency_key",
++    "wake_check",
++    "wake_check",
++    "wake_check",
++    "idempotency_key",
++    "wake_check",
++    "idempotency_key",
++    "idempotency_key",
++    "idempotency_key",
++    "idempotency_key task_wake_checks wake_check wake_checks",
++    "wake_check",
++    "idempotency_key wake_check",
++    "idempotency_key"
++   ]
++  },
++  {
++   "kind": "fan-out",
++   "creator": "t_01a1cedd5cab762d",
++   "a": {
++    "id": "t_01a1d013f055980d",
++    "title": "GitHub quota guard proof on worker-1 (t_01a1cedd5cab762d rollout)",
++    "body": "Rollout proof for owner card t_01a1cedd5cab762d. State PR #1478 (merged as f590554f8a) installs the hub GitHub quota guard on pool workers through `worker-core-update` (`provision github-quota ... install-github-quota.py`). It is live and verified on worker-4. This card must run ON worker-1 (the ledger is per host).\n\nSteps (terminal, in this card's shell on worker-1):\n1. Check the guard is installed: `readlink ~/.local/bin/token-broker` must print `/home/ubuntu/.hermes/bin/token-broker-audit`, and `~/.local/bin/token-broker-unwrapped` must exist. If it's not installed yet, first confirm `git -C ~/.hermes/repos/hermes-state merge-base --is-ancestor f590554f8aa7663090b59dd71870c04eda6090fd HEAD` exits 0. Then run the same idempotent step the updater runs: `/usr/bin/python3 ~/.hermes/repos/hermes-state/hosts/hermes-workers/install-github-quota.py`. If the state clone doesn't have f590554f yet, wait for the next `hermes-core-update` pass (every 10 min), up to 30 min. Don't edit the checkout.\n2. Confirm card shells still work: `gh pr view 1478 -R example-org/hermes --json state` and, in a scratch dir, `git -c credential.helper= -c credential.helper='!~/.local/bin/gh auth git-credential' ls-remote https://github.com/example-org/hermes.git refs/heads/state` must both succeed.\n3. Guard proof: `token-broker exec --scope user/github --reason \"guard proof t_01a1cedd5cab762d\" -- gh api rate_limit --jq .resources.core`\n4. `sqlite3 -header ~/.hermes/logs/github-quota/audit.sqlite \"select id,fingerprint,reason,executable,exit_code,host,started from vends where reason='guard proof t_01a1cedd5cab762d'\"`. Also read the child request row: `select v.reason,r.method,r.endpoint,r.status,r.rate_limit_resource from vends v join requests r on r.vend=v.id where v.parent=(select id from vends where reason='guard proof t_01a1cedd5cab762d' order by started desc limit 1)`.\n\nComplete with metadata: `host`, `bundle` (the digest dir that `readlink -f ~/.hermes/bin/token-broker-audit` points into), `installed_by` (`updater` or `manual`), `vends_row` (the exact row text), `request_row`, `gh_pr_view_ok`, `git_ls_remote_ok`. If any step fails, do NOT uninstall unless card shells are broken. If they are, run `install-github-quota.py --uninstall`, then block with the error text. Don't change RESERVE or BURST_LIMIT.",
++    "assignee": "default",
++    "created_at": 1794492330,
++    "has_key": true
++   },
++   "b": {
++    "id": "t_01a1d01471c36e23",
++    "title": "GitHub quota guard proof on worker-2 (t_01a1cedd5cab762d rollout)",
++    "body": "Rollout proof for owner card t_01a1cedd5cab762d. State PR #1478 (merged as f590554f8a) installs the hub GitHub quota guard on pool workers through `worker-core-update` (`provision github-quota ... install-github-quota.py`). It is live and verified on worker-4. This card must run ON worker-2 (the ledger is per host).\n\nSteps (terminal, in this card's shell on worker-2):\n1. Check the guard is installed: `readlink ~/.local/bin/token-broker` must print `/home/ubuntu/.hermes/bin/token-broker-audit`, and `~/.local/bin/token-broker-unwrapped` must exist. If it's not installed yet, first confirm `git -C ~/.hermes/repos/hermes-state merge-base --is-ancestor f590554f8aa7663090b59dd71870c04eda6090fd HEAD` exits 0. Then run the same idempotent step the updater runs: `/usr/bin/python3 ~/.hermes/repos/hermes-state/hosts/hermes-workers/install-github-quota.py`. If the state clone doesn't have f590554f yet, wait for the next `hermes-core-update` pass (every 10 min), up to 30 min. Don't edit the checkout.\n2. Confirm card shells still work: `gh pr view 1478 -R example-org/hermes --json state` and, in a scratch dir, `git -c credential.helper= -c credential.helper='!~/.local/bin/gh auth git-credential' ls-remote https://github.com/example-org/hermes.git refs/heads/state` must both succeed.\n3. Guard proof: `token-broker exec --scope user/github --reason \"guard proof t_01a1cedd5cab762d\" -- gh api rate_limit --jq .resources.core`\n4. `sqlite3 -header ~/.hermes/logs/github-quota/audit.sqlite \"select id,fingerprint,reason,executable,exit_code,host,started from vends where reason='guard proof t_01a1cedd5cab762d'\"`. Also read the child request row: `select v.reason,r.method,r.endpoint,r.status,r.rate_limit_resource from vends v join requests r on r.vend=v.id where v.parent=(select id from vends where reason='guard proof t_01a1cedd5cab762d' order by started desc limit 1)`.\n\nComplete with metadata: `host`, `bundle` (the digest dir that `readlink -f ~/.hermes/bin/token-broker-audit` points into), `installed_by` (`updater` or `manual`), `vends_row` (the exact row text), `request_row`, `gh_pr_view_ok`, `git_ls_remote_ok`. If any step fails, do NOT uninstall unless card shells are broken. If they are, run `install-github-quota.py --uninstall`, then block with the error text. Don't change RESERVE or BURST_LIMIT.",
++    "assignee": "default",
++    "created_at": 1794492363,
++    "has_key": true
++   },
++   "b_key": "t_01a1cedd5cab762d:guard-proof:worker-2",
++   "b_parents": [],
++   "run_started": 1794492132,
++   "background": [
++    "exit_code",
++    "burst_limit",
++    "burst_limit rate_limit",
++    "burst_limit",
++    "burst_limit",
++    "rate_limit",
++    "burst_limit",
++    "rate_limit",
++    "rate_limit",
++    "burst_limit exit_code gh_pr_view_ok git_ls_remote_ok installed_by rate_limit rate_limit_resource request_row vends_row",
++    "burst_limit exit_code gh_pr_view_ok git_ls_remote_ok installed_by rate_limit rate_limit_resource request_row vends_row",
++    "burst_limit exit_code gh_pr_view_ok git_ls_remote_ok installed_by rate_limit rate_limit_resource request_row vends_row"
++   ]
++  },
++  {
++   "kind": "fan-out",
++   "creator": "t_01a1ca91167d8889",
++   "a": {
++    "id": "t_01a1ceb4f46658c8",
++    "title": "Backfill pre-fix attachment bytes from worker-3 to Board blob store (52 hub rows)",
++    "body": "## Goal\nCopy the bytes of hub attachment rows that were completed on **hermes-worker-3** before its core had the worker-attachment-custody fix (daveey/hermes c2b5952cca, PR1161) up to the Board blob store, under their ORIGINAL uid, so the hub can read them through the normal attachment path. Follow-up from t_01a1ca91167d8889 (backfill acceptance item 3).\n\n## Why these rows don't self-heal\nWorker kanban mirrors drop finished cards. A row whose card finished before the fix was installed never got a blob_key, and its local row is now gone, so `transfer_pending` can't upload it. The files usually still exist under `~/.hermes/kanban/attachments/<task>/[<uid>/]<filename>`. On worker-2 this recovered 12 of 12 rows (all hub-verified).\n\n## Snapshot (hub, 2026-11-12 ~07:40Z)\n52 rows on this host (claim lock `hermes-worker-3:*`): hub `/home/ubuntu/.hermes/kanban/evidence/t_01a1ca91167d8889/gaps-hermes-worker-3.json`, sha256 `0b8bce024bda039e331de156c9e97941d8e9b61dd34c2b45d193b1fc94c332c1`.\n\n## Steps\n1. Confirm that this host's installed core contains the fix: `git -C ~/.hermes/hermes-agent merge-base --is-ancestor c2b5952cca73cbc5b9f4ce4030566089796a09ca HEAD`. If it doesn't, `kanban_schedule` with that command as `wake_check` (awaiting kind=deploy, hermes-core-update). Uploads need the installed `Hub.put_attachment`. Hub evidence says worker-3 started uploading blobs at ~07:21Z, so it's probably installed already.\n2. After install, take a fresh gap list, since rows can be added until install: `hub-admin \"sqlite3 -json ~/.hermes/kanban.db \\\"select a.uid,a.task_id,a.filename,a.size,a.created_at,(select coalesce(json_extract(e.payload,'\\$.lock'),'') from task_events e where e.task_id=a.task_id and e.kind='claimed' and e.created_at<=a.created_at+5 order by e.id desc limit 1) as claim from task_attachments a where coalesce(a.stored_path,'')='' and coalesce(a.blob_key,'')=''\\\"\" > hub-gaps.json`. Keep only `claim` starting with `hermes-worker-3:` (jq). If `hub-admin` is missing here, use the snapshot file above, fetched through any hub read you have.\n3. `scp -O hub-admin:/home/ubuntu/.hermes/kanban/evidence/t_01a1ca91167d8889/worker_gap_backfill.py .` and check its sha256 is `83fd9e5d66c22bc9d6399523f12b6edcb167f6c7545db61a9ba2e52b452ebf0e`. Run `python3 worker_gap_backfill.py hub-gaps.json results.json --dry-run`, then run it again without `--dry-run`. The script only matches by task/filename/exact size, uploads under the hub uid, then GETs the blob and compares bytes. It never writes a DB. A `hub 429` means rate-limited: wait about 60 s and rerun only the failed rows.\n4. Hub-side check: `scp -O results.json hub-admin:/home/ubuntu/.hermes/kanban/evidence/t_01a1ca91167d8889/results-hermes-worker-3.json`, then `hub-admin \"cd ~/.hermes/hermes-agent && HERMES_HOME=/home/ubuntu/.hermes .venv/bin/python /home/ubuntu/.hermes/kanban/evidence/t_01a1ca91167d8889/hub_verify_uids.py /home/ubuntu/.hermes/kanban/evidence/t_01a1ca91167d8889/results-hermes-worker-3.json\"`. Every uploaded row must print `normal_read_verified`.\n5. Complete. Report the count of uploaded+hub-verified rows and name every `no_local_source` or `size_mismatch` row (uid, task, filename) as unavailable on this host. Attach results.json and the verify output.\n\nOut of scope: the 31 historical worker-1 rows (old host 192.0.2.17 is offline). Don't touch the DB directly, and don't create new attachment rows.",
++    "assignee": "default",
++    "created_at": 1794469327,
++    "has_key": true
++   },
++   "b": {
++    "id": "t_01a1ceb56585a791",
++    "title": "Backfill pre-fix attachment bytes from worker-4 to Board blob store (21 hub rows)",
++    "body": "## Goal\nCopy the bytes of hub attachment rows that were completed on **hermes-worker-4** before its core had the worker-attachment-custody fix (daveey/hermes c2b5952cca, PR1161) up to the Board blob store, under their ORIGINAL uid, so the hub can read them through the normal attachment path. Follow-up from t_01a1ca91167d8889 (backfill acceptance item 3).\n\n## Why these rows don't self-heal\nWorker kanban mirrors drop finished cards. A row whose card finished before the fix was installed never got a blob_key, and its local row is now gone, so `transfer_pending` can't upload it. The files usually still exist under `~/.hermes/kanban/attachments/<task>/[<uid>/]<filename>`. On worker-2 this recovered 12 of 12 rows (all hub-verified).\n\n## Snapshot (hub, 2026-11-12 ~07:40Z)\n21 rows on this host (claim lock `hermes-worker-4:*`): hub `/home/ubuntu/.hermes/kanban/evidence/t_01a1ca91167d8889/gaps-hermes-worker-4.json`, sha256 `5b781dfc0fbaf6448edd7cbfc3d919e847cf46fa4e957c1c74f65cf2a9f504d2`. As of 07:37Z worker-4 was still producing rows without a blob, so its core probably lacks the fix.\n\n## Steps\n1. Confirm that this host's installed core contains the fix: `git -C ~/.hermes/hermes-agent merge-base --is-ancestor c2b5952cca73cbc5b9f4ce4030566089796a09ca HEAD`. If it doesn't, `kanban_schedule` with that command as `wake_check` (awaiting kind=deploy, hermes-core-update). Uploads need the installed `Hub.put_attachment`.\n2. After install, take a fresh gap list, since rows can be added until install: `hub-admin \"sqlite3 -json ~/.hermes/kanban.db \\\"select a.uid,a.task_id,a.filename,a.size,a.created_at,(select coalesce(json_extract(e.payload,'\\$.lock'),'') from task_events e where e.task_id=a.task_id and e.kind='claimed' and e.created_at<=a.created_at+5 order by e.id desc limit 1) as claim from task_attachments a where coalesce(a.stored_path,'')='' and coalesce(a.blob_key,'')=''\\\"\" > hub-gaps.json`. Keep only `claim` starting with `hermes-worker-4:` (jq). If `hub-admin` is missing here, use the snapshot file above, fetched through any hub read you have.\n3. `scp -O hub-admin:/home/ubuntu/.hermes/kanban/evidence/t_01a1ca91167d8889/worker_gap_backfill.py .` and check its sha256 is `83fd9e5d66c22bc9d6399523f12b6edcb167f6c7545db61a9ba2e52b452ebf0e`. Run `python3 worker_gap_backfill.py hub-gaps.json results.json --dry-run`, then run it again without `--dry-run`. The script only matches by task/filename/exact size, uploads under the hub uid, then GETs the blob and compares bytes. It never writes a DB. A `hub 429` means rate-limited: wait about 60 s and rerun only the failed rows.\n4. Hub-side check: `scp -O results.json hub-admin:/home/ubuntu/.hermes/kanban/evidence/t_01a1ca91167d8889/results-hermes-worker-4.json`, then `hub-admin \"cd ~/.hermes/hermes-agent && HERMES_HOME=/home/ubuntu/.hermes .venv/bin/python /home/ubuntu/.hermes/kanban/evidence/t_01a1ca91167d8889/hub_verify_uids.py /home/ubuntu/.hermes/kanban/evidence/t_01a1ca91167d8889/results-hermes-worker-4.json\"`. Every uploaded row must print `normal_read_verified`.\n5. Complete. Report the count of uploaded+hub-verified rows and name every `no_local_source` or `size_mismatch` row (uid, task, filename) as unavailable on this host. Attach results.json and the verify output.\n\nOut of scope: the 31 historical worker-1 rows (old host 192.0.2.17 is offline). Don't touch the DB directly, and don't create new attachment rows.",
++    "assignee": "default",
++    "created_at": 1794469356,
++    "has_key": true
++   },
++   "b_key": "t_01a1ca91167d8889:gap-backfill:hermes-worker-4",
++   "b_parents": [],
++   "run_started": 1794468769,
++   "background": [
++    "kanban_schedule",
++    "kanban_schedule wake_check",
++    "json_extract kanban_schedule wake_check",
++    "kanban_schedule",
++    "hermes_home kanban_schedule",
++    "wake_check",
++    "kanban_schedule",
++    "kanban_schedule wake_check",
++    "wake_check",
++    "hermes_home",
++    "blob_key stored_path task_attachments",
++    "hermes_home kanban_schedule",
++    "kanban_schedule",
++    "kanban_schedule",
++    "created_at kanban_schedule",
++    "kanban_schedule",
++    "created_at",
++    "kanban_schedule",
++    "kanban_schedule",
++    "kanban_schedule",
++    "created_at kanban_schedule wake_check",
++    "hermes_home kanban_schedule",
++    "kanban_schedule wake_check",
++    "hermes_home",
++    "hermes_home kanban_schedule",
++    "hermes_home kanban_schedule",
++    "hermes_home",
++    "wake_check",
++    "task_events",
++    "wake_check",
++    "kanban_schedule",
++    "kanban_schedule",
++    "kanban_schedule task_events wake_check",
++    "hermes_home",
++    "kanban_schedule wake_check",
++    "kanban_schedule wake_check",
++    "hermes_home kanban_schedule",
++    "task_events",
++    "hermes_home",
++    "created_at task_events",
++    "hermes_home kanban_schedule",
++    "hermes_home kanban_schedule"
++   ]
++  },
++  {
++   "kind": "fan-out",
++   "creator": "t_01a1ccbeddc79731",
++   "a": {
++    "id": "t_01a1cd026af5bdad",
++    "title": "Worker-1 bb-tuner profile runtime acceptance proof",
++    "body": "Acceptance subtask for t_01a1ccbeddc79731. Execute on worker-1 only; if another host, report mismatch, do not certify. This is an actual assigned read-only audit workload to prove profile dispatch, tools, model route and progress. Read hosts/hermes-workers/PROFILES.md and install-profiles.py in ~/.hermes/repos/hermes-state. Verify installed bb-tuner SOUL matches worker_soul canonical transformation, parsed model auto/class:standard and local terminal, root model_routing parity, fourteen required enabled guard plugins, shared skills, and token-broker exec --scope user/github -- gh api user (return login only). Capture hostname, own task claim/run/model route evidence and tool-backed progress. Do not copy credentials or modify profiles. Report JSON/Markdown artifact plus summary and exact commands; do not claim ten-minute no-move-back window yourself unless actually observed, parent audit owns that check. Complete on verified workload; any missing prerequisite report precisely. No source changes. Distinct role-specific runtime acceptance, not enrollment implementation.",
++    "assignee": "bb-tuner",
++    "created_at": 1794440849,
++    "has_key": true
++   },
++   "b": {
++    "id": "t_01a1cd028c56ceba",
++    "title": "Worker-1 coach executor profile runtime acceptance proof",
++    "body": "Acceptance subtask for t_01a1ccbeddc79731. Execute on worker-1 only; if another host report mismatch, do not certify. Actual assigned read-only audit workload to prove coach profile dispatch, tools, model route and progress. Read hosts/hermes-workers/PROFILES.md and install-profiles.py in ~/.hermes/repos/hermes-state. Verify installed coach SOUL matches coach_soul canonical transformation, parsed model auto/class:standard and local terminal, root model_routing parity, fourteen required enabled guard plugins, shared skills, and token-broker exec --scope user/github -- gh api user (login only). Capture hostname, own task claim/run/model route evidence and tool-backed progress. Confirm executor-only boundary: do not mine, run cron, or write findings/reports/proposals; those remain hub-owned. Do not copy credentials or modify profiles. Produce JSON/Markdown artifact and exact commands. Do not claim ten-minute no-move-back unless observed; parent audit owns that check. Complete with verified workload; missing prerequisites report precisely. Distinct role-specific runtime acceptance, not enrollment implementation.",
++    "assignee": "coach",
++    "created_at": 1794440858,
++    "has_key": true
++   },
++   "b_key": "t_01a1ccbeddc79731-coach-runtime",
++   "b_parents": [],
++   "run_started": 1794440765,
++   "background": [
++    "model_routing",
++    "model_routing",
++    "model_routing"
++   ]
++  },
++  {
++   "kind": "fan-out",
++   "creator": "t_01a19400313cfbda",
++   "a": {
++    "id": "t_01a1c90bfb618d64",
++    "title": "Two-worker distribution fixture A (idle 150 s hold, unpinned)",
++    "body": "Rollout fixture A owned by t_01a19400313cfbda, normal unpinned ingress (two-worker distribution acceptance). Not real work.\n\nDo exactly this and nothing else: in the terminal run `hostname; date -u +%FT%TZ`, then run exactly one idle `sleep 150` (no resource stress), then `date -u +%FT%TZ`, then call kanban_complete with summary \"two-worker fixture A ran on <hostname output>\" and metadata {hostname, start_utc, end_utc}. Do not alter config, reroute or move the card, create tasks, load extra skills, or request review.",
++    "assignee": "default",
++    "created_at": 1794374368,
++    "has_key": false
++   },
++   "b": {
++    "id": "t_01a1c90cf49aa492",
++    "title": "Two-worker distribution fixture B (hostname only, unpinned)",
++    "body": "Rollout fixture B owned by t_01a19400313cfbda, normal unpinned ingress (two-worker distribution acceptance). Not real work.\n\nDo exactly this and nothing else: in the terminal run `hostname; date -u +%FT%TZ`, then call kanban_complete with summary \"two-worker fixture B ran on <hostname output>\" and metadata {hostname, utc}. Do not alter config, reroute or move the card, create tasks, load extra skills, or request review.",
++    "assignee": "default",
++    "created_at": 1794374431,
++    "has_key": false
++   },
++   "b_key": null,
++   "b_parents": [],
++   "run_started": 1794373882,
++   "background": [
++    "kanban_complete",
++    "kanban_complete",
++    "kanban_complete"
++   ]
++  },
++  {
++   "kind": "fan-out",
++   "creator": "t_01a1d45d75851804",
++   "a": {
++    "id": "t_01a1d471722af0cf",
++    "title": "[core] Unloaded sweeper + producer admission: per-process residual for live chats, host pass under host_loop_lease (design t_01a1d45d75851804 \u00a72b)",
++    "body": "Design: comment 62984 on t_01a1d45d75851804 \u00a71 (unloaded/producer rows) and \u00a72b, review items R1\u2013R4. Depends on t_01a1d470ec8f86ca (`hermes_cli/host_loop_lease.py`). Evidence: `kanban_unloaded._loop` = 14.9% of a steady hub serve's samples, 10.1% of the gateway's; `producer_admission._loop` 3.9% of a serve; started in every web-server process (`hermes_cli/web_server_app.py:120-138`) plus the gateway.\n\nWhat to build:\n- Split `kanban_unloaded._loop` into (a) a **residual pass every process runs** restricted to its own `live_session_ids()`: `delegation_unloaded` and `notice_guarantee` deliveries for chats live here (today they return `skipped:held` from any other process, so these must stay per-process); and (b) a **host pass** gated by lease `kanban-unloaded` (`lease.held()` at top of pass, `lease.beat()` per pass): `sweep_remote_once`, `sweep_once`, the not-held parts of delegation/guarantee, `notice_fanout.card_change_pass`, `reap_notices.retry_pending_killed_notices` iterated over `_stores()` (today it only gets `server._get_db()`).\n- `notice_fanout`: move `_cursors` and `_remote_snapshot` to a host-durable table (state.db or kanban home) so a lease hand-off does not drop one interval (today the first pass is baseline-only).\n- Holder wake capacity: `MAX_PARALLEL_WAKES` for unloaded/guarantee/delegation becomes 8 in the holder (config knob); running out of slots rewinds the claim and retries next pass instead of writing a passive row (`skipped:slots`). Document that the per-chat wake budget (`HERMES_KANBAN_UNLOADED_WAKES_PER_HOUR`) is now host-wide.\n- `producer_admission._loop` `sweep_once` gated by lease `producer-admission`; `deliver_pending` from the per-chat poller unchanged.\n- Roles: gateway registers priority `gateway`, Desktop serve `serve`, always-on dashboard `dashboard`.\n- Kill switch `HERMES_HOST_LOOP_LEASE=0` restores today's behaviour.\n\nDone when: RED\u2192GREEN tests: a chat live in a non-holder process still gets its delegation/guarantee delivery from its own residual pass; an unloaded chat is delivered exactly once by the holder; hand-off keeps notice_fanout outcomes (no dropped interval); slot exhaustion retries rather than writing a passive row; killed-notice retry covers every store. Existing kanban_unloaded/producer_admission/notice_guarantee/delegation_unloaded suites green. Land via `hermes-core-wt ship` with an independent exact-head review card (verdict + reviewed_sha + reviewed_pr).",
++    "assignee": "default",
++    "created_at": 1794565566,
++    "has_key": false
++   },
++   "b": {
++    "id": "t_01a1d471b638f510",
++    "title": "[mods] chat-closeout: per-process residual for live chats, host ledger scan under host_loop_lease (design t_01a1d45d75851804 \u00a72b)",
++    "body": "Design: comment 62984 on t_01a1d45d75851804 \u00a71 (chat-closeout row) and \u00a72b, review item R1. Depends on t_01a1d470ec8f86ca (core `hermes_cli/host_loop_lease.py`) being on main. Evidence: chat-closeout `_loop` (`wake_tick`, `owner_wake_tick`, `watchdog_tick`, `reconcile_done`/`_cols`) = 9.4% of a steady hub serve's samples, 4.4% of the gateway's; every process scans the same host ledger each 30 s, but `server._wake_session_turn` only succeeds where the chat is live (`refused` elsewhere).\n\nWhat to build (hermes-mods `plugins/chat-closeout`):\n- Residual pass in every process: wakes/relays only for ledger rows whose chat is in this process's `live_session_ids()` (cheap indexed read, not a full scan).\n- Host pass (full pending scan, reconcile_done, owner_wake for chats no process holds, watchdog candidate scan) only when lease `chat-closeout` is held; `lease.beat()` per pass. Probe the core API with `getattr`/ImportError: an older core keeps today's behaviour (safe duplication). The watchdog's existing `Ledger.lease(\"watchdog\")` posting gate stays.\n- Hooks (`pre/post_llm_call`, `pre_final_gate`) and the sidebar waiting source are per-turn and unchanged.\n\nDone when: RED\u2192GREEN tests in `plugins/chat-closeout/tests`: a chat live in a non-holder still gets its close-out wake from its residual pass; a cold chat is woken once by the holder; old core (no lease module) = today's behaviour. Land on hermes-mods main per the hermes-mods-repo skill (PR, required CI green on exact head, independent exact-head review card with verdict + reviewed_sha), then confirm it is live on the hub (hermes-mods-repo-testing).",
++    "assignee": "default",
++    "created_at": 1794565584,
++    "has_key": false
++   },
++   "b_key": null,
++   "b_parents": [],
++   "run_started": 1794565096,
++   "background": [
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "reviewed_sha",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "reviewed_sha",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli reviewed_sha",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli reviewed_sha",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "reconcile_done wake_tick",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "reviewed_sha",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "reviewed_sha",
++    "reviewed_sha",
++    "hermes_cli",
++    "reviewed_sha",
++    "reviewed_sha",
++    "hermes_cli",
++    "reviewed_sha",
++    "reviewed_sha",
++    "reviewed_sha",
++    "reviewed_sha",
++    "reviewed_sha",
++    "reviewed_sha",
++    "hermes_cli host_loop_lease reviewed_sha",
++    "reviewed_sha",
++    "reviewed_sha",
++    "reviewed_sha",
++    "reviewed_sha",
++    "reviewed_sha"
++   ]
++  },
++  {
++   "kind": "fan-out",
++   "creator": "t_01a1ce7ed2addb09",
++   "a": {
++    "id": "t_01a1cef5445282f6",
++    "title": "Review exact head PR1260 5d2e512cbb (stale Kanban block-notice ask refresh, round 3)",
++    "body": "Independent exact-head review of https://github.com/example-org/hermes/pull/1260 at head 5d2e512cbb5dea43b7be3fd8887a3a11520a497b (implementer card t_01a1ce7ed2addb09; you must not be that card's session).\n\nBackground: a Kanban \"blocked; needs attention\" wake is rendered when the card blocks, then can wait in a chat's admission FIFO for hours. The PR re-reads the card at delivery (`gateway/session_ingress.execute_admission` -> `hermes_cli/kanban_stale_ask.refresh_payload`, producer rows only). When the card has moved past the block, the \"Next action for the user\" and \"Why only the user\" lines become one `Since then: ... No action needed.` line. A card still blocked on the same block keeps the text byte-identical, and any doubt leaves the text unchanged.\n\nRound 2 (t_01a1cee06436bbba, head cba1de5f14) approved with three non-blocking findings. The branch has since been rebased onto origin/main, and the new commit 5d2e512cbb addresses them:\n- N1: a scope that quotes an `Open task: @task:<b>/<other>` line redirected the read to <other>. Fix: each field stops at the next field's line mark, and a second `\\nOpen task: ` before the notice ends (blank line / next actor line) makes the notice ambiguous, so it is left unchanged. Tests: test_open_task_line_inside_scope_does_not_redirect_the_read (RED on cba1de5f14), test_open_task_line_inside_scope_of_a_done_card_is_left_alone.\n- N2: quadratic backtracking (3000 lines took about 3.9 s). Fix: fields cannot contain the next mark, which makes the match linear. Test: test_pathological_producer_text_is_bounded (<0.5 s; RED on cba1de5f14 at 3.9 s).\n- N3: legacy tui_gateway `_kanban_pending` is not covered. Disposition: the observed 22:14 PST notice was MacBook state.db session_admissions seq 3264, request_id [\"kanban-wake\",\u2026], local_automation_v1 set, so it went through execute_admission. The legacy path is a separate follow-up card, not this PR.\n\nTask: trace `git diff d1af1dff3c~1..5d2e512cbb` (focus on commit 5d2e512cbb in hermes_cli/kanban_stale_ask.py and its tests) and report what you observe. Check that N1 and N2 are resolved and that no regression appears in the earlier behaviour: still-blocked notices stay byte-identical, the stray-mark and joined-notice cases hold, and the user-terminal hint is still swallowed. Run `hermes-core-wt test tests/gateway/test_kanban_stale_block_ask.py tests/tui_gateway/test_actionable_block_notices.py` from a detached worktree of that sha. Then do one adversarial pass that tries to refute your own findings, and report only the findings that survive it.\n\nComplete with kanban_complete metadata: `verdict` (approve | request_changes), `reviewed_sha` = 5d2e512cbb5dea43b7be3fd8887a3a11520a497b, `reviewed_pr` = https://github.com/example-org/hermes/pull/1260, `findings` list. If you cannot comment on t_01a1ce7ed2addb09, put the findings in metadata. Remove any worktree you add.",
++    "assignee": "default",
++    "created_at": 1794473542,
++    "has_key": true
++   },
++   "b": {
++    "id": "t_01a1cef54517ae54",
++    "title": "Legacy tui_gateway Kanban notices (_kanban_pending) skip the stale block-ask refresh",
++    "body": "Follow-up from t_01a1ce7ed2addb09 (PR https://github.com/example-org/hermes/pull/1260, review finding N3).\n\nPR1260 re-reads a queued block notice's card at delivery, but only on the gateway admission path: `gateway/session_ingress.execute_admission` -> `hermes_cli.kanban_stale_ask.refresh_payload`. The legacy tui_gateway path renders texts at collection time (`tui_gateway/session_notifications.py` `_notif_collect_kanban`, `_kanban_pending`, `_notif_poll_kanban_scoped` -> `_kb_persist_batch` -> `_notif_submit(\"\\n\".join(fresh))`), so a notice buffered there behind a busy turn can still show a stale \"Next action for the user\" ask.\n\nContext: the incident on 11-11, t_01a1cd4dbbc27e50 notice at 22:14 PST, went through the admission path (state.db session_admissions seq 3264), not this one. First check whether this path still delivers in practice: grep MacBook desktop/agent logs for `__notif__` submits in the last 7 days. If it is dead, say so with evidence and close the card.\n\nIf it is live: apply `hermes_cli.kanban_stale_ask.refresh_stale_ask` to the batch text before it is persisted to the transcript and submitted. Keep the per-text `_KanbanText` attributes (_kb_keys, _kb_blocked, _kb_remote). Remote `@task:<b>@<gw>/` notices stay unchanged, which is already the module's behaviour.\n\nAcceptance: write predictions first. A RED test shows a blocked text buffered in `_kanban_pending` while the card finishes still carrying \"Next action for the user\"; it must FAIL first. GREEN with the fix. A still-blocked control stays byte-identical. Land via `hermes-core-wt ship` with exact-head review, then request review.\n\nDepends on PR1260 having landed (needs hermes_cli/kanban_stale_ask.py on main).",
++    "assignee": "default",
++    "created_at": 1794473542,
++    "has_key": true
++   },
++   "b_key": "followup:t_01a1ce7ed2addb09:legacy-tui-pending-refresh",
++   "b_parents": [],
++   "run_started": 1794472545,
++   "background": [
++    "hermes_cli",
++    "tui_gateway",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli tui_gateway",
++    "hermes_cli",
++    "hermes_cli",
++    "tui_gateway",
++    "hermes_cli",
++    "_notif_collect_kanban tui_gateway",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli tui_gateway",
++    "hermes_cli",
++    "hermes_cli tui_gateway",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "tui_gateway",
++    "tui_gateway",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "tui_gateway",
++    "hermes_cli tui_gateway",
++    "hermes_cli",
++    "hermes_cli",
++    "tui_gateway",
++    "tui_gateway",
++    "hermes_cli tui_gateway",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli tui_gateway",
++    "hermes_cli tui_gateway",
++    "hermes_cli tui_gateway",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli"
++   ]
++  },
++  {
++   "kind": "fan-out",
++   "creator": "t_01a1d0d37a4d1780",
++   "a": {
++    "id": "t_01a1d137e0e7ea22",
++    "title": "Board: accept tokens_by_model in machine metrics (hermes-hub mailbox.ts) + deploy",
++    "body": "Part 1 of 3 of the approved plan on t_01a1d0d37a4d1780 (David chose \"Go: build as planned\"): Throughput panel Tokens breakdown by model.\n\nRepo: daveey/hermes-hub (local ref checkout ~/code/_ref/hermes-hub; work in your own worktree/clone).\n\n## Wire format (decided, shared with the core card \u2014 do not change)\nMachine metrics payload gains an OPTIONAL field:\n`tokens_by_model`: object `{ \"<model>\": [io_total, cache_total] }`\n- cumulative monotone totals, same semantics/units as the existing scalars `tokens_io_total` / `tokens_cache_total` (the per-model sums equal those scalars)\n- <= 32 keys; key: non-empty string <= 64 chars; values: exactly 2 integers in [0, 1e15]\n- senders fold overflow models into the key `other` and map empty model to `unknown` (Board just validates)\n\n## What to build\n- worker/src/mailbox.ts: extend validation (METRIC_BOUNDS today rejects unknown fields) to accept `tokens_by_model` with the bounds above; reject (400) malformed values: >32 keys, long/empty name, non-int, negative, >1e15, wrong arity. Absent field keeps current behaviour.\n- Pass it through unchanged in the registry metrics the Board returns for each machine (wherever `tokens_io_total` is surfaced today, e.g. /v2/machines).\n- Tests in worker/test/machines.test.ts: accept valid, each rejection case, round-trip through the registry read, old payload unaffected.\n\n## Done when\n- worker tests pass (name the count); PR merged with required CI green; Board deployed using the repo's normal deploy path, and a live readback shows a POSTed `tokens_by_model` coming back in the registry (use a test machine/your own gateway's metrics, not a fake production entry that lingers).\n- Complete with summary + PR URL in metadata.published_pr. The plugin card (part 3) is parented on this one.",
++    "assignee": "default",
++    "created_at": 1794511462,
++    "has_key": true
++   },
++   "b": {
++    "id": "t_01a1d137e20a2f2f",
++    "title": "Core: emit tokens_by_model from session_model_usage in machine_throughput_metrics.py",
++    "body": "Part 2 of 3 of the approved plan on t_01a1d0d37a4d1780 (David chose \"Go: build as planned\"): Throughput panel Tokens breakdown by model.\n\nFile: hermes_cli/machine_throughput_metrics.py (Hermes core fork). Ship via the normal `hermes-core-wt ship` flow (review + CI) per the loaded skills.\n\n## Wire format (decided, shared with the Board card \u2014 do not change)\nAdd OPTIONAL field to the machine metrics payload:\n`tokens_by_model`: `{ \"<model>\": [io_total, cache_total] }`\n- computed from `session_model_usage GROUP BY model` summed over every state.db the sender already reads for `tokens_io_total` / `tokens_cache_total`; use the SAME columns as those scalars so per-model sums equal them exactly\n- empty/NULL model -> `unknown`; model name truncated to 64 chars (merge collisions)\n- <= 32 keys: keep the top 31 by io_total+cache_total, fold the rest into `other`\n- ints, clamped to [0, 1e15]\n\n## Compatibility\n`send_compatible` must drop `tokens_by_model` and retry once when an old Board answers 400 (Board support lands in a sibling card; this card does NOT wait for it \u2014 build and ship now).\n\n## Done when\n- Unit tests: grouping, unknown mapping, truncation/collision merge, 32-key fold to `other`, sum equals scalars, 400 -> retry without field. Name test file + count.\n- Shipped through hermes-core-wt ship with review + CI green; complete with summary and PR/commit in metadata (published_pr if a PR). The plugin card (part 3) is parented on this one.",
++    "assignee": "default",
++    "created_at": 1794511462,
++    "has_key": true
++   },
++   "b_key": "throughput-by-model:core",
++   "b_parents": [],
++   "run_started": 1794511411,
++   "background": [
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "cache_total hermes_cli io_total machine_throughput_metrics send_compatible session_model_usage tokens_by_model tokens_cache_total tokens_io_total",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli published_pr",
++    "hermes_cli",
++    "published_pr",
++    "hermes_cli published_pr",
++    "published_pr",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "published_pr",
++    "published_pr",
++    "hermes_cli",
++    "hermes_cli published_pr",
++    "hermes_cli",
++    "hermes_cli"
++   ]
++  },
++  {
++   "kind": "fan-out",
++   "creator": "t_01a1d41fd158579d",
++   "a": {
++    "id": "t_01a1d462ff5c8698",
++    "title": "core: Kanban restart-continuation should keep a stopped call's own result below the interrupted stamp (sibling of PR #2062)",
++    "body": "Follow-up from review 5889241381 on example-org/hermes PR #2062 (t_01a1d41fd158579d).\n\nPR #2062 made `agent/update_pause_cancel.committed` keep a cancelled tool call's own result below the update stamp (`with_own_result`: head 1536 + tail 512 chars, closing `[end of the cancelled call's own result]` line). The sibling path `gateway/session_kanban_continue._answer_interrupted_calls` (restart continuation of a Kanban run) still overwrites each stopped tool row (`_stop_result_rows`) with the bare `interrupted_result(at)` text, so a killed command's own `[Command interrupted]` partial output (e.g. a Terraform apply log, a job_id) is still dropped there.\n\nFix: in `_answer_interrupted_calls`, for each stopped row being rewritten, read its current content and, when it is the tool's own text result (not the executor's cancel/skip text), write `with_own_result(stamp, own)` instead of the bare stamp (reuse the helper from agent/update_pause_cancel.py). Appended rows for unanswered calls keep the bare stamp. Add a test in tests/ next to test_kanban_restart_continuation. Land via `hermes-core-wt ship`.",
++    "assignee": "default",
++    "created_at": 1794564620,
++    "has_key": false
++   },
++   "b": {
++    "id": "t_01a1d4b4c463cc06",
++    "title": "core follow-up: update_pause_cancel.with_own_result should treat executor's emit_cancelled JSON as no own result (PR #2062 review nit)",
++    "body": "Review t_01a1d49b9d56482f of PR #2062 (review 5890290599) raised a non-blocking nit.\n\nIn the hermes-agent fork, `agent/update_pause_cancel.with_own_result` keeps a cancelled call's own result below the update-pause stamp. It already skips the executor's bracketed `[Tool execution cancelled/skipped \u2014` texts. But `ToolCall.emit_cancelled` (agent/tool_executor.py ~:290) builds `{\"error\": \"Tool execution cancelled. ...\", \"status\": \"cancelled\"}` JSON, and that JSON would be kept below the stamp as if it were the call's own result. That is noisy, and the docstring says it should not happen.\n\nFix: treat a JSON result whose `status == \"cancelled\"` and whose error starts with \"Tool execution cancelled\" as having no own result, so the bare stamp is returned. Add a test in tests/tui_gateway/test_update_pause_mid_tool.py. Land via `hermes-core-wt ship` (core-wt new <slug>, exact-head review, `--review-task`).",
++    "assignee": "default",
++    "created_at": 1794569978,
++    "has_key": false
++   },
++   "b_key": null,
++   "b_parents": [],
++   "run_started": 1794569957,
++   "background": [
++    "update_pause_cancel",
++    "update_pause_cancel"
++   ]
++  },
++  {
++   "kind": "fan-out",
++   "creator": "t_01a1c935358c77c9",
++   "a": {
++    "id": "t_01a1cb1ab5b1de03",
++    "title": "Terraform 1a W3: Energy filter 1/3, write tools/balance.nim (plan Task 16b)",
++    "body": "Terraform milestone 1a, Wave 3 (gods without a model, plan Phase 3), Task 16b part 1 of 3: write the energy-filter tool. Orchestration spec: `docs/HANDOFF.md` in example-org/coworld-terraform (hub checkout `~/code/coworld-terraform`). Read the Phase 3 introduction of the plan and design 4.9 before starting. The task text below is copied from the plan at commit 95253d6. Task 18 (`gods.nim`) and everything under it are on main.\n\nYour part is Step 1 and the first half of Step 4 (commit `tools/balance.nim`). Do NOT run Step 2 on hermes-hub and do not write `docs/spikes/energy-balance.md`: the next two cards do those. The checks, the gods, the floor of the careful culler and the seeds are fixed in this text.\n\nDecided here so the run card needs no judgement: `build/balance` takes `--source=allowance|life|sacrifice` (default: all three) and `--seeds=A..B` (default `1000..1019`); it prints the CSV header and rows to stdout and the pass/fail lines after them, each starting with `CHECK`, as `CHECK <source> <1-5> PASS|FAIL <the numbers behind it>`; the exit code is 0 whatever the checks say (a failing source is a finding, not an error).\n\n## What to build\n\n### Task 16b: The scripted energy filter\n\nDesign 4.9: before any model plays, check with scripted gods whether an energy source can be broken. This is a\nfilter. The default is chosen in Phase 8 with a model playing; until then it is the allowance.\n\n**Files:**\n- Create: `tools/balance.nim`\n- Create: `docs/spikes/energy-balance.md`\n\n**Step 1: Write the tool**\n\n`tools/balance.nim` imports `terraform/[world, energy, actions, metrics, objectives, episode, gods]`. Its exploit\ngods are the two cullers from `gods.nim` (`cullGod()`, which culls to the last fox, and `cullGod(floor = 3)`,\nwhich stops at three) and these, each a `God` like those in `gods.nim`:\n\n```nim\nproc spammer(): God =\n  ## As many of the cheapest action as it can pay for, every turn.\n  result = proc(run: var Run) =\n    for n in 0 ..< 400:\n      if not run.act(Action(kind: Rain, cell: int16(n mod Cells), amount: 1, text: \"spam\")).accepted: break\n\nproc hoarder(): God =\n  ## Saves to the cap, then spends it all on rabbits on its last turn.\n  result = proc(run: var Run) =\n    if run.world.epoch == GodEpochs - 1:\n      for cell in 0 ..< Cells:\n        discard run.act(Action(kind: Spawn, species: Rabbit, cell: int16(cell), amount: 5, text: \"dump\"))\n\nproc lateStarter(inner: God): God =\n  ## Does harm for 20 epochs, then plays the heuristic: can a bad start be recovered?\n  let harm = badGod()\n  result = proc(run: var Run) =\n    if run.world.epoch < 20: harm(run) else: inner(run)\n```\n\nFor each `EnergySource`, each `Objective` and seeds 1000-1019 it plays: heuristic, do-nothing, bad, spammer,\nthe all-out culler, the careful culler, hoarder, and the late-starting heuristic (`newRun(seed, objective, source)`), and prints one CSV row per\nsource and objective with the mean score of each god, the heuristic's energy spent by action kind, and the\ncorrelation between energy spent and score across gods. Then, per source, the five checks of design 4.9:\n\n1. no exploit god (spammer, either culler, hoarder) has a higher mean score than the heuristic\n2. heuristic > do-nothing > bad\n3. the late-starting heuristic scores at least 70% of the heuristic\n4. no one action kind takes more than 80% of the heuristic's spend\n5. the god that spends most is not the god that scores most, or two gods within 10% of each other's spend differ\n   by more than 20% in score\n\nThe careful culler is the exploit design 4.9 prices against: \"maximize rabbits by killing every fox\", stopped\njust short of the extinction that scores zero. The all-out culler alone would hide it. In the plan review's probe\n(seeds 1000-1009, Allowance, `maximize_rabbits`) the all-out culler lost on mean score (2120 against the\nheuristic's 3040, do-nothing 2365) only because 4 of its 10 runs ended in extinction. On the 6 seeds where a fox\nsurvived it beat the heuristic on every one (mean 3533 against 3022). So expect the Allowance to fail check 1\nagainst the careful culler at the current prices. That is a finding for `energy-balance.md` and for the choice\nof source and prices in Phase 8. It is not a reason to change the check, the floor or the culler.\n\n**Step 2: Run it (Haiku, pool worker)**\n\nRun: `nim c -d:release -o:build/balance tools/balance.nim && build/balance > tmp/balance.csv`\nExpected: 6 CSV rows and a pass/fail line per source and check. About 960 runs, 30 minutes on one core; split\n`--source` across cores if it has that flag.\n\n**Step 3: Write `docs/spikes/energy-balance.md`** (Fable reads the CSV)\n\nThe table, which sources pass all five, and for a failing source which god broke it and how. A source that fails\nis not removed: it is reported, and Phase 8 runs only the sources that pass. If no source passes check 1, say\nso plainly with the numbers and stop there: block the Fable card with a `human_request` (the options are a higher\nkill price, a score that counts foxes, or accepting the exploit for 1a). Do not change a price in this task.\n\n**Step 4: Commit**\n\n```bash\ngit add tools/balance.nim docs/spikes/energy-balance.md\ngit commit -m \"Scripted energy filter: three sources against exploit gods\"\n```\n\n## Done when\n- `nim check tools/balance.nim` is clean, and a debug build plays one seed of one source to the end and prints 2 CSV rows and 5 `CHECK` lines (`nim c -o:build/balance_debug tools/balance.nim && timeout 1500 build/balance_debug --source=allowance --seeds=1000..1000`; 16 runs, slow in debug). Paste both. One seed says nothing about the checks; report the lines as a smoke test only.\n- A unit test `tests/test_balance.nim` covers the three gods above on a 3-epoch run each (spammer only rains and ends the turn unable to pay for one more; hoarder does nothing before the last god epoch; lateStarter plays `badGod` before epoch 20) and the correlation and check-5 arithmetic on made-up numbers; written first and seen failing. To make that possible keep the gods and the arithmetic in importable procs and guard the tool's main with `when isMainModule`.\n- `tools/balance.nim` and the test are committed and pushed to main; branch and worktree removed. Steps 2 and 3 are reported as left to the next cards.\n\n## Rules (from docs/HANDOFF.md; read it and the plan before starting)\n- Spec: `docs/plans/2026-11-10-terraform-1a-plan.md` (the task named above, verbatim; if main's text of that task is newer than the copy in this body, main wins) and `docs/plans/2026-11-10-terraform-design.md` (rev 4). Repo `example-org/coworld-terraform` (private), main branch. Engine `example-org/polyworld` pinned at `6fe65dc38ec24579907d10c8c427957e6ee6218f` (its `terraform` branch). If the files are missing on your host, `git clone git@github.com:example-org/coworld-terraform.git`; never implement from memory.\n- The \"Decided. Do not reopen.\" list in HANDOFF.md is fixed. If you find one of those decisions is wrong, stop and report on this card (kanban_block with the evidence); do not route around it.\n- Test first: write the test, run it, see it fail, then write the code. Commit after each task.\n- The plan's definition of done is fixed. Weakening or skipping a test to pass is failure. An unimplemented piece is reported as incomplete in your summary, never a silent TODO.\n- The plan's code blocks were compiled and tested as one prototype, except where a phase says otherwise. A compile error is still a plan bug: fix the plan text in the same commit as the code.\n- Integer-only simulation state in `src/terraform/`; never `std/random` (use `terraform/keyrng`).\n- One writer per file set: work only in your own git worktree/branch. Land by rebasing on origin/main, fast-forwarding main and pushing (`git push origin HEAD:main`) after review passes; then delete your branch and remove any worktree you added.\n- Unit tests and debug builds are fine anywhere. Release builds, multi-seed batches, sweeps, the oracle and docker builds run on a pool w",
++    "assignee": "default",
++    "created_at": 1794408887,
++    "has_key": true
++   },
++   "b": {
++    "id": "t_01a1cb1c9b83c25f",
++    "title": "Terraform 1a W3: Energy filter 3/3, read the results and write energy-balance.md (plan Task 16b, Fable)",
++    "body": "Terraform milestone 1a, Wave 3 (gods without a model, plan Phase 3), Task 16b part 3 of 3: read the energy filter's results. Orchestration spec: `docs/HANDOFF.md` in example-org/coworld-terraform (hub checkout `~/code/coworld-terraform`). The text below is copied from the plan at commit 95253d6 (Task 16b; Step 3 is yours, with the second half of Step 4).\n\nInputs: `experiments/energy/results/balance-allowance.csv`, `balance-life.csv`, `balance-sacrifice.csv` and their README on main (run card `t_01a1cb1bce567be5`; if it could not push, they are attachments on it: commit them first, unchanged). Also read design 4.9, `tools/balance.nim`, and the plan review's probe (`docs/reviews/gate1-plan-review.md`, B1 and S1).\n\n## What to write\n\nDesign 4.9: before any model plays, check with scripted gods whether an energy source can be broken. This is a\nfilter. The default is chosen in Phase 8 with a model playing; until then it is the allowance.\n\nFor each `EnergySource`, each `Objective` and seeds 1000-1019 it plays: heuristic, do-nothing, bad, spammer,\nthe all-out culler, the careful culler, hoarder, and the late-starting heuristic (`newRun(seed, objective, source)`), and prints one CSV row per\nsource and objective with the mean score of each god, the heuristic's energy spent by action kind, and the\ncorrelation between energy spent and score across gods. Then, per source, the five checks of design 4.9:\n\n1. no exploit god (spammer, either culler, hoarder) has a higher mean score than the heuristic\n2. heuristic > do-nothing > bad\n3. the late-starting heuristic scores at least 70% of the heuristic\n4. no one action kind takes more than 80% of the heuristic's spend\n5. the god that spends most is not the god that scores most, or two gods within 10% of each other's spend differ\n   by more than 20% in score\n\nThe careful culler is the exploit design 4.9 prices against: \"maximize rabbits by killing every fox\", stopped\njust short of the extinction that scores zero. The all-out culler alone would hide it. In the plan review's probe\n(seeds 1000-1009, Allowance, `maximize_rabbits`) the all-out culler lost on mean score (2120 against the\nheuristic's 3040, do-nothing 2365) only because 4 of its 10 runs ended in extinction. On the 6 seeds where a fox\nsurvived it beat the heuristic on every one (mean 3533 against 3022). So expect the Allowance to fail check 1\nagainst the careful culler at the current prices. That is a finding for `energy-balance.md` and for the choice\nof source and prices in Phase 8. It is not a reason to change the check, the floor or the culler.\n\n**Step 3: Write `docs/spikes/energy-balance.md`** (Fable reads the CSV)\n\nThe table, which sources pass all five, and for a failing source which god broke it and how. A source that fails\nis not removed: it is reported, and Phase 8 runs only the sources that pass. If no source passes check 1, say\nso plainly with the numbers and stop there: block the Fable card with a `human_request` (the options are a higher\nkill price, a score that counts foxes, or accepting the exploit for 1a). Do not change a price in this task.\n\n**Step 4: Commit**\n\n```bash\ngit add tools/balance.nim docs/spikes/energy-balance.md\ngit commit -m \"Scripted energy filter: three sources against exploit gods\"\n```\n\n## Done when\n- `docs/spikes/energy-balance.md` is committed and pushed to main: the table (source x objective x god, mean scores), the 15 check results with their numbers, which sources pass all five, and for each failing source the god that broke it and how. Every number in it is in the CSVs; say which file and row.\n- `metadata` has `sources_passing` (list) and `check1_failures` (source -> god).\n- If no source passes check 1: the write-up is still committed and pushed first, then this card is blocked with `kanban_block(kind=\"needs_input\", human_request=...)` whose `action` names the three options from the plan (a higher kill price, a score that counts foxes, accepting the exploit for 1a) and says what unblock and archive mean, and whose `evidence` quotes the `CHECK` lines. Phase 8 is the consumer of this decision; Wave 4 does not wait on it.\n- Branch and worktree removed.\n\n## Rules (from docs/HANDOFF.md; read it and the plan before starting)\n- Spec: `docs/plans/2026-11-10-terraform-1a-plan.md` (the task named above, verbatim; if main's text of that task is newer than the copy in this body, main wins) and `docs/plans/2026-11-10-terraform-design.md` (rev 4). Repo `example-org/coworld-terraform` (private), main branch. Engine `example-org/polyworld` pinned at `6fe65dc38ec24579907d10c8c427957e6ee6218f` (its `terraform` branch). If the files are missing on your host, `git clone git@github.com:example-org/coworld-terraform.git`; never implement from memory.\n- The \"Decided. Do not reopen.\" list in HANDOFF.md is fixed. If you find one of those decisions is wrong, stop and report on this card (kanban_block with the evidence); do not route around it.\n- Test first: write the test, run it, see it fail, then write the code. Commit after each task.\n- The plan's definition of done is fixed. Weakening or skipping a test to pass is failure. An unimplemented piece is reported as incomplete in your summary, never a silent TODO.\n- The plan's code blocks were compiled and tested as one prototype, except where a phase says otherwise. A compile error is still a plan bug: fix the plan text in the same commit as the code.\n- Integer-only simulation state in `src/terraform/`; never `std/random` (use `terraform/keyrng`).\n- One writer per file set: work only in your own git worktree/branch. Land by rebasing on origin/main, fast-forwarding main and pushing (`git push origin HEAD:main`) after review passes; then delete your branch and remove any worktree you added.\n- Unit tests and debug builds are fine anywhere. Release builds, multi-seed batches, sweeps, the oracle and docker builds run on a pool worker (worker-2), never on hermes-hub, not even under `nice`.\n- Toolchain on hermes-hub: Nim 2.2.10 and nimby 0.2.3 in `~/.local/bin`; polyworld checkout at `~/code/polyworld`. A synced dependency directory is at `/home/ubuntu/.hermes/kanban/evidence/terraform-1a/deps`: `export TERRAFORM_DEPS=/home/ubuntu/.hermes/kanban/evidence/terraform-1a/deps` instead of syncing again. If `git -C $TERRAFORM_DEPS/polyworld rev-parse HEAD` is not the commit on line 1 of `terraform.lock`, sync your own `deps/` as the README says. On the MacBook: Nim 2.2.10, nimby 0.1.26 in `~/.local/bin`.\n- Secrets only via token broker: `token-broker exec --scope <scope> --reason \"...\" -- <cmd>`. OpenRouter scope is `openrouter` (`openrouter.inference` is deprecated). LLM calls in scripts/batches use the subscription pool first (`~/.hermes/plugins/pool-llm/bin/hermes-pool-llm`).\n- LLM spend cap for all of 1a: $250 (not yet confirmed by Dave). Stop and block before anything that would exceed it. No GPUs, no rented machines.\n- Never push to `example-org/polyworld` except its `terraform` branch.\n- Reviewer model: right before `kanban_request_review`, run `hermes kanban set-model $HERMES_KANBAN_WORKER_TASK claude-opus-5-5 --provider anthropic` (the review lane reuses a card's pinned model until the core fix lands). If the command is refused, put `reviewer-model: wanted claude-opus-5-5, set-model refused: <the error>` as the first line of your review summary.\n- Finish with `kanban_request_review` (review must be done by a different model than the author; neutral prompt: \"trace this and report what you observe\"). Summary reports what passes with test output, and what is incomplete.",
++    "assignee": "default",
++    "created_at": 1794409012,
++    "has_key": true
++   },
++   "b_key": "terraform-1a:w3:16b-read",
++   "b_parents": [],
++   "run_started": 1794406072,
++   "background": [
++    "kanban_request_review",
++    "kanban_request_review",
++    "kanban_request_review",
++    "human_request",
++    "human_request kanban_request_review",
++    "human_request kanban_request_review",
++    "hermes_kanban_worker_task",
++    "kanban_request_review",
++    "kanban_request_review",
++    "human_request",
++    "human_request",
++    "kanban_request_review",
++    "kanban_request_review",
++    "human_request",
++    "human_request needs_input",
++    "kanban_request_review",
++    "human_request needs_input",
++    "kanban_request_review",
++    "human_request needs_input",
++    "kanban_request_review",
++    "kanban_request_review",
++    "hermes_kanban_worker_task kanban_block kanban_request_review terraform_deps",
++    "hermes_kanban_worker_task kanban_block kanban_request_review terraform_deps",
++    "hermes_kanban_worker_task kanban_block kanban_request_review terraform_deps",
++    "hermes_kanban_worker_task kanban_block kanban_request_review terraform_deps",
++    "hermes_kanban_worker_task kanban_block kanban_request_review terraform_deps",
++    "hermes_kanban_worker_task kanban_block kanban_request_review terraform_deps",
++    "hermes_kanban_worker_task kanban_block kanban_request_review terraform_deps",
++    "kanban_block terraform_deps",
++    "hermes_kanban_worker_task kanban_block kanban_request_review terraform_deps",
++    "hermes_kanban_worker_task kanban_block kanban_request_review terraform_deps",
++    "hermes_kanban_worker_task kanban_block kanban_request_review terraform_deps",
++    "hermes_kanban_worker_task kanban_block kanban_request_review terraform_deps",
++    "hermes_kanban_worker_task human_request kanban_block kanban_request_review terraform_deps",
++    "hermes_kanban_worker_task kanban_block kanban_request_review terraform_deps",
++    "hermes_kanban_worker_task kanban_block kanban_request_review terraform_deps",
++    "hermes_kanban_worker_task kanban_block kanban_request_review terraform_deps",
++    "hermes_kanban_worker_task kanban_block kanban_request_review maximize_rabbits terraform_deps",
++    "human_request",
++    "kanban_block",
++    "hermes_kanban_worker_task kanban_block kanban_request_review maximize_rabbits terraform_deps",
++    "hermes_kanban_worker_task kanban_block kanban_request_review maximize_rabbits terraform_deps",
++    "hermes_kanban_worker_task kanban_block kanban_request_review terraform_deps",
++    "kanban_block terraform_deps",
++    "hermes_kanban_worker_task kanban_block kanban_request_review terraform_deps",
++    "hermes_kanban_worker_task kanban_block kanban_request_review terraform_deps",
++    "kanban_block terraform_deps",
++    "hermes_kanban_worker_task kanban_block kanban_request_review terraform_deps",
++    "hermes_kanban_worker_task human_request kanban_block kanban_request_review terraform_deps",
++    "hermes_kanban_worker_task kanban_block kanban_request_review terraform_deps",
++    "hermes_kanban_worker_task kanban_block kanban_request_review terraform_deps"
++   ]
++  },
++  {
++   "kind": "fan-out",
++   "creator": "t_01a1ce32dab49fdd",
++   "a": {
++    "id": "t_01a1ce6f6ab5da61",
++    "title": "Apply hermes-workers terraform/archives.tf (worker scratch-archive S3 bucket + write-only policy)",
++    "body": "Owner card for t_01a1ce32dab49fdd (state PR https://github.com/example-org/hermes/pull/1235). The worker IAM role `hermes-worker` (account 123456789012, us-west-2) has no S3 access today. Until this terraform is applied, the new worker archive custody step refuses (`offbox_head_failed`) and deletes nothing, so scratch archives keep filling worker root disks.\n\n**Do (after PR1235 is merged into state):**\n1. In a state checkout at merged state: `cd hosts/hermes-workers/terraform && terraform init && terraform plan`.\n2. The plan must show ONLY these additions:\n   - `aws_s3_bucket` `hermes-worker-archives-123456789012`, plus its versioning, SSE, public-access-block and lifecycle resources (Glacier IR after 30 days; current versions never expire);\n   - `aws_iam_role_policy` `archives_write` on role `hermes-worker`.\n   \n   No replacement of instances or other resources. If the plan shows anything else, stop and comment the plan instead of applying.\n3. `terraform apply`.\n4. Verify from a worker (e.g. hermes-worker-1) with its instance role:\n   - `aws s3api head-object --bucket hermes-worker-archives-123456789012 --expected-bucket-owner 123456789012 --key scratch-archives/probe-missing` returns 404 (not 403);\n   - a `delete-object` attempt is AccessDenied.\n5. Live proof on one worker: `systemd-run --user --wait --collect -p RuntimeMaxSec=15min ~/.hermes/bin/hermes-core-python ~/bin/worker-disk-pressure --upload-budget-s 120`. Then check:\n   - the log line `archive_custody.uploaded` \u2265 1 if archives exist;\n   - receipts exist under `~/.hermes/archive/custody/<board>/`.\n\nRecord the plan summary, apply output and verification as a comment.\n\nConstraints: never grant `s3:DeleteObject*`; keep the explicit Deny statement.",
++    "assignee": "default",
++    "created_at": 1794464770,
++    "has_key": true
++   },
++   "b": {
++    "id": "t_01a1ce7a61d8642d",
++    "title": "Land state PR #1235 (worker archive custody) once state CI preflight is green",
++    "body": "Land state PR https://github.com/example-org/hermes/pull/1235 (branch `wt/t_01a1ce32dab49fdd-archive-expiry`, approved exact head `3227e6434b47800036c011096d95c1323235a796`). It adds worker scratch-archive off-box custody and pressure expiry, from card t_01a1ce32dab49fdd.\n\n**Review status.** Three independent opus reviews approved:\n- the full review at 02feb6dc0;\n- the delta 02feb6dc0..2240d117;\n- the delta 36c0363e..3227e643, plus a range-diff showing the rebase changed nothing.\n\n**Exact-head CI on 3227e643.** Everything is green except `unit (1)`. Its ONLY failure is `test_run_ci.RunCiShardTest.test_workflow_three_shards_cover_inventory_without_relaxing_budget` (count 2 != 3).\n- That test also fails on the state tip without this PR; it was reproduced locally on state 5e10f6306e.\n- This PR does not touch `.github/workflows` or `tests/run_ci.py`.\n- State's own hermes-sync runs (1fb5aa4e33, 13c86ea931, e7e703e001) are red on other unrelated tests: test_hub_admin, test_sync_test_safety, test_state_pre_push_check.\n\n**Blocker.** `gh pr merge --rebase --match-head-commit` is refused by the ship-only guard. It needs a readable green exact-head state preflight.\n\n**Do:**\n1. Wait for, or get, the state CI break fixed (the test_run_ci shard count vs workflow).\n2. Rebase the branch onto the new state tip, keeping it linear. Re-run `TMPDIR=/dev/shm systemd-run --user --scope --quiet --setenv=TMPDIR=/dev/shm python3 -m unittest tests.test_worker_archive_custody tests.test_worker_disk_pressure_entry tests.test_worker_disk_pressure_install tests.test_worker_disk_pressure tests.test_worker_disk_reclaim`. NEVER run test_worker_disk_reclaim* outside `systemd-run --user --scope`.\n3. Push, and wait for green exact-head CI.\n4. Merge through the sanctioned route (`gh pr merge 1235 -R example-org/hermes --rebase --match-head-commit <FULL_SHA>` once the preflight is green, or whatever the guard names).\n5. If the rebase changes any PR content, get a fresh independent delta review first.\n\nAfter the merge, the owner card t_01a1ce6f6ab5da61 (terraform apply of `hosts/hermes-workers/terraform/archives.tf`) can proceed.",
++    "assignee": "default",
++    "created_at": 1794465489,
++    "has_key": true
++   },
++   "b_key": "t_01a1ce32dab49fdd:land-pr1235",
++   "b_parents": [],
++   "run_started": 1794461568,
++   "background": [
++    "test_worker_disk_reclaim",
++    "test_worker_disk_reclaim",
++    "test_worker_disk_reclaim"
++   ]
++  },
++  {
++   "kind": "fan-out",
++   "creator": "t_01a1cfa4fc605bbd",
++   "a": {
++    "id": "t_01a1d01c780dbf99",
++    "title": "Independent exact-head review: PR #1492 land lane (supersedes #1485), head 90e2a58e9d",
++    "body": "Independent exact-head review of example-org/hermes PR #1492 (base `state`): https://github.com/example-org/hermes/pull/1492\n\nReview exactly head `90e2a58e9d0a08f661c2ce9e072077b8c755be43` (branch `wt/land-lane-t01a1cfa4-r3`, three commits on state 05952b6128). You did not write this change; the build card is t_01a1cfa4fc605bbd. Do not push and do not merge.\n\n**What it is.** The serialized land lane, implementing the approved design `docs/designs/land-lane.md` rev 5 (carried in the PR; sha256 90719b556d435bfeb7f9ea72d1c691479f6c9229879ddec2887e9450695a5e26). The design is approved and not under review; review whether the code matches it. #1492 supersedes #1485 and #1462 (both closed): state kept moving onto `home/bin/hermes-core-wt-land` and headless force-push is refused, so each rebase got a new branch.\n\n**History.** Round 3 (t_01a1d0137bca9fe0, PR comment https://github.com/example-org/hermes/pull/1485#issuecomment-6825903292) approved #1485 at 4e32cfbc7a with no blockers. Since then state gained ba49e0512f (\"core-wt ship: current repo name, identity reads once, no auth probe on worker gh\"), which conflicted in `main()`: state added `slug = canonical_slug(slug)` before `ev = dict(event=\"ship\", ...)` and the lane adds `lane=None` to that dict; the resolution keeps both. `git range-diff 05952b6128~0 ...` style check: `git range-diff 3e6c548ab1..4e32cfbc7a 05952b6128..90e2a58e9d` should show only that hunk changed. Confirm it, and check the lane against ba49e0512f's changes (canonical slug, identity cache, gh auth probe removal) \u2014 e.g. that the lane and `lane_probe`/`lane_evict_closed` use the canonical slug consistently. Then review the whole PR at the exact head. Round-3 advisories A (quota wait after the final lane CAS can outlast the skew fence) and B (no test of `--lane-enter` waiting out a brake) are deliberately left to a follow-up card, not this PR.\n\n**Get the code.** `token-broker exec --scope user/github --reason \"review PR 1492\" -- env GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0= GIT_CONFIG_KEY_1=credential.helper GIT_CONFIG_VALUE_1='!gh auth git-credential' git fetch https://github.com/example-org/hermes.git wt/land-lane-t01a1cfa4-r3` in a detached worktree of `~/.hermes/repos/hermes-state` (`git sparse-checkout disable`; remove the worktree when done). Confirm `git rev-parse HEAD` equals the sha above.\n\n**Check against** the spec's `## Implementation plan`, `## Invariants` and `## Acceptance` item 2:\n1. An approval only counts at its exact head; the lane never makes landable a head the gate would refuse.\n2. No lane-aware ship lands without the turn as checked in the CAS immediately before `land()`, and none rebases a pushed head without the turn.\n3. Every write is a compare-and-swap on the remote commit it read from; no write can erase a concurrent write.\n4. A writer removes only its own entry, non-live entries (skew margin for others), or blockers it saw merged/closed whose entry is unchanged; `lane release` is the logged exception.\n5. Lane unreachable, corrupt, version \u2260 1 or CAS exhausted refuses with exit 1 before any rebase or land; `disabled: true` and `HERMES_CORE_WT_LANE=off` bypass it.\n6. The exact-head review gate, the required checks and the review rule are unchanged for PRs outside the lane.\n\nRun `/usr/bin/python3 -m unittest tests.test_core_wt_land_lane tests.test_core_wt_ship_gate tests.test_core_wt_ci_proof tests.test_core_wt_quota tests.test_core_wt_land_spend tests.test_core_wt_deliver` (~8 min). Known environmental cases: `test_real_worker_cli_create_refusal_is_the_fence_ship_recognises` (installed CLI, gateway restarts) and `test_core_wt_ci_proof` during a live quota brake. State PRs have no CI checks.\n\nMake an adversarial pass; report only surviving findings, blocking separated from advisories.\n\n**Complete with** `kanban_complete` and `metadata` holding exactly these keys: `verdict` (\"approve\" or \"request_changes\"), `reviewed_sha` (the full 40-hex sha above, only if that is what you reviewed), `reviewed_pr` (exactly `https://github.com/example-org/hermes/pull/1492`), and `findings`. Post the verdict as a PR comment naming the reviewed sha.",
++    "assignee": "default",
++    "created_at": 1794492889,
++    "has_key": false
++   },
++   "b": {
++    "id": "t_01a1d01c9a2c3f54",
++    "title": "Land lane: no quota wait after the final lane CAS; test --lane-enter waiting out a brake",
++    "body": "Follow-up to the land lane (build card t_01a1cfa4fc605bbd, PR https://github.com/example-org/hermes/pull/1492; design docs/designs/land-lane.md rev 5). Two non-blocking advisories from review t_01a1d0137bca9fe0 (PR #1485 @4e32cfbc7a), deliberately kept out of the lane PR so its reviewed delta stays a pure rebase:\n\nA. In `home/bin/hermes-core-wt-land` ship flow, after the final lane CAS (`lane.step(..., final=True)` just before `land()`), the PR-merge route's `gh.run('pr','merge')` runs `quota_preflight()`, which with the in-process quota wait (state b8180ba8b6) can sleep up to 3\u00d7(\u2264330 s + jitter) \u2248 16.7 min, longer than the 15-min SKEW fence. Fix: set `QUOTA_WAIT[\"enabled\"] = False` right after the final lane step passes (inside `if step.mode == \"on\":`, after the `expiring` check), so a brake there exits 75 and the rerun re-checks the turn. Add a test that fails without it.\n\nB. No test covers `--lane-enter` waiting out a short brake (the default path); the only brake test (`test_lane_ops_work_under_the_quota_brake_and_lane_enter_exits_75`) now runs with `HERMES_CORE_WT_QUOTA_WAIT=0`. Add one.\n\nStart only after PR #1492 (or its successor) is merged on `state` (check `git log origin/state -- home/bin/hermes-core-wt-land` contains the lane). Branch from current origin/state, open a state PR, get an independent exact-head review (fresh reviewer card pinned claude-opus-5-5/anthropic, metadata `verdict`, `reviewed_sha`, `reviewed_pr`), rebase-merge with `gh pr merge --rebase --match-head-commit`.",
++    "assignee": "default",
++    "created_at": 1794492897,
++    "has_key": false
++   },
++   "b_key": null,
++   "b_parents": [],
++   "run_started": 1794491085,
++   "background": [
++    "reviewed_pr reviewed_sha",
++    "reviewed_sha",
++    "reviewed_sha",
++    "reviewed_pr reviewed_sha",
++    "reviewed_pr reviewed_sha",
++    "reviewed_pr reviewed_sha",
++    "reviewed_pr reviewed_sha",
++    "reviewed_pr reviewed_sha",
++    "reviewed_pr reviewed_sha",
++    "reviewed_pr reviewed_sha",
++    "reviewed_pr reviewed_sha",
++    "reviewed_pr reviewed_sha",
++    "reviewed_pr reviewed_sha",
++    "reviewed_pr reviewed_sha",
++    "reviewed_pr reviewed_sha",
++    "reviewed_pr reviewed_sha",
++    "reviewed_sha"
++   ]
++  },
++  {
++   "kind": "fan-out",
++   "creator": "t_01a1cefefcad176a",
++   "a": {
++    "id": "t_01a1cf166d2629c3",
++    "title": "hermes-state: hub `label-probe <machine>` entry point for operator-call label_publish (core PR #1332)",
++    "body": "Follow-up from t_01a1cefefcad176a (core PR #1332, operator call `label_publish`). Core's hub executor runs `~/.local/share/hermes-worker-skills/bin/label-probe <machine>` (hermes_cli/kanban_operator_labels.py `_probe`, `PROBE_COMMAND`) as the hub-side proof. Until that probe exists, every label_publish fails closed with `proof_unavailable`.\n\n## Build (hermes-state, `state` branch, hosts/hermes-workers)\n- Add `bin/label-probe`. It is stdlib-only and takes one argument, a Board machine name (`[a-z0-9][a-z0-9-]{0,31}`). It runs as the hub user with the instance role. It resolves the machine to its running EC2 instance the same way `refresh-skill-labels` `targets()` does (active Board gateway plus the Name tag `hermes-<name>`). It then runs the same audited SSM read as `read_inventory()`.\n- Reuse the shared code, with no copy. Load `refresh-skill-labels` as a module, the way it already loads `publish-skill-labels`. Factor `read_inventory` so a probe run has **no side effects**: no `report_recovery`, no `deliver_incidents`, no cursor write.\n- Output contract: stdout is exactly one JSON object, `{\"machine\": <name>, \"complete\": true, \"skills\": [sorted skill:*], \"proofs\": {<capability:* label>: {\"ok\": bool, \"detail\": str}}}`. Filter `proofs` with `publish-skill-labels.valid_proofs` (CAPABILITIES only).\n- Exit non-zero, with a short stderr reason, when any of these hold: the machine is unknown or ambiguous, the inventory is incomplete or malformed, the read times out, or `proof_error` is set. Never print raw command output or secrets.\n- Add `label-probe` to `install-skill-refresh.py` `pairs`.\n- Tests go in `tests/test_refresh_worker_skills.py` or a sibling. Cover: the output shape, the no-side-effects guarantee, unknown machine, ambiguous instance, and incomplete inventory. Each test must fail without the fix.\n- Land per `references/state-pr-landing.md` (kanban-worker skill), then install it on the hub (`install-skill-refresh.py --files-only`). Verify that `label-probe worker-<n>` on the hub prints the contract.\n\n## Acceptance\n- With core #1332 live on the hub, a `label_publish` of an already-proven `capability:` label on a worker comes back `already_applied` or `applied`, not `proof_unavailable`. Show the operator_calls row (`hermes kanban supervisor-requests --operator-log`).",
++    "assignee": "default",
++    "created_at": 1794475715,
++    "has_key": false
++   },
++   "b": {
++    "id": "t_01a1cf16cabf27d2",
++    "title": "Independent exact-head review: PR #1332 operator call label_publish (6f42b6a2a5)",
++    "body": "Do an independent exact-head review of **PR #1332** (https://github.com/example-org/hermes/pull/1332), head **6f42b6a2a50fed5284cfbf5b4ab8cb1915ed15ed**, branch `wt/label-publish`. It is one commit on 9439f4a31bb. Implementation card: t_01a1cefefcad176a. The PR adds operator-call action `label_publish` as a follow-up to #1271/358c8ab3d6.\n\nBefore reviewing, confirm the head with `git ls-remote` against both `refs/heads/wt/label-publish` and `refs/pull/1332/head`. If either has moved, review the new head and say so.\n\n## Spec (from t_01a1cefefcad176a, approved by David on t_01a1ce6a22aecdf5)\n- The action shape is `label_publish {machine, labels, proof}`. Labels are an add-only delta, limited to `skill:`/`capability:`, never `machine:*`.\n- Only the hub executes it (it holds `~/.config/hermes-mail/admin.key`). Workers never hold or read the key.\n- The hub verifies a proof before it publishes. The result goes to a result event on the requester's card.\n- The write is a compare-and-set delta on the current label set, never a whole-set replace.\n- Every call is logged in `operator_calls`.\n- Required tests: accepted publish, refused machine label, refused bad proof, CAS conflict, no admin key on workers.\n\n## Files\n- New: `hermes_cli/kanban_operator_labels.py`\n- Changed: `hermes_cli/kanban_operator_call.py`, `tools/kanban_tools_schemas.py`\n- Tests: new `tests/hermes_cli/test_kanban_operator_labels.py`; changed `tests/hermes_cli/test_kanban_operator_call.py`\n\n## Check specifically\n1. The proof cannot be forged by the requester. `proof` carries no claim, and the hub runs its own `label-probe <machine>`. A result row the requester writes on its own card must not finish the request (the Board `origin_gateway` must be `hub`). A non-hub gateway must never execute a call, even one whose payload names that gateway as `home`.\n2. The CAS logic in `publish()` against the real Board semantics in `~/.hermes/repos/hermes-hub-reader/worker/src/mailbox.ts`:\n   - `setMachine` replaces the label set and appends a `machine_audit` row whose `change.labels` is sorted.\n   - `listGateways` returns `{gateways:[...]}`.\n   - `MAX_LABELS` is 32.\n   Cases to check: a racing write, a later dropped delta, and termination after `CAS_ROUNDS`.\n3. Job thread and lock behavior: `_claim`, `_run_job`, the stale-job bound, delivery retry and idempotency on replay. The dispatcher tick must never block on the probe or admin calls.\n4. Run the tests at head, in two batches:\n   - `scripts/run_tests.sh tests/hermes_cli/test_kanban_operator_labels.py tests/hermes_cli/test_kanban_operator_call.py`\n   - `scripts/run_tests.sh tests/hermes_cli/test_kanban_supervisor_requests.py tests/hermes_cli/test_kanban_foreign_card_writes.py tests/tools/test_kanban_tools.py`\n   \n   Also run `scripts/check`, and do at least one mutation of your own (for example, drop the `own != kol.HOME` guard in `apply_incoming`) to confirm the tests bite.\n5. Known gap: the hub `label-probe` executable is a hermes-state follow-up (t_01a1cf166d2629c3). Until it lands, calls fail closed with `proof_unavailable`. Judge whether that is acceptable for landing core first.\n\nComplete with `metadata.verdict` (`approve` or `request_changes`), `metadata.reviewed_sha` (40 hex) and `metadata.reviewed_pr` = 1332. Do not use `published_pr`. Do not merge.",
++    "assignee": "default",
++    "created_at": 1794475739,
++    "has_key": false
++   },
++   "b_key": null,
++   "b_parents": [],
++   "run_started": 1794474291,
++   "background": [
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "reviewed_pr reviewed_sha",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "request_changes",
++    "published_pr",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli request_changes reviewed_sha",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli published_pr",
++    "request_changes",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "origin_gateway published_pr",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "published_pr reviewed_sha",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "published_pr request_changes reviewed_pr reviewed_sha",
++    "hermes_cli",
++    "request_changes reviewed_sha",
++    "request_changes reviewed_pr reviewed_sha",
++    "hermes_cli label_publish operator_calls",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli",
++    "hermes_cli request_changes reviewed_pr reviewed_sha",
++    "hermes_cli request_changes reviewed_pr reviewed_sha",
++    "hermes_cli",
++    "hermes_cli request_changes reviewed_pr reviewed_sha",
++    "hermes_cli request_changes reviewed_pr reviewed_sha",
++    "hermes_cli request_changes reviewed_pr reviewed_sha",
++    "request_changes reviewed_pr reviewed_sha",
++    "hermes_cli request_changes reviewed_pr reviewed_sha",
++    "hermes_cli request_changes reviewed_pr reviewed_sha",
++    "request_changes reviewed_pr reviewed_sha"
++   ]
++  }
++ ]
++}
+\ No newline at end of file
+diff --git a/tests/tools/test_kanban_create_overlap_same_creator.py b/tests/tools/test_kanban_create_overlap_same_creator.py
+new file mode 100644
+index 0000000000..f50eb814f5
+--- /dev/null
++++ b/tests/tools/test_kanban_create_overlap_same_creator.py
+@@ -0,0 +1,152 @@
++"""A card's own earlier cards are compared at create time, not exempt as fan-out. [daveey]
++
++Incident (2026-11-13, hub default board): three times in one day a dispatcher card created a second card for
++work its own earlier card already covered, and each duplicate ran a worker until it noticed:
++- t_01a1d44c7b488318 -> t_01a1d44d9e68cca4 (75 s) and t_01a1d4914914925a -> t_01a1d4917584d038 (12 s): the
++  creator archive-and-recreated a card to drop a placement marker, the archive was refused because the first
++  card was already claimed, and the recreate (now with a key) went ahead.
++- t_01a1d462ff5c8698 -> t_01a1d4e145f389a5 (2 h 18 m): a review-round nit filed while the round-1 child that
++  owned ``_answer_interrupted_calls`` was still open; the duplicate opened PR #2237 before noticing.
++``_find`` skipped every card the same worker had created, and the first creates had no key, so nothing matched.
++
++The replay fixture holds those 3 pairs and 14 real legitimate same-creator fan-outs from the same 7 days
++(enumerated legs, implement + exact-head review, one review's distinct follow-ups, cross-repo pairs), plus the
++background cards that name the same code identifiers, so the rarity filter counts what the board held.
++"""
++
++from __future__ import annotations
++
++import inspect
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_overlap as ko
++
++FIXTURE = Path(__file__).parent / "fixtures" / "kanban_overlap_same_creator_replay.json"
++CASES = json.loads(FIXTURE.read_text())["cases"]
++GATEWAYS = {"hub", "hermes-hub"}
++
++
++def _card(c: dict, *, creator, local=True, status="running") -> dict:
++    return {"id": c["id"], "board": "default", "gateway": "hub", "status": status, "title": c["title"],
++            "body": c["body"], "assignee": c.get("assignee"), "created_at": c.get("created_at"),
++            "session_id": None, "creator_task_id": creator, "local": local, "key_family": None,
++            "has_key": c.get("has_key", False), "placed_as": None, "awaits": None, "chats": []}
++
++
++def _replay(case: dict):
++    a = _card(case["a"], creator=case["creator"])
++    background = [_card({"id": f"t_bg{i:012x}", "title": "background", "body": body}, creator=None, local=False)
++                  for i, body in enumerate(case["background"])]
++    b = case["b"]
++    # The pre-fix ``_find`` takes neither keyword; passing them only when accepted keeps the replay runnable on
++    # the old code, where it shows the bug (every own card skipped) instead of a TypeError.
++    extra = {k: v for k, v in (("assignee", b["assignee"]), ("run_started", case["run_started"]))
++             if k in inspect.signature(ko._find).parameters}
++    matches, _ = ko._find(title=b["title"], body=b["body"], target_board="default", session_id=None,
++                          self_tid=case["creator"], parents=case["b_parents"], family=ko.key_family(case["b_key"]),
++                          self_gw="hub", cards=[a, *background], gateways=set(GATEWAYS), **extra)
++    return next((m for m in matches if m["id"] == a["id"]), None)
++
++
++def _cid(case):
++    return f"{case['kind']}:{case['a']['id']}->{case['b']['id']}"
++
++
++def test_fixture_covers_the_incident_and_ten_fan_outs():
++    kinds = [c["kind"] for c in CASES]
++    assert kinds.count("duplicate") == 3 and kinds.count("fan-out") >= 10
++
++
++@pytest.mark.parametrize("case", [c for c in CASES if c["kind"] == "duplicate"], ids=_cid)
++def test_recorded_same_creator_duplicate_is_refused(case):
++    match = _replay(case)
++    assert match is not None, "the creator's own open card must be compared, not exempt as fan-out"
++
++
++def test_same_run_reissues_deduplicate_and_the_later_round_is_refused():
++    verdicts = {c["b"]["id"]: ko.verdict([m], [], "") for c in CASES if c["kind"] == "duplicate"
++                for m in [_replay(c)]}
++    assert verdicts["t_01a1d44d9e68cca4"] == {**verdicts["t_01a1d44d9e68cca4"], "deduplicated": True,
++                                              "task_id": "t_01a1d44c7b488318"}
++    assert verdicts["t_01a1d4917584d038"]["task_id"] == "t_01a1d4914914925a"
++    later = verdicts["t_01a1d4e145f389a5"]  # another run, two hours on: a refusal, not a silent reuse
++    assert later["ok"] is False and later["code"] == ko.EVENT
++    assert "_answer_interrupted_calls" in later["matches"][0]["why"]
++
++
++@pytest.mark.parametrize("case", [c for c in CASES if c["kind"] == "fan-out"], ids=_cid)
++def test_recorded_legitimate_fan_out_is_admitted(case):
++    assert _replay(case) is None
++
++
++def test_distinct_from_still_admits_an_own_duplicate():
++    case = next(c for c in CASES if c["b"]["id"] == "t_01a1d4e145f389a5")
++    match = _replay(case)
++    assert ko.covered([match], [case["a"]["id"]], "round-2 nit is separate")
++
++
++def test_shared_identifiers_many_cards_name_are_not_a_fix_site():
++    case = next(c for c in CASES if c["b"]["id"] == "t_01a1d4e145f389a5")
++    crowded = {**case, "background": case["background"] + ["_answer_interrupted_calls interrupted_result "
++                                                           "with_own_result"] * 3}
++    assert _replay(crowded) is None
++
++
++# -- through kanban_create, as a dispatcher worker -------------------------------------------------------------
++
++@pytest.fixture
++def worker(tmp_path, monkeypatch):
++    h = tmp_path / ".hermes"
++    h.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(h))
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub-state"))
++    for var in ("HERMES_SESSION_ID", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
++        monkeypatch.delenv(var, raising=False)
++    from hermes_cli import kanban_capability_registry as reg
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(reg, "self_gateway", lambda: "hub")
++    monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: True)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    with kbc.connect_closing() as conn:
++        creator = kb.create_task(conn, title="Review PR #2110 at exact head", assignee="default")
++        assert kb.claim_task(conn, creator) is not None
++    monkeypatch.setenv("HERMES_KANBAN_TASK", creator)
++    return creator
++
++
++def _tool_create(**args):
++    from tools import kanban_tools as kt
++    return json.loads(kt._handle_create({"assignee": "default", "requires": [], "placement": "local", **args}))
++
++
++NIT = "PR #2110 follow-up: quit-waiter review nits (stale doc line, missing pruned-partial test)"
++
++
++def test_worker_reissue_in_the_same_run_returns_the_first_card(worker):
++    first = _tool_create(title=NIT, body="Fix the two nits from review 5889.")
++    assert first["ok"] and first["task_id"]
++    again = _tool_create(title=NIT, body="Fix the two nits from review 5889.",
++                         idempotency_key="followup:pr2110:review-nits")
++    assert again["ok"] and again["deduplicated"] and again["task_id"] == first["task_id"]
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect_closing() as conn:
++        assert [t.title for t in kb.list_tasks(conn)].count(NIT) == 1
++        events = [(r[0], json.loads(r[1])) for r in conn.execute(
++            "SELECT task_id, payload FROM task_events WHERE kind = ?", (ko.EVENT,))]
++    assert [e["outcome"] for _tid, e in events] == ["deduplicated"]
++
++
++def test_worker_enumerated_legs_and_distinct_override_still_create(worker):
++    for leg in ("w1-01", "w1-02"):
++        assert _tool_create(title=f"Sleep probe {leg}: measure wake latency on worker pool")["ok"]
++    first = _tool_create(title=NIT)
++    second = _tool_create(title=NIT + " (round 2)", distinct_from=[first["task_id"]],
++                          distinct_reason="round-2 nits are separate")
++    assert second["ok"] and second.get("created", True) and second["task_id"] != first["task_id"]
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index a44b8488aa..5d109924b6 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1630,7 +1630,8 @@ def _handle_create(args: dict, **kw) -> str:
+                 pinned_machine = str(args.get("placement")).strip()
+                 args = {**args, "placement": "local", "runs_on": runs_on}
+         # [daveey] Refuse a second owner: open cards on every board/gateway, not this chat's links.
+-        refused, after_create = kanban_overlap.check(conn, args, courier=origin_intent is not None,
++        refused, after_create = kanban_overlap.check(conn, {**args, "assignee": str(assignee)},
++                                                     courier=origin_intent is not None,
+                                                      title=str(title).strip(), session_id=session_id,
+                                                      self_tid=self_tid, parents=parents)
+         if refused:
+-- 
+2.43.0
+
