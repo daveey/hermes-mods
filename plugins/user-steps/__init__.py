@@ -371,16 +371,79 @@ PUBLISH_NUDGE = ('Complete the missing agent work now: publish action_request wi
                  'labels instead. Then present the decision.')
 
 
+# One decision, one tile, decided by the agent: identity is provenance only (core.same_open_ask). A reply that
+# raises an ask while this chat has an open request is held ONCE so the agent, which knows whether it meant a new
+# decision, either drops a restatement or re-sends unchanged. Never merges; publication policies still apply.
+OPEN_ASK_NUDGE_HEAD = '[user-steps: open request check]'
+
+
+def open_ask_nudge(open_asks: list, new_steps: list) -> str:
+    opened = '\n'.join(f'- requestId {a["id"]}: "{a["title"]}"' for a in open_asks[:10])
+    asks = '\n'.join(f'- "{str(s.get("verbatim_span") or s.get("text") or "")[:300]}"' for s in new_steps[:10])
+    return (f'{OPEN_ASK_NUDGE_HEAD} Your reply raises an ask while this chat already has open request(s) in the '
+            f"user's For-you list:\n{opened}\nThe ask(s) read from your reply, each of which would open a NEW "
+            f'tile:\n{asks}\nIf a sentence only restates, reminds about or points at one of the open requests '
+            '(for example "... still needs you"), delete it: the open tile already shows that ask, and the '
+            'restatement would sit beside it as a duplicate tile. To change an open request, revise it with '
+            'action_request (its requestId and expectedRevision). If an ask is a genuinely different decision, '
+            'keep it as written: send the reply again and it can get its own tile, subject to publication '
+            'policies and rate limits (this check runs once per turn). '
+            'Do not mention this check to the user.')
+
+
+def _open_ask_nudges(turn_messages: Any) -> int:
+    return sum(1 for m in turn_messages or () if isinstance(m, dict) and m.get('role') == 'user'
+               and m.get('_pre_final_gate_synthetic') and OPEN_ASK_NUDGE_HEAD in str(m.get('content') or ''))
+
+
 def _publish_nudges(turn_messages: Any) -> int:
     """How many of this hook's own publish nudges core kept in the turn (flagged synthetic user rows)."""
     return sum(1 for m in turn_messages or () if isinstance(m, dict) and m.get('role') == 'user'
                and m.get('_pre_final_gate_synthetic') and PUBLISH_NUDGE in str(m.get('content') or ''))
 
 
+def open_ask_hold(session_id, final_response, open_asks, unmapped, relay, store, owner, attempt, hold_budget,
+                  turn_messages, candidates=None):
+    """Hold once only for asks publication would currently allow to mint new tiles."""
+    if not open_asks or not unmapped or attempt >= hold_budget or _open_ask_nudges(turn_messages):
+        return None
+    # Read-only projection of process_reply's canonical retirement, before testing exact reuse/suppression.
+    now = core.time.time()
+    ledger_steps = [core.publication_step(s, store.get(owner, s['requestId'])
+                    if s.get('requestId') and s.get('session') == session_id else None, now)
+                    for s in _ledger().read(session_id).get('steps', [])]
+    if any(core.retired_action([old for old in ledger_steps if core.action_identity(old) == core.action_identity(s)])
+           for s in (candidates if candidates is not None else unmapped)):
+        return None  # one retired action holds the ENTIRE delivered reply, even its otherwise-new asks
+    budget = core.publication_budget(ledger_steps, now)
+    ledger_open = {core.action_identity(s) for s in ledger_steps if s.get('status') == 'open'}
+    other = core.elsewhere_open_keys(store, owner) if relay else set()
+    new = []
+    for s in unmapped:
+        if len(new) >= budget:
+            break
+        if core.reply_draft_holds(session_id, s.get('kind'), s.get('text'), s.get('verbatim_span')) is not None:
+            continue
+        key, span = core.ask_key(s.get('text')), core.ask_key(s.get('verbatim_span'))
+        if core.locate(final_response, s.get('verbatim_span') or '') is None or core.action_identity(s) in ledger_open \
+                or (len(key) >= core._ASK_KEY_MIN and key in other) \
+                or (len(span) >= core._SPAN_KEY_MIN and len(span.split()) >= 5 and span in other):
+            continue
+        new.append(s)
+    if not new:
+        return None
+    _trace(hook='open_ask_hold', session=session_id, open=[a['id'] for a in open_asks],
+           asks=[str(s.get('verbatim_span') or '')[:120] for s in new])
+    return {'hold': True, 'nudge': open_ask_nudge(open_asks, new)}
+
+
 def publication_buffer(session_id='', platform='', final_response='', attempt=0,
                        hold_budget=2, turn_messages=None, **_: Any):
     """Return missing plan work to the agent, never to a user-facing button."""
-    if not _eligible(session_id, platform) or not core._worth_asking(final_response):
+    # Like process_reply: a reply with no ask-like wording skips the model only while nothing is open (with an open
+    # tile the transform still extracts, so a terse reminder or "Also choose ..." could mint beside it).
+    if not _eligible(session_id, platform) or not str(final_response or '').strip() \
+            or not (core._worth_asking(final_response) or _ledger().open_steps(session_id)):
         return None
     owner = core.server_owner(session_id)
     store = core.ActionStore(timeout=HOOK_DB_TIMEOUT)
@@ -398,8 +461,9 @@ def publication_buffer(session_id='', platform='', final_response='', attempt=0,
     res = core.extract(final_response, [{'id': a['id'], 'kind': a['kind'], 'text': a['title']} for a in open_asks]
                        + [{'id': e['id'], 'kind': e['kind'], 'text': core.card_ask_listing(e)} for e in card_asks],
                        '', aux_llm, continuity=True, elsewhere=core.elsewhere_titles(store, owner) if relay else [])
-    approvals = [s for s in res.get('steps', []) if s['kind'] == 'approve']
-    if not approvals:
+    steps = [s for s in res.get('steps', []) if isinstance(s, dict)]
+    approvals = [s for s in steps if s.get('kind') == 'approve']
+    if not approvals and not open_asks:
         return None
     # An uncorroborated model repeat maps nothing (core.split_repeats): the other rules judge that sentence.
     tiles = {a['id']: core.tile_texts(a) for a in open_asks}
@@ -410,18 +474,33 @@ def publication_buffer(session_id='', platform='', final_response='', attempt=0,
              if r['kind'] == 'approval' and r['state'] == 'open' and r['scope']['complete'] and not r.get('resolution')
              and {'approve', 'revise', 'decline'} <= {c['effect'] for c in r['choices']}}
     mapped: dict = {}
+    relayed = {r.get('id') for r in res.get('repeats') or () if isinstance(r, dict)} & {e['id'] for e in card_asks}
 
-    def covered(step):
-        if core.card_ask_for(step, card_asks, res.get('repeats') or (), final_response) is not None:
-            return True
+    def maps(step):
+        """('card', entry) / ('open', ask) when provenance maps the step (as process_reply would), else None."""
+        card = core.card_ask_for(step, card_asks, res.get('repeats') or (), final_response, relayed=relayed)
+        if card is not None:
+            return 'card', card
+        draft = core.reply_draft_holds(session_id, step.get('kind'), step.get('text'), step.get('verbatim_span'))
+        if draft is not None:
+            return 'card', draft
         same = core.same_open_ask(step, open_asks, res.get('repeats') or (), mapped,
                                   _TURN_PUBLISHED.get(session_id, ()), reply=final_response)
         if same is not None:
             mapped.setdefault(core.ask_key(step.get('verbatim_span')), same)
-        return same is not None and same['id'] in ready
-
-    if all([covered(s) for s in approvals]):
+            return 'open', same
         return None
+
+    hits = [(s, maps(s)) for s in steps]  # in reply order, like process_reply (mapped accumulates)
+    held = open_ask_hold(session_id, final_response, open_asks, [s for s, hit in hits if hit is None], relay,
+                         store, owner, attempt, hold_budget, turn_messages,
+                         candidates=[s for s, hit in hits if hit is None or hit[0] != 'card'])
+
+    def covered(hit):
+        return hit is not None and (hit[0] == 'card' or hit[1]['id'] in ready)
+
+    if all(covered(hit) for s, hit in hits if s.get('kind') == 'approve'):
+        return held
     if attempt >= hold_budget:
         if _publish_nudges(turn_messages) < hold_budget:
             # Core's exhaustion boundary reached without this hook spending its holds: the iteration cap's

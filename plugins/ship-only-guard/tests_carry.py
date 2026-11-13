@@ -553,6 +553,29 @@ def test_path_changed_on_both_sides_merges_cleanly_and_carries(monkeypatch):
         f"repos/{R}/git/blobs/{blob_sha(SHARED[k])}" for k in ("base", "ours", "theirs"))
 
 
+def test_large_path_changed_on_both_sides_merges_cleanly_and_carries(monkeypatch):
+    # A large text file must take the content-merge path, not the unchanged-blob shortcut.
+    base = b"start\n" + b"unchanged line\n" * 90000 + b"end\n"
+    ours = base.replace(b"start\n", b"pr change\n", 1)
+    theirs = base.replace(b"end\n", b"base change\n")
+    merged = ours.replace(b"end\n", b"base change\n")
+    assert all(1_200_000 < len(d) < 8 << 20 for d in (base, ours, theirs, merged))
+    calls = shared(monkeypatch, base=base, ours=ours, theirs=theirs, merged=merged)
+    assert check() is None
+    assert sorted(c[-1] for c in calls if "/git/blobs/" in c[-1]) == sorted(
+        f"repos/{R}/git/blobs/{blob_sha(d)}" for d in (base, ours, theirs))
+
+
+@pytest.mark.parametrize("size", [8 * 1024 * 1024 + 1, None])
+def test_over_eight_mib_or_missing_size_refuses_before_blob_read(monkeypatch, size):
+    sha = blob_sha(SHARED["ours"])
+    calls = shared(monkeypatch, ours=("100644", sha, size))
+    why = check()
+    assert f"blob {sha[:10]} is over {g._MERGE_BLOB_BYTES} bytes or has no size" in why
+    assert "a clean merge cannot be shown" in why
+    assert not any(f"/git/blobs/{sha}" in c[-1] for c in calls)
+
+
 def test_merge_result_other_than_the_clean_content_merge_refused(monkeypatch):
     shared(monkeypatch, merged=SHARED["merged"] + b"extra\n")
     assert "its tree differs from the clean merge" in check() and "at home/shared.txt" in check()
@@ -840,6 +863,40 @@ def test_git_verifier_clean_merge_and_relocated_hunk(monkeypatch, tmp_path, git_
     assert GIT_VERIFY(*heads["clean"], R, None, env) == ""
     assert "tree differs from the clean merge" in GIT_VERIFY(*heads["moved"], R, None, env)
     assert all("--depth=128" in a for a, _ in calls if "fetch" in a)
+    assert not list((tmp_path / "home" / "cache").iterdir())
+
+
+@pytest.mark.parametrize("chain_length", [5, 140], ids=["bounded-control", "shallow-cut"])
+def test_git_verifier_shallow_cut_before_reachable_merge_base(
+        monkeypatch, tmp_path, git_history, chain_length):
+    """A short second-parent path exposes the base while a long path is cut.
+
+    Merely finding one merge base is insufficient: rev-list above that base
+    still includes a shallow boundary on the long first-parent chain.
+    """
+    import os
+    repo, heads = git_history
+    _, approved, theirs = heads["clean"]
+    env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+
+    def git(*args):
+        return REAL_RUN(["git", "-c", "user.name=test", "-c", "user.email=test@example.com",
+                         "-c", "core.hooksPath=/dev/null", *args], cwd=repo, env=env,
+                        capture_output=True, text=True, check=True).stdout.strip()
+
+    tree = git("rev-parse", approved + "^{tree}")
+    long_tip = approved
+    for i in range(chain_length):
+        long_tip = git("commit-tree", tree, "-p", long_tip, "-m", f"long path {i}")
+    short_tip = git("commit-tree", tree, "-p", approved, "-m", "short path")
+    ours = git("commit-tree", tree, "-p", long_tip, "-p", short_tip, "-m", "join paths")
+    clean_tree = git("merge-tree", "--write-tree", ours, theirs)
+    merge = git("commit-tree", clean_tree, "-p", ours, "-p", theirs, "-m", "clean carry")
+    assert git("merge-base", "--all", ours, theirs) == git("merge-base", approved, theirs)
+    calls = local_git_verifier(monkeypatch, tmp_path, repo)
+    why = GIT_VERIFY(merge, ours, theirs, R, None, {"HERMES_HOME": str(tmp_path / "home")})
+    assert why == ("fetch depth cuts history before the merge base" if chain_length == 140 else "")
+    assert any("--depth=128" in argv for argv, _ in calls if "fetch" in argv)
     assert not list((tmp_path / "home" / "cache").iterdir())
 
 

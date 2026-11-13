@@ -422,7 +422,7 @@ def _patch_id(diff, cwd):
 # This is a rejection prefilter, NOT proof of a clean Git merge: rename/delete can look clean path by path.
 # Every survivor also passes `_git_merge_tree_refusal`, including Git's rename/conflict handling.
 _MERGE_FILES = 8             # paths per merge both parents changed differently (content-merged locally)
-_MERGE_BLOB_BYTES = 1 << 20  # largest blob read for such a content merge
+_MERGE_BLOB_BYTES = 8 << 20  # allow large text files; still bound each content-merge blob
 _FILE_MODES = ("100644", "100755")
 
 
