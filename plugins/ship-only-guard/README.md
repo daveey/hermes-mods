@@ -111,7 +111,17 @@ second parent is on `state` (`compare/<parent>...state` ahead or identical);
 id (whitespace-sensitive: under `--stable` a merge that only re-indented a PR
 line or put a space inside a string literal kept its id and carried); (c) no
 non-bot blocking verdict on any head (or a verdict with no readable
-time) came at or after that approval. Any failed or odd read refuses with the
+time) came at or after that approval; (d) each of those merges is a clean,
+unedited auto-merge: its tree (`gh api repos/OWNER/REPO/git/trees/<sha>?recursive=1`)
+is exactly the three-way merge of its first and second parent over their merge
+base (`compare/<first>...<second>`'s `merge_base_commit`). A path only one
+parent changed takes that parent's entry; a path both changed differently is
+merged locally by `git merge-file` on the three blobs (`git/blobs/<sha>`,
+checked against their ids; at most 8 such paths, 1 MiB each). Any conflict,
+add/add, modify/delete, symlink or submodule on both sides, truncated tree or
+other odd read refuses. This only lacks `git merge-tree`'s rename detection, so
+a rename on one side meeting an edit on the other refuses rather than carries.
+Any failed or odd read refuses with the
 reason; a blocking verdict on H itself is never overridden. Base drift is
 checked separately and still applies. Why: #1812, #1837 and #2438 were refused
 although `gh pr update-branch` left their patch-id unchanged. Missing/malformed/offline,
@@ -131,6 +141,11 @@ that mechanically from GitHub's own data:
   byte and whitespace included. An edit hidden in a merge commit (an "evil
   merge") changes that diff, and so does a conflict resolution, which alters
   the `-` lines or the context. Either one refuses.
+- (d) shows each merge is exactly the clean auto-merge of its parents, so
+  nothing the patch-id cannot see slipped in either: patch-id hashes hunks
+  without their line numbers, and a merge that moved an identical hunk,
+  context included, to another place in the same file kept the id. Its tree
+  differs from the clean merge, so it refuses.
 - (c) means no later objection is overridden.
 
 What a reviewer could add beyond identity is how the PR behaves on the new
@@ -149,12 +164,6 @@ that flagged untested behaviour, not identity. Pre-merge confirms arrived a
 median of about 10 minutes after the update, time in which `state` can move
 again. Before the carry existed, #1812, #1837 and #2438 were refused for lack of
 one.
-
-One residual gap remains. Patch-id hashes hunks without their line numbers, so
-a merge that moved an identical hunk, context included, to another place in
-the same file would keep the id. The stronger check is that H's tree equals
-`git merge-tree --write-tree H0 <second parent>`. That needs a local fetch,
-which the gh-only reads above cannot do; follow-up t_01a1d6de4e9ec063 owns it.
 
 **Base drift under CI.** A `pull_request` run tests a merge ref built on some
 `state` commit, not the `state` tip at merge time. The PR's recorded

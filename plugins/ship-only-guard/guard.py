@@ -413,6 +413,129 @@ def _patch_id(diff, cwd):
     return lines[0][0]
 
 
+# Tree identity of each update-branch merge (t_01a1d6de4e9ec063). Patch-id hashes hunks without line numbers,
+# so a merge that moved an identical hunk (context included) elsewhere in the same file kept it and carried.
+# Each merge on the head's first-parent line must instead have exactly the tree a clean three-way merge of its
+# two parents gives over their merge base. Read through gh like the rest of the carry (no fetch, no credentials
+# in git, no cache on disk); only a path both parents changed differently is merged locally, by `git merge-file`
+# on the three blobs, and any conflict, add/add, modify/delete, symlink, submodule or oversized blob refuses.
+# That is never looser than `git merge-tree --write-tree`: it only lacks rename detection, so a rename on one
+# side meeting an edit on the other refuses (fail closed) where merge-tree would merge it.
+_MERGE_FILES = 8             # paths per merge both parents changed differently (content-merged locally)
+_MERGE_BLOB_BYTES = 1 << 20  # largest blob read for such a content merge
+_FILE_MODES = ("100644", "100755")
+
+
+def _flat_tree(sha, repo, cwd, env):
+    """{path: (mode, blob sha, size)} of every non-tree entry of commit `sha`'s tree; _Unreadable if odd."""
+    got = _gh_json(f"repos/{repo}/git/trees/{sha}?recursive=1", cwd, env)
+    entries = got.get("tree")
+    if got.get("truncated") is not False or not isinstance(entries, list):
+        raise _Unreadable(f"the tree of {sha[:10]} is truncated or unreadable")
+    out = {}
+    for e in entries:
+        if not isinstance(e, dict) or not isinstance(e.get("path"), str) or not e["path"] or not isinstance(
+                e.get("mode"), str) or not isinstance(e.get("sha"), str) or not _SHA.fullmatch(e["sha"]):
+            raise _Unreadable(f"the tree of {sha[:10]} has an unreadable entry")
+        if e.get("type") == "tree":
+            continue
+        if e.get("type") not in ("blob", "commit") or e["path"] in out:
+            raise _Unreadable(f"the tree of {sha[:10]} has an unreadable entry")
+        out[e["path"]] = (e["mode"], e["sha"], e.get("size"))
+    return out
+
+
+def _flat_trees(shas, repo, cwd, env, cache):
+    """_flat_tree of each sha; the uncached ones read in parallel (each read takes ~3 s on a 5k-path tree)."""
+    from concurrent.futures import ThreadPoolExecutor
+    todo = [s for s in dict.fromkeys(shas) if s not in cache]
+    if todo:
+        with ThreadPoolExecutor(max_workers=len(todo)) as pool:
+            futures = [pool.submit(_flat_tree, s, repo, cwd, env) for s in todo]
+            for s, future in zip(todo, futures):
+                cache[s] = future.result()   # re-raises _Unreadable
+    return [cache[s] for s in shas]
+
+
+def _blob(sha, size, repo, cwd, env):
+    import base64
+    import hashlib
+    if not isinstance(size, int) or not 0 <= size <= _MERGE_BLOB_BYTES:
+        raise _Unreadable(f"blob {sha[:10]} is over {_MERGE_BLOB_BYTES} bytes or has no size")
+    got = _gh_json(f"repos/{repo}/git/blobs/{sha}", cwd, env)
+    try:
+        if got.get("encoding") != "base64":
+            raise ValueError
+        data = base64.b64decode(str(got.get("content")))
+    except (ValueError, TypeError):
+        raise _Unreadable(f"blob {sha[:10]} is unreadable")
+    if hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest() != sha:
+        raise _Unreadable(f"blob {sha[:10]} does not hash to its id")
+    return data
+
+
+def _merge_file(ours, base, theirs, cwd):
+    """Blob id of `git merge-file -p` of three byte strings, or None on a conflict."""
+    import hashlib
+    import tempfile
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    with tempfile.TemporaryDirectory(prefix="ship-only-guard-") as tmp:
+        names = []
+        for name, data in (("ours", ours), ("base", base), ("theirs", theirs)):
+            Path(tmp, name).write_bytes(data)
+            names.append(str(Path(tmp, name)))
+        try:
+            p = subprocess.run(["git", "merge-file", "-p", "-q", *names], cwd=tmp, env=env,
+                               capture_output=True, timeout=15)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise _Unreadable(f"`git merge-file` could not run ({type(e).__name__})")
+    if p.returncode != 0 or not isinstance(p.stdout, bytes):
+        return None
+    return hashlib.sha1(b"blob %d\0" % len(p.stdout) + p.stdout).hexdigest()
+
+
+def _merge_tree_refusal(merge, ours, theirs, repo, cwd, env, cache):
+    """Why `merge` is not the clean auto-merge of `ours` and `theirs` (its first and second parent), else ''."""
+    cmp = _gh_json(f"repos/{repo}/compare/{ours}...{theirs}", cwd, env)
+    mb = cmp.get("merge_base_commit")
+    mb = mb.get("sha") if isinstance(mb, dict) else None
+    if not isinstance(mb, str) or not _SHA.fullmatch(mb):
+        raise _Unreadable(f"the merge base of {ours[:10]} and {theirs[:10]} is unreadable")
+    base, o, t, got = _flat_trees((mb, ours, theirs, merge), repo, cwd, env, cache)
+    want, both = {}, []
+    for path in sorted(set(base) | set(o) | set(t)):
+        b, x, y = (tree[path][:2] if path in tree else None for tree in (base, o, t))
+        if x == y or y == b:
+            r = x
+        elif x == b:
+            r = y
+        else:
+            if b is None or x is None or y is None:
+                return f"both parents changed {path} (an add/add or modify/delete conflict)"
+            if not {b[0], x[0], y[0]} <= set(_FILE_MODES):
+                return f"both parents changed {path}, which is not a regular file"
+            both.append(path)
+            continue
+        if r is not None:
+            want[path] = r
+    if len(both) > _MERGE_FILES:
+        return f"{len(both)} paths need a content merge (more than {_MERGE_FILES})"
+    for path in both:
+        # Two file modes only, so at most one side changed the mode: that side's mode wins, as in git.
+        mode = t[path][0] if o[path][0] == base[path][0] else o[path][0]
+        ours_b, base_b, theirs_b = (_blob(tree[path][1], tree[path][2], repo, cwd, env) for tree in (o, base, t))
+        blob = _merge_file(ours_b, base_b, theirs_b, cwd)
+        if blob is None:
+            return f"{path} does not merge cleanly"
+        want[path] = (mode, blob)
+    have = {path: e[:2] for path, e in got.items()}
+    if have != want:
+        diff = sorted(p for p in set(have) | set(want) if have.get(p) != want.get(p))
+        return (f"its tree differs from the clean merge of {ours[:10]} and {theirs[:10]} at {diff[0]}"
+                + (f" (+{len(diff) - 1} more)" if len(diff) > 1 else ""))
+    return ""
+
+
 def _carried_approval(head, data, repo, cwd, env):
     """(True, H0) when an approval of an earlier head H0 counts for `head`, else (False, why-or-'').
 
@@ -422,7 +545,11 @@ def _carried_approval(head, data, repo, cwd, env):
         (`compare/<parent>...state` ahead or identical): the head only merged the base in;
     (b) `git patch-id --verbatim` (whitespace-sensitive) of the PR diff `compare/state...H0` equals the one of
         `compare/state...head` (each is merge-base..sha, the PR's own patch);
-    (c) no non-bot blocking verdict, on any head, at or after that approval.
+    (c) no non-bot blocking verdict, on any head, at or after that approval;
+    (d) each of those merges is a clean, unedited auto-merge: its tree (`git/trees/<sha>?recursive=1`) is
+        exactly the three-way merge of its two parents over their merge base (`compare/<first>...<second>`),
+        content-merging only paths both parents changed (`_merge_tree_refusal`). Patch-id ignores line numbers,
+        so without (d) a merge that moved an identical hunk elsewhere in the same file kept the id and carried.
     The newest _CARRY_CANDIDATES distinct approved heads are tried in turn (a comment naming the head and a
     base sha yields both); the first one's refusal reason is reported."""
     first = ""
@@ -450,7 +577,7 @@ def _carry_one(head, h0, blocked, repo, cwd, env):
         for c in listed if isinstance(listed, list) else []:
             if isinstance(c, dict) and isinstance(c.get("sha"), str) and isinstance(c.get("parents"), list):
                 known[c["sha"]] = [p.get("sha") if isinstance(p, dict) else None for p in c["parents"]]
-        cur, bases = head, []
+        cur, bases, merges = head, [], []
         while cur != h0:
             if len(bases) >= _CARRY_MERGES:
                 return False, (f"{lead}: more than {_CARRY_MERGES} commits sit on the PR's first-parent line "
@@ -466,6 +593,7 @@ def _carry_one(head, h0, blocked, repo, cwd, env):
                 return False, (f"{lead}: {cur[:10]} after it is not a merge of the base (a non-merge commit "
                                "changes the PR)")
             bases.append(str(parents[1]))
+            merges.append((cur, str(parents[0]), str(parents[1])))
             cur = str(parents[0])
         for parent in dict.fromkeys(bases):
             on = _gh_json(f"repos/{repo}/compare/{parent}...state", cwd, env)
@@ -479,6 +607,14 @@ def _carry_one(head, h0, blocked, repo, cwd, env):
         return False, f"{lead}: {e}, so patch identity cannot be shown"
     if old != new:
         return False, f"{lead}: the PR's patch changed (patch-id {old[:12]} -> {new[:12]})"
+    cache = {}
+    try:
+        for merge, ours, theirs in reversed(merges):
+            why = _merge_tree_refusal(merge, ours, theirs, repo, cwd, env, cache)
+            if why:
+                return False, f"{lead}: merge {merge[:10]} is not a clean, unedited merge of the base: {why}"
+    except _Unreadable as e:
+        return False, f"{lead}: {e}, so a clean merge cannot be shown"
     return True, h0
 
 
