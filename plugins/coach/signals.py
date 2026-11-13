@@ -1929,6 +1929,49 @@ def _ask_head(r: dict) -> str:
     return "" if _preamble_head(head) else head
 
 
+def _template_hold_exempt(rule: str, head: str, reply_only: Optional[frozenset] = None) -> Optional[str]:
+    """Why template_holds does not file (rule, head) on this code, or None when it would. retry_deferred re-asks this
+    through recheck_exempts before filing a deferred row, so a classifier fix landed meanwhile withdraws it."""
+    if rule in (_reply_only_rules() if reply_only is None else reply_only):
+        return f"rule {rule} never reads the user turn"
+    if rule in NOTICE_JUDGING_RULES and _notice_head(head):
+        return f"rule {rule} judges notices and the opening is a notice"
+    return None
+
+
+def template_recheck(rule: str, head: str) -> dict:
+    return {"kind": "template_hold", "rule": rule, "head": head}
+
+
+# Detector re-checks for deferred signals (t_01a1d5815b28b08b): a signal carries {"kind": <key>, ...} as "recheck";
+# self_heal.retry_deferred calls recheck_exempts before filing and withdraws the row when the detector, on the code
+# running now, would not fire. A new detector kind adds its collector's own skip predicate here.
+RECHECKS: Dict[str, Callable[[dict], Optional[str]]] = {
+    "template_hold": lambda r: _template_hold_exempt(str(r.get("rule") or ""), str(r.get("head") or "")),
+}
+
+
+def recheck_exempts(recheck: dict) -> Optional[str]:
+    """Why the detector named by recheck["kind"] would not fire now, or None (fires, or unknown kind: fail open)."""
+    fn = RECHECKS.get(str((recheck or {}).get("kind") or ""))
+    return fn(recheck) if fn else None
+
+
+_TEMPLATE_SYMPTOM_RE = re.compile(r'^coach (\S+) held \d+ replies whose user turn has the same opening text "(.*)" in \d+ '
+                                  r'chats: ')
+
+
+def defect_recheck(d: dict) -> Optional[dict]:
+    """The recheck of a self-heal defect: its own field, else (rows deferred before the field existed) one rebuilt from a
+    template-hold symptom, trusted only when it reproduces the row's fingerprint."""
+    if isinstance(d.get("recheck"), dict):
+        return d["recheck"]
+    m = _TEMPLATE_SYMPTOM_RE.match(str(d.get("symptom") or ""))
+    if m and fp("agent", "template-hold", m.group(1), m.group(2).lower()) == d.get("fingerprint"):
+        return template_recheck(m.group(1), m.group(2))
+    return None
+
+
 def template_holds(cur: dict, nudges: List[dict], now: float, host: str = "") -> List[dict]:
     """nudges: this pass's reply_nudge rows. Keeps a 7-day window in cur["coach_template"] across passes."""
     st = cur.get("coach_template") or {}
@@ -1951,10 +1994,8 @@ def template_holds(cur: dict, nudges: List[dict], now: float, host: str = "") ->
     reply_only = _reply_only_rules()
     for (rule, _), mine in groups.items():
         head = mine[-1]["head"]
-        if rule in reply_only:
-            continue  # the rule never reads the user turn: a shared opening is not it firing on a template
-        if rule in NOTICE_JUDGING_RULES and _notice_head(head):
-            continue  # the rule judges notices on purpose: a notice opening is not a misfire
+        if _template_hold_exempt(rule, head, reply_only):
+            continue  # a reply-only rule (never reads the user turn) or a notice-judging rule on a notice opening
         chats = sorted({e["sid"] for e in mine if e["sid"]})
         # distinct prompts, not holds: one notice delivered to N subscriber chats is one prompt
         prompts = {e.get("fp") or f"{e['sid']}:{e['at']}" for e in mine}
@@ -1975,7 +2016,7 @@ def template_holds(cur: dict, nudges: List[dict], now: float, host: str = "") ->
                                 f"or a real pattern."
                                 )[:1500],
                     "fp": fp("agent", "template-hold", rule, head.lower()),
-                    "comment_open_card": True})
+                    "recheck": template_recheck(rule, head), "comment_open_card": True})
     if evs or filed:
         cur["coach_template"] = {"ev": evs[-500:], "filed": filed}
     else:
@@ -2293,7 +2334,7 @@ def to_defect(s: dict) -> dict:
          "quote": s.get("quote") or ""}
     if (s.get("count") or 1) > 1:
         d["details"] = f"(seen {s['count']}x this pass)\n" + d["details"]
-    for k in ("profile", "monitor", "kanban", "kanban_hold", "comment_open_card"):
+    for k in ("profile", "monitor", "kanban", "kanban_hold", "comment_open_card", "recheck"):
         if s.get(k):
             d[k] = s[k]
     return d

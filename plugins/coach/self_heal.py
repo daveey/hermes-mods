@@ -3161,19 +3161,50 @@ def _resolved_crash_signal_checked(d: dict, store) -> Optional[str]:
     return None
 
 
+def _signals_module():
+    """signals.py loaded from disk now (never cached: a long-lived process must judge with the code deployed now)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_coach_signals_recheck", Path(__file__).with_name("signals.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _detector_exempts_now(d: dict, cache: Optional[dict] = None) -> Optional[str]:
+    """`detector_exempts_now: <why>` when the detector that raised this deferred signal would not fire on current code
+    (a classifier fix landed while it waited: agent-ff48223e1b). Generic: the signal's `recheck` kind is dispatched to
+    signals.RECHECKS. Unknown kinds, old payloads and a broken signals.py fail open to filing. `cache` holds one
+    signals load per retry pass."""
+    if d.get("source") != "signal":
+        return None
+    cache = {} if cache is None else cache
+    try:
+        if "sig" not in cache:
+            cache["sig"] = None
+            cache["sig"] = _signals_module()
+        sig = cache["sig"]
+        rc = sig.defect_recheck(d) if sig else None
+        why = sig.recheck_exempts(rc) if rc else None
+    except Exception:  # noqa: BLE001 - a broken detector must never stop the filing pass
+        return None
+    return f"detector_exempts_now: {why}" if why else None
+
+
 def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
     """Recheck due investigations through normal admission, never automatically release a card.
 
     Highest priority first (`_pending_priority`); the pass stops at the first renewed denial, since every later row
     would hit the same cap. Rows whose detection is older than PENDING_MAX_AGE_S are dropped (`selfheal_skip`,
     why `stale pending`), which bounds the queue when input outruns the budget. Resolved sibling crash
-    incidents are withdrawn before the cap-ordered filing pass, with `resolved under <fp>` evidence."""
+    incidents are withdrawn before the cap-ordered filing pass, with `resolved under <fp>` evidence; so is a signal
+    whose own detector would not fire on the code deployed now (`detector_exempts_now: <why>`)."""
     store = _store(store)
     now = now or time.time()
     if not (Path(store.root) / "selfheal_pending.sqlite").exists():
         return []
     db = _pending_db(store)
     out = []
+    recheck_cache: dict = {}
     try:
         rows = db.execute("SELECT fp, payload, version FROM pending WHERE retry <= ?", (now,)).fetchall()
         due = []
@@ -3199,8 +3230,8 @@ def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
                 continue
             closed = (_sqlite_incident_over(d, store, now)
                       or kanban_trigger_closed(d, now=now) or _monitor_withdrawn(d, store)
-                      or _resolved_crash_signal(d, store))
-            if closed:  # the owner closed the card, or the monitor withdrew its verdict, while this waited
+                      or _resolved_crash_signal(d, store) or _detector_exempts_now(d, recheck_cache))
+            if closed:  # the owner closed the card, the monitor withdrew, or the detector no longer fires
                 with db:
                     db.execute("DELETE FROM pending WHERE fp=? AND version=?", (fp, version))
                 store.log({"event": "selfheal_skip", "mode": "live", "fingerprint": fp, "why": closed})
