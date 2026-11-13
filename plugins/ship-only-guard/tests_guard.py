@@ -406,6 +406,10 @@ def test_state_merge_refuses_without_exact_head_approval(monkeypatch, reviews, c
     "Independent exact-head review: I cannot approve this yet; the test is missing.",
     "**VERDICT: REQUEST_CHANGES**", "Approve the idea.\n\nVERDICT: REQUEST CHANGES (blocking: B1)",
     "Rejected: wrong base.",
+    # Conditional or withheld approvals put "approve" in the first line of a blocking review (t_01a1d61358568212).
+    "Unable to approve: required CI is red.", "Needs changes before I can approve: B1.",
+    "I would approve once the missing test lands.", "No approval yet: one blocker (B1).",
+    "Round 1 VERDICT: APPROVE.\n\nRe-run found B1. VERDICT: REQUEST_CHANGES",
 ])
 def test_state_merge_refuses_a_blocking_exact_head_verdict(monkeypatch, body):
     why = state_check(monkeypatch, state_pr([review(body)]))
@@ -418,6 +422,7 @@ def test_state_merge_refuses_a_blocking_exact_head_verdict(monkeypatch, body):
     "**Verdict: APPROVE.** Nothing blocks.", "APPROVE @aaaaaaaaaa", "Approve at " + STATE_SHA,
     "## Independent exact-head review — verdict: APPROVE (posted as COMMENT; own-PR)",
     "Round 1 requested changes; all fixed.\n\nVERDICT: APPROVE",
+    "Round 1 VERDICT: REQUEST_CHANGES (B1, fixed in abc).\n\nVERDICT: APPROVE",  # the last VERDICT line decides
 ])
 def test_state_merge_allows_an_exact_head_approval_review(monkeypatch, body):
     assert state_check(monkeypatch, state_pr([review(body)])) is None
@@ -430,6 +435,28 @@ def test_state_merge_approval_forms(monkeypatch):
     for text in (f"Independent review at exact head {STATE_SHA}: VERDICT: APPROVE",
                  f"**VERDICT: APPROVE** @ {STATE_SHA[:10]}"):
         assert state_check(monkeypatch, state_pr([], [comment(text)])) is None
+
+
+# The review lane also posts its verdict as a PR comment whose first line names the head and approves (live #1872,
+# #1919, #2449). Those were refused; author replies that restate an approval must still not count.
+@pytest.mark.parametrize("text", [
+    f"Agent-posted (Hermes, card t_x@macbook). Round 3 independent review @ {STATE_SHA} — **approve**, no findings.",
+    f"Independent review (card t_x, review lane) at exact head {STATE_SHA[:10]}. **Approved.**",
+    f"**Independent exact-head review: approve** @ `{STATE_SHA}` (card t_x)",
+])
+def test_state_merge_allows_a_comment_posted_exact_head_review(monkeypatch, text):
+    assert state_check(monkeypatch, state_pr([], [comment(text)])) is None
+
+
+@pytest.mark.parametrize("text", [
+    f"Re review 5879931822 (approve @{STATE_SHA[:10]}): all three nits are tracked.",
+    f"Landing owner reply to review t_x (approve @{STATE_SHA[:10]}, 0 blocking, 6 nits).",
+    f"Accepted independent exact-head approval 5880924255 at {STATE_SHA}.",
+    f"Independent review of an earlier head: approve.\n\nNow at {STATE_SHA}.",  # head not on the first line
+    f"Independent review @ {STATE_SHA}: I cannot approve this yet.",
+])
+def test_state_merge_comment_first_line_needs_a_review_of_the_head(monkeypatch, text):
+    assert state_check(monkeypatch, state_pr([], [comment(text)]))
 
 
 def test_latest_exact_head_verdict_wins(monkeypatch):

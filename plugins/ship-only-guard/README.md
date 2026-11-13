@@ -88,7 +88,11 @@ is a review on that exact commit (state APPROVED/CHANGES_REQUESTED, a
 `VERDICT: <x>` line, or a first line that approves; whichever of "approve" or a
 blocking phrase comes first decides, so "approve (posted as COMMENT because the
 account can't approve)" approves), or a PR comment that names the head (full
-sha or its first 10+ hex) and carries a `VERDICT:` line. No verdict, a review
+sha or its first 10+ hex) and carries a `VERDICT:` line, or whose first line is a
+review of that head (names it, says "review") and approves; a reply first line
+("Re review …", "Addressed …", "Accepted …", "Landing …") does not count. Blocking
+phrases include request changes, cannot/unable to/would approve, no approval, needs
+changes and withheld. No verdict, a review
 of an earlier head only, or a later request-changes refuses. A state PR with no
 review at all (#2413) is refused. Missing/malformed/offline,
 main/other base, changed head, pending/failed/skipped/neutral checks, a possibly

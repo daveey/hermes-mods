@@ -185,7 +185,18 @@ _VERDICT = re.compile(r"\bVERDICT\s*[:=]\s*(APPROVE[DS]?|PASS|REQUEST[ _-]CHANGE
                       re.IGNORECASE)
 _APPROVE_WORD = re.compile(r"\bapprov(?:e|ed|es|al)\b", re.IGNORECASE)
 _BLOCK_WORD = re.compile(r"\brequest(?:s|ed)?[ _-]changes\b|\bchanges[ _-]requested\b|\bnot\s+approv|"
-                         r"\b(?:can(?:no|')t|won't|do(?:es)?n't|do(?:es)? not)\s+approv|\breject", re.IGNORECASE)
+                         r"\b(?:can(?:no|')t|won't|do(?:es)?n't|do(?:es)? not)\s+approv|\breject|"
+                         # conditional or withheld approvals (t_01a1d61358568212): "Unable to approve: CI red",
+                         # "Needs changes before I can approve", "I would approve once X", "approval withheld"
+                         r"\bunable\s+to\s+approv|\bno\s+approv|\bneeds?\s+(?:changes|work|fix(?:es)?)\b|"
+                         r"\bwould\s+approv|\bwithh(?:o|e)ld", re.IGNORECASE)
+# A PR comment counts by its first line only when that line reads as a review of the head, not a reply: the
+# review lane's comment-posted approvals ("Independent review ... at exact head <sha>: **approve**", #1872,
+# #1919, #2449) were refused, while author replies ("Re review N (approve @<sha>)", "Addressed review N at
+# <sha>") must not stand in for a verdict.
+_REVIEW_NOUN = re.compile(r"\b(?:re-?)?review\b", re.IGNORECASE)
+_REPLY_LINE = re.compile(r"^\W*re\b|\b(?:repl(?:y|ies|ied)|answer\w*|address\w*|acknowledg\w*|accept\w*|landing|"
+                         r"merged|supersed\w*|thanks?|follow-?up|tracked|nits?\b\s+from)\b", re.IGNORECASE)
 
 
 def _flat(text):
@@ -234,6 +245,11 @@ def _approval_refusal(number, data):
                 rf"(?<![0-9a-f]){head[:10]}", body):
             continue
         verdict = _body_verdict(body, first_line_ok=False)
+        if verdict is None:
+            first = next((_flat(line) for line in body.splitlines() if line.strip()), "")
+            if (re.search(rf"(?<![0-9a-f]){head[:10]}", first) and _REVIEW_NOUN.search(first)
+                    and not _REPLY_LINE.search(first)):
+                verdict = _body_verdict(first)
         if verdict:
             verdicts.append((_when(c.get("createdAt")), verdict))
     if any(t is None for t, _ in verdicts):
