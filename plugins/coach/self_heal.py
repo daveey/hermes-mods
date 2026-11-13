@@ -5807,7 +5807,10 @@ ADOPT_RECHECK_S = 3600  # an owner whose text could not be read is re-judged at 
 
 def _owner_card_text(card: str, board: Optional[str], runner=None) -> Optional[dict]:
     """The owner card's title/body/key/created/completed via `hermes kanban show --json`; None when unreadable or
-    when the board's answer carries no title (a reply that cannot be judged is not a refusal)."""
+    when the board's answer carries no title (a reply that cannot be judged is not a refusal). A digest-sourced lane
+    holds '<gateway>:<board>' (hermes-hub:default), which the CLI refuses as a slug (exit 2): read the board part, as
+    card_lookup does. Card ids are global, so a card that is not on this host's board still reads as unreadable."""
+    board = (str(board).partition(":")[2] or None) if board and ":" in str(board) else board
     argv = ["hermes", "kanban"] + (["--board", board] if board else []) + ["show", card, "--json"]
     try:
         rc, out, _ = _run(argv, runner)
