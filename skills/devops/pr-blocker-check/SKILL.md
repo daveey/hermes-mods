@@ -52,7 +52,7 @@ head ("resuming: ... not rebasing or re-gating", then review refused on the old 
 main && git rebase origin/main` in the worktree first, then rerun ship: it re-gates, pushes the new head and
 reruns CI.
 
-A head with no Actions runs at all minutes after its push (`gh api 'repos/O/R/actions/runs?head_sha=<sha>' --jq .total_count` prints 0) while `mergeable` reads UNKNOWN is usually a conflict, not a queue: GitHub creates no `pull_request` runs for a PR that conflicts with its base. Run the conflicting row's merge-tree check before scheduling a retry.
+A head with no Actions runs at all minutes after its push (`gh api 'repos/O/R/actions/runs?head_sha=<sha>' --jq .total_count` prints 0) while `mergeable` reads UNKNOWN is usually a conflict, not a queue: GitHub creates no `pull_request` runs for a PR that conflicts with its base. Run the conflicting row's merge-tree check before scheduling a retry. For the same reason, a wake_check that parks on a PR head's CI must also wake (exit 0) when that head still has no runs ~15 min after its push: one that reads zero runs as "not yet" sleeps its owner until the park cap.
 
 `checks_pending` with the new head's run stuck `pending` (no jobs) usually means an older run is holding the
 workflow's concurrency group. Cancelled runs do this when an `if: always()` gate or report job
