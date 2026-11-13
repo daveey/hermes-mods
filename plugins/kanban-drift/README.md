@@ -10,6 +10,9 @@ Keep connection addresses and credentials out of this public repository.
 Two consecutive dirty samples create one agent-owned repair card through `kanban_create`, with
 `placement: "auto"` so it joins the worker pool: on the hub, `"local"` is a hub slot that the admission
 judge must admit, and it refuses routine repair work (pool workers have hub ssh and hub-admin).
+The sample report goes into the body inside a `<!-- placement:evidence -->` fence (markers inside it stripped), so
+its host words (state paths, `kanban.db`, gateway names) never make the card look home-bound: on the hub that
+would still cost an admission-judge call and narrow the card to `hub:write` workers.
 A persisted incident UUID makes create retries idempotent, including a crash after the tool's write.
 Unchanged samples do not spam comments; changed evidence refreshes the existing card.
 Clean resets the streak, but never closes the repair card. Unavailable resets the consecutive-sample

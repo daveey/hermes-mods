@@ -12,8 +12,28 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import re
 import time
 import uuid
+
+# Core's placement scan (hermes_cli.kanban_placement.portable_reason) skips text inside complete pairs of these
+# markers. A drift report is full of host words (state paths, kanban.db, gateway names); unfenced, they make the
+# repair card look home-bound, so on the hub "auto" costs an admission-judge call and a hub:write requirement.
+EVIDENCE_OPEN = "<!-- placement:evidence -->"
+EVIDENCE_CLOSE = "<!-- /placement:evidence -->"
+_MARKER = re.compile(r"<!--\s*/?\s*placement:evidence\s*-->", re.IGNORECASE)
+
+
+def fence_evidence(text):
+    """``text`` inside one evidence fence, with every marker in it removed (also ones re-formed from nested halves),
+    so pasted evidence can neither end the fence early nor open a fake one that hides instructions."""
+    text = text or ""
+    while True:
+        cleaned = _MARKER.sub("", text)
+        if cleaned == text:
+            break
+        text = cleaned
+    return f"{EVIDENCE_OPEN}\n{text.strip(chr(10))}\n{EVIDENCE_CLOSE}"
 
 
 class Monitor:
@@ -60,7 +80,7 @@ class Monitor:
         body = (f"Fleet sync drift on {key}, confirmed on consecutive samples. "
                 "Investigate and repair through normal sync semantics; preserve rejection audits and worker fences. "
                 "No human action is requested. Verify fresh authoritative state and attach per-row evidence.\n\n"
-                + json.dumps(report, sort_keys=True))
+                + fence_evidence(json.dumps(report, sort_keys=True)))
         if not row["card"]:
             # placement "auto", never "local": on the hub "local" is a hub slot that core's admission judge must
             # admit, and it denies routine repair work (pool workers have hub ssh + hub-admin), so the create was

@@ -540,9 +540,12 @@ def test_worker_share_real_filer_uses_selected_worker_pin(core):
     core.kp.portable_reason(fields, {})
 
 
-def test_kanban_drift_actual_create_joins_the_worker_pool(core, tmp_path):
-    # kanban-drift files with placement "auto" (94153ea2): on the hub "local" is a hub slot that the admission
-    # judge refuses for routine repair work, so the producer must never pin "local" or ask for a hub slot.
+def test_kanban_drift_actual_create_joins_the_worker_pool(core, tmp_path, monkeypatch):
+    """kanban-drift files with placement "auto", never "local" (cron-0d63c0cf26): on the hub "local" is a hub slot
+    that core's admission judge must admit, and it refuses routine repair work. Its real payload, hostile incident
+    evidence included, goes through core's real planner as the hub with a deny-all judge: never refused, never
+    judged, and routed to the worker pool."""
+    from hermes_cli import kanban_hub_admission as admission
     monitor = load("drift_placement_producer_test", PLUGINS / "kanban-drift" / "monitor.py")
     got = []
 
@@ -557,7 +560,27 @@ def test_kanban_drift_actual_create_joins_the_worker_pool(core, tmp_path):
     instance.sample("target-a", report)
     instance.sample("target-a", report)
     assert len(got) == 1
-    assert got[0]["placement"] == "auto" and got[0]["completion_contract"] == "local-only"
-    assert not got[0].get("hub_reason")
-    assert HOSTILE in got[0]["body"]
-    core.kp.portable_reason(got[0], {})
+    args = got[0]
+    assert args["placement"] == "auto" and args["completion_contract"] == "local-only"
+    assert not args.get("hub_reason") and not args.get("runs_on")
+    assert "host_repo" not in (args.get("requires") or [])
+    assert HOSTILE in args["body"]
+    # The report is fenced evidence, so the card is portable (no home marker, no reason sentence) and the
+    # monitor's markers are core's.
+    assert (monitor.EVIDENCE_OPEN, monitor.EVIDENCE_CLOSE) == (core.kp.EVIDENCE_OPEN, core.kp.EVIDENCE_CLOSE)
+    judge(core, {"kind": "tool", "fields": args}, expect="portable")
+    judged = []
+
+    def deny(fields, hub_reason=None):
+        judged.append(fields.get("title"))
+        return admission.Verdict(admit=False, why="fixture judge denies every hub slot")
+
+    monkeypatch.setattr(admission, "admit", deny)
+    for cfg in ({"worker_queue": {"hermes-hub": "pool:worker"}, "worker_pools": {"hermes-hub": ["worker-fixture"]}},
+                {"worker_pools": {"hermes-hub": ["worker-fixture"]}}):
+        monkeypatch.setattr(core.kp, "config", lambda cfg=cfg: cfg)
+        out = core.kp.decide(dict(args), cfg=cfg, self_gw="hermes-hub", machine_ok=lambda label: True)
+        assert out.get("where") != "refuse", out
+        assert out.get("runs_on") or out.get("placement_policy"), out  # it joins the worker pool
+        assert "hub:write" not in (out.get("requires") or []), out  # portable: any pool worker may take it
+    assert judged == []  # never a hub slot, so never a model call
