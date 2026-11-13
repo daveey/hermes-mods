@@ -64,6 +64,12 @@ so an open panel updates in place. A failing gateway is retried after 15 s, 30 s
 its last data stays on screen marked "Stale: last update … · <error>". Each section comes from the connected
 gateway with the best view of it (ready > stale > unknown).
 
+Each poll sends one request per connection, not one per profile: the gateway section is machine-wide and only
+the CI owner profile serves CI (the others answer `ci.state: unavailable`). The lead route is the CI owner, else
+`default`, else the first. Every profile of a connection is fetched (a discovery sweep) until the owner is known,
+every 5 min after that, and on the poll after the lead fails; while the lead backs off, one healthy profile
+keeps the gateway section fresh.
+
 ## Tests
 
 ```sh
@@ -86,6 +92,8 @@ python -m pytest plugins/runners/tests/test_fleet.py plugins/runners/tests/test_
   `test_ci_machines_take_load_from_collector_host_probes` (reporter and Board route: core
   `tests/hermes_cli/test_machine_metrics.py`, hermes-hub `worker/test/machines.test.ts`)
 - open panel updates in place, one request per poll, no polling while hidden: "open panel updates in place"
+- one request per connection, owner lead, sweep after a lead failure and every 5 min: "one request per
+  connection", "the CI owner route leads", "when the lead fails", "discovery sweeps"
 
 - CI groups: categories + counts + health, collapsed by default, expand/remember/collapse: `groups.test.mjs`,
   `test_fleet.py` `test_ci_machine_categories_for_the_panel_groups`

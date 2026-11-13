@@ -195,6 +195,116 @@ test('unreachable: a failing gateway backs off and keeps last data marked stale,
   assert.notEqual(P.summarize(v).tone, 'bad')
 })
 
+// One gateway, many profiles: the gateway section is machine-wide and only the owner
+// profile serves CI, so a poll asks one profile per connection, not all of them.
+const PROFILES = ['alpha', 'beta', 'default', 'delta', 'echo', 'owner', 'golf', 'hotel', 'india', 'juliet']
+const profileRoutes = (connectionId, profiles = PROFILES) =>
+  profiles.map((p) => ({ connectionId, mode: 'remote', profile: p, targetProfile: p }))
+function fleetCtx({ owner = 'owner', down = new Set() } = {}) {
+  const calls = []
+  return {
+    calls, down,
+    rest: async (path, opts) => {
+      const profile = new URL(path, 'http://x').searchParams.get('profile')
+      calls.push([opts.connectionId, profile])
+      if (down.has(profile)) throw Object.assign(new Error('timed out'), { status: 0 })
+      return profile === owner
+        ? fleet({ profile })
+        : fleet({ profile, ci: { state: 'unavailable', reason: 'owner_profile_mismatch', machines: [] } })
+    },
+    onDispose() {}, register() {}
+  }
+}
+const calledSince = (ctx, n) => ctx.calls.slice(n).map(([c, p]) => `${c}/${p}`).sort()
+
+test('one request per connection per poll once discovery has found the CI owner', async () => {
+  let t = NOW
+  const ctx = fleetCtx()
+  const list = [...profileRoutes('mini'), ...profileRoutes('hub', ['default', 'owner', 'x'])]
+  const transport = P.createTransport(ctx, { profileRoutes: async () => list }, () => t)
+  let view = await transport.poll() // discovery: every route
+  assert.equal(ctx.calls.length, 13)
+  assert.equal(view.ci.state, 'ready')
+  for (let i = 0; i < 4; i++) {
+    t += P.POLL_OPEN_MS
+    const n = ctx.calls.length
+    view = await transport.poll()
+    assert.deepEqual(calledSince(ctx, n), ['hub/owner', 'mini/owner'], 'exactly 1 request per connection')
+    assert.equal(view.ci.state, 'ready')
+    assert.equal(view.gateways.state, 'ready')
+  }
+})
+
+test('the CI owner route leads over default; default leads while no profile serves CI', async () => {
+  let t = NOW
+  const ctx = fleetCtx({ owner: 'owner' })
+  const transport = P.createTransport(ctx, { profileRoutes: async () => profileRoutes('mini') }, () => t)
+  await transport.poll()
+  t += P.POLL_OPEN_MS
+  let n = ctx.calls.length
+  await transport.poll()
+  assert.deepEqual(calledSince(ctx, n), ['mini/owner'])
+  // No owner among the profiles: one sweep, then `default` alone (no sweep every poll).
+  const none = fleetCtx({ owner: 'nobody' })
+  const plain = P.createTransport(none, { profileRoutes: async () => profileRoutes('mini') }, () => t)
+  await plain.poll()
+  assert.equal(none.calls.length, 10)
+  t += P.POLL_OPEN_MS
+  n = none.calls.length
+  await plain.poll()
+  assert.deepEqual(calledSince(none, n), ['mini/default'])
+})
+
+test('when the lead fails, the next poll asks the other profiles; a healthy one stands in', async () => {
+  let t = NOW
+  const ctx = fleetCtx()
+  const transport = P.createTransport(ctx, { profileRoutes: async () => profileRoutes('mini') }, () => t)
+  await transport.poll()
+  t += P.POLL_OPEN_MS
+  ctx.down.add('owner')
+  let n = ctx.calls.length
+  let view = await transport.poll() // the lead times out
+  assert.deepEqual(calledSince(ctx, n), ['mini/owner'])
+  assert.equal(view.ci.state, 'stale')
+  t += P.POLL_OPEN_MS
+  n = ctx.calls.length
+  await transport.poll() // the others, plus the owner (its 15s backoff has passed)
+  assert.deepEqual(calledSince(ctx, n), profileRoutes('mini').map((r) => `mini/${r.targetProfile}`).sort())
+  t += P.POLL_OPEN_MS
+  n = ctx.calls.length
+  view = await transport.poll() // owner backing off (30s): `default` keeps gateways fresh
+  assert.deepEqual(calledSince(ctx, n), ['mini/default'])
+  assert.equal(view.gateways.state, 'ready')
+  assert.equal(view.ci.state, 'stale')
+  ctx.down.clear()
+  t += P.POLL_OPEN_MS
+  n = ctx.calls.length
+  view = await transport.poll() // owner due again and back
+  assert.deepEqual(calledSince(ctx, n), ['mini/default', 'mini/owner'])
+  assert.equal(view.ci.state, 'ready')
+  t += P.POLL_OPEN_MS
+  n = ctx.calls.length
+  await transport.poll()
+  assert.deepEqual(calledSince(ctx, n), ['mini/owner'])
+})
+
+test('discovery sweeps every profile again after DISCOVERY_MS', async () => {
+  assert.equal(P.DISCOVERY_MS, 300000)
+  let t = NOW
+  const ctx = fleetCtx()
+  const transport = P.createTransport(ctx, { profileRoutes: async () => profileRoutes('mini') }, () => t)
+  await transport.poll()
+  const counts = []
+  for (let elapsed = P.POLL_OPEN_MS; elapsed <= P.DISCOVERY_MS; elapsed += P.POLL_OPEN_MS) {
+    t = NOW + elapsed
+    const n = ctx.calls.length
+    await transport.poll()
+    counts.push(ctx.calls.length - n)
+  }
+  assert.deepEqual(counts.slice(0, -1), Array(counts.length - 1).fill(1))
+  assert.equal(counts.at(-1), 10, 'the poll at DISCOVERY_MS sweeps all profiles')
+})
+
 test('polls every 15s open or closed, updates the open panel in place, stops while hidden', async () => {
   const later = fleet()
   later.gateways.machines[1].running = [{ board: 'default', task: 't_bbbb2222', title: 'New card', started_at: NOW / 1000 }]

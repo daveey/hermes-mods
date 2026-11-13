@@ -28,11 +28,23 @@ function validRoute(r) {
 }
 const routeKey = (r) => JSON.stringify([r.connectionId, r.targetProfile])
 
+// Re-fetch every profile of a connection at most this often once its CI owner is known.
+export const DISCOVERY_MS = 300000
+
 // Per-route last-known data and backoff. A failing route is skipped until its next
 // allowed time (15s, 30s, 60s ... 5 min), so a dead network or gateway costs at most one
 // request per backoff step, and its last data stays on screen marked stale.
+//
+// One request per connection per poll: the gateway section is machine-wide and only the
+// owner profile serves CI (the others answer ci.state 'unavailable'), so asking every
+// profile of a gateway returns the same data N times, and on a slow link the N requests
+// time out together. Each connection polls one lead route: the CI owner, else `default`,
+// else the first. All its routes are fetched (a discovery sweep) until a sweep has had an
+// answer and the owner is known, every DISCOVERY_MS, and on the poll after the lead fails.
+// While the lead is backing off, one healthy route keeps the gateway section fresh.
 export function createTransport(ctx, hostRef = host, clock = () => Date.now()) {
   const routes = new Map()
+  const connections = new Map()
   async function fetchRoute(route) {
     const key = routeKey(route)
     const s = routes.get(key) || { route, failures: 0, nextAt: 0 }
@@ -55,11 +67,47 @@ export function createTransport(ctx, hostRef = host, clock = () => Date.now()) {
       })
     }
   }
+  async function pollConnection(id, list) {
+    const now = clock()
+    const c = connections.get(id) || { owner: null, sweptAt: -Infinity, answered: false, afterFailure: false }
+    connections.set(id, c)
+    const state = (r) => routes.get(routeKey(r))
+    if (c.owner && !list.some((r) => routeKey(r) === c.owner)) c.owner = null
+    const owner = c.owner && list.find((r) => routeKey(r) === c.owner)
+    const byDefault = list.find((r) => r.targetProfile === 'default')
+    const lead = owner || byDefault || list[0]
+    // Until the owner is known, sweep every poll; if a sweep got answers but no profile
+    // serves CI, settle on the lead and keep re-sweeping only every DISCOVERY_MS.
+    const sweep = (!owner && !c.answered) || c.afterFailure || now - c.sweptAt >= DISCOVERY_MS
+    const targets = [lead]
+    if (sweep) {
+      targets.splice(0, 1, ...list)
+      c.sweptAt = now
+      c.afterFailure = false
+    } else if (state(lead)?.failures) {
+      const healthy = [byDefault, ...list].find((r) => r && r !== lead && state(r)?.body && !state(r).failures)
+      if (healthy) targets.push(healthy)
+    }
+    const before = new Map(targets.map((r) => [routeKey(r), state(r)]))
+    await Promise.all(targets.map(fetchRoute))
+    for (const r of targets) {
+      const s = state(r)
+      if (!s?.body || s.failures || s.at < now) continue // skipped (backoff), failed or old
+      c.answered = true
+      if (s.body.ci.state !== 'unavailable') c.owner ||= routeKey(r)
+      else if (c.owner === routeKey(r) && s.body.ci.reason === 'owner_profile_mismatch') c.owner = null
+    }
+    // A new lead failure (not a backoff skip): the next poll asks the other profiles.
+    if (!sweep && (state(lead)?.failures || 0) > (before.get(routeKey(lead))?.failures || 0)) c.afterFailure = true
+  }
   async function poll() {
     const list = (await hostRef.profileRoutes()).filter(validRoute)
     const keys = new Set(list.map(routeKey))
     for (const k of routes.keys()) if (!keys.has(k)) routes.delete(k)
-    await Promise.all(list.map(fetchRoute))
+    const groups = new Map()
+    for (const r of list) groups.set(r.connectionId, [...(groups.get(r.connectionId) || []), r])
+    for (const id of connections.keys()) if (!groups.has(id)) connections.delete(id)
+    await Promise.all([...groups].map(([id, g]) => pollConnection(id, g)))
     return merge([...routes.values()], clock())
   }
   return { poll, routes }
