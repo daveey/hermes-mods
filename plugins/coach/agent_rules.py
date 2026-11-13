@@ -2302,6 +2302,50 @@ def attach_hint(result: Any, hint: str) -> Any:
 
 
 
+# VERIFY t_01a1d31ce47229ff (self-heal agent-36ec41dc12): on the hub every chat terminal command reaches post_tool_call
+# behind kanban-worker-nice's niceness prefix (its terminal_request middleware, `_MARKER` + one `renice` line, ~115
+# chars), so the 140-char `->` line kept ~25 chars of the real command: no PR read was ever visible, pr_state_claim
+# nudged turns that had read the PR and logged resolved=false for agents that re-read it after the nudge. observe()
+# logs the command as the agent wrote it. tests/test_pr_read_outcome.py pins the marker to kanban-worker-nice's.
+INJECTED_PREAMBLE_RE = re.compile(r"\A(?:# kanban-worker-nice terminal floor\n[^\n]*\n)+")
+# A PR-state read past the `->` line's cut (n_ead1437cf4504565: `gh pr view` at char ~190 of a long command) gets its
+# own `   <- PR read: ...` line, from the uncut command. Same pattern as reply_check._PSC_READ_RE (a test keeps them
+# equal), which includes reply_check._MF_CHECK_RE, so pr_state_claim and merge_forecast both read the line.
+PR_READ_RE = re.compile(
+    r"\bgh\s+pr\s+(?:view|checks|status)\b|\bgh\s+api\b[^\n]*(?:/pulls\b|check-runs|check-suites|/status\b|pullRequest)"
+    r"|\bpr-blocker-check\b|\bhermes-core-wt\s+(?:check|status)\b|github\.com/[^\s\"']+/pull/\d+"
+    r"|\bgh\s+pr\s+(?:list|merge|create|ready)\b|\bhermes-core-wt\s+(?:ship|land|lane)\b",
+    re.I)
+PR_READ_HELP_RE = re.compile(r"(?:^|\s)(?:--help|-h)(?:\s|\)|$)")
+TURN_LOG_ARG_CAP = 140
+PR_READ_LINES_MAX = 3
+
+
+def strip_injected_preamble(command: str) -> str:
+    """The command as the agent wrote it: host middleware's injected prefix (kanban-worker-nice) removed."""
+    return INJECTED_PREAMBLE_RE.sub("", command) if isinstance(command, str) else command
+
+
+def pr_read_lines(arg: str, cap: int = TURN_LOG_ARG_CAP) -> list[str]:
+    """`   <- PR read: <the read>` for each PR-state read that starts past the `->` line's `cap` chars (none
+    otherwise: the `->` line shows it). `--help` calls are not reads."""
+    out: list[str] = []
+    if not isinstance(arg, str) or len(arg) <= cap:
+        return out
+    for m in PR_READ_RE.finditer(arg):
+        if m.start() < cap and m.end() <= cap:
+            continue
+        frag = arg[m.start():m.start() + 160].split("\n", 1)[0]
+        if PR_READ_HELP_RE.search(frag):
+            continue
+        line = f"   <- PR read: {frag}"
+        if line not in out:
+            out.append(line)
+        if len(out) >= PR_READ_LINES_MAX:
+            break
+    return out
+
+
 def rich_tool_line(tool: str, args: dict, arg: str = "") -> str:
     """One tool-log line with the arguments that show what the agent started or handed off."""
     try:
@@ -3702,6 +3746,8 @@ class AgentCoach:
         if not sid:
             return
         args = args if isinstance(args, dict) else {}
+        if isinstance(args.get("command"), str) and INJECTED_PREAMBLE_RE.match(args["command"]):
+            args = dict(args, command=strip_injected_preamble(args["command"]))
         s = self._s(sid)
         s["turn_tools"] += 1
         now = self.clock()
@@ -3710,8 +3756,12 @@ class AgentCoach:
                         if args.get(k)), json.dumps(args, default=str))
         except Exception:
             arg = ""
-        s["turn_log"].append(f"-> {tool}({arg[:140]})")
+        s["turn_log"].append(f"-> {tool}({arg[:TURN_LOG_ARG_CAP]})")
         s.setdefault("turn_rich", deque(maxlen=60)).append(rich_tool_line(tool, args, arg))
+        if tool in ("terminal", "execute_code"):
+            for line in pr_read_lines(arg):
+                s["turn_log"].append(line)
+                s["turn_rich"].append(line)
         if tool == "terminal" and "commit" in arg and "git" in arg:
             s.setdefault("turn_commits", deque(maxlen=20)).append(f"-> terminal({arg[:8000]})")
         if failed(tool, result, status) and not wait_check_not_yet(tool, args, result):
