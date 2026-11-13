@@ -210,3 +210,29 @@ def test_thread_scan_is_capped_per_sample():
     # Per pass: the loop thread plus at most the busy half of the 50 scanned threads.
     assert rep["samples"] >= 1
     assert len(seen) <= rep["samples"] * (1 + 25)
+
+
+# t_01a1d6cdfa497d94: pins for mutants of cb93c9ea that survived every loop-watch test.
+def test_stall_s_excludes_post_stall_formatting(monkeypatch):
+    now, loop, passes, clock, frames, wait, tid = _fake(stall_end=10.0, sample_cost=0.0)
+    w = watch.LoopWatch(loop, tid, sink=lambda r: None, stall_s=1.0, sample_s=0.1, clock=clock, frames=frames,
+                        wait=wait)
+    orig = watch._fmt_raw
+
+    def slow_fmt(raw):
+        now[0] += 5.0  # report formatting, after the loop caught up
+        return orig(raw)
+    monkeypatch.setattr(watch, "_fmt_raw", slow_fmt)
+    rep = w.check_once()
+    assert rep["busy_threads"] and now[0] >= 15.0  # formatting ran and advanced the clock
+    assert 10.0 <= rep["stall_s"] < 10.2, rep["stall_s"]
+
+
+def test_watcher_cost_is_the_sum_of_pass_costs():
+    now, loop, passes, clock, frames, wait, tid = _fake(stall_end=10.0, sample_cost=0.05)
+    w = watch.LoopWatch(loop, tid, sink=lambda r: None, stall_s=1.0, sample_s=0.1, clock=clock, frames=frames,
+                        wait=wait, max_samples=10_000)
+    rep = w.check_once()
+    assert rep["samples"] == len(passes) > 1
+    assert rep["watcher_cost_s"] > 0
+    assert rep["watcher_cost_s"] == pytest.approx(0.05 * rep["samples"], abs=1e-3), rep
