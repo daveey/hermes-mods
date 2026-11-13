@@ -17,6 +17,7 @@ results (MacBook state.db msgs 893016-893027; login, repo slug and host name scr
 """
 import importlib.util
 import json
+import os
 import sqlite3
 from collections import deque
 from pathlib import Path
@@ -189,3 +190,47 @@ def test_board_read_failure_is_fail_open(tmp_path, monkeypatch):
     monkeypatch.setenv("COACH_BOARD_DBS", str(tmp_path / "missing.db"))
     ids, _ = rc.tail_card_ids(REPLY, _capped_log(), ASK)
     assert ids[:1] == [REVIEW] and OWNER not in ids, ids
+
+
+# ── 4. mutant-gap cases (post-merge check t_01a1d6503cfbd016) ──────────────────────────────────────────────────────
+def test_card_read_line_marks_a_board_read_by_argument_shape_alone():
+    """The argument alone marks a board read when the result shows no board row: a failed call, or a count."""
+    pad = "x" * rules.TURN_LOG_ARG_CAP
+    heredoc = f"python3 - <<'EOF'\n# {pad}\ndb = H + '/kan' + 'ban.db'\nprint(read(db, '{OWNER}'))\nEOF"
+    line = rules.card_read_line(heredoc, None, ok=False)
+    assert line and OWNER in line and line.endswith(f"({rules.BOARD_READ_MARK})"), line
+    count = f"sqlite3 \"$D\" \"select count(*) from task_events where task_id='{OWNER}'\"  # {pad}"
+    count = f"# {pad}\n" + count
+    line = rules.card_read_line(count, "3\n")
+    assert line and OWNER in line and line.endswith(f"({rules.BOARD_READ_MARK})"), line
+
+
+def test_open_child_survives_the_cap_when_the_turn_touched_many_cards(tmp_path, monkeypatch):
+    """The notice card's open child ranks before the turn-touched guesses, so NAMED_CARD_MAX never drops it."""
+    monkeypatch.setenv("COACH_BOARD_DBS", _board(tmp_path))
+    others = [f"t_01a1d0ffff0001{i:02x}" for i in range(rc.NAMED_CARD_MAX)]
+    log = []
+    for cid in others:
+        log += [f"-> kanban_show(task_id={cid})", "<- OK {}"]
+    assert set(others) <= set(rc.turn_card_ids(log)), rc.turn_card_ids(log)
+    ids, fallback = rc.tail_card_ids(REPLY, log, ASK)
+    assert len(ids) == rc.NAMED_CARD_MAX and fallback, ids
+    assert ids[:2] == [REVIEW, OWNER], ids
+
+
+def test_per_board_read_failure_skips_that_board_only(tmp_path, monkeypatch):
+    """A COACH_BOARD_DBS entry that exists but is not a board (not sqlite / no task_links) is skipped; the real
+    board after it still yields the open child, and tail_card_ids does not raise."""
+    garbage = tmp_path / "garbage.db"
+    garbage.write_bytes(b"not a sqlite database\n" * 64)
+    empty = tmp_path / "empty.db"
+    c = sqlite3.connect(empty)
+    c.execute("create table other (x)")
+    c.commit()
+    c.close()
+    real = _board(tmp_path)
+    for bad in (garbage, empty):
+        monkeypatch.setenv("COACH_BOARD_DBS", f"{bad}{os.pathsep}{real}")
+        assert rc.open_child_card_ids([REVIEW]) == [OWNER], bad
+        ids, _ = rc.tail_card_ids(REPLY, _capped_log(), ASK)
+        assert ids[:2] == [REVIEW, OWNER], (bad, ids)
