@@ -3,9 +3,10 @@
 
 A process that loses POSIX locks can retain a stale WAL generation, but deleted descriptors alone do not prove
 that cause or any read failure. This scans /proc/*/fd for deleted kanban.db/state.db WAL/SHM under HERMES_HOME
-and files ONE Kanban card per (host, pid, pid start time, db). Entire absent profile homes are excluded as
-retired-reader cleanup, not live-database restart incidents; anything under HERMES_HOME/cache/ (scratch/TMPDIR
-test homes) is ignored.
+and files ONE Kanban card per (host, pid, pid start time, db). Entire absent profile homes or board directories
+(kanban/boards/<slug>/, also under a profile home) are excluded as retired-reader cleanup, not live-database restart
+incidents; a missing db inside a still-existing profile home or board directory is still reported. Anything under
+HERMES_HOME/cache/ (scratch/TMPDIR test homes) is ignored.
 
     stranded_sqlite_watch.py [--dry-run] [--json] [--home PATH]
 
@@ -60,6 +61,31 @@ def _cmdline(pid: int, proc: Path) -> str:
     return s if len(s) <= CMDLINE_MAX else s[:CMDLINE_MAX - 1] + "…"
 
 
+def _owner_absent(path: Path) -> bool:
+    """True only when the owning dir (profile home / board dir) is definitely gone. Any other OSError means
+    unknown ownership state, so the finding is retained."""
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _retired_owner(root: Path, relative: tuple) -> bool:
+    """The db lives under an entirely absent profile home or kanban board dir (retired-reader cleanup)."""
+    base = root
+    if len(relative) >= 3 and relative[0] == "profiles":
+        if _owner_absent(root / "profiles" / relative[1]):
+            return True
+        base, relative = root / "profiles" / relative[1], relative[2:]
+    # <base>/kanban/boards/<slug>/<db>
+    if len(relative) >= 4 and relative[0] == "kanban" and relative[1] == "boards":
+        return _owner_absent(base / "kanban" / "boards" / relative[2])
+    return False
+
+
 def scan(home: Optional[str] = None, proc: str = "/proc") -> list:
     """-> [{pid, starttime, cmdline, db, sidecars: [{path, fd, deleted_ctime}]}], one per (pid, db), sorted."""
     root = str(hermes_home(home).resolve()).rstrip("/") + "/"
@@ -90,16 +116,11 @@ def scan(home: Optional[str] = None, proc: str = "/proc") -> list:
                 # cache/ (scratch, TMPDIR) holds throwaway test homes (pytest tmp_path etc.), never a live
                 # Hermes db; tests deleting their own sidecars mid-run is not a stranded live reader.
                 continue
-            if len(relative) >= 3 and relative[0] == "profiles":
-                # Entire absent profile (tombstoned or otherwise retired): retained readers
-                # need lifecycle cleanup, not a live-db corruption/restart incident.
-                # Do not suppress a missing DB inside a still-existing profile home.
-                try:
-                    (Path(root) / "profiles" / relative[1]).stat()
-                except FileNotFoundError:
-                    continue
-                except OSError:
-                    pass  # unknown ownership state: retain the finding
+            if _retired_owner(Path(root), relative):
+                # Entire absent profile home or board dir (tombstoned, deleted probe board, ...): retained
+                # readers need lifecycle cleanup, not a live-db corruption/restart incident. A missing DB
+                # inside a still-existing profile home or board dir is never suppressed.
+                continue
             try:
                 ctime = os.stat(fd).st_ctime  # follows the fd to the unlinked inode: ctime ~ when it was deleted
             except OSError:
@@ -133,12 +154,13 @@ def card_body(host: str, f: dict) -> str:
 ## What it means
 This process still holds deleted WAL/SHM sidecars. This can indicate a stale generation for a live database,
 but the descriptor evidence alone does not establish read failures, corruption, the deleting actor, or POSIX
-lock loss. Entire absent profile homes are excluded as retired-reader cleanup; recheck ownership before acting.
+lock loss. Entire absent profile homes or board directories are excluded as retired-reader cleanup; recheck
+ownership before acting.
 
 ## Remediation
 1. Do NOT touch the live db or its sidecars (no delete, copy-over or checkpoint by hand).
-2. Verify that the profile/database is still live and reproduce any read error safely. For an absent retired
-   profile, close/evict cached readers rather than requesting a service restart.
+2. Verify that the profile/board/database is still live and reproduce any read error safely. For an absent
+   retired profile or board, close/evict cached readers rather than requesting a service restart.
 3. If live reads are stranded, gracefully restart only the affected process when idle (no running turn/worker),
    then confirm it no longer holds deleted sidecars.
 4. If POSIX lock loss is independently established for Kanban, inspect the kanban OFD lock guard
