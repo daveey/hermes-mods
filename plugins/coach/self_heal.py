@@ -2279,10 +2279,21 @@ the evidence you get (it describes where it happened, not where you work).
 
 # cron-0d63c0cf26: a VERIFY recorded fixed while the live check's natural event (a dirty drift pair) had not happened,
 # from a replay that stubbed the create path the hub's admission judge refused. Both VERIFY variants carry this rule.
+# desktop-bbc01a096b (VERIFY t_01a1d379a55e4489): a VERIFY parked on a wake_check matching any `taken over by pid=` line
+# and planned to record fixed on one, though the defect needs a live but slow writer and the only natural Take over
+# released in 140 ms. Hence the precondition rule, and an A/B repro on the real path in place of a days-long wait.
 NATURAL_EVENT_RULE = """   `live_check` needs a natural event (the real failing input: a dirty sample, a real create, a failing run) that
    has not happened yet? A clean or idle run is NO_PROOF: kanban_schedule a re-check with a wake_check on that
    event, never record fixed. A replay counts only if it exercises the real path; one that stubs the layer that
-   failed (a fake create, a mocked judge) proves nothing about this defect."""
+   failed (a fake create, a mocked judge) proves nothing about this defect.
+   An occurrence of the operation that skipped the failing precondition is a clean run too, so NO_PROOF (e.g. a
+   Take over whose old writer let go at once, when the defect needed a slow writer). The wake_check must match that
+   precondition, or the fixed path's own log line for it, never any success of the operation.
+   Can you build the precondition here against the real, unmodified path (real processes and handler, default
+   timeouts, a scratch HERMES_HOME, never a live session or registry)? Then run an A/B repro instead of waiting,
+   within this card's budget: the installed tree must pass, and the pre-fix tree must reproduce the original
+   symptom (build it as `<first fix sha>^` in a temporary worktree, remove it afterwards). Record fixed only when
+   both hold; a repro whose pre-fix run also passes proves nothing."""
 
 
 def verify_brief(fp: str, st: dict, fix_card: str, remote: bool = False) -> str:

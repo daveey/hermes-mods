@@ -395,3 +395,25 @@ def test_verify_never_records_fixed_without_the_natural_event(remote):
     assert "NO_PROOF" in live and "natural event" in live
     assert "kanban_schedule" in live and "wake_check" in live
     assert "stubs the layer that failed" in live
+
+
+# desktop-bbc01a096b (VERIFY t_01a1d379a55e4489): a VERIFY parked on a wake_check matching any `taken over by pid=` line
+# and planned to record fixed on one, though the defect only fails with a live but slow writer and the only natural
+# Take over released in 140 ms. Both VERIFY variants must make an occurrence that skipped the failing precondition
+# NO_PROOF, tie the wake_check to that precondition, and allow a real-path A/B repro (installed tree passes, pre-fix
+# tree reproduces the symptom, both required) in place of the wait.
+@pytest.mark.parametrize("remote", [False, True], ids=["machine-pinned", "pool"])
+def test_verify_natural_event_must_carry_the_failing_precondition(remote):
+    body = sh.verify_brief(FP, {"symptom": "Take over fails when clicked"}, "t_fix", remote=remote)
+    live = " ".join(body.split("\n5. ", 1)[1].split("\n6. ", 1)[0].split())
+    # precondition rule
+    assert "skipped the failing precondition" in live
+    assert "wake_check must match that precondition" in live
+    assert "never any success of the operation" in live
+    # A/B rule
+    assert "A/B repro" in live and "real, unmodified path" in live
+    assert "installed tree must pass" in live
+    assert "pre-fix tree must reproduce the original symptom" in live
+    assert "<first fix sha>^" in live and "temporary worktree" in live
+    assert "Record fixed only when both hold" in live
+    assert "pre-fix run also passes proves nothing" in live
