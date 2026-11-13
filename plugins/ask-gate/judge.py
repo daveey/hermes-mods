@@ -127,6 +127,12 @@ A why_human that rests on a condition an agent set (an operator, orchestrator, c
  card comment, the agent's own rule such as "ask before any new head") and quotes nothing David said is not a
  human-only step: return unverified with how = apply the in-scope recommendation (an exact-head approval or
  label is re-checked by its own gate) or ask the agent that set the condition on the card.
+A request that asks David to pick between options (yes/no, A/B/C) where one option is evidently recommended or
+ supported by the evidence, and the pick stays inside the card's limits (no real money over a standing envelope,
+ no credential or write/admin permission, no other people, no safety/consent or hard-to-reverse effect, no
+ acceptance-threshold change, no rule David himself stated) is not a human-only step, even when why_human calls it
+ "David's call" or a "preference": return unverified with how = apply your recommendation and comment how to
+ reverse (kanban_comment the pick, why and the exact reversal), then continue through the normal gates.
 """
 
 
