@@ -15,10 +15,17 @@ def ci_node_globs(text):
     return [arg for arg in runs[0].split() if not arg.startswith('-')]
 
 
+def segment_collects(glob_segment, path_segment):
+    """bash (no dotglob): a leading '.' must be matched by a literal leading '.' in the pattern."""
+    if path_segment.startswith('.') and not glob_segment.startswith('.'):
+        return False
+    return fnmatchcase(path_segment, glob_segment)
+
+
 def glob_collects(glob, path):
-    """True when the shell expands `glob` to `path`: same depth, each segment fnmatch'd ('*' never crosses '/')."""
+    """True when the shell expands `glob` to `path`: same depth, each segment matched ('*' never crosses '/')."""
     parts, pattern = PurePosixPath(path).parts, PurePosixPath(glob).parts
-    return len(parts) == len(pattern) and all(fnmatchcase(p, g) for p, g in zip(parts, pattern))
+    return len(parts) == len(pattern) and all(segment_collects(g, p) for p, g in zip(parts, pattern))
 
 
 def uncollected_node_tests(paths, globs):
@@ -105,6 +112,16 @@ class DesktopPluginCI(unittest.TestCase):
                   'plugins/n/x/tests/a.test.mjs',
                   'plugins/n/test/a.test.mjs']
         self.assertEqual(uncollected_node_tests(collected + missed, ci_node_globs(self.text)), missed)
+
+    def test_guard_rejects_dot_prefixed_segments_the_shell_skips(self):
+        # bash's `*` (no dotglob) never matches a leading '.', while fnmatch's does.
+        missed = ['desktop-plugins/.x/test/a.test.mjs',    # dot-prefixed plugin dir
+                  'desktop-plugins/p/test/.a.test.mjs',    # dot-prefixed test file
+                  'desktop-plugins/p/tests/.a.test.mjs',
+                  'plugins/.x/tests/a.test.mjs']
+        self.assertEqual(uncollected_node_tests(missed, ci_node_globs(self.text)), missed)
+        self.assertTrue(glob_collects('desktop-plugins/*/.hidden/*.mjs', 'desktop-plugins/p/.hidden/a.mjs'))
+        self.assertFalse(glob_collects('desktop-plugins/?x/test/*.mjs', 'desktop-plugins/.x/test/a.mjs'))
 
 
 if __name__ == '__main__':
