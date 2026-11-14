@@ -5,8 +5,10 @@ P1 measured the fleet panel's inventory reads at 0.8% of one core in the busiest
 This replays the hub's measured change shape (hub 2026-11-13, 1.9k runners: the collector rewrites the snapshot every
 ~30 s; between snapshots ``processed_at`` moves on ~95% of runner states, ~5% are re-observed, and the two host
 results move every other snapshot) with a fleet build every FLEET_CACHE_S = 5 s. It measures thread CPU of main's
-per-call work and of the card L path over the same replay, and asserts the P1 share scaled by that ratio is within
-the 0.1% budget."""
+per-call work and of the card L path over the same replay. The absolute thread CPU / replay duration must
+remain within 0.1% of one core; the historical P1-scaled ratio is an additional check, not the budget proof.
+The fixture includes 556 scope/coverage/provenance entries and 221 source errors, matching the measured
+post-deploy cardinalities, with fictional identifiers only."""
 import json
 import os
 import sqlite3
@@ -37,6 +39,29 @@ def snapshots(path, cfg):
     with Store(path) as store:
         snap = Collector(store, cfg, Fleet(), clock=lambda: 1000.0, host_probe=lambda host: {}).tick()
     snap = json.loads(json.dumps(snap))
+    # Public fictional replay of the measured multi-scope shape: preserve the
+    # collector's nested scope result/coverage/provenance duplication, not padding.
+    template = next(iter(snap['scope_results'].values()))
+    scopes, coverage, provenance, errors, results = [], [], [], [], {}
+    for i in range(556):
+        sid = f'scope_{i + 1:016x}'
+        scopes.append(dict(cfg['scopes'][0], id=sid, name=f'example/project-{i}'))
+        result = deepcopy(template)
+        result['coverage']['scope_id'] = sid
+        result['provenance']['source_id'] = sid
+        if i < 221:
+            result.update(error='forbidden', complete=False)
+            result['coverage'].update(state='partial', pagination_complete=False, reason_code='forbidden')
+            result['provenance']['state'] = 'unavailable'
+            errors.append(dict(source_id=sid, code='forbidden', retry_after_seconds=None,
+                               observed_at=result['provenance']['observed_at']))
+        results[sid] = result
+        coverage.append(deepcopy(result['coverage']))
+        provenance.append(deepcopy(result['provenance']))
+    cfg['scopes'] = scopes
+    snap.update(scope_results=results, coverage=coverage, provenance=provenance, source_errors=errors)
+    for i, row in enumerate(snap['runners']):
+        row['scope_id'] = scopes[i % len(scopes)]['id']
     hid = cfg['hosts'][0]['id']
     snap.setdefault('host_results', {})[hid] = dict(at=1000.0, management='reachable', facts={}, observation_ids=[])
     ids = sorted(snap['states'])
@@ -57,10 +82,10 @@ def snapshots(path, cfg):
 
 def replay(tmp_path, card_l, run=0):
     cfg = config(); cfg['hosts'] = [deepcopy(F['Host'])]
-    fingerprint = Service.config_fingerprint(cfg)  # the dashboard computes it once per parsed config
     path = tmp_path / f"{'new' if card_l else 'old'}{run}" / 'state.sqlite'
     path.parent.mkdir()
     seq = snapshots(path, cfg)
+    fingerprint = Service.config_fingerprint(cfg)  # once per parsed config, as in the dashboard
     db = sqlite3.connect(path)
     cpu, i = 0.0, 0
     for t in range(0, SPAN, CALL_EVERY):
@@ -91,3 +116,4 @@ def test_inventory_replay_budget(tmp_path):
     print(f'\nrunners inventory over {SPAN}s: main {old * 1000:.0f} ms, card L {new * 1000:.0f} ms of CPU '
           f'({new / SPAN * 100:.3f}% of a core here); P1 {P1_NOW}% -> {share:.3f}% (budget {BUDGET}%)')
     assert share <= BUDGET
+    assert new / SPAN * 100 <= BUDGET, 'absolute inventory CPU exceeds the P1 budget'

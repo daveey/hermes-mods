@@ -18,6 +18,26 @@ from .collector import ident, iso, readiness, operational_evidence, readiness_ev
 from .health import State, project, Policy
 from .models import validate
 
+try:
+    import msgspec
+except ImportError:  # older installations remain correct until dependencies are refreshed
+    msgspec = None
+
+
+def _decode_snapshot(text):
+    """Fast JSON, never an executable persisted codec. Retain legacy JSON extensions.
+
+    msgspec retains arbitrary precision integers (unlike some fast decoders). It
+    rejects NaN/Infinity, overflowing floats and lone surrogates; the authoritative
+    stdlib decoder handles those and supplies the historical malformed-JSON error.
+    """
+    if msgspec is not None:
+        try:
+            return msgspec.json.decode(text)
+        except (msgspec.DecodeError, UnicodeError):
+            pass
+    return json.loads(text)
+
 
 # Served by store.py's runner_entity expression index (schema v2): the
 # json_extract expression must stay textually equivalent to the indexed one.
@@ -118,9 +138,11 @@ def _next_flip(stamps, ttls, now):
     the bound at or before that). Each bound is FLIP_EARLY_S early: provenance compares the clock with x + d
     after an ISO round trip, which rounds to the microsecond."""
     best = math.inf
+    seen = set()
     for x in stamps:
-        if type(x) not in (int, float):
+        if type(x) not in (int, float) or x in seen:
             continue
+        seen.add(x)  # most states share a collection timestamp
         try:
             if not math.isfinite(x):
                 continue
@@ -142,8 +164,12 @@ def _same_state(a, b):
     ``_inventory`` patches on a carried row."""
     if a == b:
         return True
-    return (type(a) is dict and type(b) is dict
-            and dict(a, **_LIVENESS_ONLY) == dict(b, **_LIVENESS_ONLY))
+    if type(a) is not dict or type(b) is not dict:
+        return False
+    left, right = a.copy(), b.copy()
+    left.update(_LIVENESS_ONLY)
+    right.update(_LIVENESS_ONLY)
+    return left == right
 
 
 def _file_key(path):
@@ -239,7 +265,7 @@ class Service:
         if memo is not None and memo.text == text:
             snapshot, generation = memo.snapshot, memo.generation  # rewritten, not changed: no decode
         else:
-            snapshot, generation = (json.loads(text) if text else None), next(_GENERATION)
+            snapshot, generation = (_decode_snapshot(text) if text else None), next(_GENERATION)
         fresh = _Read(key, now, text, snapshot, generation, overlay)
         with _MEMO_LOCK:
             _READS[path] = fresh
@@ -363,10 +389,14 @@ class Service:
             carry = None
         same_host = {}  # host id -> its result and maintenance equal the carried ones
         host_flip = {}  # host id -> _host_flip
+        # Preserve first-match semantics even for callers supplying duplicate host ids.
+        maintenance_by_host = {}
+        for host in hosts:
+            maintenance_by_host.setdefault(host['id'], host['maintenance'])
         for src in snap['runners'] if snap else ():
             rid, hid = src['id'], src.get('host_id')
             observed = snap['states'][rid]
-            maintenance=next((h['maintenance'] for h in hosts if h['id']==hid), {})
+            maintenance=maintenance_by_host.get(hid, {})
             if tracked:
                 inputs = (host_results.get(hid), maintenance)
                 built.hosts[hid] = inputs
