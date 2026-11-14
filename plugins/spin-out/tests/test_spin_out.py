@@ -304,3 +304,68 @@ def test_agent_hook_links_cards_on_first_turn_only(tmp_path, monkeypatch):
     assert calls == [("child", BRIEF)] and "t_01a1ce6d3d682365" in ctx["context"]
     assert plugin.pre_llm_call(session_id="child", user_message=BRIEF, is_first_turn=False) is None
     assert len(calls) == 1
+
+
+def _adopt_step(task_id, board, env):
+    return {"next_step": f"hermes-hub adopt-task macbook default/{board}/{task_id}", "complete": True}
+
+
+def test_spun_child_skips_released_parent_links(tmp_path):
+    # A released chat link no longer makes the card the parent's: the child must not take it over.
+    p = make_kanban(tmp_path)
+    con = sqlite3.connect(p)
+    con.execute("insert into tasks values ('t_00000000000000cc','running')")
+    con.execute("insert into task_chat_links values ('t_00000000000000cc','hub',null,'20261111_091916_d2d36a',"
+                "'created',1)")
+    con.commit(); con.close()
+    brief = "Also drive t_00000000000000cc. " + BRIEF
+    ran = []
+    out = core.link_spun_cards("child", brief, home=tmp_path, next_step=_adopt_step,
+                               runner=lambda argv: ran.append(argv) or (0, ""))
+    assert [r["task_id"] for r in out] == ["t_01a1ce6d3d682365"]
+    assert all("t_00000000000000cc" not in " ".join(a) for a in ran)
+
+
+def test_spun_child_incomplete_next_step_is_not_run(tmp_path):
+    make_kanban(tmp_path)
+    ran = []
+    out = core.link_spun_cards("child", BRIEF, home=tmp_path,
+                               next_step=lambda t, b, env: {"next_step": f"hermes-hub adopt-task x {t}",
+                                                            "complete": False},
+                               runner=lambda argv: ran.append(argv) or (0, "ok"))
+    assert ran == []
+    assert len(out) == 1 and not out[0]["ok"] and out[0]["output"] == "no complete link command"
+    assert out[0]["step"] == "hermes-hub adopt-task x t_01a1ce6d3d682365"
+
+
+def test_spun_child_links_a_card_on_two_boards_once(tmp_path):
+    # The same card id linked to the parent on two board dbs is taken over once (first board wins).
+    make_kanban(tmp_path)
+    make_kanban(tmp_path / "kanban" / "boards" / "bb", "kanban.db")
+    ran = []
+    out = core.link_spun_cards("child", BRIEF, home=tmp_path, next_step=_adopt_step,
+                               runner=lambda argv: ran.append(argv) or (0, ""))
+    assert [(r["task_id"], r["board"]) for r in out] == [("t_01a1ce6d3d682365", "default")]
+    assert len(ran) == 1
+
+
+def test_spun_child_ignores_card_ids_after_the_mark(tmp_path):
+    # Only the brief (text before the spin-out pointer) hands cards over; ids after the mark are not the brief's.
+    make_kanban(tmp_path)
+    brief = ("Look into the ring speed regression.\n\n---\nSpun out of parent session "
+             "@session:default/20261111_091916_d2d36a (\"t_01a1ce6d3d682365 ring speed\"). Read the parent transcript.")
+    boom = lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run"))
+    assert core.link_spun_cards("child", brief, home=tmp_path, next_step=boom, runner=boom) == []
+
+
+def test_spun_child_link_exception_is_reported_not_swallowed(tmp_path):
+    make_kanban(tmp_path)
+
+    def next_step(task_id, board, env):
+        raise RuntimeError("core too old")
+
+    out = core.link_spun_cards("child", BRIEF, home=tmp_path, next_step=next_step,
+                               runner=lambda argv: (0, ""))
+    assert out == [{"task_id": "t_01a1ce6d3d682365", "board": "default", "ok": False, "step": "",
+                    "output": "RuntimeError: core too old"}]
+    assert "core too old" in core.linked_note(out)
