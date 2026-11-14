@@ -83,6 +83,9 @@ _MEMO_LOCK = threading.Lock()
 _GENERATION = itertools.count(1)
 _READS: dict = {}  # state file path -> _Read
 _RESULTS: dict = {}  # state file path -> _Result
+# A process normally reads one store. Bound retained multi-megabyte object graphs
+# when stores/profiles are replaced; eviction only causes an authoritative rebuild.
+MEMO_PATHS_MAX = 4
 _UNREAD = object()
 _NO_CARRY = object()
 ROWS_MAX_S = 300.0  # a carried runner row is computed afresh at least this often (its P1 ceiling)
@@ -211,9 +214,9 @@ def _carry_sources(snap, carry, built, host_results, maintenance, now, rows, pro
     built.hosts.update(inputs)
     same_hosts = {hid for hid, value in inputs.items()
                   if carry is not None and carry.hosts.get(hid, _NO_CARRY) == value}
-    # Small blocks retain reuse with scattered re-observations (not just a
-    # favorable contiguous prefix). Large blocks dirty almost the whole fleet.
-    block_size = 8
+    # Dirty blocks still carry individual unchanged rows using these same
+    # signatures; larger blocks avoid allocating many tiny bookkeeping objects.
+    block_size = 64
     for index, start in enumerate(range(0, len(sources), block_size)):
         chunk = sources[start:start + block_size]
         states = [_state_signature(snap['states'][src['id']]) for src in chunk]
@@ -228,7 +231,18 @@ def _carry_sources(snap, carry, built, host_results, maintenance, now, rows, pro
             built.blocks.append(old)
             continue
         offset = len(rows)
-        yield from chunk
+        for src, signature in zip(chunk, states):
+            rid, hid = src['id'], src.get('host_id')
+            entry = carry.rows.get(rid) if carry is not None else None
+            if (entry is not None and hid in same_hosts
+                    and entry[5] <= now < entry[6] and now < entry[5] + ROWS_MAX_S
+                    and entry[0] == src and entry[7] == signature):
+                built.rows[rid] = entry
+                rows.append(entry[2]); projections.append(entry[3])
+                if entry[4] is not None:
+                    provenance.append(dict(entry[4], collection_id=snap['states'][rid]['cycle']))
+            else:
+                yield src
         entries = {src['id']: built.rows[src['id']] for src in chunk}
         floor = max(entry[5] for entry in entries.values())
         deadline = min(min(entry[6], entry[5] + ROWS_MAX_S) for entry in entries.values())
@@ -332,6 +346,10 @@ class Service:
             snapshot, generation = (_decode_snapshot(text) if text else None), next(_GENERATION)
         fresh = _Read(key, now, text, snapshot, generation, overlay)
         with _MEMO_LOCK:
+            if path not in _READS and len(_READS) >= MEMO_PATHS_MAX:
+                oldest = next(iter(_READS))
+                del _READS[oldest]
+                _RESULTS.pop(oldest, None)
             _READS[path] = fresh
         return fresh
 
@@ -383,7 +401,10 @@ class Service:
                 until = min(until, min(entry[5] + ROWS_MAX_S for entry in rows.rows.values()))
             fresh = _Result(key, now, until, result, rows)
             with _MEMO_LOCK:
-                _RESULTS[path] = fresh
+                # A concurrent cold-path read may have evicted/replaced our read
+                # while we built. Do not resurrect an orphan result cache entry.
+                if _READS.get(path) is read:
+                    _RESULTS[path] = fresh
             return fresh.view(shared, now)
 
     def _ttl(self, name):
@@ -460,7 +481,6 @@ class Service:
         built = _Carry(current, now) if tracked else None
         if carry is _NO_CARRY or (carry is not None and carry.current != current):
             carry = None
-        same_host = {}  # host id -> its result and maintenance equal the carried ones
         host_flip = {}  # host id -> _host_flip
         # Preserve first-match semantics even for callers supplying duplicate host ids.
         maintenance_by_host = {}
@@ -474,21 +494,6 @@ class Service:
             if tracked:
                 inputs = (host_results.get(hid), maintenance)
                 built.hosts[hid] = inputs
-                entry = carry.rows.get(rid) if carry is not None else None
-                if entry is not None:
-                    if hid not in same_host:
-                        same_host[hid] = carry.hosts.get(hid, _NO_CARRY) == inputs
-                    if (same_host[hid] and entry[5] <= now < min(entry[6], entry[5] + ROWS_MAX_S)
-                            and entry[0] == src and _same_state(entry[1], observed)):
-                        provenance = entry[4]
-                        if provenance is not None and provenance['collection_id'] != observed['cycle']:
-                            provenance = dict(provenance, collection_id=observed['cycle'])
-                            entry = entry[:4] + (provenance,) + entry[5:]
-                        built.rows[rid] = entry
-                        rows.append(entry[2]); projections.append(entry[3])
-                        if provenance is not None:
-                            meta['provenance'].append(dict(provenance))
-                        continue
                 built.computed += 1
             # Only top-level keys of a row are set below: a memoized build (copy_rows=False) may share the rest.
             row=deepcopy(src) if copy_rows else dict(src)
@@ -521,7 +526,7 @@ class Service:
                 if hid not in host_flip:
                     host_flip[hid] = self._host_flip(host_results.get(hid), maintenance, now)
                 flip = min(host_flip[hid], _next_flip((observed.get('at'),), (0, policy.inventory_ttl), now))
-                built.rows[rid] = (src, observed, row, p, provenance, now, flip)
+                built.rows[rid] = (src, observed, row, p, provenance, now, flip, _state_signature(observed))
         # Many rows share an expiry. Cache parsing within this build only; the
         # clock is still checked for every row and no threshold is rounded.
         expiry_times = {}
