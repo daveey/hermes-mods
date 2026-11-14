@@ -3509,14 +3509,23 @@ def prev_turn_section(prev_turn: Optional[dict], tool_log: list[str]) -> str:
             f"PREVIOUS TURN'S FINAL MESSAGE (head):\n{head}\n\n")
 
 
+CONFIRM_POSITIVE = ("report_only", "offered")
+CONFIRM_NEGATIVE = ("fixed", "started", "proposed", "na")
+
+
 def parse_confirm(raw: str) -> Optional[tuple]:
-    """(p, evidence): p = 0.9 when the strong model labels the outcome report_only AND agent_fixable, else 0.1."""
+    """(p, evidence): p = 0.9 when the strong model labels the outcome report_only or offered AND agent_fixable, else 0.1.
+
+    "offered" counts (agent-fdfab26745): a vague "I can run a deeper live check next" on a fixable leftover is the
+    report_only stall the screen rule names ("a vague 'want me to look into it?' is not a proposal"). Scored 0.1 it
+    vetoed a 0.99 screen and the user had to type "resume" two days later. Every label CONFIRM_SYS offers is in
+    CONFIRM_POSITIVE or CONFIRM_NEGATIVE (test_every_confirm_outcome_label_is_classified)."""
     m = re.search(r"\{.*\}", raw or "", re.S)
     if not m:
         return None
     try:
         d = json.loads(m.group(0))
-        pos = d.get("outcome") == "report_only" and d.get("agent_fixable") is True
+        pos = d.get("outcome") in CONFIRM_POSITIVE and d.get("agent_fixable") is True
         return (0.9 if pos else 0.1), str(d.get("quote") or d.get("evidence") or "")[:300]
     except Exception:
         return None
