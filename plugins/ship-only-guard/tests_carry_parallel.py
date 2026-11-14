@@ -117,6 +117,38 @@ def test_earlier_merge_refusal_precedes_later_read_error(monkeypatch):
     assert 'later merge unreadable' not in result[1]
 
 
+@pytest.mark.parametrize('clean', ['refused', 'unreadable'])
+@pytest.mark.parametrize('identity', ['off-state', 'patch-changed', 'unreadable'])
+def test_identity_refusal_precedes_clean_merge_refusal(monkeypatch, identity, clean):
+    # Both proofs fail at once: the identity reason (membership, patch-id, unreadable
+    # identity) keeps its priority over any clean-merge reason.
+    g, old, middle, head, base1, base2 = fixture(monkeypatch)
+    read = g._gh_json
+    def membership(path, *args):
+        if identity == 'off-state' and path.endswith(f'{base2}...state'):
+            return {'status': 'diverged', 'behind_by': 1}
+        return read(path, *args)
+    def patch_text(path, *args, **kwargs):
+        if identity == 'unreadable':
+            raise g._Unreadable('patch read failed')
+        return 'diff of ' + path
+    def tree(merge, *args):
+        if clean == 'unreadable':
+            raise g._Unreadable('tree read failed')
+        return 'edited tree'
+    monkeypatch.setattr(g, '_gh_json', membership)
+    monkeypatch.setattr(g, '_gh_text', patch_text)
+    monkeypatch.setattr(g, '_patch_id', lambda diff, *a: diff if identity == 'patch-changed' else 'same patch')
+    monkeypatch.setattr(g, '_merge_tree_refusal', tree)
+    result = g.bounded_preflight(g._carry_one, head, old, False, 'example/repo', '.', {})
+    assert result[0] is False
+    expected = {'off-state': 'is not on state', 'patch-changed': "the PR's patch changed",
+                'unreadable': 'patch read failed, so patch identity cannot be shown'}[identity]
+    assert expected in result[1]
+    assert 'edited tree' not in result[1] and 'tree read failed' not in result[1]
+    assert 'clean' not in result[1]
+
+
 @pytest.mark.parametrize('bounded', [False, True])
 def test_drift_expiry_keeps_actual_stage(monkeypatch, bounded):
     import json
