@@ -6,6 +6,26 @@ It does not merge or push. State preflight makes two bounded read-only GitHub
 requests (the PR view and one base compare), plus at most three bounded
 per-file commit lookups when it refuses for base drift.
 
+## Preflight budgets
+
+The registered `pre_tool_call` callback declares a **150-second** host timeout
+(`hermes_hook_timeout`); other callbacks retain their own/default budgets and
+host timeout failures remain fail-closed. Carry verification can exceed the
+host's default 30 seconds even when every individual probe succeeds.
+
+The adapter and standalone `--gh-args` entry point share a **120-second aggregate
+monotonic deadline** across all probes in one invocation, including nested tool
+calls. Each subprocess keeps its existing per-call cap (2–30 seconds), clipped
+to the remaining aggregate allowance. Exhaustion stops new probes and refuses
+the operation; a result arriving after the deadline cannot allow it. The extra
+30 seconds leave cleanup/return headroom; the host remains the hard callback
+backstop for Python or filesystem stalls. Direct library callers can use
+`bounded_preflight(check_argv, argv)` for the same aggregate bound.
+
+`tests_budget.py` covers registration, clipping, late-result rejection, context
+reset/nesting, real subprocess expiry, standalone refusal, and (when core is
+available) real bounded host dispatch and fail-closed timeout/suppression.
+
 ## Configuration
 
 Create `$HERMES_HOME/ship-only-guard.json` (default home: `~/.hermes`):

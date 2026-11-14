@@ -9,8 +9,13 @@ _spec.loader.exec_module(guard)
 
 
 def _pre_tool_call(tool_name="", args=None, **_):
-    why = guard.check_tool(tool_name, args)
+    why = guard.bounded_preflight(guard.check_tool, tool_name, args)
     return {"action": "block", "message": why} if why else None
+
+
+# Leave cleanup/return headroom after the aggregate subprocess deadline. Only
+# this callback gets the larger budget; the host's fail-closed timeout stays on.
+_pre_tool_call.hermes_hook_timeout = guard.PREFLIGHT_TIMEOUT + 30.0
 
 
 def register(ctx):

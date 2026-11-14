@@ -15,6 +15,54 @@ import re
 import shlex
 import subprocess
 import sys
+import time
+from contextvars import ContextVar
+
+# One aggregate allowance, not a fresh timeout for every API/file/merge probe.
+PREFLIGHT_TIMEOUT = 120.0
+_PREFLIGHT_DEADLINE: ContextVar[float | None] = ContextVar("ship_preflight_deadline", default=None)
+
+
+class _PreflightExpired(RuntimeError):
+    pass
+
+
+def _remaining():
+    deadline = _PREFLIGHT_DEADLINE.get()
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _PreflightExpired("ship-only-guard preflight deadline exceeded; retry after checking network/CI")
+    return remaining
+
+
+def bounded_preflight(check, *args, **kwargs):
+    """Share a monotonic deadline across nested calls; late results never allow."""
+    parent = _PREFLIGHT_DEADLINE.get()
+    deadline = time.monotonic() + PREFLIGHT_TIMEOUT
+    token = _PREFLIGHT_DEADLINE.set(min(parent, deadline) if parent is not None else deadline)
+    try:
+        result = check(*args, **kwargs)
+        _remaining()
+        return result
+    except _PreflightExpired as exc:
+        return str(exc)
+    finally:
+        _PREFLIGHT_DEADLINE.reset(token)
+
+
+def _run_probe(*args, **kwargs):
+    remaining = _remaining()
+    if remaining is not None:
+        kwargs["timeout"] = min(kwargs["timeout"], remaining)
+    try:
+        result = subprocess.run(*args, **kwargs)
+    except subprocess.TimeoutExpired:
+        _remaining()  # Aggregate expiry must not be swallowed as missing evidence.
+        raise
+    _remaining()
+    return result
 
 MARKER = "HERMES_CORE_WT_LAND"
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -52,7 +100,7 @@ def _git(cwd, *args):
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env["GIT_TERMINAL_PROMPT"] = "0"
     try:
-        p = subprocess.run(["git", "--no-optional-locks", "-C", str(cwd), *args],
+        p = _run_probe(["git", "--no-optional-locks", "-C", str(cwd), *args],
                            env=env, capture_output=True, text=True, timeout=2)
         return p.stdout.strip() if p.returncode == 0 else ""
     except (OSError, subprocess.SubprocessError):
@@ -377,7 +425,7 @@ def _gh_text(path, cwd, env, accept=None):
     probe_env["GH_PROMPT_DISABLED"] = "1"
     argv = ["gh", "api", *(["-H", f"Accept: {accept}"] if accept else []), path]
     try:
-        p = subprocess.run(argv, cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True, timeout=15)
+        p = _run_probe(argv, cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.SubprocessError) as e:
         raise _Unreadable(f"`gh api {path}` could not run ({type(e).__name__})")
     if p.returncode != 0:
@@ -403,7 +451,7 @@ def _patch_id(diff, cwd):
     if not diff.strip():
         raise _Unreadable("a PR diff is empty")
     try:
-        p = subprocess.run(["git", "patch-id", "--verbatim"], input=diff, cwd=_probe_cwd(cwd),
+        p = _run_probe(["git", "patch-id", "--verbatim"], input=diff, cwd=_probe_cwd(cwd),
                            capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.SubprocessError) as e:
         raise _Unreadable(f"`git patch-id` could not run ({type(e).__name__})")
@@ -485,7 +533,7 @@ def _merge_file(ours, base, theirs, cwd):
             Path(tmp, name).write_bytes(data)
             names.append(str(Path(tmp, name)))
         try:
-            p = subprocess.run(["git", "merge-file", "-p", "-q", *names], cwd=tmp, env=env,
+            p = _run_probe(["git", "merge-file", "-p", "-q", *names], cwd=tmp, env=env,
                                capture_output=True, timeout=15)
         except (OSError, subprocess.SubprocessError) as e:
             raise _Unreadable(f"`git merge-file` could not run ({type(e).__name__})")
@@ -553,7 +601,7 @@ def _git_merge_tree_refusal(merge, ours, theirs, repo, cwd, env):
             def git(*args):
                 nonlocal step
                 step = args[0]
-                p = subprocess.run(["git", "-c", "core.hooksPath=" + os.devnull,
+                p = _run_probe(["git", "-c", "core.hooksPath=" + os.devnull,
                                     "-c", "credential.helper=!gh auth git-credential", *args],
                                    cwd=tmp, env=run_env, capture_output=True, text=True, timeout=30)
                 if p.returncode != 0:
@@ -797,7 +845,7 @@ def _base_drift_refusal(number, repo, data, cwd, env):
     probe_env = dict(env)
     probe_env["GH_PROMPT_DISABLED"] = "1"
     try:
-        p = subprocess.run(["gh", "api", f"repos/{repo}/compare/{base}...state"],
+        p = _run_probe(["gh", "api", f"repos/{repo}/compare/{base}...state"],
                            cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True, timeout=15)
         if p.returncode != 0:
             return closed(f"the compare {base[:10]}...state failed (exit {p.returncode})")
@@ -872,7 +920,7 @@ def _attribute_hits(repo, names, window, subject, cwd, env):
     out = []
     for name in names:
         try:
-            p = subprocess.run(["gh", "api", f"repos/{repo}/commits?sha=state&path={quote(name, safe='/')}&per_page=5"],
+            p = _run_probe(["gh", "api", f"repos/{repo}/commits?sha=state&path={quote(name, safe='/')}&per_page=5"],
                                cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True, timeout=8)
             listed = json.loads(p.stdout) if p.returncode == 0 else None
         except (OSError, ValueError, subprocess.SubprocessError):
@@ -916,7 +964,7 @@ def _gh_call(args, cwd, env, payload=None, timeout=10):
     probe_env["GH_PROMPT_DISABLED"] = "1"
     argv = ["gh", "api", *args, *(["--input", "-"] if payload is not None else [])]
     try:
-        p = subprocess.run(argv, cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True,
+        p = _run_probe(argv, cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True,
                            timeout=timeout, input=json.dumps(payload) if payload is not None else None)
     except (OSError, subprocess.SubprocessError):
         return -1, None
@@ -1124,7 +1172,7 @@ def _state_merge(words, repo, cwd, env):
                 "only through `hermes-core-wt ship <slug>`.")
 
     try:
-        p = subprocess.run(["gh", "pr", "view", number, "--repo", repo, "--json", fields],
+        p = _run_probe(["gh", "pr", "view", number, "--repo", repo, "--json", fields],
                            cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.SubprocessError) as e:
         return failed(f"`gh pr view {number} --repo {repo}` could not run ({type(e).__name__}: {str(e)[:120]})")
@@ -1236,7 +1284,7 @@ def _upstream_sync_merge(words, repo, cwd, env):
     probe_env = dict(env)
     probe_env["GH_PROMPT_DISABLED"] = "1"
     try:
-        p = subprocess.run(["gh", "pr", "view", args[0], "--repo", repo, "--json", fields],
+        p = _run_probe(["gh", "pr", "view", args[0], "--repo", repo, "--json", fields],
                            cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True, timeout=15)
         if p.returncode != 0:
             return False
@@ -1541,7 +1589,7 @@ def main(argv=None):
     if not argv or argv[0] != "--gh-args":
         print("usage: guard.py --gh-args <gh arguments...>", file=sys.stderr)
         return 2
-    why = check_argv(["gh", *argv[1:]])
+    why = bounded_preflight(check_argv, ["gh", *argv[1:]])
     if why:
         print(why, file=sys.stderr)
         return 1
