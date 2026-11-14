@@ -6,7 +6,8 @@ doesn't have. Use a throwaway localhost-only, no-password VNC: SSH is the only w
 1. Hub (terminal):
    - `x11vnc -display :99 -localhost -rfbport 5901 -nopw -shared -forever -timeout 1800 -bg -o $TMPDIR/x11vnc-5901.log`
    - background: `timeout 2400 websockify --web /usr/share/novnc 127.0.0.1:6082 127.0.0.1:5901`
-   - check `ss -ltn | grep -E ':5901|:6082'`.
+   - check `ss -ltn | grep -E ':5901|:6082'`. Start x11vnc unconditionally and judge by `ss`: a
+     `pgrep -f 'rfbport 5901' || x11vnc ...` guard matches its own shell's command line, so it never starts.
 2. User's Mac (`run_in_user_terminal`, reason = what they will sign in to):
    `(nc -z localhost 6082 2>/dev/null || ssh -o ExitOnForwardFailure=yes -f -N -L 6082:127.0.0.1:6082 ubuntu@<hub tailnet DNS name>) && open "http://localhost:6082/vnc.html?autoconnect=1&resize=scale"`
    The `nc -z` guard makes the same command reopen the view ("show again") without a second tunnel.
