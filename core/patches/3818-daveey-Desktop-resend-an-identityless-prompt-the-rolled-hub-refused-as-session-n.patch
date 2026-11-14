@@ -1,0 +1,397 @@
+From 01f81f3ab9a0a85724a018ffc83a5d13069e855c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:25:21 -0800
+Subject: [PATCH] [daveey] Desktop: resend an identityless prompt the rolled
+ hub refused as "session not found"
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+After a hub backend roll the first send in a hub chat failed with "Legacy submission
+acknowledgement is unknown; automatic retry is unsafe" and the typed text was not sent
+(David, 2026-11-13 12:05:43 and 12:06:37 PT; hub agent.log 20:05:40/20:06:36 UTC
+`session-scoped RPC rejected: method=prompt.submit ... not in memory`, one prompt.submit each).
+
+Problem: a send right after an instant core update rolled the hub's Desktop backend was dropped.
+Why 1: the submit callback was re-entered by withSessionNotFoundResume with
+  prepared.legacyAttempted already true, which throws by design (submit.ts:1203; bundle
+  main-DqpORIB6.js:181 matches main).
+Why 2: the first send was identityless and met the rolled backend's 4001 "session not found"
+  (tui_gateway/session_registry.py `_sess_nowait`); isDefiniteSubmitRefusal reset
+  legacyAttempted only for 4009, 4090 (not UNCONFIRMED) and 4094/4000+submission_id.
+Why 3 (why identityless at all): the hub chat runs on the `hermes serve` sidecar, whose
+  prompt.submit contract (tui_gateway/contracts/prompt_voice.py PromptSubmitParams) has no
+  submission_id; rpc_dispatch.validate_params answers 4000 "submission_id: Extra inputs are not
+  permitted" before any handler (reproduced), and Desktop remembers that per scope for 10 min
+  (submission-identity-support.ts). So every hub-sidecar send is identityless by design.
+Why 4: is 4001 a definite "nothing admitted"? Yes: prompt.submit looks the runtime up via
+  `_sess_nowait` before the turn claim, user-row write, busy queue and owner forward; only
+  note_submit (a human-input timestamp) and the typed voice-stop check run first, and the
+  owner-forward path maps owner failures to 4090, never 4001. dispatch validates params and
+  calls the handler, nothing else.
+Root (happened): the definite-refusal list is hand-enumerated per incident; the sidecar's
+  stale-runtime refusal — the one a backend roll guarantees — was never classified, so the
+  recovery the 4001 asks for (resume + resend) always hit the duplicate-turn fence.
+Root (not caught): no test drove an identityless send through withSessionNotFoundResume. The
+  sleep/wake tests use identified sends; the legacy-identity tests cover 4090/4009 but not
+  4001; nothing pinned the sidecar's 4001 frame as pre-admission.
+Recurrence: the same class as ef7a9e6b2d (4090 refusal treated as unconfirmed, Nov 12);
+  present since 41b017f1e3 (Sep 8) fenced legacy retries, made frequent by the hub's instant
+  core updates (179 on 2026-11-13).
+
+Fix: isStaleRuntimeRefusal — a JsonRpcGatewayError code 4001 whose message is exactly
+"session not found" and that carries no reason — is a definite refusal, so legacyAttempted is
+reset and the resume's resend goes out once. A codeless error, a 4001 with a canonical reason,
+prose that only mentions the phrase, and timeouts/disconnects stay ambiguous (fence unchanged).
+
+Tests:
+- submit-backend-roll.test.tsx: identityless (remembered refusal and fresh client) and
+  identified sends after a roll each land ONE turn with no visible failure (3 RED before the
+  fix, GREEN after); four ambiguous shapes still refuse the automatic resend; an explicit retry
+  after a 4001 whose resume failed resends once.
+- tests/tui_gateway/test_prompt_submit_stale_runtime.py: the sidecar answers a stale runtime
+  with the bare {4001, "session not found"} and writes nothing; the contract refuses
+  submission_id with 4000 before any handler.
+
+Deferred: identity (dedupe) for sidecar prompt.submit is a separate design (needs durable
+dedupe across rolls); this change makes the identityless path safe to retry.
+---
+ .../submit-backend-roll.test.tsx              | 241 ++++++++++++++++++
+ .../hooks/use-prompt-actions/submit.ts        |  21 +-
+ .../test_prompt_submit_stale_runtime.py       |  39 +++
+ 3 files changed, 299 insertions(+), 2 deletions(-)
+ create mode 100644 apps/desktop/src/app/session/hooks/use-prompt-actions/submit-backend-roll.test.tsx
+ create mode 100644 tests/tui_gateway/test_prompt_submit_stale_runtime.py
+
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-backend-roll.test.tsx b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-backend-roll.test.tsx
+new file mode 100644
+index 0000000000..6ff11b46f6
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-backend-roll.test.tsx
+@@ -0,0 +1,241 @@
++import { JsonRpcGatewayError } from '@hermes/shared'
++import { cleanup } from '@testing-library/react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { getLatestSessionMessages } from '@/hermes'
++import { en } from '@/i18n/en'
++import { $notifications, clearNotifications } from '@/store/notifications'
++
++import { actRender, Harness, type HarnessHandle, RUNTIME_SESSION_ID } from './index-test-utils'
++import { clearStoredJournal } from './prepared-submissions-test-utils'
++import { clearSingleFlightSessionResumeState } from './single-flight-resume'
++import { resetSubmissionIdSupportForTests } from './submission-identity-support'
++
++vi.mock('@/hermes', () => ({
++  getApiRequestConnection: () => null,
++  getApiRequestProfile: () => null,
++  getLatestSessionMessages: vi.fn(async () => ({ messages: [], session_id: 'session' })),
++  getProfiles: vi.fn(async () => ({ profiles: [] })),
++  getSession: vi.fn(),
++  PROMPT_SUBMIT_REQUEST_TIMEOUT_MS: 1_800_000,
++  setApiRequestProfile: vi.fn(),
++  transcribeAudio: vi.fn()
++}))
++
++vi.mock('@/store/gateway', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  requestGatewayForAgent: vi.fn()
++}))
++
++const STORED_SESSION_ID = '20261113_195531_88da30'
++const ROLLED_RUNTIME_ID = 'rt-after-roll'
++
++// tui_gateway/session_registry.py `_sess_nowait`: the frame a rolled backend answers for the
++// runtime id it no longer holds, before prompt.submit claims or writes anything.
++const staleRuntime = () => new JsonRpcGatewayError('session not found', { code: 4001 })
++
++// tui_gateway/rpc_dispatch.py: `hermes serve`'s strict contract refuses the unknown key.
++const identityRefused = () =>
++  Object.assign(
++    new Error(
++      'invalid params for prompt.submit: submission_id: Extra inputs are not permitted — the client and the ' +
++        'Hermes backend are out of sync (different versions); run `hermes update` and restart both'
++    ),
++    { code: 4000 }
++  )
++
++type Submit = Record<string, unknown>
++
++/** A hub backend that rolled: its old runtime id is gone until `session.resume` mints a new one.
++ *  `identity` says whether prompt.submit accepts `submission_id` (canonical) or refuses it (sidecar).
++ *  `admitted` records every submit the backend actually admitted as a turn. */
++function rolledBackend(identity: 'accepted' | 'refused', staleError: () => Error = staleRuntime) {
++  const submits: Submit[] = []
++  const admitted: Submit[] = []
++  const resumes: Submit[] = []
++  let live = RUNTIME_SESSION_ID
++
++  const requestGateway = vi.fn(async (method: string, params?: Submit) => {
++    if (method === 'session.resume') {
++      resumes.push(params!)
++      live = ROLLED_RUNTIME_ID
++
++      return { session_id: ROLLED_RUNTIME_ID } as never
++    }
++
++    if (method !== 'prompt.submit') {
++      return {} as never
++    }
++
++    submits.push(params!)
++
++    if (identity === 'refused' && 'submission_id' in params!) {
++      throw identityRefused()
++    }
++
++    if (params!.session_id !== live) {
++      throw staleError()
++    }
++
++    admitted.push(params!)
++
++    return (
++      identity === 'accepted'
++        ? { admission_id: `adm-${admitted.length}`, status: 'started', submission_id: params!.submission_id }
++        : { status: 'streaming' }
++    ) as never
++  })
++
++  // The roll drops every in-memory runtime; only a resume mints a live one again.
++  return { admitted, requestGateway, resumes, roll: () => (live = ''), submits }
++}
++
++async function render(requestGateway: ReturnType<typeof rolledBackend>['requestGateway']): Promise<HarnessHandle> {
++  let handle: HarnessHandle | null = null
++  await actRender(
++    <Harness
++      onReady={h => (handle = h)}
++      rawAdmissionReceipts
++      refreshSessions={async () => undefined}
++      requestGateway={requestGateway}
++      storedSessionId={STORED_SESSION_ID}
++    />
++  )
++
++  return handle!
++}
++
++function visibleFailures(handle: HarnessHandle): string[] {
++  return [
++    ...handle.state().messages.flatMap(m => (m.error ? [String(m.error)] : [])),
++    ...$notifications.get().map(n => n.message)
++  ]
++}
++
++beforeEach(() => {
++  clearSingleFlightSessionResumeState()
++  clearStoredJournal()
++  clearNotifications()
++  resetSubmissionIdSupportForTests()
++  vi.mocked(getLatestSessionMessages).mockImplementation(async () => ({ messages: [], session_id: 'session' }))
++})
++
++afterEach(() => {
++  cleanup()
++  vi.restoreAllMocks()
++  resetSubmissionIdSupportForTests()
++})
++
++describe('a send that meets "session not found" after a hub backend roll', () => {
++  // Incident 2026-11-13 12:05:43 / 12:06:37 PT: the hub's sidecar refuses submission_id, so Desktop
++  // remembered the refusal and sent identityless; the rolled backend answered 4001 for the old runtime,
++  // the resume re-entered the submit, and the re-entry threw "Legacy submission acknowledgement is
++  // unknown" — the typed message was never sent.
++  it('identityless (sidecar refused submission_id earlier): resumes and lands ONE turn, no failure shown', async () => {
++    const backend = rolledBackend('refused')
++    const handle = await render(backend.requestGateway)
++
++    // Before the roll: the first send teaches Desktop that this backend refuses submission_id.
++    expect(await handle.submitText('before the roll')).toBe(true)
++    expect(backend.admitted).toHaveLength(1)
++
++    backend.roll()
++    clearNotifications()
++    const sentBefore = backend.submits.length
++
++    expect(await handle.submitText('typed right after the roll')).toBe(true)
++
++    const afterRoll = backend.submits.slice(sentBefore)
++    // One identityless send to the dead runtime, one to the resumed runtime; nothing identified.
++    expect(afterRoll.map(s => [s.session_id, 'submission_id' in s])).toEqual([
++      [RUNTIME_SESSION_ID, false],
++      [ROLLED_RUNTIME_ID, false]
++    ])
++    expect(backend.resumes).toHaveLength(1)
++    expect(backend.admitted.filter(s => s.text === 'typed right after the roll')).toHaveLength(1)
++    expect(visibleFailures(handle)).toEqual([])
++  })
++
++  it('identityless on a fresh client (refusal not yet remembered): still ONE turn after the resume', async () => {
++    const backend = rolledBackend('refused')
++    backend.roll()
++    const handle = await render(backend.requestGateway)
++
++    expect(await handle.submitText('first send after the roll')).toBe(true)
++    expect(backend.admitted).toEqual([
++      expect.objectContaining({ session_id: ROLLED_RUNTIME_ID, text: 'first send after the roll' })
++    ])
++    expect(backend.admitted[0]).not.toHaveProperty('submission_id')
++    expect(visibleFailures(handle)).toEqual([])
++  })
++
++  it('identified (backend accepts submission_id): resumes and resends the SAME identity, ONE turn', async () => {
++    const backend = rolledBackend('accepted')
++    backend.roll()
++    const handle = await render(backend.requestGateway)
++
++    expect(await handle.submitText('identified after the roll', { submission_id: 'sub-roll-1' })).toBe(true)
++    expect(backend.submits.map(s => [s.session_id, s.submission_id])).toEqual([
++      [RUNTIME_SESSION_ID, 'sub-roll-1'],
++      [ROLLED_RUNTIME_ID, 'sub-roll-1']
++    ])
++    expect(backend.admitted).toHaveLength(1)
++    expect(visibleFailures(handle)).toEqual([])
++  })
++})
++
++describe('duplicate-turn protection for an identityless send is unchanged', () => {
++  // Only the bare legacy 4001 frame is an answer. Anything else that merely reads "session not found"
++  // (a codeless error from a wrapped rethrow, a canonical refusal with a reason) or a timeout says
++  // nothing about whether the send ran, so the retry stays refused.
++  it.each([
++    ['a codeless "session not found"', () => new Error('session not found')],
++    [
++      'a 4001 carrying a canonical reason',
++      () => new JsonRpcGatewayError('session not found', { code: 4001, data: { reason: 'permission_denied' } })
++    ],
++    [
++      'a 4001 whose prose only mentions it',
++      () => new JsonRpcGatewayError('tool failed: session not found in cache', { code: 4001 })
++    ],
++    ['a timeout', () => new Error('request timed out after 1800s: prompt.submit')]
++  ])('%s keeps the identityless send unconfirmed: no automatic resend', async (_label, staleError) => {
++    const backend = rolledBackend('refused', staleError)
++    const handle = await render(backend.requestGateway)
++    expect(await handle.submitText('before the roll')).toBe(true)
++
++    backend.roll()
++    const sentBefore = backend.submits.length
++    expect(await handle.submitText('ambiguous after the roll')).toBe(false)
++
++    const afterRoll = backend.submits.slice(sentBefore)
++    expect(afterRoll).toHaveLength(1)
++    expect(backend.admitted.filter(s => s.text === 'ambiguous after the roll')).toHaveLength(0)
++    expect(visibleFailures(handle).join('\n')).toContain('acknowledgement is unknown')
++  })
++
++  it('an explicit retry after a stale-runtime refusal resends it once (nothing was admitted)', async () => {
++    const backend = rolledBackend('refused')
++    const handle = await render(backend.requestGateway)
++    expect(await handle.submitText('before the roll')).toBe(true)
++    backend.roll()
++
++    // The resume itself fails once, so the first attempt surfaces the original 4001 refusal.
++    const original = backend.requestGateway.getMockImplementation()!
++    let failResume = true
++    backend.requestGateway.mockImplementation(async (method: string, params?: Submit) => {
++      if (method === 'session.resume' && failResume) {
++        failResume = false
++        throw new Error('backend restarting')
++      }
++
++      return original(method, params)
++    })
++
++    expect(await handle.submitText('retry me', { submission_id: 'roll-retry' })).toBe(false)
++    clearNotifications()
++    expect(await handle.submitText('retry me', { submission_id: 'roll-retry' })).toBe(true)
++    expect(backend.admitted.filter(s => s.text === 'retry me')).toHaveLength(1)
++    expect($notifications.get().map(n => n.message)).not.toContain(en.promptNotices.legacySendUnconfirmed)
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
+index 4ec33edfc0..119fa6754a 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
+@@ -224,13 +224,30 @@ function isPreAdmissionRefusal(error: unknown): boolean {
+   return code === 4094 || (code === 4000 && typeof message === 'string' && /submission_id/.test(message))
+ }
+ 
++/** The legacy sidecar's stale-runtime refusal: `prompt.submit` looked its runtime id up
++ *  (tui_gateway/session_registry.py `_sess_nowait`) and answered 4001 "session not found" before
++ *  claiming, queueing or writing anything. A backend roll drops every runtime, so the first send
++ *  after it meets exactly this; the resume that follows must be free to resend. Only the bare
++ *  legacy frame matches: a codeless error, a canonical refusal carrying a reason, or prose that
++ *  merely mentions the phrase stays ambiguous. */
++function isStaleRuntimeRefusal(error: unknown): boolean {
++  if (!(error instanceof JsonRpcGatewayError) || error.code !== 4001) {
++    return false
++  }
++
++  const reason = (error.data as { reason?: unknown } | undefined)?.reason
++
++  return reason === undefined && /^session not found$/i.test(error.message.trim())
++}
++
+ /** The server answered that it admitted nothing: session busy (4009), an ownership refusal (4090)
+  *  other than an unconfirmed owner hand-off (SESSION_OWNER_UNCONFIRMED: the owner may already hold
+- *  the send), or a pre-admission capability refusal. Resending it cannot run a second copy.
++ *  the send), a stale runtime id (4001, see isStaleRuntimeRefusal), or a pre-admission capability
++ *  refusal. Resending it cannot run a second copy.
+  *  Timeouts, disconnects and malformed ACKs are not answers and never match. */
+ function isDefiniteSubmitRefusal(error: unknown): boolean {
+   if (error instanceof JsonRpcGatewayError) {
+-    if (error.code === 4009) {
++    if (error.code === 4009 || isStaleRuntimeRefusal(error)) {
+       return true
+     }
+ 
+diff --git a/tests/tui_gateway/test_prompt_submit_stale_runtime.py b/tests/tui_gateway/test_prompt_submit_stale_runtime.py
+new file mode 100644
+index 0000000000..511e9d72c1
+--- /dev/null
++++ b/tests/tui_gateway/test_prompt_submit_stale_runtime.py
+@@ -0,0 +1,39 @@
++"""The sidecar's ``prompt.submit`` answers for a runtime id a backend roll dropped: the contract Desktop's
++retry depends on (apps/desktop .../use-prompt-actions/submit.ts ``isStaleRuntimeRefusal``).
++
++The hub's Desktop backend (``hermes serve``) rolls on every instant core update and forgets every
++in-memory runtime. The first send after a roll names the old runtime id. Desktop sends it without
++``submission_id`` (this contract refuses that key, below), so it can resend only if the refusal is a
++definite "nothing was admitted". It is: the stale id is looked up before the turn claim, the user-row
++write and the busy queue. These tests pin that the refusal is the bare legacy frame (code 4001, message
++``session not found``, no ``data``) and that nothing was written for it.
++"""
++
++from tui_gateway import server
++
++
++def test_stale_runtime_submit_is_a_bare_4001_before_anything_is_admitted(monkeypatch):
++    db_calls = []
++    monkeypatch.setattr(server, "_get_db", lambda: db_calls.append("db") or None)
++    before = dict(server._sessions)
++
++    resp = server.handle_request({"id": "r1", "method": "prompt.submit",
++                                  "params": {"session_id": "rolled-away", "text": "typed after the roll"}})
++
++    assert resp["error"] == {"code": 4001, "message": "session not found"}
++    assert server._sessions == before
++    assert db_calls == []
++
++
++def test_the_sidecar_contract_refuses_submission_id_before_any_handler_runs(monkeypatch):
++    """Why the hub's sends are identityless: ``PromptSubmitParams`` has no ``submission_id``."""
++    ran = []
++    monkeypatch.setitem(server._methods, "prompt.submit",
++                        lambda rid, params: ran.append(params) or {"jsonrpc": "2.0", "id": rid, "result": {}})
++
++    resp = server.handle_request({"id": "r2", "method": "prompt.submit",
++                                  "params": {"session_id": "any", "text": "hi", "submission_id": "sub-1"}})
++
++    assert resp["error"]["code"] == 4000
++    assert "submission_id" in resp["error"]["message"]
++    assert ran == []
+-- 
+2.43.0
+

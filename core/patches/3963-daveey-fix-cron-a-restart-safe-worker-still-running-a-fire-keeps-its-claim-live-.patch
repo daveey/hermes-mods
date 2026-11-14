@@ -1,0 +1,133 @@
+From d54e234665bdc83ccb8648840bf82444fea86dd7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:14:55 +0000
+Subject: [PATCH] [daveey] fix(cron): a restart-safe worker still running a
+ fire keeps its claim live after the claiming gateway exits
+
+The fire claim's `by` names the gateway that claimed it. A restart-safe
+external worker outlives that gateway, so after every gateway restart
+_claim_owner_is_dead saw a dead pid, the next gateway's tick re-claimed the
+job and the live worker was interrupted ("fire claim ownership lost").
+On the hub, with core-update restarts every 5-6 min, every self-heal lane
+pass (several minutes) was cut since 19:08Z on 11-13 and no fix card was
+filed (card t_01a1d6e6b6d6a80d).
+
+The claim heartbeat now stamps `runner` (the process refreshing it); the
+claim counts as dead only when both `by` and `runner` are provably dead.
+---
+ cron/jobs.py                          |  7 +++++-
+ cron/scheduler_ownership.py           | 24 +++++++++++++-----
+ tests/cron/test_claim_job_for_fire.py | 36 +++++++++++++++++++++++++++
+ 3 files changed, 60 insertions(+), 7 deletions(-)
+
+diff --git a/cron/jobs.py b/cron/jobs.py
+index 06c135fbc3..d51c61ef11 100644
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -2729,10 +2729,15 @@ def claim_dispatch(job_id: str) -> bool:
+ 
+ 
+ def _refresh_claim(jobs: list[dict[str, Any]], claim: Any, expected_owner: str) -> bool:
+-    """Compare-and-refresh a claim's ``at`` stamp; False unless *expected_owner* still holds it."""
++    """Compare-and-refresh a claim's ``at`` stamp; False unless *expected_owner* still holds it.
++
++    Also stamps ``runner``, the process refreshing it: a restart-safe external worker runs the fire
++    under its claiming gateway's ``by`` and outlives that gateway, so liveness must see the runner
++    too (``_claim_owner_is_dead``) or the next gateway's tick re-fires the job over the live run."""
+     if not isinstance(claim, dict) or claim.get("by") != expected_owner:
+         return False
+     claim["at"] = _hermes_now().isoformat()
++    claim["runner"] = _machine_id()
+     save_jobs(jobs)
+     return True
+ 
+diff --git a/cron/scheduler_ownership.py b/cron/scheduler_ownership.py
+index 2c0c05a234..82118a233d 100644
+--- a/cron/scheduler_ownership.py
++++ b/cron/scheduler_ownership.py
+@@ -148,11 +148,10 @@ def live_gateway_ticking(home: Optional[Path | str] = None) -> Optional[dict]:
+     return record if record_serves_profile(record, home) else None
+ 
+ 
+-def _claim_owner_is_dead(claim: dict[str, Any]) -> bool:
+-    """True when the claim's ``by`` names a process on THIS host that provably no longer exists.
+-    ``_machine_id()`` stamps ``host:pid[:token]``; a foreign host, an explicit HERMES_MACHINE_ID,
+-    or any liveness-probe failure returns False (fail safe: only a proven death shortens the TTL)."""
+-    parts = str(claim.get("by") or "").split(":")
++def _process_is_dead(ident: Any) -> bool:
++    """True when *ident* (``host:pid[:token]``) names a process on THIS host that provably no longer
++    exists; a foreign host, an explicit HERMES_MACHINE_ID or any probe failure returns False."""
++    parts = str(ident or "").split(":")
+     if len(parts) < 2 or not parts[1].isdigit():
+         return False
+     try:
+@@ -161,5 +160,18 @@ def _claim_owner_is_dead(claim: dict[str, Any]) -> bool:
+             return False
+         from gateway.status import _pid_exists
+         return not _pid_exists(int(parts[1]))
+-    except Exception:
++    except (ImportError, OSError, ValueError, OverflowError):
++        return False
++
++
++def _claim_owner_is_dead(claim: dict[str, Any]) -> bool:
++    """True when the claim's ``by`` names a process on THIS host that provably no longer exists,
++    and so does its ``runner`` when one is stamped. ``_machine_id()`` stamps ``host:pid[:token]``; a
++    foreign host, an explicit HERMES_MACHINE_ID, or any liveness-probe failure returns False (fail
++    safe: only a proven death shortens the TTL). ``runner`` is the process heartbeating the claim
++    (``cron.jobs._refresh_claim``): a restart-safe external worker still running the fire after its
++    claiming gateway exited keeps the claim live, so the next gateway's tick cannot re-fire over it."""
++    if not _process_is_dead(claim.get("by")):
+         return False
++    runner = claim.get("runner")
++    return runner is None or _process_is_dead(runner)
+diff --git a/tests/cron/test_claim_job_for_fire.py b/tests/cron/test_claim_job_for_fire.py
+index 4d4a674f4a..e9c1c422fd 100644
+--- a/tests/cron/test_claim_job_for_fire.py
++++ b/tests/cron/test_claim_job_for_fire.py
+@@ -401,6 +401,42 @@ def test_fresh_claim_from_a_dead_same_host_owner_is_reclaimable(temp_home):
+     assert claim_job_for_fire(jid) is True
+ 
+ 
++def test_claim_held_by_a_live_restart_safe_worker_survives_its_gateways_exit(temp_home):
++    """A restart-safe external worker keeps running a fire after the gateway that claimed it
++    exits; the claim's ``by`` still names that gateway's pid. The worker's heartbeat stamps the
++    process actually running the fire, so the next gateway's tick must not reclaim the job while
++    that runner lives (hub self-heal lane, 11-13: every lane pass longer than the 5-6 min between
++    core-update restarts was re-fired and interrupted with "fire claim ownership lost")."""
++    import socket
++    import subprocess
++    import sys
++
++    from cron.jobs import claim_job_for_fire, create_job, heartbeat_fire_claim, load_jobs, save_jobs
++
++    jid = create_job(prompt="x", schedule="every 5m", name="w")["id"]
++    assert claim_job_for_fire(jid) is True
++
++    gateway = subprocess.Popen([sys.executable, "-c", "pass"])
++    gateway.wait()
++    owner = f"{socket.gethostname()}:{gateway.pid}:tok"
++    jobs = load_jobs()
++    next(j for j in jobs if j["id"] == jid)["fire_claim"]["by"] = owner
++    save_jobs(jobs)
++
++    # This process plays the external worker: its heartbeat names it as the runner.
++    assert heartbeat_fire_claim(jid, expected_owner=owner) is True
++    assert claim_job_for_fire(jid) is False
++
++    # Runner gone too → provably dead, reclaimable at once.
++    worker = subprocess.Popen([sys.executable, "-c", "pass"])
++    worker.wait()
++    jobs = load_jobs()
++    claim = next(j for j in jobs if j["id"] == jid)["fire_claim"]
++    claim["runner"] = f"{socket.gethostname()}:{worker.pid}"
++    save_jobs(jobs)
++    assert claim_job_for_fire(jid) is True
++
++
+ def test_heartbeat_does_not_wait_on_the_fence_its_own_run_holds(temp_home, monkeypatch):
+     """The run thread holds the per-job fire fence across delivery; the heartbeat thread must
+     refresh the claim without taking it, or every long run reads as a false ownership loss."""
+-- 
+2.43.0
+

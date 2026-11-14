@@ -1,0 +1,479 @@
+From b06992603056065fcd87f8fe55a654391f7a647c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 00:15:58 +0000
+Subject: [PATCH] [daveey] test(kanban): exercise creator cleanup authorization
+ and races
+
+---
+ hermes_cli/kanban_operator_call.py            |   2 +-
+ hermes_cli/kanban_owner_archive_relay.py      |   3 +-
+ ...test_kanban_creator_archive_adversarial.py | 352 ++++++++++++++++++
+ .../test_kanban_creator_archive_boundary.py   |  70 ++++
+ 4 files changed, 425 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_creator_archive_adversarial.py
+ create mode 100644 tests/hermes_cli/test_kanban_creator_archive_boundary.py
+
+diff --git a/hermes_cli/kanban_operator_call.py b/hermes_cli/kanban_operator_call.py
+index e98610df41..50c98ff8cb 100644
+--- a/hermes_cli/kanban_operator_call.py
++++ b/hermes_cli/kanban_operator_call.py
+@@ -13,7 +13,7 @@ on a card another gateway created refuse ``foreign_card``. This module is the su
+    ordinary functions on its live file and appends ``operator_call_result`` on the target card.
+ 3. Request side again (:func:`poll`): finds that result in the replica, finishes the request and wakes the caller.
+ 
+-Only comment, move and unblock of a card exist, plus ``label_publish`` of a machine (``kanban_operator_labels``: the
++Card actions are comment, move, unblock and creator_archive (exact creator scope), plus ``label_publish`` (the
+ hub executes it with its Board admin key, after re-running its own probe of that machine, and answers on the
+ requester's card). complete / archive / link / unlink / block / edit of a foreign card stay with its owner and are
+ refused; so is any second op or a card the op does not name. No Board admin key is read here.
+diff --git a/hermes_cli/kanban_owner_archive_relay.py b/hermes_cli/kanban_owner_archive_relay.py
+index 313a4b2a7f..117f706550 100644
+--- a/hermes_cli/kanban_owner_archive_relay.py
++++ b/hermes_cli/kanban_owner_archive_relay.py
+@@ -213,7 +213,8 @@ def worker_archive(conn: sqlite3.Connection, tid: str, *,
+     A ``relay=home`` owner card this board lacks is forwarded home (:func:`forward`). Any other card gets the local
+     scope rule, then :func:`hermes_cli.kanban_remote_stop.archive`: a card another machine runs under its live
+     Board lease gets a stop request, since the Board would reject the status write (live_claim). A card this
+-    gateway has only as a replica copy raises :class:`hermes_cli.kanban_foreign_card.ForeignCardError`.
++    gateway has only as a replica copy is forwarded by the authenticated creator_archive courier only for
++    its exact creator task; unscoped callers still raise ForeignCardError.
+     """
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban import worker_archive_scope
+diff --git a/tests/hermes_cli/test_kanban_creator_archive_adversarial.py b/tests/hermes_cli/test_kanban_creator_archive_adversarial.py
+new file mode 100644
+index 0000000000..0554d95006
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_creator_archive_adversarial.py
+@@ -0,0 +1,352 @@
++"""Adversarial and race coverage for creator archive and triage scratch cleanup.
++
++Every test asserts persisted board state (task status, events, comments, request rows), not a mocked verdict.
++Race tests wrap a real check so a concurrent writer lands between eligibility and the archive transaction.
++"""
++import json
++from contextlib import contextmanager
++
++import pytest
++
++from hermes_cli import kanban_creator_archive as kca
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_foreign_card as kfc
++from hermes_cli import kanban_owner_archive_relay as relay
++from hermes_cli import kanban_supervisor_requests as ksr
++from hermes_cli import kanban_triage_cleanup as ktc
++from tests.hermes_cli import test_kanban_operator_call as helpers
++
++fleet = helpers.fleet
++
++
++def child(f):
++    tid = f.card(f.h, "creator's scratch fixture", creator_task_id=f.caller, workspace_kind="scratch")
++    f.board()
++    return tid
++
++
++def submit(f, tid, monkeypatch, run_id_fn=None):
++    @contextmanager
++    def replica(_path):
++        yield f.rep
++
++    monkeypatch.setattr(kfc, "open_replica", replica)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", f.caller)
++    try:
++        return relay.worker_archive(f.w, tid, run_id_fn=run_id_fn or (lambda _: f.run_id))
++    finally:
++        monkeypatch.delenv("HERMES_KANBAN_TASK")
++
++
++def archived_events(conn, tid):
++    return conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='archived'", (tid,)).fetchone()[0]
++
++
++def set_creator(conn, tid, creator):
++    row = conn.execute("SELECT id, payload FROM task_events WHERE task_id=? AND kind='created' ORDER BY id LIMIT 1",
++                       (tid,)).fetchone()
++    payload = json.loads(row["payload"])
++    payload["creator_task_id"] = creator
++    with kb.write_txn(conn):
++        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row["id"]))
++
++
++def request_status(f, out):
++    return ksr.get_request(f.w, out["request_id"])["status"]
++
++
++# ---------------------------------------------------------------- creator archive
++
++def test_home_creator_change_after_submit_rejects(fleet, monkeypatch):
++    f = fleet
++    tid = child(f)
++    refusal, out = submit(f, tid, monkeypatch)
++    assert refusal is None
++    ksr.drain(f.w)
++    f.board()
++    other = f.card(f.h, "someone else")
++    set_creator(f.h, tid, other)  # home's authoritative creator differs from the replica the caller saw
++    ksr.drain(f.h)
++    f.board()
++    ksr.drain(f.w)
++    assert kb.get_task(f.h, tid).status != "archived"
++    assert archived_events(f.h, tid) == 0
++    assert request_status(f, out) == "rejected"
++
++
++def test_home_creator_removed_after_submit_rejects(fleet, monkeypatch):
++    f = fleet
++    tid = child(f)
++    _, out = submit(f, tid, monkeypatch)
++    ksr.drain(f.w)
++    f.board()
++    set_creator(f.h, tid, None)
++    ksr.drain(f.h)
++    f.board()
++    ksr.drain(f.w)
++    assert kb.get_task(f.h, tid).status != "archived"
++    assert request_status(f, out) == "rejected"
++
++
++def test_claim_between_precheck_and_transaction_blocks_archive(fleet, monkeypatch):
++    """Claim lands after apply's pre-check passes; the in-transaction precondition must still refuse."""
++    f = fleet
++    tid = child(f)
++    real, calls = kca.refusal, []
++
++    def racing(conn, target, requester):
++        out = real(conn, target, requester)
++        calls.append(out)
++        if len(calls) == 1:
++            assert out is None  # pre-check saw an archivable card
++            assert kb.claim_task(f.h, tid)  # concurrent dispatcher claims before the txn opens
++        return out
++
++    monkeypatch.setattr(kca, "refusal", racing)
++    verdict, _why = kca.apply(f.h, {"target_task_id": tid, "request_uid": "uid-race",
++                                   "caller": {"task_id": f.caller}}, {"operator_request_uid": "uid-race"})
++    assert (verdict, calls[0]) == ("refused", None) and calls[1:], calls
++    assert calls[1] is not None  # the in-transaction check, not the pre-check, caught it
++    assert kb.get_task(f.h, tid).status == "running"
++    assert archived_events(f.h, tid) == 0
++
++
++def test_replay_is_idempotent(fleet, monkeypatch):
++    f = fleet
++    tid = child(f)
++    refusal, out = submit(f, tid, monkeypatch)
++    assert refusal is None
++    helpers._round(f)
++    assert kb.get_task(f.h, tid).status == "archived"
++    assert archived_events(f.h, tid) == 1
++    uid = f.h.execute("SELECT json_extract(payload,'$.operator_request_uid') FROM task_events "
++                      "WHERE task_id=? AND kind='archived'", (tid,)).fetchone()[0]
++    assert uid
++    payload = {"target_task_id": tid, "request_uid": uid, "caller": {"task_id": f.caller}}
++    assert kca.apply(f.h, payload, {"operator_request_uid": uid}) == ("already_applied", None)
++    helpers._round(f)  # a redelivered Board round changes nothing
++    assert archived_events(f.h, tid) == 1
++    assert request_status(f, out) == "done"
++
++
++def test_second_request_for_archived_card_adds_no_event(fleet):
++    f = fleet
++    tid = child(f)
++    assert kca.apply(f.h, {"target_task_id": tid, "request_uid": "u1", "caller": {"task_id": f.caller}},
++                     {"operator_request_uid": "u1"}) == ("applied", None)
++    verdict, _ = kca.apply(f.h, {"target_task_id": tid, "request_uid": "u2", "caller": {"task_id": f.caller}},
++                           {"operator_request_uid": "u2"})
++    assert verdict == "refused"
++    assert archived_events(f.h, tid) == 1
++
++
++@pytest.mark.parametrize("requester", [None, ""])
++def test_home_refuses_missing_requester(fleet, requester):
++    f = fleet
++    tid = child(f)
++    verdict, why = kca.apply(f.h, {"target_task_id": tid, "request_uid": "u", "caller": {"task_id": requester}},
++                             {"operator_request_uid": "u"})
++    assert verdict == "refused" and why
++    assert kb.get_task(f.h, tid).status != "archived"
++    assert archived_events(f.h, tid) == 0
++
++
++def test_home_refuses_self_requester(fleet):
++    f = fleet
++    tid = child(f)
++    verdict, _ = kca.apply(f.h, {"target_task_id": tid, "request_uid": "u", "caller": {"task_id": tid}},
++                           {"operator_request_uid": "u"})
++    assert verdict == "refused"
++    assert kb.get_task(f.h, tid).status != "archived"
++
++
++def test_missing_run_queues_nothing_and_archives_nothing(fleet, monkeypatch):
++    f = fleet
++    tid = child(f)
++    before = f.w.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]
++    refusal, out = submit(f, tid, monkeypatch, run_id_fn=lambda _: None)
++    if refusal is None:  # if a request was accepted it must still not archive anything at home
++        helpers._round(f)
++        assert request_status(f, out) != "done"
++    else:
++        assert out is None
++    assert kb.get_task(f.h, tid).status != "archived"
++    assert archived_events(f.h, tid) == 0
++    assert before <= f.w.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]
++
++
++def test_self_archive_via_worker_refused_and_unarchived(fleet, monkeypatch):
++    f = fleet
++    refusal, out = submit(f, f.caller, monkeypatch)
++    assert refusal and out is None
++    assert kb.get_task(f.w, f.caller).status != "archived"
++
++
++def test_creator_archive_does_not_leak_to_unscoped_foreign_archive(fleet, monkeypatch):
++    f = fleet
++    tid = child(f)
++    monkeypatch.setattr(kfc, "open_replica", lambda _p: _rep(f))
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    with pytest.raises(kfc.ForeignCardError):
++        relay.worker_archive(f.w, tid, run_id_fn=lambda _: f.run_id)
++    assert kb.get_task(f.h, tid).status != "archived"
++
++
++def _rep(f):
++    @contextmanager
++    def cm():
++        yield f.rep
++    return cm()
++
++
++# ---------------------------------------------------------------- triage cleanup
++
++def triage_fixture(f, creator_status="done", comment=True):
++    creator = f.card(f.h, "checker")
++    tid = f.card(f.h, "fixture", creator_task_id=creator, workspace_kind="scratch", triage=True)
++    with kb.write_txn(f.h):
++        f.h.execute("UPDATE tasks SET status=? WHERE id=?", (creator_status, creator))
++    if comment:
++        kb.add_comment(f.h, tid, "worker", f"Run `hermes kanban archive {tid}` as a non-worker caller.")
++    return creator, tid
++
++
++def test_triage_missing_creator_event_never_archives(fleet):
++    f = fleet
++    _, tid = triage_fixture(f)
++    with kb.write_txn(f.h):
++        f.h.execute("DELETE FROM task_events WHERE task_id=? AND kind='created'", (tid,))
++    assert not ktc.archive_requested_fixture(f.h, tid)
++    assert kb.get_task(f.h, tid).status == "triage"
++
++
++def test_triage_missing_creator_row_everywhere_never_archives(fleet, monkeypatch):
++    f = fleet
++    creator, tid = triage_fixture(f)
++    with kb.write_txn(f.h):
++        f.h.execute("DELETE FROM tasks WHERE id=?", (creator,))
++    monkeypatch.setattr(kfc, "open_replica", lambda _p: _rep(f))
++    f.board()
++    assert not ktc.archive_requested_fixture(f.h, tid)
++    assert kb.get_task(f.h, tid).status == "triage"
++    assert f.h.execute("SELECT COUNT(*) FROM task_comments WHERE task_id=? AND author='triage-sweep'",
++                       (tid,)).fetchone()[0] == 0
++
++
++def test_triage_finished_parent_only_in_replica_archives(fleet, monkeypatch):
++    f = fleet
++    creator = f.card(f.w, "finished checker on the worker")
++    with kb.write_txn(f.w):
++        f.w.execute("UPDATE tasks SET status='done' WHERE id=?", (creator,))
++    tid = f.card(f.h, "fixture", creator_task_id=creator, workspace_kind="scratch", triage=True)
++    kb.add_comment(f.h, tid, "worker", f"Run `hermes kanban archive {tid}`.")
++    f.board()
++    assert kb.get_task(f.h, creator) is None
++    monkeypatch.setattr(kfc, "open_replica", lambda _p: _rep(f))
++    assert ktc.archive_requested_fixture(f.h, tid)
++    assert kb.get_task(f.h, tid).status == "archived"
++    assert archived_events(f.h, tid) == 1
++
++
++def test_triage_live_parent_only_in_replica_does_not_archive(fleet, monkeypatch):
++    f = fleet
++    creator = f.card(f.w, "live checker on the worker")  # status stays non-terminal
++    tid = f.card(f.h, "fixture", creator_task_id=creator, workspace_kind="scratch", triage=True)
++    kb.add_comment(f.h, tid, "worker", f"Run `hermes kanban archive {tid}`.")
++    f.board()
++    monkeypatch.setattr(kfc, "open_replica", lambda _p: _rep(f))
++    assert not ktc.archive_requested_fixture(f.h, tid)
++    assert kb.get_task(f.h, tid).status == "triage"
++
++
++def test_triage_foreign_target_is_left_alone(fleet, monkeypatch):
++    from hermes_cli import kanban_wake_check as kwc
++    f = fleet
++    _, tid = triage_fixture(f)
++    with kb.write_txn(f.h):
++        f.h.execute("UPDATE tasks SET created_on='worker-5' WHERE id=?", (tid,))
++    monkeypatch.setattr(kwc, "own_gateway", lambda _c: "hub")
++    assert tid in kwc.foreign_ids(f.h, "hub")
++    assert not ktc.archive_requested_fixture(f.h, tid)
++    assert kb.get_task(f.h, tid).status == "triage"
++    # the same card owned locally is archivable, so the foreign marker was the deciding fact
++    with kb.write_txn(f.h):
++        f.h.execute("UPDATE tasks SET created_on='hub' WHERE id=?", (tid,))
++    from hermes_cli import kanban_sweep_gate as ksg
++    ksg._MEMOS.clear()  # foreign_ids is memoized per board revision
++    assert tid not in kwc.foreign_ids(f.h, "hub")
++    assert ktc.archive_requested_fixture(f.h, tid)
++    assert kb.get_task(f.h, tid).status == "archived"
++
++
++def test_triage_new_comment_between_eligibility_and_txn_keeps_card(fleet, monkeypatch):
++    f = fleet
++    _, tid = triage_fixture(f)
++    real, calls = ktc.eligible, []
++
++    def racing(conn, t):
++        out = real(conn, t)
++        calls.append(out)
++        if len(calls) == 1:
++            assert out is True
++            kb.add_comment(f.h, tid, "worker", "Keep this; more work remains.")
++        return out
++
++    monkeypatch.setattr(ktc, "eligible", racing)
++    assert not ktc.archive_requested_fixture(f.h, tid)
++    assert calls == [True, False]
++    assert kb.get_task(f.h, tid).status == "triage"
++    assert archived_events(f.h, tid) == 0
++    assert f.h.execute("SELECT COUNT(*) FROM task_comments WHERE task_id=? AND author='triage-sweep'",
++                       (tid,)).fetchone()[0] == 0
++
++
++def test_triage_claim_between_eligibility_and_txn_keeps_card(fleet, monkeypatch):
++    f = fleet
++    _, tid = triage_fixture(f)
++    real, calls = ktc.eligible, []
++
++    def racing(conn, t):
++        out = real(conn, t)
++        calls.append(out)
++        if len(calls) == 1:
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET human_request=? WHERE id=?", ('{"action":"sign in"}', tid))
++        return out
++
++    monkeypatch.setattr(ktc, "eligible", racing)
++    assert not ktc.archive_requested_fixture(f.h, tid)
++    assert calls == [True, False]
++    assert kb.get_task(f.h, tid).status == "triage"
++    assert archived_events(f.h, tid) == 0
++
++
++def test_triage_archive_comment_rolls_back_with_refused_precondition(fleet, monkeypatch):
++    """A refusal inside the transaction leaves no bookkeeping comment behind."""
++    f = fleet
++    creator, tid = triage_fixture(f)
++    real, calls = ktc.eligible, []
++
++    def racing(conn, t):
++        out = real(conn, t)
++        calls.append(out)
++        if len(calls) == 1:
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (creator,))
++        return out
++
++    monkeypatch.setattr(ktc, "eligible", racing)
++    assert not ktc.archive_requested_fixture(f.h, tid)
++    assert kb.get_task(f.h, tid).status == "triage"
++    bodies = [r[0] for r in f.h.execute("SELECT body FROM task_comments WHERE task_id=?", (tid,))]
++    assert not any("Archived scratch card" in b for b in bodies)
++
++
++def test_triage_replay_after_archive_is_noop(fleet):
++    f = fleet
++    _, tid = triage_fixture(f)
++    assert ktc.archive_requested_fixture(f.h, tid)
++    assert not ktc.archive_requested_fixture(f.h, tid)
++    assert archived_events(f.h, tid) == 1
++    assert f.h.execute("SELECT COUNT(*) FROM task_comments WHERE task_id=? AND author='triage-sweep'",
++                       (tid,)).fetchone()[0] == 1
+diff --git a/tests/hermes_cli/test_kanban_creator_archive_boundary.py b/tests/hermes_cli/test_kanban_creator_archive_boundary.py
+new file mode 100644
+index 0000000000..0c864959a1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_creator_archive_boundary.py
+@@ -0,0 +1,70 @@
++"""Creator cleanup authorization at the tool and canonical transport seams."""
++import json
++from contextlib import contextmanager
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_operator_call as calls
++from hermes_cli import kanban_supervisor_requests as requests
++from tests.hermes_cli import test_kanban_creator_archive_adversarial as helpers
++
++fleet = helpers.fleet
++
++
++@pytest.mark.parametrize("field", ["target_task_id", "caller"])
++def test_changed_canonical_request_never_archives(fleet, monkeypatch, field):
++    f = fleet
++    tid = helpers.child(f)
++    _, out = helpers.submit(f, tid, monkeypatch)
++    requests.drain(f.w)
++    f.board()
++    event = f.rep.execute("SELECT uid,payload FROM task_events WHERE kind=?", (calls.REQUEST_KIND,)).fetchone()
++    payload = json.loads(event[1])
++    payload[field] = f.target if field == "target_task_id" else {**payload["caller"], "task_id": tid}
++    with kb.write_txn(f.rep):
++        f.rep.execute("UPDATE task_events SET payload=? WHERE uid=?", (json.dumps(payload), event[0]))
++    requests.drain(f.h)
++    assert kb.get_task(f.h, tid).status != "archived"
++    assert kb.get_task(f.h, f.target).status != "archived"
++    f.board()
++    requests.drain(f.w)
++    assert helpers.request_status(f, out) == "rejected"
++
++
++def test_done_target_with_dependent_is_refused_at_home(fleet, monkeypatch):
++    f = fleet
++    tid = helpers.child(f)
++    with kb.write_txn(f.h):
++        f.h.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
++    f.board()
++    _, out = helpers.submit(f, tid, monkeypatch)
++    requests.drain(f.w)
++    f.board()
++    f.card(f.h, "unfinished dependent", parents=[tid])
++    requests.drain(f.h)
++    f.board()
++    requests.drain(f.w)
++    assert helpers.request_status(f, out) == "rejected"
++    assert kb.get_task(f.h, tid).status == "done"
++
++
++def test_tool_archive_forwards_creator_request(fleet, monkeypatch):
++    from hermes_cli import kanban_foreign_card as foreign
++    from tools import kanban_tools as tools
++    f = fleet
++    tid = helpers.child(f)
++
++    @contextmanager
++    def board(_slug):
++        yield kb, f.w
++
++    monkeypatch.setattr(tools, "_board", board)
++    monkeypatch.setattr(tools, "_worker_run_id", lambda _: f.run_id)
++    monkeypatch.setattr(foreign, "open_replica", lambda _p: helpers._rep(f))
++    monkeypatch.setenv("HERMES_KANBAN_TASK", f.caller)
++    out = json.loads(tools._handle_archive({"task_id": tid}))
++    monkeypatch.delenv("HERMES_KANBAN_TASK")
++    assert out["status"] == "archive_pending"
++    helpers.helpers._round(f)
++    assert kb.get_task(f.h, tid).status == "archived"
+-- 
+2.43.0
+

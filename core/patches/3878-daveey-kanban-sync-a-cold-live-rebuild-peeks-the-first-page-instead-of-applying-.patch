@@ -1,0 +1,108 @@
+From c3ece28f9b1db4f74c2f4ff1ded359cc8ad91fe3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:21:35 +0000
+Subject: [PATCH] [daveey] kanban sync: a cold live rebuild peeks the first
+ page instead of applying it
+
+Review of PR #2657 at d15019ab5a (t_01a1d6b75c6bd123, request_changes): pull_live
+applied the first feed page (cursor 0 -> page.next) before running resync, and resync
+writes the head cursor only when it finishes. A rebuild cut short by a snapshot
+HubError or a SyncStopped therefore left the file looking warm (cursor 1), and the
+next round fell back to the 20-page full-feed replay -- the worker-a1 incident state.
+
+Now a cursor-0 live file only peeks the first page (acw.changes_page, nothing
+applied). If the feed is past one page it rebuilds via resync; the cursor stays 0
+until resync writes the head, so an interrupted rebuild is retried as a rebuild.
+A cold file whose feed fits one page pulls normally.
+
+Test: test_an_interrupted_cold_rebuild_is_retried_as_a_rebuild (first snapshot page
+503s once). RED at d15019ab5a (`assert 1 == 0` on the cursor after the failed
+rebuild), green here. tests/hermes_cli/test_kanban_sync*.py using sync_board or the
+client: 49 files, 1370 passed.
+---
+ hermes_cli/kanban_sync_backlog.py             | 19 ++++++-----
+ .../hermes_cli/test_kanban_sync_cold_live.py  | 33 +++++++++++++++++++
+ 2 files changed, 44 insertions(+), 8 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_backlog.py b/hermes_cli/kanban_sync_backlog.py
+index 95be9a83eb..d9761780ab 100644
+--- a/hermes_cli/kanban_sync_backlog.py
++++ b/hermes_cli/kanban_sync_backlog.py
+@@ -138,19 +138,22 @@ def pull_live(live: sqlite3.Connection, hub: Any, slug: str, gateway: str) -> bo
+     including the requeue that ends the Board lease. So a cold file whose first page is not the head rebuilds from
+     the partitioned snapshot, as on a 410, and resumes the feed at its head. Upserts only (``resync``), no absent-row
+     sweep: a just-attached board's local cards are not on the Board yet and are queued by ``import``, not deleted.
++
++    The first page is only peeked, never applied: the cursor stays 0 until ``resync`` writes the head, so a rebuild
++    cut short (a snapshot HubError, a stop) is retried as a rebuild next round instead of leaving a warm-looking file
++    that falls back to the full replay (review of PR #2657).
+     """
++    from hermes_cli import kanban_awaited_card_wake as acw
+     from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_sync_client as ksc
+     cold = not int((sync.sync_state(live) or {}).get("cursor") or 0)
++    if cold and acw.changes_page(hub, slug, 0, {}).get("more"):
++        _log.warning("kanban sync: %s live file never pulled and the feed is past one page; rebuilding it from a "
++                     "snapshot instead of replaying the board's history", slug)
++        ksc.resync(live, hub, slug, observers=True, partition=gateway)
++        return None
+     with ksc.credited(live):  # the client's name: tests replace it there
+-        pulled = ksc.pull(live, hub, slug, observers=True, partition=gateway,
+-                          max_pages=1 if cold else PULL_PAGE_BUDGET)
+-    if not (cold and pulled.more):
+-        return pulled.more
+-    _log.warning("kanban sync: %s live file never pulled and the feed is past one page; rebuilding it from a "
+-                 "snapshot instead of replaying the board's history", slug)
+-    ksc.resync(live, hub, slug, observers=True, partition=gateway)
+-    return None
++        return ksc.pull(live, hub, slug, observers=True, partition=gateway, max_pages=PULL_PAGE_BUDGET).more
+ 
+ 
+ def _expedite(live_path: Path, changed: dict) -> None:
+diff --git a/tests/hermes_cli/test_kanban_sync_cold_live.py b/tests/hermes_cli/test_kanban_sync_cold_live.py
+index c73d6040ee..6c00c6a2aa 100644
+--- a/tests/hermes_cli/test_kanban_sync_cold_live.py
++++ b/tests/hermes_cli/test_kanban_sync_cold_live.py
+@@ -113,6 +113,39 @@ def test_a_cold_live_file_reaches_the_head_in_one_round_and_sends_its_run_start(
+     assert not live.execute("SELECT 1 FROM tasks WHERE id LIKE 't_other%'").fetchone()
+ 
+ 
++class SnapshotFailsOnceHub(PagedHub):
++    """The first snapshot page answers 503 (a Board blip mid-rebuild); later ones succeed."""
++
++    def __init__(self, svc, gateway):
++        super().__init__(svc, gateway)
++        self.failed = False
++
++    def snapshot_page(self, board, table, after="", limit=500):
++        if not self.failed:
++            self.failed = True
++            raise ksc.HubError(503, "snapshot unavailable")
++        return self._inner.snapshot_page(board, table, after)
++
++
++def test_an_interrupted_cold_rebuild_is_retried_as_a_rebuild(live, svc, kanban_home):
++    """A rebuild cut short must leave the file cold: RED at d15019ab5a, where the first feed page was applied before
++    the snapshot, so a failed rebuild left cursor 1 and the next round fell back to the 20-page full replay."""
++    _tid, _run_id, uid = _claimed_on_a_fresh_node(live, kanban_home, svc)
++    hub = SnapshotFailsOnceHub(svc, ME)
++    try:
++        first = _round(kanban_home, hub)
++    except ksc.HubError:
++        first = None
++    assert hub.failed
++    assert first is None or first.error is not None
++    assert _cursor(live) == 0  # still cold: the next round rebuilds again
++    second = _round(kanban_home, hub)
++    assert second.error is None
++    assert not second.behind
++    assert _cursor(live) > BACKLOG_PAGES
++    assert svc.board(BOARD)["rows"]["task_runs"][uid]["status"] == "running"
++
++
+ def test_a_warm_live_file_behind_the_head_still_pulls_its_budget(live, svc, kanban_home):
+     """Control: only a cursor-0 file rebuilds; a warm file behind the head drains the feed over rounds (its run
+     rows held meanwhile, test_kanban_sync_push_starvation)."""
+-- 
+2.43.0
+

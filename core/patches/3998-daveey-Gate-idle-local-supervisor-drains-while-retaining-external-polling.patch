@@ -1,0 +1,413 @@
+From 8ee243bb2ba5662c532f39412ec2910d970df831 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:38:57 +0000
+Subject: [PATCH] [daveey] Gate idle local supervisor drains while retaining
+ external polling
+
+Proof: supervisor gate RED idle drains 4 vs 1; GREEN 10 gate tests and 31 existing supervisor cases. Real killed holder and due-expiry regressions kill active-poll suppression; terminal-request-only update kills missing request input. Unstubbed synthetic drain replay preserves executor refresh (48 vs 240 upserts). Empty-board CPU is not improved (0.48 vs 0.36ms); realistic hub replay and live budget proof remain required before shipping.
+---
+ hermes_cli/kanban_supervisor_gate.py          |  53 +++++
+ hermes_cli/kanban_supervisor_requests.py      |  13 +-
+ scripts/kanban_supervisor_replay_bench.py     |  83 ++++++++
+ .../test_kanban_supervisor_drain_gate.py      | 187 ++++++++++++++++++
+ 4 files changed, 329 insertions(+), 7 deletions(-)
+ create mode 100644 hermes_cli/kanban_supervisor_gate.py
+ create mode 100644 scripts/kanban_supervisor_replay_bench.py
+ create mode 100644 tests/hermes_cli/test_kanban_supervisor_drain_gate.py
+
+diff --git a/hermes_cli/kanban_supervisor_gate.py b/hermes_cli/kanban_supervisor_gate.py
+new file mode 100644
+index 0000000000..910ba22d9a
+--- /dev/null
++++ b/hermes_cli/kanban_supervisor_gate.py
+@@ -0,0 +1,53 @@
++"""Dispatcher-only supervisor request gate; incoming operator traffic is independent. [daveey]
++
++Active requests never skip: local holders can die without a database write and forwarded
++requests read external courier/Board results. On empty queues, only task/request changes
++or the executor's persisted liveness deadline require another local drain.
++"""
++from __future__ import annotations
++
++import sqlite3
++
++from hermes_cli import kanban_sweep_gate as gate
++
++
++def _requests(conn: sqlite3.Connection) -> tuple:
++    # These tables are not in the task activity revision. Include updates and deletions,
++    # not just MAX(id); terminal rows still waiting for their requester matter too.
++    return tuple(tuple(row) for row in conn.execute(
++        "SELECT * FROM supervisor_requests WHERE status IN ('pending','accepted') "
++        "OR requester_woken=0 ORDER BY id"))
++
++
++def _key(conn: sqlite3.Connection) -> tuple:
++    return gate.config_key(), _requests(conn)
++
++
++def _due(conn: sqlite3.Connection) -> float:
++    from hermes_cli import kanban_supervisor_requests as sr
++    if conn.execute("SELECT 1 FROM supervisor_requests WHERE status IN ('pending','accepted') LIMIT 1").fetchone():
++        return 0  # process death, external replies, pending backlog, and expiry: next tick
++    row = conn.execute("SELECT last_seen FROM supervisor_executors WHERE executor_id=?",
++                       (sr.executor_identity("dispatcher"),)).fetchone()
++    # Preserve drain's strict integer-second comparison, not a new arbitrary cadence.
++    return int(row[0]) + 61 if row else 0
++
++
++def _enabled(_conn: sqlite3.Connection) -> bool:
++    from hermes_cli.config import load_config_readonly
++    cfg = ((load_config_readonly() or {}).get("kanban") or {}).get("supervisor_requests") or {}
++    return cfg.get("enabled", True) is not False
++
++
++def dispatch(conn: sqlite3.Connection, board: str | None) -> list:
++    from hermes_cli import kanban_operator_call as kox
++    from hermes_cli import kanban_supervisor_requests as sr
++    if not gate.memo("supervisor.enabled", conn, _enabled, extra=gate.config_key):
++        return []
++    result = gate.gated("dispatch.supervisor_local", conn, sr.drain, conn,
++                        board=board, role="dispatcher", incoming=False,
++                        extra=_key, due=_due, skipped={"processed": []})
++    # Replica calls, retry holds and label-process completions must not be hidden by
++    # a local-board/request gate. They retain their own scanner and watermark.
++    kox.apply_incoming(conn)
++    return result["processed"]
+diff --git a/hermes_cli/kanban_supervisor_requests.py b/hermes_cli/kanban_supervisor_requests.py
+index b2b03f4a0e..e6330a0350 100644
+--- a/hermes_cli/kanban_supervisor_requests.py
++++ b/hermes_cli/kanban_supervisor_requests.py
+@@ -88,6 +88,7 @@ _SCHEMA = (
+         requester_woken INTEGER NOT NULL DEFAULT 0)""",
+     "CREATE INDEX IF NOT EXISTS idx_supervisor_requests_status ON supervisor_requests(status, id)",
+     "CREATE INDEX IF NOT EXISTS idx_supervisor_requests_requester ON supervisor_requests(requester_task_id)",
++    "CREATE INDEX IF NOT EXISTS idx_supervisor_requests_unwoken ON supervisor_requests(id) WHERE requester_woken=0",
+     """CREATE TABLE IF NOT EXISTS supervisor_executors (
+         executor_id TEXT PRIMARY KEY,
+         role TEXT,
+@@ -664,7 +665,7 @@ def _execute(conn: sqlite3.Connection, req: dict, executor: str, board: Optional
+ 
+ def drain(conn: sqlite3.Connection, *, board: Optional[str] = None, role: str = "dispatcher",
+           limit: int = 10, now: Optional[int] = None,
+-          on_accept: Optional[Callable[[dict], None]] = None) -> dict:
++          on_accept: Optional[Callable[[dict], None]] = None, incoming: bool = True) -> dict:
+     """Execute queued requests from a non-worker process. Returns ``{executor, processed: [(id, status)]}``.
+ 
+     Refuses (without touching anything) inside a worker or delegated child."""
+@@ -709,7 +710,8 @@ def drain(conn: sqlite3.Connection, *, board: Optional[str] = None, role: str =
+     from hermes_cli import kanban_operator_call as kox
+     processed += kox.poll(conn, executor, now=now)
+     try:  # home side: calls other gateways' workers made on this gateway's cards
+-        kox.apply_incoming(conn)
++        if incoming:
++            kox.apply_incoming(conn)
+     except Exception:  # health: allow BLE001 -- the requests stay in the replica and are retried next drain
+         _log.warning("kanban: applying incoming operator calls failed", exc_info=True)
+     return {"executor": executor, "processed": processed}
+@@ -753,10 +755,7 @@ def dispatcher_drain(conn: sqlite3.Connection, *, board: Optional[str] = None) -
+     """Dispatcher-tick entry: never raises. Config ``kanban.supervisor_requests.enabled: false``
+     (default on, not in config_defaults) leaves requests pending for ``supervisor-requests --drain``."""
+     try:
+-        from hermes_cli.config import load_config_readonly
+-        cfg = ((load_config_readonly() or {}).get("kanban") or {}).get("supervisor_requests") or {}
+-        if cfg.get("enabled", True) is False:
+-            return []
++        from hermes_cli import kanban_supervisor_gate
+         refusal = _non_worker_refusal()
+         if refusal:
+             global _skip_logged
+@@ -764,7 +763,7 @@ def dispatcher_drain(conn: sqlite3.Connection, *, board: Optional[str] = None) -
+                 _skip_logged = True
+                 _log.warning("kanban: not draining supervisor requests in this process: %s", refusal)
+             return []
+-        return drain(conn, board=board, role="dispatcher")["processed"]
++        return kanban_supervisor_gate.dispatch(conn, board)
+     except Exception:  # health: allow BLE001 -- the tick must go on; the rows stay queued
+         _log.warning("kanban: draining supervisor requests failed", exc_info=True)
+         return []
+diff --git a/scripts/kanban_supervisor_replay_bench.py b/scripts/kanban_supervisor_replay_bench.py
+new file mode 100644
+index 0000000000..2e6ff80875
+--- /dev/null
++++ b/scripts/kanban_supervisor_replay_bench.py
+@@ -0,0 +1,83 @@
++"""Unstubbed local supervisor-drain replay, including its idle executor clock. [daveey]
++
++Run with scripts/run-in-hermes-env python scripts/kanban_supervisor_replay_bench.py
++--ticks 240 --output <json>. Synthetic empty boards; not a hub P1 budget proof.
++Neither drain nor its poll/apply_incoming calls are replaced. No gateway is configured,
++so replica-side operator delivery is not represented. Network/process writes are refused.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import socket
++import subprocess
++import tempfile
++import time
++from pathlib import Path
++from unittest.mock import patch
++
++
++def _refuse(*_args, **_kwargs):
++    raise AssertionError("supervisor replay must not access network or spawn processes")
++
++
++def replay(conn, ticks: int) -> dict:
++    from hermes_cli import kanban_supervisor_requests as sr
++    from hermes_cli import kanban_sweep_gate as gate
++
++    gate.reset()
++    start = int(time.time())
++    result = {}
++    for name, run in (("ungated", sr.drain), ("gated", sr.dispatcher_drain)):
++        gate.reset()
++        # Reset the executor clock to the beginning of this identical simulated timeline.
++        conn.execute("DELETE FROM supervisor_executors")
++        conn.commit()
++        statements = []
++        conn.set_trace_callback(statements.append)
++        cpu = time.thread_time()
++        with patch.object(socket.socket, "connect", _refuse), patch.object(subprocess, "Popen", _refuse):
++            for tick in range(ticks):
++                with patch.object(sr.time, "time", return_value=start + 15 * tick):
++                    run(conn)
++        elapsed = time.thread_time() - cpu
++        conn.set_trace_callback(None)
++        result[name] = {
++            "ticks": ticks, "cpu_ms_per_tick": 1000 * elapsed / ticks,
++            "core_pct_at_15s": 100 * elapsed / (15 * ticks),
++            "sql_statements": len(statements),
++            "executor_upserts": sum("INSERT INTO supervisor_executors" in q for q in statements),
++            "last_seen": conn.execute("SELECT MAX(last_seen) FROM supervisor_executors").fetchone()[0],
++        }
++    return result
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--ticks", type=int, default=240)
++    parser.add_argument("--output", type=Path)
++    args = parser.parse_args()
++    if args.ticks <= 0:
++        parser.error("--ticks must be positive")
++    with tempfile.TemporaryDirectory(prefix="supervisor-replay-") as home:
++        os.environ["HERMES_HOME"] = home
++        for key in tuple(os.environ):
++            if key.startswith(("HERMES_KANBAN", "HERMES_SESSION")):
++                del os.environ[key]
++        from hermes_cli import kanban_db as kb
++        from hermes_cli import kanban_db_connect as kbc
++        from hermes_cli import kanban_supervisor_requests as sr
++        kb.init_db()
++        with kbc.connect_closing() as conn:
++            sr.ensure_schema(conn)
++            conn.commit()
++            result = replay(conn, args.ticks)
++    text = json.dumps(result, indent=2)
++    if args.output:
++        args.output.write_text(text + "\n", encoding="utf-8")
++    print(text)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/hermes_cli/test_kanban_supervisor_drain_gate.py b/tests/hermes_cli/test_kanban_supervisor_drain_gate.py
+new file mode 100644
+index 0000000000..95d62ef4ac
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_supervisor_drain_gate.py
+@@ -0,0 +1,187 @@
++"""Quiet-board supervisor gates retain request and process-driven work. [daveey]"""
++from __future__ import annotations
++
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_operator_call as kox
++from hermes_cli import kanban_supervisor_requests as sr
++from hermes_cli import kanban_sweep_gate as gate
++from tests.hermes_cli import test_kanban_supervisor_requests as helpers
++
++board = helpers.board
++_APPLY_INCOMING = kox.apply_incoming
++
++
++@pytest.fixture
++def executor(board, monkeypatch):
++    helpers._as_executor(monkeypatch)
++    gate.reset()
++    monkeypatch.setattr(kox, "apply_incoming", Mock(return_value=[]))
++    with kbc.connect_closing() as conn:
++        sr.ensure_schema(conn)
++        conn.commit()
++        yield conn
++    gate.reset()
++
++
++def test_idle_ticks_skip_config_and_local_drain(executor, monkeypatch):
++    from hermes_cli import config
++    load = Mock(return_value={})
++    monkeypatch.setattr(config, "load_config_readonly", load)
++    real = sr.drain
++    drain = Mock(wraps=real)
++    monkeypatch.setattr(sr, "drain", drain)
++    for _ in range(4):
++        sr.dispatcher_drain(executor)
++    assert drain.call_count == 1
++    assert load.call_count == 1
++    # Incoming replica requests and label-process completions are an independent lane.
++    assert kox.apply_incoming.call_count == 4
++
++
++def test_request_only_insert_on_settled_board_runs_next_tick(executor, board):
++    for _ in range(3):
++        sr.dispatcher_drain(executor)
++    before = gate.content_revision(executor)
++    executor.execute(
++        "INSERT INTO supervisor_requests(requester_task_id, ops_json, dedupe_key, created_at) "
++        "VALUES (?, '[]', 'quiet', 0)", (board["requester"],))
++    executor.commit()
++    assert gate.content_revision(executor) == before
++    result = sr.dispatcher_drain(executor)
++    assert result and result[0][1] == "rejected"
++
++
++def test_executor_refresh_due_without_content_change(executor, monkeypatch):
++    clock = Mock(return_value=1000)
++    monkeypatch.setattr(sr.time, "time", clock)
++    sr.dispatcher_drain(executor)
++    clock.return_value = 1060
++    sr.dispatcher_drain(executor)
++    assert executor.execute("SELECT last_seen FROM supervisor_executors").fetchone()[0] == 1000
++    clock.return_value = 1061
++    sr.dispatcher_drain(executor)
++    assert executor.execute("SELECT last_seen FROM supervisor_executors").fetchone()[0] == 1061
++
++
++def test_failed_drain_retries_unchanged_key(executor, monkeypatch):
++    real = sr.drain
++    calls = Mock(side_effect=[RuntimeError("retry"), real(executor)])
++    monkeypatch.setattr(sr, "drain", calls)
++    sr.dispatcher_drain(executor)
++    sr.dispatcher_drain(executor)
++    assert calls.call_count == 2
++
++
++def test_live_holder_killed_on_quiet_board_fails_next_tick(executor, board):
++    import socket
++    import subprocess
++    import sys
++    from tools.environments.local import build_subprocess_env
++
++    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
++                             env=build_subprocess_env())
++    try:
++        executor.execute(
++            "INSERT INTO supervisor_requests(requester_task_id,ops_json,dedupe_key,created_at,"
++            "status,executor,lease_expires,attempts) VALUES (?, '[]', 'holder', ?, 'accepted', ?, ?, ?)",
++            (board["requester"], int(sr.time.time()), f"{socket.gethostname()}:{child.pid}:test",
++             int(sr.time.time()) + 1000, sr.MAX_ATTEMPTS))
++        executor.commit()
++        for _ in range(3):
++            assert sr.dispatcher_drain(executor) == []
++        before = gate.content_revision(executor)
++        child.kill()
++        child.wait(timeout=10)
++        assert gate.content_revision(executor) == before
++        assert sr.dispatcher_drain(executor) == [(1, "failed")]
++    finally:
++        if child.poll() is None:
++            child.kill()
++        child.wait(timeout=10)
++
++
++def test_expiry_reached_without_write(executor, board, monkeypatch):
++    clock = Mock(return_value=1000)
++    monkeypatch.setattr(sr.time, "time", clock)
++    executor.execute(
++        "INSERT INTO supervisor_requests(requester_task_id,ops_json,dedupe_key,created_at,"
++        "status,executor,lease_expires,attempts) VALUES (?, '[]', 'expiry', ?, 'accepted', ?, ?, 0)",
++        (board["requester"], 1000 - sr.DEADLINE_S, sr.executor_identity("test"), 2000))
++    executor.commit()
++    for _ in range(3):
++        assert sr.dispatcher_drain(executor) == []
++    before = gate.content_revision(executor)
++    clock.return_value = 1001
++    assert gate.content_revision(executor) == before
++    assert sr.dispatcher_drain(executor) == [(1, "rejected")]
++
++
++def test_request_insert_accepts_next_tick(executor, board, monkeypatch):
++    import json
++    for _ in range(3):
++        sr.dispatcher_drain(executor)
++    accepted = Mock()
++    monkeypatch.setattr(sr, "_after_accept", accepted)
++    before = gate.content_revision(executor)
++    executor.execute(
++        "INSERT INTO supervisor_requests(requester_task_id,ops_json,dedupe_key,created_at) VALUES (?, ?, 'new', ?)",
++        (board["requester"], json.dumps(helpers._reorder(board)), int(sr.time.time())))
++    executor.commit()
++    assert gate.content_revision(executor) == before
++    assert sr.dispatcher_drain(executor) == [(1, "done")]
++    accepted.assert_called_once()
++
++
++def test_config_change_reenables_pending_requests(executor, board, monkeypatch):
++    from hermes_cli import config
++    key = Mock(return_value="disabled")
++    monkeypatch.setattr(gate, "config_key", key)
++    load = Mock(return_value={"kanban": {"supervisor_requests": {"enabled": False}}})
++    monkeypatch.setattr(config, "load_config_readonly", load)
++    executor.execute(
++        "INSERT INTO supervisor_requests(requester_task_id,ops_json,dedupe_key,created_at) VALUES (?, '[]', 'new', 0)",
++        (board["requester"],))
++    executor.commit()
++    assert sr.dispatcher_drain(executor) == []
++    assert sr.dispatcher_drain(executor) == []
++    assert load.call_count == 1
++    load.return_value = {}
++    key.return_value = "enabled"
++    assert sr.dispatcher_drain(executor) == [(1, "rejected")]
++
++
++def test_terminal_request_update_invalidates_without_task_write(executor, board, monkeypatch):
++    executor.execute(
++        "INSERT INTO supervisor_requests(requester_task_id,ops_json,dedupe_key,created_at,status,requester_woken) "
++        "VALUES (?, '[]', 'late', 0, 'done', 1)", (board["requester"],))
++    executor.commit()
++    for _ in range(3):
++        sr.dispatcher_drain(executor)
++    before = gate.content_revision(executor)
++    drain = Mock(wraps=sr.drain)
++    monkeypatch.setattr(sr, "drain", drain)
++    executor.execute("UPDATE supervisor_requests SET requester_woken=0")
++    executor.commit()
++    assert gate.content_revision(executor) == before
++    sr.dispatcher_drain(executor)
++    drain.assert_called_once()
++
++
++def test_unstubbed_drain_replay(executor, monkeypatch, tmp_path):
++    import json
++    import runpy
++    from pathlib import Path
++    # The benchmark deliberately leaves poll/apply_incoming real. The fixture has no
++    # gateway/replica configured, so incoming delivery is outside this replay's scope.
++    monkeypatch.setattr(kox, "apply_incoming", _APPLY_INCOMING)
++    script = Path(__file__).resolve().parents[2] / "scripts/kanban_supervisor_replay_bench.py"
++    replay = runpy.run_path(str(script))["replay"]
++    report = replay(executor, 40)
++    (tmp_path / "supervisor-replay.json").write_text(json.dumps(report), encoding="utf-8")
++    assert report["ungated"]["executor_upserts"] == 40
++    assert report["gated"]["executor_upserts"] == 8
++    assert report["gated"]["last_seen"] == report["ungated"]["last_seen"]
+-- 
+2.43.0
+

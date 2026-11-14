@@ -1,0 +1,170 @@
+From fe24e27943a547f5ca6d1f12bf66958ac3bfb686 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:17:13 +0000
+Subject: [PATCH] fix(shell): keep arithmetic sink scanning aligned across
+ quoted data [daveey]
+
+Reuse heredoc delimiter parsing to skip literal bodies and distinguish ANSI-C escaped apostrophes. Unclosed quotes fail closed. RED at d9e85d65: seven desync/unclosed-quote failures, then three additional unbalanced quote failures. Preserve numeric date watcher exemptions and opener-only/masked heredoc caller contracts.
+---
+ tests/cron/test_arith_quote_desync.py | 42 +++++++++++++++++
+ tools/shell_arith_sink.py             | 67 +++++++++++++++++++++++----
+ 2 files changed, 99 insertions(+), 10 deletions(-)
+ create mode 100644 tests/cron/test_arith_quote_desync.py
+
+diff --git a/tests/cron/test_arith_quote_desync.py b/tests/cron/test_arith_quote_desync.py
+new file mode 100644
+index 0000000000..24b141fbcb
+--- /dev/null
++++ b/tests/cron/test_arith_quote_desync.py
+@@ -0,0 +1,42 @@
++"""Quote-like data must not hide a later arithmetic output sink."""
++
++import pytest
++
++from tools.shell_arith_sink import substitution_in_arithmetic
++from tools.shell_heredoc import output_reaches_shell
++
++SINK = r'''x=$(( 1 + $(echo "b[\$(bash BIG)]") ))'''
++
++
++@pytest.mark.parametrize("prefix", [
++    "cat <<EOF\ndon't\nEOF\n",
++    "cat <<'EOF'\ndon't\nEOF\n",
++    "cat <<-EOF\n\tdon't\n\tEOF\n",
++    "cat <<A <<B\ndon't\nA\ncan't\nB\n",
++    "printf %s $'it\\'s'\n",
++])
++def test_later_sink_survives_quote_like_data(prefix):
++    assert substitution_in_arithmetic(prefix + SINK, date_exempt=True)
++    assert output_reaches_shell(prefix + SINK)
++
++
++@pytest.mark.parametrize("prefix", [
++    "cat <<EOF\ndon't\nEOF\n",
++    "printf %s $'it\\'s'\n",
++])
++def test_quote_like_data_preserves_date_exemption(prefix):
++    assert not substitution_in_arithmetic(
++        prefix + "x=$(( $(date +%s) + 2700 ))", date_exempt=True,
++    )
++
++
++@pytest.mark.parametrize("command", [
++    "echo '$(echo data)",
++    "echo 'broken",
++    'echo "broken',
++    "echo `broken $(echo data)",
++    'echo "$(echo data)',
++    "echo $'broken\\' $(echo data)",
++])
++def test_unclosed_quotes_fail_closed(command):
++    assert substitution_in_arithmetic(command, date_exempt=True)
+diff --git a/tools/shell_arith_sink.py b/tools/shell_arith_sink.py
+index cc3131aae6..d5c239f000 100644
+--- a/tools/shell_arith_sink.py
++++ b/tools/shell_arith_sink.py
+@@ -24,7 +24,7 @@ DATE_PRODUCER_BODY = r"""[ \t]*date[ \t]+(?:\+%s|'\+%s'|"\+%s")[ \t]*\)"""
+ _DATE_PRODUCER_RE = re.compile(DATE_PRODUCER_BODY)
+ 
+ _TOKENS = (r"\\.|'|\"|`|\$\(\(|\$\(|\$\[|\$\{|\(\(|\(|\)|\[\[|\]\]|\[|\]|\}|#"
+-           r"|(?<![\w.$/-])let[ \t]+")
++           r"|\$'|<<<|<<|\n|(?<![\w.$/-])let[ \t]+")
+ _TOKEN_RE = re.compile(_TOKENS, re.DOTALL)
+ # Inside `let` the list operators end the arithmetic too; elsewhere skipping them keeps the scan
+ # of a long script fast.
+@@ -43,12 +43,12 @@ _CMD, _ARITH, _PARAM = "cmd", "arith", "param"
+ def substitution_in_arithmetic(command: str, *, date_exempt: bool) -> bool:
+     """Whether *command* holds a ``$(`` (not the exempt ``$(date +%s)`` when *date_exempt*)
+     whose nearest enclosing context is arithmetic."""
+-    if "$(" not in command:
+-        return False
+-    if _INTEGER_DECLARATION_RE.search(command):
++    if "$(" in command and _INTEGER_DECLARATION_RE.search(command):
+         return True
+     closes = [m.start() for m in re.finditer(r"\]\]", command)]
+     operators = [m.start() for m in _INT_OPERATOR_RE.finditer(command)]
++    pending = []
++    backtick_open = False
+     stack: list[list] = [[_CMD, None, 0, False]]
+     pos, end = 0, len(command)
+     while pos < end:
+@@ -60,15 +60,19 @@ def substitution_in_arithmetic(command: str, *, date_exempt: bool) -> bool:
+         pos = match.end()
+         top = stack[-1]
+         kind, quoted = top[0], top[3]
+-        if token[0] == "\\" or token == "`":
++        if token == "`":
++            backtick_open = not backtick_open
++            continue
++        if token[0] == "\\":
+             continue
+         if token == '"':
+             top[3] = not quoted
+             continue
+-        if token == "'":
+-            if not quoted:
+-                close = command.find("'", pos)
+-                pos = end if close == -1 else close + 1
++        skipped = _skip_data(command, token, start, pos, quoted, kind, pending)
++        if skipped is not None:
++            if skipped < 0:
++                return True
++            pos = skipped
+             continue
+         if token == "$((":
+             stack.append([_ARITH, "))", 0, False])
+@@ -98,7 +102,50 @@ def substitution_in_arithmetic(command: str, *, date_exempt: bool) -> bool:
+         elif token in (")", "]", "]]") and len(stack) > 1:
+             stack.pop()  # a parameter frame never closes on these: recover outward
+             pos = start
+-    return False
++    # Callers also pass opener-only command units; queued bodies are not quote errors.
++    return backtick_open or any(frame[3] for frame in stack)
++
++
++def _skip_data(command, token, start, pos, quoted, kind, pending) -> int | None:
++    """Skip literal spans; None means a normal token, -1 means fail closed."""
++    if token in ("'", "$'"):
++        return pos if quoted else _quote_close(command, pos, ansi=token == "$'") or -1
++    if quoted:
++        return None
++    # Lazy import: shell_heredoc calls this scanner, but owns delimiter parsing.
++    from tools.shell_heredoc import _find_heredoc_close, _parse_heredoc_operator
++
++    if kind == _CMD and token == "<<":
++        parsed = _parse_heredoc_operator(command, start)
++        if parsed is None:
++            return -1
++        pos, delimiter, strip_tabs, literal = parsed
++        pending.append((delimiter, strip_tabs, literal))
++        return pos
++    if token != "\n" or not pending:
++        return None
++    for delimiter, strip_tabs, literal in pending:
++        close = _find_heredoc_close(command, pos, delimiter, strip_tabs)
++        if close is None:
++            # Masked inert bodies have no terminators. Scan the remainder rather
++            # than hiding later sinks or unmatched quotes behind an unknown body.
++            break
++        body_end, after = close
++        # Unquoted bodies expand, but their apostrophes are plain data.
++        if not literal and ("$(" in command[pos:body_end] or "`" in command[pos:body_end]):
++            return -1
++        pos = after
++    pending.clear()
++    return pos
++
++
++def _quote_close(command: str, pos: int, *, ansi: bool) -> int | None:
++    """Return past a single quote, honouring escapes only in ANSI-C strings."""
++    while pos < len(command):
++        if command[pos] == "'":
++            return pos + 1
++        pos += 2 if ansi and command[pos] == "\\" else 1
++    return None
+ 
+ 
+ def _open_parameter(command: str, pos: int, stack: list[list]) -> int:
+-- 
+2.43.0
+

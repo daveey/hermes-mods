@@ -1,0 +1,383 @@
+From e39b7ddf8551c9a4a151f8f3c928f9cabbe38e25 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:16:30 +0000
+Subject: [PATCH] [daveey] host_change_feed: resolve the state topic per
+ subscriber profile; detach the probe thread
+
+Follow-up to PR #2633 review t_01a1d6a08990466b nit 1 (card t_01a1d6b6cf22e01d).
+
+Defect (latent: no loop subscribes to `state` yet). `feed()` is a process-wide singleton.
+Its probe thread was started with `spawn_context_thread` on the first `subscribe`, so it
+captured that caller's contextvars, and `default_probe` resolved state.db through
+`_default_db_path -> get_hermes_home()` in that captured context. In a multi-profile gateway,
+a loop of any other profile subscribing to `state` watched the first subscriber's state.db.
+A first subscribe inside an ACTIVE_SCOPE also made the probe thread a TrackedThread owned
+(and accounted) by that scope.
+
+Fix:
+- `subscribe()` resolves the bare `state` topic in the subscriber's own context to
+  `state:<abs path>` (`state_topic()`), and reads that db's key at once as its baseline
+  (no spurious wake on the next probe, no change after subscribe missed).
+- `poll_once()` reads every state.db some live subscription names (and only those),
+  independently of the host probe; `default_probe` no longer reads state.db.
+  An unreadable state.db is UNKNOWN (fail-open: its subscribers wake).
+- `start()` builds the probe thread in an empty `contextvars.Context()` (passive), so no
+  profile home, secret scope or work scope crosses into it.
+
+Tests (tests/hermes_cli/test_host_change_feed.py), RED on main (5 failed) -> GREEN (19 passed):
+- two subscribers bound to different HERMES_HOME contexts each wake only on their own
+  state.db data_version change;
+- a state.db is probed only while subscribed; an unreadable one wakes its subscriber;
+- a first subscribe inside an active work scope does not bind the probe thread to it
+  (not a TrackedThread, scope accounting back to 0, thread sees no scope and no home).
+---
+ hermes_cli/host_change_feed.py            |  69 +++++++++--
+ tests/hermes_cli/test_host_change_feed.py | 141 ++++++++++++++++++++--
+ 2 files changed, 186 insertions(+), 24 deletions(-)
+
+diff --git a/hermes_cli/host_change_feed.py b/hermes_cli/host_change_feed.py
+index a446b265d8..1b736b7b96 100644
+--- a/hermes_cli/host_change_feed.py
++++ b/hermes_cli/host_change_feed.py
+@@ -14,8 +14,14 @@ The counters (topics):
+ * ``replica``: the hub replica's applied feed position, ``meta.cursor`` of hub.db. The hub client stamps it
+   with the ``seq`` of the last change it applied, so it moves on every replica row written or deleted, and on
+   nothing else (hub.db's ``data_version`` also moves on its own bookkeeping).
+-* ``state``: state.db ``PRAGMA data_version`` from a retained read-only observer
+-  (``tui_gateway.kanban_replica_observer``).
++* ``state:<path>``: one state.db's ``PRAGMA data_version`` from a retained read-only observer
++  (``tui_gateway.kanban_replica_observer``). state.db is per profile, so a loop subscribes to the bare
++  :data:`STATE` topic and :meth:`HostChangeFeed.subscribe` resolves it **in the subscriber's context** to its
++  own profile's db (:func:`state_topic`). The probe reads every state.db some live subscription names, and
++  only those.
++
++The probe thread runs in an empty context: it is process infrastructure, never bound to the first
++subscriber's profile or owned by that caller's work scope.
+ 
+ A loop subscribes once and replaces its sleep with :meth:`Subscription.wait` (threads) or
+ :meth:`Subscription.wait_async` (the gateway's asyncio loops), passing **its own next due time** as the
+@@ -34,6 +40,7 @@ otherwise, with the number of moved topics as rows.
+ from __future__ import annotations
+ 
+ import asyncio
++import contextvars
+ import logging
+ import os
+ import sqlite3
+@@ -50,7 +57,18 @@ _SLICE_S = 1.0  # waits re-check their stop condition at least this often
+ 
+ BOARD = "board:"
+ REPLICA = "replica"
+-STATE = "state"
++STATE = "state"  # subscribe-only alias: resolved to state_topic() of the subscriber's own profile
++STATE_PREFIX = "state:"
++
++
++def state_topic(path: Optional[os.PathLike | str] = None) -> str:
++    """The topic of one state.db: ``state:<absolute path>``. Without ``path``, the current context's
++    profile db (``hermes_state._default_db_path``), so call it in the subscribing loop's context."""
++    if path is None:
++        from hermes_state import _default_db_path
++
++        path = _default_db_path()
++    return STATE_PREFIX + os.path.abspath(os.fspath(path))
+ 
+ 
+ class _Unknown:
+@@ -180,8 +198,9 @@ class HostChangeFeed:
+     the last probe wake their subscribers. Started on the first :meth:`subscribe` (``autostart``)."""
+ 
+     def __init__(self, probe: Optional[Probe] = None, *, interval: float = INTERVAL_S, autostart: bool = True,
+-                 name: str = "host-change-feed") -> None:
++                 name: str = "host-change-feed", state_probe: Optional[Callable[[Path], object]] = None) -> None:
+         self._probe = probe or default_probe
++        self._state_probe = state_probe or state_key
+         self.interval = interval
+         self.autostart = autostart
+         self.name = name
+@@ -194,13 +213,33 @@ class HostChangeFeed:
+         self.wakes = 0
+ 
+     def subscribe(self, name: str, topics: Iterable[str]) -> Subscription:
+-        sub = Subscription(self, name, topics)
++        """Subscribe ``name`` to ``topics``. The bare :data:`STATE` topic is resolved here, in the caller's
++        context, to its own profile's state.db (:func:`state_topic`), whose key is read at once as the baseline
++        so no change after this call is missed and the next probe wakes nobody for it."""
++        resolved = tuple(state_topic() if t == STATE else t for t in topics)
++        sub = Subscription(self, name, resolved)
++        fresh = [t for t in resolved if t.startswith(STATE_PREFIX)]
++        seeds = {t: self._read_state(t) for t in fresh}
+         with self._lock:
+             self._subs.append(sub)
++            if self._keys is not None:
++                for topic, key in seeds.items():
++                    self._keys.setdefault(topic, key)
+         if self.autostart:
+             self.start()
+         return sub
+ 
++    def _read_state(self, topic: str) -> object:
++        try:
++            return self._state_probe(Path(topic[len(STATE_PREFIX):]))
++        except Exception:  # health: allow BLE001 -- fail-open: an unreadable state.db wakes its subscribers
++            logger.debug("host change feed state probe failed for %s", topic, exc_info=True)
++            return UNKNOWN
++
++    def _state_topics(self) -> set[str]:
++        with self._lock:
++            return {t for s in self._subs for t in s.topics if t.startswith(STATE_PREFIX) and not t.endswith("*")}
++
+     def unsubscribe(self, sub: Subscription) -> None:
+         with self._lock:
+             self._subs = [s for s in self._subs if s is not sub]
+@@ -211,14 +250,17 @@ class HostChangeFeed:
+ 
+     def poll_once(self) -> frozenset[str]:
+         """One probe: read every counter, wake the subscribers of the topics that moved, return those topics.
+-        The first call only records the baseline. A probe that raises makes every known topic unknown."""
++        The first call only records the baseline. A probe that raises makes every known topic unknown; each
++        subscribed state.db is read on its own, so its key does not depend on the rest of the probe."""
+         current: dict[str, object]
+         try:
+             current = dict(self._probe())
+         except Exception:  # health: allow BLE001 -- fail-open: an unreadable probe wakes every subscriber
+             logger.debug("host change feed probe failed", exc_info=True)
+             with self._lock:
+-                current = {t: UNKNOWN for t in (self._keys or {})}
++                current = {t: UNKNOWN for t in (self._keys or {}) if not t.startswith(STATE_PREFIX)}
++        for topic in self._state_topics():
++            current[topic] = self._read_state(topic)
+         with self._lock:
+             self.probes += 1
+             previous, self._keys = self._keys, current
+@@ -252,14 +294,18 @@ class HostChangeFeed:
+                 break
+ 
+     def start(self) -> bool:
+-        """Start the probe thread once (idempotent). True when it is running."""
++        """Start the probe thread once (idempotent). True when it is running.
++
++        The thread is built in an empty context: the first subscriber's profile home, secret scope and
++        ``ACTIVE_SCOPE`` work scope never cross into it, so it neither probes as that profile nor becomes a
++        ``TrackedThread`` that the caller's scope accounts for."""
+         with self._lock:
+             if self._thread is not None and self._thread.is_alive():
+                 return True
+             self._stop.clear()
+             from agent.memory_provider import spawn_context_thread
+ 
+-            self._thread = spawn_context_thread(self._run, name=self.name)
++            self._thread = contextvars.Context().run(spawn_context_thread, self._run, name=self.name, passive=True)
+             self._thread.start()
+             return True
+ 
+@@ -351,13 +397,12 @@ def board_keys() -> dict[str, object]:
+ 
+ 
+ def default_probe() -> dict[str, object]:
+-    """Every counter of this host: each local board's content key, hub.db's cursor, state.db's data_version."""
+-    from hermes_state import _default_db_path
++    """The host-wide counters: each local board's content key and hub.db's cursor. state.db is per profile, so
++    the feed reads each subscribed one itself (:meth:`HostChangeFeed.poll_once`)."""
+     from tui_gateway.kanban_remote_notices import hub_db_path
+ 
+     keys = board_keys()
+     keys[REPLICA] = replica_key(hub_db_path())
+-    keys[STATE] = state_key(Path(_default_db_path()))
+     return keys
+ 
+ 
+diff --git a/tests/hermes_cli/test_host_change_feed.py b/tests/hermes_cli/test_host_change_feed.py
+index 7720e568d8..0155676890 100644
+--- a/tests/hermes_cli/test_host_change_feed.py
++++ b/tests/hermes_cli/test_host_change_feed.py
+@@ -67,13 +67,13 @@ def test_subscriber_is_woken_on_its_due_time_with_no_change():
+ 
+ 
+ def test_only_subscribers_of_a_moved_topic_wake():
+-    src = _Source(**{"board:/b/kanban.db": 1, "replica": 7, "state": 3})
++    src = _Source(**{"board:/b/kanban.db": 1, "replica": 7})
+     feed = _feed(src)
+     boards = feed.subscribe("boards", ["board:*"])
+-    state = feed.subscribe("sessions", ["state"])
+-    src.keys["state"] = 4
++    replica = feed.subscribe("remote", ["replica"])
++    src.keys["replica"] = 8
+     feed.poll_once()
+-    assert state.wait(5.0) == {"state"}
++    assert replica.wait(5.0) == {"replica"}
+     assert boards.wait(0.0) == frozenset()
+ 
+ 
+@@ -98,7 +98,7 @@ def test_first_probe_is_only_a_baseline():
+ 
+ 
+ def test_unreadable_counter_wakes_on_every_probe():
+-    src = _Source(replica=1, state=1)
++    src = _Source(replica=1, other=1)
+     feed = _feed(src)
+     sub = feed.subscribe("x", ["replica"])
+     src.keys["replica"] = hcf.UNKNOWN
+@@ -106,7 +106,7 @@ def test_unreadable_counter_wakes_on_every_probe():
+     assert "replica" in feed.poll_once()  # still unknown: never proof that nothing moved
+     assert sub.wait(0.0) == {"replica"}
+     src.fail = True
+-    assert feed.poll_once() == {"replica", "state"}  # the probe itself failed: every topic is unknown
++    assert feed.poll_once() == {"replica", "other"}  # the probe itself failed: every topic is unknown
+ 
+ 
+ def test_appearing_and_disappearing_topics_move():
+@@ -158,15 +158,15 @@ def test_async_wait_woken_by_change_and_by_due_time():
+ 
+ 
+ def test_probe_thread_wakes_subscriber_and_reports_passes():
+-    src = _Source(state=1)
++    src = _Source(replica=1)
+     feed = hcf.HostChangeFeed(src, interval=0.01)
+-    sub = feed.subscribe("sessions", ["state"])  # autostart
++    sub = feed.subscribe("remote", ["replica"])  # autostart
+     try:
+         from tests.waiting import wait_until
+ 
+         wait_until(lambda: feed.probes >= 2, timeout=10.0)
+-        src.keys["state"] = 2
+-        assert sub.wait(10.0) == {"state"}
++        src.keys["replica"] = 2
++        assert sub.wait(10.0) == {"replica"}
+         counters = la.counters()["change_feed.probe"]
+         assert counters["changes"] >= 1 and counters["skips"] >= 1
+     finally:
+@@ -216,11 +216,128 @@ def test_default_probe_covers_boards_replica_and_state(tmp_path, monkeypatch):
+     keys = hcf.default_probe()
+     assert keys["board:" + str(board)] == ("revision", str(board), 5)
+     assert keys[hcf.REPLICA] is None  # no hub replica on this host
+-    assert hcf.STATE in keys
++    assert not any(t == "state" or t.startswith("state:") for t in keys)  # state.db is per subscriber
+ 
+ 
+ def test_process_feed_never_autostarts_under_pytest():
+     feed = hcf.feed()
+-    feed.subscribe("x", ["state"])
++    feed.subscribe("x", ["replica"])
+     assert feed._thread is None
+     assert hcf.feed() is feed
++
++
++# ---- state.db is resolved per subscriber profile (PR #2633 review nit 1) -------------------------------------
++
++
++def _state_db(home):
++    home.mkdir(parents=True, exist_ok=True)
++    db = home / "state.db"
++    with sqlite3.connect(db) as conn:
++        conn.execute("CREATE TABLE sessions (id TEXT)")
++    return db
++
++
++@pytest.fixture
++def per_profile_state(monkeypatch):
++    """Production resolution of state.db: the hermetic conftest re-points ``DEFAULT_DB_PATH`` (which wins over
++    the profile home); restore the import default so ``_default_db_path`` follows the context's home."""
++    import hermes_state
++
++    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH)
++
++
++def _subscribe_as(feed: hcf.HostChangeFeed, home, name: str) -> hcf.Subscription:
++    """Subscribe to the bare ``state`` topic from a context bound to ``home`` (another profile's loop)."""
++    import contextvars
++
++    import hermes_scope
++
++    def run() -> hcf.Subscription:
++        token = hermes_scope.push_state(home=str(home))
++        try:
++            return feed.subscribe(name, [hcf.STATE])
++        finally:
++            token.reset()
++
++    return contextvars.Context().run(run)
++
++
++@pytest.mark.usefixtures("per_profile_state")
++def test_state_topic_resolves_in_each_subscribers_profile(tmp_path):
++    a_db, b_db = _state_db(tmp_path / "a"), _state_db(tmp_path / "b")
++    feed = hcf.HostChangeFeed(_Source(), autostart=False)
++    feed.poll_once()  # baseline
++    a = _subscribe_as(feed, tmp_path / "a", "sessions-a")
++    b = _subscribe_as(feed, tmp_path / "b", "sessions-b")
++    assert a.topics == (hcf.state_topic(a_db),)
++    assert b.topics == (hcf.state_topic(b_db),)
++    assert feed.poll_once() == frozenset()  # subscribing records each db's baseline: no spurious wake
++
++    with sqlite3.connect(b_db) as conn:
++        conn.execute("INSERT INTO sessions VALUES ('b1')")
++    assert feed.poll_once() == {hcf.state_topic(b_db)}
++    assert b.wait(5.0) == {hcf.state_topic(b_db)}
++    assert a.wait(0.0) == frozenset()  # profile A's loop never wakes for profile B's state.db
++
++    with sqlite3.connect(a_db) as conn:
++        conn.execute("INSERT INTO sessions VALUES ('a1')")
++    assert feed.poll_once() == {hcf.state_topic(a_db)}
++    assert a.wait(5.0) == {hcf.state_topic(a_db)}
++    assert b.wait(0.0) == frozenset()
++
++
++@pytest.mark.usefixtures("per_profile_state")
++def test_state_db_is_probed_only_while_subscribed(tmp_path):
++    db = _state_db(tmp_path / "a")
++    feed = _feed(_Source(replica=1))
++    sub = _subscribe_as(feed, tmp_path / "a", "sessions")
++    assert hcf.state_topic(db) in feed.keys()
++    sub.close()
++    feed.poll_once()
++    assert hcf.state_topic(db) not in feed.keys()
++
++
++@pytest.mark.usefixtures("per_profile_state")
++def test_unreadable_state_db_wakes_its_subscriber(tmp_path):
++    db = _state_db(tmp_path / "a")
++    reads = {"fail": False}
++
++    def state_probe(path):
++        if reads["fail"]:
++            raise sqlite3.OperationalError("disk I/O error")
++        return hcf.state_key(path)
++
++    feed = hcf.HostChangeFeed(_Source(), autostart=False, state_probe=state_probe)
++    feed.poll_once()
++    sub = _subscribe_as(feed, tmp_path / "a", "sessions")
++    reads["fail"] = True
++    assert feed.poll_once() == {hcf.state_topic(db)}
++    assert sub.wait(0.0) == {hcf.state_topic(db)}
++
++
++def test_probe_thread_is_detached_from_the_first_subscribers_scope(tmp_path):
++    import hermes_scope
++    from hermes_cli.local_work import ACTIVE_SCOPE, Registry
++    from hermes_cli.local_work_threads import TrackedThread
++    from tests.waiting import wait_until
++
++    seen: list[tuple[object, object]] = []
++
++    def probe() -> dict[str, object]:
++        seen.append((ACTIVE_SCOPE.get(), hermes_scope.current_state().home))
++        return {}
++
++    registry = Registry(homes=[str(tmp_path)])
++    feed = hcf.HostChangeFeed(probe, interval=0.01)
++    token = hermes_scope.push_state(home=str(tmp_path / "profile-a"))
++    try:
++        with registry.scope("turn", home=str(tmp_path), source="first-subscriber"):
++            feed.subscribe("x", ["replica"])  # autostart inside an active work scope
++            assert not isinstance(feed._thread, TrackedThread)
++        wait_until(lambda: len(seen) >= 1, timeout=10.0)
++        assert registry.snapshot().active == 0  # the probe thread is not that scope's work
++        assert feed._thread.is_alive()
++        assert seen[0] == (None, None)  # no captured work scope, no captured profile home
++    finally:
++        token.reset()
++        feed.stop()
+-- 
+2.43.0
+

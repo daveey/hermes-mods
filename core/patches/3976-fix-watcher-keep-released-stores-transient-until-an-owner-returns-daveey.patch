@@ -1,0 +1,146 @@
+From 7be3b6d97a3d854198b1652eab75791cb4085cb6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:13:39 +0000
+Subject: [PATCH] fix(watcher): keep released stores transient until an owner
+ returns [daveey]
+
+---
+ tests/tui_gateway/test_watch_store_gate.py | 46 ++++++++++++++++++++++
+ tui_gateway/watch_store.py                 | 19 +++++++--
+ 2 files changed, 61 insertions(+), 4 deletions(-)
+
+diff --git a/tests/tui_gateway/test_watch_store_gate.py b/tests/tui_gateway/test_watch_store_gate.py
+index a38712f455..3680a81bab 100644
+--- a/tests/tui_gateway/test_watch_store_gate.py
++++ b/tests/tui_gateway/test_watch_store_gate.py
+@@ -173,10 +173,56 @@ def test_close_all_under_releases_kept_connections(tmp_path):
+             pass
+     close_all_under(tmp_path / "doomed")
+     assert not has_live_connection(inside)
++    for _ in range(3):
++        with watch_store.observed(inside) as (_key, conn):
++            assert conn.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 0
++        assert not has_live_connection(inside), "idle watcher must not reacquire a released profile"
+     assert has_live_connection(outside)
+     watch_store.reset()
+ 
+ 
++def test_released_store_can_be_kept_after_an_owner_reopens(tmp_path):
++    from hermes_cli.sqlite_safe_read import has_live_connection
++    path = tmp_path / "state.db"
++    db = SessionDB(path)
++    db.close()
++    watch_store.reset()
++    with watch_store.observed(path):
++        pass
++    watch_store.release_under(tmp_path)
++    db = SessionDB(path)
++    try:
++        with watch_store.observed(path):
++            pass
++        assert str(path) in watch_store._held
++        assert has_live_connection(path)
++    finally:
++        watch_store.reset()
++        db.close()
++
++
++def test_in_place_restore_reopens_sqlite_page_cache(tmp_path):
++    path, other = tmp_path / "a.db", tmp_path / "b.db"
++    for p, value in ((path, 1), (other, 99)):
++        conn = sqlite3.connect(p)
++        conn.execute("CREATE TABLE t(v)")
++        conn.execute("INSERT INTO t VALUES (?)", (value,))
++        conn.commit()
++        conn.close()
++    watch_store.reset()
++    try:
++        with watch_store.observed(path) as (before, conn):
++            assert conn.execute("SELECT v FROM t").fetchone()[0] == 1
++        inode = path.stat().st_ino
++        shutil.copyfile(other, path)
++        assert path.stat().st_ino == inode
++        with watch_store.observed(path) as (after, conn):
++            assert after != before
++            assert conn.execute("SELECT v FROM t").fetchone()[0] == 99
++    finally:
++        watch_store.reset()
++
++
+ def test_a_transaction_left_open_drops_the_connection(tmp_path):
+     p = tmp_path / "s.db"
+     with sqlite3.connect(p) as conn:
+diff --git a/tui_gateway/watch_store.py b/tui_gateway/watch_store.py
+index 48af016387..6e29ca5424 100644
+--- a/tui_gateway/watch_store.py
++++ b/tui_gateway/watch_store.py
+@@ -27,6 +27,7 @@ _lock = threading.RLock()
+ # so a reopened store re-reads.
+ _held: OrderedDict[str, list] = OrderedDict()
+ _generation = 0
++_released: set[str] = set()
+ 
+ 
+ def _sidecars(path: str) -> dict:
+@@ -46,6 +47,7 @@ def reset() -> None:
+     with _lock:
+         while _held:
+             _drop(next(iter(_held)))
++        _released.clear()
+ 
+ 
+ def forget(db_path) -> None:
+@@ -57,11 +59,13 @@ def forget(db_path) -> None:
+ def release_under(root=None) -> int:
+     """Close every kept connection on a store under ``root`` (every one when None): called by
+     ``hermes_state_registry.close_all``/``close_all_under`` before the header probes are released, so a profile
+-    delete's rmtree meets no kept descriptor. The next watch pass reopens what still exists."""
++    delete's rmtree meets no kept descriptor. Later idle passes use transient readers until
++    another tracked owner has reopened the store."""
+     from hermes_state_common import path_is_under
+     with _lock:
+         doomed = [path for path in _held if root is None or path_is_under(Path(path), Path(root))]
+         for path in doomed:
++            _released.add(path)
+             _drop(path)
+     return len(doomed)
+ 
+@@ -84,7 +88,7 @@ def _open(path: str, ident: tuple[int, int]) -> list:
+         conn.close()
+         raise
+     _generation += 1
+-    held = _held[path] = [ident, conn, _generation, sidecars]
++    held = _held[path] = [ident, conn, _generation, sidecars, (st.st_size, st.st_mtime_ns)]
+     while len(_held) > MAX_STORES:
+         _drop(next(iter(_held)))
+     return held
+@@ -107,11 +111,18 @@ def observed(db_path):
+     inside the block drops the connection, so the next call reopens (a new generation: no stale key matches)."""
+     path = str(db_path)
+     with _lock:
++        transient = path in _released
++        if transient:
++            from hermes_cli.sqlite_safe_read import has_live_connection
++            if has_live_connection(path):
++                _released.discard(path)
++                transient = False
+         try:
+             st = os.stat(path)
+             ident = (st.st_dev, st.st_ino)
+             held = _held.get(path)
+-            if held is not None and (held[0] != ident or _stranded(held, path)):
++            if held is not None and (held[0] != ident or _stranded(held, path)
++                                     or held[4] != (st.st_size, st.st_mtime_ns)):
+                 _drop(path)  # replaced, recreated or a new WAL generation under this path
+                 held = None
+             if held is None:
+@@ -127,5 +138,5 @@ def observed(db_path):
+         except BaseException:
+             _drop(path)
+             raise
+-        if conn.in_transaction:  # a caller's snapshot left open would pin the WAL and hide later commits
++        if transient or conn.in_transaction:  # an idle released store must not regain a kept descriptor
+             _drop(path)
+-- 
+2.43.0
+

@@ -1,0 +1,96 @@
+From 0c1de9cf188992ac94d684dd62a4595f8c67bdbb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:43:12 +0000
+Subject: [PATCH] fix(loop-accounting): preserve inherited nesting after fork
+ [daveey]
+
+Review 5899581555: clearing depth made child-opened nested passes and record() double count CPU already covered by the inherited outer pass. Preserve only the surviving thread depth while clearing its parent exit mark. Deterministic single/repeated-fork tests fail before the fix (1.125 vs 0.75 s), pass after; real fork asserts accounted CPU equals outer CPU. 81 accounting/lease tests and 102 importer tests pass; scripts/check all 20 green.
+---
+ hermes_cli/loop_accounting.py            |  5 +++--
+ tests/hermes_cli/test_loop_accounting.py | 28 +++++++++++++++++++++---
+ 2 files changed, 28 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/loop_accounting.py b/hermes_cli/loop_accounting.py
+index a8b916a7c2..ddfb214956 100644
+--- a/hermes_cli/loop_accounting.py
++++ b/hermes_cli/loop_accounting.py
+@@ -213,8 +213,7 @@ class Pass:
+         else:  # opened before an os.fork, closing in the child: only the child's part, from the fork
+             cpu = _thread_time() - _fork["c0"]
+             wall = _perf() - _fork["w0"]
+-        # Clamped: a fork while a nested pass is open clears the child's depth, so its exits would go negative
+-        # and the thread would never count another outermost pass.
++        # Defensive clamp for callers that cleared thread-local state while a pass was open.
+         _local.depth = max(0, getattr(_local, "depth", 1) - 1)
+         tid = _own_tid() if self._outer else 0
+         with _lock:
+@@ -607,7 +606,9 @@ def _after_fork_child() -> None:
+     _started_at = time.time()
+     _state.pop("exited_accounted", None)
+     _state.update(thread=None, stop=None, pid=os.getpid(), role=None)
++    depth = getattr(_local, "depth", 0)  # this thread's open passes survive on the child's stack
+     _local.__dict__.clear()  # drops this thread's _ThreadExit, queueing the parent's tid: cleared next
++    _local.depth = depth  # child-opened passes remain nested until the inherited outer pass exits
+     _exited_tids.clear()
+     _fork.update(gen=_fork["gen"] + 1, c0=_thread_time(), w0=_perf())
+ 
+diff --git a/tests/hermes_cli/test_loop_accounting.py b/tests/hermes_cli/test_loop_accounting.py
+index 2add9ccf52..ac2d92651b 100644
+--- a/tests/hermes_cli/test_loop_accounting.py
++++ b/tests/hermes_cli/test_loop_accounting.py
+@@ -158,8 +158,7 @@ def test_host_loop_lease_pass_that_raised_before_beat_is_closed_as_an_error(monk
+ 
+ 
+ def test_fork_with_a_nested_pass_open_keeps_counting_outermost_passes():
+-    """The at-fork hook clears the child's thread-local depth while two passes are open: their exits must not
+-    drive depth below 0, or the thread never counts another outermost pass."""
++    """Inherited nested passes unwind to zero, so later outermost passes still count."""
+     with la.pass_("outer"):
+         with la.pass_("inner"):
+             la._after_fork_child()  # what os.fork runs in the child, here on this thread
+@@ -632,13 +631,35 @@ def test_fork_child_does_not_book_negative_cpu_for_pre_fork_passes(monkeypatch):
+     assert la.counters()["after"]["cpu_s"] == pytest.approx(1.0)
+ 
+ 
++@pytest.mark.parametrize("forks", [1, 2])
++def test_child_opened_nested_pass_is_not_accounted_twice(monkeypatch, forks):
++    clock = [50.0]
++    monkeypatch.setattr(la, "_thread_time", lambda: clock[0])
++    with la.pass_("outer"):
++        with la.pass_("inherited_inner"):
++            for _ in range(forks):
++                clock[0] = 0.0
++                la._after_fork_child()
++            with la.pass_("child_inner"):
++                clock[0] += 0.25
++            la.record("child_record", cpu_s=0.125)
++            clock[0] += 0.5
++    assert la._local.depth == 0
++    assert la.counters()["child_inner"]["cpu_s"] == pytest.approx(0.25)
++    assert la.snapshot()["process"]["accounted_cpu_s"] == pytest.approx(0.75)
++    with la.pass_("after"):
++        clock[0] += 0.5
++    assert la.snapshot()["process"]["accounted_cpu_s"] == pytest.approx(1.25)
++
++
+ def _fork_inside_nested_passes() -> int:
+     with la.pass_("outer"):
+         _burn(0.1)  # the parent's thread clock is well past the child's at the fork
+         with la.pass_("inner"):
+             pid = os.fork()
+             if pid == 0:
+-                _burn(0.01)
++                with la.pass_("child_inner"):
++                    _burn(0.01)
+     return pid
+ 
+ 
+@@ -664,4 +685,5 @@ def test_real_fork_child_books_no_negative_cpu_for_pre_fork_passes():
+     assert os.waitstatus_to_exitcode(status) == 0
+     child = json.loads(raw)
+     assert min(child.values()) >= 0.0, child
++    assert child["accounted"] == pytest.approx(child["outer"]), child
+     assert child["inner"] >= 0.005, child  # the child's own CPU inside the pass is booked
+-- 
+2.43.0
+

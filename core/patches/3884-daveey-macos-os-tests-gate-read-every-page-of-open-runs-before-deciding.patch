@@ -1,0 +1,143 @@
+From ac1110c09741307a3e649f3682b37fc71f1c588a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:40:11 +0000
+Subject: [PATCH] [daveey] macos_os_tests_gate: read every page of open runs
+ before deciding
+
+find_waiting() read only the first page (per_page=100) of each open run
+state. Busy hours have 100+ open runs, so a waiting hermes-state job on a
+later page was missed and the scheduled macOS OS-test slot ran on the
+saturated mini instead of yielding (review nit on PR #2655, review
+5898233895).
+
+Now each state's listing is followed with &page=N until a short page. The
+8-way job-list fan-out is unchanged. A state with 10 full pages (1000+
+runs) raises QueueSaturated and the slot skips, so the read stays bounded
+and fails toward yielding; read errors still fail open as before.
+
+Tests (tests/ci/test_macos_os_tests_workflow.py):
+- waiting mini job only on page 2 of in_progress runs -> skip
+  (RED on main: run=True; GREEN here), and no page 3 after a short page
+- 10 full pages of queued runs -> skip without reading job lists
+
+Card: t_01a1d6cbfb81811b
+---
+ scripts/ci/macos_os_tests_gate.py        | 32 +++++++++++++++-----
+ tests/ci/test_macos_os_tests_workflow.py | 38 ++++++++++++++++++++++++
+ 2 files changed, 63 insertions(+), 7 deletions(-)
+
+diff --git a/scripts/ci/macos_os_tests_gate.py b/scripts/ci/macos_os_tests_gate.py
+index 2ec596bd6f..c661bed372 100644
+--- a/scripts/ci/macos_os_tests_gate.py
++++ b/scripts/ci/macos_os_tests_gate.py
+@@ -35,9 +35,16 @@ MINI_LABEL = "hermes-state"
+ WAITING = frozenset({"queued", "waiting", "pending", "requested"})
+ OPEN_RUN_STATES = ("queued", "in_progress", "waiting", "pending", "requested")
+ 
++PAGE_SIZE = 100
++MAX_RUN_PAGES = 10
++
+ Api = Callable[[str], dict[str, Any]]
+ 
+ 
++class QueueSaturated(Exception):
++    """More open runs in one state than the gate reads: the mini is busy."""
++
++
+ def waiting_mini_jobs(jobs: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+     """Jobs that want the mini's label and have no runner yet."""
+     return [
+@@ -49,16 +56,25 @@ def waiting_mini_jobs(jobs: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+ def find_waiting(api: Api, repo: str, own_run_id: int) -> list[dict[str, Any]]:
+     """Every waiting mini job across this repository's open runs, ours excluded.
+ 
+-    Busy hours have 100+ open runs; their job lists are read 8 at a time
+-    (read serially, one probe took ~3 min).
++    Busy hours have 100+ open runs, so each state's listing is read page by
++    page until a short page; a waiting job on page 2 counts like one on page 1.
++    Past MAX_RUN_PAGES full pages the queue is saturated by any measure
++    (QueueSaturated: skip). Job lists are read 8 at a time (read serially,
++    one probe took ~3 min).
+     """
+     run_ids: list[int] = []
+     for state in OPEN_RUN_STATES:
+-        runs = api(f"repos/{repo}/actions/runs?status={state}&per_page=100").get("workflow_runs") or []
+-        for run in runs:
+-            run_id = int(run["id"])
+-            if run_id != own_run_id and run_id not in run_ids:
+-                run_ids.append(run_id)
++        for page in range(1, MAX_RUN_PAGES + 1):
++            path = f"repos/{repo}/actions/runs?status={state}&per_page={PAGE_SIZE}&page={page}"
++            runs = api(path).get("workflow_runs") or []
++            for run in runs:
++                run_id = int(run["id"])
++                if run_id != own_run_id and run_id not in run_ids:
++                    run_ids.append(run_id)
++            if len(runs) < PAGE_SIZE:
++                break
++        else:
++            raise QueueSaturated(f"{MAX_RUN_PAGES * PAGE_SIZE}+ {state} runs")
+ 
+     def jobs(run_id: int) -> list[dict[str, Any]]:
+         return api(f"repos/{repo}/actions/runs/{run_id}/jobs?filter=latest&per_page=100").get("jobs") or []
+@@ -72,6 +88,8 @@ def decide(event: str, api: Api, repo: str, own_run_id: int) -> tuple[bool, str]
+         return True, f"{event} run: not gated"
+     try:
+         waiting = find_waiting(api, repo, own_run_id)
++    except QueueSaturated as exc:
++        return False, f"{exc} open; skipping this slot"
+     except (subprocess.SubprocessError, OSError, ValueError, KeyError, TypeError) as exc:
+         # Any read failure (gh error/timeout, bad JSON, missing field) fails open to testing.
+         return True, f"could not read the mini's queue ({exc}); running anyway"
+diff --git a/tests/ci/test_macos_os_tests_workflow.py b/tests/ci/test_macos_os_tests_workflow.py
+index 188d6b33a3..ef63862230 100644
+--- a/tests/ci/test_macos_os_tests_workflow.py
++++ b/tests/ci/test_macos_os_tests_workflow.py
+@@ -104,6 +104,44 @@ def test_own_run_is_excluded_and_each_run_is_read_once():
+     assert not any("/runs/99/jobs" in c for c in calls)
+ 
+ 
++def _paged_api(pages: dict[str, list[list[dict]]], jobs: dict[int, list[dict]], calls: list[str]):
++    """Like _api, but each state's runs are split into pages served by &page=N (1 when absent)."""
++    def api(path: str):
++        calls.append(path)
++        if "/jobs" in path:
++            run_id = int(path.split("/runs/")[1].split("/")[0])
++            return {"jobs": jobs.get(run_id, [])}
++        state = path.split("status=")[1].split("&")[0]
++        page = int(path.split("page=")[-1].split("&")[0]) if "&page=" in path else 1
++        listing = pages.get(state, [])
++        return {"workflow_runs": listing[page - 1] if page <= len(listing) else []}
++    return api
++
++
++def test_a_mini_job_waiting_only_in_a_later_page_of_runs_still_skips_the_slot():
++    # 100 in-progress runs fill page 1 with nothing waiting; the waiting mini job sits on page 2.
++    calls: list[str] = []
++    page1 = [{"id": i} for i in range(1, 101)]
++    api = _paged_api({"in_progress": [page1, [{"id": 500}]]}, {500: [_job("queued")]}, calls)
++    run, reason = _gate().decide("schedule", api, REPO, own_run_id=99)
++    assert run is False
++    assert "1 job(s) already waiting" in reason
++    assert any("status=in_progress" in c and "&page=2" in c for c in calls)
++    # A short page ends the listing: no page 3 read.
++    assert not any("status=in_progress" in c and "&page=3" in c for c in calls)
++
++
++def test_a_state_with_more_full_pages_than_the_cap_is_treated_as_busy():
++    gate = _gate()
++    calls: list[str] = []
++    full = [[{"id": p * 1000 + i} for i in range(gate.PAGE_SIZE)] for p in range(gate.MAX_RUN_PAGES)]
++    api = _paged_api({"queued": full}, {}, calls)
++    run, reason = gate.decide("schedule", api, REPO, own_run_id=99)
++    assert run is False
++    assert "queued runs open; skipping this slot" in reason
++    assert not any("/jobs" in c for c in calls)
++
++
+ @pytest.mark.parametrize("event", ["workflow_dispatch", "push"])
+ def test_manual_and_probe_runs_are_never_gated(event):
+     def api(path):
+-- 
+2.43.0
+

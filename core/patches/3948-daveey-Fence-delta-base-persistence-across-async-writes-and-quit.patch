@@ -1,0 +1,423 @@
+From 85123c2e0d27597fc5a688068d654d88bb3fd5cb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 15:08:32 -0800
+Subject: [PATCH] [daveey] Fence delta-base persistence across async writes and
+ quit
+
+Problem: review 5899205930 reproduced quit losing an in-flight copy,
+delete being undone by a captured async writer, and quit-only stores
+exceeding the 48 MiB disk budget.
+
+Why: flush cleared dirty keys before awaiting filesystem work; quit
+could no longer see them. Async publication did not revalidate ownership
+after writing. The synchronous path omitted eviction entirely.
+Root (happened): async and terminal writers had no shared publication
+invariant. Keep dirty ownership until publication, serialize async
+flushes, fence on current copy and quit epoch, and use distinct temps.
+Use explicit delete intents so memory eviction does not delete disk bases.
+Both paths enforce the same budget, including interrupted temp files.
+Root (not caught): tests covered idle quit and deletion after completed
+flushes, not deterministic in-flight barriers or repeated quit-only stores.
+Recurrence: prior review fixed hot-base LRU and write amplification, not
+these lifecycle boundaries. No protocol or eligibility changes.
+
+Proof: new barrier and repeated-reopen tests fail in all three reported
+ways on b7a1298be4. After repair, 78 tests pass across delta-reads,
+delta-persistence-lifecycle, json-fetch and slow-link. Typecheck passes
+(with shared worktree dependency link); eslint and scripts/check 20/20
+pass. Live Desktop restart and hub-roll proof remain pending deployment.
+---
+ .../delta-persistence-lifecycle.test.ts       | 151 ++++++++++++++++++
+ apps/desktop/electron/delta-reads.ts          | 112 +++++++++----
+ 2 files changed, 232 insertions(+), 31 deletions(-)
+ create mode 100644 apps/desktop/electron/delta-persistence-lifecycle.test.ts
+
+diff --git a/apps/desktop/electron/delta-persistence-lifecycle.test.ts b/apps/desktop/electron/delta-persistence-lifecycle.test.ts
+new file mode 100644
+index 0000000000..9aedb4f9e4
+--- /dev/null
++++ b/apps/desktop/electron/delta-persistence-lifecycle.test.ts
+@@ -0,0 +1,151 @@
++import fs from 'node:fs'
++import os from 'node:os'
++import path from 'node:path'
++
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import { bodyHash, DELTA_STORE_MAX_BYTES, DeltaBodyStore } from './delta-reads'
++
++const dirs: string[] = []
++
++const directory = () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-lifecycle-'))
++  dirs.push(dir)
++
++  return dir
++}
++
++const reopen = (dir: string) => {
++  const store = new DeltaBodyStore()
++  store.persistTo(dir)
++
++  return store
++}
++
++const gate = () => {
++  let release!: () => void
++  const promise = new Promise<void>(resolve => { release = resolve })
++
++  return { promise, release }
++}
++
++afterEach(() => {
++  vi.restoreAllMocks()
++
++  for (const dir of dirs.splice(0)) {fs.rmSync(dir, { recursive: true, force: true })}
++})
++
++describe('delta persistence lifecycle ordering', () => {
++  it('quit drains a copy whose async flush is waiting for mkdir', async () => {
++    const dir = directory()
++    const store = reopen(dir)
++    const body = Buffer.from('pending body')
++    const entered = gate()
++    const resume = gate()
++    const mkdir = fs.promises.mkdir.bind(fs.promises)
++    vi.spyOn(fs.promises, 'mkdir').mockImplementation(async (...args) => {
++      entered.release()
++      await resume.promise
++
++      return mkdir(...args)
++    })
++    store.put('k', bodyHash(body), body)
++    const flushing = store.flush()
++    await entered.promise
++
++    try {
++      store.flushSync()
++      expect(reopen(dir).get('k')?.body).toEqual(body)
++    } finally {
++      resume.release()
++      await flushing
++    }
++
++    expect(reopen(dir).get('k')?.body).toEqual(body)
++  })
++
++  it.each(['delete', 'replace', 'quit'] as const)('a delayed writer cannot undo %s', async action => {
++    const dir = directory()
++    const store = reopen(dir)
++    const old = Buffer.from('old body')
++    const next = Buffer.from('new body')
++    const entered = gate()
++    const resume = gate()
++    const write = fs.promises.writeFile.bind(fs.promises)
++    vi.spyOn(fs.promises, 'writeFile').mockImplementationOnce(async (...args) => {
++      await write(...args)
++      entered.release()
++      await resume.promise
++    })
++    store.put('k', bodyHash(old), old)
++    const flushing = store.flush()
++    await entered.promise
++
++    try {
++      if (action === 'delete') {
++        const rm = fs.rm.bind(fs)
++        let removed: Promise<void> | undefined
++        vi.spyOn(fs, 'rm').mockImplementation((file, options, callback) => {
++          removed = new Promise(resolve => rm(file, options, error => { callback(error); resolve() }))
++        })
++        store.delete('k')
++
++        if (removed) {await removed}
++        // The async deletion must fence publication even without a quit epoch change.
++      } else {
++        store.put('k', bodyHash(next), next)
++
++        if (action === 'quit') {store.flushSync()}
++      }
++    } finally {
++      resume.release()
++      await flushing
++      await store.flush()
++    }
++
++    expect(reopen(dir).get('k')?.body).toEqual(action === 'delete' ? undefined : next)
++    expect(fs.readdirSync(dir).filter(name => name.endsWith('.tmp'))).toEqual([])
++  })
++
++  it('memory eviction is not a disk invalidation', async () => {
++    const dir = directory()
++    const store = reopen(dir)
++    const old = Buffer.from('persisted')
++    store.put('k', bodyHash(old), old)
++    await store.flush()
++    store.put('k', bodyHash(Buffer.from('changed')), Buffer.from('changed'))
++
++    for (let i = 0; i < 100; i++) {store.put(`other${i}`, bodyHash(old), old)}
++    await store.flush()
++    expect(reopen(dir).get('k')?.body).toEqual(old)
++  })
++
++  it('interrupted temporary writes count toward the quit budget', () => {
++    const dir = directory()
++    const tmp = path.join(dir, `${'a'.repeat(32)}.base.123.tmp`)
++    fs.writeFileSync(tmp, Buffer.alloc(DELTA_STORE_MAX_BYTES))
++    fs.utimesSync(tmp, new Date(0), new Date(0))
++    const store = reopen(dir)
++    const body = Buffer.from('newest')
++    store.put('k', bodyHash(body), body)
++    store.flushSync()
++    expect(fs.existsSync(tmp)).toBe(false)
++    expect(reopen(dir).get('k')?.body).toEqual(body)
++  })
++
++  it('quit-only writes across reopened stores stay within the disk budget', () => {
++    const dir = directory()
++
++    for (let i = 0; i < 4; i++) {
++      const store = reopen(dir)
++      const body = Buffer.alloc(DELTA_STORE_MAX_BYTES / 3, i)
++      store.put(`k${i}`, bodyHash(body), body)
++      store.flushSync()
++      const files = fs.readdirSync(dir)
++      expect(files.reduce((sum, name) => sum + fs.statSync(path.join(dir, name)).size, 0)).toBeLessThanOrEqual(DELTA_STORE_MAX_BYTES)
++
++      for (const name of files) {expect(fs.statSync(path.join(dir, name)).mode & 0o777).toBe(0o600)}
++      expect(reopen(dir).get(`k${i}`)?.hash).toBe(bodyHash(body))
++    }
++  })
++})
+diff --git a/apps/desktop/electron/delta-reads.ts b/apps/desktop/electron/delta-reads.ts
+index 7237e41d02..9432c61a89 100644
+--- a/apps/desktop/electron/delta-reads.ts
++++ b/apps/desktop/electron/delta-reads.ts
+@@ -24,7 +24,7 @@
+ // anything else is removed and that read goes whole, as it would have anyway. A copy only ever names a base: every
+ // read still reaches the backend.
+ 
+-import { createHash } from 'node:crypto'
++import { createHash, randomUUID } from 'node:crypto'
+ import fs from 'node:fs'
+ import path from 'node:path'
+ import { zstdDecompressSync } from 'node:zlib'
+@@ -74,6 +74,7 @@ interface Copy {
+ interface Disk {
+   dir: string
+   dirty: Set<string>
++  deleted: Set<string>
+   // What each read's file holds (the hash last written or loaded) and when it was last written or touched.
+   saved: Map<string, { at: number; hash: string }>
+   tried: Set<string>
+@@ -131,13 +132,15 @@ export class DeltaBodyStore {
+   readonly #scopes = new Map<string, string>()
+   #bytes = 0
+   #disk: Disk | null = null
++  #flushing: Promise<void> | null = null
++  #flushEpoch = 0
+ 
+   /**
+    * Keep each read's newest copy in `dir` as well, so a relaunch still holds the bases (module comment). Nothing is
+    * read until a read asks for its copy; nothing is written on the request path.
+    */
+   persistTo(dir: string): void {
+-    this.#disk = { dir, dirty: new Set(), saved: new Map(), tried: new Set(), timer: null }
++    this.#disk = { dir, dirty: new Set(), deleted: new Set(), saved: new Map(), tried: new Set(), timer: null }
+   }
+ 
+   /**
+@@ -195,6 +198,7 @@ export class DeltaBodyStore {
+       return
+     }
+ 
++    this.#disk?.deleted.delete(key)
+     this.#hold(key, hash, body)
+ 
+     if (!this.#alreadyOnDisk(key, hash)) {
+@@ -262,10 +266,11 @@ export class DeltaBodyStore {
+     const disk = this.#disk
+ 
+     if (disk) {
+-      disk.dirty.delete(key)
+       disk.saved.delete(key)
++      disk.deleted.add(key)
+       disk.tried.add(key)
+-      fs.rm(path.join(disk.dir, diskName(key)), { force: true }, () => undefined)
++      this.#markDirty(key)
++      void this.flush() // removal shares the write publication fence, off the request path
+     }
+   }
+ 
+@@ -277,13 +282,25 @@ export class DeltaBodyStore {
+     this.#copies.delete(key)
+   }
+ 
+-  /** Write every read's newest copy that changed since the last flush, then trim the directory to the budget. */
++  /** Write changed copies off the request path. Dirty ownership lasts until publication, including during quit. */
+   async flush(): Promise<void> {
+-    const disk = this.#disk
++    while (this.#flushing) {await this.#flushing}
+ 
+-    if (!disk) {
+-      return
++    const pending = this.#flushPending()
++
++    this.#flushing = pending
++
++    try {
++      await pending
++    } finally {
++      if (this.#flushing === pending) {this.#flushing = null}
+     }
++  }
++
++  async #flushPending(): Promise<void> {
++    const disk = this.#disk
++
++    if (!disk) {return}
+ 
+     if (disk.timer) {
+       clearTimeout(disk.timer)
+@@ -291,28 +308,41 @@ export class DeltaBodyStore {
+     }
+ 
+     const keys = [...disk.dirty]
+-
+-    disk.dirty.clear()
++    const epoch = this.#flushEpoch
+ 
+     try {
+       await fs.promises.mkdir(disk.dir, { mode: 0o700, recursive: true })
+ 
+       for (const key of keys) {
++        if (epoch !== this.#flushEpoch || disk !== this.#disk) {return}
++
+         const copy = this.#copies.get(key)?.at(-1)
++        const target = path.join(disk.dir, diskName(key))
+ 
+         if (copy) {
+-          const target = path.join(disk.dir, diskName(key))
+-          const tmp = `${target}.${process.pid}.tmp`
+-
+-          await fs.promises.writeFile(tmp, encodeDiskCopy(key, copy), { mode: 0o600 })
+-          await fs.promises.rename(tmp, target)
+-          disk.saved.set(key, { at: Date.now(), hash: copy.hash })
++          const tmp = `${target}.${randomUUID()}.tmp`
++
++          try {
++            await fs.promises.writeFile(tmp, encodeDiskCopy(key, copy), { mode: 0o600 })
++
++            // No await between validation and rename: delete/put/quit cannot interleave with publication.
++            if (epoch !== this.#flushEpoch || disk !== this.#disk || this.#copies.get(key)?.at(-1) !== copy) {continue}
++            fs.renameSync(tmp, target)
++            disk.saved.set(key, { at: Date.now(), hash: copy.hash })
++          } finally {
++            fs.rmSync(tmp, { force: true })
++          }
++        } else if (disk.deleted.has(key)) {
++          fs.rmSync(target, { force: true })
+         }
+-      }
+ 
+-      await this.#trimDisk(disk.dir)
++        disk.dirty.delete(key)
++        disk.deleted.delete(key)
++      }
+     } catch {
+-      // Persistence is an optimisation: an unwritable directory leaves the copies in memory only.
++      // Persistence is an optimisation: an unwritable directory leaves the copies in memory and dirty for retry.
++    } finally {
++      if (epoch === this.#flushEpoch) {this.#trimDisk(disk.dir)}
+     }
+   }
+ 
+@@ -331,7 +361,7 @@ export class DeltaBodyStore {
+ 
+     const keys = [...disk.dirty]
+ 
+-    disk.dirty.clear()
++    this.#flushEpoch += 1 // quit supersedes every captured async copy
+ 
+     try {
+       fs.mkdirSync(disk.dir, { mode: 0o700, recursive: true })
+@@ -341,15 +371,26 @@ export class DeltaBodyStore {
+ 
+         if (copy) {
+           const target = path.join(disk.dir, diskName(key))
+-          const tmp = `${target}.${process.pid}.tmp`
+-
+-          fs.writeFileSync(tmp, encodeDiskCopy(key, copy), { mode: 0o600 })
+-          fs.renameSync(tmp, target)
+-          disk.saved.set(key, { at: Date.now(), hash: copy.hash })
++          const tmp = `${target}.${randomUUID()}.tmp`
++
++          try {
++            fs.writeFileSync(tmp, encodeDiskCopy(key, copy), { mode: 0o600 })
++            fs.renameSync(tmp, target)
++            disk.saved.set(key, { at: Date.now(), hash: copy.hash })
++          } finally {
++            fs.rmSync(tmp, { force: true })
++          }
++        } else if (disk.deleted.has(key)) {
++          fs.rmSync(path.join(disk.dir, diskName(key)), { force: true })
+         }
++
++        disk.dirty.delete(key)
++        disk.deleted.delete(key)
+       }
+     } catch {
+       // as flush()
++    } finally {
++      this.#trimDisk(disk.dir)
+     }
+   }
+ 
+@@ -369,13 +410,22 @@ export class DeltaBodyStore {
+     }
+   }
+ 
+-  async #trimDisk(dir: string): Promise<void> {
++  #trimDisk(dir: string): void {
++    try {
++      this.#trimDiskFiles(dir)
++    } catch {
++      // Missing/unwritable cache: persistence must not interfere with reads or quitting.
++    }
++  }
++
++  #trimDiskFiles(dir: string): void {
+     const files: { at: number; file: string; size: number }[] = []
+ 
+-    for (const name of await fs.promises.readdir(dir)) {
+-      if (name.endsWith(DISK_SUFFIX)) {
++    for (const name of fs.readdirSync(dir)) {
++      // Interrupted writes count too; otherwise repeated hard exits could grow unbounded temporary files.
++      if (name.endsWith(DISK_SUFFIX) || /^[a-f0-9]{32}\.base\.[\da-f-]+\.tmp$/.test(name)) {
+         try {
+-          const stat = await fs.promises.stat(path.join(dir, name))
++          const stat = fs.statSync(path.join(dir, name))
+ 
+           files.push({ at: stat.mtimeMs, file: path.join(dir, name), size: stat.size })
+         } catch {
+@@ -391,7 +441,7 @@ export class DeltaBodyStore {
+         break
+       }
+ 
+-      await fs.promises.rm(file.file, { force: true })
++      fs.rmSync(file.file, { force: true })
+       total -= file.size
+     }
+   }
+@@ -418,7 +468,7 @@ export class DeltaBodyStore {
+     const copy = data.length <= DELTA_STORE_MAX_BYTES + 4096 ? decodeDiskCopy(key, data) : null
+ 
+     if (!copy) {
+-      fs.rm(file, { force: true }, () => undefined) // truncated, damaged or another read's: never a base
++      this.delete(key) // truncated, damaged or another read's: never a base
+ 
+       return undefined
+     }
+-- 
+2.43.0
+

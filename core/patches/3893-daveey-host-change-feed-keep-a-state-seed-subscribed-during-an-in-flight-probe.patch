@@ -1,0 +1,133 @@
+From f4694c980f7daa820286cc628b8dc77caddf0e10 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:49:42 +0000
+Subject: [PATCH] [daveey] host_change_feed: keep a state seed subscribed
+ during an in-flight probe
+
+subscribe() seeds a new state:<path> topic's key so the next probe wakes nobody.
+A subscribe() landing after poll_once() took its state-topic snapshot but before
+it committed lost that seed: the commit replaced _keys with a snapshot that
+lacked the topic, so its subscriber woke twice for nothing ("disappeared", then
+"appeared"). A subscribe() before the baseline commit had no seed at all.
+
+poll_once() now carries over, under the lock, the seed of every live state topic
+it did not read (subscribed after its snapshot), and subscribe() keeps seeds made
+before the baseline in _seeds for the baseline commit to adopt.
+
+Five whys: spurious wakes <- seed dropped <- commit overwrote _keys wholesale
+<- the probe's topic snapshot is taken outside the lock (state reads must not
+hold it) <- nothing reconciled late subscribers at commit. Fix at the commit.
+
+RED (before the fix): test_subscribe_during_an_in_flight_probe_keeps_its_seed
+[after-baseline] and [during-baseline] fail (KeyError: 'state:/b').
+GREEN: tests/hermes_cli/test_host_change_feed.py 21/21.
+
+Follow-up to PR #2682 review 5898329023 (card t_01a1d6d3a86ab228).
+---
+ hermes_cli/host_change_feed.py            | 24 ++++++++++++-----
+ tests/hermes_cli/test_host_change_feed.py | 33 +++++++++++++++++++++++
+ 2 files changed, 51 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/host_change_feed.py b/hermes_cli/host_change_feed.py
+index 1b736b7b96..5d39d64d5d 100644
+--- a/hermes_cli/host_change_feed.py
++++ b/hermes_cli/host_change_feed.py
+@@ -206,6 +206,7 @@ class HostChangeFeed:
+         self.name = name
+         self._lock = threading.Lock()
+         self._keys: Optional[dict[str, object]] = None  # None until the baseline probe
++        self._seeds: dict[str, object] = {}  # state seeds subscribed before the baseline probe committed
+         self._subs: list[Subscription] = []
+         self._thread: Optional[threading.Thread] = None
+         self._stop = threading.Event()
+@@ -222,9 +223,8 @@ class HostChangeFeed:
+         seeds = {t: self._read_state(t) for t in fresh}
+         with self._lock:
+             self._subs.append(sub)
+-            if self._keys is not None:
+-                for topic, key in seeds.items():
+-                    self._keys.setdefault(topic, key)
++            for topic, key in seeds.items():
++                (self._seeds if self._keys is None else self._keys).setdefault(topic, key)
+         if self.autostart:
+             self.start()
+         return sub
+@@ -238,7 +238,10 @@ class HostChangeFeed:
+ 
+     def _state_topics(self) -> set[str]:
+         with self._lock:
+-            return {t for s in self._subs for t in s.topics if t.startswith(STATE_PREFIX) and not t.endswith("*")}
++            return self._state_topics_locked()
++
++    def _state_topics_locked(self) -> set[str]:
++        return {t for s in self._subs for t in s.topics if t.startswith(STATE_PREFIX) and not t.endswith("*")}
+ 
+     def unsubscribe(self, sub: Subscription) -> None:
+         with self._lock:
+@@ -259,11 +262,20 @@ class HostChangeFeed:
+             logger.debug("host change feed probe failed", exc_info=True)
+             with self._lock:
+                 current = {t: UNKNOWN for t in (self._keys or {}) if not t.startswith(STATE_PREFIX)}
+-        for topic in self._state_topics():
++        polled = self._state_topics()
++        for topic in polled:
+             current[topic] = self._read_state(topic)
+         with self._lock:
+             self.probes += 1
+-            previous, self._keys = self._keys, current
++            previous = self._keys
++            # A state topic subscribed after the snapshot above was not read by this probe: keep the seed its
++            # subscribe() recorded, or this commit would drop it and wake that subscriber twice for nothing.
++            seeds = self._seeds if previous is None else previous
++            for topic in self._state_topics_locked() - polled:
++                if topic in seeds:
++                    current[topic] = seeds[topic]
++            self._seeds = {}
++            self._keys = current
+             if previous is None:
+                 return frozenset()
+             moved = frozenset(t for t in current.keys() | previous.keys()
+diff --git a/tests/hermes_cli/test_host_change_feed.py b/tests/hermes_cli/test_host_change_feed.py
+index 0155676890..8bd169f98f 100644
+--- a/tests/hermes_cli/test_host_change_feed.py
++++ b/tests/hermes_cli/test_host_change_feed.py
+@@ -341,3 +341,36 @@ def test_probe_thread_is_detached_from_the_first_subscribers_scope(tmp_path):
+     finally:
+         token.reset()
+         feed.stop()
++
++
++# ---- subscribe() racing an in-flight probe keeps its seed (PR #2682 review nit) ------------------------------
++
++
++def _racing_feed(baseline_first: bool):
++    """A feed whose read of ``state:/a`` subscribes ``state:/b`` once: that subscribe lands after the poll took
++    its state-topic snapshot and before it commits (the probe thread's window)."""
++    keys = {"/a": 1, "/b": 5}
++    late: list[hcf.Subscription] = []
++
++    def state_probe(path):
++        if str(path) == "/a" and armed and not late:
++            late.append(feed.subscribe("late", ["state:/b"]))
++        return keys[str(path)]
++
++    armed = False
++    feed = hcf.HostChangeFeed(_Source(replica=1), autostart=False, state_probe=state_probe)
++    if not baseline_first:
++        feed.poll_once()
++    feed.subscribe("early", ["state:/a"])
++    armed = True
++    return feed, late
++
++
++@pytest.mark.parametrize("baseline_first", [False, True], ids=["after-baseline", "during-baseline"])
++def test_subscribe_during_an_in_flight_probe_keeps_its_seed(baseline_first):
++    feed, late = _racing_feed(baseline_first)
++    assert feed.poll_once() == frozenset()  # the racing poll commits without dropping the new topic's seed
++    assert late, "the probe did not subscribe mid-read"
++    assert feed.keys()["state:/b"] == 5
++    assert feed.poll_once() == frozenset()  # and the next probe wakes nobody for it
++    assert late[0].wait(0.0) == frozenset()
+-- 
+2.43.0
+

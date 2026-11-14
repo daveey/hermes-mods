@@ -1,0 +1,1011 @@
+From 91cb7cb485673d71f3f55b588fe7e864a21ac1c3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:41:25 -0800
+Subject: [PATCH] [daveey] delta responses: keep delta bases across Desktop
+ relaunches and backend rolls
+
+Bases were memory only on both ends. After a Desktop relaunch, an always-on backend roll,
+or while the proxy splits connections between an old and a new backend, every large read
+went whole again, which is when a slow link hurts most.
+
+Measured live 2026-11-13 (hub lo capture, MacBook Desktop, t_01a1d67e18a4b1f8):
+- 30 min of normal use: 2,875 eligible reads, 2,551 as deltas, 90.5% of eligible bytes
+  saved. 324 whole answers carried 67.1 MB of the 69.2 MB on the wire. 269 of them named
+  a base the backend no longer held: the always-on backend rolled about 6 times in 30 min,
+  and during each overlap the proxy alternates old and new backends, each with its own
+  store.
+- First 5 min after a Desktop restart: the restart's whole first round was 48.5% of the
+  window's wire bytes (6.5 MB of 13.5 MB).
+- First 5 min after each roll: whole answers whose base was not held were 84-99% of the
+  window's wire bytes (6-24 MB each).
+
+Desktop (delta-reads.ts): persistDeltaBases(app) (main.ts) has the shared DeltaBodyStore
+keep each read's newest copy in <userData>/delta-bodies. Each copy is written 2 s after it
+arrives and synchronously on will-quit, never on the request path. One 0600 file per
+(scope, path) in a 0700 dir, a header line {format, key, hash} and then the body. The
+budget is 48 MB, least recently written out. A copy is read back lazily on the first use
+of that read. A file is a base only when it names the same scope+path and its body hashes
+to its recorded hash. Anything else is removed and the read goes whole. A failed delta
+removes the file too.
+
+Gateway (web_delta_response.py): BodyStore(disk_dir=<home>/cache/delta-bodies) is shared by
+every backend of that home. Files are 0600 and named <credential namespace>-<body hash>:
+two hex hashes, so the credential is never written. The budget is 64 MB, LRU by mtime. A
+file is a base only when its bytes hash to its name's digest. The always-on token is
+persisted and never rotated by a roll, so a rolled (or overlapping) backend can encode
+against the base another one sent. A Desktop-owned `serve` mints a new token per spawn, so
+its successor cannot use the old namespace: by design, nothing crosses credentials.
+
+Nothing changes in eligibility, headers or verification. A persisted copy only ever
+supplies a delta base, never an answer.
+main.ts stays at its line cap: a 6-line options literal in the OAuth fetch path is now one
+line.
+
+Tests: delta-reads.test.ts (re-open gives a verified delta, debounce + quit flush,
+truncated/flipped/empty/header-only file goes whole and is removed, another scope cannot
+read it even renamed, 0600/0700 and no credential, failed delta removes the file, disk
+budget LRU, unwritable dir stays in memory, persistDeltaBases wiring), and
+test_web_delta_response.py (re-open gives a verified delta, damaged file goes whole and is
+replaced, another credential namespace cannot read it, 0600/0700 and hashed names, disk
+LRU budget, non-hex keys never become paths, home cache location, unwritable dir).
+---
+ apps/desktop/electron/delta-reads.test.ts   | 212 +++++++++++++++-
+ apps/desktop/electron/delta-reads.ts        | 254 +++++++++++++++++++-
+ apps/desktop/electron/main.ts               |  10 +-
+ hermes_cli/web_delta_response.py            | 129 +++++++++-
+ tests/hermes_cli/test_web_delta_response.py | 127 ++++++++++
+ 5 files changed, 713 insertions(+), 19 deletions(-)
+
+diff --git a/apps/desktop/electron/delta-reads.test.ts b/apps/desktop/electron/delta-reads.test.ts
+index 9c2d4a70d8..8f2bab837a 100644
+--- a/apps/desktop/electron/delta-reads.test.ts
++++ b/apps/desktop/electron/delta-reads.test.ts
+@@ -1,8 +1,11 @@
++import fs from 'node:fs'
+ import http from 'node:http'
+ import type { AddressInfo } from 'node:net'
++import os from 'node:os'
++import path from 'node:path'
+ import { gzipSync, zstdCompressSync } from 'node:zlib'
+ 
+-import { afterAll, describe, expect, it } from 'vitest'
++import { afterAll, afterEach, describe, expect, it } from 'vitest'
+ 
+ import { destroyKeepaliveAgents, shouldRetryRequest, withRetry } from './api-transport'
+ import {
+@@ -10,6 +13,7 @@ import {
+   decodeDeltaBody,
+   DELTA_ACCEPT_HEADER,
+   DELTA_BASE_HEADER,
++  DELTA_DISK_FLUSH_MS,
+   DELTA_RETRY_CODE,
+   DELTA_STORE_MAX_BYTES,
+   DELTA_STORE_MAX_ENTRIES,
+@@ -17,6 +21,7 @@ import {
+   deltaBodyStore,
+   deltaRequestHeaders,
+   DeltaRetryError,
++  persistDeltaBases,
+   readEncodingHeaders
+ } from './delta-reads'
+ import { fetchJsonWith, type JsonFetchDeps } from './json-fetch'
+@@ -385,6 +390,211 @@ describe('the copy store', () => {
+   })
+ })
+ 
++describe('persisted copies (persistTo): a relaunch still holds the bases', () => {
++  const dirs: string[] = []
++
++  const tmpDir = () => {
++    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-bases-'))
++
++    dirs.push(dir)
++
++    return path.join(dir, 'delta-bodies')
++  }
++
++  const reopened = (dir: string, scope = SCOPE) => {
++    const store = new DeltaBodyStore()
++
++    store.persistTo(dir)
++    store.bindRemote(`${HUB}/`, scope)
++
++    return store
++  }
++
++  const files = (dir: string) => (fs.existsSync(dir) ? fs.readdirSync(dir).map(name => path.join(dir, name)) : [])
++
++  afterEach(() => {
++    for (const dir of dirs.splice(0)) {
++      fs.rmSync(dir, { force: true, recursive: true })
++    }
++  })
++
++  it('a copy survives a store re-open and the next read is a verified delta against it', async () => {
++    const dir = tmpDir()
++    const first = reopened(dir)
++    const v1 = cards(3000)
++
++    decodeDeltaBody(BOARD, whole(v1), v1, first)
++    expect(files(dir)).toEqual([]) // written after the debounce, never on the request path
++    await first.flush()
++
++    const relaunched = reopened(dir)
++
++    expect(deltaRequestHeaders('GET', BOARD, relaunched)).toEqual({ [DELTA_ACCEPT_HEADER]: 'zstd', [DELTA_BASE_HEADER]: bodyHash(v1) })
++
++    const v2 = cards(3000, 7)
++    const { body, response } = delta(v1, v2)
++
++    expect(body.length).toBeLessThan(v1.length / 50)
++    expect(decodeDeltaBody(BOARD, response, body, relaunched)).toBe(v2.toString('utf8'))
++  })
++
++  it('writes on its own a moment after the read, and on quit synchronously', async () => {
++    const dir = tmpDir()
++    const store = reopened(dir)
++    const v1 = cards(500)
++
++    store.put('k', bodyHash(v1), v1)
++    await new Promise(resolve => setTimeout(resolve, DELTA_DISK_FLUSH_MS + 300))
++    expect(files(dir)).toHaveLength(1)
++
++    store.put('q', bodyHash(v1), v1)
++    store.flushSync()
++    expect(files(dir)).toHaveLength(2)
++  })
++
++  it.each(['truncate', 'flip', 'empty', 'header only'])('a %s file is dropped and the read goes whole', async damage => {
++    const dir = tmpDir()
++    const first = reopened(dir)
++    const v1 = cards(3000)
++
++    decodeDeltaBody(BOARD, whole(v1), v1, first)
++    await first.flush()
++
++    const [file] = files(dir)
++    const data = fs.readFileSync(file)
++    const flipped = Buffer.from(data)
++
++    flipped[data.length - 10] ^= 1
++    fs.writeFileSync(
++      file,
++      {
++        empty: Buffer.alloc(0),
++        flip: flipped,
++        'header only': data.subarray(0, data.indexOf(0x0a) + 1),
++        truncate: data.subarray(0, data.length / 2)
++      }[damage]!
++    )
++
++    const relaunched = reopened(dir)
++
++    expect(deltaRequestHeaders('GET', BOARD, relaunched)).toEqual({ [DELTA_ACCEPT_HEADER]: 'zstd' })
++    await new Promise(resolve => setTimeout(resolve, 50))
++    expect(files(dir)).toEqual([])
++  })
++
++  it('another scope cannot read a persisted copy, even renamed to its own file', async () => {
++    const dir = tmpDir()
++    const first = reopened(dir)
++    const v1 = cards(3000)
++
++    decodeDeltaBody(BOARD, whole(v1), v1, first)
++    await first.flush()
++
++    const other = reopened(dir, 'conn:other-host::default')
++
++    expect(deltaRequestHeaders('GET', BOARD, other)).toEqual({ [DELTA_ACCEPT_HEADER]: 'zstd' })
++
++    // Same bytes under the other scope's file name: the header names the read it was written for.
++    const [file] = files(dir)
++    const probe = reopened(dir, 'conn:other-host::default')
++    const otherKey = probe.keyFor(BOARD)!
++    const { createHash } = await import('node:crypto')
++    const otherFile = path.join(dir, `${createHash('sha256').update(otherKey).digest('hex').slice(0, 32)}.base`)
++
++    fs.copyFileSync(file, otherFile)
++    expect(deltaRequestHeaders('GET', BOARD, probe)).toEqual({ [DELTA_ACCEPT_HEADER]: 'zstd' })
++  })
++
++  it('files are 0600 in a 0700 directory and never hold a request credential', async () => {
++    const dir = tmpDir()
++    const store = reopened(dir)
++    const v1 = cards(3000)
++
++    decodeDeltaBody(BOARD, whole(v1), v1, store)
++    await store.flush()
++
++    const [file] = files(dir)
++
++    expect(fs.statSync(file).mode & 0o777).toBe(0o600)
++    expect(fs.statSync(dir).mode & 0o777).toBe(0o700)
++    expect(fs.readFileSync(file).includes(Buffer.from('session-token'))).toBe(false)
++  })
++
++  it('a failed delta removes the persisted copy too, so no relaunch names it again', async () => {
++    const dir = tmpDir()
++    const store = reopened(dir)
++    const v1 = cards(3000)
++
++    decodeDeltaBody(BOARD, whole(v1), v1, store)
++    await store.flush()
++    expect(files(dir)).toHaveLength(1)
++
++    const { response } = delta(v1, cards(3000, 2))
++
++    expect(() => decodeDeltaBody(BOARD, response, Buffer.from('damaged'), store)).toThrow(DeltaRetryError)
++    await new Promise(resolve => setTimeout(resolve, 50))
++    expect(files(dir)).toEqual([])
++    expect(deltaRequestHeaders('GET', BOARD, reopened(dir))).toEqual({ [DELTA_ACCEPT_HEADER]: 'zstd' })
++  })
++
++  it('the directory keeps the same byte budget, least recently written out first', async () => {
++    const dir = tmpDir()
++    const store = reopened(dir)
++    const big = (fill: number) => Buffer.alloc(DELTA_STORE_MAX_BYTES / 3, fill)
++
++    for (const [index, name] of ['a', 'b', 'c', 'd'].entries()) {
++      const body = big(index + 1)
++
++      store.put(name, bodyHash(body), body)
++      await store.flush()
++      await new Promise(resolve => setTimeout(resolve, 20)) // distinct mtimes
++    }
++
++    const total = files(dir).reduce((sum, file) => sum + fs.statSync(file).size, 0)
++
++    expect(total).toBeLessThanOrEqual(DELTA_STORE_MAX_BYTES)
++    expect(files(dir)).toHaveLength(2)
++
++    const relaunched = reopened(dir)
++
++    expect(relaunched.get('a')).toBeUndefined()
++    expect(relaunched.get('d')?.hash).toBe(bodyHash(big(4)))
++  })
++
++  it('persistDeltaBases (main.ts) keeps the copies under userData and writes the pending ones on will-quit', () => {
++    const userData = path.dirname(tmpDir())
++    const quit: (() => void)[] = []
++    const app = { getPath: () => userData, on: (_event: 'will-quit', listener: () => void) => quit.push(listener) }
++    const store = new DeltaBodyStore()
++
++    persistDeltaBases(app, store)
++    store.bindRemote(`${HUB}/`, SCOPE)
++
++    const v1 = cards(3000)
++
++    decodeDeltaBody(BOARD, whole(v1), v1, store)
++    expect(files(path.join(userData, 'delta-bodies'))).toEqual([])
++    quit.forEach(listener => listener())
++    expect(files(path.join(userData, 'delta-bodies'))).toHaveLength(1)
++    expect(reopened(path.join(userData, 'delta-bodies')).get(store.keyFor(BOARD)!)?.hash).toBe(bodyHash(v1))
++  })
++
++  it('an unwritable directory leaves the copies in memory', async () => {
++    const parent = tmpDir()
++
++    fs.mkdirSync(path.dirname(parent), { recursive: true })
++    fs.writeFileSync(parent, 'not a directory')
++
++    const store = reopened(path.join(parent, 'sub'))
++    const v1 = cards(3000)
++
++    decodeDeltaBody(BOARD, whole(v1), v1, store)
++    await store.flush()
++    store.flushSync()
++    expect(store.get(store.keyFor(BOARD)!)?.hash).toBe(bodyHash(v1))
++  })
++})
++
+ describe('fetchJson itself (json-fetch.ts), against a live server that speaks the gateway protocol', () => {
+   const seen: { base: string; accept: string; token: string }[] = []
+   const known = new Map<string, Buffer>()
+diff --git a/apps/desktop/electron/delta-reads.ts b/apps/desktop/electron/delta-reads.ts
+index 50322386f5..9e66a80690 100644
+--- a/apps/desktop/electron/delta-reads.ts
++++ b/apps/desktop/electron/delta-reads.ts
+@@ -17,9 +17,16 @@
+ // A backend that predates this ignores the request headers and answers as before.
+ //
+ // Copies are kept per remote scope and path (not per tunnel port), so the full refetch after a tunnel rebuild,
+-// which is when a slow link hurts most, is a delta too. Memory only: a relaunch starts with whole bodies.
++// which is when a slow link hurts most, is a delta too. With persistTo() (main.ts: <userData>/delta-bodies) each
++// read's newest copy also outlives a relaunch: written a moment after it arrives (never on the request path), one
++// 0600 file per read, the same byte budget, least recently written out; read back lazily on the first use of that
++// read. A file is a base only when its body hashes to the hash it records and it names the same scope and path;
++// anything else is removed and that read goes whole, as it would have anyway. A copy only ever names a base: every
++// read still reaches the backend.
+ 
+ import { createHash } from 'node:crypto'
++import fs from 'node:fs'
++import path from 'node:path'
+ import { zstdDecompressSync } from 'node:zlib'
+ 
+ import { decodeResponseBody, displayTranscriptHeaders } from './display-transcript'
+@@ -33,6 +40,10 @@ export const DELTA_STORE_MAX_ENTRIES = 96
+ export const DELTA_COPIES_PER_READ = 2
+ // A decoded body larger than this is never a delta we asked for (the gateway caps what it encodes).
+ export const DELTA_MAX_DECODED_BYTES = 16 * 1024 * 1024
++// How long a new copy waits before it is written to disk: a burst of reads costs one write per read.
++export const DELTA_DISK_FLUSH_MS = 2_000
++const DISK_FORMAT = 'hermes-delta-base/1'
++const DISK_SUFFIX = '.base'
+ 
+ export const bodyHash = (body: Buffer) => createHash('sha256').update(body).digest('hex').slice(0, 32)
+ 
+@@ -58,6 +69,51 @@ interface Copy {
+   hash: string
+ }
+ 
++interface Disk {
++  dir: string
++  dirty: Set<string>
++  tried: Set<string>
++  timer: null | ReturnType<typeof setTimeout>
++}
++
++const diskName = (key: string) => `${createHash('sha256').update(key).digest('hex').slice(0, 32)}${DISK_SUFFIX}`
++
++/** One persisted copy: a JSON header line naming the read and the body's hash, then the body's exact bytes. */
++function encodeDiskCopy(key: string, copy: Copy): Buffer {
++  return Buffer.concat([Buffer.from(`${JSON.stringify({ format: DISK_FORMAT, hash: copy.hash, key })}\n`), copy.body])
++}
++
++function decodeDiskCopy(key: string, data: Buffer): Copy | null {
++  const eol = data.indexOf(0x0a)
++
++  if (eol < 0) {
++    return null
++  }
++
++  try {
++    const meta = JSON.parse(data.subarray(0, eol).toString('utf8')) as {
++      format?: unknown
++      hash?: unknown
++      key?: unknown
++    }
++
++    const body = Buffer.from(data.subarray(eol + 1))
++
++    if (
++      meta.format !== DISK_FORMAT ||
++      meta.key !== key ||
++      typeof meta.hash !== 'string' ||
++      bodyHash(body) !== meta.hash
++    ) {
++      return null
++    }
++
++    return { body, hash: meta.hash }
++  } catch {
++    return null
++  }
++}
++
+ /**
+  * The copies deltas are decoded against, and which tunnel baseUrl belongs to which remote scope.
+  *
+@@ -70,6 +126,15 @@ export class DeltaBodyStore {
+   readonly #copies = new Map<string, Copy[]>()
+   readonly #scopes = new Map<string, string>()
+   #bytes = 0
++  #disk: Disk | null = null
++
++  /**
++   * Keep each read's newest copy in `dir` as well, so a relaunch still holds the bases (module comment). Nothing is
++   * read until a read asks for its copy; nothing is written on the request path.
++   */
++  persistTo(dir: string): void {
++    this.#disk = { dir, dirty: new Set(), tried: new Set(), timer: null }
++  }
+ 
+   /**
+    * A remote (SSH-tunnelled) backend now answers at baseUrl for this pool scope. A scope has one tunnel, so one
+@@ -111,12 +176,12 @@ export class DeltaBodyStore {
+ 
+   /** The newest copy of a read: the base to name in the next request. */
+   get(key: string): Copy | undefined {
+-    return this.#touch(key)?.at(-1)
++    return (this.#touch(key) ?? this.#load(key))?.at(-1)
+   }
+ 
+   /** The held copy with this hash, newest or previous: the base a delta response says it was encoded against. */
+   find(key: string, hash: string): Copy | undefined {
+-    return this.#touch(key)?.find(copy => copy.hash === hash)
++    return (this.#touch(key) ?? this.#load(key))?.find(copy => copy.hash === hash)
+   }
+ 
+   put(key: string, hash: string, body: Buffer): void {
+@@ -126,9 +191,14 @@ export class DeltaBodyStore {
+       return
+     }
+ 
++    this.#hold(key, hash, body)
++    this.#markDirty(key)
++  }
++
++  #hold(key: string, hash: string, body: Buffer): void {
+     const kept = (this.#copies.get(key) ?? []).filter(copy => copy.hash !== hash)
+ 
+-    this.delete(key)
++    this.#drop(key)
+ 
+     const copies = [...kept, { body, hash }].slice(-DELTA_COPIES_PER_READ)
+ 
+@@ -144,12 +214,25 @@ export class DeltaBodyStore {
+         this.#copies.set(key, rest)
+         this.#bytes -= previous.body.length
+       } else {
+-        this.delete(oldest)
++        this.#drop(oldest) // memory only: the disk keeps its own budget
+       }
+     }
+   }
+ 
++  /** Forget a read, on disk too: its copy failed (or is too large to keep), so no relaunch may name it again. */
+   delete(key: string): void {
++    this.#drop(key)
++
++    const disk = this.#disk
++
++    if (disk) {
++      disk.dirty.delete(key)
++      disk.tried.add(key)
++      fs.rm(path.join(disk.dir, diskName(key)), { force: true }, () => undefined)
++    }
++  }
++
++  #drop(key: string): void {
+     for (const copy of this.#copies.get(key) ?? []) {
+       this.#bytes -= copy.body.length
+     }
+@@ -157,6 +240,158 @@ export class DeltaBodyStore {
+     this.#copies.delete(key)
+   }
+ 
++  /** Write every read's newest copy that changed since the last flush, then trim the directory to the budget. */
++  async flush(): Promise<void> {
++    const disk = this.#disk
++
++    if (!disk) {
++      return
++    }
++
++    if (disk.timer) {
++      clearTimeout(disk.timer)
++      disk.timer = null
++    }
++
++    const keys = [...disk.dirty]
++
++    disk.dirty.clear()
++
++    try {
++      await fs.promises.mkdir(disk.dir, { mode: 0o700, recursive: true })
++
++      for (const key of keys) {
++        const copy = this.#copies.get(key)?.at(-1)
++
++        if (copy) {
++          const target = path.join(disk.dir, diskName(key))
++          const tmp = `${target}.${process.pid}.tmp`
++
++          await fs.promises.writeFile(tmp, encodeDiskCopy(key, copy), { mode: 0o600 })
++          await fs.promises.rename(tmp, target)
++        }
++      }
++
++      await this.#trimDisk(disk.dir)
++    } catch {
++      // Persistence is an optimisation: an unwritable directory leaves the copies in memory only.
++    }
++  }
++
++  /** The same flush, synchronously, for quit (an async write would not finish before the process exits). */
++  flushSync(): void {
++    const disk = this.#disk
++
++    if (!disk) {
++      return
++    }
++
++    if (disk.timer) {
++      clearTimeout(disk.timer)
++      disk.timer = null
++    }
++
++    const keys = [...disk.dirty]
++
++    disk.dirty.clear()
++
++    try {
++      fs.mkdirSync(disk.dir, { mode: 0o700, recursive: true })
++
++      for (const key of keys) {
++        const copy = this.#copies.get(key)?.at(-1)
++
++        if (copy) {
++          const target = path.join(disk.dir, diskName(key))
++          const tmp = `${target}.${process.pid}.tmp`
++
++          fs.writeFileSync(tmp, encodeDiskCopy(key, copy), { mode: 0o600 })
++          fs.renameSync(tmp, target)
++        }
++      }
++    } catch {
++      // as flush()
++    }
++  }
++
++  #markDirty(key: string): void {
++    const disk = this.#disk
++
++    if (!disk) {
++      return
++    }
++
++    disk.dirty.add(key)
++    disk.tried.add(key) // memory now holds a newer copy than any file
++
++    if (!disk.timer) {
++      disk.timer = setTimeout(() => void this.flush(), DELTA_DISK_FLUSH_MS)
++      disk.timer.unref?.()
++    }
++  }
++
++  async #trimDisk(dir: string): Promise<void> {
++    const files: { at: number; file: string; size: number }[] = []
++
++    for (const name of await fs.promises.readdir(dir)) {
++      if (name.endsWith(DISK_SUFFIX)) {
++        try {
++          const stat = await fs.promises.stat(path.join(dir, name))
++
++          files.push({ at: stat.mtimeMs, file: path.join(dir, name), size: stat.size })
++        } catch {
++          // gone already
++        }
++      }
++    }
++
++    let total = files.reduce((sum, file) => sum + file.size, 0)
++
++    for (const file of files.sort((a, b) => a.at - b.at)) {
++      if (total <= DELTA_STORE_MAX_BYTES) {
++        break
++      }
++
++      await fs.promises.rm(file.file, { force: true })
++      total -= file.size
++    }
++  }
++
++  /** A read's persisted copy, held from now on; once per read and process, and only for a read memory lacks. */
++  #load(key: string): Copy[] | undefined {
++    const disk = this.#disk
++
++    if (!disk || disk.tried.has(key)) {
++      return undefined
++    }
++
++    disk.tried.add(key)
++
++    const file = path.join(disk.dir, diskName(key))
++    let data: Buffer
++
++    try {
++      data = fs.readFileSync(file)
++    } catch {
++      return undefined
++    }
++
++    const copy = data.length <= DELTA_STORE_MAX_BYTES + 4096 ? decodeDiskCopy(key, data) : null
++
++    if (!copy) {
++      fs.rm(file, { force: true }, () => undefined) // truncated, damaged or another read's: never a base
++
++      return undefined
++    }
++
++    const now = new Date()
++
++    fs.utimes(file, now, now, () => undefined) // recently used: last out of the disk budget
++    this.#hold(key, copy.hash, copy.body)
++
++    return this.#copies.get(key)
++  }
++
+   get size(): number {
+     return this.#copies.size
+   }
+@@ -187,6 +422,15 @@ function originOf(baseUrl: null | string | undefined): string {
+ 
+ export const deltaBodyStore = new DeltaBodyStore()
+ 
++/** main.ts: the shared store keeps its copies under userData, and writes what is still pending as the app quits. */
++export function persistDeltaBases(
++  app: { getPath(name: 'userData'): string; on(event: 'will-quit', listener: () => void): unknown },
++  store: DeltaBodyStore = deltaBodyStore
++): void {
++  store.persistTo(path.join(app.getPath('userData'), 'delta-bodies'))
++  app.on('will-quit', () => store.flushSync())
++}
++
+ /** Request headers that ask a remote backend for a delta. Empty for a non-GET and for a backend that is not bound. */
+ export function deltaRequestHeaders(
+   method: string | undefined,
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 9628a23a00..b5f59df4c8 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -216,6 +216,7 @@ import { describeCrashReason, installCrashForensics } from './crash-forensics'
+ import { adoptServedDashboardToken } from './dashboard-token'
+ import { resolveDesktopHermesHome, resolveDesktopUserData } from './data-paths'
+ import { registerDeepLinkProtocol as registerDeepLinkProtocolWith } from './deep-link-protocol'
++import { persistDeltaBases } from './delta-reads'
+ import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
+ import { formatDesktopLogLine, formatLogStamp } from './desktop-log-line'
+ import {
+@@ -789,6 +790,8 @@ if (!isPrimaryInstance) {
+   app.exit(0)
+ }
+ 
++persistDeltaBases(app) // [daveey] delta-reads.ts: remote reads' copies outlive a relaunch, so the first read is a delta
++
+ // `hermes desktop` shortens TMPDIR only so the lock above can bind its socket (#124688). The
+ // backend and every other child get the real one (the profile scratch dir) back.
+ if (process.env.HERMES_DESKTOP_TMPDIR) {
+@@ -14855,12 +14858,7 @@ async function fetchJsonForBackendOnce(descriptor: any, path: string, opts: Back
+       throw new Error('File uploads are not supported against OAuth-gated remote backends yet.')
+     }
+ 
+-    const options = {
+-      method: opts.method,
+-      body: opts.body,
+-      timeoutMs,
+-      headers: descriptor.headers
+-    }
++    const options = { method: opts.method, body: opts.body, timeoutMs, headers: descriptor.headers }
+ 
+     const answer = await requestWithOauthFallback(descriptor.baseUrl, {
+       ensureNativeAccessToken,
+diff --git a/hermes_cli/web_delta_response.py b/hermes_cli/web_delta_response.py
+index b06280361a..5deabcc85e 100644
+--- a/hermes_cli/web_delta_response.py
++++ b/hermes_cli/web_delta_response.py
+@@ -30,6 +30,12 @@ profile or principal was sent. A caller with no credential (the public paths pas
+ namespace that holds only what such callers were sent. A credential that changes on every request (single-use
+ grants) simply never gets a delta.
+ 
++Bases outlive the process: the dashboard's store also keeps each body in ``<home>/cache/delta-bodies`` (0600 files
++named ``<credential namespace>-<body hash>``, both hashes; 64 MB, least recently used out), which every backend of
++that home shares. After an always-on roll the new backend still holds the bases the old one sent, so the Desktop's
++first reads are deltas instead of whole bodies. A file is a base only when its bytes hash to the name's digest. It
++never answers a request: the handler always runs.
++
+ Failure never costs the answer: if encoding raises, or the body's length is not its declared Content-Length, the
+ handler's response goes out as it was.
+ """
+@@ -37,12 +43,16 @@ handler's response goes out as it was.
+ from __future__ import annotations
+ 
+ import asyncio
++import contextlib
+ import hashlib
+ import logging
+ import math
++import os
++import re
+ import threading
+ from collections import OrderedDict
+-from typing import Optional
++from pathlib import Path
++from typing import Callable, Optional
+ 
+ from starlette.datastructures import Headers, MutableHeaders
+ from starlette.types import ASGIApp, Message, Receive, Scope, Send
+@@ -66,6 +76,7 @@ FRAMES_MAX_ENTRIES = 512
+ ZSTD_LEVEL = 3
+ CREDENTIAL_HEADERS = ("x-hermes-session-token", "authorization", "cookie")
+ VARY_ON = ("X-Hermes-Delta-Accept", "X-Hermes-Delta-Base")
++_HEX32 = re.compile(r"[0-9a-f]{32}")
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -100,9 +111,20 @@ class BodyStore:
+     It also remembers recent delta frames by (namespace, base hash, body hash): a client polling an unchanged
+     route names the same base for the same body every time, so the zstd encode runs once per change, not once
+     per poll (t_01a1d59ed9eb75fe). The body hash is the route's change key; a new body is a new key, encoded
+-    on the request that first sees it. [daveey]"""
+-
+-    def __init__(self, max_bytes: int = STORE_MAX_BYTES, frames_max_bytes: int = FRAMES_MAX_BYTES):
++    on the request that first sees it. [daveey]
++
++    With ``disk_dir`` every body is also written there (one 0600 file per key, LRU by mtime, the same byte budget),
++    so a backend started later (an always-on roll, a restart) can still decode against a base an earlier backend
++    sent. A file is used only when its bytes hash to the digest in its key; anything else is removed and the read
++    goes whole. ``disk_dir`` may be a callable resolved on first use (the home is not final at import time).
++    Frames are memory-only."""
++
++    def __init__(
++        self,
++        max_bytes: int = STORE_MAX_BYTES,
++        frames_max_bytes: int = FRAMES_MAX_BYTES,
++        disk_dir: Path | Callable[[], Path] | None = None,
++    ):
+         self._max_bytes = max_bytes
+         self._bodies: OrderedDict[str, bytes] = OrderedDict()
+         self._bytes = 0
+@@ -110,6 +132,7 @@ class BodyStore:
+         self._frames: OrderedDict[str, Optional[bytes]] = OrderedDict()
+         self._frames_bytes = 0
+         self._lock = threading.Lock()
++        self._disk_dir = disk_dir
+ 
+     def frame(self, key: str) -> tuple[bool, Optional[bytes]]:
+         """(remembered, frame); a remembered ``None`` is an encode that came out no smaller than its body."""
+@@ -138,22 +161,114 @@ class BodyStore:
+             body = self._bodies.get(digest)
+             if body is not None:
+                 self._bodies.move_to_end(digest)
+-            return body
++                return body
++        body = self._disk_get(digest)
++        if body is not None:
++            self._remember(digest, body)
++        return body
+ 
+     def put(self, digest: str, body: bytes) -> None:
++        if self._remember(digest, body):
++            self._disk_put(digest, body)
++
++    def _remember(self, digest: str, body: bytes) -> bool:
++        """Hold ``body`` in memory; False when it already was."""
+         with self._lock:
+             if digest in self._bodies:
+                 self._bodies.move_to_end(digest)
+-                return
++                return False
+             self._bodies[digest] = body
+             self._bytes += len(body)
+             while self._bytes > self._max_bytes and self._bodies:
+                 _, dropped = self._bodies.popitem(last=False)
+                 self._bytes -= len(dropped)
++            return True
+ 
+     def __len__(self) -> int:
+         return len(self._bodies)
+ 
++    # ── on disk ──────────────────────────────────────────────────────────────────────────────────────────
++
++    def _dir(self) -> Optional[Path]:
++        if callable(self._disk_dir):
++            try:
++                self._disk_dir = Path(self._disk_dir())
++            except Exception:
++                logger.warning("delta response: no directory for persisted bases; memory only", exc_info=True)
++                self._disk_dir = None
++        return self._disk_dir
++
++    @staticmethod
++    def _file_name(key: str) -> Optional[str]:
++        """``<namespace or _>-<digest>``: both parts are hex hashes (the credential itself is never written)."""
++        namespace, _, digest = key.rpartition(":")
++        if not _HEX32.fullmatch(digest) or (namespace and not _HEX32.fullmatch(namespace)):
++            return None
++        return f"{namespace or '_'}-{digest}"
++
++    def _disk_get(self, key: str) -> Optional[bytes]:
++        root, name = self._dir(), self._file_name(key)
++        if root is None or name is None:
++            return None
++        path = root / name
++        try:
++            body = path.read_bytes()
++        except OSError:
++            return None
++        if body_hash(body) != key.rpartition(":")[2]:  # truncated, corrupted or not ours: never a base
++            with contextlib.suppress(OSError):
++                path.unlink()
++            return None
++        with contextlib.suppress(OSError):
++            os.utime(path)  # most recently used
++        return body
++
++    def _disk_put(self, key: str, body: bytes) -> None:
++        root, name = self._dir(), self._file_name(key)
++        if root is None or name is None or len(body) > self._max_bytes:
++            return
++        try:
++            root.mkdir(mode=0o700, parents=True, exist_ok=True)
++            path = root / name
++            if path.exists():
++                os.utime(path)
++                return
++            tmp = root / f".{name}.{os.getpid()}.{threading.get_ident()}.tmp"
++            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
++            try:
++                with os.fdopen(fd, "wb") as fh:
++                    fh.write(body)
++                os.replace(tmp, path)
++            except BaseException:
++                with contextlib.suppress(OSError):
++                    tmp.unlink()
++                raise
++            self._disk_evict(root)
++        except OSError:
++            logger.warning("delta response: could not persist a base; memory only for it", exc_info=True)
++
++    def _disk_evict(self, root: Path) -> None:
++        """Drop the least recently used files until the directory fits the budget (shared by every backend)."""
++        entries = []
++        for entry in os.scandir(root):
++            with contextlib.suppress(OSError):
++                if entry.is_file(follow_symlinks=False):
++                    st = entry.stat(follow_symlinks=False)
++                    entries.append((st.st_mtime_ns, st.st_size, entry.path))
++        total = sum(size for _, size, _ in entries)
++        for _, size, path in sorted(entries):
++            if total <= self._max_bytes:
++                break
++            with contextlib.suppress(OSError):
++                os.unlink(path)
++            total -= size
++
++
++def default_disk_dir() -> Path:
++    from hermes_constants import get_hermes_home
++
++    return get_hermes_home() / "cache" / "delta-bodies"
++
+ 
+ def _eligible(message: Message) -> bool:
+     """A complete, plain JSON 200 of a size worth encoding (a stream has no Content-Length)."""
+@@ -209,7 +324,7 @@ class DeltaResponseMiddleware:
+ 
+     def __init__(self, app: ASGIApp, store: Optional[BodyStore] = None):
+         self.app = app
+-        self.store = store if store is not None else BodyStore()
++        self.store = store if store is not None else BodyStore(disk_dir=default_disk_dir)
+ 
+     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+         if _zstd is None or scope["type"] != "http" or scope["method"] != "GET":
+diff --git a/tests/hermes_cli/test_web_delta_response.py b/tests/hermes_cli/test_web_delta_response.py
+index e1372f2310..6ebbd9e969 100644
+--- a/tests/hermes_cli/test_web_delta_response.py
++++ b/tests/hermes_cli/test_web_delta_response.py
+@@ -477,3 +477,130 @@ def test_a_delta_is_no_store_and_a_whole_answer_keeps_the_handlers_cache_control
+     delta = client.get(path, headers={**ASK, "X-Hermes-Delta-Base": whole.headers[wdr.HASH_HEADER]})
+     assert delta.headers[wdr.DELTA_HEADER] == "zstd"
+     assert delta.headers.get_list("cache-control") == ["no-store"]
++
++
++# ── persisted bases (BodyStore disk_dir): a rolled or restarted backend still decodes against what was sent ──
++
++
++def _served_by(store):
++    state = {"board": board(2000)}
++
++    async def get_board(request):
++        return JSONResponse(state["board"])
++
++    app = Starlette(routes=[Route("/board", get_board)])
++    app.add_middleware(wdr.DeltaResponseMiddleware, store=store)
++    return TestClient(app), state
++
++
++ALICE = {**ASK, "X-Hermes-Session-Token": "alice"}
++
++
++@needs_zstd
++def test_a_base_survives_a_store_reopen_and_gives_a_verified_delta(tmp_path):
++    client, state = _served_by(wdr.BodyStore(disk_dir=tmp_path))
++    first = client.get("/board", headers=ALICE)
++    digest = first.headers[wdr.HASH_HEADER]
++
++    rolled, state = _served_by(wdr.BodyStore(disk_dir=tmp_path))  # a new backend process, nothing in memory
++    state["board"] = board(2001, done=3)
++    answer = rolled.get("/board", headers={**ALICE, "X-Hermes-Delta-Base": digest})
++
++    assert answer.headers[wdr.DELTA_HEADER] == "zstd"
++    assert len(answer.content) < len(first.content) / 50
++    current = decode(answer.content, first.content)
++    assert json.loads(current) == state["board"]
++    assert answer.headers[wdr.HASH_HEADER] == wdr.body_hash(current)
++
++
++@needs_zstd
++@pytest.mark.parametrize("damage", ["truncate", "flip", "empty"])
++def test_a_damaged_persisted_base_gives_the_whole_body_and_is_removed(tmp_path, damage):
++    client, _ = _served_by(wdr.BodyStore(disk_dir=tmp_path))
++    first = client.get("/board", headers=ALICE)
++    digest = first.headers[wdr.HASH_HEADER]
++    [path] = [p for p in tmp_path.iterdir() if p.name.endswith(digest)]
++    data = path.read_bytes()
++    flipped = data[:100] + bytes([data[100] ^ 1]) + data[101:]
++    path.write_bytes({"truncate": data[: len(data) // 2], "flip": flipped, "empty": b""}[damage])
++
++    other, state = _served_by(wdr.BodyStore(disk_dir=tmp_path))
++    answer = other.get("/board", headers={**ALICE, "X-Hermes-Delta-Base": digest})
++    assert wdr.DELTA_HEADER not in answer.headers
++    assert answer.json() == state["board"]
++    assert answer.headers[wdr.HASH_HEADER] == wdr.body_hash(answer.content)
++    # The damaged file is gone; the whole body just sent took its place under the same (correct) digest.
++    assert path.read_bytes() == answer.content
++
++
++@needs_zstd
++def test_another_credential_cannot_use_a_persisted_base(tmp_path):
++    client, _ = _served_by(wdr.BodyStore(disk_dir=tmp_path))
++    digest = client.get("/board", headers=ALICE).headers[wdr.HASH_HEADER]
++
++    for other in ({"X-Hermes-Session-Token": "bob"}, {"Authorization": "Bearer alice"}, {}):
++        fresh, _ = _served_by(wdr.BodyStore(disk_dir=tmp_path))
++        probe = fresh.get("/board", headers={**ASK, **other, "X-Hermes-Delta-Base": digest})
++        assert wdr.DELTA_HEADER not in probe.headers, other
++    fresh, _ = _served_by(wdr.BodyStore(disk_dir=tmp_path))
++    assert fresh.get("/board", headers={**ALICE, "X-Hermes-Delta-Base": digest}).headers[wdr.DELTA_HEADER] == "zstd"
++
++
++def test_persisted_files_are_private_and_never_hold_the_credential(tmp_path):
++    root = tmp_path / "delta-bodies"
++    store = wdr.BodyStore(disk_dir=root)
++    namespace = "a" * 32
++    body = b'{"x":"' + b"y" * 20000 + b'"}'
++    store.put(f"{namespace}:{wdr.body_hash(body)}", body)
++    [path] = list(root.iterdir())
++    assert path.name == f"{namespace}-{wdr.body_hash(body)}"
++    assert path.stat().st_mode & 0o777 == 0o600
++    assert root.stat().st_mode & 0o777 == 0o700
++    assert path.read_bytes() == body
++
++
++def test_the_disk_is_bounded_least_recently_used_first(tmp_path):
++    import os
++    import time
++
++    tmp_path = tmp_path / "bases"  # the conftest's HERMES_HOME files live in tmp_path itself
++    store = wdr.BodyStore(max_bytes=3000, disk_dir=tmp_path)
++    bodies = {name: name.encode() * 1000 for name in "abcd"}
++    keys = {name: f":{wdr.body_hash(body)}" for name, body in bodies.items()}
++    for at, name in enumerate("abc"):
++        store.put(keys[name], bodies[name])
++        os.utime(tmp_path / f"_-{keys[name][1:]}", ns=(at * 10**9, at * 10**9))
++    reopened = wdr.BodyStore(max_bytes=3000, disk_dir=tmp_path)
++    assert reopened.get(keys["a"]) == bodies["a"]  # read from disk: a is now the most recently used
++    assert (tmp_path / f"_-{keys['a'][1:]}").stat().st_mtime > time.time() - 60
++    reopened.put(keys["d"], bodies["d"])
++    names = {p.name for p in tmp_path.iterdir()}
++    assert f"_-{keys['b'][1:]}" not in names
++    assert {f"_-{keys[n][1:]}" for n in "acd"} <= names
++    assert sum(p.stat().st_size for p in tmp_path.iterdir()) <= 3000
++
++
++@pytest.mark.parametrize("key", ["../../etc:" + "a" * 32, "ns:" + "../x", ":" + "A" * 32, "x" * 32 + "/y:" + "a" * 32])
++def test_a_key_that_is_not_two_hex_hashes_is_never_a_path(tmp_path, key):
++    store = wdr.BodyStore(disk_dir=tmp_path / "d")
++    store.put(key, b"z" * 20000)
++    assert store.get(key) == b"z" * 20000  # memory still holds it
++    assert not (tmp_path / "d").exists() or not any((tmp_path / "d").iterdir())
++    assert wdr.BodyStore(disk_dir=tmp_path / "d").get(key) is None
++
++
++def test_the_dashboard_store_persists_under_the_hermes_home_cache(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    store = wdr.DeltaResponseMiddleware(lambda *a: None).store
++    body = b"q" * 20000
++    store.put(f":{wdr.body_hash(body)}", body)
++    assert (tmp_path / "cache" / "delta-bodies" / f"_-{wdr.body_hash(body)}").read_bytes() == body
++
++
++def test_an_unwritable_directory_leaves_the_store_in_memory(tmp_path):
++    blocker = tmp_path / "file"
++    blocker.write_text("not a dir")
++    store = wdr.BodyStore(disk_dir=blocker / "sub")
++    body = b"w" * 20000
++    store.put(f":{wdr.body_hash(body)}", body)
++    assert store.get(f":{wdr.body_hash(body)}") == body
+-- 
+2.43.0
+

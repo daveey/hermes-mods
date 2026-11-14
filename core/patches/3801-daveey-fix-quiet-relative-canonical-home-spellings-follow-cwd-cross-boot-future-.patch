@@ -1,0 +1,152 @@
+From b43022532cc1cd66820ac8bc04dd806b2bac667d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 19:07:52 +0000
+Subject: [PATCH] [daveey] fix(quiet): relative canonical_home spellings follow
+ cwd; cross-boot future-wall cooldown is elapsed
+
+Follow-up to the non-blocking points of the exact-head review of #1806 (review 5885831058).
+
+1. hermes_cli/local_work.py canonical_home cached by the raw spelling, so a relative
+   spelling resolved against the cwd at first use and kept that answer after a chdir.
+   The cache is now keyed on os.path.abspath(os.path.expanduser(raw)).
+2. agent/claim_quiet.py _check_cooldown refused every start ("cooldown clocks are
+   incoherent") while a cross-boot wall age was negative: a record written while the wall
+   clock was ahead before a reboot wedged starts until real time caught up. A negative
+   cross-boot age now counts as elapsed (admission-open, like crash/unlock/expiry). A
+   negative same-boot monotonic age still refuses.
+
+Proof:
+- RED on dd75da236b: test_canonical_home_relative_spelling_follows_the_current_directory
+  (second call returned the first directory) and
+  test_future_wall_record_from_before_a_reboot_does_not_wedge_starts (QuietUnavailableError
+  "cooldown clocks are incoherent").
+- GREEN: both, plus test_cross_boot_zero_wall_age_is_a_full_cooldown_not_elapsed (boundary:
+  cross-boot age 0 is a full cooldown), across all 41 test files importing claim_quiet or
+  local_work.
+---
+ agent/claim_quiet.py                | 10 +++++++---
+ hermes_cli/local_work.py            | 11 ++++++-----
+ tests/agent/test_claim_quiet.py     | 22 ++++++++++++++++++++++
+ tests/hermes_cli/test_local_work.py | 18 ++++++++++++++++++
+ 4 files changed, 53 insertions(+), 8 deletions(-)
+
+diff --git a/agent/claim_quiet.py b/agent/claim_quiet.py
+index 41cb0aaaac..dabde39991 100644
+--- a/agent/claim_quiet.py
++++ b/agent/claim_quiet.py
+@@ -532,13 +532,17 @@ def _check_cooldown(dir_fd: int, wall: float, ns: int, boot: str) -> None:
+         return
+     # Same boot: the monotonic age alone is authoritative, so a wall clock that was ahead when the
+     # record was written (and later corrected) cannot refuse every start until real time catches up.
+-    # Other boot: only the wall age exists.
++    # Other boot: only the wall age exists. A negative one means the record was written while the
++    # wall clock was ahead before the reboot; it counts as elapsed (admission-open, like crash,
++    # unlock and expiry), since refusing would wedge every start until real time caught up.
+     if last.boot_id == boot:
+         age = (ns - last.started_ns) / _NS
++        if age < 0:
++            raise QuietUnavailableError("cooldown clocks are incoherent, refusing")
+     else:
+         age = wall - last.started_at
+-    if age < 0:
+-        raise QuietUnavailableError("cooldown clocks are incoherent, refusing")
++        if age < 0:
++            return
+     remaining = COOLDOWN_S - age
+     if remaining > 0:
+         raise QuietCooldownError(remaining)
+diff --git a/hermes_cli/local_work.py b/hermes_cli/local_work.py
+index 106e601e35..2ae4430343 100644
+--- a/hermes_cli/local_work.py
++++ b/hermes_cli/local_work.py
+@@ -26,19 +26,20 @@ def canonical_home(home):
+ 
+     Mirrors ``hermes_constants.hermes_home_key`` without importing it (stdlib-only seed module):
+     expanduser + realpath + normcase. Only an existing directory's answer is cached, because a
+-    path that does not exist yet can resolve differently once created.
++    path that does not exist yet can resolve differently once created. The cache is keyed on the
++    absolute spelling, so a relative spelling is resolved against the current directory every time.
+     """
+     if home is None:
+         return None
+-    raw = os.fspath(home)
+-    cached = _HOME_KEYS.get(raw)
++    spelling = os.path.abspath(os.path.expanduser(os.fspath(home)))
++    cached = _HOME_KEYS.get(spelling)
+     if cached is not None:
+         return cached
+-    key = os.path.normcase(os.path.realpath(os.path.expanduser(raw)))
++    key = os.path.normcase(os.path.realpath(spelling))
+     if os.path.isdir(key):
+         if len(_HOME_KEYS) >= _HOME_KEYS_MAX:
+             _HOME_KEYS.clear()
+-        _HOME_KEYS[raw] = key
++        _HOME_KEYS[spelling] = key
+     return key
+ 
+ 
+diff --git a/tests/agent/test_claim_quiet.py b/tests/agent/test_claim_quiet.py
+index c78e9f34e2..5902a3bd53 100644
+--- a/tests/agent/test_claim_quiet.py
++++ b/tests/agent/test_claim_quiet.py
+@@ -306,6 +306,28 @@ def test_corrected_future_wall_time_does_not_wedge_cooldown_on_same_boot(home):
+     cq.acquire(max_s=30, reason="second", clock=clock).close()
+ 
+ 
++def test_future_wall_record_from_before_a_reboot_does_not_wedge_starts(home):
++    """Cross-boot only the wall age exists. A record written while the wall clock was ahead (then a
++    reboot with a corrected clock) gives a negative age; refusing it would wedge every start until
++    real time catches up, so a negative cross-boot age counts as elapsed (admission-open).
++    RED on dd75da236b: refused as "cooldown clocks are incoherent"."""
++    clock = FakeClock()
++    clock.now_wall += 10 * 24 * 3600  # wall clock 10 days ahead at the first start
++    cq.acquire(max_s=30, reason="first", clock=clock).close()
++    clock.now_wall -= 10 * 24 * 3600  # corrected after a reboot
++    clock.boot, clock.now_ns = "boot-b", 5 * NS
++    cq.acquire(max_s=30, reason="second", clock=clock).close()
++
++
++def test_cross_boot_zero_wall_age_is_a_full_cooldown_not_elapsed(home):
++    clock = FakeClock()
++    cq.acquire(max_s=30, reason="first", clock=clock).close()
++    clock.boot, clock.now_ns = "boot-b", 5 * NS  # rebooted, wall unchanged: age exactly 0
++    with pytest.raises(cq.QuietCooldownError) as err:
++        cq.acquire(max_s=30, reason="second", clock=clock)
++    assert err.value.remaining_s == records.COOLDOWN_S
++
++
+ @pytest.mark.parametrize("payload", [b"{", b"[]", b'{"schema": 1}', b"\xff\xfe", b""])
+ def test_malformed_cooldown_refuses_it_is_never_erased_to_bypass_two_hours(home, payload):
+     clock = FakeClock()
+diff --git a/tests/hermes_cli/test_local_work.py b/tests/hermes_cli/test_local_work.py
+index 9d398060af..585553b6a2 100644
+--- a/tests/hermes_cli/test_local_work.py
++++ b/tests/hermes_cli/test_local_work.py
+@@ -31,6 +31,24 @@ print('stdlib seed import: OK')
+     assert result.stdout.strip() == "stdlib seed import: OK"
+ 
+ 
++def test_canonical_home_relative_spelling_follows_the_current_directory(tmp_path, monkeypatch):
++    """The same relative spelling names a different home after a chdir; a cache keyed on the raw
++    spelling kept answering with the first directory. RED on dd75da236b."""
++    import hermes_cli.local_work as module
++    monkeypatch.setattr(module, "_HOME_KEYS", {})
++    first, second = tmp_path / "a", tmp_path / "b"
++    (first / "home").mkdir(parents=True)
++    (second / "home").mkdir(parents=True)
++    monkeypatch.chdir(first)
++    assert module.canonical_home("home") == os.path.normcase(os.path.realpath(first / "home"))
++    monkeypatch.chdir(second)
++    assert module.canonical_home("home") == os.path.normcase(os.path.realpath(second / "home"))
++    # Absolute spellings are still cached, keyed on the absolute path.
++    absolute = str(first / "home")
++    assert module.canonical_home(absolute) == os.path.normcase(os.path.realpath(absolute))
++    assert os.path.abspath(absolute) in module._HOME_KEYS
++
++
+ def test_install_is_explicit_and_snapshot_is_detached(tmp_path, monkeypatch):
+     import hermes_cli.local_work as module
+     monkeypatch.setattr(module, "_registry", None)
+-- 
+2.43.0
+

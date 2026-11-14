@@ -1,0 +1,1127 @@
+From c3490c91769e76cdc88dd45763f420fab8301c93 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 20:42:23 +0000
+Subject: [PATCH] [daveey] kanban/state.db: kept read connections for
+ background readers (card I)
+
+Change-proportional design t_01a1d563324d7e8e, card I. In the hub gateway profile
+(prof10-gw-434368) connection opens were 11.4% of samples: connect/_open_configured,
+kanban_generation.prepare_connection, the lockguard _apply fd scan, and the writable
+SessionDB opens of the remote-notice sweep.
+
+- hermes_cli/kanban_kept_reader.py: `reading()` is a drop-in for
+  `connect_closing` in read-only callers. It keeps one query_only connection per
+  (thread, board file), so prepare_connection and the OFD lock guard run once per
+  kept connection, not once per read. The connection is reopened through
+  `connect()` when the board's (dev, ino) changes, its -shm identity changes (a
+  new WAL generation), the path drops out of _INITIALIZED_PATHS
+  (init/repair/lost schema), the generation is poisoned, or recovery closed it.
+  It is registered with kanban_generation.register_reader_cache, so recovery can
+  retire an idle kept connection that sits on another thread. A borrowed
+  connection is never closed under its borrower; recovery is told to retry.
+  Nested borrows, fenced boards and read-only-schema boards get a plain
+  per-call connection.
+- First caller: kanban_decompose.list_triage_ids, which runs on every dispatcher
+  pass for every board.
+- hermes_state_kept_reader.py: one kept SessionDB(read_only=True) per state.db
+  path per process. It runs no schema reconcile and is reopened on a change of
+  file or sidecar identity, a close, a quarantine, or a DatabaseError in the
+  body. hermes_state_registry.close_all/close_all_under retire these handles too.
+- tui_gateway/kanban_notice_session_store.py + kanban_remote_notices._session_db:
+  the remote-notice pass reads on the kept read-only handle. Only the notice write
+  borrows the shared registry writer (notice_writer).
+- kanban_db_connect.connect gains check_same_thread (default True). Kept readers
+  are the only callers that pass False.
+
+The lockguard fd scan is unchanged (C14): no verdict cache. It runs less often
+only because there are fewer opens.
+
+Tests (RED on main call sites, GREEN here):
+- tests/hermes_cli/test_kanban_kept_reader.py: list_triage_ids prepares one
+  connection across 5 passes (main: 5); a file replaced under a kept connection
+  reopens and closes the stale handle; dropped init state reopens; cross-thread
+  recovery eviction; a borrowed connection is not evicted; nested borrow;
+  sqlite error drops the connection; an exited thread's connections are closed.
+- tests/hermes_state/test_state_kept_reader.py: the kept handle is reused and
+  runs no _init_schema (main _session_db: once per pass); a replaced file reopens;
+  close, DatabaseError and registry close_all_under retire the handle; a notice
+  write goes through the shared writer.
+---
+ hermes_cli/kanban_db_connect.py              |  18 +-
+ hermes_cli/kanban_decompose.py               |   4 +-
+ hermes_cli/kanban_kept_reader.py             | 283 +++++++++++++++++++
+ hermes_state_kept_reader.py                  | 171 +++++++++++
+ hermes_state_registry.py                     |  14 +-
+ tests/hermes_cli/test_kanban_kept_reader.py  | 194 +++++++++++++
+ tests/hermes_state/test_state_kept_reader.py | 151 ++++++++++
+ tui_gateway/kanban_notice_session_store.py   |  55 ++++
+ tui_gateway/kanban_remote_notices.py         |  30 +-
+ 9 files changed, 895 insertions(+), 25 deletions(-)
+ create mode 100644 hermes_cli/kanban_kept_reader.py
+ create mode 100644 hermes_state_kept_reader.py
+ create mode 100644 tests/hermes_cli/test_kanban_kept_reader.py
+ create mode 100644 tests/hermes_state/test_state_kept_reader.py
+ create mode 100644 tui_gateway/kanban_notice_session_store.py
+
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 8b1bce874e..31c92e8a6f 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -62,10 +62,12 @@ def _resolve_busy_timeout_ms() -> int:
+     return _kb._env_int("HERMES_KANBAN_BUSY_TIMEOUT_MS", DEFAULT_BUSY_TIMEOUT_MS, minimum=1)
+ 
+ 
+-def _sqlite_connect(path: Path) -> sqlite3.Connection:
++def _sqlite_connect(path: Path, *, check_same_thread: bool = True) -> sqlite3.Connection:
+     """Open a Kanban SQLite connection via ``connect_tracked``: while registered,
+     byte-level probes of the file are refused because an ``open()``/``close()``
+-    would cancel this process's POSIX advisory locks (see ``sqlite_safe_read``)."""
++    would cancel this process's POSIX advisory locks (see ``sqlite_safe_read``).
++    ``check_same_thread=False`` only for kept readers (``kanban_kept_reader``): generation
++    recovery must be able to close an idle one from another thread."""
+     from hermes_cli.kanban_dispatch_owner import connect_with_identity
+ 
+     busy_timeout_ms = _resolve_busy_timeout_ms()
+@@ -73,6 +75,7 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
+         path,
+         isolation_level=None,
+         timeout=busy_timeout_ms / 1000.0,
++        check_same_thread=check_same_thread,
+     )
+     try:
+         # Explicit PRAGMA (besides connect(timeout=)) so it is observable and
+@@ -797,13 +800,13 @@ def _schema_is_present(conn: sqlite3.Connection) -> bool:
+     return row is not None
+ 
+ 
+-def _open_configured(path: Path, under_lock) -> tuple[sqlite3.Connection, Any]:
++def _open_configured(path: Path, under_lock, *, check_same_thread: bool = True) -> tuple[sqlite3.Connection, Any]:
+     """Open ``path`` with the kanban PRAGMA set, then run ``under_lock(conn)``.
+     WAL activation and ``under_lock`` share the ``_INIT_LOCK`` critical section:
+     WAL setup can take an exclusive lock while SQLite creates sidecars for a
+     fresh DB, and concurrent gateway startup threads must not race before
+     ``_INITIALIZED_PATHS`` is populated. Closed if anything raises."""
+-    conn = _sqlite_connect(path)
++    conn = _sqlite_connect(path, check_same_thread=check_same_thread)
+     try:
+         conn.row_factory = sqlite3.Row
+         conn.text_factory = _kb._lossy_text
+@@ -894,7 +897,8 @@ def _ensure_activity_revision(conn: sqlite3.Connection, resolved: str) -> None:
+                          resolved, exc)
+ 
+ 
+-def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> sqlite3.Connection:
++def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None,
++            check_same_thread: bool = True) -> sqlite3.Connection:
+     """Open (and initialize if needed) the kanban DB. WAL is (re)enabled on
+     every connection so a re-created file stays robust; the first connection
+     per path auto-runs :func:`init_db`, later ones skip via
+@@ -938,7 +942,7 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
+         return _schema_owner.open_read_only(path, _schema_owner.READ_ONLY[resolved],
+                                             timeout_s=_resolve_busy_timeout_ms() / 1000.0, text_factory=_kb._lossy_text)
+     if resolved in _INITIALIZED_PATHS:
+-        conn, schema_present = _open_configured(path, _schema_is_present)
++        conn, schema_present = _open_configured(path, _schema_is_present, check_same_thread=check_same_thread)
+         if schema_present:
+             return conn
+         # Cache says "initialized", file says otherwise: it was deleted or
+@@ -987,7 +991,7 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
+                 _INITIALIZED_PATHS.add(resolved)
+             return None
+ 
+-        conn, refusal = _open_configured(path, _init_if_needed)
++        conn, refusal = _open_configured(path, _init_if_needed, check_same_thread=check_same_thread)
+     if refusal:
+         conn.close()
+         return _schema_owner.open_read_only(path, refusal, timeout_s=_resolve_busy_timeout_ms() / 1000.0,
+diff --git a/hermes_cli/kanban_decompose.py b/hermes_cli/kanban_decompose.py
+index 2a36bd3747..7f848fb457 100644
+--- a/hermes_cli/kanban_decompose.py
++++ b/hermes_cli/kanban_decompose.py
+@@ -418,7 +418,9 @@ def list_triage_ids(*, tenant: Optional[str] = None, skip_awaiting_human: bool =
+     """
+     del skip_awaiting_human
+     cutoff = (time.time() if now is None else now) - max(int(min_age_seconds or 0), 0)
+-    with kbc.connect_closing() as conn:
++    # Read-only, every dispatcher tick per board: a kept connection, not an open per call (design t_01a1d563 I).
++    from hermes_cli.kanban_kept_reader import reading
++    with reading() as conn:
+         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
+         if min_age_seconds:
+             # An unparseable stamp (None) stays a candidate: excluding it would strand the card.
+diff --git a/hermes_cli/kanban_kept_reader.py b/hermes_cli/kanban_kept_reader.py
+new file mode 100644
+index 0000000000..2701609cd1
+--- /dev/null
++++ b/hermes_cli/kanban_kept_reader.py
+@@ -0,0 +1,283 @@
++"""Thread-local kept read connections for Kanban board read callers. [daveey]
++
++A ``connect_closing`` open of a board costs a realpath, the board lifecycle lock, generation recovery, the
++SQLite open, eight PRAGMAs, the OFD lock guard (``kanban_lockguard._apply``, whose fd-table scan grows with every
++descriptor the process holds) and ``kanban_generation.prepare_connection``, and the close undoes it all. Loops that
++only read paid that on every pass: 11.4% of the hub gateway's samples were connection opens (t_01a1d563324d7e8e
++card I). :func:`reading` keeps one connection per (thread, board file) instead, so ``prepare_connection`` and the
++guard run once per kept connection, not once per read.
++
++A kept connection is handed out only while it still reads the live board. Before every borrow it is checked
++against, and reopened through :func:`kanban_db_connect.connect` on any change of:
++
++- the board file's ``(st_dev, st_ino)`` (a file replaced or deleted under the connection);
++- its ``-shm`` identity (``kanban_generation`` recorded it at open; a new or missing ``-shm`` is a new WAL
++  generation, kanban-759104eb56);
++- the path's place in ``_INITIALIZED_PATHS`` (``init_db``/``repair_db``/a lost schema drop it: the next open
++  re-runs the init path) and the generation's poison flag;
++- the connection itself (closed by generation recovery: ``kanban_generation.forget`` drops it).
++
++Generation recovery in another thread must be able to retire an idle kept connection, or a stale one parked on an
++idle thread would refuse every other thread's open (``DeletedWalGenerationError``). So kept connections are opened
++with ``check_same_thread=False`` and registered with ``kanban_generation.register_reader_cache``; a borrowed one is
++never closed under its borrower (recovery is told to retry, as for ``kanban_session_activity``'s cache).
++
++Kept connections are ``PRAGMA query_only``: a caller that writes through one fails loudly instead of
++committing through a shared handle. A body that leaves a transaction open, or raises ``sqlite3.Error``, loses its
++connection. A nested borrow of the same board on one thread, a fenced (delegated) board and a read-only-schema
++board get an ordinary per-call connection.
++
++The lock guard's fd scan itself is untouched (design C14): it is a corruption guard, and fewer opens is the only
++saving claimed for it here.
++"""
++from __future__ import annotations
++
++import contextlib
++import os
++import sqlite3
++import threading
++import weakref
++from collections import OrderedDict
++from pathlib import Path
++from typing import Iterator, Optional
++
++from hermes_cli import kanban_generation as _gen
++
++# Boards one thread keeps at once; the oldest idle one is closed past this (each holds db + -wal + -shm fds).
++MAX_PER_THREAD = 16
++
++
++class _Entry:
++    __slots__ = ("__weakref__", "closed", "conn", "ident", "key", "lock")
++
++    def __init__(self, key: str, conn: sqlite3.Connection, ident: tuple[int, int]) -> None:
++        self.key = key
++        self.conn = conn
++        self.ident = ident
++        self.lock = threading.Lock()  # held while borrowed; never re-entered (a nested borrow gets its own conn)
++        self.closed = False
++
++
++_tls = threading.local()
++_registry: weakref.WeakSet[_Entry] = weakref.WeakSet()
++_registry_lock = threading.Lock()  # map operations only: never held across SQL, a close or another lock
++# Entries of exited threads: closed by the next borrow on a live thread, never from a finalizer (a close takes the
++# board lifecycle lock, and a finalizer can run on any thread while that thread holds another).
++_orphans: list[_Entry] = []
++
++# Observability for tests and P1 readback: opens = kept connections opened, reuses = borrows served warm.
++stats = {"opens": 0, "reuses": 0, "reopens": 0, "fallbacks": 0}
++
++
++def _orphan(entries: OrderedDict[str, _Entry]) -> None:
++    with _registry_lock:
++        _orphans.extend(entries.values())
++    entries.clear()
++
++
++class _ThreadEntries:
++    """Per-thread map; when the thread exits its entries move to ``_orphans``."""
++
++    def __init__(self) -> None:
++        self.entries: OrderedDict[str, _Entry] = OrderedDict()
++        weakref.finalize(self, _orphan, self.entries)
++
++
++def _mine() -> OrderedDict[str, _Entry]:
++    holder = getattr(_tls, "holder", None)
++    if holder is None:
++        holder = _tls.holder = _ThreadEntries()
++    return holder.entries
++
++
++def _close(entry: _Entry) -> None:
++    """Close *entry*'s connection; the caller holds ``entry.lock`` (or the entry is unreachable)."""
++    if entry.closed:
++        return
++    entry.closed = True
++    with _registry_lock:
++        _registry.discard(entry)
++    with contextlib.suppress(Exception):
++        entry.conn.close()
++
++
++def _drain_orphans() -> None:
++    if not _orphans:
++        return
++    with _registry_lock:
++        dead, _orphans[:] = list(_orphans), []
++    for entry in dead:
++        if entry.lock.acquire(blocking=False):
++            try:
++                _close(entry)
++            finally:
++                entry.lock.release()
++
++
++def _file_identity(path: str) -> Optional[tuple[int, int]]:
++    try:
++        st = os.stat(path)
++    except OSError:
++        return None
++    return (st.st_dev, st.st_ino)
++
++
++def _still_live(entry: _Entry) -> bool:
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli.kanban_lockguard import shm_identity
++
++    if entry.closed or entry.conn not in _gen._connections:
++        return False  # closed by generation recovery (or never registered)
++    key = entry.key
++    if key not in kbc._INITIALIZED_PATHS or key in _gen._poisoned:
++        return False
++    if _file_identity(key) != entry.ident:
++        return False  # replaced, moved or deleted under the connection
++    return shm_identity(key) == getattr(entry.conn, "_hermes_generation_shm", None)
++
++
++def _evict(path: str) -> None:
++    """``kanban_generation.recover`` hook: retire every idle kept connection to *path*, from any thread."""
++    with _registry_lock:
++        entries = [e for e in _registry if e.key == path and not e.closed]
++    for entry in entries:
++        if not entry.lock.acquire(blocking=False):
++            raise _gen.DeletedWalGenerationError(f"kanban DB {path}: a kept reader is still borrowed; retry")
++        try:
++            _close(entry)
++        finally:
++            entry.lock.release()
++
++
++_gen.register_reader_cache(_evict)
++
++
++def _open(path: Path, key: str, board: Optional[str]) -> tuple[sqlite3.Connection, Optional[_Entry]]:
++    """Open through ``connect`` (every board check and the init path stay in one place). Returns the connection
++    and its entry, or no entry when this open must not be kept."""
++    from agent.delegation_context import kanban_path_is_fenced
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_schema_owner as schema_owner
++
++    if kanban_path_is_fenced(path):
++        stats["fallbacks"] += 1
++        return kbc.connect(path, board=board), None
++    before = _file_identity(key)
++    conn = kbc.connect(path, board=board, check_same_thread=False)
++    keepable = (before is not None and key in kbc._INITIALIZED_PATHS and key not in schema_owner.READ_ONLY
++                and getattr(conn, "_hermes_generation_path", None) == key and _file_identity(key) == before)
++    if not keepable or before is None:
++        stats["fallbacks"] += 1
++        return conn, None
++    try:
++        conn.execute("PRAGMA query_only=ON")
++    except BaseException:
++        conn.close()
++        raise
++    stats["opens"] += 1
++    return conn, _Entry(key, conn, before)
++
++
++@contextlib.contextmanager
++def reading(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> Iterator[sqlite3.Connection]:
++    """Drop-in for ``kanban_db_connect.connect_closing`` in callers that only READ the board.
++
++    Same path resolution, row factory and text factory; the connection is kept for this thread's next read.
++    Writes fail (``query_only``)."""
++    from hermes_cli import kanban_db as kb
++
++    _drain_orphans()
++    path = Path(db_path) if db_path is not None else kb.kanban_db_path(board=board)
++    key = _gen._resolved(os.fspath(path))
++    mine = _mine()
++    entry = mine.get(key)
++    if entry is not None and not entry.lock.acquire(blocking=False):
++        # A nested borrow of this board on this thread: the outer borrow keeps the entry, the inner one gets an
++        # ordinary connection.
++        stats["fallbacks"] += 1
++        with contextlib.closing(_plain(path, board)) as conn:
++            yield conn
++        return
++    if entry is not None:
++        if _still_live(entry):
++            stats["reuses"] += 1
++        else:
++            mine.pop(key, None)
++            _close(entry)
++            entry.lock.release()
++            entry = None
++            stats["reopens"] += 1
++    if entry is None:
++        conn, entry = _open(path, key, board)
++        if entry is None:
++            with contextlib.closing(conn):
++                yield conn
++            return
++        entry.lock.acquire()
++        with _registry_lock:
++            _registry.add(entry)
++        mine[key] = entry
++        while len(mine) > MAX_PER_THREAD:
++            old_key, old = next(iter(mine.items()))
++            mine.pop(old_key)
++            if old.lock.acquire(blocking=False):
++                try:
++                    _close(old)
++                finally:
++                    old.lock.release()
++    mine.move_to_end(key)
++    conn = entry.conn
++    keep = False
++    try:
++        conn.row_factory = sqlite3.Row
++        conn.text_factory = kb._lossy_text
++        yield conn
++        keep = not conn.in_transaction
++    except sqlite3.Error:
++        raise
++    except BaseException:
++        keep = not entry.closed and not _in_transaction(conn)
++        raise
++    finally:
++        if not keep:
++            if mine.get(key) is entry:
++                mine.pop(key, None)
++            _close(entry)
++        entry.lock.release()
++
++
++def _in_transaction(conn: sqlite3.Connection) -> bool:
++    try:
++        return conn.in_transaction
++    except sqlite3.Error:
++        return True
++
++
++def _plain(path: Path, board: Optional[str]) -> sqlite3.Connection:
++    from hermes_cli import kanban_db_connect as kbc
++
++    return kbc.connect(path, board=board)
++
++
++def close_all() -> int:
++    """Close every idle kept connection on every thread (tests, shutdown). Returns how many closed."""
++    _drain_orphans()
++    with _registry_lock:
++        entries = [e for e in _registry if not e.closed]
++    closed = 0
++    for entry in entries:
++        if entry.lock.acquire(blocking=False):
++            try:
++                if not entry.closed:
++                    _close(entry)
++                    closed += 1
++            finally:
++                entry.lock.release()
++    holder = getattr(_tls, "holder", None)
++    if holder is not None:
++        for key in [k for k, e in holder.entries.items() if e.closed]:
++            holder.entries.pop(key, None)
++    return closed
++
++
++__all__ = ["MAX_PER_THREAD", "close_all", "reading", "stats"]
+diff --git a/hermes_state_kept_reader.py b/hermes_state_kept_reader.py
+new file mode 100644
+index 0000000000..ee7c317ac7
+--- /dev/null
++++ b/hermes_state_kept_reader.py
+@@ -0,0 +1,171 @@
++"""Kept read-only ``state.db`` handles for background readers. [daveey]
++
++A background pass that checks a chat before acting (``tui_gateway.kanban_remote_notices._session_db``: does the
++session exist, its compression tip, archived/moved, a worker transcript, a gateway lease, the notice already in the
++transcript) opened a WRITABLE ``SessionDB`` per link per pass. Each open ran the writer preflight, schema reconcile
++(``_init_schema``) and the lock-guard fd scan, and its close a WAL checkpoint: the hub gateway's
++``hermes_state.__init__`` writer opens under ``_deliver_link`` (change-proportional design, card I).
++
++:func:`read_only` keeps ONE ``SessionDB(read_only=True)`` per resolved path for the process: no schema reconcile
++at all on the read path, and the read-only open's own probes (FTS tables) run once per kept handle, not per pass.
++
++A kept handle is handed out only while it still reads the live file. Before each borrow it is retired (and a fresh
++one opened) when:
++
++- the path's ``(st_dev, st_ino)`` changed (a restore, a recovery swap, a moved/deleted profile store);
++- its ``-wal``/``-shm`` identity changed (a new WAL generation, so the handle may be stranded on a deleted one);
++- the handle was closed (test teardown, a profile delete's ``close_all_under``) or quarantined;
++- a body raised ``sqlite3.DatabaseError`` on it.
++
++A retired handle stays open for borrowers already holding it and is closed by the last of them. Writers keep using
++``hermes_state_registry.acquire`` (shared writer, schema reconcile per generation, not per call).
++"""
++from __future__ import annotations
++
++import contextlib
++import os
++import sqlite3
++import threading
++from pathlib import Path
++from typing import TYPE_CHECKING, Iterator, Optional
++
++from hermes_state_common import path_is_under as _path_is_under
++from hermes_state_common import stat_db_file_identity as _stat_db_file_identity
++
++if TYPE_CHECKING:  # pragma: no cover
++    from hermes_state import SessionDB
++
++
++class _Kept:
++    __slots__ = ("db", "identity", "path", "refs", "retired", "sidecars")
++
++    def __init__(self, path: Path, db: SessionDB, identity, sidecars) -> None:
++        self.path = path
++        self.db = db
++        self.identity = identity
++        self.sidecars = sidecars
++        self.refs = 0
++        self.retired = False
++
++
++_lock = threading.Lock()  # map and refcount operations only; opens and closes run outside it
++_kept: dict[Path, _Kept] = {}
++
++# Observability for tests and P1 readback.
++stats = {"opens": 0, "reuses": 0, "reopens": 0}
++
++
++def _sidecars(path: Path) -> dict:
++    from hermes_state_dbfile import _stat_sqlite_sidecar_identity
++
++    return _stat_sqlite_sidecar_identity(path)
++
++
++def _open_session_db(path: Path) -> SessionDB:
++    """Call-time import avoids cycles; tests patch this."""
++    from hermes_state import SessionDB
++
++    return SessionDB(path, read_only=True)
++
++
++def _usable(kept: _Kept) -> bool:
++    db = kept.db
++    if kept.retired or getattr(db, "_conn", None) is None or getattr(db, "_db_corrupt", False):
++        return False
++    if _stat_db_file_identity(kept.path) != kept.identity:
++        return False
++    return _sidecars(kept.path) == kept.sidecars
++
++
++def _close(db: SessionDB) -> None:
++    with contextlib.suppress(Exception):
++        db.close()
++
++
++def _retire(kept: _Kept) -> bool:
++    """Take *kept* out of the map (caller holds ``_lock``); True when nobody borrows it, so the caller closes it."""
++    kept.retired = True
++    if _kept.get(kept.path) is kept:
++        del _kept[kept.path]
++    return kept.refs <= 0
++
++
++def _key(db_path) -> Path:
++    try:
++        return Path(os.path.realpath(os.fspath(db_path)))
++    except (OSError, TypeError, ValueError):
++        return Path(db_path)
++
++
++def _borrow(path: Path) -> _Kept:
++    with _lock:
++        kept = _kept.get(path)
++        if kept is not None:
++            kept.refs += 1
++    if kept is not None:
++        if _usable(kept):
++            stats["reuses"] += 1
++            return kept
++        with _lock:
++            kept.refs -= 1
++            close_now = _retire(kept)
++        if close_now:
++            _close(kept.db)
++        stats["reopens"] += 1
++    identity = _stat_db_file_identity(path)
++    db = _open_session_db(path)
++    # Sidecars after the open: a WAL reader's open itself may create the -shm/-wal it then reads through.
++    sidecars = _sidecars(path)
++    if _stat_db_file_identity(path) != identity:
++        identity = None  # replaced during the open: serve this borrow, never match on the next one
++    fresh = _Kept(path, db, identity, sidecars)
++    fresh.refs = 1
++    stats["opens"] += 1
++    with _lock:
++        current = _kept.get(path)
++        if current is None or current.retired:
++            _kept[path] = fresh
++            return fresh
++        # Another thread installed one while this one opened: keep theirs, drop ours.
++        current.refs += 1
++    _close(db)
++    return current
++
++
++def _give_back(kept: _Kept, *, broken: bool = False) -> None:
++    with _lock:
++        kept.refs -= 1
++        close_now = _retire(kept) if broken else (kept.retired and kept.refs <= 0)
++    if close_now:
++        _close(kept.db)
++
++
++@contextlib.contextmanager
++def read_only(db_path) -> Iterator[SessionDB]:
++    """The process's kept ``SessionDB(read_only=True)`` for *db_path*, borrowed for the ``with`` body. The file
++    must exist (``SessionDB(read_only=True)`` raises otherwise). Never write through it."""
++    kept = _borrow(_key(db_path))
++    broken = False
++    try:
++        yield kept.db
++    except sqlite3.DatabaseError:
++        broken = True
++        raise
++    finally:
++        _give_back(kept, broken=broken)
++
++
++def close_all_under(directory: Optional[str | Path] = None) -> int:
++    """Retire every kept handle (under *directory* when given); idle ones close now, borrowed ones at their last
++    give-back. ``hermes_state_registry.close_all``/``close_all_under`` call this, so a profile delete's rmtree never
++    meets a kept descriptor. Returns how many were retired."""
++    root = None if directory is None else _key(Path(directory).expanduser())
++    with _lock:
++        chosen = [k for p, k in _kept.items() if root is None or _path_is_under(p, root)]
++        to_close = [k.db for k in chosen if _retire(k)]
++    for db in to_close:
++        _close(db)
++    return len(chosen)
++
++
++__all__ = ["close_all_under", "read_only", "stats"]
+diff --git a/hermes_state_registry.py b/hermes_state_registry.py
+index 0448216477..7deea2be1d 100644
+--- a/hermes_state_registry.py
++++ b/hermes_state_registry.py
+@@ -346,7 +346,18 @@ def close_all() -> int:
+         _retired.clear()
+         for generation in generations:
+             generation.retired = True
+-    return _teardown_swept_generations(generations, teardown_barriers, active_teardowns)
++    closed = _teardown_swept_generations(generations, teardown_barriers, active_teardowns)
++    _close_kept_readers(None)
++    return closed
++
++
++def _close_kept_readers(root: Optional[Path]) -> None:
++    """Kept read-only handles (``hermes_state_kept_reader``) hold the same files: retire them too."""
++    import sys
++
++    kept = sys.modules.get("hermes_state_kept_reader")
++    if kept is not None:
++        kept.close_all_under(root)
+ 
+ 
+ def close_all_under(directory: str | Path) -> int:
+@@ -387,6 +398,7 @@ def close_all_under(directory: str | Path) -> int:
+                 _generations.pop(generation.path, None)
+             _retired.pop(id(generation.db), None)
+     closed = _teardown_swept_generations(generations, teardown_barriers, active_teardowns)
++    _close_kept_readers(root)
+     _release_header_probes_under(root)
+     return closed
+ 
+diff --git a/tests/hermes_cli/test_kanban_kept_reader.py b/tests/hermes_cli/test_kanban_kept_reader.py
+new file mode 100644
+index 0000000000..86daacf03a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_kept_reader.py
+@@ -0,0 +1,194 @@
++"""Kept read connections for Kanban board readers (``kanban_kept_reader``). [daveey]
++
++Change-proportional design, card I: a read caller keeps one connection per (thread, board file), so
++``kanban_generation.prepare_connection`` (and the OFD lock guard it applies) runs once per kept connection, and
++the connection is reopened whenever the board file, its WAL generation or its init state changes under it.
++"""
++from __future__ import annotations
++
++import os
++import sqlite3
++import threading
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_generation as gen
++from hermes_cli import kanban_kept_reader as kept
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_DB",
++                "HERMES_KANBAN_BOARD", "HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_SESSION_ID"):
++        monkeypatch.delenv(key, raising=False)
++    path = kb.init_db()
++    yield Path(path)
++    kept.close_all()
++
++
++@pytest.fixture
++def prepares(monkeypatch):
++    calls: list = []
++    real = gen.prepare_connection
++
++    def counting(conn, timeout):
++        calls.append(conn)
++        return real(conn, timeout)
++
++    monkeypatch.setattr(gen, "prepare_connection", counting)
++    return calls
++
++
++def _triage(title: str) -> str:
++    with kbc.connect_closing() as conn:
++        return kb.create_task(conn, title=title, assignee="default", triage=True)
++
++
++def test_list_triage_ids_prepares_one_connection_across_passes(board, prepares):
++    """RED on main: every ``list_triage_ids`` (each auto-decompose pass, per board) opened and prepared a
++    fresh connection."""
++    from hermes_cli import kanban_decompose as decomp
++
++    tid = _triage("needs a spec")
++    prepares.clear()
++    for _ in range(5):
++        assert decomp.list_triage_ids() == [tid]
++    assert len(prepares) == 1
++
++
++def test_kept_reader_sees_later_writes_and_refuses_its_own(board):
++    with kept.reading() as conn:
++        first = conn
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
++        with pytest.raises(sqlite3.OperationalError):
++            conn.execute("INSERT INTO kanban_notify_subs DEFAULT VALUES")
++    tid = _triage("written by another connection")
++    with kept.reading() as conn:
++        assert conn is first
++        assert [r["id"] for r in conn.execute("SELECT id FROM tasks")] == [tid]
++
++
++def _replace_board(path: Path, title: str) -> None:
++    """Swap a different board file in under the same path (a restore): new inode, its own sidecars."""
++    copy = path.with_name("restored.db")
++    with kbc.connect_closing(path) as src, sqlite3.connect(copy) as dst:
++        src.backup(dst)
++        src.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # the old -wal must hold no frames for the new file
++    dst = sqlite3.connect(copy, isolation_level=None)
++    try:
++        dst.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('t_restored', ?, 'triage', 0)",
++                    (title,))
++        dst.execute("PRAGMA journal_mode=DELETE")
++    finally:
++        dst.close()
++    for suffix in ("-wal", "-shm"):
++        try:
++            os.unlink(str(copy) + suffix)
++        except FileNotFoundError:
++            pass
++    os.replace(copy, path)
++
++
++def test_file_replaced_under_kept_connection_reopens(board, prepares):
++    with kept.reading() as conn:
++        old = conn
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
++    _replace_board(board, "from the restored file")
++    prepares.clear()
++    with kept.reading() as conn:
++        assert conn is not old
++        assert [r["id"] for r in conn.execute("SELECT id FROM tasks")] == ["t_restored"]
++    assert len(prepares) == 1
++    with pytest.raises(sqlite3.ProgrammingError):
++        old.execute("SELECT 1")  # the stale handle was closed, not left holding the old inode
++
++
++def test_dropped_init_state_reopens_through_connect(board, prepares):
++    """``init_db``/``repair_db``/a lost schema drop the path from ``_INITIALIZED_PATHS``; the next read reopens
++    through ``connect``'s init path instead of trusting a connection opened before."""
++    with kept.reading() as conn:
++        old = conn
++    with kbc._INIT_LOCK:
++        kbc._INITIALIZED_PATHS.discard(str(board.resolve()))
++    with kept.reading() as conn:
++        assert conn is not old
++    assert str(board.resolve()) in kbc._INITIALIZED_PATHS
++
++
++def test_idle_kept_connection_on_another_thread_is_evicted_by_recovery(board):
++    """Generation recovery must be able to retire an idle kept connection parked on another thread; otherwise
++    every other thread's open of a stranded board fails until that thread reads again."""
++    got: dict = {}
++    parked, resume, done = threading.Event(), threading.Event(), threading.Event()
++
++    def other():
++        with kept.reading() as conn:
++            got["first"] = conn
++        parked.set()
++        resume.wait(10)
++        with kept.reading() as conn:
++            got["second"] = conn
++            got["rows"] = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
++        kept.close_all()
++        done.set()
++
++    worker = threading.Thread(target=other)
++    worker.start()
++    assert parked.wait(10)
++    kept._evict(gen._resolved(str(board)))  # what kanban_generation.recover calls before closing stale handles
++    with pytest.raises(sqlite3.ProgrammingError):
++        got["first"].execute("SELECT 1")
++    resume.set()
++    worker.join(10)
++    assert done.is_set() and got["second"] is not got["first"] and got["rows"] == 0
++
++
++def test_borrowed_kept_connection_is_never_closed_under_its_borrower(board):
++    with kept.reading() as conn:
++        with pytest.raises(gen.DeletedWalGenerationError):
++            kept._evict(gen._resolved(str(board)))
++        assert conn.execute("SELECT 1").fetchone()[0] == 1
++
++
++def test_nested_borrow_gets_its_own_connection(board):
++    with kept.reading() as outer:
++        with kept.reading() as inner:
++            assert inner is not outer
++            assert inner.execute("SELECT 1").fetchone()[0] == 1
++        assert outer.execute("SELECT 1").fetchone()[0] == 1
++    with kept.reading() as again:
++        assert again is outer
++
++
++def test_sqlite_error_in_body_drops_the_connection(board):
++    with pytest.raises(sqlite3.OperationalError):
++        with kept.reading() as conn:
++            first = conn
++            conn.execute("SELECT * FROM no_such_table")
++    with kept.reading() as conn:
++        assert conn is not first
++
++
++def test_exited_thread_connections_are_closed_by_the_next_borrow(board):
++    got: dict = {}
++
++    def other():
++        with kept.reading() as conn:
++            got["conn"] = conn
++
++    worker = threading.Thread(target=other)
++    worker.start()
++    worker.join(10)
++    import gc
++    gc.collect()
++    with kept.reading():
++        pass
++    with pytest.raises(sqlite3.ProgrammingError):
++        got["conn"].execute("SELECT 1")
+diff --git a/tests/hermes_state/test_state_kept_reader.py b/tests/hermes_state/test_state_kept_reader.py
+new file mode 100644
+index 0000000000..e9ae8825dc
+--- /dev/null
++++ b/tests/hermes_state/test_state_kept_reader.py
+@@ -0,0 +1,151 @@
++"""Kept read-only ``state.db`` handle for background readers (``hermes_state_kept_reader``). [daveey]
++
++Change-proportional design, card I: ``kanban_remote_notices._session_db`` opened a writable ``SessionDB`` per
++link per pass, and each open ran schema reconcile (``_reconcile_columns``) and the writer preflight. A kept
++read-only handle reconciles nothing and opens once per file identity.
++"""
++from __future__ import annotations
++
++import os
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++import hermes_state_kept_reader as kept
++from hermes_state import SessionDB
++
++
++@pytest.fixture
++def state_db(tmp_path):
++    path = tmp_path / "state.db"
++    db = SessionDB(path)
++    try:
++        db.create_session("s1", source="cli")
++    finally:
++        db.close()
++    yield path
++    kept.close_all_under(None)
++
++
++@pytest.fixture
++def reconciles(monkeypatch):
++    """Every schema pass a ``SessionDB`` open makes (``_init_schema``: the full reconcile or its memo restore)."""
++    calls: list = []
++    cls = next(c for c in SessionDB.__mro__ if "_init_schema" in c.__dict__)
++    real = cls._init_schema
++
++    def counting(self):
++        calls.append(self)
++        return real(self)
++
++    monkeypatch.setattr(cls, "_init_schema", counting)
++    return calls
++
++
++@pytest.fixture
++def opens(monkeypatch):
++    calls: list = []
++    real = kept._open_session_db
++
++    def counting(path):
++        calls.append(path)
++        return real(path)
++
++    monkeypatch.setattr(kept, "_open_session_db", counting)
++    return calls
++
++
++def test_kept_handle_is_reused_and_never_reconciles_schema(state_db, reconciles, opens):
++    for _ in range(5):
++        with kept.read_only(state_db) as db:
++            assert db.read_only
++            assert db.get_session("s1") is not None
++    assert len(opens) == 1
++    assert reconciles == []
++
++
++def test_remote_notice_session_db_does_not_reconcile_per_pass(state_db, reconciles, monkeypatch):
++    """RED on main: ``_session_db`` built ``SessionDB(path)`` (writable) per call, reconciling the schema every
++    time a pass looked at a linked chat."""
++    from hermes_cli import profiles
++    from tui_gateway import kanban_remote_notices as notices
++
++    monkeypatch.setattr(profiles, "get_profile_dir", lambda name: state_db.parent)
++    for _ in range(3):
++        with notices._session_db("default", "s1") as (db, tip):
++            assert db is not None and tip == "s1"
++    assert reconciles == []
++
++
++def test_replaced_file_reopens_the_kept_handle(state_db, opens):
++    with kept.read_only(state_db) as db:
++        old = db
++    other = state_db.with_name("other.db")
++    fresh = SessionDB(other)
++    try:
++        fresh.create_session("s2", source="cli")
++    finally:
++        fresh.close()
++    for suffix in ("-wal", "-shm"):
++        for base in (state_db, other):
++            try:
++                os.unlink(str(base) + suffix)
++            except FileNotFoundError:
++                pass
++    os.replace(other, state_db)
++    with kept.read_only(state_db) as db:
++        assert db is not old
++        assert db.get_session("s2") is not None and db.get_session("s1") is None
++    assert len(opens) == 2
++    assert old._conn is None  # the stale handle was closed, not left on the old inode
++
++
++def test_closed_handle_is_replaced(state_db, opens):
++    with kept.read_only(state_db) as db:
++        db.close()
++    with kept.read_only(state_db) as db:
++        assert db._conn is not None
++    assert len(opens) == 2
++
++
++def test_database_error_in_body_retires_the_handle(state_db, opens):
++    with pytest.raises(sqlite3.OperationalError):
++        with kept.read_only(state_db) as db:
++            first = db
++            db._conn.execute("SELECT * FROM no_such_table")
++    with kept.read_only(state_db) as db:
++        assert db is not first
++    assert first._conn is None
++
++
++def test_retire_while_borrowed_closes_at_give_back(state_db):
++    with kept.read_only(state_db) as db:
++        assert kept.close_all_under(state_db.parent) == 1
++        assert db.get_session("s1") is not None  # still usable by its borrower
++    assert db._conn is None
++
++
++def test_registry_close_all_under_retires_kept_handles(state_db):
++    import hermes_state_registry
++
++    with kept.read_only(state_db) as db:
++        pass
++    hermes_state_registry.close_all_under(state_db.parent)
++    assert db._conn is None
++
++
++def test_notice_write_goes_through_the_shared_writer(state_db, monkeypatch):
++    from tui_gateway.kanban_notice_session_store import notice_writer, session_store
++
++    with session_store(state_db, "s1") as (db, tip):
++        assert tip == "s1"
++        with pytest.raises(Exception):
++            db.append_kanban_notice(tip, "x", {"notice_id": "b:t:0"})  # the kept handle is read-only
++        with notice_writer(db) as wdb:
++            assert not wdb.read_only
++            row = wdb.append_kanban_notice(tip, "hello", {"notice_id": "b:t:1"})
++        assert row
++    with kept.read_only(state_db) as db:
++        texts = [m.get("content") for m in db.get_messages("s1")]
++    assert "hello" in " ".join(str(t) for t in texts)
+diff --git a/tui_gateway/kanban_notice_session_store.py b/tui_gateway/kanban_notice_session_store.py
+new file mode 100644
+index 0000000000..d23be50a27
+--- /dev/null
++++ b/tui_gateway/kanban_notice_session_store.py
+@@ -0,0 +1,55 @@
++"""The chat store a remote Kanban notice pass reads and writes. [daveey]
++
++Reads (session row, compression tip, archive/move, worker transcript, gateway lease, the notice already in the
++transcript) run on the process's kept read-only ``state.db`` handle (``hermes_state_kept_reader``): no writer
++open and no schema reconcile per link per pass. The one write a pass may make, the notice row and its outcome
++refresh, borrows the shared writer (``hermes_state_registry.acquire``) for just that write.
++"""
++from __future__ import annotations
++
++import contextlib
++from pathlib import Path
++from typing import Any, Iterator, Optional
++
++
++class NoticeSessionStore:
++    """Read-only ``SessionDB`` facade with :meth:`notice_writer` for the write. Attribute reads go to the kept
++    read-only handle; a write method called on it directly fails there (read-only), never silently elsewhere."""
++
++    def __init__(self, reader: Any, path: Path) -> None:
++        self._reader = reader
++        self._path = path
++
++    def __getattr__(self, name: str) -> Any:
++        return getattr(self._reader, name)
++
++    @contextlib.contextmanager
++    def notice_writer(self) -> Iterator[Any]:
++        from hermes_state_registry import acquire, release
++
++        db = acquire(self._path)
++        try:
++            yield db
++        finally:
++            release(db)
++
++
++def notice_writer(db: Any):
++    """The handle to write a notice row through: the store's shared writer, else *db* itself (a writable
++    ``SessionDB`` or a test double)."""
++    opener = getattr(db, "notice_writer", None) if isinstance(db, NoticeSessionStore) else None
++    return opener() if opener is not None else contextlib.nullcontext(db)
++
++
++@contextlib.contextmanager
++def session_store(path: Path, sid: str) -> Iterator[tuple[Optional[NoticeSessionStore], Optional[str]]]:
++    """``(store, compression tip)`` for chat *sid* in the ``state.db`` at *path*; ``(None, None)`` when the file or
++    the session is missing."""
++    if not path.is_file():
++        yield None, None
++        return
++    from hermes_state_kept_reader import read_only
++
++    with read_only(path) as reader:
++        store = NoticeSessionStore(reader, path)
++        yield (store, store.get_compression_tip(sid) or sid) if store.get_session(sid) else (None, None)
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 6d7b857a68..d7ac28dfa8 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -1002,18 +1002,12 @@ logger = logging.getLogger(__name__)
+ 
+ @contextlib.contextmanager
+ def _session_db(profile, sid):
++    """Reads on the kept read-only store; write a notice through ``notice_writer(db)`` (card I). [daveey]"""
+     from hermes_cli.profiles import get_profile_dir
+-    from hermes_state import SessionDB
++    from tui_gateway.kanban_notice_session_store import session_store
+ 
+-    path = get_profile_dir(profile) / "state.db"
+-    if not path.is_file():
+-        yield None, None
+-        return
+-    db = SessionDB(path)
+-    try:
+-        yield (db, db.get_compression_tip(sid) or sid) if db.get_session(sid) else (None, None)
+-    finally:
+-        db.close()
++    with session_store(get_profile_dir(profile) / "state.db", sid) as pair:
++        yield pair
+ 
+ 
+ def _ledger_settled(conn: Optional[sqlite3.Connection], sessions: tuple, ref: str, state: str) -> bool:
+@@ -1211,9 +1205,11 @@ def _persist_claimed(session_db, profile: str, sid: str, text: str, metadata: di
+             if db is None or chat_skip_reason(db, sid) is not None:
+                 release(claim, ledger=ledger)
+                 return False
+-            db.append_kanban_notice(tip, text, metadata)
+-            from hermes_state_outcome import refresh_outcomes_quietly
+-            refresh_outcomes_quietly([tip], "notice", db=db)  # [daveey] the passive row is the chat's last word
++            from tui_gateway.kanban_notice_session_store import notice_writer
++            with notice_writer(db) as wdb:
++                wdb.append_kanban_notice(tip, text, metadata)
++                from hermes_state_outcome import refresh_outcomes_quietly
++                refresh_outcomes_quietly([tip], "notice", db=wdb)  # [daveey] the passive row is the chat's last word
+     except SessionTurnLeaseLostError:
+         release(claim, ledger=ledger)
+         logger.info("remote Kanban notice %s for chat %s deferred: a turn is running; retrying next pass",
+@@ -1314,9 +1310,11 @@ def _deliver_link(owner, key, task, link, *, me, ref, state, path, live, session
+                 _note_wait(sid, ref, state, f"left to gateway pid {gw_pid}: its turn holds the chat's lease")
+                 return
+             if waker is None:
+-                row_id = db.append_kanban_notice(tip, text, metadata)
+-                from hermes_state_outcome import refresh_outcomes_quietly
+-                refresh_outcomes_quietly([tip], "notice", db=db)  # [daveey] unloaded sweeper's remote rows too
++                from tui_gateway.kanban_notice_session_store import notice_writer
++                with notice_writer(db) as wdb:
++                    row_id = wdb.append_kanban_notice(tip, text, metadata)
++                    from hermes_state_outcome import refresh_outcomes_quietly
++                    refresh_outcomes_quietly([tip], "notice", db=wdb)  # [daveey] unloaded sweeper's remote rows too
+                 delivered.append({"task_id": task["id"], "session_id": tip, "message_row": row_id})
+                 swept.append(memo_key)
+                 ack(claim, ledger=ledger)
+-- 
+2.43.0
+

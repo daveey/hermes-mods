@@ -1,0 +1,864 @@
+From 60ce612abd173adec985c61efb4de2e629225ed7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 20:59:48 +0000
+Subject: [PATCH] [daveey] upstream sync gate: require an independent
+ exact-head review for a fork-authored sync
+
+Core PR #2479 (upstream sync 254119c6f5) landed through scripts/ci/upstream_sync.py with
+no review, although it carried fork-authored code: 17 remerge-diff files (conflict
+resolutions and fork edits) plus a test fixup. The fork's rule for code is an independent
+exact-head approval plus green required CI.
+
+The gate now classifies a sync head before landing it (scripts/ci/upstream_sync_review.py):
+- mechanical: every merge it brings that upstream/main lacks has an empty
+  `git show --remerge-diff`, and it brings no other commit. These land exactly as before.
+- fork-authored: anything else. It lists the resolution files per merge and the fork
+  commits. It merges only after hermes-core-wt ship's own review gate approves the PR's
+  exact head: keyed_review_card / request_review files the review card, review_gate
+  reads the verdict, review_reply_guard holds unanswered non-blocking points. Until
+  then the gate prints NOT YET naming the review card (or, in a worker shell, the exact
+  kanban_create to file). A host without the ship tool, or with a tool that lacks those
+  entry points, refuses instead of landing.
+
+`upstream_sync.py --classify REV [--base REV]` is the dry run: it prints the verdict and
+lands nothing (for a landed head it classifies against main just before it landed).
+--review-reply and --impl-task pass through to ship's gate. The landing PR body names
+the fork-authored content a reviewer should read. .github/LANDING.md says which syncs
+need review.
+
+Tests (tests/scripts/ci/test_upstream_sync_review.py, real bare remotes, ship's module
+stubbed through HERMES_CORE_WT_LAND): conflict-resolution sync parks then lands on an
+exact-head approval; a mechanical sync lands with no review; a [daveey] fixup with no
+conflict parks; an unreadable or drifted ship tool refuses; worker review-card action;
+unanswered points park; classify dry run. Mutants on the classifier (drop the
+remerge-diff check, drop the fixup check, invert the verdict) each fail named tests.
+
+Task: t_01a1d6945ea46bd0
+---
+ .github/LANDING.md                            |   9 +-
+ scripts/ci/upstream_sync.py                   | 104 +++++-
+ scripts/ci/upstream_sync_review.py            | 260 +++++++++++++++
+ tests/hermes_cli/upstream_gate_fake.py        |   3 +-
+ tests/scripts/ci/test_upstream_sync_review.py | 303 ++++++++++++++++++
+ 5 files changed, 663 insertions(+), 16 deletions(-)
+ create mode 100644 scripts/ci/upstream_sync_review.py
+ create mode 100644 tests/scripts/ci/test_upstream_sync_review.py
+
+diff --git a/.github/LANDING.md b/.github/LANDING.md
+index 0c792ef7fe..de75106db6 100644
+--- a/.github/LANDING.md
++++ b/.github/LANDING.md
+@@ -15,4 +15,11 @@ So every change lands through CI on its exact sha:
+ 
+ `hermes-core-wt ship <slug>` does all three after its local lint, affected-test
+ and pre-push gates. Upstream syncs go through `scripts/ci/upstream_sync.py`
+-instead.
++instead. A purely mechanical sync (every merge has an empty
++`git show --remerge-diff` and nothing else sits on top of upstream) lands on
++green CI alone. A sync that carries fork-authored content (a conflict
++resolution or fork edit in a merge, or a `[daveey]` fixup commit) is code the
++fork wrote: the gate parks it as NOT YET until an independent exact-head review
++approves it, through the same review card and `review_gate` that
++`hermes-core-wt ship` uses. `upstream_sync.py --classify <sha>` prints which
++kind a head is.
+diff --git a/scripts/ci/upstream_sync.py b/scripts/ci/upstream_sync.py
+index 418a526653..7eded0031a 100644
+--- a/scripts/ci/upstream_sync.py
++++ b/scripts/ci/upstream_sync.py
+@@ -10,6 +10,11 @@ branch ``sync/upstream-<X>``. ``.github/workflows/upstream-sync.yml`` runs the f
+ run completed green, with every required job succeeding on an approved fork runner at exactly X, is
+ landed through a pull request from that same branch. main is protected for admins too: GitHub
+ refuses any direct push whose exact sha lacks a green "All required checks pass (v2)" (ci.yaml).
++A sync that carries fork-authored content (a merge with a non-empty ``git show --remerge-diff``, i.e. a
++conflict resolution or fork edit, or any commit upstream/main lacks, e.g. a ``[daveey]`` fixup) also needs an
++independent exact-head review through ``hermes-core-wt ship``'s own gate before it merges
++(scripts/ci/upstream_sync_review.py); until then it reports NOT YET naming the review card. A mechanical sync
++(empty remerge-diffs, nothing else) needs no review. ``--classify REV`` prints that verdict and lands nothing.
+ The gate opens (or reuses) the PR, waits across calls until that check is green on exactly X, then
+ runs ``gh pr merge --merge --match-head-commit X`` (never --admin). Nothing is ever force-pushed.
+ Red, pending or unreadable evidence is a refusal. A protection refusal is reported as REFUSED
+@@ -277,7 +282,7 @@ def _remote_sha(repo, ref: str) -> str:
+     return out.split()[0] if out else ""
+ 
+ 
+-def _land_pr(repo, cand: Candidate, gh_repo, request, gh) -> dict:
++def _land_pr(repo, cand: Candidate, gh_repo, request, gh, review_note: str = "") -> dict:
+     """The open PR main <- sync/upstream-<head> whose head is exactly the tested head; opened if absent.
+ 
+     The PR comes from the candidate's own staging branch, so its head IS the sha the full suite
+@@ -306,7 +311,7 @@ def _land_pr(repo, cand: Candidate, gh_repo, request, gh) -> dict:
+                  "--body", f"Opened by scripts/ci/upstream_sync.py. The upstream sync {cand.head} passed the "
+                            f"fork's full suite: {cand.url}\n\nThe gate merges this PR (merge commit, "
+                            f"`--match-head-commit {cand.head}`, never `--admin`) once \"{REQUIRED_CHECK}\" is "
+-                           "green on exactly this head. Do not push to this branch.",
++                           "green on exactly this head. Do not push to this branch." + review_note,
+                  reason="upstream sync gate: open the landing PR")
+     text = ((created.stdout or "") + (created.stderr or "")).strip()
+     url = re.search(r"https://\S+/pull/(\d+)", text)
+@@ -335,8 +340,31 @@ def required_check(gh_repo, sha, request) -> tuple[str, str]:
+     return "red", f'"{REQUIRED_CHECK}" concluded {run.get("conclusion")} on {sha[:10]} {where}'.rstrip()
+ 
+ 
+-def land(repo, cand: Candidate, *, gh_repo: str, request=github_pages, gh=gh_cli, protected=None) -> int:
+-    """Put the tested head on main through its PR, merged once the required check is green on exactly it."""
++def _review_module():
++    if __package__:  # imported as scripts.ci.upstream_sync (tests): the same module object they patch
++        from . import upstream_sync_review as review
++    else:  # run as a script: scripts/ci is sys.path[0]
++        import upstream_sync_review as review
++    return review
++
++
++def _fork_review(repo, cand: Candidate, found, pr: dict, gh_repo: str, review) -> tuple[int | None, str]:
++    """(None, receipt line) when the fork-authored sync has its independent exact-head approval, else
++    (NOT_YET | REFUSED, the visible status naming the review card or what blocks judging it)."""
++    where = f"PR #{pr['number']} {pr.get('html_url', '')}".rstrip()
++    status = f"{where} is a fork-authored sync ({found.summary()})"
++    try:
++        approved, message = review.check(gh_repo, int(pr["number"]), cand.head, BRANCH_PREFIX + cand.head)
++    except _review_module().ReviewUnavailable as exc:
++        return REFUSED, f"REFUSED: {status}; it lands only after an independent exact-head review, but {exc}"
++    if approved:
++        return None, message
++    return NOT_YET, f"NOT YET: {status}; it lands only after an independent exact-head review: {message}"
++
++
++def land(repo, cand: Candidate, *, gh_repo: str, request=github_pages, gh=gh_cli, protected=None, review=None) -> int:
++    """Put the tested head on main through its PR, merged once the required check is green on exactly it, and,
++    for a fork-authored sync, once an independent exact-head review approves it."""
+     main = _fetch_main(repo)
+     if _parents_on_main(repo, cand.head, main):
+         print(f"LANDED: sync {cand.head[:10]} is superseded; main {main} contains every parent")
+@@ -352,7 +380,15 @@ def land(repo, cand: Candidate, *, gh_repo: str, request=github_pages, gh=gh_cli
+             return REFUSED
+     if protected is not None:
+         protected.add(cand.head)
+-    pr = _land_pr(repo, cand, gh_repo, request, gh)
++    reviews = _review_module()
++    try:
++        found = reviews.classify(repo, cand.head, main)
++    except reviews.ClassifyError as exc:
++        raise GateError(f"cannot classify {cand.head[:10]} as mechanical or fork-authored: {exc}") from exc
++    print(f"  sync {cand.head[:10]} is {found.verdict}" + "".join(f"\n    {line}" for line in found.lines()))
++    note = (f"\n\n**Fork-authored sync**: {found.summary()}. It merges only after an independent exact-head "
++            f"review of these (upstream's own commits need none):\n{found.review_scope()}") if found.fork_authored else ""
++    pr = _land_pr(repo, cand, gh_repo, request, gh, note)
+     where = f"PR #{pr['number']} {pr.get('html_url', '')}".rstrip()
+     verdict, detail = required_check(gh_repo, cand.head, request)
+     if verdict == "pending":
+@@ -361,9 +397,17 @@ def land(repo, cand: Candidate, *, gh_repo: str, request=github_pages, gh=gh_cli
+     if verdict == "red":
+         print(f"REFUSED: {where} cannot land: {detail}")
+         return REFUSED
++    receipt = ""
++    if found.fork_authored:
++        code, message = _fork_review(repo, cand, found, pr, gh_repo, review or reviews.ShipReview(repo))
++        if code is not None:
++            print(message)
++            return code
++        receipt = f"\nReview: {message}"
++        print(f"  {message}")
+     merged = gh("pr", "merge", str(pr["number"]), "-R", gh_repo, "--merge", "--match-head-commit", cand.head,
+                 "--subject", f"Merge tested upstream sync {cand.head[:10]} into main",
+-                "--body", f"Full suite: {cand.url}\n{REQUIRED_CHECK}: {detail}",
++                "--body", f"Full suite: {cand.url}\n{REQUIRED_CHECK}: {detail}{receipt}",
+                 reason="upstream sync gate: merge the landing PR")
+     if merged.returncode:
+         message = ((merged.stderr or "") + (merged.stdout or "")).strip()[-600:]
+@@ -382,11 +426,12 @@ def land(repo, cand: Candidate, *, gh_repo: str, request=github_pages, gh=gh_cli
+     return LANDED
+ 
+ 
+-def _land_other_greens(repo, found, head, main, *, gh_repo, request, gh, protected=None) -> bool:
++def _land_other_greens(repo, found, head, main, *, gh_repo, request, gh, protected=None, review=None) -> bool:
+     landed = False
+     for cand in found.values():
+         if cand.status == "green" and cand.head != head and not _is_ancestor(repo, cand.head, main):
+-            landed = land(repo, cand, gh_repo=gh_repo, request=request, gh=gh, protected=protected) == LANDED or landed
++            landed = land(repo, cand, gh_repo=gh_repo, request=request, gh=gh, protected=protected,
++                          review=review) == LANDED or landed
+     return landed
+ 
+ 
+@@ -444,19 +489,20 @@ def _close_superseded(repo, gh_repo, request, gh, protected=()) -> None:
+ 
+ 
+ def advance(repo: Path, head: str | None, *, gh_repo: str, request=github_pages, gh=gh_cli, now=None,
+-            cache: VerdictCache | None = None) -> int:
++            cache: VerdictCache | None = None, review=None) -> int:
+     """Land green candidates, then report ``head``'s state or stage it (module doc, exit codes).
+ 
+     Every call then closes open sync PRs whose parents main already holds, including any this call's landing
+     made redundant."""
+     protected = set()
+     verdict = _advance(repo, head, gh_repo=gh_repo, request=request, gh=gh, now=now, protected=protected,
+-                       cache=cache)
++                       cache=cache, review=review)
+     _close_superseded(repo, gh_repo, request, gh, protected)
+     return verdict
+ 
+ 
+-def _advance(repo: Path, head: str | None, *, gh_repo: str, request, gh, now, protected, cache=None) -> int:
++def _advance(repo: Path, head: str | None, *, gh_repo: str, request, gh, now, protected, cache=None,
++             review=None) -> int:
+     now = time.time() if now is None else now
+     try:
+         if head is not None:
+@@ -471,7 +517,7 @@ def _advance(repo: Path, head: str | None, *, gh_repo: str, request, gh, now, pr
+ 
+         found = candidates(gh_repo, request, wanted=wanted, cache=cache)
+         landed_other = _land_other_greens(repo, found, head, main, gh_repo=gh_repo, request=request,
+-                                         gh=gh, protected=protected)
++                                         gh=gh, protected=protected, review=review)
+         if head is None:
+             return LANDED if landed_other else NOT_YET
+         main = _fetch_main(repo)
+@@ -486,7 +532,7 @@ def _advance(repo: Path, head: str | None, *, gh_repo: str, request, gh, now, pr
+             protected.add(head)
+             return _stage_or_wait(repo, head, found, now)
+         if cand.status == "green":
+-            return land(repo, cand, gh_repo=gh_repo, request=request, gh=gh, protected=protected)
++            return land(repo, cand, gh_repo=gh_repo, request=request, gh=gh, protected=protected, review=review)
+         if cand.status == "red":
+             print(f"REFUSED: the full suite failed on {head[:10]}: {cand.url}")
+             _explain_red(repo, cand, main, gh_repo, request, gh)
+@@ -571,16 +617,46 @@ def main(argv=None) -> int:
+     parser.add_argument("--repo", type=Path, default=Path.cwd())
+     parser.add_argument("--head", help="candidate commit; omitted: only land staged candidates that went green")
+     parser.add_argument("--guard-push", metavar="SHA", help="pre-push check (scripts/check --commit runs it)")
++    parser.add_argument("--classify", metavar="REV", help="dry run: print whether REV is a mechanical or a "
++                        "fork-authored sync (and what it carries), land nothing")
++    parser.add_argument("--base", metavar="REV", help="--classify against this fork main (default: origin/main, "
++                        "or main just before REV landed)")
++    parser.add_argument("--review-reply", default="", help="answer an approving review's non-blocking points "
++                        "(posted on the PR, as hermes-core-wt ship --review-reply)")
++    parser.add_argument("--impl-task", default="", help="the Kanban card that authored a fork-authored sync: "
++                        "its sessions cannot be its independent reviewer (as hermes-core-wt ship --impl-task)")
+     args = parser.parse_args(argv)
+     if args.guard_push:
+         return guard_push(args.repo, args.guard_push)
++    if args.classify:
++        return classify_cli(args.repo, args.classify, args.base)
+     try:
+         slug = origin_slug(args.repo)
+     except GateError as exc:
+         print(f"REFUSED: {exc}")
+         return REFUSED
+     cache = VerdictCache(default_cache_path())
+-    return advance(args.repo, args.head, gh_repo=canonical_slug(slug, cache=cache), cache=cache)
++    review = _review_module().ShipReview(args.repo, reply=args.review_reply, impl_task=args.impl_task)
++    return advance(args.repo, args.head, gh_repo=canonical_slug(slug, cache=cache), cache=cache, review=review)
++
++
++def classify_cli(repo, rev: str, base: str | None) -> int:
++    """``--classify``: the verdict the gate would reach for ``rev``, printed; nothing is staged or landed."""
++    reviews = _review_module()
++    try:
++        head = git(repo, "rev-parse", "--verify", f"{rev}^{{commit}}")
++        main = git(repo, "rev-parse", "--verify", "refs/remotes/origin/main^{commit}")
++        base = git(repo, "rev-parse", "--verify", f"{base}^{{commit}}") if base else reviews.landing_base(repo, head,
++                                                                                                         main)
++        found = reviews.classify(repo, head, base)
++    except (GateError, reviews.ClassifyError) as exc:
++        print(f"REFUSED: cannot classify {rev}: {exc}")
++        return REFUSED
++    print(f"CLASSIFY {head[:10]} against base {base[:10]} (upstream/main {found.upstream[:10] or 'missing'}): "
++          f"{found.verdict}" + (f" ({found.summary()})" if found.fork_authored else ""))
++    for line in found.lines():
++        print(f"  {line}")
++    return 0
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/scripts/ci/upstream_sync_review.py b/scripts/ci/upstream_sync_review.py
+new file mode 100644
+index 0000000000..12ad25199e
+--- /dev/null
++++ b/scripts/ci/upstream_sync_review.py
+@@ -0,0 +1,260 @@
++"""Which upstream syncs carry fork-authored content, and the independent review such a sync needs before it lands.
++
++    python3 scripts/ci/upstream_sync.py --classify REV [--base REV]   # dry run: print the verdict, land nothing
++
++A sync head is **mechanical** when every merge it brings that is not upstream's own has an empty
++``git show --remerge-diff`` (git re-did the merge and got exactly the committed tree) and it brings no other
++commit that upstream/main lacks. Anything else is **fork-authored**: a conflict resolution (a non-empty
++remerge-diff) or a fork commit such as a ``[daveey] Upstream sync: ...`` fixup. That is code the fork wrote, and
++the fork's rule for code is an independent exact-head approval plus green required CI (core PR #2479 landed 17
++remerge-diff files and a test fixup with no review; t_01a1d6945ea46bd0).
++
++The review gate is ``hermes-core-wt ship``'s own, loaded from ``hermes-core-wt-land`` (state repo; installed at
++``~/.hermes/bin`` on the hub and ``~/.hermes/lib/core-tools`` on pool workers, or ``$HERMES_CORE_WT_LAND``): the
++exact-head review card under its idempotency key ``core-wt-review:<repo>#<pr>:<sha>`` (filed with
++``request_review``), then ``review_gate`` on the PR's exact head, then ``review_reply_guard`` for non-blocking
++points. A host without that tool cannot judge a review, so a fork-authored sync is refused there, never landed.
++"""
++from __future__ import annotations
++
++import importlib.machinery
++import importlib.util
++import inspect
++import json
++import os
++import re
++import shutil
++import subprocess
++import sys
++from dataclasses import dataclass, field
++from pathlib import Path
++
++UPSTREAM_REF = "refs/remotes/upstream/main"
++LAND_ENV = "HERMES_CORE_WT_LAND"
++IMPL_ENV = "HERMES_UPSTREAM_SYNC_IMPL_TASK"
++
++
++class ClassifyError(Exception):
++    pass
++
++
++def _git(repo, *args) -> subprocess.CompletedProcess:
++    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, encoding="utf-8",
++                          errors="replace", timeout=600, check=False)
++
++
++def _out(repo, *args) -> str:
++    proc = _git(repo, *args)
++    if proc.returncode:
++        raise ClassifyError(f"git {' '.join(args[:2])} failed: {(proc.stderr or proc.stdout).strip()[-300:]}")
++    return proc.stdout
++
++
++@dataclass
++class Classification:
++    head: str
++    base: str
++    upstream: str  # the upstream/main sha the range excluded ("" when the ref is missing: nothing is upstream's)
++    resolutions: list = field(default_factory=list)  # [(merge sha, [files])]: non-empty remerge-diff
++    commits: list = field(default_factory=list)  # [(sha, subject)]: non-merge commits upstream/main lacks
++    clean_merges: list = field(default_factory=list)  # merges whose remerge-diff is empty
++
++    @property
++    def fork_authored(self) -> bool:
++        return bool(self.resolutions or self.commits)
++
++    @property
++    def verdict(self) -> str:
++        return "fork-authored" if self.fork_authored else "mechanical"
++
++    def lines(self) -> list[str]:
++        out = [f"merge {sha[:10]}: conflict resolution / fork edit (non-empty remerge-diff) in {len(files)} "
++               f"file(s): {', '.join(files) or '?'}" for sha, files in self.resolutions]
++        out += [f"commit {sha[:10]} {subject}" for sha, subject in self.commits]
++        out += [f"merge {sha[:10]}: clean (empty remerge-diff)" for sha in self.clean_merges]
++        return out
++
++    def summary(self) -> str:
++        files = sorted({f for _, fs in self.resolutions for f in fs})
++        parts = []
++        if self.resolutions:
++            parts.append(f"{len(files)} remerge-diff file(s) in {len(self.resolutions)} merge(s)")
++        if self.commits:
++            parts.append(f"{len(self.commits)} fork commit(s): "
++                         + ", ".join(f"{sha[:10]} {subject[:60]}" for sha, subject in self.commits[:5]))
++        return "; ".join(parts) or "no fork-authored content"
++
++    def review_scope(self) -> str:
++        """What a reviewer of this sync reads: the fork-authored content only, not upstream's commits."""
++        cmds = [f"git show --remerge-diff {sha}" for sha, _ in self.resolutions]
++        cmds += [f"git show {sha}" for sha, _ in self.commits]
++        return "\n".join(f"- `{c}`" for c in cmds)
++
++
++_DIFF_PATH = re.compile(r"^diff --git a/(.+?) b/(.+)$")
++_CONFLICT_PATH = re.compile(r"^remerge CONFLICT \([^)]*\): .*? in (.+)$")
++
++
++def remerge_files(repo, merge: str) -> list[str]:
++    """Files whose committed content differs from git's own re-merge of ``merge``'s parents ([] = mechanical)."""
++    text = _out(repo, "show", "--remerge-diff", "--no-color", "--no-ext-diff", "--format=", merge)
++    if not text.strip():
++        return []
++    files = set()
++    for line in text.splitlines():
++        hit = _DIFF_PATH.match(line) or _CONFLICT_PATH.match(line)
++        if hit:
++            files.add(hit.groups()[-1])
++    return sorted(files) or ["(unparsed remerge-diff)"]
++
++
++def classify(repo, head: str, base: str) -> Classification:
++    """Classify what ``head`` brings over ``base`` (the fork's main) that upstream/main does not already hold."""
++    upstream = _git(repo, "rev-parse", "-q", "--verify", f"{UPSTREAM_REF}^{{commit}}").stdout.strip()
++    found = Classification(head, base, upstream)
++    rng = [head, f"^{base}"] + ([f"^{upstream}"] if upstream else [])
++    for line in _out(repo, "log", "--reverse", "--format=%H%x09%P%x09%s", *rng, "--").splitlines():
++        sha, parents, subject = (line.split("\t", 2) + ["", ""])[:3]
++        parents = parents.split()
++        if len(parents) > 2:
++            found.resolutions.append((sha, ["(octopus merge: no remerge-diff)"]))
++        elif len(parents) == 2:
++            files = remerge_files(repo, sha)
++            if files:
++                found.resolutions.append((sha, files))
++            else:
++                found.clean_merges.append(sha)
++        else:
++            found.commits.append((sha, subject))
++    return found
++
++
++def landing_base(repo, head: str, main: str) -> str:
++    """The base to classify ``head`` against: ``main`` while it is not landed; once landed, main just before the
++    first-parent commit that brought it in (the dry run of an already-landed sync)."""
++    if _git(repo, "merge-base", "--is-ancestor", head, main).returncode:
++        return main
++    chain = _out(repo, "rev-list", "--first-parent", "--ancestry-path", "--reverse", f"{head}..{main}").split()
++    landing = chain[0] if chain else head
++    return _out(repo, "rev-parse", f"{landing}^1").strip()
++
++
++def land_tool_path() -> str:
++    """hermes-core-wt-land on this host ("" when absent): $HERMES_CORE_WT_LAND, next to hermes-core-wt, or the
++    hub/worker install directories."""
++    env = os.environ.get(LAND_ENV)
++    if env:
++        return env if Path(env).is_file() else ""
++    home = Path.home()
++    tried = []
++    wrapper = shutil.which("hermes-core-wt")
++    if wrapper:
++        tried.append(Path(wrapper).resolve().parent / "hermes-core-wt-land")
++    tried += [home / ".hermes/bin/hermes-core-wt-land", home / ".hermes/lib/core-tools/hermes-core-wt-land"]
++    return next((str(p) for p in tried if p.is_file()), "")
++
++
++def load_land_tool(path: str):
++    """Import hermes-core-wt-land (an extensionless script) as a module, without running its main."""
++    loader = importlib.machinery.SourceFileLoader("hermes_core_wt_land_for_sync", path)
++    spec = importlib.util.spec_from_loader(loader.name, loader)
++    if spec is None:
++        raise ImportError(f"no import spec for {path}")
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[loader.name] = module  # dataclasses and pickling resolve the module by name
++    loader.exec_module(module)
++    return module
++
++
++class ReviewUnavailable(Exception):
++    """The review gate cannot be judged on this host: refuse, never land."""
++
++
++# The ship-gate entry points this gate calls, with the parameters it passes: an installed tool that drifted
++# from them refuses here instead of failing mid-judgement (or, worse, judging with a changed meaning).
++SHIP_GATE_CONTRACT = {
++    "keyed_review_card": ("slug", "number", "sha"),
++    "request_review": ("wt", "slug", "number", "sha", "old", "base", "prior_review", "impl_task", "gh"),
++    "review_gate": ("gh", "slug", "pr", "sha", "branch", "base", "review_task", "impl_task"),
++    "review_reply_guard": ("gh", "slug", "pr", "review", "reply"),
++}
++
++
++def contract_errors(mod) -> list[str]:
++    errors = [f"{name} missing" for name in ("Gh", "ReviewRefused", "ReviewCIStopped") if not hasattr(mod, name)]
++    for name, params in SHIP_GATE_CONTRACT.items():
++        fn = getattr(mod, name, None)
++        if not callable(fn):
++            errors.append(f"{name} missing")
++            continue
++        have = inspect.signature(fn).parameters
++        errors += [f"{name} lacks {p}" for p in params if p not in have]
++    return errors
++
++
++class _NeverRaised(Exception):
++    """Stands in for a ship-tool exception class an older tool lacks."""
++
++
++class ShipReview:
++    """``hermes-core-wt ship``'s independent exact-head review gate, applied to a sync PR.
++
++    ``check`` returns (approved, message). Not approved: the message names the review card (or the exact
++    ``kanban_create`` a worker shell must submit) and what lands it. Raises ReviewUnavailable when the gate
++    cannot be read (no ship tool, a failed card filing, an unreadable PR): the caller refuses."""
++
++    def __init__(self, repo, *, reply: str = "", impl_task: str = "", tool: str | None = None):
++        self.repo, self.reply, self.tool = str(repo), reply, tool
++        self.impl_task = impl_task or os.environ.get(IMPL_ENV, "")
++
++    def _module(self):
++        path = self.tool or land_tool_path()
++        if not path:
++            raise ReviewUnavailable("review gate unavailable: hermes-core-wt-land is not installed on this host "
++                                    f"(set ${LAND_ENV}); a fork-authored sync cannot be judged here")
++        try:
++            mod = load_land_tool(path)
++        except (OSError, SyntaxError, ImportError) as exc:
++            raise ReviewUnavailable(f"review gate unavailable: cannot load {path}: {exc!r}") from exc
++        errors = contract_errors(mod)
++        if errors:
++            raise ReviewUnavailable(f"review gate unavailable: {path} does not offer ship's review entry points "
++                                    f"this gate calls ({'; '.join(errors)})")
++        return mod
++
++    def check(self, gh_repo: str, number: int, head: str, branch: str) -> tuple[bool, str]:
++        mod = self._module()
++        quota_brake = getattr(mod, "SharedQuotaBrake", _NeverRaised)
++        try:
++            return self._check(mod, gh_repo, number, head, branch)
++        except mod.ReviewCIStopped as exc:
++            raise ReviewUnavailable(f"review card not filed: {exc}") from exc
++        except quota_brake as exc:
++            return False, f"GitHub quota brake ({exc}); run again later"
++
++    def _check(self, mod, gh_repo, number, head, branch) -> tuple[bool, str]:
++        gh = mod.Gh(self.repo)
++        pr = {"number": number}
++        card = mod.keyed_review_card(gh_repo, number, head)
++        try:
++            receipt = mod.review_gate(gh, gh_repo, pr, head, branch, "main", card, impl_task=self.impl_task)
++        except mod.ReviewRefused as exc:
++            refusal = str(exc)
++        else:
++            code, why = mod.review_reply_guard(gh, gh_repo, pr, receipt, self.reply)
++            if code is not None:
++                return False, (f"{why} (answer with `upstream_sync.py --head {head[:12]} --review-reply "
++                               "\"<answers>\"`)")
++            who = receipt.get("id") or (receipt.get("reviewer") or {}).get("login") or "?"
++            return True, f"independent exact-head review {receipt.get('source', '?')} {who} approves {head}"
++        if not card:
++            card, why, action = mod.request_review(self.repo, gh_repo, number, head, "", "main", "", self.impl_task,
++                                                   gh=gh)
++            if not card:
++                if action:
++                    return False, (f"file the exact-head review card with kanban_create ({why}), link it as this "
++                                   f"card's parent, park, then rerun: {json.dumps(action, sort_keys=True)}")
++                raise ReviewUnavailable(f"review card not filed: {why}")
++        return False, (f"waiting for independent exact-head review card {card} of {head} ({refusal}); rerun "
++                       f"`python3 scripts/ci/upstream_sync.py --head {head[:12]}` from the session that owns this "
++                       "sync once it approves")
+diff --git a/tests/hermes_cli/upstream_gate_fake.py b/tests/hermes_cli/upstream_gate_fake.py
+index bca4a43ea6..f957082aef 100644
+--- a/tests/hermes_cli/upstream_gate_fake.py
++++ b/tests/hermes_cli/upstream_gate_fake.py
+@@ -110,7 +110,8 @@ class FakeFork:
+         subprocess.run(["git", "-C", str(clone), "remote", "set-url", "origin", URL], check=True)
+         gate = clone / "scripts" / "ci" / "upstream_sync.py"
+         gate.parent.mkdir(parents=True, exist_ok=True)
+-        gate.write_bytes(GATE.read_bytes())
++        for sibling in GATE.parent.glob("upstream_sync*.py"):  # the gate and the helper modules it imports
++            (gate.parent / sibling.name).write_bytes(sibling.read_bytes())
+         with open(clone / ".git" / "info" / "exclude", "a") as exclude:
+             exclude.write("/scripts/\n")
+ 
+diff --git a/tests/scripts/ci/test_upstream_sync_review.py b/tests/scripts/ci/test_upstream_sync_review.py
+new file mode 100644
+index 0000000000..f450324d37
+--- /dev/null
++++ b/tests/scripts/ci/test_upstream_sync_review.py
+@@ -0,0 +1,303 @@
++"""Upstream sync gate: a sync that carries fork-authored content lands only after an independent exact-head review.
++
++Mechanical sync: every fork merge has an empty ``git show --remerge-diff`` and nothing else on top of upstream.
++Fork-authored: a conflict resolution (non-empty remerge-diff) or any non-upstream commit (a ``[daveey]`` fixup).
++The review gate is ship's own (hermes-core-wt-land: keyed_review_card, request_review, review_gate); here a stub
++module with the same entry points stands in for it, loaded through the same HERMES_CORE_WT_LAND path the gate uses.
++Real bare Git remotes; GitHub is the FakeActions fixture from test_upstream_sync.
++"""
++import json
++import subprocess
++
++import pytest
++
++from scripts.ci import upstream_sync as sync
++from scripts.ci import upstream_sync_review as review
++from tests.scripts.ci.test_upstream_sync import FakeActions, commit, gate, git, landed_by_merge, main_of, make_world, \
++    merge_upstream, upstream_commit
++
++STUB_LAND = '''
++import json, os
++
++class ReviewRefused(Exception):
++    pass
++
++class ReviewCIStopped(RuntimeError):
++    def __init__(self, code, message):
++        super().__init__(message)
++        self.code = code
++
++class Gh:
++    def __init__(self, cwd):
++        self.cwd = cwd
++
++def _load():
++    with open(os.environ["STUB_LAND_STATE"]) as fh:
++        return json.load(fh)
++
++def _save(state):
++    with open(os.environ["STUB_LAND_STATE"], "w") as fh:
++        json.dump(state, fh)
++
++def keyed_review_card(slug, number, sha):
++    return _load()["cards"].get(f"{slug}#{number}:{sha}", "")
++
++def request_review(wt, slug, number, sha, old, base, prior_review, impl_task="", *, gh=None, **kw):
++    state = _load()
++    state["filed"].append([slug, number, sha, old, base])
++    if state.get("worker"):
++        _save(state)
++        return "", "this Kanban worker shell may not write the board", {"action": "kanban_create",
++                                                                        "title": f"review #{number} @{sha[:10]}"}
++    card = "t_" + sha[:16]
++    state["cards"][f"{slug}#{number}:{sha}"] = card
++    _save(state)
++    return card, "", None
++
++def review_gate(gh, slug, pr, sha, branch, base, review_task, impl_task=""):
++    state = _load()
++    state["gates"].append([review_task, pr["number"], sha, branch, base, impl_task])
++    _save(state)
++    if review_task and state["approve"].get(review_task) == sha:
++        return {"source": "kanban", "id": review_task, "reviewed_sha": sha, "verdict": "approve",
++                "non_blocking": state.get("nits", [])}
++    raise ReviewRefused(f"no independent review approves PR #{pr['number']}'s head {sha[:12]}")
++
++def review_reply_guard(gh, slug, pr, review, reply):
++    if review.get("non_blocking") and not reply:
++        return 1, "unanswered non-blocking review point(s)"
++    return None, ""
++'''
++
++
++@pytest.fixture
++def world(tmp_path):
++    return make_world(tmp_path)
++
++
++@pytest.fixture
++def land_stub(tmp_path, monkeypatch):
++    """ship's review entry points (a stub of hermes-core-wt-land), found through HERMES_CORE_WT_LAND."""
++    path = tmp_path / "hermes-core-wt-land"  # no .py suffix, like the real tool
++    path.write_text(STUB_LAND)
++    state = tmp_path / "land-state.json"
++    state.write_text(json.dumps({"cards": {}, "approve": {}, "filed": [], "gates": []}))
++    monkeypatch.setenv("HERMES_CORE_WT_LAND", str(path))
++    monkeypatch.setenv("STUB_LAND_STATE", str(state))
++
++    class Stub:
++        def read(self):
++            return json.loads(state.read_text())
++
++        def update(self, **kw):
++            data = self.read()
++            for key, value in kw.items():
++                data[key] = {**data[key], **value} if isinstance(value, dict) else value
++            state.write_text(json.dumps(data))
++
++    return Stub()
++
++
++def fork_main_commit(root, files, msg):
++    """A fork-only commit pushed straight to origin's main (the fork's own work)."""
++    other = root / "fork-dev"
++    if not other.exists():
++        subprocess.run(["git", "clone", "-q", str(root / "origin.git"), str(other)], check=True)
++        git(other, "config", "user.email", "f@example.com")
++        git(other, "config", "user.name", "F")
++    git(other, "pull", "-q")
++    sha = commit(other, files, msg)
++    git(other, "push", "-q", "origin", "main")
++    return sha
++
++
++def conflict_sync(root, checkout):
++    """A sync whose merge resolves a conflict by hand: its remerge-diff is non-empty (fork-authored)."""
++    fork_main_commit(root, {"shared.txt": "fork\n"}, "fork change")
++    upstream_commit(root, {"shared.txt": "upstream\n"}, "upstream change")
++    git(checkout, "fetch", "-q", "upstream")
++    git(checkout, "fetch", "-q", "origin")
++    git(checkout, "checkout", "-q", "--detach", "origin/main")
++    merged = subprocess.run(["git", "-C", str(checkout), "merge", "-q", "--no-edit", "upstream/main"],
++                            capture_output=True, text=True, check=False)
++    assert merged.returncode != 0  # a real conflict
++    (checkout / "shared.txt").write_text("fork and upstream\n")
++    git(checkout, "add", "shared.txt")
++    git(checkout, "commit", "-q", "--no-edit")
++    return git(checkout, "rev-parse", "HEAD")
++
++
++def fixup_sync(root, checkout):
++    """A clean sync merge plus a [daveey] fixup commit on top: no conflict, still fork-authored."""
++    upstream_commit(root, {"u.txt": "u\n"}, "upstream change")
++    merge_upstream(checkout)
++    return commit(checkout, {"fixup.txt": "follow upstream\n"}, "[daveey] Upstream sync: fork tests follow upstream")
++
++
++def staged_green(root, checkout, head):
++    actions = FakeActions(root / "origin.git", root)
++    assert gate(checkout, head, actions) == sync.NOT_YET  # staged
++    actions.ci()
++    assert actions.runs[-1]["conclusion"] == "success"
++    return actions
++
++
++# --- RED on main before this gate: the resolution landed with no review ---------------------------------------
++
++def test_conflict_resolution_sync_parks_for_review_then_lands_on_exact_head_approval(world, land_stub, capsys):
++    root, checkout = world
++    head = conflict_sync(root, checkout)
++    before = main_of(root)
++    actions = staged_green(root, checkout, head)
++    capsys.readouterr()
++
++    assert gate(checkout, head, actions) == sync.NOT_YET  # parks: green CI is not enough
++    out = capsys.readouterr().out
++    assert main_of(root) == before
++    card = "t_" + head[:16]
++    assert card in out and "fork-authored" in out and "shared.txt" in out, out
++    pr = actions.pulls[0]
++    assert land_stub.read()["filed"] == [["example/fork", pr["number"], head, "", "main"]]
++    assert land_stub.read()["gates"][0][:5] == ["", pr["number"], head, f"sync/upstream-{head}", "main"]
++
++    land_stub.update(approve={card: "0" * 40})  # an approval of another sha approves nothing
++    assert gate(checkout, head, actions) == sync.NOT_YET
++    assert main_of(root) == before
++    assert len(land_stub.read()["filed"]) == 1  # the keyed card is found again, never filed twice
++
++    land_stub.update(approve={card: head})
++    assert gate(checkout, head, actions) == sync.LANDED
++    assert landed_by_merge(root, head, before)
++    assert land_stub.read()["gates"][-1][:4] == [card, pr["number"], head, f"sync/upstream-{head}"]
++
++
++# --- Controls ---------------------------------------------------------------------------------------------------
++
++def test_mechanical_sync_lands_without_any_review(world, land_stub):
++    root, checkout = world
++    upstream_commit(root, {"u.txt": "u\n"}, "upstream change")
++    head = merge_upstream(checkout)
++    before = main_of(root)
++    actions = staged_green(root, checkout, head)
++    assert gate(checkout, head, actions) == sync.LANDED
++    assert landed_by_merge(root, head, before)
++    assert land_stub.read()["filed"] == [] and land_stub.read()["gates"] == []  # ship's gate never consulted
++
++
++def test_fixup_commit_without_conflict_parks_for_review(world, land_stub, capsys):
++    root, checkout = world
++    head = fixup_sync(root, checkout)
++    before = main_of(root)
++    actions = staged_green(root, checkout, head)
++    capsys.readouterr()
++    assert gate(checkout, head, actions) == sync.NOT_YET
++    out = capsys.readouterr().out
++    assert main_of(root) == before
++    assert head[:10] in out and "[daveey] Upstream sync" in out, out
++    land_stub.update(approve={"t_" + head[:16]: head})
++    assert gate(checkout, head, actions) == sync.LANDED
++    assert landed_by_merge(root, head, before)
++
++
++def test_unreadable_review_gate_refuses_a_fork_authored_sync(world, land_stub, monkeypatch, tmp_path, capsys):
++    root, checkout = world
++    head = conflict_sync(root, checkout)
++    before = main_of(root)
++    actions = staged_green(root, checkout, head)
++    monkeypatch.setenv("HERMES_CORE_WT_LAND", str(tmp_path / "absent"))
++    assert gate(checkout, head, actions) == sync.REFUSED
++    assert main_of(root) == before
++    assert "review gate unavailable" in capsys.readouterr().out
++
++
++def test_worker_shell_gets_the_exact_review_card_action(world, land_stub, capsys):
++    root, checkout = world
++    head = conflict_sync(root, checkout)
++    actions = staged_green(root, checkout, head)
++    land_stub.update(worker=True)
++    capsys.readouterr()
++    assert gate(checkout, head, actions) == sync.NOT_YET
++    out = capsys.readouterr().out
++    assert '"action": "kanban_create"' in out and "may not write the board" in out, out
++
++
++def test_unanswered_review_points_park_until_answered(world, land_stub, capsys):
++    root, checkout = world
++    head = conflict_sync(root, checkout)
++    before = main_of(root)
++    actions = staged_green(root, checkout, head)
++    gate(checkout, head, actions)
++    land_stub.update(approve={"t_" + head[:16]: head}, nits=["Nit (non-blocking): wording"])
++    capsys.readouterr()
++    assert gate(checkout, head, actions) == sync.NOT_YET
++    assert "unanswered non-blocking" in capsys.readouterr().out
++    assert main_of(root) == before
++    assert gate(checkout, head, actions, review=review.ShipReview(checkout, reply="declined: cosmetic")) == sync.LANDED
++
++
++# --- The classifier itself (each mutant fails a named test) -----------------------------------------------------
++
++def test_classify_reports_the_resolution_files_of_a_conflict_merge(world):
++    root, checkout = world
++    head = conflict_sync(root, checkout)
++    main = git(checkout, "rev-parse", "origin/main")
++    found = review.classify(checkout, head, main)
++    assert found.fork_authored
++    assert found.resolutions == [(head, ["shared.txt"])]
++    assert found.commits == []
++
++
++def test_classify_reports_a_non_upstream_commit(world):
++    root, checkout = world
++    head = fixup_sync(root, checkout)
++    found = review.classify(checkout, head, git(checkout, "rev-parse", "origin/main"))
++    assert found.fork_authored
++    assert found.resolutions == []
++    assert [sha for sha, _ in found.commits] == [head]
++
++
++def test_classify_a_clean_sync_is_mechanical(world):
++    root, checkout = world
++    upstream_commit(root, {"u.txt": "u\n"}, "upstream change")
++    head = merge_upstream(checkout)
++    found = review.classify(checkout, head, git(checkout, "rev-parse", "origin/main"))
++    assert not found.fork_authored
++    assert found.resolutions == [] and found.commits == [] and found.clean_merges == [head]
++
++
++def test_classify_dry_run_on_landed_heads(world, land_stub, capsys):
++    """The CLI dry run judges a landed sync against main just before it landed."""
++    root, checkout = world
++    head = conflict_sync(root, checkout)
++    actions = staged_green(root, checkout, head)
++    gate(checkout, head, actions)
++    land_stub.update(approve={"t_" + head[:16]: head})
++    assert gate(checkout, head, actions) == sync.LANDED
++    upstream_commit(root, {"u2.txt": "u2\n"}, "upstream again")
++    clean = merge_upstream(checkout)
++    actions2 = staged_green(root, checkout, clean)
++    assert gate(checkout, clean, actions2) == sync.LANDED
++    git(checkout, "fetch", "-q", "origin")
++    capsys.readouterr()
++    assert sync.main(["--repo", str(checkout), "--classify", head]) == 0
++    out = capsys.readouterr().out
++    assert f"CLASSIFY {head[:10]}" in out and ": fork-authored" in out and "shared.txt" in out, out
++    assert sync.main(["--repo", str(checkout), "--classify", clean]) == 0
++    out = capsys.readouterr().out
++    assert f"CLASSIFY {clean[:10]}" in out and ": mechanical" in out, out
++
++
++def test_a_ship_tool_without_the_review_entry_points_refuses(world, land_stub, monkeypatch, tmp_path, capsys):
++    """The installed hermes-core-wt-land is checked against SHIP_GATE_CONTRACT before use: a drifted tool refuses."""
++    root, checkout = world
++    head = conflict_sync(root, checkout)
++    actions = staged_green(root, checkout, head)
++    old = tmp_path / "old-land"
++    old.write_text(STUB_LAND.replace("def review_reply_guard(gh, slug, pr, review, reply)",
++                                     "def review_reply_guard(gh, slug, pr, review)"))
++    monkeypatch.setenv("HERMES_CORE_WT_LAND", str(old))
++    capsys.readouterr()
++    assert gate(checkout, head, actions) == sync.REFUSED
++    assert "review_reply_guard lacks reply" in capsys.readouterr().out
++    assert review.contract_errors(review.load_land_tool(str(tmp_path / "hermes-core-wt-land"))) == []
++
+-- 
+2.43.0
+

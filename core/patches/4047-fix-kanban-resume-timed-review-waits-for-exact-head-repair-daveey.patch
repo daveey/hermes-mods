@@ -1,0 +1,259 @@
+From 53a1d6b1b7162644b6660af739497206bee8b88f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 02:29:16 +0000
+Subject: [PATCH] fix(kanban): resume timed review waits for exact-head repair
+ [daveey]
+
+Timed waits only admitted approvals, leaving request_changes owners held active_pr. Accept named exact-current-head change requests as one repair continuation without changing merge or CI gates. Require claimed owner provenance and every awaited review to provide valid scope/head evidence; consume the continuation on the next executed claim.
+
+Proof: two original deadlock tests RED, unclaimed-owner negative RED; 116 awaited-review tests GREEN. scripts/check --base origin/main: all 20 checks pass.
+---
+ hermes_cli/kanban_awaited_review.py           |  35 ++---
+ .../test_kanban_active_pr_awaited_review.py   |   5 +-
+ .../test_kanban_awaited_review_repair.py      | 124 ++++++++++++++++++
+ 3 files changed, 147 insertions(+), 17 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_awaited_review_repair.py
+
+diff --git a/hermes_cli/kanban_awaited_review.py b/hermes_cli/kanban_awaited_review.py
+index 30cf2cca79..c0cfd320c4 100644
+--- a/hermes_cli/kanban_awaited_review.py
++++ b/hermes_cli/kanban_awaited_review.py
+@@ -1,4 +1,4 @@
+-"""An awaited review that approved the PR's current head resumes its parked owner. [daveey]
++"""An awaited exact-head review resumes its parked owner for landing or repair. [daveey]
+ 
+ A PR owner that parks with ``kanban_schedule``/``kanban_continue`` waiting on a review card
+ (its wake-check ``hermes kanban wait-check task <id>``, or ``awaiting`` kind ``card``) is
+@@ -12,13 +12,13 @@ One continuation is permitted only when all of these hold:
+ * the card's :func:`kanban_pr_same_run_park.latest_parked_run` (its latest executed run,
+   ended as the assignee's orderly ``scheduled``/``continued`` park) names the awaited card(s);
+ * each awaited card is done with a claimed completion that ended at or after the park;
+-* none requested changes; together they approve every holding PR by name
++* each approves or requests changes; together they cover every holding PR by name
+   (``pr``/``reviewed_pr``) at a full ``reviewed_sha`` equal to that PR's current GitHub head,
+   read by ``pr_state``'s own ``gh pr view`` and re-read before it releases (a cached head
+   only refuses).
+ 
+-A request-changes verdict, an approval of another head or PR, an unknown head (gh failure),
+-or a crash/reclaim after the park keeps the hold. It never authorizes a merge.
++A change request resumes repair, not approval. Another head or PR, an unknown head
++(gh failure), or a crash/reclaim after the park keeps the hold. It never authorizes a merge.
+ """
+ from __future__ import annotations
+ 
+@@ -81,6 +81,10 @@ def _park(conn: sqlite3.Connection, task_id: str):
+     run = latest_parked_run(conn, task_id)
+     if run is None:
+         return None
++    # Use event FKs (sync remaps them by stable run UID), never a JSON/local run id.
++    if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed'",
++                    (task_id, run["id"])).fetchone() is None:
++        return None
+     event = conn.execute(
+         "SELECT payload, created_at FROM task_events WHERE task_id = ? AND run_id = ? AND kind = ? "
+         "ORDER BY id DESC LIMIT 1", (task_id, run["id"], run["outcome"])).fetchone()
+@@ -90,8 +94,8 @@ def _park(conn: sqlite3.Connection, task_id: str):
+     return run, kb._json_dict(event["payload"]), parked_at
+ 
+ 
+-def _approved_at_head(conn, card: str, parked_at: int, run_id: int, urls: set[str]) -> Optional[set[str]]:
+-    """PRs ``card`` approved at their current head; None when it is unfinished or requested changes."""
++def _reviewed_at_head(conn, card: str, parked_at: int, run_id: int, urls: set[str]) -> Optional[set[str]]:
++    """PRs reviewed at their current head; None without a completed exact-head verdict."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_dependency_review as review
+ 
+@@ -99,19 +103,18 @@ def _approved_at_head(conn, card: str, parked_at: int, run_id: int, urls: set[st
+     if row is None:
+         return None  # an awaited card still open (or finished before the park) keeps the hold
+     data = kb._json_dict(row["metadata"])
+-    if review._requests_changes(row, data):
+-        return None
+     verdict = data.get("verdict")
+     sha = data.get("reviewed_sha")
+-    if (not isinstance(verdict, str) or verdict.strip().lower() not in review._APPROVALS
+-            or not isinstance(sha, str)):
+-        return set()
++    approval = isinstance(verdict, str) and verdict.strip().lower() in review._APPROVALS
++    if (not (approval or review._requests_changes(row, data))
++            or not isinstance(sha, str) or not review._SHA.fullmatch(sha)):
++        return None  # every awaited review must supply a verdict at a full exact head
+     named = review._named_prs(data, urls) or set()  # must name the PR: no checkpoint binds scope
+     return {u for u in named if _at_head(u, sha.lower())}  # pr_head is a full 40-hex sha or None
+ 
+ 
+ def resumes_awaited_review(conn: sqlite3.Connection, task_id: str, pr_urls: Iterable[str]) -> bool:
+-    """One continuation of a timed park whose awaited review approved every holding PR at head."""
++    """One continuation of a timed park whose awaited reviews cover every holding PR at head."""
+     from hermes_cli.kanban_db_dispatch_pr_policy import norm_pr
+ 
+     urls = {norm_pr(u) for u in pr_urls}
+@@ -123,8 +126,8 @@ def resumes_awaited_review(conn: sqlite3.Connection, task_id: str, pr_urls: Iter
+     for card in awaited_cards(payload):
+         if card == task_id:
+             continue
+-        approved = _approved_at_head(conn, card, parked_at, run["id"], urls)
+-        if approved is None:
+-            return False  # an open awaited card or a change request is never outvoted by a sibling
+-        covered |= approved
++        reviewed = _reviewed_at_head(conn, card, parked_at, run["id"], urls)
++        if not reviewed:
++            return False  # unfinished, unbound or stale reviews cannot be outvoted by a sibling
++        covered |= reviewed
+     return urls.issubset(covered)
+diff --git a/tests/hermes_cli/test_kanban_active_pr_awaited_review.py b/tests/hermes_cli/test_kanban_active_pr_awaited_review.py
+index aad05a6fcb..b8b4a36c76 100644
+--- a/tests/hermes_cli/test_kanban_active_pr_awaited_review.py
++++ b/tests/hermes_cli/test_kanban_active_pr_awaited_review.py
+@@ -255,7 +255,7 @@ def test_awaited_review_fixture_holds_without_the_review(clock, monkeypatch):
+ 
+ 
+ @pytest.mark.parametrize("metadata", [
+-    {"verdict": "request_changes", "reviewed_sha": HEAD, "reviewed_pr": URL},
++    {"verdict": "request_changes", "reviewed_sha": "b" * 40, "reviewed_pr": URL},
+     {"verdict": "approve", "reviewed_sha": "b" * 40, "reviewed_pr": URL},
+     {"verdict": "approve", "reviewed_sha": HEAD, "reviewed_pr": OTHER},
+     {"verdict": "approve", "reviewed_sha": HEAD},
+@@ -343,6 +343,9 @@ def test_awaited_review_changes_are_not_outvoted_by_another_awaited_approval(clo
+             payload["awaiting"] = {"kind": "card", "ref": second}
+             conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row["id"]))
+         assert rev != second
++        # This resumes repair, not merge: a change request is not an approval.
++        assert prs.active_pr_reason(conn, tid, clock[0] + 10) is None
++        kb.claim_task(conn, tid)
+         assert prs.active_pr_reason(conn, tid, clock[0] + 10) == "active_pr"
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_awaited_review_repair.py b/tests/hermes_cli/test_kanban_awaited_review_repair.py
+new file mode 100644
+index 0000000000..adbbb4b81a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_awaited_review_repair.py
+@@ -0,0 +1,124 @@
++"""Timed review waits permit one exact-current-head repair, never merge approval."""
++import pytest
++
++from hermes_cli import kanban_awaited_review as kar
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch_pr_state as prs
++from tests.hermes_cli import test_kanban_active_pr_awaited_review as base
++
++kanban_home = base.kanban_home
++clock = base.clock
++pytestmark = pytest.mark.usefixtures("kanban_home")
++REPAIR = {"verdict": "request_changes", "reviewed_sha": base.HEAD, "reviewed_pr": base.URL}
++
++
++def _owner(conn, clock, monkeypatch, *, kind="scheduled", via="awaiting", metadata=None, finish=True):
++    rev = kb.create_task(conn, title="exact-head review", assignee="reviewer")
++    tid, run_id = base._owner(conn, monkeypatch, synced=True)
++    base._comment(conn, tid, run_id, f"Opened {base.URL}", monkeypatch)
++    # Missing comment provenance keeps the generic same-second handoff closed.
++    with kb.write_txn(conn):
++        conn.execute("DELETE FROM task_events WHERE task_id=? AND kind='commented'", (tid,))
++    kwargs = ({"awaiting": {"kind": "card", "ref": rev}} if via == "awaiting" else
++              {"wake_check": f"hermes kanban wait-check task {rev}"})
++    if kind == "scheduled":
++        assert kb.schedule_task(conn, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z review",
++                                expected_run_id=run_id, **kwargs)
++    else:
++        assert base.kc.continue_task(conn, tid, checkpoint="waiting on exact review", resume_after_seconds=60,
++                                     expected_run_id=run_id, **kwargs)["ok"]
++    clock[0] += 60
++    if finish:
++        base._finish(conn, rev, metadata if metadata is not None else REPAIR)
++    base._wake(conn, tid)
++    return tid, rev
++
++
++@pytest.mark.parametrize("via", ["wake_check", "awaiting"])
++@pytest.mark.parametrize("kind", ["scheduled", "continued"])
++def test_timed_request_changes_resumes_repair_once(clock, monkeypatch, via, kind):
++    with kbc.connect() as conn:
++        tid, rev = _owner(conn, clock, monkeypatch, kind=kind, via=via)
++        assert prs.active_pr_reason(conn, tid, clock[0] + 10) is None
++        # Guard reads are idempotent, and do not rewrite the review as approval.
++        assert prs.active_pr_reason(conn, tid, clock[0] + 10) is None
++        row = conn.execute("SELECT metadata FROM task_runs WHERE task_id=?", (rev,)).fetchone()
++        assert kb._json_dict(row["metadata"])["verdict"] == "request_changes"
++        kb.claim_task(conn, tid)
++        assert prs.active_pr_reason(conn, tid, clock[0] + 10) == "active_pr"
++        assert kb.reclaim_task(conn, tid, reason="worker died", signal_fn=lambda *_: None)
++        assert prs.active_pr_reason(conn, tid, clock[0] + 10) == "active_pr"
++
++
++@pytest.mark.parametrize("metadata", [
++    REPAIR | {"reviewed_sha": "b" * 40},
++    REPAIR | {"reviewed_sha": "a" * 39},
++    REPAIR | {"reviewed_sha": "g" * 40},
++    REPAIR | {"reviewed_sha": base.HEAD + "\n"},
++    REPAIR | {"reviewed_sha": None},
++    REPAIR | {"reviewed_pr": base.OTHER},
++    {"verdict": "request_changes", "reviewed_sha": base.HEAD},
++    REPAIR | {"verdict": "uncertain"},
++])
++def test_invalid_repair_evidence_keeps_hold(clock, monkeypatch, metadata):
++    with kbc.connect() as conn:
++        tid, _ = _owner(conn, clock, monkeypatch, metadata=metadata)
++        assert prs.active_pr_reason(conn, tid, clock[0] + 10) == "active_pr"
++
++
++@pytest.mark.parametrize("mutation", ["unfinished", "stale", "unclaimed_review", "unclaimed_owner",
++                                     "foreign_park", "crashed", "reclaimed", "timed_out", "unended",
++                                     "unknown_head", "moved_on_reread", "uncovered_pr"])
++def test_repair_requires_authenticated_current_park_and_review(clock, monkeypatch, mutation):
++    with kbc.connect() as conn:
++        tid, rev = _owner(conn, clock, monkeypatch, finish=mutation != "unfinished")
++        if mutation == "unknown_head":
++            monkeypatch.setattr(kar, "pr_head", lambda *a, **kw: None)
++        elif mutation == "moved_on_reread":
++            monkeypatch.setattr(kar, "pr_head", lambda *a, **kw: "b" * 40 if kw else base.HEAD)
++        sql_cases = {
++            "stale": ("UPDATE task_runs SET ended_at=ended_at-3600 WHERE task_id=?", (rev,)),
++            "unclaimed_review": ("DELETE FROM task_events WHERE task_id=? AND kind='claimed'", (rev,)),
++            "unclaimed_owner": ("DELETE FROM task_events WHERE task_id=? AND kind='claimed'", (tid,)),
++            "foreign_park": (
++                "UPDATE task_events SET run_id=(SELECT MAX(id) FROM task_runs WHERE task_id=?) "
++                "WHERE task_id=? AND kind='scheduled'", (rev, tid)),
++            "unended": ("UPDATE task_runs SET ended_at=NULL WHERE task_id=?", (tid,)),
++            **{outcome: ("UPDATE task_runs SET outcome=? WHERE task_id=?", (outcome, tid))
++               for outcome in ("crashed", "reclaimed", "timed_out")},
++        }
++        with kb.write_txn(conn):
++            if mutation in sql_cases:
++                conn.execute(*sql_cases[mutation])
++        urls = [base.URL, base.OTHER] if mutation == "uncovered_pr" else [base.URL]
++        assert kar.resumes_awaited_review(conn, tid, urls) is False
++
++
++@pytest.mark.parametrize("metadata", [REPAIR | {"reviewed_pr": base.OTHER},
++                                      REPAIR | {"reviewed_sha": "b" * 40},
++                                      REPAIR | {"verdict": "unknown"}])
++def test_valid_sibling_does_not_outvote_invalid_repair(clock, monkeypatch, metadata):
++    from tests.hermes_cli.test_kanban_active_pr_awaited_head import _rewrite_park
++
++    with kbc.connect() as conn:
++        tid, _ = _owner(conn, clock, monkeypatch, via="wake_check")
++        second = kb.create_task(conn, title="second review", assignee="reviewer")
++        base._finish(conn, second, metadata)
++        _rewrite_park(conn, tid, lambda p: p | {"awaiting": {"kind": "card", "ref": second}})
++        assert kar.resumes_awaited_review(conn, tid, [base.URL]) is False
++
++
++def test_synced_park_uses_remapped_event_fk_not_payload_run_id(clock, monkeypatch):
++    with kbc.connect() as conn:
++        tid, _ = _owner(conn, clock, monkeypatch)
++        run = kar._park(conn, tid)[0]
++        original_uid = run["uid"]
++        # Mirror ingestion remaps relational FKs while retaining JSON source IDs.
++        with kb.write_txn(conn):
++            conn.execute("PRAGMA defer_foreign_keys=ON")
++            conn.execute("UPDATE task_runs SET id=id+1000 WHERE id=?", (run["id"],))
++            conn.execute("UPDATE task_events SET run_id=run_id+1000 WHERE run_id=?", (run["id"],))
++        assert kar._park(conn, tid)[0]["uid"] == original_uid
++        assert kar.resumes_awaited_review(conn, tid, [base.URL]) is True
++
+-- 
+2.43.0
+

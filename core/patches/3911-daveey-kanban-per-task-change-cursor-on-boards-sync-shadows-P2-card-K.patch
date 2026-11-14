@@ -1,0 +1,976 @@
+From 6778445097576cf662b6ab28eb899c6272c87685 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 20:52:40 +0000
+Subject: [PATCH] [daveey] kanban: per-task change cursor on boards + sync
+ shadows (P2, card K)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+t_01a1d59d3ef805c4, design t_01a1d563324d7e8e §2 P2/§9, review R7/R8.
+
+What:
+- kanban_activity_revision: every bumping trigger (epoch 2, marked /* kanban-activity-epoch:2 */) also upserts
+  kanban_task_change(task_id PK, rev) WITHOUT ROWID, indexed on rev, with the revision it bumped to. Keys: tasks.id,
+  both task_links ends, task_id elsewhere; UPDATE marks OLD and NEW when the key moves; DELETE marks OLD; INSERT OR
+  REPLACE is covered by the INSERT upsert. A (re)install bumps and upserts FULL_MARK ('').
+- Same exclusions as the board revision (R8): bookkeeping columns and heartbeat events do not bump or mark. Fixes a
+  hole found while testing: on a synced board the sync insert trigger's own uid stamp (UPDATE task_events SET uid ...
+  WHERE uid IS NULL) re-bumped every heartbeat event; a NULL->value uid stamp no longer counts (SYNC_STAMPED).
+- SHADOW_TABLES widened to tasks, task_links, task_runs, task_events, task_comments, task_chat_links (R8).
+- ensure_revision: leaves the whole trigger set alone when any trigger is of a newer epoch (no drop of unknown
+  PREFIX* triggers); repairs a missing change table/index.
+- New kanban_task_change.changed_since(conn, cursor) -> (frozenset | FULL, cursor'). Trusted only when (in one
+  snapshot): every watched table carries epoch>=2 triggers and the change table exists; (a) MAX(rev) == revision;
+  (b) revision >= cursor's; (c) (dev, ino), -shm identity and schema_version equal the cursor's; no FULL_MARK newer
+  than the cursor; identity unchanged after the read. Otherwise FULL (with a fresh cursor when the file vouches).
+- scripts/benchmark_kanban_task_change.py.
+
+Proof:
+- RED: tests/hermes_cli/test_kanban_task_change.py against origin/main's trigger generation/ensure_revision/
+  SHADOW_TABLES: 18/18 failed. GREEN: 25 passed.
+- Mutants (sdlc-review mutants.py, 19 by exact anchor over both modules): 19/19 killed.
+- Focused suites: 26 files / 447 passed (activity, chat links, replica, sync repair, schema owner, session
+  activity, board read/rows caches); 63 files / 1562 passed (sync, db_sync, watcher, idle, notify, incremental,
+  content key). test_kanban_schema_owner excludes kanban_task_change from the at-par reference, like the revision.
+- Write overhead (committed bumping write, 12x200 alternating blocks, same file): 3747.7 us bump-only vs 3773.7 us
+  bump+mark = +0.69% (<= 5%). Statement-only CPU (no commit): 3.85 -> 8.74 us/UPDATE (+4.9 us).
+- Scale: changed_since for one touched task at 1k / 5.8k / 20k tasks = 93.8 / 96.8 / 97.8 us (20k/1k = 1.04x,
+  <= 1.5x); a full tasks read is 4.4 / 26.9 / 89.7 ms.
+- Hub shadow rate (10 min, 2 s windows): windows where a local-or-shadow revision moves 114 -> 139 of 296 once
+  runs/events are watched; union with the hub replica 181 -> 197. This is the R8 trade: readers that key on the shadow
+  revision refresh more often, and changed_since lets them refresh only the touched tasks (cards E/F).
+---
+ hermes_cli/kanban_activity_revision.py       |  97 ++++-
+ hermes_cli/kanban_task_change.py             | 159 ++++++++
+ scripts/benchmark_kanban_task_change.py      | 157 ++++++++
+ tests/hermes_cli/test_kanban_schema_owner.py |  11 +-
+ tests/hermes_cli/test_kanban_task_change.py  | 393 +++++++++++++++++++
+ 5 files changed, 799 insertions(+), 18 deletions(-)
+ create mode 100644 hermes_cli/kanban_task_change.py
+ create mode 100644 scripts/benchmark_kanban_task_change.py
+ create mode 100644 tests/hermes_cli/test_kanban_task_change.py
+
+diff --git a/hermes_cli/kanban_activity_revision.py b/hermes_cli/kanban_activity_revision.py
+index e616b73772..3fed2423bd 100644
+--- a/hermes_cli/kanban_activity_revision.py
++++ b/hermes_cli/kanban_activity_revision.py
+@@ -24,11 +24,21 @@ change always reads afresh.
+ The update trigger names each read column, so SQLite refuses ``ALTER TABLE ... DROP COLUMN`` of a watched column
+ while it is installed. Call ``drop_triggers(conn)`` first; the next writer init reinstalls them for the new columns
+ (readers fall back to the stat key in between).
++
++Per-task change cursor (P2, t_01a1d59d3ef805c4). Every bumping trigger also upserts ``kanban_task_change(task_id,
++rev)`` with the bumped revision, for each task the row belongs to (a task's ``id``; both ends of a link; the
++``task_id`` of every other table; OLD and NEW when an update moves it; OLD on delete). ``kanban_task_change`` then says
++which tasks moved after any earlier revision (``kanban_task_change.changed_since``). A bump no task explains (a
++trigger (re)install) upserts the ``FULL_MARK`` row, which tells a cursor older than it to read everything. Triggers of
++this design carry ``EPOCH_MARK`` in their SQL; ``ensure_revision`` never drops or rewrites triggers a newer epoch
++installed, so a newer writer's coverage survives this one's init (an older writer still replaces ours: the cursor's
++trust rules catch that).
+ """
+ 
+ from __future__ import annotations
+ 
+ import os
++import re
+ import sqlite3
+ import threading
+ from pathlib import Path
+@@ -40,11 +50,12 @@ PREFIX = "kanban_activity_rev_"
+ # details (_read_session_tasks, _add_card_details), wait info. Not task_wake_checks (rewritten by every probe).
+ LOCAL_TABLES = ("tasks", "task_links", "task_runs", "task_events", "task_comments", "kanban_notify_subs",
+                 "task_chat_links")
+-# A sync replica (``sync-shadow/<board>.db``) is read only for this gateway's chat links and their card rows
+-# (``kanban_chat_links._read_replica``). Its events/runs mirror the whole board's traffic; the one read of them (the
+-# linked running cards' newest liveness event, ``kanban_replica_execution.read_runs``) runs on every read, outside
+-# any cache keyed on this revision, so their (bookkeeping) heartbeat writes need not, and do not, move it.
+-SHADOW_TABLES = ("tasks", "task_chat_links")
++# A sync replica (``sync-shadow/<board>.db``) is read for this gateway's chat links and their card rows
++# (``kanban_chat_links._read_replica``), and by the sync loop's parent evidence (``kanban_move_parent_evidence``: the
++# replica's ``task_runs``/``task_events``) and remote-parent refresh. [daveey] P2/R8 (t_01a1d59d3ef805c4): it watches
++# the same task tables as a local board, so the per-task change cursor covers runs, events, links and comments too,
++# with the same exclusions (bookkeeping columns, heartbeat events): a pulled heartbeat still does not move it.
++SHADOW_TABLES = ("tasks", "task_links", "task_runs", "task_events", "task_comments", "task_chat_links")
+ # Columns no activity reader selects, written by claims, leases, heartbeats, the sync apply path and the notifier's
+ # delivery claim. An update that changes only these is bookkeeping.
+ BOOKKEEPING_COLUMNS: dict[str, frozenset[str]] = {
+@@ -62,6 +73,55 @@ BOOKKEEPING_COLUMNS: dict[str, frozenset[str]] = {
+ # other kind, and any update or delete of an event row, still bumps.
+ UNREAD_EVENT_KINDS = ("heartbeat",)
+ _BUMP = f"UPDATE {REVISION_TABLE} SET revision = revision + 1 WHERE id = 1;"
++# [daveey] P2 per-task change cursor (t_01a1d59d3ef805c4): which tasks each bump touched.
++CHANGE_TABLE = "kanban_task_change"
++FULL_MARK = ""  # a bump no task explains (trigger (re)install): cursors older than its rev read in full
++EPOCH = 2  # 1 = the bump-only triggers (no marker); 2 = bump + kanban_task_change upsert
++EPOCH_MARK = f"/* kanban-activity-epoch:{EPOCH} */"
++_EPOCH_RE = re.compile(r"/\* kanban-activity-epoch:(\d+) \*/")
++# The task(s) a row belongs to. Every other watched table names it in ``task_id``.
++TASK_KEYS: dict[str, tuple[str, ...]] = {"tasks": ("id",), "task_links": ("parent_id", "child_id")}
++CHANGE_INDEX = f"idx_{CHANGE_TABLE}_rev"
++_CHANGE_DDL = (f"CREATE TABLE IF NOT EXISTS {CHANGE_TABLE} (task_id TEXT PRIMARY KEY NOT NULL, "
++               "rev INTEGER NOT NULL) WITHOUT ROWID",
++               f"CREATE INDEX IF NOT EXISTS {CHANGE_INDEX} ON {CHANGE_TABLE}(rev)")
++
++
++def _mark(ref: str, when: str = "") -> str:
++    """Upsert the task ``ref`` (``NEW.x``/``OLD.x``, NULL = ``FULL_MARK``) at the revision just bumped."""
++    return (f"INSERT OR REPLACE INTO {CHANGE_TABLE} (task_id, rev) SELECT COALESCE({ref}, '{FULL_MARK}'), revision "
++            f"FROM {REVISION_TABLE} WHERE id = 1{when};")
++
++
++def _marks(op: str, keys: tuple[str, ...]) -> str:
++    if not keys:  # an unexpected schema with no task column: the bump is unattributable
++        return _mark("NULL")
++    if op == "INSERT":
++        return " ".join(_mark(f"NEW.{_quote(k)}") for k in keys)
++    if op == "DELETE":
++        return " ".join(_mark(f"OLD.{_quote(k)}") for k in keys)
++    return " ".join(_mark(f"NEW.{_quote(k)}") + " " + _mark(
++        f"OLD.{_quote(k)}", f" AND OLD.{_quote(k)} IS NOT NEW.{_quote(k)}") for k in keys)
++
++
++def trigger_epoch(sql: str | None) -> int:
++    """The design epoch a trigger's SQL was generated by (1 for the unmarked bump-only triggers)."""
++    found = _EPOCH_RE.search(sql or "")
++    return int(found.group(1)) if found else 1
++
++
++# [daveey] Columns the sync insert trigger stamps onto the row it just inserted (``kanban_db_sync._insert_trigger``:
++# ``UPDATE task_events SET uid = ... WHERE id = NEW.id AND uid IS NULL``), inside the inserting statement. On a synced
++# board that update re-bumped every heartbeat the INSERT trigger had excluded, so heartbeats still moved the revision
++# (and would mark their task). NULL -> value is that stamp; any later change of the column still counts.
++SYNC_STAMPED: dict[str, frozenset[str]] = {"task_events": frozenset({"uid"})}
++
++
++def _moved(table: str, column: str) -> str:
++    q = _quote(column)
++    if column in SYNC_STAMPED.get(table, frozenset()):
++        return f"(OLD.{q} IS NOT NULL AND OLD.{q} IS NOT NEW.{q})"
++    return f"OLD.{q} IS NOT NEW.{q}"
+ 
+ 
+ def is_shadow(path: str | os.PathLike) -> bool:
+@@ -84,28 +144,36 @@ def wanted_triggers(conn: sqlite3.Connection, tables: Iterable[str]) -> dict[str
+         columns = [r[1] for r in conn.execute(f"PRAGMA table_info({_quote(table)})")]
+         if not columns:
+             continue  # table absent: nothing to read, nothing to watch
++        keys = tuple(k for k in TASK_KEYS.get(table, ("task_id",)) if k in columns)
+         for op in ("INSERT", "DELETE"):
+             name = f"{PREFIX}{table}_{op.lower()}"
+             when = ""
+             if op == "INSERT" and table == "task_events" and "kind" in columns:
+                 when = " WHEN COALESCE(NEW.kind, '') NOT IN ({})".format(", ".join(f"'{k}'" for k in UNREAD_EVENT_KINDS))
+-            out[name] = f"CREATE TRIGGER {name} AFTER {op} ON {_quote(table)}{when} BEGIN {_BUMP} END"
++            out[name] = (f"CREATE TRIGGER {name} AFTER {op} ON {_quote(table)}{when} BEGIN {EPOCH_MARK} {_BUMP} "
++                         f"{_marks(op, keys)} END")
+         read = [c for c in columns if c not in BOOKKEEPING_COLUMNS.get(table, frozenset())]
+-        changed = " OR ".join(f"OLD.{_quote(c)} IS NOT NEW.{_quote(c)}" for c in read)
++        changed = " OR ".join(_moved(table, c) for c in read)
+         name = f"{PREFIX}{table}_update"
+-        out[name] = f"CREATE TRIGGER {name} AFTER UPDATE ON {_quote(table)} WHEN {changed} BEGIN {_BUMP} END"
++        out[name] = (f"CREATE TRIGGER {name} AFTER UPDATE ON {_quote(table)} WHEN {changed} BEGIN {EPOCH_MARK} "
++                     f"{_BUMP} {_marks('UPDATE', keys)} END")
+     return out
+ 
+ 
+ def ensure_revision(conn: sqlite3.Connection, tables: Iterable[str]) -> None:
+-    """Install or repair the counter and its triggers. No write on the normal (already installed) path; a
+-    (re)install bumps the counter so readers that cached a key before the gap re-read."""
++    """Install or repair the counter, the change table and the triggers. No write on the normal (already installed)
++    path; a (re)install bumps the counter and marks ``FULL_MARK`` at it, so readers that cached a key or a cursor
++    before the gap re-read. Triggers of a newer epoch (``trigger_epoch``) are left alone, with every other trigger of
++    the set: the newer writer that installed them owns the file's coverage."""
+     tables = tuple(tables)
+-    wanted = wanted_triggers(conn, tables)
+     found = dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name GLOB ?",
+                               (PREFIX + "*",)))
+-    has_row = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+-                           (REVISION_TABLE,)).fetchone() and conn.execute(
++    if any(trigger_epoch(sql) > EPOCH for sql in found.values()):
++        return
++    wanted = wanted_triggers(conn, tables)
++    present = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE name IN (?, ?, ?)",
++                                          (REVISION_TABLE, CHANGE_TABLE, CHANGE_INDEX))}
++    has_row = present == {REVISION_TABLE, CHANGE_TABLE, CHANGE_INDEX} and conn.execute(
+         f"SELECT 1 FROM {REVISION_TABLE} WHERE id = 1").fetchone()
+     if has_row and found == wanted:
+         return
+@@ -114,7 +182,10 @@ def ensure_revision(conn: sqlite3.Connection, tables: Iterable[str]) -> None:
+         conn.execute(f"CREATE TABLE IF NOT EXISTS {REVISION_TABLE} "
+                      "(id INTEGER PRIMARY KEY CHECK (id = 1), revision INTEGER NOT NULL)")
+         conn.execute(f"INSERT OR IGNORE INTO {REVISION_TABLE} VALUES (1, 0)")
++        for ddl in _CHANGE_DDL:
++            conn.execute(ddl)
+         conn.execute(_BUMP)
++        conn.execute(_mark("NULL"))  # whatever changed while the triggers were absent or older is unknown
+         for name in set(found) - set(wanted):
+             conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+         for name, sql in wanted.items():
+diff --git a/hermes_cli/kanban_task_change.py b/hermes_cli/kanban_task_change.py
+new file mode 100644
+index 0000000000..fb9f71d8e2
+--- /dev/null
++++ b/hermes_cli/kanban_task_change.py
+@@ -0,0 +1,159 @@
++"""Per-task change cursor on a board or sync shadow (P2, t_01a1d59d3ef805c4). [daveey]
++
++The activity-revision triggers (``kanban_activity_revision``) upsert ``kanban_task_change(task_id, rev)`` with the
++revision each content write bumped to. ``changed_since(conn, cursor)`` answers "which tasks moved since ``cursor``" from
++the rev index, at a cost that does not grow with the board, so a reader that keeps per-task results can refresh only
++those tasks. A task id whose row is gone was deleted. Bookkeeping writes (claims, leases, heartbeats) do not mark: they
++do not bump the revision either (``BOOKKEEPING_COLUMNS``, ``UNREAD_EVENT_KINDS``).
++
++A cursor is trusted only when all of these hold in the reader's snapshot; otherwise the answer is ``FULL``:
++
++- the file carries every trigger of epoch >= 2 for the tables it watches, and the change table (``_covered``);
++- (a) ``MAX(kanban_task_change.rev) == kanban_activity_revision.revision``. An older writer's init replaces our
++  triggers with bump-only ones (and bumps): the counter then runs ahead of the change table;
++- (b) the revision is not below the cursor's (a database restored in place: same inode, regressed counter);
++- (c) the file's (dev, ino), its ``-shm`` identity and ``schema_version`` equal the cursor's, as in ``board_rows``
++  (a dropped trigger moves ``schema_version`` before any unmarked write can happen);
++- no ``FULL_MARK`` row is newer than the cursor (a trigger (re)install: what changed in the gap is unknown).
++
++``FULL`` comes with a fresh cursor whenever the file can vouch for the next call (``None`` otherwise), so one full read
++re-arms the incremental path.
++"""
++
++from __future__ import annotations
++
++import os
++import sqlite3
++import threading
++from dataclasses import dataclass
++from typing import Iterable, Optional
++
++from hermes_cli import kanban_activity_revision as rev
++
++
++class _Full:
++    __slots__ = ()
++
++    def __repr__(self) -> str:
++        return "FULL"
++
++
++FULL = _Full()
++
++
++@dataclass(frozen=True)
++class Cursor:
++    dev: int
++    ino: int
++    shm: Optional[tuple]
++    schema_version: int
++    revision: int
++    tables: tuple[str, ...]
++
++
++Changed = frozenset | _Full
++
++_STATE_SQL = (f"SELECT r.revision, (SELECT MAX(rev) FROM {rev.CHANGE_TABLE}) FROM {rev.REVISION_TABLE} r "
++              "WHERE r.id = 1")
++_SINCE_SQL = f"SELECT task_id FROM {rev.CHANGE_TABLE} WHERE rev > ?"
++
++# (path, dev, ino, tables) -> schema_version at which the triggers covered ``tables`` (one sqlite_master scan per
++# schema change, like ``kanban_activity_revision._COVERED``).
++_COVERED: dict[tuple, int] = {}
++_COVERED_LOCK = threading.Lock()
++_COVERED_MAX = 256
++
++
++def _main_path(conn: sqlite3.Connection) -> Optional[str]:
++    for _seq, name, file in conn.execute("PRAGMA database_list"):
++        if name == "main":
++            return file or None
++    return None
++
++
++def _identity(path: str) -> tuple:
++    from hermes_cli.kanban_lockguard import shm_identity
++    st = os.stat(path)
++    return (st.st_dev, st.st_ino, shm_identity(path))
++
++
++def _scan_covered(conn: sqlite3.Connection, tables: tuple[str, ...]) -> bool:
++    rows = conn.execute("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type IN ('table', 'trigger')")
++    names: set[str] = set()
++    triggers: dict[str, str] = {}
++    for kind, name, _tbl, sql in rows:
++        if kind == "trigger":
++            triggers[name] = sql
++        else:
++            names.add(name)
++    if not {rev.REVISION_TABLE, rev.CHANGE_TABLE} <= names:
++        return False
++    for table in tables:
++        if table not in names:
++            continue  # absent table: nothing to watch
++        for op in ("insert", "update", "delete"):
++            if rev.trigger_epoch(triggers.get(f"{rev.PREFIX}{table}_{op}")) < rev.EPOCH:
++                return False  # missing, or an older writer's bump-only trigger
++    return True
++
++
++def _covered(conn: sqlite3.Connection, memo_key: tuple, schema: int, tables: tuple[str, ...]) -> bool:
++    with _COVERED_LOCK:
++        if _COVERED.get(memo_key) == schema:
++            return True
++    ok = _scan_covered(conn, tables)
++    with _COVERED_LOCK:
++        if not ok:
++            _COVERED.pop(memo_key, None)
++        else:
++            if len(_COVERED) >= _COVERED_MAX:
++                _COVERED.clear()
++            _COVERED[memo_key] = schema
++    return ok
++
++
++def changed_since(conn: sqlite3.Connection, cursor: Optional[Cursor], *,
++                  tables: Optional[Iterable[str]] = None) -> tuple[Changed, Optional[Cursor]]:
++    """``(task ids changed after cursor, or FULL; the cursor for the next call, or None)``. ``tables`` defaults to
++    the set the file's writers watch (``tables_for``). Raises ``sqlite3.Error`` like any read."""
++    path = _main_path(conn)
++    if path is None:
++        return FULL, None
++    tables = tuple(tables) if tables is not None else rev.tables_for(path)
++    try:
++        before = _identity(path)
++    except OSError:
++        return FULL, None
++    own = not conn.in_transaction
++    if own:
++        conn.execute("BEGIN")  # one snapshot: coverage, counter, MAX(rev) and the changed rows agree
++    try:
++        schema = int(conn.execute("PRAGMA schema_version").fetchone()[0])
++        if not _covered(conn, (path, before[0], before[1], tables), schema, tables):
++            return FULL, None
++        row = conn.execute(_STATE_SQL).fetchone()
++        if row is None or row[1] is None or int(row[0]) != int(row[1]):
++            return FULL, None  # (a): something bumped without marking
++        revision = int(row[0])
++        fresh = Cursor(before[0], before[1], before[2], schema, revision, tables)
++        if (cursor is None or (cursor.dev, cursor.ino, cursor.shm, cursor.schema_version, cursor.tables)
++                != (fresh.dev, fresh.ino, fresh.shm, fresh.schema_version, fresh.tables)
++                or revision < cursor.revision):  # (c), (b)
++            changed: Changed = FULL
++        else:
++            ids = frozenset(r[0] for r in conn.execute(_SINCE_SQL, (cursor.revision,)))
++            changed = FULL if rev.FULL_MARK in ids else ids
++    finally:
++        if own:
++            conn.execute("COMMIT")
++    try:
++        if _identity(path) != before:
++            return FULL, None  # replaced or a new WAL generation while reading: which file was read is unknown
++    except OSError:
++        return FULL, None
++    return changed, fresh
++
++
++def _reset_for_tests() -> None:
++    with _COVERED_LOCK:
++        _COVERED.clear()
+diff --git a/scripts/benchmark_kanban_task_change.py b/scripts/benchmark_kanban_task_change.py
+new file mode 100644
+index 0000000000..0b996fd985
+--- /dev/null
++++ b/scripts/benchmark_kanban_task_change.py
+@@ -0,0 +1,157 @@
++#!/usr/bin/env python3
++"""Benchmark the per-task change cursor (P2, t_01a1d59d3ef805c4). [daveey]
++
++1. Write overhead: one bumping write (a task title UPDATE in its own write transaction, as kanban_db commits) with the
++   epoch-1 bump-only triggers vs the epoch-2 bump+mark triggers, on the same file, alternating blocks.
++2. Scale: ``changed_since`` for a fixed change (one task touched) at 1k, 5.8k and 20k tasks. Its cost must not grow
++   with the board (the design's bar: <= 1.5x from 1k to 20k).
++
++    bash scripts/run-in-hermes-env python3 scripts/benchmark_kanban_task_change.py [--json OUT]
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import statistics
++import sys
++import tempfile
++import time
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++
++def _home() -> Path:
++    tmp = Path(tempfile.mkdtemp(prefix="kanban-task-change-bench-"))
++    home = tmp / ".hermes"
++    home.mkdir()
++    os.environ["HERMES_HOME"] = str(home)
++    os.environ["HERMES_KANBAN_HOME"] = str(home)
++    return home
++
++
++def _seed(conn, n: int) -> list[str]:
++    from hermes_cli.kanban_db_connect import write_txn
++    ids = []
++    with write_txn(conn):
++        for i in range(n):
++            tid = f"t_bench{i:08d}"
++            conn.execute("INSERT INTO tasks (id, title, status, assignee, created_at) VALUES (?, ?, 'ready', 'w', ?)",
++                         (tid, f"task {i}", i))
++            conn.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES (?, 'created', ?)", (tid, i))
++            conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, 'me', 'hi', ?)",
++                         (tid, i))
++            if i:
++                conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (ids[-1], tid))
++            ids.append(tid)
++    return ids
++
++
++def _epoch1(conn) -> None:
++    """The bump-only triggers a writer from before P2 installs (same WHEN clauses, no marks)."""
++    from hermes_cli import kanban_activity_revision as rev
++    from hermes_cli.kanban_db_connect import write_txn
++    found = dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name GLOB ?",
++                              (rev.PREFIX + "*",)))
++    with write_txn(conn):
++        for name, sql in found.items():
++            conn.execute(f"DROP TRIGGER {name}")
++            conn.execute(sql.split(" BEGIN ", 1)[0] + f" BEGIN {rev._BUMP} END")
++
++
++def _write_cost(conn, ids: list[str], n: int) -> float:
++    from hermes_cli.kanban_db_connect import write_txn
++    samples = []
++    for i in range(n):
++        t0 = time.perf_counter()
++        with write_txn(conn):
++            conn.execute("UPDATE tasks SET title = ? WHERE id = ?", (f"w{time.perf_counter_ns()}", ids[i % len(ids)]))
++        samples.append(time.perf_counter() - t0)
++    return statistics.median(samples)
++
++
++def _statement_cost(conn, ids: list[str], n: int) -> float:
++    """The trigger's CPU share alone: n bumping UPDATEs inside one transaction (no commit/fsync per write)."""
++    from hermes_cli.kanban_db_connect import write_txn
++    with write_txn(conn):
++        t0 = time.perf_counter()
++        for i in range(n):
++            conn.execute("UPDATE tasks SET title = ? WHERE id = ?", (f"s{i}-{time.perf_counter_ns()}", ids[i % len(ids)]))
++        return (time.perf_counter() - t0) / n
++
++
++def bench_overhead(blocks: int, per_block: int) -> dict:
++    from hermes_cli import kanban_activity_revision as rev
++    from hermes_cli import kanban_db_connect as kbc
++    home = _home()
++    conn = kbc.connect(home / "kanban.db")
++    ids = _seed(conn, 1000)
++    old, new, old_s, new_s = [], [], [], []
++    for _ in range(blocks):
++        _epoch1(conn)
++        old.append(_write_cost(conn, ids, per_block))
++        old_s.append(_statement_cost(conn, ids, per_block * 5))
++        rev.ensure_revision(conn, rev.LOCAL_TABLES)
++        new.append(_write_cost(conn, ids, per_block))
++        new_s.append(_statement_cost(conn, ids, per_block * 5))
++    conn.close()
++    o, w = statistics.median(old), statistics.median(new)
++    so, sw = statistics.median(old_s), statistics.median(new_s)
++    return {"bump_only_us": round(o * 1e6, 2), "bump_and_mark_us": round(w * 1e6, 2),
++            "overhead_pct": round((w / o - 1) * 100, 2),
++            "statement_bump_only_us": round(so * 1e6, 2), "statement_bump_and_mark_us": round(sw * 1e6, 2),
++            "statement_overhead_pct": round((sw / so - 1) * 100, 2),
++            "blocks": blocks, "writes_per_block": per_block}
++
++
++def bench_scale(sizes: list[int], reps: int) -> dict:
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_task_change as tc
++    from hermes_cli.kanban_db_connect import write_txn
++    out = {}
++    for n in sizes:
++        home = _home()
++        conn = kbc.connect(home / "kanban.db")
++        ids = _seed(conn, n)
++        first, cursor = tc.changed_since(conn, None)
++        assert first is tc.FULL and cursor is not None
++        samples = []
++        for i in range(reps):
++            with write_txn(conn):
++                conn.execute("UPDATE tasks SET title = ? WHERE id = ?", (f"r{i}", ids[(i * 7919) % n]))
++            t0 = time.perf_counter()
++            changed, nxt = tc.changed_since(conn, cursor)
++            samples.append(time.perf_counter() - t0)
++            assert changed == {ids[(i * 7919) % n]}, changed
++            cursor = nxt
++        full_t0 = time.perf_counter()
++        conn.execute("SELECT * FROM tasks").fetchall()
++        full = time.perf_counter() - full_t0
++        out[n] = {"changed_since_us": round(statistics.median(samples) * 1e6, 2),
++                  "p90_us": round(sorted(samples)[int(len(samples) * 0.9)] * 1e6, 2),
++                  "full_tasks_read_us": round(full * 1e6, 2)}
++        conn.close()
++    base = out[sizes[0]]["changed_since_us"]
++    return {"sizes": out, "growth_max_over_min_size": round(out[sizes[-1]]["changed_since_us"] / base, 3)}
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--json")
++    ap.add_argument("--blocks", type=int, default=12)
++    ap.add_argument("--per-block", type=int, default=200)
++    ap.add_argument("--reps", type=int, default=400)
++    args = ap.parse_args()
++    result = {"overhead": bench_overhead(args.blocks, args.per_block),
++              "scale": bench_scale([1000, 5800, 20000], args.reps)}
++    text = json.dumps(result, indent=2)
++    print(text)
++    if args.json:
++        Path(args.json).write_text(text + "\n", encoding="utf-8")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/hermes_cli/test_kanban_schema_owner.py b/tests/hermes_cli/test_kanban_schema_owner.py
+index 45f4a68cb8..48f69d29a5 100644
+--- a/tests/hermes_cli/test_kanban_schema_owner.py
++++ b/tests/hermes_cli/test_kanban_schema_owner.py
+@@ -124,13 +124,14 @@ def test_non_installed_checkout_opens_a_current_board_normally(home):
+ 
+ def test_reference_schema_matches_what_connect_creates(home):
+     """The "at par" reference is every table/column connect()'s schema pass creates: no step is left out.
+-    Only ``kanban_activity_revision`` is outside it: display-only, its absence leaves readers on a stat fallback."""
+-    from hermes_cli.kanban_activity_revision import REVISION_TABLE
++    Only ``kanban_activity_revision`` and its ``kanban_task_change`` are outside it: display-only, their absence
++    leaves readers on a stat fallback or a full read."""
++    from hermes_cli.kanban_activity_revision import CHANGE_TABLE, REVISION_TABLE
+     db = home / "kanban.db"
+     kbc.connect(db).close()
+     raw = sqlite3.connect(db)
+     try:
+-        created = {t: c for t, c in owner._tables(raw).items() if t != REVISION_TABLE}
++        created = {t: c for t, c in owner._tables(raw).items() if t not in (REVISION_TABLE, CHANGE_TABLE)}
+         assert created == owner._reference_schema()
+     finally:
+         raw.close()
+@@ -322,12 +323,12 @@ def _synced_board(home: Path) -> Path:
+ 
+ def test_reference_schema_with_sync_matches_what_a_synced_connect_creates(home, monkeypatch):
+     """With sync live, the at-par reference also holds every sync table/column connect() installs."""
+-    from hermes_cli.kanban_activity_revision import REVISION_TABLE
++    from hermes_cli.kanban_activity_revision import CHANGE_TABLE, REVISION_TABLE
+     monkeypatch.setattr(owner, "_REFERENCE", {})
+     db = _synced_board(home)
+     raw = sqlite3.connect(db)
+     try:
+-        created = {t: c for t, c in owner._tables(raw).items() if t != REVISION_TABLE}
++        created = {t: c for t, c in owner._tables(raw).items() if t not in (REVISION_TABLE, CHANGE_TABLE)}
+         assert "kanban_sync_state" in created
+         assert created == owner._reference_schema(sync=True)
+     finally:
+diff --git a/tests/hermes_cli/test_kanban_task_change.py b/tests/hermes_cli/test_kanban_task_change.py
+new file mode 100644
+index 0000000000..53bf59f43e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_task_change.py
+@@ -0,0 +1,393 @@
++"""Per-task change cursor (P2) on boards and sync shadows (t_01a1d59d3ef805c4). [daveey]
++
++Design t_01a1d563324d7e8e §2 P2 with review R7/R8: every content write marks the task(s) it touched in
++``kanban_task_change`` at the revision it bumped, so ``changed_since`` answers incrementally; a cursor is trusted only
++while the file can vouch for it (coverage, MAX(rev) == revision, no regression, same file identity and schema),
++otherwise the answer is FULL.
++"""
++
++from __future__ import annotations
++
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_activity_revision as rev
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_task_change as tc
++from hermes_cli.kanban_db_dispatch import heartbeat_worker
++from tests.hermes_cli import kanban_sync_support as support
++
++FULL = tc.FULL
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    tc._reset_for_tests()
++    yield home
++    tc._reset_for_tests()
++
++
++@pytest.fixture
++def board(home):
++    conn = kbc.connect(home / "kanban.db")
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++@pytest.fixture
++def shadow(home):
++    conn = kbc.connect(home / "kanban" / sync.SHADOW_DIR / "default.db")
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def _armed(conn) -> tc.Cursor:
++    """A trusted cursor at the current revision (the first call is always FULL)."""
++    first, cursor = tc.changed_since(conn, None)
++    assert first is FULL and cursor is not None
++    again, cursor = tc.changed_since(conn, cursor)
++    assert again == frozenset() and cursor is not None
++    return cursor
++
++
++def _write(conn, sql, params=()):
++    with kbc.write_txn(conn):
++        conn.execute(sql, params)
++
++
++def test_a_task_write_marks_only_that_task_and_rearms(board):
++    a = kb.create_task(board, title="a", assignee="w")
++    b = kb.create_task(board, title="b", assignee="w")
++    cursor = _armed(board)
++    _write(board, "UPDATE tasks SET title = 'renamed' WHERE id = ?", (a,))
++    changed, cursor = tc.changed_since(board, cursor)
++    assert changed == {a}
++    assert tc.changed_since(board, cursor)[0] == frozenset()
++    assert b not in changed
++
++
++def test_insert_or_replace_is_marked_by_the_insert_trigger(board):
++    """R7: REPLACE deletes the old row without firing DELETE triggers (no recursive_triggers); the INSERT upsert
++    still marks the task."""
++    tid = kb.create_task(board, title="a", assignee="w")
++    cursor = _armed(board)
++    row = dict(board.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
++    row["title"] = "replaced"
++    cols = ", ".join(row)
++    _write(board, f"INSERT OR REPLACE INTO tasks ({cols}) VALUES ({', '.join('?' * len(row))})", tuple(row.values()))
++    changed, _ = tc.changed_since(board, cursor)
++    assert changed == {tid}
++
++
++def test_a_link_marks_both_ends(board):
++    parent = kb.create_task(board, title="parent", assignee="w")
++    child = kb.create_task(board, title="child", assignee="w")
++    other = kb.create_task(board, title="other", assignee="w")
++    cursor = _armed(board)
++    _write(board, "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (parent, child))
++    changed, cursor = tc.changed_since(board, cursor)
++    assert changed == {parent, child}
++    _write(board, "UPDATE task_links SET parent_id = ? WHERE parent_id = ? AND child_id = ?", (other, parent, child))
++    changed, cursor = tc.changed_since(board, cursor)
++    assert changed == {parent, other, child}  # the old parent loses a child: it moved too
++    _write(board, "DELETE FROM task_links WHERE child_id = ?", (child,))
++    assert tc.changed_since(board, cursor)[0] == {other, child}
++
++
++def test_a_delete_marks_the_task_and_readers_see_it_gone(board):
++    tid = kb.create_task(board, title="doomed", assignee="w")
++    keep = kb.create_task(board, title="keep", assignee="w")
++    cursor = _armed(board)
++    assert kb.delete_task(board, tid)
++    changed, _ = tc.changed_since(board, cursor)
++    assert tid in changed and keep not in changed
++    assert board.execute("SELECT 1 FROM tasks WHERE id = ?", (tid,)).fetchone() is None  # missing = deleted
++
++
++def test_comments_runs_and_events_mark_their_task(board):
++    tid = kb.create_task(board, title="a", assignee="w")
++    cursor = _armed(board)
++    _write(board, "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, 'me', 'hi', 1)", (tid,))
++    changed, cursor = tc.changed_since(board, cursor)
++    assert changed == {tid}
++    _write(board, "INSERT INTO task_events (task_id, kind, created_at) VALUES (?, 'completed', 1)", (tid,))
++    changed, cursor = tc.changed_since(board, cursor)
++    assert changed == {tid}
++    _write(board, "INSERT INTO task_runs (task_id, profile, status, started_at) VALUES (?, 'w', 'running', 1)", (tid,))
++    assert tc.changed_since(board, cursor)[0] == {tid}
++
++
++def test_a_row_moved_to_another_task_marks_both(board):
++    a = kb.create_task(board, title="a", assignee="w")
++    b = kb.create_task(board, title="b", assignee="w")
++    _write(board, "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, 'me', 'hi', 1)", (a,))
++    cursor = _armed(board)
++    _write(board, "UPDATE task_comments SET task_id = ? WHERE task_id = ?", (b, a))
++    assert tc.changed_since(board, cursor)[0] == {a, b}
++
++
++def test_heartbeats_and_bookkeeping_do_not_mark(board):
++    """R8: the same exclusions as the board revision: claim/lease/heartbeat columns and heartbeat events."""
++    tid = kb.create_task(board, title="a", assignee="w")
++    assert kb.claim_task(board, tid) is not None
++    cursor = _armed(board)
++    before = board.execute("SELECT revision FROM kanban_activity_revision").fetchone()[0]
++    assert heartbeat_worker(board, tid, note="alive")  # task + run heartbeat columns and a heartbeat event
++    _write(board, "UPDATE tasks SET claim_expires = 99, worker_pid = 7, lease_expires = 5 WHERE id = ?", (tid,))
++    _write(board, "UPDATE task_runs SET claim_expires = 99, last_heartbeat_at = 98 WHERE task_id = ?", (tid,))
++    changed, cursor = tc.changed_since(board, cursor)
++    assert changed == frozenset()
++    assert board.execute("SELECT revision FROM kanban_activity_revision").fetchone()[0] == before
++    _write(board, "UPDATE task_runs SET status = 'crashed' WHERE task_id = ?", (tid,))  # content: marks
++    assert tc.changed_since(board, cursor)[0] == {tid}
++
++
++def test_an_unmarked_bump_is_never_trusted(board):
++    """R7 (a): an older writer's triggers bump the counter without marking; MAX(rev) then trails the revision."""
++    tid = kb.create_task(board, title="a", assignee="w")
++    cursor = _armed(board)
++    _write(board, "UPDATE kanban_activity_revision SET revision = revision + 1 WHERE id = 1")
++    assert tc.changed_since(board, cursor) == (FULL, None)
++    assert tc.changed_since(board, None) == (FULL, None)
++    _write(board, "UPDATE tasks SET title = 'x' WHERE id = ?", (tid,))  # a marked bump re-aligns MAX(rev)
++    first, fresh = tc.changed_since(board, None)
++    assert first is FULL and fresh is not None
++
++
++def _old_writer_init(conn) -> None:
++    """What a writer from before P2 does on init: its bump-only triggers replace ours (and it bumps)."""
++    found = dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name GLOB ?",
++                              (rev.PREFIX + "*",)))
++    with kbc.write_txn(conn):
++        conn.execute(rev._BUMP)
++        for name, sql in found.items():
++            head = sql.split(" BEGIN ", 1)[0]
++            conn.execute(f"DROP TRIGGER {name}")
++            conn.execute(f"{head} BEGIN {rev._BUMP} END")
++
++
++def test_an_older_writer_dropping_the_marks_reads_full_until_reinstalled(board):
++    tid = kb.create_task(board, title="a", assignee="w")
++    cursor = _armed(board)
++    _old_writer_init(board)
++    _write(board, "UPDATE tasks SET title = 'unmarked' WHERE id = ?", (tid,))
++    assert tc.changed_since(board, cursor) == (FULL, None)
++    assert tc.changed_since(board, None) == (FULL, None)
++    rev.ensure_revision(board, rev.LOCAL_TABLES)  # a current writer's init
++    changed, fresh = tc.changed_since(board, cursor)
++    assert changed is FULL and fresh is not None  # the gap's writes are unknown: one full read
++    assert tc.changed_since(board, fresh)[0] == frozenset()
++
++
++def test_an_older_writer_trigger_is_not_coverage_even_before_it_bumps(board):
++    cursor = _armed(board)
++    sql = board.execute("SELECT sql FROM sqlite_master WHERE name = ?",
++                        (f"{rev.PREFIX}task_comments_insert",)).fetchone()[0]
++    with kbc.write_txn(board):  # no bump: only the trigger's epoch tells
++        board.execute(f"DROP TRIGGER {rev.PREFIX}task_comments_insert")
++        board.execute(sql.split(" BEGIN ", 1)[0] + f" BEGIN {rev._BUMP} END")
++    assert tc.changed_since(board, cursor) == (FULL, None)
++
++
++def test_a_dropped_trigger_is_never_trusted(board):
++    tid = kb.create_task(board, title="a", assignee="w")
++    cursor = _armed(board)
++    with kbc.write_txn(board):
++        board.execute(f"DROP TRIGGER {rev.PREFIX}tasks_update")
++    _write(board, "UPDATE tasks SET title = 'silent' WHERE id = ?", (tid,))
++    assert tc.changed_since(board, cursor) == (FULL, None)
++
++
++def test_a_database_restored_in_place_reads_full(board, tmp_path):
++    """R7 (b)/(c): the backup API restores into the same inode; its counter regressed and schema_version moved."""
++    tid = kb.create_task(board, title="a", assignee="w")
++    snapshot = sqlite3.connect(tmp_path / "snap.db")
++    board.backup(snapshot)
++    for i in range(3):
++        _write(board, "UPDATE tasks SET title = ? WHERE id = ?", (f"later {i}", tid))
++    cursor = _armed(board)
++    snapshot.backup(board)
++    snapshot.close()
++    assert tc.changed_since(board, cursor)[0] is FULL
++
++
++def test_a_regressed_revision_alone_reads_full(board):
++    """R7 (b) in isolation: same file, same schema, MAX(rev) == revision, but below the cursor."""
++    tid = kb.create_task(board, title="a", assignee="w")
++    low = board.execute("SELECT revision FROM kanban_activity_revision").fetchone()[0]
++    for i in range(3):
++        _write(board, "UPDATE tasks SET title = ? WHERE id = ?", (f"later {i}", tid))
++    cursor = _armed(board)
++    with kbc.write_txn(board):  # rewind both tables the way an older copy of the file reads
++        board.execute("UPDATE kanban_activity_revision SET revision = ?", (low,))
++        board.execute("UPDATE kanban_task_change SET rev = ? WHERE rev > ?", (low, low))
++    assert tc.changed_since(board, cursor)[0] is FULL
++
++
++def test_a_replaced_file_reads_full(home, board, tmp_path):
++    kb.create_task(board, title="a", assignee="w")
++    cursor = _armed(board)
++    other = kbc.connect(tmp_path / "other.db")
++    try:
++        kb.create_task(other, title="b", assignee="w")
++        _armed(other)
++        assert tc.changed_since(other, cursor)[0] is FULL  # same revision space, another file
++    finally:
++        other.close()
++
++
++def test_ensure_revision_keeps_a_newer_epochs_triggers(board):
++    """A newer writer's triggers (and its extra ones) survive this writer's init instead of being dropped."""
++    names = dict(board.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name GLOB ?",
++                               (rev.PREFIX + "*",)))
++    newer = names[f"{rev.PREFIX}tasks_update"].replace(rev.EPOCH_MARK, "/* kanban-activity-epoch:3 */")
++    extra = (f"CREATE TRIGGER {rev.PREFIX}future_table_insert AFTER INSERT ON tasks "
++             f"BEGIN /* kanban-activity-epoch:3 */ {rev._BUMP} END")
++    with kbc.write_txn(board):
++        board.execute(f"DROP TRIGGER {rev.PREFIX}tasks_update")
++        board.execute(newer)
++        board.execute(extra)
++    before = dict(board.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name GLOB ?",
++                                (rev.PREFIX + "*",)))
++    revision = board.execute("SELECT revision FROM kanban_activity_revision").fetchone()[0]
++    rev.ensure_revision(board, rev.LOCAL_TABLES)
++    after = dict(board.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name GLOB ?",
++                               (rev.PREFIX + "*",)))
++    assert after == before
++    assert board.execute("SELECT revision FROM kanban_activity_revision").fetchone()[0] == revision  # no write
++
++
++def test_ensure_revision_replaces_an_older_epochs_triggers(board):
++    _old_writer_init(board)
++    rev.ensure_revision(board, rev.LOCAL_TABLES)
++    sqls = [r[0] for r in board.execute("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name GLOB ?",
++                                        (rev.PREFIX + "*",))]
++    assert sqls and all(rev.trigger_epoch(s) == rev.EPOCH for s in sqls)
++
++
++def test_shadow_runs_and_events_are_covered(shadow):
++    """R8: a sync shadow marks task_runs/task_events (with the same exclusions), not only tasks/chat links."""
++    assert {"task_runs", "task_events", "task_links", "task_comments"} <= set(rev.SHADOW_TABLES)
++    with kbc.write_txn(shadow):
++        shadow.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('t_hub', 'hub card', 'running', 1)")
++    cursor = _armed(shadow)
++    _write(shadow, "INSERT INTO task_runs (task_id, profile, status, started_at) VALUES ('t_hub', 'w', 'running', 1)")
++    changed, cursor = tc.changed_since(shadow, cursor)
++    assert changed == {"t_hub"}
++    _write(shadow, "INSERT INTO task_events (task_id, kind, created_at) VALUES ('t_hub', 'claimed', 2)")
++    changed, cursor = tc.changed_since(shadow, cursor)
++    assert changed == {"t_hub"}
++    _write(shadow, "INSERT INTO task_events (task_id, kind, created_at) VALUES ('t_hub', 'heartbeat', 3)")
++    _write(shadow, "UPDATE task_runs SET last_heartbeat_at = 3, claim_expires = 9 WHERE task_id = 't_hub'")
++    changed, cursor = tc.changed_since(shadow, cursor)
++    assert changed == frozenset()
++    _write(shadow, "UPDATE task_runs SET status = 'done', ended_at = 4 WHERE task_id = 't_hub'")
++    changed, cursor = tc.changed_since(shadow, cursor)
++    assert changed == {"t_hub"}
++    _write(shadow, "DELETE FROM tasks WHERE id = 't_hub'")  # a parent vanishing from the replica (R8 parked scope)
++    assert tc.changed_since(shadow, cursor)[0] == {"t_hub"}
++
++
++def test_a_trigger_dropped_and_recreated_around_a_write_reads_full(board):
++    """(c) schema_version: the triggers look whole again and the counter never moved, but a write went unrecorded."""
++    tid = kb.create_task(board, title="a", assignee="w")
++    cursor = _armed(board)
++    name = f"{rev.PREFIX}tasks_update"
++    sql = board.execute("SELECT sql FROM sqlite_master WHERE name = ?", (name,)).fetchone()[0]
++    with kbc.write_txn(board):
++        board.execute(f"DROP TRIGGER {name}")
++        board.execute("UPDATE tasks SET title = 'unrecorded' WHERE id = ?", (tid,))
++        board.execute(sql)
++    assert tc.changed_since(board, cursor)[0] is FULL
++
++
++def test_a_cursor_of_another_inode_reads_full(board):
++    """(c) dev/ino, alone: the same revision space and schema, a cursor taken on another inode."""
++    import dataclasses
++    kb.create_task(board, title="a", assignee="w")
++    cursor = _armed(board)
++    assert tc.changed_since(board, dataclasses.replace(cursor, ino=cursor.ino + 1))[0] is FULL
++    assert tc.changed_since(board, dataclasses.replace(cursor, dev=cursor.dev + 1))[0] is FULL
++    assert tc.changed_since(board, cursor)[0] == frozenset()
++
++
++def test_a_file_swapped_while_reading_is_not_vouched_for(board, monkeypatch):
++    kb.create_task(board, title="a", assignee="w")
++    cursor = _armed(board)
++    real = tc._identity
++    calls = []
++
++    def moving(path):
++        calls.append(path)
++        found = real(path)
++        return found if len(calls) == 1 else (found[0], found[1] + 1, found[2])
++
++    monkeypatch.setattr(tc, "_identity", moving)
++    assert tc.changed_since(board, cursor) == (FULL, None)
++
++
++def test_an_unattributable_bump_reads_full(board):
++    """A bump marked ``FULL_MARK`` (no task key to name) is explained, so (a) holds, but it names no task."""
++    tid = kb.create_task(board, title="a", assignee="w")
++    cursor = _armed(board)
++    with kbc.write_txn(board):
++        board.execute(rev._BUMP)
++        board.execute(rev._mark("NULL"))
++    changed, fresh = tc.changed_since(board, cursor)
++    assert changed is FULL and fresh is not None
++    _write(board, "UPDATE tasks SET title = 'after' WHERE id = ?", (tid,))
++    assert tc.changed_since(board, fresh)[0] == {tid}
++
++
++def test_a_missing_change_table_reads_full_and_init_repairs_it(board):
++    tid = kb.create_task(board, title="a", assignee="w")
++    cursor = _armed(board)
++    with kbc.write_txn(board):
++        board.execute(f"DROP TABLE {rev.CHANGE_TABLE}")
++    assert tc.changed_since(board, cursor) == (FULL, None)
++    rev.ensure_revision(board, rev.LOCAL_TABLES)
++    _write(board, "UPDATE tasks SET title = 'after' WHERE id = ?", (tid,))
++    first, fresh = tc.changed_since(board, cursor)
++    assert first is FULL and fresh is not None
++
++
++def test_ensure_revision_repairs_a_dropped_change_index(board):
++    with kbc.write_txn(board):
++        board.execute(f"DROP INDEX {rev.CHANGE_INDEX}")
++    rev.ensure_revision(board, rev.LOCAL_TABLES)
++    assert board.execute("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
++                         (rev.CHANGE_INDEX,)).fetchone()
++
++
++def test_the_answer_is_read_in_one_snapshot(board):
++    """Coverage, counter, MAX(rev) and the changed rows are read inside one read transaction."""
++    kb.create_task(board, title="a", assignee="w")
++    cursor = _armed(board)
++    seen: list[str] = []
++    board.set_trace_callback(seen.append)
++    try:
++        tc.changed_since(board, cursor)
++    finally:
++        board.set_trace_callback(None)
++    begin = next(i for i, s in enumerate(seen) if s.strip().upper().startswith("BEGIN"))
++    commit = max(i for i, s in enumerate(seen) if s.strip().upper().startswith("COMMIT"))
++    reads = [i for i, s in enumerate(seen) if rev.CHANGE_TABLE in s or "schema_version" in s]
++    assert reads and all(begin < i < commit for i in reads)
++
++
++def test_a_cursor_inside_a_write_transaction_sees_its_own_writes(board):
++    tid = kb.create_task(board, title="a", assignee="w")
++    cursor = _armed(board)
++    with kbc.write_txn(board):
++        board.execute("UPDATE tasks SET title = 'mine' WHERE id = ?", (tid,))
++        changed, _ = tc.changed_since(board, cursor)
++    assert changed == {tid}
+-- 
+2.43.0
+

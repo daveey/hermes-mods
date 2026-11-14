@@ -1,0 +1,110 @@
+From 01c97c0a9a7aace4e3522ebbdf7e35f0a7c74067 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 03:39:28 +0000
+Subject: [PATCH] fix(quiet): dispatcher custody attaches via adopt_spawned
+ (health CC); test waits on condition, not clock
+
+---
+ hermes_cli/kanban_db_dispatch.py               |  8 +-------
+ hermes_cli/kanban_db_dispatch_custody.py       | 13 +++++++++++++
+ tests/hermes_cli/test_local_work_threads.py    |  4 ++--
+ .../test_quiet_kanban_spawn_custody.py         | 18 ++++++++++++++++++
+ 4 files changed, 34 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 3f8d5d78f3..6f8aca87af 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2767,13 +2767,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None, o
+     # Intentionally NOT closing log_f: the child keeps writing after return;
+     # the OS-level FD stays open in the child until it exits.
+     _live_worker_procs[proc.pid] = proc
+-    try:
+-        birth = _process_fingerprint(proc.pid)
+-    except Exception:  # health: allow BLE001 -- the child exists: custody must still attach; an unknown birth latches unknown
+-        birth = None
+-        if held is not None:
+-            held.mark_unknown("kanban-worker-birth-unreadable")
+-    _custody.adopt(proc, held, birth)
++    _custody.adopt_spawned(proc, held, _process_fingerprint)
+     return proc.pid
+ 
+ 
+diff --git a/hermes_cli/kanban_db_dispatch_custody.py b/hermes_cli/kanban_db_dispatch_custody.py
+index 7738a6e0bf..67bed6aaae 100644
+--- a/hermes_cli/kanban_db_dispatch_custody.py
++++ b/hermes_cli/kanban_db_dispatch_custody.py
+@@ -38,6 +38,19 @@ def adopt(proc, held, birth: Optional[str]) -> None:
+         held.mark_unknown("kanban-worker-custody-unattachable")
+ 
+ 
++def adopt_spawned(proc, held, fingerprint) -> None:
++    """Adopt right after Popen: the child exists, so custody must attach even when reading its birth
++    fingerprint raises (the token is kept and the registry latches unknown)."""
++    if held is None:
++        return
++    try:
++        birth = fingerprint(proc.pid)
++    except Exception:  # health: allow BLE001 -- the child exists: custody must still attach; an unknown birth latches unknown
++        birth = None
++        held.mark_unknown("kanban-worker-birth-unreadable")
++    adopt(proc, held, birth)
++
++
+ def _take(pid: int, proc) -> list:
+     with _lock:
+         keys = [k for k, (p, _h) in _custody.items() if k[0] == int(pid) and p is proc]
+diff --git a/tests/hermes_cli/test_local_work_threads.py b/tests/hermes_cli/test_local_work_threads.py
+index d42551bee1..7188654609 100644
+--- a/tests/hermes_cli/test_local_work_threads.py
++++ b/tests/hermes_cli/test_local_work_threads.py
+@@ -193,6 +193,7 @@ def test_audio_cancelled_queued_job_releases_and_never_runs(tmp_path, monkeypatc
+     still queued releases the reservation, and the job never runs (RED on 95089d00fb: token leaked)."""
+     from hermes_cli import local_work
+     from hermes_cli.web_routers import audio
++    from tests.waiting import async_wait_until
+ 
+     registry, home = setup_owner(tmp_path)
+     monkeypatch.setattr(local_work, "_registry", registry)
+@@ -206,8 +207,7 @@ def test_audio_cancelled_queued_job_releases_and_never_runs(tmp_path, monkeypatc
+         blocker = loop.run_in_executor(None, lambda: (entered.set(), release.wait(5)))
+         assert entered.wait(5)
+         task = asyncio.ensure_future(audio._run_reserved("test.audio", ran.set))
+-        await asyncio.sleep(0.05)
+-        assert registry.snapshot().active == 1
++        await async_wait_until(lambda: registry.snapshot().active == 1, timeout=5)
+         task.cancel()
+         with pytest.raises(asyncio.CancelledError):
+             await task
+diff --git a/tests/hermes_cli/test_quiet_kanban_spawn_custody.py b/tests/hermes_cli/test_quiet_kanban_spawn_custody.py
+index 1b8f141b6a..498cc7fc40 100644
+--- a/tests/hermes_cli/test_quiet_kanban_spawn_custody.py
++++ b/tests/hermes_cli/test_quiet_kanban_spawn_custody.py
+@@ -124,6 +124,24 @@ def test_handle_dropped_without_verified_exit_keeps_token_and_latches_unknown(re
+     assert "kanban-worker-exit-unverified" in snap.unknowns
+ 
+ 
++def test_unreadable_birth_after_popen_keeps_custody_and_latches_unknown(registry, monkeypatch, tmp_path):
++    """The child exists once Popen returns: a raising birth fingerprint must not orphan the token
++    (RED on 95089d00fb: the exception escaped before adopt, the token was never attached)."""
++    from hermes_cli import kanban_db_dispatch as kbd
++
++    def boom(pid):
++        raise OSError("proc unreadable")
++
++    monkeypatch.setattr(kbd, "_process_fingerprint", boom)
++    proc = FakeProc(51004)
++    assert _spawn(monkeypatch, tmp_path, proc) == 51004
++    snap = registry.snapshot()
++    assert snap.active == 1 and "kanban-worker-birth-unreadable" in snap.unknowns
++    proc.returncode = 0
++    assert kbd.reap_worker_zombies() == [51004]
++    assert registry.snapshot().active == 0  # the verified exit still releases the attached token
++
++
+ def test_no_registry_is_inert(monkeypatch, tmp_path):
+     from hermes_cli import kanban_db_dispatch as kbd
+     monkeypatch.setattr(local_work, "_registry", None)
+-- 
+2.43.0
+

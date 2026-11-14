@@ -1,0 +1,229 @@
+From df18cf1964878061fb04b0e17afd5cda263b5fab Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:20:25 +0000
+Subject: [PATCH] test(gateway): pin pending-fold custody boundaries [daveey]
+
+Add real admission-store boundary tests for remote ACK keys, optional scan failure, resumed human heads, held wakes, replayed transfers and cross-generation settlement. No production changes.
+
+Proof: predictions recorded before runs. 47 focused tests pass with zero skips. Mutants M7/M8/M10/M11/M12/M13 all fail their named behavioral assertion. M12 is not equivalent: a failed folded admission can be requeued and explicitly steered into a newer human generation; the retained old fold map must not turn its delivered transfer back into a queued replay. scripts/check: 20 checks ok.
+---
+ tests/gateway/test_fold_pending_contracts.py | 207 +++++++++++++++++++
+ 1 file changed, 207 insertions(+)
+ create mode 100644 tests/gateway/test_fold_pending_contracts.py
+
+diff --git a/tests/gateway/test_fold_pending_contracts.py b/tests/gateway/test_fold_pending_contracts.py
+new file mode 100644
+index 0000000000..e934a69d75
+--- /dev/null
++++ b/tests/gateway/test_fold_pending_contracts.py
+@@ -0,0 +1,207 @@
++"""Boundary contracts for pending folds, using real admission/transfer writes."""
++from types import SimpleNamespace
++
++import pytest
++
++from gateway import session_fold_pending as fold
++from tests.gateway import test_fold_pending_admissions as helpers
++
++
++async def _queued(tmp_path, monkeypatch, *, human=False):
++    async def unused(*args):
++        pytest.fail('manual boundary fixture must not start an agent')
++
++    h = await helpers._harness(tmp_path, monkeypatch, unused)
++    monkeypatch.setattr(h.authority, '_schedule', lambda ref: None)
++    if human:
++        from hermes_state_runtime import admit_session_input
++        admit_session_input(h.db, epoch=h.authority.epoch, principal_id='human',
++                            session_id=h.ref.session_id, request_id='human question', payload={'text': 'head'})
++    else:
++        await h.notice('head', 'completion')
++    return h
++
++
++def _claim(h):
++    from hermes_state_runtime import claim_session_input
++    return claim_session_input(h.db, epoch=h.authority.epoch, session_id=h.ref.session_id)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('resuming', [False, True])
++async def test_only_resuming_human_head_carries_pending_completion(tmp_path, monkeypatch, resuming):
++    h = await _queued(tmp_path, monkeypatch, human=True)
++    try:
++        await h.notice('result', 'completion')
++        head = _claim(h)
++        assert head['payload'] == {'text': 'head'}
++        # This is the resume flag supplied by the checkpoint claimant, not an
++        # automation head that could independently satisfy accepts_fold.
++        head['update_resume'] = resuming
++        event = SimpleNamespace(text='head')
++        taken = await fold.fold_pending(h.authority, h.ref, h.live, head, event)
++        result = h.rows()['result']
++        assert taken == ([result['admission_id']] if resuming else [])
++        assert event.text == ('head\n\nresult' if resuming else 'head')
++        assert result['status'] == ('terminal' if resuming else 'queued')
++    finally:
++        await h.close()
++
++
++@pytest.mark.asyncio
++async def test_remote_ack_keys_keep_the_wake_in_its_own_turn(tmp_path, monkeypatch):
++    h = await _queued(tmp_path, monkeypatch)
++    try:
++        await h.notice('remote wake', 'kanban-wake', {
++            'display_kind': 'kanban_notice', 'display_text': 'remote wake',
++            'kanban_event_keys': ['remote:event:1']})
++        await h.notice('local result', 'completion')
++        head = _claim(h)
++        event = SimpleNamespace(text='head')
++        rows = h.rows()
++        taken = await fold.fold_pending(h.authority, h.ref, h.live, head, event)
++        assert taken == [rows['local result']['admission_id']]
++        assert event.text == 'head\n\nlocal result'
++        remote = h.rows()['remote wake']
++        assert (remote['status'], remote['outcome']) == ('queued', None)
++        assert remote['payload']['local_automation_v1']['kanban_event_keys'] == ['remote:event:1']
++    finally:
++        await h.close()
++
++
++@pytest.mark.asyncio
++async def test_candidate_scan_failure_preserves_head_and_pending_row(tmp_path, monkeypatch):
++    h = await _queued(tmp_path, monkeypatch)
++    try:
++        await h.notice('later', 'kanban-wake')
++        head = _claim(h)
++        before = h.rows()
++        event = SimpleNamespace(text='head')
++
++        def broken(*args):
++            raise OSError('candidate scan unavailable')
++
++        monkeypatch.setattr(fold, 'candidates', broken)
++        error = None
++        taken = None
++        try:
++            taken = await fold.fold_pending(h.authority, h.ref, h.live, head, event)
++        except OSError as exc:
++            error = exc
++        assert error is None, 'optional candidate scan must not abort the head'
++        assert taken == []
++        assert event.text == 'head'
++        assert h.rows() == before
++    finally:
++        await h.close()
++
++
++@pytest.mark.asyncio
++async def test_held_wake_is_skipped_but_later_result_folds(tmp_path, monkeypatch):
++    from gateway import session_notifier_drain
++    h = await _queued(tmp_path, monkeypatch)
++    try:
++        await h.notice('held wake', 'kanban-wake')
++        await h.notice('later result', 'completion')
++        monkeypatch.setattr(session_notifier_drain, 'held', lambda: True)
++        head = _claim(h)
++        event = SimpleNamespace(text='head')
++        rows = h.rows()
++        assert session_notifier_drain.notifier_wake(rows['held wake'])
++        taken = await fold.fold_pending(h.authority, h.ref, h.live, head, event)
++        assert taken == [rows['later result']['admission_id']]
++        assert event.text == 'head\n\nlater result'
++        assert h.rows()['held wake']['status'] == 'queued'
++        monkeypatch.setattr(session_notifier_drain, 'held', lambda: False)
++        assert [r['payload']['text'] for r in fold.candidates(h.authority, h.ref, head)] == ['held wake']
++    finally:
++        await h.close()
++
++
++@pytest.mark.asyncio
++async def test_replayed_transfer_does_not_append_text_again(tmp_path, monkeypatch):
++    h = await _queued(tmp_path, monkeypatch)
++    try:
++        await h.notice('later', 'kanban-wake')
++        head = _claim(h)
++        snapshot = fold.candidates(h.authority, h.ref, head)
++        assert len(snapshot) == 1
++        event = SimpleNamespace(text='head')
++        first = await fold.fold_pending(h.authority, h.ref, h.live, head, event)
++        assert first == [snapshot[0]['admission_id']]
++        before = h.rows()
++        # A concurrent transfer can commit after the read-only candidate scan.
++        # Replay through the real store, which returns fresh=False for this row.
++        monkeypatch.setattr(fold, 'candidates', lambda *args: snapshot)
++        assert await fold.fold_pending(h.authority, h.ref, h.live, head, event) == []
++        assert event.text == 'head\n\nlater'
++        assert h.rows() == before
++    finally:
++        await h.close()
++
++
++@pytest.mark.asyncio
++async def test_old_fold_map_cannot_requeue_a_new_generation_delivered_steer(tmp_path, monkeypatch):
++    from gateway import session_notifier_drain
++    from hermes_state_runtime import admit_session_input, settle_session_input, steer_session_input
++    h = await _queued(tmp_path, monkeypatch)
++    try:
++        await h.notice('wake', 'kanban-wake')
++        old = _claim(h)
++        taken = await fold.fold_pending(h.authority, h.ref, h.live, old, SimpleNamespace(text='head'))
++        assert len(taken) == 1
++        admit_session_input(h.db, epoch=h.authority.epoch, principal_id='human',
++                            session_id=h.ref.session_id, request_id='next question', payload={'text': 'question'})
++        settle_session_input(h.db, epoch=h.authority.epoch, admission_id=old['admission_id'],
++                             generation=old['generation'], outcome='failed',
++                             _transfers=fold.settle_outcome(h.authority, old, {}, 'failed'))
++        assert h.rows()['wake']['status'] == 'queued'
++        monkeypatch.setattr(session_notifier_drain, 'held', lambda: True)
++        from hermes_state_runtime import claim_session_input
++        current = claim_session_input(h.db, epoch=h.authority.epoch, session_id=h.ref.session_id,
++                                      _eligible=session_notifier_drain.eligible)
++        assert current['payload']['text'] == 'question'
++        assert current['generation'] != old['generation']
++        # Explicit queued steering delivers the old admission to the newer human
++        # turn; it is not a pending fold, and failed delivered steers never replay.
++        _, fresh = steer_session_input(h.db, epoch=h.authority.epoch, admission_id=taken[0],
++                                       generation=current['generation'])
++        assert fresh
++        transfers = fold.settle_outcome(h.authority, current, {taken[0]: True}, 'failed')
++        settle_session_input(h.db, epoch=h.authority.epoch, admission_id=current['admission_id'],
++                             generation=current['generation'], outcome='failed', _transfers=transfers)
++        wake = h.rows()['wake']
++        assert (wake['status'], wake['outcome']) == ('terminal', 'interrupted')
++    finally:
++        await h.close()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('outcome', ['completed', 'failed'])
++async def test_stale_fold_generation_cannot_settle_a_newer_transfer(tmp_path, monkeypatch, outcome):
++    from hermes_state_runtime import settle_steer_transfers
++    h = await _queued(tmp_path, monkeypatch)
++    try:
++        await h.notice('later', 'kanban-wake')
++        head = _claim(h)
++        event = SimpleNamespace(text='head')
++        taken = await fold.fold_pending(h.authority, h.ref, h.live, head, event)
++        assert len(taken) == 1
++        before = h.rows()
++        stale = dict(head, generation=head['generation'] - 1)
++        transfers = fold.settle_outcome(h.authority, stale, {}, outcome)
++        h.db._execute_write(lambda conn: settle_steer_transfers(
++            conn, epoch=h.authority.epoch, generation=stale['generation'],
++            transfers=transfers, outcome=outcome))
++        # M12 may add a stale mapping, but both delivered and requeue SQL fence
++        # on the receiving generation. Neither may touch this newer transfer.
++        assert h.rows() == before
++        current = fold.settle_outcome(h.authority, head, {}, outcome)
++        h.db._execute_write(lambda conn: settle_steer_transfers(
++            conn, epoch=h.authority.epoch, generation=head['generation'],
++            transfers=current, outcome=outcome))
++        later = h.rows()['later']
++        assert (later['status'], later['outcome']) == (
++            ('terminal', 'steered') if outcome == 'completed' else ('queued', None))
++    finally:
++        await h.close()
+-- 
+2.43.0
+

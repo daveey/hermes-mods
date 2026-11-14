@@ -1,0 +1,433 @@
+From 07559b65bb3fa61ee505692648a4077a1947ecde Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 15:09:33 -0800
+Subject: [PATCH] [daveey] Keep replica projections per origin scope and share
+ slim decoded stages
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: mini idle Desktop serve used 0.6–1.2 cores. Alternating five
+profile scopes staged all 18,264 replica task rows on each read.
+Why 1: annotation holder and profile=all polls alternate origins; prior
+fixture measured 976 ms CPU/read vs 31 ms for one repeated origin.
+Why 2: projection _states had one slot per path; project discarded it
+when the gateway/profile changed. Remote read memo was single-slot too.
+Root (happened): cache identity did not match the multi-profile consumer.
+Root (not caught): incremental tests exercised one origin; the initial
+serve fixture omitted profile configs and never reproduced scope turnover.
+Recurrence: incremental/slim-row changes 60800c97577 and 14aa48d2c4c
+preserved single-path state. This fixes multi-profile reuse, not refresh
+cadence or semantic fingerprint narrowing (owned by annotation card B).
+
+Retain bounded (replica path, gateway, origin profile) states and memos.
+Share clock-free slim decoded rows only across origins they do not link;
+linked origins retain whole records. Reconcile deleted shared rows against
+the replica even when old scopes have been evicted.
+
+Proof: 33 tests passed in test_kanban_replica_profile_states.py (6),
+test_kanban_replica_incremental.py (10), test_kanban_replica_read_memo.py
+(12), test_kanban_replica_rows_memory.py (5), all under tests/hermes_cli.
+The new turnover/deletion test failed before its correction.
+Full isolated serve replay on identical mini board backups, same core
+baseline ac1110c097, same polls and seeded writes: 41.50 CPU s/90 wall s
+before vs 6.78/90 after. No live backend signalled or restarted.
+Replay omits external mod routes; measured reduction is fixture-only.
+Card t_01a1d6d42877f719 retains harness/raw outputs and owns live readback.
+---
+ hermes_cli/kanban_replica_projection.py       |  86 ++++++++--
+ hermes_cli/kanban_session_activity.py         |  19 ++-
+ .../test_kanban_replica_profile_states.py     | 155 ++++++++++++++++++
+ 3 files changed, 244 insertions(+), 16 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_replica_profile_states.py
+
+diff --git a/hermes_cli/kanban_replica_projection.py b/hermes_cli/kanban_replica_projection.py
+index a7fb3fe7b9..be4a38aec2 100644
+--- a/hermes_cli/kanban_replica_projection.py
++++ b/hermes_cli/kanban_replica_projection.py
+@@ -14,6 +14,14 @@ can become a card, and a card reads the whole record (hash-bound owner evidence,
+ other row keeps ``SLIM_FIELDS``, all the release, fold and moved logic reads, and is decoded again from its packed
+ text in the rare case a legacy alias folds a link of this origin into it. Keeping every record whole was ~150 MB of
+ each gateway/dashboard/serve heap for ~13.5k replica cards of which 54 linked the mini (t_01a1cf67a93c05b6).
++
++One state is kept per ``(replica, gateway, origin profile)``. A Desktop ``serve`` answers every profile of its home
++(``profile=all`` polls, the annotation holder's scopes), and with one state per replica each profile's read threw
++away the previous profile's state and decoded every row again: 18,264 rows and 976 ms of CPU per read on the mini's
++replica, where a single profile's read costs 31 ms, and the holder ran five such reads per 2 s pass
++(t_01a1d6d42877f719). A row that does not link the reading origin projects the same for every profile, so those
++stages are decoded once per replica and shared by its states (``_shared``); only a row linking the reading origin
++is decoded for that state, which keeps its whole record.
+ """
+ from __future__ import annotations
+ 
+@@ -89,6 +97,7 @@ class _Stage:
+         'error',
+         'historical',
+         'legacy',
++        'links',
+         'order',
+         'owner3',
+         'published',
+@@ -103,14 +112,41 @@ class _Stage:
+     )
+ 
+ 
+-def _stage(row: tuple, me: str, origin_profile: str) -> _Stage:
++def link_targets(task: dict[str, Any]) -> tuple:
++    """Every ``(gw, profile)`` whose sessions the record links: ``linked_sessions(task, gw, profile)`` is empty
++    for exactly the pairs not listed here."""
++    links = task.get("sessions")
++    out: list = []
++    for link in links if isinstance(links, list) else ():
++        if isinstance(link, dict) and link.get('session') and link.get('rel') in LINK_RELS:
++            pair = (link.get('gw'), link.get('profile'))
++            if pair not in out:
++                out.append(pair)
++    return tuple(out)
++
++
++def _shareable(st: _Stage, row: tuple, me: str, origin_profile: str) -> bool:
++    """Whether ``st``, staged for some origin, is this origin's stage of ``row`` too: the same row text, and a
++    record that links no session of this origin (or a malformed row, which no origin projects)."""
++    if not (st.row is row or st.row == row):
++        return False
++    return st.error is not None or (me, origin_profile) not in st.links
++
++
++def _stage(row: tuple, me: str, origin_profile: str, shared: dict | None = None) -> _Stage:
+     from hermes_cli.kanban_replica_rows import text
+     from hermes_cli.kanban_session_activity import LISTED_STATUSES, _decode_replica_task
+ 
+-    stats["projected"] += 1
+     gw, record_key, data, updated, version = row
++    rk = (gw, record_key)
++    if shared is not None:
++        kept = shared.get(rk)
++        if kept is not None and _shareable(kept, row, me, origin_profile):
++            stats["shared"] += 1
++            return kept
++    stats["projected"] += 1
+     st = _Stage()
+-    st.row, st.error, st.order, st.slim = row, None, (str(gw), str(record_key)), False
++    st.row, st.error, st.order, st.slim, st.links = row, None, (str(gw), str(record_key)), False, ()
+     try:
+         t, digest, evidence = _decode_replica_task(record_key, text(data))
+         parts = str(record_key).split('/')
+@@ -125,10 +161,13 @@ def _stage(row: tuple, me: str, origin_profile: str) -> _Stage:
+             raise ValueError('replica task identity mismatch')
+     except ValueError as exc:
+         st.error = exc
++        if shared is not None:
++            shared[rk] = st
+         return st
+     gw = str(gw)
+     st.tkey = (gw, owner_profile, board, tid)
+     st.sids = linked_sessions(t, me, origin_profile)
++    st.links = link_targets(t)
+     # [daveey] Release evidence reads the whole record (``record_attests_terminal`` reads origin_bindings and
+     # more), so it is computed before the record is slimmed.
+     st.attest = ((gw, owner_profile, board) if record_attests_terminal(t, gw, owner_profile, board, evidence)
+@@ -148,6 +187,11 @@ def _stage(row: tuple, me: str, origin_profile: str) -> _Stage:
+     st.published = (board, tid, created) if owner_profile is not None and created is not None else None
+     st.owner3 = (gw, board, tid)
+     st.historical = st.cards = None
++    if shared is not None:
++        if st.slim:  # links nothing of this origin: every other such origin's stage as well
++            shared[rk] = st
++        else:  # this origin keeps its own whole record; an earlier text's stage is nobody's any more
++            shared.pop(rk, None)
+     return st
+ 
+ 
+@@ -199,9 +243,14 @@ class _State:
+     closed: set  # released tkeys whose owner verified the completion
+ 
+ 
++_MAX_STATES = 16
+ _lock = threading.Lock()
+-_states: dict[str, _State] = {}
+-stats = {"projected": 0, "rebuilt": 0, "historical": 0, "considered": 0, "rehydrated": 0}
++# (replica path, this gateway, origin profile) -> the state of that origin's reads, most recently read last.
++_states: dict[tuple, _State] = {}
++# replica path -> (gw, key) -> the stage of a row that links no session of the origin it was staged for, shared by
++# every state of that replica whose origin it does not link either (``_shareable``). Dropped with the path's last state.
++_shared: dict[str, dict[tuple, _Stage]] = {}
++stats = {"projected": 0, "rebuilt": 0, "historical": 0, "considered": 0, "rehydrated": 0, "shared": 0}
+ 
+ 
+ def _new_state(tag: str, key: tuple) -> _State:
+@@ -298,6 +347,11 @@ def _advance(s: _State, view, me: str, origin_profile: str) -> None:
+     else:  # not the view ``s`` was advanced from: compare every row (no decode for unchanged ones)
+         removed = s.stages.keys() - view.by_key.keys()
+         candidates = view.by_key.keys()
++    shared = _shared.setdefault(s.tag, {})
++    # A new scope has no removed rows of its own. Reconcile the shared cache against the replica itself,
++    # or deleted rows survive indefinitely when their older scopes are evicted before reading again.
++    for rk in shared.keys() - view.by_key.keys():
++        del shared[rk]
+     for rk in removed:
+         if rk in s.stages:
+             _unapply(s, rk)
+@@ -308,7 +362,7 @@ def _advance(s: _State, view, me: str, origin_profile: str) -> None:
+             continue
+         if old is not None:
+             _unapply(s, rk)
+-        _apply(s, rk, _stage(row, me, origin_profile))
++        _apply(s, rk, _stage(row, me, origin_profile, shared))
+     s.gen = view.gen
+ 
+ 
+@@ -333,24 +387,33 @@ def project(view, now: float, me: str, info_rows: list, last_ok: float | None, o
+     origin_profile = get_active_profile_name()
+     stale = offline is not None or last_ok is None or now - last_ok > _hub_stale_after()
+     key = (me, origin_profile, stale, fresh)
++    slot = (view.path, me, origin_profile)
+     with _lock:
+-        s = _states.get(view.path)
++        s = _states.pop(slot, None)
+         try:
+-            if s is None or s.key[:2] != key[:2]:
++            if s is None:
+                 s = _new_state(view.path, key)
+             elif s.key != key:
+                 s = _rekeyed(s, key)
+             _advance(s, view, me, origin_profile)
+         except BaseException:
+-            _states.pop(view.path, None)
++            _forget_unused_shared()
+             raise
+-        _states[view.path] = s
+-        while len(_states) > 16:
++        _states[slot] = s
++        while len(_states) > _MAX_STATES:
+             _states.pop(next(iter(_states)))
++        _forget_unused_shared()
+         return _emit(s, me, origin_profile, last_ok, stale, fresh, qualified_out=qualified_out,
+                      owners_out=owners_out, seen_out=seen_out, moved_out=moved_out, closed_out=closed_out)
+ 
+ 
++def _forget_unused_shared() -> None:
++    """Caller holds ``_lock``: shared stages live only as long as a state of their replica does."""
++    live = {tag for tag, _me, _profile in _states}
++    for tag in [tag for tag in _shared if tag not in live]:
++        del _shared[tag]
++
++
+ def _hub_stale_after() -> float:
+     from hermes_cli.kanban_session_activity import HUB_STALE_AFTER_S
+     return HUB_STALE_AFTER_S
+@@ -412,5 +475,6 @@ def _emit(s: _State, me: str, origin_profile: str, last_ok, stale: bool, fresh:
+ def reset() -> None:
+     with _lock:
+         _states.clear()
++        _shared.clear()
+     for k in stats:
+         stats[k] = 0
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index f8cedbe4af..2f5f3186f8 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -581,7 +581,11 @@ def _decode_replica_task(record_key: str, data: Any) -> tuple[dict[str, Any], st
+ # delete lowers ``count``: ``_REPLICA_PROBE`` (index-only, ~6 ms) plus the small identity/heartbeat rows is the
+ # whole input. Reused while that key (scope heartbeats as their freshness verdicts at read time), the origin
+ # profile, the stale verdict and every ``synced_at`` are unchanged and wall time has not stepped back.
+-_remote_read_memo: tuple | None = None
++# One memo per (replica path, this gateway, origin profile), most recently written last (replaced whole, never
++# mutated: readers take no lock). A serve answers every profile of its home, and one slot made each profile's read
++# miss behind another's (t_01a1d6d42877f719).
++_remote_read_memo: dict[tuple, tuple] | None = None
++_REMOTE_READ_MEMOS = 16
+ _REPLICA_PROBE = ("SELECT count(*), count(seq), max(seq), total(seq), total(version), total(octet_length(data)) "
+                   "FROM replica WHERE coll = 'tasks'")
+ 
+@@ -623,7 +627,7 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+                 # (release, moved evidence): the owner's per-cycle ``observed_at`` rewrite alone is no new answer.
+                 key = (str(path), me, version_column, _scope_hb.fresh_scopes(_scope_heartbeats(info_rows), now),
+                        offline, probe, get_active_profile_name())
+-            memo = _remote_read_memo
++            memo = (_remote_read_memo or {}).get((key[0], me, key[6])) if key is not None else None
+             # [daveey] ``last_ok`` moves on every hub pull (~2 s) while the task rows rarely do; it reaches the
+             # answer only through the stale verdict and each card's ``synced_at`` (``_replica_synced``), so the
+             # memo compares those instead of ``last_ok`` itself.
+@@ -661,9 +665,14 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+                                         qualified_out=qualified, owners_out=owners, seen_out=seen_at,
+                                         moved_out=moved, closed_out=closed)
+     # Heartbeat cut-offs are the live verdicts in ``key``, hub staleness the ``stale`` check; a clock step back rereads.
+-    _remote_read_memo = (key, now, None, list(cards),
+-                         frozenset(qualified), frozenset(owners), stale, _replica_synced(seen_at, last_ok),
+-                         dict(seen_at), dict(moved), frozenset(closed))
++    memos = dict(_remote_read_memo or {})
++    memos.pop((key[0], me, key[6]), None)
++    memos[(key[0], me, key[6])] = (key, now, None, list(cards),
++                                   frozenset(qualified), frozenset(owners), stale, _replica_synced(seen_at, last_ok),
++                                   dict(seen_at), dict(moved), frozenset(closed))
++    while len(memos) > _REMOTE_READ_MEMOS:
++        del memos[next(iter(memos))]
++    _remote_read_memo = memos
+     if qualified_out is not None:
+         qualified_out.update(qualified)
+     if owners_out is not None:
+diff --git a/tests/hermes_cli/test_kanban_replica_profile_states.py b/tests/hermes_cli/test_kanban_replica_profile_states.py
+new file mode 100644
+index 0000000000..779f075bee
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replica_profile_states.py
+@@ -0,0 +1,155 @@
++"""One process reading the hub replica for several origin profiles keeps a projection state per profile. [daveey]
++
++A Desktop ``serve`` answers every profile of its home: the ``profile=all`` session polls and the annotation
++holder's scopes each read the replica under another active profile. With one state per replica, each profile's read
++discarded the previous profile's state and decoded every row again (18,264 rows, ~1 s of CPU per read on the mini,
++five reads per 2 s holder pass: t_01a1d6d42877f719). Each case alternates profiles over a 12k-row replica, compares
++every live read with the full (explicit ``now``) read of the same profile, and pins the decode counters; nothing
++here measures time.
++"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_replica_projection as projection
++from hermes_cli import kanban_replica_rows as replica_rows
++from hermes_cli import kanban_session_activity as activity
++from tests.hermes_cli import test_kanban_replica_incremental as _incremental
++from tests.hermes_cli.test_kanban_replica_read_memo import card
++
++hub = _incremental.hub
++world = _incremental.world
++N = _incremental.N
++PROFILES = ('default', 'bb-dev', 'bb-replay')
++
++
++@pytest.fixture
++def as_profile(monkeypatch):
++    """Switch the origin profile both readers see (``_read_remote_links`` and ``project`` import it at call time)."""
++    def switch(name):
++        monkeypatch.setattr('hermes_cli.profiles.get_active_profile_name', lambda: name)
++    return switch
++
++
++def _linking(tid, profile, session):
++    t = card(tid)
++    t['sessions'] = [{'gw': 'origin', 'profile': profile, 'session': session, 'rel': 'shepherd'}]
++    return json.dumps(t)
++
++
++def _zero():
++    replica_rows.stats.update(dict.fromkeys(replica_rows.stats, 0))
++    projection.stats.update(dict.fromkeys(projection.stats, 0))
++
++
++def _read(w, as_profile, name):
++    """The live read as ``name``, checked against the full read as ``name``."""
++    as_profile(name)
++    live, full, live_outs, full_outs = w.both()
++    assert live == full and live_outs == full_outs
++    return live
++
++
++def _link_each_profile(w):
++    for n, name in enumerate(PROFILES):
++        w.put(f'work/build/t_p{n}', _linking(f't_p{n}', name, f's_{name}'))
++    w.tick(1001.0)
++
++
++def test_alternating_profiles_decode_each_row_once_and_then_only_the_changed_row(world, as_profile):
++    w, _ = world
++    _link_each_profile(w)
++    _zero()
++    first = {name: _read(w, as_profile, name) for name in PROFILES}
++    # ``default`` decodes all N + 3 rows and keeps whole the N/4 + 1 that link it. ``bb-dev`` decodes those again
++    # (slim, now shared) and its own t_p1; ``bb-replay`` decodes its own t_p2 and t_p1, which ``bb-dev`` keeps whole.
++    own = N // 4 + 1
++    assert projection.stats['projected'] == (N + 3) + (own + 1) + 2
++    assert projection.stats['shared'] == 2 * (N + 3) - (own + 1) - 2
++    for name in PROFILES:
++        assert f's_{name}' in json.dumps(first[name])
++        assert all(f's_{other}' not in json.dumps(first[name]) for other in PROFILES if other != name)
++
++    for round_ in range(3):  # the holder's pass: one replica change, then every profile reads
++        w.put('work/build/t_7', json.dumps(_incremental._task(7, title=f'moved {round_}')))
++        w.tick(1002.0 + round_)
++        _zero()
++        for name in PROFILES:
++            assert _read(w, as_profile, name) == first[name]
++        assert projection.stats['projected'] == 1  # the changed row, once, for all three profiles
++        assert projection.stats['shared'] == len(PROFILES) - 1
++        assert replica_rows.stats['full'] == 0 and replica_rows.stats['delta_rows'] == 1
++
++
++def test_an_unchanged_replica_is_answered_from_each_profiles_memo(world, as_profile):
++    w, _ = world
++    _link_each_profile(w)
++    for name in PROFILES:
++        _read(w, as_profile, name)
++    _zero()
++    for _ in range(2):
++        for name in PROFILES:
++            as_profile(name)
++            activity._read_remote_links(w.path)
++    assert projection.stats == dict.fromkeys(projection.stats, 0)
++    assert replica_rows.stats == dict.fromkeys(replica_rows.stats, 0)
++
++
++def test_a_row_that_starts_and_stops_linking_one_profile_shows_only_there(world, as_profile):
++    w, _ = world
++    before = {name: _read(w, as_profile, name) for name in PROFILES}
++    w.put('work/build/t_9', _linking('t_9', 'bb-dev', 's_dev'))
++    w.tick(1001.0)
++    during = {name: _read(w, as_profile, name) for name in PROFILES}
++    assert during['default'] == before['default'] and during['bb-replay'] == before['bb-replay']
++    assert len(during['bb-dev']) == len(before['bb-dev']) + 1
++    w.put('work/build/t_9', _linking('t_9', 'bb-replay', 's_replay'))
++    w.tick(1002.0)
++    after = {name: _read(w, as_profile, name) for name in PROFILES}
++    assert after['default'] == before['default'] and after['bb-dev'] == before['bb-dev']
++    assert len(after['bb-replay']) == len(before['bb-replay']) + 1
++    w.delete('work/build/t_9')
++    w.tick(1003.0)
++    assert {name: _read(w, as_profile, name) for name in PROFILES} == before
++
++
++def test_a_malformed_row_fails_every_profile_and_recovers_for_every_profile(world, as_profile):
++    w, _ = world
++    before = {name: _read(w, as_profile, name) for name in PROFILES}
++    w.put('work/build/t_11', '{not json')
++    w.tick(1001.0)
++    for name in PROFILES:
++        as_profile(name)
++        with pytest.raises(ValueError):
++            activity._read_remote_links(w.path)
++    w.put('work/build/t_11', json.dumps(_incremental._task(11)))
++    w.tick(1002.0)
++    assert {name: _read(w, as_profile, name) for name in PROFILES} == before
++
++
++def test_states_and_shared_stages_are_bounded_and_leave_with_their_replica(world, as_profile):
++    w, _ = world
++    for i in range(projection._MAX_STATES + 4):
++        as_profile(f'p{i}')
++        activity._read_remote_links(w.path)
++    assert len(projection._states) == projection._MAX_STATES
++    assert len(activity._remote_read_memo) <= activity._REMOTE_READ_MEMOS
++    assert set(projection._shared) == {str(w.path)} and len(projection._shared[str(w.path)]) == N
++    w.delete('work/build/t_3')
++    w.tick(1001.0)
++    activity._read_remote_links(w.path)
++    assert ('owner', 'work/build/t_3') not in projection._shared[str(w.path)]
++    with projection._lock:
++        projection._states.clear()
++        projection._forget_unused_shared()
++    assert projection._shared == {}
++
++
++def test_deleted_shared_rows_leave_even_when_only_new_scopes_read(world, as_profile):
++    w, _ = world
++    for i in range(projection._MAX_STATES + 2):
++        as_profile(f'new{i}')
++        activity._read_remote_links(w.path)
++        assert len(projection._shared[str(w.path)]) == N - i
++        w.delete(f'work/build/t_{i}')
++        w.tick(1001.0 + i)
+-- 
+2.43.0
+

@@ -1,0 +1,103 @@
+From 0324054f569c68ff2edd880af82d0454673fc37d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 19:23:13 +0000
+Subject: [PATCH] fix(tui-gateway): a resumed Desktop row on its provider's own
+ endpoint still moves off a far quota wall [daveey]
+
+Follow-up to PR #2496 (review 5896509169, nit 1). `_resolve_runtime_or_defer_wall` refused the wall
+deferral on `any(overrides.values())`, which counts a persisted `api_mode` and the provider's own native
+`base_url`. The messaging gateway (`gateway/session_worker_construct.route_runtime`) refuses only for a launch
+key or `overrides_endpoint(...)`. A resumed Desktop row without `model_config.model_routing` keeps the
+base_url/api_mode its last turn ran on (e.g. openai-codex + https://chatgpt.com/backend-api/codex +
+codex_responses), so Desktop kept failing every turn on the wall where the gateway would reroute it.
+
+Fix: the Desktop guard uses the gateway's predicate: refuse on the row's api_key or when
+`overrides_endpoint(provider, base_url, config)` (a foreign or unknown endpoint); log the refusal reason
+with `log_not_deferred` like the gateway. On a deferral the row's overrides are cleared, because that
+endpoint and wire belong to the walled route: without the clear, `_resolve_agent_model_runtime` stamps the
+codex base_url/api_mode onto the rerouted runtime (mutation-checked: the new test fails with the clear removed).
+
+Tests (tests/agent/test_walled_default_pin.py):
+- new: a resumed row carrying codex's native base_url + codex_responses builds an AIAgent on Opus with
+  walled_from=Astra, the notice shows, and neither stale value rides along (RED before the fix: the wall raised).
+- refusal controls: the `own endpoint` case still refuses; a new `own key` case (native URL + api_key) refuses.
+---
+ tests/agent/test_walled_default_pin.py | 25 ++++++++++++++++++++++---
+ tui_gateway/agent_factory.py           | 12 ++++++++++--
+ 2 files changed, 32 insertions(+), 5 deletions(-)
+
+diff --git a/tests/agent/test_walled_default_pin.py b/tests/agent/test_walled_default_pin.py
+index df4cc7af38..94b2b96ef5 100644
+--- a/tests/agent/test_walled_default_pin.py
++++ b/tests/agent/test_walled_default_pin.py
+@@ -414,15 +414,34 @@ def test_desktop_session_with_router_picked_astra_builds_on_opus(home):
+     assert (agent.model, agent.provider) == (OPUS, 'anthropic')
+ 
+ 
+-@pytest.mark.parametrize('case', ['explicit switch', 'short wall', 'no session id', 'own endpoint'])
++def test_desktop_row_with_its_providers_native_endpoint_still_moves_off_the_wall(home):
++    """A resumed row keeps the base_url/api_mode its last turn ran on. Codex's own endpoint and wire override
++    nothing, so the Desktop build defers like the messaging gateway (``overrides_endpoint``) and lands on Opus;
++    the row's stale codex wire must not ride along onto the rerouted runtime."""
++    from hermes_cli.auth_constants import DEFAULT_CODEX_BASE_URL
++    from tui_gateway.server import _resolve_agent_model_runtime  # agent_factory binds into the server namespace
++    _legacy_row(home, LEGACY_ECHO)
++    _wall(home, 'openai-codex', ASTRA, 33)
++    row = dict(DESKTOP_ROW, base_url=DEFAULT_CODEX_BASE_URL, api_mode='codex_responses')
++    model, runtime = _resolve_agent_model_runtime(row, None, SID)
++    assert 'quota is out until' in runtime.pop('_fallback_notice'), runtime
++    assert runtime.get('base_url') != DEFAULT_CODEX_BASE_URL and runtime.get('api_mode') != 'codex_responses', runtime
++    agent = _desktop_agent(model, runtime)
++    assert (agent.model, agent.provider) == (OPUS, 'anthropic')
++    assert agent.model_routing['walled_from']['model'] == ASTRA
++
++
++@pytest.mark.parametrize('case', ['explicit switch', 'short wall', 'no session id', 'own endpoint', 'own key'])
+ def test_desktop_wall_still_refuses_when_the_pin_must_not_move(home, case):
+     """Controls: David's own switch, a wall under the reroute threshold, a build with no session identity
+-    (the readiness probe) and a session that overrides its endpoint all keep the refusal."""
++    (the readiness probe) and a session that overrides its endpoint or key all keep the refusal."""
+     from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    from hermes_cli.auth_constants import DEFAULT_CODEX_BASE_URL
+     from tui_gateway.server import _resolve_runtime_or_defer_wall
+     _legacy_row(home, dict(LEGACY_ECHO, reason='explicit-switch') if case == 'explicit switch' else LEGACY_ECHO)
+     _wall(home, 'openai-codex', ASTRA, 2 if case == 'short wall' else 33)
+-    overrides = {'base_url': 'https://proxy.example/v1'} if case == 'own endpoint' else {}
++    overrides = {'own endpoint': {'base_url': 'https://proxy.example/v1'},
++                 'own key': {'base_url': DEFAULT_CODEX_BASE_URL, 'api_key': '***'}}.get(case, {})
+     session = None if case == 'no session id' else SID
+     with pytest.raises(SubscriptionQuotaUnavailable):
+         _resolve_runtime_or_defer_wall({'requested': 'openai-codex', 'target_model': ASTRA}, ASTRA,
+diff --git a/tui_gateway/agent_factory.py b/tui_gateway/agent_factory.py
+index 9a648a01ca..a8a15c651c 100644
+--- a/tui_gateway/agent_factory.py
++++ b/tui_gateway/agent_factory.py
+@@ -541,15 +541,23 @@ def _resolve_runtime_or_defer_wall(resolve_kwargs, model, provider, overrides, s
+     ("Subscription quota unavailable ... gpt-6-astra", 187 times) although claude-opus-5-5 and claude-fable-5-2
+     in the same class were available. The reroute for that case (agent/model_routing_walls.py) was wired into
+     the messaging gateway's pre-build lookup only; this resolver has no session identity, so the wall was
+-    final here. A session's own override of endpoint or key is never deferred, like the gateway's."""
++    final here. A session's own key or foreign endpoint is never deferred; the provider's own base_url and an
++    api_mode a resumed row persisted override nothing (``overrides_endpoint``, the gateway's predicate). On a
++    deferral *overrides* is cleared: the row's endpoint and wire belong to the walled route, not the new one."""
+     from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
+     try:
+         return _resolve_runtime_with_fallback(resolve_kwargs)
+     except SubscriptionQuotaUnavailable as wall:
++        from agent.model_routing_managed import overrides_endpoint
++        from agent.model_routing_walls import log_not_deferred
+         from tui_gateway.class_routing import walled_pin_deferral
+-        deferred = None if any(overrides.values()) else walled_pin_deferral(wall, model, provider, session_id)
++        if overrides.get("api_key") or overrides_endpoint(provider, overrides.get("base_url"), _load_cfg()):
++            log_not_deferred(wall, "key" if overrides.get("api_key") else "endpoint")
++            raise
++        deferred = walled_pin_deferral(wall, model, provider, session_id)
+         if deferred is None:
+             raise
++        overrides.clear()
+         return _RuntimeFallbackResolution(deferred, None, False)
+ 
+ 
+-- 
+2.43.0
+

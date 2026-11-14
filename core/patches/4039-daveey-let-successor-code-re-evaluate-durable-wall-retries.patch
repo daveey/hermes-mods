@@ -1,0 +1,220 @@
+From e7e64cf70e40de16c3f8d7e678d94b5a4c252c42 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:04:11 +0000
+Subject: [PATCH] [daveey] let successor code re-evaluate durable wall retries
+
+A wall failure in the pre-retirement skew window books a reset-time close-out. The replay timer dies with its backend, but the successor inherits the durable deadline without the booking code identity. Retirement-only reset distrust cannot repair that earlier booking.
+
+Stamp long failed-wake deferrals with frozen host-loop code SHA and the existing short deadline. Candidate discovery uses the earlier deadline only for a known different build. Keep legacy/unknown/same-code rows, busy retries, CAS and attempt budgets unchanged; no migration or new replay budget.
+
+Proof: regression fails on baseline at successor discovery; 75 tests across successor/notice/superseded suites and 141 tests in all remaining notice-guarantee importer suites pass. Seven source mutants killed; scripts/check passes. Reverse by reverting this commit.
+---
+ .../test_notice_retry_successor.py            | 112 ++++++++++++++++++
+ tui_gateway/notice_guarantee.py               |  10 +-
+ tui_gateway/notice_retry.py                   |  39 ++++++
+ 3 files changed, 159 insertions(+), 2 deletions(-)
+ create mode 100644 tests/tui_gateway/test_notice_retry_successor.py
+ create mode 100644 tui_gateway/notice_retry.py
+
+diff --git a/tests/tui_gateway/test_notice_retry_successor.py b/tests/tui_gateway/test_notice_retry_successor.py
+new file mode 100644
+index 0000000000..bee71750e5
+--- /dev/null
++++ b/tests/tui_gateway/test_notice_retry_successor.py
+@@ -0,0 +1,112 @@
++"""A pre-retirement wall booking must not strand the successor for days."""
++import json
++
++import pytest
++
++from hermes_cli import host_loop_lease
++from tests.tui_gateway import test_notice_guarantee as helpers
++from tui_gateway import automation_replay as ar
++from tui_gateway import notice_guarantee as ng
++from tui_gateway import notice_retry as nr
++
++
++db = helpers.db
++
++
++def test_successor_recovers_pre_retirement_wall_booking(db, monkeypatch):
++    now = 2_000_000_000.0
++    reset = now + 4 * 86400
++    monkeypatch.setattr(ng.time, "time", lambda: now)
++    monkeypatch.setattr(host_loop_lease, "_core_sha", lambda: "a" * 40)
++    monkeypatch.setattr(host_loop_lease, "host_loops_retired", lambda: None)
++    from tui_gateway import server
++    monkeypatch.setattr(server, "_find_live_session_by_key", lambda sid: (
++        sid, {"agent_failure": {"failure_resets_at": reset}}))
++    row = helpers._notice(db, "done")
++    assert helpers._run(db, verdict="error", now=now)[1] == [(helpers.CHAT, row)]
++    assert tuple(helpers._closeout_meta(db, row)) == ("deferred", reset + ng.DEFER_SLACK_S, 1)
++    short = now + ar.REPLAY_MIN_DELAY_S + ng.DEFER_SLACK_S
++    # Same code (including a same-code process restart) still trusts the wall.
++    assert helpers._run(db, now=short) == ([], [])
++    # The process-local replay is gone; only the stored row survives the handoff.
++    ar.reset()
++    ng._reset_refreshed_for_tests()
++    monkeypatch.setattr(host_loop_lease, "_core_sha", lambda: "b" * 40)
++    assert helpers._run(db, now=short - 1) == ([], [])
++    assert helpers._run(db, now=short)[1] == [(helpers.CHAT, row)]
++    assert helpers._closeout_meta(db, row)[2] == 2
++    assert helpers._run(db, now=reset + 9999) == ([], [])
++
++
++@pytest.mark.parametrize("booking,current", [(None, "b" * 40), ("a" * 40, None),
++                                             ("a" * 40, "a" * 40)])
++def test_unknown_or_same_code_keeps_durable_reset(db, monkeypatch, booking, current):
++    now = 2_000_000_000.0
++    monkeypatch.setattr(ng.time, "time", lambda: now)
++    monkeypatch.setattr(host_loop_lease, "_core_sha", lambda: booking)
++    monkeypatch.setattr(ng, "_retry_at", lambda sid, t: t + 86400)
++    row = helpers._notice(db, "done")
++    helpers._run(db, verdict="error", now=now)
++    monkeypatch.setattr(host_loop_lease, "_core_sha", lambda: current)
++    assert helpers._run(db, now=now + 1000) == ([], [])
++    assert helpers._run(db, now=now + 86400)[1] == [(helpers.CHAT, row)]
++
++
++def test_successor_does_not_shorten_busy_backoff(db, monkeypatch):
++    now = 2_000_000_000.0
++    monkeypatch.setattr(ng.time, "time", lambda: now)
++    monkeypatch.setattr(host_loop_lease, "_core_sha", lambda: "b" * 40)
++    row = helpers._notice(db, "done", closeout={
++        "state": "deferred", "retry_at": now + 3600, "attempts": 5, "busy_attempts": 5})
++    assert helpers._run(db, now=now + 1000) == ([], [])
++    assert helpers._run(db, now=now + 3600)[1] == [(helpers.CHAT, row)]
++
++
++def test_legacy_wall_booking_keeps_deadline(db, monkeypatch):
++    now = 2_000_000_000.0
++    monkeypatch.setattr(ng.time, "time", lambda: now)
++    monkeypatch.setattr(host_loop_lease, "_core_sha", lambda: "b" * 40)
++    row = helpers._notice(db, "done", closeout={
++        "state": "deferred", "retry_at": now + 86400, "attempts": 1})
++    assert helpers._run(db, now=now + 1000) == ([], [])
++    raw = db._read_one("SELECT display_metadata FROM messages WHERE id = ?", (row,))[0]
++    assert json.loads(raw)["closeout"]["retry_at"] == now + 86400
++
++
++@pytest.mark.parametrize("field,value", [
++    ("retry_code_sha", ""), ("retry_code_sha", 7),
++    ("retry_short_at", None), ("retry_short_at", True),
++    ("retry_short_at", "100"), ("retry_short_at", float("nan")),
++    ("retry_short_at", float("inf")), ("retry_at", None),
++    ("retry_at", True), ("retry_at", "200"),
++])
++def test_malformed_provenance_keeps_original(field, value, monkeypatch):
++    monkeypatch.setattr(host_loop_lease, "_core_sha", lambda: "b" * 40)
++    closeout = {"retry_code_sha": "a" * 40, "retry_at": 200, "retry_short_at": 100, field: value}
++    assert nr.effective_due(closeout) == closeout["retry_at"]
++
++
++def test_booking_only_marks_extended_delays_and_never_extends_due(monkeypatch):
++    monkeypatch.setattr(host_loop_lease, "_core_sha", lambda: "a" * 40)
++    assert nr.booking(100, 100) == {}
++    assert nr.booking(99, 100) == {}
++    assert nr.booking(101, 100) == {"retry_code_sha": "a" * 40, "retry_short_at": 100}
++    monkeypatch.setattr(host_loop_lease, "_core_sha", lambda: None)
++    assert nr.booking(101, 100) == {}
++    monkeypatch.setattr(host_loop_lease, "_core_sha", lambda: "b" * 40)
++    assert nr.effective_due({"retry_code_sha": "a" * 40, "retry_at": 50, "retry_short_at": 100}) == 50
++
++
++def test_claim_cas_still_fences_successor_and_new_failure_rebooks(db, monkeypatch):
++    now = 2_000_000_000.0
++    monkeypatch.setattr(ng.time, "time", lambda: now)
++    monkeypatch.setattr(host_loop_lease, "_core_sha", lambda: "b" * 40)
++    monkeypatch.setattr(ng, "_retry_at", lambda sid, t: t + 86400)
++    row = helpers._notice(db, "done", closeout={
++        "state": "deferred", "retry_at": now + 86400, "attempts": 1,
++        "retry_code_sha": "a" * 40, "retry_short_at": now})
++    stale = ng.candidates(db, now)[0]
++    assert helpers._run(db, verdict="error", now=now)[1] == [(helpers.CHAT, row)]
++    assert not ng._claim(db, stale, now)
++    assert helpers._closeout_meta(db, row)[2] == 2
++    assert helpers._run(db, now=now + 1000) == ([], [])
+diff --git a/tui_gateway/notice_guarantee.py b/tui_gateway/notice_guarantee.py
+index a0f317efed..48373d420f 100644
+--- a/tui_gateway/notice_guarantee.py
++++ b/tui_gateway/notice_guarantee.py
+@@ -21,7 +21,9 @@ unloaded sweeper's loop therefore looks, in every profile store, for chats whose
+   reset goes first), at most ``MAX_ATTEMPTS`` wakes per row; the last failure stamps ``error``. The replay's timer
+   dies with its backend and its own failure gives up, so before this a close-out refused by a quota window that a
+   restart (or a still-broken store) outlived was never offered again (two hub chats, 2026-11-10). A deferred row
+-  is durable: any backend's pass picks it up. [daveey]
++  is durable: any backend's pass picks it up. Long wall bookings include the process's frozen code identity:
++  a different-code successor uses the booking's short-delay deadline instead. Same/unknown code and legacy
++  rows keep the wall deadline; discovery still claims with CAS and preserves the attempt budget. [daveey]
+ - a wake that found the chat ``"busy"`` (no live turn, yet admission refused it: a core update's admission hold or
+   drain, a paused turn owed to its restarting backend, an exiting backend's fence) is deferred the same way,
+   ``BUSY_RETRY_S`` doubling up to ``BUSY_RETRY_MAX_S``, at most ``MAX_BUSY_ATTEMPTS`` busy wakes per row (counted in
+@@ -142,7 +144,8 @@ def _deferred_due(meta: dict, now: float) -> bool:
+     closeout = meta.get("closeout")
+     if not isinstance(closeout, dict) or closeout.get("state") != "deferred":
+         return False
+-    retry_at = closeout.get("retry_at")
++    from tui_gateway.notice_retry import effective_due
++    retry_at = effective_due(closeout)
+     return isinstance(retry_at, (int, float)) and not isinstance(retry_at, bool) and retry_at <= now
+ 
+ 
+@@ -321,7 +324,10 @@ def _closeout_job(session_db, wake, sid: str, msg_id: int, attempts: int = 1,
+         elif verdict == "error" and attempts - busy_attempts < MAX_ATTEMPTS:
+             now = time.time()
+             try:
++                from tui_gateway.automation_replay import replay_due
++                from tui_gateway.notice_retry import booking
+                 extra = {"retry_at": float((retry_at or _retry_at)(sid, now)), "attempts": attempts}
++                extra.update(booking(extra["retry_at"], replay_due(now) + DEFER_SLACK_S))
+                 verdict = "deferred"
+             except Exception:
+                 logger.warning("notice close-out of %s: no retry time; stamped error", sid, exc_info=True)
+diff --git a/tui_gateway/notice_retry.py b/tui_gateway/notice_retry.py
+new file mode 100644
+index 0000000000..2d22efa434
+--- /dev/null
++++ b/tui_gateway/notice_retry.py
+@@ -0,0 +1,39 @@
++"""Code provenance for durable failed-wake deadlines, not busy backoff."""
++from __future__ import annotations
++
++import math
++from typing import Any
++
++
++def booking(due: float, short_due: float) -> dict:
++    """Keep the wall deadline on this code, but let a different build retry sooner.
++
++    Host-loop identity is frozen before its code-skew watchdog can see an update;
++    reading the checkout here would incorrectly attribute an old process to new code.
++    """
++    from hermes_cli.host_loop_lease import _core_sha
++    sha = _core_sha()
++    if sha and due > short_due:
++        return {"retry_code_sha": sha, "retry_short_at": short_due}
++    return {}
++
++
++def effective_due(closeout: dict) -> Any:
++    """Read-only eligibility; the existing close-out CAS still owns the actual wake.
++
++    Legacy/unknown provenance keeps the original deadline. The short deadline is
++    fixed at booking, so repeated discovery does not postpone it forever.
++    """
++    due = closeout.get("retry_at")
++    sha = closeout.get("retry_code_sha")
++    short = closeout.get("retry_short_at")
++    if not isinstance(sha, str) or not sha:
++        return due
++    if not all(isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t)
++               for t in (due, short)):
++        return due
++    from hermes_cli.host_loop_lease import _core_sha
++    current = _core_sha()
++    if current and current != sha:
++        return min(due, short)
++    return due
+-- 
+2.43.0
+

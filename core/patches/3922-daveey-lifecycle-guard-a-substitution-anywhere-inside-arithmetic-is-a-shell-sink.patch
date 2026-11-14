@@ -1,0 +1,358 @@
+From d9e85d65e6e375b3408ca0c97107ae68e97c7ca2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:47:23 +0000
+Subject: [PATCH] [daveey] lifecycle guard: a substitution anywhere inside
+ arithmetic is a shell sink
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`output_reaches_shell` counted a `$(` as a sink only in command position
+(after `^ ; & | ( { \n then do else`). Inside arithmetic bash evaluates the
+text recursively and an array subscript in it runs command substitutions, so a
+substitution's OUTPUT is shell code wherever it sits:
+
+    a=(1); x=$(( 1 + $(echo 'a[$(echo RAN >&2)]') ))    # prints RAN
+
+On main `x=$(( 1 + $(echo 'a[$(bash BIG)]') ))` was sink=False and
+scan_gateway_lifecycle allowed it with BIG over the scan cap (t_01a1d6ae05c19594).
+PR #2626's `$(date +%s)` exemption also opened the date-prefixed shapes
+`x=$(( $(date +%s) + $(echo 'a[$(bash BIG)]') ))` and
+`(( $(date +%s) > $(echo …) ))` (review 5898137039), which main had refused
+only through the accidental `(` anchor.
+
+Fix: tools/shell_arith_sink.py, a small linear tokenizer (quotes, comments,
+nested `$(`/`(`/`${` frames) that reports a `$(` whose nearest enclosing
+context is arithmetic: `$(( ))`, `(( ))`/`for ((`, `$[ ]`, `let`,
+`[[ … -eq|-ne|-lt|-le|-gt|-ge … ]]`, an array subscript (`a[…]=`,
+`${a[…]}`), a `${x:offset:length}` substring, and (coarsely) any
+`declare/local/typeset/readonly/export -i`. `$(date +%s)` stays exempt unless
+the command can rebind `date`. `[ … -eq … ]`/`test` are not arithmetic (bash
+5.2 reports "integer expression expected") and stay out, so the t_01a1d67ff0075752
+watcher (`deadline=$(( $(date +%s) + 2700 ))`, `[ "$(date +%s)" -lt … ]`, big-log
+greps) still passes. Anything the scanner cannot match only widens the
+arithmetic region, so a miss fails closed.
+
+Every new sink shape was checked in real bash 5.2.21 (RAN printed).
+Out of scope, unchanged: a substitution stored in a variable and evaluated
+later (`v=$(…); (( v ))`); the guard does not track data flow through
+variables (`v=$(…); $v` is the same class).
+
+Tests: tests/cron/test_lifecycle_guard_arith_sink.py gains 22 must-sink shapes
+(each also refused end to end with BIG over the cap), 16 must-not-sink shapes
+and a mixed big-log case. RED on origin/main 2c34b9880a: 23 failed, 80 passed.
+GREEN with the fix: 103 passed.
+---
+ tests/cron/test_lifecycle_guard_arith_sink.py |  63 ++++++
+ tools/shell_arith_sink.py                     | 190 ++++++++++++++++++
+ tools/shell_heredoc.py                        |  12 +-
+ 3 files changed, 262 insertions(+), 3 deletions(-)
+ create mode 100644 tools/shell_arith_sink.py
+
+diff --git a/tests/cron/test_lifecycle_guard_arith_sink.py b/tests/cron/test_lifecycle_guard_arith_sink.py
+index 43ad1b0d29..a0e519f6af 100644
+--- a/tests/cron/test_lifecycle_guard_arith_sink.py
++++ b/tests/cron/test_lifecycle_guard_arith_sink.py
+@@ -172,3 +172,66 @@ def test_executed_file_over_the_cap_still_fails_closed(tmp_path, command):
+     unsafe, refusal = scan_gateway_lifecycle(command.replace("{big}", str(big)), cwd=str(tmp_path))
+     assert unsafe
+     assert refusal and "larger than the scan cap" in refusal
++
++
++# t_01a1d6ae05c19594: inside arithmetic bash runs code from a substitution's output wherever the
++# substitution sits, not only right after `((`. Real bash 5.2 prints RAN for each shape with
++# P='a[$(echo RAN >&2)]' standing in for the payload (the `let` shape unquoted only word-splits
++# it; quoted, it runs). The date-prefixed shapes are from review 5898137039: the `$(date +%s)`
++# exemption removed the accidental first anchor main matched on.
++_OPERATOR_PRECEDED = [
++    "x=$(( 1 + $(echo 'a[$(bash {big})]') ))",
++    "x=$(( $(date +%s) + $(echo 'a[$(bash {big})]') ))",
++    "(( $(date +%s) > $(echo 'a[$(bash {big})]') ))",
++    "(( 1 > $(echo 'a[$(bash {big})]') ))",
++    "x=$((1+$(echo 'a[$(bash {big})]')))",
++    "echo \"$(( 1 + $(echo 'a[$(bash {big})]') ))\"",
++    "let x=$(echo 'a[$(bash {big})]')",
++    "let \"x=$(echo 'a[$(bash {big})]')\"",
++    "true; let x=1+$(echo 'a[$(bash {big})]')",
++    "a=(1); b[$(echo 'a[$(bash {big})]')]=1",
++    "echo ${a[$(echo 'a[$(bash {big})]')]}",
++    "echo \"${a[1 + $(echo 'a[$(bash {big})]')]}\"",
++    "s=abc; echo ${s:$(echo 'a[$(bash {big})]')}",
++    "s=abc; echo ${s:1:$(echo 'a[$(bash {big})]')}",
++    "[[ $(echo 'a[$(bash {big})]') -eq 1 ]]",
++    "[[ 1 -lt \"$(echo 'a[$(bash {big})]')\" ]]",
++    "echo $[ 1 + $(echo 'a[$(bash {big})]') ]",
++    "for (( i=$(echo 'a[$(bash {big})]'); i<1; i++ )); do :; done",
++    "declare -i x; x=$(echo 'a[$(bash {big})]')",
++    "f() { local -i y=$(echo 'a[$(bash {big})]'); }; f",
++    "x=$(( a[$(echo 'a[$(bash {big})]')] ))",
++    "x=$(( 1 + (2 * $(echo 'a[$(bash {big})]')) ))",
++]
++
++
++@pytest.mark.parametrize("shape", _OPERATOR_PRECEDED)
++def test_substitution_anywhere_in_arithmetic_is_a_sink(tmp_path, shape):
++    command = shape.replace("{big}", str(_big_log(tmp_path)))
++    assert output_reaches_shell(command)
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe
++    assert refusal and "larger than the scan cap" in refusal
++
++
++# Not arithmetic, or only the exempt producer in it: no sink, so reads of an over-cap log pass.
++@pytest.mark.parametrize("text", [
++    "n=$(( 1 + 2 ))", "x=$(( $(date +%s) + 2700 ))", "(( $(date +%s) > 1 ))",
++    "while [ \"$(date +%s)\" -lt \"$d\" ]; do :; done", "test \"$(y)\" -eq 1",
++    "[[ $(y) == z ]]", "x=${y:-$(z)}", "x=${y:=$(z)}", "echo \"a[$(y)]\"",
++    "echo '$(( 1 + $(y) ))'", "# (( 1 + $(y) ))\necho ok", "echo \"$(git -C x rev-parse HEAD)\"",
++    "echo $(( 1 + 2 )) \"$(y)\"", "a=(1 2); echo \"${a[1]}\" \"$(y)\"", "let x=1; echo \"$(y)\"",
++    "(( n += 1 )); echo \"$(y)\"",
++])
++def test_substitution_outside_arithmetic_is_no_sink(text):
++    assert not output_reaches_shell(text)
++
++
++def test_operator_preceded_shape_reading_a_big_log_fails_closed(tmp_path):
++    """The read-only big-log pass above must not hide a real arithmetic sink in the same text."""
++    log = _big_log(tmp_path)
++    command = ("x=$(( $(date +%s) + 1 ))\n" + _READERS["grep"].replace("{log}", str(log))
++               + f"y=$(( 1 + $(echo 'a[$(bash {log})]') ))\n")
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe
++    assert refusal and "larger than the scan cap" in refusal
+diff --git a/tools/shell_arith_sink.py b/tools/shell_arith_sink.py
+new file mode 100644
+index 0000000000..cc3131aae6
+--- /dev/null
++++ b/tools/shell_arith_sink.py
+@@ -0,0 +1,190 @@
++"""Find a ``$(…)`` substitution that sits inside a bash arithmetic context.
++
++Bash evaluates arithmetic text recursively, and an array subscript in it runs command
++substitutions, so a substitution's OUTPUT inside arithmetic is shell code wherever the
++substitution sits: ``x=$(( 1 + $(echo 'a[$(bash F)]') ))`` runs ``bash F``
++(t_01a1d6ae05c19594). Arithmetic contexts covered: ``$(( ))``, ``(( ))`` (``for ((``
++too), ``$[ ]``, ``let``, ``[[ … -eq … ]]`` (any of the six integer operators), an array
++subscript (``a[…]=``, ``${a[…]}``), a ``${x:offset:length}`` substring, and any
++``declare/local/typeset/readonly/export -i`` integer assignment (coarse: any substitution
++then counts). ``[ … -eq … ]``/``test`` are not arithmetic and stay out.
++
++The scan is a small linear tokenizer, not a parser: quotes and comments are honoured, and
++whatever it cannot match (an unclosed frame, a stray paren) only widens the arithmetic
++region, so a mistake fails closed (a false sink only makes the lifecycle walk scan more).
++"""
++
++from __future__ import annotations
++
++import bisect
++import re
++
++# `$(date +%s)` prints only digits: the one producer whose output arithmetic may hold.
++DATE_PRODUCER_BODY = r"""[ \t]*date[ \t]+(?:\+%s|'\+%s'|"\+%s")[ \t]*\)"""
++_DATE_PRODUCER_RE = re.compile(DATE_PRODUCER_BODY)
++
++_TOKENS = (r"\\.|'|\"|`|\$\(\(|\$\(|\$\[|\$\{|\(\(|\(|\)|\[\[|\]\]|\[|\]|\}|#"
++           r"|(?<![\w.$/-])let[ \t]+")
++_TOKEN_RE = re.compile(_TOKENS, re.DOTALL)
++# Inside `let` the list operators end the arithmetic too; elsewhere skipping them keeps the scan
++# of a long script fast.
++_LET_TOKEN_RE = re.compile(_TOKENS + r"|[;&|\n]", re.DOTALL)
++_INT_OPERATOR_RE = re.compile(r"(?<![\w-])-(?:eq|ne|lt|le|gt|ge)(?![\w-])")
++_INTEGER_DECLARATION_RE = re.compile(
++    r"(?<![\w.-])(?:declare|typeset|local|readonly|export)(?:[ \t]+[-+][A-Za-z]+)*"
++    r"[ \t]+-[A-Za-z]*i")
++_PARAM_NAME_RE = re.compile(r"[#!]?(?:[A-Za-z_]\w*|\d+|[@*#?$!-])")
++_COMMENT_PRECEDERS = frozenset(" \t\n;&|(")
++
++# Frame kinds. A frame is [kind, closer, depth, in_double_quotes].
++_CMD, _ARITH, _PARAM = "cmd", "arith", "param"
++
++
++def substitution_in_arithmetic(command: str, *, date_exempt: bool) -> bool:
++    """Whether *command* holds a ``$(`` (not the exempt ``$(date +%s)`` when *date_exempt*)
++    whose nearest enclosing context is arithmetic."""
++    if "$(" not in command:
++        return False
++    if _INTEGER_DECLARATION_RE.search(command):
++        return True
++    closes = [m.start() for m in re.finditer(r"\]\]", command)]
++    operators = [m.start() for m in _INT_OPERATOR_RE.finditer(command)]
++    stack: list[list] = [[_CMD, None, 0, False]]
++    pos, end = 0, len(command)
++    while pos < end:
++        tokens = _LET_TOKEN_RE if stack[-1][1] == "let" else _TOKEN_RE
++        match = tokens.search(command, pos)
++        if match is None:
++            break
++        token, start = match.group(), match.start()
++        pos = match.end()
++        top = stack[-1]
++        kind, quoted = top[0], top[3]
++        if token[0] == "\\" or token == "`":
++            continue
++        if token == '"':
++            top[3] = not quoted
++            continue
++        if token == "'":
++            if not quoted:
++                close = command.find("'", pos)
++                pos = end if close == -1 else close + 1
++            continue
++        if token == "$((":
++            stack.append([_ARITH, "))", 0, False])
++            continue
++        if token == "$(":
++            if kind == _ARITH and not (
++                    date_exempt and _DATE_PRODUCER_RE.match(command, pos)):
++                return True
++            stack.append([_CMD, ")", 0, False])
++            continue
++        if token == "$[":
++            stack.append([_ARITH, "]", 0, False])
++            continue
++        if token == "${":
++            pos = _open_parameter(command, pos, stack)
++            continue
++        if quoted:
++            continue  # inside "…" only expansions (handled above) matter
++        if kind == _CMD:
++            pos = _cmd_token(command, token, start, pos, stack, closes, operators)
++        elif kind == _ARITH:
++            pos = _arith_token(command, token, pos, stack)
++        elif token == "}":  # _PARAM
++            stack.pop()
++        elif token == "#" or token.startswith("let"):
++            continue
++        elif token in (")", "]", "]]") and len(stack) > 1:
++            stack.pop()  # a parameter frame never closes on these: recover outward
++            pos = start
++    return False
++
++
++def _open_parameter(command: str, pos: int, stack: list[list]) -> int:
++    """Push the frame for a ``${`` opened before *pos*; return where scanning resumes."""
++    name = _PARAM_NAME_RE.match(command, pos)
++    after = name.end() if name else pos
++    stack.append([_PARAM, "}", 0, False])
++    return _after_parameter_name(command, after, stack)
++
++
++def _after_parameter_name(command: str, pos: int, stack: list[list]) -> int:
++    """At the end of a ``${name`` (or of its ``[subscript]``): a subscript or a substring
++    offset is arithmetic."""
++    following = command[pos:pos + 2]
++    if following[:1] == "[":
++        stack.append([_ARITH, "]", 0, False])
++        return pos + 1
++    if following[:1] == ":" and following[1:2] not in ("-", "=", "+", "?"):
++        stack[-1] = [_ARITH, "}", 0, False]
++        return pos + 1
++    return pos
++
++
++def _cmd_token(command, token, start, pos, stack, closes, operators) -> int:
++    if token == "#":
++        if start == 0 or command[start - 1] in _COMMENT_PRECEDERS:
++            newline = command.find("\n", pos)
++            return len(command) if newline == -1 else newline
++        return pos
++    if token.startswith("let"):
++        stack.append([_ARITH, "let", 0, False])
++        return pos
++    if token == "((":
++        stack.append([_ARITH, "))", 0, False])
++        return pos
++    if token == "(":
++        stack.append([_CMD, ")", 0, False])
++        return pos
++    if token == ")":
++        if len(stack) > 1:
++            stack.pop()
++        return pos
++    if token == "[[":
++        index = bisect.bisect_left(closes, pos)
++        close = closes[index] if index < len(closes) else len(command)
++        operator = bisect.bisect_left(operators, pos)
++        if operator < len(operators) and operators[operator] < close:
++            stack.append([_ARITH, "]]", 0, False])
++        return pos
++    if token == "[" and start > 0 and (command[start - 1].isalnum() or command[start - 1] == "_"):
++        stack.append([_ARITH, "]", 0, False])  # `a[…]=` subscript
++    return pos
++
++
++def _arith_token(command, token, pos, stack) -> int:
++    top = stack[-1]
++    closer = top[1]
++    if closer == "let" and (token in (";", "&", "|", "\n") or (token == ")" and not top[2])):
++        stack.pop()
++        return pos - len(token)  # the list operator / paren belongs to the outer frame
++    if token in ("(", "(("):
++        top[2] += len(token)
++        return pos
++    if token == ")":
++        if top[2]:
++            top[2] -= 1
++        elif closer in ("))", ")"):
++            stack.pop()
++            if closer == "))" and command.startswith(")", pos):
++                pos += 1
++        return pos
++    if token in ("[", "[["):
++        for _ in token:
++            stack.append([_ARITH, "]", 0, False])
++        return pos
++    if token in ("]", "]]"):
++        if token == "]]" and closer == "]]":
++            stack.pop()
++            return pos
++        for _ in token:
++            if stack[-1][0] != _ARITH or stack[-1][1] != "]":
++                break
++            stack.pop()
++            if stack[-1][0] == _PARAM:
++                pos = _after_parameter_name(command, pos, stack)
++        return pos
++    if token == "}" and closer == "}":
++        stack.pop()
++    return pos
+diff --git a/tools/shell_heredoc.py b/tools/shell_heredoc.py
+index 27659752f0..ad5ae08381 100644
+--- a/tools/shell_heredoc.py
++++ b/tools/shell_heredoc.py
+@@ -16,6 +16,8 @@ from __future__ import annotations
+ import re
+ import shlex
+ 
++from tools.shell_arith_sink import DATE_PRODUCER_BODY, substitution_in_arithmetic
++
+ # Non-shell interpreters whose quoted heredoc bodies are data for THAT interpreter, judged on the
+ # command the owner actually runs: VAR=... assignments and stdin-passing wrappers (``timeout 20``,
+ # ``nice``, ``env VAR=1``, ``command``) are peeled, a path prefix is allowed, positional arguments
+@@ -500,7 +502,7 @@ _SHELL_SINK_TEMPLATE = (
+ # position (t_01a1d67ff0075752). Only this producer is exempt: inside `$((`/`((` bash still runs
+ # code from other substitutions' output (`a[$(cmd)]` subscripts, `((` falling back to nested
+ # subshells; review 5897778680).
+-_NUMERIC_PRODUCER = r"""(?![ \t]*date[ \t]+(?:\+%s|'\+%s'|"\+%s")[ \t]*\))"""
++_NUMERIC_PRODUCER = rf"(?!{DATE_PRODUCER_BODY})"
+ _SHELL_SINK_RE = re.compile(_SHELL_SINK_TEMPLATE + r"|`)", re.MULTILINE)
+ _SHELL_SINK_NUMERIC_RE = re.compile(_SHELL_SINK_TEMPLATE + _NUMERIC_PRODUCER + r"|`)", re.MULTILINE)
+ # What could make `date` something other than the date binary: a function or alias of that name,
+@@ -521,8 +523,12 @@ def output_reaches_shell(command: str) -> bool:
+     shell, so ``| grep bash`` / ``| grep -c bash`` count as sinks too: telling a wrapper's operand
+     from a filter's pattern needs a per-command grammar, and the false sink only fails closed
+     (review 5890784121 nit 3; ``| grep bash.sh`` is no sink only because of the word end)."""
+-    sink = _SHELL_SINK_RE if _DATE_REBIND_RE.search(command) else _SHELL_SINK_NUMERIC_RE
+-    return sink.search(command) is not None
++    date_exempt = not _DATE_REBIND_RE.search(command)
++    sink = _SHELL_SINK_NUMERIC_RE if date_exempt else _SHELL_SINK_RE
++    # The regex sees a substitution only in command position; inside arithmetic bash also runs
++    # code from its output wherever it sits (`$(( 1 + $(…) ))`, `a[$(…)]`; t_01a1d6ae05c19594).
++    return (sink.search(command) is not None
++            or substitution_in_arithmetic(command, date_exempt=date_exempt))
+ 
+ 
+ def _nonreading_shell_unit(unit: str, functions: set[str]) -> bool:
+-- 
+2.43.0
+

@@ -1,0 +1,1172 @@
+From 622dc84f90be7fdf265394e9879090cfd3481dd1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:22:18 +0000
+Subject: [PATCH] tui_gateway: watch signatures and the kanban poll read only
+ on change (card J part 2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Design t_01a1d563324d7e8e §3 card J (serve change_watcher + notification poller 2.0 -> 0.7% of a core; the
+gateway's change_watcher runs the same code). py-spy of hub serve 251687 (120 s @ 40 Hz): change watcher 107
+samples (groups 43, sessions 36, skills 27), kanban poll 38 (subscription rows 24).
+
+- tui_gateway/watch_store.py (new): one kept read-only tracked connection per store, keyed on file identity +
+  PRAGMA data_version (exact per commit; no racy-mtime window). Bounded LRU (32), dropped on replace, on a missing
+  file (forget) and on a transaction a caller left open.
+- change_watcher: _db_content_sig (groups) and _session_db_content_sig (sessions) read through it. An unchanged
+  store is one PRAGMA; before, every DB/WAL mtime move opened a tracked connection, parsed the schema and closed
+  it. The legacy digest throttle keeps its trailing edge (cached key stays stale while held back). Store paths
+  resolve once per (dev, ino) instead of an lstat walk per pass.
+- skills: published_scopes_signature walks each skill root once per call (memo shared across scopes).
+- notification_idle._notify_content: the tui subscription rows (2.1k on the hub, 3 ms) are reused while the
+  kanban activity revision covering kanban_notify_subs and the in-flight marks (the one bookkeeping column the
+  poll acts on) are unchanged; read in one snapshot with the event scan. Without trigger coverage the rows are
+  read on every commit, as before. A chat with a claim in flight is still polled every tick (the due input).
+- kanban_activity_revision.covered_revision: public wrapper of the memoised coverage read.
+
+Replay benches (thread_time, hub stream: state.db committed on 92 of 120 passes; main board 92 commits/min,
+activity revision 9/min): store signatures 0.075% of a core (base 0.77-0.90%, budget 0.15%); subscription
+signature 0.17-0.19% (base 0.63-0.66%, budget 0.3%). RED on base 0fa1a455fd: 7 of 19 new tests.
+---
+ agent/skill_commands.py                       |  12 +-
+ hermes_cli/kanban_activity_revision.py        |   8 +
+ tests/agent/test_skills_scope_memo.py         |  65 ++++++
+ .../tui_gateway/test_change_watcher_groups.py |  18 +-
+ .../test_change_watcher_sessions.py           |   6 +-
+ tests/tui_gateway/test_notify_subs_gate.py    | 198 ++++++++++++++++++
+ .../test_session_projection_revision.py       |  22 +-
+ tests/tui_gateway/test_watch_store_gate.py    | 183 ++++++++++++++++
+ tools/skills_tool.py                          |  15 +-
+ tui_gateway/change_watcher.py                 | 175 ++++++++--------
+ tui_gateway/notification_idle.py              |  53 +++--
+ tui_gateway/watch_store.py                    |  98 +++++++++
+ 12 files changed, 725 insertions(+), 128 deletions(-)
+ create mode 100644 tests/agent/test_skills_scope_memo.py
+ create mode 100644 tests/tui_gateway/test_notify_subs_gate.py
+ create mode 100644 tests/tui_gateway/test_watch_store_gate.py
+ create mode 100644 tui_gateway/watch_store.py
+
+diff --git a/agent/skill_commands.py b/agent/skill_commands.py
+index 4853bbac3b..dbe6d6ecbc 100644
+--- a/agent/skill_commands.py
++++ b/agent/skill_commands.py
+@@ -602,29 +602,31 @@ def published_scopes_signature() -> tuple:
+     with _publish_lock:
+         keys = list(_skill_commands_by_key)
+     scopes = sorted({(home, project) for _platform, home, project in keys if home})[:_MAX_WATCHED_SCOPES]
+-    rows = [("", None, _skill_dirs_signature())]
++    memo: dict = {}  # one walk per root per call: scopes share most of their roots
++    rows = [("", None, _skill_dirs_signature(memo))]
+     for home, project in scopes:
+         home_token = set_hermes_home_override(home)
+         # No project: an empty session cwd would fall back to the process cwd; "/" resolves no repo.
+         cwd_token = set_session_cwd(project or os.path.sep)
+         try:
+-            rows.append((home, project, _skill_dirs_signature()))
++            rows.append((home, project, _skill_dirs_signature(memo)))
+         finally:
+             reset_session_cwd(cwd_token)
+             reset_hermes_home_override(home_token)
+     return tuple(rows)
+ 
+ 
+-def _skill_dirs_signature() -> Optional[tuple]:
++def _skill_dirs_signature(memo: Optional[dict] = None) -> Optional[tuple]:
+     """Stat-cheap change signature of every skill root (the catalog's own: the mtime and child names of
+     every directory the catalog walks, depth-bounded, plus the disabled set and the platform). None when
+     it cannot be computed (a root that cannot be stat'ed), which keeps the published map rather than
+     rescanning on every lookup. Any other error raises: the catalog scan itself takes the same signature
+-    unguarded (``tools.skills_tool._skill_catalog``), and a swallowed bug would pin a stale map silently."""
++    unguarded (``tools.skills_tool._skill_catalog``), and a swallowed bug would pin a stale map silently.
++    ``memo`` shares root walks within one ``published_scopes_signature`` call."""
+     from tools.skills_tool import _get_disabled_skill_names, skill_search_dirs, _skills_scan_signature
+     try:
+         roots, _active = skill_search_dirs()
+-        return _skills_scan_signature([d for _tier, d in roots], _get_disabled_skill_names())
++        return _skills_scan_signature([d for _tier, d in roots], _get_disabled_skill_names(), memo)
+     except OSError:
+         logger.debug("Skill dir signature failed", exc_info=True)
+         return None
+diff --git a/hermes_cli/kanban_activity_revision.py b/hermes_cli/kanban_activity_revision.py
+index e63d7cc596..a60ebd7f64 100644
+--- a/hermes_cli/kanban_activity_revision.py
++++ b/hermes_cli/kanban_activity_revision.py
+@@ -321,3 +321,11 @@ def _content_key(path: Path, tables: Iterable[str], open_ro: Callable) -> tuple:
+ 
+ def is_revision(key: tuple) -> bool:
+     return bool(key) and key[0] == "revision"
++
++
++def covered_revision(conn: sqlite3.Connection, path: Path, ident: tuple, tables: Iterable[str]) -> tuple | None:
++    """``(revision, schema_version)`` on ``conn`` when the counter covers every one of ``tables``, else None (an
++    older writer dropped the triggers: the caller reads the rows). ``ident`` is the file's (dev, ino); a matching
++    ``schema_version`` reuses the coverage proof, so the warm path is one statement. Must run outside a
++    transaction (a miss opens its own snapshot). Raises ``sqlite3.Error`` like any read."""
++    return _covered_read(conn, path, tuple(ident), tuple(tables))
+diff --git a/tests/agent/test_skills_scope_memo.py b/tests/agent/test_skills_scope_memo.py
+new file mode 100644
+index 0000000000..8b8670b7c6
+--- /dev/null
++++ b/tests/agent/test_skills_scope_memo.py
+@@ -0,0 +1,65 @@
++"""[daveey] Card J (t_01a1d563324d7e8e): ``skills.changed`` walks each skill root once per watch pass.
++
++``published_scopes_signature`` signs the ambient scope plus every profile/repo scope a session resolved commands
++in. Most scopes share their roots (the install's bundled and external skill dirs), and each scope walked them
++again: on the hub that was most of the ``skills.changed`` watch. The walk of a root is now shared within one call;
++a change under any root still moves the next call's signature.
++"""
++import os
++
++import pytest
++
++from agent import skill_commands
++from tools import skills_tool
++
++
++@pytest.fixture
++def scopes(tmp_path, monkeypatch):
++    from hermes_constants import get_hermes_home
++    shared = tmp_path / "shared-skills"
++    (shared / "alpha").mkdir(parents=True)
++    homes = [tmp_path / f"home{n}" for n in range(3)]
++    for home in homes:
++        (home / "skills").mkdir(parents=True)
++    monkeypatch.setattr(skills_tool, "skill_search_dirs",
++                        lambda: ([("external", shared), ("profile", get_hermes_home() / "skills")], None))
++    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
++    monkeypatch.setattr(skill_commands, "_skill_commands_by_key",
++                        {("tui", str(home), None): {} for home in homes})
++    walks: list = []
++    real = skills_tool._dir_tree_signature
++
++    def counted(root, sig, *args, **kwargs):
++        walks.append(str(root))
++        return real(root, sig, *args, **kwargs)
++
++    monkeypatch.setattr(skills_tool, "_dir_tree_signature", counted)
++    return shared, homes, walks
++
++
++def test_a_shared_root_is_walked_once_per_call(scopes):
++    shared, homes, walks = scopes
++    skill_commands.published_scopes_signature()
++    assert walks.count(str(shared)) == 1, walks
++    for home in homes:
++        assert walks.count(str(home / "skills")) == 1
++
++
++def test_a_change_under_a_shared_or_scoped_root_moves_the_next_signature(scopes):
++    shared, homes, _walks = scopes
++    before = skill_commands.published_scopes_signature()
++    (shared / "beta").mkdir()
++    moved = skill_commands.published_scopes_signature()
++    assert moved != before
++    (homes[2] / "skills" / "gamma").mkdir()
++    assert skill_commands.published_scopes_signature() != moved
++    os.rmdir(homes[2] / "skills" / "gamma")
++    os.rmdir(shared / "beta")
++
++
++def test_scope_rows_are_unchanged_by_the_memo(scopes):
++    """Each scope's row is the same signature an unshared walk gives."""
++    shared, homes, _walks = scopes
++    rows = skill_commands.published_scopes_signature()
++    fresh = skills_tool._skills_scan_signature([shared, homes[0] / "skills"], set())
++    assert any(row[2] == fresh for row in rows if row[0] == str(homes[0]))
+diff --git a/tests/tui_gateway/test_change_watcher_groups.py b/tests/tui_gateway/test_change_watcher_groups.py
+index 451a31aee9..0ace2a3d2b 100644
+--- a/tests/tui_gateway/test_change_watcher_groups.py
++++ b/tests/tui_gateway/test_change_watcher_groups.py
+@@ -311,12 +311,13 @@ def test_a_failed_read_keeps_a_good_answer_but_not_a_fallback(tmp_path, monkeypa
+     would broadcast twice), but after a fallback a newer fallback replaces it, so an unreadable store that keeps
+     moving still moves its signature (main's sessions digest rule)."""
+     db = tmp_path / "state.db"
+-    db.write_bytes(b"")
+-    cache, mtimes, answers = {}, iter((1, 2, 3, 4)), iter(("good", RuntimeError("busy")))
++    with sqlite3.connect(db) as writer:
++        writer.execute("CREATE TABLE t(v)")
++    cache, mtimes, answers, reads = {}, iter((3, 4)), iter(("good", RuntimeError("busy"))), []
+     monkeypatch.setattr(server, "_newest_mtime_ns", lambda _paths: next(mtimes))
+-    monkeypatch.setattr(server, "_settled_mtime", lambda mtime: mtime)
+ 
+-    def read(_conn, _mtime):
++    def read(_conn, _key):
++        reads.append(1)
+         answer = next(answers, RuntimeError("busy"))
+         if isinstance(answer, Exception):
+             raise answer
+@@ -325,9 +326,16 @@ def test_a_failed_read_keeps_a_good_answer_but_not_a_fallback(tmp_path, monkeypa
+     def sig():
+         return server._db_content_sig(db, cache, read, fallback=lambda mtime: ("fallback", mtime))
+ 
++    def commit():
++        with sqlite3.connect(db) as writer:
++            writer.execute("INSERT INTO t VALUES (1)")
++
+     assert sig() == "good"
++    assert sig() == "good" and len(reads) == 1, "no commit: no read"
++    commit()
+     assert sig() == "good", "a busy read after a good answer keeps it"
+-    cache[str(db)] = (2, ("fallback", 2), True)
++    assert sig() == "good" and len(reads) == 3, "and leaves the key stale: the next pass reads again"
++    cache[str(db)] = (object(), ("fallback", 2), True)
+     assert sig() == ("fallback", 3)
+     assert sig() == ("fallback", 4), "after a fallback, a newer one replaces it"
+ 
+diff --git a/tests/tui_gateway/test_change_watcher_sessions.py b/tests/tui_gateway/test_change_watcher_sessions.py
+index d1975bbf52..39553946bd 100644
+--- a/tests/tui_gateway/test_change_watcher_sessions.py
++++ b/tests/tui_gateway/test_change_watcher_sessions.py
+@@ -99,10 +99,8 @@ def test_busy_db_is_not_redigested_more_often_than_min_interval(tmp_path, monkey
+     clock = [1000.0]
+     monkeypatch.setattr(server.time, "monotonic", lambda: clock[0])
+     reads = []
+-    import hermes_state
+-    orig = hermes_state._connect_tracked_db
+-    monkeypatch.setattr(hermes_state, "_connect_tracked_db",
+-                        lambda *a, **k: (reads.append(1), orig(*a, **k))[1])
++    orig = server._session_digest
++    monkeypatch.setattr(server, "_session_digest", lambda *a, **k: (reads.append(1), orig(*a, **k))[1])
+ 
+     before = server._sessions_sig()
+     assert len(reads) == 1
+diff --git a/tests/tui_gateway/test_notify_subs_gate.py b/tests/tui_gateway/test_notify_subs_gate.py
+new file mode 100644
+index 0000000000..e961191298
+--- /dev/null
++++ b/tests/tui_gateway/test_notify_subs_gate.py
+@@ -0,0 +1,198 @@
++"""[daveey] Card J (t_01a1d563324d7e8e): the kanban poll's per-commit read keys the tui subscription rows on what
++they are made of.
++
++``notification_idle.board_signature`` runs once per board commit for every chat poller in the process. The hub's
++main board moved ``data_version`` 92 times a minute and its activity revision 9 times (heartbeats, claims and run
++stamps are bookkeeping), so re-reading every tui subscription row (2.1k rows, 3 ms) on each commit was most of the
++serve's poll. The rows are now reused while the activity revision (its triggers cover every read column) and the
++in-flight marks (the one bookkeeping column a chat's poll acts on) are unchanged. Every input change is still seen
++on the next call, and a chat with a claim in flight is polled every tick, so a claim that goes stale on the clock
++is recovered with no other change.
++"""
++import contextlib
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kbn
++from tui_gateway import notification_idle as idle
++
++CHAT = "20261113_120000_abcdef"
++OTHER = "20261113_120000_fedcba"
++
++
++@pytest.fixture()
++def board():
++    idle.reset_board_signatures()
++    with contextlib.closing(kbc.connect()) as conn:
++        tasks = [kb.create_task(conn, title=f"card {n}", assignee="default") for n in range(3)]
++        for tid in tasks:
++            kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=CHAT)
++        kbn.add_notify_sub(conn, task_id=tasks[0], platform="tui", chat_id=OTHER)
++    yield kb.kanban_db_path(board=kb.DEFAULT_BOARD), tasks
++    idle.reset_board_signatures()
++
++
++def _write(sql: str, *args) -> None:
++    with contextlib.closing(kbc.connect()) as conn:
++        with kb.write_txn(conn):
++            conn.execute(sql, args)
++
++
++def _bookkeeping(tid: str, n: int) -> None:
++    """A commit no chat poll reads: a claim clock on a card (``BOOKKEEPING_COLUMNS``)."""
++    _write("UPDATE tasks SET claim_expires = ? WHERE id = ?", 10_000 + n, tid)
++
++
++@contextlib.contextmanager
++def _subs_reads(path):
++    """Full tui subscription reads on the shared board reader."""
++    from hermes_cli.kanban_session_activity import cached_ro
++    seen: list = []
++    with cached_ro(path) as conn:
++        conn.set_trace_callback(lambda sql: seen.append(sql) if "last_event_id, inflight_from FROM" in sql else None)
++    try:
++        yield seen
++    finally:
++        with contextlib.suppress(Exception), cached_ro(path) as conn:
++            conn.set_trace_callback(None)
++
++
++def test_a_bookkeeping_commit_does_not_reread_the_subscription_rows(board):
++    path, tasks = board
++    before = idle.board_signature(path, CHAT)
++    with _subs_reads(path) as reads:
++        for n in range(5):
++            _bookkeeping(tasks[1], n)
++            assert idle.board_signature(path, CHAT) == before
++    assert reads == [], f"{len(reads)} full subscription reads for 5 bookkeeping commits"
++
++
++def test_a_cursor_move_is_seen_on_the_next_call(board):
++    path, tasks = board
++    before = idle.board_signature(path, CHAT)
++    other = idle.board_signature(path, OTHER)
++    _write("UPDATE kanban_notify_subs SET last_event_id = last_event_id + 7 WHERE task_id = ? AND chat_id = ?",
++           tasks[2], CHAT)
++    assert idle.board_signature(path, CHAT) != before
++    assert idle.board_signature(path, OTHER) == other, "another chat's rows did not move"
++
++
++def test_a_new_and_a_removed_subscription_are_seen(board):
++    path, tasks = board
++    before = idle.board_signature(path, OTHER)
++    with contextlib.closing(kbc.connect()) as conn:
++        kbn.add_notify_sub(conn, task_id=tasks[1], platform="tui", chat_id=OTHER)
++    assert idle.board_signature(path, OTHER) != before
++    _write("DELETE FROM kanban_notify_subs WHERE task_id = ? AND chat_id = ?", tasks[1], OTHER)
++    assert idle.board_signature(path, OTHER) == before
++
++
++def test_an_in_flight_mark_alone_is_seen(board):
++    """inflight_* are bookkeeping columns: they do not move the activity revision, so the key reads them itself."""
++    path, tasks = board
++    before = idle.board_signature(path, CHAT)
++    _write("UPDATE kanban_notify_subs SET inflight_from = 0, inflight_pid = 4242 WHERE task_id = ? AND chat_id = ?",
++           tasks[0], CHAT)
++    assert idle.board_signature(path, CHAT) != before
++    _write("UPDATE kanban_notify_subs SET inflight_from = NULL, inflight_pid = NULL WHERE task_id = ? AND chat_id = ?",
++           tasks[0], CHAT)
++    assert idle.board_signature(path, CHAT) == before, "a released claim is seen with no other change"
++
++
++def test_without_the_counter_triggers_the_rows_are_read_on_every_commit(board):
++    """An older writer that dropped the triggers: the revision cannot vouch for the rows."""
++    from hermes_cli.kanban_activity_revision import drop_triggers
++    path, tasks = board
++    with contextlib.closing(sqlite3.connect(path)) as raw:  # a plain writer: nothing reinstalls the triggers
++        drop_triggers(raw)
++        raw.commit()
++    before = idle.board_signature(path, CHAT)
++    with _subs_reads(path) as reads:
++        with contextlib.closing(sqlite3.connect(path)) as raw:
++            raw.execute("UPDATE tasks SET claim_expires = 1 WHERE id = ?", (tasks[1],))
++            raw.commit()
++        assert idle.board_signature(path, CHAT) == before
++    assert reads, "no coverage: the rows are read on each commit"
++    with contextlib.closing(sqlite3.connect(path)) as raw:
++        raw.execute("UPDATE kanban_notify_subs SET last_event_id = 99 WHERE task_id = ? AND chat_id = ?",
++                    (tasks[2], CHAT))
++        raw.commit()
++    assert idle.board_signature(path, CHAT) != before
++
++
++def test_a_new_deliverable_event_is_seen(board):
++    path, tasks = board
++    before = idle.board_signature(path, CHAT)
++    with contextlib.closing(kbc.connect()) as conn:
++        with kb.write_txn(conn):
++            kb._append_event(conn, tasks[0], "completed", {})
++    assert idle.board_signature(path, CHAT) != before
++
++
++def test_a_claim_in_flight_is_polled_every_tick_with_no_commit(board, monkeypatch):
++    """The due-time input: an in-flight claim goes stale on the clock (``recover_orphaned_notify_claims`` runs in
++    the poll), not on a commit, so the chat's board is never skipped while its claim is out."""
++    from tui_gateway import server
++    _path, tasks = board
++    _write("UPDATE kanban_notify_subs SET inflight_from = 0, inflight_pid = 4242, inflight_at = ? "
++           "WHERE task_id = ? AND chat_id = ?", int(time.time()) - 3600, tasks[0], CHAT)
++    polls = []
++    monkeypatch.setattr(server, "_kb_poll_board_now", lambda *a, **k: polls.append(a) or [])
++    seen: dict = {}
++    for _ in range(3):
++        server._kb_poll_board(kb, kb.DEFAULT_BOARD, CHAT, None, seen)
++    assert len(polls) == 3
++    _write("UPDATE kanban_notify_subs SET inflight_from = NULL, inflight_pid = NULL, inflight_at = NULL "
++           "WHERE task_id = ? AND chat_id = ?", tasks[0], CHAT)
++    for _ in range(3):
++        server._kb_poll_board(kb, kb.DEFAULT_BOARD, CHAT, None, seen)
++    assert len(polls) == 4, "once released and proven quiet, the board is skipped"
++
++
++# -- replay benchmark ---------------------------------------------------------------------------------------------
++# Design §3 card J: serve change_watcher + notification poller 2.0 -> 0.7 (% of one core). This read's share is
++# held to 0.3: the hub's stream (main board, 60 s sampled at 0.5 s: data_version moved 92 times, the activity
++# revision 9) over its 2.1k tui subscriptions in 136 chats, with 10 live chats each probing every 5 s. A commit is
++# read once per process (the first chat to look after it); the other probes reuse it.
++
++SUBS, CHATS, LIVE_CHATS, POLL_S = 2100, 136, 10, 5.0
++COMMITS_PER_S = 92 / 60
++REVISION_EVERY = round(92 / 9)
++BUDGET_CORE = 0.003
++
++
++def test_replay_budget_board_signature(board):
++    path, tasks = board
++    now = int(time.time())
++    with contextlib.closing(kbc.connect()) as conn:
++        with kb.write_txn(conn):
++            conn.executemany(
++                "INSERT INTO kanban_notify_subs(task_id, platform, chat_id, thread_id, created_at, last_event_id) "
++                "VALUES (?, 'tui', ?, '', ?, 0)", [(f"t_bench_{n}", f"chat-{n % CHATS}", now) for n in range(SUBS)])
++    chats = [f"chat-{n}" for n in range(LIVE_CHATS)]
++    for chat in chats:
++        idle.board_signature(path, chat)
++    commits = 40
++    reread = warm = float("inf")
++    for _ in range(3):
++        first = rest = 0.0
++        for n in range(commits):
++            if n % REVISION_EVERY == 0:
++                _write("UPDATE kanban_notify_subs SET last_event_id = ? WHERE task_id = 't_bench_0'", n + 1)
++            else:
++                _bookkeeping(tasks[1], n)
++            t0 = time.thread_time()
++            idle.board_signature(path, chats[0])  # the first probe after a commit reads it
++            t1 = time.thread_time()
++            for chat in chats[1:]:
++                idle.board_signature(path, chat)
++            first, rest = first + t1 - t0, rest + time.thread_time() - t1
++        reread = min(reread, first / commits)
++        warm = min(warm, rest / commits / (LIVE_CHATS - 1))
++    per_s = reread * min(COMMITS_PER_S, LIVE_CHATS / POLL_S) + warm * LIVE_CHATS / POLL_S
++    assert per_s <= BUDGET_CORE, (f"{reread * 1000:.2f} ms per commit, {warm * 1000:.3f} ms per probe = "
++                                  f"{per_s:.3%} of a core")
+diff --git a/tests/tui_gateway/test_session_projection_revision.py b/tests/tui_gateway/test_session_projection_revision.py
+index d68fb8d924..b6284f115f 100644
+--- a/tests/tui_gateway/test_session_projection_revision.py
++++ b/tests/tui_gateway/test_session_projection_revision.py
+@@ -16,33 +16,35 @@ def store(tmp_path, monkeypatch):
+     db.create_session("s", source="cli")
+     server._sessions_db_sig_cache.clear()
+     server._sessions_digest_at.clear()
++    from tui_gateway import watch_store
++    watch_store.reset()
+     yield path, db
++    watch_store.reset()
+     db.close()
+ 
+ 
+ def test_settled_unchanged_tick_opens_no_database(store, monkeypatch):
+-    import os
+-
++    """Card J: an unchanged store costs one PRAGMA on its kept connection; no open, no projection read."""
+     path, _db = store
+-    # A settled timestamp is safe to reuse; recent writes retain the racy guard.
+-    for candidate in (path, path.with_name(path.name + "-wal")):
+-        if candidate.exists():
+-            os.utime(candidate, ns=(1_000_000_000, 1_000_000_000))
+     before = server._session_db_content_sig(path)
+     connect = hermes_state._connect_tracked_db
+-    calls = []
++    calls, statements = [], []
+ 
+     def observed(*args, **kwargs):
+         calls.append(args)
+         return connect(*args, **kwargs)
+ 
+     monkeypatch.setattr(hermes_state, "_connect_tracked_db", observed)
+-    assert server._session_db_content_sig(path) == before
++    from tui_gateway import watch_store
++    with watch_store.observed(path) as (_key, conn):
++        conn.set_trace_callback(statements.append)
++    for _ in range(3):
++        assert server._session_db_content_sig(path) == before
+     assert calls == []
++    assert statements == ["PRAGMA data_version"] * 3
+     with sqlite3.connect(path) as writer:
+         writer.execute("UPDATE sessions SET title='next tick'")
+     assert server._session_db_content_sig(path) != before
+-    assert calls
+ 
+ 
+ def test_projection_reads_are_bounded_after_unrelated_commits(store, monkeypatch):
+@@ -171,6 +173,8 @@ def test_failed_read_retries_without_throttle(store, monkeypatch):
+     with sqlite3.connect(path) as writer:
+         writer.execute("UPDATE sessions SET title='after failure'")
+     connect = hermes_state._connect_tracked_db
++    from tui_gateway import watch_store
++    watch_store.reset()  # the kept reader is gone: the next pass must open one, and that open fails
+ 
+     def locked(*args, **kwargs):
+         raise sqlite3.OperationalError("database is locked")
+diff --git a/tests/tui_gateway/test_watch_store_gate.py b/tests/tui_gateway/test_watch_store_gate.py
+new file mode 100644
+index 0000000000..b1e35bf145
+--- /dev/null
++++ b/tests/tui_gateway/test_watch_store_gate.py
+@@ -0,0 +1,183 @@
++"""[daveey] Card J (t_01a1d563324d7e8e): the change watcher's store signatures read through one kept connection.
++
++``groups.changed`` and ``sessions.changed`` re-read state.db whenever its DB/WAL mtime moved, and on the hub
++state.db commits on most 0.5 s passes: each re-read opened a tracked read-only connection (schema parse), resolved
++the store path and closed it (P1: 0.24-0.41% and 0.19-0.22% of a core). A store now keeps one read-only
++connection keyed on file identity + ``PRAGMA data_version``; an unchanged store costs that one PRAGMA.
++"""
++import os
++import shutil
++import sqlite3
++import time
++
++import pytest
++
++import hermes_state
++from hermes_state import SessionDB
++from tui_gateway import server, watch_store
++
++
++@pytest.fixture
++def store(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
++    path = tmp_path / "state.db"
++    db = SessionDB(path)
++    db.create_session("s", source="cli")
++    server._sessions_db_sig_cache.clear()
++    server._sessions_digest_at.clear()
++    watch_store.reset()
++    yield path, db
++    watch_store.reset()
++    db.close()
++
++
++def _opens(monkeypatch):
++    calls = []
++    connect = hermes_state._connect_tracked_db
++    monkeypatch.setattr(hermes_state, "_connect_tracked_db", lambda *a, **k: (calls.append(a), connect(*a, **k))[1])
++    return calls
++
++
++def test_a_commit_is_seen_on_the_next_pass_without_reopening(store, monkeypatch):
++    path, db = store
++    before = server._session_db_content_sig(path)
++    opens = _opens(monkeypatch)
++    db.create_session("t", source="cli")
++    after = server._session_db_content_sig(path)
++    assert after != before
++    db.set_session_title("t", "renamed")
++    assert server._session_db_content_sig(path) != after
++    assert opens == [], "the kept connection serves every pass"
++
++
++def test_a_commit_in_the_same_mtime_tick_is_seen(store, monkeypatch):
++    """data_version is exact where a coarse mtime is not: no racy-clean window."""
++    path, db = store
++    before = server._session_db_content_sig(path)
++    stat = os.stat
++    frozen = {str(p): stat(p) for p in (path, str(path) + "-wal") if os.path.exists(p)}
++    monkeypatch.setattr(server, "_newest_mtime_ns", lambda _paths: 1)
++    db.create_session("same-tick", source="cli")
++    for p, st in frozen.items():
++        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))
++    assert server._session_db_content_sig(path) != before
++
++
++def test_a_replaced_store_is_reopened(store, tmp_path):
++    path, db = store
++    before = server._session_db_content_sig(path)
++    other = tmp_path / "other.db"
++    replacement = SessionDB(other)
++    replacement.create_session("other", source="cli")
++    replacement.close()
++    db.close()
++    for suffix in ("-wal", "-shm"):
++        with __import__("contextlib").suppress(FileNotFoundError):
++            os.unlink(str(path) + suffix)
++    shutil.copy(other, str(path) + ".tmp")
++    os.replace(str(path) + ".tmp", path)
++    assert server._session_db_content_sig(path) != before
++
++
++def test_a_removed_store_reads_none_and_comes_back(store):
++    path, db = store
++    assert server._session_db_content_sig(path) is not None
++    db.close()
++    for suffix in ("", "-wal", "-shm"):
++        if os.path.exists(str(path) + suffix):
++            os.unlink(str(path) + suffix)
++    assert server._session_db_content_sig(path) is None
++    again = SessionDB(path)
++    again.create_session("back", source="cli")
++    assert server._session_db_content_sig(path) is not None
++    again.close()
++
++
++def test_legacy_digest_throttle_still_fires_its_trailing_edge_with_no_commit(tmp_path, monkeypatch):
++    """The due-time input of this loop: a digest held back by ``SESSION_DIGEST_MIN_S`` is taken once the window
++    passes, with no further commit."""
++    path = tmp_path / "state.db"
++    with sqlite3.connect(path) as conn:
++        conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT)")
++        conn.execute("INSERT INTO sessions VALUES ('a', 'A')")
++    server._sessions_db_sig_cache.clear()
++    server._sessions_digest_at.clear()
++    watch_store.reset()
++    clock = [1000.0]
++    monkeypatch.setattr(server.time, "monotonic", lambda: clock[0])
++    monkeypatch.setattr(server, "SESSION_DIGEST_MIN_S", 3.0)
++    before = server._session_db_content_sig(path)
++    with sqlite3.connect(path) as conn:
++        conn.execute("UPDATE sessions SET title = 'B'")
++    clock[0] += 0.5
++    assert server._session_db_content_sig(path) == before
++    clock[0] += 3.0
++    assert server._session_db_content_sig(path) != before
++    watch_store.reset()
++
++
++def test_kept_connections_are_bounded_and_tracked(tmp_path):
++    from hermes_cli.sqlite_safe_read import has_live_connection
++    watch_store.reset()
++    paths = []
++    for n in range(watch_store.MAX_STORES + 3):
++        p = tmp_path / f"s{n}.db"
++        with sqlite3.connect(p) as conn:
++            conn.execute("CREATE TABLE t(v)")
++        with watch_store.observed(p):
++            pass
++        paths.append(p)
++    assert len(watch_store._held) == watch_store.MAX_STORES
++    assert has_live_connection(paths[-1])
++    assert not has_live_connection(paths[0]), "the least recently used store was closed"
++    watch_store.reset()
++    assert not has_live_connection(paths[-1])
++
++
++def test_a_transaction_left_open_drops_the_connection(tmp_path):
++    p = tmp_path / "s.db"
++    with sqlite3.connect(p) as conn:
++        conn.execute("CREATE TABLE t(v)")
++    watch_store.reset()
++    with watch_store.observed(p) as (_key, conn):
++        conn.execute("BEGIN")
++        conn.execute("SELECT * FROM t").fetchall()
++    assert str(p) not in watch_store._held
++    with watch_store.observed(p) as (key, _conn):
++        assert key
++    watch_store.reset()
++
++
++# -- replay benchmark ---------------------------------------------------------------------------------------------
++# Design §3 card J: serve change_watcher + notification poller 2.0 -> 0.7 (% of one core). The two store reads of
++# a watch pass (sessions + groups over the same state.db) are held to 0.15 at 2 passes/s with the hub's stream:
++# state.db committed between 92 of 120 sampled passes.
++
++PASSES_PER_S = 2.0
++COMMIT_SHARE = 92 / 120
++BUDGET_CORE = 0.0015
++
++
++def test_replay_budget_store_signatures(store):
++    path, db = store
++    for n in range(200):
++        db.create_session(f"bench-{n}", source="cli")
++    cache: dict = {}
++
++    def read(conn, _key):
++        return tuple(conn.execute("SELECT COUNT(*) FROM sessions").fetchone()), False
++
++    passes = 60
++    best = float("inf")
++    for _ in range(3):
++        spent = 0.0
++        for n in range(passes):
++            if n / passes < COMMIT_SHARE:
++                db.set_session_title(f"bench-{n}", f"t{time.time_ns()}")
++            t0 = time.thread_time()
++            server._session_db_content_sig(path)
++            server._db_content_sig(path, cache, read)
++            spent += time.thread_time() - t0
++        best = min(best, spent / passes)
++    per_s = best * PASSES_PER_S
++    assert per_s <= BUDGET_CORE, f"{best * 1000:.3f} ms per pass = {per_s:.3%} of a core"
+diff --git a/tools/skills_tool.py b/tools/skills_tool.py
+index f4b389c301..26e4c12d16 100644
+--- a/tools/skills_tool.py
++++ b/tools/skills_tool.py
+@@ -67,14 +67,23 @@ def _dir_tree_signature(root, sig, depth=_SIGNATURE_MAX_DEPTH) -> None:
+             _dir_tree_signature(os.path.join(root, name), sig, depth - 1)
+ 
+ 
+-def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
++def _skills_scan_signature(dirs_to_scan, disabled, memo: Optional[dict] = None) -> tuple:
+     """Stat-based change signature over every directory the catalog walks; platform is read via
+-    ``agent.skill_utils.sys`` so test patches are honored."""
++    ``agent.skill_utils.sys`` so test patches are honored. ``memo`` (``{root: rows}``) shares one root's walk
++    between the scopes of one ``published_scopes_signature`` call: most scopes share their profile and external
++    roots, and walking each again per scope was most of the ``skills.changed`` watch (card J)."""
+     from agent import skill_utils as _skill_utils
+     platform = getattr(getattr(_skill_utils, "sys", None), "platform", "")
+     sig: list = []
+     for d in dirs_to_scan:
+-        _dir_tree_signature(str(d), sig)
++        if memo is None:
++            _dir_tree_signature(str(d), sig)
++            continue
++        rows = memo.get(str(d))
++        if rows is None:
++            rows = memo[str(d)] = []
++            _dir_tree_signature(str(d), rows)
++        sig.extend(rows)
+     return (tuple(sig), frozenset(disabled), platform)
+ 
+ 
+diff --git a/tui_gateway/change_watcher.py b/tui_gateway/change_watcher.py
+index 03034f2354..ab054b6da6 100644
+--- a/tui_gateway/change_watcher.py
++++ b/tui_gateway/change_watcher.py
+@@ -5,6 +5,7 @@ rebound onto server.py's globals at install time (method_ctx.bind_module)."""
+ from __future__ import annotations
+ 
+ import itertools
++import os
+ from pathlib import Path
+ 
+ from .method_ctx import HandlerRegistry, bind_module
+@@ -207,48 +208,62 @@ _MTIME_FALLBACK = "mtime-fallback"
+ 
+ 
+ def _db_content_sig(db_path: Path, cache: dict, read, *, fallback=lambda mtime: None):
+-    """``read(conn, mtime)`` over a read-only connection, cached behind the DB/WAL mtime so a watch pass
+-    stays stat-only until another process commits. ``read`` returns ``(signature, is_fallback)``. A failed
+-    read after a good answer keeps it and leaves the cached mtime stale so the next pass re-reads (answer ->
+-    fallback -> answer would broadcast twice); otherwise the answer is ``fallback(mtime)``. Session stores
+-    use :func:`_session_db_content_sig` (projection revision + digest throttle) instead. [daveey]"""
+-    mtime = _newest_mtime_ns((db_path, db_path.with_name(f"{db_path.name}-wal")))
++    """``read(conn, key)`` over the store's kept read-only connection (``tui_gateway.watch_store``), cached behind
++    its commit key (file identity + ``PRAGMA data_version``) so a watch pass is one PRAGMA until a commit
++    publishes. Card J (t_01a1d563324d7e8e): reopening the store on every DB/WAL mtime move cost a schema parse and
++    a tracked open/close on nearly every 0.5 s pass. ``read`` returns ``(signature, is_fallback)``. A failed read
++    after a good answer keeps it and leaves the cached key stale so the next pass re-reads (answer -> fallback ->
++    answer would broadcast twice); otherwise the answer is ``fallback(DB/WAL mtime)``. Session stores use
++    :func:`_session_db_content_sig` (projection revision + digest throttle) instead. [daveey]"""
++    from tui_gateway import watch_store
+     cache_key = str(db_path)
+     cached = cache.get(cache_key)
+-    if cached is not None and cached[0] == mtime:
+-        return cached[1]
+     if not db_path.exists():
+-        cache[cache_key] = (mtime, None, True)
++        watch_store.forget(db_path)
++        cache[cache_key] = (_RACY_MTIME, None, True)
+         return None
+-    conn = None
+     try:
+-        from hermes_state import _connect_tracked_db
+-        from hermes_state_holders import read_only_db_uri
+-        conn = _connect_tracked_db(read_only_db_uri(db_path), tracking_path=db_path, uri=True, timeout=0.05)
+-        signature, is_fallback = read(conn, mtime)
++        with watch_store.observed(db_path) as (key, conn):
++            if cached is not None and cached[0] == key:
++                return cached[1]
++            signature, is_fallback = read(conn, key)
+     except Exception:  # health: allow BLE001 -- any failed read (busy, locked, foreign schema) falls back like a busy one
+         if cached is not None and not cached[2]:
+             return cached[1]
+-        signature, is_fallback = fallback(mtime), True
+-    finally:
+-        if conn is not None:
+-            conn.close()
+-    cache[cache_key] = (_settled_mtime(mtime), signature, is_fallback)
++        key = _RACY_MTIME  # never equal: the next pass reads again
++        signature, is_fallback = fallback(_newest_mtime_ns((db_path, db_path.with_name(f"{db_path.name}-wal")))), True
++    cache[cache_key] = (key, signature, is_fallback)
+     return signature
+ 
+ 
++def _session_digest(conn, available: set, mtime) -> tuple:
++    """The legacy content digest of a store without the projection triggers (every session row)."""
++    import hashlib
++    fields = tuple(field for field in _SESSION_SIGNATURE_FIELDS if field in available)
++    if not fields:
++        # A state.db without a readable sessions table (foreign schema, legacy
++        # or transient file): keep the old mtime contract so any move still
++        # wakes the sidebar instead of silently never broadcasting.
++        return ("mtime-fallback", mtime)
++    order = " ORDER BY id" if "id" in available else ""
++    digest = hashlib.blake2b(digest_size=16)
++    for row in conn.execute(f"SELECT {', '.join(fields)} FROM sessions{order}"):
++        digest.update(repr(tuple(row)).encode("utf-8", "backslashreplace"))
++        digest.update(b"\0")
++    return (fields, digest.digest())
++
++
+ def _session_db_content_sig(db_path: Path):
+     """Read the transactional projection revision, or digest a legacy store.
+ 
+     Upgraded stores use bounded schema/meta probes after writes, independent of
+-    the legacy digest throttle. Unchanged stores need only data_version. The file
++    the legacy digest throttle. An unchanged store costs one ``PRAGMA data_version``
++    on its kept connection (``tui_gateway.watch_store``; card J). The file
+     identity distinguishes replacements whose counters happen to be equal.
+     Stores without the complete trigger capability retain the content fallback.
+     """
+-    from tui_gateway.kanban_replica_observer import fingerprint
++    from tui_gateway import watch_store
+ 
+-    stamp = fingerprint(db_path)
+-    mtime = _newest_mtime_ns((db_path, db_path.with_name(f"{db_path.name}-wal")))
+     cache_key = str(db_path)
+     cached = _sessions_db_sig_cache.get(cache_key)
+     try:
+@@ -256,6 +271,7 @@ def _session_db_content_sig(db_path: Path):
+         identity = (stat.st_dev, stat.st_ino)
+     except OSError:
+         _sessions_db_sig_cache.pop(cache_key, None)
++        watch_store.forget(db_path)
+         return None
+     previous_identity = _sessions_db_identity.get(cache_key)
+     if previous_identity != identity:
+@@ -263,81 +279,43 @@ def _session_db_content_sig(db_path: Path):
+         _sessions_db_sig_cache.pop(cache_key, None)
+     _sessions_db_identity[cache_key] = identity
+     revision_cached = cached is not None and cached[1] is not None and cached[1][0] == "revision"
+-
+-    if stamp is not None and cached is not None and cached[0] == stamp:
+-        return cached[1]
+     now = time.monotonic()
+-    if (not revision_cached and cached is not None and cached[1] is not None
+-            and now - _sessions_digest_at.get(cache_key, -SESSION_DIGEST_MIN_S) < SESSION_DIGEST_MIN_S):
+-        return cached[1]
+-    if not db_path.exists():
+-        _sessions_db_sig_cache[cache_key] = (mtime, None)
+-
+-        return None
+-
+-    conn = None
++    key = None
+     try:
+-        import hashlib
+-        from hermes_state import _connect_tracked_db
+-        from hermes_state_holders import read_only_db_uri
+-
+-        conn = _connect_tracked_db(read_only_db_uri(db_path), tracking_path=db_path,
+-                                   uri=True, timeout=0.05)
+-        from hermes_state_projection import session_projection_revision
+-        conn.execute("BEGIN")
+-        revision = session_projection_revision(conn)
+-        if revision is not None:
+-            signature = ("revision", identity, revision)
+-            stable = stamp if stamp is not None and fingerprint(db_path) == stamp else None
+-            _sessions_db_sig_cache[cache_key] = (stable, signature)
+-            return signature
+-        available = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+-        fields = tuple(field for field in _SESSION_SIGNATURE_FIELDS if field in available)
+-        if not fields:
+-            # A state.db without a readable sessions table (foreign schema, legacy
+-            # or transient file): keep the old mtime contract so any move still
+-            # wakes the sidebar instead of silently never broadcasting.
+-            signature = ("mtime-fallback", mtime)
+-        else:
+-            order = " ORDER BY id" if "id" in available else ""
+-            rows = conn.execute(f"SELECT {', '.join(fields)} FROM sessions{order}")
+-            digest = hashlib.blake2b(digest_size=16)
+-            for row in rows:
+-                digest.update(repr(tuple(row)).encode("utf-8", "backslashreplace"))
+-                digest.update(b"\0")
+-            signature = (fields, digest.digest())
+-    except Exception:
+-        # A busy/locked read after a good one keeps the last digest and leaves the cached mtime
++        with watch_store.observed(db_path) as (key, conn):
++            if cached is not None and cached[0] == key:
++                return cached[1]
++            if (not revision_cached and cached is not None and cached[1] is not None
++                    and now - _sessions_digest_at.get(cache_key, -SESSION_DIGEST_MIN_S) < SESSION_DIGEST_MIN_S):
++                return cached[1]  # cached key stays stale: the change is still seen on the trailing edge
++            from hermes_state_projection import session_projection_revision
++            conn.execute("BEGIN")
++            try:
++                revision = session_projection_revision(conn)
++                if revision is not None:
++                    signature = ("revision", identity, revision)
++                    _sessions_db_sig_cache[cache_key] = (key, signature)
++                    return signature
++                available = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
++                signature = _session_digest(conn, available, key)
++            finally:
++                conn.execute("COMMIT")
++    except Exception:  # health: allow BLE001 -- busy/locked/foreign store: fall back like a busy read
++        # A busy/locked read after a good one keeps the last digest and leaves the cached key
+         # stale so the next pass re-reads: digest -> mtime -> digest would broadcast twice.
+         if cached is not None and cached[1] is not None and cached[1][0] != "mtime-fallback":
+             return cached[1]
+-        signature = ("mtime-fallback", mtime)
+-    finally:
+-        if conn is not None:
+-            conn.close()
+-
+-    stable = stamp if stamp is not None and fingerprint(db_path) == stamp else None
+-    _sessions_db_sig_cache[cache_key] = (stable, signature)
++        key = None
++        signature = ("mtime-fallback", _newest_mtime_ns((db_path, db_path.with_name(f"{db_path.name}-wal"))))
++    _sessions_db_sig_cache[cache_key] = (key, signature)
+     _sessions_digest_at[cache_key] = now
+-
+     return signature
+ 
+ 
+-# Filesystem timestamps come from a coarse clock (~4 ms ticks; whole seconds on some filesystems) and
+-# SQLite commits in place, so a commit landing in the tick of a read leaves the DB/WAL mtime unchanged.
+-# A digest read while the mtime is that fresh must not become a cache hit ("racily clean", as in git's
+-# index): it is cached under a key no mtime equals, so the next tick re-reads the rows.
++# A cache key no commit key equals: a store that was missing or failed to read is read again next pass.
+ _RACY_MTIME = object()
+ 
+ 
+-def _settled_mtime(mtime):
+-    """``mtime`` when it is old enough to trust as a cache key, else a never-matching sentinel."""
+-    from utils import mtime_is_racy  # function-local: bodies are rebound onto server.py's globals
+-    if mtime is None or mtime_is_racy(mtime):
+-        return _RACY_MTIME
+-    return mtime
+-
+-
+ def _watched_homes() -> tuple[Path, ...]:
+     """The watcher home and every sibling profile home this gateway serves."""
+     return (_watcher_home(), *_served_profile_homes)
+@@ -446,6 +424,27 @@ def _room_rows_sig(conn, _mtime) -> dict:
+ 
+ 
+ _room_store_sig_cache: dict[str, tuple[object, dict | None, bool]] = {}
++# str(path) -> ((dev, ino), Path.resolve()). Resolving every store each 0.5 s pass was an lstat per path component
++# (a fifth of the groups watch on the hub, card J); one stat proves the path still names the same file.
++_resolved_paths: dict[str, tuple[tuple[int, int], Path]] = {}
++
++
++def _resolved(path) -> Path:
++    """``Path(path).resolve()``, reused while ``path`` still names the same file (dev, ino)."""
++    key = str(path)
++    try:
++        st = os.stat(key)
++    except OSError:
++        return Path(key).resolve()
++    ident = (st.st_dev, st.st_ino)
++    hit = _resolved_paths.get(key)
++    if hit is not None and hit[0] == ident:
++        return hit[1]
++    real = Path(key).resolve()
++    if len(_resolved_paths) >= 256:
++        _resolved_paths.clear()
++    _resolved_paths[key] = (ident, real)
++    return real
+ 
+ 
+ def _groups_sig() -> dict:
+@@ -458,7 +457,7 @@ def _groups_sig() -> dict:
+     from gateway.hosted_rooms import default_db_path
+     from tui_gateway.hosted_room_service import live_room_services
+     services = live_room_services()
+-    stores = {Path(path).resolve(): None for path in (
++    stores = {_resolved(path): None for path in (
+         *(root / "state.db" for root in _watched_homes()), default_db_path(),
+         *(service.db_path for service in services))}
+     rooms: dict[str, list] = {}
+@@ -495,7 +494,7 @@ def _wake_room_drivers() -> None:
+     _groups_woken_heads.update(heads)
+     for service in live_room_services():
+         with contextlib.suppress(Exception):  # health: allow BLE001 -- a stopped service must not stop the watcher
+-            if str(Path(service.db_path).resolve()) in moved:
++            if str(_resolved(service.db_path)) in moved:
+                 service.wakeup()
+ 
+ 
+diff --git a/tui_gateway/notification_idle.py b/tui_gateway/notification_idle.py
+index f0bc7f5212..c645c64b1a 100644
+--- a/tui_gateway/notification_idle.py
++++ b/tui_gateway/notification_idle.py
+@@ -62,22 +62,45 @@ def board_quiet(path, session_key):
+ 
+ 
+ # [daveey] Board path -> (reader, data_version, events scanned up to, newest notify-kind event id, tui subs by
+-# chat). data_version moves on every commit, and the main board commits ~40 times a minute with heartbeats,
+-# claims and run bookkeeping that no chat poller reads, so a commit gate re-polled every board for every chat on
+-# nearly every tick (t_01a1cee98b798343). What a chat's poll can claim is fixed by two inputs: the newest
++# chat, subscription key). data_version moves on every commit, and the main board commits ~40 times a minute with
++# heartbeats, claims and run bookkeeping that no chat poller reads, so a commit gate re-polled every board for every
++# chat on nearly every tick (t_01a1cee98b798343). What a chat's poll can claim is fixed by two inputs: the newest
+ # deliverable-kind event id (AUTOINCREMENT, so any new one is above it) and that chat's own tui subscription
+ # rows (cursor, in-flight mark). Read both once per commit for every chat in this process.
+ _SIGS: dict[str, tuple] = {}
+ _SIGS_LOCK = threading.Lock()
+ _SIGS_MAX = 64
+-
+-
+-def _notify_content(conn, version, held):
++_SUBS_SQL = ("SELECT chat_id, task_id, platform, thread_id, last_event_id, inflight_from "
++             "FROM kanban_notify_subs WHERE LOWER(platform) = 'tui' ORDER BY chat_id, task_id, platform, thread_id")
++# Card J (t_01a1d563324d7e8e): re-reading every tui subscription row (2.1k on the hub) on each of those commits was
++# most of the serve's kanban poll. The rows are keyed instead on the activity revision, whose triggers move on every
++# insert, delete and update of a read column of kanban_notify_subs (cursor, identity), plus the in-flight marks (the
++# one bookkeeping column read here; ``kanban_activity_revision.BOOKKEEPING_COLUMNS``), read in the rows' snapshot.
++_INFLIGHT_SQL = ("SELECT chat_id, task_id, platform, thread_id, inflight_from FROM kanban_notify_subs "
++                 "WHERE inflight_from IS NOT NULL AND LOWER(platform) = 'tui' "
++                 "ORDER BY chat_id, task_id, platform, thread_id")
++
++
++def _subs_revision(conn, path):
++    """``(dev, ino, revision, schema_version)`` when the activity counter covers ``kanban_notify_subs``, else None
++    (an older writer without the triggers: the rows are read on every commit, as before)."""
++    import os
++    from hermes_cli.kanban_activity_revision import covered_revision
++    st = os.stat(path)
++    revision = covered_revision(conn, Path(path), (st.st_dev, st.st_ino), ("kanban_notify_subs",))
++    return None if revision is None else (st.st_dev, st.st_ino, *revision)
++
++
++def _notify_content(conn, version, held, path=None):
+     from tui_gateway.session_notifications import _KANBAN_NOTIFY_KINDS
+     present = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN "
+                                           "('task_events', 'kanban_notify_subs')")}
+     if len(present) != 2:
+         return None  # not a board (yet): fall back to the commit revision
++    revision = None
++    if path is not None:
++        with contextlib.suppress(Exception):  # unknown coverage: read the rows
++            revision = _subs_revision(conn, path)  # before the snapshot: a commit in between only re-reads next time
+     conn.execute("BEGIN")  # one snapshot for the event scan and the subscription rows
+     try:
+         top = int(conn.execute("SELECT MAX(id) FROM task_events").fetchone()[0] or 0)
+@@ -87,15 +110,17 @@ def _notify_content(conn, version, held):
+             row = conn.execute(f"SELECT MAX(id) FROM task_events WHERE id > ? AND id <= ? AND kind IN ({marks})",
+                                (start, top, *_KANBAN_NOTIFY_KINDS)).fetchone()
+             newest = max(newest, int(row[0] or 0))
+-        rows = conn.execute("SELECT chat_id, task_id, platform, thread_id, last_event_id, inflight_from "
+-                            "FROM kanban_notify_subs WHERE LOWER(platform) = 'tui' "
+-                            "ORDER BY chat_id, task_id, platform, thread_id").fetchall()
++        subs_key = None if revision is None else (revision, tuple(conn.execute(_INFLIGHT_SQL).fetchall()))
++        by_chat = held[4] if subs_key is not None and held is not None and held[5] == subs_key else None
++        rows = conn.execute(_SUBS_SQL).fetchall() if by_chat is None else ()
+     finally:
+         conn.execute("COMMIT")
+-    by_chat: dict = {}
+-    for row in rows:
+-        by_chat.setdefault(row[0], []).append(tuple(row))
+-    return conn, version, top, newest, {chat: tuple(subs) for chat, subs in by_chat.items()}
++    if by_chat is None:
++        grouped: dict = {}
++        for row in rows:
++            grouped.setdefault(row[0], []).append(tuple(row))
++        by_chat = {chat: tuple(subs) for chat, subs in grouped.items()}
++    return conn, version, top, newest, by_chat, subs_key
+ 
+ 
+ def board_signature(path, chat_id=None):
+@@ -111,7 +136,7 @@ def board_signature(path, chat_id=None):
+         if held is not None and held[0] is not conn:
+             held = None  # another reader (reopened, replaced file): its scan offsets prove nothing here
+         if held is None or held[1] != version:
+-            held = _notify_content(conn, version, held)
++            held = _notify_content(conn, version, held, path)
+             if held is None:
+                 return conn, version
+             with _SIGS_LOCK:
+diff --git a/tui_gateway/watch_store.py b/tui_gateway/watch_store.py
+new file mode 100644
+index 0000000000..8c2c82b5bc
+--- /dev/null
++++ b/tui_gateway/watch_store.py
+@@ -0,0 +1,98 @@
++"""Kept read-only observer connections for the change watcher's store signatures. [daveey]
++
++Design t_01a1d563324d7e8e §3 card J. ``groups.changed`` and ``sessions.changed`` re-read state.db on every pass
++whose DB/WAL mtime moved, and on a busy hub state.db commits on most 0.5 s passes: each re-read opened a tracked
++connection (schema parse), resolved the path and closed it again (about 4 ms and 3 ms of CPU per pass). A store
++now keeps ONE read-only autocommit connection. Its key is the file identity plus ``PRAGMA data_version``, which
++moves on every commit by any other connection, this process's writers included, and is exact where an mtime is
++coarse. The main file's (size, mtime_ns) is in the key too: a restore copied over the same inode moves it.
++"""
++from __future__ import annotations
++
++import contextlib
++import os
++import sqlite3
++import threading
++from collections import OrderedDict
++from pathlib import Path
++
++MAX_STORES = 32
++_lock = threading.RLock()
++# path -> ((dev, ino), conn, generation). A new generation never equals an old key, so a reopened store re-reads.
++_held: OrderedDict[str, tuple[tuple[int, int], sqlite3.Connection, int]] = OrderedDict()
++_generation = 0
++
++
++def _drop(path: str) -> None:
++    held = _held.pop(path, None)
++    if held is not None:
++        with contextlib.suppress(sqlite3.Error):
++            held[1].close()
++
++
++def reset() -> None:
++    """Close every kept connection (tests, and a process forgetting its memos)."""
++    with _lock:
++        while _held:
++            _drop(next(iter(_held)))
++
++
++def forget(db_path) -> None:
++    """Close the kept connection of a store that is gone: a held fd on its deleted WAL would make the next
++    writer that recreates it refuse to open (``refuse_deleted_wal_generation``)."""
++    with _lock:
++        _drop(str(db_path))
++
++
++def _open(path: str, ident: tuple[int, int]) -> tuple:
++    global _generation
++    from hermes_state import _connect_tracked_db
++    from hermes_state_holders import read_only_db_uri
++    # Tracked: a kept fd must be visible to has_live_connection()/offline_file_access() like every state.db opener.
++    conn = _connect_tracked_db(read_only_db_uri(Path(path)), tracking_path=Path(path), uri=True,
++                               check_same_thread=False, isolation_level=None, timeout=0.05)
++    try:
++        conn.execute("PRAGMA query_only = ON")
++        st = os.stat(path)
++        if (st.st_dev, st.st_ino) != ident:
++            raise sqlite3.OperationalError("store replaced while its observer opened")
++    except BaseException:
++        conn.close()
++        raise
++    _generation += 1
++    held = _held[path] = (ident, conn, _generation)
++    while len(_held) > MAX_STORES:
++        _drop(next(iter(_held)))
++    return held
++
++
++@contextlib.contextmanager
++def observed(db_path):
++    """``(key, conn)`` for ``db_path`` under the module lock: equal keys mean no commit was published between them.
++    ``conn`` is autocommit; a caller wanting one snapshot over several statements wraps them in BEGIN/COMMIT and
++    must not leave a transaction open. Raises OSError/sqlite3.Error when the store cannot be read; any error
++    inside the block drops the connection, so the next call reopens (a new generation: no stale key matches)."""
++    path = str(db_path)
++    with _lock:
++        try:
++            st = os.stat(path)
++            ident = (st.st_dev, st.st_ino)
++            held = _held.get(path)
++            if held is not None and held[0] != ident:
++                _drop(path)  # replaced or recreated under this path
++                held = None
++            if held is None:
++                held = _open(path, ident)
++            _held.move_to_end(path)
++            conn = held[1]
++            version = conn.execute("PRAGMA data_version").fetchone()[0]
++        except BaseException:
++            _drop(path)
++            raise
++        try:
++            yield (*ident, held[2], st.st_size, st.st_mtime_ns, version), conn
++        except BaseException:
++            _drop(path)
++            raise
++        if conn.in_transaction:  # a caller's snapshot left open would pin the WAL and hide later commits
++            _drop(path)
+-- 
+2.43.0
+

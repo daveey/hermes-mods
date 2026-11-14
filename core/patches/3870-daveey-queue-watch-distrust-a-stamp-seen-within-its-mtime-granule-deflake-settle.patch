@@ -1,0 +1,163 @@
+From f0b806ae12aee493680370d65e9abe1c59cf9539 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:10:45 +0000
+Subject: [PATCH] [daveey] queue watch: distrust a stamp seen within its mtime
+ granule (deflake settle test)
+
+test_the_watch_settles_after_the_drain_wrote_its_outcome failed once on CI
+(run 43500262865, job 132144232156): after the drain marked the row
+delivered, DeliveryQueueWatch.changed() still returned False.
+
+Why: the watch stamps (path, st_mtime_ns, st_size) for deliveries.db and its
+-wal. Every delivery_queue transaction closes its connection, so SQLite
+checkpoints and deletes the WAL; the status update rewrites a page in place and
+the DB stays 20480 bytes. The only signal left is mtime, and a file timestamp
+is only as fine as the clock that wrote it (a kernel jiffy on coarse
+filesystems). When the drain's write lands in the same granule as the
+enqueue's, the stamp is byte-identical and the write is invisible. The same
+miss hits a worker's enqueue in production: the send then waits for the 60 s
+housekeeping tick, the latency #117307 removed.
+
+Fix (git's racy-index rule): a stamp taken within MTIME_GRANULARITY_NS (1 s) of
+its newest mtime is racy, and the next look reports a change even when the
+stamp matches, costing at most one empty drain pass. Once seen a granule after
+its mtime the stamp is trusted and the watch settles as before. The clock is a
+module-local _now_ns so tests control it without touching time.time_ns.
+
+Tests: the settle test advances the module clock to the next poll, so its wake
+is deterministic whichever granule the drain's write lands in. A new test forces
+a same-size write onto the seen mtime with os.utime and asserts the wake. Old
+code: changed() returns False for that write (repro reproduced with the real
+delivery_queue: size 20480 unchanged, WAL gone, utime to the enqueue mtime ->
+False). New code: file green; 30 plain + 30 SIGSTOP/SIGCONT-starved parallel
+runs of both tests all pass.
+---
+ gateway/run_delivery_queue_watch.py           | 23 +++++++++++-
+ .../test_cron_delivery_housekeeping.py        | 37 +++++++++++++++++++
+ 2 files changed, 59 insertions(+), 1 deletion(-)
+
+diff --git a/gateway/run_delivery_queue_watch.py b/gateway/run_delivery_queue_watch.py
+index f32be1b611..aba1a99748 100644
+--- a/gateway/run_delivery_queue_watch.py
++++ b/gateway/run_delivery_queue_watch.py
+@@ -18,6 +18,16 @@ from typing import Callable, Iterable, Optional
+ # How often the housekeeping thread looks at the queue file between its ticks.
+ DELIVERY_QUEUE_WATCH_SECONDS = 1.0
+ DRAIN_LABEL = "Cron durable delivery queue drain"
++# A file timestamp is only as fine as the clock that wrote it (a kernel jiffy on Linux, 1 s on
++# some filesystems), and the queue's size does not move when a status update rewrites a page in
++# place (each closed connection checkpoints and deletes the WAL). So a write that lands in the
++# same granule as the mtime we last saw leaves the stamp identical. As in git's racy-index rule,
++# a stamp taken this soon after its newest mtime proves nothing about writes after it.
++MTIME_GRANULARITY_NS = 1_000_000_000
++
++
++def _now_ns() -> int:
++    return time.time_ns()
+ 
+ 
+ class DeliveryQueueWatch:
+@@ -26,6 +36,9 @@ class DeliveryQueueWatch:
+     The watch never resets itself after draining: the drain's own status writes
+     move the stamp once more and cost one empty pass, after which the stamp is
+     stable, while a worker that enqueued during the drain still moves it again.
++    A stamp seen within ``MTIME_GRANULARITY_NS`` of its newest mtime is racy: the next
++    look reports a change even when the stamp matches (at worst one empty pass),
++    because a write in the same timestamp granule would not have moved it.
+     """
+ 
+     def __init__(self, homes: Callable[[], Iterable[Optional[Path]]], drain: Callable[[], None]) -> None:
+@@ -33,6 +46,7 @@ class DeliveryQueueWatch:
+         self.drain = drain
+         self._served: list = list(homes())
+         self._seen = self._stamp()
++        self._seen_racy = self._is_racy(self._seen)
+ 
+     def refresh_homes(self) -> None:
+         """Re-resolve the served profiles once per tick (a directory read under multiplex),
+@@ -53,11 +67,18 @@ class DeliveryQueueWatch:
+                 stamps.append((str(candidate), info.st_mtime_ns, info.st_size))
+         return tuple(stamps)
+ 
++    @staticmethod
++    def _is_racy(stamp: tuple) -> bool:
++        # Read the clock after the stat: any later write carries a timestamp past this granule.
++        newest = max((mtime_ns for _path, mtime_ns, _size in stamp), default=None)
++        return newest is not None and _now_ns() - newest <= MTIME_GRANULARITY_NS
++
+     def changed(self) -> bool:
+         current = self._stamp()
+-        if current == self._seen:
++        if current == self._seen and not self._seen_racy:
+             return False
+         self._seen = current
++        self._seen_racy = self._is_racy(current)
+         return True
+ 
+ 
+diff --git a/tests/gateway/test_cron_delivery_housekeeping.py b/tests/gateway/test_cron_delivery_housekeeping.py
+index ae45f894be..feea72e54d 100644
+--- a/tests/gateway/test_cron_delivery_housekeeping.py
++++ b/tests/gateway/test_cron_delivery_housekeeping.py
+@@ -270,10 +270,15 @@ def test_a_queued_worker_delivery_is_drained_before_the_next_housekeeping_tick(t
+ def test_the_watch_settles_after_the_drain_wrote_its_outcome(tmp_path, monkeypatch):
+     """The drain's own status write wakes exactly one more (empty) pass; a stable queue
+     never wakes it again, so the housekeeping thread does not spin on its own writes."""
++    import time
++
+     from cron import delivery_queue
++    from gateway import run_delivery_queue_watch as queue_watch
+     from gateway.run_delivery_queue_watch import DeliveryQueueWatch
+ 
+     monkeypatch.setattr(delivery_queue, "DELIVERY_DB", tmp_path / "deliveries.db")
++    later_ns = [0]
++    monkeypatch.setattr(queue_watch, "_now_ns", lambda: time.time_ns() + later_ns[0])
+     passes = []
+     watch = DeliveryQueueWatch(
+         lambda: [None],
+@@ -287,6 +292,9 @@ def test_the_watch_settles_after_the_drain_wrote_its_outcome(tmp_path, monkeypat
+     status = delivery_queue.get_status("exec-1")
+     assert status is not None and status["status"] == "delivered"
+ 
++    # The next look comes a poll later. The drain's write may share the enqueue's mtime granule
++    # (the size does not move), so the wake is owed to the racy stamp the enqueue left.
++    later_ns[0] = 10 * queue_watch.MTIME_GRANULARITY_NS
+     assert watch.changed() is True, "the delivered status was written to the queue"
+     watch.drain()
+     assert passes == [1, 0]
+@@ -296,3 +304,32 @@ def test_the_watch_settles_after_the_drain_wrote_its_outcome(tmp_path, monkeypat
+     # Hosts whose SQLite runs the queue in WAL mode write to the -wal file first.
+     (tmp_path / "deliveries.db-wal").write_bytes(b"frame")
+     assert watch.changed() is True
++
++
++def test_a_write_in_the_same_mtime_granule_still_wakes_the_watch(tmp_path, monkeypatch):
++    """A status update rewrites a page in place (same size) and a coarse file clock can give it
++    the mtime the watch already saw. A stamp seen that soon after its mtime must not be trusted:
++    CI saw the drain's own write vanish this way, and a worker's enqueue could too."""
++    import os
++
++    from cron import delivery_queue
++    from gateway import run_delivery_queue_watch as queue_watch
++    from gateway.run_delivery_queue_watch import DeliveryQueueWatch
++
++    monkeypatch.setattr(delivery_queue, "DELIVERY_DB", tmp_path / "deliveries.db")
++    queue = tmp_path / "deliveries.db"
++    queue.write_bytes(b"pending!")
++    mtime_ns = os.stat(queue).st_mtime_ns
++    now_ns = [mtime_ns]
++    monkeypatch.setattr(queue_watch, "_now_ns", lambda: now_ns[0])
++    watch = DeliveryQueueWatch(lambda: [None], lambda: None)
++
++    queue.write_bytes(b"settled!")
++    os.utime(queue, ns=(mtime_ns, mtime_ns))
++    assert watch.changed() is True, "a same-size write within the granule went unseen"
++
++    # Seen a granule after its mtime the stamp is trustworthy: no wake without a write.
++    now_ns[0] = mtime_ns + 2 * queue_watch.MTIME_GRANULARITY_NS
++    assert watch.changed() is True, "the previous look was still racy"
++    assert watch.changed() is False
++    assert watch.changed() is False
+-- 
+2.43.0
+

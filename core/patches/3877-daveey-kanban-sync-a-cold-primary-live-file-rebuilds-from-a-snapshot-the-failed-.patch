@@ -1,0 +1,351 @@
+From e60ae303077ff8709db496a3ae801f36df4b9497 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 20:43:55 +0000
+Subject: [PATCH] [daveey] kanban sync: a cold primary live file rebuilds from
+ a snapshot; the failed-result observer reads the board's sync mode
+
+Autoscaled worker-a1 (2026-11-13, t_01a1d65b80d2e9f4; evidence a1-fail-20261113-v8 on hermes-hub): the canary's 24
+outbox ops waited 13 min with attempts=0, and the node's next claim was deferred `lease_held holder=worker-a1` every
+16 s until the Board's lease TTL expired and charged a failure.
+
+Defect 1, the outbox never pushed. This is a core defect, not a Board one. Five whys:
+1. Why attempts=0? Every send ran `before_head`, which stops at the first FIFO run row. The run start (task_runs
+   upsert, 19:03:10) was at the front, so nothing behind it was sent. A send increments attempts.
+2. Why before_head every round? Each round ended `behind`: the primary live pull (partition=gateway) hit its
+   20-page budget every round. The default board ran ~88 repair rounds in 604 s; the node's other boards ran 12-20.
+3. Why behind? The live file `~/.hermes/kanban.db` began at cursor 0 and replayed the board's whole feed (head
+   ~1.93M). At 19:15:52 node-check-5 read cursor 1586950, and the feed from there still says more=true.
+4. Why cursor 0? install-boards cold-starts only the replica from a snapshot (enroll log replica_cursor 1920721).
+   Core had no cold start for a live file, only the 410 rebuild, and the default feed's floor is 0, so no 410 fired.
+5. Why only this node? Static workers had warm live files before their first run. An autoscaled node claims minutes
+   after enroll.
+Fix: `kanban_sync_backlog.pull_live`. A live file at cursor 0 whose first feed page is not the head rebuilds from the
+partitioned snapshot and resumes at the head. The rebuild is `resync`, upsert-only with no absent-row sweep, so a
+just-attached board's unimported cards are never deleted. The round's repair treats it as a rebuild.
+
+Defect 2, the lease was kept. This is a consequence of defect 1. The requeue's `tasks status=ready` is the holder's
+status-leaving write, which ends its Board lease (rows.ts clearLease). It was queued but sat behind the run start.
+Tested: with the outbox moving, the rate-limited release lands, the Board frees the lease without charging a
+failure, and the same gateway's next grant is not lease_held.
+
+Found on the way: the independent failed-result observer closed the run (`reconciled_by: observer`). The observer is
+a separate process that opens the board with `connect_existing` and never registered it as synced, so `board_mode()`
+read "off". The primary neutral release was skipped (0 `release` ops in the outbox) and the run was closed in the
+local mirror instead. The observer now registers the board's mode with `register_without_install`, which writes
+nothing.
+
+Tests:
+- tests/hermes_cli/test_kanban_sync_cold_live.py (new):
+  - a cold live file reaches the head in one round and sends its run start;
+  - a warm file behind the head still pulls its budget (control);
+  - a rate-limited requeue frees the lease, no failure is charged, and the same gateway is re-granted.
+  RED on base: 2 failed (behind=True), the control passes. Green at head: 3/3.
+- tests/hermes_cli/test_kanban_failed_result_sync.py: new `observer_process` entry (the observer without the board's
+  init registration). RED on base: the run is closed locally ('crashed' != 'running'). Green at head: 6/6.
+- tests/hermes_cli/test_kanban_sync_push_starvation.py: the backlog test's first round now reads 20 replica pages
+  + 1 live page, because the cold live file rebuilds instead of replaying 20 pages.
+Consumers: 246 test files importing kanban_sync_client/backlog/db_sync/observer or the sync fakes are green, except:
+- test_worker_resources_unknown_alarm fails on host load, identically on base 1cd1ecc706b;
+- three files hit per-file timeouts under load 27. They pass with a longer per-file timeout:
+  test_kanban_sync_rejections 617/617 at head and base, both 1011 s.
+---
+ hermes_cli/kanban_failed_result_observer.py   |   5 +
+ hermes_cli/kanban_sync_backlog.py             |  27 ++++
+ hermes_cli/kanban_sync_client.py              |   7 +-
+ .../test_kanban_failed_result_sync.py         |  16 +-
+ .../hermes_cli/test_kanban_sync_cold_live.py  | 150 ++++++++++++++++++
+ .../test_kanban_sync_push_starvation.py       |   5 +-
+ 6 files changed, 201 insertions(+), 9 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_cold_live.py
+
+diff --git a/hermes_cli/kanban_failed_result_observer.py b/hermes_cli/kanban_failed_result_observer.py
+index dfb0a9ccde..9f6535cea4 100644
+--- a/hermes_cli/kanban_failed_result_observer.py
++++ b/hermes_cli/kanban_failed_result_observer.py
+@@ -109,6 +109,11 @@ def connect_existing(path):
+         # Missing/old schema fails visibly instead of being migrated here.
+         conn.execute('SELECT current_run_id, claim_lock FROM tasks LIMIT 0')
+         conn.execute('SELECT ended_at FROM task_runs LIMIT 0')
++        # This process never ran the board's init, which is what registers a Board-attached file as synced; without
++        # it board_mode() reads "off" and a primary board's failure is closed in the local mirror instead of
++        # released to the Board (worker-a1, t_01a1d65b80d2e9f4). Writes nothing.
++        from hermes_cli import kanban_db_sync as sync
++        sync.register_without_install(conn, sync._db_key(conn) or str(path))
+         yield conn
+ 
+ 
+diff --git a/hermes_cli/kanban_sync_backlog.py b/hermes_cli/kanban_sync_backlog.py
+index d70d5128dd..95be9a83eb 100644
+--- a/hermes_cli/kanban_sync_backlog.py
++++ b/hermes_cli/kanban_sync_backlog.py
+@@ -126,6 +126,33 @@ def replica_at_head(slug: str, hub: Any, gateway: str, live_path: Path) -> None:
+             waited += BUSY_RETRY_S
+ 
+ 
++def pull_live(live: sqlite3.Connection, hub: Any, slug: str, gateway: str) -> bool | None:
++    """Pull a primary board's live file (``gateway``'s partition): True while it is still behind the feed head, None
++    when a cold file was rebuilt from a snapshot instead (the caller's repair treats it as a rebuild).
++
++    A live file that has never pulled (cursor 0) would replay every change the board ever had, at
++    :data:`PULL_PAGE_BUDGET` pages per round, and every round of that replay ends behind the head, so its sends run
++    ``before_head`` and hold the outbox at its first run row. Incident (autoscaled worker-a1, 2026-11-13,
++    t_01a1d65b80d2e9f4): the enroll cold-started the replica from a snapshot, the live file began at 0 against a
++    ~1.93M-change feed (cursor 1586950 after 17 min) and a claimed run's 24 ops never left with ``attempts=0``,
++    including the requeue that ends the Board lease. So a cold file whose first page is not the head rebuilds from
++    the partitioned snapshot, as on a 410, and resumes the feed at its head. Upserts only (``resync``), no absent-row
++    sweep: a just-attached board's local cards are not on the Board yet and are queued by ``import``, not deleted.
++    """
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as ksc
++    cold = not int((sync.sync_state(live) or {}).get("cursor") or 0)
++    with ksc.credited(live):  # the client's name: tests replace it there
++        pulled = ksc.pull(live, hub, slug, observers=True, partition=gateway,
++                          max_pages=1 if cold else PULL_PAGE_BUDGET)
++    if not (cold and pulled.more):
++        return pulled.more
++    _log.warning("kanban sync: %s live file never pulled and the feed is past one page; rebuilding it from a "
++                 "snapshot instead of replaying the board's history", slug)
++    ksc.resync(live, hub, slug, observers=True, partition=gateway)
++    return None
++
++
+ def _expedite(live_path: Path, changed: dict) -> None:
+     """``kanban_awaited_card_wake.expedite`` on the live board for a standalone replica pull (``reconcile``): the
+     sync round's own call never sees these changes, since the replica cursor has moved past them. Never raises."""
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index ad56c090cf..c8f3818e68 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1038,9 +1038,10 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+             acw.expedite(live, pulled.status_changed)  # a park naming a card the pull moved re-probes now [daveey]
+             applies: Optional[list] = []  # credited revision steps (kanban_sync_own_writes); None = a rebuild
+             if mode == "primary":
+-                try:
+-                    with credited(live):
+-                        result.behind |= pull(live, hub, slug, observers=True, partition=gateway).more
++                try:  # a never-pulled file rebuilds from a snapshot instead of replaying the feed (None)
++                    live_behind = backlog.pull_live(live, hub, slug, gateway)
++                    result.behind |= bool(live_behind)
++                    applies = None if live_behind is None else applies
+                 except Resync:
+                     from hermes_cli.kanban_sync_resync_sweep import resync_live  # also sweeps the Board's deletes
+                     applies = None
+diff --git a/tests/hermes_cli/test_kanban_failed_result_sync.py b/tests/hermes_cli/test_kanban_failed_result_sync.py
+index 1768d897a4..8a4dc6226b 100644
+--- a/tests/hermes_cli/test_kanban_failed_result_sync.py
++++ b/tests/hermes_cli/test_kanban_failed_result_sync.py
+@@ -8,6 +8,7 @@ import pytest
+ 
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import kanban_failed_result_observer as observer
+ from tests.hermes_cli import test_kanban_failed_result_reconcile as processes
+ from tests.hermes_cli import test_kanban_sync_run_rows as transport
+@@ -17,9 +18,13 @@ svc = transport.svc
+ live = transport.live
+ 
+ 
+-@pytest.mark.parametrize('entry', ['observer', 'dispatcher'])
++@pytest.mark.parametrize('entry', ['observer', 'observer_process', 'dispatcher'])
+ @pytest.mark.parametrize('rebound', [False, True])
+ def test_failed_result_closure_survives_real_sync_echo(live, kanban_home, svc, monkeypatch, tmp_path, entry, rebound):
++    """``observer_process``: the observer is its own process (kanban_failed_result_service), which never ran the
++    board's init, so nothing registered the board as synced there. worker-a1 (2026-11-13, t_01a1d65b80d2e9f4): its
++    ``board_mode`` read ``off``, the rate-limited run was closed in the local mirror (``reconciled_by: observer``)
++    instead of released to the Board, and no release op was queued."""
+     monkeypatch.setenv('HERMES_KANBAN_CRASH_GRACE_SECONDS', '0')
+     tid, uid = transport._claimed(live, kanban_home, svc, 'failed receipt transport')
+     task = kb.get_task(live, tid)
+@@ -41,9 +46,12 @@ def test_failed_result_closure_survives_real_sync_echo(live, kanban_home, svc, m
+                          run_id=task.current_run_id)
+         live.execute('UPDATE task_events SET id=? WHERE id=?', (first['id'] + 1000, first['id']))
+     transport._round(kanban_home, svc)
+-    if entry == 'observer':
+-        observer.observe({**context, 'ready_path': str(tmp_path / 'ready'),
+-                          'observer_unit': 'fixture.service'})
++    if entry.startswith('observer'):
++        with monkeypatch.context() as m:
++            if entry == 'observer_process':
++                m.setattr(sync, '_SYNCED_PATHS', set())
++            observer.observe({**context, 'ready_path': str(tmp_path / 'ready'),
++                              'observer_unit': 'fixture.service'})
+     else:
+         dispatch.detect_crashed_workers(live)
+     # A Board-primary failure is released to the Board, never closed in the
+diff --git a/tests/hermes_cli/test_kanban_sync_cold_live.py b/tests/hermes_cli/test_kanban_sync_cold_live.py
+new file mode 100644
+index 0000000000..c73d6040ee
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_cold_live.py
+@@ -0,0 +1,150 @@
++"""A fresh primary live file never replays the whole feed before its outbox moves (t_01a1d65b80d2e9f4).
++
++Incident (autoscaled worker-a1, 2026-11-13): the enroll cold-started the replica from a snapshot (cursor 1920721) but
++the primary live file began at cursor 0. Its partitioned pull read 20 pages per round of the board's whole history
++(head ~1.93M), so every round ended behind the head, every send ran ``before_head`` and stopped at the oldest pending
++op, the claimed run's start row: 24 ops waited 13 min with ``attempts=0``. Among them the requeue's ``status=ready``,
++the holder's status-leaving write that ends its Board lease (rows.ts), so the gateway's next claim was deferred
++``lease_held holder=worker-a1`` until the Board's TTL expired and charged a failure.
++
++Now a cold live file whose first feed page is not the head rebuilds from a partitioned snapshot (as on a 410), so
++the round ends at the head and its send goes out whole. The Board is the in-memory fake (``kanban_sync_fake_board``)
++served one change per feed page, so a 60-change backlog is 60 pages.
++"""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_neutral_release as neutral
++from hermes_cli import kanban_sync_backlog as backlog
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_outbox_age as outbox_age
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_sync_push_starvation import BACKLOG_PAGES, BOARD, ME, _other_creates
++
++
++class PagedHub:
++    """The fake Board's hub for one gateway, serving ONE change per feed page (release ops carry no ``uid``)."""
++
++    def __init__(self, svc, gateway):
++        self._inner = svc.hub(gateway)
++        self.ident = self._inner.ident
++
++    def __getattr__(self, name):
++        return getattr(self._inner, name)
++
++    def changes(self, board, since, limit=500):
++        return self._inner.changes(board, since, limit=1)
++
++
++@pytest.fixture(autouse=True)
++def _fresh_loop_state():
++    backlog.reset()
++    outbox_age.reset()
++    yield
++    backlog.reset()
++    outbox_age.reset()
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def svc():
++    return FakeService(lease_runs=True)
++
++
++@pytest.fixture
++def live(kanban_home, svc):
++    support.write_sync_config(kanban_home, True)
++    c = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(c, BOARD, ME)
++    sync.set_mode(c, "primary")
++    previous = sync.set_lease_client(ksc.HubLeaseClient(svc.hub(ME)))
++    try:
++        yield c
++    finally:
++        sync.set_lease_client(previous)
++        c.close()
++
++
++def _cursor(conn):
++    return int((sync.sync_state(conn) or {}).get("cursor") or 0)
++
++
++def _claimed_on_a_fresh_node(live, kanban_home, svc):
++    """The incident's node: a long Board history, a replica cold-started at the head, a live file at cursor 0 and a
++    claim whose run start is the oldest pending op."""
++    _other_creates(svc, BACKLOG_PAGES)
++    tid = kb.create_task(live, title="canary", assignee="worker")
++    ksc.push(live, svc.hub(ME), BOARD, ME, primary=True)  # the card reaches the Board; no pull yet
++    assert kb.claim_task(live, tid, ttl_seconds=900, claimer=f"{kb._host_prefix()}:1")
++    run_id = kb.get_task(live, tid).current_run_id
++    uid = sync.run_uid(live, run_id)
++    assert tid in svc.board(BOARD)["leases"]
++    assert live.execute("SELECT 1 FROM kanban_sync_outbox WHERE state = 'pending' AND table_name = 'task_runs' "
++                        "AND row_uid = ?", (uid,)).fetchone()  # the run start, which a before-head send holds
++    pulled = ksc._pull_replica(BOARD, svc.hub(ME), ME, kanban_home / "kanban.db", max_pages=None)
++    assert not pulled.more  # install-boards' snapshot cold start: the replica is at the head
++    assert _cursor(live) == 0
++    return tid, run_id, uid
++
++
++def _round(kanban_home, hub):
++    return ksc.sync_board(BOARD, kanban_home / "kanban.db", hub, ME)
++
++
++def test_a_cold_live_file_reaches_the_head_in_one_round_and_sends_its_run_start(live, svc, kanban_home):
++    _tid, _run_id, uid = _claimed_on_a_fresh_node(live, kanban_home, svc)
++    result = _round(kanban_home, PagedHub(svc, ME))
++    assert result.error is None
++    assert not result.behind  # RED on main: 20 of 60 pages, behind, the send held at the run start
++    assert _cursor(live) > BACKLOG_PAGES  # at the head the round read (its own send moved the Board on)
++    assert svc.board(BOARD)["rows"]["task_runs"][uid]["status"] == "running"
++    assert not live.execute("SELECT 1 FROM kanban_sync_outbox WHERE state = 'pending'").fetchone()
++    # The rebuild kept only this gateway's partition: another gateway's cards stay in the replica.
++    assert not live.execute("SELECT 1 FROM tasks WHERE id LIKE 't_other%'").fetchone()
++
++
++def test_a_warm_live_file_behind_the_head_still_pulls_its_budget(live, svc, kanban_home):
++    """Control: only a cursor-0 file rebuilds; a warm file behind the head drains the feed over rounds (its run
++    rows held meanwhile, test_kanban_sync_push_starvation)."""
++    _other_creates(svc, 1)
++    assert _round(kanban_home, svc.hub(ME)).error is None  # warm: at the head
++    start = _cursor(live)
++    assert start
++    _other_creates(svc, BACKLOG_PAGES)
++    result = _round(kanban_home, PagedHub(svc, ME))
++    assert result.behind and _cursor(live) == start + backlog.PULL_PAGE_BUDGET
++
++
++def test_a_rate_limited_requeue_frees_the_lease_and_the_same_gateway_reclaims(live, svc, kanban_home):
++    """Defect 2 (lease_held holder=self for the whole TTL) is defect 1: the Board frees a lease when its holder's
++    release (or status-leaving write) arrives, and those waited behind the run start. With the outbox moving, the
++    neutral release lands, the Board counts no failure, and this gateway's next claim is granted."""
++    tid, run_id, uid = _claimed_on_a_fresh_node(live, kanban_home, svc)
++    dead = dispatch._DeadWorker("rate_limited", 75, "quota", "rate_limited", {"retry_status": "ready"},
++                                rate_limited=True)
++    dead.run_id = run_id
++    with kbc.write_txn(live):
++        row = live.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
++        assert neutral.queue(live, row, dead)
++    hub = PagedHub(svc, ME)
++    assert not _round(kanban_home, hub).behind
++    board = svc.board(BOARD)
++    assert tid not in board["leases"]  # RED on main: held until the Board's TTL
++    assert board["rows"]["task_runs"][uid]["outcome"] == "rate_limited"
++    assert not board["rows"]["tasks"][tid].get("consecutive_failures")
++    _round(kanban_home, hub)  # the Board's release reaches the live file
++    assert kb.get_task(live, tid).status == "ready"
++    # The same gateway's next grant (a new run) is not deferred lease_held holder=self.
++    lease = ksc.HubLeaseClient(svc.hub(ME)).acquire(board_id=BOARD, task_uid=tid, run_uid=sync.uuid7(),
++                                                     gateway_id=ME, ttl_s=900)
++    assert lease.granted, (lease.reason, lease.holder)
+diff --git a/tests/hermes_cli/test_kanban_sync_push_starvation.py b/tests/hermes_cli/test_kanban_sync_push_starvation.py
+index af047e352b..855dd15856 100644
+--- a/tests/hermes_cli/test_kanban_sync_push_starvation.py
++++ b/tests/hermes_cli/test_kanban_sync_push_starvation.py
+@@ -122,9 +122,10 @@ def test_the_backlog_drains_over_rounds_and_pulled_at_marks_only_the_head(live,
+     log: list = []
+     hub = PagedHub(svc, ME, log)
+     first = _round(kanban_home, hub)
+-    # 20 pages each for the replica and the live file, then the round ended anyway.
++    # 20 pages for the replica, then the round ended anyway; the never-pulled live file read one page and rebuilt
++    # from a snapshot instead of replaying the feed (test_kanban_sync_cold_live).
+     assert first.behind and first.pulled == backlog.PULL_PAGE_BUDGET
+-    assert sum(1 for kind, _ in log if kind == "changes") == 2 * backlog.PULL_PAGE_BUDGET
++    assert sum(1 for kind, _ in log if kind == "changes") == backlog.PULL_PAGE_BUDGET + 1
+     cursor, pulled_at = _replica_state()
+     assert cursor == backlog.PULL_PAGE_BUDGET and pulled_at is None  # not at the head: never stamped
+     path = kanban_home / "kanban.db"
+-- 
+2.43.0
+

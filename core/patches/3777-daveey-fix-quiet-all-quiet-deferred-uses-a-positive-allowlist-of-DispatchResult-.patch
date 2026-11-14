@@ -1,0 +1,160 @@
+From 9f933fe5c30c83ee88079c019963c69ae66350f8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 19:06:44 +0000
+Subject: [PATCH] [daveey] fix(quiet): all_quiet_deferred uses a positive
+ allowlist of DispatchResult fields
+
+Review 5894221601 on PR #1806 (@258073dd06): the hand-kept denylist in
+`all_quiet_deferred` omitted `skipped_nonspawnable` and `crashed`, so a tick
+with `quiet_deferred` plus either returned True and, during an active
+claim-quiet lease (<=480s), the gateway stuck watcher reset bad_ticks instead
+of counting. Diagnostic only: claims and the quiet proof were unaffected.
+
+Fix: the check walks `dataclasses.fields(row)` and treats any set field outside
+`QUIET_COMPATIBLE_FIELDS` (the quiet defer itself, the census fields and
+bookkeeping that holds no ready card) as a hold, so an unclassified field fails
+closed. `QUIET_HOLD_FIELDS` names the rest explicitly, now also the worker /
+claim failures (crashed, timed_out, stale, reclaimed, reconciled_orphans,
+released_leftover_claims, ownership_error), clock_held and
+core_update_drain_hold.
+
+Tests (tests/hermes_cli/test_quiet_gates_dispatch.py):
+- test_every_dispatch_result_field_is_classified_for_quiet: every
+  DispatchResult field is in exactly one set; fails when main adds a field.
+- test_quiet_with_any_hold_field_keeps_stuck_accounting: quiet +
+  skipped_nonspawnable / crashed (RED on main: `assert not True`), then every
+  hold field on the same row and on a sibling board row, and every compatible
+  field still classifies as quiet.
+
+Proof: RED on origin/main dd75da236b for both quiet+skipped_nonspawnable and
+quiet+crashed; GREEN 153/153 across test_quiet_gates_dispatch,
+test_quiet_gates_watcher, test_kanban_stuck_clock_holds,
+test_kanban_dispatcher_health, test_kanban_hub_admission_claim,
+test_kanban_repin_notice, test_kanban_repin_owner (pool worker).
+---
+ hermes_cli/kanban_db_dispatch_stuck.py        | 35 ++++++++++++---
+ tests/hermes_cli/test_quiet_gates_dispatch.py | 43 +++++++++++++++++++
+ 2 files changed, 71 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_dispatch_stuck.py b/hermes_cli/kanban_db_dispatch_stuck.py
+index 58c9cf7f3d..b4bb07c063 100644
+--- a/hermes_cli/kanban_db_dispatch_stuck.py
++++ b/hermes_cli/kanban_db_dispatch_stuck.py
+@@ -4,13 +4,34 @@ Moved out of ``kanban_db_dispatch`` (which re-exports these names). ``results``
+ """
+ from __future__ import annotations
+ 
++import dataclasses
+ from typing import Any, Iterable, Optional
+ 
+ from hermes_cli.kanban_db_dispatch_clock import all_clock_held, deadline_suffixes
+ from hermes_cli.kanban_repin_notice import MANUAL_REPIN
+ 
+-__all__ = ["all_at_capacity", "all_clock_held", "all_quiet_deferred", "cap_source", "describe_suppression",
+-           "manual_repin_ids", "stuck_warning"]
++__all__ = ["QUIET_COMPATIBLE_FIELDS", "QUIET_HOLD_FIELDS", "all_at_capacity", "all_clock_held",
++           "all_quiet_deferred", "cap_source", "describe_suppression", "manual_repin_ids", "stuck_warning"]
++
++# Every ``DispatchResult`` field is in exactly one of these two sets (tests/hermes_cli/test_quiet_gates_dispatch.py
++# fails on a new, unclassified field). ``all_quiet_deferred`` reads only the allowlist: anything else set on a row,
++# classified or not, means the tick was not explained by the claim-quiet defer alone.
++QUIET_COMPATIBLE_FIELDS = frozenset({
++    "quiet_deferred", "quiet_deadlines",                 # the quiet defer itself
++    "skipped_locked", "skipped_owned",                   # rows filtered out before the check
++    "scheduling_admitted", "dispatch_owner", "lane_candidates", "admission_budget",  # per-tick census
++    "promoted", "auto_assigned_default", "supervisor_requests", "remote_archived", "reaped_terminal_workers",
++    "stopped_run_scopes", "agent_block_escalated", "ask_rechecked", "woken_continuations",
++    "shared_blocker_released", "shared_blocker_probed", "quota_block_released",  # bookkeeping, no held ready card
++})
++QUIET_HOLD_FIELDS = frozenset({
++    "spawned", "skipped_unassigned", "skipped_nonspawnable", "skipped_per_profile_capped", "owner_down",
++    "skipped_ineligible", "claim_deferred", "admission_deferred", "capsule_refused", "pinned_quota_held",
++    "auto_blocked", "respawn_guarded", "no_progress_held", "clock_held", "rate_limited",  # holds / guards
++    "crashed", "timed_out", "stale", "reclaimed", "reconciled_orphans", "released_leftover_claims",
++    "ownership_error",                                    # worker or claim failures
++    "at_capacity", "memory_pressure", "core_update_drain_hold",  # caps and host-wide holds
++})
+ 
+ 
+ def manual_repin_ids(results: Iterable[Optional[Any]]) -> list[str]:
+@@ -171,11 +192,11 @@ def all_quiet_deferred(results: Iterable[Optional[Any]]) -> bool:
+     ran = [res for res in results if res is not None and not res.skipped_locked and not res.skipped_owned]
+     if not any(getattr(res, "quiet_deferred", None) for res in ran):
+         return False
+-    other = ("spawned", "claim_deferred", "capsule_refused", "respawn_guarded", "skipped_ineligible", "owner_down",
+-             "skipped_per_profile_capped", "skipped_unassigned", "rate_limited", "no_progress_held",
+-             "pinned_quota_held", "auto_blocked", "admission_deferred")
+-    return not any(getattr(res, name, None) for res in ran for name in other) and not any(
+-        res.at_capacity or res.memory_pressure for res in ran)
++    # Positive allowlist: any set field outside QUIET_COMPATIBLE_FIELDS (a hold, failure, cap, or a field added
++    # later and not yet classified) keeps the ordinary accounting. Non-dataclass rows fail closed.
++    return all(dataclasses.is_dataclass(res) and not any(
++        getattr(res, f.name) for f in dataclasses.fields(res) if f.name not in QUIET_COMPATIBLE_FIELDS)
++        for res in ran)
+ 
+ 
+ def all_at_capacity(results: Iterable[Optional[Any]]) -> bool:
+diff --git a/tests/hermes_cli/test_quiet_gates_dispatch.py b/tests/hermes_cli/test_quiet_gates_dispatch.py
+index d2cff6475a..8d2c974533 100644
+--- a/tests/hermes_cli/test_quiet_gates_dispatch.py
++++ b/tests/hermes_cli/test_quiet_gates_dispatch.py
+@@ -6,9 +6,11 @@ destinations are never gated; the dispatcher keeps its normal branch (health pub
+ """
+ from __future__ import annotations
+ 
++import dataclasses
+ import os
+ from pathlib import Path
+ from types import SimpleNamespace
++from typing import Any
+ 
+ import pytest
+ 
+@@ -154,3 +156,44 @@ def test_stuck_diagnostics_recognize_quiet_narrowly():
+     assert not kbd.all_quiet_deferred([kbd.DispatchResult(quiet_deferred=[("t_a", ep)], spawned=[("t_a", "p", "w")])])
+     assert not kbd.all_quiet_deferred([kbd.DispatchResult(quiet_deferred=[("t_a", ep)], skipped_locked=True)])
+     assert not kbd.all_quiet_deferred([None])
++
++
++def _truthy(f) -> Any:
++    """A set value for any DispatchResult field: what a real tick would record there."""
++    default = f.default_factory() if f.default_factory is not dataclasses.MISSING else f.default
++    if isinstance(default, bool):
++        return True
++    if isinstance(default, int):
++        return 1
++    if isinstance(default, dict):
++        return {"t_b": ("x", 1)}
++    if isinstance(default, list):
++        return [("t_b", "x")]
++    return "x"
++
++
++def test_every_dispatch_result_field_is_classified_for_quiet():
++    """A new DispatchResult field must be placed in QUIET_COMPATIBLE_FIELDS or QUIET_HOLD_FIELDS (#1806 review)."""
++    from hermes_cli import kanban_db_dispatch_stuck as stuck
++    names = {f.name for f in dataclasses.fields(kbd.DispatchResult)}
++    assert not stuck.QUIET_COMPATIBLE_FIELDS & stuck.QUIET_HOLD_FIELDS
++    assert names - stuck.QUIET_COMPATIBLE_FIELDS - stuck.QUIET_HOLD_FIELDS == set(), "classify the new field"
++    assert (stuck.QUIET_COMPATIBLE_FIELDS | stuck.QUIET_HOLD_FIELDS) - names == set(), "drop the removed field"
++
++
++def test_quiet_with_any_hold_field_keeps_stuck_accounting():
++    ep = "episode-1"
++    quiet = kbd.DispatchResult(quiet_deferred=[("t_a", ep)], quiet_deadlines={ep: 5.0})
++    # The two holds the hand-kept denylist missed: a non-spawnable lane card and a crashed worker.
++    assert not kbd.all_quiet_deferred([quiet, kbd.DispatchResult(skipped_nonspawnable=["t_b"])])
++    assert not kbd.all_quiet_deferred([quiet, kbd.DispatchResult(crashed=["t_b"])])
++    assert not kbd.all_quiet_deferred([dataclasses.replace(quiet, crashed=["t_b"])])
++    from hermes_cli import kanban_db_dispatch_stuck as stuck
++    by_name = {f.name: f for f in dataclasses.fields(kbd.DispatchResult)}
++    for name in sorted(stuck.QUIET_HOLD_FIELDS):
++        row = dataclasses.replace(quiet, **{name: _truthy(by_name[name])})
++        assert not kbd.all_quiet_deferred([row]), name
++        assert not kbd.all_quiet_deferred([quiet, kbd.DispatchResult(**{name: _truthy(by_name[name])})]), name
++    for name in sorted(stuck.QUIET_COMPATIBLE_FIELDS - {"skipped_locked", "skipped_owned"}):
++        row = dataclasses.replace(quiet, **{name: _truthy(by_name[name])})
++        assert kbd.all_quiet_deferred([row]), name
+-- 
+2.43.0
+

@@ -1,0 +1,94 @@
+From 6a8bf63b4f7552d635069a6d78215dfe851df5ae Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 20:30:10 +0000
+Subject: [PATCH] [daveey] cron: pin shutdown precedence over a cancel marker
+ in _abort_if_fire_claim_lost
+
+Post-merge check of #2540 (t_01a1d6672f6410cf) found mutant E7 surviving:
+`if cancel_is_shutdown(cancel_event) and request is None:` passed all 50
+tests, so nothing pinned that this gateway's shutdown wins when the run's
+cancel marker also exists.
+
+New test drives the real run_job (like _run_and_stop): mid-turn an operator
+cancel writes the marker, then this gateway's shutdown books the interrupted
+outcome and latches a ShutdownAwareCancel claim. Asserts the error class is
+CronShutdownInterrupted, one "stopped by gateway shutdown" WARNING without a
+traceback, no "stopped on request" WARNING, no "failed:" ERROR, and the
+shutdown bookkeeping (last_status error, last_failure.kind
+lifecycle_interrupt, no failure-streak bump) is left as written.
+
+Test-only. RED under E7 (CronRunCancelled raised); GREEN at main.
+tests/cron/test_requested_stop_logging.py, test_shutdown_interrupt.py,
+tests/gateway/test_session_cron.py: 52 passed, 0 failed.
+
+Kanban: t_01a1d695038415d1
+---
+ tests/cron/test_requested_stop_logging.py | 41 +++++++++++++++++++++--
+ 1 file changed, 39 insertions(+), 2 deletions(-)
+
+diff --git a/tests/cron/test_requested_stop_logging.py b/tests/cron/test_requested_stop_logging.py
+index 47530d1379..38ff78327e 100644
+--- a/tests/cron/test_requested_stop_logging.py
++++ b/tests/cron/test_requested_stop_logging.py
+@@ -36,7 +36,7 @@ def store(tmp_path):
+         yield tmp_path
+ 
+ 
+-def _run_and_stop(tmp_path, stop):
++def _run_and_stop(tmp_path, stop, claim_lost=None):
+     """Start a real run of a real job; the fake agent's turn performs ``stop`` mid-run."""
+     from gateway import session_cron
+     from hermes_state import SessionDB
+@@ -44,7 +44,7 @@ def _run_and_stop(tmp_path, stop):
+     job = jobs.create_job(prompt="hello", schedule="every 1h", name="stop-probe", deliver="local")
+     execution_id = executions.create_execution(job["id"], source="test")["id"]
+     executions.mark_execution_running(execution_id)
+-    claim_lost = threading.Event()
++    claim_lost = threading.Event() if claim_lost is None else claim_lost
+     fence = scheduler._FireOwnership(job, claim_lost, None, CancelRequest(execution_id))
+ 
+     class _Agent:
+@@ -122,3 +122,40 @@ def test_a_lost_claim_without_a_cancel_marker_still_logs_a_failed_job(store, cap
+     failed = _failed_errors(caplog)
+     assert len(failed) == 1 and failed[0].exc_info is not None
+     assert _stop_warnings(caplog) == []
++
++
++def test_this_gateways_shutdown_wins_over_a_cancel_marker(store, caplog):
++    """Both fired: an operator cancel wrote the marker, then this gateway's shutdown latched the
++    claim and booked the interrupted outcome. The shutdown class wins (``_abort_if_fire_claim_lost``),
++    so the run logs the shutdown WARNING, not "stopped on request", and leaves the shutdown's
++    bookkeeping as written."""
++    from cron.cancellation import SHUTDOWN_INTERRUPT_REASON, ShutdownAwareCancel
++
++    caplog.set_level(logging.DEBUG, logger="cron.scheduler")
++    seen = {}
++    shutdown_fired = threading.Event()
++
++    def _cancel_then_shutdown(job_id, latch):
++        seen["job_id"] = job_id
++        assert cancel_run(job_id, reason="operator asked")["cancelled"]
++        # Gateway shutdown: flag the run interrupted, write the interrupted outcome, latch the claim.
++        shutdown_fired.set()
++        assert jobs.mark_job_run(job_id, False, SHUTDOWN_INTERRUPT_REASON, shutdown_interrupted=True)
++        latch.set()
++
++    latch = ShutdownAwareCancel(threading.Event(), shutdown_fired.is_set)
++    success, _output, _final, error = _run_and_stop(store, _cancel_then_shutdown, claim_lost=latch)
++
++    assert success is False
++    assert (error or "").startswith("CronShutdownInterrupted:"), error
++    assert _failed_errors(caplog) == []
++    assert _stop_warnings(caplog) == []
++    shutdown = [r for r in caplog.records if r.levelno == logging.WARNING
++                and "stopped by gateway shutdown" in r.getMessage()]
++    assert len(shutdown) == 1, [r.getMessage() for r in caplog.records]
++    assert shutdown[0].exc_info is None
++    job = jobs.get_job(seen["job_id"])
++    assert job is not None
++    assert job["last_status"] == "error"
++    assert job["last_failure"]["kind"] == jobs.LIFECYCLE_INTERRUPT_KIND
++    assert not job.get("failure_streak")
+-- 
+2.43.0
+

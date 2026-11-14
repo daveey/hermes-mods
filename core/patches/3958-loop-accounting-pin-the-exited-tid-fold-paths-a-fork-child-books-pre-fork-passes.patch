@@ -1,0 +1,271 @@
+From 2ecdd061e13a4e3d0be2a6b9d1ac88f9249c0437 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:32:42 +0000
+Subject: [PATCH] loop_accounting: pin the exited-tid fold paths; a fork child
+ books pre-fork passes from the fork, not negative CPU [daveey]
+
+Post-merge check t_01a1d6c731341d02 (PR #2630) found six production lines of the exited-tid fold that no
+test pinned (mutants A11-A16 survived at origin/main ac1110c097), and a live os.fork probe where the child,
+exiting passes opened before the fork, booked NEGATIVE CPU (counters['outer'].cpu_s = -0.115 s, accounted
+-0.115 s). Card t_01a1d6fffa79f116.
+
+Fix (hermes_cli/loop_accounting.py)
+- The at-fork child hook now bumps a fork generation and records the child's thread_time()/perf_counter()
+  at the fork. A Pass remembers the generation it opened in; when it closes under a newer one (opened in the
+  parent, closing in the child) it books only the child's CPU and wall since the fork. Decision: rebase,
+  not drop: that CPU really was spent by the child's thread inside the pass, while the parent's share is
+  already booked by the parent. The parent's start mark is meaningless in the child because the child's
+  thread clock restarts at 0, which is what produced the negative CPU. span tokens need nothing: span_close
+  already refuses a token from another native tid, which a fork child always has.
+- Cost: one dict read per enter and per exit (bench test_loop_accounting_bench still passes).
+
+Five whys (negative CPU)
+1. Why negative? cpu = thread_time() - self._c0 with _c0 taken in the parent.
+2. Why is that wrong in the child? CLOCK_THREAD_CPUTIME_ID of the child's (new) thread restarts near 0.
+3. Why did #2630 miss it? Its fork test calls _after_fork_child() in-process, where the clock never restarts.
+4. Why did nothing flag it? No test exercised a real fork with passes open; only the live probe did.
+5. Fix: rebase pre-fork passes to the fork point, and pin it with a fake-clock test plus a real os.fork test.
+
+New tests (tests/hermes_cli/test_loop_accounting.py), one per mutant
+- A11 span_open drops _fold_exited: test_span_open_folds_a_queued_exit_before_reading_the_baseline
+  (a reused tid with a queued stale exit opens a span with an outermost pass inside: the mutant books the
+  exited thread's 5 s again, 8 s instead of 3 s).
+- A12 thread_cpu drops _fold_exited: test_thread_cpu_folds_a_queued_exit_before_reporting_accounted_cpu
+- A13 snapshot drops _fold_exited: test_snapshot_folds_an_exit_queued_after_it_listed_the_threads
+  (a thread exits between snapshot's listing and its lock; the reused tid is live, so only snapshot's own
+  fold moves the CPU to exited).
+- A14 after-fork keeps _exited_tids: test_after_fork_child_starts_with_an_empty_exit_queue
+- A15 reset keeps _exited_tids: test_reset_clears_the_exit_queue
+  A14/A15 are numerically benign today (every accounting path folds before it adds, and the child's/reset
+  map is empty, so the stale tids pop nothing); the tests pin the state invariant that the child/reset
+  start with no inherited queue, so a later path that adds before folding cannot inherit stale tids.
+- A16 _own_tid drops the mark.tid check:
+  test_an_exit_mark_for_another_tid_is_replaced_so_the_thread_folds_its_own_tid (a stale mark would queue
+  the wrong tid at thread exit, leaving the thread's CPU for a later thread with its tid).
+- Fork: test_fork_child_does_not_book_negative_cpu_for_pre_fork_passes (fake clock, exact values) and
+  test_real_fork_child_books_no_negative_cpu_for_pre_fork_passes (real os.fork, parent burns 0.1 s first).
+- A6 (span_close <= 0 -> == 0) stays equivalent: Pass.__exit__ clamps depth at 0. Not touched.
+
+Proof (worker-2, exact-anchor mutants, the card's spec files: test_loop_accounting.py,
+test_loop_accounting_bench.py, test_host_loop_lease.py, test_kanban_annotation_host.py)
+- GREEN: 4 files, 79 passed, 0 failed.
+- A11 killed, A12 killed, A13 killed, A14 killed, A15 killed, A16 killed.
+- F1 (Pass.__exit__ ignores the fork generation) killed by both fork tests; F2 (hook does not rebase the
+  clocks) killed by both fork tests, i.e. both fork tests are RED on the pre-fix code.
+---
+ hermes_cli/loop_accounting.py            |  16 ++-
+ tests/hermes_cli/test_loop_accounting.py | 148 +++++++++++++++++++++++
+ 2 files changed, 161 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/loop_accounting.py b/hermes_cli/loop_accounting.py
+index c7cd8b945b..a8b916a7c2 100644
+--- a/hermes_cli/loop_accounting.py
++++ b/hermes_cli/loop_accounting.py
+@@ -110,6 +110,10 @@ _local = threading.local()
+ _exited_tids: collections.deque = collections.deque()  # tids whose thread ended; folded under _lock
+ _started_at = time.time()
+ _state: dict[str, Any] = {"role": None, "thread": None, "stop": None, "pid": os.getpid()}
++# Bumped by the at-fork hook in the child, with the child's thread and wall clocks at the fork: a pass opened
++# before the fork books only the child's CPU and wall since the fork (the child's thread clock restarts at 0,
++# so the parent's start mark would book negative CPU).
++_fork: dict[str, Any] = {"gen": 0, "c0": 0.0, "w0": 0.0}
+ 
+ 
+ class _ThreadExit:
+@@ -171,7 +175,7 @@ class Pass:
+     """One accounted pass (a context manager); see the module docstring. Mark the outcome with
+     :meth:`skip`, :meth:`change`, :meth:`fallback` and :meth:`rows` at any point before it exits."""
+ 
+-    __slots__ = ("_c0", "_outer", "_w0", "changed", "fell_back", "name", "nrows", "skipped")
++    __slots__ = ("_c0", "_gen", "_outer", "_w0", "changed", "fell_back", "name", "nrows", "skipped")
+ 
+     def __init__(self, name: str, skipped: bool = False, changed: Optional[bool] = None, fallback: bool = False,
+                  rows: Optional[int] = None) -> None:
+@@ -197,13 +201,18 @@ class Pass:
+         depth = getattr(_local, "depth", 0)
+         _local.depth = depth + 1
+         self._outer = depth == 0
++        self._gen = _fork["gen"]
+         self._w0 = _perf()
+         self._c0 = _thread_time()
+         return self
+ 
+     def __exit__(self, exc_type, exc, tb) -> None:
+-        cpu = _thread_time() - self._c0
+-        wall = _perf() - self._w0
++        if self._gen == _fork["gen"]:
++            cpu = _thread_time() - self._c0
++            wall = _perf() - self._w0
++        else:  # opened before an os.fork, closing in the child: only the child's part, from the fork
++            cpu = _thread_time() - _fork["c0"]
++            wall = _perf() - _fork["w0"]
+         # Clamped: a fork while a nested pass is open clears the child's depth, so its exits would go negative
+         # and the thread would never count another outermost pass.
+         _local.depth = max(0, getattr(_local, "depth", 1) - 1)
+@@ -600,6 +609,7 @@ def _after_fork_child() -> None:
+     _state.update(thread=None, stop=None, pid=os.getpid(), role=None)
+     _local.__dict__.clear()  # drops this thread's _ThreadExit, queueing the parent's tid: cleared next
+     _exited_tids.clear()
++    _fork.update(gen=_fork["gen"] + 1, c0=_thread_time(), w0=_perf())
+ 
+ 
+ if hasattr(os, "register_at_fork"):
+diff --git a/tests/hermes_cli/test_loop_accounting.py b/tests/hermes_cli/test_loop_accounting.py
+index 77e1b194f2..2add9ccf52 100644
+--- a/tests/hermes_cli/test_loop_accounting.py
++++ b/tests/hermes_cli/test_loop_accounting.py
+@@ -517,3 +517,151 @@ def test_snapshot_reports_cpu_of_exited_threads():
+     t.start()
+     t.join()
+     assert la.snapshot()["process"]["exited_threads_cpu_s"] >= 0.05
++
++
++# -- exited-tid fold paths and fork clocks, from the #2630 post-merge check (t_01a1d6fffa79f116) ---------------
++
++
++def _stale_exit_queued_for(tid: int, cpu: float) -> None:
++    """A thread that accounted ``cpu`` under ``tid`` has exited and queued its fold; this live thread now has
++    the same native id (Linux reuses tids)."""
++    with la._lock:
++        la._thread_accounted[tid] = cpu
++    la._exited_tids.append(tid)
++
++
++def test_span_open_folds_a_queued_exit_before_reading_the_baseline(monkeypatch):
++    """span_open must fold first: a stale baseline makes span_close book the exited thread's CPU again."""
++    clock = [100.0]
++    monkeypatch.setattr(la, "_thread_time", lambda: clock[0])
++    me = la._own_tid()
++    _stale_exit_queued_for(me, 5.0)
++    token = la.span_open("lease.reused")
++    with la.pass_("inside"):  # an outermost pass inside the span: its exit folds the queue
++        clock[0] += 1.0
++    clock[0] += 2.0
++    assert la.span_close(token) is True
++    with la._lock:
++        assert la._thread_accounted[me] == pytest.approx(3.0)  # the span's CPU, once
++        assert la._state["exited_accounted"] == pytest.approx(5.0)
++
++
++def test_thread_cpu_folds_a_queued_exit_before_reporting_accounted_cpu():
++    me = la._own_tid()
++    _stale_exit_queued_for(me, 5.0)
++    rows = {r["tid"]: r for r in la.thread_cpu()}
++    assert rows.get(me, {}).get("accounted_cpu_s", 0.0) == 0.0  # not the exited thread's 5 s
++    assert la._state["exited_accounted"] == pytest.approx(5.0)
++
++
++def test_snapshot_folds_an_exit_queued_after_it_listed_the_threads(monkeypatch):
++    """A thread can exit between snapshot's thread listing and its lock: its tid is live in the listing (reused),
++    so only snapshot's own fold moves its CPU to exited instead of counting it as this live thread's."""
++    me = la._own_tid()
++    with la._lock:
++        la._thread_accounted[me] = 5.0
++    real_thread_cpu = la.thread_cpu
++
++    def listing_then_exit():
++        rows = real_thread_cpu()
++        la._exited_tids.append(me)
++        return rows
++
++    monkeypatch.setattr(la, "thread_cpu", listing_then_exit)
++    snap = la.snapshot()
++    with la._lock:
++        assert me not in la._thread_accounted
++    assert la._state["exited_accounted"] == pytest.approx(5.0)
++    assert snap["process"]["accounted_cpu_s"] == pytest.approx(5.0)
++
++
++def test_after_fork_child_starts_with_an_empty_exit_queue():
++    """The child must not inherit the parent's queued exits (nor the one its own hook queues by dropping the
++    forking thread's exit mark): they are the parent's tids, not the child's."""
++    la._exited_tids.extend([111, 222])
++    la._own_tid()
++    la._after_fork_child()
++    assert not la._exited_tids
++
++
++def test_reset_clears_the_exit_queue():
++    la._exited_tids.extend([111, 222])
++    la.reset()
++    assert not la._exited_tids
++
++
++def test_an_exit_mark_for_another_tid_is_replaced_so_the_thread_folds_its_own_tid():
++    """A mark left under a tid this thread no longer has (a fork child without the at-fork hook) would queue the
++    wrong tid at exit, so a later thread given this tid inherits the exited thread's CPU."""
++    seen: list = []
++
++    def worker():
++        la._local.exit_mark = la._ThreadExit(999_999_001)
++        seen.append(threading.get_native_id())
++        la.record("w", cpu_s=2.0)
++
++    t = threading.Thread(target=worker)
++    t.start()
++    t.join()
++    la.thread_cpu()  # folds the exits queued so far
++    with la._lock:
++        assert seen[0] not in la._thread_accounted
++    assert la._state["exited_accounted"] == pytest.approx(2.0)
++
++
++def test_fork_child_does_not_book_negative_cpu_for_pre_fork_passes(monkeypatch):
++    """The child's thread clock restarts at the fork: passes open across it book only the child's CPU and wall
++    since the fork, never parent mark minus child clock (live probe: outer cpu_s -0.115 s)."""
++    clock = [50.0]
++    monkeypatch.setattr(la, "_thread_time", lambda: clock[0])
++    me = threading.get_native_id()
++    with la.pass_("outer"):
++        with la.pass_("inner"):
++            clock[0] = 0.0  # the child's thread clock
++            la._after_fork_child()  # what os.fork runs in the child, here on this thread
++            clock[0] += 0.25
++        clock[0] += 0.5
++    c = la.counters()
++    assert c["inner"]["cpu_s"] == pytest.approx(0.25)
++    assert c["outer"]["cpu_s"] == pytest.approx(0.75)
++    assert c["outer"]["wall_s"] >= 0.0 and c["inner"]["wall_s"] >= 0.0
++    with la._lock:
++        assert la._thread_accounted[me] == pytest.approx(0.75)
++    with la.pass_("after"):  # a pass opened in the child measures from its own mark
++        clock[0] += 1.0
++    assert la.counters()["after"]["cpu_s"] == pytest.approx(1.0)
++
++
++def _fork_inside_nested_passes() -> int:
++    with la.pass_("outer"):
++        _burn(0.1)  # the parent's thread clock is well past the child's at the fork
++        with la.pass_("inner"):
++            pid = os.fork()
++            if pid == 0:
++                _burn(0.01)
++    return pid
++
++
++@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
++def test_real_fork_child_books_no_negative_cpu_for_pre_fork_passes():
++    read_fd, write_fd = os.pipe()
++    pid = _fork_inside_nested_passes()
++    if pid == 0:  # child: report, then leave without running any more of pytest
++        code = 1
++        try:
++            os.close(read_fd)
++            c = la.counters()
++            snap = la.snapshot()
++            os.write(write_fd, json.dumps({"outer": c["outer"]["cpu_s"], "inner": c["inner"]["cpu_s"],
++                                           "accounted": snap["process"]["accounted_cpu_s"]}).encode())
++            code = 0
++        finally:
++            os._exit(code)
++    os.close(write_fd)
++    with os.fdopen(read_fd, "rb") as fh:
++        raw = fh.read()
++    _, status = os.waitpid(pid, 0)
++    assert os.waitstatus_to_exitcode(status) == 0
++    child = json.loads(raw)
++    assert min(child.values()) >= 0.0, child
++    assert child["inner"] >= 0.005, child  # the child's own CPU inside the pass is booked
+-- 
+2.43.0
+

@@ -1,0 +1,165 @@
+From 56085c371f74b9691487da97f259d99c29d98f04 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:55:20 +0000
+Subject: [PATCH] [daveey] pin state probe failures and passive change-feed
+ threads
+
+Add four regressions for PR #2682: repeated unreadable state reads remain UNKNOWN and wake on each poll, unreadable subscription seeds remain UNKNOWN, probe threads are explicitly passive even inside an owning scope, and global probe failure preserves active state keys while retiring closed topics.
+
+Proof: canonical run_tests.sh: 25 passed across both host change-feed files. mutants.py spec-2682.json: D1-D8 killed, zero survivors; D3/D4/D7 anchors adapted to current seed/race handling without changing mutation intent. scripts/check --base origin/main: 20 checks OK. Test-only separate file avoids sibling #2633 test edits.
+---
+ .../test_host_change_feed_state_probe.py      | 142 ++++++++++++++++++
+ 1 file changed, 142 insertions(+)
+ create mode 100644 tests/hermes_cli/test_host_change_feed_state_probe.py
+
+diff --git a/tests/hermes_cli/test_host_change_feed_state_probe.py b/tests/hermes_cli/test_host_change_feed_state_probe.py
+new file mode 100644
+index 0000000000..5560130bfe
+--- /dev/null
++++ b/tests/hermes_cli/test_host_change_feed_state_probe.py
+@@ -0,0 +1,142 @@
++"""Host change feed: pins for PR #2682's per-profile state probe and detached probe thread. [daveey]
++
++Each test kills one mutant that survived ``test_host_change_feed.py`` (post-merge check t_01a1d6de414a667d):
++D5 an unreadable state.db read as ``None``, D6 the probe thread spawned without ``passive=True``, D8 a failed
++probe turning state topics UNKNOWN. Kept in its own file so it does not collide with the open PR that pins
++PR #2633's mutants in ``test_host_change_feed.py``.
++"""
++
++from __future__ import annotations
++
++import sqlite3
++
++import pytest
++
++from hermes_cli import host_change_feed as hcf
++from hermes_cli import loop_accounting as la
++
++
++class _Source:
++    """A mutable set of counters the feed probes; ``fail`` makes the whole probe raise."""
++
++    def __init__(self, **keys: object) -> None:
++        self.keys: dict[str, object] = dict(keys)
++        self.fail = False
++
++    def __call__(self) -> dict[str, object]:
++        if self.fail:
++            raise sqlite3.OperationalError("disk I/O error")
++        return dict(self.keys)
++
++
++@pytest.fixture(autouse=True)
++def _fresh():
++    hcf.reset()
++    la.reset()
++    yield
++    hcf.reset()
++
++
++def test_state_db_unreadable_twice_wakes_each_time_or_reports_unknown():
++    """D5: a state.db that stays unreadable is UNKNOWN on every probe, so its subscriber wakes on each one
++    (fail-open). Reading it as ``None`` would wake once, then compare equal and go quiet."""
++    topic = "state:/p/state.db"
++    fail = {"on": False}
++
++    def state_probe(path):
++        if fail["on"]:
++            raise sqlite3.OperationalError("disk I/O error")
++        return ("ident", 1, 7)
++
++    feed = hcf.HostChangeFeed(_Source(replica=1), autostart=False, state_probe=state_probe)
++    feed.poll_once()  # baseline
++    sub = feed.subscribe("sessions", [topic])
++    assert feed.poll_once() == frozenset()  # readable and unchanged: nobody wakes
++
++    fail["on"] = True
++    assert feed._read_state(topic) is hcf.UNKNOWN
++    assert feed.poll_once() == {topic}
++    assert sub.wait(0.0) == {topic}
++    assert feed.keys()[topic] is hcf.UNKNOWN
++    assert feed.poll_once() == {topic}  # still unreadable: never proof that nothing moved
++    assert sub.wait(0.0) == {topic}
++    assert feed.keys()[topic] is hcf.UNKNOWN
++
++    fail["on"] = False
++    assert feed.poll_once() == {topic}  # readable again: UNKNOWN -> a real key is a move
++    assert feed.poll_once() == frozenset()
++
++
++def test_subscribe_to_an_unreadable_state_db_seeds_unknown():
++    """D5 at subscribe(): the seed of an unreadable state.db is UNKNOWN, so the first probe wakes it."""
++    topic = "state:/p/state.db"
++
++    def state_probe(path):
++        raise sqlite3.OperationalError("disk I/O error")
++
++    feed = hcf.HostChangeFeed(_Source(replica=1), autostart=False, state_probe=state_probe)
++    feed.poll_once()
++    sub = feed.subscribe("sessions", [topic])
++    assert feed.keys()[topic] is hcf.UNKNOWN
++    assert feed.poll_once() == {topic}
++    assert sub.wait(0.0) == {topic}
++
++
++def test_probe_thread_is_spawned_passive(monkeypatch, tmp_path):
++    """D6: start() asks for a passive thread, so even under a live work scope (should the empty context ever
++    be lost) the probe thread is never a TrackedThread that the first subscriber's scope accounts for."""
++    from agent import memory_provider
++    from hermes_cli.local_work import Registry
++    from hermes_cli.local_work_threads import TrackedThread
++
++    real = memory_provider.spawn_context_thread
++    registry = Registry(homes=[str(tmp_path)])
++    calls: list[dict[str, object]] = []
++    under_scope: list[object] = []
++
++    def spy(target, **kwargs):
++        calls.append(kwargs)
++        with registry.scope("turn", home=str(tmp_path), source="regression"):
++            under_scope.append(real(target, **kwargs))  # never started: a construction-only check
++        return real(target, **kwargs)
++
++    monkeypatch.setattr(memory_provider, "spawn_context_thread", spy)
++    with registry.scope("turn", home=str(tmp_path), source="control"):
++        assert isinstance(real(lambda: None, name="control"), TrackedThread)  # the scope tracks a plain spawn
++
++    feed = hcf.HostChangeFeed(_Source(replica=1), interval=0.01)
++    try:
++        assert feed.start()
++        assert calls and calls[0].get("passive") is True
++        assert under_scope and not isinstance(under_scope[0], TrackedThread)
++        assert not isinstance(feed._thread, TrackedThread)
++    finally:
++        feed.stop()
++    assert registry.snapshot().active == 0
++
++
++def test_probe_failure_keeps_state_topic_keys():
++    """D8: a failed probe makes the probe's own topics UNKNOWN but never a state topic: a state.db's key comes
++    only from its own read. A closed state subscription is dropped, not retained as UNKNOWN (which would
++    report it as moved again on the next probe)."""
++    kept, closed = "state:/a/state.db", "state:/b/state.db"
++    src = _Source(replica=1, **{"board:/k/kanban.db": 2})
++    feed = hcf.HostChangeFeed(src, autostart=False, state_probe=lambda path: ("ident", str(path), 3))
++    feed.poll_once()
++    feed.subscribe("sessions-a", [kept])
++    gone = feed.subscribe("sessions-b", [closed])
++    assert feed.poll_once() == frozenset()
++    gone.close()
++
++    src.fail = True
++    moved = feed.poll_once()
++    assert {"replica", "board:/k/kanban.db"} <= moved
++    assert kept not in moved  # re-read on its own: unchanged, so its subscriber does not wake
++    keys = feed.keys()
++    assert keys[kept] == ("ident", "/a/state.db", 3)
++    assert closed not in keys
++    assert keys["replica"] is hcf.UNKNOWN
++
++    src.fail = False
++    assert feed.poll_once() == {"replica", "board:/k/kanban.db"}  # only the probe's topics come back
++    assert closed not in feed.keys()
+-- 
+2.43.0
+

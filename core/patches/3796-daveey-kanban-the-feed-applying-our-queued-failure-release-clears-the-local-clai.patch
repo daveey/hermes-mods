@@ -1,0 +1,265 @@
+From c820a1e82ec46b245959d34a036963fc721ea70c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 19:00:56 +0000
+Subject: [PATCH] [daveey] kanban: the feed applying our queued failure release
+ clears the local claim; triage is a leftover-claim status
+
+On a primary board the dead-worker sweep queues a run-scoped `release` command and leaves the
+local row alone; the Board feed later moves the card off `running`. Claim columns are local-only,
+so the feed never cleared them and the card kept the dead worker's claim_lock/worker_pid.
+
+worker-7 fixture t_01a1d62545843356:
+- run 2440 (rc=0 protocol violation) went `ready` but kept `claim_lock hermes-worker-7:2256394`
+  until the leftover sweep released it after ORPHAN_CLAIM_GRACE_SECONDS (retry ~3.5 min late);
+- run 2462 gave up to `triage` and kept its claim forever (`triage` was missing from
+  `_LEFTOVER_CLAIM_STATUSES`), so the creator's kanban_archive was refused "it is claimed".
+
+Five whys: the claim stayed -> the feed only writes synced columns -> the release is applied by
+the Board, not by the local sweep (by design: no provisional mirror edits) -> nothing tied the
+feed's status move to the local claim the release was about -> the leftover sweep was the only
+backstop, gated by a grace window and a status list that omitted triage.
+
+Fix:
+1. `kanban_release_claim.release_on_feed`, called from `_upsert_task` in the same feed apply
+   transaction: when the card leaves `running`, the claim is this host's, its claimed run has a
+   `kanban_failure_commands` row this host queued (worker already judged gone) and the worker is
+   not alive, clear claim_lock/claim_expires/worker_pid/worker_started_at/last_heartbeat_at
+   (CAS on the exact values read). Covers ready (retry), triage/blocked (give-up) and the neutral
+   releases that use the same command table.
+2. `triage` added to `_LEFTOVER_CLAIM_STATUSES` as the backstop.
+
+Tests:
+- tests/hermes_cli/test_kanban_release_claim.py: the real primary crash sweep with an rc=0
+  protocol violation, then the Board's feed row: ready/triage/blocked each leave claim_lock NULL
+  in the same apply; the triage card is archivable by its creator; controls: a status move with
+  no queued release, a live worker, and a feed row still `running` keep the claim.
+  RED without the fix: 5 failed (claim kept, "it is claimed (status=triage)").
+- tests/hermes_cli/test_kanban_leftover_local_claim.py: the status sweep covers triage
+  (RED without the fix: test_every_non_running_status_is_covered[triage] fails).
+---
+ hermes_cli/kanban_db_dispatch_claims.py       |   2 +-
+ hermes_cli/kanban_db_sync.py                  |   2 +
+ hermes_cli/kanban_release_claim.py            |  46 +++++++
+ .../test_kanban_leftover_local_claim.py       |   2 +-
+ tests/hermes_cli/test_kanban_release_claim.py | 117 ++++++++++++++++++
+ 5 files changed, 167 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/kanban_release_claim.py
+ create mode 100644 tests/hermes_cli/test_kanban_release_claim.py
+
+diff --git a/hermes_cli/kanban_db_dispatch_claims.py b/hermes_cli/kanban_db_dispatch_claims.py
+index 3942f3f31e..b002c89d5b 100644
+--- a/hermes_cli/kanban_db_dispatch_claims.py
++++ b/hermes_cli/kanban_db_dispatch_claims.py
+@@ -38,7 +38,7 @@ def _claim_in_flight(conn: sqlite3.Connection, task_id: str, now: int) -> bool:
+     return _kb()._sync.held_by_us_live(conn, task_id, now)
+ 
+ 
+-_LEFTOVER_CLAIM_STATUSES = ("ready", "todo", "review", "blocked", "scheduled", "done")
++_LEFTOVER_CLAIM_STATUSES = ("ready", "todo", "review", "blocked", "scheduled", "done", "triage")
+ 
+ 
+ def release_leftover_local_claims(conn: sqlite3.Connection) -> list[str]:
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 539e6475b3..9771e97b6d 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1408,6 +1408,8 @@ def _upsert_task(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: A
+         assignments = ", ".join(f"{c} = ?" for c in cols)
+         conn.execute(f"UPDATE tasks SET {assignments}{', ' if cols else ''}sync_version = ? WHERE id = ?",
+                      (*cols.values(), ch.version, ch.uid))
++        from hermes_cli.kanban_release_claim import release_on_feed
++        release_on_feed(conn, ch.uid, old, cols.get("status"))  # our queued failure release landed [daveey]
+     if "lease_holder" in ch.fields:  # the service's full row carries its lease mirror
+         _mirror_lease(conn, ch.uid, ch.fields.get("lease_holder"), ch.fields.get("lease_expires"),
+                       ch.version, own, result)
+diff --git a/hermes_cli/kanban_release_claim.py b/hermes_cli/kanban_release_claim.py
+new file mode 100644
+index 0000000000..dd76d571a9
+--- /dev/null
++++ b/hermes_cli/kanban_release_claim.py
+@@ -0,0 +1,46 @@
++"""Clear this host's claim when the Board applies the failure release this host queued. [daveey]
++
++On a primary board the dead-worker sweep queues a run-scoped ``release`` command (``kanban_failure_release``) and
++leaves the local row alone; the Board feed later moves the card off ``running`` (``ready`` for a retry, ``triage`` or
++``blocked`` for a give-up). Claim columns are local-only, so the feed never clears them: the card kept the dead
++worker's ``claim_lock``/``worker_pid``. A retry waited out ``ORPHAN_CLAIM_GRACE_SECONDS`` for the leftover sweep, and a
++give-up to ``triage`` kept its claim forever, so the creator could not archive it (worker-7 t_01a1d62545843356,
++runs 2440/2462). The status move and the claim release now commit in the same feed transaction.
++"""
++from __future__ import annotations
++
++import sqlite3
++
++
++def release_on_feed(conn: sqlite3.Connection, task_id: str, old, new_status) -> bool:
++    """Called inside the feed apply, after the task row update. ``old`` is the local row before it.
++
++    Clears the claim only when the card left ``running``, the claim is this host's, the claimed run has a failure
++    command this host queued (so its worker was already judged gone), and that worker is not alive. The CAS matches
++    the exact claim values read, so a claim taken since is never touched."""
++    if old is None or old["status"] != "running" or not new_status or new_status == "running":
++        return False
++    lock, run_id = old["claim_lock"], old["current_run_id"]
++    from hermes_cli import kanban_db as kb
++    if not lock or run_id is None or not kb._claim_is_local(lock, kb._host_prefix()):
++        return False
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_failure_commands'").fetchone():
++        return False
++    from hermes_cli import kanban_db_sync as sync
++    uid = sync.run_uid(conn, run_id)
++    if not uid or conn.execute("SELECT 1 FROM kanban_failure_commands WHERE run_uid = ? AND task_id = ?",
++                               (uid, task_id)).fetchone() is None:
++        return False
++    pid = old["worker_pid"]
++    from hermes_cli.kanban_db_dispatch import _worker_alive
++    if pid and _worker_alive(pid, old["worker_started_at"]):
++        return False
++    cur = conn.execute(
++        "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
++        "last_heartbeat_at = NULL WHERE id = ? AND status = ? AND claim_lock IS ? AND worker_pid IS ?",
++        (task_id, new_status, lock, pid),
++    )
++    if cur.rowcount == 1:
++        kb._log.info("kanban: feed applied the queued release of %s (%s): cleared local claim %s",
++                     task_id, new_status, lock)
++    return cur.rowcount == 1
+diff --git a/tests/hermes_cli/test_kanban_leftover_local_claim.py b/tests/hermes_cli/test_kanban_leftover_local_claim.py
+index 42c842821c..26e6cda099 100644
+--- a/tests/hermes_cli/test_kanban_leftover_local_claim.py
++++ b/tests/hermes_cli/test_kanban_leftover_local_claim.py
+@@ -76,7 +76,7 @@ def test_dispatch_tick_releases_it_with_nothing_running(conn):
+     assert _claim_cols(conn, tid)[0] is None
+ 
+ 
+-@pytest.mark.parametrize("status", ["todo", "review", "blocked", "scheduled", "done"])
++@pytest.mark.parametrize("status", ["todo", "review", "blocked", "scheduled", "done", "triage"])
+ def test_every_non_running_status_is_covered(conn, status):
+     tid = _feed_requeued(conn, status=status)
+     assert kbd.release_leftover_local_claims(conn) == [tid]
+diff --git a/tests/hermes_cli/test_kanban_release_claim.py b/tests/hermes_cli/test_kanban_release_claim.py
+new file mode 100644
+index 0000000000..a88a272708
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_release_claim.py
+@@ -0,0 +1,117 @@
++"""The feed that applies this host's queued failure release also clears the local claim. [daveey]
++
++worker-7 t_01a1d62545843356: run 2440 (rc=0 protocol violation) went ``ready`` through the Board feed but kept
++``claim_lock``/``worker_pid`` until the leftover sweep's 180 s grace; run 2462 gave up to ``triage`` and kept its
++claim forever (``triage`` was not a leftover status), so the creator's archive was refused "it is claimed".
++"""
++import os
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_db_sync as sync
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.test_kanban_failure_transport import _running
++
++DEAD_PID = 2 ** 22 - 3
++
++
++@pytest.fixture
++def live(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    conn = kbc.connect(home / "kanban.db")
++    from hermes_cli import kanban_sync_client as client
++    client.ensure_identity(conn, "default", "fixture")
++    sync.set_mode(conn, "primary")
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def _claim(conn, tid):
++    return tuple(conn.execute("SELECT claim_lock, claim_expires, worker_pid, worker_started_at FROM tasks "
++                              "WHERE id = ?", (tid,)).fetchone())
++
++
++def _crash_rc0(conn, monkeypatch, pid=DEAD_PID):
++    """A primary card whose worker exited rc=0 with no terminal kanban call: the real sweep queues the release."""
++    from hermes_cli import kanban_owner_recovery as recovery
++    tid, rid = _running(conn)
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET worker_pid=?, claim_lock=?, claim_expires=?, started_at=1 WHERE id=?",
++                     (pid, kb._host_prefix() + "2256394", 4102444800, tid))
++        conn.execute("DELETE FROM kanban_sync_outbox")
++    monkeypatch.setattr(dispatch, "_worker_alive", lambda *a: False)
++    monkeypatch.setattr(recovery, "owner_reclaim_blocked", lambda *a, **kw: False)
++    monkeypatch.setattr(recovery, "managed_run_exit_code", lambda *a: 0)
++    monkeypatch.setattr(recovery, "apply_attempt_note", lambda *a: None)
++    monkeypatch.setattr(dispatch._host_reboot, "victims", lambda *a: (None, []))
++    monkeypatch.setattr(dispatch._host_reboot, "note", lambda *a: None)
++    monkeypatch.setattr(dispatch._owner_death, "note", lambda *a: None)
++
++    def dead_worker(*args, **kwargs):
++        dead = dispatch._DeadWorker("crashed", 0, "worker exited cleanly (rc=0) - protocol violation", "crashed",
++                                    {"exit_code": 0, "protocol_violation": True})
++        dead.protocol_violation = True
++        return dead
++    monkeypatch.setattr(dispatch, "_classify_dead_worker", dead_worker)
++    assert dispatch.detect_crashed_workers(conn) == [tid]
++    assert conn.execute("SELECT op FROM kanban_sync_outbox").fetchone()[0] == "release"
++    assert _claim(conn, tid)[0] is not None  # the sweep itself leaves the primary mirror alone
++    return tid, rid
++
++
++def _feed(conn, tid, status, version=6):
++    change = sync.RemoteChange(seq=version, table="tasks", uid=tid, op="upsert", version=version, hlc="",
++                               origin_gateway="board", fields={"status": status})
++    sync.apply_remote_changes(conn, [change], new_cursor=version, observers=False)
++
++
++@pytest.mark.parametrize("status", ["ready", "triage", "blocked"])
++def test_feed_release_clears_claim_in_the_same_apply(live, monkeypatch, status):
++    """ready = the rc=0 retry; triage/blocked = the give-up. No grace wait, no leftover sweep."""
++    tid, _ = _crash_rc0(live, monkeypatch)
++    _feed(live, tid, status)
++    assert live.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == status
++    assert _claim(live, tid) == (None, None, None, None)
++
++
++def test_ready_retry_is_claimable_at_once(live, monkeypatch):
++    tid, _ = _crash_rc0(live, monkeypatch)
++    _feed(live, tid, "ready")
++    row = live.execute("SELECT claim_lock FROM tasks WHERE id=? AND status='ready'", (tid,)).fetchone()
++    assert row is not None and row[0] is None
++
++
++def test_give_up_to_triage_can_be_archived(live, monkeypatch):
++    tid, _ = _crash_rc0(live, monkeypatch)
++    _feed(live, tid, "triage")
++    from hermes_cli import kanban_archive_scope as scope
++    assert scope._worker_may_archive_own(live, kb.get_task(live, tid)) is None
++
++
++def test_status_move_without_our_release_keeps_the_claim(live, monkeypatch):
++    """A lease-expiry status row with no queued command is the leftover sweep's job (grace applies)."""
++    tid, _ = _running(live)
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET worker_pid=?, claim_lock=? WHERE id=?",
++                     (DEAD_PID, kb._host_prefix() + "1", tid))
++    _feed(live, tid, "ready")
++    assert _claim(live, tid)[0] == kb._host_prefix() + "1"
++
++
++def test_live_worker_keeps_the_claim(live, monkeypatch):
++    tid, _ = _crash_rc0(live, monkeypatch, pid=os.getpid())
++    monkeypatch.setattr(dispatch, "_worker_alive", lambda *a: True)
++    _feed(live, tid, "ready")
++    assert _claim(live, tid)[2] == os.getpid()
++
++
++def test_still_running_on_the_feed_keeps_the_claim(live, monkeypatch):
++    tid, _ = _crash_rc0(live, monkeypatch)
++    _feed(live, tid, "running")
++    assert _claim(live, tid)[0] is not None
+-- 
+2.43.0
+

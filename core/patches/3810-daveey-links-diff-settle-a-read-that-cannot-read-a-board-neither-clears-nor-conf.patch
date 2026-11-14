@@ -1,0 +1,218 @@
+From 08d542859f09a1b8a7bf843902f85e21fdc01050 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 18:52:13 +0000
+Subject: [PATCH] [daveey] links-diff settle: a read that cannot read a board
+ neither clears nor confirms its entries
+
+PR #2520 review (t_01a1d6335e6ee782, request_changes): settle() intersected the
+entries AND the unreadable boards of every read, so a replica that turned
+unreadable after the first read dropped its only_in_* entries and its own
+unreadable mark, and the window ended clean: True. Repros: read 1 only_in_replica
+(hub,B,t_x), read 2 unreadable [B] -> clean True; lag on B then B unreadable ->
+clean True. The symmetric case failed open too: B unreadable in read 1, a real
+difference on B in every later read -> in_flight, clean True.
+
+Now each entry is judged only by the reads that could read its board: persistent
+when every such read lists it (and at least one could), in_flight otherwise.
+`unreadable` is the LAST read's, the report is never clean while it is non-empty,
+and the window keeps reading while it is.
+
+Review nits: --settle help text now renders DEFAULT_SETTLE_S. Counts vs lists in
+--json: counts (ledger_links, replica_links, chats) are the last read's raw totals,
+as the docstring says; only_in_* are the settled lists.
+
+Tests: 2 new (RED on 9107f6b5c0, GREEN here); 657 tests across every file that
+imports kanban_chat_links pass.
+---
+ hermes_cli/kanban_chat_links_settle.py        | 63 ++++++++++++-------
+ hermes_cli/kanban_parser.py                   |  4 +-
+ .../test_kanban_chat_links_settle.py          | 38 ++++++++++-
+ 3 files changed, 80 insertions(+), 25 deletions(-)
+
+diff --git a/hermes_cli/kanban_chat_links_settle.py b/hermes_cli/kanban_chat_links_settle.py
+index d2c9e67162..af0688cc33 100644
+--- a/hermes_cli/kanban_chat_links_settle.py
++++ b/hermes_cli/kanban_chat_links_settle.py
+@@ -7,10 +7,14 @@ listed 1-3 brand-new cards, each gone within 20-60 s, so ``clean`` was False in
+ a parity gate (laptop-1, 6 samples 20 s apart, 2026-11-13, live proof t_01a1d5c12a26ef3f).
+ 
+ :func:`settle` re-reads the diff every ``poll_s`` for up to ``settle_s`` and keeps as a difference only an entry
+-present in EVERY sample: a persistent divergence (a link one side never gets) is still in the last sample and the
+-report stays unclean; an entry that cleared, or that showed up only after the first sample, is sync lag and is
+-reported under ``in_flight`` without making the report unclean. It stops at the first sample in which nothing of the
+-first sample persists, so a quiet board answers in one read.
++present in EVERY sample that could read its board: a persistent divergence (a link one side never gets) is still in
++the last sample and the report stays unclean; an entry that cleared, or that showed up only after the first sample,
++is sync lag and is reported under ``in_flight`` without making the report unclean. It stops at the first sample in
++which nothing persists and every replica was readable, so a quiet board answers in one read.
++
++A sample in which a board's replica is unreadable says nothing about that board: it neither clears nor confirms its
++entries, and the report is never clean while the LAST sample has an unreadable replica (PR #2520 review: a plain
++intersection let a replica that turned unreadable mid-window drop its differences and end clean).
+ """
+ 
+ from __future__ import annotations
+@@ -22,6 +26,9 @@ from typing import Any, Callable
+ DEFAULT_SETTLE_S = 90.0
+ DIFF_KEYS = ("only_in_ledger", "only_in_replica")
+ 
++Entry = tuple[str, str, tuple]  # (diff key, session, (gateway, board, task id))
++Read = tuple[set[Entry], set[str]]  # one sample: (entries, unreadable boards)
++
+ 
+ def default_poll_s() -> float:
+     """Two sync intervals (``kanban.sync.interval_seconds``), at least 5 s."""
+@@ -34,12 +41,27 @@ def default_poll_s() -> float:
+     return max(5.0, 2 * interval)
+ 
+ 
+-def _entries(report: dict[str, Any]) -> set[tuple[str, str, tuple]]:
++def _entries(report: dict[str, Any]) -> set[Entry]:
+     return {(key, session, tuple(card)) for key in DIFF_KEYS for session, cards in report[key].items()
+             for card in cards}
+ 
+ 
+-def _grouped(entries: set[tuple[str, str, tuple]], key: str) -> dict[str, list[tuple]]:
++def _board(entry: Entry) -> str:
++    return entry[2][1]
++
++
++def _split(reads: list[Read]) -> tuple[set[Entry], set[Entry]]:
++    """(persistent, in_flight). Persistent: listed by every sample that could read the entry's board, and at least
++    one could. In flight: the rest of what any sample listed (a sample that could not read the board neither clears
++    nor confirms the entry)."""
++    listed: set[Entry] = set().union(*(entries for entries, _bad in reads))
++    persistent = {e for e in listed
++                  if any(_board(e) not in bad for _e, bad in reads)
++                  and all(e in entries for entries, bad in reads if _board(e) not in bad)}
++    return persistent, listed - persistent
++
++
++def _grouped(entries: set[Entry], key: str) -> dict[str, list[tuple]]:
+     out: dict[str, list[tuple]] = {}
+     for k, session, card in entries:
+         if k == key:
+@@ -52,30 +74,25 @@ _clock: Callable[[], float] = time.monotonic
+ 
+ 
+ def settle(snapshot: Callable[[], dict[str, Any]], settle_s: float, poll_s: float) -> dict[str, Any]:
+-    """``snapshot()`` (one raw ``links_diff`` read) re-read until nothing of the first read persists or ``settle_s``
+-    has passed. Counts come from the last read; ``only_in_*`` and ``unreadable`` hold what every read listed;
+-    ``in_flight`` what some read listed and another did not."""
++    """``snapshot()`` (one raw ``links_diff`` read) re-read until nothing persists and every replica is readable, or
++    ``settle_s`` has passed. Counts and ``unreadable`` come from the last read; ``only_in_*`` hold what every read
++    able to read the board listed; ``in_flight`` the rest of what some read listed."""
+     sleep, clock = _sleep, _clock
+     start = clock()
+-    report = snapshot()
+-    persistent = _entries(report)
+-    seen = set(persistent)
+-    unreadable = set(report["unreadable"])
+-    samples = 1
+-    while (persistent or unreadable) and clock() - start < settle_s:
+-        sleep(max(0.0, min(poll_s, settle_s - (clock() - start))))
++    reads: list[Read] = []
++    while True:
+         report = snapshot()
+-        samples += 1
+-        current = _entries(report)
+-        seen |= current
+-        persistent &= current
+-        unreadable &= set(report["unreadable"])
+-    in_flight = seen - persistent
++        reads.append((_entries(report), set(report["unreadable"])))
++        persistent, in_flight = _split(reads)
++        unreadable = reads[-1][1]
++        if not (persistent or unreadable) or clock() - start >= settle_s:
++            break
++        sleep(max(0.0, min(poll_s, settle_s - (clock() - start))))
+     out = dict(report)
+     out.update({key: _grouped(persistent, key) for key in DIFF_KEYS})
+     out["unreadable"] = sorted(unreadable)
+     out["clean"] = not persistent and not unreadable
+     out["in_flight"] = {key: _grouped(in_flight, key) for key in DIFF_KEYS}
+-    out["settle"] = {"window_s": settle_s, "poll_s": poll_s, "samples": samples,
++    out["settle"] = {"window_s": settle_s, "poll_s": poll_s, "samples": len(reads),
+                      "elapsed_s": round(clock() - start, 1)}
+     return out
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 85346cd786..0cd7bb6bd7 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -14,6 +14,7 @@ import json
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_dispatch as kbd
+ from hermes_cli import kanban_db_notify as kbn
++from hermes_cli.kanban_chat_links_settle import DEFAULT_SETTLE_S
+ # The `resume` handler rides kanban.py's existing kanban_parser import, so kanban.py (at its
+ # FILE_LINES cap) gains no line for it. [daveey]
+ from hermes_cli.kanban_operator_resume import cmd as cmd_resume
+@@ -714,7 +715,8 @@ _SPECS = [
+         _cmd("run", [_json_flag()], help="Run one sync round for every synced board now"),
+         _cmd("links", help="Reconcile this gateway's chat links (which chats each card belongs to) now"),
+         _cmd("links-diff", [_json_flag(), _arg("--settle", type=float, default=None, metavar="SECONDS",
+-                                                help="Re-read for up to SECONDS (default 90); only differences "
++                                                help=f"Re-read for up to SECONDS (default {DEFAULT_SETTLE_S:g}); "
++                                                     "only differences "
+                                                      "every read lists count, the rest are in_flight (0: one read)")],
+              help="Compare chat links from the origin ledger with the synced links in the replicas (exit 1 if not clean)"),
+         _cmd("machine-links", [_json_flag(), _arg("--release", action="store_true",
+diff --git a/tests/hermes_cli/test_kanban_chat_links_settle.py b/tests/hermes_cli/test_kanban_chat_links_settle.py
+index cbc5851010..b6966e44c1 100644
+--- a/tests/hermes_cli/test_kanban_chat_links_settle.py
++++ b/tests/hermes_cli/test_kanban_chat_links_settle.py
+@@ -122,7 +122,7 @@ def test_only_in_replica_settles_the_same_way(clock):
+     assert report["clean"] is False and report["only_in_replica"] == {"s1": [card[1]]}
+ 
+ 
+-def test_an_unreadable_replica_is_unclean_only_while_every_read_fails(clock):
++def test_an_unreadable_replica_is_unclean_only_while_the_last_read_fails(clock):
+     report = _run(clock, [_report(unreadable=["default"]), _report()])
+     assert report["clean"] is True and report["unreadable"] == []
+     clock.update(step=0, now=0.0)
+@@ -130,6 +130,42 @@ def test_an_unreadable_replica_is_unclean_only_while_every_read_fails(clock):
+     assert report["clean"] is False and report["unreadable"] == ["default"] and clock["now"] == 30
+ 
+ 
++def test_a_read_that_cannot_read_the_board_neither_clears_nor_confirms_its_entries(clock):
++    # PR #2520 review repro: read 1 lists a difference on board B, read 2 cannot read B. A plain intersection
++    # dropped the entry and the unreadable board both, so the window ended clean: True.
++    stuck = ("s1", ("hub", "B", "t_x"))
++    report = _run(clock, [_report([stuck], key="only_in_replica"), _report(unreadable=["B"])])
++    assert report["clean"] is False and report["unreadable"] == ["B"]
++    assert report["only_in_replica"] == {"s1": [stuck[1]]}
++    # B readable again and still listing it: a persistent difference, not in flight.
++    clock.update(step=0, now=0.0)
++    report = _run(clock, [_report([stuck], key="only_in_replica"), _report(unreadable=["B"]),
++                          _report([stuck], key="only_in_replica")])
++    assert report["clean"] is False and report["unreadable"] == []
++    assert report["only_in_replica"] == {"s1": [stuck[1]]} and report["in_flight"]["only_in_replica"] == {}
++    # Lag on B in read 1, B unreadable in read 2 (second repro): unclean while B cannot be read.
++    clock.update(step=0, now=0.0)
++    report = _run(clock, [_report([stuck]), _report(unreadable=["B"])])
++    assert report["clean"] is False
++    # An unreadable B does not hold up entries on a readable board: they still clear as lag.
++    clock.update(step=0, now=0.0)
++    lag = ("s2", ("hub", "default", "t_lag"))
++    report = _run(clock, [_report([lag]), _report(unreadable=["B"])])
++    assert report["only_in_ledger"] == {} and report["in_flight"]["only_in_ledger"] == {"s2": [lag[1]]}
++    assert report["clean"] is False and report["unreadable"] == ["B"]
++
++
++def test_a_difference_on_a_board_first_unreadable_counts_from_its_first_readable_read(clock):
++    # Read 1 cannot read B, reads 2-3 list a difference on it: persistent, not lag (else it ended clean).
++    stuck = ("s1", ("hub", "B", "t_x"))
++    report = _run(clock, [_report(unreadable=["B"]), _report([stuck]), _report([stuck])])
++    assert report["clean"] is False and report["only_in_ledger"] == {"s1": [stuck[1]]}
++    # Listed only while B was unreadable, never once B could be read: not a difference.
++    clock.update(step=0, now=0.0)
++    report = _run(clock, [_report([stuck], unreadable=["B"]), _report()])
++    assert report["clean"] is True and report["in_flight"]["only_in_ledger"] == {"s1": [stuck[1]]}
++
++
+ def test_the_last_sleep_stops_at_the_window(clock):
+     _run(clock, [_report([("s1", ("hub", "default", "t_x"))])], settle_s=25.0)
+     assert clock["sleeps"] == [10.0, 10.0, 5.0]
+-- 
+2.43.0
+

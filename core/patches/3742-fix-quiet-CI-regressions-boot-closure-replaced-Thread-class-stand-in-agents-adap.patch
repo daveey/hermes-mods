@@ -1,0 +1,464 @@
+From 6696ec925bcdaeff293425375c9d4e6ccac3cd5e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 01:53:52 +0000
+Subject: [PATCH] =?UTF-8?q?fix(quiet):=20CI=20regressions=20=E2=80=94=20bo?=
+ =?UTF-8?q?ot=20closure,=20replaced=20Thread=20class,=20stand-in=20agents,?=
+ =?UTF-8?q?=20adapter=20labels=20[daveey]?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- pm.environments registers the dependency tree only when hermes_bootstrap installed the
+  attestation (never imports a module an older/partial launch closure lacks); startup
+  inventory and launcher fixtures list code_attestation, local_work, _launch_template.
+- TrackedThread subclasses the stdlib Thread resolved via the main thread's MRO; a replaced
+  threading.Thread is honoured and latches 'threading-thread-replaced' unknown coverage.
+- run_in_pool(None) submits to the loop's scope-aware default executor.
+- Facade/review wrappers dispatch through the class so stand-in agents keep working.
+- Reservation labels never raise on partially built adapters (_work_label).
+- resolve_channel_skills stays importable from gateway.platforms.base (plugin boundary).
+- Revert accidentally committed */cache/plugin_hooks.json test artifacts.
+---
+ agent/memory_provider.py                      |  5 ++-
+ agent/turn_facade.py                          |  3 +-
+ default/cache/plugin_hooks.json               |  2 +-
+ gateway/platforms/base.py                     | 18 ++++++---
+ gateway/run_adapters.py                       |  3 +-
+ gateway/session_ingress.py                    |  3 +-
+ gateway/session_ingress_burst.py              |  3 +-
+ hermes_cli/local_work_threads.py              | 38 +++++++++++++++++--
+ owned/cache/plugin_hooks.json                 |  2 +-
+ p/cache/plugin_hooks.json                     |  2 +-
+ plugins/platforms/discord/adapter.py          |  2 +-
+ plugins/platforms/slack/adapter.py            |  4 +-
+ pm/environments.py                            |  8 ++--
+ pyproject.toml                                |  3 +-
+ run_agent.py                                  |  4 +-
+ target/cache/plugin_hooks.json                |  2 +-
+ tests/gateway/test_slack_channel_skills.py    |  2 +-
+ tests/hermes_cli/test_local_work_threads.py   | 25 ++++++++++++
+ .../test_source_launcher_publication.py       |  1 +
+ tools/code_kernel_scope.py                    |  4 +-
+ 20 files changed, 104 insertions(+), 30 deletions(-)
+
+diff --git a/agent/memory_provider.py b/agent/memory_provider.py
+index 522c78fab6..855dc0d0e2 100644
+--- a/agent/memory_provider.py
++++ b/agent/memory_provider.py
+@@ -35,9 +35,10 @@ def spawn_context_thread(target: Callable[..., Any], *, name: str, daemon: bool
+     Ownership is captured here but reservation begins at start(), not construction.
+     """
+     from hermes_cli.local_work import ACTIVE_SCOPE
+-    from hermes_cli.local_work_threads import TrackedThread
++    from hermes_cli.local_work_threads import TrackedThread, thread_class_replaced
+ 
+-    if ACTIVE_SCOPE.get() is not None and not passive:
++    owner = ACTIVE_SCOPE.get()
++    if owner is not None and not passive and not thread_class_replaced(owner.registry):
+         return TrackedThread(target=target, args=args, kwargs=kwargs, name=name, daemon=daemon)
+     return threading.Thread(target=ctx_bound(target), args=args, kwargs=kwargs, name=name, daemon=daemon)
+ 
+diff --git a/agent/turn_facade.py b/agent/turn_facade.py
+index e845d434c1..6b9a7dd919 100644
+--- a/agent/turn_facade.py
++++ b/agent/turn_facade.py
+@@ -224,7 +224,8 @@ class TurnFacadeMixin:
+         from agent import local_work_agent
+ 
+         with local_work_agent.scope("agent_turn", "agent.turn_facade.run_conversation"):
+-            return self._run_conversation_scoped(*args, **kwargs)
++            # Through the class, not self: callers drive this on stand-in agents (tests, relays).
++            return TurnFacadeMixin._run_conversation_scoped(self, *args, **kwargs)
+ 
+     run_conversation = functools.wraps(_run_conversation_scoped)(run_conversation)
+ 
+diff --git a/default/cache/plugin_hooks.json b/default/cache/plugin_hooks.json
+index 0a1c2e1ee8..586aaabb5f 100644
+--- a/default/cache/plugin_hooks.json
++++ b/default/cache/plugin_hooks.json
+@@ -1 +1 @@
+-{"version": 1, "fingerprint": "d2a931f859820030ad4420e1761525c8d86ed435b8748279512afbefefd36fcf", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
++{"version": 1, "fingerprint": "07774d3f617f2e7bec1c8a60ba7ec9b2c39aecf14b6a24b964230c3bace366a7", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index e3d682a295..e8a45c102a 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -23,6 +23,7 @@ from gateway.platforms.base_log_safety import describe_proxy_error, env_proxy_fo
+ from gateway.platforms.base_image_sniff import _looks_like_image
+ from gateway.platforms.base_media_flags import pad_inline_flags
+ from gateway.runtime_footer import footer_onto_photo_caption, send_footer_unless_captioned
++from gateway.platforms.base_channel_skills import resolve_channel_skills  # plugin API re-export
+ from gateway.platforms.session_model import _SessionModelSettingsMixin
+ from utils import normalize_proxy_url, unlink_files_older_than
+ from agent.i18n import t
+@@ -1785,6 +1786,13 @@ def _ingress_task(create, source):
+     return create_tracked_task(create, "gateway_ingress", source)
+ 
+ 
++def _work_label(adapter, what: str) -> str:
++    """Reservation source label; never raises (``name`` needs ``platform``, which a partially
++    built adapter lacks), so the label can never be what breaks message handling."""
++    platform = getattr(getattr(adapter, "platform", None), "value", None)
++    return f"{platform or type(adapter).__name__}:{what}"
++
++
+ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
+     """Base class for platform adapters: connect/auth, receive, send, handle media."""
+ 
+@@ -2472,7 +2480,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
+         if prior_task and not prior_task.done():
+             prior_task.cancel()
+         self._pending_text_batch_tasks[key] = _ingress_task(
+-            lambda: asyncio.create_task(self._flush_text_batch(key)), f"{self.name}:text_batch")
++            lambda: asyncio.create_task(self._flush_text_batch(key)), _work_label(self, "text_batch"))
+ 
+     def _text_batch_delay_for(self, pending: Optional[MessageEvent]) -> float:
+         """Quiet period before ``pending`` is dispatched; near-split chunks wait longer."""
+@@ -3739,7 +3747,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
+         state.cancel_timer()
+         delay = self._text_debounce_delay(session_key)
+         state.task = _ingress_task(
+-            lambda: asyncio.create_task(self._flush_text_debounce(session_key, delay)), f"{self.name}:text_debounce")
++            lambda: asyncio.create_task(self._flush_text_debounce(session_key, delay)), _work_label(self, "text_debounce"))
+ 
+     async def _flush_text_debounce(self, session_key: str, delay: float) -> None:
+         """Timer task that flushes the debounced text buffer."""
+@@ -3817,7 +3825,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
+         self._active_sessions[session_key] = guard
+         task = _ingress_task(
+             lambda: asyncio.create_task(self._process_message_background(event, session_key)),
+-            f"{self.name}:process_message")
++            _work_label(self, "process_message"))
+         if not self._track_session_task(session_key, task):
+             self._session_tasks.pop(session_key, None)
+             self._release_session_guard(session_key, guard=guard)
+@@ -3885,7 +3893,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
+         from gateway.platforms.base_process_admission import handle_message
+         from hermes_cli.local_work_threads import work_scope
+         # Reserve at entry: before topic recovery, preflight, guard/burst decisions.
+-        with work_scope("gateway_ingress", f"{self.name}:handle_message"):
++        with work_scope("gateway_ingress", _work_label(self, "handle_message")):
+             await handle_message(self, event)
+ 
+     def _shared_runtime_owns_input(self, event: MessageEvent) -> bool:
+@@ -4489,7 +4497,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
+         self._track_session_task(
+             session_key,
+             _ingress_task(lambda: asyncio.create_task(self._drain_after(pending_event, session_key, delay, guard)),
+-                          f"{self.name}:drain_after"))
++                          _work_label(self, "drain_after")))
+ 
+     async def _drain_after(self, pending_event: MessageEvent, session_key: str, delay: float,
+                            guard: Optional[asyncio.Event]) -> None:
+diff --git a/gateway/run_adapters.py b/gateway/run_adapters.py
+index b51f860377..2d9e33e2a4 100644
+--- a/gateway/run_adapters.py
++++ b/gateway/run_adapters.py
+@@ -66,10 +66,11 @@ UNRESOLVED_PROFILE_HOME = _UnresolvedProfileHome()
+ 
+ def _ingress_work_scope(adapter, home):
+     """Direct message_handler ingress reservation (home None: the launch/context home)."""
++    from gateway.platforms.base import _work_label
+     from hermes_cli.local_work_threads import work_scope
+     if home is UNRESOLVED_PROFILE_HOME:
+         home = "unresolved-profile-home"
+-    return work_scope("gateway_ingress", f"{getattr(adapter, 'name', 'adapter')}:message_handler", home)
++    return work_scope("gateway_ingress", _work_label(adapter, "message_handler"), home)
+ 
+ 
+ class _NoWork:
+diff --git a/gateway/session_ingress.py b/gateway/session_ingress.py
+index 91e6752f5b..2094064619 100644
+--- a/gateway/session_ingress.py
++++ b/gateway/session_ingress.py
+@@ -576,9 +576,10 @@ async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
+ 
+     token, commit_token = busy_acceptance.set(accepted), busy_commit.set(committed)
+     try:
++        from gateway.platforms.base import _work_label
+         from hermes_cli.local_work_threads import create_tracked_task
+         task = create_tracked_task(lambda: asyncio.create_task(observe()), 'gateway_ingress',
+-                                   f'{adapter.name}:busy_follow_up')
++                                   _work_label(adapter, 'busy_follow_up'))
+     finally:
+         busy_acceptance.reset(token)
+         busy_commit.reset(commit_token)
+diff --git a/gateway/session_ingress_burst.py b/gateway/session_ingress_burst.py
+index 6da74ab7a5..d356127954 100644
+--- a/gateway/session_ingress_burst.py
++++ b/gateway/session_ingress_burst.py
+@@ -115,7 +115,8 @@ def _track(adapter, task):
+     # A burst timer/commit holds an accepted, undispatched input: ingress work until it ends.
+     # Reserved here (after create_task) only because the coroutine has not yet run a step.
+     from hermes_cli.local_work_threads import begin_work
+-    handle = begin_work('gateway_ingress', f'{adapter.name}:busy_burst')
++    from gateway.platforms.base import _work_label
++    handle = begin_work('gateway_ingress', _work_label(adapter, 'busy_burst'))
+     if handle is not None:
+         task.add_done_callback(handle.finish)
+     adapter._background_tasks.add(task)
+diff --git a/hermes_cli/local_work_threads.py b/hermes_cli/local_work_threads.py
+index 953d1589df..fdc79fe1de 100644
+--- a/hermes_cli/local_work_threads.py
++++ b/hermes_cli/local_work_threads.py
+@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
+ from contextvars import copy_context
+ import os
+ import threading
++from typing import TYPE_CHECKING
+ import weakref
+ 
+ from hermes_cli.local_work import ACTIVE_SCOPE, WorkScope, get_registry
+@@ -60,7 +61,33 @@ def _owner(registry, home, source, kind):
+     return WorkScope(registry, kind, home, source or "explicit-physical-work")
+ 
+ 
+-class TrackedThread(threading.Thread):
++def _real_thread_class():
++    # Resolve the stdlib class through the main thread's MRO, not the ``threading.Thread``
++    # attribute: a first import while a test double replaces that attribute must not make the
++    # double this class's base for the rest of the process.
++    for cls in type(threading.main_thread()).__mro__:
++        if cls.__module__ == "threading" and cls.__name__ == "Thread":
++            return cls
++    return threading.Thread
++
++
++if TYPE_CHECKING:
++    _RealThread = threading.Thread
++else:
++    _RealThread = _real_thread_class()
++
++
++def thread_class_replaced(registry):
++    """True when ``threading.Thread`` is not the stdlib class (a test double, a green-thread
++    monkeypatch). Physical custody cannot attach to a replaced class, so the caller honours the
++    replacement and this latches unknown coverage instead of claiming the work tracked."""
++    if threading.Thread is _RealThread:
++        return False
++    registry.mark_unknown("threading-thread-replaced")
++    return True
++
++
++class TrackedThread(_RealThread):
+     """Capture ownership/context at construction; reserve only on first start.
+ 
+     Use a target, not a run() override: this class owns physical finalization.
+@@ -280,7 +307,7 @@ def create_tracked_task(create, kind, source, home=None):
+     return task
+ 
+ 
+-_scoped_loops = weakref.WeakSet()
++_scoped_loops = weakref.WeakKeyDictionary()  # loop -> its scope-aware default executor
+ 
+ 
+ async def run_in_pool(executor, ctx, func, *args, source="gateway:run_in_executor"):
+@@ -292,6 +319,8 @@ async def run_in_pool(executor, ctx, func, *args, source="gateway:run_in_executo
+     registry = installed_registry()
+     if registry is None:
+         return await loop.run_in_executor(executor, ctx.run, func, *args)
++    if executor is None:  # ``run_in_executor(None, ...)`` semantics: the loop's (scope-aware) default
++        executor = _scoped_loops[loop]
+     future = submit_tracked(executor, ctx.run, func, *args, registry=registry,
+                             home=current_home(), source=source, kind="gateway_pool")
+     return await asyncio.wrap_future(future, loop=loop)
+@@ -303,6 +332,7 @@ def install_scope_default_executor(loop):
+     maintenance ``to_thread`` stays uncounted while scoped work keeps physical custody."""
+     if loop in _scoped_loops:
+         return False
+-    loop.set_default_executor(ScopeAwareExecutor(thread_name_prefix="hermes-gateway-default"))
+-    _scoped_loops.add(loop)
++    executor = ScopeAwareExecutor(thread_name_prefix="hermes-gateway-default")
++    loop.set_default_executor(executor)
++    _scoped_loops[loop] = executor
+     return True
+diff --git a/owned/cache/plugin_hooks.json b/owned/cache/plugin_hooks.json
+index 5a1e5633be..e82ab198ae 100644
+--- a/owned/cache/plugin_hooks.json
++++ b/owned/cache/plugin_hooks.json
+@@ -1 +1 @@
+-{"version": 1, "fingerprint": "71b3072f5ced4c860fc50645731ba369eeac1efa8bea36d4cbd526207604d780", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
++{"version": 1, "fingerprint": "e40844399b9022b253155d5996eed6145372cb401554c1860c73856fda98d0e6", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
+diff --git a/p/cache/plugin_hooks.json b/p/cache/plugin_hooks.json
+index a6e8c2ea66..0182ec64d0 100644
+--- a/p/cache/plugin_hooks.json
++++ b/p/cache/plugin_hooks.json
+@@ -1 +1 @@
+-{"version": 1, "fingerprint": "672d622b7c69bf70032751b71a0f2f9ffef8ebf5360fbe80748098675000b348", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
++{"version": 1, "fingerprint": "6a2902661bf9754df31bd60d86adfc396ee83d390975bb99264e9c402a87cafe", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
+diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+index 3a54dae9b1..096eef7f25 100644
+--- a/plugins/platforms/discord/adapter.py
++++ b/plugins/platforms/discord/adapter.py
+@@ -4790,7 +4790,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
+               - id: "123456"
+                 skills: ["skill-a", "skill-b"]
+         """
+-        from gateway.platforms.base_channel_skills import resolve_channel_skills
++        from gateway.platforms.base import resolve_channel_skills
+         return resolve_channel_skills(self.config.extra, channel_id, parent_id)
+ 
+     def _resolve_channel_prompt(self, channel_id: str, parent_id: str | None = None) -> str | None:
+diff --git a/plugins/platforms/slack/adapter.py b/plugins/platforms/slack/adapter.py
+index 5e1515b4fe..7ebccf4aaa 100644
+--- a/plugins/platforms/slack/adapter.py
++++ b/plugins/platforms/slack/adapter.py
+@@ -4821,7 +4821,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
+             is_bot=self._event_declares_bot_sender(event) or await self._resolve_user_is_bot(
+                 user_id, chat_id=channel_id, team_id=team_id))
+         source.shared_session = event.get("channel_type") == "mpim"  # a group DM keys "dm" but is shared
+-        from gateway.platforms.base_channel_skills import resolve_channel_skills
++        from gateway.platforms.base import resolve_channel_skills
+         # Remaining ``<@UID>`` are OTHER participants (own mention stripped
+         # above); render as ``@DisplayName`` so the agent knows who is addressed.
+         text = await self._humanize_user_mentions(text, chat_id=channel_id, team_id=team_id)
+@@ -6211,7 +6211,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
+         source = self.build_source(
+             chat_id=channel_id, chat_type="dm" if is_dm else "group", user_id=user_id,
+             thread_id=thread_id, scope_id=team_id or None)
+-        from gateway.platforms.base_channel_skills import resolve_channel_skills
++        from gateway.platforms.base import resolve_channel_skills
+         event = MessageEvent(
+             text=text,
+             message_type=(MessageType.COMMAND if text.startswith("/") else MessageType.TEXT),
+diff --git a/pm/environments.py b/pm/environments.py
+index e7ab9a1dd9..4a24e5c6cd 100644
+--- a/pm/environments.py
++++ b/pm/environments.py
+@@ -617,9 +617,11 @@ def activate_dependencies(project_root: Path) -> None:
+     import site
+ 
+     # Executed-code attestation (quiet proof) receipts this tree before site runs its .pth.
+-    from hermes_cli import code_attestation
+-
+-    code_attestation.register_dependency_environment(selected)
++    # Only when ``hermes_bootstrap`` already installed it: activation never imports a module
++    # the launch closure may lack (an older or partial tree); no installation = refused later.
++    attestation = sys.modules.get("hermes_cli.code_attestation")
++    if attestation is not None:
++        attestation.register_dependency_environment(selected)
+     sys.path[:] = [entry for entry in sys.path
+                    if Path(entry).name not in ("site-packages", "dist-packages")
+                    and Path(entry).resolve() != project_root.resolve()]
+diff --git a/pyproject.toml b/pyproject.toml
+index d4b8c913a1..ef8d272e6c 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -609,8 +609,9 @@ opt-in-extras = ["kittentts"]
+ # must exist; an update to a tree that lacks one is refused. A change that moves one of these
+ # files updates its path here.
+ update-startup-files = [
+-  "hermes_bootstrap.py", "hermes_cli/_parser.py", "hermes_cli/_launchers.py",
++  "hermes_bootstrap.py", "hermes_cli/_parser.py", "hermes_cli/_launchers.py", "hermes_cli/_launch_template.py",
+   "hermes_cli/git_fingerprint.py", "hermes_cli/proof_home.py",
++  "hermes_cli/code_attestation.py", "hermes_cli/local_work.py",
+   "hermes_cli/_early_recovery.py", "hermes_cli/update_lock.py", "hermes_cli/update_custody.py",
+   "hermes_cli/update_handoff.py", "hermes_cli/venv_sync.py", "pm/__init__.py", "pm/environments.py",
+   "hermes_cli/main.py", "hermes_cli/config.py", "hermes_cli/__init__.py",
+diff --git a/run_agent.py b/run_agent.py
+index a116c81df3..7bdebe61c0 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -807,8 +807,8 @@ class AIAgent(
+ 
+         custody = [local_work_agent.reserve("background_review", "run_agent._spawn_background_review_now")]
+         try:
+-            self._spawn_background_review_run(
+-                messages_snapshot, review_memory, review_skills, focus, task_cfg, _requeue_attempts, explicit,
++            AIAgent._spawn_background_review_run(  # via the class: stand-in agents drive this method
++                self, messages_snapshot, review_memory, review_skills, focus, task_cfg, _requeue_attempts, explicit,
+                 _work=custody)
+         finally:
+             for held in custody:  # the thread took custody (list cleared) or nothing started
+diff --git a/target/cache/plugin_hooks.json b/target/cache/plugin_hooks.json
+index b265672bda..54d59e2e75 100644
+--- a/target/cache/plugin_hooks.json
++++ b/target/cache/plugin_hooks.json
+@@ -1 +1 @@
+-{"version": 1, "fingerprint": "1d52c676ecc22a052c08f8ad718a756db2d1896ebb68fe24bd73b27755ad9517", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
++{"version": 1, "fingerprint": "86f89b61b7131caef37774ac851aee29e987756bc9c314b8b87f8c05bfd8a070", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
+diff --git a/tests/gateway/test_slack_channel_skills.py b/tests/gateway/test_slack_channel_skills.py
+index 5b5e715cd2..d125375a62 100644
+--- a/tests/gateway/test_slack_channel_skills.py
++++ b/tests/gateway/test_slack_channel_skills.py
+@@ -10,7 +10,7 @@ def _make_adapter(extra=None):
+     return adapter
+ 
+ def _resolve(adapter, channel_id, parent_id=None):
+-    from gateway.platforms.base_channel_skills import resolve_channel_skills
++    from gateway.platforms.base import resolve_channel_skills
+     return resolve_channel_skills(adapter.config.extra, channel_id, parent_id)
+ 
+ class TestSlackResolveChannelSkills:
+diff --git a/tests/hermes_cli/test_local_work_threads.py b/tests/hermes_cli/test_local_work_threads.py
+index e1f5755670..ad1d419422 100644
+--- a/tests/hermes_cli/test_local_work_threads.py
++++ b/tests/hermes_cli/test_local_work_threads.py
+@@ -215,3 +215,28 @@ def test_canceled_async_waiter_does_not_release_physical_thread(tmp_path):
+     asyncio.run(scenario())
+     assert registry.snapshot().active == 0
+     assert registry.snapshot().unknowns == ()
++
++
++def test_replaced_thread_class_is_honoured_and_latches_unknown(tmp_path, monkeypatch):
++    """A replaced ``threading.Thread`` (test double, green threads) cannot carry custody: the
++    spawn honours it and the registry latches unknown coverage instead of claiming tracking."""
++    from agent.memory_provider import spawn_context_thread
++    import hermes_cli.local_work_threads as lwt
++
++    registry, home = setup_owner(tmp_path)
++
++    class _Double:
++        def __init__(self, target=None, **_options):
++            self.target = target
++
++        def start(self):
++            return None
++
++    monkeypatch.setattr(threading, "Thread", _Double)
++    # Resolved through the main thread's MRO: an import under the double still finds stdlib's.
++    assert lwt._real_thread_class() is lwt.TrackedThread.__mro__[1]
++    assert lwt._real_thread_class() is not _Double
++    with registry.scope("turn", home=home, source="parent"):
++        thread = spawn_context_thread(lambda: None, name="t")
++    assert isinstance(thread, _Double)
++    assert "threading-thread-replaced" in registry.snapshot().unknowns
+diff --git a/tests/hermes_cli/test_source_launcher_publication.py b/tests/hermes_cli/test_source_launcher_publication.py
+index d62098d281..28be706a2b 100644
+--- a/tests/hermes_cli/test_source_launcher_publication.py
++++ b/tests/hermes_cli/test_source_launcher_publication.py
+@@ -17,6 +17,7 @@ from pm.environments import install_state_dir, site_packages
+ ROOT = Path(__file__).resolve().parents[2]
+ BOOT_FILES = (
+     "hermes_bootstrap.py", "hermes_constants.py", "hermes_cli/__init__.py", "hermes_cli/_launchers.py",
++    "hermes_cli/_launch_template.py",
+     "pm/environments.py", "pm/filesystem.py", "pm/paths.py", "hermes_cli/runtime_state.py",
+     "hermes_cli/_early_recovery.py", "hermes_cli/_parser.py",
+     "hermes_cli/venv_sync.py", "hermes_cli/steward.py",
+diff --git a/tools/code_kernel_scope.py b/tools/code_kernel_scope.py
+index 9ba3fc5736..7b28c3188d 100644
+--- a/tools/code_kernel_scope.py
++++ b/tools/code_kernel_scope.py
+@@ -97,8 +97,10 @@ def tracked_thread(kind, source, **kwargs):
+     registry = _registry()
+     if registry is None:
+         return threading.Thread(**kwargs)  # health: allow HX012 -- no registry installed: plain thread, nothing to track
+-    from hermes_cli.local_work_threads import TrackedThread
++    from hermes_cli.local_work_threads import TrackedThread, thread_class_replaced
+ 
++    if thread_class_replaced(registry):
++        return threading.Thread(**kwargs)  # health: allow HX012 -- replaced class: honoured, unknown coverage latched
+     return TrackedThread(registry=registry, home=_home(registry), source=source,
+                          kind=kind, **kwargs)
+ 
+-- 
+2.43.0
+

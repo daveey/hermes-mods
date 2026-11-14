@@ -1,0 +1,573 @@
+From 6220524bf62b427f94f5016871badb6ef932bbf9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 19:08:55 +0000
+Subject: [PATCH] [daveey] kanban CI wait: read a PR ref, so a conflicting PR
+ (no pull_request run can start) wakes its owner
+
+Why: 2026-11-13, card t_01a1d5dae3fe181b parked (awaiting kind=ci) on
+"https://github.com/example-org/hermes/pull/2495 checks @7072089bad...". The PR conflicted with
+`state`, so GitHub started no pull_request workflow for that head (0 runs; REST mergeable still null 9 min after
+the push). kanban_ci_progress only read refs naming <repo>/actions/runs/<id>; a PR ref was `untracked`, so neither
+confirm() at park time nor sweep() while parked noticed, and the owner would have slept to its 1 h cap on a
+producer that could not fire. Kanban card t_01a1d645e8f07158.
+
+What:
+- pr_target(ref, hint): <slug>/pull/<n> plus an optional head sha (@<7-40 hex>, or a 40-hex sha in the ref or
+  the park's wake check/reason). A ref naming a run keeps the run path.
+- pr_progress(repo, n, sha, parked_at): closed/merged or head moved off the sha -> ok (the card's own probe
+  answers); mergeable false / mergeable_state dirty -> not_starting ("PR #N conflicts with <base>: pull_request
+  checks cannot start until it is rebased"); no workflow run for the head QUEUED_LIMIT_SECONDS after the later of
+  the park and the PR's updated_at -> not_starting ("no CI run was created for <sha> in 15 min (PR #N
+  mergeable=<v>)"); queued runs of the head go through ci_run_progress (runner offline/busy detection);
+  mergeable null with runs -> unknown (settling, no warning).
+- confirm() refuses a park on a conflicting PR (ci_run_unstartable, naming the PR, base and rebase); 0 runs at
+  park time is allowed (a fresh push has none yet).
+- sweep() includes PR-ref waits under the same RECHECK_SECONDS / per-sweep budget. A per-PR not_starting wakes the
+  card with one kanban-dispatcher comment and no runners-offline shared blocker (one PR's cause, not a pool's).
+- GitHub errors fail open with the existing warnings.
+
+Proof: tests/hermes_cli/test_kanban_ci_progress_pr.py (acceptance a-g, 19 tests) RED on origin/main (18 fail,
+the park-allowed control passes), GREEN here; every test file importing kanban_ci_progress or kanban_awaiting
+(21 files, 783 tests) passes; scripts/check --base origin/main ok.
+---
+ hermes_cli/kanban_ci_progress.py              | 145 ++++++++-
+ .../hermes_cli/test_kanban_ci_progress_pr.py  | 299 ++++++++++++++++++
+ 2 files changed, 438 insertions(+), 6 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_ci_progress_pr.py
+
+diff --git a/hermes_cli/kanban_ci_progress.py b/hermes_cli/kanban_ci_progress.py
+index d99c50d6b5..65f4054d4c 100644
+--- a/hermes_cli/kanban_ci_progress.py
++++ b/hermes_cli/kanban_ci_progress.py
+@@ -41,7 +41,13 @@ says only that no runner picked it up; a message says no online runner has the l
+   ``FETCH_TIMEOUT_SECONDS`` past it. A run whose runner list the budget cut off is read again first next sweep.
+ 
+ A ref is checked when it is (or contains) ``<owner>/<repo>/actions/runs/<id>``, or is a bare run id whose wake
+-check names the repo (``gh run view <id> -R owner/repo``). Anything else (a PR, a release, an unknown repo) is
++check names the repo (``gh run view <id> -R owner/repo``). A ref naming ``<owner>/<repo>/pull/<n>`` (optionally with
++its head sha) is read by :func:`pr_progress`: 2026-11-13, state PR #2495 conflicted with its base, so GitHub started
++no ``pull_request`` workflow for the pushed head, and the card parked on its checks would have slept until its cap.
++A conflicting PR is ``not_starting`` (a park refused; a parked card woken), and so is a head with no workflow run
++``QUEUED_LIMIT_SECONDS`` after the later of the park and the PR's last update. Neither asserts a
++``runners-offline`` blocker: they are one PR's, not a runner pool's. The head's queued runs go through
++:func:`ci_run_progress`, so a PR wait gets the runner checks too. Anything else (a release, an unknown repo) is
+ ``untracked``. A GitHub error is logged and fails open: the park is allowed and the next sweep tries again.
+ 
+ GitHub is read through the home's ``kanban.pr_acceptance.gh_command_prefix`` (the credential broker), as the
+@@ -89,6 +95,10 @@ AUTHOR = "kanban-dispatcher"
+ _SLUG = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
+ _RUN_PATH = re.compile(rf"(?:https?://github\.com/)?({_SLUG})/actions/runs/(\d+)")
+ _BARE_RUN = re.compile(r"\d{6,}")
++_PR_PATH = re.compile(rf"(?:https?://github\.com/)?({_SLUG})/pull/(\d+)")
++_AT_SHA = re.compile(r"@([0-9a-fA-F]{7,40})(?![0-9a-fA-F])")
++_FULL_SHA = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{40})(?![0-9a-fA-F])")
++PR_QUEUED_RUNS_MAX = 3  # queued runs of a PR head handed to ci_run_progress per read
+ _REPO_FLAG = re.compile(rf"(?:^|\s)(?:-R|--repo)(?:=|\s+)['\"]?({_SLUG})")
+ _GENERIC_LABELS = frozenset({"self-hosted", "linux", "macos", "windows", "x64", "arm64"})
+ 
+@@ -122,6 +132,22 @@ class Progress:
+     runners_readable: bool = False  # not_starting: both runner lists were read (or one had an online match)
+     idle_runner: str = ""  # not_starting: an online runner for the labels is idle, yet took no job
+     busy_runner: str = ""  # not_starting: an online runner for the labels is busy, past BUSY_LIMIT_SECONDS
++    pr: int = 0  # the pull request a PR-ref wait names
++    per_pr: bool = False  # not_starting for this PR alone (a conflict, no run created): no runner blocker
++    remedy: str = ""  # per_pr: what the owner does about it
++    settling: bool = False  # unknown only because GitHub has not computed ``mergeable`` yet: no warning
++
++
++def pr_target(ref: str, hint: str = "") -> Optional[tuple[str, int, Optional[str]]]:
++    """``(owner/repo, PR number, head sha or None)`` for a ref naming ``<owner>/<repo>/pull/<n>``, else None. The
++    sha is ``@<7-40 hex>`` in the ref, else a 40-hex sha in the ref or ``hint`` (the park's wake check and reason).
++    A ref that names a run is a run (:func:`run_target`), not a PR."""
++    ref = (ref or "").strip()
++    m = _PR_PATH.search(ref)
++    if m is None or run_target(ref, hint) is not None:
++        return None
++    sha = _AT_SHA.search(ref) or _FULL_SHA.search(f"{ref} {hint or ''}")
++    return m.group(1), int(m.group(2)), sha.group(1).lower() if sha else None
+ 
+ 
+ def run_target(ref: str, hint: str = "") -> Optional[tuple[str, str]]:
+@@ -384,7 +410,77 @@ def _recent_job_on(repo: str, labels: list[str], jobs: list, now: float, deadlin
+     return found
+ 
+ 
++def pr_progress(repo: str, number: int, sha: Optional[str], parked_at: Optional[float], *,
++                fetch: Optional[Fetch] = None, fetch_runners: Optional[FetchRunners] = None,
++                now: Optional[float] = None, deadline: Optional[float] = None) -> Progress:
++    """Whether a pull request's checks can still start for the head a wait names. Never raises. A closed or merged
++    PR, or a head that moved off ``sha``, is ``ok``: the card's own probe answers those. A PR that conflicts with
++    its base is ``not_starting`` (GitHub starts no ``pull_request`` workflow for it), and so is a head with no
++    workflow run ``QUEUED_LIMIT_SECONDS`` after the later of ``parked_at`` (None: now) and the PR's last update;
++    both are ``per_pr``. Queued runs of the head go through :func:`ci_run_progress`. ``mergeable`` null with runs
++    is ``unknown`` (``settling``): GitHub computes it lazily, so the next sweep reads it again."""
++    now = time.time() if now is None else now
++    try:
++        pr = _gh_api(f"repos/{repo}/pulls/{number}") or {}
++        if pr.get("state") != "open" or pr.get("merged"):
++            return Progress("ok", repo, pr=number)
++        head = str((pr.get("head") or {}).get("sha") or "").lower()
++        if sha and not head.startswith(sha.lower()):
++            return Progress("ok", repo, pr=number)
++        base = str((pr.get("base") or {}).get("ref") or "its base")
++        mergeable = pr.get("mergeable")
++        if mergeable is False or pr.get("mergeable_state") == "dirty":
++            return Progress(NOT_STARTING, repo, pr=number, per_pr=True, detail=(
++                f"PR #{number} conflicts with {base}: pull_request checks cannot start until it is rebased"),
++                remedy=(f"Rebase it onto {base} (or merge {base} into it), push, and park on the new head's CI; "
++                        f"a park on PR #{number} while it conflicts is refused ({CI_RUN_UNSTARTABLE})."))
++        if deadline is not None and time.monotonic() >= deadline:
++            raise OverBudget("sweep budget spent before the head's runs were read")
++        runs = (_gh_api(f"repos/{repo}/actions/runs?head_sha={head}&per_page=100") or {}).get("workflow_runs")
++    except GhMissing as exc:
++        return Progress("unknown", repo, pr=number, detail=str(exc)[-300:], gh_missing=True)
++    except NoCredential as exc:
++        return Progress("unknown", repo, pr=number, detail=str(exc)[-300:], no_credential=True)
++    except OverBudget as exc:
++        return Progress("unknown", repo, pr=number, detail=str(exc), deferred=True)
++    except (OSError, RuntimeError, ValueError, AttributeError, subprocess.TimeoutExpired) as exc:
++        return Progress("unknown", repo, pr=number, detail=str(exc)[-300:])
++    runs = [r for r in runs or [] if isinstance(r, dict) and r.get("id")]
++    if not runs:
++        since = max(parked_at if parked_at is not None else now, _epoch(pr.get("updated_at")) or 0)
++        if now - since >= QUEUED_LIMIT_SECONDS:
++            return Progress(NOT_STARTING, repo, pr=number, per_pr=True, detail=(
++                f"no CI run was created for {head[:10]} in {QUEUED_LIMIT_SECONDS // 60} min "
++                f"(PR #{number} mergeable={mergeable})"),
++                remedy=("Check whether the PR conflicts with its base (rebase it if so), or push a commit that "
++                        "triggers CI, then park on the new head's CI."))
++        return Progress("ok" if mergeable is not None else "unknown", repo, pr=number, settling=True)
++    for run in [r for r in runs if r.get("status") in ("queued", "waiting", "requested", "pending")][
++            :PR_QUEUED_RUNS_MAX]:
++        p = ci_run_progress(f"{repo}/actions/runs/{run['id']}", fetch=fetch, fetch_runners=fetch_runners, now=now,
++                            deadline=deadline)
++        if p.state != "ok":
++            p.pr = number
++            return p
++    if mergeable is None:
++        return Progress("unknown", repo, pr=number, settling=True, detail="GitHub has not computed mergeable yet")
++    return Progress("ok", repo, pr=number)
++
++
++def progress(ref: str, *, hint: str = "", parked_at: Optional[float] = None, fetch: Optional[Fetch] = None,
++             fetch_runners: Optional[FetchRunners] = None, deadline: Optional[float] = None) -> Progress:
++    """:func:`ci_run_progress` for a run ref, :func:`pr_progress` for a PR ref, else ``untracked``."""
++    if run_target(ref, hint) is not None:
++        return ci_run_progress(ref, hint=hint, fetch=fetch, fetch_runners=fetch_runners, deadline=deadline)
++    target = pr_target(ref, hint)
++    if target is None:
++        return Progress("untracked")
++    return pr_progress(*target, parked_at, fetch=fetch, fetch_runners=fetch_runners, deadline=deadline)
++
++
+ def describe(p: Progress) -> str:
++    if p.per_pr:
++        return p.detail
+     labels = ",".join(p.labels) or "(none)"
+     if p.idle_runner:
+         seen = (f"runner {p.idle_runner} is online and idle for them yet took no job: a stuck runner, or one in a "
+@@ -415,13 +511,18 @@ def confirm(awaiting: Optional[dict], *, hint: str = "", fetch: Optional[Fetch]
+     a started or freshly queued run makes one."""
+     if not awaiting or awaiting.get("kind") != "ci":
+         return
+-    p = ci_run_progress(str(awaiting.get("ref") or ""), hint=hint, fetch=fetch, fetch_runners=fetch_runners)
++    p = progress(str(awaiting.get("ref") or ""), hint=hint, fetch=fetch, fetch_runners=fetch_runners)
+     if p.state == "unknown":
+-        logger.warning("ci run progress for %s/%s unreadable, allowing the park: %s", p.repo, p.run_id, p.detail)
++        if not p.settling:
++            logger.warning("ci run progress for %s/%s unreadable, allowing the park: %s", p.repo,
++                           p.run_id or f"pull/{p.pr}", p.detail)
+         return
+     if p.state != NOT_STARTING:
+         return
+     from hermes_cli.kanban_awaiting import AwaitingError
++    if p.per_pr:
++        raise AwaitingError(CI_RUN_UNSTARTABLE, f"{p.detail}. A wait on its checks would sleep until someone "
++                                                f"notices. {p.remedy}")
+     raise AwaitingError(CI_RUN_UNSTARTABLE, (
+         f"{describe(p)}. A wait on it would sleep until someone notices. Get a runner with labels "
+         f"{','.join(p.labels)} taking jobs, or re-run the job on runners that exist (fix the workflow's runs-on), or "
+@@ -470,11 +571,18 @@ def _ci_waits(conn: sqlite3.Connection) -> list[tuple[str, str, str]]:
+         row = conn.execute("SELECT cmd FROM task_wake_checks WHERE task_id = ?", (task_id,)).fetchone()
+         hint = " ".join(x for x in (row[0] if row else "", reason) if x)
+         ref = str(awaiting.get("ref") or "")
+-        if run_target(ref, hint):
++        if run_target(ref, hint) or pr_target(ref, hint):
+             found.append((task_id, ref, hint))
+     return found
+ 
+ 
++def _parked_at(conn: sqlite3.Connection, task_id: str) -> Optional[float]:
++    """When the card's latest park was written (epoch seconds), else None."""
++    row = conn.execute("SELECT created_at FROM task_events WHERE task_id = ? AND kind IN ('scheduled','continued') "
++                       "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++    return float(row[0]) if row and row[0] is not None else None
++
++
+ def _others_behind(conn: sqlite3.Connection, task_id: str, bid: str) -> list[str]:
+     """Other live cards already waiting behind the open shared blocker ``bid`` that ``shared_blocker_guard``
+     counts (a provider-scoped blocker ignores cards routed to another provider)."""
+@@ -494,6 +602,8 @@ def apply(conn: sqlite3.Connection, task_id: str, ref: str, p: Progress) -> Opti
+     from hermes_cli.kanban_awaiting import _latest_park
+     from hermes_cli.kanban_wake_check import _wake
+ 
++    if p.per_pr:
++        return _apply_per_pr(conn, task_id, ref, p)
+     bid = blocker_id(p.labels)
+     with kb.write_txn(conn):
+         awaiting, _reason = _latest_park(conn, task_id)
+@@ -525,6 +635,28 @@ def apply(conn: sqlite3.Connection, task_id: str, ref: str, p: Progress) -> Opti
+     return woke
+ 
+ 
++def _apply_per_pr(conn: sqlite3.Connection, task_id: str, ref: str, p: Progress) -> Optional[str]:
++    """Wake a card whose PR's checks cannot start (a conflict, no run created) with one comment. No shared blocker:
++    the cause is this PR's, not a runner pool's, so no other card queues behind it."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_awaiting import _latest_park
++    from hermes_cli.kanban_wake_check import _wake
++
++    with kb.write_txn(conn):
++        awaiting, _reason = _latest_park(conn, task_id)
++        if not isinstance(awaiting, dict) or awaiting.get("kind") != "ci" or str(awaiting.get("ref") or "") != ref:
++            return None  # re-parked on something else since the read
++        note = f"Woken: {p.detail}, so the wait on its checks would sleep until its cap. {p.remedy}"
++        woke = _wake(conn, task_id, CI_RUN_UNSTARTABLE, {"ref": ref, "repo": p.repo, "pr": p.pr, "note": note})
++        if not woke:
++            return None
++        kb.add_comment(conn, task_id, AUTHOR, note)
++        kb._synthesize_ended_run(conn, task_id, outcome=CI_RUN_UNSTARTABLE, summary=p.detail,
++                                 metadata={"ci_pr": ref})
++    logger.info("kanban: woke %s, %s", task_id, p.detail)
++    return woke
++
++
+ def sweep(conn: sqlite3.Connection, *, fetch: Optional[Fetch] = None,
+           fetch_runners: Optional[FetchRunners] = None) -> list[str]:
+     """Re-read CI-waiting cards' runs and wake the cards whose run is not starting: each card at most once per
+@@ -553,14 +685,15 @@ def sweep(conn: sqlite3.Connection, *, fetch: Optional[Fetch] = None,
+                 break  # the rest are the least recently checked ones next sweep
+             with _LOCK:
+                 _LAST_CHECK[(db, task_id)] = time.monotonic()
+-            p = ci_run_progress(ref, hint=hint, fetch=fetch, fetch_runners=fetch_runners, deadline=deadline)
++            p = progress(ref, hint=hint, parked_at=_parked_at(conn, task_id), fetch=fetch,
++                         fetch_runners=fetch_runners, deadline=deadline)
+             if p.deferred:
+                 with _LOCK:
+                     _LAST_CHECK.pop((db, task_id), None)  # least recently checked: first next sweep
+                 continue
+             if p.no_credential or p.gh_missing:
+                 _warn_disabled(p, warn_key)
+-            elif p.state == "unknown":
++            elif p.state == "unknown" and not p.settling:
+                 logger.warning("ci run progress for %s (%s) unreadable: %s", task_id, ref, p.detail)
+             if p.state == NOT_STARTING and apply(conn, task_id, ref, p):
+                 woken.append(task_id)
+diff --git a/tests/hermes_cli/test_kanban_ci_progress_pr.py b/tests/hermes_cli/test_kanban_ci_progress_pr.py
+new file mode 100644
+index 0000000000..e0e9506734
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_ci_progress_pr.py
+@@ -0,0 +1,299 @@
++"""A CI wait on a pull request must notice when no check can start. [daveey]
++
++Replays 2026-11-13: t_01a1d5dae3fe181b pushed state PR #2495 head 7072089bad and parked (awaiting kind=ci) on
++``https://github.com/example-org/hermes/pull/2495 checks @7072089bad...``. The PR conflicted with
++``state``, so GitHub started no ``pull_request`` workflow for that head (0 runs), and ``kanban_ci_progress`` left the
++PR ref ``untracked``: the owner would have slept until its 1 h cap on a producer that could not fire.
++
++GitHub is stubbed at ``kanban_ci_progress._gh_api`` (the one broker-prefixed read every check goes through), serving
++the PR, the head's workflow runs and their jobs as the REST API returns them.
++"""
++from __future__ import annotations
++
++import json
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_ci_progress as kcp
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_shared_blockers as ksb
++from hermes_cli import kanban_wake_check as kwc
++
++REPO = "example-org/hermes"
++PR = 2495
++HEAD = "7072089bad288a86dc638ba386e6d12fc5d32e7d"
++OTHER = "6c627f9f0e0000000000000000000000000000ab"
++REF = f"https://github.com/{REPO}/pull/{PR} checks @{HEAD}"  # verbatim from the incident's park
++RUN_ID = "43400000001"
++LABELS = ["self-hosted", "ci-fast"]
++
++
++def _iso(age: int) -> str:
++    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age))
++
++
++@pytest.fixture
++def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_WAKE_DRYRUN", "0")
++    monkeypatch.setenv("ASK_GATE_LEDGER", str(home / "state" / "ask-ledger.sqlite"))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    yield home
++    kwc._shutdown_for_tests()
++    for state in (kcp._LAST_CHECK, kcp._LAST_SWEEP, kcp._SWEEPS, kcp._POOL_SCANS, kcp._WARNED_AT):
++        state.clear()
++
++
++class Api:
++    """GitHub as ``gh api <path>`` answers it: the PR, the head's runs, their jobs. Runner lists are 403 (a token
++    without admin scope), and the repo's recent-run lists are empty."""
++
++    def __init__(self) -> None:
++        self.pr: dict = {"number": PR, "state": "open", "merged": False, "mergeable": True,
++                         "mergeable_state": "clean", "head": {"sha": HEAD}, "base": {"ref": "state"},
++                         "updated_at": _iso(60)}
++        self.runs: list[dict] = []
++        self.jobs: dict[str, list[dict]] = {}
++        self.fail = False
++        self.calls: list[str] = []
++
++    def dirty(self) -> None:
++        self.pr.update(mergeable=False, mergeable_state="dirty")
++
++    def run(self, status: str, *, age: int, runner: str | None = None) -> None:
++        self.runs = [{"id": int(RUN_ID), "status": status, "event": "pull_request", "head_sha": HEAD,
++                      "created_at": _iso(age)}]
++        self.jobs[RUN_ID] = [{"id": 1, "run_id": int(RUN_ID), "name": "ci", "created_at": _iso(age),
++                              "status": "queued" if status == "queued" else "in_progress",
++                              "started_at": None if status == "queued" else _iso(age),
++                              "labels": LABELS, "runner_name": runner}]
++
++    def __call__(self, path: str) -> dict:
++        self.calls.append(path)
++        if self.fail:
++            raise RuntimeError("gh api exit 1: HTTP 502: Bad Gateway (https://api.github.com/)")
++        if path == f"repos/{REPO}/pulls/{PR}":
++            return json.loads(json.dumps(self.pr))
++        if path.startswith(f"repos/{REPO}/actions/runs?head_sha="):
++            sha = path.split("head_sha=", 1)[1].split("&", 1)[0]
++            runs = [r for r in self.runs if r["head_sha"] == sha]
++            return {"total_count": len(runs), "workflow_runs": runs}
++        if path.startswith(f"repos/{REPO}/actions/runs/") and "/jobs" in path:
++            run_id = path.split("/runs/", 1)[1].split("/", 1)[0]
++            return {"total_count": len(self.jobs.get(run_id, [])), "jobs": self.jobs.get(run_id, [])}
++        if "/actions/runners" in path:
++            raise RuntimeError("gh api exit 1: HTTP 403: Resource not accessible by integration")
++        if "/actions/runs?status=" in path:
++            return {"total_count": 0, "workflow_runs": []}
++        raise AssertionError(f"unexpected gh api {path}")
++
++
++@pytest.fixture
++def api(monkeypatch: pytest.MonkeyPatch) -> Api:
++    fake = Api()
++    monkeypatch.setattr(kcp, "_gh_api", fake)
++    return fake
++
++
++def _running(conn) -> str:
++    tid = kb.create_task(conn, title="t", assignee="worker")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    return tid
++
++
++def _park(monkeypatch, conn, tid, ref: str = REF) -> dict:
++    from tools import kanban_tools as kt
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb.get_task(conn, tid).current_run_id))
++    try:
++        return json.loads(kt._handle_schedule({
++            "reason": f"Waiting for CI on PR #{PR} head {HEAD[:10]}.",
++            "wake_check": f"false gh pr checks {PR} -R {REPO}",
++            "awaiting": {"kind": "ci", "ref": ref, "why": "state CI on the fix"}}))
++    finally:
++        monkeypatch.delenv("HERMES_KANBAN_TASK")
++
++
++def _parked(conn, monkeypatch, *, ago: int = 0) -> str:
++    """A card parked on the PR while it read clean (accepted), its park ``ago`` seconds back."""
++    tid = _running(conn)
++    out = _park(monkeypatch, conn, tid)
++    assert out.get("status") == "scheduled", out
++    if ago:
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_events SET created_at = created_at - ? WHERE task_id = ? "
++                         "AND kind IN ('scheduled', 'continued')", (ago, tid))
++    return tid
++
++
++def _notes(conn, tid) -> list[str]:
++    return [c.body for c in kb.list_comments(conn, tid) if c.author == kcp.AUTHOR]
++
++
++def _runner_blockers(conn) -> list[str]:
++    return [b for b in ksb.blocker_states(conn) if b.startswith(kcp.BLOCKER_PREFIX)]
++
++
++# --- the ref ----------------------------------------------------------------------------------------------------
++
++@pytest.mark.parametrize("ref,hint,want", [
++    (REF, "", (REPO, PR, HEAD)),
++    (f"{REPO}/pull/{PR}", "", (REPO, PR, None)),
++    (f"https://github.com/{REPO}/pull/{PR}@7072089", "", (REPO, PR, "7072089")),
++    (f"https://github.com/{REPO}/pull/{PR}", f"head is {HEAD}", (REPO, PR, HEAD)),
++    (f"https://github.com/{REPO}/actions/runs/{RUN_ID}", "", None),  # a run keeps the run path
++    ("t_01a1d5dae3fe181b", "", None),
++])
++def test_pr_target(ref, hint, want) -> None:
++    assert kcp.pr_target(ref, hint) == want
++
++
++# --- a. park time -------------------------------------------------------------------------------------------------
++
++def test_park_on_a_conflicting_pr_is_refused_naming_the_pr_and_rebase(kanban_home, api, monkeypatch) -> None:
++    api.dirty()
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        out = _park(monkeypatch, conn, tid)
++        err = out.get("error") or ""
++        assert kcp.CI_RUN_UNSTARTABLE in err, out
++        assert f"#{PR}" in err and "rebase" in err and "state" in err, out
++        assert kb.get_task(conn, tid).status == "running"
++
++
++def test_park_on_a_fresh_head_with_no_runs_yet_is_allowed(kanban_home, api, monkeypatch) -> None:
++    api.pr["mergeable"], api.pr["mergeable_state"] = None, "unknown"
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        assert _park(monkeypatch, conn, tid).get("status") == "scheduled"
++
++
++# --- b. the PR turns dirty while parked ---------------------------------------------------------------------------
++
++def test_sweep_wakes_a_card_whose_pr_turns_dirty_once_and_asserts_no_runner_blocker(kanban_home, api,
++                                                                                     monkeypatch) -> None:
++    api.run("in_progress", age=60, runner="ci-fast-1")
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch)
++        api.dirty()
++        assert kcp.sweep(conn) == [tid]
++        assert kb.get_task(conn, tid).status == "ready"
++        notes = _notes(conn, tid)
++        assert len(notes) == 1, notes
++        assert f"PR #{PR} conflicts with state" in notes[0] and "rebase" in notes[0], notes
++        assert _runner_blockers(conn) == []
++        kinds = [e.kind for e in kb.list_events(conn, tid)]
++        assert kcp.CI_RUN_UNSTARTABLE in kinds and ksb.PROBE_RELEASED_EVENT not in kinds, kinds
++        kcp._LAST_CHECK.clear()
++        assert kcp.sweep(conn) == []
++        assert len(_notes(conn, tid)) == 1
++
++
++# --- c/d. runs present ----------------------------------------------------------------------------------------------
++
++def test_null_mergeable_with_a_running_check_does_not_wake(kanban_home, api, monkeypatch, caplog) -> None:
++    api.run("in_progress", age=20 * 60, runner="ci-fast-1")
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch, ago=30 * 60)
++        api.pr["mergeable"], api.pr["mergeable_state"] = None, "unknown"
++        with caplog.at_level("WARNING"):
++            assert kcp.sweep(conn) == []
++        assert kb.get_task(conn, tid).status == "scheduled"
++        assert not [r for r in caplog.records if r.levelname == "WARNING"], caplog.text
++    p = kcp.pr_progress(REPO, PR, HEAD, time.time() - 30 * 60)
++    assert p.state == "unknown", p
++
++
++def test_clean_pr_with_a_running_check_does_not_wake(kanban_home, api, monkeypatch) -> None:
++    api.run("in_progress", age=20 * 60, runner="ci-fast-1")
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch, ago=30 * 60)
++        assert kcp.sweep(conn) == []
++        assert kb.get_task(conn, tid).status == "scheduled"
++    assert kcp.pr_progress(REPO, PR, HEAD, time.time() - 30 * 60).state == "ok"
++
++
++def test_clean_pr_with_a_run_queued_past_the_limit_takes_the_runners_offline_path(kanban_home, api,
++                                                                                    monkeypatch) -> None:
++    api.run("queued", age=2 * 60)
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch)
++        api.run("queued", age=20 * 60)
++        assert kcp.sweep(conn) == [tid]
++        assert _runner_blockers(conn) == ["runners-offline.ci-fast"]
++        assert tid in ksb.blocker_states(conn)["runners-offline.ci-fast"].behind
++        notes = _notes(conn, tid)
++        assert any(f"CI run {RUN_ID} queued 20 min: no runner picked it up" in n for n in notes), notes
++
++
++# --- e. no run was ever created -----------------------------------------------------------------------------------
++
++@pytest.mark.parametrize("mergeable", [True, None], ids=["clean", "null"])
++def test_no_run_for_the_head_15_min_after_the_park_wakes(kanban_home, api, monkeypatch, mergeable) -> None:
++    api.pr["updated_at"] = _iso(20 * 60)
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch, ago=16 * 60)
++        api.pr["mergeable"] = mergeable
++        api.pr["mergeable_state"] = "clean" if mergeable else "unknown"
++        assert kcp.sweep(conn) == [tid]
++        notes = _notes(conn, tid)
++        assert len(notes) == 1 and f"no CI run was created for {HEAD[:10]}" in notes[0], notes
++        assert f"mergeable={mergeable}" in notes[0], notes
++        assert _runner_blockers(conn) == []
++
++
++def test_no_run_soon_after_the_park_or_the_push_does_not_wake(kanban_home, api, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch, ago=5 * 60)
++        assert kcp.sweep(conn) == []
++        assert kb.get_task(conn, tid).status == "scheduled"
++        # Parked long ago, but the head was pushed (PR updated) 5 min back: the clock starts at the later one.
++        api.pr["updated_at"] = _iso(5 * 60)
++        assert kcp.pr_progress(REPO, PR, HEAD, time.time() - 60 * 60).state != kcp.NOT_STARTING
++
++
++# --- f. the head moved, or the PR is done ---------------------------------------------------------------------------
++
++@pytest.mark.parametrize("change", ["head-moved", "merged", "closed"])
++def test_moved_head_or_finished_pr_does_not_wake(kanban_home, api, monkeypatch, change) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch, ago=30 * 60)
++        api.dirty()
++        if change == "head-moved":
++            api.pr["head"]["sha"] = OTHER
++        elif change == "merged":
++            api.pr.update(state="closed", merged=True)
++        else:
++            api.pr.update(state="closed")
++        assert kcp.sweep(conn) == []
++        assert kb.get_task(conn, tid).status == "scheduled"
++        assert _notes(conn, tid) == []
++    assert kcp.pr_progress(REPO, PR, HEAD, time.time() - 30 * 60).state == "ok"
++
++
++# --- g. GitHub errors fail open -------------------------------------------------------------------------------------
++
++def test_github_error_allows_the_park_and_wakes_nothing(kanban_home, api, monkeypatch, caplog) -> None:
++    api.fail = True
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        with caplog.at_level("WARNING"):
++            assert _park(monkeypatch, conn, tid).get("status") == "scheduled"
++        warned = [r for r in caplog.records if r.levelname == "WARNING" and "ci run progress" in r.getMessage()]
++        assert len(warned) == 1, caplog.text
++        caplog.clear()
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_events SET created_at = created_at - 3600 WHERE task_id = ?", (tid,))
++        with caplog.at_level("WARNING"):
++            assert kcp.sweep(conn) == []
++        assert kb.get_task(conn, tid).status == "scheduled"
++        warned = [r for r in caplog.records if r.levelname == "WARNING" and "ci run progress" in r.getMessage()]
++        assert len(warned) == 1, caplog.text
+-- 
+2.43.0
+

@@ -1,0 +1,298 @@
+From 6df4e2a03f9cb0cad0175948d934fa5fc8e53c84 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:10:42 +0000
+Subject: [PATCH] [daveey] quiet-hold: ask quiet-observe-check before taking
+ the claim-quiet lease
+
+Follow-up to PR #2606 review 5897651506 nit 1 (card t_01a1d69da65e96cc).
+
+Defect: `hold` ran only the host-file preflight (`start_preflight_reasons`) before
+`cq.acquire`. A refusal only the gateway knows (code-attestation route unknowns on any
+gateway not on managed-stub / managed-stub-relaunch, coverage pending, drain/restart,
+registry unknowns) surfaced only from `quiet-observe-start`, after the lease had committed
+the 2 h claim-quiet cooldown.
+
+Fix: after the host-file step and before `cq.acquire`, `hold` asks the read-only bookkeeping
+verb `quiet-observe-check` (the same query `--check` uses, shared via `_check_doc`). A
+refusal exits 3 (the `--check` code) and prints the same JSON document, with no lease, no
+cooldown record and no registry epoch move. A gateway that does not answer (none running,
+or an older core without the verb) keeps the earlier behaviour: the hold proceeds and start
+stays authoritative (a stderr note says so).
+
+Docs: the module doc and `start_preflight_reasons` no longer say no read-only control verb
+exists; they document that `--check` uses start's own 120 s window, while hold's host-file
+step subtracts START_PREFLIGHT_MARGIN_S.
+
+Tests (tests/hermes_cli/test_code_attestation_relaunch.py, fixture gateway from
+tests/gateway/test_quiet_control.py, served through the production control-socket client):
+- near-miss route ledger: hold exits 3, no lease, no last-started.json, observer never
+  runs, epoch unchanged. RED at b189612113 ("cooldown was committed").
+- relaunch route ledger: hold acquires, the gateway's quiet-observe-start issues an
+  observer token, exit 0.
+- unsupported verb / no gateway: hold proceeds as before.
+---
+ gateway/quiet_control.py                      |  6 +-
+ hermes_cli/kanban_quiet.py                    | 88 +++++++++++++++----
+ .../test_code_attestation_relaunch.py         | 88 +++++++++++++++++++
+ 3 files changed, 162 insertions(+), 20 deletions(-)
+
+diff --git a/gateway/quiet_control.py b/gateway/quiet_control.py
+index 6cbdd5770f..d7db15d603 100644
+--- a/gateway/quiet_control.py
++++ b/gateway/quiet_control.py
+@@ -211,8 +211,10 @@ def start_preflight_reasons(*, now: int | None = None, margin_s: int = START_PRE
+     The same readers and spellings as :meth:`QuietControl.start` (``update:<reason>``, then
+     ``update_window_stale``), with the freshness bound tightened by ``margin_s`` so a window that
+     would go stale while the observer starts is refused here. Runner-only state (attestation,
+-    coverage, drain/restart flags, registry unknowns) is not exposed by any read-only control verb
+-    and stays the gateway's own refusal. Advisory: the gateway's start remains authoritative.
++    coverage, drain/restart flags, registry unknowns) is the gateway's: the read-only bookkeeping
++    verb ``quiet-observe-check`` (:meth:`QuietControl.check`) reports it with start's own 120 s
++    window and no margin, and ``quiet-hold`` asks it after this host-file step, before the lease.
++    Advisory: the gateway's start remains authoritative.
+     """
+     now = int(time.time()) if now is None else now
+     status, window_reasons = _window_status(now)
+diff --git a/hermes_cli/kanban_quiet.py b/hermes_cli/kanban_quiet.py
+index 497491d618..b55405919c 100644
+--- a/hermes_cli/kanban_quiet.py
++++ b/hermes_cli/kanban_quiet.py
+@@ -2,7 +2,8 @@
+ 
+ ``hermes kanban quiet-hold --check`` is the read-only preflight: it asks the gateway what
+ ``quiet-observe-start`` would refuse apart from the lease and prints one JSON document; it takes no
+-lease and writes no cooldown record (exit 0 admitted, 3 refused or gateway unavailable).
++lease and writes no cooldown record (exit 0 admitted, 3 refused or gateway unavailable). Its window
++freshness bound is start's own (``UPDATE_WINDOW_MAX_AGE_S``, 120 s), with no margin.
+ 
+ Takes the root-scoped claim-quiet lease (:mod:`agent.claim_quiet`), runs the observer command under
+ it and releases the lease on every path. Root-scoped: it never opens or initialises a Kanban board
+@@ -23,19 +24,29 @@ Lease identity is passed to the observer through the environment:
+ ``HERMES_CLAIM_QUIET_EPISODE_ID``, ``HERMES_CLAIM_QUIET_PRODUCER_PID``,
+ ``HERMES_CLAIM_QUIET_EXPIRES_AT`` (UTC epoch seconds), ``HERMES_CLAIM_QUIET_MAX_S``.
+ 
+-Exit codes: 0 observer succeeded; 2 usage; 69 lease unavailable (platform/filesystem/clock/record);
++Exit codes: 0 observer succeeded; 2 usage; 3 gateway check refused (no lease taken); 69 lease
++unavailable (platform/filesystem/clock/record);
+ 70 observer failed (spawn failure or non-zero exit; the observer's own status is on stderr);
+ 71 lease release failed; 75 busy (another lease is active); 76 cooldown; 78 preflight refused;
+ 124 deadline reached and the observer was terminated; 125 observer group death could not be
+ verified; 130 cancelled by signal.
+ 
+-Preflight (exit 78): before the lease is taken, so before the cooldown is committed, the host
+-files the gateway's ``quiet-observe-start`` refuses on are read (``gateway.quiet_control.
+-start_preflight_reasons``): a core-update drain/admission hold, and the deploy window, which must
+-be this host's, ``idle`` and at most ``UPDATE_WINDOW_MAX_AGE_S - START_PREFLIGHT_MARGIN_S`` old.
+-Nothing is written; retry when the window is fresh and idle. Runner-only refusals (attestation,
+-coverage pending, unknowns) have no read-only control verb, so they still surface only from the
+-gateway's start, after the lease. Once a start is attempted, lease and cooldown are unchanged.
++Preflight, before the lease is taken (so before the cooldown is committed), in two steps:
++
++1. Host files (exit 78): the files the gateway's ``quiet-observe-start`` refuses on are read
++   (``gateway.quiet_control.start_preflight_reasons``): a core-update drain/admission hold, and the
++   deploy window, which must be this host's, ``idle`` and at most ``UPDATE_WINDOW_MAX_AGE_S -
++   START_PREFLIGHT_MARGIN_S`` old (stricter than ``--check``, so a window that would go stale while
++   the observer starts is refused here).
++2. Gateway (exit 3, the ``--check`` code, with the same JSON document on stdout): the read-only
++   bookkeeping verb ``quiet-observe-check`` reports the runner-only refusals (code attestation route
++   and unknowns, coverage pending, drain/restart, registry unknowns). It takes no lease, writes no
++   cooldown and does not move the registry epoch. A gateway that does not answer (none running, or
++   an older core without the verb) keeps the earlier behaviour: the hold proceeds and the gateway's
++   start stays authoritative.
++
++Nothing is written on a refusal; retry when the cause clears. Once a start is attempted, lease and
++cooldown are unchanged.
+ 
+ Proof targets: Board pool workers republish ``window.json`` only from the 10-minute
+ ``hermes-core-update.timer`` and batch updates, so their window is usually stale or ``batching``
+@@ -163,6 +174,26 @@ def _preflight() -> list[str]:
+         return [f"preflight_unreadable:{type(exc).__name__}"]
+ 
+ 
++def _gateway_preflight(home=None, query=None) -> int | None:
++    """The gateway step of the preflight: EXIT_CHECK_REFUSED (its document printed) when the
++    gateway answers ``quiet-observe-check`` with a refusal, else None. Never raises: a gateway that
++    does not answer (none running, older core) or a failing query keeps the earlier behaviour."""
++    try:
++        doc, answered = _check_doc(home, query=query)
++    except Exception as exc:  # health: allow BLE001 -- an unanswered check keeps the earlier behaviour
++        _err(f"gateway check unavailable ({type(exc).__name__}); proceeding, start stays authoritative")
++        return None
++    if not answered:
++        _err(f"gateway check unavailable ({', '.join(doc['reasons'])}); proceeding, start stays authoritative")
++        return None
++    if _check_admitted(doc):
++        return None
++    _print_doc(doc)
++    _err("gateway quiet start would refuse (no lease taken, no cooldown spent): "
++         + ", ".join(str(r) for r in doc.get("reasons") or ["not_admitted"]))
++    return EXIT_CHECK_REFUSED
++
++
+ def hold(max_s: int, reason: str, argv: Sequence[str], *, clock=None) -> int:
+     """Acquire the lease, run ``argv`` under it, release in ``finally``; returns the exit code."""
+     from agent import claim_quiet as cq
+@@ -173,6 +204,9 @@ def hold(max_s: int, reason: str, argv: Sequence[str], *, clock=None) -> int:
+         _err("gateway quiet start would refuse (no lease taken, no cooldown spent): "
+              + ", ".join(refused))
+         return EXIT_PREFLIGHT
++    gateway_refusal = _gateway_preflight()
++    if gateway_refusal is not None:
++        return gateway_refusal
+     clock = clock or SystemClock()
+     try:
+         owner = cq.acquire(max_s=max_s, reason=reason, clock=clock)
+@@ -265,11 +299,10 @@ def _kill_leftovers(pgid: int) -> bool:
+     return True
+ 
+ 
+-def check(home=None, *, query=None) -> int:
+-    """``--check``: one JSON document on stdout with what ``quiet-observe-start`` would refuse
+-    apart from the lease (registry unknowns, launch route, reasons). Takes no lease, writes no
+-    cooldown record and reserves no work (``quiet-observe-check`` is a bookkeeping verb)."""
+-    import json
++def _check_doc(home=None, *, query=None) -> tuple[dict, bool]:
++    """Ask the gateway ``quiet-observe-check``; returns ``(document, answered)``. ``answered`` is
++    False when no gateway answered the verb (none running, an older core, a malformed answer): the
++    document then carries ``check_unsupported_by_gateway`` or ``gateway_unavailable``."""
+     from pathlib import Path
+ 
+     if query is None:
+@@ -278,15 +311,34 @@ def check(home=None, *, query=None) -> int:
+         from gateway.status import _get_process_hermes_home
+         home = _get_process_hermes_home()
+     result = query(Path(home), "quiet-observe-check", params={"schema": 1}, report_unsupported=True)
++    answered = False
+     if isinstance(result, dict) and result.get("unsupported"):
+         doc = {"admitted": False, "reasons": ["check_unsupported_by_gateway"]}
+     elif not isinstance(result, dict) or type(result.get("admitted")) is not bool:
+         doc = {"admitted": False, "reasons": ["gateway_unavailable"]}
+     else:
+-        doc = result
+-    doc = {"home": str(home), **doc}
+-    print(json.dumps(doc, sort_keys=True, default=str))
+-    return EXIT_OK if doc["admitted"] is True and not doc.get("reasons") else EXIT_CHECK_REFUSED
++        doc, answered = result, True
++    return {"home": str(home), **doc}, answered
++
++
++def _check_admitted(doc: dict) -> bool:
++    return doc.get("admitted") is True and not doc.get("reasons")
++
++
++def _print_doc(doc: dict) -> None:
++    import json
++    print(json.dumps(doc, sort_keys=True, default=str), flush=True)
++
++
++def check(home=None, *, query=None) -> int:
++    """``--check``: one JSON document on stdout with what ``quiet-observe-start`` would refuse
++    apart from the lease (registry unknowns, launch route, reasons). Takes no lease, writes no
++    cooldown record and reserves no work (``quiet-observe-check`` is a bookkeeping verb). Its
++    window bound is start's own 120 s; ``hold``'s host-file step also subtracts
++    ``START_PREFLIGHT_MARGIN_S``."""
++    doc, _answered = _check_doc(home, query=query)
++    _print_doc(doc)
++    return EXIT_OK if _check_admitted(doc) else EXIT_CHECK_REFUSED
+ 
+ 
+ def cmd_quiet_hold(args) -> int:
+diff --git a/tests/hermes_cli/test_code_attestation_relaunch.py b/tests/hermes_cli/test_code_attestation_relaunch.py
+index 3de82b50d3..b98f380406 100644
+--- a/tests/hermes_cli/test_code_attestation_relaunch.py
++++ b/tests/hermes_cli/test_code_attestation_relaunch.py
+@@ -325,3 +325,91 @@ def test_check_cli_rejects_lease_arguments():
+     from hermes_cli import kanban_quiet
+     args = types.SimpleNamespace(check=True, max_s=5, reason=None, observer_argv=None)
+     assert kanban_quiet.cmd_quiet_hold(args) == kanban_quiet.EXIT_USAGE
++
++
++# ---- quiet-hold asks quiet-observe-check BEFORE the lease (no 2 h cooldown on a doomed start) --
++
++def _serve(env, answer=None):
++    """Route the production control-socket client to the fixture gateway (wire format as in
++    ``_check``), or to a fixed ``answer`` when one is given (an older core, no gateway)."""
++    from gateway import control_socket
++
++    def query(home, verb, *, params=None, report_unsupported=False, timeout=None):
++        if answer is not None:
++            return answer()
++        raw = json.dumps({"protocol": 1, "verb": verb, "id": 1, "params": params}).encode()
++        response = json.loads(env.server.handle_request_line(raw, "uid:1000"))
++        return response.get("result") if response.get("ok") else None
++
++    env.monkeypatch.setattr(control_socket, "query_gateway_control", query)
++
++
++@pytest.fixture
++def hold_home(env, tmp_path):
++    """A second HERMES_HOME for the hold: ``env`` already holds its own lease (and so a cooldown) in
++    ``env.root``. The fixture gateway keeps serving and reads the lease and window from here."""
++    from agent import claim_quiet as cq
++    home = tmp_path / "hold-home"
++    home.mkdir(mode=0o700)
++    env.monkeypatch.setenv("HERMES_HOME", str(home))
++    write_window(home, "idle")
++    assert cq.inspect().state == "inactive"
++    return home
++
++
++def test_hold_refused_by_the_gateway_check_takes_no_lease_and_spends_no_cooldown(
++        env, recorded, hold_home, tmp_path, capsys):
++    from agent import claim_quiet as cq
++    from hermes_cli import kanban_quiet
++    _use(env, recorded["near_miss"])  # a launch route attestation does not support
++    _serve(env)
++    epoch = (env.registry.snapshot().epoch, env.registry.membership_generation())
++    marker = tmp_path / "ran"
++    code = kanban_quiet.hold(30, "measure", [sys.executable, "-c", f"open({str(marker)!r}, 'w')"])
++    captured = capsys.readouterr()
++    assert not (hold_home / "kanban" / "claim-quiet" / "last-started.json").exists(), "cooldown was committed"
++    assert not marker.exists(), "the observer must never start"
++    assert code == kanban_quiet.EXIT_CHECK_REFUSED, captured.err
++    doc = json.loads(captured.out)
++    assert doc["admitted"] is False and "unsupported-route:relaunch-argv" in "".join(doc["registry_unknowns"])
++    assert "no cooldown spent" in captured.err
++    assert cq.inspect().state == "inactive", "the lease was taken"
++    assert (env.registry.snapshot().epoch, env.registry.membership_generation()) == epoch
++
++
++def test_hold_admitted_by_the_gateway_check_acquires_and_the_gateway_starts(
++        env, recorded, hold_home, tmp_path):
++    import threading
++    from agent import claim_quiet as cq
++    from hermes_cli import kanban_quiet
++    from tests.waiting import wait_until
++    _use(env, recorded["relaunch"])
++    _serve(env)
++    go = tmp_path / "go"
++    observer = ("import os, sys, threading\n"
++                "while not os.path.exists(sys.argv[1]): threading.Event().wait(0.02)\n")
++    result = {}
++    worker = threading.Thread(target=lambda: result.setdefault("code", kanban_quiet.hold(
++        60, "measure", [sys.executable, "-c", observer, str(go)])))
++    worker.start()
++    try:
++        wait_until(lambda: cq.read_active() is not None, timeout=60, what="hold lease")
++        held = type("Held", (), {"lease": cq.read_active()})
++        started = ok(env, "quiet-observe-start", start_params(held))
++        assert started.get("observer_token"), started
++    finally:
++        go.write_text("x")
++        worker.join(60)
++    assert not worker.is_alive() and result["code"] == kanban_quiet.EXIT_OK
++    assert (hold_home / "kanban" / "claim-quiet" / "last-started.json").exists()
++    assert cq.inspect().state == "inactive"
++
++
++@pytest.mark.parametrize("answer", [lambda: {"unsupported": True}, lambda: None],
++                         ids=["older-core", "no-gateway"])
++def test_hold_proceeds_when_the_gateway_does_not_answer_the_check(env, hold_home, answer, capsys):
++    from hermes_cli import kanban_quiet
++    _serve(env, answer)
++    assert kanban_quiet.hold(30, "measure", ["true"]) == kanban_quiet.EXIT_OK
++    assert (hold_home / "kanban" / "claim-quiet" / "last-started.json").exists()
++    assert "gateway check unavailable" in capsys.readouterr().err
+-- 
+2.43.0
+

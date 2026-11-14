@@ -1,0 +1,162 @@
+From 1d9baebbd51dbe77cd0cea92ae0fbf1ac756b152 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 18:44:01 +0000
+Subject: [PATCH] [daveey] kanban source launch: never write the fenced
+ branch_name on a source card; a workspace-record failure releases the claim
+
+A source card's replica carries custody, so _prepare's set_branch_name(NULL -> source branch) raised SourceFenced
+out of the dispatcher tick after the claim: the lease leaked until stale_lease and the card gave up (LIVE
+t_01a1d5b1c1798e2a, twice on worker-4). The worker now gets the source branch in memory only, and any failure
+recording the workspace releases the grant unused and counts the failure instead of raising out of the tick.
+---
+ hermes_cli/kanban_source_launch.py            | 29 +++++++++++--
+ tests/hermes_cli/test_kanban_source_launch.py | 42 ++++++++++++++++++-
+ .../test_kanban_workspace_source.py           |  9 ++--
+ 3 files changed, 73 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_source_launch.py b/hermes_cli/kanban_source_launch.py
+index 3b55b4c1aa..21f1e0681b 100644
+--- a/hermes_cli/kanban_source_launch.py
++++ b/hermes_cli/kanban_source_launch.py
+@@ -225,9 +225,12 @@ def _prepare(conn: sqlite3.Connection, claimed: Any, workspace: Any, branch: Opt
+     from hermes_cli import kanban_db_dispatch as dispatch
+     kbw = dispatch._kbw
+     kbw.set_workspace_path(conn, claimed.id, str(workspace))
+-    if source is not None:  # the source branch is the manifest's (fenced): record it only on a card without one
++    if source is not None:
++        # The source branch is the manifest's/custody's, and ``branch_name`` is fenced on such a card (here by
++        # ``fence`` and on the Board as forbidden_field). Writing it, even NULL -> branch, raised SourceFenced out of
++        # the dispatcher tick after the claim and leaked the lease until it went stale (LIVE t_01a1d5b1c1798e2a).
++        # The worker only needs it in memory.
+         if not (claimed.branch_name or "").strip():
+-            kbw.set_branch_name(conn, claimed.id, source.branch)
+             claimed.branch_name = source.branch
+         kbw._maybe_emit_scratch_tip(conn, claimed.id, "worktree")
+         claimed.source_env = _source_env(source)
+@@ -237,6 +240,22 @@ def _prepare(conn: sqlite3.Connection, claimed: Any, workspace: Any, branch: Opt
+     kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+ 
+ 
++def _release_unprepared(conn: sqlite3.Connection, claimed: Any, exc: Exception, result: Any) -> None:
++    """Recording the workspace failed after the claim and before any attach: release the grant unused (custody is
++    untouched, nothing ran) and count the failure, instead of raising out of the tick and leaving the lease to go
++    stale."""
++    from hermes_cli import kanban_db_dispatch as dispatch
++    from hermes_cli import kanban_failure_release as release
++    from hermes_cli.kanban_db_connect import write_txn
++    error = f"workspace_source: workspace record refused ({type(exc).__name__}: {exc})"
++    _log.warning("kanban dispatcher: %s not launched: %s", claimed.id, error)
++    with write_txn(conn):
++        release.queue(conn, claimed.id, claimed.current_run_id, outcome="released", unused_grant=True, error=error)
++    dispatch._record_task_failure(conn, claimed.id, error, outcome="released", release_claim=True, end_run=True,
++                                  infrastructure=True)
++    result.respawn_guarded.append((claimed.id, f"workspace_prepare_failed:{type(exc).__name__}"))
++
++
+ def _attach_or_release(conn: sqlite3.Connection, claimed: Any, workspace: Any, source: Any, grant: Any,
+                        result: Any) -> tuple[bool, Optional[board_calls.AttachedRun]]:
+     try:
+@@ -271,7 +290,11 @@ def launch(conn: sqlite3.Connection, claimed: Any, workspace: Any, branch: Optio
+     """Record the workspace, attach (source/legacy-adopt cards), then spawn. True when a spawn slot was used."""
+     from hermes_cli import kanban_db_dispatch as dispatch
+     grant = _pop_grant(claimed.id)
+-    _prepare(conn, claimed, workspace, branch, source)
++    try:
++        _prepare(conn, claimed, workspace, branch, source)
++    except Exception as exc:  # health: allow BLE001 -- a claimed card must never leak its lease out of the tick
++        _release_unprepared(conn, claimed, exc, result)
++        return False
+     ok, run = _attach_or_release(conn, claimed, workspace, source, grant, result)
+     if not ok:
+         return False
+diff --git a/tests/hermes_cli/test_kanban_source_launch.py b/tests/hermes_cli/test_kanban_source_launch.py
+index e7bb43b387..66af1030e8 100644
+--- a/tests/hermes_cli/test_kanban_source_launch.py
++++ b/tests/hermes_cli/test_kanban_source_launch.py
+@@ -86,12 +86,17 @@ def dispatcher(conn, monkeypatch, tmp_path):
+     monkeypatch.setattr(d._kbw, "resolve_worktree_for_dispatch", lambda *a, **kw: (src, "wt/legacy"))
+     monkeypatch.setattr(d._kbw, "_maybe_emit_scratch_tip", lambda *a, **kw: None)
+ 
+-    def run(spawn_fn, *, kind="worktree", created_on=None):
++    def run(spawn_fn, *, kind="worktree", created_on=None, replica_custody=None):
+         tid = kb.create_task(conn, title="src", assignee="worker")
+         with kbc.write_txn(conn):
+             conn.execute("UPDATE tasks SET workspace_kind=? WHERE id=?", (kind, tid))
+             if created_on is not None:
+                 conn.execute("UPDATE tasks SET created_on=? WHERE id=?", (created_on, tid))
++            if replica_custody is not None:  # pulled from the Board: the replica carries custody, no branch_name
++                conn.execute("UPDATE kanban_sync_state SET applying=1")
++                conn.execute("UPDATE tasks SET workspace_custody=?, branch_name=NULL WHERE id=?",
++                             (json.dumps(replica_custody), tid))
++                conn.execute("UPDATE kanban_sync_state SET applying=0")
+         result = d.DispatchResult()
+         row = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+         used = d._dispatch_lane_task(conn, row, "worker", result, lane="ready", dry_run=False, ttl_seconds=900,
+@@ -138,6 +143,41 @@ def test_source_attach_precedes_spawn_with_no_renew_between(conn, board, dispatc
+                                       "manifest_revision", "path", "mode"}
+ 
+ 
++def test_source_card_with_replica_custody_and_no_branch_spawns(conn, board, dispatcher):
++    """LIVE t_01a1d5b1c1798e2a: the replica carries custody and branch_name is NULL (the Board refused the legacy
++    branch write as forbidden_field). The launch must not write the fenced branch_name (SourceFenced escaped the tick
++    and the lease went stale twice); the worker gets the source branch in memory and spawns."""
++    dispatcher.snapshot = _source_snapshot()
++    seen = []
++    tid, result, used = dispatcher.run(lambda task, path: seen.append(task.branch_name),
++                                       replica_custody={"source_holder": "hub", "state": "published",
++                                                        "manifest_revision": 3})
++    assert used and result.spawned and seen == ["wt/exact"]
++    task = kb.get_task(conn, tid)
++    assert task is not None and task.branch_name is None
++    ops = [json.loads(r[0]) for r in conn.execute(
++        "SELECT fields FROM kanban_sync_outbox WHERE table_name='tasks' AND row_uid=?", (tid,))]
++    assert [op["branch_name"] for op in ops if op.get("branch_name")] == []
++
++
++def test_workspace_record_failure_releases_the_claim_instead_of_raising(conn, board, dispatcher, monkeypatch):
++    """Any failure recording the workspace after the claim is released unused and counted; it never raises out of
++    the dispatcher tick (which left the claim to expire as stale_lease and skipped the rest of the tick)."""
++    from hermes_cli import kanban_db_dispatch as d
++
++    def boom(*a, **kw):
++        raise kws.SourceFenced("t: branch_name is fenced on a card with a workspace source (source_fenced)")
++    monkeypatch.setattr(d._kbw, "set_workspace_path", boom)
++    dispatcher.snapshot = _source_snapshot()
++    spawned = []
++    tid, result, used = dispatcher.run(lambda task, path: spawned.append(task.id))
++    assert not used and spawned == []
++    assert ("workspace_prepare_failed:SourceFenced" in [code for _, code in result.respawn_guarded])
++    releases = _outbox_releases(conn, tid)
++    assert len(releases) == 1 and releases[0].get("unused_grant") and "source_receipt" not in releases[0]
++    assert "source_attach" not in board.actions()
++
++
+ def test_grant_carries_source_protocol_only_from_dispatcher(conn, board):
+     tid = kb.create_task(conn, title="cli", assignee="worker")
+     assert kb.claim_task(conn, tid, ttl_seconds=900, claimer=f"{kb._host_prefix()}:1")
+diff --git a/tests/hermes_cli/test_kanban_workspace_source.py b/tests/hermes_cli/test_kanban_workspace_source.py
+index dd8d1e1878..dbb11fb694 100644
+--- a/tests/hermes_cli/test_kanban_workspace_source.py
++++ b/tests/hermes_cli/test_kanban_workspace_source.py
+@@ -292,12 +292,15 @@ def test_dispatch_routes_before_kind_branch(conn, monkeypatch, kind):
+     result = d.DispatchResult()
+     row = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+     assert d._dispatch_lane_task(conn, row, "worker", result, lane="ready", dry_run=False,
+-        ttl_seconds=900, board=None, failure_limit=2, spawn_fn=lambda task, path: spawned.append((task.id, path)),
++        ttl_seconds=900, board=None, failure_limit=2,
++        spawn_fn=lambda task, path: spawned.append((task.id, path, task.branch_name)),
+         per_profile_cap=None, per_profile_running={})
+-    assert seen == [tid] and spawned == [(tid, "/source/exact")]
++    assert seen == [tid] and spawned == [(tid, "/source/exact", "wt/exact")]
+     assert result.spawned == [(tid, "worker", "/source/exact")]
+     assert kb.get_task(conn, tid).workspace_path == "/source/exact"
+-    assert branches == ["wt/exact"]  # the branch comes from the manifest (source branch), never the legacy default
++    # The worker gets the manifest's (source) branch, never the legacy default, and the fenced branch_name column is
++    # never written for a source card (the write raised SourceFenced on a custody replica: LIVE t_01a1d5b1c1798e2a).
++    assert branches == []
+ 
+ 
+ # --- pickup skip + skip memo ----------------------------------------------------------------------------------------
+-- 
+2.43.0
+

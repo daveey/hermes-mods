@@ -1,0 +1,366 @@
+From 281a73fb33216d0c086b670076b6912dbc0633d7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 17:47:11 +0000
+Subject: [PATCH] [daveey] worker store: re-send a receipt whose reply timed
+ out instead of latching
+
+One worker.persist with no reply inside the receipt budget (worker_receipt_timeout), or a closed
+owner link, latched RuntimeSessionStore.failure for the rest of the process: the next write or
+turn-lease refresh raised it from _apply, and refresh_tick interrupted the turn with most of its
+300 s authority left (mini 11-12 20:39 PT, bb-dev worker; self-heal defect agent-6ba9ac9880).
+The owner resolves an exact resend of the same (execution, sequence, digest) from its receipt
+row, so the outcome is unknown but a resend is safe.
+
+- runtime_session_store: is_retryable_owner_error(); a retryable failure keeps the pending entry
+  and the next _apply / flush re-sends it under its own sequence (never renumbered), up to
+  _RETRYABLE_ATTEMPTS consecutive unknown outcomes, then latches as WorkerPersistenceError.
+  Every other failure (owner refusals, lost_receipt, outbox_full) stays sticky. Recovery logs
+  WARNING "worker receipt timeout recovered after Ns (op=...)".
+- turn_facade_lease.refresh_tick: a retryable owner stall is a missed tick like a SQLite lock;
+  it still stops via _stop_on_exhausted_authority when the next tick would land past expiry.
+- runtime_session_child.close: finish() still runs when the only failure is resendable.
+
+Tests: tests/agent/test_runtime_session_store_receipt_timeout.py (6 red on dc671254d6).
+---
+ agent/runtime_session_child.py                |   2 +-
+ agent/runtime_session_store.py                |  55 +++++-
+ agent/turn_facade_lease.py                    |  14 +-
+ ...t_runtime_session_store_receipt_timeout.py | 175 ++++++++++++++++++
+ 4 files changed, 239 insertions(+), 7 deletions(-)
+ create mode 100644 tests/agent/test_runtime_session_store_receipt_timeout.py
+
+diff --git a/agent/runtime_session_child.py b/agent/runtime_session_child.py
+index 7f275752f9..1996fe46d4 100644
+--- a/agent/runtime_session_child.py
++++ b/agent/runtime_session_child.py
+@@ -35,7 +35,7 @@ class ChildSessionStore(RuntimeSessionStore):
+     def close(self):
+         # The child's agent closes once, after its last write: that is this execution's end.
+         try:
+-            if not self._outbox_owner.closed and not self.failure:
++            if not self._outbox_owner.closed and (not self.failure or self._unknown is not None):
+                 self.finish()
+         finally:
+             super().close()
+diff --git a/agent/runtime_session_store.py b/agent/runtime_session_store.py
+index 6000b8e3c1..e4438b454f 100644
+--- a/agent/runtime_session_store.py
++++ b/agent/runtime_session_store.py
+@@ -56,6 +56,25 @@ _ACKED_MAX_BYTES = 256 * 1024
+ #: Operations whose result moved the worker's own identity (target, child, terminal status). A gap
+ #: holding one is not re-sent: replaying it under the current scope would not be the same write.
+ _UNREPLAYABLE = frozenset({'compression.publish', 'child.reserve', 'execution.finish'})
++#: Consecutive unknown outcomes (no reply in the receipt budget, or a closed owner link) the store
++#: re-sends through before it latches like any other failure. The owner resolves an exact resend of
++#: the pending entry from its receipt row, so one stall need not end the run.
++_RETRYABLE_ATTEMPTS = 3
++
++
++def is_retryable_owner_error(exc) -> bool:
++    """True when the owner's answer to the pending entry is unknown but a resend is safe: the
++    receipt budget ran out (``worker_receipt_timeout``) or the owner link closed. Never a refusal
++    the owner sent (``WorkerPersistenceError``), which an exact resend would only repeat."""
++    if isinstance(exc, TimeoutError):
++        return str(exc) == 'worker_receipt_timeout'
++    if isinstance(exc, ConnectionError):
++        return True
++    try:
++        from websockets.exceptions import ConnectionClosed
++    except ImportError:
++        return False
++    return isinstance(exc, ConnectionClosed)
+ 
+ 
+ def is_retired_generation_error(exc) -> bool:
+@@ -306,6 +325,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
+         self.max_bytes = max_bytes
+         self.lock = threading.RLock()
+         self.failure = None
++        self._unknown = None  # {'since', 'attempts', 'operation'} while ``failure`` is a resendable unknown outcome
+         self.path = Path(outbox_dir) / 'pending.json'
+         make_user_dir(self.path.parent, mode=0o700, parents=True, exist_ok=True)
+         if self.path.parent.is_symlink() or self.path.is_symlink():
+@@ -389,10 +409,16 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
+         if session_id != self.scope['session_id']:
+             raise WorkerPersistenceError('permission_denied')
+ 
++    def _resume_unknown(self):
++        """Re-send the pending entry a stalled reply left unknown, or raise the sticky failure."""
++        if self._unknown is None:
++            raise WorkerPersistenceError(self.failure)
++        self.retry_pending()
++
+     def _apply(self, operation, payload):
+         with self.lock:
+             if self.failure:
+-                raise WorkerPersistenceError(self.failure)
++                self._resume_unknown()
+             if self.journal['pending']:
+                 raise WorkerPersistenceError('pending_receipt')
+             entry = {'sequence': self.journal['next_sequence'], 'operation': operation, 'payload': payload}
+@@ -481,10 +507,34 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
+                     results.append(result)
+             except Exception as exc:
+                 self.failure = str(exc)
++                self._note_unknown(exc)
++                if self._unknown is None and is_retryable_owner_error(exc):
++                    raise WorkerPersistenceError(self.failure) from exc  # resends exhausted: sticky
+                 raise
++            if self._unknown is not None:
++                logger.warning('worker receipt timeout recovered after %.1fs (op=%s, attempts=%d)',
++                               time.monotonic() - self._unknown['since'], self._unknown['operation'],
++                               self._unknown['attempts'])
+             self.failure = None
++            self._unknown = None
+             return results
+ 
++    def _note_unknown(self, exc):
++        """Keep a resendable unknown outcome open for the next write, up to ``_RETRYABLE_ATTEMPTS``."""
++        unknown, self._unknown = self._unknown, None
++        if not is_retryable_owner_error(exc) or not self.journal['pending']:
++            return
++        attempts = (unknown['attempts'] if unknown else 0) + 1
++        operation = self.journal['pending'][0]['operation']
++        if attempts >= _RETRYABLE_ATTEMPTS:
++            logger.error('worker receipt outcome still unknown after %d attempts (op=%s): %s',
++                         attempts, operation, exc)
++            return
++        self._unknown = {'since': unknown['since'] if unknown else time.monotonic(),
++                         'attempts': attempts, 'operation': operation}
++        logger.warning('worker receipt outcome unknown (op=%s, attempt %d/%d): %s; the next write re-sends it',
++                       operation, attempts, _RETRYABLE_ATTEMPTS, exc)
++
+     def adopt(self, epoch):
+         """Install only a separately verified worker.adopt result; never self-adopt."""
+         with self.lock:
+@@ -493,6 +543,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
+             self.scope = candidate['scope']
+             self.journal = candidate
+             self.failure = None
++            self._unknown = None
+ 
+     def append_messages_batch(self, session_id, messages, compression_lock_holder=None,
+                               turn_lease_holder=None, chunk_rows=None, turn_lease_ttl_seconds=300.0):
+@@ -544,7 +595,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
+     def flush_token_counts(self, timeout=5.0):
+         with self.lock:
+             if self.failure:
+-                raise WorkerPersistenceError(self.failure)
++                self._resume_unknown()
+             if self.journal['pending']:
+                 raise WorkerPersistenceError('pending_receipt')
+             return True
+diff --git a/agent/turn_facade_lease.py b/agent/turn_facade_lease.py
+index b3d5f4ae90..518f4bf59a 100644
+--- a/agent/turn_facade_lease.py
++++ b/agent/turn_facade_lease.py
+@@ -381,15 +381,21 @@ class DurableTurnLease:
+         except Exception as exc:
+             if self.stop.is_set():
+                 return False
++            from agent.runtime_session_store import is_retryable_owner_error
+             from hermes_state_errors import is_sqlite_lock_error
+ 
+-            if is_sqlite_lock_error(exc):
+-                # The scheduler will not try again until one interval from now. If that attempt
+-                # could not finish before the row expiry, stop before a successor can claim it.
++            lock_error = is_sqlite_lock_error(exc)
++            if lock_error or is_retryable_owner_error(exc):
++                # A worker's owner stall (no receipt in budget, or a closed link) is a missed tick
++                # too: the store re-sends the pending renewal on the next write, and the owner
++                # resolves that exact resend from its receipt row. The scheduler will not try again
++                # until one interval from now. If that attempt could not finish before the row
++                # expiry, stop before a successor can claim it.
+                 if time.time() + self.refresh_interval + _REFRESH_EXPIRY_MARGIN_S >= self._authority_deadline:
+                     return self._stop_on_exhausted_authority()
+                 logger.warning(
+-                    "Session turn lease refresh hit a SQLite lock; will retry: %s",
++                    "Session turn lease refresh hit %s; will retry: %s",
++                    "a SQLite lock" if lock_error else f"an owner stall ({exc})",
+                     self._current_session_id(),
+                 )
+                 return None
+diff --git a/tests/agent/test_runtime_session_store_receipt_timeout.py b/tests/agent/test_runtime_session_store_receipt_timeout.py
+new file mode 100644
+index 0000000000..1297a0428f
+--- /dev/null
++++ b/tests/agent/test_runtime_session_store_receipt_timeout.py
+@@ -0,0 +1,175 @@
++"""One slow owner reply must not kill a managed worker.
++
++A ``worker.persist`` with no reply inside the receipt budget (``worker_receipt_timeout``) or a closed
++owner link leaves the outcome unknown, but the owner resolves an exact resend of the same
++(execution, sequence, digest) from its receipt row. So the store keeps the pending entry and the
++next write (or turn-lease refresh) re-sends it, never renumbered; only a bounded run of such
++failures, or any other failure, stays sticky (mini 11-12 20:39 PT: one stall latched the store and
++the next lease refresh stopped a bb-dev worker's turn).
++"""
++import logging
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from agent.runtime_session_store import RuntimeSessionStore, WorkerPersistenceError
++from agent.turn_facade_lease import LEASE_TTL_SECONDS, DurableTurnLease
++
++
++class FakeOwner:
++    """Commits each sequence once; an exact resend returns the stored result (the receipt row)."""
++
++    def __init__(self):
++        self.commits = []
++        self.receipts = {}
++        self.stalls = []  # queued: 'after_commit' | 'before_commit' | 'closed'
++
++    def __call__(self, method, **params):
++        assert method == 'worker.persist'
++        sequence = params['sequence']
++        stall = self.stalls.pop(0) if self.stalls else None
++        if stall == 'closed':
++            raise ConnectionResetError('owner link closed')
++        if stall == 'before_commit':
++            raise TimeoutError('worker_receipt_timeout')
++        if sequence in self.receipts:
++            result = self.receipts[sequence]
++        else:
++            expected = len(self.commits) + 1
++            if sequence != expected:
++                failure = WorkerPersistenceError('invalid_params')
++                failure.data = {'field': 'sequence', 'expected_sequence': expected}
++                raise failure
++            self.commits.append((sequence, params['operation']))
++            result = self.receipts[sequence] = {'value': True}
++        if stall == 'after_commit':
++            raise TimeoutError('worker_receipt_timeout')
++        return dict(result)
++
++
++@pytest.fixture
++def owner_store(tmp_path):
++    owner = FakeOwner()
++    store = RuntimeSessionStore(owner, {'session_id': 's'}, tmp_path / 'private')
++    yield owner, store
++    store.failure = None
++    store.journal['pending'] = []
++    store.close()
++
++
++@pytest.mark.parametrize('stall', ['after_commit', 'before_commit', 'closed'])
++def test_one_stalled_reply_then_next_write_lands_once_without_a_gap(owner_store, stall, caplog):
++    owner, store = owner_store
++    owner.stalls.append(stall)
++    with pytest.raises((TimeoutError, ConnectionError)):
++        store.queue_token_counts('s', input_tokens=1)
++    caplog.set_level(logging.WARNING, logger='agent.runtime_session_store')
++    store.queue_token_counts('s', input_tokens=2)
++    assert owner.commits == [(1, 'usage.main'), (2, 'usage.main')]
++    assert store.journal['pending'] == [] and store.failure is None
++    assert any('worker receipt timeout recovered after' in r.getMessage() and 'op=usage.main' in r.getMessage()
++               for r in caplog.records)
++
++
++def test_close_flush_resends_a_timed_out_entry(owner_store):
++    owner, store = owner_store
++    owner.stalls.append('before_commit')
++    with pytest.raises(TimeoutError):
++        store.queue_token_counts('s', input_tokens=1)
++    assert store.flush_token_counts() is True
++    assert owner.commits == [(1, 'usage.main')]
++
++
++def _lease(store, interrupts, *, deadline_in=LEASE_TTL_SECONDS):
++    agent = SimpleNamespace(session_id='s', interrupt=lambda message, **kwargs: interrupts.append(message))
++    lease = DurableTurnLease(agent, store, 's', 'holder', expires_at=time.time() + deadline_in)
++    lease.turn_active = True
++    return lease
++
++
++def test_refresh_after_an_earlier_write_timed_out_keeps_the_turn(owner_store):
++    """The incident: an earlier write latched the store, then the refresh raised the latch."""
++    owner, store = owner_store
++    owner.stalls.append('after_commit')
++    with pytest.raises(TimeoutError):
++        store.queue_token_counts('s', input_tokens=1)
++    interrupts = []
++    lease = _lease(store, interrupts)
++    before = lease._authority_deadline
++    assert lease.refresh_tick() is None
++    assert interrupts == [] and lease.interrupt_message is None
++    assert owner.commits == [(1, 'usage.main'), (2, 'turn.renew')]
++    assert lease._authority_deadline >= before
++
++
++def test_refresh_whose_own_reply_times_out_retries_next_tick(owner_store):
++    owner, store = owner_store
++    interrupts = []
++    lease = _lease(store, interrupts)
++    owner.stalls.append('before_commit')
++    assert lease.refresh_tick() is None, 'a retryable owner stall is a missed tick, not a lost lease'
++    assert interrupts == []
++    before = lease._authority_deadline
++    assert lease.refresh_tick() is None
++    assert interrupts == [] and owner.commits == [(1, 'turn.renew'), (2, 'turn.renew')], \
++        'the stalled renewal is re-sent under its own sequence, then this tick renews'
++    assert lease._authority_deadline >= before
++
++
++def test_refresh_timeout_near_the_deadline_still_stops(owner_store):
++    owner, store = owner_store
++    interrupts = []
++    # One refresh interval (60 s default) plus less than the 2 s expiry margin: the next tick is too late.
++    lease = _lease(store, interrupts, deadline_in=61.0)
++    owner.stalls.append('before_commit')
++    assert lease.refresh_tick() is False
++    assert interrupts, 'no renewal can land before expiry: the turn must stop'
++
++
++def test_retryable_failures_are_bounded(owner_store):
++    owner, store = owner_store
++    owner.stalls.extend(['before_commit'] * 10)
++    raised = 0
++    for _ in range(10):
++        try:
++            store.queue_token_counts('s', input_tokens=1)
++        except WorkerPersistenceError:
++            break
++        except TimeoutError:
++            raised += 1
++    else:
++        pytest.fail('a run of receipt timeouts never latched the store')
++    assert 1 <= raised <= 4
++    owner.stalls.clear()
++    calls = len(owner.commits)
++    with pytest.raises(WorkerPersistenceError):
++        store.queue_token_counts('s', input_tokens=2)
++    assert len(owner.commits) == calls, 'an exhausted latch sends nothing'
++
++
++def test_lost_receipt_stays_sticky(owner_store):
++    owner, store = owner_store
++    owner.commits.append((0, 'phantom'))  # the owner expects 2; the journal holds no acked entry 1
++    owner.receipts.clear()
++    store.journal['next_sequence'] = 3
++    with pytest.raises(WorkerPersistenceError, match='lost_receipt'):
++        store.queue_token_counts('s', input_tokens=1)
++    sent = list(owner.commits)
++    with pytest.raises(WorkerPersistenceError, match='lost_receipt'):
++        store.queue_token_counts('s', input_tokens=2)
++    assert owner.commits == sent
++
++
++def test_outbox_full_stays_sticky(tmp_path):
++    owner = FakeOwner()
++    store = RuntimeSessionStore(owner, {'session_id': 's'}, tmp_path / 'private', max_bytes=400)
++    try:
++        with pytest.raises(WorkerPersistenceError, match='outbox_full'):
++            store.queue_token_counts('s', blob='x' * 1000)
++        with pytest.raises(WorkerPersistenceError, match='outbox_full'):
++            store.queue_token_counts('s', input_tokens=1)
++        assert owner.commits == []
++    finally:
++        store.failure = None
++        store.close()
+-- 
+2.43.0
+

@@ -1,0 +1,253 @@
+From fb9dbdc2d1831515011a1fbcec88de1f9413247f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 19:26:51 +0000
+Subject: [PATCH] [daveey] turn_session_activity: TUI update-pause reader uses
+ the configured desktop.auto_continue bounds
+
+The sidebar's `turn_live` reader counted a Desktop/TUI `core_update_pause` marker as live with
+hard-coded bounds (enabled, 15 min, 2 attempts), while the producer (`_maybe_schedule_auto_continue`,
+`_durable_continuation_due`) applies the configured `desktop.auto_continue.enabled`,
+`freshness_minutes` and `max_attempts`. With auto-continue disabled or lowered, a pause that will never
+continue read as a working turn for up to 15 minutes (PR #2545 review 5896585581, nit 1).
+
+- `tui_gateway.turn_marker.auto_continue_bounds(config)`: the one parse of those bounds, same
+  coercion as before (bool-ish enabled default true; freshness float minutes, floor 0; max_attempts int,
+  negative/unparseable -> 2). `_auto_continue_config()` now delegates to it.
+- `turn_session_activity._update_paused_tui_turns` reads each home's own config.yaml
+  (`load_profile_config_effective`, lazily, only when a pause marker is present) and applies the
+  same bounds, so a profile's sidebar row follows that profile's producer.
+- The gateway 1 h bound comment now says what it is: the reader's own fail-closed cap, not a mirror
+  of agent.gateway_auto_continue_freshness.
+- Tests: `import json` moved to module top; new cases for disabled, freshness_minutes=5 with a
+  10-min-old marker, exhausted max_attempts=1, a raised window, per-profile config, and the shared parse.
+
+RED (fix reverted, tests kept): 6 new tests fail. GREEN: 26/26. Consumers (49 test files referencing
+turn_marker / session_auto_continue / turn_session_activity / _auto_continue_config): 845 passed.
+---
+ hermes_cli/turn_session_activity.py           | 29 ++++++++---
+ .../hermes_cli/test_turn_session_activity.py  | 52 ++++++++++++++++++-
+ tui_gateway/session_auto_continue.py          | 15 ++----
+ tui_gateway/turn_marker.py                    | 26 +++++++++-
+ 4 files changed, 102 insertions(+), 20 deletions(-)
+
+diff --git a/hermes_cli/turn_session_activity.py b/hermes_cli/turn_session_activity.py
+index f5814eea24..32eed80976 100644
+--- a/hermes_cli/turn_session_activity.py
++++ b/hermes_cli/turn_session_activity.py
+@@ -90,14 +90,13 @@ def _holder_dead(holder: str) -> bool:
+ 
+ # [daveey] A turn a Hermes core update paused at a step boundary holds no lease while it waits, yet it
+ # continues automatically: the row must keep reading as working, not paint its stored outcome (a red
+-# decision) for the minute or two the update takes. The freshness bounds match the auto-continue
+-# defaults (agent.gateway_auto_continue_freshness 1 h; desktop.auto_continue 15 min, 2 attempts) so a
+-# pause nobody will continue stops counting.
++# decision) for the minute or two the update takes. A Desktop/TUI pause counts only within the bounds its
++# producer applies (the home's configured ``desktop.auto_continue``: enabled, freshness_minutes,
++# max_attempts), so a pause nobody will continue stops counting. The gateway bound (1 h) is this reader's
++# own fail-closed cap on a checkpoint, not a mirrored producer setting.
+ _GATEWAY_CHECKPOINT_PREFIX = "gateway.update_checkpoint.v1."
+ _GATEWAY_PAUSE_FRESH_S = 3600.0
+ _TUI_PAUSE_REASON = "core_update_pause"
+-_TUI_PAUSE_FRESH_S = 15 * 60.0
+-_TUI_PAUSE_MAX_ATTEMPTS = 2
+ 
+ 
+ def _update_paused_gateway_turns(conn: sqlite3.Connection, now: float) -> set[str]:
+@@ -131,6 +130,7 @@ def _update_paused_tui_turns(home: Path, now: float) -> set[str]:
+     except (OSError, ValueError):
+         return set()
+     out: set[str] = set()
++    bounds: tuple[bool, float, int] | None = None
+     for key, entry in (data.items() if isinstance(data, dict) else ()):
+         if not (key and isinstance(entry, dict) and entry.get("reason") == _TUI_PAUSE_REASON
+                 and entry.get("auto_continue", True)):
+@@ -140,11 +140,28 @@ def _update_paused_tui_turns(home: Path, now: float) -> set[str]:
+             attempts = int(entry.get("attempts") or 0)
+         except (TypeError, ValueError):
+             continue
+-        if now - since <= _TUI_PAUSE_FRESH_S and attempts < _TUI_PAUSE_MAX_ATTEMPTS:
++        if bounds is None:
++            bounds = _auto_continue_bounds(home)
++        enabled, fresh_s, max_attempts = bounds
++        if enabled and now - since <= fresh_s and attempts < max_attempts:
+             out.add(str(key))
+     return out
+ 
+ 
++def _auto_continue_bounds(home: Path) -> tuple[bool, float, int]:
++    """The home's configured ``desktop.auto_continue`` bounds, parsed as the producer parses them. The
++    home's own config (``load_profile_config_effective``), never this process's: each profile's backend
++    continues its own pauses."""
++    from hermes_cli.config_effective import load_profile_config_effective
++    from tui_gateway.turn_marker import auto_continue_bounds
++    try:
++        cfg = load_profile_config_effective(home / "config.yaml")
++    except Exception:  # health: allow BLE001 -- the producer's _load_cfg also falls open to {} (defaults)
++        _log.debug("auto-continue config unreadable in %s", home, exc_info=True)
++        cfg = {}
++    return auto_continue_bounds(cfg)
++
++
+ def _collect(now: float) -> frozenset[str]:
+     global _leases
+     live: set[str] = set()
+diff --git a/tests/hermes_cli/test_turn_session_activity.py b/tests/hermes_cli/test_turn_session_activity.py
+index 19ccd00d80..ec7454a87c 100644
+--- a/tests/hermes_cli/test_turn_session_activity.py
++++ b/tests/hermes_cli/test_turn_session_activity.py
+@@ -1,5 +1,6 @@
+ """turn_live stamping on session-list rows: a turn running in any process keeps the row live. [daveey]"""
+ 
++import json
+ import os
+ import sqlite3
+ import subprocess
+@@ -177,7 +178,6 @@ def _checkpointed_db(home, sid, *, status="started", message_age=30.0, receipt_o
+         " payload_json, payload_digest, intent, status, owner_epoch, generation)"
+         " VALUES ('adm1', 'r1', 'p', ?, '[]', '{}', 'd', 'queue', ?, 1, 1)", (sid, status))
+     receipt = {"max_message_id": mid} if receipt_ok else {"other": 1}
+-    import json
+     conn.execute("INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                  ("gateway.update_checkpoint.v1.adm1", json.dumps(receipt)))
+     conn.commit()
+@@ -202,7 +202,6 @@ def test_gateway_checkpoint_that_cannot_continue_does_not_count(home, kwargs):
+ 
+ 
+ def _marker(home, key, **entry):
+-    import json
+     (home / "desktop").mkdir(parents=True, exist_ok=True)
+     (home / "desktop" / "interrupted_turns.json").write_text(json.dumps({key: entry}), encoding="utf-8")
+ 
+@@ -235,3 +234,52 @@ def test_profile_tui_marker_is_read(home):
+     _marker(home / "profiles" / "work", "w_chat", reason="core_update_pause", auto_continue=True, attempts=0,
+             started_at=now - 30)
+     assert tsa.annotate_turn_activity([{"id": "w_chat"}])[0].get("turn_live") is True
++
++
++def _auto_continue_config(home, **auto_continue):
++    lines = "".join(f"    {k}: {json.dumps(v)}\n" for k, v in auto_continue.items())
++    (home / "config.yaml").write_text(f"desktop:\n  auto_continue:\n{lines}", encoding="utf-8")
++
++
++@pytest.mark.parametrize(("config", "age_s", "attempts"), [
++    ({"enabled": False}, 60, 0),           # auto-continue off: the producer never continues it
++    ({"freshness_minutes": 5}, 600, 0),    # a 10-min-old pause is past a 5-min window
++    ({"max_attempts": 1}, 60, 1),          # attempts exhausted under a lowered cap
++])
++def test_tui_pause_outside_configured_auto_continue_bounds_does_not_count(home, config, age_s, attempts):
++    now = time.time()
++    _leases(home / "state.db", [])
++    _auto_continue_config(home, **config)
++    _marker(home, "tui_chat", reason="core_update_pause", auto_continue=True, attempts=attempts,
++            started_at=now - 7200, paused_at=now - age_s)
++    assert "turn_live" not in tsa.annotate_turn_activity([{"id": "tui_chat"}])[0]
++
++
++def test_tui_pause_within_a_raised_configured_window_counts(home):
++    now = time.time()
++    _leases(home / "state.db", [])
++    _auto_continue_config(home, freshness_minutes=60, max_attempts=3)
++    _marker(home, "tui_chat", reason="core_update_pause", auto_continue=True, attempts=2,
++            started_at=now - 7200, paused_at=now - 1800)
++    assert tsa.annotate_turn_activity([{"id": "tui_chat"}])[0].get("turn_live") is True
++
++
++def test_profile_tui_pause_uses_that_profiles_auto_continue_config(home):
++    now = time.time()
++    work = home / "profiles" / "work"
++    _leases(home / "state.db", [])
++    _leases(work / "state.db", [])
++    _auto_continue_config(work, enabled=False)  # the root home keeps the defaults (enabled)
++    for h, key in ((home, "root_chat"), (work, "w_chat")):
++        _marker(h, key, reason="core_update_pause", auto_continue=True, attempts=0, started_at=now - 30)
++    rows = tsa.annotate_turn_activity([{"id": "root_chat"}, {"id": "w_chat"}])
++    assert [r.get("turn_live") for r in rows] == [True, None]
++
++
++def test_producer_and_reader_parse_auto_continue_bounds_alike():
++    from tui_gateway.turn_marker import auto_continue_bounds
++    assert auto_continue_bounds({}) == (True, 900.0, 2)
++    assert auto_continue_bounds({"desktop": {"auto_continue": {
++        "enabled": "off", "freshness_minutes": "5", "max_attempts": -1}}}) == (False, 300.0, 2)
++    assert auto_continue_bounds({"desktop": {"auto_continue": {"freshness_minutes": "x", "max_attempts": 0}}}) \
++        == (True, 900.0, 0)
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index fb330ccd14..15e17beffc 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -15,8 +15,8 @@ from .method_ctx import bind_module
+ # and let the partial transcript speak.
+ # If the interruption is fresh, re-submit the interrupted prompt automatically (the messaging gateway has
+ # done this for restart-interrupted sessions since #27856); if it's stale, clear the marker and let the
+-# recovered partial transcript speak for itself — the user can ask to continue manually.
+-_AUTO_CONTINUE_FRESHNESS_MINUTES_DEFAULT = 15
++# recovered partial transcript speak for itself — the user can ask to continue manually. The bounds (15 min and
++# 2 attempts by default, ``desktop.auto_continue``) are parsed by turn_marker.auto_continue_bounds.
+ # [daveey] Waits before each replay of a turn refused for a retryable reason (a stale ownership lease during a core
+ # update, a rate limit). One per attempt; ``desktop.auto_continue.max_attempts`` can only lower the count.
+ _REFUSED_RETRY_DELAYS_S = (45.0, 180.0)
+@@ -58,15 +58,8 @@ def _resume_reuse_live_locked(ctx, sid: str, session: dict) -> dict:
+ 
+ def _auto_continue_config() -> tuple[bool, float, int]:
+     """(enabled, freshness window in seconds, max attempts) from ``desktop.auto_continue`` in config.yaml."""
+-    desktop = _load_cfg().get("desktop")
+-    cfg = desktop.get("auto_continue") if isinstance(desktop, dict) else None
+-    cfg = cfg if isinstance(cfg, dict) else {}
+-    try:
+-        minutes = float(cfg.get("freshness_minutes", _AUTO_CONTINUE_FRESHNESS_MINUTES_DEFAULT))
+-    except (TypeError, ValueError):
+-        minutes = float(_AUTO_CONTINUE_FRESHNESS_MINUTES_DEFAULT)
+-    return (is_truthy_value(cfg.get("enabled"), default=True), max(0.0, minutes) * 60.0,
+-            _coerce_int_config_value(cfg.get("max_attempts"), 2, min_value=0))
++    from tui_gateway.turn_marker import auto_continue_bounds
++    return auto_continue_bounds(_load_cfg())
+ 
+ 
+ def _session_home(session: dict) -> Path:
+diff --git a/tui_gateway/turn_marker.py b/tui_gateway/turn_marker.py
+index 46d2bb9f48..3f7c5c2c28 100644
+--- a/tui_gateway/turn_marker.py
++++ b/tui_gateway/turn_marker.py
+@@ -16,7 +16,7 @@ import threading
+ import time
+ from pathlib import Path
+ from typing import Any
+-from utils import atomic_json_write
++from utils import atomic_json_write, is_truthy_value
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -49,6 +49,30 @@ def _cross_process_lock(path: Path):
+                       f"Timed out waiting for the turn-marker lock ({path})")
+ 
+ 
++AUTO_CONTINUE_FRESHNESS_MINUTES_DEFAULT = 15
++AUTO_CONTINUE_MAX_ATTEMPTS_DEFAULT = 2
++
++
++def auto_continue_bounds(config: Any) -> tuple[bool, float, int]:
++    """[daveey] (enabled, freshness window in seconds, max attempts) from a config mapping's
++    ``desktop.auto_continue``. The one parse of those bounds: the producer (``_auto_continue_config``)
++    and the sidebar's paused-turn reader (``hermes_cli.turn_session_activity``) must agree, or a pause
++    that will never continue reads as a live turn."""
++    desktop = config.get("desktop") if isinstance(config, dict) else None
++    cfg = desktop.get("auto_continue") if isinstance(desktop, dict) else None
++    cfg = cfg if isinstance(cfg, dict) else {}
++    try:
++        minutes = float(cfg.get("freshness_minutes", AUTO_CONTINUE_FRESHNESS_MINUTES_DEFAULT))
++    except (TypeError, ValueError):
++        minutes = float(AUTO_CONTINUE_FRESHNESS_MINUTES_DEFAULT)
++    try:
++        attempts = int(cfg.get("max_attempts", AUTO_CONTINUE_MAX_ATTEMPTS_DEFAULT))
++    except (TypeError, ValueError):
++        attempts = AUTO_CONTINUE_MAX_ATTEMPTS_DEFAULT
++    return (is_truthy_value(cfg.get("enabled"), default=True), max(0.0, minutes) * 60.0,
++            attempts if attempts >= 0 else AUTO_CONTINUE_MAX_ATTEMPTS_DEFAULT)
++
++
+ def _started_at(entry: dict) -> float:
+     return float(entry.get("started_at") or 0)
+ 
+-- 
+2.43.0
+

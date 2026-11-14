@@ -1,0 +1,431 @@
+From 33e109a14fd960d456492f5d81ef64f535add6cc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:23:32 +0000
+Subject: [PATCH] test(desktop): pin the chat WebSocket connect-limit wiring
+ (#2635 surviving mutants)
+
+noteRemoteConnect now requires masterAlive: the only production caller passes it, and without it the
+tunnel's chat dial could never count a strike, so the limit would never stretch.
+
+New tests drive the production singletons (slowLinkTracker, remoteTransports, remoteAnswerLedger),
+registerGatewayConnectIpc on an Electron-free ipcMain, and the real preload bridge over that fake IPC.
+They kill J3 J4 J7 J8 J9 J10 J11 J14 G2 G6 G7 W1 (+W1b); W3 fails typecheck; W2 (main.ts never
+registering the IPC) is untestable without loading main.ts.
+---
+ apps/desktop/electron/delta-reads.test.ts     |   6 +-
+ .../electron/gateway-connect-wiring.test.ts   | 246 ++++++++++++++++++
+ apps/desktop/electron/slow-link.test.ts       |   2 +-
+ apps/desktop/electron/slow-link.ts            |  10 +-
+ .../gateway-link-dial-bridge-faults.test.ts   |  75 ++++++
+ 5 files changed, 329 insertions(+), 10 deletions(-)
+ create mode 100644 apps/desktop/electron/gateway-connect-wiring.test.ts
+ create mode 100644 apps/desktop/src/api/gateway-link-dial-bridge-faults.test.ts
+
+diff --git a/apps/desktop/electron/delta-reads.test.ts b/apps/desktop/electron/delta-reads.test.ts
+index 6d28ce1645..9c2d4a70d8 100644
+--- a/apps/desktop/electron/delta-reads.test.ts
++++ b/apps/desktop/electron/delta-reads.test.ts
+@@ -126,7 +126,7 @@ describe('asking for a delta', () => {
+   it('dropping a pooled backend (slowLinkTracker.forgetScope) unbinds its tunnel in the shared store', () => {
+     const url = 'http://127.0.0.1:50888/api/cron/jobs'
+ 
+-    noteRemoteConnect('http://127.0.0.1:50888', 'conn:hermes-hub::alpha', Date.now())
++    noteRemoteConnect('http://127.0.0.1:50888', 'conn:hermes-hub::alpha', Date.now(), () => undefined)
+     expect(deltaRequestHeaders('GET', url)).toEqual({ [DELTA_ACCEPT_HEADER]: 'zstd' })
+ 
+     slowLinkTracker.forgetScope('conn:hermes-hub::alpha')
+@@ -137,7 +137,7 @@ describe('asking for a delta', () => {
+     const url = 'http://127.0.0.1:50777/api/cron/jobs'
+ 
+     expect(deltaRequestHeaders('GET', url)).toEqual({})
+-    noteRemoteConnect('http://127.0.0.1:50777', 'conn:mac-mini::default', Date.now())
++    noteRemoteConnect('http://127.0.0.1:50777', 'conn:mac-mini::default', Date.now(), () => undefined)
+     expect(deltaRequestHeaders('GET', url)).toEqual({ [DELTA_ACCEPT_HEADER]: 'zstd' })
+     expect(deltaBodyStore.keyFor(url)).toBe('conn:mac-mini::default\u0000/api/cron/jobs')
+   })
+@@ -443,7 +443,7 @@ describe('fetchJson itself (json-fetch.ts), against a live server that speaks th
+     expect(await read()).toEqual(JSON.parse(board().toString('utf8')))
+     expect(seen.at(-1)).toEqual({ accept: '', base: '', token: 'session-token' })
+ 
+-    noteRemoteConnect(origin, 'conn:fetch-json-test::default', Date.now())
++    noteRemoteConnect(origin, 'conn:fetch-json-test::default', Date.now(), () => undefined)
+ 
+     expect(await read()).toEqual(JSON.parse(board().toString('utf8')))
+     expect(seen.at(-1)).toMatchObject({ accept: 'zstd', base: '' })
+diff --git a/apps/desktop/electron/gateway-connect-wiring.test.ts b/apps/desktop/electron/gateway-connect-wiring.test.ts
+new file mode 100644
+index 0000000000..6138670a6c
+--- /dev/null
++++ b/apps/desktop/electron/gateway-connect-wiring.test.ts
+@@ -0,0 +1,246 @@
++// [daveey] The chat WebSocket connect limit as main actually wires it: the module-level slowLinkTracker,
++// remoteTransports and remoteAnswerLedger singletons, noteRemoteConnect (what main calls when an SSH tunnel is up),
++// registerGatewayConnectIpc on an Electron-free ipcMain, and the real preload bridge talking to it over that fake
++// IPC. No source pins: every assertion is on what the renderer would get back or what the tracker now believes.
++
++import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
++
++import { remoteAnswerLedger } from './remote-liveness'
++import {
++  GATEWAY_CONNECT_LIMIT_CHANNEL,
++  GATEWAY_CONNECT_LIMIT_MS,
++  GATEWAY_CONNECT_OUTCOME_CHANNEL,
++  gatewayConnectLimitMs,
++  noteGatewayConnectOutcome,
++  noteRemoteConnect,
++  registerGatewayConnectIpc,
++  RemoteTransports,
++  SLOW_LINK_TIMEOUT_CAP_MS,
++  SlowLinkTracker,
++  slowLinkTracker
++} from './slow-link'
++
++type IpcListener = (event: { returnValue?: unknown }, ...args: unknown[]) => void
++
++// One in-process IPC bus: main registers on `ipcMain`, the preload's ipcRenderer sends into the same listeners.
++const bus = vi.hoisted(() => {
++  const listeners = new Map<string, IpcListener>()
++
++  return {
++    exposeInMainWorld: vi.fn(),
++    ipcMain: { on: (channel: string, listener: IpcListener) => void listeners.set(channel, listener) },
++    send: (channel: string, ...args: unknown[]): void => listeners.get(channel)?.({}, ...args),
++    // The preload also asks main for unrelated facts at load (translucency, flags, skin): those answer {}.
++    sendSync: (channel: string, ...args: unknown[]): unknown => {
++      const listener = listeners.get(channel)
++
++      if (!listener) {
++        return {}
++      }
++
++      const event: { returnValue?: unknown } = {}
++      listener(event, ...args)
++
++      return event.returnValue
++    }
++  }
++})
++
++vi.mock('electron', () => ({
++  contextBridge: { exposeInMainWorld: bus.exposeInMainWorld },
++  ipcRenderer: { send: bus.send, sendSync: bus.sendSync },
++  webFrame: {},
++  webUtils: {}
++}))
++
++const opened: string[] = []
++
++/** What main does once an SSH tunnel to `port` is up (main.ts: noteRemoteConnect after the bootstrap). */
++function connectTunnel(port: number, masterAlive: () => Promise<boolean> | undefined = async () => true) {
++  const baseUrl = `http://127.0.0.1:${port}`
++  const scope = `conn:wiring-${port}::default`
++
++  noteRemoteConnect(baseUrl, scope, Date.now(), masterAlive)
++  opened.push(scope)
++
++  return { baseUrl, connectionId: `wiring-${port}`, scope, wsUrl: `ws://127.0.0.1:${port}/api/ws?ticket=t-${port}` }
++}
++
++const timedOut = { kind: 'timed-out' } as const
++
++afterEach(() => {
++  for (const scope of opened.splice(0)) {
++    slowLinkTracker.forgetScope(scope)
++  }
++})
++
++describe('noteRemoteConnect registers the tunnel the chat dial is measured against', () => {
++  it('a dispatch-probe timeout on that tunnel stretches the chat connect limit of its ws URL to 60 s', () => {
++    const hub = connectTunnel(46101)
++
++    expect(gatewayConnectLimitMs(hub.wsUrl)).toBe(GATEWAY_CONNECT_LIMIT_MS)
++
++    slowLinkTracker.noteTimeoutWhileAlive(hub.baseUrl) // what the dispatch probe does on a live, slow tunnel
++
++    expect(gatewayConnectLimitMs(hub.wsUrl)).toBe(SLOW_LINK_TIMEOUT_CAP_MS)
++  })
++
++  it('a chat timeout asks the masterAlive it was given, and a live master makes it a strike', async () => {
++    const masterAlive = vi.fn(async () => true)
++    const hub = connectTunnel(46102, masterAlive)
++    const log = vi.fn()
++
++    await noteGatewayConnectOutcome(hub.wsUrl, timedOut, log)
++
++    expect(masterAlive).toHaveBeenCalledTimes(1)
++    expect(slowLinkTracker.isSlow(hub.baseUrl)).toBe(true)
++    expect(gatewayConnectLimitMs(hub.wsUrl)).toBe(SLOW_LINK_TIMEOUT_CAP_MS)
++  })
++
++  it('binds the scope, so a slow tunnel marks its registry connection slow (prefetch pauses for it)', () => {
++    const mini = connectTunnel(46103)
++
++    slowLinkTracker.noteTimeoutWhileAlive(mini.baseUrl)
++
++    expect(slowLinkTracker.isScopeSlow(mini.scope)).toBe(true)
++    expect(slowLinkTracker.isConnectionSlow(mini.connectionId)).toBe(true)
++  })
++})
++
++describe('a stopped backend (slowLinkTracker.forgetScope) releases its chat ws URL', () => {
++  it('its limit drops back to 15 s and a later chat timeout on that URL is not a strike', async () => {
++    const masterAlive = vi.fn(async () => true)
++    const hub = connectTunnel(46111, masterAlive)
++    const log = vi.fn()
++
++    slowLinkTracker.noteTimeoutWhileAlive(hub.baseUrl)
++    expect(gatewayConnectLimitMs(hub.wsUrl)).toBe(SLOW_LINK_TIMEOUT_CAP_MS)
++
++    slowLinkTracker.forgetScope(hub.scope)
++
++    expect(gatewayConnectLimitMs(hub.wsUrl)).toBe(GATEWAY_CONNECT_LIMIT_MS)
++
++    // A renderer still dialing the old URL must not revive slow mode for a tunnel main already tore down.
++    await noteGatewayConnectOutcome(hub.wsUrl, timedOut, log)
++
++    expect(masterAlive).not.toHaveBeenCalled()
++    expect(log).not.toHaveBeenCalled()
++    expect(slowLinkTracker.isSlow(hub.baseUrl)).toBe(false)
++    expect(gatewayConnectLimitMs(hub.wsUrl)).toBe(GATEWAY_CONNECT_LIMIT_MS)
++  })
++})
++
++describe('noteGatewayConnectOutcome', () => {
++  const base = 'http://127.0.0.1:46121'
++  const wsUrl = 'ws://127.0.0.1:46121/api/ws?ticket=o'
++  const scope = 'conn:outcome::default'
++
++  function link(masterAlive: () => Promise<boolean> | undefined = async () => true) {
++    const tracker = new SlowLinkTracker()
++    const transports = new RemoteTransports()
++
++    transports.remember(base, scope, masterAlive)
++    remoteAnswerLedger.forget(base)
++
++    return { tracker, transports }
++  }
++
++  afterEach(() => remoteAnswerLedger.forget(base))
++
++  it('an open is a recent answer in the shared liveness ledger the dispatch probe reads', async () => {
++    const { tracker, transports } = link()
++
++    await noteGatewayConnectOutcome(wsUrl, { elapsedMs: 30, kind: 'opened' }, () => undefined, tracker, transports)
++
++    expect(remoteAnswerLedger.answeredWithin(base, 30_000)).toBe(true)
++  })
++
++  it('an open whose elapsed time is not a finite, non-negative number is ignored', async () => {
++    for (const elapsedMs of [Number.NaN, -1, Number.POSITIVE_INFINITY, undefined, '30']) {
++      const { tracker, transports } = link()
++
++      await noteGatewayConnectOutcome(
++        wsUrl,
++        { elapsedMs, kind: 'opened' } as never,
++        () => undefined,
++        tracker,
++        transports
++      )
++
++      expect(remoteAnswerLedger.answeredWithin(base, 30_000), `elapsedMs=${String(elapsedMs)}`).toBe(false)
++    }
++  })
++
++  it('a masterAlive check that throws or rejects counts as a dead transport: no strike', async () => {
++    const failing: Array<() => Promise<boolean> | undefined> = [
++      () => {
++        throw new Error('ssh -O check: no master')
++      },
++      async () => {
++        throw new Error('ssh -O check: no master')
++      }
++    ]
++
++    for (const masterAlive of failing) {
++      const { tracker, transports } = link(masterAlive)
++      const log = vi.fn()
++
++      await noteGatewayConnectOutcome(wsUrl, timedOut, log, tracker, transports)
++
++      expect(tracker.isSlow(base)).toBe(false)
++      expect(gatewayConnectLimitMs(wsUrl, tracker, transports)).toBe(GATEWAY_CONNECT_LIMIT_MS)
++      expect(log).not.toHaveBeenCalled()
++    }
++  })
++})
++
++describe('main <-> preload IPC for the chat connect limit', () => {
++  const log = vi.fn()
++
++  let bridge: {
++    gatewayConnectLimit: (wsUrl: string) => unknown
++    noteGatewayConnect: (wsUrl: string, outcome: unknown) => void
++  }
++
++  beforeAll(async () => {
++    registerGatewayConnectIpc(bus.ipcMain, log)
++    await import('./preload')
++    const registration = bus.exposeInMainWorld.mock.calls.find(([name]) => name === 'hermesDesktop')
++
++    bridge = registration![1]
++  })
++
++  it('main answers the sync limit request from the live tracker: 60 s for a slow tunnel, 15 s otherwise', () => {
++    const slow = connectTunnel(46131)
++    const normal = connectTunnel(46132)
++
++    slowLinkTracker.noteTimeoutWhileAlive(slow.baseUrl)
++
++    expect(bus.sendSync(GATEWAY_CONNECT_LIMIT_CHANNEL, slow.wsUrl)).toBe(SLOW_LINK_TIMEOUT_CAP_MS)
++    expect(bus.sendSync(GATEWAY_CONNECT_LIMIT_CHANNEL, normal.wsUrl)).toBe(GATEWAY_CONNECT_LIMIT_MS)
++  })
++
++  it('main counts a reported chat timeout on a live tunnel as a strike', async () => {
++    const hub = connectTunnel(46133)
++
++    bus.send(GATEWAY_CONNECT_OUTCOME_CHANNEL, hub.wsUrl, timedOut)
++
++    await vi.waitFor(() => expect(slowLinkTracker.isSlow(hub.baseUrl)).toBe(true))
++    expect(log.mock.calls.flat().join('\n')).toContain(`${hub.scope} chat WebSocket did not open within its limit`)
++  })
++
++  it('the renderer bridge reaches both handlers: it reads the stretched limit and its timeout report is a strike', async () => {
++    const slow = connectTunnel(46134)
++    const fresh = connectTunnel(46135)
++
++    slowLinkTracker.noteTimeoutWhileAlive(slow.baseUrl)
++
++    expect(bridge.gatewayConnectLimit(slow.wsUrl)).toBe(SLOW_LINK_TIMEOUT_CAP_MS)
++    expect(bridge.gatewayConnectLimit(fresh.wsUrl)).toBe(GATEWAY_CONNECT_LIMIT_MS)
++
++    bridge.noteGatewayConnect(fresh.wsUrl, timedOut)
++
++    await vi.waitFor(() => expect(slowLinkTracker.isSlow(fresh.baseUrl)).toBe(true))
++    expect(bridge.gatewayConnectLimit(fresh.wsUrl)).toBe(SLOW_LINK_TIMEOUT_CAP_MS)
++  })
++})
+diff --git a/apps/desktop/electron/slow-link.test.ts b/apps/desktop/electron/slow-link.test.ts
+index 189dd42f3a..4e670cc4e9 100644
+--- a/apps/desktop/electron/slow-link.test.ts
++++ b/apps/desktop/electron/slow-link.test.ts
+@@ -405,7 +405,7 @@ describe('noteRemoteAnswer', () => {
+     const log = (line: string) => lines.push(line)
+ 
+     remoteAnswerLedger.forget(url)
+-    noteRemoteConnect(url, 'conn:hermes-hub::default', Date.now() - 250)
++    noteRemoteConnect(url, 'conn:hermes-hub::default', Date.now() - 250, () => undefined)
+     noteRemoteAnswer(url, '/api/status', 40, log)
+     noteRemoteAnswer(url, '/api/profiles', 40, log)
+ 
+diff --git a/apps/desktop/electron/slow-link.ts b/apps/desktop/electron/slow-link.ts
+index 85daee2300..77084a8cf4 100644
+--- a/apps/desktop/electron/slow-link.ts
++++ b/apps/desktop/electron/slow-link.ts
+@@ -356,19 +356,17 @@ export function thinnedPoll(
+ // new descriptor serves, per scope, as `[remote-timing]` lines in desktop.log.
+ const remoteFirstRequestPending = new Map<string, { scope: string; startedAt: number }>()
+ 
++// masterAlive is required: without it the chat WebSocket of this tunnel can never count a strike while the SSH master
++// lives, so a slow link would never stretch its connect limit.
+ export function noteRemoteConnect(
+   baseUrl: string,
+   scope: string,
+   startedAt: number,
+-  masterAlive?: () => Promise<boolean> | undefined
++  masterAlive: () => Promise<boolean> | undefined
+ ): void {
+   remoteFirstRequestPending.set(baseUrl, { scope, startedAt })
+   slowLinkTracker.bind(scope, baseUrl)
+-
+-  if (masterAlive) {
+-    remoteTransports.remember(baseUrl, scope, masterAlive)
+-  }
+-
++  remoteTransports.remember(baseUrl, scope, masterAlive)
+   deltaBodyStore.bindRemote(baseUrl, scope) // delta-reads.ts: this tunnel's reads may come back as deltas
+ }
+ 
+diff --git a/apps/desktop/src/api/gateway-link-dial-bridge-faults.test.ts b/apps/desktop/src/api/gateway-link-dial-bridge-faults.test.ts
+new file mode 100644
+index 0000000000..77142b0cf7
+--- /dev/null
++++ b/apps/desktop/src/api/gateway-link-dial-bridge-faults.test.ts
+@@ -0,0 +1,75 @@
++// [daveey] The renderer's dial wrapper treats Desktop main's answers as advice: a limit main cannot give (not a
++// finite positive number, or the bridge throws) falls back to the client default, and a report that throws never
++// changes how the dial itself ended.
++
++import { GATEWAY_CONNECT_TIMEOUT_CODE } from '@hermes/shared'
++import { describe, expect, it, vi } from 'vitest'
++
++import { dialWithLinkLimit, type GatewayLinkBridge } from './gateway-link-dial'
++
++const WS = 'ws://127.0.0.1:41001/api/ws?ticket=faults'
++
++function connectTimeout(): Error {
++  return Object.assign(new Error('Gateway connect timed out: no WebSocket open within 15000 ms'), {
++    code: GATEWAY_CONNECT_TIMEOUT_CODE
++  })
++}
++
++describe('dialWithLinkLimit with a limit main cannot give', () => {
++  it('dials with the client default when main answers a non-finite or non-positive limit', async () => {
++    for (const limit of [Number.POSITIVE_INFINITY, Number.NaN, 0, -60_000]) {
++      const dial = vi.fn(async () => undefined)
++
++      await dialWithLinkLimit(WS, dial, { gatewayConnectLimit: () => limit })
++
++      expect(dial, `limit=${limit}`).toHaveBeenCalledExactlyOnceWith({})
++    }
++  })
++
++  it('dials with the client default and still reports the open when the limit request throws', async () => {
++    const dial = vi.fn(async () => undefined)
++    const noteGatewayConnect = vi.fn()
++
++    const bridge: GatewayLinkBridge = {
++      gatewayConnectLimit: () => {
++        throw new Error('An object could not be cloned.')
++      },
++      noteGatewayConnect
++    }
++
++    await expect(dialWithLinkLimit(WS, dial, bridge, () => 1_000)).resolves.toBeUndefined()
++
++    expect(dial).toHaveBeenCalledExactlyOnceWith({})
++    expect(noteGatewayConnect).toHaveBeenCalledExactlyOnceWith(WS, { elapsedMs: 0, kind: 'opened' })
++  })
++})
++
++describe('dialWithLinkLimit when reporting the outcome throws', () => {
++  const throwingReport = (): GatewayLinkBridge => ({
++    gatewayConnectLimit: () => 60_000,
++    noteGatewayConnect: () => {
++      throw new Error('IPC channel closed')
++    }
++  })
++
++  it('an open dial still resolves', async () => {
++    const dial = vi.fn(async () => undefined)
++
++    await expect(dialWithLinkLimit(WS, dial, throwingReport())).resolves.toBeUndefined()
++    expect(dial).toHaveBeenCalledExactlyOnceWith({ connectTimeoutMs: 60_000 })
++  })
++
++  it('a timed-out dial rejects with its own timeout error, not the report failure', async () => {
++    const timeout = connectTimeout()
++
++    await expect(
++      dialWithLinkLimit(
++        WS,
++        async () => {
++          throw timeout
++        },
++        throwingReport()
++      )
++    ).rejects.toBe(timeout)
++  })
++})
+-- 
+2.43.0
+

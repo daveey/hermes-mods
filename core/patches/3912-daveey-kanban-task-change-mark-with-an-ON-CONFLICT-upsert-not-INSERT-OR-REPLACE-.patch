@@ -1,0 +1,98 @@
+From d3bb6a5a61382b0dc28c48b4bd122421da848d4a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:36:35 +0000
+Subject: [PATCH] [daveey] kanban task change: mark with an ON CONFLICT upsert,
+ not INSERT OR REPLACE (review 5898003274 B1/B2)
+
+Why: the trigger body's `INSERT OR REPLACE` takes on the outer statement's conflict policy (SQLite: an outer
+`OR <policy>` overrides the policy of statements in triggers it fires).
+- B1: under an outer `OR IGNORE` (kb.link_tasks, the sync link apply, chat links, notify subs) the mark of an
+  already-marked task was ignored while the bump stayed. After any later marked write MAX(rev) matched the revision
+  again, so changed_since returned a non-FULL set that missed the task.
+- B2: under an outer `OR ABORT`/`OR FAIL`/`OR ROLLBACK` the content write itself raised UNIQUE on kanban_task_change.
+
+Fix: `INSERT INTO kanban_task_change ... SELECT ... WHERE id = 1 ON CONFLICT(task_id) DO UPDATE SET rev =
+excluded.rev`. No outer policy overrides an upsert clause. The trigger SQL changes inside epoch 2, so ensure_revision
+replaces the PR's earlier epoch-2 triggers on the next writer init (same-epoch SQL mismatch = repair).
+
+Proof:
+- RED (previous head 9a98f17154): 6 new tests fail (link_tasks OR IGNORE miss; outer OR IGNORE/ABORT/FAIL/ROLLBACK
+  insert; UPDATE OR IGNORE kanban_notify_subs). OR REPLACE and plain inserts pass on both heads.
+- GREEN: test_kanban_task_change + test_kanban_schema_owner + test_kanban_activity_revision: 71 passed.
+- Benchmark (scripts/benchmark_kanban_task_change.py, worker-7): committed bumping write +0.72%
+  (18459 -> 18591 us); statement-only 4.74 -> 6.67 us; changed_since 112.1 / 119.2 / 108.3 us at
+  1k / 5.8k / 20k tasks (growth 0.97x).
+---
+ hermes_cli/kanban_activity_revision.py      | 11 +++++--
+ tests/hermes_cli/test_kanban_task_change.py | 36 +++++++++++++++++++++
+ 2 files changed, 44 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_activity_revision.py b/hermes_cli/kanban_activity_revision.py
+index 3fed2423bd..6aec0ca285 100644
+--- a/hermes_cli/kanban_activity_revision.py
++++ b/hermes_cli/kanban_activity_revision.py
+@@ -88,9 +88,14 @@ _CHANGE_DDL = (f"CREATE TABLE IF NOT EXISTS {CHANGE_TABLE} (task_id TEXT PRIMARY
+ 
+ 
+ def _mark(ref: str, when: str = "") -> str:
+-    """Upsert the task ``ref`` (``NEW.x``/``OLD.x``, NULL = ``FULL_MARK``) at the revision just bumped."""
+-    return (f"INSERT OR REPLACE INTO {CHANGE_TABLE} (task_id, rev) SELECT COALESCE({ref}, '{FULL_MARK}'), revision "
+-            f"FROM {REVISION_TABLE} WHERE id = 1{when};")
++    """Upsert the task ``ref`` (``NEW.x``/``OLD.x``, NULL = ``FULL_MARK``) at the revision just bumped.
++
++    An ``ON CONFLICT DO UPDATE`` upsert, never ``INSERT OR REPLACE``: an outer statement's conflict policy overrides a
++    trigger body's ``OR`` policy, so ``INSERT OR IGNORE INTO task_links`` silently dropped the mark (while the bump
++    stayed) and ``INSERT OR ABORT`` raised UNIQUE on this table. No outer policy overrides an upsert clause. (The
++    ``WHERE`` is required: it keeps SQLite from parsing ``ON CONFLICT`` as a join constraint.)"""
++    return (f"INSERT INTO {CHANGE_TABLE} (task_id, rev) SELECT COALESCE({ref}, '{FULL_MARK}'), revision "
++            f"FROM {REVISION_TABLE} WHERE id = 1{when} ON CONFLICT(task_id) DO UPDATE SET rev = excluded.rev;")
+ 
+ 
+ def _marks(op: str, keys: tuple[str, ...]) -> str:
+diff --git a/tests/hermes_cli/test_kanban_task_change.py b/tests/hermes_cli/test_kanban_task_change.py
+index 53bf59f43e..c6ff657ad0 100644
+--- a/tests/hermes_cli/test_kanban_task_change.py
++++ b/tests/hermes_cli/test_kanban_task_change.py
+@@ -391,3 +391,39 @@ def test_a_cursor_inside_a_write_transaction_sees_its_own_writes(board):
+         board.execute("UPDATE tasks SET title = 'mine' WHERE id = ?", (tid,))
+         changed, _ = tc.changed_since(board, cursor)
+     assert changed == {tid}
++
++
++# [daveey] Review 5898003274 (B1/B2): a trigger's own conflict policy is overridden by the outer statement's. A mark
++# written as ``INSERT OR REPLACE`` became ``OR IGNORE`` under ``INSERT OR IGNORE INTO task_links`` (the bump stayed, the
++# mark was dropped: a non-FULL miss once a later write re-aligned MAX(rev)), and ``OR ABORT``/``FAIL``/``ROLLBACK`` made
++# the content write raise UNIQUE on kanban_task_change. The mark is an ``ON CONFLICT DO UPDATE`` upsert, which no outer
++# policy overrides.
++def test_link_tasks_or_ignore_marks_the_already_marked_parent(board):
++    parent = kb.create_task(board, title="parent", assignee="w")
++    child = kb.create_task(board, title="child", assignee="w")
++    other = kb.create_task(board, title="other", assignee="w")
++    cursor = _armed(board)
++    kb.link_tasks(board, parent, child)  # INSERT OR IGNORE INTO task_links (parent already has a mark row)
++    _write(board, "UPDATE tasks SET title = 'later' WHERE id = ?", (other,))
++    changed, _ = tc.changed_since(board, cursor)
++    assert changed == {parent, child, other}
++
++
++@pytest.mark.parametrize("policy", ["OR IGNORE", "OR ABORT", "OR FAIL", "OR ROLLBACK", "OR REPLACE", ""])
++def test_every_outer_conflict_policy_marks_and_never_raises(board, policy):
++    tid = kb.create_task(board, title="a", assignee="w")
++    cursor = _armed(board)
++    _write(board, f"INSERT {policy} INTO task_comments (task_id, author, body, created_at) VALUES (?, 'me', 'hi', 1)",
++           (tid,))
++    changed, _ = tc.changed_since(board, cursor)
++    assert changed == {tid}
++
++
++def test_update_or_ignore_marks_the_already_marked_task(board):
++    tid = kb.create_task(board, title="a", assignee="w")
++    _write(board, "INSERT INTO kanban_notify_subs (task_id, platform, chat_id, created_at) VALUES (?, 'p', 'c1', 1)",
++           (tid,))
++    cursor = _armed(board)
++    _write(board, "UPDATE OR IGNORE kanban_notify_subs SET chat_id = 'c2' WHERE task_id = ?", (tid,))
++    changed, _ = tc.changed_since(board, cursor)
++    assert changed == {tid}
+-- 
+2.43.0
+

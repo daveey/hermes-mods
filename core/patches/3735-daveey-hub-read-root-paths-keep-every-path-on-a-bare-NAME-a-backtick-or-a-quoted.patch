@@ -1,0 +1,132 @@
+From 01a8f9ae2f390bbb59fb3fa39cd8633126c1e0b5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 18:16:03 +0000
+Subject: [PATCH] [daveey] hub-read root paths: keep every path on a bare
+ $NAME, a backtick or a quoted cd
+
+A declared, attested hub:read card clears ~/.hermes paths under kanban.placement.hub_read_roots, and #2405
+made the clearing keep every path when a '..' is hidden by quoting, `$(` `${` `$'` `$"` expansion or a cd.
+Post-merge check t_01a1d5f0a8589561 found it still fails open on a bare parameter or a backtick substitution:
+on origin/main `reason(body, cfg)` returns None (portable) for each of these, and real bash resolves every one
+to <home>/.hermes/.env, outside the logs root (scratch-tree probe printed OUTSIDE-ROOT for each):
+
+    X=~/.hermes/logs/ && ssh hermes-hub cat $X../.env
+    X=.; Y=~/.hermes/logs/; ssh hermes-hub cat $Y$X$X/.env
+    set -- ~/.hermes/logs/ . .; IFS=; cat "$*"/.env
+    Y=~/.hermes/logs/ && ssh hermes-hub cat $Y`printf '\56\56'`/.env
+    `printf 'c\x64'` ~/.hermes/logs && cat `printf '\56\56'`/.env
+
+Fix (_strip_read_paths, whole-text guards like the others, fail closed):
+- `_PARAMETER` `\$[\w*]`: any `$NAME`, `$1` or `$*` keeps every path. `$@` never joins its words and the
+  other special parameters (`$# $? $$ $! $-`) hold no path, so they are left out.
+- `_BACKTICK`: any backtick keeps every path. marker_work_text drops whole backtick spans anyway, so this only
+  keeps the paths outside them; the backtick therefore leaves `_SPLIT` and `_QUOTES` (now unreachable there).
+- `_CHDIR` is judged on the quote/backslash-stripped text, as bash runs it: `c''d ~/.hermes/logs` and
+  `c\d ~/.hermes/logs` are a cd into a root (on main both cleared), and `cd '/tmp'` is the plain `cd /tmp`.
+
+Over-pinning check: across the 11 hub:read cards on worker-3's board (8 contain backticks), a whole-text
+backtick guard changes 0 answers. Per review 5894942332, a `"$PWD"` with no cd used to clear; it now pins
+(fail closed), which is the intended trade.
+
+Tests (tests/hermes_cli/test_kanban_hub_read_roots.py):
+- RED on origin/main source: exactly the 7 new computed-path rows fail (the five above plus `c''d`/`c\d`).
+- B rows: one row per surviving #2405 mutant (N1 N5 N7 N8 N11 N13 N14 N16 N18 pin rows, N19 portable row
+  `...; abcd`). sdlc-review mutants.py on main's source plus these rows: baseline 94 passed, all 10 killed.
+  On this branch: baseline 101 passed; N1 N5 N7 N11 N13 N14 N16 N18 N19 and the new guards (drop
+  _PARAMETER, drop `*`, drop `\w`, drop _BACKTICK, drop the cd check, cd check on raw text) all killed.
+- GREEN: hub_read_roots + coordination_placement + placement_diagnostics + test_kanban_placement 534 passed;
+  every test file naming the module or hub_read plus pool_queue: 20 files, 1120 passed.
+
+Severity as #2405: misplacement only; a pool worker reaches the hub only through hub-read, which enforces its
+own READ_ROOTS. [daveey] t_01a1d60a67007270
+---
+ hermes_cli/kanban_placement_coordination.py   | 20 ++++++++++++++----
+ .../hermes_cli/test_kanban_hub_read_roots.py  | 21 +++++++++++++++++++
+ 2 files changed, 37 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_placement_coordination.py b/hermes_cli/kanban_placement_coordination.py
+index 3607673a8a..32a6a20cd6 100644
+--- a/hermes_cli/kanban_placement_coordination.py
++++ b/hermes_cli/kanban_placement_coordination.py
+@@ -104,7 +104,8 @@ _HUB_READ_SSH = re.compile(r"\bssh[ \t]+hermes-hub[ \t]+(?:" + "|".join(HUB_READ
+ # (``logs/'..'``, ``logs/{..,x}``, ``logs/$(echo ..)``) would hide a ``..`` from :func:`_under_roots`
+ # (reviews 5877418508, 5877782890). ``%`` is literal in shell (``%2e%2e`` is a directory name, not ``..``).
+ _STATE_PATH = re.compile(r"(?:~|/home/[A-Za-z0-9_][\w.-]*)/\.hermes/([\w.@+%~/-]*)")
+-_QUOTES = "'\"`"
++# Text with a backtick keeps every path (``_BACKTICK``), so only shell quotes reach :func:`_ends_word`.
++_QUOTES = "'\""
+ # After the path and its closing quote/paren, if any: at most one sentence mark, then the end or whitespace; or a
+ # shell operator, which ends the word.
+ _WORD_END = re.compile(r"[.,:;!?]?(?:$|\s)|[&;|<>]")
+@@ -180,15 +181,26 @@ _DOTDOT = re.compile(r"(?<![\w.~-])\.\.(?![\w.~-])")
+ # command or parameter expansion computes one (``$(dirname "$PWD")``, ``$(printf "\56\56")``, ``${D%logs/}``). So
+ # text with any of these keeps every path, as does a directory change other than into a plain absolute path outside
+ # ``~/.hermes`` (``cd ~/.hermes/logs`` then ``cd -``, ``popd`` or a relative path walks out of a root).
+-_SPLIT = re.compile(r"[\\'\"`]")
++_SPLIT = re.compile(r"[\\'\"]")
+ _EXPANSION = re.compile(r"\$[({'\"]")
++# A bare parameter computes a path just as well (``X=~/.hermes/logs/; cat $X../.env``, ``$Y$X$X/.env`` with
++# ``X=.``, or ``"$*"`` joining ``set -- ~/.hermes/logs/ . .`` under an empty IFS), and so does a backtick
++# substitution (a backtick-quoted ``printf '\56\56'`` glued to a root path, or a backtick-quoted ``printf c\\x64`` as
++# a computed cd). Any backtick counts: ``marker_work_text`` drops whole backtick spans anyway, so this only keeps the
++# paths outside them. ``$@`` never joins its words, and the other special parameters hold no path. A directory change
++# is judged with quotes and backslashes removed, as bash runs it: ``c''d`` and ``c\d`` are a ``cd``, and
++# ``cd '/tmp'`` is the plain ``cd /tmp``.
++_PARAMETER = re.compile(r"\$[\w*]")
++_BACKTICK = re.compile(r"`")
+ _CHDIR = re.compile(r"(?<![\w.-])(?:cd|pushd|popd)(?![\w.-])(?![ \t]+(?:~|/)(?![^\s;&|]*\.hermes)[\w./-]*(?=$|[\s;&|)]))")
+ 
+ 
+ def _strip_read_paths(text, roots):
+-    if _DOTDOT.search(text) or _DOTDOT.search(_SPLIT.sub("", text)) or _EXPANSION.search(text) or _CHDIR.search(text):
++    split = _SPLIT.sub("", text)
++    if (_DOTDOT.search(text) or _DOTDOT.search(split) or _EXPANSION.search(text) or _PARAMETER.search(text)
++            or _BACKTICK.search(text) or _CHDIR.search(split)):
+         return text
+-    # Keep a separator so surrounding backtick runs cannot merge and hide later markers.
++    # Keep a separator so the words around a removed path cannot merge into a new marker.
+     return _STATE_PATH.sub(
+         lambda m: " " if _ends_word(text, m.start(), m.end()) and _under_roots(m.group(1), roots) else m.group(0),
+         text)
+diff --git a/tests/hermes_cli/test_kanban_hub_read_roots.py b/tests/hermes_cli/test_kanban_hub_read_roots.py
+index 0271d32464..2854b5e221 100644
+--- a/tests/hermes_cli/test_kanban_hub_read_roots.py
++++ b/tests/hermes_cli/test_kanban_hub_read_roots.py
+@@ -48,6 +48,8 @@ def test_declared_read_step_is_portable(attested):
+     # Guards for review 5893721470 leave plain reads alone: an unquoted option value, a cd outside ~/.hermes.
+     "ssh hermes-hub grep --file=~/.hermes/logs/pat.txt ~/.hermes/logs/x.log",
+     "ssh hermes-hub cat ~/.hermes/logs/x.log, then cd /tmp && ls",
++    # A word merely ending in ``cd`` is no directory change.
++    "ssh hermes-hub cat ~/.hermes/logs/x.log; abcd",
+ ])
+ def test_other_hub_read_shapes_are_portable(attested, body):
+     cfg, _, _ = attested
+@@ -131,6 +133,25 @@ def test_malformed_roots_clear_nothing(attested, roots):
+     'cat "~/.hermes/logs/a b/../../.env"',
+     "cat '~/.hermes/logs/a b/../../.env'",
+     'cat "/home/ubuntu/.hermes/logs/a b/../../.env"',
++    # A bare parameter or a backtick substitution computes a ``..`` or a cd as well; bash reads <home>/.hermes/.env
++    # for each of the first five. A cd spelled with quotes or a backslash is still a cd into a root.
++    "X=~/.hermes/logs/ && ssh hermes-hub cat $X../.env",
++    "X=.; Y=~/.hermes/logs/; ssh hermes-hub cat $Y$X$X/.env",
++    "set -- ~/.hermes/logs/ . .; IFS=; cat \"$*\"/.env",
++    "Y=~/.hermes/logs/ && ssh hermes-hub cat $Y`printf '\\56\\56'`/.env",
++    "`printf 'c\\x64'` ~/.hermes/logs && cat `printf '\\56\\56'`/.env",
++    "c''d ~/.hermes/logs && cat auth.json",
++    "c\\d ~/.hermes/logs && cat auth.json",
++    # One row per exact anchor of the root-clearing guards: a mutant of each passed every other row.
++    'ssh hermes-hub cat --file="~/.hermes/logs/a b/c"',
++    "ssh hermes-hub cat ~/.hermes/logs/x.log .\\./.env",
++    'ssh hermes-hub cat ~/.hermes/logs/x.log .""./.env',
++    "ssh hermes-hub cat ~/.hermes/logs/x.log .``./.env",
++    "ssh hermes-hub cat ~/.hermes/logs/x.log $'\\56\\56'/.env",
++    "pushd ~/.hermes/logs && cat .env",
++    "popd && cat ~/.hermes/logs/x.log",
++    "cd ~/.hermes/logs && cat auth.json",
++    "cd /tmp/x(y) && cat ~/.hermes/logs/x.log",
+     # A relative ``..`` after a cd into a root walks out of it (review 5892779312 nit).
+     "cd ~/.hermes/logs && cat ../.env",
+     "cd ~/.hermes/logs; chmod -R 777 ../state",
+-- 
+2.43.0
+

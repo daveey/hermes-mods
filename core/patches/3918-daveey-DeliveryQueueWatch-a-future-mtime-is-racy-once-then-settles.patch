@@ -1,0 +1,135 @@
+From 839d2087294ab9bc3ab41fe3463ec6cfe3068b50 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:02:35 +0000
+Subject: [PATCH] [daveey] DeliveryQueueWatch: a future mtime is racy once,
+ then settles
+
+Follow-up to PR #2675 (review 5898378207, card t_01a1d6db8d233562).
+
+`_is_racy` treated a stamp as racy when `now - newest_mtime <= 1 s`. A newest
+mtime ahead of the clock (host wall clock stepped back, or a skewed writer on a
+network FS) makes that difference negative, so the stamp stayed racy and every
+1 s poll ran an empty drain (one SQLite open per served profile) until the clock
+passed mtime + 1 s. Fail-safe and self-healing, but a needless poll loop.
+
+Five whys: the rule assumed mtimes are never in the future; a future mtime is
+"within the granule" forever by that test; so the racy flag never clears; so
+each poll reports a change; so each poll drains.
+
+Fix: a future newest mtime is racy only on the look that first sees that stamp
+(`first_sight`), then trusted until the stamp moves. A same-size rewrite under
+the same skewed mtime landing right after the first look is still caught (one
+recheck, as for an in-granule stamp); after that the watch settles and the
+housekeeping tick's own drain remains the fallback. Stamps with
+`0 <= age <= granule` keep the existing rule.
+
+Proof: tests/gateway/test_cron_delivery_housekeeping.py
+`test_a_future_mtime_is_racy_once_then_settles` (module-local `_now_ns` clock
+30 s behind the file mtime):
+- GREEN: 9/9 in the file pass.
+- RED on origin/main's module: "a future mtime kept the stamp racy on every poll".
+- Mutant `(age_ns >= 0)` (future never racy): "a same-size write under a
+  future mtime went unseen".
+- Mutant `first_sight = True` in changed(): "a future mtime kept the stamp racy
+  on every poll".
+---
+ gateway/run_delivery_queue_watch.py           | 16 ++++++---
+ .../test_cron_delivery_housekeeping.py        | 36 +++++++++++++++++++
+ 2 files changed, 47 insertions(+), 5 deletions(-)
+
+diff --git a/gateway/run_delivery_queue_watch.py b/gateway/run_delivery_queue_watch.py
+index aba1a99748..55edd9b9dd 100644
+--- a/gateway/run_delivery_queue_watch.py
++++ b/gateway/run_delivery_queue_watch.py
+@@ -38,7 +38,9 @@ class DeliveryQueueWatch:
+     stable, while a worker that enqueued during the drain still moves it again.
+     A stamp seen within ``MTIME_GRANULARITY_NS`` of its newest mtime is racy: the next
+     look reports a change even when the stamp matches (at worst one empty pass),
+-    because a write in the same timestamp granule would not have moved it.
++    because a write in the same timestamp granule would not have moved it. A newest mtime
++    ahead of the clock (wall clock stepped back, skewed writer on a network FS) is racy only
++    on the look that first sees it, or every poll would drain until the clock passed it.
+     """
+ 
+     def __init__(self, homes: Callable[[], Iterable[Optional[Path]]], drain: Callable[[], None]) -> None:
+@@ -46,7 +48,7 @@ class DeliveryQueueWatch:
+         self.drain = drain
+         self._served: list = list(homes())
+         self._seen = self._stamp()
+-        self._seen_racy = self._is_racy(self._seen)
++        self._seen_racy = self._is_racy(self._seen, first_sight=True)
+ 
+     def refresh_homes(self) -> None:
+         """Re-resolve the served profiles once per tick (a directory read under multiplex),
+@@ -68,17 +70,21 @@ class DeliveryQueueWatch:
+         return tuple(stamps)
+ 
+     @staticmethod
+-    def _is_racy(stamp: tuple) -> bool:
++    def _is_racy(stamp: tuple, first_sight: bool) -> bool:
+         # Read the clock after the stat: any later write carries a timestamp past this granule.
+         newest = max((mtime_ns for _path, mtime_ns, _size in stamp), default=None)
+-        return newest is not None and _now_ns() - newest <= MTIME_GRANULARITY_NS
++        if newest is None:
++            return False
++        age_ns = _now_ns() - newest
++        return age_ns <= MTIME_GRANULARITY_NS and (age_ns >= 0 or first_sight)
+ 
+     def changed(self) -> bool:
+         current = self._stamp()
+         if current == self._seen and not self._seen_racy:
+             return False
++        first_sight = current != self._seen
+         self._seen = current
+-        self._seen_racy = self._is_racy(current)
++        self._seen_racy = self._is_racy(current, first_sight)
+         return True
+ 
+ 
+diff --git a/tests/gateway/test_cron_delivery_housekeeping.py b/tests/gateway/test_cron_delivery_housekeeping.py
+index feea72e54d..7d278bd1b0 100644
+--- a/tests/gateway/test_cron_delivery_housekeeping.py
++++ b/tests/gateway/test_cron_delivery_housekeeping.py
+@@ -333,3 +333,39 @@ def test_a_write_in_the_same_mtime_granule_still_wakes_the_watch(tmp_path, monke
+     assert watch.changed() is True, "the previous look was still racy"
+     assert watch.changed() is False
+     assert watch.changed() is False
++
++
++def test_a_future_mtime_is_racy_once_then_settles(tmp_path, monkeypatch):
++    """An mtime ahead of the clock (wall clock stepped back, skewed writer on a network FS)
++    never comes within a granule of `now`, so the racy rule alone would run an empty drain on
++    every poll until the clock caught up. It is racy on first sight only, then settles."""
++    import os
++
++    from cron import delivery_queue
++    from gateway import run_delivery_queue_watch as queue_watch
++    from gateway.run_delivery_queue_watch import DeliveryQueueWatch
++
++    granule = queue_watch.MTIME_GRANULARITY_NS
++    monkeypatch.setattr(delivery_queue, "DELIVERY_DB", tmp_path / "deliveries.db")
++    queue = tmp_path / "deliveries.db"
++    queue.write_bytes(b"pending!")
++    mtime_ns = os.stat(queue).st_mtime_ns
++    now_ns = [mtime_ns - 30 * granule]
++    monkeypatch.setattr(queue_watch, "_now_ns", lambda: now_ns[0])
++    watch = DeliveryQueueWatch(lambda: [None], lambda: None)
++
++    # First sight is still racy: a same-size rewrite under the same skewed mtime wakes the watch.
++    queue.write_bytes(b"settled!")
++    os.utime(queue, ns=(mtime_ns, mtime_ns))
++    assert watch.changed() is True, "a same-size write under a future mtime went unseen"
++    for _ in range(5):
++        now_ns[0] += granule
++        assert now_ns[0] < mtime_ns
++        assert watch.changed() is False, "a future mtime kept the stamp racy on every poll"
++
++    # A new write under another future mtime is a new sighting: it wakes, rechecks once, settles.
++    queue.write_bytes(b"queued again")
++    os.utime(queue, ns=(mtime_ns + 1, mtime_ns + 1))
++    assert watch.changed() is True
++    assert watch.changed() is True, "the new future stamp was not racy on first sight"
++    assert watch.changed() is False
+-- 
+2.43.0
+

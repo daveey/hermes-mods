@@ -1,0 +1,281 @@
+From 627d8c24b390f23c2dee026c9426d7ce902f28e2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 18:51:00 +0000
+Subject: [PATCH] [daveey] tests: pin the foreign process_manage gates and the
+ exit recorder's status (#2376 survivors)
+
+A post-merge check of #2376 (t_01a1d5e5c0b52228) found eleven changed conditions no test
+covered: each exact-anchor mutant passed the existing process_* readopt/adoption suites.
+tests/tools/test_process_foreign_gates.py drives each one through process_manage
+(_handle_process) or ProcessRegistry against real orphaned processes:
+
+- B2  record_exit_command `exit "$__hermes_rc"` -> `exit 0`: a spawned `exit 3` reports 3.
+- B6  an entry with our own pid as writer, absent from our registry, is not_found.
+- B7  an entry whose writer died (orphan, recovery's job) is not_found.
+- B10 a prefix shared by two entries is not_found; a unique one resolves.
+- B11 a prefix under _MIN_PREFIX_CHARS is not_found.
+- B12 pid_scope=container: poll and kill are not_found and the job is never signalled.
+- B13 another sandbox's entry is not_found (poll and kill).
+- B15/B18 the supervisor's receipt landing mid-wait returns its exit code and output at once.
+- B16 without a receipt the wait reads for the settle grace before reporting unknown.
+- B17 a foreign kill sends the signal itself.
+
+Why test_owner_chat_kills_a_job_another_process_adopted missed B17: where
+`systemd-run --user --scope` works (Linux CI and workers), the job runs in a scope and
+foreign_kill's scope stop ends it even with no signal. The new kill test uses an entry with
+no systemd unit, so only the signal can end the job. B14 (poll ignores settled) is equivalent
+(registry.get reads the receipt by exact id first) and is not pinned.
+
+Mutant proof (sdlc-review scripts/mutants.py, new file only): baseline 11 passed; B2, B6,
+B7, B10, B11, B12, B13, B15, B16, B17, B18 each killed by its own test. B17 SURVIVES the old
+kill test on this host (1 passed). Test-only change.
+---
+ tests/tools/test_process_foreign_gates.py | 236 ++++++++++++++++++++++
+ 1 file changed, 236 insertions(+)
+ create mode 100644 tests/tools/test_process_foreign_gates.py
+
+diff --git a/tests/tools/test_process_foreign_gates.py b/tests/tools/test_process_foreign_gates.py
+new file mode 100644
+index 0000000000..26302d92c7
+--- /dev/null
++++ b/tests/tools/test_process_foreign_gates.py
+@@ -0,0 +1,236 @@
++"""process_manage gates for a job another live Hermes process supervises, and the exit recorder's
++status. [daveey]
++
++``tools/process_registry_foreign.py`` answers poll/log/wait/kill for a checkpoint entry this
++process never adopted. Each case below pins one gate through ``process_manage`` itself: which
++entries it may answer (writer liveness, a unique prefix of enough characters, a host PID, this
++sandbox), how long a wait keeps reading after the job went (the supervisor's receipt, the settle
++grace), and that a foreign kill really signals the job. The jobs are real processes orphaned
++from this test (their parent exited), as after a restart; entries carry no systemd scope, so only
++the kill's own signal can end the job.
++"""
++import json
++import os
++from pathlib import Path
++import signal
++import subprocess
++import sys
++import threading
++import time
++
++import pytest
++
++import tools.process_registry as pr
++from tools.process_registry import ProcessRegistry, _handle_process
++from tests.tools import test_process_orphan_readopt_tui as helpers
++
++TUI_KEY = helpers.TUI_KEY
++checkpoint = helpers.checkpoint
++
++pytestmark = [
++    pytest.mark.skipif(os.name != "posix", reason="host PIDs and the exit recorder are POSIX-only"),
++    # The jobs are orphans reparented away from the test's subtree; killing them is the point.
++    pytest.mark.live_system_guard_bypass,
++]
++
++
++def _orphan_sleep() -> int:
++    """PID of a ``sleep`` whose parent already exited (init reaps it, so a kill really ends it)."""
++    out = subprocess.run(["sh", "-c", "sleep 60 >/dev/null 2>&1 </dev/null & echo $!"],
++                         capture_output=True, text=True, timeout=10, check=True)
++    return int(out.stdout.strip())
++
++
++def _dead_pid() -> int:
++    proc = subprocess.Popen([sys.executable, "-c", "pass"])
++    proc.wait()
++    return proc.pid
++
++
++def _alive(pid: int) -> bool:
++    return ProcessRegistry()._detached_host_fate(pid, ProcessRegistry._safe_host_start_time(pid)) == "running"
++
++
++@pytest.fixture()
++def host(checkpoint, tmp_path, monkeypatch):
++    """A fresh registry serving the owner chat, a live writer (the supervising process) and a
++    helper that writes checkpoint entries."""
++    registry = ProcessRegistry()
++    monkeypatch.setattr(pr, "process_registry", registry)
++    monkeypatch.setattr("tools.process_registry_output_log.output_dir", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_SESSION_ID", TUI_KEY)
++    writer = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], stdin=subprocess.DEVNULL)
++    jobs: list[int] = []
++
++    def orphan() -> int:
++        jobs.append(_orphan_sleep())
++        return jobs[-1]
++
++    def entry(sid: str, pid: int, *, writer_pid=None, **extra) -> dict:
++        wpid = writer.pid if writer_pid is None else writer_pid
++        return {"session_id": sid, "command": "sleep 60", "pid": pid, "pid_scope": "host",
++                "host_start_time": ProcessRegistry._safe_host_start_time(pid), "started_at": time.time(),
++                "task_id": "default", "owner_task_id": TUI_KEY, "session_key": TUI_KEY,
++                "parent_session_id": TUI_KEY, "notify_on_complete": True, "sandbox_key": "",
++                "writer_pid": wpid, "writer_start_time": ProcessRegistry._safe_host_start_time(wpid),
++                **extra}
++
++    def write(*entries: dict) -> None:
++        checkpoint.write_text(json.dumps(list(entries)))
++
++    try:
++        yield registry, orphan, entry, write
++    finally:
++        for pid in jobs:
++            try:
++                os.kill(pid, signal.SIGKILL)
++            except ProcessLookupError:
++                pass
++        writer.kill()
++        writer.wait()
++
++
++def _call(action: str, session_id: str, **args) -> dict:
++    return json.loads(_handle_process({"action": action, "session_id": session_id, **args}))
++
++
++def _receipt(session_id: str, exit_code: int, output: str) -> None:
++    """The supervisor's completion receipt, as ``save_completed_result`` writes it."""
++    from hermes_constants import get_hermes_home
++    directory = get_hermes_home() / "logs" / "process-results"
++    directory.mkdir(parents=True, exist_ok=True)
++    record = {"id": session_id, "command": "sleep 60", "cwd": "/", "task_id": "default",
++              "owner_task_id": TUI_KEY, "session_key": TUI_KEY, "parent_session_id": TUI_KEY,
++              "started_at": time.time(), "exit_code": exit_code, "completion_reason": "exited",
++              "termination_source": None, "notify_on_complete": True, "output": output}
++    tmp = directory / f".{session_id}.tmp"
++    tmp.write_text(json.dumps(record))
++    tmp.replace(directory / f"{session_id}.json")
++
++
++# ----- the exit recorder -----
++
++def test_spawner_reports_a_persisted_jobs_failing_exit_code(tmp_path, monkeypatch):
++    """The recording shell exits with the command's status: a failing job never reads as success."""
++    monkeypatch.setattr("tools.process_registry_output_log.output_dir", lambda: tmp_path)
++    registry = ProcessRegistry()
++    session = registry.spawn_local("exit 3", cwd=str(tmp_path), session_key=TUI_KEY,
++                                   owner_task_id=TUI_KEY, persist_on_release=True)
++    try:
++        assert session._completion_event.wait(15)
++        assert session.exit_code == 3, (session.exit_code, session.completion_reason)
++    finally:
++        if session._reader_thread:
++            session._reader_thread.join(5)
++        registry.kill_process(session.id)
++
++
++# ----- which entries the foreign fallback answers -----
++
++def test_a_live_job_with_a_live_writer_is_served(host):
++    """The control for the gates below: the same shape of entry, answerable."""
++    _registry, orphan, entry, write = host
++    write(entry("proc_c0ffee000001", orphan()))
++    polled = _call("poll", "proc_c0ffee000001")
++    assert polled["status"] == "running", polled
++
++
++def test_an_entry_this_process_wrote_is_not_served_as_foreign(host):
++    """Our own pid as writer but missing from our registry: not another process's job."""
++    _registry, orphan, entry, write = host
++    write(entry("proc_c0ffee000002", orphan(), writer_pid=os.getpid()))
++    assert _call("poll", "proc_c0ffee000002")["status"] == "not_found"
++
++
++def test_an_orphan_whose_writer_died_is_left_to_recovery(host):
++    """A dead writer means no one supervises it: recovery adopts orphans, the fallback does not."""
++    _registry, orphan, entry, write = host
++    write(entry("proc_c0ffee000003", orphan(), writer_pid=_dead_pid()))
++    assert _call("poll", "proc_c0ffee000003")["status"] == "not_found"
++
++
++def test_an_ambiguous_prefix_is_not_found_and_a_unique_one_resolves(host):
++    _registry, orphan, entry, write = host
++    write(entry("proc_abcd11110000", orphan()), entry("proc_abcd22220000", orphan()))
++    assert _call("poll", "proc_abcd")["status"] == "not_found"
++    assert _call("poll", "abcd")["status"] == "not_found"
++    assert _call("poll", "proc_abcd2")["status"] == "running"
++
++
++def test_a_too_short_prefix_is_not_found(host):
++    _registry, orphan, entry, write = host
++    write(entry("proc_ab0011223344", orphan()))
++    assert _call("poll", "ab")["status"] == "not_found"
++    assert _call("poll", "proc_ab")["status"] == "not_found"
++    assert _call("poll", "ab00")["status"] == "running"
++
++
++def test_a_container_pid_is_neither_polled_nor_signalled(host):
++    """A pid in another PID namespace names a different process here: never answer or kill it."""
++    _registry, orphan, entry, write = host
++    pid = orphan()
++    write(entry("proc_c0ffee000004", pid, pid_scope="container"))
++    assert _call("poll", "proc_c0ffee000004")["status"] == "not_found"
++    assert _call("kill", "proc_c0ffee000004")["status"] == "not_found"
++    assert _alive(pid)
++
++
++def test_another_sandboxs_job_is_not_found(host):
++    _registry, orphan, entry, write = host
++    pid = orphan()
++    write(entry("proc_c0ffee000005", pid, sandbox_key="other-tenant-sandbox"))
++    assert _call("poll", "proc_c0ffee000005")["status"] == "not_found"
++    assert _call("kill", "proc_c0ffee000005")["status"] == "not_found"
++    assert _alive(pid)
++
++
++# ----- wait after the job went -----
++
++def test_wait_returns_the_supervisors_receipt_as_soon_as_it_lands(host, monkeypatch):
++    """The job is gone and its supervisor records the result a moment later: the wait returns that
++    result (its real exit code and output) at once, not the grace's "status not recorded"."""
++    import tools.process_registry_foreign as foreign
++    monkeypatch.setattr(foreign, "_SETTLE_GRACE_SECONDS", 6.0)
++    _registry, _orphan, entry, write = host
++    sid = "proc_c0ffee000006"
++    write(entry(sid, _dead_pid()))
++    timer = threading.Timer(1.5, _receipt, args=(sid, 9, "receipt says done\n"))
++    timer.start()
++    started = time.monotonic()
++    try:
++        waited = _call("wait", sid, timeout=15)
++    finally:
++        timer.cancel()
++    elapsed = time.monotonic() - started
++    assert waited.get("exit_code") == 9, waited
++    assert "receipt says done" in waited.get("output", ""), waited
++    assert elapsed < 5.0, elapsed
++
++
++def test_wait_without_a_receipt_waits_out_the_settle_grace(host, monkeypatch):
++    """No receipt yet: the wait keeps reading for the grace window before reporting unknown."""
++    import tools.process_registry_foreign as foreign
++    monkeypatch.setattr(foreign, "_SETTLE_GRACE_SECONDS", 2.0)
++    _registry, _orphan, entry, write = host
++    sid = "proc_c0ffee000007"
++    write(entry(sid, _dead_pid()))
++    started = time.monotonic()
++    waited = _call("wait", sid, timeout=15)
++    elapsed = time.monotonic() - started
++    assert waited["status"] == "exited" and waited["exit_code"] is None, waited
++    assert 1.9 <= elapsed < 10.0, elapsed
++
++
++# ----- kill -----
++
++def test_foreign_kill_signals_the_job_itself(host):
++    """With no systemd scope to stop, only the kill's own signal ends the job: it must be sent."""
++    _registry, orphan, entry, write = host
++    pid = orphan()
++    write(entry("proc_c0ffee000008", pid))
++    killed = _call("kill", "proc_c0ffee000008")
++    assert killed["status"] == "killed", killed
++    deadline = time.monotonic() + 10
++    while _alive(pid):
++        assert time.monotonic() < deadline, "the job survived its kill"
++        threading.Event().wait(0.05)
+-- 
+2.43.0
+

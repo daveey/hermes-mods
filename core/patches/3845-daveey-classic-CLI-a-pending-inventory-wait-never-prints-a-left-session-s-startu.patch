@@ -1,0 +1,256 @@
+From 7a31a9ab8b8b091d5997bee9b1b9c10b2c69e49c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 20:32:09 +0000
+Subject: [PATCH] [daveey] classic CLI: a pending-inventory wait never prints a
+ left session's startup notices
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`_await_gateway_inventory` (PR #2549) registered a `SessionState.info_listeners` callback for the
+opened session and removed it only when a settled (`inventory_pending: false`) `session.info` frame
+arrived. If the late publish never came, the listener stayed. If the CLI had moved to another session
+(`/resume`, `/new`, `/branch`, an end) before a settled frame for the old one arrived, the listener
+printed the old session's unknown_toolsets / tool_availability_warnings on the new screen and adopted
+its toolset list: the `store.current is snapshot` guard covered only the snapshot merge, not the print.
+(Review nit 2 on #2549, GitHub review 5897167317.)
+
+Fix:
+- `GatewaySessionStore.set_current(snapshot)`: the one way `current` moves (`_adopt`, `end_session`,
+  the snapshot restore's drop). A move to a different snapshot runs and clears `switch_listeners`;
+  re-adopting the same snapshot (a resume's attach-then-adopt) is not a switch.
+- The wait is keyed to its session: it registers `left` on `store.switch_listeners` next to `settled`
+  on that session's `info_listeners`. Whichever of settle/switch runs first claims one lock and removes
+  both, so nothing stays registered either way.
+- `settled` returns without printing (or merging, or adopting toolsets) unless the frame's session is
+  still `store.current`, as a second guard for any path that moves `current` around the hook.
+  Frames for other session ids never reach the listener: the pump routes each frame to its own
+  `SessionState`.
+
+Proof:
+- RED on main (75c54c9f80): test_a_switch_while_pending_never_prints_the_left_sessions_notices printed
+  ['[bold red]Warning: Unknown toolsets: gone_plugin[/]', '', '⚠ web: set FIRECRAWL_API_KEY'];
+  the listener-removal tests (switch, end) and the moved-current test failed too.
+- GREEN: test_cli_gateway_inventory_pending.py 8/8; the 44 test files importing the changed modules:
+  544 passed, 1 skipped.
+- Mutants (sdlc-review mutants.py over the two touched test files): 10/11 killed (print guard, hook
+  registration, left's release, the suppress, settle's hook removal, set_current always/never firing,
+  _adopt / end_session / snapshot restore bypassing set_current). The survivor (copying instead of
+  clearing switch_listeners) is equivalent: each registered listener removes itself.
+---
+ hermes_cli/cli_init_mixin.py                  | 27 ++++++---
+ hermes_cli/cli_snapshot.py                    |  2 +-
+ hermes_cli/gateway_session_store.py           | 15 ++++-
+ .../test_cli_gateway_inventory_pending.py     | 59 +++++++++++++++++++
+ .../test_gateway_snapshot_restore_guards.py   |  5 ++
+ 5 files changed, 98 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/cli_init_mixin.py b/hermes_cli/cli_init_mixin.py
+index 341284b3f1..bd50a76aa2 100644
+--- a/hermes_cli/cli_init_mixin.py
++++ b/hermes_cli/cli_init_mixin.py
+@@ -5,7 +5,7 @@ Mixin split out of ``cli.py``; bound onto ``HermesCLI`` via the MRO.
+ 
+ from __future__ import annotations
+ 
+-from contextlib import contextmanager
++from contextlib import contextmanager, suppress
+ import logging
+ import os
+ import queue
+@@ -55,18 +55,31 @@ def _adopt_inventory(cli, info, *, warnings=False):
+ def _await_gateway_inventory(cli, store, snapshot):
+     """Print the startup notices once the late ``session.info`` (``inventory_pending: false``) settles the
+     pending reply, and keep it as the snapshot's banner info. Registered before the check, so a frame the
+-    pump applied before this runs is not missed; printed once."""
++    pump applied before this runs is not missed; printed once. The wait belongs to this session: a move
++    to another one (``/new``, ``/resume``, ``/branch``, an end) drops it, and a frame that still lands
++    after the move prints nothing, so the left session's notices never show on the new one."""
+     state = store.connection.state(snapshot["stored_session_id"])
+-    printed = threading.Lock()
++    claimed = threading.Lock()  # the settle or the switch, whichever comes first, ends the wait once
++
++    def release():
++        state.info_listeners.remove(settled)  # both were appended before the first call
++        with suppress(ValueError):  # a switch already cleared the store's list
++            store.switch_listeners.remove(left)
++
++    def left():
++        if claimed.acquire(blocking=False):
++            release()
+ 
+     def settled(payload):
+-        if payload.get("inventory_pending") is not False or not printed.acquire(blocking=False):
++        if payload.get("inventory_pending") is not False or not claimed.acquire(blocking=False):
++            return
++        release()
++        if store.current is not snapshot:
+             return
+-        state.info_listeners.remove(settled)  # appended before the first call; the lock runs this once
+-        if store.current is snapshot:
+-            snapshot["info"] = {**(snapshot.get("info") or {}), **payload}
++        snapshot["info"] = {**(snapshot.get("info") or {}), **payload}
+         _adopt_inventory(cli, payload, warnings=True)
+     state.info_listeners.append(settled)
++    store.switch_listeners.append(left)
+     settled(dict(state.info))
+ 
+ 
+diff --git a/hermes_cli/cli_snapshot.py b/hermes_cli/cli_snapshot.py
+index daf4be9067..d21c42ab33 100644
+--- a/hermes_cli/cli_snapshot.py
++++ b/hermes_cli/cli_snapshot.py
+@@ -135,7 +135,7 @@ def _restore_gateway_snapshot(cli, store, snap_id):
+                 print(f"  Profile '{home.name}' is not served again yet: {ack_failure(ack)}. "
+                       "The host retries on its next rescan (within 30s).")
+         store.snapshots.clear()
+-        store.current = None
++        store.set_current(None)
+         # The restore's own result or error decides the reply; a failed rejoin must not replace it.
+         try:
+             drained, store.connection = store.connection, GatewayConnection.shared()
+diff --git a/hermes_cli/gateway_session_store.py b/hermes_cli/gateway_session_store.py
+index d3f51d875e..78a98ab727 100644
+--- a/hermes_cli/gateway_session_store.py
++++ b/hermes_cli/gateway_session_store.py
+@@ -79,6 +79,9 @@ class GatewaySessionStore:
+         self.connection = connection or GatewayConnection.shared()
+         self.snapshots: dict[str, dict] = {}
+         self.current: dict | None = None
++        # Called once (then cleared) when ``current`` moves off the session they were registered on
++        # (``/new``, ``/resume``, ``/branch``, an end): a wait for that session's late frame is dropped.
++        self.switch_listeners: list = []
+         self._reader = None
+         self._create_parameters = None
+ 
+@@ -134,10 +137,18 @@ class GatewaySessionStore:
+     def _adopt(self, snapshot):
+         sid = snapshot["stored_session_id"]
+         self.snapshots[sid] = snapshot
+-        self.current = snapshot
++        self.set_current(snapshot)
+         self.connection.state(sid).adopt_snapshot(snapshot)
+         return sid
+ 
++    def set_current(self, snapshot):
++        """Open ``snapshot`` (``None``: none); a move off the current one runs the switch listeners."""
++        if snapshot is not self.current:
++            listeners, self.switch_listeners = self.switch_listeners, []
++            for listener in listeners:
++                listener()
++        self.current = snapshot
++
+     def attach(self, session_id, *, typed=False):
+         """``session.resume`` once per session id this viewer uses (idempotent), carrying this CLI's launch
+         key as the thin client does (``GatewayConnection.resume``, the reconnect's too). A session that does
+@@ -350,7 +361,7 @@ class GatewaySessionStore:
+             except GatewayClientError as exc:
+                 logger.debug("session.detach failed: %s", exc)
+         if self.current is snapshot:
+-            self.current = None
++            self.set_current(None)
+ 
+     def delete_session_if_empty(self, session_id, sessions_dir=None):
+         """Main's quit-immediately prune, as a gateway delete: only a row with no messages, no title
+diff --git a/tests/hermes_cli/test_cli_gateway_inventory_pending.py b/tests/hermes_cli/test_cli_gateway_inventory_pending.py
+index e553e2bc50..84068f7128 100644
+--- a/tests/hermes_cli/test_cli_gateway_inventory_pending.py
++++ b/tests/hermes_cli/test_cli_gateway_inventory_pending.py
+@@ -63,9 +63,68 @@ def test_late_inventory_prints_the_startup_notices_once(pending_store, monkeypat
+     _publish(db, client, dict(LATE))  # a later settled frame (another viewer's open) prints nothing again
+     wait_until(lambda: db.connection.state("local-new").info.get("running") is True, what="frames applied")
+     assert db.connection.state("local-new").info_listeners == []
++    assert db.switch_listeners == []  # the settled wait leaves no switch hook behind either
+     assert len(printed) == 3, printed
+ 
+ 
++def _settle_after_switch(db, client):
++    """The first session's late settled frame, then a marker frame: the pump applies frames in order, so
++    once the marker is in, every listener the settled frame reached has returned."""
++    _publish(db, client, dict(LATE))
++    _publish(db, client, {"running": True})
++    wait_until(lambda: db.connection.state("local-new").info.get("running") is True, what="frames applied")
++
++
++def test_a_switch_while_pending_never_prints_the_left_sessions_notices(pending_store, monkeypatch):
++    """/resume (or /new, /branch) moves the CLI to another session before the first one's inventory
++    settles: that late frame belongs to a session no longer on screen, so nothing prints."""
++    db, client = pending_store
++    host, printed = _launch(monkeypatch, db)
++    db.attach("local-old")
++    _settle_after_switch(db, client)
++    assert printed == [], printed
++    assert host.enabled_toolsets is None  # nor is the left session's toolset list adopted
++
++
++def test_the_wait_is_dropped_when_the_cli_switches_session(pending_store, monkeypatch):
++    db, _client = pending_store
++    _launch(monkeypatch, db)
++    first = db.connection.state("local-new")
++    assert len(first.info_listeners) == 1
++    db.attach("local-old")
++    assert first.info_listeners == []
++    assert db.switch_listeners == []
++
++
++def test_re_adopting_the_open_session_is_no_switch(pending_store, monkeypatch):
++    """The same snapshot adopted again (a resume's attach then adopt) keeps the wait, and it still prints."""
++    db, client = pending_store
++    _host, printed = _launch(monkeypatch, db)
++    db.set_current(db.current)
++    assert len(db.connection.state("local-new").info_listeners) == 1
++    _settle_after_switch(db, client)
++    assert len(printed) == 3, printed
++
++
++def test_the_wait_is_dropped_when_the_pending_session_ends(pending_store, monkeypatch):
++    """Quit (or /new's end of the old row) before the late inventory came: nothing stays registered."""
++    db, _client = pending_store
++    _launch(monkeypatch, db)
++    db.end_session("local-new")
++    assert db.connection.state("local-new").info_listeners == []
++    assert db.switch_listeners == []
++
++
++def test_a_current_moved_without_a_switch_hook_still_prints_nothing(pending_store, monkeypatch):
++    """Belt and braces: the print itself checks the session is still the one on screen."""
++    db, client = pending_store
++    _host, printed = _launch(monkeypatch, db)
++    db.current = {"stored_session_id": "local-old", "info": {}}  # moved behind the hook's back
++    _settle_after_switch(db, client)
++    assert printed == [], printed
++    assert db.connection.state("local-new").info_listeners == []
++
++
+ def test_a_settled_reply_prints_at_once_and_waits_on_nothing(pending_store, monkeypatch):
+     db, client = pending_store
+     real_rpc = client.rpc
+diff --git a/tests/hermes_cli/test_gateway_snapshot_restore_guards.py b/tests/hermes_cli/test_gateway_snapshot_restore_guards.py
+index 640b6b5a26..d4822915ef 100644
+--- a/tests/hermes_cli/test_gateway_snapshot_restore_guards.py
++++ b/tests/hermes_cli/test_gateway_snapshot_restore_guards.py
+@@ -67,6 +67,9 @@ def test_restore_reply_follows_the_restore_not_the_rejoin(tmp_path, monkeypatch,
+     store = GatewaySessionStore(old)
+     cli = SimpleNamespace(_session_db=store, _gateway_session_open=True, session_id="kept",
+                           agent=object(), conversation_history=[])
++    switched = []  # a wait on the open session's late frame (``_await_gateway_inventory``) ends with it
++    store.current = {"stored_session_id": "kept", "info": {}}
++    store.switch_listeners.append(lambda: switched.append(True))
+     satellite = case.startswith("satellite-")
+     marker = parked_marker_path(home)
+     if case == "satellite-pre-parked":
+@@ -107,9 +110,11 @@ def test_restore_reply_follows_the_restore_not_the_rejoin(tmp_path, monkeypatch,
+     if case in {"supervised", "invalid-id", "remote"}:
+         assert not paused and not old.final  # refused before tearing down the viewer
+         assert store.connection is old  # a remote chat keeps its connection too
++        assert switched == []
+     else:
+         assert "Reconnecting to the gateway failed: permission_denied" in out
+         assert store.connection is not old and store.connection.launch_api_key == "launch-only-key"
++        assert switched == [True]
+     if satellite:
+         assert parked_at.pop("unserve") is True  # parked before the teardown, so no rescan re-serves it
+         assert parked_at == ({} if case in {"satellite-unserve-error", "satellite-pre-parked"} else {"serve": False})
+-- 
+2.43.0
+

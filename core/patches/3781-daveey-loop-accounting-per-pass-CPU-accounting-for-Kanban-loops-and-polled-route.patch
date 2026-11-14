@@ -1,0 +1,1752 @@
+From 1cd1ecc706b58e2472cc91b71e3f6a8c93fe263f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 16:17:32 +0000
+Subject: [PATCH] [daveey] loop_accounting: per-pass CPU accounting for Kanban
+ loops and polled routes (P1)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Card A (t_01a1d59c4cdf97ba) of design t_01a1d563324d7e8e §2 P1 / C17, with review R3.
+
+New hermes_cli/loop_accounting.py: per pass name, runs / skips / key changes /
+fallbacks / rows / errors and time.thread_time() CPU (sum, max) plus wall time;
+per thread, /proc/self/task CPU next to the CPU its outermost passes accounted
+(R3), so the hub's unattributed CPU lands on a thread. Gateway, serve and tui
+processes (shared_metrics_process.begin_process) write an atomic JSON snapshot
+every 60 s to <root>/run/loop-accounting/<pid>.json (config.yaml
+loop_accounting.enabled / interval_s). API: pass_(name, skipped=, changed=,
+fallback=, rows=), timed(), @accounted(name, rows=), span_open/span_close.
+
+Wired: sync.board/<slug> (sync_timing board hooks), dispatcher.tick,
+dispatcher.board/<slug>, dispatch.<sweep> for every dispatch_once sub-sweep,
+dispatcher.auto_decompose, notifier.collect(+_board/<slug>),
+unloaded.host_pass and its sub-passes, unloaded.residual_pass,
+remote_index.refresh/compute, links_refresh, machine_metrics.tick,
+change_watcher.pass and change_watcher/<event>, notifications.<poll>,
+annotation.refresh/poll/revalidate/holder_refresh/<profile>, rpc/<method>,
+producer_admission.sweep, route/profiles.sessions(.sidebar),
+route/profiles.projects.tree, route/kanban.board, route/sessions.kanban_tasks.
+HostLoopLease records lease.<name> from a true held() to its beat(), so mod host
+passes (chat-closeout _host_pass) are accounted with no mod change.
+
+Tests: tests/hermes_cli/test_loop_accounting.py (counters, nesting, spans,
+lease, overflow, per-thread CPU, snapshot file, writer, prune, begin_process,
+sync hooks, exited-thread folding without procfs); test_loop_accounting_bench.py
+pins <= 20 us per pass.
+
+Exited threads fold into exited_accounted at each snapshot. Without procfs
+(macOS Desktop/serve/TUI backends, whose native thread ids are never reused)
+the live set comes from threading.enumerate(), so short-lived worker threads
+cannot grow the per-thread map.
+
+Boundary lint: the kanban dashboard (plugins/kanban/dashboard/plugin_api.py)
+already imports hermes_cli.kanban_* internals; its one new
+hermes_cli.loop_accounting import (route/kanban.board accounting) is
+intended and recorded in scripts/boundary_lint_baseline.json.
+---
+ gateway/kanban_watchers_dispatcher.py         |  18 +-
+ gateway/kanban_watchers_notifier.py           |   7 +-
+ hermes_cli/host_loop_lease.py                 |  32 +-
+ hermes_cli/kanban_annotation_host.py          |  13 +-
+ hermes_cli/kanban_db_dispatch.py              |  42 +-
+ hermes_cli/kanban_links_refresh.py            |   3 +-
+ hermes_cli/kanban_session_activity.py         |   4 +-
+ .../kanban_session_activity_revalidate.py     |  13 +-
+ hermes_cli/kanban_sync_timing.py              |  28 +-
+ hermes_cli/loop_accounting.py                 | 542 ++++++++++++++++++
+ hermes_cli/machine_metrics_sender.py          |  11 +-
+ .../observability/shared_metrics_process.py   |  10 +-
+ hermes_cli/web_routers/profiles.py            |   4 +
+ hermes_cli/web_routers/sessions.py            |   2 +
+ plugins/kanban/dashboard/plugin_api.py        |   2 +
+ scripts/boundary_lint_baseline.json           |   1 +
+ tests/hermes_cli/test_loop_accounting.py      | 292 ++++++++++
+ .../hermes_cli/test_loop_accounting_bench.py  |  48 ++
+ tui_gateway/change_watcher.py                 |  13 +-
+ tui_gateway/kanban_remote_index.py            |  31 +-
+ tui_gateway/kanban_unloaded.py                |  19 +-
+ tui_gateway/producer_admission.py             |   2 +
+ tui_gateway/rpc_dispatch.py                   |   4 +-
+ tui_gateway/session_notifications.py          |  21 +-
+ 24 files changed, 1090 insertions(+), 72 deletions(-)
+ create mode 100644 hermes_cli/loop_accounting.py
+ create mode 100644 tests/hermes_cli/test_loop_accounting.py
+ create mode 100644 tests/hermes_cli/test_loop_accounting_bench.py
+
+diff --git a/gateway/kanban_watchers_dispatcher.py b/gateway/kanban_watchers_dispatcher.py
+index 75fe9a303d..2886d13d12 100644
+--- a/gateway/kanban_watchers_dispatcher.py
++++ b/gateway/kanban_watchers_dispatcher.py
+@@ -17,6 +17,7 @@ from typing import Any, Optional
+ from gateway.kanban_watchers_common import (
+     _auto_decompose_min_age_seconds, _board_slugs, _positive_int_setting, logger,
+ )
++from hermes_cli import loop_accounting as _la
+ 
+ 
+ def _kbc():
+@@ -298,6 +299,7 @@ class _KanbanDispatcher:
+         self._rr_offset += 1
+         return slugs[start:] + slugs[:start]
+ 
++    @_la.accounted("dispatcher.tick")
+     def tick_once(self, *, suppress_spawn: bool = False) -> list[tuple[str, Optional[object]]]:
+         """Run one dispatch_once per board. Returns (slug, result) pairs.
+ 
+@@ -311,9 +313,18 @@ class _KanbanDispatcher:
+                 order = self._fair_board_order()
+                 quotas = share.shares(order, self.live_max_in_progress())
+                 if quotas is not None:
+-                    return share.run(order, quotas, self.tick_once_for_board)
+-                return [(slug, self.tick_once_for_board(slug)) for slug in order]
+-            return [(slug, self.tick_once_for_board(slug, suppress_spawn=True)) for slug in self._board_slugs()]
++                    return share.run(order, quotas, self._board_pass)
++                return [(slug, self._board_pass(slug)) for slug in order]
++            return [(slug, self._board_pass(slug, suppress_spawn=True)) for slug in self._board_slugs()]
++
++    def _board_pass(self, slug: str, **kwargs: Any) -> Optional[object]:
++        """``tick_once_for_board`` as one ``dispatcher.board/<slug>`` pass (``hermes_cli.loop_accounting``): a
++        quarantined or lock-skipped board counts as a skip. [daveey]"""
++        with _la.pass_(f"dispatcher.board/{slug}") as acct:
++            result = self.tick_once_for_board(slug, **kwargs)
++            if result is None or getattr(result, "skipped_locked", False):
++                acct.skip()
++            return result
+ 
+     @staticmethod
+     def _receipt_scope() -> tuple[set, set]:
+@@ -375,6 +386,7 @@ class _KanbanDispatcher:
+                     logger.exception("kanban dispatcher: health probe failed on board %s", slug)
+         return False
+ 
++    @_la.accounted("dispatcher.auto_decompose", rows=True)
+     def auto_decompose_tick(self, auto_decompose_per_tick: int, min_age_seconds: Optional[int] = None) -> int:
+         """Auto-decompose up to N triage tasks across all boards into ready workgraphs.
+ 
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index f205654349..89f6c18c24 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -18,6 +18,7 @@ from typing import Any, Callable, Optional
+ from agent.i18n import t
+ 
+ from gateway.kanban_watchers_common import _list_boards, _to_thread_process_service, logger
++from hermes_cli import loop_accounting as _la
+ from gateway.wake import session_owned_by_profile
+ from hermes_cli.kanban_block_notice import coalesce_superseded_blocks
+ 
+@@ -303,7 +304,10 @@ class _Collector:
+                     logger.debug("kanban notifier: skipping duplicate board slug %s for DB %s", slug, resolved_db_path)
+                     continue
+                 seen_db_paths.add(resolved_db_path)
+-                self.collect_board(slug)
++                with _la.pass_(f"notifier.collect_board/{slug}") as acct:  # rows = deliveries claimed [daveey]
++                    before = len(self.deliveries)
++                    self.collect_board(slug)
++                    acct.rows(len(self.deliveries) - before)
+         return self.deliveries
+ 
+     def _board_has_subs(self, slug: str) -> bool:
+@@ -401,6 +405,7 @@ class _Collector:
+             conn.close()
+ 
+ 
++@_la.accounted("notifier.collect", rows=True)
+ def _notifier_collect(runner: Any, kb: Any, *, notifier_profile: Optional[str], gc_due: bool, gc_retention_days: int) -> list[dict]:
+     """Claim unseen terminal events for every owned subscription on every board.
+ 
+diff --git a/hermes_cli/host_loop_lease.py b/hermes_cli/host_loop_lease.py
+index b8469f773e..599c4fb477 100644
+--- a/hermes_cli/host_loop_lease.py
++++ b/hermes_cli/host_loop_lease.py
+@@ -80,6 +80,11 @@ _NAME_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
+ _LEASES: weakref.WeakSet = weakref.WeakSet()
+ 
+ 
++def _span_open(name: str):
++    from hermes_cli import loop_accounting
++    return loop_accounting.span_open(name)
++
++
+ def enabled() -> bool:
+     return os.environ.get(KILL_SWITCH_ENV, "").strip() != "0"
+ 
+@@ -220,12 +225,21 @@ class HostLoopLease:
+         self._unavailable_logged = False
+         self._stale_warned: tuple | None = None
+         self._stale_want_warned: tuple | None = None
++        self._pass: tuple | None = None  # the loop_accounting span a true held() opened, closed by beat()
+         _LEASES.add(self)
+ 
+     # -- public API ----------------------------------------------------------------------------
+ 
+     def held(self) -> bool:
+-        """True when this process should run the host pass now. One ``flock`` syscall when not holder."""
++        """True when this process should run the host pass now. One ``flock`` syscall when not holder.
++        A True answer opens this thread's ``lease.<name>`` accounting pass, which :meth:`beat` closes."""
++        if self._held_inner():
++            if self._pass is None:
++                self._pass = _span_open(f"lease.{self.name}")
++            return True
++        return False
++
++    def _held_inner(self) -> bool:
+         if not enabled() or self._held:
+             return True
+         if self._waiting:
+@@ -263,7 +277,10 @@ class HostLoopLease:
+         return enabled() and self._held
+ 
+     def beat(self) -> None:
+-        """End of a pass: refresh the heartbeat, then hand off to a live higher-priority ``.want``."""
++        """End of a pass: refresh the heartbeat, then hand off to a live higher-priority ``.want``. Also closes the
++        ``lease.<name>`` accounting pass the last true :meth:`held` opened (``hermes_cli.loop_accounting``): this is
++        how every host loop, mods included (chat-closeout), is accounted without calling the API itself."""
++        self._account_pass()
+         if not enabled() or not self._held:
+             return
+         with self._mu:
+@@ -279,6 +296,7 @@ class HostLoopLease:
+ 
+     def release(self) -> None:
+         """Give the lease up (shutdown). A later ``held()`` competes for it again."""
++        self._pass = None  # a held() with no beat() (shut down mid-pass) records no pass
+         with self._mu:
+             if self._held:
+                 self._drop()
+@@ -296,6 +314,16 @@ class HostLoopLease:
+ 
+     # -- internals -----------------------------------------------------------------------------
+ 
++    def _account_pass(self) -> None:
++        opened, self._pass = self._pass, None
++        if opened is None:
++            return
++        try:
++            from hermes_cli import loop_accounting
++            loop_accounting.span_close(opened)  # a beat() on another thread records nothing
++        except Exception:  # health: allow BLE001 -- accounting never touches the lease
++            logger.debug("host loop %s: pass accounting failed", self.name, exc_info=True)
++
+     def _unavailable(self, why: str) -> None:
+         self._next_open = time.monotonic() + self.interval
+         if not self._unavailable_logged:
+diff --git a/hermes_cli/kanban_annotation_host.py b/hermes_cli/kanban_annotation_host.py
+index 87f4529616..a50b4e2b66 100644
+--- a/hermes_cli/kanban_annotation_host.py
++++ b/hermes_cli/kanban_annotation_host.py
+@@ -341,7 +341,18 @@ def _holder_pass() -> int:
+ 
+ 
+ def _holder_refresh(scope: tuple[str, ...]) -> bool:
+-    """Runs inside ``scope``'s own context: its demand file and copy live under that profile's home."""
++    """Runs inside ``scope``'s own context: its demand file and copy live under that profile's home. One
++    ``annotation.holder_refresh/<profile>`` pass (loop_accounting): a refresh is a key change, no refresh a skip."""
++    from hermes_cli import loop_accounting
++    with loop_accounting.pass_(f"annotation.holder_refresh/{scope[1] if len(scope) > 1 else '?'}") as acct:
++        refreshed = _holder_refresh_scope(scope)
++        acct.change(refreshed)
++        if not refreshed:
++            acct.skip()
++        return refreshed
++
++
++def _holder_refresh_scope(scope: tuple[str, ...]) -> bool:
+     from hermes_cli import kanban_session_activity as _ksa
+ 
+     age = _disk.demand_age(scope)
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 05256f9084..9fe0f6d861 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -38,7 +38,7 @@ from hermes_cli.kanban_db_dispatch_allowlist import _dispatch_profile_allowlist,
+ from hermes_cli import kanban_worker_scope as _worker_scope, kanban_aggregate_scope as _aggregate_scope
+ from hermes_cli import kanban_host_reboot as _host_reboot, kanban_owner_unavailable as _ou  # [daveey]
+ from hermes_cli import kanban_owner_death as _owner_death, kanban_parent_unclaimed as _parent_unclaimed  # [daveey]
+-from hermes_cli import kanban_guard_refusal as _guard_refusal  # [daveey]
++from hermes_cli import kanban_guard_refusal as _guard_refusal, loop_accounting as _la  # [daveey]
+ from hermes_cli.kanban_db_dispatch_crash_accounting import _account_crashes  # [daveey]
+ from hermes_cli.kanban_failure_accounting import _record_task_failure
+ from hermes_cli.kanban_db_dispatch_dead_worker import _DeadWorker
+@@ -1982,14 +1982,14 @@ def _run_reclaim_phase(
+     reconcile_orphans: bool,
+     board: Optional[str] = None, dry_run: bool = False,
+ ) -> None:
+-    """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
+-    reap_worker_zombies()
+-    result.reaped_terminal_workers = reap_terminal_workers(conn)
+-    result.stopped_run_scopes = _worker_scope.stopped_scope_units(conn, board=board)  # orphans of ended runs [daveey]
++    """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote. Each sweep is a ``dispatch.<sweep>`` pass."""
++    _la.timed("dispatch.reap_worker_zombies", reap_worker_zombies)
++    result.reaped_terminal_workers = _la.timed("dispatch.reap_terminal_workers", reap_terminal_workers, conn)
++    result.stopped_run_scopes = _la.timed("dispatch.stopped_scope_units", _worker_scope.stopped_scope_units, conn, board=board)  # orphans of ended runs [daveey]
+     # Stop requests and forwarded owner card archives other gateways sent (kanban_owner_archive_relay). Before the
+     # reclaim sweeps, so they see the archived cards. [daveey]
+     from hermes_cli.kanban_owner_archive_relay import apply_remote_archives
+-    result.remote_archived = apply_remote_archives(conn)
++    result.remote_archived = _la.timed("dispatch.apply_remote_archives", apply_remote_archives, conn)
+     # [daveey] Before any stale check: a long gap since the last pass is a host suspend, which the
+     # heartbeat backstop, the stale sweep and max_runtime must not count (``kanban_suspend_ledger``).
+     _record_dispatch_pass(conn, dry_run=dry_run)
+@@ -1997,34 +1997,34 @@ def _run_reclaim_phase(
+     # a proven empty running set may skip these sweeps, never a prior no-op.
+     has_running = conn.execute("SELECT 1 FROM tasks WHERE status = 'running' LIMIT 1").fetchone() is not None
+     if has_running:
+-        result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
++        result.reclaimed = _la.timed("dispatch.release_stale_claims", _kb.release_stale_claims, conn, failure_limit=failure_limit)
+         if reconcile_orphans:
+-            result.reconciled_orphans = reconcile_orphaned_running(conn)
++            result.reconciled_orphans = _la.timed("dispatch.reconcile_orphaned_running", reconcile_orphaned_running, conn)
+     if reconcile_orphans:
+-        close_dangling_runs(conn)  # ended/non-running tasks can still retain a running run
+-        result.released_leftover_claims = release_leftover_local_claims(conn)  # not gated: not running [daveey]
++        _la.timed("dispatch.close_dangling_runs", close_dangling_runs, conn)  # ended/non-running tasks can still retain a running run
++        result.released_leftover_claims = _la.timed("dispatch.release_leftover_local_claims", release_leftover_local_claims, conn)  # not gated: not running [daveey]
+     if has_running:
+-        result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
++        result.stale = _la.timed("dispatch.detect_stale_running", detect_stale_running, conn, stale_timeout_seconds=stale_timeout_seconds)
+     # An ended primary run can still owe post-feed effects even with no running tasks.
+     from hermes_cli.kanban_neutral_release import pending
+     if has_running or pending(conn):
+-        result.crashed = detect_crashed_workers(conn, board=board)
++        result.crashed = _la.timed("dispatch.detect_crashed_workers", detect_crashed_workers, conn, board=board)
+         result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
+         result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+         result.reclaimed += len(getattr(detect_crashed_workers, "_last_owner_restarted", []))
+     if has_running:
+-        result.timed_out = enforce_max_runtime(conn)
++        result.timed_out = _la.timed("dispatch.enforce_max_runtime", enforce_max_runtime, conn)
+     from hermes_cli.kanban_supervisor_requests import dispatcher_drain  # [daveey] non-worker executor
+-    result.supervisor_requests = [] if dry_run else dispatcher_drain(conn, board=board)
++    result.supervisor_requests = [] if dry_run else _la.timed("dispatch.dispatcher_drain", dispatcher_drain, conn, board=board)
+     from hermes_cli.kanban_continuation import wake_due_continuations
+-    result.woken_continuations = wake_due_continuations(conn)
+-    result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
++    result.woken_continuations = _la.timed("dispatch.wake_due_continuations", wake_due_continuations, conn)
++    result.promoted = _la.timed("dispatch.recompute_ready", _kb.recompute_ready, conn, failure_limit=failure_limit)
+     from hermes_cli.kanban_idle_candidates import sweep_shared_blockers
+-    sweep_shared_blockers(conn, result)
++    _la.timed("dispatch.sweep_shared_blockers", sweep_shared_blockers, conn, result)
+     from hermes_cli.kanban_provider_walls import tick_upkeep
+-    tick_upkeep(conn, board=board, dry_run=dry_run)
++    _la.timed("dispatch.tick_upkeep", tick_upkeep, conn, board=board, dry_run=dry_run)
+     try:
+-        result.quota_block_released = _kbq.release_recovered_quota_blocks(conn)
++        result.quota_block_released = _la.timed("dispatch.release_recovered_quota_blocks", _kbq.release_recovered_quota_blocks, conn)
+     except Exception:
+         _kb._log.warning("kanban: releasing recovered quota-wall blocks failed", exc_info=True)
+ 
+@@ -2188,7 +2188,7 @@ def _dispatch_once_locked(
+     )
+     if not dry_run:
+         from hermes_cli.kanban_dispatch_maintenance import sweep
+-        sweep(conn, result, _guard_notice, _parent_unclaimed)
++        _la.timed("dispatch.maintenance", sweep, conn, result, _guard_notice, _parent_unclaimed)
+     from hermes_cli.kanban_gateway_drain import dispatch_paused
+     if dispatch_paused():
+         _kb._log.info('kanban dispatcher: scheduling paused — gateway draining or restart requested')
+@@ -2196,7 +2196,7 @@ def _dispatch_once_locked(
+     if not dry_run:
+         from hermes_cli.kanban_worker_placement import dispatch_tick
+         try:
+-            dispatch_tick(conn)
++            _la.timed("dispatch.worker_placement", dispatch_tick, conn)
+         except Exception:
+             logger = _kb._log
+             logger.warning("kanban worker placement failed; continuing local dispatch", exc_info=True)
+diff --git a/hermes_cli/kanban_links_refresh.py b/hermes_cli/kanban_links_refresh.py
+index 89c045a818..1ca66711f5 100644
+--- a/hermes_cli/kanban_links_refresh.py
++++ b/hermes_cli/kanban_links_refresh.py
+@@ -54,7 +54,8 @@ class ScopeRefresher:
+                 scope = next(iter(self._pending))
+                 context = self._pending[scope]
+             try:
+-                context.run(self._refresh, scope)
++                from hermes_cli import loop_accounting  # one ``links_refresh`` pass per rebuild
++                context.run(loop_accounting.timed, "links_refresh", self._refresh, scope)
+             except Exception:  # health: allow BLE001 -- refresh failure retains last-good data; later polls retry
+                 _log.warning('kanban remote links: background rebuild failed; serving the previous projection',
+                              exc_info=True)
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index a8517c4e2d..abd0db912e 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -18,7 +18,7 @@ from hermes_cli import kanban_lockguard as _kanban_lockguard
+ from hermes_cli import kanban_activity_identity as _identity
+ from hermes_cli import kanban_annotation_disk as _annotation_copy
+ from hermes_cli import kanban_annotation_host as _host_copy
+-from hermes_cli import kanban_annotation_refresh as _bounded
++from hermes_cli import kanban_annotation_refresh as _bounded, loop_accounting as _la
+ from hermes_cli import kanban_activity_revision as _revision
+ from hermes_cli import kanban_session_activity_busy as _busy
+ from hermes_cli import kanban_session_activity_hub as _hub_signature
+@@ -1738,6 +1738,7 @@ _read_annotation_parts = _host_copy.read_annotation_parts
+ _frozen_parts = _host_copy.frozen_parts
+ 
+ 
++@_la.accounted("annotation.refresh")
+ def _refresh_annotation_locked(scope: tuple[str, ...], read_at: float | None = None) -> tuple:
+     """Read this scope's parts and publish them. Caller holds ``_annotate_refresh_lock``."""
+     global _annotate_flight_scope, _annotate_flight_result
+@@ -1757,6 +1758,7 @@ def _refresh_annotation_locked(scope: tuple[str, ...], read_at: float | None = N
+     return parts
+ 
+ 
++@_la.accounted("annotation.poll")
+ def _annotation_snapshot() -> tuple | None:
+     """One in-flight annotation read, shared by overlapping polls.
+ 
+diff --git a/hermes_cli/kanban_session_activity_revalidate.py b/hermes_cli/kanban_session_activity_revalidate.py
+index 5dcb0bde57..a65b098a0a 100644
+--- a/hermes_cli/kanban_session_activity_revalidate.py
++++ b/hermes_cli/kanban_session_activity_revalidate.py
+@@ -130,7 +130,18 @@ def unchanged_inputs(scope: tuple[str, ...]) -> tuple[float, tuple] | None:
+ def refresh_if_unchanged(scope: tuple[str, ...], refresh) -> tuple | None:
+     """Caller holds the annotation refresh lock. When nothing the read depends on moved, re-read inline, where every
+     heavy part is a cache hit (no refresh thread, no recompute; the waiting sources still run and a new observation
+-    is dated): ``refresh(scope, read_at)``'s parts. None when an input moved (or the probe failed)."""
++    is dated): ``refresh(scope, read_at)``'s parts. None when an input moved (or the probe failed). Accounted as
++    ``annotation.revalidate`` (loop_accounting): unchanged inputs are a skip, moved ones a key change."""
++    from hermes_cli import loop_accounting
++    with loop_accounting.pass_("annotation.revalidate") as acct:
++        parts = _refresh_if_unchanged(scope, refresh)
++        acct.change(parts is None)
++        if parts is not None:
++            acct.skip()
++        return parts
++
++
++def _refresh_if_unchanged(scope: tuple[str, ...], refresh) -> tuple | None:
+     try:
+         unchanged = unchanged_inputs(scope)
+     except Exception:  # health: allow BLE001 -- only a shortcut probe; the bounded refresh reports a real read error
+diff --git a/hermes_cli/kanban_sync_timing.py b/hermes_cli/kanban_sync_timing.py
+index 32c0680584..f34d92e4db 100644
+--- a/hermes_cli/kanban_sync_timing.py
++++ b/hermes_cli/kanban_sync_timing.py
+@@ -591,12 +591,28 @@ def select(fn: Callable, boards: list, now: float, pending: Callable[[list], boo
+     return _DIAG.select(fn, boards, now, pending)
+ 
+ 
+-def board_start(slug: str, results: list) -> Optional[tuple]:
+-    return _DIAG.board_start(slug, results)
+-
+-
+-def board_end(token: Optional[tuple], results: list) -> None:
+-    _DIAG.board_end(token, results)
++def board_start(slug: str, results: list) -> tuple:
++    """Start one board's service: the timing diagnostics' token (None while off) and its ``loop_accounting``
++    pass ``sync.board/<slug>`` (always on: runs, rows pulled, busy skips, errors, CPU)."""
++    from hermes_cli import loop_accounting
++    diag = _DIAG.board_start(slug, results)
++    acct = loop_accounting.pass_(f"sync.board/{slug}")
++    acct.__enter__()  # last: nothing between here and the caller's ``finally: board_end`` can raise
++    return diag, acct, len(results)
++
++
++def board_end(token: tuple, results: list) -> None:
++    diag, acct, before = token
++    try:
++        _DIAG.board_end(diag, results)
++    finally:
++        result = results[-1] if len(results) > before else None
++        acct.rows(getattr(result, "pulled", 0) or 0)
++        skipped = bool(getattr(result, "skipped", False))
++        if skipped:
++            acct.skip()
++        failed = result is None or (bool(getattr(result, "error", None)) and not skipped)
++        acct.__exit__(RuntimeError if failed else None, None, None)
+ 
+ 
+ def report(fn: Callable[[], Any]) -> Any:
+diff --git a/hermes_cli/loop_accounting.py b/hermes_cli/loop_accounting.py
+new file mode 100644
+index 0000000000..b3c30d80e7
+--- /dev/null
++++ b/hermes_cli/loop_accounting.py
+@@ -0,0 +1,542 @@
++"""Per-process pass accounting for background loops and polled routes (design t_01a1d563324d7e8e §2 P1). [daveey]
++
++Every Kanban background loop and every polled Desktop route reports each pass here, so CPU can be attributed
++to the loop that spent it instead of being inferred from py-spy samples (which left ~25% of the hub's
++measured CPU unattributed). Per pass name it counts:
++
++* ``runs``: passes started;
++* ``skips``: passes that returned early because their key did not change;
++* ``changes``: passes whose key moved (work was due);
++* ``fallbacks``: passes that took the full / fallback path;
++* ``rows``: rows the pass changed or processed, where the loop knows it;
++* ``errors``: passes that raised;
++* ``cpu_s`` / ``cpu_max_s``: ``time.thread_time()`` spent inside the pass (sum / worst), and ``wall_s``.
++
++Per process it also records every live thread's CPU (``/proc/self/task/<tid>/stat`` on Linux) next to the
++CPU the outermost passes on that thread accounted for, so the remainder is attributable to a thread
++(``unaccounted_cpu_s``) rather than lost.
++
++Use::
++
++    from hermes_cli import loop_accounting as la
++
++    with la.pass_("gateway.notifier.collect_board") as p:
++        if key == last_key:
++            p.skip()
++            return
++        p.change()
++        rows = recompute()
++        p.rows(len(rows))
++
++    result = la.timed("dispatch.release_stale_claims", release_stale_claims, conn)  # rows from an int/len
++
++    @la.accounted("serve.route.board")
++    def get_board(...): ...
++
++``pass_`` also takes the outcome up front: ``pass_(name, skipped=..., changed=..., fallback=..., rows=...)``.
++Nested passes count in their own names; only the outermost pass on a thread adds to that thread's
++``accounted_cpu_s``, so totals never double count. Mods (chat-closeout, user-steps, throughput, runners) call
++the same API; ``host_loop_lease.HostLoopLease`` records ``lease.<name>`` for every host pass between a true
++``held()`` and its ``beat()`` without any change in the caller.
++
++**Snapshot.** A long-lived process calls :func:`start` once (``shared_metrics_process.begin_process`` does it
++for the gateway, ``serve`` and the ``tui`` backend); a daemon thread then writes
++``<root home>/run/loop-accounting/<pid>.json`` every ``loop_accounting.interval_s`` (config.yaml, 60 s) with
++an atomic replace: role, pid, start time, process and per-thread CPU and the cumulative counters. Files of
++dead pids older than an hour are pruned. ``loop_accounting.enabled: false`` stops the writer (counters stay).
++
++**Cost.** One pass is two ``thread_time`` and two ``perf_counter`` reads, a thread-local depth and one
++uncontended lock: a few microseconds (``tests/hermes_cli/test_loop_accounting_bench.py`` pins <= 20 µs).
++"""
++
++from __future__ import annotations
++
++import atexit
++import functools
++import json
++import logging
++import os
++import threading
++import time
++from pathlib import Path
++from typing import Any, Callable, Optional
++
++logger = logging.getLogger(__name__)
++
++SCHEMA_VERSION = 1
++DEFAULT_INTERVAL_S = 60.0
++MAX_NAMES = 2048  # distinct pass names; later names fold into OVERFLOW (a per-method name must not grow forever)
++OVERFLOW = "_overflow"
++PRUNE_AFTER_S = 3600.0
++
++_thread_time = time.thread_time
++_perf = time.perf_counter
++_native_id = threading.get_native_id
++
++
++class _Stat:
++    __slots__ = (
++        "changes",
++        "cpu_max_s",
++        "cpu_s",
++        "errors",
++        "fallbacks",
++        "last_at",
++        "rows",
++        "runs",
++        "skips",
++        "wall_s",
++    )
++
++    def __init__(self) -> None:
++        self.runs = self.skips = self.changes = self.fallbacks = self.rows = self.errors = 0
++        self.cpu_s = self.cpu_max_s = self.wall_s = 0.0
++        self.last_at = 0.0
++
++    def as_dict(self) -> dict[str, Any]:
++        return {"runs": self.runs, "skips": self.skips, "changes": self.changes, "fallbacks": self.fallbacks,
++                "rows": self.rows, "errors": self.errors, "cpu_s": round(self.cpu_s, 6),
++                "cpu_max_s": round(self.cpu_max_s, 6), "wall_s": round(self.wall_s, 6),
++                "last_at": round(self.last_at, 3)}
++
++
++_lock = threading.Lock()
++_stats: dict[str, _Stat] = {}
++_thread_accounted: dict[int, float] = {}  # native thread id -> CPU of its outermost passes
++_local = threading.local()
++_started_at = time.time()
++_state: dict[str, Any] = {"role": None, "thread": None, "stop": None, "pid": os.getpid()}
++
++
++def _stat(name: str) -> _Stat:
++    st = _stats.get(name)
++    if st is None:
++        if len(_stats) >= MAX_NAMES:
++            name = OVERFLOW
++            st = _stats.get(name)
++        if st is None:
++            st = _stats[name] = _Stat()
++    return st
++
++
++class Pass:
++    """One accounted pass (a context manager); see the module docstring. Mark the outcome with
++    :meth:`skip`, :meth:`change`, :meth:`fallback` and :meth:`rows` at any point before it exits."""
++
++    __slots__ = ("_c0", "_outer", "_w0", "changed", "fell_back", "name", "nrows", "skipped")
++
++    def __init__(self, name: str, skipped: bool = False, changed: Optional[bool] = None, fallback: bool = False,
++                 rows: Optional[int] = None) -> None:
++        self.name = name
++        self.skipped = skipped
++        self.changed = changed
++        self.fell_back = fallback
++        self.nrows = rows or 0
++
++    def skip(self) -> None:
++        self.skipped = True
++
++    def change(self, changed: bool = True) -> None:
++        self.changed = changed
++
++    def fallback(self, fell_back: bool = True) -> None:
++        self.fell_back = fell_back
++
++    def rows(self, n: int) -> None:
++        self.nrows += int(n or 0)
++
++    def __enter__(self) -> Pass:
++        depth = getattr(_local, "depth", 0)
++        _local.depth = depth + 1
++        self._outer = depth == 0
++        self._w0 = _perf()
++        self._c0 = _thread_time()
++        return self
++
++    def __exit__(self, exc_type, exc, tb) -> None:
++        cpu = _thread_time() - self._c0
++        wall = _perf() - self._w0
++        _local.depth = getattr(_local, "depth", 1) - 1
++        with _lock:
++            st = _stat(self.name)
++            st.runs += 1
++            if self.skipped:
++                st.skips += 1
++            if self.changed:
++                st.changes += 1
++            if self.fell_back:
++                st.fallbacks += 1
++            st.rows += self.nrows
++            if exc_type is not None:
++                st.errors += 1
++            st.cpu_s += cpu
++            st.cpu_max_s = max(st.cpu_max_s, cpu)
++            st.wall_s += wall
++            st.last_at = time.time()
++            if self._outer:
++                tid = _native_id()
++                _thread_accounted[tid] = _thread_accounted.get(tid, 0.0) + cpu
++
++
++def pass_(name: str, *, skipped: bool = False, changed: Optional[bool] = None, fallback: bool = False,
++          rows: Optional[int] = None) -> Pass:
++    """A context manager accounting one pass of ``name``."""
++    return Pass(name, skipped, changed, fallback, rows)
++
++
++def record(name: str, *, cpu_s: float = 0.0, wall_s: float = 0.0, skipped: bool = False,
++           changed: Optional[bool] = None, fallback: bool = False, rows: int = 0, error: bool = False,
++           outer: bool = True) -> None:
++    """Account a pass measured elsewhere (``cpu_s`` from the caller's own ``thread_time`` delta, on this thread)."""
++    with _lock:
++        st = _stat(name)
++        st.runs += 1
++        st.skips += bool(skipped)
++        st.changes += bool(changed)
++        st.fallbacks += bool(fallback)
++        st.rows += int(rows or 0)
++        st.errors += bool(error)
++        st.cpu_s += cpu_s
++        st.cpu_max_s = max(st.cpu_max_s, cpu_s)
++        st.wall_s += wall_s
++        st.last_at = time.time()
++        if outer and getattr(_local, "depth", 0) == 0:
++            tid = _native_id()
++            _thread_accounted[tid] = _thread_accounted.get(tid, 0.0) + cpu_s
++
++
++def span_open(name: str) -> tuple:
++    """Open a pass whose end is in another call (``host_loop_lease``: a true ``held()`` to its ``beat()``).
++    Close it with :func:`span_close` on the same thread. Passes run inside it keep their own names; the
++    thread's ``accounted_cpu_s`` gets only the span's CPU those passes did not already account."""
++    tid = _native_id()
++    with _lock:
++        acc0 = _thread_accounted.get(tid, 0.0)
++    return name, tid, _thread_time(), _perf(), acc0
++
++
++def span_close(token: tuple, *, error: bool = False) -> bool:
++    """Close a :func:`span_open` token. False (nothing recorded) when called on another thread."""
++    name, tid, c0, w0, acc0 = token
++    if tid != _native_id():
++        return False
++    cpu = _thread_time() - c0
++    wall = _perf() - w0
++    with _lock:
++        st = _stat(name)
++        st.runs += 1
++        st.errors += bool(error)
++        st.cpu_s += cpu
++        st.cpu_max_s = max(st.cpu_max_s, cpu)
++        st.wall_s += wall
++        st.last_at = time.time()
++        if getattr(_local, "depth", 0) == 0:
++            inner = _thread_accounted.get(tid, 0.0) - acc0
++            _thread_accounted[tid] = _thread_accounted.get(tid, 0.0) + max(0.0, cpu - inner)
++    return True
++
++
++def _rows_of(result: Any) -> int:
++    if isinstance(result, bool) or result is None:
++        return 0
++    if isinstance(result, int):
++        return result
++    if isinstance(result, (list, tuple, set, frozenset, dict)):
++        return len(result)
++    return 0
++
++
++def timed(name: str, fn: Callable, /, *args: Any, **kwargs: Any) -> Any:
++    """Call ``fn(*args, **kwargs)`` as one pass of ``name``; ``rows`` is the result when it is an int, or its
++    length when it is a collection. Returns the result unchanged."""
++    with Pass(name) as p:
++        result = fn(*args, **kwargs)
++        p.nrows = _rows_of(result)
++        return result
++
++
++def accounted(name: str, *, rows: bool = False) -> Callable[[Callable], Callable]:
++    """Decorator: every call of the function is one pass of ``name`` (``functools.wraps`` keeps the signature,
++    so FastAPI and ``coalesced_read`` see the original parameters). ``rows=True`` counts the result as
++    :func:`timed` does."""
++    def wrap(fn: Callable) -> Callable:
++        @functools.wraps(fn)
++        def wrapped(*args: Any, **kwargs: Any) -> Any:
++            with Pass(name) as p:
++                result = fn(*args, **kwargs)
++                if rows:
++                    p.nrows = _rows_of(result)
++                return result
++        return wrapped
++    return wrap
++
++
++# -- snapshot ------------------------------------------------------------------------------------------------
++
++def counters() -> dict[str, dict[str, Any]]:
++    """A copy of the cumulative counters, by pass name."""
++    with _lock:
++        return {name: st.as_dict() for name, st in _stats.items()}
++
++
++def _clk_tck() -> float:
++    try:
++        return float(os.sysconf("SC_CLK_TCK"))
++    except (AttributeError, OSError, ValueError):
++        return 100.0
++
++
++def _proc_stat_cpu(path: str, hz: float) -> Optional[tuple[str, float]]:
++    try:
++        with open(path, encoding="ascii", errors="replace") as fh:
++            raw = fh.read()
++    except OSError:
++        return None
++    head, _, tail = raw.rpartition(")")
++    fields = tail.split()
++    if len(fields) < 13:
++        return None
++    comm = head.partition("(")[2]
++    return comm, (int(fields[11]) + int(fields[12])) / hz
++
++
++def thread_cpu() -> list[dict[str, Any]]:
++    """Every live thread of this process: native id, name and CPU seconds (user + system), plus the CPU its
++    outermost accounted passes took. Linux reads ``/proc/self/task``; elsewhere only live accounted threads are
++    listed (their ``cpu_s`` is None)."""
++    names = {t.native_id: t.name for t in threading.enumerate() if t.native_id is not None}
++    with _lock:
++        accounted_by = dict(_thread_accounted)
++    out: list[dict[str, Any]] = []
++    hz = _clk_tck()
++    task_dir = "/proc/self/task"
++    try:
++        tids = [int(t) for t in os.listdir(task_dir) if t.isdigit()]
++    except OSError:
++        tids = []
++    for tid in sorted(tids):
++        got = _proc_stat_cpu(f"{task_dir}/{tid}/stat", hz)
++        if got is None:
++            continue
++        comm, cpu = got
++        out.append({"tid": tid, "name": names.get(tid, comm), "cpu_s": round(cpu, 3),
++                    "accounted_cpu_s": round(accounted_by.get(tid, 0.0), 6)})
++    if not tids:  # no procfs: list live accounted threads only (exited ones fold in snapshot())
++        for tid, acc in sorted(accounted_by.items()):
++            if tid not in names:
++                continue
++            out.append({"tid": tid, "name": names.get(tid, "?"), "cpu_s": None, "accounted_cpu_s": round(acc, 6)})
++    return out
++
++
++def _process_start_time() -> Optional[float]:
++    try:
++        from gateway.status import get_process_start_time
++        return get_process_start_time(os.getpid())
++    except Exception:  # health: allow BLE001 -- start time is informational
++        return None
++
++
++def snapshot() -> dict[str, Any]:
++    """The JSON-ready snapshot this process writes (see the module docstring)."""
++    times = os.times()
++    threads = thread_cpu()
++    procfs = bool(threads) and threads[0]["cpu_s"] is not None
++    live = sum(t["cpu_s"] for t in threads if t["cpu_s"] is not None)
++    # Fold exited threads, so pool churn cannot grow the map. Without procfs (macOS, whose native thread
++    # ids are never reused) the live set comes from threading.enumerate().
++    if procfs:
++        live_tids = {t["tid"] for t in threads}
++    else:
++        live_tids = {t.native_id for t in threading.enumerate() if t.native_id is not None}
++    with _lock:
++        if live_tids:
++            for tid in [tid for tid in _thread_accounted if tid not in live_tids]:
++                _state["exited_accounted"] = _state.get("exited_accounted", 0.0) + _thread_accounted.pop(tid)
++        accounted_total = sum(_thread_accounted.values()) + _state.get("exited_accounted", 0.0)
++        accounted_live = sum(_thread_accounted.get(t["tid"], 0.0) for t in threads)
++    process_cpu = times.user + times.system
++    return {
++        "version": SCHEMA_VERSION,
++        "role": _state["role"] or _role_guess(),
++        "pid": os.getpid(),
++        "started_at": round(_started_at, 3),
++        "process_start_time": _process_start_time(),
++        "written_at": round(time.time(), 3),
++        "uptime_s": round(time.time() - _started_at, 3),
++        "process": {
++            "cpu_s": round(process_cpu, 3), "user_s": round(times.user, 3), "system_s": round(times.system, 3),
++            "live_threads_cpu_s": round(live, 3),
++            # CPU of threads that already exited (in the process total, gone from /proc/self/task).
++            "exited_threads_cpu_s": round(max(0.0, process_cpu - live), 3) if procfs else None,
++            "accounted_cpu_s": round(accounted_total, 6),
++            "unaccounted_live_cpu_s": round(max(0.0, live - accounted_live), 3) if procfs else None,
++        },
++        "threads": threads,
++        "loops": counters(),
++    }
++
++
++def _role_guess() -> str:
++    try:
++        from hermes_cli.observability.shared_metrics_process import current_process_kind
++        return current_process_kind()
++    except Exception:  # health: allow BLE001 -- the role is a label
++        return "other"
++
++
++def snapshot_dir() -> Path:
++    from hermes_constants import get_default_hermes_root
++    return get_default_hermes_root() / "run" / "loop-accounting"
++
++
++def snapshot_path(pid: Optional[int] = None) -> Path:
++    return snapshot_dir() / f"{pid or os.getpid()}.json"
++
++
++def write_snapshot(path: Optional[Path] = None) -> Path:
++    """Write :func:`snapshot` atomically (temp file in the same directory + ``os.replace``). Returns the path."""
++    target = Path(path) if path is not None else snapshot_path()
++    target.parent.mkdir(parents=True, exist_ok=True)
++    tmp = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
++    try:
++        with open(tmp, "w", encoding="utf-8") as fh:
++            json.dump(snapshot(), fh, separators=(",", ":"), sort_keys=True)
++        os.replace(tmp, target)
++    finally:
++        if tmp.exists():
++            tmp.unlink(missing_ok=True)
++    return target
++
++
++def _pid_alive(pid: int) -> bool:
++    from gateway.status import _pid_exists  # never os.kill(pid, 0): a CTRL_C_EVENT on Windows
++    return _pid_exists(pid)
++
++
++def prune(directory: Optional[Path] = None, *, now: Optional[float] = None) -> int:
++    """Remove snapshots of dead pids not written for ``PRUNE_AFTER_S``. Returns how many were removed."""
++    directory = Path(directory) if directory is not None else snapshot_dir()
++    now = time.time() if now is None else now
++    removed = 0
++    try:
++        entries = list(directory.glob("*.json"))
++    except OSError:
++        return 0
++    for entry in entries:
++        stem = entry.stem
++        if not stem.isdigit() or int(stem) == os.getpid():
++            continue
++        try:
++            if now - entry.stat().st_mtime < PRUNE_AFTER_S or _pid_alive(int(stem)):
++                continue
++            entry.unlink()
++            removed += 1
++        except OSError:
++            continue
++    return removed
++
++
++def _setting(key: str, default: Any) -> Any:
++    """``loop_accounting.<key>`` from config.yaml (read once per :func:`start`), else ``default``."""
++    try:
++        from hermes_cli.config import load_config
++        section = load_config().get("loop_accounting") or {}
++        return section.get(key, default) if isinstance(section, dict) else default
++    except Exception:  # health: allow BLE001 -- an unreadable config keeps the defaults
++        logger.debug("loop accounting: config unreadable; using defaults", exc_info=True)
++        return default
++
++
++def enabled() -> bool:
++    """``loop_accounting.enabled`` (default on). Off stops the snapshot writer; the counters stay."""
++    if _state.get("enabled") is None:
++        _state["enabled"] = bool(_setting("enabled", True))
++    return bool(_state["enabled"])
++
++
++def interval_s() -> float:
++    try:
++        value = float(_setting("interval_s", DEFAULT_INTERVAL_S))
++    except (TypeError, ValueError):
++        value = DEFAULT_INTERVAL_S
++    return max(value, 0.05)
++
++
++def _writer(stop: threading.Event, period: float) -> None:
++    writes = 0
++    while not stop.wait(period):
++        try:
++            write_snapshot()
++            if writes % 10 == 0:
++                prune()
++            writes += 1
++        except Exception:  # health: allow BLE001 -- accounting must never take a loop down
++            logger.debug("loop accounting: snapshot write failed", exc_info=True)
++
++
++def start(role: str) -> bool:
++    """Name this process's role and start the snapshot writer (once per process; no-op when disabled).
++    Returns True when a writer is running after the call."""
++    _state["role"] = role
++    _state["enabled"] = None  # re-read config.yaml
++    if not enabled():
++        return False
++    with _lock:
++        thread = _state.get("thread")
++        if thread is not None and thread.is_alive() and _state.get("pid") == os.getpid():
++            return True
++        stop = threading.Event()
++        thread = threading.Thread(target=_writer, args=(stop, interval_s()), name="hermes-loop-accounting",
++                                  daemon=True)
++        _state.update(thread=thread, stop=stop, pid=os.getpid())
++    thread.start()
++    if not _state.get("atexit"):
++        _state["atexit"] = True
++        atexit.register(_final_write)
++    return True
++
++
++def stop(*, write: bool = False) -> None:
++    """Stop the writer (tests, shutdown); ``write`` flushes one last snapshot."""
++    ev = _state.get("stop")
++    thread = _state.get("thread")
++    if ev is not None:
++        ev.set()
++    if thread is not None and thread is not threading.current_thread():
++        thread.join(timeout=5)
++    _state.update(thread=None, stop=None)
++    if write:
++        _final_write()
++
++
++def _final_write() -> None:
++    if _state.get("role") is None or not enabled():
++        return
++    try:
++        write_snapshot()
++    except Exception:  # health: allow BLE001 -- interpreter shutdown; the periodic file stands
++        logger.debug("loop accounting: final snapshot failed", exc_info=True)
++
++
++def reset() -> None:
++    """Clear every counter (tests)."""
++    with _lock:
++        _stats.clear()
++        _thread_accounted.clear()
++        _state.pop("exited_accounted", None)
++
++
++def _after_fork_child() -> None:
++    global _lock, _started_at
++    _lock = threading.Lock()
++    _stats.clear()
++    _thread_accounted.clear()
++    _started_at = time.time()
++    _state.pop("exited_accounted", None)
++    _state.update(thread=None, stop=None, pid=os.getpid(), role=None)
++    _local.__dict__.clear()
++
++
++if hasattr(os, "register_at_fork"):
++    os.register_at_fork(after_in_child=_after_fork_child)
+diff --git a/hermes_cli/machine_metrics_sender.py b/hermes_cli/machine_metrics_sender.py
+index e94e53b58f..0569982b42 100644
+--- a/hermes_cli/machine_metrics_sender.py
++++ b/hermes_cli/machine_metrics_sender.py
+@@ -146,7 +146,16 @@ class MetricsSender:
+                       worker_run, worker_wait)
+ 
+     def tick(self) -> Optional[bool]:
+-        """One anchored tick: True sent, False the report failed, None nothing sent (off or skipped)."""
++        """One anchored tick: True sent, False the report failed, None nothing sent (off or skipped). One
++        ``machine_metrics.tick`` pass (loop_accounting); a tick that sends nothing is a skip."""
++        from hermes_cli import loop_accounting
++        with loop_accounting.pass_("machine_metrics.tick") as acct:
++            sent = self._tick()
++            if sent is None:
++                acct.skip()
++            return sent
++
++    def _tick(self) -> Optional[bool]:
+         from hermes_cli import machine_cpu_metrics as cpu
+         self.ticks += 1
+         self.tick_started_at = self.clock()
+diff --git a/hermes_cli/observability/shared_metrics_process.py b/hermes_cli/observability/shared_metrics_process.py
+index f82ba05af9..7c16c87612 100644
+--- a/hermes_cli/observability/shared_metrics_process.py
++++ b/hermes_cli/observability/shared_metrics_process.py
+@@ -35,6 +35,7 @@ EXIT_FLUSH_TIMEOUT_S = 3.0
+ _DRAIN_MARGIN_S = 0.1
+ _STATE: dict[str, Any] = {}
+ _STATE_LOCK = threading.Lock()
++LOOP_ACCOUNTING_KINDS = frozenset({"gateway", "serve", "tui"})  # long-lived: hermes_cli.loop_accounting snapshots
+ 
+ 
+ def crash_class(exc: BaseException | None) -> str:
+@@ -127,7 +128,14 @@ def purge_pending_receipts(home: Path) -> None:
+ 
+ 
+ def begin_process(kind: str) -> None:
+-    """Mark this process as a running ``kind`` and report dead predecessors. Once per process."""
++    """Mark this process as a running ``kind`` and report dead predecessors. Once per process.
++    A long-lived ``kind`` (gateway, serve, tui) also starts the loop-accounting snapshot writer. [daveey]"""
++    if kind in LOOP_ACCOUNTING_KINDS and not _STATE:
++        try:
++            from hermes_cli import loop_accounting
++            loop_accounting.start(kind)
++        except Exception:
++            logger.debug("Loop accounting writer not started", exc_info=True)
+     try:
+         from hermes_constants import get_hermes_home
+ 
+diff --git a/hermes_cli/web_routers/profiles.py b/hermes_cli/web_routers/profiles.py
+index b09f2efb5f..11a0098fce 100644
+--- a/hermes_cli/web_routers/profiles.py
++++ b/hermes_cli/web_routers/profiles.py
+@@ -14,6 +14,7 @@ import contextlib
+ import copy
+ import functools
+ from hermes_cli.web_read_coalescing import coalesced_read
++from hermes_cli import loop_accounting as _la  # [daveey] per-route pass accounting
+ from hermes_cli.web_json_response import encoded_in_thread, native_json_response, per_request_response
+ import inspect
+ import json
+@@ -425,6 +426,7 @@ def _read_serial_profile_db(name, home, errors, read, cache_key):
+             home, cache_key, lambda: _read_profile_db(name, home, errors, read))
+ 
+ 
++@_la.accounted("route/profiles.sessions")
+ def get_profiles_sessions(
+     # ``le=500`` caps the page size — this endpoint fans out across EVERY profile's state.db.
+     # 500 (not 100) because desktop callers use limit=200 and the electron remote-merge
+@@ -565,6 +567,7 @@ def get_profiles_session_stamps(ids: str = Query(..., max_length=8000), profile:
+ 
+ 
+ @_sidebar_singleflight_cache
++@_la.accounted("route/profiles.sessions.sidebar")
+ def get_profiles_sessions_sidebar(
+     recents_profile: str = "all", recents_limit: int = 20, recents_exclude: str | None = None,
+     cron_limit: int = 50, messaging_limit: int = 100, messaging_exclude: str | None = None):
+@@ -789,6 +792,7 @@ def profile_project_trees(
+ 
+ 
+ @_sidebar_singleflight_cache
++@_la.accounted("route/profiles.projects.tree")
+ def get_profiles_projects_tree(preview_limit: int = 3, session_limit: int = 2000, profile: Optional[str] = None):
+     """Project tree for every profile at once, for the all-profiles sidebar.
+ 
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index 0060199ff8..b71ee5f260 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -24,6 +24,7 @@ from hermes_cli.session_listing import stamp_automated, subagent_listing_scope
+ from hermes_cli.session_list_flight import SESSION_LIST_CACHE, data_stamp
+ from hermes_cli.web_deps import late
+ from hermes_cli.web_read_coalescing import coalesced_read
++from hermes_cli import loop_accounting as _la  # [daveey] per-route pass accounting
+ from hermes_cli.web_json_response import encoded_in_thread, native_json_response, per_request_response
+ from hermes_cli.kanban_session_activity import annotate_kanban_activity, session_tasks as session_kanban_tasks
+ from hermes_cli.cron_session_activity import annotate_cron_activity
+@@ -194,6 +195,7 @@ def _resolve_session_id(db, session_id: str) -> Optional[str]:
+ 
+ 
+ @list_router.get("/api/session-kanban-tasks")
++@_la.accounted("route/sessions.kanban_tasks")
+ def get_session_kanban_tasks(ids: str = Query(..., max_length=4000)):
+     """Open, blocked and review kanban cards that any of the comma-separated
+     session ``ids`` (one compression lineage) created or shepherds, across every
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 396612a4dc..0b127beff0 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -34,6 +34,7 @@ from pydantic import BaseModel, Field
+ from hermes_cli import kanban_db
+ from hermes_cli import kanban_review_contract as _review_contract  # a dashboard "done" is never a worker run
+ from hermes_cli import kanban_workflow
++from hermes_cli import loop_accounting as _la  # [daveey] per-route pass accounting
+ from hermes_cli.web_read_coalescing import coalesced_read
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_db_notify as kbn
+@@ -246,6 +247,7 @@ def _link_tasks(conn: sqlite3.Connection, links: dict[str, list[str]]) -> list[d
+ 
+ # --- GET /board -------------------------------------------------------------
+ 
++@_la.accounted("route/kanban.board")
+ def get_board(
+     tenant: Optional[str] = Query(None, description="Filter to a single tenant"),
+     include_archived: bool = Query(False),
+diff --git a/scripts/boundary_lint_baseline.json b/scripts/boundary_lint_baseline.json
+index cd7ca5416e..1eaa950d24 100644
+--- a/scripts/boundary_lint_baseline.json
++++ b/scripts/boundary_lint_baseline.json
+@@ -212,6 +212,7 @@
+     "plugins/kanban/dashboard/plugin_api.py hermes_cli.kanban_wake_check": 1,
+     "plugins/kanban/dashboard/plugin_api.py hermes_cli.kanban_worker_recovery.worker_session_ids": 1,
+     "plugins/kanban/dashboard/plugin_api.py hermes_cli.kanban_workflow": 1,
++    "plugins/kanban/dashboard/plugin_api.py hermes_cli.loop_accounting": 1,
+     "plugins/kanban/dashboard/plugin_api.py hermes_cli.profile_describer": 1,
+     "plugins/kanban/dashboard/plugin_api.py hermes_cli.profiles": 4,
+     "plugins/kanban/dashboard/plugin_api.py hermes_cli.profiles.current_profile_name": 1,
+diff --git a/tests/hermes_cli/test_loop_accounting.py b/tests/hermes_cli/test_loop_accounting.py
+new file mode 100644
+index 0000000000..fd9a9a843d
+--- /dev/null
++++ b/tests/hermes_cli/test_loop_accounting.py
+@@ -0,0 +1,292 @@
++"""Loop/route pass accounting (design t_01a1d563324d7e8e §2 P1). [daveey]"""
++
++from __future__ import annotations
++
++import json
++import os
++import threading
++import time
++
++import pytest
++
++from hermes_cli import loop_accounting as la
++
++
++@pytest.fixture(autouse=True)
++def _fresh(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
++    la.stop()
++    la.reset()
++    yield
++    la.stop()
++    la.reset()
++
++
++def _burn(seconds: float) -> None:
++    end = time.thread_time() + seconds
++    while time.thread_time() < end:
++        pass
++
++
++def test_pass_counts_runs_skips_changes_fallbacks_rows():
++    with la.pass_("loop") as p:
++        p.change()
++        p.rows(3)
++    with la.pass_("loop") as p:
++        p.skip()
++    with la.pass_("loop", fallback=True, rows=2):
++        pass
++    c = la.counters()["loop"]
++    assert (c["runs"], c["skips"], c["changes"], c["fallbacks"], c["rows"], c["errors"]) == (3, 1, 1, 1, 5, 0)
++
++
++def test_pass_counts_an_error_and_reraises():
++    with pytest.raises(ValueError):
++        with la.pass_("boom"):
++            raise ValueError("x")
++    assert la.counters()["boom"]["errors"] == 1
++    assert la.counters()["boom"]["runs"] == 1
++
++
++def test_cpu_is_thread_time_sum_and_max():
++    with la.pass_("cpu"):
++        _burn(0.02)
++    with la.pass_("cpu"):
++        time.sleep(0.05)  # health: allow HX013 -- wall time that is not CPU is the behaviour under test
++    c = la.counters()["cpu"]
++    assert c["cpu_s"] >= 0.02
++    assert c["cpu_max_s"] >= 0.02
++    assert c["cpu_s"] < 0.06
++    assert c["wall_s"] >= 0.07
++
++
++def test_timed_and_accounted_count_rows_and_keep_signature():
++    import inspect
++
++    assert la.timed("t", lambda n: list(range(n)), 4) == [0, 1, 2, 3]
++    assert la.counters()["t"]["rows"] == 4
++
++    @la.accounted("dec", rows=True)
++    def work(a: int, b: str = "x") -> int:
++        """doc"""
++        return a
++
++    assert work(7) == 7
++    assert la.counters()["dec"]["rows"] == 7
++    assert list(inspect.signature(work).parameters) == ["a", "b"]
++    assert work.__doc__ == "doc"
++
++    @la.accounted("norows")
++    def other() -> list:
++        return [1, 2]
++
++    other()
++    assert la.counters()["norows"]["rows"] == 0
++
++
++def test_only_outermost_pass_adds_to_thread_accounted():
++    with la.pass_("outer"):
++        with la.pass_("inner"):
++            _burn(0.02)
++    c = la.counters()
++    assert c["inner"]["cpu_s"] >= 0.02 and c["outer"]["cpu_s"] >= c["inner"]["cpu_s"]
++    me = threading.get_native_id()
++    acc = {t["tid"]: t["accounted_cpu_s"] for t in la.thread_cpu()}
++    assert acc[me] == pytest.approx(c["outer"]["cpu_s"], abs=1e-5)
++
++
++def test_span_crosses_calls_and_does_not_double_count_inner_passes():
++    token = la.span_open("lease.x")
++    with la.pass_("inside"):
++        _burn(0.01)
++    _burn(0.01)
++    assert la.span_close(token) is True
++    c = la.counters()
++    assert c["lease.x"]["runs"] == 1 and c["lease.x"]["cpu_s"] >= 0.02
++    me = threading.get_native_id()
++    acc = {t["tid"]: t["accounted_cpu_s"] for t in la.thread_cpu()}
++    assert acc[me] == pytest.approx(c["lease.x"]["cpu_s"], abs=1e-5)
++
++
++def test_span_closed_on_another_thread_records_nothing():
++    token = la.span_open("lease.y")
++    out = []
++    t = threading.Thread(target=lambda: out.append(la.span_close(token)))
++    t.start()
++    t.join()
++    assert out == [False]
++    assert "lease.y" not in la.counters()
++
++
++def test_host_loop_lease_accounts_held_to_beat(monkeypatch, tmp_path):
++    from hermes_cli import host_loop_lease as hll
++
++    monkeypatch.setenv("HERMES_HOST_LOOP_LEASE", "1")
++    lease = hll.HostLoopLease("acct-test", "gateway", interval=1.0)
++    try:
++        if not lease.held():
++            pytest.skip("lease not acquirable in this sandbox")
++        _burn(0.01)
++        lease.beat()
++        lease.beat()  # a beat with no new held() records nothing
++    finally:
++        lease.release()
++    c = la.counters()["lease.acct-test"]
++    assert c["runs"] == 1 and c["cpu_s"] >= 0.01
++
++
++def test_name_overflow_is_bounded(monkeypatch):
++    monkeypatch.setattr(la, "MAX_NAMES", 3)
++    for i in range(10):
++        with la.pass_(f"n{i}"):
++            pass
++    c = la.counters()
++    assert len(c) <= 4
++    assert c[la.OVERFLOW]["runs"] == 7  # n0..n2 keep their names; n3..n9 fold
++
++
++def test_per_thread_cpu_covers_each_thread():
++    started = threading.Event()
++    stop = threading.Event()
++
++    def worker():
++        with la.pass_("worker"):
++            _burn(0.03)
++        started.set()
++        stop.wait(5)
++
++    t = threading.Thread(target=worker, name="acct-worker")
++    t.start()
++    started.wait(5)
++    try:
++        rows = {r["name"]: r for r in la.thread_cpu()}
++        assert "acct-worker" in rows
++        if rows["acct-worker"]["cpu_s"] is not None:  # Linux /proc
++            assert rows["acct-worker"]["cpu_s"] >= 0.02
++        assert rows["acct-worker"]["accounted_cpu_s"] >= 0.03
++    finally:
++        stop.set()
++        t.join()
++
++
++def test_without_procfs_snapshot_folds_exited_threads(monkeypatch):
++    """macOS has no /proc and never reuses native thread ids: exited threads must still fold, or the map grows."""
++    real_listdir = os.listdir
++
++    def no_procfs(path="."):
++        if str(path).startswith("/proc"):
++            raise FileNotFoundError(path)
++        return real_listdir(path)
++
++    monkeypatch.setattr(la.os, "listdir", no_procfs)
++
++    def worker():
++        with la.pass_("short-lived"):
++            _burn(0.002)
++
++    accounted_before_fold = 0.0
++    for _ in range(5):
++        threads = [threading.Thread(target=worker) for _ in range(20)]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++        with la._lock:
++            accounted_before_fold = sum(la._thread_accounted.values()) + la._state.get("exited_accounted", 0.0)
++        snap = la.snapshot()
++        assert all(row["cpu_s"] is None for row in snap["threads"])
++        assert len(la._thread_accounted) <= threading.active_count()
++        assert len(snap["threads"]) <= threading.active_count()
++        assert snap["process"]["accounted_cpu_s"] == pytest.approx(accounted_before_fold, abs=1e-5)
++        assert snap["process"]["exited_threads_cpu_s"] is None
++        assert snap["process"]["unaccounted_live_cpu_s"] is None
++    assert la._state["exited_accounted"] >= 100 * 0.002 * 0.5
++
++
++def test_snapshot_file_is_atomic_json_with_role_pid_and_counters(tmp_path):
++    with la.pass_("loop") as p:
++        p.rows(2)
++    la._state["role"] = "gateway"
++    path = la.write_snapshot(tmp_path / "s" / "123.json")
++    data = json.loads(path.read_text())
++    assert data["version"] == la.SCHEMA_VERSION
++    assert data["role"] == "gateway"
++    assert data["pid"] == os.getpid()
++    assert data["loops"]["loop"]["rows"] == 2
++    assert {"cpu_s", "live_threads_cpu_s", "accounted_cpu_s"} <= set(data["process"])
++    assert data["threads"] and all("tid" in t for t in data["threads"])
++    assert [p.name for p in path.parent.iterdir()] == ["123.json"]  # no temp file left behind
++
++
++def test_default_snapshot_path_is_under_root_run(tmp_path):
++    assert la.snapshot_path(42) == tmp_path / "home" / "run" / "loop-accounting" / "42.json"
++
++
++def test_start_writes_periodically_and_stop_flushes(monkeypatch, tmp_path):
++    monkeypatch.setattr(la, "_setting", lambda key, default: 0.05 if key == "interval_s" else default)
++    assert la.start("serve") is True
++    with la.pass_("route/x"):
++        pass
++    path = la.snapshot_path()
++    deadline = time.monotonic() + 5
++    while time.monotonic() < deadline and not path.exists():
++        time.sleep(0.02)
++    assert path.exists()
++    la.stop(write=True)
++    data = json.loads(path.read_text())
++    assert data["role"] == "serve"
++    assert data["loops"]["route/x"]["runs"] == 1
++
++
++def test_disabled_writer_keeps_counters(monkeypatch):
++    monkeypatch.setattr(la, "_setting", lambda key, default: False if key == "enabled" else default)
++    assert la.start("gateway") is False
++    with la.pass_("still"):
++        pass
++    assert la.counters()["still"]["runs"] == 1
++    assert not la.snapshot_path().exists()
++
++
++def test_prune_removes_old_files_of_dead_pids(tmp_path):
++    d = tmp_path / "snaps"
++    d.mkdir()
++    dead, mine = d / "999999999.json", d / f"{os.getpid()}.json"
++    fresh = d / "999999998.json"
++    for f in (dead, mine, fresh):
++        f.write_text("{}")
++    old = time.time() - la.PRUNE_AFTER_S - 10
++    os.utime(dead, (old, old))
++    os.utime(mine, (old, old))
++    assert la.prune(d) == 1
++    assert not dead.exists() and mine.exists() and fresh.exists()
++
++
++def test_begin_process_starts_the_writer_for_long_lived_kinds_only(monkeypatch):
++    from hermes_cli.observability import shared_metrics_process as smp
++
++    started = []
++    monkeypatch.setattr(la, "start", started.append)
++    for kind in ("cli", "cron", "gateway"):
++        monkeypatch.setattr(smp, "_STATE", {})
++        monkeypatch.setattr("hermes_cli.observability.shared_metrics_update._collection_on", lambda: False)
++        smp.begin_process(kind)
++    assert started == ["gateway"]
++
++
++def test_sync_timing_board_hooks_account_each_board():
++    from types import SimpleNamespace
++
++    from hermes_cli import kanban_sync_timing as st
++
++    results: list = []
++    tok = st.board_start("main", results)
++    results.append(SimpleNamespace(pulled=4, skipped=False, error=None))
++    st.board_end(tok, results)
++    tok = st.board_start("main", results)
++    results.append(SimpleNamespace(pulled=0, skipped=True, error="busy"))
++    st.board_end(tok, results)
++    tok = st.board_start("main", results)
++    results.append(SimpleNamespace(pulled=0, skipped=False, error="boom"))
++    st.board_end(tok, results)
++    c = la.counters()["sync.board/main"]
++    assert (c["runs"], c["rows"], c["skips"], c["errors"]) == (3, 4, 1, 1)
+diff --git a/tests/hermes_cli/test_loop_accounting_bench.py b/tests/hermes_cli/test_loop_accounting_bench.py
+new file mode 100644
+index 0000000000..4da8b51dd1
+--- /dev/null
++++ b/tests/hermes_cli/test_loop_accounting_bench.py
+@@ -0,0 +1,48 @@
++"""Overhead pin for loop accounting: one pass must cost <= 20 µs (design t_01a1d563324d7e8e §2 P1). [daveey]"""
++
++from __future__ import annotations
++
++import time
++
++from hermes_cli import loop_accounting as la
++
++BUDGET_S = 20e-6
++
++
++def _per_pass(n: int) -> float:
++    best = float("inf")
++    for _ in range(5):  # best of 5: a loaded CI host must not fail a cheap path
++        t0 = time.perf_counter()
++        for _ in range(n):
++            with la.pass_("bench") as p:
++                p.rows(1)
++        best = min(best, (time.perf_counter() - t0) / n)
++    return best
++
++
++def test_pass_overhead_under_budget():
++    la.reset()
++    try:
++        per = _per_pass(20000)
++        assert per <= BUDGET_S, f"{per * 1e6:.2f} µs per pass"
++    finally:
++        la.reset()
++
++
++def test_decorator_overhead_under_budget():
++    la.reset()
++
++    @la.accounted("bench.dec")
++    def noop() -> None:
++        return None
++
++    try:
++        best = float("inf")
++        for _ in range(5):
++            t0 = time.perf_counter()
++            for _ in range(20000):
++                noop()
++            best = min(best, (time.perf_counter() - t0) / 20000)
++        assert best <= BUDGET_S, f"{best * 1e6:.2f} µs per call"
++    finally:
++        la.reset()
+diff --git a/tui_gateway/change_watcher.py b/tui_gateway/change_watcher.py
+index 5fc88b7444..03034f2354 100644
+--- a/tui_gateway/change_watcher.py
++++ b/tui_gateway/change_watcher.py
+@@ -558,14 +558,17 @@ _change_broadcast_at: dict[str, float] = {}
+ 
+ def _broadcast_watched_changes(now: float | None = None) -> None:
+     """One pass: recompute due signatures, broadcast events whose signature moved.
+-    First sighting seeds silently so a gateway boot never fires a refresh storm."""
++    First sighting seeds silently so a gateway boot never fires a refresh storm. Each signature read is a
++    ``change_watcher/<event>`` pass (loop_accounting)."""
++    from hermes_cli import loop_accounting
+     now = time.monotonic() if now is None else now
+     for event, (interval, sig_fn, payload_fn, *diff_fn) in _CHANGE_WATCHES.items():
+         if now - _change_checked_at.get(event, -interval) < interval:
+             continue
+         _change_checked_at[event] = now
+         try:
+-            sig = sig_fn()
++            with loop_accounting.pass_(f"change_watcher/{event}"):
++                sig = sig_fn()
+         except Exception:
+             continue
+         if event not in _change_sigs:
+@@ -595,10 +598,12 @@ def _ensure_skin_watcher() -> None:
+     _note_skin_broadcast()  # seed the baseline so only a real change repaints
+ 
+     def _loop() -> None:
++        from hermes_cli import loop_accounting
+         while True:
+             time.sleep(0.5)
+-            _broadcast_skin_if_changed()
+-            _broadcast_watched_changes()
++            with loop_accounting.pass_("change_watcher.pass"):
++                _broadcast_skin_if_changed()
++                _broadcast_watched_changes()
+             # A failed wake must never end this thread: every push (skin, sessions, groups...) runs on it.
+             with contextlib.suppress(Exception):  # health: allow BLE001 -- the driver's own idle poll still runs
+                 _wake_room_drivers()
+diff --git a/tui_gateway/kanban_remote_index.py b/tui_gateway/kanban_remote_index.py
+index 962c8ab0e0..db2876a3c8 100644
+--- a/tui_gateway/kanban_remote_index.py
++++ b/tui_gateway/kanban_remote_index.py
+@@ -366,11 +366,18 @@ def _write(conn, meta: dict, key: str, me: str, ledger_id: str, hub: str, cards:
+ 
+ 
+ def compute(hub: Path, ledger, ledger_file: Path, now: float, key: Optional[str]) -> tuple:
+-    """The local build (exactly what ``collect`` did before), then an offer to publish it.
++    """The local build (exactly what ``collect`` did before), then an offer to publish it. One
++    ``remote_index.compute`` pass (loop_accounting).
+ 
+     ``key`` was read before the build; the copy is published only if the replica still has it after ``observe``,
+     so rows and first-seen times belong to that one state. ``kanban_remote_notices._lock`` is held only for the
+     index build; publishing runs after it is released."""
++    from hermes_cli import loop_accounting
++    with loop_accounting.pass_("remote_index.compute"):
++        return _compute(hub, ledger, ledger_file, now, key)
++
++
++def _compute(hub: Path, ledger, ledger_file: Path, now: float, key: Optional[str]) -> tuple:
+     from tui_gateway import kanban_remote_notices as krn
+     from tui_gateway import remote_index_projection
+     from tui_gateway.kanban_remote_observations import observe
+@@ -406,14 +413,20 @@ def published_key(ledger: Path) -> Optional[str]:
+ 
+ 
+ def refresh(hub: Path, ledger: Path, now: Optional[float] = None) -> bool:
+-    """Holder pass: republish when the copy is not of the replica's current state. True when it is current."""
+-    key = replica_key(hub)
+-    if key is None:
+-        return False
+-    if published_key(ledger) == key:
+-        return True
+-    compute(hub, ledger, ledger, time.time() if now is None else now, key)
+-    return published_key(ledger) == key
++    """Holder pass: republish when the copy is not of the replica's current state. True when it is current.
++    One ``remote_index.refresh`` pass (loop_accounting): a current copy is a skip, a rebuild a key change."""
++    from hermes_cli import loop_accounting
++    with loop_accounting.pass_("remote_index.refresh") as acct:
++        key = replica_key(hub)
++        if key is None:
++            acct.skip()
++            return False
++        if published_key(ledger) == key:
++            acct.skip()
++            return True
++        acct.change()
++        compute(hub, ledger, ledger, time.time() if now is None else now, key)
++        return published_key(ledger) == key
+ 
+ 
+ def _hold(lease, hub: Path, ledger: Path, stop: threading.Event, poll: float = REFRESH_POLL_S) -> None:
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 7a51dbc7bd..1a60d47121 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -59,6 +59,7 @@ from pathlib import Path
+ from typing import Any, Callable, Iterator, Optional
+ 
+ from tui_gateway import wake_slots
++from hermes_cli import loop_accounting as _la
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -677,40 +678,42 @@ def sweep_remote_once(live_ids: set[str], *, grace_s: float = GRACE_S, **kwargs)
+     return sweep_remote_notices(live_ids=live_ids, waker=_RemoteWaker(wake_turn, _spawn_thread, grace_s), **kwargs)
+ 
+ 
++@_la.accounted("unloaded.host_pass")
+ def host_pass(grace: float = GRACE_S, *, every_store: bool = True) -> None:
+     """Everything this loop does for the whole install; run by the ``kanban-unloaded`` lease holder only.
+     ``every_store=False`` (kill switch, lease failed open: every process runs this) retries killed-subagent
+-    notices in this process's own store only."""
++    notices in this process's own store only. Each sub-pass is an ``unloaded.<sub>`` pass (loop_accounting)."""
+     try:
+-        sweep_remote_once(live_session_ids(), grace_s=grace)
+-        sweep_once(live_session_ids(), grace_s=grace)
++        _la.timed("unloaded.remote_notices", sweep_remote_once, live_session_ids(), grace_s=grace)
++        _la.timed("unloaded.notices", sweep_once, live_session_ids(), grace_s=grace)
+     except Exception:
+         logger.warning("kanban unloaded sweep failed", exc_info=True)
+     # [daveey] Async-delegation results no live poller delivers (parent unloaded, loaded headless, or held by
+     # another backend than the copy's): one turn in the parent, ledger-claimed (delegation_unloaded).
+     try:
+         from tui_gateway.delegation_unloaded import sweep_once as delegation_sweep_once
+-        delegation_sweep_once()
++        _la.timed("unloaded.delegation", delegation_sweep_once)
+     except Exception:
+         logger.warning("async delegation unloaded sweep failed", exc_info=True)
+     # [daveey] Session outcome: refresh chats whose cards moved, then make sure no notice ends a chat unanswered.
+     from tui_gateway.notice_fanout import card_change_pass
+     from tui_gateway.notice_guarantee import guarantee_pass
+-    card_change_pass()
++    _la.timed("unloaded.card_change_pass", card_change_pass)
+     # [daveey] A parent that was mid-turn when the orphan reap killed its subagent refused that notice: re-offer
+     # it before the guarantee pass, so the same tick can wake the parent on it (desktop-ac1b365935). Every
+     # profile store, since one holder now retries for the whole install; without a real lease each process
+     # retries its own store, as before the lease.
+     if every_store:
+         from tui_gateway.reap_notices import retry_pending_killed_notices_all
+-        retry_pending_killed_notices_all()
++        _la.timed("unloaded.killed_notices", retry_pending_killed_notices_all)
+     else:
+         from tui_gateway import server
+         from tui_gateway.reap_notices import retry_pending_killed_notices
+-        retry_pending_killed_notices(server._get_db())
+-    guarantee_pass()
++        _la.timed("unloaded.killed_notices", retry_pending_killed_notices, server._get_db())
++    _la.timed("unloaded.guarantee_pass", guarantee_pass)
+ 
+ 
++@_la.accounted("unloaded.residual_pass")
+ def residual_pass() -> None:
+     """A standby's pass for the chats it holds itself: the delegation and guarantee passes skip a chat another
+     backend holds (``skipped:held``), so the holder never delivers those. Nothing to do without live chats."""
+diff --git a/tui_gateway/producer_admission.py b/tui_gateway/producer_admission.py
+index 918575182d..c15bf0eecd 100644
+--- a/tui_gateway/producer_admission.py
++++ b/tui_gateway/producer_admission.py
+@@ -27,6 +27,7 @@ from typing import Optional
+ import hermes_state_producer_admission as pa
+ from agent.memory_provider import spawn_context_thread
+ from agent.local_work_agent import scope as work_scope
++from hermes_cli import loop_accounting as _la
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -162,6 +163,7 @@ def _live(server, key: str, profile: Optional[str]):
+     return None
+ 
+ 
++@_la.accounted("producer_admission.sweep", rows=True)
+ def sweep_once() -> list[dict]:
+     """One pass over every profile store: wake each cold chat that holds an undelivered completion, then deliver.
+     Returns one record per owner it acted on. Never raises."""
+diff --git a/tui_gateway/rpc_dispatch.py b/tui_gateway/rpc_dispatch.py
+index 7b5802dc4e..370b6d67ed 100644
+--- a/tui_gateway/rpc_dispatch.py
++++ b/tui_gateway/rpc_dispatch.py
+@@ -46,11 +46,13 @@ def _handle_admitted_request(req: dict) -> dict | None:
+         params, problem = _contracts.validate_params(contract, params)
+         if problem is not None:
+             return _err(rid, 4000, problem)
++    from hermes_cli import loop_accounting  # one ``rpc/<method>`` pass per handled request
+     from hermes_cli.config_backend import ConfigBackendUnavailable
+ 
+     token = _current_rpc_method.set(method)
+     try:
+-        response = fn(rid, params)
++        with loop_accounting.pass_(f"rpc/{method}"):
++            response = fn(rid, params)
+     except ProfileUnavailableError as exc:
+         return _err(rid, 4064, str(exc))
+     except ConfigBackendUnavailable as exc:
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 01100ee6b7..c19c4b5c80 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -1823,13 +1823,12 @@ def _notification_poller_loop(stop_event: threading.Event, sid: str, session: di
+ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, session: dict) -> None:
+     """Daemon thread (started by _init_session()) that drains the process-global completion_queue for this session
+     (ownership routing: _notif_handle_event), claims the events parked while their owner was not live
+-    (``notification_park``), and polls ``kanban_notify_subs`` every ``_KANBAN_POLL_SECONDS`` — the
+-    delivery path for platform="tui" rows.
+-
+-    Also polls ``kanban_notify_subs`` every ``_KANBAN_POLL_SECONDS`` for this session's TUI kanban
+-    subscriptions and delivers terminal task events the same way (status.update + agent turn) — the delivery
+-    path tools/kanban_tools.py documents for platform="tui" rows (issue #59890).
++    (``notification_park``), and polls ``kanban_notify_subs`` every ``_KANBAN_POLL_SECONDS`` for this session's TUI
++    subscriptions, delivering terminal task events (status.update + agent turn): the delivery path for
++    platform="tui" rows that tools/kanban_tools.py documents (issue #59890). Each sub-poll is a
++    ``notifications.<poll>`` pass (loop_accounting).
+     """
++    from hermes_cli import loop_accounting as _la
+     from tools import async_delegation
+     from tools.process_registry import process_registry
+     from tools.process_registry_awaiting import release as release_in_flight, take_ready
+@@ -1849,25 +1848,25 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
+         wake_generation = generation(queue)
+         now = time.monotonic()
+         # Completions whose owner process died after this one started (#97202); throttled per profile home.
+-        async_delegation.maybe_sweep_orphaned_completions(queue)
++        _la.timed("notifications.sweep_orphaned_completions", async_delegation.maybe_sweep_orphaned_completions, queue)
+         # /loop and /heartbeat wakeup drivers: fire a due tick for THIS session while idle (same claim-under-lock
+         # as kanban dispatch). An active non-parked /goal owns the idle boundary and defers the loop tick.
+         if now - last_loop_poll >= _LOOP_POLL_SECONDS:
+             last_loop_poll = now
+             for what, fire in (("loop wakeup", _maybe_fire_tui_loop_tick), ("heartbeat", _maybe_fire_tui_heartbeat_tick)):
+                 try:
+-                    fire(sid, session)
++                    _la.timed(f"notifications.{what.replace(' ', '_')}", fire, sid, session)
+                 except Exception as tick_exc:
+                     _notif_log_failure(f"{what} poll failed", tick_exc)
+         if now - last_kanban_poll >= _KANBAN_POLL_SECONDS:
+             last_kanban_poll = now
+-            _notif_poll_kanban(sid, session)
++            _la.timed("notifications.poll_kanban", _notif_poll_kanban, sid, session)
+             # [daveey] Trusted producer completions queued for this unrouted chat (hermes_state_producer_admission).
+             from tui_gateway.producer_admission import deliver_pending
+-            deliver_pending(sid, session)
++            _la.timed("notifications.producer_deliver_pending", deliver_pending, sid, session)
+         if now - last_parked_poll >= _PARKED_POLL_SECONDS:
+             last_parked_poll = now
+-            _notif_take_parked(sid, session, process_registry, handle)
++            _la.timed("notifications.take_parked", _notif_take_parked, sid, session, process_registry, handle)
+         if session.get("_notif_held") and not session.get("running") and not session.get("_turn_cancel_requested"):
+             taken = _notif_take_held(session)
+             try:
+-- 
+2.43.0
+

@@ -1,0 +1,354 @@
+From 82c3b418880f426ee695811cca713506ad1d22c0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:27:52 +0000
+Subject: [PATCH] [daveey] Kanban submitter books its own exit 76 when no owner
+ can
+
+Incident: example-tools/t_01a197166756bd53 run 207 on hermes-hub, 2026-11-13. The owner gateway
+4111315 was alive but wedged 20:03-20:12:35 (killed by the loop-liveness watchdog). The bound
+interpreter 4117653 wrote two exit-1 receipts (events 10270 "couldn't save this conversation", 10271
+`Worker failed: WorkerPersistenceError: owner_unavailable`). The outer submitter 3995469 printed
+`Kanban owner restarted: Kanban owner silent for 283s: Gateway connection failed; no local fallback`
+and exited rc=76, but that line exists only in the card's shared task log: run 207 has no
+worker_result with exit_code 76 from the submitter. At 20:15:30 the observer booked run 207 `crashed`
+from event 10271 (source_result_event_id 10271, failure 1 of 2, infrastructure false).
+
+Five whys:
+1. Why was the run booked from the inner exit 1? `reclaim_proof`/`result_exit_code` take the exit from
+   the causally selected modern receipt (`kanban_failed_result_identity.attributable_events`); the
+   exit trailer in the log is read only when no exit code is known
+   (`kanban_db_dispatch._classify_dead_worker_exit`). Evidence: crashed event 10272 payload.
+2. Why was there no 76 receipt? `kanban_worker_client._submit`'s `except OwnerRestartLost` printed the
+   line and returned 76 without booking anything, while the sibling refusal exits (69 owner
+   unavailable, owner down, 1) book theirs via `_book_refusal` -> `record_submitter_result`
+   (fb794abb716). The board is a local SQLite file the submitter writes directly, so an unreachable
+   owner does not stop it; it simply never tried.
+3. Why did nobody else book it? The 76 receipt is written by the owner itself, and only when it stops
+   cleanly (`gateway/session_kanban_restart.record_restart_interruption`; run 207's earlier receipts
+   10251 and 10261 are exactly that). A wedged or killed owner never runs that path.
+4. Why wasn't it caught? The 76 tests cover the client returning 76 and the sweep reading a reaped 76
+   or the log trailer of an unbound legacy run (test_kanban_worker_owner_restart.py), and the
+   owner-written receipt (test_kanban_owner_restart_failed_receipt.py). No test combined a modern bound
+   receipt with a submitter-only 76.
+
+Decision (outer 76 vs inner exit 1): the submitter's 76 wins, as the owner-written 76 already does over
+a failed child (test_native_owner_supersedes_failed_child). The submitter raises OwnerRestartLost only
+after the owner admitted the turn and then never settled it (silent past the restart budget, refused
+to continue a checkpoint, or unknown after a restart); a healthy owner relays the interpreter's
+terminal receipt and the submitter exits with that code instead.
+
+Change: `record_submitter_owner_restart` (kanban_worker_log) books the submitter's 76 under the same
+attempt fence as `record_submitter_result` (task running this run under this claim, the submitter is
+the task's worker, run row agrees), with the full owner-restart witness
+(`owner_restart_identity_fields`: spawn identity + every prior result/binding), the only shape the
+classifier accepts for an owner role. An existing interpreter receipt does not suppress it; an
+unwitnessed launch writes nothing (an unmarked later result would veto reclaim). Never raises: a
+store failure keeps exit 76 and prints "receipt could not be recorded".
+
+Proof: tests/hermes_cli/test_kanban_outer_owner_restart_receipt.py runs the real `main()` in a
+subprocess as the task's worker with a real bound interpreter subprocess. RED before (receipts
+[1, 1] / [1], no 76), GREEN after (10 passed): run 207's two receipts, the turn-only receipt #2658
+does not cover, and a card-text receipt, each through dispatcher and observer, all requeued
+`reclaimed` with failures 0 and owner_restart_lost sourced from the submitter receipt; no inner
+receipt; a submitter that is not the run's worker or whose claim moved books nothing; a receipt-store
+failure still exits 76.
+
+Not tested: a live hub replay with a wedged owner; a submitter racing the owner's own late 76 booking
+(both are complete witnessed 76s; the classifier takes one); NFS/replica boards.
+---
+ hermes_cli/kanban_worker_client.py            |  17 +-
+ hermes_cli/kanban_worker_log.py               |  35 ++++
+ ...test_kanban_outer_owner_restart_receipt.py | 187 ++++++++++++++++++
+ 3 files changed, 234 insertions(+), 5 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_outer_owner_restart_receipt.py
+
+diff --git a/hermes_cli/kanban_worker_client.py b/hermes_cli/kanban_worker_client.py
+index c02d9da1a8..fa519871f4 100644
+--- a/hermes_cli/kanban_worker_client.py
++++ b/hermes_cli/kanban_worker_client.py
+@@ -359,23 +359,27 @@ def main():
+     return rc
+ 
+ 
+-def _book_refusal(params, board_db, rc, line, proof=None):
++def _book_refusal(params, board_db, rc, line, proof=None, *, owner_restart=False):
+     """Book this submitter's refusal as its run's receipt (``record_submitter_result``): a bound
+     run's crash diagnosis never trusts the shared task log, so the line printed below would
+     otherwise be lost to the owner-death classifier. *proof*: a pre-admission host refusal
+     (``kanban_host_refusal.preadmission_proof``), stored on the receipt. Never raises: the exit must
+-    not depend on it. [daveey]"""
++    not depend on it. *owner_restart*: the exit is this submitter's own 76, booked as a witnessed
++    owner-restart result (``record_submitter_owner_restart``). [daveey]"""
+     if params is None or not board_db:
+         return
+     try:
+         from hermes_cli import kanban_db as kb
++        from hermes_cli import kanban_worker_log
+         from hermes_cli.kanban_db_connect import connect_closing
+         from hermes_cli.kanban_host_refusal import PROOF_KEY
+-        from hermes_cli.kanban_worker_log import record_submitter_result
+         # The proof only when there is one: the plain refusal keeps its call shape.
+         extra = {'extra': {PROOF_KEY: proof}} if proof else {}
+         with connect_closing(Path(board_db)) as conn, kb.write_txn(conn):
+-            record_submitter_result(conn, params, os.getpid(), rc, line, **extra)
++            if owner_restart:
++                kanban_worker_log.record_submitter_owner_restart(conn, params, os.getpid(), line)
++            else:
++                kanban_worker_log.record_submitter_result(conn, params, os.getpid(), rc, line, **extra)
+     except Exception as exc:  # health: allow BLE001 -- preserve the original refusal exit on receipt-store failure
+         print(f'Kanban refusal receipt could not be recorded: {type(exc).__name__}', file=sys.stderr)
+ 
+@@ -399,7 +403,10 @@ def _submit():
+     except OwnerRestartLost as exc:
+         # The owner's restart, not the card: the sweep requeues this exit without a failure. [daveey]
+         from hermes_cli.kanban_db_dispatch_exit_code import KANBAN_OWNER_RESTART_EXIT_CODE
+-        print(f'Kanban owner restarted: {exc}', file=sys.stderr)
++        line = f'Kanban owner restarted: {exc}'
++        print(line, file=sys.stderr)
++        # A wedged or dead owner books nothing; without this the bound interpreter's receipt wins. [daveey]
++        _book_refusal(params, board_db, KANBAN_OWNER_RESTART_EXIT_CODE, line, owner_restart=True)
+         return KANBAN_OWNER_RESTART_EXIT_CODE
+     except (KeyError, ValueError, OSError) as exc:
+         line = f'Kanban owner refused: {exc}'
+diff --git a/hermes_cli/kanban_worker_log.py b/hermes_cli/kanban_worker_log.py
+index da00adb0c3..217bc0fdc3 100644
+--- a/hermes_cli/kanban_worker_log.py
++++ b/hermes_cli/kanban_worker_log.py
+@@ -192,6 +192,41 @@ def record_submitter_result(conn, params, pid, exit_code, last_output, extra=Non
+     return True
+ 
+ 
++def record_submitter_owner_restart(conn, params, pid, last_output) -> bool:
++    """Book the submitter's own exit 76 (``OwnerRestartLost``) as its run's witnessed owner-restart result.
++
++    The owner books a restart itself only when it stops cleanly (``record_restart_interruption``). An owner
++    that wedged or died never does, and the submitter's exit line is in the shared task log only, which a
++    bound run's diagnosis never reads, so the sweep booked the bound interpreter's receipt instead and
++    charged the card (example-tools run 207, 2026-11-13). Unlike ``record_submitter_result`` an existing
++    receipt does not stop it: 76 is the submitter's own observation (the owner never settled the turn), not
++    an echo of the interpreter's exit. Same fence: this run, this claim, *pid* is the task's worker. Written
++    only with the full owner-restart witness (spawn identity + every prior result/binding), the shape the
++    classifier accepts (``kanban_failed_result_identity``); an unwitnessed later result would veto reclaim.
++    Caller holds ``write_txn``; returns whether it wrote. [daveey]
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_dispatch_exit_code import KANBAN_OWNER_RESTART_EXIT_CODE
++    from hermes_cli.kanban_failed_result_identity import owner_restart_identity_fields
++
++    task_id, run_id, claim_lock = params['task_id'], int(params['run_id']), params['claim_lock']
++    task = kb.get_task(conn, task_id)
++    if task is None or (task.status, task.current_run_id, task.claim_lock, task.worker_pid) != (
++            'running', run_id, claim_lock, pid):
++        return False
++    run = conn.execute("SELECT status, claim_lock, task_id FROM task_runs WHERE id=?", (run_id,)).fetchone()
++    if run is None or tuple(run) != ('running', claim_lock, task_id):
++        return False
++    witness = owner_restart_identity_fields(conn, {'task_id': task_id, 'run_id': run_id}, task)
++    if not witness:
++        return False
++    kb._append_event(conn, task_id, 'worker_result', {
++        'pid': pid, 'claim_lock': claim_lock, 'exit_code': KANBAN_OWNER_RESTART_EXIT_CODE,
++        'last_output': str(last_output)[-500:], 'owner_restart': True, 'submitter': True, **witness},
++        run_id=run_id)
++    return True
++
++
+ def _worker_final_output(task_id: str, board: Optional[str] = None, *, run_id=None) -> str:
+     """Best-effort read of a dead worker's last printed text, for the board diagnostic.
+ 
+diff --git a/tests/hermes_cli/test_kanban_outer_owner_restart_receipt.py b/tests/hermes_cli/test_kanban_outer_owner_restart_receipt.py
+new file mode 100644
+index 0000000000..ade4095369
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_outer_owner_restart_receipt.py
+@@ -0,0 +1,187 @@
++"""The managed submitter's own exit 76 reaches the board when no owner can book it. [daveey]
++
++example-tools/t_01a197166756bd53 run 207 (hermes-hub, 2026-11-13 20:06Z): the owner gateway was alive but
++wedged, so it never booked the restart (``record_restart_interruption`` runs only in a stopping owner). The
++bound interpreter died with exit-1 receipts; the outer ``kanban_worker_client`` saw the owner silent for 283 s
++and exited 76 (``OwnerRestartLost``), but printed it only to the shared task log, which a bound run's crash
++diagnosis never reads. The sweep booked the run ``crashed`` from the inner receipt and charged the card.
++"""
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli.kanban_db_dispatch_exit_code import KANBAN_OWNER_RESTART_EXIT_CODE
++from tests.hermes_cli import test_kanban_failed_result_reconcile as fixtures
++from tools.environments.local import build_subprocess_env
++
++board = fixtures.board
++_ROOT = str(Path(__file__).resolve().parents[2])
++_SILENT = 'Kanban owner silent for 283s: Gateway connection failed; no local fallback'
++
++# The bound interpreter: binds, books its own failed turn, exits 1 (stdin is the spawn barrier).
++_INNER = '''
++import json, os, sys
++from pathlib import Path
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli.kanban_db_connect import connect_closing
++from gateway.session_kanban import _record_worker_result
++import hermes_cli.kanban_failed_result_observer as observer
++observer.arm = lambda context: None
++context = json.loads(sys.argv[1])
++sys.stdin.read(1)
++with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
++    kb._append_event(conn, context['task_id'], 'worker_bound',
++        {'pid': os.getpid(), 'started_at': kbd._process_fingerprint(os.getpid()),
++         'claim_lock': context['claim_lock']}, run_id=context['run_id'])
++for output in json.loads(sys.argv[2]):
++    _record_worker_result(context, 1, output)
++raise SystemExit(1)
++'''
++
++# The real submitter ``main()``; only its owner connection is replaced by the silent owner's outcome.
++_OUTER = '''
++import json, os, sys
++context = json.loads(sys.argv[1])
++sys.stdin.read(1)
++os.environ.update(HERMES_KANBAN_BOARD='default', HERMES_KANBAN_TASK=context['task_id'],
++                  HERMES_KANBAN_RUN_ID=str(context['run_id']), HERMES_KANBAN_CLAIM_LOCK=context['claim_lock'],
++                  HERMES_KANBAN_DB=context['db'])
++from hermes_cli import kanban_worker_client as client
++async def lost(params, board_db):
++    raise client.OwnerRestartLost(sys.argv[2])
++client.run = lost
++raise SystemExit(client.main())
++'''
++
++
++def _spawn(source, *args):
++    return subprocess.Popen([sys.executable, '-c', source, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++                            stderr=subprocess.PIPE, text=True, encoding='utf-8', env=build_subprocess_env(), cwd=_ROOT)
++
++
++def _finish(proc):
++    out, err = proc.communicate('x', timeout=60)
++    return proc.returncode, out, err
++
++
++def _run_207(conn, context, inner_outputs, *, outer_pid_owner=True):
++    """Launch the outer submitter (the task's worker), let its bound interpreter fail, then the outer exit 76."""
++    outer = _spawn(_OUTER, json.dumps(context), _SILENT)
++    try:
++        if outer_pid_owner:
++            kbd._set_worker_pid(conn, context['task_id'], outer.pid)
++        inner = _spawn(_INNER, json.dumps(context), json.dumps(inner_outputs))
++        rc, out, err = _finish(inner)
++        assert rc == 1, (out, err)
++        rc, out, err = _finish(outer)
++        assert rc == KANBAN_OWNER_RESTART_EXIT_CODE, (out, err)
++        assert f'Kanban owner restarted: {_SILENT}' in err
++        return outer.pid
++    finally:
++        for proc in (outer,):
++            if proc.poll() is None:
++                proc.kill()
++                proc.wait()
++
++
++def _results(conn, context):
++    return [(row['id'], json.loads(row['payload'])) for row in conn.execute(
++        "SELECT id, payload FROM task_events WHERE run_id=? AND kind='worker_result' ORDER BY id",
++        (context['run_id'],))]
++
++
++_TURN = ("⚠️ No reply: Hermes couldn't save this conversation, so it stopped rather than lose your messages.")
++_ENVELOPE = 'Worker failed: WorkerPersistenceError: owner_unavailable'
++
++
++@pytest.mark.parametrize('inner', [[_TURN, _ENVELOPE], [_TURN], ['fixture worker_receipt_timeout']],
++                         ids=['run207', 'turn_only', 'card_text'])
++@pytest.mark.parametrize('observer', [False, True])
++def test_outer_owner_restart_exit_is_booked_and_wins(board, inner, observer):
++    conn, context = board
++    outer_pid = _run_207(conn, context, inner)
++    results = _results(conn, context)
++    assert [p['exit_code'] for _, p in results] == [1] * len(inner) + [KANBAN_OWNER_RESTART_EXIT_CODE]
++    receipt_id, receipt = results[-1]
++    assert receipt['pid'] == outer_pid and receipt['submitter'] is True and receipt['owner_restart'] is True
++    assert receipt['result_role'] == 'owner_restart' and receipt['death_proof_version'] == 1
++    assert _SILENT in receipt['last_output'] and 'continuable' not in receipt
++    kbd.detect_crashed_workers(conn, failed_results_only=observer)
++    task = kb.get_task(conn, context['task_id'])
++    assert task.status == 'ready' and task.consecutive_failures == 0
++    run = conn.execute('SELECT * FROM task_runs WHERE id=?', (context['run_id'],)).fetchone()
++    assert run['outcome'] == 'reclaimed' and 'gateway restart' in run['error']
++    (lost,) = conn.execute("SELECT payload FROM task_events WHERE run_id=? AND kind='owner_restart_lost'",
++                           (context['run_id'],)).fetchall()
++    assert json.loads(lost['payload'])['source_result_event_id'] == receipt_id
++    kinds = [r[0] for r in conn.execute('SELECT kind FROM task_events WHERE run_id=?', (context['run_id'],))]
++    assert 'crashed' not in kinds and 'failure_finalized' not in kinds
++
++
++def test_outer_exit_with_no_inner_receipt_is_booked_too(board):
++    conn, context = board
++    outer = _spawn(_OUTER, json.dumps(context), _SILENT)
++    try:
++        kbd._set_worker_pid(conn, context['task_id'], outer.pid)
++        assert _finish(outer)[0] == KANBAN_OWNER_RESTART_EXIT_CODE
++    finally:
++        if outer.poll() is None:
++            outer.kill()
++            outer.wait()
++    (_, receipt), = _results(conn, context)
++    assert receipt['exit_code'] == KANBAN_OWNER_RESTART_EXIT_CODE and receipt['causal_predecessors'] == []
++    kbd.detect_crashed_workers(conn)
++    task = kb.get_task(conn, context['task_id'])
++    assert task.status == 'ready' and task.consecutive_failures == 0
++
++
++def test_a_submitter_that_is_not_the_runs_worker_books_nothing(board):
++    """A late submitter of an older attempt (the task's worker is someone else) leaves the board alone."""
++    conn, context = board
++    kbd._set_worker_pid(conn, context['task_id'], os.getpid())
++    outer = _spawn(_OUTER, json.dumps(context), _SILENT)
++    try:
++        assert _finish(outer)[0] == KANBAN_OWNER_RESTART_EXIT_CODE
++    finally:
++        if outer.poll() is None:
++            outer.kill()
++            outer.wait()
++    assert _results(conn, context) == []
++
++
++def test_a_moved_claim_books_nothing(board):
++    from hermes_cli.kanban_db_connect import connect_closing
++    from hermes_cli.kanban_worker_log import record_submitter_owner_restart
++    conn, context = board
++    kbd._set_worker_pid(conn, context['task_id'], os.getpid())
++    with connect_closing(Path(context['db'])) as other, kb.write_txn(other):
++        assert not record_submitter_owner_restart(other, dict(context, claim_lock='elsewhere:1'), os.getpid(), 'x')
++        assert not record_submitter_owner_restart(other, dict(context, run_id=context['run_id'] + 1),
++                                                  os.getpid(), 'x')
++    assert _results(conn, context) == []
++
++
++def test_receipt_store_failure_keeps_the_exit(monkeypatch, tmp_path, capsys):
++    from hermes_cli import kanban_worker_client as client
++    from hermes_cli import kanban_worker_log
++    for key, value in {'HERMES_KANBAN_BOARD': 'default', 'HERMES_KANBAN_TASK': 't1', 'HERMES_KANBAN_RUN_ID': '1',
++                       'HERMES_KANBAN_CLAIM_LOCK': 'h:1', 'HERMES_KANBAN_DB': str(tmp_path / 'kanban.db')}.items():
++        monkeypatch.setenv(key, value)
++
++    async def lost(params, board_db):
++        raise client.OwnerRestartLost(_SILENT)
++
++    def broken(*a, **kw):
++        raise OSError('disk gone')
++    monkeypatch.setattr(client, 'run', lost)
++    monkeypatch.setattr(kanban_worker_log, 'record_submitter_owner_restart', broken)
++    assert client.main() == KANBAN_OWNER_RESTART_EXIT_CODE
++    err = capsys.readouterr().err
++    assert 'receipt could not be recorded: OSError' in err and f'rc={KANBAN_OWNER_RESTART_EXIT_CODE}' in err
+-- 
+2.43.0
+

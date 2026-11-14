@@ -1,0 +1,252 @@
+From 934f055419e3d9e7f9daa2b12263b37d615df7af Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:41:35 +0000
+Subject: [PATCH] [daveey] Requeue an exhausted-resend owner stall
+ (worker_receipt_timeout / owner_link_closed) without charging the card
+
+Sibling of #2658 (owner_unavailable). When the resend's redial reaches the gateway but send 2/2
+still gets no receipt, or the owner drops the link again, RuntimeSessionStore._persist_resending
+latched WorkerPersistenceError(str(exc)). The bound worker then died with
+"Worker failed: WorkerPersistenceError: worker_receipt_timeout" (or a raw ConnectionClosed /
+ConnectionError text), which kanban_owner_storage_refusal._KINDS did not match, so the run was
+booked crashed and charged to the card.
+
+Five whys
+1. Why was the card charged? The terminal envelope was not in _KINDS.
+2. Why not? #2658 only added owner_unavailable (redial found no discovery answer).
+3. Why does the sibling path give another envelope? The final resend latches the raw exception
+   text: worker_receipt_timeout is fixed, but link-closed text carries owner-chosen close reasons
+   and errno strings, so no whole-line match could cover it.
+4. Fix: the store latches a fixed wire code at the raise site (exhausted_resend_code):
+   worker_receipt_timeout for a silent owner, owner_link_closed for a dropped socket,
+   ConnectionError, or an owner close code that means the owner went away/failed
+   (1001/1006/1011/1012/1013). Any other close code (1009 too big, 1008 policy, 1000) may answer
+   THIS frame, so its raw text is kept and the card still owns it.
+5. Both codes map to OWNER_UNREACHABLE; whole-line exactness and the NEUTRAL_STREAK_LIMIT breaker
+   are unchanged, and the run error names the code.
+
+Proof
+- RED on base (source reverted, tests kept): 17 failed, incl. the two-receipt dispatcher replay
+  for both envelopes and their breaker streak. GREEN: 466 passed across 52 test files that import
+  runtime_session_store / kanban_owner_storage_refusal / kanban_host_refusal;
+  test_kanban_owner_unreachable_midrun.py stays green.
+- Replay over the hub's real rows (kanban.db, boards/*, sync-shadow/*, read-only): every
+  "WorkerPersistenceError: worker_receipt_timeout" receipt is exit 1 and clusters in owner-stall
+  bursts: 11 cards within 15 s at 2026-10-31 00:10Z, 6 cards within 18 s at 2026-11-11 15:55Z
+  (incl. example-tools t_01a197166756bd53 run 183, the card of #2658's incident), plus 2 on bb.
+  All were booked crashed/charged; with this change they requeue neutrally. No receipt carries
+  raw ConnectionClosed/ConnectionError text. ENOSPC and invalid_params receipts still count.
+---
+ agent/runtime_session_store.py                | 27 +++++++++-
+ hermes_cli/kanban_host_refusal.py             |  2 +-
+ hermes_cli/kanban_owner_storage_refusal.py    |  6 ++-
+ ...t_runtime_session_store_receipt_timeout.py | 49 +++++++++++++++++
+ .../test_kanban_owner_unreachable_midrun.py   | 54 +++++++++++++++++++
+ 5 files changed, 135 insertions(+), 3 deletions(-)
+
+diff --git a/agent/runtime_session_store.py b/agent/runtime_session_store.py
+index 223c7445a2..00f32a9c83 100644
+--- a/agent/runtime_session_store.py
++++ b/agent/runtime_session_store.py
+@@ -82,6 +82,31 @@ def _retryable_owner_errors():
+     return (TimeoutError, ConnectionError, ConnectionClosed)
+ 
+ 
++#: Wire code for a final resend whose owner link dropped. The raw ConnectionClosed/ConnectionError text
++#: (owner-chosen close reasons, errno strings) is not a stable code the dispatcher can match exactly.
++OWNER_LINK_CLOSED = 'owner_link_closed'
++#: Close codes that say the owner went away or failed (going away, abnormal, internal error, service
++#: restart, try again later). Any other code (1009 message too big, 1008 policy) may answer THIS frame,
++#: so its text is kept and the card still owns the failure.
++_OWNER_GONE_CLOSE_CODES = frozenset({1001, 1006, 1011, 1012, 1013})
++
++
++def exhausted_resend_code(exc) -> str:
++    """The wire code a final unknown-outcome resend latches (one ``is_retryable_owner_error`` accepted):
++    ``worker_receipt_timeout`` for a silent owner, ``owner_link_closed`` for a link the owner dropped,
++    else the raw text. The dispatcher books the first two as the owner's fault (kanban_owner_storage_refusal)."""
++    if isinstance(exc, TimeoutError):
++        return str(exc)
++    from websockets.exceptions import ConnectionClosed
++    if isinstance(exc, ConnectionClosed):
++        # The owner's close frame, else the one this side sent failing the link (1009 for an oversized
++        # reply); none at all is a dropped socket.
++        close = exc.rcvd or exc.sent
++        if close is not None and close.code not in _OWNER_GONE_CLOSE_CODES:
++            return str(exc)
++    return OWNER_LINK_CLOSED
++
++
+ def is_retired_generation_error(exc) -> bool:
+     """True for the store's ``stale_generation`` fence: the owner retired this worker generation
+     (gateway restart / core update), so every later write is refused by design. Matches only the
+@@ -495,7 +520,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
+                 if send >= _RETRYABLE_ATTEMPTS:
+                     logger.error('worker receipt outcome still unknown after %d sends (op=%s): %s',
+                                  send, entry['operation'], exc)
+-                    raise WorkerPersistenceError(str(exc)) from exc
++                    raise WorkerPersistenceError(exhausted_resend_code(exc)) from exc
+                 stalled = time.monotonic()  # the recovery log measures from the last stall
+                 logger.warning('worker receipt outcome unknown (op=%s, send %d/%d): %s; re-sending it',
+                                entry['operation'], send, _RETRYABLE_ATTEMPTS, exc)
+diff --git a/hermes_cli/kanban_host_refusal.py b/hermes_cli/kanban_host_refusal.py
+index 3ee1dea15e..4ec5fe1a0c 100644
+--- a/hermes_cli/kanban_host_refusal.py
++++ b/hermes_cli/kanban_host_refusal.py
+@@ -157,7 +157,7 @@ def _cause(proof: dict, task_id: Optional[str] = None) -> str:
+                 "(its runtime store or session policy could not be read)")
+     if kind == OWNER_UNREACHABLE:
+         return (f"{whose} running worker could not reach its profile owner to save the turn "
+-                "(owner_unavailable: the owner gateway stopped answering)")
++                f"({proof.get('reason') or 'owner_unavailable'}: the owner gateway stopped answering)")
+     if kind == OWNER_CAPSULE_UNAVAILABLE:
+         claim = f"card {task_id}'s claim" if task_id else "the claim"
+         return (f"the profile owner kept refusing {claim} with capsule_observation_missing (no live run-bound "
+diff --git a/hermes_cli/kanban_owner_storage_refusal.py b/hermes_cli/kanban_owner_storage_refusal.py
+index 9024b58dc3..165cb7f97b 100644
+--- a/hermes_cli/kanban_owner_storage_refusal.py
++++ b/hermes_cli/kanban_owner_storage_refusal.py
+@@ -4,13 +4,17 @@ Two exact managed-worker exception envelopes are owner faults, never the card's:
+ ``storage_unavailable`` (the owner answered and refused: its store could not be read) and
+ ``owner_unavailable`` (the worker could not reach its owner at all: ``WorkerRPC`` rediscovery found no
+ answering gateway, e.g. one wedged after an aborted core-update drain; hermes-hub 2026-11-13 20:06Z).
++Its sibling, where the redial reached the gateway but the resend still got no receipt
++(``worker_receipt_timeout``) or the owner dropped the link again (``owner_link_closed``), is the same
++owner-silent fault (``runtime_session_store.exhausted_resend_code``).
+ """
+ from hermes_cli.kanban_host_refusal import OWNER_STORAGE_UNAVAILABLE, OWNER_UNREACHABLE, _run_events
+ 
+ _ENVELOPE = "Worker failed: WorkerPersistenceError: "
+ # Terminal persistence wire code -> host-refusal kind. Worker-local codes (outbox_full, lost_receipt,
+ # stale_generation, ...) stay card failures.
+-_KINDS = {"storage_unavailable": OWNER_STORAGE_UNAVAILABLE, "owner_unavailable": OWNER_UNREACHABLE}
++_KINDS = {"storage_unavailable": OWNER_STORAGE_UNAVAILABLE, "owner_unavailable": OWNER_UNREACHABLE,
++          "worker_receipt_timeout": OWNER_UNREACHABLE, "owner_link_closed": OWNER_UNREACHABLE}
+ 
+ 
+ def _proof(result):
+diff --git a/tests/agent/test_runtime_session_store_receipt_timeout.py b/tests/agent/test_runtime_session_store_receipt_timeout.py
+index c0e1770c20..a275569aaa 100644
+--- a/tests/agent/test_runtime_session_store_receipt_timeout.py
++++ b/tests/agent/test_runtime_session_store_receipt_timeout.py
+@@ -184,6 +184,55 @@ def test_retryable_classification():
+     assert not is_retryable_owner_error(ValueError('worker_receipt_timeout'))
+ 
+ 
++def _closed(rcvd=None, sent=None):
++    from websockets.exceptions import ConnectionClosedError
++    from websockets.frames import Close
++    rcvd = Close(rcvd, 'owner text that varies') if rcvd else None
++    sent = Close(sent, 'ours') if sent else None
++    return ConnectionClosedError(rcvd, sent, True if rcvd and sent else None)
++
++
++@pytest.mark.parametrize('exc, code', [
++    (TimeoutError('worker_receipt_timeout'), 'worker_receipt_timeout'),
++    (ConnectionResetError(104, 'Connection reset by peer'), 'owner_link_closed'),
++    (ConnectionRefusedError(111, 'Connection refused'), 'owner_link_closed'),
++    (_closed(), 'owner_link_closed'),  # socket dropped, no close frame
++    (_closed(rcvd=1001, sent=1001), 'owner_link_closed'),  # owner going away
++    (_closed(rcvd=1011), 'owner_link_closed'),  # owner internal error
++    (_closed(rcvd=1012, sent=1012), 'owner_link_closed'),  # owner restarting
++])
++def test_exhausted_resend_latches_a_fixed_owner_code(exc, code):
++    assert store_module.exhausted_resend_code(exc) == code
++
++
++@pytest.mark.parametrize('exc', [
++    _closed(rcvd=1009, sent=1009),  # the owner refused THIS frame's size
++    _closed(rcvd=1008),  # policy violation
++    _closed(sent=1009),  # this side failed the link on an oversized reply
++    _closed(rcvd=1000, sent=1000),
++])
++def test_a_close_that_may_answer_the_frame_keeps_its_text(exc):
++    assert store_module.exhausted_resend_code(exc) == str(exc)
++
++
++@pytest.mark.parametrize('stall, code', [('closed', 'owner_link_closed'), ('before_commit', 'worker_receipt_timeout')])
++def test_exhausted_resend_terminal_envelope_is_exact(owner_store, stall, code):
++    """The bound worker's terminal line is the whole-line envelope the dispatcher books as an owner fault."""
++    from gateway.session_kanban import failure_line
++    from hermes_cli import kanban_owner_storage_refusal as refusal
++    owner, store = owner_store
++    owner.stalls.extend([stall] * store_module._RETRYABLE_ATTEMPTS)
++    with pytest.raises(WorkerPersistenceError) as raised:
++        store.queue_token_counts('s', input_tokens=1)
++    assert str(raised.value) == code and store.failure == code
++    line = failure_line(raised.value, 'Worker failed')
++    assert line == f'Worker failed: WorkerPersistenceError: {code}'
++    assert refusal._proof({'exit_code': 1, 'last_output': line})['kind'] == 'owner_unreachable'
++    with pytest.raises(WorkerPersistenceError) as latched:  # a later write re-raises the same code
++        store.queue_token_counts('s', input_tokens=2)
++    assert failure_line(latched.value, 'Worker failed') == line
++
++
+ def test_lost_receipt_stays_sticky(owner_store):
+     owner, store = owner_store
+     owner.commits.append((0, 'phantom'))  # the owner expects 2; the journal holds no acked entry 1
+diff --git a/tests/hermes_cli/test_kanban_owner_unreachable_midrun.py b/tests/hermes_cli/test_kanban_owner_unreachable_midrun.py
+index 402a0ccced..f9a580bb62 100644
+--- a/tests/hermes_cli/test_kanban_owner_unreachable_midrun.py
++++ b/tests/hermes_cli/test_kanban_owner_unreachable_midrun.py
+@@ -106,3 +106,57 @@ def test_storage_and_unreachable_proofs_are_distinct_kinds(home):
+         task = kb.get_task(conn, tid)
+         proof = storage.proven(conn, tid, task.current_run_id, task.claim_lock)
+         assert proof == {"kind": hr.OWNER_UNREACHABLE, "phase": "midrun", "reason": "owner_unavailable"}
++
++
++# Sibling path: the resend's redial reached the gateway, but send 2/2 still got no receipt or the
++# owner dropped the link again (``runtime_session_store.exhausted_resend_code``).
++_SILENT_RESEND = ["worker_receipt_timeout", "owner_link_closed"]
++
++
++@pytest.mark.parametrize("code", _SILENT_RESEND)
++def test_exhausted_resend_requeues_without_spending_budget(home, code):
++    with kbc.connect() as conn:
++        tid, _ = helpers._admitted_run(conn)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET max_retries=1 WHERE id=?", (tid,))
++        _result(conn, tid, last_output=_TURN_TEXT)
++        _result(conn, tid, last_output=f"Worker failed: WorkerPersistenceError: {code}")
++        kbd.detect_crashed_workers(conn)
++        task = kb.get_task(conn, tid)
++        assert task.status == "ready"
++        assert task.consecutive_failures == 0
++        run = helpers._runs(conn, tid)[-1]
++        assert run["outcome"] == "owner_unavailable"
++        assert f"could not reach its profile owner to save the turn ({code}:" in run["error"]
++        assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='gave_up'", (tid,)).fetchone()
++
++
++@pytest.mark.parametrize("code", _SILENT_RESEND)
++def test_exhausted_resend_streak_still_reaches_the_breaker(home, code):
++    from hermes_cli import kanban_owner_unavailable as ou
++    with kbc.connect() as conn:
++        tid = None
++        for i in range(ou.NEUTRAL_STREAK_LIMIT + 1):
++            tid, _ = helpers._admitted_run(conn, tid, submitter=74000 + i)
++            _result(conn, tid, last_output=f"Worker failed: WorkerPersistenceError: {code}")
++            kbd.detect_crashed_workers(conn)
++        runs = helpers._runs(conn, tid)
++        assert [r["outcome"] for r in runs[:-1]] == ["owner_unavailable"] * ou.NEUTRAL_STREAK_LIMIT
++        assert runs[-1]["outcome"] == "crashed"
++        assert kb.get_task(conn, tid).consecutive_failures == 1
++
++
++@pytest.mark.parametrize("output", [
++    "Worker failed: TimeoutError: worker_receipt_timeout",  # not the store's latched envelope
++    "Worker failed: WorkerPersistenceError: worker_receipt_timeout_extra",
++    # A close code that may answer this frame keeps its raw text and stays the card's.
++    "Worker failed: WorkerPersistenceError: received 1009 (message too big); then sent 1009 (message too big)",
++    "Worker failed: WorkerPersistenceError: owner_link_closed\nAnother failure",
++])
++def test_inexact_resend_envelope_still_counts(home, output):
++    with kbc.connect() as conn:
++        tid, _ = helpers._admitted_run(conn)
++        _result(conn, tid, last_output=output)
++        kbd.detect_crashed_workers(conn)
++        assert kb.get_task(conn, tid).consecutive_failures == 1
++        assert not helpers._notices(conn)
+-- 
+2.43.0
+

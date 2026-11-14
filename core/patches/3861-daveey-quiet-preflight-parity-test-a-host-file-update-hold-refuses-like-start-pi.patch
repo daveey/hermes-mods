@@ -1,0 +1,101 @@
+From 7b669b67a82e5ad1e8ce609fd234e61207968da6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:13:07 +0000
+Subject: [PATCH] [daveey] quiet preflight parity test: a host-file update hold
+ refuses like start (pin #2591 M2c)
+
+Post-merge check t_01a1d6962c783474 found that mutant M2c survived the gateway
+suite. M2c drops `_hold_reasons()` from `gateway.quiet_control.start_preflight_reasons`:
+
+    -    reasons = [f"update:{r}" for r in _hold_reasons() + window_reasons]
+    +    reasons = [f"update:{r}" for r in window_reasons]
+
+The parity test `test_start_preflight_matches_the_start_refusal_from_host_files`
+only varied the deploy window (draining/batching/idle-500/idle-0/missing), so it
+never compared the preflight and start under an update hold. Under M2c, a host
+with a hold and a fresh idle window passes the preflight, quiet-hold takes the
+lease and commits the 2 h cooldown, and then the gateway start refuses with
+`update:update_hold`.
+
+The parity test gains a `hold` parameter and three cases. Each writes a real hold
+file under the scratch HERMES_HOME:
+- idle window + the updater's admission marker (production `admission_fence.set_hold`)
+- idle window + a live-pid `core-update/drain-hold`
+- draining window + admission marker (hold reason ordered first)
+Each case asserts that the preflight reasons equal start's refusal, that the
+start did not start, and that `update:update_hold` comes first.
+
+The quiet-hold CLI half (exit 78, no lease, no last-started.json under a hold)
+already landed on main in eb03eb9fea
+(`test_preflight_refuses_under_a_drain_or_admission_hold_even_with_an_idle_window`,
+review finding M4, the same mutation). This commit does not duplicate it.
+
+Proof (scripts/run_tests.sh tests/gateway/test_quiet_control.py
+tests/hermes_cli/test_kanban_quiet.py, worker-2):
+- GREEN at head: 81 passed, 0 failed, 0 skipped.
+- RED with M2c applied by exact anchor: 5 failed and 76 passed. The failures are
+  the 3 new parity cases (preflight `[]` vs start `['update:update_hold', ...]`)
+  plus the 2 eb03eb9fea quiet-hold cases.
+- scripts/check --base origin/main: 20 checks ok.
+
+Test-only; no production change.
+---
+ tests/gateway/test_quiet_control.py | 26 +++++++++++++++++++++++---
+ 1 file changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/tests/gateway/test_quiet_control.py b/tests/gateway/test_quiet_control.py
+index e177ec3f4e..afdf8bc7be 100644
+--- a/tests/gateway/test_quiet_control.py
++++ b/tests/gateway/test_quiet_control.py
+@@ -22,6 +22,7 @@ from gateway.control_socket import GatewayControlServer
+ from gateway.run import GatewayRunner
+ from gateway.runtime_ownership import ProfileOwnership
+ from gateway.turn_lease import SessionTurnLeaseRegistry
++from hermes_cli import admission_fence
+ from hermes_cli import kanban_deploy_window as window
+ from hermes_cli import code_attestation
+ from hermes_cli import local_work
+@@ -234,18 +235,37 @@ def test_start_refused_on_update_markers(env):
+     assert "update:update_window_unavailable" in ok(env, "quiet-observe-start", start_params(env))["reasons"]
+ 
+ 
+-@pytest.mark.parametrize("state, age", [("draining", 0), ("batching", 0), ("idle", 500), ("idle", 0), (None, 0)])
+-def test_start_preflight_matches_the_start_refusal_from_host_files(env, state, age):
++def write_update_hold(root, kind):
++    """A real core-update hold file: the updater's admission marker, or a live-pid drain hold."""
++    if kind == "admission":
++        admission_fence.set_hold(root)
++    else:
++        path = root / "core-update" / "drain-hold"
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(json.dumps({"pid": os.getpid(), "started_at": time.time(), "max_s": 600}))
++
++
++@pytest.mark.parametrize("state, age, hold", [
++    ("draining", 0, None), ("batching", 0, None), ("idle", 500, None), ("idle", 0, None), (None, 0, None),
++    # #2591 M2c: a hold alone (fresh idle window) must refuse here too, or quiet-hold spends its cooldown
++    # on a start the gateway then refuses; with a draining window the hold reason still comes first.
++    ("idle", 0, "admission"), ("idle", 0, "drain"), ("draining", 0, "admission"),
++])
++def test_start_preflight_matches_the_start_refusal_from_host_files(env, state, age, hold):
+     """quiet-hold's lease-free preflight reads the same files, with the same spellings, as start."""
+     attest(env)
+     if state is None:
+         os.unlink(window.window_path())
+     else:
+         write_window(env.root, state, age=age)
++    if hold is not None:
++        write_update_hold(env.root, hold)
+     result = ok(env, "quiet-observe-start", start_params(env))
+     refused = result["reasons"] if result["phase"] != "started" else []
+     assert quiet_control.start_preflight_reasons(margin_s=0) == refused
+-    assert (result["phase"] == "started") == (state == "idle" and age == 0)
++    assert (result["phase"] == "started") == (state == "idle" and age == 0 and hold is None)
++    if hold is not None:
++        assert refused[0] == "update:update_hold", refused
+ 
+ 
+ def test_start_preflight_margin_refuses_a_window_about_to_go_stale(env):
+-- 
+2.43.0
+

@@ -1,0 +1,109 @@
+From 3dcf124e16d2cc041c881babceb45de78d722ebe Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:42:20 +0000
+Subject: [PATCH] [daveey] Test PID memo retention and sweeper shutdown cleanup
+
+Pin a fixed 600-key churn workload and 256-entry retention budget for both path and probe identity. Exercise the real sweep through normal stop and exceptional wait exit, verifying observer connections close and lease release remains intact.
+
+Proof: canonical focused three-file suite 72 passed, zero skips. Isolated HOME/HERMES_HOME mutation baseline 72 passed; pid-bound and loop-stop-release each killed by two new cases. scripts/check --base origin/main passed. No production changes.
+---
+ tests/gateway/test_status_pid_memo.py         | 16 ++++++
+ .../test_producer_admission_gate.py           | 55 +++++++++++++++++++
+ 2 files changed, 71 insertions(+)
+
+diff --git a/tests/gateway/test_status_pid_memo.py b/tests/gateway/test_status_pid_memo.py
+index b8dd169851..a422478007 100644
+--- a/tests/gateway/test_status_pid_memo.py
++++ b/tests/gateway/test_status_pid_memo.py
+@@ -136,6 +136,22 @@ def test_answers_are_not_shared_across_probes(files, alive):
+     assert (a.calls, b.calls) == (1, 1)
+ 
+ 
++@pytest.mark.parametrize("distinct", ["paths", "probes"])
++def test_memo_retention_is_bounded_under_key_churn(files, distinct):
++    """Profile/probe churn must not retain unbounded paths or callable objects."""
++    shared = _Probe(None)
++    # Fixed workload and budget: changing the production cap must not resize this test.
++    for n in range(600):
++        path = files.with_name(f"profile-{n}.pid") if distinct == "paths" else files
++        probe = _Probe(None) if distinct == "probes" else shared
++        before = probe.calls
++        assert memo.running_pid(path, probe=probe, now=0) is None
++        assert probe.calls == before + 1
++        assert memo.running_pid(path, probe=probe, now=1) is None
++        assert probe.calls == before + 1, "bounding retention must preserve immediate reuse"
++        assert 0 < len(memo._memo) <= 256, "retain at most 256 distinct path/probe keys"
++
++
+ def test_profiles_check_gateway_running_uses_the_memo(tmp_path, monkeypatch, alive):
+     from hermes_cli import profiles
+     calls = []
+diff --git a/tests/tui_gateway/test_producer_admission_gate.py b/tests/tui_gateway/test_producer_admission_gate.py
+index e0a2f70da4..9042e697f3 100644
+--- a/tests/tui_gateway/test_producer_admission_gate.py
++++ b/tests/tui_gateway/test_producer_admission_gate.py
+@@ -208,6 +208,61 @@ def test_lease_loss_closes_the_observers(sdb):
+     assert delivery._observers == {}, "another process sweeps now: this one must hold no store fds"
+ 
+ 
++@pytest.mark.parametrize("exit_mode", ["stop", "wait_error"])
++def test_loop_exit_closes_observer_connections_and_releases_lease(sdb, monkeypatch, exit_mode):
++    import sqlite3
++    import threading
++
++    from hermes_cli import host_loop_lease
++
++    connections = []
++    released = []
++    beats = []
++
++    class _Lease:
++        def held(self):
++            return True
++
++        def beat(self):
++            beats.append(True)
++
++        def release(self):
++            released.append(True)
++
++    class _Stop(threading.Event):
++        waits = 0
++
++        def wait(self, timeout=None):
++            self.waits += 1
++            if self.waits == 1:
++                return False  # no wall-clock delay before the real first pass
++            assert self.waits == 2, "shutdown must not run another sweep"
++            assert delivery._observers and delivery._last_pass
++            connections.extend(entry[1] for entry in delivery._observers.values())
++            for conn in connections:
++                assert conn.execute("SELECT 1").fetchone()[0] == 1
++            if exit_mode == "wait_error":
++                raise RuntimeError("injected wait failure")
++            self.set()
++            return True
++
++    monkeypatch.setattr(host_loop_lease, "HostLoopLease", lambda *a, **kw: _Lease())
++    monkeypatch.setattr(host_loop_lease, "process_role", lambda: "test")
++    stop = _Stop()
++    if exit_mode == "wait_error":
++        with pytest.raises(RuntimeError, match="injected wait failure"):
++            delivery._loop(stop)
++    else:
++        delivery._loop(stop)
++        assert stop.is_set()
++    assert beats == [True] and released == [True]
++    assert connections, "exercise actual observers opened by the real sweep"
++    assert delivery._observers == {} and delivery._last_pass == {}
++    for conn in connections:
++        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
++            conn.execute("SELECT 1")
++
++
+ def test_unreadable_store_takes_the_full_path(sdb, opens, monkeypatch):
+     def _broken(path):
+         raise OSError("observer unavailable")
+-- 
+2.43.0
+

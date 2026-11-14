@@ -1,0 +1,257 @@
+From 3ca96173afd92ea280265f56bf321577e005d57b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 19:21:54 +0000
+Subject: [PATCH] [daveey] lifecycle guard: a bare `cat` relays its stdin feed;
+ a subshell's redirection keeps its output
+
+A `cat` with no file operand (or a `-` operand) writes the stdin it is fed, but
+`_cat_operands` only named its operands and its own `<` redirections. These ran a
+lifecycle script the guard never opened (scan_gateway_lifecycle -> (False, None) on main
+0068f2ca86):
+
+- `cat r.sh | cat | bash`, `cat r.sh | (cat) | bash`, `cat r.sh | { cat; } | bash`
+- `{ cat; } < r.sh | bash`, `(cat) < r.sh | bash` (PR #2442 review)
+
+Fix: `_cat_relays_stdin` (cron/lifecycle_guard.py) says whether an executed `cat` reads its
+feed: no file operand or a `-` one, and no fd-0 redirection, heredoc or here-string of its
+own (`<&0` keeps the feed). `_LineWalk.flush` adds the segment's feed to what it writes when
+so. `cat r.sh | cat x.txt | bash`, `cat r.sh | cat < clean.sh | bash` and
+`{ cat; } < clean.sh | bash` stay allowed. The check only runs when there is a feed, so
+the 8000-line heredoc perf case keeps its base timing (~1.6 s).
+
+Also fixed (same family, found while testing `(cat) < r.sh`): words after a subshell's `)`
+(`) < f`, `) 2>/dev/null`) flushed as a segment that wrote nothing and overwrote the
+subshell's output, so `(cat r.sh) 2>/dev/null | bash` failed open. `)` now records the
+group's output as `closed`, like a `}` closer does.
+
+Not covered here: `cat r.sh 2>&1 | bash` still fails open because the tokenizer splits
+`2>&1` into a background `&`; follow-up t_01a1d655f3e69b6e.
+
+Tests: tests/cron/test_lifecycle_guard_cat_relay.py, 34 cases; on base 22 fail / 12 pass,
+at head 34 pass. tests/cron/test_lifecycle*.py 826 passed; tests/cron 2743 passed,
+9 skipped (scripts/run_tests.sh).
+
+Card: t_01a1d5c442ed5fc9
+---
+ cron/lifecycle_guard.py                      | 24 ++++-
+ cron/lifecycle_guard_groups.py               | 21 +++--
+ tests/cron/test_lifecycle_guard_cat_relay.py | 94 ++++++++++++++++++++
+ 3 files changed, 132 insertions(+), 7 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_cat_relay.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index c6631a90e3..4cfc96a0ca 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -834,7 +834,8 @@ def _iter_segment_contexts(
+         return _opens_call_arguments(segment) and alias_names.isdisjoint(segment)
+     for tokens in _iter_command_token_lists(command):
+         yield from iter_line_segment_contexts(
+-            tokens, cat_operands=_cat_operands, opens_call_arguments=opens_call,
++            tokens, cat_operands=_cat_operands, cat_relays_stdin=_cat_relays_stdin,
++            opens_call_arguments=opens_call,
+             peel_reserved_words=_peel_reserved_words,
+             stdin_redirections=lambda words: _split_redirections(words)[1])
+ 
+@@ -961,6 +962,27 @@ def _cat_operands(segment: Optional[list[str]]) -> list[str]:
+     return []
+ 
+ 
++def _cat_relays_stdin(segment: list[str]) -> bool:
++    """Whether a ``cat`` segment writes the stdin it is fed (``… | cat | bash``, ``{ cat; } <
++    f``): no file operand or a ``-`` one, and no redirection, heredoc or here-string of its own
++    on fd 0 (``cat < x``, ``cat <<< x`` and ``cat x.txt`` ignore the feed)."""
++    for view in _command_segment_views(segment):
++        index = _executed_command_index(view)
++        if index is not None and _executable_name(view[index]) == "cat":
++            words, arguments = iter(view[index + 1 :]), []
++            for word in words:
++                match = _REDIRECTION.match(word)
++                if match is None:
++                    arguments.append(word)
++                    continue
++                fd, operator, target = match.groups()
++                target = target or next(words, "")
++                if fd in ("", "0") and operator.startswith("<") and (operator, target) != ("<&", "0"):
++                    return False  # `cat < x`, `cat <<< x`, `cat <&3` read their own stdin
++            return "-" in arguments or all(argument.startswith("-") for argument in arguments)
++    return False
++
++
+ def contains_launchctl_submit_command(command: str) -> bool:
+     """Detect an executed ``launchctl submit``/``bootstrap``, not quoted text.
+ 
+diff --git a/cron/lifecycle_guard_groups.py b/cron/lifecycle_guard_groups.py
+index a8c6b86886..4704f8dffb 100644
+--- a/cron/lifecycle_guard_groups.py
++++ b/cron/lifecycle_guard_groups.py
+@@ -90,9 +90,10 @@ def _substituted_variants(segment: list[str], subs: list[tuple[int, list[str]]])
+ class _LineWalk:
+     """State of one line's walk; ``contexts`` yields ``(segment, call_argument, piped_files)``."""
+ 
+-    def __init__(self, cat_operands, opens_call_arguments, peel_reserved_words, stdin_redirections,
+-                 redirected: Optional[dict[int, list[str]]] = None) -> None:
++    def __init__(self, cat_operands, cat_relays_stdin, opens_call_arguments, peel_reserved_words,
++                 stdin_redirections, redirected: Optional[dict[int, list[str]]] = None) -> None:
+         self.cat_operands = cat_operands
++        self.cat_relays_stdin = cat_relays_stdin
+         self.opens_call_arguments = opens_call_arguments
+         self.peel_reserved_words = peel_reserved_words
+         self.stdin_redirections = stdin_redirections
+@@ -140,6 +141,9 @@ class _LineWalk:
+         for variant in _substituted_variants(self.segment, self.subs):
+             yield variant, self.call_argument, self.feed
+             written += self.cat_operands(variant)
++            # A bare `cat` (or `cat -`) writes what it is fed: `cat f | cat | bash`, `{ cat; } < f`.
++            if self.feed and self.cat_relays_stdin(variant):
++                written += self.feed
+         self.pending = self.closed if self.closed is not None else written
+         self.closed = None
+         self.segment, self.subs = [], []
+@@ -188,7 +192,7 @@ class _LineWalk:
+             and self.opens_call_arguments(self.segment)
+         if self.segment:
+             yield from self.flush()
+-        self.closing = None
++        self.closing = self.closed = None
+         if operator in ("|", "|&"):
+             self.feed, self.pending = self.pending, []
+         elif operator == "(":
+@@ -200,7 +204,9 @@ class _LineWalk:
+                 if group.outer is not None:
+                     self.resume(group)
+                     return
+-                self.pending = group.output
++                # Its redirections (`) < f`, `) 2>/dev/null`) flush as a segment of their own,
++                # which writes what the group wrote.
++                self.pending = self.closed = group.output
+                 self.closing = (group.ordinal, 0)
+             self.feed = self.enclosing_feed()
+         self.call_argument = next_is_call
+@@ -222,18 +228,21 @@ class _LineWalk:
+ def iter_line_segment_contexts(
+     tokens: list[str], *,
+     cat_operands: Callable[[Optional[list[str]]], list[str]],
++    cat_relays_stdin: Callable[[list[str]], bool],
+     opens_call_arguments: Callable[[list[str]], bool],
+     peel_reserved_words: Callable[[list[str]], int],
+     stdin_redirections: Callable[[list[str]], list[str]],
+ ) -> Iterator[Context]:
+     """``(segment, call_argument, piped_files)`` for one line's shell *tokens* (see
+     ``cron.lifecycle_guard._iter_segment_contexts``). *cat_operands* names the files a segment
+-    writes to its stdout; *stdin_redirections* the files some words redirect to stdin.
++    writes to its stdout, *cat_relays_stdin* whether it also writes the feed on its stdin (a
++    bare ``cat``); *stdin_redirections* the files some words redirect to stdin.
+ 
+     A group's own redirection follows its closer, after its commands were read, so the line is
+     walked twice: the first walk only collects those redirections, the second feeds each group
+     from its own. Both walks open the same groups in the same order: feeds never change that."""
+-    callables = (cat_operands, opens_call_arguments, peel_reserved_words, stdin_redirections)
++    callables = (cat_operands, cat_relays_stdin, opens_call_arguments, peel_reserved_words,
++                 stdin_redirections)
+     probe = _LineWalk(*callables)
+     for _ in _walk(probe, tokens):
+         pass
+diff --git a/tests/cron/test_lifecycle_guard_cat_relay.py b/tests/cron/test_lifecycle_guard_cat_relay.py
+new file mode 100644
+index 0000000000..a803a2eb59
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_cat_relay.py
+@@ -0,0 +1,94 @@
++"""A bare ``cat`` relays the stdin it is fed (t_01a1d5c442ed5fc9, PR #2442 review).
++
++``cat`` with no file operand, or with a ``-`` one, writes its own stdin. The guard named only a
++``cat``'s operands and its own ``<`` redirections, never the feed a pipe or an enclosing group
++gives it, so ``cat f.sh | cat | bash`` and ``{ cat; } < f.sh | bash`` ran a lifecycle script the
++guard never opened. A ``cat`` that reads a file operand (``cat x.txt``) or its own redirection,
++heredoc or here-string ignores the feed.
++
++A subshell's own redirection (``(cat f.sh) 2>/dev/null | bash``, ``(cat) < f.sh | bash``) also
++dropped what the subshell wrote: the words after ``)`` flushed as a segment that wrote nothing.
++"""
++
++from __future__ import annotations
++
++import shlex
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++
++# Assembled so this file's own text never carries the literal command.
++LIFECYCLE = " ".join(["hermes", "gateway", "re" + "start"])
++
++
++@pytest.fixture
++def files(tmp_path) -> dict[str, str]:
++    sh = tmp_path / "r.sh"
++    sh.write_text(f"#!/bin/sh\necho hi\n{LIFECYCLE}\n", encoding="utf-8")
++    py = tmp_path / "r.py"
++    py.write_text(f"import os\nos.system({LIFECYCLE!r})\n", encoding="utf-8")
++    clean_sh = tmp_path / "clean.sh"
++    clean_sh.write_text("echo ok\n", encoding="utf-8")
++    return {name: shlex.quote(str(path)) for name, path in
++            {"sh": sh, "py": py, "clean_sh": clean_sh}.items()}
++
++
++@pytest.mark.parametrize(
++    "template",
++    [
++        # A pipe feeds a bare `cat`.
++        "cat {sh} | cat | bash",
++        "cat {sh} | cat | cat | bash",
++        "cat {sh} | cat - | bash",
++        "cat {sh} | cat -u | bash",
++        "cat {sh} | cat - {clean_sh} | bash",
++        "cat {sh} | cat {clean_sh} - | bash",
++        "cat {sh} | cat 2>/dev/null | bash",
++        "cat {sh} | /bin/cat | bash",
++        "cat {py} | cat | python3",
++        "cat {sh} | (cat) | bash",
++        "cat {sh} | {{ cat; }} | bash",
++        "cat {sh} | {{ true; cat; }} | bash",
++        "bash < <(cat {sh} | cat)",
++        # A group's own redirection feeds a bare `cat` inside it.
++        "{{ cat; }} < {sh} | bash",
++        "{{ cat -; }} < {sh} | bash",
++        "(cat) < {sh} | bash",
++        "( cat ) <{sh} | bash",
++        "{{ cat; }} < {py} | python3",
++        # A file redirected to the pipeline's first `cat` still flows through the next one.
++        "cat < {sh} | cat | bash",
++        # A subshell's own redirection keeps what the subshell wrote (it was dropped).
++        "(cat {sh}) 2>/dev/null | bash",
++        "(cat {sh}) < /dev/null | bash",
++        "( {{ cat {sh}; }} ) 2>/dev/null | bash",
++    ],
++)
++def test_bare_cat_relays_its_feed(files, template):
++    assert scan_gateway_lifecycle(template.format(**files)) == (True, None)
++
++
++@pytest.mark.parametrize(
++    "template",
++    [
++        # A file operand without `-`: the feed is ignored.
++        "cat {sh} | cat {clean_sh} | bash",
++        "cat {sh} | cat -- {clean_sh} | bash",
++        # Its own redirection, heredoc or here-string replaces the feed.
++        "cat {sh} | cat < {clean_sh} | bash",
++        "cat {sh} | cat <<< 'echo ok' | bash",
++        "cat {sh} | cat 0< {clean_sh} | bash",
++        # Clean feeds stay allowed (PR #2442 pins the group form).
++        "{{ cat; }} < {clean_sh} | bash",
++        "(cat) < {clean_sh} | bash",
++        "cat {clean_sh} | cat | bash",
++        # The feed reaches no program reader.
++        "cat {sh} | cat",
++        "cat {sh} | cat | wc -l",
++        "(cat {sh}) 2>/dev/null; bash",
++        "(cat {clean_sh}) 2>/dev/null | bash",
++    ],
++)
++def test_cat_that_ignores_or_keeps_its_feed_stays_allowed(files, template):
++    assert scan_gateway_lifecycle(template.format(**files)) == (False, None)
+-- 
+2.43.0
+

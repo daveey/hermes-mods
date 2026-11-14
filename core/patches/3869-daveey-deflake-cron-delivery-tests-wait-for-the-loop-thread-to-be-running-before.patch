@@ -1,0 +1,281 @@
+From ca41cf546f556ec6c623e21f8374606925ef6ecf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:04:26 +0000
+Subject: [PATCH] [daveey] deflake cron delivery tests: wait for the loop
+ thread to be running before delivering
+
+test_partial_split_delivery_is_not_resent_by_standalone flaked on CI (run 43498034019, job
+132136563277): "Expected send to have been awaited once. Awaited 0 times."
+
+Why: the test started `loop.run_forever` on a daemon thread and called `_deliver_result` at once.
+`_prepare_target_delivery` takes the live-adapter lane only when `loop.is_running()` is already
+True; on a CPU-throttled runner the loop thread had not reached run_forever yet, so delivery went
+down the standalone lane and the live adapter was never awaited. The two sibling tests in
+TestDeliverResultTimeoutCancelsFuture start their loop the same way (the in-flight one fails the same
+way under the same delay).
+
+Fix (test-only): `_start_running_loop()` schedules an Event-setting callback before starting the
+thread and waits (30 s hang bound, returns at once normally) until run_forever has run it, i.e.
+after is_running() flips. All three tests use it. Both live-loop classes
+(TestDeliverResultTimeoutCancelsFuture, TestDeliverResultPartialSplitDelivery) move unchanged otherwise
+to tests/cron/test_scheduler_live_loop_delivery.py to keep test_scheduler.py under its size ratchet.
+
+Proof: a pytest plugin that sleeps 0.2 s at the top of BaseEventLoop.run_forever (the descheduled
+loop thread) reproduces the exact CI assertion on the old tests (2 failed, 1 passed) and passes
+3/3 with the fix; tests/cron/test_scheduler.py + the new file 90 passed; ruff clean.
+
+Card: t_01a1d69a5c176221
+---
+ tests/cron/test_scheduler.py                  | 105 ---------------
+ .../cron/test_scheduler_live_loop_delivery.py | 123 ++++++++++++++++++
+ 2 files changed, 123 insertions(+), 105 deletions(-)
+ create mode 100644 tests/cron/test_scheduler_live_loop_delivery.py
+
+diff --git a/tests/cron/test_scheduler.py b/tests/cron/test_scheduler.py
+index b032ffc70e..d4edec3321 100644
+--- a/tests/cron/test_scheduler.py
++++ b/tests/cron/test_scheduler.py
+@@ -1792,111 +1792,6 @@ class TestParallelTick:
+         start_s2 = next(t for action, jid, t in call_times if action == "start" and jid == "s2")
+         assert start_s2 >= end_s1, "Jobs ran concurrently despite max_parallel=1"
+ 
+-class TestDeliverResultTimeoutCancelsFuture:
+-    """When the live adapter's confirmation outlasts the wait, the outcome depends on whether the
+-    send had STARTED on the gateway loop. Started: it is in flight (a paced multi-chunk send can
+-    legitimately outlast the wait) — leave it running and skip the standalone fallback, which would
+-    duplicate it (#38922). Never started (wedged loop): nothing was sent, so fall through to
+-    standalone or the message is silently dropped. ``future.cancel()`` cannot tell the two apart:
+-    a run_coroutine_threadsafe future stays PENDING until done, so cancel() returns True mid-send
+-    and kills it — these tests drive a real loop for that reason.
+-    """
+-
+-    def _deliver(self, monkeypatch, adapter, loop):
+-        from cron import scheduler_delivery
+-        from gateway.config import Platform
+-
+-        pconfig = MagicMock()
+-        pconfig.enabled = True
+-        mock_cfg = MagicMock()
+-        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+-        monkeypatch.setattr(scheduler_delivery, "_LIVE_SEND_CONFIRM_TIMEOUT_SECS", 0.3)
+-        job = {"id": "timeout-job", "deliver": "origin", "origin": {"platform": "telegram", "chat_id": "123"}}
+-        standalone_send = AsyncMock(return_value={"success": True})
+-        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+-             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+-             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+-            result = _deliver_result(job, "Hello world", adapters={Platform.TELEGRAM: adapter}, loop=loop)
+-        return result, standalone_send
+-
+-    def test_in_flight_send_outlasting_the_wait_keeps_running_and_is_not_duplicated(self, monkeypatch):
+-        import asyncio
+-        import threading
+-        import time
+-
+-        loop = asyncio.new_event_loop()
+-        threading.Thread(target=loop.run_forever, daemon=True).start()
+-        events = []
+-
+-        async def slow_send(chat_id, content, **_kw):
+-            events.append("started")
+-            await asyncio.sleep(0.6)  # outlasts the 0.3s confirmation wait
+-            events.append("finished")
+-            return MagicMock(success=True, message_id="m1", raw_response=None)
+-
+-        adapter = MagicMock()
+-        adapter.send = slow_send
+-        try:
+-            result, standalone_send = self._deliver(monkeypatch, adapter, loop)
+-            time.sleep(0.6)
+-        finally:
+-            loop.call_soon_threadsafe(loop.stop)
+-        assert result is None, f"expected the in-flight send to count as delivered, got {result!r}"
+-        standalone_send.assert_not_awaited()
+-        assert events == ["started", "finished"], "the in-flight send must not be cancelled mid-way"
+-
+-    def test_send_that_never_started_falls_back_to_standalone(self, monkeypatch):
+-        import asyncio
+-        import threading
+-        import time
+-
+-        loop = asyncio.new_event_loop()
+-        threading.Thread(target=loop.run_forever, daemon=True).start()
+-        loop.call_soon_threadsafe(time.sleep, 0.8)  # wedge the running loop past the 0.3s wait
+-        adapter = MagicMock()
+-        adapter.send = AsyncMock(return_value=MagicMock(success=True))
+-        try:
+-            result, standalone_send = self._deliver(monkeypatch, adapter, loop)
+-            time.sleep(0.8)  # the loop un-wedges: the abandoned send must still never go out
+-        finally:
+-            loop.call_soon_threadsafe(loop.stop)
+-        assert result is None, f"standalone should have delivered, got {result!r}"
+-        standalone_send.assert_awaited_once()
+-        adapter.send.assert_not_awaited()
+-
+-class TestDeliverResultPartialSplitDelivery:
+-    def test_partial_split_delivery_is_not_resent_by_standalone(self):
+-        """A split send that failed after delivering its head must not fall through to standalone,
+-        which would deliver the whole payload again; the run reports the partial failure instead."""
+-        import asyncio
+-        import threading
+-        from gateway.config import Platform
+-        from gateway.platforms.base import SendResult
+-
+-        loop = asyncio.new_event_loop()
+-        threading.Thread(target=loop.run_forever, daemon=True).start()
+-        adapter = MagicMock()
+-        adapter.splits_long_messages = True
+-        adapter.send = AsyncMock(return_value=SendResult(
+-            success=False, error="Twilio 400: rejected",
+-            raw_response={"partial_overflow": True, "delivered_chunks": 2, "total_chunks": 5}))
+-        pconfig = MagicMock()
+-        pconfig.enabled = True
+-        mock_cfg = MagicMock()
+-        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+-        job = {"id": "partial-job", "deliver": "origin", "origin": {"platform": "telegram", "chat_id": "123"}}
+-        standalone_send = AsyncMock(return_value={"success": True})
+-        try:
+-            with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+-                 patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+-                 patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+-                result = _deliver_result(job, "Hello world", adapters={Platform.TELEGRAM: adapter}, loop=loop)
+-        finally:
+-            loop.call_soon_threadsafe(loop.stop)
+-        adapter.send.assert_awaited_once()
+-        standalone_send.assert_not_awaited()
+-        assert result and "delivered 2 of 5 chunks" in result, result
+-
+ 
+ class TestDeliverResultLiveAdapterUnconfirmed:
+     """Regression for #47056.
+diff --git a/tests/cron/test_scheduler_live_loop_delivery.py b/tests/cron/test_scheduler_live_loop_delivery.py
+new file mode 100644
+index 0000000000..e67996641e
+--- /dev/null
++++ b/tests/cron/test_scheduler_live_loop_delivery.py
+@@ -0,0 +1,123 @@
++"""cron._deliver_result against a real gateway event loop on a thread: live-send timeout and
++partial split delivery (moved from test_scheduler.py)."""
++
++import asyncio
++from unittest.mock import AsyncMock, MagicMock, patch
++
++from cron.scheduler import _deliver_result
++
++
++class TestDeliverResultTimeoutCancelsFuture:
++    """When the live adapter's confirmation outlasts the wait, the outcome depends on whether the
++    send had STARTED on the gateway loop. Started: it is in flight (a paced multi-chunk send can
++    legitimately outlast the wait) — leave it running and skip the standalone fallback, which would
++    duplicate it (#38922). Never started (wedged loop): nothing was sent, so fall through to
++    standalone or the message is silently dropped. ``future.cancel()`` cannot tell the two apart:
++    a run_coroutine_threadsafe future stays PENDING until done, so cancel() returns True mid-send
++    and kills it — these tests drive a real loop for that reason.
++    """
++
++    def _deliver(self, monkeypatch, adapter, loop):
++        from cron import scheduler_delivery
++        from gateway.config import Platform
++
++        pconfig = MagicMock()
++        pconfig.enabled = True
++        mock_cfg = MagicMock()
++        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
++        monkeypatch.setattr(scheduler_delivery, "_LIVE_SEND_CONFIRM_TIMEOUT_SECS", 0.3)
++        job = {"id": "timeout-job", "deliver": "origin", "origin": {"platform": "telegram", "chat_id": "123"}}
++        standalone_send = AsyncMock(return_value={"success": True})
++        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
++             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
++             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
++            result = _deliver_result(job, "Hello world", adapters={Platform.TELEGRAM: adapter}, loop=loop)
++        return result, standalone_send
++
++    def test_in_flight_send_outlasting_the_wait_keeps_running_and_is_not_duplicated(self, monkeypatch):
++        import asyncio
++        import time
++
++        loop = _start_running_loop()
++        events = []
++
++        async def slow_send(chat_id, content, **_kw):
++            events.append("started")
++            await asyncio.sleep(0.6)  # outlasts the 0.3s confirmation wait
++            events.append("finished")
++            return MagicMock(success=True, message_id="m1", raw_response=None)
++
++        adapter = MagicMock()
++        adapter.send = slow_send
++        try:
++            result, standalone_send = self._deliver(monkeypatch, adapter, loop)
++            time.sleep(0.6)
++        finally:
++            loop.call_soon_threadsafe(loop.stop)
++        assert result is None, f"expected the in-flight send to count as delivered, got {result!r}"
++        standalone_send.assert_not_awaited()
++        assert events == ["started", "finished"], "the in-flight send must not be cancelled mid-way"
++
++    def test_send_that_never_started_falls_back_to_standalone(self, monkeypatch):
++        import time
++
++        loop = _start_running_loop()
++        loop.call_soon_threadsafe(time.sleep, 0.8)  # wedge the running loop past the 0.3s wait
++        adapter = MagicMock()
++        adapter.send = AsyncMock(return_value=MagicMock(success=True))
++        try:
++            result, standalone_send = self._deliver(monkeypatch, adapter, loop)
++            time.sleep(0.8)  # the loop un-wedges: the abandoned send must still never go out
++        finally:
++            loop.call_soon_threadsafe(loop.stop)
++        assert result is None, f"standalone should have delivered, got {result!r}"
++        standalone_send.assert_awaited_once()
++        adapter.send.assert_not_awaited()
++
++
++def _start_running_loop():
++    """Start a fresh event loop on a daemon thread and return it once ``loop.is_running()`` holds.
++
++    ``_deliver_result`` takes the live-adapter lane only when the loop is already running; a bare
++    ``Thread(target=loop.run_forever).start()`` returns before that, so a descheduled loop thread
++    sent the test down the standalone lane on a CPU-throttled runner.
++    """
++    import threading
++
++    loop = asyncio.new_event_loop()
++    running = threading.Event()
++    loop.call_soon(running.set)  # the first callback run_forever runs, after is_running() flips
++    threading.Thread(target=loop.run_forever, daemon=True).start()
++    assert running.wait(timeout=30), "event loop thread never started running"
++    return loop
++
++
++class TestDeliverResultPartialSplitDelivery:
++    def test_partial_split_delivery_is_not_resent_by_standalone(self):
++        """A split send that failed after delivering its head must not fall through to standalone,
++        which would deliver the whole payload again; the run reports the partial failure instead."""
++        from gateway.config import Platform
++        from gateway.platforms.base import SendResult
++
++        loop = _start_running_loop()
++        adapter = MagicMock()
++        adapter.splits_long_messages = True
++        adapter.send = AsyncMock(return_value=SendResult(
++            success=False, error="Twilio 400: rejected",
++            raw_response={"partial_overflow": True, "delivered_chunks": 2, "total_chunks": 5}))
++        pconfig = MagicMock()
++        pconfig.enabled = True
++        mock_cfg = MagicMock()
++        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
++        job = {"id": "partial-job", "deliver": "origin", "origin": {"platform": "telegram", "chat_id": "123"}}
++        standalone_send = AsyncMock(return_value={"success": True})
++        try:
++            with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
++                 patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
++                 patch("tools.send_message_tool._send_to_platform", new=standalone_send):
++                result = _deliver_result(job, "Hello world", adapters={Platform.TELEGRAM: adapter}, loop=loop)
++        finally:
++            loop.call_soon_threadsafe(loop.stop)
++        adapter.send.assert_awaited_once()
++        standalone_send.assert_not_awaited()
++        assert result and "delivered 2 of 5 chunks" in result, result
+-- 
+2.43.0
+

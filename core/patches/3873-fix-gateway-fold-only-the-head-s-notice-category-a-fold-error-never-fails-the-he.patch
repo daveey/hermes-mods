@@ -1,0 +1,198 @@
+From 2c34b9880aa3162a4c79300d821ea5fb4c544e23 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:08:29 +0000
+Subject: [PATCH] fix(gateway): fold only the head's notice category; a fold
+ error never fails the head [daveey]
+
+Review of PR #2618 @13528111d8 (t_01a1d6ad832d5bfa):
+- B1: a result completion folded behind a diagnostic head was muted with that
+  turn under display.suppress_warning_notifications and still settled 'steered'.
+  fold_pending now joins only rows of the head's notification_category (the
+  admission fold's rule, session_automation._waiting_completion).
+- An unexpected (non-RuntimeStoreError) scan/check/transfer error stops folding
+  instead of escaping execute_admission and failing the head; a maybe-committed
+  transfer keeps its undelivered fence so settlement requeues it (as steer_queued).
+
+RED at 13528111d8: test_a_result_never_folds_into_a_diagnostic_turn and
+test_an_unexpected_fold_error_never_fails_the_head fail; GREEN here. 201 files
+importing the touched modules: 1956 passed.
+---
+ gateway/session_fold_pending.py               | 38 ++++++++--
+ tests/gateway/test_fold_pending_admissions.py | 73 ++++++++++++++++++-
+ 2 files changed, 103 insertions(+), 8 deletions(-)
+
+diff --git a/gateway/session_fold_pending.py b/gateway/session_fold_pending.py
+index 9ee8acb91b..8a54bf6148 100644
+--- a/gateway/session_fold_pending.py
++++ b/gateway/session_fold_pending.py
+@@ -55,11 +55,20 @@ def accepts_fold(row):
+     return bool(row.get('update_resume')) or (bool(_automation(payload)) and _producer(row) in FOLDABLE_PRODUCERS)
+ 
+ 
+-def _foldable(row):
++def _category(row):
++    return _automation(row['payload']).get('notification_category', 'result')
++
++
++def _foldable(row, category):
+     payload = row['payload']
+     descriptor = _automation(payload)
+     if not descriptor or _producer(row) not in FOLDABLE_PRODUCERS or not isinstance(payload.get('text'), str):
+         return False
++    # The turn's mute is the head's (a diagnostic wake hides its turn when warnings are off): a result
++    # folded into a muted turn would settle 'steered' unseen, so only the head's own category joins it
++    # (the admission fold's rule, ``session_automation._waiting_completion``).
++    if descriptor.get('notification_category', 'result') != category:
++        return False
+     # A remote Kanban notice is acked by the keys its own turn's user row carries: it keeps its own turn.
+     return not descriptor.get('kanban_event_keys')
+ 
+@@ -69,13 +78,13 @@ def candidates(authority, ref, head):
+     producer rows (liveness ticks, loop ticks) are passed over; the first human input ends the scan, so a
+     notice never jumps a prompt queued before it."""
+     from gateway.session_notifier_drain import eligible
+-    picked = []
++    picked, category = [], _category(head)
+     for row in list_session_admissions(authority.db, session_id=ref.session_id):
+         if row['status'] != 'queued' or row['admission_id'] == head['admission_id']:
+             continue
+         if not _automation(row['payload']):
+             break
+-        if eligible(row) and _foldable(row):
++        if eligible(row) and _foldable(row, category):
+             picked.append(row)
+     return picked
+ 
+@@ -112,13 +121,24 @@ async def fold_pending(authority, ref, live, row, event):
+     from gateway.session_runtime_workers import tracked_write
+     from hermes_state_runtime import steer_session_input
+     generation, sid, taken, texts = row['generation'], ref.session_id, [], []
+-    for candidate in await asyncio.to_thread(candidates, authority, ref, row):
++    # The fold is optional: an unexpected error stops it and the head runs as it would have (never
++    # 'failed' for a row it only tried to carry). The rows not taken keep their own FIFO turns.
++    try:
++        pending = await asyncio.to_thread(candidates, authority, ref, row)
++    except Exception:
++        logger.warning('Fold scan failed; the turn runs alone: session=%s', sid, exc_info=True)
++        pending = []
++    for candidate in pending:
+         try:
+             await _check(authority, ref, live, candidate)
++            payload = dict(candidate['payload'])
++            await asyncio.to_thread(_refresh, payload)
+         except RuntimeStoreError:
+             continue  # its own claim refuses it in FIFO order
+-        payload = dict(candidate['payload'])
+-        await asyncio.to_thread(_refresh, payload)
++        except Exception:
++            logger.warning('Fold check failed; folding stops: session=%s admission=%s', sid,
++                           candidate['admission_id'], exc_info=True)
++            break
+         with live.event_stream.lock:
+             _register(authority, sid, generation, candidate['admission_id'])
+         try:
+@@ -129,6 +149,12 @@ async def fold_pending(authority, ref, live, row, event):
+             with live.event_stream.lock:
+                 _unregister(authority, sid, generation, candidate['admission_id'])
+             continue
++        except Exception:
++            # Maybe committed: the fence stays undelivered, so the claim's settlement requeues the row
++            # (a no-op when nothing committed), as ``steer_queued`` does.
++            logger.warning('Fold transfer failed; folding stops: session=%s admission=%s', sid,
++                           candidate['admission_id'], exc_info=True)
++            break
+         if not fresh:
+             continue
+         taken.append(candidate['admission_id'])
+diff --git a/tests/gateway/test_fold_pending_admissions.py b/tests/gateway/test_fold_pending_admissions.py
+index 0f5f012140..b7bb29acbd 100644
+--- a/tests/gateway/test_fold_pending_admissions.py
++++ b/tests/gateway/test_fold_pending_admissions.py
+@@ -47,9 +47,9 @@ async def _harness(tmp_path, monkeypatch, behave):
+     live = authority.sessions[ref.session_id]
+     adapter = runner._adapter_for_source(live.source)
+ 
+-    async def notice(text, producer):
++    async def notice(text, producer, metadata=None):
+         from gateway.session_automation import admit_route_wake
+-        assert await admit_route_wake(runner, adapter, live.source, text, producer) is True
++        assert await admit_route_wake(runner, adapter, live.source, text, producer, metadata) is True
+ 
+     def rows():
+         from hermes_state_runtime import list_session_admissions
+@@ -245,3 +245,72 @@ async def test_a_queued_prompt_is_never_jumped_and_never_extended(tmp_path, monk
+             '[kanban] Task t_1 blocked.', 'my question', '[IMPORTANT: Background process proc_a completed (exit 0)]']
+     finally:
+         await h.close()
++
++
++@pytest.mark.asyncio
++async def test_a_result_never_folds_into_a_diagnostic_turn(tmp_path, monkeypatch):
++    """A diagnostic head's turn is muted when warnings are hidden: a result completion folded into it would
++    settle 'steered' unseen. Only rows of the head's own notification category join it (the admission
++    fold's rule, ``session_automation._waiting_completion``); a diagnostic row joins a diagnostic head."""
++    from gateway.warning_notifications import diagnostic_wake_muted
++    gate = asyncio.Event()
++    muted = []
++
++    async def behave(n, event):
++        muted.append(diagnostic_wake_muted(event, {'display': {'suppress_warning_notifications': True}}))
++        if n == 1:
++            await gate.wait()
++        return _completed()
++
++    h = await _harness(tmp_path, monkeypatch, behave)
++    diagnostic = {'notification_category': 'diagnostic'}
++    result, d1, d2 = ('[IMPORTANT: Background process proc_a completed (exit 0)]', '[kanban] Task t_1 stale.',
++                      '[kanban] Task t_2 stale.')
++    try:
++        from tests.waiting import async_wait_until
++        await h.notice('[kanban] Task t_0 completed.', 'kanban-wake')
++        await async_wait_until(lambda: len(h.seen) == 1, timeout=10, what='the first turn')
++        await h.notice(d1, 'kanban-wake', diagnostic)
++        await h.notice(result, 'completion')
++        await h.notice(d2, 'kanban-wake', diagnostic)
++        gate.set()
++        await _idle(h, 3)
++        assert [event.text for event in h.seen][1:] == [f'{d1}\n\n{d2}', result]
++        assert muted[1:] == [True, False]
++        rows = h.rows()
++        assert [rows[text]['outcome'] for text in (d1, result, d2)] == ['completed', 'completed', 'steered']
++    finally:
++        await h.close()
++
++
++@pytest.mark.asyncio
++async def test_an_unexpected_fold_error_never_fails_the_head(tmp_path, monkeypatch):
++    """The fold is optional: a storage or check error stops folding, the head runs as it would have, and
++    the pending row keeps its own turn (nothing settles 'failed', nothing is lost)."""
++    from gateway import session_fold_pending
++    gate = asyncio.Event()
++
++    async def behave(n, event):
++        if n == 1:
++            await gate.wait()
++        return _completed()
++
++    async def broken(*args):
++        raise OSError('disk I/O error')
++
++    h = await _harness(tmp_path, monkeypatch, behave)
++    monkeypatch.setattr(session_fold_pending, '_check', broken)
++    k, result = '[kanban] Task t_1 blocked.', '[IMPORTANT: Background process proc_a completed (exit 0)]'
++    try:
++        from tests.waiting import async_wait_until
++        await h.notice('[kanban] Task t_0 completed.', 'kanban-wake')
++        await async_wait_until(lambda: len(h.seen) == 1, timeout=10, what='the first turn')
++        await h.notice(k, 'kanban-wake')
++        await h.notice(result, 'completion')
++        gate.set()
++        await _idle(h, 3)
++        assert [event.text for event in h.seen][1:] == [k, result]
++        rows = h.rows()
++        assert [rows[text]['outcome'] for text in (k, result)] == ['completed', 'completed']
++    finally:
++        await h.close()
+-- 
+2.43.0
+

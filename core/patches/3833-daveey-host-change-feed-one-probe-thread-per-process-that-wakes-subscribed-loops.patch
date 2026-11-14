@@ -1,0 +1,681 @@
+From e6cc87e2d84f7892feea84134f4b33435a63ea09 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 20:18:02 +0000
+Subject: [PATCH] =?UTF-8?q?[daveey]=20host=5Fchange=5Ffeed:=20one=20probe?=
+ =?UTF-8?q?=20thread=20per=20process=20that=20wakes=20subscribed=20loops?=
+ =?UTF-8?q?=20(card=20P,=20design=20t=5F01a1d563324d7e8e=20=C2=A76)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Design t_01a1d563324d7e8e §6/§9 (C1) names a host change-feed thread as the
+gateway's phase-2 lever: about a dozen background loops each wake on their own
+timer and probe or open their own inputs. This adds the feed itself.
+
+- One daemon thread probes, once per second, every counter of the host:
+  each local board's kanban_activity_revision content key (bookkeeping-only
+  writes do not move it), hub.db meta.cursor (the seq of the last applied
+  replica change; hub.db data_version also moves on hub bookkeeping) and
+  state.db PRAGMA data_version from a retained read-only observer.
+- Loops subscribe to topics (board:*, replica, state) and replace their sleep
+  with Subscription.wait(timeout=<own next due time>) or wait_async(...).
+  The wait returns the moved topics, or an empty set when the due time
+  passed with no change, so each loop keeps its due-time wakeups and no
+  recovery cadence is lost.
+- Fail-open: an unreadable counter (or a failing probe) is UNKNOWN, which
+  never equals anything, so its subscribers wake on every probe and run
+  their own full pass. The first probe is only the baseline.
+- Every probe is a change_feed.probe pass in loop accounting (P1).
+- Under pytest the process feed never starts its thread.
+
+Measured on hermes-hub against live data (12 topics: 10 boards, replica,
+state), 120 probes: probe CPU median 1.33 ms, max 1.72 ms, i.e. 0.13% of a
+core at 1 Hz. Over 120 s at 1 Hz, a board moved in 21 probes, the replica
+cursor in 23, state.db in 59: a subscribed loop wakes on those instead of
+on every timer tick.
+
+Wiring is staged: the loops this feed is meant for (sync, notifier,
+unloaded, remote index, links, change_watcher, session notifications) are
+being rewritten right now by phase-1 cards F, H1, H2, H3 and J, which add
+each loop's change key and due times. Each loop moves onto the feed after
+its card lands, so the two changes do not collide.
+
+Tests: tests/hermes_cli/test_host_change_feed.py (15). RED: before the
+module existed the file failed at import; a mutant that drops _notify's
+topics fails the 4 wake tests. Required cases: a subscriber is woken on
+change (thread and asyncio), and on its due time with no change.
+---
+ hermes_cli/host_change_feed.py            | 387 ++++++++++++++++++++++
+ tests/hermes_cli/test_host_change_feed.py | 226 +++++++++++++
+ 2 files changed, 613 insertions(+)
+ create mode 100644 hermes_cli/host_change_feed.py
+ create mode 100644 tests/hermes_cli/test_host_change_feed.py
+
+diff --git a/hermes_cli/host_change_feed.py b/hermes_cli/host_change_feed.py
+new file mode 100644
+index 0000000000..a446b265d8
+--- /dev/null
++++ b/hermes_cli/host_change_feed.py
+@@ -0,0 +1,387 @@
++"""One host change-feed thread per process that wakes subscribed loops (design t_01a1d563324d7e8e §6, card P). [daveey]
++
++The hub gateway runs about a dozen background loops (sync, notifier, unloaded, remote index, links refresh,
++change_watcher, session notifications, ...). Each wakes on its own timer, opens or probes its own inputs, and
++then decides whether anything moved. This module gives them one shared probe instead: a single daemon thread
++reads the host's change counters once per :data:`INTERVAL_S` and wakes only the loops subscribed to a counter
++that moved.
++
++The counters (topics):
++
++* ``board:<path>``: each local board's ``kanban_activity_revision`` content key
++  (``kanban_activity_revision.content_key``; bookkeeping-only writes such as claims, heartbeats and sync stamps
++  do not move it).
++* ``replica``: the hub replica's applied feed position, ``meta.cursor`` of hub.db. The hub client stamps it
++  with the ``seq`` of the last change it applied, so it moves on every replica row written or deleted, and on
++  nothing else (hub.db's ``data_version`` also moves on its own bookkeeping).
++* ``state``: state.db ``PRAGMA data_version`` from a retained read-only observer
++  (``tui_gateway.kanban_replica_observer``).
++
++A loop subscribes once and replaces its sleep with :meth:`Subscription.wait` (threads) or
++:meth:`Subscription.wait_async` (the gateway's asyncio loops), passing **its own next due time** as the
++timeout. ``wait`` returns the topics that moved (non-empty) or an empty set when the due time passed with no
++change, so each loop keeps every time-driven wakeup it acts on (renewals, retries, claim expiry, GC) and no
++recovery cadence is lost.
++
++**Fail-open.** A counter that cannot be read is *unknown*, and an unknown key never equals any other key, so
++its subscribers are woken on every probe while it stays unreadable and do their own full pass, as they do
++today. The first probe only sets the baseline: a loop runs its first pass on its own.
++
++Every probe is one ``change_feed.probe`` pass in loop accounting (P1): a skip when nothing moved, a change
++otherwise, with the number of moved topics as rows.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import os
++import sqlite3
++import threading
++import time
++from pathlib import Path
++from typing import Callable, Iterable, Mapping, Optional
++from urllib.parse import quote
++
++logger = logging.getLogger(__name__)
++
++INTERVAL_S = 1.0  # one probe of every counter per second
++_SLICE_S = 1.0  # waits re-check their stop condition at least this often
++
++BOARD = "board:"
++REPLICA = "replica"
++STATE = "state"
++
++
++class _Unknown:
++    """An unreadable counter: never equal to anything, itself included, so it always reads as moved."""
++
++    __slots__ = ()
++
++    def __eq__(self, other: object) -> bool:
++        return False
++
++    def __ne__(self, other: object) -> bool:
++        return True
++
++    __hash__ = object.__hash__
++
++    def __repr__(self) -> str:
++        return "<unknown>"
++
++
++UNKNOWN = _Unknown()
++
++
++def _matches(patterns: tuple[str, ...], topic: str) -> bool:
++    return any(topic == p or (p.endswith("*") and topic.startswith(p[:-1])) for p in patterns)
++
++
++class Subscription:
++    """One loop's interest in a set of topics (exact names, or a prefix ending in ``*`` such as ``board:*``)."""
++
++    def __init__(self, feed: HostChangeFeed, name: str, topics: Iterable[str]) -> None:
++        self.feed = feed
++        self.name = name
++        self.topics = tuple(topics)
++        self._cond = threading.Condition()
++        self._pending: set[str] = set()
++        self._async: list[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
++        self.closed = False
++
++    def wants(self, topic: str) -> bool:
++        return _matches(self.topics, topic)
++
++    def _notify(self, topics: Iterable[str]) -> None:
++        mine = {t for t in topics if self.wants(t)}
++        if not mine:
++            return
++        with self._cond:
++            self._pending |= mine
++            self._cond.notify_all()
++            waiters = list(self._async)
++        for loop, event in waiters:
++            try:
++                loop.call_soon_threadsafe(event.set)
++            except RuntimeError:  # that event loop is closed: its waiter is gone
++                pass
++
++    def _take(self) -> frozenset[str]:
++        out = frozenset(self._pending)
++        self._pending.clear()
++        return out
++
++    def pending(self) -> frozenset[str]:
++        """The topics that moved since the last wait, without blocking (and consuming them)."""
++        with self._cond:
++            return self._take()
++
++    def wait(self, timeout: Optional[float], *, stop: Optional[threading.Event] = None) -> frozenset[str]:
++        """Block until a subscribed topic moves, ``timeout`` seconds pass (the caller's next due time), ``stop``
++        is set or the subscription is closed. Returns the moved topics, or an empty set when woken by anything
++        else. Changes that arrived while the loop was busy are returned at once."""
++        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
++        with self._cond:
++            while not self._pending and not self.closed and not (stop is not None and stop.is_set()):
++                left = _SLICE_S if deadline is None else min(_SLICE_S, deadline - time.monotonic())
++                if left <= 0:
++                    break
++                self._cond.wait(left)
++            return self._take()
++
++    async def wait_async(self, timeout: Optional[float], *,
++                         running: Callable[[], bool] = lambda: True) -> frozenset[str]:
++        """:meth:`wait` for an asyncio loop: never blocks the event loop; returns early once ``running()`` is
++        false (checked at least every second, like the gateway's ``_sleep_between_ticks``)."""
++        loop = asyncio.get_running_loop()
++        event = asyncio.Event()
++        deadline = None if timeout is None else loop.time() + max(0.0, timeout)
++        with self._cond:
++            if self._pending:
++                return self._take()
++            self._async.append((loop, event))
++        try:
++            while not self.closed and running():
++                left = _SLICE_S if deadline is None else min(_SLICE_S, deadline - loop.time())
++                if left <= 0:
++                    break
++                try:
++                    await asyncio.wait_for(event.wait(), left)
++                except TimeoutError:
++                    continue
++                with self._cond:
++                    if self._pending:
++                        break
++                event.clear()
++        finally:
++            with self._cond:
++                self._async = [w for w in self._async if w[1] is not event]
++        with self._cond:
++            return self._take()
++
++    def close(self) -> None:
++        self.feed.unsubscribe(self)
++        with self._cond:
++            self.closed = True
++            self._cond.notify_all()
++            waiters = list(self._async)
++        for loop, event in waiters:
++            try:
++                loop.call_soon_threadsafe(event.set)
++            except RuntimeError:
++                pass
++
++
++Probe = Callable[[], Mapping[str, object]]
++
++
++class HostChangeFeed:
++    """The process's change feed: ``probe()`` maps every topic to its current key; topics whose key moved since
++    the last probe wake their subscribers. Started on the first :meth:`subscribe` (``autostart``)."""
++
++    def __init__(self, probe: Optional[Probe] = None, *, interval: float = INTERVAL_S, autostart: bool = True,
++                 name: str = "host-change-feed") -> None:
++        self._probe = probe or default_probe
++        self.interval = interval
++        self.autostart = autostart
++        self.name = name
++        self._lock = threading.Lock()
++        self._keys: Optional[dict[str, object]] = None  # None until the baseline probe
++        self._subs: list[Subscription] = []
++        self._thread: Optional[threading.Thread] = None
++        self._stop = threading.Event()
++        self.probes = 0
++        self.wakes = 0
++
++    def subscribe(self, name: str, topics: Iterable[str]) -> Subscription:
++        sub = Subscription(self, name, topics)
++        with self._lock:
++            self._subs.append(sub)
++        if self.autostart:
++            self.start()
++        return sub
++
++    def unsubscribe(self, sub: Subscription) -> None:
++        with self._lock:
++            self._subs = [s for s in self._subs if s is not sub]
++
++    def keys(self) -> dict[str, object]:
++        with self._lock:
++            return dict(self._keys or {})
++
++    def poll_once(self) -> frozenset[str]:
++        """One probe: read every counter, wake the subscribers of the topics that moved, return those topics.
++        The first call only records the baseline. A probe that raises makes every known topic unknown."""
++        current: dict[str, object]
++        try:
++            current = dict(self._probe())
++        except Exception:  # health: allow BLE001 -- fail-open: an unreadable probe wakes every subscriber
++            logger.debug("host change feed probe failed", exc_info=True)
++            with self._lock:
++                current = {t: UNKNOWN for t in (self._keys or {})}
++        with self._lock:
++            self.probes += 1
++            previous, self._keys = self._keys, current
++            if previous is None:
++                return frozenset()
++            moved = frozenset(t for t in current.keys() | previous.keys()
++                              if t not in current or t not in previous or current[t] != previous[t])
++            subs = list(self._subs)
++        if moved:
++            for sub in subs:
++                if any(sub.wants(t) for t in moved):
++                    self.wakes += 1
++                    sub._notify(moved)
++        return moved
++
++    def _run(self) -> None:
++        from hermes_cli import loop_accounting
++
++        while not self._stop.is_set():
++            try:
++                with loop_accounting.pass_("change_feed.probe") as acct:
++                    moved = self.poll_once()
++                    if moved:
++                        acct.change()
++                        acct.rows(len(moved))
++                    else:
++                        acct.skip()
++            except Exception:  # health: allow BLE001 -- the feed thread must outlive any one probe
++                logger.debug("host change feed pass failed", exc_info=True)
++            if self._stop.wait(self.interval):
++                break
++
++    def start(self) -> bool:
++        """Start the probe thread once (idempotent). True when it is running."""
++        with self._lock:
++            if self._thread is not None and self._thread.is_alive():
++                return True
++            self._stop.clear()
++            from agent.memory_provider import spawn_context_thread
++
++            self._thread = spawn_context_thread(self._run, name=self.name)
++            self._thread.start()
++            return True
++
++    def stop(self, timeout: float = 5.0) -> None:
++        self._stop.set()
++        thread = self._thread
++        if thread is not None and thread is not threading.current_thread():
++            thread.join(timeout)
++        with self._lock:
++            subs = list(self._subs)
++        for sub in subs:
++            with sub._cond:
++                sub._cond.notify_all()
++
++
++# ---- default counters ---------------------------------------------------------------------------------------
++
++_kept_lock = threading.Lock()
++_kept: dict[str, tuple[sqlite3.Connection, tuple]] = {}  # path -> (read-only autocommit connection, (dev, ino))
++
++
++def _kept_ro(path: Path) -> sqlite3.Connection:
++    """A retained read-only autocommit connection to ``path``, reopened when the file is replaced."""
++    real = os.path.realpath(path)
++    st = os.stat(real)
++    ident = (st.st_dev, st.st_ino)
++    held = _kept.get(real)
++    if held is not None and held[1] == ident:
++        return held[0]
++    if held is not None:
++        _close_kept(real)
++    conn = sqlite3.connect(f"file:{quote(real)}?mode=ro", uri=True, timeout=0.0, check_same_thread=False,
++                           isolation_level=None)
++    try:
++        conn.execute("PRAGMA query_only = ON")
++    except BaseException:
++        conn.close()
++        raise
++    _kept[real] = (conn, ident)
++    return conn
++
++
++def _close_kept(real: str) -> None:
++    held = _kept.pop(real, None)
++    if held is not None:
++        try:
++            held[0].close()
++        except sqlite3.Error:
++            pass
++
++
++def replica_key(hub: Path) -> object:
++    """``(dev, ino, cursor)`` of hub.db (None when there is no replica), UNKNOWN when unreadable."""
++    if not hub.is_file():
++        return None
++    with _kept_lock:
++        try:
++            conn = _kept_ro(hub)
++            row = conn.execute("SELECT v FROM meta WHERE k = 'cursor'").fetchone()
++            ident = _kept[os.path.realpath(hub)][1]
++        except (OSError, sqlite3.Error):
++            _close_kept(os.path.realpath(hub))
++            return UNKNOWN
++    return (*ident, None if row is None else str(row[0]))
++
++
++def state_key(path: Path) -> object:
++    """state.db's retained-observer ``(ident, generation, data_version)``; None when absent, UNKNOWN when unreadable."""
++    if not path.is_file():
++        return None
++    from tui_gateway.kanban_replica_observer import fingerprint
++
++    stamp = fingerprint(path)
++    if stamp is None:
++        return UNKNOWN
++    return (stamp.ident, stamp.generation, stamp.data_version)
++
++
++def board_keys() -> dict[str, object]:
++    from hermes_cli import kanban_session_activity as ksa
++
++    out: dict[str, object] = {}
++    for path in ksa._board_db_paths():
++        try:
++            out[BOARD + str(path)] = ksa._board_content_key(path)
++        except Exception:  # health: allow BLE001 -- fail-open: an unreadable board wakes its subscribers
++            out[BOARD + str(path)] = UNKNOWN
++    return out
++
++
++def default_probe() -> dict[str, object]:
++    """Every counter of this host: each local board's content key, hub.db's cursor, state.db's data_version."""
++    from hermes_state import _default_db_path
++    from tui_gateway.kanban_remote_notices import hub_db_path
++
++    keys = board_keys()
++    keys[REPLICA] = replica_key(hub_db_path())
++    keys[STATE] = state_key(Path(_default_db_path()))
++    return keys
++
++
++_feed: Optional[HostChangeFeed] = None
++_feed_lock = threading.Lock()
++
++
++def feed() -> HostChangeFeed:
++    """This process's feed over :func:`default_probe`. Under pytest it never starts its thread (tests drive
++    :meth:`HostChangeFeed.poll_once`), so a feed left by one test cannot wake another test's loops."""
++    global _feed
++    with _feed_lock:
++        if _feed is None:
++            _feed = HostChangeFeed(autostart=not os.environ.get("PYTEST_CURRENT_TEST"))
++        return _feed
++
++
++def reset() -> None:
++    """Stop the process feed and close the kept connections (tests, a backend forgetting its state)."""
++    global _feed
++    with _feed_lock:
++        old, _feed = _feed, None
++    if old is not None:
++        old.stop()
++    with _kept_lock:
++        for real in list(_kept):
++            _close_kept(real)
+diff --git a/tests/hermes_cli/test_host_change_feed.py b/tests/hermes_cli/test_host_change_feed.py
+new file mode 100644
+index 0000000000..7720e568d8
+--- /dev/null
++++ b/tests/hermes_cli/test_host_change_feed.py
+@@ -0,0 +1,226 @@
++"""Host change feed: one probe thread wakes subscribed loops (design t_01a1d563324d7e8e §6, card P). [daveey]"""
++
++from __future__ import annotations
++
++import asyncio
++import sqlite3
++import threading
++import time
++
++import pytest
++
++from hermes_cli import host_change_feed as hcf
++from hermes_cli import loop_accounting as la
++
++
++class _Source:
++    """A mutable set of counters the feed probes."""
++
++    def __init__(self, **keys: object) -> None:
++        self.keys: dict[str, object] = dict(keys)
++        self.fail = False
++
++    def __call__(self) -> dict[str, object]:
++        if self.fail:
++            raise sqlite3.OperationalError("disk I/O error")
++        return dict(self.keys)
++
++
++@pytest.fixture(autouse=True)
++def _fresh():
++    hcf.reset()
++    la.reset()
++    yield
++    hcf.reset()
++
++
++def _feed(src: _Source) -> hcf.HostChangeFeed:
++    feed = hcf.HostChangeFeed(src, autostart=False)
++    feed.poll_once()  # baseline
++    return feed
++
++
++def test_subscriber_is_woken_when_its_counter_moves():
++    src = _Source(**{"board:/b/kanban.db": 1, "replica": 7, "state": 3})
++    feed = _feed(src)
++    sub = feed.subscribe("sync", ["board:*", "replica"])
++    woke: list[frozenset[str]] = []
++    waiter = threading.Thread(target=lambda: woke.append(sub.wait(30.0)))
++    waiter.start()
++    started = time.monotonic()
++    src.keys["board:/b/kanban.db"] = 2
++    assert feed.poll_once() == {"board:/b/kanban.db"}
++    waiter.join(10.0)
++    assert not waiter.is_alive()
++    assert woke == [frozenset({"board:/b/kanban.db"})]
++    assert time.monotonic() - started < 10.0  # woken by the change, not by its 30 s due time
++
++
++def test_subscriber_is_woken_on_its_due_time_with_no_change():
++    src = _Source(**{"board:/b/kanban.db": 1, "replica": 7, "state": 3})
++    feed = _feed(src)
++    sub = feed.subscribe("notifier", ["board:*"])
++    started = time.monotonic()
++    assert feed.poll_once() == frozenset()
++    assert sub.wait(0.2) == frozenset()  # the due time passed: an empty wake, the loop runs its timed work
++    assert time.monotonic() - started >= 0.2
++
++
++def test_only_subscribers_of_a_moved_topic_wake():
++    src = _Source(**{"board:/b/kanban.db": 1, "replica": 7, "state": 3})
++    feed = _feed(src)
++    boards = feed.subscribe("boards", ["board:*"])
++    state = feed.subscribe("sessions", ["state"])
++    src.keys["state"] = 4
++    feed.poll_once()
++    assert state.wait(5.0) == {"state"}
++    assert boards.wait(0.0) == frozenset()
++
++
++def test_change_while_busy_is_returned_by_the_next_wait():
++    src = _Source(replica=1)
++    feed = _feed(src)
++    sub = feed.subscribe("remote_index", ["replica"])
++    src.keys["replica"] = 2
++    feed.poll_once()
++    src.keys["replica"] = 3
++    feed.poll_once()
++    assert sub.wait(0.0) == {"replica"}  # coalesced, delivered at once without waiting
++    assert sub.wait(0.0) == frozenset()
++
++
++def test_first_probe_is_only_a_baseline():
++    src = _Source(replica=1)
++    feed = hcf.HostChangeFeed(src, autostart=False)
++    sub = feed.subscribe("x", ["replica"])
++    assert feed.poll_once() == frozenset()
++    assert sub.wait(0.0) == frozenset()
++
++
++def test_unreadable_counter_wakes_on_every_probe():
++    src = _Source(replica=1, state=1)
++    feed = _feed(src)
++    sub = feed.subscribe("x", ["replica"])
++    src.keys["replica"] = hcf.UNKNOWN
++    assert "replica" in feed.poll_once()
++    assert "replica" in feed.poll_once()  # still unknown: never proof that nothing moved
++    assert sub.wait(0.0) == {"replica"}
++    src.fail = True
++    assert feed.poll_once() == {"replica", "state"}  # the probe itself failed: every topic is unknown
++
++
++def test_appearing_and_disappearing_topics_move():
++    src = _Source(**{"board:/a/kanban.db": 1})
++    feed = _feed(src)
++    sub = feed.subscribe("x", ["board:*"])
++    src.keys["board:/b/kanban.db"] = 1
++    del src.keys["board:/a/kanban.db"]
++    assert feed.poll_once() == {"board:/a/kanban.db", "board:/b/kanban.db"}
++    assert sub.wait(0.0) == {"board:/a/kanban.db", "board:/b/kanban.db"}
++
++
++def test_wait_returns_on_stop_and_close():
++    feed = _feed(_Source(replica=1))
++    sub = feed.subscribe("x", ["replica"])
++    stop = threading.Event()
++    stop.set()
++    assert sub.wait(30.0, stop=stop) == frozenset()
++    sub.close()
++    assert sub.wait(30.0) == frozenset()
++    feed.poll_once()
++    assert sub not in feed._subs
++
++
++def test_async_wait_woken_by_change_and_by_due_time():
++    src = _Source(replica=1)
++    feed = _feed(src)
++    sub = feed.subscribe("notifier", ["replica"])
++
++    async def scenario():
++        loop = asyncio.get_running_loop()
++        started = loop.time()
++        assert await sub.wait_async(0.2) == frozenset()  # due time, no change
++        assert loop.time() - started >= 0.2
++
++        def bump():
++            src.keys["replica"] = 2
++            feed.poll_once()
++
++        loop.call_later(0.05, lambda: threading.Thread(target=bump).start())
++        started = loop.time()
++        assert await sub.wait_async(30.0) == {"replica"}
++        assert loop.time() - started < 10.0
++        stopping = loop.time()
++        assert await sub.wait_async(30.0, running=lambda: False) == frozenset()
++        assert loop.time() - stopping < 5.0
++
++    asyncio.run(scenario())
++
++
++def test_probe_thread_wakes_subscriber_and_reports_passes():
++    src = _Source(state=1)
++    feed = hcf.HostChangeFeed(src, interval=0.01)
++    sub = feed.subscribe("sessions", ["state"])  # autostart
++    try:
++        from tests.waiting import wait_until
++
++        wait_until(lambda: feed.probes >= 2, timeout=10.0)
++        src.keys["state"] = 2
++        assert sub.wait(10.0) == {"state"}
++        counters = la.counters()["change_feed.probe"]
++        assert counters["changes"] >= 1 and counters["skips"] >= 1
++    finally:
++        feed.stop()
++
++
++def test_replica_key_moves_with_the_cursor_only(tmp_path):
++    hub = tmp_path / "hub.db"
++    assert hcf.replica_key(hub) is None
++    with sqlite3.connect(hub) as conn:
++        conn.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
++        conn.executemany("INSERT INTO meta VALUES (?, ?)", [("cursor", "10"), ("pulled_at", "1")])
++    first = hcf.replica_key(hub)
++    with sqlite3.connect(hub) as conn:
++        conn.execute("UPDATE meta SET v = '2' WHERE k = 'pulled_at'")  # hub bookkeeping
++    assert hcf.replica_key(hub) == first
++    with sqlite3.connect(hub) as conn:
++        conn.execute("UPDATE meta SET v = '11' WHERE k = 'cursor'")
++    assert hcf.replica_key(hub) != first
++
++
++def test_replica_key_unreadable_is_unknown(tmp_path):
++    hub = tmp_path / "hub.db"
++    hub.write_bytes(b"not a database" * 100)
++    assert hcf.replica_key(hub) is hcf.UNKNOWN
++
++
++def test_state_key_moves_on_another_connections_commit(tmp_path):
++    db = tmp_path / "state.db"
++    with sqlite3.connect(db) as conn:
++        conn.execute("CREATE TABLE sessions (id TEXT)")
++    first = hcf.state_key(db)
++    assert hcf.state_key(db) == first
++    with sqlite3.connect(db) as conn:
++        conn.execute("INSERT INTO sessions VALUES ('s1')")
++    assert hcf.state_key(db) != first
++
++
++def test_default_probe_covers_boards_replica_and_state(tmp_path, monkeypatch):
++    from hermes_cli import kanban_session_activity as ksa
++
++    board = tmp_path / "kanban.db"
++    sqlite3.connect(board).close()
++    monkeypatch.setattr(ksa, "_board_db_paths", lambda: [board])
++    monkeypatch.setattr(ksa, "_board_content_key", lambda path: ("revision", str(path), 5))
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub"))
++    keys = hcf.default_probe()
++    assert keys["board:" + str(board)] == ("revision", str(board), 5)
++    assert keys[hcf.REPLICA] is None  # no hub replica on this host
++    assert hcf.STATE in keys
++
++
++def test_process_feed_never_autostarts_under_pytest():
++    feed = hcf.feed()
++    feed.subscribe("x", ["state"])
++    assert feed._thread is None
++    assert hcf.feed() is feed
+-- 
+2.43.0
+

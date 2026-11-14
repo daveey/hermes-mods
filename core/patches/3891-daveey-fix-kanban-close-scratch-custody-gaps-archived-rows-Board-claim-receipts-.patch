@@ -1,0 +1,1024 @@
+From 969d880cdbb5fd5e5b920f550ff3bf7e28a7fa91 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 20:54:06 +0000
+Subject: [PATCH] [daveey] fix(kanban): close scratch custody gaps (archived
+ rows, Board-claim receipts, preserve list)
+
+Worker-2 kept stranding scratch trees that no pass could ever reclaim
+(t_01a1d66ffbda6276, 67.7 GiB):
+
+1. _terminal accepts a Board row with status='archived' and
+   completed_at null. Its retention clock is the newest of the row's
+   updated_at (ms) and the latest ended run on the receipt. Live row,
+   uid match and expired lease are still required, and 'done' still
+   needs completed_at. Callers age trees by owner["retention_at"].
+2. New kanban_scratch_custody_discovery: for a root child named
+   exactly t_[0-9a-f]{16} that is a plain managed-scratch dir with no
+   local row (any board) and no receipt, it reads the Board and writes
+   a {"kind":"board","runs":[...]} receipt only when:
+   - the Board row is workspace_kind='scratch';
+   - a Board 'claimed' event's lock starts with this host's
+     hostname_prefix;
+   - every such claim's run has ended.
+   Discovery never deletes. Removal stays the unchanged gc_custody
+   path. A Board error, a missing row or a missing replica leaves the
+   tree owner_unverified.
+3. retain() records the default <root>/<id> tree when a scratch row's
+   workspace_path is NULL, if that dir exists.
+4. kanban.scratch_gc_preserve (unset = []; documented, not in
+   config_defaults to respect its line cap) lists task ids that no
+   scratch removal path touches. It is enforced in
+   defer_owned_job_cleanup (completion and deferred cleanup, custody
+   GC, the disk-pressure adapter), in the retention GC walk, in the
+   custody receipt loop and in discovery. A tree is pinned when any
+   path component is a listed id. A malformed or unreadable setting
+   pins every tree.
+
+Tests: tests/hermes_cli/test_kanban_scratch_custody_gaps.py (58). On
+base plus the two new standalone modules, 15 fail across all four
+items; on this head all pass, and the scratch/worker-node/jobs
+regression set passes 509/509.
+---
+ hermes_cli/kanban_scratch_custody.py          |  65 ++-
+ .../kanban_scratch_custody_discovery.py       | 160 ++++++
+ hermes_cli/kanban_scratch_preserve.py         |  60 +++
+ hermes_cli/kanban_workspace_jobs.py           |   5 +
+ hermes_cli/kanban_worktree_gc.py              |   7 +
+ .../hermes_cli/test_kanban_scratch_custody.py |  11 +-
+ .../test_kanban_scratch_custody_gaps.py       | 463 ++++++++++++++++++
+ website/docs/user-guide/features/kanban.md    |  21 +
+ 8 files changed, 773 insertions(+), 19 deletions(-)
+ create mode 100644 hermes_cli/kanban_scratch_custody_discovery.py
+ create mode 100644 hermes_cli/kanban_scratch_preserve.py
+ create mode 100644 tests/hermes_cli/test_kanban_scratch_custody_gaps.py
+
+diff --git a/hermes_cli/kanban_scratch_custody.py b/hermes_cli/kanban_scratch_custody.py
+index 6973ca03e9..f06f7b61d1 100644
+--- a/hermes_cli/kanban_scratch_custody.py
++++ b/hermes_cli/kanban_scratch_custody.py
+@@ -38,11 +38,17 @@ def receipts(conn):
+ 
+ 
+ def retain(conn, task_id):
+-    """Inside eviction's transaction: only explicit scratch paths, never defaults."""
++    """Inside eviction's transaction: explicit scratch paths, or the default ``<root>/<id>`` tree when the
++    row's path is NULL and that tree exists (it is the only place the task's scratch can be)."""
+     row = conn.execute("SELECT workspace_kind, workspace_path FROM tasks WHERE id=?", (task_id,)).fetchone()
+-    if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
++    if not row or row["workspace_kind"] != "scratch":
+         return
+-    path = Path(row["workspace_path"]).expanduser()
++    if row["workspace_path"]:
++        path = Path(row["workspace_path"]).expanduser()
++    else:
++        from hermes_cli import kanban_db as kb
++        from hermes_cli.kanban_worktree_gc import _board_slug
++        path = kb.workspaces_root(board=_board_slug(conn)) / task_id
+     # A missing or non-directory path has nothing to retain: skip rather than record it.
+     if not path.is_absolute() or path.is_symlink() or not path.is_dir() or not ws._is_managed_scratch_path(path):
+         return
+@@ -154,19 +160,35 @@ def discover_legacy(conn, board):
+                          (task_id, str(path), json.dumps(evidence, sort_keys=True)))
+ 
+ 
+-def _terminal(hub, board, task_id):
++def _num(value):
++    return type(value) in (int, float) and value > 0
++
++
++def _terminal(hub, board, task_id, runs=()):
++    """Fresh Board terminal evidence, or None. The returned row carries ``retention_at``: its
++    ``completed_at``, or for an ``archived`` row the Board never completed (``completed_at`` null) the
++    newest of the row's ``updated_at`` (ms) and the latest ended run in *runs*."""
+     evidence = hub.row_evidence(board, "tasks", task_id)
+     row = evidence.get("row")
+     if (evidence.get("table") != "tasks" or evidence.get("uid") != task_id
+             or type(evidence.get("head")) is not int or evidence.get("state") != "live"
+             or not isinstance(row, dict) or row.get("uid") != task_id
+             or row.get("status") not in ("done", "archived")
+-            or type(row.get("completed_at")) not in (int, float) or row["completed_at"] <= 0
+             or "lease_holder" not in row or "lease_expires" not in row):
+         return None
++    if _num(row.get("completed_at")):
++        retention_at = row["completed_at"]
++    elif row["status"] == "archived" and row.get("completed_at") is None:
++        clocks = [row["updated_at"] / 1000] if _num(row.get("updated_at")) else []
++        clocks += [r["ended_at"] for r in runs if _num(r.get("ended_at"))]
++        if not clocks:
++            return None
++        retention_at = max(clocks)
++    else:
++        return None
+     if row["lease_holder"] is not None and (not row["lease_expires"] or row["lease_expires"] > time.time() * 1000):
+         return None
+-    return row
++    return dict(row, retention_at=retention_at)
+ 
+ 
+ def _legacy_unchanged(receipt):
+@@ -263,7 +285,7 @@ def terminal_owner(hub, board, receipt):
+             return None
+     except (ValueError, KeyError, TypeError):
+         return None
+-    return _terminal(hub, board, receipt["task_id"])
++    return _terminal(hub, board, receipt["task_id"], runs=json.loads(receipt["evidence"])["runs"])
+ 
+ 
+ def removal_guard(conn, receipt):
+@@ -309,7 +331,8 @@ def _remove(conn, receipt, owner, days, board, refusals=None):
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_scratch_archive as sa
+     tid, path = receipt["task_id"], Path(receipt["workspace_path"])
+-    eligible_at = owner["completed_at"] + days * 86400
++    since = owner["retention_at"]  # completed_at, or the archived-without-completion clock (_terminal)
++    eligible_at = since + days * 86400
+     log.info("Scratch custody: task=%s path=%s verified_terminal=%s eligible_at=%s",
+              tid, path, owner["status"], eligible_at)
+     if days <= 0 or eligible_at > time.time() or not _safe(conn, receipt, path):
+@@ -320,14 +343,14 @@ def _remove(conn, receipt, owner, days, board, refusals=None):
+         key = f"custody:{tid}"
+         if refusals is not None:
+             from hermes_cli.kanban_scratch_backoff import skip_logged
+-            if skip_logged(refusals, key, path, owner["completed_at"], tid):
++            if skip_logged(refusals, key, path, since, tid):
+                 return 0
+         try:
+             archive = sa.archive_workspace(path, kb.kanban_home() / "archive" / "scratch" / board / tid,
+-                                           task_id=tid, completed_at=owner["completed_at"])
++                                           task_id=tid, completed_at=since)
+         except (OSError, ValueError, sa.ArchiveRefused, subprocess.SubprocessError) as exc:
+             if refusals is not None:
+-                refusals.record(key, path, owner["completed_at"], str(exc))
++                refusals.record(key, path, since, str(exc))
+             raise
+         if refusals is not None:
+             refusals.clear(key)
+@@ -376,18 +399,33 @@ def gc_custody(conn, days, *, budget=None, refusals=None):
+     from hermes_cli import kanban_sync_client as client
+     from hermes_cli.kanban_worktree_gc import _board_slug
+     from hermes_cli.kanban_scratch_archive import ArchiveRefused
++    from hermes_cli.kanban_scratch_preserve import preserved
+     if conn.in_transaction:
+         return 0
+     board = _board_slug(conn)
+     removed = 0
+     try:
+         discover_legacy(conn, board)
++        from hermes_cli import kanban_scratch_custody_discovery as discovery
++        unowned = discovery.candidates(conn, board)
+         rows = receipts(conn)
+-        if not rows:
++        if not rows and not unowned:
+             return 0
+         hub = client.Hub(client.load_identity())
++        if unowned:
++            try:
++                discovery.discover(conn, board, hub, unowned)
++            except (OSError, sqlite3.Error, ValueError, KeyError, TypeError, client.HubError,
++                    client.SyncUnavailable, client.Resync) as exc:
++                # Fail closed: undiscovered trees stay owner_unverified; existing receipts still run.
++                log.warning("Scratch custody discovery stopped: board evidence unavailable (%s)", exc)
++            rows = receipts(conn)
+         for receipt in rows:
+             try:
++                if preserved(receipt["task_id"], receipt["workspace_path"]):
++                    log.info("Scratch custody preserved: task=%s path=%s reason=scratch_gc_preserve",
++                             receipt["task_id"], receipt["workspace_path"])
++                    continue
+                 if not Path(receipt["workspace_path"]).is_dir():
+                     # Nothing to reclaim: skip before any Board call; the receipt stays as evidence.
+                     log.info("Scratch custody skipped: task=%s path=%s reason=path_unavailable",
+@@ -401,7 +439,8 @@ def gc_custody(conn, days, *, budget=None, refusals=None):
+                     budget.defer()
+                     continue
+                 try:
+-                    owner = _terminal(hub, board, receipt["task_id"])
++                    owner = _terminal(hub, board, receipt["task_id"],
++                                      runs=json.loads(receipt["evidence"])["runs"])
+                 except (OSError, client.SyncUnavailable, client.Resync) as exc:
+                     # Unavailable authority: stop rather than repeat the failure for every receipt.
+                     log.warning("Scratch custody preserved: task=%s path=%s reason=board_unavailable "
+diff --git a/hermes_cli/kanban_scratch_custody_discovery.py b/hermes_cli/kanban_scratch_custody_discovery.py
+new file mode 100644
+index 0000000000..2dc275f6f1
+--- /dev/null
++++ b/hermes_cli/kanban_scratch_custody_discovery.py
+@@ -0,0 +1,160 @@
++"""Board-claim custody receipt discovery for scratch trees with no local row and no receipt. [daveey]
++
++An eviction that predates custody receipts, or one whose row had ``workspace_path=NULL`` before
++``retain()`` covered default paths, leaves a ``<root>/t_<16 hex>`` tree that no local record owns:
++the retention GC only reports it as ``owner_unverified``, forever. Discovery never deletes. It
++writes a ``{"kind": "board"}`` custody receipt, and only when the Board proves this machine had
++custody of exactly that tree:
++
++* the root child is named exactly ``t_[0-9a-f]{16}``, is a plain managed-scratch directory (not a
++  symlink), is not pinned by ``kanban.scratch_gc_preserve``, and no local row (any board sharing
++  storage) or receipt names it or a path inside or around it;
++* the Board ``tasks`` row for that id is live, uid-matched and ``workspace_kind='scratch'``;
++* the Board shows at least one ``claimed`` event for the task whose claim lock starts with this
++  machine's hostname, and every run those claims name has ended on the Board.
++
++The local Board replica only enumerates candidate claim events; each event and run is read back
++from the Board itself. Removal then goes through the unchanged ``gc_custody`` path (terminal +
++lease, retention, sessions idle, owned-job veto, nested receipts, archive-before-remove, rename
++fence). A Board error, a missing row or a missing replica keeps the tree ``owner_unverified``.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import re
++import sqlite3
++from pathlib import Path
++
++from hermes_cli import kanban_db_workspace as ws
++
++log = logging.getLogger(__name__)
++_ID = re.compile(r"t_[0-9a-f]{16}")
++MAX_PER_PASS = 50
++
++
++def candidates(conn, board):
++    """Root children discovery may look at: local reads only, no Board call, no write."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_worktree_gc as gc
++    from hermes_cli.kanban_scratch_preserve import preserved
++    root = kb.workspaces_root(board=board)
++    if not root.is_dir():
++        return []
++    known = gc._scratch_owner_paths(conn)
++    for other in ws._sibling_board_db_files(conn):
++        with gc._read_board(other) as sibling:
++            known.update(gc._scratch_owner_paths(sibling))
++    out = []
++    for path in sorted(root.iterdir()):
++        if not _ID.fullmatch(path.name) or not _plain(path) or preserved(path.name, path):
++            continue
++        resolved = path.resolve()
++        if any(k == resolved or k.is_relative_to(resolved) or resolved.is_relative_to(k) for k in known):
++            continue
++        if conn.execute("SELECT 1 FROM tasks WHERE id=?", (path.name,)).fetchone():
++            continue
++        out.append(path)
++        if len(out) >= MAX_PER_PASS:
++            break
++    return out
++
++
++def _plain(path: Path) -> bool:
++    return not path.is_symlink() and path.is_dir() and ws._is_managed_scratch_path(path)
++
++
++def _replica_claim_events(board, task_id):
++    """Claimed-event uids the local Board replica lists for the task; None when it cannot be read."""
++    from hermes_cli.kanban_generation import open_ro
++    from hermes_cli.kanban_sync_client import shadow_path
++    path = shadow_path(board)
++    if not path.is_file():
++        return None
++    try:
++        replica = open_ro(path)
++        try:
++            return [r[0] for r in replica.execute(
++                "SELECT uid FROM task_events WHERE task_id=? AND kind='claimed' AND uid IS NOT NULL "
++                "ORDER BY id", (task_id,))]
++        finally:
++            replica.close()
++    except sqlite3.Error:
++        return None
++
++
++def _live(evidence, table, uid):
++    row = evidence.get("row") if isinstance(evidence, dict) else None
++    if (not isinstance(row, dict) or evidence.get("table") != table or evidence.get("uid") != uid
++            or evidence.get("state") != "live" or row.get("uid") != uid):
++        return None
++    return row
++
++
++def board_runs(hub, board, task_id):
++    """``[{id: run_uid, ended_at}]`` for every run the Board shows this machine claimed, or None.
++
++    None when the Board row is not a live scratch task, no claim is this machine's, or any such
++    run has not ended. Network: never call inside a DB transaction; Board errors propagate."""
++    from hermes_cli.kanban_host_identity import hostname_prefix
++    row = _live(hub.row_evidence(board, "tasks", task_id), "tasks", task_id)
++    if row is None or row.get("workspace_kind") != "scratch":
++        return None
++    events = _replica_claim_events(board, task_id)
++    if not events:
++        return None
++    prefix = hostname_prefix()
++    run_uids = []
++    for uid in events:
++        event = _live(hub.row_evidence(board, "task_events", uid), "task_events", uid)
++        if event is None or event.get("task_id") != task_id or event.get("kind") != "claimed":
++            continue
++        try:
++            lock = json.loads(event.get("payload") or "{}").get("lock")
++        except (ValueError, AttributeError):
++            continue
++        run_uid = event.get("run_uid")
++        if isinstance(lock, str) and lock.startswith(prefix) and isinstance(run_uid, str) and run_uid:
++            if run_uid not in run_uids:
++                run_uids.append(run_uid)
++    if not run_uids:
++        return None
++    runs = []
++    for uid in run_uids:
++        run = _live(hub.row_evidence(board, "task_runs", uid), "task_runs", uid)
++        if run is None or run.get("task_id") != task_id:
++            return None
++        ended = run.get("ended_at")
++        if isinstance(ended, bool) or not isinstance(ended, (int, float)) or ended <= 0:
++            return None
++        runs.append({"id": uid, "ended_at": ended})
++    return runs
++
++
++def discover(conn, board, hub, paths):
++    """Record a board custody receipt for each of *paths* the Board proves; returns how many."""
++    from hermes_cli.kanban_db_connect import write_txn
++    from hermes_cli.kanban_scratch_custody import _TABLE, _ensure
++    from hermes_cli.kanban_scratch_preserve import preserved
++    if conn.in_transaction:
++        return 0
++    found = 0
++    for path in paths:
++        tid = path.name
++        runs = board_runs(hub, board, tid)
++        if runs is None:
++            continue
++        with write_txn(conn):
++            if (conn.execute("SELECT 1 FROM tasks WHERE id=?", (tid,)).fetchone()
++                    or not _plain(path) or preserved(tid, path)):
++                continue
++            _ensure(conn)
++            if conn.execute(f"SELECT 1 FROM {_TABLE} WHERE task_id=? OR workspace_path=?",
++                            (tid, str(path))).fetchone():
++                continue
++            evidence = {"kind": "board", "board": board, "runs": runs}
++            conn.execute(f"INSERT INTO {_TABLE} VALUES (?, ?, ?)",
++                         (tid, str(path), json.dumps(evidence, sort_keys=True)))
++        found += 1
++        log.info("Scratch custody discovered: task=%s path=%s kind=board runs=%d", tid, path, len(runs))
++    return found
+diff --git a/hermes_cli/kanban_scratch_preserve.py b/hermes_cli/kanban_scratch_preserve.py
+new file mode 100644
+index 0000000000..0569c667f6
+--- /dev/null
++++ b/hermes_cli/kanban_scratch_preserve.py
+@@ -0,0 +1,60 @@
++"""``kanban.scratch_gc_preserve``: task ids whose scratch trees no removal path may touch. [daveey]
++
++An explicit pin for workspaces that must survive every cleanup (research trees with no
++card row, hand-kept evidence). Every scratch removal path checks it: completion and deferred
++parent cleanup, the retention GC and its archive pass, custody GC and the disk-pressure
++adapter (all through ``kanban_workspace_jobs.defer_owned_job_cleanup``), plus custody
++receipt discovery, which never records a receipt for a pinned id.
++
++A tree is pinned when its task id is listed or any component of its path is a listed id,
++so a nested tree or a detached ``.<id>.gc-*`` sibling is covered too. An unreadable or
++malformed setting fails closed: every tree is treated as pinned and a warning is logged.
++"""
++from __future__ import annotations
++
++import logging
++from pathlib import Path
++
++log = logging.getLogger(__name__)
++
++_warned: set[str] = set()
++
++
++def preserved_ids() -> frozenset[str] | None:
++    """The configured ids, empty when unset; None when the setting cannot be trusted."""
++    try:
++        from hermes_cli.config import load_config_readonly
++        kanban = load_config_readonly().get("kanban") or {}
++        value = kanban.get("scratch_gc_preserve") if isinstance(kanban, dict) else ()
++    except Exception as exc:  # health: allow BLE001 -- unreadable config pins every tree (fail closed)
++        _warn(f"unreadable config ({type(exc).__name__})")
++        return None
++    if value is None:
++        return frozenset()
++    if (not isinstance(value, (list, tuple)) or
++            not all(isinstance(v, str) and v.strip() and "/" not in v for v in value)):
++        _warn(f"invalid value {value!r}: expected a list of task ids")
++        return None
++    return frozenset(v.strip() for v in value)
++
++
++def _warn(reason: str) -> None:
++    if reason not in _warned:
++        _warned.add(reason)
++        log.warning("kanban.scratch_gc_preserve: %s; preserving every scratch tree", reason)
++
++
++def preserved(task_id: str | None, path: Path | str | None = None) -> bool:
++    """True when the tree must be kept: a pinned task id, a pinned path component, or a bad setting."""
++    ids = preserved_ids()
++    if ids is None:
++        return True
++    if not ids:
++        return False
++    if task_id in ids:
++        return True
++    if path is not None:
++        for part in Path(path).parts:
++            if part in ids or (part.startswith(".") and part[1:].split(".gc-", 1)[0] in ids):
++                return True
++    return False
+diff --git a/hermes_cli/kanban_workspace_jobs.py b/hermes_cli/kanban_workspace_jobs.py
+index a35893f086..24b7c6248d 100644
+--- a/hermes_cli/kanban_workspace_jobs.py
++++ b/hermes_cli/kanban_workspace_jobs.py
+@@ -61,7 +61,12 @@ def defer_owned_job_cleanup(task_id: str, path: Path | str) -> bool:
+ 
+     A bounded incomplete scan fails closed. No cached verdict: a stale tag or
+     exited PID cannot retain a directory on the next successful GC pass.
++    An explicit ``kanban.scratch_gc_preserve`` pin vetoes first. [daveey]
+     """
++    from hermes_cli.kanban_scratch_preserve import preserved
++    if preserved(task_id, path):
++        log.info('Deferring scratch cleanup for %s: pinned by kanban.scratch_gc_preserve', task_id)
++        return True
+     path = Path(path)
+     try:
+         if not stat.S_ISDIR(path.lstat().st_mode):
+diff --git a/hermes_cli/kanban_worktree_gc.py b/hermes_cli/kanban_worktree_gc.py
+index 5edc25f23c..1f064f28ff 100644
+--- a/hermes_cli/kanban_worktree_gc.py
++++ b/hermes_cli/kanban_worktree_gc.py
+@@ -73,6 +73,7 @@ def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: float | None =
+     import shutil
+ 
+     from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_scratch_preserve import preserved
+ 
+     days = retention_days() if older_than_days is None else older_than_days
+     removed = 0
+@@ -105,6 +106,8 @@ def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: float | None =
+                     exc_info=True)
+     for row in rows:
+         path = Path(row["workspace_path"] or (kb.workspaces_root() / row["id"])).expanduser()
++        if preserved(row["id"], path):
++            continue  # kanban.scratch_gc_preserve: never walked, archived or removed
+         if not path.is_dir() or path.is_symlink() or not ws._is_managed_scratch_path(path):
+             continue
+         if ws._has_active_children(conn, row["id"]):
+@@ -235,6 +238,10 @@ def _report_unowned_scratch(root: Path, known_paths: set[Path]) -> None:
+         if path.is_symlink() or not path.is_dir() or _is_detached_trash(path):
+             continue  # detached trash is swept by gc_task_scratch, not an unknown owner
+         if path.resolve() not in represented:
++            from hermes_cli.kanban_scratch_preserve import preserved
++            if preserved(path.name, path):
++                log.info("Scratch preserved: reason=scratch_gc_preserve path=%s", path)
++                continue
+             log.warning("Scratch preserved: reason=owner_unverified path=%s; "
+                         "no local task workspace record; moved or unknown ownership; "
+                         "no deletion deadline", path)
+diff --git a/tests/hermes_cli/test_kanban_scratch_custody.py b/tests/hermes_cli/test_kanban_scratch_custody.py
+index e6886b970b..0fbd72a12b 100644
+--- a/tests/hermes_cli/test_kanban_scratch_custody.py
++++ b/tests/hermes_cli/test_kanban_scratch_custody.py
+@@ -111,10 +111,10 @@ def test_refused_receipt_does_not_starve_later_workspace(env, monkeypatch, caplo
+     first, first_path, _ = evicted(env)
+     _second, second_path, _ = evicted(env)
+ 
+-    def terminal(_hub, _board, tid):
++    def terminal(_hub, _board, tid, runs=()):
+         if tid == first:
+             raise archive.ArchiveRefused("preserve this receipt")
+-        return dict(env.owner, uid=tid)
++        return dict(env.owner, uid=tid, retention_at=env.owner["completed_at"])
+ 
+     monkeypatch.setattr(custody, "_terminal", terminal)
+     assert gc.gc_task_scratch(env.conn, older_than_days=7) == 1
+@@ -151,8 +151,7 @@ def test_eviction_receipt_and_rollback_are_local_only(env):
+     assert not env.conn.execute("SELECT 1 FROM task_events WHERE task_id=?", (tid,)).fetchone()
+ 
+ 
+-@pytest.mark.parametrize("kwargs", [{"kind": "dir"}, {"path_mode": "missing"},
+-                                    {"path_mode": "root"}, {"path_mode": "outside"}])
++@pytest.mark.parametrize("kwargs", [{"kind": "dir"}, {"path_mode": "root"}, {"path_mode": "outside"}])
+ def test_eviction_requires_explicit_managed_scratch(env, kwargs):
+     _, path, _ = evicted(env, **kwargs)
+     assert custody.receipts(env.conn) == []
+@@ -826,9 +825,9 @@ def test_commit_failure_after_rename_restores_tree_and_stops(env, monkeypatch, c
+     second, second_path, _ = evicted(env)
+     fired, asked = [], []
+ 
+-    def terminal(_hub, _board, tid):
++    def terminal(_hub, _board, tid, runs=()):
+         asked.append(tid)
+-        return dict(env.owner, uid=tid)
++        return dict(env.owner, uid=tid, retention_at=env.owner["completed_at"])
+ 
+     monkeypatch.setattr(custody, "_terminal", terminal)
+ 
+diff --git a/tests/hermes_cli/test_kanban_scratch_custody_gaps.py b/tests/hermes_cli/test_kanban_scratch_custody_gaps.py
+new file mode 100644
+index 0000000000..979ad04aec
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scratch_custody_gaps.py
+@@ -0,0 +1,463 @@
++"""Scratch custody gaps: archived-without-completion retention, Board-claim receipt discovery,
++default-path eviction receipts and the explicit ``kanban.scratch_gc_preserve`` pin. [daveey]
++
++Real SQLite eviction/GC with an injected Board transport; no live home or Board calls.
++"""
++import json
++import logging
++import shutil
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_workspace as ws
++from hermes_cli import kanban_host_identity
++from hermes_cli import kanban_scratch_custody as custody
++from hermes_cli import kanban_scratch_custody_discovery as discovery
++from hermes_cli import kanban_scratch_preserve as preserve
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_worker_node as worker
++from hermes_cli import kanban_worktree_gc as gc
++from tests.hermes_cli import test_kanban_scratch_custody as sc
++
++env = sc.env
++NOW, OLD = sc.NOW, sc.OLD
++DAY = 86400
++HOST = "hermes-worker-2"
++TID = "t_0123456789abcdef"
++
++
++@pytest.fixture
++def board(env, monkeypatch):
++    """Board rows by (table, uid); ``tasks`` keeps the env fixture's owner semantics."""
++    env.rows = {}
++    env.asked = []
++
++    class Hub:
++        def row_evidence(self, board_slug, table, uid):
++            assert not env.conn.in_transaction and board_slug == "default"
++            env.asked.append((table, uid))
++            if table == "tasks":
++                env.calls += 1
++                return {"table": table, "uid": uid, "head": 1, "state": env.evidence_state,
++                        "row": dict(env.owner), **env.evidence_extra}
++            row = env.rows.get((table, uid))
++            return {"table": table, "uid": uid, "head": 1, "state": "live" if row else "never_existed",
++                    "row": dict(row) if row else None}
++
++    monkeypatch.setattr(client, "Hub", lambda identity: Hub())
++    monkeypatch.setattr(kanban_host_identity, "hostname_prefix", lambda: HOST + ":")
++    return env
++
++
++def _hub():
++    return client.Hub(None)
++
++
++def _config(env, **kanban):
++    lines = ["kanban:", "  sync:", "    enabled: true"]
++    lines += [f"  {key}: {json.dumps(value)}" for key, value in kanban.items()]
++    (env.home / "config.yaml").write_text("\n".join(lines) + "\n")
++
++
++# -- 1. Board 'archived' with completed_at null --------------------------------------------------
++
++def _archived(env, *, updated_at=OLD):
++    env.owner.update(status="archived", completed_at=None)
++    if updated_at is not None:
++        env.owner["updated_at"] = updated_at * 1000  # Board row metadata is milliseconds
++
++
++def test_archived_without_completed_at_is_reclaimed(board, caplog):
++    _archived(board)
++    _tid, path, _ = sc.evicted(board)
++    with caplog.at_level("INFO"):
++        assert gc.gc_task_scratch(board.conn, older_than_days=7) == 1
++    assert not path.exists() and custody.receipts(board.conn) == []
++    assert "verified_terminal=archived" in caplog.text and "terminal_unverified" not in caplog.text
++
++
++@pytest.mark.parametrize("offset,removed", [(-1, 0), (0, 1)])
++def test_archived_clock_uses_latest_ended_run(board, offset, removed):
++    _archived(board)  # archived (updated) long ago, but the last run ended later
++    _tid, path, _ = sc.evicted(board, ended=NOW - DAY)
++    board.now = NOW - DAY + 7 * DAY + offset
++    assert gc.gc_task_scratch(board.conn, older_than_days=7) == removed
++    assert path.exists() is (not removed)
++
++
++@pytest.mark.parametrize("offset,removed", [(-1, 0), (0, 1)])
++def test_archived_clock_uses_board_updated_at(board, offset, removed):
++    _archived(board, updated_at=NOW - DAY)  # runs ended long ago, archived (updated) later
++    _tid, path, _ = sc.evicted(board)
++    board.now = NOW - DAY + 7 * DAY + offset
++    assert gc.gc_task_scratch(board.conn, older_than_days=7) == removed
++    assert path.exists() is (not removed)
++
++
++@pytest.mark.parametrize("fields", [
++    {"lease_holder": "other", "lease_expires": NOW * 1000 + 60000},  # lease still held
++    {"completed_at": 0},                                                # present but not a clock
++    {"completed_at": True},
++    {"status": "done"},                                                 # done still needs completed_at
++    {"status": "running"},
++])
++def test_archived_controls_keep_tree(board, fields):
++    _archived(board)
++    _tid, path, _ = sc.evicted(board)
++    board.owner.update(fields)
++    assert gc.gc_task_scratch(board.conn, older_than_days=7) == 0
++    assert path.exists()
++
++
++@pytest.mark.parametrize("control", ["uid", "deleted"])
++def test_archived_row_must_be_live_and_match(board, control):
++    _archived(board)
++    _tid, path, _ = sc.evicted(board)
++    if control == "uid":
++        board.owner["uid"] = "t_ffffffffffffffff"
++    else:
++        board.evidence_state = "deleted"
++    assert gc.gc_task_scratch(board.conn, older_than_days=7) == 0
++    assert path.exists()
++
++
++def test_archived_clock_sources(board):
++    tid, _path, _ = sc.evicted(board)
++    _archived(board, updated_at=None)
++    assert custody._terminal(_hub(), "default", tid) is None  # no clock at all
++    assert custody._terminal(_hub(), "default", tid, runs=[{"id": 1, "ended_at": None}]) is None
++    assert custody._terminal(_hub(), "default", tid, runs=[{"id": 1, "ended_at": OLD}])["retention_at"] == OLD
++    _archived(board, updated_at=NOW - DAY)
++    owner = custody._terminal(_hub(), "default", tid, runs=[{"id": 1, "ended_at": OLD}])
++    assert owner["retention_at"] == NOW - DAY and owner["completed_at"] is None
++
++
++def test_done_retention_clock_is_completed_at(board):
++    tid, _path, _ = sc.evicted(board)
++    board.owner["updated_at"] = NOW * 1000  # a later edit never moves a completed card's clock
++    assert custody._terminal(_hub(), "default", tid, runs=[{"id": 1, "ended_at": NOW}])["retention_at"] == OLD
++
++
++def test_pressure_terminal_owner_accepts_archived_with_run_clock(board):
++    tid, _path, _ = sc.evicted(board)
++    _archived(board, updated_at=None)
++    owner = custody.terminal_owner(_hub(), "default", dict(sc._receipt(board, tid)))
++    assert owner is not None and owner["retention_at"] == OLD
++
++
++# -- 2. Board-claim receipt discovery ------------------------------------------------------------
++
++def _orphan(name=TID):
++    path = kb.workspaces_root() / name
++    path.mkdir(parents=True)
++    (path / "notes").write_text("keep me")
++    return path
++
++
++def _replica(events):
++    shadow = client.shadow_path("default")
++    shadow.parent.mkdir(parents=True, exist_ok=True)
++    conn = sqlite3.connect(shadow)
++    with conn:
++        conn.execute("CREATE TABLE IF NOT EXISTS task_events "
++                     "(id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, uid TEXT)")
++        conn.executemany("INSERT INTO task_events(task_id, kind, uid) VALUES (?,?,?)", events)
++    conn.close()
++
++
++def _claimed(env, tid=TID, *, n=1, lock=HOST + ":4242", ended=OLD, kind="scratch", run_task=None):
++    """Board task row + ``n`` claims by ``lock`` (each its own run) + the replica listing them."""
++    env.owner.update(uid=tid, workspace_kind=kind)
++    events = []
++    for i in range(n):
++        ev, run = f"ev-{tid}-{i}", f"run-{tid}-{i}"
++        env.rows[("task_events", ev)] = {"uid": ev, "task_id": tid, "kind": "claimed", "run_uid": run,
++                                         "payload": json.dumps({"lock": lock, "run_id": 7 + i})}
++        env.rows[("task_runs", run)] = {"uid": run, "task_id": run_task or tid, "ended_at": ended}
++        events.append((tid, "claimed", ev))
++    _replica(events)
++
++
++def _receipt(env, tid=TID):
++    """The custody receipt row for tid, or None (also when no receipt table exists yet)."""
++    return next((r for r in custody.receipts(env.conn) if r["task_id"] == tid), None)
++
++
++def _evidence(env, tid=TID):
++    row = _receipt(env, tid)
++    return None if row is None else json.loads(row["evidence"])
++
++
++def test_board_claim_discovery_writes_receipt_then_gc_reclaims(board, caplog):
++    path = _orphan()
++    _claimed(board)
++    with caplog.at_level("INFO"):
++        assert gc.gc_task_scratch(board.conn, older_than_days=7) == 1
++    assert not path.exists()
++    assert f"Scratch custody discovered: task={TID}" in caplog.text
++    assert "verified_terminal=done" in caplog.text
++    assert not board.conn.execute("SELECT 1 FROM kanban_sync_outbox").fetchone()
++    assert not board.conn.execute("SELECT 1 FROM task_events WHERE task_id=?", (TID,)).fetchone()
++
++
++def test_discovery_never_deletes(board):
++    path = _orphan()
++    _claimed(board)
++    assert discovery.discover(board.conn, "default", _hub(), [path]) == 1
++    assert (path / "notes").read_text() == "keep me"
++    assert _evidence(board) == {"kind": "board", "board": "default",
++                                "runs": [{"id": f"run-{TID}-0", "ended_at": OLD}]}
++    assert _receipt(board, TID)["workspace_path"] == str(path)
++
++
++def test_discovered_receipt_waits_for_retention(board):
++    path = _orphan()
++    _claimed(board)
++    board.owner["completed_at"] = NOW  # done just now: discovery records, retention keeps
++    assert gc.gc_task_scratch(board.conn, older_than_days=7) == 0
++    assert path.exists() and _evidence(board)["kind"] == "board"
++
++
++def _event(env):
++    return env.rows[("task_events", f"ev-{TID}-0")]
++
++
++_BREAK = {
++    "no_board_row": lambda env: setattr(env, "evidence_state", "never_existed"),
++    "event_other_task": lambda env: _event(env).update(task_id="t_ffffffffffffffff"),
++    "event_not_claimed": lambda env: _event(env).update(kind="blocked"),
++    "event_missing": lambda env: env.rows.pop(("task_events", f"ev-{TID}-0")),
++    "bad_payload": lambda env: _event(env).update(payload="not json"),
++    "one_of_ours_live": lambda env: env.rows[("task_runs", f"run-{TID}-1")].update(ended_at=None),
++}
++
++
++@pytest.mark.parametrize("control", [
++    "dir_kind", "no_board_row", "foreign_lock", "run_live", "run_other_task", "event_other_task",
++    "event_not_claimed", "event_missing", "no_replica", "bad_payload", "one_of_ours_live", "substring_host",
++])
++def test_discovery_board_controls_keep_owner_unverified(board, caplog, control):
++    path = _orphan()
++    if control == "no_replica":
++        board.owner.update(uid=TID, workspace_kind="scratch")
++    else:
++        lock = {"foreign_lock": "hermes-worker-1:4242", "substring_host": HOST + "0:4242"}.get(control, HOST + ":4242")
++        _claimed(board, kind="dir" if control == "dir_kind" else "scratch", lock=lock,
++                 ended=None if control == "run_live" else OLD,
++                 run_task="t_ffffffffffffffff" if control == "run_other_task" else None,
++                 n=2 if control == "one_of_ours_live" else 1)
++    _BREAK.get(control, lambda env: None)(board)
++    with caplog.at_level("WARNING"):
++        assert gc.gc_task_scratch(board.conn, older_than_days=7) == 0
++    assert (path / "notes").read_text() == "keep me"
++    assert _receipt(board, TID) is None
++    assert f"reason=owner_unverified path={path}" in caplog.text
++
++
++def test_foreign_live_claim_does_not_block_our_ended_claim(board):
++    path = _orphan()
++    _claimed(board)
++    board.rows[("task_events", "ev-foreign")] = {"uid": "ev-foreign", "task_id": TID, "kind": "claimed",
++                                                 "run_uid": "run-foreign",
++                                                 "payload": json.dumps({"lock": "hermes-worker-1:9"})}
++    board.rows[("task_runs", "run-foreign")] = {"uid": "run-foreign", "task_id": TID, "ended_at": None}
++    _replica([(TID, "claimed", "ev-foreign")])
++    assert discovery.discover(board.conn, "default", _hub(), [path]) == 1
++    assert [r["id"] for r in _evidence(board)["runs"]] == [f"run-{TID}-0"]
++
++
++@pytest.mark.parametrize("name", ["t_0123456789abcde", "t_0123456789abcdef0", "t_0123456789ABCDEF",
++                                  "x_0123456789abcdef", "notes"])
++def test_discovery_requires_exact_card_name(board, name):
++    _orphan(name)
++    assert discovery.candidates(board.conn, "default") == []
++
++
++def test_discovery_candidates_skip_symlink_rows_receipts_and_pins(board, tmp_path):
++    real = tmp_path / "elsewhere"
++    real.mkdir()
++    link = kb.workspaces_root() / "t_1111111111111111"
++    link.parent.mkdir(parents=True, exist_ok=True)
++    link.symlink_to(real, target_is_directory=True)
++    shared = _orphan("t_2222222222222222")
++    sharer = kb.create_task(board.conn, title="dir sharer")
++    with kb.write_txn(board.conn):
++        board.conn.execute("UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
++                           (str(shared / "sub"), sharer))
++    pinned = _orphan("t_3333333333333333")
++    _config(board, scratch_gc_preserve=[pinned.name])
++    plain = _orphan("t_4444444444444444")
++    _tid, receipted, _ = sc.evicted(board)  # already holds an eviction receipt
++    found = discovery.candidates(board.conn, "default")
++    assert plain in found and receipted not in found
++    assert not {link, shared, pinned} & set(found)
++
++
++def test_discovery_rechecks_local_row_inside_write_txn(board, monkeypatch):
++    path = _orphan()
++    _claimed(board)
++    real = discovery.board_runs
++
++    def pickup_during_board_read(hub, board_slug, tid):
++        runs = real(hub, board_slug, tid)
++        with kb.write_txn(board.conn):
++            board.conn.execute("INSERT INTO tasks(id, title, status, created_at, workspace_kind) "
++                               "VALUES (?, 'picked up', 'running', 1, 'scratch')", (tid,))
++        assert board.conn.execute("SELECT 1 FROM tasks WHERE id=?", (tid,)).fetchone()  # race really committed
++        return runs
++
++    monkeypatch.setattr(discovery, "board_runs", pickup_during_board_read)
++    assert discovery.discover(board.conn, "default", _hub(), [path]) == 0
++    assert _receipt(board, TID) is None and path.exists()
++
++
++def test_board_error_keeps_dir_and_existing_receipts_still_run(board, caplog, monkeypatch):
++    path = _orphan()
++    _claimed(board)
++    board.owner["uid"] = ""  # the eviction below rebinds the owner row to its own card
++    evicted_tid, evicted_path, _ = sc.evicted(board)
++
++    def unavailable(hub, board_slug, tid):
++        raise client.HubError(503, "board down")
++
++    monkeypatch.setattr(discovery, "board_runs", unavailable)
++    with caplog.at_level("WARNING"):
++        assert gc.gc_task_scratch(board.conn, older_than_days=7) == 1
++    assert path.exists() and _receipt(board, TID) is None
++    assert not evicted_path.exists() and sc._receipt(board, evicted_tid) is None
++    assert "Scratch custody discovery stopped" in caplog.text
++
++
++def test_discovery_refuses_inside_caller_transaction(board):
++    path = _orphan()
++    _claimed(board)
++    with kb.write_txn(board.conn):
++        assert discovery.discover(board.conn, "default", _hub(), [path]) == 0
++    assert board.asked == []
++
++
++# -- 3. retain() records the default path for NULL workspace_path --------------------------------
++
++def test_null_workspace_path_eviction_records_default_tree(board):
++    tid, path, run = sc.evicted(board, path_mode="missing")
++    receipt = sc._receipt(board, tid)
++    assert receipt is not None and receipt["workspace_path"] == str(kb.workspaces_root() / tid)
++    assert json.loads(receipt["evidence"]) == {"kind": "eviction", "runs": [{"id": run, "ended_at": OLD}]}
++    assert gc.gc_task_scratch(board.conn, older_than_days=7) == 1
++    assert not path.exists()
++
++
++@pytest.mark.parametrize("shape", ["absent", "symlink"])
++def test_null_workspace_path_without_plain_default_tree_records_nothing(board, tmp_path, shape):
++    tid, path, _ = sc.task(board, path_mode="missing")
++    shutil.rmtree(path)
++    if shape == "symlink":
++        (tmp_path / "real").mkdir()
++        path.symlink_to(tmp_path / "real", target_is_directory=True)
++    assert worker.evict(board.conn) == [tid]
++    assert custody.receipts(board.conn) == []
++
++
++# -- 4. kanban.scratch_gc_preserve ----------------------------------------------------------------
++
++def test_preserved_custody_receipt_is_kept_without_board_call(board, caplog):
++    tid, path, _ = sc.evicted(board)
++    _config(board, scratch_gc_preserve=[tid])
++    with caplog.at_level("INFO"):
++        assert gc.gc_task_scratch(board.conn, older_than_days=7) == 0
++    assert path.exists() and sc._receipt(board, tid) is not None
++    assert board.asked == [] and "reason=scratch_gc_preserve" in caplog.text
++
++
++def _local_done(env, *, completed_at=OLD):
++    tid = kb.create_task(env.conn, title="local done")
++    path = kb.workspaces_root() / tid
++    path.mkdir(parents=True)
++    (path / "notes").write_text("keep me")
++    with kb.write_txn(env.conn):
++        env.conn.execute("UPDATE tasks SET status='done', workspace_kind='scratch', workspace_path=?, "
++                         "completed_at=? WHERE id=?", (str(path), completed_at, tid))
++    return tid, path
++
++
++def test_preserved_local_terminal_tree_is_kept_by_retention_gc(board):
++    tid, path = _local_done(board)
++    _config(board, scratch_gc_preserve=[tid])
++    assert gc.gc_task_scratch(board.conn, older_than_days=7) == 0
++    assert (path / "notes").read_text() == "keep me"
++    _config(board)
++    assert gc.gc_task_scratch(board.conn, older_than_days=7) == 1  # control: unpinned goes
++    assert not path.exists()
++
++
++def test_preserved_tree_survives_completion_cleanup(board):
++    tid, path = _local_done(board)
++    _config(board, scratch_gc_preserve=[tid])
++    ws._cleanup_workspace(board.conn, tid)
++    assert (path / "notes").read_text() == "keep me"
++    _config(board)
++    ws._cleanup_workspace(board.conn, tid)  # control: the same call removes an unpinned tree
++    assert not path.exists()
++
++
++def test_owned_job_veto_honours_pin_for_external_removers(board, tmp_path):
++    tree = tmp_path / "t_aaaaaaaaaaaaaaaa"
++    tree.mkdir()
++    (tree / "nested").mkdir()
++    other = tmp_path / "t_bbbbbbbbbbbbbbbb"
++    other.mkdir()
++    assert gc.defer_owned_job_cleanup("t_bbbbbbbbbbbbbbbb", other) is False  # control
++    _config(board, scratch_gc_preserve=["t_aaaaaaaaaaaaaaaa"])
++    assert gc.defer_owned_job_cleanup("t_aaaaaaaaaaaaaaaa", tree) is True
++    assert gc.defer_owned_job_cleanup("t_bbbbbbbbbbbbbbbb", tree / "nested") is True  # path component
++    assert gc.defer_owned_job_cleanup("t_bbbbbbbbbbbbbbbb", other) is False
++
++
++def test_preserved_unowned_dir_is_not_reported_owner_unverified(board, caplog):
++    path = _orphan()
++    _config(board, scratch_gc_preserve=[TID])
++    with caplog.at_level("INFO"):
++        assert gc.gc_task_scratch(board.conn, older_than_days=7) == 0
++    assert path.exists() and "owner_unverified" not in caplog.text
++    assert f"reason=scratch_gc_preserve path={path}" in caplog.text
++
++
++@pytest.mark.parametrize("value,expected", [
++    (None, frozenset()),
++    ([], frozenset()),
++    (["t_aaaaaaaaaaaaaaaa", " t_b "], frozenset({"t_aaaaaaaaaaaaaaaa", "t_b"})),
++    ("t_aaaaaaaaaaaaaaaa", None),       # a bare string is not a list
++    ([1], None),
++    ([""], None),
++    (["a/b"], None),
++    ({"t_a": True}, None),
++])
++def test_preserve_setting_parse_fails_closed(board, caplog, value, expected):
++    _config(board, scratch_gc_preserve=value)
++    with caplog.at_level(logging.WARNING):
++        assert preserve.preserved_ids() == expected
++    assert preserve.preserved("t_cccccccccccccccc", "/x/t_cccccccccccccccc") is (expected is None)
++
++
++def test_unreadable_config_fails_closed(board, monkeypatch):
++    from hermes_cli import config
++
++    def boom():
++        raise RuntimeError("unreadable")
++
++    monkeypatch.setattr(config, "load_config_readonly", boom)
++    assert preserve.preserved_ids() is None
++    assert preserve.preserved("t_cccccccccccccccc") is True
++
++
++def test_preserve_matches_id_component_and_detached_names(monkeypatch):
++    monkeypatch.setattr(preserve, "preserved_ids", lambda: frozenset({"t_aaaaaaaaaaaaaaaa"}))
++    assert preserve.preserved("t_aaaaaaaaaaaaaaaa")
++    assert preserve.preserved(None, "/w/t_aaaaaaaaaaaaaaaa/sub")
++    assert preserve.preserved(None, "/w/.t_aaaaaaaaaaaaaaaa.gc-rm-0123")
++    assert preserve.preserved(None, "/w/.t_aaaaaaaaaaaaaaaa.gc-77")
++    assert not preserve.preserved("t_bbbbbbbbbbbbbbbb", "/w/t_bbbbbbbbbbbbbbbb")
++    assert not preserve.preserved(None, "/w/xt_aaaaaaaaaaaaaaaa")
++    assert not preserve.preserved(None, None)
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index dbc7e691ad..74ddaf32f7 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1422,6 +1422,27 @@ Dirty trees, locked trees, active tasks, active children and live shared workspa
+ are preserved. Custom branches remain; generated `wt/` branches are pruned only
+ when their tip still matches the archived commit.
+ 
++`kanban.scratch_gc_preserve` pins scratch trees explicitly: a list of task ids
++(default `[]`) whose workspaces no cleanup path touches — completion cleanup,
++deferred parent cleanup, retention GC and its archive pass, custody GC for evicted
++cards, custody receipt discovery and the worker disk-pressure reclaimer. A tree is
++pinned when its task id is listed or any component of its path is a listed id.
++A value that is not a list of task-id strings, or a config that cannot be read,
++keeps every scratch tree and logs a warning.
++
++```yaml
++kanban:
++  scratch_gc_preserve: [t_01a1a7927a933768, t_01a19fc2faa99ef8]
++```
++
++On a Board worker, a scratch tree whose card was evicted from the local board is
++reclaimed through a custody receipt and the Board's terminal evidence. A Board row
++`archived` without `completed_at` uses the newest of its update time and its last
++ended run as the retention clock. A `<root>/t_<16 hex>` tree with neither a local
++row nor a receipt (an eviction before receipts existed) gets a receipt only when the
++Board row is a scratch task and the Board shows a claim of it by this machine's
++hostname whose runs have all ended; otherwise it stays `owner_unverified`.
++
+ CLI worktree startup maintenance applies the same policy across the current home's
+ boards. Registered `t_<hex>` worktrees with no known owning workspace are not
+ silently deleted: they receive JSON tombstones in
+-- 
+2.43.0
+

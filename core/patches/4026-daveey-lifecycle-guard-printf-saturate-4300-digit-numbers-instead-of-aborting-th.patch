@@ -1,0 +1,211 @@
+From 9cb9d3652dcdec4caaec523914568545fdff81e6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 20:42:59 +0000
+Subject: [PATCH] [daveey] lifecycle guard printf: saturate >4300-digit numbers
+ instead of aborting the walk
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Review 5897387636 (PR #2506 @a59a1e7f3c, t_01a1d685a4dbb703): the printf
+model called Python int() on user-controlled decimal strings, and int()
+raises ValueError past 4300 digits. scan_gateway_lifecycle caught it and
+fell back to the direct scan, so
+`printf '%d\n%s %s\n' <4301 digits> bash evil.sh | bash` (and its brace
+group) was allowed while real bash 5.2.21 saturates the number and runs
+the script. The merge-base refused it, so this was a fail-open regression.
+
+Fix:
+- decimal_digits(): a decimal digit string past 20 significant digits
+  (beyond 2**64, where strtoimax/strtoumax saturate and every width,
+  precision and exponent caller caps) saturates to 10**20. integer()
+  and literal widths/precisions (`%.000…04s`) use it.
+- Float parsing: a hex float's exponent saturates the same way, a zero
+  mantissa returns 0 before any 2**power, and a decimal exponent past
+  12 digits is clamped before Decimal() (which raised
+  InvalidOperation, read as 0 where bash prints inf).
+- Defence in depth: printed_argument_lines skips a model variant that
+  raises ValueError/ArithmeticError; the whole-argument and
+  arguments-only variants around it are still walked.
+
+Proof:
+- New sink rows printf-long-decimal, printf-long-decimal-group,
+  printf-long-precision; three real-bash byte-compare cases with
+  4400-digit numbers; a model-error test. All 7 red on a59a1e7f3c's
+  source, green here (188 passed in the file).
+- Mutants 8/8 killed (int() back in integer()/star(), no zero-mantissa
+  return, hex exponent int(), no decimal-exponent clamp, no wrapper,
+  no lstrip, 18-digit saturation).
+---
+ cron/lifecycle_guard_printf.py                | 12 +++++--
+ cron/lifecycle_guard_printf_number.py         | 35 ++++++++++++++++---
+ .../cron/test_lifecycle_guard_output_sink.py  | 26 ++++++++++++++
+ 3 files changed, 66 insertions(+), 7 deletions(-)
+
+diff --git a/cron/lifecycle_guard_printf.py b/cron/lifecycle_guard_printf.py
+index 745b8bc457..3a2888d8d0 100644
+--- a/cron/lifecycle_guard_printf.py
++++ b/cron/lifecycle_guard_printf.py
+@@ -26,7 +26,8 @@ import re
+ import time
+ from typing import Callable, Iterator, Optional, cast
+ 
+-from cron.lifecycle_guard_printf_number import FLOAT_MODELS, X87, FloatModel, format_number, integer
++from cron.lifecycle_guard_printf_number import (
++    FLOAT_MODELS, X87, FloatModel, decimal_digits, format_number, integer)
+ 
+ PRINTF_MAX_ROUNDS = 64
+ # The guard's whole-walk scan budget (lifecycle_guard._MAX_LIFECYCLE_SCAN_BYTES, pinned equal by a
+@@ -172,7 +173,7 @@ def printf_output(format_text: str, arguments: list[str], model: FloatModel = X8
+ 
+     def star(value: str) -> Optional[int]:
+         """A width or precision: digits, or `*` taking the next argument as a number."""
+-        return integer(take() or "") if value == "*" else (int(value) if value else None)
++        return integer(take() or "") if value == "*" else (decimal_digits(value) if value else None)
+ 
+     for _round in range(PRINTF_MAX_ROUNDS):
+         start = position
+@@ -260,7 +261,12 @@ def printed_argument_lines(name: str, arguments: list[str]) -> Iterator[str]:
+         # floating conversion prints the same under all, and the caller dedupes the lines.
+         models = FLOAT_MODELS if _FLOAT_CONVERSION_RE.search(arguments[start]) else (X87,)
+         for model in models:
+-            yield printf_output(arguments[start], arguments[start + 1 :], model)
++            try:
++                yield printf_output(arguments[start], arguments[start + 1 :], model)
++            except (ValueError, ArithmeticError):
++                # Fail closed: a model bug must not abort the guard's walk (its caller falls
++                # back to the direct scan); the variants around this one are still walked.
++                continue
+     # Fail closed: also the earlier whole-argument walk (each conversion takes its argument as
+     # written, format after every leading `-word`), so the model never yields less than it did.
+     if index < len(arguments):
+diff --git a/cron/lifecycle_guard_printf_number.py b/cron/lifecycle_guard_printf_number.py
+index 2c8c928f5d..4750d509ca 100644
+--- a/cron/lifecycle_guard_printf_number.py
++++ b/cron/lifecycle_guard_printf_number.py
+@@ -33,6 +33,12 @@ _HEX_FLOAT_RE = re.compile(r"0x([0-9a-f]*)\.?([0-9a-f]*)(?:p([-+]?[0-9]+))?")
+ # Fraction, so `1e999999999` cannot allocate a huge integer.
+ _BINARY_EXP_LIMIT = 16500
+ _DECIMAL_EXP_LIMIT = 5000
++# Past 20 decimal digits a number is beyond 2**64, where strtoimax/strtoumax saturate and every
++# width, precision and exponent caller caps; Python's int() refuses a decimal string past 4300
++# digits (ValueError), which would abort the guard's whole walk, so longer ones saturate here.
++_SATURATED_DIGITS = 20
++_DECIMAL_EXPONENT_DIGITS = 12
++_DECIMAL_EXPONENT_RE = re.compile(r"(.*?)[eE]([-+]?)0*([0-9]+)")
+ 
+ 
+ class FloatModel(NamedTuple):
+@@ -55,6 +61,18 @@ Special = str  # "inf" or "nan"
+ Real = tuple[bool, Fraction | Special]  # (negative, exact value or special)
+ 
+ 
++def decimal_digits(digits: str) -> int:
++    """``int(digits)`` of a decimal digit string, saturated to ``10**20`` past 20 significant
++    digits (see _SATURATED_DIGITS): never the ValueError of Python's int-string limit."""
++    digits = digits.lstrip("0")
++    return int(digits or "0") if len(digits) <= _SATURATED_DIGITS else 10**_SATURATED_DIGITS
++
++
++def _signed_digits(sign: Optional[str], digits: str) -> int:
++    value = decimal_digits(digits)
++    return -value if sign == "-" else value
++
++
+ def integer(text: str) -> int:
+     """``strtoimax`` of *text* as bash's printf reads a number: ``'c`` is the code of c, the
+     longest numeric prefix counts (``12abc`` is 12, ``08`` is 0) and anything else is 0."""
+@@ -68,8 +86,8 @@ def integer(text: str) -> int:
+         value = int(digits, 0)
+     elif digits.startswith("0"):
+         value = int(digits, 8)
+-    else:
+-        value = int(digits)
++    else:  # base 8 and 16 have no int-string limit; base 10 does
++        value = decimal_digits(digits)
+     return -value if match[1] == "-" else value
+ 
+ 
+@@ -122,10 +140,19 @@ def _parse_real(text: str) -> Real:
+     if hex_match:
+         whole, fraction, exponent = hex_match.groups()
+         mantissa = int(whole + fraction or "0", 16)
+-        power = int(exponent or "0") - 4 * len(fraction)
+-        if mantissa and abs(mantissa.bit_length() + power) > _BINARY_EXP_LIMIT:
++        if not mantissa:  # 0 at any exponent: `0x0p9999999999` must not build 2**9999999999
++            return negative, Fraction(0)
++        sign, exponent_digits = (exponent[:1], exponent[1:]) if exponent and exponent[0] in "+-" \
++            else ("", exponent or "0")
++        power = _signed_digits(sign, exponent_digits) - 4 * len(fraction)
++        if abs(mantissa.bit_length() + power) > _BINARY_EXP_LIMIT:
+             return negative, "inf" if power > 0 else Fraction(0)
+         return negative, mantissa * Fraction(2) ** power
++    exponent_match = _DECIMAL_EXPONENT_RE.fullmatch(word)
++    if exponent_match and len(exponent_match[3]) > _DECIMAL_EXPONENT_DIGITS:
++        # Decimal() refuses an exponent past ~10**18 (InvalidOperation, which would read as 0);
++        # 10**12 is already far past _DECIMAL_EXP_LIMIT, so the value is inf or 0 either way.
++        word = f"{exponent_match[1]}e{exponent_match[2]}{10**_DECIMAL_EXPONENT_DIGITS}"
+     try:
+         decimal = Decimal(word)
+     except InvalidOperation:
+diff --git a/tests/cron/test_lifecycle_guard_output_sink.py b/tests/cron/test_lifecycle_guard_output_sink.py
+index d0a56e0ef2..1d4b8d3175 100644
+--- a/tests/cron/test_lifecycle_guard_output_sink.py
++++ b/tests/cron/test_lifecycle_guard_output_sink.py
+@@ -16,6 +16,9 @@ from cron.lifecycle_guard import scan_gateway_lifecycle
+ from tools.shell_heredoc import output_reaches_shell, strip_inert_heredoc_bodies
+ 
+ _PRINT = "print('bash {big}')\n"
++# Past Python's 4300-digit int-string limit (int() raises ValueError there).
++_LONG_DIGITS = "9" * 4400
++_LONG_ZEROS = "0" * 4400
+ # The reviewer's two repros verbatim (paths moved under tmp_path), then the other sinks the card
+ # names.
+ _SINK_SHAPES = {
+@@ -83,6 +86,11 @@ _SINK_SHAPES = {
+     "printf-v": "printf -v x '%s %s' bash {big}; echo $x | bash\n",
+     "printf-v-dashdash": "printf -v x -- '%s %s' bash {big}; echo $x | bash\n",
+     "printf-v-glued": "printf -vx -- '%s %s' bash {big}; echo $x | bash\n",
++    # Review 5897387636 (PR #2506): a >4300-digit decimal made Python's int() raise, which aborted
++    # the walk (direct-scan fallback: allowed). bash saturates the number and runs the script.
++    "printf-long-decimal": f"printf '%d\\n%s %s\\n' {_LONG_DIGITS} bash {{big}} | bash\n",
++    "printf-long-decimal-group": f"{{ printf '%d\\n%s %s\\n' {_LONG_DIGITS} bash {{big}}; }} | bash\n",
++    "printf-long-precision": f"printf '%.{_LONG_ZEROS}4s %s' bashrc {{big}} | bash\n",  # `bash`
+     # Kept from the old opener peel (fails closed): a leading `in` is not read as the command.
+     "echo-after-in": "for w\nin echo bash {big}; do :; done | bash\n",
+     # Nit 3 (intended, fails closed): any later pipe word counts as the shell, a grep pattern too.
+@@ -307,6 +315,12 @@ _BASH_PRINTF_CASES = [
+     # Ties round half-even; a carry past 9.99… or past the significand's top bit renormalizes.
+     ("%.0a|%.0a|%.1a|%.2e|%g|%a|%f|%e|", ["0x8.8p0", "0xa.8p0", "0x8.08p0", "9.999", "999999.5",
+                                           "0x1.ffffffffffffffffp0", "1e4933", "-1e-5000"]),
++    # Review 5897387636 (PR #2506): numbers past Python's 4300-digit int() limit saturate as in
++    # C instead of raising (a literal precision's leading zeros too).
++    ("%d|%u|%i|%x|", [_LONG_DIGITS, "-" + _LONG_DIGITS, "1" + _LONG_ZEROS, _LONG_DIGITS]),
++    ("%f|%e|%a|%g|", ["1e" + _LONG_DIGITS, "1e-" + _LONG_DIGITS, "0x1p" + _LONG_DIGITS,
++                      "0x0p" + _LONG_DIGITS]),
++    ("%.*s|%d|%." + _LONG_ZEROS + "4s|", [_LONG_ZEROS + "3", "abcdef", "5", "bashrc"]),
+ ]
+ 
+ 
+@@ -350,6 +364,18 @@ def test_printf_lines_keep_the_whole_argument_walk():
+     assert {"0x8p-3", "0x1p+0"} <= floats  # x86's long double and a double (arm64 Mac)
+ 
+ 
++def test_a_printf_model_error_does_not_abort_the_walk(monkeypatch):
++    from cron import lifecycle_guard_printf
++
++    def broken(*_args, **_kwargs):
++        raise ValueError("model bug")
++
++    monkeypatch.setattr(lifecycle_guard_printf, "printf_output", broken)
++    lines = list(lifecycle_guard_printf.printed_argument_lines(
++        "printf", ["%s %s", "bash", "/x/a.sh"]))
++    assert "bash /x/a.sh" in lines  # the variants around the model are still walked
++
++
+ def test_long_double_rounding_carries_into_the_exponent():
+     from fractions import Fraction
+ 
+-- 
+2.43.0
+

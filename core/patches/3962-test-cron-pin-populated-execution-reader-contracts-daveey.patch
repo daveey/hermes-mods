@@ -1,0 +1,115 @@
+From eb13a515970f32e039786e574b2a03d1c92b6723 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:40:38 +0000
+Subject: [PATCH] test(cron): pin populated execution reader contracts [daveey]
+
+Cover newest of multiple live attempts, populated excluded latest/live rows, real fork isolation and shm-only reader invalidation. Production: 23 passed across the list memo suites; focused mutation baseline 12 passed, zero skips. M3/M4/M7/M8 and latest-filter removal each fail one behavioral assertion with 11 controls passing. scripts/check: 20 checks OK. Test-only; no updater or production changes.
+---
+ tests/cron/test_list_jobs_executions_memo.py | 79 ++++++++++++++++++++
+ 1 file changed, 79 insertions(+)
+
+diff --git a/tests/cron/test_list_jobs_executions_memo.py b/tests/cron/test_list_jobs_executions_memo.py
+index 03a46761a8..c6b8ad8205 100644
+--- a/tests/cron/test_list_jobs_executions_memo.py
++++ b/tests/cron/test_list_jobs_executions_memo.py
+@@ -5,6 +5,7 @@ cron poll still opened executions.db twice per profile per list (connect + WAL p
+ An unchanged ledger must now cost no open, and a start, a finish or an owner's death must still show on the
+ very next list. [daveey]
+ """
++import multiprocessing
+ import shutil
+ import sqlite3
+ 
+@@ -133,11 +134,89 @@ def test_listed_executions_matches_the_exact_reads(ledger):
+     ce.finish_execution(a["id"], success=True)
+     ce.create_execution(ids[0], source="builtin")
+     ce.create_execution(ids[1], source="builtin")
++    ce.create_execution(ids[2], source="builtin")  # excluded job has both latest and live rows
+     assert ce.listed_executions(ids[:2]) == (ce.latest_executions(ids[:2]), ce.live_executions(ids[:2]))
+     assert ce.listed_executions(ids) == (ce.latest_executions(ids), ce.live_executions(ids))
+     assert ce.listed_executions([]) == ({}, {})
+ 
+ 
++def test_multiple_live_attempts_choose_newest_on_cold_and_warm_reads(ledger):
++    older = ce.create_execution("job", source="builtin")
++    newer = ce.create_execution("job", source="builtin")
++    # Explicit instants avoid clock resolution and UUID tie-breaking deciding the winner.
++    with ce._transaction() as conn:
++        conn.execute("UPDATE executions SET claimed_at=? WHERE id=?",
++                     ("2026-01-01T00:00:00+00:00", older["id"]))
++        conn.execute("UPDATE executions SET claimed_at=? WHERE id=?",
++                     ("2026-01-02T00:00:00+00:00", newer["id"]))
++    expected = ce.live_executions(["job"])
++    assert expected["job"]["id"] == newer["id"]
++    for _ in range(2):
++        latest, live = ce.listed_executions(["job"])
++        assert latest["job"]["id"] == newer["id"]
++        assert live == expected
++
++
++def test_forked_child_does_not_query_inherited_reader(ledger):
++    run = ce.create_execution("job", source="builtin")
++    expected = ce.listed_executions(["job"])
++    inherited = ce._VIEWS[str(ledger)]["conn"]
++    queries = []
++    inherited.set_trace_callback(queries.append)
++    ctx = multiprocessing.get_context("fork")
++    receive, send = ctx.Pipe(duplex=False)
++
++    def read_in_child():
++        result = ce.listed_executions(["job"])
++        send.send((result, queries, ce._VIEWS[str(ledger)]["conn"] is inherited))
++        send.close()
++
++    child = ctx.Process(target=read_in_child)
++    try:
++        child.start()
++        send.close()
++        assert receive.poll(10), "child did not return its ledger read"
++        result, child_queries, reused = receive.recv()
++        child.join(10)
++        assert child.exitcode == 0
++        assert result == expected
++        assert child_queries == []
++        assert not reused
++        # The parent's handle and populated view remain usable after the child exits.
++        assert inherited.execute("SELECT id FROM executions").fetchone()[0] == run["id"]
++        assert ce.listed_executions(["job"]) == expected
++    finally:
++        if child.is_alive():
++            child.terminate()
++            child.join(10)
++        receive.close()
++        send.close()
++        inherited.set_trace_callback(None)
++
++
++def test_changed_shm_identity_reopens_reader_with_unchanged_database(ledger, monkeypatch):
++    ce.create_execution("job", source="builtin")
++    expected = ce.listed_executions(["job"])
++    key = str(ledger)
++    old = ce._VIEWS[key]
++    ident = ce._file_ident
++    db_ident = ident(key)
++    assert old["shm"] is not None
++    assert ce.listed_executions(["job"]) == expected  # settled memo-hit control
++    assert ce._VIEWS[key] is old
++    # Model only the stat boundary: never unlink an mmap-backed live SQLite WAL index.
++    changed_shm = (old["shm"][0], old["shm"][1] + 1)
++    monkeypatch.setattr(ce, "_file_ident", lambda path: changed_shm if path == key + "-shm" else ident(path))
++    assert ce._file_ident(key) == db_ident
++    assert ce.listed_executions(["job"]) == expected
++    assert ce._VIEWS[key]["conn"] is not old["conn"]
++    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
++        old["conn"].execute("SELECT 1")
++    replacement = ce._VIEWS[key]["conn"]
++    assert ce.listed_executions(["job"]) == expected
++    assert ce._VIEWS[key]["conn"] is replacement
++
++
+ def test_no_ledger_file_yet_takes_the_exact_path(ledger):
+     job = cj.create_job(prompt="first", schedule="every 1h", name="one")
+     assert not ledger.exists()
+-- 
+2.43.0
+

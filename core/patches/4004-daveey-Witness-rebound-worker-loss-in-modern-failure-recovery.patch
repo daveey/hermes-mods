@@ -1,0 +1,251 @@
+From e9fad3d004a8f18ded5ff293eeee325329af3385 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 01:00:23 +0000
+Subject: [PATCH] [daveey] Witness rebound worker loss in modern failure
+ recovery
+
+A restart receipt becomes unattributable after a continued worker binds. If that worker dies before recording its own result, the diagnostic worker_lost cannot satisfy strict recovery and modern evidence vetoes expiry forever. Capture a causal loss receipt at the owner write, retain unknown exit status and all historical death fences, and let dispatcher/observer book one crash. Existing legacy losses stay legacy; later bindings/results and damaged receipts hold. RED: both observer/dispatcher restart-rebind-loss tests retain running. GREEN: 1471 tests across nine focused/guard suites; new regression controls 8 passed. Live incident and five-whys: t_01a1d76bb38f3504.
+---
+ gateway/session_kanban.py                     |  4 +-
+ hermes_cli/kanban_db_dispatch.py              |  5 +-
+ hermes_cli/kanban_failed_result.py            |  5 +-
+ hermes_cli/kanban_failed_result_identity.py   | 19 +++---
+ hermes_cli/kanban_lost_result.py              | 46 +++++++++++++
+ .../test_kanban_rebound_worker_loss.py        | 67 +++++++++++++++++++
+ 6 files changed, 132 insertions(+), 14 deletions(-)
+ create mode 100644 hermes_cli/kanban_lost_result.py
+ create mode 100644 tests/hermes_cli/test_kanban_rebound_worker_loss.py
+
+diff --git a/gateway/session_kanban.py b/gateway/session_kanban.py
+index 7ce9cf757d..97f1367911 100644
+--- a/gateway/session_kanban.py
++++ b/gateway/session_kanban.py
+@@ -462,9 +462,11 @@ def record_worker_loss(policy, reason, *, pid=None, bound=False):
+                                (context['task_id'],)).fetchone()
+             if row is None or row[0] != 'running' or row[1] != run_id:
+                 return
++            from hermes_cli.kanban_lost_result import loss_identity_fields
++            witness = loss_identity_fields(conn, context, pid, bound)
+             kb._append_event(conn, context['task_id'], 'worker_lost',
+                              {'reason': str(reason)[:200], 'claim_lock': context['claim_lock'],
+-                              'run_id': run_id, 'pid': pid, 'bound': bool(bound)},
++                              'run_id': run_id, 'pid': pid, 'bound': bool(bound), **witness},
+                              run_id=run_id)
+     except Exception:
+         import logging
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 958ee5c7f4..63dd98cad5 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1302,9 +1302,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None,
+             if proof is None:
+                 apply_attempt_note(conn, row["id"], pid, dead)
+             else:
+-                dead.event_payload.update({k: v for k, v in proof.items() if k != 'result'})
+-                dead.event_payload['reconciled_at'] = int(time.time())
+-                dead.event_payload['reconciled_by'] = 'observer' if failed_results_only else 'dispatcher'
++                from hermes_cli.kanban_lost_result import annotate_loss
++                annotate_loss(dead, proof, int(time.time()), failed_results_only)
+             _owner_death.note(dead, conn, row["id"], row["current_run_id"])  # owner died under it [daveey]
+             _guard_refusal.note(dead, conn, row["id"], row["current_run_id"])  # host refused its kanban calls [daveey]
+             dead.run_id = row["current_run_id"]
+diff --git a/hermes_cli/kanban_failed_result.py b/hermes_cli/kanban_failed_result.py
+index d08e3447ad..1dd332b1fd 100644
+--- a/hermes_cli/kanban_failed_result.py
++++ b/hermes_cli/kanban_failed_result.py
+@@ -152,7 +152,10 @@ def failed_result_receipt(conn, task_id, run_id, claim_lock, *, allow_continuabl
+     if owner and (bound.get('pid'), bound.get('started_at')) != (row['worker_pid'], row['worker_started_at']):
+         return None
+     code = result.get('exit_code')
+-    if (not isinstance(code, int) or isinstance(code, bool) or (code == 0 and not (allow_clean and modern))
++    loss = result_event['kind'] == 'worker_lost' and result.get('loss_receipt') is True
++    if loss and (result.get('bound') is not True or code is not None):
++        return None
++    if ((not loss and (not isinstance(code, int) or isinstance(code, bool))) or (code == 0 and not (allow_clean and modern))
+             or (result.get('continuable') and not (owner and allow_continuable))
+             or (not modern and result_event['id'] <= bound_event['id'])
+             or result.get('pid') != bound.get('pid')):
+diff --git a/hermes_cli/kanban_failed_result_identity.py b/hermes_cli/kanban_failed_result_identity.py
+index 2ff22ca346..2619fc18be 100644
+--- a/hermes_cli/kanban_failed_result_identity.py
++++ b/hermes_cli/kanban_failed_result_identity.py
+@@ -22,8 +22,8 @@ def owner_restart_identity_fields(conn, context, task):
+                 and payload['pid'] == task.worker_pid
+                 and payload.get('started_at') == birth
+                 and valid_birth(birth)):
+-            rows = conn.execute("SELECT * FROM task_events WHERE task_id=? AND run_id=? "
+-                                "AND kind IN ('worker_result','worker_bound')", params).fetchall()
++            from hermes_cli.kanban_lost_result import evidence_rows
++            rows = evidence_rows(conn, *params)
+             sequences = [p['result_sequence'] for row in rows
+                          if (p := _payload(row)) and type(p.get('result_sequence')) is int]
+             return {'death_proof_version': 1, 'result_role': 'owner_restart',
+@@ -138,15 +138,14 @@ def result_identity_fields(conn, context):
+                          "AND kind='worker_bound' ORDER BY id DESC LIMIT 1", params).fetchone()
+     if bound is None or (payload := _payload(bound)) is None:
+         raise ValueError('result binding missing')
++    from hermes_cli.kanban_lost_result import evidence_rows
++    history = evidence_rows(conn, *params)
+     sequences = [0]
+-    for event in conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+-                              "AND kind='worker_result'", params):
++    for event in history:
+         prior = _payload(event)
+         seq = prior.get('result_sequence') if prior else None
+         if type(seq) is int and seq > 0:
+             sequences.append(seq)
+-    history = conn.execute("SELECT * FROM task_events WHERE task_id=? AND run_id=? "
+-                           "AND kind IN ('worker_result','worker_bound')", params).fetchall()
+     return {'bound_event_identity': _identity(bound, payload), 'result_sequence': max(sequences) + 1,
+             'causal_predecessors': [_event_identity(event) for event in history]}
+ 
+@@ -158,9 +157,9 @@ def attributable_events(conn, task_id, run_id):
+     with distinct identities also require ordinary operator recovery, not an
+     inferred causal order from replica-local integers.
+     """
+-    rows = conn.execute("SELECT * FROM task_events WHERE task_id=? AND run_id=? "
+-                        "AND kind IN ('worker_result','worker_bound') ORDER BY id", (task_id, run_id)).fetchall()
+-    results = [(row, _payload(row)) for row in rows if row['kind'] == 'worker_result']
++    from hermes_cli.kanban_lost_result import evidence_rows
++    rows = evidence_rows(conn, task_id, run_id)
++    results = [(row, _payload(row)) for row in rows if row['kind'] != 'worker_bound']
+     bounds = [(row, _payload(row)) for row in rows if row['kind'] == 'worker_bound']
+     if not results:
+         return None
+@@ -178,6 +177,8 @@ def attributable_events(conn, task_id, run_id):
+         return _observed_history(rows, results, bounds)
+     result = results[sequences.index(max(cast(list[int], sequences)))]
+     assert result[1] is not None  # validated alongside its positive sequence above
++    if result[0]['kind'] == 'worker_lost':
++        return _observed_history(rows, results, bounds)
+     if 'result_role' in result[1] or 'outer_event_identity' in result[1]:
+         return None  # owner roles are accepted only through their witnessed path
+     identity = result[1].get('bound_event_identity')
+diff --git a/hermes_cli/kanban_lost_result.py b/hermes_cli/kanban_lost_result.py
+new file mode 100644
+index 0000000000..945b5f2204
+--- /dev/null
++++ b/hermes_cli/kanban_lost_result.py
+@@ -0,0 +1,46 @@
++"""Owner-witnessed loss receipts for modern runs, without inventing an exit code."""
++from __future__ import annotations
++
++import json
++
++
++def annotate_loss(dead, proof, now, observer):
++    """Keep the authoritative loss reason without consulting the owner's session store."""
++    dead.event_payload.update({k: v for k, v in proof.items() if k != 'result'})
++    dead.event_payload['reconciled_at'] = now
++    dead.event_payload['reconciled_by'] = 'observer' if observer else 'dispatcher'
++    result = proof['result']
++    if result.get('loss_receipt') is True:
++        note = f"managed worker lost: {str(result.get('reason') or 'unknown')[:80]}"
++        dead.error_text = f"{note}; {dead.error_text}"
++        dead.event_payload['attempt_note'] = note
++
++
++def loss_identity_fields(conn, context, pid, bound):
++    """Called under the owner's loss transaction; a stale interpreter cannot attest a successor."""
++    from hermes_cli.kanban_failed_result import modern_result_recorded, recorded_process_witnesses
++    from hermes_cli.kanban_failed_result_identity import result_identity_fields
++    if bound is not True or type(pid) is not int or pid <= 0:
++        return {}
++    if not modern_result_recorded(conn, context['task_id'], context['run_id']):
++        return {}  # Preserve the legacy loss policy.
++    if not recorded_process_witnesses(conn, context):
++        return {}
++    event = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
++                         "AND kind='worker_bound' ORDER BY id DESC LIMIT 1",
++                         (context['task_id'], context['run_id'])).fetchone()
++    payload = json.loads(event['payload'])
++    if (payload.get('pid'), payload.get('claim_lock')) != (pid, context['claim_lock']):
++        return {}
++    return {'death_proof_version': 1, 'loss_receipt': True, 'exit_code': None,
++            **result_identity_fields(conn, context)}
++
++
++def evidence_rows(conn, task_id, run_id):
++    """Legacy diagnostic losses are not receipts; marked losses join the causal history."""
++    from hermes_cli.kanban_failed_result_identity import _payload
++    rows = conn.execute("SELECT * FROM task_events WHERE task_id=? AND run_id=? "
++                        "AND kind IN ('worker_result','worker_bound','worker_lost') ORDER BY id",
++                        (task_id, run_id)).fetchall()
++    return [row for row in rows if row['kind'] != 'worker_lost'
++            or (_payload(row) or {}).get('loss_receipt') is True]
+diff --git a/tests/hermes_cli/test_kanban_rebound_worker_loss.py b/tests/hermes_cli/test_kanban_rebound_worker_loss.py
+new file mode 100644
+index 0000000000..fabdf76aae
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_rebound_worker_loss.py
+@@ -0,0 +1,67 @@
++"""A continued worker lost before its result must not retain a modern claim."""
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from gateway.session_kanban import record_worker_loss
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_failed_result as proof
++from tests.hermes_cli import test_kanban_owner_restart_failed_receipt as restart
++
++board = restart.board
++
++
++def lost_after_restart(conn, context):
++    restart._failed_child(conn, context)
++    restart.book(context, True)
++    import subprocess
++    import sys
++    from pathlib import Path
++    from tools.environments.local import build_subprocess_env
++    child = restart._CONTINUED_CHILD.replace('_record_worker_result(context, code, output)', 'pass')
++    done = subprocess.run([sys.executable, '-c', child, json.dumps(context), '1', ''],
++                          capture_output=True, text=True, encoding='utf-8', timeout=60, check=False,
++                          env=build_subprocess_env(), cwd=str(Path(__file__).resolve().parents[2]))
++    assert done.returncode == 0, done.stderr
++    bound = json.loads(conn.execute("SELECT payload FROM task_events WHERE kind='worker_bound' ORDER BY id DESC LIMIT 1").fetchone()[0])
++    record_worker_loss(SimpleNamespace(kanban_json=json.dumps(context)), 'EOFError', pid=bound['pid'], bound=True)
++    return bound
++
++
++@pytest.mark.parametrize('observer', [False, True])
++def test_rebound_loss_closes_once_without_fabricating_exit_status(board, observer):
++    conn, context = board
++    lost_after_restart(conn, context)
++    dispatch.detect_crashed_workers(conn, failed_results_only=observer)
++    task = kb.get_task(conn, context['task_id'])
++    run = conn.execute('SELECT * FROM task_runs WHERE id=?', (context['run_id'],)).fetchone()
++    assert task.status == 'ready'
++    assert run['outcome'] == 'crashed' and run['ended_at'] is not None
++    assert task.consecutive_failures == 1
++    assert 'EOFError' in run['error']
++    dispatch.detect_crashed_workers(conn, failed_results_only=observer)
++    assert kb.get_task(conn, context['task_id']).consecutive_failures == 1
++
++
++@pytest.mark.parametrize('damage', ['live', 'wrong_pid', 'wrong_claim', 'unbound', 'later_binding', 'later_result'])
++def test_loss_cannot_close_unproven_or_superseded_attempt(board, monkeypatch, damage):
++    conn, context = board
++    bound = lost_after_restart(conn, context)
++    if damage == 'live':
++        monkeypatch.setattr(proof, 'process_gone', lambda *a: False)
++    else:
++        with kb.write_txn(conn):
++            event = conn.execute("SELECT * FROM task_events WHERE kind='worker_lost'").fetchone()
++            payload = json.loads(event['payload'])
++            if damage.startswith('later_'):
++                kind = 'worker_bound' if damage == 'later_binding' else 'worker_result'
++                kb._append_event(conn, context['task_id'], kind, bound, run_id=context['run_id'])
++            else:
++                key, value = {'wrong_pid': ('pid', 1), 'wrong_claim': ('claim_lock', 'foreign:1'),
++                              'unbound': ('bound', False)}[damage]
++                payload[key] = value
++                conn.execute('UPDATE task_events SET payload=? WHERE id=?', (json.dumps(payload), event['id']))
++    dispatch.detect_crashed_workers(conn)
++    assert kb.get_task(conn, context['task_id']).status == 'running'
+-- 
+2.43.0
+

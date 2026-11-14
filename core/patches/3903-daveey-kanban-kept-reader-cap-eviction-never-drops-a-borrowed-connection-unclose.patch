@@ -1,0 +1,176 @@
+From 84c7510975cd5de047ea84489bb83d87a959e8ab Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:51:00 +0000
+Subject: [PATCH] [daveey] kanban kept reader: cap eviction never drops a
+ borrowed connection unclosed
+
+PR #2654 review nit 1 (card t_01a1d6cb5b70c51b). When a thread held more than
+MAX_PER_THREAD (16) kept boards, reading() popped the oldest entry from the
+thread map even while it was borrowed. Its lock could not be taken, so it was
+never closed explicitly: after the borrow it was unreachable from the thread
+map (close_all, the next borrow) and left to GC, holding db/-wal/-shm fds.
+Only list_triage_ids uses the reader today and it never nests borrows, but
+later callers (cards G1/H2) will.
+
+Fix (_enforce_cap): evict the oldest IDLE entry and close it explicitly; skip
+borrowed entries. Only when every older entry is borrowed is the oldest
+detached, and reading()'s exit now closes any entry that is no longer the
+thread map's entry for its key, so nothing is left to GC.
+
+Proof:
+- RED on origin/main: test_cap_eviction_skips_a_borrowed_entry_and_closes_the_idle_one
+  (borrow A, open 16 other boards inside: A was popped from the map) and
+  test_cap_overflow_with_every_entry_borrowed_closes_the_evicted_one_on_exit
+  (17 nested borrows: A's connection still open after its borrow exits).
+- GREEN: tests/hermes_cli/test_kanban_kept_reader.py + test_kanban_decompose.py.
+- Mutants (each killed): drop the detach-close in finally; drop the idle
+  close; evict regardless of borrow; drop the all-borrowed fallback pop.
+- scripts/check --base origin/main: ok.
+---
+ hermes_cli/kanban_kept_reader.py            | 31 +++++++----
+ tests/hermes_cli/test_kanban_kept_reader.py | 59 +++++++++++++++++++++
+ 2 files changed, 81 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/kanban_kept_reader.py b/hermes_cli/kanban_kept_reader.py
+index 2701609cd1..a1ba94bbfc 100644
+--- a/hermes_cli/kanban_kept_reader.py
++++ b/hermes_cli/kanban_kept_reader.py
+@@ -43,7 +43,9 @@ from typing import Iterator, Optional
+ 
+ from hermes_cli import kanban_generation as _gen
+ 
+-# Boards one thread keeps at once; the oldest idle one is closed past this (each holds db + -wal + -shm fds).
++# Boards one thread keeps at once; past this the oldest idle one is closed (each holds db + -wal + -shm fds).
++# A borrowed entry is never evicted under its borrower: if every older entry is borrowed, the oldest is detached
++# and closed by its own borrow's exit.
+ MAX_PER_THREAD = 16
+ 
+ 
+@@ -217,14 +219,7 @@ def reading(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> I
+         with _registry_lock:
+             _registry.add(entry)
+         mine[key] = entry
+-        while len(mine) > MAX_PER_THREAD:
+-            old_key, old = next(iter(mine.items()))
+-            mine.pop(old_key)
+-            if old.lock.acquire(blocking=False):
+-                try:
+-                    _close(old)
+-                finally:
+-                    old.lock.release()
++        _enforce_cap(mine)
+     mine.move_to_end(key)
+     conn = entry.conn
+     keep = False
+@@ -239,6 +234,8 @@ def reading(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> I
+         keep = not entry.closed and not _in_transaction(conn)
+         raise
+     finally:
++        if mine.get(key) is not entry:
++            keep = False  # detached from the map while borrowed (the cap): nothing else would close it
+         if not keep:
+             if mine.get(key) is entry:
+                 mine.pop(key, None)
+@@ -246,6 +243,22 @@ def reading(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> I
+         entry.lock.release()
+ 
+ 
++def _enforce_cap(mine: OrderedDict[str, _Entry]) -> None:
++    """Close this thread's oldest idle entries past ``MAX_PER_THREAD``. A borrowed entry is skipped; only when
++    every older entry is borrowed is the oldest detached, and its borrow's exit closes it."""
++    while len(mine) > MAX_PER_THREAD:
++        for old_key, old in list(mine.items()):  # the entry just added is borrowed, so never picked
++            if old.lock.acquire(blocking=False):
++                try:
++                    mine.pop(old_key, None)
++                    _close(old)
++                finally:
++                    old.lock.release()
++                break
++        else:
++            mine.popitem(last=False)
++
++
+ def _in_transaction(conn: sqlite3.Connection) -> bool:
+     try:
+         return conn.in_transaction
+diff --git a/tests/hermes_cli/test_kanban_kept_reader.py b/tests/hermes_cli/test_kanban_kept_reader.py
+index 86daacf03a..911994c3b9 100644
+--- a/tests/hermes_cli/test_kanban_kept_reader.py
++++ b/tests/hermes_cli/test_kanban_kept_reader.py
+@@ -6,6 +6,7 @@ the connection is reopened whenever the board file, its WAL generation or its in
+ """
+ from __future__ import annotations
+ 
++import contextlib
+ import os
+ import sqlite3
+ import threading
+@@ -167,6 +168,64 @@ def test_nested_borrow_gets_its_own_connection(board):
+         assert again is outer
+ 
+ 
++def _boards(base: Path, n: int) -> list[Path]:
++    paths = []
++    for i in range(n):
++        path = base.parent / f"extra-{i}.db"
++        kb.init_db(path)
++        paths.append(path)
++    return paths
++
++
++def _is_closed(conn: sqlite3.Connection) -> bool:
++    try:
++        conn.execute("SELECT 1")
++    except sqlite3.ProgrammingError:
++        return True
++    return False
++
++
++def _thread_map() -> dict:
++    return dict(kept._mine())
++
++
++def test_cap_eviction_skips_a_borrowed_entry_and_closes_the_idle_one(board):
++    """RED on main: opening ``MAX_PER_THREAD`` other boards inside a borrow of board A popped A (the oldest) from
++    the thread map although it was borrowed; A was then never closed explicitly (left to GC) and was no longer
++    reachable by recovery or ``close_all``. The cap must evict the oldest IDLE entry, close it, and keep A."""
++    others = _boards(board, kept.MAX_PER_THREAD)
++    key_a = gen._resolved(str(board))
++    with kept.reading(board) as a:
++        opened = []
++        for path in others:
++            with kept.reading(path) as conn:
++                opened.append(conn)
++        assert key_a in _thread_map(), "a borrowed entry was evicted from the thread map"
++        assert a.execute("SELECT 1").fetchone()[0] == 1
++    assert _is_closed(opened[0]), "the evicted idle connection was left to GC instead of closed"
++    assert all(not _is_closed(c) for c in opened[1:])
++    assert len(_thread_map()) == kept.MAX_PER_THREAD
++    with kept.reading(board) as again:
++        assert again is a  # still kept, reachable by close_all/recovery
++    assert kept.close_all() == kept.MAX_PER_THREAD
++    assert _is_closed(a)
++
++
++def test_cap_overflow_with_every_entry_borrowed_closes_the_evicted_one_on_exit(board):
++    """Every kept entry borrowed (nested borrows of MAX_PER_THREAD + 1 boards): the oldest is detached from the map
++    and its connection is closed when its own borrow exits, not leaked."""
++    others = _boards(board, kept.MAX_PER_THREAD)
++    with contextlib.ExitStack() as stack:
++        a = stack.enter_context(kept.reading(board))
++        for path in others:
++            stack.enter_context(kept.reading(path))
++        assert len(_thread_map()) == kept.MAX_PER_THREAD
++        assert gen._resolved(str(board)) not in _thread_map()
++        assert a.execute("SELECT 1").fetchone()[0] == 1  # never closed under its borrower
++    assert _is_closed(a)
++    assert len(_thread_map()) == kept.MAX_PER_THREAD
++
++
+ def test_sqlite_error_in_body_drops_the_connection(board):
+     with pytest.raises(sqlite3.OperationalError):
+         with kept.reading() as conn:
+-- 
+2.43.0
+

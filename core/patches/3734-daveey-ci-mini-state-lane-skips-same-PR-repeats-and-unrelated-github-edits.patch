@@ -1,0 +1,544 @@
+From 75c3f73a6db767b2f764bb739a421c1a0b5bf479 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 16:37:38 +0000
+Subject: [PATCH] [daveey] ci: mini state lane skips same-PR repeats and
+ unrelated .github edits
+
+The one mini runner (mini-hermes-state-1) ran at 0.88 utilisation on PR
+`tests/hermes_state (macOS, mini)` jobs alone after #1912 dropped the
+main-push runs: 08:23-16:00Z on 2026-11-13, 31 PR jobs started (~10.5 min
+median, 368 runner-minutes), wait median 19.7 min, p90 63 min, max 91 min.
+
+Five whys
+1. Why did PRs wait? Demand on the one runner was ~4 jobs/h at ~10 min.
+2. Why that much demand? Branches re-ran the lane on every push: 9 of the
+   31 started runs repeated their branch's previous passing run on identical
+   content of every lane-routing file (e.g. wt/e6cce5965c-watch-mark 5 runs,
+   hermes_state_outcome.py unchanged; wt/gateway-quiet-v3 4 runs, pyproject.toml
+   unchanged). 3 more were PRs whose only lane trigger was an unrelated
+   `.github/` edit (ci-review-comment.yml, actions/fetch-merge-base).
+3. Why did those run the lane? classify_changes forced hermes_state on any
+   `.github/` change, and nothing remembered that a PR had already passed.
+4. Why does a `.github/` edit not need it? The lane runs no local action: only
+   hermes-state-macos.yml and its caller ci.yaml change what runs on the mini.
+5. Why can a repeat be skipped? The routing contract already leaves surface
+   files a PR does not change to their own PRs and the 4-hourly main schedule;
+   a repeat that changes none of the routing files' content adds nothing.
+
+Change
+- classify_changes: under `.github/`, only HERMES_STATE_WIRING (the lane
+  workflow and ci.yaml) routes hermes_state, like native_memory's exact-path
+  rule. Empty diffs, capped lists and CI-config files (justfile,
+  scripts/hermes-python) still run it.
+- scripts/ci/macos_state_reuse.py keys a same-repository PR's lane by the git
+  tree entries, at the PR merge commit, of every changed file that routes the
+  lane plus the lane workflow. detect looks it up (actions/cache restore,
+  lookup-only); a hit turns hermes_state off for that PR run only. macOS state
+  required (v1) saves the key after a pass in this run. Every failure (no key,
+  lookup error, save error) means the lane runs; fork PRs, releases, dispatch
+  and pushes never reuse. A reused lane is "not selected", which the required
+  check already accepts.
+
+Not changed, with evidence
+- Superseded same-PR runs: all 7 cancelled lane jobs in the window were
+  cancelled before they started (CI's per-PR group, cancel-in-progress).
+- Duration creep (14-19 min at 14:09-15:50Z): the same suite took 9.2 min at
+  15:40Z between 17.3 and 17.2 min runs; the mini's 15-min load average was 34
+  (operator sample 15:50Z) with 8 hermes-sync-macos runs queued: host contention,
+  not test growth.
+- A second runner on the mini: ruled out (BB host load and memory pressure).
+
+Replay of the window: removing the 9 repeats and 3 .github-only runs takes
+~120 of 368 runner-minutes (33%) off the lane.
+
+Tests: tests/ci/test_macos_state_reuse.py (new: key, gate replay, step
+conditions, lookup/save pairing, no local action in the lane);
+tests/ci/test_classify_changes.py (.github cases).
+Card: t_01a1d58663f79436.
+---
+ .github/workflows/ci.yaml          |  42 +++++++-
+ scripts/ci/classify_changes.py     |  34 ++++--
+ scripts/ci/macos_state_reuse.py    |  82 +++++++++++++++
+ tests/ci/test_classify_changes.py  |  16 ++-
+ tests/ci/test_macos_state_reuse.py | 162 +++++++++++++++++++++++++++++
+ 5 files changed, 321 insertions(+), 15 deletions(-)
+ create mode 100644 scripts/ci/macos_state_reuse.py
+ create mode 100644 tests/ci/test_macos_state_reuse.py
+
+diff --git a/.github/workflows/ci.yaml b/.github/workflows/ci.yaml
+index 3cd6a338f0..806a41de92 100644
+--- a/.github/workflows/ci.yaml
++++ b/.github/workflows/ci.yaml
+@@ -113,6 +113,7 @@ jobs:
+       e2e_desktop_core: ${{ steps.gate-lanes.outputs.e2e_desktop_core }}
+       e2e_desktop_update: ${{ steps.gate-lanes.outputs.e2e_desktop_update }}
+       hermes_state: ${{ steps.gate-lanes.outputs.hermes_state }}
++      hermes_state_reuse_key: ${{ steps.state-reuse-key.outputs.key }}
+       native_memory: ${{ steps.gate-lanes.outputs.native_memory }}
+       event_name: ${{ github.event_name }}
+       python_changed: ${{ steps.python-plan.outputs.changed }}
+@@ -128,6 +129,24 @@ jobs:
+         uses: ./.github/actions/detect-changes
+         with:
+           github-token: ${{ github.token }}
++      - name: Key the macOS state lane by its surface content
++        # A same-repository PR whose earlier run already passed the mini lane on the same
++        # content of every changed file that routes it skips the lane (scripts/ci/
++        # macos_state_reuse.py). No key (fork PR, release, empty/capped diff) = no reuse.
++        id: state-reuse-key
++        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && inputs.release != true && steps.classify.outputs.hermes_state == 'true'
++        run: python3 scripts/ci/macos_state_reuse.py key --files "$RUNNER_TEMP/detect-changed-files.txt"
++      - name: Look up this PR's earlier mini lane pass
++        # Saved by macOS state required (v1) after a pass. A PR run reads only its own
++        # PR's and main's caches, and main never saves one. A lookup error is a miss.
++        id: state-reuse
++        if: steps.state-reuse-key.outputs.key != ''
++        continue-on-error: true
++        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
++        with:
++          path: /tmp/hermes-state-macos-pass
++          key: ${{ steps.state-reuse-key.outputs.key }}
++          lookup-only: true
+       - name: Force all lanes on release; E2E only on release or dispatch
+         # Overwrite the classifier outputs with 'true' when inputs.release. The E2E
+         # lanes are forced off unless this is a release run or a manual dispatch
+@@ -136,19 +155,24 @@ jobs:
+         # native memory lanes are off on a main push (hermes-state-macos.yml tests
+         # main from its own 4-hourly schedule, and native-memory-macos.yml from
+         # its own push trigger, so required PR jobs never queue behind a main-push
+-        # CI run on the one mini runner) and on for a dispatch or a release.
++        # CI run on the one mini runner) and on for a dispatch or a release. A PR's
++        # macOS state lane is off when this PR already passed it on the same
++        # lane-surface content (state-reuse above).
+         id: gate-lanes
+         env:
+           RELEASE: ${{ inputs.release }}
+           EVENT_NAME: ${{ github.event_name }}
+           TEST_REF: ${{ inputs.commit || github.ref }}
+           CLASSIFIED: ${{ toJSON(steps.classify.outputs) }}
++          STATE_REUSED: ${{ steps.state-reuse.outputs.cache-hit }}
+         run: |
+           python3 - <<'PY'
+           import json, os
+           values = json.loads(os.environ['CLASSIFIED'])
+           release = os.environ['RELEASE'] == 'true'
+           e2e_allowed = release or os.environ['EVENT_NAME'] == 'workflow_dispatch'
++          reused = (os.environ['STATE_REUSED'] == 'true' and os.environ['EVENT_NAME'] == 'pull_request'
++                    and not release)
+           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+               for lane, value in values.items():
+                   if lane.startswith('e2e') and not e2e_allowed:
+@@ -156,6 +180,9 @@ jobs:
+                   elif (lane in ('hermes_state', 'native_memory') and os.environ['EVENT_NAME'] == 'push'
+                         and os.environ['TEST_REF'] == 'refs/heads/main' and not release):
+                       value = 'false'
++                  elif lane == 'hermes_state' and reused:
++                      print('hermes_state: this PR already passed the mini lane on this surface content')
++                      value = 'false'
+                   elif release and value in ('true', 'false'):
+                       value = 'true'
+                   if '\n' in value or '\r' in value:
+@@ -648,3 +675,16 @@ jobs:
+           if [ "$RELEASE" = true ]; then args+=(--release);
+           elif [ "$EVENT_NAME" = pull_request ]; then args+=(--allow-superseded); fi
+           printf '%s' "$NEEDS" | python3 scripts/ci/required_results.py "${args[@]}"
++      - name: Record the mini lane pass for this PR's later runs
++        # Only a lane that ran and passed in this run; the key is empty off a same-repo PR.
++        id: state-pass
++        if: success() && needs.hermes-state-macos.result == 'success' && needs.detect.outputs.hermes_state_reuse_key != ''
++        continue-on-error: true
++        run: printf '%s\n' "$GITHUB_RUN_ID" > /tmp/hermes-state-macos-pass
++      - name: Save the mini lane pass
++        if: steps.state-pass.outcome == 'success'
++        continue-on-error: true
++        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
++        with:
++          path: /tmp/hermes-state-macos-pass
++          key: ${{ needs.detect.outputs.hermes_state_reuse_key }}
+diff --git a/scripts/ci/classify_changes.py b/scripts/ci/classify_changes.py
+index 813129f11e..a0a1dc41c0 100644
+--- a/scripts/ci/classify_changes.py
++++ b/scripts/ci/classify_changes.py
+@@ -55,10 +55,15 @@ Lanes:
+   terminal tool, or the real-backend tests runs it on the PR.
+ * ``hermes_state`` — tests/hermes_state/ on the real macOS mini
+   (hermes-state-macos.yml): the state modules, their tests, the shared pytest
+-  harness and the dependency manifests. An empty diff, a ``.github/`` change or
+-  a list at the compare API's 300-file cap runs it. ci.yaml's ``detect`` turns
+-  it off on a non-release main push: the standalone workflow's 4-hourly
+-  schedule tests main.
++  harness and the dependency manifests. An empty diff, a list at the compare
++  API's 300-file cap or a CI-config change outside ``.github/`` runs it. Under
++  ``.github/`` only the lane's own wiring (:data:`HERMES_STATE_WIRING`) does: the
++  lane runs no local action, so another workflow edit cannot change what it does
++  on the mini, and 3 of 31 mini runs on 2026-11-13 were for such edits
++  (t_01a1d58663f79436). ci.yaml's ``detect`` turns it off on a non-release main
++  push: the standalone workflow's 4-hourly schedule tests main. On a
++  same-repository PR, ``detect`` also turns it off when this PR already passed
++  the lane on the same lane-surface content (scripts/ci/macos_state_reuse.py).
+ * ``native_memory`` — the Darwin memory reader's ABI and no-fork tests on the
+   real macOS mini (native-memory-macos.yml). Those tests are
+   ``platforms("macos")`` and skip on every Linux lane, so a PR that touches one
+@@ -79,7 +84,9 @@ must never skip one a change could break:
+ * The slow lanes above are the one deliberate exception. On a pull request
+   they skip changes that could still break them, and main is where those
+   changes meet the suite. Their path lists decide which PRs run them early.
+-* An empty diff, or any ``.github/`` change, runs everything.
++* An empty diff, or any ``.github/`` change, runs everything, except the two
++  mini lanes: a ``.github/`` change starts ``native_memory`` or ``hermes_state``
++  only when it is that lane's own wiring.
+ * ``python`` is a denylist: skipped only when *every* file is provably prose
+   or a frontend-only package; an unrecognized path keeps it on.
+ * ``skills/`` (incl. ``SKILL.md``) is python-relevant — the skill-doc tests
+@@ -307,6 +314,15 @@ HERMES_STATE_IMPORTS = (
+ _HERMES_STATE_PATHS = (
+     "hermes_state", "tests/hermes_state/", *_PY_TEST_HARNESS, *_DEP_MANIFESTS, *HERMES_STATE_IMPORTS,
+ )
++# The only .github/ files that change what the macOS state lane runs: the lane itself and
++# its caller. The lane uses no local action (tests/ci/test_macos_state_routing.py checks).
++HERMES_STATE_WIRING = (".github/workflows/hermes-state-macos.yml", ".github/workflows/ci.yaml")
++
++
++def hermes_state_files(files: list[str]) -> list[str]:
++    """The changed files that start the macOS state lane, ignoring the empty-diff and cap rules."""
++    return [f for f in files
++            if f.startswith(_HERMES_STATE_PATHS) or f in HERMES_STATE_WIRING or f in _CI_CONFIG_FILES]
+ # The native memory lane (native-memory-macos.yml): the Darwin memory reader, its one
+ # caller, their macOS-only tests and the lane's own wiring. Exact files, kept equal to the
+ # standalone workflow's ``push.paths`` by tests/ci/test_native_memory_gate.py.
+@@ -775,9 +791,8 @@ def classify(files: list[str], run_e2e: bool = False) -> dict[str, bool]:
+         "rust": any(_is_rust(f) for f in files),
+         "remote_backends": any(f.startswith(_REMOTE_BACKEND_PATHS) for f in files),
+         "catalog": catalog,
+-        # A capped list may omit the state files, so it runs the lane.
+-        "hermes_state": len(files) >= COMPARE_FILE_CAP
+-        or any(f.startswith(_HERMES_STATE_PATHS) for f in files),
++        # A capped list may omit the state files, so it runs the lane; so does an empty diff.
++        "hermes_state": not files or len(files) >= COMPARE_FILE_CAP or bool(hermes_state_files(files)),
+         # Exact paths only: an empty diff or a capped list may hide them, so those run it.
+         "native_memory": not files or len(files) >= COMPARE_FILE_CAP
+         or any(f in NATIVE_MEMORY_PATHS for f in files),
+@@ -803,7 +818,8 @@ def classify(files: list[str], run_e2e: bool = False) -> dict[str, bool]:
+         ret["rust"] = True
+         ret["remote_backends"] = True
+         ret["catalog"] = True
+-        ret["hermes_state"] = True
++        # hermes_state is not forced here: only its own wiring under .github/ starts it,
++        # and the empty diff and CI-config files already do above.
+         ret.update(dict.fromkeys(_slow_lanes([]), True))
+     return ret
+ 
+diff --git a/scripts/ci/macos_state_reuse.py b/scripts/ci/macos_state_reuse.py
+new file mode 100644
+index 0000000000..04944c6126
+--- /dev/null
++++ b/scripts/ci/macos_state_reuse.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python3
++"""Key a pull request's macOS state lane pass by the lane-surface content it tested.
++
++    macos_state_reuse.py key --files FILE [--repo DIR]
++
++Prints ``key=<cache key>`` (appended to $GITHUB_OUTPUT too), or ``key=`` when no reuse is allowed.
++
++ci.yaml's ``detect`` looks the key up in this PR's Actions cache; a hit means an earlier run of the
++same PR already passed ``tests/hermes_state (macOS, mini)`` on the same content of every changed file
++that routes the lane, so the lane is turned off for this run. ``macOS state required (v1)`` saves
++the key after a pass. A push that only changes files outside the lane surface (a review fix, a
++rebase onto a main that did not touch the PR's state files) then costs the one mini runner nothing:
++on 2026-11-13, 9 of 31 PR runs on the mini repeated their branch's previous passing surface
++(t_01a1d58663f79436).
++
++The key hashes, at the checked-out PR merge commit, the git tree entry (mode and blob id, or absence)
++of every changed file that routes the lane plus the lane workflow itself. So any new content in a
++routing file, a routing file added to or dropped from the diff, a main change to one of those files
++or a lane workflow change gives a new key. Main changes to other surface files do not: the routing
++contract already leaves those to their own PRs and the 4-hourly main schedule
++(classify_changes.py). An empty or capped file list (the lane runs whatever it touched) has no key.
++"""
++from __future__ import annotations
++
++import argparse
++import hashlib
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
++from scripts.ci.classify_changes import COMPARE_FILE_CAP, changed_paths, hermes_state_files
++
++LANE_WORKFLOW = ".github/workflows/hermes-state-macos.yml"
++KEY_PREFIX = "hermes-state-macos-pass-v1-"
++
++
++def tree_entries(repo: Path, paths: list[str]) -> list[str]:
++    """``<mode> <type> <id>\\t<path>`` per path at HEAD; ``absent\\t<path>`` for a deleted one."""
++    out = subprocess.run(["git", "-C", str(repo), "ls-tree", "-z", "--full-tree", "HEAD", "--", *paths],
++                         capture_output=True, check=True, timeout=60).stdout.decode("utf-8", "surrogateescape")
++    found = {entry.split("\t", 1)[1]: entry for entry in out.split("\0") if entry}
++    return [found.get(path, f"absent\t{path}") for path in paths]
++
++
++def reuse_key(repo: Path, files: list[str]) -> str:
++    """The cache key for this lane-surface content, or "" when the lane may not be reused."""
++    if not files or len(files) >= COMPARE_FILE_CAP:
++        return ""
++    routing = hermes_state_files(files)
++    if not routing:
++        return ""
++    paths = sorted(set(routing) | {LANE_WORKFLOW})
++    digest = hashlib.sha256("\n".join(tree_entries(repo, paths)).encode("utf-8", "surrogateescape"))
++    return KEY_PREFIX + digest.hexdigest()
++
++
++def main(argv: list[str] | None = None) -> int:
++    ap = argparse.ArgumentParser(description="Key a PR's macOS state lane pass by its lane-surface content.")
++    sub = ap.add_subparsers(dest="cmd", required=True)
++    key = sub.add_parser("key")
++    key.add_argument("--files", required=True, help="changed paths, one per line (detect-changes' list)")
++    key.add_argument("--repo", default=".")
++    args = ap.parse_args(argv)
++    lines = Path(args.files).read_text(encoding="utf-8-sig").splitlines()
++    try:
++        value = reuse_key(Path(args.repo), changed_paths(lines))
++    except (OSError, subprocess.SubprocessError) as exc:
++        # No key means the lane runs: an unreadable tree never skips it.
++        print(f"::warning::macOS state reuse key unavailable ({exc}); the lane runs", file=sys.stderr)
++        value = ""
++    line = f"key={value}"
++    if dest := os.environ.get("GITHUB_OUTPUT"):
++        with open(dest, "a", encoding="utf-8") as fh:
++            fh.write(line + "\n")
++    print(line)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/ci/test_classify_changes.py b/tests/ci/test_classify_changes.py
+index 8cf0d3a251..49b34860bd 100644
+--- a/tests/ci/test_classify_changes.py
++++ b/tests/ci/test_classify_changes.py
+@@ -55,6 +55,9 @@ DEFAULT = {
+ }
+ # An empty (failed) diff may hide the native memory paths, so it runs that lane too.
+ EMPTY_DIFF = {**DEFAULT, "native_memory": True}
++# A .github/ change outside the mini lanes' own wiring holds neither: those lanes run no local
++# action, so the edit cannot change what runs on the mini (t_01a1d58663f79436).
++GITHUB_CHANGE = {**DEFAULT, "hermes_state": False}
+ 
+ SLOW_LANES = {"docker", "nix", "e2e", "e2e_upgrade", "e2e_desktop_core", "e2e_desktop_update"}
+ 
+@@ -348,7 +351,7 @@ CASES = {
+     ),
+     "workflow yml → fail-open all": (
+         [".github/workflows/typecheck.yml"],
+-        DEFAULT,
++        GITHUB_CHANGE,
+     ),
+     # The bootstrap installer lane: shell installer, dev-checkout wrapper,
+     # and the Tauri app's non-Rust sources.
+@@ -366,7 +369,7 @@ CASES = {
+     ),
+     "composite action → fail-open all": (
+         [".github/actions/retry/action.yml"],
+-        DEFAULT,
++        GITHUB_CHANGE,
+     ),
+     "desktop src → frontend only": (
+         ["apps/desktop/src/app.tsx"],
+@@ -476,8 +479,11 @@ CASES = {
+         _lanes(python=True, scan=True, catalog=True),
+     ),
+     # Fail open: CI-config / empty / blank diffs run everything.
+-    ".github change → all": ([".github/workflows/tests.yml"], DEFAULT),
+-    "action change → all": ([".github/actions/detect-changes/action.yml"], DEFAULT),
++    ".github change → all": ([".github/workflows/tests.yml"], GITHUB_CHANGE),
++    "action change → all": ([".github/actions/detect-changes/action.yml"], GITHUB_CHANGE),
++    # The state lane's own wiring: the lane workflow and its caller.
++    "state lane workflow → all": ([".github/workflows/hermes-state-macos.yml"], DEFAULT),
++    "ci caller → all": ([".github/workflows/ci.yaml"], DEFAULT),
+     # Workflows call just recipes, so the recipes are CI config too.
+     "justfile change → all": (["justfile"], DEFAULT),
+     "recipe python wrapper → all": (["scripts/hermes-python"], DEFAULT),
+@@ -488,7 +494,7 @@ CASES = {
+         ["hermes_cli/machine_metrics.py"], _lanes(python=True, scan=True, native_memory=True),
+     ),
+     "native memory workflow → native_memory only of the mac lanes": (
+-        [".github/workflows/native-memory-macos.yml"], DEFAULT | {"native_memory": True},
++        [".github/workflows/native-memory-macos.yml"], GITHUB_CHANGE | {"native_memory": True},
+     ),
+     "neighbouring memory module → no native_memory": (
+         ["hermes_cli/machine_memory.py"], _lanes(python=True, scan=True),
+diff --git a/tests/ci/test_macos_state_reuse.py b/tests/ci/test_macos_state_reuse.py
+new file mode 100644
+index 0000000000..13e2340b34
+--- /dev/null
++++ b/tests/ci/test_macos_state_reuse.py
+@@ -0,0 +1,162 @@
++"""The macOS state lane's same-PR reuse: key, lookup, gate and save (t_01a1d58663f79436).
++
++On 2026-11-13, 9 of 31 PR runs of ``tests/hermes_state (macOS, mini)`` repeated their branch's
++previous passing lane-surface content, on a runner at 0.88 utilisation."""
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from scripts.ci import macos_state_reuse as reuse
++from scripts.ci.classify_changes import COMPARE_FILE_CAP
++from scripts.ci.required_results import evaluate_macos_state
++from tests.ci.test_macos_state_routing import context, detect, gha, workflow, workflow_steps
++
++LANE = reuse.LANE_WORKFLOW
++
++
++def _git(repo, *args):
++    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
++
++
++@pytest.fixture
++def repo(tmp_path):
++    _git(tmp_path, "init", "-q")
++    _git(tmp_path, "config", "user.email", "t@example.com")
++    _git(tmp_path, "config", "user.name", "t")
++    for path, text in {"hermes_state_outcome.py": "a\n", "run_agent.py": "x\n", LANE: "lane\n",
++                       "tests/hermes_state/test_x.py": "t\n"}.items():
++        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
++        (tmp_path / path).write_text(text)
++    _git(tmp_path, "add", "-A")
++    _git(tmp_path, "commit", "-qm", "base")
++    return tmp_path
++
++
++def _commit(repo, path, text=None):
++    if text is None:
++        (repo / path).unlink()
++    else:
++        (repo / path).parent.mkdir(parents=True, exist_ok=True)
++        (repo / path).write_text(text)
++    _git(repo, "add", "-A")
++    _git(repo, "commit", "-qm", f"edit {path}")
++
++
++def test_key_ignores_non_surface_pushes(repo):
++    key = reuse.reuse_key(repo, ["hermes_state_outcome.py"])
++    assert key.startswith(reuse.KEY_PREFIX)
++    _commit(repo, "run_agent.py", "y\n")
++    # A review fix outside the surface, now also in the PR's diff: same surface content.
++    assert reuse.reuse_key(repo, ["hermes_state_outcome.py", "run_agent.py"]) == key
++
++
++@pytest.mark.parametrize("edit,files", [
++    (("hermes_state_outcome.py", "b\n"), ["hermes_state_outcome.py"]),  # new content (PR or main)
++    (None, ["hermes_state_outcome.py", "tests/hermes_state/test_x.py"]),  # a routing file joins
++    (("tests/hermes_state/test_x.py", None), ["hermes_state_outcome.py", "tests/hermes_state/test_x.py"]),
++    ((LANE, "lane v2\n"), ["hermes_state_outcome.py"]),  # the lane workflow changed on main
++])
++def test_key_changes_with_surface_content(repo, edit, files):
++    before = reuse.reuse_key(repo, ["hermes_state_outcome.py"])
++    if edit:
++        _commit(repo, *edit)
++    assert reuse.reuse_key(repo, files) not in ("", before)
++
++
++def test_deleted_routing_file_is_keyed_as_absent(repo):
++    _commit(repo, "tests/hermes_state/test_x.py", None)
++    assert reuse.tree_entries(repo, ["tests/hermes_state/test_x.py"]) == ["absent\ttests/hermes_state/test_x.py"]
++
++
++@pytest.mark.parametrize("files", [[], ["run_agent.py"], [f"docs/{i}.md" for i in range(COMPARE_FILE_CAP)],
++                                   [*(f"docs/{i}.md" for i in range(COMPARE_FILE_CAP)), "hermes_state.py"]])
++def test_no_key_without_a_bounded_routing_diff(repo, files):
++    assert reuse.reuse_key(repo, files) == ""
++
++
++def test_cli_writes_github_output_and_fails_open(repo, tmp_path, monkeypatch, capsys):
++    listing = tmp_path / "files.txt"
++    listing.write_text("hermes_state_outcome.py\n")
++    out = tmp_path / "out"
++    monkeypatch.setenv("GITHUB_OUTPUT", str(out))
++    assert reuse.main(["key", "--files", str(listing), "--repo", str(repo)]) == 0
++    assert out.read_text() == f"key={reuse.reuse_key(repo, ['hermes_state_outcome.py'])}\n"
++    out.write_text("")
++    assert reuse.main(["key", "--files", str(listing), "--repo", str(tmp_path / "missing")]) == 0
++    assert out.read_text() == "key=\n"
++
++
++def _step(job, step_id):
++    return next(s for s in workflow("ci.yaml")["jobs"][job]["steps"] if s.get("id") == step_id)
++
++
++def _gate(ctx, hit):
++    """Replay detect's gate-lanes with the reuse lookup's cache-hit."""
++    outputs = detect(["hermes_state_outcome.py"], ctx)
++    assert outputs["hermes_state"] == "true"
++    ctx["steps"]["state-reuse"] = {"outputs": {"cache-hit": hit}}
++    step = _step("detect", "gate-lanes")
++    return workflow_steps.outputs(step, ctx)["hermes_state"]
++
++
++@pytest.mark.parametrize("hit,selected", [("true", "false"), ("false", "true"), ("", "true")])
++def test_gate_turns_the_lane_off_only_on_a_pull_request_hit(hit, selected):
++    assert _gate(context(), hit) == selected
++
++
++@pytest.mark.parametrize("ctx", [context("workflow_dispatch", "refs/heads/main"), context(release=True),
++                                 context("push", "refs/heads/other")])
++def test_gate_never_reuses_off_a_pull_request(ctx):
++    assert _gate(ctx, "true") == "true"
++
++
++def _key_step_runs(ctx, selected="true"):
++    ctx = {**ctx, "steps": {"classify": {"outputs": {"hermes_state": selected}}}}
++    return gha.condition(_step("detect", "state-reuse-key")["if"], ctx)
++
++
++def test_key_step_only_for_a_selected_same_repo_pull_request():
++    assert _key_step_runs(context())
++    assert not _key_step_runs(context(fork=True))
++    assert not _key_step_runs(context(release=True))
++    assert not _key_step_runs(context("workflow_dispatch", "refs/heads/main"))
++    assert not _key_step_runs(context(), selected="false")
++
++
++def test_lookup_and_save_share_key_and_path_and_never_fail_the_gate():
++    lookup = _step("detect", "state-reuse")
++    record = _step("macos-state-required", "state-pass")
++    save = next(s for s in workflow("ci.yaml")["jobs"]["macos-state-required"]["steps"]
++                if str(s.get("uses", "")).startswith("actions/cache/save@"))
++    assert lookup["uses"].startswith("actions/cache/restore@")
++    assert lookup["with"]["lookup-only"] is True
++    assert lookup["with"]["path"] == save["with"]["path"]
++    assert lookup["with"]["key"] == "${{ steps.state-reuse-key.outputs.key }}"
++    assert save["with"]["key"] == "${{ needs.detect.outputs.hermes_state_reuse_key }}"
++    assert workflow("ci.yaml")["jobs"]["detect"]["outputs"]["hermes_state_reuse_key"] == \
++        "${{ steps.state-reuse-key.outputs.key }}"
++    assert all(step.get("continue-on-error") is True for step in (lookup, record, save))
++    assert lookup["uses"].split("@")[1] == save["uses"].split("@")[1]
++
++
++@pytest.mark.parametrize("lane,key,saves", [("success", "k", True), ("skipped", "k", False),
++                                             ("failure", "k", False), ("success", "", False)])
++def test_only_a_pass_in_this_run_is_recorded(lane, key, saves):
++    ctx = context()
++    ctx["needs"] = {"hermes-state-macos": {"result": lane}, "detect": {"outputs": {"hermes_state_reuse_key": key}}}
++    ctx["__status__"] = {"always": lambda: True, "success": lambda: True}
++    assert gha.condition(_step("macos-state-required", "state-pass")["if"], ctx) is saves
++
++
++def test_a_reused_lane_still_satisfies_the_required_check():
++    # Reuse turns the selection off, so the skipped lane passes as unselected.
++    assert evaluate_macos_state({"detect": {"result": "success", "outputs": {"hermes_state": "false"}},
++                                 "hermes-state-macos": {"result": "skipped"}})["ok"]
++
++
++def test_lane_runs_no_local_action():
++    # classify_changes.HERMES_STATE_WIRING relies on this: another .github/ edit cannot change the lane.
++    steps = workflow("hermes-state-macos.yml")["jobs"]["hermes-state-macos"]["steps"]
++    assert not [s["uses"] for s in steps if str(s.get("uses", "")).startswith("./")]
++    assert Path(workflow("ci.yaml")["jobs"]["hermes-state-macos"]["uses"]).name == Path(LANE).name
+-- 
+2.43.0
+

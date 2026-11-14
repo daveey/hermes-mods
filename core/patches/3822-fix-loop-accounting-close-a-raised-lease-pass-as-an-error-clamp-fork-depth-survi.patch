@@ -1,0 +1,408 @@
+From 9788894aa9c201ffe04088b29249cba5c5633fbf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 20:16:43 +0000
+Subject: [PATCH] fix(loop_accounting): close a raised lease pass as an error,
+ clamp fork depth, survive ConfigBackendUnavailable, read interval outside the
+ lock, fold tids at thread exit [daveey]
+
+Follow-ups from the non-blocking points of the PR #2401 reviews (5894758704 @bfbbdfd221,
+5895222011 @d58f1856db). Kanban card t_01a1d5edd93f87e8.
+
+1. HostLoopLease span across a raising pass. kanban_annotation_host.loop skips beat() when
+   _holder_pass() raises, so the next beat() recorded one lease.<name> run spanning two passes
+   plus the sleep, errors=0. held() now closes a still-open span with errors+=1 before opening a
+   new one on every true held(). (The errored run's wall still includes the sleep up to the next
+   held(): the lease cannot see where the pass raised. Its CPU is the pass's.)
+2. Fork while a nested pass is open. _after_fork_child clears the thread-local depth, so the
+   two exits drove it to -1 and the thread never counted another outermost pass. Pass.__exit__
+   clamps with max(0, ...); span_close and record() test depth <= 0.
+3. _setting caught only Exception; ConfigBackendUnavailable is a SystemExit and escaped
+   begin_process at boot. It is now caught by name (the config modules are imported first, so
+   a missing module still falls back to the defaults).
+4. start() called interval_s() -> load_config() while holding _lock, stalling every pass exit
+   on every thread behind one config read. The interval is read before the lock.
+5. Linux tid reuse. Each thread that accounts CPU holds a _ThreadExit in the threading.local;
+   CPython drops it when the thread ends (synchronously, before join() returns and before the
+   kernel can reuse the tid), and its __del__ queues the tid in a lock-free deque. The next
+   holder of _lock folds queued tids into exited_accounted before adding CPU, so a thread given
+   a reused tid starts at 0. The snapshot's live-set fold stays as the backstop.
+6. Docstring named unaccounted_cpu_s; the key is process.unaccounted_live_cpu_s, None without
+   procfs.
+
+Proof (tests/hermes_cli/test_loop_accounting.py):
+- RED on origin/main sources (tests only): 5 failed, 18 passed
+  (raised-lease pass, fork depth, tid reuse [0.030 inherited], ConfigBackendUnavailable,
+  interval read under lock).
+- GREEN: test_loop_accounting + bench + test_host_loop_lease + test_kanban_remote_index +
+  test_kanban_unloaded_host_lease + test_kanban_annotation_host: 111 passed.
+- Bench (best of 5 x 50k passes, this worker): 3.0 us/pass (budget 20 us).
+- scripts/check --base origin/main: 20 checks ok (1 pre-existing advisory HX012 on start()).
+---
+ hermes_cli/host_loop_lease.py            | 13 ++--
+ hermes_cli/loop_accounting.py            | 94 ++++++++++++++++++++----
+ tests/hermes_cli/test_loop_accounting.py | 84 +++++++++++++++++++++
+ 3 files changed, 171 insertions(+), 20 deletions(-)
+
+diff --git a/hermes_cli/host_loop_lease.py b/hermes_cli/host_loop_lease.py
+index 599c4fb477..893d29e3a6 100644
+--- a/hermes_cli/host_loop_lease.py
++++ b/hermes_cli/host_loop_lease.py
+@@ -232,10 +232,13 @@ class HostLoopLease:
+ 
+     def held(self) -> bool:
+         """True when this process should run the host pass now. One ``flock`` syscall when not holder.
+-        A True answer opens this thread's ``lease.<name>`` accounting pass, which :meth:`beat` closes."""
++        A True answer opens this thread's ``lease.<name>`` accounting pass, which :meth:`beat` closes. A pass
++        still open here never reached its ``beat()`` (the host pass raised): it is closed as an error first, so
++        one run never spans two passes and the sleep between them."""
+         if self._held_inner():
+-            if self._pass is None:
+-                self._pass = _span_open(f"lease.{self.name}")
++            if self._pass is not None:
++                self._account_pass(error=True)
++            self._pass = _span_open(f"lease.{self.name}")
+             return True
+         return False
+ 
+@@ -314,13 +317,13 @@ class HostLoopLease:
+ 
+     # -- internals -----------------------------------------------------------------------------
+ 
+-    def _account_pass(self) -> None:
++    def _account_pass(self, *, error: bool = False) -> None:
+         opened, self._pass = self._pass, None
+         if opened is None:
+             return
+         try:
+             from hermes_cli import loop_accounting
+-            loop_accounting.span_close(opened)  # a beat() on another thread records nothing
++            loop_accounting.span_close(opened, error=error)  # a beat() on another thread records nothing
+         except Exception:  # health: allow BLE001 -- accounting never touches the lease
+             logger.debug("host loop %s: pass accounting failed", self.name, exc_info=True)
+ 
+diff --git a/hermes_cli/loop_accounting.py b/hermes_cli/loop_accounting.py
+index b3c30d80e7..c7cd8b945b 100644
+--- a/hermes_cli/loop_accounting.py
++++ b/hermes_cli/loop_accounting.py
+@@ -14,7 +14,8 @@ measured CPU unattributed). Per pass name it counts:
+ 
+ Per process it also records every live thread's CPU (``/proc/self/task/<tid>/stat`` on Linux) next to the
+ CPU the outermost passes on that thread accounted for, so the remainder is attributable to a thread
+-(``unaccounted_cpu_s``) rather than lost.
++(``process.unaccounted_live_cpu_s``; None without procfs, where thread CPU is not readable) rather than lost.
++A thread's accounted CPU folds into the exited total when the thread ends, so a reused native id starts at 0.
+ 
+ Use::
+ 
+@@ -37,7 +38,8 @@ Use::
+ Nested passes count in their own names; only the outermost pass on a thread adds to that thread's
+ ``accounted_cpu_s``, so totals never double count. Mods (chat-closeout, user-steps, throughput, runners) call
+ the same API; ``host_loop_lease.HostLoopLease`` records ``lease.<name>`` for every host pass between a true
+-``held()`` and its ``beat()`` without any change in the caller.
++``held()`` and its ``beat()`` without any change in the caller (a pass that raised before its ``beat()`` is
++closed as an error by the next true ``held()``).
+ 
+ **Snapshot.** A long-lived process calls :func:`start` once (``shared_metrics_process.begin_process`` does it
+ for the gateway, ``serve`` and the ``tui`` backend); a daemon thread then writes
+@@ -52,6 +54,7 @@ uncontended lock: a few microseconds (``tests/hermes_cli/test_loop_accounting_be
+ from __future__ import annotations
+ 
+ import atexit
++import collections
+ import functools
+ import json
+ import logging
+@@ -104,10 +107,55 @@ _lock = threading.Lock()
+ _stats: dict[str, _Stat] = {}
+ _thread_accounted: dict[int, float] = {}  # native thread id -> CPU of its outermost passes
+ _local = threading.local()
++_exited_tids: collections.deque = collections.deque()  # tids whose thread ended; folded under _lock
+ _started_at = time.time()
+ _state: dict[str, Any] = {"role": None, "thread": None, "stop": None, "pid": os.getpid()}
+ 
+ 
++class _ThreadExit:
++    """Held in ``_local`` by each thread that accounted CPU. CPython drops a thread's ``threading.local``
++    values when the thread ends, before its native id can be reused, so this queues the tid to fold then:
++    a later thread given the same id never inherits the exited thread's accounted CPU. Lock-free (a
++    ``deque.append``), so it is safe wherever teardown runs it."""
++
++    __slots__ = ("tid",)
++    _queue = _exited_tids  # bound here, so __del__ still reaches it while module globals are torn down
++
++    def __init__(self, tid: int) -> None:
++        self.tid = tid
++
++    def __del__(self) -> None:
++        self._queue.append(self.tid)
++
++
++def _own_tid() -> int:
++    """This thread's native id, registering its exit fold on first use."""
++    tid = _native_id()
++    mark = getattr(_local, "exit_mark", None)
++    if mark is None or mark.tid != tid:
++        _local.exit_mark = _ThreadExit(tid)
++    return tid
++
++
++def _fold_exited() -> None:
++    """Move the accounted CPU of ended threads into ``exited_accounted`` (caller holds ``_lock``)."""
++    while _exited_tids:
++        try:
++            tid = _exited_tids.popleft()
++        except IndexError:
++            return
++        gone = _thread_accounted.pop(tid, None)
++        if gone:
++            _state["exited_accounted"] = _state.get("exited_accounted", 0.0) + gone
++
++
++def _add_accounted(tid: int, cpu: float) -> None:
++    """Add ``cpu`` to ``tid``'s outermost-pass CPU (caller holds ``_lock``)."""
++    if _exited_tids:
++        _fold_exited()
++    _thread_accounted[tid] = _thread_accounted.get(tid, 0.0) + cpu
++
++
+ def _stat(name: str) -> _Stat:
+     st = _stats.get(name)
+     if st is None:
+@@ -156,7 +204,10 @@ class Pass:
+     def __exit__(self, exc_type, exc, tb) -> None:
+         cpu = _thread_time() - self._c0
+         wall = _perf() - self._w0
+-        _local.depth = getattr(_local, "depth", 1) - 1
++        # Clamped: a fork while a nested pass is open clears the child's depth, so its exits would go negative
++        # and the thread would never count another outermost pass.
++        _local.depth = max(0, getattr(_local, "depth", 1) - 1)
++        tid = _own_tid() if self._outer else 0
+         with _lock:
+             st = _stat(self.name)
+             st.runs += 1
+@@ -174,8 +225,7 @@ class Pass:
+             st.wall_s += wall
+             st.last_at = time.time()
+             if self._outer:
+-                tid = _native_id()
+-                _thread_accounted[tid] = _thread_accounted.get(tid, 0.0) + cpu
++                _add_accounted(tid, cpu)
+ 
+ 
+ def pass_(name: str, *, skipped: bool = False, changed: Optional[bool] = None, fallback: bool = False,
+@@ -188,6 +238,8 @@ def record(name: str, *, cpu_s: float = 0.0, wall_s: float = 0.0, skipped: bool
+            changed: Optional[bool] = None, fallback: bool = False, rows: int = 0, error: bool = False,
+            outer: bool = True) -> None:
+     """Account a pass measured elsewhere (``cpu_s`` from the caller's own ``thread_time`` delta, on this thread)."""
++    outer = outer and getattr(_local, "depth", 0) <= 0
++    tid = _own_tid() if outer else 0
+     with _lock:
+         st = _stat(name)
+         st.runs += 1
+@@ -200,17 +252,17 @@ def record(name: str, *, cpu_s: float = 0.0, wall_s: float = 0.0, skipped: bool
+         st.cpu_max_s = max(st.cpu_max_s, cpu_s)
+         st.wall_s += wall_s
+         st.last_at = time.time()
+-        if outer and getattr(_local, "depth", 0) == 0:
+-            tid = _native_id()
+-            _thread_accounted[tid] = _thread_accounted.get(tid, 0.0) + cpu_s
++        if outer:
++            _add_accounted(tid, cpu_s)
+ 
+ 
+ def span_open(name: str) -> tuple:
+     """Open a pass whose end is in another call (``host_loop_lease``: a true ``held()`` to its ``beat()``).
+     Close it with :func:`span_close` on the same thread. Passes run inside it keep their own names; the
+     thread's ``accounted_cpu_s`` gets only the span's CPU those passes did not already account."""
+-    tid = _native_id()
++    tid = _own_tid()
+     with _lock:
++        _fold_exited()
+         acc0 = _thread_accounted.get(tid, 0.0)
+     return name, tid, _thread_time(), _perf(), acc0
+ 
+@@ -230,9 +282,9 @@ def span_close(token: tuple, *, error: bool = False) -> bool:
+         st.cpu_max_s = max(st.cpu_max_s, cpu)
+         st.wall_s += wall
+         st.last_at = time.time()
+-        if getattr(_local, "depth", 0) == 0:
++        if getattr(_local, "depth", 0) <= 0:
+             inner = _thread_accounted.get(tid, 0.0) - acc0
+-            _thread_accounted[tid] = _thread_accounted.get(tid, 0.0) + max(0.0, cpu - inner)
++            _add_accounted(tid, max(0.0, cpu - inner))
+     return True
+ 
+ 
+@@ -306,6 +358,7 @@ def thread_cpu() -> list[dict[str, Any]]:
+     listed (their ``cpu_s`` is None)."""
+     names = {t.native_id: t.name for t in threading.enumerate() if t.native_id is not None}
+     with _lock:
++        _fold_exited()
+         accounted_by = dict(_thread_accounted)
+     out: list[dict[str, Any]] = []
+     hz = _clk_tck()
+@@ -343,13 +396,15 @@ def snapshot() -> dict[str, Any]:
+     threads = thread_cpu()
+     procfs = bool(threads) and threads[0]["cpu_s"] is not None
+     live = sum(t["cpu_s"] for t in threads if t["cpu_s"] is not None)
+-    # Fold exited threads, so pool churn cannot grow the map. Without procfs (macOS, whose native thread
++    # Fold exited threads, so pool churn cannot grow the map (a thread that accounted CPU already queued its
++    # fold at exit via _ThreadExit; this catches the rest). Without procfs (macOS, whose native thread
+     # ids are never reused) the live set comes from threading.enumerate().
+     if procfs:
+         live_tids = {t["tid"] for t in threads}
+     else:
+         live_tids = {t.native_id for t in threading.enumerate() if t.native_id is not None}
+     with _lock:
++        _fold_exited()
+         if live_tids:
+             for tid in [tid for tid in _thread_accounted if tid not in live_tids]:
+                 _state["exited_accounted"] = _state.get("exited_accounted", 0.0) + _thread_accounted.pop(tid)
+@@ -441,9 +496,15 @@ def _setting(key: str, default: Any) -> Any:
+     """``loop_accounting.<key>`` from config.yaml (read once per :func:`start`), else ``default``."""
+     try:
+         from hermes_cli.config import load_config
++        from hermes_cli.config_backend import ConfigBackendUnavailable
++    except Exception:  # health: allow BLE001 -- no config module: the defaults
++        logger.debug("loop accounting: config unavailable; using defaults", exc_info=True)
++        return default
++    try:
+         section = load_config().get("loop_accounting") or {}
+         return section.get(key, default) if isinstance(section, dict) else default
+-    except Exception:  # health: allow BLE001 -- an unreadable config keeps the defaults
++    except (Exception, ConfigBackendUnavailable):  # health: allow BLE001 -- an unreadable config keeps the defaults
++        # ConfigBackendUnavailable is a SystemExit, caught by name: accounting must never be what ends a boot.
+         logger.debug("loop accounting: config unreadable; using defaults", exc_info=True)
+         return default
+ 
+@@ -482,12 +543,13 @@ def start(role: str) -> bool:
+     _state["enabled"] = None  # re-read config.yaml
+     if not enabled():
+         return False
++    period = interval_s()  # a config read: never under _lock, which every pass exit on every thread takes
+     with _lock:
+         thread = _state.get("thread")
+         if thread is not None and thread.is_alive() and _state.get("pid") == os.getpid():
+             return True
+         stop = threading.Event()
+-        thread = threading.Thread(target=_writer, args=(stop, interval_s()), name="hermes-loop-accounting",
++        thread = threading.Thread(target=_writer, args=(stop, period), name="hermes-loop-accounting",
+                                   daemon=True)
+         _state.update(thread=thread, stop=stop, pid=os.getpid())
+     thread.start()
+@@ -524,6 +586,7 @@ def reset() -> None:
+     with _lock:
+         _stats.clear()
+         _thread_accounted.clear()
++        _exited_tids.clear()
+         _state.pop("exited_accounted", None)
+ 
+ 
+@@ -535,7 +598,8 @@ def _after_fork_child() -> None:
+     _started_at = time.time()
+     _state.pop("exited_accounted", None)
+     _state.update(thread=None, stop=None, pid=os.getpid(), role=None)
+-    _local.__dict__.clear()
++    _local.__dict__.clear()  # drops this thread's _ThreadExit, queueing the parent's tid: cleared next
++    _exited_tids.clear()
+ 
+ 
+ if hasattr(os, "register_at_fork"):
+diff --git a/tests/hermes_cli/test_loop_accounting.py b/tests/hermes_cli/test_loop_accounting.py
+index fd9a9a843d..b378a9fbe0 100644
+--- a/tests/hermes_cli/test_loop_accounting.py
++++ b/tests/hermes_cli/test_loop_accounting.py
+@@ -135,6 +135,90 @@ def test_host_loop_lease_accounts_held_to_beat(monkeypatch, tmp_path):
+     assert c["runs"] == 1 and c["cpu_s"] >= 0.01
+ 
+ 
++def test_host_loop_lease_pass_that_raised_before_beat_is_closed_as_an_error(monkeypatch):
++    """A host pass that raises skips beat() (kanban_annotation_host.loop): the next true held() must close the
++    stale span as one errored run, not let the next beat() record one run spanning both passes."""
++    from hermes_cli import host_loop_lease as hll
++
++    monkeypatch.setenv("HERMES_HOST_LOOP_LEASE", "1")
++    lease = hll.HostLoopLease("acct-raise", "gateway", interval=1.0)
++    try:
++        if not lease.held():
++            pytest.skip("lease not acquirable in this sandbox")
++        _burn(0.01)  # this pass "raises": no beat()
++        assert lease.held()
++        lease.beat()
++    finally:
++        lease.release()
++    c = la.counters()["lease.acct-raise"]
++    assert (c["runs"], c["errors"]) == (2, 1)
++
++
++def test_fork_with_a_nested_pass_open_keeps_counting_outermost_passes():
++    """The at-fork hook clears the child's thread-local depth while two passes are open: their exits must not
++    drive depth below 0, or the thread never counts another outermost pass."""
++    with la.pass_("outer"):
++        with la.pass_("inner"):
++            la._after_fork_child()  # what os.fork runs in the child, here on this thread
++    assert la._local.depth == 0
++    with la.pass_("after"):
++        _burn(0.01)
++    me = threading.get_native_id()
++    acc = {t["tid"]: t["accounted_cpu_s"] for t in la.thread_cpu()}
++    assert acc.get(me, 0.0) >= 0.01
++
++
++def test_reused_thread_id_does_not_inherit_the_exited_threads_cpu(monkeypatch):
++    """A Linux tid reused before the next snapshot must start at 0, or unaccounted_live_cpu_s under-reports."""
++    monkeypatch.setattr(la, "_native_id", lambda: 424242)  # both threads get the same native id
++    seen: list = []
++
++    def first():
++        with la.pass_("first"):
++            _burn(0.03)
++
++    def second():
++        with la.pass_("second"):
++            pass
++        with la._lock:
++            seen.append(la._thread_accounted.get(424242, 0.0))
++
++    for target in (first, second):
++        t = threading.Thread(target=target)
++        t.start()
++        t.join()
++    assert seen and seen[0] < 0.03, seen  # only the live thread's own CPU, not the exited one's
++    assert la.snapshot()["process"]["accounted_cpu_s"] >= 0.03  # the exited thread's CPU is kept, as exited
++
++
++def test_setting_survives_config_backend_unavailable(monkeypatch):
++    """ConfigBackendUnavailable is a SystemExit: it must not escape start() / begin_process at boot."""
++    from hermes_cli import config as config_mod
++    from hermes_cli.config_backend import ConfigBackendUnavailable
++
++    def unavailable():
++        raise ConfigBackendUnavailable("backend missing")
++
++    monkeypatch.setattr(config_mod, "load_config", unavailable)
++    assert la._setting("interval_s", 7.0) == 7.0
++    assert la.start("gateway") is True
++
++
++def test_start_reads_the_interval_outside_the_lock(monkeypatch):
++    """Every pass exit takes _lock: the config read for the interval must not run while start() holds it."""
++    held_during_read: list = []
++
++    def setting(key, default):
++        if key == "interval_s":
++            held_during_read.append(la._lock.locked())
++            return 0.05
++        return default
++
++    monkeypatch.setattr(la, "_setting", setting)
++    assert la.start("serve") is True
++    assert held_during_read == [False]
++
++
+ def test_name_overflow_is_bounded(monkeypatch):
+     monkeypatch.setattr(la, "MAX_NAMES", 3)
+     for i in range(10):
+-- 
+2.43.0
+

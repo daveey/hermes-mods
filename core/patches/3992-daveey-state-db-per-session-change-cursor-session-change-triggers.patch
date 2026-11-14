@@ -1,0 +1,1089 @@
+From 5e1948b11b09e7aebe099be0397917b470f651ac Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 20:54:26 +0000
+Subject: [PATCH] [daveey] state.db: per-session change cursor (session_change
+ + triggers)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Design t_01a1d563324d7e8e §2 P3, review R5 and C8; card D1 (t_01a1d59d422b413a). Blocks D2.
+
+Why: the session list, sidebar and project tree re-rank every session on each poll, because state.db has no
+sessions revision. PRAGMA data_version moves on any write (140 of 300 two-second windows on the hub), so a
+reader cannot tell "nothing a listing reads moved" from "a counter ticked".
+
+What:
+- hermes_state_session_change.py: session_change(session_id PK, rev) plus a one-row
+  session_change_revision(revision, epoch), fed by triggers on sessions in the writer's own transaction.
+  Coverage is an EXCLUSION list (C8): every sessions column bumps except the pure counters in
+  COUNTER_COLUMNS; the triggers are regenerated from PRAGMA table_info on each writer init, so a column added
+  later is watched automatically. That includes last_activity_at (raised mid-turn before any message),
+  started_at/ended_at/end_reason/parent_session_id/title, pinned/hidden/archived, the workspace columns,
+  source and model_config (the _branched_from/_delegate_from/_reset_from lineage markers). message_count
+  bumps only on a 0 <-> non-0 crossing (launch stub becoming real). INSERT, DELETE and a re-keyed id bump.
+- Superseded segments: local-lineage receipts (state_meta gateway.local_policy.v1:*, the
+  LOCAL_LINEAGE_PREDICATE_SQL partial index) are digested into the cursor by the reader instead of a
+  state_meta trigger, because every message insert upserts state_meta (the projection generation) and a
+  trigger there is compiled into each of those statements. A receipt change answers FULL.
+- changed_since(conn, cursor) -> (frozenset ids | FULL, cursor'), one read snapshot. FULL unless
+  (a) MAX(rev) == revision, (b) revision >= cursor's, (c) file (dev, ino), -shm identity, PRAGMA
+  schema_version, the schema_version table value and the install epoch match, the installed triggers equal
+  the generated ones, and the receipt digest matches. An older writer that rebuilt or copied the table
+  without the triggers, a newer column, a restore (in place or file swap) and a broken invariant all read
+  FULL; a (re)install rotates the epoch.
+- hermes_state_schema.py: install_fail_open after the session projection install. O(1) migration (two
+  empty tables, one index, five triggers, no backfill: the hub's state.db is 11.6 GB); a lock or read-only
+  file never fails the open, readers answer FULL until a later init installs it.
+- hermes_state_compression.py: stamp_legacy_compression_chains counted its stamps as a total_changes delta,
+  which includes trigger writes; it now sums the UPDATEs' rowcounts (stamp_compression_ancestors returns
+  them). The repo's other total_changes users compare for change/no-change only, which the cursor's
+  triggers (fired only by a sessions write) cannot flip.
+- Tests that simulate an older store with ALTER TABLE sessions DROP COLUMN now drop
+  session_change_on_sessions_update first, as they already drop sessions_projection_update: SQLite refuses
+  DROP COLUMN of a column a trigger names (production never drops sessions columns). The projection
+  heartbeat test now accounts for the cursor's two trigger writes per stamp.
+
+Proof:
+- tests/hermes_state/test_session_change_cursor.py: 23 tests. RED with the schema hook disabled (no
+  install): 22 fail (the one that passes asserts FULL). GREEN: 23 pass. Cases: mid-turn last_activity_at
+  with no message, a git_repo_root-only backfill, pin/hide/workspace/archive/title/source edits, launch
+  stub 0->1 (and not later messages), counter-only updates do
+  not bump, a new continuation, model_config lineage marker, receipts -> FULL, re-key, delete and
+  INSERT OR REPLACE, older writer -> FULL, stale trigger set -> FULL, broken invariant -> FULL, in-place
+  and row-level restores -> FULL, file-replacing restore -> FULL, limit.
+- Mutation check: 18 mutants of the module (each watched column excluded, each trigger disabled, each
+  trust rule removed, the digest ignored, the limit ignored), all killed.
+- scripts/benchmark_session_change_overhead.py (30 rounds x 150 inserts, median of paired ON/OFF ratios
+  with an OFF/OFF control): append_message wall +0.99% / -0.64% (control +0.16% / -0.28%), raw-SQL wall
+  +1.28% / -0.52%; limit 3%, PASS. append_message process CPU +2.3% to +4.4%: the trigger programs are
+  compiled into the message_count UPDATE, which the writer re-prepares per write (its scoped authorizer
+  expires statements); the commit's fsync dominates latency.
+---
+ hermes_state_compression.py                   |  25 +-
+ hermes_state_schema.py                        |   2 +
+ hermes_state_session_change.py                | 328 ++++++++++++++++++
+ scripts/benchmark_session_change_overhead.py  | 130 +++++++
+ tests/agent/test_insights.py                  |   1 +
+ tests/hermes_cli/test_browse_schema_drift.py  |   3 +
+ ...test_cli_sessions_behind_newer_surfaces.py |   1 +
+ .../test_sessions_repair_declarative.py       |   1 +
+ .../hermes_cli/test_sessions_source_local.py  |   1 +
+ .../test_bounded_recent_sessions.py           |   1 +
+ tests/hermes_state/test_hermes_state.py       |   2 +-
+ tests/hermes_state/test_runtime_schema.py     |   1 +
+ .../test_session_change_cursor.py             | 304 ++++++++++++++++
+ .../test_session_git_metadata_generation.py   |   1 +
+ .../test_session_projection_revision.py       |   7 +-
+ 15 files changed, 795 insertions(+), 13 deletions(-)
+ create mode 100644 hermes_state_session_change.py
+ create mode 100644 scripts/benchmark_session_change_overhead.py
+ create mode 100644 tests/hermes_state/test_session_change_cursor.py
+
+diff --git a/hermes_state_compression.py b/hermes_state_compression.py
+index 8eaa66b2e0..ccfe9da089 100644
+--- a/hermes_state_compression.py
++++ b/hermes_state_compression.py
+@@ -159,8 +159,9 @@ _UNSET_ANCESTOR_SQL = """
+ """
+ 
+ 
+-def stamp_compression_ancestors(conn, session_id: str) -> None:
+-    """Copy *session_id*'s ``created_source`` onto compression ancestors that have none.
++def stamp_compression_ancestors(conn, session_id: str) -> int:
++    """Copy *session_id*'s ``created_source`` onto compression ancestors that have none; returns the
++    rows stamped (statement counts, so trigger writes such as the session change cursor's are not counted).
+ 
+     A list page shows a compressed conversation as its root, painted as the tip, and filters on
+     the root's ``created_source``. Automatic compression publishes the child before any writer
+@@ -174,20 +175,23 @@ def stamp_compression_ancestors(conn, session_id: str) -> None:
+     row = conn.execute(_CREATED_ROW_SQL, (session_id,)).fetchone()
+     surface = row["created_source"] if row else None
+     if surface in _UNSET_CREATED_SOURCES:
+-        return
++        return 0
+     if conn.execute(_UNSET_ANCESTOR_SQL, (session_id, surface, _CHAIN_CAP)).fetchone() is None:
+-        return
++        return 0
++    stamped = 0
+     current, parent_id = session_id, row["parent_session_id"]
+     for _ in range(_CHAIN_CAP):
+         parent = parent_id and conn.execute(_CREATED_ROW_SQL, (parent_id,)).fetchone()
+         if not parent or parent["created_source"] not in (*_UNSET_CREATED_SOURCES, surface):
+-            return
++            return stamped
+         step = conn.execute(_CHAIN_STEP_SQL, (parent_id,)).fetchone()
+         if step is None or step["id"] != current:
+-            return
++            return stamped
+         if parent["created_source"] != surface:
+-            conn.execute("UPDATE sessions SET created_source = ? WHERE id = ?", (surface, parent_id))
++            stamped += conn.execute("UPDATE sessions SET created_source = ? WHERE id = ?",
++                                    (surface, parent_id)).rowcount
+         current, parent_id = parent_id, parent["parent_session_id"]
++    return stamped
+ 
+ 
+ # Compression edges whose parent is unset and whose continuation child carries a real surface: what
+@@ -258,10 +262,9 @@ class SessionCompressionMixin:
+         a one-hop walk per stamped child of an unset compression parent that the walk does not
+         follow (a non-preferred sibling). Returns the rows stamped."""
+         def _do(conn):
+-            before = conn.total_changes
+-            for row in conn.execute(_UNSTAMPED_EDGE_CHILD_SQL).fetchall():
+-                stamp_compression_ancestors(conn, row["id"])
+-            return conn.total_changes - before
++            # Statement row counts, not ``total_changes``: trigger writes (the session change cursor) count there.
++            return sum(stamp_compression_ancestors(conn, row["id"])
++                       for row in conn.execute(_UNSTAMPED_EDGE_CHILD_SQL).fetchall())
+         return self._execute_write(_do)
+ 
+     def find_live_compression_child(self, parent_session_id: str) -> Optional[dict[str, Any]]:
+diff --git a/hermes_state_schema.py b/hermes_state_schema.py
+index 3575d3a379..4c38575cd6 100644
+--- a/hermes_state_schema.py
++++ b/hermes_state_schema.py
+@@ -32,6 +32,7 @@ from hermes_state_fts import (_drop_orphan_fts_shadow_tables, base_index_recogni
+                               drop_retired_cjk_index, fts_layout_current)
+ from hermes_state_holders import _read_proc_argv
+ from hermes_state_search import _delete_meta, _meta_row
++from hermes_state_session_change import install_fail_open as install_session_change
+ from hermes_state_errors import is_sqlite_lock_error
+ from hermes_state_titles import next_title_in_lineage
+ 
+@@ -1071,6 +1072,7 @@ class SessionSchemaMixin:
+             logger.debug("idx_messages_platform_msg_id create skipped: %s", exc)
+         self._execute_ddl_skipping_settled_triggers(cursor, DEFERRED_INDEX_SQL)  # same ordering constraint (``active``)
+         self._ensure_session_projection(cursor)
++        install_session_change(cursor.connection)
+ 
+         # After DEFERRED_INDEX_SQL: its partial index on ``active IS NULL`` serves the probe.
+         healed = self._heal_null_active_rows(cursor) and healed
+diff --git a/hermes_state_session_change.py b/hermes_state_session_change.py
+new file mode 100644
+index 0000000000..fcb10b0f1d
+--- /dev/null
++++ b/hermes_state_session_change.py
+@@ -0,0 +1,328 @@
++"""[daveey] Per-session change cursor for state.db (design t_01a1d563324d7e8e §2 P3, card D1).
++
++The session list, sidebar and project tree re-rank every session on each poll because state.db has no
++sessions revision: ``data_version`` moves on any write (140 of 300 two-second windows on the hub), so
++a reader cannot tell "nothing a listing reads moved" from "a counter ticked". This module adds one:
++
++- ``session_change(session_id PRIMARY KEY, rev)``: the revision at which each session last changed.
++- ``session_change_revision``: one row, ``revision`` (the newest ``rev``) and an install ``epoch``.
++
++Triggers feed both, in the writer's own transaction (read-your-writes). Coverage is an EXCLUSION list
++(review C8): every ``sessions`` column bumps except the pure counters in ``COUNTER_COLUMNS``, so a
++column added later is watched once the next writer init regenerates the triggers. Included therefore:
++``last_activity_at`` (raised mid-turn before any message, ``touch_session_activity``), ``started_at``,
++``ended_at``, ``end_reason``, ``parent_session_id``, ``title``, ``pinned``, ``hidden``, the archive flags,
++the workspace columns, ``source`` and ``model_config`` (its JSON carries the ``_branched_from`` /
++``_delegate_from`` / ``_reset_from`` lineage markers). ``message_count`` bumps only when it crosses
++0 (a launch stub becoming real, or a reset to empty). INSERT (including ``INSERT OR REPLACE``) and
++DELETE always bump. A re-keyed row moves its old id too.
++
++Superseded segments: a local-lineage receipt in ``state_meta`` (``gateway.local_policy.v1:*`` naming
++more than one segment, ``LOCAL_LINEAGE_PREDICATE_SQL``, read by ``exclude_superseded_segments``) changes
++which rows a listing shows. Receipts are rare (a local reset) and sit in a partial index, so readers
++digest them into the cursor rather than trigger on ``state_meta`` (every message insert upserts a
++``state_meta`` row); a cursor across a receipt change answers FULL. A changed id that is a lineage segment
++(its ``end_reason`` moved) can change which sibling segment is the head: callers recompute the lineage
++index (``_cached_local_lineage_index`` already does on any commit).
++
++Messages are NOT covered: a reader that ranks by message time keeps its own ``messages.id`` watermark.
++
++Every trigger body bumps ``revision`` and upserts exactly one non-NULL id at it, so
++``MAX(session_change.rev) == revision`` holds for every write that went through the triggers. Bodies are
++kept minimal on purpose: SQLite compiles trigger programs into each statement that can fire them, and the
++writer re-prepares its statements per write, so the hot message path pays their size on every insert.
++
++``changed_since(conn, cursor)`` trusts the cursor only when all of these hold, else it answers ``FULL``:
++
++- (a) ``MAX(rev) == revision`` in the same snapshot;
++- (b) ``revision >= cursor.revision`` (an in-place restore regresses it);
++- (c) the file's (dev, ino), its ``-shm`` identity, ``PRAGMA schema_version``, the ``schema_version``
++  table value and the install ``epoch`` all match the cursor, and the installed triggers are exactly the
++  ones this build generates from the live columns;
++- the local-lineage receipt digest matches the cursor (no segment superseded since).
++
++Mixed writers: an older build does not know these triggers and never drops them (state.db drops only
++allowlisted FTS names), so its writes still fire them. A store whose triggers are missing or stale
++(rebuilt or copied by an older build, a column added by a newer one) fails (c), and every reader falls
++back to FULL until a current writer reinstalls them; a (re)install rotates the epoch, so a cursor from
++before the gap is never trusted afterwards.
++
++The install is O(1): two empty tables, one index and the triggers; no backfill. A fresh install, or a
++caller with no cursor, starts at FULL.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import logging
++import os
++import sqlite3
++import threading
++import uuid
++from dataclasses import dataclass
++from typing import Optional, Union
++
++logger = logging.getLogger("hermes_state")
++
++CHANGE_TABLE = "session_change"
++REVISION_TABLE = "session_change_revision"
++PREFIX = "session_change_on_"
++# Pure counters and accumulators: an update that changes only these is not a session-list change. Every
++# other ``sessions`` column (including ones added after this list was written) bumps.
++COUNTER_COLUMNS = frozenset({
++    "message_count",  # bumps on its own trigger, only when it crosses 0
++    "tool_call_count", "api_call_count", "input_tokens", "output_tokens", "cache_read_tokens",
++    "cache_write_tokens", "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd",
++    "transcript_revision", "compression_fallback_streak", "compression_ineffective_count",
++    "compression_overload_streak",
++})
++
++_TABLE_DDL = (
++    f"CREATE TABLE IF NOT EXISTS {CHANGE_TABLE} "
++    "(session_id TEXT PRIMARY KEY NOT NULL, rev INTEGER NOT NULL) WITHOUT ROWID",
++    f"CREATE INDEX IF NOT EXISTS idx_{CHANGE_TABLE}_rev ON {CHANGE_TABLE}(rev)",
++    f"CREATE TABLE IF NOT EXISTS {REVISION_TABLE} "
++    "(id INTEGER PRIMARY KEY CHECK (id = 1), revision INTEGER NOT NULL, epoch TEXT NOT NULL)",
++)
++
++
++class _Full:
++    __slots__ = ()
++
++    def __repr__(self) -> str:
++        return "FULL"
++
++
++FULL = _Full()  # the caller must do its full read
++
++
++@dataclass(frozen=True)
++class Cursor:
++    dev: int
++    ino: int
++    shm: Optional[tuple]
++    schema_cookie: int
++    schema_level: Optional[int]
++    epoch: str
++    lineage: str
++    revision: int
++
++
++def _quote(name: str) -> str:
++    return '"' + name.replace('"', '""') + '"'
++
++
++# Trigger programs are compiled into every statement they can fire for, and the writer re-prepares its
++# statements on each write attempt (its scoped authorizer expires them), so bodies stay as small as
++# possible: the hot message path pays their compile cost on every insert.
++def _stamp(ref: str) -> str:
++    """Bump the revision and stamp ``ref`` (an id expression the trigger's WHEN proved non-NULL) at it."""
++    return (f"UPDATE {REVISION_TABLE} SET revision = revision + 1 WHERE id = 1; "
++            f"INSERT INTO {CHANGE_TABLE} (session_id, rev) SELECT {ref}, revision FROM {REVISION_TABLE} "
++            "WHERE id = 1 ON CONFLICT(session_id) DO UPDATE SET rev = excluded.rev;")
++
++
++def _lineage_digest(conn: sqlite3.Connection) -> str:
++    """Digest of the local-lineage receipts that can supersede a segment. Read through the partial index
++    ``idx_state_meta_local_lineage`` (the predicate must be the literal one); there are few receipts, one
++    per local reset. Read instead of triggered: every message insert upserts ``state_meta`` (the projection
++    generation), and a ``state_meta`` trigger would be compiled into each of those statements."""
++    from hermes_state_common import LOCAL_LINEAGE_PREDICATE_SQL
++    h = hashlib.blake2b(digest_size=16)
++    for key, value in conn.execute(
++            f"SELECT key, value FROM state_meta WHERE {LOCAL_LINEAGE_PREDICATE_SQL} ORDER BY key"):
++        key, value = str(key), str(value)
++        h.update(f"{len(key)}:{key}{len(value)}:{value}".encode("utf-8", "surrogatepass"))
++    return h.hexdigest()
++
++
++def wanted_triggers(conn: sqlite3.Connection) -> dict[str, str]:
++    """Trigger name -> CREATE statement, generated from the live ``sessions`` columns."""
++    columns = [r[1] for r in conn.execute("PRAGMA table_info(sessions)")]
++    if not columns:
++        return {}
++    out = {
++        f"{PREFIX}sessions_insert": f"CREATE TRIGGER {PREFIX}sessions_insert AFTER INSERT ON sessions "
++                                    f"WHEN NEW.id IS NOT NULL BEGIN {_stamp('NEW.id')} END",
++        f"{PREFIX}sessions_delete": f"CREATE TRIGGER {PREFIX}sessions_delete AFTER DELETE ON sessions "
++                                    f"WHEN OLD.id IS NOT NULL BEGIN {_stamp('OLD.id')} END",
++    }
++    watched = [c for c in columns if c not in COUNTER_COLUMNS]
++    changed = " OR ".join(f"OLD.{_quote(c)} IS NOT NEW.{_quote(c)}" for c in watched)
++    out[f"{PREFIX}sessions_update"] = (
++        f"CREATE TRIGGER {PREFIX}sessions_update AFTER UPDATE OF {', '.join(_quote(c) for c in watched)} "
++        f"ON sessions WHEN NEW.id IS NOT NULL AND ({changed}) BEGIN {_stamp('NEW.id')} END")
++    # A re-keyed row also moves its old id (the update trigger above stamps the new one).
++    out[f"{PREFIX}sessions_rekey"] = (
++        f"CREATE TRIGGER {PREFIX}sessions_rekey AFTER UPDATE OF id ON sessions "
++        f"WHEN OLD.id IS NOT NULL AND OLD.id IS NOT NEW.id BEGIN {_stamp('OLD.id')} END")
++    if "message_count" in columns:
++        # The hot path (every message insert bumps the counter): one cheap WHEN, a body only at 0 <-> non-0.
++        out[f"{PREFIX}sessions_message_count"] = (
++            f"CREATE TRIGGER {PREFIX}sessions_message_count AFTER UPDATE OF message_count ON sessions "
++            "WHEN NEW.id IS NOT NULL AND "
++            "(COALESCE(OLD.message_count, 0) = 0) IS NOT (COALESCE(NEW.message_count, 0) = 0) "
++            f"BEGIN {_stamp('NEW.id')} END")
++    return out
++
++
++def _installed(conn: sqlite3.Connection) -> dict[str, str]:
++    return dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name GLOB ?",
++                             (PREFIX + "*",)))
++
++
++def _has_tables(conn: sqlite3.Connection) -> bool:
++    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?)",
++                                        (CHANGE_TABLE, REVISION_TABLE))}
++    return names == {CHANGE_TABLE, REVISION_TABLE}
++
++
++def ensure_installed(conn: sqlite3.Connection) -> bool:
++    """Install or repair the tables and triggers. Reads only on the settled path; a (re)install rotates
++    the epoch so no cursor issued before it is trusted. O(1): no backfill. Returns whether it wrote."""
++    wanted = wanted_triggers(conn)
++    if not wanted:
++        return False
++    found = _installed(conn)
++    if found == wanted and _has_tables(conn) and conn.execute(
++            f"SELECT 1 FROM {REVISION_TABLE} WHERE id = 1").fetchone():
++        return False
++    own = not conn.in_transaction
++    if own:
++        conn.execute("BEGIN IMMEDIATE")
++    try:
++        for ddl in _TABLE_DDL:
++            conn.execute(ddl)
++        conn.execute(f"INSERT OR IGNORE INTO {REVISION_TABLE} (id, revision, epoch) VALUES (1, 0, '')")
++        conn.execute(f"UPDATE {REVISION_TABLE} SET epoch = ? WHERE id = 1", (uuid.uuid4().hex,))
++        for name in set(found) - set(wanted):
++            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
++        for name, sql in wanted.items():
++            if found.get(name) != sql:
++                conn.execute(f"DROP TRIGGER IF EXISTS {name}")
++                conn.execute(sql)
++        if own:
++            conn.execute("COMMIT")
++    except BaseException:
++        if own and conn.in_transaction:
++            conn.execute("ROLLBACK")
++        raise
++    return True
++
++
++def install_fail_open(conn: sqlite3.Connection) -> None:
++    """``ensure_installed`` for the writer init: a failure (a lock, a read-only file) never fails the open;
++    readers answer FULL until a later init installs the triggers."""
++    try:
++        ensure_installed(conn)
++    except sqlite3.Error as exc:
++        logger.warning("session change cursor not installed (readers fall back to full reads): %s", exc)
++
++
++def drop_triggers(conn: sqlite3.Connection) -> None:
++    """Remove the triggers (not the tables), e.g. before ``DROP COLUMN`` of a watched column: the update
++    trigger names each one. Readers answer FULL until the next writer init reinstalls them."""
++    for name in list(_installed(conn)):
++        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
++
++
++def _main_path(conn: sqlite3.Connection) -> str:
++    for row in conn.execute("PRAGMA database_list"):
++        if row[1] == "main":
++            return row[2] or ""
++    return ""
++
++
++def _identity(path: str) -> Optional[tuple]:
++    """``(dev, ino, shm)`` of the database file and its ``-shm``; None when the file can't be stat'd."""
++    if not path:
++        return None
++    try:
++        st = os.stat(path)
++    except OSError:
++        return None
++    try:
++        sh = os.stat(path + "-shm")
++        shm = (sh.st_dev, sh.st_ino)
++    except OSError:
++        shm = None
++    return (st.st_dev, st.st_ino, shm)
++
++
++# (path, dev, ino, schema cookie) -> whether the installed triggers are exactly the generated ones. Any DDL
++# (a trigger dropped or recreated, a column added) moves the cookie, so a hit proves the same coverage.
++_COVERED: dict[tuple, bool] = {}
++_COVERED_LOCK = threading.Lock()
++_COVERED_MAX = 64
++
++
++def _covered(conn: sqlite3.Connection, key: tuple) -> bool:
++    with _COVERED_LOCK:
++        hit = _COVERED.get(key)
++    if hit is not None:
++        return hit
++    value = _has_tables(conn) and bool(_installed(conn)) and _installed(conn) == wanted_triggers(conn)
++    with _COVERED_LOCK:
++        if len(_COVERED) >= _COVERED_MAX:
++            _COVERED.clear()
++        _COVERED[key] = value
++    return value
++
++
++def _schema_level(conn: sqlite3.Connection) -> Optional[int]:
++    try:
++        row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
++    except sqlite3.OperationalError:
++        return None
++    return int(row[0]) if row and row[0] is not None else None
++
++
++def changed_since(conn: sqlite3.Connection, cursor: Optional[Cursor], *,
++                  limit: Optional[int] = None) -> tuple[frozenset | _Full, Optional[Cursor]]:
++    """``(session ids changed after cursor, cursor')`` or ``(FULL, cursor')``.
++
++    ``cursor'`` is None when the store cannot vouch for changes right now (missing or stale triggers, a
++    broken invariant), so the next call is FULL too. ``limit``: answer FULL rather than return more ids.
++    A deleted session's id is returned like any other; the caller treats a missing row as a delete.
++    Raises ``sqlite3.Error`` like any read."""
++    path = _main_path(conn)
++    before = _identity(path)
++    if before is None:
++        return FULL, None  # in-memory or vanished file: no identity to bind a cursor to
++    own = not conn.in_transaction
++    if own:
++        conn.execute("BEGIN")  # one snapshot for the invariant, the coverage check and the ids
++    try:
++        fresh, ids = _read(conn, path, before, cursor, limit)
++    finally:
++        if own and conn.in_transaction:
++            conn.execute("COMMIT")
++    if fresh is None or _identity(path) != before:
++        return FULL, None
++    if ids is None or (limit is not None and len(ids) > limit):
++        return FULL, fresh
++    return ids, fresh
++
++
++def _read(conn: sqlite3.Connection, path: str, ident: tuple, cursor: Optional[Cursor],
++          limit: Optional[int]) -> tuple[Optional[Cursor], Optional[frozenset]]:
++    cookie = int(conn.execute("PRAGMA schema_version").fetchone()[0])
++    if not _covered(conn, (path, ident[0], ident[1], cookie)):
++        return None, None
++    state = conn.execute(f"SELECT r.revision, r.epoch, (SELECT MAX(rev) FROM {CHANGE_TABLE}) "
++                         f"FROM {REVISION_TABLE} r WHERE r.id = 1").fetchone()
++    if state is None or int(state[2] or 0) != int(state[0]):  # (a)
++        return None, None
++    fresh = Cursor(ident[0], ident[1], ident[2], cookie, _schema_level(conn), str(state[1]),
++                   _lineage_digest(conn), int(state[0]))
++    if (cursor is None or fresh.revision < cursor.revision  # (b)
++            or (cursor.dev, cursor.ino, cursor.shm, cursor.schema_cookie, cursor.schema_level, cursor.epoch)
++            != (fresh.dev, fresh.ino, fresh.shm, fresh.schema_cookie, fresh.schema_level, fresh.epoch)  # (c)
++            or cursor.lineage != fresh.lineage):  # a segment was superseded or restored
++        return fresh, None
++    sql = f"SELECT session_id FROM {CHANGE_TABLE} WHERE rev > ? AND rev <= ?"
++    params: tuple = (cursor.revision, fresh.revision)
++    if limit is not None:
++        sql += " LIMIT ?"
++        params += (limit + 1,)
++    return fresh, frozenset(r[0] for r in conn.execute(sql, params))
+diff --git a/scripts/benchmark_session_change_overhead.py b/scripts/benchmark_session_change_overhead.py
+new file mode 100644
+index 0000000000..f580994904
+--- /dev/null
++++ b/scripts/benchmark_session_change_overhead.py
+@@ -0,0 +1,130 @@
++"""Write-overhead benchmark for the state.db session change cursor (card D1, design t_01a1d563324d7e8e §2 P3).
++
++Run: scripts/run-in-hermes-env python scripts/benchmark_session_change_overhead.py [rounds] [inserts_per_round]
++
++The hot write path is a message insert: ``append_message`` inserts the row (FTS triggers included) and bumps
++``sessions.message_count``. The cursor's ``message_count`` trigger evaluates one WHEN on that update and runs
++its body only on a 0 <-> non-0 crossing, so steady-state inserts should cost the same with or without it.
++
++Each round times three adjacent blocks on the same file: cursor ON (triggers installed), OFF (triggers
++dropped) and OFF again, in a rotating order. The ON/OFF ratio per round is the overhead and the OFF/OFF
++ratio is an A/A control showing how far this host moves with nothing changed; the reported number is the
++median over rounds, so drift (page cache, WAL growth, checkpoints, neighbours) cancels. Two paths:
++
++- ``append_message``: the real SessionDB call; its wall time per insert is the write latency a turn pays.
++  Its process CPU is printed too: the triggers' only steady-state cost is compiling their programs into
++  the ``message_count`` UPDATE, which the writer re-prepares per write (a few percent of CPU, under 1%
++  of latency, since the commit's fsync dominates).
++- ``raw sql``: the same two statements in one transaction on a plain connection with
++  ``synchronous=OFF`` and cached statements, so its wall time is statement execution only.
++
++Exits 1 when either gated (wall) median overhead is above ``LIMIT_PCT`` (3%).
++"""
++from __future__ import annotations
++
++import os
++import shutil
++import sqlite3
++import statistics
++import sys
++import tempfile
++import time
++from pathlib import Path
++
++ROUNDS = int(sys.argv[1]) if len(sys.argv) > 1 else 30
++PER_ROUND = int(sys.argv[2]) if len(sys.argv) > 2 else 150
++SESSIONS = 2000
++LIMIT_PCT = 3.0
++
++tmp = Path(tempfile.mkdtemp(prefix="session-change-bench-", dir=os.environ.get("TMPDIR")))
++os.environ["HERMES_HOME"] = str(tmp)
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++import hermes_state_session_change as sc
++from hermes_state import SessionDB
++
++db = SessionDB(db_path=tmp / "state.db")
++hot = [f"hot{i}" for i in range(20)]
++
++
++def seed() -> None:
++    def write(conn):
++        conn.executemany("INSERT INTO sessions (id, source, started_at, title) VALUES (?, 'cli', ?, ?)",
++                         [(f"s{i}", 1_700_000_000.0 + i, f"session {i}") for i in range(SESSIONS)])
++    db._execute_write(write)
++    for sid in hot:
++        db.create_session(sid, "cli")
++        db.append_message(sid, "user", "warm up")  # past 0 -> 1: steady-state inserts from here
++
++
++def set_cursor(on: bool) -> None:
++    def write(conn):
++        if on:
++            sc.ensure_installed(conn)
++        else:
++            sc.drop_triggers(conn)
++    db._execute_write(write)
++    with db._read_ctx() as conn:
++        installed = bool(sc._installed(conn))
++    assert installed is on
++
++
++def time_append(n: int) -> tuple[float, float]:
++    body = "x" * 400
++    wall, cpu = time.perf_counter(), time.process_time()
++    for i in range(n):
++        db.append_message(hot[i % len(hot)], "assistant" if i % 2 else "user", f"{body} {i}")
++    return (time.perf_counter() - wall) / n, (time.process_time() - cpu) / n
++
++
++def time_raw(conn: sqlite3.Connection, n: int) -> tuple[float, float]:
++    wall, cpu = time.perf_counter(), time.process_time()
++    for i in range(n):
++        sid = hot[i % len(hot)]
++        conn.execute("BEGIN IMMEDIATE")
++        conn.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', ?, ?)",
++                     (sid, f"raw {i}", time.time()))
++        conn.execute("UPDATE sessions SET message_count = message_count + 1 WHERE id = ?", (sid,))
++        conn.execute("COMMIT")
++    return (time.perf_counter() - wall) / n, (time.process_time() - cpu) / n
++
++
++def main() -> int:
++    seed()
++    raw = sqlite3.connect(tmp / "state.db", isolation_level=None, timeout=30)  # health: allow HX015 -- throwaway benchmark file in a temp dir
++    raw.execute("PRAGMA synchronous = OFF")  # statement cost only, no fsync noise
++    # Per round: ON, OFF and a second OFF (an A/A control), in a rotating order, so each ratio compares
++    # adjacent blocks and the control shows how much this host moves with no change at all.
++    ratios: dict[tuple[str, int, str], list[float]] = {}
++    orders = (("on", "off", "off2"), ("off", "off2", "on"), ("off2", "on", "off"))
++    for r in range(ROUNDS):
++        got: dict[str, tuple] = {}
++        for side in orders[r % 3]:
++            set_cursor(side == "on")
++            got[side] = (time_append(PER_ROUND), time_raw(raw, PER_ROUND))
++        for p, path in enumerate(("append_message", "raw sql")):
++            for i in (0, 1):
++                ratios.setdefault((path, i, "on"), []).append(got["on"][p][i] / got["off"][p][i])
++                ratios.setdefault((path, i, "a/a"), []).append(got["off2"][p][i] / got["off"][p][i])
++    raw.close()
++    db.close()
++
++    def pct(path: str, i: int, kind: str) -> float:
++        return (statistics.median(ratios[(path, i, kind)]) - 1.0) * 100.0
++
++    worst = 0.0
++    for path, gated in (("append_message", 0), ("raw sql", 0)):
++        for i, name in ((0, "wall"), (1, "cpu")):
++            over, control = pct(path, i, "on"), pct(path, i, "a/a")
++            mark = "  <- gated" if i == gated else ""
++            if i == gated:
++                worst = max(worst, over)
++            print(f"{path:15s} {name:4s} cursor overhead {over:+6.2f}%   (A/A control {control:+6.2f}%){mark}")
++    print(f"{ROUNDS} rounds x {PER_ROUND} inserts per block, median of paired ratios; limit {LIMIT_PCT:.1f}%: "
++          f"{'PASS' if worst <= LIMIT_PCT else 'FAIL'} (worst gated {worst:+.2f}%)")
++    shutil.rmtree(tmp, ignore_errors=True)
++    return 0 if worst <= LIMIT_PCT else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/agent/test_insights.py b/tests/agent/test_insights.py
+index 60ff979af5..41f16740ee 100644
+--- a/tests/agent/test_insights.py
++++ b/tests/agent/test_insights.py
+@@ -616,6 +616,7 @@ def test_source_filter_on_a_db_without_created_source(db):
+     _label(db, "legacy-cli", "cli", "cli")
+     # SQLite refuses DROP COLUMN while an index references the column.
+     db._conn.execute("DROP INDEX IF EXISTS idx_sessions_local_created_started")
++    db._conn.execute("DROP TRIGGER IF EXISTS session_change_on_sessions_update")  # names every column
+     db._conn.execute("ALTER TABLE sessions DROP COLUMN created_source")
+     db._conn.commit()
+     assert InsightsEngine(db).generate(days=30, source="cli")["overview"]["total_sessions"] == 1
+diff --git a/tests/hermes_cli/test_browse_schema_drift.py b/tests/hermes_cli/test_browse_schema_drift.py
+index b076f40439..a4beaf9c8d 100644
+--- a/tests/hermes_cli/test_browse_schema_drift.py
++++ b/tests/hermes_cli/test_browse_schema_drift.py
+@@ -32,6 +32,7 @@ def _pre_merge_store(path, *, version=31):
+         db.append_message("kept", role="user", content="history survives")
+     with closing(sqlite3.connect(path)) as conn:
+         conn.execute("DROP TRIGGER IF EXISTS sessions_runtime_ledger_delete_guard")
++        conn.execute("DROP TRIGGER IF EXISTS session_change_on_sessions_update")  # names every column
+         for table in reversed(_ADDED_TABLES):
+             conn.execute(f"DROP TABLE {table}")
+         conn.execute("DROP INDEX IF EXISTS idx_sessions_local_created_started")
+@@ -202,6 +203,7 @@ def _drop_session_column(path, column):
+         conn.execute("DROP INDEX IF EXISTS idx_sessions_effective_activity")
+         conn.execute("DROP INDEX IF EXISTS idx_sessions_pinned")
+         conn.execute("DROP TRIGGER IF EXISTS sessions_projection_update")
++        conn.execute("DROP TRIGGER IF EXISTS session_change_on_sessions_update")
+         conn.execute(f"ALTER TABLE sessions DROP COLUMN {column}")
+         conn.commit()
+ 
+@@ -276,6 +278,7 @@ def _lagging_store_with_history(home, rows=400):
+         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+         conn.execute("DROP INDEX IF EXISTS idx_sessions_effective_activity")
+         conn.execute("DROP TRIGGER IF EXISTS sessions_projection_update")
++        conn.execute("DROP TRIGGER IF EXISTS session_change_on_sessions_update")
+         conn.execute("ALTER TABLE sessions DROP COLUMN last_read_at")
+         conn.commit()
+         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+diff --git a/tests/hermes_cli/test_cli_sessions_behind_newer_surfaces.py b/tests/hermes_cli/test_cli_sessions_behind_newer_surfaces.py
+index b4117759eb..1818b6ca2d 100644
+--- a/tests/hermes_cli/test_cli_sessions_behind_newer_surfaces.py
++++ b/tests/hermes_cli/test_cli_sessions_behind_newer_surfaces.py
+@@ -131,6 +131,7 @@ def _pre_column_readonly(tmp_path) -> SessionDB:
+     with writer._lock:
+         writer._conn.execute("UPDATE sessions SET message_count=1 WHERE id='legacy-cli'")
+         writer._conn.execute("DROP INDEX IF EXISTS idx_sessions_local_created_started")
++        writer._conn.execute("DROP TRIGGER IF EXISTS session_change_on_sessions_update")  # names every column
+         writer._conn.execute("ALTER TABLE sessions DROP COLUMN created_source")
+         writer._conn.commit()
+     writer.close()
+diff --git a/tests/hermes_cli/test_sessions_repair_declarative.py b/tests/hermes_cli/test_sessions_repair_declarative.py
+index b937dc0d1b..4e678418e5 100644
+--- a/tests/hermes_cli/test_sessions_repair_declarative.py
++++ b/tests/hermes_cli/test_sessions_repair_declarative.py
+@@ -27,6 +27,7 @@ def _legacy_store(tmp_path, monkeypatch):
+         db.create_session('retained', source='cli')
+         db.append_message('retained', role='user', content='history survives')
+     with closing(sqlite3.connect(path)) as conn:
++        conn.execute('DROP TRIGGER IF EXISTS session_change_on_sessions_update')  # names every column
+         conn.execute('ALTER TABLE sessions DROP COLUMN runtime_generation')
+         conn.execute('ALTER TABLE sessions DROP COLUMN runtime_revision')
+         conn.execute('ALTER TABLE async_delegations DROP COLUMN owner_execution_id')
+diff --git a/tests/hermes_cli/test_sessions_source_local.py b/tests/hermes_cli/test_sessions_source_local.py
+index d00365bace..3fca48e461 100644
+--- a/tests/hermes_cli/test_sessions_source_local.py
++++ b/tests/hermes_cli/test_sessions_source_local.py
+@@ -55,6 +55,7 @@ def test_reader_on_a_read_only_store_from_before_the_column_and_the_runtime_tabl
+     with writer._lock:
+         writer._conn.execute("UPDATE sessions SET started_at = started_at + 60 WHERE id = 'legacy-stub'")
+         writer._conn.execute("DROP INDEX IF EXISTS idx_sessions_local_created_started")
++        writer._conn.execute("DROP TRIGGER IF EXISTS session_change_on_sessions_update")  # names every column
+         writer._conn.execute("ALTER TABLE sessions DROP COLUMN created_source")
+         writer._conn.execute("DROP TABLE session_admissions")
+         writer._conn.commit()
+diff --git a/tests/hermes_state/test_bounded_recent_sessions.py b/tests/hermes_state/test_bounded_recent_sessions.py
+index 7248b0d170..37b7aba304 100644
+--- a/tests/hermes_state/test_bounded_recent_sessions.py
++++ b/tests/hermes_state/test_bounded_recent_sessions.py
+@@ -32,6 +32,7 @@ def test_writable_startup_reconciles_legacy_activity_column_before_index(tmp_pat
+     conn = sqlite3.connect(path)
+     try:
+         conn.execute("DROP INDEX IF EXISTS idx_sessions_effective_activity")
++        conn.execute("DROP TRIGGER IF EXISTS session_change_on_sessions_update")  # names every column
+         conn.execute("ALTER TABLE sessions DROP COLUMN last_activity_at")
+         conn.commit()
+     finally:
+diff --git a/tests/hermes_state/test_hermes_state.py b/tests/hermes_state/test_hermes_state.py
+index c08443e477..1ad6be89ae 100644
+--- a/tests/hermes_state/test_hermes_state.py
++++ b/tests/hermes_state/test_hermes_state.py
+@@ -2141,7 +2141,7 @@ class TestReconcileColumnsErrorHandling:
+         SessionDB(db_path=db_path).close()
+         conn = sqlite3.connect(str(db_path))
+         try:
+-            conn.execute("DROP TRIGGER IF EXISTS sessions_projection_update")
++            conn.executescript("DROP TRIGGER IF EXISTS sessions_projection_update; DROP TRIGGER IF EXISTS session_change_on_sessions_update;")
+             conn.execute("ALTER TABLE sessions DROP COLUMN last_read_at")
+             conn.commit()
+         finally:
+diff --git a/tests/hermes_state/test_runtime_schema.py b/tests/hermes_state/test_runtime_schema.py
+index d33be27ce8..d7735d1a33 100644
+--- a/tests/hermes_state/test_runtime_schema.py
++++ b/tests/hermes_state/test_runtime_schema.py
+@@ -15,6 +15,7 @@ def test_schema_reconciles_existing_sessions_without_losing_history(tmp_path):
+     db.append_message('existing', role='user', content='retained')
+     db.close()
+     with sqlite3.connect(path) as legacy:
++        legacy.execute('DROP TRIGGER IF EXISTS session_change_on_sessions_update')  # names every column
+         legacy.execute('ALTER TABLE sessions DROP COLUMN runtime_generation')
+         legacy.execute('ALTER TABLE sessions DROP COLUMN runtime_revision')
+         for table in ('worker_receipts', 'worker_executions', 'session_admissions', 'runtime_epoch'):
+diff --git a/tests/hermes_state/test_session_change_cursor.py b/tests/hermes_state/test_session_change_cursor.py
+new file mode 100644
+index 0000000000..aeac60bfd4
+--- /dev/null
++++ b/tests/hermes_state/test_session_change_cursor.py
+@@ -0,0 +1,304 @@
++"""[daveey] state.db per-session change cursor (design t_01a1d563324d7e8e §2 P3, review R5 and C8; card D1).
++
++Each case is a session-list input that ``data_version``-free readers would otherwise miss: mid-turn activity
++with no message, pin/hide/workspace/archive/title edits, a launch stub becoming real, a new continuation,
++lineage receipts, a delete. The trust cases pin the (a)/(b)/(c) rules: an older writer that lacks the
++triggers, a broken invariant and a restore all answer FULL.
++"""
++
++import os
++import shutil
++import sqlite3
++
++import pytest
++
++import hermes_state_schema_memo
++import hermes_state_session_change as sc
++from hermes_state import SessionDB
++from hermes_state_common import LOCAL_LINEAGE_PREDICATE_SQL
++from hermes_state_session_change import FULL, changed_since
++
++
++@pytest.fixture
++def store(tmp_path):
++    hermes_state_schema_memo.clear()
++    db = SessionDB(db_path=tmp_path / "state.db")
++    reader = sqlite3.connect(tmp_path / "state.db", isolation_level=None)
++    yield db, reader, tmp_path / "state.db"
++    reader.close()
++    db.close()
++
++
++def _cursor(reader):
++    ids, cur = changed_since(reader, None)
++    assert ids is FULL and cur is not None  # no cursor yet: always a full read
++    return cur
++
++
++def _changed(reader, cur):
++    ids, new = changed_since(reader, cur)
++    assert ids is not FULL, "expected a trusted incremental answer"
++    return set(ids), new
++
++
++def test_install_is_empty_and_starts_at_full(store):
++    db, reader, _ = store
++    db.create_session("a", "cli")
++    assert changed_since(reader, None)[0] is FULL
++    # No backfill: a populated store's install writes no rows (O(1) on the hub's 11.6 GB file).
++    other = sqlite3.connect(":memory:")
++    other.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, message_count INTEGER)")
++    other.executemany("INSERT INTO sessions VALUES (?, 't', 3)", [(f"s{i}",) for i in range(50)])
++    assert sc.ensure_installed(other) is True
++    assert other.execute("SELECT COUNT(*) FROM session_change").fetchone()[0] == 0
++    assert other.execute("SELECT revision FROM session_change_revision").fetchone()[0] == 0
++    assert sc.ensure_installed(other) is False  # settled: read-only
++
++
++def test_mid_turn_activity_without_a_message(store):
++    db, reader, _ = store
++    db.create_session("a", "cli")
++    db.create_session("b", "cli")
++    cur = _cursor(reader)
++    db.touch_session_activity("a", ts=4_000_000_000.0)
++    ids, cur = _changed(reader, cur)
++    assert ids == {"a"}
++    # The next mid-turn stamp moves only last_activity_at (same description and provenance).
++    db.touch_session_activity("a", ts=4_000_000_060.0)
++    ids, _ = _changed(reader, cur)
++    assert ids == {"a"}
++
++
++def test_workspace_root_backfill_alone(store):
++    db, reader, _ = store
++    db.create_session("a", "cli")
++    db.update_session_cwd("a", "/tmp/repo/sub")
++    cur = _cursor(reader)
++    db.backfill_repo_roots({"/tmp/repo/sub": "/tmp/repo"})  # moves only git_repo_root: the workspace key
++    ids, _ = _changed(reader, cur)
++    assert ids == {"a"}
++
++
++_EDITS = {
++    "pinned": lambda db: db.set_session_pinned("a", True),
++    "hidden": lambda db: db.set_session_hidden("a", True),
++    "workspace": lambda db: db.update_session_cwd("a", "/tmp/elsewhere") or True,
++    "archive": lambda db: db.set_session_archived("a", True),
++    "title": lambda db: db.set_session_title("a", "Renamed"),
++    "source": lambda db: db._execute_write(
++        lambda c: c.execute("UPDATE sessions SET source = 'desktop' WHERE id = 'a'")) or True,
++}
++
++
++@pytest.mark.parametrize("edit", sorted(_EDITS))
++def test_admission_and_display_edits(store, edit):
++    db, reader, _ = store
++    db.create_session("a", "cli")
++    db.create_session("b", "cli")
++    cur = _cursor(reader)
++    assert _EDITS[edit](db)
++    ids, _ = _changed(reader, cur)
++    assert ids == {"a"}
++
++
++def test_launch_stub_becoming_real_but_not_later_messages(store):
++    db, reader, _ = store
++    db.create_session("a", "cli")
++    cur = _cursor(reader)
++    db.append_message("a", "user", "hello")  # 0 -> 1
++    ids, cur = _changed(reader, cur)
++    assert ids == {"a"}
++    db.append_message("a", "assistant", "hi")  # 1 -> 2: a counter tick, messages have their own watermark
++    ids, cur = _changed(reader, cur)
++    assert ids == set()
++
++
++def test_counter_only_update_does_not_bump(store):
++    db, reader, _ = store
++    db.create_session("a", "cli")
++    db.append_message("a", "user", "hello")
++    cur = _cursor(reader)
++    db._execute_write(lambda c: c.execute(
++        "UPDATE sessions SET input_tokens = input_tokens + 5, api_call_count = api_call_count + 1, "
++        "tool_call_count = tool_call_count + 1, transcript_revision = transcript_revision + 1 WHERE id = 'a'"))
++    assert _changed(reader, cur)[0] == set()
++
++
++def test_new_continuation_moves_parent_and_child(store):
++    db, reader, _ = store
++    db.create_session("root", "cli")
++    db.append_message("root", "user", "hello")
++    cur = _cursor(reader)
++    db.end_session("root", "compression")
++    db.create_session("cont", "cli", parent_session_id="root")
++    ids, _ = _changed(reader, cur)
++    assert ids == {"root", "cont"}
++
++
++def test_lineage_marker_in_model_config(store):
++    db, reader, _ = store
++    db.create_session("a", "cli")
++    db.create_session("b", "cli")
++    cur = _cursor(reader)
++    db._execute_write(lambda c: c.execute(
++        "UPDATE sessions SET model_config = json_set(COALESCE(model_config, '{}'), '$._branched_from', 'a') "
++        "WHERE id = 'b'"))
++    assert _changed(reader, cur)[0] == {"b"}
++
++
++def test_local_lineage_receipt_reads_full(store):
++    """A receipt that supersedes segments changes which rows a listing shows; it is rare (a local reset),
++    so it moves the lineage counter and the next read is FULL, after which the cursor is precise again."""
++    db, reader, _ = store
++    for sid in ("own", "seg2", "seg3"):
++        db.create_session(sid, "cli")
++    cur = _cursor(reader)
++    key = "gateway.local_policy.v1:own"
++    db._execute_write(lambda c: c.execute(
++        "INSERT INTO state_meta (key, value) VALUES (?, ?)",
++        (key, '{"session_id": "own", "lineage": ["own", "seg2"]}')))
++    ids, cur = changed_since(reader, cur)
++    assert ids is FULL and cur is not None
++    assert changed_since(reader, cur)[0] == set()
++    db._execute_write(lambda c: c.execute(
++        "UPDATE state_meta SET value = ? WHERE key = ?",
++        ('{"session_id": "own", "lineage": ["own", "seg2", "seg3"]}', key)))
++    ids, cur = changed_since(reader, cur)
++    assert ids is FULL
++    db._execute_write(lambda c: c.execute("DELETE FROM state_meta WHERE key = ?", (key,)))
++    ids, cur = changed_since(reader, cur)
++    assert ids is FULL
++    # Unrelated keys, single-segment and malformed receipts never move it, and never fail the write.
++    db._execute_write(lambda c: c.execute("INSERT INTO state_meta (key, value) VALUES ('other', 'x')"))
++    db._execute_write(lambda c: c.execute(
++        "INSERT INTO state_meta (key, value) VALUES ('gateway.local_policy.v1:one', "
++        "'{\"session_id\": \"one\", \"lineage\": [\"one\"]}')"))
++    db._execute_write(lambda c: c.execute(
++        "INSERT INTO state_meta (key, value) VALUES ('gateway.local_policy.v1:bad', 'not json')"))
++    assert changed_since(reader, cur)[0] == set()
++    plan = " ".join(str(r[-1]) for r in reader.execute(
++        "EXPLAIN QUERY PLAN SELECT key, value FROM state_meta WHERE " + LOCAL_LINEAGE_PREDICATE_SQL + " ORDER BY key"))
++    assert "idx_state_meta_local_lineage" in plan  # a poll reads the few receipts, never all of state_meta
++
++
++def test_rekeyed_row_moves_both_ids(store):
++    db, reader, _ = store
++    db.create_session("old", "cli")
++    cur = _cursor(reader)
++    db._execute_write(lambda c: c.execute("UPDATE sessions SET id = 'new' WHERE id = 'old'"))
++    assert _changed(reader, cur)[0] == {"old", "new"}
++
++
++def test_delete_and_insert_or_replace(store):
++    db, reader, _ = store
++    db.create_session("a", "cli")
++    db.create_session("b", "cli")
++    cur = _cursor(reader)
++    db.delete_session("a")
++    ids, cur = _changed(reader, cur)
++    assert ids == {"a"}
++    assert reader.execute("SELECT 1 FROM sessions WHERE id = 'a'").fetchone() is None  # caller: missing = deleted
++    # INSERT OR REPLACE fires no DELETE trigger without recursive_triggers; the INSERT upsert covers it.
++    db._execute_write(lambda c: c.execute(
++        "INSERT OR REPLACE INTO sessions (id, source, started_at) VALUES ('b', 'cli', 1.0)"))
++    assert _changed(reader, cur)[0] == {"b"}
++
++
++def test_older_writer_without_triggers_reads_full(store):
++    db, reader, path = store
++    db.create_session("a", "cli")
++    cur = _cursor(reader)
++    # A store rebuilt or copied by a build that predates the cursor carries no triggers.
++    db._execute_write(lambda c: sc.drop_triggers(c))
++    db.set_session_title("a", "Unseen by the cursor")
++    ids, again = changed_since(reader, cur)
++    assert ids is FULL and again is None
++    # A current writer's init reinstalls them and rotates the epoch: the pre-gap cursor stays untrusted.
++    db.close()
++    hermes_state_schema_memo.clear()
++    db2 = SessionDB(db_path=path)
++    try:
++        assert changed_since(reader, cur)[0] is FULL
++        fresh = _cursor(reader)
++        db2.set_session_title("a", "Seen")
++        assert _changed(reader, fresh)[0] == {"a"}
++    finally:
++        db2.close()
++
++
++def test_stale_trigger_set_reads_full(store):
++    db, reader, _ = store
++    db.create_session("a", "cli")
++    cur = _cursor(reader)
++    # A newer build added a column: until this build's init regenerates the triggers, the column is unwatched.
++    db._execute_write(lambda c: c.execute("ALTER TABLE sessions ADD COLUMN future_flag INTEGER"))
++    assert changed_since(reader, cur) == (FULL, None)
++
++
++def test_bump_without_upsert_breaks_invariant(store):
++    db, reader, _ = store
++    db.create_session("a", "cli")
++    cur = _cursor(reader)
++    db._execute_write(lambda c: c.execute("UPDATE session_change_revision SET revision = revision + 1"))
++    assert changed_since(reader, cur) == (FULL, None)  # (a): MAX(rev) != revision
++
++
++def test_in_place_restore_reads_full(store, tmp_path):
++    db, reader, path = store
++    db.create_session("a", "cli")
++    backup = sqlite3.connect(tmp_path / "backup.db")
++    src = sqlite3.connect(path)
++    src.backup(backup)
++    src.close()
++    db.create_session("b", "cli")
++    db.set_session_title("a", "After the backup")
++    cur = _cursor(reader)
++    # Backup-API restore over the live file: same inode, regressed revision (b); the backup also moves the
++    # destination's schema cookie (c).
++    dst = sqlite3.connect(path)
++    backup.backup(dst)
++    dst.close()
++    backup.close()
++    assert changed_since(reader, cur)[0] is FULL
++
++
++def test_regressed_revision_with_same_schema_reads_full(store):
++    db, reader, _ = store
++    db.create_session("a", "cli")
++    db.create_session("b", "cli")
++    before = dict(reader.execute("SELECT session_id, rev FROM session_change").fetchall())
++    mid = reader.execute("SELECT revision FROM session_change_revision").fetchone()[0]
++    db.set_session_title("a", "later")
++    cur = _cursor(reader)
++    assert cur.revision > mid
++    # The rows as they were at ``mid``, under an unchanged schema cookie and epoch (a row-level restore):
++    # (a) still holds, only (b) catches it.
++    def roll_back(conn):
++        conn.executemany("UPDATE session_change SET rev = ? WHERE session_id = ?",
++                         [(rev, sid) for sid, rev in before.items()])
++        conn.execute("UPDATE session_change_revision SET revision = ?", (mid,))
++    db._execute_write(roll_back)
++    assert changed_since(reader, cur)[0] is FULL
++
++
++def test_file_replacing_restore_reads_full(store, tmp_path):
++    db, reader, path = store
++    db.create_session("a", "cli")
++    cur = _cursor(reader)
++    db.close()
++    shutil.copy(path, tmp_path / "restored.db")
++    os.replace(tmp_path / "restored.db", path)  # new inode (c)
++    fresh_reader = sqlite3.connect(path, isolation_level=None)
++    try:
++        assert changed_since(fresh_reader, cur)[0] is FULL
++    finally:
++        fresh_reader.close()
++
++
++def test_limit_answers_full_past_it(store):
++    db, reader, _ = store
++    cur = _cursor(reader)
++    for sid in ("a", "b", "c"):
++        db.create_session(sid, "cli")
++    assert changed_since(reader, cur, limit=2)[0] is FULL
++    assert set(changed_since(reader, cur, limit=3)[0]) == {"a", "b", "c"}
+diff --git a/tests/hermes_state/test_session_git_metadata_generation.py b/tests/hermes_state/test_session_git_metadata_generation.py
+index aa15767999..82cfe716f2 100644
+--- a/tests/hermes_state/test_session_git_metadata_generation.py
++++ b/tests/hermes_state/test_session_git_metadata_generation.py
+@@ -219,6 +219,7 @@ def test_legacy_sessions_table_reconciles_generation_column(tmp_path):
+     SessionDB(db_path=path).close()
+     conn = sqlite3.connect(path)
+     try:
++        conn.execute("DROP TRIGGER IF EXISTS session_change_on_sessions_update")  # names every column
+         conn.execute("ALTER TABLE sessions DROP COLUMN git_metadata_generation")
+         conn.execute("UPDATE schema_version SET version = 25")
+         conn.commit()
+diff --git a/tests/tui_gateway/test_session_projection_revision.py b/tests/tui_gateway/test_session_projection_revision.py
+index b6284f115f..037f2d23d1 100644
+--- a/tests/tui_gateway/test_session_projection_revision.py
++++ b/tests/tui_gateway/test_session_projection_revision.py
+@@ -103,9 +103,14 @@ def test_heartbeat_and_equal_updates_do_not_write_counter(store):
+         before = writer.execute("SELECT value FROM state_meta WHERE key='sessions_change_seq'").fetchone()
+         assert before is not None
+         changes = writer.total_changes
++        stamps = writer.execute("SELECT revision FROM session_change_revision").fetchone()[0]
+         writer.execute("UPDATE sessions SET last_activity_at=123, last_activity_description='busy'")
+         writer.execute("UPDATE sessions SET title=title, archived=archived")
+-        assert writer.total_changes - changes == 2
++        # The session change cursor (hermes_state_session_change) does watch a heartbeat: each stamp is two
++        # trigger writes (its revision row and the session's row). Nothing else is written.
++        stamped = writer.execute("SELECT revision FROM session_change_revision").fetchone()[0] - stamps
++        assert stamped >= 1
++        assert writer.total_changes - changes - 2 * stamped == 2
+         assert writer.execute("SELECT value FROM state_meta WHERE key='sessions_change_seq'").fetchone() == before
+ 
+ 
+-- 
+2.43.0
+

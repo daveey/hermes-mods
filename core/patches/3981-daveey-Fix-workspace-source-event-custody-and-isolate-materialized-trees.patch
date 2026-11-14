@@ -1,0 +1,177 @@
+From f8b53a3914de2e7b35bc88696bb52fa4d665bc4c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 00:04:51 +0000
+Subject: [PATCH] [daveey] Fix workspace source event custody and isolate
+ materialized trees
+
+Proof: red holder-event and ancestor config regressions; 134 focused tests pass. Seven targeted mutations killed: holder, manifest fields, custody revision, nested target, occupied target, task reservation, dirty destination. Preserve existing holder and return-home paths; new worktrees live beside the registered clone.
+---
+ hermes_cli/kanban_source_dispatch.py          | 13 ++++--
+ hermes_cli/kanban_source_resolver.py          |  4 +-
+ .../hermes_cli/test_kanban_source_resolver.py | 31 +++++++++++--
+ .../test_kanban_workspace_source.py           | 44 +++++++++++++++++++
+ 4 files changed, 85 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_source_dispatch.py b/hermes_cli/kanban_source_dispatch.py
+index 12a75f6cee..0199826556 100644
+--- a/hermes_cli/kanban_source_dispatch.py
++++ b/hermes_cli/kanban_source_dispatch.py
+@@ -92,10 +92,17 @@ def materialized_event(conn: sqlite3.Connection, claimed: Any, snapshot: Any, so
+     from hermes_cli import kanban_db as kb
+     run_id = getattr(claimed, "current_run_id", None)
+     row = conn.execute("SELECT uid FROM task_runs WHERE id = ?", (run_id,)).fetchone() if run_id else None
+-    holder = snapshot.custody.source_holder if snapshot.custody is not None else None
++    custody = snapshot.custody if snapshot is not None else None
++    payload = source.event_payload(holder=_me(conn), run_uid=row[0] if row else None)
++    payload["prev_holder"] = custody.source_holder if custody is not None else None
++    if snapshot is not None and snapshot.manifest_value is not None:
++        manifest = snapshot.manifest()
++        payload.update(repository=manifest.full_name, commit=manifest.commit,
++                       manifest_revision=manifest.manifest_revision, source_kind=manifest.source_kind)
++    elif custody is not None:
++        payload["manifest_revision"] = custody.manifest_revision
+     with kb.write_txn(conn):
+-        kb._append_event(conn, claimed.id, "workspace_source_materialized",
+-                         source.event_payload(holder=holder, run_uid=row[0] if row else None), run_id=run_id)
++        kb._append_event(conn, claimed.id, "workspace_source_materialized", payload, run_id=run_id)
+ 
+ 
+ def _revision(exc: WorkspaceSourceRefusal) -> Optional[int]:
+diff --git a/hermes_cli/kanban_source_resolver.py b/hermes_cli/kanban_source_resolver.py
+index eb808cf0db..6f8f60da28 100644
+--- a/hermes_cli/kanban_source_resolver.py
++++ b/hermes_cli/kanban_source_resolver.py
+@@ -141,7 +141,9 @@ def materialize(conn: sqlite3.Connection, task_id: str, manifest: Manifest, cfg:
+             raise WorkspaceSourceRefusal("diverged_local_branch", f"local {manifest.branch} {local} is not an "
+                                          f"ancestor of {manifest.commit}")
+         bound.git(clone.path, "update-ref", manifest.branch, manifest.commit, local)
+-    target = str(Path(clone.path) / ".worktrees" / task_id)
++    # A nested checkout inherits ancestor build configuration (e.g. Nim's config.nims)
++    # from the clone's unrelated HEAD. Keep new trees beside, never inside, the clone.
++    target = str(Path(clone.path).parent / ".worktrees" / str(manifest.repository_id) / task_id)
+     if Path(target).exists():
+         raise WorkspaceSourceRefusal("occupied_path", f"{target} already exists")
+     if (other := _occupied_by_other_task(conn, task_id, target)) is not None:
+diff --git a/tests/hermes_cli/test_kanban_source_resolver.py b/tests/hermes_cli/test_kanban_source_resolver.py
+index 98ac1bdb8e..d6ad0cb17f 100644
+--- a/tests/hermes_cli/test_kanban_source_resolver.py
++++ b/tests/hermes_cli/test_kanban_source_resolver.py
+@@ -128,7 +128,7 @@ def test_materialize_exact_branch_and_sha(world):
+     out = resolve(world, conn, cfg, snap(world))
+     clone = world.homes["worker-2"].clone
+     assert (out.mode, out.branch, out.commit, out.manifest_revision) == ("materialized", BRANCH, world.tip, 1)
+-    assert out.path == str(clone.resolve() / ".worktrees" / TASK)
++    assert out.path == str(clone.resolve().parent / ".worktrees" / str(REPO_ID) / TASK)
+     assert git(out.path, "rev-parse", "HEAD") == world.tip
+     assert git(out.path, "symbolic-ref", "HEAD") == f"refs/heads/{BRANCH}"
+     assert git(clone, "rev-parse", f"refs/hermes/source/{TASK}") == world.tip
+@@ -142,6 +142,20 @@ def test_materialize_exact_branch_and_sha(world):
+     assert payload["hostname"]
+ 
+ 
++def test_materialized_worktree_cannot_inherit_clone_build_config(world):
++    conn, cfg = use_home(world, "worker-2")
++    clone = world.homes["worker-2"].clone
++    clone_head = commit(clone, "config.nims", 'switch("path", "src")')
++    out = resolve(world, conn, cfg, snap(world))
++    path = Path(out.path).resolve()
++    # Tools such as Nim discover config by walking ancestors, independent of Git's worktree boundary.
++    inherited = [parent / "config.nims" for parent in path.parents if (parent / "config.nims").exists()]
++    assert inherited == []
++    assert not path.is_relative_to(clone.resolve())
++    assert git(path, "rev-parse", "HEAD") == world.tip
++    assert git(clone, "rev-parse", "HEAD") == clone_head
++
++
+ def test_stale_tracking_ref_is_never_read(world):
+     conn, cfg = use_home(world, "worker-2")
+     clone = world.homes["worker-2"].clone
+@@ -223,7 +237,7 @@ def test_remote_drift_is_card_scope(world):
+     git(world.author, "push", "-q", "origin", BRANCH)
+     err = refusal(lambda: resolve(world, conn, cfg, snap(world)))
+     assert (err.code, err.scope) == ("remote_drift", "card")
+-    assert not (world.homes["worker-2"].clone / ".worktrees" / TASK).exists()
++    assert not (world.homes["worker-2"].clone.parent / ".worktrees" / str(REPO_ID) / TASK).exists()
+ 
+ 
+ def test_remote_branch_missing_is_card_scope(world):
+@@ -338,9 +352,20 @@ def test_live_checkout_refused_as_clone(world):
+ 
+ def test_occupied_path_refused(world):
+     conn, cfg = use_home(world, "worker-2")
+-    (world.homes["worker-2"].clone / ".worktrees" / TASK).mkdir(parents=True)
++    (world.homes["worker-2"].clone.parent / ".worktrees" / str(REPO_ID) / TASK).mkdir(parents=True)
++    err = refusal(lambda: resolve(world, conn, cfg, snap(world)))
++    assert (err.code, err.scope) == ("occupied_path", "host")
++
++
++def test_uncreated_destination_reserved_by_other_task_refused(world):
++    from hermes_cli import kanban_db_workspace as kbw
++    conn, cfg = use_home(world, "worker-2")
++    target = world.homes["worker-2"].clone.parent / ".worktrees" / str(REPO_ID) / TASK
++    other = kb.create_task(conn, title="reserved", assignee="worker")
++    kbw.set_workspace_path(conn, other, str(target))
+     err = refusal(lambda: resolve(world, conn, cfg, snap(world)))
+     assert (err.code, err.scope) == ("occupied_path", "host")
++    assert not target.exists()
+ 
+ 
+ def test_destination_claimed_by_other_task_refused(world):
+diff --git a/tests/hermes_cli/test_kanban_workspace_source.py b/tests/hermes_cli/test_kanban_workspace_source.py
+index dbb11fb694..b89a8d518e 100644
+--- a/tests/hermes_cli/test_kanban_workspace_source.py
++++ b/tests/hermes_cli/test_kanban_workspace_source.py
+@@ -606,6 +606,50 @@ def test_resolve_refuses_source_card_when_disabled(conn, monkeypatch):
+     assert (err.value.code, err.value.scope, err.value.evidence["manifest_revision"]) == ("source_disabled", "host", 1)
+ 
+ 
++@pytest.mark.parametrize("mode", ["materialized", "holder_reuse"])
++def test_materialized_event_names_current_holder_and_grant_source(conn, mode):
++    from hermes_cli import kanban_source_dispatch as dispatch
++    from hermes_cli.kanban_source_resolver import ResolvedSource
++    tid = kb.create_task(conn, title="source event", assignee="worker")
++    assert kb.claim_task(conn, tid)
++    claimed = kb.get_task(conn, tid)
++    assert claimed is not None
++    own = dispatch._me(conn)
++    previous = "previous-worker" if mode == "materialized" else own
++    snapshot = kws.SourceSnapshot(manifest(manifest_revision=7), kws.Custody(previous, "published", 7))
++    # A reused local copy may carry only its path/branch; the grant owns publication metadata.
++    source = ResolvedSource("/source/task", "wt/t_1", None, None, mode)
++    dispatch.materialized_event(conn, claimed, snapshot, source)
++    payload = json.loads(conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='workspace_source_materialized'", (tid,)
++    ).fetchone()[0])
++    assert payload["holder"] == own
++    assert payload["prev_holder"] == previous
++    assert {key: payload[key] for key in ("repository", "commit", "manifest_revision", "source_kind")} == {
++        "repository": "acme/widget", "commit": C1, "manifest_revision": 7, "source_kind": "task_worktree"}
++    assert payload["run_uid"] == sync.run_uid(conn, claimed.current_run_id)
++    assert payload["path"] == source.path and payload["mode"] == mode
++
++
++@pytest.mark.parametrize("snapshot_kind", ["no_snapshot", "no_custody", "custody_only"])
++def test_materialized_event_without_manifest_keeps_known_metadata(conn, snapshot_kind):
++    from hermes_cli import kanban_source_dispatch as dispatch
++    from hermes_cli.kanban_source_resolver import ResolvedSource
++    tid = kb.create_task(conn, title="unpublished source", assignee="worker")
++    custody_value = kws.Custody("previous", "retained", 3) if snapshot_kind == "custody_only" else None
++    snapshot = None if snapshot_kind == "no_snapshot" else kws.SourceSnapshot(None, custody_value)
++    source = ResolvedSource("/source/task", "wt/t_1", None, None, "holder_reuse")
++    dispatch.materialized_event(conn, SimpleNamespace(id=tid), snapshot, source)
++    payload = json.loads(conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='workspace_source_materialized'", (tid,)
++    ).fetchone()[0])
++    assert payload["holder"] == dispatch._me(conn)
++    assert payload["prev_holder"] == ("previous" if custody_value else None)
++    assert payload["manifest_revision"] == (3 if custody_value else None)
++    assert payload["repository"] is None and payload["commit"] is None and payload["source_kind"] is None
++    assert payload["run_uid"] is None
++
++
+ def test_refusal_codes_scoped():
+     assert kws.WorkspaceSourceRefusal("materialize_timeout").scope == "host"  # Q3
+     for code in ("remote_drift", "remote_branch_missing", "manifest_invalid", "custody_source_missing"):
+-- 
+2.43.0
+

@@ -1,0 +1,290 @@
+From ed75e24bda373b74f1c65a8d0f4cfa374d1fdc66 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:44:17 +0000
+Subject: [PATCH] [daveey] gateway boot: resolve native-recovery route owners
+ off the loop; batch the startup prune
+
+Problem: the hub gateway's event loop stalls 3-7 s at every boot with
+`loop top=hermes_state.py:1226 <lambda>` (SessionDB._read_one). In ~20 h of
+hub loop-watch.jsonl (2026-11-13): 223 such stalls >= 3 s, 1,533 s in total.
+
+Why 1: two boot paths do one full get_session() per routing entry on the loop:
+  - recover_profile_native_sessions -> authority.logical_owner(entry.session_id)
+    for every route (182 stalls, every 6-7 s one; e.g. 21:07:56 6.996 s, 39/40
+    samples in get_compression_lineage -> get_session);
+  - SessionStore._prune_stale_sessions_locked -> db.get_session per entry
+    (41 stalls; e.g. 21:13:32 3.96 s, 16/30 samples).
+Why 2: it is a slow query by volume, not a write-lock wait: the hub has 16,337
+  routing entries (15,884 ended local kanban/cron/oneshot routes kept by the
+  local-receipt rule), and get_session joins the resolved system prompt
+  (~45 KB/row). Measured on hub state.db: 3,000 get_session-shaped reads 0.48 s
+  raw vs 0.015 s for an id/parent/end_reason read; WAL readers never wait on
+  the writer.
+Why 3: the owner scan runs even when nothing is pending (session_admissions
+  had 0 queued/unknown/started rows), and both scans sit on the loop thread.
+Root (happened): boot recovery code scales O(routes) with full-row reads on
+  the event loop, while the routing index only grows.
+Root (not caught): tests used a handful of routes; nothing asserted the boot
+  scan stays off the loop.
+
+Fix:
+- recover_profile_native_sessions: the admission read, checkpoint reads and
+  route-owner resolution move into _pending_native_routes, run via
+  asyncio.to_thread; the per-route scan is skipped when nothing is pending.
+  Adapter lookup and recover_native_sessions stay on the loop.
+- _prune_stale_sessions_locked: end reasons come from chunked
+  `SELECT id, end_reason ... WHERE end_reason IS NOT NULL AND id IN (...)`
+  reads per owning db; _stale_entry_verdict only reads row["end_reason"].
+  Handles without _read_all (test doubles) keep the per-row get_session path.
+
+Proof: tests/gateway/test_boot_recovery_off_loop.py fails 3/3 on the old code
+(owner resolution on the loop thread; scan with nothing pending; prune calls
+get_session per entry) and passes after. Existing prune, native-boot,
+local-recovery and receipt suites (24 files, 194 tests) pass.
+---
+ gateway/run_runtime.py                       |  35 ++++--
+ gateway/session_persistence.py               |  45 ++++++--
+ tests/gateway/test_boot_recovery_off_loop.py | 114 +++++++++++++++++++
+ 3 files changed, 171 insertions(+), 23 deletions(-)
+ create mode 100644 tests/gateway/test_boot_recovery_off_loop.py
+
+diff --git a/gateway/run_runtime.py b/gateway/run_runtime.py
+index 6f88ca7f05..6498a921bc 100644
+--- a/gateway/run_runtime.py
++++ b/gateway/run_runtime.py
+@@ -681,22 +681,33 @@ async def recover_gateway_native_sessions(runner):
+     return results
+ 
+ 
++def _pending_native_routes(runner, authority):
++    """``(checkpoints, pending, [(owner, origin)])`` for boot recovery; blocking state.db reads,
++    so callers run it in a worker thread. Routes are resolved only when some FIFO is pending."""
++    from hermes_state_update_pause import get_session_checkpoint
++    rows = authority.db._read_all(
++        "SELECT DISTINCT target_session_id,status FROM session_admissions "
++        "WHERE status IN ('queued','unknown','started')")
++    # Old executions recover unknown; only a validated update receipt makes a
++    # still-started admission safe to wake (never replay an ordinary live turn).
++    checkpoints = {row['target_session_id'] for row in rows if row['status'] == 'started'
++                   and get_session_checkpoint(authority.db, session_id=row['target_session_id']) is not None}
++    pending = {row['target_session_id'] for row in rows if row['status'] != 'started'} | checkpoints
++    if not pending:
++        return checkpoints, pending, []
++    routes = [(owner, entry.origin) for entry in runner.session_store.list_sessions() if entry.origin is not None
++              for owner in [authority.logical_owner(entry.session_id)] if owner in pending]
++    return checkpoints, pending, routes
++
++
+ async def recover_profile_native_sessions(runner, authority):
+     """Bind one authority's queued native rows to the adapters connected now."""
+     from gateway.session_authorities import owner_scope
+     with owner_scope(authority):
+-        from hermes_state_update_pause import get_session_checkpoint
+-        rows = authority.db._read_all(
+-            "SELECT DISTINCT target_session_id,status FROM session_admissions "
+-            "WHERE status IN ('queued','unknown','started')")
+-        # Old executions recover unknown; only a validated update receipt makes a
+-        # still-started admission safe to wake (never replay an ordinary live turn).
+-        checkpoints = {row['target_session_id'] for row in rows if row['status'] == 'started'
+-                       and get_session_checkpoint(authority.db, session_id=row['target_session_id']) is not None}
+-        pending = {row['target_session_id'] for row in rows if row['status'] != 'started'} | checkpoints
+-        bindings = [(owner, entry.origin, runner._adapter_for_source(entry.origin))
+-                    for entry in runner.session_store.list_sessions() if entry.origin is not None
+-                    for owner in [authority.logical_owner(entry.session_id)] if owner in pending]
++        # state.db reads run off the loop: resolving owners costs one full session-row read per
++        # routing entry (thousands on a long-lived host), which stalled the loop 3-7 s per boot.
++        checkpoints, pending, routes = await asyncio.to_thread(_pending_native_routes, runner, authority)
++        bindings = [(owner, origin, runner._adapter_for_source(origin)) for owner, origin in routes]
+         outcome = await authority.recover_native_sessions(bindings)
+         from gateway.session_detached import recover_detached_sessions
+         outcome.update(dict.fromkeys(recover_detached_sessions(authority, pending - set(outcome)), 'detached'))
+diff --git a/gateway/session_persistence.py b/gateway/session_persistence.py
+index 59f0db2b91..2744c6967d 100644
+--- a/gateway/session_persistence.py
++++ b/gateway/session_persistence.py
+@@ -19,6 +19,25 @@ if TYPE_CHECKING:
+ # Log-record parity with the origin module.
+ logger = logging.getLogger("gateway.session")
+ 
++
++def _ended_reasons(db, session_ids):
++    """Lookup ``session_id -> {"id", "end_reason"}`` (None for a missing or live row) for a startup
++    prune. A real SessionDB answers in chunked id/end_reason reads: ``get_session`` joins the
++    ~45 KB resolved system prompt per row, and one call per routing entry (16k on the hub) held the
++    gateway loop 3-7 s at every boot. Handles without ``_read_all`` (test doubles) keep the per-row
++    ``get_session`` contract."""
++    if not callable(getattr(type(db), "_read_all", None)):
++        return db.get_session
++    from hermes_state_common import _id_chunks, _placeholders
++    ended = {}
++    for chunk in _id_chunks(dict.fromkeys(session_ids)):
++        for row in db._read_all(
++                f"SELECT id, end_reason FROM sessions WHERE end_reason IS NOT NULL AND id IN ({_placeholders(chunk)})",
++                chunk):
++            ended[row["id"]] = {"id": row["id"], "end_reason": row["end_reason"]}
++    return ended.get
++
++
+ # "No SessionDB pinned" sentinel: lets ``_db`` distinguish "resolve from the active scope" from a
+ # deliberate ``store._db = None`` (JSONL fallback).
+ _DB_UNPINNED = object()
+@@ -462,21 +481,25 @@ class SessionPersistenceMixin:
+         stale_keys: list = []
+         recovered_keys = 0
+         try:
++            by_db: dict = {}
+             for key, entry in self._entries.items():
+                 # Ask the store that owns the key, not the ambient handle, or a live
+                 # secondary-profile session gets pruned on the root copy.
+                 db = self._db_for_key(key)
+-                if db is None:
+-                    continue
+-                row = db.get_session(entry.session_id)
+-                if row is None or row.get("end_reason") is None:
+-                    continue
+-                verdict = self._stale_entry_verdict(key, entry, row)
+-                if verdict == "prune":
+-                    stale_keys.append(key)
+-                elif verdict is not None:
+-                    self._entries[key] = verdict
+-                    recovered_keys += 1
++                if db is not None:
++                    by_db.setdefault(id(db), (db, []))[1].append((key, entry))
++            for db, items in by_db.values():
++                ended = _ended_reasons(db, [entry.session_id for _key, entry in items])
++                for key, entry in items:
++                    row = ended(entry.session_id)
++                    if row is None or row.get("end_reason") is None:
++                        continue
++                    verdict = self._stale_entry_verdict(key, entry, row)
++                    if verdict == "prune":
++                        stale_keys.append(key)
++                    elif verdict is not None:
++                        self._entries[key] = verdict
++                        recovered_keys += 1
+         except Exception as exc:
+             logger.warning("gateway.session: stale-entry pruning skipped due to DB error: %s", exc)
+             return
+diff --git a/tests/gateway/test_boot_recovery_off_loop.py b/tests/gateway/test_boot_recovery_off_loop.py
+new file mode 100644
+index 0000000000..efecf66bac
+--- /dev/null
++++ b/tests/gateway/test_boot_recovery_off_loop.py
+@@ -0,0 +1,114 @@
++"""Gateway boot must not run per-routing-entry state.db reads on the event loop.
++
++On the hub (16k routing entries) ``recover_profile_native_sessions`` resolved every route's
++logical owner with a full ``get_session`` row (plus the ~45 KB joined system prompt) on the loop,
++and the startup prune did the same per entry: loop-watch logged 3-7 s stalls with
++``loop top=hermes_state.py:1226 <lambda>`` at every gateway boot.
++"""
++
++import threading
++from datetime import datetime, timedelta
++from types import SimpleNamespace
++
++import pytest
++
++from gateway.config import GatewayConfig, Platform
++from gateway.session import SessionEntry, SessionStore
++
++
++class _Db:
++    def __init__(self, rows, calls):
++        self.rows = rows
++        self.calls = calls
++
++    def _read_all(self, sql, params=()):
++        self.calls.append(('read_all', threading.get_ident()))
++        return self.rows
++
++
++class _Authority:
++    profile_id = 'fixture'
++
++    def __init__(self, rows, calls):
++        self.db = _Db(rows, calls)
++        self.calls = calls
++        self.sessions = {}
++        self.bindings = None
++
++    def logical_owner(self, session_id):
++        self.calls.append(('logical_owner', threading.get_ident()))
++        return 'root'
++
++    async def recover_native_sessions(self, bindings):
++        self.bindings = bindings
++        return {}
++
++
++def _runner(calls):
++    entries = [SimpleNamespace(session_id='tip', origin='origin-a'), SimpleNamespace(session_id='x', origin=None)]
++
++    def list_sessions():
++        calls.append(('list_sessions', threading.get_ident()))
++        return entries
++    return SimpleNamespace(session_store=SimpleNamespace(list_sessions=list_sessions),
++                           _adapter_for_source=lambda origin: f'adapter:{origin}')
++
++
++@pytest.mark.asyncio
++async def test_native_recovery_resolves_route_owners_off_the_loop(monkeypatch):
++    import gateway.session_detached as detached
++    from gateway.run_runtime import recover_profile_native_sessions
++    monkeypatch.setattr(detached, 'recover_detached_sessions', lambda authority, pending: [])
++    calls = []
++    authority = _Authority([{'target_session_id': 'root', 'status': 'queued'}], calls)
++    loop_thread = threading.get_ident()
++
++    assert await recover_profile_native_sessions(_runner(calls), authority) == {}
++
++    assert authority.bindings == [('root', 'origin-a', 'adapter:origin-a')]
++    assert {name for name, _ in calls} == {'read_all', 'list_sessions', 'logical_owner'}
++    assert [name for name, thread in calls if thread == loop_thread] == []
++
++
++@pytest.mark.asyncio
++async def test_native_recovery_skips_route_scan_when_nothing_is_pending(monkeypatch):
++    import gateway.session_detached as detached
++    from gateway.run_runtime import recover_profile_native_sessions
++    monkeypatch.setattr(detached, 'recover_detached_sessions', lambda authority, pending: [])
++    calls = []
++    authority = _Authority([], calls)
++
++    assert await recover_profile_native_sessions(_runner(calls), authority) == {}
++
++    assert authority.bindings == []
++    assert [name for name, _ in calls] == ['read_all']
++
++
++def test_startup_prune_reads_end_reasons_in_batches_not_full_rows(tmp_path, monkeypatch):
++    from hermes_state import SessionDB
++    db = SessionDB(db_path=tmp_path / 'state.db')
++    try:
++        for sid in ('ended_a', 'ended_b', 'live_c'):
++            db.create_session(sid, source='telegram')
++        db.end_session('ended_a', 'agent_close')
++        db.end_session('ended_b', 'session_reset')
++        with pytest.MonkeyPatch.context() as mp:
++            mp.setattr(SessionStore, '_ensure_loaded', lambda self: None)
++            store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
++        store._db = db
++        store._loaded = True
++        now = datetime.now()
++        for key, sid in (('ka', 'ended_a'), ('kb', 'ended_b'), ('kc', 'live_c'), ('kd', 'missing_d')):
++            store._entries[key] = SessionEntry(
++                session_key=key, session_id=sid, created_at=now - timedelta(hours=2),
++                updated_at=now - timedelta(hours=1), platform=Platform.TELEGRAM, chat_type='dm')
++        full_rows = []
++        monkeypatch.setattr(type(db), 'get_session', lambda self, sid: full_rows.append(sid))
++        monkeypatch.setattr(store, '_save', lambda: None)
++
++        store._prune_stale_sessions_locked()
++
++        assert full_rows == []
++        assert sorted(store._entries) == ['kc', 'kd']
++    finally:
++        db.close()
+-- 
+2.43.0
+

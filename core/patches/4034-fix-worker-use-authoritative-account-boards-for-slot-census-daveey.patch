@@ -1,0 +1,188 @@
+From 558d5a3e6a2677b936df9c2cc1782c2a32d3efcb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 01:21:28 +0000
+Subject: [PATCH] fix(worker): use authoritative account boards for slot census
+ [daveey]
+
+Composed census added current scratch HERMES_HOME and named symlinks after filtering inventory. Pass authoritative board_paths only for worker admission; preserve generic metrics discovery semantics. Discover canonical profile boards before registration and deduplicate discovery/records. RED: five composed failures against initial guard; GREEN: 81 focused tests, plus 1190 passing consumer tests before updating one strict fake signature. Full scripts/check: 20 checks OK. Mutation and independent review pending.
+---
+ hermes_cli/machine_metrics.py                 | 10 +--
+ hermes_cli/worker_account_boards.py           | 16 ++++-
+ hermes_cli/worker_resource_admission.py       |  2 +-
+ .../test_worker_board_root_boundary.py        | 61 +++++++++++++++++++
+ tests/hermes_cli/test_worker_legacy_scopes.py |  3 +-
+ 5 files changed, 83 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index ca187018dc..493769c006 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -118,7 +118,8 @@ def table_columns(db, table: str) -> set:
+     return set(row[0].split("\x1f")) if row and row[0] else set()
+ 
+ 
+-def active_card_runs(exclude=None, detail: Optional[dict] = None, *, owner_output=None, extra_paths=()) -> Optional[int]:
++def active_card_runs(exclude=None, detail: Optional[dict] = None, *, owner_output=None, extra_paths=(),
++                     board_paths=None) -> Optional[int]:
+     """All profiles share the kanban root. Count its execution boards, not replicas.
+ 
+     Unreadable/schema-unknown boards invalidate the whole sample. Conservative
+@@ -127,14 +128,15 @@ def active_card_runs(exclude=None, detail: Optional[dict] = None, *, owner_outpu
+     ``exclude`` (final admission only, a :class:`kanban_grant_echo.GrantEcho`): on the board whose file identity is
+     ``exclude.db_identity``, the ONE row that is still exactly the echo of the claimer's own unused grant is not
+     counted (review F5); it is re-proven here on this read connection, and more than one match fails closed.
+-    ``detail`` receives ``{"excluded": n}``.
++    ``detail`` receives ``{"excluded": n}``. ``board_paths`` is an authoritative
++    inventory for account worker admission; no current-home discovery is added.
+     """
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_db_boards import named_board_db_files
+ 
+     try:
+-        default = kb.kanban_home() / "kanban.db"
+-        paths = [default, *(p for _, p in named_board_db_files()), *extra_paths]
++        default = kb.kanban_home() / "kanban.db" if board_paths is None else None
++        paths = [default, *(p for _, p in named_board_db_files()), *extra_paths] if board_paths is None else board_paths
+         total = excluded = 0
+         owners = set()
+         seen = set()
+diff --git a/hermes_cli/worker_account_boards.py b/hermes_cli/worker_account_boards.py
+index 37e3d37335..a689a285b6 100644
+--- a/hermes_cli/worker_account_boards.py
++++ b/hermes_cli/worker_account_boards.py
+@@ -239,8 +239,7 @@ def _board_file(path: Path) -> bool:
+         return False
+ 
+ 
+-def paths() -> list[Path]:
+-    root = capacity.policy_root()
++def _installation_boards(root: Path) -> list[Path]:
+     found = []
+     # Only ENOENT is absence (``_missing``): an unreadable directory raises
+     # instead of silently dropping every board under it.
+@@ -253,6 +252,17 @@ def paths() -> list[Path]:
+         from hermes_cli import kanban_db as kb
+         found.extend(child / 'kanban.db' for child in boards.iterdir()
+                      if kb._BOARD_SLUG_RE.match(child.name) and _board_file(child / 'kanban.db'))
++    return found
++
++
++def paths() -> list[Path]:
++    root = capacity.policy_root()
++    found = _installation_boards(root)
++    profiles = root / 'profiles'
++    if not _missing(profiles):
++        for profile in profiles.iterdir():
++            if profile.is_dir():
++                found.extend(_installation_boards(profile))
+     directory = root / 'worker-resources' / 'boards'
+     if not _missing(directory):
+         for record in directory.iterdir():
+@@ -277,4 +287,4 @@ def paths() -> list[Path]:
+                     raise
+                 continue  # read-only: register() retires it under the fence
+             found.append(Path(raw))
+-    return [path for path in found if _account_board(path)]
++    return list(dict.fromkeys(path for path in found if _account_board(path)))
+diff --git a/hermes_cli/worker_resource_admission.py b/hermes_cli/worker_resource_admission.py
+index 65071d5394..fa6634ebfa 100644
+--- a/hermes_cli/worker_resource_admission.py
++++ b/hermes_cli/worker_resource_admission.py
+@@ -100,7 +100,7 @@ def occupied_count_for_host(echo=None, *, claimant=None) -> int | None:
+     from hermes_cli import machine_metrics
+     from hermes_cli.worker_account_boards import paths
+     active_owners = set()
+-    active = machine_metrics.active_card_runs(exclude=echo, owner_output=active_owners, extra_paths=paths())
++    active = machine_metrics.active_card_runs(exclude=echo, owner_output=active_owners, board_paths=paths())
+     if active is None:
+         return None
+     owners = {}
+diff --git a/tests/hermes_cli/test_worker_board_root_boundary.py b/tests/hermes_cli/test_worker_board_root_boundary.py
+index 769e04043a..3c3fdc6bb3 100644
+--- a/tests/hermes_cli/test_worker_board_root_boundary.py
++++ b/tests/hermes_cli/test_worker_board_root_boundary.py
+@@ -61,6 +61,67 @@ def test_legacy_foreign_record_cannot_reenter_census(account):
+     assert record.exists(), 'census remains read-only'
+ 
+ 
++def _running_board(path):
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with sqlite3.connect(path) as conn:
++        conn.execute('CREATE TABLE tasks (id TEXT, status TEXT)')
++        conn.execute("INSERT INTO tasks VALUES ('real-run', 'running')")
++
++
++@pytest.mark.parametrize('malformed', [False, True])
++def test_host_census_ignores_current_scratch_home(account, monkeypatch, malformed):
++    from hermes_cli import kanban_db as kb, worker_resource_admission as admission
++    real = account / 'kanban.db'
++    _running_board(real)
++    scratch = account / 'cache/scratch/current/kanban.db'
++    _running_board(scratch)
++    if malformed:
++        scratch.write_text('not sqlite')
++    monkeypatch.setattr(kb, 'kanban_home', lambda: scratch.parent)
++    monkeypatch.setattr(admission, 'pool_occupancy', lambda pool, owners, active, **kw: set(active))
++    assert admission.occupied_count_for_host() == 1
++
++
++def test_host_census_ignores_named_symlink(account, monkeypatch):
++    from hermes_cli import kanban_db as kb, worker_resource_admission as admission
++    _running_board(account / 'kanban.db')
++    scratch = account / 'cache/scratch/link/kanban.db'
++    _running_board(scratch)
++    boards = account / 'kanban/boards'
++    boards.mkdir(parents=True)
++    (boards / 'work').symlink_to(scratch.parent, target_is_directory=True)
++    monkeypatch.setattr(kb, 'kanban_home', lambda: account)
++    monkeypatch.setattr(admission, 'pool_occupancy', lambda pool, owners, active, **kw: set(active))
++    assert admission.occupied_count_for_host() == 1
++
++
++@pytest.mark.parametrize('relative', ['profiles/research/kanban.db',
++                                    'profiles/research/kanban/boards/work/kanban.db'])
++def test_unregistered_profile_discovered(account, relative):
++    board = account / relative
++    _running_board(board)
++    assert board in inventory.paths()
++
++
++def test_registered_missing_real_board_remains_unknown(account):
++    board = account / 'kanban.db'
++    with sqlite3.connect(board) as conn:
++        inventory.register(conn)
++    board.unlink()
++    with pytest.raises(FileNotFoundError):
++        inventory.paths()
++
++
++def test_authoritative_empty_and_disappearing_inventory(account, monkeypatch):
++    from hermes_cli import kanban_db as kb, machine_metrics
++    board = account / 'kanban.db'
++    _running_board(board)
++    monkeypatch.setattr(kb, 'kanban_home', lambda: account)
++    assert machine_metrics.active_card_runs(board_paths=[]) == 0
++    board.unlink()
++    assert machine_metrics.active_card_runs(board_paths=[board]) is None
++
++
+ def test_named_board_symlink_cannot_import_scratch(account):
+     scratch = account / 'cache/scratch/proof'
+     scratch.mkdir(parents=True)
+diff --git a/tests/hermes_cli/test_worker_legacy_scopes.py b/tests/hermes_cli/test_worker_legacy_scopes.py
+index ad63aad1cf..39e03973be 100644
+--- a/tests/hermes_cli/test_worker_legacy_scopes.py
++++ b/tests/hermes_cli/test_worker_legacy_scopes.py
+@@ -163,7 +163,8 @@ def test_census_wiring_and_unknown_stays_reserved(env, monkeypatch):
+     from hermes_cli import machine_metrics
+     home, pool, boot, db = env
+     monkeypatch.setattr('hermes_cli.worker_account_boards.paths', list)
+-    def fake_active(exclude=None, owner_output=None, extra_paths=None):
++    def fake_active(exclude=None, owner_output=None, board_paths=None):
++        assert board_paths == []
+         owner_output.add((str(db.resolve()), 't1'))
+         return 1
+     monkeypatch.setattr(machine_metrics, 'active_card_runs', fake_active)
+-- 
+2.43.0
+

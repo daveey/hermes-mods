@@ -1,0 +1,655 @@
+From 5ad9d5fccfec7f1df25b654e0f1b2dcdcc67f644 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 16:20:44 +0000
+Subject: [PATCH] [daveey] lifecycle guard: printf `*` width/precision, `%.Ns`
+ truncation, `%b` escapes and `-v NAME` no longer hide the printed command
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The output-sink walk read `printf FMT ARGS` output as "each conversion takes the next
+argument whole". Four bash printf behaviours broke that, so a shell sink ran a command the
+guard never saw (allowed while bash ran an oversized, unscannable script):
+
+- `printf '%*s %s' 5 bash /x/huge.sh | bash`: `*` takes an argument as the width.
+- `printf '%.4s %s' bashrc /x/huge.sh | bash`: precision truncates `bashrc` to `bash`.
+- `printf '%b %s' 'ba\x73h' /x/huge.sh | bash`: `%b` decodes `\xHH`/`\0NNN`, ends at `\c`.
+- `printf -v x '%s %s' bash /x/huge.sh; echo $x | bash`: `-v` takes NAME as its operand, so
+  the walk read `x` as the format (review of PR #2341 @d532aef7d4, t_01a1d6051a931de9).
+
+cron/lifecycle_guard_printf.py (added by #2341 with a whole-argument `_printf_output`) now
+models bash 5's printf builtin: flags, width and precision as digits or `*` (negative widths
+left-justify, negative precision is none), length modifiers, csbqQdiouxXeEfFgGaA and %(FMT)T
+conversions, strtoimax argument parsing ('c, 0x, 0NNN, prefixes), format-string escapes,
+`%b`/`echo -e` escapes with `\c`, format reuse, and an invalid conversion ending the output.
+Widths and numeric precision are capped at 4096. A parametrized test checks the model byte
+for byte against real bash. The format is found past `-v NAME`, `-vNAME` and `--`.
+
+Printed text is now also walked with escapes decoded printf-style and echo-style, so
+`printf 'ba\x73h %s'`, `echo -e 'ba\x73h …'` and `print('ba\x73h …')` are caught too.
+
+The wrong "imprecision can only add a line to scan" docstring and the "width and precision
+are dropped (only adds text)" test comment are gone.
+
+FILE_LINES: printed_argument_lines/with_escapes_decoded (and their two regexes) move into
+the printf module, so cron/lifecycle_guard.py ends at 1947 lines (main: 1974).
+
+Proof (bash 5.2.21):
+- Real bash runs the named script for every new shape (marker scripts print RAN-…).
+- The new tests/cron/test_lifecycle_guard_output_sink.py against main 82cbdd4b51: 10 sink
+  shapes fail (printf-star-width, printf-star-precision, printf-precision, printf-b-hex,
+  printf-b-octal, printf-b-stop, printf-v, echo-e-hex, echo-e-octal, print-hex);
+  this tree: 165 passed.
+- heredoc_shape_corpus.py report --full: cases=22212 refused=18904 violations=0.
+- Mutants: 33/33 of the printf model and its wiring (before the rebase onto #2341) and 4/4
+  of the `-v` format index killed.
+- scripts/check --base origin/main: ok.
+---
+ cron/lifecycle_guard.py                       |  35 +-
+ cron/lifecycle_guard_printf.py                | 363 ++++++++++++++++--
+ .../cron/test_lifecycle_guard_output_sink.py  | 124 +++++-
+ 3 files changed, 451 insertions(+), 71 deletions(-)
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index c9bdfbae85..dfc951854e 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -23,7 +23,11 @@ from cron.lifecycle_guard_aliases import _may_define_alias, _session_aliases_sha
+ from cron.lifecycle_guard_groups import CONTROL_CHARS as _CONTROL_CHARS
+ from cron.lifecycle_guard_groups import iter_line_segment_contexts, split_glued_redirections
+ from cron.lifecycle_guard_lines import _split_logical_lines  # newlines outside quotes
+-from cron.lifecycle_guard_printf import _printf_format_lines  # what `printf FORMAT …` prints
++
++# Lines a printer may print, walked as the sink's command (moved out for FILE_LINES).
++from cron.lifecycle_guard_printf import printed_argument_lines as _printed_argument_lines
++from cron.lifecycle_guard_printf import with_escapes_decoded as _with_escapes_decoded
++
+ # How `uv [global options] run [options] <command>` reads its argv.
+ from cron.lifecycle_guard_uv import _uv_run_command_indices
+ 
+@@ -1488,37 +1492,8 @@ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
+ # the next one of its kind, not just alternate pairs: an apostrophe inside the other kind
+ # (`print("it's")`) must not shift which spans count as literals (review 5890784121 nit 1).
+ _QUOTED_LITERAL_RES = (re.compile(r"(?='([^']+)')"), re.compile(r"(?=\"([^\"]+)\")"))
+-# C-style escapes a producer turns into whitespace (`printf 'bash /x/a.sh\n'`, `print('…\n')`):
+-# left in, `\n` would glue onto the path and hide the script it names.
+-_PRINTED_ESCAPE_RE = re.compile(r"\\[ntrvf]")
+ # Producers that print their own arguments, quoted or not (`echo bash /x/a.sh | bash`).
+ _ARGUMENT_PRINTERS = frozenset({"echo", "printf"})
+-# bash's builtin echo options (`echo -n`, `echo -ne`): they are not printed, so left in the line
+-# the walk would read `-n` as the executed command and the script path as its argument.
+-_ECHO_OPTION_RE = re.compile(r"-[neE]+")
+-
+-
+-def _printed_argument_lines(name: str, arguments: list[str]) -> Iterator[str]:
+-    """The line(s) an ``echo``/``printf`` with *arguments* may print: as written, without
+-    ``echo``'s leading option words, and (fail closed) without every leading ``-word``."""
+-    yield " ".join(arguments)
+-    if name == "echo":
+-        index = 0
+-        while index < len(arguments) and _ECHO_OPTION_RE.fullmatch(arguments[index]):
+-            index += 1
+-        yield " ".join(arguments[index:])
+-    index = 0
+-    while index < len(arguments) and arguments[index].startswith("-"):
+-        index += 1
+-    yield " ".join(arguments[index:])
+-    if name == "printf":  # the format is not printed as written (`printf '%s %s' bash X`)
+-        yield from _printf_format_lines(arguments[index:])
+-
+-
+-def _with_escapes_decoded(text: str) -> Iterator[str]:
+-    yield text
+-    if "\\" in text:
+-        yield _PRINTED_ESCAPE_RE.sub("\n", text)
+ 
+ 
+ def _iter_printed_shell_payloads(command: str) -> Iterator[str]:
+diff --git a/cron/lifecycle_guard_printf.py b/cron/lifecycle_guard_printf.py
+index 5db17a5dd8..12a21358d7 100644
+--- a/cron/lifecycle_guard_printf.py
++++ b/cron/lifecycle_guard_printf.py
+@@ -1,46 +1,343 @@
+-"""What ``printf FORMAT ARGUMENTS`` may print, for the lifecycle guard's printed-payload walk.
++"""What bash's ``printf`` builtin and ``echo -e`` print, for the lifecycle guard's output-sink walk.
+ 
+-The format is not printed as written (``printf '%s %s' bash /x/a.sh`` prints ``bash /x/a.sh``),
+-so walking the raw argument line reads ``%s`` as the executed command and hides the script that
+-bash runs. These are extra walk variants only: each can add text to scan, never remove any.
+-Not modelled (pre-existing, follow-up t_01a1d58e0438e52e): ``*`` width, ``.N`` precision and
+-``%b`` escapes.
+-"""
++Under an output sink (``printf FORMAT ARGS | bash``) the guard walks a producer's output as an
++executed command, so the walk needs the text bash really prints. Taking every conversion's
++argument whole is not enough, because three printf features change which words come out:
++
++- ``*`` as the width or precision takes an argument (``printf '%*s %s' 5 bash X`` prints
++  ``    bash X``; the whole-argument walk read ``5 bash`` and lost X).
++- A precision truncates ``%s``/``%b`` (``printf '%.4s %s' bashrc X`` prints ``bash X``).
++- ``%b`` decodes ``\\xHH``, ``\\0NNN`` and friends in its argument and stops all output at
++  ``\\c`` (``printf '%b %s' 'ba\\x73h' X`` prints ``bash X``); the format decodes its own escapes
++  too (``printf 'ba\\x73h %s' X``).
+ 
+-from __future__ import annotations
++The model follows bash 5's ``printf.def``: flags ``#'-+ 0``, a width and a precision (digits or
++``*``), the ignored length modifiers ``hjlLtz``, then one of ``csbqQdiouxXeEfFgGaA``, ``%(FMT)T``
++or ``%%``. An invalid conversion stops the output there, as in bash. Numeric conversions parse
++the argument the way ``strtoimax``/``strtold`` do (``'c`` is the character's code, ``12abc``
++is 12, a non-number is 0) and print through Python's ``%``, which is C's for these. ``%a`` and
++the ``#o`` corner cases are approximate: digits cannot form a command name, so they matter only
++inside a path. Callers also walk the arguments without the format, so the model is one
++variant among several and never the only text scanned.
++"""
+ 
+ import re
+-from typing import Iterator
++import time
++from typing import Callable, Iterator, Optional, cast
++
++PRINTF_MAX_ROUNDS = 64
++_MAX_FIELD = 4096  # width and numeric precision cap: `printf '%999999999s'` cannot eat memory
++
++_OCTAL_DIGITS = "01234567"
++_HEX_DIGITS = "0123456789abcdefABCDEF"
++_SIMPLE_ESCAPES = {
++    "a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r", "t": "\t",
++    "v": "\v", "\\": "\\",
++}
++# Decoded in a printf format but kept as written by `%b` and `echo -e`.
++_FORMAT_ONLY_ESCAPES = {"'": "'", '"': '"', "?": "?"}
++# flags, width, precision, length modifiers, then the conversion (or `(FMT)T`).
++_SPEC_RE = re.compile(r"([#'\-+ 0]*)(\*|[0-9]*)(?:\.(\*|[0-9]*))?[hjlLtz]*(?:\(([^)]*)\)(T)|(.))?",
++                      re.DOTALL)
++_STRING_CONVERSIONS = frozenset("csbqQT")
++_INTEGER_CONVERSIONS = frozenset("diouxX")
++_FLOAT_CONVERSIONS = frozenset("eEfFgGaA")
++_CONVERSIONS = _STRING_CONVERSIONS | _INTEGER_CONVERSIONS | _FLOAT_CONVERSIONS
++_INTEGER_PREFIX_RE = re.compile(r"\s*([-+]?)(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)?")
++_FLOAT_PREFIX_RE = re.compile(
++    r"\s*[-+]?(?:inf(?:inity)?|nan|0[xX](?:[0-9a-fA-F]+\.?[0-9a-fA-F]*|\.[0-9a-fA-F]+)"
++    r"(?:[pP][-+]?[0-9]+)?|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]+)?)",
++    re.IGNORECASE,
++)
++_INT64 = 1 << 63
++_UINT64 = 1 << 64
++_SAFE_CHAR_RE = re.compile(r"[A-Za-z0-9_@%+=:,./-]")
++
++
++def _decode_escape(text: str, index: int, *, echo_style: bool) -> tuple[str, int, bool]:
++    """Decode the backslash escape at ``text[index]``: ``(output, next index, stop)``.
++
++    ``echo_style`` selects ``%b``/``echo -e`` rules (``\\0NNN`` octal, ``\\c`` stops all
++    output, ``\\'`` kept) over the format's (``\\NNN`` octal, ``\\c`` kept as written)."""
++    if index + 1 >= len(text):
++        return "\\", index + 1, False
++    char = text[index + 1]
++    if char in _SIMPLE_ESCAPES:
++        return _SIMPLE_ESCAPES[char], index + 2, False
++    if char in _FORMAT_ONLY_ESCAPES and not echo_style:
++        return _FORMAT_ONLY_ESCAPES[char], index + 2, False
++    if char == "c" and echo_style:
++        return "", index + 2, True
++    if char in _OCTAL_DIGITS:
++        start = index + 2 if echo_style and char == "0" else index + 1
++        end = start
++        while end < len(text) and end < start + 3 and text[end] in _OCTAL_DIGITS:
++            end += 1
++        return chr(int(text[start:end] or "0", 8) & 0xFF), end, False
++    digits = {"x": 2, "u": 4, "U": 8}.get(char)
++    if digits:
++        start = end = index + 2
++        while end < len(text) and end < start + digits and text[end] in _HEX_DIGITS:
++            end += 1
++        value = int(text[start:end], 16) if end > start else None
++        if value is not None and (char == "x" or value < 0x110000):
++            return chr(value), end, False
++    return "\\" + char, index + 2, False
++
++
++def decode_c_escapes(text: str, *, echo_style: bool) -> str:
++    """*text* with its backslash escapes decoded as a printf format (``echo_style`` False) or as
++    a ``%b`` argument / ``echo -e`` word (True, which also drops everything from ``\\c`` on)."""
++    return _decode(text, echo_style=echo_style)[0]
++
++
++def _decode(text: str, *, echo_style: bool) -> tuple[str, bool]:
++    out: list[str] = []
++    index = 0
++    while index < len(text):
++        backslash = text.find("\\", index)
++        if backslash < 0:
++            out.append(text[index:])
++            break
++        out.append(text[index:backslash])
++        decoded, index, stop = _decode_escape(text, backslash, echo_style=echo_style)
++        out.append(decoded)
++        if stop:
++            return "".join(out), True
++    return "".join(out), False
++
++
++def _integer(text: str) -> int:
++    """``strtoimax`` of *text* as bash's printf reads a number: ``'c`` is the code of c, the
++    longest numeric prefix counts (``12abc`` is 12, ``08`` is 0) and anything else is 0."""
++    if text[:1] in ("'", '"'):
++        return ord(text[1]) if len(text) > 1 else 0
++    match = _INTEGER_PREFIX_RE.match(text)
++    if not match or not match[2]:
++        return 0
++    digits = match[2]
++    if digits[:2] in ("0x", "0X"):
++        value = int(digits, 0)
++    elif digits.startswith("0"):
++        value = int(digits, 8)
++    else:
++        value = int(digits)
++    return -value if match[1] == "-" else value
++
++
++def _float(text: str) -> float:
++    if text[:1] in ("'", '"'):
++        return float(ord(text[1])) if len(text) > 1 else 0.0
++    match = _FLOAT_PREFIX_RE.match(text)
++    if not match:
++        return 0.0
++    word = match[0].strip()
++    try:
++        if "x" in word.lower() and "n" not in word.lower():
++            return float.fromhex(word)
++        return float(word)
++    except (ValueError, OverflowError):
++        return 0.0
++
++
++def _pad(text: str, flags: str, width: int) -> str:
++    return text.ljust(width) if "-" in flags else text.rjust(width)
+ 
+-# One printf conversion (flags, width, precision, conversion letter) or a literal `%%`.
+-_PRINTF_CONVERSION_RE = re.compile(r"%(%|[-+ #0]*[0-9*]*(?:\.[0-9*]*)?[a-zA-Z])")
+-_PRINTF_MAX_ROUNDS = 64
+ 
++def _format_number(conversion: str, flags: str, width: int, precision: Optional[int],
++                   argument: str) -> str:
++    python_flags = flags.replace("'", "")
++    if precision is not None:
++        precision = min(precision, _MAX_FIELD)  # past the cap only more leading zeros or digits
++    if conversion in _INTEGER_CONVERSIONS:
++        value = _integer(argument)
++        if conversion in "di":
++            value = max(-_INT64, min(_INT64 - 1, value))
++        else:
++            value = min(value, _UINT64 - 1) % _UINT64
++            python_flags = python_flags.replace("+", "").replace(" ", "")  # C: signed only
++        if precision == 0 and value == 0:
++            return _pad("", flags, width)
++        if conversion == "o" and "#" in python_flags:
++            python_flags = python_flags.replace("#", "")
++            precision = max(precision or 0, len(f"{value:o}") + (value != 0))
++        conversion = "d" if conversion in "iu" else conversion
++    else:
++        value = _float(argument)
++        if conversion in "aA":
++            text = value.hex() if conversion == "a" else value.hex().upper()
++            return _pad(text, flags, width)
++    spec = "%" + python_flags + (str(width) if width else "") + (
++        "" if precision is None else f".{precision}")
++    return (spec + conversion) % value
+ 
+-def _printf_output(format_text: str, arguments: list[str]) -> str:
+-    """Roughly what ``printf FORMAT ARGUMENTS`` prints: each conversion takes the next argument
+-    as text, and the format repeats while arguments remain (as bash's printf does). Only a walk
+-    variant, so imprecision (``%d`` of a word) can only add a line to scan."""
+-    remaining = list(arguments)
+-    rounds: list[str] = []
+ 
+-    def convert(match: re.Match[str]) -> str:
+-        if match[1] == "%":
+-            return "%"
+-        return remaining.pop(0) if remaining else ""
++def _quoted(text: str) -> str:
++    """``%q``: bash backslash-quotes each special character, so the shell reading it gets *text*
++    back."""
++    return "".join(c if _SAFE_CHAR_RE.match(c) else "\\" + c for c in text) or "''"
+ 
+-    while len(rounds) < _PRINTF_MAX_ROUNDS:
+-        before = len(remaining)
+-        rounds.append(_PRINTF_CONVERSION_RE.sub(convert, format_text))
+-        if not remaining or len(remaining) == before:
++
++def _decoded(text: str, precision: Optional[int], _time_format: str
++             ) -> tuple[str, Optional[int], bool]:
++    """``%b``: the argument's escapes decoded as ``echo -e`` does; ``\\c`` ends all output."""
++    text, stop = _decode(text, echo_style=True)
++    return text, precision, stop
++
++
++def _strftime(text: str, time_format: str) -> str:
++    seconds = _integer(text) if text else -1
++    try:
++        return time.strftime(time_format, time.localtime(None if seconds < 0 else seconds))
++    except (ValueError, OverflowError, OSError):
++        return ""
++
++
++# Each string conversion: (argument, precision, %(FMT)T format) -> (text, precision, stop).
++# The returned precision then truncates the text (None: no truncation).
++_STRING_HANDLERS: dict[str, Callable[[str, Optional[int], str],
++                                     tuple[str, Optional[int], bool]]] = {
++    "s": lambda text, precision, _fmt: (text, precision, False),
++    "c": lambda text, _precision, _fmt: (text[:1], None, False),
++    "b": _decoded,
++    "q": lambda text, precision, _fmt: (_quoted(text), precision, False),
++    # `%Q` truncates the argument before quoting, so the quoting survives.
++    "Q": lambda text, precision, _fmt: (
++        _quoted(text if precision is None else text[:precision]), None, False),
++    "T": lambda text, precision, fmt: (_strftime(text, fmt), precision, False),
++}
++
++
++def _format_string(conversion: str, flags: str, width: int, precision: Optional[int],
++                   argument: Optional[str], time_format: str) -> tuple[str, bool]:
++    text, precision, stop = _STRING_HANDLERS[conversion](argument or "", precision, time_format)
++    if precision is not None:
++        text = text[:precision]
++    return _pad(text, flags, width), stop
++
++
++def printf_output(format_text: str, arguments: list[str]) -> str:
++    """What ``printf FORMAT ARGUMENTS`` prints in bash: conversions per the module docstring, the
++    format's escapes decoded, and the format repeated while arguments remain and the last round
++    consumed one (at most ``PRINTF_MAX_ROUNDS`` rounds). Missing arguments print as empty or 0."""
++    out: list[str] = []
++    position = 0
++
++    def take() -> Optional[str]:
++        nonlocal position
++        if position >= len(arguments):
++            return None
++        position += 1
++        return arguments[position - 1]
++
++    def star(value: str) -> Optional[int]:
++        """A width or precision: digits, or `*` taking the next argument as a number."""
++        return _integer(take() or "") if value == "*" else (int(value) if value else None)
++
++    for _round in range(PRINTF_MAX_ROUNDS):
++        start = position
++        index = 0
++        while index < len(format_text):
++            char = format_text[index]
++            if char == "\\":
++                decoded, index, _stop = _decode_escape(format_text, index, echo_style=False)
++                out.append(decoded)
++                continue
++            if char != "%":
++                out.append(char)
++                index += 1
++                continue
++            if format_text[index + 1 : index + 2] == "%":
++                out.append("%")
++                index += 2
++                continue
++            # Every group is optional, so the spec always matches (possibly empty).
++            match = cast(re.Match[str], _SPEC_RE.match(format_text, index + 1))
++            flags, width_text, precision_text, time_format, time_conversion, conversion = (
++                match.groups())
++            conversion = time_conversion or conversion
++            if conversion not in _CONVERSIONS:
++                return "".join(out)  # bash: invalid or missing format character ends the output
++            width = star(width_text) or 0
++            if width < 0:
++                flags, width = flags + "-", -width
++            width = min(width, _MAX_FIELD)  # past the cap a width only adds more blanks
++            precision = None if precision_text is None else (star(precision_text) or 0)
++            if precision is not None and precision < 0:
++                precision = None
++            argument = take()
++            if conversion in _STRING_CONVERSIONS:
++                text, stop = _format_string(conversion, flags, width, precision, argument,
++                                            time_format or "")
++                out.append(text)
++                if stop:
++                    return "".join(out)  # `%b`'s `\c`: no further output at all
++            else:
++                out.append(_format_number(conversion, flags, width, precision, argument or ""))
++            index = match.end()
++        if position >= len(arguments) or position == start:
+             break
+-    return "".join(rounds)
++    return "".join(out)
++
+ 
++# C-style escapes a producer turns into whitespace (`printf 'bash /x/a.sh\n'`, `print('…\n')`):
++# left in, `\n` would glue onto the path and hide the script it names.
++_PRINTED_ESCAPE_RE = re.compile(r"\\[ntrvf]")
++# bash's builtin echo options (`echo -n`, `echo -ne`): they are not printed, so left in the line
++# the walk would read `-n` as the executed command and the script path as its argument.
++_ECHO_OPTION_RE = re.compile(r"-[neE]+")
+ 
+-def _printf_format_lines(arguments: list[str]) -> Iterator[str]:
+-    """For printf *arguments* starting at the format: the arguments without the format (covers a
+-    format the walk cannot read, e.g. ``"$f"``), and the format applied to them."""
+-    if not arguments:
++
++def printed_argument_lines(name: str, arguments: list[str]) -> Iterator[str]:
++    """The line(s) an ``echo``/``printf`` with *arguments* may print: as written, without
++    ``echo``'s leading option words, and (fail closed) without every leading ``-word``."""
++    yield " ".join(arguments)
++    if name == "echo":
++        index = 0
++        while index < len(arguments) and _ECHO_OPTION_RE.fullmatch(arguments[index]):
++            index += 1
++        yield " ".join(arguments[index:])
++    index = 0
++    while index < len(arguments) and arguments[index].startswith("-"):
++        index += 1
++    yield " ".join(arguments[index:])
++    if name != "printf":
+         return
+-    yield " ".join(arguments[1:])
+-    yield _printf_output(arguments[0], arguments[1:])
++    # The format is not printed as written (`printf '%s %s' bash /x/a.sh` prints
++    # `bash /x/a.sh`): also yield the arguments without it, and what bash prints for them
++    # (`*` widths take an argument, precision truncates, `%b` decodes; see printf_output).
++    # The format follows the options, where `-v NAME` takes an operand (`printf -v x FMT …`
++    # stores the output in `$x`, which a later `echo $x | bash` runs).
++    start = _printf_format_index(arguments)
++    if start < len(arguments):
++        yield " ".join(arguments[start + 1 :])
++        yield printf_output(arguments[start], arguments[start + 1 :])
++
++
++def _printf_format_index(arguments: list[str]) -> int:
++    """Index of the format in bash ``printf`` *arguments*: past ``-v NAME`` (or ``-vNAME``) and a
++    ``--`` that ends the options."""
++    index = 0
++    while index < len(arguments):
++        argument = arguments[index]
++        if argument == "--":
++            return index + 1
++        if argument == "-v":
++            index += 2
++        elif argument.startswith("-v"):
++            index += 1
++        else:
++            break
++    return index
++
++
++def with_escapes_decoded(text: str) -> Iterator[str]:
++    """*text*, and with its backslash escapes decoded the ways a producer may print them: C-style
++    whitespace escapes as newlines (fail closed), as a printf format (`ba\\x73h`, `\\101`) and as
++    `echo -e`/`%b` (`\\0163`, output ends at `\\c`). Python's `print('ba\\x73h …')` matches the
++    printf decoding."""
++    yield text
++    if "\\" in text:
++        yield _PRINTED_ESCAPE_RE.sub("\n", text)
++        yield decode_c_escapes(text, echo_style=False)
++        yield decode_c_escapes(text, echo_style=True)
+diff --git a/tests/cron/test_lifecycle_guard_output_sink.py b/tests/cron/test_lifecycle_guard_output_sink.py
+index e101206c2a..b7294b48c6 100644
+--- a/tests/cron/test_lifecycle_guard_output_sink.py
++++ b/tests/cron/test_lifecycle_guard_output_sink.py
+@@ -6,6 +6,8 @@ an interpreter string literal. The shape corpus (``heredoc_shape_corpus``, ``s_p
+ "sink"``) crosses every sink with every wrapper and nesting form under real bash.
+ """
+ 
++import shutil
++import subprocess
+ import time
+ 
+ import pytest
+@@ -65,6 +67,22 @@ _SINK_SHAPES = {
+     "printf-format-function-keyword": "function f { printf '%s %s' bash {big}; }; f | bash\n",
+     "printf-variable-format": "printf \"$f\" bash {big} | bash\n",
+     "printf-format-repeats": "printf '%s%s ' ba sh {big} | bash\n",
++    # Review 5893864308 (PR #2341): a `*` width or precision takes an argument, a precision
++    # truncates and `%b` decodes its argument, so the whole-argument walk read the wrong words.
++    "printf-star-width": "printf '%*s %s' 5 bash {big} | bash\n",
++    "printf-star-precision": "printf '%.*s %s' 4 bashrc {big} | bash\n",
++    "printf-precision": "printf '%.4s %s' bashrc {big} | bash\n",
++    "printf-b-hex": "printf '%b %s' 'ba\\x73h' {big} | bash\n",
++    "printf-b-octal": "printf '%b %s' 'ba\\0163h' {big} | bash\n",
++    "printf-b-stop": "printf '%b%s' 'bash {big}\\c' .bak | bash\n",  # `\c` ends all output
++    "printf-format-hex": "printf 'ba\\x73h %s' {big} | bash\n",
++    "echo-e-hex": "echo -e 'ba\\x73h {big}' | bash\n",
++    "echo-e-octal": "echo -e 'ba\\0163h {big}' | bash\n",  # echo's `\0NNN`, not the format's
++    "print-hex": "python3 - <<'PY' | bash\nprint('ba\\x73h {big}')\nPY\n",
++    # Review of PR #2341 @d532aef7d4: `-v NAME` takes an operand, so the format is the next word.
++    "printf-v": "printf -v x '%s %s' bash {big}; echo $x | bash\n",
++    "printf-v-dashdash": "printf -v x -- '%s %s' bash {big}; echo $x | bash\n",
++    "printf-v-glued": "printf -vx -- '%s %s' bash {big}; echo $x | bash\n",
+     # Kept from the old opener peel (fails closed): a leading `in` is not read as the command.
+     "echo-after-in": "for w\nin echo bash {big}; do :; done | bash\n",
+     # Nit 3 (intended, fails closed): any later pipe word counts as the shell, a grep pattern too.
+@@ -118,6 +136,8 @@ _NO_SINK_SHAPES = {
+     "echo-or-list": "echo bash {big} || bash -c true\n",
+     "echo-function-keyword-no-sink": "function f { echo bash {big}; }; f\n",
+     "printf-format-no-sink": "printf '%s %s' bash {big}\n",
++    "printf-star-width-no-sink": "printf '%*s %s' 5 bash {big}\n",
++    "printf-b-hex-no-sink": "printf '%b %s' 'ba\\x73h' {big}\n",
+ }
+ 
+ 
+@@ -197,22 +217,110 @@ def test_shape_corpus_catches_a_guard_that_keeps_masking_sink_bodies(tmp_path, m
+ @pytest.mark.parametrize(("format_text", "arguments", "printed"), [
+     ("%s %s", ["bash", "/x/a.sh"], "bash /x/a.sh"),
+     ("%s ", ["bash", "/x/a.sh"], "bash /x/a.sh "),  # the format repeats over the arguments
+-    # Flags, width and precision are dropped: the whole argument stands in (only adds text).
+-    ("%-8s|%5.2s|%%", ["ab", "cdef"], "ab|cdef|%"),
++    # Width pads; precision truncates a string (it does not only add text).
++    ("%-4s|%5.2s|%%", ["ab", "cdef"], "ab  |   cd|%"),
++    ("%*s %s", ["5", "bash", "/x/a.sh"], " bash /x/a.sh"),  # `*` takes the width argument
++    ("%.*s %s", ["4", "bashrc", "/x/a.sh"], "bash /x/a.sh"),
++    ("%*.*s|", ["-6", "2", "abc"], "ab    |"),  # a negative `*` width left-justifies
++    ("%*s|", ["x", "ab"], "ab|"),  # a non-number width is 0
++    ("%b %s", ["ba\\x73h", "/x/a.sh"], "bash /x/a.sh"),  # `%b` decodes its argument
++    ("%b|%b|%b", ["\\0101", "\\101", "a\\'b"], "A|A|a\\'b"),
++    ("%b%s", ["bash /x/a.sh\\c", ".bak"], "bash /x/a.sh"),  # `\c` ends all output
++    ("%.2b|", ["a\\x41bc"], "aA|"),  # precision after decoding
++    ("ba\\x73h %s\\c\\0101", ["/x/a.sh"], "bash /x/a.sh\\c\b1"),  # the format's own escapes
++    ("%c|%q|%d|%x|%.3d|%5.1f", ["xyz", "a b", "12abc", "255", "7", "3.14159"],
++     "x|a\\ b|12|ff|007|  3.1"),
++    ("%d|%d|%u|%#o|%.0d|", ["'a", "0x1f", "-1", "8", "0"], "97|31|18446744073709551615|010||"),
++    ("%s|%y|%s", ["a", "b", "c"], "a|"),  # an invalid conversion ends the output (bash)
+     ("x", ["bash", "/x/a.sh"], "x"),  # no conversion consumes nothing and stops at once
+     ("%s", [], ""),
++    ("%d|%s|", [], "0||"),  # missing arguments print as 0 or empty
+ ])
+ def test_printf_output_applies_the_format(format_text, arguments, printed):
+-    from cron.lifecycle_guard_printf import _printf_output
+-
+-    assert _printf_output(format_text, arguments) == printed
++    from cron.lifecycle_guard_printf import printf_output
++
++    assert printf_output(format_text, arguments) == printed
++
++
++# Formats whose output the model must reproduce byte for byte; compared against real bash.
++_BASH_PRINTF_CASES = [
++    ("%*s %s", ["5", "bash", "/x/a.sh"]),
++    ("%.4s %s", ["bashrc", "/x/a.sh"]),
++    ("%.*s %s", ["4", "bashrc", "/x/a.sh"]),
++    ("%*.*s|%-*s|%*s|", ["-6", "2", "abcdef", "4", "a", "x", "b"]),
++    ("%b %s", ["ba\\x73h", "/x/a.sh"]),
++    ("%b|%b|%b|%b|%b", ["\\0163", "\\163", "x\\1234", "a\\'b\\q", "\\x4g"]),
++    ("%b%s", ["bash /x/a.sh\\c", ".bak"]),
++    ("%5b|%.2b|", ["a\\cb", "ab"]),
++    ("ba\\x73h \\101\\0101\\c\\'\\\"\\?\\q|%s", ["/x/a.sh"]),
++    ("%s%s ", ["ba", "sh", "/x/a.sh"]),
++    ("%c|%5c|%-3c|%.3c|", ["xyz", "a", "b", "cd"]),
++    ("%q|%q|%q|%q|", ["bash", "/x/a.sh", "it's", "a b"]),
++    ("%d|%i|%d|%d|%d|%d|%d|", ["12abc", "'a", "0x1f", "017", "08", "  -5", "+5"]),
++    ("%u|%x|%X|%o|%#x|%#o|%#o|", ["-1", "255", "255", "8", "255", "8", "0"]),
++    ("%+d|% d|%05d|%-5d|%5.3d|%.0d|%+u|", ["3", "3", "3", "3", "-7", "0", "3"]),
++    ("%e|%G|%F|%5.1f|%g|%f|", ["1234.5", "0.0001", "2", "3.14159", "1e10", "abc"]),
++    ("%s|%y|%s", ["a", "b", "c"]),
++    ("%s %", ["a"]),
++    ("%d|%s|%b|", []),
++    ("a%zb%s%ls%hd|", ["z", "y", "4"]),
++    ("%.s|%.0s|%5%|", ["abc", "def"]),
++    ("%.1Q|%Q|%.2Q|%.2q|%(%Y-%m)T|", ["a b", "it's", "a b", "a b", "1296000"]),  # Jan 1970
++    ("%.*s|%d|%i|", ["-1", "abcdef", "99999999999999999999", "-99999999999999999999"]),
++    ("%f|%.1f|%g|%e|", ["'a", "0x10", "inf", "1.5x"]),
++]
++
++
++@pytest.mark.parametrize(("format_text", "arguments"), _BASH_PRINTF_CASES)
++def test_printf_output_matches_real_bash(format_text, arguments):
++    from cron.lifecycle_guard_printf import printf_output
++
++    bash = shutil.which("bash") or ""
++    if not bash:
++        pytest.skip("no bash")
++    version = subprocess.run([bash, "-c", "echo ${BASH_VERSINFO[0]}"], capture_output=True,
++                             text=True, check=True).stdout.strip()
++    if int(version) < 5:
++        pytest.skip(f"bash {version}: the model follows bash 5's printf")
++    real = subprocess.run([bash, "-c", 'printf "$@"', "printf", format_text, *arguments],
++                          capture_output=True, check=False, env={"LC_ALL": "C"}).stdout
++    assert printf_output(format_text, arguments).encode("latin-1") == real
+ 
+ 
+ def test_printf_output_stops_after_the_round_cap():
+-    from cron.lifecycle_guard_printf import _PRINTF_MAX_ROUNDS, _printf_output
++    from cron.lifecycle_guard_printf import PRINTF_MAX_ROUNDS, printf_output
++
++    printed = printf_output("%s,", [str(n) for n in range(PRINTF_MAX_ROUNDS + 10)])
++    assert printed == "".join(f"{n}," for n in range(PRINTF_MAX_ROUNDS))
++
++
++def test_printf_output_caps_huge_widths():
++    from cron.lifecycle_guard_printf import printf_output
++
++    printed = printf_output("%999999999s|%*d|%.999999999d", ["x", "999999999", "1", "2"])
++    assert len(printed) < 15_000  # three fields of at most 4096 characters each
++
++
++def test_printed_text_is_walked_with_each_escape_decoding():
++    from cron.lifecycle_guard_printf import with_escapes_decoded
++
++    assert list(with_escapes_decoded("ba\\x73h \\0163\\t")) == [
++        "ba\\x73h \\0163\\t", "ba\\x73h \\0163\n", "bash \x0e3\t", "bash s\t"]
++    assert list(with_escapes_decoded("bash x")) == ["bash x"]
++
++
++@pytest.mark.parametrize(("text", "echo_style", "decoded"), [
++    ("ba\\x73h \\0101\\101\\c|", False, "bash \b1A\\c|"),
++    ("ba\\x73h \\0101\\101\\c|", True, "bash AA"),
++    ("\\'\\u0041\\U00000042\\x\\", False, "'AB\\x\\"),
++    ("\\'\\e\\t", True, "\\'\x1b\t"),
++    # Past U+10FFFF Python has no character (bash prints invalid UTF-8): kept as written.
++    ("\\U00110000|\\U0010FFFF", False, "\\U00110000|\U0010ffff"),
++])
++def test_decode_c_escapes(text, echo_style, decoded):
++    from cron.lifecycle_guard_printf import decode_c_escapes
+ 
+-    printed = _printf_output("%s,", [str(n) for n in range(_PRINTF_MAX_ROUNDS + 10)])
+-    assert printed == "".join(f"{n}," for n in range(_PRINTF_MAX_ROUNDS))
++    assert decode_c_escapes(text, echo_style=echo_style) == decoded
+ 
+ 
+ @pytest.mark.parametrize("printer", ["printf --", "printf", "echo -n"])
+-- 
+2.43.0
+

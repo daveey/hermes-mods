@@ -1,0 +1,150 @@
+From a4db3f50197c6fdfdcf72bb8e99ceb9556c19a41 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:02:58 +0000
+Subject: [PATCH] [daveey] Pin host-loop retirement race guards and skew
+ confirmations
+
+Hold the retirement sweep between publication and release with Events, proving exclusive(), handoff and post-lock-win guards before cleanup can mask them. Inspect the first skew observation before recovery. No production changes.
+
+Proof: scripts/run_tests.sh in disposable worker-3 clone: 17 passed on current main. Original spec-2625.json via sdlc-review mutants.py: all 18 mutants killed on e495cf8975 with the four new tests (16 baseline passes); current main kills all 17 applicable mutants, A15 anchor removed by the later replay-policy fix. A2, A4, A5, A4+A5 and A10 fail the named new assertions. scripts/check: all checks pass.
+---
+ .../hermes_cli/test_superseded_host_loops.py  | 115 ++++++++++++++++++
+ 1 file changed, 115 insertions(+)
+
+diff --git a/tests/hermes_cli/test_superseded_host_loops.py b/tests/hermes_cli/test_superseded_host_loops.py
+index acdf13f223..4380f14ba0 100644
+--- a/tests/hermes_cli/test_superseded_host_loops.py
++++ b/tests/hermes_cli/test_superseded_host_loops.py
+@@ -11,7 +11,9 @@ build failure in it never defers a delivery to a wall reset.
+ from __future__ import annotations
+ 
+ import os
++import threading
+ import time
++from contextlib import contextmanager
+ 
+ import pytest
+ 
+@@ -96,6 +98,119 @@ def test_every_reason_must_clear_before_the_process_competes_again(tmp_path):
+     assert hll.resume_host_loops("b") is True and lease.held() is True
+ 
+ 
++@contextmanager
++def _retiring_before_release(lease, monkeypatch):
++    """Pause the real retirement sweep after publication, before it releases this lease.
++
++    The registry does not make the race guards redundant: _RETIRED is published before
++    release() can acquire each lease's mutex. Events hold precisely that scheduling gap.
++    """
++    reached, finish = threading.Event(), threading.Event()
++    release = lease.release
++
++    def delayed_release():
++        reached.set()
++        finish.wait()
++        release()
++
++    monkeypatch.setattr(lease, "release", delayed_release)
++    thread = threading.Thread(target=hll.retire_host_loops, args=("race", "retiring"))
++    thread.start()
++    try:
++        assert reached.wait(10), "retirement did not reach the lease release"
++        assert hll.host_loops_retired() == "retiring"
++        yield
++    finally:
++        finish.set()
++        thread.join(10)
++        assert not thread.is_alive()
++
++
++def test_exclusive_false_while_retired_even_if_held(tmp_path, monkeypatch):
++    lease = _held_lease(tmp_path)
++    try:
++        with _retiring_before_release(lease, monkeypatch):
++            assert lease._held and not _lock_is_free(lease)
++            assert lease.exclusive() is False
++    finally:
++        hll.HostLoopLease.release(lease)
++
++
++def test_retire_during_handoff_wait_returns_the_lock(tmp_path, monkeypatch):
++    lease = hll.HostLoopLease("handoff", "gateway", interval=30, home=tmp_path)
++    fd = lease._open()
++    assert fd is not None
++    blocker = os.open(lease.path, os.O_RDWR)
++    fcntl.flock(blocker, fcntl.LOCK_EX)
++    waiting = threading.Event()
++    flock = fcntl.flock
++
++    def observed_flock(lock_fd, operation):
++        if lock_fd == fd and operation == fcntl.LOCK_EX:
++            waiting.set()
++        return flock(lock_fd, operation)
++
++    monkeypatch.setattr(fcntl, "flock", observed_flock)
++    lease._waiting = True
++    assert lease._publish_want()
++    thread = threading.Thread(target=lease._wait_for_lock, args=(fd,))
++    thread.start()
++    try:
++        assert waiting.wait(10)
++        with _retiring_before_release(lease, monkeypatch):
++            flock(blocker, fcntl.LOCK_UN)
++            thread.join(10)
++            assert not thread.is_alive()
++            # Check before the sweep releases the object; otherwise release masks A4.
++            assert lease._fd == fd and not lease._waiting
++            assert not lease._held and _lock_is_free(lease)
++            assert not lease.want_path.exists()
++    finally:
++        flock(blocker, fcntl.LOCK_UN)
++        os.close(blocker)
++        thread.join(10)
++        hll.HostLoopLease.release(lease)
++        assert not thread.is_alive()
++
++
++def test_retire_between_lock_win_and_recheck_releases(tmp_path, monkeypatch):
++    lease = hll.HostLoopLease("lock-win", "serve", interval=30, home=tmp_path)
++    retirement = _retiring_before_release(lease, monkeypatch)
++    entered = []
++
++    def retire_after_lock_win():
++        assert not _lock_is_free(lease)
++        retirement.__enter__()
++        entered.append(True)
++        # Implicit None: no higher-priority want can mask the retirement arm.
++
++    monkeypatch.setattr(lease, "_live_want", retire_after_lock_win)
++    try:
++        assert lease.held() is False
++        assert entered and not lease._held
++        assert _lock_is_free(lease)
++    finally:
++        if entered:
++            retirement.__exit__(None, None, None)
++        hll.HostLoopLease.release(lease)
++
++
++def test_one_skew_read_below_confirmations_does_not_retire(tmp_path):
++    lease = _held_lease(tmp_path)
++    stale = skew.StaleCodeLoops(lambda: ("boot", "disk"))
++    try:
++        assert skew._CONFIRMATIONS == 2
++        stale.observe()
++        # Observe the transient state, not just recovery after a later non-skew read.
++        assert not stale.retired and hll.host_loops_retired() is None
++        assert lease.exclusive() and not _lock_is_free(lease)
++        stale.observe()
++        assert stale.retired and hll.host_loops_retired()
++        assert not lease.exclusive() and _lock_is_free(lease)
++    finally:
++        lease.release()
++
++
+ # ── the watchdogs ─────────────────────────────────────────────────────────────────────────────────────
+ 
+ 
+-- 
+2.43.0
+

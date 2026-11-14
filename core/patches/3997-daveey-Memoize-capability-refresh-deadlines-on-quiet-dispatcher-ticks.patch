@@ -1,0 +1,180 @@
+From 908ed861ce7ec11df931680ac7962c36ef350866 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:15:48 +0000
+Subject: [PATCH] [daveey] Memoize capability refresh deadlines on quiet
+ dispatcher ticks
+
+G2b partial implementation: retain the registry-derived due clock behind config and file signatures, preserving external replacement, clock rollback, failed refresh retries and single-flight. RED: three redundant-read assertions fail on base. GREEN: 47 passed, one skipped across capability refresh and routing files. Remaining G2b supervisor/wake-check gates, drain replay, mutation coverage, independent review, CI and live P1 acceptance are not yet implemented or claimed.
+---
+ hermes_cli/kanban_capability_registry.py      | 42 ++++++--
+ .../test_kanban_capability_refresh_gate.py    | 95 +++++++++++++++++++
+ 2 files changed, 129 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_capability_refresh_gate.py
+
+diff --git a/hermes_cli/kanban_capability_registry.py b/hermes_cli/kanban_capability_registry.py
+index 24e516b367..6c29718295 100644
+--- a/hermes_cli/kanban_capability_registry.py
++++ b/hermes_cli/kanban_capability_registry.py
+@@ -309,24 +309,50 @@ def read_local() -> Optional[dict]:
+         return None
+ 
+ 
++# (config/file signature, observation time, next refresh due). Only a not-due
++# record is retained; a failed refresh leaves no success memo and retries next tick.
++_refresh_gate: Optional[tuple] = None
++
++
++def _refresh_key() -> tuple:
++    from hermes_cli.kanban_sweep_gate import config_key
++
++    path = registry_path()
++    try:
++        st = path.stat()
++        stamp = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
++    except FileNotFoundError:
++        stamp = None
++    return (str(path), config_key(), stamp)
++
++
+ def maybe_refresh_async(*, now: Optional[float] = None) -> bool:
+     """Start a background refresh when the file is older than ``refresh_seconds``. Never waits,
+     never raises: the dispatcher tick calls this."""
+-    global _thread
++    global _thread, _refresh_gate
+     try:
+         if os.environ.get("HERMES_TEST_ISOLATION"):
+             return False  # never run real probes (gh, sudo, ssh) from the test suite
+-        cfg = _config()
+-        if cfg.get("enabled") is False:
+-            return False
+         now = time.time() if now is None else now
+-        local = read_local()
+-        if local and now - float(local.get("refreshed_at") or 0) < _seconds(cfg, "refresh_seconds",
+-                                                                              DEFAULT_REFRESH_SECONDS):
+-            return False
+         with _lock:
+             if _thread is not None and _thread.is_alive():
+                 return False
++            key = _refresh_key()  # before reading: a racing replacement invalidates the next tick
++            held = _refresh_gate
++            if held is not None and held[0] == key and held[1] <= now < held[2]:
++                return False
++            _refresh_gate = None
++            cfg = _config()
++            if cfg.get("enabled") is False:
++                _refresh_gate = (key, now, float("inf"))
++                return False
++            local = read_local()
++            if local:
++                due = float(local.get("refreshed_at") or 0) + _seconds(
++                    cfg, "refresh_seconds", DEFAULT_REFRESH_SECONDS)
++                if now < due:
++                    _refresh_gate = (key, now, due)
++                    return False
+             _thread = threading.Thread(target=_safe_refresh, args=(cfg,), name="kanban-capabilities",
+                                        daemon=True)
+             _thread.start()
+diff --git a/tests/hermes_cli/test_kanban_capability_refresh_gate.py b/tests/hermes_cli/test_kanban_capability_refresh_gate.py
+new file mode 100644
+index 0000000000..14bc53b7fd
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_capability_refresh_gate.py
+@@ -0,0 +1,95 @@
++"""Quiet dispatcher ticks must not decode capability config/state repeatedly."""
++from __future__ import annotations
++
++import json
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import kanban_capability_registry as reg
++from hermes_cli import kanban_sweep_gate as gate
++
++
++@pytest.fixture
++def refresh_state(tmp_path, monkeypatch):
++    monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
++    path = tmp_path / "capabilities.json"
++    path.write_text(json.dumps({"schema": reg.SCHEMA, "refreshed_at": 1000}))
++    monkeypatch.setattr(reg, "registry_path", lambda: path)
++    config = {"refresh_seconds": 120}
++    load = Mock(side_effect=lambda: dict(config))
++    monkeypatch.setattr(reg, "_config", load)
++    revision = [1]
++    monkeypatch.setattr(gate, "config_key", lambda: revision[0])
++    monkeypatch.setattr(reg, "_refresh_gate", None, raising=False)
++    monkeypatch.setattr(reg, "_thread", None)
++    read = Mock(wraps=reg.read_local)
++    monkeypatch.setattr(reg, "read_local", read)
++    thread = Mock()
++    thread.is_alive.return_value = False
++    factory = Mock(return_value=thread)
++    monkeypatch.setattr(reg.threading, "Thread", factory)
++    return path, config, load, read, revision, factory
++
++
++def test_quiet_ticks_read_once_and_start_at_exact_due(refresh_state):
++    _, _, load, read, _, factory = refresh_state
++    assert reg.maybe_refresh_async(now=1000) is False
++    assert reg.maybe_refresh_async(now=1119) is False
++    assert (load.call_count, read.call_count) == (1, 1)
++    assert reg.maybe_refresh_async(now=1120) is True
++    factory.return_value.start.assert_called_once()
++
++
++def test_config_change_invalidates_future_due(refresh_state):
++    _, config, _, _, revision, factory = refresh_state
++    assert reg.maybe_refresh_async(now=1000) is False
++    config["refresh_seconds"] = 60
++    revision[0] += 1
++    assert reg.maybe_refresh_async(now=1060) is True
++    factory.return_value.start.assert_called_once()
++
++
++def test_external_registry_replacement_invalidates_due(refresh_state):
++    path, _, _, read, _, factory = refresh_state
++    assert reg.maybe_refresh_async(now=1000) is False
++    replacement = path.with_suffix(".replacement")
++    replacement.write_text(json.dumps({"schema": reg.SCHEMA, "refreshed_at": 800}))
++    replacement.replace(path)
++    assert reg.maybe_refresh_async(now=1001) is True
++    assert read.call_count == 2
++    factory.return_value.start.assert_called_once()
++
++
++def test_running_refresh_skips_reads_and_failed_refresh_retries(refresh_state):
++    _, _, load, read, _, factory = refresh_state
++    assert reg.maybe_refresh_async(now=1120) is True
++    thread = factory.return_value
++    thread.is_alive.return_value = True
++    calls = load.call_count, read.call_count
++    assert reg.maybe_refresh_async(now=1121) is False
++    assert (load.call_count, read.call_count) == calls
++    # Failure left the stale registry intact: next tick must retry, not cache success.
++    thread.is_alive.return_value = False
++    assert reg.maybe_refresh_async(now=1122) is True
++    assert thread.start.call_count == 2
++
++
++def test_disabled_refresh_reenabled_by_config_change(refresh_state):
++    _, config, load, read, revision, factory = refresh_state
++    config["enabled"] = False
++    assert reg.maybe_refresh_async(now=1000) is False
++    assert reg.maybe_refresh_async(now=1001) is False
++    assert load.call_count == 1
++    assert read.call_count == 0
++    config["enabled"] = True
++    revision[0] += 1
++    assert reg.maybe_refresh_async(now=1120) is True
++    factory.return_value.start.assert_called_once()
++
++
++def test_clock_rollback_rechecks_record(refresh_state):
++    _, _, load, _, _, _ = refresh_state
++    assert reg.maybe_refresh_async(now=1050) is False
++    assert reg.maybe_refresh_async(now=1000) is False
++    assert load.call_count == 2
+-- 
+2.43.0
+

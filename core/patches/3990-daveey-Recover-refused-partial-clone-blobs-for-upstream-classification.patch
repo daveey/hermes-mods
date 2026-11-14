@@ -1,0 +1,284 @@
+From 0f2c8090dfe4559be6f96760f9c6bfb50c031861 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:02:01 +0000
+Subject: [PATCH] [daveey] Recover refused partial-clone blobs for upstream
+ classification
+
+Git remerge-diff can fail forever when upload-pack rejects promised blob OIDs even though GitHub REST serves them. Retry only recognized missing-object failures, recover at most 32 distinct blobs through existing broker-aware gh, decode base64 losslessly and verify each Git object ID before storing it. Unavailable, invalid or repeated failures remain REFUSED.
+
+Proof: real file:// blob:none conflict fixture fails on base and on reverted recovery (both classifier and standalone CLI tests), passes with recovery. Unobtainable REST blobs still REFUSE; malformed/base64, wrong bytes, timeout, Git hash/store failures and bounded retries covered. Seven safety mutants killed. Focused classifier/gate and subprocess guard suites pass; scripts/check all 20 checks pass.
+---
+ scripts/ci/upstream_sync_review.py            |  63 ++++++-
+ tests/scripts/ci/test_upstream_sync_review.py | 164 ++++++++++++++++++
+ 2 files changed, 226 insertions(+), 1 deletion(-)
+
+diff --git a/scripts/ci/upstream_sync_review.py b/scripts/ci/upstream_sync_review.py
+index e26f428ae0..9654f4f61a 100644
+--- a/scripts/ci/upstream_sync_review.py
++++ b/scripts/ci/upstream_sync_review.py
+@@ -18,6 +18,8 @@ points. Replica discovery only supplies candidate IDs, never approval. A host wi
+ """
+ from __future__ import annotations
+ 
++import base64
++import binascii
+ import importlib.machinery
+ import importlib.util
+ import inspect
+@@ -100,9 +102,68 @@ _DIFF_PATH = re.compile(r"^diff --git a/(.+?) b/(.+)$")
+ _CONFLICT_PATH = re.compile(r"^remerge CONFLICT \([^)]*\): .*? in (.+)$")
+ 
+ 
++_REFUSED_BLOB = re.compile(r"(?:not our ref |could not fetch )([0-9a-f]{40})(?![0-9a-f])")
++_MAX_RECOVERED_BLOBS = 32
++
++
++def _recover_blob(repo, oid: str) -> None:
++    """GitHub sometimes serves a promised blob over REST but refuses it over upload-pack.
++
++    Decode JSON/base64 rather than raw text (blobs need not be UTF-8). Verify the Git object identity before
++    writing anything. Only the configured GitHub origin/upstream are queried, through the gate's broker route.
++    """
++    if __package__:
++        from .upstream_sync import gh_cli
++    else:  # standalone updater: scripts/ci, not the repository root, is on sys.path
++        from upstream_sync import gh_cli
++
++    for remote in ("origin", UPSTREAM_REMOTE):
++        url = _git(repo, "config", "--get", f"remote.{remote}.url").stdout.strip()
++        match = _GITHUB_URL.fullmatch(url)
++        if not match:
++            continue
++        proc = gh_cli("api", "-H", "Accept: application/vnd.github+json",
++                      f"repos/{match[1]}/git/blobs/{oid}", reason="upstream sync: recover promised merge blob")
++        if proc.returncode:
++            continue
++        try:
++            payload = json.loads(proc.stdout)
++            if payload["encoding"] != "base64":
++                raise ValueError("not base64")
++            data = base64.b64decode("".join(payload["content"].split()), validate=True)
++        except (ValueError, KeyError, TypeError, AttributeError, binascii.Error) as exc:
++            raise ClassifyError(f"invalid REST blob {oid}: {exc}") from exc
++        cmd = ["git", "-C", str(repo), "hash-object", "--stdin"]
++        hashed = subprocess.run(cmd, input=data, capture_output=True, timeout=30, check=False)
++        if hashed.returncode or hashed.stdout.strip() != oid.encode("ascii"):
++            raise ClassifyError(f"REST blob {oid} failed object identity verification")
++        stored = subprocess.run([*cmd, "-w"], input=data, capture_output=True, timeout=30, check=False)
++        if stored.returncode or stored.stdout.strip() != oid.encode("ascii"):
++            raise ClassifyError(f"cannot store REST blob {oid}")
++        return
++    raise ClassifyError(f"promised blob {oid} unavailable from configured GitHub remotes")
++
++
++def _remerge_diff(repo, merge: str) -> str:
++    recovered = set()
++    while True:
++        proc = _git(repo, "show", "--remerge-diff", "--no-color", "--no-ext-diff", "--format=", merge)
++        if not proc.returncode:
++            return proc.stdout
++        missing = set(_REFUSED_BLOB.findall(proc.stderr)) - recovered
++        if not missing or len(recovered | missing) > _MAX_RECOVERED_BLOBS:
++            raise ClassifyError(f"git show --remerge-diff failed: {proc.stderr.strip()[-300:]}")
++        try:
++            for oid in sorted(missing):
++                _recover_blob(repo, oid)
++        except (OSError, subprocess.TimeoutExpired) as exc:
++            raise ClassifyError(f"promised blob recovery failed: {exc}") from exc
++        recovered.update(missing)
++
++
+ def remerge_files(repo, merge: str) -> list[str]:
+     """Files whose committed content differs from git's own re-merge of ``merge``'s parents ([] = mechanical)."""
+-    text = _out(repo, "show", "--remerge-diff", "--no-color", "--no-ext-diff", "--format=", merge)
++    text = _remerge_diff(repo, merge)
+     if not text.strip():
+         return []
+     files = set()
+diff --git a/tests/scripts/ci/test_upstream_sync_review.py b/tests/scripts/ci/test_upstream_sync_review.py
+index c3ee4e0b5f..a55355814e 100644
+--- a/tests/scripts/ci/test_upstream_sync_review.py
++++ b/tests/scripts/ci/test_upstream_sync_review.py
+@@ -6,8 +6,12 @@ The review gate is ship's own (hermes-core-wt-land: keyed_review_card, request_r
+ module with the same entry points stands in for it, loaded through the same HERMES_CORE_WT_LAND path the gate uses.
+ Real bare Git remotes; GitHub is the FakeActions fixture from test_upstream_sync.
+ """
++import base64
+ import json
++import os
+ import subprocess
++import sys
++from pathlib import Path
+ 
+ import pytest
+ 
+@@ -175,6 +179,166 @@ def test_conflict_resolution_sync_parks_for_review_then_lands_on_exact_head_appr
+     assert land_stub.read()["gates"][-1][:4] == [card, pr["number"], head, f"sync/upstream-{head}"]
+ 
+ 
++@pytest.fixture
++def partial_conflict(world):
++    """Real blob:none clone; upload-pack cannot serve its promised objects."""
++    root, source = world
++    head = conflict_sync(root, source)
++    base = git(source, "rev-parse", "origin/main")
++    origin = root / "origin.git"
++    git(source, "push", "-q", "origin", f"{head}:refs/heads/sync-test")
++    git(origin, "config", "uploadpack.allowFilter", "true")
++    partial = root / "partial"
++    subprocess.run(["git", "clone", "-q", "--no-checkout", "--filter=blob:none", origin.as_uri(), str(partial)],
++                   check=True)
++    missing = git(partial, "rev-list", "--objects", "--missing=print", head)
++    assert any(line.startswith("?") for line in missing.splitlines())
++    empty = root / "empty.git"
++    subprocess.run(["git", "init", "-q", "--bare", str(empty)], check=True)
++    git(empty, "config", "uploadpack.allowFilter", "true")
++    url = "https://github.com/example/fork.git"
++    git(partial, "remote", "set-url", "origin", url)
++    git(partial, "config", f"url.{empty.as_uri()}.insteadOf", url)
++    upstream_url = "https://github.com/NousResearch/hermes-agent.git"
++    git(partial, "remote", "add", "upstream", upstream_url)
++    git(partial, "config", f"url.{root / 'upstream.git'}.insteadOf", upstream_url)
++    failed = review._git(partial, "show", "--remerge-diff", head)
++    assert failed.returncode and "not our ref" in failed.stderr
++    return partial, source, head, base
++
++
++def test_partial_clone_recovers_refused_blobs_and_classifies_fork_authored(partial_conflict, monkeypatch, capsys):
++    partial, source, head, base = partial_conflict
++    calls = []
++
++    def api(*args, **kwargs):
++        endpoint = args[-1]
++        calls.append(endpoint)
++        oid = endpoint.rsplit("/", 1)[-1]
++        data = subprocess.run(["git", "-C", str(source), "cat-file", "blob", oid],
++                              capture_output=True, check=True).stdout
++        return subprocess.CompletedProcess(args, 0, json.dumps({"encoding": "base64",
++                                           "content": base64.b64encode(data).decode("ascii")}), "")
++
++    monkeypatch.setattr(sync, "gh_cli", api)
++    assert sync.main(["--repo", str(partial), "--classify", head, "--base", base]) == 0
++    assert ": fork-authored" in capsys.readouterr().out
++    assert calls and all(c.startswith("repos/example/fork/git/blobs/") for c in calls)
++    assert review.classify(partial, head, base).resolutions == [(head, ["shared.txt"])]
++
++
++def test_partial_clone_standalone_cli_uses_gh_executable(partial_conflict, tmp_path, monkeypatch):
++    partial, source, head, base = partial_conflict
++    gh = tmp_path / "gh"
++    gh.write_text(f"#!{sys.executable}\nimport base64,json,subprocess,sys\n"
++                  f"data=subprocess.check_output(['git','-C',{str(source)!r},'cat-file','blob',"
++                  "sys.argv[-1].rsplit('/',1)[-1]])\n"
++                  "print(json.dumps({'encoding':'base64','content':base64.b64encode(data).decode()}))\n")
++    gh.chmod(0o755)
++    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
++    script = Path(sync.__file__).resolve()
++    proc = subprocess.run([sys.executable, str(script), "--repo", str(partial), "--classify", head, "--base", base],
++                          cwd=tmp_path, capture_output=True, text=True, encoding="utf-8", check=False)
++    assert proc.returncode == 0, proc.stdout + proc.stderr
++    assert ": fork-authored" in proc.stdout and "shared.txt" in proc.stdout
++
++
++@pytest.mark.parametrize("mode, reason", [
++    ("unavailable", "unavailable from configured GitHub remotes"),
++    ("wrong_bytes", "failed object identity verification"),
++    ("encoding", "invalid REST blob"),
++    ("malformed", "invalid REST blob"),
++    ("timeout", "promised blob recovery failed"),
++])
++def test_partial_clone_unobtainable_blobs_still_refuse(partial_conflict, monkeypatch, capsys, mode, reason):
++    partial, _, head, base = partial_conflict
++    calls = []
++
++    def api(*args, **kwargs):
++        calls.append(args[-1])
++        if mode == "timeout":
++            raise subprocess.TimeoutExpired("gh", 120)
++        payload = {"encoding": "base64", "content": base64.b64encode(b"wrong bytes\xff").decode("ascii")}
++        if mode == "encoding":
++            payload["encoding"] = "raw"
++        if mode == "malformed":
++            payload["content"] = "!!!"
++        return subprocess.CompletedProcess(args, 1 if mode == "unavailable" else 0, json.dumps(payload), "404")
++
++    monkeypatch.setattr(sync, "gh_cli", api)
++    assert sync.main(["--repo", str(partial), "--classify", head, "--base", base]) == sync.REFUSED
++    assert reason in capsys.readouterr().out
++    assert calls
++    if mode == "unavailable":
++        assert len(calls) == 2 and calls[-1].startswith("repos/NousResearch/hermes-agent/")
++
++
++@pytest.mark.parametrize("stderr", ["unrelated failure", "not our ref " + "a" * 40])
++def test_remerge_failure_without_progress_stays_bounded(monkeypatch, stderr):
++    calls = []
++
++    def failure(*args):
++        assert len(calls) <= 1, "retried without progress"
++        return subprocess.CompletedProcess(args, 1, "", stderr)
++
++    monkeypatch.setattr(review, "_git", failure)
++    monkeypatch.setattr(review, "_recover_blob", lambda repo, oid: calls.append(oid))
++    with pytest.raises(review.ClassifyError, match="git show --remerge-diff failed"):
++        review.remerge_files("unused", "head")
++    assert len(calls) == (1 if "not our ref" in stderr else 0)
++
++
++def test_remerge_blob_recovery_budget_refuses(monkeypatch):
++    calls = []
++
++    def failure(*args):
++        assert len(calls) <= 32, "recovery exceeded budget"
++        return subprocess.CompletedProcess(args, 1, "", f"not our ref {len(calls):040x}")
++
++    monkeypatch.setattr(review, "_git", failure)
++    monkeypatch.setattr(review, "_recover_blob", lambda repo, oid: calls.append(oid))
++    with pytest.raises(review.ClassifyError, match="git show --remerge-diff failed"):
++        review.remerge_files("unused", "head")
++    assert len(calls) == 32
++
++
++def test_recover_binary_blob_from_upstream_only(world, monkeypatch):
++    _, checkout = world
++    data = b"\x00\xff\r\n\x80"
++    oid = subprocess.run(["git", "hash-object", "--stdin"], input=data, capture_output=True, check=True).stdout.strip()
++    calls = []
++
++    def api(*args, **kwargs):
++        calls.append(args[-1])
++        return subprocess.CompletedProcess(args, 0, json.dumps({"encoding": "base64",
++            "content": base64.b64encode(data).decode("ascii") + "\n"}), "")
++
++    monkeypatch.setattr(sync, "gh_cli", api)
++    review._recover_blob(checkout, oid.decode("ascii"))
++    assert len(calls) == 1 and calls[0].startswith("repos/NousResearch/hermes-agent/")
++    assert subprocess.run(["git", "-C", str(checkout), "cat-file", "blob", oid.decode("ascii")],
++                          capture_output=True, check=True).stdout == data
++
++
++@pytest.mark.parametrize("phase", ["hash", "store"])
++def test_recover_blob_git_failure_refuses(world, monkeypatch, phase):
++    _, checkout = world
++    data = b"content"
++    oid = subprocess.run(["git", "hash-object", "--stdin"], input=data, capture_output=True, check=True).stdout.strip()
++    monkeypatch.setattr(sync, "gh_cli", lambda *a, **k: subprocess.CompletedProcess(a, 0, json.dumps({
++        "encoding": "base64", "content": base64.b64encode(data).decode("ascii")}), ""))
++    run = subprocess.run
++
++    def fail(cmd, **kwargs):
++        if "hash-object" in cmd and (("-w" in cmd) == (phase == "store")):
++            return subprocess.CompletedProcess(cmd, 1, oid + b"\n", b"disk error")
++        return run(cmd, **kwargs)
++
++    monkeypatch.setattr(review.subprocess, "run", fail)
++    with pytest.raises(review.ClassifyError, match="identity verification" if phase == "hash" else "cannot store"):
++        review._recover_blob(checkout, oid.decode("ascii"))
++
++
+ # --- Controls ---------------------------------------------------------------------------------------------------
+ 
+ def test_mechanical_sync_lands_without_any_review(world, land_stub):
+-- 
+2.43.0
+
