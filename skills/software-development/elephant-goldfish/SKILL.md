@@ -175,6 +175,7 @@ untouched.
 - Small clear fixes do not need this pipeline.
 - Reviewers explore: in a live run a refuter opened an earlier `review.md` next to the spec. Keep earlier reports
   out of the reviewed tree where possible, and mark a verdict from a reviewer that read them as not independent.
+- For historical scheduler replays, use exclusive event cuts and assert baseline counts before testing alternatives. Keep run/event joins within one database or use stable UIDs across replicas; integer run IDs are host-local. Distinguish a historical successful wake from current authoritative ownership, and label counterfactual scheduler paths rather than claiming the observed later history would remain unchanged.
 - Paths are part of the prompt: a directory named `flawed/`, `expected/` or `mismatch/` tells the reviewer what
   to find. Keep spec, fixture and source paths neutral.
 - "Read-only" is an instruction, not enforcement: reviewers may execute source to probe behavior (useful
