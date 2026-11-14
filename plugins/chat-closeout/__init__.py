@@ -1869,11 +1869,21 @@ def waiting_inputs() -> Any:
     Core reads it on every annotation fingerprint, so it is accounted too (P1 ``chat-closeout.waiting_inputs``)."""
     if _off():
         return ["off"]
-    with wi.accounting_pass("chat-closeout.waiting_inputs"), _proof_pass():
-        rows = _pending_rows()
-        parts = _input_parts(rows, time.time())
-        # Parts built here from plain JSON data are digested as they are; only core's values go through portable.
-        key = [wi.portable(parts[k]) if k == "scope" else wi.strict_digest(parts[k]) for k in sorted(parts)]
+    unportable: Optional[Exception] = None
+    with wi.accounting_pass("chat-closeout.waiting_inputs") as acct, _proof_pass():
+        try:
+            rows = _pending_rows()
+            parts = _input_parts(rows, time.time())
+            # Parts built here from plain JSON data are digested as they are; only core's values go through portable.
+            key = [wi.portable(parts[k]) if k == "scope" else wi.strict_digest(parts[k]) for k in sorted(parts)]
+        except wi.Unportable as exc:
+            # The designed no-adoption signal (e.g. a zero-budget BoardLifecycleBusy board key): core recomputes
+            # through ``waiting_source``. A fallback, not an error; it is re-raised below, outside the pass. Any
+            # other exception still escapes inside the pass and counts as an error (with its class on newer cores).
+            acct.fallback()
+            unportable = exc
+    if unportable is not None:
+        raise unportable
     # Core runs ``waiting_source`` right after a fingerprint it could not adopt: that pass reuses these reads. They
     # were taken before its own reads, so a change in between only re-runs the next pass, never hides one. Per
     # thread: the fingerprint and the pass that follows it run on one thread, and another thread's (older) reads

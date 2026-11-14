@@ -340,3 +340,61 @@ def test_another_threads_inputs_are_not_reused(world):
     t.join()
     _notice(world['state'], 'c1', 101)
     assert poll() == {'c2': ['t_2']}  # not the other thread's (older) reads
+
+
+def _acct(la, name):
+    """A copy of ``name``'s P1 counters (zeros when the pass has not run yet); ``error_kinds`` only on cores that
+    record it (``getattr``-style: an older core's counters have no such key)."""
+    got = dict(la.counters().get(name) or {})
+    base = {'runs': 0, 'errors': 0, 'fallbacks': 0, 'error_kinds': {}}
+    base.update(got)
+    base['error_kinds'] = dict(base.get('error_kinds') or {})
+    return base
+
+
+def test_an_unreadable_board_key_counts_as_a_fallback_not_an_error(world, monkeypatch):
+    """A zero-budget BoardLifecycleBusy read leaves core's board key ``("stat", stat, object())``: ``portable``
+    raises the designed no-adoption signal ``Unportable``. The P1 pass counts it as a fallback, never an error, and
+    the caller (core's annotation host) still receives ``Unportable`` so it skips adoption and runs the source."""
+    la = pytest.importorskip('hermes_cli.loop_accounting')
+    wi = plugin.wi
+    from hermes_cli.kanban_generation import BoardLifecycleBusy
+    real_ro = ksa.cached_ro
+
+    def busy_ro(path, *, busy_budget=0.5):
+        if busy_budget == 0:  # core's zero-budget board-key probe meets a lifecycle hold
+            raise BoardLifecycleBusy('board lifecycle busy')
+        return real_ro(path, busy_budget=busy_budget)
+
+    monkeypatch.setattr(ksa, 'cached_ro', busy_ro)
+    key = ksa._board_content_key(world['board'])
+    assert key[0] == 'stat' and len(key) == 3  # the real unreadable-board key ("stat", stat, object())
+    before = _acct(la, 'chat-closeout.waiting_inputs')
+    with pytest.raises(wi.Unportable):
+        plugin.waiting_inputs()
+    after = _acct(la, 'chat-closeout.waiting_inputs')
+    assert after['runs'] - before['runs'] == 1
+    assert after['errors'] - before['errors'] == 0
+    assert after['fallbacks'] - before['fallbacks'] == 1
+    assert after['error_kinds'] == before['error_kinds']
+    # The source still answers through its own (full) pass.
+    assert poll() == {'c1': ['t_1'], 'c2': ['t_2']}
+
+
+def test_a_real_read_failure_still_counts_as_an_error(world, monkeypatch):
+    """Any other exception escapes inside the pass: an error (with its class where core records it), not a fallback."""
+    la = pytest.importorskip('hermes_cli.loop_accounting')
+
+    def broken():
+        raise sqlite3.OperationalError('database is locked')
+
+    monkeypatch.setattr(plugin, '_pending_rows', broken)
+    before = _acct(la, 'chat-closeout.waiting_inputs')
+    with pytest.raises(sqlite3.OperationalError):
+        plugin.waiting_inputs()
+    after = _acct(la, 'chat-closeout.waiting_inputs')
+    assert after['runs'] - before['runs'] == 1
+    assert after['errors'] - before['errors'] == 1
+    assert after['fallbacks'] - before['fallbacks'] == 0
+    if 'error_kinds' in (la.counters().get('chat-closeout.waiting_inputs') or {}):
+        assert after['error_kinds'].get('OperationalError', 0) - before['error_kinds'].get('OperationalError', 0) == 1
