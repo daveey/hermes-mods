@@ -137,6 +137,22 @@ def test_new_permission_limit_key_publishes(gate, tmp_path):
     assert _publish(gate, more) is None
 
 
+def test_new_permission_key_without_new_target_publishes(gate, tmp_path):
+    """A new permission cannot reuse approval, even when no digit-bearing target changes."""
+    prior = json.loads(json.dumps(RUN3D))
+    more = json.loads(json.dumps(prior))
+    more["limits"].append({"key": "external disclosure", "permissionRequired": True,
+                           "value": "publish the snapshot externally"})
+    # Keep source, title and existing scope identical; neither widening escape hatch applies.
+    assert gate.approval_reuse.widened_targets(more, prior) == set()
+    assert gate.approval_reuse.declared_widening(more) is None
+    _chat(tmp_path, [("user", _decision(prior)), ("tool", _receipt("not_applied"))])
+    control = _publish(gate, prior)
+    assert control and "approval_reuse" in control["message"], control
+    # This is only the second attempt: the bounded third-attempt release cannot mask a hold.
+    assert _publish(gate, more) is None
+
+
 def test_unrelated_approval_under_same_goal_publishes(gate, tmp_path):
     other = _req("Delete the stale backup files on the worker fleet", run="x", sha="ff", checkout="aa",
                  card="t_01a1d9000000aaaa",
