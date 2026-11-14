@@ -120,6 +120,64 @@ def test_new_ask_after_a_finished_episode_starts_its_own_clock(tmp_path, monkeyp
     assert led.get('chat')['failure_since'] == 2100  # not 100: the watchdog ages this ask from its own failure
 
 
+@pytest.mark.parametrize('at', [float('nan'), float('inf'), float('-inf'), 0, -1],
+                         ids=['nan', 'positive-infinity', 'negative-infinity', 'zero', 'negative'])
+def test_invalid_remote_block_time_is_unknown_not_delivery_proof(tmp_path, at):
+    card = _remote(park={'outcome': 'blocked', 'ended_at': at}, updated_at=800)
+    assert core.blocked_since(card) is None
+    assert core.ask_age_s(card, now=1000) == 200  # fall back to a valid update, not the bad block
+    assert not core.quoted_ask([_transcript(tmp_path, 950)], ['chat'], card)
+
+
+def test_pending_completion_without_ask_preserves_failure_episode(tmp_path, monkeypatch):
+    led, calls, tick, cards, _ = _busy_chat(tmp_path, monkeypatch, None)
+    cards.clear()
+    cards['work'] = {'status': 'done'}
+    led.write('chat', batch=['work'], open=['work'])
+    tick(1000)  # a real refused close-out starts the episode
+    assert len(calls) == 1
+    assert led.get('chat')['failure_since'] == 1000
+    row = led.get('chat')
+    assert row['closing'] is None
+    assert core.pending_key(row, cards)
+    assert core.ask_relay_key(row, cards) is None
+    tick(1030)  # another busy refusal must retain the first failure, not restart its clock
+    assert len(calls) == 2
+    row = core.Ledger(led.path).get('chat')
+    assert core.pending_key(row, cards)
+    assert row['failure_since'] == 1000
+
+
+def test_inflight_closing_without_pending_key_preserves_failure_episode(tmp_path, monkeypatch):
+    led, calls, tick, cards, _ = _busy_chat(tmp_path, monkeypatch, None)
+    cards.pop('work')
+    led.write('chat', batch=list(cards), open=list(cards))
+    tick(1000)  # busy close-out: establish the episode using the real release path
+    assert len(calls) == 1
+    assert led.get('chat')['failure_since'] == 1000
+
+    observed = []
+
+    def starting(*args, **kwargs):
+        # The waker persisted coverage/closing BEFORE calling the backend. Another
+        # pass can observe this window before its successful return clears failure_since.
+        row = led.get('chat')
+        assert row['closing'] == sorted(cards)
+        assert core.pending_key(row, cards) is None
+        assert core.ask_relay_key(row, cards) is None
+        assert tick(1040) == []
+        observed.append(core.Ledger(led.path).get('chat'))
+        return 'started'
+
+    result = plugin.wake_tick(now=1030, wake=starting, unseen={}, last_user=lambda _: 0,
+                              read=lambda _: cards)
+    assert result[0]['result'] == 'started'
+    assert len(observed) == 1
+    assert observed[0]['closing'] == sorted(cards)
+    assert observed[0]['failure_since'] == 1000
+    assert led.get('chat')['failure_since'] is None  # successful admission ends the episode
+
+
 def test_untold_ask_keeps_its_failure_clock(tmp_path, monkeypatch):
     led, calls, tick, _, _ = _busy_chat(tmp_path, monkeypatch, None)
     for now in (1000, 1030, 1060):
