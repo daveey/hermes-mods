@@ -1766,8 +1766,13 @@ def _is_heading(block_text: str) -> bool:
 
 
 def _section(reply: str, span) -> str:
-    """The blocks from the heading (``#`` line or bold-only first line) at or above ``span``'s paragraph down to
-    the next heading: the part of the reply that sentence belongs to."""
+    """The part of the reply ``span``'s paragraph belongs to.
+
+    - Under a heading (``#`` line or bold-only first line): the blocks from that heading down to the next one.
+    - With no heading above it, the reply is no section: a close-out that answers several cards in plain paragraphs
+      would otherwise put a quote of one card's ask over a paraphrased relay of another. There the paragraph's
+      section is itself, plus the blockquote right above it when the paragraph names no card id (the reply to a
+      quoted ask: "> <ask line>" then "Reply here. My pick: ...")."""
     if not reply or not span:
         return ""
     target = locate(reply, span)
@@ -1780,6 +1785,11 @@ def _section(reply: str, span) -> str:
     lo = i
     while lo > 0 and not _is_heading(blocks[lo]["text"]):
         lo -= 1
+    if not _is_heading(blocks[lo]["text"]):
+        own = blocks[i]
+        if i > 0 and not own.get("quote") and blocks[i - 1].get("quote") and not _CARD_ID.search(own["text"]):
+            return blocks[i - 1]["text"] + "\n\n" + own["text"]
+        return own["text"]
     hi = i + 1
     while hi < len(blocks) and not _is_heading(blocks[hi]["text"]):
         hi += 1
