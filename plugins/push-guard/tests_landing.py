@@ -254,7 +254,12 @@ def test_invalid_review_time_cannot_mask_dismissal(stamp):
                                   'asyncio.create_subprocess_exec(*{argv})'])
 def test_python_literal_argv_raw_merge_held(exe, call):
     argv = repr([exe, 'pr', 'merge', '7', '-R', land.REPO])
-    assert 'land.py' in guard.check_python(call.format(argv=argv), '/', guards=[])
+    code = call.format(argv=argv)
+    assert 'land.py' in guard.check_python(code, '/', guards=[])
+    spec = importlib.util.spec_from_file_location('argv_plugin', Path(__file__).with_name('__init__.py'))
+    plugin = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(plugin)
+    assert plugin._pre_tool_call('execute_code', {'code': code})['action'] == 'block'
 
 
 def test_graphql_held_without_config(monkeypatch):
