@@ -27,10 +27,17 @@ class MaintenanceSchedule:
         return min(value, self.now) if type(value) in (int, float) and math.isfinite(value) and value >= 0 else -REVISIT
 
     def due(self, key, *, priority=False):
+        row = self.state.get(key)
+        if type(row) is dict and row.get('interrupted') is True and self.now - self.last(key) < REVISIT:
+            return False
         return priority or self.now - self.last(key) >= REVISIT
 
-    def attempted(self, key):
-        self.state[key] = {'at': self.now}
+    def pending(self, key):
+        row = self.state.get(key)
+        return type(row) is dict and row.get('pending') is True
+
+    def attempted(self, key, *, pending=False, interrupted=False):
+        self.state[key] = {'at': self.now, 'pending': pending, 'interrupted': interrupted}
 
     def prune(self):
         for key in set(self.state) - self.keys:
