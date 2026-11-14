@@ -26,6 +26,13 @@ stops new claims on a provider while its pooled accounts burn faster than their 
 3. **Read the provider state** in a governed host's `~/.hermes/llm_pacing.json`: `paced` with a `factor`, or `held`
    until a time, plus the per-account usage behind it. At a factor near 0.03 the pool claimed nothing for hours.
 
+4. **A freshly signed-in account isn't on the workers yet.** The hub copies new pool rows to the workers only when its
+   `hermes-oauth-relay.timer` fires (up to an hour later), so the workers' governors keep pacing on the old walled
+   accounts in the meantime. After any `hermes auth add` on the hub, run `systemctl --user start hermes-oauth-relay.service`
+   there. Its journal should show `fan-out worker-N: X/X rows match`. Then confirm the label on every box with
+   `hub-worker-exec all -- <script listing credential_pool labels>`. `claimed` events in the replica should
+   return within minutes.
+
 ## Report
 
 A paced provider has no start time. Claims resume when the pool's burn falls below what the accounts with headroom
