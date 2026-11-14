@@ -168,13 +168,18 @@ def main() -> int:
 
 def _run(args, clock: ReplayClock) -> int:
     rng = random.Random(args.seed)
-    with tempfile.TemporaryDirectory(prefix="closeout-bench-") as tmp:
+    # Worker TMPDIR may be inside its fenced live Hermes home. Own a fixture outside that root;
+    # retain every inherited descendant marker and verify the resolved board before writing.
+    with tempfile.TemporaryDirectory(prefix="closeout-bench-", dir=Path.home()) as tmp:
         home = Path(tmp)
         os.environ["HERMES_HOME"] = str(home)
-        os.environ["HERMES_KANBAN_HOME"] = str(home / "kanban")
-        # Core readers use these independently of the plugin's injected paths. Never inherit a worker's
-        # live board/replica: that contaminates timings and can admit real owner-wake work into a replay.
-        os.environ["HERMES_KANBAN_DB"] = str(home / "kanban.db")
+        os.environ["HERMES_KANBAN_HOME"] = str(home)
+        # A pinned DB is interpreted as a dispatcher board by core. Isolate through KANBAN_HOME instead.
+        os.environ.pop("HERMES_KANBAN_DB", None)
+        from hermes_cli.kanban_db import kanban_db_path
+        from agent.delegation_context import kanban_path_is_fenced
+        if kanban_db_path() != home / "kanban.db" or kanban_path_is_fenced(home / "kanban.db"):
+            raise RuntimeError("replay board is not an unfenced, fixture-owned path")
         os.environ["HERMES_KANBAN_BOARD"] = "default"
         os.environ["HERMES_HUB_STATE"] = str(home)
         os.environ["HERMES_MAIL_CONFIG"] = str(home / "mail.json")
@@ -260,8 +265,9 @@ def _run(args, clock: ReplayClock) -> int:
             sim = w * STEP_S
             if w:
                 clock.advance(STEP_S)
-            assert abs(time.time() - (wall0 + sim)) < 1e-6 and abs(time.monotonic() - (mono0 + sim)) < 1e-6, \
-                "replay clock did not advance one step per window"
+            if not (abs(time.time() - (wall0 + sim)) < 1e-6 and
+                    abs(time.monotonic() - (mono0 + sim)) < 1e-6):
+                raise RuntimeError("replay clock did not advance one step per window")
             floors.add(int(plugin.time.time() // floor_s))
             if rng.random() < RATES["state_msg"]:
                 moved["state_msg"] += 1
@@ -296,7 +302,8 @@ def _run(args, clock: ReplayClock) -> int:
             plugin.waiting_source()
             cpu["waiting"] += time.process_time() - c0
             cache = plugin._state.get("waiting_cache")
-            assert cache is None or abs(cache[0] - clock.mono) < 1e-6, "waiting freshness stamp is not on the replay clock"
+            if cache is not None and abs(cache[0] - clock.mono) >= 1e-6:
+                raise RuntimeError("waiting freshness stamp is not on the replay clock")
             passes["waiting"] += 1
             if sim >= next_host:
                 next_host += TICK_S
@@ -311,9 +318,12 @@ def _run(args, clock: ReplayClock) -> int:
             stats.sort_stats(os.environ.get("CLOSEOUT_BENCH_PROFILE_SORT", "tottime"))
             stats.print_stats(os.environ.get("CLOSEOUT_BENCH_PROFILE_FILTER", ""), 40)
         replay_s = WINDOWS * STEP_S
-        assert len(floors) >= 2, "replay omitted the production floor rollover"
-        assert abs(clock.wall - wall0 - (WINDOWS - 1) * STEP_S) < 1e-6, "replay clock did not cross the replay"
-        assert passes == {"waiting": WINDOWS, "host": int(WINDOWS * STEP_S / TICK_S)}, f"due clock off: {passes}"
+        if len(floors) < 2:
+            raise RuntimeError("replay omitted the production floor rollover")
+        if abs(clock.wall - wall0 - (WINDOWS - 1) * STEP_S) >= 1e-6:
+            raise RuntimeError("replay clock did not cross the replay")
+        if passes != {"waiting": WINDOWS, "host": int(WINDOWS * STEP_S / TICK_S)}:
+            raise RuntimeError(f"due clock off: {passes}")
         out = {
             "plugin": str(args.plugin.resolve()),
             "scale": {k: getattr(args, k) for k in ("sessions", "messages", "tasks", "replica_rows", "pending")},

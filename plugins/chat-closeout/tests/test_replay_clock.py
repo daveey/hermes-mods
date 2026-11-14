@@ -26,7 +26,9 @@ def test_cli_budget_exit(world, monkeypatch, diagnostic, expected, tmp_path):
     def isolated_load(path):
         from hermes_cli import kanban_session_activity as ksa
         home = Path(os.environ['HERMES_HOME'])
-        assert Path(os.environ['HERMES_KANBAN_DB']) == home / 'kanban.db'
+        from hermes_cli.kanban_db import kanban_db_path
+        assert 'HERMES_KANBAN_DB' not in os.environ
+        assert kanban_db_path() == home / 'kanban.db'
         assert ksa._hub_db_path() == home / 'hub.db'
         return load(path)
     monkeypatch.setattr(bench, 'load_plugin', isolated_load)
@@ -67,6 +69,22 @@ def test_replay_clock_reaches_imported_readers_and_restores_on_error():
                 clock.advance(-1)
             raise RuntimeError('restore')
     assert all(getattr(time, name) is value for name, value in original.items())
+
+
+def test_replay_preserves_descendant_fence(monkeypatch, tmp_path):
+    pytest.importorskip('hermes_state')
+    from agent.delegation_context import kanban_path_is_fenced
+    root = tmp_path / 'fenced-root'
+    root.mkdir()
+    monkeypatch.setenv('HERMES_DELEGATED_CHILD_CONTEXT', str(root))
+    monkeypatch.delenv('HERMES_DELEGATED_CHILD_OWNER', raising=False)
+    monkeypatch.setenv('HERMES_KANBAN_DB', str(root / 'kanban.db'))
+    assert kanban_path_is_fenced(root / 'kanban.db')
+    monkeypatch.setattr(bench, 'budget_failures', lambda values: [])
+    monkeypatch.setattr(sys, 'argv', ['replay_bench', '--sessions', '4', '--messages', '8',
+                                    '--tasks', '3', '--replica-rows', '3', '--pending', '2'])
+    assert bench.main() == 0
+    assert os.environ['HERMES_DELEGATED_CHILD_CONTEXT'] == str(root)
 
 
 def test_budgets_fail_closed_unless_diagnostic():

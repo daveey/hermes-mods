@@ -1894,11 +1894,11 @@ def waiting_source() -> dict[str, list[str]]:
         return {}
     with _waiting_lock:
         hit = _state.get("waiting_cache")
-        fresh = _own_inputs_hit(pop=False)
+        raw = getattr(_inputs_local, "hit", None)
         memo = _state.get("waiting_memo")
-        # The fingerprint core just took on this thread saw inputs the cached answer was not computed from: answer
-        # them now rather than hand the older answer to core under the newer key.
-        moved = fresh is not None and (memo is None or memo[0] != fresh[1])
+        # Age limits read reuse, never invalidation: core's counts read or this lock can take longer than
+        # INPUTS_REUSE_S. An expired newer fingerprint still forbids returning an older cached answer.
+        moved = raw is not None and (memo is None or memo[0] != raw[2])
         if hit and time.monotonic() - hit[0] < 3.0 and not moved:
             return hit[1]
         with wi.accounting_pass("chat-closeout.waiting") as acct, _proof_pass():
@@ -1940,6 +1940,7 @@ def waiting_source() -> dict[str, list[str]]:
                 except Exception:
                     logger.debug("chat-closeout waiting source failed", exc_info=True)
                     out, parts = {}, None
+                    acct.fallback()
                     detail.fallback()
                 acct.rows(stats.get("recomputed", 0))
                 detail.change(input_moved)
