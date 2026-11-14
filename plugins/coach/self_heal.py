@@ -5161,7 +5161,7 @@ def cards_created_today(board: Optional[str], now: float, home: Optional[Path] =
     try:
         cols = {c[1] for c in con.execute("PRAGMA table_info(tasks)")}
         if not {"created_by", "created_at"} <= cols:
-            return 0
+            raise ValueError("tasks schema cannot count daily self-heal cards")
         key = "coalesce(idempotency_key, '')" if "idempotency_key" in cols else "''"
         return int(con.execute(f"SELECT count(*) FROM tasks WHERE created_by = ? AND created_at >= ? "
                                f"AND typeof(created_at) IN ('integer', 'real') "
@@ -5285,6 +5285,22 @@ def _card_ended(board: Optional[str], tid: str) -> bool:
     return bool(row) and row[0] in ("done", "archived")
 
 
+def _digest_fingerprints(board: Optional[str], card: str) -> list:
+    """Recover the comment memo from the board after local digest state was lost."""
+    path = board_db_path(board)
+    if path is None or not path.exists():
+        return []
+    con = _ro_state(path)
+    try:
+        if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_comments'").fetchone():
+            return []  # old boards and minimal fixtures have no comments table
+        rows = con.execute("SELECT body FROM task_comments WHERE task_id = ?", (card,)).fetchall()
+    finally:
+        con.close()
+    pattern = re.compile(r"(?m)^- fingerprint: ([a-z0-9_-]+)(?: ·|$)")
+    return sorted({fp for (body,) in rows for fp in pattern.findall(body or "")})
+
+
 def _get_digest(store, board: Optional[str], now: float, cap: int, runner) -> tuple:
     """The day's digest card, created once per UTC day and board (idempotency key `selfheal-digest:<day>`), parked
     until the next midnight. One closed by hand mid-day is replaced by `selfheal-digest:<day>:<n>` (the key alone
@@ -5325,7 +5341,11 @@ def _get_digest(store, board: Optional[str], now: float, cap: int, runner) -> tu
     except Exception as exc:  # health: allow BLE001 -- the brief parks it itself
         store.log({"event": "selfheal_digest_schedule_error", "card": tid, "error": str(exc)[:200]})
     boards = dict(state.get("boards") or {}) if state.get("day") == day else {}
-    boards[board or "default"] = {"card": tid, "fps": [], "gen": gen}
+    try:
+        fps = _digest_fingerprints(board, tid)
+    except Exception as exc:  # health: allow BLE001 -- retain the cap, retry comment recovery next pass
+        return None, f"digest comments unreadable: {str(exc)[:200]}"
+    boards[board or "default"] = {"card": tid, "fps": fps, "gen": gen}
     _save_digest_state(store, {"day": day, "boards": boards})
     store.log({"event": "selfheal_digest_filed", "card": tid, "utc_day": day, "board": board,
                "key": args["idempotency_key"]})
@@ -5822,6 +5842,9 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
         why = f"kanban board {args['board']!r} does not exist"
         store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": why, "board": args["board"]})
         return {"action": "error", "why": why, "board": args["board"]}
+    capped = _legacy_creation_cap(fp, st, args, store, runner, now, "fix")
+    if capped:
+        return capped  # keep proposed; the legacy lane retries after UTC rollover
     b = (budget_fn or budget)(args.get("board"), now)
     unavailable = _budget_unavailable(b, fp, store)
     if unavailable:
@@ -5978,6 +6001,19 @@ def _verify_board(board: Optional[str], st: dict, fix_card: str) -> Optional[str
     return board.partition(":")[2] or "default"
 
 
+def _legacy_creation_cap(fp: str, st: dict, args: dict, store, runner, now: float, kind: str) -> Optional[dict]:
+    """Legacy cards keep their lifecycle, not an exemption from new-card admission.
+
+    A keyed card already on this board is an idempotent retry, so needs no new slot.
+    """
+    board = args.get("board") or "default"
+    existing = keyed_cards(args["idempotency_key"], runner)
+    if any(not c.get("gateway") and c["board"] == board for c in existing):
+        return None
+    d = {**st, "fingerprint": fp}
+    return _over_cap(d, fp, args.get("board"), store, runner, now, None, kind=kind)
+
+
 def _file_verify(fp: str, st: dict, fix_card: str, r: dict, store, runner, now: float) -> Optional[str]:
     """File the VERIFY child of ``fix_card``: on the pool through hub-admin/hub-read when this gateway is remote-
     reachable (:func:`remote_verify`), else machine-pinned here. -> its id, or None (logged)."""
@@ -6004,6 +6040,8 @@ def _file_verify(fp: str, st: dict, fix_card: str, r: dict, store, runner, now: 
         args["parents"] = []
         args["body"] += (f"\n\nOwner location: `{fix_card}` is on this host's board `{located[1]}` "
                          f"(`hermes kanban --board {located[1]} show {fix_card}`), not on this card's board.")
+    if _legacy_creation_cap(fp, st, args, store, runner, now, "verify"):
+        return None  # keep verify_card absent so reconciliation retries it
     rc, out, err = _run_card(args, runner)
     vid = _task_id(out) if rc == 0 else None
     if not vid or vid == fix_card:
