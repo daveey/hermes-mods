@@ -19,6 +19,9 @@ SOCIAL = {
                "actions": [{"id": "approve", "label": "Approve", "kind": "resolve"}]},
     "x-reply-draft": {"name": "x-reply-draft", "fields": {"id": {"required": True}},
                       "actions": [{"id": "post", "label": "Post", "kind": "resolve"}]},
+    # a thread's approval card: the whole numbered thread, so its text is not capped at one post's 280
+    "x-post-thread": {"name": "x-post-thread", "fields": {"id": {"required": True}, "text": {"max": 7200}},
+                      "actions": [{"id": "approve", "label": "Approve", "kind": "resolve"}]},
 }
 
 
@@ -92,6 +95,10 @@ REAL = [
      'X reply draft: @someone on "I can\'t see why trust fails here…"', None),
     ("kanban · highlight movies", "x-post", {"id": "CLIP-1"}, "Review demo video + caption (20 seconds)",
      None),
+    ("cron · x-daily-post-and-engage", "x-post-thread", {"id": "Q-T4", "text": "1/ " + "a" * 400 + "\n2/ b"},
+     "X post pending: Q-T4, Sun Nov 15 3pm", None),
+    ("kanban · thread card", "x-post-thread", {"id": "Q-T4", "text": "1/ " + "a" * 400 + "\n2/ b"},
+     "X post pending: Q-T4, Sun Nov 15 3pm", None),
     ("coach · engine budget", "engine-budget", {"day": "2026-10-30"}, "Engine budget: total cap hit 2026-10-30", ASK),
     ("coach · improvement", "coach-improvement", {"id": "c9"}, "Rule: Never complete cards by punting live checks",
      None),
@@ -123,3 +130,12 @@ def test_kanban_and_cron_have_no_wildcard_type():
     reg = load("_tap_ac", "ask_contract.py").registry("/nonexistent")
     for fam in ("kanban", "cron"):
         assert "*" not in reg[fam]["allowed_types"], fam
+
+
+def test_scheduled_social_posters_may_post_the_thread_card_type():
+    """Every family that posts the x-post approval card also posts its thread sibling: a multi-part queue item
+    is carded as x-post-thread, and a poster limited to x-post would leave threads with no pre-slot card."""
+    reg = load("_tap_ac2", "ask_contract.py").registry("/nonexistent")
+    for fam, row in reg.items():
+        if "x-post" in row["allowed_types"]:
+            assert "x-post-thread" in row["allowed_types"], fam
