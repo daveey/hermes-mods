@@ -85,14 +85,18 @@ def connect(path: Optional[Path] = None, timeout: float = 2.0) -> sqlite3.Connec
     if path.stat().st_mode & 0o077:
         os.chmod(path, 0o600)
     db = sqlite3.connect(str(path), timeout=timeout, isolation_level=None, check_same_thread=False)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA journal_mode=WAL").fetchone()
-    db.executescript(SCHEMA)
-    for suffix in ("-wal", "-shm"):
-        side = Path(str(path) + suffix)
-        if side.exists() and side.stat().st_mode & 0o077:
-            os.chmod(side, 0o600)
-    return db
+    try:
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA journal_mode=WAL").fetchone()
+        db.executescript(SCHEMA)
+        for suffix in ("-wal", "-shm"):
+            side = Path(str(path) + suffix)
+            if side.exists() and side.stat().st_mode & 0o077:
+                os.chmod(side, 0o600)
+        return db
+    except BaseException:
+        db.close()
+        raise
 
 
 def rows_for(event: dict, detector=None) -> list[dict]:
@@ -135,21 +139,47 @@ class Writer:
         self.errors = 0
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
+        self._retired = threading.Event()
 
     def submit(self, event: dict) -> None:
+        # Never wait for another producer or shutdown; retirement and enqueue are atomic.
+        if not self._lock.acquire(blocking=False):
+            self.dropped += 1
+            return
         try:
+            if self._retired.is_set():
+                self.dropped += 1
+                return
             if self._thread is None:
-                self._start()
+                thread = threading.Thread(target=self._run, name="risk-log-writer", daemon=True)
+                thread.start()
+                self._thread = thread
+                atexit.register(self.shutdown, 1.0)
             self.queue.put_nowait(event)
         except Exception:  # noqa: BLE001 - full queue or thread start failure: drop, never affect the call
             self.dropped += 1
+        finally:
+            self._lock.release()
 
-    def _start(self) -> None:
-        with self._lock:
-            if self._thread is None:
-                self._thread = threading.Thread(target=self._run, name="risk-log-writer", daemon=True)
-                self._thread.start()
-                atexit.register(self.flush, 1.0)
+    def shutdown(self, timeout: float = 5.0) -> bool:
+        """Retire permanently, drain accepted work, and wait at most timeout seconds.
+
+        A stalled operation may outlive the deadline; its daemon still drains and closes
+        on return. Only that owning thread may close its SQLite connection.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        if not self._lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            self._retired.set()
+            return False
+        try:
+            self._retired.set()
+            thread = self._thread
+            atexit.unregister(self.shutdown)
+        finally:
+            self._lock.release()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(max(0.0, deadline - time.monotonic()))
+        return thread is None or not thread.is_alive()
 
     def _detector(self):
         if self.detector is None:
@@ -162,21 +192,34 @@ class Writer:
 
     def _run(self) -> None:
         db = None
-        while True:
-            event = self.queue.get()
-            try:
-                if event is None:
+        try:
+            while True:
+                try:
+                    event = self.queue.get(timeout=0.05)
+                except queue.Empty:
+                    with self._lock:
+                        if self._retired.is_set() and self.queue.empty():
+                            return
                     continue
-                rows = rows_for(event, self._detector())
-                if rows:
-                    if db is None:
-                        db = connect(self.path)
-                    write_rows(db, rows)
-            except Exception:  # noqa: BLE001 - observability only
-                self.errors += 1
-                db = None
-            finally:
-                self.queue.task_done()
+                try:
+                    if event is None:
+                        continue
+                    rows = rows_for(event, self._detector())
+                    if rows:
+                        if db is None:
+                            db = connect(self.path)
+                        write_rows(db, rows)
+                except Exception:  # noqa: BLE001 - observability only
+                    self.errors += 1
+                    if db is not None:
+                        db.close()
+                    db = None
+                finally:
+                    self.queue.task_done()
+        finally:
+            if db is not None:
+                db.close()
+            atexit.unregister(self.shutdown)
 
     def flush(self, timeout: float = 5.0) -> bool:
         deadline = time.monotonic() + timeout
