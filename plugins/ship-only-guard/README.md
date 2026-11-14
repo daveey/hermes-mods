@@ -284,6 +284,11 @@ never refuse the older holder. Acquisition checks that same ordering before
 and after publication. A waiting ticket cannot reserve an extra area against
 otherwise independent PRs. This is a preflight, not an atomic merge lock.
 
+Optional `owner_task` and `owner_board` fields preserve the runtime Kanban identity
+(`HERMES_KANBAN_TASK`, else `HERMES_KANBAN_WORKER_TASK`; `HERMES_KANBAN_BOARD`).
+They come from the same environment source, never from a title or branch.
+Unknown fields are omitted and legacy records remain readable.
+
 The reader follows all ref-list pages and fetches immutable commit objects in
 batches of 100, rather than dropping old holders after six sequential reads.
 Incomplete, timed-out or malformed snapshots **fail closed**: base drift checks
