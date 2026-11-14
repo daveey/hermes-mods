@@ -9,6 +9,8 @@ agent published a fresh approval for the same machines and data, with only a new
 import json
 import sqlite3
 
+import pytest
+
 from conftest import llm_returning
 
 GOAL = "t_01a1cc1e1ffbe650"
@@ -47,9 +49,9 @@ RUN3D = _req("Run the priority reset (run 3) on all 11 machines, now immune to H
 OP = "37946c38-70f4-448a-8087-ae31ad6a4dc3"
 
 
-def _decision(req, op=OP):
+def _decision(req, op=OP, *, execution_authorized=True):
     return ("Canonical user decision. Act only on the frozen revision below. Approve permits only this exact scope "
-            "and limits.\n" + json.dumps({"effect": "approve", "executionAuthorized": True, "operationId": op,
+            "and limits.\n" + json.dumps({"effect": "approve", "executionAuthorized": execution_authorized, "operationId": op,
                                            "permissionGrants": [], "request": req, "revisionText": None})
             + "\nOwner receipt: after validating, call action_request {\"receipt\": ...}")
 
@@ -84,6 +86,38 @@ def test_repeat_of_unused_approval_is_held(gate, tmp_path):
     assert r and r["action"] == "block", r
     assert "approval_reuse" in r["message"] and "37946c38" in r["message"]
     assert "New since your approval:" in r["message"]
+
+
+@pytest.mark.parametrize("authorized,phase,retained,covers", [
+    pytest.param(False, "not_applied", False, False, id="approve-without-execution-authority"),
+    pytest.param(True, "not_applied", True, True, id="authorized-unused-control"),
+    pytest.param(True, "applied", True, False, id="authorized-applied-control"),
+])
+def test_execution_authority_controls_approval_reuse(gate, tmp_path, authorized, phase, retained, covers):
+    """An approve effect alone is not execution authority, even with an unused receipt."""
+    messages = [("user", _decision(RUN3, execution_authorized=authorized)),
+                ("tool", _receipt("acknowledged")), ("tool", _receipt(phase))]
+    rows = [(role, content, 1794590000 + i) for i, (role, content) in enumerate(messages)]
+    reuse = gate.approval_reuse
+    priors = reuse.prior_approvals(rows)
+    assert [p["operation"] for p in priors] == ([OP] if retained else [])
+    covering = reuse.covering_approval(RUN3D, priors)
+    assert (covering is not None) is covers
+    if covers:
+        assert covering["operation"] == OP
+    check = reuse.check(RUN3D, lambda: rows)
+    assert (check is not None) is covers
+    if covers:
+        assert check[0] == "approval_reuse"
+
+    # Also traverse the real hook's session-row reader, not just the helper graph.
+    _chat(tmp_path, messages)
+    result = _publish(gate, RUN3D)
+    if covers:
+        assert result and result["action"] == "block", result
+        assert "approval_reuse" in result["message"]
+    else:
+        assert result is None
 
 
 def test_single_use_attempts_clause_is_held(gate, tmp_path):
