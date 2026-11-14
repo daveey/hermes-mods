@@ -71,12 +71,22 @@ no-op.
   - `skips` = passes answered from the unchanged inputs;
   - `rows` = rows re-reconciled;
   - `fallbacks` = passes where an input was unreadable and a full pass ran instead.
+- `chat-closeout.waiting.changes` counts input-key movement, even when the answer stays identical.
+- `chat-closeout.waiting_moved`: conditional reconcile CPU and rows on input-moved passes only; `cpu_s / runs`
+  measures triggering-pass reconcile cost for C15. Cold initialization counts as moved.
+- `chat-closeout.waiting_fallback`: conditional reconcile cost when no trustworthy input key was available.
 - `chat-closeout.waiting_inputs`: the key computation core runs on each annotation fingerprint.
 - `chat-closeout.wake_tick`, with the same fields, plus `owner_wake_tick`, `owner_relay_tick` and `watchdog_tick`.
 
-Card B budgets on these numbers. Read them back from `~/.hermes/run/loop-accounting/<pid>.json`.
+Card B budgets triggering-pass cost using `waiting_moved` and charges key probes separately. The moved/fallback
+spans are **subsets** of `waiting`, not additional CPU: do not add their totals to `waiting.cpu_s`. Source-local
+key probes are included in `waiting`; declared fingerprint probes are in `waiting_inputs`. The total waiting
+budget is `waiting + waiting_inputs`, not the sum of all four spans. Read the counters back from
+`~/.hermes/run/loop-accounting/<pid>.json`.
 
 ## Benchmark
 
 `bench/replay_bench.py` builds a home at hub scale and replays the measured chg1/rf2 change rates (600 s in 2 s
-windows), then reports each loop's CPU as a percentage of one core. See the PR for before/after numbers.
+windows), then reports each loop's CPU as a percentage of one core. Wall/monotonic clocks advance coherently
+for all production readers, including floor and freshness deadlines; CPU timers remain real. Budget overruns
+exit 1 (use `--diagnostic` only for explicitly non-acceptance comparisons). See the PR for before/after numbers.
