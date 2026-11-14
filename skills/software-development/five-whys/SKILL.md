@@ -113,6 +113,8 @@ target host's logs, process list and session DB never show the change; the actor
 
 **Before profiling a live service, rule out observer-induced stalls.** Use `py-spy record/top --nonblocking` for attached production targets, with a bounded duration. Default ptrace sampling can suspend threads long enough to create the timeout being investigated; a requested duration is not a bound when sampling falls behind. Correlate profiler start/end and lag warnings with server loop coverage gaps and client failures, and discard those intervals as ordinary-load evidence. Never reproduce blocking attachment against the user's live backend; use a separate fixture. The coach profiler-safety pre-tool guard enforces common command forms, not dynamically generated scripts; on the hub and MacBook `~/.local/bin/py-spy` is a wrapper (hermes-mods `tools/process-safety/py_spy_nonblocking.py`) that adds `--nonblocking` to every attached record/top/dump, so check `ls -l ~/.local/bin/py-spy` still points there before profiling another host. When a backend stalls, grep the host's `journalctl` for `COMMAND=.*py-spy` in the window before blaming load.
 
+Before superseding a duplicate transcript row, inspect whether its carrier already folded unrelated input. A retained notice ID identifies the original row, not necessarily all current content. Exercise interleaved A/B/A rows and both sidecar orders; guard differing composite content from wholesale retirement, and verify unrelated text and durable row identities survive.
+
 ### 3. Branch where causes split
 
 One problem often has several independent causes. When one why has two true answers, branch and follow each.
