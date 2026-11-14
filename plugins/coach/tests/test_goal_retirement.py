@@ -40,8 +40,7 @@ def test_retirement_removes_registered_hook_but_preserves_other_guards(tmp_path,
     callbacks = []
     plugin.register(SimpleNamespace(register_hook=lambda n, f: callbacks.append((n, f))))
     final = [f for n, f in callbacks if n == 'pre_final_gate']
-    assert len(final) == 1
-    assert final[0].__name__ == 'envelope_gate'
+    assert [f.__name__ for f in final] == ['envelope_gate', 'status_fresh_gate']
     assert {'pre_llm_call', 'post_tool_call', 'pre_tool_call'} <= {n for n, f in callbacks}
 
 
@@ -56,8 +55,7 @@ def test_retired_gate_absent_after_normal_discovery(tmp_path, monkeypatch):
         manager.discover_and_load(force=True)
         assert Path(manager._plugins['coach'].module.__file__).resolve().parent == ROOT
         callbacks = list(manager.iter_hook_callbacks('pre_final_gate'))
-        assert len(callbacks) == 1
-        assert callbacks[0].__name__ == 'envelope_gate'
+        assert [f.__name__ for f in callbacks] == ['envelope_gate', 'status_fresh_gate']
     finally:
         manager.unload()
 

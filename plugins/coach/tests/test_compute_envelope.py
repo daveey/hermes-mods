@@ -148,7 +148,7 @@ def test_pre_final_gate_holds_the_menu_before_user_steps_can_formalize_it(tmp_pa
     assert any(r["event"] == "agent_fault" and r.get("rule") == "compute_envelope" for r in _log(tmp_path))
 
 
-def test_register_adds_both_pre_final_gate_callbacks(monkeypatch):
+def test_register_adds_all_pre_final_gate_callbacks(monkeypatch):
     spec = importlib.util.spec_from_file_location("coach_init_ce2", HERE / "__init__.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -156,9 +156,11 @@ def test_register_adds_both_pre_final_gate_callbacks(monkeypatch):
 
     class Ctx:
         def register_hook(self, name, fn):
-            seen.append(name)
+            seen.append((name, fn.__name__))
     mod.register(Ctx())
-    assert seen.count("pre_final_gate") == 2 and all(":" not in n for n in seen)
+    assert [fn for name, fn in seen if name == "pre_final_gate"] == [
+        "gate", "envelope_gate", "status_fresh_gate"]
+    assert all(":" not in name for name, _ in seen)
 
 
 def test_big_multi_gpu_ask_still_reaches_the_user(tmp_path, monkeypatch):
