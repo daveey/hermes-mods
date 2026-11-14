@@ -211,7 +211,10 @@ above pass, the guard reads `gh api repos/OWNER/REPO/compare/<baseRefOid>...stat
 that base overlaps a PR file:
 
 - the same directory cut to its top three segments (`hosts/<host>/bb-tuner/`,
-  `home/bin/`);
+  `home/scripts/`), except distinct direct children of `home/bin/` or
+  `hosts/<host>/bin/`; these flat executable directories still overlap for the
+  same file or test/code coupling below. Nested directories retain area checks;
+  the exemption is name-based and does not infer script/helper dependencies;
 - the same file for a repo-root file or one directly in a top-level dir
   (`tests/test_x.py`, `docs/x.md`, whose dozens of unrelated modules would
   otherwise hold every PR);
