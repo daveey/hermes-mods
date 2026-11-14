@@ -245,3 +245,38 @@ def test_live_outcome_respects_disabled_pr_rules(tmp_path, monkeypatch):
     outs = [r for r in rows if r["event"] == "reply_nudge_outcome"]
     assert len(outs) == 1 and outs[0]["rule"] == "confirm" and outs[0]["resolved"] is True
     assert [r for r in rows if r["event"] == "reply_nudge_outcome_new_claim"] == []
+
+
+# ── agent-aeca43a867: a PR the sentence itself calls merged is provenance, not the subject of the state claim ─────
+# On Nov 13 17:55 PST a chat reported two Kanban reviews approving an Ask Eve artifact built on merged state PR #2532.
+# The draft "The capsule-import fix (#2532) is approved by both reviewers." was nudged (fair: it reads as PR #2532 is
+# approved); the revision "... (from merged state change #2532) ... is approved by both of its new reviewers." was
+# true, said #2532 had merged, and still failed the outcome check, so the incident filed as a defect.
+AECA_REVISED = ("The update that adds the capsule-import fix (from merged state change #2532) to Ask Eve is approved "
+                "by both of its new reviewers.")
+AECA_DRAFT = "The capsule-import fix (#2532) is approved by both reviewers."
+
+
+def test_aeca43a867_merged_provenance_ref_is_not_a_state_claim():
+    assert rc.pr_state_claim(AECA_REVISED, NO_READ_LOG) is None
+    for reply in ("The build on top of merged PR #2532 is approved by both reviewers.",
+                  "The canary (built from #2532, merged at 19:33Z) is approved.",
+                  "The successor that carries #2532 (merged) is approved by review A.",
+                  "The artifact built from PR #2532, which merged at 19:33Z, is approved.",
+                  "The capsule update (from the already-merged #2532) is still in review."):
+        assert rc.pr_state_claim(reply, NO_READ_LOG) is None, reply
+
+
+def test_aeca43a867_unmarked_or_other_pr_still_fires():
+    # the ambiguous draft still gets the nudge, and a second, unmarked PR in the sentence keeps the claim live
+    assert rc.pr_state_claim(AECA_DRAFT, NO_READ_LOG)
+    for reply in ("PR #2533, which builds on merged PR #2532, is approved.",
+                  "Merged PR #2532 has a follow-up, #2540, which is approved.",
+                  "#1187 is approved and waiting for its macOS check, after #1100 merged."):
+        assert rc.pr_state_claim(reply, NO_READ_LOG), reply
+
+
+def test_aeca43a867_nudge_outcome_resolves_on_the_merged_provenance_revision():
+    res = rc.nudge_outcome("pr_state_claim", AECA_REVISED, "Kanban t_01a1d7688923ddcf done", NO_READ_LOG, _no_judge)
+    assert res.get("resolved") is True, res
+    assert "new_claim" not in res

@@ -2008,6 +2008,24 @@ _PSC_READ_RE = re.compile(
     re.I)
 _PSC_HELP_RE = re.compile(r"(?:^|\s)(?:--help|-h)(?:\s|\)|$)")
 _PSC_META_RE = re.compile(r"\bpr_state_claim\b", re.I)
+# A PR the sentence itself calls merged is provenance, not the subject of its state claim (self-heal agent-aeca43a867:
+# "The update that adds the capsule-import fix (from merged state change #2532) to Ask Eve is approved by both of its
+# new reviewers." was true: two Kanban reviews approved an artifact built on #2532, which had merged 6 h earlier).
+# "merged [up to 3 words] #N" before the ref ("already-merged" too, never "unmerged"/"not-yet-merged"), or
+# "#N (merged", "#N, merged at", "#N, which merged/was merged/landed" after it. A sentence with any other PR ref, or
+# opening with it/that/this, still counts.
+_PSC_MERGED_BEFORE_RE = re.compile(r"(?:^|[^\w-]|\balready-)merged\s+(?:[\w-]+\s+){0,3}$", re.I)
+_PSC_MERGED_AFTER_RE = re.compile(
+    r"^\s*(?:\(\s*|,\s*)?(?:(?:which|that)\s+)?(?:(?:was|were|has\s+been|have\s+been|has|is|got)\s+)?(?:already\s+)?"
+    r"(?:merged|landed)\b", re.I)
+
+
+def _psc_only_merged_refs(s: str) -> bool:
+    """True when every PR ref in sentence `s` is one the sentence marks as merged (provenance, not the claim's
+    subject), and there is at least one."""
+    refs = list(_MF_PR_RE.finditer(s))
+    return bool(refs) and all(_PSC_MERGED_BEFORE_RE.search(s[:m.start()]) or _PSC_MERGED_AFTER_RE.search(s[m.end():])
+                              for m in refs)
 PR_STATE_CLAIM_NUDGE = (
     "[coach] pr_state_claim: your reply states a PR's current state (\"{evidence}\"), but this turn never read that PR. "
     "A read from earlier in the chat (before an update pause, a wait or a resumed run) may be stale: the PR may have "
@@ -2030,7 +2048,7 @@ def pr_state_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]
         m = _PSC_CLAIM_RE.search(s)
         if not m or _PSC_HEDGE_RE.search(s[:m.start()]):
             continue
-        if _MF_PR_RE.search(s) or _PSC_IT_RE.search(s):
+        if _PSC_IT_RE.search(s) or (_MF_PR_RE.search(s) and not _psc_only_merged_refs(s)):
             hit = s
             break
     if not hit:
