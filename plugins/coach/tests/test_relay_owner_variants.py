@@ -38,4 +38,7 @@ def test_owner_without_unfinished_activity_is_not_a_relay(qualifier):
 
 
 def test_fresh_activity_without_an_owner_is_not_a_relay():
-    assert rr.relay_owner("I am tidying the follow-ups now.") is None
+    reply = "Someone is tidying the follow-ups now."
+    assert rr.UNFINISHED_RE.search(reply) is not None
+    assert rr.OWNER_NOUN_RE.search(reply) is None
+    assert rr.relay_owner(reply) is None
