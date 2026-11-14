@@ -443,6 +443,29 @@ def _cron_held_failures(recs: List[dict]) -> set:
     return held
 
 
+# A subscription wall that resets within core's WALL_REROUTE_MIN_SECONDS (agent/model_routing_walls.py) holds every
+# pin by design ("waiting beats a provider switch"): the turn gets held_reply, and the caller logs the
+# SubscriptionQuotaUnavailable traceback. Fingerprints key on exception + frames, so that designed hold reopened two
+# real defects of the same frames as "came back" (selfheal agent-13b91b3e1b: walls 2.9-4.3 h out on 11-14). Only the
+# exact class with a parseable reset strictly after the record and inside the window is a hold: a far wall (a pin
+# that should have rerouted) and a refusal at/after its own reset (a stale wall) stay defects.
+# tests/test_signals_held_wall.py asserts HELD_WALL_S equals core's constant when core is on the path.
+HELD_WALL_S = 6 * 3600
+HELD_WALL_EXC = "SubscriptionQuotaUnavailable"
+HELD_WALL_RESET_RE = re.compile(r"; resets at (\d+(?:\.\d+)?)\s*$")
+
+
+def held_wall(exc_type: str, exc_line: str, at: float) -> bool:
+    """True for core's designed short-wall refusal of a pinned route (see HELD_WALL_S)."""
+    if exc_type.rsplit(".", 1)[-1] != HELD_WALL_EXC:
+        return False
+    m = HELD_WALL_RESET_RE.search(exc_line)
+    if not m:
+        return False
+    left = float(m.group(1)) - at
+    return 0 < left < HELD_WALL_S
+
+
 def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Optional[list] = None,
                  host: str = "", prof: str = "default") -> List[dict]:
     """Records (header + continuation lines) -> traceback, hook-exception and credential-guard signals. Library
@@ -574,6 +597,8 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
         if (TRANSIENT_RE.search(text) or EXIT_NOISE_RE.search(exc_line) or OFFLINE_EXC_RE.fullmatch(exc_line)
                 or provider_5xx(exc_type, exc_line, exc_body)):
             continue
+        if held_wall(exc_type, exc_line, r["at"]):
+            continue  # a short wall holding a pin: core's designed refusal (held_reply), not a defect
         last = exc_line or (block[ei] if ei is not None else "")  # socket.gaierror
         if CONNECT_FAIL_RE.match(r["msg"]) and (NETWORK_EXC_RE.match(last) or NETWORK_RE.match(last)):
             continue  # a retried platform connect with no network; a long outage files via NEEDS_ATTENTION
@@ -1989,6 +2014,9 @@ def _cron_failure_exempt(r: dict) -> Optional[str]:
 RECHECKS: Dict[str, Callable[[dict], Optional[str]]] = {
     "template_hold": lambda r: _template_hold_exempt(str(r.get("rule") or ""), str(r.get("head") or "")),
     "cron_failure": _cron_failure_exempt,
+    "held_wall": lambda r: (f"held wall: {str(r.get('line') or '')[-120:]} (a pin's designed short-wall hold)"
+                            if held_wall(str(r.get("exc") or ""), str(r.get("line") or ""), float(r.get("at") or 0))
+                            else None),
 }
 
 
@@ -2022,6 +2050,12 @@ def defect_recheck(d: dict) -> Optional[dict]:
         m = _CRON_DETAILS_RE.match(details)
         if m and fp("cron", d.get("host"), m.group(2), m.group(1)) == d.get("fingerprint"):
             return cron_recheck(details[m.end():])  # legacy rows carry no last_failure kind: prose fallback
+    if d.get("kind") == "errors" and isinstance(d.get("at"), (int, float)):
+        # a traceback row queued before held_wall existed: its last line is the raised exception (agent-13b91b3e1b)
+        last = str(d.get("details") or "").rstrip("\n").rsplit("\n", 1)[-1]
+        m = EXC_RE.match(last)
+        if m and m.group(1).rsplit(".", 1)[-1] == HELD_WALL_EXC:
+            return {"kind": "held_wall", "exc": m.group(1), "line": last, "at": d["at"]}
     return None
 
 
