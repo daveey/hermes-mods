@@ -89,7 +89,7 @@ def pr_data():
     return data
 
 
-class Shim(lat.FakeShim):
+class Shim(lat.WallClockShim):
     """The landing host's gh shim: LATENCY + shared METER per call, COMPARE_EXTRA for the ancestry compare."""
 
     def answer(self, argv):
@@ -137,7 +137,7 @@ class Shim(lat.FakeShim):
 
 
 def load(monkeypatch, overlap):
-    g, _ = lat.load(monkeypatch, overlap)
+    g, _ = lat.load(monkeypatch, overlap, wall_clock=True)
     shim = Shim(g, overlap)
     monkeypatch.setattr(g.subprocess, "run", shim.run)
     fetches = []

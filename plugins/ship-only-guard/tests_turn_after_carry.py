@@ -29,7 +29,7 @@ TURN_REF = f"refs/land-turn/pr-{NUMBER}"
 WORDS = ["pr", "merge", str(NUMBER), "-R", R, "--rebase", "--match-head-commit", HEAD]
 
 
-class TurnShim(lat.FakeShim):
+class TurnShim(lat.WallClockShim):
     """FakeShim plus the land-turn endpoints: a ref store, commit writes and the GraphQL record read."""
 
     def __init__(self, g, overlap):
@@ -70,7 +70,7 @@ class TurnShim(lat.FakeShim):
 
 
 def load(monkeypatch, overlap=True):
-    g, _ = lat.load(monkeypatch, overlap)
+    g, _ = lat.load(monkeypatch, overlap, wall_clock=True)
     shim = TurnShim(g, overlap)
     monkeypatch.setattr(g.subprocess, "run", shim.run)
     monkeypatch.setattr(g, "LAND_TURN_TIMEOUT", 60 * lat.SCALE, raising=False)
