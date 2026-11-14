@@ -82,6 +82,31 @@ def test_a_module_global_owns_what_it_holds():
     assert rows['fakemod.small'][0] < 1000
 
 
+@pytest.mark.parametrize('top', [2, 3])
+def test_top_rows_rank_owned_shallow_bytes_descending_before_cutoff(top):
+    # A fresh interpreter keeps pytest's heap out of the ranking. These leaf owners
+    # dominate the stdlib heap and have equal counts but distinct shallow sizes.
+    code = (
+        "import importlib.util, json, sys, types\n"
+        f"spec = importlib.util.spec_from_file_location('roots', {str(_dir / 'roots.py')!r})\n"
+        "roots = importlib.util.module_from_spec(spec); spec.loader.exec_module(roots)\n"
+        "mod = types.ModuleType('rankmod')\n"
+        "mod.small = bytearray(8 << 20)\n"
+        "mod.large = bytearray(24 << 20)\n"
+        "mod.middle = bytearray(16 << 20)\n"
+        f"report = roots.scan(modules={{'rankmod': mod}}, top={top})\n"
+        "expected = [[f'rankmod.{name}', sys.getsizeof(getattr(mod, name)), 1]\n"
+        "            for name in ('large', 'middle', 'small')]\n"
+        "print(json.dumps([report, expected]))\n"
+    )
+    out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr
+    report, expected = json.loads(out.stdout)
+    assert report['status'] == 'ok' and report['truncated'] is False
+    assert report['owners'] > top  # the cutoff actually discards owners
+    assert report['top'] == expected[:top]  # preserve list order, sizes and counts
+
+
 def test_a_shared_object_is_counted_once_for_the_nearest_owner():
     shared = _blob('s')
     rows = _scan(direct=shared, nested={'a': {'b': {'c': shared}}})
