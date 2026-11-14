@@ -39,10 +39,12 @@ BROKER = (
     pytest.param("'ok'", "'ok' --unknown", id="M23-unknown-option"),
     pytest.param("'alias prose'", "alias", id="M25-prose-must-be-quoted"),
     pytest.param("ship slug", "ship alias", id="M26-alias-in-slug"),
+    # Quoted, so only slug non-inertness (not the quote rule) refuses it.
+    pytest.param("ship slug", "ship 'alias'", id="M26-alias-in-quoted-slug"),
 ])
 def test_broker_grammar_fence_refuses_composed_input(tmp_path, old, new):
     command = BROKER.replace(old, new)
-    if "--review-task 'alias'" in command or "ship alias" in command:
+    if any(s in command for s in ("--review-task 'alias'", "ship alias", "ship 'alias'")):
         command = command.replace("'alias prose'", "'ok'")
     reason = guard.refuse_reason(command, str(tmp_path))
     assert reason is not None, command
