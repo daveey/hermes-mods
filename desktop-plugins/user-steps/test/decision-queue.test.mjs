@@ -15,7 +15,7 @@ const atom = value => ({ value, get() { return this.value } })
 const host = { state: { focusedStoredSessionId: atom('S1'), connectionId: atom('C1'), profile: atom('default'), focusedSessionOwner: atom({ connectionId: 'C1', profile: 'default' }) }, composer: { submit() { assert.fail('no composer delivery for decisions') }, setDraft() {}, focus() {} } }
 globalThis.queueHarness = { React, J, host }
 register('data:text/javascript,' + encodeURIComponent(`export async function resolve(s,c,n){const map={'react':'const R=globalThis.queueHarness.React;export const useState=R.useState,useEffect=R.useEffect,useRef=R.useRef','react/jsx-runtime':'const J=globalThis.queueHarness.J;export const jsx=J.jsx,jsxs=J.jsxs','@hermes/plugin-sdk':'export const host=globalThis.queueHarness.host,COMPOSER_AREAS={top:"composer.top"},TRANSCRIPT_DIRECTIVE_AREA="transcript.directives",useValue=a=>a?.get(),MessageTextContent=({text})=>text'};return map[s]?{url:'data:text/javascript,'+encodeURIComponent(map[s]),shortCircuit:true}:n(s,c)}`))
-const m = await import('./plugin.js')
+const m = await import('../plugin.js')
 const { createRoot } = require('react-dom/client')
 const root = createRoot(document.getElementById('root'))
 const el = () => document.getElementById('root')
@@ -148,7 +148,7 @@ test('queue registration uses canonical region; aliases suppress only exact refe
  // 90a4031b: cards render the requested step, not card text; the other board's own ask survives
  assert.match(el().querySelector('[data-user-steps-card-action]').textContent,/Approve the separate board stage/)
  assert.equal(el().querySelector('[data-action-scope]').textContent,r.scope.markdown)
- const progress=await import('../session-tasks/plugin.js')
+ const progress=await import('../../session-tasks/plugin.js')
  const chip={kind:'kanban',gatewayId:'G1',profile:'default',board:'ops',id:'same',state:'blocked'}
  assert.equal(progress.progressChips([chip]).length,0)
  assert.equal(progress.progressChips([{...chip,board:'other'},{...chip,state:'running'},{kind:'bg'}]).length,3)
@@ -174,7 +174,7 @@ test('cold reload recovers retry key but confirms only server readback; malforme
  const r=freshRequest();const d={session:'S1',expectedRevision:1,choiceId:'yes',idempotencyKey:'retained-client-key'}
  const key=JSON.stringify(['C1','default','S1'])+':'+m.requestKey(r)
  window.localStorage.setItem('hermes.actionIntent.v2:'+key,JSON.stringify(d))
- const calls=[];const cold=await import('./plugin.js?cold-reload')
+ const calls=[];const cold=await import('../plugin.js?cold-reload')
  const call=async(path,opts={})=>{calls.push([path,opts]);return {operation:{operationId:'recover',dispatchState:'pending'},request:r}}
  await show(React.createElement(cold.DecisionRow,{request:r,route,call}))
  assert.match(el().textContent,/recorded.*pending/i)
@@ -548,7 +548,7 @@ test('a withdrawn ask does not resurface as a legacy reference or a blocked prog
  assert.equal(el().querySelector('[data-action-request]'), null)
  assert.equal(el().querySelector('[data-user-steps-card]'), null, 'its aliased card stays suppressed')
  assert.equal(el().textContent, '')
- const progress = await import('../session-tasks/plugin.js')
+ const progress = await import('../../session-tasks/plugin.js')
  assert.equal(progress.progressChips([{ kind: 'kanban', gatewayId: 'G1', profile: 'default', board: 'ops', id: 'same', state: 'blocked' }]).length, 0)
  await show(null); dispose(); delete window.hermesDesktop; delete window.__blockedPanel
 })

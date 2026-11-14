@@ -38,7 +38,7 @@ presentation metadata retain their existing controls.
 
 Tests: `tests/test_kanban_question_display.py` (identity, recommendations, REST
 round-trip, retry, invalid owner/revision/binding, typed archive),
-`desktop-plugins/user-steps/kanban-question.test.mjs` (rows and exact payloads), and
+`desktop-plugins/user-steps/test/kanban-question.test.mjs` (rows and exact payloads), and
 `desktop-plugins/session-panel/test/composed.test.mjs` (one ask/count, Skip dedup).
 
 ## What you see (Hermes Desktop)
@@ -102,9 +102,11 @@ held rather than re-published. Unframed or ambiguous evidence stays pending.
 answer outcomes, evidence races, owner/revision isolation, missing-plan behavior,
 pending decisions, repeat suppression, and repair API payload rejection.
 
-UI verification: `desktop-plugins/user-steps/decision-queue.test.mjs` covers
+UI verification: `desktop-plugins/user-steps/test/decision-queue.test.mjs` covers
 single dispatch across double clicks/two tiles, owner switches, stale revisions,
-retries and delivery readbacks. `decision-queue.browser.test.mjs` bundles the real
+retries and delivery readbacks. `decision-queue.browser.test.mjs` stays at the plugin
+root on purpose: it needs esbuild, Playwright and Chromium, so the CI `node-tests` glob
+(`desktop-plugins/*/test/*.mjs`) skips it; run it by hand. It bundles the real
 Desktop Markdown renderer and tests formatting, real keyboard interaction,
 agent-owned incomplete plans, clarification choices, 360px/640px widths and 200% zoom with sanitized fixtures.
 Run from `desktop-plugins/user-steps` with Node 22+:
@@ -112,7 +114,7 @@ Run from `desktop-plugins/user-steps` with Node 22+:
 ```sh
 CHROME_PATH='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' \
   /opt/homebrew/opt/nodejs/bin/node --test --test-reporter=tap \
-  test/plugin.test.mjs decision-queue.test.mjs decision-queue.browser.test.mjs
+  test/*.test.mjs decision-queue.browser.test.mjs
 ```
 
 `HERMES_DESKTOP_DIR` selects the core Desktop checkout and dependencies;
@@ -833,7 +835,7 @@ From the repository root:
 
 ```sh
 uv run --with pytest --with pyyaml --with fastapi --with httpx --with ruamel.yaml python -m pytest -q -p no:cacheprovider plugins/user-steps/tests -rs
-HERMES_DESKTOP_DIR=/path/to/test-dependencies node --test --test-reporter=tap desktop-plugins/user-steps/decision-queue.test.mjs desktop-plugins/user-steps/decision-queue.browser.test.mjs desktop-plugins/user-steps/test/*.test.mjs desktop-plugins/session-tasks/test/*.test.mjs desktop-plugins/blocked-panel/test/*.test.mjs
+HERMES_DESKTOP_DIR=/path/to/test-dependencies node --test --test-reporter=tap desktop-plugins/user-steps/decision-queue.browser.test.mjs desktop-plugins/user-steps/test/*.test.mjs desktop-plugins/session-tasks/test/*.test.mjs desktop-plugins/blocked-panel/test/*.test.mjs
 ```
 
 `tests/conftest.py` puts the core checkout (`HERMES_CORE_DIR`, else `~/.hermes/hermes-agent`) on
