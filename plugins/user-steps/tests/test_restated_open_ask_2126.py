@@ -335,6 +335,43 @@ def first_turn(plugin, monkeypatch):
     return [step['id'], req['requestId']]
 
 
+@pytest.mark.parametrize('unmapped', [False, True], ids=['no-new-ask', 'hold-budget-exhausted'])
+def test_passing_publication_with_an_open_ask_records_its_reading(plugin, monkeypatch, tmp_path, unmapped):
+    """A silent pass must leave enough evidence to explain a tile minted beside the open request.
+
+    Drive the real gate, matcher and trace writer; only the external extractor response is scripted.
+    The exhausted-budget case proves the trace contains the actual unmapped span, not empty defaults.
+    """
+    open_ids = first_turn(plugin, monkeypatch)
+    (request,) = open_requests(plugin)
+    plugin.pre_llm_call(session_id='session-a', user_message=FRESH, platform='cli')
+    llm, calls = sequenced([payload([new_step()] if unmapped else [])])
+    monkeypatch.setattr(plugin, 'aux_llm', llm)
+    reply = REPLY if unmapped else 'The checks passed; nothing else changed.'
+    attempt = 2 if unmapped else 0
+
+    verdict = plugin.publication_buffer(session_id='session-a', platform='cli', final_response=reply,
+                                         attempt=attempt, hold_budget=2, turn_messages=[])
+
+    assert verdict is None  # an actual pass, not a hold/error path that happened to log
+    assert len(calls) == 1
+    assert open_ids[0] in calls[0]  # mirrored request is listed under its ledger step id
+    assert OPEN_STEP['text'] in calls[0]
+    trace_path = tmp_path / 'cache' / 'user-steps' / 'trace.jsonl'
+    traces = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    passes = [row for row in traces if row.get('hook') == 'publication_buffer']
+    assert len(passes) == 1
+    trace = passes[0]
+    assert trace['verdict'] == 'pass'
+    assert trace['session'] == 'session-a'
+    assert trace['attempt'] == attempt
+    assert trace['open'] == [request['requestId']]
+    assert trace['steps'] == (1 if unmapped else 0)
+    assert trace['unmapped'] == ([RESTATED] if unmapped else [])
+    assert trace['repeats'] == []
+    assert open_requests(plugin) == [request]  # the gate only observed scratch requests
+
+
 def sequenced(outputs):
     calls = []
 
