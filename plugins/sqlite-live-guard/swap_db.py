@@ -30,6 +30,10 @@ DERIVED_TABLES = frozenset({
     'messages_fts_trigram', 'messages_fts_trigram_data', 'messages_fts_trigram_idx',
     'messages_fts_trigram_docsize', 'messages_fts_trigram_config',
 })
+# hermes_state_session_change: a derived per-session change cursor. Every current writer (re)installs
+# it with a rotated install epoch, after which readers distrust any older cursor and do a full read;
+# recovery rebuilds it from the copied sessions, so its rows and epoch legitimately differ.
+CURSOR_TABLES = frozenset({'session_change', 'session_change_revision'})
 GENERATED_META_KEYS = frozenset({
     'fts_storage_version', 'fts_optimize_available', 'fts_rebuild_high_water', 'fts_rebuild_progress',
     'fts_cjk_stale', 'fts_cjk_rebuild_high_water', 'fts_cjk_rebuild_progress',
@@ -189,7 +193,7 @@ def _policy(source, staged, recovered, ack):
     with contextlib.closing(_ro_connect(source)) as old, contextlib.closing(_immutable(staged)) as new:
         want, have = _tables(old), _tables(new)
         missing = sorted(want - have)
-        allowed = RUNTIME_TABLES if recovered else frozenset()
+        allowed = RUNTIME_TABLES | CURSOR_TABLES if recovered else frozenset()
         forbidden = sorted(set(missing) - allowed)
         if forbidden:
             raise Refusal(f'replacement lacks durable/unknown tables: {forbidden}')
@@ -200,6 +204,8 @@ def _policy(source, staged, recovered, ack):
             inventory[table] = {'source_rows': before, 'staged_rows': after}
             if recovered and table == 'runtime_epoch':
                 continue  # preserved separately as a monotonic floor, never reset to epoch 1
+            if recovered and table in CURSOR_TABLES:
+                continue  # derived cursor: reinstalled with a new epoch, so readers fall back to a full read
             if after < before and table != 'sqlite_sequence':
                 raise Refusal(f'durable/idempotency row loss in {table}: {before} -> {after}')
             # Preserve transcript/security/revocation/idempotency content exactly;

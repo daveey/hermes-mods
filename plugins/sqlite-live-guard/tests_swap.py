@@ -182,6 +182,28 @@ class SwapCLI(unittest.TestCase):
         with contextlib.closing(sqlite3.connect(self.db)) as con:
             self.assertEqual(con.execute('SELECT epoch FROM runtime_epoch').fetchone(), (42,))
 
+    @needs_proc
+    def test_session_change_cursor_may_be_rebuilt(self):
+        self.state()
+        cursor = ('CREATE TABLE session_change(session_id TEXT PRIMARY KEY NOT NULL, rev INTEGER NOT NULL) WITHOUT ROWID;'
+                  'CREATE TABLE session_change_revision(id INTEGER PRIMARY KEY CHECK (id = 1), revision INTEGER NOT NULL, epoch TEXT NOT NULL);')
+        self.add(self.db, cursor + 'INSERT INTO session_change VALUES("saved",1),("deleted",2);'
+                 'INSERT INTO session_change_revision VALUES(1,2,"old-epoch");')
+        self.add(self.replacement, cursor + 'INSERT INTO session_change VALUES("saved",1);'
+                 'INSERT INTO session_change_revision VALUES(1,1,"new-epoch");')
+        self.successful(self.cli('--recovered-state', '--ack-runtime-loss'))
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            self.assertEqual(con.execute('SELECT epoch FROM session_change_revision').fetchone(), ('new-epoch',))
+
+    @needs_proc
+    def test_session_change_cursor_is_not_exempt_without_recovered_state(self):
+        cursor = 'CREATE TABLE session_change(session_id TEXT PRIMARY KEY NOT NULL, rev INTEGER NOT NULL) WITHOUT ROWID;'
+        self.add(self.db, cursor + 'INSERT INTO session_change VALUES("saved",1),("deleted",2);')
+        self.add(self.replacement, cursor + 'INSERT INTO session_change VALUES("saved",1);')
+        result = self.cli()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('row loss in session_change', result.stderr)
+
     def test_fk_failure(self):
         self.add(self.replacement, 'CREATE TABLE parent(id INTEGER PRIMARY KEY); CREATE TABLE child(pid INTEGER REFERENCES parent(id)); INSERT INTO child VALUES(99);')
         result = self.cli('--stop-unit', 'fixture.service')
