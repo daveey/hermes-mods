@@ -2503,6 +2503,12 @@ def check_argv(argv, cwd=None, repos=None, env=None, _depth=0):
                 cwd = _path(w[2:], cwd, env)
         if words and words[0] == "push":
             return _push(words[1:], cwd, repos, config)
+    elif exe not in {"sh", "bash", "zsh", "dash"} and not re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", exe):
+        # Unknown exec-style wrappers must not hide a protected command. Match
+        # whole argv words, not quoted prose such as "gh pr merge".
+        for i, word in enumerate(words):
+            if os.path.basename(word) in {"gh", "git"}:
+                return check_argv(words[i:], cwd, repos, env, _depth + 1)
     return None
 
 
