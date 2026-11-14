@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -110,6 +111,7 @@ def _ledger():
 EXTRACTION_TTL_S = 900
 _EXTRACTION_CAP = 64
 _EXTRACTIONS: dict[tuple, tuple[float, str]] = {}
+_EXTRACTIONS_LOCK = threading.Lock()  # sessions of one gateway extract concurrently
 
 
 def shared_llm(system: str, user: str) -> str:
@@ -118,15 +120,17 @@ def shared_llm(system: str, user: str) -> str:
     fn = aux_llm
     key = (id(fn), hashlib.sha256(f"{system}\0{user}".encode()).hexdigest())
     now = _time.time()
-    hit = _EXTRACTIONS.get(key)
+    with _EXTRACTIONS_LOCK:
+        hit = _EXTRACTIONS.get(key)
     if hit is not None and now - hit[0] < EXTRACTION_TTL_S:
         return hit[1]
-    out = fn(system, user)
-    _EXTRACTIONS[key] = (now, out)
-    for k in [k for k, (t, _) in _EXTRACTIONS.items() if now - t >= EXTRACTION_TTL_S]:
-        _EXTRACTIONS.pop(k, None)
-    while len(_EXTRACTIONS) > _EXTRACTION_CAP:
-        _EXTRACTIONS.pop(next(iter(_EXTRACTIONS)))
+    out = fn(system, user)  # outside the lock: one slow model call never stalls another session's lookup
+    with _EXTRACTIONS_LOCK:
+        _EXTRACTIONS[key] = (now, out)
+        for k in [k for k, (t, _) in _EXTRACTIONS.items() if now - t >= EXTRACTION_TTL_S]:
+            _EXTRACTIONS.pop(k, None)
+        while len(_EXTRACTIONS) > _EXTRACTION_CAP:
+            _EXTRACTIONS.pop(next(iter(_EXTRACTIONS)))
     return out
 
 

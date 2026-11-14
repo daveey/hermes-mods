@@ -173,6 +173,47 @@ def test_quoting_or_naming_the_card_still_books_the_restatement(tmp_path):
     assert core.cited_cards(named, named, [other, entry]) == [other]  # naming the card cites it, and only it
 
 
+# Headingless close-outs answer several cards in plain paragraphs: a quote of one card's ask must not hide a
+# paraphrased relay of another card elsewhere in the reply (review of PR 194), while the reply right under the
+# quote ("Reply here.") still books to nothing else.
+KITCHEN = 't_0123456789abcdef'
+KITCHEN_ASK = ("Pick 'Turn it back on' or 'Keep it off' for the kitchen speaker microphone. It has been muted since "
+               "Tuesday after someone told it to stop listening. Unblock = the agent turns the microphone back on; "
+               "archive = it stays off.")
+PARAPHRASE = 'The kitchen speaker microphone is still muted: should the agent turn it back on, or keep it off?'
+PARA_STEP = {'text': 'Decide whether to turn the kitchen speaker microphone back on or keep it off', 'kind': 'input',
+             'verbatim_span': PARAPHRASE, 'options': []}
+
+
+def kitchen():
+    return card_entry(tid=KITCHEN, action=KITCHEN_ASK, title='Kitchen speaker microphone muted')
+
+
+def headingless(*middle):
+    return "\n\n".join(["Two cards still wait on you.", f"> {QUOTED_ASK}",
+                        "Reply here. My pick: accept the investigation, waive the replay, keep live proof.",
+                        *middle, PARAPHRASE])
+
+
+def test_headingless_quote_of_an_unlisted_card_does_not_hide_a_paraphrased_relay():
+    reply = headingless("Separately, the kitchen card from this morning:")
+    assert core.card_ask_for(PARA_STEP, [kitchen()], (), PARAPHRASE)['id'] == kitchen()['id']  # alone: maps
+    assert core.card_ask_for(PARA_STEP, [kitchen()], (), reply)['id'] == kitchen()['id']
+    assert core.cited_cards('Reply here.', reply, [kitchen(), card_entry()]) == []
+
+
+def test_headingless_quote_of_a_listed_card_does_not_hide_another_listed_cards_relay():
+    quoted = card_entry(tid='t_0a0a0a0a', action=QUOTED_ASK, title='Landing fix acceptance')
+    reply = headingless("Separately, the kitchen card from this morning:")
+    assert core.card_ask_for(PARA_STEP, [quoted, kitchen()], (), reply)['id'] == kitchen()['id']
+    assert core.cited_cards('Reply here.', reply, [quoted, kitchen(), card_entry()]) == [quoted]
+
+
+def test_headingless_reply_right_under_a_quote_still_names_its_card_by_id():
+    reply = f"> {QUOTED_ASK}\n\nAbout card {LOCAL_CARD} instead: reply here."
+    assert core.cited_cards('reply here.', reply, [card_entry(), kitchen()]) == [card_entry()]
+
+
 # ---- (a) the gate holds what the transform would mint -------------------------------------------------------
 
 FRESH = 'how are the four PRs doing?'
