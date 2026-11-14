@@ -701,6 +701,21 @@ def _merge_file(ours, base, theirs, cwd):
     return hashlib.sha1(b"blob %d\0" % len(p.stdout) + p.stdout).hexdigest()
 
 
+def _carry_merge_base(ours, theirs, repo, cwd, env, objects):
+    """The merge base of a carried merge's parents: from the chain's fetch when it holds a single base with
+    uncut history (t_01a1dadbf711c31c: the three gh compares were the heaviest calls of the carry wave),
+    else `compare/<ours>...<theirs>`'s `merge_base_commit` exactly as before."""
+    local = objects.merge_base(ours, theirs) if objects is not None else None
+    if local is not None:
+        return local
+    cmp = _gh_json(f"repos/{repo}/compare/{ours}...{theirs}", cwd, env)
+    mb = cmp.get("merge_base_commit")
+    mb = mb.get("sha") if isinstance(mb, dict) else None
+    if not isinstance(mb, str) or not _SHA.fullmatch(mb):
+        raise _Unreadable(f"the merge base of {ours[:10]} and {theirs[:10]} is unreadable")
+    return mb
+
+
 def _merge_tree_refusal(merge, ours, theirs, repo, cwd, env, cache, objects=None):
     """Why `merge` is not the clean auto-merge of `ours` and `theirs` (its first and second parent), else ''.
     `objects` (`_CarryObjects`) serves trees and blobs from the authoritative check's fetch; the predicate and
@@ -712,20 +727,16 @@ def _merge_tree_refusal(merge, ours, theirs, repo, cwd, env, cache, objects=None
             return fn(*args)
         except _Unreadable as exc:
             return exc
-    # The merge's own trees do not depend on its merge base: read them while the compare runs (one wave
-    # instead of two, t_01a1d96e71233fe1). Their errors wait until the merge base is known, so a compare
+    # The merge's own trees do not depend on its merge base: read them while the base is looked up (one wave
+    # instead of two, t_01a1d96e71233fe1). Their errors wait until the merge base is known, so a base read
     # failure keeps its priority; the memo (`_Once`) hands each tree to the check below unread twice.
-    got = _parallel([("carry tree/content check", held, (_gh_json, f"repos/{repo}/compare/{ours}...{theirs}",
-                                                         cwd, env))]
+    got = _parallel([("carry tree/content check", held,
+                      (_carry_merge_base, ours, theirs, repo, cwd, env, objects))]
                     + [("carry tree reads", held, (cache.get, s, _carry_tree, s, repo, cwd, env, objects))
                        for s in dict.fromkeys((ours, theirs, merge))])
-    cmp = got[0]
-    if isinstance(cmp, _Unreadable):
-        raise cmp
-    mb = cmp.get("merge_base_commit")
-    mb = mb.get("sha") if isinstance(mb, dict) else None
-    if not isinstance(mb, str) or not _SHA.fullmatch(mb):
-        raise _Unreadable(f"the merge base of {ours[:10]} and {theirs[:10]} is unreadable")
+    mb = got[0]
+    if isinstance(mb, _Unreadable):
+        raise mb
     base, o, t, got = _flat_trees((mb, ours, theirs, merge), repo, cwd, env, cache, objects)
     want, both = {}, []
     for path in sorted(set(base) | set(o) | set(t)):
@@ -763,20 +774,29 @@ def _merge_tree_refusal(merge, ours, theirs, repo, cwd, env, cache, objects=None
     return ""
 
 
+_FETCH_DEPTH = 128           # history fetched below each carried merge's tips (a merge base sits within it)
+
+
 class _CarryObjects:
     """One bounded shallow fetch of a carry chain's commits, shared by its merge proofs (t_01a1da82db1127a5).
 
     The authoritative check fetched merge/ours/theirs with full blobs for every merge while the API prefilter
     read the same immutable trees and blobs through `gh api git/trees|git/blobs`. Under the worker gh shim
     every concurrent call slows the others, and the prefilter's merge-base tree and blob reads ran as two
-    more serial waves, so a twice-updated state PR left the drift check ~2 s. Now the first authoritative
-    proof fetches every commit of the chain once (`--depth=128` from each tip, so at least the history each
-    per-merge fetch had), and the prefilter reads trees (`ls-tree -r -l`) and blobs (`cat-file`) from it.
+    more serial waves, so a twice-updated state PR left the drift check ~2 s. Now one fetch serves the whole
+    chain, and the prefilter reads trees (`ls-tree -r -l`), blobs (`cat-file`) and merge bases from it.
     Content addressing makes those the same entries; whatever the fetch lacks, or a refused fetch, falls back
-    to the gh reads, so every predicate and refusal (and its priority) is unchanged."""
+    to the gh reads, so every predicate and refusal (and its priority) is unchanged.
 
-    def __init__(self, repo, env, shas):
+    A carry fetches its head alone (t_01a1dadbf711c31c): every merge, first and second parent of the chain is
+    at most _CARRY_MERGES commits below it, so `--depth=_FETCH_DEPTH + _CARRY_MERGES` from the head keeps at
+    least _FETCH_DEPTH of history below each of them, as a per-merge fetch had. Needing no chain, the fetch
+    starts with the ancestry walk instead of after it."""
+
+    def __init__(self, repo, env, shas, chain=False):
         self.repo, self.shas = repo, list(dict.fromkeys(shas))
+        self.chain = chain                # shas = the carry head: the walk's merges sit within _CARRY_MERGES
+        self.depth = _FETCH_DEPTH + (_CARRY_MERGES if chain else 0)
         run_env = {k: v for k, v in {**os.environ, **env}.items() if not k.startswith("GIT_")}
         run_env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0")
         self.env = run_env
@@ -828,7 +848,7 @@ class _CarryObjects:
             self.git("init", "--bare", "--template=", "-q")
             # Fetch full blobs: avoids lazy fetch subprocesses inside merge-tree and
             # their separate auth/timeouts. Depth and wall time bound the attempt.
-            self.git("fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "--depth=128",
+            self.git("fetch", "--quiet", "--no-tags", "--no-recurse-submodules", f"--depth={self.depth}",
                      "https://github.com/" + self.repo + ".git", *self.shas)
         except _Unreadable as e:
             return str(e)
@@ -873,26 +893,45 @@ class _CarryObjects:
         except _Unreadable:
             return None
 
+    def _base(self, ours, theirs):
+        """(the single merge base of two fetched commits, '') when the shallow fetch kept all history above
+        it, else ('', why)."""
+        bases = self.git("merge-base", "--all", ours, theirs).split()
+        if len(bases) != 1 or not _SHA.fullmatch(bases[0]):
+            return "", "merge base is unreadable or multiple (cannot prove bounded history)"
+        shallow = Path(self.path, "shallow")
+        try:
+            cuts = set(shallow.read_text().split()) if shallow.exists() else set()
+        except (OSError, UnicodeError) as e:
+            return "", f"git merge-base could not complete ({type(e).__name__})"
+        if cuts:
+            relevant = set(self.git("rev-list", ours, theirs, "--not", bases[0]).split())
+            if cuts & relevant:
+                return "", "fetch depth cuts history before the merge base"
+        return bases[0], ""
+
+    def merge_base(self, ours, theirs):
+        """The prefilter's merge base from the fetch (t_01a1dadbf711c31c), or None (then it asks gh as before).
+        Only a single base with uncut history counts: then GitHub's `merge_base_commit` is that same commit."""
+        if not self._ready():
+            return None
+        try:
+            base, why = self._base(ours, theirs)
+        except _Unreadable:
+            return None
+        return None if why else base
+
     def verify(self, merge, ours, theirs):
         """The authoritative merge-tree refusal of one fetched merge, else ''."""
-        if not {merge, ours, theirs} <= set(self.shas):
+        if not self.chain and not {merge, ours, theirs} <= set(self.shas):
             return "merge-tree inputs are unreadable"
         try:
             parents = self.git("show", "-s", "--format=%P", merge).split()
             if parents != [ours, theirs]:
                 return "fetched merge parents differ from the reported parents"
-            bases = self.git("merge-base", "--all", ours, theirs).split()
-            if len(bases) != 1 or not _SHA.fullmatch(bases[0]):
-                return "merge base is unreadable or multiple (cannot prove bounded history)"
-            shallow = Path(self.path, "shallow")
-            try:
-                cuts = set(shallow.read_text().split()) if shallow.exists() else set()
-            except (OSError, UnicodeError) as e:
-                return f"git merge-base could not complete ({type(e).__name__})"
-            if cuts:
-                relevant = set(self.git("rev-list", ours, theirs, "--not", bases[0]).split())
-                if cuts & relevant:
-                    return "fetch depth cuts history before the merge base"
+            base, why = self._base(ours, theirs)
+            if why:
+                return why
             want = self.git("merge-tree", "--write-tree", ours, theirs)
             have = self.git("rev-parse", merge + "^{tree}")
         except _Unreadable as e:
@@ -942,50 +981,78 @@ def _carried_approval(head, data, repo, cwd, env):
     The newest _CARRY_CANDIDATES distinct approved heads are tried in turn (a comment naming the head and a
     base sha yields both); the first one's refusal reason is reported."""
     first = ""
-    for (_, h0), blocked in _earlier_approvals(data, head):
-        ok, why = _carry_one(head, h0, blocked, repo, cwd, env)
-        if ok:
-            return True, h0
-        first = first or why
+    candidates = _earlier_approvals(data, head)
+    # One fetch of the head serves every candidate: each earlier head is an ancestor of it (t_01a1dadbf711c31c).
+    objects = (_CarryObjects(repo, env, (head,), chain=True)
+               if _SHA.fullmatch(head) and any(not blocked for _, blocked in candidates) else None)
+    try:
+        for (_, h0), blocked in candidates:
+            ok, why = _carry_one(head, h0, blocked, repo, cwd, env, objects)
+            if ok:
+                return True, h0
+            first = first or why
+    finally:
+        if objects is not None:
+            objects.close()
     return False, first
 
 
-def _carry_one(head, h0, blocked, repo, cwd, env):
+def _carry_one(head, h0, blocked, repo, cwd, env, objects=None):
     lead = f"the approval of earlier head {h0[:10]} does not carry to it"
     if blocked:
         return False, f"{lead}: a blocking verdict came at or after that approval"
     if not _SHA.fullmatch(head):
         return False, f"{lead}: the head sha is unreadable"
-    try:
-        cmp = _gh_json(f"repos/{repo}/compare/{h0}...{head}", cwd, env)
-        if cmp.get("status") != "ahead" or cmp.get("behind_by") != 0:
-            return False, (f"{lead}: {h0[:10]} is not an ancestor of the head (compare status "
-                           f"{cmp.get('status')!r}; a rebase or force-push changed the PR)")
-        known = {}
-        listed = cmp.get("commits")
-        for c in listed if isinstance(listed, list) else []:
-            if isinstance(c, dict) and isinstance(c.get("sha"), str) and isinstance(c.get("parents"), list):
-                known[c["sha"]] = [p.get("sha") if isinstance(p, dict) else None for p in c["parents"]]
-        cur, bases, merges = head, [], []
-        while cur != h0:
-            if len(bases) >= _CARRY_MERGES:
-                return False, (f"{lead}: more than {_CARRY_MERGES} commits sit on the PR's first-parent line "
-                               f"after {h0[:10]}")
-            parents = known.get(cur)
-            if parents is None:
-                got = _gh_json(f"repos/{repo}/git/commits/{cur}", cwd, env).get("parents")
-                parents = [p.get("sha") if isinstance(p, dict) else None for p in got] if isinstance(
-                    got, list) else []
-            if not parents or not all(isinstance(p, str) and _SHA.fullmatch(p) for p in parents):
-                raise _Unreadable(f"the parents of {cur[:10]} are unreadable")
-            if len(parents) != 2:
-                return False, (f"{lead}: {cur[:10]} after it is not a merge of the base (a non-merge commit "
-                               "changes the PR)")
-            bases.append(str(parents[1]))
-            merges.append((cur, str(parents[0]), str(parents[1])))
-            cur = str(parents[0])
-    except _Unreadable as e:
-        return False, f"{lead}: {e}, so patch identity cannot be shown"
+    if objects is None:
+        objects = _CarryObjects(repo, env, (head,), chain=True)
+        try:
+            return _carry_one(head, h0, blocked, repo, cwd, env, objects)
+        finally:
+            objects.close()
+    # The head's fetch needs no chain, so it runs while the walk reads the chain and the gh proofs read their
+    # compares (t_01a1dadbf711c31c: at landing-host latency the walk's compare alone took 4.3 s and the fetch
+    # 9 s, one after the other). Every predicate, and the order its refusals are reported in, is unchanged:
+    # a refused fetch is the authoritative proof's refusal, read by `merge_proofs` as before. A walk that refuses
+    # waits for the fetch (every worker is joined): a refusal is no slower than the 9 s a carry costs anyway.
+    return _parallel([(_PREFLIGHT_STAGE.get(), _carry_chain, (head, h0, repo, cwd, env, objects)),
+                      ("carry git fetch/merge-tree", objects.fetch, ())])[0]
+
+
+def _carry_chain(head, h0, repo, cwd, env, objects):
+    lead = f"the approval of earlier head {h0[:10]} does not carry to it"
+
+    def walk():
+        """(refusal, []) or ('', [(merge, first parent, second parent), ...] newest first)."""
+        try:
+            cmp = _gh_json(f"repos/{repo}/compare/{h0}...{head}", cwd, env)
+            if cmp.get("status") != "ahead" or cmp.get("behind_by") != 0:
+                return (f"{lead}: {h0[:10]} is not an ancestor of the head (compare status "
+                        f"{cmp.get('status')!r}; a rebase or force-push changed the PR)"), []
+            known = {}
+            listed = cmp.get("commits")
+            for c in listed if isinstance(listed, list) else []:
+                if isinstance(c, dict) and isinstance(c.get("sha"), str) and isinstance(c.get("parents"), list):
+                    known[c["sha"]] = [p.get("sha") if isinstance(p, dict) else None for p in c["parents"]]
+            cur, chain = head, []
+            while cur != h0:
+                if len(chain) >= _CARRY_MERGES:
+                    return (f"{lead}: more than {_CARRY_MERGES} commits sit on the PR's first-parent line "
+                            f"after {h0[:10]}"), []
+                parents = known.get(cur)
+                if parents is None:
+                    got = _gh_json(f"repos/{repo}/git/commits/{cur}", cwd, env).get("parents")
+                    parents = [p.get("sha") if isinstance(p, dict) else None for p in got] if isinstance(
+                        got, list) else []
+                if not parents or not all(isinstance(p, str) and _SHA.fullmatch(p) for p in parents):
+                    raise _Unreadable(f"the parents of {cur[:10]} are unreadable")
+                if len(parents) != 2:
+                    return (f"{lead}: {cur[:10]} after it is not a merge of the base (a non-merge commit "
+                            "changes the PR)"), []
+                chain.append((cur, str(parents[0]), str(parents[1])))
+                cur = str(parents[0])
+        except _Unreadable as e:
+            return f"{lead}: {e}, so patch identity cannot be shown", []
+        return "", chain
 
     def outcomes(jobs):
         def capture(fn, *args):
@@ -1001,6 +1068,11 @@ def _carry_one(head, h0, blocked, repo, cwd, env):
         if isinstance(value, _Unreadable):
             raise value
         return value
+
+    why, merges = walk()
+    if why:
+        return False, why
+    bases = [theirs for _, _, theirs in merges]
 
     def membership_and_patch():
         try:
@@ -1029,9 +1101,8 @@ def _carry_one(head, h0, blocked, repo, cwd, env):
         # Immutable tree entries are read once across the concurrent merges (`_Once`).
         # No mutable decision or partially populated tree is cached here.
         ordered = list(reversed(merges))
-        # One authoritative fetch of the whole chain; the prefilter reads its trees and blobs from it
-        # instead of a gh call per tree and blob (t_01a1da82db1127a5).
-        objects = _CarryObjects(repo, env, [s for m in ordered for s in m])
+        # One authoritative fetch of the head serves the whole chain; the prefilter reads its trees, blobs and
+        # merge bases from it instead of a gh call each (t_01a1da82db1127a5, t_01a1dadbf711c31c).
 
         def authoritative(*args):
             try:
@@ -1054,8 +1125,6 @@ def _carry_one(head, h0, blocked, repo, cwd, env):
                     return f"{lead}: merge {merge[:10]} is not a clean, unedited merge of the base: {why}"
         except _Unreadable as e:
             return f"{lead}: {e}, so a clean merge cannot be shown"
-        finally:
-            objects.close()
         return ""
 
     # Once the bounded ancestry chain is known, these read-only proofs have no

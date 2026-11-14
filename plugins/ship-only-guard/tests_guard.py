@@ -26,6 +26,8 @@ def _no_land_turn(monkeypatch):
     # These cases pin the preflight's other gh calls; the land turn has its own fakes in tests_turn.py.
     monkeypatch.setattr(g, "_live_turns", lambda *a: [])
     monkeypatch.setattr(g, "_turn_acquire", lambda *a: "")
+    # Nor do they own the carry's head fetch, which starts with its ancestry walk (tests_carry.py).
+    monkeypatch.setattr(g._CarryObjects, "_fetch", lambda self: "git fetch is not run in these tests")
 
 
 @pytest.fixture

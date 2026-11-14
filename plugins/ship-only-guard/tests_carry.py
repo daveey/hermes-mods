@@ -30,6 +30,12 @@ def _no_land_turn(monkeypatch):
     # fixtures below explicitly restore the helper; never contact GitHub in tests.
     if hasattr(g, "_git_merge_tree_refusal"):
         monkeypatch.setattr(g, "_git_merge_tree_refusal", lambda *a: "")
+    # The carry starts its head fetch with the ancestry walk (t_01a1dadbf711c31c): without the verifier no
+    # fetch is read, so the prefilter reads its fakes below through gh, as with the lazy fetch before.
+    monkeypatch.setattr(g._CarryObjects, "_fetch", lambda self: "git fetch is not run in these tests")
+
+
+REAL_FETCH = g._CarryObjects._fetch
 
 R = "example/protected"
 H0 = "1fd079c68f8cc4aa5f887df5e6d3668945b68149"     # #2438's approved head
@@ -289,13 +295,16 @@ def test_two_base_merges_with_forty_newer_commits_fit_full_budget(monkeypatch):
         return run(argv, **kwargs)
     verified, fetched = [], []
     # The authoritative check's one fetch of the chain (t_01a1da82db1127a5) takes 3 s; the prefilter reads
-    # its trees from that fetch, as `git ls-tree -r -l -z` answers them, instead of through gh.
+    # its trees and merge bases from that fetch, as `git ls-tree -r -l -z` and `git merge-base --all` answer
+    # them, instead of through gh.
     def fetch(objects):
         time.sleep(3)
         fetched.append(list(objects.shas))
         objects.path = "fetched"
         return ''
     def local_git(objects, *args, binary=False):
+        if args[:2] == ("merge-base", "--all"):       # the prefilter's merge bases come from the fetch too
+            return {(H0, BASE_TIP): STATE_OLD, (mid, tip2): BASE_TIP}[args[2:4]]
         assert args[:4] == ("ls-tree", "-r", "-l", "-z"), args
         return b"".join(f"{e['mode']} {e['type']} {e['sha']} {e.get('size', '-'):>7}\t{e['path']}\0".encode()
                         for e in trees[args[4]]["tree"] if e["type"] != "tree")
@@ -311,8 +320,10 @@ def test_two_base_merges_with_forty_newer_commits_fit_full_budget(monkeypatch):
     assert result is None, result
     assert elapsed < 12, elapsed
     assert sorted(verified) == sorted([mid, H])
-    assert fetched == [[mid, H0, BASE_TIP, H, tip2]]          # one fetch for the whole chain
+    assert fetched == [[H]]          # one fetch of the head serves the whole chain (t_01a1dadbf711c31c)
     assert not [c for c in calls if "/git/trees/" in c[-1] or "/git/blobs/" in c[-1]]
+    gh_bases = (f"repos/{R}/compare/{H0}...{BASE_TIP}", f"repos/{R}/compare/{mid}...{tip2}")
+    assert not [c for c in calls if c[-1] in gh_bases]       # merge bases came from the fetch as well
     assert calls[-1][-1] == f"repos/{R}/compare/{STATE_OLD}...state"
 
 
@@ -854,6 +865,7 @@ def carry_local(monkeypatch, tmp_path, real_merges, name, fetch_failure=False):
         return REAL_RUN(argv, **kwargs)
     monkeypatch.setattr(g.subprocess, "run", run)
     monkeypatch.setattr(g, "_git_merge_tree_refusal", GIT_VERIFY)
+    monkeypatch.setattr(g._CarryObjects, "_fetch", REAL_FETCH)
     data = payload([review(f"Independent exact-head review at {h0}. **Verdict: approve**", commit=h0)])
     env = {"HERMES_HOME": str(tmp_path / "home")}
     result = g._carried_approval(heads[name], data, R, None, env)
@@ -955,6 +967,7 @@ def local_git_verifier(monkeypatch, tmp_path, repo, failure=None):
         return REAL_RUN(argv, **kw)
 
     monkeypatch.setattr(g.subprocess, "run", run)
+    monkeypatch.setattr(g._CarryObjects, "_fetch", REAL_FETCH)
     assert GIT_VERIFY is not None, "real merge-tree verifier missing"
     return calls
 
