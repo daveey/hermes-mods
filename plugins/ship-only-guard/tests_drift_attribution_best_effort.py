@@ -117,6 +117,79 @@ def test_once_single_flight():
     assert calls == ["t"] and out == [{"tree": "t"}] * 4
 
 
+@pytest.mark.parametrize("owner_fails", [False, True])
+def test_once_waiter_expires_while_owner_is_in_flight(monkeypatch, owner_fails):
+    """A waiter's budget must not become an unbounded wait on another reader.
+
+    Use a real blocked owner, but model the slot event's timeout and monotonic
+    clock together: no scheduler-dependent sleep or elapsed-time threshold.
+    The owner is released in finally, including when the deadline mutant fails.
+    """
+    g = load()
+    clock = at(g, monkeypatch, 2.0)
+    once = g._Once()
+    entered, release = threading.Event(), threading.Event()
+    calls, values, errors, waits = [], [], [], []
+
+    def read():
+        calls.append("owner")
+        entered.set()
+        release.wait()
+        if owner_fails:
+            raise RuntimeError("owner failed")
+        return {"tree": "t"}
+
+    def own():
+        try:
+            values.append(once.get("t", read))
+        except BaseException as exc:
+            errors.append(exc)
+
+    owner = threading.Thread(target=own)
+    owner.start()
+    try:
+        assert entered.wait(5), "owner did not enter the read"
+        slot = once._slots["t"]
+        event = slot[0]
+
+        class ExpiringWait:
+            def wait(self, timeout=None):
+                waits.append(timeout)
+                # An unbounded wait is itself the regression: refuse it rather
+                # than hanging the test process until an outer test timeout.
+                assert timeout is not None and timeout > 0, "waiter requested an unbounded wait"
+                assert not event.is_set() and not release.is_set()
+                clock.now += timeout
+                return event.wait(0)
+
+            def set(self):
+                event.set()
+
+        slot[0] = ExpiringWait()
+        with pytest.raises(g._PreflightExpired):
+            once.get("t", lambda: pytest.fail("waiter started a duplicate read"))
+        assert waits == [2.0]
+        assert owner.is_alive() and not release.is_set()
+        assert not event.is_set() and once._slots["t"] is slot
+        assert calls == ["owner"] and values == [] and errors == []
+    finally:
+        release.set()
+        owner.join(5)
+    assert not owner.is_alive(), "owner was not cleaned up"
+    assert event.is_set(), "owner must wake any remaining waiters"
+    if owner_fails:
+        assert values == [] and len(errors) == 1
+        assert isinstance(errors[0], RuntimeError) and str(errors[0]) == "owner failed"
+        assert "t" not in once._slots
+        assert once.get("t", lambda: "retry") == "retry"
+    else:
+        assert errors == [] and values == [{"tree": "t"}]
+        # Read the completed memo under a fresh budget (not the expired waiter).
+        g._PREFLIGHT_DEADLINE.set(clock.now + 2.0)
+        slot[0] = event
+        assert once.get("t", lambda: pytest.fail("owner result was not memoized")) == values[0]
+
+
 def test_once_memoizes_unreadable_but_not_other_failures():
     g = load()
     once, calls = g._Once(), []
