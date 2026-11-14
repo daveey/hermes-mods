@@ -102,6 +102,34 @@ def _ledger():
     return core.Ledger()
 
 
+# One extraction per reply. The pre-send gate (publication_buffer) and the transform (process_reply) read the same
+# reply with the same listing (core.reply_listing); each calling the model separately let the two disagree, and a
+# restated ask the gate had read as a plain repeat was minted by the transform as a second tile with no hold
+# (MacBook chat ..bef6c6). The transform reuses the gate's answer for the identical prompt instead. Keyed by the
+# model function too, so a different extractor (tests swap aux_llm) never sees another's answer.
+EXTRACTION_TTL_S = 900
+_EXTRACTION_CAP = 64
+_EXTRACTIONS: dict[tuple, tuple[float, str]] = {}
+
+
+def shared_llm(system: str, user: str) -> str:
+    import hashlib
+    import time as _time
+    fn = aux_llm
+    key = (id(fn), hashlib.sha256(f"{system}\0{user}".encode()).hexdigest())
+    now = _time.time()
+    hit = _EXTRACTIONS.get(key)
+    if hit is not None and now - hit[0] < EXTRACTION_TTL_S:
+        return hit[1]
+    out = fn(system, user)
+    _EXTRACTIONS[key] = (now, out)
+    for k in [k for k, (t, _) in _EXTRACTIONS.items() if now - t >= EXTRACTION_TTL_S]:
+        _EXTRACTIONS.pop(k, None)
+    while len(_EXTRACTIONS) > _EXTRACTION_CAP:
+        _EXTRACTIONS.pop(next(iter(_EXTRACTIONS)))
+    return out
+
+
 def _declared_steps(session_id: str) -> list[dict]:
     """This chat's open session_outcome(decide) ledger steps (explicitly declared decisions), oldest first."""
     try:
@@ -418,7 +446,7 @@ def transform_llm_output(response_text: str = "", session_id: str = "", platform
                 _trace(hook="transform", session=session_id, platform=platform, reconcile_error=repr(exc)[:300])
         user_msg = _USER_MSG.pop(session_id, "")
         out = core.process_reply(
-            response_text, session_id, user_msg=user_msg, llm=aux_llm, ledger=_ledger(),
+            response_text, session_id, user_msg=user_msg, llm=shared_llm, ledger=_ledger(),
             cards=None, framed=_framed(session_id),
             action_store=core.ActionStore(timeout=HOOK_DB_TIMEOUT) if action_owner else None,
             action_owner=action_owner, turn_requests=_TURN_PUBLISHED.pop(session_id, set()),
@@ -546,17 +574,18 @@ def publication_buffer(session_id='', platform='', final_response='', attempt=0,
     # A blocked card's own ask is a request too: a reply relaying it needs no new approval (no hold, no nudge to
     # publish a second, unlinked one).
     card_asks = _card_asks(session_id, _USER_MSG.get(session_id, ''))
-    res = core.extract(final_response, [{'id': a['id'], 'kind': a['kind'], 'text': a['title']} for a in open_asks]
-                       + [{'id': e['id'], 'kind': e['kind'], 'text': core.card_ask_listing(e)} for e in card_asks],
-                       '', aux_llm, continuity=True, elsewhere=core.elsewhere_titles(store, owner) if relay else [])
+    # The transform's own listing, user message and extraction (core.reply_listing, shared_llm): the gate must
+    # judge the asks the transform will mint, not a second model reading of the reply.
+    listed, tiles = core.reply_listing(_ledger().open_steps(session_id), store, owner, card_asks)
+    res = core.extract(final_response, listed, _USER_MSG.get(session_id, ''), shared_llm, continuity=True,
+                       elsewhere=core.elsewhere_titles(store, owner) if relay else [])
     steps = [s for s in res.get('steps', []) if isinstance(s, dict)]
     approvals = [s for s in steps if s.get('kind') == 'approve']
     if not approvals and not open_asks:
         return None
     # An uncorroborated model repeat maps nothing (core.split_repeats): the other rules judge that sentence.
-    tiles = {a['id']: core.tile_texts(a) for a in open_asks}
+    tiles.update({a['id']: core.tile_texts(a) for a in open_asks})
     tiles.update({a['step']['id']: core.tile_texts(a) for a in open_asks if a.get('step') and a['step'].get('id')})
-    tiles.update({e['id']: core.tile_texts(e) for e in card_asks})
     res['repeats'] = core.split_repeats(res.get('repeats') or (), tiles, final_response)[0]
     ready = {r['requestId'] for r in store.requests(owner)
              if r['kind'] == 'approval' and r['state'] == 'open' and r['scope']['complete'] and not r.get('resolution')
@@ -583,6 +612,13 @@ def publication_buffer(session_id='', platform='', final_response='', attempt=0,
     held = open_ask_hold(session_id, final_response, open_asks, [s for s, hit in hits if hit is None], relay,
                          store, owner, attempt, hold_budget, turn_messages,
                          candidates=[s for s, hit in hits if hit is None or hit[0] != 'card'])
+    if open_asks and held is None:
+        # A pass with an open request is the decision this gate can get wrong silently: record what it read, so a
+        # tile minted beside an open one can be traced to the gate's reading (none was written for ..bef6c6).
+        _trace(hook='publication_buffer', session=session_id, verdict='pass', attempt=attempt,
+               open=[a['id'] for a in open_asks], steps=len(steps),
+               unmapped=[str(s.get('verbatim_span') or '')[:120] for s, hit in hits if hit is None],
+               repeats=[r.get('id') for r in res.get('repeats') or () if isinstance(r, dict)])
 
     def covered(hit):
         return hit is not None and (hit[0] == 'card' or hit[1]['id'] in ready)
