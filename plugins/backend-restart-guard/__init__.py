@@ -230,7 +230,57 @@ def _inspection_ssh_options(opts: list) -> list:
     return safe
 
 
+def _canonical_pool_bootstrap(text: str) -> bool:
+    """Recognize only our sibling pool launcher's complete default-home payload.
+
+    The pool borrows the runtime bootstrap, not the backend entry point. Keep
+    unknown/custom wrappers protected: a filename substring is not provenance.
+    ps flattens argv without quoting; support that and shell-quoted snapshots.
+    This is classification only, not permission to stop an owned pool service.
+    """
+    try:
+        argv = shlex.split(text)
+        if len(argv) >= 5 and argv[1:3] == ['-I', '-c'] and argv[4] == 'serve':
+            executable, code, tail = argv[0], argv[3], argv[4:]
+        else:
+            executable, sep, rest = text.partition(' -I -c ')
+            code, role, suffix = rest.rpartition(' serve')
+            if not sep or not role:
+                return False
+            tail = ['serve', *shlex.split(suffix)]
+        if any(c.isspace() for c in executable) or not re.fullmatch(r'python(?:\d+(?:\.\d+)*)?', os.path.basename(executable)):
+            return False
+        # Bound AST work before parsing arbitrary process-table text.
+        if len(code) > 4096 or not code.startswith('import os, sys, runpy; '):
+            return False
+        if tail != ['serve'] and not (len(tail) == 3 and tail[:2] == ['serve', '--port'] and tail[2].isdigit()):
+            return False
+        tree = ast.parse(code)
+        # The fifth statement is the canonical sys.path.insert. Full AST
+        # equality below validates the rest, including this call's target.
+        statement = tree.body[4]
+        if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call):
+            return False
+        root = ast.literal_eval(statement.value.args[1])
+        if not isinstance(root, str) or not os.path.isabs(root):
+            return False
+        module = str(Path(__file__).resolve().parent.parent / 'pool-llm' / 'pool_llm.py')
+        expected = (
+            "import os, sys, runpy; os.environ.pop('PYTHONHOME', None); "
+            "os.environ.pop('PYTHONPATH', None); os.environ.pop('VIRTUAL_ENV', None); "
+            f"sys.path.insert(0, {root!r}); sys._hermes_pin_default_home = True; "
+            "import hermes_bootstrap; os.environ.get('HERMES_HOME') or "
+            "os.environ.__setitem__('HERMES_HOME', str(__import__('hermes_constants').get_default_hermes_root())); "
+            f"sys.argv = [{module!r}] + sys.argv[1:]; runpy.run_path({module!r}, run_name='__main__')")
+        return ast.dump(tree) == ast.dump(ast.parse(expected))
+    except (ValueError, SyntaxError, AttributeError, IndexError, TypeError, RecursionError, MemoryError):
+        # A failed exemption must not abort the enclosing gateway census.
+        return False
+
+
 def _backend_argv(text: str) -> bool:
+    if _canonical_pool_bootstrap(text):
+        return False
     try:
         argv = shlex.split(text)
     except ValueError:
