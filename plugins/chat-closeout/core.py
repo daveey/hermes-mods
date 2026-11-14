@@ -627,9 +627,20 @@ def _board_rows(path: Path, left: list[str], light: bool) -> tuple[list[dict[str
                 read_inventory = None  # old core: acceptance remains unspecified
             board = path.parent.name if path.parent.parent.name == 'boards' else 'default'
             later = _later_comments(conn, left, bool(has_runs), comp)
+            history = None
+            try:
+                from hermes_cli.kanban_completion_receipt_projection import read_completed_many
+                from hermes_cli.kanban_origin import gateway_names
+                gateway = gateway_names()[0]
+                if gateway:
+                    # Same authority rules as read_inventory (created_on wins), one projection per board.
+                    history = read_completed_many(conn, left, board=board, gateway=gateway)
+            except (ValueError, TypeError, ImportError, OSError, sqlite3.Error):
+                pass  # old core/schema: retain the existing per-task optional projection
             for r in conn.execute(full.format(ph=ph), left):
                 try:
-                    historical = read_inventory(conn, r['id'], board=board) if read_inventory else None
+                    historical = (history.get(r['id']) if history is not None else
+                                  read_inventory(conn, r['id'], board=board) if read_inventory else None)
                 except (ValueError, TypeError, ImportError, OSError, sqlite3.Error):
                     historical = None  # optional history cannot change settlement/readability
                 rows.append({**dict(r), 'parents': tuple(parents.get(r['id'], [])), **(historical or {}),

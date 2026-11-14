@@ -1754,7 +1754,25 @@ def _lineages(sids: list[str]) -> Optional[dict[str, list]]:
     """``{sid: lineage watermark}`` (``wi.lineage_key`` of the chat and its compression tip) for every chat, None
     when a state.db can't be read. The tip is looked up again only when the chain's end markers moved."""
     with _lineage_lock:
-        return _lineages_locked(sids)
+        # Reuse the assembled projection as well as the SQL rows. The stat is
+        # only a process-local probe gate, exactly as in LineageWatch; the
+        # published key remains the per-lineage content watermark (R11).
+        def probe():
+            return tuple((str(p), wi.file_stat(p)) for p in state_dbs())
+        before = probe()
+        key = (tuple(sids), before)
+        with _wi_lock:
+            hit = _wi.get("lineage_projection")
+        if hit is not None and hit[0] == key:
+            return hit[1]
+        result = _lineages_locked(sids)
+        after = probe()
+        with _wi_lock:
+            if result is not None and after == before:
+                _wi["lineage_projection"] = (key, result)
+            else:
+                _wi.pop("lineage_projection", None)
+        return result
 
 
 def _lineages_locked(sids: list[str]) -> Optional[dict[str, list]]:

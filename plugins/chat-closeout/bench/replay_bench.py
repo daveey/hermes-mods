@@ -115,7 +115,8 @@ def build(home: Path, rng: random.Random, sessions: int, messages: int, tasks: i
         conn.close()
     hub = home / "hub.db"
     with sqlite3.connect(hub) as conn:
-        conn.execute("CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, seq INTEGER, data TEXT, "
+        conn.execute("CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, version INTEGER DEFAULT 1, "
+                     "seq INTEGER, data TEXT, updated_at INTEGER DEFAULT 0, "
                      "PRIMARY KEY (gw, coll, key))")
         conn.execute("CREATE INDEX replica_coll ON replica (coll)")  # the hub's own indexes (hermes-hub hub.db)
         conn.execute("CREATE INDEX replica_poll_metadata ON replica (coll, gw, seq)")
@@ -127,10 +128,10 @@ def build(home: Path, rng: random.Random, sessions: int, messages: int, tasks: i
             gw = f"worker-{i % 8}"
             rrows.append((gw, "tasks", f"default/default/t_r{i:06d}", seq,
                           json.dumps({"id": f"t_r{i:06d}", "status": "running", "activity_at": 1.0})))
-        conn.executemany("INSERT INTO replica VALUES (?,?,?,?,?)", rrows)
+        conn.executemany("INSERT INTO replica (gw, coll, key, seq, data) VALUES (?,?,?,?,?)", rrows)
         for gw in ("hub", "macbook", "mini"):
             seq += 1
-            conn.execute("INSERT INTO replica VALUES (?,?,?,?,?)", (gw, "gateway", "info", seq, json.dumps({})))
+            conn.execute("INSERT INTO replica (gw, coll, key, seq, data) VALUES (?,?,?,?,?)", (gw, "gateway", "info", seq, json.dumps({})))
         conn.execute("INSERT INTO meta VALUES ('last_ok', ?)", (str(time.time()),))
     # Ledger: pending rows over the first sessions; half their batches settled and unreported (waiting).
     plugin_core = None
