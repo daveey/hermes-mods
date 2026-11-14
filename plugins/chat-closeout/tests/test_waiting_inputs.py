@@ -381,20 +381,29 @@ def test_an_unreadable_board_key_counts_as_a_fallback_not_an_error(world, monkey
     assert poll() == {'c1': ['t_1'], 'c2': ['t_2']}
 
 
-def test_a_real_read_failure_still_counts_as_an_error(world, monkeypatch):
-    """Any other exception escapes inside the pass: an error (with its class where core records it), not a fallback."""
+@pytest.mark.parametrize('error_type', [
+    plugin.wi.Unvouched,
+    LookupError,
+    sqlite3.OperationalError,
+], ids=['Unvouched', 'LookupError', 'OperationalError'])
+def test_a_real_read_failure_still_counts_as_an_error(world, monkeypatch, error_type):
+    """Only Unportable is a fallback; other input failures escape through accounting unchanged."""
     la = pytest.importorskip('hermes_cli.loop_accounting')
+    failure = error_type('waiting input cannot be read')
 
-    def broken():
-        raise sqlite3.OperationalError('database is locked')
+    def broken(rows, now):
+        assert {row['session_id'] for row in rows} == {'c1', 'c2', 'c3'}
+        raise failure
 
-    monkeypatch.setattr(plugin, '_pending_rows', broken)
+    monkeypatch.setattr(plugin, '_input_parts', broken)
     before = _acct(la, 'chat-closeout.waiting_inputs')
-    with pytest.raises(sqlite3.OperationalError):
+    with pytest.raises(error_type) as caught:
         plugin.waiting_inputs()
+    assert caught.value is failure
     after = _acct(la, 'chat-closeout.waiting_inputs')
     assert after['runs'] - before['runs'] == 1
     assert after['errors'] - before['errors'] == 1
     assert after['fallbacks'] - before['fallbacks'] == 0
     if 'error_kinds' in (la.counters().get('chat-closeout.waiting_inputs') or {}):
-        assert after['error_kinds'].get('OperationalError', 0) - before['error_kinds'].get('OperationalError', 0) == 1
+        kind = error_type.__name__
+        assert after['error_kinds'].get(kind, 0) - before['error_kinds'].get(kind, 0) == 1
