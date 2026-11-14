@@ -75,7 +75,11 @@ no-op.
 - `chat-closeout.waiting_moved`: conditional reconcile CPU and rows on input-moved passes only; `cpu_s / runs`
   measures triggering-pass reconcile cost for C15. Cold initialization counts as moved.
 - `chat-closeout.waiting_fallback`: conditional reconcile cost when no trustworthy input key was available.
-- `chat-closeout.waiting_inputs`: the key computation core runs on each annotation fingerprint.
+- `chat-closeout.waiting_inputs`: the key computation core runs on each annotation fingerprint. An input with no
+  portable key (`Unportable`, e.g. a zero-budget `BoardLifecycleBusy` board read) is the designed no-adoption
+  signal: it counts as a `fallback`, never an `error`, and is re-raised outside the pass so core still skips
+  adoption and runs `waiting_source`. Only a real failure (`sqlite3.OperationalError`, an unreadable state.db...)
+  counts in `errors`; cores that keep `error_kinds` name its class there.
 - `chat-closeout.wake_tick`, with the same fields, plus `owner_wake_tick`, `owner_relay_tick` and `watchdog_tick`.
 
 Card B budgets triggering-pass cost using `waiting_moved` and charges key probes separately. The moved/fallback
