@@ -7,6 +7,7 @@ import json
 import marshal
 import math
 import os
+from operator import itemgetter
 import pickle
 from datetime import datetime
 from functools import lru_cache
@@ -92,11 +93,12 @@ class _Carry:
     state, the output row, its projection, its provenance entry, when computed); hosts maps a host id to (its
     host result, its maintenance) as that build saw them."""
 
-    __slots__ = ('current', 'built_at', 'rows', 'hosts', 'computed')
+    __slots__ = ('current', 'built_at', 'rows', 'hosts', 'computed', 'blocks')
 
     def __init__(self, current, built_at):
         self.current, self.built_at = current, built_at
         self.rows, self.hosts, self.computed = {}, {}, 0
+        self.blocks = []
 
 
 @dataclass
@@ -175,6 +177,63 @@ def _same_state(a, b):
     left.update(_LIVENESS_ONLY)
     right.update(_LIVENESS_ONLY)
     return left == right
+
+
+_STATE_KEYS = frozenset(State.__dataclass_fields__)
+_STATE_VALUES = itemgetter(*(key for key in State.__dataclass_fields__ if key not in _LIVENESS_ONLY))
+
+
+def _state_signature(state):
+    if state.keys() == _STATE_KEYS:
+        return _STATE_VALUES(state)
+    # Keep unknown/missing keys: ignoring them would hide a State constructor error.
+    normalized = state.copy()
+    normalized.update(_LIVENESS_ONLY)
+    return normalized
+
+
+def _carry_sources(snap, carry, built, host_results, maintenance, now, rows, projections, provenance):
+    """Yield dirty blocks to the ordinary row path; carry equal blocks in C-sized batches.
+
+    Retain the ORIGINAL row computation times and flip bounds, not the latest build
+    time. A carried block never refreshes its own lease. The caller still owns the
+    global 30-second ceiling, configuration and snapshot-currentness invalidation.
+    """
+    sources = snap['runners'] if snap else []
+    if built is None or len({src['id'] for src in sources}) != len(sources):
+        yield from sources
+        return
+    inputs = {}
+    for src in sources:
+        hid = src.get('host_id')
+        if hid not in inputs:
+            inputs[hid] = (host_results.get(hid), maintenance.get(hid, {}))
+    built.hosts.update(inputs)
+    same_hosts = {hid for hid, value in inputs.items()
+                  if carry is not None and carry.hosts.get(hid, _NO_CARRY) == value}
+    # Small blocks retain reuse with scattered re-observations (not just a
+    # favorable contiguous prefix). Large blocks dirty almost the whole fleet.
+    block_size = 8
+    for index, start in enumerate(range(0, len(sources), block_size)):
+        chunk = sources[start:start + block_size]
+        states = [_state_signature(snap['states'][src['id']]) for src in chunk]
+        old = carry.blocks[index] if carry is not None and index < len(carry.blocks) else None
+        if (old is not None and old[5] <= now < old[6] and old[7] <= same_hosts
+                and old[0] == chunk and old[1] == states):
+            built.rows.update(old[2])
+            rows.extend(old[3]); projections.extend(old[4])
+            for rid, entry in old[2].items():
+                if entry[4] is not None:
+                    provenance.append(dict(entry[4], collection_id=snap['states'][rid]['cycle']))
+            built.blocks.append(old)
+            continue
+        offset = len(rows)
+        yield from chunk
+        entries = {src['id']: built.rows[src['id']] for src in chunk}
+        floor = max(entry[5] for entry in entries.values())
+        deadline = min(min(entry[6], entry[5] + ROWS_MAX_S) for entry in entries.values())
+        built.blocks.append((chunk, states, entries, rows[offset:], projections[offset:],
+                             floor, deadline, {src.get('host_id') for src in chunk}))
 
 
 def _file_key(path):
@@ -316,6 +375,12 @@ class Service:
             result, rows = self._inventory(snap, read.overlay, copy_rows=False, carry=carry, now=now)
             acct.rows(rows.computed)
             until = min(self._flips(snap, result['data']['hosts'], now), now + REUSE_MAX_S)
+            # A late carried build must not extend original row leases through a
+            # result-memo hit. Blocks already aggregate their original deadlines.
+            if rows.blocks:
+                until = min(until, min(block[6] for block in rows.blocks))
+            elif rows.rows:
+                until = min(until, min(entry[5] + ROWS_MAX_S for entry in rows.rows.values()))
             fresh = _Result(key, now, until, result, rows)
             with _MEMO_LOCK:
                 _RESULTS[path] = fresh
@@ -401,7 +466,8 @@ class Service:
         maintenance_by_host = {}
         for host in hosts:
             maintenance_by_host.setdefault(host['id'], host['maintenance'])
-        for src in snap['runners'] if snap else ():
+        for src in _carry_sources(snap, carry, built, host_results, maintenance_by_host,
+                                  now, rows, projections, meta['provenance']):
             rid, hid = src['id'], src.get('host_id')
             observed = snap['states'][rid]
             maintenance=maintenance_by_host.get(hid, {})
