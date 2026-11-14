@@ -2707,6 +2707,9 @@ def test_quoted_definition_real_restore_stays_refused(multi, definition, stored)
     ("'time -- alias' g=git", False),
     ("'time -p -- alias' g=git", False),
     ("'time -p builtin alias' g=git", False),
+    ("'if alias' g=git '; then :; fi'", False),
+    ("'while alias' g=git '; do break; done'", False),
+    ("'until alias' g=git '; do :; done'", False),
 ])
 def test_concatenated_definition_real_restore_stays_refused(multi, payload, stored):
     main, wt = multi
@@ -2778,13 +2781,33 @@ def test_alias_taint_unterminated_quote_keeps_whole_text_reading():
 
 @pytest.mark.parametrize("cmd", [
     "echo 'the alias file'",
-    "tool --reply 'alias/import nit'",
-    "tool --reply \"an alias, then more\"",
-    "tool --a 'x' --b \"y alias z\"",
     "no such word here",
 ])
 def test_alias_taint_helper_ignores_prose_only(cmd):
     assert not guard._may_define_alias(cmd), cmd
+
+
+@pytest.mark.parametrize('cmd', [
+    "tool --reply 'alias/import nit'",
+    'tool --reply "an alias, then more"',
+    'tool --a \'x\' --b "y alias z"',
+    "eval 'if alias' g=git '; then :; fi'",
+    "eval 'while alias' g=git '; do break; done'",
+    "eval 'until alias' g=git '; do :; done'",
+    "PAYLOAD='ordinary alias prose'; eval \"$PAYLOAD\"",
+])
+def test_unknown_consumers_keep_whole_text_taint(cmd):
+    assert guard._may_define_alias(cmd)
+
+
+@pytest.mark.parametrize('prefix,suffix', [
+    ('eval ', ''), ('PAYLOAD=', ''), ('', '; eval "$PAYLOAD"'),
+    ('', '\ng stash pop'), ('echo "$(' , ')"'),
+    ('', ' > output'), ('', ' | bash'), ('', ' # comment'),
+])
+def test_broker_prose_exemption_does_not_cross_shell_boundaries(prefix, suffix):
+    cmd = BROKER_SHIP.format(reason="'Land PR 1'", reply=shlex.quote(PROSE))
+    assert guard._may_define_alias(prefix + cmd + suffix)
 
 
 @pytest.mark.parametrize("template", [

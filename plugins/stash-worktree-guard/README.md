@@ -216,20 +216,18 @@ a `pop`/`apply` word piped into a shell, an unknown `declare -n` target, or a da
 of an unmodeled program that holds a restore command, such as `ssh host "git stash pop"`).
 This remains bounded shell analysis, not a shell sandbox. Known limits: shell aliases
 defined before the command (an `alias` in the command makes every unmodeled name a
-possible git; the word counts when it is unquoted or starts a command inside a quoted string,
-so prose such as `--review-reply 'alias/import nit'` does not taint a brokered
-`token-broker exec … -- env … hermes-core-wt ship`, while heredocs, `$'…'` text, substitutions
-inside double quotes and unterminated quotes keep the whole-text reading; quoted payloads
-containing `alias` plus nested quote, backslash, assignment (`=`), negation (`!`),
-redirection (`<>`) or expansion (`$`) syntax also retain taint (including when `eval`
-joins separate arguments). A command-prefix word before `alias` also retains taint
-across arbitrary intervening options/operands (for example `time -p -- alias`), rather
-than trying to enumerate each prefix grammar. This deliberately includes ambiguous prose.
-Only standalone quoted words qualify for the prose exemption: adjacency to another
-quoted or unquoted fragment retains taint, because concatenation can supply assignment
-syntax outside the quoted fragment. Later shell quote removal, line joining or
-assignment/redirection/negation prefixes can turn these into executable definitions,
-including stored-then-evaluated payloads),
+possible git, except for narrowly recognized literal data positions). The exemption
+accepts a single expansion-free `echo`, or the canonical
+`token-broker exec --scope user/github --reason … -- env GIT_…=… /absolute/hermes-core-wt ship …`
+shape: only quoted `--reason` and `--review-reply` values are inert there. Git identity/config
+assignments and the documented ship options are recognized; unknown consumers, extra commands,
+redirections, pipelines, comments, newlines, substitutions and escapes keep whole-text taint.
+Trailing empty semicolon statements emitted by the activation adapter are ignored. Shell words
+are assembled before classification, not assessed as individual quoted fragments. This is
+intentionally narrower than a general prose detector: quoted eval arguments, stored payloads,
+conditional prefixes and option-bearing prefixes retain taint regardless of their wording.
+The four brokered-prose acceptance controls and all real-repository restore regressions are
+retained. Other known limits include
 Git aliases already stored in repository/user config, `shopt -s lastpipe`, `set -e`,
 exported functions, inherited state of a persistent terminal (logical `PWD`, exported
 `IFS`/`CDPATH`/`GIT_DIR`, `set -a`), scripts whose text is not in the command (a file
