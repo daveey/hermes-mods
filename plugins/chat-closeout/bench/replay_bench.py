@@ -102,13 +102,17 @@ def build(home: Path, rng: random.Random, sessions: int, messages: int, tasks: i
                          "VALUES (?,?,?,?,?,1)", rows)
     board = home / "kanban.db"
     tids = [f"t_{i:06d}" for i in range(tasks)]
-    with sqlite3.connect(board) as conn:
-        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, block_kind TEXT, "
-                     "completed_at REAL)")
-        conn.executemany("INSERT INTO tasks VALUES (?,?,?,?,?)",
+    from hermes_cli.kanban_db_connect import connect
+    conn = connect(db_path=board)
+    try:
+        conn.executemany("INSERT INTO tasks (id, title, status, block_kind, completed_at, created_at) "
+                         "VALUES (?,?,?,?,?,?)",
                          [(t, f"task {t}", "done" if rng.random() < 0.7 else "running", None,
-                           100.0 if True else None) for t in tids])
+                           100.0, 1) for t in tids])
         conn.execute("UPDATE tasks SET completed_at = NULL WHERE status != 'done'")
+        conn.commit()
+    finally:
+        conn.close()
     hub = home / "hub.db"
     with sqlite3.connect(hub) as conn:
         conn.execute("CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, seq INTEGER, data TEXT, "
@@ -147,9 +151,19 @@ def main() -> int:
     ap.add_argument("--json", type=Path)
     ap.add_argument("--diagnostic", action="store_true", help="report only; do not fail on the CPU budgets")
     args = ap.parse_args()
-    # Start away from a floor boundary so the measured interval includes a rollover.
-    with ReplayClock(wall=(time.time() // 600) * 600 + 30) as clock:
-        return _run(args, clock)
+    env_keys = ('HERMES_HOME', 'HERMES_KANBAN_HOME', 'HERMES_KANBAN_DB', 'HERMES_KANBAN_BOARD', 'HERMES_HUB_STATE',
+                'HERMES_MAIL_CONFIG', 'CHAT_CLOSEOUT_OFF')
+    previous = {k: os.environ.get(k) for k in env_keys}
+    try:
+        # Start away from a floor boundary so the measured interval includes a rollover.
+        with ReplayClock(wall=(time.time() // 600) * 600 + 30) as clock:
+            return _run(args, clock)
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _run(args, clock: ReplayClock) -> int:
@@ -157,6 +171,14 @@ def _run(args, clock: ReplayClock) -> int:
     with tempfile.TemporaryDirectory(prefix="closeout-bench-") as tmp:
         home = Path(tmp)
         os.environ["HERMES_HOME"] = str(home)
+        os.environ["HERMES_KANBAN_HOME"] = str(home / "kanban")
+        # Core readers use these independently of the plugin's injected paths. Never inherit a worker's
+        # live board/replica: that contaminates timings and can admit real owner-wake work into a replay.
+        os.environ["HERMES_KANBAN_DB"] = str(home / "kanban.db")
+        os.environ["HERMES_KANBAN_BOARD"] = "default"
+        os.environ["HERMES_HUB_STATE"] = str(home)
+        os.environ["HERMES_MAIL_CONFIG"] = str(home / "mail.json")
+        (home / "mail.json").write_text('{"gateway":"hub"}')
         os.environ.pop("CHAT_CLOSEOUT_OFF", None)
         t0 = time.perf_counter()
         world = build(home, rng, args.sessions, args.messages, args.tasks, args.replica_rows, args.pending)

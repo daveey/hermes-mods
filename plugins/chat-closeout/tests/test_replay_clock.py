@@ -3,6 +3,7 @@ import importlib.util
 from pathlib import Path
 import time
 import sys
+import os
 
 import pytest
 
@@ -18,6 +19,17 @@ def test_cli_budget_exit(world, monkeypatch, diagnostic, expected, tmp_path):
     # Real fixture/replay path; force only the budget verdict, never the clocks or CPU timers.
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.delenv('CHAT_CLOSEOUT_OFF', raising=False)
+    monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'must-not-open.db'))
+    monkeypatch.setenv('HERMES_HUB_STATE', str(tmp_path / 'must-not-read'))
+    previous = dict(os.environ)
+    load = bench.load_plugin
+    def isolated_load(path):
+        from hermes_cli import kanban_session_activity as ksa
+        home = Path(os.environ['HERMES_HOME'])
+        assert Path(os.environ['HERMES_KANBAN_DB']) == home / 'kanban.db'
+        assert ksa._hub_db_path() == home / 'hub.db'
+        return load(path)
+    monkeypatch.setattr(bench, 'load_plugin', isolated_load)
     monkeypatch.setattr(bench, 'budget_failures', lambda values: ['forced overrun'])
     argv = ['replay_bench', '--sessions', '4', '--messages', '8', '--tasks', '3',
             '--replica-rows', '3', '--pending', '2']
@@ -25,6 +37,7 @@ def test_cli_budget_exit(world, monkeypatch, diagnostic, expected, tmp_path):
         argv.append('--diagnostic')
     monkeypatch.setattr(sys, 'argv', argv)
     assert bench.main() == expected
+    assert dict(os.environ) == previous
 
 
 @pytest.fixture
