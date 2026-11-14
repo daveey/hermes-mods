@@ -6,6 +6,29 @@ It does not merge or push. State preflight makes two bounded read-only GitHub
 requests (the PR view and one base compare), plus at most three bounded
 per-file commit lookups when it refuses for base drift.
 
+## Preflight budgets
+
+The registered `pre_tool_call` callback retains a **30-second** host backstop.
+The adapter and standalone `--gh-args` entry point share an **18-second aggregate
+monotonic deadline** across probes, including nested parallel workers. A deadline
+refusal names the stage (approval/carry, tree/blob reads, Git fetch/merge-tree,
+land-turn reads, or drift); late results never allow a command. Every worker gets
+its own copied context with the same deadline, and is joined before return.
+
+Independent carry patch reads, blob reads, and the two clean-merge checks run in
+parallel. Both the API tree/content prefilter and authoritative Git merge-tree
+must still pass. Approval and a **read-only** land-turn scan overlap; that scan
+never deletes refs speculatively. Non-speculative turn readers retain cleanup.
+The mutable base-drift read stays **last**, after approval/hold checks, so the
+optimization does not widen the final base-read race. Optional turn acquisition
+starts only when its budget fits; lack of time never changes a refusal to allow.
+
+Preflights taking at least one second log elapsed time and allowed/refused status,
+without logging submitted commands. `tests_budget.py` and `tests_parallel.py`
+cover registration, clipping, nested context propagation, named real subprocess
+expiry, late-result rejection, exception propagation and host fail-closed dispatch.
+Private incident recordings stay out of this public repository.
+
 ## Configuration
 
 Create `$HERMES_HOME/ship-only-guard.json` (default home: `~/.hermes`):
@@ -119,8 +142,17 @@ parent changed takes that parent's entry; a path both changed differently is
 merged locally by `git merge-file` on the three blobs (`git/blobs/<sha>`,
 checked against their ids; at most 8 such paths, 1 MiB each). Any conflict,
 add/add, modify/delete, symlink or submodule on both sides, truncated tree or
-other odd read refuses. This only lacks `git merge-tree`'s rename detection, so
-a rename on one side meeting an edit on the other refuses rather than carries.
+other odd read refuses. This path-wise check is only a rejection prefilter:
+rename/delete conflicts can look clean path by path. Every survivor must also
+pass real `git merge-tree --write-tree <first> <second>` with exit 0 and a
+single tree id equal to the fetched merge's tree. A scratch bare repository
+under `$HERMES_HOME/cache` fetches those three SHAs with `--depth=128`, no tags
+or submodules, and 30-second command timeouts. Full blobs avoid lazy fetches
+inside merge-tree; authentication uses `gh auth git-credential` and inherited
+Git configuration is disabled. Multiple merge bases, shallow cuts before the
+base, failed fetches, unsupported Git versions and odd output all refuse;
+the scratch repository is removed on exit. No carry is inferred from the
+path-wise approximation alone.
 Any failed or odd read refuses with the
 reason; a blocking verdict on H itself is never overridden. Base drift is
 checked separately and still applies. Why: #1812, #1837 and #2438 were refused

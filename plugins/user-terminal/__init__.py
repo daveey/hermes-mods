@@ -162,7 +162,10 @@ SCHEMA = {
         "reason); otherwise it is withdrawn. For a card blocked on this job, say: Authenticate in the window; "
         "the card resumes by itself when the command finishes. Unblock = resume without the result; "
         "archive = abandon. A declined command leaves the card blocked. The user can type into the window if the "
-        "command prompts. If it is still pending after `wait_s`, call again with only `job_id` to keep waiting."
+        "command prompts. If it is still pending after `wait_s`, call again with only `job_id` to keep waiting. "
+        "If the user can't find the window (it opened earlier and is now behind other windows), call "
+        "action=focus with the job_id: it brings that exact window to the front. Never hand them a link or the "
+        "command instead."
     ),
     "parameters": {
         "type": "object",
@@ -172,7 +175,7 @@ SCHEMA = {
             "cwd": {"type": "string", "description": "Working directory (default: user's home)."},
             "wait_s": {"type": "integer", "description": f"Seconds to wait for the user + command (default {DEFAULT_WAIT}, max {MAX_WAIT})."},
             "job_id": {"type": "string", "description": "Resume waiting on an earlier pending job instead of starting a new one."},
-            "action": {"type": "string", "enum": ["run", "withdraw"], "description": "withdraw (with job_id and reason): take back a request that is no longer needed; the window says so and any running command is stopped."},
+            "action": {"type": "string", "enum": ["run", "withdraw", "focus"], "description": "withdraw (with job_id and reason): take back a request that is no longer needed; the window says so and any running command is stopped. focus (with job_id): bring a pending/running job's window to the front of the user's screen; it changes nothing else."},
         },
     },
 }
@@ -472,6 +475,99 @@ def _open_iterm(shell_cmd: str) -> str:
               'end tell\nend tell\n' + _center("iTerm"))
     _osascript(script)
     return "iTerm"
+
+
+# action=focus (agent-c92065f334): a job's window is activated once, when it opens. A job can wait up to
+# max_wait_minutes, so by the time the user looks for it, it is often buried. Focus finds the window by the tty its
+# runner.sh runs on (an exact match: never another window of the same app) and raises it. Terminal choice does not
+# matter: iTerm sessions and Terminal tabs both expose `tty`.
+FOCUS_HINT = ("If the user can't find the window, call run_in_user_terminal with action=focus and this job_id to "
+              "bring it to the front; don't send a link or the command instead.")
+
+_FOCUS_SCRIPT = """
+set want to {tty}
+if application "iTerm" is running then
+  tell application "iTerm"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if tty of s is want then
+            select w
+            tell t to select
+            tell s to select
+            activate
+            return "iTerm"
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+end if
+if application "Terminal" is running then
+  tell application "Terminal"
+    repeat with w in windows
+      repeat with t in tabs of w
+        if tty of t is want then
+          set selected tab of w to t
+          set index of w to 1
+          activate
+          return "Terminal"
+        end if
+      end repeat
+    end repeat
+  end tell
+end if
+return ""
+"""
+
+
+def _tty_of(pid: int) -> str:
+    """The controlling tty of a live process as /dev/ttysNNN, else ""."""
+    try:
+        out = subprocess.run(["/bin/ps", "-o", "tty=", "-p", str(int(pid))], capture_output=True, text=True,
+                             timeout=2).stdout.strip()
+    except Exception:
+        return ""
+    if not out or out in ("?", "??", "-"):
+        return ""
+    return out if out.startswith("/dev/") else f"/dev/{out}"
+
+
+def _osascript_out(script: str) -> str:
+    try:
+        return subprocess.run(["osascript", "-e", script], check=True, capture_output=True, text=True,
+                              timeout=OSA_TIMEOUT, env=launch_env()).stdout.strip()
+    except subprocess.TimeoutExpired:
+        raise OpenTimedOut(f"osascript timed out after {OSA_TIMEOUT}s. {_diagnosis_text(osa_diagnosis())}") from None
+    except subprocess.CalledProcessError as e:
+        raise OpenFailed(f"osascript exited {e.returncode}: {str(e.stderr or '').strip() or 'no stderr'}") from None
+
+
+def focus_window(job: Path) -> dict:
+    """Bring a live job's window to the front. Never starts, answers or withdraws anything."""
+    st = read_status(job)
+    status = st.get("status") or "pending"
+    if status not in FINAL:
+        status = "running" if status == "running" else "pending"  # the shape wait_for reports
+    base = {"job_id": job.name, "status": status}
+    if status in FINAL:
+        return {**base, "ok": False, "error": f"job already ended ({status}); there is no waiting window to bring "
+                                              f"forward. Read its result with job_id instead."}
+    ttys = [t for pid, start in runner_idents(job).items() if _same_process(pid, start) for t in [_tty_of(pid)] if t]
+    if not ttys:
+        return {**base, "ok": False, "error": "no live window runs this job (its runner is gone or never started)"}
+    for tty in dict.fromkeys(ttys):
+        try:
+            app = _osascript_out(_FOCUS_SCRIPT.replace("{tty}", _osa_quote(tty)))
+        except OpenFailed as e:
+            return {**base, "ok": False, "error": f"could not bring the window forward: {e}"}
+        if app:
+            return {**base, "ok": True, "focused": app, "tty": tty,
+                    "note": f"The job's {app} window is now in front. Tell the user it is there; keep waiting with "
+                            f"job_id."}
+    return {**base, "ok": False, "error": f"no iTerm or Terminal window has the job's tty ({', '.join(ttys)}); "
+                                          f"it may run in cmux. Ask the user to look for the window titled "
+                                          f"'Hermes ... wants to run a command'."}
 
 
 OPEN_GRACE_S = 2.0  # after an osascript error, how long to watch for the window's runner before trying the next app
@@ -1893,7 +1989,10 @@ def start_reconciler(ctx):
                 continue
             except Exception:
                 log.exception("user_terminal: completion reconciliation pass failed")
-    ctx.on_unload(stop.set)
+    def unload():
+        stop.set()
+        _sweep_retire()
+    ctx.on_unload(unload)
     context = contextvars.copy_context()
     threading.Thread(target=lambda: context.run(run), name="user-terminal-reconcile", daemon=True).start()
 
@@ -2016,6 +2115,8 @@ _SWEEP_DBS: dict = {}  # path -> (file identity, connection, generation, -shm id
 _SWEEP_DB_GENERATION = 0
 _SWEEP_DB_MAX = 32
 _SWEEP_GENERATION_HOOK = False
+_SWEEP_RETIRED = False
+_SWEEP_UNREGISTER = None
 _SWEEP_FILES = ('status.json', 'meta.json', 'owner.json', 'final.lock/result.json',
                 'attachment.json', 'completion-receipt.json', 'completion-payload.json',
                 'completion-pending.json')
@@ -2062,15 +2163,35 @@ def _sweep_evict(path: str) -> None:
 
 
 def _sweep_register_hook() -> None:
-    global _SWEEP_GENERATION_HOOK
-    if _SWEEP_GENERATION_HOOK:
-        return
-    try:
-        from hermes_cli.kanban_generation import register_reader_cache
-    except ImportError:  # older core: the -shm identity check alone retires stranded observers
-        return
-    register_reader_cache(_sweep_evict)
-    _SWEEP_GENERATION_HOOK = True
+    """Serialize registration with retirement, but never hold this lock across an open."""
+    global _SWEEP_GENERATION_HOOK, _SWEEP_UNREGISTER
+    with _SWEEP_DB_LOCK:
+        if _SWEEP_RETIRED:
+            raise _SweepBoardBusy('sweep observer owner was unloaded')
+        if _SWEEP_GENERATION_HOOK:
+            return
+        try:
+            from hermes_cli import kanban_generation
+            from hermes_cli.kanban_generation import register_reader_cache
+        except ImportError:  # older core: -shm checks still retire stranded observers
+            return
+        register_reader_cache(_sweep_evict)
+        _SWEEP_UNREGISTER = getattr(kanban_generation, 'unregister_reader_cache', None)
+        _SWEEP_GENERATION_HOOK = True
+
+
+def _sweep_retire() -> None:
+    """Terminal lifecycle boundary: drain readers and fence opens already in flight."""
+    global _SWEEP_RETIRED, _SWEEP_GENERATION_HOOK, _SWEEP_UNREGISTER
+    with _SWEEP_DB_LOCK:
+        _SWEEP_RETIRED = True
+        for observer in _SWEEP_DBS.values():
+            _sweep_close(observer[1])
+        _SWEEP_DBS.clear()
+        if _SWEEP_GENERATION_HOOK and _SWEEP_UNREGISTER is not None:
+            _SWEEP_UNREGISTER(_sweep_evict)
+        _SWEEP_GENERATION_HOOK = False
+        _SWEEP_UNREGISTER = None
 
 
 def _is_board_busy(exc) -> bool:
@@ -2109,6 +2230,8 @@ def _sweep_db_stamp(path: str):
         raise FileNotFoundError(path)
     shm = _sweep_shm(path)
     with _SWEEP_DB_LOCK:
+        if _SWEEP_RETIRED:
+            raise _SweepBoardBusy('sweep observer owner was unloaded')
         observer = _SWEEP_DBS.get(path)
         if observer is not None and (observer[0] != stamp[0][:2] or observer[3] != shm):
             _sweep_close(_SWEEP_DBS.pop(path)[1])  # replaced file or a new/gone WAL generation
@@ -2130,6 +2253,9 @@ def _sweep_db_stamp(path: str):
         _sweep_close(con)
         raise
     with _SWEEP_DB_LOCK:
+        if _SWEEP_RETIRED:
+            _sweep_close(con)
+            raise _SweepBoardBusy('sweep observer owner was unloaded during open')
         old = _SWEEP_DBS.pop(path, None)
         if old is not None:
             _sweep_close(old[1])
@@ -2547,7 +2673,7 @@ def wait_for(job: Path, wait_s: float, reconcile: bool = False) -> dict:
         result["status"] = "pending" if st.get("status") != "running" else "running"
         result["note"] = ("Still waiting (user hasn't answered, or the command is still running). Call "
                           "run_in_user_terminal with this job_id to keep waiting. If it is no longer needed, "
-                          "withdraw it immediately (action=withdraw, this job_id, a reason).")
+                          "withdraw it immediately (action=withdraw, this job_id, a reason). " + FOCUS_HINT)
         if yielded:
             result["yielded"] = True
             result["note"] = YIELD_NOTE
@@ -2569,6 +2695,12 @@ def handle(args: dict, session_id: str | None = None, **_kw: Any) -> str:
     try:
         attached: dict = {}
         withdraw = str(args.get("action") or "").strip().lower() == "withdraw"
+        if str(args.get("action") or "").strip().lower() == "focus":
+            job_id = str(args.get("job_id") or "").strip()
+            job = jobs_dir() / Path(job_id or "x").name
+            if not job_id or not job.is_dir():
+                return _err(f"focus needs the job_id of a pending job; unknown job_id {job_id}")
+            return json.dumps(focus_window(job))
         resume_id = str(args.get("job_id") or "").strip()
         if resume_id and not withdraw and (jobs_dir() / Path(resume_id).name).is_dir():
             # before the sweep and the job's own check: a resumed owning run never withdraws its own request
@@ -2670,6 +2802,8 @@ def start_relayed(command: str, reason: str, cwd: str, origin: dict) -> dict:
     if isinstance(origin, dict) and origin.get("withdraw") is not None:
         return withdraw_relayed(str(origin.get("request_id") or ""), str(origin.get("gateway") or ""),
                                 str(origin.get("withdraw") or ""), str(origin.get("job_id") or ""))
+    if isinstance(origin, dict) and origin.get("focus"):  # action=focus rides /start too (a mounted-earlier route)
+        return relayed_focus(str(origin.get("job_id") or ""), str(origin.get("gateway") or ""))
     command = str(command or "").strip()
     if not command:
         return {"ok": False, "error": "command is required"}
@@ -2755,6 +2889,17 @@ def relayed_status(job_id: str, gateway: str, wait_s: float) -> dict:
         return {"ok": False, "code": "job_not_found",
                 "error": f"no job {job_id} on this Mac for gateway {gateway or '(none)'}"}
     return wait_for(job, max(0.0, min(float(wait_s or 0), 25.0)), reconcile=True)
+
+
+def relayed_focus(job_id: str, gateway: str) -> dict:
+    """action=focus for a relayed job: same lookup and same origin-gateway rule as relayed_status."""
+    job = jobs_dir() / Path(str(job_id or "x")).name
+    if not job_id or not job.is_dir() or not gateway or job_origin_gateway(job) != gateway:
+        job = find_relayed_by_request(str(job_id or ""), gateway)
+    if job is None:
+        return {"ok": False, "code": "job_not_found", "focus": True,
+                "error": f"no job {job_id} on this Mac for gateway {gateway or '(none)'}"}
+    return {**focus_window(job), "focus": True}
 
 
 # Withdrawal of a relayed request (t_01a1d47bf0506084). The gateway takes an unclaimed request out of its own
@@ -3259,6 +3404,32 @@ def withdraw_remote(base: Path, ident: str, reason: str, session_id: str | None 
             "error": error or f"`{device}` did not confirm the withdrawal of request {rid}"}
 
 
+FOCUS_RESULT_S = 30.0
+
+
+def focus_remote(base: Path, job_id: str, session_id: str | None = None) -> dict:
+    """``action: focus`` on a screenless gateway: ask the Mac that holds the job to raise its window. The Mac's
+    answer carries ``focus: true``; anything else came from a Desktop or Mac module that predates focus (an old
+    courier treats the request as a status poll), so it is never reported as focused."""
+    if not job_id:
+        return {"ok": False, "error": "focus needs the job_id of a pending job"}
+    entry = ledger_lookup(base, job_id)
+    if entry and entry.get("job_id"):
+        job_id = str(entry["job_id"])
+    device, err = pick_courier(base)
+    if err:
+        return {"ok": False, "job_id": job_id, "error": f"cannot reach the owner's Mac to raise the window: {err}"}
+    res = relay_once(base, device, {"job_id": job_id, "focus": True, "wait_s": 0}, _sender(session_id),
+                     FOCUS_RESULT_S)
+    if not res.get("focus"):
+        return {"ok": False, "job_id": job_id, "device": device, "status": res.get("status"),
+                "error": (f"`{device}` runs a Hermes Desktop or user-terminal plugin without action=focus, so the "
+                          f"window was not raised; update hermes-mods on {device}. Meanwhile ask the user to look "
+                          f"for the window titled 'Hermes ... wants to run a command'.")}
+    res.pop("focus", None)
+    return {**res, "job_id": res.get("job_id") or job_id, "device": device}
+
+
 def handle_remote(args: dict, session_id: str | None = None, **_kw: Any) -> str:
     try:
         refusal = owner_refusal(session_id)
@@ -3267,6 +3438,8 @@ def handle_remote(args: dict, session_id: str | None = None, **_kw: Any) -> str:
         if str(args.get("action") or "").strip().lower() == "withdraw":  # never a silent resume
             return json.dumps(withdraw_remote(_root(), str(args.get("job_id") or ""),
                                               str(args.get("reason") or ""), session_id))
+        if str(args.get("action") or "").strip().lower() == "focus":
+            return json.dumps(focus_remote(_root(), str(args.get("job_id") or "").strip(), session_id))
         wait_s = max(1.0, min(float(args.get("wait_s") or DEFAULT_WAIT), MAX_WAIT))
         job_id = str(args.get("job_id") or "").strip()
         command = str(args.get("command") or "").strip()
@@ -3370,7 +3543,7 @@ def handle_remote(args: dict, session_id: str | None = None, **_kw: Any) -> str:
             res["note"] = res["next"] + f" (The prompt and the window are on `{device}`.)"
         elif res.get("ok") and res.get("status") not in FINAL:
             res["note"] = (f"Still waiting on `{device}` (the owner hasn't answered, or the command is still "
-                           f"running). Call run_in_user_terminal with this job_id to keep waiting.")
+                           f"running). Call run_in_user_terminal with this job_id to keep waiting. " + FOCUS_HINT)
         return json.dumps(res)
     except Exception as e:  # never crash the agent loop
         return _err(f"{type(e).__name__}: {e}")

@@ -291,6 +291,33 @@ INVITE_STEP = {'text': 'Ask Sam to accept the two GitHub invites, or send his cu
                'options': []}
 
 
+@pytest.mark.parametrize('corroborated', [True, False])
+def test_open_tile_gate_matches_relay_fallback_publication(plugin, monkeypatch, boards, corroborated):
+    initial = 'Choose the cache backend: Redis or SQLite?'
+    turn(plugin, monkeypatch, 'configure caching', initial,
+         [{'text': 'Choose the cache backend', 'kind': 'choose',
+           'verbatim_span': initial, 'options': ['Redis', 'SQLite']}])
+    before = live(plugin)
+    assert len(before) == 1
+    add_card(boards['default'], action=INVITE_ACTION)
+    ask = 'Can you ask him to accept the invites below, or tell me his current GitHub username if that account is old?'
+    final = f'{INVITE_POINTER}\n\n{ask}'
+    repeats = [{'id': f'kanban:default:{CARD}', 'verbatim_span': INVITE_POINTER}] if corroborated else []
+    payload = {'steps': [{**INVITE_STEP, 'verbatim_span': ask}], 'resolved': [], 'repeats': repeats}
+    monkeypatch.setattr(plugin, 'aux_llm', lambda *a: json.dumps(payload))
+    plugin.pre_llm_call(session_id='session-a', user_message='did Sam get access?', platform='cli')
+    result = plugin.publication_buffer(session_id='session-a', platform='cli', final_response=final)
+    assert live(plugin) == before  # judging never publishes
+    if corroborated:
+        assert result is None
+    else:
+        assert result and result.get('hold') is True
+    plugin.transform_llm_output(response_text=final, session_id='session-a', platform='cli')
+    assert len(live(plugin)) == (1 if corroborated else 2)
+    if corroborated:
+        assert live(plugin) == before
+
+
 def test_relay_with_an_added_fallback_publishes_no_request_when_the_reply_relays_the_card(plugin, monkeypatch, boards):
     add_card(boards['default'], action=INVITE_ACTION)
     ask1 = "Can you ask him to accept the invites below, or tell me his current GitHub username if that account is old?"

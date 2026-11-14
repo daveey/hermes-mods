@@ -39,11 +39,11 @@ class _Loop:
         self.loop.close()
 
 
-def _python_stall_in_loop(seconds):
-    """Pure-Python work on the loop thread: it needs the GIL the whole time, like a slow handler."""
+def _python_stall_in_loop(seconds, sampled, release):
+    """Keep the handler observable until sampled, even if the watcher wakes late."""
     end = time.monotonic() + seconds
     x = 0
-    while time.monotonic() < end:
+    while not release.is_set() and (time.monotonic() < end or not sampled.is_set()):
         for i in range(500):
             x += i * i
     return x
@@ -66,7 +66,8 @@ def many_threads():
         t.join(5)
 
 
-def test_real_stall_with_many_threads_has_bounded_watcher_cost(many_threads, monkeypatch):
+@pytest.mark.parametrize("wake_delay", [0.0, 2.2], ids=["normal", "late-watcher"])
+def test_real_stall_with_many_threads_has_bounded_watcher_cost(many_threads, monkeypatch, wake_delay):
     # No source/stat I/O on the stall path: every such call is a GIL hand-off against the stalled loop.
     # Counted on the watcher (this) thread only; other threads may format tracebacks legitimately.
     me, io_calls = threading.get_ident(), []
@@ -78,9 +79,32 @@ def test_real_stall_with_many_threads_has_bounded_watcher_cost(many_threads, mon
             return _orig(*a, **k)
         monkeypatch.setattr(mod, name, spy)
     lp = _Loop()
+    sampled, release = threading.Event(), threading.Event()
+    # Failure cleanup must also work if sampling is broken: never leave a spinning loop behind.
+    watchdog = threading.Timer(20.0, release.set)
+    watchdog.daemon = True
+    watchdog.start()
     try:
         w = watch.LoopWatch(lp.loop, lp.th.ident, sink=lambda r: None, stall_s=0.3, sample_s=0.02)
-        lp.loop.call_soon_threadsafe(_python_stall_in_loop, 2.0)
+        original_sample, original_wait = w._sample, w.wait
+
+        def sample(*args):
+            original_sample(*args)
+            sampled.set()  # only release after the real stack capture, not merely a timeout
+
+        first_wait = True
+
+        def wait(ev, seconds):
+            nonlocal first_wait
+            result = original_wait(ev, seconds)
+            if first_wait:
+                first_wait = False
+                # Model a descheduled watcher while the loop finishes its original 2s workload.
+                time.sleep(wake_delay)
+            return result
+
+        w._sample, w.wait = sample, wait
+        lp.loop.call_soon_threadsafe(_python_stall_in_loop, 2.0, sampled, release)
         c0 = time.thread_time()
         rep = w.check_once()
         cpu = time.thread_time() - c0
@@ -94,9 +118,13 @@ def test_real_stall_with_many_threads_has_bounded_watcher_cost(many_threads, mon
         assert rep["watcher_cost_s"] <= watch.SAMPLE_BUDGET * sampled_s + first_pass_cap, rep
         # Independent CPU measure of the watcher thread across the whole stall, report built included.
         assert cpu <= 0.10 * rep["stall_s"] + 0.05, (cpu, rep)
-        # Stall time is measured when the loop caught up, not after the watcher's own report work.
-        assert rep["stall_s"] < 2.0 + 1.0
+        # Exact exclusion of post-stall report work is covered by the fake-clock test below;
+        # wall time here includes arbitrary runner descheduling and the injected late wake.
+        assert not release.is_set(), "fixture watchdog expired before sampling completed"
     finally:
+        release.set()
+        watchdog.cancel()
+        watchdog.join(5)
         lp.close()
 
 

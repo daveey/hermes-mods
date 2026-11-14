@@ -81,5 +81,46 @@ class MergedSinceTests(unittest.TestCase):
         self.assertEqual(p.stdout.strip(), "")
 
 
+def load_merged_since():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("merged_regression", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_incomplete_results_refused(monkeypatch):
+    import pytest
+    from types import SimpleNamespace
+
+    module = load_merged_since()
+    monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
+        returncode=0, stdout=json.dumps({
+            "total_count": 0, "items": [], "incomplete_results": True})))
+    with pytest.raises(RuntimeError, match="incomplete_results"):
+        module.page("q", 100, 1)
+
+
+def test_cap_excess_refused(monkeypatch, capsys):
+    module = load_merged_since()
+    monkeypatch.setattr(module, "page", lambda *args: (1001, []))
+    assert module.main(["--repo", "o/r", "--since", "2026-11-13T15:00:00Z"]) == 3
+    assert capsys.readouterr().out == ""
+
+
+def test_base_filter_reaches_query(monkeypatch):
+    module = load_merged_since()
+    queries = []
+
+    def page(query, *args):
+        queries.append(query)
+        return 0, []
+
+    monkeypatch.setattr(module, "page", page)
+    assert module.main(["--repo", "o/r", "--since", "2026-11-13T15:00:00Z",
+                        "--base", "state"]) == 0
+    assert " base:state" in queries[0]
+
+
 if __name__ == "__main__":
     unittest.main()

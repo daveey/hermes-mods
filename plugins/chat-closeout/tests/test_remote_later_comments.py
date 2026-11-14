@@ -11,6 +11,8 @@ import json
 import sqlite3
 import time
 
+import pytest
+
 from test_closeout import plugin, core
 
 KEY = 'hub/default/default/t_9a1c0ffe'
@@ -140,14 +142,18 @@ def test_remote_anchor_ignores_run_end_when_the_run_has_no_summary(tmp_path, mon
     assert _later(_fill_prompt()) == []
 
 
-def test_remote_comment_stamped_at_the_anchor_is_not_later():
-    # Parity with the local SQL read (`c.created_at > a.anchor`): a comment stamped exactly at the anchor is not later.
-    at_run_end = _record([{'author': 'a', 'body': OLD, 'at': RUN_END},
-                          {'author': 'hub:gw:macbook', 'body': DECISION, 'at': RUN_END + 1}])
-    assert [c['body'] for c in core.replica_later_comments(at_run_end)] == [DECISION]
-    at_completed = _record([{'author': 'a', 'body': OLD, 'at': COMPLETED},
-                            {'author': 'hub:gw:macbook', 'body': DECISION, 'at': COMPLETED + 1}], run=False)
-    assert [c['body'] for c in core.replica_later_comments(at_completed)] == [DECISION]
+@pytest.mark.parametrize('run, anchor', [(True, RUN_END), (False, COMPLETED)], ids=['run-end', 'completed-at'])
+def test_remote_comment_stamped_at_the_anchor_is_not_later(tmp_path, monkeypatch, run, anchor):
+    # Parity with the local SQL read (`c.created_at > a.anchor`): equal is not later; +1 second is.
+    data = _record([{'author': 'a', 'body': OLD, 'at': anchor},
+                    {'author': 'hub:gw:macbook', 'body': DECISION, 'at': anchor + 1}], run=run)
+    assert [c['body'] for c in core.replica_later_comments(data)] == [DECISION]
+    hub = _replica(tmp_path / 'hub.db', data)
+    monkeypatch.setattr(plugin, 'hub_db_path', lambda: hub)
+    prompt = _fill_prompt()
+    lines = _later(prompt)
+    assert len(lines) == 1 and DECISION in lines[0], prompt
+    assert OLD not in prompt
 
 
 def _rows(path, rows):

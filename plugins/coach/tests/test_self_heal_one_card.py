@@ -253,6 +253,41 @@ def test_open_owner_by_body_fingerprint_line_takes_a_comment(env):
     assert events(env.store, "selfheal_dedup_commented")[0]["via"] == "body"
 
 
+@pytest.mark.parametrize("via", ["key", "body"])
+def test_open_owner_excludes_self_refile_and_finds_next_owner(env, via):
+    fp = defect()["fingerprint"]
+    for tid, age in (("t_self", 120), ("t_other", 60)):
+        env.board.add(tid, key=f"selfheal:{fp}:{tid}" if via == "key" else tid,
+                      body=sh.with_fp_line("hand-filed owner", fp) if via == "body" else "",
+                      created_at=NOW - age)
+
+    # Control: the re-filing card really is the oldest matching open owner.
+    assert sh.open_owner(fp, None)["id"] == "t_self"
+    owner = sh.open_owner(fp, None, exclude=["t_self"])
+    assert owner["id"] == "t_other"
+    assert owner["via"] == via
+    assert sh.open_owner(fp, None, exclude=["t_self", "t_other"]) is None
+
+
+@pytest.mark.parametrize("via", ["key", "body"])
+def test_self_refile_comments_other_owner_not_itself(env, via):
+    d = defect(filed_by="t_self")
+    fp = d["fingerprint"]
+    for tid, age in (("t_self", 120), ("t_other", 60)):
+        env.board.add(tid, key=f"selfheal:{fp}:{tid}" if via == "key" else tid,
+                      body=sh.with_fp_line("hand-filed owner", fp) if via == "body" else "",
+                      created_at=NOW - age)
+
+    out = file(env, d)
+    assert out["action"] == "skip" and out["dedup"] is True
+    assert out["card"] == "t_other"
+    assert env.board.creates() == []
+    ((card, body),) = env.board.comments
+    assert card == "t_other" and fp in body
+    (event,) = events(env.store, "selfheal_dedup_commented")
+    assert event["card"] == "t_other" and event["via"] == via
+
+
 def test_fingerprint_mentioned_inline_is_not_an_owner(env):
     d = defect()
     fp = d["fingerprint"]
@@ -432,6 +467,89 @@ def test_backport_counts_and_is_capped(env):
     assert out["action"] == "skip" and out["over_cap"] is True
     assert [a for a in env.board.creates() if "backport" in a[a.index("create") + 1]] == []
     assert events(env.store, "selfheal_over_cap")[0]["kind"] == "backport"
+
+
+
+@pytest.mark.parametrize("count", [39, 40, 41])
+def test_receipt_verifier_obeys_daily_card_cap(env, monkeypatch, count):
+    """Receipt recovery must enforce the card count even with spend/concurrency admission open."""
+    monkeypatch.setattr(sh, "budget", OPEN)
+    fill(env.board, count)
+    d = defect(component="kanban", symptom="completed owner missing receipt")
+    fp = d["fingerprint"]
+    lane = sh.LaneState(env.store.root)
+    lane.update(fp, status="approved", component=d["component"], symptom=d["symptom"],
+                fix_card="t_owner001")
+
+    verifier = sh._recover_completion_receipt(fp, env.store, env.board, NOW)
+    st = lane.get(fp)
+    assert st["status"] == "approved"
+    if count < 40:
+        assert verifier and st["verify_card"] == verifier
+        assert len(env.board.creates()) == 1
+        assert env.board.rows("id = ?", (verifier,))[0][1].startswith(sh.VERIFY_TITLE)
+        assert sh.cards_created_today(None, NOW) == 40
+        assert not events(env.store, "selfheal_over_cap")
+        return
+
+    assert verifier is None
+    assert not st.get("verify_card")
+    assert not [row for row in env.board.rows() if row[1].startswith(sh.VERIFY_TITLE)]
+    (cap,) = events(env.store, "selfheal_over_cap")
+    assert (cap["kind"], cap["fingerprint"], cap["count"], cap["cap"]) == ("receipt", fp, count, 40)
+    (digest,) = env.board.creates()
+    assert f"selfheal-digest:{DAY}" in digest
+    assert len(env.board.comments) == 1
+    assert "not filed (receipt)" in env.board.comments[0][1]
+    assert sh.cards_created_today(None, NOW) == count
+
+    # Still capped: no verifier and no duplicate digest/comment across retries.
+    assert sh._recover_completion_receipt(fp, env.store, env.board, NOW + 60) is None
+    assert len(env.board.creates()) == len(env.board.comments) == 1
+    # Tomorrow's real count releases the same approved lane, without a receipt inferred from the cap.
+    env.board.now = MIDNIGHT + 60
+    verifier = sh._recover_completion_receipt(fp, env.store, env.board, MIDNIGHT + 60)
+    assert verifier and lane.get(fp)["verify_card"] == verifier
+    assert sh.cards_created_today(None, MIDNIGHT + 60) == 1
+
+
+@pytest.mark.parametrize("count", [39, 40])
+def test_undeployed_card_obeys_daily_cap(env, count):
+    """An overdue deployment check shares the cap, not just ordinary defects/backports."""
+    fill(env.board, count)
+    d = defect(component="agent", symptom="host has not synced its fix")
+    fp = d["fingerprint"]
+    key = f"selfheal:{fp}:undeployed:laptop:abc123def456"
+    st = {"status": "fixed", "fix_card": "t_fixed", "fixed_at": NOW - 80 * 3600}
+    lane = sh.LaneState(env.store.root)
+    lane.update(fp, **st)
+    before = lane.get(fp)
+    dec = {"key": key, "label": "Laptop-A", "sha": "abc123def456" + "a" * 28,
+           "last_sync": NOW - 90 * 3600, "deployed_at": None, "overdue": True,
+           "at": NOW - 60, "why": "host still lacks the fix after 80 hours"}
+    out = sh._file_undeployed(d, fp, st, dec, env.store, "live", env.board, NOW, HUB, OPEN)
+
+    if count == 39:
+        assert out["action"] == "not_deployed" and out["card"]
+        assert len(env.board.creates()) == 1
+        assert env.board.rows("idempotency_key = ?", (key,))[0][0] == out["card"]
+        assert lane.get(fp)["undeployed"] == {key: out["card"]}
+        assert sh.cards_created_today(None, NOW) == 40
+        assert events(env.store, "selfheal_over_cap") == []
+    else:
+        assert out["action"] == "skip" and out["over_cap"] is True
+        assert out["not_deployed"] is True
+        assert env.board.rows("idempotency_key = ?", (key,)) == []
+        assert lane.get(fp) == before  # no poisoned dedup state: next occurrence may retry
+        (digest,) = env.board.creates()
+        assert digest[digest.index("--idempotency-key") + 1] == f"selfheal-digest:{DAY}"
+        ((card, body),) = env.board.comments
+        assert card == out["digest"] and fp in body and "not filed (undeployed)" in body
+        (event,) = events(env.store, "selfheal_over_cap")
+        assert event["kind"] == "undeployed" and event["count"] == event["cap"] == 40
+        assert event["digest"] == card
+        assert sh.cards_created_today(None, NOW) == 40
+
 
 
 def test_text_created_at_rows_never_count(env):

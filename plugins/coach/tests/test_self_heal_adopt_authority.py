@@ -421,11 +421,12 @@ def test_owner_on_another_local_board_is_recorded(store, home, tmp_path, monkeyp
     assert sh.LaneState(store2.root).get("agent-04039a9129")["owner_board"] == "default"
 
 
-def test_verify_card_for_a_remote_owner_is_not_parented_on_a_card_this_board_lacks(store, home, tmp_path, monkeypatch):
+@pytest.mark.parametrize("board", [None, "macbook:default"])
+def test_verify_card_for_a_remote_owner_is_not_parented_on_a_card_this_board_lacks(store, home, tmp_path, monkeypatch, board):
     hdb = hub_db(tmp_path / "hub" / "hub.db", [("macbook", "default", OWNER, "done")],
                  [("macbook", "default", "ok", NOW - 40)])
     monkeypatch.setattr(sh, "_lookup_sources", lambda runner: (home, hdb))
-    _approved(store, "bb-448ec69637", OWNER, board=None)
+    _approved(store, "bb-448ec69637", OWNER, board=board)
     r = Runner()
     sh.reconcile(store, runner=r, now=NOW)
     st = sh.LaneState(store.root).get("bb-448ec69637")
@@ -433,7 +434,64 @@ def test_verify_card_for_a_remote_owner_is_not_parented_on_a_card_this_board_lac
     (create,) = r.creates()
     text = " ".join(map(str, create))
     assert "--parent" not in create and "gateway `macbook`" in text and "cross_task" in text
+    expected_board = "default" if board else "bb"
+    assert create[create.index("--board") + 1] == expected_board
+    assert st["board"] == board  # retain the digest owner reference for later lookups
     assert not ev(store, "selfheal_stale")
+
+
+@pytest.mark.parametrize("board, gateway, expected", [
+    ("remote:work", "remote", "default"),
+    ("local:work", None, "work"),
+    ("work", "remote", "work"),
+    (None, "remote", None),
+])
+def test_verify_create_normalizes_only_qualified_boards(store, monkeypatch, board, gateway, expected):
+    st = {"owner_card": OWNER, "owner_gateway": gateway, "owner_board": "work"}
+    calls = []
+    monkeypatch.setattr(sh, "_run_card", lambda args, runner: (calls.append(args) or (0, "t_0000000000000002", "")))
+    sh._file_verify("agent-test", st, OWNER, {"board": board}, store, Runner(), NOW)
+    assert calls[0]["board"] == expected
+    assert calls[0]["parents"] == ([] if gateway else [OWNER])
+
+
+@pytest.mark.parametrize("board, gateway, expected", [
+    ("remote:work", "remote", "default"),
+    ("local:work", None, "work"),
+    ("work", None, "work"),
+], ids=["foreign-owner", "qualified-local-owner", "local-board"])
+def test_receipt_recovery_budgets_the_verifier_board(store, monkeypatch, board, gateway, expected):
+    """Recovery admission precedes create's normalization; owner lookup keeps its original scope."""
+    fp = "agent-recovery-budget"
+    lane = sh.LaneState(store.root)
+    _approved(store, fp, OWNER, board=board)
+    lane.update(fp, owner_card=OWNER, owner_gateway=gateway, owner_board="work")
+    runner = Runner()
+    budgets = []
+
+    def record_budget(board=None, now=None):
+        # Snapshot creates too: this must be recovery admission, not a later create check.
+        budgets.append((board, now, len(runner.creates())))
+        return OPEN(board, now)
+
+    monkeypatch.setattr(sh, "budget", record_budget)
+    verifier = sh._recover_completion_receipt(fp, store, runner, NOW)
+
+    assert budgets == [(expected, NOW, 0)]
+    (create,) = runner.creates()
+    assert create[create.index("--board") + 1] == expected
+    body = create[create.index("--body") + 1]
+    if gateway:
+        assert "--parent" not in create
+        assert "gateway `remote`, board `work`" in body and "cross_task" in body
+    else:
+        assert create[create.index("--parent") + 1] == OWNER
+    st = lane.get(fp)
+    assert verifier and st["verify_card"] == verifier
+    assert st["status"] == "approved" and st["fix_card"] == OWNER
+    assert (st["board"], st["owner_card"], st["owner_gateway"], st["owner_board"]) == (
+        board, OWNER, gateway, "work")
+    assert ev(store, "selfheal_verify_filed")[0]["card"] == verifier
 
 
 def test_replica_described_candidates_obey_adopt_statuses(tmp_path):

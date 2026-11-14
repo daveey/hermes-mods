@@ -190,6 +190,55 @@ def test_answer_without_a_retained_marked_down_line_covers_the_lines_before_it(t
     assert out["backend_down"]["episodes"][0]["reason"] is None
 
 
+def test_stale_episode_closes_after_down_open_and_next_episode_starts_fresh(tmp_path, capsys):
+    """Two outages on one conn with no `answered again` in between are two episodes: the first ends DOWN_OPEN_S
+    after its last gate line, so a real timeout between them is not backend_down."""
+    now = datetime(2026, 11, 13, 14, 29, tzinfo=timezone.utc)
+    first, second = now - timedelta(minutes=25), now - timedelta(minutes=15)
+    lines = [gate(first, MARKED), gate(first + timedelta(seconds=10), TRIAL)]
+    lines += burst(first + timedelta(seconds=1), seconds=2, line=fail_fast)   # 8 lines inside episode 1
+    lines += [timeout(now - timedelta(minutes=20), BOARD)]                    # between them: one real timeout
+    lines += [gate(second, MARKED)]                                           # 10 min later, still no answer
+    lines += burst(second + timedelta(seconds=1), seconds=2, line=fail_fast)  # 8 lines inside episode 2
+    install(tmp_path, "\n".join(lines) + "\n")
+    out = report(tmp_path, capsys, now=now, dry=True)
+    assert [(e["start"], e["end"], e["seconds"], e["answered"]) for e in out["backend_down"]["episodes"]] == [
+        ("2026-11-13 14:04:00+00:00", "2026-11-13 14:05:10+00:00", 70.0, False),
+        ("2026-11-13 14:14:00+00:00", "2026-11-13 14:15:00+00:00", 60.0, False)]
+    assert out["awake_by_conn"] == {"mac-mini": 17}
+    assert out["backend_down"]["count"] == 16  # the real timeout between the episodes is not backend_down
+    assert out["awake_explained_by_path"][BOARD] == 4  # the episodes' fail-fast board lines, not the real one
+
+
+def test_episode_ending_before_window_is_not_reported(tmp_path, capsys):
+    """An episode that ended before the window start (inside the classifier's 5-minute lookback) is not reported."""
+    now = datetime(2026, 11, 13, 14, 29, tzinfo=timezone.utc)
+    start = now - timedelta(minutes=30)
+    lines = [gate(start - timedelta(seconds=200), MARKED), gate(start - timedelta(seconds=150), ANSWERED)]
+    lines += [timeout(now - timedelta(minutes=5), BOARD, "hermes-hub")]
+    install(tmp_path, "\n".join(lines) + "\n")
+    out = report(tmp_path, capsys, now=now, dry=True)
+    assert out["count"] == 1
+    assert out["backend_down"] == {"count": 0, "by_conn": {}, "episodes": []}
+
+
+def test_incident_card_body_names_backend_down_episode(tmp_path, capsys):
+    """The incident card's evidence carries the backend-down paragraph and its episodes, also when no client stall
+    or reconnect cascade is reported with it."""
+    now = datetime(2026, 11, 13, 14, 29, tzinfo=timezone.utc)
+    down = now - timedelta(minutes=10)
+    lines = [gate(down, MARKED)] + burst(down + timedelta(seconds=1), seconds=5, line=fail_fast)
+    lines += [gate(down + timedelta(seconds=10), ANSWERED)]
+    install(tmp_path, "\n".join(lines) + "\n")
+    out = report(tmp_path, capsys, now=now, dry=True)
+    assert out["client_stall"]["count"] == 0 and out["reconnect_cascade"]["count"] == 0
+    (ep,) = out["backend_down"]["episodes"]
+    assert (ep["conn"], ep["start"], ep["seconds"]) == ("mac-mini", "2026-11-13 14:19:00+00:00", 10.0)
+    body = bt.card_body("laptop", out, {"loadavg": [1.0, 1.0, 1.0], "backend_ps": []}, 30, 30)
+    assert "Backend down: 20 timeouts" in body
+    assert "conn=mac-mini 2026-11-13 14:19:00+00:00 for 10.0 s (read ECONNRESET)" in body
+
+
 def test_timeout_that_closed_the_gate_is_part_of_the_episode():
     """The request whose timeout marks the conn down is logged a moment before the `[remote-down]` line."""
     t0 = datetime(2026, 11, 13, 14, 0, tzinfo=timezone.utc)

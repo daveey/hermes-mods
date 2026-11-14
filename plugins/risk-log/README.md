@@ -1,8 +1,9 @@
 # risk-log
 
 Log and count high-risk Hermes tool use, so you can cut risky capabilities one at a time based on how they are
-actually used instead of guessing. It **never blocks, changes or slows a call**: a `post_tool_call` hook only
-enqueues the call; a background thread classifies it and appends metadata-only rows to a 0600 SQLite file.
+actually used instead of guessing. It never changes a call's result: a `post_tool_call` hook only
+queues the call under a short admission mutex, without waiting for queue capacity or SQLite;
+a background thread classifies it and appends metadata-only rows to a 0600 SQLite file.
 
 ## Risk classes
 
@@ -37,7 +38,15 @@ python3 ~/.hermes/plugins/risk-log/store.py export --prefix       # include the 
 
 - Logged after the call returns (`post_tool_call`), so a call that never returns is not logged. Calls another
   plugin blocks are logged with status `blocked`.
-- A full queue (2000 pending events, e.g. a wedged disk) drops events rather than wait.
+- A full queue (2000 pending events, e.g. a wedged disk) drops events rather than waiting for capacity.
+  Producer contention alone does not drop events. An idle writer sleeps on a semaphore until submission
+  or shutdown wakes it; shutdown wakes do not require a free queue slot.
+- Plugin unload permanently retires that generation's writer: new submissions are dropped, accepted events
+  drain, and the owning thread closes its SQLite handle. Unload waits at most 5 seconds (process exit: 1 second).
+  If disk I/O or classification stalls beyond that bound, shutdown returns false; the daemon drains and closes
+  when the operation returns. It cannot forcibly interrupt a stuck operation. Older cores without `on_unload`
+  only get the process-exit fallback.
+- Failed writes close their connection before reconnecting; failed connection setup also closes its handle.
 - Classification is pattern-based: a credential read through an indirection (a script that reads `~/.ssh`) is not
   seen.
 
@@ -48,4 +57,9 @@ cd plugins/risk-log && uv run --with pytest python -m pytest -q -p no:cacheprovi
 ```
 
 Covers redaction, every class, origin labels, 0600 file, export without prefix, hook p99 < 5 ms with a wedged
-writer and a full queue, and that a logging failure never changes the call's result.
+writer and a full queue, and that a logging failure never changes the call's result. Lifecycle fixtures load
+four successive plugin generations and verify unload leaves no retired writer thread or open writer connection;
+error/reconnect and setup-failure tests verify explicit closure. A full-queue stall fixture proves bounded
+shutdown followed by eventual draining, plus rejection of late writes and retirement before first use.
+Concurrent producers verify all 2000 events persist with no contention drops; an idle fixture verifies
+no queue polling and successful shutdown wakeup.

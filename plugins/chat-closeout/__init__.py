@@ -3032,6 +3032,7 @@ def _unload() -> None:
     if stop is not None:
         stop.set()
     _release_lease()
+    core._structural_reads.close()
 
 
 def _stop_stale_threads() -> int:

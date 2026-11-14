@@ -125,6 +125,27 @@ def _register_generation_hook(cache: "_StructuralReads") -> None:
     _GENERATION_HOOK = cache.evict
 
 
+def _unregister_generation_hook() -> None:
+    global _GENERATION_HOOK
+    hook, _GENERATION_HOOK = _GENERATION_HOOK, None
+    if hook is not None:
+        try:
+            from hermes_cli import kanban_generation
+        except ImportError:
+            return
+        unregister = getattr(kanban_generation, "unregister_reader_cache", None)
+        if unregister is not None:
+            unregister(hook)
+
+
+def _shared_reader():
+    try:
+        from hermes_cli import kanban_session_activity
+    except ImportError:
+        return None
+    return getattr(kanban_session_activity, "cached_ro", None)
+
+
 def _deleted_generation_error(message: str) -> sqlite3.OperationalError:
     try:
         from hermes_cli.kanban_generation import DeletedWalGenerationError
@@ -134,26 +155,26 @@ def _deleted_generation_error(message: str) -> sqlite3.OperationalError:
 
 
 class _StructuralReads:
-    """One bounded, process-wide pool of read-only observers; data_version is meaningful only on a retained
-    connection.
+    """Per-generation structural memo, borrowing core's process-wide reader when available.
 
     Cache only successful structural reads, never health or clock-derived decisions. No read transaction
     survives a call. A pre-read revision is rechecked after the read, so a concurrent commit cannot label
-    old data with a newer revision. Path identity fences replacement/deletion; failures close and retry.
+    old data with a newer revision. File, connection and WAL identity fence replacement/reopening.
 
-    WAL generations: each entry records its ``-shm`` identity and is dropped when the live one differs (an
-    external process unlinked the sidecars), so a frozen data_version never vouches for old rows. Board
-    observers are core's registered, guarded readers and ``evict`` is registered with core, so core
-    ``recover()`` closes them before any other connect. Entries are ``(identity, conn, cached, lock, shm)``;
-    a connection is used and closed only under its own ``lock``; ``evict`` never waits on a borrowed one.
-    The pool is shared by every thread (bounded descriptors), not per thread.
+    Older cores use private observers. Each entry is ``(identity, conn, cached, lock, shm, last_used)``;
+    a connection is used and closed only under its own lock. Idle observers expire after 300 s and
+    unload permanently retires the pool. Eviction never waits on a borrowed observer.
     """
     MAX_DATABASES = 48  # local boards + sync shadows (~16 + ~10 on the largest host); up to 3 descriptors each
     MAX_QUERIES = 128
+    IDLE_S = 300.0
     _ATTEMPTS = 3
 
     def __init__(self):
         self.entries = OrderedDict()
+        self._shared = OrderedDict()
+        self._closed = False
+        self._timer = None
         self._lock = threading.Lock()
 
     @staticmethod
@@ -173,7 +194,47 @@ class _StructuralReads:
         with self._lock:
             entries = list(self.entries.values())
             self.entries.clear()
+            self._shared.clear()
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
         self._close(*entries)
+
+    def close(self):
+        """Permanently retire this plugin generation; in-flight reads cannot republish observers."""
+        with self._lock:
+            self._closed = True
+        self.clear()
+        _unregister_generation_hook()
+
+    def _arm_idle(self):
+        """Caller holds _lock. One deadline timer, only on cores with private observers."""
+        if self._timer is not None or self._closed or not self.entries:
+            return
+        delay = max(0.1, min(e[5][0] for e in self.entries.values()) + self.IDLE_S - time.monotonic())
+        timer = threading.Timer(delay, lambda: self._expire_idle(timer))
+        timer.daemon = True
+        self._timer = timer
+        timer.start()
+
+    def _expire_idle(self, timer):
+        retired = []
+        with self._lock:
+            if self._timer is not timer:
+                return  # cancelled timer racing clear/unload
+            self._timer = None
+            now = time.monotonic()
+            for path, entry in list(self.entries.items()):
+                if now - entry[5][0] < self.IDLE_S:
+                    continue
+                if entry[3].acquire(blocking=False):
+                    del self.entries[path]
+                    retired.append(entry)
+                    entry[3].release()
+                else:
+                    entry[5][0] = now  # borrowed is active, not idle; avoid a tight retry loop
+            self._arm_idle()
+        self._close(*retired)  # never close under the pool lock (core lifecycle lock order)
 
     def evict(self, path):
         """Core reader-cache hook (``path`` is a realpath). Raises instead of waiting on a borrowed observer;
@@ -209,6 +270,8 @@ class _StructuralReads:
         identity = self.identity(path)
         shm = _shm_identity(path)
         with self._lock:
+            if self._closed:
+                raise sqlite3.OperationalError("chat-closeout reader is unloaded")
             entry = self.entries.get(path)
             stale = None
             if entry is not None and (entry[0] != identity or entry[4] != shm):
@@ -216,8 +279,11 @@ class _StructuralReads:
         self._close(stale)
         if entry is not None:
             return entry
-        if board:
-            _register_generation_hook(self)
+        with self._lock:
+            if self._closed:
+                raise sqlite3.OperationalError("chat-closeout reader is unloaded")
+            if board:
+                _register_generation_hook(self)
         conn = ro_connect(Path(path), board=board, check_same_thread=False)
         try:
             if self.identity(path) != identity:
@@ -226,21 +292,30 @@ class _StructuralReads:
         except BaseException:
             conn.close()
             raise
-        fresh = (identity, conn, OrderedDict(), threading.Lock(), shm)
+        fresh = (identity, conn, OrderedDict(), threading.Lock(), shm, [time.monotonic()])
         with self._lock:
             entry = self.entries.get(path)
             retired = []
-            if entry is None or entry[0] != identity or entry[4] != shm:
+            if not self._closed and (entry is None or entry[0] != identity or entry[4] != shm):
                 retired.append(self.entries.pop(path, None))
                 self.entries[path] = entry = fresh
                 fresh = None
                 while len(self.entries) > self.MAX_DATABASES:
                     retired.append(self.entries.popitem(last=False)[1])
+                self._arm_idle()
         self._close(fresh, *retired)  # fresh: another thread published a current one first
+        if self._closed:
+            raise sqlite3.OperationalError("chat-closeout reader is unloaded")
         return entry
 
     def read(self, path, key, query, *, board=False):
         path = str(Path(path).absolute())
+        with self._lock:
+            if self._closed:
+                raise OSError("chat-closeout reader is unloaded")
+        shared = _shared_reader()
+        if shared is not None:
+            return self._borrowed_read(shared, path, key, query)
         try:
             for _ in range(self._ATTEMPTS):
                 entry = self._current(path, board)
@@ -249,7 +324,11 @@ class _StructuralReads:
                         if self.entries.get(path) is not entry:
                             continue  # retired (evicted, bounded out, replaced) while we waited
                         self.entries.move_to_end(path)
-                    return self._read(path, entry, key, query)
+                    try:
+                        return self._read(path, entry, key, query)
+                    finally:
+                        with self._lock:
+                            entry[5][0] = time.monotonic()
         except Exception:
             self.drop(path)
             raise
@@ -260,6 +339,36 @@ class _StructuralReads:
             return query(conn)
         finally:
             conn.close()
+
+    def _borrowed_read(self, shared, path, key, query):
+        # Core owns the lifetime and the exclusive lock, including across plugin reloads.
+        # Never close a borrowed connection or keep a cursor/transaction beyond this body.
+        with shared(Path(path)) as conn:
+            identity, shm = self.identity(path), _shm_identity(path)
+            with self._lock:
+                if self._closed:
+                    # Lifecycle refusal is not a SQLite failure: cached_ro evicts on
+                    # sqlite3.Error, which would close another consumer's reader.
+                    raise OSError("chat-closeout reader is unloaded")
+                entry = self._shared.get(path)
+                # data_version is connection-relative: the same inode/revision on a new
+                # connection is NOT a cache hit. Holding the object prevents id reuse.
+                if entry is None or entry[0] != identity or entry[1] is not conn or entry[4] != shm:
+                    entry = (identity, conn, OrderedDict(), None, shm)
+                    self._shared[path] = entry
+                self._shared.move_to_end(path)
+                while len(self._shared) > self.MAX_DATABASES:
+                    self._shared.popitem(last=False)
+            factory = conn.row_factory
+            try:
+                conn.row_factory = sqlite3.Row
+                return self._read(path, entry, key, query)
+            except Exception:
+                with self._lock:
+                    self._shared.pop(path, None)
+                raise
+            finally:
+                conn.row_factory = factory
 
     def _read(self, path, entry, key, query):
         """Caller holds ``entry[3]``."""

@@ -419,6 +419,62 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
 
     envelope_gate.assess_before_holds = True
 
+    # status_fresh (agent-02be078e8a): session -> {"turn", "ask", "held"} for a status_plain turn. The gate buffers
+    # (legacy needs_buffer) while some session is armed; new core uses the per-session predicate below.
+    fresh_turns: dict = {}
+
+    def _sync_fresh_buffer():
+        status_fresh_gate.needs_buffer = bool(fresh_turns)
+
+    def _arm_status_fresh(session_id, turn, user_message):
+        try:
+            if not session_id or not _load("reply_check").status_fresh_enabled():
+                fresh_turns.pop(session_id, None)
+            else:
+                cur = fresh_turns.get(session_id)
+                if not (cur and cur.get("turn") == turn):
+                    fresh_turns[session_id] = {"turn": turn, "held": False,
+                                               "ask": " ".join(str(user_message).split())[:80]}
+        except Exception as exc:
+            log.debug("coach status_fresh arm: %s", exc)
+            fresh_turns.pop(session_id, None)
+        _sync_fresh_buffer()
+
+    def status_fresh_gate(session_id="", platform="", final_response="", turn_messages=None, attempt=0,
+                          turn_origin=None, **_):
+        """pre_final_gate: on a status_plain turn, hold once (unshown) a draft that states work status with zero tool
+        calls this turn. Deterministic, no LLM call. Fail-open."""
+        try:
+            arm = fresh_turns.get(session_id) if session_id else None
+            if not arm or turn_origin or arm.get("held") or not isinstance(final_response, str):
+                return None
+            rc = _load("reply_check")
+            if not rc.status_fresh_enabled():
+                return None
+            tools = rc.turn_tool_calls(turn_messages)
+            claim = rc.status_fresh_claim(final_response)
+            if not claim:
+                return None
+            rec = {"event": "status_fresh", "session_id": session_id, "turn": arm.get("turn"), "tools": tools,
+                   "claim": claim, "ask": arm.get("ask", ""), **({"platform": platform} if platform else {})}
+            if tools:
+                store.log({**rec, "action": "pass"})
+                return None
+            arm["held"] = True
+            store.log({**rec, "action": "hold", "draft": final_response[:300]})
+            return {"hold": True, "nudge": rc.STATUS_FRESH_NUDGE.format(ask=arm.get("ask", ""), claim=claim)}
+        except Exception as exc:
+            log.debug("coach status_fresh: %s", exc)
+            return None
+
+    status_fresh_gate.needs_buffer = False
+    # New core consumers prefer this per-session predicate over the legacy boolean.
+    # The boolean remains a conservative fallback on older core builds.
+    def _fresh_buffer_for_session(*, session_id=""):
+        return bool(session_id in fresh_turns and _load("reply_check").status_fresh_enabled())
+
+    status_fresh_gate.needs_buffer_for_session = _fresh_buffer_for_session
+
     # session -> this user turn's long_wait_pending_reply record (long_wait.py; self-heal agent-f1f8b24e9d)
     wait_turns: dict = shared.setdefault("long_wait_turns", {})
 
@@ -636,8 +692,11 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         try:
             hint = _load("reply_check").status_plain_hint(user_message, platform or "", parent_session_id or "")
             if not hint:
+                fresh_turns.pop(session_id, None)
+                _sync_fresh_buffer()
                 return None
             st, turn = coach.loop_state(session_id), coach.turn_number(session_id)
+            _arm_status_fresh(session_id, turn, user_message)
             if st.get("status_plain_turn") == turn:
                 return None
             st["status_plain_turn"] = turn
@@ -862,6 +921,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                        "empty_reply" if not text.strip() else "turn_ended")
                 _close_open(session_id, why, why)
                 coach.hint_turn_end(session_id, text, valid=why == "turn_ended")
+                if fresh_turns.pop(session_id, None) is not None:  # status_fresh: the turn is over
+                    _sync_fresh_buffer()
         except Exception as exc:
             log.debug("coach post_llm_call close nudges: %s", exc)
         try:
@@ -1292,6 +1353,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 pass
 
     hooks = {"pre_final_gate": goal_gate, "pre_final_gate:compute_envelope": envelope_gate,
+             "pre_final_gate:status_fresh": status_fresh_gate,
                    "pre_tool_call": pre_tool_call, "pre_verify": pre_verify, "post_llm_call": post_llm_call, "pre_llm_call": pre_llm_call, "post_tool_call": post_tool_call,
                    "transform_tool_result": transform_tool_result, "on_interim_message": on_interim_message}
     # Retirement removes the registered gate, not merely its enforcement mode.

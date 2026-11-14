@@ -177,6 +177,31 @@ def test_python_allow_direction(repo, code):
     assert g.check_python(code, str(repo)) is None
 
 
+@pytest.mark.parametrize("code", [
+    # Incident plugin-e90850b9da: a kanban_attach upload whose calls list holds non-literal values.
+    'import base64\nfrom pathlib import Path\np = Path("r.md")\n'
+    'tool_call(calls=[{"name": "kanban_attach", "arguments": {"filename": p.name, '
+    '"content_base64": base64.b64encode(p.read_bytes()).decode()}}])',
+    'tool_call(calls=build_calls())',
+    'tool_call(calls=None)',
+    'tool_call()',
+])
+def test_python_nonliteral_tool_call_allows(repo, code):
+    # The guard reads literals only; a non-literal calls list is allowed, never a TypeError.
+    assert g.check_python(code, str(repo)) is None
+
+
+@pytest.mark.parametrize("calls", [None, 7, "terminal", {"name": "terminal"}])
+def test_tool_call_malformed_calls_does_not_raise(repo, calls):
+    assert g.check_tool("tool_call", {"calls": calls}, str(repo)) is None
+    hooks = {}
+    class Context:
+        def register_hook(self, name, fn):
+            hooks[name] = fn
+    plugin.register(Context())
+    assert hooks["pre_tool_call"](tool_name="tool_call", args={"calls": calls}) is None
+
+
 def test_python_cwd(repo, tmp_path):
     assert g.check_python(f'subprocess.run(["git", "push", "origin", "main"], cwd={str(repo)!r})', str(tmp_path))
 

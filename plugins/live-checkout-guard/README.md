@@ -41,6 +41,26 @@ there and the updater skipped every pass for 1h25m. Tests: `tests_core_root.py`.
 
 ## Behavior
 
+Directory changes are fallible. The shell checker retains both the previous and destination cwd
+after `cd`/`pushd` followed by `;`, a newline, or `||`. A plain `cd /outside && command` may use
+the destination for that success-gated chain, but a following `; command` again includes the
+failure path. Existing directories are not proof of success (permissions and races still apply).
+Loops, branches, pipelines and subshells conservatively retain possible cwd states, including
+loop back-edges; complicated flows may be refused. Unknown destinations never erase a known
+protected cwd. Literal-prefixed relative outputs such as `pr$n.json` are checked against that
+cwd even when the loop variable is unresolved. Absolute outside output paths and explicit safe
+tool `workdir` remain supported. Tests: `tests_cwd_flow.py`, including an isolated real-Bash repro.
+
+### Review and probe evidence
+
+Use absolute evidence paths outside deployment checkouts. Create the evidence directory in a
+separate tool call and verify that call succeeded before collecting files. Prefer an explicit
+tool `workdir`; otherwise use `cd /absolute/evidence && command` and keep every dependent write
+inside the success-gated chain. Never use unchecked `cd /evidence; command` (including before
+a `for` loop): Bash continues in the prior directory if `cd` fails. An approval refusal of a
+combined mkdir/cd call means neither command ran; do not retry just the cd and assume the
+directory was created. Existing cleanup refusals still apply to accidental live-checkout files.
+
 - `patch` / `write_file` (Hermes, also `mcp__` names; replace mode and V4A `*** Update/Add/Delete File` / `Move to`):
   refused if any target resolves into the root.
 - Starting cwd: the call's `workdir`, else the session's **recorded terminal cwd** from the core

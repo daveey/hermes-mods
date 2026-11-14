@@ -283,7 +283,7 @@ The request rules (fresh regular 0600 file, atomic consume, one attempt per proc
 cache census. Once disarmed, a later request in that directory is never consumed.
 
 `result.json` (0600, at most 64 KiB) holds `schema: 1`, `kind: roots_census`, `status: ok|unknown`,
-`truncated`, `bytes`, `objects`, `gc_objects`, `roots`, `owners`, `bitmap_bytes` (the scan's visited
+`truncated`, `labels_truncated`, `bytes`, `objects`, `gc_objects`, `roots`, `owners`, `bitmap_bytes` (the scan's visited
 bitmap), `seconds`, the phase totals
 `module_bytes`, `frame_bytes`, `code_bytes`, `instance_bytes`, `unowned_bytes`, and `top`: the 100
 largest owners as `[owner, bytes, objects]`. The walk is breadth-first from all owners at once, so a
@@ -296,6 +296,13 @@ shared object is counted once, for the nearest owner. Owners, in the order they 
 | `<code module>` | what the module's classes and functions hold: class dicts, constants, docstrings, defaults, closures |
 | `<inst module.Class>`, `<inst module.Class>.attr` | objects nothing above reached, by class. A class with at most 8 such instances gets a row per attribute |
 | `<unowned type>` | the rest, by type |
+
+**Coverage.** At most 100,000 named owner buckets are retained, plus one `<other owners>` bucket.
+`labels_truncated: true` means at least one new label overflowed that budget; `owners` counts retained
+buckets, not all owners. Deadline truncation is reported separately as `truncated`. Attribution coverage
+requires `status: ok` and both flags false; even then `top` is only a ranking of 100 owners. Older reports
+without `labels_truncated` do not prove label coverage. `tests_roots_labels.py` exercises exact-cap and
+overflow boundaries, late large owners beyond the former 20,000-label budget, and serialized report flags.
 
 **What the numbers are.** Sizes are `sys.getsizeof` (shallow) sums: Python object bytes, not the
 process footprint. Allocator slack, C-extension buffers and freed-but-kept arenas are not in it, so

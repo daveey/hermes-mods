@@ -15,6 +15,84 @@ import re
 import shlex
 import subprocess
 import sys
+import time
+from contextvars import ContextVar, copy_context
+from concurrent.futures import ThreadPoolExecutor
+
+# One aggregate allowance, not a fresh timeout for every API/file/merge probe.
+PREFLIGHT_TIMEOUT = 18.0
+_PREFLIGHT_DEADLINE: ContextVar[float | None] = ContextVar("ship_preflight_deadline", default=None)
+_PREFLIGHT_STAGE = ContextVar("ship_preflight_stage", default="command inspection")
+_TURN_READ_ONLY = ContextVar("ship_turn_read_only", default=False)
+
+
+
+class _PreflightExpired(RuntimeError):
+    pass
+
+
+def _remaining():
+    deadline = _PREFLIGHT_DEADLINE.get()
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _PreflightExpired("ship-only-guard preflight deadline exceeded during "
+                                + _PREFLIGHT_STAGE.get() + "; retry after checking network/CI")
+    return remaining
+
+
+def bounded_preflight(check, *args, **kwargs):
+    """Share a monotonic deadline across nested calls; late results never allow."""
+    parent = _PREFLIGHT_DEADLINE.get()
+    deadline = time.monotonic() + PREFLIGHT_TIMEOUT
+    token = _PREFLIGHT_DEADLINE.set(min(parent, deadline) if parent is not None else deadline)
+    try:
+        result = check(*args, **kwargs)
+        _remaining()
+        return result
+    except _PreflightExpired as exc:
+        return str(exc)
+    finally:
+        _PREFLIGHT_DEADLINE.reset(token)
+
+
+def _stage(name, fn, *args):
+    token = _PREFLIGHT_STAGE.set(name)
+    try:
+        _remaining()
+        result = fn(*args)
+        _remaining()
+        return result
+    finally:
+        _PREFLIGHT_STAGE.reset(token)
+
+
+def _parallel(jobs):
+    """Independent bounded reads; preserve result/exception priority and context.
+
+    Joining all workers is intentional: none may keep probing after we return.
+    Each worker (including nested pools) inherits the SAME aggregate deadline.
+    """
+    if not jobs:
+        return []
+    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        futures = [pool.submit(copy_context().run, _stage, name, fn, *args)
+                   for name, fn, args in jobs]
+        return [f.result() for f in futures]
+
+
+def _run_probe(*args, **kwargs):
+    remaining = _remaining()
+    if remaining is not None:
+        kwargs["timeout"] = min(kwargs["timeout"], remaining)
+    try:
+        result = subprocess.run(*args, **kwargs)
+    except subprocess.TimeoutExpired:
+        _remaining()  # Aggregate expiry must not be swallowed as missing evidence.
+        raise
+    _remaining()
+    return result
 
 MARKER = "HERMES_CORE_WT_LAND"
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -52,7 +130,7 @@ def _git(cwd, *args):
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env["GIT_TERMINAL_PROMPT"] = "0"
     try:
-        p = subprocess.run(["git", "--no-optional-locks", "-C", str(cwd), *args],
+        p = _run_probe(["git", "--no-optional-locks", "-C", str(cwd), *args],
                            env=env, capture_output=True, text=True, timeout=2)
         return p.stdout.strip() if p.returncode == 0 else ""
     except (OSError, subprocess.SubprocessError):
@@ -377,7 +455,7 @@ def _gh_text(path, cwd, env, accept=None):
     probe_env["GH_PROMPT_DISABLED"] = "1"
     argv = ["gh", "api", *(["-H", f"Accept: {accept}"] if accept else []), path]
     try:
-        p = subprocess.run(argv, cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True, timeout=15)
+        p = _run_probe(argv, cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.SubprocessError) as e:
         raise _Unreadable(f"`gh api {path}` could not run ({type(e).__name__})")
     if p.returncode != 0:
@@ -403,7 +481,7 @@ def _patch_id(diff, cwd):
     if not diff.strip():
         raise _Unreadable("a PR diff is empty")
     try:
-        p = subprocess.run(["git", "patch-id", "--verbatim"], input=diff, cwd=_probe_cwd(cwd),
+        p = _run_probe(["git", "patch-id", "--verbatim"], input=diff, cwd=_probe_cwd(cwd),
                            capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.SubprocessError) as e:
         raise _Unreadable(f"`git patch-id` could not run ({type(e).__name__})")
@@ -419,10 +497,10 @@ def _patch_id(diff, cwd):
 # two parents gives over their merge base. Read through gh like the rest of the carry (no fetch, no credentials
 # in git, no cache on disk); only a path both parents changed differently is merged locally, by `git merge-file`
 # on the three blobs, and any conflict, add/add, modify/delete, symlink, submodule or oversized blob refuses.
-# That is never looser than `git merge-tree --write-tree`: it only lacks rename detection, so a rename on one
-# side meeting an edit on the other refuses (fail closed) where merge-tree would merge it.
+# This is a rejection prefilter, NOT proof of a clean Git merge: rename/delete can look clean path by path.
+# Every survivor also passes `_git_merge_tree_refusal`, including Git's rename/conflict handling.
 _MERGE_FILES = 8             # paths per merge both parents changed differently (content-merged locally)
-_MERGE_BLOB_BYTES = 1 << 20  # largest blob read for such a content merge
+_MERGE_BLOB_BYTES = 8 << 20  # allow large text files; still bound each content-merge blob
 _FILE_MODES = ("100644", "100755")
 
 
@@ -447,13 +525,10 @@ def _flat_tree(sha, repo, cwd, env):
 
 def _flat_trees(shas, repo, cwd, env, cache):
     """_flat_tree of each sha; the uncached ones read in parallel (each read takes ~3 s on a 5k-path tree)."""
-    from concurrent.futures import ThreadPoolExecutor
     todo = [s for s in dict.fromkeys(shas) if s not in cache]
     if todo:
-        with ThreadPoolExecutor(max_workers=len(todo)) as pool:
-            futures = [pool.submit(_flat_tree, s, repo, cwd, env) for s in todo]
-            for s, future in zip(todo, futures):
-                cache[s] = future.result()   # re-raises _Unreadable
+        values = _parallel([("carry tree reads", _flat_tree, (s, repo, cwd, env)) for s in todo])
+        cache.update(zip(todo, values))
     return [cache[s] for s in shas]
 
 
@@ -485,7 +560,7 @@ def _merge_file(ours, base, theirs, cwd):
             Path(tmp, name).write_bytes(data)
             names.append(str(Path(tmp, name)))
         try:
-            p = subprocess.run(["git", "merge-file", "-p", "-q", *names], cwd=tmp, env=env,
+            p = _run_probe(["git", "merge-file", "-p", "-q", *names], cwd=tmp, env=env,
                                capture_output=True, timeout=15)
         except (OSError, subprocess.SubprocessError) as e:
             raise _Unreadable(f"`git merge-file` could not run ({type(e).__name__})")
@@ -523,7 +598,9 @@ def _merge_tree_refusal(merge, ours, theirs, repo, cwd, env, cache):
     for path in both:
         # Two file modes only, so at most one side changed the mode: that side's mode wins, as in git.
         mode = t[path][0] if o[path][0] == base[path][0] else o[path][0]
-        ours_b, base_b, theirs_b = (_blob(tree[path][1], tree[path][2], repo, cwd, env) for tree in (o, base, t))
+        ours_b, base_b, theirs_b = _parallel([
+            ("carry blob reads", _blob, (tree[path][1], tree[path][2], repo, cwd, env))
+            for tree in (o, base, t)])
         blob = _merge_file(ours_b, base_b, theirs_b, cwd)
         if blob is None:
             return f"{path} does not merge cleanly"
@@ -533,6 +610,62 @@ def _merge_tree_refusal(merge, ours, theirs, repo, cwd, env, cache):
         diff = sorted(p for p in set(have) | set(want) if have.get(p) != want.get(p))
         return (f"its tree differs from the clean merge of {ours[:10]} and {theirs[:10]} at {diff[0]}"
                 + (f" (+{len(diff) - 1} more)" if len(diff) > 1 else ""))
+    return ""
+
+
+def _git_merge_tree_refusal(merge, ours, theirs, repo, cwd, env):
+    """Authoritative merge-tree check; a bounded shallow fetch may refuse, never guess."""
+    import tempfile
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) or not all(
+            isinstance(s, str) and _SHA.fullmatch(s) for s in (merge, ours, theirs)):
+        return "merge-tree inputs are unreadable"
+    run_env = {k: v for k, v in {**os.environ, **env}.items() if not k.startswith("GIT_")}
+    run_env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0")
+    home = Path(run_env.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    step = "cache"
+    try:
+        cache = home / "cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="ship-carry-", dir=cache) as tmp:
+            def git(*args):
+                nonlocal step
+                step = args[0]
+                p = _run_probe(["git", "-c", "core.hooksPath=" + os.devnull,
+                                    "-c", "credential.helper=!gh auth git-credential", *args],
+                                   cwd=tmp, env=run_env, capture_output=True, text=True, timeout=30)
+                if p.returncode != 0:
+                    raise _Unreadable(f"git {step} exited {p.returncode}")
+                if not isinstance(p.stdout, str):
+                    raise _Unreadable(f"git {step} returned unreadable output")
+                return p.stdout.strip()
+
+            git("init", "--bare", "--template=", "-q")
+            # Fetch full blobs: avoids lazy fetch subprocesses inside merge-tree and
+            # their separate auth/timeouts. Depth and wall time bound the attempt.
+            git("fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "--depth=128",
+                "https://github.com/" + repo + ".git", merge, ours, theirs)
+            parents = git("show", "-s", "--format=%P", merge).split()
+            if parents != [ours, theirs]:
+                return "fetched merge parents differ from the reported parents"
+            bases = git("merge-base", "--all", ours, theirs).split()
+            if len(bases) != 1 or not _SHA.fullmatch(bases[0]):
+                return "merge base is unreadable or multiple (cannot prove bounded history)"
+            shallow = Path(tmp, "shallow")
+            if shallow.exists():
+                cuts = set(shallow.read_text().split())
+                relevant = set(git("rev-list", ours, theirs, "--not", bases[0]).split())
+                if cuts & relevant:
+                    return "fetch depth cuts history before the merge base"
+            want = git("merge-tree", "--write-tree", ours, theirs)
+            have = git("rev-parse", merge + "^{tree}")
+            if not _SHA.fullmatch(want) or not _SHA.fullmatch(have):
+                return "merge-tree returned an unreadable tree id"
+            if have != want:
+                return "its tree differs from the clean merge computed by git merge-tree"
+    except _Unreadable as e:
+        return str(e)
+    except (OSError, UnicodeError, subprocess.SubprocessError) as e:
+        return f"git {step} could not complete ({type(e).__name__})"
     return ""
 
 
@@ -601,8 +734,9 @@ def _carry_one(head, h0, blocked, repo, cwd, env):
                 return False, (f"{lead}: merge parent {parent[:10]} is not on state (the head merged "
                                "something other than the base)")
         diff = "application/vnd.github.diff"
-        old = _patch_id(_gh_text(f"repos/{repo}/compare/state...{h0}", cwd, env, accept=diff), cwd)
-        new = _patch_id(_gh_text(f"repos/{repo}/compare/state...{head}", cwd, env, accept=diff), cwd)
+        def patch_id(sha):
+            return _patch_id(_gh_text(f"repos/{repo}/compare/state...{sha}", cwd, env, accept=diff), cwd)
+        old, new = _parallel([("carry patch reads", patch_id, (sha,)) for sha in (h0, head)])
     except _Unreadable as e:
         return False, f"{lead}: {e}, so patch identity cannot be shown"
     if old != new:
@@ -610,7 +744,11 @@ def _carry_one(head, h0, blocked, repo, cwd, env):
     cache = {}
     try:
         for merge, ours, theirs in reversed(merges):
-            why = _merge_tree_refusal(merge, ours, theirs, repo, cwd, env, cache)
+            prefilter, authoritative = _parallel([
+                ("carry tree/content check", _merge_tree_refusal, (merge, ours, theirs, repo, cwd, env, cache)),
+                ("carry git fetch/merge-tree", _git_merge_tree_refusal, (merge, ours, theirs, repo, cwd, env)),
+            ])
+            why = prefilter or authoritative
             if why:
                 return False, f"{lead}: merge {merge[:10]} is not a clean, unedited merge of the base: {why}"
     except _Unreadable as e:
@@ -739,7 +877,7 @@ def _base_drift_refusal(number, repo, data, cwd, env):
     probe_env = dict(env)
     probe_env["GH_PROMPT_DISABLED"] = "1"
     try:
-        p = subprocess.run(["gh", "api", f"repos/{repo}/compare/{base}...state"],
+        p = _run_probe(["gh", "api", f"repos/{repo}/compare/{base}...state"],
                            cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True, timeout=15)
         if p.returncode != 0:
             return closed(f"the compare {base[:10]}...state failed (exit {p.returncode})")
@@ -814,7 +952,7 @@ def _attribute_hits(repo, names, window, subject, cwd, env):
     out = []
     for name in names:
         try:
-            p = subprocess.run(["gh", "api", f"repos/{repo}/commits?sha=state&path={quote(name, safe='/')}&per_page=5"],
+            p = _run_probe(["gh", "api", f"repos/{repo}/commits?sha=state&path={quote(name, safe='/')}&per_page=5"],
                                cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True, timeout=8)
             listed = json.loads(p.stdout) if p.returncode == 0 else None
         except (OSError, ValueError, subprocess.SubprocessError):
@@ -858,7 +996,7 @@ def _gh_call(args, cwd, env, payload=None, timeout=10):
     probe_env["GH_PROMPT_DISABLED"] = "1"
     argv = ["gh", "api", *args, *(["--input", "-"] if payload is not None else [])]
     try:
-        p = subprocess.run(argv, cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True,
+        p = _run_probe(argv, cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True,
                            timeout=timeout, input=json.dumps(payload) if payload is not None else None)
     except (OSError, subprocess.SubprocessError):
         return -1, None
@@ -920,7 +1058,7 @@ def _live_turns(repo, cwd, env):
         if rec and rec["expires"] > now:
             out.append((ref["ref"], rec))
         elif rec is None or rec["expires"] + _TURN_TTL <= now:
-            _gh_call(["-X", "DELETE", f"repos/{repo}/git/{ref['ref']}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+            _turn_delete(ref['ref'], repo, cwd, env)
     return out
 
 
@@ -946,7 +1084,7 @@ def _turn_hold_refusal(number, data, repo, cwd, env):
         if rc != 0 or not isinstance(pr, dict):
             continue   # cannot tell whether the holder is still open: fail open
         if pr.get("state") != "open":
-            _gh_call(["-X", "DELETE", f"repos/{repo}/git/{ref}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+            _turn_delete(ref, repo, cwd, env)
             continue   # the holder landed or closed: its turn is over
         return (f"[ship-only-guard] Refused state merge of PR #{number}: PR #{rec['pr']} holds the state land "
                 f"turn until {_until(rec['expires'])} ({ref}), and this merge would change its area ({hit[1]} ~ "
@@ -1005,8 +1143,24 @@ def _turn_safe(fn, *args):
     """The land turn only orders landings: any error in it adds nothing (the drift compare still guards)."""
     try:
         return fn(*args)
+    except _PreflightExpired:
+        raise
     except Exception:
         return None
+
+
+def _turn_delete(ref, repo, cwd, env):
+    if not _TURN_READ_ONLY.get():
+        _gh_call(["-X", "DELETE", f"repos/{repo}/git/{ref}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+
+
+def _turn_hold_read_only(*args):
+    # Speculation must not delete refs before the approval gate has succeeded.
+    token = _TURN_READ_ONLY.set(True)
+    try:
+        return _turn_safe(_turn_hold_refusal, *args)
+    finally:
+        _TURN_READ_ONLY.reset(token)
 
 
 def _state_merge(words, repo, cwd, env):
@@ -1066,7 +1220,7 @@ def _state_merge(words, repo, cwd, env):
                 "only through `hermes-core-wt ship <slug>`.")
 
     try:
-        p = subprocess.run(["gh", "pr", "view", number, "--repo", repo, "--json", fields],
+        p = _run_probe(["gh", "pr", "view", number, "--repo", repo, "--json", fields],
                            cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.SubprocessError) as e:
         return failed(f"`gh pr view {number} --repo {repo}` could not run ({type(e).__name__}: {str(e)[:120]})")
@@ -1116,15 +1270,27 @@ def _state_merge(words, repo, cwd, env):
         if bad:
             return failed(f"{len(bad)} of {len(checks)} checks not green: " + ", ".join(bad[:8])
                           + (f", +{len(bad) - 8} more" if len(bad) > 8 else ""))
-        refusal = (_review_reply_refusal(number, data) or _approval_refusal(number, data, repo, cwd, env)
-                   or _turn_safe(_turn_hold_refusal, number, data, repo, cwd, env))
+        refusal = _review_reply_refusal(number, data)
         if refusal:
             return refusal
-        drift = _base_drift_refusal(number, repo, data, cwd, env)
+        approval, hold = _parallel([
+            ("approval/carry reads", _approval_refusal, (number, data, repo, cwd, env)),
+            ("land-turn reads", _turn_hold_read_only, (number, data, repo, cwd, env)),
+        ])
+        if approval or hold:
+            return approval or hold
+        # Keep the mutable base read last; speculative drift would widen the race
+        # between observing state and handing the admitted command to gh.
+        drift = _stage("drift check", _base_drift_refusal, number, repo, data, cwd, env)
         if drift and "state commit(s) landed since then" in drift:
             # Green, approved, refused only for drift: take the land turn so the refreshed head's CI cycle
             # is the last one (overlapping merges and direct pushes wait for it).
-            until = _turn_safe(_turn_acquire, number, data, repo, cwd, env)
+            # Taking a turn is optional and cannot change the refusal. Do not start
+            # its writes when the aggregate allowance cannot fit its own budget.
+            remaining = _remaining()
+            until = (_stage("land-turn acquisition", _turn_safe, _turn_acquire,
+                            number, data, repo, cwd, env)
+                     if remaining is None or remaining > _TURN_BUDGET else None)
             if until:
                 drift += (f" PR #{number} now holds the state land turn until {until} (refs/{_TURN_PREFIX}"
                           f"{number}): overlapping state PR merges and direct state pushes wait for it, so "
@@ -1178,7 +1344,7 @@ def _upstream_sync_merge(words, repo, cwd, env):
     probe_env = dict(env)
     probe_env["GH_PROMPT_DISABLED"] = "1"
     try:
-        p = subprocess.run(["gh", "pr", "view", args[0], "--repo", repo, "--json", fields],
+        p = _run_probe(["gh", "pr", "view", args[0], "--repo", repo, "--json", fields],
                            cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True, timeout=15)
         if p.returncode != 0:
             return False
@@ -1470,7 +1636,11 @@ def check_tool(name, args, cwd=None, repos=None, env=None, _depth=0):
     if name == "execute_code":
         return check_python(str(args.get("code") or ""), cwd, repos, env, _depth + 1)
     if name == "tool_call":
-        for call in args.get("calls", []):
+        # check_python passes non-literal values as None; only a literal list/tuple is inspectable.
+        calls = args.get("calls") or []
+        if not isinstance(calls, (list, tuple)):
+            return None
+        for call in calls:
             if isinstance(call, dict):
                 why = check_tool(str(call.get("name", "")), call.get("arguments"), cwd, repos, env, _depth + 1)
                 if why:
@@ -1483,7 +1653,7 @@ def main(argv=None):
     if not argv or argv[0] != "--gh-args":
         print("usage: guard.py --gh-args <gh arguments...>", file=sys.stderr)
         return 2
-    why = check_argv(["gh", *argv[1:]])
+    why = bounded_preflight(check_argv, ["gh", *argv[1:]])
     if why:
         print(why, file=sys.stderr)
         return 1

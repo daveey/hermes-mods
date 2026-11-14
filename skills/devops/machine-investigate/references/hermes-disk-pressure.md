@@ -46,6 +46,9 @@ Read when a Hermes host (not a Mac) is low on disk, including the "Low disk · /
 
 ## Producers the existing GC misses
 
+- **Fake-HOME test homes in running review/mutant cards.** These cards run `env -i HOME=<card>/home-<side> bash scripts/run_tests.sh`, one home per PR side (`home-new2571`, `home-old2571`, ...). Each home costs about 600 MiB of private `.hermes/installs/*/test-environment` venv plus its own uv cache. `pm.environments.account_home_root()` follows `$HOME`, so under a fake HOME it never shares the account's `cache/uv`. run_tests.sh's tool-store borrow does use `getent passwd`, but that covers only `tools/`. A 10-PR sweep holds about 7 GiB while it runs. The fix card is t_01a1d7027fa9e3b6. To find these homes, sample `/proc/<pid>/environ` HOME on the top writers.
+- **Measure private bytes with full inode accounting.** A byte is private when every link to its inode is inside the tree. Don't count only files with `nlink==1`: venv files are hard-linked to the home's own uv cache (nlink 3, all inside the home), so `nlink==1` reported 215 MiB for a home that held 599 MiB private.
+
 - **Test-run homes in `cache/scratch`** (for example `coach-collection-*`, ~400 MB each). A conftest that uses a
   `TemporaryDirectory` as `tempfile.tempdir` puts the pytest basetemp inside it, and the directory leaks when the
   run is killed. Only the 24 h idle scratch prune removes it. Delete one only after checking that no process has

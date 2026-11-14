@@ -98,5 +98,28 @@ def test_tool_call_wrapper_is_seen():
     assert got and got["action"] == "block"
 
 
+def test_python_unparseable_literal_fallback():
+    got = block("execute_code", {"code": 'terminal("gh run cancel 9"'})
+    assert got and got["action"] == "block"
+
+
+def test_unclosed_quote_adjacent_separator_fallback():
+    got = block("terminal", {"command": "echo it's;gh run cancel 9"})
+    assert got and got["action"] == "block"
+
+
+def test_escaped_semicolon_not_command():
+    assert block("terminal", {"command": r"echo a\;gh run cancel 9"}) is None
+
+
+def test_escaped_double_quote_keeps_alternation_quoted():
+    assert block("terminal", {"command": r'rg "a\"|gh run cancel 9" logs'}) is None
+
+
+def test_adjacent_semicolon_real_cancel_blocked():
+    got = block("terminal", {"command": "echo x;gh run cancel 9"})
+    assert got and got["action"] == "block"
+
+
 def test_override_is_logged_escape_hatch():
     assert block("terminal", {"command": "CI_CANCEL_GUARD=off gh run cancel 9"}) is None

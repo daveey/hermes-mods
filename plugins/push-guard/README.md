@@ -1,5 +1,38 @@
 # push-guard
 
+## hermes-mods PR-only policy
+
+`daveey/hermes-mods` PRs use `python3 plugins/push-guard/land.py --pr N --head SHA`.
+Run from the deployed checkout or use its absolute path. Run under the normal authenticated
+GitHub environment (for example `token-broker exec --scope user/github --reason 'reviewed PR landing' -- python3 ...`).
+This path is separate from ordinary fast-forward direct pushes, which retain their existing gates.
+
+The helper reads classic required checks plus applicable branch rulesets. Only an authoritative empty
+requirement inventory permits the fallback to **all** checks and commit statuses. Every selected result
+must be success on the exact head; missing, pending, cancelled, neutral, skipped, malformed and unreadable
+evidence holds. Check app identity is retained; newest runs/statuses replace older results. An independent
+non-bot GitHub approval must name the current full head and cannot be from the author or landing account.
+Effective changes-requested reviews hold both approval routes. COMMENT prose never approves.
+
+Where the same account implements and reviews, add `--review-task <done-card> --implementation-task <card>`.
+The installed `hermes-core-wt-land` review validator must be present; its read-only `review_gate` validates
+the completed run/session evidence, locally or through authenticated Board execution records. There is
+no caller-supplied receipt file, approval carry or fallback to prose. Missing/incompatible validation holds.
+Reviews with unanswered non-blocking points are conservatively held; obtain a clean follow-up review.
+
+Raw `gh pr merge`, REST PUT (gh/curl/Python), GraphQL merge and auto-merge requests are refused even with
+no `push-guards.json`; `PUSH_GUARD=off` does not bypass this PR-only policy. Cancel-auto and GET remain reads.
+The helper performs an immediate head-pinned REST merge and exact-PR readback. Do not repeat a merge whose
+write outcome is unknown: inspect the PR first. This does not change GitHub permissions. The static agent
+hook is defense in depth, not an OS sandbox: opaque programs, dynamically constructed URLs and external
+clients are outside its enforcement boundary. Head pinning is atomic; review dismissal/base movement
+after the final read is not locked by GitHub's REST SHA parameter. Existing configured overlap guards
+for other repositories are unchanged.
+
+Tests: `tests_landing.py` covers the actual helper write boundary, independent/stale/self/bot/dismissed
+review, pending/red/missing/unreadable CI, required-vs-all selection, app identity, head changes and raw
+CLI/API/auto/Python/GraphQL refusal without config. Run `scripts/test-all --no-core --exact -k plugins/push-guard -k repo-guards`.
+
 ## Landing-overlap gate (`gh pr merge` on a `require_check` repo)
 
 After the exact-head check passes, the guard asks GitHub's compare API how far the base branch moved since

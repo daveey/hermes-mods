@@ -10,6 +10,10 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs Linux /proc/self/fd")
+
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("stranded_restart", HERE / "stranded_restart.py")
 sr = importlib.util.module_from_spec(spec)

@@ -803,11 +803,102 @@ def cancel_message(what: str) -> str:
     return CANCEL_MESSAGE.format(what=what[:120])
 
 
+# PR-only repository policy: deliberately NOT part of load_guards/direct-push rules.
+MODS_REPO = "daveey/hermes-mods"
+MODS_LANDING = (
+    "PUSH GUARD: blocked: raw hermes-mods PR merges (including auto/API) lack the reviewed landing gate. "
+    "Use `python3 ~/code/hermes-mods/plugins/push-guard/land.py --pr <number> --head <40-hex-sha>` "
+    "with independent current-head GitHub approval, or add `--review-task <done-review-card> "
+    "--implementation-task <implementation-card>`. It checks required CI (ALL checks when none configured), "
+    "independent exact-head review, and merges immediately with a server-side head pin. "
+    "Ordinary guarded fast-forward direct pushes are unchanged."
+)
+
+
+def _mods_merge(cmd: str, cwd: str, python: bool = False, depth: int = 0) -> Optional[str]:
+    try:
+        return _mods_merge_checked(cmd, cwd, python, depth)
+    except Exception:
+        # The activation module historically fails open on classifier exceptions.
+        # This PR policy must instead hold uncertain merge analysis.
+        return MODS_LANDING + " Merge-target analysis failed; inspect the target before retrying."
+
+
+def _mods_merge_checked(cmd: str, cwd: str, python: bool = False, depth: int = 0) -> Optional[str]:
+    if depth > 4:
+        return MODS_LANDING
+    if python:
+        try:
+            tree = ast.parse(cmd)
+        except (SyntaxError, ValueError):
+            return MODS_LANDING
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", "")
+            if name not in PY_CALLS:
+                continue
+            texts = _py_strings(node)
+            for arg in node.args:
+                if isinstance(arg, ast.Starred) and isinstance(arg.value, (ast.List, ast.Tuple)):
+                    if all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in arg.value.elts):
+                        texts.append(shlex.join([e.value for e in arg.value.elts]))
+            for text in texts:
+                if "merge" in text.lower():
+                    why = _mods_merge(text, cwd, depth=depth + 1)
+                    if why:
+                        return why
+    # gh accepts repository flags before the subcommand; normalize only this PR policy.
+    for d, words in _commands(cmd, cwd):
+        if os.path.basename(words[0]) == "gh" and len(words) > 1 and words[1].startswith("-"):
+            rest, flags = words[1:], []
+            while rest and rest[0].startswith("-"):
+                option = rest.pop(0)
+                flags.append(option)
+                if option in GH_GLOBAL_VALUE_OPTS and rest:
+                    flags.append(rest.pop(0))
+            if rest[:2] == ["pr", "merge"]:
+                why = _mods_merge(shlex.join(["gh", *rest, *flags]), d, depth=depth + 1)
+                if why:
+                    return why
+        if os.path.basename(words[0]) in SHELL_WRAPPERS:
+            for word in words[1:]:
+                if "merge" in word.lower() and ("gh " in word or "curl " in word):
+                    why = _mods_merge(word, d, depth=depth + 1)
+                    if why:
+                        return why
+    for d, sel, repo, _ in _gh_merges(cmd, cwd):
+        if not repo and not (sel and "/pull/" in sel):
+            assigned = re.findall(r"GH_REPO=[\"']?([^\s;\"']+)", cmd)
+            if any(_slug(value) == MODS_REPO for value in [*assigned, os.environ.get("GH_REPO", "")]):
+                return MODS_LANDING
+        if _merge_repo(d, sel, repo) == MODS_REPO:
+            return MODS_LANDING
+    for _, slug, _, _, _ in _api_merges(cmd, cwd):
+        if slug == MODS_REPO:
+            return MODS_LANDING
+    if python and re.search(r"[\"']PUT[\"']|\.put\(", cmd, re.I):
+        for url in PY_REST_URL.findall(cmd):
+            match = REST_MERGE.match(url)
+            if match and _slug('/'.join(match.groups()[:2])) == MODS_REPO:
+                return MODS_LANDING
+    if GQL_MERGE.search(cmd) and GQL_CALL.search(cmd):
+        slug = _gql_repo(cmd, [{"remote": MODS_REPO}])
+        if slug is None:
+            return "PUSH GUARD: blocked: cannot identify GraphQL merge target. " + MODS_LANDING
+        if slug == MODS_REPO:
+            return MODS_LANDING
+    return None
+
+
 # --- entry points --------------------------------------------------------------------------------------------
 
 def check_shell(cmd: str, cwd: Optional[str] = None, guards: Optional[list[dict]] = None) -> Optional[str]:
     guards = load_guards() if guards is None else guards
     cmd = cmd or ""
+    policy = _mods_merge(cmd, _resolve(cwd or os.getcwd())) if "merge" in cmd.lower() else None
+    if policy:
+        return policy
     if not guards or OVERRIDE in cmd or ("push" not in cmd and "merge" not in cmd.lower()):
         return None
     why = None
@@ -886,7 +977,11 @@ def check_python(code: str, cwd: Optional[str] = None, guards: Optional[list[dic
     """Shell strings inside Python (subprocess.run("...", shell=True), terminal("...")) and argv lists."""
     guards = load_guards() if guards is None else guards
     code = code or ""
-    if not guards or ("push" not in code and "merge" not in code.lower()):
+    if "merge" in code.lower():
+        policy = _mods_merge(code, _resolve(cwd or os.getcwd()), python=True)
+        if policy:
+            return policy
+    if ("push" not in code and "merge" not in code.lower()):
         return None
     if OVERRIDE not in code:
         if GQL_MERGE.search(code) and GQL_CALL.search(code):

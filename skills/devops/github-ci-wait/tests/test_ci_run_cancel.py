@@ -109,5 +109,71 @@ class CiRunCancelTests(unittest.TestCase):
         self.assertIn("--force", p.stdout)
 
 
+# In-process tests control the clock and successive reads without waiting on GitHub.
+def load_cancel():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("cancel_regression", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def cancel_args():
+    return ["--run-id", "9", "--gh-repo", "o/r", "--expect-attempt", "2"]
+
+
+def test_postread_attempt_moves(monkeypatch):
+    module = load_cancel()
+    reads = iter([
+        {"status": "queued", "attempt": 2, "conclusion": None, "url": ""},
+        {"status": "completed", "attempt": 3, "conclusion": "cancelled", "url": ""},
+    ])
+    monkeypatch.setattr(module, "read_run", lambda *args: next(reads))
+    monkeypatch.setattr(module, "gh", lambda *args: "{}")
+    assert module.main(cancel_args()) == 4
+
+
+def test_polling_wait_actually_retries(monkeypatch):
+    module = load_cancel()
+    queued = {"status": "queued", "attempt": 2, "conclusion": None, "url": ""}
+    reads = iter([queued, queued, {**queued, "status": "completed"}])
+    sleeps = []
+    monkeypatch.setattr(module, "read_run", lambda *args: next(reads))
+    monkeypatch.setattr(module, "gh", lambda *args: "{}")
+    monkeypatch.setattr(module.time, "monotonic", lambda: 10**12)
+    monkeypatch.setattr(module.time, "sleep", sleeps.append)
+    assert module.main(cancel_args() + ["--settle-seconds", "10"]) == 0
+    assert sleeps == [3]
+
+
+def test_post_error_is_reported(monkeypatch, capsys):
+    module = load_cancel()
+    monkeypatch.setattr(module, "read_run", lambda *args: {
+        "status": "queued", "attempt": 2, "conclusion": None, "url": ""})
+
+    def fail(*args):
+        raise module.GhError("HTTP 502")
+
+    monkeypatch.setattr(module, "gh", fail)
+    assert module.main(cancel_args()) == 2
+    assert "cancel request failed" in capsys.readouterr().err
+
+
+def test_readback_error_is_reported(monkeypatch, capsys):
+    module = load_cancel()
+    calls = []
+
+    def read(*args):
+        calls.append(args)
+        if len(calls) > 1:
+            raise module.GhError("HTTP 502")
+        return {"status": "queued", "attempt": 2, "conclusion": None, "url": ""}
+
+    monkeypatch.setattr(module, "read_run", read)
+    monkeypatch.setattr(module, "gh", lambda *args: "{}")
+    assert module.main(cancel_args()) == 2
+    assert "read-back failed" in capsys.readouterr().err
+
+
 if __name__ == "__main__":
     unittest.main()
