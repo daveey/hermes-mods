@@ -1765,14 +1765,17 @@ def _is_heading(block_text: str) -> bool:
     return bool(re.match(r"#{1,6}\s", first)) or bool(re.fullmatch(r"(\*\*|__)[^*_\n]+(\*\*|__):?", first))
 
 
-def _section(reply: str, span) -> str:
+def _section(reply: str, span, cards=()) -> str:
     """The part of the reply ``span``'s paragraph belongs to.
 
     - Under a heading (``#`` line or bold-only first line): the blocks from that heading down to the next one.
     - With no heading above it, the reply is no section: a close-out that answers several cards in plain paragraphs
       would otherwise put a quote of one card's ask over a paraphrased relay of another. There the paragraph's
-      section is itself, plus the blockquote right above it when the paragraph names no card id (the reply to a
-      quoted ask: "> <ask line>" then "Reply here. My pick: ...")."""
+      section is itself, plus the nearest quoted ask line above it and the paragraphs between (the reply to a
+      quoted ask: "> <ask line>", maybe a context sentence, then "Reply here. My pick: ..."). The reach up stops
+      at a paragraph that names a card id (the paragraph itself included) or whose own words are another listed
+      card's ask (``_ask_word_match`` against ``cards``; a card the quote itself quotes does not stop it).
+      A quote that is no card's ask line is passed over."""
     if not reply or not span:
         return ""
     target = locate(reply, span)
@@ -1787,8 +1790,22 @@ def _section(reply: str, span) -> str:
         lo -= 1
     if not _is_heading(blocks[lo]["text"]):
         own = blocks[i]
-        if i > 0 and not own.get("quote") and blocks[i - 1].get("quote") and not _CARD_ID.search(own["text"]):
-            return blocks[i - 1]["text"] + "\n\n" + own["text"]
+        if own.get("quote") or _CARD_ID.search(own["text"]):
+            return own["text"]
+        others = []  # listed cards a paragraph on the way up restates by the ask's own words
+        for k in range(i, -1, -1):
+            b = blocks[k]
+            if b.get("quote") and k < i:
+                if k < i - 1 and not (_ASK_LINE.search(b["text"]) or any(_quotes_ask(b["text"], e) for e in cards or ())):
+                    continue
+                if any(not _quotes_ask(b["text"], e) for e in others):
+                    break
+                return "\n\n".join(x["text"] for x in blocks[k:i + 1])
+            if k < i and _CARD_ID.search(b["text"]):
+                break
+            hit = _ask_word_match({"text": b["text"], "verbatim_span": b["text"]}, list(cards or ()))
+            if hit is not None:
+                others.append(hit)
         return own["text"]
     hi = i + 1
     while hi < len(blocks) and not _is_heading(blocks[hi]["text"]):
@@ -1824,7 +1841,7 @@ def cited_cards(span, reply: str, cards: list[dict]) -> list[dict]:
     Without ``reply`` or a locatable sentence nothing is filtered."""
     if not reply or not span or locate(reply, span) is None:
         return list(cards)
-    para, section = _paragraph(reply, span), _section(reply, span)
+    para, section = _paragraph(reply, span), _section(reply, span, cards)
     named = set(_CARD_ID.findall(para))
     cited = [e for e in cards if _names_card(named, e.get("task_id")) or _quotes_ask(para, e)
              or _quotes_ask(section, e)]
@@ -1878,6 +1895,28 @@ def _card_ask_match(candidate: dict, cards: list[dict], repeats=(), reply: str =
                     and repeat_corroborated(candidate.get("verbatim_span"), _paragraph(reply, candidate.get("verbatim_span")),
                                             tile_texts(by_id[r["id"]])):
                 return by_id[r["id"]]
+    hit = _ask_word_match(candidate, cards)
+    if hit is not None:
+        return hit
+    raw = f"{candidate.get('text') or ''} {candidate.get('verbatim_span') or ''}"
+    mine = _words(candidate.get("text")) | _words(candidate.get("verbatim_span"))
+    named = set(_CARD_ID.findall(raw))
+    titled = [e for e in cards if str(e.get("title") or "").strip()]
+    if _CARD_DECISION.search(raw) and (_CARD_NOUN.search(raw) or named):
+        topic = _distinctive(raw)
+        hits = [e for e in titled if (topic & _distinctive(e.get("title"))) or _names_card(named, e.get("task_id"))]
+        if len(hits) == 1:
+            return hits[0]
+    hits = [e for e in titled if len(mine) >= 3 and len(_words(e["title"]) | _words(e["text"])) >= 3
+            and len(mine & (_words(e["title"]) | _words(e["text"]))) / len(mine) >= _CARD_TITLE_OVERLAP]
+    return hits[0] if len(hits) == 1 else None  # two cards that fit equally well: the relay names neither
+
+
+def _ask_word_match(candidate: dict, cards: list[dict]) -> Optional[dict]:
+    """The strong evidence that ``candidate`` is a card's ask, from the ask's own words: it contains the ask (or a
+    long sentence of it), offers two of its choice labels, or most of its words are the ask's words. No model
+    repeat, no title."""
+    text, span = ask_key(candidate.get("text")), ask_key(candidate.get("verbatim_span"))
     long_span = len(span) >= _SPAN_KEY_MIN and len(span.split()) >= 5
     options = {ask_key(o) for o in candidate.get("options") or [] if ask_key(o)}
     raw = f"{candidate.get('text') or ''} {candidate.get('verbatim_span') or ''}"
@@ -1896,15 +1935,7 @@ def _card_ask_match(candidate: dict, cards: list[dict], repeats=(), reply: str =
             share = len(mine & theirs) / len(mine)
             if share >= _CARD_ASK_OVERLAP or (e.get("task_id") in named and share >= 0.4):
                 return e
-    titled = [e for e in cards if str(e.get("title") or "").strip()]
-    if _CARD_DECISION.search(raw) and (_CARD_NOUN.search(raw) or named):
-        topic = _distinctive(raw)
-        hits = [e for e in titled if (topic & _distinctive(e.get("title"))) or _names_card(named, e.get("task_id"))]
-        if len(hits) == 1:
-            return hits[0]
-    hits = [e for e in titled if len(mine) >= 3 and len(_words(e["title"]) | _words(e["text"])) >= 3
-            and len(mine & (_words(e["title"]) | _words(e["text"]))) / len(mine) >= _CARD_TITLE_OVERLAP]
-    return hits[0] if len(hits) == 1 else None  # two cards that fit equally well: the relay names neither
+    return None
 
 
 # ---- repeat corroboration ---------------------------------------------------------------------------------

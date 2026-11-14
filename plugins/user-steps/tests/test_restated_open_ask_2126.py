@@ -209,6 +209,35 @@ def test_headingless_quote_of_a_listed_card_does_not_hide_another_listed_cards_r
     assert core.cited_cards('Reply here.', reply, [quoted, kitchen(), card_entry()]) == [quoted]
 
 
+def test_headingless_reply_one_context_paragraph_below_a_quote_is_not_booked_to_an_unnamed_card():
+    # The ..bef6c6 shape with no heading: a context sentence sits between the quoted ask and "Reply here.".
+    reply = "\n\n".join(["Two cards still wait on you.", f"> {QUOTED_ASK}",
+                         "Two of its acceptance checks need history that was never recorded.",
+                         "Reply here. My pick: accept the investigation, waive the replay, keep live proof."])
+    entry = card_entry()
+    step = {'text': 'Reply here', 'kind': 'choose', 'verbatim_span': 'Reply here.', 'options': []}
+    assert core.card_ask_for(step, [entry], [{'id': entry['id'], 'verbatim_span': 'Reply here.'}], reply) is None
+    assert core.cited_cards('Reply here.', reply, [entry]) == []
+    quoted = card_entry(tid='t_0a0a0a0a', action=QUOTED_ASK, title='Landing fix acceptance')
+    assert core.cited_cards('Reply here.', reply, [entry, quoted]) == [quoted]
+
+
+def test_headingless_quote_region_stops_at_a_paragraph_naming_another_card():
+    reply = "\n\n".join([f"> {QUOTED_ASK}", "Two of its acceptance checks need history that was never recorded.",
+                         f"Card {LOCAL_CARD} is separate.", "Reply here to submit it."])
+    assert core.cited_cards('Reply here to submit it.', reply, [card_entry()]) == [card_entry()]
+
+
+def test_headingless_quote_region_stops_at_a_paragraph_restating_another_listed_cards_ask():
+    reply = "\n\n".join([f"> {QUOTED_ASK}", PARAPHRASE, "Reply here."])
+    assert core.cited_cards('Reply here.', reply, [kitchen(), card_entry()]) == [kitchen(), card_entry()]
+    # The quoted card's own restatement on the way up does not stop it.
+    quoted = card_entry(tid='t_0a0a0a0a', action=QUOTED_ASK, title='Landing fix acceptance')
+    reply = "\n\n".join([f"> {QUOTED_ASK}", "Accept the bounded investigation and waive the old replay, keeping "
+                         "live proof required.", "Reply here."])
+    assert core.cited_cards('Reply here.', reply, [quoted, card_entry()]) == [quoted]
+
+
 def test_headingless_reply_right_under_a_quote_still_names_its_card_by_id():
     reply = f"> {QUOTED_ASK}\n\nAbout card {LOCAL_CARD} instead: reply here."
     assert core.cited_cards('reply here.', reply, [card_entry(), kitchen()]) == [card_entry()]
