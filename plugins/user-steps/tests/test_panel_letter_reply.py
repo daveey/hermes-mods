@@ -55,6 +55,39 @@ def test_recommended_option_is_letter_a(tmp_path, monkeypatch):
     assert 'B = "Go: A+B+C"' in hint
 
 
+def test_only_exact_legacy_placeholder_is_hidden_from_panel_letters(tmp_path, monkeypatch):
+    plugin = _plugin("panel_letter_placeholder", tmp_path, monkeypatch)
+    request = {
+        "requestId": "panel-placeholder",
+        "title": "Choose the next action",
+        "presentation": {
+            "kind": "kanban-question", "question": "What next?", "details": "",
+            "recommendedChoiceId": "proceed", "other": True,
+        },
+        "choices": [
+            {"id": "request-context", "effect": "revise", "label": "Revise the scope"},
+            {"id": "proceed", "effect": "approve", "label": "Proceed (recommended)"},
+        ],
+    }
+    # Matching the legacy id/effect alone must not hide a legitimate choice.
+    assert plugin._panel_rows(request) == [
+        "Proceed", "Revise the scope", "Skip", "Other (type your answer)",
+    ]
+    assert ('A = "Proceed", B = "Revise the scope", C = "Skip", '
+            'D = "Other (type your answer)"') in plugin._panel_letter_hint("b", [request])
+    assert plugin._panel_letter_hint("d", [request])
+
+    # Change only the label to the exact retired placeholder: the following letters shift.
+    placeholder = dict(request, choices=[
+        dict(request["choices"][0], label="Request complete action"), request["choices"][1],
+    ])
+    assert plugin._panel_rows(placeholder) == ["Proceed", "Skip", "Other (type your answer)"]
+    hint = plugin._panel_letter_hint("b", [placeholder])
+    assert 'A = "Proceed", B = "Skip", C = "Other (type your answer)"' in hint
+    assert "Request complete action" not in hint
+    assert plugin._panel_letter_hint("d", [placeholder]) == ""
+
+
 def test_letter_with_trailing_words_and_non_letter_messages(tmp_path, monkeypatch):
     plugin = _plugin("panel_letter_forms", tmp_path, monkeypatch)
     mirror, store = _incident_mirror(tmp_path)
