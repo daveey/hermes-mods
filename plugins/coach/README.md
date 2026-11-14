@@ -1516,6 +1516,28 @@ kind per pass, same fingerprint folded into one (`seen Nx`).
 
 ### Desktop backend timeouts (`backend_timeouts.py`, no agent, no LLM)
 
+Every completed non-dry-run scan also appends an allowlisted diagnostic record to
+`<HERMES_HOME>/coach/backend-timeouts-scans.jsonl`, including healthy, reused and throttled-owner
+scans. Schema `coach.backend-timeouts.scan.v1` records the observed window and retained coverage
+start, raw/awake/fail-fast/residual counts, threshold disposition, top-level owner-action counts,
+and positive-local startup correlation counts (`local`, `primary`, explicit local entries without
+`conn=`) with READY timestamps. This is retained-log correlation only, **not API readiness,
+causality, recovery or continuous availability evidence**. Startup-correlated failures remain in
+residual accounting; filing/admission and quiet healthy stdout are unchanged. Request paths,
+source lines, hostnames, owner IDs and probe payloads are not persisted in this sink.
+
+The sink has one active file and three numbered backups, each at most 64 KiB (256 KiB total),
+mode 0600 (including creation/rotation); a fixed empty `.lock` serializes concurrent writers/rotation
+on supported Unix hosts, with a two-second acquisition deadline before reporting sink failure.
+READY lists retain the first 128 timestamps and report `ready_times_omitted`. Retention is
+size-based, not a promised time window. Sink failures emit a fixed stderr diagnostic and exit 1
+after filing, without retrying filing. `--dry-run`, `--hours` and unresolved-clock scans do not
+append success records. Read retained files to verify production emission; do not trigger a
+production scan or fabricate a natural PASS from a fixture replay. Tests:
+`tests/test_backend_timeout_receipts.py` exercises the normal cron entry with fixture-owned logs,
+state and board adapter, including reused/throttled owners, silent healthy output, unknown-conn
+exclusion, bounded rotation/private modes, READY truncation, failure and dry-run controls.
+
 The Desktop app logs each failed backend call to `~/.hermes/logs/desktop.log` as
 `<local stamp> [hermes] [hermes:api GET /api/...] Error: Timed out connecting to Hermes backend after Nms`. On
 2026-10-27 the MacBook's `hermes serve` was CPU-starved and logged ~1,200 of those an hour for hours; nothing read
