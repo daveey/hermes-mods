@@ -98,6 +98,42 @@ def test_burst_across_paths_on_one_conn_files_one_conn_card_and_no_path_cards(tm
     assert len(board.creates()) == 1
 
 
+@pytest.mark.parametrize("conn", [None, "?", "remote-a"])
+@pytest.mark.parametrize("existing_incident", [False, True])
+def test_unknown_conn_bursts_keep_generic_ownership_not_a_saturated_link(
+        tmp_path, capsys, conn, existing_incident):
+    """The same bursts prove saturation only when they identify a remote link."""
+    paths = (BOARD, BOARDS, HUB_SYNC, LABELS)
+    lines = []
+    for i in range(20):
+        t = NOW - timedelta(minutes=20) + timedelta(seconds=4 * i)
+        for path in paths:
+            entry = line(t, path, conn or "?")
+            lines.append(entry.replace(" conn=?", "") if conn is None else entry)
+    write(tmp_path, lines)
+    board = Board()
+    if existing_incident:
+        seed_catch_all(tmp_path, board)
+    assert run(tmp_path, board) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["awake_count"] == len(lines)
+    assert out["saturated_conns"] == (["remote-a"] if conn == "remote-a" else [])
+    if not existing_incident:
+        assert keys(board) == [bt.card_key("macbook-1", NOW)]
+        body = board.creates()[0][1]
+        for path in paths:
+            assert path in body
+        assert ("Link/connection saturation suspected" in body) == (conn == "remote-a")
+    else:
+        expected = ({"conn=remote-a"} if conn == "remote-a" else set(paths))
+        owners = out["cards"][0]["path_owners"]
+        assert set(owners) == expected
+        assert all(owner["action"] == "created" for owner in owners.values())
+        expected_keys = (["backend-timeouts:macbook-1:conn:remote-a"] if conn == "remote-a"
+                         else [f"backend-timeouts:macbook-1:{path}" for path in paths])
+        assert sorted(keys(board)) == sorted(expected_keys)
+
+
 def test_single_slow_path_files_one_path_card_and_no_conn_card(tmp_path, capsys):
     write(tmp_path, single_slow_path_lines())
     board = Board()
