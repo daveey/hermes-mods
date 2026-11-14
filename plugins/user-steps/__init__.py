@@ -817,6 +817,19 @@ def _register_clarify_early() -> None:
 
 def register(ctx) -> None:
     _require_publication_contract()
+    # The dashboard's _user_steps_kanban_mirror is a different, process-owned
+    # lifetime. Only retire a mirror imported into THIS plugin package; never
+    # look up a replacement package by its reusable sys.modules name at unload.
+    on_unload = getattr(ctx, 'on_unload', None)
+    if callable(on_unload):
+        owned = globals()
+
+        def close_readers():
+            mirror = owned.get('kanban_mirror')
+            if mirror is not None:
+                mirror.close_pool()
+
+        on_unload(close_readers)
     _register_clarify_early()
     ctx.register_hook("pre_final_gate", publication_buffer)
     ctx.register_hook("pre_llm_call", pre_llm_call)

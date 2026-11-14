@@ -69,6 +69,43 @@ def test_multiple_scopes_retire_observers(monkeypatch, tmp_path, modern):
         callback()  # unload is idempotent
 
 
+def test_unload_fences_inflight_registration(monkeypatch, tmp_path):
+    modules, callbacks, connections, hooks, db = load(monkeypatch, tmp_path)
+    mod = modules[0]
+    entered, release = threading.Event(), threading.Event()
+    original = mod._sweep_register_hook
+    errors = []
+
+    def blocked():
+        entered.set()
+        assert release.wait(5)
+        return original()
+
+    monkeypatch.setattr(mod, '_sweep_register_hook', blocked)
+
+    def observe():
+        try:
+            mod._sweep_db_stamp(db)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=observe)
+    thread.start()
+    try:
+        assert entered.wait(5)
+    finally:
+        for callback in callbacks:
+            callback()
+        release.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], mod._SweepBoardBusy)
+    # Check after the paused registration resumed, not merely at unload time.
+    assert hooks == []
+    assert all(not scope._SWEEP_DBS for scope in modules)
+    assert connections == []
+
+
 def test_unload_fences_inflight_open(monkeypatch, tmp_path):
     modules, callbacks, connections, hooks, db = load(monkeypatch, tmp_path)
     mod = modules[0]

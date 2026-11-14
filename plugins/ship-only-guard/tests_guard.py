@@ -191,6 +191,39 @@ def test_python_nonliteral_tool_call_allows(repo, code):
     assert g.check_python(code, str(repo)) is None
 
 
+@pytest.mark.parametrize("entry", ["python", "tool", "hook-python", "hook-tool"])
+@pytest.mark.parametrize("command, blocked", [
+    ("gh pr merge -R example/protected 12", True),
+    ("gh pr view -R example/protected 12", False),
+])
+def test_literal_tuple_tool_call(repo, entry, command, blocked):
+    # Classify only: never execute the nested terminal command. repr preserves
+    # the singleton tuple's trailing comma through the real Python AST reader.
+    calls = ({"name": "functions.terminal", "arguments": {"command": command}},)
+    code = f"tool_call(calls={calls!r})"
+    if entry == "python":
+        result = g.check_python(code, str(repo))
+    elif entry == "tool":
+        result = g.check_tool("tool_call", {"calls": calls}, str(repo))
+    else:
+        hooks = {}
+
+        class Context:
+            def register_hook(self, name, fn):
+                hooks[name] = fn
+
+        plugin.register(Context())
+        name, args = (("execute_code", {"code": code}) if entry == "hook-python"
+                      else ("tool_call", {"calls": calls}))
+        result = hooks["pre_tool_call"](tool_name=name, args=args)
+    if blocked:
+        assert result
+        if entry.startswith("hook-"):
+            assert result["action"] == "block"
+    else:
+        assert result is None
+
+
 @pytest.mark.parametrize("calls", [None, 7, "terminal", {"name": "terminal"}])
 def test_tool_call_malformed_calls_does_not_raise(repo, calls):
     assert g.check_tool("tool_call", {"calls": calls}, str(repo)) is None

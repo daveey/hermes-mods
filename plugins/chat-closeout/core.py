@@ -627,9 +627,20 @@ def _board_rows(path: Path, left: list[str], light: bool) -> tuple[list[dict[str
                 read_inventory = None  # old core: acceptance remains unspecified
             board = path.parent.name if path.parent.parent.name == 'boards' else 'default'
             later = _later_comments(conn, left, bool(has_runs), comp)
+            history = None
+            try:
+                from hermes_cli.kanban_completion_receipt_projection import read_completed_many
+                from hermes_cli.kanban_origin import gateway_names
+                gateway = gateway_names()[0]
+                if gateway:
+                    # Same authority rules as read_inventory (created_on wins), one projection per board.
+                    history = read_completed_many(conn, left, board=board, gateway=gateway)
+            except (ValueError, TypeError, ImportError, OSError, sqlite3.Error):
+                pass  # old core/schema: retain the existing per-task optional projection
             for r in conn.execute(full.format(ph=ph), left):
                 try:
-                    historical = read_inventory(conn, r['id'], board=board) if read_inventory else None
+                    historical = (history.get(r['id']) if history is not None else
+                                  read_inventory(conn, r['id'], board=board) if read_inventory else None)
                 except (ValueError, TypeError, ImportError, OSError, sqlite3.Error):
                     historical = None  # optional history cannot change settlement/readability
                 rows.append({**dict(r), 'parents': tuple(parents.get(r['id'], [])), **(historical or {}),
@@ -1700,19 +1711,53 @@ class Ledger:
                 c.close()
 
 
+# What settling one ledger row reads (``reconcile_done``, ``pending_key`` -> ``closeout_key``, ``unlinked_removed``).
+# The sidebar's waiting pass settles from only these, so the waker's bookkeeping writes are no input to it.
+SETTLE_ROW_FIELDS = ("batch", "covered", "unlinked", "done_sig", "done_at", "closing")
+
+
 def pending_closeouts(ledger: "Ledger", read: Callable[[list[str]], dict],
-                      proof: Optional[Callable[[str, str, dict[str, Any]], bool]] = None) -> dict[str, list[str]]:
+                      proof: Optional[Callable[[str, str, dict[str, Any]], bool]] = None, *,
+                      rows: Optional[list[dict[str, Any]]] = None,
+                      row_key: Optional[Callable[[dict[str, Any], Any], Optional[str]]] = None,
+                      cache: Any = None, stats: Optional[dict[str, int]] = None,
+                      fields: Optional[Iterable[str]] = None) -> dict[str, list[str]]:
     """``{session_id: batch ids}`` for chats whose whole batch has settled but whose close-out turn has not run for
     that state: the sidebar keeps them grey "waiting" until the closing answer lands. Read-only; it applies the
-    same reconcile the waker persists, so the sidebar can never wait on a row the waker would skip."""
+    same reconcile the waker persists, so the sidebar can never wait on a row the waker would skip.
+
+    Incremental (``row_key`` and ``cache``, WAITING-INPUTS.md): a row whose key (its fields, its cards as read, its
+    lineage's transcript watermark) equals the one its last answer was computed under keeps that answer without a
+    reconcile or transcript proof. ``rows``: the pending rows already read. ``stats`` counts ``recomputed`` rows.
+    ``fields``: settle each row from only these fields (``SETTLE_ROW_FIELDS``), so writes to any other field are no
+    input."""
     out: dict[str, list[str]] = {}
-    for row in ledger.pending():
+    pending = ledger.pending() if rows is None else rows
+    for row in pending:
         cards = read(row["batch"])
         sid = row["session_id"]
-        fix = reconcile_done(row, cards, (lambda t, c, sid=sid: proof(sid, t, c)) if proof else None)
-        row = {**row, **fix}
-        if (row["batch"] or unlinked_removed(row)) and pending_key(row, cards):
-            out[sid] = sorted(row["batch"]) or unlinked_removed(row)
+        if fields is not None:
+            # Only the fields settlement reads: the waker's bookkeeping (claims, retries, wake results) is no input,
+            # and a field missing here fails the settlement tests instead of going unnoticed.
+            row = {"session_id": sid, **{f: row.get(f) for f in fields}}
+        key = row_key(row, cards) if row_key is not None and cache is not None else None
+        hit = cache.get(sid, key) if key is not None else None
+        if hit is not None:
+            result = hit[1]
+        else:
+            fix = reconcile_done(row, cards, (lambda t, c, sid=sid: proof(sid, t, c)) if proof else None)
+            row = {**row, **fix}
+            result = None
+            if (row["batch"] or unlinked_removed(row)) and pending_key(row, cards):
+                result = sorted(row["batch"]) or unlinked_removed(row)
+            if cache is not None:
+                cache.put(sid, key, result)
+            if stats is not None:
+                stats["recomputed"] = stats.get("recomputed", 0) + 1
+        if result:
+            out[sid] = list(result)
+    if cache is not None:
+        cache.keep(r["session_id"] for r in pending)
     return out
 
 

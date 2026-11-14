@@ -133,6 +133,69 @@ def test_same_named_jobs_in_distinct_workflows_do_not_hide_failure():
     assert not api.writes
 
 
+@pytest.mark.parametrize('case', ['failure', 'pending', 'distinct-suite'])
+def test_configured_required_non_success_never_writes(case):
+    api = GitHub()
+    api.required = ['tests']
+    if case == 'pending':
+        api.runs[0].update(status='in_progress', conclusion=None)
+    else:
+        api.runs[0]['conclusion'] = 'failure'
+    if case == 'distinct-suite':
+        api.runs.append({**api.runs[0], 'id': 2, 'check_suite': {'id': 102},
+                         'conclusion': 'success'})
+    with pytest.raises(land.Refused, match='Required check'):
+        land.land(7, HEAD, read=api)
+    assert not api.writes
+
+
+@pytest.mark.parametrize('case', ['valid', 'different-pr', 'outstanding-points'])
+def test_kanban_receipt_pr_and_points(monkeypatch, tmp_path, case):
+    monkeypatch.setattr(land.Path, 'home', lambda: tmp_path)
+    path = tmp_path / '.hermes/lib/core-tools/hermes-core-wt-land'
+    path.parent.mkdir(parents=True)
+    path.write_text('# fixture validator')
+    receipt = {'verdict': 'approve', 'reviewed_sha': HEAD,
+               'reviewed_pr': f'https://github.com/{land.REPO}/pull/7',
+               'non_blocking': []}
+    if case == 'different-pr':
+        receipt['reviewed_pr'] = f'https://github.com/{land.REPO}/pull/8'
+    if case == 'outstanding-points':
+        receipt['non_blocking'] = ['Explain the remaining review point']
+    monkeypatch.setattr(land.runpy, 'run_path', lambda *a, **k: {
+        'review_gate': lambda *a, **k: receipt})
+    api = GitHub()
+    api.reviews = []  # Only the Kanban receipt supplies approval.
+    if case == 'valid':
+        assert land.land(7, HEAD, 'review', 'implementation', read=api)['merged']
+        assert len(api.writes) == 1
+    else:
+        with pytest.raises(land.Refused, match='Invalid review receipt or unanswered review points'):
+            land.land(7, HEAD, 'review', 'implementation', read=api)
+        assert not api.writes
+
+
+@pytest.mark.parametrize('case', ['not-merged', 'changed-head'])
+def test_successful_put_requires_verified_readback(case):
+    api = GitHub()
+
+    def read(*args):
+        result = api(*args)
+        # Leave both preflight reads and the successful PUT untouched.
+        if api.writes and args[1] == f'repos/{land.REPO}/pulls/7':
+            if case == 'not-merged':
+                result['merged'] = False
+            else:
+                result['head']['sha'] = 'c' * 40
+        return result
+
+    with pytest.raises(land.Refused, match='exact PR readback is unverified; do not retry blindly'):
+        land.land(7, HEAD, read=read)
+    assert len(api.writes) == 1
+    assert f'sha={HEAD}' in api.writes[0]
+    assert api.reads[-1] == f'repos/{land.REPO}/pulls/7'
+
+
 def test_newer_failure_wins_over_old_success():
     api = GitHub()
     api.runs.append({**api.runs[0], 'id': 2, 'conclusion': 'failure'})
@@ -285,6 +348,7 @@ def test_malformed_evidence_names_never_write(field, value):
     assert not api.writes
 
 
-def test_graphql_held_without_config(monkeypatch):
-    monkeypatch.setattr(guard, '_gql_repo', lambda *_: land.REPO)
+@pytest.mark.parametrize('repo', [land.REPO, None])
+def test_graphql_held_without_config(monkeypatch, repo):
+    monkeypatch.setattr(guard, '_gql_repo', lambda *_: repo)
     assert guard.check_shell("gh api graphql -f 'query=mutation{mergePullRequest(input:{pullRequestId: \"PR_test123\"}){clientMutationId}}'", '/', guards=[])

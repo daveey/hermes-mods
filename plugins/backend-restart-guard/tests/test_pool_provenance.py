@@ -31,6 +31,55 @@ class PoolProvenance(unittest.TestCase):
         for render in (' '.join, shlex.join):
             self.assertFalse(guard._backend_argv(render(command())))
 
+    def assert_noncanonical_pool_protected(self, argv):
+        # Classification only: never execute these payloads or send signals.
+        for render in (' '.join, shlex.join):
+            with self.subTest(render=render.__qualname__):
+                canonical = render(command())
+                self.assertTrue(guard._canonical_pool_bootstrap(canonical))
+                self.assertFalse(guard._backend_argv(canonical))
+                text = render(argv)
+                self.assertFalse(guard._canonical_pool_bootstrap(text))
+                self.assertTrue(guard._backend_argv(text))
+
+    def test_relative_bootstrap_root_remains_protected(self):
+        argv = command()
+        argv[3] = argv[3].replace('/opt/hermes-agent', 'relative-root')
+        self.assert_noncanonical_pool_protected(argv)
+
+    def test_equivalent_noncanonical_import_spacing_remains_protected(self):
+        # Low-severity lexical policy: the AST is equivalent, not malicious.
+        argv = command()
+        argv[3] = argv[3].replace('import os, sys, runpy;', 'import os,sys,runpy;')
+        self.assertEqual(guard.ast.dump(guard.ast.parse(argv[3])),
+                         guard.ast.dump(guard.ast.parse(command()[3])))
+        self.assert_noncanonical_pool_protected(argv)
+
+    def test_nonpython_executable_remains_protected(self):
+        argv = command()
+        argv[0] = '/usr/bin/notpython'
+        self.assert_noncanonical_pool_protected(argv)
+
+    def test_extra_gateway_tail_remains_protected(self):
+        argv = command()
+        argv[4:] = ['serve', 'gateway']
+        self.assert_noncanonical_pool_protected(argv)
+
+    def test_nonnumeric_port_remains_protected(self):
+        argv = command()
+        argv[-1] = 'not-a-port'
+        self.assert_noncanonical_pool_protected(argv)
+
+    def test_oversized_equivalent_payload_rejected_before_ast(self):
+        argv = command()
+        argv[3] += ' ' * 5000
+        self.assert_noncanonical_pool_protected(argv)
+        for render in (' '.join, shlex.join):
+            with self.subTest(render=render.__qualname__), patch.object(
+                    guard.ast, 'parse', wraps=guard.ast.parse) as parse:
+                self.assertFalse(guard._canonical_pool_bootstrap(render(argv)))
+                parse.assert_not_called()
+
     def test_backend_and_unknown_payload_remain_protected(self):
         backend = "runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)"
         for entry in (backend, "import hermes_bootstrap; custom()", command()[3].split('; ')[-1] + '; ' + backend):

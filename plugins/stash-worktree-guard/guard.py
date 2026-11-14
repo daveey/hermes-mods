@@ -2513,6 +2513,77 @@ def _git_calls(cmd: str, cwd: Optional[str], depth: int = 0):
         yield repo, sub, args
 
 
+def _may_define_alias(text: str) -> bool:
+    """Keep whole-text taint except for literal arguments of known data consumers.
+
+    Quoted words are not inherently inert: eval can join them, store them, or
+    place them behind arbitrary shell grammar. Do not classify prose by its
+    contents. Only a single, expansion-free brokered ship command has known
+    --reason/--review-reply data positions. Everything else keeps the old taint.
+    """
+    if not re.search(r"\balias\b", text):
+        return False
+    # The activation adapter joins command/input/data with semicolons, including
+    # empty fields. Trailing empty statements cannot introduce executable text.
+    text = re.sub(r'(?:[ \t]*;[ \t]*)+$', '', text)
+    # A deliberately tiny simple-command grammar: no expansion, escapes,
+    # comments, operators, or newlines.
+    # Adjacent fragments are kept as one word, never classified independently.
+    token = re.compile(r"(?:'[^'\n]*'|\"[^\"\n]*\"|[^\s'\";&|()<>{}#$`\\]+)+")
+    words, spans = [], []
+    end = 0
+    for match in token.finditer(text):
+        gap = text[end:match.start()]
+        if (end and not gap) or any(c not in ' \t' for c in gap):
+            return True
+        raw = match.group()
+        if any(c in raw for c in '$`\\'):
+            return True
+        words.append(shlex.split(raw)[0])
+        spans.append(raw)
+        end = match.end()
+    if any(c not in ' \t' for c in text[end:]) or not words:
+        return True
+    inert = set()
+    # A literal echo cannot install aliases in the caller. No other generic
+    # command is presumed to treat its arguments as data.
+    if words[0] == 'echo':
+        inert.update(range(1, len(words)))
+    elif (os.path.basename(words[0]) == 'token-broker'
+          and len(words) > 8 and words[1:3] == ['exec', '--scope']
+          and words[3] == 'user/github' and words[4] == '--reason'
+          and words[6:8] == ['--', 'env']):
+        inert.add(5)
+        pos = 8
+        # Restrict env to literal Git identity/config variables, not env options
+        # or shell startup variables.
+        while pos < len(words) and re.fullmatch(
+                r'GIT_(?:AUTHOR_NAME|AUTHOR_EMAIL|COMMITTER_NAME|COMMITTER_EMAIL|'
+                r'CONFIG_COUNT|CONFIG_KEY_[0-9]+|CONFIG_VALUE_[0-9]+)=.*', words[pos]):
+            pos += 1
+        if (pos + 2 >= len(words) or not words[pos].startswith('/')
+                or os.path.basename(words[pos]) != 'hermes-core-wt'
+                or words[pos + 1] != 'ship'):
+            return True
+        pos += 3  # literal slug
+        while pos < len(words):
+            if words[pos] in ('--review-task', '--review-reply', '--no-ci-wait'):
+                if pos + 1 >= len(words):
+                    return True
+                if words[pos] == '--review-reply':
+                    inert.add(pos + 1)
+                pos += 2
+            elif words[pos].startswith('--no-ci-wait='):
+                pos += 1
+            else:
+                return True
+    else:
+        return True
+    return any(re.search(r'\balias\b', word) and
+               (i not in inert or spans[i][0] not in "'\"")
+               for i, word in enumerate(words))
+
+
 def _git_calls_noted(cmd: str, cwd: Optional[str], depth: int = 0):
     """Yield (repo, subcommand, args, note) for every git call the command may make.
 
@@ -2526,7 +2597,7 @@ def _git_calls_noted(cmd: str, cwd: Optional[str], depth: int = 0):
     variables = {key: os.environ.get(key) for key in ("HOME", "TMPDIR")}
     variables["PWD"] = cwd
     state = _State(cwd, variables, {"HOME", "TMPDIR", "PWD", "OLDPWD"}, {})
-    if re.search(r"BASH_CMDS|\balias\b", cmd or ""):
+    if re.search(r"BASH_CMDS", cmd or "") or _may_define_alias(cmd or ""):
         # BASH_CMDS (set by declare/read/printf -v too) or an alias may map any name to git.
         state.exported.add(_CMDS)
     try:

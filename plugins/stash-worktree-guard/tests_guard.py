@@ -2670,3 +2670,152 @@ def test_sql_looking_string_can_really_execute_shell(multi):
     cmd = f'cd {shlex.quote(str(wt))}; python3 -c ' + shlex.quote(program)
     assert _blocked(cmd, wt), cmd
     _assert_real_restore(cmd, main, wt)
+
+
+@pytest.mark.parametrize('definition', [
+    '"alias" g=git',
+    'builtin ""alias g=git',
+    'builtin \\alias g=git',
+    'alias\\\n g=git',
+    'A=1 alias g=git',
+    '> /dev/null alias g=git',
+    '! alias g=git',
+])
+@pytest.mark.parametrize('stored', [False, True])
+def test_quoted_definition_real_restore_stays_refused(multi, definition, stored):
+    main, wt = multi
+    setup = ('PAYLOAD=' + shlex.quote(definition) + '\neval "$PAYLOAD"'
+             if stored else 'eval ' + shlex.quote(definition))
+    cmd = ('cd ' + shlex.quote(str(wt)) + '\nshopt -s expand_aliases\n'
+           + setup + '\ng stash pop')
+    before = subprocess.check_output(['git', 'rev-parse', 'refs/stash'], cwd=main, env=GIT_ENV)
+    why = guard.refuse_reason(cmd, str(wt))
+    blocked = _blocked(cmd, wt)
+    assert subprocess.check_output(['git', 'rev-parse', 'refs/stash'], cwd=main, env=GIT_ENV) == before
+    assert (wt / 'f.txt').read_text() == 'base\n'
+    # Execute only in this disposable fixture: establish that the spelling really restores.
+    _assert_real_restore(cmd, main, wt)
+    assert why, cmd
+    assert blocked, cmd
+
+
+@pytest.mark.parametrize('payload,stored', [
+    ("'! alias 'g=git", False), ("'> /dev/null alias 'g=git", False),
+    ("'! alias 'g=git", True), ("'> /dev/null alias 'g=git", True),
+    ("'! alias ' g=git", False), ("'> /dev/null alias ' g=git", False),
+    ("'time -p alias' g=git", False),
+    ("'time -- alias' g=git", False),
+    ("'time -p -- alias' g=git", False),
+    ("'time -p builtin alias' g=git", False),
+    ("'if alias' g=git '; then :; fi'", False),
+    ("'while alias' g=git '; do break; done'", False),
+    ("'until alias' g=git '; do :; done'", False),
+])
+def test_concatenated_definition_real_restore_stays_refused(multi, payload, stored):
+    main, wt = multi
+    setup = ('PAYLOAD=' + payload + '\neval "$PAYLOAD"'
+             if stored else 'eval ' + payload)
+    cmd = ('cd ' + shlex.quote(str(wt)) + '\nshopt -s expand_aliases\n'
+           + setup + '\ng stash pop')
+    before = subprocess.check_output(['git', 'rev-parse', 'refs/stash'], cwd=main, env=GIT_ENV)
+    why = guard.refuse_reason(cmd, str(wt))
+    blocked = _blocked(cmd, wt)
+    assert subprocess.check_output(['git', 'rev-parse', 'refs/stash'], cwd=main, env=GIT_ENV) == before
+    assert (wt / 'f.txt').read_text() == 'base\n'
+    _assert_real_restore(cmd, main, wt)
+    assert why, cmd
+    assert blocked, cmd
+
+
+# --- `alias` as prose in a quoted data argument (canonical brokered core ship) -----------
+# The whole-command pre-scan treats the word `alias` as a shell alias definition that may map
+# any bare name to git. A review reply such as "alias/import placement nit" is data, but it
+# tainted `token-broker`, whose `env` child then read as an opaque alias writer.
+BROKER_SHIP = (
+    "token-broker exec --scope user/github --reason {reason} -- env "
+    "GIT_AUTHOR_NAME='Example User' GIT_AUTHOR_EMAIL=you@example.com "
+    "GIT_COMMITTER_NAME='Example User' GIT_COMMITTER_EMAIL=you@example.com "
+    "GIT_CONFIG_COUNT=3 GIT_CONFIG_KEY_0=url.https://github.com/.insteadOf "
+    "GIT_CONFIG_VALUE_0=git@github.com: GIT_CONFIG_KEY_1=credential.helper "
+    "GIT_CONFIG_VALUE_1= GIT_CONFIG_KEY_2=credential.helper "
+    "'GIT_CONFIG_VALUE_2=!gh auth git-credential' "
+    "/home/you/.hermes/bin/hermes-core-wt ship slug --no-ci-wait='Independent review complete' "
+    "--review-task t_example --review-reply {reply}"
+)
+PROSE = "1) Cosmetic internal alias/import placement nit declined: keep the private test seam."
+
+
+@pytest.mark.parametrize("reason,reply", [
+    ("'Land PR 1'", shlex.quote(PROSE)),
+    ("'Land PR 1'", '"' + PROSE + '"'),
+    ("'import alias cleanup'", "'ok'"),
+    ("'Land PR 1'", "'the alias is declined; it stays'"),
+])
+def test_alias_prose_in_quoted_data_does_not_taint_broker_ship(multi, reason, reply):
+    cmd = BROKER_SHIP.format(reason=reason, reply=reply)
+    assert guard.refuse_reason(cmd, str(multi[1])) is None
+    assert not _blocked(cmd, multi[1])
+
+
+@pytest.mark.parametrize("cmd", [
+    # A command-position `alias` inside a quoted string may still be shell code it runs.
+    "token-broker exec -- env A=1 tool --note 'x; alias y=z'",
+    "token-broker exec -- env A=1 tool --note 'alias y=z'",
+    "token-broker exec -- env A=1 tool --note \"x && alias y=z\"",
+    "token-broker exec -- env A=1 tool --note \"$(alias y=z)\"",
+    "token-broker exec -- env A=1 tool --note 'x'; alias y=z",
+    "token-broker exec -- env A=1 tool alias",
+    "echo alias; token-broker exec -- env A=1 tool",
+    # Heredocs and ANSI-C text keep the old whole-text reading.
+    "cat <<EOF\nit's an alias\nEOF\ntoken-broker exec -- env A=1 tool",
+    "token-broker exec -- env A=1 tool $'alias\\'s'",
+])
+def test_alias_taint_kept_for_possible_definitions(multi, cmd):
+    assert guard._may_define_alias(cmd), cmd
+    assert guard.refuse_reason(cmd, str(multi[1])) is not None, cmd
+
+
+def test_alias_taint_unterminated_quote_keeps_whole_text_reading():
+    assert guard._may_define_alias("tool --note 'alias")
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo 'the alias file'",
+    "no such word here",
+])
+def test_alias_taint_helper_ignores_prose_only(cmd):
+    assert not guard._may_define_alias(cmd), cmd
+
+
+@pytest.mark.parametrize('cmd', [
+    "tool --reply 'alias/import nit'",
+    'tool --reply "an alias, then more"',
+    'tool --a \'x\' --b "y alias z"',
+    "eval 'if alias' g=git '; then :; fi'",
+    "eval 'while alias' g=git '; do break; done'",
+    "eval 'until alias' g=git '; do :; done'",
+    "PAYLOAD='ordinary alias prose'; eval \"$PAYLOAD\"",
+])
+def test_unknown_consumers_keep_whole_text_taint(cmd):
+    assert guard._may_define_alias(cmd)
+
+
+@pytest.mark.parametrize('prefix,suffix', [
+    ('eval ', ''), ('PAYLOAD=', ''), ('', '; eval "$PAYLOAD"'),
+    ('', '\ng stash pop'), ('echo "$(' , ')"'),
+    ('', ' > output'), ('', ' | bash'), ('', ' # comment'),
+])
+def test_broker_prose_exemption_does_not_cross_shell_boundaries(prefix, suffix):
+    cmd = BROKER_SHIP.format(reason="'Land PR 1'", reply=shlex.quote(PROSE))
+    assert guard._may_define_alias(prefix + cmd + suffix)
+
+
+@pytest.mark.parametrize("template", [
+    "shopt -s expand_aliases\nalias tb='git -C {wt}'\ntb stash pop",
+    "alias tb=git; tb -C {wt} stash pop",
+    "A='alias tb=git'; eval \"$A\"; tb -C {wt} stash pop",
+    "token-broker exec -- env A=1 tool --reply 'alias/import nit'; git -C {wt} stash pop",
+])
+def test_alias_prose_fix_keeps_real_restore_refusals(multi, template):
+    main, wt = multi
+    assert _blocked(template.format(wt=wt), wt), template

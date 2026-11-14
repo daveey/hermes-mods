@@ -43,6 +43,9 @@ plan-less request. When revising a request that was published with `decisionCard
 `aliases` holding that card's `kanban` ref (else 422 "must retain exact producer card aliases") and keep
 `scope.sourceRefs` (dropping it gives 422 "Invalid object fields"). Before saying nothing waits on the user, read the canonical list in full: when the injected
 note says it was truncated, parse the saved file it names, because the head/tail preview can hide an open request.
+Also list the blocked cards linked to this chat: ask-gate refuses the claim while any is blocked on the user. Answer
+each one the user's standing approvals cover yourself (comment the decision, unblock, read back) instead of
+reporting it as theirs.
 Never tell the user a choice tile "is in your panel" because a user-steps row or `/requests` 200 exists: a blocked card's ask projects only when its owner chat reads its queue, and Desktop renders it later still. Say it will appear there; claim visible only after a read-only renderer check, or after the user's click is recorded. Publish acceptance fixtures (test tiles) from a disposable scratch chat, never a persistent one (user-steps README, live-fixture rule).
 When told “do it yourself,” remove discretionary blockers, not identity or explicit-deny boundaries. For an
 ambiguous acceptance tolerance, test a stricter sufficient bound without redefining the requirement to fit results.
@@ -245,7 +248,7 @@ ask only once its prerequisite is verifiably in place. If an early one is alread
   "Decision for you:" header, and is not restated next turn. user-steps drops it, so no For-you request opens and the
   chat is not painted red. A choice that really blocks you gets a direct question instead ("Should I add it? yes/no").
 - [ ] No reply asks the user to paste or run a command; `run_in_user_terminal` was used instead.
-- [ ] No reply restates an open ask as a bare reminder sentence ('… still need you') outside the ask itself; leave it out, since the open tile already shows it. user-steps holds such a reply once and names the open request: delete the restatement, or re-send unchanged only if it is a different decision.
+- [ ] No reply restates an open ask outside the ask itself, as a bare reminder ('… still need you') or as a line in a status or batch reply's 'waiting on you' list: the open tile already shows it. ask-gate refuses such a reply and user-steps holds it once; delete the line (or re-send unchanged only if it is a different decision), and mention the ask again only with a new fact: a status change, deadline or cost.
 - [ ] Every Chrome ask came after a `browser_focus` that returned that tab shown on the user's display (else the noVNC view was opened).
 - [ ] Every other-Mac GUI ask tried `remote_approve_dialog` first (for prompts) and carries a verified `::screenshare` button.
 - [ ] Every Inbox post is a user-only decision with `ask` set; agent-fixable work went to a Kanban card.
