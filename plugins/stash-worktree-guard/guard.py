@@ -2551,7 +2551,13 @@ def _may_define_alias(text: str) -> bool:
                     return True  # code inside double quotes: nesting is not scanned
                 body.append(c)
                 j += 1
-            quoted.append("".join(body))
+            part = "".join(body)
+            # A quoted payload may be evaluated as shell code later. Nested quote
+            # removal, escaped command names and line continuations change command
+            # boundaries; the prose regex cannot safely classify any of these.
+            if re.search(r"\balias\b", part) and any(c in part for c in "'\"\\"):
+                return True
+            quoted.append(part)
             unquoted.append(" ")
             i = j + 1
         else:
