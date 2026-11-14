@@ -79,14 +79,18 @@ def ci(read, head):
     for run in runs:
         if run.get("head_sha") != head or not run.get("name") or not isinstance(run.get("id"), int):
             raise Refused("Check run does not identify the exact head")
-        key = (run["name"], run.get("app", {}).get("id"))
+        # Same-named jobs in distinct workflows are independent evidence.
+        suite = run.get("check_suite", {}).get("id")
+        if not isinstance(suite, int):
+            raise Refused("Check run lacks check-suite identity")
+        key = (run["name"], run.get("app", {}).get("id"), "check", suite)
         value = (run["id"], run.get("status") == "completed" and run.get("conclusion") == "success")
         if key not in latest or value[0] > latest[key][0]:
             latest[key] = value
     for status in statuses:
         if not status.get("context") or not isinstance(status.get("id"), int):
             raise Refused("Malformed commit status")
-        key = (status["context"], None)
+        key = (status["context"], None, "status", None)
         value = (status["id"], status.get("state") == "success")
         if key not in latest or value[0] > latest[key][0]:
             latest[key] = value
@@ -94,7 +98,8 @@ def ci(read, head):
         raise Refused("No exact-head CI evidence")
     if required:
         for name, app in required:
-            matches = [ok for (n, a), (_, ok) in latest.items() if n == name and (app in (None, -1) or a == app)]
+            matches = [ok for (n, a, _, _), (_, ok) in latest.items()
+                       if n == name and (app in (None, -1) or a == app)]
             if not matches or not all(matches):
                 raise Refused(f"Required check {name!r} is missing or not successful")
     elif not all(ok for _, ok in latest.values()):
