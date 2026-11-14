@@ -469,6 +469,50 @@ def test_backport_counts_and_is_capped(env):
     assert events(env.store, "selfheal_over_cap")[0]["kind"] == "backport"
 
 
+
+@pytest.mark.parametrize("count", [39, 40, 41])
+def test_receipt_verifier_obeys_daily_card_cap(env, monkeypatch, count):
+    """Receipt recovery must enforce the card count even with spend/concurrency admission open."""
+    monkeypatch.setattr(sh, "budget", OPEN)
+    fill(env.board, count)
+    d = defect(component="kanban", symptom="completed owner missing receipt")
+    fp = d["fingerprint"]
+    lane = sh.LaneState(env.store.root)
+    lane.update(fp, status="approved", component=d["component"], symptom=d["symptom"],
+                fix_card="t_owner001")
+
+    verifier = sh._recover_completion_receipt(fp, env.store, env.board, NOW)
+    st = lane.get(fp)
+    assert st["status"] == "approved"
+    if count < 40:
+        assert verifier and st["verify_card"] == verifier
+        assert len(env.board.creates()) == 1
+        assert env.board.rows("id = ?", (verifier,))[0][1].startswith(sh.VERIFY_TITLE)
+        assert sh.cards_created_today(None, NOW) == 40
+        assert not events(env.store, "selfheal_over_cap")
+        return
+
+    assert verifier is None
+    assert not st.get("verify_card")
+    assert not [row for row in env.board.rows() if row[1].startswith(sh.VERIFY_TITLE)]
+    (cap,) = events(env.store, "selfheal_over_cap")
+    assert (cap["kind"], cap["fingerprint"], cap["count"], cap["cap"]) == ("receipt", fp, count, 40)
+    (digest,) = env.board.creates()
+    assert f"selfheal-digest:{DAY}" in digest
+    assert len(env.board.comments) == 1
+    assert "not filed (receipt)" in env.board.comments[0][1]
+    assert sh.cards_created_today(None, NOW) == count
+
+    # Still capped: no verifier and no duplicate digest/comment across retries.
+    assert sh._recover_completion_receipt(fp, env.store, env.board, NOW + 60) is None
+    assert len(env.board.creates()) == len(env.board.comments) == 1
+    # Tomorrow's real count releases the same approved lane, without a receipt inferred from the cap.
+    env.board.now = MIDNIGHT + 60
+    verifier = sh._recover_completion_receipt(fp, env.store, env.board, MIDNIGHT + 60)
+    assert verifier and lane.get(fp)["verify_card"] == verifier
+    assert sh.cards_created_today(None, MIDNIGHT + 60) == 1
+
+
 @pytest.mark.parametrize("count", [39, 40])
 def test_undeployed_card_obeys_daily_cap(env, count):
     """An overdue deployment check shares the cap, not just ordinary defects/backports."""
@@ -505,6 +549,7 @@ def test_undeployed_card_obeys_daily_cap(env, count):
         assert event["kind"] == "undeployed" and event["count"] == event["cap"] == 40
         assert event["digest"] == card
         assert sh.cards_created_today(None, NOW) == 40
+
 
 
 def test_text_created_at_rows_never_count(env):
