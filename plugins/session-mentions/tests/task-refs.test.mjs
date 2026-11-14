@@ -193,6 +193,44 @@ test('courier task_read: a failed board listing after a default-board miss is un
   assert.match(r.error, /board list unavailable/)
 })
 
+test('task receipts preserve explicit custody records, including an explicit empty receipt', async () => {
+  const m = await load({ state, connections: async () => conns }, fakeApi())
+  const receipt = [
+    { machine: 'worker-example', path: '/work/result.txt', sha256: 'a'.repeat(64), attachment_uid: 'att_example', warning: null },
+    { machine: null, path: 'missing.txt', sha256: null, attachment_uid: null, warning: 'unavailable' }
+  ]
+  const data = { task: {}, artifact_receipt: receipt, events: [{ kind: 'completed', payload: { artifact_receipt: [{ path: 'stale' }] } }] }
+  assert.deepEqual(m.summarizeTask(data).artifact_receipt, receipt)
+  assert.deepEqual(m.summarizeTask({ ...data, artifact_receipt: [] }).artifact_receipt, [])
+})
+
+test('courier task_read retains latest completion receipt outside truncated history', async () => {
+  const receipt = [{ machine: 'worker-example', path: '/work/result.txt', sha256: 'b'.repeat(64), attachment_uid: null, warning: null }]
+  const events = [
+    { kind: 'completed', payload: { artifact_receipt: [{ path: 'old' }] } },
+    { kind: 'completed', payload: { artifact_receipt: receipt } },
+    ...Array.from({ length: 30 }, () => ({ kind: 'commented', payload: {} }))
+  ]
+  const base = fakeApi()
+  const m = await load({ state, connections: async () => conns }, async req => {
+    const data = await base(req)
+    return data.task ? { ...data, events } : data
+  })
+  const result = await m.performRequest({ action: 'task_read', args: { target: '@task:default/t_aaaa1111', limit: 2 } }, 'local', conns)
+  assert.equal(result.ok, true)
+  assert.equal(result.task.events.length, 2)
+  assert.deepEqual(result.task.artifact_receipt, receipt)
+})
+
+test('legacy completions have empty receipts, not receipts from an older completion or gateway', async () => {
+  const m = await load({ state, connections: async () => conns }, fakeApi())
+  assert.deepEqual(m.summarizeTask({ task: {} }).artifact_receipt, [])
+  assert.deepEqual(m.summarizeTask({ task: {}, events: [
+    { kind: 'completed', payload: { artifact_receipt: [{ path: 'old' }] } },
+    { kind: 'completed', payload: {} }
+  ] }).artifact_receipt, [])
+})
+
 // A synced gateway answers a card another gateway owns from its Board replica (core plugin_api GET adds
 // source/owner); writes there are refused 409 foreign_card naming the owner.
 function replicaApi(calls = [], { liveOn = null } = {}) {

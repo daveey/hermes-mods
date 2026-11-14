@@ -81,6 +81,40 @@ def test_real_replica_read_and_filters(replica):
     assert not bt.handle({'action': 'read', 'target': 't_999'})['ok']
 
 
+@pytest.mark.parametrize('payload', [
+    {'artifact_receipt': [
+        {'machine': 'worker-example', 'path': '/work/result.txt', 'sha256': 'a' * 64,
+         'attachment_uid': 'att_example', 'warning': None},
+        {'machine': None, 'path': 'missing.txt', 'sha256': None,
+         'attachment_uid': None, 'warning': 'unavailable'},
+    ]},
+    {'artifact_receipt': []},
+    {},
+])
+def test_receipt_survives_truncated_replica_history(replica, payload):
+    import sqlite3
+    with sqlite3.connect(replica) as conn:
+        for index, (kind, data) in enumerate([
+            ('completed', {'artifact_receipt': [{'path': 'stale'}]}),
+            ('completed', payload),
+            *[('commented', {}) for _ in range(30)],
+        ]):
+            conn.execute('INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,?,?,?)',
+                         ('t_123', kind, json.dumps(data), index + 1))
+    result = bt.handle({'action': 'read', 'target': 't_123', 'limit': 2})
+    assert result['ok'], result
+    assert result['history_truncated']['events'] is True
+    assert len(result['events']) == 2
+    assert all(event['kind'] == 'commented' for event in result['events'])
+    assert result['artifact_receipt'] == payload.get('artifact_receipt', [])
+
+
+def test_legacy_replica_without_events_has_empty_receipt(replica):
+    result = bt.handle({'action': 'read', 'target': 't_123'})
+    assert result['ok'], result
+    assert result['artifact_receipt'] == []
+
+
 def test_comment_refused_without_board_open(replica, monkeypatch):
     from tools import kanban_tools as kt
     monkeypatch.setattr(kt, '_granted_board', lambda *a: pytest.fail('write opened board'))
