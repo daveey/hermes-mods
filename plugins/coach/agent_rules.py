@@ -2604,11 +2604,48 @@ def strip_injected_preamble(command: str) -> str:
     return INJECTED_PREAMBLE_RE.sub("", command) if isinstance(command, str) else command
 
 
+# agent-017050f699: the read ran as `G pr view $n` through `G() { timeout 60 $TB exec --scope user/github ... -- gh
+# "$@" | grep -v <secrets>; }` (a token-broker wrapper), so no `gh pr view` text existed and pr_state_claim flagged a
+# reply whose claim the turn had just read. A PR read is keyed on the gh invocation, not its spelling: gh wrappers
+# defined in the same command (a function forwarding "$@"/$* to gh, an alias for gh, a variable whose value ends in
+# gh) have their calls rewritten to `gh ...` before PR_READ_RE runs, and every such read gets its own line (the `->`
+# line shows the wrapper's name, which no rule reads).
+_GH_FUNC_RE = re.compile(r"(?:\bfunction\s+)?(?<![\w$-])([A-Za-z_][\w-]*)\s*\(\)\s*\{([^{}]*)\}")
+_GH_FORWARD_RE = re.compile(r"(?<![\w-])gh\s+[\"']?\$(?:@|\*|\{@\}|\{\*\})")
+_GH_ALIAS_RE = re.compile(r"\balias\s+([A-Za-z_][\w-]*)=([\"']?)([^\"'\n;]*?(?<![\w-])gh)\2(?=[\s;&|)]|$)")
+_GH_VAR_RE = re.compile(r"(?<![\w$])([A-Za-z_]\w*)=([\"'])([^\"'\n]*?(?<![\w-])gh)\2")
+_GH_SUBCMD = r"(pr|api)\b"
+
+
+def expand_gh_wrappers(command: str) -> str:
+    """`command` with calls of gh wrappers it defines (`G pr view 1`, `g api ...`, `$GH pr checks 1`) spelled as
+    `gh ...`; unchanged when it defines none."""
+    if not isinstance(command, str) or "gh" not in command:
+        return command
+    names = {m.group(1) for m in _GH_FUNC_RE.finditer(command) if _GH_FORWARD_RE.search(m.group(2))}
+    names |= {m.group(1) for m in _GH_ALIAS_RE.finditer(command)}
+    names.discard("gh")
+    variables = {m.group(1) for m in _GH_VAR_RE.finditer(command)}
+    out = command
+    for n in sorted(names, key=len, reverse=True):
+        out = re.sub(r"(?<![\w$/.-])" + re.escape(n) + r"\s+" + _GH_SUBCMD, r"gh \1", out)
+    for v in sorted(variables, key=len, reverse=True):
+        out = re.sub(r"\"?\$(?:\{" + re.escape(v) + r"\}|" + re.escape(v) + r"(?!\w))\"?\s+" + _GH_SUBCMD,
+                     r"gh \1", out)
+    return out
+
+
 def pr_read_lines(arg: str, cap: int = TURN_LOG_ARG_CAP) -> list[str]:
     """`   <- PR read: <the read>` for each PR-state read that starts past the `->` line's `cap` chars (none
-    otherwise: the `->` line shows it). `--help` calls are not reads."""
+    otherwise: the `->` line shows it), and for every read made through a gh wrapper the command defines
+    (expand_gh_wrappers). `--help` calls are not reads."""
     out: list[str] = []
-    if not isinstance(arg, str) or len(arg) <= cap:
+    if not isinstance(arg, str):
+        return out
+    expanded = expand_gh_wrappers(arg)
+    if expanded != arg:
+        arg, cap = expanded, 0
+    if len(arg) <= cap:
         return out
     for m in PR_READ_RE.finditer(arg):
         if m.start() < cap and m.end() <= cap:
