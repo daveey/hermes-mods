@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -222,6 +223,78 @@ def _open_asks_index(pending: list, created: dict, *, now: float, budget: int | 
         entries.pop()
 
 
+# ---- decision-panel letters ----------------------------------------------------------------------------
+
+# A reply that is (or starts with) one option letter: "a", "(b)", "c)", "A.", "b - skip that ...". An English
+# article ("a new idea") has no separator after the letter, so it never matches.
+_LETTER_REPLY = re.compile(r"^\s*(?:option\s+)?[(\[]?([A-Za-z])[)\].:]?\s*(?:$|[-\u2013\u2014:,.)]\s*\S)", re.I)
+
+
+def _presenter(st):
+    """The Desktop queue's presenter (kanban_mirror.Mirror.present adds the lettered card-ask presentation)."""
+    try:
+        from . import kanban_mirror  # type: ignore[attr-defined]
+    except ImportError:
+        import importlib.util as ilu
+        import sys as _s
+        mod = _s.modules.get("user_steps_kanban_mirror")
+        if mod is None:
+            spec = ilu.spec_from_file_location("user_steps_kanban_mirror", Path(__file__).with_name("kanban_mirror.py"))
+            mod = ilu.module_from_spec(spec)  # type: ignore[arg-type]
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
+            mod = _s.modules.setdefault("user_steps_kanban_mirror", mod)
+        kanban_mirror = mod
+    return kanban_mirror.Mirror(core, st)
+
+
+def _panel_rows(request: dict) -> list[str]:
+    """The labels the Desktop panel badges A, B, C... for one request, in display order; [] when it shows no letters.
+
+    Mirrors desktop-plugins/user-steps/plugin.js DecisionRow: only a 'kanban-question' presentation gets lettered
+    rows (`letter(index)`), the recommended choice first, then the rest in order, then Skip, then Other."""
+    p = request.get("presentation") if isinstance(request, dict) else None
+    if not (isinstance(p, dict) and p.get("kind") == "kanban-question"
+            and isinstance(p.get("question"), str) and isinstance(p.get("details"), str)):
+        return []
+    shown = [c for c in request.get("choices") or [] if isinstance(c, dict)
+             and not (c.get("id") == "request-context" and c.get("effect") == "revise")]
+    rec = next((c for c in shown if c.get("id") == p.get("recommendedChoiceId") or c.get("recommended") is True), None)
+    ordered = ([rec] + [c for c in shown if c is not rec]) if rec else shown
+    rows = [re.sub(r"\s*\(recommended\)\s*$", "", str(c.get("label") or ""), flags=re.I) for c in ordered]
+    rows.append("Skip")
+    if p.get("other") is True:
+        rows.append("Other (type your answer)")
+    return rows
+
+
+def _panel_letter_hint(message: str, requests: list) -> str:
+    """Context line mapping a typed option letter to the decision panel's lettered option (empty when none applies).
+
+    The panel badges card-ask options A, B, C; the agent's context names them only by id (card-0...). Without this,
+    a typed "a" reads as whatever the agent's own prose called A (incident agent-d61f5b16f5: a plan's part A)."""
+    m = _LETTER_REPLY.match(message or "")
+    if not m:
+        return ""
+    code = m.group(1).upper()
+    hits = []
+    for r in requests or []:
+        rows = _panel_rows(r)
+        i = ord(code) - 65
+        if 0 <= i < len(rows):
+            title = str(r.get("title") or "")[:INDEX_TITLE_CHARS]
+            table = ", ".join(f'{chr(65 + j)} = {json.dumps(label, ensure_ascii=False)}' for j, label in enumerate(rows))
+            hits.append(f'"{title}" (requestId {str(r.get("requestId") or "")[:8]}): {table}')
+    if not hits:
+        return ""
+    head = (f'[Decision panel letters: the user\'s reply starts with "{m.group(1)}". The Desktop decision panel badges '
+            'each open card-ask option with a letter, in this order. Read the letter as that panel option, NOT as a '
+            'part, step or option your own prose or plan labelled with the same letter; check the label before '
+            'narrowing or widening scope.')
+    if len(hits) > 1:
+        head += f' {len(hits)} open asks have a "{code}": ask which one before acting.'
+    return head + "\n" + "\n".join(f"- {h}" for h in hits) + "]"
+
+
 # ---- hooks ---------------------------------------------------------------------------------------------
 
 # Runtime-written user rows (Kanban notices, auto-continue): a turn they start was not started by the user.
@@ -286,6 +359,16 @@ def pre_llm_call(session_id: str = "", user_message: str = "", platform: str = "
             import time
             created = {r['requestId']: st.created_at(own, r['requestId']) for r in pending}
             note = _open_asks_index(pending, created, now=time.time(), budget=_head_budget()) + '\n' + note
+            if _LETTER_REPLY.match(user_message if isinstance(user_message, str) else ""):
+                # Only a letter-shaped reply pays for presentation; first in the context so no spill hides it.
+                try:
+                    presenter = _presenter(st)
+                    letters = _panel_letter_hint(user_message, [presenter.present(r) for r in pending])
+                except Exception:
+                    log.exception("user-steps panel letter mapping failed")
+                    letters = ''
+                if letters:
+                    note = letters + '\n' + note
         incomplete = [r for r in pending if r['kind'] == 'approval' and not r['scope']['complete']]
         if incomplete:
             # Missing plans are agent work: the user has no button for them.
