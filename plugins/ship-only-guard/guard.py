@@ -1462,6 +1462,30 @@ def parse_turn(message):
     return None
 
 
+_OWNER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def _turn_owner(env):
+    """Additive explicit owner fields for a turn record: {"owner_task", "owner_board"}, each present only when
+    known. owner_task is the supported runtime identity (HERMES_KANBAN_TASK, else HERMES_KANBAN_WORKER_TASK);
+    owner_board is HERMES_KANBAN_BOARD, set by the runtime, and only written alongside owner_task. Never
+    derived from the PR title or branch. The hook process env wins (the command env may have the worker
+    identity stripped); a malformed value counts as unknown."""
+    for src in (os.environ, env if isinstance(env, dict) else {}):
+        task = src.get("HERMES_KANBAN_TASK") or src.get("HERMES_KANBAN_WORKER_TASK")
+        if not task:
+            continue
+        if not isinstance(task, str) or not _OWNER_ID.fullmatch(task):
+            return {}
+        out = {"owner_task": task}
+        # Keep custody paired: a command's board cannot qualify the hook's task.
+        board = src.get("HERMES_KANBAN_BOARD")
+        if isinstance(board, str) and _OWNER_ID.fullmatch(board):
+            out["owner_board"] = board
+        return out
+    return {}
+
+
 def _turn_number(ref):
     m = re.fullmatch(rf"refs/{re.escape(_TURN_PREFIX)}(\d+)", str(ref.get("ref", "")) if isinstance(ref, dict) else "")
     return int(m.group(1)) if m else -1
@@ -2000,7 +2024,7 @@ def _turn_acquire_scoped(number, data, repo, cwd, env, prechecked):
         return ""
     expires = int(_now()) + _TURN_TTL
     rec = {"pr": int(number), "head": head, "acquired": expires - _TURN_TTL,
-           "expires": expires, "files": files}
+           "expires": expires, "files": files, **_turn_owner(env)}
     rc, made = _gh_call([f"repos/{repo}/git/commits"], cwd, env, timeout=_TURN_CALL_TIMEOUT, payload={
         "message": f"{_TURN_SUBJECT}{int(number)}\n\n{json.dumps(rec, sort_keys=True)}\n",
         "tree": tree, "parents": [head]})

@@ -139,6 +139,8 @@ class FakeGitHub:
 @pytest.fixture
 def gh(monkeypatch):
     holder = {}
+    for k in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK", "HERMES_KANBAN_BOARD"):
+        monkeypatch.delenv(k, raising=False)   # hermetic: a worker's ambient identity must not leak in
 
     def make(*a, **kw):
         fake = FakeGitHub(*a, **kw)
@@ -878,3 +880,80 @@ def test_parse_turn_rejects_junk(msg):
 ])
 def test_skill_prose_rule(pr_file, base_file, held):
     assert bool(g._overlap(pr_file, base_file)) is held
+
+
+
+def _clear_owner_env(monkeypatch):
+    for k in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK", "HERMES_KANBAN_BOARD"):
+        monkeypatch.delenv(k, raising=False)
+
+
+def _take(gh, data=None):
+    fake = gh({2563: data or pr(2563, H2563, F2563)}, compare=delta([F2563[0]]))
+    assert "holds the state land turn" in merge(2563, H2563)
+    return fake
+
+
+def test_owner_sources_do_not_mix_boards(monkeypatch):
+    _clear_owner_env(monkeypatch)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_hook")
+    assert g._turn_owner({"HERMES_KANBAN_TASK": "t_cmd", "HERMES_KANBAN_BOARD": "foreign"}) == {
+        "owner_task": "t_hook"}
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    assert g._turn_owner({"HERMES_KANBAN_WORKER_TASK": "t_cmd", "HERMES_KANBAN_BOARD": "ops"}) == {
+        "owner_task": "t_cmd", "owner_board": "ops"}
+    monkeypatch.setenv("HERMES_KANBAN_TASK", " t_hook ")
+    assert g._turn_owner({"HERMES_KANBAN_TASK": "t_cmd"}) == {}
+
+
+def test_turn_record_carries_explicit_owner(gh, monkeypatch):
+    _clear_owner_env(monkeypatch)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "ops")
+    fake = _take(gh)
+    msg = fake.commits[fake.refs["refs/land-turn/pr-2563"]]["message"]
+    raw = json.loads(msg.splitlines()[2])           # the real writer payload
+    assert raw["owner_task"] == "t_abc123" and raw["owner_board"] == "ops"
+    rec = fake.turn(2563)                           # canonical parser accepts it unchanged
+    assert rec["pr"] == 2563 and rec["head"] == H2563 and rec["files"] == F2563
+
+
+def test_owner_worker_task_fallback_and_unknown_board_omitted(gh, monkeypatch):
+    _clear_owner_env(monkeypatch)
+    monkeypatch.setenv("HERMES_KANBAN_WORKER_TASK", "t_worker9")
+    rec = _take(gh).turn(2563)
+    assert rec["owner_task"] == "t_worker9" and "owner_board" not in rec
+
+
+def test_no_runtime_identity_writes_legacy_shape(gh, monkeypatch):
+    _clear_owner_env(monkeypatch)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "ops")   # a board alone is not an owner
+    assert set(_take(gh).turn(2563)) == {"pr", "head", "acquired", "expires", "files"}
+
+
+def test_malformed_owner_env_is_unknown(gh, monkeypatch):
+    _clear_owner_env(monkeypatch)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", 't_x"; evil')
+    assert "owner_task" not in _take(gh).turn(2563)
+
+
+def test_owner_is_never_derived_from_title(gh, monkeypatch):
+    _clear_owner_env(monkeypatch)
+    data = pr(2563, H2563, F2563)
+    data["title"] = "fix t_deadbeef"
+    assert "owner_task" not in _take(gh, data).turn(2563)
+
+
+def test_legacy_record_parses_and_open_pr_survives_head_change(gh, monkeypatch):
+    _clear_owner_env(monkeypatch)
+    legacy = json.dumps({"pr": 7, "head": "a" * 40, "expires": NOW + 100, "files": ["x"]})
+    assert g.parse_turn(f"land-turn pr=7\n\n{legacy}\n")["pr"] == 7
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+    fake = _take(gh)
+    ref = "refs/land-turn/pr-2563"
+    before = fake.refs[ref]
+    fake.prs[2563] = pr(2563, H2600, F2563)         # head changed, PR still open
+    merge(2563, H2600)
+    assert fake.refs[ref] == before and fake.turn(2563)["owner_task"] == "t_abc123"
+    fake.prs[2564] = pr(2564, H2600, ["hermes-sync"])
+    assert "holds the state land turn" in merge(2564, H2600)
