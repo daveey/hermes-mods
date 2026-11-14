@@ -2677,11 +2677,17 @@ def test_sql_looking_string_can_really_execute_shell(multi):
     'builtin ""alias g=git',
     'builtin \\alias g=git',
     'alias\\\n g=git',
+    'A=1 alias g=git',
+    '> /dev/null alias g=git',
+    '! alias g=git',
 ])
-def test_quoted_definition_real_restore_stays_refused(multi, definition):
+@pytest.mark.parametrize('stored', [False, True])
+def test_quoted_definition_real_restore_stays_refused(multi, definition, stored):
     main, wt = multi
-    cmd = ('cd ' + shlex.quote(str(wt)) + '\nshopt -s expand_aliases\neval '
-           + shlex.quote(definition) + '\ng stash pop')
+    setup = ('PAYLOAD=' + shlex.quote(definition) + '\neval "$PAYLOAD"'
+             if stored else 'eval ' + shlex.quote(definition))
+    cmd = ('cd ' + shlex.quote(str(wt)) + '\nshopt -s expand_aliases\n'
+           + setup + '\ng stash pop')
     before = subprocess.check_output(['git', 'rev-parse', 'refs/stash'], cwd=main, env=GIT_ENV)
     why = guard.refuse_reason(cmd, str(wt))
     blocked = _blocked(cmd, wt)
