@@ -2555,7 +2555,10 @@ def _may_define_alias(text: str) -> bool:
             # A quoted payload may be evaluated as shell code later. Nested quote
             # removal, escaped command names and line continuations change command
             # boundaries; the prose regex cannot safely classify any of these.
-            if re.search(r"\balias\b", part) and any(c in part for c in "'\"\\"):
+            # Assignment-bearing payloads can define aliases behind arbitrary shell
+            # prefixes (assignments, redirections, negation), even when stored for
+            # later eval. Only assignment-free plain prose gets the narrower scan.
+            if re.search(r"\balias\b", part) and any(c in part for c in "'\"\\="):
                 return True
             quoted.append(part)
             unquoted.append(" ")
