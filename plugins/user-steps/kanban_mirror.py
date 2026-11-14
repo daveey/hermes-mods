@@ -134,31 +134,42 @@ def _kept(path, *, entry_out=None):
         finally:
             c.close()
         return
-    with entry.lock:
-        entry.owner = threading.get_ident()
-        try:
-            if entry.conn is None or entry.ident != ident:
-                if entry.conn is not None:
-                    entry.conn.close()
-                    entry.conn = None
-                entry.conn, entry.ident, entry.gen, entry.memo = _open_ro(path), ident, next(_GEN), {}
-            c = entry.conn
-            if entry_out is not None:
-                entry_out.append(entry)
+    try:
+        with entry.lock:
+            entry.owner = threading.get_ident()
             try:
-                yield c
-            except sqlite3.Error:
-                entry.conn = None  # never reuse a connection that failed mid-read
-                c.close()
-                raise
+                if entry.conn is None or entry.ident != ident:
+                    if entry.conn is not None:
+                        entry.conn.close()
+                        entry.conn = None
+                    entry.conn, entry.ident, entry.gen, entry.memo = _open_ro(path), ident, next(_GEN), {}
+                c = entry.conn
+                if entry_out is not None:
+                    entry_out.append(entry)
+                try:
+                    yield c
+                except sqlite3.Error:
+                    entry.conn = None  # never reuse a connection that failed mid-read
+                    c.close()
+                    raise
+                finally:
+                    if entry.conn is not None and c.in_transaction:
+                        c.rollback()
             finally:
-                if entry.conn is not None and c.in_transaction:
-                    c.rollback()
-        finally:
-            entry.owner = None
-            with _POOL_LOCK:
-                if entry.retired:
-                    _close_entry(entry)
+                entry.owner = None
+                with _POOL_LOCK:
+                    if entry.retired:
+                        _close_entry(entry)
+    finally:
+        # close_pool() may retire the entry after the check above but before entry.lock is
+        # released; its non-blocking acquire then fails and it skips the close. It sets
+        # ``retired`` before that acquire, so recheck after release: either we get the lock and
+        # close, or its holder (close_pool or a queued borrower) closes on its own way out.
+        if entry.retired and entry.conn is not None and entry.lock.acquire(blocking=False):
+            try:
+                _close_entry(entry)
+            finally:
+                entry.lock.release()
 
 
 def _version(c):
