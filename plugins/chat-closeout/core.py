@@ -804,6 +804,25 @@ def ask_candidates(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> lis
     return out
 
 
+def blocked_since(card: Optional[dict[str, Any]]) -> Optional[float]:
+    """When the card's current block was filed, or None. A local row carries ``blocked_at`` (its newest ``blocked``
+    event). A remote row (hub/worker replica) has no events: its ``park`` record of the run that blocked it does
+    (``outcome`` blocked, ``ended_at``), and only while the card is still blocked. Without this a remote ask the
+    chat already quoted is never learned and its relay retries forever (card t_01a1d95b5eae0f44)."""
+    if not card:
+        return None
+    raw = card.get('blocked_at')
+    if raw is None and card.get('status') in ('blocked', 'triage'):
+        park = card.get('park')
+        if isinstance(park, dict) and park.get('outcome') == 'blocked':
+            raw = park.get('ended_at')
+    try:
+        at = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return at if math.isfinite(at) and at > 0 else None
+
+
 def quoted_ask(state_dbs: Iterable[Path], ids: Iterable[str], card: dict[str, Any],
                pool: Optional[ReadPool] = None) -> bool:
     """Only an assistant's delivered text after this filing proves it was relayed.
@@ -813,11 +832,8 @@ def quoted_ask(state_dbs: Iterable[Path], ids: Iterable[str], card: dict[str, An
     """
     ask = ask_of(card)
     ids = list(dict.fromkeys(i for i in ids if i))
-    try:
-        since = float(card['blocked_at'])
-    except (KeyError, TypeError, ValueError):
-        return False
-    if not ask or not ids or not math.isfinite(since):
+    since = blocked_since(card)
+    if not ask or not ids or since is None:
         return False
     action = _norm(ask['action'])
     for path in state_dbs:
@@ -1891,14 +1907,14 @@ ASK_RECHECK_S = 12 * 3600
 
 def ask_age_s(c: dict[str, Any], now: Optional[float] = None) -> Optional[float]:
     """Seconds since the card's current block was filed (``blocked_at``, else ``updated_at``); None if unknown."""
-    for field in ("blocked_at", "updated_at"):
-        try:
-            at = float(c.get(field) or 0)
-        except (TypeError, ValueError):
-            continue
-        if at > 0:
-            return max(0.0, (time.time() if now is None else now) - at)
-    return None
+    since = blocked_since(c)
+    if since is not None:
+        return max(0.0, (time.time() if now is None else now) - since)
+    try:
+        at = float(c.get("updated_at") or 0)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, (time.time() if now is None else now) - at) if at > 0 else None
 
 
 def _age_text(age: float) -> str:

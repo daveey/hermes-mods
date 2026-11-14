@@ -52,6 +52,14 @@ not establish which session filed a block.
 `tests/test_self_relay.py` covers both entry paths, settled and working batches, prior coverage,
 fresh/stale/absent quotes, normalization, injected notices, failed replies and other sessions.
 
+The block time is `core.blocked_since`: a local row's `blocked_at`, else, for a hub/worker replica row (no
+task events), the `ended_at` of its `park` record when that run's outcome is `blocked` and the card is still
+blocked. Before this a remote ask the chat had already quoted was never learned: a chat that is always
+mid-turn answered every relay `busy`, and the watchdog filed the told ask as undelivered. The same value
+gives remote asks their age in the prompt. When nothing is left to deliver (no close-out key, no ask key, no
+close-out in flight) the wake tick clears `failure_since`, so a later unrelated ask starts its own failure
+clock instead of inheriting one from days earlier (`tests/test_remote_ask_learned.py`).
+
 Every hook fails open. Skips kanban workers, cron, webhooks and subagents. `CHAT_CLOSEOUT_OFF=1` disables it.
 
 Needs the fork core for the wake (`tui_gateway.server._wake_session_turn`) and the sidebar seam

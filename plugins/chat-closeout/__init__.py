@@ -2147,6 +2147,13 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=
         fix.update(core.track_unlinked({**row, **fix}, cards, healthy=healthy, now=now, mono=mono))
         fix.update(core.reconcile_done({**row, **fix}, cards,
                                        lambda t, c, sid=sid: (proof or session_proof)(sid, t, c)))
+        fixed = {**row, **fix}
+        if (row.get("failure_since") is not None and fixed.get("closing") is None
+                and not core.pending_key(fixed, cards) and not core.ask_relay_key(fixed, cards)):
+            # Nothing is left to deliver (the chat told the asks itself, or they were answered): the failure
+            # episode is over. Kept, a later unrelated ask would inherit this age and the watchdog would file it
+            # as undelivered for days within minutes of being asked (card t_01a1d95b5eae0f44).
+            fix["failure_since"] = None
         if fix:
             led.write(sid, **fix)
             stats["wrote"] = stats.get("wrote", 0) + 1
