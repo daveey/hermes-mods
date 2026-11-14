@@ -55,6 +55,15 @@ class DesktopPluginCI(unittest.TestCase):
         for pattern in ('desktop-plugins/*/test*/*.test.mjs', 'plugins/**/*.test.mjs'):
             for f in ROOT.glob(pattern):
                 self.assertIn(f, globbed)
+        self.assertIn(ROOT / 'desktop-plugins/user-steps/test/decision-queue.test.mjs', globbed)
+        self.assertIn(ROOT / 'desktop-plugins/user-steps/test/kanban-question.test.mjs', globbed)
+
+    def test_no_node_suite_hides_at_desktop_plugin_root(self):
+        # The globs never see desktop-plugins/<n>/*.test.mjs. Only real-browser suites
+        # (esbuild + Playwright + Chromium, run by hand) may live there, named *.browser.test.mjs.
+        stray = [f.relative_to(ROOT).as_posix() for f in ROOT.glob('desktop-plugins/**/*.test.mjs')
+                 if f.parent.name not in ('test', 'tests') and not f.name.endswith('.browser.test.mjs')]
+        self.assertEqual(stray, [], 'move these into desktop-plugins/<n>/test/ so node-tests runs them')
 
 
 if __name__ == '__main__':
