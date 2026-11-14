@@ -85,6 +85,23 @@ A new guard also belongs in private `home/plugins-every-host.txt`; export must n
   execute_code, tool, REST, Desktop...) needs a test for that path listed under `## Tests`. Don't widen a claim
   ("terminal or execute_code") without adding the test for the new path; mark an untested path "untested".
 
+## PR landings are a separate gate
+
+The normal fast-forward direct-push exception below does **not** authorize unreviewed PR merges.
+A PR landing requires independent approval of its exact current head and successful configured required
+checks; when no required checks are configured, **all** checks and commit statuses on that head must
+succeed. Missing, pending, failed, cancelled, skipped/neutral, unreadable or stale evidence holds landing.
+An independently completed Kanban review with verified execution/session custody is valid when the
+GitHub account cannot approve its own PR; a COMMENT review or a pasted verdict is not approval.
+
+Use `python3 plugins/push-guard/land.py --pr <number> --head <full-sha>` from the deployed checkout
+(or its absolute path); add `--review-task <done-card> --implementation-task <implementation-card>`
+for the installed Kanban review validator. The helper merges immediately with an exact-head REST pin
+and reads the PR back. Raw CLI/REST/GraphQL/auto-merge calls are held by push-guard, even without a
+local push-guards.json. No server permissions change; the hook is agent-tool defense in depth, not
+an OS sandbox or an atomic server-side review/base lock. Direct pushes retain existing local suite
+gates and green-main-CI obligations. See `plugins/push-guard/README.md` for limits and tests.
+
 ## Never
 
 - Commit secrets, tokens, `auth.json`/`.env` content, or anything matched by the private denylist.
