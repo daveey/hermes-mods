@@ -2513,6 +2513,61 @@ def _git_calls(cmd: str, cwd: Optional[str], depth: int = 0):
         yield repo, sub, args
 
 
+def _may_define_alias(text: str) -> bool:
+    """Whether the word ``alias`` in ``text`` may be a shell alias definition.
+
+    Any alias can map a bare name to git, so the pre-scan taints every unmodeled bare name.
+    Prose inside a quoted data argument (``--review-reply 'alias/import nit'``) is not a
+    definition: it never reaches a command position. An occurrence counts when it is unquoted,
+    or in a quoted string where it starts a command (string start, after ``;&|(){}`` or a
+    newline, after ``$(`` or a backtick, or after a command-prefix word such as ``eval``). Text
+    this small scanner cannot bound exactly (heredocs, ANSI-C quotes, substitutions inside
+    double quotes, an unterminated quote) keeps the whole-text reading.
+    """
+    if not re.search(r"\balias\b", text):
+        return False
+    if "<<" in text or "$'" in text or '$"' in text:
+        return True
+    unquoted, quoted = [], []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            unquoted.append(text[i:i + 2])
+            i += 2
+        elif ch in "'\"":
+            j, body = i + 1, []
+            while True:
+                if j >= n:
+                    return True  # unterminated quote
+                c = text[j]
+                if ch == '"' and c == "\\":
+                    body.append(text[j:j + 2])
+                    j += 2
+                    continue
+                if c == ch:
+                    break
+                if ch == '"' and (c == "`" or text.startswith(("$(", "${"), j)):
+                    return True  # code inside double quotes: nesting is not scanned
+                body.append(c)
+                j += 1
+            quoted.append("".join(body))
+            unquoted.append(" ")
+            i = j + 1
+        else:
+            unquoted.append(ch)
+            i += 1
+    if re.search(r"\balias\b", "".join(unquoted)):
+        return True
+    return any(re.search(_ALIAS_COMMAND, part) for part in quoted)
+
+
+_ALIAS_COMMAND = (
+    r"(?:^|[;&|(){}`\n]|\$\(|\b(?:then|do|else|elif|eval|exec|builtin|command|sudo|env|time|"
+    r"nohup|xargs)\s)\s*alias(?=\s|$|[;&|()])"
+)
+
+
 def _git_calls_noted(cmd: str, cwd: Optional[str], depth: int = 0):
     """Yield (repo, subcommand, args, note) for every git call the command may make.
 
@@ -2526,7 +2581,7 @@ def _git_calls_noted(cmd: str, cwd: Optional[str], depth: int = 0):
     variables = {key: os.environ.get(key) for key in ("HOME", "TMPDIR")}
     variables["PWD"] = cwd
     state = _State(cwd, variables, {"HOME", "TMPDIR", "PWD", "OLDPWD"}, {})
-    if re.search(r"BASH_CMDS|\balias\b", cmd or ""):
+    if re.search(r"BASH_CMDS", cmd or "") or _may_define_alias(cmd or ""):
         # BASH_CMDS (set by declare/read/printf -v too) or an alias may map any name to git.
         state.exported.add(_CMDS)
     try:

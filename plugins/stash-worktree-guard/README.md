@@ -216,7 +216,10 @@ a `pop`/`apply` word piped into a shell, an unknown `declare -n` target, or a da
 of an unmodeled program that holds a restore command, such as `ssh host "git stash pop"`).
 This remains bounded shell analysis, not a shell sandbox. Known limits: shell aliases
 defined before the command (an `alias` in the command makes every unmodeled name a
-possible git),
+possible git; the word counts when it is unquoted or starts a command inside a quoted string,
+so prose such as `--review-reply 'alias/import nit'` does not taint a brokered
+`token-broker exec … -- env … hermes-core-wt ship`, while heredocs, `$'…'` text, substitutions
+inside double quotes and unterminated quotes keep the whole-text reading),
 Git aliases already stored in repository/user config, `shopt -s lastpipe`, `set -e`,
 exported functions, inherited state of a persistent terminal (logical `PWD`, exported
 `IFS`/`CDPATH`/`GIT_DIR`, `set -a`), scripts whose text is not in the command (a file
