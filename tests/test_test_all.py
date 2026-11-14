@@ -160,6 +160,101 @@ class TestAll(unittest.TestCase):
         self.assertEqual(runner["post_summary_errors"]("Ran 1 test in 0.0s\nOK\nException ignored in: <x>\n"),
                          ["Exception ignored in: <x>"])
 
+    def test_output_dir_retains_early_failure_bytes_and_failure_error_ids(self):
+        import hashlib
+        make_tree(self.root, {
+            'broken': '''
+                import atexit
+                import pytest
+                def late_output():
+                    for i in range(80): print('late-output-' + str(i))
+                atexit.register(late_output)
+                def test_early_failure():
+                    assert False, 'EARLY_FAILURE_MARKER'
+                @pytest.fixture
+                def broken_fixture():
+                    raise RuntimeError('SETUP_ERROR_MARKER')
+                def test_setup_error(broken_fixture): pass
+            ''',
+            'good': 'def test_ok(): pass\n',
+        })
+        output = self.root / 'logs'
+        receipt = self.root / 'results.json'
+        r = run(self.root, '--no-core', '--output-dir', str(output), '--json', str(receipt))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        rows = {s['name']: s for s in json.loads(receipt.read_text())['suites']}
+        for name, rc in [('plugins/broken', 1), ('plugins/good', 0)]:
+            row = rows[name]
+            path = Path(row['log_path'])
+            self.assertEqual(path.parent, output.resolve())
+            raw = path.read_bytes()
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), row['log_sha256'])
+            self.assertEqual(row['rc'], rc)
+        row = rows['plugins/broken']
+        raw = Path(row['log_path']).read_bytes()
+        self.assertIn(b'EARLY_FAILURE_MARKER', raw)
+        self.assertIn(b'FAILED plugins/broken/test_load.py::test_early_failure', raw)
+        self.assertIn(b'ERROR plugins/broken/test_load.py::test_setup_error', raw)
+        self.assertNotIn('EARLY_FAILURE_MARKER', row['tail'])
+        self.assertEqual(len(row['tail'].splitlines()), 40)
+        self.assertNotIn('EARLY_FAILURE_MARKER', r.stdout)
+        # Each invocation keeps its own logs even when reusing the directory.
+        again = run(self.root, '--no-core', '--output-dir', str(output), '--json', str(receipt))
+        self.assertEqual(again.returncode, 1, again.stdout + again.stderr)
+        self.assertEqual(len(list(output.glob('*.log'))), 4)
+
+    def test_output_dir_retains_timeout_partial_bytes(self):
+        import hashlib
+        make_tree(self.root, {'hang': '''
+            import os, time
+            os.write(1, b'partial-stdout-\\xff\\r\\n')
+            os.write(2, b'partial-stderr\\n')
+            time.sleep(60)
+        '''})
+        receipt = self.root / 'timeout.json'
+        with patch.dict(os.environ, PYTEST_ADDOPTS='-s'):
+            r = run(self.root, '--no-core', '--timeout', '3', '--output-dir', str(self.root / 'logs'),
+                    '--json', str(receipt))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        row = json.loads(receipt.read_text())['suites'][0]
+        self.assertEqual(row['status'], 'TIMEOUT')
+        self.assertIsNone(row['rc'])
+        raw = Path(row['log_path']).read_bytes()
+        self.assertIn(b'partial-stdout-\xff\r\npartial-stderr\n', raw)
+        self.assertEqual(row['log_sha256'], hashlib.sha256(raw).hexdigest())
+
+    def test_without_output_dir_keeps_receipt_shape_and_return_codes(self):
+        make_tree(self.root, {'good': 'def test_ok(): pass\n',
+                              'bad': 'def test_bad(): assert False\n'})
+        receipt = self.root / 'results.json'
+        for name, expected in [('good', 0), ('bad', 1)]:
+            r = run(self.root, '--no-core', '--exact', '-k', 'plugins/' + name,
+                    '--json', str(receipt))
+            self.assertEqual(r.returncode, expected, r.stdout + r.stderr)
+            row = json.loads(receipt.read_text())['suites'][0]
+            self.assertNotIn('log_path', row)
+            self.assertNotIn('log_sha256', row)
+            self.assertLessEqual(len(row['tail'].splitlines()), 40)
+        self.assertFalse((self.root / 'logs').exists())
+
+    def test_retained_log_names_cannot_escape_or_collide_for_suite_names(self):
+        runner = runpy.run_path(str(RUNNER))
+        import hashlib
+        output = self.root / 'logs'
+        output.mkdir()
+        paths = []
+        for name in ['../../outside', 'plugins/a:b', 'plugins/a?b']:
+            row = runner['run_suite']({'name': name, 'cmd': [sys.executable, '-c',
+                                      "import os; os.write(1, b'1 passed\\n')"]},
+                                      sys.executable, None, 3, self.root, self.root,
+                                      output_dir=output)
+            self.assertEqual(row['status'], 'PASS')
+            path = Path(row['log_path'])
+            self.assertEqual(path.parent, output.resolve())
+            self.assertEqual(row['log_sha256'], hashlib.sha256(path.read_bytes()).hexdigest())
+            paths.append(path)
+        self.assertEqual(len(set(paths)), 3)
+
     def test_hanging_suite_times_out_and_is_reported(self):
         make_tree(self.root, {"hang": "import time\ntime.sleep(60)\n"})
         r = run(self.root, "--timeout", "3")

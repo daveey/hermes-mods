@@ -19,6 +19,11 @@ Usage:
   scripts/test-all --exact -k plugins/coach -k tools/tailnet --json out.json
                                         exactly those suites (CI: .github/workflows/plugin-suites.yml);
                                         --json writes each suite's status and passed/failed/errors/skipped
+  scripts/test-all -k example --output-dir logs --json out.json
+                                        retain full merged stdout/stderr bytes in unique private per-suite logs;
+                                        JSON adds log_path + log_sha256, including partial timeout output.
+                                        Logs can contain sensitive output: retain/share deliberately.
+                                        Without --output-dir only the existing bounded tail is kept.
   scripts/test-all -j 8 --timeout 900
   scripts/test-all --list
   scripts/test-all --hermes-core PATH   override the core checkout (default $HERMES_CORE_CHECKOUT,
@@ -45,6 +50,7 @@ import concurrent.futures as cf
 import contextlib
 from importlib.metadata import distributions
 import json
+import hashlib
 import os
 import shlex
 import re
@@ -479,7 +485,7 @@ def discover(root: Path, core: Path | None, explicit_core: bool) -> list[dict]:
     return suites
 
 
-def run_suite(s: dict, py: str, core: Path | None, timeout: int, root: Path = ROOT, site: Path | None = None, uv: str | None = None, isolated_home: str | None = None, isolated_temp: str | None = None) -> dict:
+def run_suite(s: dict, py: str, core: Path | None, timeout: int, root: Path = ROOT, site: Path | None = None, uv: str | None = None, isolated_home: str | None = None, isolated_temp: str | None = None, output_dir: Path | None = None) -> dict:
     res = {"name": s["name"], "status": "", "rc": None, "secs": 0.0, "tail": "", "reason": s.get("skip", ""),
            "passed": 0, "failed": 0, "errors": 0, "skipped": 0}
     if s.get("skip"):
@@ -511,7 +517,7 @@ def run_suite(s: dict, py: str, core: Path | None, timeout: int, root: Path = RO
             env.pop(key, None)
     cwd = root / s["cwd"] if s.get("cwd") else root
     cmd = [x.replace("{py}", shlex.quote(py) if s["cmd"][0] == "sh" else py).replace("{core}", str(core or "")).replace("{site}", str(site)) for x in s["cmd"]] if s.get("cmd") else \
-        [py, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider", "--rootdir", str(s["dir"]), *s["args"], *s["targets"]]
+        [py, "-m", "pytest", "-q", "-rs", "-rfEs", "-p", "no:cacheprovider", "--rootdir", str(s["dir"]), *s["args"], *s["targets"]]
     # No-core uses a clean venv, including for nested sys.executable children.
     # Dependencies remain on the explicit PYTHONPATH test site.
     t0 = time.time()
@@ -521,17 +527,31 @@ def run_suite(s: dict, py: str, core: Path | None, timeout: int, root: Path = RO
             return res
         cmd[0] = uv
     try:
-        cp = subprocess.run(cmd, cwd=cwd, env=env, text=True, errors="replace", timeout=timeout,
+        cp = subprocess.run(cmd, cwd=cwd, env=env, text=output_dir is None,
+                            errors="replace" if output_dir is None else None, timeout=timeout,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
-        out, rc = cp.stdout or "", cp.returncode
+        out, rc = cp.stdout or b"", cp.returncode
     except OSError as e:
         res.update(status='FAIL', reason=f"cannot execute {cmd[0]}: {e.strerror}")
         return res
     except subprocess.TimeoutExpired as e:
-        out = (e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else e.stdout) or ""
-        rc = None
+        out, rc = e.stdout or b"", None
         res["status"] = "TIMEOUT"
         res["reason"] = f"no result within {timeout}s"
+    if output_dir is not None:
+        # Keep raw bytes, also on timeout, before decoding for counts/tail. Write
+        # a completed snapshot rather than an inherited child fd: surviving
+        # descendants must not mutate the retained log after its hash is taken.
+        raw = out if isinstance(out, bytes) else out.encode()
+        slug = re.sub(r"[^a-zA-Z0-9_-]", "_", s["name"])[:80] or "suite"
+        # Exclusive private files avoid overwrites, collisions and traversal.
+        with tempfile.NamedTemporaryFile(mode="wb", prefix=slug + "-", suffix=".log",
+                                         dir=output_dir, delete=False) as log:
+            log.write(raw)
+        res["log_path"] = str(Path(log.name).resolve())
+        res["log_sha256"] = hashlib.sha256(raw).hexdigest()
+    if isinstance(out, bytes):
+        out = out.decode(errors="replace")
     res["secs"] = time.time() - t0
     res["rc"] = rc
     lines = [ln for ln in out.splitlines() if ln.strip()]
@@ -698,6 +718,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--exact", action="store_true",
                     help="-k names whole suites (as printed by --list), and repo-guards is not added")
     ap.add_argument("--json", dest="json_out", help="also write per-suite results (status, counts, tail) here")
+    ap.add_argument("--output-dir", help="retain full per-suite stdout/stderr logs here, including timeouts; "
+                    "JSON adds absolute log_path and log_sha256")
     ap.add_argument("--root", default=str(ROOT), help=argparse.SUPPRESS)  # tests point this at a fixture tree
     a = ap.parse_args(argv)
 
@@ -742,6 +764,9 @@ def main(argv: list[str] | None = None) -> int:
     if warning:
         print(warning, flush=True)
 
+    output_dir = Path(a.output_dir).resolve() if a.output_dir else None
+    if output_dir is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
     results = []
     # Keep the synthetic home outside the real Hermes home and outside TMPDIR;
     # tests of canonical HOME must not mistake it for a temporary export.
@@ -760,7 +785,7 @@ def main(argv: list[str] | None = None) -> int:
             subprocess.run([py, '-m', 'venv', '--without-pip', str(Path(home) / 'venv')], check=True)
             py = str(Path(home) / 'venv/bin/python')
         futs = [ex.submit(run_suite, s, py, core, a.timeout, root, site, uv,
-                          home if a.no_core else None, temp if a.no_core else None) for s in suites]
+                          home if a.no_core else None, temp if a.no_core else None, output_dir) for s in suites]
         for f in cf.as_completed(futs):
             r = f.result()
             results.append(r)
