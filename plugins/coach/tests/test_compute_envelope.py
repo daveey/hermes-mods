@@ -156,11 +156,14 @@ def test_register_adds_all_pre_final_gate_callbacks(monkeypatch):
 
     class Ctx:
         def register_hook(self, name, fn):
-            seen.append((name, fn.__name__))
+            seen.append((name, fn))
     mod.register(Ctx())
-    assert [fn for name, fn in seen if name == "pre_final_gate"] == [
-        "gate", "envelope_gate", "status_fresh_gate"]
-    assert all(":" not in name for name, _ in seen)
+    assert [(fn.__module__, fn.__qualname__) for name, fn in seen if name == 'pre_final_gate'] == [
+        (mod._load('goal_disposition').__name__, 'build_gate.<locals>.gate'),
+        (mod.__name__, 'build.<locals>.envelope_gate'),
+        (mod.__name__, 'build.<locals>.status_fresh_gate'),
+    ]
+    assert all(':' not in name for name, _ in seen)
 
 
 def test_big_multi_gpu_ask_still_reaches_the_user(tmp_path, monkeypatch):
