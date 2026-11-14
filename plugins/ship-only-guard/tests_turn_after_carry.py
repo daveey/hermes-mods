@@ -156,3 +156,28 @@ def test_hook_does_not_treat_the_land_turn_command_as_a_merge(monkeypatch, tmp_p
     g, shim = load(monkeypatch)
     cmd = f"python3 {shlex.quote(g.__file__)} --land-turn {NUMBER} --repo {R} --match-head-commit {HEAD}"
     assert g.check_shell(cmd, cwd=str(tmp_path), repos={R}) is None and not shim.calls
+
+
+class ListFailsAfterWriteShim(TurnShim):
+    """The land-turn listing is readable for the pre-write hold check, then fails once a turn was written."""
+
+    def answer(self, argv):
+        words = [w for w in argv[2:] if not w.startswith("-") and not w.startswith("Accept:")]
+        if self.writes and words and words[0] == f"repos/{R}/git/matching-refs/land-turn/pr-":
+            return "", 1
+        return super().answer(argv)
+
+
+def test_land_turn_command_exits_1_when_acquisition_refuses(monkeypatch, capsys):
+    # Acquisition wrote the ref but could not re-read the ordering snapshot: `_turn_acquire` returns a
+    # `[ship-only-guard]` refusal, not an expiry. The command must not report it as a held turn (exit 0).
+    g, _ = load(monkeypatch)
+    shim = ListFailsAfterWriteShim(g, True)
+    monkeypatch.setattr(g.subprocess, "run", shim.run)
+    rc = g.main(["--land-turn", str(NUMBER), "--repo", R, "--match-head-commit", HEAD])
+    out = capsys.readouterr()
+    text = out.out + out.err
+    assert ("ref", TURN_REF) in shim.writes, (shim.writes, text)     # the refusal comes after the write
+    assert rc == 1, text
+    assert "holds the state land turn" not in text, text
+    assert "No land turn recorded" in text and "unreadable after writing" in text, text

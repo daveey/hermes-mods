@@ -1033,7 +1033,8 @@ def test_git_verifier_checks_each_merge_in_chain(monkeypatch):
     calls = []
     monkeypatch.setattr(g, "_git_merge_tree_refusal", lambda *a: calls.append(a[:3]) or "")
     assert check() is None
-    assert calls == [(mid, H0, BASE_TIP), (H, mid, tip2)]
+    # The carry proofs run concurrently (tests_carry_parallel.py): each merge is checked once, in any order.
+    assert sorted(calls) == sorted([(mid, H0, BASE_TIP), (H, mid, tip2)])
 
 
 @pytest.mark.parametrize("step,output,reason", [
