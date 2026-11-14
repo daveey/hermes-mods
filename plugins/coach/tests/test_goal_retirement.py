@@ -40,7 +40,11 @@ def test_retirement_removes_registered_hook_but_preserves_other_guards(tmp_path,
     callbacks = []
     plugin.register(SimpleNamespace(register_hook=lambda n, f: callbacks.append((n, f))))
     final = [f for n, f in callbacks if n == 'pre_final_gate']
-    assert [f.__name__ for f in final] == ['envelope_gate', 'status_fresh_gate']
+    assert [(f.__module__, f.__qualname__) for f in final] == [
+        (plugin.__name__, 'build.<locals>.envelope_gate'),
+        (plugin.__name__, 'build.<locals>.status_fresh_gate'),
+    ]
+    assert not any(f.__qualname__ == 'build_gate.<locals>.gate' for f in final)
     assert {'pre_llm_call', 'post_tool_call', 'pre_tool_call'} <= {n for n, f in callbacks}
 
 
@@ -54,8 +58,19 @@ def test_retired_gate_absent_after_normal_discovery(tmp_path, monkeypatch):
     try:
         manager.discover_and_load(force=True)
         assert Path(manager._plugins['coach'].module.__file__).resolve().parent == ROOT
-        callbacks = list(manager.iter_hook_callbacks('pre_final_gate'))
-        assert [f.__name__ for f in callbacks] == ['envelope_gate', 'status_fresh_gate']
+        def inventory():
+            owner = manager._plugins['coach'].module.__name__
+            return [(f.__module__, f.__qualname__)
+                    for f in manager.iter_hook_callbacks('pre_final_gate')], [
+                (owner, 'build.<locals>.envelope_gate'),
+                (owner, 'build.<locals>.status_fresh_gate'),
+            ]
+        callbacks = tuple(manager.iter_hook_callbacks('pre_final_gate'))
+        assert inventory()[0] == inventory()[1]
+        assert not any(f.__qualname__ == 'build_gate.<locals>.gate' for f in callbacks)
+        manager.discover_and_load(force=True)
+        assert inventory()[0] == inventory()[1]
+        assert not set(callbacks).intersection(manager.iter_hook_callbacks('pre_final_gate'))
     finally:
         manager.unload()
 

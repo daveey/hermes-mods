@@ -45,32 +45,25 @@ def environment(tmp_path, monkeypatch):
         'plugins': {'enabled': list(ORDERS[0])},
         'agent': {'pre_verify_every_turn': True, 'max_verify_nudges': 1}}))
     class Events(list):
-        # Auxiliary coach gates stay out of the goal-gate event stream.
-        def __init__(self):
-            super().__init__()
-            self.envelope = []
-            self.status_fresh = []
+        # Unrelated gates remain observable without changing the goal-gate event stream.
+        pass
     events = Events()
+    events.other_guards = {'envelope_gate': [], 'status_fresh_gate': []}
     original = PluginContext.register_hook
     def recording_register(ctx, name, callback):
         if name == 'pre_final_gate':
-            # Coach registers goal, compute-envelope, and status-fresh gates.
-            # Keep auxiliary observations separate without skipping real callbacks.
-            envelope = ctx.plugin_id == 'coach' and callback.__name__ == 'envelope_gate'
-            status_fresh = ctx.plugin_id == 'coach' and callback.__name__ == 'status_fresh_gate'
-            label = ('coach:compute_envelope' if envelope else
-                     'coach:status_fresh' if status_fresh else ctx.plugin_id)
+            other_guard = ctx.plugin_id == 'coach' and callback.__name__ in events.other_guards
             @functools.wraps(callback)
             def recorded(**kwargs):
                 result = callback(**kwargs)
-                if envelope:
-                    events.envelope.append((kwargs['attempt'], copy.deepcopy(result)))
-                elif status_fresh:
-                    events.status_fresh.append((kwargs['attempt'], copy.deepcopy(result)))
+                if other_guard:
+                    events.other_guards[callback.__name__].append((kwargs['attempt'], copy.deepcopy(result)))
                 else:
                     events.append((ctx.plugin_id, kwargs['attempt'], copy.deepcopy(result)))
                 return result
-            recorded.acceptance_plugin = label
+            # Preserve the goal-owner label consumed by sibling turn tests.
+            recorded.acceptance_plugin = (f'coach:{callback.__name__}' if other_guard else ctx.plugin_id)
+            recorded.acceptance_identity = (ctx.plugin_id, callback.__qualname__)
             return original(ctx, name, recorded)
         return original(ctx, name, callback)
     monkeypatch.setattr(PluginContext, 'register_hook', recording_register)
@@ -89,21 +82,19 @@ def environment(tmp_path, monkeypatch):
             manager._load_plugin(manifests[name])
             assert not manager._plugins[name].error
         hooks = manager.iter_hook_callbacks('pre_final_gate')
-        # Three coach gates plus ask-gate and chat-closeout.
-        assert len(hooks) == 5
-        # Wrappers retain callback identity/attributes, including guard priority.
-        actual = [h.acceptance_plugin for h in hooks]
-        expected = [x for name in order for x in
-                    (('coach', 'coach:compute_envelope', 'coach:status_fresh')
-                     if name == 'coach' else (name,))]
+        # Exact owner-qualified inventory rejects omissions and duplicate registrations.
+        actual = [h.acceptance_identity for h in hooks]
+        expected = [(name, qualname) for name in order for qualname in
+                    (('build_gate.<locals>.gate', 'build.<locals>.envelope_gate',
+                      'build.<locals>.status_fresh_gate') if name == 'coach' else ('pre_final_gate',))]
         assert actual == expected
         print('REGISTERED', actual)
         return configure()
     try:
         yield manager, order_plugins, configure, events
-        # The envelope gate sees the same candidate text but must never hold or rewrite it here.
-        assert all(result is None for _, result in events.envelope), events.envelope
-        assert all(result is None for _, result in events.status_fresh), events.status_fresh
+        # Both unrelated guards execute but must never hold or rewrite these goal turns.
+        for name, observations in events.other_guards.items():
+            assert all(result is None for _, result in observations), (name, observations)
     finally:
         manager.unload()
 
@@ -196,6 +187,7 @@ def test_reversed_registration_executes_interacting_real_holds(environment, monk
     monkeypatch.setattr(gd, 'aux_judge', judge)
     out = run_turn(monkeypatch)
     assert_private(out)
+    assert all(events.other_guards.values()), 'complete turns must exercise both ancillary guards'
     # Replacement consensus requires every gate to inspect each candidate;
     # priority chooses the winning nudge, not a short-circuit dispatch point.
     dispatch_order = ['coach', *(n for n in order if n != 'coach')]

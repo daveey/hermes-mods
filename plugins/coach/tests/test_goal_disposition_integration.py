@@ -111,19 +111,26 @@ def test_normal_discovery_coexists_and_reloads(tmp_path, monkeypatch, order):
         assert Path(manager._plugins['coach'].module.__file__).resolve().parent == ROOT
         manifest = yaml.safe_load((ROOT / 'plugin.yaml').read_text())
         assert 'pre_final_gate' in manifest['provides_hooks']
-        # Forced reload clears the manager's old list in place.
-        hooks = tuple(manager._hooks['pre_final_gate'])
-        # Three coach gates, ask-gate, and chat-closeout.
-        assert len(hooks) == 5
-        assert sorted(h.__qualname__ for h in hooks) == sorted([
-            'build_gate.<locals>.gate', 'build.<locals>.envelope_gate',
-            'build.<locals>.status_fresh_gate',
-            'pre_final_gate', 'pre_final_gate'])
-        coach_hook = next(h for h in hooks if h.__qualname__.startswith('build_gate.'))
+        # Snapshot: unload clears the manager's original list in place.
+        hooks = tuple(manager.iter_hook_callbacks('pre_final_gate'))
+        def inventory(callbacks):
+            return sorted((h.__module__, h.__qualname__) for h in callbacks)
+        def expected_inventory():
+            coach = manager._plugins['coach'].module
+            return sorted([
+                (coach._load('goal_disposition').__name__, 'build_gate.<locals>.gate'),
+                (coach.__name__, 'build.<locals>.envelope_gate'),
+                (coach.__name__, 'build.<locals>.status_fresh_gate'),
+                (manager._plugins['ask-gate'].module.__name__, 'pre_final_gate'),
+                (manager._plugins['chat-closeout'].module.__name__, 'pre_final_gate'),
+            ])
+        assert inventory(hooks) == expected_inventory()
+        coach_hook = next(h for h in hooks if h.__qualname__ == 'build_gate.<locals>.gate')
         assert coach_hook.needs_buffer is False
         assert coach_hook(final_response='ordinary answer') is None
         manager.discover_and_load(force=True)
-        assert sorted(h.__qualname__ for h in manager._hooks['pre_final_gate']) == sorted(
-            h.__qualname__ for h in hooks)
+        reloaded = tuple(manager.iter_hook_callbacks('pre_final_gate'))
+        assert inventory(reloaded) == expected_inventory()
+        assert not set(hooks).intersection(reloaded), 'reload must retire every old callback'
     finally:
         manager.unload()
