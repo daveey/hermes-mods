@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import fcntl
 import glob
+import json
 import logging
 import math
 import os
@@ -111,6 +112,28 @@ _MODELS_SQL = ("SELECT session_id, COALESCE(NULLIF(TRIM(model),''),'unknown'), "
                "FROM session_model_usage")
 
 
+def _batch_rows(c: sqlite3.Connection, sql: str, width: int, parameters=()):
+    """Transfer a numeric/text result with one SQLite/Python boundary.
+
+    fetchall still releases/reacquires the GIL for every SQLite row. In a busy
+    process with other SQLite readers that dominates the full snapshot's CPU.
+    Keep the original SELECT (including its aggregation and NULL semantics) and
+    decode its rows in one batch. json.loads preserves integer precision.
+    Older SQLite builds and legacy BLOB identifiers retain the original path.
+    """
+    columns = ','.join(f'c{i}' for i in range(width))
+    query = (f'WITH data({columns}) AS ({sql}) '
+             f'SELECT json_group_array(json_array({columns})) FROM data')
+    try:
+        return json.loads(c.execute(query, parameters).fetchone()[0])
+    except sqlite3.OperationalError as exc:
+        message = str(exc).lower()
+        if not (message.startswith('no such function: json_') or
+                'json cannot hold blob values' in message):
+            raise
+        return c.execute(sql, parameters).fetchall()
+
+
 def model_capable(c: sqlite3.Connection) -> bool:
     return _MODEL_COLUMNS <= {r[1] for r in c.execute("PRAGMA table_info(session_model_usage)")}
 
@@ -123,7 +146,7 @@ def session_snapshot(dbs: list[Path]) -> tuple[dict[tuple[str, str], tuple[int, 
         try:
             c = ro_connect(db)
             try:
-                rows = c.execute(_TOKENS_SQL).fetchall()
+                rows = _batch_rows(c, _TOKENS_SQL, 3)
             finally:
                 c.close()
         except sqlite3.Error as exc:
@@ -162,7 +185,7 @@ def model_snapshot(dbs: list[Path]) -> tuple[dict[tuple[str, str, str], tuple[in
             try:
                 if not model_capable(c):
                     continue
-                rows = c.execute(_MODELS_SQL + " GROUP BY 1, 2").fetchall()
+                rows = _batch_rows(c, _MODELS_SQL + " GROUP BY 1, 2", 4)
             finally:
                 c.close()
         except sqlite3.Error as exc:
@@ -350,11 +373,11 @@ def read_incremental(db: Path, cur: DbCursor, now: float, models: bool):
             for i in range(0, len(ids), _IN_CHUNK):
                 part = ids[i:i + _IN_CHUNK]
                 marks = ",".join("?" * len(part))
-                for sid, io, cache in c.execute(_TOKENS_SQL + f" WHERE id IN ({marks})", part):
+                for sid, io, cache in _batch_rows(c, _TOKENS_SQL + f" WHERE id IN ({marks})", 3, part):
                     tokens[sid] = (int(io or 0), int(cache or 0))
                 if by_model is not None:
-                    for sid, model, io, cache in c.execute(
-                            _MODELS_SQL + f" WHERE session_id IN ({marks}) GROUP BY 1, 2", part):
+                    for sid, model, io, cache in _batch_rows(
+                            c, _MODELS_SQL + f" WHERE session_id IN ({marks}) GROUP BY 1, 2", 4, part):
                         by_model[sid][str(model)] = (int(io or 0), int(cache or 0))
         finally:
             c.close()
