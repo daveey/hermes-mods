@@ -188,20 +188,37 @@ def reply(created_at, body=MARKER + '\ndeclined: wording only', login='implement
     return {'id': 1, 'user': {'login': login, 'type': kind}, 'created_at': created_at, 'body': body}
 
 
-def points_fixture(monkeypatch, tmp_path, comments, completed_at=DONE, extra=None):
+def points_fixture(monkeypatch, tmp_path, comments, completed_at=DONE, extra=None, points=None):
     monkeypatch.setattr(land.Path, 'home', lambda: tmp_path)
     path = tmp_path / '.hermes/lib/core-tools/hermes-core-wt-land'
     path.parent.mkdir(parents=True)
     path.write_text('# fixture validator')
     receipt = {'verdict': 'approve', 'reviewed_sha': HEAD, 'completed_at': completed_at,
                'reviewed_pr': f'https://github.com/{land.REPO}/pull/7',
-               'non_blocking': ['Nit (non-blocking): rename the helper']}
+               'non_blocking': ['Nit (non-blocking): rename the helper'] if points is None else points}
     monkeypatch.setattr(land.runpy, 'run_path', lambda *a, **k: {
         'review_gate': lambda *a, **k: receipt, **(extra or {})})
     api = GitHub()
     api.reviews = []
     api.comments = comments
     return api, api
+
+
+@pytest.mark.parametrize('points', ['rename helper', {'nit': 'rename helper'}, ('rename helper',), True, 1])
+def test_malformed_points_refused_despite_valid_late_reply(monkeypatch, tmp_path, points):
+    api, read = points_fixture(monkeypatch, tmp_path, [reply('2026-01-02T00:00:01Z')], points=points)
+    with pytest.raises(land.Refused, match='Malformed review points'):
+        land.land(7, HEAD, 'review', 'implementation', read=read)
+    assert not api.writes
+
+
+@pytest.mark.parametrize('login', ['', ' ', '\t\n'])
+def test_invalid_reply_identity_refused_despite_marked_late_reply(monkeypatch, tmp_path, login):
+    # Strings keep the removed identity check from failing incidentally in endswith.
+    api, read = points_fixture(monkeypatch, tmp_path, [reply('2026-01-02T00:00:01Z', login=login)])
+    with pytest.raises(land.Refused, match='Unanswered review points'):
+        land.land(7, HEAD, 'review', 'implementation', read=read)
+    assert not api.writes
 
 
 @pytest.mark.parametrize('completed_at', [DONE, DONE * 1000, str(DONE), '2026-01-02T00:00:00Z'])
