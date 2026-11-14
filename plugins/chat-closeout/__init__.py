@@ -2382,11 +2382,37 @@ def _handoff_ask(led, sid: str, gateway: str, key: str, prompt: str, now: float)
     return routing.handoff(led, sid, gateway, key, prompt, now, profile=profile)
 
 
+def _quoted_now(sid: str, card: Optional[dict]) -> bool:
+    """``core.quoted_ask`` on fresh connections (no pass pool): did a delivered reply after the card's block quote its
+    ask? Any read failure is False (the ordinary relay)."""
+    try:
+        return bool(card) and core.quoted_ask(state_dbs(), _lineage(sid), card)
+    except Exception:
+        logger.debug("chat-closeout: pre-delivery quote check failed for %s", sid, exc_info=True)
+        return False
+
+
 def _relay(led, sid: str, row: dict, cards: dict, key: str, now: float, wake: Callable[..., str]) -> dict:
     """Ask relay: ONE turn telling the chat a batch card waits on the user while other batch cards still work. The
     asked cards are covered and their premises recorded BEFORE the turn (it is not a close-out: no ``closing``, the
     working cards keep their own close-out); a failed wake undoes both."""
     cands = core.ask_candidates(row, cards)
+    # Re-prove right before delivery, with a fresh read (not the pass's pooled one): a relay deferred while the chat
+    # was busy is delivered later, and the reply that ended that busy turn may already quote the ask verbatim (MacBook
+    # chat ..bef6c6: a card's ask was relayed again 21 s after a reply quoted it). A quoted ask is learned exactly as
+    # the pass's reconcile learns it; nothing left to tell is no turn at all.
+    quoted = [(t, p) for t, p in cands if _quoted_now(sid, cards.get(t))]
+    if quoted:
+        learned = {"relayed": set(row.get("relayed") or []) | {p for _, p in quoted},
+                   "covered": set(row.get("covered") or []) | {t for t, _ in quoted}}
+        led.write(sid, **learned)
+        row = {**row, **{k: sorted(v) for k, v in learned.items()}}
+        cands = [c for c in cands if c not in quoted]
+        logger.info("chat-closeout: ask relay to %s dropped for %s: a reply after the block already quoted it", sid,
+                    ", ".join(t for t, _ in quoted))
+        if not cands:
+            led.write(sid, claim_sig=None, wake_result="quoted", retry_after=0, failure_since=None)
+            return {"session_id": sid, "result": "quoted", "sig": key, "ask_relay": []}
     ids = [t for t, _ in cands]
     batch = set(row.get("batch") or [])
     before = {k: row.get(k) for k in ("covered", "relayed", "wakes", "wake_count")}
