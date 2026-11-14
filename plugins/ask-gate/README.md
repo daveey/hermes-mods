@@ -119,6 +119,18 @@ App permissions, macOS CI lane A/B/C, Fable route parity, David's own iPhone und
 `tests/test_owner_recommendation_hold.py` (the four exact requests held; $ over-cap, recurring paid spend, threshold
 change, write permission, Rose, destructive, David-quoted rule and credential asks pass).
 
+**Approval reuse (action_request, no model call).** `approval_reuse.py` runs before the judge on every
+`action_request` approval. `approval_single_use` holds one whose limits, exclusions or outcomes forbid a rerun
+without asking again ("No rerun without asking you"): any fixable refusal before a write then becomes a new ask; the
+nudge gives retry terms instead. `approval_reuse` holds one that David already approved in this chat (a `Canonical
+user decision.` row with effect approve) when it shares a source card, carries no permission-required limit key the
+earlier one lacked, names no new target in those limits (tokens with a digit such as `worker-9`, `11`; file names,
+paths and hashes are execution details), is about the same thing (title and permission-limit words overlap at least
+half), and nothing ran under the earlier one (its receipts stayed acknowledged/not_applied). A scope line
+`New since your approval: <permission limit key> ...` releases it. Same per-(session, title) bound as the judge's
+holds; errors fail open (`approval_reuse_error`). Logs `action_request_held` with `rule`. Why: agent-159f5f5152 (one
+priority reset approved five times in one chat). Tests: `tests/test_approval_reuse.py`.
+
 **Chat-delivery asks (L3, no model call).** `chat_delivery.py` refuses a `kanban_block`, blocked `kanban_create` or
 worker `kanban_complete` leftover whose ask is for a human to type, send or relay a message into a Hermes chat: a
 delivery verb (send, type, ask, tell, relay, resume…) aimed at an `@session:` ref, a `session <id>` or "the <name>

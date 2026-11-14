@@ -94,6 +94,13 @@ ask only once its prerequisite is verifiably in place. If an early one is alread
   apply refuses once any row changed, and on a live queue it goes stale within minutes. Scope it as a fresh capture
   immediately followed by apply, and first check (code or runbook) whether apply tolerates ordinary churn; if it
   doesn't, fix the tool before asking.
+- An approval is not used up by a refusal before any write. Write retry terms into its limits ("a refusal before
+  anything changes doesn't use this approval up: I fix the cause and rerun under it"), never "no rerun without
+  asking you". New paths, checkouts, file hashes or launchers are execution details, not a new decision: when the
+  run stops before writing, fix it and rerun under the approval David gave, and tell him so in one line. Ask again
+  only when a permission limit widens (more targets, data or spend), and name it in a scope line
+  `New since your approval: <limit key>: <what widened>`. ask-gate enforces both (`approval_single_use`,
+  `approval_reuse` in `plugins/ask-gate/approval_reuse.py`).
 - Serialize owner-context tests too, and give each attempt a unique log directory: isolated HOME/board fixtures
   still overwrite evidence when two chats share output paths. If that happened, hash the retained coherent logs
   and count them as one proof, not two independent runs; do not rerun merely to recreate overwritten evidence.
