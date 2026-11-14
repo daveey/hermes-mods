@@ -1,17 +1,19 @@
 """The Python producer's stored views must satisfy the real Desktop consumer.
 
 Run by scripts/test-all -k user-steps. Requires Node >= 18.19 (module.register),
-not a Desktop install: the companion runner stubs only unused UI imports.
+not a Desktop install: the companion runner stubs only unused UI imports. node_pick
+finds a qualifying Node even when an older one is first on PATH.
 """
 import importlib.util
 import itertools
 import json
 from pathlib import Path
-import shutil
 import subprocess
 import uuid
 
 import pytest
+
+from node_pick import find_node
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('desktop_contract_core', ROOT / 'core.py')
@@ -23,8 +25,7 @@ PERMISSIONS = ('absent', 'true', 'false', 'legacy')
 
 
 def test_backend_views_satisfy_desktop_contract(tmp_path):
-    node = shutil.which('node')
-    assert node, 'Node is required for the Python-to-Desktop ActionRequest contract test'
+    node = find_node()  # first Node >= 18.19; fails (never skips) listing candidates if none
     store = core.ActionStore(tmp_path / 'actions.sqlite3')
     cases = list(itertools.product(KINDS, PERMISSIONS, (False, True)))
     for kind, permission, withdrawn in cases:
