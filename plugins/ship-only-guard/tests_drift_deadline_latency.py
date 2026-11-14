@@ -8,16 +8,17 @@ preflight with per-call timings (read-only, real gh) spent 15.8 s of the 18 s in
 started the drift compare at 15.76 s: compare -> 8 recursive tree reads (two of them duplicates) -> blob reads
 ran as three serial waves while every concurrent gh call slowed the others.
 
-The fake gh below reproduces the worker shim's measured latency (a per-layer probe on that worker, same day): a lone call takes
-1.6 s, and concurrent calls share ~0.33 s each of shim work on the host (8 at once: ~3.6-4 s each; the broker vend
-alone stays 0.3-0.6 s). A recursive tree read adds ~0.15 s of transfer, an authoritative carry fetch holds a share
-for ~6.5 s. Time is scaled by SCALE so the test runs in about two seconds. On origin/main before this fix the
-overlap case expired `during drift attribution` and the clean case read 8 trees (2 duplicates).
+The original fake reproduced measured shim latency with scaled wall time. Runner scheduling noise was
+amplified tenfold and could fail healthy code. This test instead guards the expensive work and its order:
+one shared fetch for both merges, no remote tree/blob reads, and drift reads only after carry completes.
+The guard's clock is frozen locally (not the process-wide time module), so host delays cannot consume
+its deadline. Real thread-pool execution, content checks and local merge-file/patch-id stay exercised.
 
 t_01a1da82db1127a5: after that fix the carry wave still held ~13 concurrent gh calls (6 of them tree reads),
 then a serial merge-base tree read and a serial blob wave; the drift compare started at 14.3 s of 18. The
 prefilter now reads trees and blobs from the chain's one authoritative fetch (faked below as a store that
-answers what GitHub's trees/blobs API does), so the drift check must start with at least 6 s left.
+answers what GitHub's trees/blobs API does). Avoiding that redundant work leaves the drift check its time;
+this is a work/order regression contract, not a benchmark or a test of deadline expiration.
 """
 import base64
 import hashlib
@@ -31,9 +32,12 @@ from types import SimpleNamespace
 
 import pytest
 
+# Compatibility model for the separate three-merge/turn latency benchmarks. The regression below
+# uses FakeShim and causal ordinals exclusively; those consumers explicitly opt into WallClockShim.
 SCALE = 0.1
 TICK = 0.002
 LATENCY, METER, TREE_EXTRA, FETCH = 1.3, 0.33, 0.15, 6.5
+
 R = "example/state-repo"
 F = "hosts/workers/worker_disk_reclaim.py"
 
@@ -101,30 +105,19 @@ def pr_data():
 
 
 class FakeShim:
-    """gh through the worker shim: LATENCY in flight, METER seconds of serialised metering per call."""
+    """Record causal start/end ordinals, independent of host speed and thread scheduling."""
 
     def __init__(self, g, overlap):
         self.g, self.overlap = g, overlap
-        self.lock, self.active = threading.Lock(), 0
-        self.calls, self.t0 = [], time.monotonic()
+        self.lock, self.ordinal = threading.Lock(), 0
+        self.calls, self.fetches, self.local_reads, self.verified = [], [], [], []
+        self.carry_done = []
         self.real_run = subprocess.run
 
-    def busy(self, seconds=None, work=0.0):
-        """Hold one share of the host for `seconds` (wall), or until `work` shim-seconds of metering got done
-        while sharing it with every other active call (processor sharing: n concurrent calls all slow down)."""
+    def tick(self):
         with self.lock:
-            self.active += 1
-        try:
-            if seconds is not None:
-                time.sleep(seconds * SCALE)
-            done = 0.0
-            while done < work:
-                time.sleep(TICK)
-                with self.lock:
-                    done += TICK / SCALE / self.active
-        finally:
-            with self.lock:
-                self.active -= 1
+            self.ordinal += 1
+            return self.ordinal
 
     def answer(self, argv):
         words = [w for w in argv[2:] if not w.startswith("-") and not w.startswith("Accept:")]
@@ -162,9 +155,44 @@ class FakeShim:
         argv = list(argv)
         if argv[0] != "gh":
             return self.real_run(argv, *args, **kwargs)      # local git patch-id / merge-file
+        start = self.tick()
+        out, rc = self.answer(argv)
+        end = self.tick()
+        with self.lock:
+            self.calls.append((start, end, self.g._PREFLIGHT_STAGE.get(),
+                               " ".join(argv[:4])))
+        return subprocess.CompletedProcess(argv, rc, out, "")
+
+
+class WallClockShim(FakeShim):
+    """Legacy measured-latency model, retained only for explicitly opted-in sibling tests."""
+
+    def __init__(self, g, overlap):
+        super().__init__(g, overlap)
+        self.active, self.t0 = 0, time.monotonic()
+
+    def busy(self, seconds=None, work=0.0):
+        with self.lock:
+            self.active += 1
+        try:
+            if seconds is not None:
+                time.sleep(seconds * SCALE)
+            done = 0.0
+            while done < work:
+                time.sleep(TICK)
+                with self.lock:
+                    done += TICK / SCALE / self.active
+        finally:
+            with self.lock:
+                self.active -= 1
+
+    def run(self, argv, *args, **kwargs):
+        argv = list(argv)
+        if argv[0] != "gh":
+            return self.real_run(argv, *args, **kwargs)
         start = time.monotonic()
         timeout = kwargs.get("timeout")
-        self.busy(work=METER)                                # the shim's quota metering shares the host
+        self.busy(work=METER)
         extra = TREE_EXTRA if any("/git/trees/" in w for w in argv) else 0
         time.sleep((LATENCY + extra) * SCALE)
         if timeout is not None and time.monotonic() - start > timeout:
@@ -176,22 +204,31 @@ class FakeShim:
         return subprocess.CompletedProcess(argv, rc, out, "")
 
 
-def load(monkeypatch, overlap):
+def load(monkeypatch, overlap, *, wall_clock=False):
     spec = importlib.util.spec_from_file_location("drift_latency_guard", Path(__file__).with_name("guard.py"))
     g = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(g)
-    shim = FakeShim(g, overlap)
+    if wall_clock:
+        monkeypatch.setattr(g, "PREFLIGHT_TIMEOUT", 18 * SCALE)
+    else:
+        monkeypatch.setattr(g, "time", SimpleNamespace(monotonic=lambda: 1000.0))
+    shim = (WallClockShim if wall_clock else FakeShim)(g, overlap)
     monkeypatch.setattr(g, "subprocess", SimpleNamespace(**{**vars(subprocess), "run": shim.run}))
 
     def fetch(objects):
         g._remaining()
-        shim.busy(seconds=FETCH)                             # the authoritative fetch: index-pack shares the host
+        with shim.lock:
+            shim.fetches.append(tuple(objects.shas))
+        if wall_clock:
+            shim.busy(seconds=FETCH)
         g._remaining()
         objects.path = "fetched"
         return ""
 
     def local_git(objects, *args, binary=False):
         # The fetched object store answers what GitHub's trees/blobs API does (content addressing).
+        with shim.lock:
+            shim.local_reads.append(args)
         if args[:4] == ("ls-tree", "-r", "-l", "-z"):
             sizes = {blob_id(b): len(b) for b in BLOBS.values()}
             return b"".join(f"{m} blob {s} {sizes.get(s, 10):>7}\t{p}\0".encode()
@@ -203,8 +240,21 @@ def load(monkeypatch, overlap):
         raise AssertionError(args)
     monkeypatch.setattr(g._CarryObjects, "_fetch", fetch)
     monkeypatch.setattr(g._CarryObjects, "git", local_git)
-    monkeypatch.setattr(g._CarryObjects, "verify", lambda *a: "")
-    monkeypatch.setattr(g, "PREFLIGHT_TIMEOUT", 18 * SCALE)
+
+    def verify(objects, merge, ours, theirs):
+        with shim.lock:
+            shim.verified.append((merge, ours, theirs))
+        return ""
+
+    monkeypatch.setattr(g._CarryObjects, "verify", verify)
+    carry = g._carry_one
+
+    def recorded_carry(*args, **kwargs):
+        result = carry(*args, **kwargs)
+        shim.carry_done.append(shim.tick())
+        return result
+
+    monkeypatch.setattr(g, "_carry_one", recorded_carry)
     return g, shim
 
 
@@ -212,25 +262,27 @@ def load(monkeypatch, overlap):
 def test_two_merge_carry_leaves_the_drift_check_its_time(monkeypatch, overlap):
     g, shim = load(monkeypatch, overlap)
     words = ["pr", "merge", "2842", "-R", R, "--rebase", "--match-head-commit", HEAD]
-    start = time.monotonic()
     result = g.bounded_preflight(g._state_merge, words, R, ".", {})
-    took = (time.monotonic() - start) / SCALE
-    timeline = "\n".join(f"{s / SCALE:6.2f} {e / SCALE:6.2f} [{st}] {w}" for s, e, st, w in sorted(shim.calls))
-    assert "deadline exceeded" not in str(result), f"{result} after {took:.1f} shim-seconds\n{timeline}"
+    timeline = "\n".join(f"{s:3d} {e:3d} [{st}] {w}" for s, e, st, w in sorted(shim.calls))
+    assert "deadline exceeded" not in str(result), f"{result}\n{timeline}"
     if overlap:
         assert "state commit(s) landed since then" in result and "worker_parity.py" in result
     else:
         assert result is True
-    # Not merely under the wire: a live merge also pays scheduling noise on a loaded host, so keep slack.
-    assert took < 17, f"preflight took {took:.1f} shim-seconds of 18\n{timeline}"
+    assert len(shim.fetches) == 1, shim.fetches
+    assert shim.fetches == [(HEAD,)]  # one bounded ancestor fetch serves the entire chain
+    assert sorted(shim.verified) == sorted([(M1, H0, B1), (HEAD, M1, B2)])
+
     # Every immutable carry read is made once, and the drift compare is still the last read of state.
     trees = [w for _, _, _, w in shim.calls if "/git/trees/" in w]
     assert len(trees) == len(set(trees)), timeline
     drift_reads = [c for c in shim.calls if c[2] == "drift check"]
     assert drift_reads and min(c[0] for c in drift_reads) >= max(
         c[1] for c in shim.calls if c[2].startswith("carry")), timeline
+    assert len(shim.carry_done) == 1, shim.carry_done
+    assert min(c[0] for c in drift_reads) > shim.carry_done[0], timeline
     # t_01a1da82db1127a5: the prefilter reads trees and blobs from the authoritative fetch, so no gh tree or
-    # blob read joins the carry wave and the drift check starts with at least 6 of the 18 s left (it had ~2).
+    # blob read joins the carry wave. This rejects the pre-3a9573ef expensive API-prefilter behaviour.
     assert not [w for _, _, _, w in shim.calls if "/git/trees/" in w or "/git/blobs/" in w], timeline
-    drift_start = min(c[0] for c in drift_reads) / SCALE
-    assert drift_start <= 12, f"drift check started at {drift_start:.1f} shim-seconds of 18\n{timeline}"
+    assert any(args[0] == "ls-tree" for args in shim.local_reads)
+    assert any(args[0] == "cat-file" for args in shim.local_reads)
