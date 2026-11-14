@@ -51,6 +51,7 @@ the hub: read it there (hub role + SSM) before calling a run prompt-only. Re-run
 the slice's `harvest-v2` source (some families have two); a different prefix set fails `harvest source changed`.
 For interruptible collectors, checkpoint each external delivery and reconcile its durable receipt before retrying;
 test late completions, interruption and concurrent writers rather than only uninterrupted sequential runs.
+Persist fair selection before slow external work, and interleave admission with delivery rather than scanning the entire backlog before sending: a budget-expired scan followed by restart revalidation can repeat forever without delivering. Prove progress across actual journal reopen boundaries with a backlog larger than one budget and a slow failing prefix. When rotating retries, count consecutive actual failed observations durably; skipped invocation numbers must not reset red-status persistence.
 
 When you change a cron's behaviour through its skill, read the cron's prompt too (`~/.hermes/cron/jobs.json`) and edit any
 sentence that contradicts the change. The run obeys the prompt over the skill and will "fix" the skill, code and tests
