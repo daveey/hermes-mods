@@ -225,9 +225,13 @@ def _open_asks_index(pending: list, created: dict, *, now: float, budget: int | 
 
 # ---- decision-panel letters ----------------------------------------------------------------------------
 
-# A reply that is (or starts with) one option letter: "a", "(b)", "c)", "A.", "b - skip that ...". An English
-# article ("a new idea") has no separator after the letter, so it never matches.
-_LETTER_REPLY = re.compile(r"^\s*(?:option\s+)?[(\[]?([A-Za-z])[)\].:]?\s*(?:$|[-\u2013\u2014:,.)]\s*\S)", re.I)
+# A reply that is (or starts with) one option letter: "a", "(a)", "a.", "a: go", "b, please", "b - reason",
+# "(c) because". An English article ("a new idea") has no separator after the letter. After the letter a separator
+# must be followed by whitespace or the end, and a dash needs whitespace before it, so abbreviations and hyphenated
+# words ("e.g.", "i.e.", "a.k.a.", "e-mail", "A-OK") never read as option letters (PR #188 review).
+_LETTER_REPLY = re.compile(
+    r"^\s*(?:option\s+)?[(\[]?([A-Za-z])[)\]]?"
+    r"(?:\s*$|[.:,](?:\s+\S|\s*$)|\s+[-\u2013\u2014]\s*\S|(?<=[)\]])\s+\S)", re.I)
 
 
 def _presenter(st):
@@ -257,7 +261,8 @@ def _panel_rows(request: dict) -> list[str]:
             and isinstance(p.get("question"), str) and isinstance(p.get("details"), str)):
         return []
     shown = [c for c in request.get("choices") or [] if isinstance(c, dict)
-             and not (c.get("id") == "request-context" and c.get("effect") == "revise")]
+             and not (c.get("id") == "request-context" and c.get("effect") == "revise"
+                      and c.get("label") == "Request complete action")]
     rec = next((c for c in shown if c.get("id") == p.get("recommendedChoiceId") or c.get("recommended") is True), None)
     ordered = ([rec] + [c for c in shown if c is not rec]) if rec else shown
     rows = [re.sub(r"\s*\(recommended\)\s*$", "", str(c.get("label") or ""), flags=re.I) for c in ordered]
