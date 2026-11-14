@@ -1,0 +1,701 @@
+From 3a10a27f63412283fff6190eb7b8e91e88414004 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:52:03 +0000
+Subject: [PATCH] [daveey] kanban sync: claims wait for this process's first
+ round at the feed head; the outbox alarm reads the last completed round
+
+Incident (2026-11-13, autoscaled worker-a1, t_01a1d6c4e700958e; alarm card t_01a1d655b5b68523): the scaler created
+canary t_01a1d64ab82d51b2 at 19:03:03, worker-a1 leased it at 19:03:10 and the run ended rate-limited at 19:03:24,
+but that run end reached the Board only after 19:18:10. The Board kept the lease, the scaler logged `enrollment
+failed: canary running` at 19:13 and the node was terminated. The outbox-age alarm fired at 19:15 and 19:19.
+
+Five whys:
+1. Why did the run end not reach the Board? Its run row sat in the outbox ~15 min.
+2. Why? The push before a round's pulls holds every row from the first `task_runs` row on (FIFO,
+   `kanban_sync_backlog.sendable_before_head`); only the push at the end of the round sends it.
+3. Why was the round 15 min? A fresh host's first round has cursor 0: Resync, a full unbudgeted `/snapshot` of every
+   table (measured 179 s just to read the default board's replica snapshot from worker-5), then `resync_live` and
+   the full repair pass.
+4. Why was there a run at all during that round? The dispatcher claims Board leases without waiting for the first
+   round.
+5. Why did the alarm call it a stall? `_sync_board_locked` cleared `backlog.behind` at round START, so during any
+   round in progress (and before the first one completes) `kanban_sync_outbox_age._age` counted held run rows,
+   while `_loop_healthy` counts a round running >= 10 min as healthy.
+
+Fix:
+- Claim gate (`hermes_cli/kanban_sync_claims.py`, checked in `kanban_db_sync.claim_gate` before the lease
+  request): a process that runs, or is about to run, this host's sync loop (`kanban_sync_stop.run_loop`; the
+  gateway's sync watcher marks it before it waits for the host sync lock) claims nothing on a `primary` board until
+  one of its rounds on that board COMPLETED with the replica and live pulls at the feed head (`result.behind` False,
+  i.e. `mark_pulled` stamped). Fails closed; one INFO line per board while held; deferral `sync_first_round`
+  (origin local). Once open it stays open for the process. Shadow/off boards and processes without a sync loop
+  (`hermes kanban claim` from a shell) are unchanged, except that a process without a loop honours another live
+  process's loop record (`kanban/.sync-claims.json`), for a profile gateway that holds the dispatcher lock while the
+  root gateway holds the sync lock. `hermes kanban sync status` prints `claims: held (first round not at head)` /
+  `open`.
+- Alarm truth (`kanban_sync_backlog`): `behind(path)` now reads the last COMPLETED round, and is True until a round
+  of this process reaches the head. `round_started` only drops the rerun-at-once flag (`due`), so only a completed
+  round that ended behind reruns at once, as before. The outbox alarm therefore ages only sendable ops while the
+  host is behind or before its first round completes, the documented rule.
+- The FIFO run-row hold itself (#1958, t_01a1d41c2612ebc0) is untouched.
+
+Proof:
+- New tests/hermes_cli/test_kanban_sync_claim_gate.py, 9 tests, GREEN at this head. RED on main (claims module and
+  test copied onto origin/main, without the gate and backlog changes): 7 fail, among them
+  - a fake hub whose first round raises Resync and serves a 2-row-per-page snapshot: a dispatcher tick on the
+    second snapshot page leased the card (`('running', 1, True) == ('ready', 0, False)`);
+  - before any round completes, `_age` counted a 20-min-old held run row (1200 s);
+  - during a round after one that ended behind, `_age` counted it (1200 s).
+- Existing sync suites (79 files, 1166 tests: test_kanban_sync_*.py, the claim/dispatch claim tests, worker node,
+  runs_on dispatch, gateway singleton lease) pass. test_kanban_sync_rejections.py hits the 300 s per-file cap on this
+  worker both here and on origin/main (pre-existing; CI runs it).
+- Live state checked: the hub's first round after a gateway restart takes ~35 s (21:14:04 lock, 21:14:39 default
+  primary round), so the gate holds hub claims for about that long after each restart.
+---
+ gateway/kanban_watchers.py                    |   2 +
+ hermes_cli/kanban_db_sync.py                  |   4 +
+ hermes_cli/kanban_sync_backlog.py             |  40 ++-
+ hermes_cli/kanban_sync_claims.py              | 162 +++++++++++
+ hermes_cli/kanban_sync_cli.py                 |   2 +
+ hermes_cli/kanban_sync_client.py              |   4 +-
+ hermes_cli/kanban_sync_outbox_age.py          |   6 +-
+ hermes_cli/kanban_sync_stop.py                |   2 +
+ tests/gateway/conftest.py                     |   7 +
+ tests/hermes_cli/conftest.py                  |   2 +
+ .../hermes_cli/test_kanban_sync_claim_gate.py | 255 ++++++++++++++++++
+ 11 files changed, 473 insertions(+), 13 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_claims.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_claim_gate.py
+
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index 7ac172275d..c277fb5d90 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -465,6 +465,8 @@ class GatewayKanbanWatchersMixin:
+         from hermes_cli import kanban_db_sync as _sync
+         if not _sync.sync_enabled():
+             return
++        from hermes_cli.kanban_sync_claims import loop_expected
++        loop_expected()  # this gateway's dispatcher claims nothing until its sync loop's first round reaches the head
+         from hermes_cli import kanban_db as _kb
+         from hermes_cli import kanban_sync_client as _ksc
+         # Same retrying, root-preferring lease as the dispatcher: a gateway that loses the boot race
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 9771e97b6d..08ccd5a31d 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -907,6 +907,10 @@ def claim_gate(conn: sqlite3.Connection, task_id: str, expires: int, lane: str =
+         return ClaimGate(expires, deferred=True)
+     if board_mode(conn) != "primary":
+         return ClaimGate(expires)
++    from hermes_cli.kanban_sync_claims import DEFERRAL, held
++    if held(conn):  # this host's first sync round has not reached the feed head (t_01a1d6c4e700958e)
++        defer_claim(task_id, DEFERRAL, ORIGIN_LOCAL)
++        return ClaimGate(expires, deferred=True)
+     state = _state(conn)
+     ids = (state["board_id"], state["gateway_id"], task_id)
+     run_uid = uuid7()
+diff --git a/hermes_cli/kanban_sync_backlog.py b/hermes_cli/kanban_sync_backlog.py
+index d9761780ab..be05bedae7 100644
+--- a/hermes_cli/kanban_sync_backlog.py
++++ b/hermes_cli/kanban_sync_backlog.py
+@@ -47,7 +47,8 @@ def sendable_before_head(conn: Any, hub: Any, board: str, rows: list[dict], seen
+ 
+ 
+ _LOCK = threading.Lock()
+-_BEHIND: set[str] = set()  # live board paths whose last round stopped before the feed head
++_DUE: set[str] = set()  # live board paths whose last completed round stopped before the feed head: rerun at once
++_AT_HEAD: set[str] = set()  # live board paths whose last completed round (this process) reached the feed head
+ _EVIDENCE: dict[str, dict] = {}  # live board path -> its latest round's Board reads ({card id: may hold terminal})
+ 
+ 
+@@ -83,26 +84,46 @@ class Pulled(int):
+         return out
+ 
+ 
++def round_started(path: Path) -> None:
++    """A round on this board starts: it is no longer due at once (a round that fails, or finds the board in mode
++    off, never leaves a stale rerun). :func:`behind` still reads the last completed round."""
++    with _LOCK:
++        _DUE.discard(str(path))
++
++
+ def note(path: Path, more: bool) -> None:
+-    """Record whether this round left the board behind the feed head."""
++    """Record whether this round's pulls left the board behind the feed head."""
+     key = str(path)
+     with _LOCK:
+         if more:
+-            _BEHIND.add(key)
++            _DUE.add(key)
++            _AT_HEAD.discard(key)
+         else:
+-            _BEHIND.discard(key)
++            _DUE.discard(key)
++            _AT_HEAD.add(key)
++
++
++def completed(slug: str, path: Path, more: bool) -> None:
++    """A round on this board completed (its sends too): :func:`note`, and a round at the head opens this process's
++    claims on the board (``kanban_sync_claims``)."""
++    from hermes_cli import kanban_sync_claims as claims
++    note(path, more)
++    claims.note_round(slug, path, at_head=not more)
+ 
+ 
+ def due(boards: Iterable[tuple[str, Path]]) -> list[tuple[str, Path]]:
+-    """The boards to run again now: their last round stopped at the page budget."""
++    """The boards to run again now: their last completed round stopped at the page budget."""
+     with _LOCK:
+-        return [(slug, path) for slug, path in boards if str(path) in _BEHIND]
++        return [(slug, path) for slug, path in boards if str(path) in _DUE]
+ 
+ 
+ def behind(path: Path) -> bool:
+-    """The board's last round stopped before the feed head (its run rows are held back meanwhile)."""
++    """Run rows are held back on this board (``sendable_before_head``) until a round reaches the head: its last
++    completed round stopped before the feed head, or no round of this process has reached it yet. A round in
++    progress changes nothing here (t_01a1d6c4e700958e: clearing it at round start made the outbox alarm age the
++    run rows a long first round holds on purpose)."""
+     with _LOCK:
+-        return str(path) in _BEHIND
++        return str(path) not in _AT_HEAD
+ 
+ 
+ def replica_at_head(slug: str, hub: Any, gateway: str, live_path: Path) -> None:
+@@ -172,5 +193,6 @@ def _expedite(live_path: Path, changed: dict) -> None:
+ def reset() -> None:
+     """Tests: forget every board."""
+     with _LOCK:
+-        _BEHIND.clear()
++        _DUE.clear()
++        _AT_HEAD.clear()
+         _EVIDENCE.clear()
+diff --git a/hermes_cli/kanban_sync_claims.py b/hermes_cli/kanban_sync_claims.py
+new file mode 100644
+index 0000000000..11050fbd6d
+--- /dev/null
++++ b/hermes_cli/kanban_sync_claims.py
+@@ -0,0 +1,162 @@
++"""Claims wait for this process's first sync round at the feed head (synced primary boards). [daveey]
++
++Incident (2026-11-13, autoscaled worker-a1, t_01a1d6c4e700958e): a fresh host's first sync round rebuilds the
++replica from a full ``/snapshot`` (cursor 0: Resync) and resyncs the live board, which can take 15+ min on a small
++worker. Its dispatcher leased the scaler's canary 7 s after it was created, the run ended rate-limited 14 s later,
++and that run row sat in the outbox for 15 min: the push before a round's pulls holds every row from the first
++``task_runs`` row on (``kanban_sync_backlog.sendable_before_head``), so it went out only with the push at the end of
++that first round. The Board kept the lease meanwhile, the canary read ``running`` and the enrollment failed.
++
++So a process that runs (or is about to run) this host's sync loop claims nothing on a ``primary`` board until one
++of its rounds on that board COMPLETED with the replica and live pulls at the feed head (``note_round``). The gate
++fails closed: before the loop's first round, during it, and after a round that ended behind. Once open it stays open
++for the process (a later catch-up, e.g. after a Mac sleeps, keeps claiming as before).
++
++- A process with no sync loop (``hermes kanban claim``/``dispatch`` from a shell) is not gated here, unless another
++  live process's loop recorded the board held in :func:`state_path` (a profile gateway can hold the dispatcher lock
++  while the root gateway holds the sync lock): then it reads that record.
++- ``hermes kanban sync status`` prints the gate (``claims:``) from the same record.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import os
++import sqlite3
++import threading
++import time
++from pathlib import Path
++from typing import Any, Optional
++
++_log = logging.getLogger(__name__)
++_FILE = ".sync-claims.json"
++HELD = "held (first round not at head)"
++DEFERRAL = "sync_first_round"
++
++
++class _State:
++    def __init__(self) -> None:
++        self.lock = threading.Lock()
++        self.loop = False  # this process runs or is about to run the host's sync loop
++        self.open: dict[str, str] = {}  # realpath -> slug: a completed round of this process reached the head
++        self.logged: set[str] = set()  # boards whose hold was logged (one INFO line per board per hold)
++
++
++_STATE = _State()
++
++
++def _key(path: Any) -> str:
++    return os.path.realpath(str(path))
++
++
++def state_path() -> Path:
++    """Beside the host's ``.sync.lock`` (one sync loop per host)."""
++    from hermes_cli import kanban_db as kb
++    return kb.kanban_home() / "kanban" / _FILE
++
++
++def loop_expected() -> None:
++    """This process will run the sync loop (the gateway's sync watcher, before it holds the host sync lock): its
++    dispatcher holds claims from now on, so a tick before the loop's first round cannot slip a claim through."""
++    with _STATE.lock:
++        _STATE.loop = True
++
++
++def loop_started() -> None:
++    """The sync loop starts in this process: record that its boards hold claims until a round reaches the head."""
++    loop_expected()
++    _write()
++
++
++def note_round(slug: str, path: Any, *, at_head: bool) -> None:
++    """A round on this board completed; ``at_head``: its replica and live pulls reached the feed head."""
++    if not at_head:
++        return
++    key = _key(path)
++    with _STATE.lock:
++        if key in _STATE.open:
++            return
++        _STATE.open[key] = slug
++        held, loop = key in _STATE.logged, _STATE.loop
++    if held:
++        _log.info("kanban sync: %s reached the feed head; claims open", slug)
++    if loop:  # a one-off round (``sync run``) never overwrites the running loop's record
++        _write()
++
++
++def held(conn: sqlite3.Connection) -> bool:
++    """Whether a claim on this (primary) board must wait (the caller checks the mode). Logs once per board."""
++    try:
++        key = _key(next(f for _s, name, f in conn.execute("PRAGMA database_list") if name == "main"))
++    except (StopIteration, sqlite3.Error):
++        return False
++    with _STATE.lock:
++        if key in _STATE.open:
++            return False
++        local = _STATE.loop
++    if not local and not _held_elsewhere(key):
++        return False
++    with _STATE.lock:
++        first = key not in _STATE.logged
++        _STATE.logged.add(key)
++    if first:
++        _log.info("kanban sync: claims held on %s until this host's sync round reaches the feed head "
++                  "(a claim's run row would wait unsent through the catch-up)", key)
++    return True
++
++
++def _held_elsewhere(key: str) -> bool:
++    """Another live process's sync loop recorded this board held (no round of it at the head yet)."""
++    record = _read()
++    if not record or record.get("pid") == os.getpid() or not _alive(record.get("pid")):
++        return False
++    return key not in (record.get("open") or {})
++
++
++def describe(path: Any, mode: str) -> str:
++    """The gate for ``hermes kanban sync status``."""
++    if mode != "primary":
++        return f"not gated (mode {mode})"
++    key = _key(path)
++    with _STATE.lock:
++        if key in _STATE.open:
++            return "open"
++    record = _read()
++    if not record or not _alive(record.get("pid")):
++        return "no live sync loop recorded"
++    return "open" if key in (record.get("open") or {}) else HELD
++
++
++def _alive(pid: Any) -> bool:
++    try:
++        from hermes_cli.kanban_db_dispatch_pid import _pid_alive
++        return _pid_alive(int(pid))
++    except (TypeError, ValueError):
++        return False
++
++
++def _read() -> Optional[dict]:
++    try:
++        record = json.loads(state_path().read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        return None
++    return record if isinstance(record, dict) else None
++
++
++def _write() -> None:
++    with _STATE.lock:
++        record = {"pid": os.getpid(), "since": time.time(), "open": dict(_STATE.open)}
++    target = state_path()
++    try:
++        target.parent.mkdir(parents=True, exist_ok=True)
++        temp = target.with_name(f"{_FILE}.{os.getpid()}.tmp")
++        temp.write_text(json.dumps(record), encoding="utf-8")
++        temp.replace(target)
++    except OSError:
++        _log.warning("kanban sync: cannot record the claim gate at %s", target, exc_info=True)
++
++
++def reset() -> None:
++    """Tests: a process with no sync loop."""
++    global _STATE
++    _STATE = _State()
+diff --git a/hermes_cli/kanban_sync_cli.py b/hermes_cli/kanban_sync_cli.py
+index 9eab5dd8e4..9df3e95ec5 100644
+--- a/hermes_cli/kanban_sync_cli.py
++++ b/hermes_cli/kanban_sync_cli.py
+@@ -44,6 +44,8 @@ def _status(args: argparse.Namespace) -> int:
+         out = {"board": slug, **ksc.status(conn)}
+     finally:
+         conn.close()
++    from hermes_cli.kanban_sync_claims import describe
++    out["claims"] = describe(_path(slug), out.get("mode") or "off")  # the dispatcher's first-round gate
+     shadow = ksc.shadow_path(slug)
+     if shadow.exists():
+         sconn = kbc.connect(shadow)
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 19d3f093b6..74e2194703 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1012,7 +1012,7 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+     # Dropped first, so a round that fails or finds nothing to repair never leaves a stale deferral that would
+     # make the sync loop reselect this board without waiting; a deferring round sets it again.
+     _REPAIR_DEFERRED.pop(str(path), None)
+-    backlog.note(path, False)  # likewise: only a round that completes behind the head reruns at once
++    backlog.round_started(path)  # likewise: only a round that completes behind the head reruns at once
+     with connection(path, lambda: _connect(path)) as live:
+         mode = sync.board_mode(live)
+         result = RoundResult(board=slug, mode=mode)
+@@ -1097,7 +1097,7 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+             from hermes_cli.kanban_worker_placement import reevaluate
+             with credited(live):  # reservation observations and the feed pull after them
+                 reevaluate(live, hub, slug, gateway)
+-        backlog.note(path, result.behind)
++        backlog.completed(slug, path, result.behind)  # at the head: this process's claims on it open
+         return result
+ 
+ 
+diff --git a/hermes_cli/kanban_sync_outbox_age.py b/hermes_cli/kanban_sync_outbox_age.py
+index f28beb8d28..458337d0d9 100644
+--- a/hermes_cli/kanban_sync_outbox_age.py
++++ b/hermes_cli/kanban_sync_outbox_age.py
+@@ -68,8 +68,10 @@ class _NoBoardReads:
+ 
+ 
+ def sendable_age_s(conn: sqlite3.Connection, path: Path, now: Optional[float] = None) -> Optional[float]:
+-    """While a board is behind the feed head: the age of the oldest unanswered op among exactly the ops the push
+-    before the head would send (``kanban_sync_backlog.sendable_before_head``, with the latest round's Board reads).
++    """While a board is behind the feed head (``kanban_sync_backlog.behind``: its last completed round ended behind,
++    or no round of this process has reached the head yet): the age of the oldest unanswered op among exactly the
++    ops the push before the head would send (``kanban_sync_backlog.sendable_before_head``, with the latest round's
++    Board reads).
+     Held ops (from the first pending run row on, a stale wake on a card the Board completed) wait on purpose for the
+     head, possibly over a long catch-up: they age the alarm again once the board reaches it. (t_01a1d41c2612ebc0)"""
+     from hermes_cli import kanban_sync_backlog as backlog
+diff --git a/hermes_cli/kanban_sync_stop.py b/hermes_cli/kanban_sync_stop.py
+index badf530308..bf88e9431c 100644
+--- a/hermes_cli/kanban_sync_stop.py
++++ b/hermes_cli/kanban_sync_stop.py
+@@ -22,6 +22,8 @@ def stop_scope(keep_running: Callable[[], bool]):
+ def run_loop(loop, keep_running: Callable[[], bool], interval) -> None:
+     """Keep shutdown normal, crashes visible, and diagnostics cleanup unconditional."""
+     from hermes_cli import kanban_sync_runstate as runstate, kanban_sync_timing as timing
++    from hermes_cli.kanban_sync_claims import loop_started
++    loop_started()  # this process's claims wait for its first round at the feed head (t_01a1d6c4e700958e)
+     try:
+         with stop_scope(keep_running):
+             loop(keep_running, interval, runstate)
+diff --git a/tests/gateway/conftest.py b/tests/gateway/conftest.py
+index eb10d621c5..b399337521 100644
+--- a/tests/gateway/conftest.py
++++ b/tests/gateway/conftest.py
+@@ -67,6 +67,13 @@ def _join_api_turn_workers():
+         thread.join(30)
+ 
+ 
++@pytest.fixture(autouse=True)
++def _no_sync_claim_gate(monkeypatch):
++    """A sync watcher a test starts gates claims only in that test (``kanban_sync_claims``)."""
++    from hermes_cli import kanban_sync_claims
++    monkeypatch.setattr(kanban_sync_claims, "_STATE", kanban_sync_claims._State())
++
++
+ @pytest.fixture
+ def private_db_probe_cleanup(tmp_path):
+     """Release only this test's probe fds after its explicit SQLite-handle finalizers.
+diff --git a/tests/hermes_cli/conftest.py b/tests/hermes_cli/conftest.py
+index 9539e6d41a..f1a1488802 100644
+--- a/tests/hermes_cli/conftest.py
++++ b/tests/hermes_cli/conftest.py
+@@ -31,6 +31,8 @@ def _isolate_kanban_worker_process_registries(monkeypatch):
+     monkeypatch.setattr(kanban_db_dispatch, "_live_worker_procs", {})
+     monkeypatch.setattr(kanban_db_dispatch, "_recent_worker_exits", {})
+     monkeypatch.setattr(kanban_queue_reason, "_streaks", {})  # transient Board-failure streaks are per test
++    from hermes_cli import kanban_sync_claims
++    monkeypatch.setattr(kanban_sync_claims, "_STATE", kanban_sync_claims._State())  # a test's sync loop gates only it
+ 
+ 
+ @pytest.fixture
+diff --git a/tests/hermes_cli/test_kanban_sync_claim_gate.py b/tests/hermes_cli/test_kanban_sync_claim_gate.py
+new file mode 100644
+index 0000000000..cebfb1657a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_claim_gate.py
+@@ -0,0 +1,255 @@
++"""A fresh host claims nothing until its first sync round reaches the feed head, and the outbox alarm never ages the
++run rows a round holds on purpose (t_01a1d6c4e700958e).
++
++Incident (2026-11-13, autoscaled worker-a1): the first round rebuilt the replica from a full snapshot (cursor 0:
++Resync) for ~15 min. The dispatcher leased the scaler's canary during it; the run ended 14 s later, but its rows
++waited in the outbox behind the FIFO run-row hold until the end of that round, so the Board kept the lease, the
++canary read ``running`` and the enrollment failed. The outbox alarm fired twice meanwhile: the round start had
++cleared ``backlog.behind``, so it aged the held run rows.
++
++The Board is the in-memory fake (``kanban_sync_fake_board``) with Board-faithful lease runs.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import logging
++import os
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_backlog as backlog
++from hermes_cli import kanban_sync_claims as claims
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_outbox_age as outbox_age
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++ME, OTHER, BOARD = "worker-a1", "hub", "default"
++
++
++@pytest.fixture(autouse=True)
++def _fresh_process_state(monkeypatch):
++    """A fresh process: no round reached the head, no loop runs, no alarm verdicts."""
++    backlog.reset()
++    outbox_age.reset()
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    sync.consume_dispatcher_wake()
++    yield
++    backlog.reset()
++    outbox_age.reset()
++    sync.set_lease_client(None)
++
++
++@pytest.fixture
++def svc():
++    return FakeService(lease_runs=True)
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def live(kanban_home, svc):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(conn, BOARD, ME)
++    sync.set_mode(conn, "primary")
++    sync.set_lease_client(ksc.HubLeaseClient(svc.hub(ME)))
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++class SlowHub:
++    """The fake Board's hub for this gateway: snapshots of two rows per page and feed pages of one change, calling
++    ``during`` once mid-round (on the second non-empty page read)."""
++
++    def __init__(self, svc, during=None):
++        self._inner, self.during, self.calls, self.snapshot_pages = svc.hub(ME), during, 0, 0
++        self.ident = self._inner.ident
++
++    def __getattr__(self, name):
++        return getattr(self._inner, name)
++
++    def _maybe(self):
++        self.calls += 1
++        if self.calls == 2 and self.during is not None:
++            self.during()
++
++    def snapshot_page(self, board, table, after="", limit=1000):
++        page = self._inner.snapshot_page(board, table, after, limit=2)
++        self.snapshot_pages += 1
++        if page["rows"]:
++            self._maybe()
++        return page
++
++    def changes(self, board, since, limit=500):
++        page = self._inner.changes(board, since, limit=1)
++        if page["changes"]:
++            self._maybe()
++        return page
++
++
++def _other_cards(svc, prefix, n):
++    hub = svc.hub(OTHER)
++    for i in range(n):
++        hub.ops(BOARD, [{"client_op_id": f"{prefix}{i}", "op": "upsert", "table": "tasks", "uid": f"t_{prefix}{i:03d}",
++                         "hlc": f"{1:013d}-0000-{OTHER}", "fields": {"title": f"{prefix}{i}", "status": "done",
++                                                                     "created_at": 1}}])
++
++
++def _board_history(svc, n):
++    """Another gateway's cards, then compaction: a fresh host's cursor 0 is below the retention floor (Resync)."""
++    _other_cards(svc, "old", n)
++    svc.compact(BOARD)
++
++
++def _tick(live):
++    return kbd.dispatch_once(live, spawn_fn=lambda task, ws, board=None: os.getpid(), board=BOARD)
++
++
++def _round(kanban_home, hub):
++    return ksc.sync_board(BOARD, kanban_home / "kanban.db", hub, ME)
++
++
++def _backlog(svc, prefix, rounds=1):
++    """More feed changes than one round's page budget reads (pages of one change): the round ends behind."""
++    _other_cards(svc, prefix, rounds * backlog.PULL_PAGE_BUDGET + 5)
++
++
++# --- the claim gate --------------------------------------------------------------------------------------------
++
++def test_a_fresh_host_claims_nothing_during_its_snapshot_rebuild_round_and_claims_once_at_the_head(
++        live, svc, kanban_home, caplog):
++    _board_history(svc, 9)
++    claims.loop_started()  # this process runs the sync loop (``kanban_sync_stop.run_loop``)
++    tid = kb.create_task(live, title="canary", assignee="default")
++    seen: dict = {}
++
++    def mid_round():
++        seen["tick"] = _tick(live)
++        seen["status"] = kb.get_task(live, tid).status
++        seen["runs"] = live.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (tid,)).fetchone()[0]
++        seen["lease"] = tid in svc.board(BOARD)["leases"]
++
++    with caplog.at_level(logging.INFO, logger="hermes_cli.kanban_sync_claims"):
++        hub = SlowHub(svc, mid_round)
++        result = _round(kanban_home, hub)
++    assert result.error is None and not result.behind
++    assert hub.snapshot_pages > 2 and seen  # Resync: a multi-page snapshot rebuild, the tick on its second page
++    assert (seen["status"], seen["runs"], seen["lease"]) == ("ready", 0, False)  # RED on main: leased mid-round
++    assert seen["tick"].claim_deferred == [(tid, claims.DEFERRAL)]
++    assert len([r for r in caplog.records if "claims held" in r.getMessage()]) == 1  # one INFO line per board
++    _tick(live)
++    assert kb.get_task(live, tid).status == "running"
++    assert tid in svc.board(BOARD)["leases"]
++
++
++def test_a_round_that_ends_behind_the_head_keeps_claims_held(live, svc, kanban_home):
++    tid = kb.create_task(live, title="waits", assignee="default")
++    assert _round(kanban_home, svc.hub(ME)).error is None  # an earlier process reached the head
++    backlog.reset()
++    claims.reset()
++    claims.loop_started()  # this process: its own first round must reach the head
++    _backlog(svc, "new")
++    assert _round(kanban_home, SlowHub(svc)).behind
++    _tick(live)
++    assert kb.get_task(live, tid).status == "ready"
++    while _round(kanban_home, SlowHub(svc)).behind:
++        pass
++    _tick(live)
++    assert kb.get_task(live, tid).status == "running"
++
++
++def test_a_process_without_a_sync_loop_is_not_gated(live):
++    """``hermes kanban claim`` from a shell, with no loop recorded anywhere: unchanged."""
++    tid = kb.create_task(live, title="operator claim", assignee="default")
++    assert kb.claim_task(live, tid, ttl_seconds=900)
++
++
++def test_a_shadow_board_is_not_gated(live):
++    claims.loop_started()
++    sync.set_mode(live, "shadow")
++    tid = kb.create_task(live, title="shadow", assignee="default")
++    assert kb.claim_task(live, tid, ttl_seconds=900)
++
++
++def test_another_live_process_loop_record_holds_and_opens_claims(live, kanban_home):
++    """A profile gateway can hold the dispatcher lock while the root gateway runs the sync loop."""
++    tid = kb.create_task(live, title="split", assignee="default")
++    path = claims.state_path()
++    path.parent.mkdir(parents=True, exist_ok=True)
++    other = os.getppid()  # a live process that is not this one
++    path.write_text(json.dumps({"pid": other, "open": {}}))
++    assert claims.held(live)
++    assert kb.claim_task(live, tid, ttl_seconds=900) is None
++    path.write_text(json.dumps({"pid": other, "open": {os.path.realpath(kanban_home / "kanban.db"): BOARD}}))
++    assert not claims.held(live)
++    path.write_text(json.dumps({"pid": 2 ** 22 + 12345, "open": {}}))  # a dead loop's record: ignored
++    assert not claims.held(live)
++
++
++def test_sync_status_shows_the_gate(live, svc, kanban_home, capsys):
++    from hermes_cli import kanban_sync_cli
++    _board_history(svc, 3)
++    claims.loop_started()
++
++    def status():
++        kanban_sync_cli._status(argparse.Namespace(board=BOARD, json=True))
++        return json.loads(capsys.readouterr().out)["claims"]
++    assert status() == claims.HELD
++    assert _round(kanban_home, svc.hub(ME)).error is None
++    assert status() == "open"
++
++
++# --- alarm truth -----------------------------------------------------------------------------------------------
++
++def _held_run_row(live, kanban_home, svc):
++    """A claimed card whose run row is pending and 20 min old: the row the FIFO hold keeps for the head."""
++    tid = kb.create_task(live, title="ran", assignee="default")
++    assert _round(kanban_home, svc.hub(ME)).error is None
++    assert kb.claim_task(live, tid, ttl_seconds=900)
++    old = int((time.time() - 2 * outbox_age.STALE_S) * 1000)
++    with kbc.write_txn(live):
++        n = live.execute("UPDATE kanban_sync_outbox SET created_at = ? WHERE table_name = 'task_runs' "
++                         "AND state = 'pending'", (old,)).rowcount
++    assert n
++    return tid
++
++
++def test_before_any_round_reaches_the_head_the_alarm_does_not_age_a_held_run_row(live, svc, kanban_home):
++    _held_run_row(live, kanban_home, svc)
++    backlog.reset()  # a new process: none of its rounds has reached the head yet
++    path = kanban_home / "kanban.db"
++    assert outbox_age.oldest_pending_age_s(live, unanswered=True) >= outbox_age.STALE_S  # the row is old
++    assert (outbox_age._age(path) or 0) < outbox_age.STALE_S  # RED on main: behind() was False
++
++
++def test_during_a_round_after_one_that_ended_behind_the_alarm_does_not_age_a_held_run_row(
++        live, svc, kanban_home):
++    _held_run_row(live, kanban_home, svc)
++    path = kanban_home / "kanban.db"
++    _backlog(svc, "b", rounds=2)
++    assert _round(kanban_home, SlowHub(svc)).behind  # the previous round ended behind the head
++    ages: list = []
++    assert _round(kanban_home, SlowHub(svc, lambda: ages.append(outbox_age._age(path)))).behind
++    assert ages and (ages[0] or 0) < outbox_age.STALE_S  # RED on main: the round start cleared behind()
++    assert backlog.due([(BOARD, path)]) == [(BOARD, path)]  # a completed round behind still reruns at once
++
++
++def test_a_failed_round_neither_reruns_at_once_nor_clears_behind(kanban_home):
++    path = kanban_home / "kanban.db"
++    backlog.note(path, True)
++    backlog.round_started(path)  # the round then raised: nothing completed
++    assert backlog.due([(BOARD, path)]) == [] and backlog.behind(path)
++    backlog.note(path, False)
++    assert not backlog.behind(path)
+-- 
+2.43.0
+

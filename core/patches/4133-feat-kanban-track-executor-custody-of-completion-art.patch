@@ -1,0 +1,464 @@
+From fe621ba3998a05f22c6d6175cd08c2aafd845fd3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 02:52:18 +0000
+Subject: [PATCH] feat(kanban): track executor custody of completion artifacts
+ [daveey]
+
+Work in progress: record machine-qualified file receipts and synchronize external small files through existing Board attachments; expose custody in CLI/tool/REST and chat notices. Follow-up in this branch must finish cross_task projections, missing scratch/large-file semantics, full consumer coverage and deployed proof before shipping.
+---
+ gateway/kanban_watchers_notifier.py           |   3 +
+ hermes_cli/kanban.py                          |   4 +
+ hermes_cli/kanban_artifact_receipt.py         | 120 +++++++++++++
+ hermes_cli/kanban_db_completion_payload.py    |   2 +
+ hermes_cli/kanban_metadata_files.py           |  15 +-
+ plugins/kanban/dashboard/plugin_api.py        |   2 +
+ .../test_kanban_artifact_machine.py           | 157 ++++++++++++++++++
+ tools/kanban_show.py                          |   2 +
+ tui_gateway/session_notifications.py          |   6 +-
+ 9 files changed, 304 insertions(+), 7 deletions(-)
+ create mode 100644 hermes_cli/kanban_artifact_receipt.py
+ create mode 100644 tests/hermes_cli/test_kanban_artifact_machine.py
+
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index 08f6367ad1..b8617e3d94 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -529,6 +529,9 @@ def _fmt_completed(ev, n) -> tuple:
+     from hermes_cli.kanban_pr_landing import left_open_notice
+     if disposition := left_open_notice(ev.payload):
+         wake_handoff = f"{wake_handoff}\n{disposition}" if wake_handoff else disposition
++    from hermes_cli.kanban_artifact_receipt import format_receipt
++    if custody := format_receipt(ev.payload):
++        wake_handoff = (wake_handoff or "") + custody
+     handoff = f"\n{wake_handoff}" if wake_handoff is not None else ""
+     return t("gateway.kanban.ping.completed", head=n.head, title=n.title, handoff=handoff), wake_handoff, None
+ 
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 44c14b03cb..c83083f22f 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -716,6 +716,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
+             return _err(f"no such task: {args.task_id}{not_here_note(conn, args.task_id)}")
+         comments = kb.list_comments(conn, args.task_id)
+         events = kb.list_events(conn, args.task_id)
++        from hermes_cli.kanban_artifact_receipt import latest_receipt, format_receipt
++        custody = latest_receipt(events)
+         parents = kb.parent_ids(conn, args.task_id)
+         children = kb.child_ids(conn, args.task_id)
+         runs = kb.list_runs(conn, args.task_id, **rsk)
+@@ -737,6 +739,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
+     if want_json:
+         _print_json({
+             "task": _task_to_dict(task), "latest_summary": latest_summary, "parents": parents, "children": children,
++            **custody,
+             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
+             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
+             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
+@@ -795,6 +798,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
+     if comments:
+         _print_section(f"Comments ({len(comments)}):",
+                        (f"  [{_fmt_ts(c.created_at)}] {c.author}: {c.body}" for c in comments))
++    print(format_receipt(custody), end="")
+     if events:
+         _print_section(f"Events ({len(events)}):", (
+             f"  [{_fmt_ts(e.created_at)}]{f' [run {e.run_id}]' if e.run_id else ''} {e.kind}"
+diff --git a/hermes_cli/kanban_artifact_receipt.py b/hermes_cli/kanban_artifact_receipt.py
+new file mode 100644
+index 0000000000..85d1759e23
+--- /dev/null
++++ b/hermes_cli/kanban_artifact_receipt.py
+@@ -0,0 +1,120 @@
++"""Writer-local file custody, additive to immutable completion evidence refs."""
++from __future__ import annotations
++
++import contextlib
++import hashlib
++import socket
++from pathlib import Path
++
++
++def latest_receipt(events) -> dict:
++    """Expose custody independently of truncated event-history views."""
++    for event in reversed(events):
++        if event.kind == "completed":
++            payload = event.payload or {}
++            return {"artifact_receipt": payload.get("artifact_receipt", [])}
++    return {"artifact_receipt": []}
++
++
++def format_receipt(payload) -> str:
++    """Append writer-qualified custody without changing legacy notice text."""
++    records = payload.get("artifact_receipt") if isinstance(payload, dict) else None
++    if not isinstance(records, list):
++        return ""
++    lines = []
++    for record in records:
++        if not isinstance(record, dict) or not record.get("machine") or not record.get("path"):
++            continue
++        line = f"{record['machine']}:{record['path']}"
++        for key in ("sha256", "attachment_uid", "warning"):
++            if record.get(key):
++                line += f" — {key}: {record[key]}"
++        lines.append(line)
++    return "\nArtifacts:\n" + "\n".join(lines) if lines else ""
++
++
++def executing_machine(conn) -> str:
++    """The local sync identity is the executor, not tasks.home_gateway."""
++    from hermes_cli import kanban_db_sync as sync
++
++    if sync.board_mode(conn) != "off":
++        return sync._state(conn)["gateway_id"]
++    return socket.gethostname()
++
++
++def declared_files(metadata: dict) -> list[str]:
++    from hermes_cli.kanban_metadata_files import cleaned_artifact_paths
++
++    paths = cleaned_artifact_paths(metadata)
++    receipt = metadata.get("completion_receipt")
++    if isinstance(receipt, dict):
++        for item in receipt.get("items", []):
++            for evidence in item.get("evidence", []):
++                ref = evidence.get("ref", "")
++                if isinstance(ref, str) and ref.startswith(("/", "~/")):
++                    paths.append(ref)
++    return list(dict.fromkeys(paths))
++
++
++def record_files(conn, task_id: str, metadata: dict, originals: list[str], now: int,
++                 staged: list[Path], *, uploaded_by: str, relocated: dict[str, str]) -> None:
++    """Attach small external files through the same byte-sync as scratch copies.
++
++    The generated receipt never rewrites an observed evidence identity. A local
++    attachment path is useful only alongside its machine; attachment_uid locates
++    the bytes on another replica after normal Board blob synchronization.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_metadata_files import ATTACHED_KEY
++
++    machine = executing_machine(conn)
++    kept = dict(relocated)
++    kept.update(metadata.get(ATTACHED_KEY, {}))
++    records = []
++    for raw in originals:
++        record: dict = {"machine": machine, "path": raw}
++        records.append(record)
++        source = Path(kept.get(raw, raw)).expanduser()
++        dest = None
++        try:
++            if not source.is_file():
++                record["warning"] = "File missing or not a regular file on executing machine"
++                continue
++            size = source.stat().st_size
++            record["size"] = size
++            if size <= kb.KANBAN_ATTACHMENT_MAX_BYTES:
++                row = conn.execute(
++                    "SELECT * FROM task_attachments WHERE task_id=? AND stored_path=?",
++                    (task_id, str(source)),
++                ).fetchone()
++                if row is None:
++                    directory = kb.task_attachments_dir(task_id)
++                    directory.mkdir(parents=True, exist_ok=True)
++                    dest = kb._unique_attachment_path(directory, source.name, set(staged))
++                    staged.append(dest)
++                    kb._copy_capped(source, dest, raw)
++                    kb._insert_completion_attachment(
++                        conn, task_id, filename=dest.name, stored_path=str(dest),
++                        size=dest.stat().st_size, created_at=now, uploaded_by=uploaded_by,
++                    )
++                    source = dest
++                    row = conn.execute(
++                        "SELECT * FROM task_attachments WHERE task_id=? AND stored_path=?",
++                        (task_id, str(dest)),
++                    ).fetchone()
++                record["attachment_id"] = row["id"]
++                if "uid" in row.keys():
++                    record["attachment_uid"] = row["uid"]
++                record["attachment_path"] = row["stored_path"]
++            with source.open("rb") as stream:
++                record["sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
++        except (OSError, kb.ArtifactPreservationError) as exc:
++            # Do not claim a delivery that could not be read or attached.
++            if dest is not None and "attachment_id" not in record:
++                with contextlib.suppress(OSError):
++                    dest.unlink(missing_ok=True)
++            record["warning"] = f"Artifact unavailable on executing machine: {exc}"
++    if records:
++        metadata["artifact_receipt"] = records
++    else:
++        metadata.pop("artifact_receipt", None)
+diff --git a/hermes_cli/kanban_db_completion_payload.py b/hermes_cli/kanban_db_completion_payload.py
+index 025d3b8f0c..7beb79f35e 100644
+--- a/hermes_cli/kanban_db_completion_payload.py
++++ b/hermes_cli/kanban_db_completion_payload.py
+@@ -34,6 +34,8 @@ def completed_event_payload(
+         elif isinstance(owner := landing.get("landing_owner"), str):
+             payload["landing_owner"] = owner
+     if isinstance(metadata, dict):
++        if metadata.get("artifact_receipt"):
++            payload["artifact_receipt"] = metadata["artifact_receipt"]
+         cleaned = _cleaned_artifact_paths(metadata)
+         if cleaned:
+             payload["artifacts"] = cleaned
+diff --git a/hermes_cli/kanban_metadata_files.py b/hermes_cli/kanban_metadata_files.py
+index 7eb8c7f67b..1e2f56a7ff 100644
+--- a/hermes_cli/kanban_metadata_files.py
++++ b/hermes_cli/kanban_metadata_files.py
+@@ -252,12 +252,15 @@ def stage_completion_artifacts(
+     (:func:`preserve_metadata_files`). [daveey]"""
+     from hermes_cli import kanban_db as kb
+ 
++    from hermes_cli.kanban_artifact_receipt import declared_files, record_files
++
++    originals = declared_files(metadata)
++    metadata.pop("artifact_receipt", None)
+     staged: list[Path] = []
+-    if "completion_receipt" in metadata:
+-        # Only this staging pass can attest relocation; caller-provided maps
+-        # must not make missing receipt evidence appear preserved.
+-        metadata.pop(ATTACHED_KEY, None)
+-        metadata.pop(SKIPPED_KEY, None)
++    # Only this staging pass can attest relocation; caller-provided maps
++    # must not make missing evidence appear preserved.
++    metadata.pop(ATTACHED_KEY, None)
++    metadata.pop(SKIPPED_KEY, None)
+     with discard_on_error(staged):
+         declared = kb._cleaned_artifact_paths(metadata)
+         kb._persist_scratch_completion_artifacts(conn, task_id, metadata)
+@@ -277,6 +280,8 @@ def stage_completion_artifacts(
+         ))
+         if uploaded_by == "kanban_complete" and "completion_receipt" in metadata:
+             _verify_receipt_files(conn, task_id, metadata)
++        record_files(conn, task_id, metadata, originals, now, staged, uploaded_by=uploaded_by,
++                     relocated=dict(zip(declared, kb._cleaned_artifact_paths(metadata))))
+     return staged
+ 
+ 
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 520fdb2ed1..cad3e5bdf4 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -424,8 +424,10 @@ def _task_detail(conn: sqlite3.Connection, task: kanban_db.Task, run_state_type:
+     _attach_diagnostics(task_d, _compute_task_diagnostics(conn, task_ids=[task_id]).get(task_id) or [])
+     from hermes_cli import kanban_wake_check as kwc
+     task_d["wake_check"] = kwc.get_state(conn, task_id)  # condition wake probe [daveey]
++    from hermes_cli.kanban_artifact_receipt import latest_receipt
+     return {
+         "task": task_d,
++        **latest_receipt(kanban_db.list_events(conn, task_id)),
+         "comments": [asdict(c) for c in kanban_db.list_comments(conn, task_id)],
+         "events": [asdict(e) for e in kanban_db.list_events(conn, task_id)],
+         "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
+diff --git a/tests/hermes_cli/test_kanban_artifact_machine.py b/tests/hermes_cli/test_kanban_artifact_machine.py
+new file mode 100644
+index 0000000000..f60dfb14d2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_artifact_machine.py
+@@ -0,0 +1,157 @@
++"""Completion file custody follows the executor, not the card's home."""
++if not __name__.startswith("tests."):
++    raise ImportError("Use scripts/run_tests.sh; unittest discovery bypasses test isolation")
++
++import hashlib
++import json
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli import test_kanban_sync_attachments as attachment_support
++
++stores = attachment_support.stores
++
++
++def complete(conn, tid, paths, extra=None):
++    lease = sync.set_lease_client(support.FakeLeaseClient())
++    try:
++        claimed = kb.claim_task(conn, tid)
++        assert claimed is not None
++        assert kb.complete_task(conn, tid, summary="artifact custody verified",
++                                expected_run_id=claimed.current_run_id,
++                                metadata={"artifacts": paths, **(extra or {})})
++    finally:
++        sync.set_lease_client(lease)
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='completed'", (tid,)).fetchone()
++    return json.loads(row[0])
++
++
++def test_pool_completion_records_executing_machine(stores):
++    _, worker, _, conn, _, tid, _ = stores
++    report = worker / "external-evidence.md"
++    report.write_text("proof")
++    payload = complete(conn, tid, [str(report)])
++    receipt = payload["artifact_receipt"][0]
++    assert receipt["machine"] == "worker"
++    assert receipt["path"] == str(report)
++    assert receipt["sha256"] == hashlib.sha256(b"proof").hexdigest()
++
++
++def test_external_small_artifact_reaches_home_attachment(stores):
++    home, worker, home_conn, conn, _, tid, round_at = stores
++    report = worker / "external-evidence.md"
++    report.write_bytes(b"proof")
++    complete(conn, tid, [str(report)])
++    round_at(worker, "worker")
++    round_at(home, "hub")
++    rows = kb.list_attachments(home_conn, tid)
++    assert len(rows) == 1
++    assert Path(rows[0].stored_path).read_bytes() == b"proof"
++
++
++def test_missing_external_artifact_has_visible_warning(stores):
++    _, worker, _, conn, _, tid, _ = stores
++    missing = worker / "missing.md"
++    payload = complete(conn, tid, [str(missing)])
++    receipt = payload["artifact_receipt"][0]
++    assert receipt["machine"] == "worker"
++    assert receipt["path"] == str(missing)
++    assert "missing" in receipt["warning"].lower()
++    assert kb.list_attachments(conn, tid) == []
++
++
++@pytest.mark.parametrize("final", [False, True])
++def test_chat_notice_displays_writer_and_warning(final):
++    from tui_gateway.session_notifications import _format_kanban_event_text
++    from gateway.kanban_watchers_notifier import _fmt_completed
++
++    payload = {"summary": "done", "artifact_receipt": [
++        {"machine": "worker-b", "path": "/proof.md", "warning": "missing"},
++    ]}
++    if final:
++        payload["final_sends"] = {"chat-1": "addressed delivery"}
++    task = SimpleNamespace(title="proof", assignee="default", result=None)
++    event = SimpleNamespace(kind="completed", payload=payload)
++    text = _format_kanban_event_text({"task_id": "proof", "chat_id": "chat-1"}, task, event, "default")
++    if final:
++        assert "addressed delivery" in text
++    ping, wake, _ = _fmt_completed(event, SimpleNamespace(task=task, head="proof", title="proof"))
++    for value in (text, ping, wake):
++        assert "worker-b:/proof.md" in value
++        assert "warning: missing" in value
++
++
++def test_latest_receipt_survives_long_event_history():
++    from hermes_cli.kanban_artifact_receipt import latest_receipt, format_receipt
++
++    custody = [{"machine": "worker-b", "path": "/proof.md", "sha256": "abc", "attachment_uid": "uid"}]
++    events = [SimpleNamespace(kind="completed", payload={"artifact_receipt": custody})]
++    events.extend(SimpleNamespace(kind="commented", payload={}) for _ in range(60))
++    assert latest_receipt(events) == {"artifact_receipt": custody}
++    assert latest_receipt([]) == {"artifact_receipt": []}
++    assert format_receipt({}) == ""
++    assert format_receipt({"artifact_receipt": [None, {}, {"path": "/no-host"}]}) == ""
++    text = format_receipt(latest_receipt(events))
++    assert "sha256: abc" in text
++    assert "attachment_uid: uid" in text
++
++
++def test_external_receipt_ref_is_attached_without_rewriting_identity(stores):
++    from tests.hermes_cli.test_kanban_receipt_artifacts import receipt
++
++    _, worker, _, conn, _, tid, _ = stores
++    report = worker / "receipt.md"
++    report.write_text("proof")
++    value = receipt(str(report))
++    payload = complete(conn, tid, [], {"completion_receipt": value})
++    assert kb.latest_run(conn, tid).metadata["completion_receipt"] == value
++    assert payload["artifact_receipt"][0]["path"] == str(report)
++    assert payload["artifact_receipt"][0]["attachment_uid"]
++
++
++def test_large_external_file_has_digest_without_attachment(stores, monkeypatch):
++    _, worker, _, conn, _, tid, _ = stores
++    report = worker / "large.bin"
++    report.write_bytes(b"proof")
++    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 4)
++    record = complete(conn, tid, [str(report)])["artifact_receipt"][0]
++    assert record["sha256"] == hashlib.sha256(b"proof").hexdigest()
++    assert "attachment_uid" not in record
++    assert "warning" not in record
++    assert not kb.list_attachments(conn, tid)
++
++
++def test_partial_copy_failure_warns_and_leaves_no_orphan(stores, monkeypatch):
++    _, worker, _, conn, _, tid, _ = stores
++    report = worker / "proof.md"
++    report.write_bytes(b"proof")
++    def fail_copy(source, dest, raw):
++        dest.write_bytes(b"partial")
++        raise OSError("controlled copy failure")
++    monkeypatch.setattr(kb, "_copy_capped", fail_copy)
++    record = complete(conn, tid, [str(report)])["artifact_receipt"][0]
++    assert "controlled copy failure" in record["warning"]
++    assert "attachment_uid" not in record
++    assert not kb.list_attachments(conn, tid)
++    assert not list(kb.task_attachments_dir(tid).glob("*"))
++
++
++def test_caller_cannot_spoof_writer_or_relocate_missing_external_file(stores):
++    _, worker, _, conn, _, tid, _ = stores
++    missing = str(worker / "missing.md")
++    actual = worker / "actual.md"
++    actual.write_text("different evidence")
++    payload = complete(conn, tid, [missing], {
++        "artifact_receipt": [{"machine": "pretend", "path": str(actual)}],
++        "attached_from_workspace": {missing: str(actual)},
++    })
++    record = payload["artifact_receipt"][0]
++    assert record["machine"] == "worker"
++    assert record["path"] == missing
++    assert "missing" in record["warning"].lower()
++    assert not kb.list_attachments(conn, tid)
+diff --git a/tools/kanban_show.py b/tools/kanban_show.py
+index 64e7055f6a..3c0ecf3532 100644
+--- a/tools/kanban_show.py
++++ b/tools/kanban_show.py
+@@ -64,12 +64,14 @@ def _detail(kb, conn, task, args, *, replica: bool) -> dict:
+         details = kqp.detail_fields(conn, task, args.get("board"))
+     from hermes_cli.kanban_hub_admission_placement import describe, latest_verdict
+     from hermes_cli.kanban_wake_summary import wakes
++    from hermes_cli.kanban_artifact_receipt import latest_receipt
+     verdict = latest_verdict(conn, tid)
+     if verdict and details.get("queue_note"):
+         details["queue_note"] = f"{details['queue_note']} ({describe(verdict)})"
+     return {
+         "task": kt._fields(task, kt._TASK_FIELDS),
+         "source": "replica" if replica else "live",
++        **latest_receipt(kb.list_events(conn, tid)),
+         **capsule,
+         "queue_reason": kqr.latest(conn, tid),
+         "wakes": wakes(conn, task),  # [daveey] {check, next_probe_at, backstop_at} while scheduled
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 5e46c3032a..7d4fd3b768 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -588,9 +588,10 @@ def _kb_first_line(value: Any, limit: int) -> str:
+ 
+ def _kb_completed(task, payload: dict, title: str) -> str:
+     from hermes_cli.kanban_final_send import public_summary
++    from hermes_cli.kanban_artifact_receipt import format_receipt
+     handoff = (_kb_first_line(payload["summary"], 200) if payload.get("summary")
+                else _kb_first_line(public_summary(getattr(task, "result", None)), 160))
+-    return f" done — {title}{handoff}{_kb_left_open(payload)}"
++    return f" done — {title}{handoff}{_kb_left_open(payload)}{format_receipt(payload)}"
+ 
+ 
+ # kind -> (glyph, suffix after "Kanban <id>"); silent kinds (archived/unblocked) are absent → None.
+@@ -638,8 +639,9 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
+     if getattr(ev, "kind", "") == "completed":
+         # A worker refused a send into this chat put its message in the summary as a FINAL SEND line. [daveey]
+         from hermes_cli.kanban_final_send import final_send_for_chat
++        from hermes_cli.kanban_artifact_receipt import format_receipt
+         if final := final_send_for_chat(payload, str(sub.get("chat_id") or "")):
+-            return f"{prefix}Kanban {task_id} done — {title}\n{final}{_kb_left_open(payload)}"
++            return f"{prefix}Kanban {task_id} done — {title}\n{final}{_kb_left_open(payload)}{format_receipt(payload)}"
+     return f"{prefix}Kanban {task_id}{fmt(task, payload, title)}"
+ 
+ 
+-- 
+2.43.0
+

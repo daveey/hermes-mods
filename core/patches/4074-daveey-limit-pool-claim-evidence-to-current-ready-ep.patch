@@ -1,0 +1,80 @@
+From a919870204c4b09c50ac821bba176c4f035f6dc2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 01:10:19 +0000
+Subject: [PATCH] [daveey] limit pool claim evidence to current ready episode
+
+Fleet-row replay exposed a canonical ready task whose only qualifying claimant preceded its current wait. Clip the claim window to ready_since rather than treating historical placement viability as current-wait capacity evidence. 49 focused tests pass; removing the episode floor fails the new real-shape regression. Prior 15 guard mutants were killed. Full consumer rerun remains required.
+---
+ hermes_cli/kanban_label_backlog.py               | 10 +++++++---
+ .../hermes_cli/test_kanban_label_backlog_wait.py | 16 ++++++++++++++++
+ 2 files changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_label_backlog.py b/hermes_cli/kanban_label_backlog.py
+index ed343cdc0c..4f1d77ef93 100644
+--- a/hermes_cli/kanban_label_backlog.py
++++ b/hermes_cli/kanban_label_backlog.py
+@@ -52,8 +52,9 @@ def read(conn: sqlite3.Connection, task_id: str, labels: Iterable[str], *,
+     """Exact-label ready predecessors and distinct recently claimed cards in this board view.
+ 
+     Use canonical worker dispatch ordering (including donated priority). Counts are approximate: admission may
+-    skip a predecessor. Require a Board holder receipt from a currently matching available machine. Current task
+-    labels are usable only without a subsequent move/edit/repin; ambiguous history is excluded, not guessed.
++    skip a predecessor. Require a Board holder receipt from a currently matching available machine during the
++    current ready episode, capped at 30 minutes. Current labels are usable only without a subsequent move/edit;
++    ambiguous history is excluded, not guessed.
+     Unreadable evidence stays unknown and cannot refuse a move.
+     """
+     wanted, holders = frozenset(labels), set(machines)
+@@ -67,6 +68,9 @@ def read(conn: sqlite3.Connection, task_id: str, labels: Iterable[str], *,
+         ordered = [row[0] for row in lane_rows(conn, "ready")]
+         if task_id not in ordered:
+             return out
++        from hermes_cli.kanban_parent_unclaimed import ready_since
++        created = conn.execute("SELECT created_at FROM tasks WHERE id = ?", (task_id,)).fetchone()[0]
++        since = max(now - WINDOW_SECONDS, ready_since(conn, task_id, created))
+         before = set(ordered[:ordered.index(task_id)])
+         ahead = sum(row[0] in before and _labels(row[1]) == wanted for row in conn.execute(
+             "SELECT id, runs_on FROM tasks WHERE status = 'ready' AND claim_lock IS NULL"))
+@@ -77,7 +81,7 @@ def read(conn: sqlite3.Connection, task_id: str, labels: Iterable[str], *,
+             "WHERE e.kind = 'claimed' AND e.created_at >= ? AND e.created_at <= ? AND e.task_id != ? "
+             "AND NOT EXISTS (SELECT 1 FROM task_events m WHERE m.task_id=e.task_id "
+             "AND m.kind IN ('moved', 'edited') AND m.created_at >= e.created_at)",
+-            (int(now - WINDOW_SECONDS), int(now), task_id),
++            (int(since), int(now), task_id),
+         ):
+             holder = _holder(row[1])
+             if _labels(row[2]) != wanted or holder not in holders:
+diff --git a/tests/hermes_cli/test_kanban_label_backlog_wait.py b/tests/hermes_cli/test_kanban_label_backlog_wait.py
+index 452dccce90..3a28354361 100644
+--- a/tests/hermes_cli/test_kanban_label_backlog_wait.py
++++ b/tests/hermes_cli/test_kanban_label_backlog_wait.py
+@@ -47,6 +47,7 @@ def _card(conn, title, created_at):
+     tid = kb.create_task(conn, title=title, assignee="default", runs_on=list(LABELS))
+     with kb.write_txn(conn):
+         conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (created_at, tid))
++        conn.execute("UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'created'", (created_at, tid))
+     return tid
+ 
+ 
+@@ -224,3 +225,18 @@ def test_update_hold_takes_precedence_over_recent_pool_claims(hub):
+     text = kcw.notice_text(payload)
+     assert "claims are held for a pending Hermes update" in text
+     assert "Not a placement problem" not in text
++
++
++def test_claims_before_current_ready_episode_do_not_veto_capability_drop(hub):
++    from hermes_cli import kanban_label_backlog as klb
++    tid = _seed(hub.conn, claims=1)
++    now = int(time.time())
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE task_events SET created_at=? WHERE kind='claimed'", (now - 60,))
++        kb._append_event(hub.conn, tid, "continued", {"status": "ready"})
++    result = klb.read(hub.conn, tid, LABELS, machines={"worker-3"}, now=now)
++    assert result["known"] and result["claimed_recent"] == 0
++    assert klb.move_refusal(hub.conn, tid, "ready", LABELS, ["pool:worker"], machines=POOL, now=now) is None
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE task_events SET created_at=? WHERE kind='claimed'", (now,))
++    assert klb.move_refusal(hub.conn, tid, "ready", LABELS, ["pool:worker"], machines=POOL, now=now)
+-- 
+2.43.0
+

@@ -1,0 +1,425 @@
+From 1d827a121095786c040870d67021d43e6e6fe5f6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 04:14:18 +0000
+Subject: [PATCH] fix(gateway): replay parked passive rows across compression
+ [daveey]
+
+---
+ gateway/session_settlement_recovery.py        |  15 +-
+ gateway/session_transcript.py                 |  50 +++++-
+ gateway/shutdown_flush.py                     |  73 ++++++--
+ .../test_parked_passive_row_delivery.py       | 160 ++++++++++++++++++
+ 4 files changed, 274 insertions(+), 24 deletions(-)
+
+diff --git a/gateway/session_settlement_recovery.py b/gateway/session_settlement_recovery.py
+index 36171c6d53..a051e74e0f 100644
+--- a/gateway/session_settlement_recovery.py
++++ b/gateway/session_settlement_recovery.py
+@@ -244,12 +244,21 @@ async def drain_deferred_rows(authority, ref):
+     for the next append or boot recovery otherwise."""
+     store = getattr(getattr(authority, 'runner', None), 'session_store', None)
+     drain = getattr(store, 'drain_deferred_transcript', None)
+-    if not callable(drain):
++    if callable(drain) and getattr(authority, 'db', None) is not None:
++        from functools import partial
++        drain = partial(drain, session_db=authority.db)
++    elif not callable(drain):
+         from gateway.shutdown_flush import replay_deferred_rows
+         drain = lambda sid: replay_deferred_rows(authority.db, sid)
++    from contextlib import nullcontext
++    from agent.runtime_scope import bind_profile_scope
++    home = getattr(authority, 'profile_id', None)
+     try:
+-        for sid in dict.fromkeys((ref.session_id, authority.physical_target(ref))):
+-            await asyncio.to_thread(drain, sid)
++        with bind_profile_scope(home) if home else nullcontext():
++            # Each drain discovers the proven ancestors of this tip. These ids are discovery
++            # anchors, not spool-source == append-destination assertions.
++            for sid in dict.fromkeys((ref.session_id, authority.physical_target(ref))):
++                await asyncio.to_thread(drain, sid)
+     except Exception:
+         logger.debug('Deferred transcript drain for %s failed', ref.session_id, exc_info=True)
+ 
+diff --git a/gateway/session_transcript.py b/gateway/session_transcript.py
+index d3176f4593..0a01320126 100644
+--- a/gateway/session_transcript.py
++++ b/gateway/session_transcript.py
+@@ -408,18 +408,39 @@ class SessionTranscriptMixin:
+                     self._dirty_transcripts.pop(queue_session_id, None)
+         return spooled
+ 
++    @contextlib.contextmanager
++    def _transcript_spool_home(self, session_id: str):
++        """Keep spool discovery in the same profile as the session's canonical database."""
++        from agent.runtime_scope import bind_profile_scope
++        key = self._owner_key_for_session_id(session_id)
++        home = self._profile_home_for_key(key) if key else None
++        with bind_profile_scope(home) if home is not None else contextlib.nullcontext():
++            yield
++
+     def _drain_spooled_drops(self, session_id: str) -> Exception | None:
+         """Replay cap-dropped spooled transcript messages after DB recovery; return the replay
+         failure while some of them are still on disk, else None. Best-effort: replay failures keep
+         the spool files for the next successful flush; nothing here may raise."""
+         spooled_sessions = getattr(self, "_spooled_drop_sessions", None)
+-        if not spooled_sessions or session_id not in spooled_sessions:
++        if not spooled_sessions:
++            return None
++        from gateway.shutdown_flush import deferred_transcript_route, replay_spooled_row
++        try:
++            db = self._db_for_session_id(session_id)
++            target, sources = deferred_transcript_route(db, session_id)
++        except Exception as exc:
++            logger.debug('Cannot resolve deferred transcript lineage for %s', session_id, exc_info=True)
++            return exc  # unreadable lineage does not prove the backlog absent
++        if not sources.intersection(spooled_sessions):
+             return None
+         failures: list[Exception] = []
+ 
+         def replay(message: dict[str, Any]) -> None:
+             try:
+-                self._append_transcript_message(session_id, message)
++                if target == session_id:
++                    self._append_transcript_message(session_id, message)
++                else:
++                    replay_spooled_row(db, target, message)
+             except Exception as exc:
+                 failures.append(exc)
+                 raise
+@@ -430,11 +451,12 @@ class SessionTranscriptMixin:
+             # replay attempt is only the order-preserving probe, so its failure stays at DEBUG.
+             with self._transcript_retry_lock:
+                 known_failing = bool(self._transcript_append_failures.get(session_id))
+-            _replayed, remaining = drain_transcript_spool(
+-                session_id, replay, db_known_failing=known_failing)
++            with self._transcript_spool_home(session_id):
++                _replayed, remaining = drain_transcript_spool(
++                    session_id, replay, db_known_failing=known_failing, source_session_ids=sources)
+             if not remaining:
+                 with self._transcript_retry_lock:
+-                    spooled_sessions.discard(session_id)
++                    spooled_sessions.difference_update(sources)
+                 return None
+             return failures[-1] if failures else RuntimeError(
+                 f"older spooled transcript rows for {session_id} still pending")
+@@ -442,15 +464,27 @@ class SessionTranscriptMixin:
+             logger.warning("Failed to drain transcript spool for %s: %s", session_id, exc)
+             return None
+ 
+-    def drain_deferred_transcript(self, session_id: str) -> None:
++    def drain_deferred_transcript(self, session_id: str, *, session_db=None) -> None:
+         """Land the rows parked behind a turn's update checkpoint (this store's own deferred appends and the
+         mirror / bot-DM rows other writers spooled) once that turn has resumed and settled. Still-parked
+         sessions keep every file. Never raises."""
+         try:
+             with self._get_transcript_drain_lock():
++                from gateway.shutdown_flush import replay_deferred_rows
++                # An authority supplies its own DB under its profile scope: a compressed-away
++                # id may no longer have an owner hint in this shared routing store.
++                db = session_db if session_db is not None else self._db_for_session_id(session_id)
++                if db is None:
++                    return  # no proven owner; never fall back to the ambient database
++                scope = contextlib.nullcontext() if session_db is not None else self._transcript_spool_home(session_id)
++                with scope:
++                    _replayed, remaining = replay_deferred_rows(db, session_id)
+                 with self._transcript_retry_lock:
+-                    self._lazy("_spooled_drop_sessions", set).add(session_id)
+-                self._drain_spooled_drops(session_id)
++                    pending = self._lazy("_spooled_drop_sessions", set)
++                    if remaining:
++                        pending.add(session_id)
++                    else:
++                        pending.discard(session_id)
+         except Exception as exc:  # health: allow BLE001 -- the files stay for the next append or boot recovery
+             logger.debug("Deferred transcript drain for %s failed: %s", session_id, exc)
+ 
+diff --git a/gateway/shutdown_flush.py b/gateway/shutdown_flush.py
+index 4c0eaa3875..ecf0e38a0b 100644
+--- a/gateway/shutdown_flush.py
++++ b/gateway/shutdown_flush.py
+@@ -143,7 +143,8 @@ def spool_dropped_transcript_message(session_id: str, message: dict[str, Any]) -
+         return None
+ 
+ 
+-def drain_transcript_spool(session_id: str, replay, *, db_known_failing: bool = False) -> tuple[int, int]:
++def drain_transcript_spool(session_id: str, replay, *, db_known_failing: bool = False,
++                           source_session_ids=None) -> tuple[int, int]:
+     """Replay cap-dropped transcript messages spooled for *session_id*; return ``(replayed,
+     remaining)``. ``replay(message_dict)`` runs per message in drop order; a spool file is deleted
+     only after its replay succeeds. The first failure stops the drain (the DB is likely still
+@@ -170,7 +171,7 @@ def drain_transcript_spool(session_id: str, replay, *, db_known_failing: bool =
+         # like unparseable JSON instead of letting ``.get`` abort the whole drain.
+         if (not isinstance(payload, dict)
+                 or payload.get("reason") != TRANSCRIPT_CAP_DROP_REASON
+-                or payload.get("session_key") != session_id):
++                or payload.get("session_key") not in (source_session_ids or {session_id})):
+             continue
+         message = (payload.get("data") or {}).get("message")
+         if not isinstance(message, dict):
+@@ -217,13 +218,60 @@ def replay_spooled_row(session_db, session_id: str, message: dict[str, Any], *,
+     return session_db.append_message(**transcript_append_kwargs(session_id, message, fallback_ts=fallback_ts))
+ 
+ 
++def deferred_transcript_route(session_db, session_id: str) -> tuple[str, set[str]]:
++    """Prove one compression-only continuation in this DB, and discover its spool ancestors.
++
++    Unlike UI tip projection, recovery must not choose between competing children. Branches,
++    resets, delegates, tool children and profile changes cannot receive another conversation's rows.
++    A concurrent rotation after this read is harmless: the normal append fence refuses the old tip
++    and custody stays with the spool until the next pass.
++    """
++    from hermes_state_common import _non_continuation_child_sql
++    from hermes_state_compression import _CHAIN_CAP
++    read = getattr(session_db, '_read_ctx', None)
++    if not callable(read):  # legacy replay-only adapters cannot prove any redirection
++        return session_id, {session_id}
++    with read() as conn:
++        def successor(sid):
++            rows = conn.execute(
++                "SELECT c.id FROM sessions p JOIN sessions c ON c.parent_session_id=p.id "
++                "WHERE p.id=? AND p.end_reason='compression' "
++                "AND c.profile_name IS p.profile_name " + _non_continuation_child_sql('c.', 'p.id'),
++                (sid,)).fetchall()
++            return rows[0]['id'] if len(rows) == 1 else None
++
++        current, seen = session_id, {session_id}
++        for _ in range(_CHAIN_CAP):
++            child = successor(current)
++            if child is None:
++                break
++            if child in seen:
++                raise RuntimeError('cyclic deferred transcript lineage')
++            seen.add(child)
++            current = child
++        else:
++            raise RuntimeError('deferred transcript lineage exceeds bound')
++        tip, sources = current, set(seen)
++        for _ in range(_CHAIN_CAP):
++            row = conn.execute('SELECT parent_session_id FROM sessions WHERE id=?', (current,)).fetchone()
++            parent = row['parent_session_id'] if row else None
++            if not parent or parent in sources or successor(parent) != current:
++                break
++            sources.add(parent)
++            current = parent
++        else:
++            raise RuntimeError('deferred transcript ancestors exceed bound')
++        return tip, sources
++
++
+ def replay_deferred_rows(session_db, session_id: str) -> tuple[int, int]:
+-    """Land the rows :func:`defer_row_for_parked_turn` queued for *session_id*; ``(replayed, remaining)``.
+-    Still parked: the first replay is refused again and everything stays on disk. Never raises."""
++    """Drain all proven compression ancestors in spool order into the live continuation.
++    Still parked/closed: the first replay is refused and every remaining file keeps custody."""
+     try:
++        target, sources = deferred_transcript_route(session_db, session_id)
+         return drain_transcript_spool(
+-            session_id, lambda message: replay_spooled_row(session_db, session_id, message),
+-            db_known_failing=True)
++            session_id, lambda message: replay_spooled_row(session_db, target, message),
++            db_known_failing=True, source_session_ids=sources)
+     except Exception as exc:  # health: allow BLE001 -- best-effort post-resume drain; the files stay for the next one
+         logger.debug("Deferred-row replay for %s failed: %s", session_id, exc)
+         return 0, 1
+@@ -423,21 +471,20 @@ def _recover_one_payload(session_db, path: Path, payload: dict[str, Any], *,
+             logger.warning("Cannot recover structurally invalid transcript spool "
+                            "file %s; preserved for manual inspection", path)
+             return False
+-        if spooled_sid in blocked_sessions:
+-            # An older message for this session could not be replayed. Writing this one now would give
+-            # it a lower row id than the message it follows, permanently inverting the transcript, so
+-            # leave it for the next start.
+-            blocked_sessions[spooled_sid] += 1
++        target_sid, _sources = deferred_transcript_route(session_db, spooled_sid)
++        if target_sid in blocked_sessions:
++            # Ordering belongs to the destination conversation, not one physical spool segment.
++            blocked_sessions[target_sid] += 1
+             return False
+         try:
+-            replay_spooled_row(session_db, spooled_sid, message, fallback_ts=payload.get("ts"))
++            replay_spooled_row(session_db, target_sid, message, fallback_ts=payload.get("ts"))
+         except Exception as exc:
+             if is_row_rejection(exc):  # no retry can write it, so it must not hold the session back
+                 _quarantine_spool_file(path, spooled_sid, exc)
+                 return False
+             # Same contract as drain_transcript_spool: stop this session's replay on the first failure
+             # and keep the remaining spool files for the next attempt.
+-            blocked_sessions[spooled_sid] = 1
++            blocked_sessions[target_sid] = 1
+             raise
+         return True
+     session_key, data = payload.get("session_key", ""), payload.get("data", {})
+diff --git a/tests/gateway/test_parked_passive_row_delivery.py b/tests/gateway/test_parked_passive_row_delivery.py
+index cac966c6c5..438cb420fb 100644
+--- a/tests/gateway/test_parked_passive_row_delivery.py
++++ b/tests/gateway/test_parked_passive_row_delivery.py
+@@ -217,6 +217,166 @@ def test_tui_model_switch_marker_is_atomic_when_the_turn_is_parked(parked, spool
+     assert len(active()) == 1
+ 
+ 
++@pytest.mark.parametrize('entrypoint', ['settlement', 'store', 'boot', 'append'])
++def test_deferred_parent_rows_follow_compression_after_resume(parked, spool_home, monkeypatch, entrypoint):
++    import asyncio
++    from gateway.session import SessionStore
++    from gateway.session_settlement_recovery import drain_deferred_rows
++    db, _, row = parked
++    for message in [
++        {'role': 'user', 'content': 'first'},
++        {'role': 'user', 'content': 'new pivot', 'display_kind': 'model_switch'},
++        {'role': 'user', 'content': 'second'},
++    ]:
++        assert shutdown_flush.defer_row_for_parked_turn('s', message)
++    _resume(db, row)
++    for parent, child in [('s', 'mid'), ('mid', 'tip')]:
++        db.publish_compression_child(parent_session_id=parent, child_session_id=child, source='test',
++                                     messages=[{'role': 'user', 'content': 'old pivot',
++                                                'display_kind': 'model_switch'}], require_compression_lease=False)
++    before = db.get_messages('s')
++    assert shutdown_flush.defer_row_for_parked_turn('tip', {'role': 'user', 'content': 'third'})
++    if entrypoint == 'boot':
++        assert shutdown_flush.recover_pending_spool(db) == (4, set())
++    else:
++        store = None
++        if entrypoint in {'store', 'append'}:
++            store = object.__new__(SessionStore)
++            store._db = db
++            store._transcript_retry_lock = threading.Lock()
++            store._transcript_append_failures = {}
++            store._dirty_transcripts = {}
++            store._spooled_drop_sessions = {'s'}
++            monkeypatch.setattr(store, '_db_for_session_id', lambda sid: db)
++        authority = types.SimpleNamespace(db=db, runner=types.SimpleNamespace(session_store=store),
++                                          physical_target=lambda ref: 'tip')
++        # Both logical and physical refs now name only the tip: discover the parent spool from SQLite.
++        if entrypoint == 'append':
++            store.append_to_transcript('tip', {'role': 'user', 'content': 'fourth'})
++        else:
++            asyncio.run(drain_deferred_rows(authority, types.SimpleNamespace(session_id='tip')))
++    assert not _spool_files()
++    assert db.get_messages('s') == before
++    contents = [m['content'] for m in db.get_messages('tip')]
++    expected = ['first', 'new pivot', 'second', 'third'] + (['fourth'] if entrypoint == 'append' else [])
++    assert contents[-len(expected):] == expected
++    assert [m['content'] for m in db.get_messages('tip') if m.get('display_kind') == 'model_switch'] == ['new pivot']
++    assert shutdown_flush.recover_pending_spool(db) == (0, set())
++
++
++@pytest.mark.parametrize('defect', ['branch', 'reset', 'delegate', 'tool', 'noncompression', 'profile', 'ambiguous'])
++@pytest.mark.parametrize('entrypoint', ['drain', 'boot'])
++def test_deferred_rows_never_redirect_across_unproven_edges(parked, spool_home, defect, entrypoint):
++    db, _, row = parked
++    assert shutdown_flush.defer_row_for_parked_turn('s', {'role': 'user', 'content': 'keep custody'})
++    _resume(db, row)
++    config = {f'_{defect if defect != "branch" else "branched"}_from': 's'} if defect in {'branch', 'reset', 'delegate'} else {}
++    db.create_session('child', source='tool' if defect == 'tool' else 'test', parent_session_id='s', model_config=config)
++    db._execute_write(lambda c: c.execute("UPDATE sessions SET ended_at=1,end_reason=? WHERE id='s'",
++                                          ('manual' if defect == 'noncompression' else 'compression',)))
++    if defect == 'profile':
++        db._execute_write(lambda c: c.execute("UPDATE sessions SET profile_name='foreign' WHERE id='child'"))
++    if defect == 'ambiguous':
++        db.create_session('sibling', source='test', parent_session_id='s')
++    # Discovery from the child cannot steal the parent spool; nor may a parent/boot drain route to it.
++    assert shutdown_flush.replay_deferred_rows(db, 'child') == (0, 0)
++    # A noncompression-ended source may still accept its OWN passive rows; it must never
++    # redirect them to its child. Compression-ended sources cannot accept an append at all.
++    expected = int(defect == 'noncompression')
++    if entrypoint == 'drain':
++        assert shutdown_flush.replay_deferred_rows(db, 's')[0] == expected
++    else:
++        assert shutdown_flush.recover_pending_spool(db)[0] == expected
++    assert len(_spool_files()) == 1 - expected
++    assert not db.get_messages('child')
++    assert _contents(db).count('keep custody') == expected
++
++
++@pytest.mark.parametrize('entrypoint', ['drain', 'boot'])
++def test_compression_replay_failure_holds_later_tip_rows_in_order(parked, spool_home, monkeypatch, entrypoint):
++    import sqlite3
++    db, _, row = parked
++    assert shutdown_flush.defer_row_for_parked_turn('s', {'role': 'user', 'content': 'first'})
++    _resume(db, row)
++    db.publish_compression_child(parent_session_id='s', child_session_id='tip', source='test',
++                                 messages=[{'role': 'user', 'content': 'summary'}], require_compression_lease=False)
++    assert shutdown_flush.defer_row_for_parked_turn('tip', {'role': 'user', 'content': 'second'})
++    append = db.append_message
++    calls = []
++    def unavailable(**kwargs):
++        calls.append(kwargs['content'])
++        raise sqlite3.OperationalError('database is locked')
++    monkeypatch.setattr(db, 'append_message', unavailable)
++    if entrypoint == 'drain':
++        assert shutdown_flush.replay_deferred_rows(db, 'tip') == (0, 2)
++    else:
++        assert shutdown_flush.recover_pending_spool(db) == (0, {'tip'})
++    assert calls == ['first'] and len(_spool_files()) == 2
++    monkeypatch.setattr(db, 'append_message', append)
++    assert shutdown_flush.replay_deferred_rows(db, 'tip') == (2, 0)
++    assert [m['content'] for m in db.get_messages('tip')][-2:] == ['first', 'second']
++
++
++@pytest.mark.parametrize('entrypoint', ['settlement', 'store', 'boot', 'append'])
++def test_compression_replay_uses_only_the_owning_profile_spool(parked, tmp_path, monkeypatch, entrypoint):
++    import asyncio
++    from hermes_constants import get_hermes_home, set_hermes_home_override, reset_hermes_home_override
++    from gateway.session import SessionStore
++    from gateway.session_settlement_recovery import drain_deferred_rows
++    db, _, row = parked
++    from hermes_state import SessionDB
++    foreign_db = SessionDB(tmp_path / 'foreign.db')
++    foreign_db.create_session('s', source='test')
++    foreign_db.create_session('tip', source='test')
++    owner, ambient = tmp_path / 'owner', tmp_path / 'ambient'
++    owner.mkdir()
++    ambient.mkdir()
++    monkeypatch.setenv('HERMES_HOME', str(ambient))
++    token = set_hermes_home_override(str(owner))
++    try:
++        owner_file = shutdown_flush.defer_row_for_parked_turn('s', {'role': 'user', 'content': 'owner only'})
++    finally:
++        reset_hermes_home_override(token)
++    foreign_file = shutdown_flush.defer_row_for_parked_turn('s', {'role': 'user', 'content': 'foreign only'})
++    _resume(db, row)
++    db.publish_compression_child(parent_session_id='s', child_session_id='tip', source='test',
++                                 messages=[{'role': 'user', 'content': 'summary'}], require_compression_lease=False)
++    if entrypoint == 'boot':
++        token = set_hermes_home_override(str(owner))
++        try:
++            assert shutdown_flush.recover_pending_spool(db) == (1, set())
++        finally:
++            reset_hermes_home_override(token)
++    else:
++        store = None
++        if entrypoint in {'store', 'append'}:
++            store = object.__new__(SessionStore)
++            store._transcript_retry_lock = threading.Lock()
++            store._transcript_append_failures = {}
++            store._dirty_transcripts = {}
++            store._spooled_drop_sessions = {'s'}
++            # A shared SessionStore may have lost the old id's owner hint after compression.
++            # Settlement's authority still owns the canonical profile DB and must supply it.
++            monkeypatch.setattr(store, '_db_for_session_id', lambda sid: foreign_db if entrypoint == 'store' else db)
++            monkeypatch.setattr(store, '_owner_key_for_session_id', lambda sid: 'agent:owner:test')
++            monkeypatch.setattr(store, '_profile_home_for_key', lambda key: owner)
++        authority = types.SimpleNamespace(db=db, profile_id=str(owner),
++                                          runner=types.SimpleNamespace(session_store=store),
++                                          physical_target=lambda ref: 'tip')
++        if entrypoint == 'append':
++            assert store is not None
++            store.append_to_transcript('tip', {'role': 'user', 'content': 'live'})
++        else:
++            asyncio.run(drain_deferred_rows(authority, types.SimpleNamespace(session_id='tip')))
++    assert owner_file is not None and foreign_file is not None
++    assert not owner_file.exists() and foreign_file.exists()
++    expected = ['summary', 'owner only'] + (['live'] if entrypoint == 'append' else [])
++    assert [m['content'] for m in db.get_messages('tip')] == expected
++    assert get_hermes_home() == ambient
++    assert not foreign_db.get_messages('s') and not foreign_db.get_messages('tip')
++    foreign_db.close()
++
++
+ def test_settlement_drains_deferred_rows_for_both_session_ids():
+     import asyncio
+     from gateway.session_settlement_recovery import drain_deferred_rows
+-- 
+2.43.0
+

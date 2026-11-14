@@ -1,0 +1,256 @@
+From c18824850eac35bb69afa5f260f6ab13e34cc682 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 04:11:49 +0000
+Subject: [PATCH] [daveey] preserve independent parks across shared blocker
+ clears
+
+---
+ hermes_cli/kanban_awaiting.py                 | 16 ++++--
+ hermes_cli/kanban_shared_blockers.py          | 10 ++--
+ tests/hermes_cli/test_kanban_awaiting.py      | 45 +++++++++++++++-
+ .../test_kanban_blocker_park_wake.py          | 53 +++++++++++++++++--
+ 4 files changed, 109 insertions(+), 15 deletions(-)
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index d1f76b6d12..458893e0d9 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -706,10 +706,11 @@ def prior_same_premise(conn: sqlite3.Connection, task_id: str, premise: str, *,
+     froze t_f6d930b7 behind owner cards nothing could run and dropped the working idle trigger. [daveey]"""
+     from hermes_cli.kanban_deploy_window import is_healthy
+     from hermes_cli.kanban_wake_check import CONDITION_MET_EVENT
++    from hermes_cli.kanban_shared_blockers import CLEARED_EVENT
+     count = 0
+     for kind, payload in conn.execute(
+-            "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN ('scheduled','continued',?,?) "
+-            "ORDER BY id DESC LIMIT 20", (task_id, ESCALATED_EVENT, CONDITION_MET_EVENT)):
++            "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN ('scheduled','continued',?,?,?) "
++            "ORDER BY id DESC LIMIT 20", (task_id, ESCALATED_EVENT, CONDITION_MET_EVENT, CLEARED_EVENT)):
+         if kind == ESCALATED_EVENT:
+             break
+         try:
+@@ -717,6 +718,11 @@ def prior_same_premise(conn: sqlite3.Connection, task_id: str, premise: str, *,
+             got = data.get("awaiting") or {}
+         except (ValueError, AttributeError):
+             data, got = {}, {}
++        if kind == CLEARED_EVENT:
++            # Only a real wake interrupts the premise streak; hold-retirement annotations do not.
++            if data.get("status") in ("ready", "review"):
++                break
++            continue
+         if kind == CONDITION_MET_EVENT:
+             if probe and isinstance(data, dict) and data.get("wake_check") and _probe_key(data["wake_check"]) == probe:
+                 break
+@@ -847,7 +853,7 @@ def resource_apply(record: Optional[dict], reason: Optional[str],
+ # --- re-park escalation ------------------------------------------------------------------------
+ 
+ def _supervisor_profile(task) -> Optional[str]:
+-    """A capable supervisor other than the worker that keeps parking, or None (the card goes to triage)."""
++    """A capable distinct supervisor, or None (escalation falls back to the owner's profile)."""
+     from hermes_cli.kanban_assignment_routing import _supervisor
+     name, _required = _supervisor(task)
+     return name
+@@ -878,7 +884,7 @@ def escalate(conn: sqlite3.Connection, task_id: str, *, record: dict, reason: Op
+     existing = conn.execute("SELECT id, status FROM tasks WHERE idempotency_key = ?", (key,)).fetchone()
+     owner = existing[0] if existing and existing[1] not in ("done", "archived") else None
+     if owner is None:
+-        supervisor = _supervisor_profile(task)
++        supervisor = _supervisor_profile(task) or task.assignee or "default"
+         fired = record.get("fired_reparks")
+         title = (f"Unstick {task_id}: probe fired {fired}x, re-parked each time" if fired
+                  else f"Unstick {task_id}: parked 3x on the same premise")
+@@ -894,7 +900,7 @@ def escalate(conn: sqlite3.Connection, task_id: str, *, record: dict, reason: Op
+                   "do the action (grant, install, fix) where the capability lives, or route the card to the "
+                   "profile/gateway that can, or prove the premise false. Then complete this card with the "
+                   f"evidence; {task_id} waits on it and resumes when it is done."),
+-            assignee=supervisor, created_by=task.assignee, workspace_kind="scratch", triage=supervisor is None,
++            assignee=supervisor, created_by=task.assignee, workspace_kind="scratch", triage=False,
+             idempotency_key=None if existing else key, creator_task_id=task.id, session_id=task.session_id,
+             tenant=task.tenant, priority=task.priority,
+         )
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index 0a80edee7b..fff30c5196 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -581,9 +581,13 @@ def release_cleared_blockers(conn: sqlite3.Connection, *, now: Optional[int] = N
+                 continue
+             payload = {"blocker_id": st.blocker_id, "cleared_by_task": by_task, "cleared_by_run": by_run,
+                        "cleared_via": st.cleared_via or "run"}
+-            if row["status"] in ("ready", "review"):
+-                # Admission may be capacity-limited before the guard is evaluated again.
+-                # Retire the historical hold without changing lanes or bypassing admission.
++            from hermes_cli.kanban_continuation import pending_wake
++            park = pending_wake(conn, tid) or {}
++            awaiting = park.get("awaiting") or {}
++            own_wait = (row["status"] == "scheduled" and kwc.get_state(conn, tid) is not None
++                        and (awaiting.get("shared_blocker") or park.get("blocker_id")) != st.blocker_id)
++            if row["status"] in ("ready", "review") or own_wait:
++                # Retire the historical hold, not an independent park's probe/backstop.
+                 with kb.write_txn(conn):
+                     kb._append_event(conn, tid, CLEARED_EVENT, payload)
+                 continue
+diff --git a/tests/hermes_cli/test_kanban_awaiting.py b/tests/hermes_cli/test_kanban_awaiting.py
+index a9b4b4533b..e434d25894 100644
+--- a/tests/hermes_cli/test_kanban_awaiting.py
++++ b/tests/hermes_cli/test_kanban_awaiting.py
+@@ -359,6 +359,7 @@ def test_long_continue_on_an_agent_wall_is_refused(kanban_home, monkeypatch) ->
+ # -- re-parks escalate --------------------------------------------------------------------------------
+ 
+ def test_third_park_on_the_same_premise_goes_to_the_supervisor(kanban_home, monkeypatch) -> None:
++    monkeypatch.setattr(kaw, "_supervisor_profile", lambda task: None)
+     reason = "Waiting for vendor ticket 4711 (AWS quota increase), evidence: case opened {n}"
+     awaiting = {"kind": "external", "ref": "AWS support case 4711", "why": "quota increase pending"}
+     with kbc.connect_closing() as conn:
+@@ -376,8 +377,8 @@ def test_third_park_on_the_same_premise_goes_to_the_supervisor(kanban_home, monk
+         assert out.get("code") == "repark_escalated" and out.get("status") == "todo", out
+         owner = out["owner_task_id"]
+         card = kb.get_task(conn, owner)
+-        # No capable supervisor is configured here: the issue lands in triage, never on the parking worker.
+-        assert card.status == "triage" and card.assignee != "worker" and "parked 3x" in card.title
++        # A single-profile installation must have a dispatchable producer, not unassigned triage.
++        assert card.status == "ready" and card.assignee == "worker" and "parked 3x" in card.title
+         assert "not a question for David" in card.body and card.human_request is None
+         assert conn.execute("SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?", (owner, tid)).fetchone()
+         assert kwc.get_state(conn, tid) is None
+@@ -398,6 +399,46 @@ def test_third_park_on_the_same_premise_goes_to_the_supervisor(kanban_home, monk
+                                   "awaiting": awaiting}).get("status") == "scheduled"
+ 
+ 
++def test_shared_clear_wakes_do_not_exhaust_repark_budget(kanban_home, monkeypatch) -> None:
++    from hermes_cli import kanban_shared_blockers as ksb
++    awaiting = {"kind": "external", "ref": "vendor ticket 4711", "why": "vendor response pending"}
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        for n in range(4):
++            _as_worker(monkeypatch, conn, tid)
++            out = _tool("schedule", {"reason": "waiting for vendor", "wake_check": "exit 1", "awaiting": awaiting})
++            assert out.get("status") == "scheduled", (n, out)
++            if n < 3:
++                with kb.write_txn(conn):
++                    assert kwc._wake(conn, tid, ksb.CLEARED_EVENT, {"blocker_id": "github-rest-quota"})
++                assert kb.claim_task(conn, tid, claimer="worker")
++        assert not [e for e in kb.list_events(conn, tid) if e.kind == kaw.ESCALATED_EVENT]
++
++
++@pytest.mark.parametrize("status", [None, "scheduled"])
++def test_clear_annotation_does_not_reset_repark_budget(kanban_home, status):
++    from hermes_cli import kanban_shared_blockers as ksb
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        with kb.write_txn(conn):
++            for _ in range(2):
++                kb._append_event(conn, tid, "scheduled", {"awaiting": {"premise": "same"}})
++            kb._append_event(conn, tid, ksb.CLEARED_EVENT, {"status": status})
++        assert kaw.prior_same_premise(conn, tid, "same") == 2
++
++
++def test_escalation_without_any_assignee_uses_default(kanban_home, monkeypatch):
++    monkeypatch.setattr(kaw, "_supervisor_profile", lambda task: None)
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET assignee=NULL WHERE id=?", (tid,))
++            owner = kaw.escalate(conn, tid, record={"premise": "same"}, reason="stuck")
++        card = kb.get_task(conn, owner)
++        assert (card.status, card.assignee) == ("ready", "default")
++        assert kb.claim_task(conn, owner)
++
++
+ def test_escalation_goes_to_a_capable_supervisor(kanban_home, monkeypatch) -> None:
+     monkeypatch.setattr(kaw, "_supervisor_profile", lambda task: "boss")
+     awaiting = {"kind": "deploy", "ref": "release 93ed6b10", "why": "rollout"}
+diff --git a/tests/hermes_cli/test_kanban_blocker_park_wake.py b/tests/hermes_cli/test_kanban_blocker_park_wake.py
+index 2ecfaddbbc..ac9c2f9295 100644
+--- a/tests/hermes_cli/test_kanban_blocker_park_wake.py
++++ b/tests/hermes_cli/test_kanban_blocker_park_wake.py
+@@ -222,6 +222,42 @@ def test_completion_clears_and_wakes_parked_cards(kanban_home, monkeypatch):
+         assert ev and ev[0].payload["cleared_by_task"] == a
+ 
+ 
++@pytest.mark.parametrize("current_blocker", [None, "other-wall", BID])
++def test_clear_respects_current_park(kanban_home, monkeypatch, current_blocker):
++    with kbc.connect_closing() as conn:
++        clearing = _worker_block_behind(monkeypatch, conn, "wall probe")
++        waiting = _worker_block_behind(monkeypatch, conn, "lane waiter")
++    if current_blocker != BID:
++        _repark(monkeypatch, "schedule", "parent", waiting)
++    with kbc.connect_closing() as conn:
++        if current_blocker == "other-wall":
++            with kb.write_txn(conn):
++                wake = pending_wake(conn, waiting)
++                wake["awaiting"]["shared_blocker"] = current_blocker
++                kb._append_event(conn, waiting, "scheduled", wake)
++        before = kwc.get_state(conn, waiting)
++        park = pending_wake(conn, waiting)
++        comments = kb.list_comments(conn, waiting)
++        assert kb.unblock_task(conn, clearing)
++        assert kb.claim_task(conn, clearing)
++        assert kb.complete_task(conn, clearing, result="wall gone")
++        released = ksb.release_cleared_blockers(conn)
++        if current_blocker == BID:
++            assert released == [waiting]
++            assert kb.get_task(conn, waiting).status == "ready"
++        else:
++            assert released == []
++            assert kb.get_task(conn, waiting).status == "scheduled"
++            assert kwc.get_state(conn, waiting) == before
++            assert pending_wake(conn, waiting) == park
++            assert park["wake_at"] and before["cmd"] == WAKE
++            assert kb.list_comments(conn, waiting) == comments
++        events = [e for e in kb.list_events(conn, waiting) if e.kind == ksb.CLEARED_EVENT]
++        assert len(events) == 1
++        assert events[0].payload["cleared_by_task"] == clearing
++        assert ksb.release_cleared_blockers(conn) == []
++
++
+ def test_explicit_clear_blocker_opt_out(kanban_home, monkeypatch):
+     with kbc.connect_closing() as conn:
+         a = _worker_block_behind(monkeypatch, conn, "a")
+@@ -340,8 +376,8 @@ def test_woken_card_reparked_by_parent_before_running_is_not_rewoken(kanban_home
+         assert len(_cleared_events(conn, a)) == 1
+ 
+ 
+-def test_newer_clear_after_a_repark_wakes_the_card_again(kanban_home, monkeypatch):
+-    """Control: the skip is per clear. A card that re-parked after one clear is woken by a LATER clear."""
++def test_newer_clear_after_an_independent_repark_retires_only_the_hold(kanban_home, monkeypatch):
++    """A new assertion episode does not take over the card's independent park."""
+     with kbc.connect_closing() as conn:
+         a = _worker_block_behind(monkeypatch, conn, "a")
+         b = _worker_block_behind(monkeypatch, conn, "b")
+@@ -355,7 +391,11 @@ def test_newer_clear_after_a_repark_wakes_the_card_again(kanban_home, monkeypatc
+         c = _worker_block_behind(monkeypatch, conn, "c")     # X re-asserted by a third card ...
+         _clear_via_wake_check(conn, c)                      # ... and cleared again, later
+         assert ksb.blocker_states(conn)[BID].cleared_by[0] == c
+-        assert a in ksb.release_cleared_blockers(conn)
++        before = pending_wake(conn, a), kwc.get_state(conn, a), _dispatcher_comments(conn, a)
++        assert a not in ksb.release_cleared_blockers(conn)
++        assert kb.get_task(conn, a).status == "scheduled"
++        assert (pending_wake(conn, a), kwc.get_state(conn, a), _dispatcher_comments(conn, a)) == before
++        assert len(_cleared_events(conn, a)) == 2
+ 
+ 
+ def _age_all(conn, seconds: int) -> None:
+@@ -436,7 +476,7 @@ def test_redundant_clear_by_another_card_does_not_rewake(kanban_home, monkeypatc
+         assert len(_cleared_events(conn, c)) == 1
+ 
+ 
+-def test_clear_after_a_reassertion_still_wakes_after_a_redundant_clear(kanban_home, monkeypatch):
++def test_clear_after_reassertion_keeps_independent_park_after_redundant_clear(kanban_home, monkeypatch):
+     _a, _b, c = _two_clears_in_sequence(monkeypatch)
+     with kbc.connect_closing() as conn:
+         assert ksb.release_cleared_blockers(conn) == []
+@@ -447,7 +487,10 @@ def test_clear_after_a_reassertion_still_wakes_after_a_redundant_clear(kanban_ho
+         _clear_via_wake_check(conn, d)                      # ... then cleared by a run's probe
+         st = ksb.blocker_states(conn)[BID]
+         assert not st.is_open and st.cleared_by[0] == d
+-        assert c in ksb.release_cleared_blockers(conn)
++        before = pending_wake(conn, c), kwc.get_state(conn, c), _dispatcher_comments(conn, c)
++        assert c not in ksb.release_cleared_blockers(conn)
++        assert kb.get_task(conn, c).status == "scheduled"
++        assert (pending_wake(conn, c), kwc.get_state(conn, c), _dispatcher_comments(conn, c)) == before
+         assert len(_cleared_events(conn, c)) == 2
+ 
+ 
+-- 
+2.43.0
+

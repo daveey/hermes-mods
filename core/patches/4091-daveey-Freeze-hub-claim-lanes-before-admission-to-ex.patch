@@ -1,0 +1,224 @@
+From 95e0f6400a7e9cf9782fb0efeb0cfbe9f1ac16ac Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 00:12:18 +0000
+Subject: [PATCH] [daveey] Freeze hub claim lanes before admission to exclude
+ asynchronous wakes
+
+Problem: t_01a18e12cdcab970 woke stale at 1794610055 and was claimed
+on the hub at 1794610056 with no hub_admission event.
+Why 1: the claim pass enumerated ready rows after the admission screen.
+Why 2: wake probes publish ready/review from separate connections while
+screening runs (kanban_wake_check._probe_and_apply/apply_result/_wake).
+Why 3: admission screened an earlier candidate snapshot, not the set
+subsequently enumerated for claims (dispatch worker_pickup -> lane_rows).
+Root (happened): two independently sampled candidate sets straddled an
+asynchronous producer; resumable review cards were also outside the screen.
+Root (not caught): claim-screen fixtures started ready; wake tests exercised
+promotion but not a completion between admission and claim enumeration.
+Recurrence: extends PR #1637; its row/event fence protects verdict application,
+not newly arrived candidates. The prior fence remains unchanged.
+
+Freeze both lanes after foreign pickup and before the existing screen.
+Late wakes wait one tick; the next screen judges, moves, keeps or fails open
+under the existing policy. Include review resumptions in admission.
+
+Proof: ready race RED (red-run2, hub holder without verdict), then GREEN.
+Review race RED before frozen review snapshot and again before review screen
+inclusion; GREEN afterwards. Added real wake result/timer matrix covering
+ready/review and existing verdicts. Focused four suites green-run3 rc=0;
+scripts/check --base origin/main check-run2 rc=0.
+
+Remaining pre-publication work: final-byte tests/mutations, live predicate
+replay, watch count reconciliation and independent exact-head review/CI.
+---
+ hermes_cli/kanban_db_dispatch.py              |  6 +-
+ hermes_cli/kanban_db_sync.py                  |  8 +-
+ hermes_cli/kanban_hub_admission_claim.py      | 23 +++++-
+ .../test_kanban_hub_claim_wake_race.py        | 74 +++++++++++++++++++
+ 4 files changed, 99 insertions(+), 12 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_hub_claim_wake_race.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 63dd98cad5..ca72227116 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2217,13 +2217,11 @@ def _dispatch_once_locked(
+     # Cards this machine cannot lease (runs_on for another machine, ...) are never candidates: before 10-28 a
+     # review card pinned to the hub sat first in the MacBook's review lane, took the review reservation every
+     # tick, and the Board refused its lease every tick, so the eligible ready queue never started.
+-    all_ready = [row for row in lane_rows(conn, "ready") if row["id"] not in unjudged]  # hub: judged next tick
++    from hermes_cli.kanban_hub_admission_claim import screened_lanes
++    all_ready, all_review, unjudged = screened_lanes(conn, dry_run, review_dispatch_enabled(), unjudged)
+     result.admission_deferred = sorted(unjudged)
+     from hermes_cli.kanban_db_dispatch_preclaim import eligible_rows as _eligible_rows
+     ready_rows = _eligible_rows(conn, all_ready, "ready", result)
+-    # Review rows are enumerated up front so the budget split can see whether
+-    # review work exists at all.
+-    all_review = lane_rows(conn, "review") if review_dispatch_enabled() else []
+     review_rows = _eligible_rows(conn, all_review, "review", result) if all_review else []
+     result.lane_candidates = len(all_ready) + len(all_review)
+     # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 08ccd5a31d..d1fa7fa0d9 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1180,9 +1180,8 @@ def set_runs_on(conn: sqlite3.Connection, task_id: str, runs_on: Any) -> None:
+ 
+ 
+ def worker_pickup(conn: sqlite3.Connection, budget: Any, dry_run: bool, profile_exists_fn: Any) -> frozenset:
+-    """Dispatcher seam: a worker node copies eligible cards other gateways created (``kanban_worker_node``); the
+-    hub then judges its own label-less unjudged ready cards (``kanban_hub_admission_claim``) before the claims.
+-    Returns the ids this tick must not claim (still unjudged: edited while judged, or past the judge budget)."""
++    """Copy eligible foreign cards before the dispatcher freezes its lane candidates and screens admission.
++    Retain the deferred-id return contract for dispatcher callers."""
+     if dry_run or board_mode(conn) != "primary":
+         return frozenset()
+     from hermes_cli import kanban_worker_node as wn
+@@ -1190,8 +1189,7 @@ def worker_pickup(conn: sqlite3.Connection, budget: Any, dry_run: bool, profile_
+         wn.pickup(conn, budget=budget, profile_exists=profile_exists_fn())
+     except Exception:  # health: allow BLE001 -- a failed pickup must not stop the tick dispatching local work
+         _log.warning("kanban: worker-node pickup failed", exc_info=True)
+-    from hermes_cli.kanban_hub_admission_claim import safe_screen
+-    return safe_screen(conn)  # [daveey] the hub judges its own unjudged ready cards before this tick's claims
++    return frozenset()  # admission runs after the dispatcher freezes its claim candidates
+ 
+ 
+ def worker_pickup_capped(conn: sqlite3.Connection, result: Any, dry_run: bool, profile_exists_fn: Any) -> Any:
+diff --git a/hermes_cli/kanban_hub_admission_claim.py b/hermes_cli/kanban_hub_admission_claim.py
+index 91bbf369cc..508e07e54b 100644
+--- a/hermes_cli/kanban_hub_admission_claim.py
++++ b/hermes_cli/kanban_hub_admission_claim.py
+@@ -5,7 +5,9 @@ and a foreign card at pickup (``kanban_hub_admission_pickup``). Nothing judged a
+ gate: its ``runs_on`` and ``placement_policy`` are NULL, so the claim backstop (``pickup.refusals``, foreign
+ hub-bound copies only) never saw it. On 11-12 the hourly pin sweep moved 7 such cards off the hub by hand after
+ their runs (all denied by the judge), and 26 more waited (t_01a1d09606b75027). The dispatcher is the one place
+-every hub run passes, so before the hub claims a ready, label-less card with no verdict, :func:`screen`:
++every hub run passes. The dispatcher freezes its ready/review candidates before :func:`screen`: async
++wake probes finishing during admission must wait for the next tick, not join an unscreened claim pass.
++The screen covers ready and review because a scheduled continuation can resume either lane:
+ 
+ * judges ``{title, body}`` outside any write transaction (one outage per tick: the rest are not judged);
+ * records a ``hub_admission`` event with ``entry: "claim"``;
+@@ -76,7 +78,7 @@ class Counts:
+                 ).format(**asdict(self)) + ids
+ 
+ 
+-_SCREENABLE = ("status = 'ready' AND claim_lock IS NULL AND (runs_on IS NULL OR runs_on IN ('', '[]')) "
++_SCREENABLE = ("status IN ('ready', 'review') AND claim_lock IS NULL AND (runs_on IS NULL OR runs_on IN ('', '[]')) "
+                "AND placement_policy IS NULL")
+ 
+ 
+@@ -85,7 +87,8 @@ def _candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+     claims reach first and never lets lower-priority work jump a deferred higher-priority card."""
+     from hermes_cli.kanban_db_dispatch_queries import lane_rows
+     rows = {row["id"]: row for row in conn.execute(f"SELECT * FROM tasks WHERE {_SCREENABLE}").fetchall()}
+-    return [rows[row["id"]] for row in lane_rows(conn, "ready") if row["id"] in rows]
++    lanes = lane_rows(conn, "ready") + lane_rows(conn, "review")
++    return [rows[row["id"]] for row in lanes if row["id"] in rows]
+ 
+ 
+ def _current(conn: sqlite3.Connection, tid: str) -> tuple[Optional[sqlite3.Row], int]:
+@@ -273,6 +276,20 @@ def print_deferred(ids: list[str]) -> None:
+         print(f"Deferred by the hub claim screen (unjudged, judged next tick): {', '.join(ids)}")
+ 
+ 
++def screened_lanes(conn: sqlite3.Connection, dry_run: bool, review_enabled: bool, deferred=()) -> tuple:
++    """Freeze claim candidates before judging. Async wakes during the screen wait for the next tick."""
++    from hermes_cli.kanban_db_dispatch_queries import lane_rows
++    from hermes_cli.kanban_db_sync import board_mode
++
++    ready = lane_rows(conn, "ready")
++    review = lane_rows(conn, "review") if review_enabled else []
++    deferred = set(deferred)
++    if not dry_run and board_mode(conn) == "primary":
++        deferred.update(safe_screen(conn))
++    return ([row for row in ready if row["id"] not in deferred],
++            [row for row in review if row["id"] not in deferred], deferred)
++
++
+ def safe_screen(conn: sqlite3.Connection) -> frozenset:
+     """Dispatcher seam: the ids this tick must not claim. A failed screen never stops the tick (the cards are
+     claimed as before)."""
+diff --git a/tests/hermes_cli/test_kanban_hub_claim_wake_race.py b/tests/hermes_cli/test_kanban_hub_claim_wake_race.py
+new file mode 100644
+index 0000000000..7597b4009a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_hub_claim_wake_race.py
+@@ -0,0 +1,74 @@
++"""A probe finishing during admission cannot enter the current claim pass."""
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_hub_admission_claim as hac
++from hermes_cli import kanban_wake_check as wc
++from tests.hermes_cli import test_kanban_hub_admission_claim as helpers
++
++hub_judge = helpers.hub_judge
++gws = helpers.gws
++_claim_screen_first = helpers._claim_screen_first
++
++
++def _park(hub, lane, monkeypatch):
++    tid = helpers._hub_card(hub)
++    now = int(time.time())
++    cmd = "test -f ~/.hermes/cache/ready.flag"
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET status = 'scheduled' WHERE id = ?", (tid,))
++        kb._append_event(hub.conn, tid, "scheduled", {"wake_at": now + 86400, "wake_check": cmd,
++                                                     "resume_status": lane})
++        wc.set_check(hub.conn, tid, cmd, 120)
++    state = wc.get_state(hub.conn, tid)
++    assert state is not None
++    assert wc.apply_result(hub.conn, tid, cmd, 1, "", generation=state["generation"],
++                           now=now - 49 * 3600, stale_interval=48 * 3600) is None
++    # Hold delivery at the screen boundary, without an unrelated real shell worker.
++    monkeypatch.setattr(wc, "run_due_wake_checks", lambda *a, **kw: {})
++    return tid, state, now
++
++
++def _deliver(conn, tid, state, now, kind):
++    if kind == "continuation_woken":
++        from hermes_cli.kanban_continuation import wake_due_continuations
++        assert wake_due_continuations(conn, now=now + 86400) == [tid]
++    else:
++        rc = 0 if kind == "condition_met" else 1
++        assert wc.apply_result(conn, tid, state["cmd"], rc, "", generation=state["generation"],
++                               now=now, stale_interval=48 * 3600) == kind
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++@pytest.mark.parametrize("kind", ["wake_check_stale", "condition_met", "continuation_woken"])
++@pytest.mark.parametrize("judged", [False, True])
++def test_wake_after_screen_waits_for_next_judged_pass(gws, hub_judge, monkeypatch, lane, kind, judged):
++    monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: True)
++    hub, _worker, svc = gws
++    tid, state, now = _park(hub, lane, monkeypatch)
++    if judged:
++        with kb.write_txn(hub.conn):
++            kb._append_event(hub.conn, tid, "hub_admission", {"admit": True, "entry": "claim"})
++    real_screen = hac.safe_screen
++
++    def screen_then_wake(conn):
++        deferred = real_screen(conn)
++        _deliver(conn, tid, state, now, kind)
++        return deferred
++
++    monkeypatch.setattr(hac, "safe_screen", screen_then_wake)
++    helpers._tick(hub)
++    assert helpers._holder(svc, tid) != helpers.HUB
++    task = kb.get_task(hub.conn, tid)
++    assert task is not None and task.status == lane
++    monkeypatch.setattr(hac, "safe_screen", real_screen)
++    helpers._tick(hub)
++    assert helpers._holder(svc, tid) == helpers.HUB
++    events = [row[0] for row in hub.conn.execute(
++        "SELECT kind FROM task_events WHERE task_id = ? AND kind IN ('hub_admission', 'claimed') ORDER BY id",
++        (tid,))]
++    assert events[0] == "hub_admission" and "claimed" in events
++    assert len(hub_judge.calls) == (0 if judged else 1)
+-- 
+2.43.0
+

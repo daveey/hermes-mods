@@ -1,0 +1,339 @@
+From b1fd3df8dcdad663c347abc26601ae9b78153b40 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 03:07:26 +0000
+Subject: [PATCH] fix(kanban): preserve large scratch custody and warn on
+ missing evidence [daveey]
+
+---
+ hermes_cli/kanban_artifact_receipt.py         | 29 +++++++-
+ hermes_cli/kanban_dependency_review.py        |  2 +-
+ hermes_cli/kanban_metadata_files.py           | 41 +++++------
+ ...est_kanban_dependency_review_no_verdict.py |  2 +-
+ .../test_kanban_receipt_artifacts.py          | 37 +++++-----
+ .../test_kanban_scratch_artifact_custody.py   | 70 +++++++++++++++++++
+ 6 files changed, 140 insertions(+), 41 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_scratch_artifact_custody.py
+
+diff --git a/hermes_cli/kanban_artifact_receipt.py b/hermes_cli/kanban_artifact_receipt.py
+index 85d1759e23..24bd876280 100644
+--- a/hermes_cli/kanban_artifact_receipt.py
++++ b/hermes_cli/kanban_artifact_receipt.py
+@@ -3,6 +3,8 @@ from __future__ import annotations
+ 
+ import contextlib
+ import hashlib
++import os
++import shutil
+ import socket
+ from pathlib import Path
+ 
+@@ -26,7 +28,7 @@ def format_receipt(payload) -> str:
+         if not isinstance(record, dict) or not record.get("machine") or not record.get("path"):
+             continue
+         line = f"{record['machine']}:{record['path']}"
+-        for key in ("sha256", "attachment_uid", "warning"):
++        for key in ("retained_path", "sha256", "attachment_uid", "warning"):
+             if record.get(key):
+                 line += f" — {key}: {record[key]}"
+         lines.append(line)
+@@ -56,6 +58,14 @@ def declared_files(metadata: dict) -> list[str]:
+     return list(dict.fromkeys(paths))
+ 
+ 
++def _in_managed_workspace(conn, task_id: str, source: Path) -> bool:
++    from hermes_cli.kanban_db_workspace import _scratch_workspace, _managed_scratch_path_info
++
++    workspace = _scratch_workspace(conn, task_id)
++    return bool(workspace is not None and _managed_scratch_path_info(workspace)[0]
++                and source.resolve().is_relative_to(workspace.resolve()))
++
++
+ def record_files(conn, task_id: str, metadata: dict, originals: list[str], now: int,
+                  staged: list[Path], *, uploaded_by: str, relocated: dict[str, str]) -> None:
+     """Attach small external files through the same byte-sync as scratch copies.
+@@ -106,6 +116,18 @@ def record_files(conn, task_id: str, metadata: dict, originals: list[str], now:
+                 if "uid" in row.keys():
+                     record["attachment_uid"] = row["uid"]
+                 record["attachment_path"] = row["stored_path"]
++            elif _in_managed_workspace(conn, task_id, source):
++                # Large files cannot use blob sync, but must outlive scratch GC.
++                directory = kb.task_attachments_dir(task_id) / "local-artifacts"
++                directory.mkdir(parents=True, exist_ok=True)
++                dest = kb._unique_attachment_path(directory, source.name, set(staged))
++                staged.append(dest)
++                with source.open("rb") as src, dest.open("xb") as dst:
++                    shutil.copyfileobj(src, dst, 1024 * 1024)
++                    dst.flush()
++                    os.fsync(dst.fileno())
++                source = dest
++                record["retained_path"] = str(dest)
+             with source.open("rb") as stream:
+                 record["sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+         except (OSError, kb.ArtifactPreservationError) as exc:
+@@ -113,6 +135,11 @@ def record_files(conn, task_id: str, metadata: dict, originals: list[str], now:
+             if dest is not None and "attachment_id" not in record:
+                 with contextlib.suppress(OSError):
+                     dest.unlink(missing_ok=True)
++            record.pop("retained_path", None)
++            if _in_managed_workspace(conn, task_id, Path(raw).expanduser()):
++                raise kb.ArtifactPreservationError(
++                    f"could not preserve scratch artifact {raw}: {exc}"
++                ) from exc
+             record["warning"] = f"Artifact unavailable on executing machine: {exc}"
+     if records:
+         metadata["artifact_receipt"] = records
+diff --git a/hermes_cli/kanban_dependency_review.py b/hermes_cli/kanban_dependency_review.py
+index 2bbe732851..72e6dc05ad 100644
+--- a/hermes_cli/kanban_dependency_review.py
++++ b/hermes_cli/kanban_dependency_review.py
+@@ -257,7 +257,7 @@ _REVIEW_KEYS = ("verdict", "approved", "reviewed_sha")
+ # summary or result). Any other key routes by _REVIEW_KEYS alone, so hub reviews that
+ # record review_outcome or reviewer_checks, and size-judge rulings, take the ordering
+ # continuation as they did before #728. [daveey]
+-_LOST_REVIEW_KEYS = frozenset({"pr", "reviewed_pr", "worker_session_id", "artifacts"})
++_LOST_REVIEW_KEYS = frozenset({"pr", "reviewed_pr", "worker_session_id", "artifacts", "artifact_receipt"})
+ 
+ 
+ def is_review_result(metadata, summary, captured) -> bool:
+diff --git a/hermes_cli/kanban_metadata_files.py b/hermes_cli/kanban_metadata_files.py
+index 1e2f56a7ff..8d25909317 100644
+--- a/hermes_cli/kanban_metadata_files.py
++++ b/hermes_cli/kanban_metadata_files.py
+@@ -15,9 +15,10 @@ an attachment row. The metadata string is rewritten to the copy, and
+ declared artifact, a named file that cannot be kept never fails the
+ transition: it is skipped, the reason is logged, and it is recorded under
+ ``attached_from_workspace_skipped``. Paths outside the workspace are untouched.
+-Completion receipts are the exception: their observed identities are never rewritten,
+-and completion refuses any scratch evidence that cannot be preserved. The existing
+-attachment map locates the durable copy without pretending it was observed anew.
++Completion receipt identities are never rewritten. Exact file refs are recorded by
++artifact custody: missing files carry warnings, small files become attachments, and
++large scratch files retain an executor-local copy. Ambiguous scratch refs still fail
++closed, rather than pretending a different evidence identity was observed.
+ """
+ 
+ from __future__ import annotations
+@@ -36,7 +37,7 @@ ATTACHED_KEY = "attached_from_workspace"
+ SKIPPED_KEY = "attached_from_workspace_skipped"
+ # Top-level keys this pass never scans or rewrites: declared artifacts are staged
+ # (and rewritten) by ``_persist_scratch_completion_artifacts``; the rest are ours.
+-_SKIP_KEYS = frozenset({"artifacts", "_staged_artifacts", ATTACHED_KEY, SKIPPED_KEY})
++_SKIP_KEYS = frozenset({"artifacts", "artifact_receipt", "_staged_artifacts", ATTACHED_KEY, SKIPPED_KEY})
+ _TRAILING_PUNCT = ".,;:!?)]}"
+ 
+ 
+@@ -250,8 +251,6 @@ def stage_completion_artifacts(
+     transaction rolls back. Workspace files that other metadata values name
+     (``replay_report=<ws>/REPORT.md``) are kept too, best-effort
+     (:func:`preserve_metadata_files`). [daveey]"""
+-    from hermes_cli import kanban_db as kb
+-
+     from hermes_cli.kanban_artifact_receipt import declared_files, record_files
+ 
+     originals = declared_files(metadata)
+@@ -261,27 +260,24 @@ def stage_completion_artifacts(
+     # must not make missing evidence appear preserved.
+     metadata.pop(ATTACHED_KEY, None)
+     metadata.pop(SKIPPED_KEY, None)
++    metadata.pop("_staged_artifacts", None)
+     with discard_on_error(staged):
+-        declared = kb._cleaned_artifact_paths(metadata)
+-        kb._persist_scratch_completion_artifacts(conn, task_id, metadata)
+-        staged.extend(Path(stored_path) for stored_path in metadata.pop("_staged_artifacts", []))
+-        for path in staged:
+-            kb._insert_completion_attachment(
+-                conn, task_id, filename=path.name, stored_path=str(path),
+-                size=path.stat().st_size, created_at=now, uploaded_by=uploaded_by,
+-            )
+-        known: dict[str, str] = {}
+-        for original, kept in zip(declared, kb._cleaned_artifact_paths(metadata)):
+-            if kept != original:
+-                with contextlib.suppress(OSError):
+-                    known[str(Path(original).expanduser().resolve())] = kept
++        record_files(conn, task_id, metadata, originals, now, staged,
++                     uploaded_by=uploaded_by, relocated={})
++        records = metadata.get("artifact_receipt", [])
++        mapping = {r["path"]: r.get("attachment_path", r.get("retained_path"))
++                   for r in records if r.get("attachment_path") or r.get("retained_path")}
++        known = {str(Path(raw).expanduser().resolve()): kept for raw, kept in mapping.items()}
++        if "artifacts" in metadata:
++            metadata["artifacts"] = [mapping.get(raw, raw) for raw in cleaned_artifact_paths(metadata)]
+         staged.extend(preserve_metadata_files(
+             conn, task_id, metadata, now, uploaded_by=uploaded_by, known=known,
+         ))
++        # The incidental scan must not rewrite custody's observed source paths.
++        if records:
++            metadata["artifact_receipt"] = records
+         if uploaded_by == "kanban_complete" and "completion_receipt" in metadata:
+             _verify_receipt_files(conn, task_id, metadata)
+-        record_files(conn, task_id, metadata, originals, now, staged, uploaded_by=uploaded_by,
+-                     relocated=dict(zip(declared, kb._cleaned_artifact_paths(metadata))))
+     return staged
+ 
+ 
+@@ -313,6 +309,7 @@ def _verify_receipt_files(conn, task_id: str, metadata: dict) -> None:
+     refs = {e["ref"] for item in receipt["items"] for e in item["evidence"]}
+     refs.update(item["superseded_by"] for item in receipt["items"] if "superseded_by" in item)
+     attached = metadata.get(ATTACHED_KEY, {})
++    recorded = {r["path"] for r in metadata.get("artifact_receipt", [])}
+     for ref in refs:
+         # Never normalize an evidence identity silently. Workspace aliases and
+         # embedded paths must be resubmitted as the exact absolute file reference
+@@ -322,5 +319,5 @@ def _verify_receipt_files(conn, task_id: str, metadata: dict) -> None:
+             path = Path(ref).expanduser()
+             path = path if path.is_absolute() else workspace / path
+             scratch_ref = scratch_ref or path.resolve().is_relative_to(workspace.resolve())
+-        if scratch_ref and ref not in attached:
++        if scratch_ref and ref not in attached and ref not in recorded:
+             raise ArtifactPreservationError("completion_receipt evidence could not be preserved: " + ref)
+diff --git a/tests/hermes_cli/test_kanban_dependency_review_no_verdict.py b/tests/hermes_cli/test_kanban_dependency_review_no_verdict.py
+index 5efb3d544f..db082c6f9f 100644
+--- a/tests/hermes_cli/test_kanban_dependency_review_no_verdict.py
++++ b/tests/hermes_cli/test_kanban_dependency_review_no_verdict.py
+@@ -205,7 +205,7 @@ def test_lost_review_completed_by_the_worker_tool_stays_held(board, monkeypatch)
+         assert out["ok"] is True, out
+         stored = kb._json_dict(board.execute(
+             "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (parent,)).fetchone()[0])
+-        assert sorted(stored) == ["artifacts", "worker_session_id"], stored
++        assert sorted(stored) == ["artifact_receipt", "artifacts", "worker_session_id"], stored
+     kb.recompute_ready(board)
+     assert dispatch.check_respawn_guard(board, task) == "active_pr"
+ 
+diff --git a/tests/hermes_cli/test_kanban_receipt_artifacts.py b/tests/hermes_cli/test_kanban_receipt_artifacts.py
+index bfe0f5af75..91250a2002 100644
+--- a/tests/hermes_cli/test_kanban_receipt_artifacts.py
++++ b/tests/hermes_cli/test_kanban_receipt_artifacts.py
+@@ -33,33 +33,38 @@ def test_receipt_identity_survives_artifact_relocation(kanban_home):
+ 
+ 
+ @pytest.mark.parametrize("name,exists", [("report.md", False), ("report with spaces.md", False), ("report.md", True)])
+-def test_unpreservable_receipt_rolls_back_and_removes_staged_files(kanban_home, monkeypatch, name, exists):
++def test_exact_receipt_records_missing_or_attaches_beyond_incidental_budget(kanban_home, monkeypatch, name, exists):
+     monkeypatch.setattr(kmf, "METADATA_FILES_MAX_BYTES", 2)
+     with kbc.connect_closing() as conn:
+         task, ws, run = helpers._scratch_card(conn)
+         report = ws / name
+         if exists:
+-            report.write_text("exceeds cap")
+-        artifact = ws / "report"
+-        artifact.write_text("ok")
+-        before = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=?", (task,)).fetchone()[0]
+-        with pytest.raises(kb.ArtifactPreservationError, match="completion_receipt"):
+-            kb.complete_task(conn, task, summary="Report delivered", metadata={"artifacts": [str(artifact)], "completion_receipt": receipt(str(report))}, expected_run_id=run)
+-        assert kb.get_task(conn, task).status == "running"
+-        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=?", (task,)).fetchone()[0] == before
+-        assert not kb.list_attachments(conn, task)
+-        assert not list(kb.task_attachments_dir(task).glob("*"))
+-        assert ws.exists()
++            report.write_text("exceeds incidental cap")
++        value = receipt(str(report))
++        assert kb.complete_task(conn, task, summary="Report", metadata={"completion_receipt": value}, expected_run_id=run)
++        meta = kb.latest_run(conn, task).metadata
++        assert meta["completion_receipt"] == value
++        record = meta["artifact_receipt"][0]
++        assert record["path"] == str(report)
++        if exists:
++            assert Path(record["attachment_path"]).read_text() == "exceeds incidental cap"
++            assert "warning" not in record
++        else:
++            assert "missing" in record["warning"].lower()
++            assert not kb.list_attachments(conn, task)
++        assert not ws.exists()
+ 
+ 
+ def test_caller_cannot_forge_relocation_of_missing_evidence(kanban_home):
+     with kbc.connect_closing() as conn:
+         task, ws, run = helpers._scratch_card(conn)
+         ref = str(ws / "missing")
+-        with pytest.raises(kb.ArtifactPreservationError, match="completion_receipt"):
+-            kb.complete_task(conn, task, summary="Report delivered", expected_run_id=run,
+-                             metadata={"completion_receipt": receipt(ref), "attached_from_workspace": {ref: "/elsewhere/pretend"}})
+-        assert kb.get_task(conn, task).status == "running"
++        assert kb.complete_task(conn, task, summary="Report", expected_run_id=run,
++                               metadata={"completion_receipt": receipt(ref), "attached_from_workspace": {ref: "/elsewhere/pretend"}})
++        meta = kb.latest_run(conn, task).metadata
++        assert "missing" in meta["artifact_receipt"][0]["warning"].lower()
++        assert "attachment_path" not in meta["artifact_receipt"][0]
++        assert not meta.get("attached_from_workspace")
+ 
+ 
+ def test_late_run_write_failure_removes_receipt_copies(kanban_home, monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_scratch_artifact_custody.py b/tests/hermes_cli/test_kanban_scratch_artifact_custody.py
+new file mode 100644
+index 0000000000..392c396275
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scratch_artifact_custody.py
+@@ -0,0 +1,70 @@
++"""Exact scratch artifacts retain custody across cleanup, including large files."""
++if not __name__.startswith("tests."):
++    raise ImportError("Use scripts/run_tests.sh; unittest discovery bypasses test isolation")
++
++import hashlib
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_metadata_files as helpers
++from tests.hermes_cli.test_kanban_receipt_artifacts import receipt
++
++kanban_home = helpers.kanban_home
++
++
++@pytest.mark.parametrize("receipt_only", [False, True])
++def test_large_scratch_file_survives_completion_without_blob(kanban_home, monkeypatch, receipt_only):
++    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 4)
++    with kbc.connect_closing() as conn:
++        task, ws, run = helpers._scratch_card(conn)
++        report = ws / "report.bin"
++        report.write_bytes(b"proof")
++        metadata = {"completion_receipt": receipt(str(report))} if receipt_only else {"artifacts": [str(report)]}
++        assert kb.complete_task(conn, task, summary="Report", expected_run_id=run, metadata=metadata)
++        meta = kb.latest_run(conn, task).metadata
++        record = meta["artifact_receipt"][0]
++        assert record["path"] == str(report)
++        assert record["machine"]
++        assert record["sha256"] == hashlib.sha256(b"proof").hexdigest()
++        assert Path(record["retained_path"]).read_bytes() == b"proof"
++        assert not Path(record["retained_path"]).is_relative_to(ws)
++        assert not kb.list_attachments(conn, task)
++        assert not ws.exists()
++
++
++def test_missing_declared_scratch_file_completes_with_warning(kanban_home):
++    with kbc.connect_closing() as conn:
++        task, ws, run = helpers._scratch_card(conn)
++        report = ws / "missing.md"
++        assert kb.complete_task(conn, task, summary="Report", expected_run_id=run,
++                                metadata={"artifacts": [str(report)]})
++        record = kb.latest_run(conn, task).metadata["artifact_receipt"][0]
++        assert "missing" in record["warning"].lower()
++        assert record["path"] == str(report)
++        assert "sha256" not in record
++
++
++@pytest.mark.parametrize("large", [False, True])
++def test_scratch_copy_failure_does_not_destroy_existing_evidence(kanban_home, monkeypatch, large):
++    from hermes_cli import kanban_artifact_receipt as custody
++
++    if large:
++        monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 4)
++    def fail(*args, **kwargs):
++        raise OSError("controlled preservation failure")
++    monkeypatch.setattr(custody.shutil, "copyfileobj", fail)
++    if not large:
++        monkeypatch.setattr(kb, "_copy_capped", fail)
++    with kbc.connect_closing() as conn:
++        task, ws, run = helpers._scratch_card(conn)
++        report = ws / "report.bin"
++        report.write_bytes(b"proof")
++        with pytest.raises(kb.ArtifactPreservationError, match="controlled preservation"):
++            kb.complete_task(conn, task, summary="Report", expected_run_id=run,
++                             metadata={"artifacts": [str(report)]})
++        assert report.read_bytes() == b"proof"
++        assert kb.get_task(conn, task).status == "running"
++        assert not kb.list_attachments(conn, task)
++        assert not [p for p in kb.task_attachments_dir(task).rglob("*") if p.is_file()]
+-- 
+2.43.0
+

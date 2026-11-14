@@ -1,0 +1,137 @@
+From 084a98c217f207ad35860348231672771daa2048 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 00:16:18 +0000
+Subject: [PATCH] [daveey] Lifecycle guard: no backend reads for missing paths
+ on a local terminal
+
+A local backend shares the gateway's disk, so a path the scan cannot find
+there cannot run either; the backend reader only repeated the miss and spent
+the 64-read remote cap. hermes-core-wt deliver (~113 non-file path words) was
+refused with 'scan budget was exhausted (remote reads at depth 2)'.
+Remote backends keep the reader and its cap.
+
+Self-heal defect lifecycleguard-fa6b2f3e49c2.
+---
+ ...est_lifecycle_guard_local_backend_reads.py | 87 +++++++++++++++++++
+ tools/terminal_tool_guards.py                 |  8 +-
+ 2 files changed, 94 insertions(+), 1 deletion(-)
+ create mode 100644 tests/tools/test_lifecycle_guard_local_backend_reads.py
+
+diff --git a/tests/tools/test_lifecycle_guard_local_backend_reads.py b/tests/tools/test_lifecycle_guard_local_backend_reads.py
+new file mode 100644
+index 0000000000..ce043d608c
+--- /dev/null
++++ b/tests/tools/test_lifecycle_guard_local_backend_reads.py
+@@ -0,0 +1,87 @@
++"""On a local backend, a path the guard cannot find on disk is final: no backend read.
++
++Regression for self-heal defect lifecycleguard-fa6b2f3e49c2: a gateway chat on a Mac ran a large
++tool script (``hermes-core-wt deliver ...``) whose sources name ~113 path-like words that are not
++files (comment words, ``$HOME/...``, grep patterns). The terminal passed the backend reader even
++though the terminal was local, so each missing path cost a ``head -c < path`` subprocess on the
++same disk, and the 65th tripped "the scan budget was exhausted (remote reads at depth 2)".
++"""
++
++from __future__ import annotations
++
++import json
++import shlex
++from pathlib import Path
++
++import pytest
++
++from tools.terminal_tool_guards import gateway_lifecycle_block
++
++
++class _RecordingEnv:
++    """A backend whose ``execute`` records every call and finds nothing (exit 1)."""
++
++    def __init__(self, cwd: str) -> None:
++        self.cwd = cwd
++        self.calls: list[str] = []
++
++    def execute(self, command: str, **_kwargs):
++        self.calls.append(command)
++        return {"returncode": 1, "output": ""}
++
++
++def _script(tmp_path: Path, body: str) -> Path:
++    path = tmp_path / "big-tool"
++    path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
++    path.chmod(0o755)
++    return path
++
++
++def _missing_paths_script(tmp_path: Path, count: int = 100) -> Path:
++    missing = tmp_path / "no-such-dir"
++    body = "".join(f"{missing}/tool{i} --flag\n" for i in range(count))
++    return _script(tmp_path, body)
++
++
++def _block(tmp_path, monkeypatch, script: Path, env_type: str, env: _RecordingEnv):
++    monkeypatch.setattr("tools.process_registry._is_supervised_gateway_process", lambda: True)
++    return gateway_lifecycle_block(
++        command=f"{shlex.quote(str(script))} deliver host abc123",
++        env=env, env_type=env_type, cwd=str(tmp_path), workdir=str(tmp_path),
++        session_key=f"local-backend-reads-{env_type}",
++    )
++
++
++def test_local_backend_never_reads_missing_paths_through_the_backend(tmp_path, monkeypatch):
++    env = _RecordingEnv(str(tmp_path))
++    script = _missing_paths_script(tmp_path)
++
++    blocked = _block(tmp_path, monkeypatch, script, "local", env)
++
++    assert blocked is None, json.loads(blocked)["error"]
++    assert env.calls == []
++
++
++@pytest.mark.parametrize("env_type", ["docker", "ssh"])
++def test_remote_backend_keeps_the_remote_read_cap(tmp_path, monkeypatch, env_type):
++    env = _RecordingEnv(str(tmp_path))
++    script = _missing_paths_script(tmp_path)
++
++    blocked = _block(tmp_path, monkeypatch, script, env_type, env)
++
++    assert blocked is not None
++    assert "remote reads" in json.loads(blocked)["error"]
++    assert env.calls  # the backend was consulted for paths missing on this host
++
++
++def test_local_script_that_restarts_the_gateway_is_still_blocked(tmp_path, monkeypatch):
++    env = _RecordingEnv(str(tmp_path))
++    missing = tmp_path / "no-such-dir"
++    body = "".join(f"{missing}/tool{i}\n" for i in range(100)) + "hermes gateway restart\n"
++    script = _script(tmp_path, body)
++
++    blocked = _block(tmp_path, monkeypatch, script, "local", env)
++
++    assert blocked is not None
++    assert "hermes gateway restart" in json.loads(blocked)["error"]
++    assert env.calls == []
+diff --git a/tools/terminal_tool_guards.py b/tools/terminal_tool_guards.py
+index 5fa6a38cd3..eca447efa1 100644
+--- a/tools/terminal_tool_guards.py
++++ b/tools/terminal_tool_guards.py
+@@ -671,10 +671,16 @@ def gateway_lifecycle_block(
+         mounted_host=getattr(env, "host_cwd", None),
+         env=env,
+     )
++    # A local backend shares this host's disk: a path the scan cannot find here cannot run there
++    # either, so a backend read would repeat the miss and spend the remote-read cap (a large tool
++    # script naming ~100 non-file words once failed closed on "remote reads").
++    read_remote_script = None if env_type == "local" else (
++        lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES)
++    )
+     unsafe, refusal = scan_gateway_lifecycle(
+         command,
+         cwd=guard_cwd,
+-        read_remote_script=lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES),
++        read_remote_script=read_remote_script,
+         session_aliases=_session_aliases_for_guard(env),
+     )
+     if unsafe and refusal:
+-- 
+2.43.0
+

@@ -1,0 +1,154 @@
+From 338e04f645bbb4586b96cc9feebb33d670b74d30 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 03:17:12 +0000
+Subject: [PATCH] [daveey] Model printf control-character quoting before
+ precision
+
+Bash uses ANSI-C quoting for ASCII controls in %q/%Q. Preserve the representation before q precision, and add a conservative shlex-compatible output variant for completed emitted quotes; retain all existing fallback variants.
+
+Proof: Bash 5.2 differential RED 271 failures, GREEN 378 new tests; six mutants killed; focused consumer/cross-cutting suites 2170 passed; full shape corpus 28292 cases, violations=0 false_refusals=0. scripts/check passes. Independent exact-head review and required CI still needed before landing.
+---
+ cron/lifecycle_guard_printf.py                | 36 ++++++++++-
+ .../cron/test_lifecycle_guard_printf_quote.py | 61 +++++++++++++++++++
+ 2 files changed, 94 insertions(+), 3 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_printf_quote.py
+
+diff --git a/cron/lifecycle_guard_printf.py b/cron/lifecycle_guard_printf.py
+index c50bc893fb..964defa616 100644
+--- a/cron/lifecycle_guard_printf.py
++++ b/cron/lifecycle_guard_printf.py
+@@ -25,6 +25,7 @@ which bash drops again when reading script input.
+ """
+ 
+ import re
++import shlex
+ import time
+ from typing import Callable, Iterator, Optional, cast
+ 
+@@ -117,9 +118,22 @@ def _pad(text: str, flags: str, width: int) -> str:
+     return text.ljust(width) if "-" in flags else text.rjust(width)
+ 
+ 
++_ANSI_QUOTE_ESCAPES = {
++    "\a": r"\a", "\b": r"\b", "\x1b": r"\E", "\f": r"\f", "\n": r"\n",
++    "\r": r"\r", "\t": r"\t", "\v": r"\v", "\\": r"\\", "'": r"\'",
++}
++
++
+ def _quoted(text: str) -> str:
+-    """``%q``: bash backslash-quotes each special character, so the shell reading it gets *text*
+-    back."""
++    """Bash uses ANSI-C quoting for ASCII controls, backslashes otherwise.
++
++    Equivalent shell words are not interchangeable here: ``%q`` precision slices
++    the quoted representation, whereas ``%Q`` slices the argument first.
++    """
++    if any(ord(c) < 32 or ord(c) == 127 for c in text):
++        pieces = (_ANSI_QUOTE_ESCAPES.get(c, f"\\{ord(c):03o}")
++                  if ord(c) < 32 or ord(c) == 127 or c in "\\'" else c for c in text)
++        return "$'" + "".join(pieces) + "'"
+     return "".join(c if _SAFE_CHAR_RE.match(c) else "\\" + c for c in text) or "''"
+ 
+ 
+@@ -240,6 +254,20 @@ _PRINTED_ESCAPE_RE = re.compile(r"\\[ntrvf]")
+ _ECHO_OPTION_RE = re.compile(r"-[neE]+")
+ 
+ 
++_ANSI_QUOTED_RE = re.compile(r"\$'((?:\\.|[^'\\])*)'", re.DOTALL)
++
++
++def _shell_quote_variant(text: str) -> str:
++    """Also walk printf's complete ANSI-C quotes in a form shlex understands.
++
++    A precision-truncated quote may be closed by later format text. Keep the
++    original output too: this deliberately conservative variant does not infer
++    surrounding shell quote context. Only printf's emitted escape subset is decoded.
++    """
++    return _ANSI_QUOTED_RE.sub(
++        lambda match: shlex.quote(decode_c_escapes(match[1], echo_style=False)), text)
++
++
+ def printed_argument_lines(name: str, arguments: list[str]) -> Iterator[str]:
+     """The line(s) an ``echo``/``printf`` with *arguments* may print: as written, without
+     ``echo``'s leading option words, and (fail closed) without every leading ``-word``."""
+@@ -268,7 +296,9 @@ def printed_argument_lines(name: str, arguments: list[str]) -> Iterator[str]:
+         models = FLOAT_MODELS if _FLOAT_CONVERSION_RE.search(arguments[start]) else (X87,)
+         for model in models:
+             try:
+-                yield printf_output(arguments[start], arguments[start + 1 :], model)
++                output = printf_output(arguments[start], arguments[start + 1 :], model)
++                yield output
++                yield _shell_quote_variant(output)
+             except (ValueError, ArithmeticError):
+                 # Fail closed: a model bug must not abort the guard's walk (its caller falls
+                 # back to the direct scan); the variants around this one are still walked.
+diff --git a/tests/cron/test_lifecycle_guard_printf_quote.py b/tests/cron/test_lifecycle_guard_printf_quote.py
+new file mode 100644
+index 0000000000..1086dd8d03
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_printf_quote.py
+@@ -0,0 +1,61 @@
++"""Bash quoting is representation-sensitive when printf applies precision."""
++
++import shlex
++import shutil
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from cron.lifecycle_guard_printf import printf_output, printed_argument_lines
++from tests.cron.test_lifecycle_guard_output_sink import test_printf_output_matches_real_bash as _compare
++
++
++@pytest.mark.parametrize("argument", [
++    *[chr(n) for n in range(1, 32)], "\x7f", "a\tb", "\n'\\\"?", "plain", "", "a b",
++])
++@pytest.mark.parametrize("format_text", ["%q", "%.0q", "%.3q", "%12.5q", "%-12.5q",
++                                         "%Q", "%.0Q", "%.1Q", "%.3Q", "%12.2Q"])
++def test_control_quote_matches_bash(argument, format_text):
++    _compare(format_text, [argument])
++
++
++def test_quoted_control_model_keeps_fallbacks():
++    lines = set(printed_argument_lines("printf", ["%.3q%s", "a\tb", "suffix"]))
++    assert printf_output("%.3q%s", ["a\tb", "suffix"]) in lines
++    assert "a\tbsuffix" in lines
++    assert "a\tb suffix" in lines
++
++
++@pytest.mark.parametrize("sink", ["{producer} | bash", 'eval "$({producer})"',
++                                  "bash <({producer})"])
++def test_control_quote_precision_under_shell_sink(tmp_path, sink):
++    bash = shutil.which("bash")
++    if not bash:
++        pytest.skip("no bash")
++    script = tmp_path / "payload.sh"
++    script.write_text("printf marker", encoding="utf-8")
++    # %.3q keeps `$'b`, not `b` plus a backslash-quoted literal tab.
++    producer = "printf " + shlex.join([r"%.3qash\047 %s", "b\t", str(script)])
++    command = sink.format(producer=producer)
++    real = subprocess.run([bash], input=command.encode(), capture_output=True,
++                          check=True, timeout=10, env={"LC_ALL": "C"})
++    assert real.stdout == b"marker"
++    # The exact same executed path must be walked, not merely mentioned.
++    script.write_text("# padding\n" * 130000, encoding="utf-8")
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe and refusal and "scan cap" in refusal
++
++
++@pytest.mark.parametrize(("quoted", "decoded"), [
++    (r"$'a\tb'", "a\tb"), (r"$'a\001b'", "a\x01b"),
++    (r"$'a\'b\\c'", "a'b\\c"), ("$'abc", "$abc"),
++])
++def test_quote_variant_preserves_word_contents(quoted, decoded):
++    from cron.lifecycle_guard_printf import _shell_quote_variant
++
++    if quoted.endswith("'"):
++        assert shlex.split(_shell_quote_variant(quoted)) == [decoded]
++    else:
++        assert _shell_quote_variant(quoted) == quoted
++
+-- 
+2.43.0
+

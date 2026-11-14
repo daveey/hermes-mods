@@ -1,0 +1,414 @@
+From 6f8c658604744d7f01b36015e42e519a2d4107cd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 04:10:54 +0000
+Subject: [PATCH] [daveey] Preserve remote notice custody through completed
+ resume receipts
+
+Remote notice owners released exact events after a resumed automation completed when the initial keyed transcript row was absent. Synthetic resume events correctly strip control metadata, so transcript-only reconciliation lost durable custody despite canonical successful settlement.
+
+Accept exact event keys from canonical automation admissions joined to persisted completed results, binding request, principal, owner and display category. Share proof with owner and collector dedup; never infer delivery from failure, missing results or arbitrary message metadata.
+
+Proof: real ingress five-card batch with checkpoint, replacement epoch, compaction and owner restart; failure/interruption/unpersisted/missing controls and distinct later events. Consumer suite: 44 files / 636 passing. Receipt guards: 15 targeted mutants killed (producer guard strengthened after initial survivor). Full origin/main lint initially found unrelated stale-base BLE001; own diff lint passed. No live production mutation or initial-row omission cause claimed.
+---
+ .../test_remote_notice_resume_custody.py      | 152 ++++++++++++++++++
+ .../test_kanban_remote_receipt_lineage.py     |  43 +++++
+ .../test_kanban_remote_receipts.py            | 100 ++++++++++++
+ tui_gateway/kanban_remote_notices.py          |   7 +-
+ tui_gateway/kanban_remote_receipts.py         |  49 ++++++
+ 5 files changed, 349 insertions(+), 2 deletions(-)
+ create mode 100644 tests/gateway/test_remote_notice_resume_custody.py
+ create mode 100644 tests/tui_gateway/test_kanban_remote_receipt_lineage.py
+ create mode 100644 tests/tui_gateway/test_kanban_remote_receipts.py
+ create mode 100644 tui_gateway/kanban_remote_receipts.py
+
+diff --git a/tests/gateway/test_remote_notice_resume_custody.py b/tests/gateway/test_remote_notice_resume_custody.py
+new file mode 100644
+index 0000000000..55c219991b
+--- /dev/null
++++ b/tests/gateway/test_remote_notice_resume_custody.py
+@@ -0,0 +1,152 @@
++"""A completed resumed batch owns its exact remote events without an original keyed row."""
++import asyncio
++import json
++
++import pytest
++
++from gateway import kanban_remote_owner as owner, session_update_pause
++from gateway.config import GatewayConfig
++from gateway.run import GatewayRunner
++from gateway.session_authority import initialize_session_authority
++from gateway.session_automation import admit_route_wake
++from gateway.session_contract import SessionActor
++from gateway.session_local import create_local_session
++from gateway.session_results import admission_result, execution_result
++from hermes_state import SessionDB
++from hermes_state_runtime import get_session_admission
++from tests.gateway import test_kanban_remote_owner_delivery as remote
++from tests.waiting import async_wait_until
++from tui_gateway import kanban_remote_notices as notices
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('compact', [False, True])
++@pytest.mark.parametrize('restart', [False, True])
++@pytest.mark.parametrize('result_mode', ['completed', 'failed', 'interrupted', 'unpersisted', 'missing'])
++async def test_completed_resumed_batch_not_reoffered(tmp_path, monkeypatch, compact, restart, result_mode):
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    hub = tmp_path / 'hub'
++    hub.mkdir()
++    monkeypatch.setenv('HERMES_HUB_STATE', str(hub))
++    notices._reset_for_tests()
++    owner._reset_for_tests()
++    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / 'sessions'))
++    db = SessionDB(tmp_path / 'state.db')
++    runner.session_store._db = runner._session_db = db
++    authority = await initialize_session_authority(runner, profile_id='default', instance_id='custody', db=db)
++    actor = SessionActor('test-owner', 'default', frozenset(
++        {'session:create', 'session:submit', 'session:read'}), 'viewer')
++    ref = create_local_session(authority, actor, dict(request_id='local', source='tui', model='fixture',
++                                                     cwd=str(tmp_path), toolsets=[]))
++    await authority.attach(actor, ref, history=False)
++    live = authority.sessions[ref.session_id]
++    adapter = runner._adapter_for_source(live.source)
++    if live.task:
++        await asyncio.wait_for(live.task, 10)
++    physical = ref.session_id
++    cards = [remote._done(f't_{i:016x}', 100 + i, chat=ref.session_id) for i in range(4)]
++    remote._publish(hub, cards)
++    claims = notices.collect(ref.session_id, 'default', per_link=True)
++    assert len(claims) == 4
++    keys = {claim['event_key'] for claim in claims}
++    held, seen = [True], []
++    monkeypatch.setattr(session_update_pause, 'update_held', lambda authority: held[0])
++
++    async def turn(event, source, quick_key, run_generation):
++        seen.append(event)
++        if len(seen) == 1:
++            assert set(event.metadata['kanban_event_keys']) == keys
++            # Deliberately no original keyed row: the verified incident's missing evidence.
++            db.append_messages_batch(physical, [
++                {'role': 'user', 'content': event.text},
++                {'role': 'assistant', 'content': '', 'tool_calls': [
++                    {'id': 'k', 'type': 'function', 'function': {'name': 'example', 'arguments': '{}'}}]},
++                {'role': 'tool', 'content': 'done', 'tool_call_id': 'k', 'tool_name': 'example'}])
++            execution_result.get()['result'] = {'paused_for_update': True}
++            return None
++        assert event.internal is False and not event.allow_gateway_control
++        assert 'kanban_event_keys' not in event.metadata
++        db.append_message(physical, 'user', event.text, display_kind='auto_continue')
++        db.append_message(physical, 'assistant', 'all five handled')
++        if compact:
++            db._execute_write(lambda conn: conn.execute(
++                'UPDATE messages SET active=0, compacted=1 WHERE session_id=?', (physical,)))
++            db.append_message(physical, 'assistant', 'compacted summary')
++        result = {'final_response': 'all five handled', 'messages': [], 'completed': True,
++                  'agent_persisted': result_mode != 'unpersisted', 'compacted_in_place': compact}
++        if result_mode in ('failed', 'interrupted'):
++            result[result_mode] = True
++        if result_mode != 'missing':
++            execution_result.get()['result'] = result
++        return 'all five handled'
++
++    monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
++    try:
++        # Hold scheduling, not admission: all five real ingress calls fold at the FIFO tail.
++        schedule = authority._schedule_admitted
++        with monkeypatch.context() as gated:
++            gated.setattr(authority, '_schedule', lambda *args: None)
++            assert await admit_route_wake(runner, adapter, live.source, 'local card', 'kanban-wake',
++                {'kanban_cards': [
++                    {'task_id': 't_0000000000000005', 'board': 'default', 'kinds': [], 'text': 'local card'}]})
++            for claim in claims:
++                assert await owner._admit(runner, adapter, live, frozenset({ref.session_id, physical}), physical, claim)
++        schedule(ref)
++        await async_wait_until(lambda: bool(authority.update_parked), timeout=10)
++        parked = authority.update_parked[ref.session_id]
++        row = get_session_admission(db, admission_id=parked['admission_id'])
++        assert len(row['payload']['local_automation_v1']['kanban_cards']) == 5
++        if restart:
++            authority.retiring = True
++            await asyncio.wait_for(authority.sessions[ref.session_id].task, 10)
++            old_epoch = authority.epoch
++            runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / 'sessions'))
++            runner.session_store._db = runner._session_db = db
++            monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
++            authority = await initialize_session_authority(
++                runner, profile_id='default', instance_id='replacement', db=db)
++            assert authority.epoch > old_epoch
++            await authority.attach(actor, ref, history=False)
++        held[0] = False
++        authority._schedule(ref)
++        await async_wait_until(lambda: len(seen) == 2, timeout=10)
++        await asyncio.wait_for(authority.sessions[ref.session_id].task, 10)
++        row = get_session_admission(db, admission_id=parked['admission_id'])
++        expected = {'missing': 'failed', 'failed': 'failed', 'interrupted': 'interrupted'}.get(
++            result_mode, 'completed')
++        assert (row['status'], row['outcome']) == ('terminal', expected)
++        assert admission_result(db, row['admission_id']) is not None
++        assert not db.kanban_notice_keys_delivered(ref.session_id, keys)
++        if restart:
++            remote._restart(remote._dead_pid())
++        else:
++            owner._reconcile(db)
++        # A new remote owner has no in-memory custody; use the production collect callback.
++        owner._reset_for_tests()
++        def has(key, tid):
++            return notices.notice_in_transcript(db, physical, key, tid)
++        offered = notices.collect(ref.session_id, 'default', per_link=True, transcript_has=has)
++        if result_mode != 'completed':
++            assert {claim['event_key'] for claim in offered} == keys
++            assert all(not has(key, '') for key in keys)
++            return
++        assert offered == []
++        assert notices.collect(ref.session_id, 'default', per_link=True) == []
++        assert all(has(key, '') for key in keys)
++        # A new event for an already handled task must still be offered.
++        later = remote._done('t_0000000000000000', 999, chat=ref.session_id)
++        later['completed_at'] += 10  # a distinct terminal transition, not the ledger's same-second state
++        later['completion_notice']['created_at'] += 10
++        remote._publish(hub, [later])
++        offered = notices.collect(ref.session_id, 'default', per_link=True, transcript_has=has)
++        assert [claim['event_key'] for claim in offered] == [remote._key('t_0000000000000000', 999)]
++    finally:
++        held[0] = False
++        tasks = [live.task for live in authority.sessions.values() if live.task]
++        for task in tasks:
++            if not task.done():
++                task.cancel()
++        await asyncio.gather(*tasks, return_exceptions=True)
++        db.close()
++        notices._reset_for_tests()
++        owner._reset_for_tests()
+diff --git a/tests/tui_gateway/test_kanban_remote_receipt_lineage.py b/tests/tui_gateway/test_kanban_remote_receipt_lineage.py
+new file mode 100644
+index 0000000000..8790ff3ee9
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_remote_receipt_lineage.py
+@@ -0,0 +1,43 @@
++"""Remote receipt custody follows the admitted physical target, not arbitrary ancestry."""
++import json
++
++import pytest
++
++from gateway.session_results import finish_result
++from hermes_state_runtime import admit_session_input, claim_session_input
++from tests.gateway.test_resume_latest_local_cli import _owner, _call, _reset
++from tui_gateway.kanban_remote_receipts import completed_notice
++
++KEY = 'remote:worker:default/default/t_0000000000000001:123'
++
++
++@pytest.mark.asyncio
++async def test_physical_reset_target_keeps_exact_admission_custody(tmp_path, monkeypatch):
++    store, authority, connection = _owner(tmp_path / 'home', monkeypatch)
++    try:
++        created = await _call(connection, 'session.create', request_id='chat', source='tui',
++                              cwd=str(tmp_path), toolsets=[], model='m')
++        sid = created['session_id']
++        physical = _reset(authority, store, sid, 'reset-child')
++        db = authority.db
++        route = authority.sessions[sid].route
++        identity = json.dumps(['kanban-wake', route, 'event'])
++        payload = {'text': 'card', 'local_automation_v1': {'identity': identity, 'owner': sid,
++            'route': route, 'target': physical, 'display_kind': 'kanban_notice', 'kanban_event_keys': [KEY]}}
++        admit_session_input(db, epoch=authority.epoch, principal_id='automation:' + route,
++                            session_id=sid, request_id=identity, payload=payload)
++        row = claim_session_input(db, epoch=authority.epoch, session_id=sid)
++        finish_result(db, epoch=authority.epoch, row=row, response='done', outcome='completed', result={
++            'result': {'completed': True, 'agent_persisted': True, 'messages': []}})
++        assert completed_notice(db, physical, KEY)
++        # A subsequent reset is not in this admission's physical compression lineage.
++        from hermes_state_local import local_receipt
++        from hermes_state_local_lineage import reset_local_target
++        entry = dict(local_receipt(db, sid)['entry'], session_id='next-reset')
++        reset_local_target(db, epoch=authority.epoch, parent_session_id=physical, entry=entry)
++        assert not completed_notice(db, 'next-reset', KEY)
++        db.create_session('branch', 'desktop', parent_session_id=physical)
++        assert not completed_notice(db, 'branch', KEY)
++    finally:
++        await connection.close()
++        store.close_all_db_handles()
+diff --git a/tests/tui_gateway/test_kanban_remote_receipts.py b/tests/tui_gateway/test_kanban_remote_receipts.py
+new file mode 100644
+index 0000000000..ab797a1e75
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_remote_receipts.py
+@@ -0,0 +1,100 @@
++"""Successful receipts are exact-event evidence, not generic task acknowledgement."""
++import json
++
++import pytest
++
++from gateway.session_results import finish_result
++from hermes_state import SessionDB
++from hermes_state_runtime import admit_session_input, begin_runtime_epoch, claim_session_input
++from hermes_state_terminal import RESULT_PREFIX
++from tui_gateway.kanban_remote_receipts import completed_notice
++
++KEY = 'remote:worker:default/default/t_0000000000000001:123'
++
++
++@pytest.fixture
++def receipt(tmp_path):
++    with SessionDB(tmp_path / 'state.db') as db:
++        db.create_session('chat', 'desktop')
++        db.create_session('foreign', 'desktop')
++        epoch = begin_runtime_epoch(db, instance_id='owner')
++        identity = json.dumps(['kanban-wake', 'route', 'event'])
++        payload = {'text': 'one card', 'local_automation_v1': {
++            'identity': identity, 'owner': 'chat', 'route': 'route', 'target': 'chat',
++            'display_kind': 'kanban_notice', 'kanban_event_keys': [KEY]}}
++        admit_session_input(db, epoch=epoch, principal_id='automation:route', session_id='chat',
++                            request_id=identity, payload=payload)
++        row = claim_session_input(db, epoch=epoch, session_id='chat')
++        finish_result(db, epoch=epoch, row=row, response='handled', outcome='completed', result={
++            'result': {'completed': True, 'agent_persisted': True, 'final_response': 'handled', 'messages': []}})
++        yield db, row, payload
++
++
++def test_exact_event_and_conversation(receipt):
++    db, _, _ = receipt
++    assert completed_notice(db, 'chat', KEY)
++    assert not completed_notice(db, 'foreign', KEY)
++    assert not completed_notice(db, 'chat', KEY.replace(':123', ':124'))
++    assert not completed_notice(db, 'chat', '')
++    assert not completed_notice(object(), 'chat', KEY)
++
++
++@pytest.mark.parametrize('field,value', [
++    ('status', 'queued'), ('status', 'started'), ('status', 'unknown'),
++    ('outcome', 'cancelled'), ('outcome', 'failed'), ('outcome', 'interrupted'), ('outcome', 'rejected'),
++    ('principal_id', 'human'), ('request_id', json.dumps(['plugin', 'route', 'event'])),
++    ('request_id', '{}'), ('request_id', 'not-json'), ('request_id', json.dumps(['kanban-wake', 'other', 'event'])),
++])
++def test_unproven_admission_never_acknowledges(receipt, field, value):
++    db, row, _ = receipt
++    db._execute_write(lambda conn: conn.execute(
++        f'UPDATE session_admissions SET {field}=? WHERE admission_id=?', (value, row['admission_id'])))
++    assert not completed_notice(db, 'chat', KEY)
++
++
++@pytest.mark.parametrize('field,value', [('route', 'foreign'), ('owner', 'foreign'),
++                                         ('identity', 'different'), ('display_kind', 'user')])
++def test_envelope_binding_required(receipt, field, value):
++    db, row, payload = receipt
++    payload['local_automation_v1'][field] = value
++    db._execute_write(lambda conn: conn.execute(
++        'UPDATE session_admissions SET payload_json=? WHERE admission_id=?',
++        (json.dumps(payload), row['admission_id'])))
++    assert not completed_notice(db, 'chat', KEY)
++
++
++@pytest.mark.parametrize('result', [None, [], {'result': []}, {'result': {}},
++    *({'result': {'completed': True, 'agent_persisted': True, field: value}} for field, value in [
++        ('completed', False), ('completed', 1), ('agent_persisted', False), ('agent_persisted', 1),
++        ('failed', True), ('interrupted', True), ('error', 'failure'), ('paused_for_update', True)])])
++def test_result_proof_required(receipt, result):
++    db, row, _ = receipt
++    db._execute_write(lambda conn: conn.execute(
++        'UPDATE state_meta SET value=? WHERE key=?', (json.dumps(result), RESULT_PREFIX + row['admission_id'])))
++    assert not completed_notice(db, 'chat', KEY)
++
++
++def test_missing_receipt_is_not_delivery(receipt):
++    db, row, _ = receipt
++    db._execute_write(lambda conn: conn.execute('DELETE FROM state_meta WHERE key=?',
++                                               (RESULT_PREFIX + row['admission_id'],)))
++    assert not completed_notice(db, 'chat', KEY)
++
++
++def test_matching_non_kanban_producer_is_not_delivery(receipt):
++    db, row, payload = receipt
++    identity = json.dumps(['plugin', 'route', 'event'])
++    payload['local_automation_v1']['identity'] = identity
++    db._execute_write(lambda conn: conn.execute(
++        'UPDATE session_admissions SET request_id=?,payload_json=? WHERE admission_id=?',
++        (identity, json.dumps(payload), row['admission_id'])))
++    assert not completed_notice(db, 'chat', KEY)
++
++
++def test_message_metadata_cannot_supply_receipt(receipt):
++    db, row, _ = receipt
++    db._execute_write(lambda conn: conn.execute('DELETE FROM state_meta WHERE key=?',
++                                               (RESULT_PREFIX + row['admission_id'],)))
++    db.append_message('chat', 'user', json.dumps({'local_automation_v1': {'kanban_event_keys': [KEY]},
++                                                 'completed': True, 'agent_persisted': True}))
++    assert not completed_notice(db, 'chat', KEY)
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index d7ac28dfa8..accf5134ec 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -413,10 +413,13 @@ def _live_woken_session(*keys: str) -> Optional[dict]:
+ 
+ 
+ def notice_in_transcript(db, session_id: str, notice_key: str, task_id: str) -> bool:
+-    """True when this chat's compression lineage already has the notice (keyed row, or a legacy
+-    ``Kanban <id>`` line). Reuses ``kanban_notice_keys_delivered`` — the local at-least-once dedup."""
++    """Delivery evidence in this lineage: a keyed row, completed persisted automation receipt,
++    or legacy ``Kanban <id>`` line. The historical name is retained for collector callbacks."""
+     if db is None:
+         return False
++    from tui_gateway.kanban_remote_receipts import completed_notice
++    if completed_notice(db, session_id, notice_key):
++        return True
+     if notice_key and hasattr(db, "kanban_notice_keys_delivered"):
+         if notice_key in db.kanban_notice_keys_delivered(session_id, [notice_key]):
+             return True
+diff --git a/tui_gateway/kanban_remote_receipts.py b/tui_gateway/kanban_remote_receipts.py
+new file mode 100644
+index 0000000000..7a84837e6c
+--- /dev/null
++++ b/tui_gateway/kanban_remote_receipts.py
+@@ -0,0 +1,49 @@
++"""Exact remote notice custody from canonical successful automation settlement.
++
++Update resume deliberately strips message control metadata. A completed admission and its
++atomically committed execution result remain evidence even without an original keyed row.
++This reads the private admitted envelope, never arbitrary message/display metadata.
++"""
++import json
++import sqlite3
++
++from hermes_state_terminal import RESULT_PREFIX
++from tui_gateway.kanban_remote_fifo import lineage_ids
++
++
++def completed_notice(db, session_id, key):
++    """A persisted successful Kanban wake in this lineage consumed this exact event."""
++    if not key or not hasattr(db, '_read_ctx'):
++        return False
++    ids = sorted(lineage_ids(db, session_id))
++    marks = ','.join('?' for _ in ids)
++    try:
++        with db._read_ctx() as conn:
++            rows = conn.execute(
++                'SELECT a.principal_id,a.request_id,a.target_session_id,a.payload_json,s.value '
++                'FROM session_admissions a JOIN state_meta s ON s.key=? || a.admission_id '
++                f'WHERE (a.target_session_id IN ({marks}) OR '
++                f"json_extract(a.payload_json, '$.local_automation_v1.target') IN ({marks})) "
++                "AND a.status='terminal' AND a.outcome='completed' "
++                "AND EXISTS (SELECT 1 FROM json_each(a.payload_json, "
++                "'$.local_automation_v1.kanban_event_keys') WHERE value=?)",
++                (RESULT_PREFIX, *ids, *ids, key))
++            return any(_successful_wake(row) for row in rows)
++    except (sqlite3.Error, ValueError, TypeError):
++        # Missing/unreadable proof is not permission to acknowledge an undelivered event.
++        return False
++
++
++def _successful_wake(row):
++    principal, request, target, payload_json, result_json = row
++    descriptor = json.loads(payload_json)['local_automation_v1']
++    identity = json.loads(request)
++    stored = json.loads(result_json)
++    result = stored.get('result') if isinstance(stored, dict) else None
++    return (isinstance(identity, list) and identity[:1] == ['kanban-wake']
++            and principal == 'automation:' + str(descriptor.get('route'))
++            and descriptor.get('identity') == request and descriptor.get('owner') == target
++            and descriptor.get('display_kind') == 'kanban_notice'
++            and isinstance(result, dict) and result.get('completed') is True
++            and result.get('agent_persisted') is True
++            and not any(result.get(flag) for flag in ('failed', 'error', 'interrupted', 'paused_for_update')))
+-- 
+2.43.0
+

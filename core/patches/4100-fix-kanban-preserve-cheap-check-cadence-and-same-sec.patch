@@ -1,0 +1,538 @@
+From c51bfbc40bbc1447857958add9c90f3a5cdd48be Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 02:49:17 +0000
+Subject: [PATCH] fix(kanban): preserve cheap-check cadence and same-second
+ recovery ordering [daveey]
+
+---
+ hermes_cli/kanban_shared_blocker_checks.py    |  74 ++++++++-
+ hermes_cli/kanban_shared_blocker_fence.py     |  23 ++-
+ ...t_kanban_shared_blocker_check_transport.py | 145 ++++++++++++++++++
+ .../test_kanban_shared_blocker_races.py       | 129 ++++++++++++++++
+ ...test_kanban_shared_blocker_result_order.py |  34 ++++
+ 5 files changed, 397 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_shared_blocker_check_transport.py
+ create mode 100644 tests/hermes_cli/test_kanban_shared_blocker_races.py
+ create mode 100644 tests/hermes_cli/test_kanban_shared_blocker_result_order.py
+
+diff --git a/hermes_cli/kanban_shared_blocker_checks.py b/hermes_cli/kanban_shared_blocker_checks.py
+index e817088c6b..e5701e5080 100644
+--- a/hermes_cli/kanban_shared_blocker_checks.py
++++ b/hermes_cli/kanban_shared_blocker_checks.py
+@@ -6,6 +6,7 @@ at the end of blocker_states. No subprocess runs under a SQLite write lock.
+ from __future__ import annotations
+ 
+ import hashlib
++import json
+ import logging
+ import shlex
+ import subprocess
+@@ -13,6 +14,8 @@ import time
+ 
+ logger = logging.getLogger(__name__)
+ CHECK_EVENT = "shared_blocker_check"
++# Raced/discarded runs: cadence only, never evidence (not read by apply_check_clears or the fence).
++ATTEMPT_EVENT = "shared_blocker_check_attempt"
+ CHECK_EVERY_SECONDS = 120
+ CHECK_TIMEOUT_SECONDS = 10
+ BROKEN_AFTER = 3
+@@ -32,8 +35,11 @@ def registered_checks(cfg=None) -> dict[str, str]:
+         except ConfigBackendUnavailable:
+             logger.warning("shared blocker checks: config backend unavailable; skipping checks")
+             return {}
+-    commands = {"github-rest-quota": f"{shlex.quote(str(get_hermes_home() / 'bin' / 'github_quota.py'))} --reserve-ok"}
+-    overrides = (cfg.get("kanban") or {}).get("shared_blocker_checks") or {}
++    section = cfg.get("kanban") or {}
++    if not isinstance(section, dict):
++        return {}
++    commands = {"github-rest-quota": f"python3 {shlex.quote(str(get_hermes_home() / 'bin' / 'github_quota.py'))} --reserve-ok"}
++    overrides = section.get("shared_blocker_checks") or {}
+     if isinstance(overrides, dict):
+         for raw, command in overrides.items():
+             bid = normalize_blocker_id(raw, cfg=cfg)
+@@ -85,16 +91,57 @@ def _checked(payload) -> int:
+         return 0
+ 
+ 
++def run_identity(conn, run_id) -> str:
++    """Portable identity of a run: its synced UID, else task/start."""
++    from hermes_cli import kanban_db as kb
++
++    columns = {row[1] for row in conn.execute('PRAGMA table_info(task_runs)')}
++    identity = 'uid' if 'uid' in columns else 'NULL AS uid'
++    row = conn.execute(f'SELECT {identity}, task_id, started_at FROM task_runs WHERE id=?', (run_id,)).fetchone()
++    if row is None:
++        return ''
++    return str(row['uid'] or f"{row['task_id']}|{kb._to_epoch(row['started_at']) or 0}")
++
++
++def _active_run_ids(conn) -> list[str]:
++    """Identities of runs open right now."""
++    return sorted(filter(None, (run_identity(conn, r[0]) for r in
++                                conn.execute('SELECT id FROM task_runs WHERE ended_at IS NULL'))))
++
++
++def _latest_attempts(conn, now=None) -> dict[str, dict]:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_shared_blockers import normalize_blocker_id
++
++    results = {}
++    for row in conn.execute("SELECT payload FROM task_events WHERE kind=? AND created_at >= ? ORDER BY id",
++                            (ATTEMPT_EVENT, _lookback(now))):
++        payload = kb._json_dict(row["payload"])
++        bid = normalize_blocker_id(payload.get("blocker_id"))
++        if bid and (bid not in results or _checked(payload) >= _checked(results[bid])):
++            results[bid] = payload
++    return results
++
++
++def _result_key(payload, token) -> tuple:
++    # Equal-second conflicting observations for one cohort fail closed. A newer
++    # cohort supersedes its predecessor even when the wall reopened that second.
++    return (_checked(payload), payload.get("assertion_id") == token, payload.get("rc") != 0,
++            json.dumps(payload, sort_keys=True, ensure_ascii=True))
++
++
+ def _latest_results(conn, now=None) -> dict[str, dict]:
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_shared_blockers import normalize_blocker_id
+ 
+     results = {}
++    tokens = _assertion_tokens(conn, now)
+     for row in conn.execute("SELECT payload FROM task_events WHERE kind=? AND created_at >= ? ORDER BY id",
+                             (CHECK_EVENT, _lookback(now))):
+         payload = kb._json_dict(row["payload"])
+         bid = normalize_blocker_id(payload.get("blocker_id"))
+-        if bid and (bid not in results or _checked(payload) >= _checked(results[bid])):
++        token = tokens.get(bid)
++        if bid and (bid not in results or _result_key(payload, token) > _result_key(results[bid], token)):
+             results[bid] = payload
+     return results
+ 
+@@ -158,6 +205,7 @@ def run_due_checks(conn, *, cfg=None, now=None, due_out=None) -> list[str]:
+     apply_check_clears(conn, states, ts)
+     foreign = foreign_ids(conn)
+     tokens, previous = _assertion_tokens(conn, ts), _latest_results(conn, ts)
++    attempts = _latest_attempts(conn, ts)
+     cleared = []
+     for bid, st in states.items():
+         command = commands.get(bid)
+@@ -177,7 +225,13 @@ def run_due_checks(conn, *, cfg=None, now=None, due_out=None) -> list[str]:
+         fails = int(last.get("fails", 0))
+         if fails >= BROKEN_AFTER:
+             continue
+-        due = int(last.get("started_at", last.get("checked_at", ts - CHECK_EVERY_SECONDS))) + CHECK_EVERY_SECONDS
++        started = int(last.get("started_at", last.get("checked_at", ts - CHECK_EVERY_SECONDS)))
++        attempt = attempts.get(bid, {})
++        # A raced (discarded) run keeps cadence without counting as success or failure.
++        if (attempt.get("command") == command and _checked(attempt) >= st.cleared_at
++                and int(attempt.get("started_at") or 0) > started):
++            started = int(attempt["started_at"])
++        due = started + CHECK_EVERY_SECONDS
+         if due > ts:
+             if due_out is not None:
+                 due_out.append(due)
+@@ -191,8 +245,18 @@ def run_due_checks(conn, *, cfg=None, now=None, due_out=None) -> list[str]:
+                    "started_at": ts, "checked_at": checked_at, "assertion_id": token, "fails": fails}
+         with kb.write_txn(conn):
+             # A shell check can overlap a new assertion or a home ownership change.
+-            if _assertion_tokens(conn, ts).get(bid) != token or homes[0] in foreign_ids(conn):
++            if homes[0] in foreign_ids(conn):
++                continue
++            if _assertion_tokens(conn, ts).get(bid) != token:
++                kb._append_event(conn, homes[0], ATTEMPT_EVENT, {
++                    "blocker_id": bid, "command": command, "rc": "discarded", "started_at": ts,
++                    "checked_at": checked_at, "reason": "assertion changed during check"})
++                if due_out is not None:
++                    due_out.append(ts + CHECK_EVERY_SECONDS)
+                 continue
++            # Runs open now were admitted while the command was in flight; later same-second
++            # claims are absent, so the fence can tell them apart.
++            payload["active_runs"] = _active_run_ids(conn)
+             kb._append_event(conn, homes[0], CHECK_EVENT, payload)
+         if rc == 0:
+             cleared.append(bid)
+diff --git a/hermes_cli/kanban_shared_blocker_fence.py b/hermes_cli/kanban_shared_blocker_fence.py
+index 6dd6eb44c0..0ec396b18f 100644
+--- a/hermes_cli/kanban_shared_blocker_fence.py
++++ b/hermes_cli/kanban_shared_blocker_fence.py
+@@ -11,11 +11,12 @@ def fence_stale_quota_assertions(conn, states, asserting, *, now):
+     """
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_shared_blockers import _LOOKBACK_SECONDS, _mark_cleared, run_effect
+-    from hermes_cli.kanban_shared_blocker_checks import CHECK_EVENT
++    from hermes_cli.kanban_shared_blocker_checks import CHECK_EVENT, run_identity
+ 
+     st = states.get('github-rest-quota')
+     if st is None:
+         return
++    in_flight = {}
+     # Keep successful check evidence even when a delayed assertion supersedes
+     # its race token. Token validation at write time already fenced concurrent
+     # assertions. Legacy integer-token events are deliberately not accepted.
+@@ -28,6 +29,11 @@ def fence_stale_quota_assertions(conn, states, asserting, *, now):
+             checked = kb._to_epoch(payload.get('checked_at')) or 0
+             if checked <= now:
+                 _mark_cleared(st, '', None, checked, via='check')
++                active = payload.get('active_runs')
++                if isinstance(active, list):
++                    in_flight.setdefault(checked, set()).update(map(str, active))
++                else:
++                    in_flight[checked] = None   # older receipt: strict timestamp fallback
+     if not st.cleared_at:
+         return
+     eligible = []
+@@ -37,11 +43,22 @@ def fence_stale_quota_assertions(conn, states, asserting, *, now):
+             continue
+         started = kb._to_epoch(row['started_at']) or 0
+         ended = kb._to_epoch(row['ended_at']) or 0
+-        if started <= st.cleared_at < ended:
++        known = in_flight.get(st.cleared_at, False)
++        if known is False:
++            admitted = started <= st.cleared_at        # non-check clear: unchanged
++        elif known is None:
++            admitted = started < st.cleared_at         # older receipt: strict timestamps
++        else:
++            # Same-second claims are stale only if the receipt saw them running.
++            admitted = started < st.cleared_at or (
++                started == st.cleared_at and run_identity(conn, row['id']) in known)
++        if admitted and st.cleared_at < ended:
+             if st.behind.get(row['task_id']) == ended:
+                 st.behind[row['task_id']] = st.cleared_at
+         else:
+-            eligible.append(ended)
++            # A new claim and assertion can both occur after a check but within
++            # its coarse timestamp second. Preserve that ordering in derived state.
++            eligible.append(max(ended, st.cleared_at + 1) if not admitted and ended == st.cleared_at else ended)
+     st.asserted_at = max(eligible, default=0)
+     if st.cleared_at > st.asserted_at and not st.first_cleared_at:
+         st.first_cleared_at = st.cleared_at
+diff --git a/tests/hermes_cli/test_kanban_shared_blocker_check_transport.py b/tests/hermes_cli/test_kanban_shared_blocker_check_transport.py
+new file mode 100644
+index 0000000000..505c6f3616
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_shared_blocker_check_transport.py
+@@ -0,0 +1,145 @@
++"""Cheap shared-wall evidence crosses the in-memory Board with home custody.
++
++Real pickup, leases and row transport; no live Board writes or fabricated foreign IDs.
++"""
++from __future__ import annotations
++
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_shared_blocker_checks as checks
++from hermes_cli import kanban_shared_blockers as blockers
++from hermes_cli import kanban_wake_check as wake
++from tests.hermes_cli import test_kanban_shared_blockers_copies as copies
++from tests.hermes_cli.test_kanban_worker_node import BOARD
++
++BID = copies.BID
++gws = copies.gws
++
++
++def _cfg(command):
++    return {"kanban": {"shared_blocker_checks": {BID: command}}}
++
++
++def _events(conn, tid):
++    return [event for event in kb.list_events(conn, tid) if event.kind == checks.CHECK_EVENT]
++
++
++def _park_with_remapped_run(home, worker, flag):
++    # Home-only completed history occupies integer IDs but is not picked up.
++    home.enter()
++    for index in range(3):
++        seed = kb.create_task(home.conn, title=f"home history {index}", assignee="default")
++        assert kb.claim_task(home.conn, seed)
++        assert kb.complete_task(home.conn, seed, result="history")
++    tid = copies._park(home, worker, flag)
++    runs = [gateway.conn.execute(
++        "SELECT id, uid FROM task_runs WHERE task_id=? ORDER BY id DESC", (tid,)
++    ).fetchone() for gateway in (home, worker)]
++    assert runs[0]["uid"] == runs[1]["uid"]
++    assert runs[0]["id"] != runs[1]["id"], "fixture must exercise real transport remapping"
++    return tid
++
++
++@pytest.mark.parametrize("home_first", [False, True])
++@pytest.mark.parametrize("rc", [0, 1, 2])
++def test_only_home_checks_and_portable_evidence_roundtrips(gws, tmp_path, home_first, rc):
++    home, worker = gws
++    tid = _park_with_remapped_run(home, worker, tmp_path / "waiting")
++    now = int(time.time()) + 10
++    command = f"printf 'board evidence'; exit {rc}"
++    before = wake.get_state(worker.conn, tid)
++    assert before is not None
++    assert wake.get_state(home.conn, tid) is None
++    tokens = [checks._assertion_tokens(gateway.conn, now)[BID] for gateway in (home, worker)]
++    assert tokens[0] == tokens[1]
++
++    for gateway in ((home, worker) if home_first else (worker, home)):
++        gateway.enter()
++        assert (tid in wake.foreign_ids(gateway.conn)) is (gateway is worker)
++        assert checks.run_due_checks(gateway.conn, cfg=_cfg(command), now=now) == (
++            [BID] if gateway is home and rc == 0 else [])
++    assert _events(worker.conn, tid) == []
++    emitted = _events(home.conn, tid)
++    assert len(emitted) == 1
++    payload = emitted[0].payload
++    assert payload["assertion_id"] == tokens[0]
++    assert payload["rc"] == rc
++    assert payload["fails"] == (1 if rc == 2 else 0)
++    assert payload["output"] == "board evidence"
++
++    home.round()
++    worker.round()
++    home.round()
++    board_events = copies._board_events(home, tid, checks.CHECK_EVENT)
++    assert len(board_events) == 1
++    canonical = board_events[0]
++    assert canonical["origin_gateway"] == home.name
++    assert json.loads(canonical["payload"]) == payload
++    for gateway in (home, worker):
++        events = _events(gateway.conn, tid)
++        assert len(events) == 1
++        assert events[0].payload == payload
++        uid = gateway.conn.execute("SELECT uid FROM task_events WHERE id=?", (events[0].id,)).fetchone()[0]
++        assert uid == canonical["uid"]
++        assert blockers.blocker_states(gateway.conn, now=now)[BID].is_open is (rc != 0)
++        assert kb.get_task(gateway.conn, tid).status == "scheduled"
++    assert _events(home.conn, tid)[0].id != _events(worker.conn, tid)[0].id
++    # The cheap checker neither takes nor deletes the executor's host-local probe.
++    assert wake.get_state(worker.conn, tid) == before
++    assert wake.get_state(home.conn, tid) is None
++
++    worker.enter()
++    assert checks.run_due_checks(worker.conn, cfg=_cfg(command), now=now + 120) == []
++    assert blockers.release_cleared_blockers(worker.conn, now=now) == []
++    home.enter()
++    assert blockers.release_cleared_blockers(home.conn, now=now) == ([tid] if rc == 0 else [])
++    home.round()
++    worker.round()
++    assert len(copies._board_events(home, tid, checks.CHECK_EVENT)) == 1
++    assert len(copies._board_events(home, tid, blockers.CLEARED_EVENT)) == (1 if rc == 0 else 0)
++
++
++def test_same_second_reassertion_invalidates_transported_success(gws, tmp_path, monkeypatch):
++    home, worker = gws
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    first = _park_with_remapped_run(home, worker, tmp_path / "first-waiting")
++    home.enter()
++    old_token = checks._assertion_tokens(home.conn, now)[BID]
++    assert checks.run_due_checks(home.conn, cfg=_cfg("exit 0"), now=now) == [BID]
++    home.round()
++    worker.round()
++    assert not blockers.blocker_states(worker.conn, now=now)[BID].is_open
++
++    second = copies._park(home, worker, tmp_path / "second-waiting")
++    for gateway in (home, worker):
++        runs = gateway.conn.execute(
++            "SELECT uid, ended_at FROM task_runs WHERE task_id IN (?, ?) ORDER BY id", (first, second)
++        ).fetchall()
++        assert len(runs) == 2
++        assert runs[0]["ended_at"] == runs[1]["ended_at"]
++        assert runs[0]["uid"] != runs[1]["uid"]
++        assert checks._assertion_tokens(gateway.conn, now)[BID] != old_token
++        assert blockers.blocker_states(gateway.conn, now=now)[BID].is_open
++    assert checks._assertion_tokens(home.conn, now) == checks._assertion_tokens(worker.conn, now)
++
++    worker.enter()
++    assert checks.run_due_checks(worker.conn, cfg=_cfg("exit 0"), now=now) == []
++    home.enter()
++    assert checks.run_due_checks(home.conn, cfg=_cfg("exit 0"), now=now) == [BID]
++    home.round()
++    worker.round()
++    home.round()
++    events = [event for event in home.svc.board(BOARD)["rows"]["task_events"].values()
++              if event["kind"] == checks.CHECK_EVENT]
++    assert len(events) == 2
++    assert {event["origin_gateway"] for event in events} == {home.name}
++    assert len({json.loads(event["payload"])["assertion_id"] for event in events}) == 2
++    for gateway in (home, worker):
++        assert not blockers.blocker_states(gateway.conn, now=now)[BID].is_open
++        assert kb.get_task(gateway.conn, first).status == "scheduled"
++        assert kb.get_task(gateway.conn, second).status == "scheduled"
+diff --git a/tests/hermes_cli/test_kanban_shared_blocker_races.py b/tests/hermes_cli/test_kanban_shared_blocker_races.py
+new file mode 100644
+index 0000000000..a16598d902
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_shared_blocker_races.py
+@@ -0,0 +1,129 @@
++"""Same-second recovery fence and raced-check cadence for shared blocker checks."""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_shared_blocker_checks as checks
++from hermes_cli import kanban_shared_blockers as blockers
++from tests.hermes_cli import test_kanban_shared_blockers as helpers
++
++kanban_home = helpers.kanban_home
++_blocked_behind = helpers._blocked_behind
++GH = "github-rest-quota"
++CFG = {"kanban": {"shared_blocker_checks": {GH: "unused"}}}
++
++
++@pytest.fixture
++def clock(monkeypatch):
++    now = [1800000000]
++    monkeypatch.setattr(blockers.time, "time", lambda: now[0])
++    monkeypatch.setattr(checks.time, "time", lambda: now[0])
++    return now
++
++
++def _check_ok(conn, monkeypatch):
++    monkeypatch.setattr(checks, "_run_check", lambda c: (0, ""))
++    assert checks.run_due_checks(conn, cfg=CFG) == [GH]
++
++
++@pytest.mark.parametrize('end_delay', [0, 5])
++def test_same_second_claim_after_check_reopens(kanban_home, monkeypatch, clock, end_delay):
++    with kbc.connect_closing() as conn:
++        _blocked_behind(conn, "quota", blocker_id=GH)
++        worker = kb.create_task(conn, title="new worker", assignee="default")
++        clock[0] += 30
++        _check_ok(conn, monkeypatch)
++        assert kb.claim_task(conn, worker)  # same second as checked_at, after the receipt
++        clock[0] += end_delay
++        assert kb.block_task(conn, worker, reason="new outage", kind="capability", blocker_id=GH)
++        assert blockers.blocker_states(conn)[GH].is_open
++
++
++def test_next_second_claim_after_check_reopens(kanban_home, monkeypatch, clock):
++    with kbc.connect_closing() as conn:
++        _blocked_behind(conn, "quota", blocker_id=GH)
++        worker = kb.create_task(conn, title="new worker", assignee="default")
++        clock[0] += 30
++        _check_ok(conn, monkeypatch)
++        clock[0] += 1
++        assert kb.claim_task(conn, worker)
++        clock[0] += 5
++        assert kb.block_task(conn, worker, reason="new outage", kind="capability", blocker_id=GH)
++        assert blockers.blocker_states(conn)[GH].is_open
++
++
++def test_same_second_admitted_during_command_stays_fenced(kanban_home, monkeypatch, clock):
++    with kbc.connect_closing() as conn:
++        _blocked_behind(conn, "quota", blocker_id=GH)
++        worker = kb.create_task(conn, title="in flight", assignee="default")
++        clock[0] += 30
++
++        def run(_command):
++            assert kb.claim_task(conn, worker)  # admitted while the command runs
++            return 0, ""
++
++        monkeypatch.setattr(checks, "_run_check", run)
++        assert checks.run_due_checks(conn, cfg=CFG) == [GH]
++        clock[0] += 5
++        assert kb.block_task(conn, worker, reason="stale quota", kind="capability", blocker_id=GH)
++        assert not blockers.blocker_states(conn)[GH].is_open
++
++
++def test_receipt_records_active_run_snapshot(kanban_home, monkeypatch, clock):
++    with kbc.connect_closing() as conn:
++        tid = _blocked_behind(conn, "quota", blocker_id=GH)
++        clock[0] += 30
++        _check_ok(conn, monkeypatch)
++        receipt = checks._latest_results(conn)[GH]
++        assert receipt["active_runs"] == []
++        assert tid
++
++
++def test_older_receipt_uses_strict_timestamp_fallback(kanban_home, monkeypatch, clock):
++    with kbc.connect_closing() as conn:
++        _blocked_behind(conn, "quota", blocker_id=GH)
++        worker = kb.create_task(conn, title="new worker", assignee="default")
++        clock[0] += 30
++        _check_ok(conn, monkeypatch)
++        row = conn.execute("SELECT id, task_id, payload FROM task_events WHERE kind=?",
++                           (checks.CHECK_EVENT,)).fetchone()
++        payload = kb._json_dict(row["payload"])
++        payload.pop("active_runs")
++        import json
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row["id"]))
++        assert kb.claim_task(conn, worker)  # same second, no snapshot on receipt
++        clock[0] += 5
++        assert kb.block_task(conn, worker, reason="new outage", kind="capability", blocker_id=GH)
++        assert blockers.blocker_states(conn)[GH].is_open
++
++
++def test_raced_check_keeps_cadence_without_clearing(kanban_home, monkeypatch, clock):
++    cfg = {"kanban": {"shared_blocker_checks": {"test-wall": "x"}}}
++    calls = []
++    with kbc.connect_closing() as conn:
++        tid = _blocked_behind(conn, "a", blocker_id="test-wall")
++
++        def run(_command):
++            calls.append(clock[0])
++            _blocked_behind(conn, f"again{len(calls)}", blocker_id="test-wall")
++            return 0, ""
++
++        monkeypatch.setattr(checks, "_run_check", run)
++        due = []
++        for _ in range(3):
++            checks.run_due_checks(conn, cfg=cfg, due_out=due, now=clock[0])
++            clock[0] += 5
++        assert len(calls) == 1
++        assert due and min(due) == 1800000000 + checks.CHECK_EVERY_SECONDS
++        events = [e for e in kb.list_events(conn, tid) if e.kind == checks.CHECK_EVENT]
++        assert not events  # discarded result is never success evidence
++        assert blockers.blocker_states(conn)["test-wall"].is_open
++        attempts = [e for e in kb.list_events(conn, tid) if e.kind == checks.ATTEMPT_EVENT]
++        assert len(attempts) == 1 and attempts[0].payload["rc"] == "discarded"
++        # Cadence expires: the next window runs again.
++        clock[0] = 1800000000 + checks.CHECK_EVERY_SECONDS
++        checks.run_due_checks(conn, cfg=cfg, now=clock[0])
++        assert len(calls) == 2
+diff --git a/tests/hermes_cli/test_kanban_shared_blocker_result_order.py b/tests/hermes_cli/test_kanban_shared_blocker_result_order.py
+new file mode 100644
+index 0000000000..25e8b3de22
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_shared_blocker_result_order.py
+@@ -0,0 +1,34 @@
++"""Equal-second check receipts must not depend on replica-local event IDs."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_shared_blocker_checks as checks
++from hermes_cli import kanban_shared_blockers as blockers
++from tests.hermes_cli import test_kanban_shared_blockers as helpers
++
++kanban_home = helpers.kanban_home
++
++
++@pytest.mark.parametrize('reverse', [False, True])
++def test_equal_second_failure_wins_over_success(kanban_home, reverse):
++    with kbc.connect_closing() as conn:
++        tid = helpers._blocked_behind(conn, 'wall', blocker_id='test-wall')
++        now = blockers.blocker_states(conn)['test-wall'].asserted_at + 10
++        token = checks._assertion_tokens(conn, now)['test-wall']
++        results = [0, 1]
++        if reverse:
++            results.reverse()
++        with kb.write_txn(conn):
++            for rc in results:
++                kb._append_event(conn, tid, checks.CHECK_EVENT, {
++                    'blocker_id': 'test-wall', 'checked_at': now, 'started_at': now,
++                    'assertion_id': token, 'command': 'probe', 'rc': rc, 'fails': 0,
++                })
++        assert checks._latest_results(conn, now)['test-wall']['rc'] == 1
++        assert blockers.blocker_states(conn, now=now)['test-wall'].is_open
++
++
++@pytest.mark.parametrize('section', ['invalid', ['invalid'], 7])
++def test_malformed_section_disables_checks(section):
++    assert checks.registered_checks({'kanban': section}) == {}
+-- 
+2.43.0
+

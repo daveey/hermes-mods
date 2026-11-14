@@ -1,0 +1,175 @@
+From 7d2b02bd77923d7036c7e3c639414a023041c4e1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 04:33:57 +0000
+Subject: [PATCH] [daveey] Observe the submitter-started owner in the Kanban
+ restart probe
+
+The real worker reconnects through ensure_gateway_runtime, which starts the
+replacement owner itself. The fixture raced it with a second raw gateway.run:
+CI rejected that second launcher as already_running, or the fixture accepted
+the real owner's ready socket and recorded the losing launcher's PID instead.
+
+Await the real successor's ready control identity and retain its process for
+cleanup after the submitter exits. Keep the first launch identity assertion,
+all run/session/claim/history checks, and existing readiness/continuation bounds.
+Stop submitters before their captured descendants so teardown cannot relaunch.
+No production logic or retry policy changes.
+
+Proof:
+- Original CI job 132313275430: second launcher rejected by owner PID13215.
+- SIGSTOP the probe at the restart gap for12s: old fixture falsely reports
+  owner673137 while restart.log identifies actual owner672329; fixed probe
+  completes on the actual successor without a competing launch.
+- 29/29 original tests with retries disabled, including SIGSTOP/SIGCONT
+  150ms stopped /50ms running duty cycle across58 owned processes:238.4s.
+- 32/32 tests including three successor readiness/identity controls:68.3s.
+- scripts/check --base origin/main:20 checks pass.
+---
+ .../fixtures/kanban_restart_continue_probe.py | 62 +++++++++++++++++--
+ .../test_kanban_restart_probe_owner.py        | 22 +++++++
+ 2 files changed, 78 insertions(+), 6 deletions(-)
+ create mode 100644 tests/gateway/test_kanban_restart_probe_owner.py
+
+diff --git a/tests/gateway/fixtures/kanban_restart_continue_probe.py b/tests/gateway/fixtures/kanban_restart_continue_probe.py
+index a03d1b2759..839682bab5 100644
+--- a/tests/gateway/fixtures/kanban_restart_continue_probe.py
++++ b/tests/gateway/fixtures/kanban_restart_continue_probe.py
+@@ -2,7 +2,8 @@
+ 
+ Actual dispatcher argv, real ``gateway.run`` owners on one disposable home, loopback model. The first
+ owner is stopped (SIGTERM: the runtime Stop of a gateway shutdown/restart) while the card's turn waits
+-on the model (or, with ``PROBE_MID_TOOL=1``, while its ``terminal`` tool call runs); a second owner then starts on the same home. The run's submitter (the real
++on the model (or, with ``PROBE_MID_TOOL=1``, while its ``terminal`` tool call runs); the real submitter
++starts the second owner on the same home as it reconnects. The run's submitter (the real
+ ``hermes_cli.kanban_worker_client``) must survive the gap and the second owner must continue the same
+ turn in the same session: one run, one claim, one worker pid, no reclaim/crash/failure.
+ """
+@@ -17,7 +18,45 @@ import sys
+ import threading
+ import time
+ 
+-from local_recovery_probe import daemon, isolate_host_policy
++import psutil
++
++from tests.gateway.fixtures.local_recovery_probe import control, daemon, isolate_host_policy
++from tests.waiting import wait_until
++
++
++def restarted_owner(home, previous):
++    """The real submitter ensures its next owner; never race it with a second launcher."""
++    def ready():
++        try:
++            desc = control(home, 'identify')
++        except (OSError, ValueError):
++            return None
++        if desc.get('state') != 'ready':
++            return None
++        assert desc['pid'] != previous['pid'], desc
++        assert desc['instance_id'] != previous['instance_id'], desc
++        return desc
++
++    desc = wait_until(ready, timeout=120, what='submitter-started replacement owner ready')
++    assert desc is not None
++    return desc
++
++
++def stop_descendants(processes):
++    """Identity-bound teardown, including an owner whose submitter has already exited."""
++    for proc in processes:
++        try:
++            proc.terminate()
++        except psutil.NoSuchProcess:
++            pass
++    _, alive = psutil.wait_procs(processes, timeout=10)
++    for proc in alive:
++        try:
++            proc.kill()
++        except psutil.NoSuchProcess:
++            pass
++    _, alive = psutil.wait_procs(alive, timeout=10)
++    assert not alive, alive
+ 
+ CONTINUE_PREFIX = '[Kanban run continued after a gateway restart]'
+ 
+@@ -107,6 +146,7 @@ def main():
+                              assignee='default', workspace_kind='dir', workspace_path=str(workspace))
+     env = dict(os.environ)
+     receipt, clients = {'task_id': tid, 'policy_root': policy_root}, []
++    successor = None
+     original_popen = subprocess.Popen
+ 
+     def spawn(*args, **kwargs):
+@@ -124,7 +164,8 @@ def main():
+     try:
+         subprocess.Popen = spawn
+         with closing(connect(board='owned')) as conn:
+-            with daemon(root, home, env, barrier=False) as (proc, _desc):
++            with daemon(root, home, env, barrier=False) as (proc, first):
++                assert first['pid'] == proc.pid, first
+                 receipt['owner_pids'] = [proc.pid]
+                 launched = _wait(lambda: spawned(conn), 60, 'dispatcher claim and spawn')
+                 assert [s[0] for s in launched.spawned] == [tid], launched
+@@ -143,9 +184,12 @@ def main():
+                            gap_worker_pid=mid.worker_pid)
+             # The dispatcher ticks during the gap: its stale/dead sweeps must leave the live run alone.
+             dispatch.dispatch_once(conn, board='owned', max_spawn=0)
+-            with daemon(root, home, env, barrier=False) as (proc, _desc):
+-                receipt['owner_pids'].append(proc.pid)
+-                _wait(lambda: clients[0].poll() is not None, 300, 'worker exit after continuation')
++            # connect_gateway ensures an owner during reconnect. A competing Popen either loses
++            # startup or appears ready via that owner's socket while recording the wrong PID.
++            second = restarted_owner(home, first)
++            successor = psutil.Process(second['pid'])
++            receipt['owner_pids'].append(successor.pid)
++            _wait(lambda: clients[0].poll() is not None, 300, 'worker exit after continuation')
+             dispatch.reap_worker_zombies()
+             receipt['client_exit'] = list(dispatch._classify_worker_exit(clients[0].pid) or ())
+             dispatch._recent_worker_exits.clear()
+@@ -166,10 +210,16 @@ def main():
+     finally:
+         subprocess.Popen = original_popen
+         peer.release.set()
++        # Capture still-starting descendants before killing the submitter. Stop it first so it
++        # cannot start another owner during cleanup; retain an adopted owner after reparenting.
++        descendants = psutil.Process().children(recursive=True)
++        if successor is not None and successor not in descendants:
++            descendants.append(successor)
+         for child in clients:
+             if child.poll() is None:
+                 child.kill()
+             child.wait(timeout=10)
++        stop_descendants(descendants)
+         peer.shutdown()
+         peer.server_close()
+         (home / 'model-requests.json').write_text(json.dumps(peer.requests, indent=2), encoding='utf-8')
+diff --git a/tests/gateway/test_kanban_restart_probe_owner.py b/tests/gateway/test_kanban_restart_probe_owner.py
+new file mode 100644
+index 0000000000..f9464ad766
+--- /dev/null
++++ b/tests/gateway/test_kanban_restart_probe_owner.py
+@@ -0,0 +1,22 @@
++"""Restart probes observe the submitter's replacement, not a competing launcher."""
++from unittest.mock import Mock
++
++import pytest
++
++from tests.gateway.fixtures import kanban_restart_continue_probe as probe
++
++
++def test_replacement_waits_for_identified_ready_owner(monkeypatch, tmp_path):
++    previous = {'pid': 1, 'instance_id': 'old'}
++    ready = {'state': 'ready', 'pid': 2, 'instance_id': 'new'}
++    control = Mock(side_effect=[OSError('socket absent'), {'state': 'starting'}, ready])
++    monkeypatch.setattr(probe, 'control', control)
++    assert probe.restarted_owner(tmp_path, previous) is ready
++    assert control.call_args_list == [((tmp_path, 'identify'),)] * 3
++
++
++@pytest.mark.parametrize('pid,instance', [(1, 'new'), (2, 'old')])
++def test_replacement_rejects_previous_owner_identity(monkeypatch, tmp_path, pid, instance):
++    monkeypatch.setattr(probe, 'control', lambda *args: {'state': 'ready', 'pid': pid, 'instance_id': instance})
++    with pytest.raises(AssertionError):
++        probe.restarted_owner(tmp_path, {'pid': 1, 'instance_id': 'old'})
+-- 
+2.43.0
+

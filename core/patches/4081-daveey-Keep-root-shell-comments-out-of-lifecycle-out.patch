@@ -1,0 +1,353 @@
+From 3b6b5c57f5d4ee34b2765d9940a7de89b6d58fbc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 01:43:34 +0000
+Subject: [PATCH] [daveey] Keep root shell comments out of lifecycle output
+ sinks
+
+Raw sink regexes treated semicolons and backticks inside shell comments as executed command substitutions, promoting unrelated quoted data paths into script traversal. Mask only proven full-line root comments; preserve quoted/interpreter source and opaque expansions/groups, and abandon masking on unsupported or incomplete regions. Only simply quoted heredoc delimiters are traversed; unquoted backslash-newline delimiter joins remain conservative.
+
+Proof: original minimal and oversized-data wrapper assertions fail without integration (20 failures); 29 importing/cross-cutting suites pass 3133 tests, scripts/check passes 20 checks. Real Bash markers cover inert comments, real substitutions and unquoted heredoc false closes; 48 generated wrapper/nesting cases retain baseline refusals. All 31 condition/integration mutants killed. Read-only real-row replay running separately before ship.
+---
+ .../test_lifecycle_guard_comment_corpus.py    |  37 +++++
+ .../cron/test_lifecycle_guard_comment_sink.py | 141 ++++++++++++++++++
+ tools/shell_comments.py                       | 120 +++++++++++++++
+ tools/shell_heredoc.py                        |   3 +
+ 4 files changed, 301 insertions(+)
+ create mode 100644 tests/cron/test_lifecycle_guard_comment_corpus.py
+ create mode 100644 tests/cron/test_lifecycle_guard_comment_sink.py
+ create mode 100644 tools/shell_comments.py
+
+diff --git a/tests/cron/test_lifecycle_guard_comment_corpus.py b/tests/cron/test_lifecycle_guard_comment_corpus.py
+new file mode 100644
+index 0000000000..98717de797
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_comment_corpus.py
+@@ -0,0 +1,37 @@
++"""Generated Bash marker controls for the comment-only permissive change.
++
++Baseline: 04808b222ec7d6d4b3f4c226e7fd32370b0b330e, every generated case refuses.
++The marker is a fake hermes executable; no real gateway lifecycle command runs.
++"""
++
++import itertools
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++
++
++@pytest.mark.spawns_gateway_lookalike
++def test_comment_mask_preserves_generated_executed_payloads(tmp_path):
++    executable = tmp_path / 'hermes'
++    executable.write_text('#!/bin/sh\nprintf reached > seen\n', encoding='utf-8')
++    executable.chmod(0o700)
++    marker = tmp_path / 'seen'
++    payload = "printf '%s %s %s' hermes '\"gateway\"' restart"
++    comments = ['# inert; `auth`\n', '# unclosed \' \" $(\n', '# | bash\n']
++    wrappers = ['bash', 'env bash', 'command bash', 'timeout 5 bash']
++    nesting = ['{body}', '(\n{body}\n)', 'f() {{\n{body}\n}}; f', 'bash -s <<\'E\'\n{body}\nE']
++    for comment, wrapper, outer in itertools.product(comments, wrappers, nesting):
++        body = comment + payload + ' | ' + wrapper
++        command = outer.format(body=body)
++        result = subprocess.run(
++            ['bash', '-c', command], cwd=tmp_path,
++            env={'PATH': f'{tmp_path}:/usr/bin:/bin'},
++            capture_output=True, check=False, text=True, encoding='utf-8', timeout=5,
++        )
++        assert result.returncode == 0, (command, result.stderr)
++        assert marker.read_text() == 'reached', command
++        marker.unlink()
++        unsafe, _refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++        assert unsafe, command
+diff --git a/tests/cron/test_lifecycle_guard_comment_sink.py b/tests/cron/test_lifecycle_guard_comment_sink.py
+new file mode 100644
+index 0000000000..bd8120aaec
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_comment_sink.py
+@@ -0,0 +1,141 @@
++"""Shell comments must not promote unrelated data literals into executed output."""
++
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import _iter_printed_shell_payloads, scan_gateway_lifecycle
++from tools.shell_heredoc import output_reaches_shell
++
++
++@pytest.mark.parametrize("prefix", ["", "x=1\n", "printf '%s' ok\n"])
++@pytest.mark.parametrize("indent", ["", "  \t"])
++@pytest.mark.parametrize("comment", [
++    '# transport; `auth` (git helper)',
++    '# call; `config` and `alias`',
++    '# (`auth`',
++    '# | bash',
++    '# eval "$(printer)"',
++    '# unclosed " \' $( ` ; | bash',
++])
++def test_comment_is_not_an_output_sink(prefix, indent, comment):
++    text = prefix + indent + comment + '\nlog="$HOME/data.log"\n'
++    assert not output_reaches_shell(text)
++    assert list(_iter_printed_shell_payloads(text)) == []
++
++
++def test_wrapper_does_not_execute_oversized_data_assignment(tmp_path):
++    data = tmp_path / "data.log"
++    data.write_text("padding\n" * 160000, encoding="utf-8")
++    wrapper = tmp_path / "wrapper.sh"
++    wrapper.write_text(
++        '#!/bin/bash\nx=1\n# transport; `auth` (git helper)\n'
++        f'log="{data}"\n', encoding="utf-8",
++    )
++    assert scan_gateway_lifecycle(f"bash {wrapper}", cwd=str(tmp_path)) == (False, None)
++
++
++@pytest.mark.parametrize("command", [
++    "`printf marker`", "$(printf marker)",
++    "printf marker | bash", 'eval "$(printf marker)"',
++    "bash -c 'marker'",  # shell -c execution does not itself need an output sink
++])
++def test_comments_and_real_execution_with_bash(tmp_path, command):
++    marker = tmp_path / "marker"
++    marker.write_text('#!/bin/sh\nprintf reached > "$MARK"\n', encoding="utf-8")
++    marker.chmod(0o700)
++    script = tmp_path / "run.sh"
++    script.write_text('# inert; `marker` $(marker) | bash\n' + command + '\n', encoding="utf-8")
++    result = subprocess.run(
++        ["bash", str(script)], cwd=tmp_path,
++        env={"PATH": f"{tmp_path}:/usr/bin:/bin", "MARK": str(tmp_path / "seen")},
++        capture_output=True, check=False, text=True, encoding="utf-8", timeout=5,
++    )
++    assert result.returncode == 0, result.stderr
++    assert (tmp_path / "seen").read_text() == "reached"
++    if "-c" not in command:
++        assert output_reaches_shell(script.read_text())
++
++
++def test_bash_comment_does_not_run_substitutions(tmp_path):
++    mark = tmp_path / "seen"
++    script = '# inert; `touch seen` $(touch seen) | bash\nlog="data.log"\n'
++    result = subprocess.run(
++        ["bash", "-c", script], cwd=tmp_path, env={"PATH": "/usr/bin:/bin"},
++        capture_output=True, check=False, text=True, encoding="utf-8", timeout=5,
++    )
++    assert result.returncode == 0, result.stderr
++    assert not mark.exists()
++    assert not output_reaches_shell(script)
++
++
++@pytest.mark.parametrize("text", [
++    "printf '%s' '# data; `auth`'",
++    'printf "%s" "# data; `auth`"',
++    "printf '%s' 'multiline\n# data; `auth`\nend'",
++    'python3 -c "s=\'# data; `auth`\'"',
++    "cat <<'EOF'\n# data; `auth`\nEOF\n",
++    "cat <<EOF\n# data; `auth`\nEOF\n",
++    r"echo \# data; `auth`",
++    "echo word# data; `auth`",
++    'echo "$(printf \'# data; `auth`\')"',
++    "echo ${x:-# data; `auth`}",
++])
++def test_quoted_expanded_and_heredoc_hashes_remain_conservative(text):
++    assert output_reaches_shell(text)
++
++
++@pytest.mark.parametrize("prefix", [
++    "x='['\n", 'x="\'"\n', "x='\\'\n", 'x="${v:- # literal}"\n',
++    "x='literal'\n", 'x="literal"\n', 'x="$(printf \'x\')"\n',
++    "x=${v:-fallback}\n", "x=$((1 + 2))\n", "x=$[1 + 2]\n",
++    "x=$'a\\\'b'\n", "x=`printf x`\n", "echo \\#\n", "echo a#b\n",
++    "echo \\ # '\n'\n", "echo a\\\n# '\n'\n", "echo x # unclosed '\n",
++    "cat <<'E'\n# opaque; `auth`\nE\n",
++    'cat <<-"E"\n\tdata\n\tE\n',
++    "cat <<'A' <<'B'\nfirst\nA\nsecond\nB\n",
++    "cat <<''\ndata\n\n", "cat <<'E'\nE\r\n# body\nE\n",
++    "cat <<<'text'\n",
++])
++def test_root_comment_mask_preserves_opaque_prefix(prefix):
++    from tools.shell_comments import mask_root_comment_lines
++
++    comment = '# comment; `auth`'
++    assert mask_root_comment_lines(prefix + comment) == prefix + ' ' * len(comment)
++
++
++@pytest.mark.parametrize("text", [
++    "echo 'open\n# comment; `auth`", 'echo "open\n# comment; `auth`',
++    "echo $(open\n# comment; `auth`", "echo ${open\n# comment; `auth`",
++    "cat <<'E'\n# comment; `auth`", "cat <<\n# comment; `auth`",
++    "cat <<E\nx\\\nE\n# comment; `auth`\nE\n",
++    "cat <<'E'X\nE\n# comment; `auth`\nEX\n",
++    "cat <<$'E'\n$E\n# comment; `auth`\nE\n",
++    "x=$(cat <<'E'\nx\nE\n)\n# comment; `auth`",
++    "( # )\n# comment; `auth`\n)",
++    '(' * 35 + ')' * 35 + '\n# comment; `auth`',
++])
++def test_uncertain_regions_abandon_masking(text):
++    from tools.shell_comments import mask_root_comment_lines
++
++    assert mask_root_comment_lines(text) == text
++    assert output_reaches_shell(text)
++
++
++@pytest.mark.parametrize("tabs", [False, True])
++def test_unquoted_heredoc_false_close_runs_real_substitution(tmp_path, tabs):
++    from tools.shell_comments import mask_root_comment_lines
++
++    script = 'cat <<' + ('-' if tabs else '') + 'E\nx\\\n' + ('\t' if tabs else '')
++    script += 'E\n# $(printf marker | bash)\nE\n'
++    marker = tmp_path / 'marker'
++    marker.write_text('#!/bin/sh\nprintf reached > seen\n', encoding='utf-8')
++    marker.chmod(0o700)
++    result = subprocess.run(
++        ['bash', '-c', script], cwd=tmp_path, env={'PATH': f'{tmp_path}:/usr/bin:/bin'},
++        capture_output=True, check=False, text=True, encoding='utf-8', timeout=5,
++    )
++    assert result.returncode == 0, result.stderr
++    assert (tmp_path / 'seen').read_text() == 'reached'
++    assert mask_root_comment_lines(script) == script
++    assert output_reaches_shell(script)
+diff --git a/tools/shell_comments.py b/tools/shell_comments.py
+new file mode 100644
+index 0000000000..82f35a3fbc
+--- /dev/null
++++ b/tools/shell_comments.py
+@@ -0,0 +1,120 @@
++"""Conservative root-shell comment view for output-sink discovery.
++
++Only full-line comments outside quotes/expansions/groups/heredocs are removed. Opaque
++regions remain byte-for-byte visible to the sink scanner (including interpreter source).
++Unmatched or unsupported lexical regions abandon masking, not sink discovery.
++"""
++
++from __future__ import annotations
++
++import re
++
++_OPEN = re.compile(r"\$\{|\$\(|\$\[|\$'|['\"`({\[]")
++_HEREDOC = re.compile(r'''<<(-?)[ \t]*(?:'([^'\r\n]*)'|"([^"\\$`\r\n]*)")(?=$|[ \t\n;&|<>])''')
++
++_CLOSE = {"${": "}", "$(": ")", "$[": "]", "$'": "'",
++          "'": "'", '"': '"', "`": "`", "(": ")", "{": "}", "[": "]"}
++
++
++def _opaque_end(text: str, pos: int, opener: str, depth: int = 0) -> int | None:
++    """Skip a quoted/balanced region without changing any of its contents."""
++    if depth > 32:
++        return None
++    closer = _CLOSE[opener]
++    pos += len(opener)
++    while pos < len(text):
++        char = text[pos]
++        if char == "\\" and opener != "'":
++            pos += 2
++            continue
++        if char == closer:
++            return pos + 1
++        if opener in ("'", "$'", "`"):
++            pos += 1
++            continue
++        if opener == '"':
++            # Quotes inside substitutions belong to that substitution, not this string.
++            nested = re.match(r"\$[({[]|`", text[pos:pos + 2])
++        else:
++            # Nested heredocs and shell comments can hide closing delimiters. Keeping the
++            # entire original source is safer than trying to parse another shell grammar.
++            if text.startswith("<<", pos) or (char == "#" and opener != "${"
++                                              and text[pos - 1] in " \t\n;&|()"):
++                return None
++            nested = _OPEN.match(text, pos)
++        if nested is not None:
++            end = _opaque_end(text, pos, nested.group(), depth + 1)
++            if end is None:
++                return None
++            pos = end
++        else:
++            pos += 1
++    return None
++
++
++def mask_root_comment_lines(command: str) -> str:
++    """Mask proven comment lines, preserving offsets, newlines and all opaque source."""
++    chars = list(command)
++    pos, line_start, boundary = 0, True, True
++    heredocs = []
++    while pos < len(command):
++        char = command[pos]
++        if char == "\n":
++            pos += 1
++            for delimiter, strip_tabs in heredocs:
++                terminator = re.compile(
++                    r"^" + (r"\t*" if strip_tabs else "") + re.escape(delimiter) + r"(?:\n|$)",
++                    re.MULTILINE,
++                )
++                closed = terminator.search(command, pos)
++                if closed is None:
++                    return command
++                pos = closed.end()
++            heredocs.clear()
++            line_start = boundary = True
++            continue
++        if line_start and char in " \t":
++            pos += 1
++            continue
++        if line_start and char == "#":
++            end = command.find("\n", pos)
++            end = len(command) if end == -1 else end
++            chars[pos:end] = " " * (end - pos)
++            pos = end
++            continue
++        line_start = False
++        if char == "\\":
++            if command[pos:pos + 2] != "\\\n":
++                boundary = False
++            pos += 2  # a continued line is not a fresh comment-line boundary
++            continue
++        # Inline comments are not masked, but their quotes must not alter lexical state.
++        if char == "#" and boundary:
++            end = command.find("\n", pos)
++            pos = len(command) if end == -1 else end
++            continue
++        if command.startswith("<<<", pos):
++            pos += 3
++            continue
++        if command.startswith("<<", pos):
++            # Only complete, simply quoted delimiters are proven. Unquoted bodies
++            # join backslash-newlines before recognizing a terminator; ANSI/mixed
++            # quoting needs its own delimiter expansion grammar. Leave those alone.
++            parsed = _HEREDOC.match(command, pos)
++            if parsed is None:
++                return command
++            tabs, single, double = parsed.groups()
++            heredocs.append((single if single is not None else double, bool(tabs)))
++            pos = parsed.end()
++            continue
++        opening = _OPEN.match(command, pos)
++        if opening is not None:
++            end = _opaque_end(command, pos, opening.group())
++            if end is None:
++                return command
++            pos = end
++            boundary = False
++        else:
++            boundary = char in " \t;&|<>())"
++            pos += 1
++    return "".join(chars)
+diff --git a/tools/shell_heredoc.py b/tools/shell_heredoc.py
+index 0ecdf53c9e..ed6aa75813 100644
+--- a/tools/shell_heredoc.py
++++ b/tools/shell_heredoc.py
+@@ -524,7 +524,10 @@ def output_reaches_shell(command: str) -> bool:
+     shell, so ``| grep bash`` / ``| grep -c bash`` count as sinks too: telling a wrapper's operand
+     from a filter's pattern needs a per-command grammar, and the false sink only fails closed
+     (review 5890784121 nit 3; ``| grep bash.sh`` is no sink only because of the word end)."""
++    from tools.shell_comments import mask_root_comment_lines
++
+     date_exempt = not _DATE_REBIND_RE.search(command)
++    command = mask_root_comment_lines(command)
+     sink = _SHELL_SINK_NUMERIC_RE if date_exempt else _SHELL_SINK_RE
+     # The regex sees a substitution only in command position; inside arithmetic bash also runs
+     # code from its output wherever it sits (`$(( 1 + $(…) ))`, `a[$(…)]`; t_01a1d6ae05c19594).
+-- 
+2.43.0
+

@@ -1,0 +1,528 @@
+From d3b42fa007a61dcff264b0159a89f08c1e24aa33 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 03:27:28 +0000
+Subject: [PATCH] [daveey] Reuse guarded replica readers in dispatcher operator
+ and wake scans
+
+G2b live proof still costs .903% core; profiles attribute remaining drain cost to guarded opens. Borrow the bounded generation-aware reader exclusively, fallback on contention, preserve Row/5s timeout and release transactions on all exits. Keep general foreign_card close-on-exit contract unchanged.
+
+Proof: three baseline RED cases; 84 focused contracts green plus 42 operator cases. Five exact mutants killed. Real drain replica scale replay (1k/5.8k/20k live tasks, 10k/40k replica tasks, 512 extra FDs, checkpointed and 425MB WAL) cuts ~2.8-4.5ms to .43-.56ms/tick; equal executor clocks. Synthetic idle incoming workload, not live whole-reclaim acceptance. Hub P1 >=360s remains mandatory after deployment.
+---
+ hermes_cli/kanban_awaited_card_wake.py        |   2 +-
+ hermes_cli/kanban_operator_call.py            |   4 +-
+ hermes_cli/kanban_replica_reader.py           |  86 ++++++++
+ scripts/kanban_replica_drain_replay.py        | 141 +++++++++++++
+ .../test_kanban_operator_retained_replica.py  |  29 +++
+ .../hermes_cli/test_kanban_replica_reader.py  | 195 ++++++++++++++++++
+ 6 files changed, 454 insertions(+), 3 deletions(-)
+ create mode 100644 hermes_cli/kanban_replica_reader.py
+ create mode 100644 scripts/kanban_replica_drain_replay.py
+ create mode 100644 tests/hermes_cli/test_kanban_operator_retained_replica.py
+ create mode 100644 tests/hermes_cli/test_kanban_replica_reader.py
+
+diff --git a/hermes_cli/kanban_awaited_card_wake.py b/hermes_cli/kanban_awaited_card_wake.py
+index e908c148e4..2842bea7bb 100644
+--- a/hermes_cli/kanban_awaited_card_wake.py
++++ b/hermes_cli/kanban_awaited_card_wake.py
+@@ -170,7 +170,7 @@ def _replica_finished(conn: sqlite3.Connection) -> Optional[dict[str, tuple[str,
+     """``{waiting card: (awaited card, its replica status)}`` for each scheduled park naming a card the replica has
+     done/archived; None when there is no readable replica (nothing to judge by)."""
+     from hermes_cli import kanban_db_connect as kbc
+-    from hermes_cli.kanban_foreign_card import open_replica
++    from hermes_cli.kanban_replica_reader import open_replica
+ 
+     with open_replica(kbc._main_db_file(conn)) as replica:
+         if replica is None:
+diff --git a/hermes_cli/kanban_operator_call.py b/hermes_cli/kanban_operator_call.py
+index 50c98ff8cb..022a85b07d 100644
+--- a/hermes_cli/kanban_operator_call.py
++++ b/hermes_cli/kanban_operator_call.py
+@@ -178,8 +178,8 @@ def _db_path(conn: sqlite3.Connection) -> Optional[str]:
+ 
+ @contextmanager
+ def _replica(conn: sqlite3.Connection) -> Iterator[Optional[sqlite3.Connection]]:
+-    from hermes_cli import kanban_foreign_card as kfc
+-    with kfc.open_replica(_db_path(conn)) as rep:
++    from hermes_cli import kanban_replica_reader
++    with kanban_replica_reader.open_replica(_db_path(conn)) as rep:
+         yield rep
+ 
+ 
+diff --git a/hermes_cli/kanban_replica_reader.py b/hermes_cli/kanban_replica_reader.py
+new file mode 100644
+index 0000000000..33730b6e76
+--- /dev/null
++++ b/hermes_cli/kanban_replica_reader.py
+@@ -0,0 +1,86 @@
++"""Bounded guarded replica readers for dispatcher scopes that consume all results.
++
++Unlike foreign_card.open_replica, callers must not retain the connection or a cursor
++past the scope. No results are cached: external commits remain visible every tick.
++"""
++from contextlib import contextmanager, ExitStack, closing
++import logging
++import sqlite3
++
++from hermes_cli import kanban_foreign_card as foreign
++from hermes_cli import kanban_reader_retention as retention
++
++_log = logging.getLogger(__name__)
++
++
++def _discard(key, entry):
++    from hermes_cli import kanban_session_activity as activity
++
++    with activity._RO_CACHE_LOCK:
++        if activity._RO_CACHE.get(key) is entry:
++            del activity._RO_CACHE[key]
++    activity._close_quietly(entry[0])
++
++
++@contextmanager
++def _borrow(path):
++    from hermes_cli import kanban_session_activity as activity
++    from hermes_cli.kanban_reader_lifecycle import cached_entry
++    from hermes_cli.kanban_generation import DeletedWalGenerationError
++
++    key, entry = cached_entry(path, busy_budget=5)
++    conn, _ident, lock, _shm = entry
++    # Shared readers also serve unrelated callers. Never deadlock a nested borrow
++    # or wait behind a slow body: retain the old independent-reader path instead.
++    if not lock.acquire(blocking=False):
++        with closing(foreign._ro(path)) as transient:
++            yield transient
++        return
++    try:
++        with activity._RO_CACHE_LOCK:
++            if activity._RO_CACHE.get(key) is not entry:
++                raise DeletedWalGenerationError(f"kanban DB {path}: reader evicted before borrow")
++        try:
++            conn.row_factory = sqlite3.Row
++            conn.execute('PRAGMA busy_timeout=5000')
++            yield conn
++        except sqlite3.Error:
++            _discard(key, entry)
++            raise
++        finally:
++            with activity._RO_CACHE_LOCK:
++                retained = activity._RO_CACHE.get(key) is entry
++            if retained:
++                try:
++                    # Even a non-SQLite body exception must release its snapshot.
++                    conn.rollback()
++                    conn.row_factory = None
++                    conn.execute(f'PRAGMA busy_timeout={int(activity._RO_BUSY_TIMEOUT_S * 1000)}')
++                except sqlite3.Error:
++                    _discard(key, entry)
++    finally:
++        lock.release()
++        retention.prune()
++
++
++@contextmanager
++def open_replica(db_path):
++    """Resolve sync policy each time; an unavailable replica is a miss, not a create.
++
++    Only acquisition errors become None. Errors in the caller's body propagate.
++    """
++    from hermes_cli.kanban_generation import DeletedWalGenerationError
++
++    path = foreign.replica_path(db_path)
++    with ExitStack() as stack:
++        conn = None
++        if path is not None:
++            for attempt in range(2):
++                try:
++                    conn = stack.enter_context(_borrow(path))
++                    break
++                except sqlite3.Error as exc:
++                    if attempt or not isinstance(exc, (sqlite3.ProgrammingError, DeletedWalGenerationError)):
++                        _log.info('kanban: replica %s unreadable (%s)', path, exc)
++                        break
++        yield conn
+diff --git a/scripts/kanban_replica_drain_replay.py b/scripts/kanban_replica_drain_replay.py
+new file mode 100644
+index 0000000000..4888b9d841
+--- /dev/null
++++ b/scripts/kanban_replica_drain_replay.py
+@@ -0,0 +1,141 @@
++"""Real supervisor dispatcher drain with populated replicas and descriptor pressure.
++
++Synthetic scale replay, not a hub P1 acceptance result. Includes every drain/poll/
++apply_incoming path; no callback is stubbed. Network and process attempts fail the
++run even when production catches their exceptions. Run in the canonical test env.
++"""
++import argparse
++from contextlib import ExitStack, closing
++import json
++import os
++from pathlib import Path
++import socket
++import subprocess
++import tempfile
++import time
++from unittest.mock import patch
++
++
++def measure(live, replica, ticks, retained):
++    from hermes_cli import kanban_foreign_card as foreign
++    from hermes_cli import kanban_replica_reader as readers
++    from hermes_cli import kanban_reader_retention as retention
++    from hermes_cli import kanban_supervisor_requests as supervisor
++    from hermes_cli import kanban_operator_call as operator
++    from hermes_cli import kanban_sweep_gate as gate
++    from hermes_cli import kanban_lockguard as guard
++
++    path = Path(replica.execute('PRAGMA database_list').fetchone()[2])
++    clock = [1800000000]
++    forbidden, opens = [], []
++    original = guard.connect
++
++    def counted(*args, **kwargs):
++        opens.append(True)
++        return original(*args, **kwargs)
++
++    def refuse(*args, **kwargs):
++        forbidden.append(True)
++        raise AssertionError('replay attempted external side effect')
++
++    retention.close_all()
++    gate.reset()
++    live.execute('DELETE FROM supervisor_executors')
++    live.commit()
++    with ExitStack() as stack:
++        stack.enter_context(patch.object(foreign, 'replica_path', lambda _: path))
++        stack.enter_context(patch.object(operator, '_own_gateway', lambda _: 'replay-home'))
++        stack.enter_context(patch.object(operator, '_board_slug', lambda _: 'default'))
++        stack.enter_context(patch.object(socket.socket, 'connect', refuse))
++        stack.enter_context(patch.object(subprocess, 'Popen', refuse))
++        stack.enter_context(patch.object(supervisor.time, 'time', lambda: clock[0]))
++        stack.enter_context(patch.object(guard, 'connect', counted))
++        warnings = stack.enter_context(patch.object(supervisor._log, 'warning'))
++        if not retained:
++            stack.enter_context(patch.object(readers, 'open_replica', foreign.open_replica))
++        supervisor.dispatcher_drain(live)
++        assert not warnings.called, warnings.call_args_list
++        assert live.execute('SELECT count(*) FROM operator_call_scan').fetchone()[0] > 0
++        opens.clear()
++        cpu = 0.0
++        for tick in range(ticks):
++            clock[0] += 15
++            # External commits must remain visible, though no operator action is queued.
++            if tick % 3 == 0:
++                replica.execute('UPDATE tasks SET title=? WHERE id=?', (str(tick), 't_0000000000000000'))
++                replica.commit()
++            start = time.thread_time()
++            result = supervisor.dispatcher_drain(live)
++            cpu += time.thread_time() - start
++            assert result == []
++            assert not warnings.called, warnings.call_args_list
++        assert not forbidden, 'caught network/process attempt invalidates replay'
++    retention.close_all()
++    return {'cpu_ms_per_tick': 1000 * cpu / ticks, 'core_percent_nine_boards': 900 * cpu / (15 * ticks),
++            'guarded_opens': len(opens), 'ticks': ticks,
++            'last_seen': live.execute('SELECT MAX(last_seen) FROM supervisor_executors').fetchone()[0]}
++
++
++def run(home, tasks, replicas, ticks, wal_mb, fds):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_supervisor_requests as supervisor
++
++    with ExitStack() as stack:
++        live = stack.enter_context(closing(kbc.connect(home / 'live.db')))
++        rep = stack.enter_context(closing(kbc.connect(home / 'replica.db')))
++        for _ in range(fds):
++            stack.enter_context(open(os.devnull, 'rb'))
++        for conn, size in ((live, tasks), (rep, replicas)):
++            for table in ('task_events', 'task_runs'):
++                if 'uid' not in {r[1] for r in conn.execute(f'PRAGMA table_info({table})')}:
++                    conn.execute(f'ALTER TABLE {table} ADD COLUMN uid TEXT')
++            conn.commit()
++            template = kb.create_task(conn, title='replay fixture', assignee='default', created_by='default')
++            cols = [r[1] for r in conn.execute('PRAGMA table_info(tasks)') if r[1] != 'id']
++            values = tuple(conn.execute(f"SELECT {','.join(cols)} FROM tasks WHERE id=?", (template,)).fetchone())
++            conn.execute('BEGIN')
++            conn.executemany(f"INSERT INTO tasks(id,{','.join(cols)}) VALUES ({','.join('?' for _ in range(len(cols)+1))})",
++                             ((f't_{i:016x}', *values) for i in range(size)))
++            conn.commit()
++            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
++        supervisor.ensure_schema(live)
++        live.commit()
++        rep.execute('PRAGMA wal_autocheckpoint=0')
++        if wal_mb:
++            rep.execute('CREATE TABLE wal_padding(payload BLOB)')
++            for _ in range(wal_mb):
++                rep.execute('INSERT INTO wal_padding VALUES (zeroblob(1048576))')
++                rep.commit()
++        wal = Path(str(home / 'replica.db') + '-wal')
++        return {'tasks': tasks, 'replica_tasks': replicas, 'extra_fds': fds,
++                'wal_bytes': wal.stat().st_size if wal.exists() else 0,
++                'legacy': measure(live, rep, ticks, False), 'retained': measure(live, rep, ticks, True)}
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--ticks', type=int, default=240)
++    parser.add_argument('--wal-mb', type=int, default=0)
++    parser.add_argument('--fds', type=int, default=512)
++    parser.add_argument('--output', type=Path, required=True)
++    args = parser.parse_args()
++    if args.ticks < 1 or min(args.wal_mb, args.fds) < 0:
++        parser.error('positive ticks and nonnegative WAL/FD counts required')
++    with tempfile.TemporaryDirectory(prefix='replica-drain-replay-') as root:
++        os.environ['HERMES_HOME'] = root
++        for key in tuple(os.environ):
++            if key.startswith(('HERMES_KANBAN', 'HERMES_SESSION', 'HERMES_DELEGATED_CHILD_CONTEXT')):
++                del os.environ[key]
++        results = []
++        for tasks, replicas in ((1000, 10000), (5800, 40000), (20000, 40000)):
++            home = Path(root) / str(tasks)
++            home.mkdir()
++            results.append(run(home, tasks, replicas, args.ticks, args.wal_mb, args.fds))
++    text = json.dumps(results, indent=2)
++    args.output.write_text(text + '\n', encoding='utf-8')
++    print(text)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tests/hermes_cli/test_kanban_operator_retained_replica.py b/tests/hermes_cli/test_kanban_operator_retained_replica.py
+new file mode 100644
+index 0000000000..9e0244f5be
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_operator_retained_replica.py
+@@ -0,0 +1,29 @@
++"""Exercise operator retry/replay through real retained replica scopes, not injected connections."""
++import pytest
++
++from hermes_cli import kanban_foreign_card as foreign
++from hermes_cli import kanban_operator_call as operator
++from hermes_cli import kanban_reader_retention as retention
++from tests.hermes_cli import test_kanban_operator_call as cases
++
++fleet = cases.fleet
++_REAL_REPLICA = operator._replica
++
++
++@pytest.mark.parametrize('case', [
++    cases.test_worker_comments_on_foreign_card_through_operator_call,
++    cases.test_replay_never_applies_twice,
++    cases.test_unreachable_board_defers_instead_of_refusing,
++    cases.test_home_executes_only_the_card_the_request_names,
++    cases.test_result_waits_while_the_board_cannot_vouch_for_it,
++    cases.test_rebuilt_replica_is_rescanned_even_at_a_reused_position,
++])
++def test_real_reader_operator_contract(fleet, monkeypatch, case):
++    from pathlib import Path
++    path = Path(fleet.rep.execute('PRAGMA database_list').fetchone()[2])
++    monkeypatch.setattr(foreign, 'replica_path', lambda _: path)
++    monkeypatch.setattr(operator, '_replica', _REAL_REPLICA)
++    try:
++        case(fleet)
++    finally:
++        retention.close_all()
+diff --git a/tests/hermes_cli/test_kanban_replica_reader.py b/tests/hermes_cli/test_kanban_replica_reader.py
+new file mode 100644
+index 0000000000..302b687c32
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replica_reader.py
+@@ -0,0 +1,195 @@
++"""Real guarded-reader contracts for dispatcher replica reuse (G2b)."""
++import sqlite3
++from concurrent.futures import ThreadPoolExecutor
++from contextlib import closing, contextmanager
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_foreign_card as foreign
++from hermes_cli import kanban_lockguard as guard
++from hermes_cli import kanban_reader_retention as retention
++from hermes_cli import kanban_session_activity as activity
++
++
++@contextmanager
++def borrow(path):
++    from hermes_cli.kanban_replica_reader import open_replica
++    with open_replica(str(path)) as conn:
++        yield conn
++
++
++@pytest.fixture
++def replica(tmp_path, monkeypatch):
++    path = tmp_path / 'replica.db'
++    writer = guard.connect(str(path))
++    writer.execute('PRAGMA journal_mode=WAL')
++    writer.execute('CREATE TABLE sample(value TEXT)')
++    writer.execute("INSERT INTO sample VALUES ('before')")
++    writer.commit()
++    monkeypatch.setattr(foreign, 'replica_path', lambda _: path if path.is_file() else None)
++    yield path, writer
++    retention.close_all()
++    writer.close()
++
++
++def test_reuses_guarded_open_and_observes_external_commit(replica, monkeypatch):
++    path, writer = replica
++    calls = []
++    original = guard.connect
++
++    def counted(*args, **kwargs):
++        calls.append(args)
++        return original(*args, **kwargs)
++
++    monkeypatch.setattr(guard, 'connect', counted)
++    with borrow(path) as first:
++        assert first.execute('SELECT value FROM sample').fetchone()['value'] == 'before'
++    writer.execute("UPDATE sample SET value='after'")
++    writer.commit()
++    with borrow(path) as second:
++        assert second.execute('SELECT value FROM sample').fetchone()['value'] == 'after'
++        assert first is second
++    assert len(calls) == 1
++
++
++@pytest.mark.parametrize('error', [None, ValueError, sqlite3.OperationalError])
++def test_transaction_release_and_error_propagation(replica, error):
++    path, writer = replica
++
++    def scope():
++        with borrow(path) as conn:
++            conn.execute('BEGIN')
++            assert conn.execute('SELECT value FROM sample').fetchone()[0] == 'before'
++            if error:
++                raise error('body sentinel')
++
++    if error:
++        with pytest.raises(error, match='body sentinel'):
++            scope()
++    else:
++        scope()
++    writer.execute("UPDATE sample SET value='after'")
++    writer.commit()
++    with borrow(path) as conn:
++        assert not conn.in_transaction
++        assert conn.execute('SELECT value FROM sample').fetchone()[0] == 'after'
++
++
++def test_row_readonly_timeout_and_shared_reset(replica):
++    path, _ = replica
++    with borrow(path) as conn:
++        assert conn.row_factory is sqlite3.Row
++        assert conn.execute('PRAGMA busy_timeout').fetchone()[0] == 5000
++        with pytest.raises(sqlite3.OperationalError):
++            conn.execute("UPDATE sample SET value='bad'")
++    with activity.cached_ro(path) as shared:
++        assert shared.row_factory is None
++        assert shared.execute('PRAGMA busy_timeout').fetchone()[0] == 500
++    with borrow(path) as again:
++        assert again is conn
++        assert again.row_factory is sqlite3.Row
++
++
++def test_nested_and_concurrent_borrow_do_not_wait_on_shared_lock(replica):
++    path, _ = replica
++    with activity.cached_ro(path) as held:
++        with borrow(path) as nested:
++            assert nested is not held
++            assert nested.execute('SELECT value FROM sample').fetchone()[0] == 'before'
++        with ThreadPoolExecutor(max_workers=1) as pool:
++            def read():
++                with borrow(path) as concurrent:
++                    return concurrent.execute('SELECT value FROM sample').fetchone()[0]
++            assert pool.submit(read).result(timeout=10) == 'before'
++        assert held.execute('SELECT value FROM sample').fetchone()[0] == 'before'
++
++
++def test_bound_and_active_borrower_retirement(replica, monkeypatch):
++    path, _ = replica
++    monkeypatch.setattr(retention, 'LIMIT', 0)
++    with borrow(path) as conn:
++        retention.prune(missing=str(path))
++        assert conn.execute('SELECT value FROM sample').fetchone()[0] == 'before'
++        assert str(path) in activity._RO_CACHE
++    assert str(path) not in activity._RO_CACHE
++    with pytest.raises(sqlite3.ProgrammingError):
++        conn.execute('SELECT 1')
++
++
++def test_path_resolved_each_borrow_and_missing_not_created(replica, monkeypatch, tmp_path):
++    path, _ = replica
++    with borrow(path) as first:
++        assert first is not None
++    missing = tmp_path / 'missing.db'
++    monkeypatch.setattr(foreign, 'replica_path', lambda _: missing)
++    with borrow(path) as absent:
++        assert absent is None
++    assert not missing.exists()
++    with closing(guard.connect(str(missing))) as writer:
++        writer.execute('CREATE TABLE other(value)')
++        writer.commit()
++    with borrow(path) as created:
++        assert created is not None
++        assert created.execute('SELECT count(*) FROM other').fetchone()[0] == 0
++
++
++def test_replacement_reopens_without_manual_cache_clear(replica, tmp_path):
++    path, writer = replica
++    with borrow(path) as old:
++        assert old.execute('SELECT value FROM sample').fetchone()[0] == 'before'
++    assert writer.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0] == 0
++    writer.close()
++    replacement = tmp_path / 'replacement.db'
++    with closing(guard.connect(str(replacement))) as other:
++        other.execute('CREATE TABLE sample(value TEXT)')
++        other.execute("INSERT INTO sample VALUES ('replacement')")
++        other.commit()
++    replacement.replace(path)
++    with borrow(path) as current:
++        assert current is not old
++        assert current.execute('SELECT value FROM sample').fetchone()[0] == 'replacement'
++
++
++def test_deleted_sidecars_recover_before_reuse(replica):
++    path, writer = replica
++    with borrow(path) as first:
++        assert first.execute('SELECT value FROM sample').fetchone()[0] == 'before'
++    assert writer.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0] == 0
++    writer.close()
++    Path(str(path) + '-wal').unlink()
++    Path(str(path) + '-shm').unlink()
++    with borrow(path) as second:
++        assert second is not first
++        assert second.execute('SELECT value FROM sample').fetchone()[0] == 'before'
++    with pytest.raises(sqlite3.ProgrammingError):
++        first.execute('SELECT 1')
++
++
++def test_closed_cached_handle_recovers(replica):
++    path, _writer = replica
++    with borrow(path) as first:
++        first.execute('SELECT value FROM sample').fetchall()
++    first.close()  # model a same-thread recovery closing an idle handle
++    with borrow(path) as second:
++        assert second is not first
++        assert second.execute('SELECT value FROM sample').fetchone()[0] == 'before'
++
++
++def test_evicted_entry_between_prepare_and_lock_is_a_miss(replica, monkeypatch):
++    from hermes_cli import kanban_reader_lifecycle as lifecycle
++    path, _ = replica
++    original = lifecycle.cached_entry
++
++    def evicted(*args, **kwargs):
++        key, entry = original(*args, **kwargs)
++        retention.prune(missing=key)
++        return key, entry
++
++    monkeypatch.setattr(lifecycle, 'cached_entry', evicted)
++    with borrow(path) as conn:
++        assert conn is None
++    monkeypatch.setattr(lifecycle, 'cached_entry', original)
++    with borrow(path) as conn:
++        assert conn.execute('SELECT value FROM sample').fetchone()[0] == 'before'
++
+-- 
+2.43.0
+

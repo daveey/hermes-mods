@@ -1,0 +1,97 @@
+From 1418b2046c51d105e3b7bbbbbf9f395641a1a77b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 00:29:42 +0000
+Subject: [PATCH] fix(cron): stamp adopting worker before ready acknowledgement
+ [daveey]
+
+Refresh the owner-fenced fire claim after execution adoption and before publishing readiness. Otherwise gateway exit before run_one_job starts leaves a live worker reclaimable. Refuse ack and execution on replacement ownership. Regression failed before the fix with runner=None at ready publication; full cron suite: 3108 passed, 9 skipped. scripts/check: 20 checks passed.
+---
+ cron/scheduler.py                             |  6 ++
+ ...est_external_worker_fire_claim_adoption.py | 58 +++++++++++++++++++
+ 2 files changed, 64 insertions(+)
+ create mode 100644 tests/cron/test_external_worker_fire_claim_adoption.py
+
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index b0b3fe0c8f..ca9fdd956a 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -4199,6 +4199,12 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
+                     execution_id,
+                 )
+                 return False
++            # Stamp the adopting process before readiness, not at run_one_job's first
++            # heartbeat: the claiming gateway may exit as soon as it sees the ack.
++            owner = (job.get("fire_claim") or {}).get("by")
++            if owner and not heartbeat_fire_claim(job["id"], expected_owner=owner):
++                logger.error("Cron external worker lost fire claim for %s", execution_id)
++                return False
+             try:
+                 ack_path.parent.mkdir(parents=True, exist_ok=True)
+                 # Publish via write-to-temp + atomic rename. Writing ack_path in place
+diff --git a/tests/cron/test_external_worker_fire_claim_adoption.py b/tests/cron/test_external_worker_fire_claim_adoption.py
+new file mode 100644
+index 0000000000..21f97a67c3
+--- /dev/null
++++ b/tests/cron/test_external_worker_fire_claim_adoption.py
+@@ -0,0 +1,58 @@
++"""A detached worker must protect its fire claim before advertising readiness."""
++import json
++import os
++import socket
++
++import pytest
++
++from cron import jobs, scheduler
++from cron.jobs import use_cron_store
++
++
++@pytest.mark.parametrize("replaced", [False, True])
++def test_worker_stamps_claim_before_ready_without_run_heartbeat(tmp_path, monkeypatch, replaced):
++    home = tmp_path / "profile"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.delenv("HERMES_MACHINE_ID", raising=False)
++    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
++    monkeypatch.setattr("hermes_cli.env_loader.hydrate_profile_secret_sources", lambda *_: None)
++    monkeypatch.setattr("gateway.run_startup.GatewayStartupMixin._register_config_hooks", lambda *_a, **_k: None)
++    monkeypatch.setattr("cron.executions.adopt_claimed_execution", lambda *_: {"status": "running"})
++    # The gateway is provably dead; this process is the live adopting worker.
++    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: pid == os.getpid())
++    with use_cron_store(home):
++        job = jobs.create_job(prompt="x", schedule="every 5m", name="adoption")
++        assert jobs.claim_job_for_fire(job["id"])
++        records = jobs.load_jobs()
++        records[0]["fire_claim"]["by"] = f"{socket.gethostname()}:999999999:gateway"
++        jobs.save_jobs(records)
++        job = jobs.get_job(job["id"])
++        job["execution_id"] = "adopted-execution"
++        if replaced:
++            records[0]["fire_claim"]["by"] = "replacement:123:token"
++            jobs.save_jobs(records)
++    payload, ack = tmp_path / "payload.json", tmp_path / "ready"
++    payload.write_text(json.dumps({"job": job, "profile_home": str(home)}))
++    observed = []
++    real_replace = os.replace
++
++    def publish(src, dst):
++        if dst == ack:
++            observed.append("ready")
++            claim = jobs.get_job(job["id"])["fire_claim"]
++            assert claim.get("runner") == f"{socket.gethostname()}:{os.getpid()}"
++            assert not jobs.claim_job_for_fire(job["id"])
++        return real_replace(src, dst)
++
++    monkeypatch.setattr(os, "replace", publish)
++    # No run_one_job heartbeat can rescue the claim before the ack assertion.
++    monkeypatch.setattr(scheduler, "run_one_job", lambda *_a, **_k: observed.append("run") or True)
++    assert scheduler._run_external_worker_payload(payload, ack) is (not replaced)
++    assert observed == ([] if replaced else ["ready", "run"])
++    assert ack.exists() is (not replaced)
++    if replaced:
++        with use_cron_store(home):
++            claim = jobs.get_job(job["id"])["fire_claim"]
++            assert claim["by"] == "replacement:123:token"
++            assert "runner" not in claim
+-- 
+2.43.0
+

@@ -1,0 +1,140 @@
+From 13d4a0897cbf218b10f31540739dc372faafa123 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 00:54:45 +0000
+Subject: [PATCH] [daveey] Guard watched kanban tables against REPLACE writers
+
+Scan Python literals and SQL/JS/TS sources under hermes_cli, gateway and plugins. Reject both REPLACE forms on all seven watched tables and direct writers to the safe ON CONFLICT DO UPDATE contract. No production trigger semantics change.
+
+Proof: 74 targeted tests passed. Adding a scratch task_comments REPLACE writer made the production scan fail at its exact path/line with safe-upsert guidance; removing it restored all 36 guard tests. scripts/check --base origin/main: 20 checks passed. The affected-test selector includes source-tree scanners in its always-run smoke set.
+---
+ .../test_kanban_no_replace_guard.py           | 118 ++++++++++++++++++
+ 1 file changed, 118 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_no_replace_guard.py
+
+diff --git a/tests/hermes_cli/test_kanban_no_replace_guard.py b/tests/hermes_cli/test_kanban_no_replace_guard.py
+new file mode 100644
+index 0000000000..3fbb818462
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_no_replace_guard.py
+@@ -0,0 +1,118 @@
++"""Reject REPLACE writers that can silently invalidate the task cursor. [daveey]
++
++This is a static literal guard, not SQL data-flow analysis: dynamically assembled
++identifiers/keywords require review. The executable counterexample lives under
++ tests/, outside the production roots scanned here.
++"""
++
++import ast
++from pathlib import Path
++import re
++
++import pytest
++
++
++ROOT = Path(__file__).resolve().parents[2]
++WATCHED = (
++    "tasks", "task_links", "task_runs", "task_events", "task_comments",
++    "task_chat_links", "kanban_notify_subs",
++)
++# SQL comments are legal whitespace even between INSERT / OR / REPLACE.
++SPACE = r"(?:\s|/\*[\s\S]*?\*/|--[^\n]*(?:\n|$))+"
++IDENT = r'(?:[a-z_]\w*|"[^\"]+"|`[^`]+`|\[[^\]]+\])'
++REPLACE = re.compile(
++    rf"\b(?:INSERT{SPACE}OR{SPACE})?REPLACE{SPACE}INTO{SPACE}"
++    rf"(?:(?:{IDENT})\s*\.\s*)?(?P<table>{IDENT})",
++    re.IGNORECASE,
++)
++SOURCE_SUFFIXES = {".py", ".sql", ".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs"}
++
++
++def _violations(text):
++    return [
++        match.group("table")
++        for match in REPLACE.finditer(text)
++        if match.group("table").strip('"`[]').lower() in WATCHED
++    ]
++
++
++def _scan(root):
++    failures = []
++    for directory in ("hermes_cli", "gateway", "plugins"):
++        for path in sorted((root / directory).rglob("*")):
++            relative = path.relative_to(root)
++            if (path.suffix not in SOURCE_SUFFIXES or "tests" in relative.parts
++                    or "__tests__" in relative.parts or path.name.startswith("test_")
++                    or any(part in {"node_modules", "__pycache__", ".git"} for part in relative.parts)):
++                continue
++            source = path.read_text(encoding="utf-8")
++            if path.suffix == ".py":
++                # AST folds adjacent literals and exposes static f-string pieces;
++                # comments are excluded without an exemption for production files.
++                strings = [(node.lineno, node.value) for node in ast.walk(ast.parse(source))
++                           if isinstance(node, ast.Constant) and isinstance(node.value, str)]
++            else:
++                strings = [(1, source)]
++            for line, text in strings:
++                for table in _violations(text):
++                    failures.append(f"{relative}:{line}: REPLACE writes watched table {table}")
++    return failures
++
++
++def test_production_writers_do_not_replace_watched_tables():
++    failures = _scan(ROOT)
++    assert not failures, (
++        "\n".join(failures)
++        + "\nUse INSERT ... ON CONFLICT(...) DO UPDATE instead. See the writer "
++        "precondition in hermes_cli/kanban_task_change.py: REPLACE can silently "
++        "delete another task's row without marking its change cursor."
++    )
++
++
++@pytest.mark.parametrize("table", WATCHED)
++@pytest.mark.parametrize("prefix", ["INSERT OR REPLACE INTO", "replace into", "INSERT\nOR\nREPLACE INTO"])
++def test_every_watched_table_is_rejected(table, prefix):
++    assert _violations(f"{prefix} {table} (id) VALUES (?)") == [table]
++
++
++@pytest.mark.parametrize("table", ['"task_comments"', '`task_comments`', '[task_comments]', 'TASK_COMMENTS'])
++def test_quoted_schema_qualified_tables(table):
++    assert _violations(f"REPLACE INTO main.{table}(uid) VALUES (?)") == [table]
++
++
++def test_sql_comments_between_keywords():
++    assert _violations("INSERT /* why */ OR -- note\n REPLACE INTO tasks(id) VALUES (?)") == ["tasks"]
++
++
++@pytest.mark.parametrize("sql", [
++    "INSERT INTO tasks(id) VALUES (?) ON CONFLICT(id) DO UPDATE SET id=excluded.id",
++    "INSERT OR IGNORE INTO tasks VALUES (?)",
++    "INSERT OR REPLACE INTO tasks_archive VALUES (?)",
++    "REPLACE INTO kanban_sync_tombstones VALUES (?)",
++    "SELECT replace(body, 'x', 'y') FROM task_comments",
++])
++def test_safe_statements_are_allowed(sql):
++    assert not _violations(sql)
++
++
++@pytest.mark.parametrize("directory", ["hermes_cli", "gateway", "plugins/example"])
++def test_scan_finds_scratch_caller_and_excludes_tests(tmp_path, directory):
++    target = tmp_path / directory
++    target.mkdir(parents=True)
++    (target / "writer.py").write_text(
++        'db.execute("INSERT OR REPLACE " "INTO task_comments VALUES (?)")\n'
++        'db.execute(f"REPLACE INTO tasks VALUES ({value})")\n', encoding="utf-8",
++    )
++    (target / "test_counterexample.py").write_text(
++        'db.execute("REPLACE INTO tasks VALUES (?)")', encoding="utf-8",
++    )
++    failures = _scan(tmp_path)
++    assert len(failures) == 2
++    assert all(f"{directory}/writer.py:" in failure for failure in failures)
++
++
++def test_scan_covers_non_python_sources(tmp_path):
++    target = tmp_path / "plugins"
++    target.mkdir()
++    (target / "writer.ts").write_text('db.exec(`REPLACE INTO tasks VALUES (?)`)', encoding="utf-8")
++    assert _scan(tmp_path) == ["plugins/writer.ts:1: REPLACE writes watched table tasks"]
+-- 
+2.43.0
+

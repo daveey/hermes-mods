@@ -1,0 +1,299 @@
+From c15db543f4c6d509b185d6157163696514df25a8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:01:19 +0000
+Subject: [PATCH] fix(lifecycle): resolve complete process-substitution writers
+ [daveey]
+
+The output substitution opened before later operands and stdin redirects were known. Collect complete writer variants in the probe walk; apply current resolved input substitutions when feeding nested bodies. Preserve >| as a redirection, carry group feeds before suspension, and distinguish output-body stdout from input-substitution operands. Tee reads its own redirected stdin, not output operands.
+
+Proof: 17 scan cases fail at previous reviewed head 4d8aca792b and pass now; two nested cases were additionally red on recovered WIP before current-variant expansion. Full lifecycle suite passed 1072 tests before four final cat/tee mutation controls. Combined cat-relay/group-redirections/arithmetic/feed tests passed 244. Cat/tee relay condition mutants exercised with paired positive/negative controls. Earlier base RED and 22531-command replay retained in task evidence.
+---
+ cron/lifecycle_guard.py                       |  6 +-
+ cron/lifecycle_guard_groups.py                | 83 ++++++++++++++-----
+ .../cron/test_lifecycle_guard_feed_routing.py | 34 ++++++++
+ 3 files changed, 98 insertions(+), 25 deletions(-)
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index e8d8920998..c112b3fe29 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -944,12 +944,12 @@ def _split_redirections(arguments: list[str]) -> tuple[list[str], list[str]]:
+ 
+ def _cat_operands(segment: Optional[list[str]]) -> list[str]:
+     """Files a ``cat`` segment writes to its stdout (its stdout piped on to a program reader),
+-    its own stdin included (``cat < f.py | python3``, ``cat - < f.py``)."""
++    its own stdin included (``cat < f.py | python3``, ``cat - < f.py``, ``tee x < f.py``)."""
+     for view in _command_segment_views(segment) if segment else []:
+         index = _executed_command_index(view)
+-        if index is not None and _executable_name(view[index]) == "cat":
++        if index is not None and (name := _executable_name(view[index])) in ("cat", "tee"):
+             arguments, stdin = _split_redirections(view[index + 1 :])
+-            return [argument for argument in arguments if not argument.startswith("-")] + stdin
++            return [a for a in arguments if name == "cat" and not a.startswith("-")] + stdin
+     return []
+ 
+ 
+diff --git a/cron/lifecycle_guard_groups.py b/cron/lifecycle_guard_groups.py
+index 275c976ecd..dbbec52ced 100644
+--- a/cron/lifecycle_guard_groups.py
++++ b/cron/lifecycle_guard_groups.py
+@@ -27,12 +27,17 @@ _COMMAND_OPENERS = {"for": "done", "select": "done", "case": "esac"}
+ _CLOSERS = frozenset({"}", "fi", "done", "esac"})
+ # Stands where a `<(…)` that writes no known file was: NUL keeps it from ever naming a path.
+ PROCESS_SUBSTITUTION = "\x00<(…)"
++# A `<`, or a stdout redirection, right before a `(` opens a process substitution (`>>(…)`).
++_SUBSTITUTION_OPENERS = frozenset({"<", ">", ">>", ">|", "1>", "1>>", "1>|", "&>", "&>>"})
+ # Operators that carry a command on past the end of its line.
+ _CONTINUING_OPERATORS = frozenset({"|", "|&", "&&", "||"})
+ # Stands, while tokenizing, for the `&` of `>&`, `<&`, `&>` and `&>>` (a private-use character).
+ _REDIRECTION_AMPERSAND = "\ue000"
++_REDIRECTION_PIPE = "\ue001"  # likewise the `|` of `>|`
+ 
+ Context = tuple[list[str], bool, list[str]]
++# Each process substitution of a command: (its position, or None for a `>(…)`, files it writes).
++_Subs = list[tuple[Optional[int], list[str]]]
+ 
+ 
+ # Bash's `{NAME}>x` / `{NAME}<x` / `{NAME}>&N`: allocate a descriptor into $NAME (a whole word only).
+@@ -132,7 +137,8 @@ def protect_redirection_ampersands(line: str) -> str:
+     """*line* with the ``&`` of each unquoted, unescaped redirection operator (``2>&1``, ``<&0``,
+     ``&>f``, ``&>>f``) swapped for a word character, so a tokenizer splitting on ``&`` keeps the
+     redirection whole instead of reading a background ``&``. ``&&``, ``|&`` and a lone ``&``
+-    keep theirs. Undo per token with ``restore_redirection_ampersands``."""
++    keep theirs. The ``|`` of ``>|f`` is swapped too: it is no pipe. Undo per token with
++    ``restore_redirection_ampersands``."""
+     out: list[str] = []
+     in_single = in_double = escape = False
+     previous = ""  # the last character when it was unquoted and unescaped
+@@ -152,6 +158,8 @@ def protect_redirection_ampersands(line: str) -> str:
+             if ch == "&" and (previous in ("<", ">")
+                               or (after == ">" and previous not in ("&", "|"))):
+                 ch = _REDIRECTION_AMPERSAND
++            elif ch == "|" and previous == ">":  # `>|f` writes f; it pipes nothing
++                ch = _REDIRECTION_PIPE
+         previous = ch if shell_character else ""
+         out.append(ch)
+     return "".join(out)
+@@ -159,7 +167,7 @@ def protect_redirection_ampersands(line: str) -> str:
+ 
+ def restore_redirection_ampersands(token: str) -> str:
+     """*token* as written (see ``protect_redirection_ampersands``)."""
+-    return token.replace(_REDIRECTION_AMPERSAND, "&")
++    return token.replace(_REDIRECTION_AMPERSAND, "&").replace(_REDIRECTION_PIPE, "|")
+ 
+ 
+ def join_continued_lines(token_lists: Iterable[list[str]]) -> Iterator[list[str]]:
+@@ -187,8 +195,8 @@ class _Group:
+     ordinal: int = -1
+     output: list[str] = field(default_factory=list)
+     # A process substitution suspends the command it stands in: (words, call_argument, subs,
+-    # feed); the group's own feed is what its body reads.
+-    outer: Optional[tuple[list[str], bool, list[tuple[int, list[str]]], list[str]]] = None
++    # feed, its `>(…)` ordinals); the group's own feed is what its body reads.
++    outer: Optional[tuple[list[str], bool, _Subs, list[str], list[int]]] = None
+ 
+ 
+ def _opened_groups(segment: list[str], peel_reserved_words: Callable[[list[str]], int]) -> list[str]:
+@@ -200,11 +208,12 @@ def _opened_groups(segment: list[str], peel_reserved_words: Callable[[list[str]]
+     return closers
+ 
+ 
+-def _substituted_variants(segment: list[str], subs: list[tuple[int, list[str]]]) -> list[list[str]]:
++def _substituted_variants(segment: list[str], subs: _Subs) -> list[list[str]]:
+     """One reading of *segment* per file a process substitution writes, each in its place (the
+-    others left as ``PROCESS_SUBSTITUTION``); *segment* itself when none writes a file."""
++    others left as ``PROCESS_SUBSTITUTION``); *segment* itself when none writes a file. A ``>(…)``
++    (position ``None``) writes to the command's stdout instead."""
+     variants = [segment[:position] + [name] + segment[position + 1:]
+-                for position, files in subs for name in files]
++                for position, files in subs if position is not None for name in files]
+     return variants or [segment]
+ 
+ 
+@@ -212,7 +221,8 @@ class _LineWalk:
+     """State of one line's walk; ``contexts`` yields ``(segment, call_argument, piped_files)``."""
+ 
+     def __init__(self, cat_operands, cat_relays_stdin, opens_call_arguments, peel_reserved_words,
+-                 stdin_redirections, redirected: Optional[dict[int, list[str]]] = None) -> None:
++                 stdin_redirections, redirected: Optional[dict[int, list[str]]] = None,
++                 writers: Optional[dict[int, list[list[str]]]] = None) -> None:
+         self.cat_operands = cat_operands
+         self.cat_relays_stdin = cat_relays_stdin
+         self.opens_call_arguments = opens_call_arguments
+@@ -222,12 +232,18 @@ class _LineWalk:
+         # the line read them after the closer, which this walk reaches only after the commands.
+         self.redirected = redirected or {}
+         self.found_redirections: dict[int, list[str]] = {}
++        # The whole command each `>(…)` stands in, by ordinal (`cat > >(python3) f.py`): an
++        # earlier walk read the words after the `)`, which this walk reaches only after the body.
++        self.writers = writers or {}
++        self.found_writers: dict[int, list[list[str]]] = {}
++        self.output_subs: list[int] = []  # ordinals of the current command's `>(…)`
++        self.groups_open = False  # whether the current segment's own groups are open
+         self.opened = 0
+         # (ordinal, words to skip) of the group closed right before the current segment: its
+         # words past the closer are that group's redirections (`} < f`, `) < f`, `done < f`).
+         self.closing: Optional[tuple[int, int]] = None
+         self.segment: list[str] = []
+-        self.subs: list[tuple[int, list[str]]] = []
++        self.subs: _Subs = []
+         self.call_argument = False
+         self.feed: list[str] = []
+         # What the last finished command (or closed group) wrote, until an operator routes it:
+@@ -258,15 +274,27 @@ class _LineWalk:
+                 self.found_redirections[ordinal] = files
+             self.closing = None
+         # Open this segment's groups first: its own command (`{ bash`, `while read l`) runs in them.
+-        for closer in _opened_groups(self.segment, self.peel_reserved_words):
+-            self.open_group(closer)
+-        written: list[str] = []
+-        for variant in _substituted_variants(self.segment, self.subs):
++        self.open_segment_groups()
++        written: list[str] = [name for position, files in self.subs if position is None
++                              for name in files]  # `echo >(cat f.py) | python3`
++        variants = _substituted_variants(self.segment, self.subs)
++        for ordinal in self.output_subs:
++            self.found_writers[ordinal] = variants
++        for variant in variants:
+             yield variant, self.call_argument, self.feed
+             written += self.writes(variant)
+         self.pending = self.closed if self.closed is not None else written
+         self.closed = None
+-        self.segment, self.subs = [], []
++        self.segment, self.subs, self.output_subs = [], [], []
++        self.groups_open = False
++
++    def open_segment_groups(self) -> None:
++        """Open the compound commands the current segment starts, once (at its first process
++        substitution or at its end): ``{ tee >(python3); } < f.py`` feeds the ``>(…)`` too."""
++        if not self.groups_open:
++            for closer in _opened_groups(self.segment, self.peel_reserved_words):
++                self.open_group(closer)
++            self.groups_open = True
+ 
+     def writes(self, segment: list[str]) -> list[str]:
+         """Files *segment* writes to its stdout. A bare ``cat`` (or ``cat -``, ``tee``) writes
+@@ -289,8 +317,10 @@ class _LineWalk:
+         """Back in the command a closed ``<(…)`` stands in."""
+         if group.outer is None:
+             return
+-        self.segment, self.call_argument, self.subs, self.feed = group.outer
+-        self.subs.append((len(self.segment), group.output))
++        self.segment, self.call_argument, self.subs, self.feed, self.output_subs = group.outer
++        self.groups_open = True  # opened before the substitution suspended it
++        output = group.ordinal in self.output_subs  # a `>(…)` body writes the command's stdout
++        self.subs.append((None if output else len(self.segment), group.output))
+         self.segment.append(PROCESS_SUBSTITUTION)
+ 
+     def word(self, token: str) -> None:
+@@ -315,12 +345,20 @@ class _LineWalk:
+             # A closed `( … )` writes on until an operator routes it; its redirections
+             # (`(cat f.py) 2>&1 | python3`) are a segment of their own.
+             self.closed = None
+-        if operator == "(" and self.segment and self.segment[-1] in ("<", ">"):
+-            # `>(…)` reads what its command writes so far (`cat f.py > >(python3)`).
+-            feed = self.feed if self.segment.pop() == "<" else self.writes(self.segment)
+-            self.open_group(")", outer=(self.segment, self.call_argument, self.subs, self.feed),
+-                            feed=feed)
++        if operator == "(" and self.segment and self.segment[-1] in _SUBSTITUTION_OPENERS:
++            # `>(…)` reads what its whole command writes (`cat f.py > >(python3)`, `cat >
++            # >(python3) f.py`, `tee >(python3) < f.py`), the words after it from the probe walk.
++            self.open_segment_groups()  # `{ tee >(python3); } < f.py`
++            feed, ordinal = self.feed, self.opened
++            if self.segment.pop() != "<":
++                self.output_subs.append(ordinal)
++                variants = _substituted_variants(self.segment, self.subs)
++                feed = [name for segment in [*variants, *self.writers.get(ordinal, [])]
++                        for name in self.writes(segment)]
++            self.open_group(")", outer=(self.segment, self.call_argument, self.subs, self.feed,
++                                        self.output_subs), feed=feed)
+             self.segment, self.subs, self.call_argument, self.feed = [], [], False, feed
++            self.output_subs, self.groups_open = [], False
+             return
+         next_is_call = operator == "(" and bool(self.segment) \
+             and self.opens_call_arguments(self.segment)
+@@ -380,7 +418,8 @@ def iter_line_segment_contexts(
+     probe = _LineWalk(*callables)
+     for _ in _walk(probe, tokens):
+         pass
+-    yield from _walk(_LineWalk(*callables, redirected=probe.found_redirections), tokens)
++    yield from _walk(_LineWalk(*callables, redirected=probe.found_redirections,
++                               writers=probe.found_writers), tokens)
+ 
+ 
+ def _walk(walk: _LineWalk, tokens: list[str]) -> Iterator[Context]:
+diff --git a/tests/cron/test_lifecycle_guard_feed_routing.py b/tests/cron/test_lifecycle_guard_feed_routing.py
+index b17a7a5a9f..c07a5d1f5d 100644
+--- a/tests/cron/test_lifecycle_guard_feed_routing.py
++++ b/tests/cron/test_lifecycle_guard_feed_routing.py
+@@ -54,12 +54,37 @@ def files(tmp_path) -> dict[str, str]:
+         "cat {py} > >(python3)",
+         "cat {sh} > >(bash)",
+         "cat {py} | tee >(python3)",
++        # The `>(…)` body reads the whole command's output, words after it included.
++        "cat > >(python3) {py}",
++        "cat > >(bash) {sh}",
++        "cat >> >(python3) {py}",
++        "cat 1> >(python3) < {py}",
++        "tee >(python3) < {py}",
++        "tee < {py} >(python3)",
++        "{{ tee >(python3); }} < {py}",
++        "{{ cat > >(python3); }} < {py}",
++        "{{ bash <(cat); }} < {sh}",
++        "cat {clean} | tee {out} >(python3) < {py}",
++        "tee {out} < {py} | python3",
++        # `>|` is one redirection operator, not `>` and a pipe.
++        "cat {py} >| >(python3)",
++        "cat >| >(bash) {sh}",
++        "cat {py} &> >(python3)",
++        # A `>(…)` body writes where its command's stdout goes; nested bodies read on.
++        "echo >(cat {py}) | python3",
++        "tee >(python3) >(cat) < {py}",
++        "cat {py} > >(cat | python3)",
++        "cat {py} > >(cat > >(python3))",
++        "cat > >(cat <(cat) > >(python3)) {py}",
++        "{{ cat <(cat) > >(python3); }} < {py}",
+         # 3. A `cat`/`tee` with no file operand passes its stdin through.
+         "cat {py} | cat | python3",
+         "cat {py} | cat - | python3",
+         "cat {py} | if true; then cat; fi | python3",
+         "cat {py} | {{ cat; }} | python3",
+         "cat {py} | tee /dev/null | python3",
++        "cat {py} | tee /dev/null 2<{clean} | python3",
++        "cat {py} | cat 2<{clean} | python3",
+         "cat {py} | cat | cat | python3",
+         # 4. A pipe continued on the next line.
+         "cat {py} |\npython3",
+@@ -109,6 +134,8 @@ def test_routed_stdin_feeds_are_scanned(files, template):
+         "cat | python3",
+         # `tee`'s operands are files it writes, not reads.
+         "cat {clean} | tee {py} | python3",
++        "cat {py} | tee /dev/null < {clean} | python3",
++        "cat {py} | true | python3",
+         # A closed subshell's output ends at the next operator.
+         "(cat {py}); echo hi | python3",
+         "(cat {py}) > {out}; echo hi | python3",
+@@ -117,6 +144,10 @@ def test_routed_stdin_feeds_are_scanned(files, template):
+         "cat {py} &&\npython3",
+         "cat {py}\npython3",
+         "echo '>&' | python3 {clean}",
++        # `>|f` clobbers f; it pipes nothing on.
++        "cat {py} >|{out}; python3 {clean}",
++        # A `>(…)` body fed by a `cat` reading another file.
++        "cat > >(python3) {clean}",
+     ],
+ )
+ def test_routing_mentions_stay_allowed(files, template):
+@@ -141,6 +172,9 @@ def test_redirection_ampersands_survive_tokenizing():
+     assert words("echo '2>&1' \"&>\" 'a&'>x") == ["echo", "2>&1", "&>", "a&>x"]
+     assert words("echo \\>&1") == ["echo", ">", "&", "1"]
+     assert words("echo '>'&1") == ["echo", ">", "&", "1"]
++    # The `|` of `>|` (clobber) stays in its redirection; `> |` is still a pipe.
++    assert words("a >|x 2>| y | b") == ["a", ">|x", "2>|", "y", "|", "b"]
++    assert words("a > | b '>|'") == ["a", ">", "|", "b", ">|"]
+ 
+ 
+ def test_glued_ampersand_redirection_splits_from_its_word():
+-- 
+2.43.0
+

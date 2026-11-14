@@ -1,0 +1,110 @@
+From 3e11cab383ba3804a25da594bd38cba484597c46 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 00:19:19 +0000
+Subject: [PATCH] fix(lifecycle): feed output substitutions from closed groups
+ [daveey]
+
+Preserve compound output and closing-redirection state across substitution bodies, isolating body routing. Combine substitution stdout with closed group output. Addresses review 5899772041.
+
+Proof: 12 group feed cases RED on previous head then GREEN; 3 internal-review regression cases RED then GREEN. Routing suite 126 passed; direct importer suites 1639 passed. Five targeted state/feed mutants killed. Positive and clean brace/subshell/if controls cover repeated and nested substitutions and suffix stdin redirections.
+---
+ cron/lifecycle_guard_groups.py                | 18 +++++++++--
+ .../cron/test_lifecycle_guard_feed_routing.py | 32 +++++++++++++++++++
+ 2 files changed, 47 insertions(+), 3 deletions(-)
+
+diff --git a/cron/lifecycle_guard_groups.py b/cron/lifecycle_guard_groups.py
+index 986bb9c689..e064d12817 100644
+--- a/cron/lifecycle_guard_groups.py
++++ b/cron/lifecycle_guard_groups.py
+@@ -196,6 +196,9 @@ class _Group:
+     # A process substitution suspends the command it stands in: (words, call_argument, subs,
+     # feed, its `>(…)` ordinals); the group's own feed is what its body reads.
+     outer: Optional[tuple[list[str], bool, _Subs, list[str], list[int]]] = None
++    outer_closed: Optional[list[str]] = None
++    outer_closing: Optional[tuple[int, int]] = None
++    outer_pending: list[str] = field(default_factory=list)
+ 
+ 
+ def _opened_groups(segment: list[str], peel_reserved_words: Callable[[list[str]], int]) -> list[str]:
+@@ -282,7 +285,7 @@ class _LineWalk:
+         for variant in variants:
+             yield variant, self.call_argument, self.feed
+             written += self.writes(variant)
+-        self.pending = self.closed if self.closed is not None else written
++        self.pending = (self.closed or []) + written
+         self.closed = None
+         self.segment, self.subs, self.output_subs = [], [], []
+         self.groups_open = False
+@@ -317,6 +320,8 @@ class _LineWalk:
+         if group.outer is None:
+             return
+         self.segment, self.call_argument, self.subs, self.feed, self.output_subs = group.outer
++        self.closed, self.closing, self.pending = (
++            group.outer_closed, group.outer_closing, group.outer_pending)
+         self.groups_open = True  # opened before the substitution suspended it
+         output = group.ordinal in self.output_subs  # a `>(…)` body writes the command's stdout
+         self.subs.append((None if output else len(self.segment), group.output))
+@@ -354,8 +359,15 @@ class _LineWalk:
+                 variants = _substituted_variants(self.segment, self.subs)
+                 feed = [name for segment in [*variants, *self.writers.get(ordinal, [])]
+                         for name in self.writes(segment)]
+-            self.open_group(")", outer=(self.segment, self.call_argument, self.subs, self.feed,
+-                                        self.output_subs), feed=feed)
++                feed += self.closed or []
++            group = self.open_group(")", outer=(self.segment, self.call_argument, self.subs,
++                                                self.feed, self.output_subs), feed=feed)
++            # A closed compound command is the writer, not part of the substitution body.
++            # Suspend its routing state too, so nested bodies cannot consume or replace it.
++            group.outer_closed, group.outer_closing, group.outer_pending = (
++                self.closed, self.closing, self.pending)
++            self.closed = self.closing = None
++            self.pending = []
+             self.segment, self.subs, self.call_argument, self.feed = [], [], False, feed
+             self.output_subs, self.groups_open = [], False
+             return
+diff --git a/tests/cron/test_lifecycle_guard_feed_routing.py b/tests/cron/test_lifecycle_guard_feed_routing.py
+index c262f53ca9..36c7e60576 100644
+--- a/tests/cron/test_lifecycle_guard_feed_routing.py
++++ b/tests/cron/test_lifecycle_guard_feed_routing.py
+@@ -154,6 +154,38 @@ def test_routing_mentions_stay_allowed(files, template):
+     assert scan_gateway_lifecycle(template.format(**files)) == (False, None)
+ 
+ 
++@pytest.mark.parametrize("group", ["{{ cat {source}; }}", "(cat {source})",
++                                    "if true; then cat {source}; fi"])
++@pytest.mark.parametrize("suffix", ["> >(python3)", "2>&1 > >(python3)",
++                                     "> >(cat > >(python3))",
++                                     "> >(cat) | python3", "> >(cat) > >(python3)"])
++@pytest.mark.parametrize("lifecycle", [True, False])
++def test_closed_group_feeds_output_substitution(files, group, suffix, lifecycle):
++    source = files["py" if lifecycle else "clean"]
++    command = group.format(source=source) + " " + suffix
++    assert scan_gateway_lifecycle(command) == (lifecycle, None)
++
++
++@pytest.mark.parametrize("group", ["{ true; }", "(true)", "if true; then true; fi"])
++@pytest.mark.parametrize("lifecycle", [True, False])
++def test_substitution_output_survives_closed_group(files, group, lifecycle):
++    source = files["py" if lifecycle else "clean"]
++    command = group + f" > >(cat {source}) | python3"
++    assert scan_gateway_lifecycle(command) == (lifecycle, None)
++
++
++@pytest.mark.parametrize("group", ["{{ cat; }}", "(cat)", "if true; then cat; fi"])
++def test_closed_group_redirected_stdin_survives_substitution(files, group):
++    command = group.format() + " > >(python3) < " + files["py"]
++    assert scan_gateway_lifecycle(command) == (True, None)
++
++
++@pytest.mark.parametrize("group", ["{{ cat {py}; }}", "(cat {py})"])
++def test_closed_group_does_not_leak_into_substitution_pipeline(files, group):
++    command = group.format(**files) + " > >(cat {clean} | python3)".format(**files)
++    assert scan_gateway_lifecycle(command) == (False, None)
++
++
+ def test_redirection_ampersands_survive_tokenizing():
+     from cron.lifecycle_guard_groups import protect_redirection_ampersands as protect
+     from cron.lifecycle_guard_groups import restore_redirection_ampersands as restore
+-- 
+2.43.0
+

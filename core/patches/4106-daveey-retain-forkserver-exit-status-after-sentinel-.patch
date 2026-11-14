@@ -1,0 +1,111 @@
+From 43b46576e681fced0e3a37a68fa8e7aede2a9187 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 04:15:18 +0000
+Subject: [PATCH] [daveey] retain forkserver exit status after sentinel
+ consumption
+
+Why: PR2830 job132320186016 failed the new diagnostic integration test
+because poll returned None immediately after communicate returned success.
+communicate consumes the forkserver status bytes; the server closes its
+writer separately. Until close, an empty pipe is not readable. The helper
+mistook readiness for status lifetime and discarded the cached exit code.
+Quiet-host tests usually saw writer EOF and hid the race.
+
+Read multiprocessing's cached exit status under the existing fork lock
+before waiting on its sentinel, and join to retain child-registry cleanup.
+This also covers poll-before-communicate and Process.start cleanup reads.
+No fixture sleeps, changed timeouts, retries or weakened assertions.
+
+Proof: deterministic real OS pipe plus stdlib forkserver status decoder,
+writer held open after status consumption: six cases fail before the fix
+and pass after it (success, failure, signal; both call orders). Live-child
+timeout retains output; terminal polls retain status and never reenable
+kill. Original real forkserver diagnostic integration remains unchanged.
+Canonical run_tests.sh: 62 passed across diagnostic and runner suites.
+Full scripts/check --base origin/main and git diff --check passed.
+---
+ scripts/run_tests_launch.py                   |  8 ++++
+ tests/scripts/test_pytest_exit_diagnostics.py | 48 +++++++++++++++++++
+ 2 files changed, 56 insertions(+)
+
+diff --git a/scripts/run_tests_launch.py b/scripts/run_tests_launch.py
+index 4a2ea11547..48b8d2a0e3 100644
+--- a/scripts/run_tests_launch.py
++++ b/scripts/run_tests_launch.py
+@@ -91,6 +91,14 @@ def forked_exit_status(proc, timeout: float | None) -> int | None:
+     """Wait for a fork-server child, then read its status under _fork_lock (None on timeout)."""
+     from multiprocessing.connection import wait
+ 
++    # The status bytes can already be consumed while the forkserver still has
++    # its writer open: an empty sentinel is then not readable, even after join.
++    # exitcode polls/caches status, so protect it from Process.start's cleanup.
++    with _fork_lock:
++        status = proc.exitcode
++        if status is not None:
++            proc.join()
++            return status
+     if not wait([proc.sentinel], timeout):
+         return None
+     with _fork_lock:
+diff --git a/tests/scripts/test_pytest_exit_diagnostics.py b/tests/scripts/test_pytest_exit_diagnostics.py
+index 1a60aaa4ac..edc535016e 100644
+--- a/tests/scripts/test_pytest_exit_diagnostics.py
++++ b/tests/scripts/test_pytest_exit_diagnostics.py
+@@ -136,6 +136,54 @@ def test_forked_child_poll_observes_status_without_consuming_output(monkeypatch,
+     probe.assert_called_once_with(child._proc, 0)
+ 
+ 
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("status", [0, 1, -9])
++@pytest.mark.parametrize("poll_first", [False, True])
++def test_forked_status_survives_consumed_sentinel(tmp_path, monkeypatch, status, poll_first):
++    import multiprocessing
++    import os
++    from multiprocessing.connection import wait
++    from multiprocessing.forkserver import write_signed
++    from multiprocessing.popen_forkserver import Popen
++
++    # Real multiprocessing status decoding, with the forkserver's writer held
++    # open after its status write. No EOF can mask the consumed-pipe race.
++    read_fd, write_fd = os.pipe()
++    popen = Popen.__new__(Popen)
++    popen.sentinel = read_fd
++    popen.returncode = None
++    proc = multiprocessing.get_context("forkserver").Process()
++    proc._popen = popen
++    proc._sentinel = read_fd
++    child = launch._ForkedPytest.__new__(launch._ForkedPytest)
++    child._proc = proc
++    child.returncode = None
++    child.pid = 123
++    child._out = tmp_path / "output"
++    child._out.write_text("preserved diagnostics", encoding="utf-8")
++    kill = Mock()
++    monkeypatch.setattr(launch.os, "kill", kill)
++    try:
++        assert child.poll() is None  # a live child still has no status
++        with pytest.raises(subprocess.TimeoutExpired):
++            child.communicate(timeout=0)
++        assert child._out.exists()
++        write_signed(write_fd, status)
++        if poll_first:
++            assert child.poll() == status
++        assert child.communicate(timeout=0) == ("preserved diagnostics", None)
++        assert wait([read_fd], 0) == []  # consumed bytes, writer not closed
++        assert child.poll() == status
++        assert child.poll() == status
++        assert child.returncode == status
++        assert not child._out.exists()
++        child.kill()
++        kill.assert_not_called()  # terminal status must not resurrect kill eligibility
++    finally:
++        os.close(write_fd)
++        os.close(read_fd)
++
++
+ @pytest.mark.parametrize("status", [None, 0])
+ def test_runner_records_child_status_before_killing(tmp_path, monkeypatch, status):
+     from scripts import run_tests_parallel as runner
+-- 
+2.43.0
+
