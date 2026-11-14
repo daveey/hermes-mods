@@ -112,15 +112,16 @@ def test_normal_discovery_coexists_and_reloads(tmp_path, monkeypatch, order):
         manifest = yaml.safe_load((ROOT / 'plugin.yaml').read_text())
         assert 'pre_final_gate' in manifest['provides_hooks']
         hooks = manager._hooks['pre_final_gate']
-        # coach's goal gate + compute-envelope gate (b532676), ask-gate, chat-closeout.
-        assert len(hooks) == 4
+        # Coach's goal, compute-envelope and status-fresh gates, ask-gate, chat-closeout.
+        assert len(hooks) == 5
         assert sorted(h.__qualname__ for h in hooks) == sorted([
-            'build_gate.<locals>.gate', 'build.<locals>.envelope_gate',
+            'build_gate.<locals>.gate', 'build.<locals>.envelope_gate', 'build.<locals>.status_fresh_gate',
             'pre_final_gate', 'pre_final_gate'])
         coach_hook = next(h for h in hooks if h.__qualname__.startswith('build_gate.'))
         assert coach_hook.needs_buffer is False
         assert coach_hook(final_response='ordinary answer') is None
         manager.discover_and_load(force=True)
-        assert len(manager._hooks['pre_final_gate']) == 4
+        assert sorted(h.__qualname__ for h in manager._hooks['pre_final_gate']) == sorted(
+            h.__qualname__ for h in hooks)
     finally:
         manager.unload()
