@@ -1405,6 +1405,16 @@ export async function performUserTerminal(req, origin, conns) {
       })
       return { ...res, device }
     }
+    if (args.enter && args.job_id) {
+      // action=enter (agent-7e5ac22ea5): press Return once in the job's window, after the user confirmed the step in
+      // chat. Same /start route as focus; a Mac module from before enter refuses the empty command (nothing pressed).
+      const res = await apiPreSendRetry(home.id, `${UT_BASE}/start`, {
+        method: 'POST',
+        body: { command: '', reason: '', cwd: '', origin: { gateway, job_id: String(args.job_id), enter: true } },
+        timeoutMs: 40_000
+      })
+      return { ...res, device }
+    }
     if (args.job_id) {
       const wait = Math.max(0, Math.min(25, Number(args.wait_s) || 0))
       const res = await apiPreSendRetry(home.id, `${UT_BASE}/status/${enc(args.job_id)}?gateway=${enc(gateway)}&wait_s=${wait}`, { timeoutMs: (wait + 20) * 1000 })

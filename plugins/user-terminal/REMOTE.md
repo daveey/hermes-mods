@@ -79,6 +79,15 @@ Invariants (each has a test in `tests_user_terminal.py` or `../session-mentions/
   and the gateway then says to update that Mac, never "focused". Every pending note tells the agent to use focus
   rather than send a link. Tests: `test_focus_*`, `test_pending_note_tells_the_agent_to_focus_not_send_a_link`,
   `../session-mentions/tests/user-terminal.test.mjs` ("focus: ...").
+- Enter (`action: enter`, job_id; agent-7e5ac22ea5). Owner flows gate browser steps with `read` ("... then press
+  Enter here."), but the user answers in chat ("done"), which the window never hears. Enter presses Return once in
+  that exact window (same runner-tty match as focus; iTerm `write text ""`, Terminal `do script "" in t`). It types
+  no text and acts only while the command is `running` and its last output line asks for Enter/Return
+  (`_ENTER_PROMPT`); the run/decline step, password prompts and y/N questions are refused (`press_enter`).
+  Relayed, it rides `/start` with `origin.enter`; only an answer carrying `enter: true` is reported pressed, so an
+  old courier or Mac yields "update hermes-mods", never a false press. Pending notes and the schema tell the agent
+  to use it instead of asking the user to press Enter. Tests: `tests/test_enter_contracts.py`,
+  `../session-mentions/tests/user-terminal.test.mjs` ("enter: ...").
 
 ## How it works
 

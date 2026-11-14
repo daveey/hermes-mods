@@ -165,7 +165,9 @@ SCHEMA = {
         "command prompts. If it is still pending after `wait_s`, call again with only `job_id` to keep waiting. "
         "If the user can't find the window (it opened earlier and is now behind other windows), call "
         "action=focus with the job_id: it brings that exact window to the front. Never hand them a link or the "
-        "command instead."
+        "command instead. If the window's output ends with a prompt to press Enter/Return and the user tells you "
+        "in chat that they did that step (\"done\"), call action=enter with the job_id: it presses Return in that "
+        "exact window for them. Don't ask them to switch windows to press Enter."
     ),
     "parameters": {
         "type": "object",
@@ -175,7 +177,7 @@ SCHEMA = {
             "cwd": {"type": "string", "description": "Working directory (default: user's home)."},
             "wait_s": {"type": "integer", "description": f"Seconds to wait for the user + command (default {DEFAULT_WAIT}, max {MAX_WAIT})."},
             "job_id": {"type": "string", "description": "Resume waiting on an earlier pending job instead of starting a new one."},
-            "action": {"type": "string", "enum": ["run", "withdraw", "focus"], "description": "withdraw (with job_id and reason): take back a request that is no longer needed; the window says so and any running command is stopped. focus (with job_id): bring a pending/running job's window to the front of the user's screen; it changes nothing else."},
+            "action": {"type": "string", "enum": ["run", "withdraw", "focus", "enter"], "description": "withdraw (with job_id and reason): take back a request that is no longer needed; the window says so and any running command is stopped. focus (with job_id): bring a pending/running job's window to the front of the user's screen; it changes nothing else. enter (with job_id): press Return once in a running job's window whose last output line asks for Enter/Return, after the user confirmed that step in chat; it types no text and is refused at any other prompt."},
         },
     },
 }
@@ -482,7 +484,9 @@ def _open_iterm(shell_cmd: str) -> str:
 # runner.sh runs on (an exact match: never another window of the same app) and raises it. Terminal choice does not
 # matter: iTerm sessions and Terminal tabs both expose `tty`.
 FOCUS_HINT = ("If the user can't find the window, call run_in_user_terminal with action=focus and this job_id to "
-              "bring it to the front; don't send a link or the command instead.")
+              "bring it to the front; don't send a link or the command instead. If the output ends asking to press "
+              "Enter and the user says in chat the step is done, call action=enter with this job_id to press Return "
+              "there for them; don't ask them to press it.")
 
 _FOCUS_SCRIPT = """
 set want to {tty}
@@ -571,6 +575,95 @@ def focus_window(job: Path) -> dict:
 
 
 OPEN_GRACE_S = 2.0  # after an osascript error, how long to watch for the window's runner before trying the next app
+
+
+# action=enter (agent-7e5ac22ea5): an owner flow (the cred-relay OAuth recipe and the like) gates each browser step
+# with `read` ("... then press Enter here."). The user works in chat and says "done" there; the window never hears
+# it. Enter presses Return once in the job's own window (same exact-tty match as focus), so he doesn't have to
+# switch windows to confirm twice. It types no text, so a code or password never passes through it, and it only
+# acts when the command is running and its last output line asks for Enter/Return: never at the run/decline step,
+# a password prompt or a y/N question.
+_ENTER_PROMPT = re.compile(r"\b(press|hit|type)\s+(the\s+)?(enter|return)\b|\b(enter|return)\s+to\s+"
+                           r"(continue|proceed|resume|finish)\b|\[(enter|return)\]", re.I)
+ENTER_TAIL_BYTES = 4096
+
+_ENTER_SCRIPT = """
+set want to {tty}
+if application "iTerm" is running then
+  tell application "iTerm"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if tty of s is want then
+            tell s to write text ""
+            return "iTerm"
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+end if
+if application "Terminal" is running then
+  tell application "Terminal"
+    repeat with w in windows
+      repeat with t in tabs of w
+        if tty of t is want then
+          do script "" in t
+          return "Terminal"
+        end if
+      end repeat
+    end repeat
+  end tell
+end if
+return ""
+"""
+
+
+def _waiting_line(job: Path) -> str:
+    """The last non-blank line the job's command printed (what its window is showing), else ""."""
+    try:
+        with open(job / "output.log", "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - ENTER_TAIL_BYTES))
+            raw = f.read().decode(errors="replace")
+    except OSError:
+        return ""
+    lines = [ln.strip() for ln in clean_output(raw).replace("\r", "\n").split("\n") if ln.strip()]
+    return lines[-1] if lines else ""
+
+
+def press_enter(job: Path) -> dict:
+    """Press Return once in a running job's window whose last line asks for it. Types nothing else."""
+    st = read_status(job)
+    status = st.get("status") or "pending"
+    base = {"job_id": job.name, "status": status if status in FINAL or status == "running" else "pending"}
+    if status in FINAL:
+        return {**base, "ok": False, "error": f"job already ended ({status}); nothing is waiting for Enter. Read its "
+                                              f"result with job_id instead."}
+    if status != "running":
+        return {**base, "ok": False, "error": "the command has not started (the window is at its run/decline step); "
+                                              "enter only answers a running command's 'press Enter' prompt. Not "
+                                              "pressed."}
+    line = _waiting_line(job)
+    if not _ENTER_PROMPT.search(line):
+        return {**base, "ok": False, "prompt": line,
+                "error": f"the window's last line does not ask for Enter/Return ({line[-200:]!r}); not pressed. "
+                         f"Only the user can answer other prompts: use action=focus to bring the window forward."}
+    ttys = [t for pid, start in runner_idents(job).items() if _same_process(pid, start) for t in [_tty_of(pid)] if t]
+    if not ttys:
+        return {**base, "ok": False, "error": "no live window runs this job (its runner is gone or never started)"}
+    for tty in dict.fromkeys(ttys):
+        try:
+            app = _osascript_out(_ENTER_SCRIPT.replace("{tty}", _osa_quote(tty)))
+        except OpenFailed as e:
+            return {**base, "ok": False, "error": f"could not press Enter in the window: {e}"}
+        if app:
+            return {**base, "ok": True, "pressed": app, "tty": tty, "prompt": line,
+                    "note": f"Pressed Return once in the job's {app} window (it answered: {line[-200:]!r}). Keep "
+                            f"waiting with job_id; don't ask the user to press it too."}
+    return {**base, "ok": False, "error": f"no iTerm or Terminal window has the job's tty ({', '.join(ttys)}); "
+                                          f"not pressed. Ask the user to press Enter in the window titled "
+                                          f"'Hermes ... wants to run a command' (action=focus brings it forward)."}
 
 
 def window_started(job: Path) -> bool:
@@ -2701,6 +2794,12 @@ def handle(args: dict, session_id: str | None = None, **_kw: Any) -> str:
             if not job_id or not job.is_dir():
                 return _err(f"focus needs the job_id of a pending job; unknown job_id {job_id}")
             return json.dumps(focus_window(job))
+        if str(args.get("action") or "").strip().lower() == "enter":
+            job_id = str(args.get("job_id") or "").strip()
+            job = jobs_dir() / Path(job_id or "x").name
+            if not job_id or not job.is_dir():
+                return _err(f"enter needs the job_id of a running job; unknown job_id {job_id}")
+            return json.dumps(press_enter(job))
         resume_id = str(args.get("job_id") or "").strip()
         if resume_id and not withdraw and (jobs_dir() / Path(resume_id).name).is_dir():
             # before the sweep and the job's own check: a resumed owning run never withdraws its own request
@@ -2804,6 +2903,8 @@ def start_relayed(command: str, reason: str, cwd: str, origin: dict) -> dict:
                                 str(origin.get("withdraw") or ""), str(origin.get("job_id") or ""))
     if isinstance(origin, dict) and origin.get("focus"):  # action=focus rides /start too (a mounted-earlier route)
         return relayed_focus(str(origin.get("job_id") or ""), str(origin.get("gateway") or ""))
+    if isinstance(origin, dict) and origin.get("enter"):  # action=enter rides /start the same way (agent-7e5ac22ea5)
+        return relayed_enter(str(origin.get("job_id") or ""), str(origin.get("gateway") or ""))
     command = str(command or "").strip()
     if not command:
         return {"ok": False, "error": "command is required"}
@@ -2900,6 +3001,17 @@ def relayed_focus(job_id: str, gateway: str) -> dict:
         return {"ok": False, "code": "job_not_found", "focus": True,
                 "error": f"no job {job_id} on this Mac for gateway {gateway or '(none)'}"}
     return {**focus_window(job), "focus": True}
+
+
+def relayed_enter(job_id: str, gateway: str) -> dict:
+    """action=enter for a relayed job: same lookup and same origin-gateway rule as relayed_focus."""
+    job = jobs_dir() / Path(str(job_id or "x")).name
+    if not job_id or not job.is_dir() or not gateway or job_origin_gateway(job) != gateway:
+        job = find_relayed_by_request(str(job_id or ""), gateway)
+    if job is None:
+        return {"ok": False, "code": "job_not_found", "enter": True,
+                "error": f"no job {job_id} on this Mac for gateway {gateway or '(none)'}"}
+    return {**press_enter(job), "enter": True}
 
 
 # Withdrawal of a relayed request (t_01a1d47bf0506084). The gateway takes an unclaimed request out of its own
@@ -3430,6 +3542,29 @@ def focus_remote(base: Path, job_id: str, session_id: str | None = None) -> dict
     return {**res, "job_id": res.get("job_id") or job_id, "device": device}
 
 
+def enter_remote(base: Path, job_id: str, session_id: str | None = None) -> dict:
+    """``action: enter`` on a screenless gateway: ask the Mac that holds the job to press Return in its window. Only
+    an answer carrying ``enter: true`` came from a Mac that knows enter; an old courier (status poll) or an old Mac
+    module (refuses the empty command) is never reported as pressed."""
+    if not job_id:
+        return {"ok": False, "error": "enter needs the job_id of a running job"}
+    entry = ledger_lookup(base, job_id)
+    if entry and entry.get("job_id"):
+        job_id = str(entry["job_id"])
+    device, err = pick_courier(base)
+    if err:
+        return {"ok": False, "job_id": job_id, "error": f"cannot reach the owner's Mac to press Enter: {err}"}
+    res = relay_once(base, device, {"job_id": job_id, "enter": True, "wait_s": 0}, _sender(session_id),
+                     FOCUS_RESULT_S)
+    if not res.get("enter"):
+        return {"ok": False, "job_id": job_id, "device": device, "status": res.get("status"),
+                "error": (f"`{device}` runs a Hermes Desktop or user-terminal plugin without action=enter, so "
+                          f"nothing was pressed; update hermes-mods on {device}. Meanwhile ask the user to press "
+                          f"Enter in the job's window (action=focus brings it forward).")}
+    res.pop("enter", None)
+    return {**res, "job_id": res.get("job_id") or job_id, "device": device}
+
+
 def handle_remote(args: dict, session_id: str | None = None, **_kw: Any) -> str:
     try:
         refusal = owner_refusal(session_id)
@@ -3440,6 +3575,8 @@ def handle_remote(args: dict, session_id: str | None = None, **_kw: Any) -> str:
                                               str(args.get("reason") or ""), session_id))
         if str(args.get("action") or "").strip().lower() == "focus":
             return json.dumps(focus_remote(_root(), str(args.get("job_id") or "").strip(), session_id))
+        if str(args.get("action") or "").strip().lower() == "enter":
+            return json.dumps(enter_remote(_root(), str(args.get("job_id") or "").strip(), session_id))
         wait_s = max(1.0, min(float(args.get("wait_s") or DEFAULT_WAIT), MAX_WAIT))
         job_id = str(args.get("job_id") or "").strip()
         command = str(args.get("command") or "").strip()
