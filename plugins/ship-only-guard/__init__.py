@@ -9,8 +9,20 @@ assert _spec is not None and _spec.loader is not None
 guard = module_from_spec(_spec)
 _spec.loader.exec_module(guard)
 
+_bspec = spec_from_file_location(__name__ + ".brief", Path(__file__).with_name("brief.py"))
+assert _bspec is not None and _bspec.loader is not None
+brief = module_from_spec(_bspec)
+_bspec.loader.exec_module(brief)
+
 
 def _pre_tool_call(tool_name="", args=None, **_):
+    try:
+        why = brief.check(tool_name, args)
+    except Exception:  # a lint must never break the tool call it inspects
+        logging.getLogger(__name__).exception("ship-only-guard brief check failed")
+        why = None
+    if why:
+        return {"action": "block", "message": why}
     started = time.monotonic()
     why = guard.bounded_preflight(guard.check_tool, tool_name, args)
     elapsed = time.monotonic() - started

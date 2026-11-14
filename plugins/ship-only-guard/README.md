@@ -379,6 +379,19 @@ probes take the repo from the explicit `--repo`, so a derived cwd that does not
 exist (e.g. an unset `cd $VAR;` target) is dropped and the probe runs in the
 guard's own cwd; `cd $VAR`/`${VAR}` targets expand from the command's env when set.
 
+**Briefs that cancel the carry are refused (`brief.py`).** A `kanban_create` body or
+`kanban_comment` about a state PR or a base refresh (update-branch, base drift)
+that orders a fresh exact-head review for every new head, with no patch condition
+("Any new head needs a fresh exact-head verdict", "required fresh exact-head
+review"), is refused before it is written. Workers read such a rule as stricter
+than the patch-identical carry above and file one review per base refresh; each
+round gives the base time to drift again (state PR #2555 had seven review rounds
+with one unchanged verbatim patch-id). The text passes when it conditions the
+review on the patch (`patch-id`, `range-diff`, "patch differs", a conflict), or
+with a `no-carry: <reason>` line for a deliberate exception. Tests:
+`tests_brief.py`. A replay over 7 days of real hub briefs (2389) and comments
+(12609) refused only the two texts that caused those rounds.
+
 ## Upstream-sync landing (main, merge commit)
 
 An upstream-sync gate lands a fully tested sync PR into `main` as a true merge
