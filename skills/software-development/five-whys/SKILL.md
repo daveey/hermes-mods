@@ -257,7 +257,7 @@ When diagnosing scheduling or observation flakes, read `references/concurrency-t
 
 When investigating authorization or plugin isolation, read `references/scope-and-dependency-pitfalls.md` (spend authority, credential scope, module lifetime and dependency identity).
 
-When fixtures depend on event chronology or expiry, read `references/clock-fixture-pitfalls.md` (PR assignment ordering and receipt TTL clocks).
+When fixtures depend on event chronology or expiry, read `references/clock-fixture-pitfalls.md` (PR assignment ordering and receipt TTL clocks). For exact-boundary virtual-clock tests, inject fractional origins: subtraction can round below the boundary and defer a whole poll. Pin an exact fixture epoch, not longer budgets; prove inherited failures on the unchanged base.
 
 - For bounded readers that repeatedly return empty partial results, distinguish per-query exhaustion from shared quota exhaustion before raising any cap. Test eventual service across polls, including new arrivals and completed/disappearing cursor anchors: a fixed newest-first window can starve older active work forever. Preserve incomplete-coverage semantics and verify useful rows from the actual post-deploy collector, not just direct API probes; a concurrent maintenance stop makes that live check inconclusive.
 
