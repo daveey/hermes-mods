@@ -280,3 +280,243 @@ def test_waiting_source_tracks_commit_on_board_and_shadow(readers, shared):
         mod._state.pop('waiting_cache', None)
         readers.expected.pop(chat)
         assert mod.waiting_source() == readers.expected
+
+
+# ---- lifecycle fences and bounds, each driven at the interleaving it guards -------------------------------------
+def _counted():
+    calls = []
+
+    def query(conn):
+        calls.append(1)
+        return [tuple(row) for row in conn.execute('SELECT id, status FROM tasks')]
+    return calls, query
+
+
+def _fake_timers(mod, monkeypatch):
+    now, timers = [0.0], []
+
+    class Timer:
+        def __init__(self, delay, callback):
+            self.delay, self.callback, self.cancelled = delay, callback, False
+            timers.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self.cancelled = True
+
+    monkeypatch.setattr(mod.core.threading, 'Timer', Timer)
+    monkeypatch.setattr(mod.core.time, 'monotonic', lambda: now[0])
+    return now, timers
+
+
+def test_private_use_extends_the_idle_deadline(readers, monkeypatch):
+    del readers.activity.cached_ro
+    mod = readers.load(0, 0)
+    now, timers = _fake_timers(mod, monkeypatch)
+    cache, path = mod.core._structural_reads, str(readers.boards[0])
+    calls, query = _counted()
+    cache.read(path, 'k', query)
+    now[0] = 299
+    cache.read(path, 'k', query)  # used one second before the deadline of the open
+    now[0] = 300
+    timers[0].callback()
+    assert path in cache.entries and len(readers.live()) == 1  # idle counts from the last use, not the open
+    assert timers[-1].delay == 299
+    now[0] = 599
+    timers[-1].callback()
+    assert not cache.entries and readers.live() == []
+    assert len(calls) == 1
+
+
+def test_cancelled_idle_timer_cannot_displace_its_successor(readers, monkeypatch):
+    del readers.activity.cached_ro
+    mod = readers.load(0, 0)
+    now, timers = _fake_timers(mod, monkeypatch)
+    cache, path = mod.core._structural_reads, str(readers.boards[0])
+    _, query = _counted()
+    cache.read(path, 'k', query)
+    cache.clear()  # cancels the first timer, which may already be waiting on the pool lock
+    assert timers[0].cancelled and readers.live() == []
+    now[0] = 1
+    cache.read(path, 'k', query)
+    assert len(timers) == 2 and cache._timer is timers[1]
+    now[0] = 2
+    timers[0].callback()  # the cancelled timer finally runs: it owns nothing
+    assert cache._timer is timers[1] and len(timers) == 2  # one deadline timer, still the tracked one
+    cache.clear()
+    assert timers[1].cancelled and readers.live() == []
+
+
+def test_unload_between_closed_checks_cannot_reregister_the_hook(readers, monkeypatch):
+    del readers.activity.cached_ro
+    mod = readers.load(0, 0)
+    cache, path = mod.core._structural_reads, str(readers.boards[0])
+    real_close, fired = cache._close, []
+
+    def close(*entries):
+        if not fired:
+            fired.append(1)
+            mod._unload()  # lands after _current's first closed check, before it registers the hook
+        return real_close(*entries)
+    monkeypatch.setattr(cache, '_close', close)
+    calls, query = _counted()
+    with pytest.raises((sqlite3.Error, OSError)):
+        cache.read(path, 'k', query, board=True)
+    assert fired and not calls
+    assert not readers.hooks and mod.core._GENERATION_HOOK is None  # nothing pins the retired generation
+    assert not cache.entries and readers.live() == []
+
+
+def test_unload_during_private_open_is_refused_by_the_publication_fence_itself(readers, monkeypatch):
+    """``read`` also drops the path when ``_current`` raises; the fence must not depend on that cleanup."""
+    del readers.activity.cached_ro
+    mod = readers.load(0, 0)
+    cache, path = mod.core._structural_reads, str(readers.boards[0])
+    original = mod.core.ro_connect
+
+    def connect(*args, **kwargs):
+        conn = original(*args, **kwargs)
+        mod._unload()
+        return conn
+    monkeypatch.setattr(mod.core, 'ro_connect', connect)
+    with pytest.raises(sqlite3.OperationalError):
+        cache._current(path, False)
+    assert not cache.entries and readers.live() == []
+
+
+def test_unload_inside_shared_borrow_runs_no_query_and_keeps_no_memo(readers, monkeypatch):
+    mod = readers.load(0, 0)
+    cache, path = mod.core._structural_reads, str(readers.boards[0])
+    original = readers.activity.cached_ro
+
+    @contextlib.contextmanager
+    def borrow(target):
+        with original(target) as conn:
+            mod._unload()  # after read()'s entry check, before the borrowed body
+            yield conn
+    monkeypatch.setattr(readers.activity, 'cached_ro', borrow)
+    calls, query = _counted()
+    with pytest.raises(OSError):
+        cache.read(path, 'k', query)
+    assert not calls and not cache._shared
+    assert readers.pool and all(not conn.closed for conn, _ in readers.pool.values())  # core's reader survives
+
+
+@pytest.mark.parametrize('shared', [False, True])
+def test_unloaded_generation_neither_borrows_nor_opens(readers, monkeypatch, shared):
+    if not shared:
+        del readers.activity.cached_ro
+    mod = readers.load(0, 0)
+    cache, path = mod.core._structural_reads, str(readers.boards[0])
+    mod._unload()
+    borrows = []
+    if shared:
+        original = readers.activity.cached_ro
+
+        @contextlib.contextmanager
+        def borrow(target):
+            borrows.append(target)
+            with original(target) as conn:
+                yield conn
+        monkeypatch.setattr(readers.activity, 'cached_ro', borrow)
+    calls, query = _counted()
+    with pytest.raises(OSError):  # a lifecycle refusal, never a SQLite failure
+        cache.read(path, 'k', query)
+    assert not borrows and not calls
+    assert not readers.pool and readers.live() == []  # a retired generation opens nothing, core-owned included
+
+
+def test_failed_borrowed_read_drops_that_paths_memo(readers):
+    mod = readers.load(0, 0)
+    cache, path = mod.core._structural_reads, str(readers.boards[0])
+    calls, query = _counted()
+    first = cache.read(path, 'a', query)
+    assert cache.read(path, 'a', query) == first and len(calls) == 1
+
+    def broken(conn):
+        raise ValueError('undecodable row')
+    with pytest.raises(ValueError):
+        cache.read(path, 'b', broken)
+    assert path not in cache._shared  # no reference to the borrowed connection outlives a failed read
+    assert cache.read(path, 'a', query) == first and len(calls) == 2  # nor does any memo read through it
+    conn, _ = readers.pool[path]
+    assert not conn.closed and conn.row_factory is None and not conn.in_transaction
+
+
+def test_shared_memo_is_bounded_by_database_count(readers, monkeypatch):
+    mod = readers.load(0, 0)
+    cache = mod.core._structural_reads
+    monkeypatch.setattr(cache, 'MAX_DATABASES', 2)
+    paths = [str(path) for path in readers.boards[:3]]
+    counted = {path: _counted() for path in paths}
+    for path in paths:
+        cache.read(path, 'k', counted[path][1])
+    assert list(cache._shared) == paths[1:]  # the least recently read database left the memo
+    cache.read(paths[2], 'k', counted[paths[2]][1])
+    assert len(counted[paths[2]][0]) == 1  # a retained database still answers from its memo
+    cache.read(paths[0], 'k', counted[paths[0]][1])
+    assert len(counted[paths[0]][0]) == 2 and len(cache._shared) == 2
+    assert len(readers.live()) == 3  # core owns the connections; the bound is on what the plugin retains
+
+
+def test_borrowed_memo_is_fenced_by_wal_index_generation(readers, monkeypatch):
+    mod = readers.load(0, 0)
+    cache, path = mod.core._structural_reads, str(readers.boards[0])
+    shm = [(1, 1)]
+    monkeypatch.setattr(mod.core, '_shm_identity', lambda target: shm[0])
+    calls, query = _counted()
+    first = cache.read(path, 'k', query)
+    assert cache.read(path, 'k', query) == first and len(calls) == 1
+    conn = readers.pool[path][0]
+    shm[0] = (1, 2)  # the same connection and data_version over another -shm inode
+    assert cache.read(path, 'k', query) == first and len(calls) == 2
+    assert readers.pool[path][0] is conn
+    assert cache.read(path, 'k', query) == first and len(calls) == 2
+
+
+def test_reopened_core_reader_is_a_new_memo_generation(readers):
+    mod = readers.load(0, 0)
+    cache, path = mod.core._structural_reads, str(readers.boards[0])
+    calls, query = _counted()
+    assert cache.read(path, 'k', query) == [('t_0', 'done')]
+    old, _ = readers.pool.pop(path)
+    revision = old.execute('PRAGMA data_version').fetchone()[0]
+    old.close()  # core retired its reader (recovery, eviction); the next borrow opens another
+    with contextlib.closing(sqlite3.connect(path)) as writer, writer:
+        writer.execute("UPDATE tasks SET status='running'")
+    assert cache.read(path, 'k', query) == [('t_0', 'running')] and len(calls) == 2
+    conn = readers.pool[path][0]
+    # The case the connection fence exists for: another connection reporting the memo's revision number.
+    assert conn is not old and conn.execute('PRAGMA data_version').fetchone()[0] == revision
+
+
+def test_shared_borrow_failure_is_not_kept(readers, monkeypatch):
+    mod = readers.load(0, 0)
+    board = readers.boards[0]
+
+    def set_status(status):
+        with contextlib.closing(sqlite3.connect(board)) as writer, writer:
+            writer.execute('UPDATE tasks SET status=?', (status,))
+        mod._state.pop('waiting_cache', None)
+
+    set_status('running')
+    settled = dict(readers.expected)
+    unsettled = {chat: batch for chat, batch in settled.items() if chat != 'chat0'}
+    assert mod.waiting_source() == unsettled
+    original, failing, refused = readers.activity.cached_ro, [True], []
+
+    @contextlib.contextmanager
+    def flaky(target):
+        if failing[0] and Path(target) == board:
+            refused.append(target)
+            raise sqlite3.OperationalError('database is locked')
+        with original(target) as conn:
+            yield conn
+    monkeypatch.setattr(readers.activity, 'cached_ro', flaky)
+    set_status('done')
+    assert 'chat0' not in mod.waiting_source() and refused  # an unreadable board proves nothing settled
+    failing[0] = False
+    mod._state.pop('waiting_cache', None)
+    assert mod.waiting_source() == settled  # the failed pass left no answer behind
