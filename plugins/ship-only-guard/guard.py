@@ -1576,7 +1576,11 @@ def check_tool(name, args, cwd=None, repos=None, env=None, _depth=0):
     if name == "execute_code":
         return check_python(str(args.get("code") or ""), cwd, repos, env, _depth + 1)
     if name == "tool_call":
-        for call in args.get("calls", []):
+        # check_python passes non-literal values as None; only a literal list/tuple is inspectable.
+        calls = args.get("calls") or []
+        if not isinstance(calls, (list, tuple)):
+            return None
+        for call in calls:
             if isinstance(call, dict):
                 why = check_tool(str(call.get("name", "")), call.get("arguments"), cwd, repos, env, _depth + 1)
                 if why:
