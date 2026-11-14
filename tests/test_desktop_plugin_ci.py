@@ -37,17 +37,24 @@ class DesktopPluginCI(unittest.TestCase):
                         '@tanstack/react-query@5.104.1', 'radix-ui@1.7.0'):
             self.assertIn(package, self.text)
         self.assertIn('HERMES_DESKTOP_PACKAGE=$HERMES_DESKTOP_DIR/package.json', self.text)
-        self.assertIn('run: node --test --test-concurrency=1 desktop-plugins/*/test/*.mjs '
-                      'desktop-plugins/*/tests/*.test.mjs', self.text)
+        globs = 'desktop-plugins/*/test/*.mjs desktop-plugins/*/tests/*.test.mjs plugins/*/tests/*.test.mjs'
+        self.assertIn(f'          node --test --test-concurrency=1 {globs}\n', self.text)
+        # node --test's TAP output does not name files: the job lists what it collected.
+        self.assertIn(f"          printf 'collected: %s\\n' {globs}\n", self.text)
         files = list(ROOT.glob('desktop-plugins/*/test/*.mjs'))
         files += ROOT.glob('desktop-plugins/*/tests/*.test.mjs')
+        files += ROOT.glob('plugins/*/tests/*.test.mjs')
         self.assertIn(ROOT / 'desktop-plugins/session-panel/test/producer-composed.test.mjs', files)
         self.assertIn(ROOT / 'desktop-plugins/runners/tests/fleet.test.mjs', files)
+        # Agent-plugin dirs carry node suites for their desktop half; CI once collected none of them.
+        self.assertIn(ROOT / 'plugins/session-mentions/tests/user-terminal.test.mjs', files)
 
-    def test_every_desktop_plugin_test_file_is_globbed(self):
+    def test_every_node_test_file_is_globbed(self):
         globbed = set(ROOT.glob('desktop-plugins/*/test/*.mjs')) | set(ROOT.glob('desktop-plugins/*/tests/*.test.mjs'))
-        for f in ROOT.glob('desktop-plugins/*/test*/*.test.mjs'):
-            self.assertIn(f, globbed)
+        globbed |= set(ROOT.glob('plugins/*/tests/*.test.mjs'))
+        for pattern in ('desktop-plugins/*/test*/*.test.mjs', 'plugins/**/*.test.mjs'):
+            for f in ROOT.glob(pattern):
+                self.assertIn(f, globbed)
 
 
 if __name__ == '__main__':
