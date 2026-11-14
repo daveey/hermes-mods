@@ -12,6 +12,20 @@ from unittest import mock
 
 from test_guard import Base, CARD, OWNER, HOOK
 
+REAL_READLINK = os.readlink
+
+
+def mac_readlink(path, *args, **kwargs):
+    """os.readlink on the macOS host the fixture stands in for: there is no /proc there.
+
+    The remote script runs in this process, and its cwd lookup reads /proc/<pid>/cwd before the fixture's lsof.
+    On a Linux test host a real same-user process holding a fixture pid (4242) answered with its own cwd, which
+    has no OWNER.md, so the lookup said "no owner" and the guard allowed the kill (flaky on fresh CI runners,
+    whose pids pass 4242 mid-run)."""
+    if os.fspath(path).startswith("/proc/"):
+        raise FileNotFoundError(2, "No such file or directory (fixture host has no /proc)", os.fspath(path))
+    return REAL_READLINK(path, *args, **kwargs)
+
 
 class RemoteKill(Base):
     def stub(self):
@@ -25,7 +39,7 @@ class RemoteKill(Base):
         ns = {"__name__": "__remote_fixture__"}
         script = self.g.remote_script(spec)
         output = io.StringIO()
-        with mock.patch.object(platform, "system", return_value="Darwin"), mock.patch.object(sys, "argv", ["-", json.dumps(spec)]), mock.patch.object(subprocess, "run", run), redirect_stdout(output):
+        with mock.patch.object(platform, "system", return_value="Darwin"), mock.patch.object(os, "readlink", mac_readlink), mock.patch.object(sys, "argv", ["-", json.dumps(spec)]), mock.patch.object(subprocess, "run", run), redirect_stdout(output):
             exec(compile(script, "<remote>", "exec"), ns)
         return json.loads(output.getvalue())
 
@@ -89,6 +103,25 @@ class RemoteKill(Base):
         self.g.remote_lookup = lambda p, s: self.script_result(s, self.process_fixture)
         self.assertIsNotNone(self.verdict("ssh mini 'killall -TERM collector'"))
         self.assertIn(["pgrep", "-x", "collector"], self.seen)
+
+    def test_remote_fixture_ignores_test_host_proc(self):
+        """A live test-host process holding fixture pid 4242 (its cwd has no OWNER.md) must not answer for the
+        fixture's remote host. Before the fix its /proc cwd won over the fixture lsof and the kill was allowed."""
+        real = os.readlink
+        unowned = str(self.home)  # exists, holds no OWNER.md
+
+        def host_with_live_4242(path, *args, **kwargs):
+            if os.fspath(path) == "/proc/4242/cwd":
+                return unowned
+            return real(path, *args, **kwargs)
+
+        with mock.patch.object(os, "readlink", host_with_live_4242):
+            self.seen = []
+            self.g.remote_lookup = lambda p, s: self.script_result(s, self.process_fixture)
+            self.assertIsNotNone(self.verdict("ssh mini 'killall -TERM collector'"))
+            res = self.script_result({"kind": "pids", "verb": "kill", "pid": 4242}, self.process_fixture)
+            self.assertEqual(res.get("owner"), OWNER, res)
+            self.assertIn(["lsof", "-a", "-d", "cwd", "-p", "4242", "-Fn"], self.seen)
 
     def test_real_unroutable_lookup_allowed_and_logged(self):
         self.g.REMOTE_TIMEOUT = 1
