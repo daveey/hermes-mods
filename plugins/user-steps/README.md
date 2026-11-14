@@ -198,6 +198,15 @@ on an older core the projection publishes no tiles (logged "Card projection paus
 of offering clicks that cannot be delivered. `action_request` kinds are explicitly enumerated:
 `approval`, `choice`, `input`, `external_step` (not `decision` or `question`).
 
+Mirror readers are cached per loaded module. `close_pool()` permanently retires that
+owner: idle readers close immediately, active readers finish and roll back before
+closing, and later calls through old references use non-retained readers. Dashboard
+mtime replacement retires the displaced module only after the replacement imports
+successfully. Agent unload only retires its own package's mirror (if loaded), never
+the independently owned dashboard module; older cores without `on_unload` continue
+to register normally. `test_reader_lifecycle.py` covers these ownership boundaries,
+in-flight/queued opens, rollback, and unchanged projections after write/reopen.
+
 Tests: `test_kanban_mirror.py` covers projection, exact values, lifecycle and REST;
 `test_kanban_mirror_hardening.py` covers conflicts, concurrency, subscription
 ownership, failed reads and tampering; `test_kanban_mirror_core.py` exercises real
