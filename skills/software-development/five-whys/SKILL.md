@@ -271,6 +271,8 @@ When fixtures depend on event chronology or expiry, read `references/clock-fixtu
 - Stopping at the first fact that sounds technical. "The pump shaft was worn" is a fact, not the root.
 - Going so deep that the root is outside anyone's control ("because physics", "because the company was underfunded").
   Back up to the last level you can change.
+- For a live failed-result observer, inspect the entire restart/continuation event chain before treating it as a process hang. A modern restart receipt can cease to cover the history after a successor binding; if that worker dies without its own result, strict attribution may veto both the observer and legacy expiry. Compare native claim/PID fields with replica projections, preserve real receipts/checkpoints, and reproduce restart → rebind → loss with distinct process identities. Measure admission using the host's enabled policy; an out-of-gateway cgroup census need not equal row-based admission.
+
 - Checking for a parallel fix only during diagnosis. Right before you implement, fetch the repo, read its branch log
   since the incident and search open cards on every board for the same symptom: another session reading the same
   logs often lands the fix first. If one did, run your tests against its commit instead of pushing a second fix.
