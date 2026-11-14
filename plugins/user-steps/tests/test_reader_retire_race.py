@@ -94,3 +94,96 @@ def test_close_pool_in_gap_after_failed_read_closes_reader(db):
     with mod._kept(db) as later:  # module retired: one-shot readers only
         assert later.execute('SELECT 1').fetchone()[0] == 1
     assert not mod._POOL
+
+
+def test_retirement_recheck_returns_while_queued_borrower_owns_lock(db):
+    mod = load('race_mirror_queued')
+    with mod._kept(db):
+        pass
+    entry = mod._POOL[str(db)]
+    first = threading.get_ident()
+    queued, holding, finish = (threading.Event() for _ in range(3))
+    errors, connections, entries, rechecks = [], [], [], []
+
+    class HandoffLock:
+        """Force the release gap, retaining a real lock and real second borrow.
+
+        Reject a contended blocking recheck synchronously instead of letting a
+        mutant deadlock the test. Event timeouts are watchdogs, not race timing.
+        """
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.handed_off = False
+
+        def acquire(self, blocking=True):
+            if threading.get_ident() == first and self.handed_off:
+                assert holding.is_set() and not finish.is_set()
+                assert self.lock.locked()
+                rechecks.append(blocking)
+                assert not blocking, 'retirement recheck would wait for queued borrower'
+            elif threading.get_ident() != first:
+                queued.set()  # _kept already selected this entry, before retirement
+            return self.lock.acquire(blocking=blocking)
+
+        def release(self):
+            if threading.get_ident() == first and not self.handed_off:
+                assert queued.wait(5), 'second borrower did not queue'
+                # First borrower has passed its in-lock retired check.
+                mod.close_pool()
+                assert entry.retired and not mod._POOL
+                self.handed_off = True
+                self.lock.release()
+                assert holding.wait(5), 'second borrower did not take ownership'
+            else:
+                self.lock.release()
+
+        def __enter__(self):
+            self.acquire()
+
+        def __exit__(self, *exc):
+            self.release()
+
+    entry.lock = lock = HandoffLock()
+
+    def borrow_second():
+        try:
+            with mod._kept(db, entry_out=entries) as conn:
+                connections.append(conn)
+                assert conn.execute('SELECT count(*) FROM sample').fetchone()[0] == 0
+                holding.set()
+                assert finish.wait(10), 'first borrower did not release second'
+                assert conn.execute('SELECT 1').fetchone()[0] == 1
+        except BaseException as exc:
+            errors.append(exc)
+
+    second = threading.Thread(target=borrow_second, daemon=True)
+    conn = None
+    try:
+        with mod._kept(db) as conn:
+            second.start()
+            assert queued.wait(5), 'second borrower did not select entry'
+        # This point must be reached while the second borrower still holds the
+        # same connection; no sleep or elapsed-time threshold proves ordering.
+        assert holding.is_set() and not finish.is_set() and lock.lock.locked()
+        assert entries == [entry] and connections == [conn]
+        assert entry.conn is conn and rechecks == [False]
+        assert not errors
+    finally:
+        finish.set()
+        if second.ident is not None:
+            second.join(5)
+        assert not second.is_alive(), 'second borrower leaked'
+        try:
+            assert entry.conn is None, 'last queued borrower left retired reader open'
+            if conn is not None:
+                with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+                    conn.execute('SELECT 1')
+        finally:
+            # Retired entries are detached: clean up even on a failed assertion.
+            with lock.lock:
+                mod._close_entry(entry)
+    assert not errors
+    assert entry.conn is None and not mod._POOL
+    assert conn is not None
+    with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+        conn.execute('SELECT 1')
