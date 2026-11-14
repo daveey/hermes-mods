@@ -394,6 +394,29 @@ def _codex_entitled(token, model):
     return codex_entry_entitled_for_model(token, model)
 
 
+def reject_custom_entry_route(provider, base_url):
+    """Refuse a route a ``providers:`` entry owns, even one named like a built-in.
+
+    Core hands such a runtime only its entry's origin-bound pool view
+    (custom_entry_pool.load_route_pool / entry_scoped_pool, core bf42256630): a
+    built-in's row with no recorded address belongs to the built-in's host and
+    must not follow ``providers.anthropic`` to a proxy. A snapshot reads raw
+    persisted rows and treats an unrecorded row as serving the current route, so
+    it would bypass that fence. Manual choice covers built-in routes only; an
+    unreadable verdict fails closed.
+    """
+    try:
+        from agent.custom_entry_pool import is_custom_runtime
+    except ImportError:  # core predates custom-entry pool ownership
+        return
+    try:
+        custom = is_custom_runtime(provider, None, base_url)
+    except Exception:
+        custom = True
+    if custom:
+        raise SelectionRejected('Account selection is not available for a custom provider endpoint')
+
+
 def choose_snapshot(entries, *, provider, model, account_id, base_url):
     """Validate an authoritative, already-hydrated read-only row snapshot.
 
@@ -408,6 +431,7 @@ def choose_snapshot(entries, *, provider, model, account_id, base_url):
 
     if provider not in {'anthropic', 'openai-codex'} or not model:
         raise SelectionRejected('Unsupported provider or model')
+    reject_custom_entry_route(provider, base_url)
     rows = list(entries)
     matched = [e for e in rows if e.provider == provider
                and _identity_id_for(provider, e) == account_id]

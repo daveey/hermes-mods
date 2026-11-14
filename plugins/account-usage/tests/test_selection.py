@@ -190,5 +190,37 @@ class Contract(unittest.TestCase):
                          'Selection must not swap the shared agent credential')
 
 
+def probe_custom_entry_choice(base_url, *, providers=None):
+    """Pick a built-in Anthropic row with no recorded address while config holds ``providers:``."""
+    from agent.account_usage_cache import _identity_id_for
+    selection = _load_selection()
+    row = PooledCredential(provider='anthropic', id='builtin', label='builtin', auth_type='api_key',
+                           priority=0, source='manual', access_token='fixture-builtin-not-a-secret',
+                           last_status='ok')
+    config = {'model': {'provider': 'anthropic', 'default': 'claude-fixture'},
+              'providers': providers or {}}
+    with patch('hermes_cli.config.load_config_readonly', return_value=config):
+        try:
+            return selection.choose_snapshot(
+                [row], provider='anthropic', model='claude-fixture',
+                account_id=_identity_id_for('anthropic', row), base_url=base_url).entry_id
+        except selection.SelectionRejected:
+            return None
+
+
+class CustomEntryOriginFence(unittest.TestCase):
+    """Core binds a custom entry's pool rows to their origin (load_route_pool, core bf42256630).
+    A snapshot reads raw rows, so a custom route must never be chosen from them."""
+    PROXY = 'https://proxy.example.com/v1'
+
+    def test_custom_entry_shadowing_builtin_cannot_take_builtin_key(self):
+        self.assertIsNone(
+            probe_custom_entry_choice(self.PROXY, providers={'anthropic': {'base_url': self.PROXY}}),
+            "A built-in account's key followed providers.anthropic to another host")
+
+    def test_builtin_route_still_selects(self):
+        self.assertEqual(probe_custom_entry_choice('https://api.anthropic.com'), 'builtin')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
