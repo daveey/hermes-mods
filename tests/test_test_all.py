@@ -255,6 +255,26 @@ class TestAll(unittest.TestCase):
             paths.append(path)
         self.assertEqual(len(set(paths)), 3)
 
+    def test_retained_log_names_replace_every_unsafe_character_not_only_slash(self):
+        # Pins the whole [^a-zA-Z0-9_-] class: replacing only '/' would leave spaces, ':', '..', '*',
+        # newlines and non-ASCII in the --output-dir filename.
+        runner = runpy.run_path(str(RUNNER))
+        output = self.root / 'logs'
+        output.mkdir()
+        for name, slug in [('plugins/a b:..*', 'plugins_a_b____'),
+                           ('plugins/x\ny\u00e9', 'plugins_x_y_')]:
+            row = runner['run_suite']({'name': name, 'cmd': [sys.executable, '-c',
+                                      "import os; os.write(1, b'1 passed\\n')"]},
+                                      sys.executable, None, 3, self.root, self.root,
+                                      output_dir=output)
+            self.assertEqual(row['status'], 'PASS')
+            path = Path(row['log_path'])
+            self.assertEqual(path.parent, output.resolve())
+            self.assertTrue(path.resolve().is_relative_to(output.resolve()))
+            self.assertRegex(path.name, r'\A[A-Za-z0-9_-]+-.*\.log\Z')
+            self.assertRegex(path.name, r'\A[A-Za-z0-9_-]+\.log\Z')
+            self.assertTrue(path.name.startswith(slug + '-'), path.name)
+
     def test_hanging_suite_times_out_and_is_reported(self):
         make_tree(self.root, {"hang": "import time\ntime.sleep(60)\n"})
         r = run(self.root, "--timeout", "3")
