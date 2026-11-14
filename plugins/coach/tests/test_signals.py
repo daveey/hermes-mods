@@ -1737,6 +1737,23 @@ def test_moved_off_entry_after_entry_left_pool_is_designed_recovery_not_filed(tm
     assert len(got) == 2 and not any("moved-off-entry" in s["symptom"] for s in got)
 
 
+def test_moved_off_entry_before_left_pool_timestamp_still_files_drift(tmp_path):
+    """Input order is not timestamp order: a future departure cannot excuse an earlier move."""
+    moved = GUARD_LINES["moved-off-entry"].replace("13:19:41,001", "13:19:39,001")
+    # Keep the departure first in input so parse_errors has already recorded it;
+    # only the nonnegative delta guard prevents this false recovery pairing.
+    lines = [LEFT_POOL, moved]
+    rows = sg.parse_errors(lines)
+    assert len(rows) == 1
+    assert rows[0]["session_id"] == "20261028_130956_a12ab0"
+    assert "moved-off-entry" in rows[0]["symptom"]
+    assert "moved the session off pool entry acct-b (now acct-a)" in rows[0]["details"]
+    h = _auth_home(tmp_path, lines)
+    got = [s for s in sg.collect(h, {}, "macbook", _ts("2026-10-28 13:25:00")) if s["kind"] == "errors"]
+    assert len(got) == 1
+    assert "moved-off-entry" in got[0]["symptom"]
+
+
 def test_kanban_sibling_cards_with_same_stem_and_error_are_one_signal(tmp_path):
     h = tmp_path / "h"
     err = "worker exited cleanly (rc=0) without kanban_complete — protocol violation"
