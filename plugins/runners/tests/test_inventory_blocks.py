@@ -32,6 +32,25 @@ def test_unchanged_blocks_avoid_per_row_carry_checks(env, monkeypatch):
     assert calls == [], 'unchanged blocks must avoid Python per-row carry checks'
 
 
+def test_scattered_changes_compare_each_state_only_once(env, monkeypatch):
+    cfg, path, *_ = env
+    snap = fleet(cfg, path)
+    service = svc(cfg, path, 1001)
+    _, carry = service._inventory(snap, None, copy_rows=False, carry=None, now=1001)
+    newer = deepcopy(snap)
+    for state in newer['states'].values():
+        state.update(cycle='collection_new', processed_at=1002)
+    for row in newer['runners'][::20]:
+        row['labels'] = ['changed']
+    calls = []
+    same = S._same_state
+    monkeypatch.setattr(S, '_same_state', lambda *a: calls.append(1) or same(*a))
+    actual, built = service._inventory(newer, None, copy_rows=False, carry=carry, now=1002)
+    assert comparable(actual) == comparable(service._inventory(newer, None))
+    assert built.computed == len(newer['runners'][::20])
+    assert calls == [], 'dirty blocks must not repeat normalized state comparisons'
+
+
 @pytest.mark.parametrize('change', ['source', 'state', 'host', 'order', 'remove', 'add', 'rewind', 'expiry', 'ceiling', 'maintenance'])
 def test_block_carry_matches_full_build(env, change):
     cfg, path, *_ = env
