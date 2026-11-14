@@ -2672,6 +2672,27 @@ def test_sql_looking_string_can_really_execute_shell(multi):
     _assert_real_restore(cmd, main, wt)
 
 
+@pytest.mark.parametrize('definition', [
+    '"alias" g=git',
+    'builtin ""alias g=git',
+    'builtin \\alias g=git',
+    'alias\\\n g=git',
+])
+def test_quoted_definition_real_restore_stays_refused(multi, definition):
+    main, wt = multi
+    cmd = ('cd ' + shlex.quote(str(wt)) + '\nshopt -s expand_aliases\neval '
+           + shlex.quote(definition) + '\ng stash pop')
+    before = subprocess.check_output(['git', 'rev-parse', 'refs/stash'], cwd=main, env=GIT_ENV)
+    why = guard.refuse_reason(cmd, str(wt))
+    blocked = _blocked(cmd, wt)
+    assert subprocess.check_output(['git', 'rev-parse', 'refs/stash'], cwd=main, env=GIT_ENV) == before
+    assert (wt / 'f.txt').read_text() == 'base\n'
+    # Execute only in this disposable fixture: establish that the spelling really restores.
+    _assert_real_restore(cmd, main, wt)
+    assert why, cmd
+    assert blocked, cmd
+
+
 # --- `alias` as prose in a quoted data argument (canonical brokered core ship) -----------
 # The whole-command pre-scan treats the word `alias` as a shell alias definition that may map
 # any bare name to git. A review reply such as "alias/import placement nit" is data, but it
