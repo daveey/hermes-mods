@@ -5,6 +5,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('closeout_plugin_ask_relay', ROOT / '__init__.py')
 plugin = importlib.util.module_from_spec(spec)
@@ -379,6 +381,48 @@ def test_deferred_relay_still_delivers_an_ask_no_reply_quoted(tmp_path, monkeypa
     out = plugin.wake_tick(now=1200, wake=lambda *a, **k: calls.append(a) or 'started', unseen={},
                            last_user=lambda _: 0, read=lambda _: cards)
     assert [o['result'] for o in out] == ['started'] and len(calls) == 1 and QUOTED['action'] in calls[0][1]
+
+
+@pytest.mark.parametrize('wake_result', ['started', 'busy'])
+def test_quote_read_failure_relays_instead_of_learning_a_quote(tmp_path, monkeypatch, wake_result):
+    """An unavailable transcript is not proof of delivery: attempt the ordinary relay, including its rollback."""
+    led, _ = _relay_env(tmp_path, monkeypatch)
+    cards = _quoted_cards()
+    led.write('chat', batch=['t_ask', 't_child'], open=[])
+    row = led.get('chat')
+    key = core.ask_relay_key(row, cards)
+    assert key and led.claim('chat', key, 1200)
+    reads = []
+
+    def unreadable(paths, lineage, card):
+        reads.append((paths, lineage, card))
+        raise OSError('fixture transcript read failed')
+
+    monkeypatch.setattr(core, 'quoted_ask', unreadable)
+    monkeypatch.setattr(plugin, '_moved_owner', lambda sid: None)
+    calls = []
+
+    def wake(sid, prompt, **kwargs):
+        calls.append((sid, prompt, kwargs))
+        return wake_result
+
+    out = plugin._relay(led, 'chat', led.get('chat'), cards, key, 1200, wake)
+    assert len(reads) == 1 and reads[0] == ([tmp_path / 'state.db'], ['chat'], cards['t_ask'])
+    assert len(calls) == 1, 'a quote-read failure must not suppress the ordinary relay'
+    assert calls[0][0] == 'chat' and QUOTED['action'] in calls[0][1]
+    assert calls[0][2]['display_metadata']['task_ids'] == ['t_ask']
+    assert out['result'] == wake_result and out['ask_relay'] == ['t_ask']
+    after = led.get('chat')
+    assert after['wake_result'] != 'quoted'
+    if wake_result == 'started':
+        assert after['covered'] == ['t_ask']
+        assert after['relayed'] == [core.ask_premise('t_ask', cards['t_ask'])]
+        assert after['wake_count'] == 1
+    else:
+        # Ordinary delivery did not start: neither coverage nor a learned premise may survive.
+        assert after['covered'] == [] and after['relayed'] == []
+        assert after['wake_count'] == 0
+        assert core.ask_relay_key(after, cards) == key
 
 
 def test_relay_drops_only_the_quoted_ask_of_two(tmp_path, monkeypatch):
