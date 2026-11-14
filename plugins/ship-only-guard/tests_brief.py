@@ -70,6 +70,63 @@ def test_conditional_or_unrelated_text_passes(text):
     assert brief.check("kanban_comment", {"body": text}) is None
 
 
+def test_create_mandate_only_in_title_is_refused():
+    assert brief.check("kanban_create", {
+        "title": "PR to `state`: any new head needs a fresh review.",
+        "body": "Build and test the updater.",
+    }) == brief.MESSAGE
+
+
+@pytest.mark.parametrize("tool", ["kanban_create", "kanban_comment"])
+def test_mcp_prefixed_brief_tools_are_refused(tool):
+    assert brief.check("mcp__board__" + tool, {"body": CARD_BODY}) == brief.MESSAGE
+
+
+def test_state_pr_phrase_alone_scopes_mandate():
+    # No branch, update-branch, base drift or other scope alternative.
+    text = "State PR: any new head needs a fresh review."
+    assert brief.check("kanban_comment", {"body": text}) == brief.MESSAGE
+    assert brief.check("kanban_comment", {
+        "body": text.replace("State PR: ", ""),
+    }) is None
+
+
+@pytest.mark.parametrize("patch_id", ["patch-id", "patchid"])
+def test_patch_id_is_the_only_exemption_for_recognized_mandate(patch_id):
+    mandate = "PR to `state`: any new head needs a fresh review"
+    # First prove the mandate is recognized, unlike a status-only sentence.
+    assert brief.check("kanban_comment", {"body": mandate}) == brief.MESSAGE
+    assert brief.check("kanban_comment", {
+        "body": mandate + " only if its " + patch_id + " differs.",
+    }) is None
+
+
+@pytest.mark.parametrize("refusal", [None, "downstream command refusal"])
+def test_brief_exception_is_logged_and_downstream_guard_still_runs(monkeypatch, caplog, refusal):
+    args = {"command": "fixture command; never executed"}
+    calls = []
+
+    def broken_brief(tool, received):
+        assert tool == "terminal" and received is args
+        raise RuntimeError("fixture brief failure")
+
+    def downstream(tool, received):
+        calls.append((tool, received))
+        return refusal
+
+    monkeypatch.setattr(plugin.brief, "check", broken_brief)
+    monkeypatch.setattr(plugin.guard, "check_tool", downstream)
+    with caplog.at_level("ERROR", logger=plugin.__name__):
+        result = plugin._pre_tool_call("terminal", args)
+    assert calls == [("terminal", args)]
+    assert result == ({"action": "block", "message": refusal} if refusal else None)
+    records = [r for r in caplog.records if r.name == plugin.__name__]
+    assert len(records) == 1
+    assert records[0].message == "ship-only-guard brief check failed"
+    assert records[0].exc_info[0] is RuntimeError
+    assert str(records[0].exc_info[1]) == "fixture brief failure"
+
+
 def test_other_tools_and_bad_args_pass():
     assert brief.check("terminal", {"command": CARD_BODY}) is None
     assert brief.check("kanban_create", None) is None
