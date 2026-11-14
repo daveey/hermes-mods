@@ -53,9 +53,22 @@ but save confirmation evidence (atomic 0600) and provider budgets. Applied chang
 use revision/owner-epoch CAS under the collector lock, with an exact-byte 0600
 `.pre-reconcile-*.bak` backup made inside the config writer lock.
 
-Requests are serial, paced, bounded per scope, and stop on quota/backoff. Recheck
-fresh coverage after a full cycle. Tests: `tests/test_scope_reconciliation.py`,
+The CLI bounds each invocation to 32 wire attempts, repaying shared durable
+pacing debt at 300/hour average and reserve 2500. Admission requires the next
+slot within 30 seconds and maintenance debt is capped at 384 seconds; this is
+not an additional rolling-hour allowance. Advisory timestamps rotate work with a
+six-hour minimum revisit, not a full-coverage guarantee. Partial listings never
+authorize changes, and no metadata or authorization responses are persisted.
+
+Applies are at least six hours apart and always use fresh responses. Pending
+revision-bound deletion proofs defer the whole candidate for at most 24 hours
+from the first actual apply deferral in that revision. Fresh confirmation of all
+pending deletions releases it early; expiry permits only today's fresh candidate,
+never cached changes. Failed/slow collector sweeps can still prevent deletion.
+Reports include maintenance deferred work and apply-hold blockers/deadline.
+Tests: `tests/test_maintenance_*.py`, `tests/test_scope_reconciliation.py`,
 `tests/test_runtime_reconcile.py`, and existing `tests/test_canonical*.py`.
+Offline simulation counts measure maintenance transport, not live quota debits.
 
 For unattended Linux use, invoke `scripts/runtime_reconcile.py` with the installed
 runtime Python, `-I`, `--core-root`, and the reconcile arguments. It activates the
@@ -65,8 +78,9 @@ a systemd user oneshot with `UMask=0077`, `TimeoutStartSec=1800`, and
 `ExecStopPost=/usr/bin/systemctl --user start hermes-runners-collector.service` so a
 hard kill or timeout also restores collection. That recovery unit assumes the
 collector is intended to remain active: disable the maintenance timer before
-intentionally stopping collection. Use a timer with `OnActiveSec=2min` and
-`OnUnitActiveSec=6h`. Put org/credential policy only in the host's private unit.
+intentionally stopping collection. Use an hourly calendar timer, for example
+`OnCalendar=*-*-* *:15:00`, so frequent daemon reloads cannot reset its deadline.
+Keep org/credential policy only in the host's private unit.
 Never run a long maintenance pass under a short-lived interactive tool timeout.
 
 To tolerate future renames without waiting for regeneration, inventory GETs accept
