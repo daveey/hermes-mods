@@ -26,6 +26,7 @@ from plugins.runners.store import Store
 from plugins.runners.scripts.run_collector import load_runtime
 from plugins.runners.providers.github_actions import GitHubActions, _Failure
 from plugins.runners.providers.runtime import BrokerCredential, BrokerVendGitHub
+from plugins.runners.scripts.maintenance_schedule import MaintenanceSchedule
 
 INTERVAL = 3600
 MAX_PAGES = 100
@@ -120,13 +121,19 @@ def _intervening_sweep(config, snapshot, old, first, now):
 
 
 def reconcile(config, runtime, transport, resolver, *, pause=time.sleep, adapter=None,
-              evidence=None, snapshot=None, now=None, interval=INTERVAL, discover_org=()):
+              evidence=None, snapshot=None, now=None, interval=INTERVAL, discover_org=(), schedule=None):
     if type(interval) not in (int, float) or not math.isfinite(interval) or interval <= 0:
         raise ValueError('invalid_confirmation_interval')
     now = time.time() if now is None else now
+    for owner, ref in discover_org:
+        if not GitHubActions._name(owner, 1) or not isinstance(ref, str) or not ref:
+            raise ValueError('invalid_discovery_organization')
     names, changes, errors, pending, additions, removals = {}, [], [], [], [], []
     evidence = {} if evidence is None else evidence
-    previous = deepcopy(evidence); evidence.clear()
+    previous = deepcopy(evidence)
+    if schedule is None:
+        evidence.clear()
+    scheduler = MaintenanceSchedule(config, runtime, schedule, now) if schedule is not None else None
     adapter = adapter or GitHubActions(transport=transport, credential_resolver=resolver, max_cycle_requests=2048)
     adapter.begin_cycle()
     referenced = set(runtime.get('job_repositories', {})) | {w['scope_id'] for w in config['allowed_workflows']}
@@ -134,7 +141,8 @@ def reconcile(config, runtime, transport, resolver, *, pause=time.sleep, adapter
     canonical_names = set()
 
     def get(credential, path):
-        pause(0.5)
+        if scheduler is None:
+            pause(0.5)
         return adapter._get(credential, path, metadata=True)
 
     def listing(owner, credential, ref, *, deletion=False):
@@ -159,19 +167,20 @@ def reconcile(config, runtime, transport, resolver, *, pause=time.sleep, adapter
         return result
 
     def failure(scope_id, exc):
-        if isinstance(exc, _Failure) and str(exc) in ('rate_limited', 'backoff', 'cycle_budget', 'unauthorized'):
+        if scheduler is None and isinstance(exc, _Failure) and str(exc) in ('rate_limited', 'backoff', 'cycle_budget', 'unauthorized'):
             raise RuntimeError(str(exc)) from None
         errors.append({'id': scope_id, 'error': str(exc)})
 
-    for scope in config['scopes']:
+    def reconcile_scope(scope):
         if scope['kind'] != 'repository':
-            continue
+            return
         try:
             if not GitHubActions._name(scope['name'], 2):
                 raise CanonicalError('invalid_repository')
             credential = adapter._credential(scope)
             response = get(credential, '/repos/' + scope['name'])
             if response.status != 404:
+                evidence.pop(scope['id'], None)
                 # Canonical validation still controls the one numeric 301 hop.
                 name = canonical_repository(scope['name'], lambda p: response if p == '/repos/' + scope['name'] else get(credential, p))
                 canonical_names.add(name.lower())
@@ -180,7 +189,7 @@ def reconcile(config, runtime, transport, resolver, *, pause=time.sleep, adapter
                         raise CanonicalError('referenced_scope_requires_coordinated_rename')
                     names[scope['id']] = name
                     changes.append({'id': scope['id'], 'old': scope['name'], 'new': name})
-                continue
+                return
             if scope['id'] in referenced:
                 raise CanonicalError('referenced_scope_requires_coordinated_removal')
             owner = scope['name'].split('/')[0]
@@ -204,11 +213,59 @@ def reconcile(config, runtime, transport, resolver, *, pause=time.sleep, adapter
             else:
                 pending.append(dict(row, reason='confirmation_interval_or_bounded_sweep'))
         except (_Failure, CanonicalError) as exc:
+            if not (scheduler and isinstance(exc, _Failure) and str(exc) in
+                    ('cycle_budget', 'pacing', 'backoff', 'rate_limited')):
+                evidence.pop(scope['id'], None)
             failure(scope['id'], exc)
+
+    selected_discovery = []
+    if scheduler is None:
+        for scope in config['scopes']:
+            reconcile_scope(scope)
+        selected_discovery = discover_org
+    else:
+        jobs = []
+        live_ids = {scope['id'] for scope in config['scopes']}
+        for scope_id in set(evidence) - live_ids:
+            del evidence[scope_id]
+        for scope in config['scopes']:
+            if scope['kind'] != 'repository':
+                continue
+            key = scheduler.key('repository', scope)
+            old = previous.get(scope['id'], {})
+            first = old.get('at')
+            priority = (type(first) in (int, float) and now - first >= interval
+                        and _intervening_sweep(config, snapshot, old, first, now))
+            if scheduler.due(key, priority=priority):
+                jobs.append((not priority, scheduler.last(key), key, 'repository', scope))
+        for owner, ref in discover_org:
+            key = scheduler.key('discovery', dict(name=owner, credential_ref=ref))
+            if scheduler.due(key):
+                jobs.append((True, scheduler.last(key), key, 'discovery', (owner, ref)))
+        for _, _, key, kind, item in sorted(jobs):
+            if adapter._cycle_remaining <= 0:
+                break
+            before = adapter.export_state()
+            error_start = len(errors)
+            if kind == 'repository':
+                reconcile_scope(item)
+            else:
+                owner, ref = item
+                try:
+                    credential = adapter._credential(dict(credential_ref=ref))
+                    listing(owner, credential, ref)
+                    selected_discovery.append(item)
+                except (_Failure, CanonicalError) as exc:
+                    failure(owner, exc)
+            # Admission failures remain due and preserve existing evidence.
+            interrupted = any(row['error'] in ('cycle_budget', 'pacing') for row in errors[error_start:])
+            if adapter.export_state() != before and not interrupted:
+                scheduler.attempted(key)
+        scheduler.prune()
 
     candidate = repoint_scopes(config, names)
     existing = canonical_names | {s['name'].lower() for s in candidate['scopes'] if s['kind'] == 'repository'}
-    for owner, ref in discover_org:
+    for owner, ref in selected_discovery:
         if not GitHubActions._name(owner, 1) or not isinstance(ref, str) or not ref:
             raise ValueError('invalid_discovery_organization')
         try:
