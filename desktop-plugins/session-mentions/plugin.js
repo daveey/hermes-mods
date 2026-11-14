@@ -931,7 +931,12 @@ async function fetchTask(connectionId, taskId, board) {
 
 export function summarizeTask(data, limit = 10) {
   const t = data?.task || {}
+  // Resolve custody before dropping event payloads/truncating history. An explicit empty
+  // receipt is authoritative; never borrow one from an older completion or the home gateway.
+  const completion = (data?.events || []).findLast(e => e.kind === 'completed')
+  const receipt = data?.artifact_receipt ?? completion?.payload?.artifact_receipt
   return {
+    artifact_receipt: Array.isArray(receipt) ? receipt : [],
     id: t.id,
     title: t.title,
     status: t.status,
