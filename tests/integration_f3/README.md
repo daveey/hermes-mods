@@ -58,8 +58,10 @@ is a usage error (exit 4), not a skip or fallback.
   the publication gate. Only the accepted draft may publish a source action.
   The scripted extractor returns a real candidate for both drafts, so accidental
   publication of the rejected draft is observable in the ledger and ActionStore.
-  Events require `judge(first), preview(first), judge(accepted), preview(accepted),
-  extract(accepted)`; the rejected text must not reach stream or persisted history.
+  Events require `judge(first), preview(first), judge(accepted), preview(accepted)`:
+  the transform reuses the gate's extraction for the identical prompt (user-steps
+  `shared_llm`, mods `0c871d3a`), so it makes no second extractor call. The rejected
+  text must not reach stream or persisted history.
 - Standalone user-steps discovery (ask-gate disabled) repeats a resolved request
   with plain/framed replies, with and without a verification continuation. Its
   buffering declaration must prevent raw stale stream/interim emission; returned
@@ -103,3 +105,9 @@ Why it escaped detection: F3 required explicit opt-in, so ordinary repo gates di
 not exercise it while the request model changed. The repo runner now includes F3
 when it discovers a core. Runner regressions cover implicit discovery, explicit
 CLI/environment selection, conftest isolation and the genuine missing-core skip.
+
+At mods `82ee5faa`, core `854519ff5a6`, the 6 new/open/resolved cases and the held-draft
+case failed again on a stale count: they expected a second (transform) extractor call.
+Mods `0c871d3a` made the gate and transform share one extraction so both judge the same
+answer; the sequences now expect one extraction per accepted draft. The source-state
+assertions (ledger, canonical requests, stream/history) are unchanged.
