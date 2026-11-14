@@ -128,6 +128,10 @@ The steps below cover the revoked-token producer and residual provider/card hold
 
 Grep transcripts for 429 `task-notification` storms — each names a dead subagent and its model. A parallel subagent fleet pinned to one model can drain that model's weekly bucket in a day. `ps aux` shows which desktop sessions are open and their `--model` flags; an idle session spends nothing, so only sessions actively retrying or spawning count.
 
+**Fleet attribution (Kanban era).** Every host's `~/.hermes/state.db` `sessions` row carries `model`, `billing_provider`, `source` (kanban/desktop/subagent/cron/oneshot), `title` (Kanban: card title plus ` #N` per extra run) and token columns. Dump rows from the hub and each worker (`ssh hub-admin`, then `ssh hermes-worker-N` from the hub) with `sqlite3 -readonly`, and aggregate locally from script files. Single-query workers block `python3 -c` and execute_code. Cache reads dominate (≈200× in+out), so rank by a weighted sum (in + 5×out + 1.25×cache_write + 0.1×cache_read), not in+out. Join to `task_runs` (hub kanban.db) by title prefix + start time within 3 min to cost run transitions (continued→continued, scheduled→scheduled). Per day, compare against the pool's sustainable rate before blaming any single family: a worker-pool scale-up multiplies burn.
+
+**Read `seven_day` first.** When it is 100% with `seven_day_opus`/`seven_day_sonnet` null, the account-wide bucket is spent, and short Sonnet/Haiku cooldowns on that account will 429 again. A `[disabled]` row with no cooldowns is not capacity.
+
 ### 5. Fixes, in order of speed
 
 1. Switch affected sessions to a model that passes the probe matrix.
