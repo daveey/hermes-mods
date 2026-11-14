@@ -111,8 +111,11 @@ def test_dashboard_replacement_closes_previous_owner(db, tmp_path, monkeypatch):
 
 def test_repeated_agent_unload_closes_only_owned_package(db, monkeypatch):
     from types import SimpleNamespace
-    dashboard = load('independent_mirror', ROOT / 'kanban_mirror.py')
-    monkeypatch.setitem(sys.modules, '_user_steps_kanban_mirror', dashboard)
+    api = load('independent_api', ROOT / 'dashboard/plugin_api.py')
+    # Use the real loader so the cached owner carries its reload stamp. An
+    # unstamped synthetic module is legitimately retired by a dashboard retry.
+    monkeypatch.setitem(sys.modules, '_user_steps_kanban_mirror', None)
+    dashboard = api._load('kanban_mirror')
     with dashboard._kept(db) as independent:
         pass
     try:
@@ -128,6 +131,8 @@ def test_repeated_agent_unload_closes_only_owned_package(db, monkeypatch):
                 callbacks = []
                 plugin.register(SimpleNamespace(on_unload=callbacks.append,
                     register_hook=lambda *a, **k: None, register_tool=lambda **k: None))
+                # Model a dashboard retry pass while the agent is registered.
+                assert api._load('kanban_mirror') is dashboard
                 mirror = importlib.import_module(name + '.kanban_mirror')
                 with mirror._kept(db) as c:
                     pass
