@@ -292,6 +292,26 @@ per base, no per-file attribution while deciding a yield); only the post-write
 ordering check re-lists refs. If that re-read fails, the refusal says the turn
 record was already written and may be in force.
 
+**Out-of-hook turn (`--land-turn`).** The PRs that keep drifting are the
+update-branched ones, whose approval carries through the patch-identical check;
+on a loaded worker that carry plus the drift compare leave 2-4 s of the 18 s, too
+little to start the acquisition, so the hook alone never recorded their turn and
+they livelocked through update-branch, CI and drift. When the hook cannot record
+(or finish recording) the turn, its drift refusal names, before the update-branch
+step:
+
+```sh
+python3 <plugin>/guard.py --land-turn N --repo OWNER/REPO --match-head-commit FULL_SHA
+```
+
+It re-runs the same state preflight, every refusal predicate unchanged, under its
+own 60 s budget (`LAND_TURN_TIMEOUT`, outside the hook), and only records the
+turn: exit 0 when the PR holds its turn afterwards, 1 with the reason otherwise
+(including "no drift, no turn needed"), 2 for malformed arguments or an
+unprotected repository. It never merges or admits a merge. A later hook attempt
+reports the PR's own live turn from its hold snapshot instead of asking again
+(`tests_turn_after_carry.py`, under the worker shim latency model).
+
 An old ticket is not expired by age alone: the 15-minute grace below yields only
 a holder that is still drifted against its current base, so a refreshed head
 keeps its place (pinned in `tests_turn.py`).

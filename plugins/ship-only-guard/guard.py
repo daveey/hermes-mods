@@ -1755,7 +1755,10 @@ def _turn_acquire_scoped(number, data, repo, cwd, env, prechecked):
     def late():
         # No write may start without room for it and for the ordering re-read after it.
         left = _left()
-        return time.monotonic() - start > _TURN_BUDGET if left is None else left < _WRITE_RESERVE
+        missed = time.monotonic() - start > _TURN_BUDGET if left is None else left < _WRITE_RESERVE
+        if missed:
+            _cache()["turn_missed"] = True     # the caller names the out-of-hook follow-up instead
+        return missed
     seen = _cache().get(("own", int(number))) if prechecked else None
     if seen is not None:
         rec = seen[0]                        # the hold snapshot's own ref (None: malformed, to be repaired)
@@ -1782,6 +1785,7 @@ def _turn_acquire_scoped(number, data, repo, cwd, env, prechecked):
     rc, hc = _gh_call([f"repos/{repo}/git/commits/{head}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
     tree = hc.get("tree", {}).get("sha") if rc == 0 and isinstance(hc, dict) and isinstance(hc.get("tree"), dict) else None
     if not isinstance(tree, str) or late():
+        _cache()["turn_missed"] = True
         return ""
     expires = int(_now()) + _TURN_TTL
     rec = {"pr": int(number), "head": head, "acquired": expires - _TURN_TTL,
@@ -1791,6 +1795,7 @@ def _turn_acquire_scoped(number, data, repo, cwd, env, prechecked):
         "tree": tree, "parents": [head]})
     sha = made.get("sha") if rc == 0 and isinstance(made, dict) else None
     if not isinstance(sha, str):
+        _cache()["turn_missed"] = True
         return ""
     # Commits are immutable: the post-write re-list need not read back the record this call just wrote.
     _cache().setdefault("obj", {})[sha] = {"message": f"{_TURN_SUBJECT}{int(number)}\n\n{json.dumps(rec, sort_keys=True)}\n"}
@@ -1799,6 +1804,7 @@ def _turn_acquire_scoped(number, data, repo, cwd, env, prechecked):
         rc, _ = _gh_call(["-X", "PATCH", f"repos/{repo}/git/refs/{ref}"], cwd, env, timeout=_TURN_CALL_TIMEOUT,
                          payload={"sha": sha, "force": True})
     if rc != 0:
+        _cache()["turn_missed"] = True
         return ""
     # Concurrent writers can publish records, but only the oldest is effective.
     try:
@@ -1840,6 +1846,63 @@ def _turn_hold_read_only(*args):
         return _turn_safe(_turn_hold_refusal, *args)
     finally:
         _TURN_READ_ONLY.reset(token)
+
+
+# Out-of-hook land turn (t_01a1da82d9dfdebd). The PRs that drift again and again are the update-branched ones,
+# whose approval carries through the patch-identical check; on a loaded worker that carry and the drift compare
+# leave 2-4 s of PREFLIGHT_TIMEOUT, while the acquisition needs more than _TURN_BUDGET, so the hook never recorded
+# their turn and they livelocked through update-branch -> CI -> drift (#2944). The hook keeps its budget; its
+# drift refusal names `guard.py --land-turn`, which re-runs this same preflight (every refusal predicate
+# unchanged) under its own LAND_TURN_TIMEOUT and only ever records the turn: it never merges or admits.
+LAND_TURN_TIMEOUT = 60.0
+_TURN_ONLY: ContextVar[dict | None] = ContextVar("ship_turn_only", default=None)
+
+
+def _turn_follow_up(number, repo, sha):
+    cmd = shlex.join(["python3", str(Path(__file__)), "--land-turn", str(int(number)), "--repo", repo,
+                      "--match-head-commit", sha])
+    return (f"This check had no time left to record PR #{int(number)}'s land turn, so first run `{cmd}` "
+            f"(it re-runs this preflight under its own {int(LAND_TURN_TIMEOUT)} s budget, records "
+            f"refs/{_TURN_PREFIX}{int(number)} and never merges); without the turn the next state commit "
+            "drifts this PR again.")
+
+
+def _own_live_turn(number, data):
+    """The expiry of this PR's own live, unyielded turn that this invocation's hold snapshot already read and
+    ordered, else None. Makes no request: used when the budget cannot start an acquisition."""
+    seen = _cache().get(("own", int(number)))
+    rec = seen[0] if seen else None
+    if not rec or rec["expires"] <= _now():
+        return None
+    key = ("yield", rec["pr"], rec["head"], rec["expires"], rec.get("acquired"), data.get("headRefOid"))
+    return _until(rec["expires"]) if _cache().get(key) is False else None
+
+
+def land_turn(number, repo, sha, cwd=None, env=None):
+    """(exit status, message) of `guard.py --land-turn`: 0 when PR #number holds its state land turn afterwards,
+    1 otherwise. The same `_state_merge` preflight and refusal predicates, under LAND_TURN_TIMEOUT instead of the
+    hook's PREFLIGHT_TIMEOUT; its allow result is reported as "no turn needed", never as an admission."""
+    env = dict(os.environ if env is None else env)
+    words = ["pr", "merge", str(number), "--repo", repo, "--rebase", "--match-head-commit", sha]
+    out = {}
+    only = _TURN_ONLY.set(out)
+    deadline = _PREFLIGHT_DEADLINE.set(time.monotonic() + LAND_TURN_TIMEOUT)
+    try:
+        result = _state_merge(words, repo, cwd, env)
+    except _PreflightExpired as exc:
+        result = str(exc)
+    finally:
+        _PREFLIGHT_DEADLINE.reset(deadline)
+        _TURN_ONLY.reset(only)
+    until = out.get("until")
+    if until and not until.startswith("[ship-only-guard]"):
+        return 0, f"PR #{number} holds the state land turn until {until} (refs/{_TURN_PREFIX}{number}).\n{result}"
+    if result is True:
+        return 1, (f"No land turn recorded: PR #{number} shows no base drift on its areas now, so it needs none. "
+                   "Rerun the merge command.")
+    if result is False:
+        return 1, f"No land turn recorded: PR #{number} --repo {repo} is not a state merge this guard checks."
+    return 1, f"No land turn recorded for PR #{number}:\n{result}"
 
 
 def _state_merge(words, repo, cwd, env):
@@ -1980,11 +2043,22 @@ def _state_merge_scoped(words, repo, cwd, env):
             return hold + ("\nAlso: " + drift if drift else "")
         if drift and "state commit(s) landed since then" in drift:
             remaining = _remaining()
+            reached = remaining is None or remaining > _TURN_BUDGET
             until = (_stage("land-turn acquisition", _turn_safe, _turn_acquire,
                             number, data, repo, cwd, env, True)
-                     if remaining is None or remaining > _TURN_BUDGET else None)
+                     if reached else _own_live_turn(number, data))
+            turn_only = _TURN_ONLY.get()
+            if turn_only is not None:
+                turn_only["until"] = until
             if until and until.startswith("[ship-only-guard]"):
                 return drift + "\n" + until
+            if not until and turn_only is None and (not reached or _cache().get("turn_missed")):
+                # The carried PRs that drift are exactly the ones whose turn the hook budget cannot reach
+                # (t_01a1da82d9dfdebd): name the bounded follow-up that records it, ahead of update-branch.
+                follow = _turn_follow_up(number, repo, sha)
+                anchor = "Run `gh api -X PUT"
+                drift = (drift.replace(anchor, follow + "\nThen r" + anchor[1:], 1) if anchor in drift
+                         else drift + "\n" + follow)
             if until:
                 drift += (f" PR #{number} now holds the state land turn until {until} (refs/{_TURN_PREFIX}"
                           f"{number}): overlapping state PR merges and direct state pushes wait for it, so "
@@ -2346,10 +2420,27 @@ def check_tool(name, args, cwd=None, repos=None, env=None, _depth=0):
     return None
 
 
+_LAND_TURN_USAGE = "usage: guard.py --land-turn <PR> --repo OWNER/REPO --match-head-commit FULL_SHA"
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["--land-turn"]:
+        number = argv[1] if len(argv) > 1 else ""
+        opts = dict(zip(argv[2::2], argv[3::2]))
+        repo, sha = _slug(opts.get("--repo", "")), opts.get("--match-head-commit", "")
+        if (len(argv) != 6 or set(opts) != {"--repo", "--match-head-commit"}
+                or not re.fullmatch(r"[1-9][0-9]*", number) or not re.fullmatch(r"[0-9a-f]{40}", sha)):
+            print(_LAND_TURN_USAGE, file=sys.stderr)
+            return 2
+        if not repo or repo not in load_repos():
+            print(f"{_LAND_TURN_USAGE}\n{opts['--repo']} is not a repository this guard protects.", file=sys.stderr)
+            return 2
+        status, message = land_turn(number, repo, sha, cwd=os.getcwd())
+        print(message, file=sys.stdout if status == 0 else sys.stderr)
+        return status
     if not argv or argv[0] != "--gh-args":
-        print("usage: guard.py --gh-args <gh arguments...>", file=sys.stderr)
+        print("usage: guard.py --gh-args <gh arguments...>\n       " + _LAND_TURN_USAGE[7:], file=sys.stderr)
         return 2
     why = bounded_preflight(check_argv, ["gh", *argv[1:]])
     if why:
