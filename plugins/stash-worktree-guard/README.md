@@ -222,7 +222,9 @@ so prose such as `--review-reply 'alias/import nit'` does not taint a brokered
 inside double quotes and unterminated quotes keep the whole-text reading; quoted payloads
 containing `alias` plus nested quote, backslash, assignment (`=`), negation (`!`),
 redirection (`<>`) or expansion (`$`) syntax also retain taint (including when `eval`
-joins separate arguments).
+joins separate arguments). A command-prefix word before `alias` also retains taint
+across arbitrary intervening options/operands (for example `time -p -- alias`), rather
+than trying to enumerate each prefix grammar. This deliberately includes ambiguous prose.
 Only standalone quoted words qualify for the prose exemption: adjacency to another
 quoted or unquoted fragment retains taint, because concatenation can supply assignment
 syntax outside the quoted fragment. Later shell quote removal, line joining or

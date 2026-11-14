@@ -2703,6 +2703,10 @@ def test_quoted_definition_real_restore_stays_refused(multi, definition, stored)
     ("'! alias 'g=git", False), ("'> /dev/null alias 'g=git", False),
     ("'! alias 'g=git", True), ("'> /dev/null alias 'g=git", True),
     ("'! alias ' g=git", False), ("'> /dev/null alias ' g=git", False),
+    ("'time -p alias' g=git", False),
+    ("'time -- alias' g=git", False),
+    ("'time -p -- alias' g=git", False),
+    ("'time -p builtin alias' g=git", False),
 ])
 def test_concatenated_definition_real_restore_stays_refused(multi, payload, stored):
     main, wt = multi

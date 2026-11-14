@@ -2579,9 +2579,12 @@ def _may_define_alias(text: str) -> bool:
     return any(re.search(_ALIAS_COMMAND, part) for part in quoted)
 
 
+# Prefixes can take options/operands or compose with other prefixes. Do not
+# enumerate their grammars here: eval can join the assignment from another argv
+# word. Any prefix before alias keeps taint, even if it could also be prose.
 _ALIAS_COMMAND = (
     r"(?:^|[;&|(){}`\n]|\$\(|\b(?:then|do|else|elif|eval|exec|builtin|command|sudo|env|time|"
-    r"nohup|xargs)\s)\s*alias(?=\s|$|[;&|()])"
+    r"nohup|xargs)\s[^\n]*?)\s*alias(?=\s|$|[;&|()])"
 )
 
 
