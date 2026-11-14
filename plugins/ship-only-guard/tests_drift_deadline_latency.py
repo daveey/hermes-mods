@@ -198,6 +198,8 @@ def load(monkeypatch, overlap):
                             for p, (m, s) in TREES[args[4]].items())
         if args[:2] == ("cat-file", "blob"):
             return BLOBS[args[2]]
+        if args[:2] == ("merge-base", "--all"):               # as the merge-base compares answer (t_01a1dadbf711c31c)
+            return {(H0, B1): MB1, (M1, B2): B1}[args[2:4]]
         raise AssertionError(args)
     monkeypatch.setattr(g._CarryObjects, "_fetch", fetch)
     monkeypatch.setattr(g._CarryObjects, "git", local_git)
