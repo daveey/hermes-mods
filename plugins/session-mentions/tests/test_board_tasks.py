@@ -109,6 +109,17 @@ def test_receipt_survives_truncated_replica_history(replica, payload):
     assert result['artifact_receipt'] == payload.get('artifact_receipt', [])
 
 
+@pytest.mark.parametrize('bad', [{'path': '/work/result.txt'}, 'result.txt', 7])
+def test_non_list_completion_receipt_projects_empty(replica, bad):
+    import sqlite3
+    with sqlite3.connect(replica) as conn:
+        conn.execute('INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,?,?,?)',
+                     ('t_123', 'completed', json.dumps({'artifact_receipt': bad}), 1))
+    result = bt.handle({'action': 'read', 'target': 't_123'})
+    assert result['ok'], result
+    assert result['artifact_receipt'] == []
+
+
 def test_legacy_replica_without_events_has_empty_receipt(replica):
     result = bt.handle({'action': 'read', 'target': 't_123'})
     assert result['ok'], result

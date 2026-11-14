@@ -204,6 +204,15 @@ test('task receipts preserve explicit custody records, including an explicit emp
   assert.deepEqual(m.summarizeTask({ ...data, artifact_receipt: [] }).artifact_receipt, [])
 })
 
+test('non-list receipts (top-level or completion payload) project as an empty receipt', async () => {
+  const m = await load({ state, connections: async () => conns }, fakeApi())
+  for (const bad of [{ path: '/work/result.txt' }, 'result.txt', 7]) {
+    assert.deepEqual(m.summarizeTask({ task: {}, artifact_receipt: bad }).artifact_receipt, [])
+    const events = [{ kind: 'completed', payload: { artifact_receipt: bad } }]
+    assert.deepEqual(m.summarizeTask({ task: {}, events }).artifact_receipt, [])
+  }
+})
+
 test('courier task_read retains latest completion receipt outside truncated history', async () => {
   const receipt = [{ machine: 'worker-example', path: '/work/result.txt', sha256: 'b'.repeat(64), attachment_uid: null, warning: null }]
   const events = [
