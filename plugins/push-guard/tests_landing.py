@@ -25,7 +25,7 @@ class GitHub:
                    'base': {'ref': 'main', 'sha': 'b' * 40, 'repo': {'full_name': land.REPO}},
                    'user': {'login': 'author'}}
         self.runs = [{'id': 1, 'name': 'tests', 'head_sha': HEAD, 'app': {'id': 9},
-                      'status': 'completed', 'conclusion': 'success'}]
+                      'check_suite': {'id': 101}, 'status': 'completed', 'conclusion': 'success'}]
         self.statuses = []
         self.reviews = [{'id': 1, 'state': 'APPROVED', 'commit_id': HEAD,
                          'user': {'login': 'reviewer', 'type': 'User'}}]
@@ -120,6 +120,14 @@ def test_required_checks_select_and_require_matching_app():
     api = GitHub()
     api.rules = [{'type': 'required_status_checks', 'parameters': {
         'required_status_checks': [{'context': 'tests', 'integration_id': 10}]}}]
+    with pytest.raises(land.Refused): land.land(7, HEAD, read=api)
+    assert not api.writes
+
+
+def test_same_named_jobs_in_distinct_workflows_do_not_hide_failure():
+    api = GitHub()
+    api.runs[0]['conclusion'] = 'failure'
+    api.runs.append({**api.runs[0], 'id': 2, 'check_suite': {'id': 102}, 'conclusion': 'success'})
     with pytest.raises(land.Refused): land.land(7, HEAD, read=api)
     assert not api.writes
 
