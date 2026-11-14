@@ -289,6 +289,13 @@ Optional `owner_task` and `owner_board` fields preserve the runtime Kanban ident
 They come from the same environment source, never from a title or branch.
 Unknown fields are omitted and legacy records remain readable.
 
+`effective_turns(snapshot, eligible, check)` is the read-only selection seam used
+by merge preflight: it sorts a complete supplied snapshot, skips overlap waiters,
+and calls the caller's eligibility/deadline checks before yielding each holder.
+It performs no source reads or deletions itself. Owner/board filtering must follow
+selection, not precede it. An observer must still supply complete bounded verdict,
+carry and drift evidence; this helper alone is not observer integration.
+
 The reader follows all ref-list pages and fetches immutable commit objects in
 batches of 100, rather than dropping old holders after six sequential reads.
 Incomplete, timed-out or malformed snapshots **fail closed**: base drift checks
