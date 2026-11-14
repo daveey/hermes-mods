@@ -59,6 +59,46 @@ def test_enter_refuses_when_the_window_does_not_ask_for_enter(ent):
     assert out["ok"] is False and "pressed" not in out and "Enter" in out["error"]
 
 
+@pytest.mark.parametrize("line", ["enter your username:", "Return code 3", "enter passphrase:",
+                                  "Enter the 6-digit code:", "Please enter a value (or return to skip):"])
+def test_enter_refuses_lines_that_only_mention_enter_or_return(ent, monkeypatch, line):
+    """Only an explicit 'press/hit/type Enter', 'Enter to continue' or '[Enter]' prompt is answered; a line that
+    merely contains the word enter/return (a username/passphrase/code prompt, an exit-code report) is the
+    user's to answer, so Return is never typed into it."""
+    ut, job = ent
+    calls = []
+    monkeypatch.setattr(ut, "_osascript_out", lambda script: calls.append(script) or "iTerm")
+    (job / "output.log").write_text(f"Starting...\r\n{line} ")
+    out = ut.press_enter(job)
+    assert out["ok"] is False and "pressed" not in out and calls == [], out
+    assert "does not ask for Enter" in out["error"] and out["prompt"] == line
+
+
+def test_enter_refuses_when_the_runner_pid_was_reused(ent, monkeypatch):
+    """The recorded runner pid now belongs to a different process (its start time no longer matches), so its
+    tty is not the job's window: nothing is pressed even though that pid has a live tty."""
+    ut, job = ent
+    calls, ttys_asked = [], []
+    monkeypatch.setattr(ut, "_osascript_out", lambda script: calls.append(script) or "iTerm")
+    monkeypatch.setattr(ut, "_tty_of", lambda pid: ttys_asked.append(pid) or "/dev/ttys009")
+    (job / "runners").write_text("123 earlier-birth\n")
+    out = ut.press_enter(job)
+    assert out["ok"] is False and "pressed" not in out and calls == [], out
+    assert "no live window" in out["error"]
+    assert ttys_asked == []  # the reused pid's tty is never even looked up
+
+
+def test_enter_presses_only_the_runner_that_is_still_the_same_process(ent, monkeypatch):
+    ut, job = ent
+    scripts = []
+    monkeypatch.setattr(ut, "_osascript_out", lambda script: scripts.append(script) or "Terminal")
+    monkeypatch.setattr(ut, "_tty_of", lambda pid: {123: "/dev/ttys001", 456: "/dev/ttys009"}[pid])
+    (job / "runners").write_text("456 earlier-birth\n123 current-birth\n")
+    out = ut.press_enter(job)
+    assert out["ok"] is True and out["tty"] == "/dev/ttys001", out
+    assert len(scripts) == 1 and '"/dev/ttys001"' in scripts[0] and "ttys009" not in scripts[0]
+
+
 def test_enter_refuses_before_the_command_runs(ent):
     ut, job = ent
     (job / "status.json").write_text(json.dumps({"status": "waiting_for_user"}))
