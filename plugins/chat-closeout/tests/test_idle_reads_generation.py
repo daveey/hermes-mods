@@ -114,7 +114,8 @@ def test_polled_observer_reopens_after_sidecar_loss(tmp_path, kind):
 
 
 @linux
-def test_borrowed_observer_refuses_recovery_without_waiting_then_retry_succeeds(tmp_path):
+def test_borrowed_observer_refuses_recovery_without_waiting_then_retry_succeeds(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, '_shared_reader', lambda: None)  # exercise the plugin-owned entry lock
     lockguard = _core()
     from hermes_cli.kanban_generation import DeletedWalGenerationError
     path = tmp_path / 'kanban.db'
@@ -149,6 +150,7 @@ def test_borrowed_observer_refuses_recovery_without_waiting_then_retry_succeeds(
 def test_older_core_without_generation_registry_drops_on_shm_change(tmp_path, monkeypatch):
     """Core without the reader registry (no open_ro/register_reader_cache): plain observers, still dropped on a
     -shm generation change, and before any later core board connect."""
+    monkeypatch.setattr(core, '_shared_reader', lambda: None)  # old cores also lack the shared reader
     generation = pytest.importorskip('hermes_cli.kanban_generation')
     lockguard = _core()
     monkeypatch.delattr(generation, 'open_ro')

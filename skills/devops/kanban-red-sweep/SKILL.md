@@ -1,14 +1,14 @@
 ---
 name: kanban-red-sweep
-description: "Use when asked to sweep red Kanban cards. Unblock, then ask."
+description: "Use when asked to unblock red or not-ready Kanban cards."
 version: 1.0.0
 author: daveey
 license: MIT
 triggers:
   asks:
     - "sweep all red cards"
-    - "there are a bunch of red cards, check them"
     - "unblock as many as you can, then ask me about the rest"
+    - "there are 110 not-ready tasks, audit them and figure out how to unblock"
   not_for: "a digest of what waits on the user without acting (use kanban-hands-digest)"
 metadata:
   hermes:
@@ -24,6 +24,24 @@ board, unblock what an agent can, and only then ask the user about the rest, in 
 
 The user's standing order for this skill: do not ask before sweeping. Clear first, decide what you can
 reasonably guess for him, and ask only about what you are really unsure of.
+
+## 0. Scope first: red cards or not-ready cards?
+
+Pick the column set from the user's words before running anything. Red cards and not-ready cards are different
+audits, and answering one when he asked about the other is a miss even when every action is correct.
+- **Red** ("red", "blocked", "waiting on me", "gave up", "needs input"): the rest of this skill.
+- **Not ready** ("not-ready", "todo", "scheduled", "waiting", "parked", "why aren't these running", or a screenshot
+  of the Board's Todo/Scheduled columns): the Board's **Todo + Scheduled** columns. Run
+  `scripts/red_cards.py waiting` (`--json` for scripts). It reads the fleet replica
+  (`kanban/sync-shadow/<board>.db`, which is what the Board shows) per board and gateway, and lists the actionable
+  cards first: `sched-awaited-done` (wake it), `sched-overdue`, `todo-parents-done`, `todo-parent-missing`,
+  `todo-no-parents` and `todo-parent-blocked`. Act on those (wake, relink, promote, or clear the red parent with
+  steps 2-3), then summarise the rest by what they wait on (timer, card, CI/deploy, outside event, downstream of a
+  wait). Lead the reply with the not-ready findings and the counts per gateway that reconcile with his number.
+  Mention red cards in at most one line, and only when a not-ready chain is behind one. The red-card asks,
+  decision forms and Done-means list below don't apply.
+- Unsure which he means? Run both inventories (each is read-only and quick), and lead with the set whose count is
+  closest to the number he quoted.
 
 ## 1. Inventory (every gateway, board and decision chat, read-only)
 
@@ -297,6 +315,7 @@ and the final response.
 - Before saying an ask is still blocked, re-read it: the user may have answered on another surface since the last read.
 
 ## Done means
+- [ ] Scope matched his words (step 0): a not-ready/Todo/Scheduled ask got the `waiting` audit at the top of the reply, not a red sweep?
 - [ ] Every board was inventoried, and the count per board and status was reported?
 - [ ] Each red card was classified with a live premise check, not from the block reason alone?
 - [ ] Every agent-clearable card was completed, archived or unblocked, each with an evidence comment?

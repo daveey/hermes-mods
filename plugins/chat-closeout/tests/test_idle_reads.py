@@ -13,13 +13,8 @@ def _messages(path):
 
 
 def _trace(monkeypatch):
-    statements = []
-    real = core.ro_connect
-    def connect(*args, **kwargs):
-        conn = real(*args, **kwargs)
-        conn.set_trace_callback(statements.append)
-        return conn
-    monkeypatch.setattr(core, 'ro_connect', connect)
+    from reader_probe import trace_readers
+    statements, _ = trace_readers(monkeypatch, core)
     return statements
 
 
@@ -139,6 +134,7 @@ def test_commit_during_query_is_not_cached_under_new_revision(tmp_path):
 
 
 def test_observers_and_query_entries_are_bounded_and_evictions_close(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, '_shared_reader', lambda: None)  # private fallback owns these entries
     cache = core._structural_reads
     monkeypatch.setattr(cache, 'MAX_DATABASES', 2)
     monkeypatch.setattr(cache, 'MAX_QUERIES', 2)
@@ -168,7 +164,8 @@ def test_reused_board_rows_are_isolated_from_caller_mutation(tmp_path):
     assert again['t_run']['parents'] == []
 
 
-def test_structural_reads_do_not_write_database(tmp_path):
+def test_structural_reads_do_not_write_database(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, '_shared_reader', lambda: None)  # private fallback transaction assertion
     path = tmp_path / 'db'
     _board(path)
     _messages(path)

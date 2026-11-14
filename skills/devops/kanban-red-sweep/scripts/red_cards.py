@@ -4,12 +4,14 @@
   red_cards.py list            deterministic inventory of red cards on every board (cron monitor: no timestamps)
   red_cards.py log ...         append one sweep finding to ~/.hermes/state/kanban-red-sweep.jsonl
   red_cards.py stats [--days N] counts per day, class, action and avoidable; top prevention slugs
+  red_cards.py waiting [--json] "not ready" audit: Todo + Scheduled cards by what each waits on, actionable first
 """
 import argparse
 import collections
 import glob
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -115,9 +117,133 @@ def cmd_stats(a):
         print(f"  {v}x [{slug}] {last.get('prevention', '')[:140]}")
 
 
+TODO_CLASSES = {
+    # class: (actionable, what to do)
+    "todo-parents-done": (True, "every parent finished but it never promoted: re-check links / promote it"),
+    "todo-parent-missing": (True, "a parent id no longer exists on this board: unlink or re-point it"),
+    "todo-parent-blocked": (True, "chain waits on a red card: clear that card (red sweep) and this follows"),
+    "todo-no-parents": (True, "todo with nothing to wait on: find why it was parked, then ready or archive it"),
+    "todo-parent-active": (False, "parent is running/ready/in review"),
+    "todo-parent-waiting": (False, "parent is itself todo/scheduled (downstream of a wait)"),
+    "sched-overdue": (True, "wake time passed over 1 h ago and it did not wake: check its wake_check/dispatcher"),
+    "sched-awaited-done": (True, "the card it awaits already finished: wake it now"),
+    "sched-waiting": (False, "waiting on a clock, CI, deploy, card or outside event that is still pending"),
+}
+_TID = re.compile(r"\bt_[0-9a-f]{8,16}\b")
+
+
+def waiting_sources():
+    """(board, path) per board: the fleet replica (what the Board UI shows) when present, else the local DB."""
+    out = []
+    for board, local in boards():
+        shadow = os.path.join(HOME, "kanban", "sync-shadow", f"{board}.db")
+        out.append((board, shadow if os.path.isfile(shadow) else local))
+    return out
+
+
+def audit_waiting(conn, now):
+    cols = {r[1] for r in conn.execute("pragma table_info(tasks)")}
+    gw = "coalesce(created_on,'local')" if "created_on" in cols else "'local'"
+    status = dict(conn.execute("select id,status from tasks"))
+    rows = conn.execute(
+        f"select id,status,title,coalesce(priority,0),{gw} from tasks "
+        "where status in ('todo','scheduled') order by id").fetchall()
+    cards = []
+    for tid, st, title, prio, gateway in rows:
+        parents = {p: status.get(p, "MISSING") for (p,) in conn.execute(
+            "select parent_id from task_links where child_id=?", (tid,))}
+        ev = conn.execute(
+            "select payload from task_events where task_id=? and kind in ('scheduled','continued','dependency_wait')"
+            " order by id desc limit 1", (tid,)).fetchone()
+        try:
+            payload = json.loads(ev[0] or "{}") if ev else {}
+        except ValueError:
+            payload = {}
+        payload = payload if isinstance(payload, dict) else {}
+        wake_at = payload.get("wake_at")
+        aw = payload.get("awaiting")
+        aw = aw if isinstance(aw, dict) else {}
+        refs = set(_TID.findall(json.dumps(aw) + str(payload.get("wake_check") or "")))
+        if aw.get("kind") == "card" and aw.get("ref") and not aw.get("gateway"):
+            refs.add(str(aw["ref"]))
+        awaited = {r: status.get(r, "?") for r in sorted(refs) if r != tid}
+        if st == "todo":
+            open_p = [v for v in parents.values() if v not in ("done", "archived")]
+            if not parents:
+                cls = "todo-no-parents"
+            elif not open_p:
+                cls = "todo-parents-done"
+            elif "MISSING" in open_p:
+                cls = "todo-parent-missing"
+            elif "blocked" in open_p or "gave_up" in open_p:
+                cls = "todo-parent-blocked"
+            elif all(v in ("running", "ready", "review") for v in open_p):
+                cls = "todo-parent-active"
+            else:
+                cls = "todo-parent-waiting"
+        else:
+            if isinstance(wake_at, (int, float)) and wake_at < now - 3600:
+                cls = "sched-overdue"
+            elif awaited and all(v in ("done", "archived") for v in awaited.values()):
+                cls = "sched-awaited-done"
+            else:
+                cls = "sched-waiting"
+        cards.append(dict(
+            id=tid, status=st, gateway=gateway, title=title or "", priority=prio, cls=cls,
+            actionable=TODO_CLASSES[cls][0], parents=parents, awaited=awaited, wake_at=wake_at,
+            reason=str(payload.get("reason") or "")[:200]))
+    return cards
+
+
+def cmd_waiting(a):
+    now = time.time()
+    report: dict = {"counts": {}, "sources": {}, "cards": []}
+    for board, path in waiting_sources():
+        conn = _ro_connect(path)
+        try:
+            cards = audit_waiting(conn, now)
+        finally:
+            conn.close()
+        report["sources"][board] = path
+        counts = report["counts"].setdefault(board, {})
+        for c in cards:
+            c["board"] = board
+            g = counts.setdefault(c["gateway"], {})
+            g[c["status"]] = g.get(c["status"], 0) + 1
+        report["cards"].extend(cards)
+    report["counts"] = {b: v for b, v in report["counts"].items() if v}
+    if a.json:
+        print(json.dumps(report, sort_keys=True, default=str))
+        return
+    cards = report["cards"]
+    print("Not-ready audit: Todo + Scheduled columns (red/blocked cards are `list`, not this).")
+    for board, gws in sorted(report["counts"].items()):
+        for gwn, c in sorted(gws.items()):
+            print(f"  {board}/{gwn}: todo {c.get('todo', 0)}, scheduled {c.get('scheduled', 0)}")
+    tally = collections.Counter(c["cls"] for c in cards)
+    print("by class: " + ", ".join(f"{k}={v}" for k, v in sorted(tally.items())))
+    act = [c for c in cards if c["actionable"]]
+    print(f"\nactionable ({len(act)}): act on these first")
+    for c in sorted(act, key=lambda c: (c["cls"], -c["priority"])):
+        extra = {k: v for k, v in (("parents", c["parents"]), ("awaited", c["awaited"])) if v}
+        print(f"  [{c['cls']}] {c['board']}/{c['gateway']} {c['id']} {c['title'][:70]} {extra or ''}")
+        print(f"      -> {TODO_CLASSES[c['cls']][1]}")
+    rest = [c for c in cards if not c["actionable"]]
+    print(f"\nwaiting on purpose ({len(rest)}):")
+    for cls in sorted({c["cls"] for c in rest}):
+        group = [c for c in rest if c["cls"] == cls]
+        print(f"  [{cls}] {len(group)}: {TODO_CLASSES[cls][1]}")
+        for c in group[: a.limit]:
+            print(f"    {c['board']}/{c['gateway']} {c['id']} {c['title'][:70]} | {c['reason'][:90]}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
+    wt = sub.add_parser("waiting", help="audit Todo + Scheduled (\"not ready\") cards by what each waits on")
+    wt.add_argument("--json", action="store_true")
+    wt.add_argument("--limit", type=int, default=15, help="rows shown per waiting class")
+    wt.set_defaults(fn=cmd_waiting)
     listing = sub.add_parser("list")
     listing.add_argument("--local-json", action="store_true", help="local snapshot for authorized fleet readers")
     listing.set_defaults(fn=cmd_list)

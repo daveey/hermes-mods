@@ -29,16 +29,8 @@ def fresh_caches():
 
 
 def _trace(monkeypatch, target=core):
-    statements, opens = [], []
-    real = target.ro_connect
-
-    def connect(path, *args, **kwargs):
-        opens.append(str(path))
-        conn = real(path, *args, **kwargs)
-        conn.set_trace_callback(statements.append)
-        return conn
-    monkeypatch.setattr(target, 'ro_connect', connect)
-    return statements, opens
+    from reader_probe import trace_readers
+    return trace_readers(monkeypatch, target)
 
 
 def _fds(path):
@@ -313,7 +305,9 @@ def test_shadow_unchanged_file_read_once_and_any_commit_seen(board_world, monkey
         conn.commit()
     monkeypatch.setattr(plugin.time, 'time', lambda: 1121.5)
     assert plugin._read_shadow('build', {'t_one'}) == (False, {'t_one'})  # 120.5 s since the new pull
-    observer = core._structural_reads.entries[str(path.absolute())][1]
+    cache = core._structural_reads
+    entries = cache._shared if core._shared_reader() is not None else cache.entries
+    observer = entries[str(path.absolute())][1]
     assert not observer.in_transaction  # no read snapshot outlives the call
 
 
@@ -350,6 +344,7 @@ def test_shadow_replacement_corruption_and_deletion_are_never_reused(board_world
 
 
 def test_shadow_query_error_is_not_cached(board_world, monkeypatch):
+    monkeypatch.setattr(core, '_shared_reader', lambda: None)  # inject failure in the private opener
     _, path = board_world
     real = core.ro_connect
     calls = []
