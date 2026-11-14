@@ -49,6 +49,7 @@ Validate each changed slice with an actual worker read and subsequent update, no
 A pool worker's transcript lives on that worker (`hermes-worker-N` in the run's `worker_bound` claim_lock), not
 the hub: read it there (hub role + SSM) before calling a run prompt-only. Re-run `harvest` with every key prefix in
 the slice's `harvest-v2` source (some families have two); a different prefix set fails `harvest source changed`.
+For Board-backed producers, exercise create → JSON identity readback → comment → done-card reopen through the real CLI in an isolated HERMES_HOME. In-memory Board fakes can expose fields the CLI serializer omits or accept reopen calls missing required reasons; unit delivery success alone is not end-to-end proof. Verify a natural scheduled delivery against the durable queue and card thread after deployment.
 For interruptible collectors, checkpoint each external delivery and reconcile its durable receipt before retrying;
 test late completions, interruption and concurrent writers rather than only uninterrupted sequential runs.
 Propagate the same absolute monotonic deadline through discovery pagination, retry backoff and signed-download hops; a per-socket timeout does not bound a trickling transfer. Reuse socket-owning cancellation and test actual peer closure, plus a composed poll that retains an unfinished run when its artifact hop exhausts the budget. Keep DNS cancellation limits explicit and restore scoped deadline state after errors.
