@@ -85,6 +85,46 @@ def _owner(config):
     return {k: config[k] for k in ('owner_gateway_id', 'owner_profile', 'owner_epoch', 'config_revision')}
 
 
+def _valid_proof(old, identity, now, interval):
+    first = old.get('at')
+    return (old.get('identity') == identity and type(first) in (float, int)
+            and math.isfinite(first) and 0 <= now - first <= max(86400, interval * 4))
+
+
+def _apply_hold(config, candidate, runtime, evidence, maintenance, report, now, interval):
+    """Bound unrelated revision churn, without using saved proof as authority.
+
+    The first actual apply deferral starts a non-renewable 24h window for this
+    revision. Expiry releases only today's fresh candidate, never saved changes.
+    Credential keys come from configuration: this gate must not open a vend.
+    """
+    owner = _owner(config)
+    hold = maintenance.get('apply_hold')
+    if not isinstance(hold, dict) or hold.get('owner') != owner:
+        maintenance.pop('apply_hold', None)
+        hold = None
+    retained = {s['id'] for s in candidate['scopes']}
+    removed = {r['id'] for r in report.get('removals', [])} - retained
+    blockers = []
+    for scope in config['scopes']:
+        mapping = runtime.get('credentials', {}).get(scope['credential_ref'], {})
+        key = mapping.get('key') if isinstance(mapping, dict) else None
+        if scope['kind'] != 'repository' or scope['id'] in removed or not key:
+            continue
+        identity = dict(owner=owner, scope=scope, credential_key=key)
+        if _valid_proof(evidence.get(scope['id'], {}), identity, now, interval):
+            blockers.append(scope['id'])
+    if blockers and hold is None:
+        hold = dict(owner=owner, first_deferred_at=now)
+        maintenance['apply_hold'] = hold
+    started = hold.get('first_deferred_at') if hold else None
+    # Malformed/future advisory state cannot indefinitely postpone fresh work.
+    deadline = (started + 86400 if type(started) in (int, float)
+                and math.isfinite(started) and 0 <= started <= now else now)
+    return dict(deferred=bool(blockers and now < deadline),
+                blockers=blockers, deadline=deadline)
+
+
 def _intervening_sweep(config, snapshot, old, first, now):
     """Require service of every configured scope since the first confirmation.
 
@@ -201,8 +241,7 @@ def reconcile(config, runtime, transport, resolver, *, pause=time.sleep, adapter
             identity = dict(owner=_owner(config), scope=deepcopy(scope), credential_key=credential.key)
             old = previous.get(scope['id'], {})
             first = old.get('at')
-            valid = (old.get('identity') == identity and type(first) in (float, int)
-                     and math.isfinite(first) and 0 <= now - first <= max(86400, interval * 4))
+            valid = _valid_proof(old, identity, now, interval)
             if not valid:
                 old = dict(identity=identity, at=now,
                            collection_id=(snapshot or {}).get('collection', {}).get('id'))
@@ -408,6 +447,10 @@ def _run(args, source, config, runtime, github, discovery):
         _save_evidence(path, evidence)
         changed = any(report.get(k) for k in ('changes', 'additions', 'removals'))
         applied = bool(args.apply and changed and apply_due)
+        if applied:
+            report['apply_hold'] = _apply_hold(config, candidate, runtime, evidence,
+                maintenance, report, now, args.confirmation_interval)
+            applied = not report['apply_hold']['deferred']
         if applied:
             # Fence first: a crash after CAS must not permit another hourly apply.
             maintenance['last_apply'] = now
