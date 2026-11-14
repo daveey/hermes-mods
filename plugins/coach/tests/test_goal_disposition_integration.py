@@ -111,7 +111,7 @@ def test_normal_discovery_coexists_and_reloads(tmp_path, monkeypatch, order):
         assert Path(manager._plugins['coach'].module.__file__).resolve().parent == ROOT
         manifest = yaml.safe_load((ROOT / 'plugin.yaml').read_text())
         assert 'pre_final_gate' in manifest['provides_hooks']
-        hooks = manager._hooks['pre_final_gate']
+        hooks = tuple(manager._hooks['pre_final_gate'])
         # Coach's goal, compute-envelope and status-fresh gates, ask-gate, chat-closeout.
         assert len(hooks) == 5
         assert sorted(h.__qualname__ for h in hooks) == sorted([
