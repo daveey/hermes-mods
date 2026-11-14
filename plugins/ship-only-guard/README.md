@@ -8,23 +8,26 @@ per-file commit lookups when it refuses for base drift.
 
 ## Preflight budgets
 
-The registered `pre_tool_call` callback declares a **150-second** host timeout
-(`hermes_hook_timeout`); other callbacks retain their own/default budgets and
-host timeout failures remain fail-closed. Carry verification can exceed the
-host's default 30 seconds even when every individual probe succeeds.
+The registered `pre_tool_call` callback retains a **30-second** host backstop.
+The adapter and standalone `--gh-args` entry point share an **18-second aggregate
+monotonic deadline** across probes, including nested parallel workers. A deadline
+refusal names the stage (approval/carry, tree/blob reads, Git fetch/merge-tree,
+land-turn reads, or drift); late results never allow a command. Every worker gets
+its own copied context with the same deadline, and is joined before return.
 
-The adapter and standalone `--gh-args` entry point share a **120-second aggregate
-monotonic deadline** across all probes in one invocation, including nested tool
-calls. Each subprocess keeps its existing per-call cap (2–30 seconds), clipped
-to the remaining aggregate allowance. Exhaustion stops new probes and refuses
-the operation; a result arriving after the deadline cannot allow it. The extra
-30 seconds leave cleanup/return headroom; the host remains the hard callback
-backstop for Python or filesystem stalls. Direct library callers can use
-`bounded_preflight(check_argv, argv)` for the same aggregate bound.
+Independent carry patch reads, blob reads, and the two clean-merge checks run in
+parallel. Both the API tree/content prefilter and authoritative Git merge-tree
+must still pass. Approval and a **read-only** land-turn scan overlap; that scan
+never deletes refs speculatively. Non-speculative turn readers retain cleanup.
+The mutable base-drift read stays **last**, after approval/hold checks, so the
+optimization does not widen the final base-read race. Optional turn acquisition
+starts only when its budget fits; lack of time never changes a refusal to allow.
 
-`tests_budget.py` covers registration, clipping, late-result rejection, context
-reset/nesting, real subprocess expiry, standalone refusal, and (when core is
-available) real bounded host dispatch and fail-closed timeout/suppression.
+Preflights taking at least one second log elapsed time and allowed/refused status,
+without logging submitted commands. `tests_budget.py` and `tests_parallel.py`
+cover registration, clipping, nested context propagation, named real subprocess
+expiry, late-result rejection, exception propagation and host fail-closed dispatch.
+Private incident recordings stay out of this public repository.
 
 ## Configuration
 

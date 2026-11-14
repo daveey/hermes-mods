@@ -160,6 +160,10 @@ def test_merged_holder_releases_and_cleans_up(gh):
     merge(2563, H2563)
     fake.compare, fake.pr_state[2563] = IDENTICAL, "closed"
     assert merge(2600, H2600) is None
+    # Merge preflight is read-only while approval runs; non-speculative readers
+    # retain cleanup, rather than deleting a ref observed before approval.
+    assert "refs/land-turn/pr-2563" in fake.refs
+    assert g._turn_hold_refusal("2600", pr(2600, H2600, ["hermes-sync"]), R, None, {}) is None
     assert "refs/land-turn/pr-2563" not in fake.refs
 
 
@@ -203,9 +207,12 @@ def test_readers_delete_cooled_and_junk_turns(gh, monkeypatch):
     fake.compare = IDENTICAL
     monkeypatch.setattr(g, "_now", lambda: NOW + g._TURN_TTL + 5)   # cooling: kept
     assert merge(2600, H2600) is None
+    assert "refs/land-turn/pr-7" in fake.refs
+    g._live_turns(R, None, {})
     assert set(fake.refs) == {"refs/land-turn/pr-2563"}
     monkeypatch.setattr(g, "_now", lambda: NOW + 2 * g._TURN_TTL + 5)
     assert merge(2600, H2600) is None
+    g._live_turns(R, None, {})
     assert not fake.refs
 
 
