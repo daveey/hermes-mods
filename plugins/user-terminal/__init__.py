@@ -1893,7 +1893,10 @@ def start_reconciler(ctx):
                 continue
             except Exception:
                 log.exception("user_terminal: completion reconciliation pass failed")
-    ctx.on_unload(stop.set)
+    def unload():
+        stop.set()
+        _sweep_retire()
+    ctx.on_unload(unload)
     context = contextvars.copy_context()
     threading.Thread(target=lambda: context.run(run), name="user-terminal-reconcile", daemon=True).start()
 
@@ -2016,6 +2019,8 @@ _SWEEP_DBS: dict = {}  # path -> (file identity, connection, generation, -shm id
 _SWEEP_DB_GENERATION = 0
 _SWEEP_DB_MAX = 32
 _SWEEP_GENERATION_HOOK = False
+_SWEEP_RETIRED = False
+_SWEEP_UNREGISTER = None
 _SWEEP_FILES = ('status.json', 'meta.json', 'owner.json', 'final.lock/result.json',
                 'attachment.json', 'completion-receipt.json', 'completion-payload.json',
                 'completion-pending.json')
@@ -2062,15 +2067,35 @@ def _sweep_evict(path: str) -> None:
 
 
 def _sweep_register_hook() -> None:
-    global _SWEEP_GENERATION_HOOK
-    if _SWEEP_GENERATION_HOOK:
-        return
-    try:
-        from hermes_cli.kanban_generation import register_reader_cache
-    except ImportError:  # older core: the -shm identity check alone retires stranded observers
-        return
-    register_reader_cache(_sweep_evict)
-    _SWEEP_GENERATION_HOOK = True
+    """Serialize registration with retirement, but never hold this lock across an open."""
+    global _SWEEP_GENERATION_HOOK, _SWEEP_UNREGISTER
+    with _SWEEP_DB_LOCK:
+        if _SWEEP_RETIRED:
+            raise _SweepBoardBusy('sweep observer owner was unloaded')
+        if _SWEEP_GENERATION_HOOK:
+            return
+        try:
+            from hermes_cli import kanban_generation
+            from hermes_cli.kanban_generation import register_reader_cache
+        except ImportError:  # older core: -shm checks still retire stranded observers
+            return
+        register_reader_cache(_sweep_evict)
+        _SWEEP_UNREGISTER = getattr(kanban_generation, 'unregister_reader_cache', None)
+        _SWEEP_GENERATION_HOOK = True
+
+
+def _sweep_retire() -> None:
+    """Terminal lifecycle boundary: drain readers and fence opens already in flight."""
+    global _SWEEP_RETIRED, _SWEEP_GENERATION_HOOK, _SWEEP_UNREGISTER
+    with _SWEEP_DB_LOCK:
+        _SWEEP_RETIRED = True
+        for observer in _SWEEP_DBS.values():
+            _sweep_close(observer[1])
+        _SWEEP_DBS.clear()
+        if _SWEEP_GENERATION_HOOK and _SWEEP_UNREGISTER is not None:
+            _SWEEP_UNREGISTER(_sweep_evict)
+        _SWEEP_GENERATION_HOOK = False
+        _SWEEP_UNREGISTER = None
 
 
 def _is_board_busy(exc) -> bool:
@@ -2109,6 +2134,8 @@ def _sweep_db_stamp(path: str):
         raise FileNotFoundError(path)
     shm = _sweep_shm(path)
     with _SWEEP_DB_LOCK:
+        if _SWEEP_RETIRED:
+            raise _SweepBoardBusy('sweep observer owner was unloaded')
         observer = _SWEEP_DBS.get(path)
         if observer is not None and (observer[0] != stamp[0][:2] or observer[3] != shm):
             _sweep_close(_SWEEP_DBS.pop(path)[1])  # replaced file or a new/gone WAL generation
@@ -2130,6 +2157,9 @@ def _sweep_db_stamp(path: str):
         _sweep_close(con)
         raise
     with _SWEEP_DB_LOCK:
+        if _SWEEP_RETIRED:
+            _sweep_close(con)
+            raise _SweepBoardBusy('sweep observer owner was unloaded during open')
         old = _SWEEP_DBS.pop(path, None)
         if old is not None:
             _sweep_close(old[1])
