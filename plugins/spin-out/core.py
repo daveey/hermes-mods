@@ -385,3 +385,121 @@ def aux_llm(messages: list, max_tokens: int) -> str:
     from agent.auxiliary_client import call_llm  # type: ignore
     resp = call_llm(task="spin_out", messages=messages, max_tokens=max_tokens, temperature=0, timeout=120)
     return (getattr(resp.choices[0].message, "content", None) or "").strip()
+
+
+# ── a spun-out child takes over the parent's cards ────────────────────────────────────────────────────
+# A brief like "Drive kanban card t_… to completion" hands the parent's card to the child chat. Without a link the
+# child's task list is empty and its waits have no visible owner (kanban-abb8d6e8a7: hub chat
+# 20261113_195327_45059d). On the child's first turn the agent hook links every card the brief names that the parent
+# chat is linked to and that is still open, through core's supported path (``adopt_next_step``: a tui
+# ``notify-subscribe`` for a card on this gateway, ``hermes-hub adopt-task`` for another gateway's card).
+SPUN_MARK = re.compile(r"Spun out of parent session @session:([\w.-]+)/([\w.-]+)")
+CARD_ID = re.compile(r"\bt_[0-9a-f]{16}\b")
+CLOSED = ("done", "archived")
+MAX_LINKS = 4
+LINK_TIMEOUT = 45
+
+
+def _board_dbs(home: Path) -> list[tuple[str, Path]]:
+    out = [("default", home / "kanban.db")] if (home / "kanban.db").exists() else []
+    boards = home / "kanban" / "boards"
+    if boards.is_dir():
+        out += [(d.name, d / "kanban.db") for d in sorted(boards.iterdir()) if (d / "kanban.db").exists()]
+    return out
+
+
+def _parent_open_cards(path: Path, parent_id: str, wanted: list[str]) -> list[str]:
+    """``wanted`` cards linked to ``parent_id`` (an unreleased chat link or a tui subscription), not closed."""
+    q = ",".join("?" * len(wanted))
+    con = _ro_connect(path, timeout=5)
+    try:
+        have = {r[0] for r in con.execute("select name from sqlite_master where type='table'")}
+        linked: set[str] = set()
+        if "task_chat_links" in have:
+            linked |= {r[0] for r in con.execute(
+                f"select task_id from task_chat_links where chat_session=? and released=0 and task_id in ({q})",
+                (parent_id, *wanted))}
+        if "kanban_notify_subs" in have:
+            linked |= {r[0] for r in con.execute(
+                f"select task_id from kanban_notify_subs where platform='tui' and chat_id=? and task_id in ({q})",
+                (parent_id, *wanted))}
+        if linked and "tasks" in have:
+            status = dict(con.execute(f"select id, status from tasks where id in ({q})", wanted).fetchall())
+            linked = {t for t in linked if status.get(t) not in CLOSED}
+        return [t for t in wanted if t in linked]
+    finally:
+        con.close()
+
+
+def _core_next_step(task_id: str, board: str, env: dict) -> dict:
+    from hermes_cli.kanban_origin import adopt_next_step  # type: ignore
+    return adopt_next_step(task_id, board, env=env)
+
+
+def _run(argv: list[str]) -> tuple[int, str]:
+    import shutil
+    import subprocess
+    exe = shutil.which(argv[0])
+    if not exe:
+        return 127, f"{argv[0]}: not on PATH"
+    try:
+        p = subprocess.run([exe, *argv[1:]], capture_output=True, text=True, timeout=LINK_TIMEOUT,
+                           stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return 124, f"timed out after {LINK_TIMEOUT}s"
+    return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()[-400:]
+
+
+def link_spun_cards(session_id: str, message: str, home: Optional[Path] = None, next_step=None,
+                    runner=None) -> list[dict]:
+    """Link the parent's open cards named in a spun-out brief to the child chat ``session_id``.
+
+    Returns one ``{task_id, board, ok, step, output}`` per card tried; ``[]`` when ``message`` is no spin-out brief
+    or names none of the parent's open cards."""
+    import shlex
+    m = SPUN_MARK.search(message or "")
+    if not m or not session_id:
+        return []
+    parent_id = m.group(2)
+    named = list(dict.fromkeys(CARD_ID.findall(message[:m.start()])))
+    if not named:
+        return []
+    next_step, runner = next_step or _core_next_step, runner or _run
+    out: list[dict] = []
+    for board, path in _board_dbs(home or hermes_home()):
+        try:
+            cards = _parent_open_cards(path, parent_id, named)
+        except sqlite3.Error:
+            continue
+        for tid in cards:
+            if len(out) >= MAX_LINKS or any(r["task_id"] == tid for r in out):
+                continue
+            row = {"task_id": tid, "board": board, "ok": False, "step": "", "output": ""}
+            try:
+                hint = next_step(tid, board, {"HERMES_SESSION_ID": session_id})
+                row["step"] = str(hint.get("next_step") or "")
+                if not hint.get("complete") or not row["step"]:
+                    row["output"] = "no complete link command"
+                else:
+                    rc, row["output"] = runner(shlex.split(row["step"]))
+                    row["ok"] = rc == 0
+            except Exception as exc:  # never fail the turn over bookkeeping
+                row["output"] = f"{type(exc).__name__}: {exc}"[:300]
+            out.append(row)
+    return out
+
+
+def linked_note(rows: list[dict]) -> str:
+    ok = [r for r in rows if r["ok"]]
+    bad = [r for r in rows if not r["ok"]]
+    lines = []
+    if ok:
+        lines.append("[spin-out] This chat took over these Kanban cards from its parent session and is now linked to "
+                     "them (a card on another gateway shows up once its owner confirms): "
+                     + ", ".join(f"{r['task_id']} (board {r['board']})" for r in ok)
+                     + ". Wait on them through the card (its notices wake this chat), not a sleep timer.")
+    for r in bad:
+        lines.append(f"[spin-out] Linking card {r['task_id']} to this chat failed ({r['output'] or 'unknown'}). "
+                     f"This chat drives it, so link it first: run `{r['step'] or 'hermes-hub adopt-task ...'}` in a "
+                     "terminal here, then confirm it appears in this chat's task list.")
+    return "\n".join(lines)
