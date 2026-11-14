@@ -49,6 +49,78 @@ def test_batch_rows_without_json():
         assert len(calls) == 2
         assert calls[1] == ('SELECT ?, ?, ?', ('x', 1, 2))
 
+class TransferProbe:
+    """Count real SQLite result rows crossing into Python, not helper calls.
+
+    A fetchall call is one Python call but transfers N SQLite rows. A row factory
+    observes each of those transfers, including iteration and fetchmany, without
+    changing the SQL, result values, or the sampler's batching implementation.
+    Only token/ledger reads are measured; schema and watermark reads are separate.
+    """
+
+    def __init__(self, monkeypatch):
+        self.queries = []
+        real_connect = S.ro_connect
+        probe = self
+
+        class Connection:
+            def __init__(self, path):
+                self.connection = real_connect(path)
+
+            def execute(self, sql, parameters=()):
+                cursor = self.connection.execute(sql, parameters)
+                if S._TOKENS_SQL in sql or S._MODELS_SQL in sql:
+                    record = {'parameters': tuple(parameters), 'rows': 0}
+                    probe.queries.append(record)
+
+                    def count_row(cursor, row):
+                        record['rows'] += 1
+                        return row
+
+                    cursor.row_factory = count_row
+                return cursor
+
+            def close(self):
+                self.connection.close()
+
+        monkeypatch.setattr(S, 'ro_connect', Connection)
+
+
+def seed_transfer_db(tmp_path, count):
+    from test_incremental import DB, M
+    db = DB(tmp_path / 'state.db')
+    # Two ledger rows per session exercise real GROUP BY aggregation; quoted
+    # Unicode ids and >2**53 integer counters also check transport fidelity.
+    expected = {}
+    with db.conn() as c:
+        for i in range(count):
+            sid = f's-{i}-"雪'
+            io, cache = 2**53 + i, i + 7
+            c.execute('INSERT INTO sessions(id, started_at, input_tokens, cache_read_tokens) '
+                      'VALUES (?, ?, ?, ?)', (sid, M, io, cache))
+            c.executemany('INSERT INTO session_model_usage '
+                          '(session_id, model, task, input_tokens, cache_read_tokens) '
+                          'VALUES (?, ?, ?, ?, ?)',
+                          [(sid, ' m ', 'a', io - 1, cache - 1),
+                           (sid, 'm', 'b', 1, 1)])
+            expected[sid] = (io, cache)
+    return db, expected
+
+
+@pytest.mark.parametrize('count', [0, 1, 1103])
+@pytest.mark.parametrize('models', [False, True], ids=['sessions', 'models'])
+def test_full_snapshot_transfers_one_sqlite_row(tmp_path, monkeypatch, count, models):
+    db, expected = seed_transfer_db(tmp_path, count)
+    probe = TransferProbe(monkeypatch)
+    read = S.model_snapshot if models else S.session_snapshot
+    snapshot, readable = read([db.path])
+    assert readable == {str(db.path)}
+    assert snapshot == {(str(db.path), sid, 'm') if models else (str(db.path), sid): value
+                        for sid, value in expected.items()}
+    assert len(probe.queries) == 1
+    assert probe.queries[0]['rows'] == 1, 'full snapshot must transfer one aggregated SQLite row'
+
+
 @pytest.mark.parametrize('message', [
     'database is locked',
     'no such function: unrelated_function',
