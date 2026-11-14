@@ -789,32 +789,60 @@ def _carry_one(head, h0, blocked, repo, cwd, env):
             bases.append(str(parents[1]))
             merges.append((cur, str(parents[0]), str(parents[1])))
             cur = str(parents[0])
-        for parent in dict.fromkeys(bases):
-            on = _gh_json(f"repos/{repo}/compare/{parent}...state", cwd, env)
-            if on.get("status") not in ("ahead", "identical") or on.get("behind_by") != 0:
-                return False, (f"{lead}: merge parent {parent[:10]} is not on state (the head merged "
-                               "something other than the base)")
-        diff = "application/vnd.github.diff"
-        def patch_id(sha):
-            return _patch_id(_gh_text(f"repos/{repo}/compare/state...{sha}", cwd, env, accept=diff), cwd)
-        old, new = _parallel([("carry patch reads", patch_id, (sha,)) for sha in (h0, head)])
     except _Unreadable as e:
         return False, f"{lead}: {e}, so patch identity cannot be shown"
-    if old != new:
-        return False, f"{lead}: the PR's patch changed (patch-id {old[:12]} -> {new[:12]})"
-    cache = {}
-    try:
-        for merge, ours, theirs in reversed(merges):
-            prefilter, authoritative = _parallel([
+
+    def membership_and_patch():
+        try:
+            parents = list(dict.fromkeys(bases))
+            def patch_id(sha):
+                return _patch_id(_gh_text(f"repos/{repo}/compare/state...{sha}", cwd, env,
+                                         accept="application/vnd.github.diff"), cwd)
+            results = _parallel([
+                ("carry base membership", _gh_json, (f"repos/{repo}/compare/{parent}...state", cwd, env))
+                for parent in parents
+            ] + [("carry patch reads", patch_id, (sha,)) for sha in (h0, head)])
+            for parent, on in zip(parents, results):
+                if on.get("status") not in ("ahead", "identical") or on.get("behind_by") != 0:
+                    return (f"{lead}: merge parent {parent[:10]} is not on state (the head merged "
+                            "something other than the base)")
+            old, new = results[-2:]
+            if old != new:
+                return f"{lead}: the PR's patch changed (patch-id {old[:12]} -> {new[:12]})"
+        except _Unreadable as e:
+            return f"{lead}: {e}, so patch identity cannot be shown"
+        return ""
+
+    def merge_proofs():
+        cache = {}
+        # Immutable tree entries may be read twice on concurrent cache misses.
+        # No mutable decision or partially populated tree is cached here.
+        ordered = list(reversed(merges))
+        jobs = []
+        for merge, ours, theirs in ordered:
+            jobs.extend([
                 ("carry tree/content check", _merge_tree_refusal, (merge, ours, theirs, repo, cwd, env, cache)),
                 ("carry git fetch/merge-tree", _git_merge_tree_refusal, (merge, ours, theirs, repo, cwd, env)),
             ])
-            why = prefilter or authoritative
-            if why:
-                return False, f"{lead}: merge {merge[:10]} is not a clean, unedited merge of the base: {why}"
-    except _Unreadable as e:
-        return False, f"{lead}: {e}, so a clean merge cannot be shown"
-    return True, h0
+        try:
+            results = _parallel(jobs)
+            for (merge, _, _), prefilter, authoritative in zip(ordered, results[::2], results[1::2]):
+                why = prefilter or authoritative
+                if why:
+                    return f"{lead}: merge {merge[:10]} is not a clean, unedited merge of the base: {why}"
+        except _Unreadable as e:
+            return f"{lead}: {e}, so a clean merge cannot be shown"
+        return ""
+
+    # Once the bounded ancestry chain is known, these read-only proofs have no
+    # dependencies on one another. Keep every predicate and its refusal priority,
+    # join every worker, and inherit the same deadline; mutable drift stays last.
+    identity, clean = _parallel([
+        ("carry identity", membership_and_patch, ()),
+        ("carry clean merges", merge_proofs, ()),
+    ])
+    why = identity or clean
+    return (False, why) if why else (True, h0)
 
 
 # Base drift under the PR's CI (t_01a1d6201140c966). The PR's recorded baseRefOid is at or before the base its
@@ -1023,22 +1051,20 @@ def _attribute_hits(repo, names, window, subject, cwd, env):
     from urllib.parse import quote
     probe_env = dict(env)
     probe_env["GH_PROMPT_DISABLED"] = "1"
-    out = []
-    for name in names:
+    def attribute(name):
         try:
             p = _run_probe(["gh", "api", f"repos/{repo}/commits?sha=state&path={quote(name, safe='/')}&per_page=5"],
                                cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True, timeout=8)
             listed = json.loads(p.stdout) if p.returncode == 0 else None
-        except (OSError, ValueError, subprocess.SubprocessError):
-            continue
-        except _Unreadable:
-            break               # attribution is garnish; the refusal itself stands
+        except (OSError, ValueError, subprocess.SubprocessError, _Unreadable):
+            return ""           # attribution is garnish; the refusal itself stands
         if not isinstance(listed, list):
-            continue
+            return ""
         hit = next((window[c["sha"]] for c in listed if isinstance(c, dict) and c.get("sha") in window), None)
-        if hit:
-            out.append(f"{name}: {hit['sha'][:10]} {subject(hit)[:60]}")
-    return "; ".join(out)
+        return f"{name}: {hit['sha'][:10]} {subject(hit)[:60]}" if hit else ""
+    return "; ".join(filter(None, _parallel([
+        ("drift attribution", attribute, (name,)) for name in names
+    ])))
 
 
 # Land turn (t_01a1d6b3538e8e43). The drift rule above holds a PR until CI ran on a base with every later
@@ -1705,8 +1731,16 @@ def _turn_hold_read_only(*args):
 def _state_merge(words, repo, cwd, env):
     """One shared monotonic budget (`PREFLIGHT_TIMEOUT`, set by `bounded_preflight`) covers every
     read and write of the preflight; see `_state_merge_scoped` for the rules."""
-    with _scope():
-        return _state_merge_scoped(words, repo, cwd, env)
+    outer_deadline = _PREFLIGHT_DEADLINE.get()
+    try:
+        with _scope():
+            return _state_merge_scoped(words, repo, cwd, env)
+    except _PreflightExpired as exc:
+        # A nested owner must see the original stage, not a late-result check
+        # after _stage reset its context. Standalone public callers get a refusal.
+        if outer_deadline is not None:
+            raise
+        return str(exc)
 
 
 def _state_merge_scoped(words, repo, cwd, env):
@@ -1842,7 +1876,9 @@ def _state_merge_scoped(words, repo, cwd, env):
                           f"{number}): overlapping state PR merges and direct state pushes wait for it, so "
                           "update-branch now and merge as soon as the new head's CI is green.")
         return drift or True
-    except (_Unreadable, _PreflightExpired) as e:
+    except _PreflightExpired:
+        raise  # preserve the exhausted stage for the outer bounded preflight
+    except _Unreadable as e:
         return failed(f"{e}; nothing was approved or written late")
     except (ValueError, TypeError) as e:
         return failed(f"`gh pr view {number}` returned an unexpected shape ({type(e).__name__})")

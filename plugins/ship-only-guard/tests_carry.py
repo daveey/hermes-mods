@@ -173,11 +173,13 @@ def test_patch_identical_update_branch_head_admitted(monkeypatch):
     calls = fake(monkeypatch)
     assert check() is None
     paths = [c[-1] for c in calls[1:]]
-    assert paths[:2] == [f"repos/{R}/compare/{H0}...{H}", f"repos/{R}/compare/{BASE_TIP}...state"]
-    assert sorted(paths[2:4]) == sorted([f"repos/{R}/compare/state...{H0}", f"repos/{R}/compare/state...{H}"])
-    # then the merge's tree against the clean merge of its parents (trees read in parallel)
-    assert paths[4] == f"repos/{R}/compare/{H0}...{BASE_TIP}"
-    assert sorted(paths[5:9]) == sorted(tree_path(s) for s in (STATE_OLD, H0, BASE_TIP, H))
+    assert paths[0] == f"repos/{R}/compare/{H0}...{H}"
+    # Independent identity and immutable merge proofs overlap, but none is omitted.
+    assert sorted(paths[1:9]) == sorted([
+        f"repos/{R}/compare/{BASE_TIP}...state", f"repos/{R}/compare/state...{H0}",
+        f"repos/{R}/compare/state...{H}", f"repos/{R}/compare/{H0}...{BASE_TIP}",
+        *(tree_path(s) for s in (STATE_OLD, H0, BASE_TIP, H)),
+    ])
     assert paths[9:] == [f"repos/{R}/compare/{STATE_OLD}...state"]   # then the base-drift gate still runs
 
 
@@ -262,6 +264,42 @@ def test_more_merges_than_the_cap_refused(monkeypatch):
     fake(monkeypatch, answers={f"repos/{R}/compare/{H0}...{H}": {"status": "ahead", "behind_by": 0,
                                                                   "commits": commits}})
     assert f"more than {g._CARRY_MERGES} commits" in check()
+
+
+def test_two_base_merges_with_forty_newer_commits_fit_full_budget(monkeypatch):
+    import time
+    mid, tip2 = "c" * 40, "d" * 40
+    cmp = {"status": "ahead", "behind_by": 0, "commits": [node(mid, H0, BASE_TIP), node(H, mid, tip2)]}
+    notes3 = "b3" * 20
+    drift = {"status": "ahead", "behind_by": 0, "total_commits": 40,
+             "commits": [{"sha": f"{i:040x}", "commit": {"message": "sync: fixture"}} for i in range(40)],
+             "files": [{"filename": "docs/unrelated.md"}]}
+    calls = fake(monkeypatch, answers={
+        f"repos/{R}/compare/{H0}...{H}": cmp, f"repos/{R}/compare/{tip2}...state": ON_STATE,
+        f"repos/{R}/compare/{STATE_OLD}...state": drift,
+        f"repos/{R}/compare/{mid}...{tip2}": merge_base(BASE_TIP),
+        tree_path(mid): tree(FILES[H]), tree_path(tip2): tree({**FILES[BASE_TIP], "docs/notes.md": notes3}),
+        tree_path(H): tree({**FILES[H], "docs/notes.md": notes3})})
+    run = g.subprocess.run
+    def latent(argv, **kwargs):
+        if argv[0] == 'gh':
+            time.sleep(1.8)  # measured per-call transport latency, not a zero-cost API fake
+        return run(argv, **kwargs)
+    verified = []
+    def authoritative(merge, *args):
+        time.sleep(3)
+        verified.append(merge)
+        return ''
+    monkeypatch.setattr(g.subprocess, 'run', latent)
+    monkeypatch.setattr(g, '_git_merge_tree_refusal', authoritative)
+    start = time.monotonic()
+    result = g.bounded_preflight(g.check_tool, 'terminal', {'command': ' '.join(CMD)},
+                                 repos={R}, env={'GH_REPO': R})
+    elapsed = time.monotonic() - start
+    assert result is None, result
+    assert elapsed < 12, elapsed
+    assert sorted(verified) == sorted([mid, H])
+    assert calls[-1][-1] == f"repos/{R}/compare/{STATE_OLD}...state"
 
 
 def test_two_base_merges_admitted(monkeypatch):
