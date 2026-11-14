@@ -225,12 +225,16 @@ def _carry_sources(snap, carry, built, host_results, maintenance, now, rows, pro
                 and old[0] == chunk and old[1] == states):
             built.rows.update(old[2])
             rows.extend(old[3]); projections.extend(old[4])
-            for rid, entry in old[2].items():
-                if entry[4] is not None:
-                    provenance.append(dict(entry[4], collection_id=snap['states'][rid]['cycle']))
+            cycles = [snap['states'][src['id']]['cycle'] for src in chunk]
+            if cycles != old[8]:
+                patched = [dict(p, collection_id=snap['states'][p['source_id']]['cycle'])
+                           for p in old[9]]
+                old = (*old[:8], cycles, patched, old[10])
+            provenance.extend(old[9])
             built.blocks.append(old)
             continue
         offset = len(rows)
+        provenance_offset = len(provenance)
         for src, signature in zip(chunk, states):
             rid, hid = src['id'], src.get('host_id')
             entry = carry.rows.get(rid) if carry is not None else None
@@ -240,14 +244,34 @@ def _carry_sources(snap, carry, built, host_results, maintenance, now, rows, pro
                 built.rows[rid] = entry
                 rows.append(entry[2]); projections.append(entry[3])
                 if entry[4] is not None:
-                    provenance.append(dict(entry[4], collection_id=snap['states'][rid]['cycle']))
+                    previous = entry[4]
+                    cycle = snap['states'][rid]['cycle']
+                    provenance.append(previous if previous['collection_id'] == cycle
+                                      else dict(previous, collection_id=cycle))
             else:
                 yield src
         entries = {src['id']: built.rows[src['id']] for src in chunk}
         floor = max(entry[5] for entry in entries.values())
         deadline = min(min(entry[6], entry[5] + ROWS_MAX_S) for entry in entries.values())
         built.blocks.append((chunk, states, entries, rows[offset:], projections[offset:],
-                             floor, deadline, {src.get('host_id') for src in chunk}))
+                             floor, deadline, {src.get('host_id') for src in chunk},
+                             [snap['states'][src['id']]['cycle'] for src in chunk],
+                             provenance[provenance_offset:],
+                             _row_counts(rows[offset:], projections[offset:], snap['states'])))
+
+
+def _row_counts(rows, projections, states):
+    current = [p for p, row in zip(projections, rows)
+               if p.freshness == 'fresh' and not states[row['id']].get('source_error')
+               and p.registration == 'online']
+    counts = dict(registrations=len(rows), online=len(current),
+                  busy=sum(p.activity == 'busy' for p in current),
+                  verified_ready=sum(p.ready for p in projections),
+                  readiness_unverified=sum(not p.ready for p in current),
+                  issues=sum('source_unavailable' in p.reasons or p.health in
+                             ('missing', 'offline', 'unavailable', 'degraded', 'stale', 'unknown', 'suspected_offline')
+                             for p in projections))
+    return counts, {row['host_id'] for row in rows if row['host_id']}
 
 
 def _file_key(path):
@@ -521,7 +545,7 @@ class Service:
                     observed_at=stamp(at), expires_at=stamp(at+policy.inventory_ttl),
                     state='fresh' if p.freshness == 'fresh' and not observed.get('source_error') else 'stale',
                     observation_ids=row['observation_ids'])
-                meta['provenance'].append(dict(provenance) if tracked else provenance)
+                meta['provenance'].append(provenance)
             if tracked:
                 if hid not in host_flip:
                     host_flip[hid] = self._host_flip(host_results.get(hid), maintenance, now)
@@ -530,22 +554,32 @@ class Service:
         # Many rows share an expiry. Cache parsing within this build only; the
         # clock is still checked for every row and no threshold is rounded.
         expiry_times = {}
-        for provenance in meta['provenance']:
+        # Retained row provenance is immutable; freshness overlays copy on write.
+        for provenance_index, provenance in enumerate(meta['provenance']):
             if provenance['state'] != 'fresh':
                 continue
             if meta['freshness'] != 'fresh':
-                provenance['state'] = 'stale'
+                meta['provenance'][provenance_index] = dict(provenance, state='stale')
                 continue
             clock = self.clock()
             expires = provenance['expires_at']
             if expires not in expiry_times:
                 expiry_times[expires] = datetime.fromisoformat(expires.replace('Z', '+00:00')).timestamp()
             if clock > expiry_times[expires]:
-                provenance['state'] = 'stale'
+                meta['provenance'][provenance_index] = dict(provenance, state='stale')
         # online/busy/unverified describe CURRENT evidence (plan §3/§5: stale inventory keeps
         # last-known values per row but never counts as live); same rule as the Desktop chip.
-        current=[p for p,row in zip(projections,rows) if p.freshness=='fresh' and not snap['states'][row['id']].get('source_error') and p.registration=='online']
-        count=dict(registrations=len(rows),online=len(current),busy=sum(p.activity=='busy' for p in current),verified_ready=sum(r.ready for r in projections),readiness_unverified=sum(not p.ready for p in current),issues=sum('source_unavailable' in r.reasons or r.health in ('missing','offline','unavailable','degraded','stale','unknown','suspected_offline') for r in projections),mapped_hosts=len({r['host_id'] for r in rows if r['host_id']}),host_capacity=None)
+        if built is not None and built.blocks:
+            count = dict.fromkeys(built.blocks[0][10][0], 0)
+            mapped_hosts = set()
+            for block in built.blocks:
+                contribution, host_ids = block[10]
+                for name, value in contribution.items():
+                    count[name] += value
+                mapped_hosts.update(host_ids)
+        else:
+            count, mapped_hosts = _row_counts(rows, projections, snap['states'] if snap else {})
+        count = dict(count, mapped_hosts=len(mapped_hosts), host_capacity=None)
         state='loading' if not snap else ('ready' if snap['collection']['state']=='complete' else 'partial')
         if snap and any(p['state']!='fresh' for p in meta['provenance']): state='partial'
         if not c['scopes']: state='not_configured'
@@ -563,7 +597,6 @@ class Service:
                 expires_at=iso(at+policy.host_ttl) if at is not None else None,
                 state=('fresh' if evidence['management']=='reachable' else 'unavailable') if fresh else ('stale' if evidence else 'unknown'),
                 observation_ids=host['observation_ids']))
-        mapped_hosts={row['host_id'] for row in rows if row['host_id']}
         count['issues'] += sum(host['id'] in mapped_hosts and host['management']=='unreachable' for host in hosts)
         data=dict(state=state,collection=snap['collection'] if snap else None,counts=count,hosts=hosts,runners=rows,scopes=c['scopes'],providers=c['providers'],targets=c['execution_targets'])
         if tracked:

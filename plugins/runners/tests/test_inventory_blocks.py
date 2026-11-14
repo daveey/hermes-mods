@@ -32,6 +32,62 @@ def test_unchanged_blocks_avoid_per_row_carry_checks(env, monkeypatch):
     assert calls == [], 'unchanged blocks must avoid Python per-row carry checks'
 
 
+def test_unchanged_blocks_reuse_materialized_provenance(env):
+    cfg, path, *_ = env
+    snap = fleet(cfg, path)
+    service = svc(cfg, path, 1001)
+    first, carry = service._inventory(snap, None, copy_rows=False, carry=None, now=1001)
+    newer = deepcopy(snap)
+    actual, built = service._inventory(newer, None, copy_rows=False, carry=carry, now=1001)
+    assert comparable(actual) == comparable(service._inventory(newer, None))
+    ids = {row['id'] for row in snap['runners']}
+    old = {p['source_id']: p for p in first['meta']['provenance'] if p['source_id'] in ids}
+    carried = [p for p in actual['meta']['provenance'] if p['source_id'] in ids]
+    assert len(carried) == len(ids)
+    assert all(p is old[p['source_id']] for p in carried), 'unchanged blocks must not materialize provenance again'
+
+
+def test_fragment_dirty_cycle_mix_matches_cold_and_preserves_previous(env):
+    cfg, path, *_ = env
+    snap = fleet(cfg, path)
+    service = svc(cfg, path, 1001)
+    first, carry = service._inventory(snap, None, copy_rows=False, carry=None, now=1001)
+    preserved = deepcopy(first)
+    newer = deepcopy(snap)
+    for state in newer['states'].values():
+        state['cycle'] = 'collection_new'
+    for row in newer['runners'][::17]:
+        newer['states'][row['id']]['source_error'] = 'temporary failure'
+    actual, built = service._inventory(newer, None, copy_rows=False, carry=carry, now=1001)
+    assert 0 < built.computed < len(newer['runners'])
+    assert comparable(actual) == comparable(service._inventory(newer, None))
+    assert first == preserved
+    # A stale metadata overlay must not mutate the retained fragment's provenance.
+    service.clock = lambda: 100000
+    service._inventory(newer, None, copy_rows=False, carry=built, now=1001)
+    assert first == preserved
+    service.clock = lambda: 1001
+    again, _ = service._inventory(newer, None, copy_rows=False, carry=built, now=1001)
+    assert comparable(again) == comparable(actual)
+
+
+def test_cycle_only_blocks_skip_row_reductions(env, monkeypatch):
+    cfg, path, *_ = env
+    snap = fleet(cfg, path)
+    service = svc(cfg, path, 1001)
+    _, carry = service._inventory(snap, None, copy_rows=False, carry=None, now=1001)
+    newer = deepcopy(snap)
+    for state in newer['states'].values():
+        state['cycle'] = 'collection_new'
+    calls = []
+    original = S._row_counts
+    monkeypatch.setattr(S, '_row_counts', lambda rows, *args: calls.append(len(rows)) or original(rows, *args))
+    actual, built = service._inventory(newer, None, copy_rows=False, carry=carry, now=1001)
+    assert calls == [], 'clean blocks must reuse count reductions even when cycles change'
+    assert built.computed == 0
+    assert comparable(actual) == comparable(service._inventory(newer, None))
+
+
 def test_scattered_changes_compare_each_state_only_once(env, monkeypatch):
     cfg, path, *_ = env
     snap = fleet(cfg, path)
