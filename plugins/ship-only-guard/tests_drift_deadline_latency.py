@@ -13,6 +13,11 @@ The fake gh below reproduces the worker shim's measured latency (a per-layer pro
 alone stays 0.3-0.6 s). A recursive tree read adds ~0.15 s of transfer, an authoritative carry fetch holds a share
 for ~6.5 s. Time is scaled by SCALE so the test runs in about two seconds. On origin/main before this fix the
 overlap case expired `during drift attribution` and the clean case read 8 trees (2 duplicates).
+
+t_01a1da82db1127a5: after that fix the carry wave still held ~13 concurrent gh calls (6 of them tree reads),
+then a serial merge-base tree read and a serial blob wave; the drift compare started at 14.3 s of 18. The
+prefilter now reads trees and blobs from the chain's one authoritative fetch (faked below as a store that
+answers what GitHub's trees/blobs API does), so the drift check must start with at least 6 s left.
 """
 import base64
 import hashlib
@@ -178,12 +183,25 @@ def load(monkeypatch, overlap):
     shim = FakeShim(g, overlap)
     monkeypatch.setattr(g, "subprocess", SimpleNamespace(**{**vars(subprocess), "run": shim.run}))
 
-    def fetch_and_merge_tree(*args):
+    def fetch(objects):
         g._remaining()
         shim.busy(seconds=FETCH)                             # the authoritative fetch: index-pack shares the host
         g._remaining()
+        objects.path = "fetched"
         return ""
-    monkeypatch.setattr(g, "_git_merge_tree_refusal", fetch_and_merge_tree)
+
+    def local_git(objects, *args, binary=False):
+        # The fetched object store answers what GitHub's trees/blobs API does (content addressing).
+        if args[:4] == ("ls-tree", "-r", "-l", "-z"):
+            sizes = {blob_id(b): len(b) for b in BLOBS.values()}
+            return b"".join(f"{m} blob {s} {sizes.get(s, 10):>7}\t{p}\0".encode()
+                            for p, (m, s) in TREES[args[4]].items())
+        if args[:2] == ("cat-file", "blob"):
+            return BLOBS[args[2]]
+        raise AssertionError(args)
+    monkeypatch.setattr(g._CarryObjects, "_fetch", fetch)
+    monkeypatch.setattr(g._CarryObjects, "git", local_git)
+    monkeypatch.setattr(g._CarryObjects, "verify", lambda *a: "")
     monkeypatch.setattr(g, "PREFLIGHT_TIMEOUT", 18 * SCALE)
     return g, shim
 
@@ -209,3 +227,8 @@ def test_two_merge_carry_leaves_the_drift_check_its_time(monkeypatch, overlap):
     drift_reads = [c for c in shim.calls if c[2] == "drift check"]
     assert drift_reads and min(c[0] for c in drift_reads) >= max(
         c[1] for c in shim.calls if c[2].startswith("carry")), timeline
+    # t_01a1da82db1127a5: the prefilter reads trees and blobs from the authoritative fetch, so no gh tree or
+    # blob read joins the carry wave and the drift check starts with at least 6 of the 18 s left (it had ~2).
+    assert not [w for _, _, _, w in shim.calls if "/git/trees/" in w or "/git/blobs/" in w], timeline
+    drift_start = min(c[0] for c in drift_reads) / SCALE
+    assert drift_start <= 12, f"drift check started at {drift_start:.1f} shim-seconds of 18\n{timeline}"

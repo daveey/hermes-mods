@@ -274,24 +274,36 @@ def test_two_base_merges_with_forty_newer_commits_fit_full_budget(monkeypatch):
     drift = {"status": "ahead", "behind_by": 0, "total_commits": 40,
              "commits": [{"sha": f"{i:040x}", "commit": {"message": "sync: fixture"}} for i in range(40)],
              "files": [{"filename": "docs/unrelated.md"}]}
+    trees = {mid: tree(FILES[H]), tip2: tree({**FILES[BASE_TIP], "docs/notes.md": notes3}),
+             H: tree({**FILES[H], "docs/notes.md": notes3})}
     calls = fake(monkeypatch, answers={
         f"repos/{R}/compare/{H0}...{H}": cmp, f"repos/{R}/compare/{tip2}...state": ON_STATE,
         f"repos/{R}/compare/{STATE_OLD}...state": drift,
         f"repos/{R}/compare/{mid}...{tip2}": merge_base(BASE_TIP),
-        tree_path(mid): tree(FILES[H]), tree_path(tip2): tree({**FILES[BASE_TIP], "docs/notes.md": notes3}),
-        tree_path(H): tree({**FILES[H], "docs/notes.md": notes3})})
+        **{tree_path(sha): t for sha, t in trees.items()}})
+    trees.update({sha: tree(files) for sha, files in FILES.items() if sha not in trees})
     run = g.subprocess.run
     def latent(argv, **kwargs):
         if argv[0] == 'gh':
             time.sleep(1.8)  # measured per-call transport latency, not a zero-cost API fake
         return run(argv, **kwargs)
-    verified = []
-    def authoritative(merge, *args):
+    verified, fetched = [], []
+    # The authoritative check's one fetch of the chain (t_01a1da82db1127a5) takes 3 s; the prefilter reads
+    # its trees from that fetch, as `git ls-tree -r -l -z` answers them, instead of through gh.
+    def fetch(objects):
         time.sleep(3)
-        verified.append(merge)
+        fetched.append(list(objects.shas))
+        objects.path = "fetched"
         return ''
+    def local_git(objects, *args, binary=False):
+        assert args[:4] == ("ls-tree", "-r", "-l", "-z"), args
+        return b"".join(f"{e['mode']} {e['type']} {e['sha']} {e.get('size', '-'):>7}\t{e['path']}\0".encode()
+                        for e in trees[args[4]]["tree"] if e["type"] != "tree")
     monkeypatch.setattr(g.subprocess, 'run', latent)
-    monkeypatch.setattr(g, '_git_merge_tree_refusal', authoritative)
+    monkeypatch.setattr(g, '_git_merge_tree_refusal', GIT_VERIFY)
+    monkeypatch.setattr(g._CarryObjects, '_fetch', fetch)
+    monkeypatch.setattr(g._CarryObjects, 'git', local_git)
+    monkeypatch.setattr(g._CarryObjects, 'verify', lambda objects, merge, *a: verified.append(merge) or '')
     start = time.monotonic()
     result = g.bounded_preflight(g.check_tool, 'terminal', {'command': ' '.join(CMD)},
                                  repos={R}, env={'GH_REPO': R})
@@ -299,6 +311,8 @@ def test_two_base_merges_with_forty_newer_commits_fit_full_budget(monkeypatch):
     assert result is None, result
     assert elapsed < 12, elapsed
     assert sorted(verified) == sorted([mid, H])
+    assert fetched == [[mid, H0, BASE_TIP, H, tip2]]          # one fetch for the whole chain
+    assert not [c for c in calls if "/git/trees/" in c[-1] or "/git/blobs/" in c[-1]]
     assert calls[-1][-1] == f"repos/{R}/compare/{STATE_OLD}...state"
 
 
@@ -722,6 +736,9 @@ RELOC_MOVED = RELOC_STATE[:RELOC_STATE.rindex("    c = 3\n")] + "    c = 3\n" + 
     RELOC_STATE.rindex("    c = 3\n") + len("    c = 3\n"):]
 
 
+REAL_REPO = {}
+
+
 @pytest.fixture(scope="module")
 def real_merges(tmp_path_factory):
     """(h0, {name: merge head}, answers) from a real repository: the PR adds `log(a)` to first() and changes line 1
@@ -743,6 +760,7 @@ def real_merges(tmp_path_factory):
         git("add", "-A")
 
     git("init", "-q", "-b", "state")
+    REAL_REPO["path"] = repo
     write(build_py=RELOC_STATE, notes_txt="one\n", shared_txt=SHARED["base"])
     git("commit", "-q", "-m", "base")
     git("checkout", "-q", "-b", "pr")
@@ -814,6 +832,60 @@ def test_real_hunk_relocated_inside_a_merge_refused(monkeypatch, real_merges):
 def test_real_edited_merge_refused(monkeypatch, real_merges):
     (ok, why), _ = carry_real(monkeypatch, real_merges, "edited")
     assert not ok and ("patch changed" in why or "at build.py" in why)
+
+
+def carry_local(monkeypatch, tmp_path, real_merges, name, fetch_failure=False):
+    """The carry with the real authoritative check fetching from the fixture repository (t_01a1da82db1127a5):
+    gh answers compares and diffs; trees and blobs are answered by gh only when `fetch_failure`."""
+    h0, heads, answers = real_merges
+    if not fetch_failure:
+        answers = {k: v for k, v in answers.items() if "/git/trees/" not in k and "/git/blobs/" not in k}
+    calls = fake(monkeypatch, answers=answers)
+    gh, fetches, url = g.subprocess.run, [], f"https://github.com/{R}.git"
+
+    def run(argv, **kwargs):
+        if argv[0] != "git" or argv[:2] in (["git", "patch-id"], ["git", "merge-file"]):
+            return gh(argv, **kwargs)
+        if "fetch" in argv:
+            fetches.append(argv[argv.index(url) + 1:])
+            if fetch_failure:
+                return SimpleNamespace(returncode=128, stdout="", stderr="unreadable remote")
+            argv = [str(REAL_REPO["path"]) if a == url else a for a in argv]
+        return REAL_RUN(argv, **kwargs)
+    monkeypatch.setattr(g.subprocess, "run", run)
+    monkeypatch.setattr(g, "_git_merge_tree_refusal", GIT_VERIFY)
+    data = payload([review(f"Independent exact-head review at {h0}. **Verdict: approve**", commit=h0)])
+    env = {"HERMES_HOME": str(tmp_path / "home")}
+    result = g._carried_approval(heads[name], data, R, None, env)
+    assert not list((tmp_path / "home" / "cache").iterdir())       # the shared fetch is removed
+    return result, calls, fetches
+
+
+def test_prefilter_reads_trees_and_blobs_from_the_authoritative_fetch(monkeypatch, tmp_path, real_merges):
+    (ok, h0), calls, fetches = carry_local(monkeypatch, tmp_path, real_merges, "clean")
+    assert ok and h0 == real_merges[0]
+    assert len(fetches) == 1                       # one fetch serves both checks
+    # The content merge of shared.txt ran on blobs from the fetch: no gh tree or blob read at all.
+    assert not [c for c in calls if "/git/trees/" in c[-1] or "/git/blobs/" in c[-1]]
+
+
+def test_local_prefilter_keeps_its_refusal_and_priority(monkeypatch, tmp_path, real_merges):
+    (ok, why), calls, _ = carry_local(monkeypatch, tmp_path, real_merges, "relocated")
+    # Both checks refuse; the prefilter's reason (the path) still wins over git merge-tree's.
+    assert not ok and "its tree differs from the clean merge" in why and "at build.py" in why
+    assert "computed by git merge-tree" not in why
+    assert not [c for c in calls if "/git/trees/" in c[-1] or "/git/blobs/" in c[-1]]
+
+
+@pytest.mark.parametrize("name", ["clean", "relocated"])
+def test_refused_fetch_falls_back_to_gh_reads(monkeypatch, tmp_path, real_merges, name):
+    (ok, why), calls, fetches = carry_local(monkeypatch, tmp_path, real_merges, name, fetch_failure=True)
+    assert not ok and len(fetches) == 1
+    assert [c for c in calls if "/git/trees/" in c[-1]]       # the prefilter read through gh as before
+    if name == "clean":
+        assert "git fetch exited 128" in why
+    else:
+        assert "at build.py" in why and "git fetch" not in why
 
 
 # Authoritative Git verifier: real fetch/merge-tree, only the remote URL is local.

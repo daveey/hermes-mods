@@ -147,10 +147,17 @@ other odd read refuses. This path-wise check is only a rejection prefilter:
 rename/delete conflicts can look clean path by path. Every survivor must also
 pass real `git merge-tree --write-tree <first> <second>` with exit 0 and a
 single tree id equal to the fetched merge's tree. A scratch bare repository
-under `$HERMES_HOME/cache` fetches those three SHAs with `--depth=128`, no tags
+under `$HERMES_HOME/cache` fetches every merge, first and second parent of the
+carry chain once, with `--depth=128` from each tip, no tags
 or submodules, and 30-second command timeouts. Full blobs avoid lazy fetches
 inside merge-tree; authentication uses `gh auth git-credential` and inherited
-Git configuration is disabled. Multiple merge bases, shallow cuts before the
+Git configuration is disabled. The prefilter reads its trees (`git ls-tree -r
+-l`) and blobs (`git cat-file`) from that fetch instead of `git/trees` and
+`git/blobs` gh calls: objects are content-addressed, so the entries are the
+same, and a tree or blob the fetch lacks (or a refused fetch) is read through
+gh as before, so every refusal and its priority is unchanged
+(t_01a1da82db1127a5: the gh reads left the drift check ~2 s of the 18 s budget on a
+twice-updated state PR under the worker gh shim). Multiple merge bases, shallow cuts before the
 base, failed fetches, unsupported Git versions and odd output all refuse;
 the scratch repository is removed on exit. No carry is inferred from the
 path-wise approximation alone.

@@ -630,13 +630,14 @@ class _Once:
                 return slot[1]
 
 
-def _flat_trees(shas, repo, cwd, env, cache):
+def _flat_trees(shas, repo, cwd, env, cache, objects=None):
     """_flat_tree of each sha; the uncached ones read in parallel (each read takes ~3 s on a 5k-path tree).
-    `cache` is a shared `_Once` (concurrent proofs never read one tree twice) or a plain dict of done trees."""
+    `cache` is a shared `_Once` (concurrent proofs never read one tree twice) or a plain dict of done trees.
+    With `objects` (the chain's authoritative fetch) a tree it holds is read locally (`_carry_tree`)."""
     once = cache if isinstance(cache, _Once) else _Once(cache)
     unique = list(dict.fromkeys(shas))
-    values = dict(zip(unique, _parallel([("carry tree reads", once.get, (s, _flat_tree, s, repo, cwd, env))
-                                         for s in unique])))
+    values = dict(zip(unique, _parallel([("carry tree reads", once.get,
+                                          (s, _carry_tree, s, repo, cwd, env, objects)) for s in unique])))
     if isinstance(cache, dict):
         cache.update(values)
     return [values[s] for s in shas]
@@ -654,6 +655,27 @@ def _blob(sha, size, repo, cwd, env):
         data = base64.b64decode(str(got.get("content")))
     except (ValueError, TypeError):
         raise _Unreadable(f"blob {sha[:10]} is unreadable")
+    if hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest() != sha:
+        raise _Unreadable(f"blob {sha[:10]} does not hash to its id")
+    return data
+
+
+def _carry_tree(sha, repo, cwd, env, objects):
+    """`_flat_tree(sha)`, served from the chain's fetched objects when they hold it (t_01a1da82db1127a5).
+    Objects are content-addressed, so the entries are the ones `git/trees/<sha>` answers; a tree the fetch
+    lacks or cannot list (fetch refused, merge base past the depth) is read through gh exactly as before."""
+    got = objects.tree(sha) if objects is not None else None
+    return got if got is not None else _flat_tree(sha, repo, cwd, env)
+
+
+def _carry_blob(sha, size, repo, cwd, env, objects):
+    """`_blob`, served from the chain's fetched objects when they hold it; the same size bound and hash check."""
+    import hashlib
+    if not isinstance(size, int) or not 0 <= size <= _MERGE_BLOB_BYTES:
+        raise _Unreadable(f"blob {sha[:10]} is over {_MERGE_BLOB_BYTES} bytes or has no size")
+    data = objects.blob(sha) if objects is not None else None
+    if data is None:
+        return _blob(sha, size, repo, cwd, env)
     if hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest() != sha:
         raise _Unreadable(f"blob {sha[:10]} does not hash to its id")
     return data
@@ -679,8 +701,10 @@ def _merge_file(ours, base, theirs, cwd):
     return hashlib.sha1(b"blob %d\0" % len(p.stdout) + p.stdout).hexdigest()
 
 
-def _merge_tree_refusal(merge, ours, theirs, repo, cwd, env, cache):
-    """Why `merge` is not the clean auto-merge of `ours` and `theirs` (its first and second parent), else ''."""
+def _merge_tree_refusal(merge, ours, theirs, repo, cwd, env, cache, objects=None):
+    """Why `merge` is not the clean auto-merge of `ours` and `theirs` (its first and second parent), else ''.
+    `objects` (`_CarryObjects`) serves trees and blobs from the authoritative check's fetch; the predicate and
+    every refusal are the same whichever source answers."""
     cache = cache if isinstance(cache, _Once) else _Once(cache)
 
     def held(fn, *args):
@@ -693,7 +717,7 @@ def _merge_tree_refusal(merge, ours, theirs, repo, cwd, env, cache):
     # failure keeps its priority; the memo (`_Once`) hands each tree to the check below unread twice.
     got = _parallel([("carry tree/content check", held, (_gh_json, f"repos/{repo}/compare/{ours}...{theirs}",
                                                          cwd, env))]
-                    + [("carry tree reads", held, (cache.get, s, _flat_tree, s, repo, cwd, env))
+                    + [("carry tree reads", held, (cache.get, s, _carry_tree, s, repo, cwd, env, objects))
                        for s in dict.fromkeys((ours, theirs, merge))])
     cmp = got[0]
     if isinstance(cmp, _Unreadable):
@@ -702,7 +726,7 @@ def _merge_tree_refusal(merge, ours, theirs, repo, cwd, env, cache):
     mb = mb.get("sha") if isinstance(mb, dict) else None
     if not isinstance(mb, str) or not _SHA.fullmatch(mb):
         raise _Unreadable(f"the merge base of {ours[:10]} and {theirs[:10]} is unreadable")
-    base, o, t, got = _flat_trees((mb, ours, theirs, merge), repo, cwd, env, cache)
+    base, o, t, got = _flat_trees((mb, ours, theirs, merge), repo, cwd, env, cache, objects)
     want, both = {}, []
     for path in sorted(set(base) | set(o) | set(t)):
         b, x, y = (tree[path][:2] if path in tree else None for tree in (base, o, t))
@@ -725,7 +749,7 @@ def _merge_tree_refusal(merge, ours, theirs, repo, cwd, env, cache):
         # Two file modes only, so at most one side changed the mode: that side's mode wins, as in git.
         mode = t[path][0] if o[path][0] == base[path][0] else o[path][0]
         ours_b, base_b, theirs_b = _parallel([
-            ("carry blob reads", _blob, (tree[path][1], tree[path][2], repo, cwd, env))
+            ("carry blob reads", _carry_blob, (tree[path][1], tree[path][2], repo, cwd, env, objects))
             for tree in (o, base, t)])
         blob = _merge_file(ours_b, base_b, theirs_b, cwd)
         if blob is None:
@@ -739,60 +763,166 @@ def _merge_tree_refusal(merge, ours, theirs, repo, cwd, env, cache):
     return ""
 
 
-def _git_merge_tree_refusal(merge, ours, theirs, repo, cwd, env):
-    """Authoritative merge-tree check; a bounded shallow fetch may refuse, never guess."""
-    import tempfile
+class _CarryObjects:
+    """One bounded shallow fetch of a carry chain's commits, shared by its merge proofs (t_01a1da82db1127a5).
+
+    The authoritative check fetched merge/ours/theirs with full blobs for every merge while the API prefilter
+    read the same immutable trees and blobs through `gh api git/trees|git/blobs`. Under the worker gh shim
+    every concurrent call slows the others, and the prefilter's merge-base tree and blob reads ran as two
+    more serial waves, so a twice-updated state PR left the drift check ~2 s. Now the first authoritative
+    proof fetches every commit of the chain once (`--depth=128` from each tip, so at least the history each
+    per-merge fetch had), and the prefilter reads trees (`ls-tree -r -l`) and blobs (`cat-file`) from it.
+    Content addressing makes those the same entries; whatever the fetch lacks, or a refused fetch, falls back
+    to the gh reads, so every predicate and refusal (and its priority) is unchanged."""
+
+    def __init__(self, repo, env, shas):
+        self.repo, self.shas = repo, list(dict.fromkeys(shas))
+        run_env = {k: v for k, v in {**os.environ, **env}.items() if not k.startswith("GIT_")}
+        run_env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0")
+        self.env = run_env
+        self.path = None
+        self._tmp = None
+        self._why = None                  # None until fetched; '' once fetched; else why the fetch refused
+        self._lock = threading.Lock()
+        self._settled = threading.Event()
+
+    def git(self, *args, binary=False):
+        try:
+            p = _run_probe(["git", "-c", "core.hooksPath=" + os.devnull,
+                            "-c", "credential.helper=!gh auth git-credential", *args],
+                           cwd=self.path, env=self.env, capture_output=True, text=not binary, timeout=30)
+        except (OSError, UnicodeError, subprocess.SubprocessError) as e:
+            raise _Unreadable(f"git {args[0]} could not complete ({type(e).__name__})")
+        if p.returncode != 0:
+            raise _Unreadable(f"git {args[0]} exited {p.returncode}")
+        if not isinstance(p.stdout, bytes if binary else str):
+            raise _Unreadable(f"git {args[0]} returned unreadable output")
+        return p.stdout if binary else p.stdout.strip()
+
+    def fetch(self):
+        """'' once every commit of the chain is fetched, else the refusal; the first caller fetches, the
+        others wait for it (bounded by the fetch's own deadline-capped timeout)."""
+        try:
+            with self._lock:
+                if self._why is None:
+                    self._why = self._fetch()
+                return self._why
+        finally:
+            self._settled.set()
+
+    def _fetch(self):
+        import tempfile
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.repo) or not all(
+                isinstance(s, str) and _SHA.fullmatch(s) for s in self.shas):
+            return "merge-tree inputs are unreadable"
+        try:
+            if self._tmp is None:       # a retry after an expired attempt reuses (and so still removes) it
+                cache = Path(self.env.get("HERMES_HOME", str(Path.home() / ".hermes"))) / "cache"
+                cache.mkdir(parents=True, exist_ok=True)
+                self._tmp = tempfile.TemporaryDirectory(prefix="ship-carry-", dir=cache,
+                                                        ignore_cleanup_errors=True)
+                self.path = self._tmp.name
+        except OSError as e:
+            return f"git cache could not complete ({type(e).__name__})"
+        try:
+            self.git("init", "--bare", "--template=", "-q")
+            # Fetch full blobs: avoids lazy fetch subprocesses inside merge-tree and
+            # their separate auth/timeouts. Depth and wall time bound the attempt.
+            self.git("fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "--depth=128",
+                     "https://github.com/" + self.repo + ".git", *self.shas)
+        except _Unreadable as e:
+            return str(e)
+        return ""
+
+    def settle(self):
+        """No fetch is coming (the authoritative proofs are done): release waiting prefilter reads."""
+        self._settled.set()
+
+    def _ready(self):
+        while not self._settled.wait(_remaining()):
+            pass                        # _remaining() raises once this reader's own deadline has passed
+        return self._why == ""
+
+    def tree(self, sha):
+        """{path: (mode, blob sha, size)} like `_flat_tree`, or None when the fetch does not hold it."""
+        if not self._ready():
+            return None
+        try:
+            out = self.git("ls-tree", "-r", "-l", "-z", sha, binary=True)
+            entries = {}
+            for row in out.split(b"\0"):
+                if not row:
+                    continue
+                meta, tab, path = row.partition(b"\t")
+                mode, kind, obj, size = meta.decode("ascii").split()
+                path = path.decode("utf-8")
+                if not tab or not path or kind not in ("blob", "commit") or not _SHA.fullmatch(obj) or (
+                        path in entries):
+                    return None
+                entries[path] = (mode, obj, int(size) if kind == "blob" else None)
+            return entries
+        except (_Unreadable, ValueError):
+            return None
+
+    def blob(self, sha):
+        """The bytes of blob `sha`, or None when the fetch does not hold it."""
+        if not self._ready():
+            return None
+        try:
+            return self.git("cat-file", "blob", sha, binary=True)
+        except _Unreadable:
+            return None
+
+    def verify(self, merge, ours, theirs):
+        """The authoritative merge-tree refusal of one fetched merge, else ''."""
+        if not {merge, ours, theirs} <= set(self.shas):
+            return "merge-tree inputs are unreadable"
+        try:
+            parents = self.git("show", "-s", "--format=%P", merge).split()
+            if parents != [ours, theirs]:
+                return "fetched merge parents differ from the reported parents"
+            bases = self.git("merge-base", "--all", ours, theirs).split()
+            if len(bases) != 1 or not _SHA.fullmatch(bases[0]):
+                return "merge base is unreadable or multiple (cannot prove bounded history)"
+            shallow = Path(self.path, "shallow")
+            try:
+                cuts = set(shallow.read_text().split()) if shallow.exists() else set()
+            except (OSError, UnicodeError) as e:
+                return f"git merge-base could not complete ({type(e).__name__})"
+            if cuts:
+                relevant = set(self.git("rev-list", ours, theirs, "--not", bases[0]).split())
+                if cuts & relevant:
+                    return "fetch depth cuts history before the merge base"
+            want = self.git("merge-tree", "--write-tree", ours, theirs)
+            have = self.git("rev-parse", merge + "^{tree}")
+        except _Unreadable as e:
+            return str(e)
+        if not _SHA.fullmatch(want) or not _SHA.fullmatch(have):
+            return "merge-tree returned an unreadable tree id"
+        if have != want:
+            return "its tree differs from the clean merge computed by git merge-tree"
+        return ""
+
+    def close(self):
+        self._settled.set()
+        if self._tmp is not None:
+            self._tmp.cleanup()
+
+
+def _git_merge_tree_refusal(merge, ours, theirs, repo, cwd, env, objects=None):
+    """Authoritative merge-tree check; a bounded shallow fetch may refuse, never guess. `objects` is the
+    chain's shared fetch (`_CarryObjects`); without it this merge fetches its own three commits."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) or not all(
             isinstance(s, str) and _SHA.fullmatch(s) for s in (merge, ours, theirs)):
         return "merge-tree inputs are unreadable"
-    run_env = {k: v for k, v in {**os.environ, **env}.items() if not k.startswith("GIT_")}
-    run_env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0")
-    home = Path(run_env.get("HERMES_HOME", str(Path.home() / ".hermes")))
-    step = "cache"
+    own = objects is None
+    if own:
+        objects = _CarryObjects(repo, env, (merge, ours, theirs))
     try:
-        cache = home / "cache"
-        cache.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix="ship-carry-", dir=cache) as tmp:
-            def git(*args):
-                nonlocal step
-                step = args[0]
-                p = _run_probe(["git", "-c", "core.hooksPath=" + os.devnull,
-                                    "-c", "credential.helper=!gh auth git-credential", *args],
-                                   cwd=tmp, env=run_env, capture_output=True, text=True, timeout=30)
-                if p.returncode != 0:
-                    raise _Unreadable(f"git {step} exited {p.returncode}")
-                if not isinstance(p.stdout, str):
-                    raise _Unreadable(f"git {step} returned unreadable output")
-                return p.stdout.strip()
-
-            git("init", "--bare", "--template=", "-q")
-            # Fetch full blobs: avoids lazy fetch subprocesses inside merge-tree and
-            # their separate auth/timeouts. Depth and wall time bound the attempt.
-            git("fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "--depth=128",
-                "https://github.com/" + repo + ".git", merge, ours, theirs)
-            parents = git("show", "-s", "--format=%P", merge).split()
-            if parents != [ours, theirs]:
-                return "fetched merge parents differ from the reported parents"
-            bases = git("merge-base", "--all", ours, theirs).split()
-            if len(bases) != 1 or not _SHA.fullmatch(bases[0]):
-                return "merge base is unreadable or multiple (cannot prove bounded history)"
-            shallow = Path(tmp, "shallow")
-            if shallow.exists():
-                cuts = set(shallow.read_text().split())
-                relevant = set(git("rev-list", ours, theirs, "--not", bases[0]).split())
-                if cuts & relevant:
-                    return "fetch depth cuts history before the merge base"
-            want = git("merge-tree", "--write-tree", ours, theirs)
-            have = git("rev-parse", merge + "^{tree}")
-            if not _SHA.fullmatch(want) or not _SHA.fullmatch(have):
-                return "merge-tree returned an unreadable tree id"
-            if have != want:
-                return "its tree differs from the clean merge computed by git merge-tree"
-    except _Unreadable as e:
-        return str(e)
-    except (OSError, UnicodeError, subprocess.SubprocessError) as e:
-        return f"git {step} could not complete ({type(e).__name__})"
-    return ""
+        return objects.fetch() or objects.verify(merge, ours, theirs)
+    finally:
+        if own:
+            objects.close()
 
 
 def _carried_approval(head, data, repo, cwd, env):
@@ -899,21 +1029,33 @@ def _carry_one(head, h0, blocked, repo, cwd, env):
         # Immutable tree entries are read once across the concurrent merges (`_Once`).
         # No mutable decision or partially populated tree is cached here.
         ordered = list(reversed(merges))
+        # One authoritative fetch of the whole chain; the prefilter reads its trees and blobs from it
+        # instead of a gh call per tree and blob (t_01a1da82db1127a5).
+        objects = _CarryObjects(repo, env, [s for m in ordered for s in m])
+
+        def authoritative(*args):
+            try:
+                return _git_merge_tree_refusal(*args)
+            finally:
+                objects.settle()        # however it ended, no prefilter read waits on a fetch any longer
         jobs = []
         for merge, ours, theirs in ordered:
             jobs.extend([
-                ("carry tree/content check", _merge_tree_refusal, (merge, ours, theirs, repo, cwd, env, cache)),
-                ("carry git fetch/merge-tree", _git_merge_tree_refusal, (merge, ours, theirs, repo, cwd, env)),
+                ("carry tree/content check", _merge_tree_refusal,
+                 (merge, ours, theirs, repo, cwd, env, cache, objects)),
+                ("carry git fetch/merge-tree", authoritative, (merge, ours, theirs, repo, cwd, env, objects)),
             ])
         try:
             results = outcomes(jobs)
-            for (merge, _, _), prefilter, authoritative in zip(ordered, results[::2], results[1::2]):
-                prefilter, authoritative = require(prefilter), require(authoritative)
-                why = prefilter or authoritative
+            for (merge, _, _), prefilter, verdict in zip(ordered, results[::2], results[1::2]):
+                prefilter, verdict = require(prefilter), require(verdict)
+                why = prefilter or verdict
                 if why:
                     return f"{lead}: merge {merge[:10]} is not a clean, unedited merge of the base: {why}"
         except _Unreadable as e:
             return f"{lead}: {e}, so a clean merge cannot be shown"
+        finally:
+            objects.close()
         return ""
 
     # Once the bounded ancestry chain is known, these read-only proofs have no
