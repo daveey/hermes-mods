@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 from pathlib import Path
 import re
@@ -60,12 +61,26 @@ def requirements(read):
     if not isinstance(checks, dict) or not isinstance(checks.get("contexts"), list):
         raise Refused("Cannot establish classic required-check inventory")
     required = [(name, None) for name in checks["contexts"]]
-    for check in checks.get("checks", []):
-        required.append((check["context"], check.get("app_id")))
+    def identities(rows, app_key):
+        if not isinstance(rows, list):
+            raise Refused("Malformed required-check list")
+        for check in rows:
+            if not isinstance(check, dict):
+                raise Refused("Malformed required-check entry")
+            app = check.get(app_key)
+            if app is not None and (type(app) is not int or app < -1 or app == 0):
+                raise Refused("Malformed required-check app identity")
+            required.append((check.get("context"), app))
+
+    identities(checks.get("checks", []), "app_id")
     for rule in pages(read, f"repos/{REPO}/rules/branches/{BRANCH}"):
-        if rule.get("type") == "required_status_checks":
-            for check in rule["parameters"]["required_status_checks"]:
-                required.append((check["context"], check.get("integration_id")))
+        if not isinstance(rule.get("type"), str) or not rule["type"]:
+            raise Refused("Malformed branch rule identity")
+        if rule["type"] == "required_status_checks":
+            params = rule.get("parameters")
+            if not isinstance(params, dict):
+                raise Refused("Malformed required-check rule parameters")
+            identities(params.get("required_status_checks"), "integration_id")
     if any(not isinstance(name, str) or not name for name, _ in required):
         raise Refused("Malformed required-check identity")
     return set(required)
@@ -83,7 +98,10 @@ def ci(read, head):
         suite = run.get("check_suite", {}).get("id")
         if not isinstance(suite, int):
             raise Refused("Check run lacks check-suite identity")
-        key = (run["name"], run.get("app", {}).get("id"), "check", suite)
+        app = run.get("app")
+        if not isinstance(app, dict) or type(app.get("id")) is not int or app["id"] <= 0:
+            raise Refused("Check run lacks app identity")
+        key = (run["name"], app["id"], "check", suite)
         value = (run["id"], run.get("status") == "completed" and run.get("conclusion") == "success")
         if key not in latest or value[0] > latest[key][0]:
             latest[key] = value
@@ -115,9 +133,16 @@ def reviews(read, number, head, pr):
             login = user.get("login")
             if not login or not isinstance(review.get("id"), int):
                 raise Refused("Malformed review identity")
-            previous = effective.get(login.lower(), {})
-            key = (str(review.get("submitted_at") or ""), review["id"])
-            if key > (str(previous.get("submitted_at") or ""), previous.get("id", -1)):
+            stamp = review.get("submitted_at")
+            if not isinstance(stamp, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", stamp):
+                raise Refused("Malformed review timestamp")
+            try:
+                timestamp = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")
+            except ValueError as exc:
+                raise Refused("Malformed review timestamp") from exc
+            previous = effective.get(login.lower())
+            key = (timestamp, review["id"])
+            if previous is None or key > (datetime.strptime(previous["submitted_at"], "%Y-%m-%dT%H:%M:%SZ"), previous["id"]):
                 effective[login.lower()] = review
     if any(r["state"] == "CHANGES_REQUESTED" for r in effective.values()):
         raise Refused("Effective changes-requested review must be resolved")

@@ -827,6 +827,27 @@ def _mods_merge(cmd: str, cwd: str, python: bool = False, depth: int = 0) -> Opt
 def _mods_merge_checked(cmd: str, cwd: str, python: bool = False, depth: int = 0) -> Optional[str]:
     if depth > 4:
         return MODS_LANDING
+    if python:
+        try:
+            tree = ast.parse(cmd)
+        except (SyntaxError, ValueError):
+            return MODS_LANDING
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", "")
+            if name not in PY_CALLS:
+                continue
+            texts = _py_strings(node)
+            for arg in node.args:
+                if isinstance(arg, ast.Starred) and isinstance(arg.value, (ast.List, ast.Tuple)):
+                    if all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in arg.value.elts):
+                        texts.append(shlex.join([e.value for e in arg.value.elts]))
+            for text in texts:
+                if "merge" in text.lower():
+                    why = _mods_merge(text, cwd, depth=depth + 1)
+                    if why:
+                        return why
     # gh accepts repository flags before the subcommand; normalize only this PR policy.
     for d, words in _commands(cmd, cwd):
         if os.path.basename(words[0]) == "gh" and len(words) > 1 and words[1].startswith("-"):
