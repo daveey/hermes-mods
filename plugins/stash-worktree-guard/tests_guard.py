@@ -2699,6 +2699,27 @@ def test_quoted_definition_real_restore_stays_refused(multi, definition, stored)
     assert blocked, cmd
 
 
+@pytest.mark.parametrize('payload,stored', [
+    ("'! alias 'g=git", False), ("'> /dev/null alias 'g=git", False),
+    ("'! alias 'g=git", True), ("'> /dev/null alias 'g=git", True),
+    ("'! alias ' g=git", False), ("'> /dev/null alias ' g=git", False),
+])
+def test_concatenated_definition_real_restore_stays_refused(multi, payload, stored):
+    main, wt = multi
+    setup = ('PAYLOAD=' + payload + '\neval "$PAYLOAD"'
+             if stored else 'eval ' + payload)
+    cmd = ('cd ' + shlex.quote(str(wt)) + '\nshopt -s expand_aliases\n'
+           + setup + '\ng stash pop')
+    before = subprocess.check_output(['git', 'rev-parse', 'refs/stash'], cwd=main, env=GIT_ENV)
+    why = guard.refuse_reason(cmd, str(wt))
+    blocked = _blocked(cmd, wt)
+    assert subprocess.check_output(['git', 'rev-parse', 'refs/stash'], cwd=main, env=GIT_ENV) == before
+    assert (wt / 'f.txt').read_text() == 'base\n'
+    _assert_real_restore(cmd, main, wt)
+    assert why, cmd
+    assert blocked, cmd
+
+
 # --- `alias` as prose in a quoted data argument (canonical brokered core ship) -----------
 # The whole-command pre-scan treats the word `alias` as a shell alias definition that may map
 # any bare name to git. A review reply such as "alias/import placement nit" is data, but it

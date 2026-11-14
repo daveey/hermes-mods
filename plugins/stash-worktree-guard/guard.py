@@ -2558,8 +2558,16 @@ def _may_define_alias(text: str) -> bool:
             # Assignment-bearing payloads can define aliases behind arbitrary shell
             # prefixes (assignments, redirections, negation), even when stored for
             # later eval. Only assignment-free plain prose gets the narrower scan.
-            if re.search(r"\balias\b", part) and any(c in part for c in "'\"\\="):
-                return True
+            if re.search(r"\balias\b", part):
+                # Quotes delimit fragments, not shell words. Adjacent fragments
+                # may supply assignment syntax to an otherwise plain payload.
+                # Exempt only a standalone quoted word; do not try to reconstruct
+                # words that may later pass through eval or parameter expansion.
+                boundaries = " \t\r\n;&|()<>"
+                standalone = ((i == 0 or text[i - 1] in boundaries)
+                              and (j + 1 == n or text[j + 1] in boundaries))
+                if not standalone or any(c in part for c in "'\"\\=!<>$"):
+                    return True
             quoted.append(part)
             unquoted.append(" ")
             i = j + 1
