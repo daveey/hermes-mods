@@ -4,7 +4,8 @@ A public, stdlib-only command guard that routes landing through a repository's
 trusted ship workflow for core main, with a narrow state-branch preflight below.
 It does not merge or push. State preflight makes two bounded read-only GitHub
 requests (the PR view and one base compare), plus at most three bounded
-per-file commit lookups when it refuses for base drift.
+per-file commit lookups when it refuses for base drift. Turn eligibility adds the
+bounded snapshot and server-push activity reads described below.
 
 ## Preflight budgets
 
@@ -260,35 +261,93 @@ fails GitHub's rebase merge. hermes-sync pushes live skill edits straight to
 Skill prose next to code (`home/skills/x/scripts/*.py`) and markdown outside
 the skill trees still overlap.
 
-**Land turn (bounded landing).** On 2026-11-13 the hot areas (`hermes-sync`,
-`tests/`, workflows) took a commit about once per CI cycle. #2563 was green and
-approved 4 times and refused 4 times; each refusal cost an update-branch and
-another CI cycle. So the first drift refusal of a green, approved PR also records
-a turn: the ref `refs/land-turn/pr-<N>` points at a commit whose message is
-`land-turn pr=<N>` plus one JSON line `{"pr", "head", "expires", "files"}`.
-The expiry is 90 minutes out (`_TURN_TTL`). A later refusal does not extend a
-live turn. After a turn expires, its PR cannot take a new one for another
-`_TURN_TTL` (the cooldown), so a PR whose area keeps drifting through sync
-exports holds that area at most half the time. Readers delete turns that are
-past their cooldown or unparseable. They read at most `_TURN_MAX` turns, newest
-PR number first, within `_TURN_BUDGET` seconds.
-While the turn is live and its PR is open, the guard refuses any other state PR
-merge with a file that would drift the holder (`_overlap(holder_file, file)`,
-the same rules as above), and names the holder and the expiry. When the holder
-has merged or closed, the turn no longer counts: the guard deletes its ref the
-next time it reads it. State's `scripts/state-push-guard` pre-push applies the
-same check to direct pushes to `state`, except hermes-sync and skills-sync exports.
-The turn only adds refusals. If the turn listing can't be read, or the turn code raises, the guard fails
-open, because the drift compare above still guards correctness. Replayed against
-the real state history of 2026-11-13 (61 merged PRs plus #2563, start times every
-5 minutes), the share of PRs that land within 2 CI cycles rose:
+**Ordered land turns (protocol 2).** A drift refusal of a green, approved PR
+may record `refs/land-turn/pr-<N>`, pointing at a commit with subject
+`land-turn pr=<N>` and one JSON line containing `pr`, `head`, `acquired`,
+`expires`, and `files`. The lifetime is 90 minutes; repeat refusals and changed
+heads do not extend it. Legacy records infer acquisition as `expires - 5400`.
+Acquisition time, then PR number, orders tickets; only the oldest eligible
+non-overlapping holders are effective. Younger overlapping tickets wait and
+never refuse the older holder. Acquisition checks that same ordering before
+and after publication. A waiting ticket cannot reserve an extra area against
+otherwise independent PRs. This is a preflight, not an atomic merge lock.
 
-- with a 20-minute cycle, from 79.7% to 97.2%;
-- with a 60-minute cycle, from 52.5% to 96.2%.
+The reader follows all ref-list pages and fetches immutable commit objects in
+batches of 100, rather than dropping old holders after six sequential reads.
+Incomplete, timed-out or malformed snapshots **fail closed**: base drift checks
+alone cannot establish fair turn ordering. Bounded record and eligibility reads
+refuse rather than silently admitting when their deadline is reached. The
+refusal reports both a hold and independently observed base drift so the owner
+refreshes immediately rather than merely parking behind the holder.
 
-#2563 lands within 2 cycles at every start time. The PRs still left out edit
-a path that the hosts' live sync exports, for example `hosts/daveey-mini/sync.json`
-(#2483). The simulator is attached to card t_01a1d6b3538e8e43.
+**Shared time budget.** The state-merge preflight (and each state pre-push turn
+check) runs under the canonical aggregate deadline described under "Preflight
+budgets" (`PREFLIGHT_TIMEOUT`, 18 s inside the 20 s callback budget; there is
+no second, shorter budget): every `gh`/`git` timeout is clipped to what is left,
+an exhausted budget refuses with a named message (never allows), and no turn
+write starts with less than 10 s left, so nothing is published after the
+deadline. Within one invocation the snapshot is read once and reused (commit
+objects by sha, holder PRs fetched concurrently on copied contexts, one compare
+per base, no per-file attribution while deciding a yield); only the post-write
+ordering check re-lists refs. If that re-read fails, the refusal says the turn
+record was already written and may be in force.
+
+An old ticket is not expired by age alone: the 15-minute grace below yields only
+a holder that is still drifted against its current base, so a refreshed head
+keeps its place (pinned in `tests_turn.py`).
+
+Closed PRs and exact-head requests for changes yield. A changed head keeps its
+ticket exactly when the merge gate's own `_approval_refusal` would still admit
+it (exact-head approval, or the existing patch-identical update-branch carry;
+that policy is not changed here); an unreviewed content change yields.
+After a 15-minute refresh grace from the later of acquisition and sustained drift arrival, a still-drifted holder
+yields as well; a refreshed head the gate admits can regain the original ticket only
+within its original lifetime. CI may still be pending while an eligible holder
+reserves its area. The usual approval, review and CI gates still apply to landing.
+
+**Drift-age attribution (server push clock).** The 900-second grace for a drifted
+holder runs from `max(acquired, T)`, where `T` starts the currently sustained overlap.
+The validated `base...state` compare pins a unique tip. GitHub's state activity API
+supplies the authoritative `before`/`after` chain back to the CI base and the server
+push timestamps; commit parent order and commit dates never determine arrival.
+Events newer than the frozen tip are ignored; a push straddling the base is clipped
+to that base. Cycles, duplicate destinations, missing links, malformed events and
+decreasing timestamps refuse.
+
+For each push endpoint `after_j`, test the cumulative net diff `base...after_j`
+with the normal overlap rule, including both rename paths. Reuse the already
+validated overall compare for the tip. Walk endpoints newest backward until the
+latest nonoverlap, then take the next push's timestamp; if every prefix overlaps,
+take the first push's timestamp. Equivalently, choose the oldest `k` for which
+every cumulative prefix `j >= k` overlaps. Thus a touch, revert, and new touch of
+the same file (or a different overlapping file) starts a fresh full grace, not a
+grace from the cancelled touch. At most eight immutable compare reads run at once;
+results decide strictly newest-first. Truncated (>= 300 files) or unreadable
+prefixes needed for that decision refuse. Workers are stopped and joined before
+return. Eligibility's existing 30 s ceiling is also clipped by the canonical
+18 s aggregate deadline (including standalone pre-push): the earlier deadline
+bounds every subprocess and rejects late results.
+Future selected timestamps refuse; no new clock heuristic or persistent clock is used.
+
+**Retention limit:** activity is read serially by the API's `Link` next cursor,
+not page number, for at most five pages of 100 events. GitHub does not document
+activity retention. A base outside the available chain/page bound fails closed;
+its holder cannot yield on drift age and may retain priority until ticket expiry.
+
+After expiry there is a further 90-minute cooldown before reacquisition. Cleanup
+is limited to two past-cooldown records per snapshot. A malformed open peer
+record names its ref and refuses; the owner can repair its own record through
+normal acquisition (after checking other holders), or close/merge its PR.
+Malformed closed records do not block. No peer's live malformed ref is edited
+or deleted as recovery. State pre-push requires protocol 2 and invokes this same
+reader and selector for direct non-export pushes, instead of reconstructing
+eligibility from a recorded tree. Deploy the plugin before the state wrapper.
+
+The earlier single-contender history replay reported 97.2% / 96.2% landing
+within two cycles at 20 / 60 minutes respectively. Those numbers did not test
+concurrent holders and are **not evidence of a concurrent landing bound**.
+The original simulator belongs to card t_01a1d6b3538e8e43; a concurrent replay
+and deployment proof are separate validation requirements.
 
 **Gate boundary:** this guard checks that an exact-head approval record exists;
 it does not authenticate that its author was independent (every agent posts as

@@ -8,6 +8,8 @@ check_python, and check_tool. No configuration means no protected repositories.
 from __future__ import annotations
 
 import ast
+import contextlib
+import contextvars
 import json
 import os
 from pathlib import Path
@@ -83,15 +85,25 @@ def _parallel(jobs):
 
 
 def _run_probe(*args, **kwargs):
-    remaining = _remaining()
-    if remaining is not None:
-        kwargs["timeout"] = min(kwargs["timeout"], remaining)
+    def remaining():
+        outer = _remaining()
+        deadline = _ELIGIBILITY_DEADLINE.get()
+        if deadline is None:
+            return outer
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise _Unreadable("state land-turn eligibility deadline exceeded; retry complete snapshot")
+        return min(outer, left) if outer is not None else left
+
+    left = remaining()
+    if left is not None:
+        kwargs["timeout"] = min(kwargs["timeout"], left)
     try:
         result = subprocess.run(*args, **kwargs)
     except subprocess.TimeoutExpired:
-        _remaining()  # Aggregate expiry must not be swallowed as missing evidence.
+        remaining()  # Neither aggregate expiry may be swallowed as missing evidence.
         raise
-    _remaining()
+    remaining()      # A late subprocess result cannot supply admissible evidence.
     return result
 
 MARKER = "HERMES_CORE_WT_LAND"
@@ -396,6 +408,55 @@ _SHA = re.compile(r"[0-9a-f]{40}")
 
 class _Unreadable(Exception):
     pass
+
+
+# The deadline is the canonical aggregate one above (`PREFLIGHT_TIMEOUT`, set by `bounded_preflight` for the
+# adapter and the standalone entry point, 20 s host callback). This section only adds what the state land
+# turn needs on top of it: a write reserve, a per-invocation read cache, and a fail-closed `_cap`.
+_WRITE_RESERVE = 10          # seconds that must remain to start the acquisition writes + post-write re-read
+_CACHE = contextvars.ContextVar("ship_only_guard_cache", default=None)   # per-invocation, immutable-or-seconds-old reads
+
+
+@contextlib.contextmanager
+def _scope():
+    """Per-invocation cache; standalone callers also share the canonical 18 s deadline."""
+    if _CACHE.get() is not None:
+        yield
+        return
+    deadline_token = None
+    if _PREFLIGHT_DEADLINE.get() is None:
+        deadline_token = _PREFLIGHT_DEADLINE.set(time.monotonic() + PREFLIGHT_TIMEOUT)
+    token = _CACHE.set({})
+    try:
+        yield
+        if deadline_token is not None:
+            _cap(1)  # a late standalone success must fail closed as well
+    finally:
+        _CACHE.reset(token)
+        if deadline_token is not None:
+            _PREFLIGHT_DEADLINE.reset(deadline_token)
+
+
+def _left():
+    """Seconds left in the canonical aggregate budget (<= 0 once spent), or None outside `bounded_preflight`."""
+    deadline = _PREFLIGHT_DEADLINE.get()
+    return None if deadline is None else deadline - time.monotonic()
+
+
+def _cap(timeout):
+    """A subprocess timeout clipped to the aggregate budget; _Unreadable (fail closed) once spent, so a spent
+    budget never starts a (write) request."""
+    left = _remaining()  # preserve canonical expiry type and stage attribution
+    if left is None:
+        return timeout
+    if left <= 0.5:
+        raise _Unreadable("ship-only-guard preflight deadline exceeded; retry after checking network/CI")
+    return min(timeout, left)
+
+
+def _cache():
+    c = _CACHE.get()
+    return c if c is not None else {}
 
 
 def _earlier_approval(data, head, exclude=()):
@@ -856,7 +917,7 @@ def _overlap(pr, base):
     return ""
 
 
-def _base_drift_refusal(number, repo, data, cwd, env):
+def _base_drift_refusal(number, repo, data, cwd, env, attribute=True, fresh=True):
     """Refusal text when state moved, since the base the PR's CI tested, on the PR's own areas; else None.
 
     Overlap (`_overlap`): a base-delta file and a PR file in the same top-3-segment directory; any base-delta
@@ -882,14 +943,21 @@ def _base_drift_refusal(number, repo, data, cwd, env):
         return closed("its changed-file list is missing, empty or possibly capped at 100")
     probe_env = dict(env)
     probe_env["GH_PROMPT_DISABLED"] = "1"
-    try:
-        p = _run_probe(["gh", "api", f"repos/{repo}/compare/{base}...state"],
-                           cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True, timeout=15)
-        if p.returncode != 0:
-            return closed(f"the compare {base[:10]}...state failed (exit {p.returncode})")
-        cmp = json.loads(p.stdout)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return closed(f"the compare {base[:10]}...state could not be read")
+    cache, key = _cache(), ("compare", repo, base)
+    # Eligibility may reuse its frozen observation for activity-chain calculations.
+    # The final landing check must observe mutable state after parallel work joins.
+    if not fresh and key in cache:
+        cmp = cache[key]
+    else:
+        try:
+            p = _run_probe(["gh", "api", f"repos/{repo}/compare/{base}...state"],
+                               cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True, timeout=15)
+            if p.returncode != 0:
+                return closed(f"the compare {base[:10]}...state failed (exit {p.returncode})")
+            cmp = json.loads(p.stdout)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return closed(f"the compare {base[:10]}...state could not be read")
+        cache[key] = cmp
     if not isinstance(cmp, dict):
         return closed("the compare response is not an object")
     total, commits, changed = cmp.get("total_commits"), cmp.get("commits"), cmp.get("files")
@@ -936,7 +1004,7 @@ def _base_drift_refusal(number, repo, data, cwd, env):
         named += f" (+{churn} sync/merge commit(s))"
     order = sorted(hits)
     shown = ", ".join(shown_hit(h) for h in order[:6]) + (f", +{len(order) - 6} more" if len(order) > 6 else "")
-    culprits = _attribute_hits(repo, order[:_ATTRIBUTE_HITS], {c["sha"]: c for c in commits}, subject, cwd, env)
+    culprits = attribute and _attribute_hits(repo, order[:_ATTRIBUTE_HITS], {c["sha"]: c for c in commits}, subject, cwd, env)
     return (f"[ship-only-guard] Refused state merge of PR #{number}: its CI tested base {base[:10]} (or later), "
             f"and {total} state commit(s) landed since then; together they change this PR's areas ({shown}). No "
             f"check ran on that combination (#2491 turned state red this way). "
@@ -963,6 +1031,8 @@ def _attribute_hits(repo, names, window, subject, cwd, env):
             listed = json.loads(p.stdout) if p.returncode == 0 else None
         except (OSError, ValueError, subprocess.SubprocessError):
             continue
+        except _Unreadable:
+            break               # attribution is garnish; the refusal itself stands
         if not isinstance(listed, list):
             continue
         hit = next((window[c["sha"]] for c in listed if isinstance(c, dict) and c.get("sha") in window), None)
@@ -979,11 +1049,12 @@ def _attribute_hits(repo, names, window, subject, cwd, env):
 # PR's files and an expiry) and, until it expires or the PR closes, every OTHER state PR merge whose files
 # would drift the holder (`_overlap(holder_file, other_file)`) is refused, as is (in state's
 # scripts/state-push-guard pre-push) a direct non-sync push. The turn only ever adds refusals; any error
-# reading it fails open, because the drift compare still guards correctness.
+# reading it refuses: an incomplete snapshot cannot establish turn order.
 _TURN_PREFIX = "land-turn/pr-"
+TURN_PROTOCOL = 2          # effective acquisition order + eligibility, shared by state pre-push
 _TURN_TTL = 5400             # one refreshed CI cycle (#2563: 10-45 min) plus the merge attempt, with slack
-_TURN_MAX = 6                # turn commits read per preflight (newest PR numbers first)
-_TURN_BUDGET = 6             # seconds of turn reads per preflight; the rest is skipped (fail open)
+_TURN_REFRESH_GRACE = 900    # refresh the drifted acquisition head within 15 minutes
+_TURN_BUDGET = 10            # acquisition write budget; reads never silently truncate
 _TURN_CALL_TIMEOUT = 5
 _TURN_SUBJECT = "land-turn pr="
 # After a turn expires its PR cannot take another until a further _TURN_TTL has passed (the cooling ref is
@@ -1001,6 +1072,7 @@ def _gh_call(args, cwd, env, payload=None, timeout=10):
     probe_env = dict(env)
     probe_env["GH_PROMPT_DISABLED"] = "1"
     argv = ["gh", "api", *args, *(["--input", "-"] if payload is not None else [])]
+    timeout = _cap(timeout)   # _Unreadable before any call, so a spent budget never starts a (write) request
     try:
         p = _run_probe(argv, cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True,
                            timeout=timeout, input=json.dumps(payload) if payload is not None else None)
@@ -1028,8 +1100,13 @@ def parse_turn(message):
             return None
         ok = (isinstance(rec, dict) and isinstance(rec.get("pr"), int) and not isinstance(rec.get("pr"), bool)
               and isinstance(rec.get("expires"), (int, float)) and not isinstance(rec.get("expires"), bool)
-              and 0 < rec["expires"] < 4_102_444_800 and isinstance(rec.get("files"), list)
-              and all(isinstance(f, str) and f for f in rec["files"]))
+              and rec["pr"] > 0
+              and isinstance(rec.get("head"), str) and re.fullmatch(r"[0-9a-f]{40}", rec["head"])
+              and 0 < rec["expires"] < 4_102_444_800 and isinstance(rec.get("files"), list) and rec["files"]
+              and all(isinstance(f, str) and f for f in rec["files"])
+              and ("acquired" not in rec or (isinstance(rec["acquired"], (int, float))
+                   and not isinstance(rec["acquired"], bool) and 0 < rec["acquired"] < rec["expires"]
+                   and rec["expires"] - rec["acquired"] <= _TURN_TTL)))
         return rec if ok else None
     return None
 
@@ -1039,33 +1116,88 @@ def _turn_number(ref):
     return int(m.group(1)) if m else -1
 
 
-def _live_turns(repo, cwd, env):
-    """[(ref, record)] of unexpired turns; [] on any read failure (fail open).
+def _turn_order(rec):
+    # v1 records had no acquired field, but all were issued for exactly _TURN_TTL.
+    return (rec.get("acquired", rec["expires"] - _TURN_TTL), rec["pr"])
 
-    Reads at most _TURN_MAX turn commits within _TURN_BUDGET seconds (the whole preflight shares the
-    pre_tool_call budget), newest PR numbers first. A turn past its cooldown (expires + _TURN_TTL) or with a
-    junk record is deleted here, so the ref list stays as short as the set of recent turns."""
-    import time
-    rc, refs = _gh_call([f"repos/{repo}/git/matching-refs/{_TURN_PREFIX}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
-    if rc != 0 or not isinstance(refs, list):
+
+def _live_turns(repo, cwd, env, own_number=None):
+    """Read every ref in bounded batches, never admit a partial snapshot.
+
+    gh follows Link pagination if the endpoint ever adds it; --slurp preserves
+    page boundaries for validation. Objects use immutable snapshot OIDs, so a record already read in this
+    invocation (cache) is never read twice: the post-write re-read fetches only new or changed records.
+    """
+    cache = _cache()
+    objects = cache.setdefault("obj", {})          # commit sha -> {"message": ...} | None, immutable
+    deadline = time.monotonic() + 20
+    eligibility = _ELIGIBILITY_DEADLINE.get()
+    if eligibility is not None:
+        deadline = min(deadline, eligibility)
+    rc, pages = _gh_call([f"repos/{repo}/git/matching-refs/{_TURN_PREFIX}", "--paginate", "--slurp"],
+                         cwd, env, timeout=_TURN_CALL_TIMEOUT)
+    if rc != 0 or not isinstance(pages, list) or not all(isinstance(p, list) for p in pages):
+        raise _Unreadable("cannot list complete state land turns")
+    refs = [r for page in pages for r in page if _turn_number(r) >= 0]
+    cache.pop(("own", own_number), None)
+    if own_number is not None:
+        cache[("own", own_number)] = None            # complete listing: no ref of the owner unless seen below
+    if not refs:
         return []
-    out, now, start = [], _now(), time.monotonic()
-    refs = sorted((r for r in refs if _turn_number(r) >= 0), key=_turn_number, reverse=True)
-    for ref in refs[:_TURN_MAX]:
-        if time.monotonic() - start > _TURN_BUDGET:
-            break
+    owner, name = repo.split("/", 1)
+    shas = []
+    for ref in refs:
         sha = ref.get("object", {}).get("sha") if isinstance(ref.get("object"), dict) else None
         if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
-            continue
-        rc, obj = _gh_call([f"repos/{repo}/git/commits/{sha}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
-        if rc != 0 or not isinstance(obj, dict):
-            continue
-        rec = parse_turn(obj.get("message"))
-        if rec and rec["expires"] > now:
+            raise _Unreadable(f"invalid state land-turn ref {ref.get('ref')}")
+        shas.append(sha)
+    todo = [sha for sha in dict.fromkeys(shas) if sha not in objects]
+    for start in range(0, len(todo), 100):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _Unreadable("state land-turn record deadline exceeded; retry complete snapshot")
+        chunk = todo[start:start + 100]
+        fields = [f't{i}: object(oid: "{sha}") {{ ... on Commit {{ message }} }}' for i, sha in enumerate(chunk)]
+        query = ('query { repository(owner: ' + json.dumps(owner) + ', name: ' + json.dumps(name)
+                 + ') { ' + ' '.join(fields) + ' } }')
+        rc, response = _gh_call(["graphql"], cwd, env, payload={"query": query}, timeout=min(10, remaining))
+        if rc != 0 or not isinstance(response, dict) or response.get("errors"):
+            raise _Unreadable("cannot read complete state land-turn records")
+        batch = (response.get("data") or {}).get("repository")
+        if not isinstance(batch, dict):
+            raise _Unreadable("missing state land-turn objects")
+        for i, sha in enumerate(chunk):
+            if f"t{i}" not in batch:
+                raise _Unreadable(f"{sha[:10]}: missing state land-turn object response")
+            objects[sha] = batch[f"t{i}"]
+    out, now, cleaned = [], _now(), 0
+    for ref, sha in zip(refs, shas):
+        if time.monotonic() >= deadline:
+            raise _Unreadable("state land-turn record deadline exceeded; retry complete snapshot")
+        obj = objects[sha]
+        # A missing object is null and a tree/blob target is {} in GraphQL, not an API error. Apply
+        # the same owner-repair/closed-holder recovery as malformed messages.
+        rec = parse_turn(obj.get("message")) if isinstance(obj, dict) else None
+        if rec is not None and rec["pr"] != _turn_number(ref):
+            rec = None
+        if _turn_number(ref) == own_number:
+            cache[("own", own_number)] = (rec,)       # (None,) = malformed own record
+        if rec is None:
+            # An invalid own ticket cannot hold its owner; ordinary acquisition
+            # repairs it after checking all OTHER holders. Never edit a peer's
+            # live ref. Closing the holder also releases malformed records.
+            if _turn_number(ref) == own_number:
+                continue
+            holder = _turn_holder_data(_turn_number(ref), repo, cwd, env)
+            if holder["state"] != "OPEN":
+                continue
+            raise _Unreadable(f"{ref['ref']}: malformed record; owner must retry acquisition or close its PR")
+        if rec["expires"] > now:
             out.append((ref["ref"], rec))
-        elif rec is None or rec["expires"] + _TURN_TTL <= now:
+        elif rec["expires"] + _TURN_TTL <= now and cleaned < 2:
             _turn_delete(ref['ref'], repo, cwd, env)
-    return out
+            cleaned += 1
+    return sorted(out, key=lambda item: _turn_order(item[1]))
 
 
 def turn_blocks(turn_files, files):
@@ -1077,45 +1209,431 @@ def turn_blocks(turn_files, files):
     return None
 
 
+def _turn_holder_data(number, repo, cwd, env):
+    cache = _cache()
+    if ("holder", number) in cache:
+        return cache[("holder", number)]       # read earlier in this invocation (seconds old)
+    fields = "number,state,headRefOid,baseRefOid,reviews,comments,files"
+    probe_env = dict(env, GH_PROMPT_DISABLED="1")
+    timeout = _cap(10)
+    try:
+        p = _run_probe(["gh", "pr", "view", str(number), "--repo", repo, "--json", fields],
+                       cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True, timeout=timeout)
+        data = json.loads(p.stdout) if p.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        data = None
+    if (not isinstance(data, dict) or data.get("number") != number
+            or data.get("state") not in {"OPEN", "CLOSED", "MERGED"}):
+        raise _Unreadable(f"cannot read state land-turn holder #{number}")
+    cache[("holder", number)] = data
+    return data
+
+
+def _turn_yielded(rec, data, repo, cwd, env):
+    cache = _cache()
+    key = ("yield", rec["pr"], rec["head"], rec["expires"], rec.get("acquired"), data.get("headRefOid"))
+    if key not in cache:
+        cache[key] = _turn_yielded_uncached(rec, data, repo, cwd, env)
+    return cache[key]
+
+
+def _turn_yielded_uncached(rec, data, repo, cwd, env):
+    head = data.get("headRefOid")
+    if (not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head)
+            or not isinstance(data.get("reviews"), list) or not isinstance(data.get("comments"), list)
+            or len(data["reviews"]) >= 100 or len(data["comments"]) >= 100):
+        raise _Unreadable(f"cannot read complete verdict for turn #{rec['pr']}")
+    verdicts = _head_verdicts(data, head)
+    if any(t is None for t, _ in verdicts):
+        raise _Unreadable(f"cannot order verdicts for turn #{rec['pr']}")
+    if verdicts and sorted(verdicts)[-1][1] == "block":
+        return True
+    # Retain the ticket, not an unconditional reservation. A refreshed head keeps its priority exactly when the
+    # merge gate would still admit it: `_approval_refusal` (exact-head approval, or the existing patch-identical
+    # update-branch carry; its policy is unchanged here). An unreviewed content change, or a head whose carry
+    # cannot be established, yields; the documented update-branch flow does not lose the ticket mid-CI.
+    if head != rec.get("head") and _approval_refusal(rec["pr"], data, repo, cwd, env) is not None:
+        return True
+    # Ticket age is not drift age: new drift gets a full refresh window even during long CI.
+    if _now() - _turn_order(rec)[0] >= _TURN_REFRESH_GRACE:
+        drift = _base_drift_refusal(rec["pr"], repo, data, cwd, env, attribute=False, fresh=False)
+        if drift:
+            if "state commit(s) landed since then" not in drift:
+                raise _Unreadable(f"cannot establish drift for turn #{rec['pr']}: {drift}")
+            started = _turn_drift_started(data, repo, cwd, env)
+            return _now() - max(_turn_order(rec)[0], started) >= _TURN_REFRESH_GRACE
+    return False
+
+
+_ELIGIBILITY_DEADLINE = contextvars.ContextVar("ship_only_guard_eligibility_deadline", default=None)
+_EDGE_WORKERS = 8
+
+
+def _elig_cap(timeout=15):
+    """Subprocess timeout bounded by BOTH the canonical preflight deadline and the shared 30 s eligibility one."""
+    timeout = _cap(timeout)
+    deadline = _ELIGIBILITY_DEADLINE.get()
+    if deadline is not None:
+        left = deadline - time.monotonic()
+        if left <= 0.5:
+            raise _Unreadable("state land-turn eligibility deadline exceeded; retry complete snapshot")
+        timeout = min(timeout, left)
+    return timeout
+
+
+def _drift_json(path, cwd, env):
+    probe_env = dict(env)
+    probe_env["GH_PROMPT_DISABLED"] = "1"
+    try:
+        p = _run_probe(["gh", "api", path], cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True,
+                       timeout=_elig_cap(15))
+        out = json.loads(p.stdout) if p.returncode == 0 else None
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        out = None
+    if not isinstance(out, dict):
+        raise _Unreadable(f"cannot read drift evidence `{path}`")
+    return out
+
+
+_ACTIVITY_PAGES = 5          # at most 500 pushes (~10 h at the observed rate) are paged serially
+_ACTIVITY_PER_PAGE = 100
+_NEXT_LINK = re.compile(r'<([^>]*)>\s*;\s*rel="next"')
+_CURSOR = re.compile(r"[A-Za-z0-9_=-]{1,512}")
+
+
+def _edge_files(repo, edge, cwd, env):
+    """Complete net file list of the pushed range before...after (immutable SHAs only; cached)."""
+    before, after = edge["before"], edge["after"]
+    key = ("drift-edge", repo, before, after)
+    cache = _cache()
+    if key in cache:
+        return cache[key]
+    detail = _drift_json(f"repos/{repo}/compare/{before}...{after}", cwd, env)
+    if detail.get("status") not in ("ahead", "identical") or detail.get("behind_by") not in (0, None):
+        raise _Unreadable("drift push edge compare is not linear")
+    files = detail.get("files")
+    if (not isinstance(files, list) or len(files) >= _COMPARE_FILES_CAP
+            or not all(isinstance(f, dict) and isinstance(f.get("filename"), str) for f in files)):
+        raise _Unreadable("incomplete or truncated drift edge files")
+    cache[key] = files
+    return files
+
+
+def _event_stamp(raw):
+    from datetime import datetime
+    try:
+        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            raise ValueError("timezone missing")
+        return stamp.timestamp()
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        raise _Unreadable("missing or invalid push activity timestamp")
+
+
+def _activity_page(repo, cursor, cwd, env):
+    """One page of server-recorded pushes to state (newest first) and the next cursor (or None). Cached.
+
+    GitHub's activity API paginates by cursor only (`page=` is ignored); the cursor comes from the Link header."""
+    cache, key = _cache(), ("activity", repo, cursor)
+    if key in cache:
+        return cache[key]
+    path = f"repos/{repo}/activity?ref=refs%2Fheads%2Fstate&per_page={_ACTIVITY_PER_PAGE}"
+    if cursor:
+        path += f"&after={cursor}"
+    probe_env = dict(env)
+    probe_env["GH_PROMPT_DISABLED"] = "1"
+    try:
+        p = _run_probe(["gh", "api", path, "-i"], cwd=_probe_cwd(cwd), env=probe_env, capture_output=True,
+                       text=True, timeout=_elig_cap(15))
+        text = p.stdout if p.returncode == 0 else ""
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        text = ""
+    head, sep, body = text.replace("\r\n", "\n").partition("\n\n")
+    lines = head.split("\n")
+    if not sep or not re.match(r"HTTP/\S+ 200\b", lines[0] if lines else ""):
+        raise _Unreadable("cannot read state push activity")
+    try:
+        rows = json.loads(body)
+    except ValueError:
+        rows = None
+    if not isinstance(rows, list):
+        raise _Unreadable("state push activity is not a list")
+    events = []
+    for r in rows:
+        if (not isinstance(r, dict) or r.get("ref") != "refs/heads/state"
+                or not all(isinstance(r.get(k), str) and _SHA.fullmatch(r[k]) for k in ("before", "after"))):
+            raise _Unreadable("malformed state push activity event")
+        events.append({"before": r["before"], "after": r["after"], "ts": _event_stamp(r.get("timestamp"))})
+    nxt = None
+    for line in lines[1:]:
+        name, _, value = line.partition(":")
+        if name.strip().lower() == "link":
+            m = _NEXT_LINK.search(value)
+            if m:
+                from urllib.parse import parse_qs, urlsplit
+                vals = parse_qs(urlsplit(m[1]).query).get("after") or []
+                if len(vals) != 1 or not _CURSOR.fullmatch(vals[0]):
+                    raise _Unreadable("unusable state push activity cursor")
+                nxt = vals[0]
+    cache[key] = (events, nxt)
+    return cache[key]
+
+
+def _push_chain(cmp, base, repo, cwd, env):
+    """Oldest-first server push edges {before, after, ts} from the CI base to the frozen compare tip.
+
+    Authority is the push history (each event's before/after), never commit parents or dates. Events newer than the
+    frozen tip are ignored; a missing link, retention gap, ambiguity or page bound is _Unreadable."""
+    shas, referenced = set(), set()
+    for c in cmp["commits"]:
+        sha, parents = c.get("sha"), c.get("parents")
+        if (not isinstance(sha, str) or not _SHA.fullmatch(sha) or sha in shas or not isinstance(parents, list)
+                or not all(isinstance(q, dict) and isinstance(q.get("sha"), str) for q in parents)):
+            raise _Unreadable("drift compare commit lacks a valid sha/parents or is duplicated")
+        shas.add(sha)
+        referenced.update(q["sha"] for q in parents)
+    tips = [s for s in shas if s not in referenced]
+    if len(tips) != 1:
+        raise _Unreadable("drift compare has no unique endpoint")
+    tip = tips[0]                                   # frozen endpoint; mutable `state` is never queried again
+    by_after, dup = {}, set()
+    chain, seen, cur, cursor = [], {tip}, tip, None
+    for _ in range(_ACTIVITY_PAGES):
+        events, nxt = _activity_page(repo, cursor, cwd, env)
+        for e in events:
+            if e["after"] in by_after:
+                dup.add(e["after"])
+            by_after.setdefault(e["after"], e)
+        while cur != base and cur in by_after:
+            if cur in dup:
+                raise _Unreadable("state push activity names several pushes to the same commit")
+            e = by_after[cur]
+            if e["before"] == "0" * 40:
+                raise _Unreadable("state push activity shows a branch creation inside the drift window")
+            before = e["before"] if e["before"] == base or e["before"] in shas else None
+            # A push whose range contains the CI base (before is older than it) is clipped to base...after.
+            chain.append({"before": before or base, "after": cur, "ts": e["ts"]})
+            cur = before or base
+            if cur in seen:
+                raise _Unreadable("state push activity is cyclic")
+            seen.add(cur)
+        if cur == base:
+            chain.reverse()
+            if any(a["ts"] > b["ts"] for a, b in zip(chain, chain[1:])):
+                raise _Unreadable("state push activity timestamps are not monotonic")
+            return chain, tip
+        if nxt is None:
+            break
+        cursor = nxt
+    raise _Unreadable("state push activity does not reach the PR base (retention or page bound)")
+
+
+def _arrival_time(edge):
+    if edge["ts"] > _now():
+        raise _Unreadable("future state push timestamp")
+    return edge["ts"]
+
+
+def _turn_drift_started(data, repo, cwd, env):
+    """When the currently sustained overlap began (GitHub push activity timestamp).
+
+    Preserve the authoritative before/after activity chain, but compare each endpoint cumulatively against
+    the CI base. Decide newest-first until the latest nonoverlap, then use the next push's timestamp.
+    Reuse the validated tip compare; at most 8 reads run in flight under the existing deadlines.
+    No commit date and no observation clock is used or persisted."""
+    import threading
+    base = data["baseRefOid"]
+    cmp = _cache()[("compare", repo, base)]
+    chain, tip = _push_chain(cmp, base, repo, cwd, env)
+    mine = [p["path"] for p in data["files"]]
+
+    def hit(files):
+        return any(_overlap(p, name) for p in mine for f in files
+                   for name in (f["filename"], f.get("previous_filename")) if isinstance(name, str) and name)
+    if not hit(cmp["files"]):
+        raise _Unreadable("cannot identify overlapping drift commit")
+    started = chain[-1]
+    chain = list(reversed(chain[:-1]))   # tip is validated; inspect cumulative prefixes newest-first
+    ctx = contextvars.copy_context()
+    results, slots, stop = {}, threading.Semaphore(_EDGE_WORKERS), threading.Event()
+    workers = []
+    done = [threading.Event() for _ in chain]
+
+    def work(i):
+        try:
+            if stop.is_set():
+                raise _Unreadable("drift edge read abandoned")
+            results[i] = ("ok", ctx.copy().run(_edge_files, repo, {**chain[i], "before": base}, cwd, env))
+        except BaseException as exc:                       # surfaced only if this edge is reached in order
+            results[i] = ("err", exc)
+        finally:
+            slots.release()
+            done[i].set()
+    state = {"n": 0}
+
+    def submit_more():
+        while state["n"] < len(chain) and slots.acquire(blocking=False):
+            worker = threading.Thread(target=work, args=(state["n"],), daemon=True)
+            workers.append(worker)
+            worker.start()
+            state["n"] += 1
+    try:
+        for i, edge in enumerate(chain):
+            submit_more()
+            while not done[i].wait(0.02):
+                _elig_cap(1)      # raises _Unreadable once either deadline is spent; workers are capped too
+                submit_more()
+            kind, value = results[i]
+            if kind == "err":
+                raise value if isinstance(value, _Unreadable) else _Unreadable(f"drift edge read failed: {value}")
+            _elig_cap(1)          # a late result never decides
+            if not hit(value):
+                return _arrival_time(started)
+            started = edge
+    finally:
+        stop.set()                # queued workers skip the read; join bounded in-flight subprocesses
+        for worker in workers:
+            worker.join()
+    return _arrival_time(started)
+
+
 def _turn_hold_refusal(number, data, repo, cwd, env):
-    """Refusal while another open PR's live turn covers this PR's areas, else None (fail open)."""
+    """Only an older effective holder can refuse; incomplete reads fail closed (shared budget included)."""
+    with _scope():
+        outer = _PREFLIGHT_DEADLINE.get()
+        deadline = time.monotonic() + 30      # one shared eligibility allowance for every read below
+        token = _ELIGIBILITY_DEADLINE.set(min(deadline, outer) if outer is not None else deadline)
+        try:
+            return _turn_hold_refusal_scoped(number, data, repo, cwd, env)
+        finally:
+            _ELIGIBILITY_DEADLINE.reset(token)
+
+
+def _prefetch_holders(numbers, repo, cwd, env):
+    """Read the open-holder PRs concurrently (one thread each, at most 8) into the cache; a failure surfaces
+    later, and only if that holder turns out to matter."""
+    import threading
+    todo = [n for n in dict.fromkeys(numbers) if ("holder", n) not in _cache()][:8]
+    if len(todo) < 2:
+        return
+
+    def one(n):
+        try:
+            _turn_holder_data(n, repo, cwd, env)
+        except Exception:
+            pass
+    threads = [threading.Thread(target=contextvars.copy_context().run, args=(one, n), daemon=True) for n in todo]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()      # every call inside is capped by the shared deadline
+
+
+def _turn_hold_refusal_scoped(number, data, repo, cwd, env):
+    deadline = _ELIGIBILITY_DEADLINE.get() or time.monotonic() + 30
     files = [f["path"] for f in data.get("files") or [] if isinstance(f, dict) and isinstance(f.get("path"), str)]
-    for ref, rec in _live_turns(repo, cwd, env):
+    turns = _live_turns(repo, cwd, env, int(number))
+    # Resolve only the connected overlap component. An unrelated holder's review
+    # history (or API outage) cannot hold this PR, but an indirect older blocker
+    # must still be considered before admitting a non-transitive waiter.
+    relevant = set()
+    areas = [files]
+    changed = True
+    while changed:
+        changed = False
+        for _, rec in turns:
+            if rec["pr"] not in relevant and any(
+                    turn_blocks(rec["files"], area) or turn_blocks(area, rec["files"]) for area in areas):
+                relevant.add(rec["pr"])
+                areas.append(rec["files"])
+                changed = True
+    # A live own ticket bounds the ordering search: younger eligibility cannot
+    # affect admission before we reach it. Keep the full connected component
+    # (including indirect older blockers), but do not spend its budget on younger
+    # speculative reads. If our ticket yields, the loop still reads later holders.
+    older = []
+    for _, rec in turns:
         if rec["pr"] == int(number):
+            break
+        if rec["pr"] in relevant:
+            older.append(rec["pr"])
+    _prefetch_holders(older, repo, cwd, env)
+    effective = []
+    for ref, rec in turns:
+        if time.monotonic() >= deadline:
+            raise _Unreadable("state land-turn eligibility deadline exceeded; retry complete snapshot")
+        if rec["pr"] not in relevant:
             continue
-        hit = turn_blocks(rec["files"], files)
-        if not hit:
+        # A waiting turn cannot reserve additional areas from later PRs. This
+        # matters when overlap is non-transitive (A~B, B~C, but not A~C).
+        if any(turn_blocks(r["files"], rec["files"]) or turn_blocks(rec["files"], r["files"])
+               for r in effective):
             continue
-        rc, pr = _gh_call([f"repos/{repo}/pulls/{rec['pr']}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
-        if rc != 0 or not isinstance(pr, dict):
-            continue   # cannot tell whether the holder is still open: fail open
-        if pr.get("state") != "open":
+        holder = data if rec["pr"] == int(number) else _turn_holder_data(rec["pr"], repo, cwd, env)
+        _elig_cap(1)              # cached/late holder results must respect the same eligibility deadline
+        if holder.get("state") != "OPEN":
             _turn_delete(ref, repo, cwd, env)
-            continue   # the holder landed or closed: its turn is over
-        return (f"[ship-only-guard] Refused state merge of PR #{number}: PR #{rec['pr']} holds the state land "
-                f"turn until {_until(rec['expires'])} ({ref}), and this merge would change its area ({hit[1]} ~ "
-                f"{hit[0]}), sending it into another CI cycle. Wait until #{rec['pr']} merges or its turn "
-                "expires, then rerun the same merge command (the drift check will then ask for update-branch "
-                "if needed).")
+            continue
+        yielded = _turn_yielded(rec, holder, repo, cwd, env)
+        _elig_cap(1)              # includes time spent joining speculative edge reads after a decision
+        if yielded:
+            continue
+        effective.append(rec)
+        if rec["pr"] == int(number):
+            return None
+        hit = turn_blocks(rec["files"], files) or turn_blocks(files, rec["files"])
+        if hit:
+            return (f"[ship-only-guard] Refused state merge of PR #{number}: PR #{rec['pr']} holds the state land "
+                    f"turn until {_until(rec['expires'])} ({ref}); this PR waits behind that older turn "
+                    f"({hit[1]} ~ {hit[0]}). Refresh now if drift is reported below; retry when the older "
+                    "holder merges, yields, or expires. Do not park on the hold instead of refreshing.")
     return None
 
 
-def _turn_acquire(number, data, repo, cwd, env):
-    """Record this PR's land turn (best effort). Returns the expiry text, or '' when not recorded."""
+def _turn_acquire(number, data, repo, cwd, env, prechecked=False):
+    """Return expiry, a refusal, or ''. Recheck ordering at acquisition, not only at the caller.
+
+    `prechecked`: the caller just got no hold refusal for this same `data` in the same invocation, so the
+    snapshot (and the owner's own ref it listed) is reused instead of read again; the post-write check below
+    always re-lists."""
+    with _scope():
+        return _turn_acquire_scoped(number, data, repo, cwd, env, prechecked)
+
+
+def _turn_acquire_scoped(number, data, repo, cwd, env, prechecked):
+    if not prechecked:
+        refusal = _turn_safe(_turn_hold_refusal, number, data, repo, cwd, env)
+        if refusal:
+            return refusal
     head = str(data.get("headRefOid") or "")
     files = [f["path"] for f in data.get("files") or [] if isinstance(f, dict) and isinstance(f.get("path"), str)]
     if not re.fullmatch(r"[0-9a-f]{40}", head) or not files:
         return ""
     ref = f"{_TURN_PREFIX}{int(number)}"
-    import time
     start = time.monotonic()
-    late = lambda: time.monotonic() - start > _TURN_BUDGET   # noqa: E731 - preflight shares the hook budget
-    rc, cur = _gh_call([f"repos/{repo}/git/ref/{ref}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
-    if rc == 0 and isinstance(cur, dict):
-        sha = cur.get("object", {}).get("sha") if isinstance(cur.get("object"), dict) else None
-        rc2, obj = _gh_call([f"repos/{repo}/git/commits/{sha}"], cwd, env, timeout=_TURN_CALL_TIMEOUT) if sha else (-1, None)
-        rec = parse_turn(obj.get("message")) if rc2 == 0 and isinstance(obj, dict) else None
+
+    def late():
+        # No write may start without room for it and for the ordering re-read after it.
+        left = _left()
+        return time.monotonic() - start > _TURN_BUDGET if left is None else left < _WRITE_RESERVE
+    seen = _cache().get(("own", int(number))) if prechecked else None
+    if seen is not None:
+        rec = seen[0]                        # the hold snapshot's own ref (None: malformed, to be repaired)
+    elif prechecked and ("own", int(number)) in _cache():
+        rec = None                           # complete listing had no ref of this PR
+    else:
+        rc, cur = _gh_call([f"repos/{repo}/git/ref/{ref}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+        rec = None
+        if rc == 0 and isinstance(cur, dict):
+            sha = cur.get("object", {}).get("sha") if isinstance(cur.get("object"), dict) else None
+            rc2, obj = _gh_call([f"repos/{repo}/git/commits/{sha}"], cwd, env, timeout=_TURN_CALL_TIMEOUT) if sha else (-1, None)
+            rec = parse_turn(obj.get("message")) if rc2 == 0 and isinstance(obj, dict) else None
+            if rec and rec["pr"] != int(number):
+                rec = None
+    if rec is not None:
         if rec and rec["expires"] > _now():
+            if _turn_yielded(rec, data, repo, cwd, env):
+                return ""
             return _until(rec["expires"])   # one live turn per PR: a later refusal never extends it
         if rec and rec["expires"] + _TURN_TTL > _now():
             return ""                        # cooling down: others in its area get a window first
@@ -1126,18 +1644,31 @@ def _turn_acquire(number, data, repo, cwd, env):
     if not isinstance(tree, str) or late():
         return ""
     expires = int(_now()) + _TURN_TTL
-    rec = {"pr": int(number), "head": head, "expires": expires, "files": files}
+    rec = {"pr": int(number), "head": head, "acquired": expires - _TURN_TTL,
+           "expires": expires, "files": files}
     rc, made = _gh_call([f"repos/{repo}/git/commits"], cwd, env, timeout=_TURN_CALL_TIMEOUT, payload={
         "message": f"{_TURN_SUBJECT}{int(number)}\n\n{json.dumps(rec, sort_keys=True)}\n",
         "tree": tree, "parents": [head]})
     sha = made.get("sha") if rc == 0 and isinstance(made, dict) else None
     if not isinstance(sha, str):
         return ""
+    # Commits are immutable: the post-write re-list need not read back the record this call just wrote.
+    _cache().setdefault("obj", {})[sha] = {"message": f"{_TURN_SUBJECT}{int(number)}\n\n{json.dumps(rec, sort_keys=True)}\n"}
     rc, _ = _gh_call([f"repos/{repo}/git/refs"], cwd, env, timeout=_TURN_CALL_TIMEOUT, payload={"ref": f"refs/{ref}", "sha": sha})
     if rc != 0:
         rc, _ = _gh_call(["-X", "PATCH", f"repos/{repo}/git/refs/{ref}"], cwd, env, timeout=_TURN_CALL_TIMEOUT,
                          payload={"sha": sha, "force": True})
-    return _until(expires) if rc == 0 else ""
+    if rc != 0:
+        return ""
+    # Concurrent writers can publish records, but only the oldest is effective.
+    try:
+        return _turn_hold_refusal(number, data, repo, cwd, env) or _until(expires)
+    except Exception as exc:
+        # The ref is already published: say so, so the agent does not believe no turn was recorded.
+        return (f"[ship-only-guard] Refused state merge: land-turn snapshot unreadable after writing "
+                f"({type(exc).__name__}: {str(exc)[:240]}). PR #{int(number)}'s turn record was written "
+                f"(refs/{ref}) and may be in force until {_until(expires)}; the ordering check could not be "
+                "completed, so no merge is permitted from partial reads. Retry: a live own record is honored.")
 
 
 def _until(epoch):
@@ -1146,13 +1677,15 @@ def _until(epoch):
 
 
 def _turn_safe(fn, *args):
-    """The land turn only orders landings: any error in it adds nothing (the drift compare still guards)."""
+    """Unreadable ordering must never be interpreted as an empty lane."""
     try:
         return fn(*args)
     except _PreflightExpired:
         raise
-    except Exception:
-        return None
+    except Exception as exc:
+        return (f"[ship-only-guard] Refused state merge: land-turn snapshot unreadable "
+                f"({type(exc).__name__}: {str(exc)[:240]}). Retry once the complete turn snapshot is readable; "
+                "no merge or new turn is permitted from partial reads.")
 
 
 def _turn_delete(ref, repo, cwd, env):
@@ -1170,6 +1703,13 @@ def _turn_hold_read_only(*args):
 
 
 def _state_merge(words, repo, cwd, env):
+    """One shared monotonic budget (`PREFLIGHT_TIMEOUT`, set by `bounded_preflight`) covers every
+    read and write of the preflight; see `_state_merge_scoped` for the rules."""
+    with _scope():
+        return _state_merge_scoped(words, repo, cwd, env)
+
+
+def _state_merge_scoped(words, repo, cwd, env):
     """Narrow state-only exception, never a general non-main merge allowance.
 
     Returns True to allow, False when the command is not this route, or a refusal
@@ -1283,25 +1823,27 @@ def _state_merge(words, repo, cwd, env):
             ("approval/carry reads", _approval_refusal, (number, data, repo, cwd, env)),
             ("land-turn reads", _turn_hold_read_only, (number, data, repo, cwd, env)),
         ])
-        if approval or hold:
-            return approval or hold
-        # Keep the mutable base read last; speculative drift would widen the race
-        # between observing state and handing the admitted command to gh.
+        if approval:
+            return approval
+        # Keep the mutable base read last, even when an older holder blocks us:
+        # report independent drift so waiters refresh instead of parking.
         drift = _stage("drift check", _base_drift_refusal, number, repo, data, cwd, env)
+        if hold:
+            return hold + ("\nAlso: " + drift if drift else "")
         if drift and "state commit(s) landed since then" in drift:
-            # Green, approved, refused only for drift: take the land turn so the refreshed head's CI cycle
-            # is the last one (overlapping merges and direct pushes wait for it).
-            # Taking a turn is optional and cannot change the refusal. Do not start
-            # its writes when the aggregate allowance cannot fit its own budget.
             remaining = _remaining()
             until = (_stage("land-turn acquisition", _turn_safe, _turn_acquire,
-                            number, data, repo, cwd, env)
+                            number, data, repo, cwd, env, True)
                      if remaining is None or remaining > _TURN_BUDGET else None)
+            if until and until.startswith("[ship-only-guard]"):
+                return drift + "\n" + until
             if until:
                 drift += (f" PR #{number} now holds the state land turn until {until} (refs/{_TURN_PREFIX}"
                           f"{number}): overlapping state PR merges and direct state pushes wait for it, so "
                           "update-branch now and merge as soon as the new head's CI is green.")
         return drift or True
+    except (_Unreadable, _PreflightExpired) as e:
+        return failed(f"{e}; nothing was approved or written late")
     except (ValueError, TypeError) as e:
         return failed(f"`gh pr view {number}` returned an unexpected shape ({type(e).__name__})")
 

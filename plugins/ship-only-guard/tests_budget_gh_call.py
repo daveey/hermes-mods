@@ -84,7 +84,7 @@ def test_turn_acquire_never_writes_after_preflight_expiry(guard, monkeypatch, tm
             # Exhaust the aggregate budget during a successful read, well before
             # the turn's separate elapsed-time budget could stop the next write.
             if expired:
-                clock[0] = 101.0
+                clock[0] = 118.0
             return SimpleNamespace(returncode=0, stdout=json.dumps({"tree": {"sha": tree}}))
         if method == "POST" and endpoint.endswith("/commits"):
             return SimpleNamespace(returncode=0, stdout=json.dumps({"sha": made}))
@@ -94,7 +94,9 @@ def test_turn_acquire_never_writes_after_preflight_expiry(guard, monkeypatch, tm
             return SimpleNamespace(returncode=0, stdout="{}")
         pytest.fail(f"unexpected fixture request: {method} {endpoint}")
     monkeypatch.setattr(g.subprocess, "run", run)
-    token = g._PREFLIGHT_DEADLINE.set(101.0)
+    # Isolate the existing write-boundary regression from protocol-2 ordering reads.
+    monkeypatch.setattr(g, "_turn_hold_refusal", lambda *a: None)
+    token = g._PREFLIGHT_DEADLINE.set(118.0)
     try:
         result = g.bounded_preflight(lambda: g._turn_safe(
             g._turn_acquire, 12, {"headRefOid": head, "files": [{"path": "fixture.py"}]},

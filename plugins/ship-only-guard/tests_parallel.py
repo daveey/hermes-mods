@@ -90,5 +90,6 @@ def test_preflight_precedence_read_only_turn_and_final_drift(monkeypatch, approv
     monkeypatch.setattr(g, '_turn_acquire', lambda *a: pytest.fail('unexpected acquisition'))
     words = ['pr', 'merge', '12', '-R', 'example/repo', '--rebase', '--match-head-commit', head]
     assert g.bounded_preflight(g._state_merge, words, 'example/repo', '.', {}) == expected
-    assert ('drift' in done) == (not approval and not hold)
+    # Protocol 2 also reports drift to a blocked waiter; approval still wins.
+    assert ('drift' in done) == (not approval)
     assert not g._TURN_READ_ONLY.get()
