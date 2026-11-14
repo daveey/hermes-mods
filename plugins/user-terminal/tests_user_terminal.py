@@ -377,10 +377,11 @@ class FakeCourier(threading.Thread):
     answer back (a Mac whose answer arrives after the gateway stopped waiting)."""
 
     def __init__(self, base: Path, device: str, gateway_key: str = "nous-1", aliases=(), legacy=False,
-                 start_delay=0.0, old_withdraw=False):
+                 start_delay=0.0, old_withdraw=False, old_focus=False):
         super().__init__(daemon=True)
         self.base, self.device, self.gw, self.aliases = base, device, gateway_key, list(aliases) or [device]
         self.legacy, self.start_delay, self.old_withdraw = legacy, start_delay, old_withdraw
+        self.old_focus = old_focus  # a plugin.js from before action=focus: it treats the request as a status poll
         self.stop, self.claimed = threading.Event(), []
 
     def run(self):
@@ -392,6 +393,8 @@ class FakeCourier(threading.Thread):
                     res = ut.start_relayed("", "", "", {"gateway": self.gw, "request_id": a["withdraw_request"],
                                                         "job_id": a.get("withdraw_job") or "",
                                                         "withdraw": a.get("reason") or "withdrawn by its gateway"})
+                elif a.get("focus") and a.get("job_id") and not self.old_focus:  # plugin.js: /start origin.focus
+                    res = ut.start_relayed("", "", "", {"gateway": self.gw, "job_id": a["job_id"], "focus": True})
                 elif a.get("job_id"):
                     res = ut.relayed_status(a["job_id"], self.gw, a.get("wait_s") or 0)
                 else:
@@ -2325,3 +2328,114 @@ def test_stop_still_interrupts_and_is_not_a_yield(tmp_path, monkeypatch, interru
 def test_no_yield_without_core(monkeypatch):
     monkeypatch.setitem(sys.modules, "tools.interrupt", None)  # import fails -> never a yield, never a crash
     assert ut._yield_requested() is False
+
+
+# agent-c92065f334: a job's window opened (and was activated) once, then sat buried under other windows for 17 min
+# while the user looked for it ("or bring window foreground"); the tool had no way to raise it again.
+def _pending_job(tmp_path, monkeypatch, origin=None):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path / "jobs"))
+    job = ut.create_job("true", "sign in", str(tmp_path), origin)
+    _fake_runner(job, monkeypatch)
+    return job
+
+
+_FAKE_RUNNERS: list = []
+
+
+@pytest.fixture(autouse=True)
+def _reap_fake_runners():
+    yield
+    while _FAKE_RUNNERS:
+        p = _FAKE_RUNNERS.pop()
+        p.kill()
+        p.wait()
+
+
+def _fake_runner(job, monkeypatch):
+    """A live process standing in for the window's runner.sh, recorded the way runner.sh records itself."""
+    p = subprocess.Popen(["sleep", "120"])
+    _FAKE_RUNNERS.append(p)
+    monkeypatch.setattr(ut, "_test_runner_pid", p.pid, raising=False)
+    (job / "runners").write_text(f"{p.pid} {ut._proc_start(p.pid)}\n")
+    return p
+
+
+def test_schema_offers_focus_and_says_when():
+    assert "focus" in ut.SCHEMA["parameters"]["properties"]["action"]["enum"]
+    assert "action=focus" in ut.SCHEMA["description"]
+
+
+def test_pending_note_tells_the_agent_to_focus_not_send_a_link(tmp_path, monkeypatch):
+    job = _pending_job(tmp_path, monkeypatch)
+    res = ut.wait_for(job, 0.1)
+    assert res["status"] == "pending"
+    assert "action=focus" in res["note"] and "link" in res["note"]
+
+
+def test_focus_raises_the_runner_window_by_its_tty(tmp_path, monkeypatch):
+    job = _pending_job(tmp_path, monkeypatch)
+    scripts = []
+    monkeypatch.setattr(ut, "_tty_of", lambda pid: "/dev/ttys012" if pid == ut._test_runner_pid else "", raising=False)
+    monkeypatch.setattr(ut, "_osascript_out", lambda script: scripts.append(script) or "iTerm", raising=False)
+    out = json.loads(ut.handle({"action": "focus", "job_id": job.name, "wait_s": 1}))
+    assert out["ok"] and out["focused"] == "iTerm" and out["job_id"] == job.name and out["status"] == "pending", out
+    assert len(scripts) == 1 and '"/dev/ttys012"' in scripts[0] and "activate" in scripts[0]
+    assert 'application "iTerm"' in scripts[0] and 'application "Terminal"' in scripts[0]
+    assert not (job / "start.lock").exists()  # focusing never starts, answers or withdraws anything
+
+
+def test_focus_window_not_found_is_an_error_not_a_claim(tmp_path, monkeypatch):
+    job = _pending_job(tmp_path, monkeypatch)
+    monkeypatch.setattr(ut, "_tty_of", lambda pid: "/dev/ttys012", raising=False)
+    monkeypatch.setattr(ut, "_osascript_out", lambda script: "", raising=False)
+    out = json.loads(ut.handle({"action": "focus", "job_id": job.name, "wait_s": 1}))
+    assert out["ok"] is False and "focused" not in out and "window" in out["error"]
+
+
+def test_focus_of_a_finished_job_says_so(tmp_path, monkeypatch):
+    job = _pending_job(tmp_path, monkeypatch)
+    (job / "status.json").write_text(json.dumps({"status": "ran", "exit_code": 0}))
+    monkeypatch.setattr(ut, "_osascript_out", lambda script: pytest.fail("no AppleScript for a finished job"),
+                        raising=False)
+    out = json.loads(ut.handle({"action": "focus", "job_id": job.name, "wait_s": 1}))
+    assert out["ok"] is False and out["status"] == "ran" and "ended" in out["error"]
+
+
+def test_focus_round_trip_through_the_courier(remote, monkeypatch, tmp_path):
+    base, _ = remote
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
+    monkeypatch.setattr(ut, "POLL_S", 1)
+    monkeypatch.setattr(ut, "open_window", lambda job: "fake")
+    monkeypatch.setattr(ut, "_tty_of", lambda pid: "/dev/ttys004", raising=False)
+    monkeypatch.setattr(ut, "_osascript_out", lambda script: "Terminal" if "/dev/ttys004" in script else "",
+                        raising=False)
+    c = FakeCourier(base, "macbook")
+    _beat(base, "macbook")
+    c.start()
+    try:
+        first = json.loads(ut.handle_remote({"command": "true", "cwd": str(tmp_path), "wait_s": 1}))
+        assert first["ok"] and first["status"] == "pending", first
+        assert "action=focus" in first["note"]
+        job = ut.jobs_dir() / first["job_id"]
+        _fake_runner(job, monkeypatch)
+        out = json.loads(ut.handle_remote({"action": "focus", "job_id": first["job_id"], "wait_s": 1}))
+    finally:
+        c.stop.set()
+    assert out["ok"] and out["focused"] == "Terminal" and out["device"] == "macbook", out
+    assert c.claimed[-1]["args"].get("focus") is True
+
+
+def test_focus_through_an_old_courier_is_not_reported_as_focused(remote, monkeypatch, tmp_path):
+    base, _ = remote
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
+    monkeypatch.setattr(ut, "POLL_S", 1)
+    monkeypatch.setattr(ut, "open_window", lambda job: "fake")
+    c = FakeCourier(base, "macbook", old_focus=True)
+    _beat(base, "macbook")
+    c.start()
+    try:
+        first = json.loads(ut.handle_remote({"command": "true", "cwd": str(tmp_path), "wait_s": 1}))
+        out = json.loads(ut.handle_remote({"action": "focus", "job_id": first["job_id"], "wait_s": 1}))
+    finally:
+        c.stop.set()
+    assert out["ok"] is False and "focused" not in out and "update" in out["error"], out
