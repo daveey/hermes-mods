@@ -13,6 +13,24 @@ def test_batch_rows_matches_sqlite(rows):
         expected = c.execute('SELECT * FROM t').fetchall()
         assert [tuple(r) for r in S._batch_rows(c, 'SELECT * FROM t', 3)] == expected
 
+@pytest.mark.parametrize('values', [(1.9999999999999998, 0), (2**63-1, 1)])
+def test_real_token_results_preserved_full_and_incremental(tmp_path, values):
+    from test_incremental import DB, M
+    db = DB(tmp_path / 'state.db')
+    db.turn('s', io=0)
+    cur = S.read_cursor(db.path, M)
+    with db.conn() as c:
+        for table in ('sessions', 'session_model_usage'):
+            c.execute(f'UPDATE {table} SET input_tokens=?, output_tokens=?', values)
+        expected = c.execute(S._TOKENS_SQL).fetchone()[1]
+    full, readable = S.session_snapshot([db.path])
+    assert str(db.path) in readable
+    assert full[(str(db.path), 's')][0] == int(expected)
+    incremental, models = S.read_incremental(db.path, cur, M + 60, True)
+    assert incremental['s'][0] == int(expected)
+    assert models['s']['m'][0] == int(expected)
+
+
 def test_batch_rows_bound_parameters():
     with closing(sqlite3.connect(':memory:')) as c:
         assert S._batch_rows(c, 'SELECT ?, ?, ?', 3, ('x', 2**53+1, None)) == [['x', 2**53+1, None]]

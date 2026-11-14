@@ -119,13 +119,20 @@ def _batch_rows(c: sqlite3.Connection, sql: str, width: int, parameters=()):
     process with other SQLite readers that dominates the full snapshot's CPU.
     Keep the original SELECT (including its aggregation and NULL semantics) and
     decode its rows in one batch. json.loads preserves integer precision.
-    Older SQLite builds and legacy BLOB identifiers retain the original path.
+    Older SQLite builds, legacy BLOB identifiers and REAL results retain the
+    original path: SQLite's JSON float formatting can change Python int rounding,
+    including when addition of INTEGER token columns overflows into REAL.
     """
     columns = ','.join(f'c{i}' for i in range(width))
+    has_real = ' OR '.join(f"typeof(c{i})='real'" for i in range(width))
     query = (f'WITH data({columns}) AS ({sql}) '
-             f'SELECT json_group_array(json_array({columns})) FROM data')
+             f'SELECT CASE WHEN MAX({has_real}) THEN NULL ELSE '
+             f'json_group_array(json_array({columns})) END FROM data')
     try:
-        return json.loads(c.execute(query, parameters).fetchone()[0])
+        encoded = c.execute(query, parameters).fetchone()[0]
+        if encoded is None:
+            return c.execute(sql, parameters).fetchall()
+        return json.loads(encoded)
     except sqlite3.OperationalError as exc:
         message = str(exc).lower()
         if not (message.startswith('no such function: json_') or
