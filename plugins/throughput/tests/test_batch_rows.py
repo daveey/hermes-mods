@@ -37,16 +37,36 @@ def test_batch_rows_bound_parameters():
 
 def test_batch_rows_without_json():
     with closing(sqlite3.connect(':memory:')) as c:
+        calls = []
+
         class OldSQLite:
             def execute(self, sql, parameters=()):
+                calls.append((sql, parameters))
                 if 'json_group_array' in sql:
                     raise sqlite3.OperationalError('no such function: json_group_array')
                 return c.execute(sql, parameters)
         assert S._batch_rows(OldSQLite(), 'SELECT ?, ?, ?', 3, ('x', 1, 2)) == [('x', 1, 2)]
+        assert len(calls) == 2
+        assert calls[1] == ('SELECT ?, ?, ?', ('x', 1, 2))
 
-def test_batch_rows_does_not_hide_read_error():
-    class BrokenSQLite:
-        def execute(self, *args):
-            raise sqlite3.OperationalError('database is locked')
-    with pytest.raises(sqlite3.OperationalError, match='locked'):
-        S._batch_rows(BrokenSQLite(), 'SELECT 1, 2, 3', 3)
+@pytest.mark.parametrize('message', [
+    'database is locked',
+    'no such function: unrelated_function',
+], ids=['locked', 'non-json-function'])
+def test_batch_rows_does_not_hide_read_error(message):
+    with closing(sqlite3.connect(':memory:')) as c:
+        calls = []
+        error = sqlite3.OperationalError(message)
+
+        class BrokenSQLite:
+            def execute(self, sql, parameters=()):
+                calls.append((sql, parameters))
+                if len(calls) == 1:
+                    raise error
+                # A retry would succeed, hiding the original failure.
+                return c.execute(sql, parameters)
+
+        with pytest.raises(sqlite3.OperationalError) as raised:
+            S._batch_rows(BrokenSQLite(), 'SELECT ?, ?, ?', 3, ('x', 1, 2))
+        assert raised.value is error
+        assert len(calls) == 1, 'unrelated read errors must not retry via fallback'
