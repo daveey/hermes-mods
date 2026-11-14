@@ -220,9 +220,14 @@ possible git; the word counts when it is unquoted or starts a command inside a q
 so prose such as `--review-reply 'alias/import nit'` does not taint a brokered
 `token-broker exec … -- env … hermes-core-wt ship`, while heredocs, `$'…'` text, substitutions
 inside double quotes and unterminated quotes keep the whole-text reading; quoted payloads
-containing `alias` plus nested quote, backslash or assignment (`=`) syntax also retain taint,
-  since later shell quote removal, line joining or assignment/redirection/negation prefixes
-  can turn them into executable definitions, including stored-then-evaluated payloads),
+containing `alias` plus nested quote, backslash, assignment (`=`), negation (`!`),
+redirection (`<>`) or expansion (`$`) syntax also retain taint (including when `eval`
+joins separate arguments).
+Only standalone quoted words qualify for the prose exemption: adjacency to another
+quoted or unquoted fragment retains taint, because concatenation can supply assignment
+syntax outside the quoted fragment. Later shell quote removal, line joining or
+assignment/redirection/negation prefixes can turn these into executable definitions,
+including stored-then-evaluated payloads),
 Git aliases already stored in repository/user config, `shopt -s lastpipe`, `set -e`,
 exported functions, inherited state of a persistent terminal (logical `PWD`, exported
 `IFS`/`CDPATH`/`GIT_DIR`, `set -a`), scripts whose text is not in the command (a file
