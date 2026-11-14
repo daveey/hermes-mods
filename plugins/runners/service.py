@@ -7,8 +7,10 @@ import json
 import marshal
 import math
 import os
+from operator import itemgetter
 import pickle
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 import sqlite3
 import threading
@@ -17,6 +19,26 @@ import time
 from .collector import ident, iso, readiness, operational_evidence, readiness_evidence
 from .health import State, project, Policy
 from .models import validate
+
+try:
+    import msgspec
+except ImportError:  # older installations remain correct until dependencies are refreshed
+    msgspec = None
+
+
+def _decode_snapshot(text):
+    """Fast JSON, never an executable persisted codec. Retain legacy JSON extensions.
+
+    msgspec retains arbitrary precision integers (unlike some fast decoders). It
+    rejects NaN/Infinity, overflowing floats and lone surrogates; the authoritative
+    stdlib decoder handles those and supplies the historical malformed-JSON error.
+    """
+    if msgspec is not None:
+        try:
+            return msgspec.json.decode(text)
+        except (msgspec.DecodeError, UnicodeError):
+            pass
+    return json.loads(text)
 
 
 # Served by store.py's runner_entity expression index (schema v2): the
@@ -61,6 +83,9 @@ _MEMO_LOCK = threading.Lock()
 _GENERATION = itertools.count(1)
 _READS: dict = {}  # state file path -> _Read
 _RESULTS: dict = {}  # state file path -> _Result
+# A process normally reads one store. Bound retained multi-megabyte object graphs
+# when stores/profiles are replaced; eviction only causes an authoritative rebuild.
+MEMO_PATHS_MAX = 4
 _UNREAD = object()
 _NO_CARRY = object()
 ROWS_MAX_S = 300.0  # a carried runner row is computed afresh at least this often (its P1 ceiling)
@@ -71,11 +96,12 @@ class _Carry:
     state, the output row, its projection, its provenance entry, when computed); hosts maps a host id to (its
     host result, its maintenance) as that build saw them."""
 
-    __slots__ = ('current', 'built_at', 'rows', 'hosts', 'computed')
+    __slots__ = ('current', 'built_at', 'rows', 'hosts', 'computed', 'blocks')
 
     def __init__(self, current, built_at):
         self.current, self.built_at = current, built_at
         self.rows, self.hosts, self.computed = {}, {}, 0
+        self.blocks = []
 
 
 @dataclass
@@ -118,9 +144,15 @@ def _next_flip(stamps, ttls, now):
     the bound at or before that). Each bound is FLIP_EARLY_S early: provenance compares the clock with x + d
     after an ISO round trip, which rounds to the microsecond."""
     best = math.inf
+    seen_int, seen_float = set(), set()
     for x in stamps:
         if type(x) not in (int, float):
             continue
+        # Equal ints/floats can have different addition rounding at large values.
+        seen = seen_int if type(x) is int else seen_float
+        if x in seen:
+            continue
+        seen.add(x)  # most states share a collection timestamp
         try:
             if not math.isfinite(x):
                 continue
@@ -142,8 +174,104 @@ def _same_state(a, b):
     ``_inventory`` patches on a carried row."""
     if a == b:
         return True
-    return (type(a) is dict and type(b) is dict
-            and dict(a, **_LIVENESS_ONLY) == dict(b, **_LIVENESS_ONLY))
+    if type(a) is not dict or type(b) is not dict:
+        return False
+    left, right = a.copy(), b.copy()
+    left.update(_LIVENESS_ONLY)
+    right.update(_LIVENESS_ONLY)
+    return left == right
+
+
+_STATE_KEYS = frozenset(State.__dataclass_fields__)
+_STATE_VALUES = itemgetter(*(key for key in State.__dataclass_fields__ if key not in _LIVENESS_ONLY))
+
+
+def _state_signature(state):
+    if state.keys() == _STATE_KEYS:
+        return _STATE_VALUES(state)
+    # Keep unknown/missing keys: ignoring them would hide a State constructor error.
+    normalized = state.copy()
+    normalized.update(_LIVENESS_ONLY)
+    return normalized
+
+
+def _carry_sources(snap, carry, built, host_results, maintenance, now, rows, projections, provenance):
+    """Yield dirty blocks to the ordinary row path; carry equal blocks in C-sized batches.
+
+    Retain the ORIGINAL row computation times and flip bounds, not the latest build
+    time. A carried block never refreshes its own lease. The caller still owns the
+    global 30-second ceiling, configuration and snapshot-currentness invalidation.
+    """
+    sources = snap['runners'] if snap else []
+    if built is None or len({src['id'] for src in sources}) != len(sources):
+        yield from sources
+        return
+    inputs = {}
+    for src in sources:
+        hid = src.get('host_id')
+        if hid not in inputs:
+            inputs[hid] = (host_results.get(hid), maintenance.get(hid, {}))
+    built.hosts.update(inputs)
+    same_hosts = {hid for hid, value in inputs.items()
+                  if carry is not None and carry.hosts.get(hid, _NO_CARRY) == value}
+    # Dirty blocks still carry individual unchanged rows using these same
+    # signatures; larger blocks avoid allocating many tiny bookkeeping objects.
+    block_size = 64
+    for index, start in enumerate(range(0, len(sources), block_size)):
+        chunk = sources[start:start + block_size]
+        states = [_state_signature(snap['states'][src['id']]) for src in chunk]
+        old = carry.blocks[index] if carry is not None and index < len(carry.blocks) else None
+        if (old is not None and old[5] <= now < old[6] and old[7] <= same_hosts
+                and old[0] == chunk and old[1] == states):
+            built.rows.update(old[2])
+            rows.extend(old[3]); projections.extend(old[4])
+            cycles = [snap['states'][src['id']]['cycle'] for src in chunk]
+            if cycles != old[8]:
+                patched = [dict(p, collection_id=snap['states'][p['source_id']]['cycle'])
+                           for p in old[9]]
+                old = (*old[:8], cycles, patched, old[10])
+            provenance.extend(old[9])
+            built.blocks.append(old)
+            continue
+        offset = len(rows)
+        provenance_offset = len(provenance)
+        for src, signature in zip(chunk, states):
+            rid, hid = src['id'], src.get('host_id')
+            entry = carry.rows.get(rid) if carry is not None else None
+            if (entry is not None and hid in same_hosts
+                    and entry[5] <= now < entry[6] and now < entry[5] + ROWS_MAX_S
+                    and entry[0] == src and entry[7] == signature):
+                built.rows[rid] = entry
+                rows.append(entry[2]); projections.append(entry[3])
+                if entry[4] is not None:
+                    previous = entry[4]
+                    cycle = snap['states'][rid]['cycle']
+                    provenance.append(previous if previous['collection_id'] == cycle
+                                      else dict(previous, collection_id=cycle))
+            else:
+                yield src
+        entries = {src['id']: built.rows[src['id']] for src in chunk}
+        floor = max(entry[5] for entry in entries.values())
+        deadline = min(min(entry[6], entry[5] + ROWS_MAX_S) for entry in entries.values())
+        built.blocks.append((chunk, states, entries, rows[offset:], projections[offset:],
+                             floor, deadline, {src.get('host_id') for src in chunk},
+                             [snap['states'][src['id']]['cycle'] for src in chunk],
+                             provenance[provenance_offset:],
+                             _row_counts(rows[offset:], projections[offset:], snap['states'])))
+
+
+def _row_counts(rows, projections, states):
+    current = [p for p, row in zip(projections, rows)
+               if p.freshness == 'fresh' and not states[row['id']].get('source_error')
+               and p.registration == 'online']
+    counts = dict(registrations=len(rows), online=len(current),
+                  busy=sum(p.activity == 'busy' for p in current),
+                  verified_ready=sum(p.ready for p in projections),
+                  readiness_unverified=sum(not p.ready for p in current),
+                  issues=sum('source_unavailable' in p.reasons or p.health in
+                             ('missing', 'offline', 'unavailable', 'degraded', 'stale', 'unknown', 'suspected_offline')
+                             for p in projections))
+    return counts, {row['host_id'] for row in rows if row['host_id']}
 
 
 def _file_key(path):
@@ -239,9 +367,13 @@ class Service:
         if memo is not None and memo.text == text:
             snapshot, generation = memo.snapshot, memo.generation  # rewritten, not changed: no decode
         else:
-            snapshot, generation = (json.loads(text) if text else None), next(_GENERATION)
+            snapshot, generation = (_decode_snapshot(text) if text else None), next(_GENERATION)
         fresh = _Read(key, now, text, snapshot, generation, overlay)
         with _MEMO_LOCK:
+            if path not in _READS and len(_READS) >= MEMO_PATHS_MAX:
+                oldest = next(iter(_READS))
+                del _READS[oldest]
+                _RESULTS.pop(oldest, None)
             _READS[path] = fresh
         return fresh
 
@@ -285,9 +417,18 @@ class Service:
             result, rows = self._inventory(snap, read.overlay, copy_rows=False, carry=carry, now=now)
             acct.rows(rows.computed)
             until = min(self._flips(snap, result['data']['hosts'], now), now + REUSE_MAX_S)
+            # A late carried build must not extend original row leases through a
+            # result-memo hit. Blocks already aggregate their original deadlines.
+            if rows.blocks:
+                until = min(until, min(block[6] for block in rows.blocks))
+            elif rows.rows:
+                until = min(until, min(entry[5] + ROWS_MAX_S for entry in rows.rows.values()))
             fresh = _Result(key, now, until, result, rows)
             with _MEMO_LOCK:
-                _RESULTS[path] = fresh
+                # A concurrent cold-path read may have evicted/replaced our read
+                # while we built. Do not resurrect an orphan result cache entry.
+                if _READS.get(path) is read:
+                    _RESULTS[path] = fresh
             return fresh.view(shared, now)
 
     def _ttl(self, name):
@@ -344,6 +485,9 @@ class Service:
         ``_Carry``, and reuses each runner row whose inputs equal the carried ones (see ``inventory``)."""
         tracked = carry is not _NO_CARRY
         meta=self._meta(snap, shared=not copy_rows); c=self.config; rows=[]; projections=[]
+        # Collection timestamps repeat across rows. Bound this build-local cache;
+        # typed keys preserve numeric representation at datetime boundaries.
+        stamp = lru_cache(maxsize=256, typed=True)(iso)
         hosts=deepcopy(c['hosts'])
         if overlay is _UNREAD:
             overlay = self._read().overlay
@@ -361,30 +505,19 @@ class Service:
         built = _Carry(current, now) if tracked else None
         if carry is _NO_CARRY or (carry is not None and carry.current != current):
             carry = None
-        same_host = {}  # host id -> its result and maintenance equal the carried ones
         host_flip = {}  # host id -> _host_flip
-        for src in snap['runners'] if snap else ():
+        # Preserve first-match semantics even for callers supplying duplicate host ids.
+        maintenance_by_host = {}
+        for host in hosts:
+            maintenance_by_host.setdefault(host['id'], host['maintenance'])
+        for src in _carry_sources(snap, carry, built, host_results, maintenance_by_host,
+                                  now, rows, projections, meta['provenance']):
             rid, hid = src['id'], src.get('host_id')
             observed = snap['states'][rid]
-            maintenance=next((h['maintenance'] for h in hosts if h['id']==hid), {})
+            maintenance=maintenance_by_host.get(hid, {})
             if tracked:
                 inputs = (host_results.get(hid), maintenance)
                 built.hosts[hid] = inputs
-                entry = carry.rows.get(rid) if carry is not None else None
-                if entry is not None:
-                    if hid not in same_host:
-                        same_host[hid] = carry.hosts.get(hid, _NO_CARRY) == inputs
-                    if (same_host[hid] and entry[5] <= now < min(entry[6], entry[5] + ROWS_MAX_S)
-                            and entry[0] == src and _same_state(entry[1], observed)):
-                        provenance = entry[4]
-                        if provenance is not None and provenance['collection_id'] != observed['cycle']:
-                            provenance = dict(provenance, collection_id=observed['cycle'])
-                            entry = entry[:4] + (provenance,) + entry[5:]
-                        built.rows[rid] = entry
-                        rows.append(entry[2]); projections.append(entry[3])
-                        if provenance is not None:
-                            meta['provenance'].append(dict(provenance))
-                        continue
                 built.computed += 1
             # Only top-level keys of a row are set below: a memoized build (copy_rows=False) may share the rest.
             row=deepcopy(src) if copy_rows else dict(src)
@@ -409,21 +542,44 @@ class Service:
             if at is not None:
                 provenance = dict(
                     source_id=row['id'], collection_id=observed['cycle'],
-                    observed_at=iso(at), expires_at=iso(at+policy.inventory_ttl),
+                    observed_at=stamp(at), expires_at=stamp(at+policy.inventory_ttl),
                     state='fresh' if p.freshness == 'fresh' and not observed.get('source_error') else 'stale',
                     observation_ids=row['observation_ids'])
-                meta['provenance'].append(dict(provenance) if tracked else provenance)
+                meta['provenance'].append(provenance)
             if tracked:
                 if hid not in host_flip:
                     host_flip[hid] = self._host_flip(host_results.get(hid), maintenance, now)
                 flip = min(host_flip[hid], _next_flip((observed.get('at'),), (0, policy.inventory_ttl), now))
-                built.rows[rid] = (src, observed, row, p, provenance, now, flip)
-        for provenance in meta['provenance']:
-            if provenance['state']=='fresh' and (meta['freshness']!='fresh' or self.clock()>datetime.fromisoformat(provenance['expires_at'].replace('Z','+00:00')).timestamp()): provenance['state']='stale'
+                built.rows[rid] = (src, observed, row, p, provenance, now, flip, _state_signature(observed))
+        # Many rows share an expiry. Cache parsing within this build only; the
+        # clock is still checked for every row and no threshold is rounded.
+        expiry_times = {}
+        # Retained row provenance is immutable; freshness overlays copy on write.
+        for provenance_index, provenance in enumerate(meta['provenance']):
+            if provenance['state'] != 'fresh':
+                continue
+            if meta['freshness'] != 'fresh':
+                meta['provenance'][provenance_index] = dict(provenance, state='stale')
+                continue
+            clock = self.clock()
+            expires = provenance['expires_at']
+            if expires not in expiry_times:
+                expiry_times[expires] = datetime.fromisoformat(expires.replace('Z', '+00:00')).timestamp()
+            if clock > expiry_times[expires]:
+                meta['provenance'][provenance_index] = dict(provenance, state='stale')
         # online/busy/unverified describe CURRENT evidence (plan §3/§5: stale inventory keeps
         # last-known values per row but never counts as live); same rule as the Desktop chip.
-        current=[p for p,row in zip(projections,rows) if p.freshness=='fresh' and not snap['states'][row['id']].get('source_error') and p.registration=='online']
-        count=dict(registrations=len(rows),online=len(current),busy=sum(p.activity=='busy' for p in current),verified_ready=sum(r.ready for r in projections),readiness_unverified=sum(not p.ready for p in current),issues=sum('source_unavailable' in r.reasons or r.health in ('missing','offline','unavailable','degraded','stale','unknown','suspected_offline') for r in projections),mapped_hosts=len({r['host_id'] for r in rows if r['host_id']}),host_capacity=None)
+        if built is not None and built.blocks:
+            count = dict.fromkeys(built.blocks[0][10][0], 0)
+            mapped_hosts = set()
+            for block in built.blocks:
+                contribution, host_ids = block[10]
+                for name, value in contribution.items():
+                    count[name] += value
+                mapped_hosts.update(host_ids)
+        else:
+            count, mapped_hosts = _row_counts(rows, projections, snap['states'] if snap else {})
+        count = dict(count, mapped_hosts=len(mapped_hosts), host_capacity=None)
         state='loading' if not snap else ('ready' if snap['collection']['state']=='complete' else 'partial')
         if snap and any(p['state']!='fresh' for p in meta['provenance']): state='partial'
         if not c['scopes']: state='not_configured'
@@ -441,7 +597,6 @@ class Service:
                 expires_at=iso(at+policy.host_ttl) if at is not None else None,
                 state=('fresh' if evidence['management']=='reachable' else 'unavailable') if fresh else ('stale' if evidence else 'unknown'),
                 observation_ids=host['observation_ids']))
-        mapped_hosts={row['host_id'] for row in rows if row['host_id']}
         count['issues'] += sum(host['id'] in mapped_hosts and host['management']=='unreachable' for host in hosts)
         data=dict(state=state,collection=snap['collection'] if snap else None,counts=count,hosts=hosts,runners=rows,scopes=c['scopes'],providers=c['providers'],targets=c['execution_targets'])
         if tracked:

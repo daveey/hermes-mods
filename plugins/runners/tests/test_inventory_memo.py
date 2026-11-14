@@ -22,9 +22,9 @@ def env(tmp_path, monkeypatch):
     with Store(path) as store:
         Collector(store, cfg, Adapter(), clock=lambda: 1000, host_probe=lambda host: {}).tick()
     builds, decodes = [], []
-    real_inventory, real_loads = Service._inventory, json.loads
+    real_inventory, real_decode = Service._inventory, S._decode_snapshot
     monkeypatch.setattr(Service, '_inventory', lambda self, *a, **kw: builds.append(1) or real_inventory(self, *a, **kw))
-    monkeypatch.setattr(S.json, 'loads', lambda *a, **kw: decodes.append(1) or real_loads(*a, **kw))
+    monkeypatch.setattr(S, '_decode_snapshot', lambda *a, **kw: decodes.append(1) or real_decode(*a, **kw))
     return cfg, path, builds, decodes
 
 
@@ -42,6 +42,7 @@ def test_unchanged_inputs_reuse_the_decode_and_the_result(env):
     cfg, path, builds, decodes = env
     first = svc(cfg, path, 1001).inventory()
     n = len(decodes)
+    assert n == 1  # exercise the accelerated decoder too, not only stdlib fallback
     second = svc(cfg, path, 1002).inventory()
     assert len(builds) == 1 and len(decodes) == n  # neither decoded nor built again
     assert comparable(first) == comparable(second)
