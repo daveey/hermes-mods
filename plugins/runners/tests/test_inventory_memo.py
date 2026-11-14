@@ -98,6 +98,53 @@ def test_the_ceiling_recomputes_without_any_change(env, monkeypatch):
     assert len(builds) == 2
 
 
+@pytest.mark.parametrize('elapsed', [5.0, 5.1])
+def test_decoded_read_ceiling_finds_a_write_with_unchanged_file_key(env, monkeypatch, elapsed):
+    cfg, path, builds, decodes = env
+    monkeypatch.setattr(S, 'REUSE_MAX_S', 5.0)
+    monotonic = [100.0]
+    monkeypatch.setattr(S.time, 'monotonic', lambda: monotonic[0])
+    # Model a write missed by the stat key, not the normal key-invalidation path.
+    key = S._file_key(str(path))
+    monkeypatch.setattr(S, '_file_key', lambda _: key)
+    service = svc(cfg, path, 1001)
+    before = service._read()
+    with sqlite3.connect(path) as db:
+        snapshot = json.loads(db.execute(
+            "SELECT payload FROM collector_cache WHERE key='snapshot'").fetchone()[0])
+        snapshot['at'] = 999
+        db.execute("UPDATE collector_cache SET payload=? WHERE key='snapshot'", (json.dumps(snapshot),))
+    n = len(decodes)
+    monotonic[0] = 104.9
+    assert service._read() is before
+    assert len(decodes) == n
+    monotonic[0] = 100.0 + elapsed
+    after = service._read()
+    assert after.snapshot['at'] == 999
+    assert after.snapshot['at'] != before.snapshot['at']
+    assert after.generation != before.generation
+    assert len(decodes) == n + 1
+
+
+def test_unsupported_config_disables_result_memo(env):
+    cfg, path, builds, decodes = env
+    # ConfigFile.load validates JSON-shaped config, but Service is also constructed
+    # directly and dashboard.service() returns a detached, caller-mutable config.
+    # Pin the defensive constructor contract rather than mocking marshal itself.
+    cfg['extension'] = object()
+    service = svc(cfg, path, 1001)
+    first = service.inventory()
+    n = len(decodes)
+    second = service.inventory()
+    assert comparable(first) == comparable(second)
+    assert len(builds) == 2  # even identical unsupported config must not hit a memo
+    assert str(path) not in S._RESULTS
+    assert len(decodes) == n  # decoded database reads remain independently reusable
+    service.config['thresholds']['inventory_stale_seconds'] = 0
+    assert service.inventory()['meta']['freshness'] == 'stale'
+    assert len(builds) == 3
+
+
 def test_a_clock_step_back_recomputes(env):
     cfg, path, builds, decodes = env
     svc(cfg, path, 1010).inventory()
