@@ -306,11 +306,15 @@ _ASK = re.compile(
     re.I)
 # Mentions that are not a live ask: hypotheticals, explicit "nothing for you", past/third person.
 _NOT_ASK = re.compile(
-    r"\b(if you (ever|later|still|prefer|want|need|would)|unless|in case|whenever you|no action (is )?needed|"
+    r"\b(if you(?: (?:ever|later|still|prefer|want|need|would)|['’]d)|unless|in case|whenever you|no action (is )?needed|"
     r"nothing (is )?(waiting|needed|needs?) (on|from|for) you|nothing for you|you (already|have already)|"
     r"you (said|answered|approved|asked)|don'?t need (anything|you)|no (more|further) (input|action)|"
     r"the card asks|it asked|would have asked|next time)\b",
     re.I)
+# "I'll let X go ahead / I'll have it run / I'll keep the old cap": the assistant names what happens if the user is silent.
+_FIRST_PERSON_DEFAULT = (
+    r"\bi(?:'ll| will)\s+(?:just\s+)?(?:(?:let|have)\b[^.?!;]{0,80}?\b"
+    r"(?:go ahead|proceed|continue|run|land|ship|keep|leave)|keep|leave|go ahead|proceed|continue)\b")
 # An optional offer that states what the assistant does if the user stays silent. It blocks nothing, so it must not mint
 # a For-you request even under a "Decision for you" label. Checked on the whole source paragraph, not only the span.
 _SILENT_DEFAULT = re.compile(
@@ -318,7 +322,13 @@ _SILENT_DEFAULT = re.compile(
     r"|\bif you (?:say|reply|respond|tell me) nothing\b|\bif you (?:don'?t|do not) (?:reply|respond|say|answer|object)\b"
     r"|\bsilence (?:means|=|is)\b|\botherwise,? i(?:'ll| will) (?:keep|leave|go with|stay|stick)\b"
     r"|\b(?:the|my) default is\b"
-    r"|\bunless you\b[^.?!]{0,100}\b(?:it )?(?:stays?|remains?)\b",
+    r"|\bunless you\b[^.?!]{0,100}\b(?:it )?(?:stays?|remains?)\b"
+    # House-style optional offer: a first-person default, then (same paragraph) an invitation to object:
+    # "I'll let the throttle go ahead; say if you'd rather not", "I'll let the sweep run; tell me if you'd rather stop".
+    rf"|{_FIRST_PERSON_DEFAULT}[^?]{{0,200}}?\b(?:say (?:so )?if you(?:'d| would)? "
+    r"(?:rather|prefer|want|like|don'?t want|do not want|object)|tell me if you(?:'d| would)? rather)\b"
+    # ... or such a default in a paragraph labelled "Optional:".
+    rf"|(?:^|\n)\s*(?:[-*•]\s*)?optional\s*:[^?]{{0,200}}?{_FIRST_PERSON_DEFAULT}",
     re.I)
 # What still counts as a real, blocking ask inside a paragraph that states a default: a question, or an explicit
 # demand for a yes/no or a reply. A bare imperative ("Decide whether...") is exactly how an optional offer is worded.
