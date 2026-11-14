@@ -1020,6 +1020,138 @@ def local_git_verifier(monkeypatch, tmp_path, repo, failure=None):
     return calls
 
 
+def test_head_only_fetch_preserves_depth_for_oldest_carried_merge(monkeypatch, tmp_path, git_history):
+    """Real shallow history: three carry merges must not consume the tips' depth budget."""
+    import os
+    repo, heads = git_history
+    _, approved, theirs = heads["clean"]
+
+    def git(*args):
+        return REAL_RUN(["git", "-c", "user.name=test", "-c", "user.email=test@example.com",
+                         "-c", "core.hooksPath=/dev/null", *args], cwd=repo,
+                        env={**os.environ, "GIT_AUTHOR_DATE": "2026-11-13T17:00:00Z",
+                             "GIT_COMMITTER_DATE": "2026-11-13T17:00:00Z"},
+                        capture_output=True, text=True, check=True).stdout.strip()
+
+    tree = git("rev-parse", approved + "^{tree}")
+    ours = approved
+    # Fixed boundary, not derived from the production depth (a changed budget must fail).
+    for i in range(125):
+        ours = git("commit-tree", tree, "-p", ours, "-m", f"reviewed history {i}")
+    oldest = None
+    head = ours
+    for i in range(3):
+        merged_tree = git("merge-tree", "--write-tree", head, theirs)
+        merge = git("commit-tree", merged_tree, "-p", head, "-p", theirs, "-m", f"carry {i}")
+        if oldest is None:
+            oldest = (merge, head, theirs)
+        head = merge
+    assert oldest is not None
+    local_git_verifier(monkeypatch, tmp_path, repo)
+    env = {"HERMES_HOME": str(tmp_path / "home")}
+    # Control: the previous per-merge fetch can prove this oldest merge.
+    assert GIT_VERIFY(*oldest, R, None, env) == ""
+    objects = g._CarryObjects(R, env, (head,), chain=True)
+    try:
+        assert objects.fetch() == ""
+        # No stubbed verify or depth-argv assertion: merge-base and merge-tree run on fetched objects.
+        assert objects.verify(*oldest) == ""
+        assert objects.merge_base(oldest[1], oldest[2]) == git("merge-base", oldest[1], oldest[2])
+    finally:
+        objects.close()
+
+
+@pytest.mark.parametrize("owner", ["shared", "per-call", "git-verifier"])
+@pytest.mark.parametrize("outcome", ["success", "refusal", "exception"])
+def test_owned_carry_store_explicitly_closes_before_return(
+        monkeypatch, tmp_path, git_history, owner, outcome):
+    repo, heads = git_history
+    merge, ours, theirs = heads["clean"]
+    local_git_verifier(monkeypatch, tmp_path, repo)
+    retained = []
+    original_init = g._CarryObjects.__init__
+
+    def retain(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        retained.append(self)  # Prevent TemporaryDirectory's finalizer masking a missing close().
+    monkeypatch.setattr(g._CarryObjects, "__init__", retain)
+
+    def result():
+        if outcome == "exception":
+            raise g._Unreadable("injected proof error")
+        return "" if outcome == "success" else "injected proof refusal"
+
+    def chain(head, h0, repo, cwd, env, objects):
+        assert objects.fetch() == ""
+        assert Path(objects.path).is_dir()
+        why = result()
+        return (not why, why or h0)
+
+    if owner == "git-verifier":
+        def verify(self, *args):
+            assert Path(self.path).is_dir()
+            return result()
+        monkeypatch.setattr(g._CarryObjects, "verify", verify)
+    else:
+        monkeypatch.setattr(g, "_carry_chain", chain)
+    env = {"HERMES_HOME": str(tmp_path / "home")}
+
+    def call():
+        if owner == "shared":
+            data = payload([review(f"Independent exact-head review at {ours}. **Verdict: approve**", commit=ours)])
+            return g._carried_approval(merge, data, R, None, env)
+        if owner == "per-call":
+            return g._carry_one(merge, ours, False, R, None, env)
+        return GIT_VERIFY(merge, ours, theirs, R, None, env)
+
+    try:
+        if outcome == "exception":
+            with pytest.raises(g._Unreadable, match="injected proof error"):
+                call()
+        else:
+            answer = call()
+            if owner == "git-verifier":
+                assert answer == ("" if outcome == "success" else "injected proof refusal")
+            else:
+                assert answer == ((True, ours) if outcome == "success" else (False, "injected proof refusal"))
+        assert len(retained) == 1
+        assert retained[0]._settled.is_set()
+        assert retained[0].path is not None
+        assert not Path(retained[0].path).exists(), "owned store leaked before finalization"
+    finally:
+        # Test cleanup even on a mutant's failed assertion; never rely on GC here either.
+        for objects in retained:
+            objects.close()
+
+
+@pytest.mark.parametrize("local_result", ["valid", "multiple", "cut", "unreadable", "not-ready"])
+def test_local_merge_base_refusal_uses_api_fallback(monkeypatch, local_result):
+    objects = g._CarryObjects(R, {}, (H,), chain=True)
+    objects._why = "fetch refused" if local_result == "not-ready" else ""
+    objects.settle()
+    api_calls = []
+
+    def base(ours, theirs):
+        assert (ours, theirs) == (H0, BASE_TIP)
+        if local_result == "unreadable":
+            raise g._Unreadable("git merge-base exited 1")
+        if local_result == "valid":
+            return STATE_OLD, ""
+        return "", ("merge base is unreadable or multiple (cannot prove bounded history)"
+                    if local_result == "multiple" else "fetch depth cuts history before the merge base")
+
+    def api(path, cwd, env):
+        api_calls.append(path)
+        return merge_base(STATE_OLD)
+    monkeypatch.setattr(objects, "_base", base)
+    monkeypatch.setattr(g, "_gh_json", api)
+    try:
+        assert g._carry_merge_base(H0, BASE_TIP, R, None, {}, objects) == STATE_OLD
+        assert api_calls == ([] if local_result == "valid" else [f"repos/{R}/compare/{H0}...{BASE_TIP}"])
+    finally:
+        objects.close()
+
+
 def test_git_verifier_rejects_rename_delete_conflict(monkeypatch, tmp_path, git_history):
     repo, heads = git_history
     local_git_verifier(monkeypatch, tmp_path, repo)
