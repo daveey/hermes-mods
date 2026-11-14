@@ -218,8 +218,34 @@ class CustomEntryOriginFence(unittest.TestCase):
             probe_custom_entry_choice(self.PROXY, providers={'anthropic': {'base_url': self.PROXY}}),
             "A built-in account's key followed providers.anthropic to another host")
 
+    def test_classifier_exception_rejects_before_reading_credentials(self):
+        selection = _load_selection()
+        from agent.account_usage_cache import _identity_id_for
+        from unittest.mock import MagicMock
+        row = PooledCredential(provider='anthropic', id='builtin', label='builtin',
+                               auth_type='api_key', priority=0, source='manual',
+                               access_token='fixture-builtin-not-a-secret', last_status='ok')
+        account_id = _identity_id_for('anthropic', row)
+        entries = MagicMock()
+        entries.__iter__.return_value = iter([row])
+        # A route-classification failure must stop selection before even reading
+        # the supplied rows, not merely fail later because no account matches.
+        with patch('agent.custom_entry_pool.is_custom_runtime',
+                   side_effect=RuntimeError('fixture classifier failure')) as classify:
+            with self.assertRaisesRegex(selection.SelectionRejected, 'custom provider endpoint'):
+                selection.choose_snapshot(
+                    entries, provider='anthropic', model='claude-fixture',
+                    account_id=account_id, base_url=self.PROXY)
+        classify.assert_called_once_with('anthropic', None, self.PROXY)
+        self.assertEqual(entries.mock_calls, [])
+
     def test_builtin_route_still_selects(self):
         self.assertEqual(probe_custom_entry_choice('https://api.anthropic.com'), 'builtin')
+
+    def test_classifier_builtin_verdict_still_selects(self):
+        with patch('agent.custom_entry_pool.is_custom_runtime', return_value=False) as classify:
+            self.assertEqual(probe_custom_entry_choice('https://api.anthropic.com'), 'builtin')
+        classify.assert_called_once_with('anthropic', None, 'https://api.anthropic.com')
 
 
 if __name__ == '__main__':
