@@ -204,6 +204,32 @@ class SwapCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn('row loss in session_change', result.stderr)
 
+    def test_throughput_cursor_policy_without_core(self):
+        # Public CI has no core. Exercise the exact-name policy there as well as
+        # the real SessionDB/recovery/CLI integration below on core-equipped hosts.
+        spec = importlib.util.spec_from_file_location('swap_policy_fixture', SCRIPT)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for table in ('throughput_revision', 'throughput_anchors', 'throughput_changes'):
+            with self.subTest(table=table):
+                self.add(self.db, f'CREATE TABLE {table}(id TEXT); INSERT INTO {table} VALUES("old"),("history");')
+                self.add(self.replacement, f'CREATE TABLE {table}(id TEXT); INSERT INTO {table} VALUES("new");')
+                module._policy(self.db, self.replacement, recovered=True, ack=True)
+                with self.assertRaisesRegex(module.Refusal, 'row loss in ' + table):
+                    module._policy(self.db, self.replacement, recovered=False, ack=True)
+                self.add(self.replacement, f'DROP TABLE {table};')
+                module._policy(self.db, self.replacement, recovered=True, ack=True)
+                with self.assertRaisesRegex(module.Refusal, 'replacement lacks durable/unknown tables'):
+                    module._policy(self.db, self.replacement, recovered=False, ack=True)
+                self.add(self.db, f'DROP TABLE {table};')
+        self.add(self.db, 'CREATE TABLE throughput_unknown(id TEXT); INSERT INTO throughput_unknown VALUES("durable");')
+        with self.assertRaisesRegex(module.Refusal, 'replacement lacks durable/unknown tables'):
+            module._policy(self.db, self.replacement, recovered=True, ack=True)
+        self.add(self.replacement, 'CREATE TABLE throughput_unknown(id TEXT); INSERT INTO throughput_unknown VALUES("changed");')
+        with self.assertRaisesRegex(module.Refusal, 'content changed in throughput_unknown'):
+            module._policy(self.db, self.replacement, recovered=True, ack=True)
+
     def test_fk_failure(self):
         self.add(self.replacement, 'CREATE TABLE parent(id INTEGER PRIMARY KEY); CREATE TABLE child(pid INTEGER REFERENCES parent(id)); INSERT INTO child VALUES(99);')
         result = self.cli('--stop-unit', 'fixture.service')
@@ -354,8 +380,7 @@ class SwapCLI(unittest.TestCase):
         self.assertTrue(Path(str(self.db) + '.swap-pending.json').exists())
         self.assertEqual((self.root / 'units.log').read_text(), '--user stop -- fixture.service\n')
 
-    @needs_proc
-    def test_actual_sessions_recover_then_install(self):
+    def recover_actual_sessions(self):
         self.state()
         self.db.unlink()
         self.replacement.unlink()
@@ -365,15 +390,58 @@ class SwapCLI(unittest.TestCase):
                          + 'db.create_session("fixture-session", "cli")\ndb.close()\n')
         seed = subprocess.run([sys.executable, str(setup)], env=self.env, capture_output=True, text=True, timeout=60)
         self.assertEqual(seed.returncode, 0, seed.stdout + seed.stderr)
+        self.add(self.db, "INSERT INTO messages(session_id,role,content,timestamp) "
+                         "VALUES ('fixture-session','user','preserve transcript',1);"
+                         "INSERT INTO session_model_usage(session_id,model,input_tokens,output_tokens) "
+                         "VALUES ('fixture-session','fixture-model',10,20);")
+        # Repeated writes create history that recovery deliberately does not copy.
+        for _ in range(4):
+            self.add(self.db, 'UPDATE session_model_usage SET input_tokens=input_tokens+1;')
         report = self.root / 'recover.json'
         recovery = subprocess.run([sys.executable, '-m', 'hermes_cli.main', 'sessions', 'recover',
                                    '--source', str(self.db), '--output', str(self.replacement),
                                    '--report', str(report)], env=self.env, capture_output=True, text=True, timeout=120)
         self.assertEqual(recovery.returncode, 0, recovery.stdout + recovery.stderr)
         self.assertTrue(report.exists())
+
+    @needs_proc
+    def test_actual_sessions_recover_then_install(self):
+        self.recover_actual_sessions()
+        with contextlib.closing(sqlite3.connect(self.db)) as old, \
+                contextlib.closing(sqlite3.connect(self.replacement)) as new:
+            for table in ('sessions', 'messages', 'session_model_usage'):
+                self.assertEqual(old.execute('SELECT * FROM ' + table).fetchall(),
+                                 new.execute('SELECT * FROM ' + table).fetchall(), table)
+            old_epoch = old.execute('SELECT epoch FROM throughput_revision').fetchone()[0]
+            self.assertNotEqual(old_epoch, new.execute('SELECT epoch FROM throughput_revision').fetchone()[0])
+            self.assertGreater(old.execute('SELECT count(*) FROM throughput_anchors').fetchone()[0],
+                               new.execute('SELECT count(*) FROM throughput_anchors').fetchone()[0])
         self.successful(self.cli('--recovered-state', '--ack-runtime-loss'))
         with contextlib.closing(sqlite3.connect(self.db)) as con:
             self.assertEqual(con.execute('SELECT id FROM sessions').fetchall(), [('fixture-session',)])
+            self.assertEqual(con.execute('SELECT content FROM messages').fetchall(), [('preserve transcript',)])
+            self.assertEqual(con.execute('SELECT input_tokens,output_tokens FROM session_model_usage').fetchall(),
+                             [(14, 20)])
+
+    @needs_proc
+    def test_actual_recovery_rejects_changed_usage(self):
+        self.recover_actual_sessions()
+        self.add(self.replacement, 'UPDATE session_model_usage SET input_tokens=999;')
+        result = self.cli('--recovered-state', '--ack-runtime-loss')
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('durable/idempotency content changed in session_model_usage', result.stderr)
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            self.assertEqual(con.execute('SELECT input_tokens FROM session_model_usage').fetchall(), [(14,)])
+
+    @needs_proc
+    def test_actual_recovery_rejects_changed_transcript(self):
+        self.recover_actual_sessions()
+        self.add(self.replacement, "UPDATE messages SET content='changed';")
+        result = self.cli('--recovered-state', '--ack-runtime-loss')
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('durable/idempotency content changed in messages', result.stderr)
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            self.assertEqual(con.execute('SELECT content FROM messages').fetchall(), [('preserve transcript',)])
 
     @needs_proc
     def test_recheck_before_rename(self):

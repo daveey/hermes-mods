@@ -30,10 +30,16 @@ DERIVED_TABLES = frozenset({
     'messages_fts_trigram', 'messages_fts_trigram_data', 'messages_fts_trigram_idx',
     'messages_fts_trigram_docsize', 'messages_fts_trigram_config',
 })
-# hermes_state_session_change: a derived per-session change cursor. Every current writer (re)installs
-# it with a rotated install epoch, after which readers distrust any older cursor and do a full read;
-# recovery rebuilds it from the copied sessions, so its rows and epoch legitimately differ.
-CURSOR_TABLES = frozenset({'session_change', 'session_change_revision'})
+# hermes_state_session_change and hermes_cli.session_throughput_revision: derived change
+# cursors, not canonical usage or idempotency data. Recovery creates a fresh SessionDB and
+# copies sessions/session_model_usage; triggers regenerate journals with fresh epochs/nonces.
+# Throughput readers fence their memo by epoch and anchor history (and file identity), then
+# reload canonical contributions. Preserving old cursor bytes would falsely certify history.
+# Keep exact names: session_model_usage and unknown throughput_* tables remain durable.
+CURSOR_TABLES = frozenset({
+    'session_change', 'session_change_revision',
+    'throughput_revision', 'throughput_anchors', 'throughput_changes',
+})
 GENERATED_META_KEYS = frozenset({
     'fts_storage_version', 'fts_optimize_available', 'fts_rebuild_high_water', 'fts_rebuild_progress',
     'fts_cjk_stale', 'fts_cjk_rebuild_high_water', 'fts_cjk_rebuild_progress',
