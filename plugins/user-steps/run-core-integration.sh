@@ -16,7 +16,12 @@ done
 plugins="$(cd "$(dirname "$0")/.." && pwd)"
 fixtures="$(mktemp -d "$core/.user-steps-integration.XXXXXX")"
 trap 'rm -rf -- "$fixtures"' EXIT
-cp -R "$plugins/user-steps" "$fixtures/user-steps"
-cp -R "$plugins/ask-gate" "$fixtures/ask-gate"
+# Preserve the repository layout for cross-producer and Desktop contract tests.
+mkdir -p "$fixtures/plugins/coach" "$fixtures/desktop-plugins"
+for plugin in user-steps ask-gate session-outcome open-asks; do
+  cp -R "$plugins/$plugin" "$fixtures/plugins/$plugin"
+done
+cp "$plugins/coach/placement_evidence.py" "$fixtures/plugins/coach/placement_evidence.py"
+cp -R "$plugins/../desktop-plugins/user-steps" "$fixtures/desktop-plugins/user-steps"
 cd "$core"
-scripts/run_tests.sh "$fixtures/user-steps/tests" -p tests.conftest --file-retries 0 --tb=short "$@"
+scripts/run_tests.sh "$fixtures/plugins/user-steps/tests" -p tests.conftest --file-retries 0 --tb=short "$@"
