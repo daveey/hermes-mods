@@ -3,8 +3,8 @@
 P1 measured the fleet panel's inventory reads at 0.8% of one core in the busiest serve: on main every
 ``_ci_section`` call decoded the 2.4 MB snapshot twice (inventory and host load) and deep-copied every runner row.
 This replays the hub's measured change shape (hub 2026-11-13, 1.9k runners: the collector rewrites the snapshot every
-~30 s; between snapshots ``processed_at`` moves on ~95% of runner states, ~5% are re-observed, and the two host
-results move every other snapshot) with a fleet build every FLEET_CACHE_S = 5 s. It measures thread CPU of main's
+~30 s; between snapshots ``processed_at`` moves on all runner states, ~5% are re-observed, and the host
+result moves every other snapshot) with a fleet build every FLEET_CACHE_S = 5 s. It measures thread CPU of main's
 per-call work and of the card L path over the same replay. The absolute thread CPU / replay duration must
 remain within 0.1% of one core; the historical P1-scaled ratio is an additional check, not the budget proof.
 The fixture includes 556 scope/coverage/provenance entries and 221 source errors, matching the measured

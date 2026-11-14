@@ -9,6 +9,7 @@ import math
 import os
 import pickle
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 import sqlite3
 import threading
@@ -374,6 +375,9 @@ class Service:
         ``_Carry``, and reuses each runner row whose inputs equal the carried ones (see ``inventory``)."""
         tracked = carry is not _NO_CARRY
         meta=self._meta(snap, shared=not copy_rows); c=self.config; rows=[]; projections=[]
+        # Collection timestamps repeat across rows. Bound this build-local cache;
+        # typed keys preserve numeric representation at datetime boundaries.
+        stamp = lru_cache(maxsize=256, typed=True)(iso)
         hosts=deepcopy(c['hosts'])
         if overlay is _UNREAD:
             overlay = self._read().overlay
@@ -443,7 +447,7 @@ class Service:
             if at is not None:
                 provenance = dict(
                     source_id=row['id'], collection_id=observed['cycle'],
-                    observed_at=iso(at), expires_at=iso(at+policy.inventory_ttl),
+                    observed_at=stamp(at), expires_at=stamp(at+policy.inventory_ttl),
                     state='fresh' if p.freshness == 'fresh' and not observed.get('source_error') else 'stale',
                     observation_ids=row['observation_ids'])
                 meta['provenance'].append(dict(provenance) if tracked else provenance)
@@ -452,8 +456,21 @@ class Service:
                     host_flip[hid] = self._host_flip(host_results.get(hid), maintenance, now)
                 flip = min(host_flip[hid], _next_flip((observed.get('at'),), (0, policy.inventory_ttl), now))
                 built.rows[rid] = (src, observed, row, p, provenance, now, flip)
+        # Many rows share an expiry. Cache parsing within this build only; the
+        # clock is still checked for every row and no threshold is rounded.
+        expiry_times = {}
         for provenance in meta['provenance']:
-            if provenance['state']=='fresh' and (meta['freshness']!='fresh' or self.clock()>datetime.fromisoformat(provenance['expires_at'].replace('Z','+00:00')).timestamp()): provenance['state']='stale'
+            if provenance['state'] != 'fresh':
+                continue
+            if meta['freshness'] != 'fresh':
+                provenance['state'] = 'stale'
+                continue
+            clock = self.clock()
+            expires = provenance['expires_at']
+            if expires not in expiry_times:
+                expiry_times[expires] = datetime.fromisoformat(expires.replace('Z', '+00:00')).timestamp()
+            if clock > expiry_times[expires]:
+                provenance['state'] = 'stale'
         # online/busy/unverified describe CURRENT evidence (plan §3/§5: stale inventory keeps
         # last-known values per row but never counts as live); same rule as the Desktop chip.
         current=[p for p,row in zip(projections,rows) if p.freshness=='fresh' and not snap['states'][row['id']].get('source_error') and p.registration=='online']
