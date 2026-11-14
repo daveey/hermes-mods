@@ -18,7 +18,10 @@ Where the same account implements and reviews, add `--review-task <done-card> --
 The installed `hermes-core-wt-land` review validator must be present; its read-only `review_gate` validates
 the completed run/session evidence, locally or through authenticated Board execution records. There is
 no caller-supplied receipt file, approval carry or fallback to prose. Missing/incompatible validation holds.
-Reviews with unanswered non-blocking points are conservatively held; obtain a clean follow-up review.
+A review card listing non-blocking points is held until a non-bot PR comment containing
+`<!-- hermes-review-reply -->` is posted after the review completed ("fixed in <sha>", "declined: <reason>",
+"follow-up <card>" or "refuted: <evidence>"), the same rule as `hermes-core-wt-land`'s `review_reply_guard`.
+That installed guard also runs (it never posts), so points in GitHub review bodies need the same answer.
 
 Raw `gh pr merge`, REST PUT (gh/curl/Python), GraphQL merge and auto-merge requests are refused even with
 no `push-guards.json`; `PUSH_GUARD=off` does not bypass this PR-only policy. Cancel-auto and GET remain reads.

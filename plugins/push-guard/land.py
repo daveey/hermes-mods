@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 from datetime import datetime
 import json
 from pathlib import Path
@@ -158,6 +159,52 @@ def reviews(read, number, head, pr):
     return effective
 
 
+REVIEW_REPLY_MARKER = "<!-- hermes-review-reply -->"
+
+
+def _epoch(stamp):
+    """Epoch seconds of a Kanban completion stamp (seconds, milliseconds or ISO-8601 UTC), else None."""
+    if isinstance(stamp, bool):
+        return None
+    if isinstance(stamp, str) and re.fullmatch(r"\d+(\.\d+)?", stamp.strip()):
+        stamp = float(stamp)
+    if isinstance(stamp, (int, float)):
+        return float(stamp) / 1000 if stamp > 1e11 else float(stamp) if stamp > 0 else None
+    if isinstance(stamp, str) and stamp.strip():
+        try:
+            parsed = datetime.fromisoformat(stamp.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed.timestamp() if parsed.tzinfo else None
+    return None
+
+
+def points_answered(read, number, receipt):
+    """Refuse while the approving review card lists non-blocking points that no non-bot PR comment marked
+    REVIEW_REPLY_MARKER answers after the review completed (hermes-core-wt-land review_reply_guard's rule).
+    Reply forms: "fixed in <sha>", "declined: <reason>", "follow-up <card>", "refuted: <evidence>"."""
+    points = receipt.get("non_blocking")
+    if not points:
+        return
+    if not isinstance(points, list):
+        raise Refused("Malformed review points in the review receipt")
+    done = _epoch(receipt.get("completed_at"))
+    if done is None:
+        raise Refused("Review lists non-blocking points but its completion time is unreadable; "
+                      "no PR reply can be shown to answer them")
+    for comment in pages(read, f"repos/{REPO}/issues/{number}/comments"):
+        user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        login = user.get("login")
+        bot = user.get("type") != "User" or not identity(login) or login.endswith("[bot]")
+        at = _epoch(comment.get("created_at"))
+        if not bot and REVIEW_REPLY_MARKER in str(comment.get("body") or "") and at is not None and at > done:
+            return
+    quoted = "; ".join(f'"{p}"' for p in points)
+    raise Refused(f"Unanswered review points: {quoted}. Answer each in PR #{number} with a comment containing "
+                  f'{REVIEW_REPLY_MARKER} ("fixed in <sha>", "declined: <reason>", "follow-up <card>" or '
+                  '"refuted: <evidence>") posted after the review completed')
+
+
 def approval(read, number, head, pr, review_task, implementation_task):
     effective = reviews(read, number, head, pr)
     if review_task:
@@ -183,9 +230,17 @@ def approval(read, number, head, pr, review_task, implementation_task):
                                            impl_task=implementation_task,
                                            approved_sha="", pr_reuse_s=0.0)
         if (receipt.get("verdict") != "approve" or receipt.get("reviewed_sha") != head
-                or receipt.get("reviewed_pr") != f"https://github.com/{REPO}/pull/{number}"
-                or receipt.get("non_blocking")):
-            raise Refused("Invalid review receipt or unanswered review points")
+                or receipt.get("reviewed_pr") != f"https://github.com/{REPO}/pull/{number}"):
+            raise Refused("Invalid review receipt")
+        points_answered(read, number, receipt)
+        thread_guard = validator.get("review_reply_guard")
+        if callable(thread_guard):
+            # Parity with hermes-core-wt ship: the installed guard also reads every PR review body for points.
+            # It never posts here (empty reply); its progress lines go to stderr so stdout stays one JSON line.
+            with contextlib.redirect_stdout(sys.stderr):
+                code, why = thread_guard(Reader(), REPO, {"number": number}, receipt, "")
+            if code is not None:
+                raise Refused(f"Unanswered review points: {why}")
         return receipt
     author = pr.get("user", {}).get("login")
     user = read("api", "user")
