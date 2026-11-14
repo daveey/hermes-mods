@@ -30,6 +30,10 @@ def test_cli_budget_exit(world, monkeypatch, diagnostic, expected, tmp_path):
         assert 'HERMES_KANBAN_DB' not in os.environ
         assert kanban_db_path() == home / 'kanban.db'
         assert ksa._hub_db_path() == home / 'hub.db'
+        import sqlite3
+        with sqlite3.connect(home / 'hub.db') as conn:
+            assert {r[1] for r in conn.execute('PRAGMA table_info(replica)')} == {
+                'gw', 'coll', 'key', 'version', 'seq', 'data', 'updated_at'}
         return load(path)
     monkeypatch.setattr(bench, 'load_plugin', isolated_load)
     monkeypatch.setattr(bench, 'budget_failures', lambda values: ['forced overrun'])
