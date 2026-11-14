@@ -55,7 +55,7 @@ TASK_BINDING_PLATFORMS = frozenset({"", "cli", "tui", "local", "desktop"})
 DEFAULT_BOT_PROFILES = ("bb-tuner", "coach")  # cron profiles whose reports go to David and are judged like a chat reply
 _SUBAGENTS: set[str] = set()                  # sessions seen with a parent_session_id (delegate_task children)
 MAX_NUDGES = 2
-LOG = core.TurnLog()
+LOG = core.TurnLog(core.shared_turn_state(str(core.home())))  # survives a mid-turn plugin reload
 _LEDGER: dict[str, Any] = {}
 
 
