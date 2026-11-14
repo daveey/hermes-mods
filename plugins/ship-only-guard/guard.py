@@ -1904,6 +1904,27 @@ def _prefetch_holders(numbers, repo, cwd, env):
         t.join()      # every call inside is capped by the shared deadline
 
 
+def effective_turns(turns, eligible, check):
+    """Yield effective holders from a complete supplied snapshot, without IO.
+
+    Eligibility and deadline checks are caller-owned; exceptions propagate rather
+    than promoting a waiter on missing evidence. Owner/board projection must happen
+    after this selection, since foreign and ownerless tickets still block peers.
+    Lazy iteration preserves merge preflight's early stop at its own ticket.
+    """
+    effective = []
+    for ref, rec in sorted(turns, key=lambda item: _turn_order(item[1])):
+        check()
+        if any(turn_blocks(r["files"], rec["files"]) or turn_blocks(rec["files"], r["files"])
+               for r in effective):
+            continue
+        active = eligible(ref, rec)
+        check()
+        if active:
+            effective.append(rec)
+            yield ref, rec
+
+
 def _turn_hold_refusal_scoped(number, data, repo, cwd, env):
     deadline = _ELIGIBILITY_DEADLINE.get() or time.monotonic() + 30
     files = [f["path"] for f in data.get("files") or [] if isinstance(f, dict) and isinstance(f.get("path"), str)]
@@ -1933,27 +1954,21 @@ def _turn_hold_refusal_scoped(number, data, repo, cwd, env):
         if rec["pr"] in relevant:
             older.append(rec["pr"])
     _prefetch_holders(older, repo, cwd, env)
-    effective = []
-    for ref, rec in turns:
+    def check():
         if time.monotonic() >= deadline:
             raise _Unreadable("state land-turn eligibility deadline exceeded; retry complete snapshot")
-        if rec["pr"] not in relevant:
-            continue
-        # A waiting turn cannot reserve additional areas from later PRs. This
-        # matters when overlap is non-transitive (A~B, B~C, but not A~C).
-        if any(turn_blocks(r["files"], rec["files"]) or turn_blocks(rec["files"], r["files"])
-               for r in effective):
-            continue
+        _elig_cap(1)
+
+    def eligible(ref, rec):
         holder = data if rec["pr"] == int(number) else _turn_holder_data(rec["pr"], repo, cwd, env)
-        _elig_cap(1)              # cached/late holder results must respect the same eligibility deadline
+        check()
         if holder.get("state") != "OPEN":
             _turn_delete(ref, repo, cwd, env)
-            continue
-        yielded = _turn_yielded(rec, holder, repo, cwd, env)
-        _elig_cap(1)              # includes time spent joining speculative edge reads after a decision
-        if yielded:
-            continue
-        effective.append(rec)
+            return False
+        return not _turn_yielded(rec, holder, repo, cwd, env)
+
+    selected = ((ref, rec) for ref, rec in turns if rec["pr"] in relevant)
+    for ref, rec in effective_turns(selected, eligible, check):
         if rec["pr"] == int(number):
             return None
         hit = turn_blocks(rec["files"], files) or turn_blocks(files, rec["files"])
