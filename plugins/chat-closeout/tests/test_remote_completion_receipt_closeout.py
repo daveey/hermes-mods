@@ -138,6 +138,43 @@ def test_fresh_remote_receipt_reaches_closeout_prompt_with_source(world):
     assert "evidence" in prompt and '"verification":"reported"' in prompt
 
 
+def test_waiting_source_consumes_real_remote_producer(world, tmp_path, monkeypatch):
+    """Unlike replay's empty remote inventory, route a real owner observation through waiting."""
+    world['now'][0] = T0 + 1
+    rows = plugin.remote_cards()
+    assert len(rows) == 1 and rows[0]['completion_receipt'] == receipt()
+    key = rows[0]['key']
+    led = core.Ledger(tmp_path / 'closeout.db')
+    led.write('chat', batch=[key], open=[])
+    monkeypatch.setattr(plugin, 'ledger', lambda: led)
+    monkeypatch.setattr(plugin, 'state_dbs', lambda: [])
+    monkeypatch.setattr(plugin, 'session_proof', lambda *a: False)
+    monkeypatch.delenv('CHAT_CLOSEOUT_OFF', raising=False)
+    real_remote = plugin.remote_cards
+    calls = []
+
+    def remote():
+        result = real_remote()
+        calls.append(result)
+        return result
+
+    monkeypatch.setattr(plugin, 'remote_cards', remote)  # spy, not a substitute producer
+    plugin._wi_reset()
+    try:
+        plugin._state.pop('waiting_cache', None)
+        assert plugin.waiting_source() == {'chat': [key]}
+        assert len(calls) == 1
+        assert calls[0][0]['completion_receipt'] == receipt()
+        world['now'][0] = T0 + 1000
+        plugin._state.pop('waiting_cache', None)
+        assert plugin.waiting_source() == {}
+        assert len(calls) == 2
+        assert calls[-1][0]['stale'] is True
+    finally:
+        plugin._wi_reset()
+        plugin._state.pop('waiting_cache', None)
+
+
 def test_stale_remote_receipt_stays_historical_not_released_or_authorized(world):
     world['now'][0] = T0 + 1000
     cards = [c for c in plugin.remote_cards() if c.get('via') == 'origin']
