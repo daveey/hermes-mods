@@ -2514,78 +2514,74 @@ def _git_calls(cmd: str, cwd: Optional[str], depth: int = 0):
 
 
 def _may_define_alias(text: str) -> bool:
-    """Whether the word ``alias`` in ``text`` may be a shell alias definition.
+    """Keep whole-text taint except for literal arguments of known data consumers.
 
-    Any alias can map a bare name to git, so the pre-scan taints every unmodeled bare name.
-    Prose inside a quoted data argument (``--review-reply 'alias/import nit'``) is not a
-    definition: it never reaches a command position. An occurrence counts when it is unquoted,
-    or in a quoted string where it starts a command (string start, after ``;&|(){}`` or a
-    newline, after ``$(`` or a backtick, or after a command-prefix word such as ``eval``). Text
-    this small scanner cannot bound exactly (heredocs, ANSI-C quotes, substitutions inside
-    double quotes, an unterminated quote) keeps the whole-text reading.
+    Quoted words are not inherently inert: eval can join them, store them, or
+    place them behind arbitrary shell grammar. Do not classify prose by its
+    contents. Only a single, expansion-free brokered ship command has known
+    --reason/--review-reply data positions. Everything else keeps the old taint.
     """
     if not re.search(r"\balias\b", text):
         return False
-    if "<<" in text or "$'" in text or '$"' in text:
+    # The activation adapter joins command/input/data with semicolons, including
+    # empty fields. Trailing empty statements cannot introduce executable text.
+    text = re.sub(r'(?:[ \t]*;[ \t]*)+$', '', text)
+    # A deliberately tiny simple-command grammar: no expansion, escapes,
+    # comments, operators, or newlines.
+    # Adjacent fragments are kept as one word, never classified independently.
+    token = re.compile(r"(?:'[^'\n]*'|\"[^\"\n]*\"|[^\s'\";&|()<>{}#$`\\]+)+")
+    words, spans = [], []
+    end = 0
+    for match in token.finditer(text):
+        gap = text[end:match.start()]
+        if (end and not gap) or any(c not in ' \t' for c in gap):
+            return True
+        raw = match.group()
+        if any(c in raw for c in '$`\\'):
+            return True
+        words.append(shlex.split(raw)[0])
+        spans.append(raw)
+        end = match.end()
+    if any(c not in ' \t' for c in text[end:]) or not words:
         return True
-    unquoted, quoted = [], []
-    i, n = 0, len(text)
-    while i < n:
-        ch = text[i]
-        if ch == "\\":
-            unquoted.append(text[i:i + 2])
-            i += 2
-        elif ch in "'\"":
-            j, body = i + 1, []
-            while True:
-                if j >= n:
-                    return True  # unterminated quote
-                c = text[j]
-                if ch == '"' and c == "\\":
-                    body.append(text[j:j + 2])
-                    j += 2
-                    continue
-                if c == ch:
-                    break
-                if ch == '"' and (c == "`" or text.startswith(("$(", "${"), j)):
-                    return True  # code inside double quotes: nesting is not scanned
-                body.append(c)
-                j += 1
-            part = "".join(body)
-            # A quoted payload may be evaluated as shell code later. Nested quote
-            # removal, escaped command names and line continuations change command
-            # boundaries; the prose regex cannot safely classify any of these.
-            # Assignment-bearing payloads can define aliases behind arbitrary shell
-            # prefixes (assignments, redirections, negation), even when stored for
-            # later eval. Only assignment-free plain prose gets the narrower scan.
-            if re.search(r"\balias\b", part):
-                # Quotes delimit fragments, not shell words. Adjacent fragments
-                # may supply assignment syntax to an otherwise plain payload.
-                # Exempt only a standalone quoted word; do not try to reconstruct
-                # words that may later pass through eval or parameter expansion.
-                boundaries = " \t\r\n;&|()<>"
-                standalone = ((i == 0 or text[i - 1] in boundaries)
-                              and (j + 1 == n or text[j + 1] in boundaries))
-                if not standalone or any(c in part for c in "'\"\\=!<>$"):
+    inert = set()
+    # A literal echo cannot install aliases in the caller. No other generic
+    # command is presumed to treat its arguments as data.
+    if words[0] == 'echo':
+        inert.update(range(1, len(words)))
+    elif (os.path.basename(words[0]) == 'token-broker'
+          and len(words) > 8 and words[1:3] == ['exec', '--scope']
+          and words[3] == 'user/github' and words[4] == '--reason'
+          and words[6:8] == ['--', 'env']):
+        inert.add(5)
+        pos = 8
+        # Restrict env to literal Git identity/config variables, not env options
+        # or shell startup variables.
+        while pos < len(words) and re.fullmatch(
+                r'GIT_(?:AUTHOR_NAME|AUTHOR_EMAIL|COMMITTER_NAME|COMMITTER_EMAIL|'
+                r'CONFIG_COUNT|CONFIG_KEY_[0-9]+|CONFIG_VALUE_[0-9]+)=.*', words[pos]):
+            pos += 1
+        if (pos + 2 >= len(words) or not words[pos].startswith('/')
+                or os.path.basename(words[pos]) != 'hermes-core-wt'
+                or words[pos + 1] != 'ship'):
+            return True
+        pos += 3  # literal slug
+        while pos < len(words):
+            if words[pos] in ('--review-task', '--review-reply', '--no-ci-wait'):
+                if pos + 1 >= len(words):
                     return True
-            quoted.append(part)
-            unquoted.append(" ")
-            i = j + 1
-        else:
-            unquoted.append(ch)
-            i += 1
-    if re.search(r"\balias\b", "".join(unquoted)):
+                if words[pos] == '--review-reply':
+                    inert.add(pos + 1)
+                pos += 2
+            elif words[pos].startswith('--no-ci-wait='):
+                pos += 1
+            else:
+                return True
+    else:
         return True
-    return any(re.search(_ALIAS_COMMAND, part) for part in quoted)
-
-
-# Prefixes can take options/operands or compose with other prefixes. Do not
-# enumerate their grammars here: eval can join the assignment from another argv
-# word. Any prefix before alias keeps taint, even if it could also be prose.
-_ALIAS_COMMAND = (
-    r"(?:^|[;&|(){}`\n]|\$\(|\b(?:then|do|else|elif|eval|exec|builtin|command|sudo|env|time|"
-    r"nohup|xargs)\s[^\n]*?)\s*alias(?=\s|$|[;&|()])"
-)
+    return any(re.search(r'\balias\b', word) and
+               (i not in inert or spans[i][0] not in "'\"")
+               for i, word in enumerate(words))
 
 
 def _git_calls_noted(cmd: str, cwd: Optional[str], depth: int = 0):
