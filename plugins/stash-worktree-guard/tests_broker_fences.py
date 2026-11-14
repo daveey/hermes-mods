@@ -53,3 +53,33 @@ def test_broker_grammar_fence_refuses_composed_input(tmp_path, old, new):
 
 def test_broker_grammar_fence_accepts_quoted_prose_control(tmp_path):
     assert guard.refuse_reason(BROKER, str(tmp_path)) is None
+
+
+IDENTITY = (
+    'GIT_AUTHOR_NAME="Example User" GIT_AUTHOR_EMAIL=you@example.com '
+    'GIT_COMMITTER_NAME="Example User" GIT_COMMITTER_EMAIL=you@example.com '
+)
+
+
+@pytest.mark.parametrize('prefix', ['', IDENTITY])
+@pytest.mark.parametrize('option', ['', ' --impl-task t_example'])
+@pytest.mark.parametrize('redirect', ['', ' > /absolute/ship.log 2>&1'])
+def test_canonical_ship_envelope(tmp_path, prefix, option, redirect):
+    cmd = prefix + BROKER + option + redirect
+    assert not guard._may_define_alias(cmd)
+    assert guard.refuse_reason(cmd, str(tmp_path)) is None
+
+
+@pytest.mark.parametrize('prefix,suffix', [
+    ('BASH_ENV=/payload ', ''),
+    ('HOME=/other ', ''),
+    ('GIT_CONFIG_COUNT=1 ', ''),
+    ('', ' --impl-task'),
+    ('', " --impl-task 'alias'"),
+    ('', ' > /absolute/ship.log 2>&1; alias g=git'),
+    ('', ' > /absolute/ship.log 2>&1 | bash'),
+    ('', ' > "$(alias g=git)" 2>&1'),
+    ('', ' > /absolute/alias 2>&1'),
+])
+def test_canonical_ship_envelope_retains_uncertainty(prefix, suffix):
+    assert guard._may_define_alias(prefix + BROKER + suffix)

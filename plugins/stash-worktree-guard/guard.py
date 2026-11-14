@@ -2532,9 +2532,19 @@ def _may_define_alias(text: str) -> bool:
     token = re.compile(r"(?:'[^'\n]*'|\"[^\"\n]*\"|[^\s'\";&|()<>{}#$`\\]+)+")
     words, spans = [], []
     end = 0
+    redirected = False
     for match in token.finditer(text):
         gap = text[end:match.start()]
         if (end and not gap) or any(c not in ' \t' for c in gap):
+            # Only the canonical literal log suffix, at a token boundary after
+            # the complete argv. Never strip operators inside quoted prose or
+            # accept substitutions, arbitrary descriptors, or following code.
+            suffix = text[end:]
+            if (words and re.fullmatch(r'[ \t]+>[ \t]+/[A-Za-z0-9_./-]+[ \t]+2>&1[ \t]*', suffix)
+                    and not re.search(r'\balias\b', suffix)):
+                redirected = True
+                end = len(text)
+                break
             return True
         raw = match.group()
         if any(c in raw for c in '$`\\'):
@@ -2544,10 +2554,22 @@ def _may_define_alias(text: str) -> bool:
         end = match.end()
     if any(c not in ' \t' for c in text[end:]) or not words:
         return True
+    start = 0
+    while start < len(words) and re.fullmatch(
+            r'GIT_(?:AUTHOR_NAME|AUTHOR_EMAIL|COMMITTER_NAME|COMMITTER_EMAIL)=.*',
+            words[start]):
+        # A quoted whole assignment is a command word, not an assignment.
+        if not re.match(r'GIT_[A-Z_]+=', spans[start]) or re.search(r'\balias\b', words[start]):
+            return True
+        start += 1
+    prefixed = bool(start)
+    words, spans = words[start:], spans[start:]
+    if not words:
+        return True
     inert = set()
     # A literal echo cannot install aliases in the caller. No other generic
     # command is presumed to treat its arguments as data.
-    if words[0] == 'echo':
+    if words[0] == 'echo' and not prefixed and not redirected:
         inert.update(range(1, len(words)))
     elif (os.path.basename(words[0]) == 'token-broker'
           and len(words) > 8 and words[1:3] == ['exec', '--scope']
@@ -2567,7 +2589,7 @@ def _may_define_alias(text: str) -> bool:
             return True
         pos += 3  # literal slug
         while pos < len(words):
-            if words[pos] in ('--review-task', '--review-reply', '--no-ci-wait'):
+            if words[pos] in ('--review-task', '--impl-task', '--review-reply', '--no-ci-wait'):
                 if pos + 1 >= len(words):
                     return True
                 if words[pos] == '--review-reply':

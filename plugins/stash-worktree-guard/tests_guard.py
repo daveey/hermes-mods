@@ -2745,6 +2745,36 @@ BROKER_SHIP = (
 PROSE = "1) Cosmetic internal alias/import placement nit declined: keep the private test seam."
 
 
+@pytest.mark.parametrize('shape', ['following', 'substitution', 'alias'])
+def test_canonical_ship_envelope_real_restore_controls(multi, shape):
+    main, wt = multi
+    # Stub only the external broker: never execute a real ship or credential call.
+    broker = main / 'token-broker'
+    broker.write_text('#!/bin/sh\nexit 0\n')
+    broker.chmod(0o755)
+    cmd = ('GIT_AUTHOR_NAME="Example User" ' +
+           BROKER_SHIP.format(reason="'Land PR 1'", reply=shlex.quote(PROSE))
+           .replace('token-broker', str(broker), 1) +
+           f' --impl-task t_example > {main}/ship.log 2>&1')
+    restore = f'git -C {shlex.quote(str(wt))} stash pop'
+    if shape == 'following':
+        cmd += '; ' + restore
+    elif shape == 'substitution':
+        cmd = cmd.replace('GIT_AUTHOR_NAME="Example User"',
+                          'GIT_AUTHOR_NAME="$(' + restore + ')"')
+    else:
+        cmd = ('shopt -s expand_aliases\nalias g=' + shlex.quote('git -C ' + str(wt)) +
+               '\n' + cmd + '\ng stash pop')
+    _assert_real_restore(cmd, main, wt)
+
+
+def test_canonical_ship_envelope_hook_allow(multi):
+    cmd = ('GIT_AUTHOR_NAME="Example User" ' +
+           BROKER_SHIP.format(reason="'Land PR 1'", reply=shlex.quote(PROSE)) +
+           ' --impl-task t_example > /absolute/ship.log 2>&1')
+    assert not _blocked(cmd, multi[1])
+
+
 @pytest.mark.parametrize("reason,reply", [
     ("'Land PR 1'", shlex.quote(PROSE)),
     ("'Land PR 1'", '"' + PROSE + '"'),
