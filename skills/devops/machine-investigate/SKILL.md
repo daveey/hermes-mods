@@ -73,6 +73,10 @@ For a gateway restart use
 The backend-restart-guard enforces recognized literal signal commands on both Hermes and Claude Bash;
 its fail-open discovery and lexical limits are not permission to bypass it.
 
+## Heap attribution coverage
+
+For loop-watch owner censuses, check both deadline and owner-label coverage before choosing a retainer to fix. `truncated: false` alone does not mean attribution is complete: a saturated owner table can hide the largest structures in `<other owners>`. Require `labels_truncated: false` on newer reports; on older reports inspect the owner count against the implementation's cap. Keep Python shallow-object bytes distinct from physical footprint (native buffers and allocator slack are excluded), and do not rerun a consumed one-shot by clearing its lifetime sentinel. Use natural process replacement for the next live scan.
+
 ## Remote backend timeouts: separate compute from transport
 
 First read the Desktop's own gate lines for the conn in `desktop.log`: `[remote-down] conn:<c>::... marked down (<reason>)` to `... answered again; gate open` bounds an outage, and while it lasts every poll logs a fail-fast line that quotes one timeout ("is down (Timed out ..., 27s ago)"), so the timeout count is not a request count. Reason `read ECONNRESET` means the backend process went away (check the backend host's `agent.log` for a core update or restart at that second); that is neither CPU nor link. `backend_timeouts.py --dry-run` lists these as `backend_down.episodes`.
