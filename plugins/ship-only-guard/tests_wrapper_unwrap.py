@@ -27,7 +27,11 @@ def check(command, tmp_path):
                         repos={REPO}, env={"GH_TOKEN": ""})
 
 
-@pytest.mark.parametrize("prefix", [BROKER, "/opt/tools/" + BROKER, "timeout 60 ", "nice ", "stdbuf -oL ", "/usr/bin/", "~/.local/bin/"])
+@pytest.mark.parametrize("prefix", [
+    BROKER, "/opt/tools/" + BROKER, "timeout 60 ", "nice ", "stdbuf -oL ", "/usr/bin/", "~/.local/bin/",
+    # A wrapper argument that is the bare word gh/git must not end the scan.
+    BROKER.replace("--reason x", "--reason gh"), BROKER.replace("--reason x", "--reason git"), "sudo -u git ",
+])
 def test_wrapped_merge_refused(prefix, tmp_path):
     command = prefix + MERGE
     assert check(command, tmp_path), command
