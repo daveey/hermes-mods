@@ -1022,10 +1022,50 @@ def directive(ids: list[str], session_id: str, text: str = "") -> str:
     return head + "}"
 
 
-def frame(reply: str, steps: list[dict], session_id: str) -> str:
+_ID_PLACEHOLDER = "us_0000000000"
+
+
+def _frame_choice(block: dict, span: str, base: int) -> tuple[str, int, int, str]:
+    """How frame() renders one block: ``(mode, start, end, t)``. ``block``: the paragraph, framed whole when it
+    fits the attr budget; ``line``: the single line holding ``span`` (over budget); ``after``: that line is
+    itself over budget, so it stays as text and an empty directive follows it (``t`` is the line, never shown in
+    the attr); ``tail``: no line holds the span, an empty directive follows the block (``t`` is the block)."""
+    start, end, btext = block["start"], block["end"], block["text"]
+    if base + len(enc(btext)) <= ATTR_BUDGET:
+        return "block", start, end, btext
+    off = start
+    for ln in btext.split("\n"):
+        if _norm(span)[:60] in _norm(ln):
+            return ("line" if base + len(enc(ln)) <= ATTR_BUDGET else "after"), off, off + len(ln), ln
+        off += len(ln) + 1
+    return "tail", start, end, btext
+
+
+def _frame_base(ids: list[str], session_id: str, reserve: int = 0) -> int:
+    """Directive length before its ``t`` text, for ``max(len(ids), reserve)`` ids. ``reserve`` lets a caller that
+    decides a step's text before the block's final id group is known (process_reply minting) get the same choice
+    frame() will make."""
+    n = max(len(ids), int(reserve or 0))
+    pad = list(ids) + [_ID_PLACEHOLDER] * (n - len(ids))
+    return len(directive(pad, session_id, "x")) - 1
+
+
+def framed_text(reply: str, span: str, session_id: str, reserve: int = 1) -> Optional[str]:
+    """The text frame() puts in (or, over budget, right before) the directive for a step whose sentence is
+    ``span``: its paragraph, or the single line holding it when the paragraph is over the attr budget. A minted
+    request's scope and the step's ``paragraph`` are this text, so a list item framed alone is never widened to
+    its whole list (MacBook chat ..bef6c6: a restated bullet's request carried three unrelated bullets)."""
+    b = locate(reply, span)
+    if b is None:
+        return None
+    return _frame_choice(b, span, _frame_base([], session_id, reserve))[3]
+
+
+def frame(reply: str, steps: list[dict], session_id: str, reserve: Optional[dict] = None) -> str:
     """Replace each step's paragraph with a directive that carries the paragraph text. A paragraph too long for
     the attr budget falls back to its single line; a line still too long stays as text and the directive goes
-    right after it (empty ``t``). Text is never dropped."""
+    right after it (empty ``t``). Text is never dropped. ``reserve``: ``{block start: id count}`` to budget for
+    (see ``_frame_base``)."""
     by_block: dict[tuple, dict] = {}
     for s in steps:
         b = locate(reply, s["verbatim_span"])
@@ -1036,26 +1076,13 @@ def frame(reply: str, steps: list[dict], session_id: str) -> str:
     edits: list[tuple[int, int, str]] = []
     for (start, end), g in by_block.items():
         ids = g["ids"]
-        btext = g["block"]["text"]
-        base = len(directive(ids, session_id, "x")) - 1
-        if base + len(enc(btext)) <= ATTR_BUDGET:
-            edits.append((start, end, directive(ids, session_id, btext)))
-            continue
-        # one line of the block
         span = next(s["verbatim_span"] for s in steps if s["id"] == ids[0])
-        off = start
-        placed = False
-        for ln in btext.split("\n"):
-            if _norm(span)[:60] in _norm(ln):
-                if base + len(enc(ln)) <= ATTR_BUDGET:
-                    edits.append((off, off + len(ln), directive(ids, session_id, ln)))
-                else:
-                    edits.append((off + len(ln), off + len(ln), "\n\n" + directive(ids, session_id)))
-                placed = True
-                break
-            off += len(ln) + 1
-        if not placed:
-            edits.append((end, end, "\n\n" + directive(ids, session_id)))
+        mode, a, z, t = _frame_choice(g["block"], span,
+                                      _frame_base(ids, session_id, (reserve or {}).get(start, 0)))
+        if mode in ("block", "line"):
+            edits.append((a, z, directive(ids, session_id, t)))
+        else:
+            edits.append((z, z, "\n\n" + directive(ids, session_id)))
     out = reply
     for start, end, rep in sorted(edits, key=lambda e: e[0], reverse=True):
         out = out[:start] + rep + out[end:]
@@ -1282,6 +1309,30 @@ HELD_REPLY = "This reply has been held because it repeats a retired request. No 
 NO_LONGER_NEEDED = "No longer needed"
 
 
+def reply_listing(opened: list[dict], action_store=None, action_owner=None, card_asks=()) -> tuple[list, dict]:
+    """``(listed, tiles)``: what the extractor is shown for one reply, and each listed id's ``tile_texts``.
+
+    The pre-send gate (``publication_buffer``) and ``process_reply`` both build the listing here, so the same
+    reply gives the same extractor prompt (and, through the plugin's shared extraction, the same answer): the
+    gate then holds exactly the asks the transform would mint (MacBook chat ..bef6c6: the two calls listed the
+    open request differently, disagreed, and a restated ask minted a second tile with no hold).
+    Producer-published asks are tiles too: the model must see them to report a restatement as a repeat. Their ids
+    only feed "repeats"; ledger resolution ignores any step that has a requestId. Blocked cards' own asks are
+    listed so the model can name a relay of one as a repeat (never a ledger step: never resolved, never framed)."""
+    listed = list(opened)
+    tiles = {s['id']: tile_texts(s) for s in opened if s.get('id')}
+    if action_store is not None:
+        mirrored = {s.get('requestId') for s in opened}
+        for a in open_asks(action_store, action_owner):
+            if a['id'] not in mirrored:
+                listed.append({'id': a['id'], 'kind': a['kind'], 'text': a['title']})
+                tiles[a['id']] = tile_texts(a)
+    card_asks = [e for e in card_asks or () if isinstance(e, dict) and e.get('kind') == KANBAN_ASK]
+    listed += [{'id': e['id'], 'kind': e['kind'], 'text': card_ask_listing(e)} for e in card_asks]
+    tiles.update({e['id']: tile_texts(e) for e in card_asks})
+    return listed, tiles
+
+
 def process_reply(reply: str, session_id: str, *, user_msg: str = "", llm: Optional[LLM] = None,
                   ledger: Ledger, cards: Optional[Cards] = None, framed: bool = True,
                   session_ref: str = "", now: Optional[float] = None,
@@ -1321,21 +1372,8 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
     opened = ledger.open_steps(session_id)
     if not opened and not _worth_asking(reply):
         return {"text": None, "steps": [], "resolved": [], "source": "skip"}
-    # Producer-published asks are tiles too: the model must see them to report a restatement as a repeat.
-    # Their ids only feed "repeats"; ledger resolution below ignores any step that has a requestId.
-    listed = list(opened)
-    tiles = {s['id']: tile_texts(s) for s in opened if s.get('id')}
-    if action_store is not None:
-        mirrored = {s.get('requestId') for s in opened}
-        for a in open_asks(action_store, action_owner):
-            if a['id'] not in mirrored:
-                listed.append({'id': a['id'], 'kind': a['kind'], 'text': a['title']})
-                tiles[a['id']] = tile_texts(a)
-    # Blocked cards' own asks: listed so the model can name a relay of one as a repeat (its id is never a ledger
-    # step, so it is never resolved here and never framed).
     card_asks = [e for e in card_asks or () if isinstance(e, dict) and e.get('kind') == KANBAN_ASK]
-    listed += [{'id': e['id'], 'kind': e['kind'], 'text': card_ask_listing(e)} for e in card_asks]
-    tiles.update({e['id']: tile_texts(e) for e in card_asks})
+    listed, tiles = reply_listing(opened, action_store, action_owner, card_asks)
     # Other chats' open asks are only a relay source in a turn a runtime notice started (relay provenance). In a
     # turn the user started, an equal or similar title elsewhere is no source association: never suppress by it.
     relay = _runtime_message(user_msg)
@@ -1383,12 +1421,19 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
     by_id, hit_ids = {e['id']: e for e in card_asks}, {e['id'] for _, e in restated}
     for rep in res.get("repeats") or ():
         e = by_id.get(rep.get("id")) if isinstance(rep, dict) else None
-        if e is not None and e['id'] not in hit_ids:
+        if e is not None and e['id'] not in hit_ids and cited_cards(rep.get("verbatim_span"), reply, [e]):
             hit_ids.add(e['id'])
             restated.append(({"text": None, "verbatim_span": rep.get("verbatim_span")}, e))
     published, resolved = [], []
     text = reply
     changed = False
+    # Ids that may share one block's directive: every located step and repeat sentence (an upper bound of the
+    # group frame() builds), so a minted step's paragraph is decided with the same attr budget frame() uses.
+    reserve: dict[int, int] = {}
+    for x in list(res["steps"]) + list(res.get("repeats") or ()):
+        b = locate(reply, x.get("verbatim_span") or "") if isinstance(x, dict) else None
+        if b is not None:
+            reserve[b["start"]] = reserve.get(b["start"], 0) + 1
     if restated:
         # The card's own ask is the request: nothing is minted, framed or held for it. Record why, bounded.
         with ledger.edit(root) as d:
@@ -1454,9 +1499,13 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
                     continue
                 if budget <= 0 or (action_store is None and _norm(candidate["text"]) in seen):
                     continue
+                # The step's paragraph (and so the request's scope) is the text frame() puts in the directive:
+                # the paragraph, or its single line when over the attr budget, never the whole list around it.
+                shown = _frame_choice(block, candidate["verbatim_span"],
+                                      _frame_base([], session_id, reserve.get(block["start"], 1)))[3]
                 step = {**candidate, "id": new_step_id(), "status": "open", "created": now,
                         "session": session_id,
-                        "paragraph": block["text"] + ("\n\n" + candidate["payload"] if candidate.get("payload") else "")}
+                        "paragraph": shown + ("\n\n" + candidate["payload"] if candidate.get("payload") else "")}
                 if action_store is not None:
                     canonical = action_store.migrate_step(action_owner, step)
                     step.update(requestId=canonical["requestId"], requestOwner=canonical["owner"],
@@ -1483,7 +1532,7 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
                     and ask_key(r.get("verbatim_span")) not in mapped_spans:
                 published.append({**step, "verbatim_span": r["verbatim_span"]})
     if published and framed:
-        text = frame(text, published, session_id)
+        text = frame(text, published, session_id, reserve=reserve if text == reply else None)
     if changed or resolved:
         sync_card(ledger, root, session_id, session_ref or f"@session:default/{session_id}", cards)
     return {"text": text if text != reply else None, "steps": published, "resolved": resolved, "source": res["source"],
@@ -1711,6 +1760,69 @@ def _names_card(named: set, task_id) -> bool:
     return bool(tid) and any(tid == n or tid.startswith(n) for n in named)
 
 
+def _is_heading(block_text: str) -> bool:
+    first = (block_text or "").lstrip().split("\n", 1)[0].strip()
+    return bool(re.match(r"#{1,6}\s", first)) or bool(re.fullmatch(r"(\*\*|__)[^*_\n]+(\*\*|__):?", first))
+
+
+def _section(reply: str, span) -> str:
+    """The blocks from the heading (``#`` line or bold-only first line) at or above ``span``'s paragraph down to
+    the next heading: the part of the reply that sentence belongs to."""
+    if not reply or not span:
+        return ""
+    target = locate(reply, span)
+    if target is None:
+        return ""
+    blocks = _blocks(reply)
+    i = next((k for k, b in enumerate(blocks) if b["start"] == target["start"]), None)
+    if i is None:
+        return target["text"]
+    lo = i
+    while lo > 0 and not _is_heading(blocks[lo]["text"]):
+        lo -= 1
+    hi = i + 1
+    while hi < len(blocks) and not _is_heading(blocks[hi]["text"]):
+        hi += 1
+    return "\n\n".join(b["text"] for b in blocks[lo:hi])
+
+
+def _quotes_ask(text: str, entry: dict) -> bool:
+    action = _norm(str(entry.get("text") or ""))
+    return len(action) >= _SPAN_KEY_MIN and action in _norm(re.sub(r"(?m)^\s*>\s?", "", text or ""))
+
+
+# A quoted Kanban ask line: every human_request.action says what unblock and archive mean.
+_ASK_LINE = re.compile(r"\bunblock\s*=|\barchive\s*=", re.I)
+
+
+def _quoted_asks(section: str) -> list[str]:
+    """Blockquotes in ``section`` that quote some card's ask line (listed here or not: a hub card's ask is never
+    in the local listing)."""
+    return [b["text"] for b in _blocks(section) if b["quote"] and _ASK_LINE.search(b["text"])]
+
+
+def cited_cards(span, reply: str, cards: list[dict]) -> list[dict]:
+    """The listed cards a sentence of ``reply`` may restate.
+
+    - Its paragraph names a card's id or quotes a card's ask line, or its section quotes a listed card's ask line:
+      only those cards.
+    - Its section quotes the ask line of a card that is not listed: none. A sentence in a section that quotes
+      one card's ask is never booked to another card (MacBook chat ..bef6c6: "Reply here." under a blockquote of
+      a hub card's ask was booked to an unrelated local card).
+    - Nothing cited: every card (the relay rules in ``card_ask_for`` judge it; a paraphrased relay stays the
+      card's ask, never a second tile).
+    Without ``reply`` or a locatable sentence nothing is filtered."""
+    if not reply or not span or locate(reply, span) is None:
+        return list(cards)
+    para, section = _paragraph(reply, span), _section(reply, span)
+    named = set(_CARD_ID.findall(para))
+    cited = [e for e in cards if _names_card(named, e.get("task_id")) or _quotes_ask(para, e)
+             or _quotes_ask(section, e)]
+    if cited:
+        return cited
+    return [] if _quoted_asks(section) else list(cards)
+
+
 def card_ask_for(candidate: dict, entries: list[dict], repeats=(), reply: str = "", relayed=()) -> Optional[dict]:
     """The blocked card's ask ``candidate`` (an extracted step) restates, or None.
 
@@ -1724,8 +1836,11 @@ def card_ask_for(candidate: dict, entries: list[dict], repeats=(), reply: str = 
     approve the Touch ID prompt") is covered when its first action is: the follow-on is the card's own next step.
     ``relayed``: ids of cards the extractor named as a corroborated repeat elsewhere in this same reply. A step in
     that reply sharing at least ``_RELAY_SHARED`` distinctive words with exactly one such card's ask or title is
-    that card's ask (a relay that adds a fallback or reorders the ask stays one request)."""
+    that card's ask (a relay that adds a fallback or reorders the ask stays one request).
+    Only cards the sentence cites (``cited_cards``) are candidates."""
     cards = [e for e in entries or () if e.get("kind") == KANBAN_ASK]
+    if cards and reply:
+        cards = cited_cards(candidate.get("verbatim_span"), reply, cards)
     if not cards:
         return None
     hit = _card_ask_match(candidate, cards, repeats, reply)
