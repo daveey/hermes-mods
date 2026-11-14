@@ -176,15 +176,78 @@ def test_unused_writer_retirement_cannot_start_later(tmp_path, monkeypatch):
     assert not writer.path.exists()
 
 
-def test_contended_submit_and_shutdown_are_bounded(tmp_path, monkeypatch):
+def test_idle_writer_blocks_until_shutdown(tmp_path, monkeypatch):
+    mod = load_generation(monkeypatch, "idle")
+    writer = mod.store.Writer(tmp_path / "idle.sqlite", detector=False)
+    calls = []
+    real_get = writer.queue.get
+
+    def observed_get(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_get(*args, **kwargs)
+
+    monkeypatch.setattr(writer.queue, "get", observed_get)
+    try:
+        writer.submit(event(0))
+        assert writer.flush(2)
+        # Only the submitted item should cause a queue read while unretired.
+        time.sleep(0.2)
+        assert len(calls) == 1, "idle writer must not poll an empty queue"
+    finally:
+        assert writer.shutdown(2)
+    assert writer.queue.unfinished_tasks == 0
+
+
+def test_contended_shutdown_is_bounded(tmp_path, monkeypatch):
     mod = load_generation(monkeypatch, "contended")
     writer = mod.store.Writer(tmp_path / "contended.sqlite", detector=False)
     with writer._lock:
-        writer.submit(event(0))
-        assert writer.dropped == 1
         assert not writer.shutdown(0)
     writer.submit(event(1))
-    assert writer.dropped == 2
+    assert writer.dropped == 1
     assert writer.shutdown(0)
     assert writer._thread is None
+
+
+def test_concurrent_producers_do_not_drop_with_queue_capacity(tmp_path, monkeypatch):
+    mod = load_generation(monkeypatch, "producers")
+    writer = mod.store.Writer(tmp_path / "producers.sqlite", detector=False)
+    attempted = threading.Event()
+    real_lock = writer._lock
+
+    class ObservedLock:
+        def acquire(self, *args, **kwargs):
+            attempted.set()
+            return real_lock.acquire(*args, **kwargs)
+
+        def release(self):
+            real_lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *args):
+            self.release()
+
+    writer._lock = ObservedLock()
+    threads = [threading.Thread(target=lambda n=n: [writer.submit(event((n, i)))
+               for i in range(250)]) for n in range(8)]
+    try:
+        # Force ordinary contention once; the remaining submissions race naturally.
+        with real_lock:
+            for thread in threads:
+                thread.start()
+            assert attempted.wait(2)
+        for thread in threads:
+            thread.join(5)
+            assert not thread.is_alive()
+        assert writer.dropped == 0
+        assert writer.flush(30)
+    finally:
+        for thread in threads:
+            thread.join(5)
+        assert writer.shutdown(30)
+    with closing(sqlite3.connect(writer.path)) as db:
+        assert db.execute("SELECT count(*) FROM risk_events").fetchone()[0] == 2000
 

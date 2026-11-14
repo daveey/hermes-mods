@@ -130,7 +130,7 @@ def write_rows(db: sqlite3.Connection, rows: list[dict]) -> None:
 
 
 class Writer:
-    """Bounded queue + one daemon thread. ``submit`` never blocks and never raises."""
+    """Bounded queue + one daemon; submit never waits for queue capacity or SQLite."""
 
     def __init__(self, path: Optional[Path] = None, detector=None):
         self.path, self.detector = path, detector
@@ -140,12 +140,12 @@ class Writer:
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._retired = threading.Event()
+        # One permit per item plus explicit retirement wakes; no idle polling.
+        self._ready = threading.Semaphore(0)
 
     def submit(self, event: dict) -> None:
-        # Never wait for another producer or shutdown; retirement and enqueue are atomic.
-        if not self._lock.acquire(blocking=False):
-            self.dropped += 1
-            return
+        # Serialize admission, not I/O: contention is not queue saturation.
+        self._lock.acquire()
         try:
             if self._retired.is_set():
                 self.dropped += 1
@@ -156,6 +156,7 @@ class Writer:
                 self._thread = thread
                 atexit.register(self.shutdown, 1.0)
             self.queue.put_nowait(event)
+            self._ready.release()
         except Exception:  # noqa: BLE001 - full queue or thread start failure: drop, never affect the call
             self.dropped += 1
         finally:
@@ -170,9 +171,11 @@ class Writer:
         deadline = time.monotonic() + max(0.0, timeout)
         if not self._lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
             self._retired.set()
+            self._ready.release()
             return False
         try:
             self._retired.set()
+            self._ready.release()
             thread = self._thread
             atexit.unregister(self.shutdown)
         finally:
@@ -194,8 +197,9 @@ class Writer:
         db = None
         try:
             while True:
+                self._ready.acquire()
                 try:
-                    event = self.queue.get(timeout=0.05)
+                    event = self.queue.get_nowait()
                 except queue.Empty:
                     with self._lock:
                         if self._retired.is_set() and self.queue.empty():
