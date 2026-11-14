@@ -802,13 +802,19 @@ def _skill_prose(path):
     return p.endswith(".md") and (p.startswith("home/skills/") or p.startswith("skills/"))
 
 
+def _flat_executable(path):
+    """Direct children of independent executable directories, not nested packages."""
+    return bool(re.fullmatch(r"(?:home/bin|hosts/[^/]+/bin)/[^/]+", path))
+
+
 def _overlap(pr, base):
     """Why the base-delta file `base` can change what the PR file `pr` was tested against, or ''."""
     if base.startswith(_WORKFLOWS) or _GLOBAL_FILE.fullmatch(base):
         return "ci"
     if _skill_prose(pr) and _skill_prose(base):
         return ""
-    if _path_area(pr) == _path_area(base):
+    if (_path_area(pr) == _path_area(base)
+            and not (pr != base and _flat_executable(pr) and _flat_executable(base))):
         return "area"
     if (pr.count("/") == base.count("/") == 1 and pr.split("/")[0] == base.split("/")[0]
             and (_flat_shared(pr) or _flat_shared(base))):
