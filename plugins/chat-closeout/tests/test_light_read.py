@@ -95,9 +95,8 @@ def test_an_unchanged_board_is_not_read_again_and_any_commit_is_seen(tmp_path, m
     _board(board)
     writer = sqlite3.connect(board, isolation_level=None)
     writer.execute(f'PRAGMA journal_mode={journal}')
-    opens = []
-    real = core.ro_connect
-    monkeypatch.setattr(core, 'ro_connect', lambda p, *a, **k: opens.append(p) or real(p, *a, **k))
+    from reader_probe import trace_readers
+    _, opens = trace_readers(monkeypatch, core)
     first = core.read_cards([board], IDS, light=light)
     assert core.read_cards([board], IDS, light=light) == first and len(opens) == 1
     for status in ('review', 'done', 'review'):  # 'review'/'done' differ in length; 'blocked'->'running' too
@@ -107,7 +106,6 @@ def test_an_unchanged_board_is_not_read_again_and_any_commit_is_seen(tmp_path, m
     writer.execute("UPDATE tasks SET status='running' WHERE id='t_run'")
     writer.execute("UPDATE tasks SET status='runnin3' WHERE id='t_run'")
     assert core.read_cards([board], IDS, light=light)['t_run']['status'] == 'runnin3'
-    monkeypatch.setattr(core, 'ro_connect', real)
     core._structural_reads.clear()
     assert core.read_cards([board], IDS, light=light) == core.read_cards([board], IDS, light=light)
     assert core.read_cards([board], IDS + ['t_extra'], light=light) is not None  # another id set: its own read
