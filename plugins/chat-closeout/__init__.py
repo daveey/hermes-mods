@@ -1653,13 +1653,16 @@ pre_final_gate.needs_buffer = True
 # ---- declared inputs (WAITING-INPUTS.md; design t_01a1d563324d7e8e row C) --------------------------------------
 _wi_lock = threading.RLock()
 _wi: dict[str, Any] = {}
+_inputs_local = threading.local()
 INPUTS_REUSE_S = 1.0  # a waiting pass reuses the inputs core read for its fingerprint at most this long ago
 
 
 def _wi_reset() -> None:
     """Forget every input watcher and per-row answer (tests; a ledger/home switch is also caught by the keys)."""
+    global _inputs_local
     with _wi_lock:
         _wi.clear()
+        _inputs_local = threading.local()
     with _waiting_lock:
         _state.pop("waiting_cache", None)
         _state.pop("waiting_memo", None)
@@ -1857,18 +1860,18 @@ def waiting_inputs() -> Any:
     # were taken before its own reads, so a change in between only re-runs the next pass, never hides one. Per
     # thread: the fingerprint and the pass that follows it run on one thread, and another thread's (older) reads
     # must never label this thread's answer.
-    _state["inputs_hit"] = (threading.get_ident(), time.monotonic(), rows, parts)
+    _inputs_local.hit = (time.monotonic(), rows, parts)
     return key
 
 
 def _own_inputs_hit(pop: bool) -> Optional[tuple]:
     """This thread's fresh ``inputs_hit`` (``(rows, parts)``), else None; ``pop`` consumes it."""
-    hit = _state.get("inputs_hit")
-    if hit is None or hit[0] != threading.get_ident():
+    hit = getattr(_inputs_local, "hit", None)
+    if hit is None:
         return None
     if pop:
-        _state.pop("inputs_hit", None)
-    return (hit[2], hit[3]) if time.monotonic() - hit[1] <= INPUTS_REUSE_S else None
+        _inputs_local.hit = None
+    return (hit[1], hit[2]) if time.monotonic() - hit[0] <= INPUTS_REUSE_S else None
 
 
 def _waiting_row_key(lineages: Optional[dict[str, list]], floor: Any) -> Callable[[dict, Any], Optional[str]]:
@@ -1917,24 +1920,32 @@ def waiting_source() -> dict[str, list[str]]:
                 acct.skip()
                 _state["waiting_cache"] = (time.monotonic(), memo[1])
                 return memo[1]
-            stats: dict[str, int] = {}
-            try:
-                # Settlement only: the light read skips the per-card handoff/ask subqueries nobody reads here.
-                reader = _pass_reader(light=True, rows=rows)
-                _upgraded(reader)
-                if parts is None:
-                    out = core.pending_closeouts(ledger(), reader, proof=session_proof, fields=core.SETTLE_ROW_FIELDS)
-                else:
-                    lineages = dict(parts["lineage"])
-                    out = core.pending_closeouts(ledger(), reader, proof=session_proof, rows=rows,
-                                                 row_key=_waiting_row_key(lineages, parts["floor"]),
-                                                 cache=_wi_get("waiting_rows", wi.RowCache), stats=stats,
-                                                 fields=core.SETTLE_ROW_FIELDS)
-            except Exception:
-                logger.debug("chat-closeout waiting source failed", exc_info=True)
-                out, parts = {}, None
-            acct.rows(stats.get("recomputed", 0))
-            acct.change(memo is None or memo[1] != out)
+            input_moved = parts is not None
+            acct.change(input_moved)
+            category = "waiting_moved" if input_moved else "waiting_fallback"
+            with wi.accounting_pass(f"chat-closeout.{category}") as detail:
+                stats: dict[str, int] = {}
+                try:
+                    # Settlement only: no per-card handoff/ask subqueries.
+                    reader = _pass_reader(light=True, rows=rows)
+                    _upgraded(reader)
+                    if parts is None:
+                        out = core.pending_closeouts(ledger(), reader, proof=session_proof, fields=core.SETTLE_ROW_FIELDS)
+                    else:
+                        lineages = dict(parts["lineage"])
+                        out = core.pending_closeouts(ledger(), reader, proof=session_proof, rows=rows,
+                                                     row_key=_waiting_row_key(lineages, parts["floor"]),
+                                                     cache=_wi_get("waiting_rows", wi.RowCache), stats=stats,
+                                                     fields=core.SETTLE_ROW_FIELDS)
+                except Exception:
+                    logger.debug("chat-closeout waiting source failed", exc_info=True)
+                    out, parts = {}, None
+                    detail.fallback()
+                acct.rows(stats.get("recomputed", 0))
+                detail.change(input_moved)
+                if not input_moved:
+                    detail.fallback()
+                detail.rows(stats.get("recomputed", 0))
             _state["waiting_memo"] = (parts, out) if parts is not None else None
         _state["waiting_cache"] = (time.monotonic(), out)
         return out

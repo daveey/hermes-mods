@@ -27,9 +27,52 @@ import time
 from pathlib import Path
 
 WINDOWS, STEP_S, TICK_S = 300, 2.0, 30.0
+BUDGET_PCT = {"waiting": 0.2, "host": 0.5}   # % of one core over the replay (design done-when)
 RATES = {"state_msg": 83 / 300, "board_rev": 89 / 300, "hub_seq": 111 / 300}
 ACTIVITY_ONLY = 191 / 284          # rf2: liveness-only share of changed replica task rows
 WAITING_HIT = 0.1                  # share of transcript writes that land in a waiting chat's lineage
+
+
+class ReplayClock:
+    """Context manager: virtual forward-only wall/monotonic clocks installed on the global ``time`` module.
+
+    Every module calling ``time.time()``/``time.monotonic()`` (plugin, core) ages with ``advance()``, so the 600 s
+    replay really crosses production floors, freshness and due deadlines. CPU timers (process_time, thread_time,
+    perf_counter) stay real so the measured cost is real. Originals are restored on any exit."""
+
+    _NAMES = ("time", "time_ns", "monotonic", "monotonic_ns")
+
+    def __init__(self, wall: float | None = None, mono: float | None = None):
+        self.wall = float(time.time() if wall is None else wall)
+        self.mono = float(time.monotonic() if mono is None else mono)
+        self._orig: dict = {}
+
+    def advance(self, seconds: float) -> None:
+        if seconds < 0:
+            raise ValueError("replay clock only moves forward")
+        self.wall += seconds
+        self.mono += seconds
+
+    def __enter__(self):
+        if self._orig:
+            raise RuntimeError("ReplayClock already installed")
+        self._orig = {n: getattr(time, n) for n in self._NAMES}
+        time.time = lambda: self.wall
+        time.monotonic = lambda: self.mono
+        time.time_ns = lambda: round(self.wall * 1e9)
+        time.monotonic_ns = lambda: round(self.mono * 1e9)
+        return self
+
+    def __exit__(self, *exc):
+        for n, fn in self._orig.items():
+            setattr(time, n, fn)
+        self._orig = {}
+        return False
+
+
+def budget_failures(pct_core: dict, budgets: dict = BUDGET_PCT) -> list:
+    return [f"{k} {pct_core[k]:.3f}% > {limit}% of one core" for k, limit in budgets.items()
+            if pct_core[k] > limit]
 
 
 def load_plugin(plugin_dir: Path):
@@ -102,15 +145,22 @@ def main() -> int:
     ap.add_argument("--pending", type=int, default=36)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--json", type=Path)
+    ap.add_argument("--diagnostic", action="store_true", help="report only; do not fail on the CPU budgets")
     args = ap.parse_args()
+    # Start away from a floor boundary so the measured interval includes a rollover.
+    with ReplayClock(wall=(time.time() // 600) * 600 + 30) as clock:
+        return _run(args, clock)
+
+
+def _run(args, clock: ReplayClock) -> int:
     rng = random.Random(args.seed)
     with tempfile.TemporaryDirectory(prefix="closeout-bench-") as tmp:
         home = Path(tmp)
         os.environ["HERMES_HOME"] = str(home)
         os.environ.pop("CHAT_CLOSEOUT_OFF", None)
-        t0 = time.monotonic()
+        t0 = time.perf_counter()
         world = build(home, rng, args.sessions, args.messages, args.tasks, args.replica_rows, args.pending)
-        build_s = time.monotonic() - t0
+        build_s = time.perf_counter() - t0
         plugin = load_plugin(args.plugin.resolve())
         core = plugin.core
         led = core.Ledger(home / "ledger.db")
@@ -172,6 +222,9 @@ def main() -> int:
         except Exception:
             pass
         cpu = {"waiting": 0.0, "host": 0.0}
+        wall0, mono0 = clock.wall, clock.mono   # window 0 starts here; window w is exactly w * STEP_S later
+        floor_s = getattr(getattr(plugin, "wi", None), "FLOOR_S", 600)
+        floors = set()
         passes = {"waiting": 0, "host": 0}
         moved = {"state_msg": 0, "board_rev": 0, "hub_seq": 0}
         next_host = 0.0
@@ -183,6 +236,11 @@ def main() -> int:
             prof.enable()
         for w in range(WINDOWS):
             sim = w * STEP_S
+            if w:
+                clock.advance(STEP_S)
+            assert abs(time.time() - (wall0 + sim)) < 1e-6 and abs(time.monotonic() - (mono0 + sim)) < 1e-6, \
+                "replay clock did not advance one step per window"
+            floors.add(int(plugin.time.time() // floor_s))
             if rng.random() < RATES["state_msg"]:
                 moved["state_msg"] += 1
                 sid = rng.choice(world["waiting"]) if rng.random() < WAITING_HIT else rng.choice(world["sids"])
@@ -215,6 +273,8 @@ def main() -> int:
                 inputs()
             plugin.waiting_source()
             cpu["waiting"] += time.process_time() - c0
+            cache = plugin._state.get("waiting_cache")
+            assert cache is None or abs(cache[0] - clock.mono) < 1e-6, "waiting freshness stamp is not on the replay clock"
             passes["waiting"] += 1
             if sim >= next_host:
                 next_host += TICK_S
@@ -229,10 +289,14 @@ def main() -> int:
             stats.sort_stats(os.environ.get("CLOSEOUT_BENCH_PROFILE_SORT", "tottime"))
             stats.print_stats(os.environ.get("CLOSEOUT_BENCH_PROFILE_FILTER", ""), 40)
         replay_s = WINDOWS * STEP_S
+        assert len(floors) >= 2, "replay omitted the production floor rollover"
+        assert abs(clock.wall - wall0 - (WINDOWS - 1) * STEP_S) < 1e-6, "replay clock did not cross the replay"
+        assert passes == {"waiting": WINDOWS, "host": int(WINDOWS * STEP_S / TICK_S)}, f"due clock off: {passes}"
         out = {
             "plugin": str(args.plugin.resolve()),
             "scale": {k: getattr(args, k) for k in ("sessions", "messages", "tasks", "replica_rows", "pending")},
             "build_s": round(build_s, 1), "replay_s": replay_s, "windows_moved": moved, "passes": passes,
+            "clock_advance_s": clock.wall - wall0, "floor_buckets": sorted(floors),
             "cpu_s": {k: round(v, 3) for k, v in cpu.items()},
             "pct_core": {k: round(100 * v / replay_s, 3) for k, v in cpu.items()},
             "waiting_rows": len(plugin.waiting_source()),
@@ -248,7 +312,10 @@ def main() -> int:
         print(text)
         if args.json:
             args.json.write_text(text)
-    return 0
+    failures = budget_failures({k: 100 * v / replay_s for k, v in cpu.items()})
+    for f in failures:
+        print(f"BUDGET FAIL: {f}", file=sys.stderr)
+    return 1 if failures and not args.diagnostic else 0
 
 
 if __name__ == "__main__":
