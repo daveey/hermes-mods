@@ -19,6 +19,14 @@ class Refused(RuntimeError):
     pass
 
 
+def positive_id(value):
+    return type(value) is int and value > 0
+
+
+def identity(value):
+    return isinstance(value, str) and bool(value.strip())
+
+
 def gh(*args):
     result = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=30)
     if result.returncode:
@@ -74,14 +82,14 @@ def requirements(read):
 
     identities(checks.get("checks", []), "app_id")
     for rule in pages(read, f"repos/{REPO}/rules/branches/{BRANCH}"):
-        if not isinstance(rule.get("type"), str) or not rule["type"]:
+        if not identity(rule.get("type")):
             raise Refused("Malformed branch rule identity")
         if rule["type"] == "required_status_checks":
             params = rule.get("parameters")
             if not isinstance(params, dict):
                 raise Refused("Malformed required-check rule parameters")
             identities(params.get("required_status_checks"), "integration_id")
-    if any(not isinstance(name, str) or not name for name, _ in required):
+    if any(not identity(name) for name, _ in required):
         raise Refused("Malformed required-check identity")
     return set(required)
 
@@ -92,21 +100,22 @@ def ci(read, head):
     statuses = pages(read, f"repos/{REPO}/commits/{head}/statuses")
     latest = {}
     for run in runs:
-        if run.get("head_sha") != head or not run.get("name") or not isinstance(run.get("id"), int):
+        if run.get("head_sha") != head or not identity(run.get("name")) or not positive_id(run.get("id")):
             raise Refused("Check run does not identify the exact head")
         # Same-named jobs in distinct workflows are independent evidence.
-        suite = run.get("check_suite", {}).get("id")
-        if not isinstance(suite, int):
+        suite_data = run.get("check_suite")
+        suite = suite_data.get("id") if isinstance(suite_data, dict) else None
+        if not positive_id(suite):
             raise Refused("Check run lacks check-suite identity")
         app = run.get("app")
-        if not isinstance(app, dict) or type(app.get("id")) is not int or app["id"] <= 0:
+        if not isinstance(app, dict) or not positive_id(app.get("id")):
             raise Refused("Check run lacks app identity")
         key = (run["name"], app["id"], "check", suite)
         value = (run["id"], run.get("status") == "completed" and run.get("conclusion") == "success")
         if key not in latest or value[0] > latest[key][0]:
             latest[key] = value
     for status in statuses:
-        if not status.get("context") or not isinstance(status.get("id"), int):
+        if not identity(status.get("context")) or not positive_id(status.get("id")):
             raise Refused("Malformed commit status")
         key = (status["context"], None, "status", None)
         value = (status["id"], status.get("state") == "success")
@@ -129,9 +138,9 @@ def reviews(read, number, head, pr):
     effective = {}
     for review in pages(read, f"repos/{REPO}/pulls/{number}/reviews"):
         if review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
-            user = review.get("user") or {}
-            login = user.get("login")
-            if not login or not isinstance(review.get("id"), int):
+            user = review.get("user")
+            login = user.get("login") if isinstance(user, dict) else None
+            if not identity(login) or not positive_id(review.get("id")):
                 raise Refused("Malformed review identity")
             stamp = review.get("submitted_at")
             if not isinstance(stamp, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", stamp):
@@ -181,7 +190,7 @@ def approval(read, number, head, pr, review_task, implementation_task):
     author = pr.get("user", {}).get("login")
     user = read("api", "user")
     lander = user.get("login") if isinstance(user, dict) else None
-    if not author or not lander:
+    if not identity(author) or not identity(lander):
         raise Refused("Cannot establish author/lander independence")
     excluded = {author.lower(), lander.lower()}
     for login, review in effective.items():
