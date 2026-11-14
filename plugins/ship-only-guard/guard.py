@@ -17,6 +17,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from contextvars import ContextVar, copy_context
 from concurrent.futures import ThreadPoolExecutor
@@ -584,13 +585,61 @@ def _flat_tree(sha, repo, cwd, env):
     return out
 
 
+class _Once:
+    """Single-flight memo of immutable reads shared by concurrent carry proofs (t_01a1d96e71233fe1).
+
+    Under the worker gh shim every concurrent call slows every other one (8 at once: ~4 s each), so the two
+    merges of a twice-updated PR reading the same trees in parallel (#2842: 8 tree reads, 6 distinct) cost the
+    preflight its drift check. The first caller reads; a concurrent caller waits for that read, bounded by its
+    own deadline, instead of issuing a duplicate. An _Unreadable answer is memoized too (every waiter fails
+    closed the same way); any other failure (expiry) is not, and its waiters re-read or expire themselves."""
+
+    def __init__(self, done=None):
+        self._lock = threading.Lock()
+        self._slots = {}
+        for key, value in (done or {}).items():
+            slot = self._slots[key] = [threading.Event(), value, None, False]
+            slot[0].set()
+
+    def get(self, key, fn, *args):
+        while True:
+            with self._lock:
+                slot = self._slots.get(key)
+                owner = slot is None
+                if owner:
+                    slot = self._slots[key] = [threading.Event(), None, None, False]   # event, value, error, failed
+            if owner:
+                try:
+                    slot[1] = fn(*args)
+                    return slot[1]
+                except _Unreadable as e:
+                    slot[2] = str(e)
+                    raise
+                except BaseException:
+                    slot[3] = True
+                    with self._lock:
+                        self._slots.pop(key, None)
+                    raise
+                finally:
+                    slot[0].set()
+            while not slot[0].wait(_remaining()):
+                pass                    # _remaining() raises once this waiter's own deadline has passed
+            if slot[2] is not None:
+                raise _Unreadable(slot[2])
+            if not slot[3]:
+                return slot[1]
+
+
 def _flat_trees(shas, repo, cwd, env, cache):
-    """_flat_tree of each sha; the uncached ones read in parallel (each read takes ~3 s on a 5k-path tree)."""
-    todo = [s for s in dict.fromkeys(shas) if s not in cache]
-    if todo:
-        values = _parallel([("carry tree reads", _flat_tree, (s, repo, cwd, env)) for s in todo])
-        cache.update(zip(todo, values))
-    return [cache[s] for s in shas]
+    """_flat_tree of each sha; the uncached ones read in parallel (each read takes ~3 s on a 5k-path tree).
+    `cache` is a shared `_Once` (concurrent proofs never read one tree twice) or a plain dict of done trees."""
+    once = cache if isinstance(cache, _Once) else _Once(cache)
+    unique = list(dict.fromkeys(shas))
+    values = dict(zip(unique, _parallel([("carry tree reads", once.get, (s, _flat_tree, s, repo, cwd, env))
+                                         for s in unique])))
+    if isinstance(cache, dict):
+        cache.update(values)
+    return [values[s] for s in shas]
 
 
 def _blob(sha, size, repo, cwd, env):
@@ -632,7 +681,23 @@ def _merge_file(ours, base, theirs, cwd):
 
 def _merge_tree_refusal(merge, ours, theirs, repo, cwd, env, cache):
     """Why `merge` is not the clean auto-merge of `ours` and `theirs` (its first and second parent), else ''."""
-    cmp = _gh_json(f"repos/{repo}/compare/{ours}...{theirs}", cwd, env)
+    cache = cache if isinstance(cache, _Once) else _Once(cache)
+
+    def held(fn, *args):
+        try:
+            return fn(*args)
+        except _Unreadable as exc:
+            return exc
+    # The merge's own trees do not depend on its merge base: read them while the compare runs (one wave
+    # instead of two, t_01a1d96e71233fe1). Their errors wait until the merge base is known, so a compare
+    # failure keeps its priority; the memo (`_Once`) hands each tree to the check below unread twice.
+    got = _parallel([("carry tree/content check", held, (_gh_json, f"repos/{repo}/compare/{ours}...{theirs}",
+                                                         cwd, env))]
+                    + [("carry tree reads", held, (cache.get, s, _flat_tree, s, repo, cwd, env))
+                       for s in dict.fromkeys((ours, theirs, merge))])
+    cmp = got[0]
+    if isinstance(cmp, _Unreadable):
+        raise cmp
     mb = cmp.get("merge_base_commit")
     mb = mb.get("sha") if isinstance(mb, dict) else None
     if not isinstance(mb, str) or not _SHA.fullmatch(mb):
@@ -830,8 +895,8 @@ def _carry_one(head, h0, blocked, repo, cwd, env):
         return ""
 
     def merge_proofs():
-        cache = {}
-        # Immutable tree entries may be read twice on concurrent cache misses.
+        cache = _Once()
+        # Immutable tree entries are read once across the concurrent merges (`_Once`).
         # No mutable decision or partially populated tree is cached here.
         ordered = list(reversed(merges))
         jobs = []
@@ -1049,7 +1114,8 @@ def _base_drift_refusal(number, repo, data, cwd, env, attribute=True, fresh=True
         named += f" (+{churn} sync/merge commit(s))"
     order = sorted(hits)
     shown = ", ".join(shown_hit(h) for h in order[:6]) + (f", +{len(order) - 6} more" if len(order) > 6 else "")
-    culprits = attribute and _attribute_hits(repo, order[:_ATTRIBUTE_HITS], {c["sha"]: c for c in commits}, subject, cwd, env)
+    culprits = attribute and _best_effort(_attribute_hits, repo, order[:_ATTRIBUTE_HITS],
+                                          {c["sha"]: c for c in commits}, subject, cwd, env)
     return (f"[ship-only-guard] Refused state merge of PR #{number}: its CI tested base {base[:10]} (or later), "
             f"and {total} state commit(s) landed since then; together they change this PR's areas ({shown}). No "
             f"check ran on that combination (#2491 turned state red this way). "
@@ -1059,6 +1125,37 @@ def _base_drift_refusal(number, repo, data, cwd, env, attribute=True, fresh=True
             "for green CI on the new head, then rerun the merge with --match-head-commit <new head>. The guard "
             "re-checks exact-head approval on the new head; an approval of the old head carries when the new "
             "head only merged state and the PR's `git patch-id --verbatim` is unchanged.")
+
+
+_ATTRIBUTE_RESERVE = 0.1     # share of PREFLIGHT_TIMEOUT kept for the verdict after best-effort attribution
+_ATTRIBUTE_MIN = 1.0         # seconds of attribution not worth starting (a lone shim call takes ~1.6 s)
+
+
+def _best_effort(fn, *args):
+    """`fn(*args)` under a sub-deadline, '' when it passes. Attribution is garnish on a drift refusal that
+    already stands: on a slow host (#2842, #2944 under the worker gh shim, t_01a1d96e71233fe1) its reads
+    turned the verdict into a 'deadline exceeded during drift attribution' retry, and the land turn the
+    refusal should record was never acquired, so hot-path PRs livelocked through update-branch/CI/drift.
+    The sub-deadline keeps _ATTRIBUTE_RESERVE of the budget for the verdict and, when the land turn could
+    still be acquired (> _TURN_BUDGET left), keeps that eligibility: the turn outranks the garnish. The
+    canonical deadline is still checked after."""
+    deadline = _PREFLIGHT_DEADLINE.get()
+    if deadline is None:
+        return fn(*args)
+    now = time.monotonic()
+    until = deadline - PREFLIGHT_TIMEOUT * _ATTRIBUTE_RESERVE
+    if deadline - now > _TURN_BUDGET:
+        until = min(until, deadline - _TURN_BUDGET - _ATTRIBUTE_RESERVE * PREFLIGHT_TIMEOUT / 2)
+    if until - now < _ATTRIBUTE_MIN:
+        return ""
+    token = _PREFLIGHT_DEADLINE.set(until)
+    try:
+        return fn(*args)
+    except _PreflightExpired:
+        return ""
+    finally:
+        _PREFLIGHT_DEADLINE.reset(token)
+        _remaining()
 
 
 def _attribute_hits(repo, names, window, subject, cwd, env):
