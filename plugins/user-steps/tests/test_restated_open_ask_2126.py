@@ -266,6 +266,61 @@ def plugin(tmp_path, monkeypatch):
     return mod
 
 
+def test_shared_extraction_expires_at_900_seconds_without_sliding_on_hits(plugin, monkeypatch):
+    import time
+
+    clock = [10_000.0]
+    monkeypatch.setattr(time, 'time', lambda: clock[0])
+    outputs = [payload(), payload([new_step()]), payload([OPEN_STEP])]
+    llm, calls = sequenced(outputs)
+    monkeypatch.setattr(plugin, 'aux_llm', llm)
+    system, user = 'Extract the open asks.', REPLY
+
+    assert plugin.shared_llm(system, user) == outputs[0]
+    clock[0] = 10_899.0  # fixed contract: reuse before 900s, not a value derived from the implementation
+    assert plugin.shared_llm(system, user) == outputs[0]
+    assert calls == [user]
+    clock[0] = 10_900.0  # a hit at 899s must not extend the original entry's lifetime
+    assert plugin.shared_llm(system, user) == outputs[1]
+    assert calls == [user, user]
+    clock[0] = 11_799.0
+    assert plugin.shared_llm(system, user) == outputs[1]
+    assert calls == [user, user]
+    clock[0] = 11_800.0  # refreshed entries expire too; no response can stay cached forever
+    assert plugin.shared_llm(system, user) == outputs[2]
+    assert calls == [user, user, user]
+
+
+def test_shared_extraction_isolates_exact_prompts_and_model_functions(plugin, monkeypatch):
+    import time
+
+    monkeypatch.setattr(time, 'time', lambda: 10_000.0)
+    calls = []
+
+    def first(system, user):
+        calls.append(('first', system, user))
+        return f'first response {len(calls)}'
+
+    def second(system, user):
+        calls.append(('second', system, user))
+        return 'second response'
+
+    monkeypatch.setattr(plugin, 'aux_llm', first)
+    # These two pairs would collide if the system/user separator were dropped.
+    for system, user, expected in [('ab', 'c', 'first response 1'), ('a', 'bc', 'first response 2'),
+                                   ('ab', 'c ', 'first response 3')]:
+        assert plugin.shared_llm(system, user) == expected
+        assert plugin.shared_llm(system, user) == expected
+    assert calls == [('first', 'ab', 'c'), ('first', 'a', 'bc'), ('first', 'ab', 'c ')]
+    monkeypatch.setattr(plugin, 'aux_llm', second)
+    assert plugin.shared_llm('ab', 'c') == 'second response'
+    assert plugin.shared_llm('ab', 'c') == 'second response'
+    assert calls[-1] == ('second', 'ab', 'c') and len(calls) == 4
+    monkeypatch.setattr(plugin, 'aux_llm', first)
+    assert plugin.shared_llm('ab', 'c') == 'first response 1'
+    assert len(calls) == 4
+
+
 def open_requests(plugin):
     return [r for r in plugin.core.ActionStore().requests(OWNER)
             if r['state'] in ('open', 'needs_context') and not r.get('resolution')]

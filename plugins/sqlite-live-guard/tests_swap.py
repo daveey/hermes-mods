@@ -204,6 +204,7 @@ class SwapCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn('row loss in session_change', result.stderr)
 
+
     def test_throughput_cursor_policy_without_core(self):
         # Public CI has no core. Exercise the exact-name policy there as well as
         # the real SessionDB/recovery/CLI integration below on core-equipped hosts.
@@ -229,6 +230,44 @@ class SwapCLI(unittest.TestCase):
         self.add(self.replacement, 'CREATE TABLE throughput_unknown(id TEXT); INSERT INTO throughput_unknown VALUES("changed");')
         with self.assertRaisesRegex(module.Refusal, 'content changed in throughput_unknown'):
             module._policy(self.db, self.replacement, recovered=True, ack=True)
+
+    @needs_proc
+    def test_absent_session_cursor_tables_allowed_in_recovered_state(self):
+        self.state()
+        self.add(self.db,
+                 'CREATE TABLE session_change(session_id TEXT PRIMARY KEY NOT NULL, rev INTEGER NOT NULL) WITHOUT ROWID;'
+                 'INSERT INTO session_change VALUES("saved",1),("deleted",2);'
+                 'CREATE TABLE session_change_revision(id INTEGER PRIMARY KEY CHECK (id = 1), revision INTEGER NOT NULL, epoch TEXT NOT NULL);'
+                 'INSERT INTO session_change_revision VALUES(1,2,"old-epoch");')
+        # Neither cursor table exists in the replacement: changed rows alone do
+        # not exercise the missing-table allowance. Writers rebuild these cursors.
+        with contextlib.closing(sqlite3.connect(self.replacement)) as con:
+            self.assertEqual(con.execute(
+                "SELECT name FROM sqlite_master WHERE name IN ('session_change','session_change_revision')"
+            ).fetchall(), [])
+        receipt = self.successful(self.cli('--recovered-state', '--ack-runtime-loss'))
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            self.assertEqual(con.execute('SELECT id FROM sessions').fetchall(), [('saved',)])
+        self.assertEqual(receipt['phase'], 'complete')
+
+    @needs_proc
+    def test_absent_empty_session_cursor_tables_refused_in_plain_swap(self):
+        # Empty source tables isolate schema loss from the separate row-loss gate.
+        for table, schema in (
+            ('session_change', 'session_id TEXT PRIMARY KEY NOT NULL, rev INTEGER NOT NULL'),
+            ('session_change_revision', 'id INTEGER PRIMARY KEY CHECK (id = 1), revision INTEGER NOT NULL, epoch TEXT NOT NULL'),
+        ):
+            with self.subTest(table=table):
+                self.add(self.db, f'CREATE TABLE {table}({schema});')
+                before = self.db.read_bytes()
+                result = self.cli()
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn('replacement lacks durable/unknown tables', result.stderr)
+                self.assertIn(table, result.stderr)
+                self.assertEqual(self.db.read_bytes(), before)
+                self.assertFalse(list(self.root.glob('.*.recovery-*/original.db')))
+                self.add(self.db, f'DROP TABLE {table};')
+
 
     def test_fk_failure(self):
         self.add(self.replacement, 'CREATE TABLE parent(id INTEGER PRIMARY KEY); CREATE TABLE child(pid INTEGER REFERENCES parent(id)); INSERT INTO child VALUES(99);')

@@ -719,6 +719,54 @@ def test_unreadable_blob_refused(monkeypatch, which, answer, reason):
     assert why and reason in why and "a clean merge cannot be shown" in why
 
 
+@pytest.mark.parametrize("tampered", [False, True], ids=["valid", "wrong-content"])
+def test_carry_blob_checks_local_object_hash_without_fallback(monkeypatch, tampered):
+    data = b"fetched blob\n"
+    sha = blob_sha(data)
+    reads = []
+
+    def local_blob(requested):
+        reads.append(requested)
+        # Same length: rejection must depend on the content-addressed hash, not size.
+        return b"altered blob\n" if tampered else data
+
+    def no_fallback(*args):
+        pytest.fail("a local blob must be verified without an API fallback")
+
+    monkeypatch.setattr(g, "_blob", no_fallback)
+    objects = SimpleNamespace(blob=local_blob)
+    if tampered:
+        with pytest.raises(g._Unreadable, match=f"blob {sha[:10]} does not hash to its id"):
+            g._carry_blob(sha, len(data), R, None, {}, objects)
+    else:
+        assert g._carry_blob(sha, len(data), R, None, {}, objects) == data
+    assert reads == [sha]
+
+
+@pytest.mark.parametrize("has_objects", [False, True], ids=["no-objects", "local-miss"])
+@pytest.mark.parametrize("tampered", [False, True], ids=["valid", "wrong-content"])
+def test_carry_blob_fallback_keeps_hash_verification(monkeypatch, has_objects, tampered):
+    data = b"fallback blob\n"
+    sha = blob_sha(data)
+    calls = fake(monkeypatch, answers={
+        f"repos/{R}/git/blobs/{sha}": blob_answer(b"tampered blob\n" if tampered else data),
+    })
+    reads = []
+
+    def local_miss(requested):
+        reads.append(requested)
+        return None
+
+    objects = SimpleNamespace(blob=local_miss) if has_objects else None
+    if tampered:
+        with pytest.raises(g._Unreadable, match=f"blob {sha[:10]} does not hash to its id"):
+            g._carry_blob(sha, len(data), R, None, {}, objects)
+    else:
+        assert g._carry_blob(sha, len(data), R, None, {}, objects) == data
+    assert reads == ([sha] if has_objects else [])
+    assert len(calls) == 1 and calls[0][-1] == f"repos/{R}/git/blobs/{sha}"
+
+
 def test_oversized_blob_is_never_read(monkeypatch):
     big = g._MERGE_BLOB_BYTES + 1
     calls = shared(monkeypatch, ours=("100644", blob_sha(SHARED["ours"]), big))
