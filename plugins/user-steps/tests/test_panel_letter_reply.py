@@ -109,6 +109,98 @@ def test_pre_llm_call_builds_the_real_presenter(tmp_path, monkeypatch):
     assert 'A = "Go: A+B+C", B = "A only (cadence)", C = "No, keep instant", D = "Skip"' in result["context"]
 
 
+def _question(**overrides):
+    request = {
+        "requestId": "question-one", "title": "Choose a route",
+        "presentation": {"kind": "kanban-question", "question": "Which route?",
+                         "details": "Choose one", "other": True},
+        "choices": [{"id": "first", "label": "First route"},
+                    {"id": "second", "label": "Second route"}],
+    }
+    request.update(overrides)
+    return request
+
+
+def test_other_is_lettered_only_when_offered(tmp_path, monkeypatch):
+    plugin = _plugin("panel_letter_other", tmp_path, monkeypatch)
+    request = _question()
+    assert plugin._panel_rows(request) == ["First route", "Second route", "Skip", "Other (type your answer)"]
+    assert 'D = "Other (type your answer)"' in plugin._panel_letter_hint("d", [request])
+    request["presentation"]["other"] = False
+    assert plugin._panel_letter_hint("d", [request]) == ""
+
+
+def test_only_legacy_request_context_placeholder_is_filtered(tmp_path, monkeypatch):
+    plugin = _plugin("panel_letter_legacy", tmp_path, monkeypatch)
+    request = _question(choices=[
+        {"id": "request-context", "effect": "revise", "label": "Request complete action"},
+        {"id": "first", "label": "First route"},
+    ])
+    assert plugin._panel_rows(request) == ["First route", "Skip", "Other (type your answer)"]
+    assert 'A = "First route"' in plugin._panel_letter_hint("a", [request])
+    # PR190 preserves genuine revise choices; matching the id/effect alone is insufficient.
+    request["choices"][0]["label"] = "Change the route"
+    assert plugin._panel_rows(request) == ["Change the route", "First route", "Skip", "Other (type your answer)"]
+    request["choices"][0].update(label="Request complete action", effect="select")
+    assert plugin._panel_rows(request)[0] == "Request complete action"
+    request["choices"][0].update(id="real-choice", effect="revise")
+    assert plugin._panel_rows(request)[0] == "Request complete action"
+
+
+def test_non_question_presentation_never_assigns_letters(tmp_path, monkeypatch):
+    plugin = _plugin("panel_letter_kind", tmp_path, monkeypatch)
+    request = _question()
+    assert plugin._panel_letter_hint("a", [request])
+    request["presentation"]["kind"] = "approval"
+    assert plugin._panel_rows(request) == []
+    assert plugin._panel_letter_hint("a", [request]) == ""
+
+
+def test_multiple_matching_asks_require_disambiguation(tmp_path, monkeypatch):
+    plugin = _plugin("panel_letter_multiple", tmp_path, monkeypatch)
+    first = _question()
+    second = _question(requestId="another-request", title="Choose a time")
+    hint = plugin._panel_letter_hint("a", [first, second])
+    assert '2 open asks have a "A": ask which one before acting.' in hint
+    assert '"Choose a route" (requestId question)' in hint
+    assert '"Choose a time" (requestId another-)' in hint
+    assert "ask which one before acting" not in plugin._panel_letter_hint("a", [first])
+
+
+def test_choice_recommended_flag_orders_without_presentation_id(tmp_path, monkeypatch):
+    plugin = _plugin("panel_letter_flag", tmp_path, monkeypatch)
+    request = _question()
+    request["choices"][1]["recommended"] = True
+    assert "recommendedChoiceId" not in request["presentation"]
+    assert plugin._panel_rows(request) == ["Second route", "First route", "Skip", "Other (type your answer)"]
+    assert 'A = "Second route", B = "First route"' in plugin._panel_letter_hint("a", [request])
+
+
+def test_pre_llm_call_contains_mapping_failure_and_keeps_decisions(tmp_path, monkeypatch, caplog):
+    plugin = _plugin("panel_letter_failure", tmp_path, monkeypatch)
+    _, store = _incident_mirror(tmp_path)
+    monkeypatch.setattr(plugin.core, "home", lambda: tmp_path)
+    monkeypatch.setattr(plugin.core, "kanban_root", lambda: tmp_path)
+    monkeypatch.setattr(plugin.core, "server_owner", lambda sid: dict(OWNER, storedSessionId=sid))
+    monkeypatch.setattr(plugin.core, "ActionStore", lambda *a, **kw: store)
+    monkeypatch.setattr(plugin.chat, "reconcile", lambda *a, **kw: None)
+    calls = []
+
+    def broken_mapping(message, requests):
+        calls.append((message, requests))
+        raise ValueError("synthetic mapping failure")
+
+    monkeypatch.setattr(plugin, "_panel_letter_hint", broken_mapping)
+    result = plugin.pre_llm_call(session_id="session-a", platform="desktop", user_message="a")
+    assert len(calls) == 1 and calls[0][0] == "a" and calls[0][1]
+    assert result and "Canonical requests awaiting a user decision" in result["context"]
+    assert store.requests(OWNER)[0]["requestId"] in result["context"]
+    assert "Decision panel letters" not in result["context"]
+    assert "user-steps panel letter mapping failed" in caplog.text
+    assert "synthetic mapping failure" in caplog.text
+    assert "user-steps pre_llm_call failed" not in caplog.text
+
+
 def test_python_letter_order_still_matches_the_desktop_panel():
     """_panel_rows mirrors plugin.js; if the panel's lettering or order changes, update both together."""
     js = (ROOT.parents[1] / "desktop-plugins" / "user-steps" / "plugin.js").read_text()
