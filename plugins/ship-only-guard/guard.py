@@ -16,11 +16,15 @@ import shlex
 import subprocess
 import sys
 import time
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
+from concurrent.futures import ThreadPoolExecutor
 
 # One aggregate allowance, not a fresh timeout for every API/file/merge probe.
-PREFLIGHT_TIMEOUT = 120.0
+PREFLIGHT_TIMEOUT = 18.0
 _PREFLIGHT_DEADLINE: ContextVar[float | None] = ContextVar("ship_preflight_deadline", default=None)
+_PREFLIGHT_STAGE = ContextVar("ship_preflight_stage", default="command inspection")
+_TURN_READ_ONLY = ContextVar("ship_turn_read_only", default=False)
+
 
 
 class _PreflightExpired(RuntimeError):
@@ -33,7 +37,8 @@ def _remaining():
         return None
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise _PreflightExpired("ship-only-guard preflight deadline exceeded; retry after checking network/CI")
+        raise _PreflightExpired("ship-only-guard preflight deadline exceeded during "
+                                + _PREFLIGHT_STAGE.get() + "; retry after checking network/CI")
     return remaining
 
 
@@ -50,6 +55,31 @@ def bounded_preflight(check, *args, **kwargs):
         return str(exc)
     finally:
         _PREFLIGHT_DEADLINE.reset(token)
+
+
+def _stage(name, fn, *args):
+    token = _PREFLIGHT_STAGE.set(name)
+    try:
+        _remaining()
+        result = fn(*args)
+        _remaining()
+        return result
+    finally:
+        _PREFLIGHT_STAGE.reset(token)
+
+
+def _parallel(jobs):
+    """Independent bounded reads; preserve result/exception priority and context.
+
+    Joining all workers is intentional: none may keep probing after we return.
+    Each worker (including nested pools) inherits the SAME aggregate deadline.
+    """
+    if not jobs:
+        return []
+    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        futures = [pool.submit(copy_context().run, _stage, name, fn, *args)
+                   for name, fn, args in jobs]
+        return [f.result() for f in futures]
 
 
 def _run_probe(*args, **kwargs):
@@ -495,13 +525,10 @@ def _flat_tree(sha, repo, cwd, env):
 
 def _flat_trees(shas, repo, cwd, env, cache):
     """_flat_tree of each sha; the uncached ones read in parallel (each read takes ~3 s on a 5k-path tree)."""
-    from concurrent.futures import ThreadPoolExecutor
     todo = [s for s in dict.fromkeys(shas) if s not in cache]
     if todo:
-        with ThreadPoolExecutor(max_workers=len(todo)) as pool:
-            futures = [pool.submit(_flat_tree, s, repo, cwd, env) for s in todo]
-            for s, future in zip(todo, futures):
-                cache[s] = future.result()   # re-raises _Unreadable
+        values = _parallel([("carry tree reads", _flat_tree, (s, repo, cwd, env)) for s in todo])
+        cache.update(zip(todo, values))
     return [cache[s] for s in shas]
 
 
@@ -571,7 +598,9 @@ def _merge_tree_refusal(merge, ours, theirs, repo, cwd, env, cache):
     for path in both:
         # Two file modes only, so at most one side changed the mode: that side's mode wins, as in git.
         mode = t[path][0] if o[path][0] == base[path][0] else o[path][0]
-        ours_b, base_b, theirs_b = (_blob(tree[path][1], tree[path][2], repo, cwd, env) for tree in (o, base, t))
+        ours_b, base_b, theirs_b = _parallel([
+            ("carry blob reads", _blob, (tree[path][1], tree[path][2], repo, cwd, env))
+            for tree in (o, base, t)])
         blob = _merge_file(ours_b, base_b, theirs_b, cwd)
         if blob is None:
             return f"{path} does not merge cleanly"
@@ -705,8 +734,9 @@ def _carry_one(head, h0, blocked, repo, cwd, env):
                 return False, (f"{lead}: merge parent {parent[:10]} is not on state (the head merged "
                                "something other than the base)")
         diff = "application/vnd.github.diff"
-        old = _patch_id(_gh_text(f"repos/{repo}/compare/state...{h0}", cwd, env, accept=diff), cwd)
-        new = _patch_id(_gh_text(f"repos/{repo}/compare/state...{head}", cwd, env, accept=diff), cwd)
+        def patch_id(sha):
+            return _patch_id(_gh_text(f"repos/{repo}/compare/state...{sha}", cwd, env, accept=diff), cwd)
+        old, new = _parallel([("carry patch reads", patch_id, (sha,)) for sha in (h0, head)])
     except _Unreadable as e:
         return False, f"{lead}: {e}, so patch identity cannot be shown"
     if old != new:
@@ -714,9 +744,11 @@ def _carry_one(head, h0, blocked, repo, cwd, env):
     cache = {}
     try:
         for merge, ours, theirs in reversed(merges):
-            why = _merge_tree_refusal(merge, ours, theirs, repo, cwd, env, cache)
-            if not why:
-                why = _git_merge_tree_refusal(merge, ours, theirs, repo, cwd, env)
+            prefilter, authoritative = _parallel([
+                ("carry tree/content check", _merge_tree_refusal, (merge, ours, theirs, repo, cwd, env, cache)),
+                ("carry git fetch/merge-tree", _git_merge_tree_refusal, (merge, ours, theirs, repo, cwd, env)),
+            ])
+            why = prefilter or authoritative
             if why:
                 return False, f"{lead}: merge {merge[:10]} is not a clean, unedited merge of the base: {why}"
     except _Unreadable as e:
@@ -1026,7 +1058,7 @@ def _live_turns(repo, cwd, env):
         if rec and rec["expires"] > now:
             out.append((ref["ref"], rec))
         elif rec is None or rec["expires"] + _TURN_TTL <= now:
-            _gh_call(["-X", "DELETE", f"repos/{repo}/git/{ref['ref']}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+            _turn_delete(ref['ref'], repo, cwd, env)
     return out
 
 
@@ -1052,7 +1084,7 @@ def _turn_hold_refusal(number, data, repo, cwd, env):
         if rc != 0 or not isinstance(pr, dict):
             continue   # cannot tell whether the holder is still open: fail open
         if pr.get("state") != "open":
-            _gh_call(["-X", "DELETE", f"repos/{repo}/git/{ref}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+            _turn_delete(ref, repo, cwd, env)
             continue   # the holder landed or closed: its turn is over
         return (f"[ship-only-guard] Refused state merge of PR #{number}: PR #{rec['pr']} holds the state land "
                 f"turn until {_until(rec['expires'])} ({ref}), and this merge would change its area ({hit[1]} ~ "
@@ -1111,8 +1143,24 @@ def _turn_safe(fn, *args):
     """The land turn only orders landings: any error in it adds nothing (the drift compare still guards)."""
     try:
         return fn(*args)
+    except _PreflightExpired:
+        raise
     except Exception:
         return None
+
+
+def _turn_delete(ref, repo, cwd, env):
+    if not _TURN_READ_ONLY.get():
+        _gh_call(["-X", "DELETE", f"repos/{repo}/git/{ref}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+
+
+def _turn_hold_read_only(*args):
+    # Speculation must not delete refs before the approval gate has succeeded.
+    token = _TURN_READ_ONLY.set(True)
+    try:
+        return _turn_safe(_turn_hold_refusal, *args)
+    finally:
+        _TURN_READ_ONLY.reset(token)
 
 
 def _state_merge(words, repo, cwd, env):
@@ -1222,15 +1270,27 @@ def _state_merge(words, repo, cwd, env):
         if bad:
             return failed(f"{len(bad)} of {len(checks)} checks not green: " + ", ".join(bad[:8])
                           + (f", +{len(bad) - 8} more" if len(bad) > 8 else ""))
-        refusal = (_review_reply_refusal(number, data) or _approval_refusal(number, data, repo, cwd, env)
-                   or _turn_safe(_turn_hold_refusal, number, data, repo, cwd, env))
+        refusal = _review_reply_refusal(number, data)
         if refusal:
             return refusal
-        drift = _base_drift_refusal(number, repo, data, cwd, env)
+        approval, hold = _parallel([
+            ("approval/carry reads", _approval_refusal, (number, data, repo, cwd, env)),
+            ("land-turn reads", _turn_hold_read_only, (number, data, repo, cwd, env)),
+        ])
+        if approval or hold:
+            return approval or hold
+        # Keep the mutable base read last; speculative drift would widen the race
+        # between observing state and handing the admitted command to gh.
+        drift = _stage("drift check", _base_drift_refusal, number, repo, data, cwd, env)
         if drift and "state commit(s) landed since then" in drift:
             # Green, approved, refused only for drift: take the land turn so the refreshed head's CI cycle
             # is the last one (overlapping merges and direct pushes wait for it).
-            until = _turn_safe(_turn_acquire, number, data, repo, cwd, env)
+            # Taking a turn is optional and cannot change the refusal. Do not start
+            # its writes when the aggregate allowance cannot fit its own budget.
+            remaining = _remaining()
+            until = (_stage("land-turn acquisition", _turn_safe, _turn_acquire,
+                            number, data, repo, cwd, env)
+                     if remaining is None or remaining > _TURN_BUDGET else None)
             if until:
                 drift += (f" PR #{number} now holds the state land turn until {until} (refs/{_TURN_PREFIX}"
                           f"{number}): overlapping state PR merges and direct state pushes wait for it, so "

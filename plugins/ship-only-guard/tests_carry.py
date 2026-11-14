@@ -173,8 +173,8 @@ def test_patch_identical_update_branch_head_admitted(monkeypatch):
     calls = fake(monkeypatch)
     assert check() is None
     paths = [c[-1] for c in calls[1:]]
-    assert paths[:4] == [f"repos/{R}/compare/{H0}...{H}", f"repos/{R}/compare/{BASE_TIP}...state",
-                         f"repos/{R}/compare/state...{H0}", f"repos/{R}/compare/state...{H}"]
+    assert paths[:2] == [f"repos/{R}/compare/{H0}...{H}", f"repos/{R}/compare/{BASE_TIP}...state"]
+    assert sorted(paths[2:4]) == sorted([f"repos/{R}/compare/state...{H0}", f"repos/{R}/compare/state...{H}"])
     # then the merge's tree against the clean merge of its parents (trees read in parallel)
     assert paths[4] == f"repos/{R}/compare/{H0}...{BASE_TIP}"
     assert sorted(paths[5:9]) == sorted(tree_path(s) for s in (STATE_OLD, H0, BASE_TIP, H))
