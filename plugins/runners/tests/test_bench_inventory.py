@@ -15,7 +15,7 @@ import sqlite3
 import time
 from copy import deepcopy
 
-from plugins.runners.collector import Collector
+from plugins.runners.collector import Collector, iso
 from plugins.runners.providers.base import ProviderResult
 from plugins.runners.service import Service
 from plugins.runners.store import Store
@@ -47,7 +47,8 @@ def snapshots(path, cfg):
         sid = f'scope_{i + 1:016x}'
         scopes.append(dict(cfg['scopes'][0], id=sid, name=f'example/project-{i}'))
         result = deepcopy(template)
-        result['coverage']['scope_id'] = sid
+        result['coverage'].update(scope_id=sid, enumerated_count=RUNNERS // 556 + (i < RUNNERS % 556),
+                                  provider_total_count=RUNNERS // 556 + (i < RUNNERS % 556))
         result['provenance']['source_id'] = sid
         if i < 221:
             result.update(error='forbidden', complete=False)
@@ -70,10 +71,25 @@ def snapshots(path, cfg):
     for n, t in enumerate(range(0, SPAN, WRITE_EVERY)):
         at = 1000.0 + t
         snap['at'] = at
+        cycle = f'collection_{n + 1:016x}'
         for rid in ids:
-            snap['states'][rid]['processed_at'] = at
+            snap['states'][rid].update(processed_at=at, cycle=cycle)
         for rid in live:
             snap['states'][rid]['at'] = at
+        live_ids = set(live)
+        refreshed = set()
+        for row in snap['runners']:
+            if row['id'] in live_ids:
+                row['observation_ids'] = [f"observation_{n:04x}{int(row['provider_runner_id']):012x}"]
+                refreshed.add(row['scope_id'])
+        ttl = cfg['thresholds']['inventory_stale_seconds']
+        for sid in refreshed:
+            result = snap['scope_results'][sid]
+            result.update(observed_at=at, served_at=at)
+            result['provenance'].update(collection_id=cycle, observed_at=iso(at), expires_at=iso(at + ttl))
+        snap['provenance'] = [deepcopy(r['provenance']) for r in snap['scope_results'].values()]
+        for error in snap['source_errors']:
+            error['observed_at'] = snap['scope_results'][error['source_id']]['provenance']['observed_at']
         if n % 2 == 0:
             snap['host_results'][hid]['at'] = at
         out.append((t, json.dumps(snap)))

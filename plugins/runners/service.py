@@ -138,9 +138,13 @@ def _next_flip(stamps, ttls, now):
     the bound at or before that). Each bound is FLIP_EARLY_S early: provenance compares the clock with x + d
     after an ISO round trip, which rounds to the microsecond."""
     best = math.inf
-    seen = set()
+    seen_int, seen_float = set(), set()
     for x in stamps:
-        if type(x) not in (int, float) or x in seen:
+        if type(x) not in (int, float):
+            continue
+        # Equal ints/floats can have different addition rounding at large values.
+        seen = seen_int if type(x) is int else seen_float
+        if x in seen:
             continue
         seen.add(x)  # most states share a collection timestamp
         try:
