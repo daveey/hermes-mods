@@ -792,21 +792,37 @@ def _carry_one(head, h0, blocked, repo, cwd, env):
     except _Unreadable as e:
         return False, f"{lead}: {e}, so patch identity cannot be shown"
 
+    def outcomes(jobs):
+        def capture(fn, *args):
+            try:
+                return fn(*args)
+            except _Unreadable as exc:
+                return exc
+        # Capture ordinary read errors until their predicate is evaluated, but
+        # never capture expiry: every speculative worker owns the same deadline.
+        return _parallel([(name, capture, (fn, *args)) for name, fn, args in jobs])
+
+    def require(value):
+        if isinstance(value, _Unreadable):
+            raise value
+        return value
+
     def membership_and_patch():
         try:
             parents = list(dict.fromkeys(bases))
             def patch_id(sha):
                 return _patch_id(_gh_text(f"repos/{repo}/compare/state...{sha}", cwd, env,
                                          accept="application/vnd.github.diff"), cwd)
-            results = _parallel([
+            results = outcomes([
                 ("carry base membership", _gh_json, (f"repos/{repo}/compare/{parent}...state", cwd, env))
                 for parent in parents
             ] + [("carry patch reads", patch_id, (sha,)) for sha in (h0, head)])
             for parent, on in zip(parents, results):
+                on = require(on)
                 if on.get("status") not in ("ahead", "identical") or on.get("behind_by") != 0:
                     return (f"{lead}: merge parent {parent[:10]} is not on state (the head merged "
                             "something other than the base)")
-            old, new = results[-2:]
+            old, new = map(require, results[-2:])
             if old != new:
                 return f"{lead}: the PR's patch changed (patch-id {old[:12]} -> {new[:12]})"
         except _Unreadable as e:
@@ -825,8 +841,9 @@ def _carry_one(head, h0, blocked, repo, cwd, env):
                 ("carry git fetch/merge-tree", _git_merge_tree_refusal, (merge, ours, theirs, repo, cwd, env)),
             ])
         try:
-            results = _parallel(jobs)
+            results = outcomes(jobs)
             for (merge, _, _), prefilter, authoritative in zip(ordered, results[::2], results[1::2]):
+                prefilter, authoritative = require(prefilter), require(authoritative)
                 why = prefilter or authoritative
                 if why:
                     return f"{lead}: merge {merge[:10]} is not a clean, unedited merge of the base: {why}"
