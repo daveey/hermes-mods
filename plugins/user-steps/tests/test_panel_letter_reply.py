@@ -61,7 +61,18 @@ def test_letter_with_trailing_words_and_non_letter_messages(tmp_path, monkeypatc
     presented = [mirror.present(r) for r in store.requests(OWNER)]
     assert 'B = "A only (cadence)"' in plugin._panel_letter_hint("b - skip that, another session has it", presented)
     assert 'C = "No, keep instant"' in plugin._panel_letter_hint("(c)", presented)
+    assert 'A = "Go: A+B+C"' in plugin._panel_letter_hint("a.", presented)
+    assert 'A = "Go: A+B+C"' in plugin._panel_letter_hint("A: go", presented)
+    assert 'B = "A only (cadence)"' in plugin._panel_letter_hint("b, please", presented)
+    assert 'B = "A only (cadence)"' in plugin._panel_letter_hint("option b", presented)
+    assert 'A = "Go: A+B+C"' in plugin._panel_letter_hint("(a) all of it", presented)
+    assert 'C = "No, keep instant"' in plugin._panel_letter_hint("c \u2014 not now", presented)
     for text in ("a new idea: batch it", "go", "do everything", "", "z"):
+        assert plugin._panel_letter_hint(text, presented) == "", text
+    # Abbreviations and hyphenated words are English, not option letters (PR #188 review): with A-E shown,
+    # "e.g. ..." would map to Other and "a.k.a."/"A-OK" to the recommended option, the incident in reverse.
+    for text in ("e.g. do the first one", "i.e. that one", "e-mail him", "a.k.a. the plan", "A-OK",
+                 "x-ray it", "t-shirt", "u.s. only", "P.S. thanks", "a-ha"):
         assert plugin._panel_letter_hint(text, presented) == "", text
     # Unlettered (non-card) requests never produce a mapping.
     assert plugin._panel_letter_hint("a", [dict(r, presentation=None) for r in presented]) == ""
