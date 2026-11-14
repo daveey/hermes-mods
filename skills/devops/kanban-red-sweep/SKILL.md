@@ -262,7 +262,7 @@ and the final response.
   alone can hold many) and by chat-level asks (`us_*` item ids) that are not cards. `red_cards.py list`
   covers both; remote cards are commented and unblocked on their own host, `cross_task` only reads and comments.
   Macs: `tailnet_exec` with the tailnet host (`mbp`, `mini`), not the gateway name. Workers:
-  `~/.hermes/bin/hub-worker-exec worker-N -- bash -lc "hermes kanban comment <id> '...' && hermes kanban unblock <id>"`.
+  `~/.hermes/bin/hub-worker-exec worker-N -- bash -lc "hermes kanban comment <id> -- '...' && hermes kanban unblock <id>"`.
 - A chat still painted red after its cards finished: run `hermes sessions outcome <id> --refresh` on its gateway. It
   re-derives the outcome from live cards, so a decision about a done card becomes `done`. Never edit `state.db`.
 - Chat-level asks (`us_*` extracted user-steps, For-you requests) can only be withdrawn by the chat that owns them;

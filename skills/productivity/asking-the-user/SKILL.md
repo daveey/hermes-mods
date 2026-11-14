@@ -77,7 +77,7 @@ ask only once its prerequisite is verifiably in place. If an early one is alread
   "from your own Hermes chat open the owner-terminal flow" and this chat IS the user's Desktop chat, the launch is
   yours: run the reviewed recipe through `run_in_user_terminal`, comment the job id and log path, and unblock the
   card; don't relay the ask. Re-read the job's log tail, then post both in one command (`test -s <note> &&
-  hermes kanban comment <id> "$(cat <note>)" && hermes kanban unblock <id>`): a worker picks the unblocked card
+  hermes kanban comment <id> -- "$(cat <note>)" && hermes kanban unblock <id>`): a worker picks the unblocked card
   up within a minute, so an unblock that outlives a failed comment starts it without the job id, and a note
   drafted before a failed post can call a check running after it passed.
   "Approved, unblock" on such a card means run it, then unblock: unblocking alone runs
