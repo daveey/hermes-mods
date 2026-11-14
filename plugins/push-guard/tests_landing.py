@@ -262,6 +262,29 @@ def test_python_literal_argv_raw_merge_held(exe, call):
     assert plugin._pre_tool_call('execute_code', {'code': code})['action'] == 'block'
 
 
+@pytest.mark.parametrize('value', [True, False, -1, 0, '1', None, 1.5])
+@pytest.mark.parametrize('field', ['run', 'suite', 'status', 'review'])
+def test_malformed_evidence_ids_never_write(field, value):
+    api = GitHub()
+    if field == 'run': api.runs[0]['id'] = value
+    if field == 'suite': api.runs[0]['check_suite']['id'] = value
+    if field == 'status': api.statuses = [{'id': value, 'context': 'external', 'state': 'success'}]
+    if field == 'review': api.reviews[0]['id'] = value
+    with pytest.raises(land.Refused): land.land(7, HEAD, read=api)
+    assert not api.writes
+
+
+@pytest.mark.parametrize('value', [True, 123, None, '', '  ', [], {}])
+@pytest.mark.parametrize('field', ['run', 'status', 'review'])
+def test_malformed_evidence_names_never_write(field, value):
+    api = GitHub()
+    if field == 'run': api.runs[0]['name'] = value
+    if field == 'status': api.statuses = [{'id': 2, 'context': value, 'state': 'success'}]
+    if field == 'review': api.reviews[0]['user']['login'] = value
+    with pytest.raises(land.Refused): land.land(7, HEAD, read=api)
+    assert not api.writes
+
+
 def test_graphql_held_without_config(monkeypatch):
     monkeypatch.setattr(guard, '_gql_repo', lambda *_: land.REPO)
     assert guard.check_shell("gh api graphql -f 'query=mutation{mergePullRequest(input:{pullRequestId: \"PR_test123\"}){clientMutationId}}'", '/', guards=[])
