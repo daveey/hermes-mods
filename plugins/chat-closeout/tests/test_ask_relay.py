@@ -289,3 +289,107 @@ def test_read_cards_returns_parents(tmp_path):
     got = core.read_cards([db], ['t_ask', 't_kid', 't_solo'])
     assert got['t_kid']['parents'] == ['t_ask']
     assert got['t_solo']['parents'] == [] and got['t_ask']['parents'] == []
+
+
+# ---- a deferred relay re-proves the quote right before delivery (MacBook chat ..bef6c6, sanitized) ---------------
+# The relay of a card's ask was deferred while the chat was busy; that busy turn's reply quoted the ask verbatim,
+# and the ask was relayed again right after it. Placeholders only.
+
+QUOTED = {"action": "Choose whether to accept the bounded investigation and waive the old replay, keeping live proof "
+                    "required. Unblock = resume under your selected acceptance; archive = stop without claiming it "
+                    "passed.",
+          "why_human": "an acceptance limit only the user sets", "interaction": "reply",
+          "scope": "landing-fix acceptance", "evidence": "two checks need history that was never recorded"}
+BLOCKED_AT = 1000.0
+
+
+def _quoting_state_db(tmp_path, monkeypatch):
+    import sqlite3
+    db = tmp_path / 'state.db'
+    c = sqlite3.connect(db)
+    c.execute('CREATE TABLE messages (session_id TEXT, role TEXT, content TEXT, timestamp REAL, display_kind TEXT, '
+              'finish_reason TEXT, tool_calls TEXT)')
+    c.execute('CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, model_config TEXT, parent_session_id TEXT, '
+              'transcript_revision INTEGER, started_at REAL, ended_at REAL)')
+    c.execute("INSERT INTO sessions (id, source) VALUES ('chat', 'desktop')")
+    c.commit()
+    c.close()
+    monkeypatch.setattr(plugin, 'state_dbs', lambda: [db])
+
+    def reply(text, at, sid='chat', finish='stop'):
+        c = sqlite3.connect(db)
+        c.execute('INSERT INTO messages VALUES (?,?,?,?,NULL,?,NULL)', (sid, 'assistant', text, at, finish))
+        c.commit()
+        c.close()
+    return reply
+
+
+def _quoted_cards():
+    return {'t_ask': {**_blocked(QUOTED), 'title': 'Landing fix acceptance', 'blocked_at': BLOCKED_AT},
+            't_child': {'status': 'todo', 'title': 'Land the fix', 'parents': ['t_ask']}}
+
+
+REPLY_QUOTING = ("**One decision for you: how to prove the landing fix works**\n\n> " + QUOTED['action']
+                 + "\n\nReply here. My pick: accept the investigation, waive the replay, keep live proof.")
+
+
+def _relay_env(tmp_path, monkeypatch):
+    reply = _quoting_state_db(tmp_path, monkeypatch)
+    led = core.Ledger(tmp_path / 'ledger.db')
+    monkeypatch.setattr(plugin, 'ledger', lambda: led)
+    monkeypatch.setattr(plugin, '_lineage', lambda sid: [sid])
+    return led, reply
+
+
+def test_deferred_relay_is_dropped_when_the_busy_turns_reply_quoted_the_ask(tmp_path, monkeypatch):
+    """Decided: a deferred ask relay re-runs quoted_ask immediately before delivery and is dropped when a reply after
+    blocked_at quoted the ask. Here the quote lands after the pass's reconcile read (the busy turn's reply is written
+    while the relay is claimed), so only the pre-delivery proof can see it."""
+    led, reply = _relay_env(tmp_path, monkeypatch)
+    cards = _quoted_cards()
+    led.write('chat', batch=['t_ask', 't_child'], open=[])
+    assert plugin.wake_tick(now=1100, wake=lambda *a, **k: 'busy', unseen={}, last_user=lambda _: 0,
+                            read=lambda _: cards)[0]['result'] == 'busy'  # deferred: the chat is mid-turn
+    key = core.ask_relay_key(led.get('chat'), cards)
+    assert key and led.claim('chat', key, 1200)
+    reply(REPLY_QUOTING, 1150)  # the busy turn ends with a reply that quotes the ask verbatim
+    calls = []
+    out = plugin._relay(led, 'chat', led.get('chat'), cards, key, 1200,
+                        lambda *a, **k: calls.append(a) or 'started')
+    assert calls == [], 'the ask was relayed again after a reply quoted it'
+    assert out['result'] == 'quoted' and out['ask_relay'] == []
+    row = led.get('chat')
+    assert 't_ask' in row['covered'] and core.ask_premise('t_ask', cards['t_ask']) in row['relayed']
+    assert row.get('claim_sig') is None and not row.get('failure_since')
+    assert core.ask_relay_key(row, cards) is None  # learned: no later tick relays it either
+    assert not plugin.wake_tick(now=1600, wake=lambda *a, **k: calls.append(a) or 'started', unseen={},
+                                last_user=lambda _: 0, read=lambda _: cards)
+    assert calls == []
+
+
+def test_deferred_relay_still_delivers_an_ask_no_reply_quoted(tmp_path, monkeypatch):
+    """Guards: a reply before the block, a tool-call row, or a paraphrase is not delivery; the relay goes."""
+    led, reply = _relay_env(tmp_path, monkeypatch)
+    cards = _quoted_cards()
+    led.write('chat', batch=['t_ask', 't_child'], open=[])
+    reply(REPLY_QUOTING, BLOCKED_AT - 1)  # before this block
+    reply(REPLY_QUOTING, 1150, finish='tool_calls')  # not a delivered final reply
+    reply("The landing card needs your call on its proof; I'd waive the replay.", 1160)  # a paraphrase
+    calls = []
+    out = plugin.wake_tick(now=1200, wake=lambda *a, **k: calls.append(a) or 'started', unseen={},
+                           last_user=lambda _: 0, read=lambda _: cards)
+    assert [o['result'] for o in out] == ['started'] and len(calls) == 1 and QUOTED['action'] in calls[0][1]
+
+
+def test_relay_drops_only_the_quoted_ask_of_two(tmp_path, monkeypatch):
+    led, reply = _relay_env(tmp_path, monkeypatch)
+    cards = {**_quoted_cards(), 't_other': {**_blocked(), 'blocked_at': BLOCKED_AT}}
+    led.write('chat', batch=['t_ask', 't_other', 't_child'], open=[])
+    key = core.ask_relay_key(led.get('chat'), cards)
+    assert led.claim('chat', key, 1200)
+    reply(REPLY_QUOTING, 1150)
+    calls = []
+    out = plugin._relay(led, 'chat', led.get('chat'), cards, key, 1200,
+                        lambda sid, prompt, **k: calls.append(prompt) or 'started')
+    assert out['ask_relay'] == ['t_other'] and len(calls) == 1
+    assert ASK['action'] in calls[0] and QUOTED['action'] not in calls[0]
