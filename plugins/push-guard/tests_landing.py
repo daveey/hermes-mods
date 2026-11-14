@@ -28,7 +28,8 @@ class GitHub:
                       'check_suite': {'id': 101}, 'status': 'completed', 'conclusion': 'success'}]
         self.statuses = []
         self.reviews = [{'id': 1, 'state': 'APPROVED', 'commit_id': HEAD,
-                         'user': {'login': 'reviewer', 'type': 'User'}}]
+                         'user': {'login': 'reviewer', 'type': 'User'},
+                         'submitted_at': '2026-01-01T00:00:00Z'}]
         self.required = []
         self.rules = []
         self.writes = []
@@ -208,6 +209,52 @@ def test_lander_cannot_approve_and_later_dismissal_wins():
     api.reviews.append({**api.reviews[0], 'id': 2, 'state': 'DISMISSED'})
     with pytest.raises(land.Refused): land.land(7, HEAD, read=api)
     assert not api.writes
+
+
+@pytest.mark.parametrize('payload', [{}, {'contexts': [], 'checks': {}},
+    {'contexts': [], 'checks': [None]}, {'contexts': [], 'checks': [{'context': 'tests', 'app_id': '9'}]}])
+def test_malformed_classic_inventory_never_writes(payload):
+    api = GitHub()
+    def read(*args):
+        if '/branches/main' in args[1]:
+            return {'protection': {'required_status_checks': payload}}
+        return api(*args)
+    with pytest.raises(land.Refused): land.land(7, HEAD, read=read)
+    assert not api.writes
+
+
+@pytest.mark.parametrize('rule', [{}, {'type': 'required_status_checks', 'parameters': {'required_status_checks': {}}}])
+def test_malformed_rules_never_write(rule):
+    api = GitHub()
+    api.rules = [rule]
+    with pytest.raises(land.Refused): land.land(7, HEAD, read=api)
+    assert not api.writes
+
+
+@pytest.mark.parametrize('app', [None, {}, {'id': None}, {'id': True}, {'id': '9'}])
+def test_malformed_check_app_never_writes(app):
+    api = GitHub()
+    api.runs[0]['app'] = app
+    with pytest.raises(land.Refused): land.land(7, HEAD, read=api)
+    assert not api.writes
+
+
+@pytest.mark.parametrize('stamp', [None, '', 'zzzz', '2026-01-01', '2026-01-01T00:00:00'])
+def test_invalid_review_time_cannot_mask_dismissal(stamp):
+    api = GitHub()
+    api.reviews[0]['submitted_at'] = stamp
+    api.reviews.append({**api.reviews[0], 'id': 2, 'state': 'DISMISSED',
+                        'submitted_at': '2026-01-02T00:00:00Z'})
+    with pytest.raises(land.Refused): land.land(7, HEAD, read=api)
+    assert not api.writes
+
+
+@pytest.mark.parametrize('exe', ['gh', '/usr/bin/gh'])
+@pytest.mark.parametrize('call', ['subprocess.run({argv})', 'subprocess.Popen({argv})',
+                                  'asyncio.create_subprocess_exec(*{argv})'])
+def test_python_literal_argv_raw_merge_held(exe, call):
+    argv = repr([exe, 'pr', 'merge', '7', '-R', land.REPO])
+    assert 'land.py' in guard.check_python(call.format(argv=argv), '/', guards=[])
 
 
 def test_graphql_held_without_config(monkeypatch):
