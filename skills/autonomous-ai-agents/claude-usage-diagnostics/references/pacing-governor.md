@@ -49,7 +49,13 @@ stops new claims on a provider while its pooled accounts burn faster than their 
 
 A paced provider has no start time. Claims resume when the pool's burn falls below what the accounts with headroom
 sustain; an account's weekly reset adds headroom but doesn't set a time. Quote that condition and the next resets,
-never one account's reset as the ETA. A `held` provider waits for its `until`. When that is hours or days away, move the waited-on cards (below) instead of
+never one account's reset as the ETA. A `held` provider stops claiming until its `until`, but `until` is when the
+hold lifts, not when your card starts. The release admits only what the accounts that reset then can sustain (read
+their weekly % in the pace `detail`), in `DISPATCH_ORDER`, and it can re-hold within minutes. In one case, one 5-hour
+window reset while 7 of 8 accounts sat at 7d 100%. The release ran 4 cards from the head of the queue, and cards 9th
+to 31st waited another hour. Report the time the hold lifts, which accounts it adds and the card's position. Promise a
+start only for a card inside what that headroom admits. The coach's `hold_lift_forecast` rule holds a reply that
+says cards "start when Claude comes back/resets". When `until` is hours or days away, move the waited-on cards (below) instead of
 reporting the wait: a `held` state is `limit 0` on every worker, and default-routed cards leave a provider by
 themselves only on a wall, never on a pacing hold, so they sit until the reset. A `paced` peer with free slots claims
 re-pinned cards within minutes.
