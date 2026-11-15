@@ -182,3 +182,103 @@ def test_status_only_is_a_default_rule_and_can_be_turned_off(monkeypatch):
     llm = lambda s, p: json.dumps({k: 0 for k in rc.RULES})
     hit = rc.check(reply, ask, log, llm, only=["report_only"])  # rule list without it -> never fires
     assert not hit or hit["rule"] != "status_only"
+
+
+# agent-fafbddd67a: a "⏸ … blocked" Kanban notice (the gateway's needs_input ping) was scored as David asking about
+# progress, because reply_check.NOTICE_RE only knew the ✔ done notice. Its card ask ("land and deploy it") matched the
+# progress pattern, and the reply named the wall in its first sentence ("a choice only you can make"), outside the
+# 1500-char tail WALL_RE read. Real ask and reply from session 20261110_185031_4f5f4b (hermes-hub, 2026-11-13).
+BLOCKED_ASK = (
+    "⏸ [worker-6:default] @default Kanban t_01a1d59e543673b0 blocked — actor: agent (task t_01a1d59e543673b0)\n"
+    "Next action for the user: Reply A, B or C on this card (A = task liveness hold 300 s, sessions 30 s, 52.7%; "
+    "B = task hold 180 s, sessions 30 s, 51.1%; C = keep 30/30 and accept ~42%). Unblock = I apply the pick to PR "
+    "#126, get an independent review, land and deploy it; archive = drop card N and close the PR.\n"
+    "Why only the user: Each option changes an approved design limit: the ≥50% acceptance target (C), or C7's 30 s "
+    "hold bound for task liveness (A/B). At 30 s the target is not reachable: task liveness changes arrive 60–120 s "
+    "apart.\nScope: hermes-hub PR https://github.com/daveey/hermes-hub/pull/126 (LIVENESS_HOLD_S); design "
+    "t_01a1d563324d7e8e P4/C7. Session latency stays ≤30 s under A, B and C.\n"
+    "Open task: @task:default@worker-6/t_01a1d59e543673b0")
+BLOCKED_REPLY = (
+    "One piece of the hub CPU work is blocked on a choice only you can make, because each option changes a limit you "
+    "approved in the design. I checked the card on worker-6 just now and it's still waiting. Your earlier \"a\" was "
+    "for the worker-first rollout's update pause and went to that card, before this question was asked.\n\n"
+    "This piece cuts how many rows the hub sends to the Desktop backends when the only thing that changed is a \"last "
+    "active\" time. The change is built and passes CI (hermes-hub PR #126). But with the 30-second hold the design "
+    "approved, it removes only 42% of those rows, short of the 50% target. A card's \"last active\" time changes "
+    "every 60–120 seconds, so a 30-second hold rarely gets to merge two changes together.\n\n"
+    "It tested other settings by replaying 10 minutes of real hub traffic. In every option, chat activity on your "
+    "other machines still shows up within 30 seconds, and status and content changes still show up immediately.\n\n"
+    "| | Cards' \"last active\" time | Rows removed | What changes |\n|---|---|---|---|\n"
+    "| **A (recommended)** | can lag up to 5 min | 52.7% | Meets the target. The design review found that time is "
+    "only displayed, so nothing acts on it. |\n"
+    "| **B** | can lag up to 3 min | 51.1% | Meets the target with little margin. |\n"
+    "| **C** | stays at 30 s | about 42% | Lowers the target. |\n\n"
+    "Here's the card's ask word for word: \"Reply A, B or C on this card (A = task liveness hold 300 s, sessions 30 "
+    "s, 52.7%; B = task hold 180 s, sessions 30 s, 51.1%; C = keep 30/30 and accept ~42%). Unblock = I apply the "
+    "pick to PR #126, get an independent review, land and deploy it; archive = drop card N and close the PR.\"\n\n"
+    "You can reply here and I'll pass it on. If you don't reply, the PR stays as a draft and the hub keeps sending "
+    "every change. The rest of the hub CPU work goes on without it.")
+BLOCKED_LOG = ['-> cross_task({"action": "read", "task_id": "t_01a1d59e543673b0", "gateway": "worker-6"})']
+
+
+def test_blocked_kanban_notice_is_not_a_progress_ask():
+    assert rc.notice_turn(BLOCKED_ASK) and rc.automation_prompt(BLOCKED_ASK)
+    assert rc.status_only(BLOCKED_ASK, BLOCKED_REPLY, BLOCKED_LOG) is None
+
+
+# Every gateway.kanban.ping notice opens "<glyph> {head}" (head = "[board] @assignee Kanban t_x", board and assignee
+# optional; changes_requested writes "{board_tag}Kanban {task_id}" with no assignee). Listing glyphs one at a time is
+# how ⏸ was missed here (and ⏸/⏳ in self_heal before it), so every one is pinned, with and without U+FE0F.
+KANBAN_PING_GLYPHS = ("✔", "✓", "👀", "🛑", "⛔", "⏱", "⏸", "✖", "🔄", "⏳", "⚠", "ℹ")
+
+
+def test_every_kanban_ping_glyph_and_head_shape_is_a_notice():
+    heads = ("[hub:default] @default Kanban t_01a1d59e543673b0", "@default Kanban t_01a1d59e543673b0",
+             "[default] Kanban t_01a1d59e543673b0", "Kanban t_01a1d59e543673b0")
+    for glyph in KANBAN_PING_GLYPHS:
+        for sel in ("", "\ufe0f"):
+            for head in heads:
+                ask = f"{glyph}{sel} {head} blocked — can we land and deploy it? why is it still waiting?"
+                assert rc.notice_turn(ask), ask
+                assert rc.status_only(ask, "Checked it; still waiting.", BLOCKED_LOG) is None, ask
+
+
+def test_every_core_kanban_ping_template_is_a_notice():
+    """Render core's own gateway.kanban.ping templates when core is installed, so a new notice glyph fails here."""
+    import os
+    import pytest
+    root = Path(os.environ.get("HERMES_TEST_CORE") or Path.home() / ".hermes/hermes-agent")
+    locale = root / "locales" / "en.yaml"
+    if not (root / "agent/context_compressor.py").exists():
+        if os.environ.get("HERMES_TEST_CORE"):
+            raise AssertionError(f"HERMES_TEST_CORE set but {root} has no agent/context_compressor.py")
+        pytest.skip("Hermes core checkout not found")
+    import re
+    text = locale.read_text(encoding="utf-8")
+    block = text.split("\n    ping:\n", 1)[1]
+    templates = []
+    for line in block.splitlines():
+        if line.strip() and not line.startswith("      "):
+            break
+        m = re.match(r'\s+\w+: "(.*)"$', line)
+        if m and ("{head}" in m.group(1) or "Kanban {task_id}" in m.group(1)) and not m.group(1).startswith("{"):
+            templates.append(m.group(1))
+    assert len(templates) >= 8, templates
+    for tpl in templates:
+        ask = re.sub(r"\{(\w+)\}", lambda m: {"head": "[hub:default] @default Kanban t_01a1d59e543673b0",
+                                               "board_tag": "[hub:default] ", "task_id": "t_01a1d59e543673b0"}
+                     .get(m.group(1), "x"), tpl)
+        assert rc.notice_turn(ask), tpl
+
+
+def test_human_question_quoting_a_notice_stays_a_human_ask():
+    ask = "why is ⏸ [hub:default] @default Kanban t_01a1d59e543673b0 still blocked?"
+    assert not rc.notice_turn(ask)
+    assert rc.status_only(ask, "Checked it; it's still waiting on review.", BLOCKED_LOG)
+
+
+def test_quiet_when_a_long_reply_names_the_wall_in_its_opening():
+    """status_plain asks for the one thing stopping it in the first paragraph; status_only must read that opening."""
+    ask = "why are we still waiting on the hub CPU work?"
+    assert len(BLOCKED_REPLY) > 1500 and not rc.WALL_RE.search(BLOCKED_REPLY[-1500:])
+    assert rc.status_only(ask, BLOCKED_REPLY, BLOCKED_LOG) is None

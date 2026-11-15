@@ -1365,7 +1365,9 @@ def status_only(user_ask: str, reply: str, tool_log: Optional[list] = None) -> O
     kinds = [k for k in (_tool_kind(l) for l in tool_log or []) if k]
     if "work" in kinds or "card" not in kinds:
         return None
-    if WALL_RE.search(reply[-1500:]):
+    # Opening and closing paragraphs: status_plain asks for "the one thing stopping it" first, so a long reply names
+    # its wall at the top (agent-fafbddd67a: "a choice only you can make" sat 1800 chars from the end).
+    if WALL_RE.search(reply[:1500]) or WALL_RE.search(reply[-1500:]):
         return None
     ops = [l.strip()[3:].split("(", 1)[0] for l in tool_log or [] if _tool_kind(l) == "card"]
     return f"asked \"{(user_ask or '').strip()[:80]}\"; this turn only ran {', '.join(dict.fromkeys(ops))}"
@@ -3358,10 +3360,19 @@ CORE_JOB_RE = (r"\[ASYNC DELEGATION (?:BATCH COMPLETE|COMPLETE|TASK FAILED) — 
                r"|\[Background process \S+ heartbeat\b"
                r"|\[System note: background job results")
 
+# Every gateway Kanban watcher notice (core gateway/kanban_watchers_notifier.py + the gateway.kanban.ping locale
+# strings) opens "<glyph> {head}", head = [board] @assignee Kanban t_x with board and assignee optional
+# (changes_requested writes {board_tag}Kanban {task_id}): ✔ done, 👀 review, 🛑 triage/changes, ⛔ gave up, ⏱ timed
+# out, ⏸ blocked, ✖ crashed, 🔄 status, ⏳ waits, ⚠, ℹ. Matched by shape, not one glyph at a time: only ✔ was listed,
+# so a ⏸ needs_input notice whose card ask said "land and deploy it" scored status_only as David's own progress ask
+# (agent-fafbddd67a). self_heal.SYNTHETIC_RE uses the same shape.
+KANBAN_NOTICE_RE = (r"[\u2100-\u2bff\U0001F300-\U0001FAFF]\ufe0f?\s*(?:\[[^\]\n]+\]\s*)?(?:@\S+\s+)?"
+                    r"Kanban\s+t_\w+")
+
 # The Hermes-plugin envelopes stay case-insensitive; core's envelopes are fixed-case.
 NOTICE_RE = re.compile(
     r"^\s*(?:(?i:\[(?:chat-closeout|kanban close-out|false-stop recovery|owner-wake|goal continuation|babysitter)"
-    r"[^\]]*\]|[✔✓]\s*\[[^\]\n]+\]\s*@[^\n]+\bKanban\b|" + CROSS_SESSION_RE + r")|" + CORE_JOB_RE + r")")
+    r"[^\]]*\]|" + KANBAN_NOTICE_RE + r"|" + CROSS_SESSION_RE + r")|" + CORE_JOB_RE + r")")
 
 # Core's _SYNTHETIC_USER_ROW_PREFIXES (agent/context_compressor.py) that are deliberately NOT reply_check notices.
 # test_every_core_synthetic_user_prefix_is_classified fails on any core prefix that is neither here nor a notice.
