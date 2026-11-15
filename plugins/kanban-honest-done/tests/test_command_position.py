@@ -101,8 +101,9 @@ def test_nested_data(command):
 
 
 @pytest.mark.parametrize('suffix', [';', '; echo done', ' | cat', ' && echo done'])
-@pytest.mark.parametrize('consumer', ['bash', 'env A=1 bash', 'cat'])
+@pytest.mark.parametrize('consumer', ['bash', 'env A=1 bash', 'cat', 'bash -', 'sh -', 'bash -e -'])
 def test_heredoc_consumer_survives_separator(suffix, consumer):
+    # A lone `-` ends options like `--`; with no script operand the shell reads stdin.
     command = f"{consumer} <<'EOF'{suffix}\nhermes kanban comment t_X hi\nEOF"
     expected = [] if consumer == 'cat' else [('comment', ['t_X', 'hi'])]
     assert hits(command) == expected
@@ -111,28 +112,73 @@ def test_heredoc_consumer_survives_separator(suffix, consumer):
 @pytest.mark.parametrize('prefix', [
     'bash /dev/null -c', 'bash -- /dev/null -c',
     'bash -o posix /dev/null -c', 'bash --rcfile /dev/null /dev/null -c',
-    'bash -O extglob /dev/null -c',
+    'bash -O extglob /dev/null -c', 'bash - /dev/null -c',
 ])
 def test_shell_script_arguments_are_data(prefix):
     assert hits(prefix + " 'hermes kanban comment t_X hi'") == []
 
 
 @pytest.mark.parametrize('prefix', ['bash -o posix -c', 'bash --rcfile /dev/null -c',
-                                    'bash -O extglob -c', 'bash -lc'])
+                                    'bash -O extglob -c', 'bash -lc',
+                                    # -c takes the first operand after *all* options.
+                                    'bash -c -e', 'bash -c --', 'bash -c -', 'bash -c -o posix',
+                                    'bash -c +x', 'bash -c -O extglob', 'sh -c -e', 'bash -ec -x'])
 def test_shell_options_before_command(prefix):
     assert hits(prefix + " 'hermes kanban comment t_X hi'") == [('comment', ['t_X', 'hi'])]
 
 
-@pytest.mark.parametrize('consumer', ['bash /dev/null', 'bash -- /dev/null', 'cat'])
+@pytest.mark.parametrize('consumer', ['bash /dev/null', 'bash -- /dev/null', 'cat',
+                                      'bash - /dev/null', 'sh - /dev/null'])
 def test_heredoc_with_script_operand_is_data(consumer):
     assert hits(f"{consumer} <<'EOF';\nhermes kanban comment t_X hi\nEOF") == []
+
+
+# Every shape above, checked against the shells themselves: a fake `hermes` on PATH
+# records whether the shell really ran the call, and the classifier must agree.
+_REAL_SHELL_SHAPES = [
+    "bash <<'EOF';\n{cmd}\nEOF", "bash <<'EOF' | cat\n{cmd}\nEOF",
+    "bash - <<'EOF'\n{cmd}\nEOF", "sh - <<'EOF';\n{cmd}\nEOF", "bash -e - <<'EOF'\n{cmd}\nEOF",
+    "bash - /dev/null <<'EOF'\n{cmd}\nEOF", "sh - /dev/null <<'EOF';\n{cmd}\nEOF",
+    "bash /dev/null <<'EOF'\n{cmd}\nEOF", "cat <<'EOF'; echo done\n{cmd}\nEOF",
+    'bash -c {quoted}', 'bash -lc {quoted}', 'bash -c -e {quoted}', 'bash -c -- {quoted}',
+    'bash -c - {quoted}', 'bash -c -o posix {quoted}', 'bash -c +x {quoted}',
+    'bash -c -O extglob {quoted}', 'bash -ec -x {quoted}', 'sh -c -e {quoted}',
+    'bash -o posix -c {quoted}', 'bash /dev/null -c {quoted}', 'bash -- /dev/null -c {quoted}',
+    'bash - /dev/null -c {quoted}', 'bash -o posix /dev/null -c {quoted}',
+]
+
+
+@pytest.mark.parametrize('shape', _REAL_SHELL_SHAPES)
+def test_classifier_agrees_with_real_shells(tmp_path, shape):
+    import os
+    import shutil
+    import subprocess
+    if not (shutil.which('bash') and shutil.which('sh')):
+        pytest.skip('needs bash and sh')
+    marker = tmp_path / 'ran'
+    fake = tmp_path / 'hermes'
+    fake.write_text('#!/bin/sh\necho "$@" >> "$HERMES_FAKE_MARKER"\n')
+    fake.chmod(0o755)
+    cmd = 'hermes kanban comment t_X hi'
+    command = shape.format(cmd=cmd, quoted=shlex.quote(cmd))
+    env = {**os.environ, 'PATH': f'{tmp_path}{os.pathsep}{os.environ.get("PATH", "")}',
+           'HERMES_FAKE_MARKER': str(marker)}
+    subprocess.run(['bash', '-c', command], cwd=tmp_path, env=env, timeout=30,
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ran = marker.exists() and 'kanban comment t_X hi' in marker.read_text()
+    assert (hits(command) == [('comment', ['t_X', 'hi'])]) == ran, (command, ran)
 
 
 @pytest.mark.parametrize('wrap', ['{cmd}', 'env A=1 {cmd}', 'timeout 30 {cmd}',
                                  'echo $({cmd})', 'bash -c {quoted}',
                                  "bash <<'EOF';\n{cmd}\nEOF",
                                  "bash <<'EOF'; echo done\n{cmd}\nEOF",
-                                 "bash <<'EOF' | cat\n{cmd}\nEOF"])
+                                 "bash <<'EOF' | cat\n{cmd}\nEOF",
+                                 "bash - <<'EOF'\n{cmd}\nEOF",
+                                 "sh - <<'EOF';\n{cmd}\nEOF",
+                                 'bash -c -e {quoted}', 'bash -c -- {quoted}',
+                                 'bash -c -o posix {quoted}', 'bash -c +x {quoted}',
+                                 'sh -c -e {quoted}'])
 def test_comment_hook_still_refuses_real_calls(tmp_path, monkeypatch, wrap):
     from test_honest_done import make_board
     db = make_board(tmp_path, tasks=[(OWN, 'test', 'running')])

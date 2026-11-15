@@ -50,18 +50,24 @@ def command_start(words):
 
 
 def shell_input(argv):
-    """Return (inline script, reads stdin), stopping options at the script operand."""
+    """Return (inline script, reads stdin), parsing options the way bash and dash do.
+
+    Options run up to the first operand, ``--`` or a lone ``-`` (the same as ``--``).
+    ``-c`` anywhere among them makes the first operand after *all* options the
+    command string (``bash -c -e Q`` runs Q). Otherwise ``-s``, or no operand at
+    all, reads the script from stdin; a first operand is a script file.
+    """
     start = command_start(argv)
     if start >= len(argv) or os.path.basename(argv[start]) not in _SHELLS:
         return None, False
     i = start + 1
-    stdin = False
+    stdin = command = False
     while i < len(argv):
         arg = argv[i]
-        if arg == '--':
+        if arg in {'--', '-'}:
             i += 1
             break
-        if arg == '-' or not arg.startswith(('-', '+')):
+        if not arg.startswith(('-', '+')):
             break
         if arg in {'--rcfile', '--init-file'}:
             i += 2
@@ -70,15 +76,15 @@ def shell_input(argv):
             i += 1
             continue
         flags = arg[1:]
-        # -o/+o and -O/+O consume an option name (also in short clusters).
-        takes_name = any(flag in flags for flag in 'oO')
-        if arg.startswith('-') and 's' in flags:
-            stdin = True
+        if arg.startswith('-'):
+            stdin = stdin or 's' in flags
+            command = command or 'c' in flags
         i += 1
-        if takes_name:
+        # -o/+o and -O/+O consume an option name (also in short clusters).
+        if any(flag in flags for flag in 'oO'):
             i += 1
-        if arg.startswith('-') and 'c' in flags:
-            return (argv[i] if i < len(argv) else None), False
+    if command:
+        return (argv[i] if i < len(argv) else None), False
     return None, stdin or i >= len(argv)
 
 
