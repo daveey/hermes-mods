@@ -807,18 +807,28 @@ def cancel_message(what: str) -> str:
 MODS_REPO = "daveey/hermes-mods"
 
 
-def landing_repos():
+def _policy_entry_present(path):
+    # exists() follows symlinks and suppresses errors (including EACCES on newer
+    # Python). Only a genuinely absent entry may fall back to another policy.
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def landing_repos(home=None):
     """PR-only policy, inherited by profiles; never redirects core/state ship paths.
 
     No override environment variable: this is host policy, not command input.
     Missing policy retains the built-in repo; unreadable/malformed policy raises
     so merge classification and the landing helper both fail closed.
     """
-    home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    home = Path(home) if home is not None else Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
     policy = home / "ship-only-guard.json"
-    if not policy.exists() and home.parent.name == "profiles":
+    if not _policy_entry_present(policy) and home.parent.name == "profiles":
         policy = home.parent.parent / "ship-only-guard.json"
-    if not policy.exists():
+    if not _policy_entry_present(policy):
         return {MODS_REPO}
     data = json.loads(policy.read_text())
     repos = data.get("pr_landing_repos", []) if isinstance(data, dict) else None

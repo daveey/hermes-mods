@@ -80,6 +80,101 @@ def test_bad_policy_fails_closed(configured, text):
     assert not api.reads and not api.writes
 
 
+@pytest.mark.parametrize('profile', [False, True])
+@pytest.mark.parametrize('kind', ['dangling', 'loop', 'directory'])
+def test_unreadable_policy_entry_fails_closed(configured, monkeypatch, profile, kind):
+    home = configured
+    if profile:
+        home = configured / 'profiles/reviewer'
+        home.mkdir(parents=True)
+        monkeypatch.setenv('HERMES_HOME', str(home))
+    policy = home / 'ship-only-guard.json'
+    if policy.exists():
+        policy.unlink()
+    if kind == 'directory':
+        policy.mkdir()
+    else:
+        policy.symlink_to(policy.name if kind == 'loop' else 'missing.json')
+    with pytest.raises(OSError):
+        guard.landing_repos()
+    command = f'gh pr merge 7 -R {REPO}'
+    assert 'land.py' in guard.check_shell(command, '/', guards=[])
+    assert 'land.py' in guard.check_python(f'import os; os.system({command!r})', '/', guards=[])
+    api = GitHub()
+    with pytest.raises((OSError, land.Refused)):
+        land.land(7, HEAD, read=api, repo=REPO)
+    assert not api.reads and not api.writes
+
+
+@pytest.mark.parametrize('override', [{}, {'repos': ['example/core']},
+                                    {'pr_landing_repos': []},
+                                    {'pr_landing_repos': ['example/other']}])
+def test_profile_file_is_explicit_whole_file_override(configured, monkeypatch, override):
+    home = configured / 'profiles/reviewer'
+    home.mkdir(parents=True)
+    (home / 'ship-only-guard.json').write_text(json.dumps(override))
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    assert guard.landing_repos() == {land.REPO, *override.get('pr_landing_repos', [])}
+    assert guard.check_shell(f'gh pr merge 7 -R {REPO}', '/', guards=[]) is None
+
+
+@pytest.mark.parametrize('profile', [False, True])
+def test_valid_policy_symlink(configured, monkeypatch, profile):
+    home = configured
+    if profile:
+        home = configured / 'profiles/reviewer'
+        home.mkdir(parents=True)
+        monkeypatch.setenv('HERMES_HOME', str(home))
+    policy = home / 'ship-only-guard.json'
+    target = home / 'policy.json'
+    target.write_text(json.dumps({'pr_landing_repos': [REPO]}))
+    if policy.exists():
+        policy.unlink()
+    policy.symlink_to(target.name)
+    assert REPO in guard.landing_repos()
+
+
+def test_genuinely_missing_policy_uses_builtin(tmp_path, monkeypatch):
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'profiles/reviewer'))
+    assert guard.landing_repos() == {land.REPO}
+
+
+@pytest.mark.parametrize('mode', ['inherit', 'complete', 'core-only', 'empty', 'dangling', 'bad-json'])
+def test_fleet_policy_audit_cli(configured, mode):
+    profile = configured / 'profiles/reviewer'
+    profile.mkdir(parents=True)
+    policy = profile / 'ship-only-guard.json'
+    if mode == 'complete':
+        policy.write_text(json.dumps({'repos': ['example/core'], 'pr_landing_repos': [REPO]}))
+    elif mode == 'core-only':
+        policy.write_text(json.dumps({'repos': ['example/core']}))
+    elif mode == 'empty':
+        policy.write_text('{"pr_landing_repos": []}')
+    elif mode == 'dangling':
+        policy.symlink_to('missing.json')
+    elif mode == 'bad-json':
+        policy.write_text('{')
+    p = subprocess.run([sys.executable, str(Path(guard.__file__).with_name('check_policy.py')),
+                        '--home', str(configured), '--require', REPO], capture_output=True, text=True)
+    assert p.returncode == (0 if mode in ('inherit', 'complete') else 1), p.stderr
+    rows = json.loads(p.stdout)
+    assert len(rows) == 2 and rows[0]['ok']
+    assert rows[1]['home'] == str(profile)
+    if mode in ('core-only', 'empty'):
+        assert rows[1]['missing'] == [REPO]
+    if mode in ('dangling', 'bad-json'):
+        assert rows[1]['error']
+
+
+def test_policy_stat_permission_error_fails_closed(configured, monkeypatch):
+    def denied(self):
+        raise PermissionError('fixture policy stat denied')
+    monkeypatch.setattr(Path, 'lstat', denied)
+    with pytest.raises(PermissionError):
+        guard.landing_repos()
+    assert 'land.py' in guard.check_shell(f'gh pr merge 7 -R {REPO}', '/', guards=[])
+
+
 def test_existing_default_and_other_repo_control(configured):
     assert land.land(7, HEAD, read=GitHub())['merged']
     assert guard.check_shell('gh pr merge 7 -R example/unconfigured', '/', guards=[]) is None
