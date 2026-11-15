@@ -102,6 +102,11 @@ class _Result:
 
     def view(self, shared, now):
         fresh = dict(request_id=ident('request'), generated_at=iso(now))
+        if 'inventory_cache' in self.shared['meta']:
+            fresh['inventory_cache'] = [dict(row, age_s=(
+                max(0, now-datetime.fromisoformat(row['fetched_at']).timestamp())
+                if row['fetched_at'] is not None else None))
+                for row in self.shared['meta']['inventory_cache']]
         if shared:
             return dict(self.shared, meta=dict(self.shared['meta'], **fresh))
         with self.lock:
@@ -252,7 +257,18 @@ class Service:
         prov = (lambda v: [dict(p) for p in v]) if shared else deepcopy
         now=self.clock(); c=self.config; at=snapshot['at'] if snapshot else None
         ttl=c['thresholds']['inventory_stale_seconds']
-        return dict(contract_version=1,request_id=ident('request'),owner=dict(gateway_id=c['owner_gateway_id'],profile=c['owner_profile'],owner_epoch=c['owner_epoch'],config_revision=c['config_revision']),
+        cache = []
+        for scope in c['scopes']:
+            saved = (snapshot or {}).get('scope_results', {}).get(scope['id'], {})
+            fetched = saved.get('last_success_at')
+            if fetched is None and saved.get('complete'):
+                fetched = saved.get('observed_at')
+            if type(fetched) not in (int, float) or not math.isfinite(fetched) or fetched > now:
+                fetched = None
+            cache.append(dict(scope_id=scope['id'], fetched_at=iso(fetched) if fetched is not None else None,
+                              age_s=now-fetched if fetched is not None else None,
+                              incomplete=not bool(saved.get('complete')) or fetched is None))
+        return dict(inventory_cache=cache, contract_version=1,request_id=ident('request'),owner=dict(gateway_id=c['owner_gateway_id'],profile=c['owner_profile'],owner_epoch=c['owner_epoch'],config_revision=c['config_revision']),
                     generated_at=iso(now),observed_at=iso(at) if at is not None else None,expires_at=iso(at+ttl) if at is not None else None,
                     freshness=('fresh' if 0<=now-at<=ttl else 'stale') if at is not None else 'unknown',
                     provenance=prov(snapshot['provenance']) if snapshot else [],coverage=copy(snapshot['coverage']) if snapshot else [],source_errors=copy(snapshot['source_errors']) if snapshot else [])

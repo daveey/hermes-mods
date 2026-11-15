@@ -404,7 +404,7 @@ def main(argv=None):
     runtime = load_runtime(args.runtime)
     # Every GET runs inside an open broker vend: the GitHub quota ledger records it
     # and the shared reserve/brake can refuse it (providers/runtime.py).
-    github = BrokerVendGitHub({k: BrokerCredential(**v) for k, v in runtime['credentials'].items()},
+    github = BrokerVendGitHub({k: BrokerCredential.from_mapping(v) for k, v in runtime['credentials'].items()},
         broker_command=(runtime.get('broker_executable', 'token-broker'),))
     try:
         report = _run(args, source, config, runtime, github, discovery)

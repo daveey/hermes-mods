@@ -29,6 +29,7 @@ import time
 from urllib.parse import urlsplit
 
 from .base import Credential, HTTPResponse
+from .github_app import GitHubAppInstallation, mint_installation_token
 
 
 class RuntimeBoundaryError(RuntimeError):
@@ -225,9 +226,40 @@ class GitHubHTTPTransport:
 
 @dataclass(frozen=True)
 class BrokerCredential:
+    """Broker env reference, optionally an existing read-only App installation.
+
+    App references use app.quota_key as key; env_var remains a reserved token
+    env name, not the key env. The broker supplies app.app_id_env and the
+    base64 PEM in app.private_key_env only to its child. The parent sends only
+    this non-secret spec over the socket. Explicit App coverage never falls
+    back to another reference or PAT. PAT construction is unchanged.
+    """
     scope: str
     env_var: str
     key: str
+    app: GitHubAppInstallation | None = None
+
+    @classmethod
+    def from_mapping(cls, value):
+        """Decode private runtime JSON without vending or mutating its input."""
+        if type(value) is not dict:
+            raise ValueError('invalid_broker_reference')
+        value = dict(value)
+        if value.get('app') is not None:
+            if type(value['app']) is not dict:
+                raise ValueError('invalid_broker_reference')
+            app = dict(value['app'])
+            for name in ('repositories', 'organizations'):
+                if name in app:
+                    if type(app[name]) is not list:
+                        raise ValueError('invalid_broker_reference')
+                    app[name] = tuple(app[name])
+            value['app'] = GitHubAppInstallation(**app).validate()
+        return cls(**value)
+
+
+def _credential_identity(spec):
+    return (spec.scope, spec.env_var) if spec.app is None else (spec.scope, spec.env_var, spec.app)
 
 
 def _validated_references(references):
@@ -238,9 +270,17 @@ def _validated_references(references):
                 or type(spec.env_var) is not str or not re.fullmatch(r'[A-Z_][A-Z0-9_]{0,127}', spec.env_var)
                 or type(spec.key) is not str or not spec.key or len(spec.key) > 256):
             raise ValueError('invalid_broker_reference')
+        if spec.app is not None:
+            if not isinstance(spec.app, GitHubAppInstallation):
+                raise ValueError('invalid_broker_reference')
+            spec.app.validate()
+            if spec.key != spec.app.quota_key or spec.env_var in (spec.app.app_id_env, spec.app.private_key_env):
+                raise ValueError('invalid_broker_reference')
+        elif spec.key.startswith('github-app-installation:'):
+            raise ValueError('invalid_broker_reference')
     identities = {}
     for spec in references.values():
-        identity = (spec.scope, spec.env_var)
+        identity = _credential_identity(spec)
         if identities.setdefault(identity, spec.key) != spec.key:
             raise ValueError('invalid_broker_reference')
     return references
@@ -387,33 +427,48 @@ try:
     package.__path__ = [sys.argv[1]]
     sys.modules[package.__name__] = package
     runtime = importlib.import_module(package.__name__ + '.runtime')
-    runtime._serve_vend(int(sys.argv[2]), sys.argv[3], float(sys.argv[4]))
+    runtime._serve_vend(int(sys.argv[2]), sys.argv[3], float(sys.argv[4]),
+                        app_config=len(sys.argv) > 5 and sys.argv[5] == 'app')
 except BaseException:
     os._exit(1)
 os._exit(0)
 '''
 
 
-def _serve_vend(fd, env_var, idle):
+def _serve_vend(fd, env_var, idle, *, app_config=False):
     """Vend side of BrokerVendGitHub: add the vended token to each validated GET.
 
     Runs under `token-broker exec`, so the quota supervisor's http.client hook
     admits (reserve, per-vend budget, brake) and records every request. Exits on
     EOF, after `idle` seconds without a request, or on any protocol error."""
-    token = os.environ.get(env_var, '')
-    raw = token.encode('ascii')
-    if not raw or len(raw) > 4096 or any(c < 33 or c > 126 for c in raw):
-        raise ValueError()
+    token = os.environ.get(env_var, '') if not app_config else ''
     for name in {env_var, 'GH_TOKEN', 'GITHUB_TOKEN'}:
         os.environ.pop(name, None)
     metered = getattr(http.client.HTTPConnection, '_hermes_quota', False) is True
     with socket.socket(fileno=fd) as channel:
+        app = None
+        expiry = None
+        if app_config:
+            config = _recv_frame(channel, _REQUEST_LIMIT, time.monotonic() + 30)
+            if type(config) is not dict:
+                raise ValueError()
+            config['repositories'] = tuple(config['repositories'])
+            config['organizations'] = tuple(config['organizations'])
+            app = GitHubAppInstallation(**config).validate()
+            token, expiry = mint_installation_token(app, minimum_lifetime=300)
+        raw = token.encode('ascii')
+        if not raw or len(raw) > 4096 or any(c < 33 or c > 126 for c in raw):
+            raise ValueError()
         _send_frame(channel, {'ready': True, 'metered': metered})
         while True:
             request = _recv_frame(channel, _REQUEST_LIMIT, time.monotonic() + idle)
             if request is None:
                 return
+            if expiry is not None and time.time() + 90 >= expiry:
+                raise ValueError()
             if type(request) is dict and set(request) == {'method', 'path', 'body', 'timeout', 'max_bytes'}:
+                if app is not None:
+                    raise ValueError()  # Inventory-only tokens cannot dispatch jobs.
                 # Job dispatch: allowlisted method and path, re-checked on this side.
                 _validated_api_request(request['method'], request['path'], request['body'],
                                        request['timeout'], request['max_bytes'])
@@ -426,6 +481,8 @@ def _serve_vend(fd, env_var, idle):
                 _send_frame(channel, reply)
                 continue
             if type(request) is not dict or set(request) != {'url', 'headers', 'timeout', 'max_body_bytes', 'max_timeout'}:
+                raise ValueError()
+            if app is not None and not app.permits(request['url']):
                 raise ValueError()
             headers = request['headers']
             if type(headers) is not dict or any(type(k) is not str or k.lower() == 'authorization' for k in headers):
@@ -513,11 +570,11 @@ class BrokerVendGitHub:
         self.executable = executable or sys.executable
         self._keys, self._handles = {}, {}
         for spec in self._references.values():
-            identity = (spec.scope, spec.env_var)
+            identity = _credential_identity(spec)
             self._keys[identity] = spec.key
             # Stable per identity (the provider's ETag cache keys on it); not a secret.
             self._handles[identity] = 'vend-' + hashlib.sha256(
-                (spec.scope + '\0' + spec.env_var).encode()).hexdigest()[:40]
+                ((spec.scope + '\0' + spec.env_var) if spec.app is None else repr(identity)).encode()).hexdigest()[:40]
         self._identities = {handle: identity for identity, handle in self._handles.items()}
         self._sessions = {}
         self._failures = {}
@@ -526,7 +583,8 @@ class BrokerVendGitHub:
     # -- vend lifecycle (call with the lock held)
 
     def _start(self, identity):
-        scope, env_var = identity
+        scope, env_var = identity[:2]
+        app = identity[2] if len(identity) == 3 else None
         parent, child = socket.socketpair()
         process = None
         try:
@@ -534,13 +592,23 @@ class BrokerVendGitHub:
                     self.executable, '-s', '-P', '-B', '-c', _VEND_CHILD,
                     os.path.dirname(os.path.abspath(__file__)), str(child.fileno()), env_var,
                     str(self.ttl + 60)]
+            if app is not None:
+                argv.append('app')
             environment = dict(os.environ)
             for configured in self._references.values():
                 environment.pop(configured.env_var, None)
+                if configured.app is not None:
+                    environment.pop(configured.app.app_id_env, None)
+                    environment.pop(configured.app.private_key_env, None)
+            for name in ('GH_TOKEN', 'GITHUB_TOKEN'):
+                environment.pop(name, None)
             process = self.popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL, env=environment, pass_fds=(child.fileno(),),
                                  close_fds=True, shell=False)
             child.close()
+            if app is not None:
+                from dataclasses import asdict
+                _send_frame(parent, asdict(app))
             ready = _recv_frame(parent, 4096, time.monotonic() + self.start_timeout)
             if (type(ready) is not dict or set(ready) != {'ready', 'metered'} or ready['ready'] is not True
                     or type(ready['metered']) is not bool):
@@ -589,7 +657,7 @@ class BrokerVendGitHub:
         with self._lock:
             try:
                 spec = self._references[ref]
-                identity = (spec.scope, spec.env_var)
+                identity = _credential_identity(spec)
                 self._live(identity)
                 return Credential(spec.key, self._handles[identity])
             except Exception:
@@ -605,6 +673,8 @@ class BrokerVendGitHub:
                 if scheme.lower() != 'bearer' or handle not in self._identities:
                     raise ValueError()
                 identity = self._identities[handle]
+                if len(identity) == 3 and not identity[2].permits(url):
+                    raise ValueError()
                 session = self._live(identity)
                 session.used += 1
                 session.last = self.clock()
@@ -650,6 +720,8 @@ class BrokerVendGitHub:
                 if handle not in self._identities or self._keys[self._identities[handle]] != credential.key:
                     raise ValueError()
                 identity = self._identities[handle]
+                if len(identity) == 3:
+                    raise ValueError()  # Inventory App credentials never dispatch.
                 session = self._live(identity)
                 session.used += 1
                 session.last = self.clock()

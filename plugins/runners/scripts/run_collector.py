@@ -76,7 +76,7 @@ def load_runtime(path):
         executable = data.get('broker_executable')
         if executable is not None and (type(executable) is not str or not Path(executable).is_absolute() or any(ord(c) < 32 for c in executable)):
             raise ValueError()
-        credentials = {k: BrokerCredential(**v) for k, v in data['credentials'].items()}
+        credentials = {k: BrokerCredential.from_mapping(v) for k, v in data['credentials'].items()}
         BrokerVendGitHub(credentials)  # Validate without vending anything.
         jobs = data.get('job_repositories', {})
         if type(jobs) is not dict or any(type(v) is not list or len(v) > 10 or
@@ -152,7 +152,7 @@ def run(config_path, runtime_path, identity, state_dir, *, stop=None, once=False
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     with OwnerLock(state_dir / 'collector.lock', config, identity):
-        credentials = {k: BrokerCredential(**v) for k, v in private['credentials'].items()}
+        credentials = {k: BrokerCredential.from_mapping(v) for k, v in private['credentials'].items()}
         if any(s['credential_ref'] not in credentials for s in config['scopes']):
             raise RuntimeError('missing_credential_mapping')
         targets = {k: (SSHTarget(**v['target']), ProbeSpec(**v['spec'])) for k, v in private['probes'].items()}
