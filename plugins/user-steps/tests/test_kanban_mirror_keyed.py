@@ -90,6 +90,59 @@ def test_store_change_is_picked_up(keyed):
     assert runs(k)
 
 
+def test_custom_subscriber_descendant_insert_and_delete(keyed, monkeypatch):
+    k = keyed
+
+    def walk(sid, step):
+        chain = [sid]
+        while (row := step(chain[-1])) and row[0] not in chain:
+            chain.append(row[0])
+        return chain
+
+    # Exercise parent/end_reason traversal, not the identity-only fixture stub.
+    monkeypatch.setitem(sys.modules, "hermes_state_compression", types.SimpleNamespace(
+        _walk_compression_chain=walk,
+        _CHAIN_STEP_SQL="SELECT child.id FROM sessions parent JOIN sessions child "
+                        "ON child.parent_session_id=parent.id WHERE parent.id=? "
+                        "AND parent.end_reason='compression' AND child.source!='tool' "
+                        "ORDER BY child.started_at DESC LIMIT 1"))
+    board(k, "UPDATE tasks SET session_id='missing-worker'")
+    board(k, "INSERT INTO kanban_notify_subs VALUES ('t_test','desktop','session-r','default',0)")
+    with sqlite3.connect(k.state) as c:
+        c.execute("INSERT INTO sessions VALUES ('session-r',NULL,'compression','custom',0)")
+        c.execute("UPDATE sessions SET parent_session_id='session-r',source='custom' WHERE id='session-a'")
+    settle(k)
+    assert k.mirror.tip('session-r') == 'session-a'
+    assert len(k.store.requests(OWNER)) == 1
+    with sqlite3.connect(k.state) as c:
+        c.execute("UPDATE sessions SET end_reason='compression' WHERE id='session-a'")
+    settle(k)  # descendant updates still have the bounded full-pass ceiling
+    with sqlite3.connect(k.state) as c:
+        c.execute("INSERT INTO sessions VALUES ('session-a2','session-a',NULL,'custom',1)")
+    assert k.mirror.tip('session-r') == 'session-a2'
+    assert runs(k)
+    assert k.store.requests(OWNER) == []
+    settle(k)
+    with sqlite3.connect(k.state) as c:
+        c.execute("DELETE FROM sessions WHERE id='session-a2'")
+    assert k.mirror.tip('session-r') == 'session-a'
+    assert runs(k)
+    assert len(k.store.requests(OWNER)) == 1
+
+
+def test_creator_source_does_not_key_worker_churn(keyed):
+    k = keyed
+    board(k, "UPDATE tasks SET session_id='worker-creator'")
+    board(k, "INSERT INTO kanban_notify_subs VALUES ('t_test','desktop','session-a','default',0)")
+    with sqlite3.connect(k.state) as c:
+        c.execute("INSERT INTO sessions VALUES ('worker-creator',NULL,NULL,'kanban',0)")
+    settle(k)
+    assert len(k.store.requests(OWNER)) == 1
+    with sqlite3.connect(k.state) as c:
+        c.execute("INSERT INTO sessions VALUES ('worker-other',NULL,NULL,'kanban',1)")
+    assert not runs(k)
+
+
 def test_new_session_is_picked_up(keyed):
     k = keyed
     settle(k)
