@@ -5641,7 +5641,68 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
     if prev:
         store.log({"event": "selfheal_recurrence", "fingerprint": fp, "card": tid,
                    "previous": prev.get("fix_card"), "component": d.get("component")})
+    if st.get("status") == "fixed":  # recurrence or a different error: the recorded fix did not hold on its own
+        notify_superseded(fp, f"it came back at {_iso(_detected_at(d) or now)} after the earlier fix; new card {tid}",
+                          list(st.get("fix_shas") or []) or _logged_fix_shas(store, fp), [], tid, {tid}, store, runner)
     return {"action": "filed", "card": tid, "key": args["idempotency_key"], "scheduled": sched}
+
+
+SUPERSEDED_OPEN = ("todo", "ready", "scheduled", "blocked", "running", "review", "triage")
+SUPERSEDED_MAX = 10
+
+
+def _open_cards_naming(fp: str, exclude, home: Optional[Path] = None) -> list:
+    """Open cards on this host's boards whose title or body names ``fp``: verifiers and follow-ups of an earlier fix
+    round the lane never recorded (an agent-made `Verify ... live` child). -> [(board, id)], at most SUPERSEDED_MAX."""
+    import sqlite3
+    out: list = []
+    for board, path in _board_dbs(Path(home or _kanban_home())):
+        if not path.exists() or _board_in_recovery(path):
+            continue
+        try:
+            con = _ro_state(path)
+            try:
+                marks = ",".join("?" * len(SUPERSEDED_OPEN))
+                rows = con.execute(f"SELECT id FROM tasks WHERE status IN ({marks}) AND "
+                                   "(instr(coalesce(title, ''), ?) > 0 OR instr(coalesce(body, ''), ?) > 0) ORDER BY id",
+                                   (*SUPERSEDED_OPEN, fp, fp)).fetchall()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            continue
+        out += [(board, i) for (i,) in rows if i not in exclude]
+    return out[:SUPERSEDED_MAX]
+
+
+def notify_superseded(fp: str, why: str, old_shas, new_shas, owner: str, exclude, store, runner=None,
+                      home: Optional[Path] = None) -> list:
+    """Tell every open card naming ``fp`` that the fix set it may be checking was superseded (agent-10bd14a55a:
+    t_01a1c3a618a8b74b re-measured cron-7c04faf754's first fix 687b316b for five days after the fingerprint came back
+    and was refixed, then cited that sha's presence as its evidence). Advisory: never fails the caller."""
+    try:
+        cards = _open_cards_naming(fp, set(c for c in exclude if c), home)
+    except Exception:  # health: allow BLE001 -- advisory notice; a board read error must not block the lane
+        return []
+    if not cards:
+        return []
+    old = " ".join(s[:12] for s in old_shas) or "(none recorded)"
+    new = " ".join(s[:12] for s in new_shas) or f"pending on {owner}"
+    body = (f"self-heal: the fix set for `{fp}` was superseded: {why}.\n"
+            f"- earlier fix: {old}\n- current fix: {new} (owner {owner})\n"
+            "If this card checks the earlier fix, that sha's presence is no longer evidence that the symptom is fixed: "
+            "verify every current fix sha where it runs plus the symptom's own log line, or complete this card as "
+            f"superseded by {owner}.")
+    sent = []
+    for board, card in cards:
+        try:
+            rc, _, _ = _run(_kanban_board_argv(board) + ["comment", card, body], runner)
+        except Exception:  # health: allow BLE001 -- NO_EXEC or a CLI failure: log what was not delivered
+            rc = 1
+        if rc == 0:
+            sent.append(card)
+    store.log({"event": "selfheal_superseded_notice", "fingerprint": fp, "owner": owner, "why": why[:200],
+               "cards": sent, "failed": [c for _, c in cards if c not in sent]})
+    return sent
 
 
 def _logged_fix_shas(store, fp: str) -> list:
@@ -6243,8 +6304,12 @@ def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None,
                    "card": owner, "duplicate_card": card, "note": note[:300]})
     if kind == "proposed":
         kw["proposed_at"] = now
+    superseded: list = []
     if kind == "fixed":
         kw.update(fixed_at=now, fix_card=card or st.get("fix_card"), held=[], fix_shas=fix_shas(note))
+        earlier = list(st.get("fix_shas") or []) or _logged_fix_shas(store, fp)
+        if earlier and kw["fix_shas"] and set(earlier) != set(kw["fix_shas"]):
+            superseded = earlier
     if kind in ("not_defect", "declined"):
         kw["closed_at"] = now
     e = lane.update(fp, **kw)
@@ -6257,6 +6322,10 @@ def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None,
                **({"result_file": result_path} if result_path else {})})
     if kind == "not_defect":
         admission_negative(fp, e, note, store=store, now=now, runner=runner, late_adopt=late)
+    if superseded:
+        owner = card or e.get("fix_card") or e.get("card") or "?"
+        notify_superseded(fp, f"fixed again by {owner}", superseded, e.get("fix_shas") or [], owner,
+                          {card, st.get("card"), st.get("fix_card"), st.get("verify_card")}, store, runner)
     return e
 
 
