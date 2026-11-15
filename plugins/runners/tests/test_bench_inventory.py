@@ -7,7 +7,9 @@ This replays the hub's measured change shape (hub 2026-11-13, 1.9k runners: the 
 result moves every other snapshot) with a fleet build every FLEET_CACHE_S = 5 s. It measures thread CPU of main's
 per-call work and of the card L path over the same replay. The absolute thread CPU / replay duration must
 remain within 0.1% of one core on deployment-class hardware (INVENTORY-BUDGET.md).
-The historical P1-scaled ratio also runs on hosted CI, not as absolute budget proof.
+The historical P1-scaled work ratio runs on hosted CI: decoded bytes and projected
+runner rows each must retain the eightfold reduction, without noisy CPU ratios.
+This is a deterministic regression guard, not absolute CPU budget proof.
 The fixture includes 556 scope/coverage/provenance entries and 221 source errors, matching the measured
 post-deploy cardinalities, with fictional identifiers only."""
 import pytest
@@ -16,8 +18,10 @@ import os
 import sqlite3
 import time
 from copy import deepcopy
+from contextlib import ExitStack, contextmanager
 from unittest.mock import patch
 
+from plugins.runners import service as service_module
 from plugins.runners.collector import Collector, iso
 from plugins.runners.providers.base import ProviderResult
 from plugins.runners.service import Service
@@ -28,6 +32,39 @@ P1_NOW = 0.8  # % of one core, card A's P1 snapshot
 BUDGET = 0.1
 RUNNERS = int(os.environ.get('RUNNERS_BENCH_RUNNERS', '1900'))
 CALL_EVERY, WRITE_EVERY, SPAN, LIVE = 5, 30, 600, 0.05
+
+
+@contextmanager
+def count_work(work):
+    """Observe actual decoder inputs and row projections, never fixture creation.
+
+    Keep timing-only replays uninstrumented: wrappers are for deterministic CI
+    regression checks, not absolute CPU evidence.
+    """
+    if work is None:
+        yield
+        return
+    work.update(decoded_bytes=0, projected_rows=0)
+
+    def decoder(original):
+        def counted(payload, *args, **kwargs):
+            work['decoded_bytes'] += len(payload.encode('utf-8') if isinstance(payload, str) else payload)
+            return original(payload, *args, **kwargs)
+        return counted
+
+    original_project = service_module.project
+
+    def project(*args, **kwargs):
+        work['projected_rows'] += 1
+        return original_project(*args, **kwargs)
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(json, 'loads', decoder(json.loads)))
+        if service_module.msgspec is not None:
+            stack.enter_context(patch.object(service_module.msgspec.json, 'decode',
+                                            decoder(service_module.msgspec.json.decode)))
+        stack.enter_context(patch.object(service_module, 'project', project))
+        yield
 
 
 class Fleet:
@@ -100,7 +137,7 @@ def snapshots(path, cfg, scattered=False):
     return out
 
 
-def replay(tmp_path, card_l, run=0, scattered=False):
+def replay(tmp_path, card_l, run=0, scattered=False, work=None):
     cfg = config(); cfg['hosts'] = [deepcopy(F['Host'])]
     path = tmp_path / f"{'new' if card_l else 'old'}{run}" / 'state.sqlite'
     path.parent.mkdir()
@@ -108,7 +145,7 @@ def replay(tmp_path, card_l, run=0, scattered=False):
     fingerprint = Service.config_fingerprint(cfg)  # once per parsed config, as in the dashboard
     db = sqlite3.connect(path)
     cpu, i = 0.0, 0
-    with patch('plugins.runners.service.time.monotonic', lambda: float(t)):
+    with count_work(work), patch('plugins.runners.service.time.monotonic', lambda: float(t)):
         for t in range(0, SPAN, CALL_EVERY):
             while i < len(seq) and seq[i][0] <= t:
                 db.execute("UPDATE collector_cache SET payload=? WHERE key='snapshot'", (seq[i][1],)); db.commit(); i += 1
@@ -131,13 +168,25 @@ def replay(tmp_path, card_l, run=0, scattered=False):
 
 @pytest.mark.parametrize('scattered', [False, True], ids=['clustered', 'scattered'])
 def test_inventory_replay_budget(tmp_path, scattered):
-    # Best of two replays each: thread CPU on a shared CI runner carries noise from other jobs.
-    old = min(replay(tmp_path, card_l=False, run=n, scattered=scattered) for n in range(2))
-    new = min(replay(tmp_path, card_l=True, run=n, scattered=scattered) for n in range(2))
-    share = P1_NOW * new / old
-    print(f'\nrunners inventory over {SPAN}s: main {old * 1000:.0f} ms, card L {new * 1000:.0f} ms of CPU '
-          f'({new / SPAN * 100:.3f}% of a core here); P1 {P1_NOW}% -> {share:.3f}% (budget {BUDGET}%)')
-    assert share <= BUDGET
+    # Enforce the same eightfold reduction independently for both dominant work
+    # classes. No arbitrary weighting or assumption about the runner's CPU speed.
+    # This is a work-regression gate, NOT absolute CPU proof (see the gate below).
+    old, new = {}, {}
+    replay(tmp_path, card_l=False, scattered=scattered, work=old)
+    replay(tmp_path, card_l=True, scattered=scattered, work=new)
+    assert_work_budget(old, new)
+    # The actual legacy replay, substituted as "new", must fail this same gate.
+    with pytest.raises(AssertionError, match='work budget'):
+        assert_work_budget(old, old)
+
+
+def assert_work_budget(old, new):
+    for metric in ('decoded_bytes', 'projected_rows'):
+        assert old[metric] > 0 and new[metric] > 0
+        share = P1_NOW * new[metric] / old[metric]
+        print(f'{metric}: old={old[metric]}, new={new[metric]}, '
+              f'P1-scaled work={share:.6f}% (budget {BUDGET}%)')
+        assert share <= BUDGET, f'{metric} work budget exceeded: {share} > {BUDGET}'
 
 
 @pytest.mark.parametrize('scattered', [False, True], ids=['clustered', 'scattered'])
