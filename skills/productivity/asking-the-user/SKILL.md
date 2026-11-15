@@ -109,7 +109,9 @@ ask only once its prerequisite is verifiably in place. If an early one is alread
   the command, which would run it twice.
 - Never resend a relayed command whose outcome you have not read, whatever the reason the result is missing: a
   tool result replaced by `[interrupted by Hermes update ...: re-run if still needed]`, a `no answer in time`, a
-  `courier: offline` pending, a compaction that dropped the job_id, or a `result lost:` reply. The window on the
+  `courier: offline` pending, a compaction that dropped the job_id, a `result lost:` reply, or `could not reach the user-terminal plugin on <mac>`
+  (HTTP 500, then `Gateway draining (update_paused)` on a job_id poll) during that Mac's update drain: the window
+  had already run, and a job_id poll after the drain returned `ran`. The window on the
   Mac keeps running through Desktop restarts and courier reconnects. Recover in this order: call again with the
   job_id (a courier request id from `session_mentions/claimed/` works too); calling again with the identical
   command from the same session is safe, because the gateway polls the earlier start (`not_resent: true`)
