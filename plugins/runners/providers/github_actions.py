@@ -166,7 +166,7 @@ class GitHubActions:
     def _credential(self, scope):
         try:
             c = self.credential_resolver(scope['credential_ref'])
-            if not isinstance(c, Credential) or not c.key or not isinstance(c.token, str) or not c.token or any(ord(x) < 33 or ord(x) > 126 for x in c.token):
+            if not isinstance(c, Credential) or not c.key or c.key == '@global-hourly-attempts' or not isinstance(c.token, str) or not c.token or any(ord(x) < 33 or ord(x) > 126 for x in c.token):
                 raise ValueError()
             return c
         except Exception:
