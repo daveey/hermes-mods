@@ -58,9 +58,25 @@ that cache: core never publishes an older answer under the newer key.
 `wake_tick` (the host pass's wake step) computes the same inputs (whole rows) inside its proof pass.
 - A row that was **quiet** under exactly its current key is not judged again. Quiet means: no close-out key, no ask
   key, no unlinked entry, no missing or stranded batch entry, nothing written.
-- When every row was quiet and the whole input set is unchanged, the next pass returns at once.
-- A row that acts (has a close-out or ask key, or wrote the ledger) is judged on every pass, because its quiet period,
-  wake cap and claims are clock-driven.
+- A row with a close-out or ask key that was judged **not due** and wrote nothing is *idle* under its key until its
+  own clock can change the answer: the end of the chat's 5-minute typing quiet period or the oldest wake leaving the
+  hourly cap window (`_idle_until`). It is not read, queried or judged before then; a change to its row, cards or
+  transcript moves the key and re-judges it at once. A row whose claim was attempted, or that wrote, is judged again.
+- A row whose only activity is the unlink observation clock of its missing or stranded entries (`track_unlinked`
+  writing only `unlinked`) is a *clock row*. Its clock fields (`at`, `mono`, `pid`, `clocks`, `observed`) are left
+  out of the host key (`_host_row`), and while the rest of the inputs are unchanged the tick only replays
+  `track_unlinked` on the cards as last read and writes the clock (`_clock_tick`): the write carries accrued healthy
+  time across gaps and processes, so it is kept. No board or state.db query, no judgment, no proof. An entry that
+  reaches its removal, or any other field in the result, runs the full pass instead. Accounting: the tick counts as
+  a `chat-closeout.wake_tick` skip and as a run of `chat-closeout.wake_tick_clock` (rows = clock rows, changes =
+  ticks that wrote).
+- When every row was quiet, idle or a clock row and the whole input set is unchanged (the floor bucket included),
+  the next pass returns at once or does only the clock writes. The memo also ends at the earliest idle deadline.
+- `owner_wake_tick` skips while the board, shadow, replica and origin keys are unchanged and no parked card is due
+  (it ends when a waiting agent-owned card would turn stalled). `watchdog_tick` skips while its last full pass
+  observed nothing, the whole key is unchanged, the unlink clocks it held out of "stuck" still advance, and the
+  ledger holds no flag or stalled handoff. Both reuse the wake step's keys of the same tick (at most 20 s old) and are
+  counted as skips of their own passes.
 - Injected readers, proofs, clocks, or `only=` (residual passes) bypass the keys.
 
 ## Accounting (C15)
